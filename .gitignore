@@ -32,3 +32,5 @@ go.work.sum
 # .vscode/
 tmp
 regexped
+target
+perf_test/out

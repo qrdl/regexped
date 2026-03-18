@@ -238,7 +238,6 @@ func hasNonLoopAlternations(prog *syntax.Prog) bool {
 			// True alternations have different patterns (both backward or both forward)
 			isQuantifier := inst.Out < pcU32 && inst.Arg >= pcU32
 			if !isQuantifier {
-				// This is a user alternation, not a quantifier loop
 				return true
 			}
 		}
@@ -251,7 +250,6 @@ func hasNonLoopAlternations(prog *syntax.Prog) bool {
 // instead of leftmost-first. Example: (?:(?:a{3,4}){0,}) incorrectly matches all 6 chars
 // in "aaaaaa" instead of just 4.
 func hasNestedQuantifiers(prog *syntax.Prog) bool {
-	// Track which PCs are inside a quantified loop
 	inQuantifierLoop := make(map[uint32]bool)
 
 	// First pass: identify all quantifier loop instructions
@@ -259,11 +257,8 @@ func hasNestedQuantifiers(prog *syntax.Prog) bool {
 		inst := &prog.Inst[pc]
 		if inst.Op == syntax.InstAlt {
 			pcU32 := uint32(pc)
-			// Quantifier pattern: Out < PC and Arg >= PC
 			isQuantifier := inst.Out < pcU32 && inst.Arg >= pcU32
 			if isQuantifier {
-				// Mark all PCs reachable from this quantifier loop
-				// The loop body is between inst.Out and pc
 				for bodyPC := inst.Out; bodyPC < pcU32; bodyPC++ {
 					inQuantifierLoop[bodyPC] = true
 				}
@@ -278,7 +273,6 @@ func hasNestedQuantifiers(prog *syntax.Prog) bool {
 			pcU32 := uint32(pc)
 			isQuantifier := inst.Out < pcU32 && inst.Arg >= pcU32
 			if isQuantifier && inQuantifierLoop[pcU32] {
-				// This quantifier is nested inside another quantifier
 				return true
 			}
 		}
@@ -287,14 +281,17 @@ func hasNestedQuantifiers(prog *syntax.Prog) bool {
 	return false
 }
 
-// estimateDFAMemory estimates memory usage for a DFA
+// estimateDFAMemory estimates memory usage for a DFA.
 func estimateDFAMemory(states int) int {
 	// Each state: ~60 bytes + transitions
 	// Assume average 10 transitions per state at 8 bytes each
 	return states * (60 + 10*8)
 }
 
-// engineChoice represents the recommended execution engine
+// --------------------------------------------------------------------------
+// Pattern analysis
+
+// engineChoice represents the recommended execution engine.
 type engineChoice int
 
 const (
@@ -303,7 +300,7 @@ const (
 	OnlyNFA // DFA not possible
 )
 
-// patternAnalysis contains metrics about a regex pattern
+// patternAnalysis contains metrics about a regex pattern.
 type patternAnalysis struct {
 	// Program metrics
 	NumInstructions int
@@ -330,26 +327,22 @@ type patternAnalysis struct {
 }
 
 // analysePattern examines a compiled pattern and provides metrics
-// Used by selectBestEngine for engine selection decisions
+// used by selectBestEngine for engine selection decisions.
 func analysePattern(prog *syntax.Prog) *patternAnalysis {
 	analysis := &patternAnalysis{
 		NumInstructions: len(prog.Inst),
 		NumCaptures:     prog.NumCap,
 	}
 
-	// Scan instructions for features
 	for pc, inst := range prog.Inst {
 		switch inst.Op {
 		case syntax.InstAlt:
-			// Only count non-loop alternations (user alternations)
-			// Loops are quantifiers like a+, a* and don't affect leftmost-first
 			isLoop := inst.Out < uint32(pc) && inst.Arg >= uint32(pc)
 			if !isLoop {
 				analysis.NumAlternations++
 			}
 
 		case syntax.InstRune:
-			// Check size of character class
 			totalChars := 0
 			for i := 0; i+1 < len(inst.Rune); i += 2 {
 				totalChars += int(inst.Rune[i+1] - inst.Rune[i] + 1)
@@ -363,39 +356,20 @@ func analysePattern(prog *syntax.Prog) *patternAnalysis {
 
 		case syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
 			analysis.HasAnyRune = true
-
-			// Note: syntax.Prog doesn't have backreferences/lookahead
-			// Those would be rejected during compilation
 		}
 	}
 
-	// Estimate DFA complexity using heuristics
 	analysis.estimateDFAComplexity()
-
-	// Make recommendation
 	analysis.recommend()
 
 	return analysis
 }
 
-// estimateDFAComplexity estimates DFA size
 func (a *patternAnalysis) estimateDFAComplexity() {
-	// Base states: roughly equal to instruction count
-	// The instruction count already accounts for all the pattern structure including alternations
-	// We don't need to multiply by alternations since they're already counted in instructions
 	baseStates := a.NumInstructions
-
-	// DFA may need slightly more states than NFA instructions due to:
-	// - Start state
-	// - Epsilon closure expansion
-	// - Some state splitting for determinization
-	// Use a modest multiplier that grows with pattern complexity
 	multiplier := 1.0
 
-	// Alternations may cause some state expansion during determinization
-	// but NOT exponential - that only happens with nested/quantified alternations
 	if a.NumAlternations > 0 {
-		// Add 20% overhead per alternation, capped at 3x
 		multiplier = 1.0 + float64(a.NumAlternations)*0.2
 		if multiplier > 3.0 {
 			multiplier = 3.0
@@ -404,43 +378,34 @@ func (a *patternAnalysis) estimateDFAComplexity() {
 
 	a.EstimatedDFAStates = int(float64(baseStates) * multiplier)
 
-	// Transitions: each state needs transitions for char classes
-	// For simple literal patterns, most states only need 1-2 transitions
-	// For patterns with char classes, wildcards, etc., more transitions are needed
-	avgTransitionsPerState := 10 // reduced default for literal-heavy patterns
+	avgTransitionsPerState := 10
 	if a.HasLargeCharClass {
-		avgTransitionsPerState = 100 // large char classes need more
+		avgTransitionsPerState = 100
 	}
 	if a.HasUnicode {
-		avgTransitionsPerState = 200 // Unicode patterns need more
+		avgTransitionsPerState = 200
 	}
 	if a.HasAnyRune {
-		avgTransitionsPerState = 256 // wildcards need transition for every byte
+		avgTransitionsPerState = 256
 	}
 
 	a.EstimatedDFATransitions = a.EstimatedDFAStates * avgTransitionsPerState
-
-	// Memory estimate: roughly 16 bytes per transition (state ID + input + next state)
 	a.DFAMemoryEstimateKB = (a.EstimatedDFATransitions * 16) / 1024
 }
 
-// recommend makes a recommendation based on analysis
 func (a *patternAnalysis) recommend() {
-	// Features that make DFA impossible or impractical
 	if a.HasBackreferences || a.HasLookahead || a.HasLookbehind {
 		a.Recommendation = OnlyNFA
 		a.Reason = "Pattern uses features incompatible with DFA (backreferences/lookahead)"
 		return
 	}
 
-	// Capture groups favor NFA (easier to implement)
 	if a.NumCaptures > 4 {
 		a.Recommendation = PreferNFA
 		a.Reason = fmt.Sprintf("Many capture groups (%d) - easier with NFA", a.NumCaptures)
 		return
 	}
 
-	// Large estimated DFA size
 	if a.EstimatedDFAStates > 1000 {
 		a.Recommendation = PreferNFA
 		a.Reason = fmt.Sprintf("Pattern would create very large DFA (~%d states)", a.EstimatedDFAStates)
@@ -453,58 +418,45 @@ func (a *patternAnalysis) recommend() {
 		return
 	}
 
-	// Many alternations can cause state explosion, but our estimation should catch that
-	// Only reject if alternations are extreme AND we haven't already caught it in state/memory checks
-	// (This is a safety net, butmost patterns will be caught by state/memory limits above)
 	if a.NumAlternations > 20 {
 		a.Recommendation = PreferNFA
 		a.Reason = fmt.Sprintf("Too many alternations (%d) for DFA", a.NumAlternations)
 		return
 	}
 
-	// Unicode patterns are problematic for DFA
 	if a.HasUnicode && a.HasLargeCharClass {
 		a.Recommendation = PreferNFA
 		a.Reason = "Unicode character classes create huge transition tables"
 		return
 	}
 
-	// "Any" character matching (. or .*) is NOT supported by current DFA implementation
-	// because DFA subset construction skips InstRuneAny/InstRuneAnyNotNL during transition building
-	// (see dfa.go line ~170 - these instructions are marked "problematic for DFA" and skipped)
 	if a.HasAnyRune {
 		a.Recommendation = PreferNFA
 		a.Reason = "Wildcard matching requires NFA (DFA doesn't support InstRuneAny)"
 		return
 	}
 
-	// If we got here, DFA is feasible and probably better
 	a.Recommendation = PreferDFA
 	a.Reason = fmt.Sprintf("Simple pattern (~%d states, ~%d KB) - DFA will be faster",
 		a.EstimatedDFAStates, a.DFAMemoryEstimateKB)
 }
 
-// printAnalysis outputs analysis results using structured logging
 func printAnalysis(a *patternAnalysis) {
-	// Log program metrics
 	slog.Debug("Pattern metrics",
 		"instructions", a.NumInstructions,
 		"captures", a.NumCaptures,
 		"alternations", a.NumAlternations)
 
-	// Log complexity features
 	slog.Debug("Pattern features",
 		"large_char_classes", a.HasLargeCharClass,
 		"unicode", a.HasUnicode,
 		"wildcards", a.HasAnyRune)
 
-	// Log DFA estimates
 	slog.Debug("DFA estimates",
 		"states", a.EstimatedDFAStates,
 		"transitions", a.EstimatedDFATransitions,
 		"memory_kb", a.DFAMemoryEstimateKB)
 
-	// Log recommendation
 	recommendation := "unknown"
 	switch a.Recommendation {
 	case PreferNFA:
@@ -517,4 +469,130 @@ func printAnalysis(a *patternAnalysis) {
 	slog.Debug("Engine recommendation",
 		"recommended", recommendation,
 		"reason", a.Reason)
+}
+
+// --------------------------------------------------------------------------
+// One-pass detection
+
+// isOnePass checks if a program can be executed in one-pass mode.
+func isOnePass(prog *syntax.Prog) bool {
+	if len(prog.Inst) > 100 {
+		return false
+	}
+
+	for pc, inst := range prog.Inst {
+		switch inst.Op {
+		case syntax.InstAlt, syntax.InstAltMatch:
+			if !isAlternationDeterministic(prog, pc) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// isAlternationDeterministic checks if an alternation has distinct first characters
+// in each branch, making it deterministic.
+func isAlternationDeterministic(prog *syntax.Prog, altPC int) bool {
+	if altPC >= len(prog.Inst) {
+		return false
+	}
+
+	alt := &prog.Inst[altPC]
+	if alt.Op != syntax.InstAlt && alt.Op != syntax.InstAltMatch {
+		return false
+	}
+
+	leftRunes := getFirstRuneSet(prog, int(alt.Out))
+	rightRunes := getFirstRuneSet(prog, int(alt.Arg))
+
+	if len(leftRunes) == 0 || len(rightRunes) == 0 {
+		return false
+	}
+
+	for r := range leftRunes {
+		if rightRunes[r] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// getFirstRuneSet returns the set of runes that can start execution at the given PC.
+func getFirstRuneSet(prog *syntax.Prog, pc int) map[rune]bool {
+	if pc >= len(prog.Inst) {
+		return make(map[rune]bool)
+	}
+
+	runes := make(map[rune]bool)
+	visited := make(map[int]bool)
+
+	var collect func(int) bool
+	collect = func(pc int) bool {
+		if pc >= len(prog.Inst) || visited[pc] {
+			return true
+		}
+
+		visited[pc] = true
+		if len(visited) > 50 {
+			return false
+		}
+
+		inst := &prog.Inst[pc]
+
+		switch inst.Op {
+		case syntax.InstRune1:
+			runes[inst.Rune[0]] = true
+			return true
+
+		case syntax.InstRune:
+			if len(inst.Rune)%2 != 0 {
+				return false
+			}
+			totalChars := 0
+			for i := 0; i < len(inst.Rune); i += 2 {
+				low, high := inst.Rune[i], inst.Rune[i+1]
+				totalChars += int(high - low + 1)
+			}
+			if totalChars > 100 {
+				return false
+			}
+			for i := 0; i < len(inst.Rune); i += 2 {
+				low, high := inst.Rune[i], inst.Rune[i+1]
+				for r := low; r <= high; r++ {
+					runes[r] = true
+				}
+			}
+			return true
+
+		case syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+			return false
+
+		case syntax.InstCapture, syntax.InstNop:
+			return collect(int(inst.Out))
+
+		case syntax.InstEmptyWidth:
+			return collect(int(inst.Out))
+
+		case syntax.InstAlt, syntax.InstAltMatch:
+			if !collect(int(inst.Out)) {
+				return false
+			}
+			return collect(int(inst.Arg))
+
+		case syntax.InstMatch:
+			return false
+
+		default:
+			return false
+		}
+	}
+
+	if !collect(pc) {
+		return make(map[rune]bool)
+	}
+
+	return runes
 }
