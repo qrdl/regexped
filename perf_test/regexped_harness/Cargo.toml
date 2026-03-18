@@ -1,0 +1,8 @@
+[package]
+name = "regexped_harness"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "regexped_harness"
+path = "src/main.rs"
