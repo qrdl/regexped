@@ -2,6 +2,7 @@ package generate
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -27,7 +28,7 @@ func CmdStub(cfg config.BuildConfig, outDir string, rust bool) error {
 		if err := os.WriteFile(stubPath, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", stubPath, err)
 		}
-		fmt.Fprintf(os.Stderr, "Written %s\n", stubPath)
+		slog.Info("Written stub", "file", stubPath)
 	}
 	return nil
 }

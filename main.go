@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 
 	"github.com/qrdl/regexped/config"
@@ -23,6 +24,7 @@ import (
 
 func main() {
 	log.SetFlags(0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)

@@ -2,6 +2,7 @@ package compile
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp/syntax"
@@ -78,13 +79,12 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir string) error {
 	if err != nil {
 		return fmt.Errorf("read wasm-input: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "==> Compiling %d regex(es) to WASM...\n", len(cfg.Regexes))
-	fmt.Fprintf(os.Stderr, "    Rust memory top: %d (0x%x)\n", rustTop, rustTop)
+	slog.Info("Compiling regexes", "count", len(cfg.Regexes))
+	slog.Debug("Rust memory top", "bytes", rustTop)
 
 	tableBase := utils.PageAlign(rustTop)
 	for i, re := range cfg.Regexes {
-		fmt.Fprintf(os.Stderr, "    [%d/%d] module=%s  wasm=%s\n",
-			i+1, len(cfg.Regexes), re.ImportModule, re.WasmFile)
+		slog.Info("Compiling pattern", "n", i+1, "total", len(cfg.Regexes), "module", re.ImportModule, "wasm", re.WasmFile)
 
 		wasmBytes, tableEnd, err := CompileRegex(re.Pattern, re.ExportName, tableBase, false,
 			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, Mode: parseMode(re.Mode)})
@@ -96,11 +96,10 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir string) error {
 		if err := os.WriteFile(wasmPath, wasmBytes, 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", wasmPath, err)
 		}
-		fmt.Fprintf(os.Stderr, "        table_end=%d  written %s (%d bytes)\n",
-			tableEnd, wasmPath, len(wasmBytes))
+		slog.Debug("Compiled pattern", "table_end", tableEnd, "file", wasmPath, "bytes", len(wasmBytes))
 		tableBase = tableEnd
 	}
-	fmt.Fprintln(os.Stderr, "==> Done.")
+	slog.Info("Done")
 	return nil
 }
 

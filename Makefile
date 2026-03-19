@@ -7,7 +7,7 @@ re2test: build
 	cd re2_test && go build -o re2test . && ./re2test re2-exhaustive.txt
 
 perftest: build
-	cd perf_test && bash run_tests.sh
+	cd perf_test && go run .
 
 clean:
 	rm -f regexped re2_test/re2test

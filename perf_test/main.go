@@ -1,0 +1,356 @@
+// perftest benchmarks regexped WASM against the regex crate and prints a summary table.
+//
+// Run from the perf_test/ directory:
+//
+//	cd perf_test && go run ./perftest
+package main
+
+import (
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/qrdl/regexped/compile"
+	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/merge"
+	"github.com/qrdl/regexped/utils"
+)
+
+// --------------------------------------------------------------------------
+// Test case definitions
+
+type matchMode int
+
+const (
+	anchored matchMode = iota
+	find
+)
+
+type testCase struct {
+	name    string
+	pattern string
+	mode    matchMode
+	inputs  []namedInput
+}
+
+type namedInput struct {
+	label string
+	value string
+}
+
+var tests = []testCase{
+	{
+		name:    "email",
+		pattern: `[a-zA-Z0-9_%+\-]+(?:\.[a-zA-Z0-9_%+\-]+)*@[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?)*\.[a-zA-Z][a-zA-Z]+`,
+		mode:    anchored,
+		inputs: []namedInput{
+			{"match", "user@example.com"},
+			{"match-complex", "user.name+tag@sub.domain.org"},
+			{"no-match", "not-an-email"},
+		},
+	},
+	{
+		name:    "url-ipv4",
+		pattern: `[Hh][Tt][Tt][Pp][Ss]?://(?:[a-zA-Z0-9._~!$&'()*+,;=:-]+@)?(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(?:[0-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:[/?#][/a-zA-Z0-9._~!$&'()*+,;=:@%?#-]*)?`,
+		mode:    anchored,
+		inputs: []namedInput{
+			{"ipv4-short", "https://192.168.1.1:8080/path/to/resource?q=1&r=2#section"},
+			{"ipv4-auth", "https://user:pass@sub.example.com:8443/path/to/resource?q=1&r=2#section"},
+			{"ipv4-long", "https://user:password@sub.domain.example.com:8443/path/to/some/resource/page.html?param1=value1&param2=value2&param3=value3#section-anchor"},
+			{"no-match", "not-a-url"},
+		},
+	},
+	{
+		name:    "url-ipv6",
+		pattern: `[Hh][Tt][Tt][Pp][Ss]?://(?:[a-zA-Z0-9._~!$&'()*+,;=:-]+@)?(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)|\[(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|:(?::[0-9a-fA-F]{1,4}){1,7}|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}|::)\]|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(?:[0-9]|[1-9][0-9]|[1-9][0-9]{2}|[1-9][0-9]{3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:[/?#][/a-zA-Z0-9._~!$&'()*+,;=:@%?#-]*)?`,
+		mode:    anchored,
+		inputs: []namedInput{
+			{"ipv6-auth", "https://user:pass@[2001:db8:85a3::8a2e:370:7334]:8443/path/to/resource?q=1#section"},
+			{"ipv6-short", "https://[::1]/path"},
+			{"ipv6-long", "https://user:password@sub.domain.example.com:8443/path/to/some/resource/page.html?param1=value1&param2=value2&param3=value3#section-anchor"},
+			{"no-match", "not-a-url"},
+		},
+	},
+	{
+		name:    "sql-inject",
+		pattern: `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-inject ~1KB", sqlCleanInput()},
+			{"injected ~1KB", sqlInjectInput()},
+		},
+	},
+}
+
+func sqlCleanInput() string {
+	return "POST /search HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nq=" +
+		strings.Repeat("a", 400) +
+		"&page=1&sort=name&order=asc&limit=20&offset=0&filter=active&category=electronics"
+}
+
+func sqlInjectInput() string {
+	return "POST /search HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nq=" +
+		strings.Repeat("a", 200) + "' OR 1=1 --" + strings.Repeat("b", 200) +
+		"&page=1"
+}
+
+// --------------------------------------------------------------------------
+// Paths
+
+const wasmTarget = "wasm32-wasip1"
+
+func harnessWasm(dir, name string) string {
+	return filepath.Join(dir, name, "target", wasmTarget, "release", name+".wasm")
+}
+
+// wasmMerge returns the wasm-merge binary path, trying common locations.
+func wasmMerge() string {
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		filepath.Join(home, "projects", "binaryen", "bin", "wasm-merge"),
+		"wasm-merge",
+	}
+	for _, p := range candidates {
+		if _, err := exec.LookPath(p); err == nil {
+			return p
+		}
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "wasm-merge"
+}
+
+// --------------------------------------------------------------------------
+// Measurement
+
+var reNs = regexp.MustCompile(`(?:match|find):\s*(\d+)ns`)
+var reUs = regexp.MustCompile(`compile:\s*(\d+)`)
+
+// runHarness runs a pre-built WASM harness via wasmtime and parses timing output.
+func runHarness(harnessPath string, args ...string) (compileUs, opNs int64, err error) {
+	cmdArgs := append([]string{"run", harnessPath}, args...)
+	out, err := exec.Command("wasmtime", cmdArgs...).Output()
+	if err != nil {
+		return 0, 0, err
+	}
+	s := string(out)
+	if m := reUs.FindStringSubmatch(s); m != nil {
+		compileUs, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	if m := reNs.FindStringSubmatch(s); m != nil {
+		opNs, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	return compileUs, opNs, nil
+}
+
+// buildRegexped compiles pattern to WASM, merges with the harness, and returns
+// the merged WASM path (caller must delete the temp file).
+func buildRegexped(dir, harnessName, exportName string, mode compile.MatchMode, pattern string) (string, error) {
+	opts := compile.CompileOptions{
+		MaxDFAStates: 100000,
+		ForceEngine:  compile.EngineDFA,
+		Mode:         mode,
+	}
+	// Determine tableBase from the harness's Rust memory top so DFA tables don't overlap.
+	harness := harnessWasm(dir, harnessName)
+	rustTop, err := utils.RustMemTop(harness)  //nolint
+	if err != nil {
+		return "", fmt.Errorf("read harness memory: %w", err)
+	}
+	tableBase := utils.PageAlign(rustTop)
+	wasmBytes, _, err := compile.CompileRegex(pattern, exportName, tableBase, false, opts)
+	if err != nil {
+		return "", fmt.Errorf("compile: %w", err)
+	}
+
+	// Write pattern WASM to temp file.
+	patTmp, err := os.CreateTemp("", "pattern-*.wasm")
+	if err != nil {
+		return "", err
+	}
+	patPath := patTmp.Name()
+	patTmp.Write(wasmBytes)
+	patTmp.Close()
+	defer os.Remove(patPath)
+
+	// Prepare merged output file.
+	mergedTmp, err := os.CreateTemp("", "merged-*.wasm")
+	if err != nil {
+		return "", err
+	}
+	mergedPath := mergedTmp.Name()
+	mergedTmp.Close()
+
+	// Use merge.CmdMerge which handles memory patching and wasm-merge invocation.
+	cfg := config.BuildConfig{
+		WasmMerge: wasmMerge(),
+		Regexes: []config.RegexEntry{
+			{WasmFile: patPath, ImportModule: "pattern", ExportName: exportName},
+		},
+	}
+	if err := merge.CmdMerge(cfg, mergedPath, []string{harness, patPath}); err != nil {
+		os.Remove(mergedPath)
+		return "", fmt.Errorf("merge: %w", err)
+	}
+	return mergedPath, nil
+}
+
+// --------------------------------------------------------------------------
+// Table output
+
+type row struct {
+	label      string
+	compileUs  int64 // regex crate compile time (µs); shown only on first input
+	regexNs    int64
+	regexpedNs int64
+}
+
+const (
+	wLabel    = 28
+	wCompile  = 14
+	wRegex    = 12
+	wRegexped = 12
+	wSpeedup  = 8
+)
+
+func printTable(tc testCase, rows []row) {
+	modeStr := "anchored"
+	if tc.mode == find {
+		modeStr = "find"
+	}
+
+	sep := strings.Repeat("─", wLabel+2) + "┼" +
+		strings.Repeat("─", wCompile+2) + "┼" +
+		strings.Repeat("─", wRegex+2) + "┼" +
+		strings.Repeat("─", wRegexped+2) + "┼" +
+		strings.Repeat("─", wSpeedup+2)
+
+	fmt.Printf("\nPattern: %-20s [%s]\n", tc.name, modeStr)
+	fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s\n",
+		wLabel, "input",
+		wCompile, "regex compile",
+		wRegex, "regex crate",
+		wRegexped, "regexped",
+		wSpeedup, "speedup")
+	fmt.Printf("  %s\n", sep)
+
+	for _, r := range rows {
+		compileStr := ""
+		if r.compileUs > 0 {
+			compileStr = fmt.Sprintf("%dµs", r.compileUs)
+		}
+		speedup := ""
+		if r.regexNs > 0 && r.regexpedNs > 0 {
+			ratio := float64(r.regexNs) / float64(r.regexpedNs)
+			if ratio >= 1.0 {
+				speedup = fmt.Sprintf("%.1f×", ratio)
+			} else {
+				speedup = fmt.Sprintf("%.2f×", ratio)
+			}
+		}
+		fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s\n",
+			wLabel, truncate(r.label, wLabel),
+			wCompile, compileStr,
+			wRegex, fmtNs(r.regexNs),
+			wRegexped, fmtNs(r.regexpedNs),
+			wSpeedup, speedup)
+	}
+}
+
+func fmtNs(ns int64) string {
+	if ns <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%dns", ns)
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-1] + "…"
+}
+
+// --------------------------------------------------------------------------
+// Main
+
+func main() {
+	// Silence library log output — only the table goes to stdout.
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// Resolve perf_test directory (tool may be run from perftest/ or perf_test/).
+	dir, _ := os.Getwd()
+	if filepath.Base(dir) == "perftest" {
+		dir = filepath.Dir(dir)
+	}
+
+	for _, tc := range tests {
+		isFind := tc.mode == find
+
+		// Select harnesses.
+		var regexHarness, regexpedHarness, exportName string
+		if isFind {
+			regexHarness = harnessWasm(dir, "regex_find_harness")
+			regexpedHarness = "regexped_find_harness"
+			exportName = "pattern_find"
+		} else {
+			regexHarness = harnessWasm(dir, "regex_harness")
+			regexpedHarness = "regexped_harness"
+			exportName = "pattern_match"
+		}
+
+		compileMode := compile.ModeAnchoredMatch
+		if isFind {
+			compileMode = compile.ModeFind
+		}
+
+		// Build merged regexped WASM once per pattern.
+		fmt.Fprintf(os.Stderr, "==> compiling %s...\n", tc.name)
+		mergedPath, err := buildRegexped(dir, regexpedHarness, exportName, compileMode, tc.pattern)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "SKIP %s: %v\n", tc.name, err)
+			continue
+		}
+		defer os.Remove(mergedPath)
+
+		var rows []row
+		var sharedCompileUs int64
+
+		for i, inp := range tc.inputs {
+			// Regex crate timing.
+			compileUs, regexNs, hErr := runHarness(regexHarness, tc.pattern, inp.value)
+			if hErr != nil {
+				fmt.Fprintf(os.Stderr, "  warn: regex harness failed for %q: %v\n", inp.label, hErr)
+			}
+			if i == 0 {
+				sharedCompileUs = compileUs
+			}
+
+			// Regexped timing.
+			_, regexpedNs, rErr := runHarness(mergedPath, inp.value)
+			if rErr != nil {
+				fmt.Fprintf(os.Stderr, "  warn: regexped harness failed for %q: %v\n", inp.label, rErr)
+			}
+
+			r := row{
+				label:      inp.label,
+				regexNs:    regexNs,
+				regexpedNs: regexpedNs,
+			}
+			if i == 0 {
+				r.compileUs = sharedCompileUs
+			}
+			rows = append(rows, r)
+		}
+
+		printTable(tc, rows)
+	}
+	fmt.Println()
+}

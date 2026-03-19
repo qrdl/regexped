@@ -2,6 +2,7 @@ package merge
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,7 +29,7 @@ func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
 	regexWasms := inputs[1:]
 
 	// Sanity check: verify each non-first file looks like a compiled regex WASM.
-	fmt.Fprintln(os.Stderr, "==> Checking regex WASM modules...")
+	slog.Debug("Checking WASM modules")
 	for _, path := range regexWasms {
 		if !isRegexWasm(path) {
 			return fmt.Errorf("%s does not appear to be a compiled regex WASM (missing memory import from \"main\")", path)
@@ -41,7 +42,7 @@ func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
 		return fmt.Errorf("measure regex memory: %w", err)
 	}
 	pages := uint32(utils.PageAlign(requiredMem) / utils.WasmPageSize)
-	fmt.Fprintf(os.Stderr, "==> Required memory: %d bytes → %d pages\n", utils.PageAlign(requiredMem), pages)
+	slog.Debug("Memory requirement", "bytes", utils.PageAlign(requiredMem), "pages", pages)
 
 	// Read main WASM, patch memory section in memory, write to temp file.
 	mainRaw, err := os.ReadFile(mainWasm)
@@ -65,10 +66,10 @@ func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
 	}
 	tmp.Close()
 	defer os.Remove(tmpPath)
-	fmt.Fprintf(os.Stderr, "==> Patched memory to %d pages in copy of %s\n", pages, mainWasm)
+	slog.Debug("Patched harness memory", "pages", pages, "source", mainWasm)
 
 	// Build wasm-merge args: <main> main <regex1> <module1> ...
-	fmt.Fprintln(os.Stderr, "==> Merging WASM modules...")
+	slog.Debug("Merging modules")
 	mergeArgs := []string{tmpPath, "main"}
 	for _, path := range regexWasms {
 		module := moduleNameForWasm(cfg, path)
@@ -84,7 +85,7 @@ func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
 	if err != nil {
 		return fmt.Errorf("stat output: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "==> Done. Output: %s (%d bytes)\n", output, info.Size())
+	slog.Info("Merged", "output", output, "bytes", info.Size())
 	return nil
 }
 

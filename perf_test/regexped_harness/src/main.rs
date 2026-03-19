@@ -2,7 +2,7 @@ include!("stub.rs");
 
 use std::time::Instant;
 
-const N: u32 = 1000;
+const N: u32 = 1_000_000;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
