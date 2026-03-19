@@ -13,9 +13,12 @@ import (
 
 // dfa represents a compiled DFA with optimised transition tables.
 type dfa struct {
-	start     int
-	numStates int
-	accepting map[int]bool // which states are accepting
+	start    int
+	midStart int // start state for mid-string positions (attempt_start > 0) in find mode;
+	// differs from start when pattern has begin anchors (^/\A) — those are not followed here.
+	numStates    int
+	accepting    map[int]bool // eofAccepting: accepts when at end of input (via $ or \z)
+	midAccepting map[int]bool // accepts at any position (no end-anchor expansion needed)
 
 	// transitions[state*256 + byte] = nextState (-1 = no transition)
 	transitions  []int                // Flat array: [numStates * 256]
@@ -34,6 +37,7 @@ func (d *dfa) Type() EngineType {
 func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 	dfa := &dfa{
 		accepting:    make(map[int]bool),
+		midAccepting: make(map[int]bool),
 		unicodeTrans: make(map[int]map[rune]int),
 		needsUnicode: needsUnicode,
 	}
@@ -148,8 +152,30 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 	if isAccepting(startSet, ecBegin|ecEnd) {
 		dfa.accepting[0] = true
 	}
+	if isAccepting(startSet, 0) {
+		dfa.midAccepting[0] = true
+	}
 
 	queue = append(queue, workItem{dfaState: 0, nfaSet: startSet})
+
+	// Mid-string start state: epsilon closure WITHOUT begin-anchors, used for
+	// attempt_start > 0 in find mode so that ^ and \A don't fire mid-string.
+	midStartSet := epsilonClosure([]uint32{uint32(prog.Start)}, 0)
+	midStartKey := setToKey(midStartSet)
+	if id, exists := stateMap[midStartKey]; exists {
+		dfa.midStart = id
+	} else {
+		dfa.midStart = nextStateID
+		stateMap[midStartKey] = nextStateID
+		nextStateID++
+		if isAccepting(midStartSet, ecEnd) {
+			dfa.accepting[dfa.midStart] = true
+		}
+		if isAccepting(midStartSet, 0) {
+			dfa.midAccepting[dfa.midStart] = true
+		}
+		queue = append(queue, workItem{dfaState: dfa.midStart, nfaSet: midStartSet})
+	}
 
 	// Process work queue
 	for len(queue) > 0 {
@@ -237,6 +263,9 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 				if isAccepting(nextSet, ecEnd) {
 					dfa.accepting[nextDFAState] = true
 				}
+				if isAccepting(nextSet, 0) {
+					dfa.midAccepting[nextDFAState] = true
+				}
 
 				queue = append(queue, workItem{
 					dfaState: nextDFAState,
@@ -289,19 +318,23 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 
 // dfaTable holds the DFA state transition table.
 type dfaTable struct {
-	startState   int
-	numStates    int
-	acceptStates map[int]bool
-	transitions  []int // flat [state*256+byte] = nextState; -1 = dead
+	startState      int
+	midStartState   int          // start state for attempt_start>0 in find mode
+	numStates       int
+	acceptStates    map[int]bool // eofAccept: accepting at end of input
+	midAcceptStates map[int]bool // midAccept: accepting at any position
+	transitions     []int        // flat [state*256+byte] = nextState; -1 = dead
 }
 
 // dfaTableFrom builds a dfaTable directly from a compiled dfa struct.
 func dfaTableFrom(d *dfa) *dfaTable {
 	return &dfaTable{
-		startState:   d.start,
-		numStates:    d.numStates,
-		acceptStates: d.accepting,
-		transitions:  d.transitions,
+		startState:      d.start,
+		midStartState:   d.midStart,
+		numStates:       d.numStates,
+		acceptStates:    d.accepting,
+		midAcceptStates: d.midAccepting,
+		transitions:     d.transitions,
 	}
 }
 
@@ -352,7 +385,7 @@ func computeByteClasses(t *dfaTable) (classMap [256]byte, classRep []int, numCla
 //
 // The module imports memory as (import "main" "memory" (memory 0)) so that
 // wasm-merge can resolve it against the host module's exported memory.
-func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, memPages int32) []byte {
+func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, memPages int32, mode MatchMode) []byte {
 	// WASM states: 0 = dead/sink, 1..N = Go states 0..N-1
 	numWASM := t.numStates + 1
 	wasmStart := uint32(t.startState + 1)
@@ -421,11 +454,18 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 	}
 	// Dead state row (row 0) stays all-zeros in all cases.
 
-	// Accept flags: acceptFlags[wasmState] = 1 if accepting.
+	// EOF accept flags: 1 if state is accepting at end of input (via $ or \z).
 	acceptOff := tableOff + int32(len(tableBytes))
 	acceptBytes := make([]byte, numWASM)
 	for gs := range t.acceptStates {
 		acceptBytes[gs+1] = 1
+	}
+
+	// Mid-scan accept flags (find mode only): 1 if state accepts at any position.
+	midAcceptOff := acceptOff + int32(numWASM)
+	midAcceptBytes := make([]byte, numWASM)
+	for gs := range t.midAcceptStates {
+		midAcceptBytes[gs+1] = 1
 	}
 
 	var out []byte
@@ -434,12 +474,17 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 	out = append(out, 0x00, 0x61, 0x73, 0x6D) // \0asm
 	out = append(out, 0x01, 0x00, 0x00, 0x00) // version 1
 
-	// ── Type section (id=1): one func type (i32,i32)->i32 ───────────────────
+	// ── Type section (id=1) ─────────────────────────────────────────────────
+	// anchored_match: (i32,i32)->i32   find: (i32,i32)->i64
+	resultType := byte(0x7F) // i32
+	if mode == ModeFind {
+		resultType = 0x7E // i64
+	}
 	ts := []byte{
 		0x01,             // 1 type
 		0x60,             // functype
 		0x02, 0x7F, 0x7F, // 2 params: i32, i32
-		0x01, 0x7F, // 1 result: i32
+		0x01, resultType, // 1 result
 	}
 	out = appendSection(out, 1, ts)
 
@@ -483,7 +528,13 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 	out = appendSection(out, 7, es)
 
 	// ── Code section (id=10): function body ─────────────────────────────────
-	body := buildMatchBody(wasmStart, tableOff, acceptOff, classMapOff, numClasses, useU8, useCompression)
+	var body []byte
+	wasmMidStart := uint32(t.midStartState + 1)
+	if mode == ModeFind {
+		body = buildFindBody(wasmStart, wasmMidStart, tableOff, acceptOff, midAcceptOff, classMapOff, numClasses, useU8, useCompression)
+	} else {
+		body = buildMatchBody(wasmStart, tableOff, acceptOff, classMapOff, numClasses, useU8, useCompression)
+	}
 	var cs []byte
 	cs = append(cs, 0x01) // 1 function
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
@@ -493,14 +544,29 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 	// ── Data section (id=11) ─────────────────────────────────────────────────
 	var ds []byte
 	if useCompression {
-		ds = append(ds, 0x03) // 3 segments: classMap + table + accept flags
-		ds = appendDataSegment(ds, classMapOff, classMap[:])
-		ds = appendDataSegment(ds, tableOff, tableBytes)
-		ds = appendDataSegment(ds, acceptOff, acceptBytes)
+		if mode == ModeFind {
+			ds = append(ds, 0x04) // classMap + table + eofAccept + midAccept
+			ds = appendDataSegment(ds, classMapOff, classMap[:])
+			ds = appendDataSegment(ds, tableOff, tableBytes)
+			ds = appendDataSegment(ds, acceptOff, acceptBytes)
+			ds = appendDataSegment(ds, midAcceptOff, midAcceptBytes)
+		} else {
+			ds = append(ds, 0x03) // classMap + table + eofAccept
+			ds = appendDataSegment(ds, classMapOff, classMap[:])
+			ds = appendDataSegment(ds, tableOff, tableBytes)
+			ds = appendDataSegment(ds, acceptOff, acceptBytes)
+		}
 	} else {
-		ds = append(ds, 0x02) // 2 segments: table + accept flags
-		ds = appendDataSegment(ds, tableOff, tableBytes)
-		ds = appendDataSegment(ds, acceptOff, acceptBytes)
+		if mode == ModeFind {
+			ds = append(ds, 0x03) // table + eofAccept + midAccept
+			ds = appendDataSegment(ds, tableOff, tableBytes)
+			ds = appendDataSegment(ds, acceptOff, acceptBytes)
+			ds = appendDataSegment(ds, midAcceptOff, midAcceptBytes)
+		} else {
+			ds = append(ds, 0x02) // table + eofAccept
+			ds = appendDataSegment(ds, tableOff, tableBytes)
+			ds = appendDataSegment(ds, acceptOff, acceptBytes)
+		}
 	}
 	out = appendSection(out, 11, ds)
 
@@ -722,5 +788,354 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 	b = append(b, 0x0B)
 
 	b = append(b, 0x0B) // end function
+	return b
+}
+
+// buildFindBody returns the WASM function body for find mode.
+// The function scans for the leftmost-longest match and returns a packed i64:
+//
+//	(start << 32) | end   on match
+//	-1 (as i64)           on no match
+//
+// Locals: 0=ptr 1=len 2=state 3=pos 4=attempt_start 5=last_accept
+//
+// Control flow (br depths counted from innermost):
+//
+//	block $no_match
+//	  loop $outer              ; retry loop – advances attempt_start
+//	    block $found           ; exit here when end position is known
+//	      loop $scan           ; inner DFA scan
+//	        if pos >= len      ; depth from if: 0=if,1=$scan,2=$found,3=$outer,4=$no_match
+//	          ...br 2→$found or br 3→$outer
+//	        transition
+//	        if dead            ; depth from if: same as above
+//	          ...br 2→$found or br 3→$outer
+//	        update last_accept ; pos++; br 0→$scan
+//	      end $scan
+//	    end $found
+//	    return packed i64      ; (unreachable end follows)
+//	  end $outer
+//	end $no_match
+//	i64.const -1
+//	end function
+func buildFindBody(startState, midStartState uint32, tableOff, eofAcceptOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool) []byte {
+	var b []byte
+
+	// ── helper: emit the "pos >= len" handler ───────────────────────────────
+	// Called while inside $scan (depths from if body: 0=if,1=$scan,2=$found,3=$outer)
+	emitEofHandler := func(b []byte) []byte {
+		// if eofAccept[state]: last_accept = pos  (state accepts at end of input)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, eofAcceptOff)
+		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x04, 0x40)       // if (void)  [nested]
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x21, 0x05)       // local.set last_accept
+		b = append(b, 0x0B)             // end nested if
+		// if last_accept >= 0: br $found
+		b = append(b, 0x20, 0x05) // local.get last_accept
+		b = append(b, 0x41, 0x00) // i32.const 0
+		b = append(b, 0x4E)       // i32.ge_s
+		b = append(b, 0x0D, 0x02) // br_if 2 → exit $found
+		// attempt_start++; br $outer
+		b = append(b, 0x20, 0x04) // local.get attempt_start
+		b = append(b, 0x41, 0x01) // i32.const 1
+		b = append(b, 0x6A)       // i32.add
+		b = append(b, 0x21, 0x04) // local.set attempt_start
+		b = append(b, 0x0C, 0x03) // br 3 → top of $outer
+		return b
+	}
+
+	// ── helper: emit the dead-state handler ─────────────────────────────────
+	// Called while inside $scan (depths from if body: 0=if,1=$scan,2=$found,3=$outer)
+	emitDeadHandler := func(b []byte) []byte {
+		// if last_accept >= 0: br $found
+		b = append(b, 0x20, 0x05) // local.get last_accept
+		b = append(b, 0x41, 0x00) // i32.const 0
+		b = append(b, 0x4E)       // i32.ge_s
+		b = append(b, 0x0D, 0x02) // br_if 2 → exit $found
+		// attempt_start++; br $outer
+		b = append(b, 0x20, 0x04) // local.get attempt_start
+		b = append(b, 0x41, 0x01) // i32.const 1
+		b = append(b, 0x6A)       // i32.add
+		b = append(b, 0x21, 0x04) // local.set attempt_start
+		b = append(b, 0x0C, 0x03) // br 3 → top of $outer
+		return b
+	}
+
+	// ── helper: outer loop prologue ──────────────────────────────────────────
+	// Emits: if attempt_start >= len: br $no_match
+	//        state=startState, pos=attempt_start, last_accept=-1
+	//        if accept[state]: last_accept=pos  (start-state empty-match check)
+	emitOuterPrologue := func(b []byte) []byte {
+		// if attempt_start > len: br $no_match (depth 1 from $outer)
+		// Note: allow attempt_start == len for patterns that match empty string at end.
+		b = append(b, 0x20, 0x04) // local.get attempt_start
+		b = append(b, 0x20, 0x01) // local.get len
+		b = append(b, 0x4B)       // i32.gt_u
+		b = append(b, 0x0D, 0x01) // br_if 1 → exit $no_match
+		// state = (attempt_start == 0) ? startState : midStartState
+		// midStartState was computed without ecBegin so ^ and \A don't fire mid-string.
+		if startState == midStartState {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(startState))
+		} else {
+			b = append(b, 0x20, 0x04) // local.get attempt_start
+			b = append(b, 0x45)       // i32.eqz
+			b = append(b, 0x04, 0x7F) // if (result i32)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(startState))
+			b = append(b, 0x05)       // else
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(midStartState))
+			b = append(b, 0x0B) // end if
+		}
+		b = append(b, 0x21, 0x02) // local.set state
+		// pos = attempt_start
+		b = append(b, 0x20, 0x04) // local.get attempt_start
+		b = append(b, 0x21, 0x03) // local.set pos
+		// last_accept = -1
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x21, 0x05) // local.set last_accept
+		// if midAccept[startState]: last_accept = pos  (empty-string match at attempt_start)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptOff)
+		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x21, 0x05)       // local.set last_accept
+		b = append(b, 0x0B)             // end if
+		return b
+	}
+
+	// ── helper: emit the packed-i64 return and close loops ──────────────────
+	emitReturn := func(b []byte) []byte {
+		// return (attempt_start << 32) | last_accept
+		b = append(b, 0x20, 0x04) // local.get attempt_start
+		b = append(b, 0xAD)       // i64.extend_i32_u
+		b = append(b, 0x42, 0x20) // i64.const 32
+		b = append(b, 0x86)       // i64.shl
+		b = append(b, 0x20, 0x05) // local.get last_accept
+		b = append(b, 0xAD)       // i64.extend_i32_u
+		b = append(b, 0x84)       // i64.or
+		b = append(b, 0x0F)       // return
+		b = append(b, 0x0B)       // end loop $outer  (unreachable)
+		b = append(b, 0x0B)       // end block $no_match  (unreachable)
+		// no-match path falls through here
+		b = append(b, 0x42, 0x7F) // i64.const -1
+		b = append(b, 0x0B)       // end function
+		return b
+	}
+
+	if useU8 && useCompression {
+		// ── u8 compressed find path ───────────────────────────────────────────
+		// 5 locals: state(2), pos(3), attempt_start(4), last_accept(5), class(6)
+		b = append(b, 0x01, 0x05, 0x7F)
+		b = append(b, 0x02, 0x40) // block $no_match
+		b = append(b, 0x03, 0x40) // loop $outer
+		b = emitOuterPrologue(b)
+		b = append(b, 0x02, 0x40) // block $found
+		b = append(b, 0x03, 0x40) // loop $scan
+
+		// pos >= len?
+		b = append(b, 0x20, 0x03) // local.get pos
+		b = append(b, 0x20, 0x01) // local.get len
+		b = append(b, 0x4F)       // i32.ge_u
+		b = append(b, 0x04, 0x40) // if (void)
+		b = emitEofHandler(b)
+		b = append(b, 0x0B) // end if
+
+		// class = classMap[mem[ptr+pos]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, classMapOff)
+		b = append(b, 0x20, 0x00)       // local.get ptr
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
+		b = append(b, 0x6A)             // i32.add (classMapOff + byte)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (class)
+		b = append(b, 0x21, 0x06)       // local.set class
+
+		// state = table[state*numClasses + class]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, tableOff)
+		b = append(b, 0x20, 0x02) // local.get state
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(numClasses))
+		b = append(b, 0x6C)             // i32.mul
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x20, 0x06)       // local.get class
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x21, 0x02)       // local.set state
+
+		// dead state?
+		b = append(b, 0x20, 0x02) // local.get state
+		b = append(b, 0x45)       // i32.eqz
+		b = append(b, 0x04, 0x40) // if (void)
+		b = emitDeadHandler(b)
+		b = append(b, 0x0B) // end if
+
+		// if midAccept[state]: last_accept = pos + 1
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptOff)
+		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x41, 0x01)       // i32.const 1
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x21, 0x05)       // local.set last_accept
+		b = append(b, 0x0B)             // end if
+
+		b = append(b, 0x20, 0x03) // pos++
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, 0x03)
+
+		b = append(b, 0x0C, 0x00) // br 0 → top of $scan
+		b = append(b, 0x0B)       // end loop $scan
+		b = append(b, 0x0B)       // end block $found
+		b = emitReturn(b)
+		return b
+	}
+
+	if useU8 {
+		// ── u8 simple find path ───────────────────────────────────────────────
+		// 4 locals: state(2), pos(3), attempt_start(4), last_accept(5)
+		b = append(b, 0x01, 0x04, 0x7F)
+		b = append(b, 0x02, 0x40) // block $no_match
+		b = append(b, 0x03, 0x40) // loop $outer
+		b = emitOuterPrologue(b)
+		b = append(b, 0x02, 0x40) // block $found
+		b = append(b, 0x03, 0x40) // loop $scan
+
+		// pos >= len?
+		b = append(b, 0x20, 0x03) // local.get pos
+		b = append(b, 0x20, 0x01) // local.get len
+		b = append(b, 0x4F)       // i32.ge_u
+		b = append(b, 0x04, 0x40) // if (void)
+		b = emitEofHandler(b)
+		b = append(b, 0x0B) // end if
+
+		// state = table[state*256 + mem[ptr+pos]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, tableOff)
+		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x41, 0x08)       // i32.const 8
+		b = append(b, 0x74)             // i32.shl
+		b = append(b, 0x6A)
+		b = append(b, 0x20, 0x00)       // local.get ptr
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (table entry)
+		b = append(b, 0x21, 0x02)       // local.set state
+
+		// dead state?
+		b = append(b, 0x20, 0x02) // local.get state
+		b = append(b, 0x45)       // i32.eqz
+		b = append(b, 0x04, 0x40) // if (void)
+		b = emitDeadHandler(b)
+		b = append(b, 0x0B) // end if
+
+		// if midAccept[state]: last_accept = pos + 1
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptOff)
+		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, 0x05) // local.set last_accept
+		b = append(b, 0x0B)       // end if
+
+		b = append(b, 0x20, 0x03) // pos++
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, 0x03)
+
+		b = append(b, 0x0C, 0x00) // br 0 → top of $scan
+		b = append(b, 0x0B)       // end loop $scan
+		b = append(b, 0x0B)       // end block $found
+		b = emitReturn(b)
+		return b
+	}
+
+	// ── u16 find path ─────────────────────────────────────────────────────────
+	// 5 locals: state(2), pos(3), attempt_start(4), last_accept(5), byte(6)
+	b = append(b, 0x01, 0x05, 0x7F)
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $outer
+	b = emitOuterPrologue(b)
+	b = append(b, 0x02, 0x40) // block $found
+	b = append(b, 0x03, 0x40) // loop $scan
+
+	// pos >= len?
+	b = append(b, 0x20, 0x03) // local.get pos
+	b = append(b, 0x20, 0x01) // local.get len
+	b = append(b, 0x4F)       // i32.ge_u
+	b = append(b, 0x04, 0x40) // if (void)
+	b = emitEofHandler(b)
+	b = append(b, 0x0B) // end if
+
+	// byte = mem[ptr+pos]
+	b = append(b, 0x20, 0x00)
+	b = append(b, 0x20, 0x03)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x21, 0x06)       // local.set byte
+
+	// state = u16(mem[tableOff + state*512 + byte*2])
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, tableOff)
+	b = append(b, 0x20, 0x02)       // local.get state
+	b = append(b, 0x41, 0x09)       // i32.const 9
+	b = append(b, 0x74)             // i32.shl
+	b = append(b, 0x6A)
+	b = append(b, 0x20, 0x06)       // local.get byte
+	b = append(b, 0x41, 0x01)       // i32.const 1
+	b = append(b, 0x74)             // i32.shl
+	b = append(b, 0x6A)
+	b = append(b, 0x2F, 0x01, 0x00) // i32.load16_u
+	b = append(b, 0x21, 0x02)       // local.set state
+
+	// dead state?
+	b = append(b, 0x20, 0x02) // local.get state
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x04, 0x40) // if (void)
+	b = emitDeadHandler(b)
+	b = append(b, 0x0B) // end if
+
+	// if midAccept[state]: last_accept = pos + 1
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midAcceptOff)
+	b = append(b, 0x20, 0x02)       // local.get state
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x04, 0x40)       // if (void)
+	b = append(b, 0x20, 0x03)       // local.get pos
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, 0x05) // local.set last_accept
+	b = append(b, 0x0B)       // end if
+
+	b = append(b, 0x20, 0x03) // pos++
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, 0x03)
+
+	b = append(b, 0x0C, 0x00) // br 0 → top of $scan
+	b = append(b, 0x0B)       // end loop $scan
+	b = append(b, 0x0B)       // end block $found
+	b = emitReturn(b)
 	return b
 }

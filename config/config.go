@@ -24,6 +24,7 @@ type RegexEntry struct {
 	ExportName   string `yaml:"export_name"`
 	FuncName     string `yaml:"func_name"`
 	Pattern      string `yaml:"pattern"`
+	Mode         string `yaml:"mode"` // "anchored_match" (default) or "find"
 }
 
 // LoadConfig reads and parses the YAML config at configPath.

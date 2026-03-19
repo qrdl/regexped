@@ -64,10 +64,14 @@ func run(testFile string, verbose bool, maxErrors int) error {
 		inStrings   bool
 		pattern     string
 
-		// per-pattern wasmtime state; nil when pattern was skipped
+		// per-pattern anchored mode (col 0); nil when pattern was skipped
 		store   *wasmtime.Store
 		matchFn *wasmtime.Func
 		memory  *wasmtime.Memory
+
+		// per-pattern find mode (col 1); nil when compilation failed
+		findFn     *wasmtime.Func
+		findMemory *wasmtime.Memory
 
 		lineno    int
 		npass     int
@@ -119,6 +123,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 
 			pattern = q
 			store, matchFn, memory = nil, nil, nil
+			findFn, findMemory = nil, nil
 
 			// Pre-check for unsupported features before attempting compilation.
 			if reason := preCheck(pattern); reason != "" {
@@ -142,7 +147,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				continue
 			}
 
-			// Compile succeeded — set up wasmtime instance.
+			// Compile succeeded — set up wasmtime instances for anchored and find modes.
 			store = wasmtime.NewStore(engine)
 			mod, modErr := wasmtime.NewModule(engine, wasmBytes)
 			if modErr != nil {
@@ -156,6 +161,30 @@ func run(testFile string, verbose bool, maxErrors int) error {
 			if exp := inst.GetExport(store, "memory"); exp != nil {
 				memory = exp.Memory()
 			}
+
+			// Also compile find mode for non-anchored (col 1) test cases,
+			// but only when DFA semantics match RE2's leftmost-first.
+			// Skip patterns with alternations (|) or non-greedy quantifiers
+			// because DFA gives leftmost-longest while RE2 gives leftmost-first.
+			findOpts := compile.CompileOptions{
+				MaxDFAStates: maxDFAStates,
+				ForceEngine:  compile.EngineDFA,
+				Mode:         compile.ModeFind,
+			}
+			parsedForFind, _ := syntax.Parse(pattern, syntax.Perl)
+			if parsedForFind != nil && !findModeUnsafe(parsedForFind) {
+				if findBytes, _, fErr := compile.CompileRegex(pattern, "find", tableBase, true, findOpts); fErr == nil {
+					if findMod, fModErr := wasmtime.NewModule(engine, findBytes); fModErr == nil {
+						if findInst, fInstErr := wasmtime.NewInstance(store, findMod, []wasmtime.AsExtern{}); fInstErr == nil {
+							findFn = findInst.GetFunc(store, "find")
+							if exp := findInst.GetExport(store, "memory"); exp != nil {
+								findMemory = exp.Memory()
+							}
+						}
+					}
+				}
+			}
+
 			input = append([]string(nil), testStrings...)
 
 		case line[0] == '-' || ('0' <= line[0] && line[0] <= '9'):
@@ -183,9 +212,33 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				continue
 			}
 
-			// Skip cases where a match exists only in non-anchored mode.
 			if col0 == "-" && col1 != "-" {
-				skipCount[skipNonAnchored]++
+				// Non-anchored case: test with find mode if available.
+				if findFn == nil {
+					skipCount[skipNonAnchored]++
+					continue
+				}
+				got, callErr := callFind(store, findFn, findMemory, text)
+				if callErr != nil {
+					return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
+						testFile, lineno, pattern, text, callErr)
+				}
+				expected := parseCol1(col1)
+				if got == expected {
+					npass++
+					if verbose {
+						fmt.Printf("PASS %s:%d pattern=%q input=%q (find)\n", testFile, lineno, pattern, text)
+					}
+				} else {
+					nfail++
+					fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
+						pattern, text, fmtFindResult(expected), fmtFindResult(got))
+					if maxErrors > 0 && nfail >= maxErrors {
+						fmt.Printf("Stopping after %d failure(s)\n", nfail)
+						stopped = true
+						goto done
+					}
+				}
 				continue
 			}
 
@@ -259,13 +312,26 @@ func callMatch(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, t
 	return result.(int32), nil
 }
 
+// callFind writes text into WASM linear memory and invokes the find function.
+// Returns packed (start<<32)|end as int64, or -1 on no match.
+func callFind(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string) (int64, error) {
+	if len(text) > 0 {
+		buf := mem.UnsafeData(store)
+		copy(buf[inputBase:], text)
+	}
+	result, err := fn.Call(store, inputBase, int32(len(text)))
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}
+
 // parseCol0 converts a col-0 result string to the expected WASM return value.
 // "-" → -1 (no match); "0-N ..." → N (end position; submatches ignored).
 func parseCol0(col string) int32 {
 	if col == "-" {
 		return -1
 	}
-	// Take only the first space-separated pair (overall match); ignore submatches.
 	pair := col
 	if idx := strings.IndexByte(col, ' '); idx >= 0 {
 		pair = col[:idx]
@@ -281,11 +347,42 @@ func parseCol0(col string) int32 {
 	return int32(end)
 }
 
+// parseCol1 converts a col-1 result string to the expected find return value.
+// "-" → -1; "s-e ..." → packed (s<<32)|e (submatches ignored).
+func parseCol1(col string) int64 {
+	if col == "-" {
+		return -1
+	}
+	pair := col
+	if idx := strings.IndexByte(col, ' '); idx >= 0 {
+		pair = col[:idx]
+	}
+	dashIdx := strings.IndexByte(pair, '-')
+	if dashIdx < 0 {
+		return -1
+	}
+	start, err1 := strconv.ParseInt(pair[:dashIdx], 10, 64)
+	end, err2 := strconv.ParseInt(pair[dashIdx+1:], 10, 64)
+	if err1 != nil || err2 != nil {
+		return -1
+	}
+	return start<<32 | end
+}
+
 func fmtResult(v int32) string {
 	if v < 0 {
 		return "no match"
 	}
 	return fmt.Sprintf("end=%d", v)
+}
+
+func fmtFindResult(v int64) string {
+	if v == -1 {
+		return "no match"
+	}
+	start := uint32(v >> 32)
+	end := uint32(v)
+	return fmt.Sprintf("start=%d end=%d", start, end)
 }
 
 // preCheck detects patterns that cannot be tested without attempting compilation.
@@ -314,6 +411,35 @@ func hasWordBoundary(re *syntax.Regexp) bool {
 	}
 	for _, sub := range re.Sub {
 		if hasWordBoundary(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// findModeUnsafe reports whether a pattern cannot be correctly tested in find
+// mode because DFA semantics (leftmost-longest) differ from RE2 (leftmost-first).
+// Patterns with alternations or non-greedy quantifiers fall into this category.
+func findModeUnsafe(re *syntax.Regexp) bool {
+	switch re.Op {
+	case syntax.OpAlternate:
+		return true
+	case syntax.OpRepeat:
+		// Variable repetition {m,n} with m≠n has alternation-like semantics:
+		// RE2 leftmost-first picks the shortest match, DFA picks the longest.
+		if re.Min != re.Max {
+			return true
+		}
+		if re.Flags&syntax.NonGreedy != 0 {
+			return true
+		}
+	case syntax.OpStar, syntax.OpPlus, syntax.OpQuest:
+		if re.Flags&syntax.NonGreedy != 0 {
+			return true
+		}
+	}
+	for _, sub := range re.Sub {
+		if findModeUnsafe(sub) {
 			return true
 		}
 	}

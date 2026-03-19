@@ -18,7 +18,12 @@ func CmdStub(cfg config.BuildConfig, outDir string, rust bool) error {
 	}
 	for _, re := range cfg.Regexes {
 		stubPath := filepath.Join(outDir, "src", re.StubFile)
-		content := genRustStubs(re.Pattern, re.ImportModule, re.ExportName, re.FuncName)
+		var content string
+		if re.Mode == "find" {
+			content = genRustFindStubs(re.Pattern, re.ImportModule, re.ExportName, re.FuncName)
+		} else {
+			content = genRustStubs(re.Pattern, re.ImportModule, re.ExportName, re.FuncName)
+		}
 		if err := os.WriteFile(stubPath, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", stubPath, err)
 		}

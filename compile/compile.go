@@ -10,6 +10,19 @@ import (
 	"github.com/qrdl/regexped/utils"
 )
 
+// MatchMode controls the generated WASM function's matching behaviour.
+type MatchMode int
+
+const (
+	// ModeAnchoredMatch generates a function (ptr, len i32) -> i32 that matches
+	// the full input anchored at position 0, returning end position or -1.
+	ModeAnchoredMatch MatchMode = 0
+
+	// ModeFind generates a function (ptr, len i32) -> i64 that scans the input
+	// for the leftmost-longest match, returning packed (start<<32|end) or -1.
+	ModeFind MatchMode = 1
+)
+
 // EngineType represents the type of regex engine implementation.
 type EngineType byte
 
@@ -54,6 +67,7 @@ type CompileOptions struct {
 	Unicode            bool       // Enable Unicode support
 	AdaptiveNFACutover int        // Input size in bytes to switch to Pike VM in AdaptiveNFA
 	ForceEngine        EngineType // If non-zero, skip engine selection and use this engine type
+	Mode               MatchMode  // ModeAnchoredMatch (default) or ModeFind
 }
 
 // CmdCompile compiles all regex patterns from cfg to WASM modules.
@@ -72,7 +86,8 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir string) error {
 		fmt.Fprintf(os.Stderr, "    [%d/%d] module=%s  wasm=%s\n",
 			i+1, len(cfg.Regexes), re.ImportModule, re.WasmFile)
 
-		wasmBytes, tableEnd, err := CompileRegex(re.Pattern, re.ExportName, tableBase, false)
+		wasmBytes, tableEnd, err := CompileRegex(re.Pattern, re.ExportName, tableBase, false,
+			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, Mode: parseMode(re.Mode)})
 		if err != nil {
 			return fmt.Errorf("compile regex %d (%s): %w", i+1, re.ImportModule, err)
 		}
@@ -128,12 +143,23 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 	default: // u16
 		dfaSize = int64(numWASM*256*2 + numWASM)
 	}
+	if opts.Mode == ModeFind {
+		dfaSize += int64(numWASM) // extra midAccept flags
+	}
 
 	tableEnd := utils.PageAlign(tableBase + dfaSize)
 	memPages := int32(tableEnd / 65536)
 
-	wasmBytes := genWASM(table, tableBase, exportName, standalone, memPages)
+	wasmBytes := genWASM(table, tableBase, exportName, standalone, memPages, opts.Mode)
 	return wasmBytes, tableEnd, nil
+}
+
+// parseMode converts the YAML mode string to a MatchMode constant.
+func parseMode(s string) MatchMode {
+	if s == "find" {
+		return ModeFind
+	}
+	return ModeAnchoredMatch
 }
 
 // compile parses the pattern, selects the optimal engine, and returns a compiled Matcher.
