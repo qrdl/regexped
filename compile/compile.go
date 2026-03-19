@@ -143,7 +143,12 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 		dfaSize = int64(numWASM*256*2 + numWASM)
 	}
 	if opts.Mode == ModeFind {
-		dfaSize += int64(numWASM) // extra midAccept flags
+		dfaSize += int64(numWASM) // midAccept flags
+		// firstByte flags (256 bytes) only when there is no literal prefix;
+		// with a prefix the skip uses hardcoded comparisons, no table needed.
+		if len(computePrefix(table)) == 0 {
+			dfaSize += 256
+		}
 	}
 
 	tableEnd := utils.PageAlign(tableBase + dfaSize)

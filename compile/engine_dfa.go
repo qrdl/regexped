@@ -16,9 +16,10 @@ type dfa struct {
 	start    int
 	midStart int // start state for mid-string positions (attempt_start > 0) in find mode;
 	// differs from start when pattern has begin anchors (^/\A) — those are not followed here.
-	numStates    int
-	accepting    map[int]bool // eofAccepting: accepts when at end of input (via $ or \z)
-	midAccepting map[int]bool // accepts at any position (no end-anchor expansion needed)
+	numStates        int
+	accepting        map[int]bool // eofAccepting: accepts when at end of input (via $ or \z)
+	midAccepting     map[int]bool // accepts at any position (no end-anchor expansion needed)
+	startBeginAccept bool         // true if start state accepts with ecBegin only (e.g. a*^)
 
 	// transitions[state*256 + byte] = nextState (-1 = no transition)
 	transitions  []int                // Flat array: [numStates * 256]
@@ -155,6 +156,9 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 	if isAccepting(startSet, 0) {
 		dfa.midAccepting[0] = true
 	}
+	// startBeginAccept: pattern matches empty at position 0 due to begin anchor (^/\A).
+	// Distinct from acceptStates (ecBegin|ecEnd) and midAcceptStates (ctx=0).
+	dfa.startBeginAccept = isAccepting(startSet, ecBegin)
 
 	queue = append(queue, workItem{dfaState: 0, nfaSet: startSet})
 
@@ -318,23 +322,25 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 
 // dfaTable holds the DFA state transition table.
 type dfaTable struct {
-	startState      int
-	midStartState   int          // start state for attempt_start>0 in find mode
-	numStates       int
-	acceptStates    map[int]bool // eofAccept: accepting at end of input
-	midAcceptStates map[int]bool // midAccept: accepting at any position
-	transitions     []int        // flat [state*256+byte] = nextState; -1 = dead
+	startState       int
+	midStartState    int          // start state for attempt_start>0 in find mode
+	numStates        int
+	acceptStates     map[int]bool // eofAccept: accepting at end of input
+	midAcceptStates  map[int]bool // midAccept: accepting at any position
+	transitions      []int        // flat [state*256+byte] = nextState; -1 = dead
+	startBeginAccept bool         // true if startState accepts with ecBegin only (e.g. a*^)
 }
 
 // dfaTableFrom builds a dfaTable directly from a compiled dfa struct.
 func dfaTableFrom(d *dfa) *dfaTable {
 	return &dfaTable{
-		startState:      d.start,
-		midStartState:   d.midStart,
-		numStates:       d.numStates,
-		acceptStates:    d.accepting,
-		midAcceptStates: d.midAccepting,
-		transitions:     d.transitions,
+		startState:       d.start,
+		midStartState:    d.midStart,
+		numStates:        d.numStates,
+		acceptStates:     d.accepting,
+		midAcceptStates:  d.midAccepting,
+		transitions:      d.transitions,
+		startBeginAccept: d.startBeginAccept,
 	}
 }
 
@@ -468,6 +474,32 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 		midAcceptBytes[gs+1] = 1
 	}
 
+	// Literal prefix + firstByteFlags for find mode fast-skip.
+	// If the DFA has a unique literal prefix (e.g. "ghp_", "eyJ", "AKIA"), the
+	// scan loop uses hardcoded byte comparisons — much faster than a table lookup
+	// for long inputs.  Falls back to firstByteFlags (256-byte table) when there
+	// is no unique prefix (e.g. combined patterns eyJ...|ghp_...|AKIA...).
+	prefix := computePrefix(t)
+	var firstByteOff int32
+	var firstByteFlags [256]byte
+	if len(prefix) == 0 {
+		firstByteOff = midAcceptOff + int32(numWASM)
+		// If any start state is mid-accepting (can match empty string), every position
+		// is a candidate — the fast-skip must not skip any byte.
+		// This covers: (aa)* [midAcceptStates[midStartState]], ^(aa)* [midAcceptStates[startState]].
+		if t.midAcceptStates[t.midStartState] || t.midAcceptStates[t.startState] || t.acceptStates[t.startState] {
+			for b := 0; b < 256; b++ {
+				firstByteFlags[b] = 1
+			}
+		} else {
+			for b := 0; b < 256; b++ {
+				if t.transitions[t.startState*256+b] >= 0 || t.transitions[t.midStartState*256+b] >= 0 {
+					firstByteFlags[b] = 1
+				}
+			}
+		}
+	}
+
 	var out []byte
 
 	// ── Magic + version ──────────────────────────────────────────────────────
@@ -530,8 +562,15 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 	// ── Code section (id=10): function body ─────────────────────────────────
 	var body []byte
 	wasmMidStart := uint32(t.midStartState + 1)
+	// DFA state reached after consuming the literal prefix from midStartState.
+	// The find body starts the DFA scan from this state (skipping the prefix bytes).
+	prefixEndState := t.midStartState
+	for _, ch := range prefix {
+		prefixEndState = t.transitions[prefixEndState*256+int(ch)]
+	}
+	wasmPrefixEnd := uint32(prefixEndState + 1)
 	if mode == ModeFind {
-		body = buildFindBody(wasmStart, wasmMidStart, tableOff, acceptOff, midAcceptOff, classMapOff, numClasses, useU8, useCompression)
+		body = buildFindBody(wasmStart, wasmMidStart, wasmPrefixEnd, tableOff, acceptOff, midAcceptOff, firstByteOff, prefix, classMapOff, numClasses, useU8, useCompression, t.startBeginAccept)
 	} else {
 		body = buildMatchBody(wasmStart, tableOff, acceptOff, classMapOff, numClasses, useU8, useCompression)
 	}
@@ -545,11 +584,20 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 	var ds []byte
 	if useCompression {
 		if mode == ModeFind {
-			ds = append(ds, 0x04) // classMap + table + eofAccept + midAccept
-			ds = appendDataSegment(ds, classMapOff, classMap[:])
-			ds = appendDataSegment(ds, tableOff, tableBytes)
-			ds = appendDataSegment(ds, acceptOff, acceptBytes)
-			ds = appendDataSegment(ds, midAcceptOff, midAcceptBytes)
+			if len(prefix) == 0 {
+				ds = append(ds, 0x05) // classMap + table + eofAccept + midAccept + firstByte
+				ds = appendDataSegment(ds, classMapOff, classMap[:])
+				ds = appendDataSegment(ds, tableOff, tableBytes)
+				ds = appendDataSegment(ds, acceptOff, acceptBytes)
+				ds = appendDataSegment(ds, midAcceptOff, midAcceptBytes)
+				ds = appendDataSegment(ds, firstByteOff, firstByteFlags[:])
+			} else {
+				ds = append(ds, 0x04) // classMap + table + eofAccept + midAccept
+				ds = appendDataSegment(ds, classMapOff, classMap[:])
+				ds = appendDataSegment(ds, tableOff, tableBytes)
+				ds = appendDataSegment(ds, acceptOff, acceptBytes)
+				ds = appendDataSegment(ds, midAcceptOff, midAcceptBytes)
+			}
 		} else {
 			ds = append(ds, 0x03) // classMap + table + eofAccept
 			ds = appendDataSegment(ds, classMapOff, classMap[:])
@@ -558,10 +606,18 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 		}
 	} else {
 		if mode == ModeFind {
-			ds = append(ds, 0x03) // table + eofAccept + midAccept
-			ds = appendDataSegment(ds, tableOff, tableBytes)
-			ds = appendDataSegment(ds, acceptOff, acceptBytes)
-			ds = appendDataSegment(ds, midAcceptOff, midAcceptBytes)
+			if len(prefix) == 0 {
+				ds = append(ds, 0x04) // table + eofAccept + midAccept + firstByte
+				ds = appendDataSegment(ds, tableOff, tableBytes)
+				ds = appendDataSegment(ds, acceptOff, acceptBytes)
+				ds = appendDataSegment(ds, midAcceptOff, midAcceptBytes)
+				ds = appendDataSegment(ds, firstByteOff, firstByteFlags[:])
+			} else {
+				ds = append(ds, 0x03) // table + eofAccept + midAccept
+				ds = appendDataSegment(ds, tableOff, tableBytes)
+				ds = appendDataSegment(ds, acceptOff, acceptBytes)
+				ds = appendDataSegment(ds, midAcceptOff, midAcceptBytes)
+			}
 		} else {
 			ds = append(ds, 0x02) // table + eofAccept
 			ds = appendDataSegment(ds, tableOff, tableBytes)
@@ -791,6 +847,42 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 	return b
 }
 
+// computePrefix returns the longest literal byte prefix shared by all matches,
+// found by walking the DFA from midStartState while exactly one byte leads to a
+// non-dead state. Returns nil when the start state is accepting (pattern can
+// match empty string — no positions can safely be skipped).
+func computePrefix(t *dfaTable) []byte {
+	state := t.midStartState
+	if t.acceptStates[state] || t.midAcceptStates[state] {
+		return nil // accepting start state: pattern matches empty → can't skip
+	}
+	if t.startBeginAccept {
+		return nil // pattern matches empty at position 0 via begin anchor (e.g. a*^)
+	}
+	visited := map[int]bool{state: true}
+	var prefix []byte
+	for {
+		var only int = -1
+		count := 0
+		for b := 0; b < 256; b++ {
+			if t.transitions[state*256+b] >= 0 {
+				count++
+				only = b
+			}
+		}
+		if count != 1 {
+			break // ambiguous or dead → stop
+		}
+		prefix = append(prefix, byte(only))
+		state = t.transitions[state*256+only]
+		if visited[state] || t.acceptStates[state] || t.midAcceptStates[state] {
+			break // cycle or accepting state — prefix cannot extend further
+		}
+		visited[state] = true
+	}
+	return prefix
+}
+
 // buildFindBody returns the WASM function body for find mode.
 // The function scans for the leftmost-longest match and returns a packed i64:
 //
@@ -818,7 +910,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState uint32, tableOff, eofAcceptOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool) []byte {
+func buildFindBody(startState, midStartState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool) []byte {
 	var b []byte
 
 	// ── helper: emit the "pos >= len" handler ───────────────────────────────
@@ -865,37 +957,234 @@ func buildFindBody(startState, midStartState uint32, tableOff, eofAcceptOff, mid
 		return b
 	}
 
+	// simdMaskLocal: index of the i32 local for the combined bitmask.
+	// chunkLocal: index of the v128 local for the loaded 16-byte chunk.
+	// Both are set before each emitOuterPrologue call.
+	var simdMaskLocal byte
+	var chunkLocal byte
+
 	// ── helper: outer loop prologue ──────────────────────────────────────────
 	// Emits: if attempt_start >= len: br $no_match
 	//        state=startState, pos=attempt_start, last_accept=-1
 	//        if accept[state]: last_accept=pos  (start-state empty-match check)
 	emitOuterPrologue := func(b []byte) []byte {
-		// if attempt_start > len: br $no_match (depth 1 from $outer)
-		// Note: allow attempt_start == len for patterns that match empty string at end.
-		b = append(b, 0x20, 0x04) // local.get attempt_start
-		b = append(b, 0x20, 0x01) // local.get len
-		b = append(b, 0x4B)       // i32.gt_u
-		b = append(b, 0x0D, 0x01) // br_if 1 → exit $no_match
-		// state = (attempt_start == 0) ? startState : midStartState
-		// midStartState was computed without ecBegin so ^ and \A don't fire mid-string.
-		if startState == midStartState {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(startState))
-		} else {
+		if len(prefix) >= 1 {
+			// ── Hybrid SIMD prefix scan ───────────────────────────────────────
+			// One v128 load per 16-byte chunk.  Two-phase inner check:
+			//
+			//   Phase A (fast path): if prefix[0] absent in chunk → advance 16.
+			//   Phase B (slow path, only when prefix[0] found): compute combined
+			//     bitmask for ALL prefix bytes from the same v128 local (register
+			//     ops, no extra memory loads).  Combined != 0 → exact match.
+			//     Combined == 0 → advance by step=(17-N) for overlap coverage.
+			//
+			// This pays O(N) SIMD ops only on chunks that contain prefix[0],
+			// so rare first-byte patterns (e.g. 'g') stay fast.
+			//
+			// Block/loop nesting and br depths:
+			//
+			//   inside $simd_outer (loop, not in any if):
+			//     0=$simd_outer  1=$simd_exhausted  2=$prefix_matched
+			//     3=$outer  4=$no_match
+			//
+			//   inside outer if (mask_g != 0):
+			//     0=outerif  1=$simd_outer  2=$simd_exhausted  3=$prefix_matched
+			//     → br 1 restarts $simd_outer (combined==0 path)
+			//
+			//   inside inner if (combined != 0):
+			//     0=innerif  1=outerif  2=$simd_outer  3=$simd_exhausted
+			//     4=$prefix_matched
+			//     → br 4 exits $prefix_matched (match found)
+			//
+			//   inside $scalar (loop):
+			//     0=$scalar  1=$prefix_matched  2=$outer  3=$no_match
+			//     → br_if 3 = no_match;  mismatch ifs: br 1 restarts $scalar
+
+			step := 17 - len(prefix) // advance when prefix[0] found but full prefix absent
+			if step < 1 {
+				step = 1
+			}
+
+			b = append(b, 0x02, 0x40) // block $prefix_matched (void)
+			b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
+			b = append(b, 0x03, 0x40) // loop $simd_outer (void)
+
+			// if attempt_start + 15 >= len: br 1 → $simd_exhausted (scalar tail)
 			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x45)       // i32.eqz
-			b = append(b, 0x04, 0x7F) // if (result i32)
+			b = append(b, 0x41, 0x0F) // i32.const 15
+			b = append(b, 0x6A)       // i32.add
+			b = append(b, 0x20, 0x01) // local.get len
+			b = append(b, 0x4F)       // i32.ge_u
+			b = append(b, 0x0D, 0x01) // br_if 1 → $simd_exhausted
+
+			// Load 16 bytes once into v128 local.
+			b = append(b, 0x20, 0x00)              // local.get ptr
+			b = append(b, 0x20, 0x04)              // local.get attempt_start
+			b = append(b, 0x6A)                    // i32.add
+			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+			b = append(b, 0x21, chunkLocal)        // local.set chunk
+
+			// Phase A: mask for prefix[0] only.
+			b = append(b, 0x20, chunkLocal)    // local.get chunk
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(startState))
-			b = append(b, 0x05)       // else
+			b = utils.AppendSLEB128(b, int32(prefix[0]))
+			b = append(b, 0xFD, 0x0F)          // i8x16.splat
+			b = append(b, 0xFD, 0x23)          // i8x16.eq
+			b = append(b, 0xFD, 0x64)          // i8x16.bitmask → i32
+			b = append(b, 0x22, simdMaskLocal) // local.tee simdMask (store + keep on stack)
+
+			// if mask != 0: prefix[0] found → Phase B
+			b = append(b, 0x04, 0x40) // if (void): mask_g != 0  [outer if]
+
+			// Phase B: refine with prefix[1..] using same v128 local (register ops).
+			for k := 1; k < len(prefix); k++ {
+				b = append(b, 0x20, chunkLocal)    // local.get chunk  (register, no reload)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(prefix[k]))
+				b = append(b, 0xFD, 0x0F)          // i8x16.splat
+				b = append(b, 0xFD, 0x23)          // i8x16.eq
+				b = append(b, 0xFD, 0x64)          // i8x16.bitmask → i32
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(k))
+				b = append(b, 0x76)                // i32.shr_u  (align with prefix[0] positions)
+				b = append(b, 0x20, simdMaskLocal) // local.get simdMask
+				b = append(b, 0x71)                // i32.and
+				b = append(b, 0x21, simdMaskLocal) // local.set simdMask
+			}
+
+			// if combined != 0: exact match at ctz position  [inner if]
+			b = append(b, 0x20, simdMaskLocal) // local.get simdMask
+			b = append(b, 0x04, 0x40)          // if (void)
+			b = append(b, 0x20, 0x04)          // local.get attempt_start
+			b = append(b, 0x20, simdMaskLocal) // local.get simdMask
+			b = append(b, 0x68)                // i32.ctz
+			b = append(b, 0x6A)                // i32.add
+			b = append(b, 0x21, 0x04)          // local.set attempt_start
+			b = append(b, 0x0C, 0x04)          // br 4 → exit $prefix_matched
+			b = append(b, 0x0B)                // end inner if
+
+			// combined == 0: prefix[0] present but full prefix absent in window.
+			// Advance by step (overlap) so boundary positions are covered next.
+			b = append(b, 0x20, 0x04) // local.get attempt_start
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(midStartState))
-			b = append(b, 0x0B) // end if
+			b = utils.AppendSLEB128(b, int32(step))
+			b = append(b, 0x6A)       // i32.add
+			b = append(b, 0x21, 0x04) // local.set attempt_start
+			b = append(b, 0x0C, 0x01) // br 1 → restart $simd_outer
+			b = append(b, 0x0B)       // end outer if
+
+			// Phase A fast path: mask_g == 0, advance 16 and reload.
+			b = append(b, 0x20, 0x04) // local.get attempt_start
+			b = append(b, 0x41, 0x10) // i32.const 16
+			b = append(b, 0x6A)       // i32.add
+			b = append(b, 0x21, 0x04) // local.set attempt_start
+			b = append(b, 0x0C, 0x00) // br 0 → restart $simd_outer
+
+			b = append(b, 0x0B) // end loop $simd_outer
+			b = append(b, 0x0B) // end block $simd_exhausted
+
+			// ── Scalar tail (< 16 bytes remaining) ───────────────────────────
+			b = append(b, 0x03, 0x40) // loop $scalar (void)
+
+			b = append(b, 0x20, 0x04) // local.get attempt_start
+			b = append(b, 0x20, 0x01) // local.get len
+			b = append(b, 0x4F)       // i32.ge_u
+			b = append(b, 0x0D, 0x03) // br_if 3 → $no_match
+
+			for k := 0; k < len(prefix); k++ {
+				b = append(b, 0x20, 0x00) // local.get ptr
+				b = append(b, 0x20, 0x04) // local.get attempt_start
+				b = append(b, 0x6A)       // i32.add
+				b = append(b, 0x2D, 0x00) // i32.load8_u align=0 …
+				b = utils.AppendULEB128(b, uint32(k))
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(prefix[k]))
+				b = append(b, 0x47)       // i32.ne
+				b = append(b, 0x04, 0x40) // if (void): mismatch
+				b = append(b, 0x20, 0x04) // attempt_start++
+				b = append(b, 0x41, 0x01)
+				b = append(b, 0x6A)
+				b = append(b, 0x21, 0x04)
+				b = append(b, 0x0C, 0x01) // br 1 → restart $scalar
+				b = append(b, 0x0B)       // end if
+			}
+			b = append(b, 0x0B) // end loop $scalar  (fall-through = full match)
+			b = append(b, 0x0B) // end block $prefix_matched
+
+			// attempt_start now points at the start of the matched prefix.
+			// The > len check is not needed: prefix scan exits via br_if 3
+			// when attempt_start >= len, so we always have attempt_start < len here.
+		} else {
+			// ── firstByteFlags fallback ───────────────────────────────────────
+			// No unique literal prefix (e.g. combined alternating pattern).
+			// Use a 256-byte flag table to skip bytes that can't start a match.
+			//
+			// Depths from within $skip:
+			//   0=$skip(loop)  1=$skipdone(block)  2=$outer  3=$no_match
+			b = append(b, 0x02, 0x40) // block $skipdone (void)
+			b = append(b, 0x03, 0x40) // loop $skip (void)
+
+			b = append(b, 0x20, 0x04) // local.get attempt_start
+			b = append(b, 0x20, 0x01) // local.get len
+			b = append(b, 0x4F)       // i32.ge_u
+			b = append(b, 0x0D, 0x01) // br_if 1 → $skipdone
+
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, firstByteOff)
+			b = append(b, 0x20, 0x00)       // local.get ptr
+			b = append(b, 0x20, 0x04)       // local.get attempt_start
+			b = append(b, 0x6A)             // i32.add
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (byte)
+			b = append(b, 0x6A)             // firstByteOff + byte
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (flag)
+			b = append(b, 0x0D, 0x01)       // br_if 1 → $skipdone
+
+			b = append(b, 0x20, 0x04) // attempt_start++
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x6A)
+			b = append(b, 0x21, 0x04)
+			b = append(b, 0x0C, 0x00) // br 0 → $skip
+			b = append(b, 0x0B)       // end loop $skip
+			b = append(b, 0x0B)       // end block $skipdone
+
+			// Allow attempt_start == len for empty-string matches at end of input.
+			b = append(b, 0x20, 0x04) // local.get attempt_start
+			b = append(b, 0x20, 0x01) // local.get len
+			b = append(b, 0x4B)       // i32.gt_u
+			b = append(b, 0x0D, 0x01) // br_if 1 → $no_match
 		}
-		b = append(b, 0x21, 0x02) // local.set state
-		// pos = attempt_start
-		b = append(b, 0x20, 0x04) // local.get attempt_start
-		b = append(b, 0x21, 0x03) // local.set pos
+		if len(prefix) >= 1 {
+			// Prefix scan already consumed prefix bytes: start DFA from prefixEndState
+			// at pos = attempt_start + len(prefix), avoiding double-verification.
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(prefixEndState))
+			b = append(b, 0x21, 0x02) // state = prefixEndState
+			b = append(b, 0x20, 0x04) // local.get attempt_start
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(len(prefix)))
+			b = append(b, 0x6A)       // i32.add
+			b = append(b, 0x21, 0x03) // pos = attempt_start + prefix_len
+		} else {
+			// state = (attempt_start == 0) ? startState : midStartState
+			if startState == midStartState {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(startState))
+			} else {
+				b = append(b, 0x20, 0x04) // local.get attempt_start
+				b = append(b, 0x45)       // i32.eqz
+				b = append(b, 0x04, 0x7F) // if (result i32)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(startState))
+				b = append(b, 0x05) // else
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(midStartState))
+				b = append(b, 0x0B) // end if
+			}
+			b = append(b, 0x21, 0x02) // local.set state
+			// pos = attempt_start
+			b = append(b, 0x20, 0x04) // local.get attempt_start
+			b = append(b, 0x21, 0x03) // local.set pos
+		}
 		// last_accept = -1
 		b = append(b, 0x41, 0x7F) // i32.const -1
 		b = append(b, 0x21, 0x05) // local.set last_accept
@@ -909,6 +1198,16 @@ func buildFindBody(startState, midStartState uint32, tableOff, eofAcceptOff, mid
 		b = append(b, 0x20, 0x03)       // local.get pos
 		b = append(b, 0x21, 0x05)       // local.set last_accept
 		b = append(b, 0x0B)             // end if
+		// if startBeginAccept and attempt_start == 0: record empty match at position 0.
+		// Handles patterns like a*^ where startState accepts via ecBegin only.
+		if startBeginAccept {
+			b = append(b, 0x20, 0x04) // local.get attempt_start
+			b = append(b, 0x45)       // i32.eqz
+			b = append(b, 0x04, 0x40) // if (void)
+			b = append(b, 0x20, 0x03) // local.get pos
+			b = append(b, 0x21, 0x05) // local.set last_accept
+			b = append(b, 0x0B)       // end if
+		}
 		return b
 	}
 
@@ -933,10 +1232,12 @@ func buildFindBody(startState, midStartState uint32, tableOff, eofAcceptOff, mid
 
 	if useU8 && useCompression {
 		// ── u8 compressed find path ───────────────────────────────────────────
-		// 5 locals: state(2), pos(3), attempt_start(4), last_accept(5), class(6)
-		b = append(b, 0x01, 0x05, 0x7F)
+		// 6 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),simdMask(7),chunk(8)
+		b = append(b, 0x02, 0x06, 0x7F, 0x01, 0x7B)
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x03, 0x40) // loop $outer
+		simdMaskLocal = 7
+		chunkLocal = 8
 		b = emitOuterPrologue(b)
 		b = append(b, 0x02, 0x40) // block $found
 		b = append(b, 0x03, 0x40) // loop $scan
@@ -1007,10 +1308,12 @@ func buildFindBody(startState, midStartState uint32, tableOff, eofAcceptOff, mid
 
 	if useU8 {
 		// ── u8 simple find path ───────────────────────────────────────────────
-		// 4 locals: state(2), pos(3), attempt_start(4), last_accept(5)
-		b = append(b, 0x01, 0x04, 0x7F)
+		// 5 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),simdMask(6),chunk(7)
+		b = append(b, 0x02, 0x05, 0x7F, 0x01, 0x7B)
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x03, 0x40) // loop $outer
+		simdMaskLocal = 6
+		chunkLocal = 7
 		b = emitOuterPrologue(b)
 		b = append(b, 0x02, 0x40) // block $found
 		b = append(b, 0x03, 0x40) // loop $scan
@@ -1071,10 +1374,12 @@ func buildFindBody(startState, midStartState uint32, tableOff, eofAcceptOff, mid
 	}
 
 	// ── u16 find path ─────────────────────────────────────────────────────────
-	// 5 locals: state(2), pos(3), attempt_start(4), last_accept(5), byte(6)
-	b = append(b, 0x01, 0x05, 0x7F)
+	// 6 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),byte(6),simdMask(7),chunk(8)
+	b = append(b, 0x02, 0x06, 0x7F, 0x01, 0x7B)
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $outer
+	simdMaskLocal = 7
+	chunkLocal = 8
 	b = emitOuterPrologue(b)
 	b = append(b, 0x02, 0x40) // block $found
 	b = append(b, 0x03, 0x40) // loop $scan

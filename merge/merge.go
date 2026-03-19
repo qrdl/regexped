@@ -75,7 +75,7 @@ func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
 		module := moduleNameForWasm(cfg, path)
 		mergeArgs = append(mergeArgs, path, module)
 	}
-	mergeArgs = append(mergeArgs, "--rename-export-conflicts", "-o", output)
+	mergeArgs = append(mergeArgs, "--rename-export-conflicts", "--enable-simd", "-o", output)
 
 	if err := runCmd(wasmMergeCmd, mergeArgs, "", nil); err != nil {
 		return fmt.Errorf("wasm-merge: %w", err)

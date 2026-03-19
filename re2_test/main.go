@@ -76,6 +76,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 		lineno    int
 		npass     int
 		nfail     int
+		ncases    int
 		stopped   bool
 		skipCount = make(map[string]int)
 	)
@@ -199,6 +200,10 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				continue
 			}
 
+			ncases++
+			if ncases%500000 == 0 {
+				fmt.Fprintf(os.Stderr, "  ... %dK cases\n", ncases/1000)
+			}
 			results := strings.Split(line, ";")
 			if len(results) != 4 {
 				return fmt.Errorf("%s:%d: expected 4 results, got %d", testFile, lineno, len(results))

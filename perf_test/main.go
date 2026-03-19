@@ -77,6 +77,57 @@ var tests = []testCase{
 			{"no-match", "not-a-url"},
 		},
 	},
+	// ── Secret detection ─────────────────────────────────────────────────────
+	// All three patterns have a well-defined literal prefix; find mode scans a
+	// ~10 KB config file. These cases establish a baseline before literal-prefix
+	// optimisation is implemented.
+	{
+		// JWT: prefix "eyJ" (base64url of '{"'). 'e' is very common in config
+		// files, so the DFA restarts frequently — ideal for prefix optimisation.
+		name:    "secrets-jwt",
+		pattern: `eyJ[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-secret ~10KB", secretBaseInput("")},
+			{"with-secret ~10KB", secretBaseInput(
+				"export AUTH_TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+					"eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ." +
+					"SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c")},
+		},
+	},
+	{
+		// GitHub PAT: prefix "ghp_". 'g' is moderately common.
+		name:    "secrets-github",
+		pattern: `ghp_[A-Za-z0-9]{36}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-secret ~10KB", secretBaseInput("")},
+			{"with-secret ~10KB", secretBaseInput("ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab")},
+		},
+	},
+	{
+		// AWS access key: prefix "AKIA". 'A' is common (API, AWS, APP variables).
+		name:    "secrets-aws",
+		pattern: `AKIA[A-Z0-9]{16}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-secret ~10KB", secretBaseInput("")},
+			{"with-secret ~10KB", secretBaseInput("export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE")},
+		},
+	},
+	{
+		// Combined: single DFA covering all three secret types.
+		// Fast-skip uses union first-byte set {e, g, A} — skips all other bytes.
+		name:    "secrets-combined",
+		pattern: `eyJ[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+|ghp_[A-Za-z0-9]{36}|AKIA[A-Z0-9]{16}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-secret ~10KB", secretBaseInput("")},
+			{"JWT ~10KB", secretBaseInput("export AUTH_TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c")},
+			{"GitHub ~10KB", secretBaseInput("ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab")},
+			{"AWS ~10KB", secretBaseInput("export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE")},
+		},
+	},
 	{
 		name:    "sql-inject",
 		pattern: `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`,
@@ -86,6 +137,41 @@ var tests = []testCase{
 			{"injected ~1KB", sqlInjectInput()},
 		},
 	},
+}
+
+// secretBaseInput returns a ~10KB environment/config file with many 'e', 'g', 'A'
+// characters (common prefix chars for JWT, GitHub, AWS patterns) but no secrets.
+// insertAt controls where the secret is spliced in (use -1 for no secret).
+func secretBaseInput(secret string) string {
+	// Realistic env file block — high density of 'e', 'g', 'A' characters.
+	const block = `# Application Configuration
+export APP_ENV=production
+export DATABASE_URL=postgres://appuser:secure_password@db.example.com:5432/appdb
+export REDIS_URL=redis://cache.example.com:6379/0
+export EMAIL_HOST=smtp.example.com
+export EMAIL_FROM=noreply@example.com
+export ENABLE_METRICS=true
+export METRICS_ENDPOINT=http://metrics.example.com:9090/metrics
+export LOG_LEVEL=error
+export LOG_FORMAT=json
+export API_BASE_URL=https://api.example.com/v2
+export API_TIMEOUT=30000
+export MAX_CONNECTIONS=100
+export ENABLE_CACHE=true
+export CACHE_TTL=3600
+export SESSION_SECRET=change_me_in_production
+export GITHUB_ORG=example-org
+export GITHUB_REPO=example-repo
+export AWS_REGION=us-east-1
+export AWS_S3_BUCKET=example-data-bucket
+export ENCRYPTION_KEY=replace_with_actual_key
+`
+	base := strings.Repeat(block, 14) // ~10 KB
+	if secret == "" {
+		return base
+	}
+	mid := len(base) / 2
+	return base[:mid] + secret + "\n" + base[mid:]
 }
 
 func sqlCleanInput() string {
