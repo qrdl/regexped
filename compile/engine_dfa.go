@@ -2,8 +2,6 @@ package compile
 
 import (
 	"encoding/binary"
-	"fmt"
-	"os"
 	"regexp/syntax"
 	"unicode"
 
@@ -316,7 +314,7 @@ func computeByteClasses(t *dfaTable) (classMap [256]byte, classRep []int, numCla
 //
 // The module imports memory as (import "main" "memory" (memory 0)) so that
 // wasm-merge can resolve it against the host module's exported memory.
-func genWASM(t *dfaTable, tableBase int64, exportName string) []byte {
+func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, memPages int32) []byte {
 	// WASM states: 0 = dead/sink, 1..N = Go states 0..N-1
 	numWASM := t.numStates + 1
 	wasmStart := uint32(t.startState + 1)
@@ -341,7 +339,6 @@ func genWASM(t *dfaTable, tableBase int64, exportName string) []byte {
 		classMapOff = int32(tableBase)
 		tableOff = int32(tableBase) + 256
 		classMap, classRep, numClasses = computeByteClasses(t)
-		fmt.Fprintf(os.Stderr, "    Byte classes: %d (compressed)\n", numClasses)
 	} else {
 		tableOff = int32(tableBase)
 	}
@@ -408,18 +405,29 @@ func genWASM(t *dfaTable, tableBase int64, exportName string) []byte {
 	}
 	out = appendSection(out, 1, ts)
 
-	// ── Import section (id=2): (import "main" "memory" (memory 0)) ───────────
-	var is []byte
-	is = append(is, 0x01) // 1 import
-	is = appendString(is, "main")
-	is = appendString(is, "memory")
-	is = append(is, 0x02)              // memory
-	is = append(is, 0x00)              // limit type: min only (no max)
-	is = utils.AppendULEB128(is, 0x00) // min 0 pages
-	out = appendSection(out, 2, is)
+	if !standalone {
+		// ── Import section (id=2): (import "main" "memory" (memory 0)) ───────
+		var is []byte
+		is = append(is, 0x01) // 1 import
+		is = appendString(is, "main")
+		is = appendString(is, "memory")
+		is = append(is, 0x02)              // memory
+		is = append(is, 0x00)              // limit type: min only (no max)
+		is = utils.AppendULEB128(is, 0x00) // min 0 pages
+		out = appendSection(out, 2, is)
+	}
 
 	// ── Function section (id=3): 1 function using type 0 ────────────────────
 	out = appendSection(out, 3, []byte{0x01, 0x00})
+
+	if standalone {
+		// ── Memory section (id=5): define own memory ─────────────────────────
+		var ms []byte
+		ms = append(ms, 0x01)                         // 1 memory
+		ms = append(ms, 0x00)                         // limit type: min only
+		ms = utils.AppendULEB128(ms, uint32(memPages)) // min N pages
+		out = appendSection(out, 5, ms)
+	}
 
 	// ── Export section (id=7): export function as func 0 ────────────────────
 	var es []byte

@@ -56,14 +56,8 @@ type CompileOptions struct {
 	ForceEngine        EngineType // If non-zero, skip engine selection and use this engine type
 }
 
-// regexResult holds the memory layout output of compiling a single regex.
-type regexResult struct {
-	tableEnd      int64
-	initialMemory int64
-}
-
-// CmdCompile compiles all regex patterns from cfg to WASM modules and stub
-// files. wasmInput is a pre-built WASM file used to determine where in memory
+// CmdCompile compiles all regex patterns from cfg to WASM modules.
+// wasmInput is a pre-built WASM file used to determine where in memory
 // to place the DFA tables.
 func CmdCompile(cfg config.BuildConfig, wasmInput, outDir string) error {
 	rustTop, err := utils.RustMemTop(wasmInput)
@@ -75,29 +69,32 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir string) error {
 
 	tableBase := utils.PageAlign(rustTop)
 	for i, re := range cfg.Regexes {
-		fmt.Fprintf(os.Stderr, "    [%d/%d] module=%s  wasm=%s  stub=src/%s\n",
-			i+1, len(cfg.Regexes), re.ImportModule, re.WasmFile, re.StubFile)
+		fmt.Fprintf(os.Stderr, "    [%d/%d] module=%s  wasm=%s\n",
+			i+1, len(cfg.Regexes), re.ImportModule, re.WasmFile)
 
-		res, err := compileRegex(
-			re.Pattern, outDir, re.WasmFile,
-			re.ExportName, tableBase,
-		)
+		wasmBytes, tableEnd, err := CompileRegex(re.Pattern, re.ExportName, tableBase, false)
 		if err != nil {
 			return fmt.Errorf("compile regex %d (%s): %w", i+1, re.ImportModule, err)
 		}
-		fmt.Fprintf(os.Stderr, "        table_end=%d\n", res.tableEnd)
-		tableBase = res.tableEnd
+
+		wasmPath := filepath.Join(outDir, re.WasmFile)
+		if err := os.WriteFile(wasmPath, wasmBytes, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", wasmPath, err)
+		}
+		fmt.Fprintf(os.Stderr, "        table_end=%d  written %s (%d bytes)\n",
+			tableEnd, wasmPath, len(wasmBytes))
+		tableBase = tableEnd
 	}
 	fmt.Fprintln(os.Stderr, "==> Done.")
 	return nil
 }
 
-// compileRegex compiles a single regex pattern to a WASM DFA,
+// CompileRegex compiles a single regex pattern to WASM bytes.
 // tableBase must be page-aligned and >= 0.
-func compileRegex(
-	pattern, outDir, wasmFile, exportName string,
-	tableBase int64,
-) (regexResult, error) {
+// If standalone is true, the module defines its own memory (suitable for testing);
+// otherwise it imports memory from the "main" module.
+// Returns the WASM bytes and the next available table base (page-aligned end of this module's data).
+func CompileRegex(pattern, exportName string, tableBase int64, standalone bool) ([]byte, int64, error) {
 	opts := CompileOptions{
 		MaxDFAStates: 100000,
 		Unicode:      false,
@@ -105,15 +102,12 @@ func compileRegex(
 	}
 	matcher, err := compile(pattern, opts)
 	if err != nil {
-		return regexResult{}, fmt.Errorf("compile error: %w", err)
+		return nil, 0, fmt.Errorf("compile error: %w", err)
 	}
 	if matcher.Type() != EngineDFA {
-		return regexResult{}, fmt.Errorf("unexpected engine %v (wanted DFA)", matcher.Type())
+		return nil, 0, fmt.Errorf("unexpected engine %v (wanted DFA)", matcher.Type())
 	}
 	table := dfaTableFrom(matcher.(*dfa))
-
-	fmt.Fprintf(os.Stderr, "DFA: %d states, start=%d, %d accept states\n",
-		table.numStates, table.startState, len(table.acceptStates))
 
 	numWASM := table.numStates + 1
 	var dfaSize int64
@@ -127,28 +121,11 @@ func compileRegex(
 		dfaSize = int64(numWASM*256*2 + numWASM)
 	}
 
-	fmt.Fprintf(os.Stderr, "Table base: %d (0x%x), DFA size: %d\n", tableBase, tableBase, dfaSize)
+	tableEnd := utils.PageAlign(tableBase + dfaSize)
+	memPages := int32(tableEnd / 65536)
 
-	initialMemory := utils.PageAlign(tableBase + dfaSize)
-
-	wasmBytes := genWASM(table, tableBase, exportName)
-	wasmPath := filepath.Join(outDir, wasmFile)
-	if err := os.WriteFile(wasmPath, wasmBytes, 0o644); err != nil {
-		return regexResult{}, fmt.Errorf("write %s: %w", wasmPath, err)
-	}
-	fmt.Fprintf(os.Stderr, "Written %s (%d bytes)\n", wasmPath, len(wasmBytes))
-
-	if err := os.MkdirAll(filepath.Join(outDir, "src"), 0o755); err != nil {
-		return regexResult{}, fmt.Errorf("mkdir %s/src: %w", outDir, err)
-	}
-	/*	stubsPath := filepath.Join(outDir, "src", stubFile)
-		stubs := genRustStubs(pattern, importModule, exportName, funcName)
-		if err := os.WriteFile(stubsPath, []byte(stubs), 0o644); err != nil {
-			return regexResult{}, fmt.Errorf("write %s: %w", stubsPath, err)
-		}
-		fmt.Fprintf(os.Stderr, "Written %s\n", stubsPath) */
-
-	return regexResult{tableEnd: initialMemory, initialMemory: initialMemory}, nil
+	wasmBytes := genWASM(table, tableBase, exportName, standalone, memPages)
+	return wasmBytes, tableEnd, nil
 }
 
 // compile parses the pattern, selects the optimal engine, and returns a compiled Matcher.
