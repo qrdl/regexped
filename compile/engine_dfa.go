@@ -61,8 +61,18 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 	}
 	queue := []workItem{}
 
-	// Compute epsilon closure of NFA states
-	epsilonClosure := func(states []uint32) []uint32 {
+	// Context flags for epsilon closure: controls which empty-width assertions are followed.
+	// ecBegin: follow EmptyBeginText (\A) and EmptyBeginLine (^) — valid only at start of input.
+	// ecEnd:   follow EmptyEndText (\z) and EmptyEndLine ($)   — valid only at end of input.
+	// Mid-string transitions use ctx=0 so no anchors are followed, which prevents impossible
+	// sequences like (?:\z)(?:.+) or (?:.+)(?:\A) from appearing reachable.
+	const (
+		ecBegin = 1
+		ecEnd   = 2
+	)
+
+	// Compute epsilon closure of NFA states, respecting anchor context.
+	epsilonClosure := func(states []uint32, ctx int) []uint32 {
 		visited := make(map[uint32]bool)
 		result := []uint32{}
 		stack := append([]uint32{}, states...)
@@ -84,7 +94,18 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 			case syntax.InstCapture, syntax.InstNop:
 				stack = append(stack, inst.Out)
 			case syntax.InstEmptyWidth:
-				stack = append(stack, inst.Out)
+				emptyOp := syntax.EmptyOp(inst.Arg)
+				follow := false
+				if emptyOp&(syntax.EmptyBeginText|syntax.EmptyBeginLine) != 0 {
+					follow = (ctx & ecBegin) != 0
+				}
+				if emptyOp&(syntax.EmptyEndText|syntax.EmptyEndLine) != 0 {
+					follow = (ctx & ecEnd) != 0
+				}
+				// EmptyWordBoundary / EmptyNoWordBoundary: never follow in DFA construction.
+				if follow {
+					stack = append(stack, inst.Out)
+				}
 			}
 		}
 		return result
@@ -103,9 +124,13 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 		return key
 	}
 
-	// Check if any state in set is accepting
-	isAccepting := func(states []uint32) bool {
-		for _, pc := range states {
+	// Check if any state in set is accepting when at end of input.
+	// ctx controls which anchor types are expanded:
+	//   ecEnd        — for states reached after consuming bytes (only end-anchors valid)
+	//   ecBegin|ecEnd — for the start state (empty string satisfies both begin and end)
+	isAccepting := func(states []uint32, ctx int) bool {
+		expanded := epsilonClosure(states, ctx)
+		for _, pc := range expanded {
 			if prog.Inst[pc].Op == syntax.InstMatch {
 				return true
 			}
@@ -113,14 +138,14 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 		return false
 	}
 
-	// Start state: epsilon closure of NFA start
-	startSet := epsilonClosure([]uint32{uint32(prog.Start)})
+	// Start state: epsilon closure of NFA start, following begin-anchors (^ and \A).
+	startSet := epsilonClosure([]uint32{uint32(prog.Start)}, ecBegin)
 	startKey := setToKey(startSet)
 	dfa.start = 0
 	stateMap[startKey] = 0
 	nextStateID++
 
-	if isAccepting(startSet) {
+	if isAccepting(startSet, ecBegin|ecEnd) {
 		dfa.accepting[0] = true
 	}
 
@@ -163,31 +188,44 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 						minRune = inst.Rune[i]
 						maxRune = inst.Rune[i+1]
 					}
-					if maxRune-minRune < 256 {
-						for r := minRune; r <= maxRune; r++ {
-							inputMap[r] = append(inputMap[r], inst.Out)
+					// Clamp to byte range: ranges like 0x62-0x10FFFF still cover
+					// bytes 0x62-0xFF that belong in the DFA transition table.
+					lo := minRune
+					hi := maxRune
+					if hi > 0xFF {
+						hi = 0xFF
+					}
+					for r := lo; r <= hi; r++ {
+						inputMap[r] = append(inputMap[r], inst.Out)
 
-							if isFoldCase {
-								seen := make(map[rune]bool)
-								seen[r] = true
-								for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
-									if !seen[folded] && (folded < minRune || folded > maxRune) {
-										seen[folded] = true
-										inputMap[folded] = append(inputMap[folded], inst.Out)
-									}
+						if isFoldCase {
+							seen := make(map[rune]bool)
+							seen[r] = true
+							for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+								if !seen[folded] && (folded < minRune || folded > maxRune) {
+									seen[folded] = true
+									inputMap[folded] = append(inputMap[folded], inst.Out)
 								}
 							}
 						}
 					}
 				}
 
-			case syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
-				// Not supported by DFA subset construction
+			case syntax.InstRuneAny:
+				for b := 0; b < 256; b++ {
+					inputMap[rune(b)] = append(inputMap[rune(b)], inst.Out)
+				}
+			case syntax.InstRuneAnyNotNL:
+				for b := 0; b < 256; b++ {
+					if b != '\n' {
+						inputMap[rune(b)] = append(inputMap[rune(b)], inst.Out)
+					}
+				}
 			}
 		}
 
 		for r, nextNFAStates := range inputMap {
-			nextSet := epsilonClosure(nextNFAStates)
+			nextSet := epsilonClosure(nextNFAStates, 0)
 			nextKey := setToKey(nextSet)
 
 			nextDFAState, exists := stateMap[nextKey]
@@ -196,7 +234,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool) *dfa {
 				stateMap[nextKey] = nextStateID
 				nextStateID++
 
-				if isAccepting(nextSet) {
+				if isAccepting(nextSet, ecEnd) {
 					dfa.accepting[nextDFAState] = true
 				}
 
@@ -429,11 +467,18 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 		out = appendSection(out, 5, ms)
 	}
 
-	// ── Export section (id=7): export function as func 0 ────────────────────
+	// ── Export section (id=7) ────────────────────────────────────────────────
 	var es []byte
-	es = append(es, 0x01) // 1 export
+	if standalone {
+		es = append(es, 0x02)              // 2 exports: memory + func
+		es = appendString(es, "memory")    // export memory so host can write inputs
+		es = append(es, 0x02)              // memory kind
+		es = utils.AppendULEB128(es, 0x00) // memory index 0
+	} else {
+		es = append(es, 0x01) // 1 export: func only
+	}
 	es = appendString(es, exportName)
-	es = append(es, 0x00) // func
+	es = append(es, 0x00) // func kind
 	es = utils.AppendULEB128(es, 0x00)
 	out = appendSection(out, 7, es)
 

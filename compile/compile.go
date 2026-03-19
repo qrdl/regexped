@@ -94,11 +94,15 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir string) error {
 // If standalone is true, the module defines its own memory (suitable for testing);
 // otherwise it imports memory from the "main" module.
 // Returns the WASM bytes and the next available table base (page-aligned end of this module's data).
-func CompileRegex(pattern, exportName string, tableBase int64, standalone bool) ([]byte, int64, error) {
+// An optional CompileOptions argument overrides the defaults.
+func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, userOpts ...CompileOptions) ([]byte, int64, error) {
 	opts := CompileOptions{
 		MaxDFAStates: 100000,
 		Unicode:      false,
 		ForceEngine:  EngineDFA,
+	}
+	if len(userOpts) > 0 {
+		opts = userOpts[0]
 	}
 	matcher, err := compile(pattern, opts)
 	if err != nil {
@@ -108,6 +112,10 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool) 
 		return nil, 0, fmt.Errorf("unexpected engine %v (wanted DFA)", matcher.Type())
 	}
 	table := dfaTableFrom(matcher.(*dfa))
+
+	if opts.MaxDFAStates > 0 && table.numStates > opts.MaxDFAStates {
+		return nil, 0, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, opts.MaxDFAStates)
+	}
 
 	numWASM := table.numStates + 1
 	var dfaSize int64

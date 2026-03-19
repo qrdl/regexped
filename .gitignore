@@ -34,3 +34,4 @@ tmp
 regexped
 target
 perf_test/out
+re2_test/*.txt
