@@ -929,6 +929,68 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 		}
 	}
 
+	// ── SIMD strategy for firstByteFlags path ─────────────────────────────
+	// Collect the set of first bytes S (bytes where firstByteFlags[b] != 0).
+	// |S| determines which scan strategy to use in find mode:
+	//   |S| <= 8:        Teddy nibble-based scan (preferred)
+	//   8 < |S| <= 16:   Multi-eq SIMD scan
+	//   |S| > 16 or all: Scalar table-lookup (unchanged)
+	var firstBytes []byte
+	var teddyLoOff, teddyHiOff int32
+	var teddyLoBytes, teddyHiBytes []byte // 16-byte nibble tables for 1-byte Teddy
+	var teddyT1LoOff, teddyT1HiOff int32
+	var teddyT1LoBytes, teddyT1HiBytes []byte // 16-byte nibble tables for 2-byte Teddy
+	if mode == ModeFind && len(prefix) == 0 {
+		for bv := 0; bv < 256; bv++ {
+			if firstByteFlags[bv] != 0 {
+				firstBytes = append(firstBytes, byte(bv))
+			}
+		}
+		if len(firstBytes) <= 8 {
+			// 1-byte Teddy tables (T0) immediately follow the firstByteFlags table.
+			teddyLoOff = firstByteOff + 256
+			teddyHiOff = teddyLoOff + 16
+			teddyLoBytes = make([]byte, 16)
+			teddyHiBytes = make([]byte, 16)
+			for i, fb := range firstBytes {
+				teddyLoBytes[fb&0x0F] |= byte(1 << uint(i))
+				teddyHiBytes[fb>>4] |= byte(1 << uint(i))
+			}
+
+			// 2-byte Teddy tables (T1): built by walking one DFA step from midStartState
+			// on each first byte and collecting the valid second bytes.
+			// Only used when each first byte leads to ≤ 64 valid second bytes.
+			t1Lo := make([]byte, 16)
+			t1Hi := make([]byte, 16)
+			useTwoByte := true
+			for i, fb := range firstBytes {
+				stateAfterFB := t.transitions[t.midStartState*256+int(fb)]
+				if stateAfterFB < 0 {
+					useTwoByte = false
+					break
+				}
+				validCount := 0
+				for b2 := 0; b2 < 256; b2++ {
+					if t.transitions[stateAfterFB*256+b2] >= 0 {
+						validCount++
+						t1Lo[b2&0x0F] |= byte(1 << uint(i))
+						t1Hi[b2>>4] |= byte(1 << uint(i))
+					}
+				}
+				if validCount > 64 {
+					useTwoByte = false
+					break
+				}
+			}
+			if useTwoByte {
+				teddyT1LoBytes = t1Lo
+				teddyT1HiBytes = t1Hi
+				teddyT1LoOff = teddyHiOff + 16
+				teddyT1HiOff = teddyT1LoOff + 16
+			}
+		}
+	}
+
 	var out []byte
 
 	// ── Magic + version ──────────────────────────────────────────────────────
@@ -1000,7 +1062,7 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 	}
 	wasmPrefixEnd := uint32(prefixEndState + 1)
 	if mode == ModeFind {
-		body = buildFindBody(wasmStart, wasmMidStart, wasmMidStartWord, wasmPrefixEnd, tableOff, acceptOff, midAcceptOff, firstByteOff, prefix, classMapOff, numClasses, useU8, useCompression, t.startBeginAccept, immediateAcceptOff, leftmostFirst && len(t.immediateAcceptStates) > 0, wordCharTableOff, needWordCharTable, midAcceptNWOff, midAcceptWOff)
+		body = buildFindBody(wasmStart, wasmMidStart, wasmMidStartWord, wasmPrefixEnd, tableOff, acceptOff, midAcceptOff, firstByteOff, prefix, classMapOff, numClasses, useU8, useCompression, t.startBeginAccept, immediateAcceptOff, leftmostFirst && len(t.immediateAcceptStates) > 0, wordCharTableOff, needWordCharTable, midAcceptNWOff, midAcceptWOff, firstByteFlags, firstBytes, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff, len(teddyT1LoBytes) > 0)
 	} else {
 		body = buildMatchBody(wasmStart, tableOff, acceptOff, classMapOff, numClasses, useU8, useCompression, immediateAcceptOff, leftmostFirst && len(t.immediateAcceptStates) > 0)
 	}
@@ -1046,6 +1108,16 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 		return n
 	}
 
+	// teddySegs: extra data segments for Teddy nibble tables (T_lo + T_hi).
+	// Only emitted in find mode, no-prefix path, when |firstBytes| <= 8.
+	teddyExtraSegs := byte(0)
+	if len(teddyLoBytes) > 0 {
+		teddyExtraSegs = 2
+		if len(teddyT1LoBytes) > 0 {
+			teddyExtraSegs = 4
+		}
+	}
+
 	if useCompression {
 		if mode == ModeFind {
 			// base: classMap + table + eofAccept + midAccept = 4
@@ -1053,9 +1125,17 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 			transSegs = appendDataSegment(transSegs, classMapOff, classMap[:])
 			transSegs = appendDataSegment(transSegs, tableOff, tableBytes)
 			if len(prefix) == 0 {
-				ds = append(ds, findSegCount(5)) // +firstByte
+				ds = append(ds, findSegCount(5)+teddyExtraSegs) // +firstByte [+teddyLo +teddyHi]
 				ds = emitFindSegs(ds, transSegs)
 				ds = appendDataSegment(ds, firstByteOff, firstByteFlags[:])
+				if len(teddyLoBytes) > 0 {
+					ds = appendDataSegment(ds, teddyLoOff, teddyLoBytes)
+					ds = appendDataSegment(ds, teddyHiOff, teddyHiBytes)
+					if len(teddyT1LoBytes) > 0 {
+						ds = appendDataSegment(ds, teddyT1LoOff, teddyT1LoBytes)
+						ds = appendDataSegment(ds, teddyT1HiOff, teddyT1HiBytes)
+					}
+				}
 			} else {
 				ds = append(ds, findSegCount(4))
 				ds = emitFindSegs(ds, transSegs)
@@ -1079,9 +1159,17 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 			var transSegs []byte
 			transSegs = appendDataSegment(transSegs, tableOff, tableBytes)
 			if len(prefix) == 0 {
-				ds = append(ds, findSegCount(4)) // +firstByte
+				ds = append(ds, findSegCount(4)+teddyExtraSegs) // +firstByte [+teddyLo +teddyHi]
 				ds = emitFindSegs(ds, transSegs)
 				ds = appendDataSegment(ds, firstByteOff, firstByteFlags[:])
+				if len(teddyLoBytes) > 0 {
+					ds = appendDataSegment(ds, teddyLoOff, teddyLoBytes)
+					ds = appendDataSegment(ds, teddyHiOff, teddyHiBytes)
+					if len(teddyT1LoBytes) > 0 {
+						ds = appendDataSegment(ds, teddyT1LoOff, teddyT1LoBytes)
+						ds = appendDataSegment(ds, teddyT1HiOff, teddyT1HiBytes)
+					}
+				}
 			} else {
 				ds = append(ds, findSegCount(3))
 				ds = emitFindSegs(ds, transSegs)
@@ -1408,7 +1496,7 @@ func computePrefix(t *dfaTable) []byte {
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool) []byte {
 	var b []byte
 
 	// emitImmAcceptCheckFind emits: if immediateAccept[state]: last_accept=pos+1; br 2→$found
@@ -1541,10 +1629,20 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 	}
 
 	// simdMaskLocal: index of the i32 local for the combined bitmask.
-	// chunkLocal: index of the v128 local for the loaded 16-byte chunk.
-	// Both are set before each emitOuterPrologue call.
+	// chunkLocal:    index of the v128 local for the loaded 16-byte chunk (byte 0).
+	// tLoLocal:      index of the v128 local for T0_lo (pre-loaded, 1-byte Teddy).
+	// tHiLocal:      index of the v128 local for T0_hi (pre-loaded, 1-byte Teddy).
+	// chunk1Local:   index of the v128 local for chunk at offset+1 (2-byte Teddy).
+	// t1LoLocal:     index of the v128 local for T1_lo (pre-loaded, 2-byte Teddy).
+	// t1HiLocal:     index of the v128 local for T1_hi (pre-loaded, 2-byte Teddy).
+	// All set before each emitOuterPrologue call.
 	var simdMaskLocal byte
 	var chunkLocal byte
+	var tLoLocal byte
+	var tHiLocal byte
+	var chunk1Local byte
+	var t1LoLocal byte
+	var t1HiLocal byte
 
 	// ── helper: outer loop prologue ──────────────────────────────────────────
 	// Emits: if attempt_start >= len: br $no_match
@@ -1698,19 +1796,208 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 			// The > len check is not needed: prefix scan exits via br_if 3
 			// when attempt_start >= len, so we always have attempt_start < len here.
 		} else {
-			// ── firstByteFlags fallback ───────────────────────────────────────
+			// ── firstByteFlags / SIMD fast-skip ───────────────────────────────
 			// No unique literal prefix (e.g. combined alternating pattern).
-			// Use a 256-byte flag table to skip bytes that can't start a match.
+			// Strategy based on |firstBytes| (= number of distinct first bytes):
+			//   |S| <= 8:       Teddy nibble SIMD (two 16-byte lookup tables)
+			//   8 < |S| <= 16:  Multi-eq SIMD (OR of |S| equality masks)
+			//   |S| > 16:       Scalar 256-byte flag table (unchanged)
 			//
+			// For SIMD paths the structure is:
+			//   block $found_candidate
+			//     block $simd_exhausted
+			//       loop $simd_outer
+			//         ;; depths: 0=$simd_outer 1=$simd_exhausted 2=$found_candidate
+			//         ;;         3=$outer 4=$no_match
+			//         if attempt_start+15 >= len → br 1 ($simd_exhausted)
+			//         [compute 16-byte mask for this chunk]
+			//         if mask != 0: attempt_start += ctz; br 2 ($found_candidate)
+			//         attempt_start += 16; br 0
+			//       end loop
+			//     end $simd_exhausted
+			//     ;; scalar tail (< 16 bytes remaining) uses firstByteFlags
+			//     block $skipdone
+			//       loop $skip
+			//         ;; depths: 0=$skip 1=$skipdone 2=$found_candidate 3=$outer 4=$no_match
+			//         if attempt_start >= len → br 1
+			//         if firstByteFlags[byte] → br 2 ($found_candidate)
+			//         attempt_start++; br 0
+			//       end loop
+			//     end $skipdone
+			//   end $found_candidate
+			//   if attempt_start > len → br 1 ($no_match)
+			//
+			// For scalar-only path the structure is unchanged (no wrapper block).
+
+			useSIMD := len(firstBytes) > 0 && len(firstBytes) <= 16
+
+			if useSIMD {
+				// Pre-load Teddy tables into v128 locals once before the loop (loop-invariant).
+				if len(firstBytes) <= 8 {
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, teddyLoOff)
+					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T_lo
+					b = append(b, 0x21, tLoLocal)          // local.set tLoLocal
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, teddyHiOff)
+					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T_hi
+					b = append(b, 0x21, tHiLocal)          // local.set tHiLocal
+					// Pre-load T1 tables for 2-byte Teddy if available.
+					if teddyTwoByte {
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, teddyT1LoOff)
+						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T1_lo
+						b = append(b, 0x21, t1LoLocal)         // local.set t1LoLocal
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, teddyT1HiOff)
+						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T1_hi
+						b = append(b, 0x21, t1HiLocal)         // local.set t1HiLocal
+					}
+				}
+
+				b = append(b, 0x02, 0x40) // block $found_candidate (void)
+				b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
+				b = append(b, 0x03, 0x40) // loop $simd_outer (void)
+
+				// Bounds: need 16 bytes for 1-byte Teddy, 17 for 2-byte (chunk1 reads +1..+16).
+				b = append(b, 0x20, 0x04) // local.get attempt_start
+				if teddyTwoByte && len(firstBytes) <= 8 {
+					b = append(b, 0x41, 0x10) // i32.const 16
+				} else {
+					b = append(b, 0x41, 0x0F) // i32.const 15
+				}
+				b = append(b, 0x6A)       // i32.add
+				b = append(b, 0x20, 0x01) // local.get len
+				b = append(b, 0x4F)       // i32.ge_u
+				b = append(b, 0x0D, 0x01) // br_if 1 → $simd_exhausted
+
+				// Load 16-byte chunk into v128 local (chunkLocal).
+				b = append(b, 0x20, 0x00)              // local.get ptr
+				b = append(b, 0x20, 0x04)              // local.get attempt_start
+				b = append(b, 0x6A)                    // i32.add
+				b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+				b = append(b, 0x21, chunkLocal)        // local.set chunk
+
+				// For 2-byte Teddy: also load chunk at offset+1.
+				if teddyTwoByte && len(firstBytes) <= 8 {
+					b = append(b, 0x20, 0x00)              // local.get ptr
+					b = append(b, 0x20, 0x04)              // local.get attempt_start
+					b = append(b, 0x6A)                    // i32.add
+					b = append(b, 0x41, 0x01)              // i32.const 1
+					b = append(b, 0x6A)                    // i32.add
+					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+					b = append(b, 0x21, chunk1Local)       // local.set chunk1
+				}
+
+				if len(firstBytes) <= 8 {
+					// ── Teddy nibble scan ──────────────────────────────────────
+					// mask = swizzle(T_lo, chunk & 0x0F) & swizzle(T_hi, chunk >> 4)
+					// If mask != 0 (any lane nonzero): at least one byte in [0..15]
+					// matches a first-byte from S.  ctz(i8x16.bitmask(mask != 0))
+					// gives the lane index of the first candidate.
+
+					// lo_result = swizzle(T_lo, chunk & 0x0F)
+					// T_lo/T_hi pre-loaded into locals before the loop (loop-invariant, register access).
+					b = append(b, 0x20, tLoLocal)          // local.get tLoLocal -> [T_lo]
+					b = append(b, 0x20, chunkLocal)        // local.get chunk    -> [T_lo, chunk]
+					b = append(b, 0x41, 0x0F)
+					b = append(b, 0xFD, 0x0F)              // i8x16.splat(0x0F) -> [T_lo, chunk, splat]
+					b = append(b, 0xFD, 0x4E)              // v128.and -> [T_lo, lo_nibbles]
+					b = append(b, 0xFD, 0x0E)              // i8x16.swizzle(T_lo, lo_nibbles) -> [lo_result]
+
+					// hi_result = swizzle(T_hi, chunk >> 4)
+					b = append(b, 0x20, tHiLocal)          // local.get tHiLocal -> [lo_result, T_hi]
+					b = append(b, 0x20, chunkLocal)        // local.get chunk    -> [lo_result, T_hi, chunk]
+					b = append(b, 0x41, 0x04)              // i32.const 4        -> [lo_result, T_hi, chunk, 4]
+					b = append(b, 0xFD, 0x6D)              // i8x16.shr_u        -> [lo_result, T_hi, hi_nibbles]
+					b = append(b, 0xFD, 0x0E)              // i8x16.swizzle(T_hi, hi_nibbles) -> [lo_result, hi_result]
+
+					// candidates0 = lo0_result & hi0_result (byte 0 matches)
+					b = append(b, 0xFD, 0x4E) // v128.and -> [candidates0]
+
+					// 2-byte Teddy: AND with candidates1 (byte 1 matches at offset+1).
+					if teddyTwoByte {
+						// candidates1 = swizzle(T1_lo, chunk1 & 0xF) & swizzle(T1_hi, chunk1 >> 4)
+						b = append(b, 0x20, t1LoLocal)         // local.get t1LoLocal -> [c0, T1_lo]
+						b = append(b, 0x20, chunk1Local)       // local.get chunk1    -> [c0, T1_lo, c1]
+						b = append(b, 0x41, 0x0F)
+						b = append(b, 0xFD, 0x0F)              // i8x16.splat(0x0F)   -> [c0, T1_lo, c1, splat]
+						b = append(b, 0xFD, 0x4E)              // v128.and            -> [c0, T1_lo, lo1_nibbles]
+						b = append(b, 0xFD, 0x0E)              // i8x16.swizzle       -> [c0, lo1_result]
+						b = append(b, 0x20, t1HiLocal)         // local.get t1HiLocal -> [c0, lo1, T1_hi]
+						b = append(b, 0x20, chunk1Local)       // local.get chunk1    -> [c0, lo1, T1_hi, c1]
+						b = append(b, 0x41, 0x04)              // i32.const 4
+						b = append(b, 0xFD, 0x6D)              // i8x16.shr_u         -> [c0, lo1, T1_hi, hi1_nibbles]
+						b = append(b, 0xFD, 0x0E)              // i8x16.swizzle       -> [c0, lo1, hi1_result]
+						b = append(b, 0xFD, 0x4E)              // v128.and            -> [c0, candidates1]
+						b = append(b, 0xFD, 0x4E)              // v128.and c0&c1      -> [combined]
+					}
+					b = append(b, 0x41, 0x00)
+					b = append(b, 0xFD, 0x0F) // i8x16.splat(0)
+					b = append(b, 0xFD, 0x24) // i8x16.ne -> [nonzero_mask]
+					b = append(b, 0xFD, 0x64) // i8x16.bitmask -> i32
+				} else {
+					// ── Multi-eq scan ──────────────────────────────────────────
+					// mask = OR of (i8x16.eq(chunk, splat(b)).bitmask) for each b in firstBytes
+					b = append(b, 0x41, 0x00) // i32.const 0  (accumulator)
+					for _, fb := range firstBytes {
+						b = append(b, 0x20, chunkLocal) // local.get chunk
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(fb))
+						b = append(b, 0xFD, 0x0F) // i8x16.splat
+						b = append(b, 0xFD, 0x23) // i8x16.eq
+						b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+						b = append(b, 0x72)        // i32.or  (OR into accumulator)
+					}
+					// result i32 mask is on stack
+				}
+
+				// mask (i32) is on stack.
+				// local.tee simdMaskLocal to keep it for ctz.
+				b = append(b, 0x22, simdMaskLocal) // local.tee simdMask
+
+				// if mask != 0: candidate found
+				b = append(b, 0x04, 0x40) // if (void)
+				b = append(b, 0x20, 0x04) // local.get attempt_start
+				b = append(b, 0x20, simdMaskLocal)
+				b = append(b, 0x68)       // i32.ctz
+				b = append(b, 0x6A)       // i32.add
+				b = append(b, 0x21, 0x04) // local.set attempt_start
+				b = append(b, 0x0C, 0x03) // br 3 → $found_candidate
+				b = append(b, 0x0B)       // end if
+
+				// No candidate in this chunk: advance 16.
+				b = append(b, 0x20, 0x04) // local.get attempt_start
+				b = append(b, 0x41, 0x10) // i32.const 16
+				b = append(b, 0x6A)       // i32.add
+				b = append(b, 0x21, 0x04) // local.set attempt_start
+				b = append(b, 0x0C, 0x00) // br 0 → $simd_outer
+
+				b = append(b, 0x0B) // end loop $simd_outer
+				b = append(b, 0x0B) // end block $simd_exhausted
+				// fall-through: SIMD exhausted, run scalar tail below
+			}
+
+			// ── Scalar tail / full scalar ─────────────────────────────────────
+			// When SIMD is active this covers the last <16 bytes.
+			// When no SIMD this is the entire scan.
 			// Depths from within $skip:
-			//   0=$skip(loop)  1=$skipdone(block)  2=$outer  3=$no_match
+			//   SIMD path:   0=$skip 1=$skipdone 2=$found_candidate 3=$outer 4=$no_match
+			//   Scalar path: 0=$skip 1=$skipdone 2=$outer 3=$no_match
+			skipdoneExitDepth := byte(0x01) // br 1 → $skipdone (always)
+			foundCandidateDepth := byte(0x01)
+			if useSIMD {
+				foundCandidateDepth = 0x02 // br 2 → $found_candidate
+			}
+
 			b = append(b, 0x02, 0x40) // block $skipdone (void)
 			b = append(b, 0x03, 0x40) // loop $skip (void)
 
 			b = append(b, 0x20, 0x04) // local.get attempt_start
 			b = append(b, 0x20, 0x01) // local.get len
 			b = append(b, 0x4F)       // i32.ge_u
-			b = append(b, 0x0D, 0x01) // br_if 1 → $skipdone
+			b = append(b, 0x0D)
+			b = append(b, skipdoneExitDepth) // br_if → $skipdone
 
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, firstByteOff)
@@ -1720,7 +2007,8 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (byte)
 			b = append(b, 0x6A)             // firstByteOff + byte
 			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (flag)
-			b = append(b, 0x0D, 0x01)       // br_if 1 → $skipdone
+			b = append(b, 0x0D)
+			b = append(b, foundCandidateDepth) // br_if → $found_candidate (or $skipdone for scalar)
 
 			b = append(b, 0x20, 0x04) // attempt_start++
 			b = append(b, 0x41, 0x01)
@@ -1729,6 +2017,10 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 			b = append(b, 0x0C, 0x00) // br 0 → $skip
 			b = append(b, 0x0B)       // end loop $skip
 			b = append(b, 0x0B)       // end block $skipdone
+
+			if useSIMD {
+				b = append(b, 0x0B) // end block $found_candidate
+			}
 
 			// Allow attempt_start == len for empty-string matches at end of input.
 			b = append(b, 0x20, 0x04) // local.get attempt_start
@@ -1846,11 +2138,16 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 	if useU8 && useCompression {
 		// ── u8 compressed find path ───────────────────────────────────────────
 		// 6 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),simdMask(7),chunk(8)
-		b = append(b, 0x02, 0x06, 0x7F, 0x01, 0x7B)
+		b = append(b, 0x02, 0x06, 0x7F, 0x06, 0x7B)
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x03, 0x40) // loop $outer
 		simdMaskLocal = 7
 		chunkLocal = 8
+		tLoLocal = 9
+		tHiLocal = 10
+		chunk1Local = 11
+		t1LoLocal = 12
+		t1HiLocal = 13
 		b = emitOuterPrologue(b)
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitImmAcceptCheckFindStart(b)
@@ -1927,11 +2224,16 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 	if useU8 {
 		// ── u8 simple find path ───────────────────────────────────────────────
 		// 5 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),simdMask(6),chunk(7)
-		b = append(b, 0x02, 0x05, 0x7F, 0x01, 0x7B)
+		b = append(b, 0x02, 0x05, 0x7F, 0x06, 0x7B)
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x03, 0x40) // loop $outer
 		simdMaskLocal = 6
 		chunkLocal = 7
+		tLoLocal = 8
+		tHiLocal = 9
+		chunk1Local = 10
+		t1LoLocal = 11
+		t1HiLocal = 12
 		b = emitOuterPrologue(b)
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitImmAcceptCheckFindStart(b)
@@ -1998,11 +2300,16 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 
 	// ── u16 find path ─────────────────────────────────────────────────────────
 	// 6 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),byte(6),simdMask(7),chunk(8)
-	b = append(b, 0x02, 0x06, 0x7F, 0x01, 0x7B)
+	b = append(b, 0x02, 0x06, 0x7F, 0x06, 0x7B)
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $outer
 	simdMaskLocal = 7
 	chunkLocal = 8
+	tLoLocal = 9
+	tHiLocal = 10
+	chunk1Local = 11
+	t1LoLocal = 12
+	t1HiLocal = 13
 	b = emitOuterPrologue(b)
 	b = append(b, 0x02, 0x40) // block $found
 	b = emitImmAcceptCheckFindStart(b)

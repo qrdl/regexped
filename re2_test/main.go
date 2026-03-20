@@ -443,18 +443,10 @@ func preCheck(pattern string) string {
 }
 
 // findModeUnsafe reports whether a pattern cannot be correctly tested in find
-// mode. With leftmost-first DFA, alternations and {m,n} repetitions are handled
-// correctly. Only non-greedy quantifiers remain unsafe.
+// mode. With leftmost-first DFA and immediateAccepting, all quantifier types
+// including non-greedy are handled correctly by the DFA.
 func findModeUnsafe(re *syntax.Regexp) bool {
 	switch re.Op {
-	case syntax.OpRepeat:
-		if re.Flags&syntax.NonGreedy != 0 {
-			return true
-		}
-	case syntax.OpStar, syntax.OpPlus, syntax.OpQuest:
-		if re.Flags&syntax.NonGreedy != 0 {
-			return true
-		}
 	}
 	for _, sub := range re.Sub {
 		if findModeUnsafe(sub) {
