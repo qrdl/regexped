@@ -1,4 +1,4 @@
-.PHONY: re2test perftest clean
+.PHONY: re2test perftest examples clean
 
 build: regexped
 
@@ -6,11 +6,16 @@ regexped:
 	go build -o regexped .
 
 re2test: build
-	cd re2_test && go run . re2-exhaustive.txt
+	$(MAKE) -C re2test test
 
 perftest: build
-	cd perf_test && go run .
+	$(MAKE) -C perftest
+
+examples: build
+	$(MAKE) -C examples
 
 clean:
-	rm -f regexped re2_test/re2_test
-	cd perf_test && $(MAKE) clean
+	rm -f regexped
+	$(MAKE) -C re2test clean
+	$(MAKE) -C perftest clean
+	$(MAKE) -C examples clean

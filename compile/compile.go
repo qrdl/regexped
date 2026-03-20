@@ -84,8 +84,7 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir string) error {
 	for i, re := range cfg.Regexes {
 		slog.Info("Compiling pattern", "n", i+1, "total", len(cfg.Regexes), "module", re.ImportModule, "wasm", re.WasmFile)
 
-		wasmBytes, tableEnd, err := CompileRegex(re.Pattern, re.ExportName, tableBase, false,
-			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, Mode: parseMode(re.Mode)})
+		wasmBytes, tableEnd, err := compileRegexEntry(re, tableBase)
 		if err != nil {
 			return fmt.Errorf("compile regex %d (%s): %w", i+1, re.ImportModule, err)
 		}
@@ -162,6 +161,66 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 
 	wasmBytes := genWASM(table, tableBase, exportName, standalone, memPages, opts.Mode, opts.LeftmostFirst)
 	return wasmBytes, tableEnd, nil
+}
+
+// compileRegexEntry compiles a single RegexEntry to WASM using the new config schema.
+// It determines the appropriate engine based on which function stubs are requested.
+func compileRegexEntry(re config.RegexEntry, tableBase int64) ([]byte, int64, error) {
+	captureNeeded := re.CaptureStubsRequested()
+
+	// Determine which export name and mode to use for the primary function.
+	// Priority: groups > find > match.
+	if captureNeeded {
+		return CompileOnePassGroups(re.Pattern, "groups", tableBase, false)
+	}
+	if re.FindFunc != "" {
+		return CompileRegex(re.Pattern, "find", tableBase, false,
+			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, Mode: ModeFind})
+	}
+	return CompileRegex(re.Pattern, "match", tableBase, false,
+		CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA})
+}
+
+// CompileOnePassGroups compiles a pattern to a OnePass WASM module exporting
+// a groups function: (ptr i32, len i32, out_ptr i32) → i32.
+// If the pattern does not qualify for OnePass, returns an error.
+func CompileOnePassGroups(pattern, exportName string, tableBase int64, standalone bool) ([]byte, int64, error) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, 0, fmt.Errorf("parse error: %w", err)
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		return nil, 0, fmt.Errorf("compile error: %w", err)
+	}
+	if needsUnicodeSupport(prog) {
+		return nil, 0, fmt.Errorf("pattern contains Unicode features not yet supported")
+	}
+	if !isOnePass(prog) {
+		return nil, 0, fmt.Errorf("pattern is not one-pass deterministic")
+	}
+
+	op := newOnePass(prog)
+
+	// Data section: transition table (numStates * 256 bytes).
+	dataSize := int64(op.numStates * 256)
+	tableEnd := utils.PageAlign(tableBase + dataSize)
+	memPages := int32(tableEnd / 65536)
+
+	wasmBytes := genOnePassWASM(op, tableBase, exportName, standalone, memPages)
+	return wasmBytes, tableEnd, nil
+}
+
+// stripCaptures converts all capture groups in the regexp tree to non-capturing
+// by replacing each OpCapture node with its single sub-expression in-place.
+// Used when the pattern has captures but capture stubs are not requested.
+func stripCaptures(re *syntax.Regexp) {
+	for _, sub := range re.Sub {
+		stripCaptures(sub)
+	}
+	if re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		*re = *re.Sub[0]
+	}
 }
 
 // SelectEngine returns the EngineType that would be chosen for the given pattern,

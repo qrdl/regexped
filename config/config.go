@@ -17,14 +17,24 @@ type BuildConfig struct {
 }
 
 // RegexEntry describes a single regex→WASM compilation unit.
+// One or more of the Func fields must be set; only those stubs are generated.
+// The WASM export names are derived automatically from the function type.
 type RegexEntry struct {
 	WasmFile     string `yaml:"wasm_file"`
 	ImportModule string `yaml:"import_module"`
 	StubFile     string `yaml:"stub_file"`
-	ExportName   string `yaml:"export_name"`
-	FuncName     string `yaml:"func_name"`
 	Pattern      string `yaml:"pattern"`
-	Mode         string `yaml:"mode"` // "anchored_match" (default) or "find"
+
+	// Optional function names — only those set are compiled and stubbed.
+	MatchFunc       string `yaml:"match_func"`        // anchored match → Option<usize>
+	FindFunc        string `yaml:"find_func"`          // non-anchored find → Option<(usize,usize)>
+	GroupsFunc      string `yaml:"groups_func"`        // anchored + captures → Option<Vec<Option<(usize,usize)>>>
+	NamedGroupsFunc string `yaml:"named_groups_func"`  // anchored + named captures → Option<HashMap<&'static str,(usize,usize)>>
+}
+
+// CaptureStubsRequested reports whether any capture-returning stub is requested.
+func (r RegexEntry) CaptureStubsRequested() bool {
+	return r.GroupsFunc != "" || r.NamedGroupsFunc != ""
 }
 
 // LoadConfig reads and parses the YAML config at configPath.

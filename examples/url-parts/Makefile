@@ -1,0 +1,53 @@
+# regexped must be built first: run `make` in the repo root.
+REGEXPED    := ../../regexped
+WASM_TARGET := wasm32-wasip1
+
+MAIN_WASM  := target/$(WASM_TARGET)/release/url_parts.wasm
+REGEX_WASM := url_parts.wasm
+FINAL_WASM := final.wasm
+
+.PHONY: all stub build compile merge run clean
+
+all: run
+
+# Step 1 – generate Rust stub from config
+src/stub.rs: regexped.yaml
+	$(REGEXPED) stub --config=regexped.yaml --out-dir=. --rust
+
+stub: src/stub.rs
+
+# Step 2 – compile Rust source to WASM
+$(MAIN_WASM): src/main.rs src/stub.rs Cargo.toml
+	cargo build --target $(WASM_TARGET) --release
+
+build: $(MAIN_WASM)
+
+# Step 3 – compile regex pattern to WASM (OnePass engine with capture tracking)
+$(REGEX_WASM): regexped.yaml $(MAIN_WASM)
+	$(REGEXPED) compile --config=regexped.yaml --wasm-input=$(MAIN_WASM) --out-dir=.
+
+compile: $(REGEX_WASM)
+
+# Step 4 – merge main WASM and regex WASM into a single module
+$(FINAL_WASM): $(MAIN_WASM) $(REGEX_WASM) regexped.yaml
+	$(REGEXPED) merge --config=regexped.yaml $(MAIN_WASM) $(REGEX_WASM)
+
+merge: $(FINAL_WASM)
+
+# Step 5 – run with test inputs
+run: $(FINAL_WASM)
+	@echo "=== full URL ==="
+	wasmtime run $(FINAL_WASM) "https://example.com:8080/path/to/page?q=1&r=2#section"
+	@echo ""
+	@echo "=== minimal URL ==="
+	wasmtime run $(FINAL_WASM) "http://example.com"
+	@echo ""
+	@echo "=== URL with query only ==="
+	wasmtime run $(FINAL_WASM) "https://search.example.com/find?q=hello+world"
+	@echo ""
+	@echo "=== not a URL ==="
+	wasmtime run $(FINAL_WASM) "not-a-url"
+
+clean:
+	cargo clean
+	rm -f src/stub.rs $(REGEX_WASM) $(FINAL_WASM)

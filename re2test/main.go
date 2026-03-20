@@ -86,6 +86,12 @@ func run(testFile string, verbose bool, maxErrors int) error {
 		findFn     *wasmtime.Func
 		findMemory *wasmtime.Memory
 
+		// per-pattern OnePass groups mode (col 0 captures); nil when not applicable
+		groupsStore  *wasmtime.Store
+		groupsFn     *wasmtime.Func
+		groupsMemory *wasmtime.Memory
+		numGroups    int
+
 		lineno    int
 		npass     int
 		nfail     int
@@ -138,6 +144,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 			pattern = q
 			store, matchFn, memory = nil, nil, nil
 			findFn, findMemory = nil, nil
+			groupsStore, groupsFn, groupsMemory, numGroups = nil, nil, nil, 0
 
 			// Pre-check for unsupported features before attempting compilation.
 			if reason := preCheck(pattern); reason != "" {
@@ -161,7 +168,24 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				input = append([]string(nil), testStrings...)
 				continue
 			}
-			if engineType != compile.EngineDFA {
+			if engineType == compile.EngineOnePass {
+				// Pattern qualifies for OnePass capture testing.
+				groupBytes, _, gErr := compile.CompileOnePassGroups(pattern, "groups", tableBase, true)
+				if gErr == nil {
+					groupsStore = wasmtime.NewStore(engine)
+					if groupMod, gmErr := wasmtime.NewModule(engine, groupBytes); gmErr == nil {
+						if groupInst, giErr := wasmtime.NewInstance(groupsStore, groupMod, []wasmtime.AsExtern{}); giErr == nil {
+							groupsFn = groupInst.GetFunc(groupsStore, "groups")
+							if exp := groupInst.GetExport(groupsStore, "memory"); exp != nil {
+								groupsMemory = exp.Memory()
+							}
+							re2, _ := syntax.Parse(pattern, syntax.Perl)
+							numGroups = re2.MaxCap() + 1
+						}
+					}
+				}
+				// Fall through to DFA for match/find (captures stripped internally).
+			} else if engineType != compile.EngineDFA {
 				skipCount["requires "+engineType.String()] += len(testStrings)
 				input = append([]string(nil), testStrings...)
 				continue
@@ -232,7 +256,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 			input = input[1:]
 
 			// Pattern was skipped — consume the result line without testing.
-			if store == nil {
+			if store == nil && groupsStore == nil {
 				continue
 			}
 
@@ -283,26 +307,63 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				continue
 			}
 
-			got, callErr := callMatch(store, matchFn, memory, text)
-			if callErr != nil {
-				return fmt.Errorf("%s:%d: wasm call pattern=%q input=%q: %w",
-					testFile, lineno, pattern, text, callErr)
-			}
-
-			expected := parseCol0(col0)
-			if got == expected {
-				npass++
-				if verbose {
-					fmt.Printf("PASS %s:%d pattern=%q input=%q\n", testFile, lineno, pattern, text)
+			if groupsFn != nil {
+				// OnePass capture test: compare end position and capture slots.
+				endPos, slots, callErr := callGroups(groupsStore, groupsFn, groupsMemory, text, numGroups)
+				if callErr != nil {
+					return fmt.Errorf("%s:%d: wasm groups call pattern=%q input=%q: %w",
+						testFile, lineno, pattern, text, callErr)
 				}
-			} else {
-				nfail++
-				fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
-					pattern, text, fmtResult(expected), fmtResult(got))
-				if maxErrors > 0 && nfail >= maxErrors {
-					fmt.Printf("Stopping after %d failure(s)\n", nfail)
-					stopped = true
-					goto done
+				expectedEnd := parseCol0(col0)
+				expectedSlots := parseCaptures(col0, numGroups)
+				endMatch := endPos == expectedEnd
+				slotsMatch := true
+				if expectedSlots != nil && slots != nil {
+					for i := range expectedSlots {
+						if i < len(slots) && slots[i] != expectedSlots[i] {
+							slotsMatch = false
+							break
+						}
+					}
+				} else if (expectedSlots == nil) != (slots == nil) {
+					slotsMatch = false
+				}
+				if endMatch && slotsMatch {
+					npass++
+					if verbose {
+						fmt.Printf("PASS %s:%d pattern=%q input=%q (groups)\n", testFile, lineno, pattern, text)
+					}
+				} else {
+					nfail++
+					fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: end=%d slots=%s\n      got:      end=%d slots=%s\n",
+						pattern, text, expectedEnd, fmtSlots(expectedSlots), endPos, fmtSlots(slots))
+					if maxErrors > 0 && nfail >= maxErrors {
+						fmt.Printf("Stopping after %d failure(s)\n", nfail)
+						stopped = true
+						goto done
+					}
+				}
+			} else if matchFn != nil {
+				got, callErr := callMatch(store, matchFn, memory, text)
+				if callErr != nil {
+					return fmt.Errorf("%s:%d: wasm call pattern=%q input=%q: %w",
+						testFile, lineno, pattern, text, callErr)
+				}
+				expected := parseCol0(col0)
+				if got == expected {
+					npass++
+					if verbose {
+						fmt.Printf("PASS %s:%d pattern=%q input=%q\n", testFile, lineno, pattern, text)
+					}
+				} else {
+					nfail++
+					fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
+						pattern, text, fmtResult(expected), fmtResult(got))
+					if maxErrors > 0 && nfail >= maxErrors {
+						fmt.Printf("Stopping after %d failure(s)\n", nfail)
+						stopped = true
+						goto done
+					}
 				}
 			}
 
@@ -365,6 +426,91 @@ func callFind(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, te
 		return 0, err
 	}
 	return result.(int64), nil
+}
+
+// slotsBase is the WASM memory address used for the groups output buffer.
+const slotsBase = int32(512)
+
+// callGroups writes text into WASM memory and invokes the groups function.
+// Returns (endPos, slots) where slots[i*2],slots[i*2+1] = start,end for group i.
+func callGroups(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string, numGroups int) (int32, []int32, error) {
+	buf := mem.UnsafeData(store)
+	if len(text) > 0 {
+		copy(buf[inputBase:], text)
+	}
+	// Pre-initialize slots to -1.
+	for i := 0; i < numGroups*2; i++ {
+		off := slotsBase + int32(i*4)
+		buf[off] = 0xFF
+		buf[off+1] = 0xFF
+		buf[off+2] = 0xFF
+		buf[off+3] = 0xFF
+	}
+	result, err := fn.Call(store, inputBase, int32(len(text)), slotsBase)
+	if err != nil {
+		return 0, nil, err
+	}
+	endPos := result.(int32)
+	if endPos < 0 {
+		return -1, nil, nil
+	}
+	slots := make([]int32, numGroups*2)
+	for i := range slots {
+		off := slotsBase + int32(i*4)
+		slots[i] = int32(buf[off]) | int32(buf[off+1])<<8 | int32(buf[off+2])<<16 | int32(buf[off+3])<<24
+	}
+	return endPos, slots, nil
+}
+
+// parseCaptures parses a col-0 result string that may include submatches.
+// Returns nil if no match. Otherwise returns []int32{start0,end0,start1,end1,...}
+// with -1,-1 for unmatched groups.
+func parseCaptures(col string, numGroups int) []int32 {
+	if col == "-" {
+		return nil
+	}
+	parts := strings.Fields(col)
+	slots := make([]int32, numGroups*2)
+	for i := range slots {
+		slots[i] = -1
+	}
+	for i, p := range parts {
+		if i >= numGroups {
+			break
+		}
+		if p == "-" {
+			slots[i*2] = -1
+			slots[i*2+1] = -1
+			continue
+		}
+		dash := strings.IndexByte(p, '-')
+		if dash < 0 {
+			continue
+		}
+		s, err1 := strconv.Atoi(p[:dash])
+		e, err2 := strconv.Atoi(p[dash+1:])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		slots[i*2] = int32(s)
+		slots[i*2+1] = int32(e)
+	}
+	return slots
+}
+
+func fmtSlots(slots []int32) string {
+	if slots == nil {
+		return "no match"
+	}
+	var parts []string
+	for i := 0; i < len(slots); i += 2 {
+		if slots[i] < 0 {
+			parts = append(parts, "-")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d-%d", slots[i], slots[i+1]))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // parseCol0 converts a col-0 result string to the expected WASM return value.
@@ -432,12 +578,9 @@ func preCheck(pattern string) string {
 	if hasUnicode(pattern) {
 		return skipUnicode
 	}
-	re, err := syntax.Parse(pattern, syntax.Perl)
+	_, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return "" // let CompileRegex report the actual error
-	}
-	if re.MaxCap() > 0 {
-		return skipCaptures
 	}
 	return ""
 }

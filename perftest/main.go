@@ -6,6 +6,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,6 +31,7 @@ type matchMode int
 const (
 	anchored matchMode = iota
 	find
+	anchoredGroups // OnePass: (ptr, len, out_ptr) → i32
 )
 
 type testCase struct {
@@ -141,6 +143,21 @@ var tests = []testCase{
 				"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
 				"export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
 			})},
+		},
+	},
+	{
+		// URL parsing with named capture groups — benchmarks OnePass engine
+		// against regex crate's capture group extraction.
+		// Credentials omitted: [^@]+ and [^/:+] overlap making it non-one-pass.
+		name: "url-parse",
+		pattern: `(?P<scheme>https?)://(?P<host>[^/:?#]+)` +
+			`(?::(?P<port>[0-9]+))?(?P<path>/[^?#]*)?` +
+			`(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?`,
+		mode: anchoredGroups,
+		inputs: []namedInput{
+			{"full URL", "https://example.com:8080/path/to/page?q=1&r=2#section"},
+			{"simple URL", "https://example.com/path"},
+			{"no-match", "not-a-url"},
 		},
 	},
 	{
@@ -259,20 +276,13 @@ func harnessWasm(dir, name string) string {
 	return filepath.Join(dir, name, "target", wasmTarget, "release", name+".wasm")
 }
 
-// wasmMerge returns the wasm-merge binary path, trying common locations.
+// wasmMergePath is set by the --wasm-merge flag.
+var wasmMergePath string
+
+// wasmMerge returns the wasm-merge binary path from the flag, or "wasm-merge" for $PATH lookup.
 func wasmMerge() string {
-	home, _ := os.UserHomeDir()
-	candidates := []string{
-		filepath.Join(home, "projects", "binaryen", "bin", "wasm-merge"),
-		"wasm-merge",
-	}
-	for _, p := range candidates {
-		if _, err := exec.LookPath(p); err == nil {
-			return p
-		}
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
+	if wasmMergePath != "" {
+		return wasmMergePath
 	}
 	return "wasm-merge"
 }
@@ -342,8 +352,49 @@ func buildRegexped(dir, harnessName, exportName string, mode compile.MatchMode, 
 	cfg := config.BuildConfig{
 		WasmMerge: wasmMerge(),
 		Regexes: []config.RegexEntry{
-			{WasmFile: patPath, ImportModule: "pattern", ExportName: exportName},
+			{WasmFile: patPath, ImportModule: "pattern"},
 		},
+	}
+	if err := merge.CmdMerge(cfg, mergedPath, []string{harness, patPath}); err != nil {
+		os.Remove(mergedPath)
+		return "", fmt.Errorf("merge: %w", err)
+	}
+	return mergedPath, nil
+}
+
+// buildRegexpedGroups compiles a pattern to a OnePass groups WASM and merges
+// it with the groups harness.
+func buildRegexpedGroups(dir, harnessName, exportName, pattern string) (string, error) {
+	harness := harnessWasm(dir, harnessName)
+	rustTop, err := utils.RustMemTop(harness)
+	if err != nil {
+		return "", fmt.Errorf("read harness memory: %w", err)
+	}
+	tableBase := utils.PageAlign(rustTop)
+	wasmBytes, _, err := compile.CompileOnePassGroups(pattern, exportName, tableBase, false)
+	if err != nil {
+		return "", fmt.Errorf("compile: %w", err)
+	}
+
+	patTmp, err := os.CreateTemp("", "pattern-*.wasm")
+	if err != nil {
+		return "", err
+	}
+	patPath := patTmp.Name()
+	patTmp.Write(wasmBytes)
+	patTmp.Close()
+	defer os.Remove(patPath)
+
+	mergedTmp, err := os.CreateTemp("", "merged-*.wasm")
+	if err != nil {
+		return "", err
+	}
+	mergedPath := mergedTmp.Name()
+	mergedTmp.Close()
+
+	cfg := config.BuildConfig{
+		WasmMerge: wasmMerge(),
+		Regexes:   []config.RegexEntry{{WasmFile: patPath, ImportModule: "pattern"}},
 	}
 	if err := merge.CmdMerge(cfg, mergedPath, []string{harness, patPath}); err != nil {
 		os.Remove(mergedPath)
@@ -372,8 +423,11 @@ const (
 
 func printTable(tc testCase, rows []row) {
 	modeStr := "anchored"
-	if tc.mode == find {
+	switch tc.mode {
+	case find:
 		modeStr = "find"
+	case anchoredGroups:
+		modeStr = "groups"
 	}
 
 	sep := strings.Repeat("─", wLabel+2) + "┼" +
@@ -432,38 +486,47 @@ func truncate(s string, max int) string {
 // Main
 
 func main() {
+	flag.StringVar(&wasmMergePath, "wasm-merge", "", "path to wasm-merge binary (default: search $PATH)")
+	flag.Parse()
+
 	// Silence library log output — only the table goes to stdout.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	// Resolve perf_test directory (tool may be run from perftest/ or perf_test/).
 	dir, _ := os.Getwd()
-	if filepath.Base(dir) == "perftest" {
-		dir = filepath.Dir(dir)
-	}
 
 	for _, tc := range tests {
-		isFind := tc.mode == find
+		isGroups := tc.mode == anchoredGroups
 
 		// Select harnesses.
 		var regexHarness, regexpedHarness, exportName string
-		if isFind {
+		switch tc.mode {
+		case find:
 			regexHarness = harnessWasm(dir, "regex_find_harness")
 			regexpedHarness = "regexped_find_harness"
 			exportName = "pattern_find"
-		} else {
+		case anchoredGroups:
+			regexHarness = harnessWasm(dir, "regex_groups_harness")
+			regexpedHarness = "regexped_groups_harness"
+			exportName = "groups"
+		default:
 			regexHarness = harnessWasm(dir, "regex_harness")
 			regexpedHarness = "regexped_harness"
 			exportName = "pattern_match"
 		}
 
-		compileMode := compile.ModeAnchoredMatch
-		if isFind {
-			compileMode = compile.ModeFind
-		}
-
 		// Build merged regexped WASM once per pattern.
 		fmt.Fprintf(os.Stderr, "==> compiling %s...\n", tc.name)
-		mergedPath, err := buildRegexped(dir, regexpedHarness, exportName, compileMode, tc.pattern)
+		var mergedPath string
+		var err error
+		if isGroups {
+			mergedPath, err = buildRegexpedGroups(dir, regexpedHarness, exportName, tc.pattern)
+		} else {
+			compileMode := compile.ModeAnchoredMatch
+			if tc.mode == find {
+				compileMode = compile.ModeFind
+			}
+			mergedPath, err = buildRegexped(dir, regexpedHarness, exportName, compileMode, tc.pattern)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "SKIP %s: %v\n", tc.name, err)
 			continue

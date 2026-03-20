@@ -1,6 +1,11 @@
 WASM_TARGET := wasm32-wasip1
 
-.PHONY: harnesses clean
+.PHONY: run harnesses clean
+
+WASM_MERGE ?= ../../binaryen/bin/wasm-merge
+
+run: harnesses
+	go run . --wasm-merge=$(WASM_MERGE)
 
 harnesses:
 	cargo build --manifest-path regex_harness/Cargo.toml --target $(WASM_TARGET) --release

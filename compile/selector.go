@@ -106,9 +106,15 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 	// However, Simplify() may optimize away captures like (a){0}, so also check the flag
 	hasCaptureGroups := prog.NumCap > 2 || hadCapturesBeforeSimplify
 
-	// Capture groups require NFA engines (not yet implemented in DFA).
+	// Capture groups: use OnePass if the pattern qualifies, else Backtrack.
+	// Exclude nested quantifiers and non-greedy quantifiers — these require
+	// backtracking semantics that OnePass cannot provide.
 	if hasCaptureGroups {
-		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "pattern has captures")
+		if isOnePass(prog) && !hasNestedQuantifiers(prog) && !hasNonGreedyQuantifiers(prog) {
+			slog.Debug("Engine selected", "engine", "OnePass", "reason", "deterministic capture pattern")
+			return EngineOnePass
+		}
+		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "non-deterministic capture pattern")
 		return EngineBacktrack
 	}
 
@@ -125,6 +131,22 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 
 	slog.Debug("Engine selected", "engine", "DFA", "reason", "simple pattern", "complexity", complexity, "states", dfaStates)
 	return EngineDFA
+}
+
+// hasNonGreedyQuantifiers reports whether the NFA contains any non-greedy
+// quantifier loop (prefer-exit Alt: Out >= PC, Arg < PC, i.e. try exit first).
+func hasNonGreedyQuantifiers(prog *syntax.Prog) bool {
+	for pc := range prog.Inst {
+		inst := &prog.Inst[pc]
+		if inst.Op == syntax.InstAlt {
+			pcU32 := uint32(pc)
+			// Non-greedy: Out >= PC (exit first), Arg < PC (loop body backward)
+			if inst.Out >= pcU32 && inst.Arg < pcU32 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hasNonLoopAlternations detects user alternations (| operator) vs quantifier loops.
@@ -155,29 +177,33 @@ func hasNonLoopAlternations(prog *syntax.Prog) bool {
 func hasNestedQuantifiers(prog *syntax.Prog) bool {
 	inQuantifierLoop := make(map[uint32]bool)
 
-	// First pass: identify all quantifier loop instructions
+	// First pass: identify all quantifier loop instructions.
+	// Greedy loops:     Out < PC (backward body), Arg >= PC (forward exit).
+	// Non-greedy loops: Arg < PC (backward body), Out >= PC (forward exit).
 	for pc := range prog.Inst {
 		inst := &prog.Inst[pc]
 		if inst.Op == syntax.InstAlt {
 			pcU32 := uint32(pc)
-			isQuantifier := inst.Out < pcU32 && inst.Arg >= pcU32
-			if isQuantifier {
+			if inst.Out < pcU32 && inst.Arg >= pcU32 {
+				// Greedy loop body: Out..PC-1; include the Alt itself
 				for bodyPC := inst.Out; bodyPC < pcU32; bodyPC++ {
+					inQuantifierLoop[bodyPC] = true
+				}
+			} else if inst.Arg < pcU32 && inst.Out >= pcU32 {
+				// Non-greedy loop body: Arg..PC-1; include the Alt itself
+				for bodyPC := inst.Arg; bodyPC < pcU32; bodyPC++ {
 					inQuantifierLoop[bodyPC] = true
 				}
 			}
 		}
 	}
 
-	// Second pass: check if any quantifier is inside another quantifier
+	// Second pass: any Alt inside a quantifier loop body = complex nested quantifier.
+	// This catches both nested loops AND {m,n} forward-only Alts inside loops.
 	for pc := range prog.Inst {
 		inst := &prog.Inst[pc]
-		if inst.Op == syntax.InstAlt {
-			pcU32 := uint32(pc)
-			isQuantifier := inst.Out < pcU32 && inst.Arg >= pcU32
-			if isQuantifier && inQuantifierLoop[pcU32] {
-				return true
-			}
+		if inst.Op == syntax.InstAlt && inQuantifierLoop[uint32(pc)] {
+			return true
 		}
 	}
 
@@ -250,7 +276,7 @@ func analysePattern(prog *syntax.Prog) *patternAnalysis {
 			for i := 0; i+1 < len(inst.Rune); i += 2 {
 				totalChars += int(inst.Rune[i+1] - inst.Rune[i] + 1)
 			}
-			if totalChars > 100 {
+			if totalChars > 256 {
 				analysis.HasLargeCharClass = true
 			}
 			if len(inst.Rune) > 0 && inst.Rune[len(inst.Rune)-1] > 127 {
@@ -395,6 +421,32 @@ func isOnePass(prog *syntax.Prog) bool {
 	return true
 }
 
+// isEpsilonAccept reports whether pc can reach InstMatch via epsilon transitions
+// only (no byte-consuming instructions). Used to detect loop-exit branches.
+func isEpsilonAccept(prog *syntax.Prog, pc int) bool {
+	visited := make(map[int]bool)
+	var check func(int) bool
+	check = func(pc int) bool {
+		if pc >= len(prog.Inst) || visited[pc] {
+			return false
+		}
+		visited[pc] = true
+		inst := &prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstMatch:
+			return true
+		case syntax.InstCapture, syntax.InstNop:
+			return check(int(inst.Out))
+		case syntax.InstEmptyWidth:
+			return check(int(inst.Out))
+		case syntax.InstAlt, syntax.InstAltMatch:
+			return check(int(inst.Out)) || check(int(inst.Arg))
+		}
+		return false
+	}
+	return check(pc)
+}
+
 // isAlternationDeterministic checks if an alternation has distinct first characters
 // in each branch, making it deterministic.
 func isAlternationDeterministic(prog *syntax.Prog, altPC int) bool {
@@ -407,11 +459,23 @@ func isAlternationDeterministic(prog *syntax.Prog, altPC int) bool {
 		return false
 	}
 
+	leftEpsilon := isEpsilonAccept(prog, int(alt.Out))
+	rightEpsilon := isEpsilonAccept(prog, int(alt.Arg))
+
+	// If one branch accepts without consuming bytes (epsilon → InstMatch) and
+	// the other consumes bytes, they are always disjoint.
+	if leftEpsilon || rightEpsilon {
+		if leftEpsilon && rightEpsilon {
+			return false // both epsilon-accept = ambiguous
+		}
+		return true // one epsilon, one byte-consuming = always disjoint
+	}
+
 	leftRunes := getFirstRuneSet(prog, int(alt.Out))
 	rightRunes := getFirstRuneSet(prog, int(alt.Arg))
 
 	if len(leftRunes) == 0 || len(rightRunes) == 0 {
-		return false
+		return false // can't determine first chars for at least one branch
 	}
 
 	for r := range leftRunes {
@@ -459,7 +523,7 @@ func getFirstRuneSet(prog *syntax.Prog, pc int) map[rune]bool {
 				low, high := inst.Rune[i], inst.Rune[i+1]
 				totalChars += int(high - low + 1)
 			}
-			if totalChars > 100 {
+			if totalChars > 256 {
 				return false
 			}
 			for i := 0; i < len(inst.Rune); i += 2 {
