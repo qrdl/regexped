@@ -2,7 +2,6 @@ package compile
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"regexp/syntax"
 )
@@ -220,27 +219,14 @@ func estimateDFAMemory(states int) int {
 // --------------------------------------------------------------------------
 // Pattern analysis
 
-// engineChoice represents the recommended execution engine.
-type engineChoice int
-
-const (
-	PreferNFA engineChoice = iota
-	PreferDFA
-	OnlyNFA // DFA not possible
-)
-
 // patternAnalysis contains metrics about a regex pattern.
 type patternAnalysis struct {
 	// Program metrics
 	NumInstructions int
 	NumCaptures     int
 	NumAlternations int
-	NumRepeats      int
 
 	// Complexity indicators
-	HasBackreferences bool
-	HasLookahead      bool
-	HasLookbehind     bool
 	HasLargeCharClass bool
 	HasUnicode        bool
 	HasAnyRune        bool
@@ -249,10 +235,6 @@ type patternAnalysis struct {
 	EstimatedDFAStates      int
 	EstimatedDFATransitions int
 	DFAMemoryEstimateKB     int
-
-	// Recommendation
-	Recommendation engineChoice
-	Reason         string
 }
 
 // analysePattern examines a compiled pattern and provides metrics
@@ -289,7 +271,6 @@ func analysePattern(prog *syntax.Prog) *patternAnalysis {
 	}
 
 	analysis.estimateDFAComplexity()
-	analysis.recommend()
 
 	return analysis
 }
@@ -322,54 +303,6 @@ func (a *patternAnalysis) estimateDFAComplexity() {
 	a.DFAMemoryEstimateKB = (a.EstimatedDFATransitions * 16) / 1024
 }
 
-func (a *patternAnalysis) recommend() {
-	if a.HasBackreferences || a.HasLookahead || a.HasLookbehind {
-		a.Recommendation = OnlyNFA
-		a.Reason = "Pattern uses features incompatible with DFA (backreferences/lookahead)"
-		return
-	}
-
-	if a.NumCaptures > 4 {
-		a.Recommendation = PreferNFA
-		a.Reason = fmt.Sprintf("Many capture groups (%d) - easier with NFA", a.NumCaptures)
-		return
-	}
-
-	if a.EstimatedDFAStates > 1000 {
-		a.Recommendation = PreferNFA
-		a.Reason = fmt.Sprintf("Pattern would create very large DFA (~%d states)", a.EstimatedDFAStates)
-		return
-	}
-
-	if a.DFAMemoryEstimateKB > 500 {
-		a.Recommendation = PreferNFA
-		a.Reason = fmt.Sprintf("DFA would use too much memory (~%d KB)", a.DFAMemoryEstimateKB)
-		return
-	}
-
-	if a.NumAlternations > 20 {
-		a.Recommendation = PreferNFA
-		a.Reason = fmt.Sprintf("Too many alternations (%d) for DFA", a.NumAlternations)
-		return
-	}
-
-	if a.HasUnicode && a.HasLargeCharClass {
-		a.Recommendation = PreferNFA
-		a.Reason = "Unicode character classes create huge transition tables"
-		return
-	}
-
-	if a.HasAnyRune {
-		a.Recommendation = PreferNFA
-		a.Reason = "Wildcard matching requires NFA (DFA doesn't support InstRuneAny)"
-		return
-	}
-
-	a.Recommendation = PreferDFA
-	a.Reason = fmt.Sprintf("Simple pattern (~%d states, ~%d KB) - DFA will be faster",
-		a.EstimatedDFAStates, a.DFAMemoryEstimateKB)
-}
-
 func printAnalysis(a *patternAnalysis) {
 	slog.Debug("Pattern metrics",
 		"instructions", a.NumInstructions,
@@ -385,19 +318,6 @@ func printAnalysis(a *patternAnalysis) {
 		"states", a.EstimatedDFAStates,
 		"transitions", a.EstimatedDFATransitions,
 		"memory_kb", a.DFAMemoryEstimateKB)
-
-	recommendation := "unknown"
-	switch a.Recommendation {
-	case PreferNFA:
-		recommendation = "NFA"
-	case PreferDFA:
-		recommendation = "DFA"
-	case OnlyNFA:
-		recommendation = "NFA (required)"
-	}
-	slog.Debug("Engine recommendation",
-		"recommended", recommendation,
-		"reason", a.Reason)
 }
 
 // --------------------------------------------------------------------------

@@ -1,10 +1,10 @@
-// Command regexped-wasm compiles regex patterns to WASM DFA match functions.
+// Command regexped compiles regex patterns to WASM DFA match functions.
 //
 // Usage:
 //
-//	regexped-wasm stub    [--config=<file>] [--out-dir=<dir>] --rust
-//	regexped-wasm compile [--config=<file>] [--out-dir=<dir>] --wasm-input=<file>
-//	regexped-wasm merge   [--config=<file>] [--output=<file>] <main.wasm> <regex1.wasm> ...
+//	regexped stub    [--config=<file>] [--out-dir=<dir>] --rust
+//	regexped compile [--config=<file>] [--out-dir=<dir>] --wasm-input=<file>
+//	regexped merge   [--config=<file>] [--output=<file>] <main.wasm> <regex1.wasm> ...
 //
 // The config file defaults to regexped.yaml in the current directory when not specified.
 package main
@@ -45,14 +45,14 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, `Usage: regexped-wasm <command> [options]
+	fmt.Fprint(os.Stderr, `Usage: regexped <command> [options]
 
 Commands:
   stub     Generate language stubs for each regex in the config
   compile  Compile regex patterns to WASM modules
   merge    Patch memory and merge WASM modules into a single binary
 
-Run 'regexped-wasm <command> -h' for command-specific options.
+Run 'regexped <command> -h' for command-specific options.
 `)
 }
 

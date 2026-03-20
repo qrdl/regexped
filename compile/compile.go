@@ -185,10 +185,12 @@ func compileRegexEntry(re config.RegexEntry, tableBase int64) ([]byte, int64, er
 		return compileDualDFA(re.Pattern, tableBase)
 	case needFind:
 		return CompileRegex(re.Pattern, "find", tableBase, false,
-			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, Mode: ModeFind})
-	default: // match only (or neither — treat as match)
+			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, Mode: ModeFind, LeftmostFirst: true})
+	case needMatch:
 		return CompileRegex(re.Pattern, "match", tableBase, false,
 			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA})
+	default:
+		return nil, 0, fmt.Errorf("regex entry for module %q has no function field set (match_func, find_func, groups_func, or named_groups_func)", re.ImportModule)
 	}
 }
 

@@ -229,7 +229,6 @@ func patchMemoryMin(raw []byte, newMinPages uint32) ([]byte, error) {
 		sectionID := raw[off]
 		off++
 		secSize, n := utils.DecodeULEB128(raw[off:])
-		sizeFieldStart := off
 		off += n
 		secEnd := off + int(secSize)
 		if secEnd > len(raw) {
@@ -255,9 +254,12 @@ func patchMemoryMin(raw []byte, newMinPages uint32) ([]byte, error) {
 				newSec = append(newSec, flags)
 				newSec = utils.AppendULEB128(newSec, newMinPages)
 
-				if flags&0x01 != 0 { // has max — copy it unchanged
+				if flags&0x01 != 0 { // has max
 					maxVal, maxN := utils.DecodeULEB128(sec[secOff:])
 					secOff += maxN
+					if newMinPages > uint32(maxVal) {
+						return nil, fmt.Errorf("cannot patch memory: new min (%d pages) exceeds existing max (%d pages)", newMinPages, maxVal)
+					}
 					newSec = utils.AppendULEB128(newSec, uint32(maxVal))
 				}
 			}
@@ -267,7 +269,6 @@ func patchMemoryMin(raw []byte, newMinPages uint32) ([]byte, error) {
 			out = append(out, raw[:sectionStart]...)
 			out = append(out, sectionID)
 			out = utils.AppendULEB128(out, uint32(len(newSec)))
-			_ = sizeFieldStart
 			out = append(out, newSec...)
 			out = append(out, raw[secEnd:]...)
 			return out, nil
