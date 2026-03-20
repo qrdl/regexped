@@ -1,6 +1,8 @@
-.PHONY: build re2test perftest clean
+.PHONY: re2test perftest clean
 
-build:
+build: regexped
+
+regexped:
 	go build -o regexped .
 
 re2test: build
@@ -10,5 +12,5 @@ perftest: build
 	cd perf_test && go run .
 
 clean:
-	rm -f regexped re2_test/re2test
+	rm -f regexped re2_test/re2_test
 	cd perf_test && $(MAKE) clean

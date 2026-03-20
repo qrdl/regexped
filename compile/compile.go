@@ -32,7 +32,6 @@ const (
 	EngineBacktrack
 	EngineOnePass
 	EnginePikeVM
-	EngineLazyDFA
 	EngineAdaptiveNFA
 )
 
@@ -47,8 +46,6 @@ func (e EngineType) String() string {
 		return "One-Pass DFA"
 	case EnginePikeVM:
 		return "Pike VM"
-	case EngineLazyDFA:
-		return "Lazy DFA"
 	case EngineAdaptiveNFA:
 		return "Adaptive NFA"
 	default:
@@ -69,6 +66,7 @@ type CompileOptions struct {
 	AdaptiveNFACutover int        // Input size in bytes to switch to Pike VM in AdaptiveNFA
 	ForceEngine        EngineType // If non-zero, skip engine selection and use this engine type
 	Mode               MatchMode  // ModeAnchoredMatch (default) or ModeFind
+	LeftmostFirst      bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 }
 
 // CmdCompile compiles all regex patterns from cfg to WASM modules.
@@ -150,11 +148,14 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 			dfaSize += 256
 		}
 	}
+	if opts.LeftmostFirst && len(table.immediateAcceptStates) > 0 {
+		dfaSize += int64(numWASM) // immediateAccept flags
+	}
 
 	tableEnd := utils.PageAlign(tableBase + dfaSize)
 	memPages := int32(tableEnd / 65536)
 
-	wasmBytes := genWASM(table, tableBase, exportName, standalone, memPages, opts.Mode)
+	wasmBytes := genWASM(table, tableBase, exportName, standalone, memPages, opts.Mode, opts.LeftmostFirst)
 	return wasmBytes, tableEnd, nil
 }
 
@@ -195,12 +196,12 @@ func compile(pattern string, opts ...CompileOptions) (Matcher, error) {
 	if options.ForceEngine != 0 {
 		engineType = options.ForceEngine
 	} else {
-		engineType = selectBestEngine(prog, hasCapturesBeforeSimplify, opts...)
+		engineType = selectBestEngine(prog, hasCapturesBeforeSimplify, &options)
 	}
 
 	switch engineType {
 	case EngineDFA:
-		return newDFA(prog, options.Unicode), nil
+		return newDFA(prog, options.Unicode, options.LeftmostFirst), nil
 	default:
 		return nil, fmt.Errorf("engine %v not yet supported by wasm compiler", engineType)
 	}

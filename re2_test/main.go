@@ -19,7 +19,7 @@ const (
 	inputBase = int32(0)
 	tableBase = int64(65536) // page 1; page 0 is reserved for test inputs
 
-	maxDFAStates = 5000
+	maxDFAStates = 100000
 )
 
 const (
@@ -168,9 +168,10 @@ func run(testFile string, verbose bool, maxErrors int) error {
 			// Skip patterns with alternations (|) or non-greedy quantifiers
 			// because DFA gives leftmost-longest while RE2 gives leftmost-first.
 			findOpts := compile.CompileOptions{
-				MaxDFAStates: maxDFAStates,
-				ForceEngine:  compile.EngineDFA,
-				Mode:         compile.ModeFind,
+				MaxDFAStates:  maxDFAStates,
+				ForceEngine:   compile.EngineDFA,
+				Mode:          compile.ModeFind,
+				LeftmostFirst: true,
 			}
 			parsedForFind, _ := syntax.Parse(pattern, syntax.Perl)
 			if parsedForFind != nil && !findModeUnsafe(parsedForFind) {
@@ -423,18 +424,11 @@ func hasWordBoundary(re *syntax.Regexp) bool {
 }
 
 // findModeUnsafe reports whether a pattern cannot be correctly tested in find
-// mode because DFA semantics (leftmost-longest) differ from RE2 (leftmost-first).
-// Patterns with alternations or non-greedy quantifiers fall into this category.
+// mode. With leftmost-first DFA, alternations and {m,n} repetitions are handled
+// correctly. Only non-greedy quantifiers remain unsafe.
 func findModeUnsafe(re *syntax.Regexp) bool {
 	switch re.Op {
-	case syntax.OpAlternate:
-		return true
 	case syntax.OpRepeat:
-		// Variable repetition {m,n} with m≠n has alternation-like semantics:
-		// RE2 leftmost-first picks the shortest match, DFA picks the longest.
-		if re.Min != re.Max {
-			return true
-		}
 		if re.Flags&syntax.NonGreedy != 0 {
 			return true
 		}

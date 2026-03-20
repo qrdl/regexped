@@ -26,7 +26,7 @@ const (
 // but we still need to track unset capture groups in the output.
 //
 // Returns the recommended EngineType for the given pattern.
-func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts ...CompileOptions) EngineType {
+func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *CompileOptions) EngineType {
 	// Analyse pattern complexity and DFA viability
 	analysis := analysePattern(prog)
 
@@ -107,12 +107,12 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts ..
 	maxDFAMemory := defaultMaxDFAMemory
 
 	// Apply optional parameters
-	if len(opts) > 0 {
-		if opts[0].MaxDFAStates > 0 {
-			maxDFAStates = opts[0].MaxDFAStates
+	if opts != nil {
+		if opts.MaxDFAStates > 0 {
+			maxDFAStates = opts.MaxDFAStates
 		}
-		if opts[0].MaxDFAMemory > 0 {
-			maxDFAMemory = opts[0].MaxDFAMemory
+		if opts.MaxDFAMemory > 0 {
+			maxDFAMemory = opts.MaxDFAMemory
 		}
 	}
 
@@ -136,91 +136,36 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts ..
 	// However, LAZY DFA can handle alternations correctly using priority-based matching!
 
 	// Word boundaries require backtracking specifically
-	// Check if pattern has end anchors that interact badly with alternations in lazy DFA
-	hasEndAnchor := false
-	for _, inst := range prog.Inst {
-		if inst.Op == syntax.InstEmptyWidth {
-			emptyOp := syntax.EmptyOp(inst.Arg)
-			if emptyOp&syntax.EmptyEndLine != 0 || emptyOp&syntax.EmptyEndText != 0 {
-				hasEndAnchor = true
-				break
-			}
-		}
-	}
-
-	canUsePikeVM := !(hasUserAlternations && hasEndAnchor) && !hasNestedQuant
-
-	// Word boundaries prefer NFA engines; allow AdaptiveNFA when Pike VM is safe
+	// Word boundaries and captures require NFA engines (not yet implemented in DFA).
 	if hasWordBoundary {
-		if canUsePikeVM {
-			slog.Debug("Engine selected", "engine", "AdaptiveNFA", "reason", "word boundaries with NFA fallback")
-			return EngineAdaptiveNFA
-		}
-		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "pattern has word boundaries, requires backtracking")
+		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "pattern has word boundaries")
 		return EngineBacktrack
 	}
 
-	// Use backtracking for patterns with captures
 	if hasCaptureGroups {
-		if canUsePikeVM {
-			slog.Debug("Engine selected", "engine", "AdaptiveNFA", "reason", "captures with NFA fallback")
-			return EngineAdaptiveNFA
-		}
 		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "pattern has captures")
 		return EngineBacktrack
 	}
 
-	// Lazy DFA can't properly handle alternations with end anchors
-	// because empty-width assertions are position-dependent but DFA states are position-independent
-	// Pike VM also struggles with alternation priority in these cases
-	// Use Backtracking which naturally implements leftmost-first
-	if hasUserAlternations && hasEndAnchor {
-		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "alternations with end anchor require position-dependent matching and leftmost-first semantics")
-		return EngineBacktrack
-	}
-
 	// Check if DFA is viable based on complexity analysis
-	// Lazy DFA can handle alternations with correct leftmost-first semantics
-	// Classical DFA is still faster for patterns WITHOUT alternations or nested quantifiers
 	if analysis.Recommendation == PreferDFA &&
 		dfaStates < maxDFAStates &&
 		dfaMem < maxDFAMemory {
 
-		// Use lazy DFA for patterns with alternations (without end anchors)
-		if hasUserAlternations {
-			slog.Debug("Engine selected", "engine", "Lazy DFA", "reason", "alternations with leftmost-first semantics", "complexity", complexity, "states", dfaStates)
-			return EngineLazyDFA
+		// Patterns with user alternations or nested quantifiers require leftmost-first semantics.
+		if hasUserAlternations || hasNestedQuant {
+			if opts != nil {
+				opts.LeftmostFirst = true
+			}
+			slog.Debug("Engine selected", "engine", "DFA", "reason", "leftmost-first semantics for alternations/nested quantifiers", "complexity", complexity, "states", dfaStates)
+			return EngineDFA
 		}
 
-		// Classical DFA cannot handle nested quantifiers (produces longest-match instead of leftmost-first)
-		// Pike VM also struggles with leftmost-first for nested quantifiers
-		// Use Backtracking which naturally implements leftmost-first by trying positions sequentially
-		if hasNestedQuant {
-			slog.Debug("Engine selected", "engine", "Backtrack", "reason", "nested quantifiers require leftmost-first semantics")
-			return EngineBacktrack
-		}
-
-		// Classical DFA cannot handle anchors (^, $, \A, \z) correctly
-		// The issue: DFA can't distinguish required vs optional anchors, leading to incorrect matching
-		// Examples: (?:^)?abc , (?:$)? - anchors are optional but DFA treats them as required
-		// While simple patterns like ^[a-z]+$ could work with DFA, detecting "simple" vs "complex"
-		// anchored patterns is error-prone. Pike VM handles all anchored cases correctly.
-		if hasAnchor {
-			slog.Debug("Engine selected", "engine", "Pike VM", "reason", "pattern has anchors, requires position-dependent matching")
-			return EnginePikeVM
-		}
-
-		// Use classical DFA for simple patterns (no alternations, no nested quantifiers, no anchors)
 		slog.Debug("Engine selected", "engine", "DFA", "reason", "simple pattern, fits in memory, fastest matching", "complexity", complexity, "states", dfaStates)
 		return EngineDFA
 	}
 
-	// Default to Backtracking (general-purpose NFA engine with visited tracking)
-	if canUsePikeVM {
-		slog.Debug("Engine selected", "engine", "AdaptiveNFA", "reason", "general-purpose NFA matching with runtime selection")
-		return EngineAdaptiveNFA
-	}
-	slog.Debug("Engine selected", "engine", "Backtrack", "reason", "general-purpose NFA matching with visited tracking")
+	slog.Debug("Engine selected", "engine", "Backtrack", "reason", "general-purpose fallback")
 	return EngineBacktrack
 }
 
