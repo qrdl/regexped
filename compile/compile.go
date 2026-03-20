@@ -147,6 +147,11 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 		if len(computePrefix(table)) == 0 {
 			dfaSize += 256
 		}
+		// wordCharTable (256 bytes) prepended before DFA table for word-boundary patterns.
+		// Also add midAcceptNW and midAcceptW flag arrays (numWASM bytes each).
+		if table.hasWordBoundary {
+			dfaSize += 256 + int64(numWASM)*2
+		}
 	}
 	if opts.LeftmostFirst && len(table.immediateAcceptStates) > 0 {
 		dfaSize += int64(numWASM) // immediateAccept flags
@@ -157,6 +162,25 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 
 	wasmBytes := genWASM(table, tableBase, exportName, standalone, memPages, opts.Mode, opts.LeftmostFirst)
 	return wasmBytes, tableEnd, nil
+}
+
+// SelectEngine returns the EngineType that would be chosen for the given pattern,
+// without actually compiling it. Returns an error if the pattern cannot be parsed
+// or compiled to NFA bytecode.
+func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return 0, fmt.Errorf("parse error: %w", err)
+	}
+	hasCapturesBeforeSimplify := re.MaxCap() > 0
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		return 0, fmt.Errorf("compile error: %w", err)
+	}
+	if needsUnicodeSupport(prog) && !opts.Unicode {
+		return 0, fmt.Errorf("pattern contains Unicode features but Unicode option not enabled")
+	}
+	return selectBestEngine(prog, hasCapturesBeforeSimplify, &opts), nil
 }
 
 // parseMode converts the YAML mode string to a MatchMode constant.

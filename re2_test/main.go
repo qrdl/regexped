@@ -23,15 +23,28 @@ const (
 )
 
 const (
-	skipNonAnchored = "non-anchored search"
-	skipCaptures    = "capture groups"
-	skipUnicode     = "contain Unicode"
-	skipStateLimit  = "exceeded state count limit"
-	skipOther       = "other reasons"
+	skipNonAnchored  = "requires Backtracking (non-greedy find mode)"
+	skipCaptures     = "requires Backtracking (capture groups)"
+	skipUnicode      = "requires Unicode support"
+	skipStateLimit   = "requires larger DFA (state limit exceeded)"
+	skipBadSyntax    = "unsupported RE2 syntax (invalid escape sequence)"
+	skipParseError   = "parse/compile error"
+	skipOther        = "other reasons"
 )
 
 // skipOrder controls the display order of skip reasons in the summary.
-var skipOrder = []string{skipNonAnchored, skipCaptures, skipUnicode, skipStateLimit, skipOther}
+var skipOrder = []string{
+	skipNonAnchored,
+	skipCaptures,
+	skipUnicode,
+	skipStateLimit,
+	skipBadSyntax,
+	skipParseError,
+	"requires " + compile.EngineBacktrack.String(),
+	"requires " + compile.EnginePikeVM.String(),
+	"requires " + compile.EngineAdaptiveNFA.String(),
+	skipOther,
+}
 
 func main() {
 	verbose := flag.Bool("v", false, "print every test case result")
@@ -133,14 +146,36 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				continue
 			}
 
+			selOpts := compile.CompileOptions{MaxDFAStates: maxDFAStates}
+			engineType, selErr := compile.SelectEngine(pattern, selOpts)
+			if selErr != nil {
+				errStr := selErr.Error()
+				reason := skipParseError
+				switch {
+				case strings.Contains(errStr, "Unicode"):
+					reason = skipUnicode
+				case strings.Contains(errStr, "invalid escape sequence"):
+					reason = skipBadSyntax
+				}
+				skipCount[reason] += len(testStrings)
+				input = append([]string(nil), testStrings...)
+				continue
+			}
+			if engineType != compile.EngineDFA {
+				skipCount["requires "+engineType.String()] += len(testStrings)
+				input = append([]string(nil), testStrings...)
+				continue
+			}
+
 			opts := compile.CompileOptions{
 				MaxDFAStates: maxDFAStates,
 				ForceEngine:  compile.EngineDFA,
 			}
 			wasmBytes, _, compErr := compile.CompileRegex(pattern, "match", tableBase, true, opts)
 			if compErr != nil {
+				errStr := compErr.Error()
 				reason := skipOther
-				if strings.Contains(compErr.Error(), "exceeds limit") {
+				if strings.Contains(errStr, "exceeds limit") {
 					reason = skipStateLimit
 				}
 				skipCount[reason] += len(testStrings)
@@ -404,23 +439,7 @@ func preCheck(pattern string) string {
 	if re.MaxCap() > 0 {
 		return skipCaptures
 	}
-	if hasWordBoundary(re) {
-		return skipOther
-	}
 	return ""
-}
-
-// hasWordBoundary reports whether re or any sub-expression uses \b or \B.
-func hasWordBoundary(re *syntax.Regexp) bool {
-	if re.Op == syntax.OpWordBoundary || re.Op == syntax.OpNoWordBoundary {
-		return true
-	}
-	for _, sub := range re.Sub {
-		if hasWordBoundary(sub) {
-			return true
-		}
-	}
-	return false
 }
 
 // findModeUnsafe reports whether a pattern cannot be correctly tested in find

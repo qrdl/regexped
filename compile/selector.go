@@ -30,8 +30,6 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 	// Analyse pattern complexity and DFA viability
 	analysis := analysePattern(prog)
 
-	// Check if pattern is one-pass (best performance)
-	isOnePassCandidate := isOnePass(prog)
 
 	// Check for anchors and word boundaries which are incompatible with our DFA implementation
 	// Classical DFA cannot properly handle position-dependent matching required by anchors (^, $, \A, \z)
@@ -102,71 +100,31 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 	// 3. If DFA is feasible (low state count, fits in memory), use it for speed
 	// 4. Otherwise, use Backtracking as the general-purpose default
 
-	// Set defaults
-	maxDFAStates := defaultMaxDFAStates
-	maxDFAMemory := defaultMaxDFAMemory
-
-	// Apply optional parameters
-	if opts != nil {
-		if opts.MaxDFAStates > 0 {
-			maxDFAStates = opts.MaxDFAStates
-		}
-		if opts.MaxDFAMemory > 0 {
-			maxDFAMemory = opts.MaxDFAMemory
-		}
-	}
 
 	// Check if pattern has capture groups
 	// NumCap counts: [0]=full match start, [1]=full match end, [2+]=explicit capture groups
 	// However, Simplify() may optimize away captures like (a){0}, so also check the flag
 	hasCaptureGroups := prog.NumCap > 2 || hadCapturesBeforeSimplify
 
-	// Try one-pass first if pattern is simple enough
-	// OnePass can handle many patterns including some simple alternations
-	if isOnePassCandidate && len(prog.Inst) < 50 && !hasWordBoundary {
-		slog.Debug("Engine selected", "engine", "OnePass", "reason", "deterministic single-state execution with capture support")
-		return EngineOnePass
-	}
-
-	// DFA limitations:
-	// 1. Classical DFA cannot handle word boundaries (\b, \B)
-	// 2. Classical DFA cannot handle capture groups
-	// 3. Classical DFA cannot implement leftmost-first for user alternations
-	//
-	// However, LAZY DFA can handle alternations correctly using priority-based matching!
-
-	// Word boundaries require backtracking specifically
-	// Word boundaries and captures require NFA engines (not yet implemented in DFA).
-	if hasWordBoundary {
-		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "pattern has word boundaries")
-		return EngineBacktrack
-	}
-
+	// Capture groups require NFA engines (not yet implemented in DFA).
 	if hasCaptureGroups {
 		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "pattern has captures")
 		return EngineBacktrack
 	}
 
-	// Check if DFA is viable based on complexity analysis
-	if analysis.Recommendation == PreferDFA &&
-		dfaStates < maxDFAStates &&
-		dfaMem < maxDFAMemory {
-
-		// Patterns with user alternations or nested quantifiers require leftmost-first semantics.
-		if hasUserAlternations || hasNestedQuant {
-			if opts != nil {
-				opts.LeftmostFirst = true
-			}
-			slog.Debug("Engine selected", "engine", "DFA", "reason", "leftmost-first semantics for alternations/nested quantifiers", "complexity", complexity, "states", dfaStates)
-			return EngineDFA
+	// DFA handles everything else. Patterns with user alternations or nested quantifiers
+	// need leftmost-first semantics; all others use standard leftmost-longest.
+	// The MaxDFAStates limit in CompileRegex is the real guard against state explosion.
+	if hasUserAlternations || hasNestedQuant {
+		if opts != nil {
+			opts.LeftmostFirst = true
 		}
-
-		slog.Debug("Engine selected", "engine", "DFA", "reason", "simple pattern, fits in memory, fastest matching", "complexity", complexity, "states", dfaStates)
+		slog.Debug("Engine selected", "engine", "DFA", "reason", "leftmost-first semantics for alternations/nested quantifiers", "complexity", complexity, "states", dfaStates)
 		return EngineDFA
 	}
 
-	slog.Debug("Engine selected", "engine", "Backtrack", "reason", "general-purpose fallback")
-	return EngineBacktrack
+	slog.Debug("Engine selected", "engine", "DFA", "reason", "simple pattern", "complexity", complexity, "states", dfaStates)
+	return EngineDFA
 }
 
 // hasNonLoopAlternations detects user alternations (| operator) vs quantifier loops.

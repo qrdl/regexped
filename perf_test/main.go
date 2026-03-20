@@ -129,6 +129,21 @@ var tests = []testCase{
 		},
 	},
 	{
+		// Combined secrets in a large 100KB file — realistic log/config scanning scenario.
+		// Contains multiple secret occurrences spread throughout the file.
+		name:    "secrets-combined-100kb",
+		pattern: `eyJ[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+|ghp_[A-Za-z0-9]{36}|AKIA[A-Z0-9]{16}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-secret 100KB", secretLargeInput(nil)},
+			{"3 secrets 100KB", secretLargeInput([]string{
+				"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+				"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
+				"export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+			})},
+		},
+	},
+	{
 		name:    "sql-inject",
 		pattern: `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`,
 		mode:    find,
@@ -172,6 +187,55 @@ export ENCRYPTION_KEY=replace_with_actual_key
 	}
 	mid := len(base) / 2
 	return base[:mid] + secret + "\n" + base[mid:]
+}
+
+// secretLargeInput returns a ~100KB environment/config file. If secrets is non-nil,
+// they are spread evenly throughout the file.
+func secretLargeInput(secrets []string) string {
+	const block = `# Application Configuration
+export APP_ENV=production
+export DATABASE_URL=postgres://appuser:secure_password@db.example.com:5432/appdb
+export REDIS_URL=redis://cache.example.com:6379/0
+export EMAIL_HOST=smtp.example.com
+export EMAIL_FROM=noreply@example.com
+export ENABLE_METRICS=true
+export METRICS_ENDPOINT=http://metrics.example.com:9090/metrics
+export LOG_LEVEL=error
+export LOG_FORMAT=json
+export API_BASE_URL=https://api.example.com/v2
+export API_TIMEOUT=30000
+export MAX_CONNECTIONS=100
+export ENABLE_CACHE=true
+export CACHE_TTL=3600
+export SESSION_SECRET=change_me_in_production
+export GITHUB_ORG=example-org
+export GITHUB_REPO=example-repo
+export AWS_REGION=us-east-1
+export AWS_S3_BUCKET=example-data-bucket
+export ENCRYPTION_KEY=replace_with_actual_key
+`
+	// ~100KB: block is ~450 bytes, repeat ~230 times
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+
+	if len(secrets) == 0 {
+		return base
+	}
+
+	// Spread secrets evenly through the file.
+	result := []byte(base)
+	step := len(result) / (len(secrets) + 1)
+	offset := 0
+	for i, secret := range secrets {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte(secret + "\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
 }
 
 func sqlCleanInput() string {
