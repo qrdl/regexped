@@ -159,26 +159,154 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 	tableEnd := utils.PageAlign(tableBase + dfaSize)
 	memPages := int32(tableEnd / 65536)
 
-	wasmBytes := genWASM(table, tableBase, exportName, standalone, memPages, opts.Mode, opts.LeftmostFirst)
+	matchExport, findExport := "", ""
+	if opts.Mode == ModeFind {
+		findExport = exportName
+	} else {
+		matchExport = exportName
+	}
+	wasmBytes := genWASM(table, tableBase, matchExport, findExport, standalone, memPages, opts.LeftmostFirst)
 	return wasmBytes, tableEnd, nil
 }
 
-// compileRegexEntry compiles a single RegexEntry to WASM using the new config schema.
-// It determines the appropriate engine based on which function stubs are requested.
+// compileRegexEntry compiles a single RegexEntry to WASM using the config schema.
+// Dispatches to the appropriate emitter based on which _func fields are set.
 func compileRegexEntry(re config.RegexEntry, tableBase int64) ([]byte, int64, error) {
-	captureNeeded := re.CaptureStubsRequested()
+	needMatch  := re.MatchFunc != ""
+	needFind   := re.FindFunc != ""
+	needGroups := re.CaptureStubsRequested()
 
-	// Determine which export name and mode to use for the primary function.
-	// Priority: groups > find > match.
-	if captureNeeded {
+	switch {
+	case needGroups && (needMatch || needFind):
+		return compileHybrid(re, tableBase, needMatch, needFind)
+	case needGroups:
 		return CompileOnePassGroups(re.Pattern, "groups", tableBase, false)
-	}
-	if re.FindFunc != "" {
+	case needMatch && needFind:
+		return compileDualDFA(re.Pattern, tableBase)
+	case needFind:
 		return CompileRegex(re.Pattern, "find", tableBase, false,
 			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, Mode: ModeFind})
+	default: // match only (or neither — treat as match)
+		return CompileRegex(re.Pattern, "match", tableBase, false,
+			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA})
 	}
-	return CompileRegex(re.Pattern, "match", tableBase, false,
-		CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA})
+}
+
+// compileDualDFA compiles a pattern to a WASM module with both a match and a
+// find function sharing the same DFA table.
+func compileDualDFA(pattern string, tableBase int64) ([]byte, int64, error) {
+	opts := CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, LeftmostFirst: true}
+	matcher, err := compile(pattern, opts)
+	if err != nil {
+		return nil, 0, fmt.Errorf("compile error: %w", err)
+	}
+	table := dfaTableFrom(matcher.(*dfa))
+	if opts.MaxDFAStates > 0 && table.numStates > opts.MaxDFAStates {
+		return nil, 0, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, opts.MaxDFAStates)
+	}
+
+	// Data size: find mode is the superset (includes mid-accept, first-byte, Teddy tables).
+	numWASM := table.numStates + 1
+	var dfaSize int64
+	switch {
+	case numWASM <= 256 && numWASM*256 > 32*1024:
+		_, _, nc := computeByteClasses(table)
+		dfaSize = int64(256 + numWASM*nc + numWASM)
+	case numWASM <= 256:
+		dfaSize = int64(numWASM*256 + numWASM)
+	default:
+		dfaSize = int64(numWASM*256*2 + numWASM)
+	}
+	// find-mode extras: midAccept + firstByte
+	dfaSize += int64(numWASM) + 256
+	if len(computePrefix(table)) == 0 {
+		// no prefix: firstByte table already counted above
+	}
+	if len(table.immediateAcceptStates) > 0 {
+		dfaSize += int64(numWASM)
+	}
+	if table.hasWordBoundary {
+		dfaSize += 256 + int64(numWASM)*2
+	}
+
+	tableEnd := utils.PageAlign(tableBase + dfaSize)
+	memPages := int32(tableEnd / 65536)
+
+	wasmBytes := genWASM(table, tableBase, "match", "find", false, memPages, opts.LeftmostFirst)
+	return wasmBytes, tableEnd, nil
+}
+
+// compileHybrid compiles a pattern to a WASM module combining DFA (match and/or
+// find) with OnePass (groups), all sharing one memory.
+func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bool) ([]byte, int64, error) {
+	// Compile DFA (captures stripped).
+	dfaOpts := CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, LeftmostFirst: true}
+	matcher, err := compile(re.Pattern, dfaOpts)
+	if err != nil {
+		return nil, 0, fmt.Errorf("compile DFA: %w", err)
+	}
+	table := dfaTableFrom(matcher.(*dfa))
+	if dfaOpts.MaxDFAStates > 0 && table.numStates > dfaOpts.MaxDFAStates {
+		return nil, 0, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, dfaOpts.MaxDFAStates)
+	}
+
+	// Estimate DFA data size (find mode superset).
+	numWASM := table.numStates + 1
+	var dfaSize int64
+	switch {
+	case numWASM <= 256 && numWASM*256 > 32*1024:
+		_, _, nc := computeByteClasses(table)
+		dfaSize = int64(256 + numWASM*nc + numWASM)
+	case numWASM <= 256:
+		dfaSize = int64(numWASM*256 + numWASM)
+	default:
+		dfaSize = int64(numWASM*256*2 + numWASM)
+	}
+	if needFind {
+		dfaSize += int64(numWASM) + 256 // midAccept + firstByte
+		if len(table.immediateAcceptStates) > 0 {
+			dfaSize += int64(numWASM)
+		}
+		if table.hasWordBoundary {
+			dfaSize += 256 + int64(numWASM)*2
+		}
+	} else {
+		if len(table.immediateAcceptStates) > 0 {
+			dfaSize += int64(numWASM)
+		}
+	}
+
+	// Compile OnePass.
+	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
+	if err != nil {
+		return nil, 0, fmt.Errorf("parse error: %w", err)
+	}
+	prog, err := syntax.Compile(parsed.Simplify())
+	if err != nil {
+		return nil, 0, fmt.Errorf("compile NFA: %w", err)
+	}
+	if !isOnePass(prog) {
+		return nil, 0, fmt.Errorf("pattern is not one-pass deterministic")
+	}
+	op := newOnePass(prog)
+
+	opTableBase := utils.PageAlign(tableBase + dfaSize)
+	opDataSize  := int64(op.numStates * 256)
+	tableEnd    := utils.PageAlign(opTableBase + opDataSize)
+	memPages    := int32(tableEnd / 65536)
+
+	matchExport := ""
+	if needMatch {
+		matchExport = "match"
+	}
+	findExport := ""
+	if needFind {
+		findExport = "find"
+	}
+
+	wasmBytes := genHybridWASM(table, tableBase, matchExport, findExport,
+		op, opTableBase, "groups", false, memPages, dfaOpts.LeftmostFirst)
+	return wasmBytes, tableEnd, nil
 }
 
 // CompileOnePassGroups compiles a pattern to a OnePass WASM module exporting

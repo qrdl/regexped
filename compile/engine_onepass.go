@@ -256,6 +256,43 @@ func matchesRuneInstOP(inst *syntax.Inst, r rune) bool {
 // --------------------------------------------------------------------------
 // WASM emission
 
+// onePassTypeEntry returns the raw type entry bytes for the groups function type:
+// (i32, i32, i32) → i32. Does not include the count prefix.
+func onePassTypeEntry() []byte {
+	return []byte{
+		0x60,                   // func
+		0x03, 0x7F, 0x7F, 0x7F, // 3 i32 params
+		0x01, 0x7F,             // 1 i32 result
+	}
+}
+
+// onePassExportEntry returns the raw export entry bytes for an export of the
+// groups function. funcIdx is the 0-based function index in the module.
+func onePassExportEntry(name string, funcIdx int) []byte {
+	var b []byte
+	b = appendString(b, name)
+	b = append(b, 0x00) // func kind
+	b = utils.AppendULEB128(b, uint32(funcIdx))
+	return b
+}
+
+// onePassCodeEntry returns a complete code-section body for the groups function
+// (size-prefixed, ready to append to the code section payload).
+func onePassCodeEntry(op *onePass, transOff int32) []byte {
+	body := buildOnePassBody(op, transOff)
+	var b []byte
+	b = utils.AppendULEB128(b, uint32(len(body)))
+	b = append(b, body...)
+	return b
+}
+
+// onePassDataEntry returns the raw data segment for the OnePass transition table
+// (no count prefix — caller manages the segment count).
+func onePassDataEntry(op *onePass, tableBase int64) []byte {
+	var b []byte
+	return appendDataSegment(b, int32(tableBase), op.transitions)
+}
+
 // genOnePassWASM generates a WASM module exporting a "groups" function:
 //
 //	(ptr: i32, len: i32, out_ptr: i32) → i32
@@ -268,35 +305,32 @@ func matchesRuneInstOP(inst *syntax.Inst, r rune) bool {
 func genOnePassWASM(op *onePass, tableBase int64, exportName string, standalone bool, memPages int32) []byte {
 	transOff := int32(tableBase)
 
-	body := buildOnePassBody(op, transOff)
-
-	// Type section content: one function type (i32,i32,i32)→i32
+	// Type section: 1 type
 	var typeContent []byte
-	typeContent = append(typeContent, 0x01)                  // 1 type
-	typeContent = append(typeContent, 0x60)                  // func
-	typeContent = append(typeContent, 0x03, 0x7F, 0x7F, 0x7F) // 3 i32 params
-	typeContent = append(typeContent, 0x01, 0x7F)            // 1 i32 result
+	typeContent = append(typeContent, 0x01) // count
+	typeContent = append(typeContent, onePassTypeEntry()...)
 
 	// Function section: 1 function, type index 0
-	var funcContent []byte
-	funcContent = append(funcContent, 0x01, 0x00)
+	funcContent := []byte{0x01, 0x00}
 
-	// Export section: export exportName → func 0
+	// Export section
 	var exportContent []byte
-	exportContent = append(exportContent, 0x01) // 1 export
-	exportContent = appendString(exportContent, exportName)
-	exportContent = append(exportContent, 0x00, 0x00) // func kind, index 0
+	if standalone {
+		exportContent = append(exportContent, 0x02) // 2 exports: func + memory
+		exportContent = append(exportContent, onePassExportEntry(exportName, 0)...)
+		exportContent = appendString(exportContent, "memory")
+		exportContent = append(exportContent, 0x02, 0x00) // memory kind, index 0
+	} else {
+		exportContent = append(exportContent, 0x01) // 1 export: func only
+		exportContent = append(exportContent, onePassExportEntry(exportName, 0)...)
+	}
 
 	// Code section: 1 body
-	var codeContent []byte
-	codeContent = append(codeContent, 0x01) // 1 body
-	codeContent = utils.AppendULEB128(codeContent, uint32(len(body)))
-	codeContent = append(codeContent, body...)
+	codeEntry := onePassCodeEntry(op, transOff)
+	codeContent := append([]byte{0x01}, codeEntry...)
 
-	// Data section: transition table
-	var dataContent []byte
-	dataContent = append(dataContent, 0x01) // 1 segment
-	dataContent = appendDataSegment(dataContent, transOff, op.transitions)
+	// Data section: 1 segment
+	dataContent := append([]byte{0x01}, onePassDataEntry(op, tableBase)...)
 
 	var out []byte
 	out = append(out, 0x00, 0x61, 0x73, 0x6D) // magic
@@ -322,17 +356,6 @@ func genOnePassWASM(op *onePass, tableBase int64, exportName string, standalone 
 		memContent = append(memContent, 0x01, 0x00) // 1 memory, no max
 		memContent = utils.AppendULEB128(memContent, uint32(memPages))
 		out = appendSection(out, 5, memContent)
-	}
-
-	// Export memory in standalone mode so callers can access it.
-	if standalone {
-		var memExportContent []byte
-		memExportContent = append(memExportContent, 0x02) // 2 exports
-		memExportContent = appendString(memExportContent, exportName)
-		memExportContent = append(memExportContent, 0x00, 0x00) // func 0
-		memExportContent = appendString(memExportContent, "memory")
-		memExportContent = append(memExportContent, 0x02, 0x00) // memory 0
-		exportContent = memExportContent
 	}
 
 	out = appendSection(out, 7, exportContent)

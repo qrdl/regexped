@@ -33,7 +33,8 @@ go.work.sum
 tmp
 regexped
 target
-perf_test/out
-re2_test/*.txt
-re2_test/re2_test
-perf_test/perf_test
+perftest/out
+perftest/*.txt
+re2test/*.txt
+re2test/re2test
+perftest/perftest

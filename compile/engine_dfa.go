@@ -737,233 +737,233 @@ func computeByteClasses(t *dfaTable) (classMap [256]byte, classRep []int, numCla
 //
 // The module imports memory as (import "main" "memory" (memory 0)) so that
 // wasm-merge can resolve it against the host module's exported memory.
-func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, memPages int32, mode MatchMode, leftmostFirst bool) []byte {
-	// WASM states: 0 = dead/sink, 1..N = Go states 0..N-1
-	numWASM := t.numStates + 1
-	wasmStart := uint32(t.startState + 1)
+// dfaLayout captures all computed DFA table data and offsets needed to emit
+// WASM function bodies and data sections. Built once, shared between match and
+// find functions in single-DFA and hybrid modules.
+type dfaLayout struct {
+	// Basic DFA state encoding
+	numWASM        int
+	wasmStart      uint32
+	useU8          bool
+	useCompression bool
 
-	// Use u8 state IDs when all state IDs fit in a single byte.
-	// Use byte class compression when the uncompressed u8 table exceeds L1 cache.
-	useU8          := numWASM <= 256
-	useCompression := useU8 && numWASM*256 > 32*1024
+	// Transition table
+	tableOff   int32
+	tableBytes []byte
+	classMapOff int32
+	classMap    [256]byte
+	classRep    []int
+	numClasses  int
 
-	// For find mode with word boundary assertions, we prepend a 256-byte wordCharTable
-	// before the DFA transition table so the WASM prologue can check the previous byte.
-	needWordCharTable := mode == ModeFind && t.hasWordBoundary
-	var wordCharTableOff int32
-	var wordCharTableBytes [256]byte
-	if needWordCharTable {
-		wordCharTableOff = int32(tableBase)
+	// Accept flags
+	acceptOff    int32
+	acceptBytes  []byte
+
+	// Find-mode flags
+	midAcceptOff   int32
+	midAcceptBytes []byte
+
+	// LeftmostFirst immediate-accept flags (both match and find)
+	immediateAcceptOff   int32
+	immediateAcceptBytes []byte
+	hasImmAccept         bool
+
+	// Word-boundary tables (find mode only)
+	needWordCharTable  bool
+	wordCharTableOff   int32
+	wordCharTableBytes [256]byte
+	midAcceptNWOff     int32
+	midAcceptWOff      int32
+	midAcceptNWBytes   []byte
+	midAcceptWBytes    []byte
+
+	// Fast-skip / SIMD (find mode only)
+	prefix        []byte
+	firstByteOff  int32
+	firstByteFlags [256]byte
+	firstBytes    []byte
+	teddyLoOff    int32
+	teddyHiOff    int32
+	teddyLoBytes  []byte
+	teddyHiBytes  []byte
+	teddyT1LoOff  int32
+	teddyT1HiOff  int32
+	teddyT1LoBytes []byte
+	teddyT1HiBytes []byte
+
+	// Find-mode DFA states
+	wasmMidStart     uint32
+	wasmMidStartWord uint32
+	wasmPrefixEnd    uint32
+	startBeginAccept bool
+}
+
+// buildDFALayout computes all DFA table data and offsets. needFind must be true
+// when a find function will be emitted (computes extra tables for find mode).
+func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool) *dfaLayout {
+	l := &dfaLayout{}
+	l.numWASM = t.numStates + 1
+	l.wasmStart = uint32(t.startState + 1)
+	l.useU8 = l.numWASM <= 256
+	l.useCompression = l.useU8 && l.numWASM*256 > 32*1024
+
+	// Word char table (find + word boundary only).
+	l.needWordCharTable = needFind && t.hasWordBoundary
+	wordCharTableSize := int32(0)
+	if l.needWordCharTable {
+		l.wordCharTableOff = int32(tableBase)
+		wordCharTableSize = 256
 		for b := 0; b < 256; b++ {
 			bb := byte(b)
 			if (bb >= 'A' && bb <= 'Z') || (bb >= 'a' && bb <= 'z') ||
 				(bb >= '0' && bb <= '9') || bb == '_' {
-				wordCharTableBytes[b] = 1
+				l.wordCharTableBytes[b] = 1
 			}
 		}
 	}
-	wordCharTableSize := int32(0)
-	if needWordCharTable {
-		wordCharTableSize = 256
-	}
 
-	// Memory layout:
-	//   compressed:   [wordCharTable(256B)?] classMap(256B) | table(numWASM*numClasses) | accept(numWASM)
-	//   u8 simple:    [wordCharTable(256B)?] table(numWASM*256) | accept(numWASM)
-	//   u16:          [wordCharTable(256B)?] table(numWASM*512) | accept(numWASM)
-	var (
-		classMapOff int32
-		tableOff    int32
-		classMap    [256]byte
-		classRep    []int
-		numClasses  int
-	)
-	if useCompression {
-		classMapOff = int32(tableBase) + wordCharTableSize
-		tableOff = int32(tableBase) + wordCharTableSize + 256
-		classMap, classRep, numClasses = computeByteClasses(t)
-	} else {
-		tableOff = int32(tableBase) + wordCharTableSize
-	}
-
-	// Build transition table.
-	var tableBytes []byte
-	if useCompression {
-		tableBytes = make([]byte, numWASM*numClasses)
+	// Transition table.
+	if l.useCompression {
+		l.classMapOff = int32(tableBase) + wordCharTableSize
+		l.tableOff = int32(tableBase) + wordCharTableSize + 256
+		l.classMap, l.classRep, l.numClasses = computeByteClasses(t)
+		l.tableBytes = make([]byte, l.numWASM*l.numClasses)
 		for gs := 0; gs < t.numStates; gs++ {
 			ws := gs + 1
-			for c, rep := range classRep {
+			for c, rep := range l.classRep {
 				next := t.transitions[gs*256+rep]
 				if next >= 0 {
-					tableBytes[ws*numClasses+c] = byte(next + 1)
-				}
-			}
-		}
-	} else if useU8 {
-		tableBytes = make([]byte, numWASM*256)
-		for gs := 0; gs < t.numStates; gs++ {
-			ws := gs + 1
-			for b := 0; b < 256; b++ {
-				next := t.transitions[gs*256+b]
-				if next >= 0 {
-					tableBytes[ws*256+b] = byte(next + 1)
+					l.tableBytes[ws*l.numClasses+c] = byte(next + 1)
 				}
 			}
 		}
 	} else {
-		tableBytes = make([]byte, numWASM*256*2)
-		for gs := 0; gs < t.numStates; gs++ {
-			ws := gs + 1
-			for b := 0; b < 256; b++ {
-				next := t.transitions[gs*256+b]
-				var wn uint16
-				if next >= 0 {
-					wn = uint16(next + 1)
+		l.tableOff = int32(tableBase) + wordCharTableSize
+		if l.useU8 {
+			l.tableBytes = make([]byte, l.numWASM*256)
+			for gs := 0; gs < t.numStates; gs++ {
+				ws := gs + 1
+				for b := 0; b < 256; b++ {
+					next := t.transitions[gs*256+b]
+					if next >= 0 {
+						l.tableBytes[ws*256+b] = byte(next + 1)
+					}
 				}
-				binary.LittleEndian.PutUint16(tableBytes[(ws*256+b)*2:], wn)
+			}
+		} else {
+			l.tableBytes = make([]byte, l.numWASM*256*2)
+			for gs := 0; gs < t.numStates; gs++ {
+				ws := gs + 1
+				for b := 0; b < 256; b++ {
+					next := t.transitions[gs*256+b]
+					var wn uint16
+					if next >= 0 {
+						wn = uint16(next + 1)
+					}
+					binary.LittleEndian.PutUint16(l.tableBytes[(ws*256+b)*2:], wn)
+				}
 			}
 		}
 	}
-	// Dead state row (row 0) stays all-zeros in all cases.
 
-	// EOF accept flags: 1 if state is accepting at end of input (via $ or \z).
-	acceptOff := tableOff + int32(len(tableBytes))
-	acceptBytes := make([]byte, numWASM)
+	// EOF accept flags.
+	l.acceptOff = l.tableOff + int32(len(l.tableBytes))
+	l.acceptBytes = make([]byte, l.numWASM)
 	for gs := range t.acceptStates {
-		acceptBytes[gs+1] = 1
+		l.acceptBytes[gs+1] = 1
 	}
 
-	// Mid-scan accept flags (find mode only): 1 if state accepts at any position.
-	midAcceptOff := acceptOff + int32(numWASM)
-	midAcceptBytes := make([]byte, numWASM)
+	// Mid-scan accept flags.
+	l.midAcceptOff = l.acceptOff + int32(l.numWASM)
+	l.midAcceptBytes = make([]byte, l.numWASM)
 	for gs := range t.midAcceptStates {
-		midAcceptBytes[gs+1] = 1
+		l.midAcceptBytes[gs+1] = 1
 	}
 
-	// Leftmost-first immediate accept flags: 1 if state should return match immediately.
-	var immediateAcceptOff int32
-	var immediateAcceptBytes []byte
+	// Immediate-accept flags (LeftmostFirst, both match and find).
 	if leftmostFirst && len(t.immediateAcceptStates) > 0 {
-		immediateAcceptOff = midAcceptOff + int32(numWASM)
-		immediateAcceptBytes = make([]byte, numWASM)
+		l.hasImmAccept = true
+		l.immediateAcceptOff = l.midAcceptOff + int32(l.numWASM)
+		l.immediateAcceptBytes = make([]byte, l.numWASM)
 		for gs := range t.immediateAcceptStates {
-			immediateAcceptBytes[gs+1] = 1
+			l.immediateAcceptBytes[gs+1] = 1
 		}
 	}
 
-	// Word-boundary pre-transition accept flags (find mode, WB patterns only).
-	// midAcceptNW[state]: accepts BEFORE consuming the next byte when that byte is non-word.
-	// midAcceptW[state]:  accepts BEFORE consuming the next byte when that byte is word.
 	immAcceptSize := int32(0)
-	if leftmostFirst && len(t.immediateAcceptStates) > 0 {
-		immAcceptSize = int32(numWASM)
+	if l.hasImmAccept {
+		immAcceptSize = int32(l.numWASM)
 	}
-	var midAcceptNWOff, midAcceptWOff int32
-	var midAcceptNWBytes, midAcceptWBytes []byte
-	if mode == ModeFind && t.hasWordBoundary {
-		midAcceptNWOff = midAcceptOff + int32(numWASM) + immAcceptSize
-		midAcceptWOff = midAcceptNWOff + int32(numWASM)
-		midAcceptNWBytes = make([]byte, numWASM)
-		midAcceptWBytes = make([]byte, numWASM)
+
+	// Word-boundary pre-transition accept flags (find mode only).
+	if needFind && t.hasWordBoundary {
+		l.midAcceptNWOff = l.midAcceptOff + int32(l.numWASM) + immAcceptSize
+		l.midAcceptWOff = l.midAcceptNWOff + int32(l.numWASM)
+		l.midAcceptNWBytes = make([]byte, l.numWASM)
+		l.midAcceptWBytes = make([]byte, l.numWASM)
 		for gs := range t.midAcceptNWStates {
-			midAcceptNWBytes[gs+1] = 1
+			l.midAcceptNWBytes[gs+1] = 1
 		}
 		for gs := range t.midAcceptWStates {
-			midAcceptWBytes[gs+1] = 1
+			l.midAcceptWBytes[gs+1] = 1
 		}
 	}
 	wbAcceptSize := int32(0)
-	if mode == ModeFind && t.hasWordBoundary {
-		wbAcceptSize = int32(numWASM) * 2
+	if needFind && t.hasWordBoundary {
+		wbAcceptSize = int32(l.numWASM) * 2
 	}
 
-	// Literal prefix + firstByteFlags for find mode fast-skip.
-	// If the DFA has a unique literal prefix (e.g. "ghp_", "eyJ", "AKIA"), the
-	// scan loop uses hardcoded byte comparisons — much faster than a table lookup
-	// for long inputs.  Falls back to firstByteFlags (256-byte table) when there
-	// is no unique prefix (e.g. combined patterns eyJ...|ghp_...|AKIA...).
-	prefix := computePrefix(t)
-	var firstByteOff int32
-	var firstByteFlags [256]byte
-	if len(prefix) == 0 {
-		firstByteOff = midAcceptOff + int32(numWASM) + immAcceptSize + wbAcceptSize
-		// If any start state is mid-accepting (can match empty string), every position
-		// is a candidate — the fast-skip must not skip any byte.
-		// This covers: (aa)* [midAcceptStates[midStartState]], ^(aa)* [midAcceptStates[startState]].
-		// Also covers WB pre-accept: if midStartState accepts before any byte (word or non-word),
-		// mark those bytes as valid start positions.
-		// WB pre-accept for midStartState (attempt_start > 0, prev=non-word).
+	// Find-mode fast-skip: literal prefix or firstByteFlags + Teddy tables.
+	l.prefix = computePrefix(t)
+	if needFind && len(l.prefix) == 0 {
+		l.firstByteOff = l.midAcceptOff + int32(l.numWASM) + immAcceptSize + wbAcceptSize
 		wbAcceptNWMid := t.hasWordBoundary && t.midAcceptNWStates[t.midStartState]
 		wbAcceptWMid := t.hasWordBoundary && t.midAcceptWStates[t.midStartState]
-		// WB pre-accept for startState (attempt_start == 0).
-		// If startState has WB pre-accept, position 0 must not be skipped.
 		wbAcceptNWStart0 := t.hasWordBoundary && t.midAcceptNWStates[t.startState]
 		wbAcceptWStart0 := t.hasWordBoundary && t.midAcceptWStates[t.startState]
 		if t.midAcceptStates[t.midStartState] || t.midAcceptStates[t.startState] || t.acceptStates[t.startState] ||
 			(wbAcceptNWMid && wbAcceptWMid) || (wbAcceptNWStart0 && wbAcceptWStart0) {
-			// All positions are candidates.
 			for b := 0; b < 256; b++ {
-				firstByteFlags[b] = 1
+				l.firstByteFlags[b] = 1
 			}
 		} else {
 			for b := 0; b < 256; b++ {
 				if t.transitions[t.startState*256+b] >= 0 || t.transitions[t.midStartState*256+b] >= 0 {
-					firstByteFlags[b] = 1
+					l.firstByteFlags[b] = 1
 				}
-				// WB pre-accept for mid-string start (attempt_start > 0): mark triggering bytes.
 				if wbAcceptWMid && isWordCharByte(byte(b)) {
-					firstByteFlags[b] = 1
+					l.firstByteFlags[b] = 1
 				}
 				if wbAcceptNWMid && !isWordCharByte(byte(b)) {
-					firstByteFlags[b] = 1
+					l.firstByteFlags[b] = 1
 				}
-				// WB pre-accept for position 0 (startState): also mark triggering bytes.
-				// These bytes will cause a match at position 0 via the startState.
 				if wbAcceptWStart0 && isWordCharByte(byte(b)) {
-					firstByteFlags[b] = 1
+					l.firstByteFlags[b] = 1
 				}
 				if wbAcceptNWStart0 && !isWordCharByte(byte(b)) {
-					firstByteFlags[b] = 1
+					l.firstByteFlags[b] = 1
 				}
 			}
 		}
-	}
 
-	// ── SIMD strategy for firstByteFlags path ─────────────────────────────
-	// Collect the set of first bytes S (bytes where firstByteFlags[b] != 0).
-	// |S| determines which scan strategy to use in find mode:
-	//   |S| <= 8:        Teddy nibble-based scan (preferred)
-	//   8 < |S| <= 16:   Multi-eq SIMD scan
-	//   |S| > 16 or all: Scalar table-lookup (unchanged)
-	var firstBytes []byte
-	var teddyLoOff, teddyHiOff int32
-	var teddyLoBytes, teddyHiBytes []byte // 16-byte nibble tables for 1-byte Teddy
-	var teddyT1LoOff, teddyT1HiOff int32
-	var teddyT1LoBytes, teddyT1HiBytes []byte // 16-byte nibble tables for 2-byte Teddy
-	if mode == ModeFind && len(prefix) == 0 {
 		for bv := 0; bv < 256; bv++ {
-			if firstByteFlags[bv] != 0 {
-				firstBytes = append(firstBytes, byte(bv))
+			if l.firstByteFlags[bv] != 0 {
+				l.firstBytes = append(l.firstBytes, byte(bv))
 			}
 		}
-		if len(firstBytes) <= 8 {
-			// 1-byte Teddy tables (T0) immediately follow the firstByteFlags table.
-			teddyLoOff = firstByteOff + 256
-			teddyHiOff = teddyLoOff + 16
-			teddyLoBytes = make([]byte, 16)
-			teddyHiBytes = make([]byte, 16)
-			for i, fb := range firstBytes {
-				teddyLoBytes[fb&0x0F] |= byte(1 << uint(i))
-				teddyHiBytes[fb>>4] |= byte(1 << uint(i))
+		if len(l.firstBytes) <= 8 {
+			l.teddyLoOff = l.firstByteOff + 256
+			l.teddyHiOff = l.teddyLoOff + 16
+			l.teddyLoBytes = make([]byte, 16)
+			l.teddyHiBytes = make([]byte, 16)
+			for i, fb := range l.firstBytes {
+				l.teddyLoBytes[fb&0x0F] |= byte(1 << uint(i))
+				l.teddyHiBytes[fb>>4] |= byte(1 << uint(i))
 			}
-
-			// 2-byte Teddy tables (T1): built by walking one DFA step from midStartState
-			// on each first byte and collecting the valid second bytes.
-			// Only used when each first byte leads to ≤ 64 valid second bytes.
 			t1Lo := make([]byte, 16)
 			t1Hi := make([]byte, 16)
 			useTwoByte := true
-			for i, fb := range firstBytes {
+			for i, fb := range l.firstBytes {
 				stateAfterFB := t.transitions[t.midStartState*256+int(fb)]
 				if stateAfterFB < 0 {
 					useTwoByte = false
@@ -983,157 +983,82 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 				}
 			}
 			if useTwoByte {
-				teddyT1LoBytes = t1Lo
-				teddyT1HiBytes = t1Hi
-				teddyT1LoOff = teddyHiOff + 16
-				teddyT1HiOff = teddyT1LoOff + 16
+				l.teddyT1LoBytes = t1Lo
+				l.teddyT1HiBytes = t1Hi
+				l.teddyT1LoOff = l.teddyHiOff + 16
+				l.teddyT1HiOff = l.teddyT1LoOff + 16
 			}
 		}
 	}
 
-	var out []byte
-
-	// ── Magic + version ──────────────────────────────────────────────────────
-	out = append(out, 0x00, 0x61, 0x73, 0x6D) // \0asm
-	out = append(out, 0x01, 0x00, 0x00, 0x00) // version 1
-
-	// ── Type section (id=1) ─────────────────────────────────────────────────
-	// anchored_match: (i32,i32)->i32   find: (i32,i32)->i64
-	resultType := byte(0x7F) // i32
-	if mode == ModeFind {
-		resultType = 0x7E // i64
-	}
-	ts := []byte{
-		0x01,             // 1 type
-		0x60,             // functype
-		0x02, 0x7F, 0x7F, // 2 params: i32, i32
-		0x01, resultType, // 1 result
-	}
-	out = appendSection(out, 1, ts)
-
-	if !standalone {
-		// ── Import section (id=2): (import "main" "memory" (memory 0)) ───────
-		var is []byte
-		is = append(is, 0x01) // 1 import
-		is = appendString(is, "main")
-		is = appendString(is, "memory")
-		is = append(is, 0x02)              // memory
-		is = append(is, 0x00)              // limit type: min only (no max)
-		is = utils.AppendULEB128(is, 0x00) // min 0 pages
-		out = appendSection(out, 2, is)
+	// Find-mode DFA state constants.
+	if needFind {
+		l.wasmMidStart = uint32(t.midStartState + 1)
+		l.wasmMidStartWord = uint32(t.midStartWordState + 1)
+		prefixEndState := t.midStartState
+		for _, ch := range l.prefix {
+			prefixEndState = t.transitions[prefixEndState*256+int(ch)]
+		}
+		l.wasmPrefixEnd = uint32(prefixEndState + 1)
+		l.startBeginAccept = t.startBeginAccept
 	}
 
-	// ── Function section (id=3): 1 function using type 0 ────────────────────
-	out = appendSection(out, 3, []byte{0x01, 0x00})
+	return l
+}
 
-	if standalone {
-		// ── Memory section (id=5): define own memory ─────────────────────────
-		var ms []byte
-		ms = append(ms, 0x01)                         // 1 memory
-		ms = append(ms, 0x00)                         // limit type: min only
-		ms = utils.AppendULEB128(ms, uint32(memPages)) // min N pages
-		out = appendSection(out, 5, ms)
-	}
-
-	// ── Export section (id=7) ────────────────────────────────────────────────
-	var es []byte
-	if standalone {
-		es = append(es, 0x02)              // 2 exports: memory + func
-		es = appendString(es, "memory")    // export memory so host can write inputs
-		es = append(es, 0x02)              // memory kind
-		es = utils.AppendULEB128(es, 0x00) // memory index 0
-	} else {
-		es = append(es, 0x01) // 1 export: func only
-	}
-	es = appendString(es, exportName)
-	es = append(es, 0x00) // func kind
-	es = utils.AppendULEB128(es, 0x00)
-	out = appendSection(out, 7, es)
-
-	// ── Code section (id=10): function body ─────────────────────────────────
-	var body []byte
-	wasmMidStart := uint32(t.midStartState + 1)
-	wasmMidStartWord := uint32(t.midStartWordState + 1)
-	// DFA state reached after consuming the literal prefix from midStartState.
-	// The find body starts the DFA scan from this state (skipping the prefix bytes).
-	prefixEndState := t.midStartState
-	for _, ch := range prefix {
-		prefixEndState = t.transitions[prefixEndState*256+int(ch)]
-	}
-	wasmPrefixEnd := uint32(prefixEndState + 1)
-	if mode == ModeFind {
-		body = buildFindBody(wasmStart, wasmMidStart, wasmMidStartWord, wasmPrefixEnd, tableOff, acceptOff, midAcceptOff, firstByteOff, prefix, classMapOff, numClasses, useU8, useCompression, t.startBeginAccept, immediateAcceptOff, leftmostFirst && len(t.immediateAcceptStates) > 0, wordCharTableOff, needWordCharTable, midAcceptNWOff, midAcceptWOff, firstByteFlags, firstBytes, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff, len(teddyT1LoBytes) > 0)
-	} else {
-		body = buildMatchBody(wasmStart, tableOff, acceptOff, classMapOff, numClasses, useU8, useCompression, immediateAcceptOff, leftmostFirst && len(t.immediateAcceptStates) > 0)
-	}
-	var cs []byte
-	cs = append(cs, 0x01) // 1 function
-	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	cs = append(cs, body...)
-	out = appendSection(out, 10, cs)
-
-	// ── Data section (id=11) ─────────────────────────────────────────────────
-	hasImmAccept := leftmostFirst && len(t.immediateAcceptStates) > 0
-	var ds []byte
-
-	// emitFindSegments appends data segments common to all find-mode paths.
-	// Order: [wordChar?] <trans-table> eofAccept midAccept [immAccept?] [midAcceptNW midAcceptW]? [firstByte?]
-	// Returns the segment count.
-	emitFindSegs := func(ds []byte, transSegs []byte) []byte {
-		if needWordCharTable {
-			ds = appendDataSegment(ds, wordCharTableOff, wordCharTableBytes[:])
+// dfaDataSegments builds the raw data-section payload (count byte + segments)
+// for a DFA layout. needFind controls whether find-mode-only tables are emitted.
+func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
+	emitFindSegs := func(ds, transSegs []byte) []byte {
+		if l.needWordCharTable {
+			ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
 		}
 		ds = append(ds, transSegs...)
-		ds = appendDataSegment(ds, acceptOff, acceptBytes)
-		ds = appendDataSegment(ds, midAcceptOff, midAcceptBytes)
-		if hasImmAccept {
-			ds = appendDataSegment(ds, immediateAcceptOff, immediateAcceptBytes)
+		ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
+		ds = appendDataSegment(ds, l.midAcceptOff, l.midAcceptBytes)
+		if l.hasImmAccept {
+			ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
 		}
-		if needWordCharTable {
-			ds = appendDataSegment(ds, midAcceptNWOff, midAcceptNWBytes)
-			ds = appendDataSegment(ds, midAcceptWOff, midAcceptWBytes)
+		if l.needWordCharTable {
+			ds = appendDataSegment(ds, l.midAcceptNWOff, l.midAcceptNWBytes)
+			ds = appendDataSegment(ds, l.midAcceptWOff, l.midAcceptWBytes)
 		}
 		return ds
 	}
-
-	// Count helper: base segments + optional extras.
-	findSegCount := func(baseSegs int) byte {
-		n := byte(baseSegs)
-		if hasImmAccept {
+	findSegCount := func(base int) byte {
+		n := byte(base)
+		if l.hasImmAccept {
 			n++
 		}
-		if needWordCharTable {
-			n += 3 // wordChar + midAcceptNW + midAcceptW
+		if l.needWordCharTable {
+			n += 3
 		}
 		return n
 	}
-
-	// teddySegs: extra data segments for Teddy nibble tables (T_lo + T_hi).
-	// Only emitted in find mode, no-prefix path, when |firstBytes| <= 8.
 	teddyExtraSegs := byte(0)
-	if len(teddyLoBytes) > 0 {
+	if len(l.teddyLoBytes) > 0 {
 		teddyExtraSegs = 2
-		if len(teddyT1LoBytes) > 0 {
+		if len(l.teddyT1LoBytes) > 0 {
 			teddyExtraSegs = 4
 		}
 	}
 
-	if useCompression {
-		if mode == ModeFind {
-			// base: classMap + table + eofAccept + midAccept = 4
+	var ds []byte
+	if l.useCompression {
+		if needFind {
 			var transSegs []byte
-			transSegs = appendDataSegment(transSegs, classMapOff, classMap[:])
-			transSegs = appendDataSegment(transSegs, tableOff, tableBytes)
-			if len(prefix) == 0 {
-				ds = append(ds, findSegCount(5)+teddyExtraSegs) // +firstByte [+teddyLo +teddyHi]
+			transSegs = appendDataSegment(transSegs, l.classMapOff, l.classMap[:])
+			transSegs = appendDataSegment(transSegs, l.tableOff, l.tableBytes)
+			if len(l.prefix) == 0 {
+				ds = append(ds, findSegCount(5)+teddyExtraSegs)
 				ds = emitFindSegs(ds, transSegs)
-				ds = appendDataSegment(ds, firstByteOff, firstByteFlags[:])
-				if len(teddyLoBytes) > 0 {
-					ds = appendDataSegment(ds, teddyLoOff, teddyLoBytes)
-					ds = appendDataSegment(ds, teddyHiOff, teddyHiBytes)
-					if len(teddyT1LoBytes) > 0 {
-						ds = appendDataSegment(ds, teddyT1LoOff, teddyT1LoBytes)
-						ds = appendDataSegment(ds, teddyT1HiOff, teddyT1HiBytes)
+				ds = appendDataSegment(ds, l.firstByteOff, l.firstByteFlags[:])
+				if len(l.teddyLoBytes) > 0 {
+					ds = appendDataSegment(ds, l.teddyLoOff, l.teddyLoBytes)
+					ds = appendDataSegment(ds, l.teddyHiOff, l.teddyHiBytes)
+					if len(l.teddyT1LoBytes) > 0 {
+						ds = appendDataSegment(ds, l.teddyT1LoOff, l.teddyT1LoBytes)
+						ds = appendDataSegment(ds, l.teddyT1HiOff, l.teddyT1HiBytes)
 					}
 				}
 			} else {
@@ -1142,32 +1067,31 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 			}
 		} else {
 			count := byte(3)
-			if hasImmAccept {
+			if l.hasImmAccept {
 				count++
 			}
-			ds = append(ds, count) // classMap + table + eofAccept [+ immAccept]
-			ds = appendDataSegment(ds, classMapOff, classMap[:])
-			ds = appendDataSegment(ds, tableOff, tableBytes)
-			ds = appendDataSegment(ds, acceptOff, acceptBytes)
-			if hasImmAccept {
-				ds = appendDataSegment(ds, immediateAcceptOff, immediateAcceptBytes)
+			ds = append(ds, count)
+			ds = appendDataSegment(ds, l.classMapOff, l.classMap[:])
+			ds = appendDataSegment(ds, l.tableOff, l.tableBytes)
+			ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
+			if l.hasImmAccept {
+				ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
 			}
 		}
 	} else {
-		if mode == ModeFind {
-			// base: table + eofAccept + midAccept = 3
+		if needFind {
 			var transSegs []byte
-			transSegs = appendDataSegment(transSegs, tableOff, tableBytes)
-			if len(prefix) == 0 {
-				ds = append(ds, findSegCount(4)+teddyExtraSegs) // +firstByte [+teddyLo +teddyHi]
+			transSegs = appendDataSegment(transSegs, l.tableOff, l.tableBytes)
+			if len(l.prefix) == 0 {
+				ds = append(ds, findSegCount(4)+teddyExtraSegs)
 				ds = emitFindSegs(ds, transSegs)
-				ds = appendDataSegment(ds, firstByteOff, firstByteFlags[:])
-				if len(teddyLoBytes) > 0 {
-					ds = appendDataSegment(ds, teddyLoOff, teddyLoBytes)
-					ds = appendDataSegment(ds, teddyHiOff, teddyHiBytes)
-					if len(teddyT1LoBytes) > 0 {
-						ds = appendDataSegment(ds, teddyT1LoOff, teddyT1LoBytes)
-						ds = appendDataSegment(ds, teddyT1HiOff, teddyT1HiBytes)
+				ds = appendDataSegment(ds, l.firstByteOff, l.firstByteFlags[:])
+				if len(l.teddyLoBytes) > 0 {
+					ds = appendDataSegment(ds, l.teddyLoOff, l.teddyLoBytes)
+					ds = appendDataSegment(ds, l.teddyHiOff, l.teddyHiBytes)
+					if len(l.teddyT1LoBytes) > 0 {
+						ds = appendDataSegment(ds, l.teddyT1LoOff, l.teddyT1LoBytes)
+						ds = appendDataSegment(ds, l.teddyT1HiOff, l.teddyT1HiBytes)
 					}
 				}
 			} else {
@@ -1176,18 +1100,267 @@ func genWASM(t *dfaTable, tableBase int64, exportName string, standalone bool, m
 			}
 		} else {
 			count := byte(2)
-			if hasImmAccept {
+			if l.hasImmAccept {
 				count++
 			}
-			ds = append(ds, count) // table + eofAccept [+ immAccept]
-			ds = appendDataSegment(ds, tableOff, tableBytes)
-			ds = appendDataSegment(ds, acceptOff, acceptBytes)
-			if hasImmAccept {
-				ds = appendDataSegment(ds, immediateAcceptOff, immediateAcceptBytes)
+			ds = append(ds, count)
+			ds = appendDataSegment(ds, l.tableOff, l.tableBytes)
+			ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
+			if l.hasImmAccept {
+				ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
 			}
 		}
 	}
-	out = appendSection(out, 11, ds)
+	return ds
+}
+
+// genWASM generates a WASM module with up to two DFA functions sharing one table.
+// matchExport and findExport are the exported function names; either may be empty
+// to omit that function. At least one must be non-empty.
+// The public API of CompileRegex is unchanged — it maps exportName+mode internally.
+func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, standalone bool, memPages int32, leftmostFirst bool) []byte {
+	needFind := findExport != ""
+	needMatch := matchExport != ""
+
+	l := buildDFALayout(t, tableBase, needFind, leftmostFirst)
+
+	var out []byte
+	out = append(out, 0x00, 0x61, 0x73, 0x6D) // magic
+	out = append(out, 0x01, 0x00, 0x00, 0x00) // version
+
+	// ── Type section ─────────────────────────────────────────────────────────
+	// match: (i32,i32)→i32  type index 0 (if present)
+	// find:  (i32,i32)→i64  type index 0 or 1
+	numTypes := 0
+	matchTypeIdx := -1
+	findTypeIdx := -1
+	var ts []byte
+	if needMatch {
+		matchTypeIdx = numTypes
+		numTypes++
+		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F) // (i32,i32)→i32
+	}
+	if needFind {
+		findTypeIdx = numTypes
+		numTypes++
+		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E) // (i32,i32)→i64
+	}
+	out = appendSection(out, 1, append(utils.AppendULEB128(nil, uint32(numTypes)), ts...))
+
+	// ── Import section ───────────────────────────────────────────────────────
+	if !standalone {
+		var is []byte
+		is = append(is, 0x01)
+		is = appendString(is, "main")
+		is = appendString(is, "memory")
+		is = append(is, 0x02)
+		is = append(is, 0x00)
+		is = utils.AppendULEB128(is, 0x00)
+		out = appendSection(out, 2, is)
+	}
+
+	// ── Function section ─────────────────────────────────────────────────────
+	var fs []byte
+	fs = utils.AppendULEB128(fs, uint32(numTypes)) // numFuncs == numTypes here
+	if needMatch {
+		fs = utils.AppendULEB128(fs, uint32(matchTypeIdx))
+	}
+	if needFind {
+		fs = utils.AppendULEB128(fs, uint32(findTypeIdx))
+	}
+	out = appendSection(out, 3, fs)
+
+	// ── Memory section (standalone only) ─────────────────────────────────────
+	if standalone {
+		var ms []byte
+		ms = append(ms, 0x01, 0x00)
+		ms = utils.AppendULEB128(ms, uint32(memPages))
+		out = appendSection(out, 5, ms)
+	}
+
+	// ── Export section ───────────────────────────────────────────────────────
+	numExports := numTypes
+	if standalone {
+		numExports++ // memory
+	}
+	var es []byte
+	es = utils.AppendULEB128(es, uint32(numExports))
+	if standalone {
+		es = appendString(es, "memory")
+		es = append(es, 0x02)
+		es = utils.AppendULEB128(es, 0x00)
+	}
+	funcIdx := 0
+	if needMatch {
+		es = appendString(es, matchExport)
+		es = append(es, 0x00)
+		es = utils.AppendULEB128(es, uint32(funcIdx))
+		funcIdx++
+	}
+	if needFind {
+		es = appendString(es, findExport)
+		es = append(es, 0x00)
+		es = utils.AppendULEB128(es, uint32(funcIdx))
+	}
+	out = appendSection(out, 7, es)
+
+	// ── Code section ─────────────────────────────────────────────────────────
+	var cs []byte
+	cs = utils.AppendULEB128(cs, uint32(numTypes))
+	if needMatch {
+		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept)
+		cs = utils.AppendULEB128(cs, uint32(len(body)))
+		cs = append(cs, body...)
+	}
+	if needFind {
+		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0)
+		cs = utils.AppendULEB128(cs, uint32(len(body)))
+		cs = append(cs, body...)
+	}
+	out = appendSection(out, 10, cs)
+
+	// ── Data section ─────────────────────────────────────────────────────────
+	out = appendSection(out, 11, dfaDataSegments(l, needFind))
+
+	return out
+}
+
+// genHybridWASM generates a single WASM module containing up to three functions:
+//   - matchExport: DFA anchored match (i32,i32)→i32  — omitted if ""
+//   - findExport:  DFA non-anchored find (i32,i32)→i64 — omitted if ""
+//   - groupsExport: OnePass anchored groups (i32,i32,i32)→i32 — omitted if op==nil
+//
+// DFA tables are placed at dfaTableBase; OnePass table at opTableBase.
+// Both share a single memory.
+func genHybridWASM(
+	t *dfaTable, dfaTableBase int64, matchExport, findExport string,
+	op *onePass, opTableBase int64, groupsExport string,
+	standalone bool, memPages int32, leftmostFirst bool,
+) []byte {
+	needFind := findExport != ""
+	needMatch := matchExport != ""
+	needGroups := op != nil && groupsExport != ""
+
+	l := buildDFALayout(t, dfaTableBase, needFind, leftmostFirst)
+
+	var out []byte
+	out = append(out, 0x00, 0x61, 0x73, 0x6D)
+	out = append(out, 0x01, 0x00, 0x00, 0x00)
+
+	// ── Type section ─────────────────────────────────────────────────────────
+	// Assign type indices in the order: match, find, groups.
+	numTypes := 0
+	matchTypeIdx := -1
+	findTypeIdx := -1
+	groupsTypeIdx := -1
+	var ts []byte
+	if needMatch {
+		matchTypeIdx = numTypes
+		numTypes++
+		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F) // (i32,i32)→i32
+	}
+	if needFind {
+		findTypeIdx = numTypes
+		numTypes++
+		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E) // (i32,i32)→i64
+	}
+	if needGroups {
+		groupsTypeIdx = numTypes
+		numTypes++
+		ts = append(ts, onePassTypeEntry()...)                 // (i32,i32,i32)→i32
+	}
+	out = appendSection(out, 1, append(utils.AppendULEB128(nil, uint32(numTypes)), ts...))
+
+	// ── Import section ───────────────────────────────────────────────────────
+	if !standalone {
+		var is []byte
+		is = append(is, 0x01)
+		is = appendString(is, "main")
+		is = appendString(is, "memory")
+		is = append(is, 0x02, 0x00)
+		is = utils.AppendULEB128(is, 0x00)
+		out = appendSection(out, 2, is)
+	}
+
+	// ── Function section ─────────────────────────────────────────────────────
+	var fs []byte
+	fs = utils.AppendULEB128(fs, uint32(numTypes))
+	if needMatch {
+		fs = utils.AppendULEB128(fs, uint32(matchTypeIdx))
+	}
+	if needFind {
+		fs = utils.AppendULEB128(fs, uint32(findTypeIdx))
+	}
+	if needGroups {
+		fs = utils.AppendULEB128(fs, uint32(groupsTypeIdx))
+	}
+	out = appendSection(out, 3, fs)
+
+	// ── Memory section (standalone only) ─────────────────────────────────────
+	if standalone {
+		var ms []byte
+		ms = append(ms, 0x01, 0x00)
+		ms = utils.AppendULEB128(ms, uint32(memPages))
+		out = appendSection(out, 5, ms)
+	}
+
+	// ── Export section ───────────────────────────────────────────────────────
+	numExports := numTypes
+	if standalone {
+		numExports++ // memory
+	}
+	var es []byte
+	es = utils.AppendULEB128(es, uint32(numExports))
+	if standalone {
+		es = appendString(es, "memory")
+		es = append(es, 0x02)
+		es = utils.AppendULEB128(es, 0x00)
+	}
+	funcIdx := 0
+	if needMatch {
+		es = appendString(es, matchExport)
+		es = append(es, 0x00)
+		es = utils.AppendULEB128(es, uint32(funcIdx))
+		funcIdx++
+	}
+	if needFind {
+		es = appendString(es, findExport)
+		es = append(es, 0x00)
+		es = utils.AppendULEB128(es, uint32(funcIdx))
+		funcIdx++
+	}
+	if needGroups {
+		es = append(es, onePassExportEntry(groupsExport, funcIdx)...)
+	}
+	out = appendSection(out, 7, es)
+
+	// ── Code section ─────────────────────────────────────────────────────────
+	var cs []byte
+	cs = utils.AppendULEB128(cs, uint32(numTypes))
+	if needMatch {
+		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept)
+		cs = utils.AppendULEB128(cs, uint32(len(body)))
+		cs = append(cs, body...)
+	}
+	if needFind {
+		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0)
+		cs = utils.AppendULEB128(cs, uint32(len(body)))
+		cs = append(cs, body...)
+	}
+	if needGroups {
+		cs = append(cs, onePassCodeEntry(op, int32(opTableBase))...)
+	}
+	out = appendSection(out, 10, cs)
+
+	// ── Data section ─────────────────────────────────────────────────────────
+	// DFA segments (count byte already included), then OnePass segment appended.
+	dfaDS := dfaDataSegments(l, needFind)
+	if needGroups {
+		// Increment the count byte (first byte of dfaDS) by 1 for the OnePass segment.
+		dfaDS[0]++
+		dfaDS = append(dfaDS, onePassDataEntry(op, opTableBase)...)
+	}
+	out = appendSection(out, 11, dfaDS)
 
 	return out
 }

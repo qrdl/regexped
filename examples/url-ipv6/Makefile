@@ -37,20 +37,20 @@ merge: $(FINAL_WASM)
 
 # Step 5 – run with a few test inputs
 run: $(FINAL_WASM)
-	@echo "=== plain text, no URL ==="
-	wasmtime run $(FINAL_WASM) "hello world, no URLs here"
+	@echo "=== not a URL ==="
+	wasmtime run $(FINAL_WASM) "hello world"
 	@echo ""
 	@echo "=== IPv4 URL (not matched) ==="
 	wasmtime run $(FINAL_WASM) "https://example.com/page"
 	@echo ""
 	@echo "=== IPv6 URL, no port ==="
-	wasmtime run $(FINAL_WASM) "connect to https://[2001:db8::1]/api"
+	wasmtime run $(FINAL_WASM) "https://[2001:db8::1]/api"
 	@echo ""
 	@echo "=== IPv6 URL with port ==="
-	wasmtime run $(FINAL_WASM) "endpoint https://[::1]:8080/health is up"
+	wasmtime run $(FINAL_WASM) "https://[::1]:8080/health"
 	@echo ""
-	@echo "=== IPv6 URL embedded mid-sentence ==="
-	wasmtime run $(FINAL_WASM) "primary http://[fe80::1]/index secondary http://example.com"
+	@echo "=== IPv6 loopback, path and query ==="
+	wasmtime run $(FINAL_WASM) "http://[fe80::1]/index?page=1"
 
 clean:
 	cargo clean

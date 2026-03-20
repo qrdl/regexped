@@ -7,9 +7,12 @@ import (
 )
 
 func genRustMatchStub(pattern, importModule, funcName string) string {
-	exportName := "match"
+	// "match" is a Rust keyword, so we use #[link_name] to bind the WASM export
+	// "match" to a Rust-legal FFI name.
+	ffiName := "ffi_match"
 	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
+    #[link_name = "match"]
     fn %s(ptr: *const u8, len: usize) -> i32;
 }
 
@@ -22,7 +25,7 @@ pub fn %s(input: &[u8]) -> Option<usize> {
     }
 }
 
-`, importModule, exportName, funcName, exportName)
+`, importModule, ffiName, funcName, ffiName)
 }
 
 func genRustFindStubs(pattern, importModule, funcName string) string {
