@@ -1649,471 +1649,112 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 	//        state=startState, pos=attempt_start, last_accept=-1
 	//        if accept[state]: last_accept=pos  (start-state empty-match check)
 	emitOuterPrologue := func(b []byte) []byte {
-		if len(prefix) >= 1 {
-			// ── Hybrid SIMD prefix scan ───────────────────────────────────────
-			// One v128 load per 16-byte chunk.  Two-phase inner check:
-			//
-			//   Phase A (fast path): if prefix[0] absent in chunk → advance 16.
-			//   Phase B (slow path, only when prefix[0] found): compute combined
-			//     bitmask for ALL prefix bytes from the same v128 local (register
-			//     ops, no extra memory loads).  Combined != 0 → exact match.
-			//     Combined == 0 → advance by step=(17-N) for overlap coverage.
-			//
-			// This pays O(N) SIMD ops only on chunks that contain prefix[0],
-			// so rare first-byte patterns (e.g. 'g') stay fast.
-			//
-			// Block/loop nesting and br depths:
-			//
-			//   inside $simd_outer (loop, not in any if):
-			//     0=$simd_outer  1=$simd_exhausted  2=$prefix_matched
-			//     3=$outer  4=$no_match
-			//
-			//   inside outer if (mask_g != 0):
-			//     0=outerif  1=$simd_outer  2=$simd_exhausted  3=$prefix_matched
-			//     → br 1 restarts $simd_outer (combined==0 path)
-			//
-			//   inside inner if (combined != 0):
-			//     0=innerif  1=outerif  2=$simd_outer  3=$simd_exhausted
-			//     4=$prefix_matched
-			//     → br 4 exits $prefix_matched (match found)
-			//
-			//   inside $scalar (loop):
-			//     0=$scalar  1=$prefix_matched  2=$outer  3=$no_match
-			//     → br_if 3 = no_match;  mismatch ifs: br 1 restarts $scalar
-
-			step := 17 - len(prefix) // advance when prefix[0] found but full prefix absent
-			if step < 1 {
-				step = 1
-			}
-
-			b = append(b, 0x02, 0x40) // block $prefix_matched (void)
-			b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
-			b = append(b, 0x03, 0x40) // loop $simd_outer (void)
-
-			// if attempt_start + 15 >= len: br 1 → $simd_exhausted (scalar tail)
-			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x41, 0x0F) // i32.const 15
-			b = append(b, 0x6A)       // i32.add
-			b = append(b, 0x20, 0x01) // local.get len
-			b = append(b, 0x4F)       // i32.ge_u
-			b = append(b, 0x0D, 0x01) // br_if 1 → $simd_exhausted
-
-			// Load 16 bytes once into v128 local.
-			b = append(b, 0x20, 0x00)              // local.get ptr
-			b = append(b, 0x20, 0x04)              // local.get attempt_start
-			b = append(b, 0x6A)                    // i32.add
-			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-			b = append(b, 0x21, chunkLocal)        // local.set chunk
-
-			// Phase A: mask for prefix[0] only.
-			b = append(b, 0x20, chunkLocal)    // local.get chunk
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(prefix[0]))
-			b = append(b, 0xFD, 0x0F)          // i8x16.splat
-			b = append(b, 0xFD, 0x23)          // i8x16.eq
-			b = append(b, 0xFD, 0x64)          // i8x16.bitmask → i32
-			b = append(b, 0x22, simdMaskLocal) // local.tee simdMask (store + keep on stack)
-
-			// if mask != 0: prefix[0] found → Phase B
-			b = append(b, 0x04, 0x40) // if (void): mask_g != 0  [outer if]
-
-			// Phase B: refine with prefix[1..] using same v128 local (register ops).
-			for k := 1; k < len(prefix); k++ {
-				b = append(b, 0x20, chunkLocal)    // local.get chunk  (register, no reload)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(prefix[k]))
-				b = append(b, 0xFD, 0x0F)          // i8x16.splat
-				b = append(b, 0xFD, 0x23)          // i8x16.eq
-				b = append(b, 0xFD, 0x64)          // i8x16.bitmask → i32
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(k))
-				b = append(b, 0x76)                // i32.shr_u  (align with prefix[0] positions)
-				b = append(b, 0x20, simdMaskLocal) // local.get simdMask
-				b = append(b, 0x71)                // i32.and
-				b = append(b, 0x21, simdMaskLocal) // local.set simdMask
-			}
-
-			// if combined != 0: exact match at ctz position  [inner if]
-			b = append(b, 0x20, simdMaskLocal) // local.get simdMask
-			b = append(b, 0x04, 0x40)          // if (void)
-			b = append(b, 0x20, 0x04)          // local.get attempt_start
-			b = append(b, 0x20, simdMaskLocal) // local.get simdMask
-			b = append(b, 0x68)                // i32.ctz
-			b = append(b, 0x6A)                // i32.add
-			b = append(b, 0x21, 0x04)          // local.set attempt_start
-			b = append(b, 0x0C, 0x04)          // br 4 → exit $prefix_matched
-			b = append(b, 0x0B)                // end inner if
-
-			// combined == 0: prefix[0] present but full prefix absent in window.
-			// Advance by step (overlap) so boundary positions are covered next.
-			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(step))
-			b = append(b, 0x6A)       // i32.add
-			b = append(b, 0x21, 0x04) // local.set attempt_start
-			b = append(b, 0x0C, 0x01) // br 1 → restart $simd_outer
-			b = append(b, 0x0B)       // end outer if
-
-			// Phase A fast path: mask_g == 0, advance 16 and reload.
-			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x41, 0x10) // i32.const 16
-			b = append(b, 0x6A)       // i32.add
-			b = append(b, 0x21, 0x04) // local.set attempt_start
-			b = append(b, 0x0C, 0x00) // br 0 → restart $simd_outer
-
-			b = append(b, 0x0B) // end loop $simd_outer
-			b = append(b, 0x0B) // end block $simd_exhausted
-
-			// ── Scalar tail (< 16 bytes remaining) ───────────────────────────
-			b = append(b, 0x03, 0x40) // loop $scalar (void)
-
-			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x20, 0x01) // local.get len
-			b = append(b, 0x4F)       // i32.ge_u
-			b = append(b, 0x0D, 0x03) // br_if 3 → $no_match
-
-			for k := 0; k < len(prefix); k++ {
-				b = append(b, 0x20, 0x00) // local.get ptr
-				b = append(b, 0x20, 0x04) // local.get attempt_start
-				b = append(b, 0x6A)       // i32.add
-				b = append(b, 0x2D, 0x00) // i32.load8_u align=0 …
-				b = utils.AppendULEB128(b, uint32(k))
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(prefix[k]))
-				b = append(b, 0x47)       // i32.ne
-				b = append(b, 0x04, 0x40) // if (void): mismatch
-				b = append(b, 0x20, 0x04) // attempt_start++
-				b = append(b, 0x41, 0x01)
-				b = append(b, 0x6A)
-				b = append(b, 0x21, 0x04)
-				b = append(b, 0x0C, 0x01) // br 1 → restart $scalar
-				b = append(b, 0x0B)       // end if
-			}
-			b = append(b, 0x0B) // end loop $scalar  (fall-through = full match)
-			b = append(b, 0x0B) // end block $prefix_matched
-
-			// attempt_start now points at the start of the matched prefix.
-			// The > len check is not needed: prefix scan exits via br_if 3
-			// when attempt_start >= len, so we always have attempt_start < len here.
-		} else {
-			// ── firstByteFlags / SIMD fast-skip ───────────────────────────────
-			// No unique literal prefix (e.g. combined alternating pattern).
-			// Strategy based on |firstBytes| (= number of distinct first bytes):
-			//   |S| <= 8:       Teddy nibble SIMD (two 16-byte lookup tables)
-			//   8 < |S| <= 16:  Multi-eq SIMD (OR of |S| equality masks)
-			//   |S| > 16:       Scalar 256-byte flag table (unchanged)
-			//
-			// For SIMD paths the structure is:
-			//   block $found_candidate
-			//     block $simd_exhausted
-			//       loop $simd_outer
-			//         ;; depths: 0=$simd_outer 1=$simd_exhausted 2=$found_candidate
-			//         ;;         3=$outer 4=$no_match
-			//         if attempt_start+15 >= len → br 1 ($simd_exhausted)
-			//         [compute 16-byte mask for this chunk]
-			//         if mask != 0: attempt_start += ctz; br 2 ($found_candidate)
-			//         attempt_start += 16; br 0
-			//       end loop
-			//     end $simd_exhausted
-			//     ;; scalar tail (< 16 bytes remaining) uses firstByteFlags
-			//     block $skipdone
-			//       loop $skip
-			//         ;; depths: 0=$skip 1=$skipdone 2=$found_candidate 3=$outer 4=$no_match
-			//         if attempt_start >= len → br 1
-			//         if firstByteFlags[byte] → br 2 ($found_candidate)
-			//         attempt_start++; br 0
-			//       end loop
-			//     end $skipdone
-			//   end $found_candidate
-			//   if attempt_start > len → br 1 ($no_match)
-			//
-			// For scalar-only path the structure is unchanged (no wrapper block).
-
-			useSIMD := len(firstBytes) > 0 && len(firstBytes) <= 16
-
-			if useSIMD {
-				// Pre-load Teddy tables into v128 locals once before the loop (loop-invariant).
-				if len(firstBytes) <= 8 {
+		params := PrefixScanParams{
+			Prefix:         prefix,
+			FirstByteSet:   firstBytes,
+			FirstByteFlags: firstByteFlags,
+			FirstByteOff:   firstByteOff,
+			TeddyLoOff:     teddyLoOff,
+			TeddyHiOff:     teddyHiOff,
+			TeddyT1LoOff:   teddyT1LoOff,
+			TeddyT1HiOff:   teddyT1HiOff,
+			TeddyTwoByte:   teddyTwoByte,
+			EngineDepth:    2, // loop $outer + block $no_match
+			Locals: PrefixScanLocals{
+				Ptr:          0,
+				Len:          1,
+				AttemptStart: 4,
+				SimdMask:     simdMaskLocal,
+				Chunk:        chunkLocal,
+				TLo:          tLoLocal,
+				THi:          tHiLocal,
+				Chunk1:       chunk1Local,
+				T1Lo:         t1LoLocal,
+				T1Hi:         t1HiLocal,
+			},
+			OnMatch: func(b []byte) []byte {
+				if len(prefix) >= 1 {
+					// Prefix scan consumed prefix bytes: start DFA from prefixEndState
+					// at pos = attempt_start + len(prefix).
 					b = append(b, 0x41)
-					b = utils.AppendSLEB128(b, teddyLoOff)
-					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T_lo
-					b = append(b, 0x21, tLoLocal)          // local.set tLoLocal
+					b = utils.AppendSLEB128(b, int32(prefixEndState))
+					b = append(b, 0x21, 0x02) // state = prefixEndState
+					b = append(b, 0x20, 0x04) // local.get attempt_start
 					b = append(b, 0x41)
-					b = utils.AppendSLEB128(b, teddyHiOff)
-					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T_hi
-					b = append(b, 0x21, tHiLocal)          // local.set tHiLocal
-					// Pre-load T1 tables for 2-byte Teddy if available.
-					if teddyTwoByte {
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, teddyT1LoOff)
-						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T1_lo
-						b = append(b, 0x21, t1LoLocal)         // local.set t1LoLocal
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, teddyT1HiOff)
-						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T1_hi
-						b = append(b, 0x21, t1HiLocal)         // local.set t1HiLocal
-					}
-				}
-
-				b = append(b, 0x02, 0x40) // block $found_candidate (void)
-				b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
-				b = append(b, 0x03, 0x40) // loop $simd_outer (void)
-
-				// Bounds: need 16 bytes for 1-byte Teddy, 17 for 2-byte (chunk1 reads +1..+16).
-				b = append(b, 0x20, 0x04) // local.get attempt_start
-				if teddyTwoByte && len(firstBytes) <= 8 {
-					b = append(b, 0x41, 0x10) // i32.const 16
+					b = utils.AppendSLEB128(b, int32(len(prefix)))
+					b = append(b, 0x6A)       // i32.add
+					b = append(b, 0x21, 0x03) // pos = attempt_start + prefix_len
 				} else {
-					b = append(b, 0x41, 0x0F) // i32.const 15
-				}
-				b = append(b, 0x6A)       // i32.add
-				b = append(b, 0x20, 0x01) // local.get len
-				b = append(b, 0x4F)       // i32.ge_u
-				b = append(b, 0x0D, 0x01) // br_if 1 → $simd_exhausted
-
-				// Load 16-byte chunk into v128 local (chunkLocal).
-				b = append(b, 0x20, 0x00)              // local.get ptr
-				b = append(b, 0x20, 0x04)              // local.get attempt_start
-				b = append(b, 0x6A)                    // i32.add
-				b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-				b = append(b, 0x21, chunkLocal)        // local.set chunk
-
-				// For 2-byte Teddy: also load chunk at offset+1.
-				if teddyTwoByte && len(firstBytes) <= 8 {
-					b = append(b, 0x20, 0x00)              // local.get ptr
-					b = append(b, 0x20, 0x04)              // local.get attempt_start
-					b = append(b, 0x6A)                    // i32.add
-					b = append(b, 0x41, 0x01)              // i32.const 1
-					b = append(b, 0x6A)                    // i32.add
-					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-					b = append(b, 0x21, chunk1Local)       // local.set chunk1
-				}
-
-				if len(firstBytes) <= 8 {
-					// ── Teddy nibble scan ──────────────────────────────────────
-					// mask = swizzle(T_lo, chunk & 0x0F) & swizzle(T_hi, chunk >> 4)
-					// If mask != 0 (any lane nonzero): at least one byte in [0..15]
-					// matches a first-byte from S.  ctz(i8x16.bitmask(mask != 0))
-					// gives the lane index of the first candidate.
-
-					// lo_result = swizzle(T_lo, chunk & 0x0F)
-					// T_lo/T_hi pre-loaded into locals before the loop (loop-invariant, register access).
-					b = append(b, 0x20, tLoLocal)          // local.get tLoLocal -> [T_lo]
-					b = append(b, 0x20, chunkLocal)        // local.get chunk    -> [T_lo, chunk]
-					b = append(b, 0x41, 0x0F)
-					b = append(b, 0xFD, 0x0F)              // i8x16.splat(0x0F) -> [T_lo, chunk, splat]
-					b = append(b, 0xFD, 0x4E)              // v128.and -> [T_lo, lo_nibbles]
-					b = append(b, 0xFD, 0x0E)              // i8x16.swizzle(T_lo, lo_nibbles) -> [lo_result]
-
-					// hi_result = swizzle(T_hi, chunk >> 4)
-					b = append(b, 0x20, tHiLocal)          // local.get tHiLocal -> [lo_result, T_hi]
-					b = append(b, 0x20, chunkLocal)        // local.get chunk    -> [lo_result, T_hi, chunk]
-					b = append(b, 0x41, 0x04)              // i32.const 4        -> [lo_result, T_hi, chunk, 4]
-					b = append(b, 0xFD, 0x6D)              // i8x16.shr_u        -> [lo_result, T_hi, hi_nibbles]
-					b = append(b, 0xFD, 0x0E)              // i8x16.swizzle(T_hi, hi_nibbles) -> [lo_result, hi_result]
-
-					// candidates0 = lo0_result & hi0_result (byte 0 matches)
-					b = append(b, 0xFD, 0x4E) // v128.and -> [candidates0]
-
-					// 2-byte Teddy: AND with candidates1 (byte 1 matches at offset+1).
-					if teddyTwoByte {
-						// candidates1 = swizzle(T1_lo, chunk1 & 0xF) & swizzle(T1_hi, chunk1 >> 4)
-						b = append(b, 0x20, t1LoLocal)         // local.get t1LoLocal -> [c0, T1_lo]
-						b = append(b, 0x20, chunk1Local)       // local.get chunk1    -> [c0, T1_lo, c1]
-						b = append(b, 0x41, 0x0F)
-						b = append(b, 0xFD, 0x0F)              // i8x16.splat(0x0F)   -> [c0, T1_lo, c1, splat]
-						b = append(b, 0xFD, 0x4E)              // v128.and            -> [c0, T1_lo, lo1_nibbles]
-						b = append(b, 0xFD, 0x0E)              // i8x16.swizzle       -> [c0, lo1_result]
-						b = append(b, 0x20, t1HiLocal)         // local.get t1HiLocal -> [c0, lo1, T1_hi]
-						b = append(b, 0x20, chunk1Local)       // local.get chunk1    -> [c0, lo1, T1_hi, c1]
-						b = append(b, 0x41, 0x04)              // i32.const 4
-						b = append(b, 0xFD, 0x6D)              // i8x16.shr_u         -> [c0, lo1, T1_hi, hi1_nibbles]
-						b = append(b, 0xFD, 0x0E)              // i8x16.swizzle       -> [c0, lo1, hi1_result]
-						b = append(b, 0xFD, 0x4E)              // v128.and            -> [c0, candidates1]
-						b = append(b, 0xFD, 0x4E)              // v128.and c0&c1      -> [combined]
-					}
-					b = append(b, 0x41, 0x00)
-					b = append(b, 0xFD, 0x0F) // i8x16.splat(0)
-					b = append(b, 0xFD, 0x24) // i8x16.ne -> [nonzero_mask]
-					b = append(b, 0xFD, 0x64) // i8x16.bitmask -> i32
-				} else {
-					// ── Multi-eq scan ──────────────────────────────────────────
-					// mask = OR of (i8x16.eq(chunk, splat(b)).bitmask) for each b in firstBytes
-					b = append(b, 0x41, 0x00) // i32.const 0  (accumulator)
-					for _, fb := range firstBytes {
-						b = append(b, 0x20, chunkLocal) // local.get chunk
+					// state = startState / midStartState / midStartWordState
+					if startState == midStartState && (!hasWordBoundary || midStartState == midStartWordState) {
 						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, int32(fb))
-						b = append(b, 0xFD, 0x0F) // i8x16.splat
-						b = append(b, 0xFD, 0x23) // i8x16.eq
-						b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
-						b = append(b, 0x72)        // i32.or  (OR into accumulator)
+						b = utils.AppendSLEB128(b, int32(startState))
+					} else if !hasWordBoundary {
+						b = append(b, 0x20, 0x04) // local.get attempt_start
+						b = append(b, 0x45)       // i32.eqz
+						b = append(b, 0x04, 0x7F) // if (result i32)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(startState))
+						b = append(b, 0x05) // else
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(midStartState))
+						b = append(b, 0x0B) // end if
+					} else {
+						// Word boundary: check previous byte.
+						b = append(b, 0x20, 0x04) // local.get attempt_start
+						b = append(b, 0x45)       // i32.eqz
+						b = append(b, 0x04, 0x7F) // if (result i32)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(startState))
+						b = append(b, 0x05) // else
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, wordCharTableOff)
+						b = append(b, 0x20, 0x00)       // local.get ptr
+						b = append(b, 0x20, 0x04)       // local.get attempt_start
+						b = append(b, 0x6A)             // i32.add
+						b = append(b, 0x41, 0x01)       // i32.const 1
+						b = append(b, 0x6B)             // i32.sub
+						b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (prev byte)
+						b = append(b, 0x6A)             // wordCharTableOff + prev_byte
+						b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (isWordChar)
+						b = append(b, 0x04, 0x7F)       // if (result i32)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(midStartWordState))
+						b = append(b, 0x05) // else
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(midStartState))
+						b = append(b, 0x0B) // end if isWordChar
+						b = append(b, 0x0B) // end if attempt_start == 0
 					}
-					// result i32 mask is on stack
+					b = append(b, 0x21, 0x02) // local.set state
+					b = append(b, 0x20, 0x04) // local.get attempt_start
+					b = append(b, 0x21, 0x03) // local.set pos
 				}
-
-				// mask (i32) is on stack.
-				// local.tee simdMaskLocal to keep it for ctz.
-				b = append(b, 0x22, simdMaskLocal) // local.tee simdMask
-
-				// if mask != 0: candidate found
-				b = append(b, 0x04, 0x40) // if (void)
-				b = append(b, 0x20, 0x04) // local.get attempt_start
-				b = append(b, 0x20, simdMaskLocal)
-				b = append(b, 0x68)       // i32.ctz
-				b = append(b, 0x6A)       // i32.add
-				b = append(b, 0x21, 0x04) // local.set attempt_start
-				b = append(b, 0x0C, 0x03) // br 3 → $found_candidate
-				b = append(b, 0x0B)       // end if
-
-				// No candidate in this chunk: advance 16.
-				b = append(b, 0x20, 0x04) // local.get attempt_start
-				b = append(b, 0x41, 0x10) // i32.const 16
-				b = append(b, 0x6A)       // i32.add
-				b = append(b, 0x21, 0x04) // local.set attempt_start
-				b = append(b, 0x0C, 0x00) // br 0 → $simd_outer
-
-				b = append(b, 0x0B) // end loop $simd_outer
-				b = append(b, 0x0B) // end block $simd_exhausted
-				// fall-through: SIMD exhausted, run scalar tail below
-			}
-
-			// ── Scalar tail / full scalar ─────────────────────────────────────
-			// When SIMD is active this covers the last <16 bytes.
-			// When no SIMD this is the entire scan.
-			// Depths from within $skip:
-			//   SIMD path:   0=$skip 1=$skipdone 2=$found_candidate 3=$outer 4=$no_match
-			//   Scalar path: 0=$skip 1=$skipdone 2=$outer 3=$no_match
-			skipdoneExitDepth := byte(0x01) // br 1 → $skipdone (always)
-			foundCandidateDepth := byte(0x01)
-			if useSIMD {
-				foundCandidateDepth = 0x02 // br 2 → $found_candidate
-			}
-
-			b = append(b, 0x02, 0x40) // block $skipdone (void)
-			b = append(b, 0x03, 0x40) // loop $skip (void)
-
-			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x20, 0x01) // local.get len
-			b = append(b, 0x4F)       // i32.ge_u
-			b = append(b, 0x0D)
-			b = append(b, skipdoneExitDepth) // br_if → $skipdone
-
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, firstByteOff)
-			b = append(b, 0x20, 0x00)       // local.get ptr
-			b = append(b, 0x20, 0x04)       // local.get attempt_start
-			b = append(b, 0x6A)             // i32.add
-			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (byte)
-			b = append(b, 0x6A)             // firstByteOff + byte
-			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (flag)
-			b = append(b, 0x0D)
-			b = append(b, foundCandidateDepth) // br_if → $found_candidate (or $skipdone for scalar)
-
-			b = append(b, 0x20, 0x04) // attempt_start++
-			b = append(b, 0x41, 0x01)
-			b = append(b, 0x6A)
-			b = append(b, 0x21, 0x04)
-			b = append(b, 0x0C, 0x00) // br 0 → $skip
-			b = append(b, 0x0B)       // end loop $skip
-			b = append(b, 0x0B)       // end block $skipdone
-
-			if useSIMD {
-				b = append(b, 0x0B) // end block $found_candidate
-			}
-
-			// Allow attempt_start == len for empty-string matches at end of input.
-			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x20, 0x01) // local.get len
-			b = append(b, 0x4B)       // i32.gt_u
-			b = append(b, 0x0D, 0x01) // br_if 1 → $no_match
-		}
-		if len(prefix) >= 1 {
-			// Prefix scan already consumed prefix bytes: start DFA from prefixEndState
-			// at pos = attempt_start + len(prefix), avoiding double-verification.
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(prefixEndState))
-			b = append(b, 0x21, 0x02) // state = prefixEndState
-			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(len(prefix)))
-			b = append(b, 0x6A)       // i32.add
-			b = append(b, 0x21, 0x03) // pos = attempt_start + prefix_len
-		} else {
-			// state = (attempt_start == 0) ? startState : midStartState [or midStartWordState]
-			if startState == midStartState && (!hasWordBoundary || midStartState == midStartWordState) {
+				// last_accept = -1
+				b = append(b, 0x41, 0x7F) // i32.const -1
+				b = append(b, 0x21, 0x05) // local.set last_accept
+				// if midAccept[state]: last_accept = pos
 				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(startState))
-			} else if !hasWordBoundary {
-				b = append(b, 0x20, 0x04) // local.get attempt_start
-				b = append(b, 0x45)       // i32.eqz
-				b = append(b, 0x04, 0x7F) // if (result i32)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(startState))
-				b = append(b, 0x05) // else
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(midStartState))
-				b = append(b, 0x0B) // end if
-			} else {
-				// Word boundary: need to check previous byte.
-				// if attempt_start == 0: startState
-				// else if wordCharTable[mem[ptr + attempt_start - 1]]: midStartWordState
-				// else: midStartState
-				b = append(b, 0x20, 0x04) // local.get attempt_start
-				b = append(b, 0x45)       // i32.eqz
-				b = append(b, 0x04, 0x7F) // if (result i32): attempt_start == 0
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(startState))
-				b = append(b, 0x05) // else
-				// wordCharTable[mem[ptr + attempt_start - 1]]
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, wordCharTableOff)
-				b = append(b, 0x20, 0x00)       // local.get ptr
-				b = append(b, 0x20, 0x04)       // local.get attempt_start
+				b = utils.AppendSLEB128(b, midAcceptOff)
+				b = append(b, 0x20, 0x02)       // local.get state
 				b = append(b, 0x6A)             // i32.add
-				b = append(b, 0x41, 0x01)       // i32.const 1
-				b = append(b, 0x6B)             // i32.sub  (ptr + attempt_start - 1)
-				b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (prev byte)
-				b = append(b, 0x6A)             // i32.add (wordCharTableOff + prev_byte)
-				b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (isWordChar flag)
-				b = append(b, 0x04, 0x7F)       // if (result i32): isWordChar
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(midStartWordState))
-				b = append(b, 0x05) // else
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(midStartState))
-				b = append(b, 0x0B) // end if isWordChar
-				b = append(b, 0x0B) // end if attempt_start == 0
-			}
-			b = append(b, 0x21, 0x02) // local.set state
-			// pos = attempt_start
-			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x21, 0x03) // local.set pos
+				b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+				b = append(b, 0x04, 0x40)       // if (void)
+				b = append(b, 0x20, 0x03)       // local.get pos
+				b = append(b, 0x21, 0x05)       // local.set last_accept
+				b = append(b, 0x0B)             // end if
+				if startBeginAccept {
+					b = append(b, 0x20, 0x04) // local.get attempt_start
+					b = append(b, 0x45)       // i32.eqz
+					b = append(b, 0x04, 0x40) // if (void)
+					b = append(b, 0x20, 0x03) // local.get pos
+					b = append(b, 0x21, 0x05) // local.set last_accept
+					b = append(b, 0x0B)       // end if
+				}
+				return b
+			},
 		}
-		// last_accept = -1
-		b = append(b, 0x41, 0x7F) // i32.const -1
-		b = append(b, 0x21, 0x05) // local.set last_accept
-		// if midAccept[startState]: last_accept = pos  (empty-string match at attempt_start)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptOff)
-		b = append(b, 0x20, 0x02)       // local.get state
-		b = append(b, 0x6A)             // i32.add
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
-		b = append(b, 0x04, 0x40)       // if (void)
-		b = append(b, 0x20, 0x03)       // local.get pos
-		b = append(b, 0x21, 0x05)       // local.set last_accept
-		b = append(b, 0x0B)             // end if
-		// if startBeginAccept and attempt_start == 0: record empty match at position 0.
-		// Handles patterns like a*^ where startState accepts via ecBegin only.
-		if startBeginAccept {
-			b = append(b, 0x20, 0x04) // local.get attempt_start
-			b = append(b, 0x45)       // i32.eqz
-			b = append(b, 0x04, 0x40) // if (void)
-			b = append(b, 0x20, 0x03) // local.get pos
-			b = append(b, 0x21, 0x05) // local.set last_accept
-			b = append(b, 0x0B)       // end if
-		}
-		return b
+		return EmitPrefixScan(b, params)
 	}
 
 	// ── helper: emit the packed-i64 return and close loops ──────────────────
