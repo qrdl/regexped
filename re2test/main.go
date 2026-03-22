@@ -92,12 +92,14 @@ func run(testFile string, verbose bool, maxErrors int) error {
 		groupsMemory *wasmtime.Memory
 		numGroups    int
 
-		lineno    int
-		npass     int
-		nfail     int
-		ncases    int
-		stopped   bool
-		skipCount = make(map[string]int)
+		lineno       int
+		npass        int
+		nfail        int
+		ncases       int
+		stopped      bool
+		npassDFA     int
+		npassOnePass int
+		skipCount    = make(map[string]int)
 	)
 
 	scanner := bufio.NewScanner(f)
@@ -291,6 +293,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				expected := parseCol1(col1)
 				if got == expected {
 					npass++
+					npassDFA++
 					if verbose {
 						fmt.Printf("PASS %s:%d pattern=%q input=%q (find)\n", testFile, lineno, pattern, text)
 					}
@@ -330,6 +333,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				}
 				if endMatch && slotsMatch {
 					npass++
+					npassOnePass++
 					if verbose {
 						fmt.Printf("PASS %s:%d pattern=%q input=%q (groups)\n", testFile, lineno, pattern, text)
 					}
@@ -352,6 +356,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				expected := parseCol0(col0)
 				if got == expected {
 					npass++
+					npassDFA++
 					if verbose {
 						fmt.Printf("PASS %s:%d pattern=%q input=%q\n", testFile, lineno, pattern, text)
 					}
@@ -387,6 +392,8 @@ done:
 
 	fmt.Printf("\n=== RE2 Test Results ===\n")
 	fmt.Printf("passed:  %d\n", npass)
+	fmt.Printf("  %-38s %d\n", "DFA:", npassDFA)
+	fmt.Printf("  %-38s %d\n", "OnePass:", npassOnePass)
 	fmt.Printf("failed:  %d\n", nfail)
 	fmt.Printf("skipped: %d\n", totalSkipped)
 	for _, reason := range skipOrder {

@@ -1,4 +1,4 @@
-module github.com/qrdl/regexped/perf_test
+module github.com/qrdl/regexped/perftest
 
 go 1.25.7
 

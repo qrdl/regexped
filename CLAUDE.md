@@ -43,12 +43,16 @@ regexped/
 ├── perftest/
 │   ├── main.go                # Performance benchmarks vs regex crate
 │   └── Makefile               # Builds harnesses, runs benchmarks
+├── docs/
+│   ├── cli.md                 # CLI reference: commands, flags, config schema
+│   ├── rust-api.md            # Generated Rust API: function signatures, iterators
+│   └── wasm.md                # WASM interface, memory layout, table formats
 └── examples/
     ├── README.md
     ├── Makefile
-    ├── url-ipv6/              # DFA find mode: locate IPv6 URLs in text
-    ├── secrets/               # DFA find mode: detect GitHub/JWT/AWS secrets
-    └── url-parts/             # OnePass: parse URL into named capture groups
+    ├── url-ipv6/              # DFA anchored match: validate IPv6 URLs
+    ├── secrets/               # DFA find_iter: scan text for GitHub/JWT/AWS secrets
+    └── url-parts/             # OnePass named_groups_iter: find and parse all URLs in text
 ```
 
 ## Components
@@ -61,14 +65,16 @@ Parses YAML configuration files. Schema:
 
 ```yaml
 wasm_merge: "path/to/wasm-merge"  # optional, defaults to $PATH
-output: "merged.wasm"
+output:   "merged.wasm"           # output path for merge command; overridable with -o/--output
+stub_dir: "."                     # default output directory for stub files; overridable with -d/--out-dir
+wasm_dir: "."                     # default output directory for compiled WASM files; overridable with -d/--out-dir
 regexes:
   - wasm_file:        "url.wasm"
     import_module:    "url"
     stub_file:        "stub.rs"
     pattern:          '(?P<scheme>https?)://(?P<host>[^/:?#]+)...'
 
-    # One or more of these may be set:
+    # All func fields are optional; an entry with only 'pattern' is silently skipped.
     match_func:        "url_match"         # anchored match → Option<usize>
     find_func:         "url_find"          # non-anchored find → Option<(usize,usize)>
     groups_func:       "url_groups"        # anchored + captures → Option<Vec<...>>
@@ -77,6 +83,7 @@ regexes:
 
 Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation (OnePass engine).
 Setting only `match_func` and/or `find_func` strips captures from the pattern before compilation.
+An entry with no `_func` fields is valid — no WASM file is compiled and no stub is generated for it.
 
 ### 2. Compilation (`compile/`)
 
@@ -92,6 +99,7 @@ Setting only `match_func` and/or `find_func` strips captures from the pattern be
 - `groups_func`/`named_groups_func` → OnePass
 - `find_func` only → DFA find mode
 - `match_func` only → DFA anchored mode
+- no `_func` fields → returns nil (skipped silently)
 
 #### `selector.go` — Engine Selection
 
@@ -174,6 +182,17 @@ Four stub types generated based on config fields:
 | `named_groups_func` | `groups` | `Option<HashMap<&'static str, (usize, usize)>>` |
 
 `named_groups_func` is a pure Rust wrapper over the same `groups` WASM export — group names and indices are hardcoded at codegen time.
+
+For `find_func`, `groups_func`, and `named_groups_func` an iterator type is also generated alongside the single-match function:
+
+| Field | Iterator constructor | Iterator `Item` |
+|---|---|---|
+| `find_func` | `<func>_iter(input)` | `(usize, usize)` — absolute (start, end) |
+| `groups_func` | `<func>_iter(input)` | `Vec<Option<(usize, usize)>>` — absolute positions |
+| `named_groups_func` | `<func>_iter(input)` | `HashMap<&'static str, (usize, usize)>` — absolute positions |
+
+Iterators advance past zero-length matches by one byte.
+`NamedGroupsIter` calls the FFI `groups` function directly to read `slots[1]` (full-match end) for the advance distance, then builds the adjusted map.
 
 When multiple stubs are included in the same Rust compilation unit, each must be in its own `mod` block to avoid FFI name collisions (`fn find`, `fn match`, `fn groups` are always the WASM-level names).
 
@@ -314,5 +333,6 @@ Viable when every `InstAlt` in the NFA has branches with disjoint first-characte
 
 ---
 
-**Last Updated:** 2026-03-20
+**Last Updated:** 2026-03-22
+**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/wasm.md` (WASM internals)
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD), OnePass (anchored with captures)

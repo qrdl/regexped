@@ -49,7 +49,7 @@ func genRustStubsForEntry(re config.RegexEntry) (string, error) {
 		written = true
 	}
 	if re.FindFunc != "" {
-		out += genRustFindStubs(re.Pattern, re.ImportModule, re.FindFunc)
+		out += genRustFindIterStub(re.FindFunc, re.ImportModule)
 		written = true
 	}
 	if re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
@@ -58,11 +58,11 @@ func genRustStubsForEntry(re config.RegexEntry) (string, error) {
 			return "", err
 		}
 		if re.GroupsFunc != "" {
-			out += genRustGroupsStub(re.Pattern, re.ImportModule, re.GroupsFunc, numGroups)
+			out += genRustGroupsIterStub(re.GroupsFunc, re.ImportModule, numGroups)
 			written = true
 		}
 		if re.NamedGroupsFunc != "" {
-			out += genRustNamedGroupsStub(re.Pattern, re.ImportModule, re.NamedGroupsFunc, numGroups, namedGroups)
+			out += genRustNamedGroupsIterStub(re.NamedGroupsFunc, re.ImportModule, numGroups, namedGroups)
 			written = true
 		}
 	}

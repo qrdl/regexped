@@ -1,4 +1,4 @@
-module github.com/qrdl/regexped/re2_test
+module github.com/qrdl/regexped/re2test
 
 go 1.25.7
 

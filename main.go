@@ -59,8 +59,10 @@ Run 'regexped <command> -h' for command-specific options.
 func runStubCmd(args []string) {
 	fs := flag.NewFlagSet("stub", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	rust   := fs.Bool("rust", false, "generate Rust stub files")
-	outDir := fs.String("out-dir", ".", "output directory for stub files")
+	rust := fs.Bool("rust", false, "generate Rust stub files")
+	var outDir string
+	fs.StringVar(&outDir, "out-dir", "", "output directory for stub files (overrides config stub_dir)")
+	fs.StringVar(&outDir, "d", "", "output directory for stub files (alias for --out-dir)")
 	fs.Parse(args)
 
 	if !*rust {
@@ -72,16 +74,25 @@ func runStubCmd(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := generate.CmdStub(cfg, *outDir, *rust); err != nil {
+	if outDir == "" {
+		if cfg.StubDir != "" {
+			outDir = cfg.StubDir
+		} else {
+			outDir = "."
+		}
+	}
+	if err := generate.CmdStub(cfg, outDir, *rust); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func runCompileCmd(args []string) {
 	fs := flag.NewFlagSet("compile", flag.ExitOnError)
-	configFile := fs.String("config",     "", "YAML config file (default: regexped.yaml in cwd)")
-	wasmInput := fs.String("wasm-input", "", "pre-built WASM file used to measure memory layout (required)")
-	outDir    := fs.String("out-dir",    ".", "output directory for generated WASM and stub files")
+	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
+	wasmInput  := fs.String("wasm-input", "", "pre-built WASM file used to measure memory layout (required)")
+	var outDir string
+	fs.StringVar(&outDir, "out-dir", "", "output directory for compiled WASM files (overrides config wasm_dir)")
+	fs.StringVar(&outDir, "d", "", "output directory for compiled WASM files (alias for --out-dir)")
 	fs.Parse(args)
 
 	if *wasmInput == "" {
@@ -89,11 +100,18 @@ func runCompileCmd(args []string) {
 		os.Exit(1)
 	}
 
-	cfg, err :=  config.LoadConfig(*configFile)
+	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := compile.CmdCompile(cfg, *wasmInput, *outDir); err != nil {
+	if outDir == "" {
+		if cfg.WasmDir != "" {
+			outDir = cfg.WasmDir
+		} else {
+			outDir = "."
+		}
+	}
+	if err := compile.CmdCompile(cfg, *wasmInput, outDir); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -101,7 +119,9 @@ func runCompileCmd(args []string) {
 func runMergeCmd(args []string) {
 	fs := flag.NewFlagSet("merge", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	output := fs.String("output", "", "output WASM file (overrides YAML 'output' field)")
+	var outputFile string
+	fs.StringVar(&outputFile, "output", "", "output WASM file (overrides YAML 'output' field)")
+	fs.StringVar(&outputFile, "o", "", "output WASM file (alias for --output)")
 	fs.Parse(args)
 
 	inputs := fs.Args()
@@ -115,7 +135,7 @@ func runMergeCmd(args []string) {
 		log.Fatal(err)
 	}
 
-	outFile := *output
+	outFile := outputFile
 	if outFile == "" {
 		outFile = cfg.Output
 	}

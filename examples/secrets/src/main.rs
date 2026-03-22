@@ -5,16 +5,6 @@ mod github { include!("github_stub.rs"); }
 mod jwt    { include!("jwt_stub.rs");    }
 mod aws    { include!("aws_stub.rs");    }
 
-fn report(label: &str, input: &[u8], result: Option<(usize, usize)>) {
-    match result {
-        Some((start, end)) => {
-            let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
-            println!("{}: found at {}..{}: {}", label, start, end, s);
-        }
-        None => println!("{}: not found", label),
-    }
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -23,7 +13,25 @@ fn main() {
     }
     let input = args[1].as_bytes();
 
-    report("GitHub token", input, github::find_github_token(input));
-    report("JWT",          input, jwt::find_jwt_token(input));
-    report("AWS key",      input, aws::find_aws_key(input));
+    let mut found = false;
+
+    for (start, end) in github::find_github_token(input) {
+        let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
+        println!("GitHub token at {}..{}: {}", start, end, s);
+        found = true;
+    }
+    for (start, end) in jwt::find_jwt_token(input) {
+        let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
+        println!("JWT at {}..{}: {}", start, end, s);
+        found = true;
+    }
+    for (start, end) in aws::find_aws_key(input) {
+        let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
+        println!("AWS key at {}..{}: {}", start, end, s);
+        found = true;
+    }
+
+    if !found {
+        println!("No secrets found");
+    }
 }

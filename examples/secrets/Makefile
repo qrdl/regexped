@@ -47,6 +47,9 @@ run: $(FINAL_WASM)
 	@echo ""
 	@echo "=== AWS access key ==="
 	wasmtime run $(FINAL_WASM) "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
+	@echo ""
+	@echo "=== multiple secrets in one string (demonstrates iterator) ==="
+	wasmtime run $(FINAL_WASM) "key=AKIAIOSFODNN7EXAMPLE token=ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
 
 clean:
 	cargo clean

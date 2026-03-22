@@ -88,6 +88,10 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir string) error {
 		if err != nil {
 			return fmt.Errorf("compile regex %d (%s): %w", i+1, re.ImportModule, err)
 		}
+		if wasmBytes == nil {
+			slog.Debug("Skipping pattern-only entry", "n", i+1, "module", re.ImportModule)
+			continue
+		}
 
 		wasmPath := filepath.Join(outDir, re.WasmFile)
 		if err := os.WriteFile(wasmPath, wasmBytes, 0o644); err != nil {
@@ -190,7 +194,7 @@ func compileRegexEntry(re config.RegexEntry, tableBase int64) ([]byte, int64, er
 		return CompileRegex(re.Pattern, "match", tableBase, false,
 			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA})
 	default:
-		return nil, 0, fmt.Errorf("regex entry for module %q has no function field set (match_func, find_func, groups_func, or named_groups_func)", re.ImportModule)
+		return nil, tableBase, nil
 	}
 }
 

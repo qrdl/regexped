@@ -13,6 +13,8 @@ import (
 type BuildConfig struct {
 	WasmMerge string       `yaml:"wasm_merge"` // optional; defaults to "wasm-merge" in $PATH
 	Output    string       `yaml:"output"`     // default output path for merge command
+	StubDir   string       `yaml:"stub_dir"`   // default output directory for stub files
+	WasmDir   string       `yaml:"wasm_dir"`   // default output directory for compiled WASM files
 	Regexes   []RegexEntry `yaml:"regexes"`
 }
 
@@ -64,6 +66,8 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	// Resolve all paths relative to the config file's directory.
 	cfg.Output    = resolveRelative(configDir, cfg.Output)
 	cfg.WasmMerge = resolveRelative(configDir, cfg.WasmMerge)
+	cfg.StubDir   = resolveRelative(configDir, cfg.StubDir)
+	cfg.WasmDir   = resolveRelative(configDir, cfg.WasmDir)
 
 	return cfg, nil
 }

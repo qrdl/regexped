@@ -36,17 +36,14 @@ merge: $(FINAL_WASM)
 
 # Step 5 – run with test inputs
 run: $(FINAL_WASM)
-	@echo "=== full URL ==="
+	@echo "=== single URL ==="
 	wasmtime run $(FINAL_WASM) "https://example.com:8080/path/to/page?q=1&r=2#section"
 	@echo ""
-	@echo "=== minimal URL ==="
-	wasmtime run $(FINAL_WASM) "http://example.com"
+	@echo "=== two URLs in one string (demonstrates iterator) ==="
+	wasmtime run $(FINAL_WASM) "visit https://example.com/page or http://api.example.org/v2?fmt=json"
 	@echo ""
-	@echo "=== URL with query only ==="
-	wasmtime run $(FINAL_WASM) "https://search.example.com/find?q=hello+world"
-	@echo ""
-	@echo "=== not a URL ==="
-	wasmtime run $(FINAL_WASM) "not-a-url"
+	@echo "=== no URLs ==="
+	wasmtime run $(FINAL_WASM) "nothing here"
 
 clean:
 	cargo clean

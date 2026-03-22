@@ -28,61 +28,113 @@ pub fn %s(input: &[u8]) -> Option<usize> {
 `, importModule, ffiName, funcName, ffiName)
 }
 
-func genRustFindStubs(pattern, importModule, funcName string) string {
-	exportName := "find"
+// genRustFindIterStub generates a FindIter struct and a constructor named funcName
+// that yields all non-overlapping matches as absolute (start, end) pairs.
+func genRustFindIterStub(funcName, importModule string) string {
 	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
-    fn %s(ptr: *const u8, len: usize) -> i64;
+    fn find(ptr: *const u8, len: usize) -> i64;
 }
 
-/// Returns (start, end) of the leftmost-longest match, or None if no match.
-pub fn %s(input: &[u8]) -> Option<(usize, usize)> {
-    match unsafe { %s(input.as_ptr(), input.len()) } {
-        -1 => None,
-        n  => Some(((n as u64 >> 32) as usize, (n as u32) as usize)),
+pub struct FindIter<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Iterator for FindIter<'a> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        if self.offset > self.input.len() {
+            return None;
+        }
+        let remaining = &self.input[self.offset..];
+        match unsafe { find(remaining.as_ptr(), remaining.len()) } {
+            -1 => None,
+            n  => {
+                let start = (n as u64 >> 32) as usize;
+                let end   = (n as u32) as usize;
+                let abs_start = self.offset + start;
+                let abs_end   = self.offset + end;
+                self.offset += if end > start { end } else { start + 1 };
+                Some((abs_start, abs_end))
+            }
+        }
     }
 }
 
-`, importModule, exportName, funcName, exportName)
+/// Returns an iterator over all non-overlapping matches in input.
+/// Each item is an absolute (start, end) byte range.
+/// Use .next() to get only the first match.
+pub fn %s(input: &[u8]) -> FindIter<'_> {
+    FindIter { input, offset: 0 }
 }
 
-// genRustGroupsStub generates a stub returning all capture groups as a Vec.
-// Group 0 = full match. Unmatched groups are None.
-func genRustGroupsStub(pattern, importModule, funcName string, numGroups int) string {
-	exportName := "groups"
+`, importModule, funcName)
+}
+
+// genRustGroupsIterStub generates a GroupsIter struct and a constructor named funcName
+// that yields all non-overlapping anchored capture matches in the input.
+// Returned group positions are absolute offsets into the original input.
+func genRustGroupsIterStub(funcName, importModule string, numGroups int) string {
 	slotCount := numGroups * 2
 	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
-    fn %s(ptr: *const u8, len: usize, out: *mut i32) -> i32;
+    fn groups(ptr: *const u8, len: usize, out: *mut i32) -> i32;
 }
 
-/// Returns capture group positions as (start, end) pairs, or None if no match.
-/// Index 0 is the full match; subsequent indices are capture groups.
-/// A group that did not participate in the match is None.
-pub fn %s(input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
-    let mut slots = [-1i32; %d];
-    if unsafe { %s(input.as_ptr(), input.len(), slots.as_mut_ptr()) } < 0 {
-        return None;
+pub struct GroupsIter<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Iterator for GroupsIter<'a> {
+    type Item = Vec<Option<(usize, usize)>>;
+
+    fn next(&mut self) -> Option<Vec<Option<(usize, usize)>>> {
+        loop {
+            if self.offset > self.input.len() {
+                return None;
+            }
+            let remaining = &self.input[self.offset..];
+            let mut slots = [-1i32; %d];
+            if unsafe { groups(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) } < 0 {
+                if self.offset == self.input.len() {
+                    return None;
+                }
+                self.offset += 1;
+                continue;
+            }
+            let off = self.offset;
+            let match_end = if slots[1] >= 0 { slots[1] as usize } else { 0 };
+            self.offset += if match_end > 0 { match_end } else { 1 };
+            let mut result = Vec::with_capacity(%d);
+            for i in 0..%d {
+                let start = slots[i * 2];
+                let end   = slots[i * 2 + 1];
+                result.push(if start < 0 { None } else { Some((start as usize + off, end as usize + off)) });
+            }
+            return Some(result);
+        }
     }
-    let mut groups = Vec::with_capacity(%d);
-    for i in 0..%d {
-        let start = slots[i * 2];
-        let end   = slots[i * 2 + 1];
-        groups.push(if start < 0 { None } else { Some((start as usize, end as usize)) });
-    }
-    Some(groups)
 }
 
-`, importModule, exportName, funcName, slotCount, exportName, numGroups, numGroups)
+/// Returns an iterator over all non-overlapping capture matches in input.
+/// Group positions are absolute byte offsets. Index 0 is the full match.
+/// Use .next() to get only the first match.
+pub fn %s(input: &[u8]) -> GroupsIter<'_> {
+    GroupsIter { input, offset: 0 }
 }
 
-// genRustNamedGroupsStub generates a stub returning named capture groups as a HashMap.
-// Only groups that participated in the match are included.
-func genRustNamedGroupsStub(pattern, importModule, funcName string, numGroups int, namedGroups map[string]int) string {
-	exportName := "groups"
+`, importModule, slotCount, numGroups, numGroups, funcName)
+}
+
+// genRustNamedGroupsIterStub generates a NamedGroupsIter struct and a constructor
+// named funcName that yields all non-overlapping anchored capture matches in the input.
+// Returned positions are absolute offsets into the original input.
+func genRustNamedGroupsIterStub(funcName, importModule string, numGroups int, namedGroups map[string]int) string {
 	slotCount := numGroups * 2
 
-	// Build sorted insert lines for deterministic output.
 	type entry struct {
 		name  string
 		index int
@@ -95,25 +147,53 @@ func genRustNamedGroupsStub(pattern, importModule, funcName string, numGroups in
 
 	var inserts strings.Builder
 	for _, e := range entries {
-		fmt.Fprintf(&inserts, "    if slots[%d] >= 0 { map.insert(\"%s\", (slots[%d] as usize, slots[%d] as usize)); }\n",
+		fmt.Fprintf(&inserts,
+			"            if slots[%d] >= 0 { map.insert(\"%s\", (slots[%d] as usize + off, slots[%d] as usize + off)); }\n",
 			e.index*2, e.name, e.index*2, e.index*2+1)
 	}
 
 	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
-    fn %s(ptr: *const u8, len: usize, out: *mut i32) -> i32;
+    fn groups(ptr: *const u8, len: usize, out: *mut i32) -> i32;
 }
 
-/// Returns named capture groups as a map of name → (start, end), or None if no match.
-/// Only groups that participated in the match are included.
-pub fn %s(input: &[u8]) -> Option<std::collections::HashMap<&'static str, (usize, usize)>> {
-    let mut slots = [-1i32; %d];
-    if unsafe { %s(input.as_ptr(), input.len(), slots.as_mut_ptr()) } < 0 {
-        return None;
+pub struct NamedGroupsIter<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Iterator for NamedGroupsIter<'a> {
+    type Item = std::collections::HashMap<&'static str, (usize, usize)>;
+
+    fn next(&mut self) -> Option<std::collections::HashMap<&'static str, (usize, usize)>> {
+        loop {
+            if self.offset > self.input.len() {
+                return None;
+            }
+            let remaining = &self.input[self.offset..];
+            let mut slots = [-1i32; %d];
+            if unsafe { groups(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) } < 0 {
+                if self.offset == self.input.len() {
+                    return None;
+                }
+                self.offset += 1;
+                continue;
+            }
+            let off = self.offset;
+            let match_end = if slots[1] >= 0 { slots[1] as usize } else { 0 };
+            self.offset += if match_end > 0 { match_end } else { 1 };
+            let mut map = std::collections::HashMap::new();
+%s            return Some(map);
+        }
     }
-    let mut map = std::collections::HashMap::new();
-%s    Some(map)
 }
 
-`, importModule, exportName, funcName, slotCount, exportName, inserts.String())
+/// Returns an iterator over all non-overlapping named-capture matches in input.
+/// Group positions are absolute byte offsets.
+/// Use .next() to get only the first match.
+pub fn %s(input: &[u8]) -> NamedGroupsIter<'_> {
+    NamedGroupsIter { input, offset: 0 }
+}
+
+`, importModule, slotCount, inserts.String(), funcName)
 }

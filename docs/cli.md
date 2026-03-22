@@ -1,0 +1,140 @@
+# Regexped CLI Reference
+
+## Configuration File
+
+Regexped is driven by a YAML config file (default: `regexped.yaml` in the current directory).
+
+```yaml
+wasm_merge: "wasm-merge"   # path to wasm-merge binary; defaults to wasm-merge in $PATH
+output:   "merged.wasm"    # output path for the merge command; overridable with -o/--output
+stub_dir: "."              # default output directory for stub files; overridable with -d/--out-dir
+wasm_dir: "."              # default output directory for compiled WASM files; overridable with -d/--out-dir
+
+regexes:
+  - wasm_file:        "url.wasm"       # output WASM file for this pattern
+    import_module:    "url"            # WASM import module name
+    stub_file:        "url_stub.rs"    # output stub filename (placed under stub_dir/src/)
+    pattern:          'https?://...'   # RE2 regex pattern
+
+    # One or more func fields — only those set are compiled and stubbed.
+    # An entry with only 'pattern' is valid; no WASM or stub is generated for it.
+    match_func:        "url_match"         # anchored match
+    find_func:         "url_find"          # non-anchored find
+    groups_func:       "url_groups"        # anchored match with all capture groups
+    named_groups_func: "url_named_groups"  # anchored match with named capture groups
+```
+
+All paths in the config file are resolved relative to the config file's directory.
+
+### Engine selection
+
+Setting `groups_func` or `named_groups_func` triggers the **OnePass engine** (anchored matching with capture tracking). The pattern must be deterministic: all `|` alternations must have disjoint first-character sets.
+
+Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
+
+### Pattern support
+
+Regexped uses RE2 syntax. Backreferences are not supported by design.
+
+| Feature | Supported |
+|---|---|
+| Literal characters | Yes |
+| Character classes `[a-z]`, `\d`, `\w` | Yes |
+| Anchors `^`, `$` | Yes |
+| Repetition `*`, `+`, `?`, `{n,m}` | Yes |
+| Non-greedy quantifiers `*?`, `+?` | Yes |
+| Alternation `\|` (LeftmostFirst / RE2 semantics) | Yes |
+| Word boundaries `\b`, `\B` | Yes |
+| Capture groups (deterministic OnePass patterns) | Yes |
+| Capture groups (non-deterministic) | No |
+| Backreferences `\1` | No |
+| Lookahead / lookbehind | No |
+| Unicode beyond ASCII | No |
+
+---
+
+## Commands
+
+### `stub` — Generate language stubs
+
+```
+regexped stub [--config=<file>] [--out-dir=<dir>] [-d <dir>] --rust
+```
+
+Generates a Rust stub file for each regex entry that has a `stub_file` and at least one `_func` field. Stubs are written to `<out-dir>/src/<stub_file>`.
+
+| Config field | Generated function | Return type |
+|---|---|---|
+| `match_func` | `<func>(input)` | `Option<usize>` |
+| `find_func` | `<func>(input)` | `FindIter` — yields `(usize, usize)` per match |
+| `groups_func` | `<func>(input)` | `GroupsIter` — yields `Vec<Option<(usize, usize)>>` per match |
+| `named_groups_func` | `<func>(input)` | `NamedGroupsIter` — yields `HashMap<&'static str, (usize, usize)>` per match |
+
+See [rust-api.md](rust-api.md) for full usage examples.
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config` | `regexped.yaml` | YAML config file |
+| `--out-dir`, `-d` | config `stub_dir`, then `.` | Output directory |
+| `--rust` | — | Generate Rust stubs (required) |
+
+---
+
+### `compile` — Compile patterns to WASM
+
+```
+regexped compile [--config=<file>] --wasm-input=<main.wasm> [--out-dir=<dir>] [-d <dir>]
+```
+
+Reads the pre-built main WASM module to determine where in memory to place DFA/OnePass tables, then compiles each regex to a standalone WASM module.
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config` | `regexped.yaml` | YAML config file |
+| `--wasm-input` | — | Pre-built main WASM file **(required)** |
+| `--out-dir`, `-d` | config `wasm_dir`, then `.` | Output directory for `.wasm` files |
+
+Entries with no `_func` fields are silently skipped — no WASM file is written.
+
+---
+
+### `merge` — Merge WASM modules
+
+```
+regexped merge [--config=<file>] [--output=<out.wasm>] [-o <out.wasm>] <main.wasm> [regex.wasm ...]
+```
+
+Patches the main module's memory section to fit all regex tables, then calls `wasm-merge` to produce a single combined binary.
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config` | `regexped.yaml` | YAML config file |
+| `--output`, `-o` | config `output` | Output WASM file |
+
+**Positional arguments:** `<main.wasm>` followed by one or more regex WASM files (in any order).
+
+---
+
+## Typical workflow
+
+```bash
+# 1. Generate Rust stubs
+regexped stub --config=regexped.yaml --rust
+
+# 2. Build your Rust project to WASM (produces main.wasm)
+cargo build --target wasm32-wasip1 --release
+
+# 3. Compile regex patterns to WASM
+regexped compile --config=regexped.yaml --wasm-input=target/wasm32-wasip1/release/app.wasm
+
+# 4. Merge everything into a single binary
+regexped merge --config=regexped.yaml target/wasm32-wasip1/release/app.wasm pattern1.wasm pattern2.wasm
+```
+
+See [`examples/`](../examples/) for complete self-contained projects with Makefiles.
