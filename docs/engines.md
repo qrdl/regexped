@@ -1,6 +1,6 @@
 # Regex Engines
 
-Regexped currently implements two engines: **DFA** and **OnePass**. The right engine is selected automatically at compile time based on the pattern and the requested function types.
+Regexped implements three engines: **DFA**, **OnePass**, and **Backtracking**. The right engine is selected automatically at compile time based on the pattern and the requested function types.
 
 ---
 
@@ -9,12 +9,15 @@ Regexped currently implements two engines: **DFA** and **OnePass**. The right en
 Selection priority (highest first):
 
 1. **OnePass** — pattern has capture groups AND qualifies for one-pass determinism
-2. **DFA** — all other patterns (captures are stripped when only `match_func`/`find_func` are requested)
+2. **Backtracking** — pattern has capture groups but fails the OnePass check
+3. **DFA** — all other patterns (captures are stripped when only `match_func`/`find_func` are requested)
 
 A pattern qualifies for OnePass if:
 - Every `|` alternation has branches with disjoint first-character sets (deterministic at each position)
 - No nested or non-greedy quantifiers inside capture groups
 - Pattern compiles to ≤ 100 NFA instructions
+
+If a pattern has captures but fails the OnePass check (e.g. `(a|ab)c`, `(a*)(a*)`, `(.*)(foo)`), the Backtracking engine is used automatically.
 
 ---
 
@@ -44,7 +47,9 @@ In find mode, a compile-time-selected fast-skip prologue avoids testing every by
 
 | Strategy | Condition |
 |---|---|
-| **2-byte Teddy** | literal prefix ≥ 2 bytes — checks two bytes simultaneously, near-zero false positives |
+| **Hybrid prefix** | literal prefix ≥ 1 byte — SIMD check for full prefix within a 16-byte window |
+| **3-byte Teddy** | alternation patterns with ≤ 8 first bytes AND selective 3rd byte — checks bytes 0, 1, 2 simultaneously |
+| **2-byte Teddy** | alternation patterns with ≤ 8 first bytes — checks bytes 0 and 1 simultaneously |
 | **1-byte Teddy** | single-byte prefix with multiple candidates |
 | **Multi-eq SIMD** | small first-byte set — `i8x16.eq` + bitmask per candidate |
 | **Scalar** | fallback for wide first-byte sets |
@@ -55,7 +60,7 @@ Uses WASM SIMD (simd128).
 
 ## OnePass Engine
 
-**Used for:** `groups_func`, `named_groups_func`, and as the groups half of hybrid modules.
+**Used for:** `groups_func`, `named_groups_func`, and as the groups half of hybrid modules when the pattern is OnePass-eligible.
 
 **Complexity:** O(n) time and space (single forward pass, no thread copying).
 
@@ -67,46 +72,61 @@ Under this condition, capture groups can be tracked with a fixed set of slot reg
 
 The OnePass automaton is a u8 transition table (`state × byte → next_state`, 0xFF = dead). Capture slot updates (`open group N`, `close group N`) are emitted as compile-time-known `i32.store` instructions directly in the WASM function body — they are not stored in the table.
 
-### Limitations
+---
 
-OnePass is strictly more restrictive than a general capture engine. Patterns with ambiguous alternations (e.g. `(a|ab)c`) are not OnePass-eligible and currently cannot be compiled with capture tracking.
+## Backtracking Engine
+
+**Used for:** `groups_func`, `named_groups_func` when the pattern has captures but is not OnePass-eligible, and as the groups half of hybrid modules for such patterns.
+
+**Complexity:** O(n) typical, O(2ⁿ) worst case — bounded in practice by the stack limit.
+
+### How it works
+
+The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps to a handler block. The engine maintains a backtrack stack in WASM linear memory: when an `InstAlt` node is reached, the alternative branch is pushed onto the stack and execution continues with the preferred branch. On failure the stack is popped to try the alternative.
+
+**RE2 semantics via hybrid approach** — both phases run inside the single exported WASM function, with no matching logic in the host:
+
+1. **Phase 1 (DFA)**: the captures-stripped pattern is run as a standard leftmost-longest DFA anchored match to determine the correct match end position E. If no match, returns -1 immediately.
+2. **Phase 2 (Backtracking)**: the NFA backtracking engine runs constrained to `pos == E` at `InstMatch`, filling capture slots within `[0, E]`.
+
+This ensures non-greedy outer quantifiers like `(a*)*?` produce the same result as RE2 (longest match), not Perl semantics (shortest match).
+
+**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. Stack is reserved at compile time in WASM linear memory immediately after the pattern tables.
+
+**Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns -1 (no match) rather than corrupting memory. This caps catastrophic backtracking on adversarial inputs.
 
 ---
 
 ## Hybrid Modules
 
-When a config entry sets both `match_func`/`find_func` AND `groups_func`/`named_groups_func`, a single WASM module is generated containing both a DFA function (match and/or find) and a OnePass function (groups), sharing the same memory region.
+When a config entry sets both `match_func`/`find_func` AND `groups_func`/`named_groups_func`, a single WASM module is generated containing both a DFA function (match and/or find) and a groups function (OnePass or Backtracking depending on the pattern), sharing the same memory region.
 
 ---
 
 ## RE2 Test Coverage
 
-The RE2 exhaustive test suite (`re2test/`) currently reports approximately:
+The RE2 exhaustive test suite (`re2test/`) reports:
 
-- **~4.68M passing** (DFA + OnePass)
-- **~1.03M skipped**
+- **~4.94M passing** (DFA + OnePass + Backtracking)
+- **~781K skipped**
 
-Skipped cases break down as:
+| Engine | Passing cases |
+|---|---|
+| DFA | ~4.76M |
+| OnePass | ~52K |
+| Backtracking | ~120K |
+
+Skipped cases:
 
 | Reason | Approximate count |
 |---|---|
 | Unicode support not implemented | ~270K |
 | Unsupported `\C` syntax | ~511K |
-| Non-deterministic captures (not OnePass-eligible) | ~251K |
+
+The previously-skipped non-deterministic capture category (~251K) is now covered by the Backtracking engine. The remaining skipped categories (Unicode and `\C`) are architectural limitations unrelated to engine selection.
 
 ---
 
-## Future: Backtracking Engine
+## Future
 
-The largest recoverable skip category is **non-deterministic captures** (~251K cases) — patterns with capture groups that cannot be handled by the OnePass engine because their alternations have overlapping first-character sets. Examples: `(a|ab)`, `(.*)(\w+)`, `(a+)(a*)`.
-
-These require a general capture engine. The planned approach is a **backtracking engine** targeting WASM:
-
-- Implements RE2-compatible leftmost-first capture semantics
-- Uses an explicit stack in WASM linear memory (no host call stack)
-- Activated when a pattern has captures but fails the `isOnePass` check
-- Bounded by a configurable step limit to prevent worst-case O(2ⁿ) blowup on adversarial inputs (matching RE2's safety model)
-
-With a backtracking engine, the remaining ~251K skipped capture-group cases would pass, bringing total RE2 coverage to approximately **~4.93M** passing cases (excluding Unicode and `\C`).
-
-The Unicode skip category (~270K) would require a separate Unicode mode that expands character classes to full code-point ranges — a significant table size increase, considered separately.
+**Unicode support** — expanding character class handling to full Unicode code-point ranges. Currently all engines operate on byte (ASCII) input only.

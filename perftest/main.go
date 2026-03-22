@@ -169,6 +169,22 @@ var tests = []testCase{
 			{"injected ~1KB", sqlInjectInput()},
 		},
 	},
+	// ── Backtracking engine benchmark ────────────────────────────────────────
+	// .* before (ERROR|WARNING|FATAL) makes this non-OnePass: the .* loop and
+	// the keyword alternation share overlapping first-character sets.
+	// The Backtracking engine is used automatically as a fallback.
+	// Inputs are single matching log lines; anchoredGroups mode matches the
+	// full line and extracts timestamp, level, and message captures.
+	{
+		name:    "log-capture",
+		pattern: `^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) .*(ERROR|WARNING|FATAL): (.+)$`,
+		mode:    anchoredGroups,
+		inputs: []namedInput{
+			{"ERROR short",   "2026-03-22T14:05:01 app[42] ERROR: connection refused"},
+			{"WARNING long",  "2026-03-22T14:05:02 service.worker.pool[7] WARNING: queue depth 9823 exceeds threshold 5000, consider scaling"},
+			{"FATAL long",    "2026-03-22T14:05:03 db.connection.manager[1] FATAL: unable to acquire lock on table users after 30000ms, shutting down"},
+		},
+	},
 }
 
 // secretBaseInput returns a ~10KB environment/config file with many 'e', 'g', 'A'
@@ -362,8 +378,8 @@ func buildRegexped(dir, harnessName, exportName string, mode compile.MatchMode, 
 	return mergedPath, nil
 }
 
-// buildRegexpedGroups compiles a pattern to a OnePass groups WASM and merges
-// it with the groups harness.
+// buildRegexpedGroups compiles a pattern to a groups WASM (OnePass or
+// Backtracking) and merges it with the groups harness.
 func buildRegexpedGroups(dir, harnessName, exportName, pattern string) (string, error) {
 	harness := harnessWasm(dir, harnessName)
 	rustTop, err := utils.RustMemTop(harness)
@@ -373,7 +389,11 @@ func buildRegexpedGroups(dir, harnessName, exportName, pattern string) (string, 
 	tableBase := utils.PageAlign(rustTop)
 	wasmBytes, _, err := compile.CompileOnePassGroups(pattern, exportName, tableBase, false)
 	if err != nil {
-		return "", fmt.Errorf("compile: %w", err)
+		// Not OnePass-eligible — fall back to backtracking engine.
+		wasmBytes, _, err = compile.CompileBacktrackGroups(pattern, exportName, tableBase, false)
+		if err != nil {
+			return "", fmt.Errorf("compile: %w", err)
+		}
 	}
 
 	patTmp, err := os.CreateTemp("", "pattern-*.wasm")

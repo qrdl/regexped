@@ -184,7 +184,11 @@ func compileRegexEntry(re config.RegexEntry, tableBase int64) ([]byte, int64, er
 	case needGroups && (needMatch || needFind):
 		return compileHybrid(re, tableBase, needMatch, needFind)
 	case needGroups:
-		return CompileOnePassGroups(re.Pattern, re.GroupsExportName(), tableBase, false)
+		wasmBytes, tableEnd, err := CompileOnePassGroups(re.Pattern, re.GroupsExportName(), tableBase, false)
+		if err == nil {
+			return wasmBytes, tableEnd, nil
+		}
+		return CompileBacktrackGroups(re.Pattern, re.GroupsExportName(), tableBase, false)
 	case needMatch && needFind:
 		return compileDualDFA(re.Pattern, re.MatchFunc, re.FindFunc, tableBase)
 	case needFind:
@@ -282,7 +286,7 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 		}
 	}
 
-	// Compile OnePass.
+	// Compile groups function (OnePass preferred; backtrack fallback).
 	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
 	if err != nil {
 		return nil, 0, fmt.Errorf("parse error: %w", err)
@@ -291,15 +295,6 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 	if err != nil {
 		return nil, 0, fmt.Errorf("compile NFA: %w", err)
 	}
-	if !isOnePass(prog) {
-		return nil, 0, fmt.Errorf("pattern is not one-pass deterministic")
-	}
-	op := newOnePass(prog)
-
-	opTableBase := utils.PageAlign(tableBase + dfaSize)
-	opDataSize  := int64(op.numStates * 256)
-	tableEnd    := utils.PageAlign(opTableBase + opDataSize)
-	memPages    := int32(tableEnd / 65536)
 
 	matchExport := ""
 	if needMatch {
@@ -310,8 +305,27 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 		findExport = re.FindFunc
 	}
 
-	wasmBytes := genHybridWASM(table, tableBase, matchExport, findExport,
-		op, opTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst)
+	if isOnePass(prog) {
+		op := newOnePass(prog)
+		opTableBase := utils.PageAlign(tableBase + dfaSize)
+		opDataSize  := int64(op.numStates * 256)
+		tableEnd    := utils.PageAlign(opTableBase + opDataSize)
+		memPages    := int32(tableEnd / 65536)
+		wasmBytes := genHybridWASM(table, tableBase, matchExport, findExport,
+			op, opTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst)
+		return wasmBytes, tableEnd, nil
+	}
+
+	// Not one-pass: use backtracking engine for groups function.
+	bt := newBacktrack(prog)
+	btTableBase := utils.PageAlign(tableBase + dfaSize)
+	numCapLocals := bt.numGroups * 2
+	frameSize := 4 + numCapLocals*4 + 4
+	stackSize := (bt.numAlts + 2) * frameSize
+	tableEnd := utils.PageAlign(btTableBase + int64(stackSize))
+	memPages := int32(tableEnd / 65536)
+	wasmBytes := genHybridWASMWithBacktrack(table, tableBase, matchExport, findExport,
+		bt, btTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst)
 	return wasmBytes, tableEnd, nil
 }
 
@@ -420,6 +434,8 @@ func compile(pattern string, opts ...CompileOptions) (Matcher, error) {
 	switch engineType {
 	case EngineDFA:
 		return newDFA(prog, options.Unicode, options.LeftmostFirst), nil
+	case EngineBacktrack:
+		return newBacktrack(prog), nil
 	default:
 		return nil, fmt.Errorf("engine %v not yet supported by wasm compiler", engineType)
 	}

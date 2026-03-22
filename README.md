@@ -7,7 +7,8 @@ Embed high-performance regex matchers directly into WASM applications — no ful
 ## Features
 
 - **DFA engine** — O(n) anchored matching and non-anchored find, LeftmostFirst (RE2/Perl) alternation semantics, word boundary assertions (`\b`, `\B`), byte class compression, SIMD prefix scan (Teddy algorithm)
-- **OnePass engine** — anchored matching with capture group tracking for deterministic patterns
+- **OnePass engine** — O(n) capture group tracking for deterministic patterns (disjoint alternations)
+- **Backtracking engine** — capture group tracking for non-deterministic patterns with RE2 leftmost-longest semantics
 - Rust FFI stub generation with iterator support (match, find, groups, named groups)
 - WASM module merging via `wasm-merge`
 - Configurable via YAML
@@ -33,7 +34,8 @@ go build -o regexped .
 - [CLI reference](docs/cli.md) — commands, flags, config schema, pattern support
 - [Rust API](docs/rust-api.md) — generated function signatures and iterator usage
 - [Browser embedding](docs/browser.md) — JS ES module workflow, generated JS API
-- [Engines](docs/engines.md) — DFA, OnePass, engine selection, RE2 coverage, future backtracking
+- [Engines](docs/engines.md) — DFA, OnePass, Backtracking, engine selection
+- [RE2 test coverage](docs/re2.md) — pass/skip counts per engine and skip reasons
 - [WASM internals](docs/wasm.md) — WASM interface, memory layout, table formats
 
 ## Examples
@@ -47,7 +49,9 @@ See [`examples/`](examples/) for three self-contained projects with Makefiles:
 
 ## Performance
 
-**Matching:** O(n) time, O(1) runtime stack — no backtracking, no worst-case blowup.
+**DFA/OnePass matching:** O(n) time, O(1) runtime stack — no worst-case blowup.
+
+**Backtracking:** RE2 leftmost-longest semantics for non-deterministic capture patterns; stack-bounded to prevent worst-case blowup on adversarial inputs.
 
 **SIMD prefix scan:** First-byte and two-byte Teddy algorithm skips non-matching positions in bulk using WASM SIMD instructions, reducing DFA transitions on typical inputs.
 

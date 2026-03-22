@@ -32,9 +32,13 @@ All paths in the config file are resolved relative to the config file's director
 
 ### Engine selection
 
-Setting `groups_func` or `named_groups_func` triggers the **OnePass engine** (anchored matching with capture tracking). The pattern must be deterministic: all `|` alternations must have disjoint first-character sets.
+Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation:
+- **OnePass engine** — used when all `|` alternations have disjoint first-character sets (deterministic patterns)
+- **Backtracking engine** — used automatically as a fallback for patterns that are not OnePass-eligible (e.g. `(a|ab)`, `(a*)(a*)`)
 
 Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
+
+See [engines.md](engines.md) for full details on engine selection and capabilities.
 
 ### Pattern support
 
@@ -49,8 +53,8 @@ Regexped uses RE2 syntax. Backreferences are not supported by design.
 | Non-greedy quantifiers `*?`, `+?` | Yes |
 | Alternation `\|` (LeftmostFirst / RE2 semantics) | Yes |
 | Word boundaries `\b`, `\B` | Yes |
-| Capture groups (deterministic OnePass patterns) | Yes |
-| Capture groups (non-deterministic) | No |
+| Capture groups (deterministic — OnePass engine) | Yes |
+| Capture groups (non-deterministic — Backtracking engine) | Yes |
 | Backreferences `\1` | No |
 | Lookahead / lookbehind | No |
 | Unicode beyond ASCII | No |

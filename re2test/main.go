@@ -8,6 +8,7 @@ import (
 	"regexp/syntax"
 	"strconv"
 	"strings"
+	"time"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
@@ -69,7 +70,10 @@ func run(testFile string, verbose bool, maxErrors int) error {
 	}
 	defer f.Close()
 
-	engine := wasmtime.NewEngine()
+	cfg := wasmtime.NewConfig()
+	cfg.SetEpochInterruption(true)
+	engine := wasmtime.NewEngineWithConfig(cfg)
+	wd := newWatchdog(engine)
 
 	var (
 		testStrings []string
@@ -86,19 +90,21 @@ func run(testFile string, verbose bool, maxErrors int) error {
 		findFn     *wasmtime.Func
 		findMemory *wasmtime.Memory
 
-		// per-pattern OnePass groups mode (col 0 captures); nil when not applicable
-		groupsStore  *wasmtime.Store
-		groupsFn     *wasmtime.Func
-		groupsMemory *wasmtime.Memory
-		numGroups    int
+		// per-pattern groups mode (col 0 captures); nil when not applicable
+		groupsStore       *wasmtime.Store
+		groupsFn          *wasmtime.Func
+		groupsMemory      *wasmtime.Memory
+		numGroups         int
+		groupsIsBacktrack bool // true when backtracking engine is used
 
 		lineno       int
 		npass        int
 		nfail        int
 		ncases       int
 		stopped      bool
-		npassDFA     int
-		npassOnePass int
+		npassDFA        int
+		npassOnePass    int
+		npassBacktrack  int
 		skipCount    = make(map[string]int)
 	)
 
@@ -146,7 +152,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 			pattern = q
 			store, matchFn, memory = nil, nil, nil
 			findFn, findMemory = nil, nil
-			groupsStore, groupsFn, groupsMemory, numGroups = nil, nil, nil, 0
+			groupsStore, groupsFn, groupsMemory, numGroups, groupsIsBacktrack = nil, nil, nil, 0, false
 
 			// Pre-check for unsupported features before attempting compilation.
 			if reason := preCheck(pattern); reason != "" {
@@ -175,6 +181,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				groupBytes, _, gErr := compile.CompileOnePassGroups(pattern, "groups", tableBase, true)
 				if gErr == nil {
 					groupsStore = wasmtime.NewStore(engine)
+						groupsStore.SetEpochDeadline(1)
 					if groupMod, gmErr := wasmtime.NewModule(engine, groupBytes); gmErr == nil {
 						if groupInst, giErr := wasmtime.NewInstance(groupsStore, groupMod, []wasmtime.AsExtern{}); giErr == nil {
 							groupsFn = groupInst.GetFunc(groupsStore, "groups")
@@ -183,6 +190,25 @@ func run(testFile string, verbose bool, maxErrors int) error {
 							}
 							re2, _ := syntax.Parse(pattern, syntax.Perl)
 							numGroups = re2.MaxCap() + 1
+						}
+					}
+				}
+				// Fall through to DFA for match/find (captures stripped internally).
+			} else if engineType == compile.EngineBacktrack {
+				// Pattern requires backtracking for captures.
+				groupBytes, _, gErr := compile.CompileBacktrackGroups(pattern, "groups", tableBase, true)
+				if gErr == nil {
+					groupsStore = wasmtime.NewStore(engine)
+						groupsStore.SetEpochDeadline(1)
+					if groupMod, gmErr := wasmtime.NewModule(engine, groupBytes); gmErr == nil {
+						if groupInst, giErr := wasmtime.NewInstance(groupsStore, groupMod, []wasmtime.AsExtern{}); giErr == nil {
+							groupsFn = groupInst.GetFunc(groupsStore, "groups")
+							if exp := groupInst.GetExport(groupsStore, "memory"); exp != nil {
+								groupsMemory = exp.Memory()
+							}
+							re2, _ := syntax.Parse(pattern, syntax.Perl)
+							numGroups = re2.MaxCap() + 1
+							groupsIsBacktrack = true
 						}
 					}
 				}
@@ -211,6 +237,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 
 			// Compile succeeded — set up wasmtime instances for anchored and find modes.
 			store = wasmtime.NewStore(engine)
+			store.SetEpochDeadline(1)
 			mod, modErr := wasmtime.NewModule(engine, wasmBytes)
 			if modErr != nil {
 				return fmt.Errorf("%s:%d: NewModule for %q: %w", testFile, lineno, pattern, modErr)
@@ -285,9 +312,10 @@ func run(testFile string, verbose bool, maxErrors int) error {
 					skipCount[skipNonAnchored]++
 					continue
 				}
-				got, callErr := callFind(store, findFn, findMemory, text)
+				got, callErr := callFind(wd, store, findFn, findMemory, text)
 				if callErr != nil {
-					return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
+					if isTimeout(callErr) { return fmt.Errorf("TIMEOUT: find pattern=%q input=%q", pattern, text) }
+				return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
 						testFile, lineno, pattern, text, callErr)
 				}
 				expected := parseCol1(col1)
@@ -311,10 +339,10 @@ func run(testFile string, verbose bool, maxErrors int) error {
 			}
 
 			if groupsFn != nil {
-				// OnePass capture test: compare end position and capture slots.
-				endPos, slots, callErr := callGroups(groupsStore, groupsFn, groupsMemory, text, numGroups)
+				endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
 				if callErr != nil {
-					return fmt.Errorf("%s:%d: wasm groups call pattern=%q input=%q: %w",
+					if isTimeout(callErr) { return fmt.Errorf("TIMEOUT: groups pattern=%q input=%q", pattern, text) }
+				return fmt.Errorf("%s:%d: wasm groups call pattern=%q input=%q: %w",
 						testFile, lineno, pattern, text, callErr)
 				}
 				expectedEnd := parseCol0(col0)
@@ -333,7 +361,7 @@ func run(testFile string, verbose bool, maxErrors int) error {
 				}
 				if endMatch && slotsMatch {
 					npass++
-					npassOnePass++
+					if groupsIsBacktrack { npassBacktrack++ } else { npassOnePass++ }
 					if verbose {
 						fmt.Printf("PASS %s:%d pattern=%q input=%q (groups)\n", testFile, lineno, pattern, text)
 					}
@@ -348,9 +376,10 @@ func run(testFile string, verbose bool, maxErrors int) error {
 					}
 				}
 			} else if matchFn != nil {
-				got, callErr := callMatch(store, matchFn, memory, text)
+				got, callErr := callMatch(wd, store, matchFn, memory, text)
 				if callErr != nil {
-					return fmt.Errorf("%s:%d: wasm call pattern=%q input=%q: %w",
+					if isTimeout(callErr) { return fmt.Errorf("TIMEOUT: match pattern=%q input=%q", pattern, text) }
+				return fmt.Errorf("%s:%d: wasm call pattern=%q input=%q: %w",
 						testFile, lineno, pattern, text, callErr)
 				}
 				expected := parseCol0(col0)
@@ -371,7 +400,6 @@ func run(testFile string, verbose bool, maxErrors int) error {
 					}
 				}
 			}
-
 		default:
 			return fmt.Errorf("%s:%d: unexpected line: %s", testFile, lineno, line)
 		}
@@ -394,6 +422,7 @@ done:
 	fmt.Printf("passed:  %d\n", npass)
 	fmt.Printf("  %-38s %d\n", "DFA:", npassDFA)
 	fmt.Printf("  %-38s %d\n", "OnePass:", npassOnePass)
+	fmt.Printf("  %-38s %d\n", "Backtrack:", npassBacktrack)
 	fmt.Printf("failed:  %d\n", nfail)
 	fmt.Printf("skipped: %d\n", totalSkipped)
 	for _, reason := range skipOrder {
@@ -408,8 +437,48 @@ done:
 	return nil
 }
 
+const wasmCallTimeout = 2 * time.Second
+
+// watchdog manages a single reusable timeout goroutine.
+// Arm before a WASM call; Disarm when it completes normally.
+// If the timeout fires before Disarm, the engine epoch is incremented.
+type watchdog struct {
+	arm    chan *wasmtime.Store
+	disarm chan struct{}
+}
+
+func newWatchdog(eng *wasmtime.Engine) *watchdog {
+	w := &watchdog{
+		arm:    make(chan *wasmtime.Store),
+		disarm: make(chan struct{}),
+	}
+	go func() {
+		for store := range w.arm {
+			store.SetEpochDeadline(1)
+			select {
+			case <-time.After(wasmCallTimeout):
+				eng.IncrementEpoch()
+				<-w.disarm // consume the disarm that will arrive after interrupt
+			case <-w.disarm:
+				// call completed before timeout — nothing to do
+			}
+		}
+	}()
+	return w
+}
+
+func (w *watchdog) Arm(store *wasmtime.Store)  { w.arm <- store }
+func (w *watchdog) Disarm()                    { w.disarm <- struct{}{} }
+
+// isTimeout reports whether a wasmtime error is an epoch interruption.
+func isTimeout(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "interrupt")
+}
+
 // callMatch writes text into WASM linear memory and invokes the match function.
-func callMatch(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string) (int32, error) {
+func callMatch(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string) (int32, error) {
+	wd.Arm(store)
+	defer wd.Disarm()
 	if len(text) > 0 {
 		buf := mem.UnsafeData(store)
 		copy(buf[inputBase:], text)
@@ -423,7 +492,9 @@ func callMatch(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, t
 
 // callFind writes text into WASM linear memory and invokes the find function.
 // Returns packed (start<<32)|end as int64, or -1 on no match.
-func callFind(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string) (int64, error) {
+func callFind(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string) (int64, error) {
+	wd.Arm(store)
+	defer wd.Disarm()
 	if len(text) > 0 {
 		buf := mem.UnsafeData(store)
 		copy(buf[inputBase:], text)
@@ -440,7 +511,7 @@ const slotsBase = int32(512)
 
 // callGroups writes text into WASM memory and invokes the groups function.
 // Returns (endPos, slots) where slots[i*2],slots[i*2+1] = start,end for group i.
-func callGroups(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string, numGroups int) (int32, []int32, error) {
+func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string, numGroups int) (int32, []int32, error) {
 	buf := mem.UnsafeData(store)
 	if len(text) > 0 {
 		copy(buf[inputBase:], text)
@@ -453,6 +524,8 @@ func callGroups(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, 
 		buf[off+2] = 0xFF
 		buf[off+3] = 0xFF
 	}
+	wd.Arm(store)
+	defer wd.Disarm()
 	result, err := fn.Call(store, inputBase, int32(len(text)), slotsBase)
 	if err != nil {
 		return 0, nil, err

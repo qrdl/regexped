@@ -2,7 +2,7 @@
 
 ## Purpose
 
-**Regexped** is a Go-based compiler that transforms regular expression patterns into standalone WebAssembly (WASM) modules. It analyzes regex patterns, compiles them to optimized DFA or OnePass automaton implementations, generates WASM bytecode, and produces language-specific stubs for integration with host applications.
+**Regexped** is a Go-based compiler that transforms regular expression patterns into standalone WebAssembly (WASM) modules. It analyzes regex patterns, compiles them to optimized DFA, OnePass, or Backtracking engine implementations, generates WASM bytecode, and produces language-specific stubs for integration with host applications.
 
 The project enables embedding high-performance regex matchers directly into WASM applications without shipping a full regex engine, reducing binary size and improving performance predictability.
 
@@ -24,10 +24,11 @@ regexped/
 ├── config/
 │   └── config.go              # YAML configuration parsing
 ├── compile/
-│   ├── compile.go             # Public API: CmdCompile, CompileRegex, CompileOnePassGroups, SelectEngine
+│   ├── compile.go             # Public API: CmdCompile, CompileRegex, CompileOnePassGroups, CompileBacktrackGroups, SelectEngine
 │   ├── selector.go            # Engine selection + isOnePass detection
 │   ├── engine_dfa.go          # DFA subset construction, table generation, WASM emission
 │   ├── engine_onepass.go      # OnePass automaton construction and WASM emission
+│   ├── engine_backtrack.go    # Backtracking engine: hybrid DFA+NFA, br_table dispatch, explicit stack, WASM emission
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/
@@ -84,7 +85,7 @@ regexes:
     named_groups_func: "url_named_groups"  # anchored + named captures → NamedGroupsIter / generator (JS)
 ```
 
-Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation (OnePass engine).
+Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation (OnePass or Backtracking engine).
 Setting only `match_func` and/or `find_func` strips captures from the pattern before compilation.
 An entry with no `_func` fields is valid — no WASM file is compiled and no stub is generated for it.
 
@@ -95,11 +96,12 @@ An entry with no `_func` fields is valid — no WASM file is compiled and no stu
 - `CmdCompile(cfg, wasmInput, outDir)` — compiles all patterns from config
 - `CompileRegex(pattern, exportName, tableBase, standalone, opts)` — DFA compilation
 - `CompileOnePassGroups(pattern, exportName, tableBase, standalone)` — OnePass compilation
+- `CompileBacktrackGroups(pattern, exportName, tableBase, standalone)` — Backtracking compilation
 - `SelectEngine(pattern, opts)` — returns engine type without compiling
 - `stripCaptures(re)` — removes capture groups from parsed regexp tree
 
 `compileRegexEntry` dispatches based on which `_func` fields are set:
-- `groups_func`/`named_groups_func` → OnePass
+- `groups_func`/`named_groups_func` → OnePass (with fallback to Backtracking if not OnePass-eligible)
 - `find_func` only → DFA find mode
 - `match_func` only → DFA anchored mode
 - no `_func` fields → returns nil (skipped silently)
@@ -109,7 +111,7 @@ An entry with no `_func` fields is valid — no WASM file is compiled and no stu
 Decision tree (in priority order):
 
 1. **OnePass** — has captures + `isOnePass()` + no nested/non-greedy quantifiers
-2. **Backtrack** — has captures that don't qualify for OnePass (not yet implemented for WASM)
+2. **Backtracking** — has captures that don't qualify for OnePass
 3. **DFA (LeftmostFirst)** — user alternations (`|`) or nested quantifiers
 4. **DFA (standard)** — everything else
 
@@ -236,7 +238,8 @@ make test        # from re2test/
 
 Test data is unpacked from `$GOROOT/src/regexp/testdata/re2-exhaustive.txt.bz2`.
 
-**Current results:** ~4.68M passing, 0 failures, ~1.03M skipped
+**Current results:** ~4.94M passing, 0 failures, ~781K skipped
+- DFA: ~4.76M, OnePass: ~52K, Backtracking: ~120K
 - Skipped: Unicode (270K), unsupported `\C` syntax (511K), non-deterministic captures (251K)
 
 Each pattern is compiled and tested for:
@@ -302,9 +305,8 @@ Capture operations are emitted as inline WASM code, not stored in memory.
 
 ## Plans / Pending Work
 
-- **HYBRID_WASM_PLAN.md** — multi-function WASM modules (match + find + groups in one file)
 - **CM_PLAN.md** — WASM Component Model support
-- **ONEPASS_PLAN.md** — OnePass implementation (complete, file can be deleted)
+- **OPTIMISATION_PLAN.md** — future performance optimisations
 
 ## Technical Decisions
 
@@ -344,5 +346,5 @@ Viable when every `InstAlt` in the NFA has branches with disjoint first-characte
 
 **Last Updated:** 2026-03-22
 **CLI commands:** `generate` (stubs / dummy_main), `compile`, `merge`
-**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details + roadmap), `docs/wasm.md` (WASM internals)
-**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD), OnePass (anchored with captures)
+**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals)
+**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD), OnePass (anchored with captures), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, all logic inside WASM)
