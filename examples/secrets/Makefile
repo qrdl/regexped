@@ -6,18 +6,18 @@ MAIN_WASM   := target/$(WASM_TARGET)/release/secrets.wasm
 REGEX_WASMS := github.wasm jwt.wasm aws.wasm
 FINAL_WASM  := final.wasm
 
-.PHONY: all stub build compile merge run clean
+.PHONY: all generate build compile merge run clean
 
 all: run
 
-# Step 1 – generate Rust stubs (one file per pattern)
-src/github_stub.rs src/jwt_stub.rs src/aws_stub.rs: regexped.yaml
-	$(REGEXPED) stub --config=regexped.yaml --out-dir=. --rust
+# Step 1 – generate Rust stubs (all patterns into one file)
+src/stubs.rs: regexped.yaml
+	$(REGEXPED) generate --config=regexped.yaml --out-dir=. --rust
 
-stub: src/github_stub.rs src/jwt_stub.rs src/aws_stub.rs
+generate: src/stubs.rs
 
 # Step 2 – compile Rust source to WASM
-$(MAIN_WASM): src/main.rs src/github_stub.rs src/jwt_stub.rs src/aws_stub.rs Cargo.toml
+$(MAIN_WASM): src/main.rs src/stubs.rs Cargo.toml
 	cargo build --target $(WASM_TARGET) --release
 
 build: $(MAIN_WASM)
@@ -53,4 +53,4 @@ run: $(FINAL_WASM)
 
 clean:
 	cargo clean
-	rm -f src/github_stub.rs src/jwt_stub.rs src/aws_stub.rs $(REGEX_WASMS) $(FINAL_WASM)
+	rm -f src/stubs.rs $(REGEX_WASMS) $(FINAL_WASM)

@@ -6,15 +6,15 @@ MAIN_WASM  := target/$(WASM_TARGET)/release/url_ipv6.wasm
 REGEX_WASM := url_ipv6.wasm
 FINAL_WASM := final.wasm
 
-.PHONY: all stub compile build merge run clean
+.PHONY: all generate compile build merge run clean
 
 all: run
 
 # Step 1 – generate Rust stub from config
 src/stub.rs: regexped.yaml
-	$(REGEXPED) stub --config=regexped.yaml --out-dir=. --rust
+	$(REGEXPED) generate --config=regexped.yaml --out-dir=. --rust
 
-stub: src/stub.rs
+generate: src/stub.rs
 
 # Step 2 – compile Rust source to WASM
 $(MAIN_WASM): src/main.rs src/stub.rs Cargo.toml

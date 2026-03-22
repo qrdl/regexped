@@ -6,13 +6,14 @@ import (
 	"strings"
 )
 
-func genRustMatchStub(pattern, importModule, funcName string) string {
-	// "match" is a Rust keyword, so we use #[link_name] to bind the WASM export
-	// "match" to a Rust-legal FFI name.
-	ffiName := "ffi_match"
+// genRustMatchStub generates an anchored-match stub.
+// The WASM export is named funcName; the internal FFI binding uses the ffi_ prefix
+// to avoid a name collision with the public Rust wrapper.
+func genRustMatchStub(importModule, funcName string) string {
+	ffiName := "ffi_" + funcName
 	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
-    #[link_name = "match"]
+    #[link_name = "%s"]
     fn %s(ptr: *const u8, len: usize) -> i32;
 }
 
@@ -25,15 +26,18 @@ pub fn %s(input: &[u8]) -> Option<usize> {
     }
 }
 
-`, importModule, ffiName, funcName, ffiName)
+`, importModule, funcName, ffiName, funcName, ffiName)
 }
 
-// genRustFindIterStub generates a FindIter struct and a constructor named funcName
-// that yields all non-overlapping matches as absolute (start, end) pairs.
-func genRustFindIterStub(funcName, importModule string) string {
+// genRustFindIterStub generates a find iterator.
+// The WASM export is named funcName; ffi_ prefix avoids collision with the
+// public constructor of the same name.
+func genRustFindIterStub(importModule, funcName string) string {
+	ffiName := "ffi_" + funcName
 	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
-    fn find(ptr: *const u8, len: usize) -> i64;
+    #[link_name = "%s"]
+    fn %s(ptr: *const u8, len: usize) -> i64;
 }
 
 pub struct FindIter<'a> {
@@ -49,7 +53,7 @@ impl<'a> Iterator for FindIter<'a> {
             return None;
         }
         let remaining = &self.input[self.offset..];
-        match unsafe { find(remaining.as_ptr(), remaining.len()) } {
+        match unsafe { %s(remaining.as_ptr(), remaining.len()) } {
             -1 => None,
             n  => {
                 let start = (n as u64 >> 32) as usize;
@@ -70,20 +74,30 @@ pub fn %s(input: &[u8]) -> FindIter<'_> {
     FindIter { input, offset: 0 }
 }
 
-`, importModule, funcName)
+`, importModule, funcName, ffiName, ffiName, funcName)
 }
 
-// genRustGroupsIterStub generates a GroupsIter struct and a constructor named funcName
-// that yields all non-overlapping anchored capture matches in the input.
-// Returned group positions are absolute offsets into the original input.
-func genRustGroupsIterStub(funcName, importModule string, numGroups int) string {
+// genRustGroupsIterStub generates a capture-groups iterator.
+// exportName is the actual WASM export (= funcName unless named_groups_func
+// shares the same WASM export, in which case exportName = groups_func value).
+// declareFFI controls whether the extern "C" block is emitted; pass false when
+// a sibling named-groups stub in the same file already declared it.
+func genRustGroupsIterStub(importModule, funcName, exportName string, declareFFI bool, numGroups int) string {
+	ffiName := "ffi_" + exportName
 	slotCount := numGroups * 2
-	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
+
+	var ffiDecl string
+	if declareFFI {
+		ffiDecl = fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
-    fn groups(ptr: *const u8, len: usize, out: *mut i32) -> i32;
+    #[link_name = "%s"]
+    fn %s(ptr: *const u8, len: usize, out: *mut i32) -> i32;
 }
 
-pub struct GroupsIter<'a> {
+`, importModule, exportName, ffiName)
+	}
+
+	return ffiDecl + fmt.Sprintf(`pub struct GroupsIter<'a> {
     input: &'a [u8],
     offset: usize,
 }
@@ -98,7 +112,7 @@ impl<'a> Iterator for GroupsIter<'a> {
             }
             let remaining = &self.input[self.offset..];
             let mut slots = [-1i32; %d];
-            if unsafe { groups(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) } < 0 {
+            if unsafe { %s(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) } < 0 {
                 if self.offset == self.input.len() {
                     return None;
                 }
@@ -126,13 +140,15 @@ pub fn %s(input: &[u8]) -> GroupsIter<'_> {
     GroupsIter { input, offset: 0 }
 }
 
-`, importModule, slotCount, numGroups, numGroups, funcName)
+`, slotCount, ffiName, numGroups, numGroups, funcName)
 }
 
-// genRustNamedGroupsIterStub generates a NamedGroupsIter struct and a constructor
-// named funcName that yields all non-overlapping anchored capture matches in the input.
-// Returned positions are absolute offsets into the original input.
-func genRustNamedGroupsIterStub(funcName, importModule string, numGroups int, namedGroups map[string]int) string {
+// genRustNamedGroupsIterStub generates a named-capture-groups iterator.
+// exportName is the actual WASM export name.
+// declareFFI controls whether the extern "C" block is emitted; pass false when
+// a sibling groups stub in the same file already declared it.
+func genRustNamedGroupsIterStub(importModule, funcName, exportName string, declareFFI bool, numGroups int, namedGroups map[string]int) string {
+	ffiName := "ffi_" + exportName
 	slotCount := numGroups * 2
 
 	type entry struct {
@@ -152,12 +168,18 @@ func genRustNamedGroupsIterStub(funcName, importModule string, numGroups int, na
 			e.index*2, e.name, e.index*2, e.index*2+1)
 	}
 
-	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
+	var ffiDecl string
+	if declareFFI {
+		ffiDecl = fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
-    fn groups(ptr: *const u8, len: usize, out: *mut i32) -> i32;
+    #[link_name = "%s"]
+    fn %s(ptr: *const u8, len: usize, out: *mut i32) -> i32;
 }
 
-pub struct NamedGroupsIter<'a> {
+`, importModule, exportName, ffiName)
+	}
+
+	return ffiDecl + fmt.Sprintf(`pub struct NamedGroupsIter<'a> {
     input: &'a [u8],
     offset: usize,
 }
@@ -172,7 +194,7 @@ impl<'a> Iterator for NamedGroupsIter<'a> {
             }
             let remaining = &self.input[self.offset..];
             let mut slots = [-1i32; %d];
-            if unsafe { groups(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) } < 0 {
+            if unsafe { %s(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) } < 0 {
                 if self.offset == self.input.len() {
                     return None;
                 }
@@ -195,5 +217,5 @@ pub fn %s(input: &[u8]) -> NamedGroupsIter<'_> {
     NamedGroupsIter { input, offset: 0 }
 }
 
-`, importModule, slotCount, inserts.String(), funcName)
+`, slotCount, ffiName, inserts.String(), funcName)
 }

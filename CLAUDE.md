@@ -20,7 +20,7 @@ YAML Config → Parse Patterns → Select Engine → Compile → Generate WASM �
 
 ```
 regexped/
-├── main.go                    # CLI entry point: stub, compile, merge
+├── main.go                    # CLI entry point: generate, compile, merge
 ├── config/
 │   └── config.go              # YAML configuration parsing
 ├── compile/
@@ -31,8 +31,9 @@ regexped/
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/
-│   ├── generate.go            # Stub generation orchestration
-│   └── rust_stub.go           # Rust FFI stub generator
+│   ├── generate.go            # Stub generation orchestration (CmdStub)
+│   ├── rust_stub.go           # Rust FFI stub generator (iterators)
+│   └── dummy_main.go          # Dummy main WASM generator (CmdDummyMain)
 ├── merge/
 │   └── merge.go               # WASM module merging with wasm-merge
 ├── utils/
@@ -51,8 +52,9 @@ regexped/
     ├── README.md
     ├── Makefile
     ├── url-ipv6/              # DFA anchored match: validate IPv6 URLs
-    ├── secrets/               # DFA find_iter: scan text for GitHub/JWT/AWS secrets
-    └── url-parts/             # OnePass named_groups_iter: find and parse all URLs in text
+    ├── secrets/               # DFA find: scan text for GitHub/JWT/AWS secrets
+    ├── url-parts/             # OnePass named_groups: find and parse all URLs in text
+    └── browser/               # Browser demo: email + URL validation via JS + WASM
 ```
 
 ## Components
@@ -66,19 +68,20 @@ Parses YAML configuration files. Schema:
 ```yaml
 wasm_merge: "path/to/wasm-merge"  # optional, defaults to $PATH
 output:   "merged.wasm"           # output path for merge command; overridable with -o/--output
-stub_dir: "."                     # default output directory for stub files; overridable with -d/--out-dir
 wasm_dir: "."                     # default output directory for compiled WASM files; overridable with -d/--out-dir
+stub_file: "src/stubs.rs"         # default stub output file (Rust or JS); per-entry overrides
 regexes:
   - wasm_file:        "url.wasm"
     import_module:    "url"
-    stub_file:        "stub.rs"
+    stub_file:        "src/url.rs"  # per-entry override; if absent, uses top-level stub_file
     pattern:          '(?P<scheme>https?)://(?P<host>[^/:?#]+)...'
 
     # All func fields are optional; an entry with only 'pattern' is silently skipped.
-    match_func:        "url_match"         # anchored match → Option<usize>
-    find_func:         "url_find"          # non-anchored find → Option<(usize,usize)>
-    groups_func:       "url_groups"        # anchored + captures → Option<Vec<...>>
-    named_groups_func: "url_named_groups"  # anchored + named captures → Option<HashMap<...>>
+    # Each func name becomes the WASM export name AND the generated function name.
+    match_func:        "url_match"         # anchored match → Option<usize> / boolean (JS)
+    find_func:         "url_find"          # non-anchored find → FindIter / generator (JS)
+    groups_func:       "url_groups"        # anchored + captures → GroupsIter / generator (JS)
+    named_groups_func: "url_named_groups"  # anchored + named captures → NamedGroupsIter / generator (JS)
 ```
 
 Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation (OnePass engine).
@@ -170,31 +173,37 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 - `appendSection(out, id, content)` — encodes a WASM section with LEB128 size
 - `appendDataSegment(out, offset, data)` — active data segment at fixed memory offset
 
-### 3. Stub Generation (`generate/`)
+### 3. Code Generation (`generate/`)
 
-Four stub types generated based on config fields:
+**WASM export names = func names.** The value of `match_func`, `find_func`, `groups_func`, or `named_groups_func` is used directly as the WASM export name. This ensures unique export names in merged WASMs and removes the need for special-casing `match` (a Rust keyword).
 
-| Field | WASM export | Rust return type |
+**Rust stubs** (`generate/generate.go` + `rust_stub.go`):
+
+| Field | WASM export | Generated function | Rust type |
+|---|---|---|---|
+| `match_func` | `<func>` | `<func>(input)` | `Option<usize>` |
+| `find_func` | `<func>` | `<func>(input)` | `FindIter` — yields `(usize, usize)` |
+| `groups_func` | `<func>` | `<func>(input)` | `GroupsIter` — yields `Vec<Option<(usize,usize)>>` |
+| `named_groups_func` | `<func>` | `<func>(input)` | `NamedGroupsIter` — yields `HashMap<&str,(usize,usize)>` |
+
+All FFI declarations use `ffi_<func>` internally with `#[link_name = "<func>"]` to avoid collision with the public Rust wrapper of the same name. Iterators advance past zero-length matches by one byte.
+
+When multiple entries share the same `stub_file`, each is wrapped in `pub mod <import_module> { }`. Single-entry files have no mod block.
+
+**JS stubs** (`generate/js_stub.go`):
+
+Generated as a single ES module using top-level `await`. Loads the merged WASM (`output` field) and exports:
+
+| Field | JS export | Returns |
 |---|---|---|
-| `match_func` | `match` | `Option<usize>` |
-| `find_func` | `find` | `Option<(usize, usize)>` |
-| `groups_func` | `groups` | `Option<Vec<Option<(usize, usize)>>>` |
-| `named_groups_func` | `groups` | `Option<HashMap<&'static str, (usize, usize)>>` |
+| `match_func` | `function <func>(input)` | `boolean` |
+| `find_func` | `function* <func>(input)` | generator of `[start, end]` |
+| `groups_func` | `function* <func>(input)` | generator of `Array<[start,end]\|null>` |
+| `named_groups_func` | `function* <func>(input)` | generator of `Object` (name→`[start,end]`) |
 
-`named_groups_func` is a pure Rust wrapper over the same `groups` WASM export — group names and indices are hardcoded at codegen time.
+Input `string` or `Uint8Array`. Capture slot buffer placed at memory offset 1024.
 
-For `find_func`, `groups_func`, and `named_groups_func` an iterator type is also generated alongside the single-match function:
-
-| Field | Iterator constructor | Iterator `Item` |
-|---|---|---|
-| `find_func` | `<func>_iter(input)` | `(usize, usize)` — absolute (start, end) |
-| `groups_func` | `<func>_iter(input)` | `Vec<Option<(usize, usize)>>` — absolute positions |
-| `named_groups_func` | `<func>_iter(input)` | `HashMap<&'static str, (usize, usize)>` — absolute positions |
-
-Iterators advance past zero-length matches by one byte.
-`NamedGroupsIter` calls the FFI `groups` function directly to read `slots[1]` (full-match end) for the advance distance, then builds the adjusted map.
-
-When multiple stubs are included in the same Rust compilation unit, each must be in its own `mod` block to avoid FFI name collisions (`fn find`, `fn match`, `fn groups` are always the WASM-level names).
+**Dummy main** (`generate/dummy_main.go`): 25-byte WASM with 2-page memory export; used as `--wasm-input` for browser deployments.
 
 ### 4. WASM Merging (`merge/`)
 
@@ -334,5 +343,6 @@ Viable when every `InstAlt` in the NFA has branches with disjoint first-characte
 ---
 
 **Last Updated:** 2026-03-22
-**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/wasm.md` (WASM internals)
+**CLI commands:** `generate` (stubs / dummy_main), `compile`, `merge`
+**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details + roadmap), `docs/wasm.md` (WASM internals)
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD), OnePass (anchored with captures)

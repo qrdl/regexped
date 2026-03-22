@@ -1,0 +1,14 @@
+wasm_merge: "../../../binaryen/bin/wasm-merge"
+output:    "final.wasm"
+stub_file: "regex.js"
+
+regexes:
+  - wasm_file:     "email.wasm"
+    import_module: "email"
+    pattern:       '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+    match_func:    "email_match"
+
+  - wasm_file:     "url.wasm"
+    import_module: "url"
+    pattern:       'https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?'
+    match_func:    "url_match"

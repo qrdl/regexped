@@ -7,22 +7,26 @@ Regexped is driven by a YAML config file (default: `regexped.yaml` in the curren
 ```yaml
 wasm_merge: "wasm-merge"   # path to wasm-merge binary; defaults to wasm-merge in $PATH
 output:   "merged.wasm"    # output path for the merge command; overridable with -o/--output
-stub_dir: "."              # default output directory for stub files; overridable with -d/--out-dir
 wasm_dir: "."              # default output directory for compiled WASM files; overridable with -d/--out-dir
+stub_file: "src/stubs.rs"  # default stub output file for all entries (Rust or JS); per-entry overrides
 
 regexes:
-  - wasm_file:        "url.wasm"       # output WASM file for this pattern
-    import_module:    "url"            # WASM import module name
-    stub_file:        "url_stub.rs"    # output stub filename (placed under stub_dir/src/)
-    pattern:          'https?://...'   # RE2 regex pattern
+  - wasm_file:        "url.wasm"     # output WASM file for this pattern
+    import_module:    "url"          # WASM import module name (used by wasm-merge and Rust FFI)
+    stub_file:        "src/url.rs"   # per-entry override; if absent, uses top-level stub_file
+    pattern:          'https?://...' # RE2 regex pattern
 
     # One or more func fields — only those set are compiled and stubbed.
+    # The func name becomes both the WASM export name and the generated function name.
     # An entry with only 'pattern' is valid; no WASM or stub is generated for it.
     match_func:        "url_match"         # anchored match
     find_func:         "url_find"          # non-anchored find
     groups_func:       "url_groups"        # anchored match with all capture groups
     named_groups_func: "url_named_groups"  # anchored match with named capture groups
 ```
+
+When multiple entries share the same stub file, each entry's stubs are wrapped in a
+`pub mod <import_module> { }` block (Rust) to prevent FFI name collisions.
 
 All paths in the config file are resolved relative to the config file's directory.
 
@@ -55,13 +59,17 @@ Regexped uses RE2 syntax. Backreferences are not supported by design.
 
 ## Commands
 
-### `stub` — Generate language stubs
+### `generate` — Generate stubs or dummy main module
+
+`--rust`, `--js`, and `--dummy_main` are mutually exclusive.
+
+#### `--rust` — Generate Rust language stubs
 
 ```
-regexped stub [--config=<file>] [--out-dir=<dir>] [-d <dir>] --rust
+regexped generate [--config=<file>] [--out-dir=<dir>] [-d <dir>] --rust
 ```
 
-Generates a Rust stub file for each regex entry that has a `stub_file` and at least one `_func` field. Stubs are written to `<out-dir>/src/<stub_file>`.
+Generates Rust stub files. Entries sharing the top-level `stub_file` are collected into one file with `pub mod <import_module>` blocks; entries with a per-entry `stub_file` go to their own file. Output path: `<out-dir>/<stub_file>` (include any subdirectory in the `stub_file` value, e.g. `src/stubs.rs`).
 
 | Config field | Generated function | Return type |
 |---|---|---|
@@ -77,8 +85,57 @@ See [rust-api.md](rust-api.md) for full usage examples.
 | Flag | Default | Description |
 |---|---|---|
 | `--config` | `regexped.yaml` | YAML config file |
-| `--out-dir`, `-d` | config `stub_dir`, then `.` | Output directory |
-| `--rust` | — | Generate Rust stubs (required) |
+| `--out-dir`, `-d` | `.` | Output directory |
+| `--rust` | — | Generate Rust stubs |
+
+#### `--js` — Generate a JS ES module stub
+
+```
+regexped generate [--config=<file>] [--out-dir=<dir>] [-d <dir>] --js
+```
+
+Generates a single ES module that loads the merged WASM (`output` field) and exports wrapper functions for every entry. Output path: `<out-dir>/<stub_file>`.
+
+Requires `output` and `stub_file` to be set in the config.
+
+| Config field | Generated JS export | Returns |
+|---|---|---|
+| `match_func` | `function <func>(input)` | `boolean` — true if full input matches |
+| `find_func` | `function* <func>(input)` | generator yielding `[start, end]` per match |
+| `groups_func` | `function* <func>(input)` | generator yielding `Array<[start,end]\|null>` per match |
+| `named_groups_func` | `function* <func>(input)` | generator yielding `Object` (name→`[start,end]`) per match |
+
+The generated module uses top-level `await` and is suitable for `<script type="module">` or ESM imports. Input can be a `string` or `Uint8Array`.
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config` | `regexped.yaml` | YAML config file |
+| `--out-dir`, `-d` | `.` | Output directory |
+| `--js` | — | Generate JS ES module stub |
+
+---
+
+#### `--dummy_main` — Generate a minimal main WASM module
+
+```
+regexped generate [--out-dir=<dir>] [-d <dir>] --dummy_main
+```
+
+Writes `main.wasm` to `<out-dir>`. The generated module exports 2 pages of memory and has no code or data. Use it as:
+
+- `--wasm-input` for the `compile` command when there is no Rust main module (e.g. browser deployments)
+- The `main` module in a `wasm-merge` invocation
+
+No config file is required.
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--out-dir`, `-d` | `.` | Output directory for `main.wasm` |
+| `--dummy_main` | — | Generate dummy main WASM |
 
 ---
 
@@ -125,7 +182,7 @@ Patches the main module's memory section to fit all regex tables, then calls `wa
 
 ```bash
 # 1. Generate Rust stubs
-regexped stub --config=regexped.yaml --rust
+regexped generate --config=regexped.yaml --rust
 
 # 2. Build your Rust project to WASM (produces main.wasm)
 cargo build --target wasm32-wasip1 --release

@@ -32,6 +32,8 @@ go build -o regexped .
 
 - [CLI reference](docs/cli.md) — commands, flags, config schema, pattern support
 - [Rust API](docs/rust-api.md) — generated function signatures and iterator usage
+- [Browser embedding](docs/browser.md) — JS ES module workflow, generated JS API
+- [Engines](docs/engines.md) — DFA, OnePass, engine selection, RE2 coverage, future backtracking
 - [WASM internals](docs/wasm.md) — WASM interface, memory layout, table formats
 
 ## Examples
@@ -39,8 +41,9 @@ go build -o regexped .
 See [`examples/`](examples/) for three self-contained projects with Makefiles:
 
 - **url-ipv6** — match a URL with an IPv6 address using anchored DFA
-- **secrets** — scan text for GitHub tokens, JWTs, and AWS keys using `find_iter`
-- **url-parts** — find and parse all URLs in text using `named_groups_iter` with the OnePass engine
+- **secrets** — scan text for GitHub tokens, JWTs, and AWS keys
+- **url-parts** — find and parse all URLs in text using the OnePass engine
+- **browser** — email and URL validation in the browser via JS + WASM (no Rust, no bundler)
 
 ## Performance
 

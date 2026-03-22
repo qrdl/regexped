@@ -1,9 +1,9 @@
 wasm_merge: "../../../binaryen/bin/wasm-merge"
 output:    "final.wasm"
+stub_file: "src/stub.rs"
 
 regexes:
   - wasm_file:        "url_parts.wasm"
     import_module:    "url_parts"
-    stub_file:        "stub.rs"
     pattern:          '(?P<scheme>https?)://(?P<host>[^/:?#]+)(?::(?P<port>[0-9]+))?(?P<path>/[^?#]*)?(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?'
     named_groups_func: "parse_url"

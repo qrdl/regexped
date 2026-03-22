@@ -1,8 +1,16 @@
+GO_SRCS := main.go \
+	config/config.go \
+	compile/compile.go compile/selector.go compile/engine_dfa.go \
+	compile/engine_onepass.go compile/prefix_scan.go compile/wasm.go \
+	generate/generate.go generate/rust_stub.go generate/dummy_main.go \
+	merge/merge.go \
+	utils/bytes.go
+
 .PHONY: re2test perftest examples clean
 
 build: regexped
 
-regexped:
+regexped: $(GO_SRCS) go.mod go.sum
 	go build -o regexped .
 
 re2test: build

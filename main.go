@@ -2,9 +2,10 @@
 //
 // Usage:
 //
-//	regexped stub    [--config=<file>] [--out-dir=<dir>] --rust
-//	regexped compile [--config=<file>] [--out-dir=<dir>] --wasm-input=<file>
-//	regexped merge   [--config=<file>] [--output=<file>] <main.wasm> <regex1.wasm> ...
+//	regexped generate [--config=<file>] [--out-dir=<dir>] --rust
+//	regexped generate [--out-dir=<dir>] --dummy_main
+//	regexped compile  [--config=<file>] [--out-dir=<dir>] --wasm-input=<file>
+//	regexped merge    [--config=<file>] [--output=<file>] <main.wasm> <regex1.wasm> ...
 //
 // The config file defaults to regexped.yaml in the current directory when not specified.
 package main
@@ -16,10 +17,10 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/merge"
-	"github.com/qrdl/regexped/generate"
 	"github.com/qrdl/regexped/compile"
+	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/generate"
+	"github.com/qrdl/regexped/merge"
 )
 
 func main() {
@@ -31,8 +32,8 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "stub":
-		runStubCmd(os.Args[2:])
+	case "generate":
+		runGenerateCmd(os.Args[2:])
 	case "compile":
 		runCompileCmd(os.Args[2:])
 	case "merge":
@@ -48,40 +49,66 @@ func printUsage() {
 	fmt.Fprint(os.Stderr, `Usage: regexped <command> [options]
 
 Commands:
-  stub     Generate language stubs for each regex in the config
-  compile  Compile regex patterns to WASM modules
-  merge    Patch memory and merge WASM modules into a single binary
+  generate  Generate language stubs or a dummy main WASM module
+  compile   Compile regex patterns to WASM modules
+  merge     Patch memory and merge WASM modules into a single binary
 
 Run 'regexped <command> -h' for command-specific options.
 `)
 }
 
-func runStubCmd(args []string) {
-	fs := flag.NewFlagSet("stub", flag.ExitOnError)
+func runGenerateCmd(args []string) {
+	fs := flag.NewFlagSet("generate", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	rust := fs.Bool("rust", false, "generate Rust stub files")
+	rust      := fs.Bool("rust", false, "generate Rust stub files")
+	js        := fs.Bool("js", false, "generate JS ES module stub file")
+	dummyMain := fs.Bool("dummy_main", false, "generate a minimal main.wasm (memory-only, no code)")
 	var outDir string
-	fs.StringVar(&outDir, "out-dir", "", "output directory for stub files (overrides config stub_dir)")
-	fs.StringVar(&outDir, "d", "", "output directory for stub files (alias for --out-dir)")
+	fs.StringVar(&outDir, "out-dir", "", "output directory for generated stubs (default: .)")
+	fs.StringVar(&outDir, "d", "", "output directory (alias for --out-dir)")
 	fs.Parse(args)
 
-	if !*rust {
-		fmt.Fprintln(os.Stderr, "stub: specify at least one output format (e.g. --rust)")
+	modeCount := 0
+	for _, b := range []bool{*rust, *js, *dummyMain} {
+		if b {
+			modeCount++
+		}
+	}
+	if modeCount > 1 {
+		fmt.Fprintln(os.Stderr, "generate: --rust, --js, and --dummy_main are mutually exclusive")
+		os.Exit(1)
+	}
+	if modeCount == 0 {
+		fmt.Fprintln(os.Stderr, "generate: specify --rust, --js, or --dummy_main")
 		os.Exit(1)
 	}
 
+	if *dummyMain {
+		if outDir == "" {
+			outDir = "."
+		}
+		if err := generate.CmdDummyMain(outDir); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	// --rust / --js path: needs config
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if outDir == "" {
-		if cfg.StubDir != "" {
-			outDir = cfg.StubDir
-		} else {
-			outDir = "."
-		}
+		outDir = "."
 	}
-	if err := generate.CmdStub(cfg, outDir, *rust); err != nil {
+
+	if *js {
+		if err := generate.CmdJS(cfg, outDir); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if err := generate.CmdStub(cfg, outDir); err != nil {
 		log.Fatal(err)
 	}
 }

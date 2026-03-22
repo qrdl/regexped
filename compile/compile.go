@@ -184,14 +184,14 @@ func compileRegexEntry(re config.RegexEntry, tableBase int64) ([]byte, int64, er
 	case needGroups && (needMatch || needFind):
 		return compileHybrid(re, tableBase, needMatch, needFind)
 	case needGroups:
-		return CompileOnePassGroups(re.Pattern, "groups", tableBase, false)
+		return CompileOnePassGroups(re.Pattern, re.GroupsExportName(), tableBase, false)
 	case needMatch && needFind:
-		return compileDualDFA(re.Pattern, tableBase)
+		return compileDualDFA(re.Pattern, re.MatchFunc, re.FindFunc, tableBase)
 	case needFind:
-		return CompileRegex(re.Pattern, "find", tableBase, false,
+		return CompileRegex(re.Pattern, re.FindFunc, tableBase, false,
 			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, Mode: ModeFind, LeftmostFirst: true})
 	case needMatch:
-		return CompileRegex(re.Pattern, "match", tableBase, false,
+		return CompileRegex(re.Pattern, re.MatchFunc, tableBase, false,
 			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA})
 	default:
 		return nil, tableBase, nil
@@ -200,7 +200,7 @@ func compileRegexEntry(re config.RegexEntry, tableBase int64) ([]byte, int64, er
 
 // compileDualDFA compiles a pattern to a WASM module with both a match and a
 // find function sharing the same DFA table.
-func compileDualDFA(pattern string, tableBase int64) ([]byte, int64, error) {
+func compileDualDFA(pattern, matchName, findName string, tableBase int64) ([]byte, int64, error) {
 	opts := CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, LeftmostFirst: true}
 	matcher, err := compile(pattern, opts)
 	if err != nil {
@@ -238,7 +238,7 @@ func compileDualDFA(pattern string, tableBase int64) ([]byte, int64, error) {
 	tableEnd := utils.PageAlign(tableBase + dfaSize)
 	memPages := int32(tableEnd / 65536)
 
-	wasmBytes := genWASM(table, tableBase, "match", "find", false, memPages, opts.LeftmostFirst)
+	wasmBytes := genWASM(table, tableBase, matchName, findName, false, memPages, opts.LeftmostFirst)
 	return wasmBytes, tableEnd, nil
 }
 
@@ -303,15 +303,15 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 
 	matchExport := ""
 	if needMatch {
-		matchExport = "match"
+		matchExport = re.MatchFunc
 	}
 	findExport := ""
 	if needFind {
-		findExport = "find"
+		findExport = re.FindFunc
 	}
 
 	wasmBytes := genHybridWASM(table, tableBase, matchExport, findExport,
-		op, opTableBase, "groups", false, memPages, dfaOpts.LeftmostFirst)
+		op, opTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst)
 	return wasmBytes, tableEnd, nil
 }
 

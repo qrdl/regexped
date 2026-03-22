@@ -13,8 +13,8 @@ import (
 type BuildConfig struct {
 	WasmMerge string       `yaml:"wasm_merge"` // optional; defaults to "wasm-merge" in $PATH
 	Output    string       `yaml:"output"`     // default output path for merge command
-	StubDir   string       `yaml:"stub_dir"`   // default output directory for stub files
 	WasmDir   string       `yaml:"wasm_dir"`   // default output directory for compiled WASM files
+	StubFile  string       `yaml:"stub_file"`  // default stub output file (Rust or JS); per-entry overrides
 	Regexes   []RegexEntry `yaml:"regexes"`
 }
 
@@ -37,6 +37,24 @@ type RegexEntry struct {
 // CaptureStubsRequested reports whether any capture-returning stub is requested.
 func (r RegexEntry) CaptureStubsRequested() bool {
 	return r.GroupsFunc != "" || r.NamedGroupsFunc != ""
+}
+
+// GroupsExportName returns the WASM export name for the groups function.
+// GroupsFunc takes priority; falls back to NamedGroupsFunc.
+func (r RegexEntry) GroupsExportName() string {
+	if r.GroupsFunc != "" {
+		return r.GroupsFunc
+	}
+	return r.NamedGroupsFunc
+}
+
+// EffectiveStubFile returns the stub file for this entry: per-entry stub_file
+// if set, otherwise the global stub_file from the build config.
+func (r RegexEntry) EffectiveStubFile(globalStubFile string) string {
+	if r.StubFile != "" {
+		return r.StubFile
+	}
+	return globalStubFile
 }
 
 // LoadConfig reads and parses the YAML config at configPath.
@@ -66,7 +84,6 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	// Resolve all paths relative to the config file's directory.
 	cfg.Output    = resolveRelative(configDir, cfg.Output)
 	cfg.WasmMerge = resolveRelative(configDir, cfg.WasmMerge)
-	cfg.StubDir   = resolveRelative(configDir, cfg.StubDir)
 	cfg.WasmDir   = resolveRelative(configDir, cfg.WasmDir)
 
 	return cfg, nil
