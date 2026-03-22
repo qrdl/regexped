@@ -395,7 +395,8 @@ func compile(pattern string, opts ...CompileOptions) (Matcher, error) {
 	originalMaxCap := re.MaxCap()
 	_ = originalMaxCap
 
-	prog, err := syntax.Compile(re.Simplify())
+	simplified := re.Simplify()
+	prog, err := syntax.Compile(simplified)
 	if err != nil {
 		return nil, fmt.Errorf("compile error: %w", err)
 	}

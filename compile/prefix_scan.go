@@ -13,6 +13,8 @@ type PrefixScanLocals struct {
 	TLo, THi     byte // v128 locals: T0_lo, T0_hi (1-byte Teddy, pre-loaded)
 	Chunk1       byte // v128 local: 16-byte chunk at attempt_start+1 (2-byte Teddy)
 	T1Lo, T1Hi   byte // v128 locals: T1_lo, T1_hi (2-byte Teddy, pre-loaded)
+	Chunk2       byte // v128 local: 16-byte chunk at attempt_start+2 (3-byte Teddy)
+	T2Lo, T2Hi   byte // v128 locals: T2_lo, T2_hi (3-byte Teddy, pre-loaded)
 }
 
 // PrefixScanParams configures EmitPrefixScan.
@@ -32,6 +34,8 @@ type PrefixScanParams struct {
 	TeddyLoOff, TeddyHiOff     int32 // T0_lo, T0_hi (1-byte Teddy)
 	TeddyT1LoOff, TeddyT1HiOff int32 // T1_lo, T1_hi (2-byte Teddy)
 	TeddyTwoByte               bool  // whether 2-byte Teddy tables are available
+	TeddyT2LoOff, TeddyT2HiOff int32 // T2_lo, T2_hi (3-byte Teddy)
+	TeddyThreeByte             bool  // whether 3-byte Teddy tables are available
 
 	// EngineDepth: number of engine-level blocks/loops that surround the scan.
 	// For DFA find body: 2  (loop $outer + block $no_match).
@@ -224,6 +228,16 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 					b = utils.AppendSLEB128(b, p.TeddyT1HiOff)
 					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T1_hi
 					b = append(b, 0x21, l.T1Hi)
+					if p.TeddyThreeByte {
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, p.TeddyT2LoOff)
+						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T2_lo
+						b = append(b, 0x21, l.T2Lo)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, p.TeddyT2HiOff)
+						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T2_hi
+						b = append(b, 0x21, l.T2Hi)
+					}
 				}
 			}
 
@@ -231,9 +245,11 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 			b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
 			b = append(b, 0x03, 0x40) // loop $simd_outer (void)
 
-			// Bounds check: need 16 bytes (17 for 2-byte Teddy).
+			// Bounds check: need 16 bytes (17 for 2-byte Teddy, 18 for 3-byte Teddy).
 			b = append(b, 0x20, l.AttemptStart)
-			if p.TeddyTwoByte && len(p.FirstByteSet) <= 8 {
+			if p.TeddyThreeByte && len(p.FirstByteSet) <= 8 {
+				b = append(b, 0x41, 0x11) // i32.const 17
+			} else if p.TeddyTwoByte && len(p.FirstByteSet) <= 8 {
 				b = append(b, 0x41, 0x10) // i32.const 16
 			} else {
 				b = append(b, 0x41, 0x0F) // i32.const 15
@@ -259,6 +275,16 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 				b = append(b, 0x6A)
 				b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
 				b = append(b, 0x21, l.Chunk1)
+				if p.TeddyThreeByte {
+					// Load chunk2 = chunk at attempt_start+2.
+					b = append(b, 0x20, l.Ptr)
+					b = append(b, 0x20, l.AttemptStart)
+					b = append(b, 0x6A)
+					b = append(b, 0x41, 0x02)
+					b = append(b, 0x6A)
+					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+					b = append(b, 0x21, l.Chunk2)
+				}
 			}
 
 			// Compute candidate mask.
@@ -292,6 +318,22 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 					b = append(b, 0xFD, 0x0E)      // i8x16.swizzle → hi1
 					b = append(b, 0xFD, 0x4E)      // v128.and → candidates1
 					b = append(b, 0xFD, 0x4E)      // v128.and c0&c1 → combined
+					if p.TeddyThreeByte {
+						// 3-byte: AND with candidates2 from chunk2.
+						b = append(b, 0x20, l.T2Lo)
+						b = append(b, 0x20, l.Chunk2)
+						b = append(b, 0x41, 0x0F)
+						b = append(b, 0xFD, 0x0F)  // i8x16.splat(0x0F)
+						b = append(b, 0xFD, 0x4E)  // v128.and
+						b = append(b, 0xFD, 0x0E)  // i8x16.swizzle → lo2
+						b = append(b, 0x20, l.T2Hi)
+						b = append(b, 0x20, l.Chunk2)
+						b = append(b, 0x41, 0x04)
+						b = append(b, 0xFD, 0x6D)  // i8x16.shr_u
+						b = append(b, 0xFD, 0x0E)  // i8x16.swizzle → hi2
+						b = append(b, 0xFD, 0x4E)  // v128.and → candidates2
+						b = append(b, 0xFD, 0x4E)  // v128.and combined&c2
+					}
 				}
 
 				// bitmask of nonzero lanes.
