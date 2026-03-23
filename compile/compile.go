@@ -169,7 +169,11 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 	} else {
 		matchExport = exportName
 	}
-	wasmBytes := genWASM(table, tableBase, matchExport, findExport, standalone, memPages, opts.LeftmostFirst)
+	var mandatoryLit *MandatoryLit
+	if opts.Mode == ModeFind {
+		mandatoryLit = FindMandatoryLit(pattern)
+	}
+	wasmBytes := genWASM(table, tableBase, matchExport, findExport, standalone, memPages, opts.LeftmostFirst, mandatoryLit)
 	return wasmBytes, tableEnd, nil
 }
 
@@ -242,7 +246,8 @@ func compileDualDFA(pattern, matchName, findName string, tableBase int64) ([]byt
 	tableEnd := utils.PageAlign(tableBase + dfaSize)
 	memPages := int32(tableEnd / 65536)
 
-	wasmBytes := genWASM(table, tableBase, matchName, findName, false, memPages, opts.LeftmostFirst)
+	mandatoryLit := FindMandatoryLit(pattern)
+	wasmBytes := genWASM(table, tableBase, matchName, findName, false, memPages, opts.LeftmostFirst, mandatoryLit)
 	return wasmBytes, tableEnd, nil
 }
 
@@ -305,6 +310,8 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 		findExport = re.FindFunc
 	}
 
+	mandatoryLit := FindMandatoryLit(re.Pattern)
+
 	if isOnePass(prog) {
 		op := newOnePass(prog)
 		opTableBase := utils.PageAlign(tableBase + dfaSize)
@@ -312,7 +319,7 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 		tableEnd    := utils.PageAlign(opTableBase + opDataSize)
 		memPages    := int32(tableEnd / 65536)
 		wasmBytes := genHybridWASM(table, tableBase, matchExport, findExport,
-			op, opTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst)
+			op, opTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst, mandatoryLit)
 		return wasmBytes, tableEnd, nil
 	}
 
@@ -325,7 +332,7 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 	tableEnd := utils.PageAlign(btTableBase + int64(stackSize))
 	memPages := int32(tableEnd / 65536)
 	wasmBytes := genHybridWASMWithBacktrack(table, tableBase, matchExport, findExport,
-		bt, btTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst)
+		bt, btTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst, mandatoryLit)
 	return wasmBytes, tableEnd, nil
 }
 

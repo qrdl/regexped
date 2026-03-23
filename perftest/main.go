@@ -146,6 +146,25 @@ var tests = []testCase{
 		},
 	},
 	{
+		// URL find in prose — benchmarks non-prefix mandatory literal extraction.
+		// First-byte set [a-zA-Z] matches ~20% of bytes in typical text, but
+		// "://" is very rare. This is the ideal pattern for mandatory-literal
+		// optimisation: noisy prefix, highly selective interior literal.
+		name:    "url-find-100kb",
+		pattern: `[a-zA-Z]{2,8}://[^\s]+`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-url 100KB", urlProseInput(nil)},
+			{"5 urls 100KB", urlProseInput([]string{
+				"https://example.com/path/to/page?q=hello&lang=en",
+				"http://api.internal/v2/users/42/profile",
+				"ftp://files.example.org/pub/release-2.3.tar.gz",
+				"https://cdn.example.net/static/js/bundle.min.js?v=8a3f1b",
+				"https://auth.example.com/oauth2/token?grant_type=client_credentials",
+			})},
+		},
+	},
+	{
 		// URL parsing with named capture groups — benchmarks OnePass engine
 		// against regex crate's capture group extraction.
 		// Credentials omitted: [^@]+ and [^/:+] overlap making it non-one-pass.
@@ -265,6 +284,45 @@ export ENCRYPTION_KEY=replace_with_actual_key
 			pos = len(result)
 		}
 		line := []byte(secret + "\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
+// urlProseInput returns a ~100KB block of prose-like text dense with alphabetic
+// characters (high false-positive rate for [a-zA-Z] prefix) but containing no
+// "://" sequences unless URLs are explicitly injected. Ideal for benchmarking
+// non-prefix mandatory literal extraction for the [a-zA-Z]{2,8}://[^\s]+ pattern.
+func urlProseInput(urls []string) string {
+	const block = `The application encountered an error while processing the request from the
+client. The server returned status code four hundred and three, indicating that
+the user does not have permission to access the requested resource. Please
+contact your system administrator if you believe this is a mistake. The event
+has been logged for review by the security team. Timestamp of the failure was
+recorded along with the originating address and the affected service name.
+The retry policy specifies that failed requests are retried up to three times
+with exponential backoff before being sent to the dead letter queue. Operators
+should monitor the queue depth and alert threshold configured in the service
+manifest. Configuration values must not contain unescaped special characters.
+All field names are case sensitive and must match the schema definition exactly.
+`
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+
+	if len(urls) == 0 {
+		return base
+	}
+
+	result := []byte(base)
+	step := len(result) / (len(urls) + 1)
+	offset := 0
+	for i, url := range urls {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte("See " + url + " for details.\n")
 		result = append(result[:pos], append(line, result[pos:]...)...)
 		offset += len(line)
 	}

@@ -1166,7 +1166,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 // matchExport and findExport are the exported function names; either may be empty
 // to omit that function. At least one must be non-empty.
 // The public API of CompileRegex is unchanged — it maps exportName+mode internally.
-func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, standalone bool, memPages int32, leftmostFirst bool) []byte {
+func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, standalone bool, memPages int32, leftmostFirst bool, mandatoryLit *MandatoryLit) []byte {
 	needFind := findExport != ""
 	needMatch := matchExport != ""
 
@@ -1261,7 +1261,7 @@ func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, stand
 		cs = append(cs, body...)
 	}
 	if needFind {
-		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0)
+		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit)
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
@@ -1283,7 +1283,7 @@ func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, stand
 func genHybridWASM(
 	t *dfaTable, dfaTableBase int64, matchExport, findExport string,
 	op *onePass, opTableBase int64, groupsExport string,
-	standalone bool, memPages int32, leftmostFirst bool,
+	standalone bool, memPages int32, leftmostFirst bool, mandatoryLit *MandatoryLit,
 ) []byte {
 	needFind := findExport != ""
 	needMatch := matchExport != ""
@@ -1391,7 +1391,7 @@ func genHybridWASM(
 		cs = append(cs, body...)
 	}
 	if needFind {
-		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0)
+		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit)
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
@@ -1881,8 +1881,11 @@ func computePrefix(t *dfaTable) []byte {
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, mandatoryLit *MandatoryLit) []byte {
 	var b []byte
+
+	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
+	useMandatoryLit := mandatoryLit != nil && len(prefix) == 0
 
 	// emitImmAcceptCheckFind emits: if immediateAccept[state]: last_accept=pos+1; br 2→$found
 	// Called inside $scan loop (br 2 exits $found).
@@ -1938,9 +1941,9 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 		b = append(b, 0x21, 0x05)       // local.set last_accept
 		b = append(b, 0x0B)             // end nested if
 		// if last_accept >= 0: br $found
-		b = append(b, 0x20, 0x05) // local.get last_accept
-		b = append(b, 0x41, 0x00) // i32.const 0
-		b = append(b, 0x4E)       // i32.ge_s
+		b = append(b, 0x20, 0x05)       // local.get last_accept
+		b = append(b, 0x41, 0x00)       // i32.const 0
+		b = append(b, 0x4E)             // i32.ge_s
 		b = append(b, 0x0D, 0x02) // br_if 2 → exit $found
 		// attempt_start++; br $outer
 		b = append(b, 0x20, 0x04) // local.get attempt_start
@@ -2034,6 +2037,9 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 	var chunk2Local byte
 	var t2LoLocal byte
 	var t2HiLocal byte
+
+	// Mandatory-lit locals (set in each path branch when useMandatoryLit):
+	var litPosLocal, scanStartLocal, simdMaskScanLocal, chunkScanLocal byte
 
 	// ── helper: outer loop prologue ──────────────────────────────────────────
 	// Emits: if attempt_start >= len: br $no_match
@@ -2166,6 +2172,9 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 		b = append(b, 0x84)       // i64.or
 		b = append(b, 0x0F)       // return
 		b = append(b, 0x0B)       // end loop $outer  (unreachable)
+		if useMandatoryLit {
+			b = append(b, 0x0B) // end loop $lit_outer  (unreachable)
+		}
 		b = append(b, 0x0B)       // end block $no_match  (unreachable)
 		// no-match path falls through here
 		b = append(b, 0x42, 0x7F) // i64.const -1
@@ -2173,23 +2182,168 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 		return b
 	}
 
+	// emitDFAPrologue emits: state=..., pos=attempt_start, last_accept=-1, midAccept check.
+	// Used only for the mandatory-lit code path (which has no prefix scan).
+	emitDFAPrologue := func(b []byte) []byte {
+		if startState == midStartState && (!hasWordBoundary || midStartState == midStartWordState) {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(startState))
+		} else if !hasWordBoundary {
+			b = append(b, 0x20, 0x04)
+			b = append(b, 0x45)
+			b = append(b, 0x04, 0x7F)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(startState))
+			b = append(b, 0x05)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(midStartState))
+			b = append(b, 0x0B)
+		} else {
+			b = append(b, 0x20, 0x04)
+			b = append(b, 0x45)
+			b = append(b, 0x04, 0x7F)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(startState))
+			b = append(b, 0x05)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, wordCharTableOff)
+			b = append(b, 0x20, 0x00)
+			b = append(b, 0x20, 0x04)
+			b = append(b, 0x6A)
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x6B)
+			b = append(b, 0x2D, 0x00, 0x00)
+			b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00)
+			b = append(b, 0x04, 0x7F)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(midStartWordState))
+			b = append(b, 0x05)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(midStartState))
+			b = append(b, 0x0B)
+			b = append(b, 0x0B)
+		}
+		b = append(b, 0x21, 0x02) // local.set state
+		b = append(b, 0x20, 0x04) // local.get attempt_start
+		b = append(b, 0x21, 0x03) // local.set pos
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x21, 0x05) // local.set last_accept
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptOff)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x21, 0x05)
+		b = append(b, 0x0B)
+		if startBeginAccept {
+			b = append(b, 0x20, 0x04)
+			b = append(b, 0x45)
+			b = append(b, 0x04, 0x40)
+			b = append(b, 0x20, 0x03)
+			b = append(b, 0x21, 0x05)
+			b = append(b, 0x0B)
+		}
+		return b
+	}
+
+	// emitMLRangeCheck emits the range check at the top of $outer.
+	// If attempt_start > lit_pos - MinOff: scan_start = lit_pos + 1; br 2 → $lit_outer.
+	// Depths from inside if block: 0=if, 1=$outer, 2=$lit_outer.
+	emitMLRangeCheck := func(b []byte) []byte {
+		b = append(b, 0x20, 0x04)                       // local.get attempt_start
+		b = append(b, 0x20, litPosLocal)                 // local.get lit_pos
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, mandatoryLit.MinOff)
+		b = append(b, 0x6B)                              // i32.sub: lit_pos - MinOff
+		b = append(b, 0x4A)                              // i32.gt_s: attempt_start > lit_pos-MinOff?
+		b = append(b, 0x04, 0x40)                        // if (void)
+		b = append(b, 0x20, litPosLocal)                 // local.get lit_pos
+		b = append(b, 0x41, 0x01)                        // i32.const 1
+		b = append(b, 0x6A)                              // i32.add
+		b = append(b, 0x21, scanStartLocal)              // scan_start = lit_pos + 1
+		b = append(b, 0x0C, 0x02)                        // br 2 → $lit_outer
+		b = append(b, 0x0B)                              // end if
+		return b
+	}
+
+	// emitMLOuterSetup emits: [init scan_start if MinOff>0]; loop $lit_outer; EmitPrefixScan(lit);
+	// OnMatch: set lit_pos, adjust attempt_start; loop $outer; range check; DFA prologue.
+	emitMLOuterSetup := func(b []byte) []byte {
+		if mandatoryLit.MinOff > 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, mandatoryLit.MinOff)
+			b = append(b, 0x21, scanStartLocal)
+		}
+		b = append(b, 0x03, 0x40) // loop $lit_outer
+		b = EmitPrefixScan(b, PrefixScanParams{
+			Prefix:      mandatoryLit.Bytes,
+			EngineDepth: 2, // loop $lit_outer + block $no_match
+			Locals: PrefixScanLocals{
+				Ptr:          0,
+				Len:          1,
+				AttemptStart: scanStartLocal,
+				SimdMask:     simdMaskScanLocal,
+				Chunk:        chunkScanLocal,
+			},
+			OnMatch: func(b []byte) []byte {
+				// lit_pos = scan_start (AttemptStart was advanced to the found position)
+				b = append(b, 0x20, scanStartLocal)
+				b = append(b, 0x21, litPosLocal)
+				// attempt_start = max(max(lit_pos - MaxOff, 0), attempt_start)
+				// Step 1: adj = lit_pos - MaxOff
+				b = append(b, 0x20, litPosLocal)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, mandatoryLit.MaxOff)
+				b = append(b, 0x6B)                     // i32.sub
+				b = append(b, 0x21, simdMaskScanLocal)  // temp = adj
+				// Step 2: clamp temp to >= 0
+				b = append(b, 0x20, simdMaskScanLocal)
+				b = append(b, 0x41, 0x00)
+				b = append(b, 0x48)                     // i32.lt_s: temp < 0?
+				b = append(b, 0x04, 0x40)               // if (void)
+				b = append(b, 0x41, 0x00)
+				b = append(b, 0x21, simdMaskScanLocal)  // temp = 0
+				b = append(b, 0x0B)
+				// Step 3: take max with attempt_start
+				b = append(b, 0x20, simdMaskScanLocal)
+				b = append(b, 0x20, 0x04)
+				b = append(b, 0x4A)                     // i32.gt_s: temp > attempt_start?
+				b = append(b, 0x04, 0x40)               // if (void)
+				b = append(b, 0x20, simdMaskScanLocal)
+				b = append(b, 0x21, 0x04)               // attempt_start = temp
+				b = append(b, 0x0B)
+				return b
+			},
+		})
+		b = append(b, 0x03, 0x40) // loop $outer
+		b = emitMLRangeCheck(b)
+		b = emitDFAPrologue(b)
+		return b
+	}
+	_ = emitMLOuterSetup // used in path branches below
+
 	if useU8 && useCompression {
 		// ── u8 compressed find path ───────────────────────────────────────────
-		// 6 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),simdMask(7),chunk(8),...,chunk2(14),t2Lo(15),t2Hi(16)
-		b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+		if useMandatoryLit {
+			// 8 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),lit_pos(7),scan_start(8),simdMask_scan(9),chunk_scan(10)
+			litPosLocal = 7; scanStartLocal = 8; simdMaskScanLocal = 9; chunkScanLocal = 10
+			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
+		} else {
+			// 6 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),simdMask(7),chunk(8),...,chunk2(14),t2Lo(15),t2Hi(16)
+			simdMaskLocal = 7; chunkLocal = 8; tLoLocal = 9; tHiLocal = 10
+			chunk1Local = 11; t1LoLocal = 12; t1HiLocal = 13; chunk2Local = 14; t2LoLocal = 15; t2HiLocal = 16
+			b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+		}
 		b = append(b, 0x02, 0x40) // block $no_match
-		b = append(b, 0x03, 0x40) // loop $outer
-		simdMaskLocal = 7
-		chunkLocal = 8
-		tLoLocal = 9
-		tHiLocal = 10
-		chunk1Local = 11
-		t1LoLocal = 12
-		t1HiLocal = 13
-		chunk2Local = 14
-		t2LoLocal = 15
-		t2HiLocal = 16
-		b = emitOuterPrologue(b)
+		if useMandatoryLit {
+			b = emitMLOuterSetup(b)
+		} else {
+			b = append(b, 0x03, 0x40) // loop $outer
+			b = emitOuterPrologue(b)
+		}
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitImmAcceptCheckFindStart(b)
 		b = append(b, 0x03, 0x40) // loop $scan
@@ -2264,21 +2418,23 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 
 	if useU8 {
 		// ── u8 simple find path ───────────────────────────────────────────────
-		// 5 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),simdMask(6),chunk(7),...,chunk2(13),t2Lo(14),t2Hi(15)
-		b = append(b, 0x02, 0x05, 0x7F, 0x09, 0x7B)
+		if useMandatoryLit {
+			// 7 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),lit_pos(6),scan_start(7),simdMask_scan(8),chunk_scan(9)
+			litPosLocal = 6; scanStartLocal = 7; simdMaskScanLocal = 8; chunkScanLocal = 9
+			b = append(b, 0x02, 0x07, 0x7F, 0x01, 0x7B)
+		} else {
+			// 5 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),simdMask(6),chunk(7),...,chunk2(13),t2Lo(14),t2Hi(15)
+			simdMaskLocal = 6; chunkLocal = 7; tLoLocal = 8; tHiLocal = 9
+			chunk1Local = 10; t1LoLocal = 11; t1HiLocal = 12; chunk2Local = 13; t2LoLocal = 14; t2HiLocal = 15
+			b = append(b, 0x02, 0x05, 0x7F, 0x09, 0x7B)
+		}
 		b = append(b, 0x02, 0x40) // block $no_match
-		b = append(b, 0x03, 0x40) // loop $outer
-		simdMaskLocal = 6
-		chunkLocal = 7
-		tLoLocal = 8
-		tHiLocal = 9
-		chunk1Local = 10
-		t1LoLocal = 11
-		t1HiLocal = 12
-		chunk2Local = 13
-		t2LoLocal = 14
-		t2HiLocal = 15
-		b = emitOuterPrologue(b)
+		if useMandatoryLit {
+			b = emitMLOuterSetup(b)
+		} else {
+			b = append(b, 0x03, 0x40) // loop $outer
+			b = emitOuterPrologue(b)
+		}
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitImmAcceptCheckFindStart(b)
 		b = append(b, 0x03, 0x40) // loop $scan
@@ -2343,21 +2499,23 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 	}
 
 	// ── u16 find path ─────────────────────────────────────────────────────────
-	// 6 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),byte(6),simdMask(7),chunk(8),...,chunk2(14),t2Lo(15),t2Hi(16)
-	b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+	if useMandatoryLit {
+		// 8 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),byte(6),lit_pos(7),scan_start(8),simdMask_scan(9),chunk_scan(10)
+		litPosLocal = 7; scanStartLocal = 8; simdMaskScanLocal = 9; chunkScanLocal = 10
+		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
+	} else {
+		// 6 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),byte(6),simdMask(7),chunk(8),...,chunk2(14),t2Lo(15),t2Hi(16)
+		simdMaskLocal = 7; chunkLocal = 8; tLoLocal = 9; tHiLocal = 10
+		chunk1Local = 11; t1LoLocal = 12; t1HiLocal = 13; chunk2Local = 14; t2LoLocal = 15; t2HiLocal = 16
+		b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+	}
 	b = append(b, 0x02, 0x40) // block $no_match
-	b = append(b, 0x03, 0x40) // loop $outer
-	simdMaskLocal = 7
-	chunkLocal = 8
-	tLoLocal = 9
-	tHiLocal = 10
-	chunk1Local = 11
-	t1LoLocal = 12
-	t1HiLocal = 13
-	chunk2Local = 14
-	t2LoLocal = 15
-	t2HiLocal = 16
-	b = emitOuterPrologue(b)
+	if useMandatoryLit {
+		b = emitMLOuterSetup(b)
+	} else {
+		b = append(b, 0x03, 0x40) // loop $outer
+		b = emitOuterPrologue(b)
+	}
 	b = append(b, 0x02, 0x40) // block $found
 	b = emitImmAcceptCheckFindStart(b)
 	b = append(b, 0x03, 0x40) // loop $scan
