@@ -1,0 +1,527 @@
+# Custom edge-case tests for regexped.
+# Format: col0=anchored-full-match(LL); col1=first-find(LF); col2="-"; col3="-"
+# Optional col4 (5th field): all find matches comma-separated.
+# Optional col5 (6th field): non-anchored find with captures.
+#
+# col0: standard DFA, must match from pos 0 consuming ALL input (leftmost-longest).
+#       Returns end=len(input) on success, or "-" for no match.
+# col1: LeftmostFirst DFA find (first branch wins at equal start position).
+#       Agrees with Go stdlib regexp semantics.
+# ============================================================
+# Category 1: LeftmostFirst alternation semantics
+# ============================================================
+# AltOrderMatters: "a|ab" vs "ab|a"
+#   a|ab  shorter branch listed first -> LF gives shorter find than LL
+#   ab|a  longer branch listed first  -> LF and LL agree (longer wins either way)
+# Note: col0 "-" when neither branch matches the full input string.
+AltOrderMatters
+strings
+""
+"a"
+"b"
+"ab"
+"ba"
+"xab"
+"aba"
+"xaba"
+regexps
+"a|ab"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;1-2;-;-
+-;1-2;-;-
+-;0-1;-;-
+-;1-2;-;-
+"ab|a"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;1-2;-;-
+-;1-3;-;-
+-;0-2;-;-
+-;1-3;-;-
+# AltNestedGroup: alternation inside a non-capturing group where one branch is
+# a prefix of the other.
+#   a(?:b|bc):   inner "b" vs "bc" -> LF picks "b", LL picks "bc"
+#   foo|foobar:  classic prefix alternation
+AltNestedGroup
+strings
+""
+"ab"
+"abc"
+"foo"
+"foobar"
+"xabc"
+"xfoobar"
+"foobarbaz"
+regexps
+"a(?:b|bc)"
+-;-;-;-
+0-2;0-2;-;-
+0-3;0-2;-;-
+-;-;-;-
+-;-;-;-
+-;1-3;-;-
+-;-;-;-
+-;-;-;-
+"foo|foobar"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+0-6;0-3;-;-
+-;-;-;-
+-;1-4;-;-
+-;0-3;-;-
+# AltMultipleBranches: three or more alternatives.
+#   a|b|ab  -> at pos 0: "a" wins (first branch), NOT "ab"
+#   ab|b|a  -> at pos 0: "ab" wins (first branch, and longest)
+AltMultipleBranches
+strings
+""
+"a"
+"b"
+"ab"
+"ba"
+"xab"
+regexps
+"a|b|ab"
+-;-;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+-;1-2;-;-
+"ab|b|a"
+-;-;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+-;1-3;-;-
+# ============================================================
+# Category 2: Non-greedy quantifiers in find mode
+# Tests that LeftmostFirst + immediateAccepting stops DFA at shortest match.
+# col0 = full-match standard DFA (non-greedy vs greedy makes no difference
+#        for full-match since all input must be consumed either way).
+# col1 = LF find: non-greedy picks minimum occurrences.
+# ============================================================
+# Cat2NonGreedyPlus: a+? picks exactly 1 "a" at leftmost position.
+# Compare: a+ (greedy) would pick all consecutive "a"s.
+Cat2NonGreedyPlus
+strings
+""
+"a"
+"aaa"
+"aaab"
+"b"
+"xaaa"
+regexps
+"a+?"
+-;-;-;-
+0-1;0-1;-;-
+0-3;0-1;-;-
+-;0-1;-;-
+-;-;-;-
+-;1-2;-;-
+# Cat2NonGreedyRange: a{2,5}? picks minimum 2 "a"s.
+# Full-match: must consume entire input within 2-5 "a"s.
+Cat2NonGreedyRange
+strings
+""
+"a"
+"aa"
+"aaaaa"
+"aaaaaa"
+"xaa"
+regexps
+"a{2,5}?"
+-;-;-;-
+-;-;-;-
+0-2;0-2;-;-
+0-5;0-2;-;-
+-;0-2;-;-
+-;1-3;-;-
+# Cat2NonGreedySuffix: a+?b — non-greedy forces minimum "a"s before "b".
+# At each position tries 1 "a" first; extends only if "b" doesn't follow.
+Cat2NonGreedySuffix
+strings
+""
+"ab"
+"aab"
+"aaab"
+"b"
+"xaab"
+regexps
+"a+?b"
+-;-;-;-
+0-2;0-2;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+-;-;-;-
+-;1-4;-;-
+# Cat2NonGreedyDot: .*?end — non-greedy ".*?" finds first "end" in string.
+# Full-match: equivalent to .*end (both consume any prefix then "end" suffix).
+Cat2NonGreedyDot
+strings
+""
+"end"
+"xend"
+"xyz"
+"xyzend"
+"start end"
+"start end finish"
+regexps
+".*?end"
+-;-;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+-;-;-;-
+0-6;0-6;-;-
+0-9;0-9;-;-
+-;0-9;-;-
+# ============================================================
+# Category 3: Find iteration (all matches via col4)
+# Tests the full iteration loop: call find repeatedly with advancing offset,
+# advancing by 1 on zero-length matches to avoid infinite loops.
+# col4 format: "s1-e1,s2-e2,..." or "-" for no matches.
+# NOTE: after a non-zero match ending at pos p, we call find on text[p:]
+# and DO report any empty match there (unlike Go's FindAllStringIndex which
+# skips such adjacent empty matches).
+# ============================================================
+# Cat3ZeroLen: a* produces zero-length matches in gaps and at end.
+# col4 shows empty matches interspersed with real "a" matches.
+Cat3ZeroLen
+strings
+""
+"a"
+"aaa"
+"abc"
+"b"
+"bab"
+regexps
+"a*"
+0-0;0-0;-;-;0-0
+0-1;0-1;-;-;0-1,1-1
+0-3;0-3;-;-;0-3,3-3
+-;0-1;-;-;0-1,1-1,2-2,3-3
+-;0-0;-;-;0-0,1-1
+-;0-0;-;-;0-0,1-2,2-2,3-3
+# Cat3Greedy: a+ and [0-9] — non-overlapping greedy matches only, no zero-length.
+# The find function skips non-matching regions to find next match.
+Cat3Greedy
+strings
+""
+"a"
+"aaa"
+"aaabaaaa"
+"b"
+"1a2b3"
+"123"
+regexps
+"a+"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-3;0-3;-;-;0-3
+-;0-3;-;-;0-3,4-8
+-;-;-;-;-
+-;1-2;-;-;1-2
+-;-;-;-;-
+"[0-9]"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-1;-;-;0-1,2-3,4-5
+-;0-1;-;-;0-1,1-2,2-3
+# ============================================================
+# Category 4: Word boundaries
+# Tests the doubled DFA state space (prevWasWord context bit) used for \b/\B.
+# \b fires between word-char and non-word-char (or at string start/end).
+# \B fires between two word-chars or two non-word-chars (not at string start/end).
+# ============================================================
+# Cat4WordBoundaryFoo: \bfoo\b — word "foo" with surrounding context.
+# Key cases: digit adjacent to word (no boundary), punctuation (has boundary).
+Cat4WordBoundaryFoo
+strings
+""
+"foo"
+"foobar"
+"foo!"
+"foo1"
+"1foo"
+"foo rest"
+"rest foo"
+"(foo)"
+regexps
+"\\bfoo\\b"
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+-;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;0-3;-;-
+-;5-8;-;-
+-;1-4;-;-
+# Cat4WordBoundaryWord: \b[a-z]+\b — any lowercase word.
+# Includes multi-match strings, so col4 is present.
+# "hello123" and "123hello" have no match (digit is \w, no boundary).
+Cat4WordBoundaryWord
+strings
+""
+"hello"
+"hello world"
+"hello123"
+"123hello"
+"say-hello"
+"HELLO"
+regexps
+"\\b[a-z]+\\b"
+-;-;-;-;-
+0-5;0-5;-;-;0-5
+-;0-5;-;-;0-5,6-11
+-;-;-;-;-
+-;-;-;-;-
+-;0-3;-;-;0-3,4-9
+-;-;-;-;-
+# Cat4NoBoundary: \Boo\B — "oo" strictly inside a word (not at word edges).
+# Matches only when both sides of "oo" are word chars.
+Cat4NoBoundary
+strings
+""
+"oo"
+"foo"
+"foobar"
+"cool"
+" oo "
+"book"
+regexps
+"\\Boo\\B"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;1-3;-;-
+-;1-3;-;-
+-;-;-;-
+-;1-3;-;-
+# ============================================================
+# Category 5: Anchor-aware find
+# When pattern starts with ^, the DFA midStartState has no transitions
+# (isAnchoredFind=true) and the find body avoids scanning past pos 0.
+# Key: ^pattern never matches in strings that don't start with the pattern.
+# ============================================================
+# Cat5AnchorStart: ^abc and ^a+ — anchored at beginning of string.
+# ^abc: finds only if string starts with "abc".
+# ^a+: finds the "a" prefix at pos 0 only (no scan for later positions).
+Cat5AnchorStart
+strings
+""
+"abc"
+"aaa"
+"aaabbb"
+"xabc"
+"xaaa"
+regexps
+"^abc"
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"^a+"
+-;-;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+-;0-3;-;-
+-;-;-;-
+-;-;-;-
+# Cat5AnchorEnd: abc$ — anchored at end of string.
+# Finds rightmost "abc" that is immediately followed by end of string.
+Cat5AnchorEnd
+strings
+""
+"abc"
+"xyzabc"
+"abcx"
+"abc abc"
+"abcabc"
+regexps
+"abc$"
+-;-;-;-
+0-3;0-3;-;-
+-;3-6;-;-
+-;-;-;-
+-;4-7;-;-
+-;3-6;-;-
+# Cat5AnchorBoth: ^abc$ — must match entire string.
+# Equivalent to full-match: only "abc" passes, no prefix or suffix allowed.
+Cat5AnchorBoth
+strings
+""
+"abc"
+"abcd"
+"xabc"
+"abc abc"
+regexps
+"^abc$"
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category 6: Backtracking engine — capture edge cases
+# These patterns have captures that don't qualify for OnePass
+# (overlapping first-char sets between loop and exit branches).
+# col0 format: "fullstart-fullend group1start-group1end ..."
+# col5: non-anchored find with captures (DFA finds leftmost extent,
+#        NFA fills slots). Tests strings where match starts at pos > 0.
+# ============================================================
+# Cat6BacktrackGreedy: (.+)(.+) — greedy first group takes max, leaves 1 for second.
+# RE2 semantics: first group gets all but last char (leftmost-longest).
+Cat6BacktrackGreedy
+strings
+""
+"a"
+"ab"
+"abc"
+"abcd"
+"hello"
+regexps
+"(.+)(.+)"
+-;-;-;-
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+0-3 0-2 2-3;0-3;-;-
+0-4 0-3 3-4;0-4;-;-
+0-5 0-4 4-5;0-5;-;-
+# Cat6BacktrackNonGreedy: (a+?)(a+) — non-greedy first gets minimum (1 "a").
+# Phase 1 LL DFA anchored at pos 0; Phase 2 NFA fills non-greedily within that extent.
+# col0: anchored from pos 0. Strings starting with non-"a" get no match.
+Cat6BacktrackNonGreedy
+strings
+""
+"a"
+"aa"
+"aaa"
+"aaaa"
+"xaa"
+"xyaaa"
+regexps
+"(a+?)(a+)"
+-;-;-;-
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+0-3 0-1 1-3;0-3;-;-
+0-4 0-1 1-4;0-4;-;-
+-;1-3;-;-
+-;2-5;-;-
+# Cat6BacktrackCharRange: (.*?)([0-9]+) — exercises character range opcodes in BT engine.
+# Non-greedy wildcard before digit range: Backtracking since .* and [0-9] overlap.
+# col0: Phase 1 LL DFA anchored at pos 0 (full extent), NFA fills captures within extent.
+# "x123y": no match from pos 0 (starts with x, LL DFA can't consume trailing y as digit).
+# "a1b2": LL extent 0-4, NFA: .*?=a1b, [0-9]+=2.
+Cat6BacktrackCharRange
+strings
+""
+"123"
+"abc123"
+"abc"
+"x123y"
+"a1b2"
+regexps
+"(.*?)([0-9]+)"
+-;-;-;-
+0-3 0-0 0-3;0-3;-;-
+0-6 0-3 3-6;0-6;-;-
+-;-;-;-
+-;0-4;-;-
+0-4 0-3 3-4;0-2;-;-
+# ============================================================
+# Category 7: OnePass engine — capture edge cases
+# These patterns have deterministic alternation (disjoint first-char sets)
+# so they compile to the OnePass engine with inline i32.store capture ops.
+# col0 format: "fullstart-fullend group1start-group1end ..."
+# Unmatched optional groups shown as "-".
+# ============================================================
+# Cat7OnePassNumeric: ([0-9]+)-([0-9]+) — two digit groups around a literal "-".
+# Tests basic OnePass slot filling.
+Cat7OnePassNumeric
+strings
+""
+"1-2"
+"2024-03"
+"12-"
+"-12"
+"abc"
+regexps
+"([0-9]+)-([0-9]+)"
+-;-;-;-
+0-3 0-1 2-3;0-3;-;-
+0-7 0-4 5-7;0-7;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# Cat7OnePassWord: ([a-z]+)@([a-z]+) — two word groups around "@".
+Cat7OnePassWord
+strings
+""
+"foo@bar"
+"a@b"
+"foo@"
+"@bar"
+"FOO@BAR"
+regexps
+"([a-z]+)@([a-z]+)"
+-;-;-;-
+0-7 0-3 4-7;0-7;-;-
+0-3 0-1 2-3;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# Cat7OnePassOptional: ([a-z]+)(-([0-9]+))? — word with optional numeric suffix.
+# Tests unmatched optional groups (shown as "-") and nested group slots.
+Cat7OnePassOptional
+strings
+""
+"foo"
+"foo-42"
+"foo-"
+"123"
+"bar"
+regexps
+"([a-z]+)(-([0-9]+))?"
+-;-;-;-
+0-3 0-3 - -;0-3;-;-
+0-6 0-3 3-6 4-6;0-6;-;-
+-;0-3;-;-
+-;-;-;-
+0-3 0-3 - -;0-3;-;-
+# ============================================================
+# Category 8: u16 DFA table path
+# a{1,300} needs 302 DFA states (one per count 0..300 + dead) which exceeds
+# the u16 threshold of 256. Tests that the u16 table path + row dedup produce
+# correct results. Row dedup merges states 1..299 (identical transition rows).
+# ============================================================
+Cat8U16DFA
+strings
+""
+"a"
+"aaa"
+"b"
+"xaaa"
+"aaab"
+regexps
+"a{1,300}"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;1-4;-;-;1-4
+-;0-3;-;-;0-3

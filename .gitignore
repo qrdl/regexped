@@ -35,7 +35,7 @@ regexped
 target
 perftest/out
 perftest/*.txt
-re2test/*.txt
+re2test/re2-exhaustive.txt
 re2test/re2test
 perftest/perftest
 examples/*/*wasm
