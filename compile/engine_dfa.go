@@ -668,9 +668,10 @@ type dfaTable struct {
 	hasWordBoundary       bool         // true if pattern contains \b or \B
 }
 
-// dfaTableFrom builds a dfaTable directly from a compiled dfa struct.
+// dfaTableFrom builds a dfaTable directly from a compiled dfa struct,
+// then applies Hopcroft DFA minimization.
 func dfaTableFrom(d *dfa) *dfaTable {
-	return &dfaTable{
+	t := &dfaTable{
 		startState:            d.start,
 		midStartState:         d.midStart,
 		midStartWordState:     d.midStartWord,
@@ -684,6 +685,159 @@ func dfaTableFrom(d *dfa) *dfaTable {
 		startBeginAccept:      d.startBeginAccept,
 		hasWordBoundary:       d.hasWordBoundary,
 	}
+	minimizeDFA(t)
+	return t
+}
+
+// minimizeDFA applies Hopcroft's DFA minimization algorithm, merging
+// equivalent states (states that are indistinguishable from any starting
+// point). Modifies t in place.
+func minimizeDFA(t *dfaTable) {
+	n := t.numStates
+	if n <= 1 {
+		return
+	}
+
+	// ── Initial partition: group states by accept-flag signature ─────────────
+	// Two states must be in different classes if they differ in any accept flag.
+	type sigKey struct{ a, ma, maw, manw, imm bool }
+	sigToClass := make(map[sigKey]int, 8)
+	classOf := make([]int, n)
+	numClasses := 0
+	for s := 0; s < n; s++ {
+		sk := sigKey{
+			t.acceptStates[s],
+			t.midAcceptStates[s],
+			t.midAcceptWStates[s],
+			t.midAcceptNWStates[s],
+			t.immediateAcceptStates[s],
+		}
+		c, ok := sigToClass[sk]
+		if !ok {
+			c = numClasses
+			sigToClass[sk] = c
+			numClasses++
+		}
+		classOf[s] = c
+	}
+
+	// ── Iterative partition refinement ────────────────────────────────────────
+	// Two states stay in the same class only if, for every input byte, their
+	// transitions land in the same class.  Repeat until stable.
+	// Dead state (-1 in transitions) is treated as its own implicit class (-1).
+	buf := make([]byte, 256*4) // reusable key buffer: 4 bytes per byte position
+	for {
+		// Bucket states by current class.
+		classes := make([][]int, numClasses)
+		for s := 0; s < n; s++ {
+			classes[classOf[s]] = append(classes[classOf[s]], s)
+		}
+
+		newClassOf := make([]int, n)
+		newNumClasses := 0
+		changed := false
+
+		for _, members := range classes {
+			if len(members) == 1 {
+				newClassOf[members[0]] = newNumClasses
+				newNumClasses++
+				continue
+			}
+			// For each member compute its transition-class fingerprint.
+			// Encode: 4 bytes per byte position; dead→0, class c→c+1 (uint32 LE).
+			keyToNew := make(map[string]int, 4)
+			for _, s := range members {
+				for b := 0; b < 256; b++ {
+					next := t.transitions[s*256+b]
+					var cv uint32
+					if next >= 0 {
+						cv = uint32(classOf[next]) + 1
+					}
+					buf[b*4] = byte(cv)
+					buf[b*4+1] = byte(cv >> 8)
+					buf[b*4+2] = byte(cv >> 16)
+					buf[b*4+3] = byte(cv >> 24)
+				}
+				key := string(buf)
+				nc, ok := keyToNew[key]
+				if !ok {
+					nc = newNumClasses
+					newNumClasses++
+					keyToNew[key] = nc
+				}
+				newClassOf[s] = nc
+			}
+			if len(keyToNew) > 1 {
+				changed = true
+			}
+		}
+
+		classOf = newClassOf
+		numClasses = newNumClasses
+		if !changed {
+			break
+		}
+	}
+
+	if numClasses >= n {
+		return // No states merged — nothing to do.
+	}
+
+	// ── Build minimized DFA ──────────────────────────────────────────────────
+	// Representative of each class: state with the smallest index.
+	rep := make([]int, numClasses)
+	for i := range rep {
+		rep[i] = -1
+	}
+	for s := 0; s < n; s++ {
+		c := classOf[s]
+		if rep[c] < 0 || s < rep[c] {
+			rep[c] = s
+		}
+	}
+
+	// Transition table for the minimized DFA.
+	newTrans := make([]int, numClasses*256)
+	for i := range newTrans {
+		newTrans[i] = -1
+	}
+	for c := 0; c < numClasses; c++ {
+		r := rep[c]
+		for b := 0; b < 256; b++ {
+			next := t.transitions[r*256+b]
+			if next >= 0 {
+				newTrans[c*256+b] = classOf[next]
+			}
+		}
+	}
+
+	// Accept maps for the minimized DFA.
+	newAccept    := make(map[int]bool)
+	newMidAccept := make(map[int]bool)
+	newMidAcceptNW := make(map[int]bool)
+	newMidAcceptW  := make(map[int]bool)
+	newImmAccept   := make(map[int]bool)
+	for s := 0; s < n; s++ {
+		c := classOf[s]
+		if t.acceptStates[s]          { newAccept[c]      = true }
+		if t.midAcceptStates[s]       { newMidAccept[c]   = true }
+		if t.midAcceptNWStates[s]     { newMidAcceptNW[c] = true }
+		if t.midAcceptWStates[s]      { newMidAcceptW[c]  = true }
+		if t.immediateAcceptStates[s] { newImmAccept[c]   = true }
+	}
+
+	// Remap special state indices.
+	t.startState        = classOf[t.startState]
+	t.midStartState     = classOf[t.midStartState]
+	t.midStartWordState = classOf[t.midStartWordState]
+	t.numStates         = numClasses
+	t.transitions       = newTrans
+	t.acceptStates      = newAccept
+	t.midAcceptStates   = newMidAccept
+	t.midAcceptNWStates = newMidAcceptNW
+	t.midAcceptWStates  = newMidAcceptW
+	t.immediateAcceptStates = newImmAccept
+	// hasWordBoundary and startBeginAccept are pattern-level flags, unchanged.
 }
 
 // computeByteClasses groups the 256 possible byte values into equivalence

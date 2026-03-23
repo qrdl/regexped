@@ -62,6 +62,21 @@ Many bytes share identical transition rows. Byte-class compression maps 256 byte
 [accept:      u8[numStates]]
 ```
 
+### u16 with row deduplication
+
+When a u16 DFA has ≤ 255 unique transition rows, a u8 rowMap is prepended. The
+table stores only the unique rows, reducing size from `numStates × 512` bytes to
+`numStates + numUniqueRows × 512` bytes (e.g. 512 KB → 52 KB for 1000 states /
+100 unique rows).
+
+```
+[rowMap:      u8[numStates]]                 // state → row index (0-254)
+[transitions: u16[numUniqueRows * 256]]
+[accept:      u8[numStates]]
+```
+
+Runtime lookup: `row = rowMap[state]; state = transitions[row * 256 + byte]`.
+
 ### Find-mode extras
 
 Find mode appends additional arrays after the base table:
@@ -76,16 +91,28 @@ Find mode appends additional arrays after the base table:
 
 ---
 
-## SIMD prefix scan (Teddy algorithm)
+## Find-mode fast-skip
 
-Find mode uses a compile-time-selected fast-skip prologue to avoid testing every byte position:
+Two compile-time mechanisms skip over input positions that cannot start a match.
+
+### Prefix / Teddy scan
+
+Applied when the match starts at the scanned position:
 
 | Strategy | Condition | Description |
 |---|---|---|
-| **2-byte Teddy** | literal prefix ≥ 2 bytes | T1_lo/T1_hi nibble tables check `byte[k]` and `byte[k+1]` simultaneously; near-zero false positives |
-| **1-byte Teddy** | prefix has 1 byte, multiple first-byte candidates | T_lo/T_hi nibble tables |
+| **Hybrid prefix** | literal prefix ≥ 1 byte | SIMD check for full prefix within a 16-byte window |
+| **3-byte Teddy** | ≤ 8 first bytes, selective 3rd byte | nibble tables check bytes 0, 1, 2 simultaneously |
+| **2-byte Teddy** | ≤ 8 first bytes | nibble tables check bytes 0 and 1 simultaneously |
+| **1-byte Teddy** | 1-byte prefix, multiple candidates | T_lo/T_hi nibble tables |
 | **Multi-eq SIMD** | small first-byte set | `i8x16.eq` + bitmask per candidate |
-| **Scalar** | many possible first bytes | byte-by-byte scan |
+| **Scalar** | wide first-byte set | byte-by-byte scan |
+
+### Mandatory literal extraction
+
+Applied when the prefix is low-entropy but a selective fixed byte sequence (mandatory literal) exists deeper in the pattern. `FindMandatoryLit` extracts the literal and its min/max offset from match start at compile time. The WASM find function scans for the literal using the same SIMD strategies above, then derives candidate start positions from each hit. This is implemented as a two-level outer loop (`$lit_outer` / `$outer`) in the find function body.
+
+Example: `[a-zA-Z]{2,8}://[^\s]+` — prefix `[a-zA-Z]` matches 52/256 bytes, but `://` is rare; scanning for `://` skips far more of the input.
 
 Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq`, `i8x16.bitmask`, `v128.and`.
 

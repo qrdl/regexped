@@ -344,7 +344,7 @@ Viable when every `InstAlt` in the NFA has branches with disjoint first-characte
 
 ---
 
-**Last Updated:** 2026-03-22
+**Last Updated:** 2026-03-23
 **CLI commands:** `generate` (stubs / dummy_main), `compile`, `merge`
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals)
-**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD), OnePass (anchored with captures), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, all logic inside WASM)
+**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), OnePass (anchored with captures), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, all logic inside WASM)

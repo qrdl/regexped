@@ -35,26 +35,34 @@ The NFA produced from the pattern is converted to a DFA via subset construction.
 
 **Word boundaries** (`\b`, `\B`): the state space is doubled with a `prevWasWord` context bit. Two mid-start states (`midStart`, `midStartWord`) are used in find-mode scan loops; a `wordCharTable` data segment provides O(1) byte classification.
 
+**DFA minimization** (Hopcroft's algorithm): after subset construction, equivalent states — states indistinguishable from any starting point — are merged. This reduces state count and table size for complex patterns such as case-insensitive URL regexes, where many states differ only in how they were reached.
+
 ### Table formats
 
-State IDs fit in u8 when ≤ 256 states, u16 otherwise. When the table would exceed 32 KB, byte-class compression is applied: many bytes share identical transition rows and are mapped to a smaller set of equivalence classes, shrinking the table significantly.
+State IDs fit in u8 when ≤ 256 states, u16 otherwise. When the table would exceed 32 KB, byte-class compression is applied: many bytes share identical transition rows and are mapped to a smaller set of equivalence classes, shrinking the table significantly. For u16 DFAs, row deduplication is additionally applied: states with identical transition rows share one row via a u8 rowMap, dramatically reducing large tables (e.g. 512KB → 52KB for a 1000-state DFA with 100 unique rows).
 
 Find mode stores additional arrays alongside the transition table: `midAccept` (accepting states reachable mid-scan), `firstByteFlags` or Teddy nibble tables (for the SIMD prefix scan), `immediateAccept`, and word-boundary variants.
 
-### SIMD prefix scan
+**Anchor-aware find mode**: when a pattern is anchored at the start (e.g. `^foo.*$`), `midStartState` has no live transitions. In this case a simplified find body is emitted that runs the DFA exactly once from position 0 rather than scanning the input.
 
-In find mode, a compile-time-selected fast-skip prologue avoids testing every byte position:
+### SIMD prefix scan and mandatory literal extraction
+
+In find mode, a compile-time-selected fast-skip prologue avoids testing every byte position. Two mechanisms are used:
+
+**1. Prefix/Teddy scan** (applied when the match must start at the scan position):
 
 | Strategy | Condition |
 |---|---|
 | **Hybrid prefix** | literal prefix ≥ 1 byte — SIMD check for full prefix within a 16-byte window |
-| **3-byte Teddy** | alternation patterns with ≤ 8 first bytes AND selective 3rd byte — checks bytes 0, 1, 2 simultaneously |
-| **2-byte Teddy** | alternation patterns with ≤ 8 first bytes — checks bytes 0 and 1 simultaneously |
+| **3-byte Teddy** | alternation patterns with ≤ 8 first bytes AND selective 3rd byte |
+| **2-byte Teddy** | alternation patterns with ≤ 8 first bytes |
 | **1-byte Teddy** | single-byte prefix with multiple candidates |
 | **Multi-eq SIMD** | small first-byte set — `i8x16.eq` + bitmask per candidate |
 | **Scalar** | fallback for wide first-byte sets |
 
-Uses WASM SIMD (simd128).
+**2. Mandatory literal extraction** (applied when the prefix is noisy but a selective literal exists deeper in the pattern): `FindMandatoryLit` analyzes the pattern's syntax tree to find the best fixed byte sequence that must appear in every match (e.g. `://` in `[a-zA-Z]{2,8}://[^\s]+`). The SIMD scan searches for that literal instead; a two-level outer loop (`$lit_outer` / `$outer`) adjusts candidate start positions using the literal's known min/max offset from the match start.
+
+Both mechanisms use WASM SIMD (simd128).
 
 ---
 
