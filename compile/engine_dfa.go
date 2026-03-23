@@ -1261,7 +1261,12 @@ func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, stand
 		cs = append(cs, body...)
 	}
 	if needFind {
-		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit)
+		var body []byte
+		if isAnchoredFind(t) {
+			body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff)
+		} else {
+			body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit)
+		}
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
@@ -1391,7 +1396,12 @@ func genHybridWASM(
 		cs = append(cs, body...)
 	}
 	if needFind {
-		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit)
+		var body []byte
+		if isAnchoredFind(t) {
+			body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff)
+		} else {
+			body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit)
+		}
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
@@ -1853,6 +1863,415 @@ func computePrefix(t *dfaTable) []byte {
 	return prefix
 }
 
+
+// isAnchoredFind reports whether the DFA can only match starting at position 0.
+// This is true when midStartState (and midStartWordState for WB patterns) have
+// no live outgoing transitions and are not accepting. Patterns with a leading ^
+// or \A anchor always satisfy this.
+func isAnchoredFind(t *dfaTable) bool {
+	// midStartState must be a complete dead-end: no live transitions, not accepting
+	// in any mode (mid, eof, or immediate). If midStartState can accept, the pattern
+	// matches from non-zero positions (e.g. `$` matches at end-of-input).
+	if t.midAcceptStates[t.midStartState] ||
+		t.acceptStates[t.midStartState] ||
+		t.immediateAcceptStates[t.midStartState] {
+		return false
+	}
+	for b := 0; b < 256; b++ {
+		if t.transitions[t.midStartState*256+b] >= 0 {
+			return false
+		}
+	}
+	if t.hasWordBoundary {
+		if t.midAcceptStates[t.midStartWordState] ||
+			t.acceptStates[t.midStartWordState] ||
+			t.immediateAcceptStates[t.midStartWordState] ||
+			t.midAcceptNWStates[t.midStartState] ||
+			t.midAcceptWStates[t.midStartWordState] {
+			return false
+		}
+		for b := 0; b < 256; b++ {
+			if t.transitions[t.midStartWordState*256+b] >= 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// buildAnchoredFindBody returns the WASM function body for anchored find mode.
+// Used when isAnchoredFind is true: the pattern can only match at position 0,
+// so no scan loop is needed — we run the DFA once from pos=0 and return.
+//
+// Function signature: (ptr i32, len i32) → i64
+//   Returns (0 << 32 | end) on match, -1 on no match.
+//
+// Control flow:
+//   block $no_match
+//     block $found
+//       [DFA prologue: state=startState, pos=0, last_accept=-1]
+//       loop $scan
+//         if pos >= len  → eofAccept check; br 2→$found
+//         [WB pre-accept; transition; dead → br 2→$found; midAccept; immAccept; pos++]
+//       end $scan
+//     end $found
+//     if last_accept >= 0: return packed i64
+//   end $no_match
+//   i64.const -1
+func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32) []byte {
+	var b []byte
+
+	// emitImmAcceptCheckFind emits: if immediateAccept[state]: last_accept=pos+1; br 2→$found
+	emitImmAcceptCheckFind := func(b []byte) []byte {
+		if !hasImmAccept {
+			return b
+		}
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, immediateAcceptOff)
+		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x41, 0x01)       // i32.const 1
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x21, 0x05)       // local.set last_accept
+		b = append(b, 0x0C, 0x02)       // br 2 → exit $found
+		b = append(b, 0x0B)             // end if
+		return b
+	}
+
+	// emitImmAcceptCheckFindStart emits: if immediateAccept[state]: last_accept=pos; br 1→$found
+	emitImmAcceptCheckFindStart := func(b []byte) []byte {
+		if !hasImmAccept {
+			return b
+		}
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, immediateAcceptOff)
+		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x21, 0x05)       // local.set last_accept
+		b = append(b, 0x0C, 0x01)       // br 1 → exit $found
+		b = append(b, 0x0B)             // end if
+		return b
+	}
+
+	// emitEofHandler: check eofAccept, maybe update last_accept, exit $found.
+	// Depths from inside if body: 0=if, 1=$scan, 2=$found.
+	emitEofHandler := func(b []byte) []byte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, eofAcceptOff)
+		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x04, 0x40)       // if (void): eofAccept
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x21, 0x05)       // local.set last_accept
+		b = append(b, 0x0B)             // end if
+		b = append(b, 0x0C, 0x02)       // br 2 → exit $found (anchored: no retry)
+		return b
+	}
+
+	// emitDeadHandler: exit $found (no retry in anchored mode).
+	// Depths from inside if body: 0=if, 1=$scan, 2=$found.
+	emitDeadHandler := func(b []byte) []byte {
+		b = append(b, 0x0C, 0x02) // br 2 → exit $found
+		return b
+	}
+
+	// emitWBPreAcceptCheck: same as regular find — checks midAcceptW/NW inside $scan.
+	emitWBPreAcceptCheck := func(b []byte) []byte {
+		if !hasWordBoundary {
+			return b
+		}
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, wordCharTableOff)
+		b = append(b, 0x20, 0x00)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x04, 0x40) // if isWordChar
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptWOff)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x21, 0x05)
+		b = append(b, 0x0B)
+		b = append(b, 0x05) // else: non-word
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptNWOff)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x21, 0x05)
+		b = append(b, 0x0B)
+		b = append(b, 0x0B) // end if isWordChar
+		return b
+	}
+
+	// emitPrologue: state=startState, pos=0 (default), last_accept=-1, midAccept check.
+	emitPrologue := func(b []byte) []byte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(startState))
+		b = append(b, 0x21, 0x02) // local.set state
+		// pos = 0: already 0 (default local value)
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x21, 0x05) // local.set last_accept
+		// if midAccept[startState]: last_accept = 0
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptOff)
+		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x41, 0x00)       // i32.const 0
+		b = append(b, 0x21, 0x05)       // local.set last_accept
+		b = append(b, 0x0B)             // end if
+		if startBeginAccept {
+			// pattern matches empty at position 0
+			b = append(b, 0x41, 0x00) // i32.const 0
+			b = append(b, 0x21, 0x05) // local.set last_accept
+		}
+		return b
+	}
+
+	// emitReturn: if last_accept >= 0, return (0 << 32 | last_accept), else fall through.
+	emitReturn := func(b []byte) []byte {
+		b = append(b, 0x20, 0x05) // local.get last_accept
+		b = append(b, 0x41, 0x00) // i32.const 0
+		b = append(b, 0x4E)       // i32.ge_s
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, 0x04) // local.get attempt_start (= 0)
+		b = append(b, 0xAD)       // i64.extend_i32_u
+		b = append(b, 0x42, 0x20) // i64.const 32
+		b = append(b, 0x86)       // i64.shl
+		b = append(b, 0x20, 0x05) // local.get last_accept
+		b = append(b, 0xAD)       // i64.extend_i32_u
+		b = append(b, 0x84)       // i64.or
+		b = append(b, 0x0F)       // return
+		b = append(b, 0x0B)       // end if
+		b = append(b, 0x0B)       // end block $no_match
+		b = append(b, 0x42, 0x7F) // i64.const -1
+		b = append(b, 0x0B)       // end function
+		return b
+	}
+
+	if useU8 && useCompression {
+		// 5 i32: state(2),pos(3),attempt_start(4)=0,last_accept(5),class(6)
+		b = append(b, 0x01, 0x05, 0x7F)
+		b = append(b, 0x02, 0x40) // block $no_match
+		b = append(b, 0x02, 0x40) // block $found
+		b = emitPrologue(b)
+		b = emitImmAcceptCheckFindStart(b)
+		b = append(b, 0x03, 0x40) // loop $scan
+
+		b = append(b, 0x20, 0x03) // pos
+		b = append(b, 0x20, 0x01) // len
+		b = append(b, 0x4F)       // i32.ge_u
+		b = append(b, 0x04, 0x40) // if (void)
+		b = emitEofHandler(b)
+		b = append(b, 0x0B)
+
+		b = emitWBPreAcceptCheck(b)
+
+		// class = classMap[mem[ptr+pos]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, classMapOff)
+		b = append(b, 0x20, 0x00)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x21, 0x06) // local.set class
+
+		// state = table[state*numClasses + class]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, tableOff)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(numClasses))
+		b = append(b, 0x6C) // i32.mul
+		b = append(b, 0x6A)
+		b = append(b, 0x20, 0x06)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x21, 0x02) // local.set state
+
+		b = append(b, 0x20, 0x02) // dead?
+		b = append(b, 0x45)
+		b = append(b, 0x04, 0x40)
+		b = emitDeadHandler(b)
+		b = append(b, 0x0B)
+
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptOff)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, 0x05)
+		b = append(b, 0x0B)
+
+		b = emitImmAcceptCheckFind(b)
+
+		b = append(b, 0x20, 0x03) // pos++
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, 0x03)
+		b = append(b, 0x0C, 0x00) // br 0 → $scan
+		b = append(b, 0x0B)       // end loop $scan
+		b = append(b, 0x0B)       // end block $found
+		b = emitReturn(b)
+		return b
+	}
+
+	if useU8 {
+		// 4 i32: state(2),pos(3),attempt_start(4)=0,last_accept(5)
+		b = append(b, 0x01, 0x04, 0x7F)
+		b = append(b, 0x02, 0x40) // block $no_match
+		b = append(b, 0x02, 0x40) // block $found
+		b = emitPrologue(b)
+		b = emitImmAcceptCheckFindStart(b)
+		b = append(b, 0x03, 0x40) // loop $scan
+
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x20, 0x01)
+		b = append(b, 0x4F)
+		b = append(b, 0x04, 0x40)
+		b = emitEofHandler(b)
+		b = append(b, 0x0B)
+
+		b = emitWBPreAcceptCheck(b)
+
+		// state = table[state*256 + mem[ptr+pos]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, tableOff)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x41, 0x08)
+		b = append(b, 0x74) // i32.shl
+		b = append(b, 0x6A)
+		b = append(b, 0x20, 0x00)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x21, 0x02) // local.set state
+
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x45)
+		b = append(b, 0x04, 0x40)
+		b = emitDeadHandler(b)
+		b = append(b, 0x0B)
+
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptOff)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, 0x05)
+		b = append(b, 0x0B)
+
+		b = emitImmAcceptCheckFind(b)
+
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, 0x03)
+		b = append(b, 0x0C, 0x00)
+		b = append(b, 0x0B) // end loop $scan
+		b = append(b, 0x0B) // end block $found
+		b = emitReturn(b)
+		return b
+	}
+
+	// u16 path
+	// 5 i32: state(2),pos(3),attempt_start(4)=0,last_accept(5),byte(6)
+	b = append(b, 0x01, 0x05, 0x7F)
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x02, 0x40) // block $found
+	b = emitPrologue(b)
+	b = emitImmAcceptCheckFindStart(b)
+	b = append(b, 0x03, 0x40) // loop $scan
+
+	b = append(b, 0x20, 0x03)
+	b = append(b, 0x20, 0x01)
+	b = append(b, 0x4F)
+	b = append(b, 0x04, 0x40)
+	b = emitEofHandler(b)
+	b = append(b, 0x0B)
+
+	b = emitWBPreAcceptCheck(b)
+
+	// byte = mem[ptr+pos]
+	b = append(b, 0x20, 0x00)
+	b = append(b, 0x20, 0x03)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00)
+	b = append(b, 0x21, 0x06) // local.set byte
+
+	// state = u16(table[state*512 + byte*2])
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, tableOff)
+	b = append(b, 0x20, 0x02)
+	b = append(b, 0x41, 0x09)
+	b = append(b, 0x74) // i32.shl
+	b = append(b, 0x6A)
+	b = append(b, 0x20, 0x06)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x74) // i32.shl
+	b = append(b, 0x6A)
+	b = append(b, 0x2F, 0x01, 0x00) // i32.load16_u
+	b = append(b, 0x21, 0x02)
+
+	b = append(b, 0x20, 0x02)
+	b = append(b, 0x45)
+	b = append(b, 0x04, 0x40)
+	b = emitDeadHandler(b)
+	b = append(b, 0x0B)
+
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midAcceptOff)
+	b = append(b, 0x20, 0x02)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, 0x03)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, 0x05)
+	b = append(b, 0x0B)
+
+	b = emitImmAcceptCheckFind(b)
+
+	b = append(b, 0x20, 0x03)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, 0x03)
+	b = append(b, 0x0C, 0x00)
+	b = append(b, 0x0B) // end loop $scan
+	b = append(b, 0x0B) // end block $found
+	b = emitReturn(b)
+	return b
+}
 
 // buildFindBody returns the WASM function body for find mode.
 // The function scans for the leftmost-longest match and returns a packed i64:
