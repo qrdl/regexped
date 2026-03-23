@@ -26,4 +26,11 @@ fn main() {
 
     eprintln!("checksum:{}", sum);
     println!("compile: {}µs  match: {}ns", compile_us, avg_ns);
+    match re.captures(input) {
+        Some(caps) => {
+            let m = caps.get(0).unwrap();
+            println!("result:{}:{}", m.start(), m.end());
+        }
+        None => println!("result:none"),
+    }
 }

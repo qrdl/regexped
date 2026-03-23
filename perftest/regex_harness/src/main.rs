@@ -27,4 +27,5 @@ fn main() {
     eprintln!("checksum:{}", sum);
 
     println!("compile: {}µs  match: {}ns", compile_us, avg_ns);
+    println!("result:{}", if re.is_match(input) { "match" } else { "none" });
 }

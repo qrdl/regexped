@@ -188,6 +188,25 @@ var tests = []testCase{
 			{"injected ~1KB", sqlInjectInput()},
 		},
 	},
+	{
+		// Comment extraction from source code — benchmarks per-state SIMD in DFA inner loop.
+		// Two self-loop states qualify (255/256 bytes each):
+		//   - inside // comment: [^\n]+ self-loops until newline
+		//   - inside /* */ comment body: everything except '*' self-loops
+		// Block comments can be hundreds of bytes long, making long self-loop runs likely.
+		// (?s) enables DOTALL so /* */ spans newlines correctly.
+		name:    "comments-100kb",
+		pattern: `//[^\n]+|/\*(?s:.*?)\*/`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-comments 100KB", sourceCodeInput(nil, nil)},
+			{"comments 100KB",    sourceCodeInput(
+				[]string{"// initialise connection pool", "// retry with exponential backoff", "// validate request parameters"},
+				[]string{"/*\n * Copyright 2026 Example Corp.\n * Licensed under the Apache License, Version 2.0.\n */",
+					"/* TODO: replace with proper error handling once the new\n   error framework is merged into main branch */"},
+			)},
+		},
+	},
 	// ── Backtracking engine benchmark ────────────────────────────────────────
 	// .* before (ERROR|WARNING|FATAL) makes this non-OnePass: the .* loop and
 	// the keyword alternation share overlapping first-character sets.
@@ -294,6 +313,70 @@ export ENCRYPTION_KEY=replace_with_actual_key
 // characters (high false-positive rate for [a-zA-Z] prefix) but containing no
 // "://" sequences unless URLs are explicitly injected. Ideal for benchmarking
 // non-prefix mandatory literal extraction for the [a-zA-Z]{2,8}://[^\s]+ pattern.
+// sourceCodeInput returns ~100KB of C-style source code. singleLine comments are
+// injected as // ... lines, blockComments as /* ... */ blocks, spread evenly.
+// With nil slices the output contains no comment tokens at all.
+func sourceCodeInput(singleLine, blockComments []string) string {
+	const block = `int processRequest(Request *req, Response *resp) {
+    if (req == NULL || resp == NULL) {
+        return ERR_INVALID_ARG;
+    }
+    int status = validateHeaders(req->headers, req->headerCount);
+    if (status != OK) {
+        resp->statusCode = 400;
+        setBody(resp, "Bad Request");
+        return status;
+    }
+    Connection *conn = poolAcquire(globalPool, POOL_TIMEOUT_MS);
+    if (conn == NULL) {
+        resp->statusCode = 503;
+        setBody(resp, "Service Unavailable");
+        return ERR_NO_CONNECTION;
+    }
+    QueryResult result = executeQuery(conn, req->path, req->params);
+    poolRelease(globalPool, conn);
+    if (result.error != 0) {
+        resp->statusCode = 500;
+        setBody(resp, "Internal Server Error");
+        return result.error;
+    }
+    resp->statusCode = 200;
+    resp->body = result.data;
+    resp->bodyLen = result.dataLen;
+    return OK;
+}
+
+`
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+
+	if len(singleLine) == 0 && len(blockComments) == 0 {
+		return base
+	}
+
+	all := make([]string, 0, len(singleLine)+len(blockComments))
+	for _, c := range singleLine {
+		all = append(all, c)
+	}
+	for _, c := range blockComments {
+		all = append(all, c)
+	}
+
+	result := []byte(base)
+	step := len(result) / (len(all) + 1)
+	offset := 0
+	for i, comment := range all {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte(comment + "\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
 func urlProseInput(urls []string) string {
 	const block = `The application encountered an error while processing the request from the
 client. The server returned status code four hundred and three, indicating that
@@ -364,15 +447,19 @@ func wasmMerge() string {
 // --------------------------------------------------------------------------
 // Measurement
 
-var reNs = regexp.MustCompile(`(?:match|find):\s*(\d+)ns`)
-var reUs = regexp.MustCompile(`compile:\s*(\d+)`)
+var reNs        = regexp.MustCompile(`(?:match|find):\s*(\d+)ns`)
+var reUs        = regexp.MustCompile(`compile:\s*(\d+)`)
+var reResultAll = regexp.MustCompile(`result:(\S+)`)
 
 // runHarness runs a pre-built WASM harness via wasmtime and parses timing output.
-func runHarness(harnessPath string, args ...string) (compileUs, opNs int64, err error) {
+// results collects all "result:X" lines (excluding "result:done").
+// For single-result modes (anchored, groups) results has one element.
+// For find mode results holds all match spans.
+func runHarness(harnessPath string, args ...string) (compileUs, opNs int64, results []string, err error) {
 	cmdArgs := append([]string{"run", harnessPath}, args...)
 	out, err := exec.Command("wasmtime", cmdArgs...).Output()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	s := string(out)
 	if m := reUs.FindStringSubmatch(s); m != nil {
@@ -381,16 +468,35 @@ func runHarness(harnessPath string, args ...string) (compileUs, opNs int64, err 
 	if m := reNs.FindStringSubmatch(s); m != nil {
 		opNs, _ = strconv.ParseInt(m[1], 10, 64)
 	}
-	return compileUs, opNs, nil
+	for _, m := range reResultAll.FindAllStringSubmatch(s, -1) {
+		if m[1] == "done" {
+			break
+		}
+		results = append(results, m[1])
+	}
+	return compileUs, opNs, results, nil
+}
+
+func resultsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // buildRegexped compiles pattern to WASM, merges with the harness, and returns
 // the merged WASM path (caller must delete the temp file).
 func buildRegexped(dir, harnessName, exportName string, mode compile.MatchMode, pattern string) (string, error) {
 	opts := compile.CompileOptions{
-		MaxDFAStates: 100000,
-		ForceEngine:  compile.EngineDFA,
-		Mode:         mode,
+		MaxDFAStates:  100000,
+		ForceEngine:   compile.EngineDFA,
+		Mode:          mode,
+		LeftmostFirst: mode == compile.ModeFind, // required for non-greedy semantics in find mode
 	}
 	// Determine tableBase from the harness's Rust memory top so DFA tables don't overlap.
 	harness := harnessWasm(dir, harnessName)
@@ -398,7 +504,20 @@ func buildRegexped(dir, harnessName, exportName string, mode compile.MatchMode, 
 	if err != nil {
 		return "", fmt.Errorf("read harness memory: %w", err)
 	}
-	tableBase := utils.PageAlign(rustTop)
+	// Place DFA tables 512KB above rustTop to prevent overlap with the Rust heap.
+	//
+	// The Rust harnesses receive input as a WASI command-line argument (args[1]),
+	// which the WASI runtime heap-allocates starting near __heap_base (≈ rustTop).
+	// For a 100KB input the heap can grow to roughly rustTop + 100KB + runtime overhead
+	// (~50KB), putting the heap top at rustTop + ~150KB. The 512KB margin keeps DFA
+	// tables safely above that.
+	//
+	// If you add a test whose input exceeds ~350KB (i.e. rustTop + 512KB - ~150KB
+	// runtime overhead), increase this margin accordingly, OR refactor the harnesses
+	// to write input into a fixed buffer placed above the DFA tables instead of
+	// passing it as a WASI command-line argument. See the "Fixed Input Buffer" plan
+	// in the code comments / design notes for the proper long-term fix.
+	tableBase := utils.PageAlign(rustTop + 512*1024)
 	wasmBytes, _, err := compile.CompileRegex(pattern, exportName, tableBase, false, opts)
 	if err != nil {
 		return "", fmt.Errorf("compile: %w", err)
@@ -444,7 +563,9 @@ func buildRegexpedGroups(dir, harnessName, exportName, pattern string) (string, 
 	if err != nil {
 		return "", fmt.Errorf("read harness memory: %w", err)
 	}
-	tableBase := utils.PageAlign(rustTop)
+	// Same 512KB margin as buildRegexped — see comment there for details and the
+	// threshold above which this margin must be increased.
+	tableBase := utils.PageAlign(rustTop + 512*1024)
 	wasmBytes, _, err := compile.CompileOnePassGroups(pattern, exportName, tableBase, false)
 	if err != nil {
 		// Not OnePass-eligible — fall back to backtracking engine.
@@ -615,8 +736,8 @@ func main() {
 		var sharedCompileUs int64
 
 		for i, inp := range tc.inputs {
-			// Regex crate timing.
-			compileUs, regexNs, hErr := runHarness(regexHarness, tc.pattern, inp.value)
+			// Regex crate timing + result.
+			compileUs, regexNs, regexResult, hErr := runHarness(regexHarness, tc.pattern, inp.value)
 			if hErr != nil {
 				fmt.Fprintf(os.Stderr, "  warn: regex harness failed for %q: %v\n", inp.label, hErr)
 			}
@@ -624,10 +745,16 @@ func main() {
 				sharedCompileUs = compileUs
 			}
 
-			// Regexped timing.
-			_, regexpedNs, rErr := runHarness(mergedPath, inp.value)
+			// Regexped timing + result.
+			_, regexpedNs, regexpedResult, rErr := runHarness(mergedPath, inp.value)
 			if rErr != nil {
 				fmt.Fprintf(os.Stderr, "  warn: regexped harness failed for %q: %v\n", inp.label, rErr)
+			}
+
+			// Correctness check: compare all results (all matches for find, single for others).
+			if len(regexResult) > 0 && len(regexpedResult) > 0 && !resultsEqual(regexResult, regexpedResult) {
+				fmt.Fprintf(os.Stderr, "  MISMATCH %s / %q: regex=%v regexped=%v\n",
+					tc.name, inp.label, regexResult, regexpedResult)
 			}
 
 			r := row{

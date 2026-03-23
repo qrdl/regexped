@@ -178,8 +178,14 @@ func genBacktrackWASM(bt *backtrack, tableBase int64, exportName string, standal
 	out = appendSection(out, 10, codeContent)
 
 	// Data section: DFA tables (match-only, no find tables).
-	// Backtrack stack is zero-initialised; only DFA data needs to be in the data section.
+	// Backtrack stack is zero-initialised at runtime; only DFA tables need data segments.
+	// For non-standalone mode, add a 1-byte sentinel at tableEnd-1 so that merge.go
+	// can see the full memory requirement (stack occupies stackBase..tableEnd at runtime).
 	dfaDS := dfaDataSegments(dfaL, false)
+	if !standalone {
+		dfaDS[0]++ // increment segment count
+		dfaDS = appendDataSegment(dfaDS, int32(tableEnd-1), []byte{0x00})
+	}
 	out = appendSection(out, 11, dfaDS)
 
 	return out, tableEnd
@@ -760,7 +766,7 @@ func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(hi))
-	b = append(b, 0x4E) // i32.le_u
+	b = append(b, 0x4D) // i32.le_u
 
 	b = append(b, 0x71) // i32.and → 0 or 1
 
