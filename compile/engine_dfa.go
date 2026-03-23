@@ -751,6 +751,12 @@ type dfaLayout struct {
 	classRep    []int
 	numClasses  int
 
+	// Row deduplication (u8 paths only)
+	useRowDedup   bool
+	rowMapOff     int32
+	rowMapBytes   []byte // numWASM bytes: wasm-state → row index
+	numUniqueRows int
+
 	// Accept flags
 	acceptOff    int32
 	acceptBytes  []byte
@@ -863,6 +869,44 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool) 
 					binary.LittleEndian.PutUint16(l.tableBytes[(ws*256+b)*2:], wn)
 				}
 			}
+		}
+	}
+
+	// Row deduplication for u16: states with identical transition rows share one row.
+	// u16 tables can be 100s of KB (e.g. 1000 states × 512 bytes = 512KB), well beyond
+	// L1 cache, so dedup meaningfully reduces cache pressure.  u8 tables are ≤ 32KB and
+	// typically L1-resident, so the extra indirection would hurt more than it helps.
+	// rowMap is u8 (1 byte per state → row index), so we only dedup when uniqueRows ≤ 255.
+	if !l.useU8 {
+		const rowWidth = 512 // 256 entries × 2 bytes (u16)
+		seen := make(map[string]int, l.numWASM)
+		rowOf := make([]int, l.numWASM)
+		var uniqueRows [][]byte
+		for ws := 0; ws < l.numWASM; ws++ {
+			row := l.tableBytes[ws*rowWidth : (ws+1)*rowWidth]
+			key := string(row)
+			idx, ok := seen[key]
+			if !ok {
+				idx = len(uniqueRows)
+				seen[key] = idx
+				uniqueRows = append(uniqueRows, append([]byte(nil), row...))
+			}
+			rowOf[ws] = idx
+		}
+		if len(uniqueRows) < l.numWASM && len(uniqueRows) <= 255 {
+			l.useRowDedup = true
+			l.numUniqueRows = len(uniqueRows)
+			l.rowMapOff = l.tableOff
+			l.rowMapBytes = make([]byte, l.numWASM)
+			for ws, idx := range rowOf {
+				l.rowMapBytes[ws] = byte(idx)
+			}
+			l.tableOff = l.rowMapOff + int32(l.numWASM)
+			dedup := make([]byte, l.numUniqueRows*rowWidth)
+			for i, row := range uniqueRows {
+				copy(dedup[i*rowWidth:], row)
+			}
+			l.tableBytes = dedup
 		}
 	}
 
@@ -1070,6 +1114,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 		if l.needWordCharTable {
 			n += 3
 		}
+		if l.useRowDedup {
+			n++
+		}
 		return n
 	}
 	teddyExtraSegs := byte(0)
@@ -1088,6 +1135,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 		if needFind {
 			var transSegs []byte
 			transSegs = appendDataSegment(transSegs, l.classMapOff, l.classMap[:])
+			if l.useRowDedup {
+				transSegs = appendDataSegment(transSegs, l.rowMapOff, l.rowMapBytes)
+			}
 			transSegs = appendDataSegment(transSegs, l.tableOff, l.tableBytes)
 			if len(l.prefix) == 0 {
 				ds = append(ds, findSegCount(5)+teddyExtraSegs)
@@ -1114,8 +1164,14 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			if l.hasImmAccept {
 				count++
 			}
+			if l.useRowDedup {
+				count++
+			}
 			ds = append(ds, count)
 			ds = appendDataSegment(ds, l.classMapOff, l.classMap[:])
+			if l.useRowDedup {
+				ds = appendDataSegment(ds, l.rowMapOff, l.rowMapBytes)
+			}
 			ds = appendDataSegment(ds, l.tableOff, l.tableBytes)
 			ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
 			if l.hasImmAccept {
@@ -1125,6 +1181,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 	} else {
 		if needFind {
 			var transSegs []byte
+			if l.useRowDedup {
+				transSegs = appendDataSegment(transSegs, l.rowMapOff, l.rowMapBytes)
+			}
 			transSegs = appendDataSegment(transSegs, l.tableOff, l.tableBytes)
 			if len(l.prefix) == 0 {
 				ds = append(ds, findSegCount(4)+teddyExtraSegs)
@@ -1151,7 +1210,13 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			if l.hasImmAccept {
 				count++
 			}
+			if l.useRowDedup {
+				count++
+			}
 			ds = append(ds, count)
+			if l.useRowDedup {
+				ds = appendDataSegment(ds, l.rowMapOff, l.rowMapBytes)
+			}
 			ds = appendDataSegment(ds, l.tableOff, l.tableBytes)
 			ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
 			if l.hasImmAccept {
@@ -1256,16 +1321,16 @@ func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, stand
 	var cs []byte
 	cs = utils.AppendULEB128(cs, uint32(numTypes))
 	if needMatch {
-		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept)
+		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept, l.rowMapOff, l.useRowDedup)
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
 	if needFind {
 		var body []byte
 		if isAnchoredFind(t) {
-			body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff)
+			body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.rowMapOff, l.useRowDedup)
 		} else {
-			body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit)
+			body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit, l.rowMapOff, l.useRowDedup)
 		}
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
@@ -1391,16 +1456,16 @@ func genHybridWASM(
 	var cs []byte
 	cs = utils.AppendULEB128(cs, uint32(numTypes))
 	if needMatch {
-		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept)
+		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept, l.rowMapOff, l.useRowDedup)
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
 	if needFind {
 		var body []byte
 		if isAnchoredFind(t) {
-			body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff)
+			body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.rowMapOff, l.useRowDedup)
 		} else {
-			body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit)
+			body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit, l.rowMapOff, l.useRowDedup)
 		}
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
@@ -1436,7 +1501,7 @@ func genHybridWASM(
 // u16 (useU8=false):
 //
 //	Local indices: 0=ptr 1=len 2=state 3=pos 4=byte
-func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, immediateAcceptOff int32, hasImmAccept bool) []byte {
+func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, immediateAcceptOff int32, hasImmAccept bool, rowMapOff int32, useRowDedup bool) []byte {
 	var b []byte
 
 	// emitImmAcceptCheck emits: if immediateAccept[state]: return pos
@@ -1484,10 +1549,19 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (class)
 		b = append(b, 0x21, 0x04)       // local.set class
 
-		// state = u8(mem[tableOff + state*numClasses + class])
+		// state = u8(mem[tableOff + row*numClasses + class])
+		// where row = rowMap[state] when useRowDedup, else row = state
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
-		b = append(b, 0x20, 0x02) // local.get state
+		if useRowDedup {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02)       // local.get state
+			b = append(b, 0x6A)             // rowMapOff + state
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
+		} else {
+			b = append(b, 0x20, 0x02) // local.get state
+		}
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(numClasses))
 		b = append(b, 0x6C)             // i32.mul
@@ -1546,12 +1620,21 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x4F)
 		b = append(b, 0x0D, 0x01) // if pos >= len: br_if $done
 
-		// state = u8(mem[tableOff + state*256 + mem[ptr+pos]])
+		// state = u8(mem[tableOff + row*256 + mem[ptr+pos]])
+		// where row = rowMap[state] when useRowDedup, else row = state
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
-		b = append(b, 0x20, 0x02)       // local.get state
+		if useRowDedup {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02)       // local.get state
+			b = append(b, 0x6A)             // rowMapOff + state
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
+		} else {
+			b = append(b, 0x20, 0x02) // local.get state
+		}
 		b = append(b, 0x41, 0x08)       // i32.const 8
-		b = append(b, 0x74)             // i32.shl (state * 256)
+		b = append(b, 0x74)             // i32.shl (row * 256)
 		b = append(b, 0x6A)
 		b = append(b, 0x20, 0x00)       // local.get ptr
 		b = append(b, 0x20, 0x03)       // local.get pos
@@ -1616,12 +1699,18 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 	b = append(b, 0x21, 0x04)       // local.set byte
 
-	// state = u16(mem[tableOff + state*512 + byte*2])
+	// state = u16(mem[tableOff + row*512 + byte*2]) where row = rowMap[state] or state
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, tableOff)
-	b = append(b, 0x20, 0x02)       // local.get state
+	if useRowDedup {
+		b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
+		b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
+	} else {
+		b = append(b, 0x20, 0x02)       // local.get state
+	}
 	b = append(b, 0x41, 0x09)       // i32.const 9
-	b = append(b, 0x74)             // i32.shl (state * 512)
+	b = append(b, 0x74)             // i32.shl (row/state * 512)
 	b = append(b, 0x6A)
 	b = append(b, 0x20, 0x04)       // local.get byte
 	b = append(b, 0x41, 0x01)       // i32.const 1
@@ -1687,6 +1776,7 @@ func buildMatchBodyInline(b []byte,
 	useU8, useCompression bool,
 	immediateAcceptOff int32, hasImmAccept bool,
 	localPtr, localLen, localSt, localPo, localCl uint32,
+	rowMapOff int32, useRowDedup bool,
 ) []byte {
 	lget := func(b []byte, idx uint32) []byte {
 		b = append(b, 0x20)
@@ -1743,10 +1833,18 @@ func buildMatchBodyInline(b []byte,
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (class)
 		b = lset(b, localCl)
 
-		// state = table[state*numClasses + class]
+		// state = table[row*numClasses + class] where row = rowMap[state] or state
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
-		b = lget(b, localSt)
+		if useRowDedup {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, rowMapOff)
+			b = lget(b, localSt)
+			b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
+		} else {
+			b = lget(b, localSt)
+		}
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(numClasses))
 		b = append(b, 0x6C) // i32.mul
@@ -1756,12 +1854,20 @@ func buildMatchBodyInline(b []byte,
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 		b = lset(b, localSt)
 	} else if useU8 {
-		// state = table[state*256 + mem[ptr+pos]]
+		// state = table[row*256 + mem[ptr+pos]] where row = rowMap[state] or state
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
-		b = lget(b, localSt)
+		if useRowDedup {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, rowMapOff)
+			b = lget(b, localSt)
+			b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
+		} else {
+			b = lget(b, localSt)
+		}
 		b = append(b, 0x41, 0x08) // i32.const 8
-		b = append(b, 0x74)       // i32.shl (state * 256)
+		b = append(b, 0x74)       // i32.shl (row * 256)
 		b = append(b, 0x6A)
 		b = lget(b, localPtr)
 		b = lget(b, localPo)
@@ -1771,7 +1877,7 @@ func buildMatchBodyInline(b []byte,
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (table entry)
 		b = lset(b, localSt)
 	} else {
-		// u16: byte = mem[ptr+pos]; state = table[state*512 + byte*2]
+		// u16: byte = mem[ptr+pos]; state = table[row*512 + byte*2] (row = rowMap[state] or state)
 		b = lget(b, localPtr)
 		b = lget(b, localPo)
 		b = append(b, 0x6A)
@@ -1780,9 +1886,15 @@ func buildMatchBodyInline(b []byte,
 
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
-		b = lget(b, localSt)
+		if useRowDedup {
+			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
+			b = lget(b, localSt); b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
+		} else {
+			b = lget(b, localSt)
+		}
 		b = append(b, 0x41, 0x09) // i32.const 9
-		b = append(b, 0x74)       // i32.shl (state * 512)
+		b = append(b, 0x74)       // i32.shl (row/state * 512)
 		b = append(b, 0x6A)
 		b = lget(b, localCl)
 		b = append(b, 0x41, 0x01) // i32.const 1
@@ -1918,7 +2030,7 @@ func isAnchoredFind(t *dfaTable) bool {
 //     if last_accept >= 0: return packed i64
 //   end $no_match
 //   i64.const -1
-func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32) []byte {
+func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, rowMapOff int32, useRowDedup bool) []byte {
 	var b []byte
 
 	// emitImmAcceptCheckFind emits: if immediateAccept[state]: last_accept=pos+1; br 2→$found
@@ -2095,10 +2207,16 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x2D, 0x00, 0x00)
 		b = append(b, 0x21, 0x06) // local.set class
 
-		// state = table[state*numClasses + class]
+		// state = table[row*numClasses + class] where row = rowMap[state] or state
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
-		b = append(b, 0x20, 0x02)
+		if useRowDedup {
+			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00)
+		} else {
+			b = append(b, 0x20, 0x02)
+		}
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(numClasses))
 		b = append(b, 0x6C) // i32.mul
@@ -2157,10 +2275,16 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 
 		b = emitWBPreAcceptCheck(b)
 
-		// state = table[state*256 + mem[ptr+pos]]
+		// state = table[row*256 + mem[ptr+pos]] where row = rowMap[state] or state
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
-		b = append(b, 0x20, 0x02)
+		if useRowDedup {
+			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00)
+		} else {
+			b = append(b, 0x20, 0x02)
+		}
 		b = append(b, 0x41, 0x08)
 		b = append(b, 0x74) // i32.shl
 		b = append(b, 0x6A)
@@ -2300,7 +2424,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, mandatoryLit *MandatoryLit) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, mandatoryLit *MandatoryLit, rowMapOff int32, useRowDedup bool) []byte {
 	var b []byte
 
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
@@ -2788,10 +2912,16 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (class)
 		b = append(b, 0x21, 0x06)       // local.set class
 
-		// state = table[state*numClasses + class]
+		// state = table[row*numClasses + class] where row = rowMap[state] or state
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
-		b = append(b, 0x20, 0x02) // local.get state
+		if useRowDedup {
+			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00)
+		} else {
+			b = append(b, 0x20, 0x02) // local.get state
+		}
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(numClasses))
 		b = append(b, 0x6C)             // i32.mul
@@ -2868,10 +2998,16 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 
 		b = emitWBPreAcceptCheck(b)
 
-		// state = table[state*256 + mem[ptr+pos]]
+		// state = table[row*256 + mem[ptr+pos]] where row = rowMap[state] or state
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
-		b = append(b, 0x20, 0x02)       // local.get state
+		if useRowDedup {
+			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00)
+		} else {
+			b = append(b, 0x20, 0x02)       // local.get state
+		}
 		b = append(b, 0x41, 0x08)       // i32.const 8
 		b = append(b, 0x74)             // i32.shl
 		b = append(b, 0x6A)
@@ -2956,10 +3092,16 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 	b = append(b, 0x21, 0x06)       // local.set byte
 
-	// state = u16(mem[tableOff + state*512 + byte*2])
+	// state = u16(mem[tableOff + row*512 + byte*2]) where row = rowMap[state] or state
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, tableOff)
-	b = append(b, 0x20, 0x02)       // local.get state
+	if useRowDedup {
+		b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
+		b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
+	} else {
+		b = append(b, 0x20, 0x02)       // local.get state
+	}
 	b = append(b, 0x41, 0x09)       // i32.const 9
 	b = append(b, 0x74)             // i32.shl
 	b = append(b, 0x6A)
