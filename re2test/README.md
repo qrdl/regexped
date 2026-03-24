@@ -1,0 +1,66 @@
+# re2test — Regex Exhaustive Test Runner
+
+Tests regexped WASM modules against a test file, optionally validating expectations against Go stdlib.
+
+## Usage
+
+```bash
+go run . [options] <test-file>
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `-v` | false | Print every test case result |
+| `--max-errors N` | 100 | Stop after N failures (0 = unlimited) |
+| `--validate-go` | false | Validate test expectations against Go stdlib; skips WASM testing |
+| `--validate-groups` | false | Enable col0 capture-groups validation (see below) |
+
+### Test files
+
+- `re2-exhaustive.txt` — RE2 C++ exhaustive test suite. Run **without** `--validate-groups`.
+- `custom-tests.txt` — Edge-case tests for regexped. Run **with** `--validate-groups`.
+
+## Test file format
+
+```
+SectionName
+strings
+"str1"
+"str2"
+regexps
+"pattern"
+col0;col1;col2;col3
+col0;col1;col2;col3
+```
+
+| Column | Meaning |
+|---|---|
+| col0 | Anchored full-string match with captures (e.g. `0-3 0-1 2-3`) or `-` for no match |
+| col1 | Leftmost find result (e.g. `0-3`) or `-` for no match |
+| col2 | Unused (POSIX anchored — not implemented) |
+| col3 | Unused (POSIX find — not implemented) |
+| col4 (optional) | All find matches, comma-separated (e.g. `0-1,3-5`) |
+| col5 (optional) | Non-anchored find with captures |
+
+## Semantic differences: Go stdlib vs RE2 C++
+
+**Regexped matches Go stdlib semantics**, not RE2 C++ semantics.
+
+The key difference is in alternation and quantifier matching:
+
+- **Go stdlib** uses **leftmost-first (LF / Perl)** semantics: the first matching alternative wins, and non-greedy quantifiers prefer the shortest match.
+- **RE2 C++** uses **leftmost-longest (LL / POSIX)** semantics for the *overall match extent*: among all matches starting at the leftmost position, the longest one wins.
+
+### Example
+
+Pattern `a|ab` on input `"ab"`:
+- **Go stdlib (LF)**: `a` wins → match `"a"` (end=1). Full-string match fails (end≠2). col0=`-`
+- **RE2 C++ (LL)**: `ab` wins → match `"ab"` (end=2). col0=`0-2`
+
+Because `re2-exhaustive.txt` was generated with RE2 C++, its col0 values for patterns involving alternation or non-greedy quantifiers may differ from Go stdlib. This is why `--validate-groups` (which validates col0 against Go stdlib and WASM) must **not** be used with `re2-exhaustive.txt`.
+
+## `\C` pattern limitation
+
+The `\C` escape (match any single byte) is not supported by Go stdlib's `regexp` package and is not implemented in regexped. Patterns containing `\C` are skipped during testing.

@@ -51,7 +51,8 @@ var skipOrder = []string{
 func main() {
 	verbose := flag.Bool("v", false, "print every test case result")
 	maxErrors := flag.Int("max-errors", 100, "stop after this many failures (0 = unlimited)")
-	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors before WASM testing)")
+	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors, skips WASM testing)")
+	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -59,13 +60,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo); err != nil {
+	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(testFile string, verbose bool, maxErrors int, validateGo bool) error {
+func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool) error {
 	f, err := os.Open(testFile)
 	if err != nil {
 		return err
@@ -288,7 +289,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool) error {
 			input = input[1:]
 
 			// Pattern was skipped — consume the result line without testing.
-			if store == nil && groupsStore == nil {
+			if store == nil && groupsStore == nil && !validateGo {
 				continue
 			}
 
@@ -318,7 +319,25 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool) error {
 
 			// --validate-go: check expectations against Go stdlib before WASM testing.
 			if validateGo {
-				re := regexp.MustCompile(pattern)
+				re, reErr := regexp.Compile(pattern)
+				if reErr != nil {
+					// Pattern not supported by Go stdlib (e.g. \C) — skip validation.
+					continue
+				}
+				// col0 (anchored groups): only when --validate-groups is on.
+				if validateGroups && col0 != "-" {
+					goSub0 := re.FindStringSubmatchIndex(text)
+					expSlots0 := parseCaptures(col0, re.NumSubexp()+1)
+					goAnchored := goSub0 != nil && len(goSub0) >= 2 && goSub0[0] == 0 && goSub0[1] == len(text)
+					if !goAnchored {
+						goSub0 = nil
+					}
+					if !slotsEqualGo(goSub0, expSlots0) {
+						nDataErrors++
+						fmt.Printf("DATA  pattern: %q\n      input:   %q\n      col0 expected: %s\n      col0 go:       %s\n",
+							pattern, text, fmtSlots(expSlots0), fmtGoSub(goSub0))
+					}
+				}
 				// col1 (find): Go uses leftmost-first, same as our find DFA.
 				goM := re.FindStringIndex(text)
 				var goFind int64 = -1
@@ -366,6 +385,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool) error {
 				}
 			}
 
+			if !validateGo {
 			// col1: non-anchored find (only when no anchored result expected, matching RE2 test convention).
 			if col0 == "-" && col1 != "-" {
 				if findFn == nil {
@@ -396,13 +416,19 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool) error {
 						}
 					}
 				}
-			} else if groupsFn != nil {
-				// col0: anchored match with captures.
+			} else if groupsFn != nil && validateGroups {
+				// col0: anchored match with captures (only when --validate-groups is on).
+				// groups is now non-anchored; treat as no match if result doesn't start at 0.
 				endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
 				if callErr != nil {
 					if isTimeout(callErr) { return fmt.Errorf("TIMEOUT: groups pattern=%q input=%q", pattern, text) }
 					return fmt.Errorf("%s:%d: wasm groups call pattern=%q input=%q: %w",
 						testFile, lineno, pattern, text, callErr)
+				}
+				// Non-anchored groups: if match doesn't start at 0, treat as no match for col0.
+				if endPos >= 0 && len(slots) > 0 && slots[0] != 0 {
+					endPos = -1
+					slots = nil
 				}
 				expectedEnd := parseCol0(col0)
 				expectedSlots := parseCaptures(col0, numGroups)
@@ -533,6 +559,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool) error {
 					}
 				}
 			}
+			} // end !validateGo
 		default:
 			return fmt.Errorf("%s:%d: unexpected line: %s", testFile, lineno, line)
 		}

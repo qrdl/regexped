@@ -45,7 +45,9 @@ func newBacktrack(prog *syntax.Prog) *backtrack {
 // WASM emission
 
 // CompileBacktrackGroups compiles a pattern to a backtracking WASM module
-// exporting a groups function: (ptr i32, len i32, out_ptr i32) → i32.
+// exporting a non-anchored groups function: (ptr i32, len i32, out_ptr i32) → i32.
+// The module contains find_internal (LF DFA find), capture_internal (LL DFA + NFA),
+// and a groups_exported wrapper that calls find_internal then capture_internal.
 func CompileBacktrackGroups(pattern, exportName string, tableBase int64, standalone bool) ([]byte, int64, error) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -57,8 +59,7 @@ func CompileBacktrackGroups(pattern, exportName string, tableBase int64, standal
 	}
 	bt := newBacktrack(prog)
 
-	// Compile DFA (captures stripped) for Phase 1 RE2-semantics extent check.
-	// Re-parse to get a fresh tree — stripCaptures mutates in place.
+	// Re-parse to get stripped program (stripCaptures mutates in place).
 	reStripped, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, 0, err
@@ -68,15 +69,26 @@ func CompileBacktrackGroups(pattern, exportName string, tableBase int64, standal
 	if err != nil {
 		return nil, 0, err
 	}
-	dfaL := compileDFAForBacktrack(progStripped, tableBase)
 
-	// Backtracking stack starts after DFA data (page-aligned).
-	btTableBase := utils.PageAlign(int64(dfaL.acceptOff) + int64(dfaL.numWASM))
-	if dfaL.hasImmAccept {
-		btTableBase = utils.PageAlign(int64(dfaL.immediateAcceptOff) + int64(dfaL.numWASM))
+	// Find DFA (LF, find mode) — only needed for non-anchored patterns.
+	dFind := newDFA(progStripped, false, true) // unicode=false, leftmostFirst=true
+	tFind := dfaTableFrom(dFind)
+
+	var findDFAL *dfaLayout
+	captureDFABase := tableBase
+	if !isAnchoredFind(tFind) {
+		// Non-anchored: include find DFA tables; capture DFA follows.
+		findDFAL = buildDFALayout(tFind, tableBase, true, true)
+		captureDFABase = utils.PageAlign(findDFAL.tableEnd)
 	}
 
-	wasmBytes, tableEnd := genBacktrackWASM(bt, btTableBase, exportName, standalone, dfaL)
+	// Phase 1 DFA (LL, match mode) for capture_internal.
+	captureDFAL := compileDFAForBacktrack(progStripped, captureDFABase)
+
+	// Backtrack stack after all DFA tables.
+	btTableBase := utils.PageAlign(captureDFAL.tableEnd)
+
+	wasmBytes, tableEnd := genBacktrackWASM(bt, btTableBase, exportName, standalone, captureDFAL, findDFAL)
 	return wasmBytes, tableEnd, nil
 }
 
@@ -85,21 +97,28 @@ func CompileBacktrackGroups(pattern, exportName string, tableBase int64, standal
 // tableBase is the memory offset where DFA tables are placed.
 func compileDFAForBacktrack(progStripped *syntax.Prog, tableBase int64) *dfaLayout {
 	// leftmostFirst=false: standard leftmost-longest DFA semantics for anchored match.
-	// This avoids immediateAccept states which use `return` instructions incompatible
-	// with inline use inside the backtracking function body.
+	// Phase 1 uses LL semantics to determine the correct RE2 match extent for Phase 2.
 	d := newDFA(progStripped, false, false)
 	t := dfaTableFrom(d)
 	return buildDFALayout(t, tableBase, false, false)
 }
 
-// genBacktrackWASM generates a WASM module exporting a groups function:
+// genBacktrackWASM generates a WASM module exporting a groups function.
+//
+// When findDFAL is nil: emits a single anchored groups function (1 function):
 //
 //	(ptr: i32, len: i32, out_ptr: i32) → i32
 //
-// dfaL is the layout for the captures-stripped DFA used in Phase 1.
-// tableBase is the start of the backtracking stack (after DFA data).
-// Returns end position of match or -1 on failure.
-func genBacktrackWASM(bt *backtrack, tableBase int64, exportName string, standalone bool, dfaL *dfaLayout) ([]byte, int64) {
+// When findDFAL is non-nil: emits three functions:
+//
+//	func 0: find_internal (i32,i32)→i64       — not exported, LF DFA find
+//	func 1: capture_internal (i32,i32,i32)→i32 — not exported, Phase 1 LL + NFA
+//	func 2: groups_exported (i32,i32,i32)→i32  — exported as exportName, calls 0 then 1
+//
+// dfaL is the layout for the Phase 1 LL match DFA used inside capture_internal.
+// findDFAL (when non-nil) is the layout for the LF find DFA used inside find_internal.
+// tableBase is the start of the backtracking stack (after all DFA data).
+func genBacktrackWASM(bt *backtrack, tableBase int64, exportName string, standalone bool, dfaL *dfaLayout, findDFAL *dfaLayout) ([]byte, int64) {
 	numCapLocals := bt.numGroups * 2
 	// frameSize = 4 (pos) + numCapLocals*4 (captures) + 4 (retry PC)
 	frameSize := 4 + numCapLocals*4 + 4
@@ -116,37 +135,71 @@ func genBacktrackWASM(bt *backtrack, tableBase int64, exportName string, standal
 	stackBase := int32(tableBase)
 	stackLimit := stackBase + int32(stackSize)
 
-	body := buildBacktrackBody(bt, stackBase, stackLimit, int32(frameSize), dfaL)
+	captureBody := buildBacktrackBody(bt, stackBase, stackLimit, int32(frameSize), dfaL)
 
-	// Type section: 1 type — (i32 i32 i32) → i32
-	typeContent := []byte{
-		0x01,                         // count=1
-		0x60,                         // func
-		0x03, 0x7F, 0x7F, 0x7F,       // 3 i32 params
-		0x01, 0x7F,                   // 1 i32 result
-	}
+	var typeContent, funcContent, exportContent, codeContent []byte
 
-	// Function section: 1 function, type index 0
-	funcContent := []byte{0x01, 0x00}
+	if findDFAL != nil {
+		// 3-function module: find_internal (0), capture_internal (1), groups_exported (2).
+		typeContent = []byte{
+			0x02,                                        // 2 types
+			0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E,         // type 0: (i32,i32)→i64
+			0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F,   // type 1: (i32,i32,i32)→i32
+		}
+		funcContent = []byte{0x03, 0x00, 0x01, 0x01} // 3 funcs: type0, type1, type1
 
-	// Export section
-	var exportContent []byte
-	if standalone {
-		exportContent = append(exportContent, 0x02) // 2 exports: func + memory
+		numExports := byte(1)
+		if standalone {
+			numExports = 2
+		}
+		exportContent = append(exportContent, numExports)
+		exportContent = append(exportContent, btExportEntry(exportName, 2)...) // export func 2
+		if standalone {
+			exportContent = appendString(exportContent, "memory")
+			exportContent = append(exportContent, 0x02, 0x00)
+		}
+
+		findBody := buildFindBody(
+			findDFAL.wasmStart, findDFAL.wasmMidStart, findDFAL.wasmMidStartWord,
+			findDFAL.wasmPrefixEnd, findDFAL.tableOff, findDFAL.acceptOff, findDFAL.midAcceptOff,
+			findDFAL.firstByteOff, findDFAL.prefix, findDFAL.classMapOff, findDFAL.numClasses,
+			findDFAL.useU8, findDFAL.useCompression, findDFAL.startBeginAccept,
+			findDFAL.immediateAcceptOff, findDFAL.hasImmAccept,
+			findDFAL.wordCharTableOff, findDFAL.needWordCharTable,
+			findDFAL.midAcceptNWOff, findDFAL.midAcceptWOff,
+			findDFAL.firstByteFlags, findDFAL.firstBytes,
+			findDFAL.teddyLoOff, findDFAL.teddyHiOff,
+			findDFAL.teddyT1LoOff, findDFAL.teddyT1HiOff, len(findDFAL.teddyT1LoBytes) > 0,
+			findDFAL.teddyT2LoOff, findDFAL.teddyT2HiOff, len(findDFAL.teddyT2LoBytes) > 0,
+			nil, findDFAL.rowMapOff, findDFAL.useRowDedup)
+		wrapperBody := buildGroupsWrapperBody(0, 1, bt.numGroups, false)
+
+		var fe, ce, we []byte
+		fe = utils.AppendULEB128(fe, uint32(len(findBody))); fe = append(fe, findBody...)
+		ce = utils.AppendULEB128(ce, uint32(len(captureBody))); ce = append(ce, captureBody...)
+		we = utils.AppendULEB128(we, uint32(len(wrapperBody))); we = append(we, wrapperBody...)
+		codeContent = append(append(append([]byte{0x03}, fe...), ce...), we...)
 	} else {
-		exportContent = append(exportContent, 0x01) // 1 export: func only
-	}
-	exportContent = append(exportContent, btExportEntry(exportName, 0)...)
-	if standalone {
-		exportContent = appendString(exportContent, "memory")
-		exportContent = append(exportContent, 0x02, 0x00) // memory kind, index 0
-	}
+		// 1-function module: anchored groups only.
+		typeContent = []byte{0x01, 0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F}
+		funcContent = []byte{0x01, 0x00}
 
-	// Code section: 1 body
-	var codeEntry []byte
-	codeEntry = utils.AppendULEB128(codeEntry, uint32(len(body)))
-	codeEntry = append(codeEntry, body...)
-	codeContent := append([]byte{0x01}, codeEntry...)
+		numExports := byte(1)
+		if standalone {
+			numExports = 2
+		}
+		exportContent = append(exportContent, numExports)
+		exportContent = append(exportContent, btExportEntry(exportName, 0)...)
+		if standalone {
+			exportContent = appendString(exportContent, "memory")
+			exportContent = append(exportContent, 0x02, 0x00)
+		}
+
+		var codeEntry []byte
+		codeEntry = utils.AppendULEB128(codeEntry, uint32(len(captureBody)))
+		codeEntry = append(codeEntry, captureBody...)
+		codeContent = append([]byte{0x01}, codeEntry...)
+	}
 
 	var out []byte
 	out = append(out, 0x00, 0x61, 0x73, 0x6D) // magic
@@ -156,12 +209,12 @@ func genBacktrackWASM(bt *backtrack, tableBase int64, exportName string, standal
 
 	if !standalone {
 		var importContent []byte
-		importContent = append(importContent, 0x01) // 1 import
+		importContent = append(importContent, 0x01)
 		importContent = appendString(importContent, "main")
 		importContent = appendString(importContent, "memory")
-		importContent = append(importContent, 0x02)              // memory kind
-		importContent = append(importContent, 0x00)              // limit type: min only
-		importContent = utils.AppendULEB128(importContent, 0x00) // min 0 pages
+		importContent = append(importContent, 0x02)
+		importContent = append(importContent, 0x00)
+		importContent = utils.AppendULEB128(importContent, 0x00)
 		out = appendSection(out, 2, importContent)
 	}
 
@@ -169,7 +222,7 @@ func genBacktrackWASM(bt *backtrack, tableBase int64, exportName string, standal
 
 	if standalone {
 		var memContent []byte
-		memContent = append(memContent, 0x01, 0x00) // 1 memory, no max
+		memContent = append(memContent, 0x01, 0x00)
 		memContent = utils.AppendULEB128(memContent, uint32(memPages))
 		out = appendSection(out, 5, memContent)
 	}
@@ -177,14 +230,25 @@ func genBacktrackWASM(bt *backtrack, tableBase int64, exportName string, standal
 	out = appendSection(out, 7, exportContent)
 	out = appendSection(out, 10, codeContent)
 
-	// Data section: DFA tables (match-only, no find tables).
-	// Backtrack stack is zero-initialised at runtime; only DFA tables need data segments.
-	// For non-standalone mode, add a 1-byte sentinel at tableEnd-1 so that merge.go
-	// can see the full memory requirement (stack occupies stackBase..tableEnd at runtime).
-	dfaDS := dfaDataSegments(dfaL, false)
-	if !standalone {
-		dfaDS[0]++ // increment segment count
-		dfaDS = appendDataSegment(dfaDS, int32(tableEnd-1), []byte{0x00})
+	// Data section.
+	var dfaDS []byte
+	if findDFAL != nil {
+		// find DFA tables + capture DFA tables.
+		findDS := dfaDataSegments(findDFAL, true)
+		capDS := dfaDataSegments(dfaL, false)
+		findDS[0] += capDS[0]
+		dfaDS = append(findDS, capDS[1:]...)
+		if !standalone {
+			dfaDS[0]++
+			dfaDS = appendDataSegment(dfaDS, int32(tableEnd-1), []byte{0x00})
+		}
+	} else {
+		// Capture DFA tables only + sentinel for non-standalone.
+		dfaDS = dfaDataSegments(dfaL, false)
+		if !standalone {
+			dfaDS[0]++
+			dfaDS = appendDataSegment(dfaDS, int32(tableEnd-1), []byte{0x00})
+		}
 	}
 	out = appendSection(out, 11, dfaDS)
 
@@ -986,48 +1050,64 @@ func btFoldRune(r rune) rune {
 
 // genHybridWASMWithBacktrack generates a WASM module combining a DFA (match and/or
 // find) with a backtracking NFA (groups), all sharing one memory.
-// This mirrors genHybridWASM but replaces the OnePass groups body with a
-// backtrack body, and emits no extra data segment for the groups function
-// (backtrack stack uses zero-initialised memory reserved at btTableBase).
+// When groups are needed, three functions are emitted:
+//   - find_internal (not exported): locates leftmost match start
+//   - capture_internal (not exported): Phase 1 DFA + Phase 2 NFA for captures
+//   - groups_wrapper (exported as groupsExport): calls find_internal then capture_internal
+//
+// captureDFAL is the Phase 1 DFA layout (LL match semantics, captures stripped).
 func genHybridWASMWithBacktrack(
 	t *dfaTable, dfaTableBase int64, matchExport, findExport string,
 	bt *backtrack, btTableBase int64, groupsExport string,
 	standalone bool, memPages int32, leftmostFirst bool, mandatoryLit *MandatoryLit,
+	captureDFAL *dfaLayout,
 ) []byte {
 	needFind := findExport != ""
 	needMatch := matchExport != ""
 	needGroups := bt != nil && groupsExport != ""
+	// For non-anchored groups the wrapper needs find_internal; for anchored groups it doesn't.
+	anchored := isAnchoredFind(t)
+	needFindInternal := needFind || (needGroups && !anchored)
 
-	l := buildDFALayout(t, dfaTableBase, needFind, leftmostFirst)
+	l := buildDFALayout(t, dfaTableBase, needFindInternal, leftmostFirst)
 
-	var out []byte
-	out = append(out, 0x00, 0x61, 0x73, 0x6D)
-	out = append(out, 0x01, 0x00, 0x00, 0x00)
-
-	// ── Type section ─────────────────────────────────────────────────────────
+	// Count types and functions
 	numTypes := 0
-	matchTypeIdx := -1
-	findTypeIdx := -1
-	groupsTypeIdx := -1
+	matchTypeIdx, findTypeIdx, groupsTypeIdx := -1, -1, -1
 	var ts []byte
 	if needMatch {
 		matchTypeIdx = numTypes
 		numTypes++
-		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F) // (i32,i32)→i32
+		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F)
 	}
-	if needFind {
+	if needFindInternal {
 		findTypeIdx = numTypes
 		numTypes++
-		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E) // (i32,i32)→i64
+		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E)
 	}
 	if needGroups {
 		groupsTypeIdx = numTypes
 		numTypes++
-		ts = append(ts, onePassTypeEntry()...) // (i32,i32,i32)→i32 — same signature
+		ts = append(ts, onePassTypeEntry()...)
 	}
-	out = appendSection(out, 1, append(utils.AppendULEB128(nil, uint32(numTypes)), ts...))
+	numDeclaredTypes := numTypes
 
-	// ── Import section ───────────────────────────────────────────────────────
+	// Functions: match?, find_internal?, capture_internal?, groups_wrapper?
+	numFuncs := numDeclaredTypes
+	captureInternalIdx := -1
+	if needGroups {
+		captureInternalIdx = numFuncs
+		numFuncs++ // capture_internal always added
+		if !anchored {
+			numFuncs++ // groups_wrapper only for non-anchored
+		}
+	}
+
+	var out []byte
+	out = append(out, 0x00, 0x61, 0x73, 0x6D)
+	out = append(out, 0x01, 0x00, 0x00, 0x00)
+	out = appendSection(out, 1, append(utils.AppendULEB128(nil, uint32(numDeclaredTypes)), ts...))
+
 	if !standalone {
 		var is []byte
 		is = append(is, 0x01)
@@ -1038,21 +1118,23 @@ func genHybridWASMWithBacktrack(
 		out = appendSection(out, 2, is)
 	}
 
-	// ── Function section ─────────────────────────────────────────────────────
+	// Function section
 	var fs []byte
-	fs = utils.AppendULEB128(fs, uint32(numTypes))
+	fs = utils.AppendULEB128(fs, uint32(numFuncs))
 	if needMatch {
 		fs = utils.AppendULEB128(fs, uint32(matchTypeIdx))
 	}
-	if needFind {
+	if needFindInternal {
 		fs = utils.AppendULEB128(fs, uint32(findTypeIdx))
 	}
 	if needGroups {
-		fs = utils.AppendULEB128(fs, uint32(groupsTypeIdx))
+		fs = utils.AppendULEB128(fs, uint32(groupsTypeIdx)) // captureInternal
+		if !anchored {
+			fs = utils.AppendULEB128(fs, uint32(groupsTypeIdx)) // groupsWrapper
+		}
 	}
 	out = appendSection(out, 3, fs)
 
-	// ── Memory section (standalone only) ─────────────────────────────────────
 	if standalone {
 		var ms []byte
 		ms = append(ms, 0x01, 0x00)
@@ -1060,10 +1142,19 @@ func genHybridWASMWithBacktrack(
 		out = appendSection(out, 5, ms)
 	}
 
-	// ── Export section ───────────────────────────────────────────────────────
-	numExports := numTypes
+	// Export section
+	numExports := 0
 	if standalone {
-		numExports++ // memory
+		numExports++
+	}
+	if needMatch {
+		numExports++
+	}
+	if needFind {
+		numExports++
+	}
+	if needGroups {
+		numExports++
 	}
 	var es []byte
 	es = utils.AppendULEB128(es, uint32(numExports))
@@ -1072,34 +1163,64 @@ func genHybridWASMWithBacktrack(
 		es = append(es, 0x02)
 		es = utils.AppendULEB128(es, 0x00)
 	}
-	funcIdx := 0
+	fIdx := 0
 	if needMatch {
 		es = appendString(es, matchExport)
 		es = append(es, 0x00)
-		es = utils.AppendULEB128(es, uint32(funcIdx))
-		funcIdx++
+		es = utils.AppendULEB128(es, uint32(fIdx))
+		fIdx++
 	}
-	if needFind {
-		es = appendString(es, findExport)
-		es = append(es, 0x00)
-		es = utils.AppendULEB128(es, uint32(funcIdx))
-		funcIdx++
+	if needFindInternal {
+		if needFind {
+			es = appendString(es, findExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(fIdx))
+		}
+		fIdx++
 	}
 	if needGroups {
-		es = append(es, btExportEntry(groupsExport, funcIdx)...)
+		if anchored {
+			// Anchored: export capture_internal directly (same as before).
+			es = append(es, btExportEntry(groupsExport, fIdx)...)
+			fIdx++
+		} else {
+			// Non-anchored: capture_internal is internal; export wrapper.
+			fIdx++ // skip captureInternal
+			es = append(es, btExportEntry(groupsExport, fIdx)...)
+			fIdx++
+		}
 	}
 	out = appendSection(out, 7, es)
 
-	// ── Code section ─────────────────────────────────────────────────────────
+	// Find function index for wrapper
+	findFuncIdx := -1
+	{
+		cf := 0
+		if needMatch {
+			cf++
+		}
+		if needFindInternal {
+			findFuncIdx = cf
+			cf++
+		}
+		_ = cf
+	}
+
+	// Code section
 	var cs []byte
-	cs = utils.AppendULEB128(cs, uint32(numTypes))
+	cs = utils.AppendULEB128(cs, uint32(numFuncs))
 	if needMatch {
 		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept, l.rowMapOff, l.useRowDedup)
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
-	if needFind {
-		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit, l.rowMapOff, l.useRowDedup)
+	if needFindInternal {
+		var body []byte
+		if isAnchoredFind(t) {
+			body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.rowMapOff, l.useRowDedup)
+		} else {
+			body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0, mandatoryLit, l.rowMapOff, l.useRowDedup)
+		}
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
@@ -1111,15 +1232,29 @@ func genHybridWASMWithBacktrack(
 			maxFrames = 4096
 		}
 		btStackLimit := int32(btTableBase) + int32(maxFrames)*frameSize
-		btBody := buildBacktrackBody(bt, int32(btTableBase), btStackLimit, frameSize, l)
-		cs = utils.AppendULEB128(cs, uint32(len(btBody)))
-		cs = append(cs, btBody...)
+		// capture_internal uses captureDFAL (separate LL match DFA)
+		capBody := buildBacktrackBody(bt, int32(btTableBase), btStackLimit, frameSize, captureDFAL)
+		cs = utils.AppendULEB128(cs, uint32(len(capBody)))
+		cs = append(cs, capBody...)
+		if !anchored {
+			// groups_wrapper only for non-anchored patterns
+			wrapBody := buildGroupsWrapperBody(findFuncIdx, captureInternalIdx, bt.numGroups, false)
+			cs = utils.AppendULEB128(cs, uint32(len(wrapBody)))
+			cs = append(cs, wrapBody...)
+		}
 	}
 	out = appendSection(out, 10, cs)
 
-	// ── Data section ─────────────────────────────────────────────────────────
-	// DFA data segments only — backtrack stack uses zero-initialised memory.
-	out = appendSection(out, 11, dfaDataSegments(l, needFind))
+	// Data section: main DFA tables + capture DFA tables
+	dfaDS := dfaDataSegments(l, needFindInternal)
+	if needGroups && captureDFAL != nil {
+		capDS := dfaDataSegments(captureDFAL, false)
+		dfaDS[0] += capDS[0]
+		dfaDS = append(dfaDS, capDS[1:]...)
+	}
+	out = appendSection(out, 11, dfaDS)
 
 	return out
 }
+
+

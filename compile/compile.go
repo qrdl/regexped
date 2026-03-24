@@ -252,9 +252,11 @@ func compileDualDFA(pattern, matchName, findName string, tableBase int64) ([]byt
 }
 
 // compileHybrid compiles a pattern to a WASM module combining DFA (match and/or
-// find) with OnePass (groups), all sharing one memory.
+// find) with OnePass or Backtracking (groups), all sharing one memory.
+// Groups are always non-anchored: find_internal locates the leftmost match start,
+// then capture_internal fills the capture slots.
 func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bool) ([]byte, int64, error) {
-	// Compile DFA (captures stripped).
+	// Compile LF find DFA (captures stripped) — always needed as find_internal for groups.
 	dfaOpts := CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, LeftmostFirst: true}
 	matcher, err := compile(re.Pattern, dfaOpts)
 	if err != nil {
@@ -265,31 +267,10 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 		return nil, 0, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, dfaOpts.MaxDFAStates)
 	}
 
-	// Estimate DFA data size (find mode superset).
-	numWASM := table.numStates + 1
-	var dfaSize int64
-	switch {
-	case numWASM <= 256 && numWASM*256 > 32*1024:
-		_, _, nc := computeByteClasses(table)
-		dfaSize = int64(256 + numWASM*nc + numWASM)
-	case numWASM <= 256:
-		dfaSize = int64(numWASM*256 + numWASM)
-	default:
-		dfaSize = int64(numWASM*256*2 + numWASM)
-	}
-	if needFind {
-		dfaSize += int64(numWASM) + 256 // midAccept + firstByte
-		if len(table.immediateAcceptStates) > 0 {
-			dfaSize += int64(numWASM)
-		}
-		if table.hasWordBoundary {
-			dfaSize += 256 + int64(numWASM)*2
-		}
-	} else {
-		if len(table.immediateAcceptStates) > 0 {
-			dfaSize += int64(numWASM)
-		}
-	}
+	// The find DFA is always needed internally (for groups wrapper) even if !needFind.
+	// Build the layout to get the exact tableEnd, then use that as the base for groups tables.
+	findDFAL := buildDFALayout(table, tableBase, true, true)
+	dfaSize := findDFAL.tableEnd - tableBase
 
 	// Compile groups function (OnePass preferred; backtrack fallback).
 	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
@@ -315,9 +296,9 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 	if isOnePass(prog) {
 		op := newOnePass(prog)
 		opTableBase := utils.PageAlign(tableBase + dfaSize)
-		opDataSize  := int64(op.numStates * 256)
-		tableEnd    := utils.PageAlign(opTableBase + opDataSize)
-		memPages    := int32(tableEnd / 65536)
+		opDataSize := int64(op.numStates * 256)
+		tableEnd := utils.PageAlign(opTableBase + opDataSize)
+		memPages := int32(tableEnd / 65536)
 		wasmBytes := genHybridWASM(table, tableBase, matchExport, findExport,
 			op, opTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst, mandatoryLit)
 		return wasmBytes, tableEnd, nil
@@ -325,20 +306,39 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 
 	// Not one-pass: use backtracking engine for groups function.
 	bt := newBacktrack(prog)
-	btTableBase := utils.PageAlign(tableBase + dfaSize)
+
+	// Compile Phase 1 DFA (LL match mode) for capture_internal.
+	reStripped2, err2 := syntax.Parse(re.Pattern, syntax.Perl)
+	if err2 != nil {
+		return nil, 0, fmt.Errorf("parse stripped: %w", err2)
+	}
+	stripCaptures(reStripped2)
+	progStripped2, err2 := syntax.Compile(reStripped2.Simplify())
+	if err2 != nil {
+		return nil, 0, fmt.Errorf("compile stripped: %w", err2)
+	}
+	p1TableBase := utils.PageAlign(tableBase + dfaSize)
+	captureDFAL := compileDFAForBacktrack(progStripped2, p1TableBase)
+
+	btTableBase := utils.PageAlign(captureDFAL.tableEnd)
 	numCapLocals := bt.numGroups * 2
 	frameSize := 4 + numCapLocals*4 + 4
-	stackSize := (bt.numAlts + 2) * frameSize
+	maxFrames := bt.numAlts * 4096
+	if maxFrames < 4096 {
+		maxFrames = 4096
+	}
+	stackSize := maxFrames * frameSize
 	tableEnd := utils.PageAlign(btTableBase + int64(stackSize))
 	memPages := int32(tableEnd / 65536)
 	wasmBytes := genHybridWASMWithBacktrack(table, tableBase, matchExport, findExport,
-		bt, btTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst, mandatoryLit)
+		bt, btTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst, mandatoryLit, captureDFAL)
 	return wasmBytes, tableEnd, nil
 }
 
 // CompileOnePassGroups compiles a pattern to a OnePass WASM module exporting
-// a groups function: (ptr i32, len i32, out_ptr i32) → i32.
-// If the pattern does not qualify for OnePass, returns an error.
+// a non-anchored groups function: (ptr i32, len i32, out_ptr i32) → i32.
+// The module contains find_internal (LF DFA find), capture_internal (OnePass body),
+// and a groups_exported wrapper. If the pattern does not qualify for OnePass, returns an error.
 func CompileOnePassGroups(pattern, exportName string, tableBase int64, standalone bool) ([]byte, int64, error) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -357,12 +357,25 @@ func CompileOnePassGroups(pattern, exportName string, tableBase int64, standalon
 
 	op := newOnePass(prog)
 
-	// Data section: transition table (numStates * 256 bytes).
-	dataSize := int64(op.numStates * 256)
-	tableEnd := utils.PageAlign(tableBase + dataSize)
+	// Find DFA — only needed for non-anchored patterns.
+	reStripped, _ := syntax.Parse(pattern, syntax.Perl)
+	stripCaptures(reStripped)
+	progStripped, _ := syntax.Compile(reStripped.Simplify())
+	dFind := newDFA(progStripped, false, true) // leftmostFirst=true
+	tFind := dfaTableFrom(dFind)
+
+	var findDFAL *dfaLayout
+	opTableBase := tableBase
+	if !isAnchoredFind(tFind) {
+		findDFAL = buildDFALayout(tFind, tableBase, true, true)
+		opTableBase = utils.PageAlign(findDFAL.tableEnd)
+	}
+
+	opDataSize := int64(op.numStates * 256)
+	tableEnd := utils.PageAlign(opTableBase + opDataSize)
 	memPages := int32(tableEnd / 65536)
 
-	wasmBytes := genOnePassWASM(op, tableBase, exportName, standalone, memPages)
+	wasmBytes := genOnePassWASM(op, opTableBase, exportName, standalone, memPages, findDFAL)
 	return wasmBytes, tableEnd, nil
 }
 

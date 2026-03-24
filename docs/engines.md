@@ -103,11 +103,19 @@ This ensures non-greedy outer quantifiers like `(a*)*?` produce the same result 
 
 **Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns -1 (no match) rather than corrupting memory. This caps catastrophic backtracking on adversarial inputs.
 
+**No memoization needed:** the hybrid approach means Phase 2 NFA only runs over the short region `[0, E]` confirmed by Phase 1 DFA. Patterns that would cause exponential backtracking (e.g. `(a+)+`) have their extent bounded by the DFA in O(n), so the NFA never processes the full input. Memoization would only matter if Phase 2 backtracks exponentially within `[0, E]` — in practice this does not occur because E is tight.
+
 ---
 
 ## Hybrid Modules
 
 When a config entry sets both `match_func`/`find_func` AND `groups_func`/`named_groups_func`, a single WASM module is generated containing both a DFA function (match and/or find) and a groups function (OnePass or Backtracking depending on the pattern), sharing the same memory region.
+
+---
+
+## Semantics
+
+Regexped implements **RE2 syntax with Perl/RE2 semantics** (leftmost-first match, non-greedy quantifiers prefer shorter matches). POSIX semantics (leftmost-longest) are not supported.
 
 ---
 

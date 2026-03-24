@@ -956,6 +956,9 @@ type dfaLayout struct {
 	wasmMidStartWord uint32
 	wasmPrefixEnd    uint32
 	startBeginAccept bool
+
+	// tableEnd is the highest memory address used by any table in this layout.
+	tableEnd int64
 }
 
 // buildDFALayout computes all DFA table data and offsets. needFind must be true
@@ -1238,6 +1241,37 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool) 
 		l.startBeginAccept = t.startBeginAccept
 	}
 
+	// Compute tableEnd: highest memory address used by any table.
+	tableEnd := int64(l.acceptOff) + int64(l.numWASM)
+	maxEnd := func(off int32, size int64) {
+		if e := int64(off) + size; e > tableEnd {
+			tableEnd = e
+		}
+	}
+	if l.hasImmAccept {
+		maxEnd(l.immediateAcceptOff, int64(l.numWASM))
+	}
+	if needFind {
+		maxEnd(l.midAcceptOff, int64(l.numWASM))
+		if l.needWordCharTable {
+			maxEnd(l.midAcceptNWOff, int64(l.numWASM))
+			maxEnd(l.midAcceptWOff, int64(l.numWASM))
+		}
+		if len(l.prefix) == 0 {
+			maxEnd(l.firstByteOff, 256)
+			if len(l.teddyLoBytes) > 0 {
+				maxEnd(l.teddyHiOff, 16)
+				if len(l.teddyT1LoBytes) > 0 {
+					maxEnd(l.teddyT1HiOff, 16)
+					if len(l.teddyT2LoBytes) > 0 {
+						maxEnd(l.teddyT2HiOff, 16)
+					}
+				}
+			}
+		}
+	}
+	l.tableEnd = tableEnd
+
 	return l
 }
 
@@ -1497,10 +1531,12 @@ func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, stand
 	return out
 }
 
-// genHybridWASM generates a single WASM module containing up to three functions:
+// genHybridWASM generates a single WASM module containing up to five functions:
 //   - matchExport: DFA anchored match (i32,i32)→i32  — omitted if ""
-//   - findExport:  DFA non-anchored find (i32,i32)→i64 — omitted if ""
-//   - groupsExport: OnePass anchored groups (i32,i32,i32)→i32 — omitted if op==nil
+//   - findExport:  DFA non-anchored find (i32,i32)→i64 — omitted if "" (but always emitted internally when groups needed)
+//   - find_internal: not exported, locates leftmost match start — only when needGroups and !needFind
+//   - capture_internal: not exported, OnePass body for anchored capture
+//   - groups_exported: exported as groupsExport, wrapper calling find_internal then capture_internal
 //
 // DFA tables are placed at dfaTableBase; OnePass table at opTableBase.
 // Both share a single memory.
@@ -1512,15 +1548,17 @@ func genHybridWASM(
 	needFind := findExport != ""
 	needMatch := matchExport != ""
 	needGroups := op != nil && groupsExport != ""
+	anchored := isAnchoredFind(t)
+	// needFindInternal: find function needed internally only for non-anchored groups.
+	needFindInternal := needFind || (needGroups && !anchored)
 
-	l := buildDFALayout(t, dfaTableBase, needFind, leftmostFirst)
+	l := buildDFALayout(t, dfaTableBase, needFindInternal, leftmostFirst)
 
 	var out []byte
 	out = append(out, 0x00, 0x61, 0x73, 0x6D)
 	out = append(out, 0x01, 0x00, 0x00, 0x00)
 
 	// ── Type section ─────────────────────────────────────────────────────────
-	// Assign type indices in the order: match, find, groups.
 	numTypes := 0
 	matchTypeIdx := -1
 	findTypeIdx := -1
@@ -1531,7 +1569,7 @@ func genHybridWASM(
 		numTypes++
 		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F) // (i32,i32)→i32
 	}
-	if needFind {
+	if needFindInternal {
 		findTypeIdx = numTypes
 		numTypes++
 		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E) // (i32,i32)→i64
@@ -1539,9 +1577,21 @@ func genHybridWASM(
 	if needGroups {
 		groupsTypeIdx = numTypes
 		numTypes++
-		ts = append(ts, onePassTypeEntry()...)                 // (i32,i32,i32)→i32
+		ts = append(ts, onePassTypeEntry()...) // (i32,i32,i32)→i32
 	}
-	out = appendSection(out, 1, append(utils.AppendULEB128(nil, uint32(numTypes)), ts...))
+	// Total declared types
+	numDeclaredTypes := numTypes
+
+	// ── Count functions (may exceed numDeclaredTypes due to shared types) ──────
+	numFuncs := numTypes
+	if needGroups {
+		numFuncs++ // capture_internal
+		if !anchored {
+			numFuncs++ // groups_wrapper only for non-anchored
+		}
+	}
+
+	out = appendSection(out, 1, append(utils.AppendULEB128(nil, uint32(numDeclaredTypes)), ts...))
 
 	// ── Import section ───────────────────────────────────────────────────────
 	if !standalone {
@@ -1556,15 +1606,18 @@ func genHybridWASM(
 
 	// ── Function section ─────────────────────────────────────────────────────
 	var fs []byte
-	fs = utils.AppendULEB128(fs, uint32(numTypes))
+	fs = utils.AppendULEB128(fs, uint32(numFuncs))
 	if needMatch {
 		fs = utils.AppendULEB128(fs, uint32(matchTypeIdx))
 	}
-	if needFind {
+	if needFindInternal {
 		fs = utils.AppendULEB128(fs, uint32(findTypeIdx))
 	}
 	if needGroups {
-		fs = utils.AppendULEB128(fs, uint32(groupsTypeIdx))
+		fs = utils.AppendULEB128(fs, uint32(groupsTypeIdx)) // capture_internal
+		if !anchored {
+			fs = utils.AppendULEB128(fs, uint32(groupsTypeIdx)) // groups_wrapper
+		}
 	}
 	out = appendSection(out, 3, fs)
 
@@ -1577,9 +1630,19 @@ func genHybridWASM(
 	}
 
 	// ── Export section ───────────────────────────────────────────────────────
-	numExports := numTypes
+	// Count only publicly exported entries.
+	numExports := 0
 	if standalone {
 		numExports++ // memory
+	}
+	if needMatch {
+		numExports++
+	}
+	if needFind {
+		numExports++ // only if user asked for find export
+	}
+	if needGroups {
+		numExports++ // capture_internal (anchored) or groups_wrapper (non-anchored)
 	}
 	var es []byte
 	es = utils.AppendULEB128(es, uint32(numExports))
@@ -1595,26 +1658,49 @@ func genHybridWASM(
 		es = utils.AppendULEB128(es, uint32(funcIdx))
 		funcIdx++
 	}
-	if needFind {
-		es = appendString(es, findExport)
-		es = append(es, 0x00)
-		es = utils.AppendULEB128(es, uint32(funcIdx))
-		funcIdx++
+	if needFindInternal {
+		if needFind {
+			es = appendString(es, findExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(funcIdx))
+		}
+		funcIdx++ // advance past find (whether exported or not)
 	}
 	if needGroups {
-		es = append(es, onePassExportEntry(groupsExport, funcIdx)...)
+		if anchored {
+			// Anchored: export capture_internal directly.
+			es = append(es, onePassExportEntry(groupsExport, funcIdx)...)
+			funcIdx++
+		} else {
+			// Non-anchored: capture_internal is internal; export wrapper.
+			funcIdx++ // skip captureInternal
+			es = append(es, onePassExportEntry(groupsExport, funcIdx)...)
+			funcIdx++
+		}
 	}
 	out = appendSection(out, 7, es)
 
 	// ── Code section ─────────────────────────────────────────────────────────
+	// findFuncIdx: index of find_internal in the function table
+	findFuncIdx := -1
+	cf := 0
+	if needMatch {
+		cf++
+	}
+	if needFindInternal {
+		findFuncIdx = cf
+		cf++
+	}
+	capFuncIdx := cf // captureInternal
+
 	var cs []byte
-	cs = utils.AppendULEB128(cs, uint32(numTypes))
+	cs = utils.AppendULEB128(cs, uint32(numFuncs))
 	if needMatch {
 		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept, l.rowMapOff, l.useRowDedup)
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
-	if needFind {
+	if needFindInternal {
 		var body []byte
 		if isAnchoredFind(t) {
 			body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.rowMapOff, l.useRowDedup)
@@ -1625,21 +1711,135 @@ func genHybridWASM(
 		cs = append(cs, body...)
 	}
 	if needGroups {
-		cs = append(cs, onePassCodeEntry(op, int32(opTableBase))...)
+		capBody := buildOnePassBody(op, int32(opTableBase))
+		cs = utils.AppendULEB128(cs, uint32(len(capBody)))
+		cs = append(cs, capBody...)
+		if !anchored {
+			wrapBody := buildGroupsWrapperBody(findFuncIdx, capFuncIdx, op.numGroups, true)
+			cs = utils.AppendULEB128(cs, uint32(len(wrapBody)))
+			cs = append(cs, wrapBody...)
+		}
 	}
 	out = appendSection(out, 10, cs)
 
 	// ── Data section ─────────────────────────────────────────────────────────
-	// DFA segments (count byte already included), then OnePass segment appended.
-	dfaDS := dfaDataSegments(l, needFind)
+	dfaDS := dfaDataSegments(l, needFindInternal)
 	if needGroups {
-		// Increment the count byte (first byte of dfaDS) by 1 for the OnePass segment.
 		dfaDS[0]++
 		dfaDS = append(dfaDS, onePassDataEntry(op, opTableBase)...)
 	}
 	out = appendSection(out, 11, dfaDS)
 
 	return out
+}
+
+// buildGroupsWrapperBody emits the WASM body for the exported groups wrapper function.
+//
+// Signature: (ptr i32, len i32, out_ptr i32) → i32
+//
+// The wrapper:
+//  1. Calls find_internal(ptr, len) → i64; if -1, returns -1.
+//  2. Extracts start = high-32 of result, end_LF = low-32 of result.
+//  3. Calls capture_internal(ptr+start, end_LF-start, out_ptr).
+//     Both OnePass and Backtracking receive the exact LF match extent.
+//     Phase 1 LL DFA inside capture_internal finds the LL extent within that slice.
+//  4. If capture returns -1, returns -1.
+//  5. Adds start to every non-negative slot in out_ptr.
+//  6. Returns captureResult + start (absolute end position).
+//
+// isOnePass is retained for caller documentation but no longer affects code generation.
+//
+// Locals (after 3 i32 params):
+//
+//	3: startLocal  (i32)
+//	4: captureResult (i32)
+//	5: slotScratch  (i32)
+//	6: findResult   (i64)
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups int, isOnePass bool) []byte {
+	var b []byte
+
+	// Local declarations: 3 × i32, 1 × i64
+	b = append(b, 0x02)       // 2 declaration groups
+	b = append(b, 0x03, 0x7F) // 3 × i32  (startLocal=3, captureResult=4, slotScratch=5)
+	b = append(b, 0x01, 0x7E) // 1 × i64  (findResult=6)
+
+	// call find_internal(ptr, len) → i64
+	b = append(b, 0x20, 0x00) // local.get ptr (param 0)
+	b = append(b, 0x20, 0x01) // local.get len (param 1)
+	b = append(b, 0x10)       // call
+	b = utils.AppendULEB128(b, uint32(findFuncIdx))
+
+	// local.tee findResult(6), compare with -1
+	b = append(b, 0x22, 0x06) // local.tee findResult (i64 local)
+	b = append(b, 0x42, 0x7F) // i64.const -1
+	b = append(b, 0x51)       // i64.eq → i32
+	b = append(b, 0x04, 0x7F) // if (result i32)
+	b = append(b, 0x41, 0x7F) // i32.const -1  [no match branch]
+	b = append(b, 0x05)       // else
+
+	// Extract start = (findResult >> 32) as i32
+	b = append(b, 0x20, 0x06) // local.get findResult
+	b = append(b, 0x42, 0x20) // i64.const 32
+	b = append(b, 0x88)       // i64.shr_u
+	b = append(b, 0xA7)       // i32.wrap_i64
+	b = append(b, 0x21, 0x03) // local.set startLocal(3)
+
+	// Build call to capture_internal(ptr+start, captureLen, out_ptr)
+	// ptr + start
+	b = append(b, 0x20, 0x00) // local.get ptr
+	b = append(b, 0x20, 0x03) // local.get startLocal
+	b = append(b, 0x6A)       // i32.add
+
+	// captureLen = end_LF - start (both OnePass and Backtracking)
+	b = append(b, 0x20, 0x06) // local.get findResult
+	b = append(b, 0xA7)       // i32.wrap_i64 → end_LF (low 32 bits)
+	b = append(b, 0x20, 0x03) // local.get startLocal
+	b = append(b, 0x6B)       // i32.sub
+
+	b = append(b, 0x20, 0x02) // local.get out_ptr
+	b = append(b, 0x10)       // call
+	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
+	b = append(b, 0x22, 0x04) // local.tee captureResult(4)
+
+	// if captureResult == -1: return -1
+	b = append(b, 0x41, 0x7F) // i32.const -1
+	b = append(b, 0x46)       // i32.eq
+	b = append(b, 0x04, 0x7F) // if (result i32)
+	b = append(b, 0x41, 0x7F) // i32.const -1
+	b = append(b, 0x05)       // else
+
+	// Adjust slots: slot[i] += startLocal for each i in [0, numGroups*2)
+	for i := 0; i < numGroups*2; i++ {
+		offset := uint32(i * 4)
+
+		// load slot[i]
+		b = append(b, 0x20, 0x02)   // local.get out_ptr
+		b = append(b, 0x28, 0x02)   // i32.load align=2
+		b = utils.AppendULEB128(b, offset)
+		b = append(b, 0x22, 0x05) // local.tee slotScratch(5)
+
+		// if slot >= 0: store slot + start back
+		b = append(b, 0x41, 0x00) // i32.const 0
+		b = append(b, 0x4E)       // i32.ge_s
+		b = append(b, 0x04, 0x40) // if void
+		b = append(b, 0x20, 0x02) // local.get out_ptr
+		b = append(b, 0x20, 0x05) // local.get slotScratch
+		b = append(b, 0x20, 0x03) // local.get startLocal
+		b = append(b, 0x6A)       // i32.add
+		b = append(b, 0x36, 0x02) // i32.store align=2
+		b = utils.AppendULEB128(b, offset)
+		b = append(b, 0x0B) // end if
+	}
+
+	// return captureResult + startLocal
+	b = append(b, 0x20, 0x04) // local.get captureResult
+	b = append(b, 0x20, 0x03) // local.get startLocal
+	b = append(b, 0x6A)       // i32.add
+
+	b = append(b, 0x0B) // end if (captureResult == -1)
+	b = append(b, 0x0B) // end if (find == -1)
+	b = append(b, 0x0B) // end function
+	return b
 }
 
 // buildMatchBody returns the WASM function body bytes (locals + instructions + end).

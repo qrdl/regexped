@@ -293,59 +293,100 @@ func onePassDataEntry(op *onePass, tableBase int64) []byte {
 	return appendDataSegment(b, int32(tableBase), op.transitions)
 }
 
-// genOnePassWASM generates a WASM module exporting a "groups" function:
+// genOnePassWASM generates a WASM module exporting a groups function.
 //
-//	(ptr: i32, len: i32, out_ptr: i32) → i32
+// When findDFAL is nil: emits a single anchored groups function (1 function).
 //
-// The function writes numGroups×2 i32 values to out_ptr:
+// When findDFAL is non-nil: emits three functions:
 //
-//	[start0, end0, start1, end1, ...]
-//
-// Unmatched groups have start=end=-1. Returns end position of match or -1.
-func genOnePassWASM(op *onePass, tableBase int64, exportName string, standalone bool, memPages int32) []byte {
+//	func 0: find_internal (i32,i32)→i64       — not exported, LF DFA find
+//	func 1: capture_internal (i32,i32,i32)→i32 — not exported, OnePass body
+//	func 2: groups_exported (i32,i32,i32)→i32  — exported as exportName
+func genOnePassWASM(op *onePass, tableBase int64, exportName string, standalone bool, memPages int32, findDFAL *dfaLayout) []byte {
 	transOff := int32(tableBase)
 
-	// Type section: 1 type
-	var typeContent []byte
-	typeContent = append(typeContent, 0x01) // count
-	typeContent = append(typeContent, onePassTypeEntry()...)
+	var typeContent, funcContent, exportContent, codeContent, dataContent []byte
 
-	// Function section: 1 function, type index 0
-	funcContent := []byte{0x01, 0x00}
+	if findDFAL != nil {
+		// 3-function module.
+		typeContent = []byte{
+			0x02,
+			0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E,      // type 0: (i32,i32)→i64
+			0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 1: (i32,i32,i32)→i32
+		}
+		funcContent = []byte{0x03, 0x00, 0x01, 0x01}
 
-	// Export section
-	var exportContent []byte
-	if standalone {
-		exportContent = append(exportContent, 0x02) // 2 exports: func + memory
-		exportContent = append(exportContent, onePassExportEntry(exportName, 0)...)
-		exportContent = appendString(exportContent, "memory")
-		exportContent = append(exportContent, 0x02, 0x00) // memory kind, index 0
+		numExports := byte(1)
+		if standalone {
+			numExports = 2
+		}
+		exportContent = append(exportContent, numExports)
+		exportContent = append(exportContent, onePassExportEntry(exportName, 2)...)
+		if standalone {
+			exportContent = appendString(exportContent, "memory")
+			exportContent = append(exportContent, 0x02, 0x00)
+		}
+
+		findBody := buildFindBody(
+			findDFAL.wasmStart, findDFAL.wasmMidStart, findDFAL.wasmMidStartWord,
+			findDFAL.wasmPrefixEnd, findDFAL.tableOff, findDFAL.acceptOff, findDFAL.midAcceptOff,
+			findDFAL.firstByteOff, findDFAL.prefix, findDFAL.classMapOff, findDFAL.numClasses,
+			findDFAL.useU8, findDFAL.useCompression, findDFAL.startBeginAccept,
+			findDFAL.immediateAcceptOff, findDFAL.hasImmAccept,
+			findDFAL.wordCharTableOff, findDFAL.needWordCharTable,
+			findDFAL.midAcceptNWOff, findDFAL.midAcceptWOff,
+			findDFAL.firstByteFlags, findDFAL.firstBytes,
+			findDFAL.teddyLoOff, findDFAL.teddyHiOff,
+			findDFAL.teddyT1LoOff, findDFAL.teddyT1HiOff, len(findDFAL.teddyT1LoBytes) > 0,
+			findDFAL.teddyT2LoOff, findDFAL.teddyT2HiOff, len(findDFAL.teddyT2LoBytes) > 0,
+			nil, findDFAL.rowMapOff, findDFAL.useRowDedup)
+		capBody := buildOnePassBody(op, transOff)
+		wrapBody := buildGroupsWrapperBody(0, 1, op.numGroups, true)
+
+		var fe, ce, we []byte
+		fe = utils.AppendULEB128(fe, uint32(len(findBody))); fe = append(fe, findBody...)
+		ce = utils.AppendULEB128(ce, uint32(len(capBody))); ce = append(ce, capBody...)
+		we = utils.AppendULEB128(we, uint32(len(wrapBody))); we = append(we, wrapBody...)
+		codeContent = append(append(append([]byte{0x03}, fe...), ce...), we...)
+
+		// Data: find DFA tables + OnePass transition table.
+		findDS := dfaDataSegments(findDFAL, true)
+		findDS[0]++
+		findDS = append(findDS, onePassDataEntry(op, tableBase)...)
+		dataContent = findDS
 	} else {
-		exportContent = append(exportContent, 0x01) // 1 export: func only
-		exportContent = append(exportContent, onePassExportEntry(exportName, 0)...)
+		// 1-function module: anchored groups only.
+		typeContent = append(typeContent, 0x01)
+		typeContent = append(typeContent, onePassTypeEntry()...)
+		funcContent = []byte{0x01, 0x00}
+
+		if standalone {
+			exportContent = append(exportContent, 0x02)
+			exportContent = append(exportContent, onePassExportEntry(exportName, 0)...)
+			exportContent = appendString(exportContent, "memory")
+			exportContent = append(exportContent, 0x02, 0x00)
+		} else {
+			exportContent = append(exportContent, 0x01)
+			exportContent = append(exportContent, onePassExportEntry(exportName, 0)...)
+		}
+
+		codeContent = append([]byte{0x01}, onePassCodeEntry(op, transOff)...)
+		dataContent = append([]byte{0x01}, onePassDataEntry(op, tableBase)...)
 	}
 
-	// Code section: 1 body
-	codeEntry := onePassCodeEntry(op, transOff)
-	codeContent := append([]byte{0x01}, codeEntry...)
-
-	// Data section: 1 segment
-	dataContent := append([]byte{0x01}, onePassDataEntry(op, tableBase)...)
-
 	var out []byte
-	out = append(out, 0x00, 0x61, 0x73, 0x6D) // magic
-	out = append(out, 0x01, 0x00, 0x00, 0x00) // version
-
+	out = append(out, 0x00, 0x61, 0x73, 0x6D)
+	out = append(out, 0x01, 0x00, 0x00, 0x00)
 	out = appendSection(out, 1, typeContent)
 
 	if !standalone {
 		var importContent []byte
-		importContent = append(importContent, 0x01) // 1 import
+		importContent = append(importContent, 0x01)
 		importContent = appendString(importContent, "main")
 		importContent = appendString(importContent, "memory")
-		importContent = append(importContent, 0x02)              // memory
-		importContent = append(importContent, 0x00)              // limit type: min only
-		importContent = utils.AppendULEB128(importContent, 0x00) // min 0 pages
+		importContent = append(importContent, 0x02)
+		importContent = append(importContent, 0x00)
+		importContent = utils.AppendULEB128(importContent, 0x00)
 		out = appendSection(out, 2, importContent)
 	}
 
@@ -353,7 +394,7 @@ func genOnePassWASM(op *onePass, tableBase int64, exportName string, standalone 
 
 	if standalone {
 		var memContent []byte
-		memContent = append(memContent, 0x01, 0x00) // 1 memory, no max
+		memContent = append(memContent, 0x01, 0x00)
 		memContent = utils.AppendULEB128(memContent, uint32(memPages))
 		out = appendSection(out, 5, memContent)
 	}
@@ -364,6 +405,7 @@ func genOnePassWASM(op *onePass, tableBase int64, exportName string, standalone 
 
 	return out
 }
+
 
 // buildOnePassBody emits the WASM function body.
 //
