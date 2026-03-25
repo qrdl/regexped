@@ -1582,13 +1582,12 @@ func genHybridWASM(
 	// Total declared types
 	numDeclaredTypes := numTypes
 
-	// ── Count functions (may exceed numDeclaredTypes due to shared types) ──────
+	// ── Count functions ──────────────────────────────────────────────────────
+	// captureInternal reuses the groupsTypeIdx slot already in numDeclaredTypes.
+	// Only the wrapper adds an extra function.
 	numFuncs := numTypes
-	if needGroups {
-		numFuncs++ // capture_internal
-		if !anchored {
-			numFuncs++ // groups_wrapper only for non-anchored
-		}
+	if needGroups && !anchored {
+		numFuncs++ // groups_wrapper is one extra beyond numDeclaredTypes
 	}
 
 	out = appendSection(out, 1, append(utils.AppendULEB128(nil, uint32(numDeclaredTypes)), ts...))
@@ -1696,7 +1695,7 @@ func genHybridWASM(
 	var cs []byte
 	cs = utils.AppendULEB128(cs, uint32(numFuncs))
 	if needMatch {
-		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept, l.rowMapOff, l.useRowDedup)
+		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, false, l.rowMapOff, l.useRowDedup)
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}

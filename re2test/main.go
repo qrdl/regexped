@@ -180,44 +180,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				input = append([]string(nil), testStrings...)
 				continue
 			}
-			if engineType == compile.EngineOnePass {
-				// Pattern qualifies for OnePass capture testing.
-				groupBytes, _, gErr := compile.CompileOnePassGroups(pattern, "groups", tableBase, true)
-				if gErr == nil {
-					groupsStore = wasmtime.NewStore(engine)
-						groupsStore.SetEpochDeadline(1)
-					if groupMod, gmErr := wasmtime.NewModule(engine, groupBytes); gmErr == nil {
-						if groupInst, giErr := wasmtime.NewInstance(groupsStore, groupMod, []wasmtime.AsExtern{}); giErr == nil {
-							groupsFn = groupInst.GetFunc(groupsStore, "groups")
-							if exp := groupInst.GetExport(groupsStore, "memory"); exp != nil {
-								groupsMemory = exp.Memory()
-							}
-							re2, _ := syntax.Parse(pattern, syntax.Perl)
-							numGroups = re2.MaxCap() + 1
-						}
-					}
-				}
-				// Fall through to DFA for match/find (captures stripped internally).
-			} else if engineType == compile.EngineBacktrack {
-				// Pattern requires backtracking for captures.
-				groupBytes, _, gErr := compile.CompileBacktrackGroups(pattern, "groups", tableBase, true)
-				if gErr == nil {
-					groupsStore = wasmtime.NewStore(engine)
-						groupsStore.SetEpochDeadline(1)
-					if groupMod, gmErr := wasmtime.NewModule(engine, groupBytes); gmErr == nil {
-						if groupInst, giErr := wasmtime.NewInstance(groupsStore, groupMod, []wasmtime.AsExtern{}); giErr == nil {
-							groupsFn = groupInst.GetFunc(groupsStore, "groups")
-							if exp := groupInst.GetExport(groupsStore, "memory"); exp != nil {
-								groupsMemory = exp.Memory()
-							}
-							re2, _ := syntax.Parse(pattern, syntax.Perl)
-							numGroups = re2.MaxCap() + 1
-							groupsIsBacktrack = true
-						}
-					}
-				}
-				// Fall through to DFA for match/find (captures stripped internally).
-			} else if engineType != compile.EngineDFA {
+			hybridDone := false
+			_ = hybridDone
+			/* EXPERIMENT: hybrid disabled, use pure DFA
+			if engineType == compile.EngineOnePass || engineType == compile.EngineBacktrack {
+				...
+			} else */ if engineType != compile.EngineDFA && engineType != compile.EngineOnePass && engineType != compile.EngineBacktrack {
 				skipCount["requires "+engineType.String()] += len(testStrings)
 				input = append([]string(nil), testStrings...)
 				continue

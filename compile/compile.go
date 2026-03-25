@@ -186,7 +186,7 @@ func compileRegexEntry(re config.RegexEntry, tableBase int64) ([]byte, int64, er
 
 	switch {
 	case needGroups && (needMatch || needFind):
-		return compileHybrid(re, tableBase, needMatch, needFind)
+		return compileHybrid(re, tableBase, needMatch, needFind, false)
 	case needGroups:
 		wasmBytes, tableEnd, err := CompileOnePassGroups(re.Pattern, re.GroupsExportName(), tableBase, false)
 		if err == nil {
@@ -255,7 +255,20 @@ func compileDualDFA(pattern, matchName, findName string, tableBase int64) ([]byt
 // find) with OnePass or Backtracking (groups), all sharing one memory.
 // Groups are always non-anchored: find_internal locates the leftmost match start,
 // then capture_internal fills the capture slots.
-func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bool) ([]byte, int64, error) {
+// CompileHybridModule compiles a pattern to a single hybrid WASM module containing
+// match, find, and groups functions sharing one memory region. Pass "" to omit a function.
+// Use standalone=true for testing (module defines its own memory).
+func CompileHybridModule(pattern, matchExport, findExport, groupsExport string, tableBase int64, standalone bool) ([]byte, int64, error) {
+	re := config.RegexEntry{
+		Pattern:    pattern,
+		MatchFunc:  matchExport,
+		FindFunc:   findExport,
+		GroupsFunc: groupsExport,
+	}
+	return compileHybrid(re, tableBase, matchExport != "", findExport != "", standalone)
+}
+
+func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bool, standalone bool) ([]byte, int64, error) {
 	// Compile LF find DFA (captures stripped) — always needed as find_internal for groups.
 	dfaOpts := CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, LeftmostFirst: true}
 	matcher, err := compile(re.Pattern, dfaOpts)
@@ -293,14 +306,17 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 
 	mandatoryLit := FindMandatoryLit(re.Pattern)
 
-	if isOnePass(prog) {
+	// Use selectBestEngine (not bare isOnePass) so that nested/non-greedy quantifiers
+	// correctly route to Backtracking even when the pattern passes the isOnePass check.
+	groupsEngine := selectBestEngine(prog, prog.NumCap > 2, nil)
+	if groupsEngine == EngineOnePass {
 		op := newOnePass(prog)
 		opTableBase := utils.PageAlign(tableBase + dfaSize)
 		opDataSize := int64(op.numStates * 256)
 		tableEnd := utils.PageAlign(opTableBase + opDataSize)
 		memPages := int32(tableEnd / 65536)
 		wasmBytes := genHybridWASM(table, tableBase, matchExport, findExport,
-			op, opTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst, mandatoryLit)
+			op, opTableBase, re.GroupsExportName(), standalone, memPages, dfaOpts.LeftmostFirst, mandatoryLit)
 		return wasmBytes, tableEnd, nil
 	}
 
@@ -331,7 +347,7 @@ func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bo
 	tableEnd := utils.PageAlign(btTableBase + int64(stackSize))
 	memPages := int32(tableEnd / 65536)
 	wasmBytes := genHybridWASMWithBacktrack(table, tableBase, matchExport, findExport,
-		bt, btTableBase, re.GroupsExportName(), false, memPages, dfaOpts.LeftmostFirst, mandatoryLit, captureDFAL)
+		bt, btTableBase, re.GroupsExportName(), standalone, memPages, dfaOpts.LeftmostFirst, mandatoryLit, captureDFAL)
 	return wasmBytes, tableEnd, nil
 }
 

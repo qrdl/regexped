@@ -1126,14 +1126,15 @@ func genHybridWASMWithBacktrack(
 	}
 	numDeclaredTypes := numTypes
 
-	// Functions: match?, find_internal?, capture_internal?, groups_wrapper?
+	// Functions: match?, find_internal?, capture_internal (reuses groups type slot), groups_wrapper?
+	// captureInternal reuses the groupsTypeIdx slot already in numDeclaredTypes.
+	// Only the wrapper adds an extra function beyond numDeclaredTypes.
 	numFuncs := numDeclaredTypes
 	captureInternalIdx := -1
 	if needGroups {
-		captureInternalIdx = numFuncs
-		numFuncs++ // capture_internal always added
+		captureInternalIdx = numFuncs - 1 // reuses the last declared type slot (groupsTypeIdx)
 		if !anchored {
-			numFuncs++ // groups_wrapper only for non-anchored
+			numFuncs++ // groups_wrapper is one extra
 		}
 	}
 
@@ -1244,7 +1245,7 @@ func genHybridWASMWithBacktrack(
 	var cs []byte
 	cs = utils.AppendULEB128(cs, uint32(numFuncs))
 	if needMatch {
-		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept, l.rowMapOff, l.useRowDedup)
+		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, false, l.rowMapOff, l.useRowDedup)
 		cs = utils.AppendULEB128(cs, uint32(len(body)))
 		cs = append(cs, body...)
 	}
