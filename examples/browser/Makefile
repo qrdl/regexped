@@ -2,7 +2,7 @@
 REGEXPED    := ../../regexped
 WASM_MERGE  := ../../../binaryen/bin/wasm-merge
 MAIN_WASM   := main.wasm
-REGEX_WASMS := email.wasm url.wasm
+REGEX_WASMS := regexps.wasm
 FINAL_WASM  := final.wasm
 JS_STUB     := regex.js
 

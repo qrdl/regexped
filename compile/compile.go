@@ -69,38 +69,444 @@ type CompileOptions struct {
 	LeftmostFirst      bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 }
 
-// CmdCompile compiles all regex patterns from cfg to WASM modules.
-// wasmInput is a pre-built WASM file used to determine where in memory
-// to place the DFA tables.
-func CmdCompile(cfg config.BuildConfig, wasmInput, outDir string) error {
+// compiledPattern holds the intermediate compilation result for one RegexEntry.
+// All function bodies are size-prefixed (ready for the WASM code section).
+type compiledPattern struct {
+	matchBody   []byte // (i32,i32)→i32; nil if not requested
+	findBody    []byte // (i32,i32)→i64; nil if not needed; exported or internal
+	captureBody []byte // (i32,i32,i32)→i32; nil if no groups; always internal
+
+	matchExport       string // empty = not exported
+	findExport        string // empty = internal-only (for wrapper use)
+	groupsExport      string
+	namedGroupsExport string
+
+	anchored   bool     // true = pattern anchored at 0; no wrapper needed
+	numGroups  int      // capture group count (for wrapper slot adjustment)
+	isOnePass  bool     // true = OnePass capture; false = Backtracking
+	groupNames []string // groupNames[i] = name for group i+1; "" = unnamed
+
+	dataSegCount int   // number of data segments in dataBytes
+	dataBytes    []byte // raw data segments (no count prefix)
+
+	tableEnd int64
+}
+
+// funcCount returns the number of WASM functions this pattern contributes.
+func (p *compiledPattern) funcCount() int {
+	n := 0
+	if p.matchBody != nil { n++ }
+	if p.findBody != nil  { n++ }
+	if p.captureBody != nil {
+		n++ // capture_internal
+		if !p.anchored            { n++ } // groups_wrapper
+		if p.namedGroupsExport != "" { n++ } // named_groups_wrapper
+	}
+	return n
+}
+
+// offsets returns the sub-indices of each function within this pattern.
+// Returns -1 for absent functions.
+func (p *compiledPattern) offsets() (matchOff, findOff, captureOff, wrapperOff, namedWrapperOff int) {
+	matchOff, findOff, captureOff, wrapperOff, namedWrapperOff = -1, -1, -1, -1, -1
+	idx := 0
+	if p.matchBody != nil      { matchOff = idx; idx++ }
+	if p.findBody != nil       { findOff = idx; idx++ }
+	if p.captureBody != nil    {
+		captureOff = idx; idx++
+		if !p.anchored              { wrapperOff = idx; idx++ }
+		if p.namedGroupsExport != "" { namedWrapperOff = idx; idx++ }
+	}
+	return
+}
+
+// stripSegCount strips the LEB128 count prefix from a data section payload,
+// returning the raw segment bytes and the count.
+func stripSegCount(data []byte) ([]byte, int) {
+	if len(data) == 0 { return nil, 0 }
+	count, n := utils.DecodeULEB128(data)
+	return data[n:], int(count)
+}
+
+// extractGroupNames returns the capture group names (1-indexed) from a parsed regexp.
+// groupNames[i] is the name of group i+1; empty string if unnamed.
+func extractGroupNames(re *syntax.Regexp) []string {
+	var names []string
+	var walk func(*syntax.Regexp)
+	walk = func(r *syntax.Regexp) {
+		if r.Op == syntax.OpCapture {
+			names = append(names, r.Name)
+		}
+		for _, sub := range r.Sub {
+			walk(sub)
+		}
+	}
+	walk(re)
+	return names
+}
+
+// compilePattern compiles one RegexEntry into an intermediate compiledPattern.
+// It does not build the final WASM module; call assembleModule for that.
+func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, error) {
+	needMatch  := re.MatchFunc != ""
+	needFind   := re.FindFunc != ""
+	needGroups := re.CaptureStubsRequested()
+
+	if !needMatch && !needFind && !needGroups {
+		return &compiledPattern{tableEnd: tableBase}, nil
+	}
+
+	const maxStates = 100000
+
+	// Match function uses LL (leftmostFirst=false): finds the longest full-string
+	// match from pos 0, matching RE2/Go anchored-match semantics.
+	// Find/groups use LF (leftmostFirst=true): leftmost-first Perl semantics.
+	// These require separate DFA compilations.
+
+	var matchBody   []byte
+	var matchData   []byte
+	var matchSegCnt int
+	var matchEnd    int64
+
+	cur := tableBase
+
+	if needMatch {
+		// Match uses LL (leftmostFirst=false): all NFA alternative paths are kept in each
+		// DFA state, so the DFA can find ANY path that consumes the full input string.
+		// LF would discard lower-priority alternatives after a higher-priority one matches,
+		// making full-string match fail for patterns like `a|aa` on "aa" (LF picks `a` at
+		// pos 0, loses the `aa` path, then can't reach the end of input).
+		// This matches Go stdlib semantics: regexp.MustCompile("^(a|aa)$").MatchString("aa") = true.
+		llOpts  := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: false}
+		llMatch, llErr := compile(re.Pattern, llOpts)
+		if llErr != nil { return nil, fmt.Errorf("compile match DFA: %w", llErr) }
+		llTable := dfaTableFrom(llMatch.(*dfa))
+		if llTable.numStates > maxStates {
+			return nil, fmt.Errorf("DFA has %d states, exceeds limit %d", llTable.numStates, maxStates)
+		}
+		lm := buildDFALayout(llTable, cur, false, false)
+		matchBody = appendMatchCodeEntry(nil, lm, lm.hasImmAccept)
+		rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
+		matchData   = rawM
+		matchSegCnt = cntM
+		matchEnd    = lm.tableEnd
+		cur         = utils.PageAlign(lm.tableEnd)
+	}
+
+	// LF DFA for find and/or groups.
+	opts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: true}
+	matcher, err := compile(re.Pattern, opts)
+	if err != nil {
+		return nil, fmt.Errorf("compile DFA: %w", err)
+	}
+	table := dfaTableFrom(matcher.(*dfa))
+	if table.numStates > maxStates {
+		return nil, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, maxStates)
+	}
+
+	anchored      := isAnchoredFind(table)
+	needFindBody  := needFind || (needGroups && !anchored)
+	l             := buildDFALayout(table, cur, needFindBody, true)
+	mandatoryLit  := FindMandatoryLit(re.Pattern)
+
+	p := &compiledPattern{
+		matchExport: re.MatchFunc,
+		findExport:  re.FindFunc,
+		anchored:    anchored,
+	}
+
+	if needMatch {
+		p.matchBody    = matchBody
+		p.dataBytes    = matchData
+		p.dataSegCount = matchSegCnt
+		if !needFind && !needGroups {
+			p.tableEnd = matchEnd
+			return p, nil
+		}
+	}
+
+	if needFindBody { p.findBody = appendFindCodeEntry(nil, l, table, mandatoryLit) }
+
+	rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))
+	p.dataBytes    = append(p.dataBytes, rawData...)
+	p.dataSegCount += segCount
+	p.tableEnd      = l.tableEnd
+
+	if !needGroups {
+		return p, nil
+	}
+
+	p.groupsExport      = re.GroupsFunc  // only set when groups_func explicitly requested
+	if re.NamedGroupsFunc != "" {
+		p.namedGroupsExport = re.NamedGroupsFunc
+	}
+
+	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
+	if err != nil { return nil, fmt.Errorf("parse error: %w", err) }
+	prog, err := syntax.Compile(parsed.Simplify())
+	if err != nil { return nil, fmt.Errorf("compile NFA: %w", err) }
+	if needsUnicodeSupport(prog) {
+		return nil, fmt.Errorf("pattern contains Unicode features not yet supported")
+	}
+
+	p.groupNames = extractGroupNames(parsed)
+	groupsEngine := selectBestEngine(prog, prog.NumCap > 2, nil)
+	p.isOnePass   = (groupsEngine == EngineOnePass)
+
+	if p.isOnePass {
+		op         := newOnePass(prog)
+		opBase     := utils.PageAlign(l.tableEnd)
+		p.numGroups = op.numGroups
+		p.captureBody = appendOnePassCodeEntry(nil, op, int32(opBase))
+		p.tableEnd  = utils.PageAlign(opBase + int64(op.numStates*256))
+		p.dataBytes  = append(p.dataBytes, onePassDataEntry(op, opBase)...)
+		p.dataSegCount++
+	} else {
+		bt := newBacktrack(prog)
+
+		reStripped, _ := syntax.Parse(re.Pattern, syntax.Perl)
+		stripCaptures(reStripped)
+		progStripped, _ := syntax.Compile(reStripped.Simplify())
+		captureDFABase := utils.PageAlign(l.tableEnd)
+		captureDFAL    := compileDFAForBacktrack(progStripped, captureDFABase)
+
+		btBase     := utils.PageAlign(captureDFAL.tableEnd)
+		numCapLocs := bt.numGroups * 2
+		frameSize  := 4 + numCapLocs*4 + 4
+		maxFrames  := bt.numAlts * 4096
+		if maxFrames < 4096 { maxFrames = 4096 }
+		stackSize  := maxFrames * frameSize
+		stackBase  := int32(btBase)
+		stackLimit := stackBase + int32(stackSize)
+
+		p.numGroups   = bt.numGroups
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), captureDFAL)
+		p.tableEnd    = utils.PageAlign(btBase + int64(stackSize))
+
+		phase1Raw, phase1Count := stripSegCount(dfaDataSegments(captureDFAL, false))
+		p.dataBytes    = append(p.dataBytes, phase1Raw...)
+		p.dataSegCount += phase1Count
+	}
+
+	return p, nil
+}
+
+// assembleModule builds a single WASM module from multiple compiled patterns.
+// standalone=true: module defines its own memory.
+// standalone=false: module imports memory from "main" (for wasm-merge).
+func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool) []byte {
+	// Pass 1: assign base function indices.
+	baseIdx := make([]int, len(patterns))
+	total   := 0
+	for i, p := range patterns {
+		baseIdx[i] = total
+		total += p.funcCount()
+	}
+
+	var out []byte
+	out = append(out, 0x00, 0x61, 0x73, 0x6D)
+	out = append(out, 0x01, 0x00, 0x00, 0x00)
+
+	// Type section: 3 fixed types (match, find, capture/groups).
+	typeSection := []byte{
+		0x03,
+		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F,        // type 0: (i32,i32)→i32
+		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E,        // type 1: (i32,i32)→i64
+		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F,  // type 2: (i32,i32,i32)→i32
+	}
+	out = appendSection(out, 1, typeSection)
+
+	// Import section (if !standalone): import memory from "main".
+	if !standalone {
+		var imp []byte
+		imp = append(imp, 0x01)
+		imp = appendString(imp, "main")
+		imp = appendString(imp, "memory")
+		imp = append(imp, 0x02, 0x00)
+		imp = utils.AppendULEB128(imp, 0x00)
+		out = appendSection(out, 2, imp)
+	}
+
+	// Function section.
+	var fs []byte
+	fs = utils.AppendULEB128(fs, uint32(total))
+	for _, p := range patterns {
+		if p.matchBody != nil    { fs = append(fs, 0x00) }
+		if p.findBody != nil     { fs = append(fs, 0x01) }
+		if p.captureBody != nil  {
+			fs = append(fs, 0x02)
+			if !p.anchored               { fs = append(fs, 0x02) }
+			if p.namedGroupsExport != "" { fs = append(fs, 0x02) }
+		}
+	}
+	out = appendSection(out, 3, fs)
+
+	// Memory section (if standalone).
+	if standalone {
+		var mem []byte
+		mem = append(mem, 0x01, 0x00)
+		mem = utils.AppendULEB128(mem, uint32(memPages))
+		out = appendSection(out, 5, mem)
+	}
+
+	// Export section.
+	numExports := 0
+	if standalone { numExports++ }
+	for _, p := range patterns {
+		if p.matchExport != ""       { numExports++ }
+		if p.findExport != ""        { numExports++ }
+		if p.groupsExport != ""      { numExports++ }
+		if p.namedGroupsExport != "" { numExports++ }
+	}
+	var es []byte
+	es = utils.AppendULEB128(es, uint32(numExports))
+	if standalone {
+		es = appendString(es, "memory")
+		es = append(es, 0x02, 0x00)
+	}
+	for i, p := range patterns {
+		base := baseIdx[i]
+		matchOff, findOff, captureOff, wrapperOff, namedWrapperOff := p.offsets()
+		if p.matchExport != "" && matchOff >= 0 {
+			es = appendString(es, p.matchExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(base+matchOff))
+		}
+		if p.findExport != "" && findOff >= 0 {
+			es = appendString(es, p.findExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(base+findOff))
+		}
+		if p.groupsExport != "" {
+			var groupsFuncIdx int
+			if p.anchored {
+				groupsFuncIdx = base + captureOff
+			} else {
+				groupsFuncIdx = base + wrapperOff
+			}
+			es = appendString(es, p.groupsExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(groupsFuncIdx))
+		}
+		if p.namedGroupsExport != "" && namedWrapperOff >= 0 {
+			es = appendString(es, p.namedGroupsExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(base+namedWrapperOff))
+		}
+	}
+	out = appendSection(out, 7, es)
+
+	// Code section.
+	var cs []byte
+	cs = utils.AppendULEB128(cs, uint32(total))
+	for i, p := range patterns {
+		base := baseIdx[i]
+		_, findOff, captureOff, _, _ := p.offsets()
+		if p.matchBody != nil { cs = append(cs, p.matchBody...) }
+		if p.findBody != nil  { cs = append(cs, p.findBody...) }
+		if p.captureBody != nil {
+			cs = append(cs, p.captureBody...)
+			if !p.anchored {
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, p.isOnePass)
+				if p.namedGroupsExport != "" {
+					_, _, _, wrapperOff, _ := p.offsets()
+					cs = appendNamedGroupsWrapperCodeEntry(cs, base+wrapperOff)
+				}
+			} else if p.namedGroupsExport != "" {
+				cs = appendNamedGroupsWrapperCodeEntry(cs, base+captureOff)
+			}
+		}
+	}
+	out = appendSection(out, 10, cs)
+
+	// Data section.
+	totalSegs := 0
+	var rawData []byte
+	for _, p := range patterns {
+		totalSegs += p.dataSegCount
+		rawData    = append(rawData, p.dataBytes...)
+	}
+	// Non-standalone Backtracking patterns need a sentinel at tableEnd-1 so that
+	// regexMemoryTop in merge.go sees the full memory extent (stack is zero-init).
+	if !standalone {
+		for _, p := range patterns {
+			if p.captureBody != nil && !p.isOnePass && p.tableEnd > 0 {
+				rawData = appendDataSegment(rawData, int32(p.tableEnd-1), []byte{0x00})
+				totalSegs++
+			}
+		}
+	}
+	if totalSegs > 0 {
+		var ds []byte
+		ds = utils.AppendULEB128(ds, uint32(totalSegs))
+		ds = append(ds, rawData...)
+		out = appendSection(out, 11, ds)
+	}
+
+	return out
+}
+
+// Compile compiles multiple regex patterns to a single WASM module.
+//   - standalone=false: module imports memory from "main" (for wasm-merge with Rust binary)
+//   - standalone=true:  module defines its own memory (for testing, future Component Model)
+//   - tableBase: starting address for DFA/capture tables; use 0 for standalone CM-style
+//
+// All patterns must compile successfully; any error stops compilation immediately.
+func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool) ([]byte, int64, error) {
+	var compiled []*compiledPattern
+	cur := tableBase
+	for _, re := range patterns {
+		p, err := compilePattern(re, cur)
+		if err != nil {
+			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
+		}
+		compiled = append(compiled, p)
+		if p.tableEnd > cur {
+			cur = utils.PageAlign(p.tableEnd)
+		}
+	}
+	if len(compiled) == 0 {
+		return nil, tableBase, nil
+	}
+	lastTableEnd := compiled[len(compiled)-1].tableEnd
+	memPages     := int32(utils.PageAlign(lastTableEnd) / 65536)
+	if memPages < 1 { memPages = 1 }
+	return assembleModule(compiled, memPages, standalone), lastTableEnd, nil
+}
+
+// CmdCompile compiles all regex patterns from cfg to a single WASM module.
+// wasmInput is the Rust/host WASM used to determine memory layout (rustTop).
+// outputFile overrides cfg.WasmFile; if both are empty, returns an error.
+// outDir is used to resolve relative output paths.
+func CmdCompile(cfg config.BuildConfig, wasmInput, outDir, outputFile string) error {
 	rustTop, err := utils.RustMemTop(wasmInput)
 	if err != nil {
 		return fmt.Errorf("read wasm-input: %w", err)
 	}
-	slog.Info("Compiling regexes", "count", len(cfg.Regexes))
-	slog.Debug("Rust memory top", "bytes", rustTop)
+
+	outPath := outputFile
+	if outPath == "" {
+		outPath = cfg.WasmFile
+	}
+	if outPath == "" {
+		return fmt.Errorf("output WASM file not specified: use -o flag or set wasm_file in config")
+	}
+	if !filepath.IsAbs(outPath) && outDir != "" {
+		outPath = filepath.Join(outDir, outPath)
+	}
 
 	tableBase := utils.PageAlign(rustTop)
-	for i, re := range cfg.Regexes {
-		slog.Info("Compiling pattern", "n", i+1, "total", len(cfg.Regexes), "module", re.ImportModule, "wasm", re.WasmFile)
+	slog.Info("Compiling regexes", "count", len(cfg.Regexes), "output", outPath)
 
-		wasmBytes, tableEnd, err := compileRegexEntry(re, tableBase)
-		if err != nil {
-			return fmt.Errorf("compile regex %d (%s): %w", i+1, re.ImportModule, err)
-		}
-		if wasmBytes == nil {
-			slog.Debug("Skipping pattern-only entry", "n", i+1, "module", re.ImportModule)
-			continue
-		}
-
-		wasmPath := filepath.Join(outDir, re.WasmFile)
-		if err := os.WriteFile(wasmPath, wasmBytes, 0o644); err != nil {
-			return fmt.Errorf("write %s: %w", wasmPath, err)
-		}
-		slog.Debug("Compiled pattern", "table_end", tableEnd, "file", wasmPath, "bytes", len(wasmBytes))
-		tableBase = tableEnd
+	wasmBytes, _, err := Compile(cfg.Regexes, tableBase, false)
+	if err != nil {
+		return fmt.Errorf("compile: %w", err)
 	}
-	slog.Info("Done")
+
+	if err := os.WriteFile(outPath, wasmBytes, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", outPath, err)
+	}
+	slog.Info("Done", "bytes", len(wasmBytes))
 	return nil
 }
 
@@ -177,179 +583,6 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 	return wasmBytes, tableEnd, nil
 }
 
-// compileRegexEntry compiles a single RegexEntry to WASM using the config schema.
-// Dispatches to the appropriate emitter based on which _func fields are set.
-func compileRegexEntry(re config.RegexEntry, tableBase int64) ([]byte, int64, error) {
-	needMatch  := re.MatchFunc != ""
-	needFind   := re.FindFunc != ""
-	needGroups := re.CaptureStubsRequested()
-
-	switch {
-	case needGroups && (needMatch || needFind):
-		return compileHybrid(re, tableBase, needMatch, needFind, false)
-	case needGroups:
-		wasmBytes, tableEnd, err := CompileOnePassGroups(re.Pattern, re.GroupsExportName(), tableBase, false)
-		if err == nil {
-			return wasmBytes, tableEnd, nil
-		}
-		return CompileBacktrackGroups(re.Pattern, re.GroupsExportName(), tableBase, false)
-	case needMatch && needFind:
-		return compileDualDFA(re.Pattern, re.MatchFunc, re.FindFunc, tableBase)
-	case needFind:
-		return CompileRegex(re.Pattern, re.FindFunc, tableBase, false,
-			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, Mode: ModeFind, LeftmostFirst: true})
-	case needMatch:
-		return CompileRegex(re.Pattern, re.MatchFunc, tableBase, false,
-			CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA})
-	default:
-		return nil, tableBase, nil
-	}
-}
-
-// compileDualDFA compiles a pattern to a WASM module with both a match and a
-// find function sharing the same DFA table.
-func compileDualDFA(pattern, matchName, findName string, tableBase int64) ([]byte, int64, error) {
-	opts := CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, LeftmostFirst: true}
-	matcher, err := compile(pattern, opts)
-	if err != nil {
-		return nil, 0, fmt.Errorf("compile error: %w", err)
-	}
-	table := dfaTableFrom(matcher.(*dfa))
-	if opts.MaxDFAStates > 0 && table.numStates > opts.MaxDFAStates {
-		return nil, 0, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, opts.MaxDFAStates)
-	}
-
-	// Data size: find mode is the superset (includes mid-accept, first-byte, Teddy tables).
-	numWASM := table.numStates + 1
-	var dfaSize int64
-	switch {
-	case numWASM <= 256 && numWASM*256 > 32*1024:
-		_, _, nc := computeByteClasses(table)
-		dfaSize = int64(256 + numWASM*nc + numWASM)
-	case numWASM <= 256:
-		dfaSize = int64(numWASM*256 + numWASM)
-	default:
-		dfaSize = int64(numWASM*256*2 + numWASM)
-	}
-	// find-mode extras: midAccept + firstByte
-	dfaSize += int64(numWASM) + 256
-	if len(computePrefix(table)) == 0 {
-		// no prefix: firstByte table already counted above
-	}
-	if len(table.immediateAcceptStates) > 0 {
-		dfaSize += int64(numWASM)
-	}
-	if table.hasWordBoundary {
-		dfaSize += 256 + int64(numWASM)*2
-	}
-
-	tableEnd := utils.PageAlign(tableBase + dfaSize)
-	memPages := int32(tableEnd / 65536)
-
-	mandatoryLit := FindMandatoryLit(pattern)
-	wasmBytes := genWASM(table, tableBase, matchName, findName, false, memPages, opts.LeftmostFirst, mandatoryLit)
-	return wasmBytes, tableEnd, nil
-}
-
-// compileHybrid compiles a pattern to a WASM module combining DFA (match and/or
-// find) with OnePass or Backtracking (groups), all sharing one memory.
-// Groups are always non-anchored: find_internal locates the leftmost match start,
-// then capture_internal fills the capture slots.
-// CompileHybridModule compiles a pattern to a single hybrid WASM module containing
-// match, find, and groups functions sharing one memory region. Pass "" to omit a function.
-// Use standalone=true for testing (module defines its own memory).
-func CompileHybridModule(pattern, matchExport, findExport, groupsExport string, tableBase int64, standalone bool) ([]byte, int64, error) {
-	re := config.RegexEntry{
-		Pattern:    pattern,
-		MatchFunc:  matchExport,
-		FindFunc:   findExport,
-		GroupsFunc: groupsExport,
-	}
-	return compileHybrid(re, tableBase, matchExport != "", findExport != "", standalone)
-}
-
-func compileHybrid(re config.RegexEntry, tableBase int64, needMatch, needFind bool, standalone bool) ([]byte, int64, error) {
-	// Compile LF find DFA (captures stripped) — always needed as find_internal for groups.
-	dfaOpts := CompileOptions{MaxDFAStates: 100000, ForceEngine: EngineDFA, LeftmostFirst: true}
-	matcher, err := compile(re.Pattern, dfaOpts)
-	if err != nil {
-		return nil, 0, fmt.Errorf("compile DFA: %w", err)
-	}
-	table := dfaTableFrom(matcher.(*dfa))
-	if dfaOpts.MaxDFAStates > 0 && table.numStates > dfaOpts.MaxDFAStates {
-		return nil, 0, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, dfaOpts.MaxDFAStates)
-	}
-
-	// The find DFA is always needed internally (for groups wrapper) even if !needFind.
-	// Build the layout to get the exact tableEnd, then use that as the base for groups tables.
-	findDFAL := buildDFALayout(table, tableBase, true, true)
-	dfaSize := findDFAL.tableEnd - tableBase
-
-	// Compile groups function (OnePass preferred; backtrack fallback).
-	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
-	if err != nil {
-		return nil, 0, fmt.Errorf("parse error: %w", err)
-	}
-	prog, err := syntax.Compile(parsed.Simplify())
-	if err != nil {
-		return nil, 0, fmt.Errorf("compile NFA: %w", err)
-	}
-
-	matchExport := ""
-	if needMatch {
-		matchExport = re.MatchFunc
-	}
-	findExport := ""
-	if needFind {
-		findExport = re.FindFunc
-	}
-
-	mandatoryLit := FindMandatoryLit(re.Pattern)
-
-	// Use selectBestEngine (not bare isOnePass) so that nested/non-greedy quantifiers
-	// correctly route to Backtracking even when the pattern passes the isOnePass check.
-	groupsEngine := selectBestEngine(prog, prog.NumCap > 2, nil)
-	if groupsEngine == EngineOnePass {
-		op := newOnePass(prog)
-		opTableBase := utils.PageAlign(tableBase + dfaSize)
-		opDataSize := int64(op.numStates * 256)
-		tableEnd := utils.PageAlign(opTableBase + opDataSize)
-		memPages := int32(tableEnd / 65536)
-		wasmBytes := genHybridWASM(table, tableBase, matchExport, findExport,
-			op, opTableBase, re.GroupsExportName(), standalone, memPages, dfaOpts.LeftmostFirst, mandatoryLit)
-		return wasmBytes, tableEnd, nil
-	}
-
-	// Not one-pass: use backtracking engine for groups function.
-	bt := newBacktrack(prog)
-
-	// Compile Phase 1 DFA (LL match mode) for capture_internal.
-	reStripped2, err2 := syntax.Parse(re.Pattern, syntax.Perl)
-	if err2 != nil {
-		return nil, 0, fmt.Errorf("parse stripped: %w", err2)
-	}
-	stripCaptures(reStripped2)
-	progStripped2, err2 := syntax.Compile(reStripped2.Simplify())
-	if err2 != nil {
-		return nil, 0, fmt.Errorf("compile stripped: %w", err2)
-	}
-	p1TableBase := utils.PageAlign(tableBase + dfaSize)
-	captureDFAL := compileDFAForBacktrack(progStripped2, p1TableBase)
-
-	btTableBase := utils.PageAlign(captureDFAL.tableEnd)
-	numCapLocals := bt.numGroups * 2
-	frameSize := 4 + numCapLocals*4 + 4
-	maxFrames := bt.numAlts * 4096
-	if maxFrames < 4096 {
-		maxFrames = 4096
-	}
-	stackSize := maxFrames * frameSize
-	tableEnd := utils.PageAlign(btTableBase + int64(stackSize))
-	memPages := int32(tableEnd / 65536)
-	wasmBytes := genHybridWASMWithBacktrack(table, tableBase, matchExport, findExport,
-		bt, btTableBase, re.GroupsExportName(), standalone, memPages, dfaOpts.LeftmostFirst, mandatoryLit, captureDFAL)
-	return wasmBytes, tableEnd, nil
-}
 
 // CompileOnePassGroups compiles a pattern to a OnePass WASM module exporting
 // a non-anchored groups function: (ptr i32, len i32, out_ptr i32) → i32.
@@ -503,4 +736,103 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 		}
 	}
 	return false
+}
+
+// buildGroupsWrapperBody emits the WASM body for the exported groups wrapper function.
+// See engine_dfa.go for the full documentation — this function was moved to compile.go
+// because it is not DFA-specific; it is used by the module assembler.
+//
+// Signature: (ptr i32, len i32, out_ptr i32) → i32
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups int, isOnePass bool) []byte {
+	var b []byte
+	b = append(b, 0x02)
+	b = append(b, 0x03, 0x7F) // 3 × i32
+	b = append(b, 0x01, 0x7E) // 1 × i64
+	b = append(b, 0x20, 0x00)
+	b = append(b, 0x20, 0x01)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(findFuncIdx))
+	b = append(b, 0x22, 0x06)
+	b = append(b, 0x42, 0x7F)
+	b = append(b, 0x51)
+	b = append(b, 0x04, 0x7F)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x05)
+	b = append(b, 0x20, 0x06)
+	b = append(b, 0x42, 0x20)
+	b = append(b, 0x88)
+	b = append(b, 0xA7)
+	b = append(b, 0x21, 0x03)
+	b = append(b, 0x20, 0x00)
+	b = append(b, 0x20, 0x03)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, 0x06)
+	b = append(b, 0xA7)
+	b = append(b, 0x20, 0x03)
+	b = append(b, 0x6B)
+	b = append(b, 0x20, 0x02)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
+	b = append(b, 0x22, 0x04)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x46)
+	b = append(b, 0x04, 0x7F)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x05)
+	for i := 0; i < numGroups*2; i++ {
+		offset := uint32(i * 4)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x28, 0x02)
+		b = utils.AppendULEB128(b, offset)
+		b = append(b, 0x22, 0x05)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x4E)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x20, 0x05)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x6A)
+		b = append(b, 0x36, 0x02)
+		b = utils.AppendULEB128(b, offset)
+		b = append(b, 0x0B)
+	}
+	b = append(b, 0x20, 0x04)
+	b = append(b, 0x20, 0x03)
+	b = append(b, 0x6A)
+	b = append(b, 0x0B)
+	b = append(b, 0x0B)
+	b = append(b, 0x0B)
+	return b
+}
+
+// appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
+func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups int, isOnePass bool) []byte {
+	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, isOnePass)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// appendNamedGroupsWrapperCodeEntry appends a size-prefixed named-groups wrapper body to cs.
+// The wrapper calls groupsFuncIdx (the groups wrapper) and maps numbered slot pairs
+// to named output slots using compile-time constants from groupNames.
+// groupNames[i] is the name for capture group i+1 (empty = unnamed, skip).
+//
+// Signature: (ptr i32, len i32, out_ptr i32) → i32
+//
+// The named-groups out_ptr layout is identical to groups out_ptr — the stub
+// uses the name→index mapping to present results by name to callers.
+// This function is a thin pass-through: it calls the groups wrapper and returns
+// its result unchanged; named group mapping is handled entirely in the stub.
+func appendNamedGroupsWrapperCodeEntry(cs []byte, groupsFuncIdx int) []byte {
+	// Body: call groupsFuncIdx(ptr, len, out_ptr), return result.
+	var b []byte
+	b = append(b, 0x00) // 0 local declarations
+	b = append(b, 0x20, 0x00) // local.get ptr
+	b = append(b, 0x20, 0x01) // local.get len
+	b = append(b, 0x20, 0x02) // local.get out_ptr
+	b = append(b, 0x10)       // call
+	b = utils.AppendULEB128(b, uint32(groupsFuncIdx))
+	b = append(b, 0x0B) // end
+	cs = utils.AppendULEB128(cs, uint32(len(b)))
+	return append(cs, b...)
 }

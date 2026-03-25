@@ -3,7 +3,7 @@ REGEXPED    := ../../regexped
 WASM_TARGET := wasm32-wasip1
 
 MAIN_WASM   := target/$(WASM_TARGET)/release/secrets.wasm
-REGEX_WASMS := github.wasm jwt.wasm aws.wasm
+REGEX_WASMS := regexps.wasm
 FINAL_WASM  := final.wasm
 
 .PHONY: all generate build compile merge run clean
@@ -53,4 +53,4 @@ run: $(FINAL_WASM)
 
 clean:
 	cargo clean
-	rm -f src/stubs.rs $(REGEX_WASMS) $(FINAL_WASM)
+	rm -f src/stubs.rs regexps.wasm $(FINAL_WASM)

@@ -286,6 +286,11 @@ func onePassCodeEntry(op *onePass, transOff int32) []byte {
 	return b
 }
 
+// appendOnePassCodeEntry appends a size-prefixed OnePass capture body to cs.
+func appendOnePassCodeEntry(cs []byte, op *onePass, transOff int32) []byte {
+	return append(cs, onePassCodeEntry(op, transOff)...)
+}
+
 // onePassDataEntry returns the raw data segment for the OnePass transition table
 // (no count prefix — caller manages the segment count).
 func onePassDataEntry(op *onePass, tableBase int64) []byte {

@@ -566,13 +566,10 @@ func buildRegexpedGroups(dir, harnessName, exportName, pattern string) (string, 
 	// Same 512KB margin as buildRegexped — see comment there for details and the
 	// threshold above which this margin must be increased.
 	tableBase := utils.PageAlign(rustTop + 512*1024)
-	wasmBytes, _, err := compile.CompileOnePassGroups(pattern, exportName, tableBase, false)
+	re := config.RegexEntry{Pattern: pattern, GroupsFunc: exportName}
+	wasmBytes, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, false)
 	if err != nil {
-		// Not OnePass-eligible — fall back to backtracking engine.
-		wasmBytes, _, err = compile.CompileBacktrackGroups(pattern, exportName, tableBase, false)
-		if err != nil {
-			return "", fmt.Errorf("compile: %w", err)
-		}
+		return "", fmt.Errorf("compile: %w", err)
 	}
 
 	patTmp, err := os.CreateTemp("", "pattern-*.wasm")

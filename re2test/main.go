@@ -13,6 +13,7 @@ import (
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
+	"github.com/qrdl/regexped/config"
 )
 
 const (
@@ -180,22 +181,22 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				input = append([]string(nil), testStrings...)
 				continue
 			}
-			hybridDone := false
-			_ = hybridDone
-			/* EXPERIMENT: hybrid disabled, use pure DFA
-			if engineType == compile.EngineOnePass || engineType == compile.EngineBacktrack {
-				...
-			} else */ if engineType != compile.EngineDFA && engineType != compile.EngineOnePass && engineType != compile.EngineBacktrack {
+			if engineType != compile.EngineDFA && engineType != compile.EngineOnePass && engineType != compile.EngineBacktrack {
 				skipCount["requires "+engineType.String()] += len(testStrings)
 				input = append([]string(nil), testStrings...)
 				continue
 			}
 
-			opts := compile.CompileOptions{
-				MaxDFAStates: maxDFAStates,
-				ForceEngine:  compile.EngineDFA,
+			// Compile a single standalone WASM module containing all functions.
+			re := config.RegexEntry{
+				Pattern:   pattern,
+				MatchFunc: "match",
+				FindFunc:  "find",
 			}
-			wasmBytes, _, compErr := compile.CompileRegex(pattern, "match", tableBase, true, opts)
+			if engineType == compile.EngineOnePass || engineType == compile.EngineBacktrack {
+				re.GroupsFunc = "groups"
+			}
+			wasmBytes, _, compErr := compile.Compile([]config.RegexEntry{re}, tableBase, true)
 			if compErr != nil {
 				errStr := compErr.Error()
 				reason := skipOther
@@ -207,7 +208,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				continue
 			}
 
-			// Compile succeeded — set up wasmtime instances for anchored and find modes.
+			// Load single module — all functions share one memory.
 			store = wasmtime.NewStore(engine)
 			store.SetEpochDeadline(1)
 			mod, modErr := wasmtime.NewModule(engine, wasmBytes)
@@ -219,31 +220,19 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				return fmt.Errorf("%s:%d: NewInstance for %q: %w", testFile, lineno, pattern, instErr)
 			}
 			matchFn = inst.GetFunc(store, "match")
+			findFn  = inst.GetFunc(store, "find")
 			if exp := inst.GetExport(store, "memory"); exp != nil {
 				memory = exp.Memory()
 			}
+			findMemory = memory
 
-			// Also compile find mode for non-anchored (col 1) test cases,
-			// but only when DFA semantics match RE2's leftmost-first.
-			// Skip patterns with alternations (|) or non-greedy quantifiers
-			// because DFA gives leftmost-longest while RE2 gives leftmost-first.
-			findOpts := compile.CompileOptions{
-				MaxDFAStates:  maxDFAStates,
-				ForceEngine:   compile.EngineDFA,
-				Mode:          compile.ModeFind,
-				LeftmostFirst: true,
-			}
-			parsedForFind, _ := syntax.Parse(pattern, syntax.Perl)
-			if parsedForFind != nil && !findModeUnsafe(parsedForFind) {
-				if findBytes, _, fErr := compile.CompileRegex(pattern, "find", tableBase, true, findOpts); fErr == nil {
-					if findMod, fModErr := wasmtime.NewModule(engine, findBytes); fModErr == nil {
-						if findInst, fInstErr := wasmtime.NewInstance(store, findMod, []wasmtime.AsExtern{}); fInstErr == nil {
-							findFn = findInst.GetFunc(store, "find")
-							if exp := findInst.GetExport(store, "memory"); exp != nil {
-								findMemory = exp.Memory()
-							}
-						}
-					}
+			if re.GroupsFunc != "" {
+				groupsFn    = inst.GetFunc(store, "groups")
+				groupsStore = store
+				groupsMemory = memory
+				groupsIsBacktrack = (engineType == compile.EngineBacktrack)
+				if p2, p2Err := syntax.Parse(pattern, syntax.Perl); p2Err == nil {
+					numGroups = p2.MaxCap() + 1
 				}
 			}
 
