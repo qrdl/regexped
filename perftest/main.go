@@ -180,6 +180,23 @@ var tests = []testCase{
 		},
 	},
 	{
+		// Non-anchored groups: find URLs anywhere in 10KB prose and capture host.
+		// This exercises the wrapper's internal find_internal scan over a large buffer.
+		name:    "url-domains-10k",
+		pattern: `https?://(?P<host>[^/:?#\s]+)`,
+		mode:    anchoredGroups,
+		inputs: []namedInput{
+			{"no-url 10KB", urlProseInputSmall(nil)},
+			{"5 urls 10KB", urlProseInputSmall([]string{
+				"https://example.com",
+				"https://api.github.com/repos",
+				"https://storage.googleapis.com/bucket",
+				"https://cdn.cloudflare.net/assets",
+				"https://docs.anthropic.com/api",
+			})},
+		},
+	},
+	{
 		name:    "sql-inject",
 		pattern: `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`,
 		mode:    find,
@@ -371,6 +388,34 @@ func sourceCodeInput(singleLine, blockComments []string) string {
 			pos = len(result)
 		}
 		line := []byte(comment + "\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
+func urlProseInputSmall(urls []string) string {
+	const block = `The application encountered an error while processing the request from the
+client. The server returned status code four hundred and three, indicating that
+the user does not have permission to access the requested resource. Please
+contact your system administrator if you believe this is a mistake. The event
+has been logged for review by the security team. Timestamp of the failure was
+recorded along with the originating address and the affected service name.
+`
+	repeat := (10 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+	if len(urls) == 0 {
+		return base
+	}
+	result := []byte(base)
+	step := len(result) / (len(urls) + 1)
+	offset := 0
+	for i, url := range urls {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte("See " + url + " for details.\n")
 		result = append(result[:pos], append(line, result[pos:]...)...)
 		offset += len(line)
 	}
