@@ -232,8 +232,15 @@ func matchesRuneInstOP(inst *syntax.Inst, r rune) bool {
 		return false
 	}
 	isFold := syntax.Flags(inst.Arg)&syntax.FoldCase != 0
-	for i := 0; i+1 < len(inst.Rune); i += 2 {
-		lo, hi := inst.Rune[i], inst.Rune[i+1]
+	for i := 0; i < len(inst.Rune); i += 2 {
+		var lo, hi rune
+		if i+1 >= len(inst.Rune) {
+			lo = inst.Rune[i]
+			hi = inst.Rune[i] // single-rune element (e.g. FoldCase with one base rune)
+		} else {
+			lo = inst.Rune[i]
+			hi = inst.Rune[i+1]
+		}
 		if hi > 0x7F {
 			hi = 0x7F
 		}

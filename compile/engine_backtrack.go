@@ -592,9 +592,15 @@ func btCheckRuneRanges(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 	// Use block $matched (result i32): emit 1 and br if matched, else 0 falls through.
 	b = append(b, 0x02, 0x7F) // block (result i32)
 
-	for i := 0; i+1 < len(inst.Rune); i += 2 {
-		lo := inst.Rune[i]
-		hi := inst.Rune[i+1]
+	for i := 0; i < len(inst.Rune); i += 2 {
+		var lo, hi rune
+		if i+1 >= len(inst.Rune) {
+			lo = inst.Rune[i]
+			hi = inst.Rune[i] // single-rune element (e.g. FoldCase with one base rune)
+		} else {
+			lo = inst.Rune[i]
+			hi = inst.Rune[i+1]
+		}
 		if lo > 0x7F {
 			continue // skip non-ASCII ranges
 		}
