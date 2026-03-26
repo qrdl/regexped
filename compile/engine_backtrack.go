@@ -60,6 +60,47 @@ func capStartLocal(i int) uint32 { return uint32(7 + i*2) }
 func capEndLocal(i int) uint32   { return uint32(8 + i*2) }
 
 // appendBacktrackCodeEntry appends a size-prefixed backtracking capture body to cs.
+// loopCaptureLocals returns the capture local variable indices that are
+// modified inside the loop body at loopPC (reachable from inst.Out before
+// re-entering loopPC). Only those locals need snapshot save/restore.
+// Returns nil if no captures are inside the loop.
+func loopCaptureLocals(prog *syntax.Prog, loopPC int) []uint32 {
+	inst := prog.Inst[loopPC]
+	visited := make([]bool, len(prog.Inst))
+	queue := []int{int(inst.Out)}
+	seen := make(map[uint32]bool)
+	var locals []uint32
+	for len(queue) > 0 {
+		pc := queue[0]
+		queue = queue[1:]
+		if pc == loopPC || visited[pc] {
+			continue
+		}
+		visited[pc] = true
+		i := prog.Inst[pc]
+		if i.Op == syntax.InstCapture {
+			g := int(i.Arg >> 1)
+			var loc uint32
+			if i.Arg&1 == 0 {
+				loc = capStartLocal(g)
+			} else {
+				loc = capEndLocal(g)
+			}
+			if !seen[loc] {
+				seen[loc] = true
+				locals = append(locals, loc)
+			}
+		}
+		switch i.Op {
+		case syntax.InstAlt, syntax.InstAltMatch:
+			queue = append(queue, int(i.Out), int(i.Arg))
+		default:
+			queue = append(queue, int(i.Out))
+		}
+	}
+	return locals
+}
+
 func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32) []byte {
 	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
@@ -89,16 +130,25 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32) [
 		loopLocalIdx[pc] = uint32(7 + numCapLocals + j)
 	}
 
-	// Loop capture snapshot locals.
+	// Loop capture snapshot locals — only the specific capture locals modified
+	// inside each loop's body, not all caps. Loops with no captures inside need
+	// no snapshot at all.
 	baseExtra := uint32(7 + numCapLocals + len(loopPCsSorted))
-	loopSnapBase := make(map[int]uint32, len(loopPCsSorted))
-	for j, pc := range loopPCsSorted {
-		loopSnapBase[pc] = baseExtra + uint32(j*numCapLocals)
+	loopSnapBase    := make(map[int]uint32,   len(loopPCsSorted)) // loop PC → first snapshot local
+	loopSnapLocals  := make(map[int][]uint32, len(loopPCsSorted)) // loop PC → which cap locals to snap
+	snapTotal := 0
+	for _, pc := range loopPCsSorted {
+		locals := loopCaptureLocals(prog, pc)
+		if len(locals) > 0 {
+			loopSnapBase[pc]   = baseExtra + uint32(snapTotal)
+			loopSnapLocals[pc] = locals
+			snapTotal += len(locals)
+		}
 	}
 
 	// Total non-param locals: pos, sp, state, scratch, cap0s, cap0e, ...,
-	// loop_pos..., loop_snap...
-	totalLocals := 4 + numCapLocals + len(loopPCsSorted) + len(loopPCsSorted)*numCapLocals
+	// loop_pos..., loop_snap... (only specific cap locals for loops that need it)
+	totalLocals := 4 + numCapLocals + len(loopPCsSorted) + snapTotal
 
 	var body []byte
 
@@ -134,11 +184,11 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32) [
 	}
 
 	// ── Initialise loop snapshot locals to -1 ───────────────────────────────
-	for _, snapBase := range loopSnapBase {
-		for i := 0; i < numCapLocals; i++ {
+	for pc, snapBase := range loopSnapBase {
+		for k := range loopSnapLocals[pc] {
 			body = append(body, 0x41, 0x7F) // i32.const -1
 			body = append(body, 0x21)
-			body = utils.AppendULEB128(body, snapBase+uint32(i))
+			body = utils.AppendULEB128(body, snapBase+uint32(k))
 		}
 	}
 
@@ -223,7 +273,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32) [
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, stackBase, stackLimit, frameSize, numCapLocals)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackBase, stackLimit, frameSize, numCapLocals)
 	}
 
 	body = append(body, 0x00) // unreachable (after all handlers, inside $run)
@@ -241,8 +291,9 @@ func emitBTInstHandler(
 	p int,
 	inst syntax.Inst,
 	brRun uint32,
-	loopLocalIdx map[int]uint32,
-	loopSnapBase map[int]uint32,
+	loopLocalIdx  map[int]uint32,
+	loopSnapBase  map[int]uint32,
+	loopSnapLocals map[int][]uint32,
 	stackBase, stackLimit, frameSize int32,
 	numCapLocals int,
 ) []byte {
@@ -306,13 +357,13 @@ func emitBTInstHandler(
 			body = utils.AppendULEB128(body, loopLocal)
 			body = append(body, 0x46)       // i32.eq
 			body = append(body, 0x04, 0x40) // if void
-			// Restore cap locals from snapshot (last non-empty iteration).
+			// Restore only the specific cap locals snapshotted for this loop.
 			if snapBase, ok := loopSnapBase[p]; ok {
-				for i := 0; i < numCapLocals; i++ {
+				for k, capLocal := range loopSnapLocals[p] {
 					body = append(body, 0x20)
-					body = utils.AppendULEB128(body, snapBase+uint32(i))
+					body = utils.AppendULEB128(body, snapBase+uint32(k))
 					body = append(body, 0x21)
-					body = utils.AppendULEB128(body, capStartLocal(0)+uint32(i))
+					body = utils.AppendULEB128(body, capLocal)
 				}
 			}
 			body = btSetStateAndBr(body, int32(inst.Arg), brRunNested)
@@ -323,13 +374,13 @@ func emitBTInstHandler(
 			body = append(body, 0x21)
 			body = utils.AppendULEB128(body, loopLocal)
 
-			// Save cap locals to snapshot.
+			// Save only the specific cap locals for this loop.
 			if snapBase, ok := loopSnapBase[p]; ok {
-				for i := 0; i < numCapLocals; i++ {
+				for k, capLocal := range loopSnapLocals[p] {
 					body = append(body, 0x20)
-					body = utils.AppendULEB128(body, capStartLocal(0)+uint32(i))
+					body = utils.AppendULEB128(body, capLocal)
 					body = append(body, 0x21)
-					body = utils.AppendULEB128(body, snapBase+uint32(i))
+					body = utils.AppendULEB128(body, snapBase+uint32(k))
 				}
 			}
 
