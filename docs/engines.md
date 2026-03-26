@@ -82,28 +82,31 @@ The OnePass automaton is a u8 transition table (`state × byte → next_state`, 
 
 ---
 
-## Backtracking Engine
+## Backtracking Engine (BitState)
 
 **Used for:** `groups_func`, `named_groups_func` when the pattern has captures but is not OnePass-eligible, and as the groups half of hybrid modules for such patterns.
 
-**Complexity:** O(n) typical, O(2ⁿ) worst case — bounded in practice by the stack limit.
+**Complexity:** O(n × numStates) time and space — guaranteed by BitState memoization (see below).
 
 ### How it works
 
 The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps to a handler block. The engine maintains a backtrack stack in WASM linear memory: when an `InstAlt` node is reached, the alternative branch is pushed onto the stack and execution continues with the preferred branch. On failure the stack is popped to try the alternative.
 
-**RE2 semantics via hybrid approach** — both phases run inside the single exported WASM function, with no matching logic in the host:
+**BitState memoization:** before executing any NFA state at a given input position, the engine checks a `(pc, position)` visited bitset. If the `(state, pos)` pair was already visited, the current thread is immediately discarded — it cannot produce a result not already covered by a previous thread. This prevents infinite loops on patterns with nested zero-matching quantifiers (e.g. `(?:(?:(a){0,})*?)`) and guarantees O(n × numStates) worst-case execution.
 
-1. **Phase 1 (DFA)**: the captures-stripped pattern is run as a standard leftmost-longest DFA anchored match to determine the correct match end position E. If no match, returns -1 immediately.
-2. **Phase 2 (Backtracking)**: the NFA backtracking engine runs constrained to `pos == E` at `InstMatch`, filling capture slots within `[0, E]`.
+The bitset is stored in WASM linear memory immediately after the backtrack stack. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes computed at runtime. It is zero-initialised at the start of each match call. For inputs exceeding `maxMemoLen` (8192 chars), memoization is skipped and the engine falls back to stack-bounded backtracking.
 
-This ensures non-greedy outer quantifiers like `(a*)*?` produce the same result as RE2 (longest match), not Perl semantics (shortest match).
+**Limitation:** the memoization bitset is allocated at a fixed compile-time address in the module's linear memory. This is safe for single-threaded WASM (the standard). The WebAssembly threads proposal (Phase 3) would allow shared-memory parallelism, but this is not supported — calling the same pattern's groups function from two concurrent threads would cause a data race on the memo table. Single-threaded use is the only supported mode.
 
-**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. Stack is reserved at compile time in WASM linear memory immediately after the pattern tables.
+**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. Stack is reserved at compile time in WASM linear memory immediately after the DFA tables.
 
-**Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns -1 (no match) rather than corrupting memory. This caps catastrophic backtracking on adversarial inputs.
+**Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns -1 (no match) rather than corrupting memory.
 
-**No memoization needed:** the hybrid approach means Phase 2 NFA only runs over the short region `[0, E]` confirmed by Phase 1 DFA. Patterns that would cause exponential backtracking (e.g. `(a+)+`) have their extent bounded by the DFA in O(n), so the NFA never processes the full input. Memoization would only matter if Phase 2 backtracks exponentially within `[0, E]` — in practice this does not occur because E is tight.
+**Memory layout:**
+```
+[DFA find tables] → [backtrack stack] → [BitState memo bitset]
+```
+All regions are page-aligned and strictly non-overlapping. The input buffer is placed at address 0 by the host and never overlaps with the tables region.
 
 ---
 

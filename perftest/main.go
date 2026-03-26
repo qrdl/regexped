@@ -206,6 +206,19 @@ var tests = []testCase{
 		},
 	},
 	{
+		// CSV row parsing with 3 capture groups — benchmarks non-anchored Backtracking engine.
+		// Fields can be unquoted or double-quoted (RFC 4180); quoted fields may contain commas
+		// and doubled quotes (""). The alternation "..."|[^,\n]* is non-OnePass (overlapping
+		// first-char sets), so the Backtracking engine is used automatically.
+		// Input is a 16-line CSV file; groups_func scans for each row and extracts 3 columns.
+		name:    "csv-parse",
+		pattern: `((?:"(?:[^"]|"")*"|[^,\n]*)),((?:"(?:[^"]|"")*"|[^,\n]*)),((?:"(?:[^"]|"")*"|[^,\n]*))`,
+		mode:    anchoredGroups,
+		inputs: []namedInput{
+			{"16-line CSV", csvInput()},
+		},
+	},
+	{
 		// Comment extraction from source code — benchmarks per-state SIMD in DFA inner loop.
 		// Two self-loop states qualify (255/256 bytes each):
 		//   - inside // comment: [^\n]+ self-loops until newline
@@ -455,6 +468,30 @@ All field names are case sensitive and must match the schema definition exactly.
 		offset += len(line)
 	}
 	return string(result)
+}
+
+// csvInput returns a 16-line CSV with 3 columns per row. Rows use a mix of
+// unquoted fields, quoted fields containing commas, and fields with doubled
+// quotes (RFC 4180 escaping). Exercises the Backtracking engine's
+// non-anchored groups path.
+func csvInput() string {
+	return `John,Doe,john.doe@example.com
+"Smith, Jr.",Alice,alice@example.com
+Bob,"O'Brien, Jr.","bob@example.com"
+"""Admin""",root,root@localhost
+Carol,White,"carol.white@corp.example.com"
+Dave,"Sales, EMEA",dave@corp.com
+Eve,"R&D ""Lab""",eve@lab.example.com
+Frank,,frank@example.com
+"Grace, PhD","AI, ML",grace@uni.edu
+Heidi,Blue,heidi@example.com
+"Ivan ""The Terrible""","Marketing, Global",ivan@corp.com
+Judy,Green,judy@example.com
+"Karl, III","Finance, APAC",karl@corp.com
+Laura,Red,laura@example.com
+"Mallory ""M""","Ops, EU",mallory@corp.com
+Niaj,Black,niaj@example.com
+`
 }
 
 func sqlCleanInput() string {

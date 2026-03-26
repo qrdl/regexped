@@ -1,8 +1,9 @@
-.PHONY: test exhaustive custom clean
+.PHONY: test exhaustive custom adjusted clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
 CUSTOM       := custom-tests.txt
+ADJUSTED     := re2-adjusted.txt
 
 $(TESTDATA): $(TESTDATA_BZ2)
 	bzip2 -dk -c $< > $@
@@ -14,7 +15,13 @@ custom:
 	go run . --validate-go --validate-groups $(CUSTOM)
 	go run . --validate-groups $(CUSTOM)
 
-test: exhaustive custom
+$(ADJUSTED): $(TESTDATA)
+	go run ./make_adjusted $(TESTDATA) $(ADJUSTED)
+
+adjusted: $(ADJUSTED)
+	go run . --validate-groups $(ADJUSTED)
+
+test: exhaustive custom adjusted
 
 clean:
-	rm -f $(TESTDATA)
+	rm -f $(TESTDATA) $(ADJUSTED)
