@@ -973,3 +973,61 @@ regexps
 0-1;0-1;-;-;0-1
 0-3;0-3;-;-;0-3
 0-11;0-11;-;-;0-11
+# ============================================================
+# Category 15: Hybrid module — DFA find + groups in same module
+# Tests that find_internal and groups wrapper share memory correctly.
+# ============================================================
+Cat15HybridOnePass
+strings
+""
+"2024-03"
+"today is 2024-03 done"
+"no dates here"
+"v1-2 and v3-4"
+regexps
+"([0-9]+)-([0-9]+)"
+-;-;-;-
+0-7 0-4 5-7;0-7;-;-
+-;9-16;-;-
+-;-;-;-
+-;1-4;-;-
+Cat15HybridBacktrack
+strings
+""
+"hello world"
+"say hello world please"
+"hello"
+"one two three"
+regexps
+"([a-z]+)\\s+([a-z]+)"
+-;-;-;-
+0-11 0-5 6-11;0-11;-;-
+-;0-9;-;-
+-;-;-;-
+-;0-7;-;-
+# ============================================================
+# Category 16: Multiline mode — (?m:^) and (?m:$) anchors
+# NOTE: regexped DFA does not track prev-was-newline context,
+# so (?m:^) only fires at absolute pos 0 (same as ^).
+# These tests document the current behaviour.
+# ============================================================
+Cat16Multiline
+strings
+""
+"foo"
+"bar\nfoo"
+"foobar"
+"bar\nfoobar"
+regexps
+"(?m:^foo)"
+-;-;-;-
+-;0-3;-;-
+-;4-7;-;-
+-;0-3;-;-
+-;4-7;-;-
+"(?m:foo$)"
+-;-;-;-
+-;0-3;-;-
+-;4-7;-;-
+-;-;-;-
+-;-;-;-

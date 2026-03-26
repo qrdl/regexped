@@ -15,27 +15,28 @@ import (
 type dfa struct {
 	start        int
 	midStart     int // start state for mid-string positions (attempt_start > 0) with prev=non-word
-	midStartWord int // start state for mid-string positions with prev=word (new for word boundary support)
+	midStartWord    int // start state for mid-string positions with prev=word
+	midStartNewline int // start state for mid-string positions with prev=newline (for (?m:^))
 	// differs from start when pattern has begin anchors (^/\A) — those are not followed here.
 	numStates        int
 	accepting        map[int]bool // eofAccepting: accepts when at end of input (via $ or \z)
 	midAccepting     map[int]bool // accepts at any position (no end-anchor expansion needed)
 	// midAcceptingNW and midAcceptingW are for word-boundary patterns (find mode only).
-	// midAcceptingNW[s]: state s accepts BEFORE consuming the next byte, when that byte is non-word.
-	// midAcceptingW[s]:  state s accepts BEFORE consuming the next byte, when that byte is word.
-	// These cover trailing \b/\B assertions that fire based on the upcoming byte.
 	midAcceptingNW   map[int]bool
 	midAcceptingW    map[int]bool
+	// midAcceptingNL[s]: state s accepts BEFORE consuming the next byte when prev was '\n' (for (?m:^)).
+	midAcceptingNL   map[int]bool
 	startBeginAccept bool // true if start state accepts with ecBegin only (e.g. a*^)
 
 	// transitions[state*256 + byte] = nextState (-1 = no transition)
 	transitions  []int                // Flat array: [numStates * 256]
 	unicodeTrans map[int]map[rune]int // state -> (unicode rune -> next state)
 
-	hasEndAnchor      bool
-	hasWordBoundary   bool
-	needsUnicode      bool
-	immediateAccepting map[int]bool // leftmost-first: accept without scanning further
+	hasEndAnchor        bool
+	hasWordBoundary     bool
+	hasNewlineBoundary  bool // true when pattern contains (?m:^) or (?m:$)
+	needsUnicode        bool
+	immediateAccepting  map[int]bool // leftmost-first: accept without scanning further
 }
 
 func (d *dfa) Type() EngineType {
@@ -72,12 +73,13 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 		midAccepting:       make(map[int]bool),
 		midAcceptingNW:     make(map[int]bool),
 		midAcceptingW:      make(map[int]bool),
+		midAcceptingNL:     make(map[int]bool),
 		unicodeTrans:       make(map[int]map[rune]int),
 		needsUnicode:       needsUnicode,
 		immediateAccepting: make(map[int]bool),
 	}
 
-	// Detect if pattern has begin/end anchors or word boundary assertions
+	// Detect if pattern has begin/end anchors, word boundary, or multiline assertions
 	for _, inst := range prog.Inst {
 		if inst.Op == syntax.InstEmptyWidth {
 			emptyOp := syntax.EmptyOp(inst.Arg)
@@ -87,6 +89,9 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 			if emptyOp&syntax.EmptyWordBoundary != 0 || emptyOp&syntax.EmptyNoWordBoundary != 0 {
 				dfa.hasWordBoundary = true
 			}
+			if emptyOp&syntax.EmptyBeginLine != 0 || emptyOp&syntax.EmptyEndLine != 0 {
+				dfa.hasNewlineBoundary = true
+			}
 		}
 	}
 
@@ -95,9 +100,10 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 	nextStateID := 0
 
 	type workItem struct {
-		dfaState    int
-		nfaSet      []uint32
-		prevWasWord bool
+		dfaState       int
+		nfaSet         []uint32
+		prevWasWord    bool
+		prevWasNewline bool // true when previous byte was '\n' (for (?m:^) context)
 	}
 	queue := []workItem{}
 
@@ -106,13 +112,16 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 	// ecEnd:            follow EmptyEndText (\z) and EmptyEndLine ($)   — valid only at end of input.
 	// ecWordBoundary:   follow EmptyWordBoundary (\b) — prev != curr (crossing word/non-word boundary).
 	// ecNoWordBoundary: follow EmptyNoWordBoundary (\B) — prev == curr (same class).
-	// Mid-string transitions use ctx=0 so no anchors are followed, which prevents impossible
-	// sequences like (?:\z)(?:.+) or (?:.+)(?:\A) from appearing reachable.
+	// ecBeginLine:       follow EmptyBeginLine ((?m:^)) — prev was '\n' or start-of-text.
+	// ecEndLine:         follow EmptyEndLine ((?m:$))   — next byte is '\n' or end-of-text.
+	// Mid-string transitions use ctx=0 so no anchors are followed.
 	const (
 		ecBegin          = 1
 		ecEnd            = 2
 		ecWordBoundary   = 4
 		ecNoWordBoundary = 8
+		ecBeginLine      = 16 // prev byte was '\n' (or start of text): (?m:^) fires
+		ecEndLine        = 32 // next byte is '\n' (or end of text):   (?m:$) fires
 	)
 
 	// Compute epsilon closure of NFA states, respecting anchor context.
@@ -154,11 +163,19 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 			case syntax.InstEmptyWidth:
 				emptyOp := syntax.EmptyOp(inst.Arg)
 				follow := true
-				if emptyOp&(syntax.EmptyBeginText|syntax.EmptyBeginLine) != 0 {
+				if emptyOp&syntax.EmptyBeginText != 0 {
 					follow = follow && (ctx&ecBegin) != 0
 				}
-				if emptyOp&(syntax.EmptyEndText|syntax.EmptyEndLine) != 0 {
+				if emptyOp&syntax.EmptyBeginLine != 0 {
+					// (?m:^) fires at start-of-text OR after '\n'
+					follow = follow && (ctx&(ecBegin|ecBeginLine)) != 0
+				}
+				if emptyOp&syntax.EmptyEndText != 0 {
 					follow = follow && (ctx&ecEnd) != 0
+				}
+				if emptyOp&syntax.EmptyEndLine != 0 {
+					// (?m:$) fires at end-of-text OR before '\n'
+					follow = follow && (ctx&(ecEnd|ecEndLine)) != 0
 				}
 				if emptyOp&syntax.EmptyWordBoundary != 0 {
 					follow = follow && (ctx&ecWordBoundary) != 0
@@ -244,14 +261,20 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 				case syntax.InstCapture, syntax.InstNop:
 					stack = append(stack, inst2.Out)
 				case syntax.InstEmptyWidth:
-					// For begin/end/WB assertions in newly reached states, use wbCtx.
+					// For begin/end/WB/NL assertions in newly reached states, use wbCtx (full ctx).
 					emptyOp2 := syntax.EmptyOp(inst2.Arg)
 					follow2 := true
-					if emptyOp2&(syntax.EmptyBeginText|syntax.EmptyBeginLine) != 0 {
+					if emptyOp2&syntax.EmptyBeginText != 0 {
 						follow2 = follow2 && (wbCtx&ecBegin) != 0
 					}
-					if emptyOp2&(syntax.EmptyEndText|syntax.EmptyEndLine) != 0 {
+					if emptyOp2&syntax.EmptyBeginLine != 0 {
+						follow2 = follow2 && (wbCtx&(ecBegin|ecBeginLine)) != 0
+					}
+					if emptyOp2&syntax.EmptyEndText != 0 {
 						follow2 = follow2 && (wbCtx&ecEnd) != 0
+					}
+					if emptyOp2&syntax.EmptyEndLine != 0 {
+						follow2 = follow2 && (wbCtx&(ecEnd|ecEndLine)) != 0
 					}
 					if emptyOp2&syntax.EmptyWordBoundary != 0 {
 						follow2 = follow2 && (wbCtx&ecWordBoundary) != 0
@@ -290,7 +313,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 	// Convert NFA state set + prevWasWord context to unique string key.
 	// Two states with identical NFA sets but different prevWasWord values are
 	// distinct DFA states because they resolve word boundary assertions differently.
-	setToKey := func(states []uint32, prevWasWord bool) string {
+	setToKey := func(states []uint32, prevWasWord bool, prevWasNewline ...bool) string {
 		key := ""
 		seen := make(map[uint32]bool)
 		for _, s := range states {
@@ -301,6 +324,9 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 		}
 		if prevWasWord {
 			key += "W"
+		}
+		if len(prevWasNewline) > 0 && prevWasNewline[0] {
+			key += "N"
 		}
 		return key
 	}
@@ -421,6 +447,40 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 		queue = append(queue, workItem{dfaState: dfa.midStartWord, nfaSet: midStartSet, prevWasWord: true})
 	}
 
+	// Mid-string start state (prev=newline): used when attempt_start > 0 and prev byte was '\n'.
+	// NFA set uses ecBeginLine context so (?m:^) assertions fire.
+	if dfa.hasNewlineBoundary {
+		midStartNewlineSet := epsilonClosure([]uint32{uint32(prog.Start)}, ecBeginLine)
+		midStartNewlineKey := setToKey(midStartNewlineSet, false, true) // prevWasWord=false, prevWasNewline=true
+		if id, exists := stateMap[midStartNewlineKey]; exists {
+			dfa.midStartNewline = id
+			if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
+				dfa.immediateAccepting[dfa.midStartNewline] = true
+			}
+		} else {
+			dfa.midStartNewline = nextStateID
+			stateMap[midStartNewlineKey] = nextStateID
+			nextStateID++
+			// midStartNewline is prevWasNewline=true: ecBeginLine fires, ecNoWordBoundary fires (newline is non-word).
+			if isAccepting(midStartNewlineSet, ecEnd|ecNoWordBoundary) {
+				dfa.accepting[dfa.midStartNewline] = true
+			}
+			if isAccepting(midStartNewlineSet, 0) {
+				dfa.midAccepting[dfa.midStartNewline] = true
+			}
+			if isAccepting(midStartNewlineSet, ecNoWordBoundary) {
+				dfa.midAcceptingNW[dfa.midStartNewline] = true
+			}
+			if isAccepting(midStartNewlineSet, ecWordBoundary) {
+				dfa.midAcceptingW[dfa.midStartNewline] = true
+			}
+			if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
+				dfa.immediateAccepting[dfa.midStartNewline] = true
+			}
+			queue = append(queue, workItem{dfaState: dfa.midStartNewline, nfaSet: midStartNewlineSet, prevWasNewline: true})
+		}
+	}
+
 	// Process work queue
 	for len(queue) > 0 {
 		item := queue[0]
@@ -524,14 +584,33 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 			return m
 		}
 
+		// expandedForNewline: expansion for '\n' bytes.
+		// When reading '\n': it is non-word (use word/non-word boundary context),
+		// and ecEndLine fires ((?m:$) assertions follow).
+		var expandedForNewline []uint32
+		if dfa.hasNewlineBoundary {
+			var nlWBCtx int
+			if item.prevWasWord {
+				nlWBCtx = ecWordBoundary | ecEndLine
+			} else {
+				nlWBCtx = ecNoWordBoundary | ecEndLine
+			}
+			expandedForNewline = expandWithWB(item.nfaSet, nlWBCtx)
+		}
+
 		inputMapWord := buildInputMap(expandedForWordChar)
 		inputMapNonWord := buildInputMap(expandedForNonWordChar)
+		var inputMapNewline map[rune][]uint32
+		if dfa.hasNewlineBoundary {
+			inputMapNewline = buildInputMap(expandedForNewline)
+		}
 
 		// Collect transitions for all 256 bytes, using the appropriate inputMap.
 		// Two bytes with the same isWordChar class and identical next-NFA-states map
 		// to the same next DFA state naturally via setToKey.
-		getOrAddState := func(nextSet []uint32, nextPrevWasWord bool) int {
-			nextKey := setToKey(nextSet, nextPrevWasWord)
+		getOrAddState := func(nextSet []uint32, nextPrevWasWord bool, nextPrevWasNewline ...bool) int {
+			nlFlag := len(nextPrevWasNewline) > 0 && nextPrevWasNewline[0]
+			nextKey := setToKey(nextSet, nextPrevWasWord, nlFlag)
 			nextDFAState, exists := stateMap[nextKey]
 			if !exists {
 				nextDFAState = nextStateID
@@ -599,9 +678,20 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 				dfa.unicodeTrans[item.dfaState][r] = nextDFAState
 			}
 		}
-		// Process non-word-char bytes using inputMapNonWord
+		// Process '\n' using inputMapNewline (ecEndLine context, nextPrevWasNewline=true).
+		if dfa.hasNewlineBoundary && inputMapNewline != nil {
+			if nextNFAStates, ok := inputMapNewline['\n']; ok {
+				nextSet := epsilonClosure(nextNFAStates, 0)
+				nextDFAState := getOrAddState(nextSet, false, true) // nextPrevWasNewline=true
+				dfa.unicodeTrans[item.dfaState]['\n'] = nextDFAState
+			}
+		}
+		// Process non-word-char bytes (excluding '\n' if handled above) using inputMapNonWord
 		for r, nextNFAStates := range inputMapNonWord {
 			if !isWordChar(byte(r)) {
+				if dfa.hasNewlineBoundary && r == '\n' {
+					continue // handled above
+				}
 				nextSet := epsilonClosure(nextNFAStates, 0)
 				nextDFAState := getOrAddState(nextSet, false)
 				dfa.unicodeTrans[item.dfaState][r] = nextDFAState
@@ -654,18 +744,20 @@ func isWordCharByte(b byte) bool {
 
 // dfaTable holds the DFA state transition table.
 type dfaTable struct {
-	startState            int
-	midStartState         int          // start state for attempt_start>0 in find mode (prev=non-word)
-	midStartWordState     int          // start state for attempt_start>0 in find mode (prev=word)
-	numStates             int
-	acceptStates          map[int]bool // eofAccept: accepting at end of input
-	midAcceptStates       map[int]bool // midAccept: accepting at any position (no WB context)
-	midAcceptNWStates     map[int]bool // midAcceptNW: accepts before non-word byte (WB triggered)
-	midAcceptWStates      map[int]bool // midAcceptW: accepts before word byte (WB triggered)
-	immediateAcceptStates map[int]bool // leftmost-first: accept without scanning further
-	transitions           []int        // flat [state*256+byte] = nextState; -1 = dead
-	startBeginAccept      bool         // true if startState accepts with ecBegin only (e.g. a*^)
-	hasWordBoundary       bool         // true if pattern contains \b or \B
+	startState             int
+	midStartState          int          // start state for attempt_start>0 in find mode (prev=non-word)
+	midStartWordState      int          // start state for attempt_start>0 in find mode (prev=word)
+	midStartNewlineState   int          // start state for attempt_start>0 in find mode (prev=newline)
+	numStates              int
+	acceptStates           map[int]bool // eofAccept: accepting at end of input
+	midAcceptStates        map[int]bool // midAccept: accepting at any position (no WB context)
+	midAcceptNWStates      map[int]bool // midAcceptNW: accepts before non-word byte (WB triggered)
+	midAcceptWStates       map[int]bool // midAcceptW: accepts before word byte (WB triggered)
+	immediateAcceptStates  map[int]bool // leftmost-first: accept without scanning further
+	transitions            []int        // flat [state*256+byte] = nextState; -1 = dead
+	startBeginAccept       bool         // true if startState accepts with ecBegin only (e.g. a*^)
+	hasWordBoundary        bool         // true if pattern contains \b or \B
+	hasNewlineBoundary     bool         // true if pattern contains (?m:^) or (?m:$)
 }
 
 // dfaTableFrom builds a dfaTable directly from a compiled dfa struct,
@@ -675,6 +767,7 @@ func dfaTableFrom(d *dfa) *dfaTable {
 		startState:            d.start,
 		midStartState:         d.midStart,
 		midStartWordState:     d.midStartWord,
+		midStartNewlineState:  d.midStartNewline,
 		numStates:             d.numStates,
 		acceptStates:          d.accepting,
 		midAcceptStates:       d.midAccepting,
@@ -684,6 +777,7 @@ func dfaTableFrom(d *dfa) *dfaTable {
 		transitions:           d.transitions,
 		startBeginAccept:      d.startBeginAccept,
 		hasWordBoundary:       d.hasWordBoundary,
+		hasNewlineBoundary:    d.hasNewlineBoundary,
 	}
 	minimizeDFA(t)
 	return t
@@ -827,17 +921,20 @@ func minimizeDFA(t *dfaTable) {
 	}
 
 	// Remap special state indices.
-	t.startState        = classOf[t.startState]
-	t.midStartState     = classOf[t.midStartState]
-	t.midStartWordState = classOf[t.midStartWordState]
-	t.numStates         = numClasses
-	t.transitions       = newTrans
-	t.acceptStates      = newAccept
-	t.midAcceptStates   = newMidAccept
-	t.midAcceptNWStates = newMidAcceptNW
-	t.midAcceptWStates  = newMidAcceptW
-	t.immediateAcceptStates = newImmAccept
-	// hasWordBoundary and startBeginAccept are pattern-level flags, unchanged.
+	t.startState             = classOf[t.startState]
+	t.midStartState          = classOf[t.midStartState]
+	t.midStartWordState      = classOf[t.midStartWordState]
+	if t.hasNewlineBoundary {
+		t.midStartNewlineState = classOf[t.midStartNewlineState]
+	}
+	t.numStates              = numClasses
+	t.transitions            = newTrans
+	t.acceptStates           = newAccept
+	t.midAcceptStates        = newMidAccept
+	t.midAcceptNWStates      = newMidAcceptNW
+	t.midAcceptWStates       = newMidAcceptW
+	t.immediateAcceptStates  = newImmAccept
+	// hasWordBoundary, hasNewlineBoundary and startBeginAccept are pattern-level flags, unchanged.
 }
 
 // computeByteClasses groups the 256 possible byte values into equivalence
@@ -952,8 +1049,9 @@ type dfaLayout struct {
 	teddyT2HiBytes []byte
 
 	// Find-mode DFA states
-	wasmMidStart     uint32
-	wasmMidStartWord uint32
+	wasmMidStart        uint32
+	wasmMidStartWord    uint32
+	wasmMidStartNewline uint32
 	wasmPrefixEnd    uint32
 	startBeginAccept bool
 
@@ -1233,6 +1331,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool) 
 	if needFind {
 		l.wasmMidStart = uint32(t.midStartState + 1)
 		l.wasmMidStartWord = uint32(t.midStartWordState + 1)
+		l.wasmMidStartNewline = uint32(t.midStartNewlineState + 1)
 		prefixEndState := t.midStartState
 		for _, ch := range l.prefix {
 			prefixEndState = t.transitions[prefixEndState*256+int(ch)]
@@ -1436,12 +1535,12 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *Man
 			l.rowMapOff, l.useRowDedup)
 	} else {
 		body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
-			l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff,
+			l.wasmMidStartNewline, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff,
 			l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
 			l.useU8, l.useCompression, l.startBeginAccept,
 			l.immediateAcceptOff, l.hasImmAccept,
 			l.wordCharTableOff, l.needWordCharTable,
-			l.midAcceptNWOff, l.midAcceptWOff,
+			l.midAcceptNWOff, l.midAcceptWOff, t.hasNewlineBoundary,
 			l.firstByteFlags, l.firstBytes,
 			l.teddyLoOff, l.teddyHiOff,
 			l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0,
@@ -2062,6 +2161,20 @@ func isAnchoredFind(t *dfaTable) bool {
 			return false
 		}
 	}
+	// If pattern has newline boundary, midStartNewline may have transitions even when
+	// midStart is dead — the pattern can match at line starts (after '\n').
+	if t.hasNewlineBoundary {
+		if t.midAcceptStates[t.midStartNewlineState] ||
+			t.acceptStates[t.midStartNewlineState] ||
+			t.immediateAcceptStates[t.midStartNewlineState] {
+			return false
+		}
+		for b := 0; b < 256; b++ {
+			if t.transitions[t.midStartNewlineState*256+b] >= 0 {
+				return false
+			}
+		}
+	}
 	if t.hasWordBoundary {
 		if t.midAcceptStates[t.midStartWordState] ||
 			t.acceptStates[t.midStartWordState] ||
@@ -2492,7 +2605,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, mandatoryLit *MandatoryLit, rowMapOff int32, useRowDedup bool) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, mandatoryLit *MandatoryLit, rowMapOff int32, useRowDedup bool) []byte {
 	var b []byte
 
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
@@ -2796,10 +2909,10 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 	// emitDFAPrologue emits: state=..., pos=attempt_start, last_accept=-1, midAccept check.
 	// Used only for the mandatory-lit code path (which has no prefix scan).
 	emitDFAPrologue := func(b []byte) []byte {
-		if startState == midStartState && (!hasWordBoundary || midStartState == midStartWordState) {
+		if startState == midStartState && (!hasWordBoundary || midStartState == midStartWordState) && (!hasNewlineBoundary || midStartState == midStartNewlineState) {
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(startState))
-		} else if !hasWordBoundary {
+		} else if !hasWordBoundary && !hasNewlineBoundary {
 			b = append(b, 0x20, 0x04)
 			b = append(b, 0x45)
 			b = append(b, 0x04, 0x7F)
@@ -2808,6 +2921,29 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 			b = append(b, 0x05)
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(midStartState))
+			b = append(b, 0x0B)
+		} else if hasNewlineBoundary && !hasWordBoundary {
+			b = append(b, 0x20, 0x04)
+			b = append(b, 0x45)
+			b = append(b, 0x04, 0x7F)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(startState))
+			b = append(b, 0x05)
+			b = append(b, 0x20, 0x00)
+			b = append(b, 0x20, 0x04)
+			b = append(b, 0x6A)
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x6B)
+			b = append(b, 0x2D, 0x00, 0x00) // prev byte
+			b = append(b, 0x41, 0x0A)       // '\n'
+			b = append(b, 0x46)             // i32.eq
+			b = append(b, 0x04, 0x7F)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(midStartNewlineState))
+			b = append(b, 0x05)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(midStartState))
+			b = append(b, 0x0B)
 			b = append(b, 0x0B)
 		} else {
 			b = append(b, 0x20, 0x04)
@@ -2830,8 +2966,25 @@ func buildFindBody(startState, midStartState, midStartWordState, prefixEndState 
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(midStartWordState))
 			b = append(b, 0x05)
+			if hasNewlineBoundary {
+				b = append(b, 0x20, 0x00)
+				b = append(b, 0x20, 0x04)
+				b = append(b, 0x6A)
+				b = append(b, 0x41, 0x01)
+				b = append(b, 0x6B)
+				b = append(b, 0x2D, 0x00, 0x00) // prev byte
+				b = append(b, 0x41, 0x0A)       // '\n'
+				b = append(b, 0x46)             // i32.eq
+				b = append(b, 0x04, 0x7F)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(midStartNewlineState))
+				b = append(b, 0x05)
+			}
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(midStartState))
+			if hasNewlineBoundary {
+				b = append(b, 0x0B)
+			}
 			b = append(b, 0x0B)
 			b = append(b, 0x0B)
 		}
