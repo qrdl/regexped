@@ -1031,3 +1031,60 @@ regexps
 -;4-7;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category 17: Long inputs (~500 chars)
+# Tests memory layout correctness on larger inputs.
+# Short prose repeated to ~500 chars, with/without embedded matches.
+# ============================================================
+Cat17LongDFAFind
+strings
+"The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance. The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance. The application encountered an err"
+"The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating https://example.com/api permissions. Please contact your system administrator for assistance. The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance."
+regexps
+"https?://[a-z./]+"
+-;-;-;-;-
+-;150-173;-;-;150-173
+Cat17LongBacktracking
+strings
+"2026-03-22T14:05:01 app[42] ERROR: connection refused at endpoint"
+"The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance. The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance. The application encountered an err"
+regexps
+"(a+?)(a+)"
+-;-;-;-
+-;-;-;-
+"([a-z]+)([0-9]+)"
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category 18: State-count boundary
+# Patterns with exactly 253, 254, 255, 256, 257 DFA states
+# to verify the u8→u16 threshold (>256 states triggers u16).
+# a{N} has N+2 states (counting dead + states 0..N).
+# a{253}: 255 states (u8), a{254}: 256 states (u8 max), a{255}: 257 states (u16).
+# ============================================================
+Cat18StateCountBoundary
+strings
+""
+"a"
+"aaa"
+regexps
+"a{253}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"a{254}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"a{255}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"a{256}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"a{257}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
