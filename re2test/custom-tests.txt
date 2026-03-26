@@ -1332,3 +1332,62 @@ regexps
 0-3 0-2 2-3;0-3;-;-
 0-7 0-4 4-7;0-7;-;-
 0-5 0-4 4-5;0-5;-;-
+# ============================================================
+# Category 21: Ungreedy flag (?U) — swaps greedy and non-greedy
+# (?U) makes + and * non-greedy by default; +? and *? become greedy.
+# Cat21UngreedyDFA: find mode (no captures)
+# Cat21UngreedyBacktrack: groups, Backtracking ((?U) with quantifiers
+#   forces hasNonGreedyQuantifiers → Backtracking always used)
+# ============================================================
+Cat21UngreedyDFA
+strings
+""
+"a"
+"aaa"
+"ab"
+"aabb"
+regexps
+"(?U:a+)"
+-;-;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+"(?U:.+)"
+-;-;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+"(?U:a+b+)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-2;-;-
+-;0-3;-;-
+Cat21UngreedyBacktrack
+strings
+""
+"a"
+"aaa"
+"ab"
+"aaabbb"
+regexps
+"(?U:(a+))"
+-;-;-;-
+0-1 0-1;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+"(?U:(a+)(b+))"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+-;0-4;-;-
+"(?U:(a*)(b+))"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+-;0-4;-;-
