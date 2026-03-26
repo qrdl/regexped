@@ -264,13 +264,10 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 	} else {
 		bt := newBacktrack(prog)
 
-		reStripped, _ := syntax.Parse(re.Pattern, syntax.Perl)
-		stripCaptures(reStripped)
-		progStripped, _ := syntax.Compile(reStripped.Simplify())
-		captureDFABase := utils.PageAlign(l.tableEnd)
-		captureDFAL    := compileDFAForBacktrack(progStripped, captureDFABase)
-
-		btBase     := utils.PageAlign(captureDFAL.tableEnd)
+		// Stack placed directly after LF DFA tables — no Phase 1 DFA needed.
+		// The wrapper already calls find_internal to locate the match; capture_internal
+		// receives the bounded slice (end_LF - start) and runs the NFA directly.
+		btBase     := utils.PageAlign(l.tableEnd)
 		numCapLocs := bt.numGroups * 2
 		frameSize  := 4 + numCapLocs*4 + 4
 		maxFrames  := bt.numAlts * 4096
@@ -280,12 +277,8 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 		stackLimit := stackBase + int32(stackSize)
 
 		p.numGroups   = bt.numGroups
-		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), captureDFAL)
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize))
 		p.tableEnd    = utils.PageAlign(btBase + int64(stackSize))
-
-		phase1Raw, phase1Count := stripSegCount(dfaDataSegments(captureDFAL, false))
-		p.dataBytes    = append(p.dataBytes, phase1Raw...)
-		p.dataSegCount += phase1Count
 	}
 
 	return p, nil
@@ -583,50 +576,6 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 	return wasmBytes, tableEnd, nil
 }
 
-
-// CompileOnePassGroups compiles a pattern to a OnePass WASM module exporting
-// a non-anchored groups function: (ptr i32, len i32, out_ptr i32) → i32.
-// The module contains find_internal (LF DFA find), capture_internal (OnePass body),
-// and a groups_exported wrapper. If the pattern does not qualify for OnePass, returns an error.
-func CompileOnePassGroups(pattern, exportName string, tableBase int64, standalone bool) ([]byte, int64, error) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return nil, 0, fmt.Errorf("parse error: %w", err)
-	}
-	prog, err := syntax.Compile(re.Simplify())
-	if err != nil {
-		return nil, 0, fmt.Errorf("compile error: %w", err)
-	}
-	if needsUnicodeSupport(prog) {
-		return nil, 0, fmt.Errorf("pattern contains Unicode features not yet supported")
-	}
-	if !isOnePass(prog) {
-		return nil, 0, fmt.Errorf("pattern is not one-pass deterministic")
-	}
-
-	op := newOnePass(prog)
-
-	// Find DFA — only needed for non-anchored patterns.
-	reStripped, _ := syntax.Parse(pattern, syntax.Perl)
-	stripCaptures(reStripped)
-	progStripped, _ := syntax.Compile(reStripped.Simplify())
-	dFind := newDFA(progStripped, false, true) // leftmostFirst=true
-	tFind := dfaTableFrom(dFind)
-
-	var findDFAL *dfaLayout
-	opTableBase := tableBase
-	if !isAnchoredFind(tFind) {
-		findDFAL = buildDFALayout(tFind, tableBase, true, true)
-		opTableBase = utils.PageAlign(findDFAL.tableEnd)
-	}
-
-	opDataSize := int64(op.numStates * 256)
-	tableEnd := utils.PageAlign(opTableBase + opDataSize)
-	memPages := int32(tableEnd / 65536)
-
-	wasmBytes := genOnePassWASM(op, opTableBase, exportName, standalone, memPages, findDFAL)
-	return wasmBytes, tableEnd, nil
-}
 
 // stripCaptures converts all capture groups in the regexp tree to non-capturing
 // by replacing each OpCapture node with its single sub-expression in-place.
