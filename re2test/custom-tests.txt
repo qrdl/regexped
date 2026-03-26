@@ -1007,9 +1007,6 @@ regexps
 -;0-7;-;-
 # ============================================================
 # Category 16: Multiline mode — (?m:^) and (?m:$) anchors
-# NOTE: regexped DFA does not track prev-was-newline context,
-# so (?m:^) only fires at absolute pos 0 (same as ^).
-# These tests document the current behaviour.
 # ============================================================
 Cat16Multiline
 strings
@@ -1088,3 +1085,51 @@ regexps
 -;-;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category 16b: Multiline mode with capture groups
+# (?m:^...$) with captures: tests non-anchored groups wrapper
+# where find_internal must locate line starts via midStartNewline,
+# and capture_internal must match within the line slice.
+# ============================================================
+Cat16MultilineGroups
+strings
+""
+"foo"
+"bar\nfoo"
+"foo\nbar"
+"bar\nfoo\nbaz"
+"2026-03-22 ERROR: oops"
+"done\n2026-03-22 WARNING: load high\nfin"
+regexps
+"(?m:^(foo))"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;-;-;-;-;-
+-;-;-;-;-;-
+"(?m:(foo)$)"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;-;-;-;-;-
+-;-;-;-;-;-
+"(?m:^(foo.*)$)"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;-;-;-;-;-
+-;-;-;-;-;-
+"(?m:^(\\d{4}-\\d{2}-\\d{2}) (ERROR|WARNING): (.+)$)"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+0-22 0-10 11-16 18-22;0-22;-;-;-;0-22 0-10 11-16 18-22
+-;5-34;-;-;-;5-34 5-15 16-23 25-34

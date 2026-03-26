@@ -241,16 +241,16 @@ var tests = []testCase{
 	// .* before (ERROR|WARNING|FATAL) makes this non-OnePass: the .* loop and
 	// the keyword alternation share overlapping first-character sets.
 	// The Backtracking engine is used automatically as a fallback.
-	// Inputs are single matching log lines; anchoredGroups mode matches the
-	// full line and extracts timestamp, level, and message captures.
+	// (?m:^...multiline...$) makes ^ and $ match at line boundaries so the
+	// non-anchored groups wrapper scans a multi-line log and extracts one
+	// match per ERROR/WARNING/FATAL line.
 	{
 		name:    "log-capture",
-		pattern: `^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) .*(ERROR|WARNING|FATAL): (.+)$`,
+		pattern: `(?m:^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) .*(ERROR|WARNING|FATAL): (.+)$)`,
 		mode:    anchoredGroups,
 		inputs: []namedInput{
-			{"ERROR short",   "2026-03-22T14:05:01 app[42] ERROR: connection refused"},
-			{"WARNING long",  "2026-03-22T14:05:02 service.worker.pool[7] WARNING: queue depth 9823 exceeds threshold 5000, consider scaling"},
-			{"FATAL long",    "2026-03-22T14:05:03 db.connection.manager[1] FATAL: unable to acquire lock on table users after 30000ms, shutting down"},
+			{"few matches",  logInput(true)},
+			{"no matches",   logInput(false)},
 		},
 	},
 }
@@ -492,6 +492,47 @@ Laura,Red,laura@example.com
 "Mallory ""M""","Ops, EU",mallory@corp.com
 Niaj,Black,niaj@example.com
 `
+}
+
+// logInput returns a 20-line structured log. If withErrors is true, 4 lines
+// are ERROR/WARNING/FATAL entries that match the log-capture pattern; the
+// rest are INFO/DEBUG lines that do not match.
+func logInput(withErrors bool) string {
+	info := "2026-03-22T14:05:00 app[1] INFO: server started on port 8080\n" +
+		"2026-03-22T14:05:01 app[1] DEBUG: accepted connection from 10.0.0.5:54321\n" +
+		"2026-03-22T14:05:02 db.pool[3] INFO: acquired connection from pool (idle=4)\n" +
+		"2026-03-22T14:05:03 cache[2] DEBUG: cache hit for key user:1042\n" +
+		"2026-03-22T14:05:04 app[1] INFO: GET /api/v1/users/1042 200 3ms\n" +
+		"2026-03-22T14:05:05 app[1] DEBUG: accepted connection from 10.0.0.6:54322\n" +
+		"2026-03-22T14:05:06 cache[2] DEBUG: cache miss for key user:9999\n" +
+		"2026-03-22T14:05:07 db.pool[3] INFO: query executed in 12ms rows=1\n" +
+		"2026-03-22T14:05:08 app[1] INFO: GET /api/v1/users/9999 200 15ms\n" +
+		"2026-03-22T14:05:09 app[1] DEBUG: connection from 10.0.0.5:54321 closed\n" +
+		"2026-03-22T14:05:10 app[1] INFO: GET /healthz 200 1ms\n" +
+		"2026-03-22T14:05:11 db.pool[3] DEBUG: pool stats: active=2 idle=3 waiting=0\n" +
+		"2026-03-22T14:05:12 cache[2] INFO: evicted 128 entries (maxmem reached)\n" +
+		"2026-03-22T14:05:13 app[1] INFO: POST /api/v1/jobs 202 8ms\n" +
+		"2026-03-22T14:05:14 worker[5] DEBUG: job 7f3a picked up by worker pool\n" +
+		"2026-03-22T14:05:15 worker[5] INFO: job 7f3a completed in 340ms\n"
+	if !withErrors {
+		return info
+	}
+	return "2026-03-22T14:05:00 app[1] INFO: server started on port 8080\n" +
+		"2026-03-22T14:05:01 app[1] DEBUG: accepted connection from 10.0.0.5:54321\n" +
+		"2026-03-22T14:05:02 db.pool[3] ERROR: connection refused after 3 retries\n" +
+		"2026-03-22T14:05:03 cache[2] DEBUG: cache miss for key user:9999\n" +
+		"2026-03-22T14:05:04 app[1] INFO: GET /api/v1/users/1042 200 3ms\n" +
+		"2026-03-22T14:05:05 service.worker.pool[7] WARNING: queue depth 9823 exceeds threshold 5000, consider scaling\n" +
+		"2026-03-22T14:05:06 cache[2] DEBUG: cache miss for key session:abc\n" +
+		"2026-03-22T14:05:07 db.pool[3] INFO: query executed in 12ms rows=1\n" +
+		"2026-03-22T14:05:08 app[1] ERROR: panic in handler: runtime error: index out of range [3] with length 3\n" +
+		"2026-03-22T14:05:09 app[1] DEBUG: connection from 10.0.0.5:54321 closed\n" +
+		"2026-03-22T14:05:10 app[1] INFO: GET /healthz 200 1ms\n" +
+		"2026-03-22T14:05:11 db.pool[3] DEBUG: pool stats: active=2 idle=3 waiting=0\n" +
+		"2026-03-22T14:05:12 db.connection.manager[1] FATAL: unable to acquire lock on table users after 30000ms, shutting down\n" +
+		"2026-03-22T14:05:13 app[1] INFO: POST /api/v1/jobs 202 8ms\n" +
+		"2026-03-22T14:05:14 worker[5] DEBUG: job 7f3a picked up by worker pool\n" +
+		"2026-03-22T14:05:15 worker[5] INFO: job 7f3a completed in 340ms\n"
 }
 
 func sqlCleanInput() string {
