@@ -1,6 +1,6 @@
 # Regex Engines
 
-Regexped implements three engines: **DFA**, **OnePass**, and **Backtracking**. The right engine is selected automatically at compile time based on the pattern and the requested function types.
+Regexped implements four engines: **Compiled DFA**, **DFA**, **OnePass**, and **Backtracking**. The right engine is selected automatically at compile time based on the pattern and the requested function types.
 
 ---
 
@@ -10,7 +10,8 @@ Selection priority (highest first):
 
 1. **OnePass** — pattern has capture groups AND qualifies for one-pass determinism
 2. **Backtracking** — pattern has capture groups but fails the OnePass check
-3. **DFA** — all other patterns (captures are stripped when only `match_func`/`find_func` are requested)
+3. **Compiled DFA** — no captures; minimised DFA has ≤ 256 states (default threshold)
+4. **DFA** — no captures; minimised DFA exceeds the compiled-DFA threshold
 
 A pattern qualifies for OnePass if:
 - Every `|` alternation has branches with disjoint first-character sets (deterministic at each position)
@@ -18,6 +19,56 @@ A pattern qualifies for OnePass if:
 - Pattern compiles to ≤ 100 NFA instructions
 
 If a pattern has captures but fails the OnePass check (e.g. `(a|ab)c`, `(a*)(a*)`, `(.*)(foo)`), the Backtracking engine is used automatically.
+
+---
+
+## Compiled DFA Engine
+
+**Used for:** `match_func` when the minimised DFA fits within the compiled-DFA threshold (default: 256 states).
+
+**Complexity:** O(n) time; no data-segment transition table.
+
+### How it works
+
+Like the DFA engine, the NFA is converted to a minimised DFA via subset construction and Hopcroft's algorithm. The difference is in how transitions are executed at runtime.
+
+Instead of looking up the next state in a memory table, every transition is baked directly into the WASM function body as a two-level `br_table` dispatch:
+
+```
+// Outer dispatch: jump to the handler for the current state
+block $dispatch_done
+  block $state_{N-1}  ... block $state_0
+    local.get $state
+    i32.sub 1                          // 1-based WASM state → 0-based index
+    br_table 0 1 … N-1 N-1
+  end $state_0
+    // State 0 handler: inner dispatch on byte class
+    block $class_{K-1}  ... block $class_0
+      local.get $class
+      br_table 0 1 … K-1 K-1
+    end $class_0
+      i32.const <next_state_s0_c0>
+      local.set $state
+      br <depth_to_dispatch_done>
+    end $class_1
+      ...
+    end $class_{K-1}  // dead class for state 0 → return -1 or branch out
+  end $state_1
+    ...
+  end $state_{N-1}
+end $dispatch_done  // falls through with $state set to next state
+```
+
+The 256-byte `classMap` data segment is still loaded at runtime (one byte per input byte, always L1-resident). The full transition table (which would be `numStates × numClasses` bytes) is eliminated entirely.
+
+### When it is used
+
+The compiled path is activated when:
+- the minimised DFA has ≤ the compiled-DFA threshold states (default 256, hard ceiling 256)
+- state IDs fit in a u8 (implied by the ≤ 256 limit)
+- only anchored match is requested (`match_func`); find mode uses the table-driven DFA
+
+The threshold can be adjusted (including disabled with a negative value) via `CompileOptions.CompiledDFAThreshold`. This field is not exposed in the YAML config — it is an internal knob for benchmarking and programmatic use.
 
 ---
 

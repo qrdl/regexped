@@ -1,26 +1,22 @@
 // perftest benchmarks regexped WASM against the regex crate and prints a summary table.
 //
-// Run from the perf_test/ directory:
+// Run from the perftest/ directory:
 //
-//	cd perf_test && go run ./perftest
+//	cd perftest && make run
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
+	"time"
 
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/merge"
-	"github.com/qrdl/regexped/utils"
 )
 
 // --------------------------------------------------------------------------
@@ -230,7 +226,7 @@ var tests = []testCase{
 		mode:    find,
 		inputs: []namedInput{
 			{"no-comments 100KB", sourceCodeInput(nil, nil)},
-			{"comments 100KB",    sourceCodeInput(
+			{"comments 100KB", sourceCodeInput(
 				[]string{"// initialise connection pool", "// retry with exponential backoff", "// validate request parameters"},
 				[]string{"/*\n * Copyright 2026 Example Corp.\n * Licensed under the Apache License, Version 2.0.\n */",
 					"/* TODO: replace with proper error handling once the new\n   error framework is merged into main branch */"},
@@ -249,8 +245,8 @@ var tests = []testCase{
 		pattern: `(?m:^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) .*(ERROR|WARNING|FATAL): (.+)$)`,
 		mode:    anchoredGroups,
 		inputs: []namedInput{
-			{"few matches",  logInput(true)},
-			{"no matches",   logInput(false)},
+			{"few matches", logInput(true)},
+			{"no matches", logInput(false)},
 		},
 	},
 }
@@ -548,199 +544,382 @@ func sqlInjectInput() string {
 }
 
 // --------------------------------------------------------------------------
-// Paths
-
-const wasmTarget = "wasm32-wasip1"
-
-func harnessWasm(dir, name string) string {
-	return filepath.Join(dir, name, "target", wasmTarget, "release", name+".wasm")
-}
-
-// wasmMergePath is set by the --wasm-merge flag.
-var wasmMergePath string
-
-// wasmMerge returns the wasm-merge binary path from the flag, or "wasm-merge" for $PATH lookup.
-func wasmMerge() string {
-	if wasmMergePath != "" {
-		return wasmMergePath
-	}
-	return "wasm-merge"
-}
-
-// --------------------------------------------------------------------------
-// Measurement
-
-var reNs        = regexp.MustCompile(`(?:match|find):\s*(\d+)ns`)
-var reUs        = regexp.MustCompile(`compile:\s*(\d+)`)
-var reResultAll = regexp.MustCompile(`result:(\S+)`)
-
-// runHarness runs a pre-built WASM harness via wasmtime and parses timing output.
-// results collects all "result:X" lines (excluding "result:done").
-// For single-result modes (anchored, groups) results has one element.
-// For find mode results holds all match spans.
-func runHarness(harnessPath string, args ...string) (compileUs, opNs int64, results []string, err error) {
-	cmdArgs := append([]string{"run", harnessPath}, args...)
-	out, err := exec.Command("wasmtime", cmdArgs...).Output()
-	if err != nil {
-		return 0, 0, nil, err
-	}
-	s := string(out)
-	if m := reUs.FindStringSubmatch(s); m != nil {
-		compileUs, _ = strconv.ParseInt(m[1], 10, 64)
-	}
-	if m := reNs.FindStringSubmatch(s); m != nil {
-		opNs, _ = strconv.ParseInt(m[1], 10, 64)
-	}
-	for _, m := range reResultAll.FindAllStringSubmatch(s, -1) {
-		if m[1] == "done" {
-			break
-		}
-		results = append(results, m[1])
-	}
-	return compileUs, opNs, results, nil
-}
-
-func resultsEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// buildRegexped compiles pattern to WASM, merges with the harness, and returns
-// the merged WASM path (caller must delete the temp file).
-func buildRegexped(dir, harnessName, exportName string, mode compile.MatchMode, pattern string) (string, error) {
-	opts := compile.CompileOptions{
-		MaxDFAStates:  100000,
-		ForceEngine:   compile.EngineDFA,
-		Mode:          mode,
-		LeftmostFirst: mode == compile.ModeFind, // required for non-greedy semantics in find mode
-	}
-	// Determine tableBase from the harness's Rust memory top so DFA tables don't overlap.
-	harness := harnessWasm(dir, harnessName)
-	rustTop, err := utils.RustMemTop(harness)  //nolint
-	if err != nil {
-		return "", fmt.Errorf("read harness memory: %w", err)
-	}
-	// Place DFA tables 512KB above rustTop to prevent overlap with the Rust heap.
-	//
-	// The Rust harnesses receive input as a WASI command-line argument (args[1]),
-	// which the WASI runtime heap-allocates starting near __heap_base (≈ rustTop).
-	// For a 100KB input the heap can grow to roughly rustTop + 100KB + runtime overhead
-	// (~50KB), putting the heap top at rustTop + ~150KB. The 512KB margin keeps DFA
-	// tables safely above that.
-	//
-	// If you add a test whose input exceeds ~350KB (i.e. rustTop + 512KB - ~150KB
-	// runtime overhead), increase this margin accordingly, OR refactor the harnesses
-	// to write input into a fixed buffer placed above the DFA tables instead of
-	// passing it as a WASI command-line argument. See the "Fixed Input Buffer" plan
-	// in the code comments / design notes for the proper long-term fix.
-	tableBase := utils.PageAlign(rustTop + 512*1024)
-	wasmBytes, _, err := compile.CompileRegex(pattern, exportName, tableBase, false, opts)
-	if err != nil {
-		return "", fmt.Errorf("compile: %w", err)
-	}
-
-	// Write pattern WASM to temp file.
-	patTmp, err := os.CreateTemp("", "pattern-*.wasm")
-	if err != nil {
-		return "", err
-	}
-	patPath := patTmp.Name()
-	patTmp.Write(wasmBytes)
-	patTmp.Close()
-	defer os.Remove(patPath)
-
-	// Prepare merged output file.
-	mergedTmp, err := os.CreateTemp("", "merged-*.wasm")
-	if err != nil {
-		return "", err
-	}
-	mergedPath := mergedTmp.Name()
-	mergedTmp.Close()
-
-	// Use merge.CmdMerge which handles memory patching and wasm-merge invocation.
-	cfg := config.BuildConfig{
-		WasmMerge: wasmMerge(),
-		Regexes: []config.RegexEntry{
-			{WasmFile: patPath, ImportModule: "pattern"},
-		},
-	}
-	if err := merge.CmdMerge(cfg, mergedPath, []string{harness, patPath}); err != nil {
-		os.Remove(mergedPath)
-		return "", fmt.Errorf("merge: %w", err)
-	}
-	return mergedPath, nil
-}
-
-// buildRegexpedGroups compiles a pattern to a groups WASM (OnePass or
-// Backtracking) and merges it with the groups harness.
-func buildRegexpedGroups(dir, harnessName, exportName, pattern string) (string, error) {
-	harness := harnessWasm(dir, harnessName)
-	rustTop, err := utils.RustMemTop(harness)
-	if err != nil {
-		return "", fmt.Errorf("read harness memory: %w", err)
-	}
-	// Same 512KB margin as buildRegexped — see comment there for details and the
-	// threshold above which this margin must be increased.
-	tableBase := utils.PageAlign(rustTop + 512*1024)
-	re := config.RegexEntry{Pattern: pattern, GroupsFunc: exportName}
-	wasmBytes, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, false)
-	if err != nil {
-		return "", fmt.Errorf("compile: %w", err)
-	}
-
-	patTmp, err := os.CreateTemp("", "pattern-*.wasm")
-	if err != nil {
-		return "", err
-	}
-	patPath := patTmp.Name()
-	patTmp.Write(wasmBytes)
-	patTmp.Close()
-	defer os.Remove(patPath)
-
-	mergedTmp, err := os.CreateTemp("", "merged-*.wasm")
-	if err != nil {
-		return "", err
-	}
-	mergedPath := mergedTmp.Name()
-	mergedTmp.Close()
-
-	cfg := config.BuildConfig{
-		WasmMerge: wasmMerge(),
-		Regexes:   []config.RegexEntry{{WasmFile: patPath, ImportModule: "pattern"}},
-	}
-	if err := merge.CmdMerge(cfg, mergedPath, []string{harness, patPath}); err != nil {
-		os.Remove(mergedPath)
-		return "", fmt.Errorf("merge: %w", err)
-	}
-	return mergedPath, nil
-}
-
-// --------------------------------------------------------------------------
-// Table output
-
-type row struct {
-	label      string
-	compileUs  int64 // regex crate compile time (µs); shown only on first input
-	regexNs    int64
-	regexpedNs int64
-}
+// Constants and types
 
 const (
-	wLabel    = 28
-	wCompile  = 14
-	wRegex    = 12
-	wRegexped = 12
-	wSpeedup  = 8
+	// inputBase is where test inputs are written in regexped WASM memory.
+	inputBase = int32(0)
+	// tableBase is the start of DFA/OnePass tables; must be page-aligned and above input.
+	tableBase = int64(65536) // page 1; page 0 is reserved for input/slots
+	// slotsBase is where capture output slots are written for groups calls.
+	slotsBase = int32(512)
+	// benchIters is the number of iterations run inside WASM per benchmark call.
+	// The loop executes entirely within WASM so CGo overhead is paid only once.
+	benchIters = 100_000
 )
 
-func printTable(tc testCase, rows []row) {
+type benchResult struct {
+	instantiation time.Duration
+	compilation   time.Duration // zero means n/a (regexped has no runtime compilation)
+	avgExec       time.Duration
+	wasmSize      int
+}
+
+// --------------------------------------------------------------------------
+// Bench shim WASM modules
+//
+// Each shim imports one regexped function and loops it benchIters times.
+// The shim is instantiated via NewInstance with the regexped export as the
+// single extern — no Linker needed. One Go→WASM call per benchmark, so
+// CGo overhead is amortised across all iterations.
+//
+// Hand-encoded WASM binary format. Sections in order:
+//
+//	magic+version, type, import, function, export, code
+//
+// matchBenchShim: imports "regexped"."match" (i32,i32)->i32
+//
+//	exports "bench"            (i32,i32,i32)->void
+var matchBenchShim = []byte{
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic, version
+	// type section: (i32,i32)->i32 ; (i32,i32,i32)->void
+	0x01, 0x0d, 0x02,
+	0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+	0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x00,
+	// import section: "regexped"."match" = func type 0
+	0x02, 0x12, 0x01,
+	0x08, 0x72, 0x65, 0x67, 0x65, 0x78, 0x70, 0x65, 0x64,
+	0x05, 0x6d, 0x61, 0x74, 0x63, 0x68,
+	0x00, 0x00,
+	// function section: 1 func of type 1
+	0x03, 0x02, 0x01, 0x01,
+	// export section: "bench" -> func 1
+	0x07, 0x09, 0x01, 0x05, 0x62, 0x65, 0x6e, 0x63, 0x68, 0x00, 0x01,
+	// code section: bench body (ptr,len,iters; local i)
+	0x0a, 0x23, 0x01, 0x21, 0x01, 0x01, 0x7f,
+	0x02, 0x40, 0x03, 0x40,
+	0x20, 0x03, 0x20, 0x02, 0x4e, 0x0d, 0x01,
+	0x20, 0x00, 0x20, 0x01, 0x10, 0x00, 0x1a,
+	0x20, 0x03, 0x41, 0x01, 0x6a, 0x21, 0x03,
+	0x0c, 0x00, 0x0b, 0x0b, 0x0b,
+}
+
+// findBenchShim: imports "regexped"."find" (i32,i32)->i64
+//
+//	exports "bench"           (i32,i32,i32)->void
+var findBenchShim = []byte{
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+	// type section: (i32,i32)->i64 ; (i32,i32,i32)->void
+	0x01, 0x0d, 0x02,
+	0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7e, // note 0x7e = i64
+	0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x00,
+	// import section: "regexped"."find" = func type 0
+	0x02, 0x11, 0x01,
+	0x08, 0x72, 0x65, 0x67, 0x65, 0x78, 0x70, 0x65, 0x64,
+	0x04, 0x66, 0x69, 0x6e, 0x64,
+	0x00, 0x00,
+	0x03, 0x02, 0x01, 0x01,
+	0x07, 0x09, 0x01, 0x05, 0x62, 0x65, 0x6e, 0x63, 0x68, 0x00, 0x01,
+	0x0a, 0x23, 0x01, 0x21, 0x01, 0x01, 0x7f,
+	0x02, 0x40, 0x03, 0x40,
+	0x20, 0x03, 0x20, 0x02, 0x4e, 0x0d, 0x01,
+	0x20, 0x00, 0x20, 0x01, 0x10, 0x00, 0x1a,
+	0x20, 0x03, 0x41, 0x01, 0x6a, 0x21, 0x03,
+	0x0c, 0x00, 0x0b, 0x0b, 0x0b,
+}
+
+// groupsBenchShim: imports "regexped"."groups" (i32,i32,i32)->i32
+//
+//	exports "bench"             (i32,i32,i32,i32)->void
+var groupsBenchShim = []byte{
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+	// type section: (i32,i32,i32)->i32 ; (i32,i32,i32,i32)->void
+	0x01, 0x0f, 0x02,
+	0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+	0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x00,
+	// import section: "regexped"."groups" = func type 0
+	0x02, 0x13, 0x01,
+	0x08, 0x72, 0x65, 0x67, 0x65, 0x78, 0x70, 0x65, 0x64,
+	0x06, 0x67, 0x72, 0x6f, 0x75, 0x70, 0x73,
+	0x00, 0x00,
+	0x03, 0x02, 0x01, 0x01,
+	0x07, 0x09, 0x01, 0x05, 0x62, 0x65, 0x6e, 0x63, 0x68, 0x00, 0x01,
+	// code section: bench body (ptr,len,out_ptr,iters; local i)
+	0x0a, 0x25, 0x01, 0x23, 0x01, 0x01, 0x7f,
+	0x02, 0x40, 0x03, 0x40,
+	0x20, 0x04, 0x20, 0x03, 0x4e, 0x0d, 0x01,
+	0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x10, 0x00, 0x1a,
+	0x20, 0x04, 0x41, 0x01, 0x6a, 0x21, 0x04,
+	0x0c, 0x00, 0x0b, 0x0b, 0x0b,
+}
+
+// --------------------------------------------------------------------------
+// Warmup
+
+// minimalWASM is the smallest valid WASM module: magic + version, no sections.
+var minimalWASM = []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+
+// warmup compiles a trivial WASM module to bring Cranelift's JIT machinery into CPU
+// i-cache before the first real instantiation measurement.
+func warmup(engine *wasmtime.Engine) {
+	mod, err := wasmtime.NewModule(engine, minimalWASM)
+	if err != nil {
+		return
+	}
+	store := wasmtime.NewStore(engine)
+	_, _ = wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+}
+
+// --------------------------------------------------------------------------
+// Benchmark helpers
+
+// regexpedEngineName returns the name of the engine regexped uses for this test case.
+func regexpedEngineName(tc testCase) string {
+	if tc.mode != anchoredGroups {
+		// Captures are stripped for anchored/find modes; engine is always DFA.
+		return "DFA"
+	}
+	opts := compile.CompileOptions{MaxDFAStates: 100000}
+	et, err := compile.SelectEngine(tc.pattern, opts)
+	if err != nil {
+		return "?"
+	}
+	return et.String()
+}
+
+// benchRegexped compiles tc.pattern to a standalone WASM module and benchmarks
+// instantiation and execution. Execution is timed via a bench shim WASM that
+// imports the regexped function and loops benchIters times internally — only
+// one CGo crossing for the entire measurement.
+func benchRegexped(tc testCase, input string, engine *wasmtime.Engine) benchResult {
+	re := config.RegexEntry{Pattern: tc.pattern}
+	var fnExport string
+	switch tc.mode {
+	case anchored:
+		re.MatchFunc = "match"
+		fnExport = "match"
+	case find:
+		re.FindFunc = "find"
+		fnExport = "find"
+	case anchoredGroups:
+		re.GroupsFunc = "groups"
+		fnExport = "groups"
+	}
+	wasmBytes, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped compile(%s): %v\n", tc.name, err)
+		return benchResult{}
+	}
+
+	// Measure JIT instantiation of the regexped module.
+	t0 := time.Now()
+	mod, err := wasmtime.NewModule(engine, wasmBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped NewModule(%s): %v\n", tc.name, err)
+		return benchResult{}
+	}
+	store := wasmtime.NewStore(engine)
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped NewInstance(%s): %v\n", tc.name, err)
+		return benchResult{}
+	}
+	instantiation := time.Since(t0)
+
+	// Get memory and the exported function.
+	var mem *wasmtime.Memory
+	if exp := inst.GetExport(store, "memory"); exp != nil {
+		mem = exp.Memory()
+	}
+	rpdFn := inst.GetFunc(store, fnExport)
+	if rpdFn == nil || mem == nil {
+		fmt.Fprintf(os.Stderr, "  regexped: missing export for %s\n", tc.name)
+		return benchResult{instantiation: instantiation}
+	}
+
+	// Instantiate the bench shim with the regexped function as its single import.
+	var shimBytes []byte
+	switch tc.mode {
+	case anchored:
+		shimBytes = matchBenchShim
+	case find:
+		shimBytes = findBenchShim
+	case anchoredGroups:
+		shimBytes = groupsBenchShim
+	}
+	shimMod, err := wasmtime.NewModule(engine, shimBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped shim parse(%s): %v\n", tc.name, err)
+		return benchResult{instantiation: instantiation}
+	}
+	shimInst, err := wasmtime.NewInstance(store, shimMod, []wasmtime.AsExtern{rpdFn})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped shim instantiate(%s): %v\n", tc.name, err)
+		return benchResult{instantiation: instantiation}
+	}
+	benchFn := shimInst.GetFunc(store, "bench")
+	if benchFn == nil {
+		fmt.Fprintf(os.Stderr, "  regexped shim: missing bench export for %s\n", tc.name)
+		return benchResult{instantiation: instantiation}
+	}
+
+	// Write input into regexped's memory and make a single timed call.
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	inputLen := int32(len(input))
+
+	var callErr error
+	t1 := time.Now()
+	if tc.mode == anchoredGroups {
+		_, callErr = benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters))
+	} else {
+		_, callErr = benchFn.Call(store, inputBase, inputLen, int32(benchIters))
+	}
+	total := time.Since(t1)
+	if callErr != nil {
+		fmt.Fprintf(os.Stderr, "  regexped bench(%s): %v\n", tc.name, callErr)
+		return benchResult{instantiation: instantiation}
+	}
+
+	return benchResult{
+		instantiation: instantiation,
+		avgExec:       total / benchIters,
+		wasmSize:      len(wasmBytes),
+	}
+}
+
+// benchRegex instantiates regex_bench.wasm, compiles the pattern via regex_init,
+// and times execution via the internal-timing regex_bench_* functions.
+// A single Go→WASM call runs benchIters iterations internally and returns
+// total nanoseconds, eliminating CGo overhead from the per-iteration measurement.
+func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmtime.Engine) benchResult {
+	// Measure JIT instantiation (NewModule + linker.Instantiate).
+	t0 := time.Now()
+	mod, err := wasmtime.NewModule(engine, regexWasmBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regex NewModule(%s): %v\n", tc.name, err)
+		return benchResult{}
+	}
+	linker := wasmtime.NewLinker(engine)
+	if err = linker.DefineWasi(); err != nil {
+		fmt.Fprintf(os.Stderr, "  regex DefineWasi(%s): %v\n", tc.name, err)
+		return benchResult{}
+	}
+	store := wasmtime.NewStore(engine)
+	store.SetWasi(wasmtime.NewWasiConfig())
+	inst, err := linker.Instantiate(store, mod)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regex Instantiate(%s): %v\n", tc.name, err)
+		return benchResult{}
+	}
+	instantiation := time.Since(t0)
+
+	// Get exported functions and memory.
+	var mem *wasmtime.Memory
+	if exp := inst.GetExport(store, "memory"); exp != nil {
+		mem = exp.Memory()
+	}
+	getPtrFn := inst.GetFunc(store, "get_input_ptr")
+	initFn := inst.GetFunc(store, "regex_init")
+	var benchExecFn *wasmtime.Func
+	switch tc.mode {
+	case anchored:
+		benchExecFn = inst.GetFunc(store, "regex_bench_match")
+	case find:
+		benchExecFn = inst.GetFunc(store, "regex_bench_find")
+	case anchoredGroups:
+		benchExecFn = inst.GetFunc(store, "regex_bench_groups")
+	}
+	if mem == nil || getPtrFn == nil || initFn == nil || benchExecFn == nil {
+		fmt.Fprintf(os.Stderr, "  regex: missing export for %s\n", tc.name)
+		return benchResult{instantiation: instantiation}
+	}
+
+	// Get the address of the static input buffer inside WASM.
+	ptrRes, err := getPtrFn.Call(store)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regex get_input_ptr(%s): %v\n", tc.name, err)
+		return benchResult{instantiation: instantiation}
+	}
+	inputPtr := int(ptrRes.(int32))
+	buf := mem.UnsafeData(store)
+
+	// Write pattern and time regex compilation.
+	pat := tc.pattern
+	if tc.mode == anchored {
+		pat = "^(?:" + tc.pattern + ")$"
+	}
+	patBytes := []byte(pat)
+	copy(buf[inputPtr:], patBytes)
+	t1 := time.Now()
+	_, err = initFn.Call(store, int32(len(patBytes)))
+	compilation := time.Since(t1)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regex_init(%s): %v\n", tc.name, err)
+		return benchResult{instantiation: instantiation}
+	}
+
+	// Write input and call the bench function once — it loops internally and
+	// returns total nanoseconds via std::time::Instant.
+	copy(buf[inputPtr:], []byte(input))
+	inputLen := int32(len(input))
+
+	nsRes, callErr := benchExecFn.Call(store, inputLen, int32(benchIters))
+	if callErr != nil {
+		fmt.Fprintf(os.Stderr, "  regex bench(%s): %v\n", tc.name, callErr)
+		return benchResult{instantiation: instantiation, compilation: compilation}
+	}
+	totalNs := nsRes.(int64)
+
+	return benchResult{
+		instantiation: instantiation,
+		compilation:   compilation,
+		avgExec:       time.Duration(totalNs / int64(benchIters)),
+		wasmSize:      len(regexWasmBytes),
+	}
+}
+
+// --------------------------------------------------------------------------
+// Output
+
+func fmtDur(d time.Duration) string {
+	if d == 0 {
+		return "n/a"
+	}
+	if d >= time.Millisecond {
+		return fmt.Sprintf("%.2f ms", float64(d)/float64(time.Millisecond))
+	}
+	if d >= time.Microsecond {
+		return fmt.Sprintf("%.1f µs", float64(d)/float64(time.Microsecond))
+	}
+	return fmt.Sprintf("%d ns", d.Nanoseconds())
+}
+
+func fmtSize(n int) string {
+	if n == 0 {
+		return "n/a"
+	}
+	if n >= 1024 {
+		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
+func fmtRatio(rped, rxp time.Duration) string {
+	if rped == 0 || rxp == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.2fx", float64(rxp)/float64(rped))
+}
+
+type inputResult struct {
+	label   string
+	size    int
+	rxpAvg  time.Duration
+	rpedAvg time.Duration
+}
+
+func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs []inputResult) {
 	modeStr := "anchored"
 	switch tc.mode {
 	case find:
@@ -748,147 +927,84 @@ func printTable(tc testCase, rows []row) {
 	case anchoredGroups:
 		modeStr = "groups"
 	}
-
-	sep := strings.Repeat("─", wLabel+2) + "┼" +
-		strings.Repeat("─", wCompile+2) + "┼" +
-		strings.Repeat("─", wRegex+2) + "┼" +
-		strings.Repeat("─", wRegexped+2) + "┼" +
-		strings.Repeat("─", wSpeedup+2)
-
-	fmt.Printf("\nPattern: %-20s [%s]\n", tc.name, modeStr)
-	fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s\n",
-		wLabel, "input",
-		wCompile, "regex compile",
-		wRegex, "regex crate",
-		wRegexped, "regexped",
-		wSpeedup, "speedup")
-	fmt.Printf("  %s\n", sep)
-
-	for _, r := range rows {
-		compileStr := ""
-		if r.compileUs > 0 {
-			compileStr = fmt.Sprintf("%dµs", r.compileUs)
-		}
-		speedup := ""
-		if r.regexNs > 0 && r.regexpedNs > 0 {
-			ratio := float64(r.regexNs) / float64(r.regexpedNs)
-			if ratio >= 1.0 {
-				speedup = fmt.Sprintf("%.1f×", ratio)
-			} else {
-				speedup = fmt.Sprintf("%.2f×", ratio)
-			}
-		}
-		fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s\n",
-			wLabel, truncate(r.label, wLabel),
-			wCompile, compileStr,
-			wRegex, fmtNs(r.regexNs),
-			wRegexped, fmtNs(r.regexpedNs),
-			wSpeedup, speedup)
+	fmt.Printf("\n=== %s  [%s, %s] ===\n", tc.name, engineName, modeStr)
+	fmt.Printf("  %-26s  %14s  %14s  %8s\n", "", "regex", "regexped", "ratio")
+	fmt.Printf("  %-26s  %14s  %14s  %8s\n",
+		"instantiation:",
+		fmtDur(rxp.instantiation),
+		fmtDur(rped.instantiation),
+		fmtRatio(rped.instantiation, rxp.instantiation))
+	fmt.Printf("  %-26s  %14s  %14s\n",
+		"wasm size:",
+		fmtSize(rxp.wasmSize),
+		fmtSize(rped.wasmSize))
+	fmt.Printf("  %-26s  %14s\n",
+		"compilation:",
+		fmtDur(rxp.compilation))
+	for _, inp := range inputs {
+		fmt.Printf("\n  input: %s (%d bytes)\n", inp.label, inp.size)
+		fmt.Printf("    %-24s  %14s  %14s  %8s\n",
+			"avg execution:",
+			fmtDur(inp.rxpAvg),
+			fmtDur(inp.rpedAvg),
+			fmtRatio(inp.rpedAvg, inp.rxpAvg))
 	}
-}
-
-func fmtNs(ns int64) string {
-	if ns <= 0 {
-		return "-"
-	}
-	return fmt.Sprintf("%dns", ns)
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-1] + "…"
 }
 
 // --------------------------------------------------------------------------
 // Main
 
 func main() {
-	flag.StringVar(&wasmMergePath, "wasm-merge", "", "path to wasm-merge binary (default: search $PATH)")
-	flag.Parse()
-
-	// Silence library log output — only the table goes to stdout.
+	// Silence library log output — only the benchmark table goes to stdout.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
+	// Load the pre-built regex_bench.wasm harness.
 	dir, _ := os.Getwd()
+	regexWasmPath := filepath.Join(dir, "regex_bench", "target", "wasm32-wasip1", "release", "regex_bench.wasm")
+	regexWasmBytes, err := os.ReadFile(regexWasmPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot read %s: %v\n", regexWasmPath, err)
+		fmt.Fprintf(os.Stderr, "hint: run 'make harnesses' first\n")
+		os.Exit(1)
+	}
+
+	engine := wasmtime.NewEngine()
+
+	// Warm up Cranelift before the first real measurement.
+	warmup(engine)
 
 	for _, tc := range tests {
-		isGroups := tc.mode == anchoredGroups
+		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
+		engineName := regexpedEngineName(tc)
 
-		// Select harnesses.
-		var regexHarness, regexpedHarness, exportName string
-		switch tc.mode {
-		case find:
-			regexHarness = harnessWasm(dir, "regex_find_harness")
-			regexpedHarness = "regexped_find_harness"
-			exportName = "pattern_find"
-		case anchoredGroups:
-			regexHarness = harnessWasm(dir, "regex_groups_harness")
-			regexpedHarness = "regexped_groups_harness"
-			exportName = "groups"
-		default:
-			regexHarness = harnessWasm(dir, "regex_harness")
-			regexpedHarness = "regexped_harness"
-			exportName = "pattern_match"
-		}
-
-		// Build merged regexped WASM once per pattern.
-		fmt.Fprintf(os.Stderr, "==> compiling %s...\n", tc.name)
-		var mergedPath string
-		var err error
-		if isGroups {
-			mergedPath, err = buildRegexpedGroups(dir, regexpedHarness, exportName, tc.pattern)
-		} else {
-			compileMode := compile.ModeAnchoredMatch
-			if tc.mode == find {
-				compileMode = compile.ModeFind
-			}
-			mergedPath, err = buildRegexped(dir, regexpedHarness, exportName, compileMode, tc.pattern)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "SKIP %s: %v\n", tc.name, err)
-			continue
-		}
-		defer os.Remove(mergedPath)
-
-		var rows []row
-		var sharedCompileUs int64
+		// Benchmark all inputs; use the first input's instantiation timing for display
+		// (instantiation depends only on pattern/module, not on input content).
+		var rxpInst, rpedInst benchResult
+		var inputResults []inputResult
 
 		for i, inp := range tc.inputs {
-			// Regex crate timing + result.
-			compileUs, regexNs, regexResult, hErr := runHarness(regexHarness, tc.pattern, inp.value)
-			if hErr != nil {
-				fmt.Fprintf(os.Stderr, "  warn: regex harness failed for %q: %v\n", inp.label, hErr)
-			}
+			rxp := benchRegex(regexWasmBytes, tc, inp.value, engine)
+			rped := benchRegexped(tc, inp.value, engine)
 			if i == 0 {
-				sharedCompileUs = compileUs
+				rxpInst = rxp
+				rpedInst = rped
 			}
-
-			// Regexped timing + result.
-			_, regexpedNs, regexpedResult, rErr := runHarness(mergedPath, inp.value)
-			if rErr != nil {
-				fmt.Fprintf(os.Stderr, "  warn: regexped harness failed for %q: %v\n", inp.label, rErr)
-			}
-
-			// Correctness check: compare all results (all matches for find, single for others).
-			if len(regexResult) > 0 && len(regexpedResult) > 0 && !resultsEqual(regexResult, regexpedResult) {
-				fmt.Fprintf(os.Stderr, "  MISMATCH %s / %q: regex=%v regexped=%v\n",
-					tc.name, inp.label, regexResult, regexpedResult)
-			}
-
-			r := row{
-				label:      inp.label,
-				regexNs:    regexNs,
-				regexpedNs: regexpedNs,
-			}
-			if i == 0 {
-				r.compileUs = sharedCompileUs
-			}
-			rows = append(rows, r)
+			inputResults = append(inputResults, inputResult{
+				label:   inp.label,
+				size:    len(inp.value),
+				rxpAvg:  rxp.avgExec,
+				rpedAvg: rped.avgExec,
+			})
 		}
 
-		printTable(tc, rows)
+		printResults(tc, engineName, benchResult{
+			instantiation: rxpInst.instantiation,
+			compilation:   rxpInst.compilation,
+			wasmSize:      rxpInst.wasmSize,
+		}, benchResult{
+			instantiation: rpedInst.instantiation,
+			wasmSize:      rpedInst.wasmSize,
+		}, inputResults)
 	}
 	fmt.Println()
 }

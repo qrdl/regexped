@@ -29,7 +29,6 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 	// Analyse pattern complexity and DFA viability
 	analysis := analysePattern(prog)
 
-
 	// Check for anchors and word boundaries which are incompatible with our DFA implementation
 	// Classical DFA cannot properly handle position-dependent matching required by anchors (^, $, \A, \z)
 	// The issue: DFA construction doesn't track whether anchors are required or optional.
@@ -99,7 +98,6 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 	// 3. If DFA is feasible (low state count, fits in memory), use it for speed
 	// 4. Otherwise, use Backtracking as the general-purpose default
 
-
 	// Check if pattern has capture groups
 	// NumCap counts: [0]=full match start, [1]=full match end, [2+]=explicit capture groups
 	// However, Simplify() may optimize away captures like (a){0}, so also check the flag
@@ -125,11 +123,43 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 			opts.LeftmostFirst = true
 		}
 		slog.Debug("Engine selected", "engine", "DFA", "reason", "leftmost-first semantics for alternations/nested quantifiers", "complexity", complexity, "states", dfaStates)
-		return EngineDFA
+		return maybeCompiledDFA(EngineDFA, dfaStates, opts)
 	}
 
 	slog.Debug("Engine selected", "engine", "DFA", "reason", "simple pattern", "complexity", complexity, "states", dfaStates)
+	return maybeCompiledDFA(EngineDFA, dfaStates, opts)
+}
+
+// maybeCompiledDFA promotes engine from EngineDFA to EngineCompiledDFA when the
+// estimated state count fits within the compiled-DFA threshold.
+// The estimate is pre-minimisation; the final decision is confirmed in buildDFALayout.
+func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptions) EngineType {
+	if engine != EngineDFA {
+		return engine
+	}
+	threshold := resolveCompiledDFAThreshold(opts)
+	if threshold > 0 && estimatedStates+1 <= threshold {
+		return EngineCompiledDFA
+	}
 	return EngineDFA
+}
+
+// resolveCompiledDFAThreshold returns the effective compiled-DFA state threshold
+// from opts. Zero → default (256). Negative → disabled (0). Capped at 256.
+func resolveCompiledDFAThreshold(opts *CompileOptions) int {
+	if opts == nil {
+		return 256
+	}
+	switch {
+	case opts.CompiledDFAThreshold < 0:
+		return 0 // disabled
+	case opts.CompiledDFAThreshold == 0:
+		return 256 // default
+	case opts.CompiledDFAThreshold > 256:
+		return 256 // hard ceiling
+	default:
+		return opts.CompiledDFAThreshold
+	}
 }
 
 // hasNonGreedyQuantifiers reports whether the NFA contains any non-greedy

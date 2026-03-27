@@ -13,17 +13,17 @@ import (
 
 // dfa represents a compiled DFA with optimised transition tables.
 type dfa struct {
-	start        int
-	midStart     int // start state for mid-string positions (attempt_start > 0) with prev=non-word
+	start           int
+	midStart        int // start state for mid-string positions (attempt_start > 0) with prev=non-word
 	midStartWord    int // start state for mid-string positions with prev=word
 	midStartNewline int // start state for mid-string positions with prev=newline (for (?m:^))
 	// differs from start when pattern has begin anchors (^/\A) — those are not followed here.
-	numStates        int
-	accepting        map[int]bool // eofAccepting: accepts when at end of input (via $ or \z)
-	midAccepting     map[int]bool // accepts at any position (no end-anchor expansion needed)
+	numStates    int
+	accepting    map[int]bool // eofAccepting: accepts when at end of input (via $ or \z)
+	midAccepting map[int]bool // accepts at any position (no end-anchor expansion needed)
 	// midAcceptingNW and midAcceptingW are for word-boundary patterns (find mode only).
-	midAcceptingNW   map[int]bool
-	midAcceptingW    map[int]bool
+	midAcceptingNW map[int]bool
+	midAcceptingW  map[int]bool
 	// midAcceptingNL[s]: state s accepts BEFORE consuming the next byte when prev was '\n' (for (?m:^)).
 	midAcceptingNL   map[int]bool
 	startBeginAccept bool // true if start state accepts with ecBegin only (e.g. a*^)
@@ -32,11 +32,11 @@ type dfa struct {
 	transitions  []int                // Flat array: [numStates * 256]
 	unicodeTrans map[int]map[rune]int // state -> (unicode rune -> next state)
 
-	hasEndAnchor        bool
-	hasWordBoundary     bool
-	hasNewlineBoundary  bool // true when pattern contains (?m:^) or (?m:$)
-	needsUnicode        bool
-	immediateAccepting  map[int]bool // leftmost-first: accept without scanning further
+	hasEndAnchor       bool
+	hasWordBoundary    bool
+	hasNewlineBoundary bool // true when pattern contains (?m:^) or (?m:$)
+	needsUnicode       bool
+	immediateAccepting map[int]bool // leftmost-first: accept without scanning further
 }
 
 func (d *dfa) Type() EngineType {
@@ -50,9 +50,10 @@ func (d *dfa) Type() EngineType {
 // alternative can only match empty — lower-priority byte-consumers were suppressed.
 //
 // Examples (after suppression):
-//   |a start: [InstMatch, rune_a_suppressed_was_here] -> but NFA set = [InstMatch] after
-//             suppression means just InstMatch first -> true
-//   a?|b start: NFA = [rune_a, InstMatch] (rune_b suppressed) -> rune_a before match -> false
+//
+//	|a start: [InstMatch, rune_a_suppressed_was_here] -> but NFA set = [InstMatch] after
+//	          suppression means just InstMatch first -> true
+//	a?|b start: NFA = [rune_a, InstMatch] (rune_b suppressed) -> rune_a before match -> false
 func isImmediateAccepting(states []uint32, prog *syntax.Prog) bool {
 	for _, pc := range states {
 		switch prog.Inst[pc].Op {
@@ -215,7 +216,10 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 		// For each state in the original set, if it is an EmptyWordBoundary or
 		// EmptyNoWordBoundary that fires, expand from its Out state.
 		// We insert new states right after the firing instruction (maintaining order).
-		var insertions []struct{ afterIdx int; newStates []uint32 }
+		var insertions []struct {
+			afterIdx  int
+			newStates []uint32
+		}
 
 		for i, pc := range closedSet {
 			inst := &prog.Inst[pc]
@@ -288,7 +292,10 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 				}
 			}
 			if len(newStates) > 0 {
-				insertions = append(insertions, struct{ afterIdx int; newStates []uint32 }{i, newStates})
+				insertions = append(insertions, struct {
+					afterIdx  int
+					newStates []uint32
+				}{i, newStates})
 			}
 		}
 
@@ -773,21 +780,21 @@ func isWordCharByte(b byte) bool {
 
 // dfaTable holds the DFA state transition table.
 type dfaTable struct {
-	startState             int
-	midStartState          int          // start state for attempt_start>0 in find mode (prev=non-word)
-	midStartWordState      int          // start state for attempt_start>0 in find mode (prev=word)
-	midStartNewlineState   int          // start state for attempt_start>0 in find mode (prev=newline)
-	numStates              int
-	acceptStates           map[int]bool // eofAccept: accepting at end of input
-	midAcceptStates        map[int]bool // midAccept: accepting at any position (no WB context)
-	midAcceptNWStates      map[int]bool // midAcceptNW: accepts before non-word byte (WB triggered)
-	midAcceptWStates       map[int]bool // midAcceptW: accepts before word byte (WB triggered)
-	midAcceptNLStates      map[int]bool // midAcceptNL: accepts before '\n' byte ((?m:$) triggered)
-	immediateAcceptStates  map[int]bool // leftmost-first: accept without scanning further
-	transitions            []int        // flat [state*256+byte] = nextState; -1 = dead
-	startBeginAccept       bool         // true if startState accepts with ecBegin only (e.g. a*^)
-	hasWordBoundary        bool         // true if pattern contains \b or \B
-	hasNewlineBoundary     bool         // true if pattern contains (?m:^) or (?m:$)
+	startState            int
+	midStartState         int // start state for attempt_start>0 in find mode (prev=non-word)
+	midStartWordState     int // start state for attempt_start>0 in find mode (prev=word)
+	midStartNewlineState  int // start state for attempt_start>0 in find mode (prev=newline)
+	numStates             int
+	acceptStates          map[int]bool // eofAccept: accepting at end of input
+	midAcceptStates       map[int]bool // midAccept: accepting at any position (no WB context)
+	midAcceptNWStates     map[int]bool // midAcceptNW: accepts before non-word byte (WB triggered)
+	midAcceptWStates      map[int]bool // midAcceptW: accepts before word byte (WB triggered)
+	midAcceptNLStates     map[int]bool // midAcceptNL: accepts before '\n' byte ((?m:$) triggered)
+	immediateAcceptStates map[int]bool // leftmost-first: accept without scanning further
+	transitions           []int        // flat [state*256+byte] = nextState; -1 = dead
+	startBeginAccept      bool         // true if startState accepts with ecBegin only (e.g. a*^)
+	hasWordBoundary       bool         // true if pattern contains \b or \B
+	hasNewlineBoundary    bool         // true if pattern contains (?m:^) or (?m:$)
 }
 
 // dfaTableFrom builds a dfaTable directly from a compiled dfa struct,
@@ -938,37 +945,49 @@ func minimizeDFA(t *dfaTable) {
 	}
 
 	// Accept maps for the minimized DFA.
-	newAccept    := make(map[int]bool)
+	newAccept := make(map[int]bool)
 	newMidAccept := make(map[int]bool)
 	newMidAcceptNW := make(map[int]bool)
-	newMidAcceptW  := make(map[int]bool)
+	newMidAcceptW := make(map[int]bool)
 	newMidAcceptNL := make(map[int]bool)
-	newImmAccept   := make(map[int]bool)
+	newImmAccept := make(map[int]bool)
 	for s := 0; s < n; s++ {
 		c := classOf[s]
-		if t.acceptStates[s]          { newAccept[c]      = true }
-		if t.midAcceptStates[s]       { newMidAccept[c]   = true }
-		if t.midAcceptNWStates[s]     { newMidAcceptNW[c] = true }
-		if t.midAcceptWStates[s]      { newMidAcceptW[c]  = true }
-		if t.midAcceptNLStates[s]     { newMidAcceptNL[c] = true }
-		if t.immediateAcceptStates[s] { newImmAccept[c]   = true }
+		if t.acceptStates[s] {
+			newAccept[c] = true
+		}
+		if t.midAcceptStates[s] {
+			newMidAccept[c] = true
+		}
+		if t.midAcceptNWStates[s] {
+			newMidAcceptNW[c] = true
+		}
+		if t.midAcceptWStates[s] {
+			newMidAcceptW[c] = true
+		}
+		if t.midAcceptNLStates[s] {
+			newMidAcceptNL[c] = true
+		}
+		if t.immediateAcceptStates[s] {
+			newImmAccept[c] = true
+		}
 	}
 
 	// Remap special state indices.
-	t.startState             = classOf[t.startState]
-	t.midStartState          = classOf[t.midStartState]
-	t.midStartWordState      = classOf[t.midStartWordState]
+	t.startState = classOf[t.startState]
+	t.midStartState = classOf[t.midStartState]
+	t.midStartWordState = classOf[t.midStartWordState]
 	if t.hasNewlineBoundary {
 		t.midStartNewlineState = classOf[t.midStartNewlineState]
 	}
-	t.numStates              = numClasses
-	t.transitions            = newTrans
-	t.acceptStates           = newAccept
-	t.midAcceptStates        = newMidAccept
-	t.midAcceptNWStates      = newMidAcceptNW
-	t.midAcceptWStates       = newMidAcceptW
-	t.midAcceptNLStates      = newMidAcceptNL
-	t.immediateAcceptStates  = newImmAccept
+	t.numStates = numClasses
+	t.transitions = newTrans
+	t.acceptStates = newAccept
+	t.midAcceptStates = newMidAccept
+	t.midAcceptNWStates = newMidAcceptNW
+	t.midAcceptWStates = newMidAcceptW
+	t.midAcceptNLStates = newMidAcceptNL
+	t.immediateAcceptStates = newImmAccept
 	// hasWordBoundary, hasNewlineBoundary and startBeginAccept are pattern-level flags, unchanged.
 }
 
@@ -1030,8 +1049,8 @@ type dfaLayout struct {
 	useCompression bool
 
 	// Transition table
-	tableOff   int32
-	tableBytes []byte
+	tableOff    int32
+	tableBytes  []byte
 	classMapOff int32
 	classMap    [256]byte
 	classRep    []int
@@ -1044,8 +1063,8 @@ type dfaLayout struct {
 	numUniqueRows int
 
 	// Accept flags
-	acceptOff    int32
-	acceptBytes  []byte
+	acceptOff   int32
+	acceptBytes []byte
 
 	// Find-mode flags
 	midAcceptOff   int32
@@ -1068,20 +1087,20 @@ type dfaLayout struct {
 	midAcceptNLBytes   []byte
 
 	// Fast-skip / SIMD (find mode only)
-	prefix        []byte
-	firstByteOff  int32
+	prefix         []byte
+	firstByteOff   int32
 	firstByteFlags [256]byte
-	firstBytes    []byte
-	teddyLoOff    int32
-	teddyHiOff    int32
-	teddyLoBytes  []byte
-	teddyHiBytes  []byte
-	teddyT1LoOff  int32
-	teddyT1HiOff  int32
+	firstBytes     []byte
+	teddyLoOff     int32
+	teddyHiOff     int32
+	teddyLoBytes   []byte
+	teddyHiBytes   []byte
+	teddyT1LoOff   int32
+	teddyT1HiOff   int32
 	teddyT1LoBytes []byte
 	teddyT1HiBytes []byte
-	teddyT2LoOff  int32
-	teddyT2HiOff  int32
+	teddyT2LoOff   int32
+	teddyT2HiOff   int32
 	teddyT2LoBytes []byte
 	teddyT2HiBytes []byte
 
@@ -1089,21 +1108,41 @@ type dfaLayout struct {
 	wasmMidStart        uint32
 	wasmMidStartWord    uint32
 	wasmMidStartNewline uint32
-	wasmPrefixEnd    uint32
-	startBeginAccept bool
+	wasmPrefixEnd       uint32
+	startBeginAccept    bool
 
 	// tableEnd is the highest memory address used by any table in this layout.
 	tableEnd int64
+
+	// useCompiledDispatch is true when the compiled (br_table) dispatch path is
+	// chosen instead of the table-driven interpreter. Set in buildDFALayout.
+	useCompiledDispatch bool
+	// useHybridDispatch is true when the hybrid path is chosen: table-driven
+	// state transitions combined with compiled self-loop inner blocks.
+	useHybridDispatch bool
 }
 
 // buildDFALayout computes all DFA table data and offsets. needFind must be true
 // when a find function will be emitted (computes extra tables for find mode).
-func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool) *dfaLayout {
+// compiledDFAThreshold is the resolved threshold (0 = disabled, 1..256 = active).
+func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int) *dfaLayout {
 	l := &dfaLayout{}
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
 	l.useU8 = l.numWASM <= 256
 	l.useCompression = l.useU8 && l.numWASM*256 > 32*1024
+
+	// Hybrid dispatch: active when useU8 and state count fits within threshold.
+	// Uses the natural compression decision (does NOT force compression).
+	// When the table is uncompressed, classMap is still computed at Go time for
+	// literalChain analysis but is not emitted to the WASM data segment.
+	if l.useU8 && compiledDFAThreshold > 0 && l.numWASM <= compiledDFAThreshold {
+		l.useHybridDispatch = true
+		if !l.useCompression {
+			// Pre-compute class info needed by literalChain at Go compile time.
+			l.classMap, l.classRep, l.numClasses = computeByteClasses(t)
+		}
+	}
 
 	// Word char table (find + word boundary only).
 	l.needWordCharTable = needFind && t.hasWordBoundary
@@ -1164,7 +1203,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool) 
 		}
 	}
 
-	// Row deduplication for u16: states with identical transition rows share one row.
+	// Row deduplication for u16 only (compiled dispatch never reaches here).
 	// u16 tables can be 100s of KB (e.g. 1000 states × 512 bytes = 512KB), well beyond
 	// L1 cache, so dedup meaningfully reduces cache pressure.  u8 tables are ≤ 32KB and
 	// typically L1-resident, so the extra indirection would hurt more than it helps.
@@ -1185,7 +1224,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool) 
 			}
 			rowOf[ws] = idx
 		}
-		if len(uniqueRows) < l.numWASM && len(uniqueRows) <= 255 {
+		if len(uniqueRows) < l.numWASM && len(uniqueRows) <= 255 && !l.useHybridDispatch {
 			l.useRowDedup = true
 			l.numUniqueRows = len(uniqueRows)
 			l.rowMapOff = l.tableOff
@@ -1202,7 +1241,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool) 
 		}
 	}
 
-	// EOF accept flags.
+	// EOF accept flags. For compiled dispatch, acceptOff follows classMap (no table).
 	l.acceptOff = l.tableOff + int32(len(l.tableBytes))
 	l.acceptBytes = make([]byte, l.numWASM)
 	for gs := range t.acceptStates {
@@ -1574,10 +1613,16 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 }
 
 // appendMatchCodeEntry appends a size-prefixed match function body to cs.
-func appendMatchCodeEntry(cs []byte, l *dfaLayout, hasImmAccept bool) []byte {
-	body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff,
-		l.numClasses, l.useU8, l.useCompression,
-		l.immediateAcceptOff, hasImmAccept, l.rowMapOff, l.useRowDedup)
+// Uses the hybrid dispatch path when l.useHybridDispatch is true.
+func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, hasImmAccept bool) []byte {
+	var body []byte
+	if l.useHybridDispatch {
+		body = buildHybridMatchBody(t, l, hasImmAccept)
+	} else {
+		body = buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff,
+			l.numClasses, l.useU8, l.useCompression,
+			l.immediateAcceptOff, hasImmAccept, l.rowMapOff, l.useRowDedup)
+	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -1586,7 +1631,13 @@ func appendMatchCodeEntry(cs []byte, l *dfaLayout, hasImmAccept bool) []byte {
 // Uses buildAnchoredFindBody when isAnchoredFind(t), else buildFindBody.
 func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *MandatoryLit) []byte {
 	var body []byte
-	if isAnchoredFind(t) {
+	if l.useHybridDispatch {
+		if isAnchoredFind(t) {
+			body = buildHybridAnchoredFindBody(t, l)
+		} else {
+			body = buildHybridFindBody(t, l, mandatoryLit)
+		}
+	} else if isAnchoredFind(t) {
 		body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff,
 			l.classMapOff, l.numClasses, l.useU8, l.useCompression,
 			l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept,
@@ -1614,11 +1665,11 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *Man
 // matchExport and findExport are the exported function names; either may be empty
 // to omit that function. At least one must be non-empty.
 // The public API of CompileRegex is unchanged — it maps exportName+mode internally.
-func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, standalone bool, memPages int32, leftmostFirst bool, mandatoryLit *MandatoryLit) []byte {
+func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, standalone bool, memPages int32, leftmostFirst bool, mandatoryLit *MandatoryLit, compiledDFAThreshold int) []byte {
 	needFind := findExport != ""
 	needMatch := matchExport != ""
 
-	l := buildDFALayout(t, tableBase, needFind, leftmostFirst)
+	l := buildDFALayout(t, tableBase, needFind, leftmostFirst, compiledDFAThreshold)
 
 	var out []byte
 	out = append(out, 0x00, 0x61, 0x73, 0x6D) // magic
@@ -1703,8 +1754,12 @@ func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, stand
 	// ── Code section ─────────────────────────────────────────────────────────
 	var cs []byte
 	cs = utils.AppendULEB128(cs, uint32(numTypes))
-	if needMatch { cs = appendMatchCodeEntry(cs, l, l.hasImmAccept) }
-	if needFind  { cs = appendFindCodeEntry(cs, l, t, mandatoryLit) }
+	if needMatch {
+		cs = appendMatchCodeEntry(cs, l, t, l.hasImmAccept)
+	}
+	if needFind {
+		cs = appendFindCodeEntry(cs, l, t, mandatoryLit)
+	}
 	out = appendSection(out, 10, cs)
 
 	// ── Data section ─────────────────────────────────────────────────────────
@@ -1712,7 +1767,6 @@ func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, stand
 
 	return out
 }
-
 
 // buildMatchBody returns the WASM function body bytes (locals + instructions + end).
 //
@@ -1859,11 +1913,11 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		} else {
 			b = append(b, 0x20, 0x02) // local.get state
 		}
-		b = append(b, 0x41, 0x08)       // i32.const 8
-		b = append(b, 0x74)             // i32.shl (row * 256)
+		b = append(b, 0x41, 0x08) // i32.const 8
+		b = append(b, 0x74)       // i32.shl (row * 256)
 		b = append(b, 0x6A)
-		b = append(b, 0x20, 0x00)       // local.get ptr
-		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x20, 0x00) // local.get ptr
+		b = append(b, 0x20, 0x03) // local.get pos
 		b = append(b, 0x6A)
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
 		b = append(b, 0x6A)
@@ -1929,18 +1983,20 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, tableOff)
 	if useRowDedup {
-		b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
-		b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, rowMapOff)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x6A)
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
 	} else {
-		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x20, 0x02) // local.get state
 	}
-	b = append(b, 0x41, 0x09)       // i32.const 9
-	b = append(b, 0x74)             // i32.shl (row/state * 512)
+	b = append(b, 0x41, 0x09) // i32.const 9
+	b = append(b, 0x74)       // i32.shl (row/state * 512)
 	b = append(b, 0x6A)
-	b = append(b, 0x20, 0x04)       // local.get byte
-	b = append(b, 0x41, 0x01)       // i32.const 1
-	b = append(b, 0x74)             // i32.shl (byte * 2)
+	b = append(b, 0x20, 0x04) // local.get byte
+	b = append(b, 0x41, 0x01) // i32.const 1
+	b = append(b, 0x74)       // i32.shl (byte * 2)
 	b = append(b, 0x6A)
 	b = append(b, 0x2F, 0x01, 0x00) // i32.load16_u
 	b = append(b, 0x21, 0x02)       // local.set state
@@ -2021,13 +2077,13 @@ func buildMatchBodyInline(b []byte,
 		}
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, immediateAcceptOff)
-		b = lget(b, localSt)        // local.get state
-		b = append(b, 0x6A)         // i32.add
+		b = lget(b, localSt)            // local.get state
+		b = append(b, 0x6A)             // i32.add
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
-		b = append(b, 0x04, 0x40)   // if (void)
-		b = lget(b, localPo)        // local.get pos
-		b = append(b, 0x0F)         // return
-		b = append(b, 0x0B)         // end if
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = lget(b, localPo)            // local.get pos
+		b = append(b, 0x0F)             // return
+		b = append(b, 0x0B)             // end if
 		return b
 	}
 
@@ -2108,13 +2164,15 @@ func buildMatchBodyInline(b []byte,
 		b = lget(b, localPo)
 		b = append(b, 0x6A)
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
-		b = lset(b, localCl)             // reuse localCl as byte
+		b = lset(b, localCl)            // reuse localCl as byte
 
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
 		if useRowDedup {
-			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
-			b = lget(b, localSt); b = append(b, 0x6A)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, rowMapOff)
+			b = lget(b, localSt)
+			b = append(b, 0x6A)
 			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
 		} else {
 			b = lget(b, localSt)
@@ -2201,7 +2259,6 @@ func computePrefix(t *dfaTable) []byte {
 	return prefix
 }
 
-
 // isAnchoredFind reports whether the DFA can only match starting at position 0.
 // This is true when midStartState (and midStartWordState for WB patterns) have
 // no live outgoing transitions and are not accepting. Patterns with a leading ^
@@ -2256,20 +2313,22 @@ func isAnchoredFind(t *dfaTable) bool {
 // so no scan loop is needed — we run the DFA once from pos=0 and return.
 //
 // Function signature: (ptr i32, len i32) → i64
-//   Returns (0 << 32 | end) on match, -1 on no match.
+//
+//	Returns (0 << 32 | end) on match, -1 on no match.
 //
 // Control flow:
-//   block $no_match
-//     block $found
-//       [DFA prologue: state=startState, pos=0, last_accept=-1]
-//       loop $scan
-//         if pos >= len  → eofAccept check; br 2→$found
-//         [WB pre-accept; transition; dead → br 2→$found; midAccept; immAccept; pos++]
-//       end $scan
-//     end $found
-//     if last_accept >= 0: return packed i64
-//   end $no_match
-//   i64.const -1
+//
+//	block $no_match
+//	  block $found
+//	    [DFA prologue: state=startState, pos=0, last_accept=-1]
+//	    loop $scan
+//	      if pos >= len  → eofAccept check; br 2→$found
+//	      [WB pre-accept; transition; dead → br 2→$found; midAccept; immAccept; pos++]
+//	    end $scan
+//	  end $found
+//	  if last_accept >= 0: return packed i64
+//	end $no_match
+//	i64.const -1
 func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, hasNewlineBoundary bool) []byte {
 	var b []byte
 
@@ -2477,8 +2536,10 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
 		if useRowDedup {
-			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02)
+			b = append(b, 0x6A)
 			b = append(b, 0x2D, 0x00, 0x00)
 		} else {
 			b = append(b, 0x20, 0x02)
@@ -2546,8 +2607,10 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
 		if useRowDedup {
-			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02)
+			b = append(b, 0x6A)
 			b = append(b, 0x2D, 0x00, 0x00)
 		} else {
 			b = append(b, 0x20, 0x02)
@@ -2752,9 +2815,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x21, 0x05)       // local.set last_accept
 		b = append(b, 0x0B)             // end nested if
 		// if last_accept >= 0: br $found
-		b = append(b, 0x20, 0x05)       // local.get last_accept
-		b = append(b, 0x41, 0x00)       // i32.const 0
-		b = append(b, 0x4E)             // i32.ge_s
+		b = append(b, 0x20, 0x05) // local.get last_accept
+		b = append(b, 0x41, 0x00) // i32.const 0
+		b = append(b, 0x4E)       // i32.ge_s
 		b = append(b, 0x0D, 0x02) // br_if 2 → exit $found
 		// attempt_start++; br $outer
 		b = append(b, 0x20, 0x04) // local.get attempt_start
@@ -3011,7 +3074,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		if useMandatoryLit {
 			b = append(b, 0x0B) // end loop $lit_outer  (unreachable)
 		}
-		b = append(b, 0x0B)       // end block $no_match  (unreachable)
+		b = append(b, 0x0B) // end block $no_match  (unreachable)
 		// no-match path falls through here
 		b = append(b, 0x42, 0x7F) // i64.const -1
 		b = append(b, 0x0B)       // end function
@@ -3129,19 +3192,19 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	// If attempt_start > lit_pos - MinOff: scan_start = lit_pos + 1; br 2 → $lit_outer.
 	// Depths from inside if block: 0=if, 1=$outer, 2=$lit_outer.
 	emitMLRangeCheck := func(b []byte) []byte {
-		b = append(b, 0x20, 0x04)                       // local.get attempt_start
-		b = append(b, 0x20, litPosLocal)                 // local.get lit_pos
+		b = append(b, 0x20, 0x04)        // local.get attempt_start
+		b = append(b, 0x20, litPosLocal) // local.get lit_pos
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, mandatoryLit.MinOff)
-		b = append(b, 0x6B)                              // i32.sub: lit_pos - MinOff
-		b = append(b, 0x4A)                              // i32.gt_s: attempt_start > lit_pos-MinOff?
-		b = append(b, 0x04, 0x40)                        // if (void)
-		b = append(b, 0x20, litPosLocal)                 // local.get lit_pos
-		b = append(b, 0x41, 0x01)                        // i32.const 1
-		b = append(b, 0x6A)                              // i32.add
-		b = append(b, 0x21, scanStartLocal)              // scan_start = lit_pos + 1
-		b = append(b, 0x0C, 0x02)                        // br 2 → $lit_outer
-		b = append(b, 0x0B)                              // end if
+		b = append(b, 0x6B)                 // i32.sub: lit_pos - MinOff
+		b = append(b, 0x4A)                 // i32.gt_s: attempt_start > lit_pos-MinOff?
+		b = append(b, 0x04, 0x40)           // if (void)
+		b = append(b, 0x20, litPosLocal)    // local.get lit_pos
+		b = append(b, 0x41, 0x01)           // i32.const 1
+		b = append(b, 0x6A)                 // i32.add
+		b = append(b, 0x21, scanStartLocal) // scan_start = lit_pos + 1
+		b = append(b, 0x0C, 0x02)           // br 2 → $lit_outer
+		b = append(b, 0x0B)                 // end if
 		return b
 	}
 
@@ -3173,23 +3236,23 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				b = append(b, 0x20, litPosLocal)
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, mandatoryLit.MaxOff)
-				b = append(b, 0x6B)                     // i32.sub
-				b = append(b, 0x21, simdMaskScanLocal)  // temp = adj
+				b = append(b, 0x6B)                    // i32.sub
+				b = append(b, 0x21, simdMaskScanLocal) // temp = adj
 				// Step 2: clamp temp to >= 0
 				b = append(b, 0x20, simdMaskScanLocal)
 				b = append(b, 0x41, 0x00)
-				b = append(b, 0x48)                     // i32.lt_s: temp < 0?
-				b = append(b, 0x04, 0x40)               // if (void)
+				b = append(b, 0x48)       // i32.lt_s: temp < 0?
+				b = append(b, 0x04, 0x40) // if (void)
 				b = append(b, 0x41, 0x00)
-				b = append(b, 0x21, simdMaskScanLocal)  // temp = 0
+				b = append(b, 0x21, simdMaskScanLocal) // temp = 0
 				b = append(b, 0x0B)
 				// Step 3: take max with attempt_start
 				b = append(b, 0x20, simdMaskScanLocal)
 				b = append(b, 0x20, 0x04)
-				b = append(b, 0x4A)                     // i32.gt_s: temp > attempt_start?
-				b = append(b, 0x04, 0x40)               // if (void)
+				b = append(b, 0x4A)       // i32.gt_s: temp > attempt_start?
+				b = append(b, 0x04, 0x40) // if (void)
 				b = append(b, 0x20, simdMaskScanLocal)
-				b = append(b, 0x21, 0x04)               // attempt_start = temp
+				b = append(b, 0x21, 0x04) // attempt_start = temp
 				b = append(b, 0x0B)
 				return b
 			},
@@ -3205,12 +3268,23 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		// ── u8 compressed find path ───────────────────────────────────────────
 		if useMandatoryLit {
 			// 8 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),lit_pos(7),scan_start(8),simdMask_scan(9),chunk_scan(10)
-			litPosLocal = 7; scanStartLocal = 8; simdMaskScanLocal = 9; chunkScanLocal = 10
+			litPosLocal = 7
+			scanStartLocal = 8
+			simdMaskScanLocal = 9
+			chunkScanLocal = 10
 			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 		} else {
 			// 6 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),simdMask(7),chunk(8),...,chunk2(14),t2Lo(15),t2Hi(16)
-			simdMaskLocal = 7; chunkLocal = 8; tLoLocal = 9; tHiLocal = 10
-			chunk1Local = 11; t1LoLocal = 12; t1HiLocal = 13; chunk2Local = 14; t2LoLocal = 15; t2HiLocal = 16
+			simdMaskLocal = 7
+			chunkLocal = 8
+			tLoLocal = 9
+			tHiLocal = 10
+			chunk1Local = 11
+			t1LoLocal = 12
+			t1HiLocal = 13
+			chunk2Local = 14
+			t2LoLocal = 15
+			t2HiLocal = 16
 			b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
@@ -3250,8 +3324,10 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
 		if useRowDedup {
-			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02)
+			b = append(b, 0x6A)
 			b = append(b, 0x2D, 0x00, 0x00)
 		} else {
 			b = append(b, 0x20, 0x02) // local.get state
@@ -3303,12 +3379,23 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		// ── u8 simple find path ───────────────────────────────────────────────
 		if useMandatoryLit {
 			// 7 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),lit_pos(6),scan_start(7),simdMask_scan(8),chunk_scan(9)
-			litPosLocal = 6; scanStartLocal = 7; simdMaskScanLocal = 8; chunkScanLocal = 9
+			litPosLocal = 6
+			scanStartLocal = 7
+			simdMaskScanLocal = 8
+			chunkScanLocal = 9
 			b = append(b, 0x02, 0x07, 0x7F, 0x01, 0x7B)
 		} else {
 			// 5 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),simdMask(6),chunk(7),...,chunk2(13),t2Lo(14),t2Hi(15)
-			simdMaskLocal = 6; chunkLocal = 7; tLoLocal = 8; tHiLocal = 9
-			chunk1Local = 10; t1LoLocal = 11; t1HiLocal = 12; chunk2Local = 13; t2LoLocal = 14; t2HiLocal = 15
+			simdMaskLocal = 6
+			chunkLocal = 7
+			tLoLocal = 8
+			tHiLocal = 9
+			chunk1Local = 10
+			t1LoLocal = 11
+			t1HiLocal = 12
+			chunk2Local = 13
+			t2LoLocal = 14
+			t2HiLocal = 15
 			b = append(b, 0x02, 0x05, 0x7F, 0x09, 0x7B)
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
@@ -3337,17 +3424,19 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tableOff)
 		if useRowDedup {
-			b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, rowMapOff)
+			b = append(b, 0x20, 0x02)
+			b = append(b, 0x6A)
 			b = append(b, 0x2D, 0x00, 0x00)
 		} else {
-			b = append(b, 0x20, 0x02)       // local.get state
+			b = append(b, 0x20, 0x02) // local.get state
 		}
-		b = append(b, 0x41, 0x08)       // i32.const 8
-		b = append(b, 0x74)             // i32.shl
+		b = append(b, 0x41, 0x08) // i32.const 8
+		b = append(b, 0x74)       // i32.shl
 		b = append(b, 0x6A)
-		b = append(b, 0x20, 0x00)       // local.get ptr
-		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x20, 0x00) // local.get ptr
+		b = append(b, 0x20, 0x03) // local.get pos
 		b = append(b, 0x6A)
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
 		b = append(b, 0x6A)
@@ -3364,7 +3453,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		// if midAccept[state]: last_accept = pos + 1
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, midAcceptOff)
-		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x6A)
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 		b = append(b, 0x04, 0x40)       // if (void)
@@ -3391,12 +3480,23 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	// ── u16 find path ─────────────────────────────────────────────────────────
 	if useMandatoryLit {
 		// 8 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),byte(6),lit_pos(7),scan_start(8),simdMask_scan(9),chunk_scan(10)
-		litPosLocal = 7; scanStartLocal = 8; simdMaskScanLocal = 9; chunkScanLocal = 10
+		litPosLocal = 7
+		scanStartLocal = 8
+		simdMaskScanLocal = 9
+		chunkScanLocal = 10
 		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 	} else {
 		// 6 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),byte(6),simdMask(7),chunk(8),...,chunk2(14),t2Lo(15),t2Hi(16)
-		simdMaskLocal = 7; chunkLocal = 8; tLoLocal = 9; tHiLocal = 10
-		chunk1Local = 11; t1LoLocal = 12; t1HiLocal = 13; chunk2Local = 14; t2LoLocal = 15; t2HiLocal = 16
+		simdMaskLocal = 7
+		chunkLocal = 8
+		tLoLocal = 9
+		tHiLocal = 10
+		chunk1Local = 11
+		t1LoLocal = 12
+		t1HiLocal = 13
+		chunk2Local = 14
+		t2LoLocal = 15
+		t2HiLocal = 16
 		b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
 	}
 	b = append(b, 0x02, 0x40) // block $no_match
@@ -3432,18 +3532,20 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, tableOff)
 	if useRowDedup {
-		b = append(b, 0x41); b = utils.AppendSLEB128(b, rowMapOff)
-		b = append(b, 0x20, 0x02); b = append(b, 0x6A)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, rowMapOff)
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x6A)
 		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → row
 	} else {
-		b = append(b, 0x20, 0x02)       // local.get state
+		b = append(b, 0x20, 0x02) // local.get state
 	}
-	b = append(b, 0x41, 0x09)       // i32.const 9
-	b = append(b, 0x74)             // i32.shl
+	b = append(b, 0x41, 0x09) // i32.const 9
+	b = append(b, 0x74)       // i32.shl
 	b = append(b, 0x6A)
-	b = append(b, 0x20, 0x06)       // local.get byte
-	b = append(b, 0x41, 0x01)       // i32.const 1
-	b = append(b, 0x74)             // i32.shl
+	b = append(b, 0x20, 0x06) // local.get byte
+	b = append(b, 0x41, 0x01) // i32.const 1
+	b = append(b, 0x74)       // i32.shl
 	b = append(b, 0x6A)
 	b = append(b, 0x2F, 0x01, 0x00) // i32.load16_u
 	b = append(b, 0x21, 0x02)       // local.set state
@@ -3458,7 +3560,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	// if midAccept[state]: last_accept = pos + 1
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, midAcceptOff)
-	b = append(b, 0x20, 0x02)       // local.get state
+	b = append(b, 0x20, 0x02) // local.get state
 	b = append(b, 0x6A)
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 	b = append(b, 0x04, 0x40)       // if (void)
