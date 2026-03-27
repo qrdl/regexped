@@ -550,7 +550,10 @@ const (
 	// inputBase is where test inputs are written in regexped WASM memory.
 	inputBase = int32(0)
 	// tableBase is the start of DFA/OnePass tables; must be page-aligned and above input.
-	tableBase = int64(65536) // page 1; page 0 is reserved for input/slots
+	// The largest test inputs are ~100 KB (102400 bytes), so tableBase must be at least
+	// pageAlign(102400) = 131072 to prevent inputs written at inputBase=0 from overwriting
+	// the DFA table data segment.
+	tableBase = int64(131072) // page 2; pages 0-1 are reserved for input
 	// slotsBase is where capture output slots are written for groups calls.
 	slotsBase = int32(512)
 	// benchIters is the number of iterations run inside WASM per benchmark call.
