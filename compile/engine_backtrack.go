@@ -342,14 +342,12 @@ func emitBTInstHandler(
 		} else {
 			// Loop alternation: zero-progress guard
 			loopLocal := loopLocalIdx[p]
-			pcU32 := uint32(p)
 			// For greedy: Out < PC means body=Out(backward), exit=Arg(forward)
 			// preferred=Out(body), retry=Arg(exit)
 			// For non-greedy: Arg < PC means body=Arg(backward), exit=Out(forward)
 			// preferred=Out(exit), retry=Arg(body)
 			// In both cases: preferred=inst.Out, retry=inst.Arg.
 			// Zero-progress: if pos == loop_pos_local, take retry directly (avoid infinite loop).
-			_ = pcU32
 
 			// if pos == loop_pos_local: take retry branch
 			body = append(body, 0x20, localPos)

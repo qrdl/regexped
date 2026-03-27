@@ -689,8 +689,6 @@ func compile(pattern string, opts ...CompileOptions) (Matcher, error) {
 	}
 
 	hasCapturesBeforeSimplify := re.MaxCap() > 0
-	originalMaxCap := re.MaxCap()
-	_ = originalMaxCap
 
 	simplified := re.Simplify()
 	prog, err := syntax.Compile(simplified)
