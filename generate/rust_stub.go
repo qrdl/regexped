@@ -6,6 +6,28 @@ import (
 	"strings"
 )
 
+// iterTypeName derives a unique Rust type name for an iterator from the function name.
+// "find_github_token" → "FindGithubTokenIter"
+func iterTypeName(funcName string) string {
+	var b strings.Builder
+	upper := true
+	for _, c := range funcName {
+		if c == '_' {
+			upper = true
+			continue
+		}
+		if upper {
+			if c >= 'a' && c <= 'z' {
+				c -= 'a' - 'A'
+			}
+			upper = false
+		}
+		b.WriteRune(c)
+	}
+	b.WriteString("Iter")
+	return b.String()
+}
+
 // genRustMatchStub generates an anchored-match stub.
 // The WASM export is named funcName; the internal FFI binding uses the ffi_ prefix
 // to avoid a name collision with the public Rust wrapper.
@@ -34,18 +56,19 @@ pub fn %s(input: &[u8]) -> Option<usize> {
 // public constructor of the same name.
 func genRustFindIterStub(importModule, funcName string) string {
 	ffiName := "ffi_" + funcName
+	iterName := iterTypeName(funcName)
 	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
     #[link_name = "%s"]
     fn %s(ptr: *const u8, len: usize) -> i64;
 }
 
-pub struct FindIter<'a> {
+pub struct %s<'a> {
     input: &'a [u8],
     offset: usize,
 }
 
-impl<'a> Iterator for FindIter<'a> {
+impl<'a> Iterator for %s<'a> {
     type Item = (usize, usize);
 
     fn next(&mut self) -> Option<(usize, usize)> {
@@ -70,11 +93,11 @@ impl<'a> Iterator for FindIter<'a> {
 /// Returns an iterator over all non-overlapping matches in input.
 /// Each item is an absolute (start, end) byte range.
 /// Use .next() to get only the first match.
-pub fn %s(input: &[u8]) -> FindIter<'_> {
-    FindIter { input, offset: 0 }
+pub fn %s(input: &[u8]) -> %s<'_> {
+    %s { input, offset: 0 }
 }
 
-`, importModule, funcName, ffiName, ffiName, funcName)
+`, importModule, funcName, ffiName, iterName, iterName, ffiName, funcName, iterName, iterName)
 }
 
 // genRustGroupsIterStub generates a capture-groups iterator.
@@ -97,12 +120,13 @@ unsafe extern "C" {
 `, importModule, exportName, ffiName)
 	}
 
-	return ffiDecl + fmt.Sprintf(`pub struct GroupsIter<'a> {
+	iterName := iterTypeName(funcName)
+	return ffiDecl + fmt.Sprintf(`pub struct %s<'a> {
     input: &'a [u8],
     offset: usize,
 }
 
-impl<'a> Iterator for GroupsIter<'a> {
+impl<'a> Iterator for %s<'a> {
     type Item = Vec<Option<(usize, usize)>>;
 
     fn next(&mut self) -> Option<Vec<Option<(usize, usize)>>> {
@@ -136,11 +160,11 @@ impl<'a> Iterator for GroupsIter<'a> {
 /// Returns an iterator over all non-overlapping capture matches in input.
 /// Group positions are absolute byte offsets. Index 0 is the full match.
 /// Use .next() to get only the first match.
-pub fn %s(input: &[u8]) -> GroupsIter<'_> {
-    GroupsIter { input, offset: 0 }
+pub fn %s(input: &[u8]) -> %s<'_> {
+    %s { input, offset: 0 }
 }
 
-`, slotCount, ffiName, numGroups, numGroups, funcName)
+`, iterName, iterName, slotCount, ffiName, numGroups, numGroups, funcName, iterName, iterName)
 }
 
 // genRustNamedGroupsIterStub generates a named-capture-groups iterator.
@@ -179,12 +203,13 @@ unsafe extern "C" {
 `, importModule, exportName, ffiName)
 	}
 
-	return ffiDecl + fmt.Sprintf(`pub struct NamedGroupsIter<'a> {
+	iterName := iterTypeName(funcName)
+	return ffiDecl + fmt.Sprintf(`pub struct %s<'a> {
     input: &'a [u8],
     offset: usize,
 }
 
-impl<'a> Iterator for NamedGroupsIter<'a> {
+impl<'a> Iterator for %s<'a> {
     type Item = std::collections::HashMap<&'static str, (usize, usize)>;
 
     fn next(&mut self) -> Option<std::collections::HashMap<&'static str, (usize, usize)>> {
@@ -213,9 +238,9 @@ impl<'a> Iterator for NamedGroupsIter<'a> {
 /// Returns an iterator over all non-overlapping named-capture matches in input.
 /// Group positions are absolute byte offsets.
 /// Use .next() to get only the first match.
-pub fn %s(input: &[u8]) -> NamedGroupsIter<'_> {
-    NamedGroupsIter { input, offset: 0 }
+pub fn %s(input: &[u8]) -> %s<'_> {
+    %s { input, offset: 0 }
 }
 
-`, slotCount, ffiName, inserts.String(), funcName)
+`, iterName, iterName, slotCount, ffiName, inserts.String(), funcName, iterName, iterName)
 }

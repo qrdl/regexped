@@ -25,4 +25,8 @@ fn main() {
     eprintln!("checksum:{}", sum);
 
     println!("compile: {}µs  find: {}ns", compile_us, avg_ns);
+    for m in re.find_iter(input) {
+        println!("result:{}:{}", m.start(), m.end());
+    }
+    println!("result:done");
 }

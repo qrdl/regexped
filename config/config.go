@@ -11,11 +11,13 @@ import (
 
 // BuildConfig is the top-level structure of the YAML config file.
 type BuildConfig struct {
-	WasmMerge string       `yaml:"wasm_merge"` // optional; defaults to "wasm-merge" in $PATH
-	Output    string       `yaml:"output"`     // default output path for merge command
-	WasmDir   string       `yaml:"wasm_dir"`   // default output directory for compiled WASM files
-	StubFile  string       `yaml:"stub_file"`  // default stub output file (Rust or JS); per-entry overrides
-	Regexes   []RegexEntry `yaml:"regexes"`
+	WasmMerge    string       `yaml:"wasm_merge"`    // optional; defaults to "wasm-merge" in $PATH
+	Output       string       `yaml:"output"`        // output path for merge command; overridable with -o
+	WasmDir      string       `yaml:"wasm_dir"`      // default output directory for compiled WASM files
+	WasmFile     string       `yaml:"wasm_file"`     // output WASM file for compile command; overridable with -o
+	ImportModule string       `yaml:"import_module"` // WASM import module name used by wasm-merge
+	StubFile     string       `yaml:"stub_file"`     // stub output file (Rust or JS)
+	Regexes      []RegexEntry `yaml:"regexes"`
 }
 
 // RegexEntry describes a single regex→WASM compilation unit.

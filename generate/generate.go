@@ -56,6 +56,10 @@ func groupByStubFile(cfg config.BuildConfig) map[string][]config.RegexEntry {
 		if sf == "" {
 			continue
 		}
+		// Use top-level import_module as fallback when per-entry field is empty.
+		if re.ImportModule == "" {
+			re.ImportModule = cfg.ImportModule
+		}
 		groups[sf] = append(groups[sf], re)
 	}
 	return groups
@@ -81,9 +85,15 @@ func genRustStubFile(entries []config.RegexEntry) (string, error) {
 		return header + body, nil
 	}
 
-	// Multiple entries: wrap each in a pub mod block.
-	var out strings.Builder
-	out.WriteString(header)
+	// Multiple entries: group by import_module, one pub mod block per unique module name.
+	// Preserve declaration order of first occurrence of each module name.
+	type modEntry struct {
+		name string
+		body strings.Builder
+	}
+	modOrder := []string{}
+	modBodies := map[string]*strings.Builder{}
+
 	for _, re := range entries {
 		body, err := genRustStubsForEntry(re)
 		if err != nil {
@@ -92,8 +102,20 @@ func genRustStubFile(entries []config.RegexEntry) (string, error) {
 		if body == "" {
 			continue
 		}
-		fmt.Fprintf(&out, "pub mod %s {\n", re.ImportModule)
-		for _, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
+		mod := re.ImportModule
+		if _, seen := modBodies[mod]; !seen {
+			modOrder = append(modOrder, mod)
+			modBodies[mod] = &strings.Builder{}
+		}
+		modBodies[mod].WriteString(body)
+	}
+
+	var out strings.Builder
+	out.WriteString(header)
+	for _, mod := range modOrder {
+		content := strings.TrimRight(modBodies[mod].String(), "\n")
+		fmt.Fprintf(&out, "pub mod %s {\n", mod)
+		for _, line := range strings.Split(content, "\n") {
 			if line == "" {
 				out.WriteString("\n")
 			} else {

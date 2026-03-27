@@ -35,26 +35,34 @@ The NFA produced from the pattern is converted to a DFA via subset construction.
 
 **Word boundaries** (`\b`, `\B`): the state space is doubled with a `prevWasWord` context bit. Two mid-start states (`midStart`, `midStartWord`) are used in find-mode scan loops; a `wordCharTable` data segment provides O(1) byte classification.
 
+**DFA minimization** (Hopcroft's algorithm): after subset construction, equivalent states — states indistinguishable from any starting point — are merged. This reduces state count and table size for complex patterns such as case-insensitive URL regexes, where many states differ only in how they were reached.
+
 ### Table formats
 
-State IDs fit in u8 when ≤ 256 states, u16 otherwise. When the table would exceed 32 KB, byte-class compression is applied: many bytes share identical transition rows and are mapped to a smaller set of equivalence classes, shrinking the table significantly.
+State IDs fit in u8 when ≤ 256 states, u16 otherwise. When the table would exceed 32 KB, byte-class compression is applied: many bytes share identical transition rows and are mapped to a smaller set of equivalence classes, shrinking the table significantly. For u16 DFAs, row deduplication is additionally applied: states with identical transition rows share one row via a u8 rowMap, dramatically reducing large tables (e.g. 512KB → 52KB for a 1000-state DFA with 100 unique rows).
 
 Find mode stores additional arrays alongside the transition table: `midAccept` (accepting states reachable mid-scan), `firstByteFlags` or Teddy nibble tables (for the SIMD prefix scan), `immediateAccept`, and word-boundary variants.
 
-### SIMD prefix scan
+**Anchor-aware find mode**: when a pattern is anchored at the start (e.g. `^foo.*$`), `midStartState` has no live transitions. In this case a simplified find body is emitted that runs the DFA exactly once from position 0 rather than scanning the input.
 
-In find mode, a compile-time-selected fast-skip prologue avoids testing every byte position:
+### SIMD prefix scan and mandatory literal extraction
+
+In find mode, a compile-time-selected fast-skip prologue avoids testing every byte position. Two mechanisms are used:
+
+**1. Prefix/Teddy scan** (applied when the match must start at the scan position):
 
 | Strategy | Condition |
 |---|---|
 | **Hybrid prefix** | literal prefix ≥ 1 byte — SIMD check for full prefix within a 16-byte window |
-| **3-byte Teddy** | alternation patterns with ≤ 8 first bytes AND selective 3rd byte — checks bytes 0, 1, 2 simultaneously |
-| **2-byte Teddy** | alternation patterns with ≤ 8 first bytes — checks bytes 0 and 1 simultaneously |
+| **3-byte Teddy** | alternation patterns with ≤ 8 first bytes AND selective 3rd byte |
+| **2-byte Teddy** | alternation patterns with ≤ 8 first bytes |
 | **1-byte Teddy** | single-byte prefix with multiple candidates |
 | **Multi-eq SIMD** | small first-byte set — `i8x16.eq` + bitmask per candidate |
 | **Scalar** | fallback for wide first-byte sets |
 
-Uses WASM SIMD (simd128).
+**2. Mandatory literal extraction** (applied when the prefix is noisy but a selective literal exists deeper in the pattern): `FindMandatoryLit` analyzes the pattern's syntax tree to find the best fixed byte sequence that must appear in every match (e.g. `://` in `[a-zA-Z]{2,8}://[^\s]+`). The SIMD scan searches for that literal instead; a two-level outer loop (`$lit_outer` / `$outer`) adjusts candidate start positions using the literal's known min/max offset from the match start.
+
+Both mechanisms use WASM SIMD (simd128).
 
 ---
 
@@ -74,32 +82,43 @@ The OnePass automaton is a u8 transition table (`state × byte → next_state`, 
 
 ---
 
-## Backtracking Engine
+## Backtracking Engine (BitState)
 
 **Used for:** `groups_func`, `named_groups_func` when the pattern has captures but is not OnePass-eligible, and as the groups half of hybrid modules for such patterns.
 
-**Complexity:** O(n) typical, O(2ⁿ) worst case — bounded in practice by the stack limit.
+**Complexity:** O(n × numStates) time and space — guaranteed by BitState memoization (see below).
 
 ### How it works
 
 The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps to a handler block. The engine maintains a backtrack stack in WASM linear memory: when an `InstAlt` node is reached, the alternative branch is pushed onto the stack and execution continues with the preferred branch. On failure the stack is popped to try the alternative.
 
-**RE2 semantics via hybrid approach** — both phases run inside the single exported WASM function, with no matching logic in the host:
+**BitState memoization:** before executing any NFA state at a given input position, the engine checks a `(pc, position)` visited bitset. If the `(state, pos)` pair was already visited, the current thread is immediately discarded — it cannot produce a result not already covered by a previous thread. This prevents infinite loops on patterns with nested zero-matching quantifiers (e.g. `(?:(?:(a){0,})*?)`) and guarantees O(n × numStates) worst-case execution.
 
-1. **Phase 1 (DFA)**: the captures-stripped pattern is run as a standard leftmost-longest DFA anchored match to determine the correct match end position E. If no match, returns -1 immediately.
-2. **Phase 2 (Backtracking)**: the NFA backtracking engine runs constrained to `pos == E` at `InstMatch`, filling capture slots within `[0, E]`.
+The bitset is stored in WASM linear memory immediately after the backtrack stack. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes computed at runtime. It is zero-initialised at the start of each match call. For inputs exceeding `maxMemoLen` (8192 chars), memoization is skipped and the engine falls back to stack-bounded backtracking.
 
-This ensures non-greedy outer quantifiers like `(a*)*?` produce the same result as RE2 (longest match), not Perl semantics (shortest match).
+**Limitation:** the memoization bitset is allocated at a fixed compile-time address in the module's linear memory. This is safe for single-threaded WASM (the standard). The WebAssembly threads proposal (Phase 3) would allow shared-memory parallelism, but this is not supported — calling the same pattern's groups function from two concurrent threads would cause a data race on the memo table. Single-threaded use is the only supported mode.
 
-**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. Stack is reserved at compile time in WASM linear memory immediately after the pattern tables.
+**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. Stack is reserved at compile time in WASM linear memory immediately after the DFA tables.
 
-**Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns -1 (no match) rather than corrupting memory. This caps catastrophic backtracking on adversarial inputs.
+**Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns -1 (no match) rather than corrupting memory.
+
+**Memory layout:**
+```
+[DFA find tables] → [backtrack stack] → [BitState memo bitset]
+```
+All regions are page-aligned and strictly non-overlapping. The input buffer is placed at address 0 by the host and never overlaps with the tables region.
 
 ---
 
 ## Hybrid Modules
 
 When a config entry sets both `match_func`/`find_func` AND `groups_func`/`named_groups_func`, a single WASM module is generated containing both a DFA function (match and/or find) and a groups function (OnePass or Backtracking depending on the pattern), sharing the same memory region.
+
+---
+
+## Semantics
+
+Regexped implements **RE2 syntax with Perl/RE2 semantics** (leftmost-first match, non-greedy quantifiers prefer shorter matches). POSIX semantics (leftmost-longest) are not supported.
 
 ---
 

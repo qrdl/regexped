@@ -146,6 +146,25 @@ var tests = []testCase{
 		},
 	},
 	{
+		// URL find in prose — benchmarks non-prefix mandatory literal extraction.
+		// First-byte set [a-zA-Z] matches ~20% of bytes in typical text, but
+		// "://" is very rare. This is the ideal pattern for mandatory-literal
+		// optimisation: noisy prefix, highly selective interior literal.
+		name:    "url-find-100kb",
+		pattern: `[a-zA-Z]{2,8}://[^\s]+`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-url 100KB", urlProseInput(nil)},
+			{"5 urls 100KB", urlProseInput([]string{
+				"https://example.com/path/to/page?q=hello&lang=en",
+				"http://api.internal/v2/users/42/profile",
+				"ftp://files.example.org/pub/release-2.3.tar.gz",
+				"https://cdn.example.net/static/js/bundle.min.js?v=8a3f1b",
+				"https://auth.example.com/oauth2/token?grant_type=client_credentials",
+			})},
+		},
+	},
+	{
 		// URL parsing with named capture groups — benchmarks OnePass engine
 		// against regex crate's capture group extraction.
 		// Credentials omitted: [^@]+ and [^/:+] overlap making it non-one-pass.
@@ -161,6 +180,23 @@ var tests = []testCase{
 		},
 	},
 	{
+		// Non-anchored groups: find URLs anywhere in 10KB prose and capture host.
+		// This exercises the wrapper's internal find_internal scan over a large buffer.
+		name:    "url-domains-10k",
+		pattern: `https?://(?P<host>[^/:?#\s]+)`,
+		mode:    anchoredGroups,
+		inputs: []namedInput{
+			{"no-url 10KB", urlProseInputSmall(nil)},
+			{"5 urls 10KB", urlProseInputSmall([]string{
+				"https://example.com",
+				"https://api.github.com/repos",
+				"https://storage.googleapis.com/bucket",
+				"https://cdn.cloudflare.net/assets",
+				"https://docs.anthropic.com/api",
+			})},
+		},
+	},
+	{
 		name:    "sql-inject",
 		pattern: `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`,
 		mode:    find,
@@ -169,20 +205,52 @@ var tests = []testCase{
 			{"injected ~1KB", sqlInjectInput()},
 		},
 	},
+	{
+		// CSV row parsing with 3 capture groups — benchmarks non-anchored Backtracking engine.
+		// Fields can be unquoted or double-quoted (RFC 4180); quoted fields may contain commas
+		// and doubled quotes (""). The alternation "..."|[^,\n]* is non-OnePass (overlapping
+		// first-char sets), so the Backtracking engine is used automatically.
+		// Input is a 16-line CSV file; groups_func scans for each row and extracts 3 columns.
+		name:    "csv-parse",
+		pattern: `((?:"(?:[^"]|"")*"|[^,\n]*)),((?:"(?:[^"]|"")*"|[^,\n]*)),((?:"(?:[^"]|"")*"|[^,\n]*))`,
+		mode:    anchoredGroups,
+		inputs: []namedInput{
+			{"16-line CSV", csvInput()},
+		},
+	},
+	{
+		// Comment extraction from source code — benchmarks per-state SIMD in DFA inner loop.
+		// Two self-loop states qualify (255/256 bytes each):
+		//   - inside // comment: [^\n]+ self-loops until newline
+		//   - inside /* */ comment body: everything except '*' self-loops
+		// Block comments can be hundreds of bytes long, making long self-loop runs likely.
+		// (?s) enables DOTALL so /* */ spans newlines correctly.
+		name:    "comments-100kb",
+		pattern: `//[^\n]+|/\*(?s:.*?)\*/`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-comments 100KB", sourceCodeInput(nil, nil)},
+			{"comments 100KB",    sourceCodeInput(
+				[]string{"// initialise connection pool", "// retry with exponential backoff", "// validate request parameters"},
+				[]string{"/*\n * Copyright 2026 Example Corp.\n * Licensed under the Apache License, Version 2.0.\n */",
+					"/* TODO: replace with proper error handling once the new\n   error framework is merged into main branch */"},
+			)},
+		},
+	},
 	// ── Backtracking engine benchmark ────────────────────────────────────────
 	// .* before (ERROR|WARNING|FATAL) makes this non-OnePass: the .* loop and
 	// the keyword alternation share overlapping first-character sets.
 	// The Backtracking engine is used automatically as a fallback.
-	// Inputs are single matching log lines; anchoredGroups mode matches the
-	// full line and extracts timestamp, level, and message captures.
+	// (?m:^...multiline...$) makes ^ and $ match at line boundaries so the
+	// non-anchored groups wrapper scans a multi-line log and extracts one
+	// match per ERROR/WARNING/FATAL line.
 	{
 		name:    "log-capture",
-		pattern: `^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) .*(ERROR|WARNING|FATAL): (.+)$`,
+		pattern: `(?m:^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) .*(ERROR|WARNING|FATAL): (.+)$)`,
 		mode:    anchoredGroups,
 		inputs: []namedInput{
-			{"ERROR short",   "2026-03-22T14:05:01 app[42] ERROR: connection refused"},
-			{"WARNING long",  "2026-03-22T14:05:02 service.worker.pool[7] WARNING: queue depth 9823 exceeds threshold 5000, consider scaling"},
-			{"FATAL long",    "2026-03-22T14:05:03 db.connection.manager[1] FATAL: unable to acquire lock on table users after 30000ms, shutting down"},
+			{"few matches",  logInput(true)},
+			{"no matches",   logInput(false)},
 		},
 	},
 }
@@ -271,6 +339,202 @@ export ENCRYPTION_KEY=replace_with_actual_key
 	return string(result)
 }
 
+// urlProseInput returns a ~100KB block of prose-like text dense with alphabetic
+// characters (high false-positive rate for [a-zA-Z] prefix) but containing no
+// "://" sequences unless URLs are explicitly injected. Ideal for benchmarking
+// non-prefix mandatory literal extraction for the [a-zA-Z]{2,8}://[^\s]+ pattern.
+// sourceCodeInput returns ~100KB of C-style source code. singleLine comments are
+// injected as // ... lines, blockComments as /* ... */ blocks, spread evenly.
+// With nil slices the output contains no comment tokens at all.
+func sourceCodeInput(singleLine, blockComments []string) string {
+	const block = `int processRequest(Request *req, Response *resp) {
+    if (req == NULL || resp == NULL) {
+        return ERR_INVALID_ARG;
+    }
+    int status = validateHeaders(req->headers, req->headerCount);
+    if (status != OK) {
+        resp->statusCode = 400;
+        setBody(resp, "Bad Request");
+        return status;
+    }
+    Connection *conn = poolAcquire(globalPool, POOL_TIMEOUT_MS);
+    if (conn == NULL) {
+        resp->statusCode = 503;
+        setBody(resp, "Service Unavailable");
+        return ERR_NO_CONNECTION;
+    }
+    QueryResult result = executeQuery(conn, req->path, req->params);
+    poolRelease(globalPool, conn);
+    if (result.error != 0) {
+        resp->statusCode = 500;
+        setBody(resp, "Internal Server Error");
+        return result.error;
+    }
+    resp->statusCode = 200;
+    resp->body = result.data;
+    resp->bodyLen = result.dataLen;
+    return OK;
+}
+
+`
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+
+	if len(singleLine) == 0 && len(blockComments) == 0 {
+		return base
+	}
+
+	all := make([]string, 0, len(singleLine)+len(blockComments))
+	for _, c := range singleLine {
+		all = append(all, c)
+	}
+	for _, c := range blockComments {
+		all = append(all, c)
+	}
+
+	result := []byte(base)
+	step := len(result) / (len(all) + 1)
+	offset := 0
+	for i, comment := range all {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte(comment + "\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
+func urlProseInputSmall(urls []string) string {
+	const block = `The application encountered an error while processing the request from the
+client. The server returned status code four hundred and three, indicating that
+the user does not have permission to access the requested resource. Please
+contact your system administrator if you believe this is a mistake. The event
+has been logged for review by the security team. Timestamp of the failure was
+recorded along with the originating address and the affected service name.
+`
+	repeat := (10 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+	if len(urls) == 0 {
+		return base
+	}
+	result := []byte(base)
+	step := len(result) / (len(urls) + 1)
+	offset := 0
+	for i, url := range urls {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte("See " + url + " for details.\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
+func urlProseInput(urls []string) string {
+	const block = `The application encountered an error while processing the request from the
+client. The server returned status code four hundred and three, indicating that
+the user does not have permission to access the requested resource. Please
+contact your system administrator if you believe this is a mistake. The event
+has been logged for review by the security team. Timestamp of the failure was
+recorded along with the originating address and the affected service name.
+The retry policy specifies that failed requests are retried up to three times
+with exponential backoff before being sent to the dead letter queue. Operators
+should monitor the queue depth and alert threshold configured in the service
+manifest. Configuration values must not contain unescaped special characters.
+All field names are case sensitive and must match the schema definition exactly.
+`
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+
+	if len(urls) == 0 {
+		return base
+	}
+
+	result := []byte(base)
+	step := len(result) / (len(urls) + 1)
+	offset := 0
+	for i, url := range urls {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte("See " + url + " for details.\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
+// csvInput returns a 16-line CSV with 3 columns per row. Rows use a mix of
+// unquoted fields, quoted fields containing commas, and fields with doubled
+// quotes (RFC 4180 escaping). Exercises the Backtracking engine's
+// non-anchored groups path.
+func csvInput() string {
+	return `John,Doe,john.doe@example.com
+"Smith, Jr.",Alice,alice@example.com
+Bob,"O'Brien, Jr.","bob@example.com"
+"""Admin""",root,root@localhost
+Carol,White,"carol.white@corp.example.com"
+Dave,"Sales, EMEA",dave@corp.com
+Eve,"R&D ""Lab""",eve@lab.example.com
+Frank,,frank@example.com
+"Grace, PhD","AI, ML",grace@uni.edu
+Heidi,Blue,heidi@example.com
+"Ivan ""The Terrible""","Marketing, Global",ivan@corp.com
+Judy,Green,judy@example.com
+"Karl, III","Finance, APAC",karl@corp.com
+Laura,Red,laura@example.com
+"Mallory ""M""","Ops, EU",mallory@corp.com
+Niaj,Black,niaj@example.com
+`
+}
+
+// logInput returns a 20-line structured log. If withErrors is true, 4 lines
+// are ERROR/WARNING/FATAL entries that match the log-capture pattern; the
+// rest are INFO/DEBUG lines that do not match.
+func logInput(withErrors bool) string {
+	info := "2026-03-22T14:05:00 app[1] INFO: server started on port 8080\n" +
+		"2026-03-22T14:05:01 app[1] DEBUG: accepted connection from 10.0.0.5:54321\n" +
+		"2026-03-22T14:05:02 db.pool[3] INFO: acquired connection from pool (idle=4)\n" +
+		"2026-03-22T14:05:03 cache[2] DEBUG: cache hit for key user:1042\n" +
+		"2026-03-22T14:05:04 app[1] INFO: GET /api/v1/users/1042 200 3ms\n" +
+		"2026-03-22T14:05:05 app[1] DEBUG: accepted connection from 10.0.0.6:54322\n" +
+		"2026-03-22T14:05:06 cache[2] DEBUG: cache miss for key user:9999\n" +
+		"2026-03-22T14:05:07 db.pool[3] INFO: query executed in 12ms rows=1\n" +
+		"2026-03-22T14:05:08 app[1] INFO: GET /api/v1/users/9999 200 15ms\n" +
+		"2026-03-22T14:05:09 app[1] DEBUG: connection from 10.0.0.5:54321 closed\n" +
+		"2026-03-22T14:05:10 app[1] INFO: GET /healthz 200 1ms\n" +
+		"2026-03-22T14:05:11 db.pool[3] DEBUG: pool stats: active=2 idle=3 waiting=0\n" +
+		"2026-03-22T14:05:12 cache[2] INFO: evicted 128 entries (maxmem reached)\n" +
+		"2026-03-22T14:05:13 app[1] INFO: POST /api/v1/jobs 202 8ms\n" +
+		"2026-03-22T14:05:14 worker[5] DEBUG: job 7f3a picked up by worker pool\n" +
+		"2026-03-22T14:05:15 worker[5] INFO: job 7f3a completed in 340ms\n"
+	if !withErrors {
+		return info
+	}
+	return "2026-03-22T14:05:00 app[1] INFO: server started on port 8080\n" +
+		"2026-03-22T14:05:01 app[1] DEBUG: accepted connection from 10.0.0.5:54321\n" +
+		"2026-03-22T14:05:02 db.pool[3] ERROR: connection refused after 3 retries\n" +
+		"2026-03-22T14:05:03 cache[2] DEBUG: cache miss for key user:9999\n" +
+		"2026-03-22T14:05:04 app[1] INFO: GET /api/v1/users/1042 200 3ms\n" +
+		"2026-03-22T14:05:05 service.worker.pool[7] WARNING: queue depth 9823 exceeds threshold 5000, consider scaling\n" +
+		"2026-03-22T14:05:06 cache[2] DEBUG: cache miss for key session:abc\n" +
+		"2026-03-22T14:05:07 db.pool[3] INFO: query executed in 12ms rows=1\n" +
+		"2026-03-22T14:05:08 app[1] ERROR: panic in handler: runtime error: index out of range [3] with length 3\n" +
+		"2026-03-22T14:05:09 app[1] DEBUG: connection from 10.0.0.5:54321 closed\n" +
+		"2026-03-22T14:05:10 app[1] INFO: GET /healthz 200 1ms\n" +
+		"2026-03-22T14:05:11 db.pool[3] DEBUG: pool stats: active=2 idle=3 waiting=0\n" +
+		"2026-03-22T14:05:12 db.connection.manager[1] FATAL: unable to acquire lock on table users after 30000ms, shutting down\n" +
+		"2026-03-22T14:05:13 app[1] INFO: POST /api/v1/jobs 202 8ms\n" +
+		"2026-03-22T14:05:14 worker[5] DEBUG: job 7f3a picked up by worker pool\n" +
+		"2026-03-22T14:05:15 worker[5] INFO: job 7f3a completed in 340ms\n"
+}
+
 func sqlCleanInput() string {
 	return "POST /search HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nq=" +
 		strings.Repeat("a", 400) +
@@ -306,15 +570,19 @@ func wasmMerge() string {
 // --------------------------------------------------------------------------
 // Measurement
 
-var reNs = regexp.MustCompile(`(?:match|find):\s*(\d+)ns`)
-var reUs = regexp.MustCompile(`compile:\s*(\d+)`)
+var reNs        = regexp.MustCompile(`(?:match|find):\s*(\d+)ns`)
+var reUs        = regexp.MustCompile(`compile:\s*(\d+)`)
+var reResultAll = regexp.MustCompile(`result:(\S+)`)
 
 // runHarness runs a pre-built WASM harness via wasmtime and parses timing output.
-func runHarness(harnessPath string, args ...string) (compileUs, opNs int64, err error) {
+// results collects all "result:X" lines (excluding "result:done").
+// For single-result modes (anchored, groups) results has one element.
+// For find mode results holds all match spans.
+func runHarness(harnessPath string, args ...string) (compileUs, opNs int64, results []string, err error) {
 	cmdArgs := append([]string{"run", harnessPath}, args...)
 	out, err := exec.Command("wasmtime", cmdArgs...).Output()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	s := string(out)
 	if m := reUs.FindStringSubmatch(s); m != nil {
@@ -323,16 +591,35 @@ func runHarness(harnessPath string, args ...string) (compileUs, opNs int64, err 
 	if m := reNs.FindStringSubmatch(s); m != nil {
 		opNs, _ = strconv.ParseInt(m[1], 10, 64)
 	}
-	return compileUs, opNs, nil
+	for _, m := range reResultAll.FindAllStringSubmatch(s, -1) {
+		if m[1] == "done" {
+			break
+		}
+		results = append(results, m[1])
+	}
+	return compileUs, opNs, results, nil
+}
+
+func resultsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // buildRegexped compiles pattern to WASM, merges with the harness, and returns
 // the merged WASM path (caller must delete the temp file).
 func buildRegexped(dir, harnessName, exportName string, mode compile.MatchMode, pattern string) (string, error) {
 	opts := compile.CompileOptions{
-		MaxDFAStates: 100000,
-		ForceEngine:  compile.EngineDFA,
-		Mode:         mode,
+		MaxDFAStates:  100000,
+		ForceEngine:   compile.EngineDFA,
+		Mode:          mode,
+		LeftmostFirst: mode == compile.ModeFind, // required for non-greedy semantics in find mode
 	}
 	// Determine tableBase from the harness's Rust memory top so DFA tables don't overlap.
 	harness := harnessWasm(dir, harnessName)
@@ -340,7 +627,20 @@ func buildRegexped(dir, harnessName, exportName string, mode compile.MatchMode, 
 	if err != nil {
 		return "", fmt.Errorf("read harness memory: %w", err)
 	}
-	tableBase := utils.PageAlign(rustTop)
+	// Place DFA tables 512KB above rustTop to prevent overlap with the Rust heap.
+	//
+	// The Rust harnesses receive input as a WASI command-line argument (args[1]),
+	// which the WASI runtime heap-allocates starting near __heap_base (≈ rustTop).
+	// For a 100KB input the heap can grow to roughly rustTop + 100KB + runtime overhead
+	// (~50KB), putting the heap top at rustTop + ~150KB. The 512KB margin keeps DFA
+	// tables safely above that.
+	//
+	// If you add a test whose input exceeds ~350KB (i.e. rustTop + 512KB - ~150KB
+	// runtime overhead), increase this margin accordingly, OR refactor the harnesses
+	// to write input into a fixed buffer placed above the DFA tables instead of
+	// passing it as a WASI command-line argument. See the "Fixed Input Buffer" plan
+	// in the code comments / design notes for the proper long-term fix.
+	tableBase := utils.PageAlign(rustTop + 512*1024)
 	wasmBytes, _, err := compile.CompileRegex(pattern, exportName, tableBase, false, opts)
 	if err != nil {
 		return "", fmt.Errorf("compile: %w", err)
@@ -386,14 +686,13 @@ func buildRegexpedGroups(dir, harnessName, exportName, pattern string) (string, 
 	if err != nil {
 		return "", fmt.Errorf("read harness memory: %w", err)
 	}
-	tableBase := utils.PageAlign(rustTop)
-	wasmBytes, _, err := compile.CompileOnePassGroups(pattern, exportName, tableBase, false)
+	// Same 512KB margin as buildRegexped — see comment there for details and the
+	// threshold above which this margin must be increased.
+	tableBase := utils.PageAlign(rustTop + 512*1024)
+	re := config.RegexEntry{Pattern: pattern, GroupsFunc: exportName}
+	wasmBytes, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, false)
 	if err != nil {
-		// Not OnePass-eligible — fall back to backtracking engine.
-		wasmBytes, _, err = compile.CompileBacktrackGroups(pattern, exportName, tableBase, false)
-		if err != nil {
-			return "", fmt.Errorf("compile: %w", err)
-		}
+		return "", fmt.Errorf("compile: %w", err)
 	}
 
 	patTmp, err := os.CreateTemp("", "pattern-*.wasm")
@@ -557,8 +856,8 @@ func main() {
 		var sharedCompileUs int64
 
 		for i, inp := range tc.inputs {
-			// Regex crate timing.
-			compileUs, regexNs, hErr := runHarness(regexHarness, tc.pattern, inp.value)
+			// Regex crate timing + result.
+			compileUs, regexNs, regexResult, hErr := runHarness(regexHarness, tc.pattern, inp.value)
 			if hErr != nil {
 				fmt.Fprintf(os.Stderr, "  warn: regex harness failed for %q: %v\n", inp.label, hErr)
 			}
@@ -566,10 +865,16 @@ func main() {
 				sharedCompileUs = compileUs
 			}
 
-			// Regexped timing.
-			_, regexpedNs, rErr := runHarness(mergedPath, inp.value)
+			// Regexped timing + result.
+			_, regexpedNs, regexpedResult, rErr := runHarness(mergedPath, inp.value)
 			if rErr != nil {
 				fmt.Fprintf(os.Stderr, "  warn: regexped harness failed for %q: %v\n", inp.label, rErr)
+			}
+
+			// Correctness check: compare all results (all matches for find, single for others).
+			if len(regexResult) > 0 && len(regexpedResult) > 0 && !resultsEqual(regexResult, regexpedResult) {
+				fmt.Fprintf(os.Stderr, "  MISMATCH %s / %q: regex=%v regexped=%v\n",
+					tc.name, inp.label, regexResult, regexpedResult)
 			}
 
 			r := row{

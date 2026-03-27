@@ -117,9 +117,11 @@ func runCompileCmd(args []string) {
 	fs := flag.NewFlagSet("compile", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
 	wasmInput  := fs.String("wasm-input", "", "pre-built WASM file used to measure memory layout (required)")
-	var outDir string
+	var outDir, outputFile string
 	fs.StringVar(&outDir, "out-dir", "", "output directory for compiled WASM files (overrides config wasm_dir)")
 	fs.StringVar(&outDir, "d", "", "output directory for compiled WASM files (alias for --out-dir)")
+	fs.StringVar(&outputFile, "output", "", "output WASM file (overrides config wasm_file)")
+	fs.StringVar(&outputFile, "o", "", "output WASM file (alias for --output)")
 	fs.Parse(args)
 
 	if *wasmInput == "" {
@@ -138,7 +140,7 @@ func runCompileCmd(args []string) {
 			outDir = "."
 		}
 	}
-	if err := compile.CmdCompile(cfg, *wasmInput, outDir); err != nil {
+	if err := compile.CmdCompile(cfg, *wasmInput, outDir, outputFile); err != nil {
 		log.Fatal(err)
 	}
 }

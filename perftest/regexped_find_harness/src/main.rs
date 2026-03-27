@@ -36,4 +36,19 @@ fn main() {
     eprintln!("checksum:{}", sum);
 
     println!("find: {}ns", avg_ns);
+    // Iterate all matches by calling pattern_find with advancing slices.
+    // Matching logic is inside WASM; the host only manages the input window.
+    let mut offset = 0usize;
+    loop {
+        match pattern_find(&input[offset..]) {
+            None => break,
+            Some((s, e)) => {
+                println!("result:{}:{}", offset + s, offset + e);
+                let advance = if e > s { e } else { s + 1 };
+                offset += advance;
+                if offset >= input.len() { break; }
+            }
+        }
+    }
+    println!("result:done");
 }

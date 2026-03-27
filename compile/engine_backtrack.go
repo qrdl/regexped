@@ -44,191 +44,74 @@ func newBacktrack(prog *syntax.Prog) *backtrack {
 // --------------------------------------------------------------------------
 // WASM emission
 
-// CompileBacktrackGroups compiles a pattern to a backtracking WASM module
-// exporting a groups function: (ptr i32, len i32, out_ptr i32) → i32.
-func CompileBacktrackGroups(pattern, exportName string, tableBase int64, standalone bool) ([]byte, int64, error) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return nil, 0, err
-	}
-	prog, err := syntax.Compile(re.Simplify())
-	if err != nil {
-		return nil, 0, err
-	}
-	bt := newBacktrack(prog)
-
-	// Compile DFA (captures stripped) for Phase 1 RE2-semantics extent check.
-	// Re-parse to get a fresh tree — stripCaptures mutates in place.
-	reStripped, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return nil, 0, err
-	}
-	stripCaptures(reStripped)
-	progStripped, err := syntax.Compile(reStripped.Simplify())
-	if err != nil {
-		return nil, 0, err
-	}
-	dfaL := compileDFAForBacktrack(progStripped, tableBase)
-
-	// Backtracking stack starts after DFA data (page-aligned).
-	btTableBase := utils.PageAlign(int64(dfaL.acceptOff) + int64(dfaL.numWASM))
-	if dfaL.hasImmAccept {
-		btTableBase = utils.PageAlign(int64(dfaL.immediateAcceptOff) + int64(dfaL.numWASM))
-	}
-
-	wasmBytes, tableEnd := genBacktrackWASM(bt, btTableBase, exportName, standalone, dfaL)
-	return wasmBytes, tableEnd, nil
-}
-
-// compileDFAForBacktrack builds a dfaLayout for the captures-stripped pattern,
-// used as Phase 1 in the hybrid backtracking function.
-// tableBase is the memory offset where DFA tables are placed.
-func compileDFAForBacktrack(progStripped *syntax.Prog, tableBase int64) *dfaLayout {
-	// leftmostFirst=false: standard leftmost-longest DFA semantics for anchored match.
-	// This avoids immediateAccept states which use `return` instructions incompatible
-	// with inline use inside the backtracking function body.
-	d := newDFA(progStripped, false, false)
-	t := dfaTableFrom(d)
-	return buildDFALayout(t, tableBase, false, false)
-}
-
-// genBacktrackWASM generates a WASM module exporting a groups function:
-//
-//	(ptr: i32, len: i32, out_ptr: i32) → i32
-//
-// dfaL is the layout for the captures-stripped DFA used in Phase 1.
-// tableBase is the start of the backtracking stack (after DFA data).
-// Returns end position of match or -1 on failure.
-func genBacktrackWASM(bt *backtrack, tableBase int64, exportName string, standalone bool, dfaL *dfaLayout) ([]byte, int64) {
-	numCapLocals := bt.numGroups * 2
-	// frameSize = 4 (pos) + numCapLocals*4 (captures) + 4 (retry PC)
-	frameSize := 4 + numCapLocals*4 + 4
-	// Stack depth: each InstAlt can push one frame per input byte in the worst
-	// case (loop iterates once per byte). Use numAlts * 4096 as a generous bound;
-	// minimum 4096 frames to handle short-but-complex nested-loop patterns.
-	maxFrames := bt.numAlts * 4096
-	if maxFrames < 4096 {
-		maxFrames = 4096
-	}
-	stackSize := maxFrames * frameSize
-	tableEnd := utils.PageAlign(tableBase + int64(stackSize))
-	memPages := int32(tableEnd / 65536)
-	stackBase := int32(tableBase)
-	stackLimit := stackBase + int32(stackSize)
-
-	body := buildBacktrackBody(bt, stackBase, stackLimit, int32(frameSize), dfaL)
-
-	// Type section: 1 type — (i32 i32 i32) → i32
-	typeContent := []byte{
-		0x01,                         // count=1
-		0x60,                         // func
-		0x03, 0x7F, 0x7F, 0x7F,       // 3 i32 params
-		0x01, 0x7F,                   // 1 i32 result
-	}
-
-	// Function section: 1 function, type index 0
-	funcContent := []byte{0x01, 0x00}
-
-	// Export section
-	var exportContent []byte
-	if standalone {
-		exportContent = append(exportContent, 0x02) // 2 exports: func + memory
-	} else {
-		exportContent = append(exportContent, 0x01) // 1 export: func only
-	}
-	exportContent = append(exportContent, btExportEntry(exportName, 0)...)
-	if standalone {
-		exportContent = appendString(exportContent, "memory")
-		exportContent = append(exportContent, 0x02, 0x00) // memory kind, index 0
-	}
-
-	// Code section: 1 body
-	var codeEntry []byte
-	codeEntry = utils.AppendULEB128(codeEntry, uint32(len(body)))
-	codeEntry = append(codeEntry, body...)
-	codeContent := append([]byte{0x01}, codeEntry...)
-
-	var out []byte
-	out = append(out, 0x00, 0x61, 0x73, 0x6D) // magic
-	out = append(out, 0x01, 0x00, 0x00, 0x00) // version
-
-	out = appendSection(out, 1, typeContent)
-
-	if !standalone {
-		var importContent []byte
-		importContent = append(importContent, 0x01) // 1 import
-		importContent = appendString(importContent, "main")
-		importContent = appendString(importContent, "memory")
-		importContent = append(importContent, 0x02)              // memory kind
-		importContent = append(importContent, 0x00)              // limit type: min only
-		importContent = utils.AppendULEB128(importContent, 0x00) // min 0 pages
-		out = appendSection(out, 2, importContent)
-	}
-
-	out = appendSection(out, 3, funcContent)
-
-	if standalone {
-		var memContent []byte
-		memContent = append(memContent, 0x01, 0x00) // 1 memory, no max
-		memContent = utils.AppendULEB128(memContent, uint32(memPages))
-		out = appendSection(out, 5, memContent)
-	}
-
-	out = appendSection(out, 7, exportContent)
-	out = appendSection(out, 10, codeContent)
-
-	// Data section: DFA tables (match-only, no find tables).
-	// Backtrack stack is zero-initialised; only DFA data needs to be in the data section.
-	dfaDS := dfaDataSegments(dfaL, false)
-	out = appendSection(out, 11, dfaDS)
-
-	return out, tableEnd
-}
-
-// btExportEntry returns the export entry for the groups function.
-func btExportEntry(name string, funcIdx int) []byte {
-	var b []byte
-	b = appendString(b, name)
-	b = append(b, 0x00) // func kind
-	b = utils.AppendULEB128(b, uint32(funcIdx))
-	return b
-}
-
-// --------------------------------------------------------------------------
-// Local variable layout
-//
-// Index  Purpose
-//   0    ptr      (param)
-//   1    len      (param)
-//   2    out_ptr  (param)
-//   3    pos      i32
-//   4    sp       i32  (stack pointer)
-//   5    state    i32  (current NFA PC; -1 = FAIL)
-//   6    scratch  i32  (temporary, e.g. for word-char byte)
-//   7 + i*2      cap_i_start  (i = 0..numGroups-1)
-//   8 + i*2      cap_i_end
-//   7 + numGroups*2 + j   loop_pos for j-th loop PC (sorted)
-//
-// capStartLocal(i) = 7 + i*2
-// capEndLocal(i)   = 8 + i*2
-// loopPosLocal(j)  = 7 + numGroups*2 + j
-
+// Local variable indices for the backtracking function body.
+// Params: 0=ptr, 1=len, 2=out_ptr.
 const (
-	localPtr     = 0
-	localLen     = 1
-	localOutPtr  = 2
-	localPos     = 3
-	localSP      = 4
-	localState   = 5
-	localScratch = 6
+	localPtr      = byte(0x00)
+	localLen      = byte(0x01)
+	localOutPtr   = byte(0x02)
+	localPos      = byte(0x03)
+	localSP       = byte(0x04)
+	localState    = byte(0x05)
+	localScratch  = byte(0x06)
 )
 
 func capStartLocal(i int) uint32 { return uint32(7 + i*2) }
 func capEndLocal(i int) uint32   { return uint32(8 + i*2) }
 
+// appendBacktrackCodeEntry appends a size-prefixed backtracking capture body to cs.
+// loopCaptureLocals returns the capture local variable indices that are
+// modified inside the loop body at loopPC (reachable from inst.Out before
+// re-entering loopPC). Only those locals need snapshot save/restore.
+// Returns nil if no captures are inside the loop.
+func loopCaptureLocals(prog *syntax.Prog, loopPC int) []uint32 {
+	inst := prog.Inst[loopPC]
+	visited := make([]bool, len(prog.Inst))
+	queue := []int{int(inst.Out)}
+	seen := make(map[uint32]bool)
+	var locals []uint32
+	for len(queue) > 0 {
+		pc := queue[0]
+		queue = queue[1:]
+		if pc == loopPC || visited[pc] {
+			continue
+		}
+		visited[pc] = true
+		i := prog.Inst[pc]
+		if i.Op == syntax.InstCapture {
+			g := int(i.Arg >> 1)
+			var loc uint32
+			if i.Arg&1 == 0 {
+				loc = capStartLocal(g)
+			} else {
+				loc = capEndLocal(g)
+			}
+			if !seen[loc] {
+				seen[loc] = true
+				locals = append(locals, loc)
+			}
+		}
+		switch i.Op {
+		case syntax.InstAlt, syntax.InstAltMatch:
+			queue = append(queue, int(i.Out), int(i.Arg))
+		default:
+			queue = append(queue, int(i.Out))
+		}
+	}
+	return locals
+}
+
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32) []byte {
+	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
 // buildBacktrackBody emits the WASM function body for the backtracking NFA.
-// dfaL is the layout for the captures-stripped DFA used in Phase 1.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, dfaL *dfaLayout) []byte {
+// The caller (wrapper) has already located the match extent via find_internal and
+// passes a bounded slice (ptr=match_start, len=match_length). This function runs
+// Phase 2 NFA only — no Phase 1 DFA traversal.
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 	numCaps := bt.numGroups
@@ -247,58 +130,32 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, d
 		loopLocalIdx[pc] = uint32(7 + numCapLocals + j)
 	}
 
-	// Phase 1 DFA locals: dfaStateLocal, dfaPosLocal, btEndLocal.
-	// They follow after all existing locals.
+	// Loop capture snapshot locals — only the specific capture locals modified
+	// inside each loop's body, not all caps. Loops with no captures inside need
+	// no snapshot at all.
 	baseExtra := uint32(7 + numCapLocals + len(loopPCsSorted))
-	dfaStateLocal := baseExtra         // DFA state scratch for Phase 1
-	dfaPosLocal   := baseExtra + 1     // DFA position scratch for Phase 1
-	btEndLocal    := baseExtra + 2     // DFA-determined match end (or -1)
-	// localCl for DFA: reuse btEndLocal slot is wrong — need a separate one
-	// for u16/compressed paths. We always allocate 4 extras total:
-	// dfaStateLocal, dfaPosLocal, btEndLocal, dfaClassLocal.
-	dfaClassLocal := baseExtra + 3
+	loopSnapBase    := make(map[int]uint32,   len(loopPCsSorted)) // loop PC → first snapshot local
+	loopSnapLocals  := make(map[int][]uint32, len(loopPCsSorted)) // loop PC → which cap locals to snap
+	snapTotal := 0
+	for _, pc := range loopPCsSorted {
+		locals := loopCaptureLocals(prog, pc)
+		if len(locals) > 0 {
+			loopSnapBase[pc]   = baseExtra + uint32(snapTotal)
+			loopSnapLocals[pc] = locals
+			snapTotal += len(locals)
+		}
+	}
 
 	// Total non-param locals: pos, sp, state, scratch, cap0s, cap0e, ...,
-	// loop_pos..., dfaState, dfaPos, btEnd, dfaClass
-	// = 4 + numCapLocals + numLoops + 4
-	totalLocals := 4 + numCapLocals + len(loopPCsSorted) + 4
+	// loop_pos..., loop_snap... (only specific cap locals for loops that need it)
+	totalLocals := 4 + numCapLocals + len(loopPCsSorted) + snapTotal
 
 	var body []byte
 
 	// ── Local declarations ────────────────────────────────────────────────────
-	// Declare all as a single group of i32s.
-	body = append(body, 0x01)                              // 1 declaration entry
-	body = utils.AppendULEB128(body, uint32(totalLocals))  // count
-	body = append(body, 0x7F)                              // type: i32
-
-	// ── Phase 1: DFA anchored match to determine extent ──────────────────────
-	// Initialise dfaPos = 0 (dfaState is set inside buildMatchBodyInline).
-	body = append(body, 0x41, 0x00) // i32.const 0
-	body = append(body, 0x21)       // local.set
-	body = utils.AppendULEB128(body, dfaPosLocal)
-
-	body = buildMatchBodyInline(body,
-		dfaL.wasmStart,
-		dfaL.tableOff, dfaL.acceptOff, dfaL.classMapOff,
-		dfaL.numClasses,
-		dfaL.useU8, dfaL.useCompression,
-		dfaL.immediateAcceptOff, dfaL.hasImmAccept,
-		uint32(localPtr), uint32(localLen),
-		dfaStateLocal, dfaPosLocal, dfaClassLocal,
-	)
-	// buildMatchBodyInline leaves result (pos or -1) on stack — store to btEndLocal.
-	body = append(body, 0x21)
-	body = utils.AppendULEB128(body, btEndLocal)
-
-	// If btEndLocal == -1: return -1 immediately (no DFA match).
-	body = append(body, 0x20)
-	body = utils.AppendULEB128(body, btEndLocal)
-	body = append(body, 0x41, 0x7F) // i32.const -1
-	body = append(body, 0x46)       // i32.eq
-	body = append(body, 0x04, 0x40) // if void
-	body = append(body, 0x41, 0x7F) // i32.const -1
-	body = append(body, 0x0F)       // return
-	body = append(body, 0x0B)       // end if
+	body = append(body, 0x01)
+	body = utils.AppendULEB128(body, uint32(totalLocals))
+	body = append(body, 0x7F)
 
 	// ── Initialise pos=0, sp=stackBase, state=prog.Start ────────────────────
 	body = append(body, 0x41, 0x00) // i32.const 0
@@ -324,6 +181,15 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, d
 		body = append(body, 0x41, 0x7F) // i32.const -1
 		body = append(body, 0x21)       // local.set
 		body = utils.AppendULEB128(body, loopLocal)
+	}
+
+	// ── Initialise loop snapshot locals to -1 ───────────────────────────────
+	for pc, snapBase := range loopSnapBase {
+		for k := range loopSnapLocals[pc] {
+			body = append(body, 0x41, 0x7F) // i32.const -1
+			body = append(body, 0x21)
+			body = utils.AppendULEB128(body, snapBase+uint32(k))
+		}
 	}
 
 	// ── Main loop $run ───────────────────────────────────────────────────────
@@ -407,7 +273,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, d
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, stackBase, stackLimit, frameSize, numCapLocals)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackBase, stackLimit, frameSize, numCapLocals)
 	}
 
 	body = append(body, 0x00) // unreachable (after all handlers, inside $run)
@@ -425,7 +291,9 @@ func emitBTInstHandler(
 	p int,
 	inst syntax.Inst,
 	brRun uint32,
-	loopLocalIdx map[int]uint32,
+	loopLocalIdx  map[int]uint32,
+	loopSnapBase  map[int]uint32,
+	loopSnapLocals map[int][]uint32,
 	stackBase, stackLimit, frameSize int32,
 	numCapLocals int,
 ) []byte {
@@ -489,6 +357,15 @@ func emitBTInstHandler(
 			body = utils.AppendULEB128(body, loopLocal)
 			body = append(body, 0x46)       // i32.eq
 			body = append(body, 0x04, 0x40) // if void
+			// Restore only the specific cap locals snapshotted for this loop.
+			if snapBase, ok := loopSnapBase[p]; ok {
+				for k, capLocal := range loopSnapLocals[p] {
+					body = append(body, 0x20)
+					body = utils.AppendULEB128(body, snapBase+uint32(k))
+					body = append(body, 0x21)
+					body = utils.AppendULEB128(body, capLocal)
+				}
+			}
 			body = btSetStateAndBr(body, int32(inst.Arg), brRunNested)
 			body = append(body, 0x0B) // end if
 
@@ -496,6 +373,16 @@ func emitBTInstHandler(
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x21)
 			body = utils.AppendULEB128(body, loopLocal)
+
+			// Save only the specific cap locals for this loop.
+			if snapBase, ok := loopSnapBase[p]; ok {
+				for k, capLocal := range loopSnapLocals[p] {
+					body = append(body, 0x20)
+					body = utils.AppendULEB128(body, capLocal)
+					body = append(body, 0x21)
+					body = utils.AppendULEB128(body, snapBase+uint32(k))
+				}
+			}
 
 			// Push retry=inst.Arg, continue with inst.Out
 			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize)
@@ -705,9 +592,15 @@ func btCheckRuneRanges(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 	// Use block $matched (result i32): emit 1 and br if matched, else 0 falls through.
 	b = append(b, 0x02, 0x7F) // block (result i32)
 
-	for i := 0; i+1 < len(inst.Rune); i += 2 {
-		lo := inst.Rune[i]
-		hi := inst.Rune[i+1]
+	for i := 0; i < len(inst.Rune); i += 2 {
+		var lo, hi rune
+		if i+1 >= len(inst.Rune) {
+			lo = inst.Rune[i]
+			hi = inst.Rune[i] // single-rune element (e.g. FoldCase with one base rune)
+		} else {
+			lo = inst.Rune[i]
+			hi = inst.Rune[i+1]
+		}
 		if lo > 0x7F {
 			continue // skip non-ASCII ranges
 		}
@@ -759,7 +652,7 @@ func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(hi))
-	b = append(b, 0x4E) // i32.le_u
+	b = append(b, 0x4D) // i32.le_u
 
 	b = append(b, 0x71) // i32.and → 0 or 1
 
@@ -977,142 +870,4 @@ func btFoldRune(r rune) rune {
 	return r
 }
 
-// genHybridWASMWithBacktrack generates a WASM module combining a DFA (match and/or
-// find) with a backtracking NFA (groups), all sharing one memory.
-// This mirrors genHybridWASM but replaces the OnePass groups body with a
-// backtrack body, and emits no extra data segment for the groups function
-// (backtrack stack uses zero-initialised memory reserved at btTableBase).
-func genHybridWASMWithBacktrack(
-	t *dfaTable, dfaTableBase int64, matchExport, findExport string,
-	bt *backtrack, btTableBase int64, groupsExport string,
-	standalone bool, memPages int32, leftmostFirst bool,
-) []byte {
-	needFind := findExport != ""
-	needMatch := matchExport != ""
-	needGroups := bt != nil && groupsExport != ""
 
-	l := buildDFALayout(t, dfaTableBase, needFind, leftmostFirst)
-
-	var out []byte
-	out = append(out, 0x00, 0x61, 0x73, 0x6D)
-	out = append(out, 0x01, 0x00, 0x00, 0x00)
-
-	// ── Type section ─────────────────────────────────────────────────────────
-	numTypes := 0
-	matchTypeIdx := -1
-	findTypeIdx := -1
-	groupsTypeIdx := -1
-	var ts []byte
-	if needMatch {
-		matchTypeIdx = numTypes
-		numTypes++
-		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F) // (i32,i32)→i32
-	}
-	if needFind {
-		findTypeIdx = numTypes
-		numTypes++
-		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E) // (i32,i32)→i64
-	}
-	if needGroups {
-		groupsTypeIdx = numTypes
-		numTypes++
-		ts = append(ts, onePassTypeEntry()...) // (i32,i32,i32)→i32 — same signature
-	}
-	out = appendSection(out, 1, append(utils.AppendULEB128(nil, uint32(numTypes)), ts...))
-
-	// ── Import section ───────────────────────────────────────────────────────
-	if !standalone {
-		var is []byte
-		is = append(is, 0x01)
-		is = appendString(is, "main")
-		is = appendString(is, "memory")
-		is = append(is, 0x02, 0x00)
-		is = utils.AppendULEB128(is, 0x00)
-		out = appendSection(out, 2, is)
-	}
-
-	// ── Function section ─────────────────────────────────────────────────────
-	var fs []byte
-	fs = utils.AppendULEB128(fs, uint32(numTypes))
-	if needMatch {
-		fs = utils.AppendULEB128(fs, uint32(matchTypeIdx))
-	}
-	if needFind {
-		fs = utils.AppendULEB128(fs, uint32(findTypeIdx))
-	}
-	if needGroups {
-		fs = utils.AppendULEB128(fs, uint32(groupsTypeIdx))
-	}
-	out = appendSection(out, 3, fs)
-
-	// ── Memory section (standalone only) ─────────────────────────────────────
-	if standalone {
-		var ms []byte
-		ms = append(ms, 0x01, 0x00)
-		ms = utils.AppendULEB128(ms, uint32(memPages))
-		out = appendSection(out, 5, ms)
-	}
-
-	// ── Export section ───────────────────────────────────────────────────────
-	numExports := numTypes
-	if standalone {
-		numExports++ // memory
-	}
-	var es []byte
-	es = utils.AppendULEB128(es, uint32(numExports))
-	if standalone {
-		es = appendString(es, "memory")
-		es = append(es, 0x02)
-		es = utils.AppendULEB128(es, 0x00)
-	}
-	funcIdx := 0
-	if needMatch {
-		es = appendString(es, matchExport)
-		es = append(es, 0x00)
-		es = utils.AppendULEB128(es, uint32(funcIdx))
-		funcIdx++
-	}
-	if needFind {
-		es = appendString(es, findExport)
-		es = append(es, 0x00)
-		es = utils.AppendULEB128(es, uint32(funcIdx))
-		funcIdx++
-	}
-	if needGroups {
-		es = append(es, btExportEntry(groupsExport, funcIdx)...)
-	}
-	out = appendSection(out, 7, es)
-
-	// ── Code section ─────────────────────────────────────────────────────────
-	var cs []byte
-	cs = utils.AppendULEB128(cs, uint32(numTypes))
-	if needMatch {
-		body := buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.immediateAcceptOff, l.hasImmAccept)
-		cs = utils.AppendULEB128(cs, uint32(len(body)))
-		cs = append(cs, body...)
-	}
-	if needFind {
-		body := buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff, l.firstByteOff, l.prefix, l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept, l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff, l.firstByteFlags, l.firstBytes, l.teddyLoOff, l.teddyHiOff, l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0, l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0)
-		cs = utils.AppendULEB128(cs, uint32(len(body)))
-		cs = append(cs, body...)
-	}
-	if needGroups {
-		numCapLocals := bt.numGroups * 2
-		frameSize := int32(4 + numCapLocals*4 + 4)
-		maxFrames := bt.numAlts * 4096
-		if maxFrames < 4096 {
-			maxFrames = 4096
-		}
-		btStackLimit := int32(btTableBase) + int32(maxFrames)*frameSize
-		btBody := buildBacktrackBody(bt, int32(btTableBase), btStackLimit, frameSize, l)
-		cs = utils.AppendULEB128(cs, uint32(len(btBody)))
-		cs = append(cs, btBody...)
-	}
-	out = appendSection(out, 10, cs)
-
-	// ── Data section ─────────────────────────────────────────────────────────
-	// DFA data segments only — backtrack stack uses zero-initialised memory.
-	out = appendSection(out, 11, dfaDataSegments(l, needFind))
-
-	return out
-}

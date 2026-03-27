@@ -24,4 +24,5 @@ fn main() {
     eprintln!("checksum:{}", sum);
 
     println!("match: {}ns", avg_ns);
+    println!("result:{}", if pattern_match(input).is_some() { "match" } else { "none" });
 }

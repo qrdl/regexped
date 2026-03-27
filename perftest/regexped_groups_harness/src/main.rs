@@ -23,4 +23,11 @@ fn main() {
 
     eprintln!("checksum:{}", sum);
     println!("match: {}ns", avg_ns);
+    match pattern_groups(input) {
+        Some(ref groups) => match groups.get(0) {
+            Some(Some((s, e))) => println!("result:{}:{}", s, e),
+            _ => println!("result:none"),
+        },
+        None => println!("result:none"),
+    }
 }

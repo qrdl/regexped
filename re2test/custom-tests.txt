@@ -1,0 +1,1393 @@
+# Custom edge-case tests for regexped.
+# Format: col0=anchored-full-match(LL); col1=first-find(LF); col2="-"; col3="-"
+# Optional col4 (5th field): all find matches comma-separated.
+# Optional col5 (6th field): non-anchored find with captures.
+#
+# col0: standard DFA, must match from pos 0 consuming ALL input (leftmost-longest).
+#       Returns end=len(input) on success, or "-" for no match.
+# col1: LeftmostFirst DFA find (first branch wins at equal start position).
+#       Agrees with Go stdlib regexp semantics.
+# ============================================================
+# Category 1: LeftmostFirst alternation semantics
+# ============================================================
+# AltOrderMatters: "a|ab" vs "ab|a"
+#   a|ab  shorter branch listed first -> LF gives shorter find than LL
+#   ab|a  longer branch listed first  -> LF and LL agree (longer wins either way)
+# Note: col0 "-" when neither branch matches the full input string.
+AltOrderMatters
+strings
+""
+"a"
+"b"
+"ab"
+"ba"
+"xab"
+"aba"
+"xaba"
+regexps
+"a|ab"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;0-1;-;-
+-;1-2;-;-
+-;1-2;-;-
+-;0-1;-;-
+-;1-2;-;-
+"ab|a"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;1-2;-;-
+-;1-3;-;-
+-;0-2;-;-
+-;1-3;-;-
+# AltNestedGroup: alternation inside a non-capturing group where one branch is
+# a prefix of the other.
+#   a(?:b|bc):   inner "b" vs "bc" -> LF picks "b", LL picks "bc"
+#   foo|foobar:  classic prefix alternation
+AltNestedGroup
+strings
+""
+"ab"
+"abc"
+"foo"
+"foobar"
+"xabc"
+"xfoobar"
+"foobarbaz"
+regexps
+"a(?:b|bc)"
+-;-;-;-
+0-2;0-2;-;-
+-;0-2;-;-
+-;-;-;-
+-;-;-;-
+-;1-3;-;-
+-;-;-;-
+-;-;-;-
+"foo|foobar"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;0-3;-;-
+-;-;-;-
+-;1-4;-;-
+-;0-3;-;-
+# AltMultipleBranches: three or more alternatives.
+#   a|b|ab  -> at pos 0: "a" wins (first branch), NOT "ab"
+#   ab|b|a  -> at pos 0: "ab" wins (first branch, and longest)
+AltMultipleBranches
+strings
+""
+"a"
+"b"
+"ab"
+"ba"
+"xab"
+regexps
+"a|b|ab"
+-;-;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;1-2;-;-
+"ab|b|a"
+-;-;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+-;1-3;-;-
+# ============================================================
+# Category 2: Non-greedy quantifiers in find mode
+# Tests that LeftmostFirst + immediateAccepting stops DFA at shortest match.
+# col0 = full-match standard DFA (non-greedy vs greedy makes no difference
+#        for full-match since all input must be consumed either way).
+# col1 = LF find: non-greedy picks minimum occurrences.
+# ============================================================
+# Cat2NonGreedyPlus: a+? picks exactly 1 "a" at leftmost position.
+# Compare: a+ (greedy) would pick all consecutive "a"s.
+Cat2NonGreedyPlus
+strings
+""
+"a"
+"aaa"
+"aaab"
+"b"
+"xaaa"
+regexps
+"a+?"
+-;-;-;-
+0-1;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;-;-;-
+-;1-2;-;-
+# Cat2NonGreedyRange: a{2,5}? picks minimum 2 "a"s.
+# Full-match: must consume entire input within 2-5 "a"s.
+Cat2NonGreedyRange
+strings
+""
+"a"
+"aa"
+"aaaaa"
+"aaaaaa"
+"xaa"
+regexps
+"a{2,5}?"
+-;-;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;0-2;-;-
+-;0-2;-;-
+-;1-3;-;-
+# Cat2NonGreedySuffix: a+?b — non-greedy forces minimum "a"s before "b".
+# At each position tries 1 "a" first; extends only if "b" doesn't follow.
+Cat2NonGreedySuffix
+strings
+""
+"ab"
+"aab"
+"aaab"
+"b"
+"xaab"
+regexps
+"a+?b"
+-;-;-;-
+0-2;0-2;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+-;-;-;-
+-;1-4;-;-
+# Cat2NonGreedyDot: .*?end — non-greedy ".*?" finds first "end" in string.
+# Full-match: equivalent to .*end (both consume any prefix then "end" suffix).
+Cat2NonGreedyDot
+strings
+""
+"end"
+"xend"
+"xyz"
+"xyzend"
+"start end"
+"start end finish"
+regexps
+".*?end"
+-;-;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+-;-;-;-
+0-6;0-6;-;-
+0-9;0-9;-;-
+-;0-9;-;-
+# ============================================================
+# Category 3: Find iteration (all matches via col4)
+# Tests the full iteration loop: call find repeatedly with advancing offset,
+# advancing by 1 on zero-length matches to avoid infinite loops.
+# col4 format: "s1-e1,s2-e2,..." or "-" for no matches.
+# NOTE: after a non-zero match ending at pos p, we call find on text[p:]
+# and DO report any empty match there (unlike Go's FindAllStringIndex which
+# skips such adjacent empty matches).
+# ============================================================
+# Cat3ZeroLen: a* produces zero-length matches in gaps and at end.
+# col4 shows empty matches interspersed with real "a" matches.
+Cat3ZeroLen
+strings
+""
+"a"
+"aaa"
+"abc"
+"b"
+"bab"
+regexps
+"a*"
+0-0;0-0;-;-;0-0
+0-1;0-1;-;-;0-1,1-1
+0-3;0-3;-;-;0-3,3-3
+-;0-1;-;-;0-1,1-1,2-2,3-3
+-;0-0;-;-;0-0,1-1
+-;0-0;-;-;0-0,1-2,2-2,3-3
+# Cat3Greedy: a+ and [0-9] — non-overlapping greedy matches only, no zero-length.
+# The find function skips non-matching regions to find next match.
+Cat3Greedy
+strings
+""
+"a"
+"aaa"
+"aaabaaaa"
+"b"
+"1a2b3"
+"123"
+regexps
+"a+"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-3;0-3;-;-;0-3
+-;0-3;-;-;0-3,4-8
+-;-;-;-;-
+-;1-2;-;-;1-2
+-;-;-;-;-
+"[0-9]"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-1;-;-;0-1,2-3,4-5
+-;0-1;-;-;0-1,1-2,2-3
+# ============================================================
+# Category 4: Word boundaries
+# Tests the doubled DFA state space (prevWasWord context bit) used for \b/\B.
+# \b fires between word-char and non-word-char (or at string start/end).
+# \B fires between two word-chars or two non-word-chars (not at string start/end).
+# ============================================================
+# Cat4WordBoundaryFoo: \bfoo\b — word "foo" with surrounding context.
+# Key cases: digit adjacent to word (no boundary), punctuation (has boundary).
+Cat4WordBoundaryFoo
+strings
+""
+"foo"
+"foobar"
+"foo!"
+"foo1"
+"1foo"
+"foo rest"
+"rest foo"
+"(foo)"
+regexps
+"\\bfoo\\b"
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+-;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;0-3;-;-
+-;5-8;-;-
+-;1-4;-;-
+# Cat4WordBoundaryWord: \b[a-z]+\b — any lowercase word.
+# Includes multi-match strings, so col4 is present.
+# "hello123" and "123hello" have no match (digit is \w, no boundary).
+Cat4WordBoundaryWord
+strings
+""
+"hello"
+"hello world"
+"hello123"
+"123hello"
+"say-hello"
+"HELLO"
+regexps
+"\\b[a-z]+\\b"
+-;-;-;-;-
+0-5;0-5;-;-;0-5
+-;0-5;-;-;0-5,6-11
+-;-;-;-;-
+-;-;-;-;-
+-;0-3;-;-;0-3,4-9
+-;-;-;-;-
+# Cat4NoBoundary: \Boo\B — "oo" strictly inside a word (not at word edges).
+# Matches only when both sides of "oo" are word chars.
+Cat4NoBoundary
+strings
+""
+"oo"
+"foo"
+"foobar"
+"cool"
+" oo "
+"book"
+regexps
+"\\Boo\\B"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;1-3;-;-
+-;1-3;-;-
+-;-;-;-
+-;1-3;-;-
+# ============================================================
+# Category 5: Anchor-aware find
+# When pattern starts with ^, the DFA midStartState has no transitions
+# (isAnchoredFind=true) and the find body avoids scanning past pos 0.
+# Key: ^pattern never matches in strings that don't start with the pattern.
+# ============================================================
+# Cat5AnchorStart: ^abc and ^a+ — anchored at beginning of string.
+# ^abc: finds only if string starts with "abc".
+# ^a+: finds the "a" prefix at pos 0 only (no scan for later positions).
+Cat5AnchorStart
+strings
+""
+"abc"
+"aaa"
+"aaabbb"
+"xabc"
+"xaaa"
+regexps
+"^abc"
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"^a+"
+-;-;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+-;0-3;-;-
+-;-;-;-
+-;-;-;-
+# Cat5AnchorEnd: abc$ — anchored at end of string.
+# Finds rightmost "abc" that is immediately followed by end of string.
+Cat5AnchorEnd
+strings
+""
+"abc"
+"xyzabc"
+"abcx"
+"abc abc"
+"abcabc"
+regexps
+"abc$"
+-;-;-;-
+0-3;0-3;-;-
+-;3-6;-;-
+-;-;-;-
+-;4-7;-;-
+-;3-6;-;-
+# Cat5AnchorBoth: ^abc$ — must match entire string.
+# Equivalent to full-match: only "abc" passes, no prefix or suffix allowed.
+Cat5AnchorBoth
+strings
+""
+"abc"
+"abcd"
+"xabc"
+"abc abc"
+regexps
+"^abc$"
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category 6: Backtracking engine — capture edge cases
+# These patterns have captures that don't qualify for OnePass
+# (overlapping first-char sets between loop and exit branches).
+# col0 format: "fullstart-fullend group1start-group1end ..."
+# col5: non-anchored find with captures (DFA finds leftmost extent,
+#        NFA fills slots). Tests strings where match starts at pos > 0.
+# ============================================================
+# Cat6BacktrackGreedy: (.+)(.+) — greedy first group takes max, leaves 1 for second.
+# RE2 semantics: first group gets all but last char (leftmost-longest).
+Cat6BacktrackGreedy
+strings
+""
+"a"
+"ab"
+"abc"
+"abcd"
+"hello"
+regexps
+"(.+)(.+)"
+-;-;-;-
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+0-3 0-2 2-3;0-3;-;-
+0-4 0-3 3-4;0-4;-;-
+0-5 0-4 4-5;0-5;-;-
+# Cat6BacktrackNonGreedy: (a+?)(a+) — non-greedy first gets minimum (1 "a").
+# Phase 1 LL DFA anchored at pos 0; Phase 2 NFA fills non-greedily within that extent.
+# col0: anchored from pos 0. Strings starting with non-"a" get no match.
+Cat6BacktrackNonGreedy
+strings
+""
+"a"
+"aa"
+"aaa"
+"aaaa"
+"xaa"
+"xyaaa"
+regexps
+"(a+?)(a+)"
+-;-;-;-
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+0-3 0-1 1-3;0-3;-;-
+0-4 0-1 1-4;0-4;-;-
+-;1-3;-;-
+-;2-5;-;-
+# Cat6BacktrackCharRange: (.*?)([0-9]+) — exercises character range opcodes in BT engine.
+# Non-greedy wildcard before digit range: Backtracking since .* and [0-9] overlap.
+# col0: Phase 1 LL DFA anchored at pos 0 (full extent), NFA fills captures within extent.
+# "x123y": no match from pos 0 (starts with x, LL DFA can't consume trailing y as digit).
+# "a1b2": LL extent 0-4, NFA: .*?=a1b, [0-9]+=2.
+Cat6BacktrackCharRange
+strings
+""
+"123"
+"abc123"
+"abc"
+"x123y"
+"a1b2"
+regexps
+"(.*?)([0-9]+)"
+-;-;-;-
+0-3 0-0 0-3;0-3;-;-
+0-6 0-3 3-6;0-6;-;-
+-;-;-;-
+-;0-4;-;-
+-;0-2;-;-
+# ============================================================
+# Category 7: OnePass engine — capture edge cases
+# These patterns have deterministic alternation (disjoint first-char sets)
+# so they compile to the OnePass engine with inline i32.store capture ops.
+# col0 format: "fullstart-fullend group1start-group1end ..."
+# Unmatched optional groups shown as "-".
+# ============================================================
+# Cat7OnePassNumeric: ([0-9]+)-([0-9]+) — two digit groups around a literal "-".
+# Tests basic OnePass slot filling.
+Cat7OnePassNumeric
+strings
+""
+"1-2"
+"2024-03"
+"12-"
+"-12"
+"abc"
+regexps
+"([0-9]+)-([0-9]+)"
+-;-;-;-
+0-3 0-1 2-3;0-3;-;-
+0-7 0-4 5-7;0-7;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# Cat7OnePassWord: ([a-z]+)@([a-z]+) — two word groups around "@".
+Cat7OnePassWord
+strings
+""
+"foo@bar"
+"a@b"
+"foo@"
+"@bar"
+"FOO@BAR"
+regexps
+"([a-z]+)@([a-z]+)"
+-;-;-;-
+0-7 0-3 4-7;0-7;-;-
+0-3 0-1 2-3;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# Cat7OnePassOptional: ([a-z]+)(-([0-9]+))? — word with optional numeric suffix.
+# Tests unmatched optional groups (shown as "-") and nested group slots.
+Cat7OnePassOptional
+strings
+""
+"foo"
+"foo-42"
+"foo-"
+"123"
+"bar"
+regexps
+"([a-z]+)(-([0-9]+))?"
+-;-;-;-
+0-3 0-3 - -;0-3;-;-
+0-6 0-3 3-6 4-6;0-6;-;-
+-;0-3;-;-
+-;-;-;-
+0-3 0-3 - -;0-3;-;-
+# ============================================================
+# Category 8: u16 DFA table path
+# a{1,300} needs 302 DFA states (one per count 0..300 + dead) which exceeds
+# the u16 threshold of 256. Tests that the u16 table path + row dedup produce
+# correct results. Row dedup merges states 1..299 (identical transition rows).
+# ============================================================
+Cat8U16DFA
+strings
+""
+"a"
+"aaa"
+"b"
+"xaaa"
+"aaab"
+regexps
+"a{1,300}"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;1-4;-;-;1-4
+-;0-3;-;-;0-3
+# ============================================================
+# Category 6 (Backtracking) — non-anchored capture tests (col5).
+# These strings have no match from pos 0 (col0=-), but the non-anchored
+# groups function finds a match at some pos > 0 (col5 shows start-end and slots).
+# ============================================================
+Cat6BacktrackNonAnchored
+strings
+"xaa"
+"xyaaa"
+"x123y"
+"a1b2"
+regexps
+"(a+?)(a+)"
+-;1-3;-;-;1-3;1-3 1-2 2-3
+-;2-5;-;-;2-5;2-5 2-3 3-5
+-;-;-;-;-;-
+-;-;-;-;-;-
+"(.*?)([0-9]+)"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;0-4;-;-;0-4;0-4 0-1 1-4
+-;0-2;-;-;0-2,2-4;0-2 0-1 1-2
+# ============================================================
+# Category 7 (OnePass) — non-anchored capture tests (col5).
+# ============================================================
+Cat7OnePassNonAnchored
+strings
+"date: 1-2"
+"date: 2024-03"
+"user: foo@bar"
+"user: a@b"
+"123 foo-42"
+"123 foo"
+regexps
+"([0-9]+)-([0-9]+)"
+-;6-9;-;-;6-9;6-9 6-7 8-9
+-;6-13;-;-;6-13;6-13 6-10 11-13
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+"([a-z]+)@([a-z]+)"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;6-13;-;-;6-13;6-13 6-9 10-13
+-;6-9;-;-;6-9;6-9 6-7 8-9
+-;-;-;-;-;-
+-;-;-;-;-;-
+"([a-z]+)(-([0-9]+))?"
+-;0-4;-;-;0-4;0-4 0-4 - -
+-;0-4;-;-;0-4;0-4 0-4 - -
+-;0-4;-;-;0-4,6-9,10-13;0-4 0-4 - -
+-;0-4;-;-;0-4,6-7,8-9;0-4 0-4 - -
+-;4-10;-;-;4-10;4-10 4-7 7-10 8-10
+-;4-7;-;-;4-7;4-7 4-7 - -# ============================================================
+# Category 9: Mandatory literal extraction
+# Patterns that contain a fixed byte sequence in every match path.
+# The DFA scanner uses this to skip positions that can't start a match.
+# Tests verify correctness (the optimisation must not change results).
+# ============================================================
+Cat9MandatoryLitURL
+strings
+""
+"http://foo"
+"https://bar"
+"ftp://baz"
+"no match here"
+"visit http://foo today"
+"https://foo and http://bar"
+"The application encountered an error while processing the request. The server returned status code four hundred and three, indicating insufficient permissions. Please contact the administrator."
+regexps
+"https?://[a-z]+"
+-;-;-;-;-
+0-10;0-10;-;-;0-10
+0-11;0-11;-;-;0-11
+-;-;-;-;-
+-;-;-;-;-
+-;6-16;-;-;6-16
+-;0-11;-;-;0-11,16-26
+-;-;-;-;-
+Cat9MandatoryLitHyphen
+strings
+""
+"foo-42"
+"nohyphen"
+"abc-def"
+"test foo-99 end"
+"a-1 b-2 c-3"
+regexps
+"[a-z]+-[0-9]+"
+-;-;-;-;-
+0-6;0-6;-;-;0-6
+-;-;-;-;-
+-;-;-;-;-
+-;5-11;-;-;5-11
+-;0-3;-;-;0-3,4-7,8-11
+# ============================================================
+# Category 10: Dot-all mode — (?s:.) matches newline
+# Tests that the dot-all flag correctly allows "." to match "\n".
+# ============================================================
+Cat10DotAllSingle
+strings
+""
+"axb"
+"a\nb"
+"ab"
+"xaxbx"
+regexps
+"(?s:a.b)"
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;1-4;-;-;1-4
+Cat10DotAllStar
+strings
+""
+"ab"
+"axb"
+"a\nb"
+"a\n\nb"
+"xaxb"
+regexps
+"(?s:a.*b)"
+-;-;-;-;-
+0-2;0-2;-;-;0-2
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+0-4;0-4;-;-;0-4
+-;1-4;-;-;1-4
+# ============================================================
+# Category 11: Edge inputs — empty string, single byte, null byte, newline
+# Tests correct handling of boundary conditions and unusual byte values.
+# ============================================================
+Cat11EdgeInputs
+strings
+""
+"a"
+"\n"
+"\x00"
+"a\x00b"
+regexps
+"a*"
+0-0;0-0;-;-;0-0
+0-1;0-1;-;-;0-1,1-1
+-;0-0;-;-;0-0,1-1
+-;0-0;-;-;0-0,1-1
+-;0-1;-;-;0-1,1-1,2-2,3-3
+"a?"
+0-0;0-0;-;-;0-0
+0-1;0-1;-;-;0-1,1-1
+-;0-0;-;-;0-0,1-1
+-;0-0;-;-;0-0,1-1
+-;0-1;-;-;0-1,1-1,2-2,3-3
+"."
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2,2-3
+"[^\n]"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2,2-3
+"^$"
+0-0;0-0;-;-;0-0
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"a+"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+-;-;-;-;-
+-;-;-;-;-
+-;0-1;-;-;0-1
+"\x00"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+-;1-2;-;-;1-2
+# ============================================================
+# Category 12: FoldCase (case-insensitive matching)
+# Tests (?i:pattern) for DFA, OnePass, and Backtracking engines.
+# ============================================================
+Cat12FoldCaseDFA
+strings
+""
+"abc"
+"ABC"
+"Abc"
+"xyz"
+"xABCy"
+"hElLo WoRlD"
+regexps
+"(?i:abc)"
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;1-4;-;-;1-4
+-;-;-;-;-
+"(?i:[a-z]+)"
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+0-5;0-5;-;-;0-5
+-;0-5;-;-;0-5,6-11
+"(?i:foo|bar)"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+Cat12FoldCaseOnePass
+strings
+""
+"foo@bar"
+"FOO@BAR"
+"Foo@Bar"
+"no-at-sign"
+"user: FOO@BAR"
+regexps
+"(?i:([a-z]+)@([a-z]+))"
+-;-;-;-
+0-7 0-3 4-7;0-7;-;-
+0-7 0-3 4-7;0-7;-;-
+0-7 0-3 4-7;0-7;-;-
+-;-;-;-
+-;6-13;-;-
+Cat12FoldCaseBacktracking
+strings
+""
+"foo@bar"
+"FOO@BAR"
+"User@Domain"
+"no-at"
+regexps
+"(?i:(.+)@(.+))"
+-;-;-;-
+0-7 0-3 4-7;0-7;-;-
+0-7 0-3 4-7;0-7;-;-
+0-11 0-4 5-11;0-11;-;-
+-;-;-;-
+# ============================================================
+# Category 13: OnePass engine — deeper coverage
+# EOF-accept, deeply nested optional captures, case-insensitive
+# ============================================================
+Cat13OnePassEOFAccept
+strings
+""
+"a"
+"ab"
+"abc"
+"b"
+"xab"
+regexps
+"a(b)?"
+-;-;-;-
+0-1 -;0-1;-;-
+0-2 1-2;0-2;-;-
+-;0-2;-;-
+-;-;-;-
+-;1-3;-;-
+"(a)(b)?"
+-;-;-;-
+0-1 0-1 -;0-1;-;-
+0-2 0-1 1-2;0-2;-;-
+-;0-2;-;-
+-;-;-;-
+-;1-3;-;-
+Cat13OnePassDeepOptional
+strings
+""
+"a"
+"a1"
+"a12"
+"a1b2"
+"xa12"
+regexps
+"([a-z])([0-9])?([0-9])?"
+-;-;-;-
+0-1 0-1 - -;0-1;-;-
+0-2 0-1 1-2 -;0-2;-;-
+0-3 0-1 1-2 2-3;0-3;-;-
+-;0-2;-;-
+-;0-1;-;-
+Cat13OnePassFoldCase
+strings
+""
+"Foo"
+"fOO"
+"FOO"
+"foo"
+"bar"
+"xFOOy"
+regexps
+"(?i:([a-z]+))"
+-;-;-;-
+0-3 0-3;0-3;-;-
+0-3 0-3;0-3;-;-
+0-3 0-3;0-3;-;-
+0-3 0-3;0-3;-;-
+0-3 0-3;0-3;-;-
+0-5 0-5;0-5;-;-
+# ============================================================
+# Category 14: Backtracking engine — deeper coverage
+# Complex nested quantifiers, word boundaries with captures,
+# non-greedy multi-group, loop detection.
+# ============================================================
+Cat14BacktrackNestedQuant
+strings
+""
+"a"
+"aa"
+"aaa"
+"aaaa"
+"b"
+"ab"
+regexps
+"((a+)+)"
+-;-;-;-
+0-1 0-1 0-1;0-1;-;-
+0-2 0-2 0-2;0-2;-;-
+0-3 0-3 0-3;0-3;-;-
+0-4 0-4 0-4;0-4;-;-
+-;-;-;-
+-;0-1;-;-
+"((a*)+)"
+0-0 0-0 0-0;0-0;-;-
+0-1 0-1 0-1;0-1;-;-
+0-2 0-2 0-2;0-2;-;-
+0-3 0-3 0-3;0-3;-;-
+0-4 0-4 0-4;0-4;-;-
+-;0-0;-;-
+-;0-1;-;-
+Cat14BacktrackWordCapture
+strings
+""
+"hello"
+"hello world"
+"foo123"
+"123foo"
+"say-hello"
+regexps
+"(\\b[a-z]+\\b)"
+-;-;-;-
+0-5 0-5;0-5;-;-
+-;0-5;-;-
+-;-;-;-
+-;-;-;-
+-;0-3;-;-
+Cat14BacktrackNonGreedyMulti
+strings
+""
+"ab"
+"aab"
+"aaab"
+"b"
+"xaab"
+regexps
+"(a+?)(a*)(b)"
+-;-;-;-
+0-2 0-1 1-1 1-2;0-2;-;-
+0-3 0-1 1-2 2-3;0-3;-;-
+0-4 0-1 1-3 3-4;0-4;-;-
+-;-;-;-
+-;1-4;-;-
+# ============================================================
+# Category 9 (additional): Mandatory literal extraction
+# Tests patterns where a mandatory non-prefix literal enables fast skip.
+# ============================================================
+Cat9MandatoryLitNeedle
+strings
+""
+"needle"
+"find the needle here"
+"no match here"
+"xneedley"
+"The application encountered an error while processing the request. The server returned status code four hundred and three. Please contact the administrator for assistance with this matter."
+regexps
+".*?(needle)"
+-;-;-;-;-
+0-6 0-6;0-6;-;-;0-6
+-;0-15;-;-;0-15
+-;-;-;-;-
+-;0-7;-;-;0-7
+-;-;-;-;-
+Cat9CaptureInMandatory
+strings
+""
+"noerrorhere"
+"error"
+"xnoerrorherey"
+"haserror"
+"errorhere"
+regexps
+"([a-z]+)(error)([a-z]+)"
+-;-;-;-
+0-11 0-2 2-7 7-11;0-11;-;-
+-;-;-;-
+0-13 0-3 3-8 8-13;0-13;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category 10 (additional): Newline handling
+# Tests [^\n]+ stops at newline, \n matches newline.
+# ============================================================
+Cat10NewlineMatch
+strings
+""
+"line1"
+"\n"
+"a\nb"
+"line1\nline2"
+regexps
+"[^\\n]+"
+-;-;-;-;-
+0-5;0-5;-;-;0-5
+-;-;-;-;-
+-;0-1;-;-;0-1,2-3
+-;0-5;-;-;0-5,6-11
+"\\n"
+-;-;-;-;-
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+-;1-2;-;-;1-2
+-;5-6;-;-;5-6
+Cat10DotAllFlag
+strings
+""
+"a"
+"a\nb"
+"line1\nline2"
+regexps
+"(?s).+"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-3;0-3;-;-;0-3
+0-11;0-11;-;-;0-11
+# ============================================================
+# Category 15: Hybrid module — DFA find + groups in same module
+# Tests that find_internal and groups wrapper share memory correctly.
+# ============================================================
+Cat15HybridOnePass
+strings
+""
+"2024-03"
+"today is 2024-03 done"
+"no dates here"
+"v1-2 and v3-4"
+regexps
+"([0-9]+)-([0-9]+)"
+-;-;-;-
+0-7 0-4 5-7;0-7;-;-
+-;9-16;-;-
+-;-;-;-
+-;1-4;-;-
+Cat15HybridBacktrack
+strings
+""
+"hello world"
+"say hello world please"
+"hello"
+"one two three"
+regexps
+"([a-z]+)\\s+([a-z]+)"
+-;-;-;-
+0-11 0-5 6-11;0-11;-;-
+-;0-9;-;-
+-;-;-;-
+-;0-7;-;-
+# ============================================================
+# Category 16: Multiline mode — (?m:^) and (?m:$) anchors
+# ============================================================
+Cat16Multiline
+strings
+""
+"foo"
+"bar\nfoo"
+"foobar"
+"bar\nfoobar"
+regexps
+"(?m:^foo)"
+-;-;-;-
+-;0-3;-;-
+-;4-7;-;-
+-;0-3;-;-
+-;4-7;-;-
+"(?m:foo$)"
+-;-;-;-
+-;0-3;-;-
+-;4-7;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category 17: Long inputs (~500 chars)
+# Tests memory layout correctness on larger inputs.
+# Short prose repeated to ~500 chars, with/without embedded matches.
+# ============================================================
+Cat17LongDFAFind
+strings
+"The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance. The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance. The application encountered an err"
+"The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating https://example.com/api permissions. Please contact your system administrator for assistance. The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance."
+regexps
+"https?://[a-z./]+"
+-;-;-;-;-
+-;150-173;-;-;150-173
+Cat17LongBacktracking
+strings
+"2026-03-22T14:05:01 app[42] ERROR: connection refused at endpoint"
+"The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance. The application encountered an error while processing the request from the client. The server returned status code four hundred and three, indicating insufficient permissions. Please contact your system administrator for assistance. The application encountered an err"
+regexps
+"(a+?)(a+)"
+-;-;-;-
+-;-;-;-
+"([a-z]+)([0-9]+)"
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category 18: State-count boundary
+# Patterns with exactly 253, 254, 255, 256, 257 DFA states
+# to verify the u8→u16 threshold (>256 states triggers u16).
+# a{N} has N+2 states (counting dead + states 0..N).
+# a{253}: 255 states (u8), a{254}: 256 states (u8 max), a{255}: 257 states (u16).
+# ============================================================
+Cat18StateCountBoundary
+strings
+""
+"a"
+"aaa"
+regexps
+"a{253}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"a{254}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"a{255}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"a{256}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"a{257}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category 16b: Multiline mode with capture groups
+# (?m:^...$) with captures: tests non-anchored groups wrapper
+# where find_internal must locate line starts via midStartNewline,
+# and capture_internal must match within the line slice.
+# ============================================================
+Cat16MultilineGroups
+strings
+""
+"foo"
+"bar\nfoo"
+"foo\nbar"
+"bar\nfoo\nbaz"
+"2026-03-22 ERROR: oops"
+"done\n2026-03-22 WARNING: load high\nfin"
+regexps
+"(?m:^(foo))"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;-;-;-;-;-
+-;-;-;-;-;-
+"(?m:(foo)$)"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;-;-;-;-;-
+-;-;-;-;-;-
+"(?m:^(foo.*)$)"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;0-3;-;-;-;0-3 0-3
+-;4-7;-;-;-;4-7 4-7
+-;-;-;-;-;-
+-;-;-;-;-;-
+"(?m:^(\\d{4}-\\d{2}-\\d{2}) (ERROR|WARNING): (.+)$)"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+0-22 0-10 11-16 18-22;0-22;-;-;-;0-22 0-10 11-16 18-22
+-;5-34;-;-;-;5-34 5-15 16-23 25-34
+# ============================================================
+# Category 19: Case-insensitive flag (?i)
+# Tests that (?i:...) matches both upper and lower case.
+# Covers DFA, OnePass, and Backtracking engines.
+# ============================================================
+Cat19CaseInsensitiveDFA
+strings
+""
+"foo"
+"FOO"
+"Foo"
+"foobar"
+"FOOBAR"
+"bar"
+"BAR"
+regexps
+"(?i:foo)"
+-;-;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;-;-;-
+-;-;-;-
+"(?i:foo|bar)"
+-;-;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+"(?i:[a-z]+)"
+-;-;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-6;-;-
+-;0-6;-;-
+-;0-3;-;-
+-;0-3;-;-
+Cat19CaseInsensitiveGroups
+strings
+""
+"foo"
+"FOO"
+"Foo"
+"foobar"
+"FOOBAR"
+"xFoOy"
+"user@example.com"
+"USER@EXAMPLE.COM"
+"User@Example.Com"
+"user@example"
+"USER@EXAMPLE"
+regexps
+"(?i:(foo))"
+-;-;-;-
+0-3 0-3;0-3;-;-
+0-3 0-3;0-3;-;-
+0-3 0-3;0-3;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;1-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"(?i:([a-z]+)@([a-z]+))"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-12;-;-
+-;0-12;-;-
+-;0-12;-;-
+0-12 0-4 5-12;0-12;-;-
+0-12 0-4 5-12;0-12;-;-
+"(?i:(foo)(bar))"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-6 0-3 3-6;0-6;-;-
+0-6 0-3 3-6;0-6;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category 19b: Case-insensitive Backtracking groups
+# (?i:(.+)(foo)) — .+ before (foo) forces Backtracking engine
+# because .+ can also match 'f'/'F', making the Alt non-deterministic.
+# ============================================================
+Cat19CaseInsensitiveBacktrack
+strings
+"xfoo"
+"xFOO"
+"XFOO"
+regexps
+"(?i:(.+)(foo))"
+0-4 0-1 1-4;0-4;-;-
+0-4 0-1 1-4;0-4;-;-
+0-4 0-1 1-4;0-4;-;-
+# ============================================================
+# Category 20: Dotall flag (?s) — makes . match \n
+# Cat20DotAllDFA: find mode (no captures)
+# Cat20DotAllOnePass: groups, OnePass engine (no quantifier loops)
+# Cat20DotAllBacktrack: groups, Backtracking (quantifier loop on .)
+# ============================================================
+Cat20DotAllDFA
+strings
+""
+"a"
+"ab"
+"a\nb"
+"a\n\nb"
+"\n"
+"xaby"
+"xa\nby"
+regexps
+"(?s:.)"
+-;-;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+"(?s:a.b)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;1-4;-;-
+"(?s:.+)"
+-;-;-;-
+-;0-1;-;-
+-;0-2;-;-
+-;0-3;-;-
+-;0-4;-;-
+-;0-1;-;-
+-;0-4;-;-
+-;0-5;-;-
+Cat20DotAllOnePass
+strings
+""
+"ab"
+"a\nb"
+"a\n\nb"
+"xaby"
+"xa\nby"
+regexps
+"(?s:(a.b))"
+-;-;-;-
+-;-;-;-
+0-3 0-3;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;1-4;-;-
+"(?s:(a)(.))"
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+-;0-2;-;-
+-;0-2;-;-
+-;1-3;-;-
+-;1-3;-;-
+Cat20DotAllBacktrack
+strings
+""
+"ab"
+"a\nb"
+"foo\nbar"
+"x\ny\nz"
+regexps
+"(?s:(.+)(b))"
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+0-3 0-2 2-3;0-3;-;-
+-;0-5;-;-
+-;-;-;-
+"(?s:(.*\n)(.+))"
+-;-;-;-
+-;-;-;-
+0-3 0-2 2-3;0-3;-;-
+0-7 0-4 4-7;0-7;-;-
+0-5 0-4 4-5;0-5;-;-
+# ============================================================
+# Category 21: Ungreedy flag (?U) — swaps greedy and non-greedy
+# (?U) makes + and * non-greedy by default; +? and *? become greedy.
+# Cat21UngreedyDFA: find mode (no captures)
+# Cat21UngreedyBacktrack: groups, Backtracking ((?U) with quantifiers
+#   forces hasNonGreedyQuantifiers → Backtracking always used)
+# ============================================================
+Cat21UngreedyDFA
+strings
+""
+"a"
+"aaa"
+"ab"
+"aabb"
+regexps
+"(?U:a+)"
+-;-;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+"(?U:.+)"
+-;-;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+"(?U:a+b+)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-2;-;-
+-;0-3;-;-
+Cat21UngreedyBacktrack
+strings
+""
+"a"
+"aaa"
+"ab"
+"aaabbb"
+regexps
+"(?U:(a+))"
+-;-;-;-
+0-1 0-1;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+"(?U:(a+)(b+))"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+-;0-4;-;-
+"(?U:(a*)(b+))"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2 0-1 1-2;0-2;-;-
+-;0-4;-;-

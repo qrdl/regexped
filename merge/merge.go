@@ -89,19 +89,20 @@ func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
 	return nil
 }
 
-// moduleNameForWasm looks up the import_module for a given WASM file path by
-// matching its basename against the wasm_file entries in cfg. Falls back to
-// the basename without extension.
+// moduleNameForWasm returns the import_module for a given WASM file.
+// Uses top-level cfg.ImportModule if set; falls back to the basename
+// without extension, or per-entry import_module for multi-file legacy configs.
 func moduleNameForWasm(cfg config.BuildConfig, path string) string {
+	if cfg.ImportModule != "" {
+		return cfg.ImportModule
+	}
 	base := filepath.Base(path)
 	for _, re := range cfg.Regexes {
-		if filepath.Base(re.WasmFile) == base {
+		if re.ImportModule != "" && filepath.Base(re.WasmFile) == base {
 			return re.ImportModule
 		}
 	}
-	// Fallback: strip extension.
-	name := strings.TrimSuffix(base, filepath.Ext(base))
-	return name
+	return strings.TrimSuffix(base, filepath.Ext(base))
 }
 
 // checkTool verifies that the given executable exists and is accessible.
