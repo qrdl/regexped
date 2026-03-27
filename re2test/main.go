@@ -289,7 +289,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				if validateGroups && col0 != "-" {
 					goSub0 := re.FindStringSubmatchIndex(text)
 					expSlots0 := parseCaptures(col0, re.NumSubexp()+1)
-					goAnchored := goSub0 != nil && len(goSub0) >= 2 && goSub0[0] == 0 && goSub0[1] == len(text)
+					goAnchored := len(goSub0) >= 2 && goSub0[0] == 0 && goSub0[1] == len(text)
 					if !goAnchored {
 						goSub0 = nil
 					}

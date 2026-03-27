@@ -1,11 +1,13 @@
 [package]
-name = "regex_find_harness"
+name = "regex_bench"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "regex_find_harness"
-path = "src/main.rs"
+name = "regex_bench"
 
 [dependencies]
 regex = "1"
+
+[profile.release]
+opt-level = 3
