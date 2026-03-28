@@ -149,27 +149,39 @@ The OnePass automaton is a u8 transition table (`state × byte → next_state`, 
 
 **Used for:** `groups_func`, `named_groups_func` when the pattern has captures but is not OnePass-eligible, and as the groups half of hybrid modules for such patterns.
 
-**Complexity:** O(n × numStates) time and space — guaranteed by BitState memoization (see below).
+**Complexity:** O(n × inputLen) time and space — guaranteed by BitState memoization when enabled (see below).
 
 ### How it works
 
 The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps to a handler block. The engine maintains a backtrack stack in WASM linear memory: when an `InstAlt` node is reached, the alternative branch is pushed onto the stack and execution continues with the preferred branch. On failure the stack is popped to try the alternative.
 
-**BitState memoization:** before executing any NFA state at a given input position, the engine checks a `(pc, position)` visited bitset. If the `(state, pos)` pair was already visited, the current thread is immediately discarded — it cannot produce a result not already covered by a previous thread. This prevents infinite loops on patterns with nested zero-matching quantifiers (e.g. `(?:(?:(a){0,})*?)`) and guarantees O(n × numStates) worst-case execution.
-
-The bitset is stored in WASM linear memory immediately after the backtrack stack. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes computed at runtime. It is zero-initialised at the start of each match call. For inputs exceeding `maxMemoLen` (8192 chars), memoization is skipped and the engine falls back to stack-bounded backtracking.
-
-**Limitation:** the memoization bitset is allocated at a fixed compile-time address in the module's linear memory. This is safe for single-threaded WASM (the standard). The WebAssembly threads proposal (Phase 3) would allow shared-memory parallelism, but this is not supported — calling the same pattern's groups function from two concurrent threads would cause a data race on the memo table. Single-threaded use is the only supported mode.
-
 **Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. Stack is reserved at compile time in WASM linear memory immediately after the DFA tables.
 
 **Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns -1 (no match) rather than corrupting memory.
+
+### BitState memoization
+
+Memoization is only enabled when the pattern contains a **non-greedy loop whose body can match zero bytes** — the condition checked by `needsBitState`. Patterns like `(a+)*` or `(?:b*)*` do not need it; patterns like `(?:(?:(a){0,})*?)` do, because the inner loop body can succeed without consuming input, causing the engine to revisit the same `(state, position)` pair infinitely.
+
+When enabled, before executing a non-greedy loop head (`InstAlt` with a backward edge), the engine checks a `(pc, pos)` visited bitset stored in WASM linear memory immediately after the backtrack stack:
+
+```
+bitIndex  = pc * (inputLen + 1) + pos
+byteAddr  = memoTableBase + bitIndex / 8
+bit       = 1 << (bitIndex & 7)
+```
+
+If the bit is already set, the current thread is discarded — it cannot produce a new result. Otherwise the bit is set and execution continues. This guarantees each `(pc, pos)` pair is visited at most once, bounding runtime to O(numInstructions × inputLen).
+
+The bitset is zero-initialised at the start of each call. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, computed at runtime from the actual input length. The maximum supported input length (`maxMemoLen`) is derived from a compile-time budget of 128 KB: `maxMemoLen = budget × 8 / numInstructions - 1`. For inputs exceeding `maxMemoLen` the function returns -1 without attempting a match (safe: the caller should fall back or reject the input).
 
 **Memory layout:**
 ```
 [DFA find tables] → [backtrack stack] → [BitState memo bitset]
 ```
 All regions are page-aligned and strictly non-overlapping. The input buffer is placed at address 0 by the host and never overlaps with the tables region.
+
+**Thread safety:** the memo bitset is allocated at a fixed compile-time address. Single-threaded use only — concurrent calls on the same module instance would race on the bitset.
 
 ---
 
