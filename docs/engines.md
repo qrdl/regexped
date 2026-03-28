@@ -1,6 +1,6 @@
 # Regex Engines
 
-Regexped implements three engines: **DFA**, **OnePass**, and **Backtracking**. The right engine is selected automatically at compile time based on the pattern and the requested function types.
+Regexped implements four engines: **Compiled DFA**, **DFA**, **OnePass**, and **Backtracking**. The right engine is selected automatically at compile time based on the pattern and the requested function types.
 
 ---
 
@@ -10,7 +10,8 @@ Selection priority (highest first):
 
 1. **OnePass** — pattern has capture groups AND qualifies for one-pass determinism
 2. **Backtracking** — pattern has capture groups but fails the OnePass check
-3. **DFA** — all other patterns (captures are stripped when only `match_func`/`find_func` are requested)
+3. **Compiled DFA** — no captures; minimised DFA has ≤ 256 states (default threshold)
+4. **DFA** — no captures; minimised DFA exceeds the compiled-DFA threshold
 
 A pattern qualifies for OnePass if:
 - Every `|` alternation has branches with disjoint first-character sets (deterministic at each position)
@@ -18,6 +19,68 @@ A pattern qualifies for OnePass if:
 - Pattern compiles to ≤ 100 NFA instructions
 
 If a pattern has captures but fails the OnePass check (e.g. `(a|ab)c`, `(a*)(a*)`, `(.*)(foo)`), the Backtracking engine is used automatically.
+
+---
+
+## Compiled DFA Engine
+
+**Used for:** `match_func`, `find_func`, and the DFA component of groups modules, when the minimised DFA fits within the compiled-DFA threshold (default: 256 states).
+
+**Complexity:** O(n) time.
+
+### How it works
+
+Like the DFA engine, the NFA is converted to a minimised DFA via subset construction and Hopcroft's algorithm. The difference is in how the transition table is indexed and what optimisations are applied on top.
+
+The compiled path uses **pure table-driven transitions** — the same DFA table layout as the regular DFA engine — but with two differences that improve performance for small DFAs:
+
+**1. Direct-index table access (no row deduplication, no `br_table`)**
+
+For uncompressed tables (small DFAs where `numStates × 256 ≤ 32 KB`):
+
+```
+// Hybrid uncompressed transition step:
+state = table[tableOff + (state << 8) + mem[ptr + pos]]   // shift instead of multiply
+```
+
+For compressed tables (larger DFAs where the table would exceed 32 KB, byte-class compression is applied):
+
+```
+// Hybrid compressed transition step:
+class = classMap[mem[ptr + pos]]                          // 1 load: byte → equivalence class
+state = table[tableOff + state * numClasses + class]      // 1 load: next state
+```
+
+Row deduplication (used by the regular DFA engine to collapse identical transition rows behind a rowMap) is explicitly **disabled** for the compiled path. The compiled path indexes directly into the full `numStates × stride` table, so the extra indirection level would add cost with no benefit for small DFAs.
+
+**2. Literal-chain prefix optimisation (match mode only)**
+
+If the DFA's start state has a unique sequence of unambiguous single-byte transitions from state 0 (i.e. each state in the chain has exactly one live outgoing byte), those transitions are emitted as hardcoded inline byte comparisons in the WASM function body rather than table lookups:
+
+```
+// Emitted once at function entry for a 3-byte literal chain "foo":
+if pos + 3 > len: return -1
+if mem[ptr + pos] != 'f': return -1;  pos++
+if mem[ptr + pos] != 'o': return -1;  pos++
+if mem[ptr + pos] != 'o': return -1;  pos++
+state = <state after "foo">           // compile-time constant
+// now enter the main table-driven loop
+```
+
+This eliminates table lookups entirely for the mandatory literal prefix and allows an early-exit check (`pos + chain_len > len → return -1`) that skips the loop for inputs that are too short.
+
+### Design note
+
+An earlier iteration used a two-level `br_table` dispatch that embedded all next-state values as WASM bytecode immediates and eliminated the transition table entirely. In benchmarks `br_table` was slower than table lookups due to branch misprediction costs in Cranelift's JIT — the table approach keeps the hot state value in a register and accesses L1-cached data, while `br_table` on many-entry dispatch creates unpredictable indirect branches. The hybrid approach was adopted as a result.
+
+### When it is used
+
+The hybrid path is activated when:
+- the minimised DFA has ≤ the compiled-DFA threshold WASM states (default 256, hard ceiling 256)
+- state IDs fit in a u8 (implied by the ≤ 256 limit)
+- applies to match, find, and the DFA scan component of groups modules
+
+The threshold can be adjusted (including disabled with a negative value) via `CompileOptions.CompiledDFAThreshold`. This field is not exposed in the YAML config — it is an internal knob for benchmarking and programmatic use.
 
 ---
 

@@ -33,6 +33,7 @@ const (
 	EngineOnePass
 	EnginePikeVM
 	EngineAdaptiveNFA
+	EngineCompiledDFA // DFA with compiled (br_table) dispatch; no transition table at runtime
 )
 
 // String returns the human-readable name of the engine type.
@@ -42,6 +43,8 @@ func (e EngineType) String() string {
 		return "Backtracking"
 	case EngineDFA:
 		return "DFA"
+	case EngineCompiledDFA:
+		return "Compiled DFA"
 	case EngineOnePass:
 		return "One-Pass DFA"
 	case EnginePikeVM:
@@ -67,6 +70,12 @@ type CompileOptions struct {
 	ForceEngine        EngineType // If non-zero, skip engine selection and use this engine type
 	Mode               MatchMode  // ModeAnchoredMatch (default) or ModeFind
 	LeftmostFirst      bool       // Use leftmost-first (RE2/Perl) semantics for alternations
+	// CompiledDFAThreshold is the maximum minimised WASM state count for which the
+	// compiled dispatch path (EngineCompiledDFA) is used instead of the table-driven
+	// interpreter. 0 means use the default (256). Capped at 256 (u8 state index
+	// constraint). Negative value disables the compiled path entirely.
+	// NOT exposed in the YAML config schema — internal/programmatic use only.
+	CompiledDFAThreshold int
 }
 
 // compiledPattern holds the intermediate compilation result for one RegexEntry.
@@ -86,7 +95,7 @@ type compiledPattern struct {
 	isOnePass  bool     // true = OnePass capture; false = Backtracking
 	groupNames []string // groupNames[i] = name for group i+1; "" = unnamed
 
-	dataSegCount int   // number of data segments in dataBytes
+	dataSegCount int    // number of data segments in dataBytes
 	dataBytes    []byte // raw data segments (no count prefix)
 
 	tableEnd int64
@@ -95,12 +104,20 @@ type compiledPattern struct {
 // funcCount returns the number of WASM functions this pattern contributes.
 func (p *compiledPattern) funcCount() int {
 	n := 0
-	if p.matchBody != nil { n++ }
-	if p.findBody != nil  { n++ }
+	if p.matchBody != nil {
+		n++
+	}
+	if p.findBody != nil {
+		n++
+	}
 	if p.captureBody != nil {
 		n++ // capture_internal
-		if !p.anchored            { n++ } // groups_wrapper
-		if p.namedGroupsExport != "" { n++ } // named_groups_wrapper
+		if !p.anchored {
+			n++
+		} // groups_wrapper
+		if p.namedGroupsExport != "" {
+			n++
+		} // named_groups_wrapper
 	}
 	return n
 }
@@ -110,12 +127,25 @@ func (p *compiledPattern) funcCount() int {
 func (p *compiledPattern) offsets() (matchOff, findOff, captureOff, wrapperOff, namedWrapperOff int) {
 	matchOff, findOff, captureOff, wrapperOff, namedWrapperOff = -1, -1, -1, -1, -1
 	idx := 0
-	if p.matchBody != nil      { matchOff = idx; idx++ }
-	if p.findBody != nil       { findOff = idx; idx++ }
-	if p.captureBody != nil    {
-		captureOff = idx; idx++
-		if !p.anchored              { wrapperOff = idx; idx++ }
-		if p.namedGroupsExport != "" { namedWrapperOff = idx; idx++ }
+	if p.matchBody != nil {
+		matchOff = idx
+		idx++
+	}
+	if p.findBody != nil {
+		findOff = idx
+		idx++
+	}
+	if p.captureBody != nil {
+		captureOff = idx
+		idx++
+		if !p.anchored {
+			wrapperOff = idx
+			idx++
+		}
+		if p.namedGroupsExport != "" {
+			namedWrapperOff = idx
+			idx++
+		}
 	}
 	return
 }
@@ -123,7 +153,9 @@ func (p *compiledPattern) offsets() (matchOff, findOff, captureOff, wrapperOff, 
 // stripSegCount strips the LEB128 count prefix from a data section payload,
 // returning the raw segment bytes and the count.
 func stripSegCount(data []byte) ([]byte, int) {
-	if len(data) == 0 { return nil, 0 }
+	if len(data) == 0 {
+		return nil, 0
+	}
 	count, n := utils.DecodeULEB128(data)
 	return data[n:], int(count)
 }
@@ -148,8 +180,8 @@ func extractGroupNames(re *syntax.Regexp) []string {
 // compilePattern compiles one RegexEntry into an intermediate compiledPattern.
 // It does not build the final WASM module; call assembleModule for that.
 func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, error) {
-	needMatch  := re.MatchFunc != ""
-	needFind   := re.FindFunc != ""
+	needMatch := re.MatchFunc != ""
+	needFind := re.FindFunc != ""
 	needGroups := re.CaptureStubsRequested()
 
 	if !needMatch && !needFind && !needGroups {
@@ -163,10 +195,10 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 	// Find/groups use LF (leftmostFirst=true): leftmost-first Perl semantics.
 	// These require separate DFA compilations.
 
-	var matchBody   []byte
-	var matchData   []byte
+	var matchBody []byte
+	var matchData []byte
 	var matchSegCnt int
-	var matchEnd    int64
+	var matchEnd int64
 
 	cur := tableBase
 
@@ -177,20 +209,22 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 		// making full-string match fail for patterns like `a|aa` on "aa" (LF picks `a` at
 		// pos 0, loses the `aa` path, then can't reach the end of input).
 		// This matches Go stdlib semantics: regexp.MustCompile("^(a|aa)$").MatchString("aa") = true.
-		llOpts  := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: false}
+		llOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: false}
 		llMatch, llErr := compile(re.Pattern, llOpts)
-		if llErr != nil { return nil, fmt.Errorf("compile match DFA: %w", llErr) }
+		if llErr != nil {
+			return nil, fmt.Errorf("compile match DFA: %w", llErr)
+		}
 		llTable := dfaTableFrom(llMatch.(*dfa))
 		if llTable.numStates > maxStates {
 			return nil, fmt.Errorf("DFA has %d states, exceeds limit %d", llTable.numStates, maxStates)
 		}
-		lm := buildDFALayout(llTable, cur, false, false)
-		matchBody = appendMatchCodeEntry(nil, lm, lm.hasImmAccept)
+		lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(nil))
+		matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept)
 		rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
-		matchData   = rawM
+		matchData = rawM
 		matchSegCnt = cntM
-		matchEnd    = lm.tableEnd
-		cur         = utils.PageAlign(lm.tableEnd)
+		matchEnd = lm.tableEnd
+		cur = utils.PageAlign(lm.tableEnd)
 	}
 
 	// LF DFA for find and/or groups.
@@ -204,10 +238,10 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 		return nil, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, maxStates)
 	}
 
-	anchored      := isAnchoredFind(table)
-	needFindBody  := needFind || (needGroups && !anchored)
-	l             := buildDFALayout(table, cur, needFindBody, true)
-	mandatoryLit  := FindMandatoryLit(re.Pattern)
+	anchored := isAnchoredFind(table)
+	needFindBody := needFind || (needGroups && !anchored)
+	l := buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(nil))
+	mandatoryLit := FindMandatoryLit(re.Pattern)
 
 	p := &compiledPattern{
 		matchExport: re.MatchFunc,
@@ -216,8 +250,8 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 	}
 
 	if needMatch {
-		p.matchBody    = matchBody
-		p.dataBytes    = matchData
+		p.matchBody = matchBody
+		p.dataBytes = matchData
 		p.dataSegCount = matchSegCnt
 		if !needFind && !needGroups {
 			p.tableEnd = matchEnd
@@ -225,41 +259,47 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 		}
 	}
 
-	if needFindBody { p.findBody = appendFindCodeEntry(nil, l, table, mandatoryLit) }
+	if needFindBody {
+		p.findBody = appendFindCodeEntry(nil, l, table, mandatoryLit)
+	}
 
 	rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))
-	p.dataBytes    = append(p.dataBytes, rawData...)
+	p.dataBytes = append(p.dataBytes, rawData...)
 	p.dataSegCount += segCount
-	p.tableEnd      = l.tableEnd
+	p.tableEnd = l.tableEnd
 
 	if !needGroups {
 		return p, nil
 	}
 
-	p.groupsExport      = re.GroupsFunc  // only set when groups_func explicitly requested
+	p.groupsExport = re.GroupsFunc // only set when groups_func explicitly requested
 	if re.NamedGroupsFunc != "" {
 		p.namedGroupsExport = re.NamedGroupsFunc
 	}
 
 	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
-	if err != nil { return nil, fmt.Errorf("parse error: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("parse error: %w", err)
+	}
 	prog, err := syntax.Compile(parsed.Simplify())
-	if err != nil { return nil, fmt.Errorf("compile NFA: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("compile NFA: %w", err)
+	}
 	if needsUnicodeSupport(prog) {
 		return nil, fmt.Errorf("pattern contains Unicode features not yet supported")
 	}
 
 	p.groupNames = extractGroupNames(parsed)
 	groupsEngine := selectBestEngine(prog, prog.NumCap > 2, nil)
-	p.isOnePass   = (groupsEngine == EngineOnePass)
+	p.isOnePass = (groupsEngine == EngineOnePass)
 
 	if p.isOnePass {
-		op         := newOnePass(prog)
-		opBase     := utils.PageAlign(l.tableEnd)
+		op := newOnePass(prog)
+		opBase := utils.PageAlign(l.tableEnd)
 		p.numGroups = op.numGroups
 		p.captureBody = appendOnePassCodeEntry(nil, op, int32(opBase))
-		p.tableEnd  = utils.PageAlign(opBase + int64(op.numStates*256))
-		p.dataBytes  = append(p.dataBytes, onePassDataEntry(op, opBase)...)
+		p.tableEnd = utils.PageAlign(opBase + int64(op.numStates*256))
+		p.dataBytes = append(p.dataBytes, onePassDataEntry(op, opBase)...)
 		p.dataSegCount++
 	} else {
 		bt := newBacktrack(prog)
@@ -267,18 +307,20 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 		// Stack placed directly after LF DFA tables — no Phase 1 DFA needed.
 		// The wrapper already calls find_internal to locate the match; capture_internal
 		// receives the bounded slice (end_LF - start) and runs the NFA directly.
-		btBase     := utils.PageAlign(l.tableEnd)
+		btBase := utils.PageAlign(l.tableEnd)
 		numCapLocs := bt.numGroups * 2
-		frameSize  := 4 + numCapLocs*4 + 4
-		maxFrames  := bt.numAlts * 4096
-		if maxFrames < 4096 { maxFrames = 4096 }
-		stackSize  := maxFrames * frameSize
-		stackBase  := int32(btBase)
+		frameSize := 4 + numCapLocs*4 + 4
+		maxFrames := bt.numAlts * 4096
+		if maxFrames < 4096 {
+			maxFrames = 4096
+		}
+		stackSize := maxFrames * frameSize
+		stackBase := int32(btBase)
 		stackLimit := stackBase + int32(stackSize)
 
-		p.numGroups   = bt.numGroups
+		p.numGroups = bt.numGroups
 		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize))
-		p.tableEnd    = utils.PageAlign(btBase + int64(stackSize))
+		p.tableEnd = utils.PageAlign(btBase + int64(stackSize))
 	}
 
 	return p, nil
@@ -290,7 +332,7 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool) []byte {
 	// Pass 1: assign base function indices.
 	baseIdx := make([]int, len(patterns))
-	total   := 0
+	total := 0
 	for i, p := range patterns {
 		baseIdx[i] = total
 		total += p.funcCount()
@@ -303,9 +345,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	// Type section: 3 fixed types (match, find, capture/groups).
 	typeSection := []byte{
 		0x03,
-		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F,        // type 0: (i32,i32)→i32
-		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E,        // type 1: (i32,i32)→i64
-		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F,  // type 2: (i32,i32,i32)→i32
+		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0: (i32,i32)→i32
+		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E, // type 1: (i32,i32)→i64
+		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 2: (i32,i32,i32)→i32
 	}
 	out = appendSection(out, 1, typeSection)
 
@@ -324,12 +366,20 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	var fs []byte
 	fs = utils.AppendULEB128(fs, uint32(total))
 	for _, p := range patterns {
-		if p.matchBody != nil    { fs = append(fs, 0x00) }
-		if p.findBody != nil     { fs = append(fs, 0x01) }
-		if p.captureBody != nil  {
+		if p.matchBody != nil {
+			fs = append(fs, 0x00)
+		}
+		if p.findBody != nil {
+			fs = append(fs, 0x01)
+		}
+		if p.captureBody != nil {
 			fs = append(fs, 0x02)
-			if !p.anchored               { fs = append(fs, 0x02) }
-			if p.namedGroupsExport != "" { fs = append(fs, 0x02) }
+			if !p.anchored {
+				fs = append(fs, 0x02)
+			}
+			if p.namedGroupsExport != "" {
+				fs = append(fs, 0x02)
+			}
 		}
 	}
 	out = appendSection(out, 3, fs)
@@ -344,12 +394,22 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 
 	// Export section.
 	numExports := 0
-	if standalone { numExports++ }
+	if standalone {
+		numExports++
+	}
 	for _, p := range patterns {
-		if p.matchExport != ""       { numExports++ }
-		if p.findExport != ""        { numExports++ }
-		if p.groupsExport != ""      { numExports++ }
-		if p.namedGroupsExport != "" { numExports++ }
+		if p.matchExport != "" {
+			numExports++
+		}
+		if p.findExport != "" {
+			numExports++
+		}
+		if p.groupsExport != "" {
+			numExports++
+		}
+		if p.namedGroupsExport != "" {
+			numExports++
+		}
 	}
 	var es []byte
 	es = utils.AppendULEB128(es, uint32(numExports))
@@ -395,8 +455,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	for i, p := range patterns {
 		base := baseIdx[i]
 		_, findOff, captureOff, _, _ := p.offsets()
-		if p.matchBody != nil { cs = append(cs, p.matchBody...) }
-		if p.findBody != nil  { cs = append(cs, p.findBody...) }
+		if p.matchBody != nil {
+			cs = append(cs, p.matchBody...)
+		}
+		if p.findBody != nil {
+			cs = append(cs, p.findBody...)
+		}
 		if p.captureBody != nil {
 			cs = append(cs, p.captureBody...)
 			if !p.anchored {
@@ -417,7 +481,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	var rawData []byte
 	for _, p := range patterns {
 		totalSegs += p.dataSegCount
-		rawData    = append(rawData, p.dataBytes...)
+		rawData = append(rawData, p.dataBytes...)
 	}
 	// Non-standalone Backtracking patterns need a sentinel at tableEnd-1 so that
 	// regexMemoryTop in merge.go sees the full memory extent (stack is zero-init).
@@ -462,8 +526,10 @@ func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool) ([]
 		return nil, tableBase, nil
 	}
 	lastTableEnd := compiled[len(compiled)-1].tableEnd
-	memPages     := int32(utils.PageAlign(lastTableEnd) / 65536)
-	if memPages < 1 { memPages = 1 }
+	memPages := int32(utils.PageAlign(lastTableEnd) / 65536)
+	if memPages < 1 {
+		memPages = 1
+	}
 	return assembleModule(compiled, memPages, standalone), lastTableEnd, nil
 }
 
@@ -572,10 +638,9 @@ func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, 
 	if opts.Mode == ModeFind {
 		mandatoryLit = FindMandatoryLit(pattern)
 	}
-	wasmBytes := genWASM(table, tableBase, matchExport, findExport, standalone, memPages, opts.LeftmostFirst, mandatoryLit)
+	wasmBytes := genWASM(table, tableBase, matchExport, findExport, standalone, memPages, opts.LeftmostFirst, mandatoryLit, resolveCompiledDFAThreshold(&opts))
 	return wasmBytes, tableEnd, nil
 }
-
 
 // stripCaptures converts all capture groups in the regexp tree to non-capturing
 // by replacing each OpCapture node with its single sub-expression in-place.
@@ -624,8 +689,6 @@ func compile(pattern string, opts ...CompileOptions) (Matcher, error) {
 	}
 
 	hasCapturesBeforeSimplify := re.MaxCap() > 0
-	originalMaxCap := re.MaxCap()
-	_ = originalMaxCap
 
 	simplified := re.Simplify()
 	prog, err := syntax.Compile(simplified)
@@ -775,7 +838,7 @@ func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups in
 func appendNamedGroupsWrapperCodeEntry(cs []byte, groupsFuncIdx int) []byte {
 	// Body: call groupsFuncIdx(ptr, len, out_ptr), return result.
 	var b []byte
-	b = append(b, 0x00) // 0 local declarations
+	b = append(b, 0x00)       // 0 local declarations
 	b = append(b, 0x20, 0x00) // local.get ptr
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x20, 0x02) // local.get out_ptr

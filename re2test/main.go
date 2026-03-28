@@ -26,13 +26,13 @@ const (
 )
 
 const (
-	skipNonAnchored  = "requires Backtracking (non-greedy find mode)"
-	skipCaptures     = "requires Backtracking (capture groups)"
-	skipUnicode      = "requires Unicode support"
-	skipStateLimit   = "requires larger DFA (state limit exceeded)"
-	skipBadSyntax    = "unsupported RE2 syntax (invalid escape sequence)"
-	skipParseError   = "parse/compile error"
-	skipOther        = "other reasons"
+	skipNonAnchored = "requires Backtracking (non-greedy find mode)"
+	skipCaptures    = "requires Backtracking (capture groups)"
+	skipUnicode     = "requires Unicode support"
+	skipStateLimit  = "requires larger DFA (state limit exceeded)"
+	skipBadSyntax   = "unsupported RE2 syntax (invalid escape sequence)"
+	skipParseError  = "parse/compile error"
+	skipOther       = "other reasons"
 )
 
 // skipOrder controls the display order of skip reasons in the summary.
@@ -100,17 +100,19 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 		groupsMemory      *wasmtime.Memory
 		numGroups         int
 		groupsIsBacktrack bool // true when backtracking engine is used
+		isCompiledDFA     bool // true when compiled DFA engine is used
 
-		lineno       int
-		npass        int
-		nfail        int
-		nDataErrors  int
-		ncases       int
-		stopped      bool
-		npassDFA        int
-		npassOnePass    int
-		npassBacktrack  int
-		skipCount    = make(map[string]int)
+		lineno           int
+		npass            int
+		nfail            int
+		nDataErrors      int
+		ncases           int
+		stopped          bool
+		npassDFA         int
+		npassCompiledDFA int
+		npassOnePass     int
+		npassBacktrack   int
+		skipCount        = make(map[string]int)
 	)
 
 	scanner := bufio.NewScanner(f)
@@ -158,6 +160,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			store, matchFn, memory = nil, nil, nil
 			findFn, findMemory = nil, nil
 			groupsStore, groupsFn, groupsMemory, numGroups, groupsIsBacktrack = nil, nil, nil, 0, false
+			isCompiledDFA = false
 
 			// Pre-check for unsupported features before attempting compilation.
 			if reason := preCheck(pattern); reason != "" {
@@ -181,7 +184,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				input = append([]string(nil), testStrings...)
 				continue
 			}
-			if engineType != compile.EngineDFA && engineType != compile.EngineOnePass && engineType != compile.EngineBacktrack {
+			if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineOnePass && engineType != compile.EngineBacktrack {
 				skipCount["requires "+engineType.String()] += len(testStrings)
 				input = append([]string(nil), testStrings...)
 				continue
@@ -220,14 +223,15 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				return fmt.Errorf("%s:%d: NewInstance for %q: %w", testFile, lineno, pattern, instErr)
 			}
 			matchFn = inst.GetFunc(store, "match")
-			findFn  = inst.GetFunc(store, "find")
+			findFn = inst.GetFunc(store, "find")
 			if exp := inst.GetExport(store, "memory"); exp != nil {
 				memory = exp.Memory()
 			}
 			findMemory = memory
+			isCompiledDFA = (engineType == compile.EngineCompiledDFA)
 
 			if re.GroupsFunc != "" {
-				groupsFn    = inst.GetFunc(store, "groups")
+				groupsFn = inst.GetFunc(store, "groups")
 				groupsStore = store
 				groupsMemory = memory
 				groupsIsBacktrack = (engineType == compile.EngineBacktrack)
@@ -285,7 +289,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				if validateGroups && col0 != "-" {
 					goSub0 := re.FindStringSubmatchIndex(text)
 					expSlots0 := parseCaptures(col0, re.NumSubexp()+1)
-					goAnchored := goSub0 != nil && len(goSub0) >= 2 && goSub0[0] == 0 && goSub0[1] == len(text)
+					goAnchored := len(goSub0) >= 2 && goSub0[0] == 0 && goSub0[1] == len(text)
 					if !goAnchored {
 						goSub0 = nil
 					}
@@ -317,11 +321,17 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					off := 0
 					for off <= len(text) {
 						m := re.FindStringIndex(text[off:])
-						if m == nil { break }
+						if m == nil {
+							break
+						}
 						s := m[0] + off
 						e := m[1] + off
 						goAll = append(goAll, []int{s, e})
-						if e > s { off = e } else { off = s + 1 }
+						if e > s {
+							off = e
+						} else {
+							off = s + 1
+						}
 					}
 					expAll := parseCol4(col4)
 					if !col4Equal(goAll, expAll) {
@@ -343,29 +353,117 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 
 			if !validateGo {
-			// col1: non-anchored find (only when no anchored result expected, matching RE2 test convention).
-			if col0 == "-" && col1 != "-" {
-				if findFn == nil {
-					skipCount[skipNonAnchored]++
-					// Fall through to col4/col5 tests below.
-				} else {
-					got, callErr := callFind(wd, store, findFn, findMemory, text)
+				// col1: non-anchored find (only when no anchored result expected, matching RE2 test convention).
+				if col0 == "-" && col1 != "-" {
+					if findFn == nil {
+						skipCount[skipNonAnchored]++
+						// Fall through to col4/col5 tests below.
+					} else {
+						got, callErr := callFind(wd, store, findFn, findMemory, text)
+						if callErr != nil {
+							if isTimeout(callErr) {
+								return fmt.Errorf("TIMEOUT: find pattern=%q input=%q", pattern, text)
+							}
+							return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
+								testFile, lineno, pattern, text, callErr)
+						}
+						expected := parseCol1(col1)
+						if got == expected {
+							npass++
+							if isCompiledDFA {
+								npassCompiledDFA++
+							} else {
+								npassDFA++
+							}
+							if verbose {
+								fmt.Printf("PASS %s:%d pattern=%q input=%q (find)\n", testFile, lineno, pattern, text)
+							}
+						} else {
+							nfail++
+							fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
+								pattern, text, fmtFindResult(expected), fmtFindResult(got))
+							if maxErrors > 0 && nfail >= maxErrors {
+								fmt.Printf("Stopping after %d failure(s)\n", nfail)
+								stopped = true
+								goto done
+							}
+						}
+					}
+				} else if groupsFn != nil && validateGroups {
+					// col0: anchored match with captures (only when --validate-groups is on).
+					// groups is now non-anchored; treat as no match if result doesn't start at 0.
+					endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
 					if callErr != nil {
-						if isTimeout(callErr) { return fmt.Errorf("TIMEOUT: find pattern=%q input=%q", pattern, text) }
-						return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
+						if isTimeout(callErr) {
+							return fmt.Errorf("TIMEOUT: groups pattern=%q input=%q", pattern, text)
+						}
+						return fmt.Errorf("%s:%d: wasm groups call pattern=%q input=%q: %w",
 							testFile, lineno, pattern, text, callErr)
 					}
-					expected := parseCol1(col1)
+					// Non-anchored groups: if match doesn't start at 0, treat as no match for col0.
+					if endPos >= 0 && len(slots) > 0 && slots[0] != 0 {
+						endPos = -1
+						slots = nil
+					}
+					expectedEnd := parseCol0(col0)
+					expectedSlots := parseCaptures(col0, numGroups)
+					endMatch := endPos == expectedEnd
+					slotsMatch := true
+					if expectedSlots != nil && slots != nil {
+						for i := range expectedSlots {
+							if i < len(slots) && slots[i] != expectedSlots[i] {
+								slotsMatch = false
+								break
+							}
+						}
+					} else if (expectedSlots == nil) != (slots == nil) {
+						slotsMatch = false
+					}
+					if endMatch && slotsMatch {
+						npass++
+						if groupsIsBacktrack {
+							npassBacktrack++
+						} else {
+							npassOnePass++
+						}
+						if verbose {
+							fmt.Printf("PASS %s:%d pattern=%q input=%q (groups)\n", testFile, lineno, pattern, text)
+						}
+					} else {
+						nfail++
+						fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: end=%d slots=%s\n      got:      end=%d slots=%s\n",
+							pattern, text, expectedEnd, fmtSlots(expectedSlots), endPos, fmtSlots(slots))
+						if maxErrors > 0 && nfail >= maxErrors {
+							fmt.Printf("Stopping after %d failure(s)\n", nfail)
+							stopped = true
+							goto done
+						}
+					}
+				} else if matchFn != nil {
+					// col0: anchored match (no captures).
+					got, callErr := callMatch(wd, store, matchFn, memory, text)
+					if callErr != nil {
+						if isTimeout(callErr) {
+							return fmt.Errorf("TIMEOUT: match pattern=%q input=%q", pattern, text)
+						}
+						return fmt.Errorf("%s:%d: wasm call pattern=%q input=%q: %w",
+							testFile, lineno, pattern, text, callErr)
+					}
+					expected := parseCol0(col0)
 					if got == expected {
 						npass++
-						npassDFA++
+						if isCompiledDFA {
+							npassCompiledDFA++
+						} else {
+							npassDFA++
+						}
 						if verbose {
-							fmt.Printf("PASS %s:%d pattern=%q input=%q (find)\n", testFile, lineno, pattern, text)
+							fmt.Printf("PASS %s:%d pattern=%q input=%q\n", testFile, lineno, pattern, text)
 						}
 					} else {
 						nfail++
 						fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
-							pattern, text, fmtFindResult(expected), fmtFindResult(got))
+							pattern, text, fmtResult(expected), fmtResult(got))
 						if maxErrors > 0 && nfail >= maxErrors {
 							fmt.Printf("Stopping after %d failure(s)\n", nfail)
 							stopped = true
@@ -373,149 +471,97 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						}
 					}
 				}
-			} else if groupsFn != nil && validateGroups {
-				// col0: anchored match with captures (only when --validate-groups is on).
-				// groups is now non-anchored; treat as no match if result doesn't start at 0.
-				endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
-				if callErr != nil {
-					if isTimeout(callErr) { return fmt.Errorf("TIMEOUT: groups pattern=%q input=%q", pattern, text) }
-					return fmt.Errorf("%s:%d: wasm groups call pattern=%q input=%q: %w",
-						testFile, lineno, pattern, text, callErr)
-				}
-				// Non-anchored groups: if match doesn't start at 0, treat as no match for col0.
-				if endPos >= 0 && len(slots) > 0 && slots[0] != 0 {
-					endPos = -1
-					slots = nil
-				}
-				expectedEnd := parseCol0(col0)
-				expectedSlots := parseCaptures(col0, numGroups)
-				endMatch := endPos == expectedEnd
-				slotsMatch := true
-				if expectedSlots != nil && slots != nil {
-					for i := range expectedSlots {
-						if i < len(slots) && slots[i] != expectedSlots[i] {
-							slotsMatch = false
+
+				// col4: find iteration (all matches).
+				if col4 != "" && col4 != "-" && findFn != nil {
+					expAll := parseCol4(col4)
+					var gotAll [][2]int
+					offset := 0
+					for offset <= len(text) {
+						r, callErr := callFind(wd, store, findFn, findMemory, text[offset:])
+						if callErr != nil {
+							if isTimeout(callErr) {
+								return fmt.Errorf("TIMEOUT: find-iter pattern=%q input=%q", pattern, text)
+							}
+							return fmt.Errorf("%s:%d: wasm find-iter call pattern=%q input=%q: %w",
+								testFile, lineno, pattern, text, callErr)
+						}
+						if r == -1 {
 							break
 						}
+						s := int(r>>32) + offset
+						e := int(uint32(r)) + offset
+						gotAll = append(gotAll, [2]int{s, e})
+						if e > s {
+							offset = e
+						} else {
+							offset = s + 1
+						}
 					}
-				} else if (expectedSlots == nil) != (slots == nil) {
-					slotsMatch = false
-				}
-				if endMatch && slotsMatch {
-					npass++
-					if groupsIsBacktrack { npassBacktrack++ } else { npassOnePass++ }
-					if verbose {
-						fmt.Printf("PASS %s:%d pattern=%q input=%q (groups)\n", testFile, lineno, pattern, text)
-					}
-				} else {
-					nfail++
-					fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: end=%d slots=%s\n      got:      end=%d slots=%s\n",
-						pattern, text, expectedEnd, fmtSlots(expectedSlots), endPos, fmtSlots(slots))
-					if maxErrors > 0 && nfail >= maxErrors {
-						fmt.Printf("Stopping after %d failure(s)\n", nfail)
-						stopped = true
-						goto done
-					}
-				}
-			} else if matchFn != nil {
-				// col0: anchored match (no captures).
-				got, callErr := callMatch(wd, store, matchFn, memory, text)
-				if callErr != nil {
-					if isTimeout(callErr) { return fmt.Errorf("TIMEOUT: match pattern=%q input=%q", pattern, text) }
-					return fmt.Errorf("%s:%d: wasm call pattern=%q input=%q: %w",
-						testFile, lineno, pattern, text, callErr)
-				}
-				expected := parseCol0(col0)
-				if got == expected {
-					npass++
-					npassDFA++
-					if verbose {
-						fmt.Printf("PASS %s:%d pattern=%q input=%q\n", testFile, lineno, pattern, text)
-					}
-				} else {
-					nfail++
-					fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
-						pattern, text, fmtResult(expected), fmtResult(got))
-					if maxErrors > 0 && nfail >= maxErrors {
-						fmt.Printf("Stopping after %d failure(s)\n", nfail)
-						stopped = true
-						goto done
+					if !col4WasmEqual(gotAll, expAll) {
+						nfail++
+						fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      col4 expected: %s\n      col4 got:      %s\n",
+							pattern, text, fmtCol4(expAll), fmtCol4Wasm(gotAll))
+						if maxErrors > 0 && nfail >= maxErrors {
+							fmt.Printf("Stopping after %d failure(s)\n", nfail)
+							stopped = true
+							goto done
+						}
+					} else {
+						npass++
+						if isCompiledDFA {
+							npassCompiledDFA++
+						} else {
+							npassDFA++
+						}
 					}
 				}
-			}
 
-			// col4: find iteration (all matches).
-			if col4 != "" && col4 != "-" && findFn != nil {
-				expAll := parseCol4(col4)
-				var gotAll [][2]int
-				offset := 0
-				for offset <= len(text) {
-					r, callErr := callFind(wd, store, findFn, findMemory, text[offset:])
+				// col5: non-anchored find with captures.
+				if col5 != "" && col5 != "-" && groupsFn != nil {
+					endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
 					if callErr != nil {
-						if isTimeout(callErr) { return fmt.Errorf("TIMEOUT: find-iter pattern=%q input=%q", pattern, text) }
-						return fmt.Errorf("%s:%d: wasm find-iter call pattern=%q input=%q: %w",
+						if isTimeout(callErr) {
+							return fmt.Errorf("TIMEOUT: groups-find pattern=%q input=%q", pattern, text)
+						}
+						return fmt.Errorf("%s:%d: wasm groups-find call pattern=%q input=%q: %w",
 							testFile, lineno, pattern, text, callErr)
 					}
-					if r == -1 { break }
-					s := int(r>>32) + offset
-					e := int(uint32(r)) + offset
-					gotAll = append(gotAll, [2]int{s, e})
-					if e > s { offset = e } else { offset = s + 1 }
-				}
-				if !col4WasmEqual(gotAll, expAll) {
-					nfail++
-					fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      col4 expected: %s\n      col4 got:      %s\n",
-						pattern, text, fmtCol4(expAll), fmtCol4Wasm(gotAll))
-					if maxErrors > 0 && nfail >= maxErrors {
-						fmt.Printf("Stopping after %d failure(s)\n", nfail)
-						stopped = true
-						goto done
+					expectedEnd := parseCol0(col5)
+					expectedSlots := parseCaptures(col5, numGroups)
+					endMatch := endPos == expectedEnd
+					slotsMatch := true
+					if expectedSlots != nil && slots != nil {
+						for i := range expectedSlots {
+							if i < len(slots) && slots[i] != expectedSlots[i] {
+								slotsMatch = false
+								break
+							}
+						}
+					} else if (expectedSlots == nil) != (slots == nil) {
+						slotsMatch = false
 					}
-				} else {
-					npass++
-					npassDFA++
-				}
-			}
-
-			// col5: non-anchored find with captures.
-			if col5 != "" && col5 != "-" && groupsFn != nil {
-				endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
-				if callErr != nil {
-					if isTimeout(callErr) { return fmt.Errorf("TIMEOUT: groups-find pattern=%q input=%q", pattern, text) }
-					return fmt.Errorf("%s:%d: wasm groups-find call pattern=%q input=%q: %w",
-						testFile, lineno, pattern, text, callErr)
-				}
-				expectedEnd := parseCol0(col5)
-				expectedSlots := parseCaptures(col5, numGroups)
-				endMatch := endPos == expectedEnd
-				slotsMatch := true
-				if expectedSlots != nil && slots != nil {
-					for i := range expectedSlots {
-						if i < len(slots) && slots[i] != expectedSlots[i] {
-							slotsMatch = false
-							break
+					if endMatch && slotsMatch {
+						npass++
+						if groupsIsBacktrack {
+							npassBacktrack++
+						} else {
+							npassOnePass++
+						}
+						if verbose {
+							fmt.Printf("PASS %s:%d pattern=%q input=%q (groups-find)\n", testFile, lineno, pattern, text)
+						}
+					} else {
+						nfail++
+						fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      col5 expected: end=%d slots=%s\n      col5 got:      end=%d slots=%s\n",
+							pattern, text, expectedEnd, fmtSlots(expectedSlots), endPos, fmtSlots(slots))
+						if maxErrors > 0 && nfail >= maxErrors {
+							fmt.Printf("Stopping after %d failure(s)\n", nfail)
+							stopped = true
+							goto done
 						}
 					}
-				} else if (expectedSlots == nil) != (slots == nil) {
-					slotsMatch = false
 				}
-				if endMatch && slotsMatch {
-					npass++
-					if groupsIsBacktrack { npassBacktrack++ } else { npassOnePass++ }
-					if verbose {
-						fmt.Printf("PASS %s:%d pattern=%q input=%q (groups-find)\n", testFile, lineno, pattern, text)
-					}
-				} else {
-					nfail++
-					fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      col5 expected: end=%d slots=%s\n      col5 got:      end=%d slots=%s\n",
-						pattern, text, expectedEnd, fmtSlots(expectedSlots), endPos, fmtSlots(slots))
-					if maxErrors > 0 && nfail >= maxErrors {
-						fmt.Printf("Stopping after %d failure(s)\n", nfail)
-						stopped = true
-						goto done
-					}
-				}
-			}
 			} // end !validateGo
 		default:
 			return fmt.Errorf("%s:%d: unexpected line: %s", testFile, lineno, line)
@@ -538,6 +584,7 @@ done:
 	fmt.Printf("\n=== RE2 Test Results ===\n")
 	fmt.Printf("passed:  %d\n", npass)
 	fmt.Printf("  %-38s %d\n", "DFA:", npassDFA)
+	fmt.Printf("  %-38s %d\n", "Compiled DFA:", npassCompiledDFA)
 	fmt.Printf("  %-38s %d\n", "OnePass:", npassOnePass)
 	fmt.Printf("  %-38s %d\n", "Backtrack:", npassBacktrack)
 	fmt.Printf("failed:  %d\n", nfail)
@@ -590,8 +637,8 @@ func newWatchdog(eng *wasmtime.Engine) *watchdog {
 	return w
 }
 
-func (w *watchdog) Arm(store *wasmtime.Store)  { w.arm <- store }
-func (w *watchdog) Disarm()                    { w.disarm <- struct{}{} }
+func (w *watchdog) Arm(store *wasmtime.Store) { w.arm <- store }
+func (w *watchdog) Disarm()                   { w.disarm <- struct{}{} }
 
 // isTimeout reports whether a wasmtime error is an epoch interruption.
 func isTimeout(err error) bool {
