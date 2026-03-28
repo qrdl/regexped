@@ -21,7 +21,7 @@ $(ADJUSTED): $(TESTDATA)
 adjusted: $(ADJUSTED)
 	go run . --validate-groups $(ADJUSTED)
 
-test: exhaustive custom
+test: exhaustive custom adjusted
 
 clean:
 	rm -f $(TESTDATA) $(ADJUSTED)

@@ -76,6 +76,10 @@ type CompileOptions struct {
 	// constraint). Negative value disables the compiled path entirely.
 	// NOT exposed in the YAML config schema — internal/programmatic use only.
 	CompiledDFAThreshold int
+	// MemoBudget is the maximum bytes allocated for the BitState memoization
+	// buffer. Only used when the pattern requires BitState (needsBitState == true).
+	// Defaults to 128*1024 (128 KB) when zero.
+	MemoBudget int
 }
 
 // compiledPattern holds the intermediate compilation result for one RegexEntry.
@@ -318,9 +322,30 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 		stackBase := int32(btBase)
 		stackLimit := stackBase + int32(stackSize)
 
+		// Memo table (BitState memoization) — only when the pattern has loops
+		// whose body can match zero bytes, which can cause infinite revisiting.
+		useMemo := needsBitState(prog)
+		var memoTableBase int32
+		var memoMaxLen int32
+		if useMemo {
+			N := len(prog.Inst)
+			memoBudget := 128 * 1024 // default 128 KB
+			memoMaxLen = int32(memoBudget*8/N - 1)
+			memoMaxSize := int64((N*(int(memoMaxLen)+1) + 7) / 8)
+			if memoMaxSize > int64(memoBudget) {
+				return nil, fmt.Errorf(
+					"pattern requires %d bytes of memo memory, exceeds budget %d: "+
+						"increase CompileOptions.MemoBudget",
+					memoMaxSize, memoBudget)
+			}
+			memoTableBase = stackBase + int32(stackSize)
+			p.tableEnd = utils.PageAlign(int64(memoTableBase) + memoMaxSize)
+		} else {
+			p.tableEnd = utils.PageAlign(btBase + int64(stackSize))
+		}
+
 		p.numGroups = bt.numGroups
-		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize))
-		p.tableEnd = utils.PageAlign(btBase + int64(stackSize))
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, memoMaxLen, useMemo)
 	}
 
 	return p, nil
