@@ -44,8 +44,6 @@ var skipOrder = []string{
 	skipBadSyntax,
 	skipParseError,
 	"requires " + compile.EngineBacktrack.String(),
-	"requires " + compile.EnginePikeVM.String(),
-	"requires " + compile.EngineAdaptiveNFA.String(),
 	skipOther,
 }
 
@@ -110,7 +108,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 		stopped          bool
 		npassDFA         int
 		npassCompiledDFA int
-		npassOnePass     int
+		npassTDFA        int
 		npassBacktrack   int
 		skipCount        = make(map[string]int)
 	)
@@ -184,7 +182,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				input = append([]string(nil), testStrings...)
 				continue
 			}
-			if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineOnePass && engineType != compile.EngineBacktrack && engineType != compile.EngineTDFA {
+			if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineBacktrack && engineType != compile.EngineTDFA {
 				skipCount["requires "+engineType.String()] += len(testStrings)
 				input = append([]string(nil), testStrings...)
 				continue
@@ -196,7 +194,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				MatchFunc: "match",
 				FindFunc:  "find",
 			}
-			if engineType == compile.EngineOnePass || engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA {
+			if engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA {
 				re.GroupsFunc = "groups"
 			}
 			wasmBytes, _, compErr := compile.Compile([]config.RegexEntry{re}, tableBase, true)
@@ -424,7 +422,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						if groupsIsBacktrack {
 							npassBacktrack++
 						} else {
-							npassOnePass++
+							npassTDFA++
 						}
 						if verbose {
 							fmt.Printf("PASS %s:%d pattern=%q input=%q (groups)\n", testFile, lineno, pattern, text)
@@ -546,7 +544,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						if groupsIsBacktrack {
 							npassBacktrack++
 						} else {
-							npassOnePass++
+							npassTDFA++
 						}
 						if verbose {
 							fmt.Printf("PASS %s:%d pattern=%q input=%q (groups-find)\n", testFile, lineno, pattern, text)
@@ -585,7 +583,7 @@ done:
 	fmt.Printf("passed:  %d\n", npass)
 	fmt.Printf("  %-38s %d\n", "DFA:", npassDFA)
 	fmt.Printf("  %-38s %d\n", "Compiled DFA:", npassCompiledDFA)
-	fmt.Printf("  %-38s %d\n", "OnePass:", npassOnePass)
+	fmt.Printf("  %-38s %d\n", "TDFA:", npassTDFA)
 	fmt.Printf("  %-38s %d\n", "Backtrack:", npassBacktrack)
 	fmt.Printf("failed:  %d\n", nfail)
 	if nDataErrors > 0 {

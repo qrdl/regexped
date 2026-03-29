@@ -30,9 +30,6 @@ type EngineType byte
 const (
 	EngineDFA EngineType = iota + 1
 	EngineBacktrack
-	EngineOnePass
-	EnginePikeVM
-	EngineAdaptiveNFA
 	EngineCompiledDFA // DFA with compiled (br_table) dispatch; no transition table at runtime
 	EngineTDFA        // Tagged DFA: O(n) matching with full capture support
 )
@@ -46,14 +43,8 @@ func (e EngineType) String() string {
 		return "DFA"
 	case EngineCompiledDFA:
 		return "Compiled DFA"
-	case EngineOnePass:
-		return "One-Pass DFA"
 	case EngineTDFA:
 		return "TDFA"
-	case EnginePikeVM:
-		return "Pike VM"
-	case EngineAdaptiveNFA:
-		return "Adaptive NFA"
 	default:
 		return "Unknown"
 	}
@@ -66,13 +57,16 @@ type Matcher interface {
 
 // CompileOptions contains optional parameters for engine selection.
 type CompileOptions struct {
-	MaxDFAStates       int        // Maximum DFA states before falling back (default: 1000)
-	MaxDFAMemory       int        // Maximum DFA memory in bytes (default: 102400)
-	Unicode            bool       // Enable Unicode support
-	AdaptiveNFACutover int        // Input size in bytes to switch to Pike VM in AdaptiveNFA
-	ForceEngine        EngineType // If non-zero, skip engine selection and use this engine type
-	Mode               MatchMode  // ModeAnchoredMatch (default) or ModeFind
-	LeftmostFirst      bool       // Use leftmost-first (RE2/Perl) semantics for alternations
+	// MaxDFAStates is the maximum number of states allowed when building a TDFA
+	// (tagged DFA, used for capture groups). If the TDFA exceeds this limit the
+	// engine falls back to Backtracking. 0 means use the default (512).
+	// NOT exposed in the YAML config schema — internal/programmatic use only.
+	MaxDFAStates  int
+	MaxDFAMemory  int        // Maximum DFA memory in bytes (default: 102400)
+	Unicode       bool       // Enable Unicode support
+	ForceEngine   EngineType // If non-zero, skip engine selection and use this engine type
+	Mode          MatchMode  // ModeAnchoredMatch (default) or ModeFind
+	LeftmostFirst bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 	// CompiledDFAThreshold is the maximum minimised WASM state count for which the
 	// compiled dispatch path (EngineCompiledDFA) is used instead of the table-driven
 	// interpreter. 0 means use the default (256). Capped at 256 (u8 state index
@@ -99,7 +93,7 @@ type compiledPattern struct {
 
 	anchored   bool     // true = pattern anchored at 0; no wrapper needed
 	numGroups  int      // capture group count (for wrapper slot adjustment)
-	isOnePass  bool     // true = OnePass capture; false = Backtracking
+	isTDFA     bool     // true = TDFA capture; false = Backtracking (controls sentinel data segment)
 	groupNames []string // groupNames[i] = name for group i+1; "" = unnamed
 
 	dataSegCount int    // number of data segments in dataBytes
@@ -302,15 +296,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if forceGroupsEngine != 0 {
 		groupsEngine = forceGroupsEngine
 	}
-	p.isOnePass = (groupsEngine == EngineOnePass || groupsEngine == EngineTDFA)
 
 	if groupsEngine == EngineTDFA {
-		tt, ok := newTDFA(prog, 400)
+		tt, ok := newTDFA(prog, resolveTDFALimit(nil))
 		if !ok {
 			// Fallback: TDFA limit exceeded during actual compilation (should match selector).
 			groupsEngine = EngineBacktrack
-			p.isOnePass = false
 		} else {
+			p.isTDFA = true
 			tdfaBase := utils.PageAlign(l.tableEnd)
 			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(nil))
 			p.numGroups = tt.numGroups
@@ -323,15 +316,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 	}
 
-	if groupsEngine == EngineOnePass {
-		op := newOnePass(prog)
-		opBase := utils.PageAlign(l.tableEnd)
-		p.numGroups = op.numGroups
-		p.captureBody = appendOnePassCodeEntry(nil, op, int32(opBase))
-		p.tableEnd = utils.PageAlign(opBase + int64(op.numStates*256))
-		p.dataBytes = append(p.dataBytes, onePassDataEntry(op, opBase)...)
-		p.dataSegCount++
-	} else if groupsEngine == EngineBacktrack {
+	if groupsEngine == EngineBacktrack {
 		bt := newBacktrack(prog)
 
 		// Stack placed directly after LF DFA tables — no Phase 1 DFA needed.
@@ -515,7 +500,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		if p.captureBody != nil {
 			cs = append(cs, p.captureBody...)
 			if !p.anchored {
-				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, p.isOnePass)
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups)
 				if p.namedGroupsExport != "" {
 					_, _, _, wrapperOff, _ := p.offsets()
 					cs = appendNamedGroupsWrapperCodeEntry(cs, base+wrapperOff)
@@ -538,7 +523,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	// regexMemoryTop in merge.go sees the full memory extent (stack is zero-init).
 	if !standalone {
 		for _, p := range patterns {
-			if p.captureBody != nil && !p.isOnePass && p.tableEnd > 0 {
+			if p.captureBody != nil && !p.isTDFA && p.tableEnd > 0 {
 				rawData = appendDataSegment(rawData, int32(p.tableEnd-1), []byte{0x00})
 				totalSegs++
 			}
@@ -566,7 +551,7 @@ func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool) ([]
 
 // CompileForced is like Compile but forces the given engine for the capture path
 // of every entry that requests capture groups. Pass EngineBacktrack to force
-// backtracking regardless of the pattern's eligibility for TDFA or OnePass.
+// backtracking regardless of the pattern's eligibility for TDFA.
 func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType) ([]byte, int64, error) {
 	return compileAll(patterns, tableBase, standalone, forceGroupsEngine)
 }
@@ -824,7 +809,7 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 // because it is not DFA-specific; it is used by the module assembler.
 //
 // Signature: (ptr i32, len i32, out_ptr i32) → i32
-func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups int, isOnePass bool) []byte {
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups int) []byte {
 	var b []byte
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F) // 3 × i32
@@ -887,8 +872,8 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups int, isOnePas
 }
 
 // appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
-func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups int, isOnePass bool) []byte {
-	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, isOnePass)
+func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups int) []byte {
+	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

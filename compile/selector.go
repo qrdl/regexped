@@ -6,16 +6,9 @@ import (
 	"regexp/syntax"
 )
 
-const (
-	// defaultMaxDFAStates is the default maximum DFA states before falling back to backtracking
-	defaultMaxDFAStates = 1000
-	// defaultMaxDFAMemory is the default maximum DFA memory in bytes (100 KB)
-	defaultMaxDFAMemory = 100 * 1024
-)
-
 // selectBestEngine analyses the compiled regex pattern and selects the optimal engine type.
 // It considers pattern complexity, feature requirements (captures, word boundaries),
-// and estimated resource usage to choose between Backtrack, DFA, or OnePass engines.
+// and estimated resource usage to choose between Backtrack, DFA, TDFA, or CompiledDFA.
 //
 // The optional CompileOptions parameter can customize DFA selection thresholds.
 // When omitted, uses sensible defaults (1000 states, 100KB memory limit).
@@ -111,7 +104,7 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 	if hasCaptureGroups {
 		if !hasNonGreedyQuantifiers(prog) && !hasLineAnchors(prog) &&
 			!hasWordBoundary && !hasAmbiguousCaptures(prog) {
-			tt, ok := newTDFA(prog, 400)
+			tt, ok := newTDFA(prog, resolveTDFALimit(opts))
 			if ok {
 				_ = tt // table will be built again in compilePattern; here we only report engine type
 				slog.Debug("Engine selected", "engine", "TDFA", "reason", "capture pattern within state limit")
@@ -151,6 +144,18 @@ func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptio
 		return EngineCompiledDFA
 	}
 	return EngineDFA
+}
+
+// resolveTDFALimit returns the effective TDFA state limit from opts.
+// Zero → default (512). Negative → disabled (0, meaning TDFA is never used).
+func resolveTDFALimit(opts *CompileOptions) int {
+	if opts == nil || opts.MaxDFAStates == 0 {
+		return 512
+	}
+	if opts.MaxDFAStates < 0 {
+		return 0
+	}
+	return opts.MaxDFAStates
 }
 
 // resolveCompiledDFAThreshold returns the effective compiled-DFA state threshold
@@ -394,25 +399,7 @@ func printAnalysis(a *patternAnalysis) {
 }
 
 // --------------------------------------------------------------------------
-// One-pass detection
-
-// isOnePass checks if a program can be executed in one-pass mode.
-func isOnePass(prog *syntax.Prog) bool {
-	if len(prog.Inst) > 100 {
-		return false
-	}
-
-	for pc, inst := range prog.Inst {
-		switch inst.Op {
-		case syntax.InstAlt, syntax.InstAltMatch:
-			if !isAlternationDeterministic(prog, pc) {
-				return false
-			}
-		}
-	}
-
-	return true
-}
+// Alternation determinism helpers
 
 // isEpsilonAccept reports whether pc can reach InstMatch via epsilon transitions
 // only (no byte-consuming instructions). Used to detect loop-exit branches.

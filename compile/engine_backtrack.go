@@ -11,7 +11,7 @@ import (
 // Backtracking NFA engine
 
 // backtrack is a compiled backtracking NFA.
-// It handles capture patterns that fail the OnePass test.
+// It handles capture patterns that cannot be processed by TDFA.
 type backtrack struct {
 	prog      *syntax.Prog
 	numGroups int          // prog.NumCap / 2 (includes group 0)

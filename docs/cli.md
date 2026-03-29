@@ -33,8 +33,8 @@ All paths in the config file are resolved relative to the config file's director
 ### Engine selection
 
 Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation:
-- **OnePass engine** — used when all `|` alternations have disjoint first-character sets (deterministic patterns)
-- **Backtracking engine** — used automatically as a fallback for patterns that are not OnePass-eligible (e.g. `(a|ab)`, `(a*)(a*)`)
+- **TDFA engine** — used when the pattern has no non-greedy quantifiers, no line anchors, no word boundaries, and no ambiguous alternations (Laurikari’s tagged DFA, O(n))
+- **Backtracking engine** — used automatically as a fallback for patterns that are not TDFA-eligible (e.g. `(a|ab)`, `(a*)(a*)`)  
 
 Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
 
@@ -53,8 +53,8 @@ Regexped uses RE2 syntax. Backreferences are not supported by design.
 | Non-greedy quantifiers `*?`, `+?` | Yes |
 | Alternation `\|` (LeftmostFirst / RE2 semantics) | Yes |
 | Word boundaries `\b`, `\B` | Yes |
-| Capture groups (deterministic — OnePass engine) | Yes |
-| Capture groups (non-deterministic — Backtracking engine) | Yes |
+| Capture groups (TDFA engine — O(n)) | Yes |
+| Capture groups (Backtracking engine) | Yes |
 | Backreferences `\1` | No |
 | Lookahead / lookbehind | No |
 | Unicode beyond ASCII | No |
@@ -149,7 +149,7 @@ No config file is required.
 regexped compile [--config=<file>] --wasm-input=<main.wasm> [--out-dir=<dir>] [-d <dir>]
 ```
 
-Reads the pre-built main WASM module to determine where in memory to place DFA/OnePass tables, then compiles each regex to a standalone WASM module.
+Reads the pre-built main WASM module to determine where in memory to place DFA/TDFA tables, then compiles each regex to a standalone WASM module.
 
 **Flags:**
 

@@ -18,6 +18,13 @@ import (
 // Tag operations on a transition are one of:
 //   reg = pos        — record current input position into register
 //   reg = other_reg  — copy (register reconciliation on loop back-edges)
+
+// captureOp records an open or close event for a capture group.
+type captureOp struct {
+	open  bool // true=open (record start), false=close (record end)
+	group int  // capture group index (0 = whole match)
+}
+
 //
 // The TDFA transition table shares the same format as dfaTable and reuses
 // minimizeDFA, buildDFALayout, and dfaDataSegments unchanged.
