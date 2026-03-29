@@ -184,7 +184,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				input = append([]string(nil), testStrings...)
 				continue
 			}
-			if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineOnePass && engineType != compile.EngineBacktrack {
+			if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineOnePass && engineType != compile.EngineBacktrack && engineType != compile.EngineTDFA {
 				skipCount["requires "+engineType.String()] += len(testStrings)
 				input = append([]string(nil), testStrings...)
 				continue
@@ -196,7 +196,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				MatchFunc: "match",
 				FindFunc:  "find",
 			}
-			if engineType == compile.EngineOnePass || engineType == compile.EngineBacktrack {
+			if engineType == compile.EngineOnePass || engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA {
 				re.GroupsFunc = "groups"
 			}
 			wasmBytes, _, compErr := compile.Compile([]config.RegexEntry{re}, tableBase, true)

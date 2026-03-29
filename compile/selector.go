@@ -100,18 +100,27 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 
 	// Check if pattern has capture groups
 	// NumCap counts: [0]=full match start, [1]=full match end, [2+]=explicit capture groups
-	// However, Simplify() may optimize away captures like (a){0}, so also check the flag
-	hasCaptureGroups := prog.NumCap > 2 || hadCapturesBeforeSimplify
+	// Simplify() may optimize away captures like (a){0}; if NumCap==2 after simplification,
+	// no capture instructions remain in the NFA regardless of hadCapturesBeforeSimplify.
+	hasCaptureGroups := prog.NumCap > 2
 
-	// Capture groups: use OnePass if the pattern qualifies, else Backtrack.
-	// Exclude nested quantifiers and non-greedy quantifiers — these require
-	// backtracking semantics that OnePass cannot provide.
+	// Capture groups: try TDFA first (O(n)), fall back to Backtrack for patterns TDFA
+	// cannot correctly handle: non-greedy quantifiers, multiline line anchors,
+	// word boundaries (broken \ b start-state construction), or overlapping greedy
+	// Alt branches where a quantifier's char class includes the following separator.
 	if hasCaptureGroups {
-		if isOnePass(prog) && !hasNestedQuantifiers(prog) && !hasNonGreedyQuantifiers(prog) {
-			slog.Debug("Engine selected", "engine", "OnePass", "reason", "deterministic capture pattern")
-			return EngineOnePass
+		if !hasNonGreedyQuantifiers(prog) && !hasLineAnchors(prog) &&
+			!hasWordBoundary && !hasAmbiguousCaptures(prog) {
+			tt, ok := newTDFA(prog, 400)
+			if ok {
+				_ = tt // table will be built again in compilePattern; here we only report engine type
+				slog.Debug("Engine selected", "engine", "TDFA", "reason", "capture pattern within state limit")
+				return EngineTDFA
+			}
+			slog.Debug("Engine selected", "engine", "Backtrack", "reason", "TDFA state limit exceeded")
+		} else {
+			slog.Debug("Engine selected", "engine", "Backtrack", "reason", "non-greedy or line-anchor captures")
 		}
-		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "non-deterministic capture pattern")
 		return EngineBacktrack
 	}
 
@@ -171,6 +180,40 @@ func hasNonGreedyQuantifiers(prog *syntax.Prog) bool {
 			pcU32 := uint32(pc)
 			// Non-greedy: Out >= PC (exit first), Arg < PC (loop body backward)
 			if inst.Out >= pcU32 && inst.Arg < pcU32 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasLineAnchors reports whether the NFA contains any begin-of-line (^) or
+// end-of-line ($) assertions, either multiline (EmptyBeginLine/EmptyEndLine) or
+// end-of-text (EmptyEndText = non-multiline $). TDFA does not correctly handle
+// these assertions, so patterns with them fall back to backtracking.
+func hasLineAnchors(prog *syntax.Prog) bool {
+	for i := range prog.Inst {
+		inst := &prog.Inst[i]
+		if inst.Op == syntax.InstEmptyWidth {
+			flag := syntax.EmptyOp(inst.Arg)
+			if flag&(syntax.EmptyBeginLine|syntax.EmptyEndLine|syntax.EmptyEndText) != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasAmbiguousCaptures reports whether any Alt in the NFA has non-disjoint
+// first-character sets between its branches. When such an Alt is inside a
+// capture group's quantifier, TDFA's LeftmostFirst priority causes the greedy
+// loop to over-consume and record wrong capture positions. These patterns must
+// use backtracking instead.
+func hasAmbiguousCaptures(prog *syntax.Prog) bool {
+	for pc, inst := range prog.Inst {
+		switch inst.Op {
+		case syntax.InstAlt, syntax.InstAltMatch:
+			if !isAlternationDeterministic(prog, pc) {
 				return true
 			}
 		}

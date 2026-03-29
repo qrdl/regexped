@@ -34,6 +34,7 @@ const (
 	EnginePikeVM
 	EngineAdaptiveNFA
 	EngineCompiledDFA // DFA with compiled (br_table) dispatch; no transition table at runtime
+	EngineTDFA        // Tagged DFA: O(n) matching with full capture support
 )
 
 // String returns the human-readable name of the engine type.
@@ -47,6 +48,8 @@ func (e EngineType) String() string {
 		return "Compiled DFA"
 	case EngineOnePass:
 		return "One-Pass DFA"
+	case EngineTDFA:
+		return "TDFA"
 	case EnginePikeVM:
 		return "Pike VM"
 	case EngineAdaptiveNFA:
@@ -183,7 +186,8 @@ func extractGroupNames(re *syntax.Regexp) []string {
 
 // compilePattern compiles one RegexEntry into an intermediate compiledPattern.
 // It does not build the final WASM module; call assembleModule for that.
-func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, error) {
+// forceGroupsEngine overrides engine selection for the capture path (0 = auto).
+func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine EngineType) (*compiledPattern, error) {
 	needMatch := re.MatchFunc != ""
 	needFind := re.FindFunc != ""
 	needGroups := re.CaptureStubsRequested()
@@ -295,9 +299,31 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 
 	p.groupNames = extractGroupNames(parsed)
 	groupsEngine := selectBestEngine(prog, prog.NumCap > 2, nil)
-	p.isOnePass = (groupsEngine == EngineOnePass)
+	if forceGroupsEngine != 0 {
+		groupsEngine = forceGroupsEngine
+	}
+	p.isOnePass = (groupsEngine == EngineOnePass || groupsEngine == EngineTDFA)
 
-	if p.isOnePass {
+	if groupsEngine == EngineTDFA {
+		tt, ok := newTDFA(prog, 400)
+		if !ok {
+			// Fallback: TDFA limit exceeded during actual compilation (should match selector).
+			groupsEngine = EngineBacktrack
+			p.isOnePass = false
+		} else {
+			tdfaBase := utils.PageAlign(l.tableEnd)
+			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(nil))
+			p.numGroups = tt.numGroups
+			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout)
+			// TDFA only needs the transition table (no stack/memo).
+			p.tableEnd = tdfaLayout.tableEnd
+			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false))
+			p.dataBytes = append(p.dataBytes, rawTDFA...)
+			p.dataSegCount += cntTDFA
+		}
+	}
+
+	if groupsEngine == EngineOnePass {
 		op := newOnePass(prog)
 		opBase := utils.PageAlign(l.tableEnd)
 		p.numGroups = op.numGroups
@@ -305,7 +331,7 @@ func compilePattern(re config.RegexEntry, tableBase int64) (*compiledPattern, er
 		p.tableEnd = utils.PageAlign(opBase + int64(op.numStates*256))
 		p.dataBytes = append(p.dataBytes, onePassDataEntry(op, opBase)...)
 		p.dataSegCount++
-	} else {
+	} else if groupsEngine == EngineBacktrack {
 		bt := newBacktrack(prog)
 
 		// Stack placed directly after LF DFA tables — no Phase 1 DFA needed.
@@ -535,10 +561,21 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 //
 // All patterns must compile successfully; any error stops compilation immediately.
 func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool) ([]byte, int64, error) {
+	return compileAll(patterns, tableBase, standalone, 0)
+}
+
+// CompileForced is like Compile but forces the given engine for the capture path
+// of every entry that requests capture groups. Pass EngineBacktrack to force
+// backtracking regardless of the pattern's eligibility for TDFA or OnePass.
+func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType) ([]byte, int64, error) {
+	return compileAll(patterns, tableBase, standalone, forceGroupsEngine)
+}
+
+func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType) ([]byte, int64, error) {
 	var compiled []*compiledPattern
 	cur := tableBase
 	for _, re := range patterns {
-		p, err := compilePattern(re, cur)
+		p, err := compilePattern(re, cur, forceGroupsEngine)
 		if err != nil {
 			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
 		}

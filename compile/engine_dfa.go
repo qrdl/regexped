@@ -67,6 +67,250 @@ func isImmediateAccepting(states []uint32, prog *syntax.Prog) bool {
 	return false
 }
 
+// Context flags for epsilon closure: controls which empty-width assertions are followed.
+// Used by epsilonClosure and expandWithWB (shared between newDFA and newTDFA).
+const (
+	ecBegin          = 1
+	ecEnd            = 2
+	ecWordBoundary   = 4
+	ecNoWordBoundary = 8
+	ecBeginLine      = 16 // prev byte was '\n' (or start of text): (?m:^) fires
+	ecEndLine        = 32 // next byte is '\n' (or end of text):   (?m:$) fires
+)
+
+// nfaEpsilonClosure computes the epsilon closure of a set of NFA states,
+// respecting anchor context flags (ec* constants above).
+// With leftmostFirst=true, states are ordered by priority (lower PC = higher priority).
+func nfaEpsilonClosure(prog *syntax.Prog, states []uint32, ctx int, leftmostFirst bool) []uint32 {
+	visited := make(map[uint32]bool)
+	result := []uint32{}
+	var stack []uint32
+	if leftmostFirst {
+		for i := len(states) - 1; i >= 0; i-- {
+			stack = append(stack, states[i])
+		}
+	} else {
+		stack = append([]uint32{}, states...)
+	}
+	for len(stack) > 0 {
+		pc := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if visited[pc] {
+			continue
+		}
+		visited[pc] = true
+		result = append(result, pc)
+		inst := &prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstAlt:
+			if leftmostFirst {
+				stack = append(stack, inst.Arg, inst.Out)
+			} else {
+				stack = append(stack, inst.Out, inst.Arg)
+			}
+		case syntax.InstCapture, syntax.InstNop:
+			stack = append(stack, inst.Out)
+		case syntax.InstEmptyWidth:
+			emptyOp := syntax.EmptyOp(inst.Arg)
+			follow := true
+			if emptyOp&syntax.EmptyBeginText != 0 {
+				follow = follow && (ctx&ecBegin) != 0
+			}
+			if emptyOp&syntax.EmptyBeginLine != 0 {
+				follow = follow && (ctx&(ecBegin|ecBeginLine)) != 0
+			}
+			if emptyOp&syntax.EmptyEndText != 0 {
+				follow = follow && (ctx&ecEnd) != 0
+			}
+			if emptyOp&syntax.EmptyEndLine != 0 {
+				follow = follow && (ctx&(ecEnd|ecEndLine)) != 0
+			}
+			if emptyOp&syntax.EmptyWordBoundary != 0 {
+				follow = follow && (ctx&ecWordBoundary) != 0
+			}
+			if emptyOp&syntax.EmptyNoWordBoundary != 0 {
+				follow = follow && (ctx&ecNoWordBoundary) != 0
+			}
+			if follow {
+				stack = append(stack, inst.Out)
+			}
+		}
+	}
+	return result
+}
+
+// nfaExpandWithWB extends an already-closed NFA set by following word-boundary
+// assertions that fire given wbCtx, then fully expanding epsilon transitions
+// from newly reached states. Preserves leftmostFirst ordering of the original set.
+func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostFirst bool) []uint32 {
+	visited := make(map[uint32]bool)
+	for _, s := range closedSet {
+		visited[s] = true
+	}
+	result := append([]uint32{}, closedSet...)
+	var insertions []struct {
+		afterIdx  int
+		newStates []uint32
+	}
+	for i, pc := range closedSet {
+		inst := &prog.Inst[pc]
+		if inst.Op != syntax.InstEmptyWidth {
+			continue
+		}
+		emptyOp := syntax.EmptyOp(inst.Arg)
+		fires := false
+		if emptyOp&syntax.EmptyWordBoundary != 0 && (wbCtx&ecWordBoundary) != 0 {
+			fires = true
+		}
+		if emptyOp&syntax.EmptyNoWordBoundary != 0 && (wbCtx&ecNoWordBoundary) != 0 {
+			fires = true
+		}
+		if !fires || visited[inst.Out] {
+			continue
+		}
+		var newStates []uint32
+		stack := []uint32{inst.Out}
+		for len(stack) > 0 {
+			s2 := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if visited[s2] {
+				continue
+			}
+			visited[s2] = true
+			newStates = append(newStates, s2)
+			inst2 := &prog.Inst[s2]
+			switch inst2.Op {
+			case syntax.InstAlt:
+				if leftmostFirst {
+					stack = append(stack, inst2.Arg, inst2.Out)
+				} else {
+					stack = append(stack, inst2.Out, inst2.Arg)
+				}
+			case syntax.InstCapture, syntax.InstNop:
+				stack = append(stack, inst2.Out)
+			case syntax.InstEmptyWidth:
+				emptyOp2 := syntax.EmptyOp(inst2.Arg)
+				follow2 := true
+				if emptyOp2&syntax.EmptyBeginText != 0 {
+					follow2 = follow2 && (wbCtx&ecBegin) != 0
+				}
+				if emptyOp2&syntax.EmptyBeginLine != 0 {
+					follow2 = follow2 && (wbCtx&(ecBegin|ecBeginLine)) != 0
+				}
+				if emptyOp2&syntax.EmptyEndText != 0 {
+					follow2 = follow2 && (wbCtx&ecEnd) != 0
+				}
+				if emptyOp2&syntax.EmptyEndLine != 0 {
+					follow2 = follow2 && (wbCtx&(ecEnd|ecEndLine)) != 0
+				}
+				if emptyOp2&syntax.EmptyWordBoundary != 0 {
+					follow2 = follow2 && (wbCtx&ecWordBoundary) != 0
+				}
+				if emptyOp2&syntax.EmptyNoWordBoundary != 0 {
+					follow2 = follow2 && (wbCtx&ecNoWordBoundary) != 0
+				}
+				if follow2 {
+					stack = append(stack, inst2.Out)
+				}
+			}
+		}
+		if len(newStates) > 0 {
+			insertions = append(insertions, struct {
+				afterIdx  int
+				newStates []uint32
+			}{i, newStates})
+		}
+	}
+	if len(insertions) == 0 {
+		return result
+	}
+	out := make([]uint32, 0, len(result)+32)
+	insertIdx := 0
+	for i, pc := range result {
+		out = append(out, pc)
+		for insertIdx < len(insertions) && insertions[insertIdx].afterIdx == i {
+			out = append(out, insertions[insertIdx].newStates...)
+			insertIdx++
+		}
+	}
+	return out
+}
+
+// nfaBuildInputMap builds a rune→nextNFAStates map from an expanded NFA set,
+// applying leftmostFirst suppression (skip byte-consumers after InstMatch).
+func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool) map[rune][]uint32 {
+	m := make(map[rune][]uint32)
+	seenMatch := false
+	for _, pc := range expanded {
+		inst := &prog.Inst[pc]
+		if leftmostFirst && seenMatch {
+			switch inst.Op {
+			case syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+				continue
+			}
+		}
+		if inst.Op == syntax.InstMatch {
+			seenMatch = true
+		}
+		switch inst.Op {
+		case syntax.InstRune1:
+			r := inst.Rune[0]
+			m[r] = append(m[r], inst.Out)
+			if syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
+				seen := make(map[rune]bool)
+				seen[r] = true
+				for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+					if !seen[folded] {
+						seen[folded] = true
+						m[folded] = append(m[folded], inst.Out)
+					}
+				}
+			}
+		case syntax.InstRune:
+			isFoldCase := syntax.Flags(inst.Arg)&syntax.FoldCase != 0
+			for i := 0; i < len(inst.Rune); i += 2 {
+				var minRune, maxRune rune
+				if i+1 >= len(inst.Rune) {
+					minRune = inst.Rune[i]
+					maxRune = inst.Rune[i]
+				} else {
+					minRune = inst.Rune[i]
+					maxRune = inst.Rune[i+1]
+				}
+				lo := minRune
+				hi := maxRune
+				if hi > 0xFF {
+					hi = 0xFF
+				}
+				for r := lo; r <= hi; r++ {
+					m[r] = append(m[r], inst.Out)
+					if isFoldCase {
+						seen := make(map[rune]bool)
+						seen[r] = true
+						for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+							if !seen[folded] && (folded < minRune || folded > maxRune) {
+								seen[folded] = true
+								m[folded] = append(m[folded], inst.Out)
+							}
+						}
+					}
+				}
+			}
+		case syntax.InstRuneAny:
+			for b := 0; b < 256; b++ {
+				m[rune(b)] = append(m[rune(b)], inst.Out)
+			}
+		case syntax.InstRuneAnyNotNL:
+			for b := 0; b < 256; b++ {
+				if b != '\n' {
+					m[rune(b)] = append(m[rune(b)], inst.Out)
+				}
+			}
+		}
+	}
+	return m
+}
+
 // newDFA converts syntax.Prog (NFA bytecode) to DFA using subset construction.
 func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 	dfa := &dfa{
@@ -116,205 +360,21 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 	// ecBeginLine:       follow EmptyBeginLine ((?m:^)) — prev was '\n' or start-of-text.
 	// ecEndLine:         follow EmptyEndLine ((?m:$))   — next byte is '\n' or end-of-text.
 	// Mid-string transitions use ctx=0 so no anchors are followed.
-	const (
-		ecBegin          = 1
-		ecEnd            = 2
-		ecWordBoundary   = 4
-		ecNoWordBoundary = 8
-		ecBeginLine      = 16 // prev byte was '\n' (or start of text): (?m:^) fires
-		ecEndLine        = 32 // next byte is '\n' (or end of text):   (?m:$) fires
-	)
 
 	// Compute epsilon closure of NFA states, respecting anchor context.
 	epsilonClosure := func(states []uint32, ctx int) []uint32 {
-		visited := make(map[uint32]bool)
-		result := []uint32{}
-		// For leftmostFirst: push initial states in reverse so the first element
-		// ends up on top of the LIFO stack (processed first = highest priority).
-		var stack []uint32
-		if leftmostFirst {
-			for i := len(states) - 1; i >= 0; i-- {
-				stack = append(stack, states[i])
-			}
-		} else {
-			stack = append([]uint32{}, states...)
-		}
-
-		for len(stack) > 0 {
-			pc := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-
-			if visited[pc] {
-				continue
-			}
-			visited[pc] = true
-			result = append(result, pc)
-
-			inst := &prog.Inst[pc]
-			switch inst.Op {
-			case syntax.InstAlt:
-				if leftmostFirst {
-					// Priority-ordered: Out (higher priority) on top of stack → processed first
-					stack = append(stack, inst.Arg, inst.Out)
-				} else {
-					stack = append(stack, inst.Out, inst.Arg)
-				}
-			case syntax.InstCapture, syntax.InstNop:
-				stack = append(stack, inst.Out)
-			case syntax.InstEmptyWidth:
-				emptyOp := syntax.EmptyOp(inst.Arg)
-				follow := true
-				if emptyOp&syntax.EmptyBeginText != 0 {
-					follow = follow && (ctx&ecBegin) != 0
-				}
-				if emptyOp&syntax.EmptyBeginLine != 0 {
-					// (?m:^) fires at start-of-text OR after '\n'
-					follow = follow && (ctx&(ecBegin|ecBeginLine)) != 0
-				}
-				if emptyOp&syntax.EmptyEndText != 0 {
-					follow = follow && (ctx&ecEnd) != 0
-				}
-				if emptyOp&syntax.EmptyEndLine != 0 {
-					// (?m:$) fires at end-of-text OR before '\n'
-					follow = follow && (ctx&(ecEnd|ecEndLine)) != 0
-				}
-				if emptyOp&syntax.EmptyWordBoundary != 0 {
-					follow = follow && (ctx&ecWordBoundary) != 0
-				}
-				if emptyOp&syntax.EmptyNoWordBoundary != 0 {
-					follow = follow && (ctx&ecNoWordBoundary) != 0
-				}
-				if follow {
-					stack = append(stack, inst.Out)
-				}
-			}
-		}
-		return result
+		return nfaEpsilonClosure(prog, states, ctx, leftmostFirst)
 	}
 
 	// isWordChar reports whether b is a word character ([A-Za-z0-9_]).
 	// Used during DFA construction to resolve \b / \B assertions.
-	isWordChar := func(b byte) bool {
-		return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') ||
-			(b >= '0' && b <= '9') || b == '_'
-	}
+	isWordChar := isWordCharByte
 
 	// expandWithWB extends an already-closed NFA set by following word-boundary
 	// assertions that fire given wbCtx, then fully expanding epsilon transitions
-	// from newly reached states. The input set is appended to as-is; new states
-	// are inserted directly after the WB instruction they originate from.
-	// This preserves leftmostFirst ordering of the original set.
+	// from newly reached states. This preserves leftmostFirst ordering of the original set.
 	expandWithWB := func(closedSet []uint32, wbCtx int) []uint32 {
-		visited := make(map[uint32]bool)
-		for _, s := range closedSet {
-			visited[s] = true
-		}
-
-		// Build result starting with the original set.
-		result := append([]uint32{}, closedSet...)
-
-		// For each state in the original set, if it is an EmptyWordBoundary or
-		// EmptyNoWordBoundary that fires, expand from its Out state.
-		// We insert new states right after the firing instruction (maintaining order).
-		var insertions []struct {
-			afterIdx  int
-			newStates []uint32
-		}
-
-		for i, pc := range closedSet {
-			inst := &prog.Inst[pc]
-			if inst.Op != syntax.InstEmptyWidth {
-				continue
-			}
-			emptyOp := syntax.EmptyOp(inst.Arg)
-			fires := false
-			if emptyOp&syntax.EmptyWordBoundary != 0 && (wbCtx&ecWordBoundary) != 0 {
-				fires = true
-			}
-			if emptyOp&syntax.EmptyNoWordBoundary != 0 && (wbCtx&ecNoWordBoundary) != 0 {
-				fires = true
-			}
-			if !fires || visited[inst.Out] {
-				continue
-			}
-			// Perform a plain epsilon closure from inst.Out (leftmostFirst ordering).
-			// These new states are fully expanded and inserted after position i.
-			var newStates []uint32
-			var stack []uint32
-			if leftmostFirst {
-				stack = []uint32{inst.Out}
-			} else {
-				stack = []uint32{inst.Out}
-			}
-			for len(stack) > 0 {
-				s2 := stack[len(stack)-1]
-				stack = stack[:len(stack)-1]
-				if visited[s2] {
-					continue
-				}
-				visited[s2] = true
-				newStates = append(newStates, s2)
-				inst2 := &prog.Inst[s2]
-				switch inst2.Op {
-				case syntax.InstAlt:
-					if leftmostFirst {
-						stack = append(stack, inst2.Arg, inst2.Out)
-					} else {
-						stack = append(stack, inst2.Out, inst2.Arg)
-					}
-				case syntax.InstCapture, syntax.InstNop:
-					stack = append(stack, inst2.Out)
-				case syntax.InstEmptyWidth:
-					// For begin/end/WB/NL assertions in newly reached states, use wbCtx (full ctx).
-					emptyOp2 := syntax.EmptyOp(inst2.Arg)
-					follow2 := true
-					if emptyOp2&syntax.EmptyBeginText != 0 {
-						follow2 = follow2 && (wbCtx&ecBegin) != 0
-					}
-					if emptyOp2&syntax.EmptyBeginLine != 0 {
-						follow2 = follow2 && (wbCtx&(ecBegin|ecBeginLine)) != 0
-					}
-					if emptyOp2&syntax.EmptyEndText != 0 {
-						follow2 = follow2 && (wbCtx&ecEnd) != 0
-					}
-					if emptyOp2&syntax.EmptyEndLine != 0 {
-						follow2 = follow2 && (wbCtx&(ecEnd|ecEndLine)) != 0
-					}
-					if emptyOp2&syntax.EmptyWordBoundary != 0 {
-						follow2 = follow2 && (wbCtx&ecWordBoundary) != 0
-					}
-					if emptyOp2&syntax.EmptyNoWordBoundary != 0 {
-						follow2 = follow2 && (wbCtx&ecNoWordBoundary) != 0
-					}
-					if follow2 {
-						stack = append(stack, inst2.Out)
-					}
-				}
-			}
-			if len(newStates) > 0 {
-				insertions = append(insertions, struct {
-					afterIdx  int
-					newStates []uint32
-				}{i, newStates})
-			}
-		}
-
-		if len(insertions) == 0 {
-			return result
-		}
-
-		// Rebuild result with insertions in order.
-		out := make([]uint32, 0, len(result)+32)
-		insertIdx := 0
-		for i, pc := range result {
-			out = append(out, pc)
-			// Insert any new states after this position.
-			for insertIdx < len(insertions) && insertions[insertIdx].afterIdx == i {
-				out = append(out, insertions[insertIdx].newStates...)
-				insertIdx++
-			}
-		}
-		return out
+		return nfaExpandWithWB(prog, closedSet, wbCtx, leftmostFirst)
 	}
 
 	// Convert NFA state set + prevWasWord context to unique string key.
@@ -540,77 +600,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 
 		// buildInputMap builds the rune→nextNFAStates map from an expanded NFA set.
 		buildInputMap := func(expanded []uint32) map[rune][]uint32 {
-			m := make(map[rune][]uint32)
-			seenMatch := false
-			for _, pc := range expanded {
-				inst := &prog.Inst[pc]
-				// leftmostFirst suppression: skip byte-consumers after InstMatch.
-				if leftmostFirst && seenMatch {
-					switch inst.Op {
-					case syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
-						continue
-					}
-				}
-				if inst.Op == syntax.InstMatch {
-					seenMatch = true
-				}
-				switch inst.Op {
-				case syntax.InstRune1:
-					r := inst.Rune[0]
-					m[r] = append(m[r], inst.Out)
-					if syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
-						seen := make(map[rune]bool)
-						seen[r] = true
-						for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
-							if !seen[folded] {
-								seen[folded] = true
-								m[folded] = append(m[folded], inst.Out)
-							}
-						}
-					}
-				case syntax.InstRune:
-					isFoldCase := syntax.Flags(inst.Arg)&syntax.FoldCase != 0
-					for i := 0; i < len(inst.Rune); i += 2 {
-						var minRune, maxRune rune
-						if i+1 >= len(inst.Rune) {
-							minRune = inst.Rune[i]
-							maxRune = inst.Rune[i]
-						} else {
-							minRune = inst.Rune[i]
-							maxRune = inst.Rune[i+1]
-						}
-						lo := minRune
-						hi := maxRune
-						if hi > 0xFF {
-							hi = 0xFF
-						}
-						for r := lo; r <= hi; r++ {
-							m[r] = append(m[r], inst.Out)
-							if isFoldCase {
-								seen := make(map[rune]bool)
-								seen[r] = true
-								for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
-									if !seen[folded] && (folded < minRune || folded > maxRune) {
-										seen[folded] = true
-										m[folded] = append(m[folded], inst.Out)
-									}
-								}
-							}
-						}
-					}
-				case syntax.InstRuneAny:
-					for b := 0; b < 256; b++ {
-						m[rune(b)] = append(m[rune(b)], inst.Out)
-					}
-				case syntax.InstRuneAnyNotNL:
-					for b := 0; b < 256; b++ {
-						if b != '\n' {
-							m[rune(b)] = append(m[rune(b)], inst.Out)
-						}
-					}
-				}
-			}
-			return m
+			return nfaBuildInputMap(prog, expanded, leftmostFirst)
 		}
 
 		// expandedForNewline: expansion for '\n' bytes.
