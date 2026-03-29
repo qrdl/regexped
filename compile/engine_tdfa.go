@@ -493,20 +493,6 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		return nil, false // should always be 0
 	}
 
-	// Also build mid-start (no begin-anchor expansion, prevWasWord=false and true).
-	midStartPCSet := filterTerminalPCs(epsilonClosure([]uint32{uint32(prog.Start)}, 0))
-	midThreads := make([]tdfaThread, len(midStartPCSet))
-	for i, pc := range midStartPCSet {
-		midThreads[i] = tdfaThread{pc: int(pc), regMap: append([]int(nil), startRegMap...)}
-	}
-	midStartID, _ := getOrAddState(midThreads, false)
-
-	midThreadsW := make([]tdfaThread, len(midStartPCSet))
-	for i, pc := range midStartPCSet {
-		midThreadsW[i] = tdfaThread{pc: int(pc), regMap: append([]int(nil), startRegMap...)}
-	}
-	midStartWordID, _ := getOrAddState(midThreadsW, true)
-
 	// ---- main BFS ----
 	for si := 0; si < len(states); si++ {
 		if nextStateID > limit {
@@ -668,8 +654,8 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 
 	dt := &dfaTable{
 		startState:            0,
-		midStartState:         midStartID,
-		midStartWordState:     midStartWordID,
+		midStartState:         0, // TDFA is always called anchored; mid-start states are unused
+		midStartWordState:     0,
 		numStates:             n,
 		acceptStates:          dfaAccepting,
 		midAcceptStates:       dfaMidAccepting,
