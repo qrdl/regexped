@@ -1,6 +1,6 @@
 # Regexped
 
-A Go-based compiler that transforms regular expression patterns into standalone WebAssembly (WASM) modules. Regexped compiles regex patterns to optimized DFA or OnePass automaton implementations, generates WASM bytecode, and produces language-specific stubs for host application integration.
+A Go-based compiler that transforms regular expression patterns into standalone WebAssembly (WASM) modules. Regexped compiles regex patterns to optimized DFA, OnePass, or Backtracking engine implementations, generates WASM bytecode, and produces language-specific stubs for host application integration.
 
 Embed high-performance regex matchers directly into WASM applications — no full regex engine needed at runtime.
 
@@ -8,7 +8,7 @@ Embed high-performance regex matchers directly into WASM applications — no ful
 
 - **DFA engine** — O(n) anchored matching and non-anchored find, LeftmostFirst (RE2/Perl) alternation semantics, word boundary assertions (`\b`, `\B`), byte class compression, SIMD prefix scan (Teddy algorithm)
 - **OnePass engine** — O(n) capture group tracking for deterministic patterns (disjoint alternations)
-- **Backtracking engine** — capture group tracking for non-deterministic patterns with RE2 leftmost-longest semantics
+- **Backtracking engine** — capture group tracking for non-deterministic patterns, LeftmostFirst (RE2/Perl) semantics, BitState memoization for O(n) worst-case on zero-matchable loops
 - Rust FFI stub generation with iterator support (match, find, groups, named groups)
 - WASM module merging via `wasm-merge`
 - Configurable via YAML
@@ -51,7 +51,7 @@ See [`examples/`](examples/) for three self-contained projects with Makefiles:
 
 **DFA/OnePass matching:** O(n) time, O(1) runtime stack — no worst-case blowup.
 
-**Backtracking:** RE2 leftmost-longest semantics for non-deterministic capture patterns; stack-bounded to prevent worst-case blowup on adversarial inputs.
+**Backtracking:** LeftmostFirst (RE2/Perl) semantics for non-deterministic capture patterns. BitState memoization bounds runtime to O(n × numStates) for patterns with zero-matchable loops; stack overflow guard prevents memory corruption on deeply nested patterns.
 
 **SIMD prefix scan:** First-byte and two-byte Teddy algorithm skips non-matching positions in bulk using WASM SIMD instructions, reducing DFA transitions on typical inputs.
 

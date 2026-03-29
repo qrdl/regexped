@@ -6,6 +6,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -922,7 +923,7 @@ type inputResult struct {
 	rpedAvg time.Duration
 }
 
-func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs []inputResult) {
+func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs []inputResult, full bool) {
 	modeStr := "anchored"
 	switch tc.mode {
 	case find:
@@ -932,18 +933,20 @@ func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs 
 	}
 	fmt.Printf("\n=== %s  [%s, %s] ===\n", tc.name, engineName, modeStr)
 	fmt.Printf("  %-26s  %14s  %14s  %8s\n", "", "regex", "regexped", "ratio")
-	fmt.Printf("  %-26s  %14s  %14s  %8s\n",
-		"instantiation:",
-		fmtDur(rxp.instantiation),
-		fmtDur(rped.instantiation),
-		fmtRatio(rped.instantiation, rxp.instantiation))
-	fmt.Printf("  %-26s  %14s  %14s\n",
-		"wasm size:",
-		fmtSize(rxp.wasmSize),
-		fmtSize(rped.wasmSize))
-	fmt.Printf("  %-26s  %14s\n",
-		"compilation:",
-		fmtDur(rxp.compilation))
+	if full {
+		fmt.Printf("  %-26s  %14s  %14s  %8s\n",
+			"instantiation:",
+			fmtDur(rxp.instantiation),
+			fmtDur(rped.instantiation),
+			fmtRatio(rped.instantiation, rxp.instantiation))
+		fmt.Printf("  %-26s  %14s  %14s\n",
+			"wasm size:",
+			fmtSize(rxp.wasmSize),
+			fmtSize(rped.wasmSize))
+		fmt.Printf("  %-26s  %14s\n",
+			"compilation:",
+			fmtDur(rxp.compilation))
+	}
 	for _, inp := range inputs {
 		fmt.Printf("\n  input: %s (%d bytes)\n", inp.label, inp.size)
 		fmt.Printf("    %-24s  %14s  %14s  %8s\n",
@@ -960,6 +963,9 @@ func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs 
 func main() {
 	// Silence library log output — only the benchmark table goes to stdout.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	full := flag.Bool("full", false, "show wasm size and instantiation/compilation time")
+	flag.Parse()
 
 	// Load the pre-built regex_bench.wasm harness.
 	dir, _ := os.Getwd()
@@ -1007,7 +1013,7 @@ func main() {
 		}, benchResult{
 			instantiation: rpedInst.instantiation,
 			wasmSize:      rpedInst.wasmSize,
-		}, inputResults)
+		}, inputResults, *full)
 	}
 	fmt.Println()
 }

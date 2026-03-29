@@ -575,7 +575,7 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir, outputFile string) er
 	if outPath == "" {
 		return fmt.Errorf("output WASM file not specified: use -o flag or set wasm_file in config")
 	}
-	if !filepath.IsAbs(outPath) && outDir != "" {
+	if outPath != "-" && !filepath.IsAbs(outPath) && outDir != "" {
 		outPath = filepath.Join(outDir, outPath)
 	}
 
@@ -587,6 +587,13 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir, outputFile string) er
 		return fmt.Errorf("compile: %w", err)
 	}
 
+	if outPath == "-" {
+		if _, err := os.Stdout.Write(wasmBytes); err != nil {
+			return fmt.Errorf("write stdout: %w", err)
+		}
+		slog.Info("Done", "bytes", len(wasmBytes))
+		return nil
+	}
 	if err := os.WriteFile(outPath, wasmBytes, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", outPath, err)
 	}

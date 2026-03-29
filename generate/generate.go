@@ -16,7 +16,8 @@ import (
 // Patterns using the global stub_file are collected into one file,
 // each wrapped in a pub mod <import_module> { } block when there are
 // multiple entries sharing the file.
-func CmdStub(cfg config.BuildConfig, outDir string) error {
+// If out is "-", all content is written to stdout instead of files.
+func CmdStub(cfg config.BuildConfig, outDir, out string) error {
 	groups := groupByStubFile(cfg)
 	for stubFile, entries := range groups {
 		content, err := genRustStubFile(entries)
@@ -24,6 +25,12 @@ func CmdStub(cfg config.BuildConfig, outDir string) error {
 			return fmt.Errorf("generate Rust stub %s: %w", stubFile, err)
 		}
 		if content == "" {
+			continue
+		}
+		if out == "-" {
+			if _, err := os.Stdout.WriteString(content); err != nil {
+				return fmt.Errorf("write stdout: %w", err)
+			}
 			continue
 		}
 		if err := writeStub(outDir, stubFile, []byte(content)); err != nil {
@@ -34,8 +41,9 @@ func CmdStub(cfg config.BuildConfig, outDir string) error {
 }
 
 // CmdJS generates a single ES module JS stub file for all regex entries.
-func CmdJS(cfg config.BuildConfig, outDir string) error {
-	if cfg.StubFile == "" {
+// If out is "-", content is written to stdout instead of a file.
+func CmdJS(cfg config.BuildConfig, outDir, out string) error {
+	if out != "-" && cfg.StubFile == "" {
 		return fmt.Errorf("js: stub_file must be set in config (top-level)")
 	}
 	if cfg.Output == "" {
@@ -44,6 +52,10 @@ func CmdJS(cfg config.BuildConfig, outDir string) error {
 	content, err := genJSStubFile(cfg)
 	if err != nil {
 		return fmt.Errorf("generate JS stub: %w", err)
+	}
+	if out == "-" {
+		_, err := os.Stdout.WriteString(content)
+		return err
 	}
 	return writeStub(outDir, cfg.StubFile, []byte(content))
 }

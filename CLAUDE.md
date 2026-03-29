@@ -308,6 +308,11 @@ Capture operations are emitted as inline WASM code, not stored in memory.
 - **CM_PLAN.md** — WASM Component Model support
 - **OPTIMISATION_PLAN.md** — future performance optimisations
 
+## Design Principles
+
+- **RE2/Perl semantics only.** All engines implement leftmost-first (Perl/RE2) match semantics. POSIX leftmost-longest is not supported and must not be introduced.
+- **Runtime over compile time.** Pattern compilation happens once and its cost is irrelevant. Every design and implementation decision should minimise the runtime cost of matching — prefer larger tables, more WASM locals, additional compile-time passes, or any other compile-time complexity if it makes the generated code faster.
+
 ## Technical Decisions
 
 ### Why DFA?
