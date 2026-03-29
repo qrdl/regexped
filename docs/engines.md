@@ -1,6 +1,6 @@
 # Regex Engines
 
-Regexped implements four engines: **Compiled DFA**, **DFA**, **OnePass**, and **Backtracking**. The right engine is selected automatically at compile time based on the pattern and the requested function types.
+Regexped implements four engines: **Compiled DFA**, **DFA**, **TDFA**, and **Backtracking**. The right engine is selected automatically at compile time based on the pattern and the requested function types.
 
 ---
 
@@ -8,17 +8,18 @@ Regexped implements four engines: **Compiled DFA**, **DFA**, **OnePass**, and **
 
 Selection priority (highest first):
 
-1. **OnePass** — pattern has capture groups AND qualifies for one-pass determinism
-2. **Backtracking** — pattern has capture groups but fails the OnePass check
+1. **TDFA** — pattern has capture groups AND qualifies for tagged-DFA (no non-greedy quantifiers inside captures, no line anchors, no word boundaries, no ambiguous alternations)
+2. **Backtracking** — pattern has capture groups but fails the TDFA check
 3. **Compiled DFA** — no captures; minimised DFA has ≤ 256 states (default threshold)
 4. **DFA** — no captures; minimised DFA exceeds the compiled-DFA threshold
 
-A pattern qualifies for OnePass if:
-- Every `|` alternation has branches with disjoint first-character sets (deterministic at each position)
-- No nested or non-greedy quantifiers inside capture groups
-- Pattern compiles to ≤ 100 NFA instructions
+A pattern qualifies for TDFA if it has no:
+- Non-greedy quantifiers (`*?`, `+?`, `??`) anywhere in the pattern
+- Line anchors (`^`, `$`) inside the pattern
+- Word boundaries (`\b`, `\B`) inside capture groups
+- Alternations with overlapping first-character sets in branches that affect captures
 
-If a pattern has captures but fails the OnePass check (e.g. `(a|ab)c`, `(a*)(a*)`, `(.*)(foo)`), the Backtracking engine is used automatically.
+If a pattern has captures but fails the TDFA check (e.g. `(a|ab)c`, `(a*)(a*)`, `(.*)(foo)`), the Backtracking engine is used automatically.
 
 ---
 
@@ -129,25 +130,35 @@ Both mechanisms use WASM SIMD (simd128).
 
 ---
 
-## OnePass Engine
+## TDFA Engine (Tagged DFA)
 
-**Used for:** `groups_func`, `named_groups_func`, and as the groups half of hybrid modules when the pattern is OnePass-eligible.
+**Used for:** `groups_func`, `named_groups_func` — O(n) capture tracking for patterns that qualify.
 
-**Complexity:** O(n) time and space (single forward pass, no thread copying).
+**Complexity:** O(n) time.
 
 ### How it works
 
-A pattern is OnePass-eligible when at every position in the input exactly one NFA thread can be active. This means every `|` alternation has branches that begin with disjoint character sets — the automaton can always determine which branch to follow from a single byte without exploring alternatives.
+TDFA implements Laurikari's tagged DFA algorithm. The NFA is extended with "tag" operations that record input positions at capture group boundaries. Subset construction then builds a DFA whose transitions carry register operations — at each transition, one or more WASM locals (registers) are updated to record the current input position or copy from another register.
 
-Under this condition, capture groups can be tracked with a fixed set of slot registers updated inline as bytes are consumed. No thread copying (PikeVM), no backtracking stack, and no speculative work.
+**Tag operations** on a transition are one of:
+- `reg = pos` — record the current input position (an `i32` WASM local)
+- `reg = other_reg` — copy (register reconciliation on loop back-edges)
 
-The OnePass automaton is a u8 transition table (`state × byte → next_state`, 0xFF = dead). Capture slot updates (`open group N`, `close group N`) are emitted as compile-time-known `i32.store` instructions directly in the WASM function body — they are not stored in the table.
+Capture slot values are reconstructed from registers at match acceptance time. The WASM function signature is `(ptr i32, len i32, out_ptr i32) → i32`; output slots are written as `[start0, end0, start1, end1, ...]` at `out_ptr`.
+
+**TDFA eligibility:** TDFA is used when the pattern has no non-greedy quantifiers, no line anchors (`^`/`$`), no word boundaries, and no ambiguous alternations (overlapping first-character sets that affect capture slot assignment). Patterns that fail any of these checks use the Backtracking engine instead.
+
+**Register minimization:** after table construction, a liveness-based graph-coloring pass merges registers whose live ranges do not overlap, reducing WASM local count.
+
+**Tag-op emission:** each DFA state's per-byte tag operations are emitted as a `br_table` dispatch in the WASM function body. A majority-group optimization encodes only the minority of differing transitions explicitly; the dominant operation is emitted unconditionally, keeping WASM bytecode size small.
+
+**State limit:** the TDFA state count is bounded at compile time (default 512; adjustable via `CompileOptions.MaxDFAStates`). Patterns exceeding the limit fall back to Backtracking.
 
 ---
 
 ## Backtracking Engine (BitState)
 
-**Used for:** `groups_func`, `named_groups_func` when the pattern has captures but is not OnePass-eligible, and as the groups half of hybrid modules for such patterns.
+**Used for:** `groups_func`, `named_groups_func` when the pattern has captures but is not TDFA-eligible, and as the groups half of hybrid modules for such patterns.
 
 **Complexity:** O(n × inputLen) time and space — guaranteed by BitState memoization when enabled (see below).
 
@@ -187,7 +198,7 @@ All regions are page-aligned and strictly non-overlapping. The input buffer is p
 
 ## Hybrid Modules
 
-When a config entry sets both `match_func`/`find_func` AND `groups_func`/`named_groups_func`, a single WASM module is generated containing both a DFA function (match and/or find) and a groups function (OnePass or Backtracking depending on the pattern), sharing the same memory region.
+When a config entry sets both `match_func`/`find_func` AND `groups_func`/`named_groups_func`, a single WASM module is generated containing both a DFA function (match and/or find) and a groups function (TDFA or Backtracking depending on the pattern), sharing the same memory region.
 
 ---
 
@@ -201,16 +212,29 @@ Regexped implements **RE2 syntax with Perl/RE2 semantics** (leftmost-first match
 
 The RE2 exhaustive test suite (`re2test/`) reports:
 
-- **~4.94M passing** (DFA + OnePass + Backtracking)
-- **~781K skipped**
+- **~4.94M passing** (DFA + Compiled DFA; match and find)
+- **~1.88M passing** (re2-adjusted.txt with `--validate-groups`; includes TDFA and Backtracking capture accuracy)
+- **~781K skipped** (exhaustive only)
+
+**Exhaustive test** (`re2-exhaustive.txt`, match/find only):
 
 | Engine | Passing cases |
 |---|---|
-| DFA | ~4.76M |
-| OnePass | ~52K |
-| Backtracking | ~120K |
+| DFA | ~334K |
+| Compiled DFA | ~4.6M |
+| **Total** | **~4.94M** |
 
-Skipped cases:
+**Adjusted test** (`re2-adjusted.txt`, with `--validate-groups`):
+
+| Engine | Passing cases |
+|---|---|
+| DFA | ~360K |
+| Compiled DFA | ~1.2M |
+| TDFA | ~41K |
+| Backtracking | ~267K |
+| **Total** | **~1.88M** |
+
+Skipped cases (exhaustive only):
 
 | Reason | Approximate count |
 |---|---|

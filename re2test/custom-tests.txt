@@ -377,7 +377,7 @@ regexps
 -;-;-;-
 # ============================================================
 # Category 6: Backtracking engine — capture edge cases
-# These patterns have captures that don't qualify for OnePass
+# These patterns have captures that don't qualify for TDFA
 # (overlapping first-char sets between loop and exit branches).
 # col0 format: "fullstart-fullend group1start-group1end ..."
 # col5: non-anchored find with captures (DFA finds leftmost extent,
@@ -444,15 +444,15 @@ regexps
 -;0-4;-;-
 -;0-2;-;-
 # ============================================================
-# Category 7: OnePass engine — capture edge cases
+# Category 7: TDFA engine — capture edge cases
 # These patterns have deterministic alternation (disjoint first-char sets)
-# so they compile to the OnePass engine with inline i32.store capture ops.
+# so they compile to the TDFA engine with inline i32.store capture ops.
 # col0 format: "fullstart-fullend group1start-group1end ..."
 # Unmatched optional groups shown as "-".
 # ============================================================
-# Cat7OnePassNumeric: ([0-9]+)-([0-9]+) — two digit groups around a literal "-".
-# Tests basic OnePass slot filling.
-Cat7OnePassNumeric
+# Cat7TDFANumeric: ([0-9]+)-([0-9]+) — two digit groups around a literal "-".
+# Tests basic TDFA slot filling.
+Cat7TDFANumeric
 strings
 ""
 "1-2"
@@ -468,8 +468,8 @@ regexps
 -;-;-;-
 -;-;-;-
 -;-;-;-
-# Cat7OnePassWord: ([a-z]+)@([a-z]+) — two word groups around "@".
-Cat7OnePassWord
+# Cat7TDFAWord: ([a-z]+)@([a-z]+) — two word groups around "@".
+Cat7TDFAWord
 strings
 ""
 "foo@bar"
@@ -485,9 +485,9 @@ regexps
 -;-;-;-
 -;-;-;-
 -;-;-;-
-# Cat7OnePassOptional: ([a-z]+)(-([0-9]+))? — word with optional numeric suffix.
+# Cat7TDFAOptional: ([a-z]+)(-([0-9]+))? — word with optional numeric suffix.
 # Tests unmatched optional groups (shown as "-") and nested group slots.
-Cat7OnePassOptional
+Cat7TDFAOptional
 strings
 ""
 "foo"
@@ -548,9 +548,9 @@ regexps
 -;0-4;-;-;0-4;0-4 0-1 1-4
 -;0-2;-;-;0-2,2-4;0-2 0-1 1-2
 # ============================================================
-# Category 7 (OnePass) — non-anchored capture tests (col5).
+# Category 7 (TDFA) — non-anchored capture tests (col5).
 # ============================================================
-Cat7OnePassNonAnchored
+Cat7TDFANonAnchored
 strings
 "date: 1-2"
 "date: 2024-03"
@@ -711,7 +711,7 @@ regexps
 -;1-2;-;-;1-2
 # ============================================================
 # Category 12: FoldCase (case-insensitive matching)
-# Tests (?i:pattern) for DFA, OnePass, and Backtracking engines.
+# Tests (?i:pattern) for DFA, TDFA, and Backtracking engines.
 # ============================================================
 Cat12FoldCaseDFA
 strings
@@ -747,7 +747,7 @@ regexps
 -;-;-;-;-
 -;-;-;-;-
 -;-;-;-;-
-Cat12FoldCaseOnePass
+Cat12FoldCaseTDFA
 strings
 ""
 "foo@bar"
@@ -778,10 +778,10 @@ regexps
 0-11 0-4 5-11;0-11;-;-
 -;-;-;-
 # ============================================================
-# Category 13: OnePass engine — deeper coverage
+# Category 13: TDFA engine — deeper coverage
 # EOF-accept, deeply nested optional captures, case-insensitive
 # ============================================================
-Cat13OnePassEOFAccept
+Cat13TDFAEOFAccept
 strings
 ""
 "a"
@@ -804,7 +804,7 @@ regexps
 -;0-2;-;-
 -;-;-;-
 -;1-3;-;-
-Cat13OnePassDeepOptional
+Cat13TDFADeepOptional
 strings
 ""
 "a"
@@ -820,7 +820,7 @@ regexps
 0-3 0-1 1-2 2-3;0-3;-;-
 -;0-2;-;-
 -;0-1;-;-
-Cat13OnePassFoldCase
+Cat13TDFAFoldCase
 strings
 ""
 "Foo"
@@ -977,7 +977,7 @@ regexps
 # Category 15: Hybrid module — DFA find + groups in same module
 # Tests that find_internal and groups wrapper share memory correctly.
 # ============================================================
-Cat15HybridOnePass
+Cat15HybridTDFA
 strings
 ""
 "2024-03"
@@ -1136,7 +1136,7 @@ regexps
 # ============================================================
 # Category 19: Case-insensitive flag (?i)
 # Tests that (?i:...) matches both upper and lower case.
-# Covers DFA, OnePass, and Backtracking engines.
+# Covers DFA, TDFA, and Backtracking engines.
 # ============================================================
 Cat19CaseInsensitiveDFA
 strings
@@ -1248,7 +1248,7 @@ regexps
 # ============================================================
 # Category 20: Dotall flag (?s) — makes . match \n
 # Cat20DotAllDFA: find mode (no captures)
-# Cat20DotAllOnePass: groups, OnePass engine (no quantifier loops)
+# Cat20DotAllTDFA: groups, TDFA engine (no quantifier loops)
 # Cat20DotAllBacktrack: groups, Backtracking (quantifier loop on .)
 # ============================================================
 Cat20DotAllDFA
@@ -1289,7 +1289,7 @@ regexps
 -;0-1;-;-
 -;0-4;-;-
 -;0-5;-;-
-Cat20DotAllOnePass
+Cat20DotAllTDFA
 strings
 ""
 "ab"

@@ -139,7 +139,7 @@ The page must be served over HTTP (not `file://`) so that `fetch` can load `fina
 ## How the merged WASM works
 
 After `wasm-merge`:
-- `final.wasm` contains all DFA/OnePass tables as data segments
+- `final.wasm` contains all DFA/TDFA tables as data segments
 - It exports `memory` (from the dummy main module) — no JS memory setup needed
 - It exports each regex function under its `_func` name (e.g. `email_match`, `url_find`)
 - The generated `regex.js` instantiates it with no imports and accesses exports directly

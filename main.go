@@ -60,12 +60,14 @@ Run 'regexped <command> -h' for command-specific options.
 func runGenerateCmd(args []string) {
 	fs := flag.NewFlagSet("generate", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	rust      := fs.Bool("rust", false, "generate Rust stub files")
-	js        := fs.Bool("js", false, "generate JS ES module stub file")
+	rust := fs.Bool("rust", false, "generate Rust stub files")
+	js := fs.Bool("js", false, "generate JS ES module stub file")
 	dummyMain := fs.Bool("dummy_main", false, "generate a minimal main.wasm (memory-only, no code)")
-	var outDir string
+	var outDir, out string
 	fs.StringVar(&outDir, "out-dir", "", "output directory for generated stubs (default: .)")
 	fs.StringVar(&outDir, "d", "", "output directory (alias for --out-dir)")
+	fs.StringVar(&out, "output", "", "output file; use - to write to stdout")
+	fs.StringVar(&out, "o", "", "output file (alias for --output)")
 	fs.Parse(args)
 
 	modeCount := 0
@@ -84,10 +86,10 @@ func runGenerateCmd(args []string) {
 	}
 
 	if *dummyMain {
-		if outDir == "" {
+		if outDir == "" && out != "-" {
 			outDir = "."
 		}
-		if err := generate.CmdDummyMain(outDir); err != nil {
+		if err := generate.CmdDummyMain(outDir, out); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -103,12 +105,12 @@ func runGenerateCmd(args []string) {
 	}
 
 	if *js {
-		if err := generate.CmdJS(cfg, outDir); err != nil {
+		if err := generate.CmdJS(cfg, outDir, out); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
-	if err := generate.CmdStub(cfg, outDir); err != nil {
+	if err := generate.CmdStub(cfg, outDir, out); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -116,7 +118,7 @@ func runGenerateCmd(args []string) {
 func runCompileCmd(args []string) {
 	fs := flag.NewFlagSet("compile", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	wasmInput  := fs.String("wasm-input", "", "pre-built WASM file used to measure memory layout (required)")
+	wasmInput := fs.String("wasm-input", "", "pre-built WASM file used to measure memory layout (required)")
 	var outDir, outputFile string
 	fs.StringVar(&outDir, "out-dir", "", "output directory for compiled WASM files (overrides config wasm_dir)")
 	fs.StringVar(&outDir, "d", "", "output directory for compiled WASM files (alias for --out-dir)")

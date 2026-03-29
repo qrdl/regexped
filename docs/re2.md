@@ -24,44 +24,61 @@ Test data is unpacked automatically from the Go standard library.
 
 ## Current results
 
+**Exhaustive test** (`re2-exhaustive.txt`, match and find only):
+
 | Engine | Passing cases |
 |---|---|
-| DFA | ~4,763,000 |
-| OnePass | ~52,000 |
-| Backtracking | ~120,000 |
-| **Total passing** | **~4,935,000** |
+| DFA | ~334,000 |
+| Compiled DFA | ~4,602,000 |
+| **Total passing** | **~4,936,000** |
 | **Failed** | **0** |
 | **Skipped** | **~781,000** |
+
+**Adjusted test** (`re2-adjusted.txt`, with `--validate-groups`):
+
+| Engine | Passing cases |
+|---|---|
+| DFA | ~360,000 |
+| Compiled DFA | ~1,211,000 |
+| TDFA | ~41,000 |
+| Backtracking | ~267,000 |
+| **Total passing** | **~1,879,000** |
+| **Failed** | **0** |
 
 ---
 
 ## Per-engine breakdown
 
-### DFA (~4.76M passing)
+### DFA / Compiled DFA (~4.94M passing)
 
-The DFA engine handles all non-capture patterns (`match_func`, `find_func`) and
-the DFA half of hybrid modules.
+The DFA and Compiled DFA engines handle all non-capture patterns (`match_func`,
+`find_func`) and the DFA half of hybrid modules.
 
 Tests covered:
 - Anchored match (col 0): patterns without captures
 - Non-anchored find (col 1): all patterns where find mode is safe (leftmostFirst
   semantics match RE2)
 
-### OnePass (~52K passing)
+The Compiled DFA path applies when the minimised DFA has ≤ 256 states; it avoids
+a runtime transition table and instead uses direct-index table access with a
+compile-time literal-chain prefix optimisation.
 
-The OnePass engine handles `groups_func` / `named_groups_func` for patterns
-where every `|` alternation has disjoint first-character sets. Each test case
+### TDFA (~41K passing, via `--validate-groups`)
+
+The TDFA engine handles `groups_func` / `named_groups_func` for patterns
+where Laurikari's tagged DFA construction is feasible (no non-greedy quantifiers,
+no line anchors, no word boundaries, no ambiguous alternations). Each test case
 verifies both the match end position and all capture slot positions.
 
-Examples of patterns handled by OnePass:
+Examples of patterns handled by TDFA:
 - `(?P<scheme>https?)://(?P<host>[^/:?#]+)...` — disjoint scheme alternatives
 - `(\d{4})-(\d{2})-(\d{2})` — date capture with fixed delimiters
 - `(GET|POST|PUT):\s+(.+)` — keyword alternatives with disjoint first bytes
 
-### Backtracking (~120K passing)
+### Backtracking (~267K passing, via `--validate-groups`)
 
 The Backtracking engine handles `groups_func` / `named_groups_func` for patterns
-that are not OnePass-eligible — those with ambiguous alternations or overlapping
+that are not TDFA-eligible — those with ambiguous alternations or overlapping
 quantifiers. Each test case verifies both match position and capture slots.
 
 **RE2 semantics are preserved via a hybrid approach** — both phases run inside

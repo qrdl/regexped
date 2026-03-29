@@ -2,7 +2,7 @@
 
 ## Purpose
 
-**Regexped** is a Go-based compiler that transforms regular expression patterns into standalone WebAssembly (WASM) modules. It analyzes regex patterns, compiles them to optimized DFA, OnePass, or Backtracking engine implementations, generates WASM bytecode, and produces language-specific stubs for integration with host applications.
+**Regexped** is a Go-based compiler that transforms regular expression patterns into standalone WebAssembly (WASM) modules. It analyzes regex patterns, compiles them to optimized DFA, TDFA, or Backtracking engine implementations, generates WASM bytecode, and produces language-specific stubs for integration with host applications.
 
 The project enables embedding high-performance regex matchers directly into WASM applications without shipping a full regex engine, reducing binary size and improving performance predictability.
 
@@ -24,11 +24,12 @@ regexped/
 ├── config/
 │   └── config.go              # YAML configuration parsing
 ├── compile/
-│   ├── compile.go             # Public API: CmdCompile, CompileRegex, CompileOnePassGroups, CompileBacktrackGroups, SelectEngine
-│   ├── selector.go            # Engine selection + isOnePass detection
+│   ├── compile.go             # Public API: Compile, CompileForced, SelectEngine, assembleModule
+│   ├── selector.go            # Engine selection (TDFA vs Backtrack vs DFA vs CompiledDFA)
 │   ├── engine_dfa.go          # DFA subset construction, table generation, WASM emission
-│   ├── engine_onepass.go      # OnePass automaton construction and WASM emission
+│   ├── engine_tdfa.go         # TDFA (Laurikari tagged DFA): subset construction, register ops, WASM emission
 │   ├── engine_backtrack.go    # Backtracking engine: hybrid DFA+NFA, br_table dispatch, explicit stack, WASM emission
+│   ├── mandatory_lit.go       # Mandatory literal extraction (FindMandatoryLit)
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/
@@ -54,7 +55,7 @@ regexped/
     ├── Makefile
     ├── url-ipv6/              # DFA anchored match: validate IPv6 URLs
     ├── secrets/               # DFA find: scan text for GitHub/JWT/AWS secrets
-    ├── url-parts/             # OnePass named_groups: find and parse all URLs in text
+    ├── url-parts/             # TDFA named_groups: find and parse all URLs in text
     └── browser/               # Browser demo: email + URL validation via JS + WASM
 ```
 
@@ -85,7 +86,7 @@ regexes:
     named_groups_func: "url_named_groups"  # anchored + named captures → NamedGroupsIter / generator (JS)
 ```
 
-Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation (OnePass or Backtracking engine).
+Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation (TDFA or Backtracking engine).
 Setting only `match_func` and/or `find_func` strips captures from the pattern before compilation.
 An entry with no `_func` fields is valid — no WASM file is compiled and no stub is generated for it.
 
@@ -93,15 +94,13 @@ An entry with no `_func` fields is valid — no WASM file is compiled and no stu
 
 #### `compile.go` — Public API
 
-- `CmdCompile(cfg, wasmInput, outDir)` — compiles all patterns from config
-- `CompileRegex(pattern, exportName, tableBase, standalone, opts)` — DFA compilation
-- `CompileOnePassGroups(pattern, exportName, tableBase, standalone)` — OnePass compilation
-- `CompileBacktrackGroups(pattern, exportName, tableBase, standalone)` — Backtracking compilation
+- `Compile(patterns, tableBase, standalone)` — compile all patterns to a single WASM module
+- `CompileForced(patterns, tableBase, standalone, forceEngine)` — like `Compile` but forces a specific engine for capture paths
 - `SelectEngine(pattern, opts)` — returns engine type without compiling
 - `stripCaptures(re)` — removes capture groups from parsed regexp tree
 
-`compileRegexEntry` dispatches based on which `_func` fields are set:
-- `groups_func`/`named_groups_func` → OnePass (with fallback to Backtracking if not OnePass-eligible)
+`compilePattern` dispatches based on which `_func` fields are set:
+- `groups_func`/`named_groups_func` → TDFA (with fallback to Backtracking if not TDFA-eligible)
 - `find_func` only → DFA find mode
 - `match_func` only → DFA anchored mode
 - no `_func` fields → returns nil (skipped silently)
@@ -110,15 +109,14 @@ An entry with no `_func` fields is valid — no WASM file is compiled and no stu
 
 Decision tree (in priority order):
 
-1. **OnePass** — has captures + `isOnePass()` + no nested/non-greedy quantifiers
-2. **Backtracking** — has captures that don't qualify for OnePass
-3. **DFA (LeftmostFirst)** — user alternations (`|`) or nested quantifiers
-4. **DFA (standard)** — everything else
+1. **TDFA** — has captures + no non-greedy quantifiers + no line anchors + no word boundaries + no ambiguous alternations + fits within state limit (default 512)
+2. **Backtracking** — has captures that don't qualify for TDFA
+3. **CompiledDFA (LeftmostFirst)** — user alternations (`|`) or nested quantifiers, minimised DFA ≤ 256 states
+4. **DFA (LeftmostFirst)** — user alternations or nested quantifiers, DFA > 256 states
+5. **CompiledDFA (standard)** — simple patterns, ≤ 256 states
+6. **DFA (standard)** — simple patterns, > 256 states
 
-`isOnePass` checks:
-- All `InstAlt` nodes have disjoint first-character sets (`isAlternationDeterministic`)
-- One branch can be epsilon-accept (loop exit) — handled by `isEpsilonAccept`
-- Pattern ≤ 100 NFA instructions
+TDFA eligibility checked by `selectBestEngine`: `hasNonGreedyQuantifiers`, `hasLineAnchors`, `hasWordBoundary`, `hasAmbiguousCaptures`.
 
 #### `engine_dfa.go` — DFA Engine
 
@@ -145,7 +143,7 @@ Decision tree (in priority order):
 
 #### `prefix_scan.go` — Shared SIMD Prefix Scan
 
-`EmitPrefixScan(b, params)` emits the fast-skip prologue for find mode. Used by `engine_dfa.go`; will be used by OnePass find mode when implemented.
+`EmitPrefixScan(b, params)` emits the fast-skip prologue for find mode. Used by `engine_dfa.go`.
 
 Strategies (chosen at compile time based on pattern):
 1. **2-byte Teddy** — if literal prefix has ≥ 2 bytes: T1_lo/T1_hi nibble tables check byte[k] and byte[k+1] simultaneously, near-zero false positives
@@ -155,20 +153,28 @@ Strategies (chosen at compile time based on pattern):
 
 Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq`, `i8x16.bitmask`, `v128.and`.
 
-#### `engine_onepass.go` — OnePass Engine
+#### `engine_tdfa.go` — TDFA Engine
 
-**Automaton construction (`newOnePass`):**
-- `transFromPC(prog, pc, byte, visited)` — follows epsilon transitions until a byte-consuming instruction; collects `captureOp` records (open/close group index) along the path
-- `eofAcceptFromPC` — checks if EOF can match from a given PC
-- Transitions stored as u8: `transitions[state*256 + byte]` = next state, 0xFF = dead
-- `captureOps[state*256 + byte]` = operations to apply on this transition
+**Algorithm:** Laurikari's tagged DFA. Each DFA state carries a set of tag operations on transitions that update WASM locals (registers) recording capture slot positions.
 
-**WASM emission (`genOnePassWASM`):**
+**Key types:**
+- `captureOp{open bool, group int}` — records an open or close event; used during NFA→DFA construction
+- `tdfaState` — DFA state with tag operations per outgoing transition
+- `tagOp / regOp` — compiled register operations (set-to-pos or copy)
+
+**Construction (`newTDFA`):**
+- `tdfaEpsCapOps(prog, fromPC, visited)` — follows epsilon transitions, collecting `captureOp` records
+- `tdfaEpsCapOpsTo(prog, fromPC, targetPC, visited)` — targeted epsilon walk to a specific byte-consuming PC
+- `getOrAddState` — shared sentinel optimization: reuses existing sentinel states per tagIdx
+- `minimizeTDFARegisters` — liveness-based graph coloring to minimize WASM local count
+
+**WASM emission (`appendTDFACodeEntry`):**
 - Function signature: `(ptr i32, len i32, out_ptr i32) → i32`
-- `out_ptr` points to caller-allocated buffer of `numGroups * 2 * 4` bytes
-- Slots written: `[start0, end0, start1, end1, ...]` as little-endian i32
-- Group 0 (full match): start hardcoded to 0, end written at each accept point
-- Capture ops emitted inline as compile-time-known `i32.store` sequences
+- Tag operations emitted per state as `br_table` dispatch
+- `emitTDFATagOps` — majority-group optimization: minority transitions explicit, majority ops unconditional
+- `emitTDFAWriteCaptures` — writes final slot values to `out_ptr` at match acceptance
+
+**State limit:** default 512, configurable via `CompileOptions.MaxDFAStates` / `resolveTDFALimit(opts)`.
 
 #### `wasm.go` — WASM Encoding
 
@@ -238,13 +244,17 @@ make test        # from re2test/
 
 Test data is unpacked from `$GOROOT/src/regexp/testdata/re2-exhaustive.txt.bz2`.
 
-**Current results:** ~4.94M passing, 0 failures, ~781K skipped
-- DFA: ~4.76M, OnePass: ~52K, Backtracking: ~120K
-- Skipped: Unicode (270K), unsupported `\C` syntax (511K), non-deterministic captures (251K)
+**Current results (exhaustive, match+find):** ~4.94M passing, 0 failures, ~781K skipped
+- DFA: ~334K, Compiled DFA: ~4.6M
+- Skipped: Unicode (270K), unsupported `\C` syntax (511K)
+
+**Current results (adjusted, with --validate-groups):** ~1.88M passing, 0 failures
+- DFA: ~360K, Compiled DFA: ~1.2M, TDFA: ~41K, Backtracking: ~267K
 
 Each pattern is compiled and tested for:
-- Col 0: anchored match (DFA or OnePass if captures present)
+- Col 0: anchored match (DFA/Compiled DFA for non-capture, TDFA/Backtracking for captures with --validate-groups)
 - Col 1: non-anchored find (LeftmostFirst DFA)
+- Col 5: non-anchored find with captures (with --validate-groups)
 
 ### Performance benchmarks (`perftest/`)
 
@@ -269,7 +279,7 @@ Harnesses must be pre-built with `make harnesses` if changed.
 ```
 
 - **rustTop** = highest address used by Rust code (from `RustMemTop`)
-- **tableBase** = `PageAlign(rustTop)` — start of first DFA/OnePass table
+- **tableBase** = `PageAlign(rustTop)` — start of first DFA/TDFA table
 - Each regex gets a contiguous region; next regex starts at `PageAlign(prevEnd)`
 
 ### DFA Table Format
@@ -295,18 +305,19 @@ Harnesses must be pre-built with `make harnesses` if changed.
 
 Find mode appends additional arrays: `midAccept`, `firstByteFlags` (or Teddy tables), `immediateAccept`, and (for word-boundary patterns) `wordCharTable`, `midAcceptNW`, `midAcceptW`.
 
-### OnePass Table Format
+### TDFA Table Format
 
-```
-[transitions: u8[numStates * 256]]   // state × byte → next_state (0xFF = dead)
-```
-
-Capture operations are emitted as inline WASM code, not stored in memory.
+TDFA uses the same DFA table layout as the DFA engine (u8 or u16 state IDs, optional byte-class compression). Capture register operations are stored as `tagOp`/`regOp` structs in Go memory during compilation and emitted as inline WASM locals and `br_table` dispatch — they are not present in the runtime table.
 
 ## Plans / Pending Work
 
 - **CM_PLAN.md** — WASM Component Model support
 - **OPTIMISATION_PLAN.md** — future performance optimisations
+
+## Design Principles
+
+- **RE2/Perl semantics only.** All engines implement leftmost-first (Perl/RE2) match semantics. POSIX leftmost-longest is not supported and must not be introduced.
+- **Runtime over compile time.** Pattern compilation happens once and its cost is irrelevant. Every design and implementation decision should minimise the runtime cost of matching — prefer larger tables, more WASM locals, additional compile-time passes, or any other compile-time complexity if it makes the generated code faster.
 
 ## Technical Decisions
 
@@ -331,9 +342,9 @@ Classical DFA produces leftmost-longest (greedy). To match RE2/Perl semantics:
 - `ecWordBoundary`/`ecNoWordBoundary` flags in epsilon closure
 - `wordCharTable` data segment for O(1) lookup during find prologue
 
-### OnePass Engine
+### TDFA Engine
 
-Viable when every `InstAlt` in the NFA has branches with disjoint first-character sets — at each position exactly one NFA thread is active, so capture slots can be updated in a single forward pass. Avoids thread copying overhead of PikeVM or backtracking cost of a general engine.
+Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM or OnePass that achieves O(n) capture tracking without the constraints of one-pass determinism. Uses subset construction extended with tag operations on transitions; register minimization (liveness-based graph coloring) reduces WASM local count; a majority-group optimization keeps tag-op bytecode small.
 
 ## Dependencies
 
@@ -344,7 +355,7 @@ Viable when every `InstAlt` in the NFA has branches with disjoint first-characte
 
 ---
 
-**Last Updated:** 2026-03-23
+**Last Updated:** 2026-03-29
 **CLI commands:** `generate` (stubs / dummy_main), `compile`, `merge`
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals)
-**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), OnePass (anchored with captures), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, all logic inside WASM)
+**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

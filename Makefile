@@ -1,7 +1,7 @@
 GO_SRCS := main.go \
 	config/config.go \
 	compile/compile.go compile/selector.go compile/engine_dfa.go \
-	compile/engine_onepass.go compile/prefix_scan.go compile/wasm.go \
+	compile/engine_backtrack.go compile/engine_tdfa.go compile/prefix_scan.go compile/wasm.go compile/mandatory_lit.go \
 	generate/generate.go generate/rust_stub.go generate/dummy_main.go \
 	merge/merge.go \
 	utils/bytes.go

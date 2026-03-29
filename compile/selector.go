@@ -6,16 +6,9 @@ import (
 	"regexp/syntax"
 )
 
-const (
-	// defaultMaxDFAStates is the default maximum DFA states before falling back to backtracking
-	defaultMaxDFAStates = 1000
-	// defaultMaxDFAMemory is the default maximum DFA memory in bytes (100 KB)
-	defaultMaxDFAMemory = 100 * 1024
-)
-
 // selectBestEngine analyses the compiled regex pattern and selects the optimal engine type.
 // It considers pattern complexity, feature requirements (captures, word boundaries),
-// and estimated resource usage to choose between Backtrack, DFA, or OnePass engines.
+// and estimated resource usage to choose between Backtrack, DFA, TDFA, or CompiledDFA.
 //
 // The optional CompileOptions parameter can customize DFA selection thresholds.
 // When omitted, uses sensible defaults (1000 states, 100KB memory limit).
@@ -100,18 +93,27 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 
 	// Check if pattern has capture groups
 	// NumCap counts: [0]=full match start, [1]=full match end, [2+]=explicit capture groups
-	// However, Simplify() may optimize away captures like (a){0}, so also check the flag
-	hasCaptureGroups := prog.NumCap > 2 || hadCapturesBeforeSimplify
+	// Simplify() may optimize away captures like (a){0}; if NumCap==2 after simplification,
+	// no capture instructions remain in the NFA regardless of hadCapturesBeforeSimplify.
+	hasCaptureGroups := prog.NumCap > 2
 
-	// Capture groups: use OnePass if the pattern qualifies, else Backtrack.
-	// Exclude nested quantifiers and non-greedy quantifiers — these require
-	// backtracking semantics that OnePass cannot provide.
+	// Capture groups: try TDFA first (O(n)), fall back to Backtrack for patterns TDFA
+	// cannot correctly handle: non-greedy quantifiers, multiline line anchors,
+	// word boundaries (broken \ b start-state construction), or overlapping greedy
+	// Alt branches where a quantifier's char class includes the following separator.
 	if hasCaptureGroups {
-		if isOnePass(prog) && !hasNestedQuantifiers(prog) && !hasNonGreedyQuantifiers(prog) {
-			slog.Debug("Engine selected", "engine", "OnePass", "reason", "deterministic capture pattern")
-			return EngineOnePass
+		if !hasNonGreedyQuantifiers(prog) && !hasLineAnchors(prog) &&
+			!hasWordBoundary && !hasAmbiguousCaptures(prog) {
+			tt, ok := newTDFA(prog, resolveTDFALimit(opts))
+			if ok {
+				_ = tt // table will be built again in compilePattern; here we only report engine type
+				slog.Debug("Engine selected", "engine", "TDFA", "reason", "capture pattern within state limit")
+				return EngineTDFA
+			}
+			slog.Debug("Engine selected", "engine", "Backtrack", "reason", "TDFA state limit exceeded")
+		} else {
+			slog.Debug("Engine selected", "engine", "Backtrack", "reason", "non-greedy or line-anchor captures")
 		}
-		slog.Debug("Engine selected", "engine", "Backtrack", "reason", "non-deterministic capture pattern")
 		return EngineBacktrack
 	}
 
@@ -144,6 +146,18 @@ func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptio
 	return EngineDFA
 }
 
+// resolveTDFALimit returns the effective TDFA state limit from opts.
+// Zero → default (512). Negative → disabled (0, meaning TDFA is never used).
+func resolveTDFALimit(opts *CompileOptions) int {
+	if opts == nil || opts.MaxDFAStates == 0 {
+		return 512
+	}
+	if opts.MaxDFAStates < 0 {
+		return 0
+	}
+	return opts.MaxDFAStates
+}
+
 // resolveCompiledDFAThreshold returns the effective compiled-DFA state threshold
 // from opts. Zero → default (256). Negative → disabled (0). Capped at 256.
 func resolveCompiledDFAThreshold(opts *CompileOptions) int {
@@ -171,6 +185,40 @@ func hasNonGreedyQuantifiers(prog *syntax.Prog) bool {
 			pcU32 := uint32(pc)
 			// Non-greedy: Out >= PC (exit first), Arg < PC (loop body backward)
 			if inst.Out >= pcU32 && inst.Arg < pcU32 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasLineAnchors reports whether the NFA contains any begin-of-line (^) or
+// end-of-line ($) assertions, either multiline (EmptyBeginLine/EmptyEndLine) or
+// end-of-text (EmptyEndText = non-multiline $). TDFA does not correctly handle
+// these assertions, so patterns with them fall back to backtracking.
+func hasLineAnchors(prog *syntax.Prog) bool {
+	for i := range prog.Inst {
+		inst := &prog.Inst[i]
+		if inst.Op == syntax.InstEmptyWidth {
+			flag := syntax.EmptyOp(inst.Arg)
+			if flag&(syntax.EmptyBeginLine|syntax.EmptyEndLine|syntax.EmptyEndText) != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasAmbiguousCaptures reports whether any Alt in the NFA has non-disjoint
+// first-character sets between its branches. When such an Alt is inside a
+// capture group's quantifier, TDFA's LeftmostFirst priority causes the greedy
+// loop to over-consume and record wrong capture positions. These patterns must
+// use backtracking instead.
+func hasAmbiguousCaptures(prog *syntax.Prog) bool {
+	for pc, inst := range prog.Inst {
+		switch inst.Op {
+		case syntax.InstAlt, syntax.InstAltMatch:
+			if !isAlternationDeterministic(prog, pc) {
 				return true
 			}
 		}
@@ -351,25 +399,7 @@ func printAnalysis(a *patternAnalysis) {
 }
 
 // --------------------------------------------------------------------------
-// One-pass detection
-
-// isOnePass checks if a program can be executed in one-pass mode.
-func isOnePass(prog *syntax.Prog) bool {
-	if len(prog.Inst) > 100 {
-		return false
-	}
-
-	for pc, inst := range prog.Inst {
-		switch inst.Op {
-		case syntax.InstAlt, syntax.InstAltMatch:
-			if !isAlternationDeterministic(prog, pc) {
-				return false
-			}
-		}
-	}
-
-	return true
-}
+// Alternation determinism helpers
 
 // isEpsilonAccept reports whether pc can reach InstMatch via epsilon transitions
 // only (no byte-consuming instructions). Used to detect loop-exit branches.

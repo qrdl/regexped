@@ -118,12 +118,9 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 
 ---
 
-## OnePass table format
+## TDFA table format
 
-```
-[transitions: u8[numStates * 256]]   // state × byte → next_state  (0xFF = dead)
-```
-
-Capture operations (open/close group slot writes) are emitted as inline WASM `i32.store` instructions — they are not stored in the table.
-
-Group 0 (full match): start is hardcoded to 0; end is written at each accept point.
+TDFA uses the same DFA table format described above (u8 or u16 state IDs,
+with optional byte-class compression). Capture register operations are emitted
+as inline WASM locals and `br_table` dispatch in the function body — they are
+not stored in the table.

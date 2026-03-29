@@ -26,12 +26,17 @@ var dummyMainWASM = []byte{
 }
 
 // CmdDummyMain writes a minimal main.wasm to outDir.
+// If out is "-", WASM bytes are written to stdout instead.
 //
 // The generated module exports 2 pages of memory and has no code, making it
 // suitable as the --wasm-input for the compile command and as the "main" module
 // for wasm-merge in deployments where no host-language runtime is needed (e.g.
 // browser environments where JS provides the memory directly).
-func CmdDummyMain(outDir string) error {
+func CmdDummyMain(outDir, out string) error {
+	if out == "-" {
+		_, err := os.Stdout.Write(dummyMainWASM)
+		return err
+	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", outDir, err)
 	}
