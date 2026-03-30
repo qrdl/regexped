@@ -120,6 +120,7 @@ type compiledPattern struct {
 	splitLitTeddyT1HiOff   int32
 	splitLitTeddyT1LoBytes []byte
 	splitLitTeddyT1HiBytes []byte
+	splitLitSet            [][]byte // raw literals for post-Teddy scalar verification
 }
 
 // funcCount returns the number of WASM functions this pattern contributes.
@@ -401,6 +402,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					p.splitLitTeddyT1HiOff = litTeddyT1HiOff
 					p.splitLitTeddyT1LoBytes = litTeddyT1LoBytes
 					p.splitLitTeddyT1HiBytes = litTeddyT1HiBytes
+					p.splitLitSet = sp.LitSet
 					// Append reversed DFA + literal SIMD data segments.
 					p.dataBytes = append(p.dataBytes, revRawData...)
 					p.dataSegCount += revSegCnt

@@ -2812,6 +2812,53 @@ func buildSplitFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncId
 	}
 	b = EmitPrefixScan(b, simdParams)
 
+	// ── Scalar literal verification ───────────────────────────────────────────
+	// After the SIMD scan places a candidate in attempt_start, verify that one
+	// of the literals in p.splitLitSet actually matches there byte-for-byte.
+	// This eliminates false-positive Teddy hits (nibble tables are approximate
+	// and T1 covers at most 2 bytes) before paying the cost of a backward DFA call.
+	//
+	// Control-flow depths at this point (outside any nested block):
+	//   0 = $lit_outer (loop — br 0 restarts it)
+	//   1 = $no_match  (block — br 1 exits it)
+	//
+	// We wrap the check in a block $lit_ok so a "matched" path can break out of
+	// it, while the "no match" path falls through to advance+restart.
+	//
+	// Inside block $lit_ok:
+	//   0 = $lit_ok, 1 = $lit_outer, 2 = $no_match
+	// Inside block $try_litN:
+	//   0 = $try_litN, 1 = $lit_ok, 2 = $lit_outer, 3 = $no_match
+	if len(p.splitLitSet) > 0 {
+		b = append(b, 0x02, 0x40) // block $lit_ok
+		for _, lit := range p.splitLitSet {
+			b = append(b, 0x02, 0x40) // block $try_litN
+			for k, byt := range lit {
+				// load input[ptr + attempt_start + k]
+				b = append(b, 0x20, locPtr)          // local.get ptr
+				b = append(b, 0x20, locAttemptStart) // local.get attempt_start
+				b = append(b, 0x6A)                  // i32.add
+				b = append(b, 0x2D, 0x00)            // i32.load8_u align=0
+				b = utils.AppendULEB128(b, uint32(k)) // offset = k
+				// i32.const byt — must use SLEB128 since bytes 64-127 have bit 6 set
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(byt))
+				b = append(b, 0x47)       // i32.ne
+				b = append(b, 0x0D, 0x00) // br_if 0 → exit $try_litN (try next literal)
+			}
+			b = append(b, 0x0C, 0x01) // br 1 → exit $lit_ok (literal matched)
+			b = append(b, 0x0B)       // end $try_litN
+		}
+		// No literal matched: advance attempt_start by 1 and restart $lit_outer.
+		b = append(b, 0x20, locAttemptStart) // local.get attempt_start
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)                  // i32.add (attempt_start + 1)
+		b = append(b, 0x21, locAttemptStart) // local.set attempt_start
+		b = append(b, 0x0C, 0x01)            // br 1 → restart $lit_outer (0=$lit_ok, 1=$lit_outer)
+		b = append(b, 0x0B)                  // end $lit_ok
+		// Literal verified at attempt_start — fall through to backward scan.
+	}
+
 	// ── Phase 2: backward scan ────────────────────────────────────────────────
 	// Call backward_scan(ptr, attempt_start - 1).
 	b = append(b, 0x20, locPtr)          // local.get ptr
