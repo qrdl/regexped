@@ -194,6 +194,25 @@ var tests = []testCase{
 		},
 	},
 	{
+		// Email domain filter — non-anchored find with alternating literal "@foo.com"|"@bar.com".
+		// Baseline for the literal-anchored matching non-anchored optimisation.
+		// The literal alternation (foo|bar) sits at a bounded interior offset;
+		// currently the firstByteFlags scan fires on every alphabetic character.
+		name:    "email-domain-find",
+		pattern: `[a-zA-Z0-9_%+\-]+(?:\.[a-zA-Z0-9_%+\-]+)*@(foo|bar)\.com`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-match 10KB", emailDomainInput(nil)},
+			{"5 matches 10KB", emailDomainInput([]string{
+				"alice@foo.com",
+				"bob.smith@bar.com",
+				"carol@foo.com",
+				"dave.r@bar.com",
+				"eve@foo.com",
+			})},
+		},
+	},
+	{
 		name:    "sql-inject",
 		pattern: `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`,
 		mode:    find,
@@ -530,6 +549,38 @@ func logInput(withErrors bool) string {
 		"2026-03-22T14:05:13 app[1] INFO: POST /api/v1/jobs 202 8ms\n" +
 		"2026-03-22T14:05:14 worker[5] DEBUG: job 7f3a picked up by worker pool\n" +
 		"2026-03-22T14:05:15 worker[5] INFO: job 7f3a completed in 340ms\n"
+}
+
+// emailDomainInput returns a ~10KB block of prose with realistic email addresses
+// at various domains (example.com, corp.org, etc.) but no @foo.com or @bar.com
+// occurrences unless explicitly injected. The '@' character appears frequently,
+// giving the first-byte scanner many false-positive candidates.
+func emailDomainInput(emails []string) string {
+	const block = `Team update: contact support@example.com or helpdesk@corp.org for account issues.
+New registrations: user@company.org, admin@example.net, noreply@platform.io.
+Deployment alerts go to devops@internal.io and pagerduty@monitoring.net.
+Unsubscribe via newsletter@example.com; billing queries to billing@vendor.example.com.
+Security events forwarded to sec@example.com and abuse@example.com for triage.
+Service account: service@platform.example.com; CI notifications: ci@build.example.com.
+`
+	repeat := (10 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+	if len(emails) == 0 {
+		return base
+	}
+	result := []byte(base)
+	step := len(result) / (len(emails) + 1)
+	offset := 0
+	for i, email := range emails {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte("Contact " + email + " for domain-specific support.\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
 }
 
 func sqlCleanInput() string {
@@ -958,6 +1009,187 @@ func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs 
 }
 
 // --------------------------------------------------------------------------
+// Fuel measurement
+
+const fuelBudget = uint64(10_000_000_000) // 10 billion units; enough for any test input
+
+type fuelInputResult struct {
+	label    string
+	size     int
+	rxpFuel  uint64
+	rpedFuel uint64
+}
+
+// measFuelRegexped compiles tc.pattern, instantiates the module with a fuel-enabled
+// store, then measures fuel consumed by a single exported function call.
+func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (uint64, bool) {
+	re := config.RegexEntry{Pattern: tc.pattern}
+	var fnExport string
+	switch tc.mode {
+	case anchored:
+		re.MatchFunc = "match"
+		fnExport = "match"
+	case find:
+		re.FindFunc = "find"
+		fnExport = "find"
+	case anchoredGroups:
+		re.GroupsFunc = "groups"
+		fnExport = "groups"
+	}
+	wasmBytes, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  fuel regexped compile(%s): %v\n", tc.name, err)
+		return 0, false
+	}
+	mod, err := wasmtime.NewModule(fuelEngine, wasmBytes)
+	if err != nil {
+		return 0, false
+	}
+	store := wasmtime.NewStore(fuelEngine)
+	if err := store.SetFuel(fuelBudget); err != nil {
+		return 0, false
+	}
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		return 0, false
+	}
+	var mem *wasmtime.Memory
+	if exp := inst.GetExport(store, "memory"); exp != nil {
+		mem = exp.Memory()
+	}
+	fn := inst.GetFunc(store, fnExport)
+	if fn == nil || mem == nil {
+		return 0, false
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	inputLen := int32(len(input))
+
+	before, _ := store.GetFuel()
+	var callErr error
+	if tc.mode == anchoredGroups {
+		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase)
+	} else {
+		_, callErr = fn.Call(store, inputBase, inputLen)
+	}
+	after, _ := store.GetFuel()
+	if callErr != nil {
+		fmt.Fprintf(os.Stderr, "  fuel regexped call(%s): %v\n", tc.name, callErr)
+		return 0, false
+	}
+	return before - after, true
+}
+
+// measFuelRegex instantiates the regex harness, compiles the pattern, warms up the
+// lazy DFA with one uncounted call, then measures fuel for a single direct match call.
+// Uses regex_match/find/groups directly (no bench wrapper) to avoid Instant::now overhead.
+func measFuelRegex(regexWasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime.Engine) (uint64, bool) {
+	mod, err := wasmtime.NewModule(fuelEngine, regexWasmBytes)
+	if err != nil {
+		return 0, false
+	}
+	linker := wasmtime.NewLinker(fuelEngine)
+	if err = linker.DefineWasi(); err != nil {
+		return 0, false
+	}
+	store := wasmtime.NewStore(fuelEngine)
+	store.SetWasi(wasmtime.NewWasiConfig())
+	if err := store.SetFuel(fuelBudget); err != nil {
+		return 0, false
+	}
+	inst, err := linker.Instantiate(store, mod)
+	if err != nil {
+		return 0, false
+	}
+	var mem *wasmtime.Memory
+	if exp := inst.GetExport(store, "memory"); exp != nil {
+		mem = exp.Memory()
+	}
+	getPtrFn := inst.GetFunc(store, "get_input_ptr")
+	initFn := inst.GetFunc(store, "regex_init")
+	// Use direct match functions (no bench wrapper) to avoid Instant::now/elapsed fuel.
+	var execFn *wasmtime.Func
+	switch tc.mode {
+	case anchored:
+		execFn = inst.GetFunc(store, "regex_match")
+	case find:
+		execFn = inst.GetFunc(store, "regex_find")
+	case anchoredGroups:
+		execFn = inst.GetFunc(store, "regex_groups")
+	}
+	if mem == nil || getPtrFn == nil || initFn == nil || execFn == nil {
+		return 0, false
+	}
+	ptrRes, err := getPtrFn.Call(store)
+	if err != nil {
+		return 0, false
+	}
+	inputPtr := int(ptrRes.(int32))
+	buf := mem.UnsafeData(store)
+	pat := tc.pattern
+	if tc.mode == anchored {
+		pat = "^(?:" + tc.pattern + ")$"
+	}
+	copy(buf[inputPtr:], []byte(pat))
+	if _, err = initFn.Call(store, int32(len([]byte(pat)))); err != nil {
+		return 0, false
+	}
+	copy(buf[inputPtr:], []byte(input))
+	// Warm-up call: the regex crate uses a lazy DFA that builds states on first use.
+	// This uncounted call lets it reach steady state before we measure fuel.
+	if _, err = execFn.Call(store, int32(len(input))); err != nil {
+		return 0, false
+	}
+	// Measure a single steady-state call.
+	before, _ := store.GetFuel()
+	if _, err = execFn.Call(store, int32(len(input))); err != nil {
+		fmt.Fprintf(os.Stderr, "  fuel regex call(%s): %v\n", tc.name, err)
+		return 0, false
+	}
+	after, _ := store.GetFuel()
+	return before - after, true
+}
+
+func fmtFuel(n uint64) string {
+	if n == 0 {
+		return "n/a"
+	}
+	s := fmt.Sprintf("%d", n)
+	var b []byte
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b = append(b, ',')
+		}
+		b = append(b, byte(c))
+	}
+	return string(b)
+}
+
+func printFuelResults(tc testCase, engineName string, inputs []fuelInputResult) {
+	modeStr := "anchored"
+	switch tc.mode {
+	case find:
+		modeStr = "find"
+	case anchoredGroups:
+		modeStr = "groups"
+	}
+	fmt.Printf("\n=== %s  [%s, %s] ===\n", tc.name, engineName, modeStr)
+	fmt.Printf("  %-26s  %14s  %14s  %8s\n", "", "regex", "regexped", "ratio")
+	for _, inp := range inputs {
+		fmt.Printf("\n  input: %s (%d bytes)\n", inp.label, inp.size)
+		ratio := "n/a"
+		if inp.rpedFuel > 0 && inp.rxpFuel > 0 {
+			ratio = fmt.Sprintf("%.2fx", float64(inp.rxpFuel)/float64(inp.rpedFuel))
+		}
+		fmt.Printf("    %-24s  %14s  %14s  %8s\n",
+			"fuel consumed:",
+			fmtFuel(inp.rxpFuel),
+			fmtFuel(inp.rpedFuel),
+			ratio)
+	}
+}
+
+// --------------------------------------------------------------------------
 // Main
 
 func main() {
@@ -965,6 +1197,7 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	full := flag.Bool("full", false, "show wasm size and instantiation/compilation time")
+	fuel := flag.Bool("fuel", false, "measure fuel (WASM instruction count) for a single call instead of timing")
 	flag.Parse()
 
 	// Load the pre-built regex_bench.wasm harness.
@@ -982,9 +1215,32 @@ func main() {
 	// Warm up Cranelift before the first real measurement.
 	warmup(engine)
 
+	var fuelEngine *wasmtime.Engine
+	if *fuel {
+		fuelCfg := wasmtime.NewConfig()
+		fuelCfg.SetConsumeFuel(true)
+		fuelEngine = wasmtime.NewEngineWithConfig(fuelCfg)
+	}
+
 	for _, tc := range tests {
 		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
 		engineName := regexpedEngineName(tc)
+
+		if *fuel {
+			var fuelInputs []fuelInputResult
+			for _, inp := range tc.inputs {
+				rxpF, _ := measFuelRegex(regexWasmBytes, tc, inp.value, fuelEngine)
+				rpedF, _ := measFuelRegexped(tc, inp.value, fuelEngine)
+				fuelInputs = append(fuelInputs, fuelInputResult{
+					label:    inp.label,
+					size:     len(inp.value),
+					rxpFuel:  rxpF,
+					rpedFuel: rpedF,
+				})
+			}
+			printFuelResults(tc, engineName, fuelInputs)
+			continue
+		}
 
 		// Benchmark all inputs; use the first input's instantiation timing for display
 		// (instantiation depends only on pattern/module, not on input content).

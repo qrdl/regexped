@@ -2530,6 +2530,582 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 	return b
 }
 
+// buildLitAnchorBackScanBody returns the size-prefixed WASM function body for the
+// backward scan helper used by the literal-anchored find optimisation.
+//
+// Signature: (ptr i32, scan_end i32) → i32
+//
+//   - ptr:      base address of the input buffer (same as the outer find function)
+//   - scan_end: index of the last byte to check, scanning leftward (= lit_pos - 1)
+//
+// Returns the forward match-start position (>= 0) or -1 on no match.
+//
+// The function runs the reversed-prefix DFA backward through the input, reading
+// bytes at positions scan_end, scan_end-1, … 0.  When the DFA accepts or a
+// newline boundary is hit, it records last_accept and terminates.
+//
+// Locals: ptr(0), scan_end(1), state(2), pos(3), last_accept(4), byte_or_class(5)
+func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable) []byte {
+	var b []byte
+
+	// ── local declarations ────────────────────────────────────────────────────
+	// 4 extra i32 locals beyond the 2 params: state(2), pos(3), last_accept(4), byte/class(5)
+	b = append(b, 0x01, 0x04, 0x7F)
+
+	// state = revL.wasmStart
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(revL.wasmStart))
+	b = append(b, 0x21, 0x02) // local.set state
+
+	// pos = scan_end (param 1)
+	b = append(b, 0x20, 0x01)
+	b = append(b, 0x21, 0x03) // local.set pos
+
+	// last_accept = -1
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x21, 0x04) // local.set last_accept
+
+	// Initial midAccept check: if revMidAccept[wasmStart], the reversed prefix
+	// matches the empty string, so the forward match starts at scan_end + 1.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, revL.midAcceptOff)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(revL.wasmStart))
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x04, 0x40)       // if (void)
+	b = append(b, 0x20, 0x01)       // local.get scan_end
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)       // scan_end + 1
+	b = append(b, 0x21, 0x04) // local.set last_accept
+	b = append(b, 0x0B)       // end if
+
+	// ── main scan loop ────────────────────────────────────────────────────────
+	// Control flow depths (from inside $rev loop):
+	//   depth 0 = $rev (loop)
+	//   depth 1 = $done (block)  — br exits $done
+	// From inside an if block inside $rev:
+	//   depth 0 = if, depth 1 = $rev (loop), depth 2 = $done (block)
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $rev
+
+	// if pos < 0 (signed): check EOF accept, then exit.
+	b = append(b, 0x20, 0x03) // local.get pos
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x48)       // i32.lt_s
+	b = append(b, 0x04, 0x40) // if (void) — depth 0
+	// if acceptOff[state] != 0: last_accept = 0 (match starts at text start)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, revL.acceptOff)
+	b = append(b, 0x20, 0x02) // local.get state
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x04, 0x40)       // if (void)
+	b = append(b, 0x41, 0x00)       // i32.const 0
+	b = append(b, 0x21, 0x04)       // local.set last_accept
+	b = append(b, 0x0B)             // end if
+	b = append(b, 0x0C, 0x02)       // br 2 → $done (0=outer_if, 1=$rev, 2=$done)
+	b = append(b, 0x0B)             // end if pos<0
+
+	// byte = mem[ptr + pos]; local.tee byte(5) leaves it on stack for '\n' check.
+	b = append(b, 0x20, 0x00) // local.get ptr
+	b = append(b, 0x20, 0x03) // local.get pos
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x22, 0x05)       // local.tee byte(5) — also leaves value on stack
+
+	if revTable.hasNewlineBoundary {
+		// if byte == '\n': check midAcceptNL, record match start, always stop.
+		b = append(b, 0x41, 0x0A) // i32.const '\n'
+		b = append(b, 0x46)       // i32.eq — depth 0 = this if
+		b = append(b, 0x04, 0x40) // if (void)
+		// if midAcceptNL[state]: last_accept = pos + 1
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, revL.midAcceptNLOff)
+		b = append(b, 0x20, 0x02) // local.get state
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x20, 0x03)       // local.get pos
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)       // pos + 1
+		b = append(b, 0x21, 0x04) // local.set last_accept
+		b = append(b, 0x0B)       // end if midAcceptNL
+		// Always stop at '\n' for anchored patterns.
+		// Depths: 0=nl_if, 1=$rev, 2=$done → br 2 exits $done
+		b = append(b, 0x0C, 0x02) // br 2 → $done
+		b = append(b, 0x0B)       // end if byte=='\n'
+		// Stack now has: nothing (the local.tee result was consumed by i32.eq)
+	} else {
+		b = append(b, 0x1A) // drop the stacked byte value (local.tee leftover)
+	}
+
+	// ── DFA transition ────────────────────────────────────────────────────────
+	if revL.useCompression {
+		// class = classMap[byte]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, revL.classMapOff)
+		b = append(b, 0x20, 0x05) // local.get byte
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u → class
+		b = append(b, 0x21, 0x05)       // local.set class (overwrite byte)
+
+		// state = table[state * numClasses + class]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, revL.tableOff)
+		b = append(b, 0x20, 0x02) // local.get state
+		b = utils.AppendULEB128(b, uint32(revL.numClasses))
+		b = append(b, 0x6C) // i32.mul
+		b = append(b, 0x6A)
+		b = append(b, 0x20, 0x05) // local.get class
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x21, 0x02)       // local.set state
+	} else {
+		// state = table[state * 256 + byte]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, revL.tableOff)
+		b = append(b, 0x20, 0x02) // local.get state
+		b = append(b, 0x41, 0x08)
+		b = append(b, 0x74) // i32.shl (state * 256)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, 0x05) // local.get byte
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x21, 0x02)       // local.set state
+	}
+
+	// if state == 0 (dead state): exit $done
+	b = append(b, 0x20, 0x02) // local.get state
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x0C, 0x02) // br 2 → $done (0=dead_if, 1=$rev, 2=$done)
+	b = append(b, 0x0B)       // end if dead
+
+	// if midAccept[state]: last_accept = pos (= current position before decrement)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, revL.midAcceptOff)
+	b = append(b, 0x20, 0x02) // local.get state
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x04, 0x40)       // if (void)
+	b = append(b, 0x20, 0x03)       // local.get pos
+	b = append(b, 0x21, 0x04)       // local.set last_accept
+	b = append(b, 0x0B)             // end if midAccept
+
+	// pos--
+	b = append(b, 0x20, 0x03)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6B)       // i32.sub
+	b = append(b, 0x21, 0x03) // local.set pos
+
+	b = append(b, 0x0C, 0x00) // br 0 → $rev (restart loop)
+	b = append(b, 0x0B)       // end loop $rev
+	b = append(b, 0x0B)       // end block $done
+
+	// return last_accept
+	b = append(b, 0x20, 0x04) // local.get last_accept
+	b = append(b, 0x0B)       // end function
+
+	// Prepend size-prefix (required by WASM code section).
+	sz := utils.AppendULEB128(nil, uint32(len(b)))
+	return append(sz, b...)
+}
+
+// buildLitAnchorFindBody returns the WASM function body for the literal-anchored find
+// optimisation.  It performs three phases for each candidate position:
+//
+//  1. SIMD scan for the first byte of any literal in the literal set.
+//  2. Backward DFA scan (call to backward_scan) to find the match start.
+//  3. Forward DFA scan from the match start to find the match end.
+//
+// Signature: (ptr i32, len i32) → i64
+// Returns (match_start << 32 | match_end) on success, -1 on no match.
+//
+// Locals:
+//
+//	ptr(0), len(1)                                  — params
+//	state(2), pos(3), attempt_start(4), last_accept(5) — i32
+//	rev_result(6)                                   — i32 (backward_scan result)
+//	simdMask_or_class(7)                            — i32 (reused across phases)
+//	chunk(8)                                        — v128
+//	tLo(9), tHi(10)                                 — v128 (T0 Teddy, if applicable)
+//	chunk1(11), t1Lo(12), t1Hi(13)                  — v128 (T1 Teddy, if applicable)
+func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncIdx int) []byte {
+	var b []byte
+
+	// ── local declarations ────────────────────────────────────────────────────
+	hasT0 := len(p.litAnchorTeddyLoBytes) > 0
+	hasT1 := len(p.litAnchorTeddyT1LoBytes) > 0
+	numI32Locals := 6 // state(2), pos(3), attempt_start(4), last_accept(5), rev_result(6), simdMask_or_class(7)
+	var numV128Locals int
+	if hasT1 {
+		numV128Locals = 6 // chunk(8), tLo(9), tHi(10), chunk1(11), t1Lo(12), t1Hi(13)
+	} else if hasT0 {
+		numV128Locals = 3 // chunk(8), tLo(9), tHi(10)
+	} else if len(p.litAnchorFirstBytes) > 0 && len(p.litAnchorFirstBytes) <= 16 {
+		numV128Locals = 1 // chunk(8)
+	} else {
+		numV128Locals = 0
+	}
+
+	// Local group count  (groups share the same type).
+	if numV128Locals > 0 {
+		b = append(b, 0x02)                      // 2 local groups
+		b = append(b, byte(numI32Locals), 0x7F)  // 6 × i32
+		b = append(b, byte(numV128Locals), 0x7B) // N × v128
+	} else {
+		b = append(b, 0x01)                     // 1 local group
+		b = append(b, byte(numI32Locals), 0x7F) // 6 × i32
+	}
+
+	// Local indices for the DFA locals (also used by EmitPrefixScan).
+	const (
+		locPtr          = 0
+		locLen          = 1
+		locState        = 2
+		locPos          = 3
+		locAttemptStart = 4
+		locLastAccept   = 5
+		locRevResult    = 6
+		locSimdOrClass  = 7
+		locChunk        = 8
+		locTLo          = 9
+		locTHi          = 10
+		locChunk1       = 11
+		locT1Lo         = 12
+		locT1Hi         = 13
+	)
+
+	// ── outer control flow ────────────────────────────────────────────────────
+	// block $no_match (depth 1 from inside $lit_outer)
+	// loop $lit_outer (depth 0 from inside the loop body)
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $lit_outer
+
+	// ── Phase 1: SIMD scan for any literal first byte ─────────────────────────
+	// EmitPrefixScan uses EngineDepth=2 (loop $lit_outer + block $no_match).
+	// OnMatch: nothing — attempt_start is set to the candidate position, fall through.
+	simdParams := PrefixScanParams{
+		FirstByteSet:   p.litAnchorFirstBytes,
+		FirstByteFlags: p.litAnchorFirstByteFlags,
+		FirstByteOff:   p.litAnchorFirstByteOff,
+		TeddyLoOff:     p.litAnchorTeddyLoOff,
+		TeddyHiOff:     p.litAnchorTeddyHiOff,
+		TeddyTwoByte:   hasT1,
+		TeddyT1LoOff:   p.litAnchorTeddyT1LoOff,
+		TeddyT1HiOff:   p.litAnchorTeddyT1HiOff,
+		EngineDepth:    2,
+		Locals: PrefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdOrClass,
+			Chunk:        locChunk,
+			TLo:          locTLo,
+			THi:          locTHi,
+			Chunk1:       locChunk1,
+			T1Lo:         locT1Lo,
+			T1Hi:         locT1Hi,
+		},
+		OnMatch: nil, // fall through with attempt_start = candidate position
+	}
+	b = EmitPrefixScan(b, simdParams)
+
+	// ── Scalar literal verification ───────────────────────────────────────────
+	// After the SIMD scan places a candidate in attempt_start, verify that one
+	// of the literals in p.litAnchorLitSet actually matches there byte-for-byte.
+	// This eliminates false-positive Teddy hits (nibble tables are approximate
+	// and T1 covers at most 2 bytes) before paying the cost of a backward DFA call.
+	//
+	// Control-flow depths at this point (outside any nested block):
+	//   0 = $lit_outer (loop — br 0 restarts it)
+	//   1 = $no_match  (block — br 1 exits it)
+	//
+	// We wrap the check in a block $lit_ok so a "matched" path can break out of
+	// it, while the "no match" path falls through to advance+restart.
+	//
+	// Inside block $lit_ok:
+	//   0 = $lit_ok, 1 = $lit_outer, 2 = $no_match
+	// Inside block $try_litN:
+	//   0 = $try_litN, 1 = $lit_ok, 2 = $lit_outer, 3 = $no_match
+	if len(p.litAnchorLitSet) > 0 {
+		b = append(b, 0x02, 0x40) // block $lit_ok
+		for _, lit := range p.litAnchorLitSet {
+			b = append(b, 0x02, 0x40) // block $try_litN
+			for k, byt := range lit {
+				// load input[ptr + attempt_start + k]
+				b = append(b, 0x20, locPtr)           // local.get ptr
+				b = append(b, 0x20, locAttemptStart)  // local.get attempt_start
+				b = append(b, 0x6A)                   // i32.add
+				b = append(b, 0x2D, 0x00)             // i32.load8_u align=0
+				b = utils.AppendULEB128(b, uint32(k)) // offset = k
+				// i32.const byt — must use SLEB128 since bytes 64-127 have bit 6 set
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(byt))
+				b = append(b, 0x47)       // i32.ne
+				b = append(b, 0x0D, 0x00) // br_if 0 → exit $try_litN (try next literal)
+			}
+			b = append(b, 0x0C, 0x01) // br 1 → exit $lit_ok (literal matched)
+			b = append(b, 0x0B)       // end $try_litN
+		}
+		// No literal matched: advance attempt_start by 1 and restart $lit_outer.
+		b = append(b, 0x20, locAttemptStart) // local.get attempt_start
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)                  // i32.add (attempt_start + 1)
+		b = append(b, 0x21, locAttemptStart) // local.set attempt_start
+		b = append(b, 0x0C, 0x01)            // br 1 → restart $lit_outer (0=$lit_ok, 1=$lit_outer)
+		b = append(b, 0x0B)                  // end $lit_ok
+		// Literal verified at attempt_start — fall through to backward scan.
+	}
+
+	// ── Phase 2: backward scan ────────────────────────────────────────────────
+	// Call backward_scan(ptr, attempt_start - 1).
+	b = append(b, 0x20, locPtr)          // local.get ptr
+	b = append(b, 0x20, locAttemptStart) // local.get attempt_start
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6B) // i32.sub  (attempt_start - 1)
+	b = append(b, 0x10) // call
+	b = utils.AppendULEB128(b, uint32(revFuncIdx))
+	b = append(b, 0x21, locRevResult) // local.set rev_result
+
+	// if rev_result < 0 (backward scan failed): advance attempt_start++; restart $lit_outer
+	b = append(b, 0x20, locRevResult) // local.get rev_result
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x48)       // i32.lt_s
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart) // attempt_start++
+	b = append(b, 0x0C, 0x01)            // br 1 → $lit_outer (0=if, 1=$lit_outer loop)
+	b = append(b, 0x0B)                  // end if
+
+	// ── Phase 3: forward DFA scan from rev_result ─────────────────────────────
+	// Initial state:
+	//   rev_result == 0              → wasmStart (match starts at input begin)
+	//   ptr[rev_result-1] == '\n'    → wasmMidStartNewline
+	//   otherwise                    → wasmMidStart
+	// For patterns without word boundaries wasmMidStart == wasmMidStartNewline;
+	// the byte check is still emitted for correctness and future-proofing.
+	b = append(b, 0x20, locRevResult) // local.get rev_result
+	b = append(b, 0x45)               // i32.eqz
+	b = append(b, 0x04, 0x7F)         // if (result i32) — start of input
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(l.wasmStart))
+	b = append(b, 0x05) // else
+	// load byte at ptr + rev_result - 1
+	b = append(b, 0x20, locPtr)       // local.get ptr
+	b = append(b, 0x20, locRevResult) // local.get rev_result
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6B)             // i32.sub (rev_result - 1)
+	b = append(b, 0x6A)             // i32.add (ptr + rev_result - 1)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x41, 0x0A)       // i32.const '\n'
+	b = append(b, 0x46)             // i32.eq
+	b = append(b, 0x04, 0x7F)       // if (result i32) — preceded by '\n'
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(l.wasmMidStartNewline))
+	b = append(b, 0x05) // else
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(l.wasmMidStart))
+	b = append(b, 0x0B)           // end if newline
+	b = append(b, 0x0B)           // end if start
+	b = append(b, 0x21, locState) // local.set state
+
+	b = append(b, 0x20, locRevResult)
+	b = append(b, 0x21, locPos) // local.set pos = rev_result
+
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x21, locLastAccept) // last_accept = -1
+
+	// Initial midAccept check at start position.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, l.midAcceptOff)
+	b = append(b, 0x20, locState)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // midAccept[state]
+	b = append(b, 0x04, 0x40)       // if (void)
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x21, locLastAccept) // last_accept = pos
+	b = append(b, 0x0B)                // end if
+
+	// Optional immediateAccept check at start position.
+	// br depth: 0=if, 1=$fwd_done (block, opened just below)
+	// We open $fwd_done first, then emit the start immAccept check inside it.
+	b = append(b, 0x02, 0x40) // block $fwd_done
+	if l.hasImmAccept {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
+		b = append(b, 0x20, locState)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // immediateAccept[state]
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x0C, 0x01)       // br 1 → $fwd_done (0=if, 1=$fwd_done)
+		b = append(b, 0x0B)             // end if
+	}
+
+	// Inner forward DFA scan loop.
+	// Control flow depths inside $fwd_scan (relative to inner if blocks):
+	//   depth 0=if, depth 1=$fwd_scan(loop), depth 2=$fwd_done(block)
+	b = append(b, 0x03, 0x40) // loop $fwd_scan
+
+	// if pos >= len: EOF check, then exit $fwd_done.
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4F)       // i32.ge_u
+	b = append(b, 0x04, 0x40) // if (void)
+	// if acceptOff[state]: last_accept = pos (EOF accept)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, l.acceptOff)
+	b = append(b, 0x20, locState)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x04, 0x40)       // if (void)
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x21, locLastAccept) // last_accept = pos
+	b = append(b, 0x0B)                // end if accept
+	b = append(b, 0x0C, 0x02)          // br 2 → $fwd_done (0=eof_if, 1=$fwd_scan, 2=$fwd_done)
+	b = append(b, 0x0B)                // end if pos>=len
+
+	// NL pre-accept check (if pattern has (?m:$)).
+	if t.hasNewlineBoundary {
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // input[ptr+pos]
+		b = append(b, 0x41, 0x0A)
+		b = append(b, 0x46)       // == '\n' ?
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptNLOff)
+		b = append(b, 0x20, locState)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // midAcceptNL[state]
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x21, locLastAccept) // last_accept = pos (before '\n')
+		b = append(b, 0x0B)                // end if midAcceptNL
+		b = append(b, 0x0B)                // end if '\n'
+	}
+
+	// DFA transition.
+	if l.useCompression {
+		// class = classMap[input[ptr+pos]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.classMapOff)
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x21, locSimdOrClass) // local.set class
+
+		// state = table[state * numClasses + class]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.tableOff)
+		b = append(b, 0x20, locState)
+		b = utils.AppendULEB128(b, uint32(l.numClasses))
+		b = append(b, 0x6C) // i32.mul
+		b = append(b, 0x6A)
+		b = append(b, 0x20, locSimdOrClass)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x21, locState)   // local.set state
+	} else {
+		// state = table[state * 256 + input[ptr+pos]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.tableOff)
+		b = append(b, 0x20, locState)
+		b = append(b, 0x41, 0x08)
+		b = append(b, 0x74) // i32.shl (state * 256)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // input[ptr+pos]
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (table entry)
+		b = append(b, 0x21, locState)   // local.set state
+	}
+
+	// if state == 0 (dead): exit $fwd_done.
+	b = append(b, 0x20, locState)
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x0C, 0x02) // br 2 → $fwd_done (0=dead_if, 1=$fwd_scan, 2=$fwd_done)
+	b = append(b, 0x0B)       // end if dead
+
+	// if midAccept[state]: last_accept = pos + 1
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, l.midAcceptOff)
+	b = append(b, 0x20, locState)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // midAccept[state]
+	b = append(b, 0x04, 0x40)       // if (void)
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A) // pos + 1
+	b = append(b, 0x21, locLastAccept)
+	b = append(b, 0x0B) // end if midAccept
+
+	// immediateAccept check (LeftmostFirst: stop as soon as match found).
+	if l.hasImmAccept {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
+		b = append(b, 0x20, locState)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // immediateAccept[state]
+		b = append(b, 0x04, 0x40)       // if (void)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A) // pos + 1
+		b = append(b, 0x21, locLastAccept)
+		b = append(b, 0x0C, 0x02) // br 2 → $fwd_done
+		b = append(b, 0x0B)       // end if immediateAccept
+	}
+
+	// pos++; restart scan.
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locPos) // pos++
+	b = append(b, 0x0C, 0x00)   // br 0 → $fwd_scan
+	b = append(b, 0x0B)         // end loop $fwd_scan
+	b = append(b, 0x0B)         // end block $fwd_done
+
+	// if last_accept >= 0: return packed i64 (rev_result << 32 | last_accept).
+	b = append(b, 0x20, locLastAccept)
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x4E)       // i32.ge_s
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, locRevResult)
+	b = append(b, 0xAD)       // i64.extend_i32_u
+	b = append(b, 0x42, 0x20) // i64.const 32
+	b = append(b, 0x86)       // i64.shl
+	b = append(b, 0x20, locLastAccept)
+	b = append(b, 0xAD) // i64.extend_i32_u
+	b = append(b, 0x84) // i64.or
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B) // end if last_accept >= 0
+
+	// No match from this candidate: advance attempt_start and restart.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart) // attempt_start++
+	b = append(b, 0x0C, 0x00)            // br 0 → $lit_outer (restart from here)
+	b = append(b, 0x0B)                  // end loop $lit_outer (unreachable)
+	b = append(b, 0x0B)                  // end block $no_match
+
+	// No match at all: return -1.
+	b = append(b, 0x42, 0x7F) // i64.const -1
+	b = append(b, 0x0B)       // end function
+
+	return b
+}
+
 // buildFindBody returns the WASM function body for find mode.
 // The function scans for the leftmost-longest match and returns a packed i64:
 //

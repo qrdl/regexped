@@ -97,17 +97,17 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 		// Load 16 bytes once into v128 local.
 		b = append(b, 0x20, l.Ptr)
 		b = append(b, 0x20, l.AttemptStart)
-		b = append(b, 0x6A)                    // i32.add
+		b = append(b, 0x6A)                   // i32.add
 		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-		b = append(b, 0x21, l.Chunk)           // local.set chunk
+		b = append(b, 0x21, l.Chunk)          // local.set chunk
 
 		// Phase A: bitmask for prefix[0].
 		b = append(b, 0x20, l.Chunk)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(prefix[0]))
-		b = append(b, 0xFD, 0x0F) // i8x16.splat
-		b = append(b, 0xFD, 0x23) // i8x16.eq
-		b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+		b = append(b, 0xFD, 0x0F)       // i8x16.splat
+		b = append(b, 0xFD, 0x23)       // i8x16.eq
+		b = append(b, 0xFD, 0x64)       // i8x16.bitmask → i32
 		b = append(b, 0x22, l.SimdMask) // local.tee simdMask
 
 		// if mask != 0: prefix[0] found → Phase B
@@ -123,9 +123,9 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 			b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(k))
-			b = append(b, 0x76)          // i32.shr_u (align with prefix[0] positions)
+			b = append(b, 0x76) // i32.shr_u (align with prefix[0] positions)
 			b = append(b, 0x20, l.SimdMask)
-			b = append(b, 0x71)          // i32.and
+			b = append(b, 0x71) // i32.and
 			b = append(b, 0x21, l.SimdMask)
 		}
 
@@ -134,8 +134,8 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 		b = append(b, 0x04, 0x40) // if (void): inner if
 		b = append(b, 0x20, l.AttemptStart)
 		b = append(b, 0x20, l.SimdMask)
-		b = append(b, 0x68)       // i32.ctz
-		b = append(b, 0x6A)       // i32.add
+		b = append(b, 0x68) // i32.ctz
+		b = append(b, 0x6A) // i32.add
 		b = append(b, 0x21, l.AttemptStart)
 		// br 4 exits $prefix_matched (self-contained depth: 0=innerif 1=outerif
 		// 2=$simd_outer 3=$simd_exhausted 4=$prefix_matched)
@@ -146,7 +146,7 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 		b = append(b, 0x20, l.AttemptStart)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(step))
-		b = append(b, 0x6A)       // i32.add
+		b = append(b, 0x6A) // i32.add
 		b = append(b, 0x21, l.AttemptStart)
 		b = append(b, 0x0C, 0x01) // br 1 → restart $simd_outer
 		b = append(b, 0x0B)       // end outer if
@@ -168,8 +168,8 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 
 		b = append(b, 0x20, l.AttemptStart)
 		b = append(b, 0x20, l.Len)
-		b = append(b, 0x4F)             // i32.ge_u
-		b = append(b, 0x0D, 1+ed)       // br_if (1+ed) → $no_match
+		b = append(b, 0x4F)       // i32.ge_u
+		b = append(b, 0x0D, 1+ed) // br_if (1+ed) → $no_match
 
 		for k := 0; k < len(prefix); k++ {
 			b = append(b, 0x20, l.Ptr)
@@ -290,49 +290,49 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 			// Compute candidate mask.
 			if len(p.FirstByteSet) <= 8 {
 				// 1-byte Teddy: candidates0 = swizzle(T0_lo, chunk&0xF) & swizzle(T0_hi, chunk>>4)
-				b = append(b, 0x20, l.TLo)         // local.get T0_lo
+				b = append(b, 0x20, l.TLo) // local.get T0_lo
 				b = append(b, 0x20, l.Chunk)
 				b = append(b, 0x41, 0x0F)
-				b = append(b, 0xFD, 0x0F)          // i8x16.splat(0x0F)
-				b = append(b, 0xFD, 0x4E)          // v128.and → lo_nibbles
-				b = append(b, 0xFD, 0x0E)          // i8x16.swizzle → lo_result
-				b = append(b, 0x20, l.THi)         // local.get T0_hi
+				b = append(b, 0xFD, 0x0F)  // i8x16.splat(0x0F)
+				b = append(b, 0xFD, 0x4E)  // v128.and → lo_nibbles
+				b = append(b, 0xFD, 0x0E)  // i8x16.swizzle → lo_result
+				b = append(b, 0x20, l.THi) // local.get T0_hi
 				b = append(b, 0x20, l.Chunk)
-				b = append(b, 0x41, 0x04)           // i32.const 4
-				b = append(b, 0xFD, 0x6D)           // i8x16.shr_u
-				b = append(b, 0xFD, 0x0E)           // i8x16.swizzle → hi_result
-				b = append(b, 0xFD, 0x4E)           // v128.and → candidates0
+				b = append(b, 0x41, 0x04) // i32.const 4
+				b = append(b, 0xFD, 0x6D) // i8x16.shr_u
+				b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi_result
+				b = append(b, 0xFD, 0x4E) // v128.and → candidates0
 
 				if p.TeddyTwoByte {
 					// 2-byte: AND with candidates1 from chunk1.
 					b = append(b, 0x20, l.T1Lo)
 					b = append(b, 0x20, l.Chunk1)
 					b = append(b, 0x41, 0x0F)
-					b = append(b, 0xFD, 0x0F)      // i8x16.splat(0x0F)
-					b = append(b, 0xFD, 0x4E)      // v128.and
-					b = append(b, 0xFD, 0x0E)      // i8x16.swizzle → lo1
+					b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
+					b = append(b, 0xFD, 0x4E) // v128.and
+					b = append(b, 0xFD, 0x0E) // i8x16.swizzle → lo1
 					b = append(b, 0x20, l.T1Hi)
 					b = append(b, 0x20, l.Chunk1)
 					b = append(b, 0x41, 0x04)
-					b = append(b, 0xFD, 0x6D)      // i8x16.shr_u
-					b = append(b, 0xFD, 0x0E)      // i8x16.swizzle → hi1
-					b = append(b, 0xFD, 0x4E)      // v128.and → candidates1
-					b = append(b, 0xFD, 0x4E)      // v128.and c0&c1 → combined
+					b = append(b, 0xFD, 0x6D) // i8x16.shr_u
+					b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi1
+					b = append(b, 0xFD, 0x4E) // v128.and → candidates1
+					b = append(b, 0xFD, 0x4E) // v128.and c0&c1 → combined
 					if p.TeddyThreeByte {
 						// 3-byte: AND with candidates2 from chunk2.
 						b = append(b, 0x20, l.T2Lo)
 						b = append(b, 0x20, l.Chunk2)
 						b = append(b, 0x41, 0x0F)
-						b = append(b, 0xFD, 0x0F)  // i8x16.splat(0x0F)
-						b = append(b, 0xFD, 0x4E)  // v128.and
-						b = append(b, 0xFD, 0x0E)  // i8x16.swizzle → lo2
+						b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
+						b = append(b, 0xFD, 0x4E) // v128.and
+						b = append(b, 0xFD, 0x0E) // i8x16.swizzle → lo2
 						b = append(b, 0x20, l.T2Hi)
 						b = append(b, 0x20, l.Chunk2)
 						b = append(b, 0x41, 0x04)
-						b = append(b, 0xFD, 0x6D)  // i8x16.shr_u
-						b = append(b, 0xFD, 0x0E)  // i8x16.swizzle → hi2
-						b = append(b, 0xFD, 0x4E)  // v128.and → candidates2
-						b = append(b, 0xFD, 0x4E)  // v128.and combined&c2
+						b = append(b, 0xFD, 0x6D) // i8x16.shr_u
+						b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi2
+						b = append(b, 0xFD, 0x4E) // v128.and → candidates2
+						b = append(b, 0xFD, 0x4E) // v128.and combined&c2
 					}
 				}
 
@@ -351,7 +351,7 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 					b = append(b, 0xFD, 0x0F) // i8x16.splat
 					b = append(b, 0xFD, 0x23) // i8x16.eq
 					b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
-					b = append(b, 0x72)        // i32.or
+					b = append(b, 0x72)       // i32.or
 				}
 			}
 
@@ -360,8 +360,8 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 			b = append(b, 0x04, 0x40)       // if (void)
 			b = append(b, 0x20, l.AttemptStart)
 			b = append(b, 0x20, l.SimdMask)
-			b = append(b, 0x68)             // i32.ctz
-			b = append(b, 0x6A)             // i32.add
+			b = append(b, 0x68) // i32.ctz
+			b = append(b, 0x6A) // i32.add
 			b = append(b, 0x21, l.AttemptStart)
 			// br 3 exits $found_candidate (0=if 1=$simd_outer 2=$simd_exhausted 3=$found_candidate)
 			b = append(b, 0x0C, 0x03) // br 3 → $found_candidate
@@ -392,17 +392,17 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 
 		b = append(b, 0x20, l.AttemptStart)
 		b = append(b, 0x20, l.Len)
-		b = append(b, 0x4F)                  // i32.ge_u
-		b = append(b, 0x0D, skipdoneDepth)   // br_if → $skipdone
+		b = append(b, 0x4F)                // i32.ge_u
+		b = append(b, 0x0D, skipdoneDepth) // br_if → $skipdone
 
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, p.FirstByteOff)
 		b = append(b, 0x20, l.Ptr)
 		b = append(b, 0x20, l.AttemptStart)
-		b = append(b, 0x6A)             // i32.add
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (byte)
-		b = append(b, 0x6A)             // firstByteOff + byte
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (flag)
+		b = append(b, 0x6A)                      // i32.add
+		b = append(b, 0x2D, 0x00, 0x00)          // i32.load8_u (byte)
+		b = append(b, 0x6A)                      // firstByteOff + byte
+		b = append(b, 0x2D, 0x00, 0x00)          // i32.load8_u (flag)
 		b = append(b, 0x0D, foundCandidateDepth) // br_if → $found_candidate
 
 		b = append(b, 0x20, l.AttemptStart)
@@ -421,8 +421,8 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 		// Depth from $outer: (ed-1) to $no_match.
 		b = append(b, 0x20, l.AttemptStart)
 		b = append(b, 0x20, l.Len)
-		b = append(b, 0x4B)          // i32.gt_u
-		b = append(b, 0x0D, ed-1)   // br_if (ed-1) → $no_match
+		b = append(b, 0x4B)       // i32.gt_u
+		b = append(b, 0x0D, ed-1) // br_if (ed-1) → $no_match
 	}
 
 	// Scan complete: candidate at attempt_start. Call engine-specific setup.

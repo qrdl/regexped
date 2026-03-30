@@ -1,8 +1,8 @@
 package utils
 
 import (
-	"os"
 	"fmt"
+	"os"
 )
 
 const WasmPageSize = 65536 // 64 KB

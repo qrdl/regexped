@@ -128,6 +128,49 @@ In find mode, a compile-time-selected fast-skip prologue avoids testing every by
 
 Both mechanisms use WASM SIMD (simd128).
 
+### Literal-anchored find
+
+When a pattern's mandatory literal is at least 2 bytes long (up to 8 byte-alternating variants), the compiler may emit a three-phase find body that is substantially faster than scanning every start position with the full DFA.
+
+**Conditions for activation:**
+- find mode (`find_func` requested)
+- u8 DFA (≤ 256 states, no word boundaries)
+- a qualifying mandatory literal exists: ASCII, length ≥ 2, at most 8 alternates
+- the reversed-prefix DFA has ≤ 256 states
+- for non-anchored patterns: the reversed-prefix DFA start state does not accept the empty string
+
+**Three-phase runtime execution:**
+
+```
+Phase 1 — SIMD scan for the literal set
+  (Teddy / multi-eq / scalar, same as standard prefix scan)
+  candidate position → literal byte k found at attempt_start
+
+  Post-Teddy scalar verification (if literal > 2 bytes):
+    check all bytes of each literal variant at attempt_start
+    mismatch on all variants → attempt_start++, back to Phase 1
+
+Phase 2 — Backward DFA scan
+  reversed-prefix DFA runs right-to-left from attempt_start-1
+  finds the furthest-left position where the prefix matches
+  result: rev_result = match start candidate (or -1 → skip to next Phase 1 hit)
+
+Phase 3 — Forward DFA scan
+  full leftmost-first DFA starts at rev_result
+  runs forward to find the match end
+  match: return (rev_result << 32 | match_end)
+  no match: attempt_start++, back to Phase 1
+```
+
+**Why it is faster than a standard find scan:**
+
+The SIMD scan in Phase 1 typically eliminates ≥ 99% of input positions before any DFA runs — the mandatory literal is rare. The backward DFA in Phase 2 is compiled from the prefix sub-pattern only (typically a handful of states) and runs in reverse for a bounded short distance. The forward DFA in Phase 3 runs from a known candidate start rather than trying every position. The combination avoids the outer DFA loop over all start positions entirely.
+
+**Memory layout** (additional tables placed after the main DFA table):
+```
+[main LF DFA table] → [reversed-prefix DFA table] → [literal SIMD tables (firstByteFlags / Teddy T0 / Teddy T1)]
+```
+
 ---
 
 ## TDFA Engine (Tagged DFA)

@@ -187,13 +187,23 @@ func hasMemoryImportFromMain(data []byte) bool {
 			off += n
 		case 0x01: // table – reftype + limits
 			off++ // reftype
-			flags := data[off]; off++
-			_, n = utils.DecodeULEB128(data[off:]); off += n
-			if flags&0x01 != 0 { _, n = utils.DecodeULEB128(data[off:]); off += n }
+			flags := data[off]
+			off++
+			_, n = utils.DecodeULEB128(data[off:])
+			off += n
+			if flags&0x01 != 0 {
+				_, n = utils.DecodeULEB128(data[off:])
+				off += n
+			}
 		case 0x02: // memory – limits
-			flags := data[off]; off++
-			_, n = utils.DecodeULEB128(data[off:]); off += n
-			if flags&0x01 != 0 { _, n = utils.DecodeULEB128(data[off:]); off += n }
+			flags := data[off]
+			off++
+			_, n = utils.DecodeULEB128(data[off:])
+			off += n
+			if flags&0x01 != 0 {
+				_, n = utils.DecodeULEB128(data[off:])
+				off += n
+			}
 		case 0x03: // global – valtype + mutability
 			off += 2
 		}
