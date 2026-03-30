@@ -101,26 +101,26 @@ type compiledPattern struct {
 
 	tableEnd int64
 
-	// Split-pattern optimisation fields.
-	// splitBackwardScanBody != nil means this pattern uses the split find path:
-	//   an internal backward_scan function + a split_find function generated at
+	// Literal-anchored matching fields.
+	// litAnchorBackScanBody != nil means this pattern uses the literal-anchored find path:
+	//   an internal backward_scan function + a lit_anchor_find function generated at
 	//   assembleModule time (when the function index is known).
-	splitBackwardScanBody []byte     // size-prefixed backward_scan body; nil = no split
-	splitFindLayout       *dfaLayout // LF DFA layout for the forward scan in split_find
-	splitFindTable        *dfaTable  // LF DFA table for the forward scan in split_find
+	litAnchorBackScanBody []byte     // size-prefixed backward_scan body; nil = no lit-anchor
+	litAnchorFindLayout   *dfaLayout // LF DFA layout for the forward scan in lit_anchor_find
+	litAnchorFindTable    *dfaTable  // LF DFA table for the forward scan in lit_anchor_find
 	// SIMD scan tables for the literal set (stored in data segment, offsets known at compile time).
-	splitLitFirstByteOff   int32
-	splitLitFirstByteFlags [256]byte
-	splitLitFirstBytes     []byte
-	splitLitTeddyLoOff     int32
-	splitLitTeddyHiOff     int32
-	splitLitTeddyLoBytes   []byte
-	splitLitTeddyHiBytes   []byte
-	splitLitTeddyT1LoOff   int32
-	splitLitTeddyT1HiOff   int32
-	splitLitTeddyT1LoBytes []byte
-	splitLitTeddyT1HiBytes []byte
-	splitLitSet            [][]byte // raw literals for post-Teddy scalar verification
+	litAnchorFirstByteOff   int32
+	litAnchorFirstByteFlags [256]byte
+	litAnchorFirstBytes     []byte
+	litAnchorTeddyLoOff     int32
+	litAnchorTeddyHiOff     int32
+	litAnchorTeddyLoBytes   []byte
+	litAnchorTeddyHiBytes   []byte
+	litAnchorTeddyT1LoOff   int32
+	litAnchorTeddyT1HiOff   int32
+	litAnchorTeddyT1LoBytes []byte
+	litAnchorTeddyT1HiBytes []byte
+	litAnchorLitSet         [][]byte // raw literals for post-Teddy scalar verification
 }
 
 // funcCount returns the number of WASM functions this pattern contributes.
@@ -129,8 +129,8 @@ func (p *compiledPattern) funcCount() int {
 	if p.matchBody != nil {
 		n++
 	}
-	if p.splitBackwardScanBody != nil {
-		n += 2 // backward_scan + split_find
+	if p.litAnchorBackScanBody != nil {
+		n += 2 // backward_scan + lit_anchor_find
 	} else if p.findBody != nil {
 		n++
 	}
@@ -148,7 +148,7 @@ func (p *compiledPattern) funcCount() int {
 
 // offsets returns the sub-indices of each function within this pattern.
 // backwardScanOff is the index of backward_scan (-1 if no split).
-// findOff is the index of the find function (normal or split_find, -1 if absent).
+// findOff is the index of the find function (normal or lit_anchor_find, -1 if absent).
 // Returns -1 for absent functions.
 func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, captureOff, wrapperOff, namedWrapperOff int) {
 	matchOff, backwardScanOff, findOff, captureOff, wrapperOff, namedWrapperOff = -1, -1, -1, -1, -1, -1
@@ -157,7 +157,7 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 		matchOff = idx
 		idx++
 	}
-	if p.splitBackwardScanBody != nil {
+	if p.litAnchorBackScanBody != nil {
 		backwardScanOff = idx
 		idx++
 		findOff = idx
@@ -292,13 +292,13 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	if needFindBody {
-		// Check for split-pattern optimisation (anchored and non-anchored).
+		// Check for literal-anchored matching optimisation (anchored and non-anchored).
 		// Conditions: u8 DFA, no word boundary in main DFA.
 		// For non-anchored: reversed prefix start state must not accept the empty string.
-		sp := FindSplitPoint(re.Pattern)
-		if sp != nil && l.useU8 && !table.hasWordBoundary {
+		lap := FindLitAnchorPoint(re.Pattern)
+		if lap != nil && l.useU8 && !table.hasWordBoundary {
 			// Compile the reversed prefix DFA for the backward scan.
-			revRe := reverseRegexp(sp.PrefixRe)
+			revRe := reverseRegexp(lap.PrefixRe)
 			revSimplified := revRe.Simplify()
 			revProg, revCompErr := syntax.Compile(revSimplified)
 			if revCompErr == nil && !needsUnicodeSupport(revProg) {
@@ -308,22 +308,22 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				revDFA := newDFA(revProg, false, false)
 				revTable := dfaTableFrom(revDFA)
 				if revTable.numStates+1 <= 256 && // require u8 for simplicity
-					// For non-anchored splits the reversed prefix DFA start state must not
+					// For non-anchored literal-anchored matching the reversed prefix DFA start state must not
 					// accept the empty string; otherwise backward_scan would succeed at every
 					// candidate position without consuming any prefix characters.
-					(sp.Anchored || (!revTable.acceptStates[revTable.startState] &&
+					(lap.Anchored || (!revTable.acceptStates[revTable.startState] &&
 						!revTable.midAcceptStates[revTable.startState])) {
 					revTableBase := utils.PageAlign(l.tableEnd)
 					// Use needFind=true to include midAccept / midAcceptNL tables.
 					revL := buildDFALayout(revTable, revTableBase, true, false, 0)
 
 					// Backward scan function body (no function index needed — pure DFA).
-					bsBody := buildBackwardScanBody(revL, revTable)
+					bsBody := buildLitAnchorBackScanBody(revL, revTable)
 
 					// Compute SIMD tables for the literal set.
 					var litFirstBytes []byte
 					var litFirstByteFlags [256]byte
-					for _, lit := range sp.LitSet {
+					for _, lit := range lap.LitSet {
 						b0 := lit[0]
 						if litFirstByteFlags[b0] == 0 {
 							litFirstByteFlags[b0] = 1
@@ -355,7 +355,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						for i, fb := range litFirstBytes {
 							fbToBit[fb] = i
 						}
-						for _, lit := range sp.LitSet {
+						for _, lit := range lap.LitSet {
 							bit, ok := fbToBit[lit[0]]
 							if !ok {
 								continue
@@ -386,23 +386,23 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						}
 					}
 
-					// Populate compiledPattern with split fields.
+					// Populate compiledPattern with literal-anchored matching fields.
 					// The LF DFA data segments are still emitted (used by forward scan).
-					p.splitBackwardScanBody = bsBody
-					p.splitFindLayout = l
-					p.splitFindTable = table
-					p.splitLitFirstByteOff = litFirstByteOff
-					p.splitLitFirstByteFlags = litFirstByteFlags
-					p.splitLitFirstBytes = litFirstBytes
-					p.splitLitTeddyLoOff = litTeddyLoOff
-					p.splitLitTeddyHiOff = litTeddyHiOff
-					p.splitLitTeddyLoBytes = litTeddyLoBytes
-					p.splitLitTeddyHiBytes = litTeddyHiBytes
-					p.splitLitTeddyT1LoOff = litTeddyT1LoOff
-					p.splitLitTeddyT1HiOff = litTeddyT1HiOff
-					p.splitLitTeddyT1LoBytes = litTeddyT1LoBytes
-					p.splitLitTeddyT1HiBytes = litTeddyT1HiBytes
-					p.splitLitSet = sp.LitSet
+					p.litAnchorBackScanBody = bsBody
+					p.litAnchorFindLayout = l
+					p.litAnchorFindTable = table
+					p.litAnchorFirstByteOff = litFirstByteOff
+					p.litAnchorFirstByteFlags = litFirstByteFlags
+					p.litAnchorFirstBytes = litFirstBytes
+					p.litAnchorTeddyLoOff = litTeddyLoOff
+					p.litAnchorTeddyHiOff = litTeddyHiOff
+					p.litAnchorTeddyLoBytes = litTeddyLoBytes
+					p.litAnchorTeddyHiBytes = litTeddyHiBytes
+					p.litAnchorTeddyT1LoOff = litTeddyT1LoOff
+					p.litAnchorTeddyT1HiOff = litTeddyT1HiOff
+					p.litAnchorTeddyT1LoBytes = litTeddyT1LoBytes
+					p.litAnchorTeddyT1HiBytes = litTeddyT1HiBytes
+					p.litAnchorLitSet = lap.LitSet
 					// Append reversed DFA + literal SIMD data segments.
 					p.dataBytes = append(p.dataBytes, revRawData...)
 					p.dataSegCount += revSegCnt
@@ -417,7 +417,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				}
 			}
 		}
-		if p.splitBackwardScanBody == nil {
+		if p.litAnchorBackScanBody == nil {
 			// No split optimisation: use normal find body.
 			p.findBody = appendFindCodeEntry(nil, l, table, mandatoryLit)
 		}
@@ -426,8 +426,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))
 	p.dataBytes = append(p.dataBytes, rawData...)
 	p.dataSegCount += segCount
-	if p.splitBackwardScanBody == nil {
-		// For the split path the tableEnd was already set to include the split tables.
+	if p.litAnchorBackScanBody == nil {
+		// For the literal-anchored path the tableEnd was already set to include the lit-anchor tables.
 		p.tableEnd = l.tableEnd
 	}
 
@@ -480,8 +480,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if groupsEngine == EngineBacktrack {
 		bt := newBacktrack(prog)
 
-		// Stack placed directly after all find-mode DFA and split tables.
-		// p.tableEnd includes split reversed-DFA and SIMD tables when active;
+		// Stack placed directly after all find-mode DFA and lit-anchor tables.
+		// p.tableEnd includes lit-anchor reversed-DFA and SIMD tables when active;
 		// using l.tableEnd would overlap those tables and corrupt them at runtime.
 		btBase := utils.PageAlign(p.tableEnd)
 		numCapLocs := bt.numGroups * 2
@@ -566,9 +566,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		if p.matchBody != nil {
 			fs = append(fs, 0x00)
 		}
-		if p.splitBackwardScanBody != nil {
+		if p.litAnchorBackScanBody != nil {
 			fs = append(fs, 0x00) // backward_scan: (i32,i32)->i32
-			fs = append(fs, 0x01) // split_find: (i32,i32)->i64
+			fs = append(fs, 0x01) // lit_anchor_find: (i32,i32)->i64
 		} else if p.findBody != nil {
 			fs = append(fs, 0x01)
 		}
@@ -658,12 +658,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		if p.matchBody != nil {
 			cs = append(cs, p.matchBody...)
 		}
-		if p.splitBackwardScanBody != nil {
-			cs = append(cs, p.splitBackwardScanBody...)
-			// Generate split_find body now that function indices are known.
-			splitFindBody := buildSplitFindBody(p.splitFindTable, p.splitFindLayout, p, base+backwardScanOff)
-			cs = utils.AppendULEB128(cs, uint32(len(splitFindBody)))
-			cs = append(cs, splitFindBody...)
+		if p.litAnchorBackScanBody != nil {
+			cs = append(cs, p.litAnchorBackScanBody...)
+			// Generate lit_anchor_find body now that function indices are known.
+			litAnchorFindBody := buildLitAnchorFindBody(p.litAnchorFindTable, p.litAnchorFindLayout, p, base+backwardScanOff)
+			cs = utils.AppendULEB128(cs, uint32(len(litAnchorFindBody)))
+			cs = append(cs, litAnchorFindBody...)
 		} else if p.findBody != nil {
 			cs = append(cs, p.findBody...)
 		}

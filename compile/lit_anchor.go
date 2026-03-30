@@ -2,7 +2,7 @@ package compile
 
 import "regexp/syntax"
 
-// SplitPoint describes a three-way split of a regex pattern:
+// LitAnchorPoint describes a three-way literal-anchored split of a regex pattern:
 //
 //	PREFIX · LitSet · SUFFIX
 //
@@ -13,7 +13,7 @@ import "regexp/syntax"
 //
 // Anchored is true when PrefixRe begins with ^ or (?m:^), which means the
 // backward scan can stop at '\n' or pos 0 rather than running to a dead state.
-type SplitPoint struct {
+type LitAnchorPoint struct {
 	PrefixRe *syntax.Regexp
 	LitSet   [][]byte       // 1..8 ASCII literals, each len >= 2
 	SuffixRe *syntax.Regexp // includes the literal itself
@@ -150,10 +150,10 @@ func reverseRegexp(re *syntax.Regexp) *syntax.Regexp {
 	return n
 }
 
-// FindSplitPoint parses pattern and returns the first SplitPoint where the
-// top-level concat contains a qualifying literal set.  Returns nil when no
+// FindLitAnchorPoint parses pattern and returns the first LitAnchorPoint where
+// the top-level concat contains a qualifying literal set.  Returns nil when no
 // qualifying child is found.
-func FindSplitPoint(pattern string) *SplitPoint {
+func FindLitAnchorPoint(pattern string) *LitAnchorPoint {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
@@ -171,16 +171,16 @@ func FindSplitPoint(pattern string) *SplitPoint {
 		if lits == nil || len(lits) > 8 {
 			continue
 		}
-		sp := &SplitPoint{LitSet: lits}
+		lap := &LitAnchorPoint{LitSet: lits}
 
 		// PrefixRe: children [0, i)
 		switch i {
 		case 0:
-			sp.PrefixRe = &syntax.Regexp{Op: syntax.OpEmptyMatch}
+			lap.PrefixRe = &syntax.Regexp{Op: syntax.OpEmptyMatch}
 		case 1:
-			sp.PrefixRe = children[0]
+			lap.PrefixRe = children[0]
 		default:
-			sp.PrefixRe = &syntax.Regexp{
+			lap.PrefixRe = &syntax.Regexp{
 				Op:    syntax.OpConcat,
 				Sub:   children[:i],
 				Flags: re.Flags,
@@ -191,17 +191,17 @@ func FindSplitPoint(pattern string) *SplitPoint {
 		// forward DFA can be started at the match start and run forward.
 		remaining := children[i:]
 		if len(remaining) == 1 {
-			sp.SuffixRe = remaining[0]
+			lap.SuffixRe = remaining[0]
 		} else {
-			sp.SuffixRe = &syntax.Regexp{
+			lap.SuffixRe = &syntax.Regexp{
 				Op:    syntax.OpConcat,
 				Sub:   remaining,
 				Flags: re.Flags,
 			}
 		}
 
-		sp.Anchored = prefixStartsWithLineAnchor(sp.PrefixRe)
-		return sp
+		lap.Anchored = prefixStartsWithLineAnchor(lap.PrefixRe)
+		return lap
 	}
 	return nil
 }

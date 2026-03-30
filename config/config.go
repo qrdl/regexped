@@ -31,9 +31,9 @@ type RegexEntry struct {
 
 	// Optional function names — only those set are compiled and stubbed.
 	MatchFunc       string `yaml:"match_func"`        // anchored match → Option<usize>
-	FindFunc        string `yaml:"find_func"`          // non-anchored find → Option<(usize,usize)>
-	GroupsFunc      string `yaml:"groups_func"`        // anchored + captures → Option<Vec<Option<(usize,usize)>>>
-	NamedGroupsFunc string `yaml:"named_groups_func"`  // anchored + named captures → Option<HashMap<&'static str,(usize,usize)>>
+	FindFunc        string `yaml:"find_func"`         // non-anchored find → Option<(usize,usize)>
+	GroupsFunc      string `yaml:"groups_func"`       // anchored + captures → Option<Vec<Option<(usize,usize)>>>
+	NamedGroupsFunc string `yaml:"named_groups_func"` // anchored + named captures → Option<HashMap<&'static str,(usize,usize)>>
 }
 
 // CaptureStubsRequested reports whether any capture-returning stub is requested.
@@ -84,9 +84,9 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	}
 
 	// Resolve all paths relative to the config file's directory.
-	cfg.Output    = resolveRelative(configDir, cfg.Output)
+	cfg.Output = resolveRelative(configDir, cfg.Output)
 	cfg.WasmMerge = resolveRelative(configDir, cfg.WasmMerge)
-	cfg.WasmDir   = resolveRelative(configDir, cfg.WasmDir)
+	cfg.WasmDir = resolveRelative(configDir, cfg.WasmDir)
 
 	return cfg, nil
 }

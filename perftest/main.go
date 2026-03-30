@@ -195,7 +195,7 @@ var tests = []testCase{
 	},
 	{
 		// Email domain filter — non-anchored find with alternating literal "@foo.com"|"@bar.com".
-		// Baseline for the split-pattern non-anchored optimisation (Part 2).
+		// Baseline for the literal-anchored matching non-anchored optimisation.
 		// The literal alternation (foo|bar) sits at a bounded interior offset;
 		// currently the firstByteFlags scan fires on every alphabetic character.
 		name:    "email-domain-find",

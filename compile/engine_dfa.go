@@ -2530,8 +2530,8 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 	return b
 }
 
-// buildBackwardScanBody returns the size-prefixed WASM function body for the
-// backward scan helper used by the split-pattern find optimisation.
+// buildLitAnchorBackScanBody returns the size-prefixed WASM function body for the
+// backward scan helper used by the literal-anchored find optimisation.
 //
 // Signature: (ptr i32, scan_end i32) → i32
 //
@@ -2545,7 +2545,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 // newline boundary is hit, it records last_accept and terminates.
 //
 // Locals: ptr(0), scan_end(1), state(2), pos(3), last_accept(4), byte_or_class(5)
-func buildBackwardScanBody(revL *dfaLayout, revTable *dfaTable) []byte {
+func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable) []byte {
 	var b []byte
 
 	// ── local declarations ────────────────────────────────────────────────────
@@ -2712,7 +2712,7 @@ func buildBackwardScanBody(revL *dfaLayout, revTable *dfaTable) []byte {
 	return append(sz, b...)
 }
 
-// buildSplitFindBody returns the WASM function body for the split-pattern find
+// buildLitAnchorFindBody returns the WASM function body for the literal-anchored find
 // optimisation.  It performs three phases for each candidate position:
 //
 //  1. SIMD scan for the first byte of any literal in the literal set.
@@ -2731,19 +2731,19 @@ func buildBackwardScanBody(revL *dfaLayout, revTable *dfaTable) []byte {
 //	chunk(8)                                        — v128
 //	tLo(9), tHi(10)                                 — v128 (T0 Teddy, if applicable)
 //	chunk1(11), t1Lo(12), t1Hi(13)                  — v128 (T1 Teddy, if applicable)
-func buildSplitFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncIdx int) []byte {
+func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncIdx int) []byte {
 	var b []byte
 
 	// ── local declarations ────────────────────────────────────────────────────
-	hasT0 := len(p.splitLitTeddyLoBytes) > 0
-	hasT1 := len(p.splitLitTeddyT1LoBytes) > 0
+	hasT0 := len(p.litAnchorTeddyLoBytes) > 0
+	hasT1 := len(p.litAnchorTeddyT1LoBytes) > 0
 	numI32Locals := 6 // state(2), pos(3), attempt_start(4), last_accept(5), rev_result(6), simdMask_or_class(7)
 	var numV128Locals int
 	if hasT1 {
 		numV128Locals = 6 // chunk(8), tLo(9), tHi(10), chunk1(11), t1Lo(12), t1Hi(13)
 	} else if hasT0 {
 		numV128Locals = 3 // chunk(8), tLo(9), tHi(10)
-	} else if len(p.splitLitFirstBytes) > 0 && len(p.splitLitFirstBytes) <= 16 {
+	} else if len(p.litAnchorFirstBytes) > 0 && len(p.litAnchorFirstBytes) <= 16 {
 		numV128Locals = 1 // chunk(8)
 	} else {
 		numV128Locals = 0
@@ -2787,14 +2787,14 @@ func buildSplitFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncId
 	// EmitPrefixScan uses EngineDepth=2 (loop $lit_outer + block $no_match).
 	// OnMatch: nothing — attempt_start is set to the candidate position, fall through.
 	simdParams := PrefixScanParams{
-		FirstByteSet:   p.splitLitFirstBytes,
-		FirstByteFlags: p.splitLitFirstByteFlags,
-		FirstByteOff:   p.splitLitFirstByteOff,
-		TeddyLoOff:     p.splitLitTeddyLoOff,
-		TeddyHiOff:     p.splitLitTeddyHiOff,
+		FirstByteSet:   p.litAnchorFirstBytes,
+		FirstByteFlags: p.litAnchorFirstByteFlags,
+		FirstByteOff:   p.litAnchorFirstByteOff,
+		TeddyLoOff:     p.litAnchorTeddyLoOff,
+		TeddyHiOff:     p.litAnchorTeddyHiOff,
 		TeddyTwoByte:   hasT1,
-		TeddyT1LoOff:   p.splitLitTeddyT1LoOff,
-		TeddyT1HiOff:   p.splitLitTeddyT1HiOff,
+		TeddyT1LoOff:   p.litAnchorTeddyT1LoOff,
+		TeddyT1HiOff:   p.litAnchorTeddyT1HiOff,
 		EngineDepth:    2,
 		Locals: PrefixScanLocals{
 			Ptr:          locPtr,
@@ -2814,7 +2814,7 @@ func buildSplitFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncId
 
 	// ── Scalar literal verification ───────────────────────────────────────────
 	// After the SIMD scan places a candidate in attempt_start, verify that one
-	// of the literals in p.splitLitSet actually matches there byte-for-byte.
+	// of the literals in p.litAnchorLitSet actually matches there byte-for-byte.
 	// This eliminates false-positive Teddy hits (nibble tables are approximate
 	// and T1 covers at most 2 bytes) before paying the cost of a backward DFA call.
 	//
@@ -2829,16 +2829,16 @@ func buildSplitFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncId
 	//   0 = $lit_ok, 1 = $lit_outer, 2 = $no_match
 	// Inside block $try_litN:
 	//   0 = $try_litN, 1 = $lit_ok, 2 = $lit_outer, 3 = $no_match
-	if len(p.splitLitSet) > 0 {
+	if len(p.litAnchorLitSet) > 0 {
 		b = append(b, 0x02, 0x40) // block $lit_ok
-		for _, lit := range p.splitLitSet {
+		for _, lit := range p.litAnchorLitSet {
 			b = append(b, 0x02, 0x40) // block $try_litN
 			for k, byt := range lit {
 				// load input[ptr + attempt_start + k]
-				b = append(b, 0x20, locPtr)          // local.get ptr
-				b = append(b, 0x20, locAttemptStart) // local.get attempt_start
-				b = append(b, 0x6A)                  // i32.add
-				b = append(b, 0x2D, 0x00)            // i32.load8_u align=0
+				b = append(b, 0x20, locPtr)           // local.get ptr
+				b = append(b, 0x20, locAttemptStart)  // local.get attempt_start
+				b = append(b, 0x6A)                   // i32.add
+				b = append(b, 0x2D, 0x00)             // i32.load8_u align=0
 				b = utils.AppendULEB128(b, uint32(k)) // offset = k
 				// i32.const byt — must use SLEB128 since bytes 64-127 have bit 6 set
 				b = append(b, 0x41)
