@@ -2835,16 +2835,35 @@ func buildSplitFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncId
 	b = append(b, 0x0B)                  // end if
 
 	// ── Phase 3: forward DFA scan from rev_result ─────────────────────────────
-	// Initial state: if rev_result == 0 → wasmStart; else → wasmMidStartNewline.
+	// Initial state:
+	//   rev_result == 0              → wasmStart (match starts at input begin)
+	//   ptr[rev_result-1] == '\n'    → wasmMidStartNewline
+	//   otherwise                    → wasmMidStart
+	// For patterns without word boundaries wasmMidStart == wasmMidStartNewline;
+	// the byte check is still emitted for correctness and future-proofing.
 	b = append(b, 0x20, locRevResult) // local.get rev_result
 	b = append(b, 0x45)               // i32.eqz
-	b = append(b, 0x04, 0x7F)         // if (result i32)
+	b = append(b, 0x04, 0x7F)         // if (result i32) — start of input
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(l.wasmStart))
 	b = append(b, 0x05) // else
+	// load byte at ptr + rev_result - 1
+	b = append(b, 0x20, locPtr)       // local.get ptr
+	b = append(b, 0x20, locRevResult) // local.get rev_result
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6B)             // i32.sub (rev_result - 1)
+	b = append(b, 0x6A)             // i32.add (ptr + rev_result - 1)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x41, 0x0A)       // i32.const '\n'
+	b = append(b, 0x46)             // i32.eq
+	b = append(b, 0x04, 0x7F)       // if (result i32) — preceded by '\n'
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(l.wasmMidStartNewline))
-	b = append(b, 0x0B)           // end if
+	b = append(b, 0x05) // else
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(l.wasmMidStart))
+	b = append(b, 0x0B)           // end if newline
+	b = append(b, 0x0B)           // end if start
 	b = append(b, 0x21, locState) // local.set state
 
 	b = append(b, 0x20, locRevResult)

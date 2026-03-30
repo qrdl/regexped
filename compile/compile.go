@@ -291,10 +291,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	if needFindBody {
-		// Check for split-pattern optimisation (anchored patterns only for Part 1).
-		// Conditions: anchored split point, u8 DFA, no word boundary in main DFA.
+		// Check for split-pattern optimisation (anchored and non-anchored).
+		// Conditions: u8 DFA, no word boundary in main DFA.
+		// For non-anchored: reversed prefix start state must not accept the empty string.
 		sp := FindSplitPoint(re.Pattern)
-		if sp != nil && sp.Anchored && l.useU8 && !table.hasWordBoundary {
+		if sp != nil && l.useU8 && !table.hasWordBoundary {
 			// Compile the reversed prefix DFA for the backward scan.
 			revRe := reverseRegexp(sp.PrefixRe)
 			revSimplified := revRe.Simplify()
@@ -305,7 +306,12 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				// match start by scanning all the way back.
 				revDFA := newDFA(revProg, false, false)
 				revTable := dfaTableFrom(revDFA)
-				if revTable.numStates+1 <= 256 { // require u8 for simplicity
+				if revTable.numStates+1 <= 256 && // require u8 for simplicity
+					// For non-anchored splits the reversed prefix DFA start state must not
+					// accept the empty string; otherwise backward_scan would succeed at every
+					// candidate position without consuming any prefix characters.
+					(sp.Anchored || (!revTable.acceptStates[revTable.startState] &&
+						!revTable.midAcceptStates[revTable.startState])) {
 					revTableBase := utils.PageAlign(l.tableEnd)
 					// Use needFind=true to include midAccept / midAcceptNL tables.
 					revL := buildDFALayout(revTable, revTableBase, true, false, 0)
@@ -457,7 +463,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			groupsEngine = EngineBacktrack
 		} else {
 			p.isTDFA = true
-			tdfaBase := utils.PageAlign(l.tableEnd)
+			tdfaBase := utils.PageAlign(p.tableEnd)
 			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(nil))
 			p.numGroups = tt.numGroups
 			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout)
@@ -472,10 +478,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if groupsEngine == EngineBacktrack {
 		bt := newBacktrack(prog)
 
-		// Stack placed directly after LF DFA tables — no Phase 1 DFA needed.
-		// The wrapper already calls find_internal to locate the match; capture_internal
-		// receives the bounded slice (end_LF - start) and runs the NFA directly.
-		btBase := utils.PageAlign(l.tableEnd)
+		// Stack placed directly after all find-mode DFA and split tables.
+		// p.tableEnd includes split reversed-DFA and SIMD tables when active;
+		// using l.tableEnd would overlap those tables and corrupt them at runtime.
+		btBase := utils.PageAlign(p.tableEnd)
 		numCapLocs := bt.numGroups * 2
 		frameSize := 4 + numCapLocs*4 + 4
 		maxFrames := bt.numAlts * 4096
