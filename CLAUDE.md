@@ -109,7 +109,7 @@ An entry with no `_func` fields is valid — no WASM file is compiled and no stu
 
 Decision tree (in priority order):
 
-1. **TDFA** — has captures + no non-greedy quantifiers + no line anchors + no word boundaries + no ambiguous alternations + fits within state limit (default 512)
+1. **TDFA** — has captures + no non-greedy quantifiers + no line anchors + no word boundaries + no ambiguous alternations + fits within state limit (default 1024) AND register count ≤ MaxTDFARegs (default 32)
 2. **Backtracking** — has captures that don't qualify for TDFA
 3. **CompiledDFA (LeftmostFirst)** — user alternations (`|`) or nested quantifiers, minimised DFA ≤ 256 states
 4. **DFA (LeftmostFirst)** — user alternations or nested quantifiers, DFA > 256 states
@@ -174,7 +174,7 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 - `emitTDFATagOps` — majority-group optimization: minority transitions explicit, majority ops unconditional
 - `emitTDFAWriteCaptures` — writes final slot values to `out_ptr` at match acceptance
 
-**State limit:** default 512, configurable via `CompileOptions.MaxDFAStates` / `resolveTDFALimit(opts)`.
+**State limit:** default 1024, configurable via `CompileOptions.MaxDFAStates` / `resolveMaxDFAStates(opts)`. **Register limit:** default 32, configurable via `CompileOptions.MaxTDFARegs` / `resolveMaxTDFARegs(opts)`.
 
 #### `wasm.go` — WASM Encoding
 

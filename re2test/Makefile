@@ -21,7 +21,11 @@ $(ADJUSTED): $(TESTDATA)
 adjusted: $(ADJUSTED)
 	go run . --validate-groups $(ADJUSTED)
 
-test: exhaustive custom adjusted
+force-backtrack: $(ADJUSTED)
+	go run . --force-backtrack $(TESTDATA)
+	go run . --force-backtrack --validate-groups $(ADJUSTED)
+
+test: exhaustive custom adjusted force-backtrack
 
 clean:
 	rm -f $(TESTDATA) $(ADJUSTED)

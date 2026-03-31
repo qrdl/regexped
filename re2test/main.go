@@ -33,6 +33,7 @@ const (
 	skipBadSyntax   = "unsupported RE2 syntax (invalid escape sequence)"
 	skipParseError  = "parse/compile error"
 	skipOther       = "other reasons"
+	skipTimeout     = "timeout (exponential backtracking)"
 )
 
 // skipOrder controls the display order of skip reasons in the summary.
@@ -43,6 +44,7 @@ var skipOrder = []string{
 	skipStateLimit,
 	skipBadSyntax,
 	skipParseError,
+	skipTimeout,
 	"requires " + compile.EngineBacktrack.String(),
 	skipOther,
 }
@@ -52,6 +54,7 @@ func main() {
 	maxErrors := flag.Int("max-errors", 100, "stop after this many failures (0 = unlimited)")
 	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors, skips WASM testing)")
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
+	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find (sets MaxDFAStates=1 so DFA always overflows to BT)")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -59,13 +62,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups); err != nil {
+	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool) error {
+func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool) error {
 	f, err := os.Open(testFile)
 	if err != nil {
 		return err
@@ -110,6 +113,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 		npassCompiledDFA int
 		npassTDFA        int
 		npassBacktrack   int
+		npassBTMatchFind int // BT match/find (--force-backtrack)
 		skipCount        = make(map[string]int)
 	)
 
@@ -167,25 +171,31 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				continue
 			}
 
-			selOpts := compile.CompileOptions{MaxDFAStates: maxDFAStates}
-			engineType, selErr := compile.SelectEngine(pattern, selOpts)
-			if selErr != nil {
-				errStr := selErr.Error()
-				reason := skipParseError
-				switch {
-				case strings.Contains(errStr, "Unicode"):
-					reason = skipUnicode
-				case strings.Contains(errStr, "invalid escape sequence"):
-					reason = skipBadSyntax
+			var engineType compile.EngineType
+			if forceBacktrack {
+				engineType = compile.EngineBacktrack
+			} else {
+				selOpts := compile.CompileOptions{MaxDFAStates: maxDFAStates}
+				var selErr error
+				engineType, selErr = compile.SelectEngine(pattern, selOpts)
+				if selErr != nil {
+					errStr := selErr.Error()
+					reason := skipParseError
+					switch {
+					case strings.Contains(errStr, "Unicode"):
+						reason = skipUnicode
+					case strings.Contains(errStr, "invalid escape sequence"):
+						reason = skipBadSyntax
+					}
+					skipCount[reason] += len(testStrings)
+					input = append([]string(nil), testStrings...)
+					continue
 				}
-				skipCount[reason] += len(testStrings)
-				input = append([]string(nil), testStrings...)
-				continue
-			}
-			if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineBacktrack && engineType != compile.EngineTDFA {
-				skipCount["requires "+engineType.String()] += len(testStrings)
-				input = append([]string(nil), testStrings...)
-				continue
+				if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineBacktrack && engineType != compile.EngineTDFA {
+					skipCount["requires "+engineType.String()] += len(testStrings)
+					input = append([]string(nil), testStrings...)
+					continue
+				}
 			}
 
 			// Compile a single standalone WASM module containing all functions.
@@ -194,10 +204,14 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				MatchFunc: "match",
 				FindFunc:  "find",
 			}
-			if engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA {
+			if !forceBacktrack && (engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA) {
 				re.GroupsFunc = "groups"
 			}
-			wasmBytes, _, compErr := compile.Compile([]config.RegexEntry{re}, tableBase, true)
+			var compileOpts compile.CompileOptions
+			if forceBacktrack {
+				compileOpts.ForceEngine = compile.EngineBacktrack
+			}
+			wasmBytes, _, compErr := compile.Compile([]config.RegexEntry{re}, tableBase, true, compileOpts)
 			if compErr != nil {
 				errStr := compErr.Error()
 				reason := skipOther
@@ -226,7 +240,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				memory = exp.Memory()
 			}
 			findMemory = memory
-			isCompiledDFA = (engineType == compile.EngineCompiledDFA)
+			isCompiledDFA = !forceBacktrack && (engineType == compile.EngineCompiledDFA)
 
 			if re.GroupsFunc != "" {
 				groupsFn = inst.GetFunc(store, "groups")
@@ -360,6 +374,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						got, callErr := callFind(wd, store, findFn, findMemory, text)
 						if callErr != nil {
 							if isTimeout(callErr) {
+								if forceBacktrack {
+									store, matchFn, memory = nil, nil, nil
+									findFn, findMemory = nil, nil
+									skipCount[skipTimeout]++
+									continue
+								}
 								return fmt.Errorf("TIMEOUT: find pattern=%q input=%q", pattern, text)
 							}
 							return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
@@ -368,7 +388,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						expected := parseCol1(col1)
 						if got == expected {
 							npass++
-							if isCompiledDFA {
+							if forceBacktrack {
+								npassBTMatchFind++
+							} else if isCompiledDFA {
 								npassCompiledDFA++
 							} else {
 								npassDFA++
@@ -393,6 +415,11 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
 					if callErr != nil {
 						if isTimeout(callErr) {
+							if forceBacktrack {
+								groupsStore, groupsFn, groupsMemory = nil, nil, nil
+								skipCount[skipTimeout]++
+								continue
+							}
 							return fmt.Errorf("TIMEOUT: groups pattern=%q input=%q", pattern, text)
 						}
 						return fmt.Errorf("%s:%d: wasm groups call pattern=%q input=%q: %w",
@@ -442,6 +469,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					got, callErr := callMatch(wd, store, matchFn, memory, text)
 					if callErr != nil {
 						if isTimeout(callErr) {
+							if forceBacktrack {
+								store, matchFn, memory = nil, nil, nil
+								findFn, findMemory = nil, nil
+								skipCount[skipTimeout]++
+								continue
+							}
 							return fmt.Errorf("TIMEOUT: match pattern=%q input=%q", pattern, text)
 						}
 						return fmt.Errorf("%s:%d: wasm call pattern=%q input=%q: %w",
@@ -450,7 +483,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					expected := parseCol0(col0)
 					if got == expected {
 						npass++
-						if isCompiledDFA {
+						if forceBacktrack {
+							npassBTMatchFind++
+						} else if isCompiledDFA {
 							npassCompiledDFA++
 						} else {
 							npassDFA++
@@ -479,6 +514,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						r, callErr := callFind(wd, store, findFn, findMemory, text[offset:])
 						if callErr != nil {
 							if isTimeout(callErr) {
+								if forceBacktrack {
+									store, matchFn, memory = nil, nil, nil
+									findFn, findMemory = nil, nil
+									skipCount[skipTimeout]++
+									goto nextResultLine
+								}
 								return fmt.Errorf("TIMEOUT: find-iter pattern=%q input=%q", pattern, text)
 							}
 							return fmt.Errorf("%s:%d: wasm find-iter call pattern=%q input=%q: %w",
@@ -507,7 +548,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						}
 					} else {
 						npass++
-						if isCompiledDFA {
+						if forceBacktrack {
+							npassBTMatchFind++
+						} else if isCompiledDFA {
 							npassCompiledDFA++
 						} else {
 							npassDFA++
@@ -520,6 +563,11 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
 					if callErr != nil {
 						if isTimeout(callErr) {
+							if forceBacktrack {
+								groupsStore, groupsFn, groupsMemory = nil, nil, nil
+								skipCount[skipTimeout]++
+								goto nextResultLine
+							}
 							return fmt.Errorf("TIMEOUT: groups-find pattern=%q input=%q", pattern, text)
 						}
 						return fmt.Errorf("%s:%d: wasm groups-find call pattern=%q input=%q: %w",
@@ -560,6 +608,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						}
 					}
 				}
+			nextResultLine:
 			} // end !validateGo
 		default:
 			return fmt.Errorf("%s:%d: unexpected line: %s", testFile, lineno, line)
@@ -585,6 +634,9 @@ done:
 	fmt.Printf("  %-38s %d\n", "Compiled DFA:", npassCompiledDFA)
 	fmt.Printf("  %-38s %d\n", "TDFA:", npassTDFA)
 	fmt.Printf("  %-38s %d\n", "Backtrack:", npassBacktrack)
+	if npassBTMatchFind > 0 {
+		fmt.Printf("  %-38s %d\n", "Backtrack (match/find):", npassBTMatchFind)
+	}
 	fmt.Printf("failed:  %d\n", nfail)
 	if nDataErrors > 0 {
 		fmt.Printf("data errors (--validate-go): %d\n", nDataErrors)

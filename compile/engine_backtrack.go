@@ -484,7 +484,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackBase, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackBase, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nil, nil)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -499,6 +499,12 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 // memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte are the
 // memo locals/constants; useMemo enables bit check/set for non-greedy zero-
 // matchable loop heads.
+// noCaptures: when true, InstCapture is treated as NOP and InstMatch calls instMatchFn.
+// instMatchFn: emits match action for InstMatch when noCaptures is true.
+//
+//	second arg is brRunNested (depth from inside one if-block to restart $run).
+//
+// overflowFn: emits stack-overflow return code for btPushFrame (nil = i32.const -1; return).
 func emitBTInstHandler(
 	body []byte,
 	bt *backtrack,
@@ -513,6 +519,9 @@ func emitBTInstHandler(
 	memoTableBase int32,
 	memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte uint32,
 	useMemo bool,
+	noCaptures bool,
+	instMatchFn func([]byte, uint32) []byte,
+	overflowFn func([]byte) []byte,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
@@ -554,7 +563,7 @@ func emitBTInstHandler(
 		isLoop := bt.loops[p]
 		if !isLoop {
 			// Non-loop alternation: push retry=inst.Arg, continue with inst.Out
-			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize)
+			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, overflowFn)
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 		} else {
 			// Loop alternation: zero-progress guard
@@ -669,11 +678,16 @@ func emitBTInstHandler(
 			}
 
 			// Push retry=inst.Arg, continue with inst.Out
-			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize)
+			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, overflowFn)
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 		}
 
 	case syntax.InstCapture:
+		if noCaptures {
+			// No capture tracking — treat as NOP, follow inst.Out.
+			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			break
+		}
 		// inst.Arg: even = open (store pos as group start), odd = close (store pos as group end)
 		groupIdx := int(inst.Arg >> 1)
 		isOpen := inst.Arg&1 == 0
@@ -727,6 +741,11 @@ func emitBTInstHandler(
 		body = btSetStateAndBr(body, int32(inst.Out), brRun)
 
 	case syntax.InstMatch:
+		if noCaptures && instMatchFn != nil {
+			// No capture tracking — caller-provided match action.
+			body = instMatchFn(body, brRunNested)
+			break
+		}
 		// RE2 semantics: only accept if the full input slice is consumed.
 		// The caller sets len = DFA-determined end, so pos must equal len.
 		body = append(body, 0x20, localPos)
@@ -955,7 +974,7 @@ func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 // btPushFrame pushes a backtrack frame. stackLimit and frameSize are passed
 // so we can guard against stack overflow: if sp+frameSize > stackLimit, set
 // state=-1 (fail) and return instead of writing past allocated memory.
-func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSize int32) []byte {
+func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSize int32, overflowFn func([]byte) []byte) []byte {
 	// Guard: if sp + frameSize > stackLimit → fail (treat as no-match).
 	b = append(b, 0x20, localSP)
 	b = append(b, 0x41)
@@ -965,9 +984,13 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSi
 	b = utils.AppendSLEB128(b, stackLimit)
 	b = append(b, 0x4B)       // i32.gt_u
 	b = append(b, 0x04, 0x40) // if void
-	b = append(b, 0x41, 0x7F) // i32.const -1
-	b = append(b, 0x0F)       // return
-	b = append(b, 0x0B)       // end if
+	if overflowFn != nil {
+		b = overflowFn(b)
+	} else {
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x0F)       // return
+	}
+	b = append(b, 0x0B) // end if
 
 	// pos at offset 0
 	b = append(b, 0x20, localSP)
@@ -1152,4 +1175,595 @@ func btFoldRune(r rune) rune {
 		return r + 32
 	}
 	return r
+}
+
+// --------------------------------------------------------------------------
+// No-capture BT match and find bodies
+
+// compileBTProg parses pattern, strips captures, and compiles the NFA for use
+// in a no-capture BT match/find body.
+func compileBTProg(pattern string) (*syntax.Prog, error) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, err
+	}
+	stripCaptures(re)
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		return nil, err
+	}
+	return prog, nil
+}
+
+// btAllocSizes returns (stackSize, memoSize) in bytes for a no-capture BT engine.
+// frameSize is always 8 (pos + retryPC, no cap slots).
+// memoBudget is the maximum bytes to allocate for the BitState bitset.
+func btAllocSizes(bt *backtrack, useMemo bool, _ int, memoBudget int) (stackSize, memoSize int) {
+	frameSize := 8 // pos(4) + retryPC(4)
+	maxFrames := bt.numAlts * 4096
+	if maxFrames < 4096 {
+		maxFrames = 4096
+	}
+	stackSize = maxFrames * frameSize
+	if useMemo && memoBudget > 0 {
+		memoSize = memoBudget
+	}
+	return
+}
+
+// btMemoMaxLenFor returns the maximum input length supported by BitState memo
+// for a prog with the given budget (bytes).
+func btMemoMaxLenFor(prog *syntax.Prog, memoBudget int) int {
+	N := len(prog.Inst)
+	if N == 0 {
+		return 0
+	}
+	return memoBudget*8/N - 1
+}
+
+// nfaFirstBytes walks the NFA from prog.Start via epsilon transitions and
+// collects the set of bytes that can begin a match.
+// Returns (firstBytes, flags, allBytes) where allBytes is true when any byte
+// is possible (InstRuneAny / InstRuneAnyNotNL reachable).
+func nfaFirstBytes(prog *syntax.Prog) (firstBytes []byte, flags [256]byte, allBytes bool) {
+	visited := make([]bool, len(prog.Inst))
+	queue := []int{prog.Start}
+	for len(queue) > 0 {
+		pc := queue[0]
+		queue = queue[1:]
+		if visited[pc] {
+			continue
+		}
+		visited[pc] = true
+		inst := prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstRune1:
+			r := inst.Rune[0]
+			if r <= 127 {
+				b := byte(r)
+				if flags[b] == 0 {
+					flags[b] = 1
+					firstBytes = append(firstBytes, b)
+				}
+				if syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
+					var alt byte
+					if b >= 'a' && b <= 'z' {
+						alt = b - 32
+					} else if b >= 'A' && b <= 'Z' {
+						alt = b + 32
+					}
+					if alt != 0 && alt != b && flags[alt] == 0 {
+						flags[alt] = 1
+						firstBytes = append(firstBytes, alt)
+					}
+				}
+			}
+		case syntax.InstRune:
+			isFold := syntax.Flags(inst.Arg)&syntax.FoldCase != 0
+			for i := 0; i < len(inst.Rune); i += 2 {
+				var lo, hi rune
+				if i+1 < len(inst.Rune) {
+					lo, hi = inst.Rune[i], inst.Rune[i+1]
+				} else {
+					lo = inst.Rune[i]
+					hi = inst.Rune[i] // single-rune entry at odd position
+				}
+				for r := lo; r <= hi && r <= 127; r++ {
+					b := byte(r)
+					if flags[b] == 0 {
+						flags[b] = 1
+						firstBytes = append(firstBytes, b)
+					}
+					if isFold {
+						var alt byte
+						if b >= 'a' && b <= 'z' {
+							alt = b - 32
+						} else if b >= 'A' && b <= 'Z' {
+							alt = b + 32
+						}
+						if alt != 0 && alt != b && flags[alt] == 0 {
+							flags[alt] = 1
+							firstBytes = append(firstBytes, alt)
+						}
+					}
+				}
+			}
+		case syntax.InstRuneAny, syntax.InstRuneAnyNotNL, syntax.InstMatch:
+			return nil, [256]byte{}, true
+		default:
+			queue = append(queue, int(inst.Out))
+			if inst.Op == syntax.InstAlt || inst.Op == syntax.InstAltMatch {
+				queue = append(queue, int(inst.Arg))
+			}
+		}
+	}
+	return firstBytes, flags, false
+}
+
+// buildBTScanTables computes the SIMD scan tables for BT find from the NFA first
+// bytes and returns (PrefixScanParams, raw data segment bytes (no count prefix), segCount).
+// tableBase is the memory address where the tables will be stored.
+func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes bool, tableBase int64) (PrefixScanParams, []byte, int) {
+	if allBytes || len(firstBytes) == 0 {
+		// Scalar fallback: store 256-byte flag table.
+		off := int32(tableBase)
+		var segs []byte
+		var fb [256]byte
+		if allBytes {
+			for i := range fb {
+				fb[i] = 1
+			}
+		} else {
+			fb = firstByteFlags
+		}
+		segs = appendDataSegment(segs, off, fb[:])
+		params := PrefixScanParams{
+			FirstByteSet:   firstBytes,
+			FirstByteFlags: firstByteFlags,
+			FirstByteOff:   off,
+			Locals: PrefixScanLocals{
+				Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8,
+				Chunk: 9, TLo: 10, THi: 11, Chunk1: 12, T1Lo: 13, T1Hi: 14,
+			},
+			EngineDepth: 2,
+		}
+		return params, segs, 1
+	}
+
+	firstByteOff := int32(tableBase)
+	teddyLoOff := firstByteOff + 256
+	teddyHiOff := teddyLoOff + 16
+
+	var segs []byte
+	segCnt := 1
+	segs = appendDataSegment(segs, firstByteOff, firstByteFlags[:])
+
+	var teddyLoBytes, teddyHiBytes []byte
+	if len(firstBytes) <= 8 {
+		teddyLoBytes = make([]byte, 16)
+		teddyHiBytes = make([]byte, 16)
+		for i, fb := range firstBytes {
+			teddyLoBytes[fb&0x0F] |= byte(1 << uint(i))
+			teddyHiBytes[fb>>4] |= byte(1 << uint(i))
+		}
+		segs = appendDataSegment(segs, teddyLoOff, teddyLoBytes)
+		segs = appendDataSegment(segs, teddyHiOff, teddyHiBytes)
+		segCnt += 2
+	}
+
+	params := PrefixScanParams{
+		FirstByteSet:   firstBytes,
+		FirstByteFlags: firstByteFlags,
+		FirstByteOff:   firstByteOff,
+		TeddyLoOff:     teddyLoOff,
+		TeddyHiOff:     teddyHiOff,
+		TeddyTwoByte:   false,
+		Locals: PrefixScanLocals{
+			Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8,
+			Chunk: 9, TLo: 10, THi: 11, Chunk1: 12, T1Lo: 13, T1Hi: 14,
+		},
+		EngineDepth: 2,
+	}
+
+	return params, segs, segCnt
+}
+
+// --------------------------------------------------------------------------
+// buildBTInnerDisp emits the NFA dispatch body (FAIL handler + N blocks + br_table +
+// per-PC handlers) for insertion inside a pre-opened "loop $run".
+//
+// The caller is responsible for opening "loop $run" (0x03, 0x40) before calling
+// and closing "end $run" (0x0B) after the returned bytes.
+//
+// loopLocalIdx maps loop-PC → WASM local index (computed by the caller with the
+// correct local layout for the enclosing function).
+//
+// failEmptyStack: emits WASM for when the backtrack stack is exhausted.
+//   - For match: append(b, 0x41, 0x7F, 0x0F)  // i32.const -1; return
+//   - For find:  append(b, 0x0C, 0x03)          // br 3 → exit $run_exit
+//
+// instMatchFn: emits WASM for when InstMatch is reached.
+//
+//	second arg is brRunNested (depth from inside one if-block to restart $run).
+//
+// overflowFn: emits the return code when the BT stack overflows (nil = i32.const -1; return).
+func buildBTInnerDisp(
+	body []byte,
+	bt *backtrack,
+	loopLocalIdx map[int]uint32,
+	stackBase, stackLimit, frameSize int32,
+	memoTableBase int32,
+	memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte uint32,
+	useMemo bool,
+	failEmptyStack func([]byte) []byte,
+	instMatchFn func([]byte, uint32) []byte,
+	overflowFn func([]byte) []byte,
+) []byte {
+	numCapLocals := 0
+	prog := bt.prog
+	N := len(prog.Inst)
+
+	// ── FAIL handler (state == -1) ──
+	body = append(body, 0x20, localState, 0x41, 0x7F, 0x46, 0x04, 0x40) // state==-1; if void
+	body = append(body, 0x20, localSP, 0x41)
+	body = utils.AppendSLEB128(body, stackBase)
+	body = append(body, 0x4D, 0x04, 0x40) // i32.le_u; if void (empty stack)
+	body = failEmptyStack(body)
+	body = append(body, 0x0B) // end of (empty stack) if
+	// Pop frame: sp -= frameSize
+	body = append(body, 0x20, localSP, 0x41)
+	body = utils.AppendSLEB128(body, frameSize)
+	body = append(body, 0x6B, 0x21, localSP) // i32.sub; local.set sp
+	// Restore pos = mem[sp+0]
+	body = append(body, 0x20, localSP, 0x28, 0x02)
+	body = utils.AppendULEB128(body, 0)
+	body = append(body, 0x21, localPos)
+	// Restore retryPC = mem[sp+4]
+	retryOff := uint32(4 + numCapLocals*4)
+	body = append(body, 0x20, localSP, 0x28, 0x02)
+	body = utils.AppendULEB128(body, retryOff)
+	body = append(body, 0x21, localState)
+	body = append(body, 0x0C, 0x01) // br 1 → restart $run
+	body = append(body, 0x0B)       // end of (state==-1) if
+
+	// ── N nested blocks for PC dispatch ──
+	for i := 0; i < N; i++ {
+		body = append(body, 0x02, 0x40)
+	}
+	// br_table on state
+	body = append(body, 0x20, localState, 0x0E)
+	body = utils.AppendULEB128(body, uint32(N))
+	for i := 0; i < N; i++ {
+		body = utils.AppendULEB128(body, uint32(i))
+	}
+	body = utils.AppendULEB128(body, 0) // default
+
+	// ── Per-PC handlers ──
+	emptySnapBase := map[int]uint32{}
+	emptySnapLocals := map[int][]uint32{}
+	for p := 0; p < N; p++ {
+		body = append(body, 0x0B) // end block $pc_p
+		inst := prog.Inst[p]
+		brRun := uint32(N - 1 - p)
+		body = emitBTInstHandler(
+			body, bt, p, inst, brRun,
+			loopLocalIdx, emptySnapBase, emptySnapLocals,
+			stackBase, stackLimit, frameSize, numCapLocals,
+			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
+			useMemo,
+			true,
+			instMatchFn,
+			overflowFn,
+		)
+	}
+	return body
+}
+
+// --------------------------------------------------------------------------
+// appendBTMatchCodeEntry / buildBTMatchBody
+
+// appendBTMatchCodeEntry appends a size-prefixed no-capture BT match body.
+// Signature: (ptr i32, len i32) → i32
+// Returns match end position (≥ 0) on success, -1 on failure.
+func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool) []byte {
+	body := buildBTMatchBody(bt, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen, useMemo)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildBTMatchBody emits the full WASM function body for a no-capture BT match.
+//
+// Local layout (function type: (i32,i32)→i32):
+//
+//	Params:  ptr(0), len(1)
+//	Locals:  fake_out_ptr(2) [aligns pkg constants], pos(3), sp(4), state(5),
+//	         scratch(6), loop_pos(7+), memo(7+numLoops+)
+//
+// The fake_out_ptr at index 2 aligns the remaining locals with the package-level
+// constants (localPos=3, localSP=4, localState=5, localScratch=6) so all
+// existing helper functions (btFail, btSetStateAndBr, etc.) can be reused.
+func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool) []byte {
+	prog := bt.prog
+	N := len(prog.Inst)
+
+	loopPCsSorted := make([]int, 0, len(bt.loops))
+	for pc := range bt.loops {
+		loopPCsSorted = append(loopPCsSorted, pc)
+	}
+	sort.Ints(loopPCsSorted)
+	loopLocalIdx := make(map[int]uint32, len(loopPCsSorted))
+	for j, pc := range loopPCsSorted {
+		loopLocalIdx[pc] = uint32(7 + j)
+	}
+
+	memoLocalsCount := 0
+	var memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen, memoZeroIdx uint32
+	if useMemo {
+		memoLocalsCount = 6
+		base := uint32(7 + len(loopPCsSorted))
+		memoLenPlus1 = base
+		memoBitIdx = base + 1
+		memoByteAddr = base + 2
+		memoMemoByte = base + 3
+		memoZeroLen = base + 4
+		memoZeroIdx = base + 5
+	}
+
+	// +1 for fake out_ptr at index 2
+	totalLocals := 4 + len(loopPCsSorted) + memoLocalsCount + 1
+
+	var body []byte
+	body = append(body, 0x01)
+	body = utils.AppendULEB128(body, uint32(totalLocals))
+	body = append(body, 0x7F)
+
+	// pos=0, sp=stackBase, state=prog.Start
+	body = append(body, 0x41, 0x00, 0x21, localPos)
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, stackBase)
+	body = append(body, 0x21, localSP)
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, int32(prog.Start))
+	body = append(body, 0x21, localState)
+
+	for _, ll := range loopLocalIdx {
+		body = append(body, 0x41, 0x7F, 0x21)
+		body = utils.AppendULEB128(body, ll)
+	}
+
+	if useMemo {
+		body = emitBTMemoZeroInit(body, memoTableBase, N, memoLenPlus1, memoZeroLen, memoZeroIdx)
+	}
+
+	// loop $run
+	body = append(body, 0x03, 0x40)
+
+	failEmpty := func(b []byte) []byte { return append(b, 0x41, 0x7F, 0x0F) } // i32.const -1; return
+	// matchFn: LF semantics — accept at first InstMatch, return pos.
+	matchFn := func(b []byte, _ uint32) []byte {
+		b = append(b, 0x20, localPos, 0x0F) // local.get pos; return
+		return b
+	}
+
+	body = buildBTInnerDisp(body, bt, loopLocalIdx,
+		stackBase, stackLimit, frameSize,
+		memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
+		useMemo, failEmpty, matchFn, nil)
+
+	body = append(body, 0x00)       // unreachable
+	body = append(body, 0x0B)       // end loop $run
+	body = append(body, 0x41, 0x7F) // i32.const -1
+	body = append(body, 0x0B)       // end function
+	return body
+}
+
+// emitBTMemoZeroInit emits the memo bitset zero-initialisation loop.
+func emitBTMemoZeroInit(body []byte, memoTableBase int32, N int,
+	memoLenPlus1, memoZeroLen, memoZeroIdx uint32) []byte {
+
+	// lenPlus1 = localLen + 1
+	body = append(body, 0x20, localLen, 0x41, 0x01, 0x6A, 0x21)
+	body = utils.AppendULEB128(body, memoLenPlus1)
+	// memoZeroLen = (N * lenPlus1 + 7) / 8
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, int32(N))
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoLenPlus1)
+	body = append(body, 0x6C, 0x41, 0x07, 0x6A, 0x41, 0x03, 0x76, 0x21)
+	body = utils.AppendULEB128(body, memoZeroLen)
+	// memoZeroIdx = 0
+	body = append(body, 0x41, 0x00, 0x21)
+	body = utils.AppendULEB128(body, memoZeroIdx)
+
+	body = append(body, 0x02, 0x40) // block $zeroEnd
+	body = append(body, 0x03, 0x40) // loop $zeroLoop
+
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoZeroIdx)
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoZeroLen)
+	body = append(body, 0x4F, 0x0D, 0x01) // i32.ge_u; br_if $zeroEnd
+
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, memoTableBase)
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoZeroIdx)
+	body = append(body, 0x6A, 0x41, 0x00, 0x3A, 0x00)
+	body = utils.AppendULEB128(body, 0)
+
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoZeroIdx)
+	body = append(body, 0x41, 0x01, 0x6A, 0x21)
+	body = utils.AppendULEB128(body, memoZeroIdx)
+
+	body = append(body, 0x0C, 0x00) // br $zeroLoop
+	body = append(body, 0x0B)       // end loop
+	body = append(body, 0x0B)       // end block $zeroEnd
+	return body
+}
+
+// --------------------------------------------------------------------------
+// appendBTFindCodeEntry / buildBTFindBody
+
+// appendBTFindCodeEntry appends a size-prefixed no-capture BT find body.
+// Signature: (ptr i32, len i32) → i64
+// Returns (start << 32 | end) on match, -1 on no match.
+func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams PrefixScanParams,
+	stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool) []byte {
+	body := buildBTFindBody(bt, scanParams, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen, useMemo)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildBTFindBody emits the full WASM function body for a no-capture BT find.
+//
+// Local layout (function type: (i32,i32)→i64):
+//
+//	Params:   ptr(0), len(1)
+//	i32 fixed: fake_out_ptr(2), pos(3), sp(4), state(5), scratch(6),
+//	           attempt_start(7), simd_mask(8)
+//	v128:     chunk(9), tLo(10), tHi(11), [chunk1(12), t1Lo(13), t1Hi(14)] if T1
+//	i32 rest: loop_pos(9+numV128+j ...), memo(...)
+func buildBTFindBody(bt *backtrack, scanParams PrefixScanParams,
+	stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool) []byte {
+	prog := bt.prog
+	N := len(prog.Inst)
+
+	// Number of v128 locals needed by EmitPrefixScan.
+	var numV128Locals int
+	if len(scanParams.Prefix) >= 1 {
+		numV128Locals = 1
+	} else if scanParams.TeddyTwoByte {
+		numV128Locals = 6
+	} else if len(scanParams.FirstByteSet) > 0 && len(scanParams.FirstByteSet) <= 8 {
+		numV128Locals = 3
+	} else if len(scanParams.FirstByteSet) > 0 && len(scanParams.FirstByteSet) <= 16 {
+		numV128Locals = 1
+	}
+
+	// loop_pos locals start at index 9+numV128Locals.
+	loopLocalsBase := uint32(9 + numV128Locals)
+
+	loopPCsSorted := make([]int, 0, len(bt.loops))
+	for pc := range bt.loops {
+		loopPCsSorted = append(loopPCsSorted, pc)
+	}
+	sort.Ints(loopPCsSorted)
+	loopLocalIdx := make(map[int]uint32, len(loopPCsSorted))
+	for j, pc := range loopPCsSorted {
+		loopLocalIdx[pc] = loopLocalsBase + uint32(j)
+	}
+
+	memoLocalsCount := 0
+	var memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen, memoZeroIdx uint32
+	if useMemo {
+		memoLocalsCount = 6
+		base := loopLocalsBase + uint32(len(loopPCsSorted))
+		memoLenPlus1 = base
+		memoBitIdx = base + 1
+		memoByteAddr = base + 2
+		memoMemoByte = base + 3
+		memoZeroLen = base + 4
+		memoZeroIdx = base + 5
+	}
+
+	// Declare three local groups so that v128 indices are stable regardless of
+	// how many loop or memo i32 locals follow:
+	//   Group 1: 7 fixed i32s (fake, pos, sp, state, scratch, attempt_start, simd_mask) → idx 2..8
+	//   Group 2: numV128Locals v128s → idx 9..9+numV128-1
+	//   Group 3: loop + memo i32s → idx 9+numV128..
+	// This matches loopLocalsBase = 9 + numV128Locals exactly.
+	numLoopAndMemoLocals := len(loopPCsSorted) + memoLocalsCount
+	var body []byte
+	if numV128Locals > 0 {
+		numGroups := byte(2)
+		if numLoopAndMemoLocals > 0 {
+			numGroups = 3
+		}
+		body = append(body, numGroups)
+		body = utils.AppendULEB128(body, 7)
+		body = append(body, 0x7F) // 7 fixed i32s
+		body = utils.AppendULEB128(body, uint32(numV128Locals))
+		body = append(body, 0x7B) // numV128 v128s
+		if numLoopAndMemoLocals > 0 {
+			body = utils.AppendULEB128(body, uint32(numLoopAndMemoLocals))
+			body = append(body, 0x7F) // loop+memo i32s
+		}
+	} else {
+		body = append(body, 0x01)
+		body = utils.AppendULEB128(body, uint32(7+numLoopAndMemoLocals))
+		body = append(body, 0x7F)
+	}
+
+	// block $no_match / loop $outer
+	const locAttemptStart = byte(0x07)
+	body = append(body, 0x02, 0x40)
+	body = append(body, 0x03, 0x40)
+
+	scanParams.EngineDepth = 2
+	scanParams.OnMatch = func(b []byte) []byte {
+		// Re-init BT state.
+		b = append(b, 0x20, locAttemptStart, 0x21, localPos)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, stackBase)
+		b = append(b, 0x21, localSP)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(prog.Start))
+		b = append(b, 0x21, localState)
+		for _, ll := range loopLocalIdx {
+			b = append(b, 0x41, 0x7F, 0x21)
+			b = utils.AppendULEB128(b, ll)
+		}
+		if useMemo {
+			b = emitBTMemoZeroInit(b, memoTableBase, N, memoLenPlus1, memoZeroLen, memoZeroIdx)
+		}
+
+		// block $run_exit
+		b = append(b, 0x02, 0x40)
+		// loop $run
+		b = append(b, 0x03, 0x40)
+
+		failEmpty := func(bb []byte) []byte {
+			return append(bb, 0x0C, 0x03) // br 3: exit $run_exit
+		}
+		// Find matchFn: accept immediately (non-anchored, first match from attempt_start).
+		matchFn := func(bb []byte, _ uint32) []byte {
+			bb = append(bb, 0x20, locAttemptStart)
+			bb = append(bb, 0xAD)       // i64.extend_i32_u
+			bb = append(bb, 0x42, 0x20) // i64.const 32
+			bb = append(bb, 0x86)       // i64.shl
+			bb = append(bb, 0x20, localPos)
+			bb = append(bb, 0xAD) // i64.extend_i32_u
+			bb = append(bb, 0x84) // i64.or
+			bb = append(bb, 0x0F) // return
+			return bb
+		}
+
+		overflowFind := func(bb []byte) []byte {
+			bb = append(bb, 0x42, 0x7F) // i64.const -1
+			bb = append(bb, 0x0F)       // return
+			return bb
+		}
+		b = buildBTInnerDisp(b, bt, loopLocalIdx,
+			stackBase, stackLimit, frameSize,
+			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
+			useMemo, failEmpty, matchFn, overflowFind)
+
+		b = append(b, 0x00) // unreachable
+		b = append(b, 0x0B) // end loop $run
+		b = append(b, 0x0B) // end block $run_exit
+		return b
+	}
+	body = EmitPrefixScan(body, scanParams)
+
+	// attempt_start++; br $outer
+	body = append(body, 0x20, locAttemptStart, 0x41, 0x01, 0x6A, 0x21, locAttemptStart)
+	body = append(body, 0x0C, 0x00)
+
+	body = append(body, 0x0B)       // end loop $outer
+	body = append(body, 0x0B)       // end block $no_match
+	body = append(body, 0x42, 0x7F) // i64.const -1
+	body = append(body, 0x0F)       // return
+	body = append(body, 0x0B)       // end function
+	return body
 }

@@ -104,13 +104,19 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 	if hasCaptureGroups {
 		if !hasNonGreedyQuantifiers(prog) && !hasLineAnchors(prog) &&
 			!hasWordBoundary && !hasAmbiguousCaptures(prog) {
-			tt, ok := newTDFA(prog, resolveTDFALimit(opts))
+			tt, ok := newTDFA(prog, resolveMaxDFAStates(opts))
+			if ok && tt.numRegs > resolveMaxTDFARegs(opts) {
+				ok = false
+				slog.Debug("Engine selected", "engine", "Backtrack", "reason", "TDFA register limit exceeded", "numRegs", tt.numRegs)
+			}
 			if ok {
 				_ = tt // table will be built again in compilePattern; here we only report engine type
 				slog.Debug("Engine selected", "engine", "TDFA", "reason", "capture pattern within state limit")
 				return EngineTDFA
 			}
-			slog.Debug("Engine selected", "engine", "Backtrack", "reason", "TDFA state limit exceeded")
+			if tt != nil {
+				slog.Debug("Engine selected", "engine", "Backtrack", "reason", "TDFA state limit exceeded")
+			}
 		} else {
 			slog.Debug("Engine selected", "engine", "Backtrack", "reason", "non-greedy or line-anchor captures")
 		}
@@ -146,16 +152,37 @@ func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptio
 	return EngineDFA
 }
 
-// resolveTDFALimit returns the effective TDFA state limit from opts.
-// Zero → default (512). Negative → disabled (0, meaning TDFA is never used).
-func resolveTDFALimit(opts *CompileOptions) int {
+// resolveMaxDFAStates returns the effective DFA/TDFA state limit from opts.
+// Zero → default (1024). Negative → disabled (0, meaning TDFA is never used).
+func resolveMaxDFAStates(opts *CompileOptions) int {
 	if opts == nil || opts.MaxDFAStates == 0 {
-		return 512
+		return 1024
 	}
 	if opts.MaxDFAStates < 0 {
 		return 0
 	}
 	return opts.MaxDFAStates
+}
+
+// resolveMaxTDFARegs returns the effective TDFA register limit from opts.
+// Zero → default (32). Negative → disabled (0, meaning TDFA always falls back).
+func resolveMaxTDFARegs(opts *CompileOptions) int {
+	if opts == nil || opts.MaxTDFARegs == 0 {
+		return 32
+	}
+	if opts.MaxTDFARegs < 0 {
+		return 0
+	}
+	return opts.MaxTDFARegs
+}
+
+// resolveMemoBudget returns the effective BitState memo budget in bytes.
+// Zero → default (128 KB).
+func resolveMemoBudget(opts *CompileOptions) int {
+	if opts == nil || opts.MemoBudget == 0 {
+		return 128 * 1024
+	}
+	return opts.MemoBudget
 }
 
 // resolveCompiledDFAThreshold returns the effective compiled-DFA state threshold
