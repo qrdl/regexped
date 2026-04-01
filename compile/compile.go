@@ -301,7 +301,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if !dfaTooLarge {
 		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(nil))
 	}
-	mandatoryLit := findMandatoryLit(re.Pattern)
+	patMandLit := findMandatoryLit(re.Pattern)
 
 	p := &compiledPattern{
 		matchExport: re.MatchFunc,
@@ -329,10 +329,32 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
 			useMemo := needsBitState(btProg)
-			// Compute first-byte SIMD tables from NFA.
-			btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
-			// Build Teddy tables for the first bytes if small enough.
-			btScanParams, btScanDataBytes, btScanSegCnt := buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
+			// Choose scan strategy (in priority order):
+			//   1. Multi-byte literal prefix from the (large) LF DFA — no data tables, pure SIMD.
+			//   2. Mandatory interior literal via two-level outer loop.
+			//   3. First-byte SIMD/Teddy tables from NFA (fallback).
+			var btScanParams prefixScanParams
+			var btScanDataBytes []byte
+			var btScanSegCnt int
+			var btMandLit *mandatoryLit
+			btPrefix := computePrefix(table) // table is always available (even when too large)
+			if len(btPrefix) >= 2 {
+				// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
+				btScanParams = prefixScanParams{
+					Prefix: btPrefix,
+					Locals: prefixScanLocals{
+						Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8, Chunk: 9,
+					},
+					EngineDepth: 2,
+				}
+			} else if patMandLit != nil {
+				// Mandatory interior literal: two-level outer loop; no first-byte tables needed.
+				btMandLit = patMandLit
+			} else {
+				// Fallback: first-byte SIMD/Teddy tables from NFA.
+				btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
+				btScanParams, btScanDataBytes, btScanSegCnt = buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
+			}
 			p.dataBytes = append(p.dataBytes, btScanDataBytes...)
 			p.dataSegCount += btScanSegCnt
 			// Allocate BT stack after SIMD tables.
@@ -348,7 +370,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				btMemoMaxLen = int32(btMemoMaxLenFor(btProg, memoBudget))
 			}
 			frameSize := int32(8) // pos + retryPC only (no cap slots)
-			p.findBody = appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, btMemoMaxLen, useMemo)
+			p.findBody = appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, btMemoMaxLen, useMemo, btMandLit)
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
@@ -456,7 +478,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				}
 			}
 			if p.litAnchorBackScanBody == nil {
-				p.findBody = appendFindCodeEntry(nil, l, table, mandatoryLit)
+				p.findBody = appendFindCodeEntry(nil, l, table, patMandLit)
 			}
 
 			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))

@@ -269,6 +269,69 @@ var tests = []testCase{
 			{"no matches", logInput(false)},
 		},
 	},
+	{
+		// HTML tag extraction — benchmarks BitState memo zero-init overhead.
+		// The outer *? loop body (\s*(attr)?(="val")?) can match zero bytes, so
+		// needsBitState fires: a memo table of N×(len+1) bits is zeroed at the
+		// start of every BT capture call.  Each '<' in the input triggers one
+		// such call, including closing tags that fail immediately (the '/' is
+		// not \w).
+		// "bare-tags": 18 '<' positions, 0 lazy iterations per matching tag.
+		// "attr-tags": same '<' count; each opening tag requires multiple lazy
+		// iterations to step past attributes, adding BT work atop zeroing overhead.
+		name:    "html-tags",
+		pattern: `<(?P<tag>\w+)(?:\s*(?P<attr>\w+)?(?:="(?P<val>[^"]*)")?)*?>`,
+		mode:    anchoredGroups,
+		inputs: []namedInput{
+			{"bare-tags", htmlTagInput(false)},
+			{"attr-tags", htmlTagInput(true)},
+		},
+	},
+	// ── BT find-mode baselines ────────────────────────────────────────────────
+	// NOTE: These cases do NOT exercise the BT find code path.  Despite having
+	// Backtracking capture engines, both patterns have compact LeftmostFirst DFAs
+	// (25 and 27 states respectively), so their find bodies use DFA find.  The BT
+	// find path (dfaTooLarge=true) requires the LF DFA to exceed 1024 states,
+	// which almost never happens because LeftmostFirst construction is inherently
+	// compact.  These cases are kept as performance baselines for the BT capture
+	// engine on log-structured input.
+	{
+		// BT capture baseline on a 100KB log file.  The LF DFA (25 states) handles
+		// the find phase; the BT engine handles the capture phase.  Groups_func
+		// scans the log and captures worker/id/severity/message for each event line.
+		name:    "bt-find-mand-lit",
+		pattern: `(\w+)\[(\d+)\] .*(ERROR|FAILURE|CRASH): (.+)`,
+		mode:    anchoredGroups,
+		inputs: []namedInput{
+			{"no events 100KB", largeLogInput(nil)},
+			{"5 events 100KB", largeLogInput([]string{
+				"2026-03-22T14:30:01 worker[12] info: connect attempt 3, ERROR: connection refused: CRASH: code=1",
+				"2026-03-22T14:30:15 worker[7] info: query timed out, FAILURE: deadline exceeded after 30s",
+				"2026-03-22T14:30:28 worker[3] info: task aborted, ERROR: out of memory allocating 512MB",
+				"2026-03-22T14:30:42 worker[19] info: upstream unreachable, CRASH: signal 11 received",
+				"2026-03-22T14:30:57 worker[5] info: retry limit reached, FAILURE: giving up after 5 attempts",
+			})},
+		},
+	},
+	{
+		// BT capture baseline on a 100KB log file.  The LF DFA (27 states) handles
+		// the find phase; the BT engine handles the capture phase.  The pattern
+		// starts with one of three keywords (E/F/W first bytes); groups_func scans
+		// and captures severity/component/elapsed for each event line.
+		name:    "bt-find-prefix",
+		pattern: `(ERROR|FAILURE|WARNING): (\w+) .+ (\d+)ms`,
+		mode:    anchoredGroups,
+		inputs: []namedInput{
+			{"no events 100KB", largeLogInput(nil)},
+			{"5 events 100KB", largeLogInput([]string{
+				"ERROR: worker[12] connection refused after retry, elapsed 3000ms",
+				"FAILURE: worker[7] query deadline exceeded, total wait 15000ms",
+				"WARNING: worker[3] memory pressure detected, threshold 85%, check 500ms",
+				"ERROR: worker[19] upstream timeout, attempted 3 retries over 9000ms",
+				"FAILURE: worker[5] task aborted, cleanup finished in 250ms",
+			})},
+		},
+	},
 }
 
 // secretBaseInput returns a ~10KB environment/config file with many 'e', 'g', 'A'
@@ -549,6 +612,68 @@ func logInput(withErrors bool) string {
 		"2026-03-22T14:05:13 app[1] INFO: POST /api/v1/jobs 202 8ms\n" +
 		"2026-03-22T14:05:14 worker[5] DEBUG: job 7f3a picked up by worker pool\n" +
 		"2026-03-22T14:05:15 worker[5] INFO: job 7f3a completed in 340ms\n"
+}
+
+// largeLogInput returns a ~100KB structured log file. Each line is realistic
+// log output dense with words starting with E, F, W (event, elapsed, function,
+// fetching, worker, writing, etc.) so the BT first-byte scan fires frequently,
+// but without ERROR/FAILURE/CRASH/WARNING occurrences unless injected.
+// Used as input for the bt-find-mand-lit and bt-find-prefix BT capture baselines.
+func largeLogInput(events []string) string {
+	const block = `2026-03-22T14:05:00 worker[1] info: function started, event_id=7f3a received from event queue
+2026-03-22T14:05:00 worker[2] info: fetching resource from storage backend, elapsed=2ms
+2026-03-22T14:05:01 worker[3] info: event processed, writing result to database, rows=1
+2026-03-22T14:05:01 scheduler[4] info: worker allocated for task execution, waiting for slot
+2026-03-22T14:05:02 worker[1] info: finished processing event, elapsed=12ms, events_total=3
+2026-03-22T14:05:02 worker[2] info: enqueueing follow-up event for downstream worker, queue_depth=4
+2026-03-22T14:05:03 worker[3] info: fetching next event from queue, worker_id=3, attempt=1
+2026-03-22T14:05:03 scheduler[4] info: evaluating worker load, free_slots=2, enqueued=7
+2026-03-22T14:05:04 worker[1] info: event forwarded to external endpoint, waited=5ms
+2026-03-22T14:05:04 worker[2] info: writing event metadata, fields=8, elapsed=1ms
+`
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+	if len(events) == 0 {
+		return base
+	}
+	result := []byte(base)
+	step := len(result) / (len(events) + 1)
+	offset := 0
+	for i, event := range events {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte(event + "\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
+// htmlTagInput returns a small HTML document (~165 / ~355 bytes). The pattern
+// <(\w+)(?:\s*(\w+)?(="([^"]*)")?)*?> triggers needsBitState because the outer
+// *? loop body is entirely optional (can match zero bytes); a BitState memo
+// table (25 NFA states × (len+1) bits) is therefore zeroed on every BT capture
+// call — one per '<' character, closing tags included (they fail after one byte).
+// withAttrs=false: bare tags, 0 lazy iterations per matching tag.
+// withAttrs=true:  attribute-bearing tags, multiple lazy iterations per match.
+func htmlTagInput(withAttrs bool) string {
+	if !withAttrs {
+		return "<html><head><title>Test Page</title></head>" +
+			"<body><div><h1>Hello World</h1>" +
+			"<p>First paragraph text here.</p>" +
+			"<a>Click here</a>" +
+			"<span>Some note.</span>" +
+			"</div></body></html>\n"
+	}
+	return `<html lang="en"><head><meta charset="UTF-8"><title>Test Page</title></head>` +
+		`<body class="page" id="main"><div class="container" id="content">` +
+		`<h1 class="title">Hello World</h1>` +
+		`<p class="intro" id="p1">First paragraph text here.</p>` +
+		`<a href="https://example.com" class="link" target="_blank">Click here</a>` +
+		`<span class="note">Some note.</span>` +
+		`</div></body></html>` + "\n"
 }
 
 // emailDomainInput returns a ~10KB block of prose with realistic email addresses

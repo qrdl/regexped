@@ -4,10 +4,19 @@ import "regexp/syntax"
 
 // mandatoryLit describes a fixed byte sequence that must appear in every match,
 // along with its offset range from the start of the match.
+//
+// Usage in find mode:
+//   - The SIMD scan starts at input position minOff (not 0), because no match
+//     can have the literal starting before minOff bytes into the match.
+//     This safely skips the first minOff bytes of the input.
+//   - When the literal is found at position litPos, the DFA is run from
+//     max(0, litPos-maxOff) to determine the actual match start.
+//     A match starting at position 0 is found correctly as long as the literal
+//     appears at litPos >= minOff (which is guaranteed by the pattern structure).
 type mandatoryLit struct {
 	bytes  []byte
-	minOff int32 // minimum offset of the literal start from match start
-	maxOff int32 // maximum offset of the literal start from match start
+	minOff int32 // minimum byte distance from match start to literal start
+	maxOff int32 // maximum byte distance from match start to literal start
 }
 
 // findMandatoryLit analyzes the regex pattern and returns the first mandatory
