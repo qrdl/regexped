@@ -1097,6 +1097,10 @@ type dfaLayout struct {
 	teddyT2HiOff   int32
 	teddyT2LoBytes []byte
 	teddyT2HiBytes []byte
+	teddyT3LoOff   int32
+	teddyT3HiOff   int32
+	teddyT3LoBytes []byte
+	teddyT3HiBytes []byte
 
 	// Find-mode DFA states
 	wasmMidStart        uint32
@@ -1405,6 +1409,49 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 					l.teddyT2HiBytes = t2Hi
 					l.teddyT2LoOff = l.teddyT1HiOff + 16
 					l.teddyT2HiOff = l.teddyT2LoOff + 16
+
+					// Try T3 tables (fourth byte).
+					t3Lo := make([]byte, 16)
+					t3Hi := make([]byte, 16)
+					useFourByte := true
+				outerFourByte:
+					for i, fb := range l.firstBytes {
+						stateAfterFB := t.transitions[t.midStartState*256+int(fb)]
+						if stateAfterFB < 0 {
+							useFourByte = false
+							break
+						}
+						for b2 := 0; b2 < 256; b2++ {
+							stateAfterFB2 := t.transitions[stateAfterFB*256+b2]
+							if stateAfterFB2 < 0 {
+								continue
+							}
+							for b3 := 0; b3 < 256; b3++ {
+								stateAfterFB3 := t.transitions[stateAfterFB2*256+b3]
+								if stateAfterFB3 < 0 {
+									continue
+								}
+								validCount4 := 0
+								for b4 := 0; b4 < 256; b4++ {
+									if t.transitions[stateAfterFB3*256+b4] >= 0 {
+										validCount4++
+										t3Lo[b4&0x0F] |= byte(1 << uint(i))
+										t3Hi[b4>>4] |= byte(1 << uint(i))
+									}
+								}
+								if validCount4 > 64 {
+									useFourByte = false
+									break outerFourByte
+								}
+							}
+						}
+					}
+					if useFourByte {
+						l.teddyT3LoBytes = t3Lo
+						l.teddyT3HiBytes = t3Hi
+						l.teddyT3LoOff = l.teddyT2HiOff + 16
+						l.teddyT3HiOff = l.teddyT3LoOff + 16
+					}
 				}
 			}
 		}
@@ -1450,6 +1497,9 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 					maxEnd(l.teddyT1HiOff, 16)
 					if len(l.teddyT2LoBytes) > 0 {
 						maxEnd(l.teddyT2HiOff, 16)
+						if len(l.teddyT3LoBytes) > 0 {
+							maxEnd(l.teddyT3HiOff, 16)
+						}
 					}
 				}
 			}
@@ -1505,6 +1555,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			teddyExtraSegs = 4
 			if len(l.teddyT2LoBytes) > 0 {
 				teddyExtraSegs = 6
+				if len(l.teddyT3LoBytes) > 0 {
+					teddyExtraSegs = 8
+				}
 			}
 		}
 	}
@@ -1531,6 +1584,10 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 						if len(l.teddyT2LoBytes) > 0 {
 							ds = appendDataSegment(ds, l.teddyT2LoOff, l.teddyT2LoBytes)
 							ds = appendDataSegment(ds, l.teddyT2HiOff, l.teddyT2HiBytes)
+							if len(l.teddyT3LoBytes) > 0 {
+								ds = appendDataSegment(ds, l.teddyT3LoOff, l.teddyT3LoBytes)
+								ds = appendDataSegment(ds, l.teddyT3HiOff, l.teddyT3HiBytes)
+							}
 						}
 					}
 				}
@@ -1577,6 +1634,10 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 						if len(l.teddyT2LoBytes) > 0 {
 							ds = appendDataSegment(ds, l.teddyT2LoOff, l.teddyT2LoBytes)
 							ds = appendDataSegment(ds, l.teddyT2HiOff, l.teddyT2HiBytes)
+							if len(l.teddyT3LoBytes) > 0 {
+								ds = appendDataSegment(ds, l.teddyT3LoOff, l.teddyT3LoBytes)
+								ds = appendDataSegment(ds, l.teddyT3HiOff, l.teddyT3HiBytes)
+							}
 						}
 					}
 				}
@@ -1649,6 +1710,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.teddyLoOff, l.teddyHiOff,
 			l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0,
 			l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0,
+			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
@@ -3030,7 +3092,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32) []byte {
 	var b []byte
 
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
@@ -3211,6 +3273,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	var chunk2Local byte
 	var t2LoLocal byte
 	var t2HiLocal byte
+	var chunk3Local byte
+	var t3LoLocal byte
+	var t3HiLocal byte
 
 	// Mandatory-lit locals (set in each path branch when useMandatoryLit):
 	var litPosLocal, scanStartLocal, simdMaskScanLocal, chunkScanLocal byte
@@ -3233,6 +3298,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			TeddyT2LoOff:   teddyT2LoOff,
 			TeddyT2HiOff:   teddyT2HiOff,
 			TeddyThreeByte: teddyThreeByte,
+			TeddyT3LoOff:   teddyT3LoOff,
+			TeddyT3HiOff:   teddyT3HiOff,
+			TeddyFourByte:  teddyFourByte,
 			EngineDepth:    2, // loop $outer + block $no_match
 			Locals: prefixScanLocals{
 				Ptr:          0,
@@ -3248,6 +3316,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				Chunk2:       chunk2Local,
 				T2Lo:         t2LoLocal,
 				T2Hi:         t2HiLocal,
+				Chunk3:       chunk3Local,
+				T3Lo:         t3LoLocal,
+				T3Hi:         t3HiLocal,
 			},
 			OnMatch: func(b []byte) []byte {
 				if len(prefix) >= 1 {
@@ -3560,7 +3631,15 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunk2Local = 14
 			t2LoLocal = 15
 			t2HiLocal = 16
-			b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+			if teddyFourByte {
+				// 6 i32 + 12 v128: adds chunk3(17),t3Lo(18),t3Hi(19)
+				chunk3Local = 17
+				t3LoLocal = 18
+				t3HiLocal = 19
+				b = append(b, 0x02, 0x06, 0x7F, 0x0C, 0x7B)
+			} else {
+				b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+			}
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
 		if useMandatoryLit {
@@ -3671,7 +3750,15 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunk2Local = 13
 			t2LoLocal = 14
 			t2HiLocal = 15
-			b = append(b, 0x02, 0x05, 0x7F, 0x09, 0x7B)
+			if teddyFourByte {
+				// 5 i32 + 12 v128: adds chunk3(16),t3Lo(17),t3Hi(18)
+				chunk3Local = 16
+				t3LoLocal = 17
+				t3HiLocal = 18
+				b = append(b, 0x02, 0x05, 0x7F, 0x0C, 0x7B)
+			} else {
+				b = append(b, 0x02, 0x05, 0x7F, 0x09, 0x7B)
+			}
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
 		if useMandatoryLit {
@@ -3772,7 +3859,15 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		chunk2Local = 14
 		t2LoLocal = 15
 		t2HiLocal = 16
-		b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+		if teddyFourByte {
+			// 6 i32 + 12 v128: adds chunk3(17),t3Lo(18),t3Hi(19)
+			chunk3Local = 17
+			t3LoLocal = 18
+			t3HiLocal = 19
+			b = append(b, 0x02, 0x06, 0x7F, 0x0C, 0x7B)
+		} else {
+			b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+		}
 	}
 	b = append(b, 0x02, 0x40) // block $no_match
 	if useMandatoryLit {

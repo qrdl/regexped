@@ -735,7 +735,7 @@ const (
 	slotsBase = int32(512)
 	// benchIters is the number of iterations run inside WASM per benchmark call.
 	// The loop executes entirely within WASM so CGo overhead is paid only once.
-	benchIters = 100_000
+	benchIters = 10_000
 )
 
 type benchResult struct {

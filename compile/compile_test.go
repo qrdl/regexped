@@ -136,6 +136,10 @@ func TestCompileIntegrationDFA(t *testing.T) {
 	t.Run("find_lit_anchor", func(t *testing.T) {
 		mustCompileEntries(t, []config.RegexEntry{{Pattern: `.*foo.*`, FindFunc: "f"}})
 	})
+	// Alternation with 2 first bytes and selective tails → T1/T2/T3 Teddy tables.
+	t.Run("find_teddy_t3", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(http|ftp)://[^\s]+`, FindFunc: "f"}})
+	})
 	t.Run("no_func_entry", func(t *testing.T) {
 		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc"}})
 	})
