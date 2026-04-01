@@ -55,8 +55,6 @@ type tdfaTable struct {
 	entryOps     []tdfaTagOp // ops emitted at function entry (before first byte is consumed)
 }
 
-func (t *tdfaTable) Type() EngineType { return EngineTDFA }
-
 // --------------------------------------------------------------------------
 // Internal subset-construction types
 
@@ -1231,57 +1229,6 @@ func DFAStateCount(pattern string) (int, error) {
 	d := newDFA(prog, false, true) // leftmostFirst
 	t := dfaTableFrom(d)
 	return t.numStates, nil
-}
-
-// TDFADetailStats compiles pattern to TDFA and returns detailed stats:
-//
-//	numStates, numRegs, totalTagOps
-//	allSameStates  — number of states where all bytes with ops share identical ops (fast path)
-//	diffStates     — number of states where bytes have differing ops (slow: linear byte scan)
-//	diffTotalBytes — total number of (state,byte) entries in diffStates (= size of linear scan)
-func TDFADetailStats(pattern string) (numStates, numRegs, totalTagOps, allSameStates, diffStates, diffTotalBytes int) {
-	parsed, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return
-	}
-	prog, err := syntax.Compile(parsed.Simplify())
-	if err != nil {
-		return
-	}
-	tt, ok := newTDFA(prog, 2000)
-	if !ok {
-		numStates = -1
-		return
-	}
-	numStates = tt.numStates
-	numRegs = tt.numRegs
-	for gs := 0; gs < tt.numStates; gs++ {
-		var entries []int
-		for b := 0; b < 256; b++ {
-			idx := gs*256 + b
-			if idx < len(tt.tagOps) && len(tt.tagOps[idx]) > 0 {
-				totalTagOps += len(tt.tagOps[idx])
-				entries = append(entries, idx)
-			}
-		}
-		if len(entries) == 0 {
-			continue
-		}
-		allSame := true
-		for i := 1; i < len(entries); i++ {
-			if !tdfaTagOpsEqual(tt.tagOps[entries[0]], tt.tagOps[entries[i]]) {
-				allSame = false
-				break
-			}
-		}
-		if allSame {
-			allSameStates++
-		} else {
-			diffStates++
-			diffTotalBytes += len(entries)
-		}
-	}
-	return
 }
 
 func tdfaTagOpsEqual(a, b []tdfaTagOp) bool {

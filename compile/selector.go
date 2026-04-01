@@ -125,7 +125,7 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 
 	// DFA handles everything else. Patterns with user alternations or nested quantifiers
 	// need leftmost-first semantics; all others use standard leftmost-longest.
-	// The MaxDFAStates limit in CompileRegex is the real guard against state explosion.
+	// The MaxDFAStates limit in CompileOptions is the real guard against state explosion.
 	if hasUserAlternations || hasNestedQuant {
 		if opts != nil {
 			opts.LeftmostFirst = true

@@ -313,12 +313,3 @@ func runCmd(name string, args []string, dir string, extraEnv []string) error {
 	}
 	return cmd.Run()
 }
-
-// captureCmd executes name with args and returns the combined stdout output.
-// stderr is streamed to the process's own stderr.
-func captureCmd(name string, args []string, dir string) ([]byte, error) {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	cmd.Stderr = os.Stderr
-	return cmd.Output()
-}

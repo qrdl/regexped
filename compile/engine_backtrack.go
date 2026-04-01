@@ -59,16 +59,6 @@ const (
 func capStartLocal(i int) uint32 { return uint32(7 + i*2) }
 func capEndLocal(i int) uint32   { return uint32(8 + i*2) }
 
-// isLoopPC returns true if pc is a loop back-edge (Out or Arg points backward).
-func isLoopPC(prog *syntax.Prog, pc int) bool {
-	inst := prog.Inst[pc]
-	if inst.Op != syntax.InstAlt && inst.Op != syntax.InstAltMatch {
-		return false
-	}
-	pcU32 := uint32(pc)
-	return inst.Out < pcU32 || inst.Arg < pcU32
-}
-
 // loopBodyStart returns the PC of the first instruction inside the loop body
 // at loopPC (the backward-pointing branch).
 func loopBodyStart(prog *syntax.Prog, loopPC int) int {
@@ -139,45 +129,6 @@ func needsBitState(prog *syntax.Prog) bool {
 		}
 	}
 	return false
-}
-
-// memoStateSet returns the set of NFA PCs that are reachable within the body
-// of any non-greedy zero-matchable loop.  Only these states need a BitState
-// bit check/set.  Returns nil if needsBitState is false.
-func memoStateSet(prog *syntax.Prog) map[int]bool {
-	states := make(map[int]bool)
-	for pc, inst := range prog.Inst {
-		if inst.Op != syntax.InstAlt && inst.Op != syntax.InstAltMatch {
-			continue
-		}
-		if inst.Arg >= uint32(pc) || !loopBodyCanMatchEmpty(prog, pc) {
-			continue // only non-greedy zero-matchable loops
-		}
-		bodyStart := loopBodyStart(prog, pc)
-		visited := make([]bool, len(prog.Inst))
-		queue := []int{bodyStart}
-		for len(queue) > 0 {
-			cur := queue[0]
-			queue = queue[1:]
-			if cur == pc || visited[cur] {
-				continue
-			}
-			visited[cur] = true
-			states[cur] = true
-			i := prog.Inst[cur]
-			switch i.Op {
-			case syntax.InstAlt, syntax.InstAltMatch:
-				queue = append(queue, int(i.Out), int(i.Arg))
-			default:
-				queue = append(queue, int(i.Out))
-			}
-		}
-		states[pc] = true // loop head itself needs the check
-	}
-	if len(states) == 0 {
-		return nil
-	}
-	return states
 }
 
 // appendBacktrackCodeEntry appends a size-prefixed backtracking capture body to cs.

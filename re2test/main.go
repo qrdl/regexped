@@ -880,7 +880,7 @@ func preCheck(pattern string) string {
 	}
 	_, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
-		return "" // let CompileRegex report the actual error
+		return "" // let the compiler report the actual error
 	}
 	return ""
 }

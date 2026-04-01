@@ -850,79 +850,6 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir, outputFile string) er
 	return nil
 }
 
-// CompileRegex compiles a single regex pattern to WASM bytes.
-// tableBase must be page-aligned and >= 0.
-// If standalone is true, the module defines its own memory (suitable for testing);
-// otherwise it imports memory from the "main" module.
-// Returns the WASM bytes and the next available table base (page-aligned end of this module's data).
-// An optional CompileOptions argument overrides the defaults.
-func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, userOpts ...CompileOptions) ([]byte, int64, error) {
-	opts := CompileOptions{
-		MaxDFAStates: 100000,
-		Unicode:      false,
-		ForceEngine:  EngineDFA,
-	}
-	if len(userOpts) > 0 {
-		opts = userOpts[0]
-	}
-	matcher, err := compile(pattern, opts)
-	if err != nil {
-		return nil, 0, fmt.Errorf("compile error: %w", err)
-	}
-	if matcher.Type() != EngineDFA {
-		return nil, 0, fmt.Errorf("unexpected engine %v (wanted DFA)", matcher.Type())
-	}
-	table := dfaTableFrom(matcher.(*dfa))
-
-	if opts.MaxDFAStates > 0 && table.numStates > opts.MaxDFAStates {
-		return nil, 0, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, opts.MaxDFAStates)
-	}
-
-	numWASM := table.numStates + 1
-	var dfaSize int64
-	switch {
-	case numWASM <= 256 && numWASM*256 > 32*1024: // u8 + compression
-		_, _, nc := computeByteClasses(table)
-		dfaSize = int64(256 + numWASM*nc + numWASM)
-	case numWASM <= 256: // u8, no compression
-		dfaSize = int64(numWASM*256 + numWASM)
-	default: // u16
-		dfaSize = int64(numWASM*256*2 + numWASM)
-	}
-	if opts.Mode == ModeFind {
-		dfaSize += int64(numWASM) // midAccept flags
-		// firstByte flags (256 bytes) only when there is no literal prefix;
-		// with a prefix the skip uses hardcoded comparisons, no table needed.
-		if len(computePrefix(table)) == 0 {
-			dfaSize += 256
-		}
-		// wordCharTable (256 bytes) prepended before DFA table for word-boundary patterns.
-		// Also add midAcceptNW and midAcceptW flag arrays (numWASM bytes each).
-		if table.hasWordBoundary {
-			dfaSize += 256 + int64(numWASM)*2
-		}
-	}
-	if opts.LeftmostFirst && len(table.immediateAcceptStates) > 0 {
-		dfaSize += int64(numWASM) // immediateAccept flags
-	}
-
-	tableEnd := utils.PageAlign(tableBase + dfaSize)
-	memPages := int32(tableEnd / 65536)
-
-	matchExport, findExport := "", ""
-	if opts.Mode == ModeFind {
-		findExport = exportName
-	} else {
-		matchExport = exportName
-	}
-	var mandatoryLit *MandatoryLit
-	if opts.Mode == ModeFind {
-		mandatoryLit = FindMandatoryLit(pattern)
-	}
-	wasmBytes := genWASM(table, tableBase, matchExport, findExport, standalone, memPages, opts.LeftmostFirst, mandatoryLit, resolveCompiledDFAThreshold(&opts))
-	return wasmBytes, tableEnd, nil
-}
-
 // stripCaptures converts all capture groups in the regexp tree to non-capturing
 // by replacing each OpCapture node with its single sub-expression in-place.
 // Used when the pattern has captures but capture stubs are not requested.
@@ -952,14 +879,6 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 		return 0, fmt.Errorf("pattern contains Unicode features but Unicode option not enabled")
 	}
 	return selectBestEngine(prog, hasCapturesBeforeSimplify, &opts), nil
-}
-
-// parseMode converts the YAML mode string to a MatchMode constant.
-func parseMode(s string) MatchMode {
-	if s == "find" {
-		return ModeFind
-	}
-	return ModeAnchoredMatch
 }
 
 // compile parses the pattern, selects the optimal engine, and returns a compiled Matcher.
