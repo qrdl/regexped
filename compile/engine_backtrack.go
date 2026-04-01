@@ -125,7 +125,9 @@ func loopBodyCanMatchEmpty(prog *syntax.Prog, loopPC int) bool {
 // of exiting), causing an infinite loop.  BitState memoisation breaks the cycle.
 //
 // Greedy loops are already handled correctly by the zero-progress guard
-// (zero-progress → take exit), so they never need BitState.
+// (zero-progress → take exit), so they never need BitState.  In particular,
+// the canonical "catastrophic backtracking" pattern (?:a?)* has a greedy outer
+// loop: when a? matches empty the guard fires and the loop exits immediately.
 func needsBitState(prog *syntax.Prog) bool {
 	for pc, inst := range prog.Inst {
 		if inst.Op != syntax.InstAlt && inst.Op != syntax.InstAltMatch {

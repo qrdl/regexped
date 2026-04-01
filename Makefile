@@ -6,7 +6,7 @@ GO_SRCS := main.go \
 	merge/merge.go \
 	utils/bytes.go
 
-.PHONY: re2test perftest examples clean
+.PHONY: re2test perftest examples clean unittest
 
 build: regexped
 
@@ -21,6 +21,11 @@ perftest: build
 
 examples: build
 	$(MAKE) -C examples
+
+unittest:
+	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./utils
+	@go tool cover -func=cover.out | grep "total:" | awk '{print "Test coverage: " $$3}'
+	@rm cover.out
 
 clean:
 	rm -f regexped
