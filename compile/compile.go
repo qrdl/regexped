@@ -768,17 +768,6 @@ func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool, use
 	return compileAll(patterns, tableBase, standalone, 0, opts)
 }
 
-// CompileForced is like Compile but forces the given engine for the capture path
-// of every entry that requests capture groups. Pass EngineBacktrack to force
-// backtracking regardless of the pattern's eligibility for TDFA.
-func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, userOpts ...CompileOptions) ([]byte, int64, error) {
-	var opts CompileOptions
-	if len(userOpts) > 0 {
-		opts = userOpts[0]
-	}
-	return compileAll(patterns, tableBase, standalone, forceGroupsEngine, opts)
-}
-
 func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, error) {
 	var compiled []*compiledPattern
 	cur := tableBase

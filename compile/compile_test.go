@@ -8,6 +8,16 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
+// compileForced is like Compile but forces the given engine for the capture path
+// of every entry that requests capture groups. Used in tests only.
+func compileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, userOpts ...CompileOptions) ([]byte, int64, error) {
+	var opts CompileOptions
+	if len(userOpts) > 0 {
+		opts = userOpts[0]
+	}
+	return compileAll(patterns, tableBase, standalone, forceGroupsEngine, opts)
+}
+
 func parseTestRe(t *testing.T, pattern string) *syntax.Regexp {
 	t.Helper()
 	re, err := syntax.Parse(pattern, syntax.Perl)
@@ -160,21 +170,21 @@ func TestCompileIntegrationTDFA(t *testing.T) {
 
 func TestCompileIntegrationBacktrack(t *testing.T) {
 	t.Run("groups_forced", func(t *testing.T) {
-		_, _, err := CompileForced(
+		_, _, err := compileForced(
 			[]config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("CompileForced(BT groups): %v", err)
+			t.Fatalf("compileForced(BT groups): %v", err)
 		}
 	})
 	t.Run("named_groups_forced", func(t *testing.T) {
-		_, _, err := CompileForced(
+		_, _, err := compileForced(
 			[]config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", NamedGroupsFunc: "ng"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("CompileForced(BT named_groups): %v", err)
+			t.Fatalf("compileForced(BT named_groups): %v", err)
 		}
 	})
 	t.Run("natural_bt_nongreedy", func(t *testing.T) {

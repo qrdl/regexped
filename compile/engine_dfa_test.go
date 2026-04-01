@@ -20,6 +20,23 @@ func compileTestDFA(t *testing.T, pattern string, leftmostFirst bool) *dfaTable 
 	return dfaTableFrom(d)
 }
 
+// dfaStateCount returns the number of LF DFA states for the given pattern
+// after stripping capture groups. Used for diagnostics in tests.
+func dfaStateCount(pattern string) (int, error) {
+	re2, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return 0, err
+	}
+	stripCaptures(re2)
+	prog, err := syntax.Compile(re2.Simplify())
+	if err != nil {
+		return 0, err
+	}
+	d := newDFA(prog, false, true) // leftmostFirst
+	t := dfaTableFrom(d)
+	return t.numStates, nil
+}
+
 func TestDFAStateCount(t *testing.T) {
 	cases := []struct {
 		pattern string
@@ -34,13 +51,13 @@ func TestDFAStateCount(t *testing.T) {
 		{"[a-z]+", 1, 10},
 	}
 	for _, c := range cases {
-		got, err := DFAStateCount(c.pattern)
+		got, err := dfaStateCount(c.pattern)
 		if err != nil {
-			t.Errorf("DFAStateCount(%q): %v", c.pattern, err)
+			t.Errorf("dfaStateCount(%q): %v", c.pattern, err)
 			continue
 		}
 		if got < c.wantMin || got > c.wantMax {
-			t.Errorf("DFAStateCount(%q) = %d, want [%d, %d]", c.pattern, got, c.wantMin, c.wantMax)
+			t.Errorf("dfaStateCount(%q) = %d, want [%d, %d]", c.pattern, got, c.wantMin, c.wantMax)
 		}
 	}
 }

@@ -1183,54 +1183,6 @@ func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localC
 	return b
 }
 
-// TDFAStats compiles pattern to TDFA and returns state/register/op counts.
-// Uses a high state limit (2000) so it never returns (0,0,0,false) due to the cap.
-// Returns (0,0,0,false) only if the pattern fails to parse or compile as NFA.
-func TDFAStats(pattern string) (numStates, numRegs, totalTagOps int, ok bool) {
-	parsed, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return
-	}
-	prog, err := syntax.Compile(parsed.Simplify())
-	if err != nil {
-		return
-	}
-	tt, success := newTDFA(prog, 2000)
-	if !success {
-		numStates = -1
-		ok = false
-		return
-	}
-	numStates = tt.numStates
-	numRegs = tt.numRegs
-	for _, ops := range tt.tagOps {
-		totalTagOps += len(ops)
-	}
-	ok = true
-	return
-}
-
-// DFAStateCount returns the number of LF DFA states for the given pattern
-// after stripping capture groups. Used for diagnostics.
-func DFAStateCount(pattern string) (int, error) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return 0, err
-	}
-	// Re-parse a fresh copy so stripCaptures (which mutates in-place) doesn't
-	// affect what the caller might use for TDFA stats.
-	re2, _ := syntax.Parse(pattern, syntax.Perl)
-	stripCaptures(re2)
-	prog, err := syntax.Compile(re2.Simplify())
-	if err != nil {
-		return 0, err
-	}
-	_ = re
-	d := newDFA(prog, false, true) // leftmostFirst
-	t := dfaTableFrom(d)
-	return t.numStates, nil
-}
-
 func tdfaTagOpsEqual(a, b []tdfaTagOp) bool {
 	if len(a) != len(b) {
 		return false
