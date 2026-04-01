@@ -658,8 +658,29 @@ func emitBTInstHandler(
 	case syntax.InstEmptyWidth:
 		emptyOp := syntax.EmptyOp(inst.Arg)
 		switch {
-		case emptyOp&(syntax.EmptyBeginText|syntax.EmptyBeginLine) != 0:
-			// fail if pos != 0
+		case emptyOp&syntax.EmptyBeginLine != 0:
+			// (?m:^): fires at pos==0 or when prev byte is '\n'
+			// Fail if: pos != 0 AND mem[ptr + pos - 1] != '\n'
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x45)       // i32.eqz
+			body = append(body, 0x04, 0x40) // if void (pos == 0): ok
+			body = append(body, 0x05)       // else (pos > 0): check prev byte
+			body = append(body, 0x20, localPtr)
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x6A)             // i32.add
+			body = append(body, 0x41, 0x01)       // i32.const 1
+			body = append(body, 0x6B)             // i32.sub (ptr + pos - 1)
+			body = append(body, 0x2D, 0x00, 0x00) // i32.load8_u (prev byte)
+			body = append(body, 0x41, 0x0A)       // i32.const '\n'
+			body = append(body, 0x47)             // i32.ne
+			body = append(body, 0x04, 0x40)       // if void (prev != '\n'): fail
+			body = btFail(body, brRunNested)
+			body = append(body, 0x0B) // end if prev != '\n'
+			body = append(body, 0x0B) // end if pos == 0
+			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+
+		case emptyOp&syntax.EmptyBeginText != 0:
+			// \A: fires only at pos==0 (beginning of match slice)
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x45)       // i32.eqz
 			body = append(body, 0x45)       // i32.eqz (NOT: nonzero = fail)
@@ -668,8 +689,28 @@ func emitBTInstHandler(
 			body = append(body, 0x0B) // end if
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 
-		case emptyOp&(syntax.EmptyEndText|syntax.EmptyEndLine) != 0:
-			// fail if pos != len
+		case emptyOp&syntax.EmptyEndLine != 0:
+			// (?m:$): fires at pos==len or when next byte is '\n'
+			// Fail if: pos != len AND mem[ptr + pos] != '\n'
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x20, localLen)
+			body = append(body, 0x46)       // i32.eq
+			body = append(body, 0x04, 0x40) // if void (pos == len): ok
+			body = append(body, 0x05)       // else (pos < len): check next byte
+			body = append(body, 0x20, localPtr)
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x6A)             // i32.add (ptr + pos)
+			body = append(body, 0x2D, 0x00, 0x00) // i32.load8_u (next byte)
+			body = append(body, 0x41, 0x0A)       // i32.const '\n'
+			body = append(body, 0x47)             // i32.ne
+			body = append(body, 0x04, 0x40)       // if void (next != '\n'): fail
+			body = btFail(body, brRunNested)
+			body = append(body, 0x0B) // end if next != '\n'
+			body = append(body, 0x0B) // end if pos == len
+			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+
+		case emptyOp&syntax.EmptyEndText != 0:
+			// \z: fires only at pos==len (end of match slice)
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x20, localLen)
 			body = append(body, 0x47)       // i32.ne

@@ -1433,3 +1433,61 @@ regexps
 -;0-0;-;-
 -;0-0;-;-
 -;0-0;-;-
+# ============================================================
+# Category 23: Backtracking — EmptyBeginLine / EmptyEndLine mid-pattern
+# Bug: BT EmptyBeginLine handler checks only pos==0; EmptyEndLine only pos==len.
+# These are correct when the anchor is at pos 0 or pos len of the BT call slice,
+# but fail when the anchor appears after / before byte-matching content.
+# The wrapper calls DFA find to locate [start,end], then calls BT capture on the
+# substring [start..end]. A (?m:^) at the start of the substring lands at pos 0
+# and passes; a (?m:^) after consuming bytes (e.g. "foo\n^") lands at pos>0 and
+# the current pos==0 check rejects it incorrectly.
+# ============================================================
+Cat23MultilineMidPattern
+strings
+""
+"foo\nbar"
+"baz\nfoo\nbar"
+"foo\nbaz"
+regexps
+"(?m:foo\n^(bar))"
+-;-;-;-;-;-
+0-7 4-7;0-7;-;-;-;0-7 4-7
+-;4-11;-;-;-;4-11 8-11
+-;-;-;-;-;-
+"(?m:(foo)$\nbar)"
+-;-;-;-;-;-
+0-7 0-3;0-7;-;-;-;0-7 0-3
+-;4-11;-;-;-;4-11 4-7
+-;-;-;-;-;-
+# ============================================================
+# Category 24: dot (.) and nfaFirstBytes allBytes behaviour
+# Anomaly #4: TEST_ANOMALIES.md claims bare (.) produces a 255-byte first-byte
+# set (allBytes=false, '\n' excluded). The actual code places both
+# InstRuneAnyNotNL and InstRuneAny in the allBytes=true branch, so the BT find
+# scan correctly tries all positions including '\n'-starting ones.
+# These tests document the expected correct semantics for both bare dot and
+# dot-all. They will also catch a regression if InstRuneAnyNotNL is ever moved
+# out of the allBytes=true branch (which would make the ((?s).+) tests fail on
+# '\n'-starting inputs).
+# ============================================================
+Cat24DotFirstBytes
+strings
+""
+"foo"
+"\nfoo"
+"foo\nbar"
+"\nfoo\nbar"
+regexps
+"(.+)"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+-;1-4;-;-;-;1-4 1-4
+-;0-3;-;-;-;0-3 0-3
+-;1-4;-;-;-;1-4 1-4
+"((?s).+)"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+0-4 0-4;0-4;-;-;-;0-4 0-4
+0-7 0-7;0-7;-;-;-;0-7 0-7
+0-8 0-8;0-8;-;-;-;0-8 0-8

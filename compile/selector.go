@@ -141,6 +141,11 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 // maybeCompiledDFA promotes engine from EngineDFA to EngineCompiledDFA when the
 // estimated state count fits within the compiled-DFA threshold.
 // The estimate is pre-minimisation; the final decision is confirmed in buildDFALayout.
+//
+// The check is estimatedStates+1 <= threshold because WASM emission always
+// reserves state 0 as the implicit dead state, so a DFA with N logical states
+// occupies N+1 WASM state slots.  As a result the effective maximum number of
+// logical states is threshold-1, not threshold.
 func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptions) EngineType {
 	if engine != EngineDFA {
 		return engine

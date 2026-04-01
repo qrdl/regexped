@@ -165,6 +165,9 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 		if emptyOp&syntax.EmptyNoWordBoundary != 0 && (wbCtx&ecNoWordBoundary) != 0 {
 			fires = true
 		}
+		if emptyOp&syntax.EmptyEndLine != 0 && (wbCtx&(ecEnd|ecEndLine)) != 0 {
+			fires = true
+		}
 		if !fires || visited[inst.Out] {
 			continue
 		}
@@ -707,7 +710,8 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 		// Process '\n' using inputMapNewline (ecEndLine context, nextPrevWasNewline=true).
 		if dfa.hasNewlineBoundary && inputMapNewline != nil {
 			if nextNFAStates, ok := inputMapNewline['\n']; ok {
-				nextSet := epsilonClosure(nextNFAStates, 0)
+				// After consuming '\n', ecBeginLine fires so (?m:^) assertions mid-pattern are followed.
+				nextSet := epsilonClosure(nextNFAStates, ecBeginLine)
 				nextDFAState := getOrAddState(nextSet, false, true) // nextPrevWasNewline=true
 				dfa.unicodeTrans[item.dfaState]['\n'] = nextDFAState
 			}
