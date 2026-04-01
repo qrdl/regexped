@@ -1,10 +1,10 @@
 package compile
 
-import "github.com/qrdl/regexped/utils"
+import "github.com/qrdl/regexped/internal/utils"
 
-// PrefixScanLocals holds the WASM local variable indices used by EmitPrefixScan.
+// prefixScanLocals holds the WASM local variable indices used by emitPrefixScan.
 // These indices differ per engine because each engine declares its own local layout.
-type PrefixScanLocals struct {
+type prefixScanLocals struct {
 	Ptr          byte // i32 param: input buffer base address
 	Len          byte // i32 param: input length
 	AttemptStart byte // i32 local: current scan position (read/write)
@@ -17,8 +17,8 @@ type PrefixScanLocals struct {
 	T2Lo, T2Hi   byte // v128 locals: T2_lo, T2_hi (3-byte Teddy, pre-loaded)
 }
 
-// PrefixScanParams configures EmitPrefixScan.
-type PrefixScanParams struct {
+// prefixScanParams configures emitPrefixScan.
+type prefixScanParams struct {
 	// What to scan for. Exactly one scan strategy is chosen at emit time:
 	//   len(Prefix) >= 1            → SIMD hybrid prefix scan
 	//   len(FirstByteSet) 1..8      → 2-byte Teddy (when TeddyTwoByte) or 1-byte Teddy
@@ -42,7 +42,7 @@ type PrefixScanParams struct {
 	// Used to compute br depths to $no_match from within the scan.
 	EngineDepth byte
 
-	Locals PrefixScanLocals
+	Locals prefixScanLocals
 
 	// OnMatch is called after the scan finds a candidate and all scan blocks
 	// have closed. attempt_start holds the candidate position.
@@ -50,7 +50,7 @@ type PrefixScanParams struct {
 	OnMatch func(b []byte) []byte
 }
 
-// EmitPrefixScan emits the WASM bytes for the prefix/firstByteFlags scan phase.
+// emitPrefixScan emits the WASM bytes for the prefix/firstByteFlags scan phase.
 //
 // On success: advances attempt_start to the candidate, calls p.OnMatch, returns.
 // On exhaustion: branches to $no_match (depth = p.EngineDepth-1 from the outer
@@ -58,7 +58,7 @@ type PrefixScanParams struct {
 // the prefix path).
 //
 // The caller is responsible for the surrounding $no_match/$outer blocks.
-func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
+func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 	l := p.Locals
 	ed := p.EngineDepth
 

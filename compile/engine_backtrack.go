@@ -4,7 +4,7 @@ import (
 	"regexp/syntax"
 	"sort"
 
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------
@@ -1254,9 +1254,9 @@ func nfaFirstBytes(prog *syntax.Prog) (firstBytes []byte, flags [256]byte, allBy
 }
 
 // buildBTScanTables computes the SIMD scan tables for BT find from the NFA first
-// bytes and returns (PrefixScanParams, raw data segment bytes (no count prefix), segCount).
+// bytes and returns (prefixScanParams, raw data segment bytes (no count prefix), segCount).
 // tableBase is the memory address where the tables will be stored.
-func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes bool, tableBase int64) (PrefixScanParams, []byte, int) {
+func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes bool, tableBase int64) (prefixScanParams, []byte, int) {
 	if allBytes || len(firstBytes) == 0 {
 		// Scalar fallback: store 256-byte flag table.
 		off := int32(tableBase)
@@ -1270,11 +1270,11 @@ func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes boo
 			fb = firstByteFlags
 		}
 		segs = appendDataSegment(segs, off, fb[:])
-		params := PrefixScanParams{
+		params := prefixScanParams{
 			FirstByteSet:   firstBytes,
 			FirstByteFlags: firstByteFlags,
 			FirstByteOff:   off,
-			Locals: PrefixScanLocals{
+			Locals: prefixScanLocals{
 				Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8,
 				Chunk: 9, TLo: 10, THi: 11, Chunk1: 12, T1Lo: 13, T1Hi: 14,
 			},
@@ -1304,14 +1304,14 @@ func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes boo
 		segCnt += 2
 	}
 
-	params := PrefixScanParams{
+	params := prefixScanParams{
 		FirstByteSet:   firstBytes,
 		FirstByteFlags: firstByteFlags,
 		FirstByteOff:   firstByteOff,
 		TeddyLoOff:     teddyLoOff,
 		TeddyHiOff:     teddyHiOff,
 		TeddyTwoByte:   false,
-		Locals: PrefixScanLocals{
+		Locals: prefixScanLocals{
 			Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8,
 			Chunk: 9, TLo: 10, THi: 11, Chunk1: 12, T1Lo: 13, T1Hi: 14,
 		},
@@ -1561,7 +1561,7 @@ func emitBTMemoZeroInit(body []byte, memoTableBase int32, N int,
 // appendBTFindCodeEntry appends a size-prefixed no-capture BT find body.
 // Signature: (ptr i32, len i32) → i64
 // Returns (start << 32 | end) on match, -1 on no match.
-func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams PrefixScanParams,
+func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams,
 	stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool) []byte {
 	body := buildBTFindBody(bt, scanParams, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen, useMemo)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
@@ -1577,12 +1577,12 @@ func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams PrefixScanParams
 //	           attempt_start(7), simd_mask(8)
 //	v128:     chunk(9), tLo(10), tHi(11), [chunk1(12), t1Lo(13), t1Hi(14)] if T1
 //	i32 rest: loop_pos(9+numV128+j ...), memo(...)
-func buildBTFindBody(bt *backtrack, scanParams PrefixScanParams,
+func buildBTFindBody(bt *backtrack, scanParams prefixScanParams,
 	stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 
-	// Number of v128 locals needed by EmitPrefixScan.
+	// Number of v128 locals needed by emitPrefixScan.
 	var numV128Locals int
 	if len(scanParams.Prefix) >= 1 {
 		numV128Locals = 1
@@ -1707,7 +1707,7 @@ func buildBTFindBody(bt *backtrack, scanParams PrefixScanParams,
 		b = append(b, 0x0B) // end block $run_exit
 		return b
 	}
-	body = EmitPrefixScan(body, scanParams)
+	body = emitPrefixScan(body, scanParams)
 
 	// attempt_start++; br $outer
 	body = append(body, 0x20, locAttemptStart, 0x41, 0x01, 0x6A, 0x21, locAttemptStart)

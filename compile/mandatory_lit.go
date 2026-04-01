@@ -2,19 +2,19 @@ package compile
 
 import "regexp/syntax"
 
-// MandatoryLit describes a fixed byte sequence that must appear in every match,
+// mandatoryLit describes a fixed byte sequence that must appear in every match,
 // along with its offset range from the start of the match.
-type MandatoryLit struct {
-	Bytes  []byte
-	MinOff int32 // minimum offset of the literal start from match start
-	MaxOff int32 // maximum offset of the literal start from match start
+type mandatoryLit struct {
+	bytes  []byte
+	minOff int32 // minimum offset of the literal start from match start
+	maxOff int32 // maximum offset of the literal start from match start
 }
 
-// FindMandatoryLit analyzes the regex pattern and returns the first mandatory
+// findMandatoryLit analyzes the regex pattern and returns the first mandatory
 // literal found (with its min/max offset from match start). Returns nil if no
 // mandatory literal is found or if MaxOff > 256.
 // Does NOT call Simplify() so that OpPlus/OpRepeat are preserved.
-func FindMandatoryLit(pattern string) *MandatoryLit {
+func findMandatoryLit(pattern string) *mandatoryLit {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
@@ -25,7 +25,7 @@ func FindMandatoryLit(pattern string) *MandatoryLit {
 // findMandatoryLitRec recursively searches for a mandatory literal in re,
 // given that the match position is within [minOff, maxOff] bytes from the
 // literal's potential start.
-func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) *MandatoryLit {
+func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) *mandatoryLit {
 	if maxOff < 0 || maxOff > 256 {
 		return nil
 	}
@@ -45,7 +45,7 @@ func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) *MandatoryLit 
 		if len(bs) == 0 {
 			return nil
 		}
-		return &MandatoryLit{Bytes: bs, MinOff: minOff, MaxOff: maxOff}
+		return &mandatoryLit{bytes: bs, minOff: minOff, maxOff: maxOff}
 
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {

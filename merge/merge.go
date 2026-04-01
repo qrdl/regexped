@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // cmdMerge patches the main WASM module's memory size and merges it with the

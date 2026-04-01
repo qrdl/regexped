@@ -77,7 +77,7 @@ func DecodeSLEB128(data []byte) (int64, int) {
 	return v, len(data)
 }
 
-// rustMemTop scans the given WASM binary and returns the highest byte address
+// RustMemTop scans the given WASM binary and returns the highest byte address
 // that the module occupies: max of all active data-segment end addresses and
 // the initial value of the mutable i32 global (the shadow-stack pointer).
 func RustMemTop(path string) (int64, error) {

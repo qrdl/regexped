@@ -33,25 +33,25 @@ func TestFindMandatoryLit(t *testing.T) {
 		{`[a-zA-Z]{2,8}://[^\s]+`, false, "://", 2},
 	}
 	for _, c := range cases {
-		got := FindMandatoryLit(c.pattern)
+		got := findMandatoryLit(c.pattern)
 		if c.wantNil {
 			if got != nil {
-				t.Errorf("FindMandatoryLit(%q): got %v, want nil", c.pattern, got)
+				t.Errorf("findMandatoryLit(%q): got %v, want nil", c.pattern, got)
 			}
 			continue
 		}
 		if got == nil {
-			t.Errorf("FindMandatoryLit(%q): got nil, want lit=%q", c.pattern, c.wantLit)
+			t.Errorf("findMandatoryLit(%q): got nil, want lit=%q", c.pattern, c.wantLit)
 			continue
 		}
-		if string(got.Bytes) != c.wantLit {
-			t.Errorf("FindMandatoryLit(%q): lit=%q, want %q", c.pattern, got.Bytes, c.wantLit)
+		if string(got.bytes) != c.wantLit {
+			t.Errorf("findMandatoryLit(%q): lit=%q, want %q", c.pattern, got.bytes, c.wantLit)
 		}
-		if got.MinOff != c.wantMin {
-			t.Errorf("FindMandatoryLit(%q): minOff=%d, want %d", c.pattern, got.MinOff, c.wantMin)
+		if got.minOff != c.wantMin {
+			t.Errorf("findMandatoryLit(%q): minOff=%d, want %d", c.pattern, got.minOff, c.wantMin)
 		}
-		if got.MaxOff < got.MinOff {
-			t.Errorf("FindMandatoryLit(%q): maxOff %d < minOff %d", c.pattern, got.MaxOff, got.MinOff)
+		if got.maxOff < got.minOff {
+			t.Errorf("findMandatoryLit(%q): maxOff %d < minOff %d", c.pattern, got.maxOff, got.minOff)
 		}
 	}
 }

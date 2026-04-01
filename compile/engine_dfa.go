@@ -5,7 +5,7 @@ import (
 	"regexp/syntax"
 	"unicode"
 
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------
@@ -1619,7 +1619,7 @@ func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, hasImmAccept boo
 
 // appendFindCodeEntry appends a size-prefixed find function body to cs.
 // Uses buildAnchoredFindBody when isAnchoredFind(t), else buildFindBody.
-func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *MandatoryLit) []byte {
+func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit) []byte {
 	var body []byte
 	if l.useHybridDispatch {
 		if isAnchoredFind(t) {
@@ -2652,7 +2652,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		b = append(b, byte(numI32Locals), 0x7F) // 6 × i32
 	}
 
-	// Local indices for the DFA locals (also used by EmitPrefixScan).
+	// Local indices for the DFA locals (also used by emitPrefixScan).
 	const (
 		locPtr          = 0
 		locLen          = 1
@@ -2677,9 +2677,9 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x03, 0x40) // loop $lit_outer
 
 	// ── Phase 1: SIMD scan for any literal first byte ─────────────────────────
-	// EmitPrefixScan uses EngineDepth=2 (loop $lit_outer + block $no_match).
+	// emitPrefixScan uses EngineDepth=2 (loop $lit_outer + block $no_match).
 	// OnMatch: nothing — attempt_start is set to the candidate position, fall through.
-	simdParams := PrefixScanParams{
+	simdParams := prefixScanParams{
 		FirstByteSet:   p.litAnchorFirstBytes,
 		FirstByteFlags: p.litAnchorFirstByteFlags,
 		FirstByteOff:   p.litAnchorFirstByteOff,
@@ -2689,7 +2689,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		TeddyT1LoOff:   p.litAnchorTeddyT1LoOff,
 		TeddyT1HiOff:   p.litAnchorTeddyT1HiOff,
 		EngineDepth:    2,
-		Locals: PrefixScanLocals{
+		Locals: prefixScanLocals{
 			Ptr:          locPtr,
 			Len:          locLen,
 			AttemptStart: locAttemptStart,
@@ -2703,7 +2703,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		},
 		OnMatch: nil, // fall through with attempt_start = candidate position
 	}
-	b = EmitPrefixScan(b, simdParams)
+	b = emitPrefixScan(b, simdParams)
 
 	// ── Scalar literal verification ───────────────────────────────────────────
 	// After the SIMD scan places a candidate in attempt_start, verify that one
@@ -3026,7 +3026,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, mandatoryLit *MandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32) []byte {
 	var b []byte
 
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
@@ -3216,7 +3216,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	//        state=startState, pos=attempt_start, last_accept=-1
 	//        if accept[state]: last_accept=pos  (start-state empty-match check)
 	emitOuterPrologue := func(b []byte) []byte {
-		params := PrefixScanParams{
+		params := prefixScanParams{
 			Prefix:         prefix,
 			FirstByteSet:   firstBytes,
 			FirstByteFlags: firstByteFlags,
@@ -3230,7 +3230,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			TeddyT2HiOff:   teddyT2HiOff,
 			TeddyThreeByte: teddyThreeByte,
 			EngineDepth:    2, // loop $outer + block $no_match
-			Locals: PrefixScanLocals{
+			Locals: prefixScanLocals{
 				Ptr:          0,
 				Len:          1,
 				AttemptStart: 4,
@@ -3327,7 +3327,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				return b
 			},
 		}
-		return EmitPrefixScan(b, params)
+		return emitPrefixScan(b, params)
 	}
 
 	// ── helper: emit the packed-i64 return and close loops ──────────────────
@@ -3460,13 +3460,13 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	}
 
 	// emitMLRangeCheck emits the range check at the top of $outer.
-	// If attempt_start > lit_pos - MinOff: scan_start = lit_pos + 1; br 2 → $lit_outer.
+	// If attempt_start > lit_pos - minOff: scan_start = lit_pos + 1; br 2 → $lit_outer.
 	// Depths from inside if block: 0=if, 1=$outer, 2=$lit_outer.
 	emitMLRangeCheck := func(b []byte) []byte {
 		b = append(b, 0x20, 0x04)        // local.get attempt_start
 		b = append(b, 0x20, litPosLocal) // local.get lit_pos
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, mandatoryLit.MinOff)
+		b = utils.AppendSLEB128(b, mandatoryLit.minOff)
 		b = append(b, 0x6B)                 // i32.sub: lit_pos - MinOff
 		b = append(b, 0x4A)                 // i32.gt_s: attempt_start > lit_pos-MinOff?
 		b = append(b, 0x04, 0x40)           // if (void)
@@ -3479,19 +3479,19 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		return b
 	}
 
-	// emitMLOuterSetup emits: [init scan_start if MinOff>0]; loop $lit_outer; EmitPrefixScan(lit);
+	// emitMLOuterSetup emits: [init scan_start if MinOff>0]; loop $lit_outer; emitPrefixScan(lit);
 	// OnMatch: set lit_pos, adjust attempt_start; loop $outer; range check; DFA prologue.
 	emitMLOuterSetup := func(b []byte) []byte {
-		if mandatoryLit.MinOff > 0 {
+		if mandatoryLit.minOff > 0 {
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, mandatoryLit.MinOff)
+			b = utils.AppendSLEB128(b, mandatoryLit.minOff)
 			b = append(b, 0x21, scanStartLocal)
 		}
 		b = append(b, 0x03, 0x40) // loop $lit_outer
-		b = EmitPrefixScan(b, PrefixScanParams{
-			Prefix:      mandatoryLit.Bytes,
+		b = emitPrefixScan(b, prefixScanParams{
+			Prefix:      mandatoryLit.bytes,
 			EngineDepth: 2, // loop $lit_outer + block $no_match
-			Locals: PrefixScanLocals{
+			Locals: prefixScanLocals{
 				Ptr:          0,
 				Len:          1,
 				AttemptStart: scanStartLocal,
@@ -3506,7 +3506,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				// Step 1: adj = lit_pos - MaxOff
 				b = append(b, 0x20, litPosLocal)
 				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, mandatoryLit.MaxOff)
+				b = utils.AppendSLEB128(b, mandatoryLit.maxOff)
 				b = append(b, 0x6B)                    // i32.sub
 				b = append(b, 0x21, simdMaskScanLocal) // temp = adj
 				// Step 2: clamp temp to >= 0

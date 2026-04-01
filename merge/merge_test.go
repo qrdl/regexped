@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 func buildImportSection(mod, field string, kind byte) []byte {

@@ -1,7 +1,7 @@
 package compile
 
 import (
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------
@@ -311,10 +311,10 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout) []byte {
 // pattern is non-anchored. It is a thin wrapper that delegates to buildFindBody with
 // parameters taken from the pre-computed dfaLayout.
 //
-// The SIMD prefix scan (EmitPrefixScan) is already table/SIMD-only with no br_table
+// The SIMD prefix scan (emitPrefixScan) is already table/SIMD-only with no br_table
 // dispatch, so no restructuring is required for the find hot path.
 // Row deduplication is guaranteed disabled for the hybrid path.
-func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *MandatoryLit) []byte {
+func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit) []byte {
 	return buildFindBody(
 		l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
 		l.wasmMidStartNewline, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff,

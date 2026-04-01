@@ -5,7 +5,7 @@ import (
 	"regexp/syntax"
 	"sort"
 
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------

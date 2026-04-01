@@ -8,20 +8,20 @@ import (
 	"regexp/syntax"
 
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
-// MatchMode controls the generated WASM function's matching behaviour.
-type MatchMode int
+// matchMode controls the generated WASM function's matching behaviour.
+type matchMode int
 
 const (
-	// ModeAnchoredMatch generates a function (ptr, len i32) -> i32 that matches
+	// modeAnchoredMatch generates a function (ptr, len i32) -> i32 that matches
 	// the full input anchored at position 0, returning end position or -1.
-	ModeAnchoredMatch MatchMode = 0
+	modeAnchoredMatch matchMode = 0
 
-	// ModeFind generates a function (ptr, len i32) -> i64 that scans the input
+	// modeFind generates a function (ptr, len i32) -> i64 that scans the input
 	// for the leftmost-longest match, returning packed (start<<32|end) or -1.
-	ModeFind MatchMode = 1
+	modeFind matchMode = 1
 )
 
 // EngineType represents the type of regex engine implementation.
@@ -50,8 +50,8 @@ func (e EngineType) String() string {
 	}
 }
 
-// Matcher is the common interface implemented by all regex engines.
-type Matcher interface {
+// matcher is the common interface implemented by all regex engines.
+type matcher interface {
 	Type() EngineType
 }
 
@@ -69,7 +69,7 @@ type CompileOptions struct {
 	MaxDFAMemory  int        // Maximum DFA memory in bytes (default: 102400)
 	Unicode       bool       // Enable Unicode support
 	ForceEngine   EngineType // If non-zero, skip engine selection and use this engine type
-	Mode          MatchMode  // ModeAnchoredMatch (default) or ModeFind
+	Mode          matchMode  // modeAnchoredMatch (default) or modeFind
 	LeftmostFirst bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 	// CompiledDFAThreshold is the maximum minimised WASM state count for which the
 	// compiled dispatch path (EngineCompiledDFA) is used instead of the table-driven
@@ -301,7 +301,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if !dfaTooLarge {
 		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(nil))
 	}
-	mandatoryLit := FindMandatoryLit(re.Pattern)
+	mandatoryLit := findMandatoryLit(re.Pattern)
 
 	p := &compiledPattern{
 		matchExport: re.MatchFunc,
@@ -352,17 +352,17 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
-			lap := FindLitAnchorPoint(re.Pattern)
+			lap := findLitAnchorPoint(re.Pattern)
 			if lap != nil && l.useU8 && !table.hasWordBoundary {
 				// Compile the reversed prefix DFA for the backward scan.
-				revRe := reverseRegexp(lap.PrefixRe)
+				revRe := reverseRegexp(lap.prefixRe)
 				revSimplified := revRe.Simplify()
 				revProg, revCompErr := syntax.Compile(revSimplified)
 				if revCompErr == nil && !needsUnicodeSupport(revProg) {
 					revDFA := newDFA(revProg, false, false)
 					revTable := dfaTableFrom(revDFA)
 					if revTable.numStates+1 <= 256 &&
-						(lap.Anchored || (!revTable.acceptStates[revTable.startState] &&
+						(lap.anchored || (!revTable.acceptStates[revTable.startState] &&
 							!revTable.midAcceptStates[revTable.startState])) {
 						revTableBase := utils.PageAlign(l.tableEnd)
 						revL := buildDFALayout(revTable, revTableBase, true, false, 0)
@@ -370,7 +370,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 						var litFirstBytes []byte
 						var litFirstByteFlags [256]byte
-						for _, lit := range lap.LitSet {
+						for _, lit := range lap.litSet {
 							b0 := lit[0]
 							if litFirstByteFlags[b0] == 0 {
 								litFirstByteFlags[b0] = 1
@@ -398,7 +398,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 							for i, fb := range litFirstBytes {
 								fbToBit[fb] = i
 							}
-							for _, lit := range lap.LitSet {
+							for _, lit := range lap.litSet {
 								bit, ok := fbToBit[lit[0]]
 								if !ok {
 									continue
@@ -441,7 +441,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						p.litAnchorTeddyT1HiOff = litTeddyT1HiOff
 						p.litAnchorTeddyT1LoBytes = litTeddyT1LoBytes
 						p.litAnchorTeddyT1HiBytes = litTeddyT1HiBytes
-						p.litAnchorLitSet = lap.LitSet
+						p.litAnchorLitSet = lap.litSet
 						p.dataBytes = append(p.dataBytes, revRawData...)
 						p.dataSegCount += revSegCnt
 						p.dataBytes = append(p.dataBytes, litSegs...)
@@ -870,8 +870,8 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 	return selectBestEngine(prog, hasCapturesBeforeSimplify, &opts), nil
 }
 
-// compile parses the pattern, selects the optimal engine, and returns a compiled Matcher.
-func compile(pattern string, opts ...CompileOptions) (Matcher, error) {
+// compile parses the pattern, selects the optimal engine, and returns a compiled matcher.
+func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)

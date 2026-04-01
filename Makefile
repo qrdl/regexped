@@ -4,7 +4,7 @@ GO_SRCS := main.go \
 	compile/engine_backtrack.go compile/engine_tdfa.go compile/prefix_scan.go compile/wasm.go compile/mandatory_lit.go \
 	generate/generate.go generate/rust_stub.go generate/dummy_main.go \
 	merge/merge.go \
-	utils/bytes.go
+	internal/utils/bytes.go
 
 .PHONY: re2test perftest examples clean unittest
 
@@ -23,7 +23,7 @@ examples: build
 	$(MAKE) -C examples
 
 unittest:
-	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./utils
+	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/...
 	@go tool cover -func=cover.out | grep "total:" | awk '{print "Test coverage: " $$3}'
 	@rm cover.out
 
