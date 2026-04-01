@@ -4,7 +4,7 @@ import (
 	"regexp/syntax"
 	"sort"
 
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------
@@ -58,16 +58,6 @@ const (
 
 func capStartLocal(i int) uint32 { return uint32(7 + i*2) }
 func capEndLocal(i int) uint32   { return uint32(8 + i*2) }
-
-// isLoopPC returns true if pc is a loop back-edge (Out or Arg points backward).
-func isLoopPC(prog *syntax.Prog, pc int) bool {
-	inst := prog.Inst[pc]
-	if inst.Op != syntax.InstAlt && inst.Op != syntax.InstAltMatch {
-		return false
-	}
-	pcU32 := uint32(pc)
-	return inst.Out < pcU32 || inst.Arg < pcU32
-}
 
 // loopBodyStart returns the PC of the first instruction inside the loop body
 // at loopPC (the backward-pointing branch).
@@ -125,7 +115,9 @@ func loopBodyCanMatchEmpty(prog *syntax.Prog, loopPC int) bool {
 // of exiting), causing an infinite loop.  BitState memoisation breaks the cycle.
 //
 // Greedy loops are already handled correctly by the zero-progress guard
-// (zero-progress → take exit), so they never need BitState.
+// (zero-progress → take exit), so they never need BitState.  In particular,
+// the canonical "catastrophic backtracking" pattern (?:a?)* has a greedy outer
+// loop: when a? matches empty the guard fires and the loop exits immediately.
 func needsBitState(prog *syntax.Prog) bool {
 	for pc, inst := range prog.Inst {
 		if inst.Op != syntax.InstAlt && inst.Op != syntax.InstAltMatch {
@@ -137,45 +129,6 @@ func needsBitState(prog *syntax.Prog) bool {
 		}
 	}
 	return false
-}
-
-// memoStateSet returns the set of NFA PCs that are reachable within the body
-// of any non-greedy zero-matchable loop.  Only these states need a BitState
-// bit check/set.  Returns nil if needsBitState is false.
-func memoStateSet(prog *syntax.Prog) map[int]bool {
-	states := make(map[int]bool)
-	for pc, inst := range prog.Inst {
-		if inst.Op != syntax.InstAlt && inst.Op != syntax.InstAltMatch {
-			continue
-		}
-		if inst.Arg >= uint32(pc) || !loopBodyCanMatchEmpty(prog, pc) {
-			continue // only non-greedy zero-matchable loops
-		}
-		bodyStart := loopBodyStart(prog, pc)
-		visited := make([]bool, len(prog.Inst))
-		queue := []int{bodyStart}
-		for len(queue) > 0 {
-			cur := queue[0]
-			queue = queue[1:]
-			if cur == pc || visited[cur] {
-				continue
-			}
-			visited[cur] = true
-			states[cur] = true
-			i := prog.Inst[cur]
-			switch i.Op {
-			case syntax.InstAlt, syntax.InstAltMatch:
-				queue = append(queue, int(i.Out), int(i.Arg))
-			default:
-				queue = append(queue, int(i.Out))
-			}
-		}
-		states[pc] = true // loop head itself needs the check
-	}
-	if len(states) == 0 {
-		return nil
-	}
-	return states
 }
 
 // appendBacktrackCodeEntry appends a size-prefixed backtracking capture body to cs.
@@ -272,7 +225,6 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		memoByteAddr uint32 // memoTableBase + bitIdx/8
 		memoMemoByte uint32 // loaded byte from bitset
 		memoZeroLen  uint32 // (N * lenPlus1 + 7) / 8
-		memoZeroIdx  uint32 // loop counter for zero-init
 	)
 	if useMemo {
 		memoLenPlus1 = memoLocalsBase
@@ -280,14 +232,13 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		memoByteAddr = memoLocalsBase + 2
 		memoMemoByte = memoLocalsBase + 3
 		memoZeroLen = memoLocalsBase + 4
-		memoZeroIdx = memoLocalsBase + 5
 	}
 
 	// Total non-param locals: pos, sp, state, scratch, cap0s, cap0e, ...,
 	// loop_pos..., loop_snap..., (memo locals when useMemo)
 	memoLocalsCount := 0
 	if useMemo {
-		memoLocalsCount = 6
+		memoLocalsCount = 5
 	}
 	totalLocals := 4 + numCapLocals + len(loopPCsSorted) + snapTotal + memoLocalsCount
 
@@ -355,44 +306,13 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		body = append(body, 0x21)
 		body = utils.AppendULEB128(body, memoZeroLen)
 
-		// memoZeroIdx = 0
-		body = append(body, 0x41, 0x00)
-		body = append(body, 0x21)
-		body = utils.AppendULEB128(body, memoZeroIdx)
-
-		// block $zeroEnd / loop $zeroLoop: memset(memoTableBase, 0, memoZeroLen)
-		body = append(body, 0x02, 0x40) // block void $zeroEnd
-		body = append(body, 0x03, 0x40) // loop void $zeroLoop
-
-		// if memoZeroIdx >= memoZeroLen: br $zeroEnd
-		body = append(body, 0x20)
-		body = utils.AppendULEB128(body, memoZeroIdx)
-		body = append(body, 0x20)
-		body = utils.AppendULEB128(body, memoZeroLen)
-		body = append(body, 0x4F)       // i32.ge_u
-		body = append(body, 0x0D, 0x01) // br_if 1 ($zeroEnd)
-
-		// mem[memoTableBase + memoZeroIdx] = 0
+		// memory.fill(memoTableBase, 0, memoZeroLen) — single bulk-memory instruction
 		body = append(body, 0x41)
-		body = utils.AppendSLEB128(body, memoTableBase)
+		body = utils.AppendSLEB128(body, memoTableBase) // i32.const memoTableBase (dst)
+		body = append(body, 0x41, 0x00)                 // i32.const 0 (val)
 		body = append(body, 0x20)
-		body = utils.AppendULEB128(body, memoZeroIdx)
-		body = append(body, 0x6A)       // i32.add
-		body = append(body, 0x41, 0x00) // i32.const 0
-		body = append(body, 0x3A, 0x00) // i32.store8 align=0
-		body = utils.AppendULEB128(body, 0)
-
-		// memoZeroIdx += 1
-		body = append(body, 0x20)
-		body = utils.AppendULEB128(body, memoZeroIdx)
-		body = append(body, 0x41, 0x01)
-		body = append(body, 0x6A) // i32.add
-		body = append(body, 0x21)
-		body = utils.AppendULEB128(body, memoZeroIdx)
-
-		body = append(body, 0x0C, 0x00) // br $zeroLoop
-		body = append(body, 0x0B)       // end loop
-		body = append(body, 0x0B)       // end block $zeroEnd
+		body = utils.AppendULEB128(body, memoZeroLen) // local.get memoZeroLen (len)
+		body = append(body, 0xFC, 0x0B, 0x00)         // memory.fill memory_idx=0
 	}
 
 	// ── Main loop $run ───────────────────────────────────────────────────────
@@ -705,8 +625,29 @@ func emitBTInstHandler(
 	case syntax.InstEmptyWidth:
 		emptyOp := syntax.EmptyOp(inst.Arg)
 		switch {
-		case emptyOp&(syntax.EmptyBeginText|syntax.EmptyBeginLine) != 0:
-			// fail if pos != 0
+		case emptyOp&syntax.EmptyBeginLine != 0:
+			// (?m:^): fires at pos==0 or when prev byte is '\n'
+			// Fail if: pos != 0 AND mem[ptr + pos - 1] != '\n'
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x45)       // i32.eqz
+			body = append(body, 0x04, 0x40) // if void (pos == 0): ok
+			body = append(body, 0x05)       // else (pos > 0): check prev byte
+			body = append(body, 0x20, localPtr)
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x6A)             // i32.add
+			body = append(body, 0x41, 0x01)       // i32.const 1
+			body = append(body, 0x6B)             // i32.sub (ptr + pos - 1)
+			body = append(body, 0x2D, 0x00, 0x00) // i32.load8_u (prev byte)
+			body = append(body, 0x41, 0x0A)       // i32.const '\n'
+			body = append(body, 0x47)             // i32.ne
+			body = append(body, 0x04, 0x40)       // if void (prev != '\n'): fail
+			body = btFail(body, brRunNested)
+			body = append(body, 0x0B) // end if prev != '\n'
+			body = append(body, 0x0B) // end if pos == 0
+			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+
+		case emptyOp&syntax.EmptyBeginText != 0:
+			// \A: fires only at pos==0 (beginning of match slice)
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x45)       // i32.eqz
 			body = append(body, 0x45)       // i32.eqz (NOT: nonzero = fail)
@@ -715,8 +656,28 @@ func emitBTInstHandler(
 			body = append(body, 0x0B) // end if
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 
-		case emptyOp&(syntax.EmptyEndText|syntax.EmptyEndLine) != 0:
-			// fail if pos != len
+		case emptyOp&syntax.EmptyEndLine != 0:
+			// (?m:$): fires at pos==len or when next byte is '\n'
+			// Fail if: pos != len AND mem[ptr + pos] != '\n'
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x20, localLen)
+			body = append(body, 0x46)       // i32.eq
+			body = append(body, 0x04, 0x40) // if void (pos == len): ok
+			body = append(body, 0x05)       // else (pos < len): check next byte
+			body = append(body, 0x20, localPtr)
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x6A)             // i32.add (ptr + pos)
+			body = append(body, 0x2D, 0x00, 0x00) // i32.load8_u (next byte)
+			body = append(body, 0x41, 0x0A)       // i32.const '\n'
+			body = append(body, 0x47)             // i32.ne
+			body = append(body, 0x04, 0x40)       // if void (next != '\n'): fail
+			body = btFail(body, brRunNested)
+			body = append(body, 0x0B) // end if next != '\n'
+			body = append(body, 0x0B) // end if pos == len
+			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+
+		case emptyOp&syntax.EmptyEndText != 0:
+			// \z: fires only at pos==len (end of match slice)
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x20, localLen)
 			body = append(body, 0x47)       // i32.ne
@@ -1301,9 +1262,9 @@ func nfaFirstBytes(prog *syntax.Prog) (firstBytes []byte, flags [256]byte, allBy
 }
 
 // buildBTScanTables computes the SIMD scan tables for BT find from the NFA first
-// bytes and returns (PrefixScanParams, raw data segment bytes (no count prefix), segCount).
+// bytes and returns (prefixScanParams, raw data segment bytes (no count prefix), segCount).
 // tableBase is the memory address where the tables will be stored.
-func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes bool, tableBase int64) (PrefixScanParams, []byte, int) {
+func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes bool, tableBase int64) (prefixScanParams, []byte, int) {
 	if allBytes || len(firstBytes) == 0 {
 		// Scalar fallback: store 256-byte flag table.
 		off := int32(tableBase)
@@ -1317,11 +1278,11 @@ func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes boo
 			fb = firstByteFlags
 		}
 		segs = appendDataSegment(segs, off, fb[:])
-		params := PrefixScanParams{
+		params := prefixScanParams{
 			FirstByteSet:   firstBytes,
 			FirstByteFlags: firstByteFlags,
 			FirstByteOff:   off,
-			Locals: PrefixScanLocals{
+			Locals: prefixScanLocals{
 				Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8,
 				Chunk: 9, TLo: 10, THi: 11, Chunk1: 12, T1Lo: 13, T1Hi: 14,
 			},
@@ -1351,14 +1312,14 @@ func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes boo
 		segCnt += 2
 	}
 
-	params := PrefixScanParams{
+	params := prefixScanParams{
 		FirstByteSet:   firstBytes,
 		FirstByteFlags: firstByteFlags,
 		FirstByteOff:   firstByteOff,
 		TeddyLoOff:     teddyLoOff,
 		TeddyHiOff:     teddyHiOff,
 		TeddyTwoByte:   false,
-		Locals: PrefixScanLocals{
+		Locals: prefixScanLocals{
 			Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8,
 			Chunk: 9, TLo: 10, THi: 11, Chunk1: 12, T1Lo: 13, T1Hi: 14,
 		},
@@ -1497,16 +1458,15 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	}
 
 	memoLocalsCount := 0
-	var memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen, memoZeroIdx uint32
+	var memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen uint32
 	if useMemo {
-		memoLocalsCount = 6
+		memoLocalsCount = 5
 		base := uint32(7 + len(loopPCsSorted))
 		memoLenPlus1 = base
 		memoBitIdx = base + 1
 		memoByteAddr = base + 2
 		memoMemoByte = base + 3
 		memoZeroLen = base + 4
-		memoZeroIdx = base + 5
 	}
 
 	// +1 for fake out_ptr at index 2
@@ -1532,7 +1492,7 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	}
 
 	if useMemo {
-		body = emitBTMemoZeroInit(body, memoTableBase, N, memoLenPlus1, memoZeroLen, memoZeroIdx)
+		body = emitBTMemoZeroInit(body, memoTableBase, N, memoLenPlus1, memoZeroLen)
 	}
 
 	// loop $run
@@ -1557,9 +1517,9 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	return body
 }
 
-// emitBTMemoZeroInit emits the memo bitset zero-initialisation loop.
+// emitBTMemoZeroInit emits a memory.fill instruction to zero the memo bitset.
 func emitBTMemoZeroInit(body []byte, memoTableBase int32, N int,
-	memoLenPlus1, memoZeroLen, memoZeroIdx uint32) []byte {
+	memoLenPlus1, memoZeroLen uint32) []byte {
 
 	// lenPlus1 = localLen + 1
 	body = append(body, 0x20, localLen, 0x41, 0x01, 0x6A, 0x21)
@@ -1571,34 +1531,13 @@ func emitBTMemoZeroInit(body []byte, memoTableBase int32, N int,
 	body = utils.AppendULEB128(body, memoLenPlus1)
 	body = append(body, 0x6C, 0x41, 0x07, 0x6A, 0x41, 0x03, 0x76, 0x21)
 	body = utils.AppendULEB128(body, memoZeroLen)
-	// memoZeroIdx = 0
-	body = append(body, 0x41, 0x00, 0x21)
-	body = utils.AppendULEB128(body, memoZeroIdx)
-
-	body = append(body, 0x02, 0x40) // block $zeroEnd
-	body = append(body, 0x03, 0x40) // loop $zeroLoop
-
-	body = append(body, 0x20)
-	body = utils.AppendULEB128(body, memoZeroIdx)
-	body = append(body, 0x20)
-	body = utils.AppendULEB128(body, memoZeroLen)
-	body = append(body, 0x4F, 0x0D, 0x01) // i32.ge_u; br_if $zeroEnd
-
+	// memory.fill(memoTableBase, 0, memoZeroLen) — single bulk-memory instruction
 	body = append(body, 0x41)
-	body = utils.AppendSLEB128(body, memoTableBase)
+	body = utils.AppendSLEB128(body, memoTableBase) // i32.const memoTableBase (dst)
+	body = append(body, 0x41, 0x00)                 // i32.const 0 (val)
 	body = append(body, 0x20)
-	body = utils.AppendULEB128(body, memoZeroIdx)
-	body = append(body, 0x6A, 0x41, 0x00, 0x3A, 0x00)
-	body = utils.AppendULEB128(body, 0)
-
-	body = append(body, 0x20)
-	body = utils.AppendULEB128(body, memoZeroIdx)
-	body = append(body, 0x41, 0x01, 0x6A, 0x21)
-	body = utils.AppendULEB128(body, memoZeroIdx)
-
-	body = append(body, 0x0C, 0x00) // br $zeroLoop
-	body = append(body, 0x0B)       // end loop
-	body = append(body, 0x0B)       // end block $zeroEnd
+	body = utils.AppendULEB128(body, memoZeroLen) // local.get memoZeroLen (len)
+	body = append(body, 0xFC, 0x0B, 0x00)         // memory.fill memory_idx=0
 	return body
 }
 
@@ -1608,9 +1547,9 @@ func emitBTMemoZeroInit(body []byte, memoTableBase int32, N int,
 // appendBTFindCodeEntry appends a size-prefixed no-capture BT find body.
 // Signature: (ptr i32, len i32) → i64
 // Returns (start << 32 | end) on match, -1 on no match.
-func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams PrefixScanParams,
-	stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool) []byte {
-	body := buildBTFindBody(bt, scanParams, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen, useMemo)
+func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams,
+	stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool, mandLit *mandatoryLit) []byte {
+	body := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen, useMemo)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -1623,15 +1562,21 @@ func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams PrefixScanParams
 //	i32 fixed: fake_out_ptr(2), pos(3), sp(4), state(5), scratch(6),
 //	           attempt_start(7), simd_mask(8)
 //	v128:     chunk(9), tLo(10), tHi(11), [chunk1(12), t1Lo(13), t1Hi(14)] if T1
-//	i32 rest: loop_pos(9+numV128+j ...), memo(...)
-func buildBTFindBody(bt *backtrack, scanParams PrefixScanParams,
+//	i32 rest: loop_pos(9+numV128+j ...), memo(...), [lit_pos, scan_start] if mandLit
+//
+// When mandLit != nil: uses a two-level outer loop — outer loop scans for the
+// mandatory literal, inner loop runs BT attempts in the resulting window.
+// scanParams is ignored when mandLit != nil (the mandatory-lit prefix scan replaces it).
+func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandatoryLit,
 	stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 
-	// Number of v128 locals needed by EmitPrefixScan.
+	// Number of v128 locals needed by emitPrefixScan.
 	var numV128Locals int
-	if len(scanParams.Prefix) >= 1 {
+	if mandLit != nil {
+		numV128Locals = 1 // chunk for the mandatory-lit prefix scan
+	} else if len(scanParams.Prefix) >= 1 {
 		numV128Locals = 1
 	} else if scanParams.TeddyTwoByte {
 		numV128Locals = 6
@@ -1655,25 +1600,33 @@ func buildBTFindBody(bt *backtrack, scanParams PrefixScanParams,
 	}
 
 	memoLocalsCount := 0
-	var memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen, memoZeroIdx uint32
+	var memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen uint32
 	if useMemo {
-		memoLocalsCount = 6
+		memoLocalsCount = 5
 		base := loopLocalsBase + uint32(len(loopPCsSorted))
 		memoLenPlus1 = base
 		memoBitIdx = base + 1
 		memoByteAddr = base + 2
 		memoMemoByte = base + 3
 		memoZeroLen = base + 4
-		memoZeroIdx = base + 5
 	}
 
 	// Declare three local groups so that v128 indices are stable regardless of
 	// how many loop or memo i32 locals follow:
 	//   Group 1: 7 fixed i32s (fake, pos, sp, state, scratch, attempt_start, simd_mask) → idx 2..8
 	//   Group 2: numV128Locals v128s → idx 9..9+numV128-1
-	//   Group 3: loop + memo i32s → idx 9+numV128..
+	//   Group 3: loop + memo i32s (+ lit_pos + scan_start when mandLit != nil) → idx 9+numV128..
 	// This matches loopLocalsBase = 9 + numV128Locals exactly.
 	numLoopAndMemoLocals := len(loopPCsSorted) + memoLocalsCount
+	// When using mandatory-lit two-level loop, two extra i32 locals are appended:
+	//   lit_pos       = loopLocalsBase + len(loopPCsSorted) + memoLocalsCount
+	//   scan_start    = lit_pos + 1
+	var litPosLocal, scanStartLocal uint32
+	if mandLit != nil {
+		litPosLocal = loopLocalsBase + uint32(len(loopPCsSorted)) + uint32(memoLocalsCount)
+		scanStartLocal = litPosLocal + 1
+		numLoopAndMemoLocals += 2
+	}
 	var body []byte
 	if numV128Locals > 0 {
 		numGroups := byte(2)
@@ -1687,7 +1640,7 @@ func buildBTFindBody(bt *backtrack, scanParams PrefixScanParams,
 		body = append(body, 0x7B) // numV128 v128s
 		if numLoopAndMemoLocals > 0 {
 			body = utils.AppendULEB128(body, uint32(numLoopAndMemoLocals))
-			body = append(body, 0x7F) // loop+memo i32s
+			body = append(body, 0x7F) // loop+memo (+ lit_pos+scan_start) i32s
 		}
 	} else {
 		body = append(body, 0x01)
@@ -1695,8 +1648,163 @@ func buildBTFindBody(bt *backtrack, scanParams PrefixScanParams,
 		body = append(body, 0x7F)
 	}
 
-	// block $no_match / loop $outer
 	const locAttemptStart = byte(0x07)
+
+	// ── Mandatory-literal two-level outer loop ────────────────────────────────
+	// When mandLit != nil: outer loop $lit_outer scans for the mandatory literal
+	// using an SIMD prefix scan, inner loop $outer runs BT from each candidate
+	// window [attempt_start, lit_pos−minOff].  scanParams is not used in this path.
+	if mandLit != nil {
+		// block $no_match
+		body = append(body, 0x02, 0x40)
+
+		// Initialise scan_start = minOff (skip positions where lit can't appear).
+		if mandLit.minOff > 0 {
+			body = append(body, 0x41)
+			body = utils.AppendSLEB128(body, mandLit.minOff)
+			body = append(body, 0x21)
+			body = utils.AppendULEB128(body, scanStartLocal) // local.set scan_start
+		}
+
+		// loop $lit_outer
+		body = append(body, 0x03, 0x40)
+
+		// Emit mandatory-literal SIMD prefix scan.
+		// On match: scan_start points to the literal position; OnMatch computes
+		//   lit_pos = scan_start
+		//   attempt_start = max(0, max(lit_pos − maxOff, attempt_start))
+		// On exhaustion: br 1 (ed−1) → exits $no_match → falls through to −1 return.
+		//
+		// NOTE: scanStartLocal and litPosLocal are < 128 in all practical cases
+		// (bounded by loop-PC count + 9 extra locals), so byte-casting is safe.
+		mlScan := prefixScanParams{
+			Prefix:      mandLit.bytes,
+			EngineDepth: 2,
+			Locals: prefixScanLocals{
+				Ptr:          0,
+				Len:          1,
+				AttemptStart: byte(scanStartLocal),
+				SimdMask:     8,
+				Chunk:        9,
+			},
+			OnMatch: func(b []byte) []byte {
+				// lit_pos = scan_start
+				b = append(b, 0x20)
+				b = utils.AppendULEB128(b, scanStartLocal) // local.get scan_start
+				b = append(b, 0x21)
+				b = utils.AppendULEB128(b, litPosLocal) // local.set lit_pos
+
+				// simd_mask (temp) = lit_pos − maxOff; clamp to 0
+				b = append(b, 0x20)
+				b = utils.AppendULEB128(b, litPosLocal) // local.get lit_pos
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, mandLit.maxOff)
+				b = append(b, 0x6B)       // i32.sub
+				b = append(b, 0x22, 0x08) // local.tee simd_mask
+				b = append(b, 0x41, 0x00)
+				b = append(b, 0x48)       // i32.lt_s: temp < 0?
+				b = append(b, 0x04, 0x40) // if void
+				b = append(b, 0x41, 0x00)
+				b = append(b, 0x21, 0x08) // simd_mask = 0
+				b = append(b, 0x0B)       // end if
+
+				// attempt_start = max(simd_mask, attempt_start)
+				b = append(b, 0x20, 0x08)            // local.get simd_mask
+				b = append(b, 0x20, locAttemptStart) // local.get attempt_start
+				b = append(b, 0x4A)                  // i32.gt_s
+				b = append(b, 0x04, 0x40)            // if void
+				b = append(b, 0x20, 0x08)            // local.get simd_mask
+				b = append(b, 0x21, locAttemptStart) // local.set attempt_start
+				b = append(b, 0x0B)                  // end if
+				return b
+			},
+		}
+		body = emitPrefixScan(body, mlScan)
+
+		// loop $outer: try BT at each position in [attempt_start, lit_pos−minOff].
+		body = append(body, 0x03, 0x40) // loop $outer
+
+		// Range check: if attempt_start > lit_pos − minOff:
+		//   scan_start = lit_pos + 1; br 2 → $lit_outer (continue outer scan)
+		// Depths from inside if block: 0=if, 1=$outer, 2=$lit_outer.
+		body = append(body, 0x20, locAttemptStart) // local.get attempt_start
+		body = append(body, 0x20)
+		body = utils.AppendULEB128(body, litPosLocal) // local.get lit_pos
+		body = append(body, 0x41)
+		body = utils.AppendSLEB128(body, mandLit.minOff)
+		body = append(body, 0x6B)       // i32.sub: lit_pos − minOff
+		body = append(body, 0x4A)       // i32.gt_s
+		body = append(body, 0x04, 0x40) // if void
+		body = append(body, 0x20)
+		body = utils.AppendULEB128(body, litPosLocal) // local.get lit_pos
+		body = append(body, 0x41, 0x01)
+		body = append(body, 0x6A) // i32.add
+		body = append(body, 0x21)
+		body = utils.AppendULEB128(body, scanStartLocal) // local.set scan_start
+		body = append(body, 0x0C, 0x02)                  // br 2 → $lit_outer
+		body = append(body, 0x0B)                        // end if
+
+		// Re-init BT state for this attempt_start.
+		body = append(body, 0x20, locAttemptStart, 0x21, localPos)
+		body = append(body, 0x41)
+		body = utils.AppendSLEB128(body, stackBase)
+		body = append(body, 0x21, localSP)
+		body = append(body, 0x41)
+		body = utils.AppendSLEB128(body, int32(prog.Start))
+		body = append(body, 0x21, localState)
+		for _, ll := range loopLocalIdx {
+			body = append(body, 0x41, 0x7F, 0x21)
+			body = utils.AppendULEB128(body, ll)
+		}
+		if useMemo {
+			body = emitBTMemoZeroInit(body, memoTableBase, N, memoLenPlus1, memoZeroLen)
+		}
+
+		// block $run_exit / loop $run / dispatch
+		failEmpty := func(bb []byte) []byte {
+			return append(bb, 0x0C, 0x03) // br 3 → exit $run_exit
+		}
+		matchFn := func(bb []byte, _ uint32) []byte {
+			bb = append(bb, 0x20, locAttemptStart)
+			bb = append(bb, 0xAD)       // i64.extend_i32_u
+			bb = append(bb, 0x42, 0x20) // i64.const 32
+			bb = append(bb, 0x86)       // i64.shl
+			bb = append(bb, 0x20, localPos)
+			bb = append(bb, 0xAD) // i64.extend_i32_u
+			bb = append(bb, 0x84) // i64.or
+			bb = append(bb, 0x0F) // return
+			return bb
+		}
+		overflowFind := func(bb []byte) []byte {
+			bb = append(bb, 0x42, 0x7F) // i64.const -1
+			bb = append(bb, 0x0F)
+			return bb
+		}
+		body = append(body, 0x02, 0x40) // block $run_exit
+		body = append(body, 0x03, 0x40) // loop $run
+		body = buildBTInnerDisp(body, bt, loopLocalIdx,
+			stackBase, stackLimit, frameSize,
+			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
+			useMemo, failEmpty, matchFn, overflowFind)
+		body = append(body, 0x00) // unreachable
+		body = append(body, 0x0B) // end loop $run
+		body = append(body, 0x0B) // end block $run_exit
+
+		// attempt_start++; br $outer
+		body = append(body, 0x20, locAttemptStart, 0x41, 0x01, 0x6A, 0x21, locAttemptStart)
+		body = append(body, 0x0C, 0x00) // br 0 → $outer
+
+		body = append(body, 0x0B)       // end loop $outer (unreachable)
+		body = append(body, 0x0B)       // end loop $lit_outer (unreachable)
+		body = append(body, 0x0B)       // end block $no_match (unreachable)
+		body = append(body, 0x42, 0x7F) // i64.const -1
+		body = append(body, 0x0F)       // return
+		body = append(body, 0x0B)       // end function
+		return body
+	}
+
+	// ── Standard first-byte / prefix scan path ────────────────────────────────
+	// block $no_match / loop $outer
 	body = append(body, 0x02, 0x40)
 	body = append(body, 0x03, 0x40)
 
@@ -1715,7 +1823,7 @@ func buildBTFindBody(bt *backtrack, scanParams PrefixScanParams,
 			b = utils.AppendULEB128(b, ll)
 		}
 		if useMemo {
-			b = emitBTMemoZeroInit(b, memoTableBase, N, memoLenPlus1, memoZeroLen, memoZeroIdx)
+			b = emitBTMemoZeroInit(b, memoTableBase, N, memoLenPlus1, memoZeroLen)
 		}
 
 		// block $run_exit
@@ -1754,7 +1862,7 @@ func buildBTFindBody(bt *backtrack, scanParams PrefixScanParams,
 		b = append(b, 0x0B) // end block $run_exit
 		return b
 	}
-	body = EmitPrefixScan(body, scanParams)
+	body = emitPrefixScan(body, scanParams)
 
 	// attempt_start++; br $outer
 	body = append(body, 0x20, locAttemptStart, 0x41, 0x01, 0x6A, 0x21, locAttemptStart)

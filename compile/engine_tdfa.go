@@ -5,7 +5,7 @@ import (
 	"regexp/syntax"
 	"sort"
 
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------
@@ -54,8 +54,6 @@ type tdfaTable struct {
 	numGroups    int         // number of capture groups (including group 0)
 	entryOps     []tdfaTagOp // ops emitted at function entry (before first byte is consumed)
 }
-
-func (t *tdfaTable) Type() EngineType { return EngineTDFA }
 
 // --------------------------------------------------------------------------
 // Internal subset-construction types
@@ -1183,105 +1181,6 @@ func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localC
 
 	b = append(b, 0x0B) // end $exit
 	return b
-}
-
-// TDFAStats compiles pattern to TDFA and returns state/register/op counts.
-// Uses a high state limit (2000) so it never returns (0,0,0,false) due to the cap.
-// Returns (0,0,0,false) only if the pattern fails to parse or compile as NFA.
-func TDFAStats(pattern string) (numStates, numRegs, totalTagOps int, ok bool) {
-	parsed, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return
-	}
-	prog, err := syntax.Compile(parsed.Simplify())
-	if err != nil {
-		return
-	}
-	tt, success := newTDFA(prog, 2000)
-	if !success {
-		numStates = -1
-		ok = false
-		return
-	}
-	numStates = tt.numStates
-	numRegs = tt.numRegs
-	for _, ops := range tt.tagOps {
-		totalTagOps += len(ops)
-	}
-	ok = true
-	return
-}
-
-// DFAStateCount returns the number of LF DFA states for the given pattern
-// after stripping capture groups. Used for diagnostics.
-func DFAStateCount(pattern string) (int, error) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return 0, err
-	}
-	// Re-parse a fresh copy so stripCaptures (which mutates in-place) doesn't
-	// affect what the caller might use for TDFA stats.
-	re2, _ := syntax.Parse(pattern, syntax.Perl)
-	stripCaptures(re2)
-	prog, err := syntax.Compile(re2.Simplify())
-	if err != nil {
-		return 0, err
-	}
-	_ = re
-	d := newDFA(prog, false, true) // leftmostFirst
-	t := dfaTableFrom(d)
-	return t.numStates, nil
-}
-
-// TDFADetailStats compiles pattern to TDFA and returns detailed stats:
-//
-//	numStates, numRegs, totalTagOps
-//	allSameStates  — number of states where all bytes with ops share identical ops (fast path)
-//	diffStates     — number of states where bytes have differing ops (slow: linear byte scan)
-//	diffTotalBytes — total number of (state,byte) entries in diffStates (= size of linear scan)
-func TDFADetailStats(pattern string) (numStates, numRegs, totalTagOps, allSameStates, diffStates, diffTotalBytes int) {
-	parsed, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return
-	}
-	prog, err := syntax.Compile(parsed.Simplify())
-	if err != nil {
-		return
-	}
-	tt, ok := newTDFA(prog, 2000)
-	if !ok {
-		numStates = -1
-		return
-	}
-	numStates = tt.numStates
-	numRegs = tt.numRegs
-	for gs := 0; gs < tt.numStates; gs++ {
-		var entries []int
-		for b := 0; b < 256; b++ {
-			idx := gs*256 + b
-			if idx < len(tt.tagOps) && len(tt.tagOps[idx]) > 0 {
-				totalTagOps += len(tt.tagOps[idx])
-				entries = append(entries, idx)
-			}
-		}
-		if len(entries) == 0 {
-			continue
-		}
-		allSame := true
-		for i := 1; i < len(entries); i++ {
-			if !tdfaTagOpsEqual(tt.tagOps[entries[0]], tt.tagOps[entries[i]]) {
-				allSame = false
-				break
-			}
-		}
-		if allSame {
-			allSameStates++
-		} else {
-			diffStates++
-			diffTotalBytes += len(entries)
-		}
-	}
-	return
 }
 
 func tdfaTagOpsEqual(a, b []tdfaTagOp) bool {

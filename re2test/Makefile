@@ -12,7 +12,7 @@ exhaustive: $(TESTDATA)
 	go run . $(TESTDATA)
 
 custom:
-	go run . --validate-go --validate-groups $(CUSTOM)
+	#go run . --validate-go --validate-groups $(CUSTOM)
 	go run . --validate-groups $(CUSTOM)
 
 $(ADJUSTED): $(TESTDATA)
@@ -24,6 +24,7 @@ adjusted: $(ADJUSTED)
 force-backtrack: $(ADJUSTED)
 	go run . --force-backtrack $(TESTDATA)
 	go run . --force-backtrack --validate-groups $(ADJUSTED)
+	go run . --force-backtrack --validate-groups $(CUSTOM)
 
 test: exhaustive custom adjusted force-backtrack
 

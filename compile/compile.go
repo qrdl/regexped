@@ -8,20 +8,20 @@ import (
 	"regexp/syntax"
 
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
-// MatchMode controls the generated WASM function's matching behaviour.
-type MatchMode int
+// matchMode controls the generated WASM function's matching behaviour.
+type matchMode int
 
 const (
-	// ModeAnchoredMatch generates a function (ptr, len i32) -> i32 that matches
+	// modeAnchoredMatch generates a function (ptr, len i32) -> i32 that matches
 	// the full input anchored at position 0, returning end position or -1.
-	ModeAnchoredMatch MatchMode = 0
+	modeAnchoredMatch matchMode = 0
 
-	// ModeFind generates a function (ptr, len i32) -> i64 that scans the input
+	// modeFind generates a function (ptr, len i32) -> i64 that scans the input
 	// for the leftmost-longest match, returning packed (start<<32|end) or -1.
-	ModeFind MatchMode = 1
+	modeFind matchMode = 1
 )
 
 // EngineType represents the type of regex engine implementation.
@@ -50,8 +50,8 @@ func (e EngineType) String() string {
 	}
 }
 
-// Matcher is the common interface implemented by all regex engines.
-type Matcher interface {
+// matcher is the common interface implemented by all regex engines.
+type matcher interface {
 	Type() EngineType
 }
 
@@ -69,7 +69,7 @@ type CompileOptions struct {
 	MaxDFAMemory  int        // Maximum DFA memory in bytes (default: 102400)
 	Unicode       bool       // Enable Unicode support
 	ForceEngine   EngineType // If non-zero, skip engine selection and use this engine type
-	Mode          MatchMode  // ModeAnchoredMatch (default) or ModeFind
+	Mode          matchMode  // modeAnchoredMatch (default) or modeFind
 	LeftmostFirst bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 	// CompiledDFAThreshold is the maximum minimised WASM state count for which the
 	// compiled dispatch path (EngineCompiledDFA) is used instead of the table-driven
@@ -301,7 +301,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if !dfaTooLarge {
 		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(nil))
 	}
-	mandatoryLit := FindMandatoryLit(re.Pattern)
+	patMandLit := findMandatoryLit(re.Pattern)
 
 	p := &compiledPattern{
 		matchExport: re.MatchFunc,
@@ -329,10 +329,32 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
 			useMemo := needsBitState(btProg)
-			// Compute first-byte SIMD tables from NFA.
-			btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
-			// Build Teddy tables for the first bytes if small enough.
-			btScanParams, btScanDataBytes, btScanSegCnt := buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
+			// Choose scan strategy (in priority order):
+			//   1. Multi-byte literal prefix from the (large) LF DFA — no data tables, pure SIMD.
+			//   2. Mandatory interior literal via two-level outer loop.
+			//   3. First-byte SIMD/Teddy tables from NFA (fallback).
+			var btScanParams prefixScanParams
+			var btScanDataBytes []byte
+			var btScanSegCnt int
+			var btMandLit *mandatoryLit
+			btPrefix := computePrefix(table) // table is always available (even when too large)
+			if len(btPrefix) >= 2 {
+				// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
+				btScanParams = prefixScanParams{
+					Prefix: btPrefix,
+					Locals: prefixScanLocals{
+						Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8, Chunk: 9,
+					},
+					EngineDepth: 2,
+				}
+			} else if patMandLit != nil {
+				// Mandatory interior literal: two-level outer loop; no first-byte tables needed.
+				btMandLit = patMandLit
+			} else {
+				// Fallback: first-byte SIMD/Teddy tables from NFA.
+				btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
+				btScanParams, btScanDataBytes, btScanSegCnt = buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
+			}
 			p.dataBytes = append(p.dataBytes, btScanDataBytes...)
 			p.dataSegCount += btScanSegCnt
 			// Allocate BT stack after SIMD tables.
@@ -348,21 +370,21 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				btMemoMaxLen = int32(btMemoMaxLenFor(btProg, memoBudget))
 			}
 			frameSize := int32(8) // pos + retryPC only (no cap slots)
-			p.findBody = appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, btMemoMaxLen, useMemo)
+			p.findBody = appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, btMemoMaxLen, useMemo, btMandLit)
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
-			lap := FindLitAnchorPoint(re.Pattern)
+			lap := findLitAnchorPoint(re.Pattern)
 			if lap != nil && l.useU8 && !table.hasWordBoundary {
 				// Compile the reversed prefix DFA for the backward scan.
-				revRe := reverseRegexp(lap.PrefixRe)
+				revRe := reverseRegexp(lap.prefixRe)
 				revSimplified := revRe.Simplify()
 				revProg, revCompErr := syntax.Compile(revSimplified)
 				if revCompErr == nil && !needsUnicodeSupport(revProg) {
 					revDFA := newDFA(revProg, false, false)
 					revTable := dfaTableFrom(revDFA)
 					if revTable.numStates+1 <= 256 &&
-						(lap.Anchored || (!revTable.acceptStates[revTable.startState] &&
+						(lap.anchored || (!revTable.acceptStates[revTable.startState] &&
 							!revTable.midAcceptStates[revTable.startState])) {
 						revTableBase := utils.PageAlign(l.tableEnd)
 						revL := buildDFALayout(revTable, revTableBase, true, false, 0)
@@ -370,7 +392,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 						var litFirstBytes []byte
 						var litFirstByteFlags [256]byte
-						for _, lit := range lap.LitSet {
+						for _, lit := range lap.litSet {
 							b0 := lit[0]
 							if litFirstByteFlags[b0] == 0 {
 								litFirstByteFlags[b0] = 1
@@ -398,7 +420,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 							for i, fb := range litFirstBytes {
 								fbToBit[fb] = i
 							}
-							for _, lit := range lap.LitSet {
+							for _, lit := range lap.litSet {
 								bit, ok := fbToBit[lit[0]]
 								if !ok {
 									continue
@@ -441,7 +463,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						p.litAnchorTeddyT1HiOff = litTeddyT1HiOff
 						p.litAnchorTeddyT1LoBytes = litTeddyT1LoBytes
 						p.litAnchorTeddyT1HiBytes = litTeddyT1HiBytes
-						p.litAnchorLitSet = lap.LitSet
+						p.litAnchorLitSet = lap.litSet
 						p.dataBytes = append(p.dataBytes, revRawData...)
 						p.dataSegCount += revSegCnt
 						p.dataBytes = append(p.dataBytes, litSegs...)
@@ -456,7 +478,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				}
 			}
 			if p.litAnchorBackScanBody == nil {
-				p.findBody = appendFindCodeEntry(nil, l, table, mandatoryLit)
+				p.findBody = appendFindCodeEntry(nil, l, table, patMandLit)
 			}
 
 			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))
@@ -768,17 +790,6 @@ func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool, use
 	return compileAll(patterns, tableBase, standalone, 0, opts)
 }
 
-// CompileForced is like Compile but forces the given engine for the capture path
-// of every entry that requests capture groups. Pass EngineBacktrack to force
-// backtracking regardless of the pattern's eligibility for TDFA.
-func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, userOpts ...CompileOptions) ([]byte, int64, error) {
-	var opts CompileOptions
-	if len(userOpts) > 0 {
-		opts = userOpts[0]
-	}
-	return compileAll(patterns, tableBase, standalone, forceGroupsEngine, opts)
-}
-
 func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, error) {
 	var compiled []*compiledPattern
 	cur := tableBase
@@ -850,79 +861,6 @@ func CmdCompile(cfg config.BuildConfig, wasmInput, outDir, outputFile string) er
 	return nil
 }
 
-// CompileRegex compiles a single regex pattern to WASM bytes.
-// tableBase must be page-aligned and >= 0.
-// If standalone is true, the module defines its own memory (suitable for testing);
-// otherwise it imports memory from the "main" module.
-// Returns the WASM bytes and the next available table base (page-aligned end of this module's data).
-// An optional CompileOptions argument overrides the defaults.
-func CompileRegex(pattern, exportName string, tableBase int64, standalone bool, userOpts ...CompileOptions) ([]byte, int64, error) {
-	opts := CompileOptions{
-		MaxDFAStates: 100000,
-		Unicode:      false,
-		ForceEngine:  EngineDFA,
-	}
-	if len(userOpts) > 0 {
-		opts = userOpts[0]
-	}
-	matcher, err := compile(pattern, opts)
-	if err != nil {
-		return nil, 0, fmt.Errorf("compile error: %w", err)
-	}
-	if matcher.Type() != EngineDFA {
-		return nil, 0, fmt.Errorf("unexpected engine %v (wanted DFA)", matcher.Type())
-	}
-	table := dfaTableFrom(matcher.(*dfa))
-
-	if opts.MaxDFAStates > 0 && table.numStates > opts.MaxDFAStates {
-		return nil, 0, fmt.Errorf("DFA has %d states, exceeds limit %d", table.numStates, opts.MaxDFAStates)
-	}
-
-	numWASM := table.numStates + 1
-	var dfaSize int64
-	switch {
-	case numWASM <= 256 && numWASM*256 > 32*1024: // u8 + compression
-		_, _, nc := computeByteClasses(table)
-		dfaSize = int64(256 + numWASM*nc + numWASM)
-	case numWASM <= 256: // u8, no compression
-		dfaSize = int64(numWASM*256 + numWASM)
-	default: // u16
-		dfaSize = int64(numWASM*256*2 + numWASM)
-	}
-	if opts.Mode == ModeFind {
-		dfaSize += int64(numWASM) // midAccept flags
-		// firstByte flags (256 bytes) only when there is no literal prefix;
-		// with a prefix the skip uses hardcoded comparisons, no table needed.
-		if len(computePrefix(table)) == 0 {
-			dfaSize += 256
-		}
-		// wordCharTable (256 bytes) prepended before DFA table for word-boundary patterns.
-		// Also add midAcceptNW and midAcceptW flag arrays (numWASM bytes each).
-		if table.hasWordBoundary {
-			dfaSize += 256 + int64(numWASM)*2
-		}
-	}
-	if opts.LeftmostFirst && len(table.immediateAcceptStates) > 0 {
-		dfaSize += int64(numWASM) // immediateAccept flags
-	}
-
-	tableEnd := utils.PageAlign(tableBase + dfaSize)
-	memPages := int32(tableEnd / 65536)
-
-	matchExport, findExport := "", ""
-	if opts.Mode == ModeFind {
-		findExport = exportName
-	} else {
-		matchExport = exportName
-	}
-	var mandatoryLit *MandatoryLit
-	if opts.Mode == ModeFind {
-		mandatoryLit = FindMandatoryLit(pattern)
-	}
-	wasmBytes := genWASM(table, tableBase, matchExport, findExport, standalone, memPages, opts.LeftmostFirst, mandatoryLit, resolveCompiledDFAThreshold(&opts))
-	return wasmBytes, tableEnd, nil
-}
-
 // stripCaptures converts all capture groups in the regexp tree to non-capturing
 // by replacing each OpCapture node with its single sub-expression in-place.
 // Used when the pattern has captures but capture stubs are not requested.
@@ -954,16 +892,8 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 	return selectBestEngine(prog, hasCapturesBeforeSimplify, &opts), nil
 }
 
-// parseMode converts the YAML mode string to a MatchMode constant.
-func parseMode(s string) MatchMode {
-	if s == "find" {
-		return ModeFind
-	}
-	return ModeAnchoredMatch
-}
-
-// compile parses the pattern, selects the optimal engine, and returns a compiled Matcher.
-func compile(pattern string, opts ...CompileOptions) (Matcher, error) {
+// compile parses the pattern, selects the optimal engine, and returns a compiled matcher.
+func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)

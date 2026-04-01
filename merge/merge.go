@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // cmdMerge patches the main WASM module's memory size and merges it with the
@@ -312,13 +312,4 @@ func runCmd(name string, args []string, dir string, extraEnv []string) error {
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
 	return cmd.Run()
-}
-
-// captureCmd executes name with args and returns the combined stdout output.
-// stderr is streamed to the process's own stderr.
-func captureCmd(name string, args []string, dir string) ([]byte, error) {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	cmd.Stderr = os.Stderr
-	return cmd.Output()
 }

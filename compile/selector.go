@@ -125,7 +125,7 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 
 	// DFA handles everything else. Patterns with user alternations or nested quantifiers
 	// need leftmost-first semantics; all others use standard leftmost-longest.
-	// The MaxDFAStates limit in CompileRegex is the real guard against state explosion.
+	// The MaxDFAStates limit in CompileOptions is the real guard against state explosion.
 	if hasUserAlternations || hasNestedQuant {
 		if opts != nil {
 			opts.LeftmostFirst = true
@@ -141,6 +141,11 @@ func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *C
 // maybeCompiledDFA promotes engine from EngineDFA to EngineCompiledDFA when the
 // estimated state count fits within the compiled-DFA threshold.
 // The estimate is pre-minimisation; the final decision is confirmed in buildDFALayout.
+//
+// The check is estimatedStates+1 <= threshold because WASM emission always
+// reserves state 0 as the implicit dead state, so a DFA with N logical states
+// occupies N+1 WASM state slots.  As a result the effective maximum number of
+// logical states is threshold-1, not threshold.
 func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptions) EngineType {
 	if engine != EngineDFA {
 		return engine

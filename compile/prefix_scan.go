@@ -1,10 +1,10 @@
 package compile
 
-import "github.com/qrdl/regexped/utils"
+import "github.com/qrdl/regexped/internal/utils"
 
-// PrefixScanLocals holds the WASM local variable indices used by EmitPrefixScan.
+// prefixScanLocals holds the WASM local variable indices used by emitPrefixScan.
 // These indices differ per engine because each engine declares its own local layout.
-type PrefixScanLocals struct {
+type prefixScanLocals struct {
 	Ptr          byte // i32 param: input buffer base address
 	Len          byte // i32 param: input length
 	AttemptStart byte // i32 local: current scan position (read/write)
@@ -15,10 +15,12 @@ type PrefixScanLocals struct {
 	T1Lo, T1Hi   byte // v128 locals: T1_lo, T1_hi (2-byte Teddy, pre-loaded)
 	Chunk2       byte // v128 local: 16-byte chunk at attempt_start+2 (3-byte Teddy)
 	T2Lo, T2Hi   byte // v128 locals: T2_lo, T2_hi (3-byte Teddy, pre-loaded)
+	Chunk3       byte // v128 local: 16-byte chunk at attempt_start+3 (4-byte Teddy)
+	T3Lo, T3Hi   byte // v128 locals: T3_lo, T3_hi (4-byte Teddy, pre-loaded)
 }
 
-// PrefixScanParams configures EmitPrefixScan.
-type PrefixScanParams struct {
+// prefixScanParams configures emitPrefixScan.
+type prefixScanParams struct {
 	// What to scan for. Exactly one scan strategy is chosen at emit time:
 	//   len(Prefix) >= 1            → SIMD hybrid prefix scan
 	//   len(FirstByteSet) 1..8      → 2-byte Teddy (when TeddyTwoByte) or 1-byte Teddy
@@ -36,13 +38,15 @@ type PrefixScanParams struct {
 	TeddyTwoByte               bool  // whether 2-byte Teddy tables are available
 	TeddyT2LoOff, TeddyT2HiOff int32 // T2_lo, T2_hi (3-byte Teddy)
 	TeddyThreeByte             bool  // whether 3-byte Teddy tables are available
+	TeddyT3LoOff, TeddyT3HiOff int32 // T3_lo, T3_hi (4-byte Teddy)
+	TeddyFourByte              bool  // whether 4-byte Teddy tables are available
 
 	// EngineDepth: number of engine-level blocks/loops that surround the scan.
 	// For DFA find body: 2  (loop $outer + block $no_match).
 	// Used to compute br depths to $no_match from within the scan.
 	EngineDepth byte
 
-	Locals PrefixScanLocals
+	Locals prefixScanLocals
 
 	// OnMatch is called after the scan finds a candidate and all scan blocks
 	// have closed. attempt_start holds the candidate position.
@@ -50,7 +54,7 @@ type PrefixScanParams struct {
 	OnMatch func(b []byte) []byte
 }
 
-// EmitPrefixScan emits the WASM bytes for the prefix/firstByteFlags scan phase.
+// emitPrefixScan emits the WASM bytes for the prefix/firstByteFlags scan phase.
 //
 // On success: advances attempt_start to the candidate, calls p.OnMatch, returns.
 // On exhaustion: branches to $no_match (depth = p.EngineDepth-1 from the outer
@@ -58,7 +62,7 @@ type PrefixScanParams struct {
 // the prefix path).
 //
 // The caller is responsible for the surrounding $no_match/$outer blocks.
-func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
+func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 	l := p.Locals
 	ed := p.EngineDepth
 
@@ -237,6 +241,16 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 						b = utils.AppendSLEB128(b, p.TeddyT2HiOff)
 						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T2_hi
 						b = append(b, 0x21, l.T2Hi)
+						if p.TeddyFourByte {
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, p.TeddyT3LoOff)
+							b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T3_lo
+							b = append(b, 0x21, l.T3Lo)
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, p.TeddyT3HiOff)
+							b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T3_hi
+							b = append(b, 0x21, l.T3Hi)
+						}
 					}
 				}
 			}
@@ -245,9 +259,11 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 			b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
 			b = append(b, 0x03, 0x40) // loop $simd_outer (void)
 
-			// Bounds check: need 16 bytes (17 for 2-byte Teddy, 18 for 3-byte Teddy).
+			// Bounds check: need 16 bytes (17 for 2-byte Teddy, 18 for 3-byte Teddy, 19 for 4-byte Teddy).
 			b = append(b, 0x20, l.AttemptStart)
-			if p.TeddyThreeByte && len(p.FirstByteSet) <= 8 {
+			if p.TeddyFourByte && len(p.FirstByteSet) <= 8 {
+				b = append(b, 0x41, 0x12) // i32.const 18
+			} else if p.TeddyThreeByte && len(p.FirstByteSet) <= 8 {
 				b = append(b, 0x41, 0x11) // i32.const 17
 			} else if p.TeddyTwoByte && len(p.FirstByteSet) <= 8 {
 				b = append(b, 0x41, 0x10) // i32.const 16
@@ -284,6 +300,16 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 					b = append(b, 0x6A)
 					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
 					b = append(b, 0x21, l.Chunk2)
+					if p.TeddyFourByte {
+						// Load chunk3 = chunk at attempt_start+3.
+						b = append(b, 0x20, l.Ptr)
+						b = append(b, 0x20, l.AttemptStart)
+						b = append(b, 0x6A)
+						b = append(b, 0x41, 0x03)
+						b = append(b, 0x6A)
+						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+						b = append(b, 0x21, l.Chunk3)
+					}
 				}
 			}
 
@@ -333,6 +359,22 @@ func EmitPrefixScan(b []byte, p PrefixScanParams) []byte {
 						b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi2
 						b = append(b, 0xFD, 0x4E) // v128.and → candidates2
 						b = append(b, 0xFD, 0x4E) // v128.and combined&c2
+						if p.TeddyFourByte {
+							// 4-byte: AND with candidates3 from chunk3.
+							b = append(b, 0x20, l.T3Lo)
+							b = append(b, 0x20, l.Chunk3)
+							b = append(b, 0x41, 0x0F)
+							b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
+							b = append(b, 0xFD, 0x4E) // v128.and
+							b = append(b, 0xFD, 0x0E) // i8x16.swizzle → lo3
+							b = append(b, 0x20, l.T3Hi)
+							b = append(b, 0x20, l.Chunk3)
+							b = append(b, 0x41, 0x04)
+							b = append(b, 0xFD, 0x6D) // i8x16.shr_u
+							b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi3
+							b = append(b, 0xFD, 0x4E) // v128.and → candidates3
+							b = append(b, 0xFD, 0x4E) // v128.and combined&c3
+						}
 					}
 				}
 

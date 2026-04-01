@@ -2,22 +2,22 @@ package compile
 
 import "regexp/syntax"
 
-// LitAnchorPoint describes a three-way literal-anchored split of a regex pattern:
+// litAnchorPoint describes a three-way literal-anchored split of a regex pattern:
 //
 //	PREFIX · LitSet · SUFFIX
 //
 // Every valid match must contain one of the literals in LitSet, preceded by a
-// match of PrefixRe and followed by a match of SuffixRe (which includes the
+// match of prefixRe and followed by a match of SuffixRe (which includes the
 // literal itself so the forward DFA can be started at the match start and run
 // to completion).
 //
-// Anchored is true when PrefixRe begins with ^ or (?m:^), which means the
+// anchored is true when prefixRe begins with ^ or (?m:^), which means the
 // backward scan can stop at '\n' or pos 0 rather than running to a dead state.
-type LitAnchorPoint struct {
-	PrefixRe *syntax.Regexp
-	LitSet   [][]byte       // 1..8 ASCII literals, each len >= 2
-	SuffixRe *syntax.Regexp // includes the literal itself
-	Anchored bool
+type litAnchorPoint struct {
+	prefixRe *syntax.Regexp
+	litSet   [][]byte       // 1..8 ASCII literals, each len >= 2
+	suffixRe *syntax.Regexp // includes the literal itself
+	anchored bool
 }
 
 // extractLitSet returns the literal set encoded by re, or nil when re is not
@@ -150,10 +150,10 @@ func reverseRegexp(re *syntax.Regexp) *syntax.Regexp {
 	return n
 }
 
-// FindLitAnchorPoint parses pattern and returns the first LitAnchorPoint where
+// findLitAnchorPoint parses pattern and returns the first litAnchorPoint where
 // the top-level concat contains a qualifying literal set.  Returns nil when no
 // qualifying child is found.
-func FindLitAnchorPoint(pattern string) *LitAnchorPoint {
+func findLitAnchorPoint(pattern string) *litAnchorPoint {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
@@ -171,36 +171,36 @@ func FindLitAnchorPoint(pattern string) *LitAnchorPoint {
 		if lits == nil || len(lits) > 8 {
 			continue
 		}
-		lap := &LitAnchorPoint{LitSet: lits}
+		lap := &litAnchorPoint{litSet: lits}
 
-		// PrefixRe: children [0, i)
+		// prefixRe: children [0, i)
 		switch i {
 		case 0:
-			lap.PrefixRe = &syntax.Regexp{Op: syntax.OpEmptyMatch}
+			lap.prefixRe = &syntax.Regexp{Op: syntax.OpEmptyMatch}
 		case 1:
-			lap.PrefixRe = children[0]
+			lap.prefixRe = children[0]
 		default:
-			lap.PrefixRe = &syntax.Regexp{
+			lap.prefixRe = &syntax.Regexp{
 				Op:    syntax.OpConcat,
 				Sub:   children[:i],
 				Flags: re.Flags,
 			}
 		}
 
-		// SuffixRe: children [i, N) — includes the literal itself so the
+		// suffixRe: children [i, N) — includes the literal itself so the
 		// forward DFA can be started at the match start and run forward.
 		remaining := children[i:]
 		if len(remaining) == 1 {
-			lap.SuffixRe = remaining[0]
+			lap.suffixRe = remaining[0]
 		} else {
-			lap.SuffixRe = &syntax.Regexp{
+			lap.suffixRe = &syntax.Regexp{
 				Op:    syntax.OpConcat,
 				Sub:   remaining,
 				Flags: re.Flags,
 			}
 		}
 
-		lap.Anchored = prefixStartsWithLineAnchor(lap.PrefixRe)
+		lap.anchored = prefixStartsWithLineAnchor(lap.prefixRe)
 		return lap
 	}
 	return nil

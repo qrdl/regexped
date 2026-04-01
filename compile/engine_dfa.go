@@ -5,7 +5,7 @@ import (
 	"regexp/syntax"
 	"unicode"
 
-	"github.com/qrdl/regexped/utils"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------
@@ -163,6 +163,9 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 			fires = true
 		}
 		if emptyOp&syntax.EmptyNoWordBoundary != 0 && (wbCtx&ecNoWordBoundary) != 0 {
+			fires = true
+		}
+		if emptyOp&syntax.EmptyEndLine != 0 && (wbCtx&(ecEnd|ecEndLine)) != 0 {
 			fires = true
 		}
 		if !fires || visited[inst.Out] {
@@ -707,7 +710,8 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 		// Process '\n' using inputMapNewline (ecEndLine context, nextPrevWasNewline=true).
 		if dfa.hasNewlineBoundary && inputMapNewline != nil {
 			if nextNFAStates, ok := inputMapNewline['\n']; ok {
-				nextSet := epsilonClosure(nextNFAStates, 0)
+				// After consuming '\n', ecBeginLine fires so (?m:^) assertions mid-pattern are followed.
+				nextSet := epsilonClosure(nextNFAStates, ecBeginLine)
 				nextDFAState := getOrAddState(nextSet, false, true) // nextPrevWasNewline=true
 				dfa.unicodeTrans[item.dfaState]['\n'] = nextDFAState
 			}
@@ -1093,6 +1097,10 @@ type dfaLayout struct {
 	teddyT2HiOff   int32
 	teddyT2LoBytes []byte
 	teddyT2HiBytes []byte
+	teddyT3LoOff   int32
+	teddyT3HiOff   int32
+	teddyT3LoBytes []byte
+	teddyT3HiBytes []byte
 
 	// Find-mode DFA states
 	wasmMidStart        uint32
@@ -1401,6 +1409,49 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 					l.teddyT2HiBytes = t2Hi
 					l.teddyT2LoOff = l.teddyT1HiOff + 16
 					l.teddyT2HiOff = l.teddyT2LoOff + 16
+
+					// Try T3 tables (fourth byte).
+					t3Lo := make([]byte, 16)
+					t3Hi := make([]byte, 16)
+					useFourByte := true
+				outerFourByte:
+					for i, fb := range l.firstBytes {
+						stateAfterFB := t.transitions[t.midStartState*256+int(fb)]
+						if stateAfterFB < 0 {
+							useFourByte = false
+							break
+						}
+						for b2 := 0; b2 < 256; b2++ {
+							stateAfterFB2 := t.transitions[stateAfterFB*256+b2]
+							if stateAfterFB2 < 0 {
+								continue
+							}
+							for b3 := 0; b3 < 256; b3++ {
+								stateAfterFB3 := t.transitions[stateAfterFB2*256+b3]
+								if stateAfterFB3 < 0 {
+									continue
+								}
+								validCount4 := 0
+								for b4 := 0; b4 < 256; b4++ {
+									if t.transitions[stateAfterFB3*256+b4] >= 0 {
+										validCount4++
+										t3Lo[b4&0x0F] |= byte(1 << uint(i))
+										t3Hi[b4>>4] |= byte(1 << uint(i))
+									}
+								}
+								if validCount4 > 64 {
+									useFourByte = false
+									break outerFourByte
+								}
+							}
+						}
+					}
+					if useFourByte {
+						l.teddyT3LoBytes = t3Lo
+						l.teddyT3HiBytes = t3Hi
+						l.teddyT3LoOff = l.teddyT2HiOff + 16
+						l.teddyT3HiOff = l.teddyT3LoOff + 16
+					}
 				}
 			}
 		}
@@ -1446,6 +1497,9 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 					maxEnd(l.teddyT1HiOff, 16)
 					if len(l.teddyT2LoBytes) > 0 {
 						maxEnd(l.teddyT2HiOff, 16)
+						if len(l.teddyT3LoBytes) > 0 {
+							maxEnd(l.teddyT3HiOff, 16)
+						}
 					}
 				}
 			}
@@ -1501,6 +1555,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			teddyExtraSegs = 4
 			if len(l.teddyT2LoBytes) > 0 {
 				teddyExtraSegs = 6
+				if len(l.teddyT3LoBytes) > 0 {
+					teddyExtraSegs = 8
+				}
 			}
 		}
 	}
@@ -1527,6 +1584,10 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 						if len(l.teddyT2LoBytes) > 0 {
 							ds = appendDataSegment(ds, l.teddyT2LoOff, l.teddyT2LoBytes)
 							ds = appendDataSegment(ds, l.teddyT2HiOff, l.teddyT2HiBytes)
+							if len(l.teddyT3LoBytes) > 0 {
+								ds = appendDataSegment(ds, l.teddyT3LoOff, l.teddyT3LoBytes)
+								ds = appendDataSegment(ds, l.teddyT3HiOff, l.teddyT3HiBytes)
+							}
 						}
 					}
 				}
@@ -1573,6 +1634,10 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 						if len(l.teddyT2LoBytes) > 0 {
 							ds = appendDataSegment(ds, l.teddyT2LoOff, l.teddyT2LoBytes)
 							ds = appendDataSegment(ds, l.teddyT2HiOff, l.teddyT2HiBytes)
+							if len(l.teddyT3LoBytes) > 0 {
+								ds = appendDataSegment(ds, l.teddyT3LoOff, l.teddyT3LoBytes)
+								ds = appendDataSegment(ds, l.teddyT3HiOff, l.teddyT3HiBytes)
+							}
 						}
 					}
 				}
@@ -1619,7 +1684,7 @@ func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, hasImmAccept boo
 
 // appendFindCodeEntry appends a size-prefixed find function body to cs.
 // Uses buildAnchoredFindBody when isAnchoredFind(t), else buildFindBody.
-func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *MandatoryLit) []byte {
+func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit) []byte {
 	var body []byte
 	if l.useHybridDispatch {
 		if isAnchoredFind(t) {
@@ -1645,117 +1710,11 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *Man
 			l.teddyLoOff, l.teddyHiOff,
 			l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0,
 			l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0,
+			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
-}
-
-// genWASM generates a WASM module with up to two DFA functions sharing one table.
-// matchExport and findExport are the exported function names; either may be empty
-// to omit that function. At least one must be non-empty.
-// The public API of CompileRegex is unchanged — it maps exportName+mode internally.
-func genWASM(t *dfaTable, tableBase int64, matchExport, findExport string, standalone bool, memPages int32, leftmostFirst bool, mandatoryLit *MandatoryLit, compiledDFAThreshold int) []byte {
-	needFind := findExport != ""
-	needMatch := matchExport != ""
-
-	l := buildDFALayout(t, tableBase, needFind, leftmostFirst, compiledDFAThreshold)
-
-	var out []byte
-	out = append(out, 0x00, 0x61, 0x73, 0x6D) // magic
-	out = append(out, 0x01, 0x00, 0x00, 0x00) // version
-
-	// ── Type section ─────────────────────────────────────────────────────────
-	// match: (i32,i32)→i32  type index 0 (if present)
-	// find:  (i32,i32)→i64  type index 0 or 1
-	numTypes := 0
-	matchTypeIdx := -1
-	findTypeIdx := -1
-	var ts []byte
-	if needMatch {
-		matchTypeIdx = numTypes
-		numTypes++
-		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F) // (i32,i32)→i32
-	}
-	if needFind {
-		findTypeIdx = numTypes
-		numTypes++
-		ts = append(ts, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E) // (i32,i32)→i64
-	}
-	out = appendSection(out, 1, append(utils.AppendULEB128(nil, uint32(numTypes)), ts...))
-
-	// ── Import section ───────────────────────────────────────────────────────
-	if !standalone {
-		var is []byte
-		is = append(is, 0x01)
-		is = appendString(is, "main")
-		is = appendString(is, "memory")
-		is = append(is, 0x02)
-		is = append(is, 0x00)
-		is = utils.AppendULEB128(is, 0x00)
-		out = appendSection(out, 2, is)
-	}
-
-	// ── Function section ─────────────────────────────────────────────────────
-	var fs []byte
-	fs = utils.AppendULEB128(fs, uint32(numTypes)) // numFuncs == numTypes here
-	if needMatch {
-		fs = utils.AppendULEB128(fs, uint32(matchTypeIdx))
-	}
-	if needFind {
-		fs = utils.AppendULEB128(fs, uint32(findTypeIdx))
-	}
-	out = appendSection(out, 3, fs)
-
-	// ── Memory section (standalone only) ─────────────────────────────────────
-	if standalone {
-		var ms []byte
-		ms = append(ms, 0x01, 0x00)
-		ms = utils.AppendULEB128(ms, uint32(memPages))
-		out = appendSection(out, 5, ms)
-	}
-
-	// ── Export section ───────────────────────────────────────────────────────
-	numExports := numTypes
-	if standalone {
-		numExports++ // memory
-	}
-	var es []byte
-	es = utils.AppendULEB128(es, uint32(numExports))
-	if standalone {
-		es = appendString(es, "memory")
-		es = append(es, 0x02)
-		es = utils.AppendULEB128(es, 0x00)
-	}
-	funcIdx := 0
-	if needMatch {
-		es = appendString(es, matchExport)
-		es = append(es, 0x00)
-		es = utils.AppendULEB128(es, uint32(funcIdx))
-		funcIdx++
-	}
-	if needFind {
-		es = appendString(es, findExport)
-		es = append(es, 0x00)
-		es = utils.AppendULEB128(es, uint32(funcIdx))
-	}
-	out = appendSection(out, 7, es)
-
-	// ── Code section ─────────────────────────────────────────────────────────
-	var cs []byte
-	cs = utils.AppendULEB128(cs, uint32(numTypes))
-	if needMatch {
-		cs = appendMatchCodeEntry(cs, l, t, l.hasImmAccept)
-	}
-	if needFind {
-		cs = appendFindCodeEntry(cs, l, t, mandatoryLit)
-	}
-	out = appendSection(out, 10, cs)
-
-	// ── Data section ─────────────────────────────────────────────────────────
-	out = appendSection(out, 11, dfaDataSegments(l, needFind))
-
-	return out
 }
 
 // buildMatchBody returns the WASM function body bytes (locals + instructions + end).
@@ -2759,7 +2718,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		b = append(b, byte(numI32Locals), 0x7F) // 6 × i32
 	}
 
-	// Local indices for the DFA locals (also used by EmitPrefixScan).
+	// Local indices for the DFA locals (also used by emitPrefixScan).
 	const (
 		locPtr          = 0
 		locLen          = 1
@@ -2784,9 +2743,9 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x03, 0x40) // loop $lit_outer
 
 	// ── Phase 1: SIMD scan for any literal first byte ─────────────────────────
-	// EmitPrefixScan uses EngineDepth=2 (loop $lit_outer + block $no_match).
+	// emitPrefixScan uses EngineDepth=2 (loop $lit_outer + block $no_match).
 	// OnMatch: nothing — attempt_start is set to the candidate position, fall through.
-	simdParams := PrefixScanParams{
+	simdParams := prefixScanParams{
 		FirstByteSet:   p.litAnchorFirstBytes,
 		FirstByteFlags: p.litAnchorFirstByteFlags,
 		FirstByteOff:   p.litAnchorFirstByteOff,
@@ -2796,7 +2755,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		TeddyT1LoOff:   p.litAnchorTeddyT1LoOff,
 		TeddyT1HiOff:   p.litAnchorTeddyT1HiOff,
 		EngineDepth:    2,
-		Locals: PrefixScanLocals{
+		Locals: prefixScanLocals{
 			Ptr:          locPtr,
 			Len:          locLen,
 			AttemptStart: locAttemptStart,
@@ -2810,7 +2769,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		},
 		OnMatch: nil, // fall through with attempt_start = candidate position
 	}
-	b = EmitPrefixScan(b, simdParams)
+	b = emitPrefixScan(b, simdParams)
 
 	// ── Scalar literal verification ───────────────────────────────────────────
 	// After the SIMD scan places a candidate in attempt_start, verify that one
@@ -3133,7 +3092,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, mandatoryLit *MandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32) []byte {
 	var b []byte
 
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
@@ -3314,6 +3273,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	var chunk2Local byte
 	var t2LoLocal byte
 	var t2HiLocal byte
+	var chunk3Local byte
+	var t3LoLocal byte
+	var t3HiLocal byte
 
 	// Mandatory-lit locals (set in each path branch when useMandatoryLit):
 	var litPosLocal, scanStartLocal, simdMaskScanLocal, chunkScanLocal byte
@@ -3323,7 +3285,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	//        state=startState, pos=attempt_start, last_accept=-1
 	//        if accept[state]: last_accept=pos  (start-state empty-match check)
 	emitOuterPrologue := func(b []byte) []byte {
-		params := PrefixScanParams{
+		params := prefixScanParams{
 			Prefix:         prefix,
 			FirstByteSet:   firstBytes,
 			FirstByteFlags: firstByteFlags,
@@ -3336,8 +3298,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			TeddyT2LoOff:   teddyT2LoOff,
 			TeddyT2HiOff:   teddyT2HiOff,
 			TeddyThreeByte: teddyThreeByte,
+			TeddyT3LoOff:   teddyT3LoOff,
+			TeddyT3HiOff:   teddyT3HiOff,
+			TeddyFourByte:  teddyFourByte,
 			EngineDepth:    2, // loop $outer + block $no_match
-			Locals: PrefixScanLocals{
+			Locals: prefixScanLocals{
 				Ptr:          0,
 				Len:          1,
 				AttemptStart: 4,
@@ -3351,6 +3316,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				Chunk2:       chunk2Local,
 				T2Lo:         t2LoLocal,
 				T2Hi:         t2HiLocal,
+				Chunk3:       chunk3Local,
+				T3Lo:         t3LoLocal,
+				T3Hi:         t3HiLocal,
 			},
 			OnMatch: func(b []byte) []byte {
 				if len(prefix) >= 1 {
@@ -3434,7 +3402,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				return b
 			},
 		}
-		return EmitPrefixScan(b, params)
+		return emitPrefixScan(b, params)
 	}
 
 	// ── helper: emit the packed-i64 return and close loops ──────────────────
@@ -3567,13 +3535,13 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	}
 
 	// emitMLRangeCheck emits the range check at the top of $outer.
-	// If attempt_start > lit_pos - MinOff: scan_start = lit_pos + 1; br 2 → $lit_outer.
+	// If attempt_start > lit_pos - minOff: scan_start = lit_pos + 1; br 2 → $lit_outer.
 	// Depths from inside if block: 0=if, 1=$outer, 2=$lit_outer.
 	emitMLRangeCheck := func(b []byte) []byte {
 		b = append(b, 0x20, 0x04)        // local.get attempt_start
 		b = append(b, 0x20, litPosLocal) // local.get lit_pos
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, mandatoryLit.MinOff)
+		b = utils.AppendSLEB128(b, mandatoryLit.minOff)
 		b = append(b, 0x6B)                 // i32.sub: lit_pos - MinOff
 		b = append(b, 0x4A)                 // i32.gt_s: attempt_start > lit_pos-MinOff?
 		b = append(b, 0x04, 0x40)           // if (void)
@@ -3586,19 +3554,19 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		return b
 	}
 
-	// emitMLOuterSetup emits: [init scan_start if MinOff>0]; loop $lit_outer; EmitPrefixScan(lit);
+	// emitMLOuterSetup emits: [init scan_start if MinOff>0]; loop $lit_outer; emitPrefixScan(lit);
 	// OnMatch: set lit_pos, adjust attempt_start; loop $outer; range check; DFA prologue.
 	emitMLOuterSetup := func(b []byte) []byte {
-		if mandatoryLit.MinOff > 0 {
+		if mandatoryLit.minOff > 0 {
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, mandatoryLit.MinOff)
+			b = utils.AppendSLEB128(b, mandatoryLit.minOff)
 			b = append(b, 0x21, scanStartLocal)
 		}
 		b = append(b, 0x03, 0x40) // loop $lit_outer
-		b = EmitPrefixScan(b, PrefixScanParams{
-			Prefix:      mandatoryLit.Bytes,
+		b = emitPrefixScan(b, prefixScanParams{
+			Prefix:      mandatoryLit.bytes,
 			EngineDepth: 2, // loop $lit_outer + block $no_match
-			Locals: PrefixScanLocals{
+			Locals: prefixScanLocals{
 				Ptr:          0,
 				Len:          1,
 				AttemptStart: scanStartLocal,
@@ -3613,7 +3581,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				// Step 1: adj = lit_pos - MaxOff
 				b = append(b, 0x20, litPosLocal)
 				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, mandatoryLit.MaxOff)
+				b = utils.AppendSLEB128(b, mandatoryLit.maxOff)
 				b = append(b, 0x6B)                    // i32.sub
 				b = append(b, 0x21, simdMaskScanLocal) // temp = adj
 				// Step 2: clamp temp to >= 0
@@ -3663,7 +3631,15 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunk2Local = 14
 			t2LoLocal = 15
 			t2HiLocal = 16
-			b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+			if teddyFourByte {
+				// 6 i32 + 12 v128: adds chunk3(17),t3Lo(18),t3Hi(19)
+				chunk3Local = 17
+				t3LoLocal = 18
+				t3HiLocal = 19
+				b = append(b, 0x02, 0x06, 0x7F, 0x0C, 0x7B)
+			} else {
+				b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+			}
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
 		if useMandatoryLit {
@@ -3774,7 +3750,15 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunk2Local = 13
 			t2LoLocal = 14
 			t2HiLocal = 15
-			b = append(b, 0x02, 0x05, 0x7F, 0x09, 0x7B)
+			if teddyFourByte {
+				// 5 i32 + 12 v128: adds chunk3(16),t3Lo(17),t3Hi(18)
+				chunk3Local = 16
+				t3LoLocal = 17
+				t3HiLocal = 18
+				b = append(b, 0x02, 0x05, 0x7F, 0x0C, 0x7B)
+			} else {
+				b = append(b, 0x02, 0x05, 0x7F, 0x09, 0x7B)
+			}
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
 		if useMandatoryLit {
@@ -3875,7 +3859,15 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		chunk2Local = 14
 		t2LoLocal = 15
 		t2HiLocal = 16
-		b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+		if teddyFourByte {
+			// 6 i32 + 12 v128: adds chunk3(17),t3Lo(18),t3Hi(19)
+			chunk3Local = 17
+			t3LoLocal = 18
+			t3HiLocal = 19
+			b = append(b, 0x02, 0x06, 0x7F, 0x0C, 0x7B)
+		} else {
+			b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
+		}
 	}
 	b = append(b, 0x02, 0x40) // block $no_match
 	if useMandatoryLit {
