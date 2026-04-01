@@ -9,6 +9,8 @@ wasm_merge: "wasm-merge"   # path to wasm-merge binary; defaults to wasm-merge i
 output:   "merged.wasm"    # output path for the merge command; overridable with -o/--output
 wasm_dir: "."              # default output directory for compiled WASM files; overridable with -d/--out-dir
 stub_file: "src/stubs.rs"  # default stub output file for all entries (Rust or JS); per-entry overrides
+max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
+max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
 
 regexes:
   - wasm_file:        "url.wasm"     # output WASM file for this pattern
@@ -36,7 +38,7 @@ Setting `groups_func` or `named_groups_func` triggers capture-tracking compilati
 - **TDFA engine** — used when the pattern has no non-greedy quantifiers, no line anchors, no word boundaries, and no ambiguous alternations (Laurikari’s tagged DFA, O(n))
 - **Backtracking engine** — used automatically as a fallback for patterns that are not TDFA-eligible (e.g. `(a|ab)`, `(a*)(a*)`)  
 
-Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
+Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation. If the DFA exceeds `max_dfa_states` states, the **Backtracking engine** is used instead (no captures, same match/find semantics).
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
 

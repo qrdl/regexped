@@ -8,10 +8,11 @@ Regexped implements four engines: **Compiled DFA**, **DFA**, **TDFA**, and **Bac
 
 Selection priority (highest first):
 
-1. **TDFA** — pattern has capture groups AND qualifies for tagged-DFA (no non-greedy quantifiers inside captures, no line anchors, no word boundaries, no ambiguous alternations)
+1. **TDFA** — pattern has capture groups AND qualifies for tagged-DFA (no non-greedy quantifiers inside captures, no line anchors, no word boundaries, no ambiguous alternations) AND TDFA has ≤ `MaxDFAStates` states AND ≤ `MaxTDFARegs` registers
 2. **Backtracking** — pattern has capture groups but fails the TDFA check
 3. **Compiled DFA** — no captures; minimised DFA has ≤ 256 states (default threshold)
-4. **DFA** — no captures; minimised DFA exceeds the compiled-DFA threshold
+4. **DFA** — no captures; minimised DFA ≤ `MaxDFAStates` states
+5. **Backtracking** — no captures; DFA exceeds `MaxDFAStates` (fallback for match/find)
 
 A pattern qualifies for TDFA if it has no:
 - Non-greedy quantifiers (`*?`, `+?`, `??`) anywhere in the pattern
@@ -177,6 +178,8 @@ The SIMD scan in Phase 1 typically eliminates ≥ 99% of input positions before 
 
 **Used for:** `groups_func`, `named_groups_func` — O(n) capture tracking for patterns that qualify.
 
+**State limit:** the TDFA state count is bounded at compile time (default 1024; adjustable via `CompileOptions.MaxDFAStates`). The register count is also bounded (default 32; adjustable via `CompileOptions.MaxTDFARegs`). Patterns exceeding either limit fall back to Backtracking.
+
 **Complexity:** O(n) time.
 
 ### How it works
@@ -195,13 +198,13 @@ Capture slot values are reconstructed from registers at match acceptance time. T
 
 **Tag-op emission:** each DFA state's per-byte tag operations are emitted as a `br_table` dispatch in the WASM function body. A majority-group optimization encodes only the minority of differing transitions explicitly; the dominant operation is emitted unconditionally, keeping WASM bytecode size small.
 
-**State limit:** the TDFA state count is bounded at compile time (default 512; adjustable via `CompileOptions.MaxDFAStates`). Patterns exceeding the limit fall back to Backtracking.
+
 
 ---
 
 ## Backtracking Engine (BitState)
 
-**Used for:** `groups_func`, `named_groups_func` when the pattern has captures but is not TDFA-eligible, and as the groups half of hybrid modules for such patterns.
+**Used for:** `groups_func`, `named_groups_func` when the pattern has captures but is not TDFA-eligible; and `match_func`, `find_func` when the DFA exceeds `MaxDFAStates` states (default 1024).
 
 **Complexity:** O(n × inputLen) time and space — guaranteed by BitState memoization when enabled (see below).
 
@@ -256,6 +259,7 @@ Regexped implements **RE2 syntax with Perl/RE2 semantics** (leftmost-first match
 The RE2 exhaustive test suite (`re2test/`) reports:
 
 - **~4.94M passing** (DFA + Compiled DFA; match and find)
+- **~4.94M passing** (Backtracking engine forced via `--force-backtrack`; match and find)
 - **~1.88M passing** (re2-adjusted.txt with `--validate-groups`; includes TDFA and Backtracking capture accuracy)
 - **~781K skipped** (exhaustive only)
 
@@ -265,6 +269,13 @@ The RE2 exhaustive test suite (`re2test/`) reports:
 |---|---|
 | DFA | ~334K |
 | Compiled DFA | ~4.6M |
+| **Total** | **~4.94M** |
+
+**Exhaustive test** (`re2-exhaustive.txt`, match/find, `--force-backtrack`):
+
+| Engine | Passing cases |
+|---|---|
+| Backtracking | ~4.94M |
 | **Total** | **~4.94M** |
 
 **Adjusted test** (`re2-adjusted.txt`, with `--validate-groups`):
