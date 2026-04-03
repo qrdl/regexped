@@ -1,10 +1,8 @@
-GO_SRCS := main.go \
-	config/config.go \
+GO_SRCS := main.go config/config.go \
 	compile/compile.go compile/selector.go compile/engine_dfa.go \
-	compile/engine_backtrack.go compile/engine_tdfa.go compile/prefix_scan.go compile/wasm.go compile/mandatory_lit.go \
-	generate/generate.go generate/rust_stub.go generate/dummy_main.go \
-	merge/merge.go \
-	internal/utils/bytes.go
+	compile/engine_backtrack.go compile/engine_tdfa.go compile/prefix_scan.go \
+	compile/wasm.go compile/mandatory_lit.go generate/generate.go \
+	generate/rust_stub.go merge/merge.go internal/utils/bytes.go
 
 .PHONY: re2test perftest examples clean unittest
 

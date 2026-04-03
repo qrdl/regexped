@@ -12,9 +12,31 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// cmdMerge patches the main WASM module's memory size and merges it with the
-// regex WASM modules. inputs[0] is the main module; the rest are regex modules.
-func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
+// dummyMainWASM is a minimal WASM module that exports 2 pages (128 KB) of memory.
+// It has no code, no data, and no imports. Used by --dummy-main when there is no
+// host-language runtime (browser, JS, Cloudflare Worker deployments).
+//
+// Equivalent WAT:
+//
+//	(module
+//	  (memory (export "memory") 2))
+var dummyMainWASM = []byte{
+	0x00, 0x61, 0x73, 0x6d, // magic "\0asm"
+	0x01, 0x00, 0x00, 0x00, // version 1
+	// Memory section (id=5): 1 memory, min=2 pages, no max
+	0x05, 0x03, 0x01, 0x00, 0x02,
+	// Export section (id=7): export "memory" as memory 0
+	0x07, 0x0a, 0x01, 0x06,
+	0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, // "memory"
+	0x02, 0x00,
+}
+
+// CmdMerge patches the main WASM module's memory size and merges it with the
+// regex WASM modules.
+// mainWasm is the path to the host main module; if empty, the built-in dummy
+// main (memory-only, no code) is used instead (pass --dummy-main in CLI).
+// regexWasms are the regex WASM files to merge (at least one required).
+func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []string) error {
 	wasmMergeCmd := expandHome(cfg.WasmMerge)
 	if wasmMergeCmd == "" {
 		wasmMergeCmd = "wasm-merge"
@@ -25,10 +47,7 @@ func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
 		return err
 	}
 
-	mainWasm := inputs[0]
-	regexWasms := inputs[1:]
-
-	// Sanity check: verify each non-first file looks like a compiled regex WASM.
+	// Sanity check: verify each file looks like a compiled regex WASM.
 	slog.Debug("Checking WASM modules")
 	for _, path := range regexWasms {
 		if !isRegexWasm(path) {
@@ -44,10 +63,15 @@ func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
 	pages := uint32(utils.PageAlign(requiredMem) / utils.WasmPageSize)
 	slog.Debug("Memory requirement", "bytes", utils.PageAlign(requiredMem), "pages", pages)
 
-	// Read main WASM, patch memory section in memory, write to temp file.
-	mainRaw, err := os.ReadFile(mainWasm)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", mainWasm, err)
+	// Load main WASM bytes: from file or built-in dummy.
+	var mainRaw []byte
+	if mainWasm == "" {
+		mainRaw = dummyMainWASM
+	} else {
+		mainRaw, err = os.ReadFile(mainWasm)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", mainWasm, err)
+		}
 	}
 	patched, err := patchMemoryMin(mainRaw, pages)
 	if err != nil {
@@ -89,19 +113,13 @@ func CmdMerge(cfg config.BuildConfig, output string, inputs []string) error {
 	return nil
 }
 
-// moduleNameForWasm returns the import_module for a given WASM file.
-// Uses top-level cfg.ImportModule if set; falls back to the basename
-// without extension, or per-entry import_module for multi-file legacy configs.
+// moduleNameForWasm returns the import_module name for a given WASM file.
+// Uses cfg.ImportModule if set; falls back to the basename without extension.
 func moduleNameForWasm(cfg config.BuildConfig, path string) string {
 	if cfg.ImportModule != "" {
 		return cfg.ImportModule
 	}
 	base := filepath.Base(path)
-	for _, re := range cfg.Regexes {
-		if re.ImportModule != "" && filepath.Base(re.WasmFile) == base {
-			return re.ImportModule
-		}
-	}
 	return strings.TrimSuffix(base, filepath.Ext(base))
 }
 

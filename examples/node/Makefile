@@ -1,9 +1,9 @@
 # regexped must be built first: run `make` in the repo root.
 REGEXPED    := ../../regexped
 WASM_MERGE  := ../../../binaryen/bin/wasm-merge
-REGEX_WASMS := regexps.wasm
+REGEX_WASMS := urls.wasm
 FINAL_WASM  := final.wasm
-JS_STUB     := regex.js
+JS_STUB     := regex.ts
 
 .PHONY: all build run clean
 
@@ -17,16 +17,17 @@ $(REGEX_WASMS): regexped.yaml
 $(FINAL_WASM): $(REGEX_WASMS) regexped.yaml
 	$(REGEXPED) merge --config=regexped.yaml --dummy-main $(REGEX_WASMS)
 
-# Step 3 – generate JS ES module stub
+# Step 3 – generate TypeScript ES module stub
 $(JS_STUB): regexped.yaml $(FINAL_WASM)
 	$(REGEXPED) generate --config=regexped.yaml
 
 build: $(JS_STUB)
 
-# Step 4 – serve locally (requires Python 3)
+# Step 4 – run the example (pipe text via stdin)
+# Requires Node.js 22+ (--experimental-strip-types) or tsx (npm install -g tsx)
+TSX ?= npx --yes tsx
 run: build
-	@echo "Open http://localhost:8080 in your browser"
-	python3 -m http.server 8080
+	@echo "Visit https://example.com or check http://foo.org/path?q=1 for details." | $(TSX) main.ts
 
 clean:
 	rm -f $(REGEX_WASMS) $(FINAL_WASM) $(JS_STUB)

@@ -2,10 +2,9 @@
 //
 // Usage:
 //
-//	regexped generate [--config=<file>] [--out-dir=<dir>] --rust
-//	regexped generate [--out-dir=<dir>] --dummy_main
-//	regexped compile  [--config=<file>] [--out-dir=<dir>] --wasm-input=<file>
-//	regexped merge    [--config=<file>] [--output=<file>] <main.wasm> <regex1.wasm> ...
+//	regexped generate [--config=<file>] [--output=<file>|-]
+//	regexped compile  [--config=<file>] [--main=<file>] [--output=<file>|-]
+//	regexped merge    [--config=<file>] (--main=<file>|--dummy-main) [--output=<file>|-] <regex1.wasm> ...
 //
 // The config file defaults to regexped.yaml in the current directory when not specified.
 package main
@@ -49,8 +48,8 @@ func printUsage() {
 	fmt.Fprint(os.Stderr, `Usage: regexped <command> [options]
 
 Commands:
-  generate  Generate language stubs or a dummy main WASM module
-  compile   Compile regex patterns to WASM modules
+  generate  Generate language stubs (Rust/JS/TS) from a config file
+  compile   Compile regex patterns to a WASM module
   merge     Patch memory and merge WASM modules into a single binary
 
 Run 'regexped <command> -h' for command-specific options.
@@ -60,57 +59,39 @@ Run 'regexped <command> -h' for command-specific options.
 func runGenerateCmd(args []string) {
 	fs := flag.NewFlagSet("generate", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	rust := fs.Bool("rust", false, "generate Rust stub files")
-	js := fs.Bool("js", false, "generate JS ES module stub file")
-	dummyMain := fs.Bool("dummy_main", false, "generate a minimal main.wasm (memory-only, no code)")
-	var outDir, out string
-	fs.StringVar(&outDir, "out-dir", "", "output directory for generated stubs (default: .)")
-	fs.StringVar(&outDir, "d", "", "output directory (alias for --out-dir)")
-	fs.StringVar(&out, "output", "", "output file; use - to write to stdout")
+	var out string
+	fs.StringVar(&out, "output", "", "override stub output file from config; - writes to stdout")
 	fs.StringVar(&out, "o", "", "output file (alias for --output)")
 	fs.Parse(args)
 
-	modeCount := 0
-	for _, b := range []bool{*rust, *js, *dummyMain} {
-		if b {
-			modeCount++
-		}
-	}
-	if modeCount > 1 {
-		fmt.Fprintln(os.Stderr, "generate: --rust, --js, and --dummy_main are mutually exclusive")
-		os.Exit(1)
-	}
-	if modeCount == 0 {
-		fmt.Fprintln(os.Stderr, "generate: specify --rust, --js, or --dummy_main")
-		os.Exit(1)
-	}
-
-	if *dummyMain {
-		if outDir == "" && out != "-" {
-			outDir = "."
-		}
-		if err := generate.CmdDummyMain(outDir, out); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-
-	// --rust / --js path: needs config
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if outDir == "" {
-		outDir = "."
+
+	// Resolve effective output path.
+	outPath := out
+	if outPath == "" {
+		outPath = cfg.StubFile
+	}
+	if outPath == "" {
+		fmt.Fprintln(os.Stderr, "generate: --output is required (or set stub_file in config)")
+		os.Exit(1)
 	}
 
-	if *js {
-		if err := generate.CmdJS(cfg, outDir, out); err != nil {
-			log.Fatal(err)
-		}
-		return
+	// Validate stub type before doing any work.
+	stubType, err := generate.ResolveStubType(cfg)
+	if err != nil {
+		log.Fatal(err)
 	}
-	if err := generate.CmdStub(cfg, outDir, out); err != nil {
+
+	// Rust stubs require import_module for the pub mod block name.
+	if stubType == "rust" && cfg.ImportModule == "" {
+		fmt.Fprintln(os.Stderr, "generate: import_module is required in config for Rust stubs")
+		os.Exit(1)
+	}
+
+	if err := generate.CmdGenerateStub(cfg, outPath); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -118,31 +99,28 @@ func runGenerateCmd(args []string) {
 func runCompileCmd(args []string) {
 	fs := flag.NewFlagSet("compile", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	wasmInput := fs.String("wasm-input", "", "pre-built WASM file used to measure memory layout (required)")
-	var outDir, outputFile string
-	fs.StringVar(&outDir, "out-dir", "", "output directory for compiled WASM files (overrides config wasm_dir)")
-	fs.StringVar(&outDir, "d", "", "output directory for compiled WASM files (alias for --out-dir)")
-	fs.StringVar(&outputFile, "output", "", "output WASM file (overrides config wasm_file)")
-	fs.StringVar(&outputFile, "o", "", "output WASM file (alias for --output)")
+	mainWasm := fs.String("main", "", "main WASM file for memory layout; if omitted, rustTop=0 is assumed")
+	var out string
+	fs.StringVar(&out, "output", "", "override wasm_file from config; - writes to stdout")
+	fs.StringVar(&out, "o", "", "output file (alias for --output)")
 	fs.Parse(args)
-
-	if *wasmInput == "" {
-		fmt.Fprintln(os.Stderr, "compile: --wasm-input is required")
-		os.Exit(1)
-	}
 
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if outDir == "" {
-		if cfg.WasmDir != "" {
-			outDir = cfg.WasmDir
-		} else {
-			outDir = "."
-		}
+
+	// Resolve effective output path.
+	outPath := out
+	if outPath == "" {
+		outPath = cfg.WasmFile
 	}
-	if err := compile.CmdCompile(cfg, *wasmInput, outDir, outputFile); err != nil {
+	if outPath == "" {
+		fmt.Fprintln(os.Stderr, "compile: --output is required (or set wasm_file in config)")
+		os.Exit(1)
+	}
+
+	if err := compile.CmdCompile(cfg, *mainWasm, outPath); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -150,14 +128,26 @@ func runCompileCmd(args []string) {
 func runMergeCmd(args []string) {
 	fs := flag.NewFlagSet("merge", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	var outputFile string
-	fs.StringVar(&outputFile, "output", "", "output WASM file (overrides YAML 'output' field)")
-	fs.StringVar(&outputFile, "o", "", "output WASM file (alias for --output)")
+	mainFlag := fs.String("main", "", "main WASM file (mutually exclusive with --dummy-main)")
+	dummyMain := fs.Bool("dummy-main", false, "use built-in dummy main (for JS/browser/CF Worker deployments)")
+	var out string
+	fs.StringVar(&out, "output", "", "override output from config; - writes to stdout")
+	fs.StringVar(&out, "o", "", "output file (alias for --output)")
 	fs.Parse(args)
 
-	inputs := fs.Args()
-	if len(inputs) < 2 {
-		fmt.Fprintln(os.Stderr, "merge: requires <main.wasm> and at least one <regex.wasm>")
+	// Validate flags before loading config.
+	if *mainFlag != "" && *dummyMain {
+		fmt.Fprintln(os.Stderr, "merge: --main and --dummy-main are mutually exclusive")
+		os.Exit(1)
+	}
+	if *mainFlag == "" && !*dummyMain {
+		fmt.Fprintln(os.Stderr, "merge: --main=<file> or --dummy-main is required")
+		os.Exit(1)
+	}
+
+	regexWasms := fs.Args()
+	if len(regexWasms) == 0 {
+		fmt.Fprintln(os.Stderr, "merge: at least one regex WASM file is required as a positional argument")
 		os.Exit(1)
 	}
 
@@ -166,15 +156,18 @@ func runMergeCmd(args []string) {
 		log.Fatal(err)
 	}
 
-	outFile := outputFile
-	if outFile == "" {
-		outFile = cfg.Output
+	// Resolve effective output path.
+	outPath := out
+	if outPath == "" {
+		outPath = cfg.Output
 	}
-	if outFile == "" {
-		fmt.Fprintln(os.Stderr, "merge: --output is required (or set 'output' in YAML config)")
+	if outPath == "" {
+		fmt.Fprintln(os.Stderr, "merge: --output is required (or set output in config)")
 		os.Exit(1)
 	}
-	if err := merge.CmdMerge(cfg, outFile, inputs); err != nil {
+
+	mainWasm := *mainFlag // empty string when --dummy-main is used
+	if err := merge.CmdMerge(cfg, mainWasm, outPath, regexWasms); err != nil {
 		log.Fatal(err)
 	}
 }

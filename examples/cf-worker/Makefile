@@ -5,7 +5,7 @@ REGEX_WASMS := regexps.wasm
 FINAL_WASM  := final.wasm
 JS_STUB     := regex.js
 
-.PHONY: all build run clean
+.PHONY: all build dev deploy clean
 
 all: build
 
@@ -23,10 +23,13 @@ $(JS_STUB): regexped.yaml $(FINAL_WASM)
 
 build: $(JS_STUB)
 
-# Step 4 – serve locally (requires Python 3)
-run: build
-	@echo "Open http://localhost:8080 in your browser"
-	python3 -m http.server 8080
+# Step 4 – run locally with wrangler (requires: npm install -g wrangler)
+dev: build
+	npx wrangler dev
+
+# Step 5 – deploy to Cloudflare (requires: wrangler login)
+deploy: build
+	npx wrangler deploy
 
 clean:
 	rm -f $(REGEX_WASMS) $(FINAL_WASM) $(JS_STUB)

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"regexp/syntax"
 
 	"github.com/qrdl/regexped/config"
@@ -815,25 +814,20 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 }
 
 // CmdCompile compiles all regex patterns from cfg to a single WASM module.
-// wasmInput is the Rust/host WASM used to determine memory layout (rustTop).
-// outputFile overrides cfg.WasmFile; if both are empty, returns an error.
-// outDir is used to resolve relative output paths.
-func CmdCompile(cfg config.BuildConfig, wasmInput, outDir, outputFile string) error {
-	rustTop, err := utils.RustMemTop(wasmInput)
-	if err != nil {
-		return fmt.Errorf("read wasm-input: %w", err)
+// mainWasm is the Rust/host WASM used to determine memory layout (rustTop).
+// If mainWasm is empty, rustTop is assumed to be 0 (no host runtime, e.g. browser/JS deployments).
+// output is the output path (absolute, relative to cwd, or "-" for stdout).
+func CmdCompile(cfg config.BuildConfig, mainWasm, output string) error {
+	var rustTop int64
+	if mainWasm != "" {
+		var err error
+		rustTop, err = utils.RustMemTop(mainWasm)
+		if err != nil {
+			return fmt.Errorf("read main wasm: %w", err)
+		}
 	}
 
-	outPath := outputFile
-	if outPath == "" {
-		outPath = cfg.WasmFile
-	}
-	if outPath == "" {
-		return fmt.Errorf("output WASM file not specified: use -o flag or set wasm_file in config")
-	}
-	if outPath != "-" && !filepath.IsAbs(outPath) && outDir != "" {
-		outPath = filepath.Join(outDir, outPath)
-	}
+	outPath := output
 
 	tableBase := utils.PageAlign(rustTop)
 	slog.Info("Compiling regexes", "count", len(cfg.Regexes), "output", outPath)

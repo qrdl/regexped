@@ -1,0 +1,9 @@
+wasm_merge:    "../../../binaryen/bin/wasm-merge"
+output:        "final.wasm"
+wasm_file:     "urls.wasm"
+import_module: "urls"
+stub_file:     "regex.ts"
+
+regexes:
+  - pattern:          'https?://(?P<host>[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?' 
+    named_groups_func: "extract_domain"

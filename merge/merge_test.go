@@ -101,12 +101,6 @@ func TestPatchMemoryMinNotWasm(t *testing.T) {
 }
 
 func TestModuleNameForWasm(t *testing.T) {
-	baseCfg := config.BuildConfig{
-		Regexes: []config.RegexEntry{
-			{WasmFile: "url.wasm", ImportModule: "url"},
-			{WasmFile: "tokens.wasm", ImportModule: "tok"},
-		},
-	}
 	cases := []struct {
 		name string
 		cfg  config.BuildConfig
@@ -114,9 +108,8 @@ func TestModuleNameForWasm(t *testing.T) {
 		want string
 	}{
 		{"top-level ImportModule", config.BuildConfig{ImportModule: "global"}, "anything.wasm", "global"},
-		{"matches first entry", baseCfg, "/dir/url.wasm", "url"},
-		{"matches second entry", baseCfg, "tokens.wasm", "tok"},
-		{"no match: stem fallback", baseCfg, "/dir/other.wasm", "other"},
+		{"basename fallback", config.BuildConfig{}, "/dir/other.wasm", "other"},
+		{"bare filename fallback", config.BuildConfig{}, "tokens.wasm", "tokens"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
