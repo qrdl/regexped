@@ -59,14 +59,14 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 		if re.GroupsFunc != "" {
 			numGroups, _, err := extractGroupInfo(re.Pattern)
 			if err != nil {
-				return "", fmt.Errorf("entry %s: %w", re.ImportModule, err)
+				return "", fmt.Errorf("pattern %q: %w", re.Pattern, err)
 			}
 			sb.WriteString(genJSGroupsFunc(re.GroupsFunc, numGroups))
 		}
 		if re.NamedGroupsFunc != "" {
 			numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
 			if err != nil {
-				return "", fmt.Errorf("entry %s: %w", re.ImportModule, err)
+				return "", fmt.Errorf("pattern %q: %w", re.Pattern, err)
 			}
 			sb.WriteString(genJSNamedGroupsFunc(re.NamedGroupsFunc, re.GroupsExportName(), numGroups, namedGroups))
 		}

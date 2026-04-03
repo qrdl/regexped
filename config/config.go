@@ -13,23 +13,20 @@ import (
 type BuildConfig struct {
 	WasmMerge    string       `yaml:"wasm_merge"`     // optional; defaults to "wasm-merge" in $PATH
 	Output       string       `yaml:"output"`         // output path for merge command; overridable with -o
-	WasmDir      string       `yaml:"wasm_dir"`       // default output directory for compiled WASM files
 	WasmFile     string       `yaml:"wasm_file"`      // output WASM file for compile command; overridable with -o
-	ImportModule string       `yaml:"import_module"`  // WASM import module name used by wasm-merge
-	StubFile     string       `yaml:"stub_file"`      // stub output file (Rust or JS)
+	ImportModule string       `yaml:"import_module"`  // WASM import module name used by wasm-merge and Rust FFI
+	StubFile     string       `yaml:"stub_file"`      // stub output file (Rust, JS, or TS)
+	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "js", "ts"; inferred from stub_file extension if absent
 	MaxDFAStates int          `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int          `yaml:"max_tdfa_regs"`  // 0 = default (32)
 	Regexes      []RegexEntry `yaml:"regexes"`
 }
 
-// RegexEntry describes a single regex→WASM compilation unit.
+// RegexEntry describes a single regex pattern and the functions to generate for it.
 // One or more of the Func fields must be set; only those stubs are generated.
 // The WASM export names are derived automatically from the function type.
 type RegexEntry struct {
-	WasmFile     string `yaml:"wasm_file"`
-	ImportModule string `yaml:"import_module"`
-	StubFile     string `yaml:"stub_file"`
-	Pattern      string `yaml:"pattern"`
+	Pattern string `yaml:"pattern"`
 
 	// Optional function names — only those set are compiled and stubbed.
 	MatchFunc       string `yaml:"match_func"`        // anchored match → Option<usize>
@@ -50,15 +47,6 @@ func (r RegexEntry) GroupsExportName() string {
 		return r.GroupsFunc
 	}
 	return r.NamedGroupsFunc
-}
-
-// EffectiveStubFile returns the stub file for this entry: per-entry stub_file
-// if set, otherwise the global stub_file from the build config.
-func (r RegexEntry) EffectiveStubFile(globalStubFile string) string {
-	if r.StubFile != "" {
-		return r.StubFile
-	}
-	return globalStubFile
 }
 
 // LoadConfig reads and parses the YAML config at configPath.
@@ -86,19 +74,29 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	}
 
 	// Resolve all paths relative to the config file's directory.
-	cfg.Output = resolveRelative(configDir, cfg.Output)
+	cfg.Output = resolveFilePath(configDir, cfg.Output)
+	cfg.WasmFile = resolveFilePath(configDir, cfg.WasmFile)
+	cfg.StubFile = resolveFilePath(configDir, cfg.StubFile)
 	cfg.WasmMerge = resolveRelative(configDir, cfg.WasmMerge)
-	cfg.WasmDir = resolveRelative(configDir, cfg.WasmDir)
 
 	return cfg, nil
 }
 
 // resolveRelative resolves path relative to base, unless path is empty,
 // already absolute, starts with "~/" (home-relative), or is a bare command
-// name with no path separator.
+// name with no path separator (kept as-is for PATH lookup, e.g. "wasm-merge").
 func resolveRelative(base, path string) string {
 	if path == "" || filepath.IsAbs(path) || strings.HasPrefix(path, "~/") ||
 		!strings.ContainsRune(path, '/') {
+		return path
+	}
+	return filepath.Join(base, path)
+}
+
+// resolveFilePath resolves path relative to base unless path is empty or absolute.
+// Unlike resolveRelative, bare filenames (with no path separator) are also resolved.
+func resolveFilePath(base, path string) string {
+	if path == "" || filepath.IsAbs(path) || strings.HasPrefix(path, "~/") {
 		return path
 	}
 	return filepath.Join(base, path)

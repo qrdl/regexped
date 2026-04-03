@@ -1,17 +1,11 @@
 package generate
 
 import (
-	"os"
 	"strings"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
 )
-
-// readFile is a small helper used by TestCmdDummyMain.
-func readFile(path string) ([]byte, error) {
-	return os.ReadFile(path)
-}
 
 func TestIterTypeName(t *testing.T) {
 	cases := []struct {
@@ -95,39 +89,11 @@ func TestExtractGroupInfo(t *testing.T) {
 	}
 }
 
-func TestGroupByStubFile(t *testing.T) {
-	cfg := config.BuildConfig{
-		StubFile: "stubs.rs",
-		Regexes: []config.RegexEntry{
-			{ImportModule: "a", MatchFunc: "m1", StubFile: "a.rs"},
-			{ImportModule: "b", MatchFunc: "m2"},
-			{ImportModule: "c", MatchFunc: "m3"},
-		},
-	}
-	groups := groupByStubFile(cfg)
-	if len(groups["a.rs"]) != 1 {
-		t.Errorf("groupByStubFile: a.rs has %d entries, want 1", len(groups["a.rs"]))
-	}
-	if len(groups["stubs.rs"]) != 2 {
-		t.Errorf("groupByStubFile: stubs.rs has %d entries, want 2", len(groups["stubs.rs"]))
-	}
-	// Entry with no stub_file and no global stub_file should not appear.
-	cfg2 := config.BuildConfig{
-		Regexes: []config.RegexEntry{
-			{ImportModule: "x", MatchFunc: "m"},
-		},
-	}
-	g2 := groupByStubFile(cfg2)
-	if len(g2) != 0 {
-		t.Errorf("groupByStubFile: expected empty map, got %d entries", len(g2))
-	}
-}
-
 func TestGenRustStubFileSingle(t *testing.T) {
 	entries := []config.RegexEntry{
-		{ImportModule: "url", MatchFunc: "url_match"},
+		{MatchFunc: "url_match"},
 	}
-	out, err := genRustStubFile(entries)
+	out, err := genRustStubFile(entries, "url")
 	if err != nil {
 		t.Fatalf("genRustStubFile: %v", err)
 	}
@@ -137,25 +103,28 @@ func TestGenRustStubFileSingle(t *testing.T) {
 	if !strings.Contains(out, "url_match") {
 		t.Error("genRustStubFile: missing function name")
 	}
-	if strings.Contains(out, "pub mod") {
-		t.Error("genRustStubFile: unexpected pub mod for single entry")
+	if !strings.Contains(out, "pub mod url") {
+		t.Error("genRustStubFile: missing pub mod block")
 	}
 }
 
 func TestGenRustStubFileMultiple(t *testing.T) {
 	entries := []config.RegexEntry{
-		{ImportModule: "url", MatchFunc: "url_match"},
-		{ImportModule: "tok", FindFunc: "tok_find"},
+		{MatchFunc: "url_match"},
+		{FindFunc: "tok_find"},
 	}
-	out, err := genRustStubFile(entries)
+	out, err := genRustStubFile(entries, "mymod")
 	if err != nil {
 		t.Fatalf("genRustStubFile: %v", err)
 	}
-	if !strings.Contains(out, "pub mod url") {
-		t.Error("genRustStubFile: missing pub mod url")
+	if !strings.Contains(out, "pub mod mymod") {
+		t.Error("genRustStubFile: missing pub mod block")
 	}
-	if !strings.Contains(out, "pub mod tok") {
-		t.Error("genRustStubFile: missing pub mod tok")
+	if !strings.Contains(out, "url_match") {
+		t.Error("genRustStubFile: missing url_match")
+	}
+	if !strings.Contains(out, "tok_find") {
+		t.Error("genRustStubFile: missing tok_find")
 	}
 }
 
@@ -164,8 +133,8 @@ func TestGenJSStubFile(t *testing.T) {
 		Output:   "merged.wasm",
 		StubFile: "regex.js",
 		Regexes: []config.RegexEntry{
-			{ImportModule: "url", MatchFunc: "url_match", FindFunc: "url_find"},
-			{ImportModule: "tok", GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named"},
+			{MatchFunc: "url_match", FindFunc: "url_find"},
+			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
 		},
 	}
 	out, err := genJSStubFile(cfg)
@@ -188,8 +157,8 @@ func TestGenTSStubFile(t *testing.T) {
 		Output:   "merged.wasm",
 		StubFile: "regex.ts",
 		Regexes: []config.RegexEntry{
-			{ImportModule: "url", MatchFunc: "url_match", FindFunc: "url_find"},
-			{ImportModule: "tok", GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named"},
+			{MatchFunc: "url_match", FindFunc: "url_find"},
+			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
 		},
 	}
 	out, err := genTSStubFile(cfg)
@@ -211,16 +180,34 @@ func TestGenTSStubFile(t *testing.T) {
 	}
 }
 
-func TestCmdDummyMain(t *testing.T) {
-	dir := t.TempDir()
-	if err := CmdDummyMain(dir, ""); err != nil {
-		t.Fatalf("CmdDummyMain: %v", err)
+func TestResolveStubType(t *testing.T) {
+	cases := []struct {
+		cfg     config.BuildConfig
+		want    string
+		wantErr bool
+	}{
+		{config.BuildConfig{StubType: "rust"}, "rust", false},
+		{config.BuildConfig{StubType: "js"}, "js", false},
+		{config.BuildConfig{StubType: "ts"}, "ts", false},
+		{config.BuildConfig{StubType: "invalid"}, "", true},
+		{config.BuildConfig{StubFile: "out.rs"}, "rust", false},
+		{config.BuildConfig{StubFile: "out.js"}, "js", false},
+		{config.BuildConfig{StubFile: "out.ts"}, "ts", false},
+		{config.BuildConfig{StubFile: "out.wasm"}, "", true},
+		{config.BuildConfig{}, "", true},
 	}
-	data, err := readFile(dir + "/main.wasm")
-	if err != nil {
-		t.Fatalf("reading main.wasm: %v", err)
-	}
-	if len(data) < 4 || string(data[:4]) != "\x00asm" {
-		t.Errorf("CmdDummyMain: output is not valid WASM")
+	for _, c := range cases {
+		got, err := ResolveStubType(c.cfg)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("ResolveStubType(%+v): expected error, got %q", c.cfg, got)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("ResolveStubType(%+v): unexpected error: %v", c.cfg, err)
+			} else if got != c.want {
+				t.Errorf("ResolveStubType(%+v) = %q, want %q", c.cfg, got, c.want)
+			}
+		}
 	}
 }

@@ -42,23 +42,6 @@ func TestGroupsExportName(t *testing.T) {
 	}
 }
 
-func TestEffectiveStubFile(t *testing.T) {
-	cases := []struct {
-		entry      RegexEntry
-		globalStub string
-		want       string
-	}{
-		{RegexEntry{StubFile: "local.rs"}, "global.rs", "local.rs"},
-		{RegexEntry{}, "global.rs", "global.rs"},
-		{RegexEntry{}, "", ""},
-	}
-	for _, c := range cases {
-		if got := c.entry.EffectiveStubFile(c.globalStub); got != c.want {
-			t.Errorf("EffectiveStubFile(%+v, %q) = %q, want %q", c.entry, c.globalStub, got, c.want)
-		}
-	}
-}
-
 func TestLoadConfig(t *testing.T) {
 	yaml := "regexes:\n  - pattern: 'foo'\n    match_func: foo_match\n"
 	dir := t.TempDir()
@@ -99,5 +82,27 @@ func TestLoadConfigNoRegexes(t *testing.T) {
 	_, err := LoadConfig(path)
 	if err == nil {
 		t.Fatal("expected error for config with no regexes, got nil")
+	}
+}
+
+func TestLoadConfigPathResolution(t *testing.T) {
+	dir := t.TempDir()
+	yaml := "wasm_file: regexps.wasm\nstub_file: src/stub.rs\noutput: final.wasm\nregexes:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+	path := filepath.Join(dir, "regexped.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.WasmFile != filepath.Join(dir, "regexps.wasm") {
+		t.Errorf("WasmFile = %q, want %q", cfg.WasmFile, filepath.Join(dir, "regexps.wasm"))
+	}
+	if cfg.StubFile != filepath.Join(dir, "src/stub.rs") {
+		t.Errorf("StubFile = %q, want %q", cfg.StubFile, filepath.Join(dir, "src/stub.rs"))
+	}
+	if cfg.Output != filepath.Join(dir, "final.wasm") {
+		t.Errorf("Output = %q, want %q", cfg.Output, filepath.Join(dir, "final.wasm"))
 	}
 }

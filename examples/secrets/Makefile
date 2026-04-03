@@ -12,7 +12,7 @@ all: run
 
 # Step 1 – generate Rust stubs (all patterns into one file)
 src/stubs.rs: regexped.yaml
-	$(REGEXPED) generate --config=regexped.yaml --out-dir=. --rust
+	$(REGEXPED) generate --config=regexped.yaml
 
 generate: src/stubs.rs
 
@@ -24,13 +24,13 @@ build: $(MAIN_WASM)
 
 # Step 3 – compile all regex patterns to WASM
 $(REGEX_WASMS): regexped.yaml $(MAIN_WASM)
-	$(REGEXPED) compile --config=regexped.yaml --wasm-input=$(MAIN_WASM) --out-dir=.
+	$(REGEXPED) compile --config=regexped.yaml --main=$(MAIN_WASM)
 
 compile: $(REGEX_WASMS)
 
 # Step 4 – merge main WASM and all regex WASMs into a single module
 $(FINAL_WASM): $(MAIN_WASM) $(REGEX_WASMS) regexped.yaml
-	$(REGEXPED) merge --config=regexped.yaml $(MAIN_WASM) $(REGEX_WASMS)
+	$(REGEXPED) merge --config=regexped.yaml --main=$(MAIN_WASM) $(REGEX_WASMS)
 
 merge: $(FINAL_WASM)
 

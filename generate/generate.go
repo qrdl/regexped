@@ -11,44 +11,68 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// CmdStub generates Rust stub files for each regex in cfg.
-// Patterns with a per-entry stub_file go to their own file.
-// Patterns using the global stub_file are collected into one file,
-// each wrapped in a pub mod <import_module> { } block when there are
-// multiple entries sharing the file.
-// If out is "-", all content is written to stdout instead of files.
-func CmdStub(cfg config.BuildConfig, outDir, out string) error {
-	groups := groupByStubFile(cfg)
-	for stubFile, entries := range groups {
-		content, err := genRustStubFile(entries)
-		if err != nil {
-			return fmt.Errorf("generate Rust stub %s: %w", stubFile, err)
-		}
-		if content == "" {
-			continue
-		}
-		if out == "-" {
-			if _, err := os.Stdout.WriteString(content); err != nil {
-				return fmt.Errorf("write stdout: %w", err)
-			}
-			continue
-		}
-		if err := writeStub(outDir, stubFile, []byte(content)); err != nil {
-			return err
+// ResolveStubType determines the stub type from cfg.StubType or the extension
+// of cfg.StubFile. Returns one of "rust", "js", "ts", or an error.
+func ResolveStubType(cfg config.BuildConfig) (string, error) {
+	if cfg.StubType != "" {
+		switch cfg.StubType {
+		case "rust", "js", "ts":
+			return cfg.StubType, nil
+		default:
+			return "", fmt.Errorf("unknown stub_type %q (expected rust, js, or ts)", cfg.StubType)
 		}
 	}
-	return nil
+	ext := strings.ToLower(filepath.Ext(cfg.StubFile))
+	switch ext {
+	case ".rs":
+		return "rust", nil
+	case ".js":
+		return "js", nil
+	case ".ts":
+		return "ts", nil
+	default:
+		return "", fmt.Errorf("cannot infer stub type from %q: set stub_type in config (rust, js, or ts)", cfg.StubFile)
+	}
 }
 
-// CmdTS generates a single TypeScript ES module stub file for all regex entries.
-// If out is "-", content is written to stdout instead of a file.
-func CmdTS(cfg config.BuildConfig, outDir, out string) error {
-	if out != "-" && cfg.StubFile == "" {
-		return fmt.Errorf("ts: stub_file must be set in config (top-level)")
+// CmdGenerateStub generates a stub file of the appropriate type for cfg.
+// out is the full output path or "-" for stdout.
+func CmdGenerateStub(cfg config.BuildConfig, out string) error {
+	stubType, err := ResolveStubType(cfg)
+	if err != nil {
+		return err
 	}
-	if cfg.Output == "" {
-		return fmt.Errorf("ts: output (merged WASM path) must be set in config")
+	switch stubType {
+	case "rust":
+		return CmdStub(cfg, out)
+	case "js":
+		return CmdJS(cfg, out)
+	case "ts":
+		return CmdTS(cfg, out)
 	}
+	return fmt.Errorf("unknown stub type: %s", stubType)
+}
+
+// CmdStub generates a Rust stub file for all regex entries in cfg.
+// out is the full output path or "-" for stdout.
+func CmdStub(cfg config.BuildConfig, out string) error {
+	content, err := genRustStubFile(cfg.Regexes, cfg.ImportModule)
+	if err != nil {
+		return fmt.Errorf("generate Rust stub: %w", err)
+	}
+	if content == "" {
+		return nil
+	}
+	if out == "-" {
+		_, err := os.Stdout.WriteString(content)
+		return err
+	}
+	return writeStub(out, []byte(content))
+}
+
+// CmdTS generates a TypeScript ES module stub file for all regex entries in cfg.
+// out is the full output path or "-" for stdout.
+func CmdTS(cfg config.BuildConfig, out string) error {
 	content, err := genTSStubFile(cfg)
 	if err != nil {
 		return fmt.Errorf("generate TS stub: %w", err)
@@ -57,18 +81,12 @@ func CmdTS(cfg config.BuildConfig, outDir, out string) error {
 		_, err := os.Stdout.WriteString(content)
 		return err
 	}
-	return writeStub(outDir, cfg.StubFile, []byte(content))
+	return writeStub(out, []byte(content))
 }
 
-// CmdJS generates a single ES module JS stub file for all regex entries.
-// If out is "-", content is written to stdout instead of a file.
-func CmdJS(cfg config.BuildConfig, outDir, out string) error {
-	if out != "-" && cfg.StubFile == "" {
-		return fmt.Errorf("js: stub_file must be set in config (top-level)")
-	}
-	if cfg.Output == "" {
-		return fmt.Errorf("js: output (merged WASM path) must be set in config")
-	}
+// CmdJS generates a JS ES module stub file for all regex entries in cfg.
+// out is the full output path or "-" for stdout.
+func CmdJS(cfg config.BuildConfig, out string) error {
 	content, err := genJSStubFile(cfg)
 	if err != nil {
 		return fmt.Errorf("generate JS stub: %w", err)
@@ -77,99 +95,58 @@ func CmdJS(cfg config.BuildConfig, outDir, out string) error {
 		_, err := os.Stdout.WriteString(content)
 		return err
 	}
-	return writeStub(outDir, cfg.StubFile, []byte(content))
-}
-
-// groupByStubFile groups RegexEntry values by their effective stub file path.
-func groupByStubFile(cfg config.BuildConfig) map[string][]config.RegexEntry {
-	groups := make(map[string][]config.RegexEntry)
-	for _, re := range cfg.Regexes {
-		sf := re.EffectiveStubFile(cfg.StubFile)
-		if sf == "" {
-			continue
-		}
-		// Use top-level import_module as fallback when per-entry field is empty.
-		if re.ImportModule == "" {
-			re.ImportModule = cfg.ImportModule
-		}
-		groups[sf] = append(groups[sf], re)
-	}
-	return groups
+	return writeStub(out, []byte(content))
 }
 
 // genRustStubFile generates the content of a Rust stub file for a slice of entries.
-// If there is more than one entry, each is wrapped in pub mod <import_module> { }.
-func genRustStubFile(entries []config.RegexEntry) (string, error) {
+// All entries are wrapped in a single pub mod <importModule> { } block.
+func genRustStubFile(entries []config.RegexEntry, importModule string) (string, error) {
 	if len(entries) == 0 {
 		return "", nil
 	}
 
-	header := "// Auto-generated by regexped. Do not edit.\n\n"
-
-	if len(entries) == 1 {
-		body, err := genRustStubsForEntry(entries[0])
-		if err != nil {
-			return "", err
-		}
-		if body == "" {
-			return "", nil
-		}
-		return header + body, nil
-	}
-
-	// Multiple entries: group by import_module, one pub mod block per unique module name.
-	// Preserve declaration order of first occurrence of each module name.
-	type modEntry struct {
-		name string
-		body strings.Builder
-	}
-	modOrder := []string{}
-	modBodies := map[string]*strings.Builder{}
-
+	var bodyParts []string
 	for _, re := range entries {
-		body, err := genRustStubsForEntry(re)
+		body, err := genRustStubsForEntry(re, importModule)
 		if err != nil {
 			return "", err
 		}
-		if body == "" {
-			continue
+		if body != "" {
+			bodyParts = append(bodyParts, body)
 		}
-		mod := re.ImportModule
-		if _, seen := modBodies[mod]; !seen {
-			modOrder = append(modOrder, mod)
-			modBodies[mod] = &strings.Builder{}
-		}
-		modBodies[mod].WriteString(body)
+	}
+	if len(bodyParts) == 0 {
+		return "", nil
 	}
 
+	combined := strings.TrimRight(strings.Join(bodyParts, ""), "\n")
+
+	header := "// Auto-generated by regexped. Do not edit.\n\n"
 	var out strings.Builder
 	out.WriteString(header)
-	for _, mod := range modOrder {
-		content := strings.TrimRight(modBodies[mod].String(), "\n")
-		fmt.Fprintf(&out, "pub mod %s {\n", mod)
-		for _, line := range strings.Split(content, "\n") {
-			if line == "" {
-				out.WriteString("\n")
-			} else {
-				fmt.Fprintf(&out, "    %s\n", line)
-			}
+	fmt.Fprintf(&out, "pub mod %s {\n", importModule)
+	for _, line := range strings.Split(combined, "\n") {
+		if line == "" {
+			out.WriteString("\n")
+		} else {
+			fmt.Fprintf(&out, "    %s\n", line)
 		}
-		out.WriteString("}\n\n")
 	}
+	out.WriteString("}\n")
 	return out.String(), nil
 }
 
 // genRustStubsForEntry generates the Rust stub content for a single entry.
-func genRustStubsForEntry(re config.RegexEntry) (string, error) {
+func genRustStubsForEntry(re config.RegexEntry, importModule string) (string, error) {
 	var out string
 	written := false
 
 	if re.MatchFunc != "" {
-		out += genRustMatchStub(re.ImportModule, re.MatchFunc)
+		out += genRustMatchStub(importModule, re.MatchFunc)
 		written = true
 	}
 	if re.FindFunc != "" {
-		out += genRustFindIterStub(re.ImportModule, re.FindFunc)
+		out += genRustFindIterStub(importModule, re.FindFunc)
 		written = true
 	}
 	if re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
@@ -179,13 +156,13 @@ func genRustStubsForEntry(re config.RegexEntry) (string, error) {
 		}
 		exportName := re.GroupsExportName()
 		if re.GroupsFunc != "" {
-			out += genRustGroupsIterStub(re.ImportModule, re.GroupsFunc, exportName, true, numGroups)
+			out += genRustGroupsIterStub(importModule, re.GroupsFunc, exportName, true, numGroups)
 			written = true
 		}
 		if re.NamedGroupsFunc != "" {
 			// Only declare the FFI if groups_func didn't already declare it.
 			declareFFI := re.GroupsFunc == ""
-			out += genRustNamedGroupsIterStub(re.ImportModule, re.NamedGroupsFunc, exportName, declareFFI, numGroups, namedGroups)
+			out += genRustNamedGroupsIterStub(importModule, re.NamedGroupsFunc, exportName, declareFFI, numGroups, namedGroups)
 			written = true
 		}
 	}
@@ -196,9 +173,8 @@ func genRustStubsForEntry(re config.RegexEntry) (string, error) {
 	return out, nil
 }
 
-// writeStub creates the parent directory and writes data to outDir/stubFile.
-func writeStub(outDir, stubFile string, data []byte) error {
-	path := filepath.Join(outDir, stubFile)
+// writeStub creates the parent directory and writes data to path.
+func writeStub(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
 	}
