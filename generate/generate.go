@@ -40,6 +40,26 @@ func CmdStub(cfg config.BuildConfig, outDir, out string) error {
 	return nil
 }
 
+// CmdTS generates a single TypeScript ES module stub file for all regex entries.
+// If out is "-", content is written to stdout instead of a file.
+func CmdTS(cfg config.BuildConfig, outDir, out string) error {
+	if out != "-" && cfg.StubFile == "" {
+		return fmt.Errorf("ts: stub_file must be set in config (top-level)")
+	}
+	if cfg.Output == "" {
+		return fmt.Errorf("ts: output (merged WASM path) must be set in config")
+	}
+	content, err := genTSStubFile(cfg)
+	if err != nil {
+		return fmt.Errorf("generate TS stub: %w", err)
+	}
+	if out == "-" {
+		_, err := os.Stdout.WriteString(content)
+		return err
+	}
+	return writeStub(outDir, cfg.StubFile, []byte(content))
+}
+
 // CmdJS generates a single ES module JS stub file for all regex entries.
 // If out is "-", content is written to stdout instead of a file.
 func CmdJS(cfg config.BuildConfig, outDir, out string) error {

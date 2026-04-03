@@ -2,8 +2,8 @@
 //
 // Usage:
 //
-//	regexped generate [--config=<file>] [--out-dir=<dir>] --rust
-//	regexped generate [--out-dir=<dir>] --dummy_main
+//	regexped generate [--config=<file>] [--out-dir=<dir>] --rust//	 regexped generate [--config=<file>] [--out-dir=<dir>] --js
+//	 regexped generate [--config=<file>] [--out-dir=<dir>] --ts//	regexped generate [--out-dir=<dir>] --dummy_main
 //	regexped compile  [--config=<file>] [--out-dir=<dir>] --wasm-input=<file>
 //	regexped merge    [--config=<file>] [--output=<file>] <main.wasm> <regex1.wasm> ...
 //
@@ -62,6 +62,7 @@ func runGenerateCmd(args []string) {
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
 	rust := fs.Bool("rust", false, "generate Rust stub files")
 	js := fs.Bool("js", false, "generate JS ES module stub file")
+	ts := fs.Bool("ts", false, "generate TypeScript ES module stub file")
 	dummyMain := fs.Bool("dummy_main", false, "generate a minimal main.wasm (memory-only, no code)")
 	var outDir, out string
 	fs.StringVar(&outDir, "out-dir", "", "output directory for generated stubs (default: .)")
@@ -71,17 +72,17 @@ func runGenerateCmd(args []string) {
 	fs.Parse(args)
 
 	modeCount := 0
-	for _, b := range []bool{*rust, *js, *dummyMain} {
+	for _, b := range []bool{*rust, *js, *ts, *dummyMain} {
 		if b {
 			modeCount++
 		}
 	}
 	if modeCount > 1 {
-		fmt.Fprintln(os.Stderr, "generate: --rust, --js, and --dummy_main are mutually exclusive")
+		fmt.Fprintln(os.Stderr, "generate: --rust, --js, --ts, and --dummy_main are mutually exclusive")
 		os.Exit(1)
 	}
 	if modeCount == 0 {
-		fmt.Fprintln(os.Stderr, "generate: specify --rust, --js, or --dummy_main")
+		fmt.Fprintln(os.Stderr, "generate: specify --rust, --js, --ts, or --dummy_main")
 		os.Exit(1)
 	}
 
@@ -106,6 +107,12 @@ func runGenerateCmd(args []string) {
 
 	if *js {
 		if err := generate.CmdJS(cfg, outDir, out); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if *ts {
+		if err := generate.CmdTS(cfg, outDir, out); err != nil {
 			log.Fatal(err)
 		}
 		return

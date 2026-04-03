@@ -173,12 +173,40 @@ func TestGenJSStubFile(t *testing.T) {
 		t.Fatalf("genJSStubFile: %v", err)
 	}
 	for _, sub := range []string{
-		"merged.wasm", "url_match", "url_find",
+		"url_match", "url_find",
 		"tok_groups", "tok_named",
-		"WebAssembly.instantiateStreaming", "_SLOTS",
+		"export async function init", "WebAssembly.instantiate", "_SLOTS",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genJSStubFile: output missing %q", sub)
+		}
+	}
+}
+
+func TestGenTSStubFile(t *testing.T) {
+	cfg := config.BuildConfig{
+		Output:   "merged.wasm",
+		StubFile: "regex.ts",
+		Regexes: []config.RegexEntry{
+			{ImportModule: "url", MatchFunc: "url_match", FindFunc: "url_find"},
+			{ImportModule: "tok", GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named"},
+		},
+	}
+	out, err := genTSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("genTSStubFile: %v", err)
+	}
+	for _, sub := range []string{
+		"url_match", "url_find",
+		"tok_groups", "tok_named",
+		"export async function init", "Promise<void>",
+		"WebAssembly.Module", "WebAssembly.instantiate",
+		"Generator<[number, number]>",
+		"Generator<Record<string, [number, number]>>",
+		"_SLOTS",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genTSStubFile: output missing %q", sub)
 		}
 	}
 }
