@@ -1370,13 +1370,13 @@ func buildBTInnerDisp(
 	body = utils.AppendSLEB128(body, frameSize)
 	body = append(body, 0x6B, 0x21, localSP) // i32.sub; local.set sp
 	// Restore pos = mem[sp+0]
-	body = append(body, 0x20, localSP, 0x28, 0x02)
-	body = utils.AppendULEB128(body, 0)
+	body = append(body, 0x20, localSP)
+	body = appendTableLoad32(body, tableMemIdx, 0)
 	body = append(body, 0x21, localPos)
 	// Restore retryPC = mem[sp+4]
 	retryOff := uint32(4 + numCapLocals*4)
-	body = append(body, 0x20, localSP, 0x28, 0x02)
-	body = utils.AppendULEB128(body, retryOff)
+	body = append(body, 0x20, localSP)
+	body = appendTableLoad32(body, tableMemIdx, retryOff)
 	body = append(body, 0x21, localState)
 	body = append(body, 0x0C, 0x01) // br 1 → restart $run
 	body = append(body, 0x0B)       // end of (state==-1) if
