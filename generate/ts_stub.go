@@ -2,11 +2,26 @@ package generate
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
 	"github.com/qrdl/regexped/config"
 )
+
+// tsStub generates a TypeScript ES module stub file for all regex entries in cfg.
+// out is the full output path or "-" for stdout.
+func tsStub(cfg config.BuildConfig, out string) error {
+	content, err := genTSStubFile(cfg)
+	if err != nil {
+		return fmt.Errorf("generate TS stub: %w", err)
+	}
+	if out == "-" {
+		_, err := os.Stdout.WriteString(content)
+		return err
+	}
+	return writeStub(out, []byte(content))
+}
 
 // genTSStubFile generates the content of a TypeScript ES module stub that
 // exports typed wrapper functions for every regex entry in cfg.
