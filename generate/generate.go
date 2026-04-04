@@ -16,10 +16,10 @@ import (
 func ResolveStubType(cfg config.BuildConfig) (string, error) {
 	if cfg.StubType != "" {
 		switch cfg.StubType {
-		case "rust", "js", "ts", "go":
+		case "rust", "js", "ts", "go", "c":
 			return cfg.StubType, nil
 		default:
-			return "", fmt.Errorf("unknown stub_type %q (expected rust, js, ts, or go)", cfg.StubType)
+			return "", fmt.Errorf("unknown stub_type %q (expected rust, js, ts, go, or c)", cfg.StubType)
 		}
 	}
 	ext := strings.ToLower(filepath.Ext(cfg.StubFile))
@@ -32,8 +32,10 @@ func ResolveStubType(cfg config.BuildConfig) (string, error) {
 		return "ts", nil
 	case ".go":
 		return "go", nil
+	case ".h":
+		return "c", nil
 	default:
-		return "", fmt.Errorf("cannot infer stub type from %q: set stub_type in config (rust, js, ts, or go)", cfg.StubFile)
+		return "", fmt.Errorf("cannot infer stub type from %q: set stub_type in config (rust, js, ts, go, or c)", cfg.StubFile)
 	}
 }
 
@@ -46,20 +48,22 @@ func CmdGenerateStub(cfg config.BuildConfig, out string) error {
 	}
 	switch stubType {
 	case "rust":
-		return CmdStub(cfg, out)
+		return rustStub(cfg, out)
 	case "js":
-		return CmdJS(cfg, out)
+		return jsStub(cfg, out)
 	case "ts":
-		return CmdTS(cfg, out)
+		return tsStub(cfg, out)
 	case "go":
-		return CmdGo(cfg, out)
+		return goStub(cfg, out)
+	case "c":
+		return cStub(cfg, out)
 	}
 	return fmt.Errorf("unknown stub type: %s", stubType)
 }
 
-// CmdStub generates a Rust stub file for all regex entries in cfg.
+// rustStub generates a Rust stub file for all regex entries in cfg.
 // out is the full output path or "-" for stdout.
-func CmdStub(cfg config.BuildConfig, out string) error {
+func rustStub(cfg config.BuildConfig, out string) error {
 	content, err := genRustStubFile(cfg.Regexes, cfg.ImportModule)
 	if err != nil {
 		return fmt.Errorf("generate Rust stub: %w", err)
@@ -74,9 +78,9 @@ func CmdStub(cfg config.BuildConfig, out string) error {
 	return writeStub(out, []byte(content))
 }
 
-// CmdTS generates a TypeScript ES module stub file for all regex entries in cfg.
+// tsStub generates a TypeScript ES module stub file for all regex entries in cfg.
 // out is the full output path or "-" for stdout.
-func CmdTS(cfg config.BuildConfig, out string) error {
+func tsStub(cfg config.BuildConfig, out string) error {
 	content, err := genTSStubFile(cfg)
 	if err != nil {
 		return fmt.Errorf("generate TS stub: %w", err)
@@ -88,9 +92,9 @@ func CmdTS(cfg config.BuildConfig, out string) error {
 	return writeStub(out, []byte(content))
 }
 
-// CmdJS generates a JS ES module stub file for all regex entries in cfg.
+// jsStub generates a JS ES module stub file for all regex entries in cfg.
 // out is the full output path or "-" for stdout.
-func CmdJS(cfg config.BuildConfig, out string) error {
+func jsStub(cfg config.BuildConfig, out string) error {
 	content, err := genJSStubFile(cfg)
 	if err != nil {
 		return fmt.Errorf("generate JS stub: %w", err)

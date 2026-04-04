@@ -1,8 +1,8 @@
-wasm_merge:    "../../../binaryen/bin/wasm-merge"
+wasm_merge:    "../../../../../binaryen/bin/wasm-merge"
 output:        "final.wasm"
 wasm_file:     "url_parts.wasm"
 import_module: "url_parts"
-stub_file:     "src/stub.rs"
+stub_file:     "stub.h"
 
 regexes:
   - pattern:          '(?P<scheme>https?)://(?P<host>[^/:?#]+)(?::(?P<port>[0-9]+))?(?P<path>/[^?#]*)?(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?'

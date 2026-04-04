@@ -1,5 +1,5 @@
 # regexped must be built first: run `make` in the repo root.
-REGEXPED    := ../../regexped
+REGEXPED    := ../../../../regexped
 WASM_TARGET := wasm32-wasip1
 
 MAIN_WASM   := target/$(WASM_TARGET)/release/secrets.wasm
@@ -11,13 +11,13 @@ FINAL_WASM  := final.wasm
 all: run
 
 # Step 1 – generate Rust stubs (all patterns into one file)
-src/stubs.rs: regexped.yaml
+stubs.rs: regexped.yaml
 	$(REGEXPED) generate --config=regexped.yaml
 
-generate: src/stubs.rs
+generate: stubs.rs
 
 # Step 2 – compile Rust source to WASM
-$(MAIN_WASM): src/main.rs src/stubs.rs Cargo.toml
+$(MAIN_WASM): main.rs stubs.rs Cargo.toml
 	cargo build --target $(WASM_TARGET) --release
 
 build: $(MAIN_WASM)
@@ -53,4 +53,4 @@ run: $(FINAL_WASM)
 
 clean:
 	cargo clean
-	rm -f src/stubs.rs regexps.wasm $(FINAL_WASM)
+	rm -f stubs.rs regexps.wasm $(FINAL_WASM)

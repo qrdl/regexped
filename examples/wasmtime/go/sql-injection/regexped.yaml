@@ -1,4 +1,4 @@
-wasm_merge:    "../../../binaryen/bin/wasm-merge"
+wasm_merge:    "../../../../../binaryen/bin/wasm-merge"
 output:        "final.wasm"
 wasm_file:     "sqli.wasm"
 import_module: "sqli"
