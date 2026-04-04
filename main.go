@@ -3,8 +3,8 @@
 // Usage:
 //
 //	regexped generate [--config=<file>] [--output=<file>|-]
-//	regexped compile  [--config=<file>] [--main=<file>] [--output=<file>|-]
-//	regexped merge    [--config=<file>] (--main=<file>|--dummy-main) [--output=<file>|-] <regex1.wasm> ...
+//	regexped compile  [--config=<file>] [--output=<file>|-]
+//	regexped merge    [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
 //
 // The config file defaults to regexped.yaml in the current directory when not specified.
 package main
@@ -48,9 +48,9 @@ func printUsage() {
 	fmt.Fprint(os.Stderr, `Usage: regexped <command> [options]
 
 Commands:
-  generate  Generate language stubs (Rust/JS/TS) from a config file
-  compile   Compile regex patterns to a WASM module
-  merge     Patch memory and merge WASM modules into a single binary
+  generate  Generate language stubs (Rust/Go/JS/TS) from a config file
+  compile   Compile regex patterns to a standalone WASM module
+  merge     Merge WASM modules into a single binary (thin wrapper around wasm-merge)
 
 Run 'regexped <command> -h' for command-specific options.
 `)
@@ -99,7 +99,6 @@ func runGenerateCmd(args []string) {
 func runCompileCmd(args []string) {
 	fs := flag.NewFlagSet("compile", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	mainWasm := fs.String("main", "", "main WASM file for memory layout; if omitted, rustTop=0 is assumed")
 	var out string
 	fs.StringVar(&out, "output", "", "override wasm_file from config; - writes to stdout")
 	fs.StringVar(&out, "o", "", "output file (alias for --output)")
@@ -120,7 +119,7 @@ func runCompileCmd(args []string) {
 		os.Exit(1)
 	}
 
-	if err := compile.CmdCompile(cfg, *mainWasm, outPath); err != nil {
+	if err := compile.CmdCompile(cfg, outPath); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -128,20 +127,14 @@ func runCompileCmd(args []string) {
 func runMergeCmd(args []string) {
 	fs := flag.NewFlagSet("merge", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	mainFlag := fs.String("main", "", "main WASM file (mutually exclusive with --dummy-main)")
-	dummyMain := fs.Bool("dummy-main", false, "use built-in dummy main (for JS/browser/CF Worker deployments)")
+	mainFlag := fs.String("main", "", "main WASM file to merge into (required)")
 	var out string
 	fs.StringVar(&out, "output", "", "override output from config; - writes to stdout")
 	fs.StringVar(&out, "o", "", "output file (alias for --output)")
 	fs.Parse(args)
 
-	// Validate flags before loading config.
-	if *mainFlag != "" && *dummyMain {
-		fmt.Fprintln(os.Stderr, "merge: --main and --dummy-main are mutually exclusive")
-		os.Exit(1)
-	}
-	if *mainFlag == "" && !*dummyMain {
-		fmt.Fprintln(os.Stderr, "merge: --main=<file> or --dummy-main is required")
+	if *mainFlag == "" {
+		fmt.Fprintln(os.Stderr, "merge: --main=<file> is required")
 		os.Exit(1)
 	}
 
@@ -166,8 +159,7 @@ func runMergeCmd(args []string) {
 		os.Exit(1)
 	}
 
-	mainWasm := *mainFlag // empty string when --dummy-main is used
-	if err := merge.CmdMerge(cfg, mainWasm, outPath, regexWasms); err != nil {
+	if err := merge.CmdMerge(cfg, *mainFlag, outPath, regexWasms); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -33,13 +33,15 @@ regexped/
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/
-│   ├── generate.go            # Stub generation orchestration (CmdStub)
+│   ├── generate.go            # Stub generation orchestration (CmdStub, CmdGo, CmdJS, CmdTS)
 │   ├── rust_stub.go           # Rust FFI stub generator (iterators)
-│   └── dummy_main.go          # Dummy main WASM generator (CmdDummyMain)
+│   ├── go_stub.go             # Go (wasip1) stub generator (//go:wasmimport, iter.Seq2)
+│   ├── js_stub.go             # JS ES module stub generator
+│   └── ts_stub.go             # TypeScript ES module stub generator
 ├── merge/
 │   └── merge.go               # WASM module merging with wasm-merge
 ├── utils/
-│   └── bytes.go               # LEB128, page alignment, RustMemTop
+│   └── bytes.go               # LEB128, page alignment, WasmMemTop
 ├── re2test/
 │   ├── main.go                # RE2 exhaustive test runner (wasmtime-based)
 │   └── Makefile               # Unpacks test data, runs tests
@@ -198,6 +200,18 @@ All FFI declarations use `ffi_<func>` internally with `#[link_name = "<func>"]` 
 
 When multiple entries share the same `stub_file`, each is wrapped in `pub mod <import_module> { }`. Single-entry files have no mod block.
 
+**Go stubs** (`generate/go_stub.go`):
+
+Generated as a `//go:build wasip1` file using `//go:wasmimport` declarations. Requires Go 1.23+.
+Function names are converted to `PascalCase` for the public API; FFI shims use `ffi_` prefix.
+
+| Field | Generated function | Go type |
+|---|---|---|
+| `match_func` | `<PascalCase>(input []byte)` | `(int, bool)` |
+| `find_func` | `<PascalCase>(input []byte)` | `iter.Seq2[int, int]` |
+| `groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[[][]int]` |
+| `named_groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[map[string][]int]` |
+
 **JS stubs** (`generate/js_stub.go`):
 
 Generated as a single ES module using top-level `await`. Loads the merged WASM (`output` field) and exports:
@@ -211,7 +225,7 @@ Generated as a single ES module using top-level `await`. Loads the merged WASM (
 
 Input `string` or `Uint8Array`. Capture slot buffer placed at memory offset 1024.
 
-**Dummy main** (`generate/dummy_main.go`): 25-byte WASM with 2-page memory export; used as `--wasm-input` for browser deployments.
+**Dummy main** (embedded in `merge/merge.go`): 25-byte WASM with 2-page memory export; used when no `--main` is provided for browser/JS deployments.
 
 ### 4. WASM Merging (`merge/`)
 
@@ -230,7 +244,7 @@ Input `string` or `Uint8Array`. Capture slot buffer placed at memory offset 1024
 - `AppendULEB128` / `DecodeULEB128` — unsigned LEB128
 - `AppendSLEB128` / `DecodeSLEB128` — signed LEB128
 - `PageAlign(n)` — rounds up to 64KB boundary
-- `RustMemTop(path)` — scans WASM data segments and globals to find the highest used address
+- `WasmMemTop(path)` — scans WASM data segments and globals to find the highest used address
 
 ## Testing
 
@@ -278,7 +292,7 @@ Harnesses must be pre-built with `make harnesses` if changed.
 0               rustTop          tableBase1      tableBase2
 ```
 
-- **rustTop** = highest address used by Rust code (from `RustMemTop`)
+- **memTop** = highest address used by host code (from `WasmMemTop`)
 - **tableBase** = `PageAlign(rustTop)` — start of first DFA/TDFA table
 - Each regex gets a contiguous region; next regex starts at `PageAlign(prevEnd)`
 

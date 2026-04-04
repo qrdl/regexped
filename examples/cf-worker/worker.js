@@ -7,7 +7,7 @@
 //
 // Response: JSON { findings: [{ type, start, end, value }] }
 
-import wasm from './final.wasm';
+import wasm from './regexps.wasm';
 import { init, find_github_token, find_jwt_token, find_aws_key } from './regex.js';
 
 // Instantiate once at module load time (outside the fetch handler).

@@ -9,33 +9,16 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/internal/utils"
 )
 
-// dummyMainWASM is a minimal WASM module that exports 2 pages (128 KB) of memory.
-// It has no code, no data, and no imports. Used by --dummy-main when there is no
-// host-language runtime (browser, JS, Cloudflare Worker deployments).
-//
-// Equivalent WAT:
-//
-//	(module
-//	  (memory (export "memory") 2))
-var dummyMainWASM = []byte{
-	0x00, 0x61, 0x73, 0x6d, // magic "\0asm"
-	0x01, 0x00, 0x00, 0x00, // version 1
-	// Memory section (id=5): 1 memory, min=2 pages, no max
-	0x05, 0x03, 0x01, 0x00, 0x02,
-	// Export section (id=7): export "memory" as memory 0
-	0x07, 0x0a, 0x01, 0x06,
-	0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, // "memory"
-	0x02, 0x00,
-}
-
-// CmdMerge patches the main WASM module's memory size and merges it with the
-// regex WASM modules.
-// mainWasm is the path to the host main module; if empty, the built-in dummy
-// main (memory-only, no code) is used instead (pass --dummy-main in CLI).
+// CmdMerge merges the main WASM module with the regex WASM modules using wasm-merge.
+// mainWasm is the path to the host main module.
 // regexWasms are the regex WASM files to merge (at least one required).
+//
+// This is a thin wrapper around wasm-merge. Users may invoke wasm-merge directly:
+//
+//	wasm-merge --enable-multimemory --enable-simd <main.wasm> main <regex.wasm> <module> \
+//	           --rename-export-conflicts -o output
 func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []string) error {
 	wasmMergeCmd := expandHome(cfg.WasmMerge)
 	if wasmMergeCmd == "" {
@@ -47,60 +30,19 @@ func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []stri
 		return err
 	}
 
-	// Sanity check: verify each file looks like a compiled regex WASM.
-	slog.Debug("Checking WASM modules")
-	for _, path := range regexWasms {
-		if !isRegexWasm(path) {
-			return fmt.Errorf("%s does not appear to be a compiled regex WASM (missing memory import from \"main\")", path)
-		}
-	}
-
-	// Find the required memory size from the regex WASMs' data segments.
-	requiredMem, err := regexMemoryTop(regexWasms)
-	if err != nil {
-		return fmt.Errorf("measure regex memory: %w", err)
-	}
-	pages := uint32(utils.PageAlign(requiredMem) / utils.WasmPageSize)
-	slog.Debug("Memory requirement", "bytes", utils.PageAlign(requiredMem), "pages", pages)
-
-	// Load main WASM bytes: from file or built-in dummy.
-	var mainRaw []byte
-	if mainWasm == "" {
-		mainRaw = dummyMainWASM
-	} else {
-		mainRaw, err = os.ReadFile(mainWasm)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", mainWasm, err)
-		}
-	}
-	patched, err := patchMemoryMin(mainRaw, pages)
-	if err != nil {
-		return fmt.Errorf("patch memory section: %w", err)
-	}
-
-	tmp, err := os.CreateTemp("", "regexped-main-*.wasm")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(patched); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("write temp file: %w", err)
-	}
-	tmp.Close()
-	defer os.Remove(tmpPath)
-	slog.Debug("Patched harness memory", "pages", pages, "source", mainWasm)
-
-	// Build wasm-merge args: <main> main <regex1> <module1> ...
-	slog.Debug("Merging modules")
-	mergeArgs := []string{tmpPath, "main"}
+	// Feature flags must precede input files so Binaryen applies them during parsing.
+	// Main module is listed first so it keeps memory index 0 in the merged output
+	// (wasm-merge assigns memory indices in argument order). Regex modules come after
+	// and get renumbered to higher indices by wasm-merge.
+	mergeArgs := []string{"--enable-multimemory", "--enable-simd", "--enable-bulk-memory", "--enable-bulk-memory-opt"}
+	mergeArgs = append(mergeArgs, mainWasm, "main")
 	for _, path := range regexWasms {
 		module := moduleNameForWasm(cfg, path)
 		mergeArgs = append(mergeArgs, path, module)
 	}
-	mergeArgs = append(mergeArgs, "--rename-export-conflicts", "--enable-simd", "-o", output)
+	mergeArgs = append(mergeArgs, "--rename-export-conflicts", "-o", output)
 
+	slog.Debug("Merging modules")
 	if err := runCmd(wasmMergeCmd, mergeArgs, "", nil); err != nil {
 		return fmt.Errorf("wasm-merge: %w", err)
 	}
@@ -139,173 +81,6 @@ func checkTool(path string) error {
 		return fmt.Errorf("tool not found in PATH: %s", path)
 	}
 	return nil
-}
-
-// isRegexWasm returns true if the WASM file at path contains a memory import
-// from module "main", which is the signature of our generated regex modules.
-func isRegexWasm(path string) bool {
-	raw, err := os.ReadFile(path)
-	if err != nil || len(raw) < 8 || string(raw[:4]) != "\x00asm" {
-		return false
-	}
-	off := 8
-	for off < len(raw) {
-		sectionID := raw[off]
-		off++
-		secSize, n := utils.DecodeULEB128(raw[off:])
-		off += n
-		secEnd := off + int(secSize)
-		if secEnd > len(raw) {
-			break
-		}
-		if sectionID == 2 { // import section
-			return hasMemoryImportFromMain(raw[off:secEnd])
-		}
-		off = secEnd
-	}
-	return false
-}
-
-// hasMemoryImportFromMain parses a WASM import section and returns true if it
-// contains a memory import with module name "main".
-func hasMemoryImportFromMain(data []byte) bool {
-	off := 0
-	count, n := utils.DecodeULEB128(data[off:])
-	off += n
-
-	for i := uint64(0); i < count && off < len(data); i++ {
-		// module name
-		modLen, n := utils.DecodeULEB128(data[off:])
-		off += n
-		if off+int(modLen) > len(data) {
-			return false
-		}
-		mod := string(data[off : off+int(modLen)])
-		off += int(modLen)
-
-		// field name (skip)
-		fieldLen, n := utils.DecodeULEB128(data[off:])
-		off += n
-		off += int(fieldLen)
-
-		if off >= len(data) {
-			return false
-		}
-		kind := data[off]
-		off++
-
-		if kind == 0x02 && mod == "main" { // memory import from "main"
-			return true
-		}
-
-		// Skip import descriptor to advance to the next import.
-		switch kind {
-		case 0x00: // func – type index
-			_, n = utils.DecodeULEB128(data[off:])
-			off += n
-		case 0x01: // table – reftype + limits
-			off++ // reftype
-			flags := data[off]
-			off++
-			_, n = utils.DecodeULEB128(data[off:])
-			off += n
-			if flags&0x01 != 0 {
-				_, n = utils.DecodeULEB128(data[off:])
-				off += n
-			}
-		case 0x02: // memory – limits
-			flags := data[off]
-			off++
-			_, n = utils.DecodeULEB128(data[off:])
-			off += n
-			if flags&0x01 != 0 {
-				_, n = utils.DecodeULEB128(data[off:])
-				off += n
-			}
-		case 0x03: // global – valtype + mutability
-			off += 2
-		}
-	}
-	return false
-}
-
-// regexMemoryTop returns the highest data segment end address across all
-// given WASM files, representing the total memory consumed by the regex tables.
-func regexMemoryTop(paths []string) (int64, error) {
-	var max int64
-	for _, path := range paths {
-		v, err := utils.RustMemTop(path)
-		if err != nil {
-			return 0, fmt.Errorf("%s: %w", path, err)
-		}
-		if v > max {
-			max = v
-		}
-	}
-	return max, nil
-}
-
-// patchMemoryMin rebuilds the WASM memory section with newMinPages as the
-// minimum page count. The rest of the binary is unchanged.
-func patchMemoryMin(raw []byte, newMinPages uint32) ([]byte, error) {
-	if len(raw) < 8 || string(raw[:4]) != "\x00asm" {
-		return nil, fmt.Errorf("not a WASM file")
-	}
-
-	off := 8
-	for off < len(raw) {
-		sectionStart := off
-		sectionID := raw[off]
-		off++
-		secSize, n := utils.DecodeULEB128(raw[off:])
-		off += n
-		secEnd := off + int(secSize)
-		if secEnd > len(raw) {
-			return nil, fmt.Errorf("truncated WASM section at %d", sectionStart)
-		}
-
-		if sectionID == 5 { // memory section
-			// Rebuild memory section content with new min pages.
-			sec := raw[off:secEnd]
-			secOff := 0
-			count, cn := utils.DecodeULEB128(sec[secOff:])
-			secOff += cn
-
-			var newSec []byte
-			newSec = utils.AppendULEB128(newSec, uint32(count))
-
-			for i := uint64(0); i < count && secOff < len(sec); i++ {
-				flags := sec[secOff]
-				secOff++
-				_, mn := utils.DecodeULEB128(sec[secOff:]) // skip old min
-				secOff += mn
-
-				newSec = append(newSec, flags)
-				newSec = utils.AppendULEB128(newSec, newMinPages)
-
-				if flags&0x01 != 0 { // has max
-					maxVal, maxN := utils.DecodeULEB128(sec[secOff:])
-					secOff += maxN
-					if newMinPages > uint32(maxVal) {
-						return nil, fmt.Errorf("cannot patch memory: new min (%d pages) exceeds existing max (%d pages)", newMinPages, maxVal)
-					}
-					newSec = utils.AppendULEB128(newSec, uint32(maxVal))
-				}
-			}
-
-			// Reassemble: prefix + section_id + new_size + new_content + suffix.
-			var out []byte
-			out = append(out, raw[:sectionStart]...)
-			out = append(out, sectionID)
-			out = utils.AppendULEB128(out, uint32(len(newSec)))
-			out = append(out, newSec...)
-			out = append(out, raw[secEnd:]...)
-			return out, nil
-		}
-
-		off = secEnd
-	}
-	return nil, fmt.Errorf("memory section not found in WASM binary")
 }
 
 // expandHome replaces a leading "~/" with the user's home directory.

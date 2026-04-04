@@ -1,0 +1,15 @@
+wasm_merge:    "../../../binaryen/bin/wasm-merge"
+output:        "final.wasm"
+wasm_file:     "csv_regex.wasm"
+import_module: "csvregex"
+stub_file:     "stub.go"
+stub_type:     "go"
+
+regexes:
+  # Finds any row that looks like 3-column CSV (including rows with invalid emails).
+  - pattern:   '"?[0-9]+"?,[^,\n]+,[^\n]+'
+    find_func: "find_csv_row"
+
+  # Parses rows that also have a valid email address; extracts named capture groups.
+  - pattern:          '(?P<id>"?[0-9]+"?),(?P<name>[^,\n]+),(?P<email>[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})'
+    named_groups_func: "parse_csv_row"

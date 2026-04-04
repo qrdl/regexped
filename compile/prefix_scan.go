@@ -46,6 +46,10 @@ type prefixScanParams struct {
 	// Used to compute br depths to $no_match from within the scan.
 	EngineDepth byte
 
+	// TableMemIdx: memory index for DFA/SIMD table loads.
+	// 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables).
+	TableMemIdx int
+
 	Locals prefixScanLocals
 
 	// OnMatch is called after the scan finds a candidate and all scan blocks
@@ -217,38 +221,38 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 			if len(p.FirstByteSet) <= 8 {
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, p.TeddyLoOff)
-				b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T0_lo
+				b = appendTableVLoad(b, p.TableMemIdx) // v128.load T0_lo
 				b = append(b, 0x21, l.TLo)
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, p.TeddyHiOff)
-				b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T0_hi
+				b = appendTableVLoad(b, p.TableMemIdx) // v128.load T0_hi
 				b = append(b, 0x21, l.THi)
 				if p.TeddyTwoByte {
 					b = append(b, 0x41)
 					b = utils.AppendSLEB128(b, p.TeddyT1LoOff)
-					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T1_lo
+					b = appendTableVLoad(b, p.TableMemIdx) // v128.load T1_lo
 					b = append(b, 0x21, l.T1Lo)
 					b = append(b, 0x41)
 					b = utils.AppendSLEB128(b, p.TeddyT1HiOff)
-					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T1_hi
+					b = appendTableVLoad(b, p.TableMemIdx) // v128.load T1_hi
 					b = append(b, 0x21, l.T1Hi)
 					if p.TeddyThreeByte {
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, p.TeddyT2LoOff)
-						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T2_lo
+						b = appendTableVLoad(b, p.TableMemIdx) // v128.load T2_lo
 						b = append(b, 0x21, l.T2Lo)
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, p.TeddyT2HiOff)
-						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T2_hi
+						b = appendTableVLoad(b, p.TableMemIdx) // v128.load T2_hi
 						b = append(b, 0x21, l.T2Hi)
 						if p.TeddyFourByte {
 							b = append(b, 0x41)
 							b = utils.AppendSLEB128(b, p.TeddyT3LoOff)
-							b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T3_lo
+							b = appendTableVLoad(b, p.TableMemIdx) // v128.load T3_lo
 							b = append(b, 0x21, l.T3Lo)
 							b = append(b, 0x41)
 							b = utils.AppendSLEB128(b, p.TeddyT3HiOff)
-							b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load T3_hi
+							b = appendTableVLoad(b, p.TableMemIdx) // v128.load T3_hi
 							b = append(b, 0x21, l.T3Hi)
 						}
 					}
@@ -442,9 +446,9 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		b = append(b, 0x20, l.Ptr)
 		b = append(b, 0x20, l.AttemptStart)
 		b = append(b, 0x6A)                      // i32.add
-		b = append(b, 0x2D, 0x00, 0x00)          // i32.load8_u (byte)
+		b = append(b, 0x2D, 0x00, 0x00)          // i32.load8_u (byte) - input load
 		b = append(b, 0x6A)                      // firstByteOff + byte
-		b = append(b, 0x2D, 0x00, 0x00)          // i32.load8_u (flag)
+		b = appendTableLoad8u(b, p.TableMemIdx)  // i32.load8_u (flag)
 		b = append(b, 0x0D, foundCandidateDepth) // br_if → $found_candidate
 
 		b = append(b, 0x20, l.AttemptStart)

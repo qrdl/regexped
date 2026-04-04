@@ -1,4 +1,4 @@
-EXAMPLES := url-ipv6 secrets url-parts browser node
+EXAMPLES := url-ipv6 secrets url-parts browser node go-csv
 
 .PHONY: all clean $(EXAMPLES)
 

@@ -683,8 +683,8 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 
 // appendTDFACodeEntry appends a size-prefixed TDFA anchored-match function body
 // to cs. The function has signature (ptr i32, len i32, out_ptr i32) → i32.
-func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout) []byte {
-	body := buildTDFAMatchBody(tt, l)
+func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
+	body := buildTDFAMatchBody(tt, l, tableMemIdx)
 	var b []byte
 	b = utils.AppendULEB128(b, uint32(len(body)))
 	b = append(b, body...)
@@ -721,7 +721,7 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout) []byte {
 //	  end loop
 //	end block $done
 //	EOF accept or return -1
-func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout) []byte {
+func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	var b []byte
 
 	numCapRegs := tt.numRegs
@@ -794,7 +794,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout) []byte {
 	b = append(b, 0x6A)
 	b = append(b, 0x20, byte(localByte))
 	b = append(b, 0x6A)
-	b = append(b, 0x2D, 0x00, 0x00) // table load → new state
+	b = appendTableLoad8u(b, tableMemIdx) // table load → new state
 	b = append(b, 0x21, byte(localState))
 
 	// if state == 0: return -1 (dead)
@@ -815,7 +815,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout) []byte {
 		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
 		b = append(b, 0x20, byte(localState))
 		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00)
+		b = appendTableLoad8u(b, tableMemIdx) // immediateAccept[state]
 		b = append(b, 0x04, 0x40)
 		// Accept here: write captures and return pos (pos already = exclusive end).
 		b = emitTDFAAccept(tt, b, localState, localPos, localCapBase)
@@ -831,8 +831,8 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout) []byte {
 	b = utils.AppendSLEB128(b, l.acceptOff)
 	b = append(b, 0x20, byte(localState))
 	b = append(b, 0x6A)
-	b = append(b, 0x2D, 0x00, 0x00) // accept[state]
-	b = append(b, 0x04, 0x7F)       // if [i32]: then-branch returns, else-branch leaves i32
+	b = appendTableLoad8u(b, tableMemIdx) // accept[state]
+	b = append(b, 0x04, 0x7F)            // if [i32]: then-branch returns, else-branch leaves i32
 	b = emitTDFAAcceptEOF(tt, b, localState, localPos, localCapBase)
 	b = append(b, 0x05)       // else
 	b = append(b, 0x41, 0x7F) // -1
