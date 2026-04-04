@@ -1,5 +1,3 @@
-wasm_merge:    "../../../binaryen/bin/wasm-merge"
-output:        "final.wasm"
 wasm_file:     "urls.wasm"
 import_module: "urls"
 stub_file:     "regex.ts"

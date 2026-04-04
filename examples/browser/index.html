@@ -59,7 +59,7 @@
     // Call init() with the WASM bytes before using any exported functions.
     import { init, email_match, url_match } from './regex.js';
 
-    await init(await fetch('./final.wasm').then(r => r.arrayBuffer()));
+    await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
     document.getElementById('loading').style.display = 'none';
     document.getElementById('app').style.display = 'block';
 

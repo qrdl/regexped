@@ -9,7 +9,11 @@ Self-contained examples showing how to compile regex patterns to WASM and call t
 
 Each example's `regexped.yaml` references wasm-merge via a path relative to the config file (`../../../binaryen/bin/wasm-merge`). Adjust if your Binaryen install is elsewhere.
 
-**For Rust examples only:**
+**For Go examples:**
+- Go 1.23+
+- **wasmtime**: https://wasmtime.dev
+
+**For Rust examples only:****
 - **Rust** with the WASI target: `rustup target add wasm32-wasip1`
 - **wasmtime**: https://wasmtime.dev
 
@@ -21,11 +25,21 @@ Each example's `regexped.yaml` references wasm-merge via a path relative to the 
 ### Rust examples
 
 ```
-regexped generate --rust  →  generate Rust FFI stubs from regexped.yaml
-cargo build               →  compile Rust + stubs to WASM (wasm32-wasip1)
-regexped compile          →  compile regex pattern(s) to WASM
-regexped merge            →  merge Rust WASM + regex WASM(s) into final binary
-wasmtime run              →  execute with test inputs
+regexped generate       →  generate Rust FFI stubs from regexped.yaml
+cargo build             →  compile Rust + stubs to WASM (wasm32-wasip1)
+regexped compile        →  compile regex pattern(s) to WASM
+regexped merge          →  merge Rust WASM + regex WASM(s) into final binary
+wasmtime run            →  execute with test inputs
+```
+
+### Go examples
+
+```
+regexped generate       →  generate Go stubs (//go:wasmimport) from regexped.yaml
+go build (GOOS=wasip1) →  compile Go + stubs to WASM
+regexped compile        →  compile regex pattern(s) to WASM
+regexped merge          →  merge Go WASM + regex WASM(s) into final binary
+wasmtime                →  execute
 ```
 
 ### JS examples
@@ -119,6 +133,32 @@ Expected output:
 ```
 example.com
 foo.org
+```
+
+---
+
+## go-csv — parse and validate a CSV file  *(Go)*
+
+Reads a CSV file with three columns (user ID, name, email) from stdin. Uses two regex patterns:
+
+- **`find_csv_row`** (DFA find) — counts all rows with three columns, including those with an invalid email
+- **`parse_csv_row`** (TDFA named groups) — extracts `id`, `name`, and `email` from rows that pass email validation
+
+The program prints parsed rows and a summary showing how many rows had invalid emails.
+
+```sh
+cd go-csv && make
+```
+
+Expected output:
+```
+=== parse CSV (find_csv_row + parse_csv_row) ===
+id=1         name=John Doe                   email=john@example.com
+id=2         name=Jane "Jenny" Smith          email=jenny@test.org
+id=4         name=Alice Wonderland           email=alice@company.co.uk
+id="5"       name=Carol Brown                email=carol@somewhere.net
+
+6 rows total, 4 valid, 2 with invalid email
 ```
 
 ---

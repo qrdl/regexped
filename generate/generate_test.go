@@ -180,6 +180,135 @@ func TestGenTSStubFile(t *testing.T) {
 	}
 }
 
+func TestGoPublicName(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"url_match", "UrlMatch"},
+		{"find_github_token", "FindGithubToken"},
+		{"m", "M"},
+		{"foo", "Foo"},
+	}
+	for _, c := range cases {
+		got := goPublicName(c.input)
+		if got != c.want {
+			t.Errorf("goPublicName(%q) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}
+
+func TestGenGoMatchStub(t *testing.T) {
+	out := genGoMatchStub("url", "url_match")
+	for _, sub := range []string{
+		"//go:wasmimport url url_match",
+		"ffi_url_match",
+		"func UrlMatch(input []byte) (int, bool)",
+		"unsafe.Pointer",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genGoMatchStub: output missing %q", sub)
+		}
+	}
+}
+
+func TestGenGoFindStub(t *testing.T) {
+	out := genGoFindStub("url", "url_find")
+	for _, sub := range []string{
+		"//go:wasmimport url url_find",
+		"ffi_url_find",
+		"func UrlFind(input []byte) iter.Seq2[int, int]",
+		"uint64(r)>>32",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genGoFindStub: output missing %q", sub)
+		}
+	}
+}
+
+func TestGenGoGroupsStub(t *testing.T) {
+	out := genGoGroupsStub("url", "url_groups", "url_groups", true, 3)
+	for _, sub := range []string{
+		"//go:wasmimport url url_groups",
+		"ffi_url_groups",
+		"func UrlGroups(input []byte) iter.Seq[[][]int]",
+		"make([]int32, 6)",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genGoGroupsStub: output missing %q", sub)
+		}
+	}
+}
+
+func TestGenGoNamedGroupsStub(t *testing.T) {
+	named := map[string]int{"scheme": 1, "host": 2}
+	out := genGoNamedGroupsStub("url", "url_named_groups", "url_groups", false, 3, named)
+	for _, sub := range []string{
+		"func UrlNamedGroups(input []byte) iter.Seq[map[string][]int]",
+		`named["scheme"]`,
+		`named["host"]`,
+		"ffi_url_groups",
+		"make([]int32, 6)",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genGoNamedGroupsStub: output missing %q", sub)
+		}
+	}
+	// declareFFI=false: no wasmimport block expected
+	if strings.Contains(out, "//go:wasmimport") {
+		t.Error("genGoNamedGroupsStub: unexpected //go:wasmimport when declareFFI=false")
+	}
+}
+
+func TestGenGoStubFileMatchOnly(t *testing.T) {
+	entries := []config.RegexEntry{
+		{MatchFunc: "url_match"},
+	}
+	out, err := genGoStubFile(entries, "url", "url")
+	if err != nil {
+		t.Fatalf("genGoStubFile: %v", err)
+	}
+	for _, sub := range []string{
+		"//go:build wasip1",
+		"package url",
+		`import "unsafe"`,
+		"url_match",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genGoStubFile match-only: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, `"iter"`) {
+		t.Error("genGoStubFile match-only: should not import iter")
+	}
+}
+
+func TestGenGoStubFileFull(t *testing.T) {
+	entries := []config.RegexEntry{
+		{MatchFunc: "url_match", FindFunc: "url_find",
+			GroupsFunc: "url_groups", NamedGroupsFunc: "url_named",
+			Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
+	}
+	out, err := genGoStubFile(entries, "url", "url")
+	if err != nil {
+		t.Fatalf("genGoStubFile: %v", err)
+	}
+	for _, sub := range []string{
+		"//go:build wasip1",
+		"package url",
+		`"iter"`,
+		`"unsafe"`,
+		"url_match", "url_find", "url_groups", "UrlNamed",
+		"iter.Seq2[int, int]",
+		"iter.Seq[[][]int]",
+		"iter.Seq[map[string][]int]",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genGoStubFile full: missing %q", sub)
+		}
+	}
+}
+
 func TestResolveStubType(t *testing.T) {
 	cases := []struct {
 		cfg     config.BuildConfig
@@ -189,10 +318,12 @@ func TestResolveStubType(t *testing.T) {
 		{config.BuildConfig{StubType: "rust"}, "rust", false},
 		{config.BuildConfig{StubType: "js"}, "js", false},
 		{config.BuildConfig{StubType: "ts"}, "ts", false},
+		{config.BuildConfig{StubType: "go"}, "go", false},
 		{config.BuildConfig{StubType: "invalid"}, "", true},
 		{config.BuildConfig{StubFile: "out.rs"}, "rust", false},
 		{config.BuildConfig{StubFile: "out.js"}, "js", false},
 		{config.BuildConfig{StubFile: "out.ts"}, "ts", false},
+		{config.BuildConfig{StubFile: "out.go"}, "go", false},
 		{config.BuildConfig{StubFile: "out.wasm"}, "", true},
 		{config.BuildConfig{}, "", true},
 	}

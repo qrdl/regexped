@@ -23,8 +23,8 @@ $(MAIN_WASM): src/main.rs src/stubs.rs Cargo.toml
 build: $(MAIN_WASM)
 
 # Step 3 – compile all regex patterns to WASM
-$(REGEX_WASMS): regexped.yaml $(MAIN_WASM)
-	$(REGEXPED) compile --config=regexped.yaml --main=$(MAIN_WASM)
+$(REGEX_WASMS): regexped.yaml
+	$(REGEXPED) compile --config=regexped.yaml
 
 compile: $(REGEX_WASMS)
 

@@ -1,0 +1,14 @@
+wasm_merge:    "../../../binaryen/bin/wasm-merge"
+output:        "final.wasm"
+wasm_file:     "sqli.wasm"
+import_module: "sqli"
+stub_file:     "stub.go"
+stub_type:     "go"
+max_dfa_states: 1  # forces Backtracking engine for match and find
+
+regexes:
+  - pattern: |-
+      (?i)(?P<type>union\s+(?:all\s+)?select|or\s+'1'='1|drop\s+table|insert\s+into|delete\s+from|exec\s*\()(?P<payload>[^\n]*)
+    match_func:        "is_sqli"
+    find_func:         "find_sqli"
+    named_groups_func: "parse_sqli"

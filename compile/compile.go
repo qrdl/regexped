@@ -79,7 +79,8 @@ type CompileOptions struct {
 	// MemoBudget is the maximum bytes allocated for the BitState memoization
 	// buffer. Only used when the pattern requires BitState (needsBitState == true).
 	// Defaults to 128*1024 (128 KB) when zero.
-	MemoBudget int
+	MemoBudget  int
+	tableMemIdx int // 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables)
 }
 
 // compiledPattern holds the intermediate compilation result for one RegexEntry.
@@ -269,11 +270,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				btMemoBase = btStackLimit
 				btMemoMaxLen = int32(btMemoMaxLenFor(btProg, 128*1024))
 			}
-			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, 8, btMemoBase, btMemoMaxLen, useMemo)
+			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, 8, btMemoBase, btMemoMaxLen, useMemo, buildOpts.tableMemIdx)
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(nil))
-			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept)
+			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
 			matchData = rawM
 			matchSegCnt = cntM
@@ -353,6 +354,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				// Fallback: first-byte SIMD/Teddy tables from NFA.
 				btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
 				btScanParams, btScanDataBytes, btScanSegCnt = buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
+				btScanParams.TableMemIdx = buildOpts.tableMemIdx
 			}
 			p.dataBytes = append(p.dataBytes, btScanDataBytes...)
 			p.dataSegCount += btScanSegCnt
@@ -369,7 +371,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				btMemoMaxLen = int32(btMemoMaxLenFor(btProg, memoBudget))
 			}
 			frameSize := int32(8) // pos + retryPC only (no cap slots)
-			p.findBody = appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, btMemoMaxLen, useMemo, btMandLit)
+			p.findBody = appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, btMemoMaxLen, useMemo, btMandLit, buildOpts.tableMemIdx)
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
@@ -387,7 +389,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 							!revTable.midAcceptStates[revTable.startState])) {
 						revTableBase := utils.PageAlign(l.tableEnd)
 						revL := buildDFALayout(revTable, revTableBase, true, false, 0)
-						bsBody := buildLitAnchorBackScanBody(revL, revTable)
+						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
 
 						var litFirstBytes []byte
 						var litFirstByteFlags [256]byte
@@ -477,7 +479,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				}
 			}
 			if p.litAnchorBackScanBody == nil {
-				p.findBody = appendFindCodeEntry(nil, l, table, patMandLit)
+				p.findBody = appendFindCodeEntry(nil, l, table, patMandLit, buildOpts.tableMemIdx)
 			}
 
 			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))
@@ -535,7 +537,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			tdfaBase := utils.PageAlign(p.tableEnd)
 			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(nil))
 			p.numGroups = tt.numGroups
-			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout)
+			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx)
 			// TDFA only needs the transition table (no stack/memo).
 			p.tableEnd = tdfaLayout.tableEnd
 			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false))
@@ -584,7 +586,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 
 		p.numGroups = bt.numGroups
-		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, memoMaxLen, useMemo)
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, memoMaxLen, useMemo, buildOpts.tableMemIdx)
 	}
 
 	return p, nil
@@ -593,7 +595,17 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 // assembleModule builds a single WASM module from multiple compiled patterns.
 // standalone=true: module defines its own memory.
 // standalone=false: module imports memory from "main" (for wasm-merge).
+// Both modes emit active data segments; in non-standalone mode the host stub's
+// reservation variable ensures the host runtime declares enough initial memory.
 func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool) []byte {
+	// Pre-collect data segments.
+	totalSegs := 0
+	var rawData []byte
+	for _, p := range patterns {
+		totalSegs += p.dataSegCount
+		rawData = append(rawData, p.dataBytes...)
+	}
+
 	// Pass 1: assign base function indices.
 	baseIdx := make([]int, len(patterns))
 	total := 0
@@ -615,18 +627,21 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	}
 	out = appendSection(out, 1, typeSection)
 
-	// Import section (if !standalone): import memory from "main".
+	// Import section (embedded only): import "main" memory as memory[0].
+	// In the merged binary, main keeps memory[0] and our own memory becomes memory[1].
+	// Input data loads use implicit memory[0]; DFA table loads use explicit memory[1].
 	if !standalone {
-		var imp []byte
-		imp = append(imp, 0x01)
-		imp = appendString(imp, "main")
-		imp = appendString(imp, "memory")
-		imp = append(imp, 0x02, 0x00)
-		imp = utils.AppendULEB128(imp, 0x00)
-		out = appendSection(out, 2, imp)
+		var importSec []byte
+		importSec = utils.AppendULEB128(importSec, 1) // 1 import
+		importSec = appendString(importSec, "main")   // module name
+		importSec = appendString(importSec, "memory") // field name
+		importSec = append(importSec, 0x02)           // kind: memory
+		importSec = append(importSec, 0x00)           // limits flags: no max
+		importSec = append(importSec, 0x00)           // min = 0 pages
+		out = appendSection(out, 2, importSec)
 	}
 
-	// Function section.
+	// Function section: pattern functions only.
 	var fs []byte
 	fs = utils.AppendULEB128(fs, uint32(total))
 	for _, p := range patterns {
@@ -651,8 +666,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	}
 	out = appendSection(out, 3, fs)
 
-	// Memory section (if standalone).
-	if standalone {
+	// Memory section: own memory for both standalone and embedded.
+	// standalone modules export it; embedded modules do not (wasm-merge renumbers).
+	{
 		var mem []byte
 		mem = append(mem, 0x01, 0x00)
 		mem = utils.AppendULEB128(mem, uint32(memPages))
@@ -728,7 +744,11 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		if p.litAnchorBackScanBody != nil {
 			cs = append(cs, p.litAnchorBackScanBody...)
 			// Generate lit_anchor_find body now that function indices are known.
-			litAnchorFindBody := buildLitAnchorFindBody(p.litAnchorFindTable, p.litAnchorFindLayout, p, base+backwardScanOff)
+			tableMemIdx := 0
+			if !standalone {
+				tableMemIdx = 1
+			}
+			litAnchorFindBody := buildLitAnchorFindBody(p.litAnchorFindTable, p.litAnchorFindLayout, p, base+backwardScanOff, tableMemIdx)
 			cs = utils.AppendULEB128(cs, uint32(len(litAnchorFindBody)))
 			cs = append(cs, litAnchorFindBody...)
 		} else if p.findBody != nil {
@@ -748,27 +768,20 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	}
 	out = appendSection(out, 10, cs)
 
-	// Data section.
-	totalSegs := 0
-	var rawData []byte
-	for _, p := range patterns {
-		totalSegs += p.dataSegCount
-		rawData = append(rawData, p.dataBytes...)
-	}
-	// Non-standalone Backtracking patterns need a sentinel at tableEnd-1 so that
-	// regexMemoryTop in merge.go sees the full memory extent (stack is zero-init).
-	if !standalone {
-		for _, p := range patterns {
-			if p.captureBody != nil && !p.isTDFA && p.tableEnd > 0 {
-				rawData = appendDataSegment(rawData, int32(p.tableEnd-1), []byte{0x00})
-				totalSegs++
-			}
-		}
-	}
+	// Data section: active segments targeting the correct memory index.
 	if totalSegs > 0 {
 		var ds []byte
-		ds = utils.AppendULEB128(ds, uint32(totalSegs))
-		ds = append(ds, rawData...)
+		if !standalone {
+			// Re-encode data segments to target memory[1] (own DFA-table memory).
+			segs := parseDataSegments(rawData)
+			ds = utils.AppendULEB128(ds, uint32(len(segs)))
+			for _, seg := range segs {
+				ds = appendDataSegmentMem1(ds, seg.offset, seg.data)
+			}
+		} else {
+			ds = utils.AppendULEB128(ds, uint32(totalSegs))
+			ds = append(ds, rawData...)
+		}
 		out = appendSection(out, 11, ds)
 	}
 
@@ -776,9 +789,11 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 }
 
 // Compile compiles multiple regex patterns to a single WASM module.
-//   - standalone=false: module imports memory from "main" (for wasm-merge with Rust binary)
-//   - standalone=true:  module defines its own memory (for testing, future Component Model)
-//   - tableBase: starting address for DFA/capture tables; use 0 for standalone CM-style
+//   - standalone=false: module declares its own memory, no export (for embedding via wasm-merge)
+//   - standalone=true:  module declares its own memory and exports it as "memory" (for testing/standalone use)
+//   - tableBase: starting address for DFA/capture tables within the module's memory; use 0 for
+//     embedded modules (tables start at address 0 of own memory). Callers like re2test/perftest
+//     pass a non-zero value to reserve low pages for their own test input buffers.
 //
 // All patterns must compile successfully; any error stops compilation immediately.
 func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool, userOpts ...CompileOptions) ([]byte, int64, error) {
@@ -790,6 +805,9 @@ func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool, use
 }
 
 func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, error) {
+	if !standalone {
+		opts.tableMemIdx = 1
+	}
 	var compiled []*compiledPattern
 	cur := tableBase
 	for _, re := range patterns {
@@ -814,29 +832,18 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 }
 
 // CmdCompile compiles all regex patterns from cfg to a single WASM module.
-// mainWasm is the Rust/host WASM used to determine memory layout (rustTop).
-// If mainWasm is empty, rustTop is assumed to be 0 (no host runtime, e.g. browser/JS deployments).
 // output is the output path (absolute, relative to cwd, or "-" for stdout).
-func CmdCompile(cfg config.BuildConfig, mainWasm, output string) error {
-	var rustTop int64
-	if mainWasm != "" {
-		var err error
-		rustTop, err = utils.RustMemTop(mainWasm)
-		if err != nil {
-			return fmt.Errorf("read main wasm: %w", err)
-		}
-	}
-
+// The module declares its own memory (tables start at address 0) and does not
+// import memory from any host; use regexped merge to embed it.
+func CmdCompile(cfg config.BuildConfig, output string) error {
 	outPath := output
-
-	tableBase := utils.PageAlign(rustTop)
 	slog.Info("Compiling regexes", "count", len(cfg.Regexes), "output", outPath)
 
 	compOpts := CompileOptions{
 		MaxDFAStates: cfg.MaxDFAStates,
 		MaxTDFARegs:  cfg.MaxTDFARegs,
 	}
-	wasmBytes, _, err := Compile(cfg.Regexes, tableBase, false, compOpts)
+	wasmBytes, _, err := Compile(cfg.Regexes, 0, false, compOpts)
 	if err != nil {
 		return fmt.Errorf("compile: %w", err)
 	}

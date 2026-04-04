@@ -16,23 +16,44 @@ Each regex WASM module exports one or more functions depending on which `_func` 
 (func $groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (result i32))
 ```
 
-All modules **import** memory from the `"main"` module — they do not allocate their own. The host (main WASM module) owns the linear memory; regex modules access it directly.
+Each regex WASM module declares its **own memory** (memory index 0 within the module). It does not import memory from any host. When embedded via `regexped merge`, `wasm-merge` renumbers the memories so the host retains memory 0 and the regex module's memory becomes memory 1 (or higher). All memory instructions within the regex module still reference index 0 — wasm-merge updates the references automatically during merge.
+
+For standalone use (JS/TS/browser), the compiled WASM is used directly with no merging. Memory index 0 is exported as `"memory"` so the JS host can read input/output.
 
 ---
 
 ## Memory layout
 
+### Embedded (Rust/Go via wasm-merge)
+
 ```
-┌─────────────────┬─────────────────┬─────────────────┬─────┐
-│   Rust Stack    │   Rust Heap     │  DFA Table 1    │ ... │
-│   & Globals     │   (optional)    │                 │     │
-└─────────────────┴─────────────────┴─────────────────┴─────┘
-0               rustTop          tableBase1      tableBase2
+Regex module's own memory (index 1 after merge):
+┌─────────────────┬─────────────────┬─────┐
+│  DFA Table 1    │  DFA Table 2    │ ... │
+└─────────────────┴─────────────────┴─────┘
+0              tableEnd1         tableEnd2
+
+Host module's memory (index 0):
+┌─────────────────┬─────────────────┐
+│   Stack         │   Heap          │
+│   & Globals     │                 │
+└─────────────────┴─────────────────┘
+0               memTop
 ```
 
-- **rustTop** — highest address used by the Rust module (determined by scanning the main WASM data segments and globals via `RustMemTop`).
-- **tableBase** — `PageAlign(rustTop)`, the start of the first regex table. Each subsequent table starts at `PageAlign(prevTableEnd)`.
-- The `merge` command patches the main module's memory section minimum to cover all tables before calling `wasm-merge`.
+Tables start at address 0 of the regex module's own memory. Each subsequent table starts at `PageAlign(prevTableEnd)`. The host memory is completely separate — no coordination needed.
+
+### Standalone (JS/TS/browser)
+
+```
+Single memory (index 0, exported as "memory"):
+┌──────────────────┬─────────────────┬─────┐
+│  (caller input)  │  DFA Table 1    │ ... │
+└──────────────────┴─────────────────┴─────┘
+0              tableBase         tableEnd
+```
+
+The caller writes input into low pages and passes the pointer. Tables start at `tableBase` (caller-chosen, e.g. page 1 for re2test).
 
 ---
 
