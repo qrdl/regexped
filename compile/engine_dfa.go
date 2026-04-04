@@ -2694,15 +2694,19 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	var b []byte
 
 	// ── local declarations ────────────────────────────────────────────────────
-	hasT0 := len(p.litAnchorTeddyLoBytes) > 0
-	hasT1 := len(p.litAnchorTeddyT1LoBytes) > 0
+	// When there is a single literal use the hybrid prefix scan (one v128.load
+	// per iteration, fast-path skip when the first byte is absent).  For multiple
+	// literals fall back to Teddy (two v128.load per iteration) as before.
+	usePrefixScan := len(p.litAnchorLitSet) == 1
+	hasT0 := !usePrefixScan && len(p.litAnchorTeddyLoBytes) > 0
+	hasT1 := !usePrefixScan && len(p.litAnchorTeddyT1LoBytes) > 0
 	numI32Locals := 6 // state(2), pos(3), attempt_start(4), last_accept(5), rev_result(6), simdMask_or_class(7)
 	var numV128Locals int
 	if hasT1 {
 		numV128Locals = 6 // chunk(8), tLo(9), tHi(10), chunk1(11), t1Lo(12), t1Hi(13)
 	} else if hasT0 {
 		numV128Locals = 3 // chunk(8), tLo(9), tHi(10)
-	} else if len(p.litAnchorFirstBytes) > 0 && len(p.litAnchorFirstBytes) <= 16 {
+	} else if usePrefixScan || (len(p.litAnchorFirstBytes) > 0 && len(p.litAnchorFirstBytes) <= 16) {
 		numV128Locals = 1 // chunk(8)
 	} else {
 		numV128Locals = 0
@@ -2742,54 +2746,77 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $lit_outer
 
-	// ── Phase 1: SIMD scan for any literal first byte ─────────────────────────
+	// ── Phase 1: SIMD scan ───────────────────────────────────────────────────
 	// emitPrefixScan uses EngineDepth=2 (loop $lit_outer + block $no_match).
 	// OnMatch: nothing — attempt_start is set to the candidate position, fall through.
-	simdParams := prefixScanParams{
-		FirstByteSet:   p.litAnchorFirstBytes,
-		FirstByteFlags: p.litAnchorFirstByteFlags,
-		FirstByteOff:   p.litAnchorFirstByteOff,
-		TeddyLoOff:     p.litAnchorTeddyLoOff,
-		TeddyHiOff:     p.litAnchorTeddyHiOff,
-		TeddyTwoByte:   hasT1,
-		TeddyT1LoOff:   p.litAnchorTeddyT1LoOff,
-		TeddyT1HiOff:   p.litAnchorTeddyT1HiOff,
-		EngineDepth:    2,
-		TableMemIdx:    tableMemIdx,
-		Locals: prefixScanLocals{
-			Ptr:          locPtr,
-			Len:          locLen,
-			AttemptStart: locAttemptStart,
-			SimdMask:     locSimdOrClass,
-			Chunk:        locChunk,
-			TLo:          locTLo,
-			THi:          locTHi,
-			Chunk1:       locChunk1,
-			T1Lo:         locT1Lo,
-			T1Hi:         locT1Hi,
-		},
-		OnMatch: nil, // fall through with attempt_start = candidate position
+	//
+	// Single-literal case: use hybrid prefix scan (one v128.load per iteration,
+	// immediate 16-byte advance when first byte absent — same strategy as the
+	// mandatory-lit DFA find path).  The prefix scan fully verifies all bytes of
+	// the literal, so the separate scalar verification below is skipped.
+	//
+	// Multi-literal case: use Teddy as before (first-byte and optional second-byte
+	// nibble tables); scalar verification is needed to eliminate Teddy false positives.
+	var simdParams prefixScanParams
+	if usePrefixScan {
+		simdParams = prefixScanParams{
+			Prefix:      p.litAnchorLitSet[0],
+			EngineDepth: 2,
+			TableMemIdx: tableMemIdx,
+			Locals: prefixScanLocals{
+				Ptr:          locPtr,
+				Len:          locLen,
+				AttemptStart: locAttemptStart,
+				SimdMask:     locSimdOrClass,
+				Chunk:        locChunk,
+			},
+			OnMatch: nil,
+		}
+	} else {
+		simdParams = prefixScanParams{
+			FirstByteSet:   p.litAnchorFirstBytes,
+			FirstByteFlags: p.litAnchorFirstByteFlags,
+			FirstByteOff:   p.litAnchorFirstByteOff,
+			TeddyLoOff:     p.litAnchorTeddyLoOff,
+			TeddyHiOff:     p.litAnchorTeddyHiOff,
+			TeddyTwoByte:   hasT1,
+			TeddyT1LoOff:   p.litAnchorTeddyT1LoOff,
+			TeddyT1HiOff:   p.litAnchorTeddyT1HiOff,
+			EngineDepth:    2,
+			TableMemIdx:    tableMemIdx,
+			Locals: prefixScanLocals{
+				Ptr:          locPtr,
+				Len:          locLen,
+				AttemptStart: locAttemptStart,
+				SimdMask:     locSimdOrClass,
+				Chunk:        locChunk,
+				TLo:          locTLo,
+				THi:          locTHi,
+				Chunk1:       locChunk1,
+				T1Lo:         locT1Lo,
+				T1Hi:         locT1Hi,
+			},
+			OnMatch: nil,
+		}
 	}
 	b = emitPrefixScan(b, simdParams)
 
-	// ── Scalar literal verification ───────────────────────────────────────────
-	// After the SIMD scan places a candidate in attempt_start, verify that one
-	// of the literals in p.litAnchorLitSet actually matches there byte-for-byte.
-	// This eliminates false-positive Teddy hits (nibble tables are approximate
-	// and T1 covers at most 2 bytes) before paying the cost of a backward DFA call.
+	// ── Scalar literal verification (multi-literal / Teddy only) ─────────────
+	// After Teddy places a candidate in attempt_start, verify that one of the
+	// literals in litAnchorLitSet actually matches byte-for-byte (Teddy is
+	// approximate — nibble tables can produce false positives).
+	// Skipped for the single-literal case: the prefix scan above already verified
+	// all bytes of the literal exactly.
 	//
 	// Control-flow depths at this point (outside any nested block):
 	//   0 = $lit_outer (loop — br 0 restarts it)
 	//   1 = $no_match  (block — br 1 exits it)
 	//
-	// We wrap the check in a block $lit_ok so a "matched" path can break out of
-	// it, while the "no match" path falls through to advance+restart.
-	//
 	// Inside block $lit_ok:
 	//   0 = $lit_ok, 1 = $lit_outer, 2 = $no_match
 	// Inside block $try_litN:
 	//   0 = $try_litN, 1 = $lit_ok, 2 = $lit_outer, 3 = $no_match
-	if len(p.litAnchorLitSet) > 0 {
+	if !usePrefixScan && len(p.litAnchorLitSet) > 0 {
 		b = append(b, 0x02, 0x40) // block $lit_ok
 		for _, lit := range p.litAnchorLitSet {
 			b = append(b, 0x02, 0x40) // block $try_litN
