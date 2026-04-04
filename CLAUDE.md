@@ -33,11 +33,12 @@ regexped/
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/
-│   ├── generate.go            # Stub generation orchestration (CmdStub, CmdGo, CmdJS, CmdTS)
+│   ├── generate.go            # Stub generation orchestration (ResolveStubType, CmdGenerateStub)
 │   ├── rust_stub.go           # Rust FFI stub generator (iterators)
 │   ├── go_stub.go             # Go (wasip1) stub generator (//go:wasmimport, iter.Seq2)
 │   ├── js_stub.go             # JS ES module stub generator
-│   └── ts_stub.go             # TypeScript ES module stub generator
+│   ├── ts_stub.go             # TypeScript ES module stub generator
+│   └── c_stub.go              # C header stub generator (WASM imports, static iterators)
 ├── merge/
 │   └── merge.go               # WASM module merging with wasm-merge
 ├── utils/
@@ -55,10 +56,18 @@ regexped/
 └── examples/
     ├── README.md
     ├── Makefile
-    ├── url-ipv6/              # DFA anchored match: validate IPv6 URLs
-    ├── secrets/               # DFA find: scan text for GitHub/JWT/AWS secrets
-    ├── url-parts/             # TDFA named_groups: find and parse all URLs in text
-    └── browser/               # Browser demo: email + URL validation via JS + WASM
+    ├── browser/               # Browser demo: email + URL validation via JS + WASM
+    ├── node/                  # Node.js: domain extraction via TS stub
+    ├── workers/               # Cloudflare Worker: credential scanner edge API
+    └── wasmtime/
+        ├── rust/
+        │   ├── url-ipv6/      # DFA anchored match: validate IPv6 URLs (Rust)
+        │   └── secrets/       # DFA find: scan text for GitHub/JWT/AWS secrets (Rust)
+        ├── go/
+        │   ├── csv/           # TDFA named_groups: parse and validate CSV (Go)
+        │   └── sql-injection/ # Backtracking: SQL injection detection (Go)
+        └── c/
+            └── url-parts/     # TDFA named_groups: parse URLs into components (C)
 ```
 
 ## Components
@@ -100,6 +109,7 @@ An entry with no `_func` fields is valid — no WASM file is compiled and no stu
 - `CompileForced(patterns, tableBase, standalone, forceEngine)` — like `Compile` but forces a specific engine for capture paths
 - `SelectEngine(pattern, opts)` — returns engine type without compiling
 - `stripCaptures(re)` — removes capture groups from parsed regexp tree
+- `CmdCompile(cfg, output)` — CLI entry point; auto-selects standalone vs embedded based on `cfg.Output`: no `output` field → standalone (single memory, for JS/TS direct load); `output` field present → embedded (imports memory from `"main"`, for merge with Rust/Go/C host)
 
 `compilePattern` dispatches based on which `_func` fields are set:
 - `groups_func`/`named_groups_func` → TDFA (with fallback to Backtracking if not TDFA-eligible)
@@ -187,7 +197,7 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 
 **WASM export names = func names.** The value of `match_func`, `find_func`, `groups_func`, or `named_groups_func` is used directly as the WASM export name. This ensures unique export names in merged WASMs and removes the need for special-casing `match` (a Rust keyword).
 
-**Rust stubs** (`generate/generate.go` + `rust_stub.go`):
+**Rust stubs** (`generate/rust_stub.go`):
 
 | Field | WASM export | Generated function | Rust type |
 |---|---|---|---|
@@ -198,7 +208,7 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 
 All FFI declarations use `ffi_<func>` internally with `#[link_name = "<func>"]` to avoid collision with the public Rust wrapper of the same name. Iterators advance past zero-length matches by one byte.
 
-When multiple entries share the same `stub_file`, each is wrapped in `pub mod <import_module> { }`. Single-entry files have no mod block.
+All entries are wrapped in a single `pub mod <import_module> { }` block.
 
 **Go stubs** (`generate/go_stub.go`):
 
@@ -224,6 +234,17 @@ Generated as a single ES module using top-level `await`. Loads the merged WASM (
 | `named_groups_func` | `function* <func>(input)` | generator of `Object` (name→`[start,end]`) |
 
 Input `string` or `Uint8Array`. Capture slot buffer placed at memory offset 1024.
+
+**C stubs** (`generate/c_stub.go`):
+
+Generated as a single `#pragma once` header. No libc or sysroot required; uses `__attribute__((import_module(...), import_name(...)))`. Iterators use static offset state.
+
+| Field | Generated API |
+|---|---|
+| `match_func` | `<func>(input, len)` → `int` (end pos or -1) |
+| `find_func` | `<func>_next(input, len, *start, *end)` + `<func>_reset()` |
+| `groups_func` | `<func>_next(input, len, slots[])` + `<func>_reset()` |
+| `named_groups_func` | same as groups + `<func>_get(slots, name, *start, *end)` |
 
 **Dummy main** (embedded in `merge/merge.go`): 25-byte WASM with 2-page memory export; used when no `--main` is provided for browser/JS deployments.
 

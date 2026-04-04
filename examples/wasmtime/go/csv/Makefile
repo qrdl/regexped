@@ -1,9 +1,9 @@
 # regexped must be built first: run `make` in the repo root.
-REGEXPED   := ../../regexped
+REGEXPED   := ../../../../regexped
 GO         := go
 
 APP_WASM   := app.wasm
-REGEX_WASM := sqli.wasm
+REGEX_WASM := csv_regex.wasm
 FINAL_WASM := final.wasm
 STUB       := stub.go
 
@@ -35,10 +35,10 @@ $(FINAL_WASM): $(APP_WASM) $(REGEX_WASM) regexped.yaml
 
 merge: $(FINAL_WASM)
 
-# Step 5 – run
+# Step 5 – run with sample CSV input
 run: $(FINAL_WASM)
-	@echo "=== SQL injection detection (Backtracking engine) ==="
-	wasmtime $(FINAL_WASM)
+	@echo "=== parse CSV (find_csv_row + parse_csv_row) ==="
+	wasmtime $(FINAL_WASM) < testdata.csv
 
 clean:
 	rm -f $(APP_WASM) $(REGEX_WASM) $(FINAL_WASM) $(STUB)

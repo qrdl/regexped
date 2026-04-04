@@ -2,11 +2,26 @@ package generate
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
 	"github.com/qrdl/regexped/config"
 )
+
+// jsStub generates a JS ES module stub file for all regex entries in cfg.
+// out is the full output path or "-" for stdout.
+func jsStub(cfg config.BuildConfig, out string) error {
+	content, err := genJSStubFile(cfg)
+	if err != nil {
+		return fmt.Errorf("generate JS stub: %w", err)
+	}
+	if out == "-" {
+		_, err := os.Stdout.WriteString(content)
+		return err
+	}
+	return writeStub(out, []byte(content))
+}
 
 // genJSStubFile generates the content of an ES module JS stub that exports
 // wrapper functions for every regex entry in cfg.  The caller is responsible

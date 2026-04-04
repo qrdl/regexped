@@ -1,8 +1,9 @@
 # regexped must be built first: run `make` in the repo root.
-REGEXPED    := ../../regexped
-WASM_TARGET := wasm32-wasip1
+REGEXPED   := ../../../../regexped
+CC         := clang-19
+CFLAGS     := --target=wasm32-wasi -nostdlib -Wl,--no-entry
 
-MAIN_WASM  := target/$(WASM_TARGET)/release/url_parts.wasm
+MAIN_WASM  := main.wasm
 REGEX_WASM := url_parts.wasm
 FINAL_WASM := final.wasm
 
@@ -10,19 +11,19 @@ FINAL_WASM := final.wasm
 
 all: run
 
-# Step 1 – generate Rust stub from config
-src/stub.rs: regexped.yaml
+# Step 1 – generate C stub from config
+stub.h: regexped.yaml
 	$(REGEXPED) generate --config=regexped.yaml
 
-generate: src/stub.rs
+generate: stub.h
 
-# Step 2 – compile Rust source to WASM
-$(MAIN_WASM): src/main.rs src/stub.rs Cargo.toml
-	cargo build --target $(WASM_TARGET) --release
+# Step 2 – compile C source to WASM
+$(MAIN_WASM): main.c stub.h
+	$(CC) $(CFLAGS) -o $@ main.c
 
 build: $(MAIN_WASM)
 
-# Step 3 – compile regex pattern to WASM (OnePass engine with capture tracking)
+# Step 3 – compile regex pattern to WASM
 $(REGEX_WASM): regexped.yaml
 	$(REGEXPED) compile --config=regexped.yaml
 
@@ -46,5 +47,4 @@ run: $(FINAL_WASM)
 	wasmtime run $(FINAL_WASM) "nothing here"
 
 clean:
-	cargo clean
-	rm -f src/stub.rs $(REGEX_WASM) $(FINAL_WASM)
+	rm -f stub.h $(MAIN_WASM) $(REGEX_WASM) $(FINAL_WASM)

@@ -309,6 +309,218 @@ func TestGenGoStubFileFull(t *testing.T) {
 	}
 }
 
+func TestGenRustStubFileGroupsAndNamed(t *testing.T) {
+	entries := []config.RegexEntry{{
+		GroupsFunc:      "url_groups",
+		NamedGroupsFunc: "url_named",
+		Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
+	}}
+	out, err := genRustStubFile(entries, "url")
+	if err != nil {
+		t.Fatalf("genRustStubFile groups+named: %v", err)
+	}
+	// FFI block emitted only once (for groups_func); named_groups_func shares it.
+	if count := strings.Count(out, `#[link(wasm_import_module = "url")]`); count != 1 {
+		t.Errorf("genRustStubFile groups+named: want 1 FFI block, got %d", count)
+	}
+	if !strings.Contains(out, "UrlGroupsIter") {
+		t.Error("missing UrlGroupsIter")
+	}
+	if !strings.Contains(out, "UrlNamedIter") {
+		t.Error("missing UrlNamedIter")
+	}
+}
+
+func TestGenRustStubFileNamedOnly(t *testing.T) {
+	entries := []config.RegexEntry{{
+		NamedGroupsFunc: "url_named",
+		Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
+	}}
+	out, err := genRustStubFile(entries, "url")
+	if err != nil {
+		t.Fatalf("genRustStubFile named-only: %v", err)
+	}
+	if !strings.Contains(out, `#[link(wasm_import_module = "url")]`) {
+		t.Error("genRustStubFile named-only: missing FFI block")
+	}
+	if !strings.Contains(out, "UrlNamedIter") {
+		t.Error("missing UrlNamedIter")
+	}
+}
+
+func TestGenRustStubFileNoFuncs(t *testing.T) {
+	entries := []config.RegexEntry{{Pattern: "something"}}
+	out, err := genRustStubFile(entries, "url")
+	if err != nil {
+		t.Fatalf("genRustStubFile no-funcs: %v", err)
+	}
+	if out != "" {
+		t.Errorf("genRustStubFile no-funcs: expected empty output, got %q", out)
+	}
+}
+
+func TestGenCMatchStub(t *testing.T) {
+	out := genCMatchStub("mymod", "my_match")
+	for _, sub := range []string{
+		`import_module("mymod")`, `import_name("my_match")`,
+		"_ffi_my_match", "static int my_match",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genCMatchStub: output missing %q", sub)
+		}
+	}
+}
+
+func TestGenCFindStub(t *testing.T) {
+	out := genCFindStub("mymod", "tok_find")
+	for _, sub := range []string{
+		`import_module("mymod")`, `import_name("tok_find")`,
+		"_ffi_tok_find", "tok_find_reset", "tok_find_next", "_tok_find_off",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genCFindStub: output missing %q", sub)
+		}
+	}
+}
+
+func TestGenCGroupsStub(t *testing.T) {
+	out := genCGroupsStub("mymod", "url_groups", "url_groups", true, 3)
+	for _, sub := range []string{
+		"URL_GROUPS_SLOTS", "_ffi_url_groups",
+		"url_groups_reset", "url_groups_next",
+		`import_module("mymod")`,
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genCGroupsStub: output missing %q", sub)
+		}
+	}
+}
+
+func TestGenCGroupsStubNoFFI(t *testing.T) {
+	out := genCGroupsStub("mymod", "url_named", "url_groups", false, 3)
+	if strings.Contains(out, `import_module(`) {
+		t.Error("genCGroupsStub declareFFI=false: should not emit import_module")
+	}
+	if !strings.Contains(out, "url_named_reset") {
+		t.Error("genCGroupsStub declareFFI=false: missing url_named_reset")
+	}
+}
+
+func TestGenCNamedGroupsStub(t *testing.T) {
+	named := map[string]int{"scheme": 1, "host": 2}
+	out := genCNamedGroupsStub("mymod", "url_named", "url_groups", true, 3, named)
+	for _, sub := range []string{
+		"url_named_get", `_rx_streq(name, "scheme")`, `_rx_streq(name, "host")`,
+		"url_named_reset", "url_named_next",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genCNamedGroupsStub: output missing %q", sub)
+		}
+	}
+}
+
+func TestGenCStubFileFind(t *testing.T) {
+	entries := []config.RegexEntry{{FindFunc: "tok_find"}}
+	out, err := genCStubFile(entries, "mymod")
+	if err != nil {
+		t.Fatalf("genCStubFile find: %v", err)
+	}
+	for _, sub := range []string{"#pragma once", "tok_find_reset", "tok_find_next"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genCStubFile find: missing %q", sub)
+		}
+	}
+}
+
+func TestGenCStubFileGroupsAndNamed(t *testing.T) {
+	entries := []config.RegexEntry{{
+		GroupsFunc:      "url_groups",
+		NamedGroupsFunc: "url_named",
+		Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
+	}}
+	out, err := genCStubFile(entries, "mymod")
+	if err != nil {
+		t.Fatalf("genCStubFile groups+named: %v", err)
+	}
+	for _, sub := range []string{"url_groups_next", "url_named_get", "_rx_streq"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genCStubFile groups+named: missing %q", sub)
+		}
+	}
+}
+
+func TestGenCStubFileSingle(t *testing.T) {
+	entries := []config.RegexEntry{{MatchFunc: "url_match"}}
+	out, err := genCStubFile(entries, "mymod")
+	if err != nil {
+		t.Fatalf("genCStubFile: %v", err)
+	}
+	for _, sub := range []string{"Auto-generated", "#pragma once", "url_match"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genCStubFile: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, "_rx_streq") {
+		t.Error("genCStubFile: should not emit _rx_streq without named groups")
+	}
+}
+
+func TestGenCStubFileWithNamedGroups(t *testing.T) {
+	entries := []config.RegexEntry{
+		{NamedGroupsFunc: "url_named", Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
+	}
+	out, err := genCStubFile(entries, "mymod")
+	if err != nil {
+		t.Fatalf("genCStubFile: %v", err)
+	}
+	if !strings.Contains(out, "_rx_streq") {
+		t.Error("genCStubFile: missing _rx_streq for named groups")
+	}
+	if !strings.Contains(out, "url_named_get") {
+		t.Error("genCStubFile: missing url_named_get")
+	}
+}
+
+func TestGenJSStubFileWithNamedPattern(t *testing.T) {
+	cfg := config.BuildConfig{
+		Output:   "merged.wasm",
+		StubFile: "regex.js",
+		Regexes: []config.RegexEntry{{
+			NamedGroupsFunc: "url_named",
+			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
+		}},
+	}
+	out, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("genJSStubFile named pattern: %v", err)
+	}
+	for _, sub := range []string{"url_named", `result['scheme']`, `result['host']`} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genJSStubFile named pattern: missing %q", sub)
+		}
+	}
+}
+
+func TestGenTSStubFileWithNamedPattern(t *testing.T) {
+	cfg := config.BuildConfig{
+		Output:   "merged.wasm",
+		StubFile: "regex.ts",
+		Regexes: []config.RegexEntry{{
+			NamedGroupsFunc: "url_named",
+			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
+		}},
+	}
+	out, err := genTSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("genTSStubFile named pattern: %v", err)
+	}
+	for _, sub := range []string{"url_named", `result['scheme']`, `result['host']`} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genTSStubFile named pattern: missing %q", sub)
+		}
+	}
+}
+
 func TestResolveStubType(t *testing.T) {
 	cases := []struct {
 		cfg     config.BuildConfig
@@ -319,11 +531,13 @@ func TestResolveStubType(t *testing.T) {
 		{config.BuildConfig{StubType: "js"}, "js", false},
 		{config.BuildConfig{StubType: "ts"}, "ts", false},
 		{config.BuildConfig{StubType: "go"}, "go", false},
+		{config.BuildConfig{StubType: "c"}, "c", false},
 		{config.BuildConfig{StubType: "invalid"}, "", true},
 		{config.BuildConfig{StubFile: "out.rs"}, "rust", false},
 		{config.BuildConfig{StubFile: "out.js"}, "js", false},
 		{config.BuildConfig{StubFile: "out.ts"}, "ts", false},
 		{config.BuildConfig{StubFile: "out.go"}, "go", false},
+		{config.BuildConfig{StubFile: "out.h"}, "c", false},
 		{config.BuildConfig{StubFile: "out.wasm"}, "", true},
 		{config.BuildConfig{}, "", true},
 	}

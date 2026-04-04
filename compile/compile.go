@@ -843,7 +843,8 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 		MaxDFAStates: cfg.MaxDFAStates,
 		MaxTDFARegs:  cfg.MaxTDFARegs,
 	}
-	wasmBytes, _, err := Compile(cfg.Regexes, 0, false, compOpts)
+	standalone := cfg.Output == ""
+	wasmBytes, _, err := Compile(cfg.Regexes, 0, standalone, compOpts)
 	if err != nil {
 		return fmt.Errorf("compile: %w", err)
 	}

@@ -40,6 +40,7 @@ re2test/re2-exhaustive.txt
 re2test/re2test
 perftest/perftest
 examples/*/*wasm
+examples/*/*/*wasm
 examples/*/stub*.*
 examples/*/*/stub*.*
 examples/*/regex.*s

@@ -1,8 +1,8 @@
-wasm_merge:   "../../../binaryen/bin/wasm-merge"
+wasm_merge:   "../../../../../binaryen/bin/wasm-merge"
 output:       "final.wasm"
 wasm_file:    "url_ipv6.wasm"
 import_module: "url_ipv6"
-stub_file:    "src/stub.rs"
+stub_file:    "stub.rs"
 
 regexes:
   - pattern: |-

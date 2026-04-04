@@ -9,11 +9,11 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// CmdGo generates a Go stub file (//go:build wasip1) for all regex entries in cfg.
+// goStub generates a Go stub file (//go:build wasip1) for all regex entries in cfg.
 // out is the full output path for stub.go, or "-" for stdout.
 // The Go package name is set to cfg.ImportModule when the stub is placed in a
 // subdirectory named after the import module; otherwise "main" is used.
-func CmdGo(cfg config.BuildConfig, out string) error {
+func goStub(cfg config.BuildConfig, out string) error {
 	pkgName := cfg.ImportModule
 	if filepath.Base(filepath.Dir(out)) != cfg.ImportModule {
 		pkgName = "main"
@@ -331,4 +331,3 @@ func genGoStubsForEntry(re config.RegexEntry, importModule string) (string, erro
 	}
 	return out, nil
 }
-

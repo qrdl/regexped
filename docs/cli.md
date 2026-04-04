@@ -9,8 +9,8 @@ wasm_merge: "wasm-merge"   # path to wasm-merge binary; defaults to wasm-merge i
 output:   "merged.wasm"    # output path for the merge command; overridable with --output
 wasm_file: "regexps.wasm"  # output path for the compile command; overridable with --output
 import_module: "mymod"     # WASM module name used by wasm-merge and Rust/Go FFI
-stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .js, .ts, .go
-stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go
+stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .js, .ts, .go, .h
+stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c
 max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
 
@@ -69,10 +69,10 @@ All commands validate their required options and config fields before doing any 
 regexped generate [--config=<file>] [--output=<file>|-]
 ```
 
-Generates a stub file (Rust, JS, TypeScript, or Go) from the config. The stub type is determined by:
+Generates a stub file (Rust, JS, TypeScript, Go, or C) from the config. The stub type is determined by:
 
-1. `stub_type` field in YAML (`rust`, `js`, `ts`, `go`)
-2. Extension of `stub_file` in YAML (`.rs` → rust, `.js` → js, `.ts` → ts, `.go` → go)
+1. `stub_type` field in YAML (`rust`, `js`, `ts`, `go`, `c`)
+2. Extension of `stub_file` in YAML (`.rs` → rust, `.js` → js, `.ts` → ts, `.go` → go, `.h` → c)
 3. Error if neither resolves to a known type
 
 **Flags:**
@@ -88,7 +88,7 @@ Generates a stub file (Rust, JS, TypeScript, or Go) from the config. The stub ty
 |---|---|
 | `stub_file` | Required unless `--output` is given |
 | `stub_type` or `stub_file` extension | Determines output language |
-| `import_module` | Required for Rust and Go stubs |
+| `import_module` | Required for Rust, Go, and C stubs |
 
 #### Rust stubs
 
@@ -134,6 +134,18 @@ Generates a single ES module. Exports an `init(wasm)` function that must be call
 
 Same as JS stubs but with TypeScript type annotations.
 
+#### C stubs
+
+Generates a single `#pragma once` header file. Requires `import_module` in config.
+No libc or sysroot required — uses `__attribute__((import_module(...), import_name(...)))` for WASM imports.
+
+| Config field | Generated functions | Notes |
+|---|---|---|
+| `match_func` | `<func>(input, len)` | Returns end position (≥0) or -1 |
+| `find_func` | `<func>_next(input, len, *start, *end)` + `<func>_reset()` | Static offset state; call reset before iterating |
+| `groups_func` | `<func>_next(input, len, slots[])` + `<func>_reset()` | `slots[i*2]`/`[i*2+1]` = start/end for group i; -1 if absent |
+| `named_groups_func` | same as groups + `<func>_get(slots, name, *start, *end)` | Hardcoded name→index mapping |
+
 ---
 
 ### `compile` — Compile patterns to WASM
@@ -142,7 +154,10 @@ Same as JS stubs but with TypeScript type annotations.
 regexped compile [--config=<file>] [--output=<file>|-]
 ```
 
-Compiles each regex pattern to a single WASM module. The module declares its own memory (DFA/TDFA tables start at address 0) and does not import memory from any host. It is self-contained and can be used directly (JS/TS deployments) or embedded into a host binary via `regexped merge` (Rust/Go deployments).
+Compiles each regex pattern to a single WASM module. The output mode is selected automatically based on the config:
+
+- **Standalone** (no `output` field in config) — the module owns its memory, DFA/TDFA tables start at address 0. Load directly in JS/TS without merging.
+- **Embedded** (`output` field present) — the module imports memory from a `"main"` host module. Use `regexped merge` to combine with a Rust/Go/C host binary.
 
 **Flags:**
 

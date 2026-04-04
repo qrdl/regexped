@@ -5,4 +5,4 @@ edition = "2021"
 
 [[bin]]
 name = "url_ipv6"
-path = "src/main.rs"
+path = "main.rs"
