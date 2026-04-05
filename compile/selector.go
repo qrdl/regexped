@@ -181,6 +181,15 @@ func resolveMaxTDFARegs(opts *CompileOptions) int {
 	return opts.MaxTDFARegs
 }
 
+// resolveMaxDFAMemory returns the effective DFA table memory limit in bytes.
+// Zero → no limit (default).
+func resolveMaxDFAMemory(opts *CompileOptions) int {
+	if opts == nil || opts.MaxDFAMemory == 0 {
+		return 0
+	}
+	return opts.MaxDFAMemory
+}
+
 // resolveMemoBudget returns the effective BitState memo budget in bytes.
 // Zero → default (128 KB).
 func resolveMemoBudget(opts *CompileOptions) int {
@@ -515,9 +524,6 @@ func getFirstRuneSet(prog *syntax.Prog, pc int) map[rune]bool {
 		}
 
 		visited[pc] = true
-		if len(visited) > 50 {
-			return false
-		}
 
 		inst := &prog.Inst[pc]
 

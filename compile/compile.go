@@ -225,6 +225,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	maxStates := resolveMaxDFAStates(&buildOpts)
+	memLimit := resolveMaxDFAMemory(&buildOpts)
 
 	// Match function uses LL (leftmostFirst=false): finds the longest full-string
 	// match from pos 0, matching RE2/Go anchored-match semantics.
@@ -251,7 +252,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			return nil, fmt.Errorf("compile match DFA: %w", llErr)
 		}
 		llTable := dfaTableFrom(llMatch.(*dfa))
-		if llTable.numStates > maxStates {
+		if llTable.numStates > maxStates || (memLimit > 0 && dfaTableBytes(llTable) > memLimit) {
 			// DFA too large — fall back to Backtracking match.
 			btProg, btProgErr := compileBTProg(re.Pattern)
 			if btProgErr != nil {
@@ -261,19 +262,20 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			bt.numGroups = 0
 			useMemo := needsBitState(btProg)
 			btBase := utils.PageAlign(cur)
-			btStackSize, btMemoSize := btAllocSizes(bt, useMemo, 0, 128*1024)
+			matchMemoBudget := resolveMemoBudget(&buildOpts)
+			btStackSize, btMemoSize := btAllocSizes(bt, useMemo, 0, matchMemoBudget)
 			btStackBase := int32(btBase)
 			btStackLimit := btStackBase + int32(btStackSize)
 			var btMemoBase int32
 			var btMemoMaxLen int32
 			if useMemo {
 				btMemoBase = btStackLimit
-				btMemoMaxLen = int32(btMemoMaxLenFor(btProg, 128*1024))
+				btMemoMaxLen = int32(btMemoMaxLenFor(btProg, matchMemoBudget))
 			}
 			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, 8, btMemoBase, btMemoMaxLen, useMemo, buildOpts.tableMemIdx)
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
-			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(nil))
+			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts))
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
 			matchData = rawM
@@ -295,11 +297,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	needFindBody := needFind || (needGroups && !anchored)
 
 	// Check if the LF DFA exceeds the state limit — if so, use BT find body.
-	dfaTooLarge := table.numStates > maxStates
+	dfaTooLarge := table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit)
 
 	var l *dfaLayout
 	if !dfaTooLarge {
-		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(nil))
+		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(&buildOpts))
 	}
 	patMandLit := findMandatoryLit(re.Pattern)
 
@@ -535,7 +537,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		} else {
 			p.isTDFA = true
 			tdfaBase := utils.PageAlign(p.tableEnd)
-			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(nil))
+			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(&buildOpts))
 			p.numGroups = tt.numGroups
 			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx)
 			// TDFA only needs the transition table (no stack/memo).
@@ -570,7 +572,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		var memoMaxLen int32
 		if useMemo {
 			N := len(prog.Inst)
-			memoBudget := 128 * 1024 // default 128 KB
+			memoBudget := resolveMemoBudget(&buildOpts)
 			memoMaxLen = int32(memoBudget*8/N - 1)
 			memoMaxSize := int64((N*(int(memoMaxLen)+1) + 7) / 8)
 			if memoMaxSize > int64(memoBudget) {
