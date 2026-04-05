@@ -746,92 +746,19 @@ type benchResult struct {
 }
 
 // --------------------------------------------------------------------------
-// Bench shim WASM modules
+// Bench shim WASM modules — built at startup by shims.go.
 //
-// Each shim imports one regexped function and loops it benchIters times.
-// The shim is instantiated via NewInstance with the regexped export as the
-// single extern — no Linker needed. One Go→WASM call per benchmark, so
-// CGo overhead is amortised across all iterations.
-//
-// Hand-encoded WASM binary format. Sections in order:
-//
-//	magic+version, type, import, function, export, code
-//
-// matchBenchShim: imports "regexped"."match" (i32,i32)->i32
-//
-//	exports "bench"            (i32,i32,i32)->void
-var matchBenchShim = []byte{
-	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic, version
-	// type section: (i32,i32)->i32 ; (i32,i32,i32)->void
-	0x01, 0x0d, 0x02,
-	0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
-	0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x00,
-	// import section: "regexped"."match" = func type 0
-	0x02, 0x12, 0x01,
-	0x08, 0x72, 0x65, 0x67, 0x65, 0x78, 0x70, 0x65, 0x64,
-	0x05, 0x6d, 0x61, 0x74, 0x63, 0x68,
-	0x00, 0x00,
-	// function section: 1 func of type 1
-	0x03, 0x02, 0x01, 0x01,
-	// export section: "bench" -> func 1
-	0x07, 0x09, 0x01, 0x05, 0x62, 0x65, 0x6e, 0x63, 0x68, 0x00, 0x01,
-	// code section: bench body (ptr,len,iters; local i)
-	0x0a, 0x23, 0x01, 0x21, 0x01, 0x01, 0x7f,
-	0x02, 0x40, 0x03, 0x40,
-	0x20, 0x03, 0x20, 0x02, 0x4e, 0x0d, 0x01,
-	0x20, 0x00, 0x20, 0x01, 0x10, 0x00, 0x1a,
-	0x20, 0x03, 0x41, 0x01, 0x6a, 0x21, 0x03,
-	0x0c, 0x00, 0x0b, 0x0b, 0x0b,
-}
+// Each shim imports wasi_snapshot_preview1.clock_time_get and one regexped
+// function, times each of benchIters iterations individually, and writes the
+// u32 nanosecond samples into its exported memory starting at offset 0.
+// find/groups shims exhaust all matches per iteration for a fair comparison.
+// See shims.go for details.
 
-// findBenchShim: imports "regexped"."find" (i32,i32)->i64
-//
-//	exports "bench"           (i32,i32,i32)->void
-var findBenchShim = []byte{
-	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-	// type section: (i32,i32)->i64 ; (i32,i32,i32)->void
-	0x01, 0x0d, 0x02,
-	0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7e, // note 0x7e = i64
-	0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x00,
-	// import section: "regexped"."find" = func type 0
-	0x02, 0x11, 0x01,
-	0x08, 0x72, 0x65, 0x67, 0x65, 0x78, 0x70, 0x65, 0x64,
-	0x04, 0x66, 0x69, 0x6e, 0x64,
-	0x00, 0x00,
-	0x03, 0x02, 0x01, 0x01,
-	0x07, 0x09, 0x01, 0x05, 0x62, 0x65, 0x6e, 0x63, 0x68, 0x00, 0x01,
-	0x0a, 0x23, 0x01, 0x21, 0x01, 0x01, 0x7f,
-	0x02, 0x40, 0x03, 0x40,
-	0x20, 0x03, 0x20, 0x02, 0x4e, 0x0d, 0x01,
-	0x20, 0x00, 0x20, 0x01, 0x10, 0x00, 0x1a,
-	0x20, 0x03, 0x41, 0x01, 0x6a, 0x21, 0x03,
-	0x0c, 0x00, 0x0b, 0x0b, 0x0b,
-}
-
-// groupsBenchShim: imports "regexped"."groups" (i32,i32,i32)->i32
-//
-//	exports "bench"             (i32,i32,i32,i32)->void
-var groupsBenchShim = []byte{
-	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-	// type section: (i32,i32,i32)->i32 ; (i32,i32,i32,i32)->void
-	0x01, 0x0f, 0x02,
-	0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
-	0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x00,
-	// import section: "regexped"."groups" = func type 0
-	0x02, 0x13, 0x01,
-	0x08, 0x72, 0x65, 0x67, 0x65, 0x78, 0x70, 0x65, 0x64,
-	0x06, 0x67, 0x72, 0x6f, 0x75, 0x70, 0x73,
-	0x00, 0x00,
-	0x03, 0x02, 0x01, 0x01,
-	0x07, 0x09, 0x01, 0x05, 0x62, 0x65, 0x6e, 0x63, 0x68, 0x00, 0x01,
-	// code section: bench body (ptr,len,out_ptr,iters; local i)
-	0x0a, 0x25, 0x01, 0x23, 0x01, 0x01, 0x7f,
-	0x02, 0x40, 0x03, 0x40,
-	0x20, 0x04, 0x20, 0x03, 0x4e, 0x0d, 0x01,
-	0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x10, 0x00, 0x1a,
-	0x20, 0x04, 0x41, 0x01, 0x6a, 0x21, 0x04,
-	0x0c, 0x00, 0x0b, 0x0b, 0x0b,
-}
+var (
+	matchBenchShim  = buildMatchBenchShim()
+	findBenchShim   = buildFindBenchShim()
+	groupsBenchShim = buildGroupsBenchShim()
+)
 
 // --------------------------------------------------------------------------
 // Warmup
@@ -871,7 +798,7 @@ func regexpedEngineName(tc testCase) string {
 // instantiation and execution. Execution is timed via a bench shim WASM that
 // imports the regexped function and loops benchIters times internally — only
 // one CGo crossing for the entire measurement.
-func benchRegexped(tc testCase, input string, engine *wasmtime.Engine) benchResult {
+func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) benchResult {
 	re := config.RegexEntry{Pattern: tc.pattern}
 	var fnExport string
 	switch tc.mode {
@@ -899,6 +826,7 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine) benchResu
 		return benchResult{}
 	}
 	store := wasmtime.NewStore(engine)
+	store.SetWasi(wasmtime.NewWasiConfig())
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regexped NewInstance(%s): %v\n", tc.name, err)
@@ -917,7 +845,7 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine) benchResu
 		return benchResult{instantiation: instantiation}
 	}
 
-	// Instantiate the bench shim with the regexped function as its single import.
+	// Instantiate the bench shim via a linker (needs WASI for clock_time_get).
 	var shimBytes []byte
 	switch tc.mode {
 	case anchored:
@@ -932,47 +860,59 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine) benchResu
 		fmt.Fprintf(os.Stderr, "  regexped shim parse(%s): %v\n", tc.name, err)
 		return benchResult{instantiation: instantiation}
 	}
-	shimInst, err := wasmtime.NewInstance(store, shimMod, []wasmtime.AsExtern{rpdFn})
+	linker := wasmtime.NewLinker(engine)
+	if err = linker.DefineWasi(); err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped shim DefineWasi(%s): %v\n", tc.name, err)
+		return benchResult{instantiation: instantiation}
+	}
+	if err = linker.Define(store, "regexped", fnExport, rpdFn); err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped shim Define(%s): %v\n", tc.name, err)
+		return benchResult{instantiation: instantiation}
+	}
+	shimInst, err := linker.Instantiate(store, shimMod)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regexped shim instantiate(%s): %v\n", tc.name, err)
 		return benchResult{instantiation: instantiation}
 	}
+	var shimMem *wasmtime.Memory
+	if exp := shimInst.GetExport(store, "memory"); exp != nil {
+		shimMem = exp.Memory()
+	}
 	benchFn := shimInst.GetFunc(store, "bench")
-	if benchFn == nil {
-		fmt.Fprintf(os.Stderr, "  regexped shim: missing bench export for %s\n", tc.name)
+	if benchFn == nil || shimMem == nil {
+		fmt.Fprintf(os.Stderr, "  regexped shim: missing bench/memory export for %s\n", tc.name)
 		return benchResult{instantiation: instantiation}
 	}
 
-	// Write input into regexped's memory and make a single timed call.
+	// Write input into regexped's memory and call the bench function.
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
 	inputLen := int32(len(input))
 
 	var callErr error
-	t1 := time.Now()
 	if tc.mode == anchoredGroups {
 		_, callErr = benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters))
 	} else {
 		_, callErr = benchFn.Call(store, inputBase, inputLen, int32(benchIters))
 	}
-	total := time.Since(t1)
 	if callErr != nil {
 		fmt.Fprintf(os.Stderr, "  regexped bench(%s): %v\n", tc.name, callErr)
 		return benchResult{instantiation: instantiation}
 	}
 
+	shimBuf := shimMem.UnsafeData(store)
 	return benchResult{
 		instantiation: instantiation,
-		avgExec:       total / benchIters,
+		avgExec:       computeStat(shimBuf[:timingsBytes], pct),
 		wasmSize:      len(wasmBytes),
 	}
 }
 
 // benchRegex instantiates regex_bench.wasm, compiles the pattern via regex_init,
 // and times execution via the internal-timing regex_bench_* functions.
-// A single Go→WASM call runs benchIters iterations internally and returns
-// total nanoseconds, eliminating CGo overhead from the per-iteration measurement.
-func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmtime.Engine) benchResult {
+// Each iteration is timed individually inside WASM; the timings buffer is read
+// back by Go to compute avg or a percentile.
+func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmtime.Engine, pct int) benchResult {
 	// Measure JIT instantiation (NewModule + linker.Instantiate).
 	t0 := time.Now()
 	mod, err := wasmtime.NewModule(engine, regexWasmBytes)
@@ -1000,6 +940,7 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 		mem = exp.Memory()
 	}
 	getPtrFn := inst.GetFunc(store, "get_input_ptr")
+	getTimingsPtrFn := inst.GetFunc(store, "get_timings_ptr")
 	initFn := inst.GetFunc(store, "regex_init")
 	var benchExecFn *wasmtime.Func
 	switch tc.mode {
@@ -1010,18 +951,24 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 	case anchoredGroups:
 		benchExecFn = inst.GetFunc(store, "regex_bench_groups")
 	}
-	if mem == nil || getPtrFn == nil || initFn == nil || benchExecFn == nil {
+	if mem == nil || getPtrFn == nil || getTimingsPtrFn == nil || initFn == nil || benchExecFn == nil {
 		fmt.Fprintf(os.Stderr, "  regex: missing export for %s\n", tc.name)
 		return benchResult{instantiation: instantiation}
 	}
 
-	// Get the address of the static input buffer inside WASM.
+	// Get the addresses of the static input and timings buffers inside WASM.
 	ptrRes, err := getPtrFn.Call(store)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regex get_input_ptr(%s): %v\n", tc.name, err)
 		return benchResult{instantiation: instantiation}
 	}
+	timPtrRes, err := getTimingsPtrFn.Call(store)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regex get_timings_ptr(%s): %v\n", tc.name, err)
+		return benchResult{instantiation: instantiation}
+	}
 	inputPtr := int(ptrRes.(int32))
+	timingsPtr := int(timPtrRes.(int32))
 	buf := mem.UnsafeData(store)
 
 	// Write pattern and time regex compilation.
@@ -1039,22 +986,21 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 		return benchResult{instantiation: instantiation}
 	}
 
-	// Write input and call the bench function once — it loops internally and
-	// returns total nanoseconds via std::time::Instant.
+	// Write input and run the bench function; it times each iteration individually
+	// and writes u32 ns samples to the timings buffer.
 	copy(buf[inputPtr:], []byte(input))
 	inputLen := int32(len(input))
 
-	nsRes, callErr := benchExecFn.Call(store, inputLen, int32(benchIters))
+	_, callErr := benchExecFn.Call(store, inputLen, int32(benchIters))
 	if callErr != nil {
 		fmt.Fprintf(os.Stderr, "  regex bench(%s): %v\n", tc.name, callErr)
 		return benchResult{instantiation: instantiation, compilation: compilation}
 	}
-	totalNs := nsRes.(int64)
 
 	return benchResult{
 		instantiation: instantiation,
 		compilation:   compilation,
-		avgExec:       time.Duration(totalNs / int64(benchIters)),
+		avgExec:       computeStat(buf[timingsPtr:timingsPtr+timingsBytes], pct),
 		wasmSize:      len(regexWasmBytes),
 	}
 }
@@ -1085,6 +1031,13 @@ func fmtSize(n int) string {
 	return fmt.Sprintf("%d B", n)
 }
 
+func execLabel(pct int) string {
+	if pct == 0 {
+		return "avg execution:"
+	}
+	return fmt.Sprintf("p%d execution:", pct)
+}
+
 func fmtRatio(rped, rxp time.Duration) string {
 	if rped == 0 || rxp == 0 {
 		return "n/a"
@@ -1099,7 +1052,7 @@ type inputResult struct {
 	rpedAvg time.Duration
 }
 
-func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs []inputResult, full bool) {
+func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs []inputResult, full bool, pct int) {
 	modeStr := "anchored"
 	switch tc.mode {
 	case find:
@@ -1126,7 +1079,7 @@ func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs 
 	for _, inp := range inputs {
 		fmt.Printf("\n  input: %s (%d bytes)\n", inp.label, inp.size)
 		fmt.Printf("    %-24s  %14s  %14s  %8s\n",
-			"avg execution:",
+			execLabel(pct),
 			fmtDur(inp.rxpAvg),
 			fmtDur(inp.rpedAvg),
 			fmtRatio(inp.rpedAvg, inp.rxpAvg))
@@ -1323,6 +1276,7 @@ func main() {
 
 	full := flag.Bool("full", false, "show wasm size and instantiation/compilation time")
 	fuel := flag.Bool("fuel", false, "measure fuel (WASM instruction count) for a single call instead of timing")
+	pct := flag.Int("p", 0, "report this percentile (1-99) instead of average (e.g. -p 95)")
 	flag.Parse()
 
 	// Load the pre-built regex_bench.wasm harness.
@@ -1373,8 +1327,8 @@ func main() {
 		var inputResults []inputResult
 
 		for i, inp := range tc.inputs {
-			rxp := benchRegex(regexWasmBytes, tc, inp.value, engine)
-			rped := benchRegexped(tc, inp.value, engine)
+			rxp := benchRegex(regexWasmBytes, tc, inp.value, engine, *pct)
+			rped := benchRegexped(tc, inp.value, engine, *pct)
 			if i == 0 {
 				rxpInst = rxp
 				rpedInst = rped
@@ -1394,7 +1348,7 @@ func main() {
 		}, benchResult{
 			instantiation: rpedInst.instantiation,
 			wasmSize:      rpedInst.wasmSize,
-		}, inputResults, *full)
+		}, inputResults, *full, *pct)
 	}
 	fmt.Println()
 }

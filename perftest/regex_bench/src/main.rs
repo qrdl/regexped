@@ -5,13 +5,14 @@
 // Exports:
 //   get_input_ptr() -> i32   address of a static 512KB input buffer
 //   get_output_ptr() -> i32  address of a static output buffer (i32 slots)
+//   get_timings_ptr() -> i32 address of the timings buffer (u32 ns per iteration)
 //   regex_init(len: i32)     compile pattern from input_buf[..len]
 //   regex_match(len: i32) -> i32   1 if match, 0 otherwise
 //   regex_find(len: i32) -> i64    start<<32|end, or -1 on no match
 //   regex_groups(len: i32) -> i32  writes slots to output buf, returns end pos or -1
-//   regex_bench_match(len: i32, iters: i32) -> i64   total ns for iters iterations
-//   regex_bench_find(len: i32, iters: i32) -> i64    total ns for iters iterations
-//   regex_bench_groups(len: i32, iters: i32) -> i64  total ns for iters iterations
+//   regex_bench_match(len: i32, iters: i32)   times iters iterations; writes ns to timings buf
+//   regex_bench_find(len: i32, iters: i32)    times iters iterations (all matches); writes ns to timings buf
+//   regex_bench_groups(len: i32, iters: i32)  times iters iterations (all matches); writes ns to timings buf
 //
 // The Go host writes data directly into WASM linear memory at the addresses
 // returned by get_input_ptr() / get_output_ptr().
@@ -24,6 +25,9 @@ static mut INPUT_BUF: [u8; 512 * 1024] = [0u8; 512 * 1024];
 
 // Output buffer for capture group slots: [start0, end0, start1, end1, ...]
 static mut OUTPUT_BUF: [i32; 256] = [0i32; 256];
+
+// Timings buffer: one u32 nanosecond value per iteration.
+static mut TIMINGS_BUF: [u32; 10_000] = [0u32; 10_000];
 
 static REGEX: OnceLock<Regex> = OnceLock::new();
 
@@ -39,6 +43,12 @@ pub extern "C" fn get_input_ptr() -> i32 {
 #[no_mangle]
 pub extern "C" fn get_output_ptr() -> i32 {
     core::ptr::addr_of!(OUTPUT_BUF) as i32
+}
+
+/// Returns the address of the timings buffer (u32 ns per iteration).
+#[no_mangle]
+pub extern "C" fn get_timings_ptr() -> i32 {
+    core::ptr::addr_of!(TIMINGS_BUF) as i32
 }
 
 /// Compiles the regex pattern stored in input_buf[..len].
@@ -102,42 +112,55 @@ pub extern "C" fn regex_groups(len: i32) -> i32 {
 }
 
 // --------------------------------------------------------------------------
-// Bench functions — loop iters times internally using std::time::Instant,
-// return total nanoseconds as i64. A single Go→WASM call amortises CGo overhead
-// across all iterations, giving true per-iteration execution time.
+// Bench functions — loop iters times internally, timing each iteration
+// individually with std::time::Instant and storing the nanosecond duration
+// as u32 into TIMINGS_BUF. The Go host reads the buffer to compute avg or pN.
 
-/// Runs regex_match iters times and returns total elapsed nanoseconds.
+/// Benchmarks regex_match: times each of iters iterations; writes ns to timings buf.
 #[no_mangle]
-pub extern "C" fn regex_bench_match(len: i32, iters: i32) -> i64 {
+pub extern "C" fn regex_bench_match(len: i32, iters: i32) {
     let re = REGEX.get().expect("regex not initialised");
     let input = unsafe { std::str::from_utf8_unchecked(&INPUT_BUF[..len as usize]) };
-    let start = std::time::Instant::now();
-    for _ in 0..iters {
+    let timings = unsafe { &mut *core::ptr::addr_of_mut!(TIMINGS_BUF) };
+    let mut prev = std::time::Instant::now();
+    for i in 0..iters as usize {
         let _ = re.is_match(std::hint::black_box(input));
+        let cur = std::time::Instant::now();
+        timings[i] = cur.duration_since(prev).as_nanos() as u32;
+        prev = cur;
     }
-    start.elapsed().as_nanos() as i64
 }
 
-/// Runs regex_find iters times and returns total elapsed nanoseconds.
+/// Benchmarks regex_find: exhausts all matches per iteration; writes ns to timings buf.
 #[no_mangle]
-pub extern "C" fn regex_bench_find(len: i32, iters: i32) -> i64 {
+pub extern "C" fn regex_bench_find(len: i32, iters: i32) {
     let re = REGEX.get().expect("regex not initialised");
     let input = unsafe { std::str::from_utf8_unchecked(&INPUT_BUF[..len as usize]) };
-    let start = std::time::Instant::now();
-    for _ in 0..iters {
-        let _ = re.find(std::hint::black_box(input));
+    let timings = unsafe { &mut *core::ptr::addr_of_mut!(TIMINGS_BUF) };
+    let mut prev = std::time::Instant::now();
+    for i in 0..iters as usize {
+        for m in re.find_iter(std::hint::black_box(input)) {
+            let _ = std::hint::black_box(m);
+        }
+        let cur = std::time::Instant::now();
+        timings[i] = cur.duration_since(prev).as_nanos() as u32;
+        prev = cur;
     }
-    start.elapsed().as_nanos() as i64
 }
 
-/// Runs regex_groups iters times and returns total elapsed nanoseconds.
+/// Benchmarks regex_groups: exhausts all capture matches per iteration; writes ns to timings buf.
 #[no_mangle]
-pub extern "C" fn regex_bench_groups(len: i32, iters: i32) -> i64 {
+pub extern "C" fn regex_bench_groups(len: i32, iters: i32) {
     let re = REGEX.get().expect("regex not initialised");
     let input = unsafe { std::str::from_utf8_unchecked(&INPUT_BUF[..len as usize]) };
-    let start = std::time::Instant::now();
-    for _ in 0..iters {
-        let _ = std::hint::black_box(re.captures(std::hint::black_box(input)));
+    let timings = unsafe { &mut *core::ptr::addr_of_mut!(TIMINGS_BUF) };
+    let mut prev = std::time::Instant::now();
+    for i in 0..iters as usize {
+        for caps in re.captures_iter(std::hint::black_box(input)) {
+            let _ = std::hint::black_box(caps);
+        }
+        let cur = std::time::Instant::now();
+        timings[i] = cur.duration_since(prev).as_nanos() as u32;
+        prev = cur;
     }
-    start.elapsed().as_nanos() as i64
 }

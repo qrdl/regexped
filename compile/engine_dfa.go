@@ -1120,6 +1120,17 @@ type dfaLayout struct {
 	useHybridDispatch bool
 }
 
+// dfaTableBytes returns the upper-bound byte footprint of the runtime transition
+// and accept tables for a minimised DFA (uncompressed size for u8 tables, exact
+// for u16). Used to enforce MaxDFAMemory before committing to a DFA layout.
+func dfaTableBytes(t *dfaTable) int {
+	n := t.numStates + 1 // +1 for the implicit dead state at index 0
+	if n <= 256 {
+		return n * 257 // u8: transitions(n*256) + accept(n)
+	}
+	return n * 513 // u16: transitions(n*256*2) + accept(n)
+}
+
 // buildDFALayout computes all DFA table data and offsets. needFind must be true
 // when a find function will be emitted (computes extra tables for find mode).
 // compiledDFAThreshold is the resolved threshold (0 = disabled, 1..256 = active).

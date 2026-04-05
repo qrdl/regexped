@@ -1536,6 +1536,52 @@ func emitBTMemoZeroInit(body []byte, memoTableBase int32, N int,
 	return body
 }
 
+// emitBTMemoZeroInitTrimmed is like emitBTMemoZeroInit but avoids zeroing bytes
+// before the current attempt window. Because the BT engine uses absolute positions
+// (localPos starts at attempt_start), bits at absolute position p land in byte
+// p/8 of the memo. Positions 0..attempt_start-1 are never visited by this
+// attempt, so bytes 0..attempt_start/8-1 are guaranteed clean and can be skipped.
+//
+//	skip = attempt_start >> 3
+//	memory.fill(memoTableBase + skip, 0, memoZeroLen - skip)
+//
+// simd_mask (local 8) is used as a scratch register — it is always free at the
+// two find-path call sites (outer retry loop and OnMatch callback).
+func emitBTMemoZeroInitTrimmed(body []byte, memoTableBase int32, N int,
+	memoLenPlus1, memoZeroLen uint32) []byte {
+
+	// lenPlus1 = localLen + 1
+	body = append(body, 0x20, localLen, 0x41, 0x01, 0x6A, 0x21)
+	body = utils.AppendULEB128(body, memoLenPlus1)
+	// memoZeroLen = (N * lenPlus1 + 7) / 8
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, int32(N))
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoLenPlus1)
+	body = append(body, 0x6C, 0x41, 0x07, 0x6A, 0x41, 0x03, 0x76, 0x21)
+	body = utils.AppendULEB128(body, memoZeroLen)
+	// skip = attempt_start(7) >> 3; store in simd_mask(8)
+	body = append(body, 0x20, 0x07) // local.get attempt_start
+	body = append(body, 0x41, 0x03) // i32.const 3
+	body = append(body, 0x76)       // i32.shr_u
+	body = append(body, 0x22, 0x08) // local.tee simd_mask (scratch)
+	// dst = memoTableBase + skip
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, memoTableBase)
+	body = append(body, 0x20, 0x08) // local.get simd_mask
+	body = append(body, 0x6A)       // i32.add
+	// val = 0
+	body = append(body, 0x41, 0x00)
+	// clearLen = memoZeroLen - skip
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoZeroLen)
+	body = append(body, 0x20, 0x08) // local.get simd_mask
+	body = append(body, 0x6B)       // i32.sub
+	// memory.fill memory_idx=0
+	body = append(body, 0xFC, 0x0B, 0x00)
+	return body
+}
+
 // --------------------------------------------------------------------------
 // appendBTFindCodeEntry / buildBTFindBody
 
@@ -1752,7 +1798,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			body = utils.AppendULEB128(body, ll)
 		}
 		if useMemo {
-			body = emitBTMemoZeroInit(body, memoTableBase, N, memoLenPlus1, memoZeroLen)
+			body = emitBTMemoZeroInitTrimmed(body, memoTableBase, N, memoLenPlus1, memoZeroLen)
 		}
 
 		// block $run_exit / loop $run / dispatch
@@ -1818,7 +1864,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			b = utils.AppendULEB128(b, ll)
 		}
 		if useMemo {
-			b = emitBTMemoZeroInit(b, memoTableBase, N, memoLenPlus1, memoZeroLen)
+			b = emitBTMemoZeroInitTrimmed(b, memoTableBase, N, memoLenPlus1, memoZeroLen)
 		}
 
 		// block $run_exit
