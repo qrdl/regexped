@@ -524,9 +524,6 @@ func getFirstRuneSet(prog *syntax.Prog, pc int) map[rune]bool {
 		}
 
 		visited[pc] = true
-		if len(visited) > 50 {
-			return false
-		}
 
 		inst := &prog.Inst[pc]
 
