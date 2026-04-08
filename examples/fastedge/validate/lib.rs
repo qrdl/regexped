@@ -70,6 +70,8 @@ impl HttpContext for HttpReqBody {
             return Action::Pause;
         };
 
+        println!("Received request: email={}, url={}, descr={}", p.email, p.url, p.descr);
+
         // validate the e-mail address
         if regexps::match_email(p.email.as_bytes()).is_none() {
             println!("Invalid email address: {}", p.email);
