@@ -1,0 +1,16 @@
+wasm_merge:    "../../../../binaryen/bin/wasm-merge"
+output:        "final.wasm"
+wasm_file:     "regexps.wasm"
+import_module: "regexps"
+stub_file:     "stubs.rs"
+
+regexes:
+  - pattern:   '^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$'
+    match_func: "match_email"
+
+  - pattern:    '^https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?$'
+    match_func: "url_match"
+
+  - pattern: |-
+      (?i)(?:<\s*(?:script|iframe|object|embed|applet|frameset)\b[^>]*>|\bon\w{1,30}\s*=|(?:javascript|vbscript)\s*:|expression\s*\()
+    find_func: "find_xss"

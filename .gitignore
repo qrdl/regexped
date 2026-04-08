@@ -31,6 +31,7 @@ go.work.sum
 # .idea/
 .vscode/
 .claude/
+
 tmp
 regexped
 target
@@ -43,3 +44,5 @@ perftest/perftest
 examples/**/*.wasm
 examples/**/stub*.*
 examples/**/regex.*s
+Cargo.lock
+wasm-merge

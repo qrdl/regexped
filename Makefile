@@ -25,6 +25,10 @@ unittest:
 	@go tool cover -func=cover.out | grep "total:" | awk '{print "Test coverage: " $$3}'
 	@rm cover.out
 
+docker: regexped
+	./get_wasm_merge.sh
+	docker build -t regexped .
+
 clean:
 	rm -f regexped
 	$(MAKE) -C re2test clean
