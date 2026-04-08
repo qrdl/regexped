@@ -7,6 +7,7 @@
 | URL parsing into components | wasmtime | C | [wasmtime/c/url-parts](wasmtime/c/url-parts) |
 | CSV parsing and validation | wasmtime | Go | [wasmtime/go/csv](wasmtime/go/csv) |
 | SQL injection detection | wasmtime | Go | [wasmtime/go/sql-injection](wasmtime/go/sql-injection) |
+| Email, URL, XSS validation | FastEdge | Rust | [fastedge/validate](fastedge/validate) |
 | Email and URL validation | Browser | JavaScript | [browser](browser) |
 | Domain extraction from URLs | Node.js | TypeScript | [node](node) |
 | Credential scanner edge API | Cloudflare Workers | JavaScript | [workers](workers) |

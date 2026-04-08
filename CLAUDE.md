@@ -62,6 +62,8 @@ regexped/
     ├── browser/               # Browser demo: email + URL validation via JS + WASM
     ├── node/                  # Node.js: domain extraction via TS stub
     ├── workers/               # Cloudflare Worker: credential scanner edge API
+    ├── fastedge/
+    │   └── validate/          # FastEdge CDN app: email, URL, XSS validation via regexped WASM stubs
     └── wasmtime/
         ├── rust/
         │   ├── url-ipv6/      # DFA anchored match: validate IPv6 URLs (Rust)
