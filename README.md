@@ -69,6 +69,11 @@ See [`examples/`](examples/) for self-contained projects with Makefiles:
 
 **SIMD prefix scan:** First-byte and two-byte Teddy algorithm skips non-matching positions in bulk using WASM SIMD instructions, reducing DFA transitions on typical inputs.
 
+## Limitations
+
+- **No Unicode support** — patterns and input are treated as raw bytes (Latin-1/ASCII). Unicode character classes (`\p{L}`, `\p{N}`, etc.), Unicode case folding, and multi-byte Unicode literals are not supported.
+- **No WASM Component Model** — generated modules use the core WASM ABI (linear memory + exported functions). WASM Component Model support is planned.
+
 ## Requirements
 
 - Go 1.25.7+
