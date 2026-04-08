@@ -1,0 +1,12 @@
+[package]
+name = "regex_ser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fastedge = "0.3"
+regex-automata = "0.4"
+
+[lib]
+path = "main.rs"
+crate-type = ["cdylib"]
