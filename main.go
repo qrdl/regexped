@@ -48,7 +48,7 @@ func printUsage() {
 	fmt.Fprint(os.Stderr, `Usage: regexped <command> [options]
 
 Commands:
-  generate  Generate language stubs (Rust/Go/JS/TS) from a config file
+  generate  Generate language stubs (Rust/Go/JS/TS/AS) from a config file
   compile   Compile regex patterns to a standalone WASM module
   merge     Merge WASM modules into a single binary (thin wrapper around wasm-merge)
 
@@ -85,9 +85,9 @@ func runGenerateCmd(args []string) {
 		log.Fatal(err)
 	}
 
-	// Rust stubs require import_module for the pub mod block name.
-	if stubType == "rust" && cfg.ImportModule == "" {
-		fmt.Fprintln(os.Stderr, "generate: import_module is required in config for Rust stubs")
+	// Rust and AS stubs require import_module for the FFI module name.
+	if (stubType == "rust" || stubType == "as") && cfg.ImportModule == "" {
+		fmt.Fprintln(os.Stderr, "generate: import_module is required in config for Rust and AS stubs")
 		os.Exit(1)
 	}
 
