@@ -11,5 +11,6 @@
 | Email and URL validation | Browser | JavaScript | [browser](browser) |
 | Domain extraction from URLs | Node.js | TypeScript | [node](node) |
 | Credential scanner edge API | Cloudflare Workers | JavaScript | [workers](workers) |
+| Email extraction with captures | wasmtime | AssemblyScript | [wasmtime/as/find-email](wasmtime/as/find-email) |
 
 Run `make` in any example directory to build and run end-to-end.

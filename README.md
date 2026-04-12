@@ -43,23 +43,11 @@ go build -o regexped .
 
 ## Examples
 
-See [`examples/`](examples/) for self-contained projects with Makefiles:
+See [`examples/README.md`](examples/README.md) for the full list.
 
-**Rust (wasmtime)**
-- **url-ipv6** — anchored DFA match: validate URLs with IPv6 addresses
-- **secrets** — DFA find: scan text for GitHub tokens, JWTs, and AWS keys
+Examples are available for the following environments: wasmtime, Node.js, Cloudflare Workers, FastEdge, browser.
 
-**Go (wasip1)**
-- **csv** — TDFA named groups: parse and validate CSV rows, extract fields by name
-- **sql-injection** — Backtracking: detect SQL injection patterns in query strings
-
-**C (wasmtime)**
-- **url-parts** — TDFA named groups: parse URLs into scheme, host, path, and query
-
-**JavaScript / TypeScript**
-- **node** — Node.js: extract domains from URLs in text using a TS stub
-- **workers** — Cloudflare Worker: credential scanner edge API using a JS stub
-- **browser** — browser: email and URL validation via JS + WASM (no bundler required)
+Languages: Rust, Go, C, JavaScript, TypeScript, AssemblyScript.
 
 ## Performance
 
