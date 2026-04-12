@@ -73,6 +73,7 @@ See [`examples/`](examples/) for self-contained projects with Makefiles:
 
 - **No Unicode support** — patterns and input are treated as raw bytes (Latin-1/ASCII). Unicode character classes (`\p{L}`, `\p{N}`, etc.), Unicode case folding, and multi-byte Unicode literals are not supported.
 - **No WASM Component Model** — generated modules use the core WASM ABI (linear memory + exported functions). WASM Component Model support is planned.
+- **Not thread-safe** — the C, JS, TS, and AS stubs are not safe for concurrent use. Only the Rust and Go stubs are thread-safe.
 
 ## Requirements
 

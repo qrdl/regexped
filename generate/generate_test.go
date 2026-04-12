@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -359,125 +360,122 @@ func TestGenRustStubFileNoFuncs(t *testing.T) {
 	}
 }
 
-func TestGenCMatchStub(t *testing.T) {
-	out := genCMatchStub("mymod", "my_match")
+func TestGenCMatchParts(t *testing.T) {
+	h := genCMatchHPart("my_match")
+	c := genCMatchCPart("mymod", "my_match")
+	for _, sub := range []string{"int my_match", "anchored match"} {
+		if !strings.Contains(h, sub) {
+			t.Errorf("genCMatchHPart: output missing %q", sub)
+		}
+	}
 	for _, sub := range []string{
 		`import_module("mymod")`, `import_name("my_match")`,
-		"_ffi_my_match", "static int my_match",
+		"_ffi_my_match", "int my_match",
 	} {
-		if !strings.Contains(out, sub) {
-			t.Errorf("genCMatchStub: output missing %q", sub)
+		if !strings.Contains(c, sub) {
+			t.Errorf("genCMatchCPart: output missing %q", sub)
 		}
 	}
 }
 
-func TestGenCFindStub(t *testing.T) {
-	out := genCFindStub("mymod", "tok_find")
+func TestGenCFindParts(t *testing.T) {
+	h := genCFindHPart("tok_find")
+	c := genCFindCPart("mymod", "tok_find")
+	for _, sub := range []string{"rx_match_t tok_find", "offset"} {
+		if !strings.Contains(h, sub) {
+			t.Errorf("genCFindHPart: output missing %q", sub)
+		}
+	}
 	for _, sub := range []string{
 		`import_module("mymod")`, `import_name("tok_find")`,
-		"_ffi_tok_find", "tok_find_reset", "tok_find_next", "_tok_find_off",
+		"_ffi_tok_find", "rx_match_t tok_find",
+		"unsigned long long", "0xFFFFFFFFU",
 	} {
-		if !strings.Contains(out, sub) {
-			t.Errorf("genCFindStub: output missing %q", sub)
+		if !strings.Contains(c, sub) {
+			t.Errorf("genCFindCPart: output missing %q", sub)
 		}
 	}
 }
 
-func TestGenCGroupsStub(t *testing.T) {
-	out := genCGroupsStub("mymod", "url_groups", "url_groups", true, 3)
-	for _, sub := range []string{
-		"URL_GROUPS_SLOTS", "_ffi_url_groups",
-		"url_groups_reset", "url_groups_next",
-		`import_module("mymod")`,
-	} {
-		if !strings.Contains(out, sub) {
-			t.Errorf("genCGroupsStub: output missing %q", sub)
-		}
-	}
-}
-
-func TestGenCGroupsStubNoFFI(t *testing.T) {
-	out := genCGroupsStub("mymod", "url_named", "url_groups", false, 3)
-	if strings.Contains(out, `import_module(`) {
-		t.Error("genCGroupsStub declareFFI=false: should not emit import_module")
-	}
-	if !strings.Contains(out, "url_named_reset") {
-		t.Error("genCGroupsStub declareFFI=false: missing url_named_reset")
-	}
-}
-
-func TestGenCNamedGroupsStub(t *testing.T) {
+func TestGenCGroupsStubParts(t *testing.T) {
 	named := map[string]int{"scheme": 1, "host": 2}
-	out := genCNamedGroupsStub("mymod", "url_named", "url_groups", true, 3, named)
+	h, c := genCGroupsStubParts("mymod", "parse_url", "parse_url", 3, named)
 	for _, sub := range []string{
-		"url_named_get", `_rx_streq(name, "scheme")`, `_rx_streq(name, "host")`,
-		"url_named_reset", "url_named_next",
+		"PARSE_URL_GROUP_SCHEME", "PARSE_URL_GROUP_HOST",
+		"PARSE_URL_GROUPS", "const rx_group_t *parse_url",
 	} {
-		if !strings.Contains(out, sub) {
-			t.Errorf("genCNamedGroupsStub: output missing %q", sub)
+		if !strings.Contains(h, sub) {
+			t.Errorf("genCGroupsStubParts h: missing %q", sub)
+		}
+	}
+	for _, sub := range []string{
+		`import_module("mymod")`, `import_name("parse_url")`,
+		"_ffi_parse_url", "PARSE_URL_GROUP_SCHEME",
+		"const rx_group_t *parse_url",
+	} {
+		if !strings.Contains(c, sub) {
+			t.Errorf("genCGroupsStubParts c: missing %q", sub)
 		}
 	}
 }
 
-func TestGenCStubFileFind(t *testing.T) {
+func TestGenCStubFilesFind(t *testing.T) {
 	entries := []config.RegexEntry{{FindFunc: "tok_find"}}
-	out, err := genCStubFile(entries, "mymod")
+	h, c, err := genCStubFiles(entries, "mymod", "stub.h")
 	if err != nil {
-		t.Fatalf("genCStubFile find: %v", err)
+		t.Fatalf("genCStubFiles find: %v", err)
 	}
-	for _, sub := range []string{"#pragma once", "tok_find_reset", "tok_find_next"} {
-		if !strings.Contains(out, sub) {
-			t.Errorf("genCStubFile find: missing %q", sub)
+	for _, sub := range []string{"#pragma once", "rx_match_t", "tok_find"} {
+		if !strings.Contains(h, sub) {
+			t.Errorf("genCStubFiles find h: missing %q", sub)
+		}
+	}
+	for _, sub := range []string{`#include "stub.h"`, "_ffi_tok_find", "rx_match_t tok_find"} {
+		if !strings.Contains(c, sub) {
+			t.Errorf("genCStubFiles find c: missing %q", sub)
 		}
 	}
 }
 
-func TestGenCStubFileGroupsAndNamed(t *testing.T) {
+func TestGenCStubFilesGroupsAndNamed(t *testing.T) {
+	// named_groups_func is not supported for C stubs — must return an error.
 	entries := []config.RegexEntry{{
 		GroupsFunc:      "url_groups",
 		NamedGroupsFunc: "url_named",
 		Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
 	}}
-	out, err := genCStubFile(entries, "mymod")
-	if err != nil {
-		t.Fatalf("genCStubFile groups+named: %v", err)
-	}
-	for _, sub := range []string{"url_groups_next", "url_named_get", "_rx_streq"} {
-		if !strings.Contains(out, sub) {
-			t.Errorf("genCStubFile groups+named: missing %q", sub)
-		}
+	_, _, err := genCStubFiles(entries, "mymod", "stub.h")
+	if err == nil {
+		t.Fatal("genCStubFiles groups+named: expected error for named_groups_func, got nil")
 	}
 }
 
-func TestGenCStubFileSingle(t *testing.T) {
+func TestGenCStubFilesSingle(t *testing.T) {
 	entries := []config.RegexEntry{{MatchFunc: "url_match"}}
-	out, err := genCStubFile(entries, "mymod")
+	h, c, err := genCStubFiles(entries, "mymod", "stub.h")
 	if err != nil {
-		t.Fatalf("genCStubFile: %v", err)
+		t.Fatalf("genCStubFiles: %v", err)
 	}
 	for _, sub := range []string{"Auto-generated", "#pragma once", "url_match"} {
-		if !strings.Contains(out, sub) {
-			t.Errorf("genCStubFile: missing %q", sub)
+		if !strings.Contains(h, sub) {
+			t.Errorf("genCStubFiles h: missing %q", sub)
 		}
 	}
-	if strings.Contains(out, "_rx_streq") {
-		t.Error("genCStubFile: should not emit _rx_streq without named groups")
+	for _, sub := range []string{`#include "stub.h"`, "url_match"} {
+		if !strings.Contains(c, sub) {
+			t.Errorf("genCStubFiles c: missing %q", sub)
+		}
 	}
 }
 
-func TestGenCStubFileWithNamedGroups(t *testing.T) {
+func TestGenCStubFilesWithNamedGroups(t *testing.T) {
+	// named_groups_func is not supported for C stubs — must return an error.
 	entries := []config.RegexEntry{
 		{NamedGroupsFunc: "url_named", Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
 	}
-	out, err := genCStubFile(entries, "mymod")
-	if err != nil {
-		t.Fatalf("genCStubFile: %v", err)
-	}
-	if !strings.Contains(out, "_rx_streq") {
-		t.Error("genCStubFile: missing _rx_streq for named groups")
-	}
-	if !strings.Contains(out, "url_named_get") {
-		t.Error("genCStubFile: missing url_named_get")
+	_, _, err := genCStubFiles(entries, "mymod", "stub.h")
+	if err == nil {
+		t.Fatal("genCStubFiles named groups: expected error for named_groups_func, got nil")
 	}
 }
 
@@ -554,5 +552,157 @@ func TestResolveStubType(t *testing.T) {
 				t.Errorf("ResolveStubType(%+v) = %q, want %q", c.cfg, got, c.want)
 			}
 		}
+	}
+}
+
+func TestGenASMatchStub(t *testing.T) {
+	out := genASMatchStub("mymod", "url_match")
+	for _, sub := range []string{`@external("mymod", "url_match")`, "_ffi_url_match", "export function url_match", "i32"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genASMatchStub: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, "bool") {
+		t.Error("genASMatchStub: must not return bool")
+	}
+}
+
+func TestGenASFindStub(t *testing.T) {
+	out := genASFindStub("mymod", "url_find")
+	for _, sub := range []string{`@external("mymod", "url_find")`, "_ffi_url_find", "export function url_find", "offset: i32", "i64"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genASFindStub: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, "_url_find_off") {
+		t.Error("genASFindStub: must not have module-level offset state")
+	}
+}
+
+func TestGenASGroupsStub(t *testing.T) {
+	out := genASGroupsStub("mymod", "parse_url", "parse_url", 3)
+	for _, sub := range []string{`@external("mymod", "parse_url")`, "_ffi_parse_url", "export function parse_url", "offset: i32", "Int32Array(6)", "dataStart"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genASGroupsStub: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, "_parse_url_off") {
+		t.Error("genASGroupsStub: must not have module-level offset state")
+	}
+}
+
+func TestGenASStubNamedGroupsFuncError(t *testing.T) {
+	entries := []config.RegexEntry{
+		{NamedGroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
+	}
+	_, err := genASStubFile(entries, "mymod")
+	if err == nil {
+		t.Fatal("genASStubFile: expected error for named_groups_func, got nil")
+	}
+}
+
+func TestGenASStubFileGroupsFunc(t *testing.T) {
+	entries := []config.RegexEntry{
+		{GroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
+	}
+	out, err := genASStubFile(entries, "mymod")
+	if err != nil {
+		t.Fatalf("genASStubFile: %v", err)
+	}
+	for _, sub := range []string{"Auto-generated", "find_email", "offset: i32", "Int32Array", "dataStart"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genASStubFile groups_func: missing %q", sub)
+		}
+	}
+}
+
+// TestCmdGenerateStubDispatchers covers the per-type stub dispatcher functions
+// (asStub, cStub, goStub, jsStub, tsStub, rustStub) by passing "-" as the
+// output path, which bypasses file I/O and writes to stdout.
+func TestCmdGenerateStubDispatchers(t *testing.T) {
+	cases := []struct {
+		name     string
+		stubType string
+		cfg      config.BuildConfig
+	}{
+		{
+			name:     "rust",
+			stubType: "rust",
+			cfg: config.BuildConfig{
+				StubType:     "rust",
+				ImportModule: "mymod",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "go",
+			stubType: "go",
+			cfg: config.BuildConfig{
+				StubType:     "go",
+				ImportModule: "mymod",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "js",
+			stubType: "js",
+			cfg: config.BuildConfig{
+				StubType:     "js",
+				ImportModule: "mymod",
+				Output:       "merged.wasm",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "ts",
+			stubType: "ts",
+			cfg: config.BuildConfig{
+				StubType:     "ts",
+				ImportModule: "mymod",
+				Output:       "merged.wasm",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "c",
+			stubType: "c",
+			cfg: config.BuildConfig{
+				StubType:     "c",
+				ImportModule: "mymod",
+				StubFile:     "stub.h",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "as",
+			stubType: "as",
+			cfg: config.BuildConfig{
+				StubType:     "as",
+				ImportModule: "mymod",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := CmdGenerateStub(c.cfg, "-"); err != nil {
+				t.Errorf("CmdGenerateStub(%s): %v", c.stubType, err)
+			}
+		})
+	}
+}
+
+func TestWriteStub(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/sub/out.txt"
+	if err := writeStub(path, []byte("hello")); err != nil {
+		t.Fatalf("writeStub: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("writeStub: got %q, want %q", string(data), "hello")
 	}
 }

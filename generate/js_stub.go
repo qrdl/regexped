@@ -91,13 +91,15 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 }
 
 // genJSMatchFunc generates a JS export for an anchored match.
-// Returns true if the full input matches, false otherwise.
+// Returns [endPos, true] on match, or [0, false] if no match.
 func genJSMatchFunc(funcName string) string {
-	return fmt.Sprintf(`// %s — anchored match; returns true if the full input matches.
+	return fmt.Sprintf(`// %s — anchored match; returns [endPos, true] on match or [0, false] if no match.
 export function %s(input) {
     const b = _b(input);
     _mem.set(b, 0);
-    return _exp['%s'](0, b.length) === b.length;
+    const r = _exp['%s'](0, b.length);
+    if (r < 0) return [0, false];
+    return [r, true];
 }
 
 `, funcName, funcName, funcName)

@@ -63,14 +63,17 @@
     document.getElementById('loading').style.display = 'none';
     document.getElementById('app').style.display = 'block';
 
+    const _enc = new TextEncoder();
     function bind(inputId, statusId, matchFn) {
       const input  = document.getElementById(inputId);
       const status = document.getElementById(statusId);
       input.addEventListener('input', () => {
         if (!input.value) { status.textContent = ''; status.className = 'status'; return; }
-        const ok = matchFn(input.value);
-        status.textContent = ok ? '✓ valid' : '✗ invalid';
-        status.className   = ok ? 'status valid' : 'status invalid';
+        const bytes = _enc.encode(input.value);
+        const [end, ok] = matchFn(bytes);
+        const valid = ok && end === bytes.length;
+        status.textContent = valid ? '✓ valid' : '✗ invalid';
+        status.className   = valid ? 'status valid' : 'status invalid';
       });
     }
 

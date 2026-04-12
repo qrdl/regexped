@@ -10,7 +10,7 @@ output:   "merged.wasm"    # output path for the merge command; overridable with
 wasm_file: "regexps.wasm"  # output path for the compile command; overridable with --output
 import_module: "mymod"     # WASM module name used by wasm-merge and Rust/Go FFI
 stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .js, .ts, .go, .h
-stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c
+stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c, as
 max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
 
@@ -71,9 +71,11 @@ regexped generate [--config=<file>] [--output=<file>|-]
 
 Generates a stub file (Rust, JS, TypeScript, Go, or C) from the config. The stub type is determined by:
 
-1. `stub_type` field in YAML (`rust`, `js`, `ts`, `go`, `c`)
+1. `stub_type` field in YAML (`rust`, `js`, `ts`, `go`, `c`, `as`)
 2. Extension of `stub_file` in YAML (`.rs` → rust, `.js` → js, `.ts` → ts, `.go` → go, `.h` → c)
 3. Error if neither resolves to a known type
+
+> **Note:** AssemblyScript source files use the `.ts` extension (same as TypeScript). Set `stub_type: "as"` explicitly — extension-based inference always resolves `.ts` to the TypeScript ES module stub.
 
 **Flags:**
 
@@ -88,7 +90,7 @@ Generates a stub file (Rust, JS, TypeScript, Go, or C) from the config. The stub
 |---|---|
 | `stub_file` | Required unless `--output` is given |
 | `stub_type` or `stub_file` extension | Determines output language |
-| `import_module` | Required for Rust, Go, and C stubs |
+| `import_module` | Required for Rust, Go, C, and AS stubs |
 
 #### Rust stubs
 
@@ -145,6 +147,22 @@ No libc or sysroot required — uses `__attribute__((import_module(...), import_
 | `find_func` | `<func>_next(input, len, *start, *end)` + `<func>_reset()` | Static offset state; call reset before iterating |
 | `groups_func` | `<func>_next(input, len, slots[])` + `<func>_reset()` | `slots[i*2]`/`[i*2+1]` = start/end for group i; -1 if absent |
 | `named_groups_func` | same as groups + `<func>_get(slots, name, *start, *end)` | Hardcoded name→index mapping |
+
+#### AS stubs (AssemblyScript)
+
+Generates a single AssemblyScript `.ts` file using `@external` declarations. Requires `import_module` in config. Must set `stub_type: "as"` — `.ts` extension alone infers TypeScript.
+
+**`named_groups_func` is not supported for AS stubs.** Use `groups_func` and access slots by index instead.
+
+Input is `ArrayBuffer` (use `String.UTF8.encode(str)` to convert from string). All functions are stateless — the caller passes an `offset` argument and no module-level state is mutated.
+
+| Config field | Generated function | Returns |
+|---|---|---|
+| `match_func` | `<func>(input: ArrayBuffer): i32` | End position (≥0) or -1 if no match |
+| `find_func` | `<func>(input: ArrayBuffer, offset: i32): i64` | Packed `(absStart << 32 \| absEnd)` or -1 if not found |
+| `groups_func` | `<func>(input: ArrayBuffer, offset: i32): i32` | `dataStart` pointer to static `Int32Array` slots, or 0 on no match |
+
+See [as-api.md](as-api.md) for full usage examples and slot layout.
 
 ---
 

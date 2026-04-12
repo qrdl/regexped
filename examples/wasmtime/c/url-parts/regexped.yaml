@@ -5,5 +5,5 @@ import_module: "url_parts"
 stub_file:     "stub.h"
 
 regexes:
-  - pattern:          '(?P<scheme>https?)://(?P<host>[^/:?#]+)(?::(?P<port>[0-9]+))?(?P<path>/[^?#]*)?(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?'
-    named_groups_func: "parse_url"
+  - pattern:          '(?P<scheme>https?)://(?P<host>[^/:?#\s]+)(?::(?P<port>[0-9]+))?(?P<path>/[^?#\s]*)?(?:\?(?P<query>[^#\s]*))?(?:#(?P<fragment>[^\s]*))?'
+    groups_func: "parse_url"

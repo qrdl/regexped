@@ -16,10 +16,10 @@ import (
 func ResolveStubType(cfg config.BuildConfig) (string, error) {
 	if cfg.StubType != "" {
 		switch cfg.StubType {
-		case "rust", "js", "ts", "go", "c":
+		case "rust", "js", "ts", "go", "c", "as":
 			return cfg.StubType, nil
 		default:
-			return "", fmt.Errorf("unknown stub_type %q (expected rust, js, ts, go, or c)", cfg.StubType)
+			return "", fmt.Errorf("unknown stub_type %q (expected rust, js, ts, go, c, or as)", cfg.StubType)
 		}
 	}
 	ext := strings.ToLower(filepath.Ext(cfg.StubFile))
@@ -35,7 +35,7 @@ func ResolveStubType(cfg config.BuildConfig) (string, error) {
 	case ".h":
 		return "c", nil
 	default:
-		return "", fmt.Errorf("cannot infer stub type from %q: set stub_type in config (rust, js, ts, go, or c)", cfg.StubFile)
+		return "", fmt.Errorf("cannot infer stub type from %q: set stub_type in config (rust, js, ts, go, c, or as)", cfg.StubFile)
 	}
 }
 
@@ -57,6 +57,8 @@ func CmdGenerateStub(cfg config.BuildConfig, out string) error {
 		return goStub(cfg, out)
 	case "c":
 		return cStub(cfg, out)
+	case "as":
+		return asStub(cfg, out)
 	}
 	return fmt.Errorf("unknown stub type: %s", stubType)
 }

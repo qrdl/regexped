@@ -200,4 +200,108 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	t.Run("find_dfa_overflow", func(t *testing.T) {
 		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", FindFunc: "f"}}, CompileOptions{MaxDFAStates: 1})
 	})
+	// btCheckRuneRanges: char-class range in backtracking engine.
+	t.Run("bt_char_range", func(t *testing.T) {
+		_, _, err := compileForced(
+			[]config.RegexEntry{{Pattern: "([a-z]+)", GroupsFunc: "g"}},
+			0, true, EngineBacktrack,
+		)
+		if err != nil {
+			t.Fatalf("compileForced(BT char range): %v", err)
+		}
+	})
+	// btWordBoundary: word-boundary assertion in backtracking engine.
+	t.Run("bt_word_boundary", func(t *testing.T) {
+		_, _, err := compileForced(
+			[]config.RegexEntry{{Pattern: `(\bfoo\b)`, GroupsFunc: "g"}},
+			0, true, EngineBacktrack,
+		)
+		if err != nil {
+			t.Fatalf("compileForced(BT word boundary): %v", err)
+		}
+	})
+	// btFoldRune: case-insensitive single-character match in backtracking engine.
+	t.Run("bt_case_fold_char", func(t *testing.T) {
+		_, _, err := compileForced(
+			[]config.RegexEntry{{Pattern: "((?i:a)+)", GroupsFunc: "g"}},
+			0, true, EngineBacktrack,
+		)
+		if err != nil {
+			t.Fatalf("compileForced(BT case-fold): %v", err)
+		}
+	})
+	// buildBTScanTables: BT find mode (no-capture find path).
+	t.Run("bt_find_mode", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]+", FindFunc: "f"}}, CompileOptions{MaxDFAStates: 1})
+	})
+	// emitBTMemoZeroInit: non-greedy loop with zero-matchable body forces BitState memo.
+	t.Run("bt_memo_nongreedy_loop", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "((?:a*?)+)", GroupsFunc: "g"}})
+	})
+}
+
+// noHybridOpts returns CompileOptions that disable the hybrid/compiled-DFA dispatch,
+// forcing buildMatchBody and buildAnchoredFindBody / buildFindBody to be exercised.
+func noHybridOpts() CompileOptions {
+	return CompileOptions{CompiledDFAThreshold: -1}
+}
+
+func TestCompileIntegrationNonHybridDFA(t *testing.T) {
+	// buildMatchBody: non-hybrid match path (u8 simple).
+	t.Run("match_non_hybrid", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}, noHybridOpts())
+	})
+	// buildAnchoredFindBody: non-hybrid anchored find (^ pattern).
+	t.Run("find_anchored_non_hybrid", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "^abc", FindFunc: "f"}}, noHybridOpts())
+	})
+	// buildFindBody: non-hybrid non-anchored find.
+	t.Run("find_non_hybrid", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", FindFunc: "f"}}, noHybridOpts())
+	})
+	// Non-hybrid match+find combined.
+	t.Run("match_and_find_non_hybrid", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", MatchFunc: "m", FindFunc: "f"}}, noHybridOpts())
+	})
+	// buildAnchoredFindBody with word boundary.
+	t.Run("find_anchored_word_boundary_non_hybrid", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `^\bfoo`, FindFunc: "f"}}, noHybridOpts())
+	})
+	// buildLitAnchorFindBody / buildLitAnchorBackScanBody: literal-anchor find path.
+	t.Run("find_lit_anchor_non_hybrid", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `.*foo.*`, FindFunc: "f"}}, noHybridOpts())
+	})
+}
+
+func TestSelectEngineOptions(t *testing.T) {
+	// MaxDFAStates: -1 disables TDFA → falls back to Backtrack for capture patterns.
+	t.Run("max_dfa_states_disabled_forces_bt", func(t *testing.T) {
+		got, err := SelectEngine("(a)(b)", CompileOptions{MaxDFAStates: -1})
+		if err != nil {
+			t.Fatalf("SelectEngine: %v", err)
+		}
+		if got != EngineBacktrack {
+			t.Errorf("SelectEngine with MaxDFAStates=-1 = %v, want Backtrack", got)
+		}
+	})
+	// MaxTDFARegs: -1 disables TDFA → falls back to Backtrack.
+	t.Run("max_tdfa_regs_disabled_forces_bt", func(t *testing.T) {
+		got, err := SelectEngine("(a)(b)", CompileOptions{MaxTDFARegs: -1})
+		if err != nil {
+			t.Fatalf("SelectEngine: %v", err)
+		}
+		if got != EngineBacktrack {
+			t.Errorf("SelectEngine with MaxTDFARegs=-1 = %v, want Backtrack", got)
+		}
+	})
+	// Negative CompiledDFAThreshold disables compiled dispatch → plain DFA.
+	t.Run("compiled_dfa_threshold_disabled", func(t *testing.T) {
+		got, err := SelectEngine("abc", CompileOptions{CompiledDFAThreshold: -1})
+		if err != nil {
+			t.Fatalf("SelectEngine: %v", err)
+		}
+		if got != EngineDFA {
+			t.Errorf("SelectEngine with CompiledDFAThreshold=-1 = %v, want DFA", got)
+		}
+	})
 }

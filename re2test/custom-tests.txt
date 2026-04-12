@@ -1491,3 +1491,142 @@ regexps
 0-4 0-4;0-4;-;-;-;0-4 0-4
 0-7 0-7;0-7;-;-;-;0-7 0-7
 0-8 0-8;0-8;-;-;-;0-8 0-8
+# ============================================================
+# Category 20: Optional quantifier inside capture group (TDFA bug regression)
+# (https?) — when "s?" does not match, the group end must be after "http", not after ":".
+# Tests that TDFA correctly closes the capture group at the end of the consumed
+# bytes, not at the end of the optional sub-expression's last possible position.
+# ============================================================
+Cat20TDFAOptionalInCapture
+strings
+""
+"http://foo.com"
+"https://bar.com"
+"visit http://foo.com"
+regexps
+"(?P<scheme>https?)://(?P<host>[^/:?# ]+)"
+-;-;-;-
+0-14 0-4 7-14;0-14;-;-
+0-15 0-5 8-15;0-15;-;-
+-;6-20;-;-;;6-20 6-10 13-20
+# ============================================================
+# Category 25: TDFA optional-suffix capture: additional edge cases
+#
+# The root-cause bug: in emitTDFATagOps, non-dead transitions with EMPTY
+# tagOps were absent from the `entries` slice.  When all real (non-empty)
+# entries shared the same ops, allSame=true caused those ops to fire
+# unconditionally — including on bytes that should not modify any register.
+#
+# The fix adds every non-dead byte as an entry (with nil ops when empty),
+# so allSame becomes false whenever any non-dead byte truly has no ops,
+# triggering the majority/minority guard that correctly skips those bytes.
+#
+# Cat25A: (a?)b — simplest possible trigger.
+#   Start state has 'a' (ops: close=pos) and 'b' (no ops, close pre-set=0).
+#   Bug: consuming 'b' fires close=1 instead of keeping close=0.
+#   "b"  → group1 = [0,0];  bug gives [0,1].
+#   "ab" → group1 = [0,1];  correct either way.
+# ============================================================
+Cat25ATDFAOptionalSimple
+strings
+""
+"b"
+"ab"
+"xb"
+"xab"
+regexps
+"(a?)b"
+-;-;-;-
+0-1 0-0;0-1;-;-
+0-2 0-1;0-2;-;-
+-;1-2;-;-;;1-2 1-1
+-;1-3;-;-;;1-3 1-2
+# Cat25B: (ab?)c — optional suffix inside a longer group.
+#   State after consuming 'a' has 'b' (ops: close=pos) and 'c' (no ops).
+#   Bug: consuming 'c' fires close=pos_after_c instead of pos_after_a.
+#   "ac"  → group1 = [0,1];  bug gives [0,2].
+#   "abc" → group1 = [0,2];  correct either way.
+Cat25BTDFAOptionalMultiChar
+strings
+""
+"ac"
+"abc"
+"xac"
+"xabc"
+regexps
+"(ab?)c"
+-;-;-;-
+0-2 0-1;0-2;-;-
+0-3 0-2;0-3;-;-
+-;1-3;-;-;;1-3 1-2
+-;1-4;-;-;;1-4 1-3
+# Cat25C: (a?)b(c?)d — two independent groups with optional suffix.
+#   Tests that the fix applies independently to each group's close tag.
+#   "bd"   → group1=[0,0] group2=[1,1];  bug gives [0,1] [1,2].
+#   "abd"  → group1=[0,1] group2=[2,2];  group1 correct either way.
+#   "bcd"  → group1=[0,0] group2=[1,2];  group2 correct either way.
+#   "abcd" → group1=[0,1] group2=[2,3];  correct either way.
+Cat25CTDFAOptionalTwoGroups
+strings
+""
+"bd"
+"abd"
+"bcd"
+"abcd"
+"xbd"
+regexps
+"(a?)b(c?)d"
+-;-;-;-
+0-2 0-0 1-1;0-2;-;-
+0-3 0-1 2-2;0-3;-;-
+0-3 0-0 1-2;0-3;-;-
+0-4 0-1 2-3;0-4;-;-
+-;1-3;-;-;;1-3 1-1 2-2
+# Cat25D: (ab?c?)d — two consecutive optionals at the tail of one group.
+#   State after consuming 'a' has 'b' and 'c' with same ops (close=pos),
+#   and 'd' with no ops.  allSame=true for {b,c} in old code fires close on
+#   'd' too.  After fix: majority={b,c} (count 2), minority={d,nil} (count 1).
+#   "ad"   → group1=[0,1];  bug gives [0,2].
+#   "abd"  → group1=[0,2] ('b' present, 'c' absent).
+#   "acd"  → group1=[0,2] ('b' absent, 'c' present via b?-skip path).
+#   "abcd" → group1=[0,3].
+Cat25DTDFADoubleOptionalSuffix
+strings
+""
+"ad"
+"abd"
+"acd"
+"abcd"
+"xad"
+regexps
+"(ab?c?)d"
+-;-;-;-
+0-2 0-1;0-2;-;-
+0-3 0-2;0-3;-;-
+0-3 0-2;0-3;-;-
+0-4 0-3;0-4;-;-
+-;1-3;-;-;;1-3 1-2
+# Cat25E: ([abc]?)d — optional char-class with 3 members, then delimiter.
+#   From start: 'a','b','c' all have the same ops (close=pos), 'd' has none.
+#   With old code allSame=true fires close unconditionally.
+#   With fix: majority={a,b,c} (count 3), minority={d,nil} (count 1).
+#   "d"  → group1=[0,0];  bug gives [0,1].
+#   "ad" → group1=[0,1];  correct either way.
+Cat25ETDFAOptionalCharClass
+strings
+""
+"d"
+"ad"
+"bd"
+"cd"
+"xd"
+"xad"
+regexps
+"([abc]?)d"
+-;-;-;-
+0-1 0-0;0-1;-;-
+0-2 0-1;0-2;-;-
+0-2 0-1;0-2;-;-
+0-2 0-1;0-2;-;-
+-;1-2;-;-;;1-2 1-1
+-;1-3;-;-;;1-3 1-2

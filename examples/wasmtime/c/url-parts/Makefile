@@ -11,15 +11,16 @@ FINAL_WASM := final.wasm
 
 all: run
 
-# Step 1 – generate C stub from config
+# Step 1 – generate C stubs from config (produces both stub.h and stub.c)
 stub.h: regexped.yaml
 	$(REGEXPED) generate --config=regexped.yaml
+stub.c: stub.h
 
-generate: stub.h
+generate: stub.h stub.c
 
 # Step 2 – compile C source to WASM
-$(MAIN_WASM): main.c stub.h
-	$(CC) $(CFLAGS) -o $@ main.c
+$(MAIN_WASM): main.c stub.h stub.c
+	$(CC) $(CFLAGS) -o $@ main.c stub.c
 
 build: $(MAIN_WASM)
 
@@ -47,4 +48,4 @@ run: $(FINAL_WASM)
 	wasmtime run $(FINAL_WASM) "nothing here"
 
 clean:
-	rm -f stub.h $(MAIN_WASM) $(REGEX_WASM) $(FINAL_WASM)
+	rm -f stub.h stub.c $(MAIN_WASM) $(REGEX_WASM) $(FINAL_WASM)
