@@ -49,15 +49,25 @@ wasmtime run        →  execute
 
 ## AS stub API
 
-The generated `assembly/stub.ts` exports:
+The generated `stub.ts` exports a single stateless function:
 
-| Function | Description |
+```ts
+export function find_email(input: ArrayBuffer, offset: i32): i32
+```
+
+Scans `input[offset..]` for the next match. Returns the **`dataStart`** pointer of a
+static `Int32Array` slot buffer on match, or `0` if no match is found.
+
+Slot layout (each value is an absolute byte offset into `input`):
+
+| Slot index | Meaning |
 |---|---|
-| `find_email_reset()` | Reset iterator before scanning a new input |
-| `find_email_next(buf: ArrayBuffer): bool` | Advance to the next match; returns false when exhausted |
-| `find_email_group(i: i32): i64` | Packed `(start << 32 \| end)` for group i (0 = full match), or -1 |
-| `find_email_get_user(): i64` | Packed `(start << 32 \| end)` for the `user` group, or -1 |
-| `find_email_get_domain(): i64` | Packed `(start << 32 \| end)` for the `domain` group, or -1 |
+| 0, 1 | full match start, end |
+| 2, 3 | `user` group start, end |
+| 4, 5 | `domain` group start, end |
 
-Positions are byte offsets into the `ArrayBuffer` passed to `find_email_next`.
-Use `String.UTF8.decodeUnsafe(ptr + start, end - start, false)` to extract substrings.
+Read slots with `load<i32>(slots + i * 4)`. The buffer is **static** — copy values
+before the next call. An unmatched optional group has both slots set to `-1`.
+
+Advance `offset` to `matchEnd` (or `matchStart + 1` for zero-length matches) to
+iterate all non-overlapping matches.
