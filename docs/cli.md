@@ -150,16 +150,19 @@ No libc or sysroot required — uses `__attribute__((import_module(...), import_
 
 #### AS stubs (AssemblyScript)
 
-Generates a single AssemblyScript `.ts` file using `@external` declarations and module-level iterator state. Requires `import_module` in config. Must set `stub_type: "as"` — `.ts` extension alone infers TypeScript.
+Generates a single AssemblyScript `.ts` file using `@external` declarations. Requires `import_module` in config. Must set `stub_type: "as"` — `.ts` extension alone infers TypeScript.
 
-Input is `ArrayBuffer` (use `String.UTF8.encode(str)` to convert from string). Group positions are returned as packed `i64` values: `(start << 32 | end)`. Unpack with `i32(<u64>packed >> 32)` for start and `i32(<u32>packed)` for end.
+**`named_groups_func` is not supported for AS stubs.** Use `groups_func` and access slots by index instead.
 
-| Config field | Generated functions | Notes |
+Input is `ArrayBuffer` (use `String.UTF8.encode(str)` to convert from string). All functions are stateless — the caller passes an `offset` argument and no module-level state is mutated.
+
+| Config field | Generated function | Returns |
 |---|---|---|
-| `match_func` | `<func>(input: ArrayBuffer): bool` | True if full input matches |
-| `find_func` | `<func>_next(input): i64` + `<func>_reset()` | Returns packed `(start << 32 \| end)` or -1; call reset before iterating |
-| `groups_func` | `<func>_next(input): bool` + `<func>_reset()` + `<func>_group(i): i64` | Module-level `Int32Array` slot buffer; group(0) = full match |
-| `named_groups_func` | same as groups + `<func>_get_<name>(): i64` per named group | One accessor per named group |
+| `match_func` | `<func>(input: ArrayBuffer): i32` | End position (≥0) or -1 if no match |
+| `find_func` | `<func>(input: ArrayBuffer, offset: i32): i64` | Packed `(absStart << 32 \| absEnd)` or -1 if not found |
+| `groups_func` | `<func>(input: ArrayBuffer, offset: i32): i32` | `dataStart` pointer to static `Int32Array` slots, or 0 on no match |
+
+See [as-api.md](as-api.md) for full usage examples and slot layout.
 
 ---
 

@@ -83,10 +83,7 @@ while (off <= len) {
 
 ---
 
-### `groups_func` / `named_groups_func` — capture groups
-
-Both config fields generate the same C API. Named groups have their `name` field set
-to a public constant; unnamed groups have `name == NULL`.
+### `groups_func` — capture groups
 
 ```c
 const rx_group_t *<func>(const unsigned char *input, unsigned int len, unsigned int offset);
@@ -98,6 +95,10 @@ subsequent entries are capture groups in order.
 
 All entries have `start == -1` and `end == -1` when no match is found starting from
 `offset`.
+
+> **Note:** `named_groups_func` is **not supported** for C stubs — the generator will
+> return an error. Use `groups_func` and identify groups by their index constants
+> (`<FUNC_UPPER>_GROUP_<NAME>`) instead.
 
 **Group name constants** are declared as `extern const char <FUNC_UPPER>_GROUP_<NAME>[]`
 and defined in `stub.c`. Use `==` (pointer identity) for fast group name comparison:
@@ -132,7 +133,7 @@ while (off <= len) {
 | `match_func` | `int <func>(input, len)` | end position `>=0`, or `-1` |
 | `find_func` | `rx_match_t <func>(input, len, offset)` | `{start, end}` absolute, or `{-1,-1}` |
 | `groups_func` | `const rx_group_t *<func>(input, len, offset)` | static array of `rx_group_t` |
-| `named_groups_func` | same as `groups_func` | same, named groups have `name` set |
+| `named_groups_func` | **not supported** — generator returns an error | — |
 
 ---
 

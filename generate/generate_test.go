@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -437,20 +438,15 @@ func TestGenCStubFilesFind(t *testing.T) {
 }
 
 func TestGenCStubFilesGroupsAndNamed(t *testing.T) {
+	// named_groups_func is not supported for C stubs — must return an error.
 	entries := []config.RegexEntry{{
 		GroupsFunc:      "url_groups",
 		NamedGroupsFunc: "url_named",
 		Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
 	}}
-	h, c, err := genCStubFiles(entries, "mymod", "stub.h")
-	if err != nil {
-		t.Fatalf("genCStubFiles groups+named: %v", err)
-	}
-	// When both are set, groups_func takes precedence
-	for _, sub := range []string{"url_groups", "URL_GROUPS_GROUP_SCHEME", "URL_GROUPS_GROUP_HOST"} {
-		if !strings.Contains(h+c, sub) {
-			t.Errorf("genCStubFiles groups+named: missing %q", sub)
-		}
+	_, _, err := genCStubFiles(entries, "mymod", "stub.h")
+	if err == nil {
+		t.Fatal("genCStubFiles groups+named: expected error for named_groups_func, got nil")
 	}
 }
 
@@ -473,17 +469,13 @@ func TestGenCStubFilesSingle(t *testing.T) {
 }
 
 func TestGenCStubFilesWithNamedGroups(t *testing.T) {
+	// named_groups_func is not supported for C stubs — must return an error.
 	entries := []config.RegexEntry{
 		{NamedGroupsFunc: "url_named", Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
 	}
-	h, c, err := genCStubFiles(entries, "mymod", "stub.h")
-	if err != nil {
-		t.Fatalf("genCStubFiles: %v", err)
-	}
-	for _, sub := range []string{"URL_NAMED_GROUP_SCHEME", "URL_NAMED_GROUP_HOST", "url_named"} {
-		if !strings.Contains(h+c, sub) {
-			t.Errorf("genCStubFiles named groups: missing %q", sub)
-		}
+	_, _, err := genCStubFiles(entries, "mymod", "stub.h")
+	if err == nil {
+		t.Fatal("genCStubFiles named groups: expected error for named_groups_func, got nil")
 	}
 }
 
@@ -560,5 +552,157 @@ func TestResolveStubType(t *testing.T) {
 				t.Errorf("ResolveStubType(%+v) = %q, want %q", c.cfg, got, c.want)
 			}
 		}
+	}
+}
+
+func TestGenASMatchStub(t *testing.T) {
+	out := genASMatchStub("mymod", "url_match")
+	for _, sub := range []string{`@external("mymod", "url_match")`, "_ffi_url_match", "export function url_match", "i32"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genASMatchStub: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, "bool") {
+		t.Error("genASMatchStub: must not return bool")
+	}
+}
+
+func TestGenASFindStub(t *testing.T) {
+	out := genASFindStub("mymod", "url_find")
+	for _, sub := range []string{`@external("mymod", "url_find")`, "_ffi_url_find", "export function url_find", "offset: i32", "i64"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genASFindStub: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, "_url_find_off") {
+		t.Error("genASFindStub: must not have module-level offset state")
+	}
+}
+
+func TestGenASGroupsStub(t *testing.T) {
+	out := genASGroupsStub("mymod", "parse_url", "parse_url", 3)
+	for _, sub := range []string{`@external("mymod", "parse_url")`, "_ffi_parse_url", "export function parse_url", "offset: i32", "Int32Array(6)", "dataStart"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genASGroupsStub: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, "_parse_url_off") {
+		t.Error("genASGroupsStub: must not have module-level offset state")
+	}
+}
+
+func TestGenASStubNamedGroupsFuncError(t *testing.T) {
+	entries := []config.RegexEntry{
+		{NamedGroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
+	}
+	_, err := genASStubFile(entries, "mymod")
+	if err == nil {
+		t.Fatal("genASStubFile: expected error for named_groups_func, got nil")
+	}
+}
+
+func TestGenASStubFileGroupsFunc(t *testing.T) {
+	entries := []config.RegexEntry{
+		{GroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
+	}
+	out, err := genASStubFile(entries, "mymod")
+	if err != nil {
+		t.Fatalf("genASStubFile: %v", err)
+	}
+	for _, sub := range []string{"Auto-generated", "find_email", "offset: i32", "Int32Array", "dataStart"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genASStubFile groups_func: missing %q", sub)
+		}
+	}
+}
+
+// TestCmdGenerateStubDispatchers covers the per-type stub dispatcher functions
+// (asStub, cStub, goStub, jsStub, tsStub, rustStub) by passing "-" as the
+// output path, which bypasses file I/O and writes to stdout.
+func TestCmdGenerateStubDispatchers(t *testing.T) {
+	cases := []struct {
+		name     string
+		stubType string
+		cfg      config.BuildConfig
+	}{
+		{
+			name:     "rust",
+			stubType: "rust",
+			cfg: config.BuildConfig{
+				StubType:     "rust",
+				ImportModule: "mymod",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "go",
+			stubType: "go",
+			cfg: config.BuildConfig{
+				StubType:     "go",
+				ImportModule: "mymod",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "js",
+			stubType: "js",
+			cfg: config.BuildConfig{
+				StubType:     "js",
+				ImportModule: "mymod",
+				Output:       "merged.wasm",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "ts",
+			stubType: "ts",
+			cfg: config.BuildConfig{
+				StubType:     "ts",
+				ImportModule: "mymod",
+				Output:       "merged.wasm",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "c",
+			stubType: "c",
+			cfg: config.BuildConfig{
+				StubType:     "c",
+				ImportModule: "mymod",
+				StubFile:     "stub.h",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+		{
+			name:     "as",
+			stubType: "as",
+			cfg: config.BuildConfig{
+				StubType:     "as",
+				ImportModule: "mymod",
+				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := CmdGenerateStub(c.cfg, "-"); err != nil {
+				t.Errorf("CmdGenerateStub(%s): %v", c.stubType, err)
+			}
+		})
+	}
+}
+
+func TestWriteStub(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/sub/out.txt"
+	if err := writeStub(path, []byte("hello")); err != nil {
+		t.Fatalf("writeStub: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("writeStub: got %q, want %q", string(data), "hello")
 	}
 }

@@ -2,7 +2,6 @@ package generate
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/qrdl/regexped/config"
@@ -53,6 +52,10 @@ func genASStubFile(entries []config.RegexEntry, importModule string) (string, er
 
 // genASStubsForEntry generates the AS stub content for a single regex entry.
 func genASStubsForEntry(re config.RegexEntry, importModule string) (string, error) {
+	if re.NamedGroupsFunc != "" {
+		return "", fmt.Errorf("named_groups_func is not supported for AS stubs; use groups_func instead")
+	}
+
 	var out string
 	written := false
 
@@ -64,21 +67,14 @@ func genASStubsForEntry(re config.RegexEntry, importModule string) (string, erro
 		out += genASFindStub(importModule, re.FindFunc)
 		written = true
 	}
-	if re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
-		numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
+	if re.GroupsFunc != "" {
+		numGroups, _, err := extractGroupInfo(re.Pattern)
 		if err != nil {
 			return "", err
 		}
 		exportName := re.GroupsExportName()
-		if re.GroupsFunc != "" {
-			out += genASGroupsStub(importModule, re.GroupsFunc, exportName, true, numGroups)
-			written = true
-		}
-		if re.NamedGroupsFunc != "" {
-			declareFFI := re.GroupsFunc == ""
-			out += genASNamedGroupsStub(importModule, re.NamedGroupsFunc, exportName, declareFFI, numGroups, namedGroups)
-			written = true
-		}
+		out += genASGroupsStub(importModule, re.GroupsFunc, exportName, numGroups)
+		written = true
 	}
 
 	if !written {
@@ -88,119 +84,70 @@ func genASStubsForEntry(re config.RegexEntry, importModule string) (string, erro
 }
 
 // genASMatchStub generates an anchored-match AS stub.
+// Returns end position (≥0) or -1 if no match — mirrors Go and C API.
 func genASMatchStub(importModule, funcName string) string {
 	ffi := "_ffi_" + funcName
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "@external(\"%s\", \"%s\")\n", importModule, funcName)
 	fmt.Fprintf(&sb, "declare function %s(ptr: usize, len: usize): i32;\n\n", ffi)
-	fmt.Fprintf(&sb, "/** Returns true if input matches anchored at the start. */\n")
-	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer): bool {\n", funcName)
-	fmt.Fprintf(&sb, "  return %s(changetype<usize>(input), <usize>input.byteLength) >= 0;\n", ffi)
+	fmt.Fprintf(&sb, "/** Returns end position (≥0) or -1 if no match. */\n")
+	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer): i32 {\n", funcName)
+	fmt.Fprintf(&sb, "  return %s(changetype<usize>(input), <usize>input.byteLength);\n", ffi)
 	sb.WriteString("}\n\n")
 	return sb.String()
 }
 
-// genASFindStub generates a find iterator AS stub with module-level offset state.
+// genASFindStub generates a stateless find AS stub.
+// The caller passes an offset and receives packed (absStart<<32|absEnd) or -1.
 func genASFindStub(importModule, funcName string) string {
 	ffi := "_ffi_" + funcName
-	off := "_" + funcName + "_off"
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "@external(\"%s\", \"%s\")\n", importModule, funcName)
 	fmt.Fprintf(&sb, "declare function %s(ptr: usize, len: usize): i64;\n\n", ffi)
-	fmt.Fprintf(&sb, "let %s: i32 = 0;\n\n", off)
-	fmt.Fprintf(&sb, "/** Resets the %s iterator. Call before the first %s_next(). */\n", funcName, funcName)
-	fmt.Fprintf(&sb, "export function %s_reset(): void { %s = 0; }\n\n", funcName, off)
-	fmt.Fprintf(&sb, "/** Advances to the next match.\n")
-	fmt.Fprintf(&sb, " *  Returns packed (absStart << 32 | absEnd) as i64, or -1 when exhausted. */\n")
-	fmt.Fprintf(&sb, "export function %s_next(input: ArrayBuffer): i64 {\n", funcName)
-	fmt.Fprintf(&sb, "  const len = input.byteLength;\n")
-	fmt.Fprintf(&sb, "  while (%s <= len) {\n", off)
-	fmt.Fprintf(&sb, "    const r = %s(changetype<usize>(input) + <usize>%s, <usize>(len - %s));\n", ffi, off, off)
-	fmt.Fprintf(&sb, "    if (r < 0) { %s = len + 1; return -1; }\n", off)
-	sb.WriteString("    const relStart = i32(<u64>r >> 32);\n")
-	sb.WriteString("    const relEnd   = i32(<u32>r);\n")
-	fmt.Fprintf(&sb, "    const absStart = %s + relStart;\n", off)
-	fmt.Fprintf(&sb, "    const absEnd   = %s + relEnd;\n", off)
-	fmt.Fprintf(&sb, "    %s += relEnd > relStart ? relEnd : relStart + 1;\n", off)
-	sb.WriteString("    return (i64(absStart) << 32) | i64(absEnd);\n")
-	sb.WriteString("  }\n")
-	sb.WriteString("  return -1;\n")
+	fmt.Fprintf(&sb, "/** Finds match starting from offset.\n")
+	fmt.Fprintf(&sb, " *  Returns packed (absStart << 32 | absEnd) as i64, or -1 if not found. */\n")
+	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer, offset: i32): i64 {\n", funcName)
+	sb.WriteString("  const len = input.byteLength;\n")
+	sb.WriteString("  if (offset > len) return -1;\n")
+	fmt.Fprintf(&sb, "  const r = %s(changetype<usize>(input) + <usize>offset, <usize>(len - offset));\n", ffi)
+	sb.WriteString("  if (r < 0) return -1;\n")
+	sb.WriteString("  const relStart = i32(<u64>r >> 32);\n")
+	sb.WriteString("  const relEnd   = i32(<u32>r);\n")
+	sb.WriteString("  return (i64(offset + relStart) << 32) | i64(offset + relEnd);\n")
 	sb.WriteString("}\n\n")
 	return sb.String()
 }
 
-// genASGroupsStub generates a capture-groups iterator AS stub.
-// declareFFI controls whether the @external declaration is emitted.
-func genASGroupsStub(importModule, funcName, exportName string, declareFFI bool, numGroups int) string {
+// genASGroupsStub generates a stateless capture-groups AS stub.
+// Returns the dataStart pointer of a static Int32Array slots buffer, or 0 on no match.
+// Slot layout: [g0_start, g0_end, g1_start, g1_end, ...] as i32 values (absolute offsets).
+func genASGroupsStub(importModule, funcName, exportName string, numGroups int) string {
 	ffi := "_ffi_" + exportName
-	off := "_" + funcName + "_off"
 	slotsVar := "_" + funcName + "_slots"
 	slotCount := numGroups * 2
 
 	var sb strings.Builder
-	if declareFFI {
-		fmt.Fprintf(&sb, "@external(\"%s\", \"%s\")\n", importModule, exportName)
-		fmt.Fprintf(&sb, "declare function %s(ptr: usize, len: usize, out_ptr: usize): i32;\n\n", ffi)
-	}
-	fmt.Fprintf(&sb, "const %s = new Int32Array(%d);\n", slotsVar, slotCount)
-	fmt.Fprintf(&sb, "let %s: i32 = 0;\n\n", off)
-	fmt.Fprintf(&sb, "/** Resets the %s iterator. Call before the first %s_next(). */\n", funcName, funcName)
-	fmt.Fprintf(&sb, "export function %s_reset(): void { %s = 0; }\n\n", funcName, off)
-	fmt.Fprintf(&sb, "/** Advances to the next match; fills the slot buffer.\n")
-	fmt.Fprintf(&sb, " *  Use %s_group(i) to read group i (0 = full match). Returns false when exhausted. */\n", funcName)
-	fmt.Fprintf(&sb, "export function %s_next(input: ArrayBuffer): bool {\n", funcName)
-	fmt.Fprintf(&sb, "  const len = input.byteLength;\n")
-	fmt.Fprintf(&sb, "  while (%s <= len) {\n", off)
-	fmt.Fprintf(&sb, "    %s.fill(-1);\n", slotsVar)
-	fmt.Fprintf(&sb, "    const r = %s(changetype<usize>(input) + <usize>%s, <usize>(len - %s), %s.dataStart);\n", ffi, off, off, slotsVar)
-	fmt.Fprintf(&sb, "    if (r < 0) {\n")
-	fmt.Fprintf(&sb, "      if (%s == len) { %s = len + 1; return false; }\n", off, off)
-	fmt.Fprintf(&sb, "      %s++; continue;\n", off)
-	sb.WriteString("    }\n")
-	fmt.Fprintf(&sb, "    const matchOff = %s;\n", off)
-	fmt.Fprintf(&sb, "    for (let i = 0; i < %d; i++) {\n", slotCount)
-	fmt.Fprintf(&sb, "      if (%s[i] >= 0) %s[i] += matchOff;\n", slotsVar, slotsVar)
-	sb.WriteString("    }\n")
-	fmt.Fprintf(&sb, "    const end = %s[1] >= 0 ? %s[1] : matchOff + 1;\n", slotsVar, slotsVar)
-	fmt.Fprintf(&sb, "    %s = end > matchOff ? end : matchOff + 1;\n", off)
-	sb.WriteString("    return true;\n")
+	fmt.Fprintf(&sb, "@external(\"%s\", \"%s\")\n", importModule, exportName)
+	fmt.Fprintf(&sb, "declare function %s(ptr: usize, len: usize, out_ptr: usize): i32;\n\n", ffi)
+	fmt.Fprintf(&sb, "const %s = new Int32Array(%d);\n\n", slotsVar, slotCount)
+	fmt.Fprintf(&sb, "/** Finds capture match starting from offset.\n")
+	fmt.Fprintf(&sb, " *  Returns dataStart pointer to slots buffer (pairs: start,end per group), or 0 on no match.\n")
+	fmt.Fprintf(&sb, " *  Group 0 is the full match. Unmatched optional groups have start=-1, end=-1.\n")
+	fmt.Fprintf(&sb, " *  Slot layout: [g0_start, g0_end, g1_start, g1_end, ...] as i32 values. */\n")
+	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer, offset: i32): i32 {\n", funcName)
+	sb.WriteString("  const len = input.byteLength;\n")
+	sb.WriteString("  if (offset > len) return 0;\n")
+	fmt.Fprintf(&sb, "  %s.fill(-1);\n", slotsVar)
+	fmt.Fprintf(&sb, "  const r = %s(\n", ffi)
+	sb.WriteString("    changetype<usize>(input) + <usize>offset,\n")
+	sb.WriteString("    <usize>(len - offset),\n")
+	fmt.Fprintf(&sb, "    %s.dataStart,\n", slotsVar)
+	sb.WriteString("  );\n")
+	sb.WriteString("  if (r < 0) return 0;\n")
+	fmt.Fprintf(&sb, "  for (let i = 0; i < %d; i++) {\n", slotCount)
+	fmt.Fprintf(&sb, "    if (%s[i] >= 0) %s[i] += offset;\n", slotsVar, slotsVar)
 	sb.WriteString("  }\n")
-	sb.WriteString("  return false;\n")
-	sb.WriteString("}\n\n")
-	fmt.Fprintf(&sb, "/** Returns packed (start << 32 | end) for group i (0 = full match), or -1 if absent. */\n")
-	fmt.Fprintf(&sb, "export function %s_group(i: i32): i64 {\n", funcName)
-	fmt.Fprintf(&sb, "  const s = %s[i * 2];\n", slotsVar)
-	sb.WriteString("  if (s < 0) return -1;\n")
-	fmt.Fprintf(&sb, "  return (i64(s) << 32) | i64(%s[i * 2 + 1]);\n", slotsVar)
+	fmt.Fprintf(&sb, "  return i32(%s.dataStart);\n", slotsVar)
 	sb.WriteString("}\n\n")
 	return sb.String()
-}
-
-// genASNamedGroupsStub generates a named-capture-groups iterator AS stub.
-// declareFFI controls whether the @external declaration is emitted.
-func genASNamedGroupsStub(importModule, funcName, exportName string, declareFFI bool, numGroups int, namedGroups map[string]int) string {
-	// Iterator body is identical to groups; reuse it.
-	out := genASGroupsStub(importModule, funcName, exportName, declareFFI, numGroups)
-
-	type entry struct {
-		name  string
-		index int
-	}
-	var entries []entry
-	for name, idx := range namedGroups {
-		entries = append(entries, entry{name, idx})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].index < entries[j].index })
-
-	slotsVar := "_" + funcName + "_slots"
-	var sb strings.Builder
-	for _, e := range entries {
-		fmt.Fprintf(&sb, "/** Returns packed (start << 32 | end) for group %q, or -1 if absent. */\n", e.name)
-		fmt.Fprintf(&sb, "export function %s_get_%s(): i64 {\n", funcName, e.name)
-		fmt.Fprintf(&sb, "  const s = %s[%d];\n", slotsVar, e.index*2)
-		sb.WriteString("  if (s < 0) return -1;\n")
-		fmt.Fprintf(&sb, "  return (i64(s) << 32) | i64(%s[%d]);\n", slotsVar, e.index*2+1)
-		sb.WriteString("}\n\n")
-	}
-	return out + sb.String()
 }

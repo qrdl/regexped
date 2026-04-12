@@ -81,6 +81,10 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 
 // genCPartsForEntry generates the .h and .c fragments for one regex entry.
 func genCPartsForEntry(re config.RegexEntry, importModule string) (hPart, cPart string, err error) {
+	if re.NamedGroupsFunc != "" {
+		return "", "", fmt.Errorf("named_groups_func is not supported for C stubs; use groups_func instead")
+	}
+
 	var hb, cb strings.Builder
 
 	if re.MatchFunc != "" {
@@ -91,17 +95,13 @@ func genCPartsForEntry(re config.RegexEntry, importModule string) (hPart, cPart 
 		hb.WriteString(genCFindHPart(re.FindFunc))
 		cb.WriteString(genCFindCPart(importModule, re.FindFunc))
 	}
-	if re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
-		funcName := re.GroupsFunc
-		if funcName == "" {
-			funcName = re.NamedGroupsFunc
-		}
+	if re.GroupsFunc != "" {
 		exportName := re.GroupsExportName()
 		numGroups, namedGroups, e := extractGroupInfo(re.Pattern)
 		if e != nil {
 			return "", "", e
 		}
-		h, c := genCGroupsStubParts(importModule, funcName, exportName, numGroups, namedGroups)
+		h, c := genCGroupsStubParts(importModule, re.GroupsFunc, exportName, numGroups, namedGroups)
 		hb.WriteString(h)
 		cb.WriteString(c)
 	}
@@ -200,7 +200,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	if len(named) > 0 {
 		fmt.Fprintf(&hb, "/* Group name constants for %s */\n", funcName)
 		for _, g := range named {
-			fmt.Fprintf(&hb, "extern const char %s[];\n", cGroupConst(funcName, g.name))
+			fmt.Fprintf(&hb, "extern const char * const %s;\n", cGroupConst(funcName, g.name))
 		}
 		hb.WriteString("\n")
 	}
@@ -225,7 +225,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	if len(named) > 0 {
 		fmt.Fprintf(&cb, "/* Group name constants for %s */\n", funcName)
 		for _, g := range named {
-			fmt.Fprintf(&cb, "const char %s[] = \"%s\";\n", cGroupConst(funcName, g.name), g.name)
+			fmt.Fprintf(&cb, "const char * const %s = \"%s\";\n", cGroupConst(funcName, g.name), g.name)
 		}
 		cb.WriteString("\n")
 	}

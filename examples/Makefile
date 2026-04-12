@@ -1,7 +1,8 @@
 WASMTIME_RUST := wasmtime/rust/url-ipv6 wasmtime/rust/secrets
 WASMTIME_GO   := wasmtime/go/csv wasmtime/go/sql-injection
 WASMTIME_C    := wasmtime/c/url-parts
-WASMTIME      := $(WASMTIME_RUST) $(WASMTIME_GO) $(WASMTIME_C)
+WASMTIME_AS   := wasmtime/as/find-email
+WASMTIME      := $(WASMTIME_RUST) $(WASMTIME_GO) $(WASMTIME_C) $(WASMTIME_AS)
 FASTEDGE	  := fastedge/validate
 OTHER         := browser node workers
 
