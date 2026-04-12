@@ -1491,3 +1491,21 @@ regexps
 0-4 0-4;0-4;-;-;-;0-4 0-4
 0-7 0-7;0-7;-;-;-;0-7 0-7
 0-8 0-8;0-8;-;-;-;0-8 0-8
+# ============================================================
+# Category 20: Optional quantifier inside capture group (TDFA bug regression)
+# (https?) — when "s?" does not match, the group end must be after "http", not after ":".
+# Tests that TDFA correctly closes the capture group at the end of the consumed
+# bytes, not at the end of the optional sub-expression's last possible position.
+# ============================================================
+Cat20TDFAOptionalInCapture
+strings
+""
+"http://foo.com"
+"https://bar.com"
+"visit http://foo.com"
+regexps
+"(?P<scheme>https?)://(?P<host>[^/:?# ]+)"
+-;-;-;-
+0-14 0-4 7-14;0-14;-;-
+0-15 0-5 8-15;0-15;-;-
+-;6-20;-;-;;6-20 6-10 13-20

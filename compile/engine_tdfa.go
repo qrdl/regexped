@@ -832,7 +832,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x20, byte(localState))
 	b = append(b, 0x6A)
 	b = appendTableLoad8u(b, tableMemIdx) // accept[state]
-	b = append(b, 0x04, 0x7F)            // if [i32]: then-branch returns, else-branch leaves i32
+	b = append(b, 0x04, 0x7F)             // if [i32]: then-branch returns, else-branch leaves i32
 	b = emitTDFAAcceptEOF(tt, b, localState, localPos, localCapBase)
 	b = append(b, 0x05)       // else
 	b = append(b, 0x41, 0x7F) // -1
@@ -880,6 +880,28 @@ func emitTDFATagOps(tt *tdfaTable, l *dfaLayout, b []byte,
 			continue
 		}
 		anyHasOps = true
+
+		// Expand entries to include non-dead transitions with empty ops.
+		// Without this, the allSame path would emit ops unconditionally for
+		// ALL non-dead transitions from this state — including those that
+		// have no ops — producing incorrect results.
+		// Example: state with valid bytes 's' (ops: [{1,-1}]) and ':' (no ops);
+		// allSame=true would fire the op on ':' too, overwriting the register.
+		{
+			inEntries := make([]bool, 256)
+			for _, e := range entries {
+				inEntries[e.bv] = true
+			}
+			for bv := 0; bv < 256; bv++ {
+				if inEntries[bv] {
+					continue
+				}
+				transIdx := gs*256 + bv
+				if transIdx < len(tt.dfaTable.transitions) && tt.dfaTable.transitions[transIdx] >= 0 {
+					entries = append(entries, byteOps{bv, nil}) // nil = no ops
+				}
+			}
+		}
 
 		// Check allSame.
 		allSame := true

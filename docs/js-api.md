@@ -42,14 +42,28 @@ await init(wasm);
 ### `match_func` — anchored match
 
 ```js
-export function <func>(input: string | Uint8Array): boolean
+export function <func>(input: string | Uint8Array): [number, boolean]
 ```
 
-Returns `true` if the full input matches the pattern, `false` otherwise. The match is anchored: the pattern must match the entire input from position 0.
+Returns `[endPos, true]` if the pattern matches starting at position 0, or `[0, false]` if no match. `endPos` is the exclusive end position of the match in bytes.
+
+To test whether the full input matches (anchored at both ends):
 
 ```js
-if (url_match('https://example.com/path')) {
+const enc = new TextEncoder();
+const bytes = enc.encode('https://example.com/path');
+const [end, ok] = url_match(bytes);
+if (ok && end === bytes.length) {
     console.log('valid URL');
+}
+```
+
+For start-anchored use cases where the end position matters:
+
+```js
+const [end, ok] = url_match(input);
+if (ok) {
+    console.log('matched first', end, 'bytes');
 }
 ```
 
@@ -137,7 +151,7 @@ if (first?.host) {
 
 | Config field | Generated export | Returns |
 |---|---|---|
-| `match_func` | `function <func>(input)` | `boolean` |
+| `match_func` | `function <func>(input)` | `[number, boolean]` — `[endPos, matched]` |
 | `find_func` | `function* <func>(input)` | generator of `[start, end]` |
 | `groups_func` | `function* <func>(input)` | generator of `Array<[start,end]\|null>` |
 | `named_groups_func` | `function* <func>(input)` | generator of `Object` (name → `[start,end]`) |

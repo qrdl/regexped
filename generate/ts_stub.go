@@ -91,11 +91,13 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 }
 
 func genTSMatchFunc(funcName string) string {
-	return fmt.Sprintf(`// %s — anchored match; returns true if the full input matches.
-export function %s(input: string | Uint8Array): boolean {
+	return fmt.Sprintf(`// %s — anchored match; returns [endPos, true] on match or [0, false] if no match.
+export function %s(input: string | Uint8Array): [number, boolean] {
     const b = _b(input);
     _mem.set(b, 0);
-    return (_exp['%s'] as CallableFunction)(0, b.length) === b.length;
+    const r = (_exp['%s'] as CallableFunction)(0, b.length) as number;
+    if (r < 0) return [0, false];
+    return [r, true];
 }
 
 `, funcName, funcName, funcName)
