@@ -1,0 +1,23 @@
+name: Build
+
+on:
+  push:
+
+jobs:
+  build:
+    name: Build CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build regexped
+        run: go build -o regexped .
+      - name: Run unit tests
+        run: go test ./compile/... ./config/... ./generate/... ./merge/... ./internal/...
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: regexped
+          path: regexped
