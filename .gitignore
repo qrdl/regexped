@@ -46,3 +46,4 @@ examples/**/stub*.*
 examples/**/regex.*s
 Cargo.lock
 wasm-merge
+examples/workers/.wrangler
