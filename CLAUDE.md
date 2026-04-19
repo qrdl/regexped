@@ -388,7 +388,7 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 ## Dependencies
 
-- **Go 1.25.7+**
+- **Go 1.25.9+**
 - **gopkg.in/yaml.v3** — YAML parsing
 - **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (re2test only)
 - **wasm-merge** (external, Binaryen) — for `merge` command and perftest

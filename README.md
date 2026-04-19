@@ -65,7 +65,7 @@ Languages: Rust, Go, C, JavaScript, TypeScript, AssemblyScript.
 
 ## Requirements
 
-- Go 1.25.7+
+- Go 1.25.9+
 - `wasm-merge` from [Binaryen](https://github.com/WebAssembly/binaryen) (for `merge` command)
 
 ## License

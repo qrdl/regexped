@@ -1,6 +1,6 @@
 module github.com/qrdl/regexped/re2test
 
-go 1.25.7
+go 1.25.9
 
 replace github.com/qrdl/regexped => ../
 
