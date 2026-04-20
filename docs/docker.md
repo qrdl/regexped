@@ -2,7 +2,15 @@
 
 The regexped Docker image contains the `regexped` compiler and `wasm-merge` (from Binaryen). It is intended to be used as a command-line tool against a project directory mounted as a volume.
 
-## Building the image
+## Official image
+
+The official image is published on Docker Hub as [`qrdl/regexped`](https://hub.docker.com/r/qrdl/regexped):
+
+```bash
+docker pull qrdl/regexped
+```
+
+## Building the image locally
 
 ```bash
 make docker

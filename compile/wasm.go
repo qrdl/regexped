@@ -24,15 +24,6 @@ func appendDataSegment(out []byte, offset int32, data []byte) []byte {
 	return append(out, data...)
 }
 
-// appendPassiveDataSegment appends a passive data segment (type 1) to out.
-// Passive segments are not automatically initialized; the module's start
-// function copies them into place using memory.init after growing memory.
-func appendPassiveDataSegment(out []byte, data []byte) []byte {
-	out = append(out, 0x01) // passive
-	out = utils.AppendULEB128(out, uint32(len(data)))
-	return append(out, data...)
-}
-
 // dataSegment holds one data segment's target address and raw bytes.
 // Used when building the non-standalone init function (passive segments).
 type dataSegment struct {
@@ -65,42 +56,6 @@ func parseDataSegments(rawData []byte) []dataSegment {
 		segs = append(segs, dataSegment{int32(offset64), data})
 	}
 	return segs
-}
-
-// buildStartFunctionBody builds the WASM function body for the non-standalone
-// memory-init start function. It grows memory by growPages pages and then uses
-// memory.init to copy each passive segment to its target address, followed by
-// data.drop to release the passive segment data.
-func buildStartFunctionBody(segs []dataSegment, growPages int32) []byte {
-	var body []byte
-	body = append(body, 0x00) // no local variable declarations
-
-	// memory.grow(growPages); drop result
-	body = append(body, 0x41) // i32.const
-	body = utils.AppendULEB128(body, uint32(growPages))
-	body = append(body, 0x40, 0x00) // memory.grow memidx=0
-	body = append(body, 0x1a)       // drop
-
-	for i, seg := range segs {
-		// destination address in memory
-		body = append(body, 0x41) // i32.const
-		body = utils.AppendSLEB128(body, seg.offset)
-		// source offset within passive segment (always 0)
-		body = append(body, 0x41, 0x00) // i32.const 0
-		// byte count
-		body = append(body, 0x41) // i32.const
-		body = utils.AppendULEB128(body, uint32(len(seg.data)))
-		// memory.init segidx memidx=0
-		body = append(body, 0xfc, 0x08)
-		body = utils.AppendULEB128(body, uint32(i))
-		body = append(body, 0x00) // memidx
-		// data.drop segidx
-		body = append(body, 0xfc, 0x09)
-		body = utils.AppendULEB128(body, uint32(i))
-	}
-
-	body = append(body, 0x0b) // end
-	return body
 }
 
 func appendString(out []byte, s string) []byte {
@@ -170,9 +125,9 @@ func appendTableStore8(b []byte, tableMemIdx int) []byte {
 // appendDataSegmentMem1 appends an active data segment targeting memory index 1.
 // Uses the multi-memory encoding (type 0x02 + memidx LEB128).
 func appendDataSegmentMem1(out []byte, offset int32, data []byte) []byte {
-	out = append(out, 0x02) // active segment with explicit memory index
+	out = append(out, 0x02)           // active segment with explicit memory index
 	out = utils.AppendULEB128(out, 1) // memory index = 1
-	out = append(out, 0x41) // i32.const
+	out = append(out, 0x41)           // i32.const
 	out = utils.AppendSLEB128(out, offset)
 	out = append(out, 0x0B) // end
 	out = utils.AppendULEB128(out, uint32(len(data)))

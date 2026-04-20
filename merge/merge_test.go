@@ -9,7 +9,6 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-
 func TestModuleNameForWasm(t *testing.T) {
 	cases := []struct {
 		name string

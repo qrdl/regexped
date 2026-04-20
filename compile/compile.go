@@ -13,16 +13,6 @@ import (
 // matchMode controls the generated WASM function's matching behaviour.
 type matchMode int
 
-const (
-	// modeAnchoredMatch generates a function (ptr, len i32) -> i32 that matches
-	// the full input anchored at position 0, returning end position or -1.
-	modeAnchoredMatch matchMode = 0
-
-	// modeFind generates a function (ptr, len i32) -> i64 that scans the input
-	// for the leftmost-longest match, returning packed (start<<32|end) or -1.
-	modeFind matchMode = 1
-)
-
 // EngineType represents the type of regex engine implementation.
 type EngineType byte
 
@@ -179,7 +169,6 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 		}
 		if p.namedGroupsExport != "" {
 			namedWrapperOff = idx
-			idx++
 		}
 	}
 	return

@@ -1,10 +1,6 @@
-GO_SRCS := main.go config/config.go \
-	compile/compile.go compile/selector.go compile/engine_dfa.go \
-	compile/engine_backtrack.go compile/engine_tdfa.go compile/prefix_scan.go \
-	compile/wasm.go compile/mandatory_lit.go generate/generate.go \
-	generate/rust_stub.go merge/merge.go internal/utils/bytes.go
+GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/**/*.go merge/*.go))
 
-.PHONY: re2test perftest examples clean unittest
+.PHONY: re2test perftest examples clean unittest lint fmt
 
 build: regexped
 
@@ -28,6 +24,12 @@ unittest:
 docker: regexped
 	./get_wasm_merge.sh
 	docker build -t regexped .
+
+lint:
+	golangci-lint run -D errcheck
+
+fmt:
+	gofmt -s -w .
 
 clean:
 	rm -f regexped

@@ -807,7 +807,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 
 	// Emit tag ops keyed on (prevState, byte).
 	// At this point pos = exclusive end of consumed byte.
-	b = emitTDFATagOps(tt, l, b, localPrevState, localByte, localPos, localState, localCapBase)
+	b = emitTDFATagOps(tt, b, localPrevState, localByte, localPos, localCapBase)
 
 	// Immediate-accept check.
 	if l.hasImmAccept {
@@ -846,10 +846,10 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 // Dispatches on prevState-1 (0-based) via br_table for O(1) per-byte overhead.
 // localByte holds the current input byte (already saved in a local).
 // localPos holds the current position (after pos++, = exclusive end of consumed byte).
-func emitTDFATagOps(tt *tdfaTable, l *dfaLayout, b []byte,
-	localPrevState, localByte, localPos, localState, localCapBase uint32) []byte {
+func emitTDFATagOps(tt *tdfaTable, b []byte,
+	localPrevState, localByte, localPos, localCapBase uint32) []byte {
 
-	n := tt.dfaTable.numStates
+	n := tt.numStates
 	if n == 0 {
 		return b
 	}
@@ -897,7 +897,7 @@ func emitTDFATagOps(tt *tdfaTable, l *dfaLayout, b []byte,
 					continue
 				}
 				transIdx := gs*256 + bv
-				if transIdx < len(tt.dfaTable.transitions) && tt.dfaTable.transitions[transIdx] >= 0 {
+				if transIdx < len(tt.transitions) && tt.transitions[transIdx] >= 0 {
 					entries = append(entries, byteOps{bv, nil}) // nil = no ops
 				}
 			}
@@ -1101,7 +1101,7 @@ func emitTDFAAcceptEOF(tt *tdfaTable, b []byte, localState, localPos, localCapBa
 // For each accepting state, acceptRegMap tells which local holds each group
 // start/end. pos already equals the exclusive end.
 func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localCapBase uint32) []byte {
-	n := tt.dfaTable.numStates
+	n := tt.numStates
 	if n == 0 {
 		return b
 	}
@@ -1237,7 +1237,7 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	if numRegs <= 1 {
 		return tt
 	}
-	transitions := tt.dfaTable.transitions
+	transitions := tt.transitions
 
 	// ---- Step 1: backwards liveness ----
 	// live[s][r] = register r may be needed on a future path from state s.

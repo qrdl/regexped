@@ -516,7 +516,7 @@ func emitBTInstHandler(
 
 				// memoByte = mem[byteAddr]
 				body = appendTableLoad8u(body, tableMemIdx) // i32.load8_u (memo byte)
-				body = append(body, 0x22)                  // local.tee
+				body = append(body, 0x22)                   // local.tee
 				body = utils.AppendULEB128(body, memoMemoByte)
 
 				// check bit: (memoByte >> (bitIdx & 7)) & 1
@@ -541,9 +541,9 @@ func emitBTInstHandler(
 				body = append(body, 0x20)
 				body = utils.AppendULEB128(body, memoBitIdx)
 				body = append(body, 0x41, 0x07)
-				body = append(body, 0x71)       // i32.and (&7) (shift amount)
-				body = append(body, 0x74)       // i32.shl: 1 << (bitIdx & 7)
-				body = append(body, 0x72)                       // i32.or
+				body = append(body, 0x71)                   // i32.and (&7) (shift amount)
+				body = append(body, 0x74)                   // i32.shl: 1 << (bitIdx & 7)
+				body = append(body, 0x72)                   // i32.or
 				body = appendTableStore8(body, tableMemIdx) // i32.store8 to memo table
 			}
 
