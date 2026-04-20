@@ -18,13 +18,13 @@ func TestPrefixStartsWithLineAnchor(t *testing.T) {
 		pattern string
 		want    bool
 	}{
-		{"^abc", true},        // OpConcat starting with OpBeginLine
-		{`\Aabc`, true},       // OpConcat starting with OpBeginText
-		{"abc", false},        // no anchor
-		{"[a-z]", false},      // OpCharClass
-		{"(^abc)", true},      // OpCapture containing anchor concat
-		{"(abc)", false},      // OpCapture without anchor
-		{"a|^b", false},       // OpAlternate — not handled, returns false
+		{"^abc", true},   // OpConcat starting with OpBeginLine
+		{`\Aabc`, true},  // OpConcat starting with OpBeginText
+		{"abc", false},   // no anchor
+		{"[a-z]", false}, // OpCharClass
+		{"(^abc)", true}, // OpCapture containing anchor concat
+		{"(abc)", false}, // OpCapture without anchor
+		{"a|^b", false},  // OpAlternate — not handled, returns false
 	}
 	for _, c := range cases {
 		re := parse(c.pattern)

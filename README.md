@@ -2,6 +2,7 @@
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/qrdl/regexped)](https://goreportcard.com/report/github.com/qrdl/regexped)
 [![Tests](https://github.com/qrdl/regexped/actions/workflows/ci.yml/badge.svg?query=branch%3Amain)](https://github.com/qrdl/regexped/actions/workflows/ci.yml?query=branch%3Amain)
+[![codecov](https://codecov.io/github/qrdl/regexped/graph/badge.svg)](https://codecov.io/github/qrdl/regexped)
 
 Regexped (pronounced reg-exped, short for REGexp EXPEDited) compiles regular expression patterns into standalone WebAssembly modules. It analyses your patterns, picks the best engine (DFA, TDFA, or Backtracking/BitState), emits WASM bytecode, and generates ready-to-use stubs for Rust, Go, C, JavaScript, TypeScript, and AssemblyScript.
 

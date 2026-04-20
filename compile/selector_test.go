@@ -139,15 +139,15 @@ func TestResolveMemoBudget(t *testing.T) {
 
 func TestPrintAnalysis(t *testing.T) {
 	a := &patternAnalysis{
-		NumInstructions:        42,
-		NumCaptures:            3,
-		NumAlternations:        2,
-		HasLargeCharClass:      true,
-		HasUnicode:             false,
-		HasAnyRune:             true,
-		EstimatedDFAStates:     100,
+		NumInstructions:         42,
+		NumCaptures:             3,
+		NumAlternations:         2,
+		HasLargeCharClass:       true,
+		HasUnicode:              false,
+		HasAnyRune:              true,
+		EstimatedDFAStates:      100,
 		EstimatedDFATransitions: 25600,
-		DFAMemoryEstimateKB:    25,
+		DFAMemoryEstimateKB:     25,
 	}
 	printAnalysis(a) // must not panic
 }

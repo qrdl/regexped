@@ -379,9 +379,9 @@ func TestCompileEmbeddedMode(t *testing.T) {
 
 func TestCompileInvalidPattern(t *testing.T) {
 	cases := []string{
-		"[invalid",   // unclosed character class
-		"(?P<>foo)",  // empty group name
-		"(?Pfoo)",    // malformed named group
+		"[invalid",  // unclosed character class
+		"(?P<>foo)", // empty group name
+		"(?Pfoo)",   // malformed named group
 	}
 	for _, pat := range cases {
 		_, _, err := Compile([]config.RegexEntry{{Pattern: pat, MatchFunc: "m"}}, 0, true)

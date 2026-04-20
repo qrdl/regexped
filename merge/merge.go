@@ -19,6 +19,7 @@ import (
 //
 //	wasm-merge --enable-multimemory --enable-simd <main.wasm> main <regex.wasm> <module> \
 //	           --rename-export-conflicts -o output
+//
 // resolveWasmMerge returns the wasm-merge binary path using the lookup order:
 // config field → $WASM_MERGE env var → "wasm-merge" in $PATH.
 func resolveWasmMerge(cfg config.BuildConfig) string {

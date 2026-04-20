@@ -15,9 +15,9 @@ func TestRegexpMinMaxLen(t *testing.T) {
 	}
 
 	cases := []struct {
-		pattern  string
-		wantMin  int
-		wantMax  int
+		pattern string
+		wantMin int
+		wantMax int
 	}{
 		// OpLiteral
 		{"abc", 3, 3},
