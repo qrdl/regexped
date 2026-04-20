@@ -278,11 +278,21 @@ func TestReverseRegexp(t *testing.T) {
 	})
 
 	t.Run("concat reversed", func(t *testing.T) {
-		re := parse("ab")
+		// a[bc] → OpConcat{OpLiteral['a'], OpCharClass}
+		// reversed → OpConcat{OpCharClass, OpLiteral['a']}
+		re := parse("a[bc]")
 		rev := reverseRegexp(re)
-		if rev.Op == syntax.OpConcat && len(rev.Sub) == 2 {
-			// first sub should be the reversed 'b', second 'a'
-			_ = rev.Sub
+		if rev.Op != syntax.OpConcat {
+			t.Fatalf("expected OpConcat, got %v", rev.Op)
+		}
+		if len(rev.Sub) != 2 {
+			t.Fatalf("expected 2 subs, got %d", len(rev.Sub))
+		}
+		if rev.Sub[0].Op != syntax.OpCharClass {
+			t.Errorf("sub[0] = %v, want OpCharClass", rev.Sub[0].Op)
+		}
+		if rev.Sub[1].Op != syntax.OpLiteral {
+			t.Errorf("sub[1] = %v, want OpLiteral", rev.Sub[1].Op)
 		}
 	})
 
@@ -522,9 +532,28 @@ func TestCmdCompile(t *testing.T) {
 	})
 
 	t.Run("stdout", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		orig := os.Stdout
+		os.Stdout = w
+
 		cfg := config.BuildConfig{Regexes: entries}
-		if err := CmdCompile(cfg, "-"); err != nil {
-			t.Fatalf("CmdCompile stdout: %v", err)
+		compErr := CmdCompile(cfg, "-")
+
+		w.Close()
+		os.Stdout = orig
+
+		if compErr != nil {
+			t.Fatalf("CmdCompile stdout: %v", compErr)
+		}
+		var buf bytes.Buffer
+		if _, err := buf.ReadFrom(r); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.HasPrefix(buf.Bytes(), wasmMagic) {
+			t.Error("stdout output is not valid WASM")
 		}
 	})
 }
