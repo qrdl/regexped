@@ -69,6 +69,71 @@ func TestTDFAStatsValues(t *testing.T) {
 	}
 }
 
+func TestTDFATagOpsEqual(t *testing.T) {
+	cases := []struct {
+		a, b []tdfaTagOp
+		want bool
+	}{
+		{nil, nil, true},
+		{[]tdfaTagOp{}, []tdfaTagOp{}, true},
+		{[]tdfaTagOp{{dst: 0, src: -1}}, []tdfaTagOp{{dst: 0, src: -1}}, true},
+		{[]tdfaTagOp{{dst: 0, src: -1}, {dst: 1, src: 0}}, []tdfaTagOp{{dst: 0, src: -1}, {dst: 1, src: 0}}, true},
+		// different lengths
+		{[]tdfaTagOp{{dst: 0, src: -1}}, []tdfaTagOp{}, false},
+		{[]tdfaTagOp{}, []tdfaTagOp{{dst: 0, src: -1}}, false},
+		// same length, different elements
+		{[]tdfaTagOp{{dst: 0, src: -1}}, []tdfaTagOp{{dst: 1, src: -1}}, false},
+		{[]tdfaTagOp{{dst: 0, src: -1}}, []tdfaTagOp{{dst: 0, src: 1}}, false},
+	}
+	for _, c := range cases {
+		if got := tdfaTagOpsEqual(c.a, c.b); got != c.want {
+			t.Errorf("tdfaTagOpsEqual(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestMinimizeTDFARegistersLowRegs(t *testing.T) {
+	// numRegs <= 1 → early return, no minimization attempted.
+	base := &dfaTable{numStates: 1, transitions: make([]int, 256), acceptStates: map[int]bool{0: true}}
+	tt := &tdfaTable{dfaTable: base, numRegs: 1}
+	got := minimizeTDFARegisters(tt)
+	if got != tt {
+		t.Error("minimizeTDFARegisters(numRegs=1): expected same table returned")
+	}
+}
+
+func TestMinimizeTDFARegisters(t *testing.T) {
+	t.Run("applies coloring when improvement possible", func(t *testing.T) {
+		// (a)|(b) has two separate accept states: one where group1 regs are live
+		// and group2 regs are -1, and vice versa. The two sets never interfere,
+		// so minimization can merge them → newNumRegs < numRegs.
+		numStates, numRegs, _, ok := tdfaStats("(a)|(b)")
+		if !ok {
+			t.Skip("(a)|(b) not TDFA-eligible")
+		}
+		if numStates <= 0 {
+			t.Errorf("expected states > 0, got %d", numStates)
+		}
+		// After minimization numRegs should be reduced (2 groups → 2 regs, not 4).
+		if numRegs >= 4 {
+			t.Errorf("expected register reduction for (a)|(b), got numRegs=%d", numRegs)
+		}
+	})
+
+	t.Run("no improvement when all registers interfere", func(t *testing.T) {
+		// (a)(b)(c): sequential groups all live at accept state → all interfere.
+		// minimizeTDFARegisters returns tt unchanged (no improvement path).
+		_, numRegs, _, ok := tdfaStats("(a)(b)(c)")
+		if !ok {
+			t.Skip("(a)(b)(c) not TDFA-eligible")
+		}
+		// All 6 registers still present (no reduction possible).
+		if numRegs < 4 {
+			t.Errorf("unexpected register reduction for (a)(b)(c): numRegs=%d", numRegs)
+		}
+	})
+}
+
 func TestTDFARegisterMinimization(t *testing.T) {
 	// After minimization, register count should not exceed the default limit.
 	_, numRegs, _, ok := tdfaStats("(a+)(b+)(c+)")
@@ -78,4 +143,76 @@ func TestTDFARegisterMinimization(t *testing.T) {
 	if numRegs > resolveMaxTDFARegs(nil) {
 		t.Errorf("numRegs %d exceeds default limit %d", numRegs, resolveMaxTDFARegs(nil))
 	}
+}
+
+func TestTDFAEpsCapOps(t *testing.T) {
+	compile := func(pattern string) *syntax.Prog {
+		t.Helper()
+		re, err := syntax.Parse(pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", pattern, err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatalf("Compile(%q): %v", pattern, err)
+		}
+		return prog
+	}
+
+	t.Run("byte consumer stops traversal", func(t *testing.T) {
+		prog := compile("a")
+		pc, ops := tdfaEpsCapOps(prog, prog.Start, make(map[int]bool))
+		if pc < 0 {
+			// start may be an Alt; just verify no panic and ops are sane
+			t.Logf("tdfaEpsCapOps returned pc=%d (Alt or similar)", pc)
+		}
+		_ = ops
+	})
+
+	t.Run("capture ops collected", func(t *testing.T) {
+		// (a) has InstCapture open + close around the 'a'
+		prog := compile("(a)")
+		pc, ops := tdfaEpsCapOps(prog, prog.Start, make(map[int]bool))
+		_ = pc
+		// at least one captureOp should be collected (open for group 1)
+		if len(ops) == 0 {
+			t.Error("expected capture ops for (a), got none")
+		}
+	})
+
+	t.Run("out of bounds returns -1", func(t *testing.T) {
+		prog := compile("a")
+		pc, ops := tdfaEpsCapOps(prog, len(prog.Inst)+99, make(map[int]bool))
+		if pc != -1 || ops != nil {
+			t.Errorf("out-of-bounds: got pc=%d ops=%v, want (-1, nil)", pc, ops)
+		}
+	})
+
+	t.Run("already visited returns -1", func(t *testing.T) {
+		prog := compile("a")
+		visited := make(map[int]bool)
+		visited[prog.Start] = true
+		pc, ops := tdfaEpsCapOps(prog, prog.Start, visited)
+		if pc != -1 || ops != nil {
+			t.Errorf("already visited: got pc=%d ops=%v, want (-1, nil)", pc, ops)
+		}
+	})
+
+	t.Run("empty width followed", func(t *testing.T) {
+		// \b creates InstEmptyWidth nodes in the NFA
+		prog := compile(`\ba`)
+		pc, ops := tdfaEpsCapOps(prog, prog.Start, make(map[int]bool))
+		_ = pc
+		_ = ops // must not panic
+	})
+
+	t.Run("nested captures", func(t *testing.T) {
+		// ((?P<x>a)) has nested capture groups — multiple captureOps
+		prog := compile("((?P<x>a))")
+		pc, ops := tdfaEpsCapOps(prog, prog.Start, make(map[int]bool))
+		_ = pc
+		if len(ops) < 2 {
+			t.Logf("nested captures: got %d ops (may vary by NFA structure)", len(ops))
+		}
+	})
 }

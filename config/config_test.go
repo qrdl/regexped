@@ -106,3 +106,64 @@ func TestLoadConfigPathResolution(t *testing.T) {
 		t.Errorf("Output = %q, want %q", cfg.Output, filepath.Join(dir, "final.wasm"))
 	}
 }
+
+func TestLoadConfigWasmMergeResolution(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name      string
+		wasmMerge string
+		want      string
+	}{
+		{"relative path", "tools/wasm-merge", filepath.Join(dir, "tools/wasm-merge")},
+		{"bare command", "wasm-merge", filepath.Join(dir, "wasm-merge")},
+		{"absolute path", "/usr/local/bin/wasm-merge", "/usr/local/bin/wasm-merge"},
+		{"home relative", "~/bin/wasm-merge", "~/bin/wasm-merge"},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			yaml := "wasm_merge: " + c.wasmMerge + "\nregexes:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+			if c.wasmMerge == "" {
+				yaml = "regexes:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+			}
+			path := filepath.Join(dir, "regexped.yaml")
+			if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if cfg.WasmMerge != c.want {
+				t.Errorf("WasmMerge = %q, want %q", cfg.WasmMerge, c.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigNotFound(t *testing.T) {
+	_, err := LoadConfig("/nonexistent/path/regexped.yaml")
+	if err == nil {
+		t.Fatal("expected error for non-existent config file, got nil")
+	}
+}
+
+func TestResolveFilePath(t *testing.T) {
+	base := "/home/user/project"
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"", ""},
+		{"/absolute/path", "/absolute/path"},
+		{"~/bin/tool", "~/bin/tool"},
+		{"relative/file", "/home/user/project/relative/file"},
+		{"bare.wasm", "/home/user/project/bare.wasm"},
+	}
+	for _, c := range cases {
+		got := resolveFilePath(base, c.path)
+		if got != c.want {
+			t.Errorf("resolveFilePath(%q, %q) = %q, want %q", base, c.path, got, c.want)
+		}
+	}
+}

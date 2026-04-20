@@ -47,3 +47,5 @@ examples/**/regex.*s
 Cargo.lock
 wasm-merge
 examples/workers/.wrangler
+node_modules
+package-lock.json

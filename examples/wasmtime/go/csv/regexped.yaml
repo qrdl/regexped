@@ -1,4 +1,3 @@
-wasm_merge:    "../../../../../binaryen/bin/wasm-merge"
 output:        "final.wasm"
 wasm_file:     "csv_regex.wasm"
 import_module: "csvregex"

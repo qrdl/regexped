@@ -84,7 +84,7 @@ regexped/
 Parses YAML configuration files. Schema:
 
 ```yaml
-wasm_merge: "path/to/wasm-merge"  # optional, defaults to $PATH
+wasm_merge: "path/to/wasm-merge"  # optional; defaults to $WASM_MERGE env var, then wasm-merge in $PATH
 output:   "merged.wasm"           # output path for merge command; overridable with -o/--output
 wasm_dir: "."                     # default output directory for compiled WASM files; overridable with -d/--out-dir
 stub_file: "src/stubs.rs"         # default stub output file (Rust or JS); per-entry overrides
@@ -299,8 +299,7 @@ Each pattern is compiled and tested for:
 ### Performance benchmarks (`perftest/`)
 
 ```bash
-make perftest                                  # from repo root
-make perftest WASM_MERGE=/path/to/wasm-merge  # custom wasm-merge
+make perftest   # from repo root
 # or
 make run        # from perftest/
 ```

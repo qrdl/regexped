@@ -77,24 +77,12 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	cfg.Output = resolveFilePath(configDir, cfg.Output)
 	cfg.WasmFile = resolveFilePath(configDir, cfg.WasmFile)
 	cfg.StubFile = resolveFilePath(configDir, cfg.StubFile)
-	cfg.WasmMerge = resolveRelative(configDir, cfg.WasmMerge)
+	cfg.WasmMerge = resolveFilePath(configDir, cfg.WasmMerge)
 
 	return cfg, nil
 }
 
-// resolveRelative resolves path relative to base, unless path is empty,
-// already absolute, starts with "~/" (home-relative), or is a bare command
-// name with no path separator (kept as-is for PATH lookup, e.g. "wasm-merge").
-func resolveRelative(base, path string) string {
-	if path == "" || filepath.IsAbs(path) || strings.HasPrefix(path, "~/") ||
-		!strings.ContainsRune(path, '/') {
-		return path
-	}
-	return filepath.Join(base, path)
-}
-
 // resolveFilePath resolves path relative to base unless path is empty or absolute.
-// Unlike resolveRelative, bare filenames (with no path separator) are also resolved.
 func resolveFilePath(base, path string) string {
 	if path == "" || filepath.IsAbs(path) || strings.HasPrefix(path, "~/") {
 		return path

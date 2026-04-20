@@ -94,11 +94,35 @@ func TestIsAnchoredFind(t *testing.T) {
 		{"\\Afoo", true},
 		{"foo", false},
 		{"foo.*bar", false},
+		// Multiline ^ matches at start-of-line (after \n), not just start-of-input →
+		// hasNewlineBoundary=true and midStartNewline can match → not anchored.
+		{"(?m:^foo)", false},
+		// Word boundary: \bfoo can match anywhere after a word boundary → not anchored.
+		{`\bfoo`, false},
 	}
 	for _, c := range cases {
 		tab := compileTestDFA(t, c.pattern, false)
 		if got := isAnchoredFind(tab); got != c.want {
 			t.Errorf("isAnchoredFind(%q) = %v, want %v", c.pattern, got, c.want)
+		}
+	}
+}
+
+func TestDFATableBytes(t *testing.T) {
+	cases := []struct {
+		numStates int
+		want      int
+	}{
+		{1, 2 * 257},     // u8: n=2
+		{5, 6 * 257},     // u8: n=6
+		{255, 256 * 257}, // u8: n=256, boundary
+		{256, 257 * 513}, // u16: n=257, just over boundary
+		{300, 301 * 513}, // u16: n=301
+	}
+	for _, c := range cases {
+		got := dfaTableBytes(&dfaTable{numStates: c.numStates})
+		if got != c.want {
+			t.Errorf("dfaTableBytes(numStates=%d) = %d, want %d", c.numStates, got, c.want)
 		}
 	}
 }

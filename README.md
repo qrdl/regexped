@@ -51,13 +51,22 @@ See [docs/docker.md](docs/docker.md) for full Docker usage and workflow examples
 ## Documentation
 
 - [CLI reference](docs/cli.md) — commands, flags, config schema, pattern support
-- [Rust API](docs/rust-api.md) — generated Rust function signatures and iterator usage
-- [Go API](docs/go-api.md) — generated Go stubs (`//go:wasmimport`, `iter.Seq2`, `iter.Seq`)
+
+**Languages**
+- [Rust API](docs/rust-api.md) — generated Rust stubs
+- [Go API](docs/go-api.md) — generated Go stubs
 - [JavaScript API](docs/js-api.md) — generated JS ES module and generator functions
 - [TypeScript API](docs/ts-api.md) — generated TS ES module with typed generator functions
 - [AssemblyScript API](docs/as-api.md) — generated AS module with typed iterator classes
 - [C API](docs/c-api.md) — generated C header with static iterator functions
-- [Browser embedding](docs/browser.md) — loading WASM in the browser, JS/TS stub workflow
+
+**Environments**
+- [Browser embedding](docs/browser.md) — standalone WASM, JS/TS stub, no merge needed
+- [Node.js](docs/node.md) — standalone WASM, TypeScript stub, `readFileSync` + `init()`
+- [Cloudflare Workers](docs/workers.md) — standalone WASM, JS module import, isolate-level init
+- [Gcore FastEdge](docs/fastedge.md) — embedded WASM, Rust stubs, merge workflow
+
+**Internals**
 - [Engines](docs/engines.md) — DFA, TDFA, Backtracking, engine selection
 - [RE2 test coverage](docs/re2.md) — pass/skip counts per engine and skip reasons
 - [WASM internals](docs/wasm.md) — WASM interface, memory layout, table formats

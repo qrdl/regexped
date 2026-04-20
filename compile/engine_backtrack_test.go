@@ -3,6 +3,8 @@ package compile
 import (
 	"regexp/syntax"
 	"testing"
+
+	"github.com/qrdl/regexped/config"
 )
 
 func compileBTTestProg(t *testing.T, pattern string) *syntax.Prog {
@@ -88,6 +90,67 @@ func TestBtMemoMaxLenFor(t *testing.T) {
 	if maxLen != expected {
 		t.Errorf("btMemoMaxLenFor: got %d, want %d", maxLen, expected)
 	}
+}
+
+func TestBtFoldRune(t *testing.T) {
+	cases := []struct {
+		r    rune
+		want rune
+	}{
+		{'a', 'A'}, {'z', 'Z'}, {'m', 'M'}, // lowercase → uppercase
+		{'A', 'a'}, {'Z', 'z'}, {'M', 'm'}, // uppercase → lowercase
+		{'1', '1'}, {'!', '!'}, {' ', ' '}, // other → unchanged
+	}
+	for _, c := range cases {
+		if got := btFoldRune(c.r); got != c.want {
+			t.Errorf("btFoldRune(%q) = %q, want %q", c.r, got, c.want)
+		}
+	}
+}
+
+func TestBtCheckRune1CaseFold(t *testing.T) {
+	// (?i:a) compiled with BT engine exercises btCheckRune1 with isFold=true.
+	_, _, err := compileForced(
+		[]config.RegexEntry{{Pattern: "(?i:a)", GroupsFunc: "g"}},
+		0, true, EngineBacktrack,
+	)
+	if err != nil {
+		t.Fatalf("compileForced((?i:a) BT): %v", err)
+	}
+}
+
+func TestLoopCaptureLocals(t *testing.T) {
+	t.Run("captures inside loop", func(t *testing.T) {
+		// (a)+ has a greedy loop with a capture group inside — loopCaptureLocals
+		// should find the capture locals for that loop.
+		prog := compileBTTestProg(t, "(a)+")
+		bt := newBacktrack(prog)
+		if len(bt.loops) == 0 {
+			t.Skip("no loops found in (a)+")
+		}
+		foundCapture := false
+		for pc := range bt.loops {
+			locals := loopCaptureLocals(prog, pc)
+			if len(locals) > 0 {
+				foundCapture = true
+			}
+		}
+		if !foundCapture {
+			t.Error("loopCaptureLocals: expected capture locals for (a)+, got none")
+		}
+	})
+
+	t.Run("no captures inside loop", func(t *testing.T) {
+		// (?:a)+ has a loop but no captures — loopCaptureLocals should return nil.
+		prog := compileBTTestProg(t, "(?:a)+")
+		bt := newBacktrack(prog)
+		for pc := range bt.loops {
+			locals := loopCaptureLocals(prog, pc)
+			if len(locals) != 0 {
+				t.Errorf("loopCaptureLocals: expected nil for (?:a)+, got %v", locals)
+			}
+		}
+	})
 }
 
 func TestBtAllocSizes(t *testing.T) {
