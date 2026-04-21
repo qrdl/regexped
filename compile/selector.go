@@ -13,12 +13,8 @@ import (
 // The optional CompileOptions parameter can customize DFA selection thresholds.
 // When omitted, uses sensible defaults (1000 states, 100KB memory limit).
 //
-// hadCapturesBeforeSimplify indicates if the original pattern had capture groups before
-// Simplify() optimization. This is needed because Simplify() may remove {0} quantifiers
-// but we still need to track unset capture groups in the output.
-//
 // Returns the recommended EngineType for the given pattern.
-func selectBestEngine(prog *syntax.Prog, hadCapturesBeforeSimplify bool, opts *CompileOptions) EngineType {
+func selectBestEngine(prog *syntax.Prog, opts *CompileOptions) EngineType {
 	// Analyse pattern complexity and DFA viability
 	analysis := analysePattern(prog)
 

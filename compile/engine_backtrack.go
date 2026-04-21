@@ -172,8 +172,8 @@ func loopCaptureLocals(prog *syntax.Prog, loopPC int) []uint32 {
 	return locals
 }
 
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, memoMaxLen int32, useMemo bool, tableMemIdx int) []byte {
-	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen, useMemo, tableMemIdx)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
+	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -182,7 +182,7 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // The caller (wrapper) has already located the match extent via find_internal and
 // passes a bounded slice (ptr=match_start, len=match_length). This function runs
 // Phase 2 NFA only — no Phase 1 DFA traversal.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool, tableMemIdx int) []byte {
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 	numCaps := bt.numGroups
@@ -401,7 +401,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackBase, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nil, nil, tableMemIdx)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nil, nil, tableMemIdx)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -431,7 +431,7 @@ func emitBTInstHandler(
 	loopLocalIdx map[int]uint32,
 	loopSnapBase map[int]uint32,
 	loopSnapLocals map[int][]uint32,
-	stackBase, stackLimit, frameSize int32,
+	stackLimit, frameSize int32,
 	numCapLocals int,
 	memoTableBase int32,
 	memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte uint32,
@@ -1403,7 +1403,7 @@ func buildBTInnerDisp(
 		body = emitBTInstHandler(
 			body, bt, p, inst, brRun,
 			loopLocalIdx, emptySnapBase, emptySnapLocals,
-			stackBase, stackLimit, frameSize, numCapLocals,
+			stackLimit, frameSize, numCapLocals,
 			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
 			useMemo,
 			true,
@@ -1421,8 +1421,8 @@ func buildBTInnerDisp(
 // appendBTMatchCodeEntry appends a size-prefixed no-capture BT match body.
 // Signature: (ptr i32, len i32) → i32
 // Returns match end position (≥ 0) on success, -1 on failure.
-func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool, tableMemIdx int) []byte {
-	body := buildBTMatchBody(bt, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen, useMemo, tableMemIdx)
+func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
+	body := buildBTMatchBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -1438,7 +1438,7 @@ func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, fra
 // The fake_out_ptr at index 2 aligns the remaining locals with the package-level
 // constants (localPos=3, localSP=4, localState=5, localScratch=6) so all
 // existing helper functions (btFail, btSetStateAndBr, etc.) can be reused.
-func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool, tableMemIdx int) []byte {
+func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 
@@ -1589,8 +1589,8 @@ func emitBTMemoZeroInitTrimmed(body []byte, memoTableBase int32, N int,
 // Signature: (ptr i32, len i32) → i64
 // Returns (start << 32 | end) on match, -1 on no match.
 func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams,
-	stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool, mandLit *mandatoryLit, tableMemIdx int) []byte {
-	body := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen, useMemo, tableMemIdx)
+	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, mandLit *mandatoryLit, tableMemIdx int) []byte {
+	body := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -1609,7 +1609,7 @@ func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams
 // mandatory literal, inner loop runs BT attempts in the resulting window.
 // scanParams is ignored when mandLit != nil (the mandatory-lit prefix scan replaces it).
 func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandatoryLit,
-	stackBase, stackLimit, frameSize, memoTableBase, memoMaxLen int32, useMemo bool, tableMemIdx int) []byte {
+	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 
