@@ -49,3 +49,4 @@ wasm-merge
 examples/workers/.wrangler
 node_modules
 package-lock.json
+plans/
