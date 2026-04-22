@@ -15,8 +15,8 @@ type BuildConfig struct {
 	Output       string       `yaml:"output"`         // output path for merge command; overridable with -o
 	WasmFile     string       `yaml:"wasm_file"`      // output WASM file for compile command; overridable with -o
 	ImportModule string       `yaml:"import_module"`  // WASM import module name used by wasm-merge and Rust FFI
-	StubFile     string       `yaml:"stub_file"`      // stub output file (Rust, JS, or TS)
-	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "js", "ts"; inferred from stub_file extension if absent
+	StubFile     string       `yaml:"stub_file"`      // stub output file (Rust, Go, JS, TS, AS, or C)
+	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
 	MaxDFAStates int          `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int          `yaml:"max_tdfa_regs"`  // 0 = default (32)
 	Regexes      []RegexEntry `yaml:"regexes"`

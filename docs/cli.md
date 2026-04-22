@@ -207,7 +207,7 @@ This command is a thin wrapper around `wasm-merge`. You may invoke wasm-merge di
 
 ```
 wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk-memory-opt \
-  <regex.wasm> <module_name> ... <main.wasm> main \
+  <main.wasm> main <regex.wasm> <module_name> ... \
   --rename-export-conflicts -o output.wasm
 ```
 

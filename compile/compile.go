@@ -772,8 +772,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 }
 
 // Compile compiles multiple regex patterns to a single WASM module.
-//   - standalone=false: module declares its own memory, no export (for embedding via wasm-merge)
-//   - standalone=true:  module declares its own memory and exports it as "memory" (for testing/standalone use)
+//   - standalone=false: module imports "main" memory as memory[0] (input) and declares its own memory for DFA tables (becomes memory[1] after wasm-merge)
+//   - standalone=true:  module declares its own memory and exports it as "memory" (for JS/TS/browser direct use)
 //   - tableBase: starting address for DFA/capture tables within the module's memory; use 0 for
 //     embedded modules (tables start at address 0 of own memory). Callers like re2test/perftest
 //     pass a non-zero value to reserve low pages for their own test input buffers.
@@ -816,8 +816,8 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 
 // CmdCompile compiles all regex patterns from cfg to a single WASM module.
 // output is the output path (absolute, relative to cwd, or "-" for stdout).
-// The module declares its own memory (tables start at address 0) and does not
-// import memory from any host; use regexped merge to embed it.
+// Mode is auto-selected from cfg.Output: empty → standalone (own memory, exported as "memory");
+// non-empty → embedded (imports "main" memory + own memory for tables, for use with regexped merge).
 func CmdCompile(cfg config.BuildConfig, output string) error {
 	outPath := output
 	slog.Info("Compiling regexes", "count", len(cfg.Regexes), "output", outPath)

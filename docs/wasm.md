@@ -16,7 +16,9 @@ Each regex WASM module exports one or more functions depending on which `_func` 
 (func $groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (result i32))
 ```
 
-Each regex WASM module declares its **own memory** (memory index 0 within the module). It does not import memory from any host. When embedded via `regexped merge`, `wasm-merge` renumbers the memories so the host retains memory 0 and the regex module's memory becomes memory 1 (or higher). All memory instructions within the regex module still reference index 0 — wasm-merge updates the references automatically during merge.
+**Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regex WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regex module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
+
+**Standalone mode** (produced when `output` is absent, for JS/TS/browser direct load): the regex WASM declares and exports its own single memory as `"memory"` (`memory[0]`). No import.
 
 For standalone use (JS/TS/browser), the compiled WASM is used directly with no merging. Memory index 0 is exported as `"memory"` so the JS host can read input/output.
 

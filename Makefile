@@ -1,4 +1,4 @@
-GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/**/*.go merge/*.go))
+GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/*/*.go merge/*.go))
 
 .PHONY: re2test perftest examples clean unittest lint fmt
 

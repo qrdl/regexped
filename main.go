@@ -1,4 +1,4 @@
-// Command regexped compiles regex patterns to WASM DFA match functions.
+// Command regexped compiles regex patterns to WASM match functions.
 //
 // Usage:
 //
