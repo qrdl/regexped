@@ -27,16 +27,16 @@ jobs:
         uses: github/codeql-action/init@v3
         with:
           languages: go
-          build-mode: manual
 
-      - name: Build
-        run: go test -run='^$' ./...
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
+          category: "/language:go"
           output: sarif-results
-          upload: false
+          upload: failure-only
 
       - name: Filter SARIF
         uses: advanced-security/filter-sarif@v1
