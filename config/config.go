@@ -15,8 +15,8 @@ type BuildConfig struct {
 	Output       string       `yaml:"output"`         // output path for merge command; overridable with -o
 	WasmFile     string       `yaml:"wasm_file"`      // output WASM file for compile command; overridable with -o
 	ImportModule string       `yaml:"import_module"`  // WASM import module name used by wasm-merge and Rust FFI
-	StubFile     string       `yaml:"stub_file"`      // stub output file (Rust, JS, or TS)
-	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "js", "ts"; inferred from stub_file extension if absent
+	StubFile     string       `yaml:"stub_file"`      // stub output file (Rust, Go, JS, TS, AS, or C)
+	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
 	MaxDFAStates int          `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int          `yaml:"max_tdfa_regs"`  // 0 = default (32)
 	Regexes      []RegexEntry `yaml:"regexes"`
@@ -77,24 +77,12 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	cfg.Output = resolveFilePath(configDir, cfg.Output)
 	cfg.WasmFile = resolveFilePath(configDir, cfg.WasmFile)
 	cfg.StubFile = resolveFilePath(configDir, cfg.StubFile)
-	cfg.WasmMerge = resolveRelative(configDir, cfg.WasmMerge)
+	cfg.WasmMerge = resolveFilePath(configDir, cfg.WasmMerge)
 
 	return cfg, nil
 }
 
-// resolveRelative resolves path relative to base, unless path is empty,
-// already absolute, starts with "~/" (home-relative), or is a bare command
-// name with no path separator (kept as-is for PATH lookup, e.g. "wasm-merge").
-func resolveRelative(base, path string) string {
-	if path == "" || filepath.IsAbs(path) || strings.HasPrefix(path, "~/") ||
-		!strings.ContainsRune(path, '/') {
-		return path
-	}
-	return filepath.Join(base, path)
-}
-
 // resolveFilePath resolves path relative to base unless path is empty or absolute.
-// Unlike resolveRelative, bare filenames (with no path separator) are also resolved.
 func resolveFilePath(base, path string) string {
 	if path == "" || filepath.IsAbs(path) || strings.HasPrefix(path, "~/") {
 		return path

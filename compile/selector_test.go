@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"regexp/syntax"
 	"testing"
 )
 
@@ -102,4 +103,106 @@ func TestSelectEngine(t *testing.T) {
 			t.Errorf("SelectEngine(%q) = %v, want %v", c.pattern, got, c.want)
 		}
 	}
+}
+
+func TestResolveMaxDFAMemory(t *testing.T) {
+	cases := []struct {
+		opts *CompileOptions
+		want int
+	}{
+		{nil, 0},
+		{&CompileOptions{}, 0},
+		{&CompileOptions{MaxDFAMemory: 1024}, 1024},
+	}
+	for _, c := range cases {
+		if got := resolveMaxDFAMemory(c.opts); got != c.want {
+			t.Errorf("resolveMaxDFAMemory(%v) = %d, want %d", c.opts, got, c.want)
+		}
+	}
+}
+
+func TestResolveMemoBudget(t *testing.T) {
+	cases := []struct {
+		opts *CompileOptions
+		want int
+	}{
+		{nil, 128 * 1024},
+		{&CompileOptions{}, 128 * 1024},
+		{&CompileOptions{MemoBudget: 65536}, 65536},
+	}
+	for _, c := range cases {
+		if got := resolveMemoBudget(c.opts); got != c.want {
+			t.Errorf("resolveMemoBudget(%v) = %d, want %d", c.opts, got, c.want)
+		}
+	}
+}
+
+func TestPrintAnalysis(t *testing.T) {
+	a := &patternAnalysis{
+		NumInstructions:         42,
+		NumCaptures:             3,
+		NumAlternations:         2,
+		HasLargeCharClass:       true,
+		HasUnicode:              false,
+		HasAnyRune:              true,
+		EstimatedDFAStates:      100,
+		EstimatedDFATransitions: 25600,
+		DFAMemoryEstimateKB:     25,
+	}
+	printAnalysis(a) // must not panic
+}
+
+func TestGetFirstRuneSet(t *testing.T) {
+	compile := func(pattern string) *syntax.Prog {
+		t.Helper()
+		re, err := syntax.Parse(pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", pattern, err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatalf("Compile(%q): %v", pattern, err)
+		}
+		return prog
+	}
+
+	t.Run("single rune", func(t *testing.T) {
+		prog := compile("a")
+		got := getFirstRuneSet(prog, prog.Start)
+		if !got['a'] || len(got) != 1 {
+			t.Errorf("getFirstRuneSet(a) = %v, want {a}", got)
+		}
+	})
+
+	t.Run("alternation", func(t *testing.T) {
+		prog := compile("a|b")
+		got := getFirstRuneSet(prog, prog.Start)
+		if !got['a'] || !got['b'] {
+			t.Errorf("getFirstRuneSet(a|b) = %v, want {a,b}", got)
+		}
+	})
+
+	t.Run("char class", func(t *testing.T) {
+		prog := compile("[abc]")
+		got := getFirstRuneSet(prog, prog.Start)
+		if !got['a'] || !got['b'] || !got['c'] {
+			t.Errorf("getFirstRuneSet([abc]) = %v, want {a,b,c}", got)
+		}
+	})
+
+	t.Run("any rune returns empty", func(t *testing.T) {
+		prog := compile(".")
+		got := getFirstRuneSet(prog, prog.Start)
+		if len(got) != 0 {
+			t.Errorf("getFirstRuneSet(.) = %v, want empty (wildcard)", got)
+		}
+	})
+
+	t.Run("out of bounds pc returns empty", func(t *testing.T) {
+		prog := compile("a")
+		got := getFirstRuneSet(prog, len(prog.Inst)+99)
+		if len(got) != 0 {
+			t.Errorf("getFirstRuneSet(out-of-bounds) = %v, want empty", got)
+		}
+	})
 }

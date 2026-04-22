@@ -10,19 +10,6 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// matchMode controls the generated WASM function's matching behaviour.
-type matchMode int
-
-const (
-	// modeAnchoredMatch generates a function (ptr, len i32) -> i32 that matches
-	// the full input anchored at position 0, returning end position or -1.
-	modeAnchoredMatch matchMode = 0
-
-	// modeFind generates a function (ptr, len i32) -> i64 that scans the input
-	// for the leftmost-longest match, returning packed (start<<32|end) or -1.
-	modeFind matchMode = 1
-)
-
 // EngineType represents the type of regex engine implementation.
 type EngineType byte
 
@@ -68,7 +55,6 @@ type CompileOptions struct {
 	MaxDFAMemory  int        // Maximum DFA memory in bytes (default: 102400)
 	Unicode       bool       // Enable Unicode support
 	ForceEngine   EngineType // If non-zero, skip engine selection and use this engine type
-	Mode          matchMode  // modeAnchoredMatch (default) or modeFind
 	LeftmostFirst bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 	// CompiledDFAThreshold is the maximum minimised WASM state count for which the
 	// compiled dispatch path (EngineCompiledDFA) is used instead of the table-driven
@@ -179,7 +165,6 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 		}
 		if p.namedGroupsExport != "" {
 			namedWrapperOff = idx
-			idx++
 		}
 	}
 	return
@@ -267,12 +252,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			btStackBase := int32(btBase)
 			btStackLimit := btStackBase + int32(btStackSize)
 			var btMemoBase int32
-			var btMemoMaxLen int32
 			if useMemo {
 				btMemoBase = btStackLimit
-				btMemoMaxLen = int32(btMemoMaxLenFor(btProg, matchMemoBudget))
 			}
-			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, 8, btMemoBase, btMemoMaxLen, useMemo, buildOpts.tableMemIdx)
+			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, 8, btMemoBase, useMemo, buildOpts.tableMemIdx)
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts))
@@ -367,13 +350,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			btStackBase := int32(btBase)
 			btStackLimit := btStackBase + int32(btStackSize)
 			var btMemoBase int32
-			var btMemoMaxLen int32
 			if useMemo {
 				btMemoBase = btStackLimit
-				btMemoMaxLen = int32(btMemoMaxLenFor(btProg, memoBudget))
 			}
 			frameSize := int32(8) // pos + retryPC only (no cap slots)
-			p.findBody = appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, btMemoMaxLen, useMemo, btMandLit, buildOpts.tableMemIdx)
+			p.findBody = appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx)
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
@@ -521,7 +502,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	p.groupNames = extractGroupNames(parsed)
-	groupsEngine := selectBestEngine(prog, prog.NumCap > 2, &buildOpts)
+	groupsEngine := selectBestEngine(prog, &buildOpts)
 	if forceGroupsEngine != 0 {
 		groupsEngine = forceGroupsEngine
 	}
@@ -588,7 +569,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 
 		p.numGroups = bt.numGroups
-		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, memoMaxLen, useMemo, buildOpts.tableMemIdx)
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, buildOpts.tableMemIdx)
 	}
 
 	return p, nil
@@ -791,8 +772,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 }
 
 // Compile compiles multiple regex patterns to a single WASM module.
-//   - standalone=false: module declares its own memory, no export (for embedding via wasm-merge)
-//   - standalone=true:  module declares its own memory and exports it as "memory" (for testing/standalone use)
+//   - standalone=false: module imports "main" memory as memory[0] (input) and declares its own memory for DFA tables (becomes memory[1] after wasm-merge)
+//   - standalone=true:  module declares its own memory and exports it as "memory" (for JS/TS/browser direct use)
 //   - tableBase: starting address for DFA/capture tables within the module's memory; use 0 for
 //     embedded modules (tables start at address 0 of own memory). Callers like re2test/perftest
 //     pass a non-zero value to reserve low pages for their own test input buffers.
@@ -835,8 +816,8 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 
 // CmdCompile compiles all regex patterns from cfg to a single WASM module.
 // output is the output path (absolute, relative to cwd, or "-" for stdout).
-// The module declares its own memory (tables start at address 0) and does not
-// import memory from any host; use regexped merge to embed it.
+// Mode is auto-selected from cfg.Output: empty → standalone (own memory, exported as "memory");
+// non-empty → embedded (imports "main" memory + own memory for tables, for use with regexped merge).
 func CmdCompile(cfg config.BuildConfig, output string) error {
 	outPath := output
 	slog.Info("Compiling regexes", "count", len(cfg.Regexes), "output", outPath)
@@ -885,7 +866,6 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 	if err != nil {
 		return 0, fmt.Errorf("parse error: %w", err)
 	}
-	hasCapturesBeforeSimplify := re.MaxCap() > 0
 	prog, err := syntax.Compile(re.Simplify())
 	if err != nil {
 		return 0, fmt.Errorf("compile error: %w", err)
@@ -893,7 +873,7 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 	if needsUnicodeSupport(prog) && !opts.Unicode {
 		return 0, fmt.Errorf("pattern contains Unicode features but Unicode option not enabled")
 	}
-	return selectBestEngine(prog, hasCapturesBeforeSimplify, &opts), nil
+	return selectBestEngine(prog, &opts), nil
 }
 
 // compile parses the pattern, selects the optimal engine, and returns a compiled matcher.
@@ -902,8 +882,6 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
-
-	hasCapturesBeforeSimplify := re.MaxCap() > 0
 
 	simplified := re.Simplify()
 	prog, err := syntax.Compile(simplified)
@@ -924,7 +902,7 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 	if options.ForceEngine != 0 {
 		engineType = options.ForceEngine
 	} else {
-		engineType = selectBestEngine(prog, hasCapturesBeforeSimplify, &options)
+		engineType = selectBestEngine(prog, &options)
 	}
 
 	switch engineType {

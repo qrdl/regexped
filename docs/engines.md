@@ -230,7 +230,7 @@ bit       = 1 << (bitIndex & 7)
 
 If the bit is already set, the current thread is discarded — it cannot produce a new result. Otherwise the bit is set and execution continues. This guarantees each `(pc, pos)` pair is visited at most once, bounding runtime to O(numInstructions × inputLen).
 
-The bitset is zero-initialised at the start of each call. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, computed at runtime from the actual input length. The maximum supported input length (`maxMemoLen`) is derived from a compile-time budget of 128 KB: `maxMemoLen = budget × 8 / numInstructions - 1`. For inputs exceeding `maxMemoLen` the function returns -1 without attempting a match (safe: the caller should fall back or reject the input).
+The bitset is zero-initialised at the start of each call. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, computed at runtime from the actual input length. A compile-time budget of 128 KB is reserved in WASM linear memory for the bitset; the memory region is placed last in the layout so longer inputs consume only unused space.
 
 **Memory layout:**
 ```

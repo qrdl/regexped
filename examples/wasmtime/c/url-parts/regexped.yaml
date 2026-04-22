@@ -1,4 +1,3 @@
-wasm_merge:    "../../../../../binaryen/bin/wasm-merge"
 output:        "final.wasm"
 wasm_file:     "url_parts.wasm"
 import_module: "url_parts"

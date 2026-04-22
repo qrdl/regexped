@@ -2,7 +2,15 @@
 
 The regexped Docker image contains the `regexped` compiler and `wasm-merge` (from Binaryen). It is intended to be used as a command-line tool against a project directory mounted as a volume.
 
-## Building the image
+## Official image
+
+The official image is published on Docker Hub as [`qrdl/regexped`](https://hub.docker.com/r/qrdl/regexped):
+
+```bash
+docker pull qrdl/regexped
+```
+
+## Building the image locally
 
 ```bash
 make docker
@@ -15,7 +23,8 @@ This builds the `regexped` binary locally, downloads `wasm-merge` if not already
 Mount your project directory to `/work` and pass `regexped` commands as arguments:
 
 ```bash
-docker run --rm -v /path/to/your/project:/work -w /work regexped <command> [flags]
+docker run --rm -v /path/to/your/project:/work -w /work --user $(id -u):$(id -g) regexped \
+  <command> [flags]
 ```
 
 All paths in `regexped.yaml` are resolved relative to the config file, which in turn resolves relative to `/work` inside the container. Keep all input and output files inside the mounted directory.
@@ -25,7 +34,7 @@ All paths in `regexped.yaml` are resolved relative to the config file, which in 
 ## Generating stubs
 
 ```bash
-docker run --rm -v /path/to/your/project:/work -w /work regexped \
+docker run --rm -v /path/to/your/project:/work -w /work --user $(id -u):$(id -g) regexped \
   generate --config=regexped.yaml
 ```
 
@@ -43,7 +52,7 @@ docker run --rm -v /path/to/your/project:/work -w /work regexped \
 ## Compiling patterns to WASM
 
 ```bash
-docker run --rm -v /path/to/your/project:/work -w /work regexped \
+docker run --rm -v /path/to/your/project:/work -w /work --user $(id -u):$(id -g) regexped \
   compile --config=regexped.yaml
 ```
 
@@ -57,7 +66,7 @@ Compiles all regex patterns in the config to a single WASM file at the path spec
 ## Merging WASM modules
 
 ```bash
-docker run --rm -v /path/to/your/project:/work -w /work regexped \
+docker run --rm -v /path/to/your/project:/work -w /work --user $(id -u):$(id -g) regexped \
   merge --config=regexped.yaml --main=target/wasm32-wasip1/release/app.wasm regexps.wasm
 ```
 
@@ -73,16 +82,18 @@ Merges the host main WASM with one or more regex WASM modules into a single bina
 
 ```bash
 # 1. Generate Rust stubs
-docker run --rm -v $(pwd):/work -w /work regexped generate --config=regexped.yaml
+docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
+  generate --config=regexped.yaml
 
 # 2. Build your Rust project to WASM (outside the container — needs cargo)
 cargo build --target wasm32-wasip1 --release
 
 # 3. Compile regex patterns to WASM
-docker run --rm -v $(pwd):/work -w /work regexped compile --config=regexped.yaml
+docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
+  compile --config=regexped.yaml
 
 # 4. Merge into a single binary
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
   merge --config=regexped.yaml --main=target/wasm32-wasip1/release/app.wasm regexps.wasm
 ```
 
@@ -90,16 +101,18 @@ docker run --rm -v $(pwd):/work -w /work regexped \
 
 ```bash
 # 1. Generate Go stubs
-docker run --rm -v $(pwd):/work -w /work regexped generate --config=regexped.yaml
+docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
+  generate --config=regexped.yaml
 
 # 2. Compile regex patterns to WASM
-docker run --rm -v $(pwd):/work -w /work regexped compile --config=regexped.yaml
+docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
+  compile --config=regexped.yaml
 
 # 3. Build your Go project to WASM (outside the container — needs Go)
 GOOS=wasip1 GOARCH=wasm go build -o app.wasm .
 
 # 4. Merge into a single binary
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
   merge --config=regexped.yaml --main=app.wasm regexps.wasm
 ```
 
@@ -107,10 +120,12 @@ docker run --rm -v $(pwd):/work -w /work regexped \
 
 ```bash
 # 1. Compile regex patterns to WASM (standalone mode — no output field in config)
-docker run --rm -v $(pwd):/work -w /work regexped compile --config=regexped.yaml
+docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
+  compile --config=regexped.yaml
 
 # 2. Generate JS/TS stub
-docker run --rm -v $(pwd):/work -w /work regexped generate --config=regexped.yaml
+docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
+  generate --config=regexped.yaml
 ```
 
 Load the compiled WASM directly in your JS/TS code:

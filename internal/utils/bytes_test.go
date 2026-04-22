@@ -87,11 +87,11 @@ func appendTestSection(b []byte, id byte, payload []byte) []byte {
 func TestParseMemorySection(t *testing.T) {
 	// Two memories: 1 page and 3 pages. Max should be 3 * WasmPageSize.
 	var sec []byte
-	sec = AppendULEB128(sec, 2)    // count
-	sec = append(sec, 0x00)        // memory 0: flags=0 (no max)
-	sec = AppendULEB128(sec, 1)    // min=1 page
-	sec = append(sec, 0x00)        // memory 1: flags=0
-	sec = AppendULEB128(sec, 3)    // min=3 pages
+	sec = AppendULEB128(sec, 2) // count
+	sec = append(sec, 0x00)     // memory 0: flags=0 (no max)
+	sec = AppendULEB128(sec, 1) // min=1 page
+	sec = append(sec, 0x00)     // memory 1: flags=0
+	sec = AppendULEB128(sec, 3) // min=3 pages
 
 	got, err := ParseMemorySection(sec)
 	if err != nil {
@@ -106,10 +106,10 @@ func TestParseMemorySection(t *testing.T) {
 func TestParseMemorySectionWithMax(t *testing.T) {
 	// One memory with flags=1 (has max). Only min pages count.
 	var sec []byte
-	sec = AppendULEB128(sec, 1)    // count
-	sec = append(sec, 0x01)        // flags = has max
-	sec = AppendULEB128(sec, 2)    // min=2 pages
-	sec = AppendULEB128(sec, 10)   // max=10 pages (should be ignored)
+	sec = AppendULEB128(sec, 1)  // count
+	sec = append(sec, 0x01)      // flags = has max
+	sec = AppendULEB128(sec, 2)  // min=2 pages
+	sec = AppendULEB128(sec, 10) // max=10 pages (should be ignored)
 
 	got, err := ParseMemorySection(sec)
 	if err != nil {
@@ -325,12 +325,12 @@ func TestParseGlobalSectionNonI32Const(t *testing.T) {
 	// global 0: i64 (valtype=0x7E), mutable, i64.const init → else branch, ignored
 	// global 1: i32 (valtype=0x7F), mutable, i32.const = 100000 → captured
 	var sec []byte
-	sec = AppendULEB128(sec, 2)       // count
-	sec = append(sec, 0x7E, 0x01)     // i64, mutable
-	sec = append(sec, 0x42, 0x00)     // i64.const 0
-	sec = append(sec, 0x0b)           // end
-	sec = append(sec, 0x7F, 0x01)     // i32, mutable
-	sec = append(sec, 0x41)           // i32.const
+	sec = AppendULEB128(sec, 2)   // count
+	sec = append(sec, 0x7E, 0x01) // i64, mutable
+	sec = append(sec, 0x42, 0x00) // i64.const 0
+	sec = append(sec, 0x0b)       // end
+	sec = append(sec, 0x7F, 0x01) // i32, mutable
+	sec = append(sec, 0x41)       // i32.const
 	sec = AppendSLEB128(sec, 100000)
 	sec = append(sec, 0x0b)
 

@@ -1,8 +1,63 @@
 package compile
 
 import (
+	"regexp/syntax"
 	"testing"
 )
+
+func TestRegexpMinMaxLen(t *testing.T) {
+	parse := func(pattern string) *syntax.Regexp {
+		re, err := syntax.Parse(pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", pattern, err)
+		}
+		return re // NOT simplified — preserves OpRepeat
+	}
+
+	cases := []struct {
+		pattern string
+		wantMin int
+		wantMax int
+	}{
+		// OpLiteral
+		{"abc", 3, 3},
+		{"a", 1, 1},
+		// OpAnyCharNotNL
+		{".", 1, 1},
+		// OpCharClass
+		{"[a-z]", 1, 1},
+		// OpStar
+		{"a*", 0, -1},
+		// OpPlus
+		{"a+", 1, -1},
+		// OpQuest
+		{"a?", 0, 1},
+		// OpRepeat finite
+		{"a{2,5}", 2, 5},
+		// OpRepeat infinite upper
+		{"a{3,}", 3, -1},
+		// OpConcat
+		{"ab", 2, 2},
+		{"abc", 3, 3},
+		// OpConcat with unbounded part
+		{"ab*", 1, -1},
+		// OpAlternate
+		{"a|bb", 1, 2},
+		// OpCapture
+		{"(abc)", 3, 3},
+		// Anchors/boundaries → (0,0)
+		{"^", 0, 0},
+		{`\b`, 0, 0},
+	}
+	for _, c := range cases {
+		re := parse(c.pattern)
+		gotMin, gotMax := regexpMinMaxLen(re)
+		if gotMin != c.wantMin || gotMax != c.wantMax {
+			t.Errorf("regexpMinMaxLen(%q) = (%d,%d), want (%d,%d)",
+				c.pattern, gotMin, gotMax, c.wantMin, c.wantMax)
+		}
+	}
+}
 
 func TestFindMandatoryLit(t *testing.T) {
 	cases := []struct {

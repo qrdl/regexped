@@ -2,6 +2,8 @@
 
 A Cloudflare Worker that scans the POST body for leaked credentials (GitHub tokens, JWTs, AWS keys) and returns a JSON list of findings. Demonstrates importing a WASM module directly in a Worker module.
 
+See [docs/workers.md](../../docs/workers.md) for the full guide.
+
 ## Prerequisites
 
 - `regexped` binary (run `make` in the repo root)

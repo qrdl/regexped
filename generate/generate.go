@@ -12,7 +12,7 @@ import (
 )
 
 // ResolveStubType determines the stub type from cfg.StubType or the extension
-// of cfg.StubFile. Returns one of "rust", "js", "ts", or an error.
+// of cfg.StubFile. Returns one of "rust", "go", "js", "ts", "c", "as", or an error.
 func ResolveStubType(cfg config.BuildConfig) (string, error) {
 	if cfg.StubType != "" {
 		switch cfg.StubType {

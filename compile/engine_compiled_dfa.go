@@ -83,10 +83,7 @@ func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, hasImmAcc
 		nextWS  uint32
 	}
 	ws := startWS
-	for {
-		if visited[ws] {
-			break // cycle detected
-		}
+	for !visited[ws] { // until cycle detected
 		visited[ws] = true
 		gs := int(ws) - 1 // WASM state to DFA state
 		// Stop if accept or immediateAccept — we can't skip the accept check.
@@ -238,7 +235,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 		b = append(b, 0x20, 0x00)
 		b = append(b, 0x20, byte(localPos))
 		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00)      // INPUT: mem[ptr+pos]
+		b = append(b, 0x2D, 0x00, 0x00) // INPUT: mem[ptr+pos]
 		b = append(b, 0x6A)
 		b = appendTableLoad8u(b, tableMemIdx) // TABLE: table[state*256+input_byte]
 		b = append(b, 0x21, byte(localState))

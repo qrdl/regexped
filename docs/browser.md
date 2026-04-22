@@ -1,13 +1,13 @@
 # Embedding Regexped in a Browser Application
 
-This guide covers building a single merged WASM file and a generated JS module for use in a browser, with no Rust or WASI runtime required.
+This guide covers compiling regex patterns to a standalone WASM file and generating a JS module for use in a browser, with no Rust, WASI runtime, or wasm-merge required.
 
 ## Overview
 
 The browser workflow produces two files:
 
-- **`final.wasm`** — merged WASM containing all regex engines and their own memory
-- **`regex.js`** — generated ES module that loads `final.wasm` and exports typed JS wrapper functions
+- **`regexps.wasm`** — standalone WASM containing all regex engines with their own memory
+- **`regex.js`** — generated ES module that loads `regexps.wasm` and exports typed JS wrapper functions
 
 The `index.html` imports `regex.js` as an ES module and calls the exported functions directly.
 
@@ -15,55 +15,52 @@ The `index.html` imports `regex.js` as an ES module and calls the exported funct
 
 ```yaml
 # regexped.yaml
-wasm_merge: "path/to/wasm-merge"   # required for merge step
-output:    "final.wasm"            # merged WASM output
-stub_file: "regex.js"              # generated JS module
+wasm_file:     "regexps.wasm"   # compiled standalone WASM output
+stub_file:     "regex.js"       # generated JS module
+import_module: "regexps"        # module name used in generated stubs
 
 regexes:
-  - wasm_file:     "email.wasm"
-    import_module: "email"
-    pattern:       '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
-    match_func:    "email_match"
+  - pattern:    '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+    match_func: "email_match"
 
-  - wasm_file:     "url.wasm"
-    import_module: "url"
-    pattern:       'https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?'
-    find_func:     "url_find"
+  - pattern:    'https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?'
+    match_func: "url_match"
 ```
+
+No `output` field means standalone mode: the compiled WASM owns its own memory and can be loaded directly in JS without merging.
 
 ## Build Steps
 
 ```bash
-# 1. Generate a minimal main WASM (memory-only placeholder, no Rust code needed)
-regexped generate --dummy_main
+# 1. Compile regex patterns to a standalone WASM module
+regexped compile --config=regexped.yaml
 
-# 2. Compile each regex pattern to WASM
-regexped compile --config=regexped.yaml --wasm-input=main.wasm
-
-# 3. Merge everything into a single self-contained WASM
-#    The merged module owns its memory — no JS memory management needed
-regexped merge --config=regexped.yaml main.wasm email.wasm url.wasm
-
-# 4. Generate the JS ES module stub
-regexped generate --config=regexped.yaml --js
+# 2. Generate the JS ES module stub
+regexped generate --config=regexped.yaml
 ```
 
 See [`examples/browser/Makefile`](../examples/browser/Makefile) for a complete Makefile that automates these steps.
 
 ## Generated JS API
 
-`regex.js` is an ES module using top-level `await`. It loads `final.wasm` at import time and exports wrapper functions named after the `_func` fields in the config.
+`regex.js` is an ES module. Call `init()` with the WASM bytes before using any exported function:
+
+```js
+import { init, email_match, url_match } from './regex.js';
+
+await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
+```
+
+Input can be a `string` or `Uint8Array`.
 
 ### `match_func` — boolean validation
 
 ```js
-import { email_match } from './regex.js';
-
-email_match('user@example.com');   // true
-email_match('not-an-email');       // false
+const [end, ok] = email_match('user@example.com');
+const valid = ok && end === input.length;   // true — full input matched
 ```
 
-Returns `true` if the entire input matches the pattern (anchored at both ends), `false` otherwise. Input can be a `string` or `Uint8Array`.
+Returns `[endPos, matched]`. `matched` is true if the pattern matched; `endPos` is the byte position where the match ended. For full-string validation, check both `matched` and `end === input.length`.
 
 ### `find_func` — scan for all matches
 
@@ -89,9 +86,6 @@ for (const groups of parse_record(text)) {
     // groups[0] = full match [start, end]
     // groups[1] = first capture group [start, end], or null if unmatched
 }
-
-// First match only:
-const groups = parse_record(text).next().value;
 ```
 
 Returns a generator yielding `Array<[start, end] | null>` per match. Index 0 is the full match.
@@ -105,9 +99,6 @@ for (const parts of parse_url(text)) {
     const [s, e] = parts['host'] ?? [0, 0];
     console.log('host:', text.slice(s, e));
 }
-
-// First match only:
-const parts = parse_url(text).next().value;
 ```
 
 Returns a generator yielding a plain object mapping group name → `[start, end]` for groups that participated in the match.
@@ -122,11 +113,14 @@ Returns a generator yielding a plain object mapping group name → `[start, end]
 </head>
 <body>
   <script type="module">
-    // regex.js uses top-level await — import it as a module.
-    import { email_match, url_find } from './regex.js';
+    import { init, email_match, url_match } from './regex.js';
+
+    await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
 
     document.getElementById('email').addEventListener('input', e => {
-      const valid = email_match(e.target.value);
+      const bytes = new TextEncoder().encode(e.target.value);
+      const [end, ok] = email_match(bytes);
+      const valid = ok && end === bytes.length;
       e.target.style.borderColor = valid ? 'green' : 'red';
     });
   </script>
@@ -134,14 +128,13 @@ Returns a generator yielding a plain object mapping group name → `[start, end]
 </html>
 ```
 
-The page must be served over HTTP (not `file://`) so that `fetch` can load `final.wasm`. Any static file server works: `python3 -m http.server`, `npx serve`, `caddy file-server`, etc.
+The page must be served over HTTP (not `file://`) so that `fetch` can load `regexps.wasm`. Any static file server works: `python3 -m http.server`, `npx serve`, `caddy file-server`, etc.
 
-## How the merged WASM works
+## How the standalone WASM works
 
-After `wasm-merge`:
-- `final.wasm` contains all DFA/TDFA tables as data segments
-- It exports `memory` (from the dummy main module) — no JS memory setup needed
-- It exports each regex function under its `_func` name (e.g. `email_match`, `url_find`)
+The standalone WASM (no `output` field in config):
+- Owns its own memory — no JS memory setup needed
+- Exports each regex function under its `_func` name (e.g. `email_match`, `url_match`)
 - The generated `regex.js` instantiates it with no imports and accesses exports directly
 
-Input strings are written to memory at address 0; capture group output buffers are placed at offset 1024. Both areas are well within the module's 2-page (128 KB) minimum memory.
+Input strings are written to memory at address 0; capture group output buffers are placed at offset 1024. Both areas are well within the module's minimum memory.

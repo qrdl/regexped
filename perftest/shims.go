@@ -25,9 +25,9 @@ import (
 )
 
 const (
-	timingsBytes = benchIters * 4    // 40 000 bytes
+	timingsBytes = benchIters * 4      // 40 000 bytes
 	clockScratch = int32(timingsBytes) // 40 000; 8-byte aligned (40000 = 8×5000)
-	shimMemPages = 1                  // 64KB; enough for 40 008 bytes
+	shimMemPages = 1                   // 64KB; enough for 40 008 bytes
 )
 
 // computeStat reads benchIters u32 nanosecond samples from data and returns
@@ -154,8 +154,8 @@ func emitClockGet(b []byte) []byte {
 	b = append(b, 0x42, 0x00)                // i64.const 0  (precision)
 	b = append(b, 0x41)                      // i32.const
 	b = utils.AppendSLEB128(b, clockScratch) // 40000
-	b = append(b, 0x10, 0x00)               // call 0 (clock_time_get)
-	return append(b, 0x1A)                  // drop errno
+	b = append(b, 0x10, 0x00)                // call 0 (clock_time_get)
+	return append(b, 0x1A)                   // drop errno
 }
 
 // emitLoadClock emits: push i64.load(clockScratch) onto the stack.
@@ -172,15 +172,15 @@ func emitStoreElapsed(b []byte, iLocal, tStartLocal uint32) []byte {
 	// address = iLocal * 4  (timingsBase = 0)
 	b = append(b, 0x20)
 	b = utils.AppendULEB128(b, iLocal) // local.get i
-	b = append(b, 0x41, 0x04)         // i32.const 4
-	b = append(b, 0x6C)               // i32.mul
+	b = append(b, 0x41, 0x04)          // i32.const 4
+	b = append(b, 0x6C)                // i32.mul
 	// value = i32.wrap_i64(i64.load(clockScratch) - t_start)
 	b = emitLoadClock(b)
 	b = append(b, 0x20)
 	b = utils.AppendULEB128(b, tStartLocal) // local.get t_start
-	b = append(b, 0x7D)                    // i64.sub
-	b = append(b, 0xA7)                    // i32.wrap_i64
-	return append(b, 0x36, 0x02, 0x00)    // i32.store align=2 offset=0
+	b = append(b, 0x7D)                     // i64.sub
+	b = append(b, 0xA7)                     // i32.wrap_i64
+	return append(b, 0x36, 0x02, 0x00)      // i32.store align=2 offset=0
 }
 
 // --------------------------------------------------------------------------

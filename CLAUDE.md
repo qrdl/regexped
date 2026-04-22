@@ -27,9 +27,11 @@ regexped/
 │   ├── compile.go             # Public API: Compile, CompileForced, SelectEngine, assembleModule
 │   ├── selector.go            # Engine selection (TDFA vs Backtrack vs DFA vs CompiledDFA)
 │   ├── engine_dfa.go          # DFA subset construction, table generation, WASM emission
+│   ├── engine_compiled_dfa.go # Compiled DFA: direct-index dispatch, literal-chain prefix
 │   ├── engine_tdfa.go         # TDFA (Laurikari tagged DFA): subset construction, register ops, WASM emission
 │   ├── engine_backtrack.go    # Backtracking engine: hybrid DFA+NFA, br_table dispatch, explicit stack, WASM emission
 │   ├── mandatory_lit.go       # Mandatory literal extraction (FindMandatoryLit)
+│   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/
@@ -38,11 +40,13 @@ regexped/
 │   ├── go_stub.go             # Go (wasip1) stub generator (//go:wasmimport, iter.Seq2)
 │   ├── js_stub.go             # JS ES module stub generator
 │   ├── ts_stub.go             # TypeScript ES module stub generator
+│   ├── as_stub.go             # AssemblyScript stub generator
 │   └── c_stub.go              # C header stub generator (WASM imports, static iterators)
 ├── merge/
 │   └── merge.go               # WASM module merging with wasm-merge
-├── utils/
-│   └── bytes.go               # LEB128, page alignment, WasmMemTop
+├── internal/
+│   └── utils/
+│       └── bytes.go           # LEB128, page alignment, WasmMemTop
 ├── re2test/
 │   ├── main.go                # RE2 exhaustive test runner (wasmtime-based)
 │   └── Makefile               # Unpacks test data, runs tests
@@ -84,15 +88,16 @@ regexped/
 Parses YAML configuration files. Schema:
 
 ```yaml
-wasm_merge: "path/to/wasm-merge"  # optional, defaults to $PATH
-output:   "merged.wasm"           # output path for merge command; overridable with -o/--output
-wasm_dir: "."                     # default output directory for compiled WASM files; overridable with -d/--out-dir
-stub_file: "src/stubs.rs"         # default stub output file (Rust or JS); per-entry overrides
+wasm_merge:    "path/to/wasm-merge"  # optional; defaults to $WASM_MERGE env var, then wasm-merge in $PATH
+output:        "merged.wasm"         # output path for merge command; overridable with -o/--output
+wasm_file:     "regexps.wasm"        # output path for compile command; overridable with -o/--output
+import_module: "mymod"               # WASM module name used by wasm-merge and Rust/Go FFI
+stub_file:     "src/stubs.rs"        # stub output file; extension determines type: .rs, .js, .ts, .go, .h
+stub_type:     "rust"                # optional; overrides extension inference: rust, js, ts, go, c, as
+max_dfa_states: 1024                 # optional; max DFA/TDFA states before falling back (default 1024)
+max_tdfa_regs:  32                   # optional; max TDFA registers before falling back (default 32)
 regexes:
-  - wasm_file:        "url.wasm"
-    import_module:    "url"
-    stub_file:        "src/url.rs"  # per-entry override; if absent, uses top-level stub_file
-    pattern:          '(?P<scheme>https?)://(?P<host>[^/:?#]+)...'
+  - pattern: '(?P<scheme>https?)://(?P<host>[^/:?#]+)...'
 
     # All func fields are optional; an entry with only 'pattern' is silently skipped.
     # Each func name becomes the WASM export name AND the generated function name.
@@ -124,14 +129,15 @@ An entry with no `_func` fields is valid — no WASM file is compiled and no stu
 
 #### `selector.go` — Engine Selection
 
-Decision tree (in priority order):
+Two-phase decision in `selectBestEngine`:
 
-1. **TDFA** — has captures + no non-greedy quantifiers + no line anchors + no word boundaries + no ambiguous alternations + fits within state limit (default 1024) AND register count ≤ MaxTDFARegs (default 32)
-2. **Backtracking** — has captures that don't qualify for TDFA
-3. **CompiledDFA (LeftmostFirst)** — user alternations (`|`) or nested quantifiers, minimised DFA ≤ 256 states
-4. **DFA (LeftmostFirst)** — user alternations or nested quantifiers, DFA > 256 states
-5. **CompiledDFA (standard)** — simple patterns, ≤ 256 states
-6. **DFA (standard)** — simple patterns, > 256 states
+**Phase 1 — capture groups present:**
+- Try **TDFA** if: no non-greedy quantifiers + no line anchors + no word boundaries + no ambiguous alternations + TDFA state count ≤ MaxDFAStates (default 1024) + register count ≤ MaxTDFARegs (default 32)
+- Fall back to **Backtracking** otherwise
+
+**Phase 2 — no capture groups:**
+- Always **DFA**; `LeftmostFirst` mode is enabled when the pattern has user alternations (`|`) or nested quantifiers (required for correct RE2/Perl semantics)
+- Promoted to **CompiledDFA** via `maybeCompiledDFA` when estimated state count ≤ 256
 
 TDFA eligibility checked by `selectBestEngine`: `hasNonGreedyQuantifiers`, `hasLineAnchors`, `hasWordBoundary`, `hasAmbiguousCaptures`.
 
@@ -149,8 +155,8 @@ TDFA eligibility checked by `selectBestEngine`: `hasNonGreedyQuantifiers`, `hasL
 - `wordCharTable` — 256-byte lookup for `\w` characters, stored in data segment
 
 **WASM emission (`genWASM`):**
-- Imports memory from `"main"` module
-- Exports `match` function `(ptr i32, len i32) → i32`  or `find` function `(ptr i32, len i32) → i64`
+- Embedded mode: imports `"main"` memory as `memory[0]` (input), declares own memory for DFA tables (`memory[1]` after merge); standalone mode: declares and exports own memory as `memory[0]`
+- Exports the configured `match_func` name `(ptr i32, len i32) → i32` or `find_func` name `(ptr i32, len i32) → i64`
 - DFA execution loop in WASM structured control flow (`block`/`loop`/`br_table`)
 - Calls `EmitPrefixScan` for fast-skip prologue in find mode
 
@@ -251,19 +257,21 @@ Generated as a single `#pragma once` header. No libc or sysroot required; uses `
 | `groups_func` | `<func>_next(input, len, slots[])` + `<func>_reset()` |
 | `named_groups_func` | same as groups + `<func>_get(slots, name, *start, *end)` |
 
-**Dummy main** (embedded in `merge/merge.go`): 25-byte WASM with 2-page memory export; used when no `--main` is provided for browser/JS deployments.
-
 ### 4. WASM Merging (`merge/`)
 
 **File:** `merge.go`
 
-1. Verify each regex WASM imports memory from `"main"` (`isRegexWasm`)
-2. Find highest data segment end across all regex WASMs (`regexMemoryTop`)
-3. Patch main module memory section to fit all tables (`patchMemoryMin`)
-4. Write patched main to temp file
-5. Invoke `wasm-merge`: `wasm-merge <main> main <regex1> <module1> ... --enable-simd -o output`
+Thin wrapper around `wasm-merge`. Resolves the wasm-merge binary path (config field → `$WASM_MERGE` env var → `wasm-merge` in `$PATH`), builds the argument list, and shells out:
 
-### 5. Utilities (`utils/`)
+```
+wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk-memory-opt \
+  <main.wasm> main <regex1.wasm> <module1> ... \
+  --rename-export-conflicts -o output
+```
+
+Main module is listed first so it keeps `memory[0]` in the merged output; regex modules follow and get renumbered to `memory[1]` and above by wasm-merge.
+
+### 5. Utilities (`internal/utils/`)
 
 **File:** `bytes.go`
 
@@ -299,8 +307,7 @@ Each pattern is compiled and tested for:
 ### Performance benchmarks (`perftest/`)
 
 ```bash
-make perftest                                  # from repo root
-make perftest WASM_MERGE=/path/to/wasm-merge  # custom wasm-merge
+make perftest   # from repo root
 # or
 make run        # from perftest/
 ```
@@ -310,17 +317,33 @@ Harnesses must be pre-built with `make harnesses` if changed.
 
 ## Memory Layout
 
+### Embedded (Rust/Go/C via wasm-merge)
+
+Each regex WASM module has **two memories** after merging:
+
 ```
-┌─────────────────┬─────────────────┬─────────────────┬─────┐
-│   Rust Stack    │   Rust Heap     │  DFA Table 1    │ ... │
-│   & Globals     │   (optional)    │                 │     │
-└─────────────────┴─────────────────┴─────────────────┴─────┘
-0               rustTop          tableBase1      tableBase2
+Host memory (memory[0]):                 Regex module's own memory (memory[1]):
+┌─────────────────┬──────────┐           ┌─────────────────┬─────────────────┬─────┐
+│  Stack/Globals  │   Heap   │           │  DFA Table 1    │  DFA Table 2    │ ... │
+└─────────────────┴──────────┘           └─────────────────┴─────────────────┴─────┘
+0               memTop                   0              tableEnd1         tableEnd2
 ```
 
-- **memTop** = highest address used by host code (from `WasmMemTop`)
-- **tableBase** = `PageAlign(rustTop)` — start of first DFA/TDFA table
-- Each regex gets a contiguous region; next regex starts at `PageAlign(prevEnd)`
+- Host memory is completely separate — no coordination needed.
+- DFA tables start at address 0 of the regex module's own memory. Each subsequent table starts at `PageAlign(prevTableEnd)`.
+- The embedded WASM **imports** `"main"` memory as `memory[0]` for reading input; its own memory (for tables) becomes `memory[1]` after wasm-merge.
+
+### Standalone (JS/TS/browser)
+
+```
+Single memory (memory[0], exported as "memory"):
+┌──────────────────┬─────────────────┬─────┐
+│  (caller input)  │  DFA Table 1    │ ... │
+└──────────────────┴─────────────────┴─────┘
+0              tableBase         tableEnd
+```
+
+The caller writes input into low pages and passes the pointer. Tables start at `tableBase` (caller-chosen, e.g. page 1 for re2test).
 
 ### DFA Table Format
 
@@ -395,7 +418,7 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 ---
 
-**Last Updated:** 2026-03-29
-**CLI commands:** `generate` (stubs / dummy_main), `compile`, `merge`
+**Last Updated:** 2026-04-22
+**CLI commands:** `generate` (stubs), `compile`, `merge`
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals)
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

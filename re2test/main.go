@@ -787,8 +787,8 @@ func parseCaptures(col string, numGroups int) []int32 {
 		if dash < 0 {
 			continue
 		}
-		s, err1 := strconv.Atoi(p[:dash])
-		e, err2 := strconv.Atoi(p[dash+1:])
+		s, err1 := strconv.ParseInt(p[:dash], 10, 32)
+		e, err2 := strconv.ParseInt(p[dash+1:], 10, 32)
 		if err1 != nil || err2 != nil {
 			continue
 		}
@@ -827,7 +827,7 @@ func parseCol0(col string) int32 {
 	if dashIdx < 0 {
 		return -1
 	}
-	end, err := strconv.Atoi(pair[dashIdx+1:])
+	end, err := strconv.ParseInt(pair[dashIdx+1:], 10, 32)
 	if err != nil {
 		return -1
 	}
@@ -883,20 +883,6 @@ func preCheck(pattern string) string {
 		return "" // let the compiler report the actual error
 	}
 	return ""
-}
-
-// findModeUnsafe reports whether a pattern cannot be correctly tested in find
-// mode. With leftmost-first DFA and immediateAccepting, all quantifier types
-// including non-greedy are handled correctly by the DFA.
-func findModeUnsafe(re *syntax.Regexp) bool {
-	switch re.Op {
-	}
-	for _, sub := range re.Sub {
-		if findModeUnsafe(sub) {
-			return true
-		}
-	}
-	return false
 }
 
 // hasUnicode reports whether a pattern string requires Unicode support.

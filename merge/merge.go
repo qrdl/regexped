@@ -19,11 +19,21 @@ import (
 //
 //	wasm-merge --enable-multimemory --enable-simd <main.wasm> main <regex.wasm> <module> \
 //	           --rename-export-conflicts -o output
-func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []string) error {
-	wasmMergeCmd := expandHome(cfg.WasmMerge)
-	if wasmMergeCmd == "" {
-		wasmMergeCmd = "wasm-merge"
+//
+// resolveWasmMerge returns the wasm-merge binary path using the lookup order:
+// config field → $WASM_MERGE env var → "wasm-merge" in $PATH.
+func resolveWasmMerge(cfg config.BuildConfig) string {
+	if cfg.WasmMerge != "" {
+		return expandHome(cfg.WasmMerge)
 	}
+	if env := os.Getenv("WASM_MERGE"); env != "" {
+		return expandHome(env)
+	}
+	return "wasm-merge"
+}
+
+func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []string) error {
+	wasmMergeCmd := resolveWasmMerge(cfg)
 
 	// Verify tool is available before doing any work.
 	if err := checkTool(wasmMergeCmd); err != nil {

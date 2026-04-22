@@ -5,7 +5,7 @@
 Regexped is driven by a YAML config file (default: `regexped.yaml` in the current directory).
 
 ```yaml
-wasm_merge: "wasm-merge"   # path to wasm-merge binary; defaults to wasm-merge in $PATH
+wasm_merge: "wasm-merge"   # path to wasm-merge binary; defaults to $WASM_MERGE env var, then wasm-merge in $PATH
 output:   "merged.wasm"    # output path for the merge command; overridable with --output
 wasm_file: "regexps.wasm"  # output path for the compile command; overridable with --output
 import_module: "mymod"     # WASM module name used by wasm-merge and Rust/Go FFI
@@ -207,7 +207,7 @@ This command is a thin wrapper around `wasm-merge`. You may invoke wasm-merge di
 
 ```
 wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk-memory-opt \
-  <regex.wasm> <module_name> ... <main.wasm> main \
+  <main.wasm> main <regex.wasm> <module_name> ... \
   --rename-export-conflicts -o output.wasm
 ```
 
@@ -226,7 +226,7 @@ wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk
 | Field | Notes |
 |---|---|
 | `output` | Required unless `--output` is given |
-| `wasm_merge` | Optional; path to wasm-merge binary; defaults to `wasm-merge` in $PATH |
+| `wasm_merge` | Optional; path to wasm-merge binary; defaults to `$WASM_MERGE` env var, then `wasm-merge` in $PATH |
 | `import_module` | Optional; module name passed to wasm-merge; defaults to basename of the regex WASM |
 
 ---

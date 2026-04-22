@@ -2,6 +2,8 @@
 
 Reads text from stdin and prints the domain of every URL found, one per line. Uses **TDFA named groups** to extract just the `host` capture group.
 
+See [docs/node.md](../../docs/node.md) for the full guide.
+
 ## Prerequisites
 
 - `regexped` binary (run `make` in the repo root)
