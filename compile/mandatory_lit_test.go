@@ -48,6 +48,16 @@ func TestRegexpMinMaxLen(t *testing.T) {
 		// Anchors/boundaries → (0,0)
 		{"^", 0, 0},
 		{`\b`, 0, 0},
+		// 2-byte UTF-8 literal (é = U+00E9): OpPlus recurses into Literal → n += 2
+		{"é+", 2, -1},
+		// 3-byte UTF-8 literal (中 = U+4E2D): n += 3
+		{"中+", 3, -1},
+		// 4-byte UTF-8 literal (𐀀 = U+10000): n += 4
+		{"𐀀+", 4, -1},
+		// OpRepeat with unbounded child max → hi = -1
+		{"(?:[a-z]+){2,3}", 2, -1},
+		// OpAlternate with unbounded branch → totMax = -1
+		{"a+|b", 1, -1},
 	}
 	for _, c := range cases {
 		re := parse(c.pattern)
@@ -55,6 +65,56 @@ func TestRegexpMinMaxLen(t *testing.T) {
 		if gotMin != c.wantMin || gotMax != c.wantMax {
 			t.Errorf("regexpMinMaxLen(%q) = (%d,%d), want (%d,%d)",
 				c.pattern, gotMin, gotMax, c.wantMin, c.wantMax)
+		}
+	}
+}
+
+// TestFindMandatoryLitRecDegenerate covers defensive branches in findMandatoryLitRec
+// that the parser never triggers (empty literal rune slice, captures/plus with wrong
+// sub count). Called directly to reach these guards.
+func TestFindMandatoryLitRecDegenerate(t *testing.T) {
+	cases := []struct {
+		name string
+		re   *syntax.Regexp
+	}{
+		// OpLiteral with empty Rune slice → len(bs)==0 → nil.
+		{"literal_empty_rune", &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune{}}},
+		// OpCapture with 0 subs → len(re.Sub)!=1 → nil.
+		{"capture_no_sub", &syntax.Regexp{Op: syntax.OpCapture}},
+		// OpPlus with 0 subs → len(re.Sub)!=1 → nil.
+		{"plus_no_sub", &syntax.Regexp{Op: syntax.OpPlus}},
+	}
+	for _, c := range cases {
+		got := findMandatoryLitRec(c.re, 0, 0)
+		if got != nil {
+			t.Errorf("findMandatoryLitRec(%s): got %v, want nil", c.name, got)
+		}
+	}
+}
+
+// TestRegexpMinMaxLenDegenerate covers edge cases that the parser never produces
+// (empty Sub slices, OpNoMatch/OpEmptyMatch, unknown Op) by constructing Regexp
+// nodes directly.
+func TestRegexpMinMaxLenDegenerate(t *testing.T) {
+	cases := []struct {
+		name    string
+		re      *syntax.Regexp
+		wantMin int
+		wantMax int
+	}{
+		{"OpRepeat_no_sub", &syntax.Regexp{Op: syntax.OpRepeat, Min: 1, Max: 3}, 0, 0},
+		{"OpPlus_no_sub", &syntax.Regexp{Op: syntax.OpPlus}, 0, -1},
+		{"OpQuest_no_sub", &syntax.Regexp{Op: syntax.OpQuest}, 0, 0},
+		{"OpAlternate_no_sub", &syntax.Regexp{Op: syntax.OpAlternate}, 0, 0},
+		{"OpCapture_no_sub", &syntax.Regexp{Op: syntax.OpCapture}, 0, 0},
+		{"OpNoMatch", &syntax.Regexp{Op: syntax.OpNoMatch}, 0, 0},
+		{"OpEmptyMatch", &syntax.Regexp{Op: syntax.OpEmptyMatch}, 0, 0},
+		{"unknown_op", &syntax.Regexp{Op: syntax.Op(99)}, 0, -1},
+	}
+	for _, c := range cases {
+		min, max := regexpMinMaxLen(c.re)
+		if min != c.wantMin || max != c.wantMax {
+			t.Errorf("regexpMinMaxLen(%s) = (%d,%d), want (%d,%d)", c.name, min, max, c.wantMin, c.wantMax)
 		}
 	}
 }
@@ -86,6 +146,10 @@ func TestFindMandatoryLit(t *testing.T) {
 		{"", true, "", 0},
 		// URL-like: mandatory literal ://, minOff=2 (minimum 2 chars before it).
 		{`[a-zA-Z]{2,8}://[^\s]+`, false, "://", 2},
+		// Non-ASCII literal: r > 127 → returns nil.
+		{"é", true, "", 0},
+		// OpRepeat with Min=0: not mandatory → skipped; foo found after.
+		{"[a-z]{0,3}foo", false, "foo", 0},
 	}
 	for _, c := range cases {
 		got := findMandatoryLit(c.pattern)

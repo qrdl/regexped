@@ -199,6 +199,39 @@ func TestSelectEngineNonCapturePaths(t *testing.T) {
 	})
 }
 
+// TestIsAlternationDeterministicPaths exercises specific branches in
+// isAlternationDeterministic, isEpsilonAccept, and getFirstRuneSet that are called
+// when hasAmbiguousCaptures evaluates whether captures need the BT engine.
+func TestIsAlternationDeterministicPaths(t *testing.T) {
+	cases := []struct {
+		pattern string
+		want    EngineType
+		note    string
+	}{
+		// Each branch in its own capture prevents prefix factoring, so both start with 'c'
+		// and getFirstRuneSet returns overlapping sets → not deterministic → BT.
+		{"((cat)|(car))", EngineBacktrack, "overlapping first rune"},
+		// Left branch is empty capture (epsilon), right is rune 'a' → disjoint → TDFA-eligible.
+		{"(()|a)", EngineTDFA, "one epsilon branch"},
+		// Both branches epsilon-accepting: () and (a?) both reach Match without consuming
+		// a byte → ambiguous → BT.
+		{"(()|(?:a?))", EngineBacktrack, "both epsilon branches"},
+		// Large char class >256 chars in left branch → getFirstRuneSet returns empty set
+		// → treated as undetermined → not deterministic → BT.
+		{"(([\x00-Ā])|(b))", EngineBacktrack, "large char class first rune set"},
+	}
+	for _, c := range cases {
+		got, err := SelectEngine(c.pattern, CompileOptions{})
+		if err != nil {
+			t.Errorf("SelectEngine(%q) [%s]: %v", c.pattern, c.note, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("SelectEngine(%q) [%s] = %v, want %v", c.pattern, c.note, got, c.want)
+		}
+	}
+}
+
 // TestSelectEngineLineAnchorCapture verifies that capture patterns with line anchors
 // or word boundaries are routed to Backtrack (not TDFA).
 func TestSelectEngineLineAnchorCapture(t *testing.T) {

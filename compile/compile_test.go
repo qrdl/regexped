@@ -780,6 +780,127 @@ func TestEngineTypeStringUnknown(t *testing.T) {
 	}
 }
 
+// TestCompileBTInstHandlerEmptyWidth exercises the EmptyWidth cases in emitBTInstHandler
+// that are only reached when captures are compiled with the BT engine.
+func TestCompileBTInstHandlerEmptyWidth(t *testing.T) {
+	// EmptyBeginLine: (?m:^) routes captures to BT via hasLineAnchors.
+	t.Run("begin_line", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `((?m:^)a)`, GroupsFunc: "g"}})
+	})
+	// EmptyEndLine: (?m:$) routes captures to BT via hasLineAnchors.
+	t.Run("end_line", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a(?m:$))`, GroupsFunc: "g"}})
+	})
+	// EmptyNoWordBoundary: \B routes captures to BT via hasWordBoundary.
+	t.Run("no_word_boundary", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a\Bb)`, GroupsFunc: "g"}})
+	})
+}
+
+// TestCompileBTLoopCaptureSnapshot exercises the loopSnapBase/loopSnapLocals path
+// in buildBacktrackBody. ((a?)+) has a greedy + loop containing inner capture (a?);
+// loopCaptureLocals finds that capture, setting loopSnapBase. On zero-progress
+// (a? matches empty) the snapshot is restored.
+func TestCompileBTLoopCaptureSnapshot(t *testing.T) {
+	_, _, err := compileForced(
+		[]config.RegexEntry{{Pattern: "((a?)+)", GroupsFunc: "g"}},
+		0, true, EngineBacktrack,
+	)
+	if err != nil {
+		t.Fatalf("compileForced(((a?)+) BT): %v", err)
+	}
+}
+
+// TestCompileBTLoopBodyCanMatchEmpty exercises uncovered branches in loopBodyCanMatchEmpty,
+// which is called by needsBitState to detect non-greedy loops with empty-matchable bodies.
+func TestCompileBTLoopBodyCanMatchEmpty(t *testing.T) {
+	// ((a|b)+?): inner alternation causes both 'a' and 'b' paths to enqueue the
+	// same merge-point PC, triggering the visited-cache path in loopBodyCanMatchEmpty.
+	t.Run("visited_cache", func(t *testing.T) {
+		_, _, err := compileForced(
+			[]config.RegexEntry{{Pattern: "((a|b)+?)", GroupsFunc: "g"}},
+			0, true, EngineBacktrack,
+		)
+		if err != nil {
+			t.Fatalf("compileForced(((a|b)+?) BT): %v", err)
+		}
+	})
+	// ((a)+?): non-greedy + loop whose body contains an InstCapture instruction,
+	// which hits the default case in loopBodyCanMatchEmpty's switch.
+	t.Run("default_case", func(t *testing.T) {
+		_, _, err := compileForced(
+			[]config.RegexEntry{{Pattern: "((a)+?)", GroupsFunc: "g"}},
+			0, true, EngineBacktrack,
+		)
+		if err != nil {
+			t.Fatalf("compileForced(((a)+?) BT): %v", err)
+		}
+	})
+}
+
+// TestCompileFindBodyWBNoPrefix exercises the word-boundary prev-byte state-selection
+// path in buildFindBody's emitOuterPrologue. \b[a-z] has hasWordBoundary=true and an
+// empty computePrefix (char class has many first bytes), so the OnMatch callback takes
+// the "check previous byte" branch rather than the fixed-prefix branch.
+func TestCompileFindBodyWBNoPrefix(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `\b[a-z]`, FindFunc: "f"}}, noHybridOpts())
+}
+
+// TestCompileFindBodyMandLitWBNL exercises the mandatory-literal DFA prologue
+// (emitDFAPrologue) when both hasWordBoundary and hasNewlineBoundary are true.
+// (?m:\b[a-z]{1,5}foo$) finds "foo" as mandatory literal (minOff=1, maxOff=5),
+// has an empty prefix (char class first bytes), and sets both flag bits.
+func TestCompileFindBodyMandLitWBNL(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m:\b[a-z]{1,5}foo$)`, FindFunc: "f"}}, noHybridOpts())
+}
+
+// TestCompileFindBodyCompressed exercises the u8-compressed non-anchored find path in
+// buildFindBody. [a-z]{130} produces 131 DFA states: 131×256 = 33 536 B > 32 KB →
+// useCompression=true, useU8=true. No fixed literal or prefix → non-mandatory-lit path.
+func TestCompileFindBodyCompressed(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{130}", FindFunc: "f"}},
+		CompileOptions{MaxDFAStates: 100000, CompiledDFAThreshold: -1})
+}
+
+// TestCompileMultiEqSIMD exercises the multi-eq SIMD path in emitPrefixScan.
+// [a-i]+ has exactly 9 distinct first bytes, which puts it in the 9–16 range
+// that uses multi-eq rather than Teddy tables.
+func TestCompileMultiEqSIMD(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-i]+", FindFunc: "f"}}, noHybridOpts())
+}
+
+// TestCompileLitAnchorFindCompressed exercises the useCompression branch in
+// buildLitAnchorFindBody. .*[a-z]{130}foo.* has "foo" as a lit-anchor point and a
+// forward DFA with ~134 states (131 for [a-z]{130} + a few for foo), making the
+// forward-scan table exceed 32 KB → useCompression=true in the forward layout.
+func TestCompileLitAnchorFindCompressed(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `.*[a-z]{130}foo.*`, FindFunc: "f"}},
+		CompileOptions{MaxDFAStates: 100000, CompiledDFAThreshold: -1})
+}
+
+// TestCompileFindBodyU16 exercises the u16 (>256 states) non-anchored find path in
+// buildFindBody. [a-z]{512} produces ~513 DFA states → useU8=false → u16 table path.
+func TestCompileFindBodyU16(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{512}", FindFunc: "f"}},
+		CompileOptions{MaxDFAStates: 100000, CompiledDFAThreshold: -1})
+}
+
+// TestCompileFindBodyWBAndNL exercises buildFindBody when both hasWordBoundary and
+// hasNewlineBoundary are true simultaneously. (?m:\bfoo$) has \b (word boundary)
+// and (?m:$) (EmptyEndLine), causing both emitWBPreAcceptCheck and emitNLPreAcceptCheck
+// to emit code in the same find loop body.
+func TestCompileFindBodyWBAndNL(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m:\bfoo$)`, FindFunc: "f"}}, noHybridOpts())
+}
+
+// TestCompileBTCaptureWithMemo exercises the useMemo=true initialization block in
+// buildBacktrackBody for the capture path. ((?:a?)+?) selects BT (non-greedy +?)
+// and needsBitState returns true (non-greedy loop with zero-matchable body a?),
+// so useMemo=true and the memo locals and zero-init code are emitted.
+func TestCompileBTCaptureWithMemo(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "((?:a?)+?)", GroupsFunc: "g"}})
+}
+
 // TestCompileNFAFirstBytesFold exercises the fold-case alternative byte path
 // in nfaFirstBytes. (?i:abc) has first byte 'a' with fold alternative 'A'.
 func TestCompileNFAFirstBytesFold(t *testing.T) {
