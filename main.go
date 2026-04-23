@@ -2,11 +2,12 @@
 //
 // Usage:
 //
-//	regexped generate [--config=<file>] [--output=<file>|-]
-//	regexped compile  [--config=<file>] [--output=<file>|-]
-//	regexped merge    [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
+//	regexped [--debug] generate [--config=<file>] [--output=<file>|-]
+//	regexped [--debug] compile  [--config=<file>] [--output=<file>|-]
+//	regexped [--debug] merge    [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
 //
 // The config file defaults to regexped.yaml in the current directory when not specified.
+// Global flags (--debug) must appear before the subcommand name.
 package main
 
 import (
@@ -24,28 +25,41 @@ import (
 
 func main() {
 	log.SetFlags(0)
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	if len(os.Args) < 2 {
+
+	debug := flag.Bool("debug", false, "enable debug logging")
+	flag.Usage = printUsage
+	flag.Parse()
+
+	level := slog.LevelWarn
+	if *debug {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+
+	if flag.NArg() < 1 {
 		printUsage()
 		os.Exit(1)
 	}
 
-	switch os.Args[1] {
+	switch flag.Arg(0) {
 	case "generate":
-		runGenerateCmd(os.Args[2:])
+		runGenerateCmd(flag.Args()[1:])
 	case "compile":
-		runCompileCmd(os.Args[2:])
+		runCompileCmd(flag.Args()[1:])
 	case "merge":
-		runMergeCmd(os.Args[2:])
+		runMergeCmd(flag.Args()[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", flag.Arg(0))
 		printUsage()
 		os.Exit(1)
 	}
 }
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, `Usage: regexped <command> [options]
+	fmt.Fprint(os.Stderr, `Usage: regexped [--debug] <command> [options]
+
+Global flags:
+  --debug   Enable debug logging (default: warnings only)
 
 Commands:
   generate  Generate language stubs (Rust/Go/JS/TS/AS) from a config file
