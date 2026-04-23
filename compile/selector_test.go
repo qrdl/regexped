@@ -155,27 +155,27 @@ func TestPrintAnalysis(t *testing.T) {
 // TestSelectEngineNonCapturePaths exercises selectBestEngine branches that only fire
 // for non-capture patterns and are not covered by the existing capture-group tests.
 func TestSelectEngineNonCapturePaths(t *testing.T) {
-	// Non-capture user alternation → sets LeftmostFirst=true (lines 125-130).
+	// Non-capture user alternation → sets LeftmostFirst=true.
 	t.Run("user_alternation", func(t *testing.T) {
 		got, err := SelectEngine("a|b", CompileOptions{})
 		if err != nil {
 			t.Fatalf("SelectEngine: %v", err)
 		}
 		if got == EngineBacktrack || got == EngineTDFA {
-			t.Errorf("SelectEngine(a|b) = %v, expected DFA-family", got)
+			t.Errorf("SelectEngine(%q) = %v, want DFA or CompiledDFA (no captures)", "a|b", got)
 		}
 	})
-	// Anchor + word boundary → both hasAnchor and hasWordBoundary set → early break (line 42).
+	// Anchor + word boundary → both hasAnchor and hasWordBoundary set → early break in detection loop.
 	t.Run("anchor_and_word_boundary", func(t *testing.T) {
 		got, err := SelectEngine(`^\bfoo`, CompileOptions{})
 		if err != nil {
 			t.Fatalf("SelectEngine: %v", err)
 		}
 		if got == EngineBacktrack || got == EngineTDFA {
-			t.Errorf(`SelectEngine(^\bfoo) = %v, expected DFA-family`, got)
+			t.Errorf("SelectEngine(%q) = %v, want DFA or CompiledDFA (no captures)", `^\bfoo`, got)
 		}
 	})
-	// Mixed ASCII+non-ASCII char class → HasUnicode=true in analysePattern → complexity="Unicode" (line 70).
+	// Mixed ASCII+non-ASCII char class → HasUnicode=true in analysePattern → complexity="Unicode".
 	// [a-é] has hasASCII=true so needsUnicodeSupport returns false, but the last rune (0xe9) > 127
 	// sets analysis.HasUnicode=true.
 	t.Run("unicode", func(t *testing.T) {
@@ -184,17 +184,17 @@ func TestSelectEngineNonCapturePaths(t *testing.T) {
 			t.Fatalf("SelectEngine: %v", err)
 		}
 		if got == EngineBacktrack || got == EngineTDFA {
-			t.Errorf(`SelectEngine([a-é]+) = %v, expected DFA-family`, got)
+			t.Errorf("SelectEngine(%q) = %v, want DFA or CompiledDFA (no captures)", "[a-é]+", got)
 		}
 	})
-	// Long pattern: EstimatedDFAStates > 100, no Unicode, no alternations → complexity="Complex" (line 72).
+	// Long pattern: EstimatedDFAStates > 100, no Unicode, no alternations → complexity="Complex".
 	t.Run("complex_dfa_estimate", func(t *testing.T) {
 		got, err := SelectEngine("a{101}", CompileOptions{})
 		if err != nil {
 			t.Fatalf("SelectEngine: %v", err)
 		}
 		if got == EngineBacktrack || got == EngineTDFA {
-			t.Errorf("SelectEngine(a{101}) = %v, expected DFA-family", got)
+			t.Errorf("SelectEngine(%q) = %v, want DFA or CompiledDFA (no captures)", "a{101}", got)
 		}
 	})
 }
