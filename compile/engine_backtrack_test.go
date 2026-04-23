@@ -92,6 +92,14 @@ func TestBtMemoMaxLenFor(t *testing.T) {
 	}
 }
 
+func TestBtMemoMaxLenForEmptyProg(t *testing.T) {
+	// N==0 early-return path: prog with no instructions returns 0.
+	empty := &syntax.Prog{}
+	if got := btMemoMaxLenFor(empty, 128*1024); got != 0 {
+		t.Errorf("btMemoMaxLenFor(empty prog) = %d, want 0", got)
+	}
+}
+
 func TestBtFoldRune(t *testing.T) {
 	cases := []struct {
 		r    rune

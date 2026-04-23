@@ -434,6 +434,132 @@ func TestWasmTableBaseType2Segment(t *testing.T) {
 	}
 }
 
+// TestDecodeULEB128Truncated exercises the fallback return when data ends without
+// a terminating byte (both bytes have the continuation bit set).
+func TestDecodeULEB128Truncated(t *testing.T) {
+	data := []byte{0x80, 0x80} // continuation bytes only, no terminator
+	_, n := DecodeULEB128(data)
+	if n != len(data) {
+		t.Errorf("DecodeULEB128 truncated: consumed %d bytes, want %d", n, len(data))
+	}
+}
+
+// TestDecodeSLEB128Truncated exercises the fallback return when data ends mid-sequence.
+func TestDecodeSLEB128Truncated(t *testing.T) {
+	data := []byte{0x80, 0x80} // continuation bytes only, no terminator
+	_, n := DecodeSLEB128(data)
+	if n != len(data) {
+		t.Errorf("DecodeSLEB128 truncated: consumed %d bytes, want %d", n, len(data))
+	}
+}
+
+// TestWasmMemTopInvalid exercises the not-a-WASM-file error path.
+func TestWasmMemTopInvalid(t *testing.T) {
+	f, err := os.CreateTemp("", "*.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.Write([]byte("not a wasm file"))
+	f.Close()
+	if _, err = WasmMemTop(f.Name()); err == nil {
+		t.Error("WasmMemTop: expected error for non-WASM input")
+	}
+}
+
+// TestWasmMemTopGlobalWins exercises the branch where the global section value
+// is the maximum and updates top (line "top = v" for case 6).
+func TestWasmMemTopGlobalWins(t *testing.T) {
+	var globalPayload []byte
+	globalPayload = AppendULEB128(globalPayload, 1)
+	globalPayload = append(globalPayload, 0x7F, 0x01) // i32, mutable
+	globalPayload = append(globalPayload, 0x41)
+	globalPayload = AppendSLEB128(globalPayload, 999999)
+	globalPayload = append(globalPayload, 0x0b)
+
+	var raw []byte
+	raw = append(raw, 0x00, 0x61, 0x73, 0x6d)
+	raw = append(raw, 0x01, 0x00, 0x00, 0x00)
+	raw = appendTestSection(raw, 6, globalPayload)
+
+	f, err := os.CreateTemp("", "*.wasm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.Write(raw)
+	f.Close()
+
+	got, err := WasmMemTop(f.Name())
+	if err != nil {
+		t.Fatalf("WasmMemTop global wins: %v", err)
+	}
+	if got != 999999 {
+		t.Errorf("WasmMemTop global wins: got %d, want 999999", got)
+	}
+}
+
+// TestWasmMemTopDataWins exercises the branch where the data section value
+// is the maximum and updates top (line "top = v" for case 11).
+func TestWasmMemTopDataWins(t *testing.T) {
+	var dataSeg []byte
+	dataSeg = AppendULEB128(dataSeg, 0) // type=0 active
+	dataSeg = append(dataSeg, 0x41)
+	dataSeg = AppendSLEB128(dataSeg, 900000)
+	dataSeg = append(dataSeg, 0x0b)
+	dataSeg = AppendULEB128(dataSeg, 1000)
+	dataSeg = append(dataSeg, make([]byte, 1000)...)
+	var dataPayload []byte
+	dataPayload = AppendULEB128(dataPayload, 1)
+	dataPayload = append(dataPayload, dataSeg...)
+
+	var raw []byte
+	raw = append(raw, 0x00, 0x61, 0x73, 0x6d)
+	raw = append(raw, 0x01, 0x00, 0x00, 0x00)
+	raw = appendTestSection(raw, 11, dataPayload)
+
+	f, err := os.CreateTemp("", "*.wasm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.Write(raw)
+	f.Close()
+
+	got, err := WasmMemTop(f.Name())
+	if err != nil {
+		t.Fatalf("WasmMemTop data wins: %v", err)
+	}
+	if got != 901000 { // offset 900000 + size 1000
+		t.Errorf("WasmMemTop data wins: got %d, want 901000", got)
+	}
+}
+
+// TestFindMagicInDataSectionType2Direct calls findMagicInDataSection directly with
+// a type-2 segment containing ReservationMagic to cover the match-found return path.
+func TestFindMagicInDataSectionType2Direct(t *testing.T) {
+	const segOffset = int32(77777)
+	var data []byte
+	data = AppendULEB128(data, 1)         // count=1
+	data = AppendULEB128(data, 2)         // segType=2
+	data = AppendULEB128(data, 0)         // memory index
+	data = append(data, 0x41)             // i32.const
+	data = AppendSLEB128(data, segOffset) // offset
+	data = append(data, 0x0b)             // end
+	payload := make([]byte, 64)
+	copy(payload, ReservationMagic[:])
+	data = AppendULEB128(data, 64)
+	data = append(data, payload...)
+
+	got, err := findMagicInDataSection(data)
+	if err != nil {
+		t.Fatalf("findMagicInDataSection type2: %v", err)
+	}
+	if got != int64(segOffset) {
+		t.Errorf("findMagicInDataSection type2: got %d, want %d", got, segOffset)
+	}
+}
+
 func TestWasmTableBasePassiveSegment(t *testing.T) {
 	// type 1 (passive) segment with magic — passive has no offset, ignored.
 	var seg1 []byte
