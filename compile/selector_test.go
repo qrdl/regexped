@@ -152,6 +152,29 @@ func TestPrintAnalysis(t *testing.T) {
 	printAnalysis(a) // must not panic
 }
 
+// TestSelectEngineLineAnchorCapture verifies that capture patterns with line anchors
+// or word boundaries are routed to Backtrack (not TDFA).
+func TestSelectEngineLineAnchorCapture(t *testing.T) {
+	cases := []struct {
+		pattern string
+		want    EngineType
+	}{
+		{"(?m:^(foo)$)", EngineBacktrack}, // multiline begin/end-line + capture
+		{"^(foo)$", EngineBacktrack},       // EmptyEndText counts as line anchor
+		{`(\bfoo\b)`, EngineBacktrack},    // word boundary + capture
+	}
+	for _, c := range cases {
+		got, err := SelectEngine(c.pattern, CompileOptions{})
+		if err != nil {
+			t.Errorf("SelectEngine(%q): %v", c.pattern, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("SelectEngine(%q) = %v, want %v", c.pattern, got, c.want)
+		}
+	}
+}
+
 func TestGetFirstRuneSet(t *testing.T) {
 	compile := func(pattern string) *syntax.Prog {
 		t.Helper()

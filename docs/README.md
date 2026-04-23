@@ -1,7 +1,8 @@
 # Regexped
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/qrdl/regexped)](https://goreportcard.com/report/github.com/qrdl/regexped)
-[![Tests](https://github.com/qrdl/regexped/actions/workflows/ci.yml/badge.svg?query=branch%3Amain)](https://github.com/qrdl/regexped/actions/workflows/ci.yml?query=branch%3Amain)
+[![Build](https://github.com/qrdl/regexped/actions/workflows/ci.yml/badge.svg)](https://github.com/qrdl/regexped/actions/workflows/ci.yml)
+[![Scan](https://github.com/qrdl/regexped/actions/workflows/codeql.yml/badge.svg)](https://github.com/qrdl/regexped/actions/workflows/codeql.yml)
 [![codecov](https://codecov.io/github/qrdl/regexped/graph/badge.svg)](https://codecov.io/github/qrdl/regexped)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=fff)](https://hub.docker.com/r/qrdl/regexped)
 
@@ -43,35 +44,35 @@ docker pull qrdl/regexped
 docker run --rm -v $(pwd):/work -w /work qrdl/regexped <command> [flags]
 ```
 
-See [docs/docker.md](docs/docker.md) for full Docker usage and workflow examples.
+See [docker.md](docker.md) for full Docker usage and workflow examples.
 
 ## Usage
 
-- **CLI** — see [docs/cli.md](docs/cli.md) for all commands, flags, and config schema.
-- **Docker** — see [docs/docker.md](docs/docker.md); official image [`qrdl/regexped`](https://hub.docker.com/r/qrdl/regexped) includes `wasm-merge`.
+- **CLI** — see [cli.md](cli.md) for all commands, flags, and config schema.
+- **Docker** — see [docker.md](docker.md); official image [`qrdl/regexped`](https://hub.docker.com/r/qrdl/regexped) includes `wasm-merge`.
 
 ## Documentation
 
-- [CLI reference](docs/cli.md) — commands, flags, config schema, pattern support
+- [CLI reference](cli.md) — commands, flags, config schema, pattern support
 
 **Languages**
-- [Rust API](docs/rust-api.md) — generated Rust stubs
-- [Go API](docs/go-api.md) — generated Go stubs
-- [JavaScript API](docs/js-api.md) — generated JS ES module and generator functions
-- [TypeScript API](docs/ts-api.md) — generated TS ES module with typed generator functions
-- [AssemblyScript API](docs/as-api.md) — generated AS module with typed iterator classes
-- [C API](docs/c-api.md) — generated C header with static iterator functions
+- [Rust API](rust-api.md) — generated Rust stubs
+- [Go API](go-api.md) — generated Go stubs
+- [JavaScript API](js-api.md) — generated JS ES module and generator functions
+- [TypeScript API](ts-api.md) — generated TS ES module with typed generator functions
+- [AssemblyScript API](as-api.md) — generated AS module with typed iterator classes
+- [C API](c-api.md) — generated C header with static iterator functions
 
 **Environments**
-- [Browser embedding](docs/browser.md) — standalone WASM, JS/TS stub, no merge needed
-- [Node.js](docs/node.md) — standalone WASM, TypeScript stub, `readFileSync` + `init()`
-- [Cloudflare Workers](docs/workers.md) — standalone WASM, JS module import, isolate-level init
-- [Gcore FastEdge](docs/fastedge.md) — embedded WASM, Rust stubs, merge workflow
+- [Browser embedding](browser.md) — standalone WASM, JS/TS stub, no merge needed
+- [Node.js](node.md) — standalone WASM, TypeScript stub, `readFileSync` + `init()`
+- [Cloudflare Workers](workers.md) — standalone WASM, JS module import, isolate-level init
+- [Gcore FastEdge](fastedge.md) — embedded WASM, Rust stubs, merge workflow
 
 **Internals**
-- [Engines](docs/engines.md) — DFA, TDFA, Backtracking, engine selection
-- [RE2 test coverage](docs/re2.md) — pass/skip counts per engine and skip reasons
-- [WASM internals](docs/wasm.md) — WASM interface, memory layout, table formats
+- [Engines](engines.md) — DFA, TDFA, Backtracking, engine selection
+- [RE2 test coverage](re2.md) — pass/skip counts per engine and skip reasons
+- [WASM internals](wasm.md) — WASM interface, memory layout, table formats
 
 ## Examples
 
@@ -79,7 +80,7 @@ Examples are available for the following environments: wasmtime, Node.js, Cloudf
 
 Languages: Rust, Go, C, JavaScript, TypeScript, AssemblyScript.
 
-See [`examples/README.md`](examples/README.md) for more details.
+See [`examples/README.md`](../examples/README.md) for more details.
 
 ## Performance
 
@@ -108,9 +109,9 @@ See [`examples/README.md`](examples/README.md) for more details.
 
 ## Requirements
 
-- Go 1.25
+- Go 1.25 (build only)
 - `wasm-merge` from [Binaryen](https://github.com/WebAssembly/binaryen) (for `merge` command)
 
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](../LICENSE).
