@@ -28,8 +28,10 @@ jobs:
         with:
           languages: go
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
+      - name: Build
+        run: |
+          go build -o regexped .
+          go test ./compile/... ./config/... ./generate/... ./merge/... ./internal/...
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
