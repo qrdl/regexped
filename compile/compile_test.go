@@ -643,6 +643,26 @@ func TestCompileBTInstHandlerNonLoopAlt(t *testing.T) {
 	}
 }
 
+// TestCompileAnchoredFindBodyNLBoundary exercises the hasNewlineBoundary path in
+// buildAnchoredFindBody (u8 simple path). ^[a-z]+(?m:$): ^ anchors the find,
+// (?m:$) sets hasNewlineBoundary=true; [a-z] has no fixed literal so
+// findLitAnchorPoint returns nil and appendFindCodeEntry reaches buildAnchoredFindBody.
+func TestCompileAnchoredFindBodyNLBoundary(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `^[a-z]+(?m:$)`, FindFunc: "f"}}, noHybridOpts())
+}
+
+// TestCompileAnchoredFindBodyCompressedNL exercises the useU8&&useCompression path in
+// buildAnchoredFindBody. ^[a-z]{130}(?m:$): ~132 DFA states → table >32KB → useCompression=true.
+func TestCompileAnchoredFindBodyCompressedNL(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `^[a-z]{130}(?m:$)`, FindFunc: "f"}}, noHybridOpts())
+}
+
+// TestCompileAnchoredFindBodyU16NL exercises the u16 path in buildAnchoredFindBody.
+// ^[a-z]{512}(?m:$): ~513 DFA states > 256 → useU8=false → u16 table path.
+func TestCompileAnchoredFindBodyU16NL(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `^[a-z]{512}(?m:$)`, FindFunc: "f"}}, noHybridOpts())
+}
+
 // TestCompileFindBodyFlags exercises flag-dependent branches in buildFindBody
 // (non-hybrid mode), each requiring a specific DFA property.
 func TestCompileFindBodyFlags(t *testing.T) {

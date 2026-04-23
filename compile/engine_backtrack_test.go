@@ -108,6 +108,23 @@ func TestBtFoldRune(t *testing.T) {
 	}
 }
 
+// TestBtCheckRune1FoldDirect exercises the isFold=true branch in btCheckRune1
+// by calling it with a manually constructed InstRune1+FoldCase instruction.
+// Go's regex compiler never produces InstRune1 with FoldCase (it expands case-
+// insensitive single chars to InstRune with a character class), so this branch
+// is only reachable via a directly constructed instruction.
+func TestBtCheckRune1FoldDirect(t *testing.T) {
+	inst := syntax.Inst{
+		Op:   syntax.InstRune1,
+		Arg:  uint32(syntax.FoldCase),
+		Rune: []rune{'a'},
+	}
+	result := btCheckRune1(nil, inst, 0)
+	if len(result) == 0 {
+		t.Error("btCheckRune1(isFold=true): expected non-empty WASM output")
+	}
+}
+
 func TestBtCheckRune1CaseFold(t *testing.T) {
 	// (?i:a) compiled with BT engine exercises btCheckRune1 with isFold=true.
 	_, _, err := compileForced(

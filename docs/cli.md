@@ -59,6 +59,20 @@ Regexped uses RE2 syntax. Backreferences are not supported by design.
 
 ---
 
+## Global flags
+
+These flags must appear before the subcommand name.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--debug` | off | Enable debug logging. By default only warnings are printed. |
+
+```bash
+regexped --debug compile --config=regexped.yaml
+```
+
+---
+
 ## Commands
 
 All commands validate their required options and config fields before doing any work.
@@ -66,7 +80,7 @@ All commands validate their required options and config fields before doing any 
 ### `generate` — Generate language stubs
 
 ```
-regexped generate [--config=<file>] [--output=<file>|-]
+regexped [--debug] generate [--config=<file>] [--output=<file>|-]
 ```
 
 Generates a stub file (Rust, JS, TypeScript, Go, or C) from the config. The stub type is determined by:
@@ -169,7 +183,7 @@ See [as-api.md](as-api.md) for full usage examples and slot layout.
 ### `compile` — Compile patterns to WASM
 
 ```
-regexped compile [--config=<file>] [--output=<file>|-]
+regexped [--debug] compile [--config=<file>] [--output=<file>|-]
 ```
 
 Compiles each regex pattern to a single WASM module. The output mode is selected automatically based on the config:
@@ -198,7 +212,7 @@ Entries with no `_func` fields are silently skipped.
 ### `merge` — Merge WASM modules
 
 ```
-regexped merge [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
+regexped [--debug] merge [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
 ```
 
 Merges the host main WASM with one or more regex WASM modules into a single binary using `wasm-merge`. Each regex module's memory is kept separate (multi-memory) and renumbered by wasm-merge.
