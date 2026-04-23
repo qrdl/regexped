@@ -145,6 +145,23 @@ func TestTDFARegisterMinimization(t *testing.T) {
 	}
 }
 
+// TestEmitTDFATagOpCopy exercises the op.src >= 0 (register-to-register copy) branch
+// in emitTDFATagOp directly, since this path is difficult to trigger via pattern selection.
+func TestEmitTDFATagOpCopy(t *testing.T) {
+	op := tdfaTagOp{dst: 1, src: 0} // copy register 0 → register 1
+	result := emitTDFATagOp(op, nil, 3, 4)
+	// Expected: local.get (localCapBase+src = 4+0 = 4); local.set (localCapBase+dst = 4+1 = 5)
+	if len(result) < 3 {
+		t.Fatalf("emitTDFATagOp(copy): expected ≥3 bytes, got %d: %v", len(result), result)
+	}
+	if result[0] != 0x20 {
+		t.Errorf("byte[0] = 0x%02x, want 0x20 (local.get)", result[0])
+	}
+	if result[1] != 4 {
+		t.Errorf("byte[1] = %d, want 4 (localCapBase+src)", result[1])
+	}
+}
+
 func TestTDFAEpsCapOps(t *testing.T) {
 	compile := func(pattern string) *syntax.Prog {
 		t.Helper()

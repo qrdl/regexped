@@ -1,10 +1,8 @@
-name: Code scanning
+name: Scan
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
   schedule:
     - cron: '0 0 * * 6'
 
@@ -27,32 +25,19 @@ jobs:
         uses: github/codeql-action/init@v4
         with:
           languages: go
+          config: |
+            paths-ignore:
+              - re2test
+              - perftest
+              - examples
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
+      - name: Build
+        run: |
+          go build -o regexped .
+          go test ./compile/... ./config/... ./generate/... ./merge/... ./internal/...
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
-        with:
-          category: "/language:go"
-          output: sarif-results
-          upload: failure-only
-
-      - name: Filter SARIF
-        uses: advanced-security/filter-sarif@v1
-        with:
-          patterns: |
-            -**/*_test.go
-            -re2test/**
-            -perftest/**
-            -examples/**
-          input: sarif-results/go.sarif
-          output: sarif-results/go.sarif
-
-      - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: sarif-results/go.sarif
 
   analyze-actions:
     name: Analyze Actions

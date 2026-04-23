@@ -643,6 +643,123 @@ func TestCompileBTInstHandlerNonLoopAlt(t *testing.T) {
 	}
 }
 
+// TestCompileFindBodyFlags exercises flag-dependent branches in buildFindBody
+// (non-hybrid mode), each requiring a specific DFA property.
+func TestCompileFindBodyFlags(t *testing.T) {
+	// hasImmAccept: a* accepts the empty string → immediateAccept at start state.
+	t.Run("imm_accept", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "a*", FindFunc: "f"}}, noHybridOpts())
+	})
+	// hasWordBoundary: non-anchored find with \b emits word-char table and midAcceptW/NW.
+	t.Run("word_boundary", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `\bfoo\b`, FindFunc: "f"}}, noHybridOpts())
+	})
+	// hasNewlineBoundary: (?m:$) emits midAcceptNL table.
+	t.Run("newline_boundary", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m:foo$)`, FindFunc: "f"}}, noHybridOpts())
+	})
+	// useMandatoryLit: pattern has a mandatory interior literal ("://") with no fixed prefix.
+	t.Run("mandatory_lit", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `[a-z]+://\S+`, FindFunc: "f"}}, noHybridOpts())
+	})
+}
+
+// TestCompileAnchoredFindBodyFlags exercises flag-dependent branches in buildAnchoredFindBody
+// (non-hybrid mode).
+func TestCompileAnchoredFindBodyFlags(t *testing.T) {
+	// hasImmAccept: ^a* is anchored and has immediateAccept at the start state.
+	t.Run("imm_accept", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "^a*", FindFunc: "f"}}, noHybridOpts())
+	})
+	// hasNewlineBoundary: \A anchors the find; (?m:$) adds EmptyEndLine → midAcceptNL.
+	// midStartNewline is dead because \A requires ecBeginText which ecBeginLine cannot satisfy.
+	t.Run("newline_boundary", func(t *testing.T) {
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: `\Afoo(?m:$)`, FindFunc: "f"}}, noHybridOpts())
+	})
+}
+
+// TestCompileHybridMatchBodyCompressed exercises the useCompression branch in buildHybridMatchBody.
+// a{130} produces ~132 states: 132×256 = 33 792 > 32 KB → useCompression=true;
+// 133 states ≤ default threshold 256 → useHybridDispatch=true.
+func TestCompileHybridMatchBodyCompressed(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a{130}", MatchFunc: "m"}},
+		CompileOptions{MaxDFAStates: 100000})
+}
+
+// TestCompileHybridMatchBodyImmAccept exercises the hasImmAccept branch in buildHybridMatchBody.
+// a* accepts the empty string → immediateAccept at start state → hybrid match with hasImmAccept=true.
+func TestCompileHybridMatchBodyImmAccept(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a*", MatchFunc: "m"}})
+}
+
+// TestCompileEmbeddedFindPaths exercises tableMemIdx=1 branches in the DFA find WASM emitter.
+func TestCompileEmbeddedFindPaths(t *testing.T) {
+	embed := func(t *testing.T, entries []config.RegexEntry, opts ...CompileOptions) {
+		t.Helper()
+		var o CompileOptions
+		if len(opts) > 0 {
+			o = opts[0]
+		}
+		wasm, _, err := Compile(entries, 0, false, o)
+		if err != nil {
+			t.Fatalf("Compile(embedded): %v", err)
+		}
+		if !bytes.HasPrefix(wasm, wasmMagic) {
+			t.Fatal("output is not a valid WASM module")
+		}
+	}
+	// appendTableLoad16u tableMemIdx=1: u16 find (>256 states) in embedded mode.
+	t.Run("u16_find", func(t *testing.T) {
+		embed(t, []config.RegexEntry{{Pattern: "a{512}", FindFunc: "f"}},
+			CompileOptions{MaxDFAStates: 100000})
+	})
+	// appendTableVLoad tableMemIdx=1: Teddy find in embedded mode.
+	// (foo|bar)[0-9]+ has 2 first bytes (f/b), no mandatory interior literal →
+	// useMandatoryLit=false → emitOuterPrologue → Teddy VLoad with tableMemIdx=1.
+	t.Run("teddy_find", func(t *testing.T) {
+		embed(t, []config.RegexEntry{{Pattern: `(foo|bar)[0-9]+`, FindFunc: "f"}})
+	})
+	// word char table with tableMemIdx=1: word boundary find in embedded mode.
+	t.Run("word_boundary_find", func(t *testing.T) {
+		embed(t, []config.RegexEntry{{Pattern: `\bfoo\b`, FindFunc: "f"}})
+	})
+	// appendTableStore32/Store8 tableMemIdx=1: BT find fallback in embedded mode.
+	t.Run("bt_find", func(t *testing.T) {
+		embed(t, []config.RegexEntry{{Pattern: "(?:a?)+?", FindFunc: "f"}},
+			CompileOptions{MaxDFAStates: 1})
+	})
+}
+
+// TestCompileEmbeddedBTMatch exercises appendTableStore32/Load32 with tableMemIdx=1
+// in the BT match (groups) path when compiled in embedded mode.
+func TestCompileEmbeddedBTMatch(t *testing.T) {
+	wasm, _, err := compileForced(
+		[]config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}},
+		0, false, EngineBacktrack,
+	)
+	if err != nil {
+		t.Fatalf("compileForced(embedded BT match): %v", err)
+	}
+	if !bytes.HasPrefix(wasm, wasmMagic) {
+		t.Fatal("output is not a valid WASM module")
+	}
+}
+
+// TestStripSegCountEmpty exercises the len(data)==0 early return in stripSegCount.
+func TestStripSegCountEmpty(t *testing.T) {
+	data, n := stripSegCount(nil)
+	if data != nil || n != 0 {
+		t.Errorf("stripSegCount(nil) = (%v, %d), want (nil, 0)", data, n)
+	}
+}
+
+// TestEngineTypeStringUnknown exercises the default case of EngineType.String().
+func TestEngineTypeStringUnknown(t *testing.T) {
+	if got := EngineType(99).String(); got == "" {
+		t.Error("EngineType(99).String() returned empty string, want non-empty")
+	}
+}
+
 // TestCompileNFAFirstBytesFold exercises the fold-case alternative byte path
 // in nfaFirstBytes. (?i:abc) has first byte 'a' with fold alternative 'A'.
 func TestCompileNFAFirstBytesFold(t *testing.T) {
