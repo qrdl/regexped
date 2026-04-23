@@ -25,6 +25,11 @@ jobs:
         uses: github/codeql-action/init@v4
         with:
           languages: go
+          config: |
+            paths-ignore:
+              - re2test
+              - perftest
+              - examples
 
       - name: Build
         run: |
