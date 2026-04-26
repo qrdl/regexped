@@ -235,11 +235,11 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 
 	// DFA-compatible accept/transition tables — built in parallel with tag data.
 	// We build the dfaTable fields manually so we can pass the result to minimizeDFA.
-	dfaAccepting := make(map[int]bool)
-	dfaMidAccepting := make(map[int]bool)
-	dfaMidAcceptNW := make(map[int]bool)
-	dfaMidAcceptW := make(map[int]bool)
-	dfaImmediateAccepting := make(map[int]bool)
+	dfaAccepting := make(map[int]uint64)
+	dfaMidAccepting := make(map[int]uint64)
+	dfaMidAcceptNW := make(map[int]uint64)
+	dfaMidAcceptW := make(map[int]uint64)
+	dfaImmediateAccepting := make(map[int]uint64)
 	var dfaTransitions []int // allocated after construction
 
 	// Tag operation tables.
@@ -377,10 +377,10 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			eofWBCtx = ecNoWordBoundary
 		}
 		if isAccepting(pcs, ecEnd|eofWBCtx) {
-			dfaAccepting[id] = true
+			dfaAccepting[id] = 1
 		}
 		if isAccepting(pcs, 0) {
-			dfaMidAccepting[id] = true
+			dfaMidAccepting[id] = 1
 		}
 		var nwCtx, wCtx int
 		if prevWasWord {
@@ -391,13 +391,13 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			wCtx = ecWordBoundary
 		}
 		if isAccepting(pcs, nwCtx) {
-			dfaMidAcceptNW[id] = true
+			dfaMidAcceptNW[id] = 1
 		}
 		if isAccepting(pcs, wCtx) {
-			dfaMidAcceptW[id] = true
+			dfaMidAcceptW[id] = 1
 		}
 		if isImmediateAccepting(pcs, prog) {
-			dfaImmediateAccepting[id] = true
+			dfaImmediateAccepting[id] = 1
 		}
 
 		// Build acceptRegMap: which register holds each tag in the highest-priority

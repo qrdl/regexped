@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"regexp/syntax"
+	"sort"
 
 	"github.com/qrdl/regexped/config"
 )
@@ -87,29 +88,15 @@ func dfaFingerprint(t *dfaTable) uint64 {
 
 	for s := 0; s < t.numStates; s++ {
 		for b := 0; b < 256; b++ {
-			// +1 so that -1 (dead) maps to 0, not wrapping.
 			writeU64(uint64(t.transitions[s*256+b] + 1))
 		}
-		var af uint8
-		if t.acceptStates[s] {
-			af |= 1
-		}
-		if t.midAcceptStates[s] {
-			af |= 2
-		}
-		if t.midAcceptNWStates[s] {
-			af |= 4
-		}
-		if t.midAcceptWStates[s] {
-			af |= 8
-		}
-		if t.midAcceptNLStates[s] {
-			af |= 16
-		}
-		if t.immediateAcceptStates[s] {
-			af |= 32
-		}
-		h.Write([]byte{af})
+		// Hash actual uint64 bitmasks for precision across single- and multi-pattern paths.
+		writeU64(t.acceptStates[s])
+		writeU64(t.midAcceptStates[s])
+		writeU64(t.midAcceptNWStates[s])
+		writeU64(t.midAcceptWStates[s])
+		writeU64(t.midAcceptNLStates[s])
+		writeU64(t.immediateAcceptStates[s])
 	}
 	return h.Sum64()
 }
@@ -136,12 +123,12 @@ func dfaTableEqual(a, b *dfaTable) bool {
 			return false
 		}
 	}
-	eqMaps := func(ma, mb map[int]bool) bool {
+	eqMaps := func(ma, mb map[int]uint64) bool {
 		if len(ma) != len(mb) {
 			return false
 		}
-		for s := range ma {
-			if !mb[s] {
+		for s, va := range ma {
+			if mb[s] != va {
 				return false
 			}
 		}
@@ -227,4 +214,175 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	info.suffixID = suffixPool.Add(suffixTable)
 
 	return info, nil
+}
+
+// --------------------------------------------------------------------------
+// Phase 2: single-bucket merge
+
+// AcceptKind describes how accept bits are encoded in the merged suffix DFA.
+// Phase 6 will add AcceptSparseSet for WAF-scale patterns.
+type AcceptKind int
+
+const (
+	AcceptBitmask AcceptKind = iota + 1 // one bit per pattern in a u64 per DFA state
+)
+
+// CompileSetOptions holds tunable parameters for set composition.
+// Zero value uses defaults.
+type CompileSetOptions struct {
+	BitmaskWidth         int // max patterns per bucket using AcceptBitmask; default 64
+	MaxPatternsPerBucket int // hard cap for AcceptSparseSet (Phase 6); default 4096
+}
+
+// mergeSuffixASTs builds a canonical union AST from suffix sub-trees.
+// Sorts the inputs by re.String() before alternation so patterns sharing
+// prefixes converge in the NFA sooner, reducing DFA state count.
+func mergeSuffixASTs(asts []*syntax.Regexp) *syntax.Regexp {
+	if len(asts) == 0 {
+		return nil
+	}
+	if len(asts) == 1 {
+		return deepCopyRegexp(asts[0])
+	}
+	sorted := make([]*syntax.Regexp, len(asts))
+	for i, a := range asts {
+		sorted[i] = deepCopyRegexp(a)
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].String() < sorted[j].String()
+	})
+	return &syntax.Regexp{Op: syntax.OpAlternate, Sub: sorted}
+}
+
+// combinedClassCount returns the number of byte equivalence classes produced
+// by merging class maps a and b. Two bytes are in the same combined class only
+// if they are in the same class in both a and b.
+func combinedClassCount(a, b [256]byte) int {
+	type pair struct{ ca, cb byte }
+	seen := make(map[pair]struct{})
+	for i := range a {
+		seen[pair{a[i], b[i]}] = struct{}{}
+	}
+	return len(seen)
+}
+
+// mergeSuffixDFA builds a merged DFA for the union of suffix ASTs.
+// Each suffix AST is compiled individually, then their NFAs are manually
+// combined so that each pattern gets a distinct InstMatch. This avoids
+// the Go compiler merging shared suffixes into a single accept state.
+// Bit k in the patternBits vector identifies pattern k.
+//
+// Returns error if len(asts) > BitmaskWidth (default 64).
+func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, AcceptKind, error) {
+	bw := opts.BitmaskWidth
+	if bw == 0 {
+		bw = 64
+	}
+	if len(asts) == 0 {
+		return nil, 0, fmt.Errorf("mergeSuffixDFA: empty pattern list")
+	}
+	if len(asts) > bw {
+		return nil, 0, fmt.Errorf("mergeSuffixDFA: %d patterns exceed bitmaskWidth %d", len(asts), bw)
+	}
+
+	// Compile each suffix individually.
+	progs := make([]*syntax.Prog, len(asts))
+	for k, a := range asts {
+		p, err := syntax.Compile(a.Simplify())
+		if err != nil {
+			return nil, 0, fmt.Errorf("mergeSuffixDFA: compile suffix %d: %w", k, err)
+		}
+		progs[k] = p
+	}
+
+	// Build union NFA manually so each pattern gets a distinct InstMatch.
+	unionProg, patternBits := buildUnionProg(progs, bw)
+
+	d := newDFA(unionProg, false, true, patternBits)
+	t := dfaTableFromCanonical(d)
+	return t, AcceptBitmask, nil
+}
+
+// buildUnionProg concatenates individual NFAs into a single union prog with an
+// InstAlt chain at the start. Each pattern k's InstMatch instructions are
+// assigned bit k in the returned patternBits slice (indexed by instruction PC).
+//
+// Instruction 0 in each individual prog is always InstFail by convention.
+// In the combined prog we reserve position 0 as a shared InstFail; instructions
+// from prog k (skipping its own inst 0) start at offsets[k].
+func buildUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uint64) {
+	// Compute placement offsets — skip instruction 0 (InstFail) from each prog.
+	offsets := make([]int, len(progs))
+	offsets[0] = 1 // reserve position 0 for the shared InstFail
+	for k := 1; k < len(progs); k++ {
+		offsets[k] = offsets[k-1] + len(progs[k-1].Inst) - 1
+	}
+	// Position after all copied instructions.
+	copyEnd := offsets[len(progs)-1] + len(progs[len(progs)-1].Inst) - 1
+	// Alt chain: one InstAlt per pattern except the last.
+	altCount := len(progs) - 1
+	total := copyEnd + altCount
+
+	union := &syntax.Prog{
+		Inst:   make([]syntax.Inst, total),
+		NumCap: 2,
+	}
+	union.Inst[0] = syntax.Inst{Op: syntax.InstFail}
+
+	patternBits := make([]uint64, total)
+
+	// adjustPC maps a PC within prog k (with offset off) to the combined-prog PC.
+	// PC=0 in any individual prog means InstFail → stays at 0.
+	adjustPC := func(pc int, off int) int {
+		if pc == 0 {
+			return 0
+		}
+		return pc + off - 1 // -1 because we skip inst 0 from the source prog
+	}
+
+	// Copy instructions from each prog (skipping their instruction 0).
+	for k, p := range progs {
+		off := offsets[k]
+		for i := 1; i < len(p.Inst); i++ {
+			inst := p.Inst[i]
+			ni := inst
+			ni.Out = uint32(adjustPC(int(inst.Out), off))
+			if inst.Op == syntax.InstAlt || inst.Op == syntax.InstAltMatch {
+				ni.Arg = uint32(adjustPC(int(inst.Arg), off))
+			}
+			pos := off + i - 1
+			union.Inst[pos] = ni
+			if inst.Op == syntax.InstMatch && k < bitmaskWidth {
+				patternBits[pos] = 1 << uint(k)
+			}
+		}
+	}
+
+	// Compute each pattern's start PC in the combined prog.
+	starts := make([]int, len(progs))
+	for k, p := range progs {
+		starts[k] = adjustPC(p.Start, offsets[k])
+	}
+
+	if altCount == 0 {
+		union.Start = starts[0]
+		return union, patternBits
+	}
+
+	// Build the InstAlt chain at copyEnd..copyEnd+altCount-1.
+	for k := 0; k < altCount-1; k++ {
+		union.Inst[copyEnd+k] = syntax.Inst{
+			Op:  syntax.InstAlt,
+			Out: uint32(starts[k]),
+			Arg: uint32(copyEnd + k + 1), // next link in the chain
+		}
+	}
+	// Last link: branches between the second-to-last and last patterns.
+	union.Inst[copyEnd+altCount-1] = syntax.Inst{
+		Op:  syntax.InstAlt,
+		Out: uint32(starts[len(progs)-2]),
+		Arg: uint32(starts[len(progs)-1]),
+	}
+	union.Start = copyEnd
+	return union, patternBits
 }

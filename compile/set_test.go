@@ -1,10 +1,13 @@
 package compile
 
 import (
+	"os"
+	"path/filepath"
 	"regexp/syntax"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"gopkg.in/yaml.v3"
 )
 
 // --------------------------------------------------------------------------
@@ -353,7 +356,7 @@ func TestDFATableEqual_AcceptMapMismatch(t *testing.T) {
 		hasNewlineBoundary:    a.hasNewlineBoundary,
 		startBeginAccept:      a.startBeginAccept,
 		transitions:           a.transitions,
-		acceptStates:          map[int]bool{}, // empty — different from a
+		acceptStates:          map[int]uint64{}, // empty — different from a
 		midAcceptStates:       a.midAcceptStates,
 		midAcceptNWStates:     a.midAcceptNWStates,
 		midAcceptWStates:      a.midAcceptWStates,
@@ -485,10 +488,9 @@ func TestDFATableEqual_EqMapsMembership(t *testing.T) {
 		t.Skip("pattern produced no midAcceptW states")
 	}
 	// Build acceptStates/midAcceptNWStates/midAcceptWStates with same size but wrong key.
-	badW := make(map[int]bool)
-	for s := range a.midAcceptWStates {
-		// Use a state that definitely isn't in a.midAcceptWStates.
-		badW[s+a.numStates+1] = true
+	badW := make(map[int]uint64)
+	for s, v := range a.midAcceptWStates {
+		badW[s+a.numStates+1] = v
 	}
 	b := &dfaTable{
 		startState:            a.startState,
@@ -584,12 +586,12 @@ func TestBFSRelabelDFA_UnreachableStates(t *testing.T) {
 		midStartWordState:     1,
 		numStates:             3,
 		transitions:           trans,
-		acceptStates:          map[int]bool{1: true},
-		midAcceptStates:       map[int]bool{},
-		midAcceptNWStates:     map[int]bool{},
-		midAcceptWStates:      map[int]bool{},
-		midAcceptNLStates:     map[int]bool{},
-		immediateAcceptStates: map[int]bool{},
+		acceptStates:          map[int]uint64{1: 1},
+		midAcceptStates:       map[int]uint64{},
+		midAcceptNWStates:     map[int]uint64{},
+		midAcceptWStates:      map[int]uint64{},
+		midAcceptNLStates:     map[int]uint64{},
+		immediateAcceptStates: map[int]uint64{},
 	}
 
 	bfsRelabelDFA(tbl)
@@ -628,6 +630,213 @@ func TestAnalyzePattern_SharedSuffix(t *testing.T) {
 		}
 		if info.suffixID != firstSuffixID {
 			t.Errorf("pattern %q: suffixID=%d, want %d (shared suffix)", p, info.suffixID, firstSuffixID)
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
+// Phase 2: fixture loader and tests
+
+type setFixture struct {
+	Patterns []struct {
+		Pattern string `yaml:"pattern"`
+	} `yaml:"patterns"`
+	Expect struct {
+		SuffixDedupPoolSize int `yaml:"suffix_dedup_pool_size"`
+		BucketCount         int `yaml:"bucket_count"`
+	} `yaml:"expect"`
+}
+
+func testdataFixture(t *testing.T, name string) setFixture {
+	t.Helper()
+	path := filepath.Join("testdata", "set", name, "patterns.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("testdataFixture(%q): %v", name, err)
+	}
+	var f setFixture
+	if err := yaml.Unmarshal(data, &f); err != nil {
+		t.Fatalf("testdataFixture(%q): yaml: %v", name, err)
+	}
+	return f
+}
+
+func TestBitmaskPropagation_TwoPatterns(t *testing.T) {
+	// "ab" and "ac": after consuming 'b' only bit 0 accepts; after 'c' only bit 1.
+	asts := []*syntax.Regexp{mustParse(t, `ab`), mustParse(t, `ac`)}
+	table, kind, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	if err != nil {
+		t.Fatalf("mergeSuffixDFA: %v", err)
+	}
+	if kind != AcceptBitmask {
+		t.Errorf("AcceptKind = %v, want AcceptBitmask", kind)
+	}
+	// Both bit 0 and bit 1 must appear as separate accept bitmasks.
+	var combined uint64
+	for _, v := range table.acceptStates {
+		combined |= v
+	}
+	if combined&1 == 0 {
+		t.Error("bit 0 (pattern 'ab') never appears in accept bitmasks")
+	}
+	if combined&2 == 0 {
+		t.Error("bit 1 (pattern 'ac') never appears in accept bitmasks")
+	}
+	// The two patterns must produce distinct accept values (not merged into one state).
+	distinct := make(map[uint64]bool)
+	for _, v := range table.acceptStates {
+		if v != 0 {
+			distinct[v] = true
+		}
+	}
+	if len(distinct) < 2 {
+		t.Errorf("want ≥2 distinct accept bitmasks for 'ab'|'ac', got %d: %v", len(distinct), distinct)
+	}
+}
+
+func TestBitmaskPropagation_EpsilonClosure(t *testing.T) {
+	// "a?" has an epsilon path to accept (can match empty string).
+	asts := []*syntax.Regexp{mustParse(t, `a?`), mustParse(t, `b`)}
+	table, _, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	if err != nil {
+		t.Fatalf("mergeSuffixDFA: %v", err)
+	}
+	if len(table.acceptStates) == 0 {
+		t.Error("no accepting states in merged DFA")
+	}
+}
+
+func TestCombinedClassCount_Subsumed(t *testing.T) {
+	// b maps all bytes to class 0 → combined count == number of classes in a.
+	var a, b [256]byte
+	for i := range a {
+		a[i] = byte(i % 4)
+	}
+	if got := combinedClassCount(a, b); got != 4 {
+		t.Errorf("combinedClassCount (b constant): got %d, want 4", got)
+	}
+}
+
+func TestCombinedClassCount_Orthogonal(t *testing.T) {
+	// Every (a[i], b[i]) pair is unique → combined count == 256.
+	var a, b [256]byte
+	for i := range a {
+		a[i] = byte(i / 16)
+		b[i] = byte(i % 16)
+	}
+	if got := combinedClassCount(a, b); got != 256 {
+		t.Errorf("combinedClassCount (orthogonal): got %d, want 256", got)
+	}
+}
+
+func TestMergeSuffixASTs_Empty(t *testing.T) {
+	if got := mergeSuffixASTs(nil); got != nil {
+		t.Errorf("mergeSuffixASTs(nil) = %v, want nil", got)
+	}
+}
+
+func TestMergeSuffixASTs_Single(t *testing.T) {
+	re := mustParse(t, `foo`)
+	got := mergeSuffixASTs([]*syntax.Regexp{re})
+	if got == nil {
+		t.Fatal("mergeSuffixASTs([one]) returned nil")
+	}
+}
+
+func TestMergeSuffixDFA_EmptyList(t *testing.T) {
+	_, _, err := mergeSuffixDFA(nil, CompileSetOptions{})
+	if err == nil {
+		t.Error("mergeSuffixDFA(nil): expected error for empty list, got nil")
+	}
+}
+
+func TestBuildUnionProg_SinglePattern(t *testing.T) {
+	// Single pattern: altCount == 0, union.Start = starts[0], no Alt chain.
+	re, _ := syntax.Parse(`ab`, syntax.Perl)
+	prog, _ := syntax.Compile(re.Simplify())
+	union, patternBits := buildUnionProg([]*syntax.Prog{prog}, 64)
+	if union == nil {
+		t.Fatal("buildUnionProg: nil result")
+	}
+	// At least the single InstMatch should be assigned bit 0.
+	var combined uint64
+	for _, v := range patternBits {
+		combined |= v
+	}
+	if combined&1 == 0 {
+		t.Error("buildUnionProg (single): bit 0 not assigned to any instruction")
+	}
+}
+
+func TestMergeSuffixASTs_Sorted(t *testing.T) {
+	asts := []*syntax.Regexp{mustParse(t, `z`), mustParse(t, `a`)}
+	merged := mergeSuffixASTs(asts)
+	if merged == nil || merged.Op != syntax.OpAlternate || len(merged.Sub) != 2 {
+		t.Fatalf("mergeSuffixASTs: unexpected result %v", merged)
+	}
+	if merged.Sub[0].String() > merged.Sub[1].String() {
+		t.Errorf("not sorted: sub[0]=%q sub[1]=%q", merged.Sub[0], merged.Sub[1])
+	}
+}
+
+func TestMergeSuffixDFA_TooManyPatterns(t *testing.T) {
+	asts := make([]*syntax.Regexp, 65)
+	for i := range asts {
+		asts[i] = mustParse(t, `a`)
+	}
+	_, _, err := mergeSuffixDFA(asts, CompileSetOptions{BitmaskWidth: 64})
+	if err == nil {
+		t.Error("expected error for 65 patterns with BitmaskWidth=64, got nil")
+	}
+}
+
+func TestEquivalence_Compat001(t *testing.T) {
+	fix := testdataFixture(t, "compat_001")
+	var prefixPool, suffixPool dfaPool
+	var firstSuffixID int
+	for i, p := range fix.Patterns {
+		info, err := analyzePattern(config.RegexEntry{Pattern: p.Pattern}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("pattern %d %q: %v", i, p.Pattern, err)
+		}
+		if i == 0 {
+			firstSuffixID = info.suffixID
+			continue
+		}
+		if fix.Expect.SuffixDedupPoolSize > 0 && info.suffixID != firstSuffixID {
+			t.Errorf("pattern %d %q: suffixID=%d, want %d (suffix dedup failed)",
+				i, p.Pattern, info.suffixID, firstSuffixID)
+		}
+	}
+	if fix.Expect.SuffixDedupPoolSize > 0 && len(suffixPool.tables) != fix.Expect.SuffixDedupPoolSize {
+		t.Errorf("suffixPool size=%d, want %d", len(suffixPool.tables), fix.Expect.SuffixDedupPoolSize)
+	}
+}
+
+func TestEquivalence_Compat003(t *testing.T) {
+	fix := testdataFixture(t, "compat_003")
+	asts := make([]*syntax.Regexp, len(fix.Patterns))
+	for i, p := range fix.Patterns {
+		asts[i] = mustParse(t, p.Pattern)
+	}
+	table, kind, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	if err != nil {
+		t.Fatalf("mergeSuffixDFA: %v", err)
+	}
+	if kind != AcceptBitmask {
+		t.Errorf("kind=%v, want AcceptBitmask", kind)
+	}
+	if table.numStates == 0 {
+		t.Error("merged DFA has 0 states")
+	}
+	// Each pattern's bit must appear in at least one accept state.
+	var combined uint64
+	for _, v := range table.acceptStates {
+		combined |= v
+	}
+	for i := range fix.Patterns {
+		if combined>>uint(i)&1 == 0 {
+			t.Errorf("pattern %d bit not set in any accept state (combined=0x%x)", i, combined)
 		}
 	}
 }

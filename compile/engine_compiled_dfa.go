@@ -87,10 +87,10 @@ func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, hasImmAcc
 		visited[ws] = true
 		gs := int(ws) - 1 // WASM state to DFA state
 		// Stop if accept or immediateAccept — we can't skip the accept check.
-		if t.acceptStates[gs] {
+		if t.acceptStates[gs] != 0 {
 			break
 		}
-		if hasImmAccept && t.immediateAcceptStates[gs] {
+		if hasImmAccept && t.immediateAcceptStates[gs] != 0 {
 			break
 		}
 		d := disp[gs]

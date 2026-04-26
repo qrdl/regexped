@@ -97,7 +97,7 @@ func TestTDFATagOpsEqual(t *testing.T) {
 
 func TestMinimizeTDFARegistersLowRegs(t *testing.T) {
 	// numRegs <= 1 → early return, no minimization attempted.
-	base := &dfaTable{numStates: 1, transitions: make([]int, 256), acceptStates: map[int]bool{0: true}}
+	base := &dfaTable{numStates: 1, transitions: make([]int, 256), acceptStates: map[int]uint64{0: 1}}
 	tt := &tdfaTable{dfaTable: base, numRegs: 1}
 	got := minimizeTDFARegisters(tt)
 	if got != tt {

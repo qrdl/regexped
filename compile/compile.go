@@ -368,8 +368,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					revDFA := newDFA(revProg, false, false)
 					revTable := dfaTableFrom(revDFA)
 					if revTable.numStates+1 <= 256 &&
-						(lap.anchored || (!revTable.acceptStates[revTable.startState] &&
-							!revTable.midAcceptStates[revTable.startState])) {
+						(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
+							revTable.midAcceptStates[revTable.startState] == 0)) {
 						revTableBase := utils.PageAlign(l.tableEnd)
 						revL := buildDFALayout(revTable, revTableBase, true, false, 0)
 						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
