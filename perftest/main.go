@@ -956,6 +956,15 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 	copy(buf[inputBase:], []byte(input))
 	inputLen := int32(len(input))
 
+	warmupEnd := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(warmupEnd) {
+		if tc.mode == anchoredGroups {
+			benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters)) //nolint:errcheck
+		} else {
+			benchFn.Call(store, inputBase, inputLen, int32(benchIters)) //nolint:errcheck
+		}
+	}
+
 	var callErr error
 	if tc.mode == anchoredGroups {
 		_, callErr = benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters))
@@ -1057,6 +1066,11 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 	// and writes u32 ns samples to the timings buffer.
 	copy(buf[inputPtr:], []byte(input))
 	inputLen := int32(len(input))
+
+	warmupEnd := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(warmupEnd) {
+		benchExecFn.Call(store, inputLen, int32(benchIters)) //nolint:errcheck
+	}
 
 	_, callErr := benchExecFn.Call(store, inputLen, int32(benchIters))
 	if callErr != nil {
@@ -1374,7 +1388,7 @@ func runSizeOnly() {
 }
 
 // --------------------------------------------------------------------------
-// Time baseline comparison helpers (for -compare-time mode)
+// Speedup-ratio baseline comparison (for -compare-time mode)
 
 // parseDur parses the output of fmtDur back into a time.Duration.
 func parseDur(s string) (time.Duration, error) {
@@ -1395,17 +1409,19 @@ func parseDur(s string) (time.Duration, error) {
 	return 0, fmt.Errorf("unknown duration format: %q", s)
 }
 
+type timeBaseline struct{ rxp, rped time.Duration }
+
 // parseTimeBaseline reads baseline_time.txt and returns a map of
-// "name:mode:input_label" → regexped duration.
-func parseTimeBaseline(path string) (map[string]time.Duration, error) {
+// "name:mode:input_label" → {rxp, rped} durations.
+func parseTimeBaseline(path string) (map[string]timeBaseline, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	result := make(map[string]time.Duration)
-	var curKey string // "name:mode"
+	result := make(map[string]timeBaseline)
+	var curKey string
 	var curInput string
 
 	scanner := bufio.NewScanner(f)
@@ -1413,20 +1429,14 @@ func parseTimeBaseline(path string) (map[string]time.Duration, error) {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 
-		// Match: "=== NAME  [ENG, MODE] ==="
 		if strings.HasPrefix(trimmed, "===") && strings.HasSuffix(trimmed, "===") {
-			inner := strings.TrimPrefix(trimmed, "===")
-			inner = strings.TrimSuffix(inner, "===")
-			inner = strings.TrimSpace(inner)
-			// Split on "  [" to separate name from engine/mode
+			inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "==="), "==="))
 			bracketIdx := strings.LastIndex(inner, "  [")
 			if bracketIdx < 0 {
 				continue
 			}
 			name := strings.TrimSpace(inner[:bracketIdx])
-			rest := strings.TrimPrefix(inner[bracketIdx:], "  [")
-			rest = strings.TrimSuffix(rest, "]")
-			// rest = "ENG, MODE" — extract mode
+			rest := strings.TrimSuffix(strings.TrimPrefix(inner[bracketIdx:], "  ["), "]")
 			parts := strings.SplitN(rest, ", ", 2)
 			if len(parts) != 2 {
 				continue
@@ -1436,10 +1446,8 @@ func parseTimeBaseline(path string) (map[string]time.Duration, error) {
 			continue
 		}
 
-		// Match: "input: LABEL (N bytes)"
 		if strings.HasPrefix(trimmed, "input: ") {
 			after := strings.TrimPrefix(trimmed, "input: ")
-			// strip " (N bytes)"
 			if idx := strings.LastIndex(after, " ("); idx >= 0 {
 				curInput = strings.TrimSpace(after[:idx])
 			} else {
@@ -1448,38 +1456,68 @@ func parseTimeBaseline(path string) (map[string]time.Duration, error) {
 			continue
 		}
 
-		// Match: "p50 execution: ..." or "avg execution: ..."
 		if strings.Contains(trimmed, "execution:") && curKey != "" && curInput != "" {
-			// line: "    p50 execution:      [14-char rxp]  [14-char rped]  [8-char ratio]"
-			// Split on 2+ consecutive spaces after "execution:"
 			idx := strings.Index(trimmed, "execution:")
 			after := trimmed[idx+len("execution:"):]
 			fields := strings.Fields(after)
-			// fields[0] = rxp value (may be "n/a")
-			// fields[1] = rxp unit (if split by space: e.g. "100", "ns")
-			// The durations use fmtDur: "100 ns", "1.4 µs", "2.50 ms"
-			// After strings.Fields, "100 ns" → ["100", "ns"], "1.4 µs" → ["1.4", "µs"]
-			// So regexped value starts at fields[2] (index 2+3 for 2-word duration)
-			// or we need to re-join pairs.
-			// Easier: re-parse from the raw columns in the padded line.
-			// The fmt is: %-24s  %14s  %14s  %8s
-			// after "execution:   " there are 24-len("execution:")-2 spaces, then 14-char rxp, 2 spaces, 14-char rped
-			// Let's find the rped value by reconstructing from fields:
-			// fields may be: ["100", "ns", "70", "ns", "1.43x"] (rxp=100ns, rped=70ns)
-			// or: ["1.4", "µs", "851", "ns", "1.59x"] (rxp=1.4µs, rped=851ns)
+			// fields: [rxp_val, rxp_unit, rped_val, rped_unit, ratio]
 			if len(fields) >= 4 {
-				// Pair up two-word durations: pair 0 = rxp, pair 1 = rped
-				rpedStr := fields[2] + " " + fields[3]
-				d, err := parseDur(rpedStr)
-				if err == nil && d > 0 {
-					key := curKey + ":" + curInput
-					result[key] = d
+				rxpD, err1 := parseDur(fields[0] + " " + fields[1])
+				rpedD, err2 := parseDur(fields[2] + " " + fields[3])
+				if err1 == nil && err2 == nil && rxpD > 0 && rpedD > 0 {
+					result[curKey+":"+curInput] = timeBaseline{rxp: rxpD, rped: rpedD}
 				}
 			}
 			continue
 		}
 	}
 	return result, scanner.Err()
+}
+
+// runCompareTime measures speedup ratio (rxp/rped) and compares against baseline.
+// Patterns where min(rxp_base, rped_base) < 1µs are skipped — too noisy.
+// Tolerance: ±10%.
+func runCompareTime(baselinePath string, regexWasmBytes []byte, engine *wasmtime.Engine) bool {
+	baseline, err := parseTimeBaseline(baselinePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "compare-time: cannot read baseline %s: %v\n", baselinePath, err)
+		return false
+	}
+
+	const pct = 50
+	const tolerance = 0.10
+	const minBaseline = 1 * time.Microsecond
+	ok := true
+
+	for _, tc := range tests {
+		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
+		modeKey := tcModeStr(tc)
+		for _, inp := range tc.inputs {
+			key := tc.name + ":" + modeKey + ":" + inp.label
+			base, found := baseline[key]
+			if !found {
+				fmt.Fprintf(os.Stderr, "  compare-time: no baseline for %q\n", key)
+				continue
+			}
+			if base.rxp < minBaseline || base.rped < minBaseline {
+				continue // too noisy
+			}
+			baseRatio := float64(base.rxp) / float64(base.rped)
+			rxp := benchRegex(regexWasmBytes, tc, inp.value, engine, pct)
+			rped := benchRegexped(tc, inp.value, engine, pct)
+			if rxp.avgExec <= 0 || rped.avgExec <= 0 {
+				continue
+			}
+			curRatio := float64(rxp.avgExec) / float64(rped.avgExec)
+			drift := math.Abs(curRatio-baseRatio) / baseRatio
+			if drift > tolerance {
+				fmt.Printf("REGRESSION %s input=%q: baseline ratio=%.2fx current=%.2fx (%.1f%% drift, limit ±%.0f%%)\n",
+					tc.name, inp.label, baseRatio, curRatio, drift*100, tolerance*100)
+				ok = false
+			}
+		}
+	}
+	return ok
 }
 
 // --------------------------------------------------------------------------
@@ -1661,52 +1699,6 @@ func runCompareSize(baselinePath string) bool {
 	return ok
 }
 
-// runCompareTime runs the p50 benchmark and compares against a baseline file.
-// Returns true if all measurements are within ±50%, false otherwise.
-// NOTE: the plan specified ±5% but practical measurement shows p50 wall-clock
-// timing varies dramatically for sub-100ns patterns (measurement noise dominates)
-// and ±10%+ on longer patterns. ±50% catches genuine 2x regressions while
-// ignoring noise on nanosecond-range patterns. See Phase 0 implementation notes.
-func runCompareTime(baselinePath string, regexWasmBytes []byte, engine *wasmtime.Engine) bool {
-	baseline, err := parseTimeBaseline(baselinePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "compare-time: cannot read baseline %s: %v\n", baselinePath, err)
-		return false
-	}
-
-	const pct = 50
-	const tolerance = 0.50
-	// Skip patterns where the baseline timing is below this threshold — p50 of
-	// 10,000 samples in the nanosecond range is dominated by cache and scheduler
-	// noise and cannot be compared reliably across runs.
-	const minBaseline = 1 * time.Microsecond
-	ok := true
-
-	for _, tc := range tests {
-		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
-		modeKey := tcModeStr(tc)
-		for _, inp := range tc.inputs {
-			rped := benchRegexped(tc, inp.value, engine, pct)
-			key := tc.name + ":" + modeKey + ":" + inp.label
-			base, found := baseline[key]
-			if !found {
-				fmt.Fprintf(os.Stderr, "  compare-time: no baseline for %q\n", key)
-				continue
-			}
-			if base < minBaseline {
-				continue // too noisy to check reliably
-			}
-			ratio := math.Abs(float64(rped.avgExec)-float64(base)) / float64(base)
-			if ratio > tolerance {
-				fmt.Printf("REGRESSION %s input=%q: baseline=%s current=%s (%.1f%% drift, limit ±%.0f%%)\n",
-					tc.name, inp.label, fmtDur(base), fmtDur(rped.avgExec), ratio*100, tolerance*100)
-				ok = false
-			}
-		}
-	}
-	return ok
-}
-
 // --------------------------------------------------------------------------
 // Main
 
@@ -1718,7 +1710,7 @@ func main() {
 	fuel := flag.Bool("fuel", false, "measure fuel (WASM instruction count) for a single call instead of timing")
 	pct := flag.Int("p", 0, "report this percentile (1-99) instead of average (e.g. -p 95)")
 	sizeOnly := flag.Bool("size-only", false, "print WASM module sizes per test case and exit (no harness required)")
-	compareTime := flag.String("compare-time", "", "compare p50 timing against baseline file; exit 1 if any regexped measurement is outside ±5%")
+	compareTime := flag.String("compare-time", "", "compare speedup ratio (rxp/rped p50) against baseline file; exit 1 if outside ±10%")
 	compareFuel := flag.String("compare-fuel", "", "compare fuel counts against baseline file; exit 1 if outside ±20% (TDFA non-determinism budget)")
 	compareSize := flag.String("compare-size", "", "compare WASM sizes against baseline file; exit 1 if outside ±5%")
 	flag.Parse()
@@ -1750,7 +1742,7 @@ func main() {
 	// Warm up Cranelift before the first real measurement.
 	warmup(engine)
 
-	// -compare-time runs the p50 benchmark and compares against a baseline.
+	// -compare-time measures speedup ratio and compares against a baseline.
 	if *compareTime != "" {
 		if !runCompareTime(*compareTime, regexWasmBytes, engine) {
 			os.Exit(1)

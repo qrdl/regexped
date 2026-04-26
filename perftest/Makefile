@@ -18,11 +18,10 @@ baseline: harnesses
 
 # Regression gate: compare current run against all three baselines.
 # Tolerances:
-#   - fuel:  exact match — WASM emission is deterministic after the TDFA setOps
-#             sort fix (engine_tdfa.go); any fuel change means the WASM changed.
+#   - fuel:  exact match — WASM emission is deterministic.
 #   - size:  exact match — same reasoning as fuel.
-#   - time:  ±15% — wall-clock p50 is machine-dependent; p50 of 10k samples
-#             still varies ±10%+ between runs due to cache/thermal/scheduler effects.
+#   - ratio: ±10% on speedup ratio (rxp p50 / rped p50); patterns where
+#             min(rxp,rped) < 1µs are skipped as too noisy.
 # To update baselines: run 'make baseline' and commit the resulting txt files.
 perftest-check: harnesses
 	@echo "Checking fuel baseline (exact)..."
@@ -31,9 +30,9 @@ perftest-check: harnesses
 	@echo "Checking WASM size baseline (exact)..."
 	@go run . -compare-size baseline_size.txt 2>/dev/null || \
 		(echo "BASELINE REGRESSION: WASM size — run 'make baseline' if intentional" && exit 1)
-	@echo "Checking p50 timing (±50%)..."
+	@echo "Checking speedup ratio (±10%)..."
 	@go run . -compare-time baseline_time.txt 2>/dev/null || \
-		(echo "BASELINE REGRESSION: p50 timing — run 'make baseline' if intentional" && exit 1)
+		(echo "BASELINE REGRESSION: speedup ratio — run 'make baseline' if intentional" && exit 1)
 	@echo "All baseline checks passed."
 
 clean:
