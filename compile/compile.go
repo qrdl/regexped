@@ -814,22 +814,33 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	return assembleModule(compiled, memPages, standalone), lastTableEnd, nil
 }
 
-// CmdCompile compiles all regex patterns from cfg to a single WASM module.
+// CmdCompile compiles all regex patterns (and optional sets) from cfg to a
+// single WASM module. When cfg.Sets is non-empty, CompileFile is used instead
+// of the bare Compile path, so set-match functions are included in the output.
 // output is the output path (absolute, relative to cwd, or "-" for stdout).
-// Mode is auto-selected from cfg.Output: empty → standalone (own memory, exported as "memory");
-// non-empty → embedded (imports "main" memory + own memory for tables, for use with regexped merge).
+// Mode is auto-selected from cfg.Output: empty → standalone; non-empty → embedded.
 func CmdCompile(cfg config.BuildConfig, output string) error {
 	outPath := output
 	slog.Info("Compiling regexes", "count", len(cfg.Regexes), "output", outPath)
 
-	compOpts := CompileOptions{
-		MaxDFAStates: cfg.MaxDFAStates,
-		MaxTDFARegs:  cfg.MaxTDFARegs,
-	}
-	standalone := cfg.Output == ""
-	wasmBytes, _, err := Compile(cfg.Regexes, 0, standalone, compOpts)
-	if err != nil {
-		return fmt.Errorf("compile: %w", err)
+	var wasmBytes []byte
+	if len(cfg.Sets) > 0 {
+		var err error
+		wasmBytes, _, err = CompileFile(cfg, output)
+		if err != nil {
+			return fmt.Errorf("compile: %w", err)
+		}
+	} else {
+		compOpts := CompileOptions{
+			MaxDFAStates: cfg.MaxDFAStates,
+			MaxTDFARegs:  cfg.MaxTDFARegs,
+		}
+		standalone := cfg.Output == ""
+		var err error
+		wasmBytes, _, err = Compile(cfg.Regexes, 0, standalone, compOpts)
+		if err != nil {
+			return fmt.Errorf("compile: %w", err)
+		}
 	}
 
 	if outPath == "-" {

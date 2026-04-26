@@ -1,0 +1,16 @@
+# compat_005: large_multi_literal
+# 10 patterns with distinct mandatory literals — exceeds the 8-literal Teddy
+# limit, so the AC frontend is chosen.
+patterns:
+  - pattern: 'alpha\d+'
+  - pattern: 'beta\w+'
+  - pattern: 'gamma[a-z]+'
+  - pattern: 'delta[0-9]+'
+  - pattern: 'epsilon\d+'
+  - pattern: 'zeta\w+'
+  - pattern: 'eta[a-z]+'
+  - pattern: 'theta[0-9]+'
+  - pattern: 'iota\d+'
+  - pattern: 'kappa\w+'
+expect:
+  frontend: ac

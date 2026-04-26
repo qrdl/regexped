@@ -1,0 +1,11 @@
+# compat_004: small_multi_literal
+# 4 patterns with distinct 2-byte mandatory literals — triggers Teddy frontend.
+# All patterns fit in a single bitmask bucket (≤64 patterns, compatible classes).
+patterns:
+  - pattern: 'ab\d+'
+  - pattern: 'cd\w+'
+  - pattern: 'ef[a-z]+'
+  - pattern: 'gh[0-9]+'
+expect:
+  bucket_count: 4
+  frontend: teddy

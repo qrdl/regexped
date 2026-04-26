@@ -19,9 +19,8 @@ type PatternInfo struct {
 	mandLit     *mandatoryLit  // from findMandatoryLitRec
 	splittable  bool           // false when splitAtPath rejects the path (routes to fallback)
 
-	prefixDFA      *dfaTable // built from prefixAST (reversed); nil when trivial
-	prefixClassMap [256]byte // byte-class map for prefixDFA (Phase 2)
-	prefixID       int       // index into dedup prefix pool; -1 = trivial
+	prefixDFA *dfaTable // built from prefixAST (reversed); nil when trivial
+	prefixID  int       // index into dedup prefix pool; -1 = trivial
 
 	trivialPrefix bool // true when prefixAST is nil
 
@@ -420,6 +419,109 @@ func buildUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uin
 }
 
 // --------------------------------------------------------------------------
+// Phase 4a: multi-pattern Teddy + frontend strategy selection
+
+// frontendKind is the literal-scan strategy chosen for a set.
+type frontendKind int
+
+const (
+	frontendTeddy  frontendKind = iota // ≤8 literals, 1–4 bytes each
+	frontendAC                         // >8 literals → Aho-Corasick
+	frontendScalar                     // fallback: byte-by-byte scan
+)
+
+func (f frontendKind) String() string {
+	switch f {
+	case frontendTeddy:
+		return "teddy"
+	case frontendAC:
+		return "ac"
+	default:
+		return "scalar"
+	}
+}
+
+// teddyTables holds the precomputed nibble tables for multi-pattern Teddy
+// (up to 8 literals × up to 4 bytes each). Each lane bit k (0..7) corresponds
+// to literal k in the input list.
+type teddyTables struct {
+	T0Lo, T0Hi [16]byte // 1-byte Teddy: nibble tables for literal byte[0]
+	T1Lo, T1Hi [16]byte // 2-byte Teddy: nibble tables for literal byte[1]
+	T2Lo, T2Hi [16]byte // 3-byte Teddy
+	T3Lo, T3Hi [16]byte // 4-byte Teddy
+	MinLen     int      // minimum literal length across all literals (1–4)
+	TwoByte    bool     // T1 tables are valid (all literals ≥ 2 bytes)
+	ThreeByte  bool     // T2 tables are valid
+	FourByte   bool     // T3 tables are valid
+	LaneToID   []int    // LaneToID[laneBit] = index in the original literals slice
+}
+
+// buildTeddyTablesMulti builds nibble tables for up to 8 literals of 1–4 bytes.
+// Returns (tables, true) on success; (nil, false) if more than 8 literals or
+// any literal is empty or longer than 4 bytes.
+// Reuses the bit-packing pattern from compile.go:394–419.
+func buildTeddyTablesMulti(literals [][]byte) (*teddyTables, bool) {
+	if len(literals) == 0 || len(literals) > 8 {
+		return nil, false
+	}
+	for _, lit := range literals {
+		if len(lit) == 0 || len(lit) > 4 {
+			return nil, false
+		}
+	}
+
+	t := &teddyTables{LaneToID: make([]int, len(literals))}
+	minLen := 4
+	for i := range t.LaneToID {
+		t.LaneToID[i] = i
+		if len(literals[i]) < minLen {
+			minLen = len(literals[i])
+		}
+	}
+	t.MinLen = minLen
+	t.TwoByte = minLen >= 2
+	t.ThreeByte = minLen >= 3
+	t.FourByte = minLen >= 4
+
+	for laneBit, lit := range literals {
+		bit := byte(1 << uint(laneBit))
+		t.T0Lo[lit[0]&0x0F] |= bit
+		t.T0Hi[lit[0]>>4] |= bit
+		if len(lit) >= 2 {
+			t.T1Lo[lit[1]&0x0F] |= bit
+			t.T1Hi[lit[1]>>4] |= bit
+		}
+		if len(lit) >= 3 {
+			t.T2Lo[lit[2]&0x0F] |= bit
+			t.T2Hi[lit[2]>>4] |= bit
+		}
+		if len(lit) >= 4 {
+			t.T3Lo[lit[3]&0x0F] |= bit
+			t.T3Hi[lit[3]>>4] |= bit
+		}
+	}
+	return t, true
+}
+
+// chooseLiteralFrontend selects the scan strategy for a set of mandatory
+// literals. Teddy is used when ≤8 literals all have length 1–4 bytes; AC
+// is used for larger sets; scalar is the final fallback.
+func chooseLiteralFrontend(literals [][]byte) frontendKind {
+	if len(literals) == 0 {
+		return frontendScalar
+	}
+	if len(literals) <= 8 {
+		for _, lit := range literals {
+			if len(lit) == 0 || len(lit) > 4 {
+				return frontendAC
+			}
+		}
+		return frontendTeddy
+	}
+	return frontendAC
+}
+
+// --------------------------------------------------------------------------
 // Phase 3: bin-packing + fallback
 
 // bucket holds a set of patterns whose suffix DFAs have been merged.
@@ -436,8 +538,6 @@ type bucket struct {
 
 // bucketKey is used in the literal grouping map. "~fallback~" is the sentinel
 // for patterns without a mandatory literal or with non-splittable paths.
-const fallbackKey = "~fallback~"
-
 // bucketByLiteral partitions patterns into per-literal groups and a fallback
 // slice for patterns with mandLit==nil or splittable==false.
 func bucketByLiteral(patterns []*PatternInfo) (map[string][]*PatternInfo, []*PatternInfo) {
@@ -518,8 +618,8 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 							Pattern: pRef, CandidateBucket: len(buckets) + bi,
 							Reason: "class_count_incompatible",
 							Detail: map[string]interface{}{
-								"combined_classes":  cc,
-								"prefilter_budget":  prefilterBudget,
+								"combined_classes": cc,
+								"prefilter_budget": prefilterBudget,
 							},
 						})
 					}
@@ -543,8 +643,8 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 							Pattern: pRef, CandidateBucket: len(buckets) + bi,
 							Reason: "table_size_exceeded",
 							Detail: map[string]interface{}{
-								"merged_bytes":  mergedBytes,
-								"budget_bytes":  byteBudget,
+								"merged_bytes": mergedBytes,
+								"budget_bytes": byteBudget,
 							},
 						})
 					}
@@ -556,8 +656,8 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 							Pattern: pRef, CandidateBucket: len(buckets) + bi,
 							Reason: "state_count_exceeded",
 							Detail: map[string]interface{}{
-								"merged_states":  mergedTable.numStates,
-								"budget_states":  stateBudget,
+								"merged_states": mergedTable.numStates,
+								"budget_states": stateBudget,
 							},
 						})
 					}

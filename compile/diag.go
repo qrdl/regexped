@@ -15,10 +15,10 @@ func (p PatternRef) String() string {
 
 // Diagnostics is the top-level diagnostic structure produced by CompileFile.
 type Diagnostics struct {
-	PatternsTotal       int      `json:"patterns_total"`
-	CaptureBearing      int      `json:"capture_bearing"`
-	InSet               int      `json:"in_set"`
-	PrefixDedupPoolSize int      `json:"prefix_dedup_pool_size"`
+	PatternsTotal       int       `json:"patterns_total"`
+	CaptureBearing      int       `json:"capture_bearing"`
+	InSet               int       `json:"in_set"`
+	PrefixDedupPoolSize int       `json:"prefix_dedup_pool_size"`
 	Sets                []SetDiag `json:"sets"`
 }
 

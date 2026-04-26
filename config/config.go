@@ -20,12 +20,87 @@ type BuildConfig struct {
 	MaxDFAStates int          `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int          `yaml:"max_tdfa_regs"`  // 0 = default (32)
 	Regexes      []RegexEntry `yaml:"regexes"`
+	Sets         []SetConfig  `yaml:"sets"` // optional set composition entries
+}
+
+// SetConfig describes one `sets:` entry in the YAML config.
+type SetConfig struct {
+	Name        string          `yaml:"name"`          // set name; must be unique within the file
+	MatchAny    string          `yaml:"match_any"`     // export name for match_any (first match)
+	MatchAll    string          `yaml:"match_all"`     // export name for match_all (all matches via start_pos)
+	BatchSize   int             `yaml:"batch_size"`    // output buffer hint (default 256); stub-gen only
+	Patterns    PatternSelector `yaml:"patterns"`      // which regexes belong to this set
+	EmitNameMap bool            `yaml:"emit_name_map"` // include pattern name→ID map in WASM data
+}
+
+// PatternSelector selects patterns for a set. It can be the scalar string "all"
+// or a list of pattern names.
+type PatternSelector struct {
+	All   bool     // true when the YAML value was the scalar "all"
+	Names []string // pattern names when All is false
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler for PatternSelector.
+// Accepts either the scalar string "all" or a sequence of strings.
+func (p *PatternSelector) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode && value.Value == "all" {
+		p.All = true
+		return nil
+	}
+	if value.Kind == yaml.SequenceNode {
+		var names []string
+		if err := value.Decode(&names); err != nil {
+			return err
+		}
+		p.Names = names
+		return nil
+	}
+	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names, got %s", value.Value)
+}
+
+// ValidateSets validates the `sets:` block against the `regexes:` list.
+// Returns an error if any name is not unique, any pattern reference is unknown,
+// or a set entry has neither match_any nor match_all set.
+func ValidateSets(cfg *BuildConfig) error {
+	// Build name → index map.
+	nameIdx := make(map[string]int, len(cfg.Regexes))
+	for i, re := range cfg.Regexes {
+		if re.Name != "" {
+			if _, dup := nameIdx[re.Name]; dup {
+				return fmt.Errorf("duplicate regex name %q", re.Name)
+			}
+			nameIdx[re.Name] = i
+		}
+	}
+
+	setNames := make(map[string]bool)
+	for _, s := range cfg.Sets {
+		if s.Name == "" {
+			return fmt.Errorf("sets entry missing required name field")
+		}
+		if setNames[s.Name] {
+			return fmt.Errorf("duplicate set name %q", s.Name)
+		}
+		setNames[s.Name] = true
+		if s.MatchAny == "" && s.MatchAll == "" {
+			return fmt.Errorf("set %q: at least one of match_any or match_all must be set", s.Name)
+		}
+		if !s.Patterns.All {
+			for _, pname := range s.Patterns.Names {
+				if _, ok := nameIdx[pname]; !ok {
+					return fmt.Errorf("set %q: unknown pattern name %q", s.Name, pname)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // RegexEntry describes a single regex pattern and the functions to generate for it.
 // One or more of the Func fields must be set; only those stubs are generated.
 // The WASM export names are derived automatically from the function type.
 type RegexEntry struct {
+	Name    string `yaml:"name"` // optional; used by sets: for pattern selection
 	Pattern string `yaml:"pattern"`
 
 	// Optional function names — only those set are compiled and stubbed.

@@ -52,10 +52,24 @@ type prefixScanParams struct {
 
 	Locals prefixScanLocals
 
+	// LaneToLiteralID maps Teddy/AC lane index (0..N-1) to the global literal
+	// ID within the set's literal list. Nil for single-pattern callers.
+	LaneToLiteralID []int
+
+	// LiteralTableOff is the memory offset of the literal-ID-keyed fan-out table
+	// used by the set match dispatcher (Phase 4c). 0 when unused.
+	LiteralTableOff int32
+
 	// OnMatch is called after the scan finds a candidate and all scan blocks
 	// have closed. attempt_start holds the candidate position.
 	// Emits engine-specific setup code (e.g. DFA state/pos initialisation).
+	// Used by single-pattern callers (LaneToLiteralID == nil).
 	OnMatch func(b []byte) []byte
+
+	// OnMatchMulti is used by multi-pattern callers (LaneToLiteralID != nil).
+	// laneBitLocal is the WASM local index holding the fired lane bitmask.
+	// Used by Phase 4c emitSetMatchFn; nil for single-pattern callers.
+	OnMatchMulti func(b []byte, laneBitLocal byte) []byte
 }
 
 // emitPrefixScan emits the WASM bytes for the prefix/firstByteFlags scan phase.

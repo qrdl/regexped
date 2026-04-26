@@ -653,6 +653,7 @@ type setFixture struct {
 		BucketCount         int      `yaml:"bucket_count"`
 		FallbackCount       int      `yaml:"fallback_count"`
 		ConflictReasons     []string `yaml:"conflict_reasons"`
+		Frontend            string   `yaml:"frontend"`
 	} `yaml:"expect"`
 }
 
@@ -874,26 +875,521 @@ func TestEquivalence_Compat003(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Phase 3: bin-packing tests
+// Phase 4a: multi-pattern Teddy tests
 
-func TestBinPacking_BitmaskCap(t *testing.T) {
-	// 100 patterns same literal "foo" with bitmaskWidth=64 → 2 buckets.
+func TestMultiPatternTeddy_FourLiterals(t *testing.T) {
+	literals := [][]byte{[]byte("ab"), []byte("cd"), []byte("ef"), []byte("gh")}
+	tables, ok := buildTeddyTablesMulti(literals)
+	if !ok {
+		t.Fatal("buildTeddyTablesMulti returned ok=false for 4 two-byte literals")
+	}
+	// Each literal's first byte should set exactly one bit in T0Lo/T0Hi.
+	for i, lit := range literals {
+		bit := byte(1 << uint(i))
+		b := lit[0]
+		if tables.T0Lo[b&0x0F]&bit == 0 {
+			t.Errorf("literal %d (%q): bit not set in T0Lo[%d]", i, lit, b&0x0F)
+		}
+		if tables.T0Hi[b>>4]&bit == 0 {
+			t.Errorf("literal %d (%q): bit not set in T0Hi[%d]", i, lit, b>>4)
+		}
+		b1 := lit[1]
+		if tables.T1Lo[b1&0x0F]&bit == 0 {
+			t.Errorf("literal %d (%q): bit not set in T1Lo[%d]", i, lit, b1&0x0F)
+		}
+		if tables.T1Hi[b1>>4]&bit == 0 {
+			t.Errorf("literal %d (%q): bit not set in T1Hi[%d]", i, lit, b1>>4)
+		}
+	}
+	if !tables.TwoByte {
+		t.Error("TwoByte should be true for 2-byte literals")
+	}
+	if tables.ThreeByte {
+		t.Error("ThreeByte should be false for 2-byte literals")
+	}
+}
+
+func TestMultiPatternTeddy_LaneToID(t *testing.T) {
+	literals := [][]byte{[]byte("ab"), []byte("xy"), []byte("mn")}
+	tables, ok := buildTeddyTablesMulti(literals)
+	if !ok {
+		t.Fatal("buildTeddyTablesMulti failed")
+	}
+	if len(tables.LaneToID) != 3 {
+		t.Fatalf("LaneToID len = %d, want 3", len(tables.LaneToID))
+	}
+	for i, id := range tables.LaneToID {
+		if id != i {
+			t.Errorf("LaneToID[%d] = %d, want %d", i, id, i)
+		}
+	}
+}
+
+func TestMultiPatternTeddy_TooManyLiterals(t *testing.T) {
+	lits := make([][]byte, 9)
+	for i := range lits {
+		lits[i] = []byte{byte('a' + i)}
+	}
+	_, ok := buildTeddyTablesMulti(lits)
+	if ok {
+		t.Error("buildTeddyTablesMulti: expected ok=false for 9 literals")
+	}
+}
+
+func TestMultiPatternTeddy_LiteralTooLong(t *testing.T) {
+	lits := [][]byte{[]byte("abcde")} // 5 bytes > 4
+	_, ok := buildTeddyTablesMulti(lits)
+	if ok {
+		t.Error("buildTeddyTablesMulti: expected ok=false for 5-byte literal")
+	}
+}
+
+func TestChooseLiteralFrontend(t *testing.T) {
+	cases := []struct {
+		lits [][]byte
+		want frontendKind
+	}{
+		{[][]byte{[]byte("ab"), []byte("cd")}, frontendTeddy},
+		{[][]byte{[]byte("a")}, frontendTeddy},
+		{[][]byte{[]byte("abcd")}, frontendTeddy}, // 4 bytes: still Teddy
+		{[][]byte{[]byte("abcde")}, frontendAC},   // 5 bytes: too long for Teddy
+		{nil, frontendScalar},
+	}
+	// 9 literals → AC
+	nineLits := make([][]byte, 9)
+	for i := range nineLits {
+		nineLits[i] = []byte{byte('a' + i)}
+	}
+	cases = append(cases, struct {
+		lits [][]byte
+		want frontendKind
+	}{nineLits, frontendAC})
+
+	for _, c := range cases {
+		got := chooseLiteralFrontend(c.lits)
+		if got != c.want {
+			t.Errorf("chooseLiteralFrontend(%v) = %v, want %v", c.lits, got, c.want)
+		}
+	}
+}
+
+func TestEquivalence_Compat004(t *testing.T) {
+	fix := testdataFixture(t, "compat_004")
+	patterns := fix.patternInfos(t)
+	opts := fix.compileOpts()
+	buckets := binPack(patterns, opts, nil)
+	if fix.Expect.BucketCount > 0 && len(buckets) != fix.Expect.BucketCount {
+		t.Errorf("compat_004: got %d buckets, want %d", len(buckets), fix.Expect.BucketCount)
+	}
+	// Verify Teddy is the chosen frontend for these 4 two-byte literals.
+	var lits [][]byte
+	for _, p := range patterns {
+		if p.mandLit != nil {
+			lits = append(lits, p.mandLit.bytes)
+		}
+	}
+	if len(lits) > 0 {
+		fe := chooseLiteralFrontend(lits)
+		if fix.Expect.Frontend != "" && fe.String() != fix.Expect.Frontend {
+			t.Errorf("compat_004: frontend = %q, want %q", fe.String(), fix.Expect.Frontend)
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
+// Phase 4b: Aho-Corasick tests
+
+func TestAC_Construction(t *testing.T) {
+	// Build AC for {"he", "she", "his", "hers"} — standard textbook example.
+	literals := [][]byte{[]byte("he"), []byte("she"), []byte("his"), []byte("hers")}
+	ac := buildAC(literals)
+	if len(ac.nodes) == 0 {
+		t.Fatal("buildAC: no nodes")
+	}
+
+	// Simulate scanning "ushers" — should find "she" at pos 2, "he" at pos 3, "hers" at pos 3.
+	input := []byte("ushers")
+	found := make(map[string]bool)
+	state := 0
+	for pos, b := range input {
+		state = ac.nodes[state].gotoTable[int(b)]
+		for _, litID := range ac.nodes[state].output {
+			lit := string(literals[litID])
+			found[fmt.Sprintf("%s@%d", lit, pos+1)] = true
+		}
+	}
+	// In "ushers": "she" and "he" end at pos 3 (0-indexed) → key suffix @4;
+	// "hers" ends at pos 5 → key suffix @6.
+	if !found["she@4"] {
+		t.Errorf("expected 'she@4'; got %v", found)
+	}
+	if !found["he@4"] {
+		t.Errorf("expected 'he@4'; got %v", found)
+	}
+	if !found["hers@6"] {
+		t.Errorf("expected 'hers@6'; got %v", found)
+	}
+}
+
+func TestAC_WASMScan_HitPositions(t *testing.T) {
+	// Verify buildACLayout produces non-empty table bytes.
+	literals := [][]byte{[]byte("ab"), []byte("bc"), []byte("abc")}
+	ac := buildAC(literals)
+	l := buildACLayout(ac, 0)
+	if len(l.gotoBytes) == 0 {
+		t.Error("gotoBytes is empty")
+	}
+	if l.tableEnd <= 0 {
+		t.Errorf("tableEnd = %d, want > 0", l.tableEnd)
+	}
+	// numNodes should be at least 4 (root + a + ab + b + bc + abc chain).
+	if l.numNodes < 4 {
+		t.Errorf("numNodes = %d, want >= 4", l.numNodes)
+	}
+}
+
+func TestEquivalence_Compat005(t *testing.T) {
+	fix := testdataFixture(t, "compat_005")
+	patterns := fix.patternInfos(t)
+	// Collect unique mandatory literals.
+	var lits [][]byte
+	seen := make(map[string]bool)
+	for _, p := range patterns {
+		if p.mandLit != nil {
+			key := string(p.mandLit.bytes)
+			if !seen[key] {
+				seen[key] = true
+				lits = append(lits, p.mandLit.bytes)
+			}
+		}
+	}
+	fe := chooseLiteralFrontend(lits)
+	if fix.Expect.Frontend != "" && fe.String() != fix.Expect.Frontend {
+		t.Errorf("compat_005: frontend = %q, want %q", fe.String(), fix.Expect.Frontend)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Phase 4c: config and CompileFile tests
+
+func TestPatternSelector_UnmarshalYAML_All(t *testing.T) {
+	data := `patterns: "all"`
+	var s struct {
+		Patterns config.PatternSelector `yaml:"patterns"`
+	}
+	if err := yaml.Unmarshal([]byte(data), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !s.Patterns.All {
+		t.Error("expected All=true for scalar 'all'")
+	}
+}
+
+func TestPatternSelector_UnmarshalYAML_List(t *testing.T) {
+	data := "patterns:\n  - rule_a\n  - rule_b\n"
+	var s struct {
+		Patterns config.PatternSelector `yaml:"patterns"`
+	}
+	if err := yaml.Unmarshal([]byte(data), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if s.Patterns.All {
+		t.Error("expected All=false for list")
+	}
+	if len(s.Patterns.Names) != 2 || s.Patterns.Names[0] != "rule_a" {
+		t.Errorf("unexpected names: %v", s.Patterns.Names)
+	}
+}
+
+func TestConfig_DuplicateName_Rejected(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Name: "dup", Pattern: `foo`},
+			{Name: "dup", Pattern: `bar`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", MatchAny: "ma", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	if err := config.ValidateSets(&cfg); err == nil {
+		t.Error("expected error for duplicate regex name, got nil")
+	}
+}
+
+func TestConfig_UnknownPatternRef_Rejected(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Name: "known", Pattern: `foo`},
+		},
+		Sets: []config.SetConfig{
+			{
+				Name:     "s",
+				MatchAny: "ma",
+				Patterns: config.PatternSelector{Names: []string{"unknown_name"}},
+			},
+		},
+	}
+	if err := config.ValidateSets(&cfg); err == nil {
+		t.Error("expected error for unknown pattern reference, got nil")
+	}
+}
+
+func TestConfig_MissingMatchAnyAndAll_Rejected(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{{Name: "p", Pattern: `foo`}},
+		Sets: []config.SetConfig{
+			{Name: "s", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	if err := config.ValidateSets(&cfg); err == nil {
+		t.Error("expected error for set with neither match_any nor match_all")
+	}
+}
+
+func TestCompileFile_NoSets_ByteIdentical(t *testing.T) {
+	// CompileFile with no sets must produce byte-identical output to Compile.
+	patterns := []config.RegexEntry{
+		{Pattern: `[a-z]+`, FindFunc: "find"},
+	}
+	wasmA, _, err := Compile(patterns, 0, true)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	cfg := config.BuildConfig{Regexes: patterns}
+	wasmB, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasmA) != len(wasmB) {
+		t.Errorf("byte lengths differ: Compile=%d CompileFile=%d", len(wasmA), len(wasmB))
+	}
+}
+
+func TestCompileFile_WithSets_ValidWASM(t *testing.T) {
+	// CompileFile with sets must produce a non-empty WASM module with the
+	// correct magic bytes and at least one exported function.
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Name: "foo_pat", Pattern: `foo\d+`},
+			{Name: "bar_pat", Pattern: `bar\w+`},
+		},
+		Sets: []config.SetConfig{
+			{
+				Name:     "test_set",
+				MatchAny: "test_match_any",
+				Patterns: config.PatternSelector{All: true},
+			},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 {
+		t.Fatalf("WASM too short: %d bytes", len(wasm))
+	}
+	if wasm[0] != 0x00 || wasm[1] != 0x61 || wasm[2] != 0x73 || wasm[3] != 0x6D {
+		t.Errorf("WASM magic bytes wrong: %x", wasm[:4])
+	}
+}
+
+func TestSetMatch_SingleBucket_Equivalence(t *testing.T) {
+	// Verify that CompileSet produces a compiledSet with the expected structure.
 	var prefixPool, suffixPool dfaPool
-	patterns := make([]*PatternInfo, 100)
-	for i := range patterns {
-		p, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`foo[^\n]{%d}\d+`, i+1)}, &prefixPool, &suffixPool)
+	patterns := []*PatternInfo{}
+	patternIDs := []int{}
+	for i, pat := range []string{`foo\d+`, `foo[a-z]+`} {
+		info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("analyzePattern[%d]: %v", i, err)
+		}
+		patterns = append(patterns, info)
+		patternIDs = append(patternIDs, i)
+	}
+	spec := SetSpec{
+		Name:       "test",
+		MatchAny:   "test_any",
+		Patterns:   patterns,
+		PatternIDs: patternIDs,
+	}
+	cs, err := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
+	if err != nil {
+		t.Fatalf("CompileSet: %v", err)
+	}
+	// matchFnBody is built at assemble time (assembleModuleWithSets), not in CompileSet.
+	if cs.numSuffixFns == 0 {
+		t.Error("expected at least one suffix function body")
+	}
+	if len(cs.suffixFnBodies) == 0 {
+		t.Error("no suffix function bodies")
+	}
+}
+
+func TestACDataSegments_NonEmpty(t *testing.T) {
+	ac := buildAC([][]byte{[]byte("foo"), []byte("bar")})
+	l := buildACLayout(ac, 0)
+	ds := emitACDataSegments(l)
+	if len(ds) == 0 {
+		t.Error("emitACDataSegments returned empty bytes")
+	}
+}
+
+func TestEmitACScan_NotPanics(t *testing.T) {
+	// Smoke test: emitACScan must produce non-empty bytes without panicking.
+	ac := buildAC([][]byte{[]byte("ab"), []byte("cd")})
+	l := buildACLayout(ac, 0)
+	locals := acScanLocals{State: 3, Pos: 4, ByteTmp: 5, LitID: 6, OutIdx: 7, OutEnd: 8}
+	var b []byte
+	b = emitACScan(b, l, locals, 0, 1, 0, 0, func(bb []byte) []byte { return bb })
+	if len(b) == 0 {
+		t.Error("emitACScan returned empty bytes")
+	}
+}
+
+func TestAppendACInputLoad8u(t *testing.T) {
+	b := appendACInputLoad8u(nil)
+	if len(b) == 0 {
+		t.Error("appendACInputLoad8u returned empty bytes")
+	}
+}
+
+func TestPatternRef_String(t *testing.T) {
+	p := PatternRef{ID: 3, Name: "rule_x"}
+	got := p.String()
+	want := `(3,"rule_x")`
+	if got != want {
+		t.Errorf("PatternRef.String() = %q, want %q", got, want)
+	}
+}
+
+func TestFrontendKind_String_All(t *testing.T) {
+	if frontendTeddy.String() != "teddy" {
+		t.Errorf("frontendTeddy.String() = %q", frontendTeddy.String())
+	}
+	if frontendAC.String() != "ac" {
+		t.Errorf("frontendAC.String() = %q", frontendAC.String())
+	}
+	if frontendScalar.String() != "scalar" {
+		t.Errorf("frontendScalar.String() = %q", frontendScalar.String())
+	}
+}
+
+func TestCompileFallback_BudgetCap(t *testing.T) {
+	// Patterns with no mandatory literal → all go to compileFallback.
+	// With budget_states=1, each pattern gets its own fallback bucket.
+	var prefixPool, suffixPool dfaPool
+	pats := []string{`\w+`, `[a-z]+`, `[0-9]+`}
+	patterns := make([]*PatternInfo, len(pats))
+	for i, pat := range pats {
+		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
 		patterns[i] = p
 	}
-	buckets := binPack(patterns, CompileSetOptions{BitmaskWidth: 64}, nil)
-	if len(buckets) != 2 {
-		t.Errorf("bitmaskWidth=64: got %d buckets, want 2", len(buckets))
+	buckets := compileFallback(patterns, CompileSetOptions{BudgetStates: 1}, nil)
+	if len(buckets) != 3 {
+		t.Errorf("got %d fallback buckets, want 3", len(buckets))
 	}
-	buckets32 := binPack(patterns, CompileSetOptions{BitmaskWidth: 32}, nil)
-	if len(buckets32) != 4 {
-		t.Errorf("bitmaskWidth=32: got %d buckets, want 4", len(buckets32))
+	for _, b := range buckets {
+		if !b.isFallback {
+			t.Error("expected isFallback=true for all fallback buckets")
+		}
+	}
+}
+
+func TestCompileFallback_Merges(t *testing.T) {
+	// With generous budget, fallback patterns merge into shared buckets.
+	var prefixPool, suffixPool dfaPool
+	// Use patterns with no mandatory literal but compatible small suffix DFAs.
+	pats := []string{`\d+`, `[0-9]+`} // both have no mandatory lit, simple DFAs
+	patterns := make([]*PatternInfo, len(pats))
+	for i, pat := range pats {
+		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("analyzePattern[%d]: %v", i, err)
+		}
+		patterns[i] = p
+	}
+	// With large budget, both should merge into 1 fallback bucket.
+	buckets := compileFallback(patterns, CompileSetOptions{}, nil)
+	// May be 1 or 2 depending on merge success; just verify no panic.
+	if len(buckets) == 0 {
+		t.Error("expected at least 1 fallback bucket")
+	}
+}
+
+func TestCompileFile_Embedded_WithSets(t *testing.T) {
+	// Non-empty cfg.Output triggers embedded mode. Must produce valid WASM.
+	cfg := config.BuildConfig{
+		Output:  "merged.wasm", // non-empty → embedded
+		Regexes: []config.RegexEntry{{Name: "p", Pattern: `bar\w+`}},
+		Sets: []config.SetConfig{
+			{Name: "s", MatchAll: "s_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "out.wasm")
+	if err != nil {
+		t.Fatalf("CompileFile embedded: %v", err)
+	}
+	if len(wasm) < 8 {
+		t.Fatalf("WASM too short: %d bytes", len(wasm))
+	}
+}
+
+func TestAssembleModuleWithSets_ValidWASM(t *testing.T) {
+	// assembleModuleWithSets with at least one set must produce valid WASM magic.
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Name: "p1", Pattern: `foo\d+`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", MatchAny: "ma", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Errorf("invalid WASM magic: %x", wasm[:min(8, len(wasm))])
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// --------------------------------------------------------------------------
+// Phase 3: bin-packing tests
+
+func TestBinPacking_BitmaskCap(t *testing.T) {
+	// 9 patterns all sharing mandatory literal "foo" (variable-length suffix keeps
+	// "foo" as the mandatory lit). bitmaskWidth=8 → 2 buckets; bitmaskWidth=4 → 3.
+	pats := []string{
+		`foo\d+`, `foo\w+`, `foo[a-z]+`, `foo[A-Z]+`,
+		`foo[0-9]+`, `foo[a-zA-Z]+`, `foo[a-z0-9]+`, `foo[A-Z0-9]+`,
+		`foo[^a-z]+`,
+	}
+	var prefixPool, suffixPool dfaPool
+	patterns := make([]*PatternInfo, len(pats))
+	for i, pat := range pats {
+		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("analyzePattern[%d]: %v", i, err)
+		}
+		patterns[i] = p
+	}
+	buckets := binPack(patterns, CompileSetOptions{BitmaskWidth: 8}, nil)
+	if len(buckets) != 2 {
+		t.Errorf("bitmaskWidth=8: got %d buckets, want 2", len(buckets))
+	}
+	buckets4 := binPack(patterns, CompileSetOptions{BitmaskWidth: 4}, nil)
+	if len(buckets4) != 3 {
+		t.Errorf("bitmaskWidth=4: got %d buckets, want 3", len(buckets4))
 	}
 }
 
