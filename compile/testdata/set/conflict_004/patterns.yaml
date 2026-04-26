@@ -1,0 +1,13 @@
+# conflict_004: budget_overflow_states
+# Patterns with same literal "qux". The merged DFA exceeds the state count
+# budget.
+options:
+  bitmask_width: 64
+  budget_states: 1
+patterns:
+  - pattern: 'qux[a-z]+'
+  - pattern: 'qux[0-9]+'
+expect:
+  bucket_count: 2
+  conflict_reasons:
+    - state_count_exceeded

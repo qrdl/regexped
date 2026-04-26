@@ -211,6 +211,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	suffixTable := dfaTableFromCanonical(d)
 	info.suffixDFA = suffixTable
 	info.suffixStates = suffixTable.numStates
+	info.suffixClassMap, _, info.suffixClasses = computeByteClasses(suffixTable)
 	info.suffixID = suffixPool.Add(suffixTable)
 
 	return info, nil
@@ -230,8 +231,39 @@ const (
 // CompileSetOptions holds tunable parameters for set composition.
 // Zero value uses defaults.
 type CompileSetOptions struct {
-	BitmaskWidth         int // max patterns per bucket using AcceptBitmask; default 64
-	MaxPatternsPerBucket int // hard cap for AcceptSparseSet (Phase 6); default 4096
+	BitmaskWidth          int // max patterns per bucket using AcceptBitmask; default 64
+	MaxPatternsPerBucket  int // hard cap for AcceptSparseSet (Phase 6); default 4096
+	BudgetBytes           int // max merged DFA table bytes per bucket; default 65536
+	BudgetStates          int // max DFA states per merged bucket; default 512
+	BudgetStatesPreFilter int // pre-filter: suffixStates * combinedClassCount; default 65536
+}
+
+func (o CompileSetOptions) bitmaskWidth() int {
+	if o.BitmaskWidth > 0 {
+		return o.BitmaskWidth
+	}
+	return 64
+}
+
+func (o CompileSetOptions) budgetBytes() int {
+	if o.BudgetBytes > 0 {
+		return o.BudgetBytes
+	}
+	return 65536
+}
+
+func (o CompileSetOptions) budgetStates() int {
+	if o.BudgetStates > 0 {
+		return o.BudgetStates
+	}
+	return 512
+}
+
+func (o CompileSetOptions) budgetStatesPreFilter() int {
+	if o.BudgetStatesPreFilter > 0 {
+		return o.BudgetStatesPreFilter
+	}
+	return 65536
 }
 
 // mergeSuffixASTs builds a canonical union AST from suffix sub-trees.
@@ -385,4 +417,305 @@ func buildUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uin
 	}
 	union.Start = copyEnd
 	return union, patternBits
+}
+
+// --------------------------------------------------------------------------
+// Phase 3: bin-packing + fallback
+
+// bucket holds a set of patterns whose suffix DFAs have been merged.
+type bucket struct {
+	literal      string         // string(mandLit.bytes); "" for fallback
+	patterns     []*PatternInfo // patterns in placement order (bit k = patterns[k])
+	suffixDFA    *dfaTable      // current merged suffix DFA; nil until 2+ patterns merged
+	suffixStates int            // suffixDFA.numStates (0 before first merge)
+	tableBytes   int            // estimated table bytes
+	classMap     [256]byte      // combined byte-class map of all suffix DFAs
+	numClasses   int            // number of distinct classes in classMap
+	isFallback   bool           // true = no literal, full-pattern DFA
+}
+
+// bucketKey is used in the literal grouping map. "~fallback~" is the sentinel
+// for patterns without a mandatory literal or with non-splittable paths.
+const fallbackKey = "~fallback~"
+
+// bucketByLiteral partitions patterns into per-literal groups and a fallback
+// slice for patterns with mandLit==nil or splittable==false.
+func bucketByLiteral(patterns []*PatternInfo) (map[string][]*PatternInfo, []*PatternInfo) {
+	groups := make(map[string][]*PatternInfo)
+	var fallback []*PatternInfo
+	for _, p := range patterns {
+		if p.mandLit == nil || !p.splittable {
+			fallback = append(fallback, p)
+		} else {
+			key := string(p.mandLit.bytes)
+			groups[key] = append(groups[key], p)
+		}
+	}
+	return groups, fallback
+}
+
+// binPack groups patterns into merged-DFA buckets using first-fit-decreasing
+// (sorted by suffixStates ascending). Three constraints gate admission into an
+// existing bucket:
+//  1. bitmask capacity: len(bucket.patterns) < bitmaskWidth
+//  2. class-count pre-filter: bucket.suffixStates * combinedClassCount ≤ budgetStatesPreFilter
+//  3. actual merge: merged table bytes ≤ budgetBytes AND merged states ≤ budgetStates
+//
+// Each rejection is recorded in diag. Non-literal and non-splittable patterns
+// are routed to compileFallback instead.
+func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*bucket {
+	bw := opts.bitmaskWidth()
+	prefilterBudget := opts.budgetStatesPreFilter()
+	byteBudget := opts.budgetBytes()
+	stateBudget := opts.budgetStates()
+
+	literalGroups, fallbackPatterns := bucketByLiteral(patterns)
+
+	// Deterministic iteration: sort literal keys.
+	litKeys := make([]string, 0, len(literalGroups))
+	for k := range literalGroups {
+		litKeys = append(litKeys, k)
+	}
+	sort.Strings(litKeys)
+
+	var buckets []*bucket
+
+	for _, lit := range litKeys {
+		group := literalGroups[lit]
+		// Sort group by suffixStates ascending (smallest first).
+		sort.Slice(group, func(i, j int) bool {
+			if group[i].suffixStates != group[j].suffixStates {
+				return group[i].suffixStates < group[j].suffixStates
+			}
+			return group[i].fullPattern < group[j].fullPattern // tie-break for determinism
+		})
+
+		// Track buckets within this literal group.
+		var litBuckets []*bucket
+
+		for _, p := range group {
+			pRef := patternRefFor(p)
+			placed := false
+
+			for bi, b := range litBuckets {
+				// Constraint 1: bitmask capacity.
+				if len(b.patterns) >= bw {
+					if diag != nil {
+						diag.Conflicts = append(diag.Conflicts, ConflictDiag{
+							Pattern: pRef, CandidateBucket: len(buckets) + bi,
+							Reason: "bitmask_cap_full",
+							Detail: map[string]interface{}{"bitmask_width": bw},
+						})
+					}
+					continue
+				}
+
+				// Constraint 2: class-count pre-filter.
+				cc := combinedClassCount(b.classMap, p.suffixClassMap)
+				if b.suffixStates > 0 && b.suffixStates*cc > prefilterBudget {
+					if diag != nil {
+						diag.Conflicts = append(diag.Conflicts, ConflictDiag{
+							Pattern: pRef, CandidateBucket: len(buckets) + bi,
+							Reason: "class_count_incompatible",
+							Detail: map[string]interface{}{
+								"combined_classes":  cc,
+								"prefilter_budget":  prefilterBudget,
+							},
+						})
+					}
+					continue
+				}
+
+				// Constraint 3: actual merge.
+				candidateASTs := make([]*syntax.Regexp, len(b.patterns)+1)
+				for i, bp := range b.patterns {
+					candidateASTs[i] = patternSuffixAST(bp)
+				}
+				candidateASTs[len(b.patterns)] = patternSuffixAST(p)
+				mergedTable, _, mergeErr := mergeSuffixDFA(candidateASTs, opts)
+				if mergeErr != nil {
+					continue
+				}
+				mergedBytes := dfaTableBytes(mergedTable)
+				if mergedBytes > byteBudget {
+					if diag != nil {
+						diag.Conflicts = append(diag.Conflicts, ConflictDiag{
+							Pattern: pRef, CandidateBucket: len(buckets) + bi,
+							Reason: "table_size_exceeded",
+							Detail: map[string]interface{}{
+								"merged_bytes":  mergedBytes,
+								"budget_bytes":  byteBudget,
+							},
+						})
+					}
+					continue
+				}
+				if mergedTable.numStates > stateBudget {
+					if diag != nil {
+						diag.Conflicts = append(diag.Conflicts, ConflictDiag{
+							Pattern: pRef, CandidateBucket: len(buckets) + bi,
+							Reason: "state_count_exceeded",
+							Detail: map[string]interface{}{
+								"merged_states":  mergedTable.numStates,
+								"budget_states":  stateBudget,
+							},
+						})
+					}
+					continue
+				}
+
+				// Admitted: update bucket.
+				b.patterns = append(b.patterns, p)
+				b.suffixDFA = mergedTable
+				b.suffixStates = mergedTable.numStates
+				b.tableBytes = mergedBytes
+				newCM, _, newNC := computeByteClasses(mergedTable)
+				b.classMap = newCM
+				b.numClasses = newNC
+				placed = true
+				break
+			}
+
+			if !placed {
+				// Create a new bucket for this pattern.
+				nb := &bucket{
+					literal:      lit,
+					patterns:     []*PatternInfo{p},
+					suffixStates: p.suffixStates,
+					tableBytes:   dfaTableBytes(p.suffixDFA),
+					classMap:     p.suffixClassMap,
+					numClasses:   p.suffixClasses,
+				}
+				if p.suffixDFA != nil {
+					nb.suffixDFA = p.suffixDFA
+				}
+				litBuckets = append(litBuckets, nb)
+			}
+		}
+		buckets = append(buckets, litBuckets...)
+	}
+
+	// Fallback: compile non-literal / non-splittable patterns.
+	if len(fallbackPatterns) > 0 {
+		fb := compileFallback(fallbackPatterns, opts, diag)
+		buckets = append(buckets, fb...)
+	}
+
+	// Build BucketDiag entries.
+	if diag != nil {
+		for i, b := range buckets {
+			btype := "merged"
+			if len(b.patterns) == 1 {
+				btype = "singleton"
+			}
+			if b.isFallback {
+				btype = "fallback"
+			}
+			refs := make([]PatternRef, len(b.patterns))
+			for j, p := range b.patterns {
+				refs[j] = patternRefFor(p)
+			}
+			diag.Buckets = append(diag.Buckets, BucketDiag{
+				ID:           i,
+				Type:         btype,
+				AcceptKind:   "bitmask",
+				Literal:      b.literal,
+				Patterns:     refs,
+				SuffixStates: b.suffixStates,
+				TableBytes:   b.tableBytes,
+			})
+		}
+	}
+
+	return buckets
+}
+
+// compileFallback applies the same bin-packing algorithm to patterns that have
+// no mandatory literal or whose split path was rejected. These buckets run on
+// every input position (no literal scan gate).
+func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*bucket {
+	// Sort by suffixStates ascending.
+	sort.Slice(patterns, func(i, j int) bool {
+		if patterns[i].suffixStates != patterns[j].suffixStates {
+			return patterns[i].suffixStates < patterns[j].suffixStates
+		}
+		return patterns[i].fullPattern < patterns[j].fullPattern
+	})
+
+	bw := opts.bitmaskWidth()
+	byteBudget := opts.budgetBytes()
+	stateBudget := opts.budgetStates()
+
+	var buckets []*bucket
+
+	for _, p := range patterns {
+		placed := false
+		for _, b := range buckets {
+			if len(b.patterns) >= bw {
+				continue
+			}
+			candidateASTs := make([]*syntax.Regexp, len(b.patterns)+1)
+			for i, bp := range b.patterns {
+				candidateASTs[i] = patternSuffixAST(bp)
+			}
+			candidateASTs[len(b.patterns)] = patternSuffixAST(p)
+			mergedTable, _, mergeErr := mergeSuffixDFA(candidateASTs, opts)
+			if mergeErr != nil {
+				continue
+			}
+			mergedBytes := dfaTableBytes(mergedTable)
+			if mergedBytes > byteBudget || mergedTable.numStates > stateBudget {
+				continue
+			}
+			b.patterns = append(b.patterns, p)
+			b.suffixDFA = mergedTable
+			b.suffixStates = mergedTable.numStates
+			b.tableBytes = mergedBytes
+			newCM, _, newNC := computeByteClasses(mergedTable)
+			b.classMap = newCM
+			b.numClasses = newNC
+			placed = true
+			break
+		}
+		if !placed {
+			nb := &bucket{
+				literal:      "",
+				patterns:     []*PatternInfo{p},
+				suffixStates: p.suffixStates,
+				tableBytes:   dfaTableBytes(p.suffixDFA),
+				classMap:     p.suffixClassMap,
+				numClasses:   p.suffixClasses,
+				isFallback:   true,
+			}
+			if p.suffixDFA != nil {
+				nb.suffixDFA = p.suffixDFA
+			}
+			buckets = append(buckets, nb)
+		}
+	}
+
+	for _, b := range buckets {
+		b.isFallback = true
+	}
+	return buckets
+}
+
+// patternSuffixAST returns the suffix AST for p, or the full-pattern AST when
+// there is no suffix split (literal at end, or no split found).
+func patternSuffixAST(p *PatternInfo) *syntax.Regexp {
+	if p.suffixAST != nil {
+		return p.suffixAST
+	}
+	re, err := syntax.Parse(p.fullPattern, syntax.Perl)
+	if err != nil {
+		return nil
+	}
+	return re
+}
+
+// patternRefFor builds a PatternRef from a PatternInfo.
+// Phase 3 doesn't yet thread global pattern IDs; use 0 as placeholder.
+// Phase 4c will replace this with the actual global ID.
+func patternRefFor(p *PatternInfo) PatternRef {
+	return PatternRef{ID: 0, Name: p.fullPattern}
 }

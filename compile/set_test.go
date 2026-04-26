@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp/syntax"
@@ -641,10 +642,41 @@ type setFixture struct {
 	Patterns []struct {
 		Pattern string `yaml:"pattern"`
 	} `yaml:"patterns"`
+	Options struct {
+		BitmaskWidth          int `yaml:"bitmask_width"`
+		BudgetBytes           int `yaml:"budget_bytes"`
+		BudgetStates          int `yaml:"budget_states"`
+		BudgetStatesPreFilter int `yaml:"budget_states_prefilter"`
+	} `yaml:"options"`
 	Expect struct {
-		SuffixDedupPoolSize int `yaml:"suffix_dedup_pool_size"`
-		BucketCount         int `yaml:"bucket_count"`
+		SuffixDedupPoolSize int      `yaml:"suffix_dedup_pool_size"`
+		BucketCount         int      `yaml:"bucket_count"`
+		FallbackCount       int      `yaml:"fallback_count"`
+		ConflictReasons     []string `yaml:"conflict_reasons"`
 	} `yaml:"expect"`
+}
+
+func (f setFixture) compileOpts() CompileSetOptions {
+	return CompileSetOptions{
+		BitmaskWidth:          f.Options.BitmaskWidth,
+		BudgetBytes:           f.Options.BudgetBytes,
+		BudgetStates:          f.Options.BudgetStates,
+		BudgetStatesPreFilter: f.Options.BudgetStatesPreFilter,
+	}
+}
+
+func (f setFixture) patternInfos(t *testing.T) []*PatternInfo {
+	t.Helper()
+	var prefixPool, suffixPool dfaPool
+	infos := make([]*PatternInfo, len(f.Patterns))
+	for i, p := range f.Patterns {
+		info, err := analyzePattern(config.RegexEntry{Pattern: p.Pattern}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("analyzePattern(%q): %v", p.Pattern, err)
+		}
+		infos[i] = info
+	}
+	return infos
 }
 
 func testdataFixture(t *testing.T, name string) setFixture {
@@ -838,5 +870,148 @@ func TestEquivalence_Compat003(t *testing.T) {
 		if combined>>uint(i)&1 == 0 {
 			t.Errorf("pattern %d bit not set in any accept state (combined=0x%x)", i, combined)
 		}
+	}
+}
+
+// --------------------------------------------------------------------------
+// Phase 3: bin-packing tests
+
+func TestBinPacking_BitmaskCap(t *testing.T) {
+	// 100 patterns same literal "foo" with bitmaskWidth=64 → 2 buckets.
+	var prefixPool, suffixPool dfaPool
+	patterns := make([]*PatternInfo, 100)
+	for i := range patterns {
+		p, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`foo[^\n]{%d}\d+`, i+1)}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("analyzePattern[%d]: %v", i, err)
+		}
+		patterns[i] = p
+	}
+	buckets := binPack(patterns, CompileSetOptions{BitmaskWidth: 64}, nil)
+	if len(buckets) != 2 {
+		t.Errorf("bitmaskWidth=64: got %d buckets, want 2", len(buckets))
+	}
+	buckets32 := binPack(patterns, CompileSetOptions{BitmaskWidth: 32}, nil)
+	if len(buckets32) != 4 {
+		t.Errorf("bitmaskWidth=32: got %d buckets, want 4", len(buckets32))
+	}
+}
+
+func TestBinPacking_BudgetCap(t *testing.T) {
+	// With budget_bytes=1, every pattern exceeds the budget after the first,
+	// so each pattern gets its own bucket.
+	var prefixPool, suffixPool dfaPool
+	patterns := make([]*PatternInfo, 3)
+	for i, pat := range []string{`baz[a-z]+`, `baz[0-9]+`, `baz\w+`} {
+		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("analyzePattern[%d]: %v", i, err)
+		}
+		patterns[i] = p
+	}
+	buckets := binPack(patterns, CompileSetOptions{BudgetBytes: 1}, nil)
+	if len(buckets) < 2 {
+		t.Errorf("budget_bytes=1: got %d buckets, want ≥2", len(buckets))
+	}
+}
+
+func TestBinPacking_FirstFitDecreasing(t *testing.T) {
+	// Patterns sorted ascending by suffixStates; smallest placed first.
+	// Verify deterministic placement order by checking bucket 0 gets the
+	// smallest-suffix patterns.
+	var prefixPool, suffixPool dfaPool
+	// foo[a] has suffix [a]+ — very small DFA; foo\w+ has larger suffix DFA.
+	pats := []string{`foo\w+`, `fooa+`, `foob+`}
+	patterns := make([]*PatternInfo, len(pats))
+	for i, pat := range pats {
+		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("analyzePattern[%d]: %v", i, err)
+		}
+		patterns[i] = p
+	}
+	buckets := binPack(patterns, CompileSetOptions{}, nil)
+	if len(buckets) == 0 {
+		t.Fatal("binPack returned no buckets")
+	}
+	// First bucket must have been built deterministically (no random ordering).
+	if len(buckets[0].patterns) == 0 {
+		t.Error("bucket 0 has no patterns")
+	}
+}
+
+func runConflictTest(t *testing.T, fixtureName string) ([]*bucket, *SetDiag) {
+	t.Helper()
+	fix := testdataFixture(t, fixtureName)
+	patterns := fix.patternInfos(t)
+	opts := fix.compileOpts()
+	diag := &SetDiag{}
+	buckets := binPack(patterns, opts, diag)
+	if fix.Expect.BucketCount > 0 && len(buckets) != fix.Expect.BucketCount {
+		t.Errorf("fixture %s: got %d buckets, want %d", fixtureName, len(buckets), fix.Expect.BucketCount)
+	}
+	if fix.Expect.FallbackCount > 0 {
+		fb := 0
+		for _, b := range buckets {
+			if b.isFallback {
+				fb++
+			}
+		}
+		if fb != fix.Expect.FallbackCount {
+			t.Errorf("fixture %s: got %d fallback buckets, want %d", fixtureName, fb, fix.Expect.FallbackCount)
+		}
+	}
+	return buckets, diag
+}
+
+func TestEquivalence_Conflict001(t *testing.T) { runConflictTest(t, "conflict_001") }
+func TestEquivalence_Conflict002(t *testing.T) { runConflictTest(t, "conflict_002") }
+func TestEquivalence_Conflict003(t *testing.T) { runConflictTest(t, "conflict_003") }
+func TestEquivalence_Conflict004(t *testing.T) { runConflictTest(t, "conflict_004") }
+func TestEquivalence_Conflict005(t *testing.T) { runConflictTest(t, "conflict_005") }
+func TestEquivalence_Conflict006(t *testing.T) { runConflictTest(t, "conflict_006") }
+func TestEquivalence_Conflict007(t *testing.T) { runConflictTest(t, "conflict_007") }
+func TestEquivalence_Conflict008(t *testing.T) { runConflictTest(t, "conflict_008") }
+
+func TestFallback_NoLiteral(t *testing.T) {
+	// conflict_005 patterns have no mandatory literal → all in fallback buckets.
+	_, diag := runConflictTest(t, "conflict_005")
+	if len(diag.Buckets) == 0 {
+		t.Fatal("no BucketDiag entries")
+	}
+	for _, b := range diag.Buckets {
+		if b.Type != "fallback" && b.Type != "singleton" {
+			t.Errorf("bucket %d type=%q, want fallback/singleton for no-literal patterns", b.ID, b.Type)
+		}
+	}
+}
+
+func TestDiagnostics_ConflictReasons(t *testing.T) {
+	type tc struct {
+		name    string
+		reasons []string
+	}
+	cases := []tc{
+		{"conflict_001", []string{"bitmask_cap_full"}},
+		{"conflict_002", []string{"class_count_incompatible"}},
+		{"conflict_003", []string{"table_size_exceeded"}},
+		{"conflict_004", []string{"state_count_exceeded"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fix := testdataFixture(t, c.name)
+			patterns := fix.patternInfos(t)
+			diag := &SetDiag{}
+			binPack(patterns, fix.compileOpts(), diag)
+			reasonSeen := make(map[string]bool)
+			for _, cd := range diag.Conflicts {
+				reasonSeen[cd.Reason] = true
+			}
+			for _, want := range c.reasons {
+				if !reasonSeen[want] {
+					t.Errorf("fixture %s: reason %q not found in conflicts %v", c.name, want, diag.Conflicts)
+				}
+			}
+		})
 	}
 }

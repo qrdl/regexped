@@ -1,0 +1,12 @@
+# conflict_006: non_splittable_in_quantifier
+# The mandatory literal "foo" is inside a quantifier (foo)+ — the path to the
+# literal passes through OpPlus, which splitAtPath rejects.
+# These route to compileFallback.
+options:
+  budget_states: 1
+patterns:
+  - pattern: '(foo)+bar'
+  - pattern: '(foo){2,3}baz'
+expect:
+  bucket_count: 2
+  fallback_count: 2

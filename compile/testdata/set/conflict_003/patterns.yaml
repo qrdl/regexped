@@ -1,0 +1,13 @@
+# conflict_003: budget_overflow_bytes
+# Patterns with same literal "baz". After merging pattern 1, pattern 2's merged
+# DFA exceeds the table-bytes budget.
+options:
+  bitmask_width: 64
+  budget_bytes: 1
+patterns:
+  - pattern: 'baz[a-z]+'
+  - pattern: 'baz[0-9]+'
+expect:
+  bucket_count: 2
+  conflict_reasons:
+    - table_size_exceeded

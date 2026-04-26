@@ -1,0 +1,11 @@
+# conflict_005: no_mandatory_literal
+# Patterns with no fixed mandatory literal — findMandatoryLitRec returns nil.
+# These route directly to compileFallback (no literal scan possible).
+options:
+  budget_states: 1
+patterns:
+  - pattern: '\w+'
+  - pattern: '[a-z]*[0-9]+'
+expect:
+  bucket_count: 2
+  fallback_count: 2

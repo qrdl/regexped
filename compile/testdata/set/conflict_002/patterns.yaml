@@ -1,0 +1,14 @@
+# conflict_002: incompatible_class_partitions
+# Two patterns with same literal "bar" but very different suffix byte-class
+# structures. The pre-filter budget is set low so the combined class count
+# causes rejection before attempting the actual merge.
+options:
+  bitmask_width: 64
+  budget_states_prefilter: 3
+patterns:
+  - pattern: 'bar[a-z]+'
+  - pattern: 'bar[0-9]+'
+expect:
+  bucket_count: 2
+  conflict_reasons:
+    - class_count_incompatible
