@@ -699,28 +699,33 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool) *dfa {
 			dfa.unicodeTrans[item.dfaState] = make(map[rune]int)
 		}
 
-		// Process word-char bytes using inputMapWord
-		for r, nextNFAStates := range inputMapWord {
+		// Process all 256 bytes in fixed order to ensure deterministic DFA state
+		// numbering. Iterating inputMapWord/inputMapNonWord as maps would create
+		// states in non-deterministic order (Go map iteration is randomised).
+		for b := 0; b < 256; b++ {
+			r := rune(b)
 			if isWordChar(byte(r)) {
+				nextNFAStates, ok := inputMapWord[r]
+				if !ok {
+					continue
+				}
 				nextSet := epsilonClosure(nextNFAStates, 0)
 				nextDFAState := getOrAddState(nextSet, true)
 				dfa.unicodeTrans[item.dfaState][r] = nextDFAState
-			}
-		}
-		// Process '\n' using inputMapNewline (ecEndLine context, nextPrevWasNewline=true).
-		if dfa.hasNewlineBoundary && inputMapNewline != nil {
-			if nextNFAStates, ok := inputMapNewline['\n']; ok {
-				// After consuming '\n', ecBeginLine fires so (?m:^) assertions mid-pattern are followed.
-				nextSet := epsilonClosure(nextNFAStates, ecBeginLine)
-				nextDFAState := getOrAddState(nextSet, false, true) // nextPrevWasNewline=true
-				dfa.unicodeTrans[item.dfaState]['\n'] = nextDFAState
-			}
-		}
-		// Process non-word-char bytes (excluding '\n' if handled above) using inputMapNonWord
-		for r, nextNFAStates := range inputMapNonWord {
-			if !isWordChar(byte(r)) {
-				if dfa.hasNewlineBoundary && r == '\n' {
-					continue // handled above
+			} else if dfa.hasNewlineBoundary && r == '\n' {
+				// '\n' is non-word; if newline-boundary is active, handle it separately
+				// so ecEndLine fires ((?m:$) assertions follow).
+				if inputMapNewline != nil {
+					if nextNFAStates, ok := inputMapNewline['\n']; ok {
+						nextSet := epsilonClosure(nextNFAStates, ecBeginLine)
+						nextDFAState := getOrAddState(nextSet, false, true) // nextPrevWasNewline=true
+						dfa.unicodeTrans[item.dfaState]['\n'] = nextDFAState
+					}
+				}
+			} else {
+				nextNFAStates, ok := inputMapNonWord[r]
+				if !ok {
+					continue
 				}
 				nextSet := epsilonClosure(nextNFAStates, 0)
 				nextDFAState := getOrAddState(nextSet, false)

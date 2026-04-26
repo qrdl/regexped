@@ -1,8 +1,11 @@
 package compile
 
 import (
+	"bytes"
 	"regexp/syntax"
 	"testing"
+
+	"github.com/qrdl/regexped/config"
 )
 
 // tdfaStats compiles pattern to TDFA and returns state/register/op counts.
@@ -135,7 +138,7 @@ func TestMinimizeTDFARegisters(t *testing.T) {
 }
 
 func TestTDFARegisterMinimization(t *testing.T) {
-	// After minimization, register count should not exceed the default limit.
+	// After minimisation, register count must not exceed the default limit.
 	_, numRegs, _, ok := tdfaStats("(a+)(b+)(c+)")
 	if !ok {
 		t.Skip("pattern not TDFA-eligible")
@@ -232,4 +235,82 @@ func TestTDFAEpsCapOps(t *testing.T) {
 			t.Logf("nested captures: got %d ops (may vary by NFA structure)", len(ops))
 		}
 	})
+}
+
+// TestTDFACompileDeterminism verifies that TDFA compilation produces byte-identical
+// WASM output on every call, regardless of Go's non-deterministic map iteration order
+// (engine_tdfa.go Fix 1: sort setOps by dst after iterating the rename map).
+func TestTDFACompileDeterminism(t *testing.T) {
+	// url-parse is a 6-group TDFA pattern with non-trivial register operations.
+	// It was observed to produce different WASM sizes across runs before the fix.
+	re := config.RegexEntry{
+		Pattern: `(?P<scheme>https?)://(?P<host>[^/:?#]+)` +
+			`(?::(?P<port>[0-9]+))?(?P<path>/[^?#]*)?` +
+			`(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?`,
+		GroupsFunc: "groups",
+	}
+	first, _, err := Compile([]config.RegexEntry{re}, 0, true)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		got, _, err := Compile([]config.RegexEntry{re}, 0, true)
+		if err != nil {
+			t.Fatalf("iteration %d: Compile: %v", i+1, err)
+		}
+		if !bytes.Equal(first, got) {
+			t.Errorf("iteration %d: WASM output differs from first (TDFA emission non-deterministic)", i+1)
+		}
+	}
+}
+
+// TestTDFARegisterMinimizationDegreeSort verifies that degree-sorted greedy graph
+// colouring (engine_tdfa.go Fix 2) reduces the number of WASM locals used by the TDFA.
+// Expected numRegs values were measured with the optimised colouring and are strictly
+// less than prog.NumCap, proving minimisation occurred with the correct ordering.
+func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
+	cases := []struct {
+		name       string
+		pattern    string
+		wantRegs   int // expected numRegs after minimisation with degree-sorted colouring
+		rawTags    int // prog.NumCap = upper bound without minimisation
+	}{
+		// Two sequential groups: a then b. Open-tags don't overlap, close-tags can share.
+		// rawTags=6 (3 groups × 2 tags incl. group 0), minimised to 4.
+		{"seq-2-groups", `(?P<a>\d+)-(?P<b>\d+)`, 4, 6},
+		// Three sequential groups.
+		// rawTags=8 (4 groups × 2), minimised to 6.
+		{"seq-3-groups", `(?P<a>\d+)-(?P<b>\d+)-(?P<c>\d+)`, 6, 8},
+		// Nested groups: b inside a. Open-tags are simultaneously live → can't share.
+		// Close-tags are NOT simultaneously live → can share (one colour).
+		// rawTags=6, minimised to 4.
+		{"nested-2-groups", `(?P<a>a+(?P<b>b+))`, 4, 6},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed, err := syntax.Parse(tc.pattern, syntax.Perl)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			prog, err := syntax.Compile(parsed.Simplify())
+			if err != nil {
+				t.Fatalf("Compile NFA: %v", err)
+			}
+			if prog.NumCap != tc.rawTags {
+				t.Errorf("rawTags: got %d want %d (test case stale?)", prog.NumCap, tc.rawTags)
+			}
+			tt, ok := newTDFA(prog, 2000)
+			if !ok {
+				t.Fatalf("newTDFA failed — pattern ineligible for TDFA")
+			}
+			if tt.numRegs != tc.wantRegs {
+				t.Errorf("numRegs: got %d want %d (register minimisation regressed?)", tt.numRegs, tc.wantRegs)
+			}
+			if tt.numRegs >= prog.NumCap {
+				t.Errorf("numRegs %d >= rawTags %d — minimisation had no effect", tt.numRegs, prog.NumCap)
+			}
+		})
+	}
 }

@@ -338,6 +338,8 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		//   orig >= sentinelBase → was a freshly-captured tag → reg[can] = pos
 		//   orig <  sentinelBase, orig != can → inherited but renumbered → reg[can] = reg[orig]
 		// Copies are sorted by descending dst to avoid clobbering chains (A←B←C emits C←B first).
+		// Set-ops are sorted by ascending dst to ensure deterministic WASM emission independent
+		// of Go's non-deterministic map iteration order over `rename`.
 		var copyOps, setOps []tdfaTagOp
 		for orig, can := range rename {
 			if orig >= sentinelBase {
@@ -347,6 +349,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			}
 		}
 		sort.Slice(copyOps, func(i, j int) bool { return copyOps[i].dst > copyOps[j].dst })
+		sort.Slice(setOps, func(i, j int) bool { return setOps[i].dst < setOps[j].dst })
 		ops := append(copyOps, setOps...)
 
 		// Update global register high-water mark (canonical indices ARE WASM locals).
@@ -1343,12 +1346,35 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	}
 
 	// ---- Step 3: greedy colouring ----
+	// Sort registers by interference degree descending (most-constrained first).
+	// Coloring high-degree nodes first minimises the number of colors used
+	// (= WASM locals), which shrinks the emitted module.  This ordering is
+	// also deterministic, unlike the raw allocation order.
+	degree := make([]int, numRegs)
+	for r := 0; r < numRegs; r++ {
+		for r2 := 0; r2 < numRegs; r2++ {
+			if interfere[r][r2] {
+				degree[r]++
+			}
+		}
+	}
+	order := make([]int, numRegs)
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool {
+		if degree[order[i]] != degree[order[j]] {
+			return degree[order[i]] > degree[order[j]] // higher degree first
+		}
+		return order[i] < order[j] // stable tie-break by register index
+	})
+
 	color := make([]int, numRegs)
 	for i := range color {
 		color[i] = -1
 	}
 	forbidden := make([]bool, numRegs)
-	for r := 0; r < numRegs; r++ {
+	for _, r := range order {
 		for i := range forbidden {
 			forbidden[i] = false
 		}
