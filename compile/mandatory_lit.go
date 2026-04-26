@@ -1,6 +1,16 @@
 package compile
 
-import "regexp/syntax"
+import (
+	"regexp/syntax"
+)
+
+// splitFrame records one step of the AST path from the root to the mandatory
+// literal found by findMandatoryLitRec. splitAtPath consumes the path to
+// reconstruct the prefix and suffix sub-trees.
+type splitFrame struct {
+	op    syntax.Op // OpConcat, OpCapture, OpPlus, or OpRepeat
+	index int       // for OpConcat: child index where the literal was found
+}
 
 // mandatoryLit describes a fixed byte sequence that must appear in every match,
 // along with its offset range from the start of the match.
@@ -28,62 +38,77 @@ func findMandatoryLit(pattern string) *mandatoryLit {
 	if err != nil {
 		return nil
 	}
-	return findMandatoryLitRec(re, 0, 0)
+	lit, _ := findMandatoryLitRec(re, 0, 0)
+	return lit
 }
 
 // findMandatoryLitRec recursively searches for a mandatory literal in re,
 // given that the match position is within [minOff, maxOff] bytes from the
-// literal's potential start.
-func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) *mandatoryLit {
+// literal's potential start. Returns the literal and the AST path from re to
+// the literal node (path[0] is the frame at re's level). Returns (nil, nil)
+// when no mandatory literal is found.
+func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) (*mandatoryLit, []splitFrame) {
 	if maxOff < 0 || maxOff > 256 {
-		return nil
+		return nil, nil
 	}
 	switch re.Op {
 	case syntax.OpLiteral:
 		// Only handle ASCII literals without FoldCase flag.
 		if re.Flags&syntax.FoldCase != 0 {
-			return nil
+			return nil, nil
 		}
 		var bs []byte
 		for _, r := range re.Rune {
 			if r > 127 {
-				return nil
+				return nil, nil
 			}
 			bs = append(bs, byte(r))
 		}
 		if len(bs) == 0 {
-			return nil
+			return nil, nil
 		}
-		return &mandatoryLit{bytes: bs, minOff: minOff, maxOff: maxOff}
+		return &mandatoryLit{bytes: bs, minOff: minOff, maxOff: maxOff}, nil
 
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {
-			return findMandatoryLitRec(re.Sub[0], minOff, maxOff)
+			lit, path := findMandatoryLitRec(re.Sub[0], minOff, maxOff)
+			if lit == nil {
+				return nil, nil
+			}
+			return lit, append([]splitFrame{{op: syntax.OpCapture}}, path...)
 		}
-		return nil
+		return nil, nil
 
 	case syntax.OpPlus:
 		// re+ executes body at least once, so we can recurse into body.
 		if len(re.Sub) == 1 {
-			return findMandatoryLitRec(re.Sub[0], minOff, maxOff)
+			lit, path := findMandatoryLitRec(re.Sub[0], minOff, maxOff)
+			if lit == nil {
+				return nil, nil
+			}
+			return lit, append([]splitFrame{{op: syntax.OpPlus}}, path...)
 		}
-		return nil
+		return nil, nil
 
 	case syntax.OpRepeat:
 		// re{min,max} with min >= 1: body executes at least once.
 		if re.Min >= 1 && len(re.Sub) == 1 {
-			return findMandatoryLitRec(re.Sub[0], minOff, maxOff)
+			lit, path := findMandatoryLitRec(re.Sub[0], minOff, maxOff)
+			if lit == nil {
+				return nil, nil
+			}
+			return lit, append([]splitFrame{{op: syntax.OpRepeat}}, path...)
 		}
-		return nil
+		return nil, nil
 
 	case syntax.OpConcat:
 		// Walk children left to right. For each child, first try to find a lit.
 		// If not found, accumulate the child's min/max length into the offset.
 		curMin := minOff
 		curMax := maxOff
-		for _, sub := range re.Sub {
-			if ml := findMandatoryLitRec(sub, curMin, curMax); ml != nil {
-				return ml
+		for i, sub := range re.Sub {
+			if lit, path := findMandatoryLitRec(sub, curMin, curMax); lit != nil {
+				return lit, append([]splitFrame{{op: syntax.OpConcat, index: i}}, path...)
 			}
 			childMin, childMax := regexpMinMaxLen(sub)
 			curMin += int32(childMin)
@@ -93,14 +118,107 @@ func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) *mandatoryLit 
 				curMax += int32(childMax)
 			}
 			if curMax > 256 {
-				return nil
+				return nil, nil
 			}
 		}
-		return nil
+		return nil, nil
 
 	default:
 		// OpAlternate, OpStar, OpQuest, OpRepeat with Min=0, etc.
+		return nil, nil
+	}
+}
+
+// splitAtPath splits root around the mandatory literal recorded in path.
+// path is produced by findMandatoryLitRec. Returns (prefixAST, suffixAST, true)
+// where prefixAST is the sub-tree before the literal and suffixAST is the
+// sub-tree after. Either may be nil when the literal is at the start/end.
+// Returns (nil, nil, false) when the path passes through a quantifier or
+// alternate that makes a clean split impossible.
+func splitAtPath(root *syntax.Regexp, path []splitFrame) (prefixAST, suffixAST *syntax.Regexp, ok bool) {
+	return splitAtPathRec(root, path)
+}
+
+func splitAtPathRec(re *syntax.Regexp, path []splitFrame) (*syntax.Regexp, *syntax.Regexp, bool) {
+	if len(path) == 0 {
+		// At the literal leaf: nothing on either side at this level.
+		return nil, nil, true
+	}
+	frame := path[0]
+	rest := path[1:]
+	switch frame.op {
+	case syntax.OpPlus, syntax.OpRepeat, syntax.OpAlternate:
+		return nil, nil, false
+	case syntax.OpCapture:
+		if re.Op != syntax.OpCapture || len(re.Sub) != 1 {
+			return nil, nil, false
+		}
+		return splitAtPathRec(re.Sub[0], rest)
+	case syntax.OpConcat:
+		if re.Op != syntax.OpConcat {
+			return nil, nil, false
+		}
+		i := frame.index
+		if i < 0 || i >= len(re.Sub) {
+			return nil, nil, false
+		}
+		innerPre, innerSuf, ok := splitAtPathRec(re.Sub[i], rest)
+		if !ok {
+			return nil, nil, false
+		}
+		var preParts []*syntax.Regexp
+		for j := 0; j < i; j++ {
+			preParts = append(preParts, deepCopyRegexp(re.Sub[j]))
+		}
+		if innerPre != nil {
+			preParts = append(preParts, innerPre)
+		}
+		var sufParts []*syntax.Regexp
+		if innerSuf != nil {
+			sufParts = append(sufParts, innerSuf)
+		}
+		for j := i + 1; j < len(re.Sub); j++ {
+			sufParts = append(sufParts, deepCopyRegexp(re.Sub[j]))
+		}
+		return concatRegexp(preParts), concatRegexp(sufParts), true
+	default:
+		return nil, nil, false
+	}
+}
+
+func deepCopyRegexp(re *syntax.Regexp) *syntax.Regexp {
+	if re == nil {
 		return nil
+	}
+	n := &syntax.Regexp{
+		Op:    re.Op,
+		Flags: re.Flags,
+		Min:   re.Min,
+		Max:   re.Max,
+		Cap:   re.Cap,
+		Name:  re.Name,
+	}
+	if len(re.Rune) > 0 {
+		n.Rune = make([]rune, len(re.Rune))
+		copy(n.Rune, re.Rune)
+	}
+	if len(re.Sub) > 0 {
+		n.Sub = make([]*syntax.Regexp, len(re.Sub))
+		for i, sub := range re.Sub {
+			n.Sub[i] = deepCopyRegexp(sub)
+		}
+	}
+	return n
+}
+
+func concatRegexp(parts []*syntax.Regexp) *syntax.Regexp {
+	switch len(parts) {
+	case 0:
+		return nil
+	case 1:
+		return parts[0]
+	default:
+		return &syntax.Regexp{Op: syntax.OpConcat, Sub: parts}
 	}
 }
 

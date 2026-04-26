@@ -85,7 +85,7 @@ func TestFindMandatoryLitRecDegenerate(t *testing.T) {
 		{"plus_no_sub", &syntax.Regexp{Op: syntax.OpPlus}},
 	}
 	for _, c := range cases {
-		got := findMandatoryLitRec(c.re, 0, 0)
+		got, _ := findMandatoryLitRec(c.re, 0, 0)
 		if got != nil {
 			t.Errorf("findMandatoryLitRec(%s): got %v, want nil", c.name, got)
 		}

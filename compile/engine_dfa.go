@@ -820,6 +820,105 @@ func dfaTableFrom(d *dfa) *dfaTable {
 	return t
 }
 
+// dfaTableFromCanonical builds a dfaTable, applies Hopcroft minimization, then
+// BFS-relabels states so that structurally equivalent DFAs get identical state
+// numbering. Used by the set composition path (compile/set.go) to produce
+// canonical DFAs for fingerprinting and dedup. The per-pattern path continues
+// to use dfaTableFrom (no relabel) so single-pattern fuel/size baselines are
+// unchanged.
+func dfaTableFromCanonical(d *dfa) *dfaTable {
+	t := dfaTableFrom(d)
+	bfsRelabelDFA(t)
+	return t
+}
+
+// bfsRelabelDFA renumbers DFA states in BFS discovery order starting from
+// the canonical start states (startState first, then mid-start states).
+// After relabelling, startState == 0 and structurally identical DFAs have
+// identical state numberings — a precondition for dfaFingerprint.
+func bfsRelabelDFA(t *dfaTable) {
+	n := t.numStates
+	if n <= 1 {
+		return
+	}
+
+	oldToNew := make([]int, n)
+	for i := range oldToNew {
+		oldToNew[i] = -1
+	}
+	newID := 0
+	queue := make([]int, 0, n)
+
+	assign := func(s int) {
+		if s >= 0 && s < n && oldToNew[s] < 0 {
+			oldToNew[s] = newID
+			newID++
+			queue = append(queue, s)
+		}
+	}
+
+	// Seed BFS in canonical order so start states get the lowest IDs.
+	assign(t.startState)
+	assign(t.midStartState)
+	assign(t.midStartWordState)
+	if t.hasNewlineBoundary {
+		assign(t.midStartNewlineState)
+	}
+
+	for len(queue) > 0 {
+		s := queue[0]
+		queue = queue[1:]
+		for b := 0; b < 256; b++ {
+			if next := t.transitions[s*256+b]; next >= 0 {
+				assign(next)
+			}
+		}
+	}
+
+	// Assign IDs to any unreachable states (defensive; shouldn't occur after minimization).
+	for s := 0; s < n; s++ {
+		if oldToNew[s] < 0 {
+			oldToNew[s] = newID
+			newID++
+		}
+	}
+
+	newTrans := make([]int, n*256)
+	for i := range newTrans {
+		newTrans[i] = -1
+	}
+	for s := 0; s < n; s++ {
+		ns := oldToNew[s]
+		for b := 0; b < 256; b++ {
+			if next := t.transitions[s*256+b]; next >= 0 {
+				newTrans[ns*256+b] = oldToNew[next]
+			}
+		}
+	}
+
+	remapMap := func(m map[int]bool) map[int]bool {
+		out := make(map[int]bool, len(m))
+		for s := range m {
+			out[oldToNew[s]] = true
+		}
+		return out
+	}
+
+	t.startState = oldToNew[t.startState]
+	t.midStartState = oldToNew[t.midStartState]
+	t.midStartWordState = oldToNew[t.midStartWordState]
+	if t.hasNewlineBoundary {
+		t.midStartNewlineState = oldToNew[t.midStartNewlineState]
+	}
+	t.transitions = newTrans
+	t.acceptStates = remapMap(t.acceptStates)
+	t.midAcceptStates = remapMap(t.midAcceptStates)
+	t.midAcceptNWStates = remapMap(t.midAcceptNWStates)
+	t.midAcceptWStates = remapMap(t.midAcceptWStates)
+	t.midAcceptNLStates = remapMap(t.midAcceptNLStates)
+	t.immediateAcceptStates = remapMap(t.immediateAcceptStates)
+}
+
 // minimizeDFA applies Hopcroft's DFA minimization algorithm, merging
 // equivalent states (states that are indistinguishable from any starting
 // point). Modifies t in place.

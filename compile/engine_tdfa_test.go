@@ -271,10 +271,10 @@ func TestTDFACompileDeterminism(t *testing.T) {
 // less than prog.NumCap, proving minimisation occurred with the correct ordering.
 func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
 	cases := []struct {
-		name       string
-		pattern    string
-		wantRegs   int // expected numRegs after minimisation with degree-sorted colouring
-		rawTags    int // prog.NumCap = upper bound without minimisation
+		name     string
+		pattern  string
+		wantRegs int // expected numRegs after minimisation with degree-sorted colouring
+		rawTags  int // prog.NumCap = upper bound without minimisation
 	}{
 		// Two sequential groups: a then b. Open-tags don't overlap, close-tags can share.
 		// rawTags=6 (3 groups × 2 tags incl. group 0), minimised to 4.
