@@ -1811,6 +1811,151 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 	return ds
 }
 
+// genSuffixWASM generates a size-prefixed WASM function body and data segments
+// for a suffix DFA with bitmask accept returns.
+//
+// Function signature: (ptr i32, start i32, len i32) → i64
+// Returns (firstAcceptPos << 32) | bitmask where:
+//
+//	bitmask       = OR of accept bitmasks for all states visited during the scan
+//	firstAcceptPos = pos+1 at which the first accept occurred (0 = no accept)
+//
+// tableBase is the memory address at which this DFA's data will be placed.
+// tableMemIdx is 0 for standalone modules (single memory).
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int) (funcBody []byte, dataBytes []byte, dataSegCount int) {
+	if t == nil || t.numStates == 0 {
+		body := []byte{0x01, 0x01, 0x7F} // 1 local i32
+		body = append(body, 0x42, 0x00)  // i64.const 0
+		body = append(body, 0x0B)        // end
+		funcBody = utils.AppendULEB128(nil, uint32(len(body)))
+		funcBody = append(funcBody, body...)
+		return
+	}
+
+	l := buildDFALayout(t, tableBase, false, true, 0)
+
+	// Place 8-byte-per-state bitmask table after all layout data.
+	bitmaskOff := int32(l.tableEnd)
+	bitmaskBytes := make([]byte, l.numWASM*8)
+	for gs, bits := range t.acceptStates {
+		if bits != 0 {
+			off := (gs + 1) * 8
+			for i := 0; i < 8; i++ {
+				bitmaskBytes[off+i] = byte(bits >> uint(i*8))
+			}
+		}
+	}
+
+	// Get layout data segments (stripping the count prefix), then append bitmask.
+	layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false))
+	dataBytes = append(dataBytes, layoutRaw...)
+	dataBytes = append(dataBytes, appendDataSegment(nil, bitmaskOff, bitmaskBytes)...)
+	dataSegCount = layoutCount + 1
+
+	body := buildSuffixBody(l, bitmaskOff, tableMemIdx)
+	funcBody = utils.AppendULEB128(nil, uint32(len(body)))
+	funcBody = append(funcBody, body...)
+	return
+}
+
+// buildSuffixBody generates the WASM function body for suffix DFA scanning.
+// Signature: (ptr i32, start i32, len i32) → i64
+// Uses the fully-optimized DFA table from the layout (byte-class compression,
+// row dedup, immediateAccept early exit) plus a separate 8-byte bitmask accept
+// table at bitmaskOff.
+func buildSuffixBody(l *dfaLayout, bitmaskOff int32, tableMemIdx int) []byte {
+	const (
+		paramPtr   = byte(0)
+		paramStart = byte(1)
+		paramLen   = byte(2)
+		lState     = byte(3)
+		lPos       = byte(4)
+		lEndPos    = byte(5)
+		lByteClass = byte(6)
+		lBits      = byte(7)
+		lResult    = byte(8)
+	)
+	var b []byte
+	// 2 local groups: (4 × i32: state, pos, endPos, byteOrClass), (2 × i64: bits, result)
+	b = append(b, 0x02, 0x04, 0x7F, 0x02, 0x7E)
+
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(l.wasmStart))
+	b = append(b, 0x21, lState)                 // state = wasmStart
+	b = append(b, 0x20, paramStart, 0x21, lPos) // pos = start
+	// lEndPos, lBits, lResult = 0 (default)
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $main
+
+	// if pos >= len: br $done
+	b = append(b, 0x20, lPos, 0x20, paramLen, 0x4F, 0x0D, 0x01)
+
+	// DFA transition
+	if l.useU8 && l.useCompression {
+		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
+			l.useRowDedup, l.rowMapOff, lState, lByteClass, paramPtr, lPos, 0xff, tableMemIdx)
+	} else if l.useU8 {
+		b = emitSimpleU8Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff,
+			lState, paramPtr, lPos, 0xff, tableMemIdx)
+	} else {
+		// u16: load input byte into lByteClass first
+		b = append(b, 0x20, paramPtr, 0x20, lPos, 0x6A, 0x2D, 0x00, 0x00) // mem[ptr+pos]
+		b = append(b, 0x21, lByteClass)
+		b = emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff, lState, lByteClass, tableMemIdx)
+	}
+
+	// lBits = bitmask[state * 8] — address is i32 (WASM32)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, bitmaskOff)
+	b = append(b, 0x20, lState) // push state (i32)
+	b = append(b, 0x41, 0x03)   // i32.const 3
+	b = append(b, 0x74)         // i32.shl (state * 8)
+	b = append(b, 0x6A)         // i32.add (bitmaskOff + state*8)
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x21, lBits)
+
+	// if endPos==0 && bits!=0: endPos = pos+1
+	b = append(b, 0x20, lEndPos, 0x45)                         // i32.eqz
+	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52)               // bits!=0: i64.const 0, i64.ne
+	b = append(b, 0x71)                                        // i32.and
+	b = append(b, 0x04, 0x40)                                  // if (void)
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lEndPos) // endPos = pos+1
+	b = append(b, 0x0B)                                        // end if
+
+	// result |= bits
+	b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult) // i64.or
+
+	// if immediateAccept[state]: br $done (LeftmostFirst early exit)
+	if l.hasImmAccept {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
+		b = append(b, 0x20, lState)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx)
+		b = append(b, 0x0D, 0x01) // br_if $done
+	}
+
+	// if state == 0 (dead): br $done
+	b = append(b, 0x20, lState, 0x45, 0x0D, 0x01) // i32.eqz + br_if $done
+
+	// pos++; br $main
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, 0x00) // br $main
+
+	b = append(b, 0x0B) // end loop $main
+	b = append(b, 0x0B) // end block $done
+
+	// return (i64(endPos) << 32) | result
+	b = append(b, 0x20, lEndPos)       // push endPos (i32)
+	b = append(b, 0xAD)                // i64.extend_i32_u
+	b = append(b, 0x42, 0x20)          // i64.const 32
+	b = append(b, 0x86)                // i64.shl
+	b = append(b, 0x20, lResult, 0x84) // lResult; i64.or
+	b = append(b, 0x0B)                // end function
+	return b
+}
+
 // appendMatchCodeEntry appends a size-prefixed match function body to cs.
 // Uses the hybrid dispatch path when l.useHybridDispatch is true.
 func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, hasImmAccept bool, tableMemIdx int) []byte {
@@ -1861,6 +2006,326 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 	return append(cs, body...)
 }
 
+// emitCompressedU8Transition emits the compressed u8 DFA transition:
+//
+//	class = classMap[classMapOff + byte]
+//	state = table[tableOff + row*numClasses + class]
+//
+// where byte is loaded from mem[ptrLocal+posLocal] when byteLocal==0xff,
+// or taken from byteLocal otherwise (byte already in a local).
+// row = rowMap[state] when useRowDedup, otherwise row = state.
+// classLocal receives the class value; stateLocal is updated with the new state.
+func emitCompressedU8Transition(b []byte,
+	tableOff, classMapOff int32, numClasses int,
+	useRowDedup bool, rowMapOff int32,
+	stateLocal, classLocal byte,
+	ptrLocal, posLocal byte,
+	byteLocal byte,
+	tableMemIdx int) []byte {
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, classMapOff)
+	if byteLocal == 0xff {
+		b = append(b, 0x20, ptrLocal)
+		b = append(b, 0x20, posLocal)
+		b = append(b, 0x6A)             // i32.add
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
+	} else {
+		b = append(b, 0x20, byteLocal)
+	}
+	b = append(b, 0x6A)                   // classMapOff + byte
+	b = appendTableLoad8u(b, tableMemIdx) // class = classMap[...]
+	b = append(b, 0x21, classLocal)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, tableOff)
+	if useRowDedup {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, rowMapOff)
+		b = append(b, 0x20, stateLocal)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // rowMap[state] → row
+	} else {
+		b = append(b, 0x20, stateLocal)
+	}
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(numClasses))
+	b = append(b, 0x6C)                   // i32.mul
+	b = append(b, 0x6A)                   // i32.add
+	b = append(b, 0x20, classLocal)       // local.get class
+	b = append(b, 0x6A)                   // i32.add
+	b = appendTableLoad8u(b, tableMemIdx) // table[row*numClasses+class]
+	b = append(b, 0x21, stateLocal)
+	return b
+}
+
+// emitSimpleU8Transition emits the simple u8 DFA transition:
+//
+//	state = table[tableOff + row*256 + byte]
+//
+// where byte is loaded from mem[ptrLocal+posLocal] when byteLocal==0xff,
+// or taken from byteLocal otherwise.
+// row = rowMap[state] when useRowDedup, otherwise row = state.
+// stateLocal is updated with the new state.
+func emitSimpleU8Transition(b []byte,
+	tableOff int32,
+	useRowDedup bool, rowMapOff int32,
+	stateLocal byte,
+	ptrLocal, posLocal byte,
+	byteLocal byte,
+	tableMemIdx int) []byte {
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, tableOff)
+	if useRowDedup {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, rowMapOff)
+		b = append(b, 0x20, stateLocal)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // rowMap[state] → row
+	} else {
+		b = append(b, 0x20, stateLocal)
+	}
+	b = append(b, 0x41, 0x08) // i32.const 8
+	b = append(b, 0x74)       // i32.shl (row * 256)
+	b = append(b, 0x6A)
+	if byteLocal == 0xff {
+		b = append(b, 0x20, ptrLocal)
+		b = append(b, 0x20, posLocal)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
+	} else {
+		b = append(b, 0x20, byteLocal)
+	}
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx) // table[row*256+byte]
+	b = append(b, 0x21, stateLocal)
+	return b
+}
+
+// emitU16Transition emits the u16 DFA transition:
+//
+//	state = u16(table[tableOff + row*512 + byteLocal*2])
+//
+// byteLocal must be a pre-loaded i32 local containing the input byte.
+// row = rowMap[state] when useRowDedup, otherwise row = state.
+// stateLocal is updated with the new state.
+func emitU16Transition(b []byte,
+	tableOff int32,
+	useRowDedup bool, rowMapOff int32,
+	stateLocal, byteLocal byte,
+	tableMemIdx int) []byte {
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, tableOff)
+	if useRowDedup {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, rowMapOff)
+		b = append(b, 0x20, stateLocal)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // rowMap[state] → row
+	} else {
+		b = append(b, 0x20, stateLocal)
+	}
+	b = append(b, 0x41, 0x09) // i32.const 9
+	b = append(b, 0x74)       // i32.shl (row * 512)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, byteLocal)
+	b = append(b, 0x41, 0x01) // i32.const 1
+	b = append(b, 0x74)       // i32.shl (byte * 2)
+	b = append(b, 0x6A)
+	b = appendTableLoad16u(b, tableMemIdx) // i32.load16_u
+	b = append(b, 0x21, stateLocal)
+	return b
+}
+
+// emitImmAcceptCheckMatch emits: if immediateAccept[state]: return pos.
+// Used in match mode. No-op when hasImmAccept is false.
+func emitImmAcceptCheckMatch(b []byte, immediateAcceptOff int32,
+	hasImmAccept bool, stateLocal, posLocal byte, tableMemIdx int) []byte {
+	if !hasImmAccept {
+		return b
+	}
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, immediateAcceptOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx)
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B) // end if
+	return b
+}
+
+// emitImmAcceptCheckFindMid emits: if immediateAccept[state]: last_accept=pos+1; br brDepth.
+// Used mid-scan in find mode. No-op when hasImmAccept is false.
+func emitImmAcceptCheckFindMid(b []byte, immediateAcceptOff int32,
+	hasImmAccept bool, stateLocal, posLocal, lastAcceptLocal byte,
+	brDepth byte, tableMemIdx int) []byte {
+	if !hasImmAccept {
+		return b
+	}
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, immediateAcceptOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx)
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x41, 0x01) // i32.const 1
+	b = append(b, 0x6A)       // pos + 1
+	b = append(b, 0x21, lastAcceptLocal)
+	b = append(b, 0x0C, brDepth) // br brDepth
+	b = append(b, 0x0B)          // end if
+	return b
+}
+
+// emitImmAcceptCheckFindStart emits: if immediateAccept[state]: last_accept=pos; br brDepth.
+// Used at the start of each attempt in find mode. No-op when hasImmAccept is false.
+func emitImmAcceptCheckFindStart(b []byte, immediateAcceptOff int32,
+	hasImmAccept bool, stateLocal, posLocal, lastAcceptLocal byte,
+	brDepth byte, tableMemIdx int) []byte {
+	if !hasImmAccept {
+		return b
+	}
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, immediateAcceptOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx)
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x21, lastAcceptLocal)
+	b = append(b, 0x0C, brDepth) // br brDepth
+	b = append(b, 0x0B)          // end if
+	return b
+}
+
+// emitEofHandler emits the EOF (pos >= len) handler inside the DFA scan loop.
+// Checks eofAccept[state]; if set, updates last_accept = pos.
+// When hasRetry is false (anchored mode): unconditionally br foundDepth → $found.
+// When hasRetry is true (full find mode): br_if foundDepth → $found if last_accept>=0,
+// otherwise increment attemptStartLocal and br outerDepth → $outer.
+func emitEofHandler(b []byte, eofAcceptOff int32,
+	stateLocal, posLocal, lastAcceptLocal, attemptStartLocal byte,
+	foundDepth byte, hasRetry bool, outerDepth byte,
+	tableMemIdx int) []byte {
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, eofAcceptOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx)
+	b = append(b, 0x04, 0x40) // if eofAccept[state]
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x21, lastAcceptLocal)
+	b = append(b, 0x0B) // end if
+	if !hasRetry {
+		b = append(b, 0x0C, foundDepth) // br → $found (unconditional, anchored)
+	} else {
+		b = append(b, 0x20, lastAcceptLocal)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x4E)             // i32.ge_s
+		b = append(b, 0x0D, foundDepth) // br_if → $found
+		b = append(b, 0x20, attemptStartLocal)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, attemptStartLocal)
+		b = append(b, 0x0C, outerDepth) // br → $outer
+	}
+	return b
+}
+
+// emitDeadHandler emits the dead-state handler inside the DFA scan loop.
+// When hasRetry is false (anchored mode): unconditionally br foundDepth → $found.
+// When hasRetry is true (full find mode): br_if foundDepth → $found if last_accept>=0,
+// otherwise increment attemptStartLocal and br outerDepth → $outer.
+func emitDeadHandler(b []byte,
+	lastAcceptLocal, attemptStartLocal byte,
+	foundDepth byte, hasRetry bool, outerDepth byte) []byte {
+	if !hasRetry {
+		b = append(b, 0x0C, foundDepth) // br → $found (unconditional, anchored)
+	} else {
+		b = append(b, 0x20, lastAcceptLocal)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x4E)             // i32.ge_s
+		b = append(b, 0x0D, foundDepth) // br_if → $found
+		b = append(b, 0x20, attemptStartLocal)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, attemptStartLocal)
+		b = append(b, 0x0C, outerDepth) // br → $outer
+	}
+	return b
+}
+
+// emitWBPreAcceptCheck emits: before the DFA transition, check wordChar/non-wordChar
+// and update last_accept from midAcceptW or midAcceptNW accordingly.
+// No-op when hasWordBoundary is false.
+func emitWBPreAcceptCheck(b []byte, wordCharTableOff, midAcceptWOff, midAcceptNWOff int32,
+	hasWordBoundary bool,
+	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
+	tableMemIdx int) []byte {
+	if !hasWordBoundary {
+		return b
+	}
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, wordCharTableOff)
+	b = append(b, 0x20, ptrLocal)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx) // wordCharTable[byte]
+	b = append(b, 0x04, 0x40)             // if isWordChar
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midAcceptWOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx) // midAcceptW[state]
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x21, lastAcceptLocal)
+	b = append(b, 0x0B)
+	b = append(b, 0x05) // else: non-word
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midAcceptNWOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx) // midAcceptNW[state]
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x21, lastAcceptLocal)
+	b = append(b, 0x0B)
+	b = append(b, 0x0B) // end if isWordChar
+	return b
+}
+
+// emitNLPreAcceptCheck emits: if current byte == '\n', check midAcceptNL[state]
+// and update last_accept = pos. No-op when hasNewlineBoundary is false.
+func emitNLPreAcceptCheck(b []byte, midAcceptNLOff int32,
+	hasNewlineBoundary bool,
+	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
+	tableMemIdx int) []byte {
+	if !hasNewlineBoundary {
+		return b
+	}
+	b = append(b, 0x20, ptrLocal)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
+	b = append(b, 0x41, 0x0A)       // i32.const '\n'
+	b = append(b, 0x46)             // i32.eq
+	b = append(b, 0x04, 0x40)       // if (void)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midAcceptNLOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx) // midAcceptNL[state]
+	b = append(b, 0x04, 0x40)             // if (void)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x21, lastAcceptLocal)
+	b = append(b, 0x0B) // end if midAcceptNL
+	b = append(b, 0x0B) // end if '\n'
+	return b
+}
+
 // buildMatchBody returns the WASM function body bytes (locals + instructions + end).
 //
 // u8 compressed (useU8=true, useCompression=true):
@@ -1876,23 +2341,6 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 //	Local indices: 0=ptr 1=len 2=state 3=pos 4=byte
 func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, immediateAcceptOff int32, hasImmAccept bool, rowMapOff int32, useRowDedup bool, tableMemIdx int) []byte {
 	var b []byte
-
-	// emitImmAcceptCheck emits: if immediateAccept[state]: return pos
-	emitImmAcceptCheck := func(b []byte) []byte {
-		if !hasImmAccept {
-			return b
-		}
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, immediateAcceptOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = append(b, 0x6A)       // i32.add
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x0F)       // return
-		b = append(b, 0x0B)       // end if
-		return b
-	}
 
 	if useU8 && useCompression {
 		// ── u8 compressed path ────────────────────────────────────────────────
@@ -1911,38 +2359,8 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x0D, 0x01) // br_if $done
 
-		// class = classMap[mem[ptr+pos]]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, classMapOff)
-		b = append(b, 0x20, 0x00)             // local.get ptr
-		b = append(b, 0x20, 0x03)             // local.get pos
-		b = append(b, 0x6A)                   // i32.add
-		b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u (input byte)
-		b = append(b, 0x6A)                   // i32.add (classMapOff + byte)
-		b = appendTableLoad8u(b, tableMemIdx) // i32.load8_u (class)
-		b = append(b, 0x21, 0x04)             // local.set class
-
-		// state = u8(mem[tableOff + row*numClasses + class])
-		// where row = rowMap[state] when useRowDedup, else row = state
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, tableOff)
-		if useRowDedup {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02)             // local.get state
-			b = append(b, 0x6A)                   // rowMapOff + state
-			b = appendTableLoad8u(b, tableMemIdx) // i32.load8_u → row
-		} else {
-			b = append(b, 0x20, 0x02) // local.get state
-		}
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(numClasses))
-		b = append(b, 0x6C)                   // i32.mul
-		b = append(b, 0x6A)                   // i32.add
-		b = append(b, 0x20, 0x04)             // local.get class
-		b = append(b, 0x6A)                   // i32.add
-		b = appendTableLoad8u(b, tableMemIdx) // i32.load8_u
-		b = append(b, 0x21, 0x02)             // local.set state
+		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
+			useRowDedup, rowMapOff, 0x02, 0x04, 0x00, 0x03, 0xff, tableMemIdx)
 
 		b = append(b, 0x20, 0x02)
 		b = append(b, 0x45)       // i32.eqz
@@ -1951,7 +2369,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheck(b)
+		b = emitImmAcceptCheckMatch(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -1993,29 +2411,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x4F)
 		b = append(b, 0x0D, 0x01) // if pos >= len: br_if $done
 
-		// state = u8(mem[tableOff + row*256 + mem[ptr+pos]])
-		// where row = rowMap[state] when useRowDedup, else row = state
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, tableOff)
-		if useRowDedup {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02)             // local.get state
-			b = append(b, 0x6A)                   // rowMapOff + state
-			b = appendTableLoad8u(b, tableMemIdx) // i32.load8_u → row
-		} else {
-			b = append(b, 0x20, 0x02) // local.get state
-		}
-		b = append(b, 0x41, 0x08) // i32.const 8
-		b = append(b, 0x74)       // i32.shl (row * 256)
-		b = append(b, 0x6A)
-		b = append(b, 0x20, 0x00) // local.get ptr
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // i32.load8_u (table entry)
-		b = append(b, 0x21, 0x02)             // local.set state
+		b = emitSimpleU8Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
 
 		b = append(b, 0x20, 0x02)
 		b = append(b, 0x45)
@@ -2024,7 +2420,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheck(b)
+		b = emitImmAcceptCheckMatch(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -2072,27 +2468,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
 	b = append(b, 0x21, 0x04)       // local.set byte
 
-	// state = u16(mem[tableOff + row*512 + byte*2]) where row = rowMap[state] or state
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, tableOff)
-	if useRowDedup {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, rowMapOff)
-		b = append(b, 0x20, 0x02)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // i32.load8_u → row
-	} else {
-		b = append(b, 0x20, 0x02) // local.get state
-	}
-	b = append(b, 0x41, 0x09) // i32.const 9
-	b = append(b, 0x74)       // i32.shl (row/state * 512)
-	b = append(b, 0x6A)
-	b = append(b, 0x20, 0x04) // local.get byte
-	b = append(b, 0x41, 0x01) // i32.const 1
-	b = append(b, 0x74)       // i32.shl (byte * 2)
-	b = append(b, 0x6A)
-	b = appendTableLoad16u(b, tableMemIdx) // i32.load16_u
-	b = append(b, 0x21, 0x02)              // local.set state
+	b = emitU16Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x04, tableMemIdx)
 
 	b = append(b, 0x20, 0x02)
 	b = append(b, 0x45)
@@ -2101,7 +2477,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
 
-	b = emitImmAcceptCheck(b)
+	b = emitImmAcceptCheckMatch(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)
@@ -2235,129 +2611,6 @@ func isAnchoredFind(t *dfaTable) bool {
 func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, hasNewlineBoundary bool, tableMemIdx int) []byte {
 	var b []byte
 
-	// emitImmAcceptCheckFind emits: if immediateAccept[state]: last_accept=pos+1; br 2→$found
-	emitImmAcceptCheckFind := func(b []byte) []byte {
-		if !hasImmAccept {
-			return b
-		}
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, immediateAcceptOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = append(b, 0x6A)       // i32.add
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x41, 0x01) // i32.const 1
-		b = append(b, 0x6A)       // i32.add
-		b = append(b, 0x21, 0x05) // local.set last_accept
-		b = append(b, 0x0C, 0x02) // br 2 → exit $found
-		b = append(b, 0x0B)       // end if
-		return b
-	}
-
-	// emitImmAcceptCheckFindStart emits: if immediateAccept[state]: last_accept=pos; br 1→$found
-	emitImmAcceptCheckFindStart := func(b []byte) []byte {
-		if !hasImmAccept {
-			return b
-		}
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, immediateAcceptOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = append(b, 0x6A)       // i32.add
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x21, 0x05) // local.set last_accept
-		b = append(b, 0x0C, 0x01) // br 1 → exit $found
-		b = append(b, 0x0B)       // end if
-		return b
-	}
-
-	// emitEofHandler: check eofAccept, maybe update last_accept, exit $found.
-	// Depths from inside if body: 0=if, 1=$scan, 2=$found.
-	emitEofHandler := func(b []byte) []byte {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, eofAcceptOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = append(b, 0x6A)       // i32.add
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x04, 0x40) // if (void): eofAccept
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x21, 0x05) // local.set last_accept
-		b = append(b, 0x0B)       // end if
-		b = append(b, 0x0C, 0x02) // br 2 → exit $found (anchored: no retry)
-		return b
-	}
-
-	// emitDeadHandler: exit $found (no retry in anchored mode).
-	// Depths from inside if body: 0=if, 1=$scan, 2=$found.
-	emitDeadHandler := func(b []byte) []byte {
-		b = append(b, 0x0C, 0x02) // br 2 → exit $found
-		return b
-	}
-
-	// emitWBPreAcceptCheck: same as regular find — checks midAcceptW/NW inside $scan.
-	emitWBPreAcceptCheck := func(b []byte) []byte {
-		if !hasWordBoundary {
-			return b
-		}
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, wordCharTableOff)
-		b = append(b, 0x20, 0x00)
-		b = append(b, 0x20, 0x03)
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // wordCharTable[byte]
-		b = append(b, 0x04, 0x40)             // if isWordChar
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptWOff)
-		b = append(b, 0x20, 0x02)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // midAcceptW[state]
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, 0x03)
-		b = append(b, 0x21, 0x05)
-		b = append(b, 0x0B)
-		b = append(b, 0x05) // else: non-word
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptNWOff)
-		b = append(b, 0x20, 0x02)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // midAcceptNW[state]
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, 0x03)
-		b = append(b, 0x21, 0x05)
-		b = append(b, 0x0B)
-		b = append(b, 0x0B) // end if isWordChar
-		return b
-	}
-
-	// emitNLPreAcceptCheck: before '\n' byte, check midAcceptNL[state] → last_accept = pos.
-	emitNLPreAcceptCheck := func(b []byte) []byte {
-		if !hasNewlineBoundary {
-			return b
-		}
-		b = append(b, 0x20, 0x00)       // local.get ptr
-		b = append(b, 0x20, 0x03)       // local.get pos
-		b = append(b, 0x6A)             // i32.add
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
-		b = append(b, 0x41, 0x0A)       // i32.const '\n'
-		b = append(b, 0x46)             // i32.eq
-		b = append(b, 0x04, 0x40)       // if (void)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptNLOff)
-		b = append(b, 0x20, 0x02)             // local.get state
-		b = append(b, 0x6A)                   // i32.add
-		b = appendTableLoad8u(b, tableMemIdx) // midAcceptNL[state]
-		b = append(b, 0x04, 0x40)             // if (void)
-		b = append(b, 0x20, 0x03)             // local.get pos
-		b = append(b, 0x21, 0x05)             // local.set last_accept
-		b = append(b, 0x0B)                   // end if
-		b = append(b, 0x0B)                   // end if '\n'
-		return b
-	}
-
 	// emitPrologue: state=startState, pos=0 (default), last_accept=-1, midAccept check.
 	emitPrologue := func(b []byte) []byte {
 		b = append(b, 0x41)
@@ -2411,55 +2664,26 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitPrologue(b)
-		b = emitImmAcceptCheckFindStart(b)
+		b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		b = append(b, 0x20, 0x03) // pos
 		b = append(b, 0x20, 0x01) // len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b)
+		b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, false, 0, tableMemIdx)
 		b = append(b, 0x0B)
 
-		b = emitWBPreAcceptCheck(b)
-		b = emitNLPreAcceptCheck(b)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
-		// class = classMap[mem[ptr+pos]]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, classMapOff)
-		b = append(b, 0x20, 0x00)
-		b = append(b, 0x20, 0x03)
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // classMap[byte]
-		b = append(b, 0x21, 0x06)             // local.set class
-
-		// state = table[row*numClasses + class] where row = rowMap[state] or state
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, tableOff)
-		if useRowDedup {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02)
-			b = append(b, 0x6A)
-			b = appendTableLoad8u(b, tableMemIdx) // rowMap[state]
-		} else {
-			b = append(b, 0x20, 0x02)
-		}
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(numClasses))
-		b = append(b, 0x6C) // i32.mul
-		b = append(b, 0x6A)
-		b = append(b, 0x20, 0x06)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // table[row*numClasses+class]
-		b = append(b, 0x21, 0x02)             // local.set state
+		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
+			useRowDedup, rowMapOff, 0x02, 0x06, 0x00, 0x03, 0xff, tableMemIdx)
 
 		b = append(b, 0x20, 0x02) // dead?
 		b = append(b, 0x45)
 		b = append(b, 0x04, 0x40)
-		b = emitDeadHandler(b)
+		b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0)
 		b = append(b, 0x0B)
 
 		b = append(b, 0x41)
@@ -2474,7 +2698,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x21, 0x05)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckFind(b)
+		b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -2493,46 +2717,25 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitPrologue(b)
-		b = emitImmAcceptCheckFindStart(b)
+		b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		b = append(b, 0x20, 0x03)
 		b = append(b, 0x20, 0x01)
 		b = append(b, 0x4F)
 		b = append(b, 0x04, 0x40)
-		b = emitEofHandler(b)
+		b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, false, 0, tableMemIdx)
 		b = append(b, 0x0B)
 
-		b = emitWBPreAcceptCheck(b)
-		b = emitNLPreAcceptCheck(b)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
-		// state = table[row*256 + mem[ptr+pos]] where row = rowMap[state] or state
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, tableOff)
-		if useRowDedup {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02)
-			b = append(b, 0x6A)
-			b = appendTableLoad8u(b, tableMemIdx) // rowMap[state]
-		} else {
-			b = append(b, 0x20, 0x02)
-		}
-		b = append(b, 0x41, 0x08)
-		b = append(b, 0x74) // i32.shl
-		b = append(b, 0x6A)
-		b = append(b, 0x20, 0x00)
-		b = append(b, 0x20, 0x03)
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // table[row*256+byte]
-		b = append(b, 0x21, 0x02)             // local.set state
+		b = emitSimpleU8Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
 
 		b = append(b, 0x20, 0x02)
 		b = append(b, 0x45)
 		b = append(b, 0x04, 0x40)
-		b = emitDeadHandler(b)
+		b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0)
 		b = append(b, 0x0B)
 
 		b = append(b, 0x41)
@@ -2547,7 +2750,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x21, 0x05)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckFind(b)
+		b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 		b = append(b, 0x20, 0x03)
 		b = append(b, 0x41, 0x01)
@@ -2566,18 +2769,18 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x02, 0x40) // block $found
 	b = emitPrologue(b)
-	b = emitImmAcceptCheckFindStart(b)
+	b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 	b = append(b, 0x03, 0x40) // loop $scan
 
 	b = append(b, 0x20, 0x03)
 	b = append(b, 0x20, 0x01)
 	b = append(b, 0x4F)
 	b = append(b, 0x04, 0x40)
-	b = emitEofHandler(b)
+	b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, false, 0, tableMemIdx)
 	b = append(b, 0x0B)
 
-	b = emitWBPreAcceptCheck(b)
-	b = emitNLPreAcceptCheck(b)
+	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+	b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
 	// byte = mem[ptr+pos]
 	b = append(b, 0x20, 0x00)
@@ -2586,24 +2789,12 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
 	b = append(b, 0x21, 0x06)       // local.set byte
 
-	// state = u16(table[state*512 + byte*2])
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, tableOff)
-	b = append(b, 0x20, 0x02)
-	b = append(b, 0x41, 0x09)
-	b = append(b, 0x74) // i32.shl
-	b = append(b, 0x6A)
-	b = append(b, 0x20, 0x06)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x74) // i32.shl
-	b = append(b, 0x6A)
-	b = appendTableLoad16u(b, tableMemIdx) // i32.load16_u
-	b = append(b, 0x21, 0x02)
+	b = emitU16Transition(b, tableOff, false, 0, 0x02, 0x06, tableMemIdx)
 
 	b = append(b, 0x20, 0x02)
 	b = append(b, 0x45)
 	b = append(b, 0x04, 0x40)
-	b = emitDeadHandler(b)
+	b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0)
 	b = append(b, 0x0B)
 
 	b = append(b, 0x41)
@@ -2618,7 +2809,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 	b = append(b, 0x21, 0x05)
 	b = append(b, 0x0B)
 
-	b = emitImmAcceptCheckFind(b)
+	b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 	b = append(b, 0x20, 0x03)
 	b = append(b, 0x41, 0x01)
@@ -2743,37 +2934,10 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 
 	// ── DFA transition ────────────────────────────────────────────────────────
 	if revL.useCompression {
-		// class = classMap[byte]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, revL.classMapOff)
-		b = append(b, 0x20, 0x05) // local.get byte
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // classMap[byte] → class
-		b = append(b, 0x21, 0x05)             // local.set class (overwrite byte)
-
-		// state = table[state * numClasses + class]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, revL.tableOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = utils.AppendULEB128(b, uint32(revL.numClasses))
-		b = append(b, 0x6C) // i32.mul
-		b = append(b, 0x6A)
-		b = append(b, 0x20, 0x05) // local.get class
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // table[state*numClasses+class]
-		b = append(b, 0x21, 0x02)             // local.set state
+		b = emitCompressedU8Transition(b, revL.tableOff, revL.classMapOff, revL.numClasses,
+			false, 0, 0x02, 0x05, 0, 0, 0x05, tableMemIdx)
 	} else {
-		// state = table[state * 256 + byte]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, revL.tableOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = append(b, 0x41, 0x08)
-		b = append(b, 0x74) // i32.shl (state * 256)
-		b = append(b, 0x6A)
-		b = append(b, 0x20, 0x05) // local.get byte
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // table[state*256+byte]
-		b = append(b, 0x21, 0x02)             // local.set state
+		b = emitSimpleU8Transition(b, revL.tableOff, false, 0, 0x02, 0, 0, 0x05, tableMemIdx)
 	}
 
 	// if state == 0 (dead state): exit $done
@@ -3097,66 +3261,14 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x0C, 0x02)          // br 2 → $fwd_done (0=eof_if, 1=$fwd_scan, 2=$fwd_done)
 	b = append(b, 0x0B)                // end if pos>=len
 
-	// NL pre-accept check (if pattern has (?m:$)).
-	if t.hasNewlineBoundary {
-		b = append(b, 0x20, locPtr)
-		b = append(b, 0x20, locPos)
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00) // input[ptr+pos]
-		b = append(b, 0x41, 0x0A)
-		b = append(b, 0x46)       // == '\n' ?
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.midAcceptNLOff)
-		b = append(b, 0x20, locState)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // midAcceptNL[state]
-		b = append(b, 0x04, 0x40)             // if (void)
-		b = append(b, 0x20, locPos)
-		b = append(b, 0x21, locLastAccept) // last_accept = pos (before '\n')
-		b = append(b, 0x0B)                // end if midAcceptNL
-		b = append(b, 0x0B)                // end if '\n'
-	}
+	b = emitNLPreAcceptCheck(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPtr, locPos, locState, locLastAccept, tableMemIdx)
 
 	// DFA transition.
 	if l.useCompression {
-		// class = classMap[input[ptr+pos]]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.classMapOff)
-		b = append(b, 0x20, locPtr)
-		b = append(b, 0x20, locPos)
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00) // input[ptr+pos]
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // classMap[byte]
-		b = append(b, 0x21, locSimdOrClass)   // local.set class
-
-		// state = table[state * numClasses + class]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.tableOff)
-		b = append(b, 0x20, locState)
-		b = utils.AppendULEB128(b, uint32(l.numClasses))
-		b = append(b, 0x6C) // i32.mul
-		b = append(b, 0x6A)
-		b = append(b, 0x20, locSimdOrClass)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // table[state*numClasses+class]
-		b = append(b, 0x21, locState)         // local.set state
+		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
+			false, 0, locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
 	} else {
-		// state = table[state * 256 + input[ptr+pos]]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.tableOff)
-		b = append(b, 0x20, locState)
-		b = append(b, 0x41, 0x08)
-		b = append(b, 0x74) // i32.shl (state * 256)
-		b = append(b, 0x6A)
-		b = append(b, 0x20, locPtr)
-		b = append(b, 0x20, locPos)
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00) // input[ptr+pos]
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // table[state*256+input]
-		b = append(b, 0x21, locState)         // local.set state
+		b = emitSimpleU8Transition(b, l.tableOff, false, 0, locState, locPtr, locPos, 0xff, tableMemIdx)
 	}
 
 	// if state == 0 (dead): exit $fwd_done.
@@ -3179,21 +3291,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x21, locLastAccept)
 	b = append(b, 0x0B) // end if midAccept
 
-	// immediateAccept check (LeftmostFirst: stop as soon as match found).
-	if l.hasImmAccept {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
-		b = append(b, 0x20, locState)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // immediateAccept[state]
-		b = append(b, 0x04, 0x40)             // if (void)
-		b = append(b, 0x20, locPos)
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x6A) // pos + 1
-		b = append(b, 0x21, locLastAccept)
-		b = append(b, 0x0C, 0x02) // br 2 → $fwd_done
-		b = append(b, 0x0B)       // end if immediateAccept
-	}
+	b = emitImmAcceptCheckFindMid(b, l.immediateAcceptOff, l.hasImmAccept, locState, locPos, locLastAccept, 2, tableMemIdx)
 
 	// pos++; restart scan.
 	b = append(b, 0x20, locPos)
@@ -3268,160 +3366,10 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
 	useMandatoryLit := mandatoryLit != nil && len(prefix) == 0
 
-	// emitImmAcceptCheckFind emits: if immediateAccept[state]: last_accept=pos+1; br 2→$found
-	// Called inside $scan loop (br 2 exits $found).
-	emitImmAcceptCheckFind := func(b []byte) []byte {
-		if !hasImmAccept {
-			return b
-		}
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, immediateAcceptOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = append(b, 0x6A)       // i32.add
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x41, 0x01) // i32.const 1
-		b = append(b, 0x6A)       // i32.add
-		b = append(b, 0x21, 0x05) // local.set last_accept
-		b = append(b, 0x0C, 0x02) // br 2 → exit $found
-		b = append(b, 0x0B)       // end if
-		return b
-	}
-
-	// emitImmAcceptCheckFindStart emits: if immediateAccept[state]: last_accept=pos; br 1→$found
-	// Called inside $found block, before $scan loop (br 1 exits $found).
-	emitImmAcceptCheckFindStart := func(b []byte) []byte {
-		if !hasImmAccept {
-			return b
-		}
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, immediateAcceptOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = append(b, 0x6A)       // i32.add
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x21, 0x05) // local.set last_accept
-		b = append(b, 0x0C, 0x01) // br 1 → exit $found
-		b = append(b, 0x0B)       // end if
-		return b
-	}
-
-	// ── helper: emit the "pos >= len" handler ───────────────────────────────
-	// Called while inside $scan (depths from if body: 0=if,1=$scan,2=$found,3=$outer)
-	emitEofHandler := func(b []byte) []byte {
-		// if eofAccept[state]: last_accept = pos  (state accepts at end of input)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, eofAcceptOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = append(b, 0x6A)       // i32.add
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x04, 0x40) // if (void)  [nested]
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x21, 0x05) // local.set last_accept
-		b = append(b, 0x0B)       // end nested if
-		// if last_accept >= 0: br $found
-		b = append(b, 0x20, 0x05) // local.get last_accept
-		b = append(b, 0x41, 0x00) // i32.const 0
-		b = append(b, 0x4E)       // i32.ge_s
-		b = append(b, 0x0D, 0x02) // br_if 2 → exit $found
-		// attempt_start++; br $outer
-		b = append(b, 0x20, 0x04) // local.get attempt_start
-		b = append(b, 0x41, 0x01) // i32.const 1
-		b = append(b, 0x6A)       // i32.add
-		b = append(b, 0x21, 0x04) // local.set attempt_start
-		b = append(b, 0x0C, 0x03) // br 3 → top of $outer
-		return b
-	}
-
-	// ── helper: emit the dead-state handler ─────────────────────────────────
-	// Called while inside $scan (depths from if body: 0=if,1=$scan,2=$found,3=$outer)
-	emitDeadHandler := func(b []byte) []byte {
-		// if last_accept >= 0: br $found
-		b = append(b, 0x20, 0x05) // local.get last_accept
-		b = append(b, 0x41, 0x00) // i32.const 0
-		b = append(b, 0x4E)       // i32.ge_s
-		b = append(b, 0x0D, 0x02) // br_if 2 → exit $found
-		// attempt_start++; br $outer
-		b = append(b, 0x20, 0x04) // local.get attempt_start
-		b = append(b, 0x41, 0x01) // i32.const 1
-		b = append(b, 0x6A)       // i32.add
-		b = append(b, 0x21, 0x04) // local.set attempt_start
-		b = append(b, 0x0C, 0x03) // br 3 → top of $outer
-		return b
-	}
-
 	// ── helper: word-boundary pre-transition accept check ────────────────────
 	// Called at the start of the $scan body, BEFORE taking the byte transition.
 	// If the current byte (at ptr+pos) is a word char, checks midAcceptW[state].
 	// If non-word, checks midAcceptNW[state].
-	// On a hit, records last_accept = pos (the match ends before this byte).
-	// No-op when hasWordBoundary is false.
-	emitWBPreAcceptCheck := func(b []byte) []byte {
-		if !hasWordBoundary {
-			return b
-		}
-		// isWC = wordCharTable[mem[ptr+pos]]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, wordCharTableOff)
-		b = append(b, 0x20, 0x00)             // local.get ptr
-		b = append(b, 0x20, 0x03)             // local.get pos
-		b = append(b, 0x6A)                   // i32.add  (ptr + pos)
-		b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u  (input byte)
-		b = append(b, 0x6A)                   // i32.add  (wordCharTableOff + byte)
-		b = appendTableLoad8u(b, tableMemIdx) // wordCharTable[byte] (isWC flag)
-		b = append(b, 0x04, 0x40)             // if (void): isWC
-		// word char → check midAcceptW[state]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptWOff)
-		b = append(b, 0x20, 0x02)             // local.get state
-		b = append(b, 0x6A)                   // i32.add
-		b = appendTableLoad8u(b, tableMemIdx) // midAcceptW[state]
-		b = append(b, 0x04, 0x40)             // if (void): midAcceptW
-		b = append(b, 0x20, 0x03)             // local.get pos
-		b = append(b, 0x21, 0x05)             // local.set last_accept
-		b = append(b, 0x0B)                   // end if midAcceptW
-		b = append(b, 0x05)                   // else: non-word char
-		// non-word char → check midAcceptNW[state]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptNWOff)
-		b = append(b, 0x20, 0x02)             // local.get state
-		b = append(b, 0x6A)                   // i32.add
-		b = appendTableLoad8u(b, tableMemIdx) // midAcceptNW[state]
-		b = append(b, 0x04, 0x40)             // if (void): midAcceptNW
-		b = append(b, 0x20, 0x03)             // local.get pos
-		b = append(b, 0x21, 0x05)             // local.set last_accept
-		b = append(b, 0x0B)                   // end if midAcceptNW
-		b = append(b, 0x0B)                   // end if isWC
-		return b
-	}
-
-	// emitNLPreAcceptCheck: before '\n' byte, check midAcceptNL[state] → last_accept = pos.
-	emitNLPreAcceptCheck := func(b []byte) []byte {
-		if !hasNewlineBoundary {
-			return b
-		}
-		b = append(b, 0x20, 0x00)       // local.get ptr
-		b = append(b, 0x20, 0x03)       // local.get pos
-		b = append(b, 0x6A)             // i32.add
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
-		b = append(b, 0x41, 0x0A)       // i32.const '\n'
-		b = append(b, 0x46)             // i32.eq
-		b = append(b, 0x04, 0x40)       // if (void)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptNLOff)
-		b = append(b, 0x20, 0x02)             // local.get state
-		b = append(b, 0x6A)                   // i32.add
-		b = appendTableLoad8u(b, tableMemIdx) // midAcceptNL[state]
-		b = append(b, 0x04, 0x40)             // if (void)
-		b = append(b, 0x20, 0x03)             // local.get pos
-		b = append(b, 0x21, 0x05)             // local.set last_accept
-		b = append(b, 0x0B)                   // end if
-		b = append(b, 0x0B)                   // end if '\n'
-		return b
-	}
-
 	// simdMaskLocal: index of the i32 local for the combined bitmask.
 	// chunkLocal:    index of the v128 local for the loaded 16-byte chunk (byte 0).
 	// tLoLocal:      index of the v128 local for T0_lo (pre-loaded, 1-byte Teddy).
@@ -3820,7 +3768,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			b = emitOuterPrologue(b)
 		}
 		b = append(b, 0x02, 0x40) // block $found
-		b = emitImmAcceptCheckFindStart(b)
+		b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		// pos >= len?
@@ -3828,49 +3776,20 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b)
+		b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, true, 3, tableMemIdx)
 		b = append(b, 0x0B) // end if
 
-		b = emitWBPreAcceptCheck(b)
-		b = emitNLPreAcceptCheck(b)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
-		// class = classMap[mem[ptr+pos]]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, classMapOff)
-		b = append(b, 0x20, 0x00)             // local.get ptr
-		b = append(b, 0x20, 0x03)             // local.get pos
-		b = append(b, 0x6A)                   // i32.add
-		b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u (input byte)
-		b = append(b, 0x6A)                   // i32.add (classMapOff + byte)
-		b = appendTableLoad8u(b, tableMemIdx) // classMap[byte]
-		b = append(b, 0x21, 0x06)             // local.set class
-
-		// state = table[row*numClasses + class] where row = rowMap[state] or state
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, tableOff)
-		if useRowDedup {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02)
-			b = append(b, 0x6A)
-			b = appendTableLoad8u(b, tableMemIdx) // rowMap[state]
-		} else {
-			b = append(b, 0x20, 0x02) // local.get state
-		}
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(numClasses))
-		b = append(b, 0x6C)                   // i32.mul
-		b = append(b, 0x6A)                   // i32.add
-		b = append(b, 0x20, 0x06)             // local.get class
-		b = append(b, 0x6A)                   // i32.add
-		b = appendTableLoad8u(b, tableMemIdx) // table[row*numClasses+class]
-		b = append(b, 0x21, 0x02)             // local.set state
+		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
+			useRowDedup, rowMapOff, 0x02, 0x06, 0x00, 0x03, 0xff, tableMemIdx)
 
 		// dead state?
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b)
+		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3)
 		b = append(b, 0x0B) // end if
 
 		// if midAccept[state]: last_accept = pos + 1
@@ -3886,7 +3805,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x21, 0x05)             // local.set last_accept
 		b = append(b, 0x0B)                   // end if
 
-		b = emitImmAcceptCheckFind(b)
+		b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -3939,7 +3858,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			b = emitOuterPrologue(b)
 		}
 		b = append(b, 0x02, 0x40) // block $found
-		b = emitImmAcceptCheckFindStart(b)
+		b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		// pos >= len?
@@ -3947,40 +3866,19 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b)
+		b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, true, 3, tableMemIdx)
 		b = append(b, 0x0B) // end if
 
-		b = emitWBPreAcceptCheck(b)
-		b = emitNLPreAcceptCheck(b)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
-		// state = table[row*256 + mem[ptr+pos]] where row = rowMap[state] or state
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, tableOff)
-		if useRowDedup {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, rowMapOff)
-			b = append(b, 0x20, 0x02)
-			b = append(b, 0x6A)
-			b = appendTableLoad8u(b, tableMemIdx) // rowMap[state]
-		} else {
-			b = append(b, 0x20, 0x02) // local.get state
-		}
-		b = append(b, 0x41, 0x08) // i32.const 8
-		b = append(b, 0x74)       // i32.shl
-		b = append(b, 0x6A)
-		b = append(b, 0x20, 0x00) // local.get ptr
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // table[row*256+byte]
-		b = append(b, 0x21, 0x02)             // local.set state
+		b = emitSimpleU8Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
 
 		// dead state?
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b)
+		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3)
 		b = append(b, 0x0B) // end if
 
 		// if midAccept[state]: last_accept = pos + 1
@@ -3996,7 +3894,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x21, 0x05) // local.set last_accept
 		b = append(b, 0x0B)       // end if
 
-		b = emitImmAcceptCheckFind(b)
+		b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -4048,7 +3946,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitOuterPrologue(b)
 	}
 	b = append(b, 0x02, 0x40) // block $found
-	b = emitImmAcceptCheckFindStart(b)
+	b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 	b = append(b, 0x03, 0x40) // loop $scan
 
 	// pos >= len?
@@ -4056,11 +3954,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitEofHandler(b)
+	b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, true, 3, tableMemIdx)
 	b = append(b, 0x0B) // end if
 
-	b = emitWBPreAcceptCheck(b)
-	b = emitNLPreAcceptCheck(b)
+	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+	b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
 	// byte = mem[ptr+pos]
 	b = append(b, 0x20, 0x00)
@@ -4069,33 +3967,13 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
 	b = append(b, 0x21, 0x06)       // local.set byte
 
-	// state = u16(mem[tableOff + row*512 + byte*2]) where row = rowMap[state] or state
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, tableOff)
-	if useRowDedup {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, rowMapOff)
-		b = append(b, 0x20, 0x02)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // rowMap[state]
-	} else {
-		b = append(b, 0x20, 0x02) // local.get state
-	}
-	b = append(b, 0x41, 0x09) // i32.const 9
-	b = append(b, 0x74)       // i32.shl
-	b = append(b, 0x6A)
-	b = append(b, 0x20, 0x06) // local.get byte
-	b = append(b, 0x41, 0x01) // i32.const 1
-	b = append(b, 0x74)       // i32.shl
-	b = append(b, 0x6A)
-	b = appendTableLoad16u(b, tableMemIdx) // i32.load16_u
-	b = append(b, 0x21, 0x02)              // local.set state
+	b = emitU16Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x06, tableMemIdx)
 
 	// dead state?
 	b = append(b, 0x20, 0x02) // local.get state
 	b = append(b, 0x45)       // i32.eqz
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitDeadHandler(b)
+	b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3)
 	b = append(b, 0x0B) // end if
 
 	// if midAccept[state]: last_accept = pos + 1
@@ -4111,7 +3989,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x21, 0x05) // local.set last_accept
 	b = append(b, 0x0B)       // end if
 
-	b = emitImmAcceptCheckFind(b)
+	b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)

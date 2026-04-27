@@ -141,8 +141,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	var totalDataSegs int
 	var tableOffset int32 = 0 // data segment base for this set's tables
 
-	for bi, b := range buckets {
-		fnBody, dataBytes, dataSegs := emitSuffixDFAFn(b, tableOffset, 0)
+	for bi, bkt := range buckets {
+		fnBody, dataBytes, dataSegs := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), 0)
 		suffixFnBodies[bi] = fnBody
 		tableOffset += int32(len(dataBytes))
 		allDataBytes = append(allDataBytes, dataBytes...)
@@ -165,184 +165,6 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		diag:           diag,
 	}
 	return cs, nil
-}
-
-// emitSuffixDFAFn emits the WASM function body for one bucket's suffix DFA.
-// Signature: (ptr i32, suffix_start i32, len i32) → i64
-// Returns: (funcBody, dataBytes, dataSegCount).
-//
-// The function runs the DFA from suffix_start and returns the OR of all accept
-// bitmasks for states visited during the scan. It stops when it reaches the dead
-// state (WASM state 0) or end of input. For multi-pattern suffix DFAs each bit
-// in the returned bitmask corresponds to one pattern.
-func emitSuffixDFAFn(b *bucket, tableBase int32, tableMemIdx int) (funcBody []byte, dataBytes []byte, dataSegCount int) {
-	t := b.suffixDFA
-	if t == nil || t.numStates == 0 {
-		// Degenerate: no DFA — always returns 0.
-		body := []byte{0x01, 0x01, 0x7F} // 1 local i32
-		body = append(body, 0x42, 0x00)  // i64.const 0
-		body = append(body, 0x0B)        // end
-		funcBody = utils.AppendULEB128(nil, uint32(len(body)))
-		funcBody = append(funcBody, body...)
-		return
-	}
-
-	numWASM := t.numStates + 1
-	useU8 := numWASM <= 256
-
-	// --- Transition table data segment ---
-	// u8 table: [numWASM * 256] bytes, table[state*256+byte] = next WASM state (0 = dead).
-	// u16 table: [numWASM * 256 * 2] bytes, little-endian uint16.
-	var tableBytesSlice []byte
-	if useU8 {
-		tableBytesSlice = make([]byte, numWASM*256)
-		for gs := 0; gs < t.numStates; gs++ {
-			for bv := 0; bv < 256; bv++ {
-				if next := t.transitions[gs*256+bv]; next >= 0 {
-					tableBytesSlice[(gs+1)*256+bv] = byte(next + 1)
-				}
-			}
-		}
-	} else {
-		tableBytesSlice = make([]byte, numWASM*256*2)
-		for gs := 0; gs < t.numStates; gs++ {
-			for bv := 0; bv < 256; bv++ {
-				wn := uint16(0)
-				if next := t.transitions[gs*256+bv]; next >= 0 {
-					wn = uint16(next + 1)
-				}
-				off := ((gs+1)*256 + bv) * 2
-				tableBytesSlice[off] = byte(wn)
-				tableBytesSlice[off+1] = byte(wn >> 8)
-			}
-		}
-	}
-
-	// --- Bitmask accept array data segment ---
-	// u64 per WASM state: bitmask[ws*8] = accept bitmask for DFA state ws-1.
-	bitmaskBytes := make([]byte, numWASM*8)
-	for gs, bits := range t.acceptStates {
-		if bits != 0 {
-			off := (gs + 1) * 8
-			for i := 0; i < 8; i++ {
-				bitmaskBytes[off+i] = byte(bits >> uint(i*8))
-			}
-		}
-	}
-
-	tableOff := tableBase
-	bitmaskOff := tableOff + int32(len(tableBytesSlice))
-	dataBytes = appendDataSegment(dataBytes, tableOff, tableBytesSlice)
-	dataBytes = appendDataSegment(dataBytes, bitmaskOff, bitmaskBytes)
-	dataSegCount = 2
-
-	// --- WASM function body ---
-	// Params: ptr(0 i32), suffix_start(1 i32), len(2 i32).
-	// Returns i64 packed as: (firstAcceptPos << 32) | bitmask
-	//   bitmask: OR of accept bits for all patterns that matched anywhere in suffix
-	//   firstAcceptPos: position AFTER the first accepted byte (i.e. suffix_start +
-	//     chars consumed up to first accept); 0 when no accept found.
-	//
-	// Algorithm:
-	//   state = 1; pos = suffix_start; endPos = 0; result = 0
-	//   block $done:
-	//     loop $main:
-	//       if pos >= len: br $done
-	//       byte = mem[ptr + pos]
-	//       state = table[state][byte]
-	//       bits  = bitmask64[state]
-	//       if endPos==0 && bits!=0: endPos = pos + 1
-	//       result |= bits
-	//       if state == 0: br $done
-	//       pos++; br $main
-	//   return (i64(endPos) << 32) | result
-	//
-	// Locals: state(3 i32), pos(4 i32), byte(5 i32), endPos(6 i32), bits(7 i64), result(8 i64)
-	const (
-		paramPtr   = byte(0)
-		paramStart = byte(1)
-		paramLen   = byte(2)
-		lState     = byte(3)
-		lPos       = byte(4)
-		lByte      = byte(5)
-		lEndPos    = byte(6)
-		lBits      = byte(7)
-		lResult    = byte(8)
-	)
-	var body []byte
-	// 2 local groups: (4 × i32: state, pos, byte, endPos), (2 × i64: bits, result)
-	body = append(body, 0x02, 0x04, 0x7F, 0x02, 0x7E)
-
-	body = append(body, 0x41, 0x01, 0x21, lState)     // state = 1
-	body = append(body, 0x20, paramStart, 0x21, lPos) // pos = suffix_start
-	// lEndPos, lBits, lResult default to 0
-
-	body = append(body, 0x02, 0x40) // block $done
-	body = append(body, 0x03, 0x40) // loop $main
-
-	// if pos >= len: br $done
-	body = append(body, 0x20, lPos, 0x20, paramLen, 0x4F, 0x0D, 0x01)
-
-	// byte = mem[ptr + pos]
-	body = append(body, 0x20, paramPtr, 0x20, lPos, 0x6A)
-	body = append(body, 0x2D, 0x00, 0x00) // i32.load8_u
-	body = append(body, 0x21, lByte)
-
-	// state = table[state][byte]
-	body = append(body, 0x41)
-	body = utils.AppendSLEB128(body, tableOff)
-	if useU8 {
-		body = append(body, 0x20, lState, 0x41, 0x08, 0x74) // state << 8 = state*256
-		body = append(body, 0x6A, 0x20, lByte, 0x6A)        // + byte → addr
-		body = appendTableLoad8u(body, tableMemIdx)
-	} else {
-		body = append(body, 0x20, lState, 0x41, 0x09, 0x74) // state << 9 = state*512
-		body = append(body, 0x6A)
-		body = append(body, 0x20, lByte, 0x41, 0x01, 0x74) // byte << 1 = byte*2
-		body = append(body, 0x6A)                          // + → addr
-		body = appendTableLoad16u(body, tableMemIdx)
-	}
-	body = append(body, 0x21, lState) // state = table result
-
-	// lBits = bitmask64[state * 8]
-	body = append(body, 0x41)
-	body = utils.AppendSLEB128(body, bitmaskOff)
-	body = append(body, 0x20, lState, 0x41, 0x03, 0x74, 0x6A) // bitmaskOff + state*8
-	body = appendTableLoad64(body, tableMemIdx)
-	body = append(body, 0x21, lBits)
-
-	// if endPos == 0 && bits != 0: endPos = pos + 1
-	body = append(body, 0x20, lEndPos, 0x45)         // i32.eqz: endPos==0
-	body = append(body, 0x20, lBits, 0x42, 0x00, 0x52) // bits!=0: i64.const 0, i64.ne
-	body = append(body, 0x71)                         // i32.and
-	body = append(body, 0x04, 0x40)                   // if
-	body = append(body, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lEndPos) // endPos = pos+1
-	body = append(body, 0x0B)                         // end if
-
-	// result |= bits
-	body = append(body, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult) // i64.or
-
-	// if state == 0: br $done
-	body = append(body, 0x20, lState, 0x45, 0x0D, 0x01) // i32.eqz + br_if $done
-
-	// pos++; br $main
-	body = append(body, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
-	body = append(body, 0x0C, 0x00) // br $main
-
-	body = append(body, 0x0B) // end loop $main
-	body = append(body, 0x0B) // end block $done
-
-	// return (i64(endPos) << 32) | result
-	body = append(body, 0x20, lEndPos)          // push endPos (i32)
-	body = append(body, 0xAD)                   // i64.extend_i32_u
-	body = append(body, 0x42, 0x20)             // i64.const 32
-	body = append(body, 0x86)                   // i64.shl
-	body = append(body, 0x20, lResult, 0x84)    // lResult; i64.or
-	body = append(body, 0x0B)                   // end function
-
-	funcBody = utils.AppendULEB128(nil, uint32(len(body)))
-	funcBody = append(funcBody, body...)
-	return
 }
 
 // emitSetMatchFnAnchored emits the WASM function body for the anchored `match`
@@ -966,8 +788,8 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 		b = append(b, 0x11, byte(setMatchTypeSuffix), 0x00)
 
 		// Store full i64 result; extract bitmask (low 32) and endPos (high 32).
-		b = append(b, 0x21, lCallRes) // local.set lCallRes
-		b = append(b, 0x20, lCallRes, 0xA7, 0x21, lTmp1) // bitmask = i32.wrap_i64(lCallRes)
+		b = append(b, 0x21, lCallRes)                                        // local.set lCallRes
+		b = append(b, 0x20, lCallRes, 0xA7, 0x21, lTmp1)                     // bitmask = i32.wrap_i64(lCallRes)
 		b = append(b, 0x20, lCallRes, 0x42, 0x20, 0x88, 0xA7, 0x21, lEndPos) // endPos = i32(lCallRes >> 32)
 
 		for bitPos, globalID := range cs.patternIDs[bi] {
