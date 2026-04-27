@@ -706,3 +706,184 @@ func TestWriteStub(t *testing.T) {
 		t.Errorf("writeStub: got %q, want %q", string(data), "hello")
 	}
 }
+
+// --------------------------------------------------------------------------
+// Set stub tests (Phase 5)
+
+// setTestCfg builds a BuildConfig with two named patterns and one set that
+// exercises all three export types: find_all, find_any, and match.
+func setTestCfg() config.BuildConfig {
+	return config.BuildConfig{
+		ImportModule: "mymod",
+		Regexes: []config.RegexEntry{
+			{Name: "pat_a", Pattern: `foo\d+`},
+			{Name: "pat_b", Pattern: `bar\w+`},
+		},
+		Sets: []config.SetConfig{
+			{
+				Name:        "scanner",
+				FindAll:     "scan_all",
+				FindAny:     "scan_any",
+				Match:       "validate",
+				EmitNameMap: true,
+				Patterns:    config.PatternSelector{All: true},
+			},
+		},
+	}
+}
+
+func TestGenRustSetSection(t *testing.T) {
+	cfg := setTestCfg()
+	out := genRustSetSection(cfg)
+	required := []string{
+		"SetMatch",
+		"SetAnchorMatch",
+		"scan_all",
+		"scan_any",
+		"validate",
+		"pattern_name",
+		"\"pat_a\"",
+		"\"pat_b\"",
+		"ffi_scan_all",
+		"ffi_validate",
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genRustSetSection: missing %q", s)
+		}
+	}
+}
+
+func TestGenGoSetSection(t *testing.T) {
+	cfg := setTestCfg()
+	out := genGoSetSection(cfg, "mymod")
+	required := []string{
+		"SetMatch",
+		"SetAnchorMatch",
+		"ScanAll",
+		"ScanAny",
+		"Validate",
+		"PatternName",
+		"find_all", // wasmimport directive
+		"validate", // wasmimport directive
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genGoSetSection: missing %q", s)
+		}
+	}
+}
+
+func TestGenJSSetSection(t *testing.T) {
+	cfg := setTestCfg()
+	out := genJSSetSection(cfg)
+	required := []string{
+		"scan_all",
+		"scan_any",
+		"validate",
+		"patternName",
+		"patternId",
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genJSSetSection: missing %q", s)
+		}
+	}
+}
+
+func TestGenTSSetSection(t *testing.T) {
+	cfg := setTestCfg()
+	out := genTSSetSection(cfg)
+	required := []string{
+		"SetMatch",
+		"SetAnchorMatch",
+		"scan_all",
+		"scan_any",
+		"validate",
+		"patternName",
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genTSSetSection: missing %q", s)
+		}
+	}
+}
+
+func TestGenCStubFilesWithSets(t *testing.T) {
+	cfg := setTestCfg()
+	h, c, err := genCStubFilesWithSets(cfg, "stub.h")
+	if err != nil {
+		t.Fatalf("genCStubFilesWithSets: %v", err)
+	}
+	for _, s := range []string{"rx_set_match_t", "rx_set_anchor_t", "scan_all", "validate", "pattern_name"} {
+		if !strings.Contains(h, s) && !strings.Contains(c, s) {
+			t.Errorf("genCStubFilesWithSets: missing %q in output", s)
+		}
+	}
+}
+
+func TestGenASSetSection(t *testing.T) {
+	cfg := setTestCfg()
+	out := genASSetSection(cfg)
+	required := []string{
+		"SetMatch",
+		"SetAnchorMatch",
+		"scan_all",
+		"scan_any",
+		"validate",
+		"patternName",
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genASSetSection: missing %q", s)
+		}
+	}
+}
+
+func TestRustStub_WithSets(t *testing.T) {
+	cfg := setTestCfg()
+	out, err := genRustStubFile(cfg.Regexes, cfg.ImportModule)
+	out += genRustSetSection(cfg)
+	if err != nil {
+		t.Fatalf("genRustStubFile: %v", err)
+	}
+	if !strings.Contains(out, "SetMatch") {
+		t.Error("rust stub with sets: missing SetMatch type")
+	}
+}
+
+func TestSetSection_NoSets_Empty(t *testing.T) {
+	cfg := config.BuildConfig{ImportModule: "m", Regexes: []config.RegexEntry{{Pattern: `foo`}}}
+	if s := genRustSetSection(cfg); s != "" {
+		t.Errorf("genRustSetSection with no sets: got non-empty %q", s)
+	}
+	if s := genGoSetSection(cfg, "m"); s != "" {
+		t.Errorf("genGoSetSection with no sets: got non-empty %q", s)
+	}
+	if s := genJSSetSection(cfg); s != "" {
+		t.Errorf("genJSSetSection with no sets: got non-empty %q", s)
+	}
+	if s := genTSSetSection(cfg); s != "" {
+		t.Errorf("genTSSetSection with no sets: got non-empty %q", s)
+	}
+	if s := genASSetSection(cfg); s != "" {
+		t.Errorf("genASSetSection with no sets: got non-empty %q", s)
+	}
+}
+
+func TestSetSection_FindAllOnly(t *testing.T) {
+	cfg := config.BuildConfig{
+		ImportModule: "m",
+		Regexes:      []config.RegexEntry{{Pattern: `foo`}},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	rust := genRustSetSection(cfg)
+	if !strings.Contains(rust, "find_all") {
+		t.Error("find_all not in Rust set stub")
+	}
+	if strings.Contains(rust, "fn validate") || strings.Contains(rust, "ffi_find_any") {
+		t.Error("unexpected exports in find_all-only Rust stub")
+	}
+}
