@@ -1,0 +1,39 @@
+wasm_file:     "secrets.wasm"
+import_module: "secrets"
+
+regexes:
+  - name: aws_key
+    pattern: 'AKIA[0-9A-Z]{16}'
+
+  - name: aws_secret
+    pattern: 'aws_secret_access_key\s*=\s*[0-9a-zA-Z/+]{40}'
+
+  - name: github_pat
+    pattern: 'ghp_[0-9a-zA-Z]{36}'
+
+  - name: github_oauth
+    pattern: 'gho_[0-9a-zA-Z]{36}'
+
+  - name: github_app
+    pattern: 'ghu_[0-9a-zA-Z]{36}'
+
+  - name: jwt
+    pattern: 'eyJ[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]{20,}\.'
+
+  - name: slack_token
+    pattern: 'xox[baprs]-[0-9a-zA-Z\-]{10,}'
+
+  - name: stripe_live
+    pattern: 'sk_live_[0-9a-zA-Z]{24,}'
+
+  - name: stripe_test
+    pattern: 'sk_test_[0-9a-zA-Z]{24,}'
+
+  - name: google_api
+    pattern: 'AIza[0-9A-Za-z\-_]{35}'
+
+sets:
+  - name: scanner
+    find_all: scan_secrets
+    emit_name_map: true
+    patterns: "all"

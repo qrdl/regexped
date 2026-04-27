@@ -238,25 +238,26 @@ func emitSuffixDFAFn(b *bucket, tableBase int32, tableMemIdx int) (funcBody []by
 
 	// --- WASM function body ---
 	// Params: ptr(0 i32), suffix_start(1 i32), len(2 i32).
-	// Returned i64 is the OR of accept bitmasks of all states visited.
+	// Returns i64 packed as: (firstAcceptPos << 32) | bitmask
+	//   bitmask: OR of accept bits for all patterns that matched anywhere in suffix
+	//   firstAcceptPos: position AFTER the first accepted byte (i.e. suffix_start +
+	//     chars consumed up to first accept); 0 when no accept found.
 	//
-	// Algorithm (same for u8 and u16, only table-load differs):
-	//   state = 1  (WASM start state; dead = 0)
-	//   pos   = suffix_start
-	//   result = 0
+	// Algorithm:
+	//   state = 1; pos = suffix_start; endPos = 0; result = 0
 	//   block $done:
 	//     loop $main:
-	//       if pos >= len: br $done          // EOF
+	//       if pos >= len: br $done
 	//       byte = mem[ptr + pos]
-	//       state = table[state][byte]       // transition
-	//       result |= bitmask64[state]       // accumulate accept bitmask
-	//       if state == 0: br $done          // dead state
-	//       pos++
-	//       br $main
-	//   return result
+	//       state = table[state][byte]
+	//       bits  = bitmask64[state]
+	//       if endPos==0 && bits!=0: endPos = pos + 1
+	//       result |= bits
+	//       if state == 0: br $done
+	//       pos++; br $main
+	//   return (i64(endPos) << 32) | result
 	//
-	// Locals for u8:  state(3 i32), pos(4 i32), byte(5 i32), result(6 i64)
-	// Locals for u16: same
+	// Locals: state(3 i32), pos(4 i32), byte(5 i32), endPos(6 i32), bits(7 i64), result(8 i64)
 	const (
 		paramPtr   = byte(0)
 		paramStart = byte(1)
@@ -264,21 +265,23 @@ func emitSuffixDFAFn(b *bucket, tableBase int32, tableMemIdx int) (funcBody []by
 		lState     = byte(3)
 		lPos       = byte(4)
 		lByte      = byte(5)
-		lResult    = byte(6)
+		lEndPos    = byte(6)
+		lBits      = byte(7)
+		lResult    = byte(8)
 	)
 	var body []byte
-	// 2 local groups: (3 × i32: state, pos, byte), (1 × i64: result)
-	body = append(body, 0x02, 0x03, 0x7F, 0x01, 0x7E)
+	// 2 local groups: (4 × i32: state, pos, byte, endPos), (2 × i64: bits, result)
+	body = append(body, 0x02, 0x04, 0x7F, 0x02, 0x7E)
 
 	body = append(body, 0x41, 0x01, 0x21, lState)     // state = 1
 	body = append(body, 0x20, paramStart, 0x21, lPos) // pos = suffix_start
-	body = append(body, 0x42, 0x00, 0x21, lResult)    // result = 0 (local.set, not global.set)
+	// lEndPos, lBits, lResult default to 0
 
 	body = append(body, 0x02, 0x40) // block $done
 	body = append(body, 0x03, 0x40) // loop $main
 
 	// if pos >= len: br $done
-	body = append(body, 0x20, lPos, 0x20, paramLen, 0x4D, 0x0D, 0x01)
+	body = append(body, 0x20, lPos, 0x20, paramLen, 0x4F, 0x0D, 0x01)
 
 	// byte = mem[ptr + pos]
 	body = append(body, 0x20, paramPtr, 0x20, lPos, 0x6A)
@@ -301,14 +304,23 @@ func emitSuffixDFAFn(b *bucket, tableBase int32, tableMemIdx int) (funcBody []by
 	}
 	body = append(body, 0x21, lState) // state = table result
 
-	// result |= bitmask64[state * 8]
-	body = append(body, 0x20, lResult)
+	// lBits = bitmask64[state * 8]
 	body = append(body, 0x41)
 	body = utils.AppendSLEB128(body, bitmaskOff)
 	body = append(body, 0x20, lState, 0x41, 0x03, 0x74, 0x6A) // bitmaskOff + state*8
 	body = appendTableLoad64(body, tableMemIdx)
-	body = append(body, 0x86, 0x01)    // i64.or
-	body = append(body, 0x21, lResult) // local.set
+	body = append(body, 0x21, lBits)
+
+	// if endPos == 0 && bits != 0: endPos = pos + 1
+	body = append(body, 0x20, lEndPos, 0x45)         // i32.eqz: endPos==0
+	body = append(body, 0x20, lBits, 0x42, 0x00, 0x52) // bits!=0: i64.const 0, i64.ne
+	body = append(body, 0x71)                         // i32.and
+	body = append(body, 0x04, 0x40)                   // if
+	body = append(body, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lEndPos) // endPos = pos+1
+	body = append(body, 0x0B)                         // end if
+
+	// result |= bits
+	body = append(body, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult) // i64.or
 
 	// if state == 0: br $done
 	body = append(body, 0x20, lState, 0x45, 0x0D, 0x01) // i32.eqz + br_if $done
@@ -320,8 +332,13 @@ func emitSuffixDFAFn(b *bucket, tableBase int32, tableMemIdx int) (funcBody []by
 	body = append(body, 0x0B) // end loop $main
 	body = append(body, 0x0B) // end block $done
 
-	body = append(body, 0x20, lResult) // return result
-	body = append(body, 0x0B)          // end function
+	// return (i64(endPos) << 32) | result
+	body = append(body, 0x20, lEndPos)          // push endPos (i32)
+	body = append(body, 0xAD)                   // i64.extend_i32_u
+	body = append(body, 0x42, 0x20)             // i64.const 32
+	body = append(body, 0x86)                   // i64.shl
+	body = append(body, 0x20, lResult, 0x84)    // lResult; i64.or
+	body = append(body, 0x0B)                   // end function
 
 	funcBody = utils.AppendULEB128(nil, uint32(len(body)))
 	funcBody = append(funcBody, body...)
@@ -388,7 +405,7 @@ func emitSetMatchFnAnchored(cs *compiledSet, tableBase int) []byte {
 			b = append(b, 0x04, 0x40) // if
 
 			// if out_count >= out_cap: br $done
-			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4D, 0x0D, 0x01)
+			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)
 
 			// out_base = out_ptr + out_count * 8  (8 bytes per match tuple)
 			b = append(b, 0x20, pOutPtr)
@@ -884,7 +901,8 @@ func rebuildSetMatchBody(cs *compiledSet, suffixFnTableBase int) []byte {
 // table base index. Uses a scalar literal scan; Teddy/AC is layered on in Phase 5.
 func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 	var b []byte
-	b = append(b, 0x01, 0x04, 0x7F) // 4 i32 locals: pos, out_count, tmp1, tmp2
+	// 2 local groups: (5 × i32: pos, out_count, bitmask, out_base, end_pos), (1 × i64: call_result)
+	b = append(b, 0x02, 0x05, 0x7F, 0x01, 0x7E)
 
 	const (
 		pInPtr    = byte(0)
@@ -894,8 +912,10 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 		pStartPos = byte(4)
 		lPos      = byte(5)
 		lOutCount = byte(6)
-		lTmp1     = byte(7)
-		lTmp2     = byte(8)
+		lTmp1     = byte(7)  // bitmask (low 32 bits of call result)
+		lTmp2     = byte(8)  // out_base pointer
+		lEndPos   = byte(9)  // first accept pos (high 32 bits of call result)
+		lCallRes  = byte(10) // full i64 from call_indirect
 	)
 
 	b = append(b, 0x41, 0x00, 0x21, lOutCount)
@@ -904,8 +924,8 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 	b = append(b, 0x02, 0x40) // block $batch_done
 	b = append(b, 0x03, 0x40) // loop $scan
 
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4D, 0x0D, 0x01)
-	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4D, 0x0D, 0x01)
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)
 
 	for bi, bkt := range cs.buckets {
 		if bkt.isFallback || bkt.literal == "" {
@@ -945,8 +965,10 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 		b = utils.AppendSLEB128(b, int32(tableBase+bi))
 		b = append(b, 0x11, byte(setMatchTypeSuffix), 0x00)
 
-		// Wrap i64 bitmask to i32.
-		b = append(b, 0xA7, 0x21, lTmp1)
+		// Store full i64 result; extract bitmask (low 32) and endPos (high 32).
+		b = append(b, 0x21, lCallRes) // local.set lCallRes
+		b = append(b, 0x20, lCallRes, 0xA7, 0x21, lTmp1) // bitmask = i32.wrap_i64(lCallRes)
+		b = append(b, 0x20, lCallRes, 0x42, 0x20, 0x88, 0xA7, 0x21, lEndPos) // endPos = i32(lCallRes >> 32)
 
 		for bitPos, globalID := range cs.patternIDs[bi] {
 			if bitPos >= 32 {
@@ -958,7 +980,7 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 			b = utils.AppendSLEB128(b, int32(bit))
 			b = append(b, 0x71) // i32.and
 			b = append(b, 0x04, 0x40)
-			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4D, 0x0D, 0x03)
+			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x03)
 
 			b = append(b, 0x20, pOutPtr, 0x20, lOutCount)
 			b = append(b, 0x41, 12, 0x6C, 0x6A, 0x21, lTmp2)
@@ -967,9 +989,8 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 			b = utils.AppendSLEB128(b, int32(globalID))
 			b = append(b, 0x36, 0x02, 0x00)
 			b = append(b, 0x20, lTmp2, 0x20, lPos, 0x36, 0x02, 0x04)
-			b = append(b, 0x20, lTmp2, 0x41)
-			b = utils.AppendSLEB128(b, int32(litLen))
-			b = append(b, 0x36, 0x02, 0x08)
+			// length = endPos - lPos (full match length including literal)
+			b = append(b, 0x20, lTmp2, 0x20, lEndPos, 0x20, lPos, 0x6B, 0x36, 0x02, 0x08)
 			b = append(b, 0x20, lOutCount, 0x41, 0x01, 0x6A, 0x21, lOutCount)
 			b = append(b, 0x0B)
 		}
