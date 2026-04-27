@@ -26,8 +26,9 @@ type BuildConfig struct {
 // SetConfig describes one `sets:` entry in the YAML config.
 type SetConfig struct {
 	Name        string          `yaml:"name"`          // set name; must be unique within the file
-	MatchAny    string          `yaml:"match_any"`     // export name for match_any (first match)
-	MatchAll    string          `yaml:"match_all"`     // export name for match_all (all matches via start_pos)
+	FindAny     string          `yaml:"find_any"`      // export name for find_any (non-anchored, first match)
+	FindAll     string          `yaml:"find_all"`      // export name for find_all (non-anchored, all matches)
+	Match       string          `yaml:"match"`         // export name for match (anchored at position 0)
 	BatchSize   int             `yaml:"batch_size"`    // output buffer hint (default 256); stub-gen only
 	Patterns    PatternSelector `yaml:"patterns"`      // which regexes belong to this set
 	EmitNameMap bool            `yaml:"emit_name_map"` // include pattern name→ID map in WASM data
@@ -60,7 +61,7 @@ func (p *PatternSelector) UnmarshalYAML(value *yaml.Node) error {
 
 // ValidateSets validates the `sets:` block against the `regexes:` list.
 // Returns an error if any name is not unique, any pattern reference is unknown,
-// or a set entry has neither match_any nor match_all set.
+// or a set entry has neither find_any nor find_all set.
 func ValidateSets(cfg *BuildConfig) error {
 	// Build name → index map.
 	nameIdx := make(map[string]int, len(cfg.Regexes))
@@ -82,8 +83,8 @@ func ValidateSets(cfg *BuildConfig) error {
 			return fmt.Errorf("duplicate set name %q", s.Name)
 		}
 		setNames[s.Name] = true
-		if s.MatchAny == "" && s.MatchAll == "" {
-			return fmt.Errorf("set %q: at least one of match_any or match_all must be set", s.Name)
+		if s.FindAny == "" && s.FindAll == "" && s.Match == "" {
+			return fmt.Errorf("set %q: at least one of find_any, find_all, or match must be set", s.Name)
 		}
 		if !s.Patterns.All {
 			for _, pname := range s.Patterns.Names {

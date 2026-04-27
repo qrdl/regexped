@@ -12,9 +12,10 @@ import (
 // The match function body is not stored here — it is built at assemble time
 // (when function-table indices are known) by emitSetMatchFnFinal.
 type compiledSet struct {
-	name     string
-	matchAny string // WASM export name, or ""
-	matchAll string // WASM export name, or ""
+	name    string
+	findAny string // WASM export name, or ""
+	findAll string // WASM export name, or ""
+	match   string // WASM export name for anchored match, or ""
 
 	// suffixFnBodies[i] is the body for bucket i's suffix DFA function.
 	suffixFnBodies [][]byte
@@ -35,9 +36,51 @@ type compiledSet struct {
 }
 
 // funcCount returns the number of WASM functions contributed by this compiled set.
-// = 1 (match fn) + len(suffixFnBodies).
+// = find fn (if findAny or findAll set) + anchored fn (if match set) + N suffix fns.
 func (cs *compiledSet) funcCount() int {
-	return 1 + cs.numSuffixFns
+	n := cs.numSuffixFns
+	if cs.findAny != "" || cs.findAll != "" {
+		n++
+	}
+	if cs.match != "" {
+		n++
+	}
+	return n
+}
+
+// findFnOffset returns the index of the find function within this set's functions
+// (relative to the set's base), or -1 if there is no find function.
+func (cs *compiledSet) findFnOffset() int {
+	if cs.findAny != "" || cs.findAll != "" {
+		return 0
+	}
+	return -1
+}
+
+// matchFnOffset returns the index of the anchored match function within this set's
+// functions (relative to the set's base), or -1 if there is no match function.
+func (cs *compiledSet) matchFnOffset() int {
+	if cs.match == "" {
+		return -1
+	}
+	off := 0
+	if cs.findAny != "" || cs.findAll != "" {
+		off++
+	}
+	return off
+}
+
+// suffixFnBaseOffset returns the index of the first suffix function within this
+// set's functions (relative to the set's base).
+func (cs *compiledSet) suffixFnBaseOffset() int {
+	off := 0
+	if cs.findAny != "" || cs.findAll != "" {
+		off++
+	}
+	if cs.match != "" {
+		off++
+	}
+	return off
 }
 
 // CompileSetOptions resolved defaults.
@@ -49,8 +92,9 @@ const (
 // SetSpec is the resolved specification for one set, ready for compilation.
 type SetSpec struct {
 	Name       string
-	MatchAny   string
-	MatchAll   string
+	FindAny    string
+	FindAll    string
+	Match      string         // anchored match export name, or ""
 	Patterns   []*PatternInfo // resolved, capture-bearing dropped
 	PatternIDs []int          // global indices into the regexes list
 }
@@ -109,8 +153,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// indices are known). Store nil here; assembleModuleWithSets fills it in.
 	cs := &compiledSet{
 		name:           spec.Name,
-		matchAny:       spec.MatchAny,
-		matchAll:       spec.MatchAll,
+		findAny:        spec.FindAny,
+		findAll:        spec.FindAll,
+		match:          spec.Match,
 		suffixFnBodies: suffixFnBodies,
 		numSuffixFns:   len(suffixFnBodies),
 		dataBytes:      allDataBytes,
@@ -283,6 +328,102 @@ func emitSuffixDFAFn(b *bucket, tableBase int32, tableMemIdx int) (funcBody []by
 	return
 }
 
+// emitSetMatchFnAnchored emits the WASM function body for the anchored `match`
+// export. Signature: (in_ptr i32, in_len i32, out_ptr i32, out_cap i32) → i32.
+//
+// No literal scan — calls each bucket's suffix DFA from position 0. Returns
+// the first match as a (pattern_id, end_pos) tuple (8 bytes, 2×i32) written to
+// out_ptr, then returns count (0 or 1 currently; structured for easy extension
+// to all-matches by removing the early-exit after the first hit).
+//
+// tableBase is the first element-table index of cs's suffix functions.
+func emitSetMatchFnAnchored(cs *compiledSet, tableBase int) []byte {
+	// Params: in_ptr(0 i32), in_len(1 i32), out_ptr(2 i32), out_cap(3 i32)
+	// Locals: bitmask(4 i64), out_count(5 i32), tmp(6 i32)
+	const (
+		pInPtr    = byte(0)
+		pInLen    = byte(1)
+		pOutPtr   = byte(2)
+		pOutCap   = byte(3)
+		lBitmask  = byte(4)
+		lOutCount = byte(5)
+		lTmp      = byte(6)
+	)
+	var b []byte
+	// 2 local groups: (2 × i32: out_count, tmp), (1 × i64: bitmask)
+	b = append(b, 0x02, 0x02, 0x7F, 0x01, 0x7E)
+
+	// out_count = 0
+	b = append(b, 0x41, 0x00, 0x21, lOutCount)
+
+	// block $done
+	b = append(b, 0x02, 0x40)
+
+	// For each bucket: call suffix DFA from position 0.
+	// The loop is unrolled — one call_indirect per bucket.
+	// Early exit after the first match (remove the br $done to return all matches).
+	for bi := range cs.buckets {
+		// bitmask = call_indirect suffixFn(in_ptr, 0, in_len)
+		b = append(b, 0x20, pInPtr)
+		b = append(b, 0x41, 0x00) // suffix_start = 0
+		b = append(b, 0x20, pInLen)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(tableBase+bi))
+		b = append(b, 0x11, byte(setMatchTypeSuffix), 0x00) // call_indirect
+		b = append(b, 0x21, lBitmask)
+
+		// Iterate bits in bitmask — one bit per pattern in this bucket.
+		for bitPos, globalID := range cs.patternIDs[bi] {
+			if bitPos >= 32 {
+				break
+			}
+			bit := uint32(1) << uint(bitPos)
+
+			// if (bitmask & bit) != 0: write (pattern_id, end_pos) and return
+			b = append(b, 0x20, lBitmask)
+			b = append(b, 0xA7) // i32.wrap_i64
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(bit))
+			b = append(b, 0x71)       // i32.and
+			b = append(b, 0x04, 0x40) // if
+
+			// if out_count >= out_cap: br $done
+			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4D, 0x0D, 0x01)
+
+			// out_base = out_ptr + out_count * 8  (8 bytes per match tuple)
+			b = append(b, 0x20, pOutPtr)
+			b = append(b, 0x20, lOutCount, 0x41, 0x08, 0x6C, 0x6A) // + count*8
+			b = append(b, 0x21, lTmp)
+
+			// mem[base+0] = pattern_id (i32)
+			b = append(b, 0x20, lTmp)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(globalID))
+			b = append(b, 0x36, 0x02, 0x00)
+
+			// mem[base+4] = in_len (end_pos = full input length for anchored match)
+			b = append(b, 0x20, lTmp, 0x20, pInLen, 0x36, 0x02, 0x04)
+
+			// out_count++
+			b = append(b, 0x20, lOutCount, 0x41, 0x01, 0x6A, 0x21, lOutCount)
+
+			// Early exit after first match — remove this br to return all matches.
+			b = append(b, 0x0C, 0x01) // br $done
+
+			b = append(b, 0x0B) // end if
+		}
+	}
+
+	b = append(b, 0x0B) // end block $done
+
+	b = append(b, 0x20, lOutCount) // return out_count
+	b = append(b, 0x0B)            // end function
+
+	funcBody := utils.AppendULEB128(nil, uint32(len(b)))
+	funcBody = append(funcBody, b...)
+	return funcBody
+}
+
 // appendTableLoad64 emits i64.load align=3 offset=0.
 // tableMemIdx is reserved for future multi-memory support (Phase 4c.6).
 func appendTableLoad64(b []byte, _ int) []byte {
@@ -378,8 +519,9 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 
 		spec := SetSpec{
 			Name:       sc.Name,
-			MatchAny:   sc.MatchAny,
-			MatchAll:   sc.MatchAll,
+			FindAny:    sc.FindAny,
+			FindAll:    sc.FindAll,
+			Match:      sc.Match,
 			Patterns:   infos,
 			PatternIDs: globalIDs,
 		}
@@ -436,29 +578,36 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		total += cs.funcCount()
 	}
 
-	// Count suffix functions across all sets (for the function table).
+	// Count suffix functions and compute their global function indices.
 	totalSuffixFns := 0
-	suffixFnBase := make([]int, len(sets)) // suffixFnBase[si] = first suffix fn global index
-	{
-		for si, cs := range sets {
-			suffixFnBase[si] = setBaseIdx[si] + 1 // +1 for the match fn
-			totalSuffixFns += cs.numSuffixFns
-		}
+	suffixFnBase := make([]int, len(sets))
+	for si, cs := range sets {
+		suffixFnBase[si] = setBaseIdx[si] + cs.suffixFnBaseOffset()
+		totalSuffixFns += cs.numSuffixFns
 	}
 
 	var out []byte
 	out = append(out, 0x00, 0x61, 0x73, 0x6D)
 	out = append(out, 0x01, 0x00, 0x00, 0x00)
 
-	// Type section: 6 types (3 existing + 3 new for set functions).
+	// Type section: 7 types.
+	// 0: (i32,i32)→i32          match/backward-prefix
+	// 1: (i32,i32)→i64          find
+	// 2: (i32,i32,i32)→i32      capture/groups
+	// 3: (i32,i32,i32)→i64      suffix DFA
+	// 4: (i32,i32)→i32          prefix backward DFA (same as 0, kept for clarity)
+	// 5: (i32×5)→i32            find_any / find_all set match body
+	// 6: (i32×4)→i32            anchored match body
+	const setMatchTypeAnchored = 6
 	typeSection := []byte{
-		0x06,
-		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0: (i32,i32)→i32
-		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E, // type 1: (i32,i32)→i64
-		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 2: (i32,i32,i32)→i32
-		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 3: (i32,i32,i32)→i64  [suffix DFA]
-		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 4: (i32,i32)→i32      [prefix backward DFA]
-		0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 5: (i32×5)→i32 [set match]
+		0x07,
+		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0
+		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E, // type 1
+		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 2
+		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 3
+		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 4
+		0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 5
+		0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 6
 	}
 	out = appendSection(out, 1, typeSection)
 
@@ -496,7 +645,12 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 	}
 	for _, cs := range sets {
-		fs = append(fs, byte(setMatchTypeMatch)) // match fn: type 5
+		if cs.findAny != "" || cs.findAll != "" {
+			fs = append(fs, byte(setMatchTypeMatch)) // find fn: type 5
+		}
+		if cs.match != "" {
+			fs = append(fs, byte(setMatchTypeAnchored)) // anchored fn: type 6
+		}
 		for range cs.suffixFnBodies {
 			fs = append(fs, byte(setMatchTypeSuffix)) // suffix fn: type 3
 		}
@@ -559,10 +713,13 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 	}
 	for _, cs := range sets {
-		if cs.matchAny != "" {
+		if cs.findAny != "" {
 			numExports++
 		}
-		if cs.matchAll != "" {
+		if cs.findAll != "" {
+			numExports++
+		}
+		if cs.match != "" {
 			numExports++
 		}
 	}
@@ -604,16 +761,24 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 	}
 	for si, cs := range sets {
-		matchFnIdx := setBaseIdx[si]
-		if cs.matchAny != "" {
-			es = appendString(es, cs.matchAny)
-			es = append(es, 0x00)
-			es = utils.AppendULEB128(es, uint32(matchFnIdx))
+		base := setBaseIdx[si]
+		if cs.findFnOffset() >= 0 {
+			findIdx := uint32(base + cs.findFnOffset())
+			if cs.findAny != "" {
+				es = appendString(es, cs.findAny)
+				es = append(es, 0x00)
+				es = utils.AppendULEB128(es, findIdx)
+			}
+			if cs.findAll != "" {
+				es = appendString(es, cs.findAll)
+				es = append(es, 0x00)
+				es = utils.AppendULEB128(es, findIdx)
+			}
 		}
-		if cs.matchAll != "" {
-			es = appendString(es, cs.matchAll)
+		if cs.matchFnOffset() >= 0 {
+			es = appendString(es, cs.match)
 			es = append(es, 0x00)
-			es = utils.AppendULEB128(es, uint32(matchFnIdx))
+			es = utils.AppendULEB128(es, uint32(base+cs.matchFnOffset()))
 		}
 	}
 	out = appendSection(out, 7, es)
@@ -651,13 +816,16 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			}
 		}
 	}
-	// Set function bodies.
+	// Set function bodies: find fn (if any), anchored match fn (if any), suffix DFA fns.
 	for si, cs := range sets {
-		// Patch the call_indirect table indices in the match fn body.
-		// The match fn body uses bi as placeholder; the real index is suffixFnBase[si] + bi.
-		// For simplicity in this initial version, we rebuild the match fn body with correct indices.
-		matchBody := rebuildSetMatchBody(cs, suffixFnBase[si])
-		cs_bytes = append(cs_bytes, matchBody...)
+		if cs.findAny != "" || cs.findAll != "" {
+			findBody := rebuildSetMatchBody(cs, suffixFnBase[si])
+			cs_bytes = append(cs_bytes, findBody...)
+		}
+		if cs.match != "" {
+			anchoredBody := emitSetMatchFnAnchored(cs, suffixFnBase[si])
+			cs_bytes = append(cs_bytes, anchoredBody...)
+		}
 		for _, sfn := range cs.suffixFnBodies {
 			cs_bytes = append(cs_bytes, sfn...)
 		}

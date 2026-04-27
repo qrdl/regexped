@@ -654,6 +654,7 @@ type setFixture struct {
 		FallbackCount       int      `yaml:"fallback_count"`
 		ConflictReasons     []string `yaml:"conflict_reasons"`
 		Frontend            string   `yaml:"frontend"`
+		Match               string   `yaml:"match"` // expected match export name
 	} `yaml:"expect"`
 }
 
@@ -1108,7 +1109,7 @@ func TestConfig_DuplicateName_Rejected(t *testing.T) {
 			{Name: "dup", Pattern: `bar`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", MatchAny: "ma", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", FindAny: "ma", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	if err := config.ValidateSets(&cfg); err == nil {
@@ -1124,7 +1125,7 @@ func TestConfig_UnknownPatternRef_Rejected(t *testing.T) {
 		Sets: []config.SetConfig{
 			{
 				Name:     "s",
-				MatchAny: "ma",
+				FindAny:  "ma",
 				Patterns: config.PatternSelector{Names: []string{"unknown_name"}},
 			},
 		},
@@ -1134,7 +1135,7 @@ func TestConfig_UnknownPatternRef_Rejected(t *testing.T) {
 	}
 }
 
-func TestConfig_MissingMatchAnyAndAll_Rejected(t *testing.T) {
+func TestConfig_MissingFindAnyAndAll_Rejected(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexes: []config.RegexEntry{{Name: "p", Pattern: `foo`}},
 		Sets: []config.SetConfig{
@@ -1176,7 +1177,7 @@ func TestCompileFile_WithSets_ValidWASM(t *testing.T) {
 		Sets: []config.SetConfig{
 			{
 				Name:     "test_set",
-				MatchAny: "test_match_any",
+				FindAny:  "test_match_any",
 				Patterns: config.PatternSelector{All: true},
 			},
 		},
@@ -1208,7 +1209,7 @@ func TestSetMatch_SingleBucket_Equivalence(t *testing.T) {
 	}
 	spec := SetSpec{
 		Name:       "test",
-		MatchAny:   "test_any",
+		FindAny:    "test_any",
 		Patterns:   patterns,
 		PatternIDs: patternIDs,
 	}
@@ -1325,7 +1326,7 @@ func TestCompileFile_Embedded_WithSets(t *testing.T) {
 		Output:  "merged.wasm", // non-empty → embedded
 		Regexes: []config.RegexEntry{{Name: "p", Pattern: `bar\w+`}},
 		Sets: []config.SetConfig{
-			{Name: "s", MatchAll: "s_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", FindAll: "s_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "out.wasm")
@@ -1344,7 +1345,7 @@ func TestAssembleModuleWithSets_ValidWASM(t *testing.T) {
 			{Name: "p1", Pattern: `foo\d+`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", MatchAny: "ma", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", FindAny: "ma", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -1509,5 +1510,86 @@ func TestDiagnostics_ConflictReasons(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// Phase 4.5: anchored match tests
+
+func TestSetMatch_Anchored_ValidWASM(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Name: "sel", Pattern: `(?i)^\s*SELECT\b`},
+			{Name: "ins", Pattern: `(?i)^\s*INSERT\s+INTO\b`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "sql", Match: "validate_sql", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM magic: %x", wasm[:min(8, len(wasm))])
+	}
+}
+
+func TestSetMatch_Anchored_FindOnlyCompiles(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{{Name: "p", Pattern: `foo\d+`}},
+		Sets:    []config.SetConfig{{Name: "s", FindAny: "find_foo", Patterns: config.PatternSelector{All: true}}},
+	}
+	if _, _, err := CompileFile(cfg, ""); err != nil {
+		t.Fatalf("CompileFile find-only: %v", err)
+	}
+}
+
+func TestSetMatch_Anchored_BothExports(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Name: "p1", Pattern: `foo\d+`},
+			{Name: "p2", Pattern: `bar\w+`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "both", FindAll: "find_all_fn", Match: "match_fn", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 {
+		t.Fatalf("WASM too short: %d bytes", len(wasm))
+	}
+}
+
+func TestSetMatch_Anchored_SQLValidator_Fixture(t *testing.T) {
+	fix := testdataFixture(t, "sql_validator")
+	cfg := config.BuildConfig{
+		Regexes: make([]config.RegexEntry, len(fix.Patterns)),
+		Sets: []config.SetConfig{
+			{Name: "sql", Match: "validate_sql", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	for i, p := range fix.Patterns {
+		cfg.Regexes[i] = config.RegexEntry{Pattern: p.Pattern}
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile SQL validator: %v", err)
+	}
+	if len(wasm) < 8 {
+		t.Fatalf("WASM too short: %d bytes", len(wasm))
+	}
+}
+
+func TestValidateSets_MatchOnly(t *testing.T) {
+	cfg := &config.BuildConfig{
+		Regexes: []config.RegexEntry{{Name: "p", Pattern: "foo"}},
+		Sets:    []config.SetConfig{{Name: "s", Match: "validate", Patterns: config.PatternSelector{All: true}}},
+	}
+	if err := config.ValidateSets(cfg); err != nil {
+		t.Errorf("ValidateSets match-only set: %v", err)
 	}
 }

@@ -1,0 +1,46 @@
+# sql_validator: anchored match for SQL statement classification.
+# Each pattern matches from position 0 (case-insensitive via (?i)).
+# Uses the `match` export — no literal scan needed since all patterns are anchored.
+patterns:
+  - name: select
+    pattern: '(?i)^\s*SELECT\b'
+  - name: insert
+    pattern: '(?i)^\s*INSERT\s+INTO\b'
+  - name: update
+    pattern: '(?i)^\s*UPDATE\s+\w'
+  - name: delete
+    pattern: '(?i)^\s*DELETE\s+FROM\b'
+  - name: create_table
+    pattern: '(?i)^\s*CREATE\s+TABLE\b'
+  - name: drop_table
+    pattern: '(?i)^\s*DROP\s+TABLE\b'
+  - name: alter_table
+    pattern: '(?i)^\s*ALTER\s+TABLE\b'
+  - name: truncate
+    pattern: '(?i)^\s*TRUNCATE\b'
+  - name: grant
+    pattern: '(?i)^\s*GRANT\b'
+  - name: revoke
+    pattern: '(?i)^\s*REVOKE\b'
+  - name: begin
+    pattern: '(?i)^\s*BEGIN\b'
+  - name: commit
+    pattern: '(?i)^\s*COMMIT\b'
+  - name: rollback
+    pattern: '(?i)^\s*ROLLBACK\b'
+  - name: savepoint
+    pattern: '(?i)^\s*SAVEPOINT\b'
+  - name: explain
+    pattern: '(?i)^\s*EXPLAIN\b'
+  - name: show
+    pattern: '(?i)^\s*SHOW\b'
+  - name: describe
+    pattern: '(?i)^\s*DESCRIBE\b'
+  - name: use
+    pattern: '(?i)^\s*USE\s+\w'
+  - name: call
+    pattern: '(?i)^\s*CALL\b'
+  - name: with
+    pattern: '(?i)^\s*WITH\s+\w'
+expect:
+  match: validate_sql

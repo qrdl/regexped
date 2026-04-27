@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestCaptureStubsRequested(t *testing.T) {
@@ -145,6 +147,120 @@ func TestLoadConfigNotFound(t *testing.T) {
 	_, err := LoadConfig("/nonexistent/path/regexped.yaml")
 	if err == nil {
 		t.Fatal("expected error for non-existent config file, got nil")
+	}
+}
+
+func TestPatternSelector_UnmarshalYAML_All(t *testing.T) {
+	var s struct {
+		P PatternSelector `yaml:"patterns"`
+	}
+	if err := yaml.Unmarshal([]byte("patterns: \"all\"\n"), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !s.P.All {
+		t.Error("All=false, want true")
+	}
+	if len(s.P.Names) != 0 {
+		t.Errorf("Names=%v, want empty", s.P.Names)
+	}
+}
+
+func TestPatternSelector_UnmarshalYAML_List(t *testing.T) {
+	var s struct {
+		P PatternSelector `yaml:"patterns"`
+	}
+	if err := yaml.Unmarshal([]byte("patterns:\n  - rule_a\n  - rule_b\n"), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if s.P.All {
+		t.Error("All=true, want false")
+	}
+	if len(s.P.Names) != 2 || s.P.Names[0] != "rule_a" || s.P.Names[1] != "rule_b" {
+		t.Errorf("Names=%v, want [rule_a rule_b]", s.P.Names)
+	}
+}
+
+func TestPatternSelector_UnmarshalYAML_Invalid(t *testing.T) {
+	var s struct {
+		P PatternSelector `yaml:"patterns"`
+	}
+	if err := yaml.Unmarshal([]byte("patterns: 42\n"), &s); err == nil {
+		t.Error("expected error for invalid patterns value, got nil")
+	}
+}
+
+func TestValidateSets_Valid(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "p1", Pattern: "foo"}, {Name: "p2", Pattern: "bar"}},
+		Sets: []SetConfig{
+			{Name: "s1", FindAny: "s1_any", Patterns: PatternSelector{All: true}},
+			{Name: "s2", FindAll: "s2_all", Patterns: PatternSelector{Names: []string{"p1"}}},
+		},
+	}
+	if err := ValidateSets(cfg); err != nil {
+		t.Errorf("ValidateSets valid config: %v", err)
+	}
+}
+
+func TestValidateSets_DuplicateRegexName(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "dup", Pattern: "foo"}, {Name: "dup", Pattern: "bar"}},
+		Sets:    []SetConfig{{Name: "s", FindAny: "ma", Patterns: PatternSelector{All: true}}},
+	}
+	if err := ValidateSets(cfg); err == nil {
+		t.Error("expected error for duplicate regex name, got nil")
+	}
+}
+
+func TestValidateSets_DuplicateSetName(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "p", Pattern: "foo"}},
+		Sets: []SetConfig{
+			{Name: "same", FindAny: "a", Patterns: PatternSelector{All: true}},
+			{Name: "same", FindAll: "b", Patterns: PatternSelector{All: true}},
+		},
+	}
+	if err := ValidateSets(cfg); err == nil {
+		t.Error("expected error for duplicate set name, got nil")
+	}
+}
+
+func TestValidateSets_UnknownPatternRef(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "known", Pattern: "foo"}},
+		Sets:    []SetConfig{{Name: "s", FindAny: "ma", Patterns: PatternSelector{Names: []string{"unknown"}}}},
+	}
+	if err := ValidateSets(cfg); err == nil {
+		t.Error("expected error for unknown pattern reference, got nil")
+	}
+}
+
+func TestValidateSets_NoExportField(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "p", Pattern: "foo"}},
+		Sets:    []SetConfig{{Name: "s", Patterns: PatternSelector{All: true}}},
+	}
+	if err := ValidateSets(cfg); err == nil {
+		t.Error("expected error for set with no export field, got nil")
+	}
+}
+
+func TestValidateSets_MissingSetName(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "p", Pattern: "foo"}},
+		Sets:    []SetConfig{{FindAny: "ma", Patterns: PatternSelector{All: true}}},
+	}
+	if err := ValidateSets(cfg); err == nil {
+		t.Error("expected error for set with missing name, got nil")
+	}
+}
+
+func TestValidateSets_EmptySets(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "p", Pattern: "foo"}},
+	}
+	if err := ValidateSets(cfg); err != nil {
+		t.Errorf("ValidateSets empty sets: %v", err)
 	}
 }
 
