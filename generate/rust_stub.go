@@ -9,21 +9,149 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// rustStub generates a Rust stub file for all regex entries in cfg.
+// rustStub generates a Rust stub file for all regex entries and sets in cfg.
 // out is the full output path or "-" for stdout.
 func rustStub(cfg config.BuildConfig, out string) error {
 	content, err := genRustStubFile(cfg.Regexes, cfg.ImportModule)
 	if err != nil {
 		return fmt.Errorf("generate Rust stub: %w", err)
 	}
-	if content == "" {
+	setContent := genRustSetSection(cfg)
+	if content == "" && setContent == "" {
 		return nil
 	}
+	combined := content + setContent
 	if out == "-" {
-		_, err := os.Stdout.WriteString(content)
+		_, err := os.Stdout.WriteString(combined)
 		return err
 	}
-	return writeStub(out, []byte(content))
+	return writeStub(out, []byte(combined))
+}
+
+// genRustSetSection generates Rust wrappers for all sets in cfg.
+// Emits SetMatch/SetAnchorMatch types (once), per-set iterators/wrappers,
+// and an optional file-wide pattern_name() helper.
+func genRustSetSection(cfg config.BuildConfig) string {
+	if !hasSetExports(cfg) {
+		return ""
+	}
+	var out strings.Builder
+	out.WriteString(`
+/// A match returned by set find_any / find_all operations.
+#[derive(Debug, Clone, Copy)]
+pub struct SetMatch {
+    pub pattern_id: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// A match returned by anchored set match operations.
+#[derive(Debug, Clone, Copy)]
+pub struct SetAnchorMatch {
+    pub pattern_id: usize,
+    pub end: usize,
+}
+
+`)
+	for _, s := range cfg.Sets {
+		bs := batchSize(s)
+		if s.FindAll != "" || s.FindAny != "" {
+			ffiName := "ffi_" + s.FindAll
+			wasmExport := s.FindAll
+			if wasmExport == "" {
+				wasmExport = s.FindAny
+				ffiName = "ffi_" + s.FindAny
+			}
+			iterName := iterTypeName(s.FindAll)
+			if s.FindAll == "" {
+				iterName = iterTypeName(s.FindAny)
+			}
+			fmt.Fprintf(&out, `#[link(wasm_import_module = "%s")]
+unsafe extern "C" {
+    #[link_name = "%s"]
+    fn %s(ptr: *const u8, len: i32, out: *mut i32, cap: i32, start: i32) -> i32;
+}
+
+`, cfg.ImportModule, wasmExport, ffiName)
+
+			if s.FindAll != "" {
+				fmt.Fprintf(&out, `pub struct %s<'a> {
+    input: &'a [u8],
+    start_pos: i32,
+    buf: [[i32; 3]; %d],
+    count: i32,
+    idx: i32,
+}
+
+impl<'a> Iterator for %s<'a> {
+    type Item = SetMatch;
+    fn next(&mut self) -> Option<SetMatch> {
+        loop {
+            if self.idx < self.count {
+                let e = self.buf[self.idx as usize];
+                self.idx += 1;
+                return Some(SetMatch { pattern_id: e[0] as usize, start: e[1] as usize, end: (e[1]+e[2]) as usize });
+            }
+            if self.start_pos < 0 { return None; }
+            let n = unsafe { %s(self.input.as_ptr(), self.input.len() as i32, self.buf.as_mut_ptr() as *mut i32, %d, self.start_pos) };
+            if n <= 0 { return None; }
+            self.count = n;
+            self.idx = 0;
+            let last = self.buf[(n-1) as usize];
+            self.start_pos = last[1] + if last[2] > 0 { last[2] } else { 1 };
+        }
+    }
+}
+
+pub fn %s(input: &[u8]) -> %s<'_> {
+    %s { input, start_pos: 0, buf: [[0;3]; %d], count: 0, idx: 0 }
+}
+
+`, iterName, bs, iterName, ffiName, bs, s.FindAll, iterName, iterName, bs)
+			}
+			if s.FindAny != "" {
+				anyFfiName := ffiName
+				if s.FindAll != "" {
+					// reuse the same FFI binding
+					anyFfiName = "ffi_" + s.FindAll
+				}
+				fmt.Fprintf(&out, `pub fn %s(input: &[u8]) -> Option<SetMatch> {
+    let mut buf = [0i32; 3];
+    let n = unsafe { %s(input.as_ptr(), input.len() as i32, buf.as_mut_ptr(), 1, 0) };
+    if n <= 0 { return None; }
+    Some(SetMatch { pattern_id: buf[0] as usize, start: buf[1] as usize, end: (buf[1]+buf[2]) as usize })
+}
+
+`, s.FindAny, anyFfiName)
+			}
+		}
+		if s.Match != "" {
+			ffiName := "ffi_" + s.Match
+			fmt.Fprintf(&out, `#[link(wasm_import_module = "%s")]
+unsafe extern "C" {
+    #[link_name = "%s"]
+    fn %s(ptr: *const u8, len: i32, out: *mut i32, cap: i32) -> i32;
+}
+
+pub fn %s(input: &[u8]) -> Option<SetAnchorMatch> {
+    let mut buf = [0i32; 2];
+    let n = unsafe { %s(input.as_ptr(), input.len() as i32, buf.as_mut_ptr(), 1) };
+    if n <= 0 { return None; }
+    Some(SetAnchorMatch { pattern_id: buf[0] as usize, end: buf[1] as usize })
+}
+
+`, cfg.ImportModule, s.Match, ffiName, s.Match, ffiName)
+		}
+	}
+	if hasEmitNameMap(cfg) {
+		out.WriteString("pub fn pattern_name(id: u32) -> &'static str {\n    match id {\n")
+		for i, re := range cfg.Regexes {
+			name := re.Name
+			fmt.Fprintf(&out, "        %d => %q,\n", i, name)
+		}
+		out.WriteString("        _ => \"\",\n    }\n}\n\n")
+	}
+	return out.String()
 }
 
 // genRustStubFile generates the content of a Rust stub file for a slice of entries.

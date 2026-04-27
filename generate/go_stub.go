@@ -22,14 +22,109 @@ func goStub(cfg config.BuildConfig, out string) error {
 	if err != nil {
 		return fmt.Errorf("generate Go stub: %w", err)
 	}
-	if content == "" {
+	setContent := genGoSetSection(cfg, pkgName)
+	if content == "" && setContent == "" {
 		return nil
 	}
+	combined := content + setContent
 	if out == "-" {
-		_, err := fmt.Print(content)
+		_, err := fmt.Print(combined)
 		return err
 	}
-	return writeStub(out, []byte(content))
+	return writeStub(out, []byte(combined))
+}
+
+// genGoSetSection generates Go wrappers for all sets in cfg.
+func genGoSetSection(cfg config.BuildConfig, pkgName string) string {
+	if !hasSetExports(cfg) {
+		return ""
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "// ---- set composition wrappers ----\n\n")
+	fmt.Fprintf(&out, "// SetMatch is a match from a set find_any / find_all call.\ntype SetMatch struct { PatternID, Start, End int }\n\n")
+	fmt.Fprintf(&out, "// SetAnchorMatch is a match from an anchored set match call.\ntype SetAnchorMatch struct { PatternID, End int }\n\n")
+	for _, s := range cfg.Sets {
+		bs := batchSize(s)
+		if s.FindAll != "" || s.FindAny != "" {
+			wasmExport := s.FindAll
+			if wasmExport == "" {
+				wasmExport = s.FindAny
+			}
+			ffiName := "ffi_" + wasmExport
+			fmt.Fprintf(&out, "//go:wasmimport %s %s\nfunc %s(ptr uintptr, length int32, outPtr uintptr, outCap int32, startPos int32) int32\n\n",
+				cfg.ImportModule, wasmExport, ffiName)
+			if s.FindAll != "" {
+				pubName := goPublicName(s.FindAll)
+				fmt.Fprintf(&out, `// %s returns an iter.Seq[SetMatch] over all non-overlapping matches.
+func %s(input []byte) iter.Seq[SetMatch] {
+    return func(yield func(SetMatch) bool) {
+        buf := make([][3]int32, %d)
+        startPos := int32(0)
+        for {
+            n := %s(unsafe.SliceData(input), int32(len(input)), uintptr(unsafe.Pointer(&buf[0])), %d, startPos)
+            if n <= 0 { return }
+            for i := int32(0); i < n; i++ {
+                m := SetMatch{PatternID: int(buf[i][0]), Start: int(buf[i][1]), End: int(buf[i][1]+buf[i][2])}
+                if !yield(m) { return }
+            }
+            last := buf[n-1]
+            adv := last[2]; if adv <= 0 { adv = 1 }
+            startPos = last[1] + adv
+        }
+    }
+}
+
+`, pubName, pubName, bs, ffiName, bs)
+			}
+			if s.FindAny != "" {
+				pubName := goPublicName(s.FindAny)
+				anyFfi := "ffi_" + s.FindAny
+				if s.FindAll != "" {
+					anyFfi = "ffi_" + s.FindAll
+				}
+				fmt.Fprintf(&out, `// %s returns the first match, or zero value and false if none.
+func %s(input []byte) (SetMatch, bool) {
+    var buf [1][3]int32
+    if %s(unsafe.SliceData(input), int32(len(input)), uintptr(unsafe.Pointer(&buf[0])), 1, 0) <= 0 { return SetMatch{}, false }
+    return SetMatch{PatternID: int(buf[0][0]), Start: int(buf[0][1]), End: int(buf[0][1]+buf[0][2])}, true
+}
+
+`, pubName, pubName, anyFfi)
+			}
+		}
+		if s.Match != "" {
+			ffiName := "ffi_" + s.Match
+			pubName := goPublicName(s.Match)
+			fmt.Fprintf(&out, "//go:wasmimport %s %s\nfunc %s(ptr uintptr, length int32, outPtr uintptr, outCap int32) int32\n\n",
+				cfg.ImportModule, s.Match, ffiName)
+			fmt.Fprintf(&out, `// %s tries to match input from position 0, returning the first matching pattern or nil.
+func %s(input []byte) *SetAnchorMatch {
+    var buf [1][2]int32
+    if %s(unsafe.SliceData(input), int32(len(input)), uintptr(unsafe.Pointer(&buf[0])), 1) <= 0 { return nil }
+    m := SetAnchorMatch{PatternID: int(buf[0][0]), End: int(buf[0][1])}
+    return &m
+}
+
+`, pubName, pubName, ffiName)
+		}
+	}
+	if hasEmitNameMap(cfg) {
+		out.WriteString("// PatternName returns the name of the pattern with the given file-wide ID.\n")
+		out.WriteString("func PatternName(id int) string {\n    switch id {\n")
+		for i, re := range cfg.Regexes {
+			if re.Name != "" {
+				fmt.Fprintf(&out, "    case %d: return %q\n", i, re.Name)
+			}
+		}
+		out.WriteString("    }\n    return \"\"\n}\n\n")
+	}
+	// Check if we need extra imports for the set section.
+	if hasSetExports(cfg) {
+		// Prepend import block to the set section.
+		prefix := "import (\n    \"iter\"\n    \"unsafe\"\n)\n\n"
+		return prefix + out.String()
+	}
+	return out.String()
 }
 
 // goPublicName converts a snake_case function name to a PascalCase Go identifier.

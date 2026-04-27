@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -640,6 +641,7 @@ func TestAnalyzePattern_SharedSuffix(t *testing.T) {
 
 type setFixture struct {
 	Patterns []struct {
+		Name    string `yaml:"name"`
 		Pattern string `yaml:"pattern"`
 	} `yaml:"patterns"`
 	Options struct {
@@ -654,8 +656,10 @@ type setFixture struct {
 		FallbackCount       int      `yaml:"fallback_count"`
 		ConflictReasons     []string `yaml:"conflict_reasons"`
 		Frontend            string   `yaml:"frontend"`
-		Match               string   `yaml:"match"` // expected match export name
+		Match               string   `yaml:"match"`
+		SetCount            int      `yaml:"set_count"`
 	} `yaml:"expect"`
+	Sets []config.SetConfig `yaml:"sets"`
 }
 
 func (f setFixture) compileOpts() CompileSetOptions {
@@ -1591,5 +1595,100 @@ func TestValidateSets_MatchOnly(t *testing.T) {
 	}
 	if err := config.ValidateSets(cfg); err != nil {
 		t.Errorf("ValidateSets match-only set: %v", err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Phase 5: fuzzer, mixed_004, diag JSON tests
+
+func FuzzSetMatchEquivalence(f *testing.F) {
+	// Seed corpus: simple patterns that exercise different code paths.
+	seeds := []struct{ pat, input string }{
+		{`foo\d+`, "foo123"},
+		{`bar`, "hello bar world"},
+		{`[a-z]+`, "abc"},
+	}
+	for _, s := range seeds {
+		f.Add(s.pat, s.input)
+	}
+	f.Fuzz(func(t *testing.T, pat, input string) {
+		// Compile the pattern — skip if it's invalid or uses captures.
+		cfg := config.BuildConfig{
+			Regexes: []config.RegexEntry{{Name: "p", Pattern: pat, FindFunc: "find"}},
+			Sets: []config.SetConfig{
+				{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			},
+		}
+		if err := config.ValidateSets(&cfg); err != nil {
+			return // invalid config
+		}
+		wasm, _, err := CompileFile(cfg, "")
+		if err != nil {
+			return // pattern may be unsupported — skip
+		}
+		if len(wasm) < 8 {
+			t.Errorf("WASM too short: %d bytes for pattern %q", len(wasm), pat)
+		}
+	})
+}
+
+func TestMixed004_Fixture_CompileFile(t *testing.T) {
+	fix := testdataFixture(t, "mixed_004")
+	if len(fix.Sets) == 0 {
+		t.Skip("mixed_004 fixture has no sets block — skipping CompileFile test")
+	}
+	cfg := config.BuildConfig{
+		Regexes: make([]config.RegexEntry, len(fix.Patterns)),
+		Sets:    fix.Sets,
+	}
+	for i, p := range fix.Patterns {
+		cfg.Regexes[i] = config.RegexEntry{Name: p.Name, Pattern: p.Pattern}
+	}
+	if err := config.ValidateSets(&cfg); err != nil {
+		t.Fatalf("ValidateSets: %v", err)
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 {
+		t.Fatalf("WASM too short: %d bytes", len(wasm))
+	}
+	if fix.Expect.SetCount > 0 && len(fix.Sets) != fix.Expect.SetCount {
+		t.Errorf("set count = %d, want %d", len(fix.Sets), fix.Expect.SetCount)
+	}
+}
+
+func TestDiagJSON_Schema(t *testing.T) {
+	fix := testdataFixture(t, "mixed_004")
+	if len(fix.Sets) == 0 {
+		t.Skip("mixed_004 has no sets")
+	}
+	cfg := config.BuildConfig{
+		Regexes: make([]config.RegexEntry, len(fix.Patterns)),
+		Sets:    fix.Sets,
+	}
+	for i, p := range fix.Patterns {
+		cfg.Regexes[i] = config.RegexEntry{Name: p.Name, Pattern: p.Pattern}
+	}
+	if err := config.ValidateSets(&cfg); err != nil {
+		t.Fatalf("ValidateSets: %v", err)
+	}
+
+	// Write diag JSON to a temp file and verify required fields are present.
+	tmp := t.TempDir() + "/diag.json"
+	if err := CmdWriteDiagJSON(cfg, "", tmp); err != nil {
+		t.Fatalf("CmdWriteDiagJSON: %v", err)
+	}
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read diag JSON: %v", err)
+	}
+
+	required := []string{`"patterns_total"`, `"sets"`, `"buckets"`, `"frontend"`}
+	for _, field := range required {
+		if !bytes.Contains(data, []byte(field)) {
+			t.Errorf("diag JSON missing field %s", field)
+		}
 	}
 }

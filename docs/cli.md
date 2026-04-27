@@ -197,6 +197,7 @@ Compiles each regex pattern to a single WASM module. The output mode is selected
 |---|---|---|
 | `--config` | `regexped.yaml` | YAML config file |
 | `--output`, `-o` | config `wasm_file` | Output WASM file; `-` writes to stdout |
+| `--diag-json` | (none) | Write set-composition diagnostics as JSON to this path; `-` for stdout |
 
 **Required config fields:**
 
@@ -206,6 +207,44 @@ Compiles each regex pattern to a single WASM module. The output mode is selected
 | `regexes` | One or more patterns to compile |
 
 Entries with no `_func` fields are silently skipped.
+
+#### `sets:` block — multi-pattern set composition
+
+When the config contains a `sets:` block, `compile` also emits multi-pattern set-match functions. Each set entry produces up to three exported WASM functions.
+
+```yaml
+regexes:
+  - name: aws_key      # name is required for sets: pattern references
+    pattern: 'AKIA[0-9A-Z]{16}'
+  - name: github_pat
+    pattern: 'ghp_[0-9a-zA-Z]{36}'
+
+sets:
+  - name: secret_scanner
+    find_all: scan_secrets   # non-anchored: returns all matches with positions
+    find_any: scan_first     # non-anchored: returns first match only (optional)
+    match: validate_secret   # anchored at position 0 (optional)
+    batch_size: 256          # output buffer size (stub-gen knob; default 256)
+    emit_name_map: true      # emit pattern_name(id) helper in stubs
+    patterns:
+      - aws_key              # list of regexes.name values
+      - github_pat
+      # or: patterns: "all" to include every entry in regexes:
+```
+
+| `sets:` field | Required | Description |
+|---|---|---|
+| `name` | Yes | Unique set name |
+| `find_all` | At least one | Export name for non-anchored all-matches function |
+| `find_any` | At least one | Export name for non-anchored first-match function |
+| `match` | At least one | Export name for anchored match function (position 0) |
+| `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexes:` |
+| `batch_size` | No | Output buffer hint for stub iterators (default 256) |
+| `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
+
+The `name:` field on `regexes:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
+
+See [sets.md](sets.md) for full pipeline details and output tuple formats.
 
 ---
 

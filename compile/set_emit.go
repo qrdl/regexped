@@ -272,7 +272,7 @@ func emitSuffixDFAFn(b *bucket, tableBase int32, tableMemIdx int) (funcBody []by
 
 	body = append(body, 0x41, 0x01, 0x21, lState)     // state = 1
 	body = append(body, 0x20, paramStart, 0x21, lPos) // pos = suffix_start
-	body = append(body, 0x42, 0x00, 0x24, lResult)    // result = 0
+	body = append(body, 0x42, 0x00, 0x21, lResult)    // result = 0 (local.set, not global.set)
 
 	body = append(body, 0x02, 0x40) // block $done
 	body = append(body, 0x03, 0x40) // loop $main
@@ -307,8 +307,8 @@ func emitSuffixDFAFn(b *bucket, tableBase int32, tableMemIdx int) (funcBody []by
 	body = utils.AppendSLEB128(body, bitmaskOff)
 	body = append(body, 0x20, lState, 0x41, 0x03, 0x74, 0x6A) // bitmaskOff + state*8
 	body = appendTableLoad64(body, tableMemIdx)
-	body = append(body, 0x86, 0x01) // i64.or
-	body = append(body, 0x24, lResult)
+	body = append(body, 0x86, 0x01)    // i64.or
+	body = append(body, 0x21, lResult) // local.set
 
 	// if state == 0: br $done
 	body = append(body, 0x20, lState, 0x45, 0x0D, 0x01) // i32.eqz + br_if $done
@@ -532,9 +532,27 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		compiledSets = append(compiledSets, cs)
 	}
 
+	// Compute required memory pages from the largest data address used:
+	// max(per-pattern tableEnd, total set DFA data bytes).
+	totalSetData := int64(0)
+	for _, cs := range compiledSets {
+		totalSetData += int64(len(cs.dataBytes))
+	}
+	dataTop := lastTableEnd
+	if totalSetData > dataTop {
+		dataTop = totalSetData
+	}
 	var memPages int32 = 1
-	if !standalone && lastTableEnd > 0 {
-		memPages = int32((lastTableEnd + 65535) / 65536)
+	if dataTop > 0 {
+		memPages = int32((dataTop + 65535) / 65536)
+		if memPages < 1 {
+			memPages = 1
+		}
+	}
+	if standalone && memPages < 1 {
+		memPages = 1
+	} else if !standalone && lastTableEnd == 0 && totalSetData == 0 {
+		memPages = 1
 	}
 	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone), lastTableEnd, nil
 }
@@ -675,24 +693,6 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		out = appendSection(out, 5, mem)
 	}
 
-	// Element section: populate the function table with suffix DFA function indices.
-	if totalSuffixFns > 0 {
-		var elemSec []byte
-		elemSec = utils.AppendULEB128(elemSec, 1) // 1 element segment
-		elemSec = append(elemSec, 0x00)           // active, table 0, funcref
-		// offset = i32.const 0
-		elemSec = append(elemSec, 0x41, 0x00, 0x0B)
-		// num elements
-		elemSec = utils.AppendULEB128(elemSec, uint32(totalSuffixFns))
-		for si, cs := range sets {
-			base := suffixFnBase[si]
-			for j := 0; j < cs.numSuffixFns; j++ {
-				elemSec = utils.AppendULEB128(elemSec, uint32(base+j))
-			}
-		}
-		out = appendSection(out, 9, elemSec)
-	}
-
 	// Export section.
 	numExports := 0
 	if standalone {
@@ -783,6 +783,23 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	}
 	out = appendSection(out, 7, es)
 
+	// Element section (must come after Export per WASM spec section ordering).
+	// Populates the function table with suffix DFA function indices.
+	if totalSuffixFns > 0 {
+		var elemSec []byte
+		elemSec = utils.AppendULEB128(elemSec, 1)   // 1 element segment
+		elemSec = append(elemSec, 0x00)             // active, table 0, funcref
+		elemSec = append(elemSec, 0x41, 0x00, 0x0B) // offset = i32.const 0
+		elemSec = utils.AppendULEB128(elemSec, uint32(totalSuffixFns))
+		for si, cs := range sets {
+			base := suffixFnBase[si]
+			for j := 0; j < cs.numSuffixFns; j++ {
+				elemSec = utils.AppendULEB128(elemSec, uint32(base+j))
+			}
+		}
+		out = appendSection(out, 9, elemSec)
+	}
+
 	// Code section.
 	var cs_bytes []byte
 	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total))
@@ -817,18 +834,22 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 	}
 	// Set function bodies: find fn (if any), anchored match fn (if any), suffix DFA fns.
-	for si, cs := range sets {
+	// call_indirect uses TABLE ELEMENT indices (0..totalSuffixFns-1), not global function
+	// indices. tableElemBase tracks the first element index for each set's suffix DFAs.
+	tableElemBase := 0
+	for _, cs := range sets {
 		if cs.findAny != "" || cs.findAll != "" {
-			findBody := rebuildSetMatchBody(cs, suffixFnBase[si])
+			findBody := rebuildSetMatchBody(cs, tableElemBase)
 			cs_bytes = append(cs_bytes, findBody...)
 		}
 		if cs.match != "" {
-			anchoredBody := emitSetMatchFnAnchored(cs, suffixFnBase[si])
+			anchoredBody := emitSetMatchFnAnchored(cs, tableElemBase)
 			cs_bytes = append(cs_bytes, anchoredBody...)
 		}
 		for _, sfn := range cs.suffixFnBodies {
 			cs_bytes = append(cs_bytes, sfn...)
 		}
+		tableElemBase += cs.numSuffixFns
 	}
 	out = appendSection(out, 10, cs_bytes)
 
@@ -900,16 +921,17 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
 
 		for li, lb := range lit {
-			b = append(b, 0x20, pInPtr, 0x20, lPos)
+			// addr = pInPtr + lPos [+ li]
+			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A) // ptr + pos
 			if li > 0 {
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, int32(li))
-				b = append(b, 0x6A)
+				b = append(b, 0x6A) // + li
 			}
-			b = append(b, 0x2D, 0x00, 0x00)
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(lb))
-			b = append(b, 0x47, 0x0D, 0x00)
+			b = append(b, 0x47, 0x0D, 0x00) // i32.ne + br_if $no_lit
 		}
 
 		// Call suffix DFA via call_indirect.

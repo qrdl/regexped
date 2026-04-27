@@ -21,6 +21,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------
@@ -1700,6 +1701,247 @@ func runCompareSize(baselinePath string) bool {
 }
 
 // --------------------------------------------------------------------------
+// Set composition benchmarks (task 5.4)
+//
+// Compares:
+//   (a) regexped find_all via CompileFile — one WASM call returns all
+//       (pattern_id, start, length) tuples for all patterns simultaneously.
+//   (b) regex crate RegexSet::matches + per-pattern Regex::find_iter — the
+//       idiomatic two-pass approach needed because RegexSet returns only which
+//       patterns matched, not where. This is the real-world cost users pay.
+
+type setTestCase struct {
+	name     string
+	patterns []string
+	inputs   []namedInput
+}
+
+var setTests = []setTestCase{
+	{
+		name: "secrets-10-set",
+		patterns: []string{
+			`AKIA[0-9A-Z]{16}`,
+			`aws_secret_access_key\s*=\s*[0-9a-zA-Z/+]{40}`,
+			`ghp_[0-9a-zA-Z]{36}`,
+			`gho_[0-9a-zA-Z]{36}`,
+			`ghu_[0-9a-zA-Z]{36}`,
+			`eyJ[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]{20,}\.`,
+			`xox[baprs]-[0-9a-zA-Z\-]{10,}`,
+			`sk_live_[0-9a-zA-Z]{24,}`,
+			`sk_test_[0-9a-zA-Z]{24,}`,
+			`AIza[0-9A-Za-z\-_]{35}`,
+		},
+		inputs: []namedInput{
+			{"no-secret 100KB", secretLargeInput(nil)},
+			{"3 secrets 100KB", secretLargeInput([]string{
+				"AKIAIOSFODNN7EXAMPLE",
+				"ghp_abcdefghijklmnopqrstuvwxyz123456789",
+				"sk_live_abcdefghijklmnopqrstuvwx",
+			})},
+		},
+	},
+}
+
+// benchRegexSet runs the regex crate RegexSet+rescan benchmark via the Rust harness.
+// Each iteration: (1) RegexSet::matches → which patterns, (2) Regex::find_iter per hit → positions.
+func benchRegexSet(sc setTestCase, input string, regexWasmBytes []byte, engine *wasmtime.Engine, pct int) benchResult {
+	mod, err := wasmtime.NewModule(engine, regexWasmBytes)
+	if err != nil {
+		return benchResult{}
+	}
+	linker := wasmtime.NewLinker(engine)
+	_ = linker.DefineWasi()
+	store := wasmtime.NewStore(engine)
+	store.SetWasi(wasmtime.NewWasiConfig())
+	inst, err := linker.Instantiate(store, mod)
+	if err != nil {
+		return benchResult{}
+	}
+	var mem *wasmtime.Memory
+	if exp := inst.GetExport(store, "memory"); exp != nil {
+		mem = exp.Memory()
+	}
+	getPatternsPtr := inst.GetFunc(store, "get_set_patterns_ptr")
+	getTimingsPtr := inst.GetFunc(store, "get_timings_ptr")
+	getInputPtr := inst.GetFunc(store, "get_input_ptr")
+	setInit := inst.GetFunc(store, "regex_set_init")
+	benchFn := inst.GetFunc(store, "regex_bench_set_find")
+	if mem == nil || getPatternsPtr == nil || getTimingsPtr == nil || getInputPtr == nil || setInit == nil || benchFn == nil {
+		return benchResult{}
+	}
+
+	// Write patterns (newline-delimited) to the patterns buffer.
+	patStr := strings.Join(sc.patterns, "\n")
+	patternsPtr, _ := getPatternsPtr.Call(store)
+	buf := mem.UnsafeData(store)
+	copy(buf[patternsPtr.(int32):], []byte(patStr))
+	if _, err := setInit.Call(store, int32(len(patStr))); err != nil {
+		return benchResult{}
+	}
+
+	// Write input to the input buffer.
+	inputPtrRes, _ := getInputPtr.Call(store)
+	copy(buf[inputPtrRes.(int32):], []byte(input))
+
+	// Warmup.
+	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
+		benchFn.Call(store, int32(len(input)), int32(benchIters)) //nolint:errcheck
+	}
+
+	// Benchmark.
+	if _, err := benchFn.Call(store, int32(len(input)), int32(benchIters)); err != nil {
+		return benchResult{}
+	}
+	timingsPtrRes, _ := getTimingsPtr.Call(store)
+	return benchResult{avgExec: computeStat(buf[timingsPtrRes.(int32):timingsPtrRes.(int32)+timingsBytes], pct)}
+}
+
+// benchRegexpedSet compiles the patterns as a regexped set and benchmarks find_all.
+// Timing is Go-level (one time.Since per full-input exhaustion pass).
+// CGo overhead (~1µs per call) is negligible vs. 100KB input scan times.
+func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct int) benchResult {
+	entries := make([]config.RegexEntry, len(sc.patterns))
+	for i, p := range sc.patterns {
+		entries[i] = config.RegexEntry{Pattern: p}
+	}
+	cfg := config.BuildConfig{
+		Regexes: entries,
+		Sets: []config.SetConfig{
+			{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasmBytes, tableEnd, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped set compile: %v\n", err)
+		return benchResult{}
+	}
+
+	mod, err := wasmtime.NewModule(engine, wasmBytes)
+	if err != nil {
+		return benchResult{}
+	}
+	store := wasmtime.NewStore(engine)
+	store.SetWasi(wasmtime.NewWasiConfig())
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		return benchResult{}
+	}
+	var mem *wasmtime.Memory
+	if exp := inst.GetExport(store, "memory"); exp != nil {
+		mem = exp.Memory()
+	}
+	findFn := inst.GetFunc(store, "find_all")
+	if mem == nil || findFn == nil {
+		return benchResult{}
+	}
+
+	// Determine memory layout: input goes after tables, output after input.
+	// tableEnd covers per-pattern tables; set DFA tables also start near 0.
+	// ParseDataSectionBytes finds the actual highest data segment address so
+	// we never write input on top of DFA data.
+	const pageSize = 65536
+	actualTop := tableEnd
+	if top, err2 := utils.ParseDataSectionBytes(wasmBytes); err2 == nil && top > actualTop {
+		actualTop = top
+	}
+	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
+	outBase := inBase + int32(len(input)) + 4096
+	// Ensure enough memory pages.
+	neededPages := uint64((int64(outBase) + 4096*3 + pageSize - 1) / pageSize)
+	curPages := mem.Size(store)
+	if neededPages > curPages {
+		mem.Grow(store, neededPages-curPages) //nolint:errcheck
+	}
+
+	// Write input into WASM memory.
+	buf := mem.UnsafeData(store)
+	copy(buf[inBase:], []byte(input))
+
+	const outCap = int32(256)
+
+	// Warmup: exhaust all matches a few times.
+	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
+		startPos := int32(0)
+		for {
+			n, err := findFn.Call(store, inBase, int32(len(input)), outBase, outCap, startPos)
+			if err != nil || n.(int32) <= 0 {
+				break
+			}
+			b := mem.UnsafeData(store)
+			last := n.(int32) - 1
+			start := b[int(outBase)+int(last)*12+4 : int(outBase)+int(last)*12+8]
+			length := b[int(outBase)+int(last)*12+8 : int(outBase)+int(last)*12+12]
+			s := int32(start[0]) | int32(start[1])<<8 | int32(start[2])<<16 | int32(start[3])<<24
+			l := int32(length[0]) | int32(length[1])<<8 | int32(length[2])<<16 | int32(length[3])<<24
+			if l <= 0 {
+				l = 1
+			}
+			startPos = s + l
+		}
+	}
+
+	// Benchmark: time each full exhaustion pass.
+	const setIters = 1000
+	timings := make([]time.Duration, setIters)
+	for i := range timings {
+		t0 := time.Now()
+		startPos := int32(0)
+		for {
+			n, err := findFn.Call(store, inBase, int32(len(input)), outBase, outCap, startPos)
+			if err != nil || n.(int32) <= 0 {
+				break
+			}
+			b := mem.UnsafeData(store)
+			last := n.(int32) - 1
+			start := b[int(outBase)+int(last)*12+4 : int(outBase)+int(last)*12+8]
+			length := b[int(outBase)+int(last)*12+8 : int(outBase)+int(last)*12+12]
+			s := int32(start[0]) | int32(start[1])<<8 | int32(start[2])<<16 | int32(start[3])<<24
+			l := int32(length[0]) | int32(length[1])<<8 | int32(length[2])<<16 | int32(length[3])<<24
+			if l <= 0 {
+				l = 1
+			}
+			startPos = s + l
+		}
+		timings[i] = time.Since(t0)
+	}
+
+	// Compute pct percentile.
+	ns := make([]byte, setIters*4)
+	for i, d := range timings {
+		v := uint32(d.Nanoseconds())
+		ns[i*4] = byte(v)
+		ns[i*4+1] = byte(v >> 8)
+		ns[i*4+2] = byte(v >> 16)
+		ns[i*4+3] = byte(v >> 24)
+	}
+	return benchResult{avgExec: computeStat(ns, pct), wasmSize: len(wasmBytes)}
+}
+
+// runSetBenchmarks runs all set composition benchmarks and prints the results.
+func runSetBenchmarks(regexWasmBytes []byte, engine *wasmtime.Engine, pct int) {
+	const setFindLabel = "set find_all (regexped) vs RegexSet+rescan (regex crate)"
+	fmt.Printf("\n%s\n%s\n\n", setFindLabel, strings.Repeat("─", len(setFindLabel)))
+	fmt.Printf("%-32s  %14s  %14s  %8s\n", "", "regex-crate", "regexped-set", "speedup")
+	fmt.Printf("%-32s  %14s  %14s  %8s\n", "", "(RegexSet+rescan)", "(find_all)", "")
+	fmt.Println(strings.Repeat("─", 75))
+
+	for _, sc := range setTests {
+		fmt.Printf("\n=== %s (%d patterns) ===\n", sc.name, len(sc.patterns))
+		for _, inp := range sc.inputs {
+			rxp := benchRegexSet(sc, inp.value, regexWasmBytes, engine, pct)
+			rped := benchRegexpedSet(sc, inp.value, engine, pct)
+			ratio := ""
+			if rxp.avgExec > 0 && rped.avgExec > 0 {
+				ratio = fmt.Sprintf("%.2fx", float64(rxp.avgExec)/float64(rped.avgExec))
+			}
+			fmt.Printf("  input: %s (%d bytes)\n", inp.label, len(inp.value))
+			fmt.Printf("    p%d execution:  %14s  %14s  %8s\n",
+				pct, fmtDur(rxp.avgExec), fmtDur(rped.avgExec), ratio)
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
 // Main
 
 func main() {
@@ -1710,6 +1952,7 @@ func main() {
 	fuel := flag.Bool("fuel", false, "measure fuel (WASM instruction count) for a single call instead of timing")
 	pct := flag.Int("p", 0, "report this percentile (1-99) instead of average (e.g. -p 95)")
 	sizeOnly := flag.Bool("size-only", false, "print WASM module sizes per test case and exit (no harness required)")
+	sets := flag.Bool("sets", false, "run set composition benchmarks (regexped find_all vs regex crate RegexSet+rescan)")
 	compareTime := flag.String("compare-time", "", "compare speedup ratio (rxp/rped p50) against baseline file; exit 1 if outside ±10%")
 	compareFuel := flag.String("compare-fuel", "", "compare fuel counts against baseline file; exit 1 if outside ±20% (TDFA non-determinism budget)")
 	compareSize := flag.String("compare-size", "", "compare WASM sizes against baseline file; exit 1 if outside ±5%")
@@ -1762,6 +2005,16 @@ func main() {
 		if !runCompareFuel(*compareFuel, regexWasmBytes, fuelEngine) {
 			os.Exit(1)
 		}
+		return
+	}
+
+	// --sets runs set composition benchmarks.
+	if *sets {
+		pctVal := *pct
+		if pctVal == 0 {
+			pctVal = 50
+		}
+		runSetBenchmarks(regexWasmBytes, engine, pctVal)
 		return
 	}
 

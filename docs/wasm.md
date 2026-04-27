@@ -147,3 +147,73 @@ TDFA uses the same DFA table format described above (u8 or u16 state IDs,
 with optional byte-class compression). Capture register operations are emitted
 as inline WASM locals and `br_table` dispatch in the function body — they are
 not stored in the table.
+
+---
+
+## Set composition exports
+
+When the config contains a `sets:` block, `regexped compile` emits additional
+WASM functions for multi-pattern matching.
+
+### find_any / find_all — non-anchored set match
+
+```wasm
+;; Set find function (one body; exported under find_any and/or find_all names).
+;; Scans input from start_pos, writes up to out_cap match tuples to out_ptr,
+;; returns count of tuples written (0 = exhausted).
+(func $find_all
+    (param $in_ptr i32) (param $in_len i32)
+    (param $out_ptr i32) (param $out_cap i32)
+    (param $start_pos i32)
+    (result i32))
+```
+
+Each tuple written to `out_ptr` is 12 bytes (3 × i32):
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0 | `pattern_id` i32 | Global YAML order index of the matching pattern |
+| +4 | `start` i32 | Absolute byte offset of the match start |
+| +8 | `length` i32 | Byte length of the match |
+
+The host advances `start_pos` to `last.start + max(last.length, 1)` after each
+batch and re-calls until the function returns 0.
+
+`find_any` uses the same function body with `out_cap=1, start_pos=0`.
+
+### match — anchored set match
+
+```wasm
+;; Anchored match: tries all patterns from position 0.
+;; Writes up to out_cap match tuples to out_ptr, returns count.
+(func $match
+    (param $in_ptr i32) (param $in_len i32)
+    (param $out_ptr i32) (param $out_cap i32)
+    (result i32))
+```
+
+Each tuple written to `out_ptr` is 8 bytes (2 × i32):
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0 | `pattern_id` i32 | Global YAML order index |
+| +4 | `end_pos` i32 | Byte position where the match ends (start is always 0) |
+
+Currently returns at most 1 match (first matching pattern). Structured so that
+removing the early-exit condition extends it to return all matches.
+
+### Suffix DFA functions (internal)
+
+Each literal bucket gets one suffix DFA function in the WASM function table:
+
+```wasm
+;; Runs the merged suffix DFA from suffix_start.
+;; Returns i64 bitmask: bit k set means pattern k in this bucket matched.
+(func $suffix_dfa_N
+    (param $ptr i32) (param $suffix_start i32) (param $len i32)
+    (result i64))
+```
+
+These are called via `call_indirect` from the set match body and are not
+exported. The bit positions in the returned bitmask are bucket-local (not
+global pattern IDs); the set match function maps them to global IDs.

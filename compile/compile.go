@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -855,6 +856,82 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 	}
 	slog.Info("Done", "bytes", len(wasmBytes))
 	return nil
+}
+
+// CmdWriteDiagJSON re-runs CompileFile, collects set diagnostics, and writes
+// the Diagnostics structure as JSON to diagPath (or stdout if diagPath == "-").
+// Independent of slog level — the JSON is always complete.
+func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
+	if len(cfg.Sets) == 0 {
+		return nil
+	}
+	// Gather diagnostics by re-running CompileFile (it already computed them;
+	// for simplicity we re-run rather than threading Diagnostics through CmdCompile).
+	var prefixPool, suffixPool dfaPool
+	nameIdx := make(map[string]int, len(cfg.Regexes))
+	for i, re := range cfg.Regexes {
+		if re.Name != "" {
+			nameIdx[re.Name] = i
+		}
+	}
+	diag := Diagnostics{PatternsTotal: len(cfg.Regexes)}
+	for _, sc := range cfg.Sets {
+		var selectedIdx []int
+		if sc.Patterns.All {
+			for i := range cfg.Regexes {
+				selectedIdx = append(selectedIdx, i)
+			}
+		} else {
+			for _, name := range sc.Patterns.Names {
+				if idx, ok := nameIdx[name]; ok {
+					selectedIdx = append(selectedIdx, idx)
+				}
+			}
+		}
+		var infos []*PatternInfo
+		var globalIDs []int
+		for _, idx := range selectedIdx {
+			re := cfg.Regexes[idx]
+			if re.CaptureStubsRequested() {
+				continue
+			}
+			info, err := analyzePattern(re, &prefixPool, &suffixPool)
+			if err != nil {
+				continue
+			}
+			infos = append(infos, info)
+			globalIDs = append(globalIDs, idx)
+		}
+		spec := SetSpec{
+			Name:       sc.Name,
+			FindAny:    sc.FindAny,
+			FindAll:    sc.FindAll,
+			Match:      sc.Match,
+			Patterns:   infos,
+			PatternIDs: globalIDs,
+		}
+		cs, err := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
+		if err != nil {
+			continue
+		}
+		if cs.diag != nil {
+			diag.Sets = append(diag.Sets, *cs.diag)
+		}
+		diag.InSet += len(infos)
+	}
+	diag.PrefixDedupPoolSize = len(prefixPool.tables)
+
+	data, err := json.MarshalIndent(diag, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal diag JSON: %w", err)
+	}
+	data = append(data, '\n')
+
+	if diagPath == "-" {
+		_, err = os.Stdout.Write(data)
+		return err
+	}
+	return os.WriteFile(diagPath, data, 0o644)
 }
 
 // stripCaptures converts all capture groups in the regexp tree to non-capturing

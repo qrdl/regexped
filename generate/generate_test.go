@@ -595,7 +595,7 @@ func TestGenASStubNamedGroupsFuncError(t *testing.T) {
 	entries := []config.RegexEntry{
 		{NamedGroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
 	}
-	_, err := genASStubFile(entries, "mymod")
+	_, err := genASStubFile(config.BuildConfig{Regexes: entries, ImportModule: "mymod"})
 	if err == nil {
 		t.Fatal("genASStubFile: expected error for named_groups_func, got nil")
 	}
@@ -605,7 +605,7 @@ func TestGenASStubFileGroupsFunc(t *testing.T) {
 	entries := []config.RegexEntry{
 		{GroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
 	}
-	out, err := genASStubFile(entries, "mymod")
+	out, err := genASStubFile(config.BuildConfig{Regexes: entries, ImportModule: "mymod"})
 	if err != nil {
 		t.Fatalf("genASStubFile: %v", err)
 	}

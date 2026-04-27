@@ -59,7 +59,8 @@ regexped/
 │   ├── go-api.md              # Generated Go API: wasip1 stubs, iter.Seq2, iter.Seq
 │   ├── js-api.md              # Generated JavaScript API: ES module, generators
 │   ├── ts-api.md              # Generated TypeScript API: typed ES module, generators
-│   └── wasm.md                # WASM interface, memory layout, table formats
+│   ├── wasm.md                # WASM interface, memory layout, table formats
+│   └── sets.md                # Set composition pipeline, YAML schema, output formats
 └── examples/
     ├── README.md
     ├── Makefile
@@ -420,5 +421,5 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 **Last Updated:** 2026-04-22
 **CLI commands:** `generate` (stubs), `compile`, `merge`
-**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals)
+**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition)
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

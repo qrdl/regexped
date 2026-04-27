@@ -113,6 +113,7 @@ func runGenerateCmd(args []string) {
 func runCompileCmd(args []string) {
 	fs := flag.NewFlagSet("compile", flag.ExitOnError)
 	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
+	diagJSON := fs.String("diag-json", "", "write set-composition diagnostics as JSON to this path (- for stdout)")
 	var out string
 	fs.StringVar(&out, "output", "", "override wasm_file from config; - writes to stdout")
 	fs.StringVar(&out, "o", "", "output file (alias for --output)")
@@ -135,6 +136,12 @@ func runCompileCmd(args []string) {
 
 	if err := compile.CmdCompile(cfg, outPath); err != nil {
 		log.Fatal(err)
+	}
+
+	if *diagJSON != "" && len(cfg.Sets) > 0 {
+		if err := compile.CmdWriteDiagJSON(cfg, outPath, *diagJSON); err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 

@@ -9,7 +9,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// jsStub generates a JS ES module stub file for all regex entries in cfg.
+// jsStub generates a JS ES module stub file for all regex entries and sets in cfg.
 // out is the full output path or "-" for stdout.
 func jsStub(cfg config.BuildConfig, out string) error {
 	content, err := genJSStubFile(cfg)
@@ -21,6 +21,78 @@ func jsStub(cfg config.BuildConfig, out string) error {
 		return err
 	}
 	return writeStub(out, []byte(content))
+}
+
+// genJSSetSection returns JS set wrappers appended to the module body.
+// Called from genJSStubFile's inner builder when cfg.Sets is non-empty.
+func genJSSetSection(cfg config.BuildConfig) string {
+	if !hasSetExports(cfg) {
+		return ""
+	}
+	var out strings.Builder
+	out.WriteString("\n// ---- set composition wrappers ----\n\n")
+	for _, s := range cfg.Sets {
+		bs := batchSize(s)
+		if s.FindAll != "" || s.FindAny != "" {
+			wasmExport := s.FindAll
+			if wasmExport == "" {
+				wasmExport = s.FindAny
+			}
+			if s.FindAll != "" {
+				fmt.Fprintf(&out, `export function* %s(input) {
+    const b = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+    const mem = new Uint8Array(_inst.exports.memory.buffer);
+    const outBuf = new Int32Array(_inst.exports.memory.buffer, 1024, %d*3);
+    let ptr = 0, startPos = 0;
+    mem.set(b, ptr);
+    while (true) {
+        const n = _inst.exports['%s'](ptr, b.length, 1024, %d, startPos);
+        if (n <= 0) break;
+        for (let i = 0; i < n; i++) {
+            yield { patternId: outBuf[i*3], start: outBuf[i*3+1], end: outBuf[i*3+1]+outBuf[i*3+2] };
+        }
+        const last = outBuf[(n-1)*3+2]; startPos = outBuf[(n-1)*3+1] + (last > 0 ? last : 1);
+    }
+}
+`, s.FindAll, bs, wasmExport, bs)
+			}
+			if s.FindAny != "" {
+				fmt.Fprintf(&out, `export function %s(input) {
+    const b = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+    const mem = new Uint8Array(_inst.exports.memory.buffer);
+    const outBuf = new Int32Array(_inst.exports.memory.buffer, 1024, 3);
+    mem.set(b, 0);
+    const n = _inst.exports['%s'](0, b.length, 1024, 1, 0);
+    if (n <= 0) return null;
+    return { patternId: outBuf[0], start: outBuf[1], end: outBuf[1]+outBuf[2] };
+}
+`, s.FindAny, wasmExport)
+			}
+		}
+		if s.Match != "" {
+			fmt.Fprintf(&out, `export function %s(input) {
+    const b = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+    const mem = new Uint8Array(_inst.exports.memory.buffer);
+    const outBuf = new Int32Array(_inst.exports.memory.buffer, 1024, 2);
+    mem.set(b, 0);
+    const n = _inst.exports['%s'](0, b.length, 1024, 1);
+    if (n <= 0) return null;
+    return { patternId: outBuf[0], end: outBuf[1] };
+}
+`, s.Match, s.Match)
+		}
+	}
+	if hasEmitNameMap(cfg) {
+		out.WriteString("const _patternNames = [")
+		for i, re := range cfg.Regexes {
+			if i > 0 {
+				out.WriteString(", ")
+			}
+			fmt.Fprintf(&out, "%q", re.Name)
+		}
+		out.WriteString("];\nexport function patternName(id) { return _patternNames[id] ?? ''; }\n")
+	}
+	return out.String()
 }
 
 // genJSStubFile generates the content of an ES module JS stub that exports
@@ -88,6 +160,7 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 		}
 	}
 
+	sb.WriteString(genJSSetSection(cfg))
 	return sb.String(), nil
 }
 

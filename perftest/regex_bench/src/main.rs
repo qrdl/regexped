@@ -18,7 +18,7 @@
 // returned by get_input_ptr() / get_output_ptr().
 
 use std::sync::OnceLock;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 
 // 512KB input buffer — large enough for the biggest test inputs (~100KB).
 static mut INPUT_BUF: [u8; 512 * 1024] = [0u8; 512 * 1024];
@@ -30,6 +30,75 @@ static mut OUTPUT_BUF: [i32; 256] = [0i32; 256];
 static mut TIMINGS_BUF: [u32; 10_000] = [0u32; 10_000];
 
 static REGEX: OnceLock<Regex> = OnceLock::new();
+
+// --------------------------------------------------------------------------
+// Multi-pattern set benchmarking (RegexSet + per-pattern re-scan for positions)
+
+// Separate 64KB buffer for receiving newline-delimited patterns.
+static mut SET_PATTERNS_BUF: [u8; 64 * 1024] = [0u8; 64 * 1024];
+
+struct SetState {
+    set: RegexSet,
+    patterns: Vec<Regex>,
+}
+
+static SET_STATE: OnceLock<SetState> = OnceLock::new();
+
+/// Returns the address of the set-patterns buffer (newline-delimited UTF-8 patterns).
+#[no_mangle]
+pub extern "C" fn get_set_patterns_ptr() -> i32 {
+    core::ptr::addr_of!(SET_PATTERNS_BUF) as i32
+}
+
+/// Compiles N patterns from set_patterns_buf[..len] (newline-delimited).
+/// Must be called before regex_bench_set_find.
+#[no_mangle]
+pub extern "C" fn regex_set_init(len: i32) {
+    let data = unsafe {
+        std::str::from_utf8(&SET_PATTERNS_BUF[..len as usize]).expect("set patterns not valid UTF-8")
+    };
+    let pats: Vec<&str> = data.split('\n').filter(|s| !s.is_empty()).collect();
+    let set = RegexSet::new(&pats).expect("invalid regex set");
+    let patterns: Vec<Regex> = pats.iter()
+        .map(|p| Regex::new(p).expect("invalid pattern"))
+        .collect();
+    let _ = SET_STATE.set(SetState { set, patterns });
+}
+
+/// Benchmarks the two-pass RegexSet approach:
+///   Pass 1: RegexSet::matches(input) → which patterns match (no positions)
+///   Pass 2: for each matched pattern, Regex::find_iter(input) → positions
+///
+/// This is the idiomatic way to get positions out of RegexSet, and is exactly
+/// the extra cost that regexped's find_all avoids by returning positions directly.
+///
+/// Times each full two-pass scan over the input; writes ns per iteration to TIMINGS_BUF.
+#[no_mangle]
+pub extern "C" fn regex_bench_set_find(input_len: i32, iters: i32) {
+    let state = SET_STATE.get().expect("set not initialised — call regex_set_init first");
+    let input = unsafe { std::str::from_utf8_unchecked(&INPUT_BUF[..input_len as usize]) };
+    let timings = unsafe { &mut *core::ptr::addr_of_mut!(TIMINGS_BUF) };
+    let mut prev = std::time::Instant::now();
+    for i in 0..iters as usize {
+        // Pass 1: which patterns match? (no positions)
+        let matched: Vec<usize> = state.set
+            .matches(std::hint::black_box(input))
+            .into_iter()
+            .collect();
+        // Pass 2: for each matched pattern, re-scan for positions
+        let mut total: usize = 0;
+        for pat_idx in &matched {
+            for m in state.patterns[*pat_idx].find_iter(input) {
+                let _ = std::hint::black_box((m.start(), m.end(), pat_idx));
+                total += 1;
+            }
+        }
+        let _ = std::hint::black_box(total);
+        let cur = std::time::Instant::now();
+        timings[i] = cur.duration_since(prev).as_nanos() as u32;
+        prev = cur;
+    }
+}
 
 fn main() {}
 

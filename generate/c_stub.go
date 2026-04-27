@@ -20,7 +20,7 @@ func cStub(cfg config.BuildConfig, out string) error {
 		hBase = filepath.Base(base + ".h")
 	}
 
-	hContent, cContent, err := genCStubFiles(cfg.Regexes, cfg.ImportModule, hBase)
+	hContent, cContent, err := genCStubFilesWithSets(cfg, hBase)
 	if err != nil {
 		return fmt.Errorf("generate C stub: %w", err)
 	}
@@ -52,9 +52,6 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 			parts = append(parts, entryParts{h, c})
 		}
 	}
-	if len(parts) == 0 {
-		return "", "", nil
-	}
 
 	var hb, cb strings.Builder
 
@@ -65,6 +62,8 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 	hb.WriteString("#define REGEXPED_TYPES_DEFINED\n")
 	hb.WriteString("typedef struct { int start; int end; } rx_match_t;\n")
 	hb.WriteString("typedef struct { int start; int end; const char *name; } rx_group_t;\n")
+	hb.WriteString("typedef struct { int pattern_id; int start; int end; } rx_set_match_t;\n")
+	hb.WriteString("typedef struct { int pattern_id; int end; } rx_set_anchor_t;\n")
 	hb.WriteString("#endif\n\n")
 
 	// .c file
@@ -76,7 +75,94 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 		cb.WriteString(p.c)
 	}
 
+	if len(parts) == 0 && !hasSetExports(config.BuildConfig{Sets: nil}) {
+		return "", "", nil
+	}
+
 	return hb.String(), cb.String(), nil
+}
+
+// cStubWithSets updates genCStubFiles to also handle sets.
+func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, cContent string, err error) {
+	hContent, cContent, err = genCStubFiles(cfg.Regexes, cfg.ImportModule, hBasename)
+	if err != nil {
+		return
+	}
+	if !hasSetExports(cfg) {
+		return
+	}
+	var hb, cb strings.Builder
+	hb.WriteString(hContent)
+	cb.WriteString(cContent)
+	for _, s := range cfg.Sets {
+		if s.FindAll != "" || s.FindAny != "" {
+			wasmExport := s.FindAll
+			if wasmExport == "" {
+				wasmExport = s.FindAny
+			}
+			fmt.Fprintf(&hb, `__attribute__((import_module("%s"), import_name("%s")))
+int ffi_%s(const char *ptr, int len, int *out, int cap, int start);
+`, cfg.ImportModule, wasmExport, wasmExport)
+			if s.FindAll != "" {
+				fmt.Fprintf(&hb, "int %s_next(const char *input, int len, rx_set_match_t *out);\nvoid %s_reset(void);\n\n", s.FindAll, s.FindAll)
+				fmt.Fprintf(&cb, `static int _start_%s = 0; static int _buf_%s[3];
+int %s_next(const char *input, int len, rx_set_match_t *out) {
+    int n = ffi_%s(input, len, _buf_%s, 1, _start_%s);
+    if (n <= 0) return 0;
+    out->pattern_id = _buf_%s[0]; out->start = _buf_%s[1]; out->end = _buf_%s[1]+_buf_%s[2];
+    _start_%s = _buf_%s[1] + (_buf_%s[2] > 0 ? _buf_%s[2] : 1);
+    return 1;
+}
+void %s_reset(void) { _start_%s = 0; }
+`, s.FindAll, s.FindAll, s.FindAll, wasmExport, s.FindAll, s.FindAll,
+					s.FindAll, s.FindAll, s.FindAll, s.FindAll,
+					s.FindAll, s.FindAll, s.FindAll, s.FindAll,
+					s.FindAll, s.FindAll)
+			}
+			if s.FindAny != "" {
+				anyFFI := "ffi_" + s.FindAny
+				if s.FindAll != "" {
+					anyFFI = "ffi_" + s.FindAll
+				}
+				fmt.Fprintf(&hb, "int %s(const char *input, int len, rx_set_match_t *out);\n\n", s.FindAny)
+				fmt.Fprintf(&cb, `int %s(const char *input, int len, rx_set_match_t *out) {
+    int buf[3];
+    if (%s(input, len, buf, 1, 0) <= 0) return 0;
+    out->pattern_id = buf[0]; out->start = buf[1]; out->end = buf[1]+buf[2];
+    return 1;
+}
+`, s.FindAny, anyFFI)
+			}
+		}
+		if s.Match != "" {
+			fmt.Fprintf(&hb, `__attribute__((import_module("%s"), import_name("%s")))
+int ffi_%s(const char *ptr, int len, int *out, int cap);
+int %s(const char *input, int len, rx_set_anchor_t *out);
+
+`, cfg.ImportModule, s.Match, s.Match, s.Match)
+			fmt.Fprintf(&cb, `int %s(const char *input, int len, rx_set_anchor_t *out) {
+    int buf[2];
+    if (ffi_%s(input, len, buf, 1) <= 0) return 0;
+    out->pattern_id = buf[0]; out->end = buf[1];
+    return 1;
+}
+`, s.Match, s.Match)
+		}
+	}
+	if hasEmitNameMap(cfg) {
+		hb.WriteString("const char *pattern_name(int id);\n\n")
+		cb.WriteString("static const char *_pattern_names[] = {")
+		for i, re := range cfg.Regexes {
+			if i > 0 {
+				cb.WriteString(", ")
+			}
+			fmt.Fprintf(&cb, "%q", re.Name)
+		}
+		cb.WriteString("};\nconst char *pattern_name(int id) { int n=sizeof(_pattern_names)/sizeof(*_pattern_names); return (id>=0&&id<n)?_pattern_names[id]:\"\"; }\n")
+	}
+	hContent = hb.String()
+	cContent = cb.String()
+	return
 }
 
 // genCPartsForEntry generates the .h and .c fragments for one regex entry.
