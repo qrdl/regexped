@@ -1885,6 +1885,22 @@ func buildSuffixBody(l *dfaLayout, bitmaskOff int32, tableMemIdx int) []byte {
 	b = append(b, 0x20, paramStart, 0x21, lPos) // pos = start
 	// lEndPos, lBits, lResult = 0 (default)
 
+	// Check if the start state itself is accepting (handles patterns where the
+	// suffix can match empty string, e.g. when the mandatory literal is the
+	// whole pattern). Load bitmask[wasmStart] and update result/endPos if nonzero.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, bitmaskOff)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(l.wasmStart))
+	b = append(b, 0x41, 0x03, 0x74, 0x6A) // wasmStart * 8; bitmaskOff + wasmStart*8
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x21, lBits)                     // lBits = bitmask[wasmStart]
+	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52)   // bits != 0
+	b = append(b, 0x04, 0x40)                      // if
+	b = append(b, 0x20, paramStart, 0x21, lEndPos) // endPos = paramStart (empty suffix match)
+	b = append(b, 0x20, lBits, 0x21, lResult)      // result = bits
+	b = append(b, 0x0B)                            // end if
+
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $main
 
@@ -1946,13 +1962,17 @@ func buildSuffixBody(l *dfaLayout, bitmaskOff int32, tableMemIdx int) []byte {
 	b = append(b, 0x0B) // end loop $main
 	b = append(b, 0x0B) // end block $done
 
-	// return (i64(endPos) << 32) | result
-	b = append(b, 0x20, lEndPos)       // push endPos (i32)
-	b = append(b, 0xAD)                // i64.extend_i32_u
-	b = append(b, 0x42, 0x20)          // i64.const 32
-	b = append(b, 0x86)                // i64.shl
-	b = append(b, 0x20, lResult, 0x84) // lResult; i64.or
-	b = append(b, 0x0B)                // end function
+	// return (i64(endPos) << 32) | (result & 0xFFFFFFFF)
+	// Mask result to low 32 bits — high bits corrupt endPos when ORing.
+	b = append(b, 0x20, lEndPos) // push endPos (i32)
+	b = append(b, 0xAD)          // i64.extend_i32_u
+	b = append(b, 0x42, 0x20)    // i64.const 32
+	b = append(b, 0x86)          // i64.shl
+	b = append(b, 0x20, lResult) // push lResult
+	b = append(b, 0xA7)          // i32.wrap_i64 (keep low 32 bits)
+	b = append(b, 0xAD)          // i64.extend_i32_u (zero-extend)
+	b = append(b, 0x84)          // i64.or
+	b = append(b, 0x0B)          // end function
 	return b
 }
 

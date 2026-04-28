@@ -686,8 +686,12 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 					classMap:     p.suffixClassMap,
 					numClasses:   p.suffixClasses,
 				}
-				if p.suffixDFA != nil {
-					nb.suffixDFA = p.suffixDFA
+				// Build the bucket's suffix DFA with correct bitmask accepts (bit 0 = pattern 0).
+				// p.suffixDFA is built without patternBits (for dedup); we need bitmask info for WASM.
+				if ast := patternSuffixAST(p); ast != nil {
+					if t, _, mergeErr := mergeSuffixDFA([]*syntax.Regexp{ast}, opts); mergeErr == nil {
+						nb.suffixDFA = t
+					}
 				}
 				litBuckets = append(litBuckets, nb)
 			}
@@ -800,11 +804,19 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 	return buckets
 }
 
-// patternSuffixAST returns the suffix AST for p, or the full-pattern AST when
-// there is no suffix split (literal at end, or no split found).
+// patternSuffixAST returns the suffix AST for p.
+// When suffixAST is nil and the pattern was splittable, the mandatory literal
+// covers the whole pattern (empty suffix) — return an empty regex so the
+// suffix DFA accepts immediately at suffix_start.
+// When the pattern was not splittable, fall back to the full pattern AST.
 func patternSuffixAST(p *PatternInfo) *syntax.Regexp {
 	if p.suffixAST != nil {
 		return p.suffixAST
+	}
+	if p.splittable {
+		// The mandatory literal IS the whole pattern; suffix is empty.
+		empty, _ := syntax.Parse("", syntax.Perl)
+		return empty
 	}
 	re, err := syntax.Parse(p.fullPattern, syntax.Perl)
 	if err != nil {

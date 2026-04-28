@@ -14,6 +14,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 const (
@@ -55,6 +56,7 @@ func main() {
 	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors, skips WASM testing)")
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
 	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find (sets MaxDFAStates=1 so DFA always overflows to BT)")
+	setsMode := flag.Bool("sets", false, "test set find_all: compile each regexps block as a set and verify all matches against col4/col1 expected results")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -62,13 +64,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack); err != nil {
+	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool) error {
+func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool) error {
 	f, err := os.Open(testFile)
 	if err != nil {
 		return err
@@ -79,6 +81,15 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 	cfg.SetEpochInterruption(true)
 	engine := wasmtime.NewEngineWithConfig(cfg)
 	wd := newWatchdog(engine)
+
+	// Set-mode state: collect eligible patterns per regexps block, test at block boundaries.
+	var (
+		setBlockEntries []setBlockEntry // eligible patterns for current block
+		setBlockStrings []string        // testStrings saved when "regexps" was seen
+		setCurrentEntry *setBlockEntry  // entry being populated (nil = ineligible pattern)
+		npassSet        int
+		nfailSet        int
+	)
 
 	var (
 		testStrings []string
@@ -135,11 +146,31 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			continue
 
 		case line == "strings":
+			if setsMode && !inStrings && len(setBlockEntries) >= 2 {
+				p, f, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+				npassSet += p
+				nfailSet += f
+				if testErr != nil {
+					return testErr
+				}
+				if maxErrors > 0 && nfailSet >= maxErrors {
+					fmt.Printf("Stopping after %d set failure(s)\n", nfailSet)
+					stopped = true
+					goto done
+				}
+			}
 			testStrings = testStrings[:0]
 			inStrings = true
+			if setsMode {
+				setBlockEntries = setBlockEntries[:0]
+				setCurrentEntry = nil
+			}
 
 		case line == "regexps":
 			inStrings = false
+			if setsMode {
+				setBlockStrings = append([]string(nil), testStrings...)
+			}
 
 		case line[0] == '"':
 			q, err := strconv.Unquote(line)
@@ -159,6 +190,14 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 
 			pattern = q
+			if setsMode {
+				if preCheck(q) == "" {
+					setBlockEntries = append(setBlockEntries, setBlockEntry{pattern: q})
+					setCurrentEntry = &setBlockEntries[len(setBlockEntries)-1]
+				} else {
+					setCurrentEntry = nil
+				}
+			}
 			store, matchFn, memory = nil, nil, nil
 			findFn, findMemory = nil, nil
 			groupsStore, groupsFn, groupsMemory, numGroups, groupsIsBacktrack = nil, nil, nil, 0, false
@@ -260,6 +299,11 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 			text := input[0]
 			input = input[1:]
+
+			// Collect result line for set mode.
+			if setsMode && setCurrentEntry != nil {
+				setCurrentEntry.results = append(setCurrentEntry.results, line)
+			}
 
 			// Pattern was skipped — consume the result line without testing.
 			if store == nil && groupsStore == nil && !validateGo {
@@ -623,6 +667,16 @@ done:
 		return fmt.Errorf("out of sync: %d strings left at EOF", len(input))
 	}
 
+	// Test the final block (not triggered by a "strings" line).
+	if setsMode && !stopped && !inStrings && len(setBlockEntries) >= 2 {
+		p, f, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+		npassSet += p
+		nfailSet += f
+		if testErr != nil {
+			return testErr
+		}
+	}
+
 	totalSkipped := 0
 	for _, n := range skipCount {
 		totalSkipped += n
@@ -648,13 +702,196 @@ done:
 		}
 	}
 
+	if setsMode {
+		fmt.Printf("\n=== Set Mode Results ===\n")
+		fmt.Printf("passed:  %d\n", npassSet)
+		fmt.Printf("failed:  %d\n", nfailSet)
+	}
+
 	if nDataErrors > 0 {
 		return fmt.Errorf("%d data error(s) — fix test file expectations", nDataErrors)
 	}
 	if nfail > 0 {
 		return fmt.Errorf("%d test(s) failed", nfail)
 	}
+	if nfailSet > 0 {
+		return fmt.Errorf("%d set test(s) failed", nfailSet)
+	}
 	return nil
+}
+
+// setBlockEntry holds one eligible pattern from a regexps block plus its result lines.
+type setBlockEntry struct {
+	pattern string
+	results []string // one result line per testString
+}
+
+const (
+	setOutCap        = 1024 // max tuples per find_all batch
+	setOutTupleBytes = 12   // (pattern_id i32, start i32, length i32)
+)
+
+// testSetBlock compiles all patterns in entries as a set and runs find_all against
+// each string, comparing results against the per-pattern col4 (all matches) or col1
+// (first match) expected values from the re2 test data.
+func testSetBlock(
+	entries []setBlockEntry,
+	testStrings []string,
+	engine *wasmtime.Engine,
+	wd *watchdog,
+	verbose bool,
+) (npass, nfail int, err error) {
+	// Only include patterns with a mandatory literal — patterns without one go to
+	// the fallback bucket which is currently not scanned by emitSetMatchFnFinal.
+	type eligibleEntry struct {
+		orig  int // index into entries
+		entry setBlockEntry
+	}
+	var eligible []eligibleEntry
+	for i, e := range entries {
+		if compile.HasMandatoryLit(e.pattern) {
+			eligible = append(eligible, eligibleEntry{orig: i, entry: e})
+		}
+	}
+	if len(eligible) < 2 {
+		return // not enough non-fallback patterns to form a set
+	}
+
+	regexes := make([]config.RegexEntry, len(eligible))
+	for i, e := range eligible {
+		regexes[i] = config.RegexEntry{Pattern: e.entry.pattern}
+	}
+	cfg := config.BuildConfig{
+		Regexes: regexes,
+		Sets: []config.SetConfig{
+			{Name: "test", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+
+	wasmBytes, _, compErr := compile.CompileFile(cfg, "")
+	if compErr != nil {
+		return // skip this block silently on compile error
+	}
+
+	mod, modErr := wasmtime.NewModule(engine, wasmBytes)
+	if modErr != nil {
+		return
+	}
+	store := wasmtime.NewStore(engine)
+	store.SetEpochDeadline(1)
+	inst, instErr := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if instErr != nil {
+		return
+	}
+	var mem *wasmtime.Memory
+	if exp := inst.GetExport(store, "memory"); exp != nil {
+		mem = exp.Memory()
+	}
+	findAllFn := inst.GetFunc(store, "find_all")
+	if mem == nil || findAllFn == nil {
+		return
+	}
+
+	// Place input after DFA tables (page-aligned), output after input.
+	const pageSize = 65536
+	dataTop, _ := utils.ParseDataSectionBytes(wasmBytes)
+	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+	outBase := inBase + int32(pageSize) // one page after input
+	outBytes := int64(setOutCap * setOutTupleBytes)
+
+	neededPages := uint64((int64(outBase) + outBytes + pageSize - 1) / pageSize)
+	if cur := mem.Size(store); neededPages > cur {
+		if _, growErr := mem.Grow(store, neededPages-cur); growErr != nil {
+			return
+		}
+	}
+
+	buf := mem.UnsafeData(store)
+
+nextString:
+	for si, text := range testStrings {
+		if hasUnicode(text) {
+			continue
+		}
+		if len(text) > 0 {
+			copy(buf[inBase:], []byte(text))
+		}
+
+		// Collect all find_all matches: gotMatches[patternID] = [][2]int{start,end}
+		gotMatches := make(map[int32][][2]int, len(entries))
+		startPos := int32(0)
+		for {
+			wd.Arm(store)
+			result, callErr := findAllFn.Call(store, inBase, int32(len(text)), outBase, int32(setOutCap), startPos)
+			wd.Disarm()
+			if callErr != nil {
+				continue nextString // timeout or error — skip string
+			}
+			count := result.(int32)
+			if count == 0 {
+				break
+			}
+			var lastStart, lastLen int32
+			for i := int32(0); i < count; i++ {
+				base := int(outBase) + int(i)*setOutTupleBytes
+				pid := int32(buf[base]) | int32(buf[base+1])<<8 | int32(buf[base+2])<<16 | int32(buf[base+3])<<24
+				start := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
+				length := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
+				gotMatches[pid] = append(gotMatches[pid], [2]int{int(start), int(start + length)})
+				lastStart, lastLen = start, length
+			}
+			if lastLen > 0 {
+				startPos = lastStart + lastLen
+			} else {
+				startPos = lastStart + 1
+			}
+		}
+
+		// Compare against each eligible pattern's expected results.
+		// pattern_id in the set output = index into eligible[].
+		for pi, el := range eligible {
+			if si >= len(el.entry.results) {
+				continue
+			}
+			cols := strings.Split(el.entry.results[si], ";")
+
+			// Prefer col4 (all matches); fall back to col1 (first match).
+			var expected [][2]int
+			hasExpected := false
+			if len(cols) >= 5 {
+				col4 := strings.TrimSpace(cols[4])
+				if col4 != "" {
+					expected = parseCol4(col4)
+					hasExpected = true
+				}
+			}
+			if !hasExpected && len(cols) >= 2 {
+				col1 := strings.TrimSpace(cols[1])
+				if col1 != "" && col1 != "-" {
+					if r := parseCol1(col1); r != -1 {
+						expected = [][2]int{{int(r >> 32), int(uint32(r))}}
+					}
+				}
+				hasExpected = true
+			}
+			if !hasExpected {
+				continue // no expected data for this column
+			}
+
+			got := gotMatches[int32(pi)]
+			if col4WasmEqual(got, expected) {
+				npass++
+				if verbose {
+					fmt.Printf("PASS set pattern[%d] (orig %d): %q input=%q\n", pi, el.orig, el.entry.pattern, text)
+				}
+			} else {
+				nfail++
+				fmt.Printf("FAIL  set pattern[%d] (orig %d): %q\n      input:    %q\n      expected: %s\n      got:      %s\n",
+					pi, el.orig, el.entry.pattern, text, fmtCol4(expected), fmtCol4Wasm(got))
+			}
+		}
+	}
+	return
 }
 
 const wasmCallTimeout = 2 * time.Second

@@ -1,4 +1,4 @@
-.PHONY: test exhaustive custom adjusted clean
+.PHONY: test exhaustive custom adjusted sets clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -27,6 +27,9 @@ force-backtrack: $(ADJUSTED)
 	go run . --force-backtrack --validate-groups $(CUSTOM)
 
 test: exhaustive custom adjusted force-backtrack
+
+sets: $(TESTDATA)
+	go run . --sets $(TESTDATA)
 
 clean:
 	rm -f $(TESTDATA) $(ADJUSTED)

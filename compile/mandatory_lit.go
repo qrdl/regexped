@@ -31,6 +31,13 @@ type mandatoryLit struct {
 
 // findMandatoryLit analyzes the regex pattern and returns the first mandatory
 // literal found (with its min/max offset from match start). Returns nil if no
+// HasMandatoryLit reports whether pattern has a non-empty mandatory literal
+// that can anchor it in set composition. Patterns without one go to the
+// fallback bucket which is currently not scanned by emitSetMatchFnFinal.
+func HasMandatoryLit(pattern string) bool {
+	return findMandatoryLit(pattern) != nil
+}
+
 // mandatory literal is found or if MaxOff > 256.
 // Does NOT call Simplify() so that OpPlus/OpRepeat are preserved.
 func findMandatoryLit(pattern string) *mandatoryLit {
