@@ -197,6 +197,8 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				} else {
 					setCurrentEntry = nil
 				}
+				input = append([]string(nil), testStrings...)
+				continue // skip single-pattern compilation in sets mode
 			}
 			store, matchFn, memory = nil, nil, nil
 			findFn, findMemory = nil, nil
@@ -879,7 +881,23 @@ nextString:
 			}
 
 			got := gotMatches[int32(pi)]
-			if col4WasmEqual(got, expected) {
+			var matchOk bool
+			if len(cols) >= 5 && strings.TrimSpace(cols[4]) != "" {
+				// col4 available: exact match required.
+				matchOk = col4WasmEqual(got, expected)
+			} else if expected == nil {
+				// col1 = "-": no match expected.
+				matchOk = len(got) == 0
+			} else {
+				// col1 only: the expected first match must appear in got.
+				for _, g := range got {
+					if g == expected[0] {
+						matchOk = true
+						break
+					}
+				}
+			}
+			if matchOk {
 				npass++
 				if verbose {
 					fmt.Printf("PASS set pattern[%d] (orig %d): %q input=%q\n", pi, el.orig, el.entry.pattern, text)

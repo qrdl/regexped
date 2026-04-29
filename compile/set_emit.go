@@ -136,13 +136,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	diag.Frontend = fe.String()
 
 	// Build suffix DFA function bodies, one per bucket.
+	// The suffix DFA now writes match tuples directly (Option C); no startMask needed.
 	suffixFnBodies := make([][]byte, len(buckets))
 	var allDataBytes []byte
 	var totalDataSegs int
 	var tableOffset int32 = 0 // data segment base for this set's tables
 
 	for bi, bkt := range buckets {
-		fnBody, dataBytes, dataSegs := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), 0)
+		fnBody, dataBytes, dataSegs := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), 0, patternIDs[bi])
 		suffixFnBodies[bi] = fnBody
 		tableOffset += int32(len(dataBytes))
 		allDataBytes = append(allDataBytes, dataBytes...)
@@ -170,93 +171,60 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 // emitSetMatchFnAnchored emits the WASM function body for the anchored `match`
 // export. Signature: (in_ptr i32, in_len i32, out_ptr i32, out_cap i32) → i32.
 //
-// No literal scan — calls each bucket's suffix DFA from position 0. Returns
-// the first match as a (pattern_id, end_pos) tuple (8 bytes, 2×i32) written to
-// out_ptr, then returns count (0 or 1 currently; structured for easy extension
-// to all-matches by removing the early-exit after the first hit).
-//
-// tableBase is the first element-table index of cs's suffix functions.
+// Checks each bucket's literal at position 0, then calls the suffix DFA which
+// writes (patternID, matchStart=0, matchLength) tuples directly to out_ptr.
 func emitSetMatchFnAnchored(cs *compiledSet, tableBase int) []byte {
-	// Params: in_ptr(0 i32), in_len(1 i32), out_ptr(2 i32), out_cap(3 i32)
-	// Locals: bitmask(4 i64), out_count(5 i32), tmp(6 i32)
 	const (
 		pInPtr    = byte(0)
 		pInLen    = byte(1)
 		pOutPtr   = byte(2)
 		pOutCap   = byte(3)
-		lBitmask  = byte(4)
-		lOutCount = byte(5)
-		lTmp      = byte(6)
+		lOutCount = byte(4)
 	)
 	var b []byte
-	// 2 local groups: (2 × i32: out_count, tmp), (1 × i64: bitmask)
-	b = append(b, 0x02, 0x02, 0x7F, 0x01, 0x7E)
+	// 1 local: lOutCount i32
+	b = append(b, 0x01, 0x01, 0x7F)
 
-	// out_count = 0
-	b = append(b, 0x41, 0x00, 0x21, lOutCount)
+	b = append(b, 0x41, 0x00, 0x21, lOutCount) // lOutCount = 0
 
-	// block $done
-	b = append(b, 0x02, 0x40)
-
-	// For each bucket: call suffix DFA from position 0.
-	// The loop is unrolled — one call_indirect per bucket.
-	// Early exit after the first match (remove the br $done to return all matches).
-	for bi := range cs.buckets {
-		// bitmask = call_indirect suffixFn(in_ptr, 0, in_len)
-		b = append(b, 0x20, pInPtr)
-		b = append(b, 0x41, 0x00) // suffix_start = 0
-		b = append(b, 0x20, pInLen)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(tableBase+bi))
-		b = append(b, 0x11, byte(setMatchTypeSuffix), 0x00) // call_indirect
-		b = append(b, 0x21, lBitmask)
-
-		// Iterate bits in bitmask — one bit per pattern in this bucket.
-		for bitPos, globalID := range cs.patternIDs[bi] {
-			if bitPos >= 32 {
-				break
+	for bi, bkt := range cs.buckets {
+		lit := []byte(bkt.literal)
+		litLen := len(lit)
+		if !bkt.isFallback && litLen > 0 {
+			// Check literal at position 0.
+			b = append(b, 0x02, 0x40) // block $no_lit
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(litLen))
+			b = append(b, 0x20, pInLen, 0x4B, 0x0D, 0x00) // litLen > len: br $no_lit
+			for li, lb := range lit {
+				b = append(b, 0x20, pInPtr)
+				if li > 0 {
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, int32(li))
+					b = append(b, 0x6A)
+				}
+				b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(lb))
+				b = append(b, 0x47, 0x0D, 0x00) // i32.ne + br_if $no_lit
 			}
-			bit := uint32(1) << uint(bitPos)
-
-			// if (bitmask & bit) != 0: write (pattern_id, end_pos) and return
-			b = append(b, 0x20, lBitmask)
-			b = append(b, 0xA7) // i32.wrap_i64
+			// Call suffix DFA: (ptr, litLen, len, 0, out_ptr+lOutCount*12, cap-lOutCount)
+			b = append(b, 0x20, pInPtr)
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(bit))
-			b = append(b, 0x71)       // i32.and
-			b = append(b, 0x04, 0x40) // if
-
-			// if out_count >= out_cap: br $done
-			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)
-
-			// out_base = out_ptr + out_count * 8  (8 bytes per match tuple)
-			b = append(b, 0x20, pOutPtr)
-			b = append(b, 0x20, lOutCount, 0x41, 0x08, 0x6C, 0x6A) // + count*8
-			b = append(b, 0x21, lTmp)
-
-			// mem[base+0] = pattern_id (i32)
-			b = append(b, 0x20, lTmp)
+			b = utils.AppendSLEB128(b, int32(litLen)) // start = litLen
+			b = append(b, 0x20, pInLen)
+			b = append(b, 0x41, 0x00) // lPos = 0
+			b = append(b, 0x20, pOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A)
+			b = append(b, 0x20, pOutCap, 0x20, lOutCount, 0x6B)
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(globalID))
-			b = append(b, 0x36, 0x02, 0x00)
-
-			// mem[base+4] = in_len (end_pos = full input length for anchored match)
-			b = append(b, 0x20, lTmp, 0x20, pInLen, 0x36, 0x02, 0x04)
-
-			// out_count++
-			b = append(b, 0x20, lOutCount, 0x41, 0x01, 0x6A, 0x21, lOutCount)
-
-			// Early exit after first match — remove this br to return all matches.
-			b = append(b, 0x0C, 0x01) // br $done
-
-			b = append(b, 0x0B) // end if
+			b = utils.AppendSLEB128(b, int32(tableBase+bi))
+			b = append(b, 0x11, byte(setMatchTypeSuffix), 0x00)
+			b = append(b, 0x20, lOutCount, 0x6A, 0x21, lOutCount)
+			b = append(b, 0x0B) // end block $no_lit
 		}
 	}
 
-	b = append(b, 0x0B) // end block $done
-
-	b = append(b, 0x20, lOutCount) // return out_count
-	b = append(b, 0x0B)            // end function
+	b = append(b, 0x20, lOutCount, 0x0B) // return lOutCount
 
 	funcBody := utils.AppendULEB128(nil, uint32(len(b)))
 	funcBody = append(funcBody, b...)
@@ -451,7 +419,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// 0: (i32,i32)→i32          match/backward-prefix
 	// 1: (i32,i32)→i64          find
 	// 2: (i32,i32,i32)→i32      capture/groups
-	// 3: (i32,i32,i32)→i64      suffix DFA
+	// 3: (i32×6)→i32            suffix DFA (ptr,start,len,lPos,out_ptr,out_cap)→count
 	// 4: (i32,i32)→i32          prefix backward DFA (same as 0, kept for clarity)
 	// 5: (i32×5)→i32            find_any / find_all set match body
 	// 6: (i32×4)→i32            anchored match body
@@ -461,7 +429,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E, // type 1
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 2
-		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 3
+		0x60, 0x06, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 3
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 4
 		0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 5
 		0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 6
@@ -720,11 +688,12 @@ func rebuildSetMatchBody(cs *compiledSet, suffixFnTableBase int) []byte {
 }
 
 // emitSetMatchFnFinal emits the set match function body with the given suffix-function
-// table base index. Uses a scalar literal scan; Teddy/AC is layered on in Phase 5.
+// table base index.  The suffix DFA functions now write match tuples directly (Option C),
+// so this function only does literal scanning and delegates all matching to the suffix DFAs.
 func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 	var b []byte
-	// 2 local groups: (5 × i32: pos, out_count, bitmask, out_base, end_pos), (1 × i64: call_result)
-	b = append(b, 0x02, 0x05, 0x7F, 0x01, 0x7E)
+	// locals: 3 × i32 (lPos, lOutCount, lTmp)
+	b = append(b, 0x01, 0x03, 0x7F)
 
 	const (
 		pInPtr    = byte(0)
@@ -734,10 +703,7 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 		pStartPos = byte(4)
 		lPos      = byte(5)
 		lOutCount = byte(6)
-		lTmp1     = byte(7)  // bitmask (low 32 bits of call result)
-		lTmp2     = byte(8)  // out_base pointer
-		lEndPos   = byte(9)  // first accept pos (high 32 bits of call result)
-		lCallRes  = byte(10) // full i64 from call_indirect
+		lTmp      = byte(7)
 	)
 
 	b = append(b, 0x41, 0x00, 0x21, lOutCount)
@@ -746,8 +712,8 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 	b = append(b, 0x02, 0x40) // block $batch_done
 	b = append(b, 0x03, 0x40) // loop $scan
 
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
-	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)       // if lPos >= len: br $batch_done
+	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01) // if full: br $batch_done
 
 	for bi, bkt := range cs.buckets {
 		if bkt.isFallback || bkt.literal == "" {
@@ -757,18 +723,18 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 		litLen := len(lit)
 
 		b = append(b, 0x02, 0x40) // block $no_lit
-		b = append(b, 0x20, lPos)
-		b = append(b, 0x41)
+		// if lPos + litLen > pInLen: br $no_lit
+		b = append(b, 0x20, lPos, 0x41)
 		b = utils.AppendSLEB128(b, int32(litLen))
 		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
 
+		// Check each literal byte
 		for li, lb := range lit {
-			// addr = pInPtr + lPos [+ li]
-			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A) // ptr + pos
+			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
 			if li > 0 {
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, int32(li))
-				b = append(b, 0x6A) // + li
+				b = append(b, 0x6A)
 			}
 			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 			b = append(b, 0x41)
@@ -776,57 +742,36 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int) []byte {
 			b = append(b, 0x47, 0x0D, 0x00) // i32.ne + br_if $no_lit
 		}
 
-		// Call suffix DFA via call_indirect.
+		// Literal matched: call suffix DFA with adjusted out_ptr and remaining cap.
+		// Signature: (ptr, start=lPos+litLen, len, lPos, adj_out_ptr, remaining_cap) → count
 		b = append(b, 0x20, pInPtr)
 		b = append(b, 0x20, lPos, 0x41)
 		b = utils.AppendSLEB128(b, int32(litLen))
-		b = append(b, 0x6A)
-		b = append(b, 0x20, pInLen)
-		// table index = tableBase + bi
+		b = append(b, 0x6A)         // start = lPos + litLen
+		b = append(b, 0x20, pInLen) // len
+		b = append(b, 0x20, lPos)   // lPos (match start)
+		// adj_out_ptr = pOutPtr + lOutCount * 12
+		b = append(b, 0x20, pOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A)
+		// remaining_cap = pOutCap - lOutCount
+		b = append(b, 0x20, pOutCap, 0x20, lOutCount, 0x6B)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(tableBase+bi))
-		b = append(b, 0x11, byte(setMatchTypeSuffix), 0x00)
+		b = append(b, 0x11, byte(setMatchTypeSuffix), 0x00) // call_indirect
 
-		// Store full i64 result; extract bitmask (low 32) and endPos (high 32).
-		b = append(b, 0x21, lCallRes)                                        // local.set lCallRes
-		b = append(b, 0x20, lCallRes, 0xA7, 0x21, lTmp1)                     // bitmask = i32.wrap_i64(lCallRes)
-		b = append(b, 0x20, lCallRes, 0x42, 0x20, 0x88, 0xA7, 0x21, lEndPos) // endPos = i32(lCallRes >> 32)
-
-		for bitPos, globalID := range cs.patternIDs[bi] {
-			if bitPos >= 32 {
-				break
-			}
-			bit := uint32(1) << uint(bitPos)
-			b = append(b, 0x20, lTmp1)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(bit))
-			b = append(b, 0x71) // i32.and
-			b = append(b, 0x04, 0x40)
-			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x03)
-
-			b = append(b, 0x20, pOutPtr, 0x20, lOutCount)
-			b = append(b, 0x41, 12, 0x6C, 0x6A, 0x21, lTmp2)
-			b = append(b, 0x20, lTmp2)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(globalID))
-			b = append(b, 0x36, 0x02, 0x00)
-			b = append(b, 0x20, lTmp2, 0x20, lPos, 0x36, 0x02, 0x04)
-			// length = endPos - lPos (full match length including literal)
-			b = append(b, 0x20, lTmp2, 0x20, lEndPos, 0x20, lPos, 0x6B, 0x36, 0x02, 0x08)
-			b = append(b, 0x20, lOutCount, 0x41, 0x01, 0x6A, 0x21, lOutCount)
-			b = append(b, 0x0B)
-		}
+		// lOutCount += returned count
+		b = append(b, 0x20, lOutCount, 0x6A, 0x21, lOutCount) // i32.add
 
 		b = append(b, 0x0B) // end block $no_lit
 	}
 
-	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
-	b = append(b, 0x0C, 0x00)
-	b = append(b, 0x0B) // end loop
-	b = append(b, 0x0B) // end block
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
+	b = append(b, 0x0C, 0x00)                               // br $scan
+	b = append(b, 0x0B)                                     // end loop
+	b = append(b, 0x0B)                                     // end block
 
-	b = append(b, 0x20, lOutCount, 0x0B)
+	b = append(b, 0x20, lOutCount, 0x0B) // return lOutCount
 
+	_ = lTmp // unused but reserved
 	funcBody := utils.AppendULEB128(nil, uint32(len(b)))
 	funcBody = append(funcBody, b...)
 	return funcBody

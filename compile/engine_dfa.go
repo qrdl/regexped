@@ -241,19 +241,44 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 
 // nfaBuildInputMap builds a rune→nextNFAStates map from an expanded NFA set,
 // applying leftmostFirst suppression (skip byte-consumers after InstMatch).
-func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool) map[rune][]uint32 {
+//
+// In single-pattern mode (pBits == nil) suppression is global: once any
+// InstMatch is seen, all subsequent byte-consumers are skipped.
+//
+// In multi-pattern mode (pBits != nil) suppression is per-pattern: a
+// byte-consumer at PC p is skipped only when pBits[p] != 0 and all of its
+// pattern bits have already seen their InstMatch.  This prevents one
+// pattern's early match from suppressing transitions for other patterns.
+func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool, pBits []uint64) map[rune][]uint32 {
 	m := make(map[rune][]uint32)
-	seenMatch := false
+	seenMatch := false       // single-pattern mode
+	var seenMatchBits uint64 // multi-pattern mode
+	multiPattern := leftmostFirst && pBits != nil
 	for _, pc := range expanded {
 		inst := &prog.Inst[pc]
-		if leftmostFirst && seenMatch {
-			switch inst.Op {
-			case syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
-				continue
+		if leftmostFirst {
+			if multiPattern {
+				// Per-pattern suppression: skip this byte-consumer only if ALL
+				// of its pattern bits have already matched.
+				if bits := pBits[pc]; bits != 0 && seenMatchBits&bits == bits {
+					switch inst.Op {
+					case syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+						continue
+					}
+				}
+			} else if seenMatch {
+				switch inst.Op {
+				case syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+					continue
+				}
 			}
 		}
 		if inst.Op == syntax.InstMatch {
-			seenMatch = true
+			if multiPattern {
+				seenMatchBits |= pBits[pc]
+			} else {
+				seenMatch = true
+			}
 		}
 		switch inst.Op {
 		case syntax.InstRune1:
@@ -633,7 +658,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, patternBit
 
 		// buildInputMap builds the rune→nextNFAStates map from an expanded NFA set.
 		buildInputMap := func(expanded []uint32) map[rune][]uint32 {
-			return nfaBuildInputMap(prog, expanded, leftmostFirst)
+			return nfaBuildInputMap(prog, expanded, leftmostFirst, pBits)
 		}
 
 		// expandedForNewline: expansion for '\n' bytes.
@@ -693,12 +718,36 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, patternBit
 				if dfa.hasNewlineBoundary {
 					orAccept(dfa.midAcceptingNL, nextDFAState, acceptBitsFor(nextSet, nwCtx|ecEndLine))
 				}
-				if leftmostFirst && isImmediateAccepting(nextSet, prog) {
-					bits := nfaAcceptBits(nextSet)
-					if bits == 0 {
-						bits = 1
+				if leftmostFirst {
+					if pBits != nil {
+						// Multi-pattern: per-pattern immediate acceptance.
+						// Bit k is immediately accepting iff pattern k's InstMatch
+						// appears before any of k's byte-consumers in the priority
+						// ordered NFA set.  Patterns with ongoing byte-consumers
+						// (a+, a*) are NOT marked immediately accepting here.
+						var seenByteConsumers uint64
+						var immBits uint64
+						for _, pc := range nextSet {
+							var pkBits uint64
+							if int(pc) < len(pBits) {
+								pkBits = pBits[pc]
+							}
+							switch prog.Inst[pc].Op {
+							case syntax.InstMatch:
+								immBits |= pkBits &^ seenByteConsumers
+							case syntax.InstRune, syntax.InstRune1,
+								syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+								seenByteConsumers |= pkBits
+							}
+						}
+						dfa.immediateAccepting[nextDFAState] |= immBits
+					} else if isImmediateAccepting(nextSet, prog) {
+						bits := nfaAcceptBits(nextSet)
+						if bits == 0 {
+							bits = 1
+						}
+						dfa.immediateAccepting[nextDFAState] |= bits
 					}
-					dfa.immediateAccepting[nextDFAState] |= bits
 				}
 				queue = append(queue, workItem{
 					dfaState:    nextDFAState,
@@ -1812,20 +1861,29 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 }
 
 // genSuffixWASM generates a size-prefixed WASM function body and data segments
-// for a suffix DFA with bitmask accept returns.
+// for a set suffix DFA that writes match tuples directly to the caller's output buffer.
 //
-// Function signature: (ptr i32, start i32, len i32) → i64
-// Returns (firstAcceptPos << 32) | bitmask where:
+// Function signature: (ptr i32, start i32, len i32, lPos i32, out_ptr i32, out_cap i32) → i32
 //
-//	bitmask       = OR of accept bitmasks for all states visited during the scan
-//	firstAcceptPos = pos+1 at which the first accept occurred (0 = no accept)
+// For each matching pattern k, writes a (patternID, matchStart, matchLength) tuple
+// to out_ptr[outCount*12] and returns the total count written.  All patterns are
+// handled independently: fixed-length patterns write on immediateAccept, greedy
+// patterns write after the scan ends.  This eliminates shared-endPos contamination.
 //
+// Three 8-byte-per-state bitmask tables are stored at tableBase:
+//
+//	midBitmask: midAcceptStates — any-position accept
+//	eofBitmask: acceptStates   — end-of-input accept ($ anchors)
+//	immBitmask: immediateAcceptStates — leftmost-first stop per pattern
+//
+// patternIDs[k] is the global pattern ID written into the output tuple for bit k.
 // tableBase is the memory address at which this DFA's data will be placed.
 // tableMemIdx is 0 for standalone modules (single memory).
-func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int) (funcBody []byte, dataBytes []byte, dataSegCount int) {
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs []int) (funcBody []byte, dataBytes []byte, dataSegCount int) {
 	if t == nil || t.numStates == 0 {
+		// Empty DFA: return 0 (no matches).
 		body := []byte{0x01, 0x01, 0x7F} // 1 local i32
-		body = append(body, 0x42, 0x00)  // i64.const 0
+		body = append(body, 0x41, 0x00)  // i32.const 0
 		body = append(body, 0x0B)        // end
 		funcBody = utils.AppendULEB128(nil, uint32(len(body)))
 		funcBody = append(funcBody, body...)
@@ -1834,25 +1892,35 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int) (funcBody []by
 
 	l := buildDFALayout(t, tableBase, false, true, 0)
 
-	// Place 8-byte-per-state bitmask table after all layout data.
-	bitmaskOff := int32(l.tableEnd)
-	bitmaskBytes := make([]byte, l.numWASM*8)
-	for gs, bits := range t.acceptStates {
-		if bits != 0 {
-			off := (gs + 1) * 8
-			for i := 0; i < 8; i++ {
-				bitmaskBytes[off+i] = byte(bits >> uint(i*8))
+	// Three 8-byte-per-state bitmask tables placed after all layout data.
+	midBitmaskOff := int32(l.tableEnd)
+	eofBitmaskOff := midBitmaskOff + int32(l.numWASM)*8
+	immBitmaskOff := eofBitmaskOff + int32(l.numWASM)*8
+
+	writeBitmask := func(m map[int]uint64) []byte {
+		bs := make([]byte, l.numWASM*8)
+		for gs, bits := range m {
+			if bits != 0 {
+				off := (gs + 1) * 8
+				for i := 0; i < 8; i++ {
+					bs[off+i] = byte(bits >> uint(i*8))
+				}
 			}
 		}
+		return bs
 	}
 
-	// Get layout data segments (stripping the count prefix), then append bitmask.
 	layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false))
 	dataBytes = append(dataBytes, layoutRaw...)
-	dataBytes = append(dataBytes, appendDataSegment(nil, bitmaskOff, bitmaskBytes)...)
-	dataSegCount = layoutCount + 1
+	dataBytes = append(dataBytes, appendDataSegment(nil, midBitmaskOff, writeBitmask(t.midAcceptStates))...)
+	dataBytes = append(dataBytes, appendDataSegment(nil, eofBitmaskOff, writeBitmask(t.acceptStates))...)
+	dataBytes = append(dataBytes, appendDataSegment(nil, immBitmaskOff, writeBitmask(t.immediateAcceptStates))...)
+	dataSegCount = layoutCount + 3
 
-	body := buildSuffixBody(l, bitmaskOff, tableMemIdx)
+	// The suffix scan is always mid-string: use midStartState (no begin-text context)
+	// so ^ anchors in suffixes don't fire false positives.
+	wasmMidStart := uint32(t.midStartState + 1)
+	body := buildSetSuffixBody(l, midBitmaskOff, eofBitmaskOff, immBitmaskOff, wasmMidStart, patternIDs, tableMemIdx)
 	funcBody = utils.AppendULEB128(nil, uint32(len(body)))
 	funcBody = append(funcBody, body...)
 	return
@@ -1860,10 +1928,13 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int) (funcBody []by
 
 // buildSuffixBody generates the WASM function body for suffix DFA scanning.
 // Signature: (ptr i32, start i32, len i32) → i64
-// Uses the fully-optimized DFA table from the layout (byte-class compression,
-// row dedup, immediateAccept early exit) plus a separate 8-byte bitmask accept
-// table at bitmaskOff.
-func buildSuffixBody(l *dfaLayout, bitmaskOff int32, tableMemIdx int) []byte {
+//
+// midBitmaskOff: 8-byte-per-state table of midAcceptStates (any-position accept).
+// eofBitmaskOff: 8-byte-per-state table of acceptStates (end-of-input accept, $ anchors).
+//
+// endPos is updated greedily on every mid-accept (not just the first), giving
+// correct leftmost-first match lengths for a*, a+, a?, etc.
+func buildSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff int32, tableMemIdx int) []byte {
 	const (
 		paramPtr   = byte(0)
 		paramStart = byte(1)
@@ -1885,19 +1956,19 @@ func buildSuffixBody(l *dfaLayout, bitmaskOff int32, tableMemIdx int) []byte {
 	b = append(b, 0x20, paramStart, 0x21, lPos) // pos = start
 	// lEndPos, lBits, lResult = 0 (default)
 
-	// Check if the start state itself is accepting (handles patterns where the
-	// suffix can match empty string, e.g. when the mandatory literal is the
-	// whole pattern). Load bitmask[wasmStart] and update result/endPos if nonzero.
+	// Check start-state midAccept: handles patterns whose suffix accepts empty
+	// (e.g. mandatory literal IS the whole pattern, or a* / b? at suffix start).
+	// Uses midBitmaskOff so $ patterns (acceptStates only) are excluded here.
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, bitmaskOff)
+	b = utils.AppendSLEB128(b, midBitmaskOff)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(l.wasmStart))
-	b = append(b, 0x41, 0x03, 0x74, 0x6A) // wasmStart * 8; bitmaskOff + wasmStart*8
+	b = append(b, 0x41, 0x03, 0x74, 0x6A) // wasmStart*8; midBitmaskOff + wasmStart*8
 	b = appendTableLoad64(b, tableMemIdx)
-	b = append(b, 0x21, lBits)                     // lBits = bitmask[wasmStart]
+	b = append(b, 0x21, lBits)                     // lBits = midBitmask[wasmStart]
 	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52)   // bits != 0
 	b = append(b, 0x04, 0x40)                      // if
-	b = append(b, 0x20, paramStart, 0x21, lEndPos) // endPos = paramStart (empty suffix match)
+	b = append(b, 0x20, paramStart, 0x21, lEndPos) // endPos = paramStart
 	b = append(b, 0x20, lBits, 0x21, lResult)      // result = bits
 	b = append(b, 0x0B)                            // end if
 
@@ -1921,20 +1992,16 @@ func buildSuffixBody(l *dfaLayout, bitmaskOff int32, tableMemIdx int) []byte {
 		b = emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff, lState, lByteClass, tableMemIdx)
 	}
 
-	// lBits = bitmask[state * 8] — address is i32 (WASM32)
+	// lBits = midBitmask[state * 8] — fires at any position (no $ context)
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, bitmaskOff)
-	b = append(b, 0x20, lState) // push state (i32)
-	b = append(b, 0x41, 0x03)   // i32.const 3
-	b = append(b, 0x74)         // i32.shl (state * 8)
-	b = append(b, 0x6A)         // i32.add (bitmaskOff + state*8)
+	b = utils.AppendSLEB128(b, midBitmaskOff)
+	b = append(b, 0x20, lState)
+	b = append(b, 0x41, 0x03, 0x74, 0x6A) // state*8; midBitmaskOff + state*8
 	b = appendTableLoad64(b, tableMemIdx)
 	b = append(b, 0x21, lBits)
 
-	// if endPos==0 && bits!=0: endPos = pos+1
-	b = append(b, 0x20, lEndPos, 0x45)                         // i32.eqz
-	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52)               // bits!=0: i64.const 0, i64.ne
-	b = append(b, 0x71)                                        // i32.and
+	// if bits!=0: endPos = pos+1 (greedy — update on every accept, not just first)
+	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52)               // bits != 0
 	b = append(b, 0x04, 0x40)                                  // if (void)
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lEndPos) // endPos = pos+1
 	b = append(b, 0x0B)                                        // end if
@@ -1962,17 +2029,248 @@ func buildSuffixBody(l *dfaLayout, bitmaskOff int32, tableMemIdx int) []byte {
 	b = append(b, 0x0B) // end loop $main
 	b = append(b, 0x0B) // end block $done
 
+	// EOF accept: load eofBitmask[state] for $ anchors and patterns accepting at EOF.
+	// If endPos still 0 (no mid-accept), set endPos = lPos (scan position at EOF).
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, eofBitmaskOff)
+	b = append(b, 0x20, lState)
+	b = append(b, 0x41, 0x03, 0x74, 0x6A) // state*8; eofBitmaskOff + state*8
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x21, lBits)
+	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52)                   // lBits != 0
+	b = append(b, 0x04, 0x40)                                      // if
+	b = append(b, 0x20, lEndPos, 0x45)                             // i32.eqz endPos
+	b = append(b, 0x04, 0x40)                                      // if endPos == 0
+	b = append(b, 0x20, lPos, 0x21, lEndPos)                       // endPos = lPos
+	b = append(b, 0x0B)                                            // end if
+	b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult) // result |= lBits
+	b = append(b, 0x0B)                                            // end if lBits != 0
+
 	// return (i64(endPos) << 32) | (result & 0xFFFFFFFF)
-	// Mask result to low 32 bits — high bits corrupt endPos when ORing.
-	b = append(b, 0x20, lEndPos) // push endPos (i32)
-	b = append(b, 0xAD)          // i64.extend_i32_u
-	b = append(b, 0x42, 0x20)    // i64.const 32
-	b = append(b, 0x86)          // i64.shl
-	b = append(b, 0x20, lResult) // push lResult
-	b = append(b, 0xA7)          // i32.wrap_i64 (keep low 32 bits)
-	b = append(b, 0xAD)          // i64.extend_i32_u (zero-extend)
-	b = append(b, 0x84)          // i64.or
-	b = append(b, 0x0B)          // end function
+	b = append(b, 0x20, lEndPos)
+	b = append(b, 0xAD)       // i64.extend_i32_u
+	b = append(b, 0x42, 0x20) // i64.const 32
+	b = append(b, 0x86)       // i64.shl
+	b = append(b, 0x20, lResult)
+	b = append(b, 0xA7) // i32.wrap_i64
+	b = append(b, 0xAD) // i64.extend_i32_u
+	b = append(b, 0x84) // i64.or
+	b = append(b, 0x0B) // end function
+	return b
+}
+
+// buildSetSuffixBody generates the WASM function body for per-pattern set suffix scanning.
+// Signature: (ptr i32, start i32, len i32, lPos i32, out_ptr i32, out_cap i32) → i32
+//
+// Writes (patternID, matchStart, matchLength) tuples directly to the output buffer,
+// one tuple per matching pattern.  Returns the count written.
+//
+// Uses per-pattern endPos tracking to eliminate shared-endPos contamination:
+// each pattern k has its own endPos_k local, updated only when bit k fires in midAccept.
+func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOff int32, wasmMidStart uint32, patternIDs []int, tableMemIdx int) []byte {
+	n := len(patternIDs)
+	if n > 32 {
+		n = 32
+	}
+
+	// Param indices 0..5; local indices start at 6.
+	const (
+		paramPtr    = byte(0)
+		paramStart  = byte(1)
+		paramLen    = byte(2)
+		paramLPos   = byte(3)
+		paramOutPtr = byte(4)
+		paramOutCap = byte(5)
+		// Fixed i32 locals: 6..12
+		lState       = byte(6)
+		lScanPos     = byte(7)
+		lByteClass   = byte(8)
+		lDoneMask    = byte(9)
+		lOutCount    = byte(10)
+		lBitsScratch = byte(11) // i32: low32 of bitmask
+		lOutBase     = byte(12) // i32: output tuple base ptr
+	)
+	// Per-pattern endPos locals: 13..13+n-1 (i32 each)
+	// i64 locals after: 13+n, 13+n+1, 13+n+2
+	endPosBase := byte(13)
+	endPosK := func(k int) byte { return endPosBase + byte(k) }
+	lBits := byte(13 + n)
+	lResult := byte(14 + n)
+	lStartResult := byte(15 + n)
+
+	var b []byte
+	// Local declaration: (7 + n) × i32, 3 × i64
+	b = append(b, 0x02)
+	b = utils.AppendULEB128(b, uint32(7+n))
+	b = append(b, 0x7F)       // i32
+	b = append(b, 0x03, 0x7E) // 3 × i64
+
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(wasmMidStart)) // use midStart: no begin-text context
+	b = append(b, 0x21, lState)
+	b = append(b, 0x20, paramStart, 0x21, lScanPos)
+
+	// emitWriteMatch: write tuple using endPos_k for pattern at bitPos k.
+	emitWriteMatchK := func(b []byte, bit uint32, globalID, k int) []byte {
+		b = append(b, 0x20, lOutCount, 0x20, paramOutCap, 0x49, 0x04, 0x40) // if outCount < cap
+		b = append(b, 0x20, paramOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A, 0x21, lOutBase)
+		b = append(b, 0x20, lOutBase, 0x41)
+		b = utils.AppendSLEB128(b, int32(globalID))
+		b = append(b, 0x36, 0x02, 0x00)
+		b = append(b, 0x20, lOutBase, 0x20, paramLPos, 0x36, 0x02, 0x04)
+		// length = endPos_k - paramLPos
+		b = append(b, 0x20, lOutBase, 0x20, endPosK(k), 0x20, paramLPos, 0x6B, 0x36, 0x02, 0x08)
+		b = append(b, 0x20, lOutCount, 0x41, 0x01, 0x6A, 0x21, lOutCount)
+		b = append(b, 0x20, lDoneMask, 0x41)
+		b = utils.AppendSLEB128(b, int32(bit))
+		b = append(b, 0x72, 0x21, lDoneMask)
+		b = append(b, 0x0B) // end if
+		return b
+	}
+
+	// emitCheckAndWriteK: if (bitsLocal & bit) && !(doneMask & bit): write using endPos_k.
+	emitCheckAndWriteK := func(b []byte, bitsLocal byte, bit uint32, globalID, k int) []byte {
+		b = append(b, 0x20, bitsLocal, 0x41)
+		b = utils.AppendSLEB128(b, int32(bit))
+		b = append(b, 0x71, 0x04, 0x40) // i32.and; if
+		b = append(b, 0x20, lDoneMask, 0x41)
+		b = utils.AppendSLEB128(b, int32(bit))
+		b = append(b, 0x71, 0x45, 0x04, 0x40) // i32.and; i32.eqz; if
+		b = emitWriteMatchK(b, bit, globalID, k)
+		b = append(b, 0x0B) // end if not done
+		b = append(b, 0x0B) // end if bit set
+		return b
+	}
+
+	// --- Start-state check: record bits + set per-pattern endPos = paramStart ---
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midBitmaskOff)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(wasmMidStart))
+	b = append(b, 0x41, 0x03, 0x74, 0x6A) // wasmMidStart*8
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x21, lBits)
+	b = append(b, 0x20, lStartResult, 0x20, lBits, 0x84, 0x21, lStartResult)
+	b = append(b, 0x20, lBits, 0xA7, 0x21, lBitsScratch)
+	// For each bit k in start-state midAccept: set endPos_k = paramStart
+	for k := range patternIDs {
+		if k >= 32 {
+			break
+		}
+		bit := uint32(1) << uint(k)
+		b = append(b, 0x20, lBitsScratch, 0x41)
+		b = utils.AppendSLEB128(b, int32(bit))
+		b = append(b, 0x71, 0x04, 0x40) // if (lBitsScratch & bit) != 0
+		b = append(b, 0x20, paramStart, 0x21, endPosK(k))
+		b = append(b, 0x0B)
+	}
+
+	// --- Main scan loop ---
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $main
+
+	b = append(b, 0x20, lScanPos, 0x20, paramLen, 0x4F, 0x0D, 0x01) // pos>=len: br $done
+
+	// DFA transition
+	if l.useU8 && l.useCompression {
+		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
+			l.useRowDedup, l.rowMapOff, lState, lByteClass, paramPtr, lScanPos, 0xff, tableMemIdx)
+	} else if l.useU8 {
+		b = emitSimpleU8Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff,
+			lState, paramPtr, lScanPos, 0xff, tableMemIdx)
+	} else {
+		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A, 0x2D, 0x00, 0x00, 0x21, lByteClass)
+		b = emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff, lState, lByteClass, tableMemIdx)
+	}
+
+	// Load midBitmask and update per-pattern endPos for each bit that fires.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midBitmaskOff)
+	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x21, lBits)
+	b = append(b, 0x20, lBits, 0xA7, 0x21, lBitsScratch)
+	b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult)
+	// Per-pattern: if bit k in midAccept, update endPos_k = scanPos+1
+	for k := range patternIDs {
+		if k >= 32 {
+			break
+		}
+		bit := uint32(1) << uint(k)
+		b = append(b, 0x20, lBitsScratch, 0x41)
+		b = utils.AppendSLEB128(b, int32(bit))
+		b = append(b, 0x71, 0x04, 0x40)                                   // if bit k fired
+		b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, endPosK(k)) // endPos_k = scanPos+1
+		b = append(b, 0x0B)
+	}
+
+	// Per-pattern immediateAccept: write immediately when pattern k is done.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, immBitmaskOff)
+	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0xA7, 0x21, lBitsScratch)
+	for k, gid := range patternIDs {
+		if k >= 32 {
+			break
+		}
+		bit := uint32(1) << uint(k)
+		b = emitCheckAndWriteK(b, lBitsScratch, bit, gid, k)
+	}
+
+	b = append(b, 0x20, lState, 0x45, 0x0D, 0x01)                   // dead: br $done
+	b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, lScanPos) // scanPos++
+	b = append(b, 0x0C, 0x00)                                       // br $main
+
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block
+
+	// --- EOF check ---
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, eofBitmaskOff)
+	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x21, lBits)
+	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52, 0x04, 0x40) // if lBits != 0
+	// For eof-only patterns (no midAccept), set endPos_k = lScanPos
+	b = append(b, 0x20, lBits, 0xA7, 0x21, lBitsScratch)
+	for k := range patternIDs {
+		if k >= 32 {
+			break
+		}
+		bit := uint32(1) << uint(k)
+		b = append(b, 0x20, lBitsScratch, 0x41)
+		b = utils.AppendSLEB128(b, int32(bit))
+		b = append(b, 0x71, 0x04, 0x40)                   // if eof bit k fired
+		b = append(b, 0x20, endPosK(k), 0x45, 0x04, 0x40) // if endPos_k == 0
+		b = append(b, 0x20, lScanPos, 0x21, endPosK(k))   // endPos_k = lScanPos
+		b = append(b, 0x0B)                               // end if endPos_k==0
+		b = append(b, 0x0B)                               // end if eof bit k
+	}
+	b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult)
+	b = append(b, 0x0B) // end if lBits != 0
+
+	// --- Post-loop: write scan+eof bits with per-pattern endPos ---
+	b = append(b, 0x20, lResult, 0xA7, 0x21, lBitsScratch)
+	for k, gid := range patternIDs {
+		if k >= 32 {
+			break
+		}
+		bit := uint32(1) << uint(k)
+		b = emitCheckAndWriteK(b, lBitsScratch, bit, gid, k)
+	}
+
+	// --- Post-loop: write start-only bits (used paramStart as endPos_k) ---
+	b = append(b, 0x20, lStartResult, 0xA7, 0x21, lBitsScratch)
+	for k, gid := range patternIDs {
+		if k >= 32 {
+			break
+		}
+		bit := uint32(1) << uint(k)
+		b = emitCheckAndWriteK(b, lBitsScratch, bit, gid, k)
+	}
+
+	b = append(b, 0x20, lOutCount, 0x0B) // return lOutCount
 	return b
 }
 

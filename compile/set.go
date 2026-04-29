@@ -241,7 +241,7 @@ func (o CompileSetOptions) bitmaskWidth() int {
 	if o.BitmaskWidth > 0 {
 		return o.BitmaskWidth
 	}
-	return 64
+	return 32 // 32 patterns per bucket: fits in the i32 extracted by emitSetMatchFnFinal
 }
 
 func (o CompileSetOptions) budgetBytes() int {
@@ -307,7 +307,7 @@ func combinedClassCount(a, b [256]byte) int {
 func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, AcceptKind, error) {
 	bw := opts.BitmaskWidth
 	if bw == 0 {
-		bw = 64
+		bw = 32
 	}
 	if len(asts) == 0 {
 		return nil, 0, fmt.Errorf("mergeSuffixDFA: empty pattern list")
@@ -372,6 +372,9 @@ func buildUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uin
 	}
 
 	// Copy instructions from each prog (skipping their instruction 0).
+	// patternBits[pos] is set for ALL instructions from pattern k (not just
+	// InstMatch) so that nfaBuildInputMap can suppress byte-consumers from
+	// pattern k once that pattern's InstMatch has been seen.
 	for k, p := range progs {
 		off := offsets[k]
 		for i := 1; i < len(p.Inst); i++ {
@@ -383,7 +386,7 @@ func buildUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uin
 			}
 			pos := off + i - 1
 			union.Inst[pos] = ni
-			if inst.Op == syntax.InstMatch && k < bitmaskWidth {
+			if k < bitmaskWidth {
 				patternBits[pos] = 1 << uint(k)
 			}
 		}

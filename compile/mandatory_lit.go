@@ -29,13 +29,30 @@ type mandatoryLit struct {
 	maxOff int32 // maximum byte distance from match start to literal start
 }
 
-// findMandatoryLit analyzes the regex pattern and returns the first mandatory
-// literal found (with its min/max offset from match start). Returns nil if no
 // HasMandatoryLit reports whether pattern has a non-empty mandatory literal
 // that can anchor it in set composition. Patterns without one go to the
 // fallback bucket which is currently not scanned by emitSetMatchFnFinal.
 func HasMandatoryLit(pattern string) bool {
 	return findMandatoryLit(pattern) != nil
+}
+
+// HasTrivialPrefix reports whether the prefix before the mandatory literal is
+// trivially empty (nil). Patterns with non-trivial prefixes (e.g. "(a|b)a$")
+// require a backward prefix DFA check that the set scan does not yet perform.
+func HasTrivialPrefix(pattern string) bool {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return false
+	}
+	lit, path := findMandatoryLitRec(re, 0, 0)
+	if lit == nil {
+		return false
+	}
+	prefixAST, _, ok := splitAtPath(re, path)
+	if !ok {
+		return false
+	}
+	return prefixAST == nil
 }
 
 // mandatory literal is found or if MaxOff > 256.
