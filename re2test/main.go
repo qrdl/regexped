@@ -729,7 +729,7 @@ type setBlockEntry struct {
 }
 
 const (
-	setOutCap        = 1024 // max tuples per find_all batch
+	setOutCap        = 65536 // max tuples per find_all batch
 	setOutTupleBytes = 12   // (pattern_id i32, start i32, length i32)
 )
 

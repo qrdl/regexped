@@ -22,7 +22,13 @@ type PatternInfo struct {
 	prefixDFA *dfaTable // built from prefixAST (reversed); nil when trivial
 	prefixID  int       // index into dedup prefix pool; -1 = trivial
 
-	trivialPrefix bool // true when prefixAST is nil
+	trivialPrefix     bool // true when prefixAST is nil
+	startAnchor       bool // true when original prefixAST (before trimming) had BeginText/BeginLine
+	prefixMaxLen      int  // max byte length of prefix (0=trivial, -1=unbounded)
+	prefixMinLen      int  // min byte length of prefix (0=trivial)
+	varLenEmptySuffix    bool // variable-length prefix + empty suffix: write match tuple directly
+	varLenNonEmptySuffix bool // variable-length prefix + non-empty suffix: call suffix DFA with corrected lPos
+	isolatedFallback     bool // non-greedy: isolate in own fallback bucket with leftmostFirst=false DFA
 
 	suffixDFA      *dfaTable // built from suffixAST
 	suffixClasses  int       // numClasses after computeByteClasses (Phase 2)
@@ -141,6 +147,23 @@ func dfaTableEqual(a, b *dfaTable) bool {
 		eqMaps(a.immediateAcceptStates, b.immediateAcceptStates)
 }
 
+// hasBeginAnchor reports whether re contains a BeginText or BeginLine assertion.
+func hasBeginAnchor(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	switch re.Op {
+	case syntax.OpBeginText, syntax.OpBeginLine:
+		return true
+	}
+	for _, sub := range re.Sub {
+		if hasBeginAnchor(sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // analyzePattern parses re.Pattern, finds the mandatory literal, splits the
 // AST around it, and builds canonical prefix and suffix DFAs — deduplicating
 // them through the supplied pools.
@@ -153,11 +176,27 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	if err != nil {
 		return nil, fmt.Errorf("analyzePattern: parse %q: %w", re.Pattern, err)
 	}
+	stripCaptures(parsed)
 
 	info := &PatternInfo{
 		fullPattern: re.Pattern,
 		prefixID:    -1,
 		suffixID:    -1,
+	}
+
+	// Patterns with non-greedy quantifiers contaminate merged suffix DFAs when mixed
+	// with greedy patterns (via immediateAcceptStates). Isolate them in their own
+	// fallback bucket; mergeSuffixDFA (leftmostFirst=true) gives correct non-greedy
+	// semantics for isolated patterns without contaminating greedy-pattern buckets.
+	{
+		prog, compErr := syntax.Compile(parsed.Simplify())
+		if compErr == nil && hasNonGreedyQuantifiers(prog) {
+			info.splittable = false
+			info.isolatedFallback = true
+			info.startAnchor = hasBeginAnchor(parsed)
+			// suffixDFA is built later by compileFallback via mergeSuffixDFA.
+			return info, nil
+		}
 	}
 
 	lit, path := findMandatoryLitRec(parsed, 0, 0)
@@ -167,18 +206,45 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		prefixAST, suffixAST, ok := splitAtPath(parsed, path)
 		info.splittable = ok
 		if ok {
-			// Trim zero-byte prefix (e.g. purely anchors like ^) — treat as trivial.
+			// Zero-length prefix: only strip if it's purely a begin-anchor (^).
+			// Other zero-length assertions (like $, \b) carry semantic meaning that
+			// cannot be dropped; patterns with them route to fallback.
 			if prefixAST != nil {
 				if _, maxLen := regexpMinMaxLen(prefixAST); maxLen == 0 {
-					prefixAST = nil
+					if hasBeginAnchor(prefixAST) {
+						info.startAnchor = true
+						prefixAST = nil
+					} else {
+						// Non-begin zero-length prefix (e.g. $, \b): route to fallback.
+						info.splittable = false
+						ok = false
+					}
 				}
 			}
 			info.prefixAST = prefixAST
 			info.suffixAST = suffixAST
 		}
+		// Fallback patterns with BeginText in the full pattern are also start-anchored.
+		if !info.splittable {
+			info.startAnchor = hasBeginAnchor(parsed)
+		}
 	}
 
 	info.trivialPrefix = info.prefixAST == nil
+	if !info.trivialPrefix && info.prefixAST != nil {
+		minLen, maxLen := regexpMinMaxLen(info.prefixAST)
+		info.prefixMinLen = minLen
+		info.prefixMaxLen = maxLen // -1 if unbounded
+		// Variable-length prefix: match start computed at runtime via backward DFA.
+		// Split by suffix presence for different handling in emitComputeValidMask.
+		if minLen != maxLen {
+			if info.suffixAST == nil {
+				info.varLenEmptySuffix = true
+			} else {
+				info.varLenNonEmptySuffix = true
+			}
+		}
+	}
 
 	// Build prefix DFA (reversed prefix AST).
 	if !info.trivialPrefix {
@@ -756,6 +822,31 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 	var buckets []*bucket
 
 	for _, p := range patterns {
+		// Isolated patterns (e.g. non-greedy) get their own bucket to prevent
+		// their pre-built leftmostFirst=false DFA from being replaced by a merged one.
+		if p.isolatedFallback {
+			// Build suffix DFA for isolated pattern via mergeSuffixDFA (leftmostFirst=true)
+			// so non-greedy patterns get correct semantics without contaminating other buckets.
+			isolatedDFA := p.suffixDFA
+			if ast := patternSuffixAST(p); ast != nil {
+				if t, _, mergeErr := mergeSuffixDFA([]*syntax.Regexp{ast}, opts); mergeErr == nil {
+					isolatedDFA = t
+				}
+			}
+			isolatedCM, _, isolatedNC := computeByteClasses(isolatedDFA)
+			nb := &bucket{
+				literal:      "",
+				patterns:     []*PatternInfo{p},
+				suffixStates: isolatedDFA.numStates,
+				tableBytes:   dfaTableBytes(isolatedDFA),
+				classMap:     isolatedCM,
+				numClasses:   isolatedNC,
+				isFallback:   true,
+				suffixDFA:    isolatedDFA,
+			}
+			buckets = append(buckets, nb)
+			continue
+		}
 		placed := false
 		for _, b := range buckets {
 			if len(b.patterns) >= bw {
@@ -785,17 +876,24 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 			break
 		}
 		if !placed {
+			// Build suffix DFA from full pattern (patternSuffixAST), not just the
+			// suffix part stored in p.suffixDFA, which may be incomplete for non-splittable patterns.
+			nbDFA := p.suffixDFA
+			if ast := patternSuffixAST(p); ast != nil {
+				if t, _, mergeErr := mergeSuffixDFA([]*syntax.Regexp{ast}, opts); mergeErr == nil {
+					nbDFA = t
+				}
+			}
+			nbCM, _, nbNC := computeByteClasses(nbDFA)
 			nb := &bucket{
 				literal:      "",
 				patterns:     []*PatternInfo{p},
-				suffixStates: p.suffixStates,
-				tableBytes:   dfaTableBytes(p.suffixDFA),
-				classMap:     p.suffixClassMap,
-				numClasses:   p.suffixClasses,
+				suffixStates: nbDFA.numStates,
+				tableBytes:   dfaTableBytes(nbDFA),
+				classMap:     nbCM,
+				numClasses:   nbNC,
 				isFallback:   true,
-			}
-			if p.suffixDFA != nil {
-				nb.suffixDFA = p.suffixDFA
+				suffixDFA:    nbDFA,
 			}
 			buckets = append(buckets, nb)
 		}
@@ -813,19 +911,20 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 // suffix DFA accepts immediately at suffix_start.
 // When the pattern was not splittable, fall back to the full pattern AST.
 func patternSuffixAST(p *PatternInfo) *syntax.Regexp {
+	if !p.splittable {
+		// Non-splittable: use the full pattern so the suffix DFA handles all matching.
+		re, err := syntax.Parse(p.fullPattern, syntax.Perl)
+		if err != nil {
+			return nil
+		}
+		return re
+	}
 	if p.suffixAST != nil {
 		return p.suffixAST
 	}
-	if p.splittable {
-		// The mandatory literal IS the whole pattern; suffix is empty.
-		empty, _ := syntax.Parse("", syntax.Perl)
-		return empty
-	}
-	re, err := syntax.Parse(p.fullPattern, syntax.Perl)
-	if err != nil {
-		return nil
-	}
-	return re
+	// The mandatory literal IS the whole pattern; suffix is empty.
+	empty, _ := syntax.Parse("", syntax.Perl)
+	return empty
 }
 
 // patternRefFor builds a PatternRef from a PatternInfo.
