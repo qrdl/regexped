@@ -26,7 +26,8 @@ type dfa struct {
 	midAcceptingW  map[int]uint64
 	// midAcceptingNL[s]: state s accepts BEFORE consuming the next byte when prev was '\n' (for (?m:^)).
 	midAcceptingNL   map[int]uint64
-	startBeginAccept bool // true if start state accepts with ecBegin only (e.g. a*^)
+	startBeginAccept bool   // true if start state accepts with ecBegin only (e.g. a*^)
+	startAcceptEnd   uint64 // acceptBitsFor(startSet, ecEnd|ecNoWordBoundary) — ecEnd-only accept at start state
 
 	// transitions[state*256 + byte] = nextState (-1 = no transition)
 	transitions  []int                // Flat array: [numStates * 256]
@@ -506,6 +507,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, patternBit
 	// startBeginAccept: pattern matches empty at position 0 due to begin anchor (^/\A).
 	// Distinct from acceptStates (ecBegin|ecEnd) and midAcceptStates (ctx=0).
 	dfa.startBeginAccept = isAccepting(startSet, ecBegin)
+	dfa.startAcceptEnd = acceptBitsFor(startSet, ecEnd|ecNoWordBoundary)
 
 	if leftmostFirst && isImmediateAccepting(startSet, prog) {
 		bits := nfaAcceptBits(startSet)
@@ -855,6 +857,7 @@ type dfaTable struct {
 	immediateAcceptStates map[int]uint64 // leftmost-first: accept without scanning further
 	transitions           []int          // flat [state*256+byte] = nextState; -1 = dead
 	startBeginAccept      bool           // true if startState accepts with ecBegin only (e.g. a*^)
+	startAcceptEnd        uint64         // acceptBitsFor(startSet, ecEnd|ecNoWordBoundary) — ecEnd-only
 	hasWordBoundary       bool           // true if pattern contains \b or \B
 	hasNewlineBoundary    bool           // true if pattern contains (?m:^) or (?m:$)
 }
@@ -876,6 +879,7 @@ func dfaTableFrom(d *dfa) *dfaTable {
 		immediateAcceptStates: d.immediateAccepting,
 		transitions:           d.transitions,
 		startBeginAccept:      d.startBeginAccept,
+		startAcceptEnd:        d.startAcceptEnd,
 		hasWordBoundary:       d.hasWordBoundary,
 		hasNewlineBoundary:    d.hasNewlineBoundary,
 	}
@@ -1893,10 +1897,11 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 
 	l := buildDFALayout(t, tableBase, false, true, 0)
 
-	// Three 8-byte-per-state bitmask tables placed after all layout data.
-	midBitmaskOff := int32(l.tableEnd)
-	eofBitmaskOff := midBitmaskOff + int32(l.numWASM)*8
-	immBitmaskOff := eofBitmaskOff + int32(l.numWASM)*8
+	// Four 8-byte-per-state bitmask tables placed after all layout data.
+	midBitmaskOff    := int32(l.tableEnd)
+	eofBitmaskOff    := midBitmaskOff + int32(l.numWASM)*8
+	immBitmaskOff    := eofBitmaskOff + int32(l.numWASM)*8
+	eofMidBitmaskOff := immBitmaskOff + int32(l.numWASM)*8
 
 	writeBitmask := func(m map[int]uint64) []byte {
 		bs := make([]byte, l.numWASM*8)
@@ -1911,17 +1916,33 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		return bs
 	}
 
+	// eofMidBitmask: like eofBitmask but with ecEnd-only acceptance at startState.
+	// Used when paramLPos != 0 (not at text start) to avoid false accepts for
+	// patterns like \z^ whose startState acceptance includes ecBegin.
+	writeMidEofBitmask := func() []byte {
+		bs := writeBitmask(t.acceptStates)
+		startOff := (t.startState + 1) * 8
+		if startOff >= 0 && startOff+8 <= len(bs) {
+			v := t.startAcceptEnd
+			for i := 0; i < 8; i++ {
+				bs[startOff+i] = byte(v >> uint(i*8))
+			}
+		}
+		return bs
+	}
+
 	layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false))
 	dataBytes = append(dataBytes, layoutRaw...)
 	dataBytes = append(dataBytes, appendDataSegment(nil, midBitmaskOff, writeBitmask(t.midAcceptStates))...)
 	dataBytes = append(dataBytes, appendDataSegment(nil, eofBitmaskOff, writeBitmask(t.acceptStates))...)
 	dataBytes = append(dataBytes, appendDataSegment(nil, immBitmaskOff, writeBitmask(t.immediateAcceptStates))...)
-	dataSegCount = layoutCount + 3
+	dataBytes = append(dataBytes, appendDataSegment(nil, eofMidBitmaskOff, writeMidEofBitmask())...)
+	dataSegCount = layoutCount + 4
 
 	// Use wasmStart for lPos==0 (allows ^ anchors to fire), wasmMidStart otherwise.
 	wasmMidStart := uint32(t.midStartState + 1)
 	wasmStart := uint32(t.startState + 1)
-	body := buildSetSuffixBody(l, midBitmaskOff, eofBitmaskOff, immBitmaskOff, wasmStart, wasmMidStart, patternIDs, prefixFixedLens, tableMemIdx)
+	body := buildSetSuffixBody(l, midBitmaskOff, eofBitmaskOff, eofMidBitmaskOff, immBitmaskOff, wasmStart, wasmMidStart, patternIDs, prefixFixedLens, tableMemIdx)
 	funcBody = utils.AppendULEB128(nil, uint32(len(body)))
 	funcBody = append(funcBody, body...)
 	return
@@ -2068,7 +2089,7 @@ func buildSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff int32, tableMemI
 // Returns the count written.
 //
 // Uses per-pattern endPos tracking to eliminate shared-endPos contamination.
-func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOff int32, wasmStart, wasmMidStart uint32, patternIDs, prefixFixedLens []int, tableMemIdx int) []byte {
+func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmaskOff, immBitmaskOff int32, wasmStart, wasmMidStart uint32, patternIDs, prefixFixedLens []int, tableMemIdx int) []byte {
 	n := len(patternIDs)
 	if n > 32 {
 		n = 32
@@ -2258,8 +2279,16 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOf
 	b = append(b, 0x0B) // end block
 
 	// --- EOF check ---
+	// At text start (paramLPos==0), use eofBitmaskOff which includes ecBegin acceptance.
+	// At mid-string (paramLPos!=0), use eofMidBitmaskOff (ecEnd-only) to avoid false
+	// EOF matches for patterns like \z^ whose startState acceptance includes ecBegin.
+	b = append(b, 0x20, paramLPos, 0x45, 0x04, 0x7F) // if paramLPos == 0 (result i32)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, eofBitmaskOff)
+	b = append(b, 0x05) // else
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, eofMidBitmaskOff)
+	b = append(b, 0x0B) // end if → bitmask base on stack
 	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
 	b = appendTableLoad64(b, tableMemIdx)
 	b = append(b, 0x21, lBits)

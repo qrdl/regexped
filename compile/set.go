@@ -164,6 +164,73 @@ func hasBeginAnchor(re *syntax.Regexp) bool {
 	return false
 }
 
+// hasBeginAnchorAtTopLevel reports whether the mandatory start of re is a
+// BeginText or BeginLine assertion — i.e. the anchor is NOT inside *, ?, +,
+// or alternation, so the pattern is truly restricted to position 0.
+func hasBeginAnchorAtTopLevel(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	switch re.Op {
+	case syntax.OpBeginText, syntax.OpBeginLine:
+		return true
+	case syntax.OpConcat:
+		if len(re.Sub) > 0 {
+			return hasBeginAnchorAtTopLevel(re.Sub[0])
+		}
+	case syntax.OpCapture:
+		if len(re.Sub) > 0 {
+			return hasBeginAnchorAtTopLevel(re.Sub[0])
+		}
+	}
+	return false
+}
+
+// endsWithBeginAnchor reports whether the last mandatory element of re is a
+// begin-text or begin-line assertion at the top level (not inside *, ?, etc.).
+// e.g. \z^ returns true, (^^)*$ returns false.
+func endsWithBeginAnchor(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	switch re.Op {
+	case syntax.OpBeginText, syntax.OpBeginLine:
+		return true
+	case syntax.OpConcat:
+		if len(re.Sub) > 0 {
+			return endsWithBeginAnchor(re.Sub[len(re.Sub)-1])
+		}
+	case syntax.OpCapture:
+		if len(re.Sub) > 0 {
+			return endsWithBeginAnchor(re.Sub[0])
+		}
+	}
+	return false
+}
+
+// isOnlyBeginAnchors reports whether re consists entirely of BeginText or
+// BeginLine assertions (possibly concatenated). Used to decide whether a
+// zero-length prefix can be safely stripped to just a startAnchor flag.
+func isOnlyBeginAnchors(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	switch re.Op {
+	case syntax.OpBeginText, syntax.OpBeginLine:
+		return true
+	case syntax.OpConcat:
+		for _, sub := range re.Sub {
+			if !isOnlyBeginAnchors(sub) {
+				return false
+			}
+		}
+		return len(re.Sub) > 0
+	case syntax.OpCapture:
+		return len(re.Sub) == 1 && isOnlyBeginAnchors(re.Sub[0])
+	}
+	return false
+}
+
 // analyzePattern parses re.Pattern, finds the mandatory literal, splits the
 // AST around it, and builds canonical prefix and suffix DFAs — deduplicating
 // them through the supplied pools.
@@ -199,6 +266,31 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		}
 	}
 
+	// Patterns whose minimum match length is 0 can match without consuming their
+	// mandatory literal (e.g. (aa)* matches ""). Route them to fallback so the
+	// full-pattern DFA runs at every position, including on empty inputs.
+	// Exception: patterns that also contain begin-anchors (e.g. \z^) produce
+	// degenerate DFAs with false EOF accepts — exclude them from sets entirely.
+	if minLen, _ := regexpMinMaxLen(parsed); minLen == 0 {
+		// Word-boundary patterns (\b, \B) with minLen=0 need pre-transition accept
+		// handling that the set suffix DFA body doesn't support. Exclude from set.
+		{
+			prog, compErr := syntax.Compile(parsed.Simplify())
+			if compErr == nil {
+				for _, inst := range prog.Inst {
+					if inst.Op == syntax.InstEmptyWidth {
+						if inst.Arg&(uint32(syntax.EmptyWordBoundary)|uint32(syntax.EmptyNoWordBoundary)) != 0 {
+							return nil, fmt.Errorf("analyzePattern: word boundary in zero-length pattern %q", re.Pattern)
+						}
+					}
+				}
+			}
+		}
+		info.splittable = false
+		info.startAnchor = hasBeginAnchorAtTopLevel(parsed)
+		return info, nil
+	}
+
 	lit, path := findMandatoryLitRec(parsed, 0, 0)
 	info.mandLit = lit
 
@@ -206,27 +298,33 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		prefixAST, suffixAST, ok := splitAtPath(parsed, path)
 		info.splittable = ok
 		if ok {
-			// Zero-length prefix: only strip if it's purely a begin-anchor (^).
-			// Other zero-length assertions (like $, \b) carry semantic meaning that
-			// cannot be dropped; patterns with them route to fallback.
+			// Zero-length prefix: only strip if it consists purely of begin-anchors (^, \A).
+			// Mixed prefixes (e.g. ^$, \b) or non-begin zero-length assertions route to fallback.
 			if prefixAST != nil {
 				if _, maxLen := regexpMinMaxLen(prefixAST); maxLen == 0 {
-					if hasBeginAnchor(prefixAST) {
+					if isOnlyBeginAnchors(prefixAST) {
 						info.startAnchor = true
 						prefixAST = nil
 					} else {
-						// Non-begin zero-length prefix (e.g. $, \b): route to fallback.
+						// Non-begin or mixed zero-length prefix: route to fallback.
 						info.splittable = false
 						ok = false
 					}
 				}
 			}
+			// Begin-anchors in the suffix (e.g. a^) can't fire after the literal has
+			// been consumed. Route to fallback so the full-pattern DFA handles it correctly.
+			if suffixAST != nil && hasBeginAnchor(suffixAST) {
+				info.splittable = false
+				ok = false
+			}
 			info.prefixAST = prefixAST
 			info.suffixAST = suffixAST
 		}
-		// Fallback patterns with BeginText in the full pattern are also start-anchored.
+		// Fallback patterns: only truly anchored if the begin-anchor is at the
+		// mandatory top level (not inside *, ?, etc.).
 		if !info.splittable {
-			info.startAnchor = hasBeginAnchor(parsed)
+			info.startAnchor = hasBeginAnchorAtTopLevel(parsed)
 		}
 	}
 

@@ -851,7 +851,11 @@ func emitSetMatchFnFinal(cs *compiledSet, tableBase int, prefixFnBaseIdx int) []
 	b = append(b, 0x02, 0x40) // block $batch_done
 	b = append(b, 0x03, 0x40) // loop $scan
 
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+	// lPos > pInLen: allows position 0 to be processed on empty input (pInLen=0),
+	// so patterns like (aa)* that match "" get their zero-length match at position 0.
+	// For non-empty inputs, position pInLen is processed once (for EOF-anchored patterns
+	// like (aa)*$); the eofMidBitmask in buildSetSuffixBody avoids false positives.
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01) // lPos > pInLen (i32.gt_u)
 	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)
 
 	// emitComputeValidMask: compute lValidMask for bucket bi.

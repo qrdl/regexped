@@ -751,12 +751,21 @@ func testSetBlock(
 	}
 	var eligible []eligibleEntry
 	for i, e := range entries {
-		if compile.HasMandatoryLit(e.pattern) {
-			eligible = append(eligible, eligibleEntry{orig: i, entry: e})
+		if preCheck(e.pattern) != "" {
+			continue // skip unicode etc.
 		}
+		if _, err := syntax.Parse(e.pattern, syntax.Perl); err != nil {
+			continue // skip unsupported syntax (\C etc.)
+		}
+		// Skip word-boundary-only patterns (\b, \B): the set suffix DFA does not
+		// support pre-transition word-boundary accepts.
+		if strings.Contains(e.pattern, `\b`) || strings.Contains(e.pattern, `\B`) {
+			continue
+		}
+		eligible = append(eligible, eligibleEntry{orig: i, entry: e})
 	}
 	if len(eligible) < 2 {
-		return // not enough non-fallback patterns to form a set
+		return // not enough patterns to form a set
 	}
 
 	regexes := make([]config.RegexEntry, len(eligible))
