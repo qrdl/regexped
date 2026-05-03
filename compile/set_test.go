@@ -1239,25 +1239,6 @@ func TestACDataSegments_NonEmpty(t *testing.T) {
 	}
 }
 
-func TestEmitACScan_NotPanics(t *testing.T) {
-	// Smoke test: emitACScan must produce non-empty bytes without panicking.
-	ac := buildAC([][]byte{[]byte("ab"), []byte("cd")})
-	l := buildACLayout(ac, 0)
-	locals := acScanLocals{State: 3, Pos: 4, ByteTmp: 5, LitID: 6, OutIdx: 7, OutEnd: 8}
-	var b []byte
-	b = emitACScan(b, l, locals, 0, 1, 0, 0, func(bb []byte) []byte { return bb })
-	if len(b) == 0 {
-		t.Error("emitACScan returned empty bytes")
-	}
-}
-
-func TestAppendACInputLoad8u(t *testing.T) {
-	b := appendACInputLoad8u(nil)
-	if len(b) == 0 {
-		t.Error("appendACInputLoad8u returned empty bytes")
-	}
-}
-
 func TestPatternRef_String(t *testing.T) {
 	p := PatternRef{ID: 3, Name: "rule_x"}
 	got := p.String()
@@ -1702,13 +1683,13 @@ func TestEndsWithBeginAnchor(t *testing.T) {
 		pat  string
 		want bool
 	}{
-		{`^`, true},                 // bare ^
-		{`\z^`, true},               // end-then-begin: ends with ^
-		{`(^^)*$`, false},           // ends with $, not ^
-		{`(?:a)`, false},            // no anchor
-		{`a^`, true},                // concat ending with ^
-		{`^a`, false},               // concat ending with 'a'
-		{`(^)`, true},               // capture wrapping ^
+		{`^`, true},       // bare ^
+		{`\z^`, true},     // end-then-begin: ends with ^
+		{`(^^)*$`, false}, // ends with $, not ^
+		{`(?:a)`, false},  // no anchor
+		{`a^`, true},      // concat ending with ^
+		{`^a`, false},     // concat ending with 'a'
+		{`(^)`, true},     // capture wrapping ^
 	}
 	for _, tc := range cases {
 		re := mustParse(t, tc.pat)
@@ -1726,13 +1707,13 @@ func TestIsOnlyBeginAnchors(t *testing.T) {
 		pat  string
 		want bool
 	}{
-		{`^`, true},          // single ^
-		{`\A`, true},         // \A (begin-text)
-		{`^^`, true},         // concat of two begin-anchors
-		{`^a`, false},        // concat with non-anchor
-		{`^$`, false},        // concat with end-anchor
-		{`(?:a)`, false},     // not an anchor at all
-		{`(^)`, true},        // capture wrapping ^
+		{`^`, true},      // single ^
+		{`\A`, true},     // \A (begin-text)
+		{`^^`, true},     // concat of two begin-anchors
+		{`^a`, false},    // concat with non-anchor
+		{`^$`, false},    // concat with end-anchor
+		{`(?:a)`, false}, // not an anchor at all
+		{`(^)`, true},    // capture wrapping ^
 	}
 	for _, tc := range cases {
 		re := mustParse(t, tc.pat)
@@ -1773,12 +1754,12 @@ func TestHasBeginAnchorAtTopLevel(t *testing.T) {
 		pat  string
 		want bool
 	}{
-		{`^a`, true},          // ^ at mandatory start
-		{`\Aa`, true},         // \A at mandatory start
-		{`a^`, false},         // ^ after byte-consumer — not at top-level start
-		{`(^^)*$`, false},     // ^ inside *, not mandatory at top level
-		{`a+`, false},         // no anchor
-		{`(^a)`, true},        // ^ through capture
+		{`^a`, true},      // ^ at mandatory start
+		{`\Aa`, true},     // \A at mandatory start
+		{`a^`, false},     // ^ after byte-consumer — not at top-level start
+		{`(^^)*$`, false}, // ^ inside *, not mandatory at top level
+		{`a+`, false},     // no anchor
+		{`(^a)`, true},    // ^ through capture
 	}
 	for _, tc := range cases {
 		re := mustParse(t, tc.pat)

@@ -36,25 +36,6 @@ func HasMandatoryLit(pattern string) bool {
 	return findMandatoryLit(pattern) != nil
 }
 
-// HasTrivialPrefix reports whether the prefix before the mandatory literal is
-// trivially empty (nil). Patterns with non-trivial prefixes (e.g. "(a|b)a$")
-// require a backward prefix DFA check that the set scan does not yet perform.
-func HasTrivialPrefix(pattern string) bool {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return false
-	}
-	lit, path := findMandatoryLitRec(re, 0, 0)
-	if lit == nil {
-		return false
-	}
-	prefixAST, _, ok := splitAtPath(re, path)
-	if !ok {
-		return false
-	}
-	return prefixAST == nil
-}
-
 // mandatory literal is found or if MaxOff > 256.
 // Does NOT call Simplify() so that OpPlus/OpRepeat are preserved.
 func findMandatoryLit(pattern string) *mandatoryLit {

@@ -154,7 +154,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				if testErr != nil {
 					return testErr
 				}
-				if (prevPassSet/500000) != (npassSet/500000) {
+				if (prevPassSet / 500000) != (npassSet / 500000) {
 					fmt.Fprintf(os.Stderr, "  ... %dK set cases\n", npassSet/1000)
 				}
 				if maxErrors > 0 && nfailSet >= maxErrors {
@@ -682,7 +682,7 @@ done:
 		if testErr != nil {
 			return testErr
 		}
-		if (prevPassSet/500000) != (npassSet/500000) {
+		if (prevPassSet / 500000) != (npassSet / 500000) {
 			fmt.Fprintf(os.Stderr, "  ... %dK set cases\n", npassSet/1000)
 		}
 	}
@@ -738,7 +738,7 @@ type setBlockEntry struct {
 
 const (
 	setOutCap        = 65536 // max tuples per find_all batch
-	setOutTupleBytes = 12   // (pattern_id i32, start i32, length i32)
+	setOutTupleBytes = 12    // (pattern_id i32, start i32, length i32)
 )
 
 // testSetBlock compiles all patterns in entries as a set and runs find_all against

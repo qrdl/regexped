@@ -208,7 +208,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				// pml[j] = 0 (variable-length, handled via individual suffix DFA call)
 			} else {
 				idxes[j] = p.prefixID
-				if p.prefixMinLen > 0 && p.prefixMinLen == p.prefixMaxLen { pml[j] = p.prefixMaxLen }
+				if p.prefixMinLen > 0 && p.prefixMinLen == p.prefixMaxLen {
+					pml[j] = p.prefixMaxLen
+				}
 			}
 		}
 		prefixFnIdx[bi] = idxes
@@ -235,7 +237,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	}
 
 	// Second pass: build prefix DFA function bodies (after suffix data, to avoid address overlap).
-	var prefixTableOffset int32 = tableOffset // start after all suffix DFA data
+	prefixTableOffset := tableOffset // start after all suffix DFA data
 	for bi, bkt := range buckets {
 		// Resolve prefixID → fnIdx for non-trivial patterns in this bucket.
 		for j, p := range bkt.patterns {
@@ -266,26 +268,26 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// The set match function body is built at assemble time (when function table
 	// indices are known). Store nil here; assembleModuleWithSets fills it in.
 	cs := &compiledSet{
-		name:               spec.Name,
-		findAny:            spec.FindAny,
-		findAll:            spec.FindAll,
-		match:              spec.Match,
-		suffixFnBodies:     suffixFnBodies,
-		numSuffixFns:       len(suffixFnBodies),
-		dataBytes:          allDataBytes,
-		dataSegCount:       totalDataSegs,
-		prefixFnBodies:     prefixFnBodies,
-		prefixDataBytes:    prefixDataBytes,
-		prefixDataSegCount: prefixDataSegCount,
-		prefixFnIdx:        prefixFnIdx,
+		name:                spec.Name,
+		findAny:             spec.FindAny,
+		findAll:             spec.FindAll,
+		match:               spec.Match,
+		suffixFnBodies:      suffixFnBodies,
+		numSuffixFns:        len(suffixFnBodies),
+		dataBytes:           allDataBytes,
+		dataSegCount:        totalDataSegs,
+		prefixFnBodies:      prefixFnBodies,
+		prefixDataBytes:     prefixDataBytes,
+		prefixDataSegCount:  prefixDataSegCount,
+		prefixFnIdx:         prefixFnIdx,
 		trivialPrefixMasks:  trivialPrefixMasks,
 		startAnchorMasks:    startAnchorMasks,
 		varLenMasks:         varLenMasks,
 		varLenNonemptyMasks: varLenNonemptyMasks,
 		prefixFixedLens:     prefixFixedLens,
-		buckets:            buckets,
-		patternIDs:         patternIDs,
-		diag:               diag,
+		buckets:             buckets,
+		patternIDs:          patternIDs,
+		diag:                diag,
 	}
 	return cs, nil
 }

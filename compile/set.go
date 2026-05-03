@@ -22,10 +22,10 @@ type PatternInfo struct {
 	prefixDFA *dfaTable // built from prefixAST (reversed); nil when trivial
 	prefixID  int       // index into dedup prefix pool; -1 = trivial
 
-	trivialPrefix     bool // true when prefixAST is nil
-	startAnchor       bool // true when original prefixAST (before trimming) had BeginText/BeginLine
-	prefixMaxLen      int  // max byte length of prefix (0=trivial, -1=unbounded)
-	prefixMinLen      int  // min byte length of prefix (0=trivial)
+	trivialPrefix        bool // true when prefixAST is nil
+	startAnchor          bool // true when original prefixAST (before trimming) had BeginText/BeginLine
+	prefixMaxLen         int  // max byte length of prefix (0=trivial, -1=unbounded)
+	prefixMinLen         int  // min byte length of prefix (0=trivial)
 	varLenEmptySuffix    bool // variable-length prefix + empty suffix: write match tuple directly
 	varLenNonEmptySuffix bool // variable-length prefix + non-empty suffix: call suffix DFA with corrected lPos
 	isolatedFallback     bool // non-greedy: isolate in own fallback bucket with leftmostFirst=false DFA
@@ -294,7 +294,6 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 					} else {
 						// Non-begin or mixed zero-length prefix: route to fallback.
 						info.splittable = false
-						ok = false
 					}
 				}
 			}
@@ -302,7 +301,6 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 			// been consumed. Route to fallback so the full-pattern DFA handles it correctly.
 			if suffixAST != nil && hasBeginAnchor(suffixAST) {
 				info.splittable = false
-				ok = false
 			}
 			info.prefixAST = prefixAST
 			info.suffixAST = suffixAST

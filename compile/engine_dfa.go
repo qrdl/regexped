@@ -1920,9 +1920,9 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	l := buildDFALayout(t, tableBase, false, true, 0, t.hasWordBoundary)
 
 	// Four 8-byte-per-state bitmask tables placed after all layout data.
-	midBitmaskOff    := int32(l.tableEnd)
-	eofBitmaskOff    := midBitmaskOff + int32(l.numWASM)*8
-	immBitmaskOff    := eofBitmaskOff + int32(l.numWASM)*8
+	midBitmaskOff := int32(l.tableEnd)
+	eofBitmaskOff := midBitmaskOff + int32(l.numWASM)*8
+	immBitmaskOff := eofBitmaskOff + int32(l.numWASM)*8
 	eofMidBitmaskOff := immBitmaskOff + int32(l.numWASM)*8
 
 	writeBitmask := func(m map[int]uint64) []byte {
@@ -1981,139 +1981,6 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	return
 }
 
-// buildSuffixBody generates the WASM function body for suffix DFA scanning.
-// Signature: (ptr i32, start i32, len i32) → i64
-//
-// midBitmaskOff: 8-byte-per-state table of midAcceptStates (any-position accept).
-// eofBitmaskOff: 8-byte-per-state table of acceptStates (end-of-input accept, $ anchors).
-//
-// endPos is updated greedily on every mid-accept (not just the first), giving
-// correct leftmost-first match lengths for a*, a+, a?, etc.
-func buildSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff int32, tableMemIdx int) []byte {
-	const (
-		paramPtr   = byte(0)
-		paramStart = byte(1)
-		paramLen   = byte(2)
-		lState     = byte(3)
-		lPos       = byte(4)
-		lEndPos    = byte(5)
-		lByteClass = byte(6)
-		lBits      = byte(7)
-		lResult    = byte(8)
-	)
-	var b []byte
-	// 2 local groups: (4 × i32: state, pos, endPos, byteOrClass), (2 × i64: bits, result)
-	b = append(b, 0x02, 0x04, 0x7F, 0x02, 0x7E)
-
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmStart))
-	b = append(b, 0x21, lState)                 // state = wasmStart
-	b = append(b, 0x20, paramStart, 0x21, lPos) // pos = start
-	// lEndPos, lBits, lResult = 0 (default)
-
-	// Check start-state midAccept: handles patterns whose suffix accepts empty
-	// (e.g. mandatory literal IS the whole pattern, or a* / b? at suffix start).
-	// Uses midBitmaskOff so $ patterns (acceptStates only) are excluded here.
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, midBitmaskOff)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmStart))
-	b = append(b, 0x41, 0x03, 0x74, 0x6A) // wasmStart*8; midBitmaskOff + wasmStart*8
-	b = appendTableLoad64(b, tableMemIdx)
-	b = append(b, 0x21, lBits)                     // lBits = midBitmask[wasmStart]
-	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52)   // bits != 0
-	b = append(b, 0x04, 0x40)                      // if
-	b = append(b, 0x20, paramStart, 0x21, lEndPos) // endPos = paramStart
-	b = append(b, 0x20, lBits, 0x21, lResult)      // result = bits
-	b = append(b, 0x0B)                            // end if
-
-	b = append(b, 0x02, 0x40) // block $done
-	b = append(b, 0x03, 0x40) // loop $main
-
-	// if pos >= len: br $done
-	b = append(b, 0x20, lPos, 0x20, paramLen, 0x4F, 0x0D, 0x01)
-
-	// DFA transition
-	if l.useU8 && l.useCompression {
-		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
-			l.useRowDedup, l.rowMapOff, lState, lByteClass, paramPtr, lPos, 0xff, tableMemIdx)
-	} else if l.useU8 {
-		b = emitSimpleU8Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff,
-			lState, paramPtr, lPos, 0xff, tableMemIdx)
-	} else {
-		// u16: load input byte into lByteClass first
-		b = append(b, 0x20, paramPtr, 0x20, lPos, 0x6A, 0x2D, 0x00, 0x00) // mem[ptr+pos]
-		b = append(b, 0x21, lByteClass)
-		b = emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff, lState, lByteClass, tableMemIdx)
-	}
-
-	// lBits = midBitmask[state * 8] — fires at any position (no $ context)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, midBitmaskOff)
-	b = append(b, 0x20, lState)
-	b = append(b, 0x41, 0x03, 0x74, 0x6A) // state*8; midBitmaskOff + state*8
-	b = appendTableLoad64(b, tableMemIdx)
-	b = append(b, 0x21, lBits)
-
-	// if bits!=0: endPos = pos+1 (greedy — update on every accept, not just first)
-	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52)               // bits != 0
-	b = append(b, 0x04, 0x40)                                  // if (void)
-	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lEndPos) // endPos = pos+1
-	b = append(b, 0x0B)                                        // end if
-
-	// result |= bits
-	b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult) // i64.or
-
-	// if immediateAccept[state]: br $done (LeftmostFirst early exit)
-	if l.hasImmAccept {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
-		b = append(b, 0x20, lState)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x0D, 0x01) // br_if $done
-	}
-
-	// if state == 0 (dead): br $done
-	b = append(b, 0x20, lState, 0x45, 0x0D, 0x01) // i32.eqz + br_if $done
-
-	// pos++; br $main
-	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
-	b = append(b, 0x0C, 0x00) // br $main
-
-	b = append(b, 0x0B) // end loop $main
-	b = append(b, 0x0B) // end block $done
-
-	// EOF accept: load eofBitmask[state] for $ anchors and patterns accepting at EOF.
-	// If endPos still 0 (no mid-accept), set endPos = lPos (scan position at EOF).
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, eofBitmaskOff)
-	b = append(b, 0x20, lState)
-	b = append(b, 0x41, 0x03, 0x74, 0x6A) // state*8; eofBitmaskOff + state*8
-	b = appendTableLoad64(b, tableMemIdx)
-	b = append(b, 0x21, lBits)
-	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52)                   // lBits != 0
-	b = append(b, 0x04, 0x40)                                      // if
-	b = append(b, 0x20, lEndPos, 0x45)                             // i32.eqz endPos
-	b = append(b, 0x04, 0x40)                                      // if endPos == 0
-	b = append(b, 0x20, lPos, 0x21, lEndPos)                       // endPos = lPos
-	b = append(b, 0x0B)                                            // end if
-	b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult) // result |= lBits
-	b = append(b, 0x0B)                                            // end if lBits != 0
-
-	// return (i64(endPos) << 32) | (result & 0xFFFFFFFF)
-	b = append(b, 0x20, lEndPos)
-	b = append(b, 0xAD)       // i64.extend_i32_u
-	b = append(b, 0x42, 0x20) // i64.const 32
-	b = append(b, 0x86)       // i64.shl
-	b = append(b, 0x20, lResult)
-	b = append(b, 0xA7) // i32.wrap_i64
-	b = append(b, 0xAD) // i64.extend_i32_u
-	b = append(b, 0x84) // i64.or
-	b = append(b, 0x0B) // end function
-	return b
-}
-
 // buildSetSuffixBody generates the WASM function body for per-pattern set suffix scanning.
 // Signature: (ptr i32, start i32, len i32, lPos i32, out_ptr i32, out_cap i32, validMask i32) → i32
 //
@@ -2150,9 +2017,9 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 	// Per-pattern endPos locals: 14..14+n-1 (i32 each)
 	// i64 locals after: 14+n, 14+n+1, 14+n+2
 	endPosBase := byte(14)
-	endPosK    := func(k int) byte { return endPosBase + byte(k) }
-	lBits        := byte(14 + n)
-	lResult      := byte(15 + n)
+	endPosK := func(k int) byte { return endPosBase + byte(k) }
+	lBits := byte(14 + n)
+	lResult := byte(15 + n)
 	lStartResult := byte(16 + n)
 
 	var b []byte
@@ -2175,10 +2042,10 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(wordCharOff[0]))
 		b = append(b, 0x20, paramPtr, 0x20, paramLPos, 0x41, 0x01, 0x6B, 0x6A) // paramPtr + paramLPos - 1
-		b = appendTableLoad8u(b, tableMemIdx)                                    // input[prev]
-		b = append(b, 0x6A)                                                      // wordCharOff + input[prev]
-		b = appendTableLoad8u(b, tableMemIdx)                                    // wordChar[prev]
-		b = append(b, 0x04, 0x7F)                                               // if prevWasWord (result i32)
+		b = appendTableLoad8u(b, tableMemIdx)                                  // input[prev]
+		b = append(b, 0x6A)                                                    // wordCharOff + input[prev]
+		b = appendTableLoad8u(b, tableMemIdx)                                  // wordChar[prev]
+		b = append(b, 0x04, 0x7F)                                              // if prevWasWord (result i32)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(l.wasmMidStartWord))
 		b = append(b, 0x05)
@@ -2189,7 +2056,7 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(wasmMidStart))
 	}
-	b = append(b, 0x0B)      // end outer if → i32 on stack
+	b = append(b, 0x0B) // end outer if → i32 on stack
 	b = append(b, 0x21, lState)
 	b = append(b, 0x20, paramStart, 0x21, lScanPos)
 
@@ -2204,11 +2071,11 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 		// Read wordChar[input[paramPtr + lScanPos]]
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(wordCharOff[0]))
-		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)  // paramPtr + lScanPos
-		b = appendTableLoad8u(b, tableMemIdx)                  // input[lScanPos]
-		b = append(b, 0x6A)                                    // wordCharOff + byte
-		b = appendTableLoad8u(b, tableMemIdx)                  // wordChar[byte] (isWord)
-		b = append(b, 0x04, 0x40)                             // if isWord (void)
+		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A) // paramPtr + lScanPos
+		b = appendTableLoad8u(b, tableMemIdx)               // input[lScanPos]
+		b = append(b, 0x6A)                                 // wordCharOff + byte
+		b = appendTableLoad8u(b, tableMemIdx)               // wordChar[byte] (isWord)
+		b = append(b, 0x04, 0x40)                           // if isWord (void)
 		// isWord: wbBits = wbWBitmask[lState]
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(wbW))
