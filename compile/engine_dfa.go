@@ -1307,7 +1307,9 @@ func dfaTableBytes(t *dfaTable) int {
 // buildDFALayout computes all DFA table data and offsets. needFind must be true
 // when a find function will be emitted (computes extra tables for find mode).
 // compiledDFAThreshold is the resolved threshold (0 = disabled, 1..256 = active).
-func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int) *dfaLayout {
+// forceWordChar (optional): force word-char table computation even when needFind=false.
+func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, forceWordChar ...bool) *dfaLayout {
+	wantWordChar := needFind || (len(forceWordChar) > 0 && forceWordChar[0])
 	l := &dfaLayout{}
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
@@ -1326,8 +1328,8 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 		}
 	}
 
-	// Word char table (find + word boundary only).
-	l.needWordCharTable = needFind && t.hasWordBoundary
+	// Word char table (find + word boundary, or when forceWordChar is set).
+	l.needWordCharTable = wantWordChar && t.hasWordBoundary
 	wordCharTableSize := int32(0)
 	if l.needWordCharTable {
 		l.wordCharTableOff = int32(tableBase)
@@ -1459,8 +1461,8 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 		immAcceptSize = int32(l.numWASM)
 	}
 
-	// Word-boundary pre-transition accept flags (find mode only).
-	if needFind && t.hasWordBoundary {
+	// Word-boundary pre-transition accept flags.
+	if wantWordChar && t.hasWordBoundary {
 		l.midAcceptNWOff = l.midAcceptOff + int32(l.numWASM) + immAcceptSize
 		l.midAcceptWOff = l.midAcceptNWOff + int32(l.numWASM)
 		l.midAcceptNWBytes = make([]byte, l.numWASM)
@@ -1477,7 +1479,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 		}
 	}
 	wbAcceptSize := int32(0)
-	if needFind && t.hasWordBoundary {
+	if wantWordChar && t.hasWordBoundary {
 		wbAcceptSize = int32(l.numWASM) * 2
 	}
 
@@ -1654,8 +1656,8 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 		}
 	}
 
-	// Find-mode DFA state constants.
-	if needFind {
+	// Find-mode DFA state constants (also needed for word-boundary suffix DFAs).
+	if needFind || (wantWordChar && t.hasWordBoundary) {
 		l.wasmMidStart = uint32(t.midStartState + 1)
 		l.wasmMidStartWord = uint32(t.midStartWordState + 1)
 		l.wasmMidStartNewline = uint32(t.midStartNewlineState + 1)
@@ -1677,12 +1679,12 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	if l.hasImmAccept {
 		maxEnd(l.immediateAcceptOff, int64(l.numWASM))
 	}
+	if l.needWordCharTable {
+		maxEnd(l.midAcceptNWOff, int64(l.numWASM))
+		maxEnd(l.midAcceptWOff, int64(l.numWASM))
+	}
 	if needFind {
 		maxEnd(l.midAcceptOff, int64(l.numWASM))
-		if l.needWordCharTable {
-			maxEnd(l.midAcceptNWOff, int64(l.numWASM))
-			maxEnd(l.midAcceptWOff, int64(l.numWASM))
-		}
 		if l.midAcceptNLBytes != nil {
 			maxEnd(l.midAcceptNLOff, int64(l.numWASM))
 		}
@@ -1800,7 +1802,13 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			if l.useRowDedup {
 				count++
 			}
+			if l.needWordCharTable {
+				count += 3 // wordCharTable + midAcceptNW + midAcceptW
+			}
 			ds = append(ds, count)
+			if l.needWordCharTable {
+				ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
+			}
 			ds = appendDataSegment(ds, l.classMapOff, l.classMap[:])
 			if l.useRowDedup {
 				ds = appendDataSegment(ds, l.rowMapOff, l.rowMapBytes)
@@ -1810,6 +1818,10 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			ds = appendDataSegment(ds, l.midAcceptOff, l.midAcceptBytes)
 			if l.hasImmAccept {
 				ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
+			}
+			if l.needWordCharTable {
+				ds = appendDataSegment(ds, l.midAcceptNWOff, l.midAcceptNWBytes)
+				ds = appendDataSegment(ds, l.midAcceptWOff, l.midAcceptWBytes)
 			}
 		}
 	} else {
@@ -1851,7 +1863,13 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			if l.useRowDedup {
 				count++
 			}
+			if l.needWordCharTable {
+				count += 3 // wordCharTable + midAcceptNW + midAcceptW
+			}
 			ds = append(ds, count)
+			if l.needWordCharTable {
+				ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
+			}
 			if l.useRowDedup {
 				ds = appendDataSegment(ds, l.rowMapOff, l.rowMapBytes)
 			}
@@ -1859,6 +1877,10 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
 			if l.hasImmAccept {
 				ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
+			}
+			if l.needWordCharTable {
+				ds = appendDataSegment(ds, l.midAcceptNWOff, l.midAcceptNWBytes)
+				ds = appendDataSegment(ds, l.midAcceptWOff, l.midAcceptWBytes)
 			}
 		}
 	}
@@ -1895,7 +1917,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		return
 	}
 
-	l := buildDFALayout(t, tableBase, false, true, 0)
+	l := buildDFALayout(t, tableBase, false, true, 0, t.hasWordBoundary)
 
 	// Four 8-byte-per-state bitmask tables placed after all layout data.
 	midBitmaskOff    := int32(l.tableEnd)
@@ -1931,6 +1953,11 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		return bs
 	}
 
+	// Word-boundary bitmask tables (8 bytes per state, per-pattern bitmasks).
+	// Only present when t.hasWordBoundary; placed after the standard 4 bitmask tables.
+	wbNWBitmaskOff := eofMidBitmaskOff + int32(l.numWASM)*8
+	wbWBitmaskOff := wbNWBitmaskOff + int32(l.numWASM)*8
+
 	layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false))
 	dataBytes = append(dataBytes, layoutRaw...)
 	dataBytes = append(dataBytes, appendDataSegment(nil, midBitmaskOff, writeBitmask(t.midAcceptStates))...)
@@ -1938,11 +1965,17 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	dataBytes = append(dataBytes, appendDataSegment(nil, immBitmaskOff, writeBitmask(t.immediateAcceptStates))...)
 	dataBytes = append(dataBytes, appendDataSegment(nil, eofMidBitmaskOff, writeMidEofBitmask())...)
 	dataSegCount = layoutCount + 4
+	if t.hasWordBoundary {
+		dataBytes = append(dataBytes, appendDataSegment(nil, wbNWBitmaskOff, writeBitmask(t.midAcceptNWStates))...)
+		dataBytes = append(dataBytes, appendDataSegment(nil, wbWBitmaskOff, writeBitmask(t.midAcceptWStates))...)
+		dataSegCount += 2
+	}
 
 	// Use wasmStart for lPos==0 (allows ^ anchors to fire), wasmMidStart otherwise.
 	wasmMidStart := uint32(t.midStartState + 1)
 	wasmStart := uint32(t.startState + 1)
-	body := buildSetSuffixBody(l, midBitmaskOff, eofBitmaskOff, eofMidBitmaskOff, immBitmaskOff, wasmStart, wasmMidStart, patternIDs, prefixFixedLens, tableMemIdx)
+	body := buildSetSuffixBody(l, midBitmaskOff, eofBitmaskOff, eofMidBitmaskOff, immBitmaskOff, wasmStart, wasmMidStart, patternIDs, prefixFixedLens, tableMemIdx,
+		l.wordCharTableOff, wbNWBitmaskOff, wbWBitmaskOff)
 	funcBody = utils.AppendULEB128(nil, uint32(len(body)))
 	funcBody = append(funcBody, body...)
 	return
@@ -2089,7 +2122,8 @@ func buildSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff int32, tableMemI
 // Returns the count written.
 //
 // Uses per-pattern endPos tracking to eliminate shared-endPos contamination.
-func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmaskOff, immBitmaskOff int32, wasmStart, wasmMidStart uint32, patternIDs, prefixFixedLens []int, tableMemIdx int) []byte {
+func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmaskOff, immBitmaskOff int32, wasmStart, wasmMidStart uint32, patternIDs, prefixFixedLens []int, tableMemIdx int, wordCharOff ...int32) []byte {
+	hasWordChar := len(wordCharOff) == 3 && l.needWordCharTable
 	n := len(patternIDs)
 	if n > 32 {
 		n = 32
@@ -2128,18 +2162,86 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 	b = append(b, 0x7F)       // i32
 	b = append(b, 0x03, 0x7E) // 3 × i64
 
-	// Initial state: wasmStart when lPos==0 (allows ^ to fire), wasmMidStart otherwise.
+	// Initial state: wasmStart when lPos==0; for word-boundary DFAs also select
+	// wasmMidStartWord when the previous byte was a word char.
 	b = append(b, 0x20, paramLPos)
 	b = append(b, 0x45)       // i32.eqz (lPos == 0)
 	b = append(b, 0x04, 0x7F) // if (result i32)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(wasmStart))
-	b = append(b, 0x05) // else
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(wasmMidStart))
-	b = append(b, 0x0B)      // end if → i32 on stack
+	b = append(b, 0x05) // else: paramLPos != 0
+	if hasWordChar {
+		// prevWasWord = wordChar[input[paramPtr + paramLPos - 1]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(wordCharOff[0]))
+		b = append(b, 0x20, paramPtr, 0x20, paramLPos, 0x41, 0x01, 0x6B, 0x6A) // paramPtr + paramLPos - 1
+		b = appendTableLoad8u(b, tableMemIdx)                                    // input[prev]
+		b = append(b, 0x6A)                                                      // wordCharOff + input[prev]
+		b = appendTableLoad8u(b, tableMemIdx)                                    // wordChar[prev]
+		b = append(b, 0x04, 0x7F)                                               // if prevWasWord (result i32)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(l.wasmMidStartWord))
+		b = append(b, 0x05)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(wasmMidStart))
+		b = append(b, 0x0B) // end inner if
+	} else {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(wasmMidStart))
+	}
+	b = append(b, 0x0B)      // end outer if → i32 on stack
 	b = append(b, 0x21, lState)
 	b = append(b, 0x20, paramStart, 0x21, lScanPos)
+
+	// emitWBPreAcceptCheck emits the word-boundary pre-transition bitmask check.
+	// Reads current byte, selects wbWBitmask or wbNWBitmask, ORs into lResult, updates endPos_k.
+	emitWBCheck := func(b []byte) []byte {
+		if !hasWordChar {
+			return b
+		}
+		wbNW := wordCharOff[1]
+		wbW := wordCharOff[2]
+		// Read wordChar[input[paramPtr + lScanPos]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(wordCharOff[0]))
+		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)  // paramPtr + lScanPos
+		b = appendTableLoad8u(b, tableMemIdx)                  // input[lScanPos]
+		b = append(b, 0x6A)                                    // wordCharOff + byte
+		b = appendTableLoad8u(b, tableMemIdx)                  // wordChar[byte] (isWord)
+		b = append(b, 0x04, 0x40)                             // if isWord (void)
+		// isWord: wbBits = wbWBitmask[lState]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(wbW))
+		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+		b = appendTableLoad64(b, tableMemIdx)
+		b = append(b, 0x21, lBits)
+		b = append(b, 0x05) // else: !isWord
+		// !isWord: wbBits = wbNWBitmask[lState]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(wbNW))
+		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+		b = appendTableLoad64(b, tableMemIdx)
+		b = append(b, 0x21, lBits)
+		b = append(b, 0x0B) // end if isWord
+		// lResult |= lBits
+		b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult)
+		// lBitsScratch = low32(lBits) & validMask
+		b = append(b, 0x20, lBits, 0xA7, 0x21, lBitsScratch)
+		b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch)
+		// For each bit k: if fires, set endPos_k = lScanPos (pre-transition boundary)
+		for k := range patternIDs {
+			if k >= 32 {
+				break
+			}
+			bit := uint32(1) << uint(k)
+			b = append(b, 0x20, lBitsScratch, 0x41)
+			b = utils.AppendSLEB128(b, int32(bit))
+			b = append(b, 0x71, 0x04, 0x40)
+			b = append(b, 0x20, lScanPos, 0x21, endPosK(k))
+			b = append(b, 0x0B)
+		}
+		return b
+	}
 
 	// emitWriteMatchK: write match tuple for pattern k with compile-time prefix length.
 	// prefixMaxLen: max prefix length (0 = trivial, >0 = fixed, -1 = variable/unknown).
@@ -2215,6 +2317,9 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 	b = append(b, 0x03, 0x40) // loop $main
 
 	b = append(b, 0x20, lScanPos, 0x20, paramLen, 0x4F, 0x0D, 0x01) // pos>=len: br $done
+
+	// Word-boundary pre-transition accept check (before consuming current byte).
+	b = emitWBCheck(b)
 
 	// DFA transition
 	if l.useU8 && l.useCompression {

@@ -26,7 +26,7 @@ force-backtrack: $(ADJUSTED)
 	go run . --force-backtrack --validate-groups $(ADJUSTED)
 	go run . --force-backtrack --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack
+test: exhaustive custom adjusted force-backtrack sets
 
 sets: $(TESTDATA)
 	go run . --sets $(TESTDATA)

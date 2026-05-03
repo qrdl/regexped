@@ -1692,3 +1692,176 @@ func TestDiagJSON_Schema(t *testing.T) {
 		}
 	}
 }
+
+// --------------------------------------------------------------------------
+// Anchor helper tests (endsWithBeginAnchor, isOnlyBeginAnchors,
+// hasBeginAnchor, hasBeginAnchorAtTopLevel)
+
+func TestEndsWithBeginAnchor(t *testing.T) {
+	cases := []struct {
+		pat  string
+		want bool
+	}{
+		{`^`, true},                 // bare ^
+		{`\z^`, true},               // end-then-begin: ends with ^
+		{`(^^)*$`, false},           // ends with $, not ^
+		{`(?:a)`, false},            // no anchor
+		{`a^`, true},                // concat ending with ^
+		{`^a`, false},               // concat ending with 'a'
+		{`(^)`, true},               // capture wrapping ^
+	}
+	for _, tc := range cases {
+		re := mustParse(t, tc.pat)
+		if got := endsWithBeginAnchor(re); got != tc.want {
+			t.Errorf("endsWithBeginAnchor(%q) = %v, want %v", tc.pat, got, tc.want)
+		}
+	}
+	if endsWithBeginAnchor(nil) {
+		t.Error("endsWithBeginAnchor(nil) = true, want false")
+	}
+}
+
+func TestIsOnlyBeginAnchors(t *testing.T) {
+	cases := []struct {
+		pat  string
+		want bool
+	}{
+		{`^`, true},          // single ^
+		{`\A`, true},         // \A (begin-text)
+		{`^^`, true},         // concat of two begin-anchors
+		{`^a`, false},        // concat with non-anchor
+		{`^$`, false},        // concat with end-anchor
+		{`(?:a)`, false},     // not an anchor at all
+		{`(^)`, true},        // capture wrapping ^
+	}
+	for _, tc := range cases {
+		re := mustParse(t, tc.pat)
+		if got := isOnlyBeginAnchors(re); got != tc.want {
+			t.Errorf("isOnlyBeginAnchors(%q) = %v, want %v", tc.pat, got, tc.want)
+		}
+	}
+	if isOnlyBeginAnchors(nil) {
+		t.Error("isOnlyBeginAnchors(nil) = true, want false")
+	}
+}
+
+func TestHasBeginAnchor(t *testing.T) {
+	cases := []struct {
+		pat  string
+		want bool
+	}{
+		{`^a`, true},
+		{`a^`, true},
+		{`(^^)*$`, true},
+		{`a+`, false},
+		{`$`, false},
+		{`\z`, false},
+	}
+	for _, tc := range cases {
+		re := mustParse(t, tc.pat)
+		if got := hasBeginAnchor(re); got != tc.want {
+			t.Errorf("hasBeginAnchor(%q) = %v, want %v", tc.pat, got, tc.want)
+		}
+	}
+	if hasBeginAnchor(nil) {
+		t.Error("hasBeginAnchor(nil) = true, want false")
+	}
+}
+
+func TestHasBeginAnchorAtTopLevel(t *testing.T) {
+	cases := []struct {
+		pat  string
+		want bool
+	}{
+		{`^a`, true},          // ^ at mandatory start
+		{`\Aa`, true},         // \A at mandatory start
+		{`a^`, false},         // ^ after byte-consumer — not at top-level start
+		{`(^^)*$`, false},     // ^ inside *, not mandatory at top level
+		{`a+`, false},         // no anchor
+		{`(^a)`, true},        // ^ through capture
+	}
+	for _, tc := range cases {
+		re := mustParse(t, tc.pat)
+		if got := hasBeginAnchorAtTopLevel(re); got != tc.want {
+			t.Errorf("hasBeginAnchorAtTopLevel(%q) = %v, want %v", tc.pat, got, tc.want)
+		}
+	}
+	if hasBeginAnchorAtTopLevel(nil) {
+		t.Error("hasBeginAnchorAtTopLevel(nil) = true, want false")
+	}
+}
+
+// --------------------------------------------------------------------------
+// analyzePattern edge-case coverage
+
+func TestAnalyzePattern_NonGreedyFallback(t *testing.T) {
+	// Non-greedy pattern: should go to isolated fallback (no error).
+	re := config.RegexEntry{Pattern: `(?:a+?)b`}
+	var pp, sp dfaPool
+	info, err := analyzePattern(re, &pp, &sp)
+	if err != nil {
+		t.Fatalf("analyzePattern non-greedy: unexpected error: %v", err)
+	}
+	if info.splittable {
+		t.Error("expected splittable=false for non-greedy pattern")
+	}
+	if !info.isolatedFallback {
+		t.Error("expected isolatedFallback=true for non-greedy pattern")
+	}
+}
+
+func TestAnalyzePattern_ZeroLengthFallback(t *testing.T) {
+	// Pattern with minLen=0: routes to fallback.
+	re := config.RegexEntry{Pattern: `(?:aa)*`}
+	var pp, sp dfaPool
+	info, err := analyzePattern(re, &pp, &sp)
+	if err != nil {
+		t.Fatalf("analyzePattern zero-length: unexpected error: %v", err)
+	}
+	if info.splittable {
+		t.Error("expected splittable=false for zero-length pattern")
+	}
+}
+
+func TestAnalyzePattern_ZeroLengthBeginAnchor(t *testing.T) {
+	// Pattern with minLen=0 and begin-anchor at top level: startAnchor=true.
+	re := config.RegexEntry{Pattern: `^(?:aa)*`}
+	var pp, sp dfaPool
+	info, err := analyzePattern(re, &pp, &sp)
+	if err != nil {
+		t.Fatalf("analyzePattern ^(aa)*: unexpected error: %v", err)
+	}
+	if info.splittable {
+		t.Error("expected splittable=false")
+	}
+	if !info.startAnchor {
+		t.Error("expected startAnchor=true for ^(aa)*")
+	}
+}
+
+func TestAnalyzePattern_NonBeginZeroLenPrefix(t *testing.T) {
+	// Pattern where the prefix is a non-begin zero-length assertion ($a):
+	// should route to fallback (splittable=false).
+	re := config.RegexEntry{Pattern: `(?:$)a`}
+	var pp, sp dfaPool
+	info, err := analyzePattern(re, &pp, &sp)
+	if err != nil {
+		t.Fatalf("analyzePattern $a: unexpected error: %v", err)
+	}
+	if info.splittable {
+		t.Error("expected splittable=false for $a (non-begin zero-len prefix)")
+	}
+}
+
+func TestAnalyzePattern_BeginSuffixFallback(t *testing.T) {
+	// Pattern whose suffix contains a begin-anchor (a^): routes to fallback.
+	re := config.RegexEntry{Pattern: `a^`}
+	var pp, sp dfaPool
+	info, err := analyzePattern(re, &pp, &sp)
+	if err != nil {
+		t.Fatalf("analyzePattern a^: unexpected error: %v", err)
+	}
+	if info.splittable {
+		t.Error("expected splittable=false for a^ (begin-anchor in suffix)")
+	}
+}

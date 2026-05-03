@@ -148,10 +148,14 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 		case line == "strings":
 			if setsMode && !inStrings && len(setBlockEntries) >= 2 {
 				p, f, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+				prevPassSet := npassSet
 				npassSet += p
 				nfailSet += f
 				if testErr != nil {
 					return testErr
+				}
+				if (prevPassSet/500000) != (npassSet/500000) {
+					fmt.Fprintf(os.Stderr, "  ... %dK set cases\n", npassSet/1000)
 				}
 				if maxErrors > 0 && nfailSet >= maxErrors {
 					fmt.Printf("Stopping after %d set failure(s)\n", nfailSet)
@@ -672,10 +676,14 @@ done:
 	// Test the final block (not triggered by a "strings" line).
 	if setsMode && !stopped && !inStrings && len(setBlockEntries) >= 2 {
 		p, f, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+		prevPassSet := npassSet
 		npassSet += p
 		nfailSet += f
 		if testErr != nil {
 			return testErr
+		}
+		if (prevPassSet/500000) != (npassSet/500000) {
+			fmt.Fprintf(os.Stderr, "  ... %dK set cases\n", npassSet/1000)
 		}
 	}
 
@@ -756,11 +764,6 @@ func testSetBlock(
 		}
 		if _, err := syntax.Parse(e.pattern, syntax.Perl); err != nil {
 			continue // skip unsupported syntax (\C etc.)
-		}
-		// Skip word-boundary-only patterns (\b, \B): the set suffix DFA does not
-		// support pre-transition word-boundary accepts.
-		if strings.Contains(e.pattern, `\b`) || strings.Contains(e.pattern, `\B`) {
-			continue
 		}
 		eligible = append(eligible, eligibleEntry{orig: i, entry: e})
 	}

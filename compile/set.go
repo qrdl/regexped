@@ -272,20 +272,6 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	// Exception: patterns that also contain begin-anchors (e.g. \z^) produce
 	// degenerate DFAs with false EOF accepts — exclude them from sets entirely.
 	if minLen, _ := regexpMinMaxLen(parsed); minLen == 0 {
-		// Word-boundary patterns (\b, \B) with minLen=0 need pre-transition accept
-		// handling that the set suffix DFA body doesn't support. Exclude from set.
-		{
-			prog, compErr := syntax.Compile(parsed.Simplify())
-			if compErr == nil {
-				for _, inst := range prog.Inst {
-					if inst.Op == syntax.InstEmptyWidth {
-						if inst.Arg&(uint32(syntax.EmptyWordBoundary)|uint32(syntax.EmptyNoWordBoundary)) != 0 {
-							return nil, fmt.Errorf("analyzePattern: word boundary in zero-length pattern %q", re.Pattern)
-						}
-					}
-				}
-			}
-		}
 		info.splittable = false
 		info.startAnchor = hasBeginAnchorAtTopLevel(parsed)
 		return info, nil
