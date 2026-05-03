@@ -14,7 +14,7 @@ stub_type: "rust"          # optional; overrides extension-based type inference:
 max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
 
-regexes:
+regexps:
   - pattern: 'https?://...' # RE2 regex pattern
 
     # One or more func fields — only those set are compiled and stubbed.
@@ -204,7 +204,7 @@ Compiles each regex pattern to a single WASM module. The output mode is selected
 | Field | Notes |
 |---|---|
 | `wasm_file` | Required unless `--output` is given |
-| `regexes` | One or more patterns to compile |
+| `regexps` | One or more patterns to compile |
 
 Entries with no `_func` fields are silently skipped.
 
@@ -213,7 +213,7 @@ Entries with no `_func` fields are silently skipped.
 When the config contains a `sets:` block, `compile` also emits multi-pattern set-match functions. Each set entry produces up to three exported WASM functions.
 
 ```yaml
-regexes:
+regexps:
   - name: aws_key      # name is required for sets: pattern references
     pattern: 'AKIA[0-9A-Z]{16}'
   - name: github_pat
@@ -229,7 +229,7 @@ sets:
     patterns:
       - aws_key              # list of regexes.name values
       - github_pat
-      # or: patterns: "all" to include every entry in regexes:
+      # or: patterns: "all" to include every entry in regexps:
 ```
 
 | `sets:` field | Required | Description |
@@ -238,11 +238,11 @@ sets:
 | `find_all` | At least one | Export name for non-anchored all-matches function |
 | `find_any` | At least one | Export name for non-anchored first-match function |
 | `match` | At least one | Export name for anchored match function (position 0) |
-| `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexes:` |
+| `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
 | `batch_size` | No | Output buffer hint for stub iterators (default 256) |
 | `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
 
-The `name:` field on `regexes:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
+The `name:` field on `regexps:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
 
 See [sets.md](sets.md) for full pipeline details and output tuple formats.
 

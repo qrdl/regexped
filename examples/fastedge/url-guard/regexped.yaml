@@ -1,0 +1,77 @@
+output:        "final.wasm"
+wasm_file:     "patterns.wasm"
+import_module: "patterns"
+stub_file:     "stubs.rs"
+
+regexps:
+  - name: "sql_injection"
+    pattern: '(?i)(?:union\s+select|exec\s*\(|xp_cmdshell|drop\s+table|insert\s+into|delete\s+from|select\s+\*\s+from)'
+
+  - name: "path_traversal"
+    pattern: '(?:\.\./|\.\.\\|%2e%2e%2f|%252e%252e|%2e%2e/)'
+
+  - name: "xss"
+    pattern: '(?i)(?:<\s*(?:script|iframe|object|embed)\b[^>]*>|\bon\w{1,30}\s*=|(?:javascript|vbscript)\s*:|eval\s*\()'
+
+  - name: "shell_injection"
+    pattern: '(?:;\s*(?:wget|curl|bash|sh\b|cmd\.exe)|`[^`]+`|\$\([^)]+\))'
+
+  - name: "log4shell"
+    pattern: '\$\{(?:jndi|lower|upper|env|sys|java)\s*:'
+
+  - name: "dir_bruteforce"
+    pattern: '(?:/(?:admin|wp-admin|phpmyadmin|\.git|\.env|\.htaccess|\.htpasswd|config\.php|wp-config\.php)(?:/|$))'
+
+  - name: "open_redirect"
+    pattern: '(?i)(?:(?:^|[?&])(?:redirect|redir|url|next|return|goto|dest|target|link)\s*=\s*https?://)'
+
+  - name: "sensitive_file_exposure"
+    pattern: '(?i)(?:\.(?:bak|backup|old|orig|save|swp|tmp|sql|dump|gz|tar|zip)(?:\?|$)|/config\.(?:yml|json|xml|ini)(?:\?|$))'
+
+  - name: "ssrf"
+    pattern: '(?i)(?:(?:url|uri|src|href|host|dest)=https?://(?:169\.254\.|127\.|10\.|192\.168\.|localhost))'
+
+  - name: "xxe"
+    pattern: '(?:%3C(?:%21|%3F)|<(?:!|(?:xml|DOCTYPE)))'
+
+  - name: "null_byte"
+    pattern: '(?:%00|\\x00)'
+
+  - name: "crlf_injection"
+    pattern: '(?:%0[Dd]%0[Aa]|%0[Dd]|%0[Aa])'
+
+  - name: "cmd_execution"
+    pattern: '(?i)(?:/(?:cmd|exec|command|system|passthru|shell_exec|popen|proc_open)\b)'
+
+  - name: "template_injection"
+    pattern: '(?:\{\{[^}]+\}\}|\{%[^%]+%\}|\$\{[^}]+\}|#\{[^}]+\})'
+
+  - name: "prototype_pollution"
+    pattern: '(?:__proto__|__defineGetter__|constructor\[|prototype\[)'
+
+  - name: "ssti_probe"
+    pattern: '(?:\{\{7\*7\}\}|\$\{7\*7\}|<%=7\*7%>|#\{7\*7\})'
+
+  - name: "host_header_injection"
+    pattern: '(?:@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)'
+
+  - name: "request_smuggling"
+    pattern: '(?i)(?:transfer-encoding:|content-length:)'
+
+  - name: "ldap_injection"
+    pattern: '(?:\)\s*\(|\*\s*\)|\(\s*\||\(\s*&|,\s*(?:uid|cn|dc|ou)\s*=)'
+
+  - name: "xpath_injection"
+    pattern: "(?i)(?:'\\s+or\\s+'1'\\s*=\\s*'1|/\\*|contains\\s*\\(|string-length\\s*\\(|substring\\s*\\()"
+
+  - name: "nosql_injection"
+    pattern: '(?:\$(?:where|gt|lt|gte|lte|ne|in|nin|regex|exists|not|or|and|nor)\b|\{[^}]*\$)'
+
+  - name: "unicode_normalization"
+    pattern: '(?:%c0%af|%c0%2f|%e0%80%af|%c0%ae|%25c0%25af|%uff0e%uff0e)'
+
+sets:
+  - name: "attacks"
+    find_all: "scan_url"
+    emit_name_map: true
+    patterns: all

@@ -383,6 +383,7 @@ type CompileSetOptions struct {
 	BudgetBytes           int // max merged DFA table bytes per bucket; default 65536
 	BudgetStates          int // max DFA states per merged bucket; default 512
 	BudgetStatesPreFilter int // pre-filter: suffixStates * combinedClassCount; default 65536
+	TableMemIdx           int // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
 }
 
 func (o CompileSetOptions) bitmaskWidth() int {

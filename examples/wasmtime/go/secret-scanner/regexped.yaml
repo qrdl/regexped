@@ -1,5 +1,7 @@
+output:        "final.wasm"
 wasm_file:     "secrets.wasm"
 import_module: "secrets"
+stub_file:     "stub.go"
 
 regexps:
   - name: aws_key
@@ -36,4 +38,4 @@ sets:
   - name: scanner
     find_all: scan_secrets
     emit_name_map: true
-    patterns: "all"
+    patterns: all

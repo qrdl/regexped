@@ -45,7 +45,7 @@ func TestGroupsExportName(t *testing.T) {
 }
 
 func TestLoadConfig(t *testing.T) {
-	yaml := "regexes:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+	yaml := "regexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
 	dir := t.TempDir()
 	path := filepath.Join(dir, "regexped.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
@@ -89,7 +89,7 @@ func TestLoadConfigNoRegexes(t *testing.T) {
 
 func TestLoadConfigPathResolution(t *testing.T) {
 	dir := t.TempDir()
-	yaml := "wasm_file: regexps.wasm\nstub_file: src/stub.rs\noutput: final.wasm\nregexes:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+	yaml := "wasm_file: regexps.wasm\nstub_file: src/stub.rs\noutput: final.wasm\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
 	path := filepath.Join(dir, "regexped.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
 		t.Fatal(err)
@@ -124,9 +124,9 @@ func TestLoadConfigWasmMergeResolution(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			yaml := "wasm_merge: " + c.wasmMerge + "\nregexes:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+			yaml := "wasm_merge: " + c.wasmMerge + "\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
 			if c.wasmMerge == "" {
-				yaml = "regexes:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+				yaml = "regexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
 			}
 			path := filepath.Join(dir, "regexped.yaml")
 			if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {

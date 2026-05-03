@@ -19,7 +19,7 @@ wasm_file:     "regexps.wasm"   # compiled standalone WASM output
 stub_file:     "regex.js"       # generated JS module
 import_module: "regexps"        # module name used in generated stubs
 
-regexes:
+regexps:
   - pattern:    '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
     match_func: "email_match"
 

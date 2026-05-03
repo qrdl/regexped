@@ -16,7 +16,7 @@ their positions and pattern IDs — in one WASM call.
 ## Pipeline overview
 
 ```
-regexes: [p1, p2, ..., pN]
+regexps: [p1, p2, ..., pN]
             │
             ▼
     analyzePattern()       ← split each pattern at its mandatory literal
@@ -37,7 +37,7 @@ regexes: [p1, p2, ..., pN]
 ## YAML configuration
 
 ```yaml
-regexes:
+regexps:
   - name: aws_key          # name: required for sets.patterns list references
     pattern: 'AKIA[0-9A-Z]{16}'
   - name: github_pat
@@ -53,7 +53,7 @@ sets:
     patterns:
       - aws_key
       - github_pat
-      # or: patterns: "all"   ← include every entry in regexes:
+      # or: patterns: "all"   ← include every entry in regexps:
 ```
 
 At least one of `find_all`, `find_any`, or `match` must be set per entry.
@@ -97,7 +97,7 @@ used in generated stubs (default 256). Tune it:
 
 When any set has `emit_name_map: true`, the stub generator emits a single
 file-wide `pattern_name(id)` lookup function built from the `name:` fields
-in `regexes:`. The function maps a global pattern ID back to the name string.
+in `regexps:`. The function maps a global pattern ID back to the name string.
 It is emitted exactly once even when multiple sets opt in; it is never
 set-prefixed since pattern IDs are file-wide YAML order indices.
 

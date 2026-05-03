@@ -97,7 +97,7 @@ stub_file:     "src/stubs.rs"        # stub output file; extension determines ty
 stub_type:     "rust"                # optional; overrides extension inference: rust, js, ts, go, c, as
 max_dfa_states: 1024                 # optional; max DFA/TDFA states before falling back (default 1024)
 max_tdfa_regs:  32                   # optional; max TDFA registers before falling back (default 32)
-regexes:
+regexps:
   - pattern: '(?P<scheme>https?)://(?P<host>[^/:?#]+)...'
 
     # All func fields are optional; an entry with only 'pattern' is silently skipped.

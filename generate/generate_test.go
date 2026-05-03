@@ -732,12 +732,12 @@ func setTestCfg() config.BuildConfig {
 	}
 }
 
-func TestGenRustSetSection(t *testing.T) {
+func TestGenRustSetInner(t *testing.T) {
 	cfg := setTestCfg()
-	out := genRustSetSection(cfg)
+	out := genRustSetInner(cfg)
 	required := []string{
 		"SetMatch",
-		"SetAnchorMatch",
+		"range(self)",
 		"scan_all",
 		"scan_any",
 		"validate",
@@ -749,8 +749,11 @@ func TestGenRustSetSection(t *testing.T) {
 	}
 	for _, s := range required {
 		if !strings.Contains(out, s) {
-			t.Errorf("genRustSetSection: missing %q", s)
+			t.Errorf("genRustSetInner: missing %q", s)
 		}
+	}
+	if strings.Contains(out, "SetAnchorMatch") {
+		t.Error("genRustSetInner: should not contain SetAnchorMatch (removed in 5.4.1)")
 	}
 }
 
@@ -759,7 +762,6 @@ func TestGenGoSetSection(t *testing.T) {
 	out := genGoSetSection(cfg, "mymod")
 	required := []string{
 		"SetMatch",
-		"SetAnchorMatch",
 		"ScanAll",
 		"ScanAny",
 		"Validate",
@@ -796,7 +798,6 @@ func TestGenTSSetSection(t *testing.T) {
 	out := genTSSetSection(cfg)
 	required := []string{
 		"SetMatch",
-		"SetAnchorMatch",
 		"scan_all",
 		"scan_any",
 		"validate",
@@ -827,7 +828,6 @@ func TestGenASSetSection(t *testing.T) {
 	out := genASSetSection(cfg)
 	required := []string{
 		"SetMatch",
-		"SetAnchorMatch",
 		"scan_all",
 		"scan_any",
 		"validate",
@@ -842,20 +842,24 @@ func TestGenASSetSection(t *testing.T) {
 
 func TestRustStub_WithSets(t *testing.T) {
 	cfg := setTestCfg()
-	out, err := genRustStubFile(cfg.Regexes, cfg.ImportModule)
-	out += genRustSetSection(cfg)
+	inner, err := genRustStubsInner(cfg.Regexes, cfg.ImportModule)
 	if err != nil {
-		t.Fatalf("genRustStubFile: %v", err)
+		t.Fatalf("genRustStubsInner: %v", err)
 	}
+	inner += genRustSetInner(cfg)
+	out := wrapRustModule(inner, cfg.ImportModule)
 	if !strings.Contains(out, "SetMatch") {
 		t.Error("rust stub with sets: missing SetMatch type")
+	}
+	if !strings.Contains(out, "pub mod "+cfg.ImportModule) {
+		t.Error("rust stub with sets: missing module wrapper")
 	}
 }
 
 func TestSetSection_NoSets_Empty(t *testing.T) {
 	cfg := config.BuildConfig{ImportModule: "m", Regexes: []config.RegexEntry{{Pattern: `foo`}}}
-	if s := genRustSetSection(cfg); s != "" {
-		t.Errorf("genRustSetSection with no sets: got non-empty %q", s)
+	if s := genRustSetInner(cfg); s != "" {
+		t.Errorf("genRustSetInner with no sets: got non-empty %q", s)
 	}
 	if s := genGoSetSection(cfg, "m"); s != "" {
 		t.Errorf("genGoSetSection with no sets: got non-empty %q", s)
@@ -879,7 +883,7 @@ func TestSetSection_FindAllOnly(t *testing.T) {
 			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
-	rust := genRustSetSection(cfg)
+	rust := genRustSetInner(cfg)
 	if !strings.Contains(rust, "find_all") {
 		t.Error("find_all not in Rust set stub")
 	}

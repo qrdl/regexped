@@ -5,7 +5,7 @@ stub_file:     "stub.go"
 stub_type:     "go"
 max_dfa_states: 1  # forces Backtracking engine for match and find
 
-regexes:
+regexps:
   - pattern: |-
       (?i)(?P<type>union\s+(?:all\s+)?select|or\s+'1'='1|drop\s+table|insert\s+into|delete\s+from|exec\s*\()(?P<payload>[^\n]*)
     match_func:        "is_sqli"

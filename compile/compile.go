@@ -822,7 +822,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 // Mode is auto-selected from cfg.Output: empty → standalone; non-empty → embedded.
 func CmdCompile(cfg config.BuildConfig, output string) error {
 	outPath := output
-	slog.Info("Compiling regexes", "count", len(cfg.Regexes), "output", outPath)
+	slog.Info("Compiling regexps", "count", len(cfg.Regexes), "output", outPath)
 
 	var wasmBytes []byte
 	if len(cfg.Sets) > 0 {

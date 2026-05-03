@@ -19,7 +19,7 @@ type BuildConfig struct {
 	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
 	MaxDFAStates int          `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int          `yaml:"max_tdfa_regs"`  // 0 = default (32)
-	Regexes      []RegexEntry `yaml:"regexes"`
+	Regexes      []RegexEntry `yaml:"regexps"`
 	Sets         []SetConfig  `yaml:"sets"` // optional set composition entries
 }
 
@@ -146,7 +146,7 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 		return BuildConfig{}, fmt.Errorf("parse config %s: %w", configPath, err)
 	}
 	if len(cfg.Regexes) == 0 {
-		return BuildConfig{}, fmt.Errorf("config %s has no regexes", configPath)
+		return BuildConfig{}, fmt.Errorf("config %s has no regexps", configPath)
 	}
 
 	// Resolve all paths relative to the config file's directory.
