@@ -1753,6 +1753,27 @@ type setTestCase struct {
 
 var setTests = []setTestCase{
 	{
+		// 20 patterns with 2-byte mandatory literals starting with 'q' and 'z'.
+		// 20 > 16 → frontendAC; 23 AC nodes ≤ 32 cap.
+		// The secretLargeInput has virtually no 'q' or 'z' bytes, giving near-zero
+		// firstByteFlags hit rate — ideal for measuring AC prefilter fast-skip speedup.
+		name: "ac-20-set",
+		patterns: func() []string {
+			pats := make([]string, 20)
+			for i := 0; i < 10; i++ {
+				pats[i] = "q" + string(rune('a'+i)) + `[0-9a-zA-Z]{4,}`
+			}
+			for i := 0; i < 10; i++ {
+				pats[10+i] = "z" + string(rune('a'+i)) + `[0-9a-zA-Z]{4,}`
+			}
+			return pats
+		}(),
+		inputs: []namedInput{
+			{"no-match 100KB", secretLargeInput(nil)},
+			{"5 matches 100KB", secretLargeInput([]string{"qa12345", "zb67890", "qcABCDE", "zdFGHIJ", "qeKLMNO"})},
+		},
+	},
+	{
 		// 8 patterns with 3-byte mandatory literals → Teddy SIMD path (16 bytes/cycle).
 		name: "log-levels-8-set",
 		patterns: []string{

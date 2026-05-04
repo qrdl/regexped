@@ -67,9 +67,11 @@ type compiledSet struct {
 	fe frontendKind
 
 	// AC frontend (fe == frontendAC): Aho-Corasick automaton tables.
-	acL            *acLayout
-	acDataBytes    []byte
-	acDataSegCount int
+	acL                 *acLayout
+	acDataBytes         []byte
+	acDataSegCount      int
+	acFirstByteSet      []byte // distinct first bytes for SIMD prefilter
+	acFirstByteFlagsOff int32  // data offset of firstByteFlags[256] table
 
 	// Teddy frontend (fe == frontendTeddy): SIMD nibble tables.
 	teddyTabs         *teddyTables
@@ -305,6 +307,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	var acL *acLayout
 	var acDataBytes []byte
 	acDataSegCount := 0
+	var acFirstByteSet []byte
+	var acFirstByteFlagsOff int32
 	if fe == frontendAC {
 		ac := buildAC(lits)
 		// Cap: fall back to scalar if the automaton exceeds 32 nodes (goto table > 16 KB).
@@ -313,6 +317,21 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			acL = buildACLayout(ac, prefixTableOffset)
 			acDataBytes = emitACDataSegments(acL)
 			acDataSegCount = 3 // goto, failure, output segments
+
+			// Build firstByteFlags[256] table for SIMD prefilter.
+			fbFlags := make([]byte, 256)
+			fbSeen := make(map[byte]bool)
+			for _, lit := range lits {
+				fb := lit[0]
+				fbFlags[fb] = 1
+				if !fbSeen[fb] {
+					fbSeen[fb] = true
+					acFirstByteSet = append(acFirstByteSet, fb)
+				}
+			}
+			acFirstByteFlagsOff = acL.tableEnd
+			acDataBytes = append(acDataBytes, appendDataSegment(nil, acFirstByteFlagsOff, fbFlags)...)
+			acDataSegCount++ // one more segment for firstByteFlags
 		} else {
 			fe = frontendScalar
 		}
@@ -361,6 +380,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		acL:                 acL,
 		acDataBytes:         acDataBytes,
 		acDataSegCount:      acDataSegCount,
+		acFirstByteSet:      acFirstByteSet,
+		acFirstByteFlagsOff: acFirstByteFlagsOff,
 		teddyTabs:           teddyTabs,
 		teddyDataOffset:     teddyDataOffset,
 		teddyDataBytes:      teddyDataBytes,
@@ -1166,7 +1187,13 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		lOutIdx    = byte(12)
 		lACOutEnd  = byte(13)
 		lLitID     = byte(14)
+		// Prefilter locals (lSkipMask=15 i32, lChunk=16 v128; only used when prefilter emitted)
+		lSkipMask = byte(15)
+		lChunk    = byte(16)
 	)
+
+	// usePrefilter: apply SIMD first-byte prefilter when at root state and no fallback buckets.
+	usePrefilter := !hasSetFallbackBuckets(cs) && len(cs.acFirstByteSet) > 0
 
 	// Parameterised helpers (use posLocal instead of hardcoded lPos).
 	emitValidMaskAt := func(b []byte, bi int, posLocal byte) []byte {
@@ -1272,8 +1299,13 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	}
 
 	var b []byte
-	// 10 i32 locals (indices 5-14)
-	b = append(b, 0x01, 0x0A, 0x7F)
+	if usePrefilter {
+		// 11 i32 locals (5-15) + 1 v128 local (16)
+		b = append(b, 0x02, 0x0B, 0x7F, 0x01, 0x7B)
+	} else {
+		// 10 i32 locals (5-14)
+		b = append(b, 0x01, 0x0A, 0x7F)
+	}
 
 	// Init
 	b = append(b, 0x41, 0x00, 0x21, lOutCount)
@@ -1300,6 +1332,75 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	// AC transition: only when lPos < pInLen (there is a byte to consume)
 	b = append(b, 0x02, 0x40)                                 // block $end_ac_pos
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x00) // lPos >= pInLen → br 0 (skip)
+
+	// SIMD first-byte prefilter: when at root state, fast-skip to next candidate position.
+	// Only emitted when there are no fallback buckets (those require visiting every position).
+	// Block structure (depths from inside loop $skip_loop):
+	//   block $skip_done (1), loop $skip_loop (0)
+	//   Inside if(SIMD): depths are 0=if, 1=loop, 2=$skip_done
+	//   Inside if(mask): depths are 0=if, 1=outer_if, 2=loop, 3=$skip_done
+	if usePrefilter {
+		b = append(b, 0x20, lACState, 0x45, 0x04, 0x40) // if lACState == 0 (eqz; if)
+
+		b = append(b, 0x02, 0x40) // block $skip_done
+		b = append(b, 0x03, 0x40) // loop $skip_loop
+
+		// Exhaustion check: if lPos >= pInLen → br 1 → exit $skip_done
+		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+
+		// SIMD path: if lPos + 15 < pInLen
+		b = append(b, 0x20, lPos, 0x41, 15, 0x6A, 0x20, pInLen, 0x49) // lt_u
+		b = append(b, 0x04, 0x40)                                        // if (void)
+
+		// Load 16-byte chunk from memory[0] (input)
+		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
+		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+		b = append(b, 0x22, lChunk)            // local.tee lChunk
+
+		// Compute bitmask: OR of bitmask(eq(chunk, splat(fb))) for each first byte.
+		b = append(b, 0x41, 0x00) // accumulator = 0
+		for _, fb := range cs.acFirstByteSet {
+			b = append(b, 0x20, lChunk)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(fb))
+			b = append(b, 0xFD, 0x0F) // i8x16.splat
+			b = append(b, 0xFD, 0x23) // i8x16.eq
+			b = append(b, 0xFD, 0x64) // i8x16.bitmask
+			b = append(b, 0x72)       // i32.or
+		}
+		b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
+
+		// if mask != 0: candidate found at lPos + ctz(mask)
+		b = append(b, 0x04, 0x40)                                                   // if (void)
+		b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos)         // lPos += ctz(mask)
+		b = append(b, 0x0C, 0x03)                                                   // br 3 → $skip_done
+		b = append(b, 0x0B)                                                          // end if mask
+
+		// No candidate: advance 16 and restart
+		b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos) // lPos += 16
+		b = append(b, 0x0C, 0x01)                                 // br 1 → restart $skip_loop
+		b = append(b, 0x0B)                                       // end if (SIMD path)
+
+		// Scalar tail: check firstByteFlags[input[lPos]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, cs.acFirstByteFlagsOff)       // firstByteFlags base
+		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x2D, 0x00, 0x00) // + input[lPos]
+		b = append(b, 0x6A)                                               // add → flags address
+		b = appendTableLoad8u(b, tableMemIdx)                             // load flag byte
+		b = append(b, 0x04, 0x40)                                         // if (void) non-zero
+		b = append(b, 0x0C, 0x02)                                         // br 2 → $skip_done (candidate at lPos)
+		b = append(b, 0x0B)                                               // end if
+
+		b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
+		b = append(b, 0x0C, 0x00)                                 // br 0 → restart $skip_loop
+		b = append(b, 0x0B)                                       // end loop $skip_loop
+		b = append(b, 0x0B)                                       // end block $skip_done
+
+		b = append(b, 0x0B) // end if lACState == 0
+
+		// Re-check bounds: prefilter may have exhausted input (lPos = pInLen)
+		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x00) // ge_u → br 0 → exit $end_ac_pos
+	}
 
 	// lACState = goto_table[lACState * 512 + input[lPos] * 2] as u16
 	b = append(b, 0x41)
