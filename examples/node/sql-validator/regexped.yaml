@@ -1,0 +1,25 @@
+wasm_file:     "patterns.wasm"
+import_module: "sql"
+stub_file:     "stubs.ts"
+
+regexps:
+  - name: "select"
+    pattern: '(?i)select'
+  - name: "insert"
+    pattern: '(?i)insert'
+  - name: "update"
+    pattern: '(?i)update'
+  - name: "delete"
+    pattern: '(?i)delete'
+  - name: "drop"
+    pattern: '(?i)drop'
+  - name: "create"
+    pattern: '(?i)create'
+  - name: "alter"
+    pattern: '(?i)alter'
+
+sets:
+  - name: "statement_type"
+    find_any: "classify_statement"
+    emit_name_map: true
+    patterns: all

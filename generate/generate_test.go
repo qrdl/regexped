@@ -785,11 +785,16 @@ func TestGenJSSetSection(t *testing.T) {
 		"validate",
 		"patternName",
 		"patternId",
+		"_exp",
+		"_mem",
 	}
 	for _, s := range required {
 		if !strings.Contains(out, s) {
 			t.Errorf("genJSSetSection: missing %q", s)
 		}
+	}
+	if strings.Contains(out, "_inst") {
+		t.Errorf("genJSSetSection: should not contain _inst")
 	}
 }
 
@@ -802,11 +807,19 @@ func TestGenTSSetSection(t *testing.T) {
 		"scan_any",
 		"validate",
 		"patternName",
+		"_exp",
+		"_mem",
 	}
 	for _, s := range required {
 		if !strings.Contains(out, s) {
 			t.Errorf("genTSSetSection: missing %q", s)
 		}
+	}
+	if strings.Contains(out, "_inst") {
+		t.Errorf("genTSSetSection: should not contain _inst")
+	}
+	if strings.Contains(out, "SetAnchorMatch") {
+		t.Errorf("genTSSetSection: SetAnchorMatch should be removed (unified into SetMatch)")
 	}
 }
 

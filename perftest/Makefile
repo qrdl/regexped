@@ -1,9 +1,12 @@
 WASM_TARGET := wasm32-wasip1
 
-.PHONY: run harnesses baseline perftest-check clean
+.PHONY: run run-sets harnesses baseline perftest-check clean
 
 run: harnesses
 	go run .
+
+run-sets: harnesses
+	go run . --sets
 
 harnesses:
 	cargo build --manifest-path regex_bench/Cargo.toml --target $(WASM_TARGET) --release

@@ -931,21 +931,36 @@ func TestMultiPatternTeddy_LaneToID(t *testing.T) {
 }
 
 func TestMultiPatternTeddy_TooManyLiterals(t *testing.T) {
-	lits := make([][]byte, 9)
+	// 17 literals exceeds the new limit of 16 → ok=false
+	lits := make([][]byte, 17)
 	for i := range lits {
-		lits[i] = []byte{byte('a' + i)}
+		lits[i] = []byte{byte('a' + i%26), byte('0' + i%10)}
 	}
 	_, ok := buildTeddyTablesMulti(lits)
 	if ok {
-		t.Error("buildTeddyTablesMulti: expected ok=false for 9 literals")
+		t.Error("buildTeddyTablesMulti: expected ok=false for 17 literals")
+	}
+	// 9 literals ≤ 16 → ok=true (two groups)
+	lits9 := make([][]byte, 9)
+	for i := range lits9 {
+		lits9[i] = []byte{byte('a' + i)}
+	}
+	if _, ok2 := buildTeddyTablesMulti(lits9); !ok2 {
+		t.Error("buildTeddyTablesMulti: expected ok=true for 9 literals (≤16)")
 	}
 }
 
 func TestMultiPatternTeddy_LiteralTooLong(t *testing.T) {
-	lits := [][]byte{[]byte("abcde")} // 5 bytes > 4
+	// Long literals are probed on their first 4 bytes → ok=true
+	lits := [][]byte{[]byte("sk_live_abcdef")} // >4 bytes: partial probe
 	_, ok := buildTeddyTablesMulti(lits)
-	if ok {
-		t.Error("buildTeddyTablesMulti: expected ok=false for 5-byte literal")
+	if !ok {
+		t.Error("buildTeddyTablesMulti: expected ok=true for long literal (partial probe)")
+	}
+	// Empty literal → ok=false
+	empty := [][]byte{[]byte("")}
+	if _, ok2 := buildTeddyTablesMulti(empty); ok2 {
+		t.Error("buildTeddyTablesMulti: expected ok=false for empty literal")
 	}
 }
 
@@ -956,11 +971,13 @@ func TestChooseLiteralFrontend(t *testing.T) {
 	}{
 		{[][]byte{[]byte("ab"), []byte("cd")}, frontendTeddy},
 		{[][]byte{[]byte("a")}, frontendTeddy},
-		{[][]byte{[]byte("abcd")}, frontendTeddy}, // 4 bytes: still Teddy
-		{[][]byte{[]byte("abcde")}, frontendAC},   // 5 bytes: too long for Teddy
+		{[][]byte{[]byte("abcd")}, frontendTeddy},     // 4 bytes → Teddy
+		{[][]byte{[]byte("abcde")}, frontendTeddy},    // 5 bytes → Teddy (partial probe)
+		{[][]byte{[]byte("sk_live_")}, frontendTeddy}, // 8 bytes → Teddy (partial probe)
 		{nil, frontendScalar},
+		{[][]byte{[]byte("")}, frontendScalar}, // empty literal → scalar
 	}
-	// 9 literals → AC
+	// 9 literals ≤ 16 → Teddy (two groups)
 	nineLits := make([][]byte, 9)
 	for i := range nineLits {
 		nineLits[i] = []byte{byte('a' + i)}
@@ -968,7 +985,16 @@ func TestChooseLiteralFrontend(t *testing.T) {
 	cases = append(cases, struct {
 		lits [][]byte
 		want frontendKind
-	}{nineLits, frontendAC})
+	}{nineLits, frontendTeddy})
+	// 17 literals > 16 → AC
+	seventeenLits := make([][]byte, 17)
+	for i := range seventeenLits {
+		seventeenLits[i] = []byte{byte('a' + i%26), byte('0' + i%10)}
+	}
+	cases = append(cases, struct {
+		lits [][]byte
+		want frontendKind
+	}{seventeenLits, frontendAC})
 
 	for _, c := range cases {
 		got := chooseLiteralFrontend(c.lits)
@@ -1236,6 +1262,157 @@ func TestACDataSegments_NonEmpty(t *testing.T) {
 	ds := emitACDataSegments(l)
 	if len(ds) == 0 {
 		t.Error("emitACDataSegments returned empty bytes")
+	}
+}
+
+// ---- Phase 5.5: AC/Teddy WASM emitter tests ----
+
+// TestCompileFile_ACFrontend exercises emitSetMatchFnFinalAC (0% coverage without this).
+// 17 unique 2-byte literals → >16 → frontendAC.
+func TestCompileFile_ACFrontend(t *testing.T) {
+	pats := make([]config.RegexEntry, 17)
+	for i := range pats {
+		// "aa\w+", "ab\w+", ..., "aq\w+" — 17 distinct 2-byte mandatory literals
+		pats[i] = config.RegexEntry{Pattern: "a" + string(rune('a'+i)) + `\w+`}
+	}
+	cfg := config.BuildConfig{
+		Regexes: pats,
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile AC frontend: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Errorf("invalid WASM magic: %x", wasm[:min(8, len(wasm))])
+	}
+}
+
+// TestCompileFile_TeddyTwoGroups exercises the TwoGroups path in emitSetMatchFnFinalTeddy.
+// 10 unique 1-byte literals → ≤16, TwoGroups=true.
+func TestCompileFile_TeddyTwoGroups(t *testing.T) {
+	pats := make([]config.RegexEntry, 10)
+	for i := range pats {
+		pats[i] = config.RegexEntry{Pattern: string(rune('a'+i)) + `\w+`}
+	}
+	cfg := config.BuildConfig{
+		Regexes: pats,
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile Teddy two-groups: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Errorf("invalid WASM magic")
+	}
+}
+
+// TestCompileFile_TeddyPartialProbe exercises tail-byte verification for literals >4 bytes.
+func TestCompileFile_TeddyPartialProbe(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Pattern: `sk_live_[0-9a-zA-Z]{24}`},
+			{Pattern: `sk_test_[0-9a-zA-Z]{24}`},
+			{Pattern: `gh_pat_[0-9a-zA-Z]{36}`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile Teddy partial probe: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Errorf("invalid WASM magic")
+	}
+}
+
+func TestBuildTeddyTablesMulti_TwoGroups(t *testing.T) {
+	lits := make([][]byte, 10)
+	for i := range lits {
+		lits[i] = []byte{byte('a' + i)}
+	}
+	tt, ok := buildTeddyTablesMulti(lits)
+	if !ok {
+		t.Fatal("expected ok=true for 10 literals")
+	}
+	if !tt.TwoGroups {
+		t.Error("expected TwoGroups=true for 10 literals")
+	}
+	if len(tt.LaneToID) != 10 {
+		t.Errorf("LaneToID len = %d, want 10", len(tt.LaneToID))
+	}
+	// Group B should have entries (literals 8-9 map to bit 0,1 of BT0Lo/BT0Hi)
+	if tt.BT0Lo['h'&0x0F] == 0 && tt.BT0Hi['h'>>4] == 0 {
+		t.Error("Group B tables not populated for literal 'h' (index 7→group B bit 0?)")
+	}
+}
+
+func TestBuildTeddyTablesMulti_PartialProbe(t *testing.T) {
+	// Literals longer than 4 bytes — probe on first 4 only.
+	lits := [][]byte{[]byte("sk_live_"), []byte("sk_test_")}
+	tt, ok := buildTeddyTablesMulti(lits)
+	if !ok {
+		t.Fatal("expected ok=true for long literals")
+	}
+	if tt.MinLen != 4 {
+		t.Errorf("MinLen = %d, want 4", tt.MinLen)
+	}
+	if !tt.FourByte {
+		t.Error("expected FourByte=true (both literals ≥4 bytes)")
+	}
+	if !tt.TwoByte || !tt.ThreeByte {
+		t.Error("expected TwoByte and ThreeByte=true")
+	}
+	// Both start with 'sk_l' / 'sk_t' — probe byte[0]='s' should fire both lanes.
+	bit0, bit1 := byte(1<<0), byte(1<<1)
+	if tt.T0Lo['s'&0x0F]&bit0 == 0 {
+		t.Error("T0Lo missing bit 0 for 's'")
+	}
+	if tt.T0Lo['s'&0x0F]&bit1 == 0 {
+		t.Error("T0Lo missing bit 1 for 's'")
+	}
+}
+
+func TestTeddyGroupABytes_AllCases(t *testing.T) {
+	cases := []struct {
+		lits [][]byte
+		want int32
+	}{
+		{[][]byte{[]byte("a")}, 32},      // MinLen=1: T0Lo+T0Hi only
+		{[][]byte{[]byte("ab")}, 64},     // MinLen=2: +T1Lo+T1Hi
+		{[][]byte{[]byte("abc")}, 96},    // MinLen=3: +T2Lo+T2Hi
+		{[][]byte{[]byte("abcd")}, 128},  // MinLen=4: +T3Lo+T3Hi
+		{[][]byte{[]byte("abcde")}, 128}, // MinLen=min(5,4)=4 → same as 4-byte
+	}
+	for _, c := range cases {
+		tt, ok := buildTeddyTablesMulti(c.lits)
+		if !ok {
+			t.Fatalf("buildTeddyTablesMulti failed for %q", c.lits[0])
+		}
+		got := teddyGroupABytes(tt)
+		if got != c.want {
+			t.Errorf("teddyGroupABytes(%q) = %d, want %d", c.lits[0], got, c.want)
+		}
+	}
+}
+
+func TestBuildTeddyRawBytes_TwoGroups(t *testing.T) {
+	lits := make([][]byte, 10)
+	for i := range lits {
+		lits[i] = []byte{byte('a' + i)}
+	}
+	tt, _ := buildTeddyTablesMulti(lits)
+	raw := buildTeddyRawBytes(tt)
+	// Group A: 32 bytes (MinLen=1, T0Lo+T0Hi only). Group B: same.
+	if len(raw) != 64 {
+		t.Errorf("buildTeddyRawBytes two-groups: len=%d, want 64", len(raw))
 	}
 }
 

@@ -98,8 +98,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 	}
 	var out strings.Builder
 	out.WriteString("\n// ---- set composition wrappers ----\n\n")
-	out.WriteString("export interface SetMatch { patternId: number; start: number; end: number; }\n")
-	out.WriteString("export interface SetAnchorMatch { patternId: number; end: number; }\n\n")
+	out.WriteString("export interface SetMatch { patternId: number; start: number; end: number; }\n\n")
 	for _, s := range cfg.Sets {
 		bs := batchSize(s)
 		if s.FindAll != "" || s.FindAny != "" {
@@ -109,13 +108,12 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			}
 			if s.FindAll != "" {
 				fmt.Fprintf(&out, `export function* %s(input: string | Uint8Array): Generator<SetMatch> {
-    const b = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-    const mem = new Uint8Array((_inst.exports.memory as WebAssembly.Memory).buffer);
-    const outBuf = new Int32Array((_inst.exports.memory as WebAssembly.Memory).buffer, 1024, %d*3);
-    mem.set(b, 0);
+    const b = _b(input);
+    const outBuf = new Int32Array(_mem.buffer, 1024, %d*3);
+    _mem.set(b, 0);
     let startPos = 0;
     while (true) {
-        const n = (_inst.exports['%s'] as Function)(0, b.length, 1024, %d, startPos) as number;
+        const n = (_exp['%s'] as Function)(0, b.length, 1024, %d, startPos) as number;
         if (n <= 0) break;
         for (let i = 0; i < n; i++) {
             yield { patternId: outBuf[i*3], start: outBuf[i*3+1], end: outBuf[i*3+1]+outBuf[i*3+2] };
@@ -127,24 +125,22 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			}
 			if s.FindAny != "" {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): SetMatch | null {
-    const b = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-    const mem = new Uint8Array((_inst.exports.memory as WebAssembly.Memory).buffer);
-    const outBuf = new Int32Array((_inst.exports.memory as WebAssembly.Memory).buffer, 1024, 3);
-    mem.set(b, 0);
-    if ((_inst.exports['%s'] as Function)(0, b.length, 1024, 1, 0) <= 0) return null;
+    const b = _b(input);
+    const outBuf = new Int32Array(_mem.buffer, 1024, 3);
+    _mem.set(b, 0);
+    if ((_exp['%s'] as Function)(0, b.length, 1024, 1, 0) <= 0) return null;
     return { patternId: outBuf[0], start: outBuf[1], end: outBuf[1]+outBuf[2] };
 }
 `, s.FindAny, wasmExport)
 			}
 		}
 		if s.Match != "" {
-			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): SetAnchorMatch | null {
-    const b = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-    const mem = new Uint8Array((_inst.exports.memory as WebAssembly.Memory).buffer);
-    const outBuf = new Int32Array((_inst.exports.memory as WebAssembly.Memory).buffer, 1024, 2);
-    mem.set(b, 0);
-    if ((_inst.exports['%s'] as Function)(0, b.length, 1024, 1) <= 0) return null;
-    return { patternId: outBuf[0], end: outBuf[1] };
+			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): SetMatch | null {
+    const b = _b(input);
+    const outBuf = new Int32Array(_mem.buffer, 1024, 2);
+    _mem.set(b, 0);
+    if ((_exp['%s'] as Function)(0, b.length, 1024, 1) <= 0) return null;
+    return { patternId: outBuf[0], start: 0, end: outBuf[1] };
 }
 `, s.Match, s.Match)
 		}

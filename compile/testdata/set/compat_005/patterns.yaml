@@ -1,6 +1,6 @@
 # compat_005: large_multi_literal
-# 10 patterns with distinct mandatory literals — exceeds the 8-literal Teddy
-# limit, so the AC frontend is chosen.
+# 10 patterns with distinct mandatory literals (5-7 bytes each). With the
+# extended Teddy limit of 16, these use Teddy with partial probing.
 patterns:
   - pattern: 'alpha\d+'
   - pattern: 'beta\w+'
@@ -13,4 +13,4 @@ patterns:
   - pattern: 'iota\d+'
   - pattern: 'kappa\w+'
 expect:
-  frontend: ac
+  frontend: teddy

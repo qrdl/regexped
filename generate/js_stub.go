@@ -40,13 +40,12 @@ func genJSSetSection(cfg config.BuildConfig) string {
 			}
 			if s.FindAll != "" {
 				fmt.Fprintf(&out, `export function* %s(input) {
-    const b = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-    const mem = new Uint8Array(_inst.exports.memory.buffer);
-    const outBuf = new Int32Array(_inst.exports.memory.buffer, 1024, %d*3);
-    let ptr = 0, startPos = 0;
-    mem.set(b, ptr);
+    const b = _b(input);
+    const outBuf = new Int32Array(_exp.memory.buffer, 1024, %d*3);
+    _mem.set(b, 0);
+    let startPos = 0;
     while (true) {
-        const n = _inst.exports['%s'](ptr, b.length, 1024, %d, startPos);
+        const n = _exp['%s'](0, b.length, 1024, %d, startPos);
         if (n <= 0) break;
         for (let i = 0; i < n; i++) {
             yield { patternId: outBuf[i*3], start: outBuf[i*3+1], end: outBuf[i*3+1]+outBuf[i*3+2] };
@@ -58,11 +57,10 @@ func genJSSetSection(cfg config.BuildConfig) string {
 			}
 			if s.FindAny != "" {
 				fmt.Fprintf(&out, `export function %s(input) {
-    const b = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-    const mem = new Uint8Array(_inst.exports.memory.buffer);
-    const outBuf = new Int32Array(_inst.exports.memory.buffer, 1024, 3);
-    mem.set(b, 0);
-    const n = _inst.exports['%s'](0, b.length, 1024, 1, 0);
+    const b = _b(input);
+    const outBuf = new Int32Array(_exp.memory.buffer, 1024, 3);
+    _mem.set(b, 0);
+    const n = _exp['%s'](0, b.length, 1024, 1, 0);
     if (n <= 0) return null;
     return { patternId: outBuf[0], start: outBuf[1], end: outBuf[1]+outBuf[2] };
 }
@@ -71,13 +69,12 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		}
 		if s.Match != "" {
 			fmt.Fprintf(&out, `export function %s(input) {
-    const b = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-    const mem = new Uint8Array(_inst.exports.memory.buffer);
-    const outBuf = new Int32Array(_inst.exports.memory.buffer, 1024, 2);
-    mem.set(b, 0);
-    const n = _inst.exports['%s'](0, b.length, 1024, 1);
+    const b = _b(input);
+    const outBuf = new Int32Array(_exp.memory.buffer, 1024, 2);
+    _mem.set(b, 0);
+    const n = _exp['%s'](0, b.length, 1024, 1);
     if (n <= 0) return null;
-    return { patternId: outBuf[0], end: outBuf[1] };
+    return { patternId: outBuf[0], start: 0, end: outBuf[1] };
 }
 `, s.Match, s.Match)
 		}

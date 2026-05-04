@@ -486,6 +486,41 @@ export ENCRYPTION_KEY=replace_with_actual_key
 	return string(result)
 }
 
+// logLargeInput returns a ~100KB server log file with timestamps and 2xx/3xx status
+// codes only. None of the log-level keywords (ERR, WRN, INF, DBG, CRT, FAT, TRC, NOT)
+// appear in the baseline text. If matches is non-nil they are spread evenly through it.
+func logLargeInput(matches []string) string {
+	const block = `2026-05-04T12:00:01Z host1 access: 200 GET /api/v1/users 42ms
+2026-05-04T12:00:02Z host1 access: 200 POST /api/v1/sessions 18ms
+2026-05-04T12:00:03Z host1 access: 301 GET /old/path 1ms
+2026-05-04T12:00:04Z host2 access: 200 GET /api/v1/items?page=2 55ms
+2026-05-04T12:00:05Z host2 access: 200 PUT /api/v1/items/42 29ms
+2026-05-04T12:00:06Z host1 access: 304 GET /static/app.js 2ms
+2026-05-04T12:00:07Z host2 access: 200 GET /health 3ms
+2026-05-04T12:00:08Z host1 access: 200 DELETE /api/v1/items/17 11ms
+2026-05-04T12:00:09Z host2 access: 302 GET /login 1ms
+2026-05-04T12:00:10Z host1 access: 200 GET /api/v1/stats 88ms
+`
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+	if len(matches) == 0 {
+		return base
+	}
+	result := []byte(base)
+	step := len(result) / (len(matches) + 1)
+	offset := 0
+	for i, m := range matches {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte("2026-05-04T12:00:99Z host1 app: " + m + "\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
 // urlProseInput returns a ~100KB block of prose-like text dense with alphabetic
 // characters (high false-positive rate for [a-zA-Z] prefix) but containing no
 // "://" sequences unless URLs are explicitly injected. Ideal for benchmarking
@@ -1717,6 +1752,24 @@ type setTestCase struct {
 }
 
 var setTests = []setTestCase{
+	{
+		// 8 patterns with 3-byte mandatory literals → Teddy SIMD path (16 bytes/cycle).
+		name: "log-levels-8-set",
+		patterns: []string{
+			`ERR\b[^\n]*`,
+			`WRN\b[^\n]*`,
+			`INF\b[^\n]*`,
+			`DBG\b[^\n]*`,
+			`CRT\b[^\n]*`,
+			`FAT\b[^\n]*`,
+			`TRC\b[^\n]*`,
+			`NOT\b[^\n]*`,
+		},
+		inputs: []namedInput{
+			{"no-match 100KB", logLargeInput(nil)},
+			{"5 matches 100KB", logLargeInput([]string{"ERR disk full", "WRN low memory", "ERR timeout", "FAT panic", "CRT cpu overload"})},
+		},
+	},
 	{
 		name: "secrets-10-set",
 		patterns: []string{

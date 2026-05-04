@@ -593,81 +593,160 @@ func (f frontendKind) String() string {
 	}
 }
 
-// teddyTables holds the precomputed nibble tables for multi-pattern Teddy
-// (up to 8 literals × up to 4 bytes each). Each lane bit k (0..7) corresponds
-// to literal k in the input list.
+// teddyTables holds the precomputed nibble tables for multi-pattern Teddy.
+// Supports up to 16 literals via two groups of 8 (group A = literals 0-7,
+// group B = literals 8-15). Literals longer than 4 bytes use only their first
+// 4 bytes as the probe; the Teddy dispatch verifies the remaining bytes.
 type teddyTables struct {
-	T0Lo, T0Hi [16]byte // 1-byte Teddy: nibble tables for literal byte[0]
-	T1Lo, T1Hi [16]byte // 2-byte Teddy: nibble tables for literal byte[1]
-	T2Lo, T2Hi [16]byte // 3-byte Teddy
-	T3Lo, T3Hi [16]byte // 4-byte Teddy
-	MinLen     int      // minimum literal length across all literals (1–4)
-	TwoByte    bool     // T1 tables are valid (all literals ≥ 2 bytes)
-	ThreeByte  bool     // T2 tables are valid
-	FourByte   bool     // T3 tables are valid
-	LaneToID   []int    // LaneToID[laneBit] = index in the original literals slice
+	// Group A: literals 0-7
+	T0Lo, T0Hi [16]byte
+	T1Lo, T1Hi [16]byte
+	T2Lo, T2Hi [16]byte
+	T3Lo, T3Hi [16]byte
+	// Group B: literals 8-15 (only populated when TwoGroups is true)
+	BT0Lo, BT0Hi [16]byte
+	BT1Lo, BT1Hi [16]byte
+	BT2Lo, BT2Hi [16]byte
+	BT3Lo, BT3Hi [16]byte
+
+	MinLen    int   // min(litLen, 4) across all literals — how many bytes Teddy probes
+	TwoByte   bool  // T1 tables valid (all literals ≥ 2 bytes)
+	ThreeByte bool  // T2 tables valid (all literals ≥ 3 bytes)
+	FourByte  bool  // T3 tables valid (all literals ≥ 4 bytes)
+	TwoGroups bool  // true when len(LaneToID) > 8
+	LaneToID  []int // LaneToID[k] = global literal index for lane k (0-based within its group)
 }
 
-// buildTeddyTablesMulti builds nibble tables for up to 8 literals of 1–4 bytes.
-// Returns (tables, true) on success; (nil, false) if more than 8 literals or
-// any literal is empty or longer than 4 bytes.
-// Reuses the bit-packing pattern from compile.go:394–419.
+// buildTeddyTablesMulti builds nibble tables for up to 16 literals of any length.
+// Literals longer than 4 bytes are probed on their first 4 bytes; the caller
+// must verify the remaining bytes after a Teddy hit.
+// Returns (nil, false) only when len(literals) == 0, > 16, or any literal is empty.
 func buildTeddyTablesMulti(literals [][]byte) (*teddyTables, bool) {
-	if len(literals) == 0 || len(literals) > 8 {
+	if len(literals) == 0 || len(literals) > 16 {
 		return nil, false
 	}
 	for _, lit := range literals {
-		if len(lit) == 0 || len(lit) > 4 {
+		if len(lit) == 0 {
 			return nil, false
 		}
 	}
 
-	t := &teddyTables{LaneToID: make([]int, len(literals))}
-	minLen := 4
-	for i := range t.LaneToID {
+	t := &teddyTables{LaneToID: make([]int, len(literals)), TwoGroups: len(literals) > 8}
+	minProbe := 4
+	for i, lit := range literals {
 		t.LaneToID[i] = i
-		if len(literals[i]) < minLen {
-			minLen = len(literals[i])
+		pl := len(lit)
+		if pl > 4 {
+			pl = 4
+		}
+		if pl < minProbe {
+			minProbe = pl
 		}
 	}
-	t.MinLen = minLen
-	t.TwoByte = minLen >= 2
-	t.ThreeByte = minLen >= 3
-	t.FourByte = minLen >= 4
+	t.MinLen = minProbe
+	t.TwoByte = minProbe >= 2
+	t.ThreeByte = minProbe >= 3
+	t.FourByte = minProbe >= 4
 
-	for laneBit, lit := range literals {
-		bit := byte(1 << uint(laneBit))
-		t.T0Lo[lit[0]&0x0F] |= bit
-		t.T0Hi[lit[0]>>4] |= bit
-		if len(lit) >= 2 {
-			t.T1Lo[lit[1]&0x0F] |= bit
-			t.T1Hi[lit[1]>>4] |= bit
-		}
-		if len(lit) >= 3 {
-			t.T2Lo[lit[2]&0x0F] |= bit
-			t.T2Hi[lit[2]>>4] |= bit
-		}
-		if len(lit) >= 4 {
-			t.T3Lo[lit[3]&0x0F] |= bit
-			t.T3Hi[lit[3]>>4] |= bit
+	for litIdx, lit := range literals {
+		k := litIdx % 8
+		bit := byte(1 << uint(k))
+		if litIdx < 8 {
+			// Group A
+			t.T0Lo[lit[0]&0x0F] |= bit
+			t.T0Hi[lit[0]>>4] |= bit
+			if len(lit) >= 2 && t.TwoByte {
+				t.T1Lo[lit[1]&0x0F] |= bit
+				t.T1Hi[lit[1]>>4] |= bit
+			}
+			if len(lit) >= 3 && t.ThreeByte {
+				t.T2Lo[lit[2]&0x0F] |= bit
+				t.T2Hi[lit[2]>>4] |= bit
+			}
+			if len(lit) >= 4 && t.FourByte {
+				t.T3Lo[lit[3]&0x0F] |= bit
+				t.T3Hi[lit[3]>>4] |= bit
+			}
+		} else {
+			// Group B (literals 8-15)
+			t.BT0Lo[lit[0]&0x0F] |= bit
+			t.BT0Hi[lit[0]>>4] |= bit
+			if len(lit) >= 2 && t.TwoByte {
+				t.BT1Lo[lit[1]&0x0F] |= bit
+				t.BT1Hi[lit[1]>>4] |= bit
+			}
+			if len(lit) >= 3 && t.ThreeByte {
+				t.BT2Lo[lit[2]&0x0F] |= bit
+				t.BT2Hi[lit[2]>>4] |= bit
+			}
+			if len(lit) >= 4 && t.FourByte {
+				t.BT3Lo[lit[3]&0x0F] |= bit
+				t.BT3Hi[lit[3]>>4] |= bit
+			}
 		}
 	}
 	return t, true
 }
 
-// chooseLiteralFrontend selects the scan strategy for a set of mandatory
-// literals. Teddy is used when ≤8 literals all have length 1–4 bytes; AC
-// is used for larger sets; scalar is the final fallback.
+// buildTeddyRawBytes serialises the teddyTables nibble tables into a flat byte slice.
+// Layout: groupA(T0Lo T0Hi [T1Lo T1Hi] [T2Lo T2Hi] [T3Lo T3Hi])
+//
+//	[groupB(BT0Lo BT0Hi ...) when TwoGroups]
+func buildTeddyRawBytes(t *teddyTables) []byte {
+	appendGroup := func(b []byte, t0lo, t0hi, t1lo, t1hi, t2lo, t2hi, t3lo, t3hi *[16]byte) []byte {
+		b = append(b, t0lo[:]...)
+		b = append(b, t0hi[:]...)
+		if t.TwoByte {
+			b = append(b, t1lo[:]...)
+			b = append(b, t1hi[:]...)
+		}
+		if t.ThreeByte {
+			b = append(b, t2lo[:]...)
+			b = append(b, t2hi[:]...)
+		}
+		if t.FourByte {
+			b = append(b, t3lo[:]...)
+			b = append(b, t3hi[:]...)
+		}
+		return b
+	}
+	var b []byte
+	b = appendGroup(b, &t.T0Lo, &t.T0Hi, &t.T1Lo, &t.T1Hi, &t.T2Lo, &t.T2Hi, &t.T3Lo, &t.T3Hi)
+	if t.TwoGroups {
+		b = appendGroup(b, &t.BT0Lo, &t.BT0Hi, &t.BT1Lo, &t.BT1Hi, &t.BT2Lo, &t.BT2Hi, &t.BT3Lo, &t.BT3Hi)
+	}
+	return b
+}
+
+// teddyGroupABytes returns the byte size of group A in the raw Teddy data.
+func teddyGroupABytes(t *teddyTables) int32 {
+	n := int32(32) // T0Lo + T0Hi
+	if t.TwoByte {
+		n += 32
+	}
+	if t.ThreeByte {
+		n += 32
+	}
+	if t.FourByte {
+		n += 32
+	}
+	return n
+}
+
+// chooseLiteralFrontend selects the scan strategy for a set of mandatory literals.
+// Teddy is used for ≤16 non-empty literals of any length (literals >4 bytes use
+// their first 4 bytes as the probe; the dispatch verifies remaining bytes).
+// AC is used for 17-32 unique literals (capped at 32 AC nodes). Scalar otherwise.
 func chooseLiteralFrontend(literals [][]byte) frontendKind {
 	if len(literals) == 0 {
 		return frontendScalar
 	}
-	if len(literals) <= 8 {
-		for _, lit := range literals {
-			if len(lit) == 0 || len(lit) > 4 {
-				return frontendAC
-			}
+	for _, lit := range literals {
+		if len(lit) == 0 {
+			return frontendScalar // empty literal → scalar
 		}
+	}
+	if len(literals) <= 16 {
 		return frontendTeddy
 	}
 	return frontendAC
