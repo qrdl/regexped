@@ -176,10 +176,31 @@ Each tuple written to `out_ptr` is 12 bytes (3 × i32):
 | +4 | `start` i32 | Absolute byte offset of the match start |
 | +8 | `length` i32 | Byte length of the match |
 
-The host advances `start_pos` to `last.start + max(last.length, 1)` after each
-batch and re-calls until the function returns 0.
+Tuples within a batch are emitted in non-decreasing `start` order.
 
-`find_any` uses the same function body with `out_cap=1, start_pos=0`.
+**Capacity precondition.** The caller MUST size `out_cap` to be at least the
+maximum same-start fan-out — that is, the maximum number of tuples the
+function may produce at a single `start` position. A safe upper bound is the
+number of patterns in the set (each global pattern ID can appear at most
+once per `start` in `find_all` output), so `out_cap ≥ patterns_in_set` is
+always sufficient. Generated stubs enforce this floor automatically; custom
+hosts must enforce it themselves.
+
+**Resume rule.** Under the capacity precondition above, after a batch of
+`count` tuples the host advances
+
+```
+start_pos = last.start + max(last.length, 1)
+```
+
+and re-calls until the function returns 0. If the precondition is violated
+(`out_cap` smaller than the same-start fan-out) and `count == out_cap`, the
+batch may have been truncated mid-position and this advance formula will
+silently skip the remaining same-start tuples — the ABI provides no
+continuation mechanism for that case.
+
+`find_any` uses the same function body with `out_cap=1, start_pos=0` and is
+exempt from the precondition because it stops at the first match.
 
 ### match — anchored set match
 

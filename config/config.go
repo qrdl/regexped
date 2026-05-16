@@ -85,7 +85,25 @@ func ValidateSets(cfg *BuildConfig) error {
 	}
 
 	setNames := make(map[string]bool)
-	exportNames := make(map[string]string) // export name → set name that claimed it
+	exportNames := make(map[string]string) // export name → owner ("set X" or "regex Y")
+	// Seed with per-regex export names so set exports can't collide with them.
+	for _, re := range cfg.Regexes {
+		owner := "regex"
+		if re.Name != "" {
+			owner = fmt.Sprintf("regex %q", re.Name)
+		} else if re.Pattern != "" {
+			owner = fmt.Sprintf("regex %q", re.Pattern)
+		}
+		for _, name := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc, re.NamedGroupsFunc} {
+			if name == "" {
+				continue
+			}
+			if prior, dup := exportNames[name]; dup {
+				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
+			}
+			exportNames[name] = owner
+		}
+	}
 	for _, s := range cfg.Sets {
 		if s.Name == "" {
 			return fmt.Errorf("sets entry missing required name field")
@@ -97,14 +115,15 @@ func ValidateSets(cfg *BuildConfig) error {
 		if s.FindAny == "" && s.FindAll == "" && s.Match == "" {
 			return fmt.Errorf("set %q: at least one of find_any, find_all, or match must be set", s.Name)
 		}
+		owner := fmt.Sprintf("set %q", s.Name)
 		for _, name := range []string{s.FindAny, s.FindAll, s.Match} {
 			if name == "" {
 				continue
 			}
 			if prior, dup := exportNames[name]; dup {
-				return fmt.Errorf("duplicate WASM export name %q (used by set %q and set %q)", name, prior, s.Name)
+				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
 			}
-			exportNames[name] = s.Name
+			exportNames[name] = owner
 		}
 		if !s.Patterns.All && len(s.Patterns.Names) == 0 {
 			return fmt.Errorf("set %q: patterns is required (use \"all\" or a non-empty list of pattern names)", s.Name)

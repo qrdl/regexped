@@ -1,6 +1,9 @@
 # sql_validator: anchored match for SQL statement classification.
 # Each pattern matches from position 0 (case-insensitive via (?i)).
-# Uses the `match` export — no literal scan needed since all patterns are anchored.
+# Because (?i) strips mandatory literals, all patterns route to the fallback
+# bucket, which the anchored `match` export evaluates at position 0 by running
+# the full per-pattern DFA. There is no SIMD/Aho-Corasick literal scan, but
+# that is a consequence of having no mandatory literal — not of anchoring.
 patterns:
   - name: select
     pattern: '(?i)^\s*SELECT\b'

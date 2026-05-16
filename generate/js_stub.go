@@ -32,7 +32,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 	var out strings.Builder
 	out.WriteString("\n// ---- set composition wrappers ----\n\n")
 	for _, s := range cfg.Sets {
-		bs := max(batchSize(s), 64)
+		bs := batchSize(s, cfg)
 		if s.FindAll != "" || s.FindAny != "" {
 			wasmExport := s.FindAll
 			if wasmExport == "" {

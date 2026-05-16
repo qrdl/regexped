@@ -1,4 +1,4 @@
-WASMTIME_RUST := wasmtime/rust/url-ipv6 wasmtime/rust/secrets
+WASMTIME_RUST := wasmtime/rust/url-ipv6 wasmtime/rust/secrets wasmtime/rust/secret-scanner
 WASMTIME_GO   := wasmtime/go/csv wasmtime/go/sql-injection wasmtime/go/secret-scanner
 WASMTIME_C    := wasmtime/c/url-parts
 WASMTIME_AS   := wasmtime/as/find-email wasmtime/as/inject-scanner

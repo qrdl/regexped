@@ -103,7 +103,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 	out.WriteString("\n// ---- set composition wrappers ----\n\n")
 	out.WriteString("export interface SetMatch { patternId: number; start: number; end: number; }\n\n")
 	for _, s := range cfg.Sets {
-		bs := max(batchSize(s), 64)
+		bs := batchSize(s, cfg)
 		if s.FindAll != "" || s.FindAny != "" {
 			wasmExport := s.FindAll
 			if wasmExport == "" {

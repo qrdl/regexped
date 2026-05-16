@@ -102,7 +102,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 	cb.WriteString(cContent)
 	for _, s := range cfg.Sets {
 		if s.FindAll != "" || s.FindAny != "" {
-			bs := max(batchSize(s), 64)
+			bs := batchSize(s, cfg)
 			wasmExport := s.FindAll
 			if wasmExport == "" {
 				wasmExport = s.FindAny

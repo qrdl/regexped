@@ -174,3 +174,25 @@ func TestFindMandatoryLit(t *testing.T) {
 		}
 	}
 }
+
+func TestHasMandatoryLit(t *testing.T) {
+	cases := []struct {
+		pattern string
+		want    bool
+	}{
+		{"foo", true},
+		{"foo.*bar", true},
+		{`[a-z]{0,3}foo`, true}, // bounded prefix; literal still mandatory
+		{`\d+foo`, false},       // unbounded prefix → maxOff -1 rejects literal
+		{"a|b", false},
+		{"a*", false},
+		{"(?i)foo", false}, // FoldCase strips the literal
+		{"[a-z]+", false},
+		{"[invalid", false}, // parse error
+	}
+	for _, c := range cases {
+		if got := HasMandatoryLit(c.pattern); got != c.want {
+			t.Errorf("HasMandatoryLit(%q) = %v, want %v", c.pattern, got, c.want)
+		}
+	}
+}

@@ -58,12 +58,14 @@ exports its own memory and a `scan_secrets(ptr, len, out_ptr, out_cap, start)
 → count` function. The host:
 
 1. Loads `secrets.wasm` with the `wasmtime` crate.
-2. Grows WASM memory to 4 pages: tables (pages 0–1), input (page 2), output
-   (page 3).
-3. Writes the input bytes into page 2 and calls `scan_secrets` in a loop,
-   advancing `start_pos` after each batch until the function returns 0.
+2. Reads the module's initial memory size (which already covers the compiled
+   DFA tables) and grows it by 2 pages: one for input, one for output. The
+   total page count depends on how large the tables are.
+3. Writes the input bytes into the first grown page and calls `scan_secrets`
+   in a loop, advancing `start_pos` after each batch until the function
+   returns 0.
 4. Reads `(pattern_id i32, start i32, length i32)` tuples (12 bytes each)
-   from the output buffer.
+   from the output buffer (second grown page).
 
 No generated stub is used. The host interacts with the WASM ABI directly.
 

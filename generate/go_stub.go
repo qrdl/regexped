@@ -60,7 +60,7 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 	fmt.Fprintf(&out, "// SetMatch is a match from a set find_any, find_all, or anchored match call.\ntype SetMatch struct { PatternID, Start, End int }\n\n")
 	needsIter := false
 	for _, s := range cfg.Sets {
-		bs := max(batchSize(s), 64)
+		bs := batchSize(s, cfg)
 		if s.FindAll != "" || s.FindAny != "" {
 			wasmExport := s.FindAll
 			if wasmExport == "" {

@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/qrdl/regexped/config"
@@ -398,31 +399,97 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 // emitSetMatchFnAnchored emits the WASM function body for the anchored `match`
 // export. Signature: (in_ptr i32, in_len i32, out_ptr i32, out_cap i32) → i32.
 //
-// Checks each bucket's literal at position 0, then calls the suffix DFA which
-// writes (patternID, matchStart=0, matchLength) tuples directly to out_ptr.
-func emitSetMatchFnAnchored(cs *compiledSet, suffixFnBase int) []byte {
+// For each bucket, determines the candidate positions at which the bucket's
+// mandatory literal could appear inside a match anchored at position 0, then
+// verifies the prefix (via the backward prefix DFA) and finally calls the
+// suffix DFA. The suffix DFA writes (patternID, matchStart, matchLength) tuples
+// to out_ptr; for anchored matches matchStart is always 0.
+//
+// Prefix categories handled per bucket:
+//   - trivial         : literal at offset 0; call suffix at lPos=0.
+//   - fixed-length L  : literal at offset L; backward prefix DFA from L-1 must
+//     return 0; call suffix at lPos=L (suffix writes
+//     matchStart = L - prefixFixedLen[k] = 0).
+//   - variable-length : scan candidate literal offsets p in [0, inLen-litLen];
+//     backward prefix DFA from p-1 must return 0; for empty
+//     suffix, write tuple directly; otherwise call suffix at
+//     lPos=0 (suffix writes matchStart = 0).
+//
+// Fallback buckets (no literal): call the bucket's suffix DFA once at start=0,
+// lPos=0 with all pattern bits valid; the DFA models the full pattern so any
+// match it reports starts at position 0.
+func emitSetMatchFnAnchored(cs *compiledSet, suffixFnBase, prefixFnBaseIdx int) []byte {
 	const (
 		pInPtr    = byte(0)
 		pInLen    = byte(1)
 		pOutPtr   = byte(2)
 		pOutCap   = byte(3)
 		lOutCount = byte(4)
+		lLitPos   = byte(5)
+		lOutBase  = byte(6)
 	)
 	var b []byte
-	// 1 local: lOutCount i32
-	b = append(b, 0x01, 0x01, 0x7F)
+	// 3 i32 locals: lOutCount, lLitPos, lOutBase.
+	b = append(b, 0x01, 0x03, 0x7F)
 
 	b = append(b, 0x41, 0x00, 0x21, lOutCount) // lOutCount = 0
 
+	// emitCallSuffix emits a call to suffix DFA bi with constant `start`, `lPos`,
+	// and `validMask`. Increments lOutCount by the returned count.
+	emitCallSuffix := func(b []byte, start, lPos int, validMask uint32, bi int) []byte {
+		b = append(b, 0x20, pInPtr)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(start))
+		b = append(b, 0x20, pInLen)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(lPos))
+		b = append(b, 0x20, pOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A)
+		b = append(b, 0x20, pOutCap, 0x20, lOutCount, 0x6B)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(validMask))
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(suffixFnBase+bi))
+		b = append(b, 0x20, lOutCount, 0x6A, 0x21, lOutCount)
+		return b
+	}
+
 	for bi, bkt := range cs.buckets {
+		if bkt.isFallback {
+			// Fallback bucket: suffix DFA is the full pattern. Scan from 0
+			// with all patterns valid; any reported match has matchStart=0.
+			n := len(cs.patternIDs[bi])
+			if n > 32 {
+				n = 32
+			}
+			var mask uint32
+			if n == 32 {
+				mask = 0xFFFFFFFF
+			} else {
+				mask = (uint32(1) << uint(n)) - 1
+			}
+			if mask == 0 {
+				continue
+			}
+			b = append(b, 0x02, 0x40) // block $skip_fb
+			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x00)
+			b = emitCallSuffix(b, 0, 0, mask, bi)
+			b = append(b, 0x0B) // end $skip_fb
+			continue
+		}
+
 		lit := []byte(bkt.literal)
 		litLen := len(lit)
-		if !bkt.isFallback && litLen > 0 {
-			// Check literal at position 0.
-			b = append(b, 0x02, 0x40) // block $no_lit
+		if litLen == 0 {
+			continue
+		}
+
+		// 1) Trivial-prefix patterns: literal at offset 0.
+		if trivMask := cs.trivialPrefixMasks[bi]; trivMask != 0 {
+			b = append(b, 0x02, 0x40) // block $no_triv
+			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x00)
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(litLen))
-			b = append(b, 0x20, pInLen, 0x4B, 0x0D, 0x00) // litLen > len: br $no_lit
+			b = append(b, 0x20, pInLen, 0x4B, 0x0D, 0x00) // litLen > inLen: br
 			for li, lb := range lit {
 				b = append(b, 0x20, pInPtr)
 				if li > 0 {
@@ -433,24 +500,136 @@ func emitSetMatchFnAnchored(cs *compiledSet, suffixFnBase int) []byte {
 				b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, int32(lb))
-				b = append(b, 0x47, 0x0D, 0x00) // i32.ne + br_if $no_lit
+				b = append(b, 0x47, 0x0D, 0x00) // i32.ne + br_if
 			}
-			// For anchored match at position 0: prefix check not possible (nothing before pos 0).
-			// validMask = trivial-prefix patterns only.
-			validMask := int32(cs.trivialPrefixMasks[bi])
+			b = emitCallSuffix(b, litLen, 0, trivMask, bi)
+			b = append(b, 0x0B) // end $no_triv
+		}
+
+		// 2) Fixed-length prefix patterns: literal at offset L, backward
+		// prefix DFA from L-1 must return 0.
+		for k, fnIdx := range cs.prefixFnIdx[bi] {
+			if k >= 32 || fnIdx < 0 {
+				continue
+			}
+			bit := uint32(1) << uint(k)
+			if cs.varLenMasks[bi]&bit != 0 || cs.varLenNonemptyMasks[bi]&bit != 0 {
+				continue // handled below
+			}
+			L := cs.prefixFixedLens[bi][k]
+			if L <= 0 {
+				continue
+			}
+			globalFn := prefixFnBaseIdx + fnIdx
+
+			b = append(b, 0x02, 0x40) // block $skip_fixed
+			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x00)
+			// L+litLen > inLen: skip.
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(L+litLen))
+			b = append(b, 0x20, pInLen, 0x4B, 0x0D, 0x00)
+			// Check literal bytes at offset L.
+			for li, lb := range lit {
+				b = append(b, 0x20, pInPtr, 0x41)
+				b = utils.AppendSLEB128(b, int32(L+li))
+				b = append(b, 0x6A)
+				b = append(b, 0x2D, 0x00, 0x00)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(lb))
+				b = append(b, 0x47, 0x0D, 0x00)
+			}
+			// Backward prefix DFA(pInPtr, L-1). Result must be 0 (reached
+			// position 0). Any non-zero result (>0 or -1) → skip.
 			b = append(b, 0x20, pInPtr)
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(litLen)) // start = litLen
-			b = append(b, 0x20, pInLen)
-			b = append(b, 0x41, 0x00) // lPos = 0
-			b = append(b, 0x20, pOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A)
-			b = append(b, 0x20, pOutCap, 0x20, lOutCount, 0x6B)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, validMask) // validMask (7th arg)
+			b = utils.AppendSLEB128(b, int32(L-1))
 			b = append(b, 0x10)
-			b = utils.AppendULEB128(b, uint32(suffixFnBase+bi))
-			b = append(b, 0x20, lOutCount, 0x6A, 0x21, lOutCount)
-			b = append(b, 0x0B) // end block $no_lit
+			b = utils.AppendULEB128(b, uint32(globalFn))
+			b = append(b, 0x0D, 0x00) // br_if (result != 0)
+			// Suffix DFA: start=L+litLen, lPos=L → matchStart = L - prefixFixedLen[k] = 0.
+			b = emitCallSuffix(b, L+litLen, L, bit, bi)
+			b = append(b, 0x0B) // end $skip_fixed
+		}
+
+		// 3) Variable-length prefix patterns: scan literal positions.
+		for k, fnIdx := range cs.prefixFnIdx[bi] {
+			if k >= 32 || fnIdx < 0 {
+				continue
+			}
+			bit := uint32(1) << uint(k)
+			isEmpty := cs.varLenMasks[bi]&bit != 0
+			isNonempty := cs.varLenNonemptyMasks[bi]&bit != 0
+			if !isEmpty && !isNonempty {
+				continue
+			}
+			globalFn := prefixFnBaseIdx + fnIdx
+			patID := cs.patternIDs[bi][k]
+
+			b = append(b, 0x41, 0x00, 0x21, lLitPos) // lLitPos = 0
+			b = append(b, 0x02, 0x40)                // block $scan_done
+			b = append(b, 0x03, 0x40)                // loop $scan
+			// lLitPos+litLen > inLen → done.
+			b = append(b, 0x20, lLitPos, 0x41)
+			b = utils.AppendSLEB128(b, int32(litLen))
+			b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x01)
+			// outCount >= cap → done.
+			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)
+
+			b = append(b, 0x02, 0x40) // block $no_match
+			// Check literal at lLitPos.
+			for li, lb := range lit {
+				b = append(b, 0x20, pInPtr, 0x20, lLitPos, 0x6A)
+				if li > 0 {
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, int32(li))
+					b = append(b, 0x6A)
+				}
+				b = append(b, 0x2D, 0x00, 0x00)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(lb))
+				b = append(b, 0x47, 0x0D, 0x00)
+			}
+			// Backward prefix DFA(pInPtr, lLitPos-1). Require result == 0.
+			b = append(b, 0x20, pInPtr)
+			b = append(b, 0x20, lLitPos, 0x41, 0x01, 0x6B)
+			b = append(b, 0x10)
+			b = utils.AppendULEB128(b, uint32(globalFn))
+			b = append(b, 0x0D, 0x00) // br_if (result != 0)
+
+			if isEmpty {
+				// Write tuple (patID, 0, lLitPos+litLen) directly.
+				b = append(b, 0x20, pOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A, 0x21, lOutBase)
+				b = append(b, 0x20, lOutBase, 0x41)
+				b = utils.AppendSLEB128(b, int32(patID))
+				b = append(b, 0x36, 0x02, 0x00)
+				b = append(b, 0x20, lOutBase, 0x41, 0x00, 0x36, 0x02, 0x04)
+				b = append(b, 0x20, lOutBase, 0x20, lLitPos, 0x41)
+				b = utils.AppendSLEB128(b, int32(litLen))
+				b = append(b, 0x6A, 0x36, 0x02, 0x08)
+				b = append(b, 0x20, lOutCount, 0x41, 0x01, 0x6A, 0x21, lOutCount)
+			} else {
+				// Suffix DFA: start=lLitPos+litLen, lPos=0, mask=bit.
+				b = append(b, 0x20, pInPtr)
+				b = append(b, 0x20, lLitPos, 0x41)
+				b = utils.AppendSLEB128(b, int32(litLen))
+				b = append(b, 0x6A)
+				b = append(b, 0x20, pInLen)
+				b = append(b, 0x41, 0x00)
+				b = append(b, 0x20, pOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A)
+				b = append(b, 0x20, pOutCap, 0x20, lOutCount, 0x6B)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(bit))
+				b = append(b, 0x10)
+				b = utils.AppendULEB128(b, uint32(suffixFnBase+bi))
+				b = append(b, 0x20, lOutCount, 0x6A, 0x21, lOutCount)
+			}
+			b = append(b, 0x0B) // end $no_match
+
+			// lLitPos++; br $scan.
+			b = append(b, 0x20, lLitPos, 0x41, 0x01, 0x6A, 0x21, lLitPos)
+			b = append(b, 0x0C, 0x00)
+			b = append(b, 0x0B) // end loop $scan
+			b = append(b, 0x0B) // end block $scan_done
 		}
 	}
 
@@ -552,7 +731,11 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 			}
 			info, err := analyzePattern(re, &prefixPool, &suffixPool)
 			if err != nil {
-				continue
+				patLabel := re.Name
+				if patLabel == "" {
+					patLabel = re.Pattern
+				}
+				return nil, 0, fmt.Errorf("set %q: pattern %q: %w", sc.Name, patLabel, err)
 			}
 			info.globalID = idx
 			info.name = re.Name
@@ -878,7 +1061,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = append(cs_bytes, findBody...)
 		}
 		if cs.match != "" {
-			anchoredBody := emitSetMatchFnAnchored(cs, suffixFnBase[si])
+			anchoredBody := emitSetMatchFnAnchored(cs, suffixFnBase[si], prefixFnBase[si])
 			cs_bytes = append(cs_bytes, anchoredBody...)
 		}
 		for _, sfn := range cs.suffixFnBodies {

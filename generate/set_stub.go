@@ -22,12 +22,38 @@ func hasEmitNameMap(cfg config.BuildConfig) bool {
 	return false
 }
 
-// batchSize returns the batch size for a set (default 256).
-// Callers must use max(batchSize(s), 64) as the output capacity to ensure all
-// patterns matching the same start position fit in a single WASM call.
-func batchSize(s config.SetConfig) int {
-	if s.BatchSize > 0 {
-		return s.BatchSize
+// patternsInSet returns the number of patterns in s. For sets.patterns: "all"
+// this is len(cfg.Regexes); otherwise it is len(s.Patterns.Names). The count
+// is a safe upper bound on how many matches the WASM function can emit at a
+// single start position (each global pattern ID can emit at most once per
+// start in the find_all output).
+func patternsInSet(s config.SetConfig, cfg config.BuildConfig) int {
+	if s.Patterns.All {
+		return len(cfg.Regexes)
 	}
-	return 256
+	return len(s.Patterns.Names)
+}
+
+// batchSize returns the effective output capacity in tuples for a set. It is
+// the maximum of:
+//   - the user-configured batch_size (default 256),
+//   - 64 (minimum amortisation floor),
+//   - patternsInSet(s, cfg) — so a single start position can never emit more
+//     matches than the buffer holds. This is required for the "advance to
+//     last.start + max(last.length, 1)" resume rule used by the generated
+//     wrappers: when out_cap == count the batch may have been truncated
+//     mid-position, but with out_cap >= patternsInSet that truncation
+//     cannot happen.
+func batchSize(s config.SetConfig, cfg config.BuildConfig) int {
+	bs := s.BatchSize
+	if bs <= 0 {
+		bs = 256
+	}
+	if bs < 64 {
+		bs = 64
+	}
+	if n := patternsInSet(s, cfg); bs < n {
+		bs = n
+	}
+	return bs
 }

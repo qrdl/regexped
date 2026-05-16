@@ -53,7 +53,7 @@ impl SetMatch {
 
 `)
 	for _, s := range cfg.Sets {
-		bs := max(batchSize(s), 64)
+		bs := batchSize(s, cfg)
 		if s.FindAll != "" || s.FindAny != "" {
 			ffiName := "ffi_" + s.FindAll
 			wasmExport := s.FindAll

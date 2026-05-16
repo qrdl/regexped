@@ -58,7 +58,7 @@ func genASSetSection(cfg config.BuildConfig) string {
 	out.WriteString("class SetMatch { constructor(public patternId: i32, public start: i32, public end: i32) {} }\n")
 	out.WriteString("class SetAnchorMatch { constructor(public patternId: i32, public end: i32) {} }\n\n")
 	for _, s := range cfg.Sets {
-		bs := batchSize(s)
+		bs := batchSize(s, cfg)
 		if s.FindAll != "" || s.FindAny != "" {
 			wasmExport := s.FindAll
 			if wasmExport == "" {

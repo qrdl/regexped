@@ -1746,6 +1746,96 @@ func TestSetMatch_Anchored_SQLValidator_Fixture(t *testing.T) {
 	}
 }
 
+// TestSetMatch_Anchored_FixedLenPrefix exercises the fixed-length prefix
+// branch of emitSetMatchFnAnchored: `\d{3}foo` produces a prefix of exact
+// length 3 followed by the mandatory literal "foo".
+func TestSetMatch_Anchored_FixedLenPrefix(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Name: "p1", Pattern: `\d{3}foo`},
+			{Name: "p2", Pattern: `[a-z]{2}bar`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestSetMatch_Anchored_VarLenEmptySuffix exercises the variable-length
+// prefix path with an empty suffix: `\d+foo` has a varlen prefix and the
+// mandatory literal "foo" at the end.
+func TestSetMatch_Anchored_VarLenEmptySuffix(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Name: "p1", Pattern: `\d+foo`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestSetMatch_Anchored_VarLenNonEmptySuffix exercises the variable-length
+// prefix path with a non-empty suffix: `\d+foo\d+` has both a varlen prefix
+// and a non-empty suffix around the mandatory literal "foo".
+func TestSetMatch_Anchored_VarLenNonEmptySuffix(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexes: []config.RegexEntry{
+			{Name: "p1", Pattern: `\d+foo\d+`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestSetMatch_Anchored_LargeFallback exercises the n > 32 clamp in the
+// fallback bucket branch of emitSetMatchFnAnchored. We use (?i) patterns
+// without a mandatory literal so all 40 patterns fall back to a single
+// bucket that must be clamped to 32-pattern mask width.
+func TestSetMatch_Anchored_LargeFallback(t *testing.T) {
+	const n = 40
+	cfg := config.BuildConfig{
+		Regexes: make([]config.RegexEntry, n),
+		Sets: []config.SetConfig{
+			{Name: "s", Match: "m", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	for i := 0; i < n; i++ {
+		cfg.Regexes[i] = config.RegexEntry{
+			Pattern: fmt.Sprintf(`(?i)tok%02d`, i),
+		}
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
 func TestValidateSets_MatchOnly(t *testing.T) {
 	cfg := &config.BuildConfig{
 		Regexes: []config.RegexEntry{{Name: "p", Pattern: "foo"}},

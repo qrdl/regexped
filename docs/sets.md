@@ -69,8 +69,32 @@ out_ptr + i*12 + 8 : length      i32   byte length of match
 ```
 
 The host calls with `(in_ptr, in_len, out_ptr, out_cap, start_pos)` and
-receives `count` (tuples written). After each batch, advance
-`start_pos = last.start + max(last.length, 1)` and re-call until count = 0.
+receives `count` (tuples written). Tuples within a batch are emitted in
+strictly non-decreasing `start` order.
+
+**Resume rule.** After a batch of `count` tuples, let `last` be the final
+tuple. If `count < out_cap` the batch is complete for all positions up to and
+including `last.start`; advance with
+
+```
+start_pos = last.start + max(last.length, 1)
+```
+
+If `count == out_cap` the batch may have been truncated mid-position (the
+suffix DFA respects the remaining capacity and stops writing as soon as the
+buffer is full, even when more patterns match at `last.start`). To resume
+safely in this case the host must either:
+
+- size `out_cap ≥ (number of patterns in the set)` — guaranteeing no single
+  start position can produce more matches than the buffer holds, after which
+  the advance formula above is always safe; **or**
+- resume at `start_pos = last.start` and dedupe any `(pattern_id, start)`
+  pairs already emitted in the previous batch.
+
+Generated stubs use `batch_size` (default 256) and assume the first option;
+this is safe for sets with up to 256 patterns. Custom hosts using a smaller
+buffer must apply the second resume rule, or risk missing same-position
+matches.
 
 ### match — match tuples (12 bytes each)
 
@@ -82,7 +106,11 @@ out_ptr + i*12 + 4 : start       i32   always 0 for anchored match
 out_ptr + i*12 + 8 : length      i32   byte length of match
 ```
 
-`end = start + length`. The host reads `pattern_id = buf[0]`, `end = buf[1]+buf[2]`.
+The host calls with `(in_ptr, in_len, out_ptr, out_cap)` and receives `count`
+(tuples written; 0 if no pattern matches anchored at position 0). Anchored
+match is not batched — one call returns all matching patterns, up to `out_cap`.
+Each tuple occupies 12 bytes; decode three little-endian i32s at offsets 0, 4,
+and 8. `end = start + length` (with `start = 0`).
 
 ## Batched streaming and batch_size
 
@@ -93,6 +121,13 @@ used in generated stubs (default 256). Tune it:
 - **Dense matches** (many matches per KB): increase `batch_size` to amortise
   host↔WASM transition overhead
 - **Memory-tight environments**: reduce `batch_size`
+
+The stub generator always raises the effective capacity to at least
+`max(64, patterns_in_set)`, so a single start position can never overflow the
+buffer and the standard advance rule (`last.start + max(last.length, 1)`)
+remains safe regardless of the configured `batch_size`. Custom hosts that
+bypass the generated stubs must apply the same floor themselves or use the
+dedupe-on-truncation resume rule described above.
 
 `batch_size` is a stub-generation knob and does not affect the WASM binary.
 
@@ -149,17 +184,25 @@ The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
 For 9–16 literals Teddy uses two groups of 8 (`TwoGroups=true`), ORing the
 results of two independent nibble probes per 16-byte chunk.
 
-## Limitation: anchored `match` and case-insensitive patterns
+## Anchored `match` and patterns without a mandatory literal
 
-The anchored `match` export only fires for patterns that have a mandatory literal
-(a fixed byte sequence present in every match). Case-insensitive patterns (those
-using `(?i)`) never have a mandatory literal because their literals have
-`FoldCase` set and are excluded from literal extraction. Such patterns land in the
-fallback bucket and are **silently skipped** by the anchored match function —
-they will never match via `match`, only via `find_any` / `find_all`.
+The anchored `match` export classifies which pattern(s) in a set match the input
+starting at position 0. Patterns are routed at compile time into buckets keyed by
+their mandatory literal (a fixed byte sequence that must appear in every match).
+Patterns with no extractable mandatory literal — most commonly case-insensitive
+patterns (those using `(?i)`, whose literals carry `FoldCase` and are excluded
+from literal extraction) — route to a **fallback bucket** instead.
 
-To use anchored set validation with a fixed keyword vocabulary (e.g. SQL
-keywords), write the patterns without `(?i)` and use uppercase literals directly.
+For `match`, fallback bucket patterns are evaluated at position 0 by running the
+bucket's combined suffix DFA directly: no literal scan is performed, but the
+bucket's patterns still participate in matching. They will be reported in the
+result tuples just like literal-bucket patterns.
+
+The trade-off is purely a performance one: literal-bucket patterns benefit from
+the SIMD/Aho-Corasick prefilter, fallback-bucket patterns do not. For a fixed
+keyword vocabulary where you control the casing, writing patterns without `(?i)`
+and using a single uppercase literal lets them flow into literal buckets and run
+faster — but it is not required for correctness.
 
 ## Examples
 

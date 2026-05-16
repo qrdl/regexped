@@ -63,3 +63,67 @@ regexps
 -;0-3;-;-;0-3
 -;0-5;-;-;0-5,2-5
 -;0-7;-;-;0-7,2-7,4-7
+# ============================================================
+# Category S3: SQL classifier — case-insensitive, ^-anchored
+# ============================================================
+# Mirrors compile/testdata/set/sql_validator/patterns.yaml. These patterns
+# carry (?i) so they have no mandatory literal and route to the fallback
+# bucket. find_all must still report exactly one match per pattern at the
+# anchored position (or none), verifying that fallback patterns are not
+# silently dropped by the set-find code path.
+SetSQLClassifier
+strings
+"SELECT 1"
+"  SELECT * FROM t"
+"select 1"
+"INSERT INTO t VALUES(1)"
+"UPDATE t SET x=1"
+"DELETE FROM t"
+"BEGIN"
+"NOTAKEYWORD"
+regexps
+"(?i)^\\s*SELECT\\b"
+-;0-6;-;-;0-6
+-;0-8;-;-;0-8
+-;0-6;-;-;0-6
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)^\\s*INSERT\\s+INTO\\b"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-11;-;-;0-11
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)^\\s*UPDATE\\s+\\w"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-8;-;-;0-8
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)^\\s*DELETE\\s+FROM\\b"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-11;-;-;0-11
+-;-;-;-;-
+-;-;-;-;-
+"(?i)^\\s*BEGIN\\b"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-5;-;-;0-5
+-;-;-;-;-

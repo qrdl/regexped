@@ -798,12 +798,14 @@ func testSetBlock(
 
 	mod, modErr := wasmtime.NewModule(engine, wasmBytes)
 	if modErr != nil {
+		err = fmt.Errorf("set block NewModule: %w", modErr)
 		return
 	}
 	store := wasmtime.NewStore(engine)
 	store.SetEpochDeadline(1)
 	inst, instErr := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if instErr != nil {
+		err = fmt.Errorf("set block NewInstance: %w", instErr)
 		return
 	}
 	var mem *wasmtime.Memory
@@ -812,6 +814,7 @@ func testSetBlock(
 	}
 	findAllFn := inst.GetFunc(store, "find_all")
 	if mem == nil || findAllFn == nil {
+		err = fmt.Errorf("set block missing exports: memory=%v find_all=%v", mem != nil, findAllFn != nil)
 		return
 	}
 
@@ -825,6 +828,7 @@ func testSetBlock(
 	neededPages := uint64((int64(outBase) + outBytes + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); neededPages > cur {
 		if _, growErr := mem.Grow(store, neededPages-cur); growErr != nil {
+			err = fmt.Errorf("set block memory.Grow to %d pages: %w", neededPages, growErr)
 			return
 		}
 	}
