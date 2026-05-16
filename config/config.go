@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"github.com/goccy/go-yaml"
 )
 
 // BuildConfig is the top-level structure of the YAML config file.
@@ -41,22 +41,31 @@ type PatternSelector struct {
 	Names []string // pattern names when All is false
 }
 
-// UnmarshalYAML implements yaml.Unmarshaler for PatternSelector.
+// UnmarshalYAML implements yaml.InterfaceUnmarshaler for PatternSelector.
 // Accepts either the scalar string "all" or a sequence of strings.
-func (p *PatternSelector) UnmarshalYAML(value *yaml.Node) error {
-	if value.Kind == yaml.ScalarNode && value.Value == "all" {
-		p.All = true
-		return nil
+func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var raw interface{}
+	if err := unmarshal(&raw); err != nil {
+		return err
 	}
-	if value.Kind == yaml.SequenceNode {
-		var names []string
-		if err := value.Decode(&names); err != nil {
-			return err
+	switch v := raw.(type) {
+	case string:
+		if v == "all" {
+			p.All = true
+			return nil
 		}
-		p.Names = names
+		return fmt.Errorf("patterns: expected \"all\" or a list of pattern names, got %q", v)
+	case []interface{}:
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return fmt.Errorf("patterns: list items must be strings")
+			}
+			p.Names = append(p.Names, s)
+		}
 		return nil
 	}
-	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names, got %s", value.Value)
+	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names")
 }
 
 // ValidateSets validates the `sets:` block against the `regexes:` list.
@@ -85,6 +94,9 @@ func ValidateSets(cfg *BuildConfig) error {
 		setNames[s.Name] = true
 		if s.FindAny == "" && s.FindAll == "" && s.Match == "" {
 			return fmt.Errorf("set %q: at least one of find_any, find_all, or match must be set", s.Name)
+		}
+		if !s.Patterns.All && len(s.Patterns.Names) == 0 {
+			return fmt.Errorf("set %q: patterns is required (use \"all\" or a non-empty list of pattern names)", s.Name)
 		}
 		if !s.Patterns.All {
 			for _, pname := range s.Patterns.Names {
@@ -154,6 +166,10 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	cfg.WasmFile = resolveFilePath(configDir, cfg.WasmFile)
 	cfg.StubFile = resolveFilePath(configDir, cfg.StubFile)
 	cfg.WasmMerge = resolveFilePath(configDir, cfg.WasmMerge)
+
+	if err := ValidateSets(&cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
 
 	return cfg, nil
 }

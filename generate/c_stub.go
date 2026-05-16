@@ -75,15 +75,21 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 		cb.WriteString(p.c)
 	}
 
-	if len(parts) == 0 && !hasSetExports(config.BuildConfig{Sets: nil}) {
-		return "", "", nil
-	}
-
 	return hb.String(), cb.String(), nil
 }
 
 // cStubWithSets updates genCStubFiles to also handle sets.
 func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, cContent string, err error) {
+	hasIndividual := false
+	for _, re := range cfg.Regexes {
+		if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
+			hasIndividual = true
+			break
+		}
+	}
+	if !hasIndividual && !hasSetExports(cfg) {
+		return "", "", nil
+	}
 	hContent, cContent, err = genCStubFiles(cfg.Regexes, cfg.ImportModule, hBasename)
 	if err != nil {
 		return
@@ -96,6 +102,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 	cb.WriteString(cContent)
 	for _, s := range cfg.Sets {
 		if s.FindAll != "" || s.FindAny != "" {
+			bs := batchSize(s)
 			wasmExport := s.FindAll
 			if wasmExport == "" {
 				wasmExport = s.FindAny
@@ -105,19 +112,31 @@ int ffi_%s(const char *ptr, int len, int *out, int cap, int start);
 `, cfg.ImportModule, wasmExport, wasmExport)
 			if s.FindAll != "" {
 				fmt.Fprintf(&hb, "int %s_next(const char *input, int len, rx_set_match_t *out);\nvoid %s_reset(void);\n\n", s.FindAll, s.FindAll)
-				fmt.Fprintf(&cb, `static int _start_%s = 0; static int _buf_%s[3];
+				fmt.Fprintf(&cb, `static int _start_%s = 0; static int _buf_%s[%d*3]; static int _buf_n_%s = 0; static int _buf_i_%s = 0;
 int %s_next(const char *input, int len, rx_set_match_t *out) {
-    int n = ffi_%s(input, len, _buf_%s, 1, _start_%s);
-    if (n <= 0) return 0;
-    out->pattern_id = _buf_%s[0]; out->start = _buf_%s[1]; out->end = _buf_%s[1]+_buf_%s[2];
-    _start_%s = _buf_%s[1] + (_buf_%s[2] > 0 ? _buf_%s[2] : 1);
+    if (_buf_i_%s >= _buf_n_%s) {
+        int n = ffi_%s(input, len, _buf_%s, %d, _start_%s);
+        if (n <= 0) { _buf_n_%s = 0; _buf_i_%s = 0; return 0; }
+        _buf_n_%s = n; _buf_i_%s = 0;
+        int last = (n-1)*3;
+        _start_%s = _buf_%s[last+1] + (_buf_%s[last+2] > 0 ? _buf_%s[last+2] : 1);
+    }
+    int i = _buf_i_%s++ * 3;
+    out->pattern_id = _buf_%s[i]; out->start = _buf_%s[i+1]; out->end = _buf_%s[i+1]+_buf_%s[i+2];
     return 1;
 }
-void %s_reset(void) { _start_%s = 0; }
-`, s.FindAll, s.FindAll, s.FindAll, wasmExport, s.FindAll, s.FindAll,
+void %s_reset(void) { _start_%s = 0; _buf_n_%s = 0; _buf_i_%s = 0; }
+`,
+					s.FindAll, s.FindAll, bs, s.FindAll, s.FindAll,
+					s.FindAll,
+					s.FindAll, s.FindAll,
+					wasmExport, s.FindAll, bs, s.FindAll,
+					s.FindAll, s.FindAll,
+					s.FindAll, s.FindAll,
 					s.FindAll, s.FindAll, s.FindAll, s.FindAll,
+					s.FindAll,
 					s.FindAll, s.FindAll, s.FindAll, s.FindAll,
-					s.FindAll, s.FindAll)
+					s.FindAll, s.FindAll, s.FindAll, s.FindAll)
 			}
 			if s.FindAny != "" {
 				anyFFI := "ffi_" + s.FindAny

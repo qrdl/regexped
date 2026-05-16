@@ -58,6 +58,14 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("function _b(input: string | Uint8Array): Uint8Array {\n")
 	sb.WriteString("    return typeof input === 'string' ? _enc.encode(input) : input;\n")
 	sb.WriteString("}\n\n")
+	sb.WriteString("function _resize(inputLen: number): void {\n")
+	sb.WriteString("    _outBase = _inBase + Math.max(1, Math.ceil(inputLen / 65536)) * 65536;\n")
+	sb.WriteString("    const needed = _outBase + 65536;\n")
+	sb.WriteString("    if (needed > _mem.buffer.byteLength) {\n")
+	sb.WriteString("        (_exp.memory as WebAssembly.Memory).grow(Math.ceil((needed - _mem.buffer.byteLength) / 65536));\n")
+	sb.WriteString("        _mem = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer);\n")
+	sb.WriteString("    }\n")
+	sb.WriteString("}\n\n")
 
 	for _, re := range cfg.Regexes {
 		if re.MatchFunc != "" {
@@ -104,6 +112,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			if s.FindAll != "" {
 				fmt.Fprintf(&out, `export function* %s(input: string | Uint8Array): Generator<SetMatch> {
     const b = _b(input);
+    _resize(b.length);
     const outBuf = new Int32Array(_mem.buffer, _outBase, %d*3);
     _mem.set(b, _inBase);
     let startPos = 0;
@@ -121,6 +130,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			if s.FindAny != "" {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): SetMatch | null {
     const b = _b(input);
+    _resize(b.length);
     const outBuf = new Int32Array(_mem.buffer, _outBase, 3);
     _mem.set(b, _inBase);
     if ((_exp['%s'] as Function)(_inBase, b.length, _outBase, 1, 0) <= 0) return null;
@@ -132,6 +142,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		if s.Match != "" {
 			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): SetMatch | null {
     const b = _b(input);
+    _resize(b.length);
     const outBuf = new Int32Array(_mem.buffer, _outBase, 2);
     _mem.set(b, _inBase);
     if ((_exp['%s'] as Function)(_inBase, b.length, _outBase, 1) <= 0) return null;
@@ -157,6 +168,7 @@ func genTSMatchFunc(funcName string) string {
 	return fmt.Sprintf(`// %s — anchored match; returns [endPos, true] on match or [0, false] if no match.
 export function %s(input: string | Uint8Array): [number, boolean] {
     const b = _b(input);
+    _resize(b.length);
     _mem.set(b, _inBase);
     const r = (_exp['%s'] as CallableFunction)(_inBase, b.length) as number;
     if (r < 0) return [0, false];
@@ -170,6 +182,7 @@ func genTSFindFunc(funcName string) string {
 	return fmt.Sprintf(`// %s — yields [start, end] for each non-overlapping match.
 export function* %s(input: string | Uint8Array): Generator<[number, number]> {
     const b = _b(input);
+    _resize(b.length);
     let off = 0;
     while (off <= b.length) {
         _mem.set(b.subarray(off), _inBase);
@@ -192,6 +205,7 @@ func genTSGroupsFunc(funcName string, numGroups int) string {
 // Index 0 is the full match.
 export function* %s(input: string | Uint8Array): Generator<Array<[number, number] | null>> {
     const b = _b(input);
+    _resize(b.length);
     let off = 0;
     while (off <= b.length) {
         _mem.set(b.subarray(off), _inBase);
@@ -240,6 +254,7 @@ func genTSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 // Each object maps name → [start, end] (absolute) for participating groups.
 export function* %s(input: string | Uint8Array): Generator<Record<string, [number, number]>> {
     const b = _b(input);
+    _resize(b.length);
     let off = 0;
     while (off <= b.length) {
         _mem.set(b.subarray(off), _inBase);

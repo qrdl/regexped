@@ -8,14 +8,15 @@
 | URL parsing into components | wasmtime | C | individual | [wasmtime/c/url-parts](wasmtime/c/url-parts) |
 | CSV parsing and validation | wasmtime | Go | individual | [wasmtime/go/csv](wasmtime/go/csv) |
 | SQL injection detection | wasmtime | Go | individual | [wasmtime/go/sql-injection](wasmtime/go/sql-injection) |
-| Multi-pattern secret scanning (wasip1 app) | wasmtime | Go | set | [wasmtime/go/secret-scanner](wasmtime/go/secret-scanner) |
+| Multi-pattern secret scanning | wasmtime | Go | set | [wasmtime/go/secret-scanner](wasmtime/go/secret-scanner) |
 | Email, URL, XSS validation | FastEdge | Rust | individual | [fastedge/validate](fastedge/validate) |
-| URL guard (path + header + body rules) | FastEdge | Rust | set | [fastedge/url-guard](fastedge/url-guard) |
+| URL guard | FastEdge | Rust | set | [fastedge/url-guard](fastedge/url-guard) |
 | Email and URL validation | Browser | JavaScript | individual | [browser](browser) |
 | Domain extraction from URLs | Node.js | TypeScript | individual | [node/domain-extract](node/domain-extract) |
 | SQL statement validation | Node.js | TypeScript | set | [node/sql-validator](node/sql-validator) |
 | Credential scanner edge API | Cloudflare Workers | JavaScript | individual | [workers](workers) |
 | Email extraction with captures | wasmtime | AssemblyScript | individual | [wasmtime/as/find-email](wasmtime/as/find-email) |
+| Injections scanner | wasmtime | AssemblyScript | 2 sets | [wasmtime/as/inject-scanner](wasmtime/as/inject-scanner) |
 
 Run `make` in any example directory to build and run end-to-end.
 

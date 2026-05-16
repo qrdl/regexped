@@ -115,7 +115,7 @@ suffix DFAs within each group:
 
 | Constraint | Default | Config field |
 |---|---|---|
-| Max patterns per bitmask bucket | 64 | `bitmask_width` (internal) |
+| Max patterns per bitmask bucket | 32 | `bitmask_width` (internal) |
 | Max merged DFA table bytes | 64 KB | `budget_bytes` (internal) |
 | Max merged DFA states | 512 | `budget_states` (internal) |
 | Pre-filter (states × combined classes) | 65536 | `budget_states_prefilter` (internal) |
@@ -139,13 +139,12 @@ The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
 
 | Condition | Frontend |
 |---|---|
-| ≤ 8 distinct literals, all 1–4 bytes | **Teddy** — SIMD nibble fingerprint, near-zero false positives |
-| > 8 literals, or any literal > 4 bytes | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count |
-| No mandatory literals (fallback buckets) | **Scalar** — position-by-position check |
+| 1–16 distinct literals | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch |
+| 17–32 distinct literals | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count; capped at 32 automaton nodes |
+| >32 literals, or no mandatory literals | **Scalar** — position-by-position check |
 
-> **Future:** multi-pass Teddy (8 literals per pass, OR-ed results) could cover
-> 9–64 literals with cost proportional to ⌈N/8⌉ passes, outperforming AC for
-> moderate-sized sets. See plan note in `plans/COMPOSING_PATTERNS_PLAN.md`.
+For 9–16 literals Teddy uses two groups of 8 (`TwoGroups=true`), ORing the
+results of two independent nibble probes per 16-byte chunk.
 
 ## Limitation: anchored `match` and case-insensitive patterns
 
@@ -164,4 +163,4 @@ keywords), write the patterns without `(?i)` and use uppercase literals directly
 - [examples/node/sql-validator/](../examples/node/sql-validator/) — anchored `match`, SQL statement validation (Node.js / TypeScript)
 - [examples/wasmtime/go/secret-scanner/](../examples/wasmtime/go/secret-scanner/) — `find_all`, secret detection (Go wasip1)
 - [examples/wasmtime/rust/secret-scanner/](../examples/wasmtime/rust/secret-scanner/) — `find_all`, secret detection (native Rust host)
-- [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `find_any`, URL/header/body rule matching (FastEdge)
+- [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `find_all`, URL rule matching (FastEdge)

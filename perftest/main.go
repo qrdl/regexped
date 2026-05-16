@@ -2335,14 +2335,14 @@ func runCompareSetTime(baselinePath string, regexWasmBytes []byte, engine *wasmt
 	return ok
 }
 
-// runCompareSetFuel measures set fuel and compares against baseline (±20%).
+// runCompareSetFuel measures set fuel and compares against baseline (±5%).
 func runCompareSetFuel(baselinePath string, fuelEngine *wasmtime.Engine) bool {
 	baseline, err := parseSetFuelBaseline(baselinePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "compare-sets-fuel: cannot read baseline %s: %v\n", baselinePath, err)
 		return false
 	}
-	const tolerance = 0.20
+	const tolerance = 0.05
 	ok := true
 	for _, sc := range setTests {
 		for _, inp := range sc.inputs {
@@ -2428,7 +2428,7 @@ func main() {
 	sets := flag.Bool("sets", false, "run set composition benchmarks (regexped find_all vs regex crate RegexSet+rescan)")
 	sizeOnlySets := flag.Bool("size-only-sets", false, "print WASM sizes for set test cases and exit")
 	compareSetsTime := flag.String("compare-sets-time", "", "compare set p50 times against baseline file; exit 1 if outside ±10%")
-	compareSetsFuel := flag.String("compare-sets-fuel", "", "compare set fuel counts against baseline file; exit 1 if outside ±20%")
+	compareSetsFuel := flag.String("compare-sets-fuel", "", "compare set fuel counts against baseline file; exit 1 if outside ±5%")
 	compareSetsSizeFlag := flag.String("compare-sets-size", "", "compare set WASM sizes against baseline file; exit 1 if outside ±5%")
 	compareTime := flag.String("compare-time", "", "compare speedup ratio (rxp/rped p50) against baseline file; exit 1 if outside ±10%")
 	compareFuel := flag.String("compare-fuel", "", "compare fuel counts against baseline file; exit 1 if outside ±20% (TDFA non-determinism budget)")

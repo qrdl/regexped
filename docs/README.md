@@ -111,10 +111,13 @@ See [`examples/README.md`](../examples/README.md) for more details.
 - **No WASM Component Model** — generated modules use the core WASM ABI (linear memory + exported functions). WASM Component Model support is planned.
 - **Not thread-safe** — the C, JS, TS, and AS stubs are not safe for concurrent use. Only the Rust and Go stubs are thread-safe.
 
-## Requirements
+## Dependencies
 
-- Go 1.25 (build only)
-- `wasm-merge` from [Binaryen](https://github.com/WebAssembly/binaryen) (for `merge` command)
+Regexped is almost dependency-free. The only compile-time dependency is [`github.com/goccy/go-yaml`](https://github.com/goccy/go-yaml) for YAML config parsing. All regex compilation, WASM emission, and stub generation are implemented from scratch with no external libraries.
+
+The `wasmtime-go` binding is used only in `re2test/` (the exhaustive correctness test suite) and is not part of the main tool.
+
+[`wasm-merge`](https://github.com/WebAssembly/binaryen) (from the Binaryen toolkit) is an external binary required only for the `merge` command. It must be installed separately using `get_wasm_merge.sh` shell script.
 
 ## License
 

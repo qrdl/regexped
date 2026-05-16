@@ -41,6 +41,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 			if s.FindAll != "" {
 				fmt.Fprintf(&out, `export function* %s(input) {
     const b = _b(input);
+    _resize(b.length);
     const outBuf = new Int32Array(_mem.buffer, _outBase, %d*3);
     _mem.set(b, _inBase);
     let startPos = 0;
@@ -58,6 +59,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 			if s.FindAny != "" {
 				fmt.Fprintf(&out, `export function %s(input) {
     const b = _b(input);
+    _resize(b.length);
     const outBuf = new Int32Array(_mem.buffer, _outBase, 3);
     _mem.set(b, _inBase);
     const n = _exp['%s'](_inBase, b.length, _outBase, 1, 0);
@@ -70,6 +72,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		if s.Match != "" {
 			fmt.Fprintf(&out, `export function %s(input) {
     const b = _b(input);
+    _resize(b.length);
     const outBuf = new Int32Array(_mem.buffer, _outBase, 2);
     _mem.set(b, _inBase);
     const n = _exp['%s'](_inBase, b.length, _outBase, 1);
@@ -128,6 +131,14 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("function _b(input) {\n")
 	sb.WriteString("    return typeof input === 'string' ? _enc.encode(input) : input;\n")
 	sb.WriteString("}\n\n")
+	sb.WriteString("function _resize(inputLen) {\n")
+	sb.WriteString("    _outBase = _inBase + Math.max(1, Math.ceil(inputLen / 65536)) * 65536;\n")
+	sb.WriteString("    const needed = _outBase + 65536;\n")
+	sb.WriteString("    if (needed > _mem.buffer.byteLength) {\n")
+	sb.WriteString("        _exp.memory.grow(Math.ceil((needed - _mem.buffer.byteLength) / 65536));\n")
+	sb.WriteString("        _mem = new Uint8Array(_exp.memory.buffer);\n")
+	sb.WriteString("    }\n")
+	sb.WriteString("}\n\n")
 
 	for _, re := range cfg.Regexes {
 		if re.MatchFunc != "" {
@@ -162,6 +173,7 @@ func genJSMatchFunc(funcName string) string {
 	return fmt.Sprintf(`// %s — anchored match; returns [endPos, true] on match or [0, false] if no match.
 export function %s(input) {
     const b = _b(input);
+    _resize(b.length);
     _mem.set(b, _inBase);
     const r = _exp['%s'](_inBase, b.length);
     if (r < 0) return [0, false];
@@ -177,6 +189,7 @@ func genJSFindFunc(funcName string) string {
 	return fmt.Sprintf(`// %s — yields [start, end] for each non-overlapping match.
 export function* %s(input) {
     const b = _b(input);
+    _resize(b.length);
     let off = 0;
     while (off <= b.length) {
         _mem.set(b.subarray(off), _inBase);
@@ -202,6 +215,7 @@ func genJSGroupsFunc(funcName string, numGroups int) string {
 // Index 0 is the full match.
 export function* %s(input) {
     const b = _b(input);
+    _resize(b.length);
     let off = 0;
     while (off <= b.length) {
         _mem.set(b.subarray(off), _inBase);
@@ -253,6 +267,7 @@ func genJSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 // Each object maps name → [start, end] (absolute) for participating groups.
 export function* %s(input) {
     const b = _b(input);
+    _resize(b.length);
     let off = 0;
     while (off <= b.length) {
         _mem.set(b.subarray(off), _inBase);

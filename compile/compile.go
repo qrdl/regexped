@@ -890,15 +890,20 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		}
 		var infos []*PatternInfo
 		var globalIDs []int
+		var droppedRefs []PatternRef
 		for _, idx := range selectedIdx {
 			re := cfg.Regexes[idx]
 			if re.CaptureStubsRequested() {
+				diag.CaptureBearing++
+				droppedRefs = append(droppedRefs, PatternRef{ID: idx, Name: re.Name})
 				continue
 			}
 			info, err := analyzePattern(re, &prefixPool, &suffixPool)
 			if err != nil {
 				continue
 			}
+			info.globalID = idx
+			info.name = re.Name
 			infos = append(infos, info)
 			globalIDs = append(globalIDs, idx)
 		}
@@ -915,6 +920,7 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 			continue
 		}
 		if cs.diag != nil {
+			cs.diag.CaptureBearingDropped = droppedRefs
 			diag.Sets = append(diag.Sets, *cs.diag)
 		}
 		diag.InSet += len(infos)

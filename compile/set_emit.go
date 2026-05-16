@@ -138,7 +138,7 @@ func (cs *compiledSet) suffixFnBaseOffset() int {
 
 // CompileSetOptions resolved defaults.
 const (
-	setMatchTypeSuffix = 3 // type index for suffix DFA fn: (i32,i32,i32)→i64
+	setMatchTypeSuffix = 3 // type index for suffix DFA fn: (i32,i32,i32,i32,i32,i32,i32)→i32
 	setMatchTypeMatch  = 5 // type index for set match fn:   (i32,i32,i32,i32,i32)→i32
 )
 
@@ -186,7 +186,6 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 	}
 	fe := chooseLiteralFrontend(lits)
-	diag.Frontend = fe.String()
 
 	// First pass: compute per-bucket prefix metadata (before building suffix DFAs).
 	prefixFnIdx := make([][]int, len(buckets))
@@ -247,7 +246,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	suffixFnBodies := make([][]byte, len(buckets))
 	var allDataBytes []byte
 	var totalDataSegs int
-	var tableOffset int32 = 0 // data segment base for this set's tables
+	tableOffset := opts.TableBase // data segment base for this set's tables
 
 	for bi, bkt := range buckets {
 		fnBody, dataBytes, dataSegs := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi])
@@ -353,6 +352,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			fe = frontendScalar
 		}
 	}
+
+	// Record the frontend actually used (after any fallback to scalar).
+	diag.Frontend = fe.String()
 
 	// The set match function body is built at assemble time (when function table
 	// indices are known). Store nil here; assembleModuleWithSets fills it in.
@@ -526,6 +528,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 
 	var prefixPool, suffixPool dfaPool
 	var compiledSets []*compiledSet
+	setTableBase := lastTableEnd // each set's tables start after all preceding data
 	for _, sc := range cfg.Sets {
 		// Resolve patterns.
 		var selectedIdx []int
@@ -551,6 +554,8 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 			if err != nil {
 				continue
 			}
+			info.globalID = idx
+			info.name = re.Name
 			infos = append(infos, info)
 			globalIDs = append(globalIDs, idx)
 		}
@@ -567,22 +572,21 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		if !standalone {
 			setOpts.TableMemIdx = 1
 		}
+		setOpts.TableBase = int32(setTableBase)
 		cs, err := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
 		if err != nil {
 			return nil, 0, err
 		}
 		compiledSets = append(compiledSets, cs)
+		setTableBase += int64(len(cs.dataBytes)) + int64(len(cs.prefixDataBytes)) +
+			int64(len(cs.acDataBytes)) + int64(len(cs.teddyDataBytes))
 	}
 
-	// Compute required memory pages from the largest data address used:
-	// max(per-pattern tableEnd, total set DFA data bytes).
-	totalSetData := int64(0)
-	for _, cs := range compiledSets {
-		totalSetData += int64(len(cs.dataBytes))
-	}
+	// Compute required memory pages from the largest data address used.
+	// setTableBase already holds the end of all set data (per-set accumulation above).
 	dataTop := lastTableEnd
-	if totalSetData > dataTop {
-		dataTop = totalSetData
+	if setTableBase > dataTop {
+		dataTop = setTableBase
 	}
 	var memPages int32 = 1
 	if dataTop > 0 {
@@ -593,7 +597,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	}
 	if standalone && memPages < 1 {
 		memPages = 1
-	} else if !standalone && lastTableEnd == 0 && totalSetData == 0 {
+	} else if !standalone && lastTableEnd == 0 && setTableBase == 0 {
 		memPages = 1
 	}
 	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone), lastTableEnd, nil

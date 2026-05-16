@@ -8,8 +8,8 @@ import (
 	"regexp/syntax"
 	"testing"
 
+	"github.com/goccy/go-yaml"
 	"github.com/qrdl/regexped/config"
-	"gopkg.in/yaml.v3"
 )
 
 // --------------------------------------------------------------------------

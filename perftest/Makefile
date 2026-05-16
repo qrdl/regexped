@@ -46,14 +46,14 @@ baseline-sets: harnesses
 	@echo "Set baselines captured."
 
 # Regression gate for set benchmarks.
-# Tolerances: time ±10%, fuel ±20%, size ±5%.
+# Tolerances: time ±10%, fuel ±5%, size ±5%.
 sets-check: harnesses
+	@echo "Checking set fuel baseline (±5%)..."
+	@go run . --compare-sets-fuel baseline_sets_fuel.txt 2>/dev/null || \
+		(echo "SET REGRESSION: fuel — run 'make baseline-sets' if intentional" && exit 1)
 	@echo "Checking set time baseline (±10%)..."
 	@go run . --compare-sets-time baseline_sets_time.txt 2>/dev/null || \
 		(echo "SET REGRESSION: time — run 'make baseline-sets' if intentional" && exit 1)
-	@echo "Checking set fuel baseline (±20%)..."
-	@go run . --compare-sets-fuel baseline_sets_fuel.txt 2>/dev/null || \
-		(echo "SET REGRESSION: fuel — run 'make baseline-sets' if intentional" && exit 1)
 	@echo "Checking set size baseline (±5%)..."
 	@go run . --compare-sets-size baseline_sets_size.txt 2>/dev/null || \
 		(echo "SET REGRESSION: size — run 'make baseline-sets' if intentional" && exit 1)

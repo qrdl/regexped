@@ -3,7 +3,7 @@
 A FastEdge application that scans incoming request URLs for OWASP Top 10
 attack patterns and blocks matching requests with a 403 response.
 
-Uses **set composition**: 8 attack patterns are compiled into a single WASM set.
+Uses **set composition**: 21 attack patterns are compiled into a single WASM set.
 One `scan_url()` call checks all patterns simultaneously; `.next()` returns the
 first match (if any) so blocked requests incur minimal overhead.
 

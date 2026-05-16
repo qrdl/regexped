@@ -766,7 +766,7 @@ func TestGenGoSetSection(t *testing.T) {
 		"ScanAny",
 		"Validate",
 		"PatternName",
-		"find_all", // wasmimport directive
+		"scan_all", // wasmimport directive
 		"validate", // wasmimport directive
 	}
 	for _, s := range required {

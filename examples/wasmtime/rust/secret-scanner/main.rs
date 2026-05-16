@@ -74,9 +74,13 @@ fn main() -> Result<()> {
         memory.grow(&mut store, needed - current)?;
     }
 
-    // Write input into WASM memory.
+    // Write input into WASM memory (input page: [IN_BASE, OUT_BASE)).
+    let max_input = (OUT_BASE - IN_BASE) as usize;
+    if input.len() > max_input {
+        return Err(anyhow!("input too large: {} bytes (max {} bytes)", input.len(), max_input));
+    }
     memory.write(&mut store, IN_BASE as usize, &input)
-        .map_err(|_| anyhow!("input too large for page 2 buffer (max 65535 bytes)"))?;
+        .map_err(|e| anyhow!("memory write failed: {}", e))?;
 
     // Scan: call find_all in batches until exhausted.
     let mut start_pos: i32 = 0;

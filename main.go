@@ -139,6 +139,10 @@ func runCompileCmd(args []string) {
 	}
 
 	if *diagJSON != "" && len(cfg.Sets) > 0 {
+		if outPath == "-" && *diagJSON == "-" {
+			fmt.Fprintln(os.Stderr, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
+			os.Exit(1)
+		}
 		if err := compile.CmdWriteDiagJSON(cfg, outPath, *diagJSON); err != nil {
 			log.Fatal(err)
 		}

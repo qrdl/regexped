@@ -204,16 +204,19 @@ removing the early-exit condition extends it to return all matches.
 
 ### Suffix DFA functions (internal)
 
-Each literal bucket gets one suffix DFA function in the WASM function table:
+Each literal bucket gets one suffix DFA function. It writes match tuples
+directly into the caller's output buffer and returns the count written:
 
 ```wasm
-;; Runs the merged suffix DFA from suffix_start.
-;; Returns i64 bitmask: bit k set means pattern k in this bucket matched.
+;; Runs the merged suffix DFA starting at lPos.
+;; Writes (pattern_id i32, start i32, length i32) tuples to out_ptr.
+;; Returns the number of tuples written (0 or 1 per bucket call).
 (func $suffix_dfa_N
-    (param $ptr i32) (param $suffix_start i32) (param $len i32)
-    (result i64))
+    (param $ptr i32) (param $start i32) (param $len i32)
+    (param $lPos i32) (param $out_ptr i32) (param $out_cap i32)
+    (param $valid_mask i32)
+    (result i32))
 ```
 
-These are called via `call_indirect` from the set match body and are not
-exported. The bit positions in the returned bitmask are bucket-local (not
-global pattern IDs); the set match function maps them to global IDs.
+These are called via direct `call` (not `call_indirect`) from the set match
+body using statically known function indices, and are not exported.

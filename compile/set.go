@@ -14,6 +14,8 @@ import (
 // Populated by analyzePattern; consumed by set composition (Phase 2+).
 type PatternInfo struct {
 	fullPattern string
+	name        string         // YAML name: field; empty when not set
+	globalID    int            // index into cfg.Regexes
 	prefixAST   *syntax.Regexp // AST before the mandatory literal; nil when trivial
 	suffixAST   *syntax.Regexp // AST after the mandatory literal; nil when trivial
 	mandLit     *mandatoryLit  // from findMandatoryLitRec
@@ -378,13 +380,14 @@ const (
 // CompileSetOptions holds tunable parameters for set composition.
 // Zero value uses defaults.
 type CompileSetOptions struct {
-	BitmaskWidth          int // max patterns per bucket using AcceptBitmask; default 64
-	MaxPatternsPerBucket  int // hard cap for AcceptSparseSet (Phase 6); default 4096
-	BudgetBytes           int // max merged DFA table bytes per bucket; default 65536
-	BudgetStates          int // max DFA states per merged bucket; default 512
-	BudgetStatesPreFilter int // pre-filter: suffixStates * combinedClassCount; default 65536
-	MaxFallbackStates     int // max DFA states for a single-pattern fallback bucket; default 1024
-	TableMemIdx           int // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
+	BitmaskWidth          int   // max patterns per bucket using AcceptBitmask; default 32
+	MaxPatternsPerBucket  int   // hard cap for AcceptSparseSet (Phase 6); default 4096
+	BudgetBytes           int   // max merged DFA table bytes per bucket; default 65536
+	BudgetStates          int   // max DFA states per merged bucket; default 512
+	BudgetStatesPreFilter int   // pre-filter: suffixStates * combinedClassCount; default 65536
+	MaxFallbackStates     int   // max DFA states for a single-pattern fallback bucket; default 1024
+	TableBase             int32 // byte offset where this set's DFA tables start in memory; default 0
+	TableMemIdx           int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
 }
 
 func (o CompileSetOptions) bitmaskWidth() int {
@@ -460,7 +463,7 @@ func combinedClassCount(a, b [256]byte) int {
 // the Go compiler merging shared suffixes into a single accept state.
 // Bit k in the patternBits vector identifies pattern k.
 //
-// Returns error if len(asts) > BitmaskWidth (default 64).
+// Returns error if len(asts) > BitmaskWidth (default 32).
 func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, AcceptKind, error) {
 	bw := opts.BitmaskWidth
 	if bw == 0 {
@@ -585,8 +588,8 @@ func buildUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uin
 type frontendKind int
 
 const (
-	frontendTeddy  frontendKind = iota // ≤8 literals, 1–4 bytes each
-	frontendAC                         // >8 literals → Aho-Corasick
+	frontendTeddy  frontendKind = iota // 1–16 literals, any length (>4 bytes: probe first 4, verify rest)
+	frontendAC                         // 17–32 literals → Aho-Corasick (capped at 32 nodes)
 	frontendScalar                     // fallback: byte-by-byte scan
 )
 
@@ -1110,8 +1113,10 @@ func patternSuffixAST(p *PatternInfo) *syntax.Regexp {
 }
 
 // patternRefFor builds a PatternRef from a PatternInfo.
-// Phase 3 doesn't yet thread global pattern IDs; use 0 as placeholder.
-// Phase 4c will replace this with the actual global ID.
 func patternRefFor(p *PatternInfo) PatternRef {
-	return PatternRef{ID: 0, Name: p.fullPattern}
+	name := p.name
+	if name == "" {
+		name = p.fullPattern
+	}
+	return PatternRef{ID: p.globalID, Name: name}
 }
