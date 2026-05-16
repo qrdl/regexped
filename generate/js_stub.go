@@ -41,7 +41,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 			if s.FindAll != "" {
 				fmt.Fprintf(&out, `export function* %s(input) {
     const b = _b(input);
-    _resize(b.length);
+    _resize(b.length, %d*12);
     const outBuf = new Int32Array(_mem.buffer, _outBase, %d*3);
     _mem.set(b, _inBase);
     let startPos = 0;
@@ -54,7 +54,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
         const last = outBuf[(n-1)*3+2]; startPos = outBuf[(n-1)*3+1] + (last > 0 ? last : 1);
     }
 }
-`, s.FindAll, bs, wasmExport, bs)
+`, s.FindAll, bs, bs, wasmExport, bs)
 			}
 			if s.FindAny != "" {
 				fmt.Fprintf(&out, `export function %s(input) {
@@ -131,9 +131,10 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("function _b(input) {\n")
 	sb.WriteString("    return typeof input === 'string' ? _enc.encode(input) : input;\n")
 	sb.WriteString("}\n\n")
-	sb.WriteString("function _resize(inputLen) {\n")
+	sb.WriteString("function _resize(inputLen, outBytes) {\n")
+	sb.WriteString("    const ob = outBytes && outBytes > 65536 ? outBytes : 65536;\n")
 	sb.WriteString("    _outBase = _inBase + Math.max(1, Math.ceil(inputLen / 65536)) * 65536;\n")
-	sb.WriteString("    const needed = _outBase + 65536;\n")
+	sb.WriteString("    const needed = _outBase + ob;\n")
 	sb.WriteString("    if (needed > _mem.buffer.byteLength) {\n")
 	sb.WriteString("        _exp.memory.grow(Math.ceil((needed - _mem.buffer.byteLength) / 65536));\n")
 	sb.WriteString("        _mem = new Uint8Array(_exp.memory.buffer);\n")

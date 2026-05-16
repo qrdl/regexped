@@ -2,7 +2,7 @@
 
 Set composition lets you compile multiple regex patterns into a single
 multi-pattern matcher that scans the input once and reports all matches with
-their positions and pattern IDs — in one WASM call.
+their positions and pattern IDs.
 
 ## When to use set composition
 
@@ -91,10 +91,11 @@ safely in this case the host must either:
 - resume at `start_pos = last.start` and dedupe any `(pattern_id, start)`
   pairs already emitted in the previous batch.
 
-Generated stubs use `batch_size` (default 256) and assume the first option;
-this is safe for sets with up to 256 patterns. Custom hosts using a smaller
-buffer must apply the second resume rule, or risk missing same-position
-matches.
+Generated stubs use the first option: the stub generator floors the effective
+capacity at `max(batch_size, 64, patterns_in_set)` (see "Batched streaming and
+batch_size" below), so generated stubs are always safe regardless of set size.
+Custom hosts that do not apply this floor must use the dedupe-on-truncation
+resume rule, or risk missing same-position matches.
 
 ### match — match tuples (12 bytes each)
 

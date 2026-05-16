@@ -236,7 +236,7 @@ sets:
     batch_size: 256          # output buffer size (stub-gen knob; default 256)
     emit_name_map: true      # emit pattern_name(id) helper in stubs
     patterns:
-      - aws_key              # list of regexes.name values
+      - aws_key              # list of regexps.name values
       - github_pat
       # or: patterns: "all" to include every entry in regexps:
 ```

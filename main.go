@@ -134,15 +134,17 @@ func runCompileCmd(args []string) {
 		os.Exit(1)
 	}
 
+	// Validate stdout conflict before writing any output.
+	if *diagJSON != "" && len(cfg.Sets) > 0 && outPath == "-" && *diagJSON == "-" {
+		fmt.Fprintln(os.Stderr, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
+		os.Exit(1)
+	}
+
 	if err := compile.CmdCompile(cfg, outPath); err != nil {
 		log.Fatal(err)
 	}
 
 	if *diagJSON != "" && len(cfg.Sets) > 0 {
-		if outPath == "-" && *diagJSON == "-" {
-			fmt.Fprintln(os.Stderr, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
-			os.Exit(1)
-		}
 		if err := compile.CmdWriteDiagJSON(cfg, outPath, *diagJSON); err != nil {
 			log.Fatal(err)
 		}

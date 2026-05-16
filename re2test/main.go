@@ -685,6 +685,9 @@ done:
 		if (prevPassSet / 500000) != (npassSet / 500000) {
 			fmt.Fprintf(os.Stderr, "  ... %dK set cases\n", npassSet/1000)
 		}
+		if maxErrors > 0 && nfailSet >= maxErrors {
+			fmt.Printf("Stopping after %d set failure(s)\n", nfailSet)
+		}
 	}
 
 	totalSkipped := 0
@@ -828,6 +831,7 @@ func testSetBlock(
 	neededPages := uint64((int64(outBase) + outBytes + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); neededPages > cur {
 		if _, growErr := mem.Grow(store, neededPages-cur); growErr != nil {
+			nfail += len(eligible) * len(testStrings)
 			err = fmt.Errorf("set block memory.Grow to %d pages: %w", neededPages, growErr)
 			return
 		}

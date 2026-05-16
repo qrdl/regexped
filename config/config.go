@@ -31,7 +31,7 @@ type SetConfig struct {
 	Match       string          `yaml:"match"`         // export name for match (anchored at position 0)
 	BatchSize   int             `yaml:"batch_size"`    // output buffer hint (default 256); stub-gen only
 	Patterns    PatternSelector `yaml:"patterns"`      // which regexes belong to this set
-	EmitNameMap bool            `yaml:"emit_name_map"` // include pattern name→ID map in WASM data
+	EmitNameMap bool            `yaml:"emit_name_map"` // generate pattern_name / patternName helper in stubs (does not change WASM)
 }
 
 // PatternSelector selects patterns for a set. It can be the scalar string "all"
@@ -68,7 +68,7 @@ func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error
 	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names")
 }
 
-// ValidateSets validates the `sets:` block against the `regexes:` list.
+// ValidateSets validates the `sets:` block against the `regexps:` list.
 // Returns an error if any set name is not unique, any pattern reference is
 // unknown, a set entry has none of find_any/find_all/match set, or patterns
 // is empty.
@@ -129,10 +129,15 @@ func ValidateSets(cfg *BuildConfig) error {
 			return fmt.Errorf("set %q: patterns is required (use \"all\" or a non-empty list of pattern names)", s.Name)
 		}
 		if !s.Patterns.All {
+			seen := make(map[string]bool, len(s.Patterns.Names))
 			for _, pname := range s.Patterns.Names {
 				if _, ok := nameIdx[pname]; !ok {
 					return fmt.Errorf("set %q: unknown pattern name %q", s.Name, pname)
 				}
+				if seen[pname] {
+					return fmt.Errorf("set %q: pattern %q listed more than once", s.Name, pname)
+				}
+				seen[pname] = true
 			}
 		}
 	}

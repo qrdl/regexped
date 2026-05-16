@@ -222,7 +222,11 @@ Each tuple written to `out_ptr` is 12 bytes (3 × i32), the same layout as
 | +4 | `start` i32 | Always 0 for anchored match |
 | +8 | `length` i32 | Byte length of the match |
 
-Currently returns at most 1 match (first matching pattern).
+Returns the number of matching patterns written (0 if none match anchored
+at position 0). Anchored match is not batched — one call returns all matching
+patterns, up to `out_cap`. As with `find_all`, hosts must size `out_cap` to
+hold the maximum same-position fan-out; `out_cap ≥ patterns_in_set` is always
+sufficient (generated stubs enforce this floor automatically).
 
 ### Suffix DFA functions (internal)
 

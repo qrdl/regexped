@@ -102,12 +102,15 @@ func newACNode() acNode {
 type acLayout struct {
 	gotoOff    int32 // offset of goto table: [numNodes][256]int16 (little-endian)
 	failureOff int32 // offset of failure table: [numNodes]int16
-	outputOff  int32 // offset of output table: [numOutputPairs*2]int16 (litID, nodeStart/count)
-	nodeOutOff int32 // offset of per-node output start indices: [numNodes]int16
+	nodeOutOff int32 // offset of per-node output start offsets: [numNodes+1]int16
+	// (entry i = start index into the output array for node i;
+	//  entry numNodes = total output count = end sentinel)
+	outputOff int32 // offset of flat output array: [total]int16 of literal IDs,
+	// indexed by [nodeOut[i] .. nodeOut[i+1]) for node i
 
 	gotoBytes    []byte
 	failureBytes []byte
-	outputBytes  []byte // flat (nodeID, litID) pairs preceded by per-node offsets
+	outputBytes  []byte // concatenation of nodeOut offsets and flat litID array
 
 	numNodes int
 	tableEnd int32

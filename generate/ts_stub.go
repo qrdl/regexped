@@ -58,9 +58,10 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("function _b(input: string | Uint8Array): Uint8Array {\n")
 	sb.WriteString("    return typeof input === 'string' ? _enc.encode(input) : input;\n")
 	sb.WriteString("}\n\n")
-	sb.WriteString("function _resize(inputLen: number): void {\n")
+	sb.WriteString("function _resize(inputLen: number, outBytes: number = 65536): void {\n")
+	sb.WriteString("    const ob = outBytes > 65536 ? outBytes : 65536;\n")
 	sb.WriteString("    _outBase = _inBase + Math.max(1, Math.ceil(inputLen / 65536)) * 65536;\n")
-	sb.WriteString("    const needed = _outBase + 65536;\n")
+	sb.WriteString("    const needed = _outBase + ob;\n")
 	sb.WriteString("    if (needed > _mem.buffer.byteLength) {\n")
 	sb.WriteString("        (_exp.memory as WebAssembly.Memory).grow(Math.ceil((needed - _mem.buffer.byteLength) / 65536));\n")
 	sb.WriteString("        _mem = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer);\n")
@@ -112,7 +113,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			if s.FindAll != "" {
 				fmt.Fprintf(&out, `export function* %s(input: string | Uint8Array): Generator<SetMatch> {
     const b = _b(input);
-    _resize(b.length);
+    _resize(b.length, %d*12);
     const outBuf = new Int32Array(_mem.buffer, _outBase, %d*3);
     _mem.set(b, _inBase);
     let startPos = 0;
@@ -125,7 +126,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
         const l = outBuf[(n-1)*3+2]; startPos = outBuf[(n-1)*3+1] + (l > 0 ? l : 1);
     }
 }
-`, s.FindAll, bs, wasmExport, bs)
+`, s.FindAll, bs, bs, wasmExport, bs)
 			}
 			if s.FindAny != "" {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): SetMatch | null {
