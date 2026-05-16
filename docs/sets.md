@@ -72,14 +72,17 @@ The host calls with `(in_ptr, in_len, out_ptr, out_cap, start_pos)` and
 receives `count` (tuples written). After each batch, advance
 `start_pos = last.start + max(last.length, 1)` and re-call until count = 0.
 
-### match — match tuples (8 bytes each)
+### match — match tuples (12 bytes each)
+
+Same layout as `find_all`/`find_any`:
 
 ```
-out_ptr + i*8 + 0 : pattern_id  i32   global YAML order index
-out_ptr + i*8 + 4 : end_pos     i32   byte position where match ends
+out_ptr + i*12 + 0 : pattern_id  i32   global YAML order index
+out_ptr + i*12 + 4 : start       i32   always 0 for anchored match
+out_ptr + i*12 + 8 : length      i32   byte length of match
 ```
 
-`start` is always 0 for anchored match and is not included in the tuple.
+`end = start + length`. The host reads `pattern_id = buf[0]`, `end = buf[1]+buf[2]`.
 
 ## Batched streaming and batch_size
 

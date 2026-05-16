@@ -7,8 +7,8 @@ import (
 // --------------------------------------------------------------------------
 // Aho-Corasick automaton
 //
-// Used as the literal-scan frontend when there are more than 8 literals in a
-// set (or when any literal is longer than 4 bytes, making Teddy ineligible).
+// Used as the literal-scan frontend when there are 17–32 distinct literals in
+// a set. Teddy handles 1–16 literals (any length, probing first 4 bytes).
 
 // acNode is one node in the Aho-Corasick goto graph.
 type acNode struct {

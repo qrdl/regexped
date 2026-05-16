@@ -31,7 +31,7 @@ type mandatoryLit struct {
 
 // HasMandatoryLit reports whether pattern has a non-empty mandatory literal
 // that can anchor it in set composition. Patterns without one go to the
-// fallback bucket which is currently not scanned by emitSetMatchFnFinal.
+// fallback bucket scanned at every position by the scalar/AC set match paths.
 func HasMandatoryLit(pattern string) bool {
 	return findMandatoryLit(pattern) != nil
 }

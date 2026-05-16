@@ -85,6 +85,7 @@ func ValidateSets(cfg *BuildConfig) error {
 	}
 
 	setNames := make(map[string]bool)
+	exportNames := make(map[string]string) // export name → set name that claimed it
 	for _, s := range cfg.Sets {
 		if s.Name == "" {
 			return fmt.Errorf("sets entry missing required name field")
@@ -95,6 +96,15 @@ func ValidateSets(cfg *BuildConfig) error {
 		setNames[s.Name] = true
 		if s.FindAny == "" && s.FindAll == "" && s.Match == "" {
 			return fmt.Errorf("set %q: at least one of find_any, find_all, or match must be set", s.Name)
+		}
+		for _, name := range []string{s.FindAny, s.FindAll, s.Match} {
+			if name == "" {
+				continue
+			}
+			if prior, dup := exportNames[name]; dup {
+				return fmt.Errorf("duplicate WASM export name %q (used by set %q and set %q)", name, prior, s.Name)
+			}
+			exportNames[name] = s.Name
 		}
 		if !s.Patterns.All && len(s.Patterns.Names) == 0 {
 			return fmt.Errorf("set %q: patterns is required (use \"all\" or a non-empty list of pattern names)", s.Name)

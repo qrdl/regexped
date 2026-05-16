@@ -72,7 +72,7 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 			if s.FindAll != "" {
 				needsIter = true
 				pubName := goPublicName(s.FindAll)
-				fmt.Fprintf(&out, `// %s returns an iter.Seq[SetMatch] over all non-overlapping matches.
+				fmt.Fprintf(&out, `// %s returns an iter.Seq[SetMatch] over all matches (may include overlapping matches at the same start position).
 func %s(input []byte) iter.Seq[SetMatch] {
 	return func(yield func(SetMatch) bool) {
 		buf := make([][3]int32, %d)

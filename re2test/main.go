@@ -791,7 +791,8 @@ func testSetBlock(
 
 	wasmBytes, _, compErr := compile.CompileFile(cfg, "")
 	if compErr != nil {
-		return // skip this block silently on compile error
+		nfail += len(eligible) * len(testStrings)
+		return
 	}
 	stats.ran = true
 

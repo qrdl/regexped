@@ -192,15 +192,16 @@ batch and re-calls until the function returns 0.
     (result i32))
 ```
 
-Each tuple written to `out_ptr` is 8 bytes (2 × i32):
+Each tuple written to `out_ptr` is 12 bytes (3 × i32), the same layout as
+`find_all`/`find_any`:
 
 | Offset | Field | Notes |
 |---|---|---|
 | +0 | `pattern_id` i32 | Global YAML order index |
-| +4 | `end_pos` i32 | Byte position where the match ends (start is always 0) |
+| +4 | `start` i32 | Always 0 for anchored match |
+| +8 | `length` i32 | Byte length of the match |
 
-Currently returns at most 1 match (first matching pattern). Structured so that
-removing the early-exit condition extends it to return all matches.
+Currently returns at most 1 match (first matching pattern).
 
 ### Suffix DFA functions (internal)
 

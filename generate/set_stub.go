@@ -23,6 +23,8 @@ func hasEmitNameMap(cfg config.BuildConfig) bool {
 }
 
 // batchSize returns the batch size for a set (default 256).
+// Callers must use max(batchSize(s), 64) as the output capacity to ensure all
+// patterns matching the same start position fit in a single WASM call.
 func batchSize(s config.SetConfig) int {
 	if s.BatchSize > 0 {
 		return s.BatchSize
