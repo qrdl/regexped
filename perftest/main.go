@@ -521,6 +521,23 @@ func logLargeInput(matches []string) string {
 	return string(result)
 }
 
+// logDenseInput returns a ~100KB log file where every line begins with one of the
+// 8 log-level keywords (ERR, WRN, INF, DBG, CRT, FAT, TRC, NOT). Every line is a
+// match — maximises suffix DFA call rate to stress-test suffix DFA verification.
+func logDenseInput() string {
+	const block = `ERR connection refused: timeout after 30s on host db.example.com
+WRN memory usage at 85 percent: consider scaling up the instance
+INF request processed in 42ms: GET /api/v1/users HTTP/1.1 200 OK
+DBG state machine transition from IDLE to ACTIVE on event CONNECT
+CRT disk usage at 95 percent on /var/data: immediate action required
+FAT unable to allocate 512MB: kernel OOM kill triggered for process
+TRC entering function processRequest with args=[42, true, hello]
+NOT configuration reloaded from /etc/app/config.yaml successfully
+`
+	repeat := (100 * 1024) / len(block)
+	return strings.Repeat(block, repeat)
+}
+
 // urlProseInput returns a ~100KB block of prose-like text dense with alphabetic
 // characters (high false-positive rate for [a-zA-Z] prefix) but containing no
 // "://" sequences unless URLs are explicitly injected. Ideal for benchmarking
@@ -1774,6 +1791,24 @@ var setTests = []setTestCase{
 		},
 	},
 	{
+		// 8 patterns × dense input: every line starts with a keyword → stresses suffix DFA path.
+		// Measures how fast suffix DFA verification is (not the fast-skip scan).
+		name: "log-levels-dense",
+		patterns: []string{
+			`ERR\b[^\n]*`,
+			`WRN\b[^\n]*`,
+			`INF\b[^\n]*`,
+			`DBG\b[^\n]*`,
+			`CRT\b[^\n]*`,
+			`FAT\b[^\n]*`,
+			`TRC\b[^\n]*`,
+			`NOT\b[^\n]*`,
+		},
+		inputs: []namedInput{
+			{"dense matches 100KB", logDenseInput()},
+		},
+	},
+	{
 		// 8 patterns with 3-byte mandatory literals → Teddy SIMD path (16 bytes/cycle).
 		name: "log-levels-8-set",
 		patterns: []string{
@@ -1991,28 +2026,392 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	return benchResult{avgExec: computeStat(ns, pct), wasmSize: len(wasmBytes)}
 }
 
+// benchRegexpedSetFuel measures WASM fuel consumed by one complete find_all exhaustion
+// pass over the input using a fuel-enabled wasmtime engine.
+func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Engine) uint64 {
+	entries := make([]config.RegexEntry, len(sc.patterns))
+	for i, p := range sc.patterns {
+		entries[i] = config.RegexEntry{Pattern: p}
+	}
+	cfg := config.BuildConfig{
+		Regexes: entries,
+		Sets: []config.SetConfig{
+			{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasmBytes, tableEnd, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		return 0
+	}
+	mod, err := wasmtime.NewModule(fuelEngine, wasmBytes)
+	if err != nil {
+		return 0
+	}
+	store := wasmtime.NewStore(fuelEngine)
+	store.SetWasi(wasmtime.NewWasiConfig())
+	if err := store.SetFuel(fuelBudget); err != nil {
+		return 0
+	}
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		return 0
+	}
+	var mem *wasmtime.Memory
+	if exp := inst.GetExport(store, "memory"); exp != nil {
+		mem = exp.Memory()
+	}
+	findFn := inst.GetFunc(store, "find_all")
+	if mem == nil || findFn == nil {
+		return 0
+	}
+	const pageSize = 65536
+	actualTop := tableEnd
+	if top, err2 := utils.ParseDataSectionBytes(wasmBytes); err2 == nil && top > actualTop {
+		actualTop = top
+	}
+	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
+	outBase := inBase + int32(len(input)) + 4096
+	neededPages := uint64((int64(outBase) + 4096*3 + pageSize - 1) / pageSize)
+	if cur := mem.Size(store); neededPages > cur {
+		mem.Grow(store, neededPages-cur) //nolint:errcheck
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inBase:], []byte(input))
+
+	// Warmup call (uncounted).
+	findFn.Call(store, inBase, int32(len(input)), outBase, int32(256), int32(0)) //nolint:errcheck
+	store.SetFuel(fuelBudget)                                                    //nolint:errcheck
+
+	before, _ := store.GetFuel()
+	startPos := int32(0)
+	for {
+		n, err := findFn.Call(store, inBase, int32(len(input)), outBase, int32(256), startPos)
+		if err != nil || n.(int32) <= 0 {
+			break
+		}
+		b := mem.UnsafeData(store)
+		last := n.(int32) - 1
+		s := int32(b[int(outBase)+int(last)*12+4]) | int32(b[int(outBase)+int(last)*12+5])<<8 |
+			int32(b[int(outBase)+int(last)*12+6])<<16 | int32(b[int(outBase)+int(last)*12+7])<<24
+		l := int32(b[int(outBase)+int(last)*12+8]) | int32(b[int(outBase)+int(last)*12+9])<<8 |
+			int32(b[int(outBase)+int(last)*12+10])<<16 | int32(b[int(outBase)+int(last)*12+11])<<24
+		if l <= 0 {
+			l = 1
+		}
+		startPos = s + l
+	}
+	after, _ := store.GetFuel()
+	return before - after
+}
+
 // runSetBenchmarks runs all set composition benchmarks and prints the results.
-func runSetBenchmarks(regexWasmBytes []byte, engine *wasmtime.Engine, pct int) {
+func runSetBenchmarks(regexWasmBytes []byte, engine *wasmtime.Engine, fuelEngine *wasmtime.Engine, pct int) {
 	const setFindLabel = "set find_all (regexped) vs RegexSet+rescan (regex crate)"
 	fmt.Printf("\n%s\n%s\n\n", setFindLabel, strings.Repeat("─", len(setFindLabel)))
-	fmt.Printf("%-32s  %14s  %14s  %8s\n", "", "regex-crate", "regexped-set", "speedup")
-	fmt.Printf("%-32s  %14s  %14s  %8s\n", "", "(RegexSet+rescan)", "(find_all)", "")
-	fmt.Println(strings.Repeat("─", 75))
+	if fuelEngine != nil {
+		fmt.Printf("%-32s  %14s\n", "", "regexped-set fuel")
+		fmt.Println(strings.Repeat("─", 50))
+	} else {
+		fmt.Printf("%-32s  %14s  %14s  %8s\n", "", "regex-crate", "regexped-set", "speedup")
+		fmt.Printf("%-32s  %14s  %14s  %8s\n", "", "(RegexSet+rescan)", "(find_all)", "")
+		fmt.Println(strings.Repeat("─", 75))
+	}
 
 	for _, sc := range setTests {
 		fmt.Printf("\n=== %s (%d patterns) ===\n", sc.name, len(sc.patterns))
 		for _, inp := range sc.inputs {
-			rxp := benchRegexSet(sc, inp.value, regexWasmBytes, engine, pct)
-			rped := benchRegexpedSet(sc, inp.value, engine, pct)
-			ratio := ""
-			if rxp.avgExec > 0 && rped.avgExec > 0 {
-				ratio = fmt.Sprintf("%.2fx", float64(rxp.avgExec)/float64(rped.avgExec))
-			}
 			fmt.Printf("  input: %s (%d bytes)\n", inp.label, len(inp.value))
-			fmt.Printf("    p%d execution:  %14s  %14s  %8s\n",
-				pct, fmtDur(rxp.avgExec), fmtDur(rped.avgExec), ratio)
+			if fuelEngine != nil {
+				f := benchRegexpedSetFuel(sc, inp.value, fuelEngine)
+				fmt.Printf("    fuel consumed:  %14s\n", fmtFuel(f))
+			} else {
+				rxp := benchRegexSet(sc, inp.value, regexWasmBytes, engine, pct)
+				rped := benchRegexpedSet(sc, inp.value, engine, pct)
+				ratio := ""
+				if rxp.avgExec > 0 && rped.avgExec > 0 {
+					ratio = fmt.Sprintf("%.2fx", float64(rxp.avgExec)/float64(rped.avgExec))
+				}
+				fmt.Printf("    p%d execution:  %14s  %14s  %8s\n",
+					pct, fmtDur(rxp.avgExec), fmtDur(rped.avgExec), ratio)
+				if rped.wasmSize > 0 {
+					fmt.Printf("    WASM size:  %d bytes\n", rped.wasmSize)
+				}
+			}
 		}
 	}
+}
+
+// --------------------------------------------------------------------------
+// Sets baseline comparison helpers
+
+// setKey builds the baseline map key: "set_name:input_label".
+func setKey(name, inputLabel string) string { return name + ":" + inputLabel }
+
+// parseSetName extracts the set name from a line like "=== name (N patterns) ===".
+func parseSetName(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "===") || !strings.HasSuffix(trimmed, "===") {
+		return "", false
+	}
+	inner := strings.TrimSpace(trimmed[3 : len(trimmed)-3])
+	if idx := strings.LastIndex(inner, " ("); idx >= 0 {
+		return strings.TrimSpace(inner[:idx]), true
+	}
+	return inner, true
+}
+
+// parseSetInputLabel extracts the label from "  input: LABEL (N bytes)".
+func parseSetInputLabel(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "input: ") {
+		return "", false
+	}
+	after := strings.TrimPrefix(trimmed, "input: ")
+	if idx := strings.LastIndex(after, " ("); idx >= 0 {
+		return strings.TrimSpace(after[:idx]), true
+	}
+	return strings.TrimSpace(after), true
+}
+
+// parseSetTimeBaseline reads a set timing baseline file (output of --sets -pN)
+// and returns map["set_name:input_label"] → regexped p50 duration.
+func parseSetTimeBaseline(path string) (map[string]time.Duration, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	result := make(map[string]time.Duration)
+	var name, input string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if n, ok := parseSetName(line); ok {
+			name, input = n, ""
+			continue
+		}
+		if l, ok := parseSetInputLabel(line); ok {
+			input = l
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if name != "" && input != "" && strings.Contains(trimmed, "execution:") {
+			fields := strings.Fields(trimmed)
+			// "p50 execution:  RXP_VAL RXP_UNIT  RPED_VAL RPED_UNIT  RATIO"
+			// Find "execution:" and take the 3rd+4th field after it (regexped time).
+			for i, f2 := range fields {
+				if strings.HasPrefix(f2, "execution:") && i+4 < len(fields) {
+					d, err2 := parseDur(fields[i+3] + " " + fields[i+4])
+					if err2 == nil && d > 0 {
+						result[setKey(name, input)] = d
+					}
+					break
+				}
+			}
+		}
+	}
+	return result, scanner.Err()
+}
+
+// parseSetFuelBaseline reads a set fuel baseline file (output of --sets -fuel).
+func parseSetFuelBaseline(path string) (map[string]uint64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	result := make(map[string]uint64)
+	var name, input string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if n, ok := parseSetName(line); ok {
+			name, input = n, ""
+			continue
+		}
+		if l, ok := parseSetInputLabel(line); ok {
+			input = l
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if name != "" && input != "" && strings.HasPrefix(trimmed, "fuel consumed:") {
+			fields := strings.Fields(trimmed)
+			if len(fields) >= 3 {
+				v, err2 := parseFuelValue(fields[2])
+				if err2 == nil {
+					result[setKey(name, input)] = v
+				}
+			}
+		}
+	}
+	return result, scanner.Err()
+}
+
+// parseSetSizeBaseline reads a set size baseline file (output of --sets --size-only-sets).
+func parseSetSizeBaseline(path string) (map[string]int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	result := make(map[string]int)
+	var name string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if n, ok := parseSetName(line); ok {
+			name = n
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if name != "" && strings.HasPrefix(trimmed, "WASM size:") {
+			fields := strings.Fields(trimmed)
+			if len(fields) >= 3 {
+				n, err2 := strconv.Atoi(fields[2])
+				if err2 == nil {
+					result[name] = n
+				}
+			}
+		}
+	}
+	return result, scanner.Err()
+}
+
+// runSizeOnlySets prints WASM module sizes for all set test cases and exits.
+func runSizeOnlySets() {
+	for _, sc := range setTests {
+		entries := make([]config.RegexEntry, len(sc.patterns))
+		for i, p := range sc.patterns {
+			entries[i] = config.RegexEntry{Pattern: p}
+		}
+		cfg := config.BuildConfig{
+			Regexes: entries,
+			Sets: []config.SetConfig{
+				{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			},
+		}
+		wasmBytes, _, err := compile.CompileFile(cfg, "")
+		fmt.Printf("\n=== %s (%d patterns) ===\n", sc.name, len(sc.patterns))
+		if err != nil {
+			fmt.Printf("    WASM size: ERROR %v\n", err)
+		} else {
+			fmt.Printf("    WASM size: %d bytes\n", len(wasmBytes))
+		}
+	}
+}
+
+// runCompareSetTime measures set p50 timing and compares against baseline (±10%).
+func runCompareSetTime(baselinePath string, regexWasmBytes []byte, engine *wasmtime.Engine, pct int) bool {
+	baseline, err := parseSetTimeBaseline(baselinePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "compare-sets-time: cannot read baseline %s: %v\n", baselinePath, err)
+		return false
+	}
+	const tolerance = 0.10
+	ok := true
+	for _, sc := range setTests {
+		for _, inp := range sc.inputs {
+			k := setKey(sc.name, inp.label)
+			base, found := baseline[k]
+			if !found {
+				fmt.Fprintf(os.Stderr, "  compare-sets-time: no baseline for %q\n", k)
+				continue
+			}
+			if base < time.Microsecond {
+				continue // too noisy
+			}
+			rped := benchRegexpedSet(sc, inp.value, engine, pct)
+			if rped.avgExec <= 0 {
+				continue
+			}
+			ratio := math.Abs(float64(rped.avgExec)-float64(base)) / float64(base)
+			if ratio > tolerance {
+				fmt.Printf("REGRESSION %s: baseline=%s current=%s (%.1f%% drift, limit ±%.0f%%)\n",
+					k, fmtDur(base), fmtDur(rped.avgExec), ratio*100, tolerance*100)
+				ok = false
+			}
+		}
+	}
+	return ok
+}
+
+// runCompareSetFuel measures set fuel and compares against baseline (±20%).
+func runCompareSetFuel(baselinePath string, fuelEngine *wasmtime.Engine) bool {
+	baseline, err := parseSetFuelBaseline(baselinePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "compare-sets-fuel: cannot read baseline %s: %v\n", baselinePath, err)
+		return false
+	}
+	const tolerance = 0.20
+	ok := true
+	for _, sc := range setTests {
+		for _, inp := range sc.inputs {
+			k := setKey(sc.name, inp.label)
+			base, found := baseline[k]
+			if !found {
+				fmt.Fprintf(os.Stderr, "  compare-sets-fuel: no baseline for %q\n", k)
+				continue
+			}
+			if base == 0 {
+				continue
+			}
+			cur := benchRegexpedSetFuel(sc, inp.value, fuelEngine)
+			if cur == 0 {
+				continue
+			}
+			ratio := math.Abs(float64(cur)-float64(base)) / float64(base)
+			if ratio > tolerance {
+				fmt.Printf("REGRESSION %s: baseline=%s current=%s (%.1f%% drift, limit ±%.0f%%)\n",
+					k, fmtFuel(base), fmtFuel(cur), ratio*100, tolerance*100)
+				ok = false
+			}
+		}
+	}
+	return ok
+}
+
+// runCompareSetSize compiles all sets and compares WASM sizes against baseline (±5%).
+func runCompareSetSize(baselinePath string) bool {
+	baseline, err := parseSetSizeBaseline(baselinePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "compare-sets-size: cannot read baseline %s: %v\n", baselinePath, err)
+		return false
+	}
+	const tolerance = 0.05
+	ok := true
+	for _, sc := range setTests {
+		base, found := baseline[sc.name]
+		if !found {
+			fmt.Fprintf(os.Stderr, "  compare-sets-size: no baseline for %q\n", sc.name)
+			continue
+		}
+		entries := make([]config.RegexEntry, len(sc.patterns))
+		for i, p := range sc.patterns {
+			entries[i] = config.RegexEntry{Pattern: p}
+		}
+		cfg := config.BuildConfig{
+			Regexes: entries,
+			Sets: []config.SetConfig{
+				{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			},
+		}
+		wasmBytes, _, err2 := compile.CompileFile(cfg, "")
+		if err2 != nil {
+			fmt.Fprintf(os.Stderr, "  compare-sets-size compile(%s): %v\n", sc.name, err2)
+			continue
+		}
+		cur := len(wasmBytes)
+		if base == 0 {
+			continue
+		}
+		ratio := math.Abs(float64(cur)-float64(base)) / float64(base)
+		if ratio > tolerance {
+			fmt.Printf("REGRESSION %s: baseline=%d bytes current=%d bytes (%.1f%% drift, limit ±%.0f%%)\n",
+				sc.name, base, cur, ratio*100, tolerance*100)
+			ok = false
+		}
+	}
+	return ok
 }
 
 // --------------------------------------------------------------------------
@@ -2027,10 +2426,26 @@ func main() {
 	pct := flag.Int("p", 0, "report this percentile (1-99) instead of average (e.g. -p 95)")
 	sizeOnly := flag.Bool("size-only", false, "print WASM module sizes per test case and exit (no harness required)")
 	sets := flag.Bool("sets", false, "run set composition benchmarks (regexped find_all vs regex crate RegexSet+rescan)")
+	sizeOnlySets := flag.Bool("size-only-sets", false, "print WASM sizes for set test cases and exit")
+	compareSetsTime := flag.String("compare-sets-time", "", "compare set p50 times against baseline file; exit 1 if outside ±10%")
+	compareSetsFuel := flag.String("compare-sets-fuel", "", "compare set fuel counts against baseline file; exit 1 if outside ±20%")
+	compareSetsSizeFlag := flag.String("compare-sets-size", "", "compare set WASM sizes against baseline file; exit 1 if outside ±5%")
 	compareTime := flag.String("compare-time", "", "compare speedup ratio (rxp/rped p50) against baseline file; exit 1 if outside ±10%")
 	compareFuel := flag.String("compare-fuel", "", "compare fuel counts against baseline file; exit 1 if outside ±20% (TDFA non-determinism budget)")
 	compareSize := flag.String("compare-size", "", "compare WASM sizes against baseline file; exit 1 if outside ±5%")
 	flag.Parse()
+
+	// Sets-specific modes that don't need the regex_bench.wasm harness.
+	if *sizeOnlySets {
+		runSizeOnlySets()
+		return
+	}
+	if *compareSetsSizeFlag != "" {
+		if !runCompareSetSize(*compareSetsSizeFlag) {
+			os.Exit(1)
+		}
+		return
+	}
 
 	// -size-only and -compare-size do not need the regex_bench.wasm harness.
 	if *sizeOnly {
@@ -2068,7 +2483,7 @@ func main() {
 	}
 
 	var fuelEngine *wasmtime.Engine
-	if *fuel || *compareFuel != "" {
+	if *fuel || *compareFuel != "" || *compareSetsFuel != "" {
 		fuelCfg := wasmtime.NewConfig()
 		fuelCfg.SetConsumeFuel(true)
 		fuelEngine = wasmtime.NewEngineWithConfig(fuelCfg)
@@ -2082,13 +2497,31 @@ func main() {
 		return
 	}
 
+	// Sets comparison modes.
+	if *compareSetsTime != "" {
+		pctVal := *pct
+		if pctVal == 0 {
+			pctVal = 50
+		}
+		if !runCompareSetTime(*compareSetsTime, regexWasmBytes, engine, pctVal) {
+			os.Exit(1)
+		}
+		return
+	}
+	if *compareSetsFuel != "" {
+		if !runCompareSetFuel(*compareSetsFuel, fuelEngine) {
+			os.Exit(1)
+		}
+		return
+	}
+
 	// --sets runs set composition benchmarks.
 	if *sets {
 		pctVal := *pct
 		if pctVal == 0 {
 			pctVal = 50
 		}
-		runSetBenchmarks(regexWasmBytes, engine, pctVal)
+		runSetBenchmarks(regexWasmBytes, engine, fuelEngine, pctVal)
 		return
 	}
 
