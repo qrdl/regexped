@@ -60,7 +60,7 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 	fmt.Fprintf(&out, "// SetMatch is a match from a set find_any, find_all, or anchored match call.\ntype SetMatch struct { PatternID, Start, End int }\n\n")
 	needsIter := false
 	for _, s := range cfg.Sets {
-		bs := batchSize(s)
+		bs := max(batchSize(s), 64)
 		if s.FindAll != "" || s.FindAny != "" {
 			wasmExport := s.FindAll
 			if wasmExport == "" {
@@ -116,9 +116,9 @@ func %s(input []byte) (SetMatch, bool) {
 				cfg.ImportModule, s.Match, ffiName)
 			fmt.Fprintf(&out, `// %s anchored match: returns the first matching pattern with Start=0, or nil.
 func %s(input []byte) *SetMatch {
-	var buf [1][2]int32
+	var buf [1][3]int32
 	if %s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), unsafe.Pointer(&buf[0]), 1) <= 0 { return nil }
-	m := SetMatch{PatternID: int(buf[0][0]), Start: 0, End: int(buf[0][1])}
+	m := SetMatch{PatternID: int(buf[0][0]), Start: int(buf[0][1]), End: int(buf[0][1]) + int(buf[0][2])}
 	return &m
 }
 

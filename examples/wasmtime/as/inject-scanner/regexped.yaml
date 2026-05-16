@@ -1,0 +1,33 @@
+output:        "final.wasm"
+wasm_file:     "threats.wasm"
+import_module: "threats"
+stub_file:     "stub.ts"
+stub_type:     "as"
+
+regexps:
+  - name: "union_select"
+    pattern: 'UNION\s+SELECT'
+  - name: "drop_table"
+    pattern: 'DROP\s+TABLE'
+  - name: "or_tautology"
+    pattern: 'OR\s+1\s*=\s*1'
+  - name: "sleep_inject"
+    pattern: 'SLEEP\s*\('
+  - name: "script_tag"
+    pattern: '<script'
+  - name: "js_protocol"
+    pattern: 'javascript:'
+  - name: "event_handler"
+    pattern: 'onerror\s*='
+  - name: "alert_call"
+    pattern: 'alert\s*\('
+
+sets:
+  - name: "sqli"
+    find_any: "scan_sqli"
+    emit_name_map: true
+    patterns: ["union_select", "drop_table", "or_tautology", "sleep_inject"]
+
+  - name: "xss"
+    find_any: "scan_xss"
+    patterns: ["script_tag", "js_protocol", "event_handler", "alert_call"]

@@ -69,8 +69,9 @@ func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error
 }
 
 // ValidateSets validates the `sets:` block against the `regexes:` list.
-// Returns an error if any name is not unique, any pattern reference is unknown,
-// or a set entry has neither find_any nor find_all set.
+// Returns an error if any set name is not unique, any pattern reference is
+// unknown, a set entry has none of find_any/find_all/match set, or patterns
+// is empty.
 func ValidateSets(cfg *BuildConfig) error {
 	// Build name → index map.
 	nameIdx := make(map[string]int, len(cfg.Regexes))

@@ -841,10 +841,17 @@ func TestGenASSetSection(t *testing.T) {
 	out := genASSetSection(cfg)
 	required := []string{
 		"SetMatch",
-		"scan_all",
+		"scan_all_next",
+		"scan_all_reset",
 		"scan_any",
 		"validate",
 		"patternName",
+	}
+	disallowed := []string{"Generator<", "function*", "yield"}
+	for _, s := range disallowed {
+		if strings.Contains(out, s) {
+			t.Errorf("genASSetSection: must not contain %q (AS has no generator support)", s)
+		}
 	}
 	for _, s := range required {
 		if !strings.Contains(out, s) {

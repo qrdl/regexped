@@ -102,7 +102,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 	cb.WriteString(cContent)
 	for _, s := range cfg.Sets {
 		if s.FindAll != "" || s.FindAny != "" {
-			bs := batchSize(s)
+			bs := max(batchSize(s), 64)
 			wasmExport := s.FindAll
 			if wasmExport == "" {
 				wasmExport = s.FindAny
@@ -160,9 +160,9 @@ int %s(const char *input, int len, rx_set_anchor_t *out);
 
 `, cfg.ImportModule, s.Match, s.Match, s.Match)
 			fmt.Fprintf(&cb, `int %s(const char *input, int len, rx_set_anchor_t *out) {
-    int buf[2];
+    int buf[3];
     if (ffi_%s(input, len, buf, 1) <= 0) return 0;
-    out->pattern_id = buf[0]; out->end = buf[1];
+    out->pattern_id = buf[0]; out->end = buf[1] + buf[2];
     return 1;
 }
 `, s.Match, s.Match)

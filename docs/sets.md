@@ -28,7 +28,7 @@ regexps: [p1, p2, ..., pN]
     binPack()              ← merge compatible suffix DFAs within each bucket
             │
             ▼
-    chooseLiteralFrontend() ← Teddy (≤8 literals) or AC (>8) or scalar
+    chooseLiteralFrontend() ← Teddy (≤16 literals) or AC (17–32) or scalar
             │
             ▼
     assembleModuleWithSets() ← emit WASM: suffix DFAs + set match function
@@ -104,7 +104,7 @@ set-prefixed since pattern IDs are file-wide YAML order indices.
 ```rust
 // Example Rust usage
 for m in scan_secrets(input) {
-    println!("{} at {}..{}", pattern_name(m.pattern_id as u32), m.start, m.end);
+    println!("{} at {}..{}", pattern_name(m.pattern_id), m.start, m.end);
 }
 ```
 

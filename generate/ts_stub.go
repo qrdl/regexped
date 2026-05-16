@@ -103,7 +103,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 	out.WriteString("\n// ---- set composition wrappers ----\n\n")
 	out.WriteString("export interface SetMatch { patternId: number; start: number; end: number; }\n\n")
 	for _, s := range cfg.Sets {
-		bs := batchSize(s)
+		bs := max(batchSize(s), 64)
 		if s.FindAll != "" || s.FindAny != "" {
 			wasmExport := s.FindAll
 			if wasmExport == "" {
@@ -143,10 +143,10 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): SetMatch | null {
     const b = _b(input);
     _resize(b.length);
-    const outBuf = new Int32Array(_mem.buffer, _outBase, 2);
+    const outBuf = new Int32Array(_mem.buffer, _outBase, 3);
     _mem.set(b, _inBase);
     if ((_exp['%s'] as Function)(_inBase, b.length, _outBase, 1) <= 0) return null;
-    return { patternId: outBuf[0], start: 0, end: outBuf[1] };
+    return { patternId: outBuf[0], start: outBuf[1], end: outBuf[1]+outBuf[2] };
 }
 `, s.Match, s.Match)
 		}

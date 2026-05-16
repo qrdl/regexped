@@ -53,7 +53,7 @@ impl SetMatch {
 
 `)
 	for _, s := range cfg.Sets {
-		bs := batchSize(s)
+		bs := max(batchSize(s), 64)
 		if s.FindAll != "" || s.FindAny != "" {
 			ffiName := "ffi_" + s.FindAll
 			wasmExport := s.FindAll
@@ -133,10 +133,10 @@ unsafe extern "C" {
 
 /// Anchored set match: returns the first matching pattern with start=0, or None.
 pub fn %s(input: &[u8]) -> Option<SetMatch> {
-    let mut buf = [0i32; 2];
+    let mut buf = [0i32; 3];
     let n = unsafe { %s(input.as_ptr(), input.len() as i32, buf.as_mut_ptr(), 1) };
     if n <= 0 { return None; }
-    Some(SetMatch { pattern_id: buf[0] as usize, start: 0, end: buf[1] as usize })
+    Some(SetMatch { pattern_id: buf[0] as usize, start: buf[1] as usize, end: (buf[1] + buf[2]) as usize })
 }
 
 `, cfg.ImportModule, s.Match, ffiName, s.Match, ffiName)

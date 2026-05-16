@@ -30,7 +30,7 @@ and returns all matches with their pattern name and position.
 
 ```sh
 make
-echo "token: ghp_abc123456789012345678901234567890" | wasmtime final.wasm
+echo "token: ghp_abcdef123456789012345678901234567890" | wasmtime final.wasm
 ```
 
 ## Build pipeline

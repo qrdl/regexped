@@ -51,7 +51,7 @@ make
 ```
 regexped generate   →  generate Rust FFI stubs (stubs.rs)
 cargo build         →  compile Rust app to WASM
-regexped compile    →  compile 8 attack patterns to WASM
+regexped compile    →  compile 21 attack patterns to WASM
 regexped merge      →  merge app + patterns into final.wasm
 ```
 

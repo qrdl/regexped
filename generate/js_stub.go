@@ -32,7 +32,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 	var out strings.Builder
 	out.WriteString("\n// ---- set composition wrappers ----\n\n")
 	for _, s := range cfg.Sets {
-		bs := batchSize(s)
+		bs := max(batchSize(s), 64)
 		if s.FindAll != "" || s.FindAny != "" {
 			wasmExport := s.FindAll
 			if wasmExport == "" {
@@ -73,11 +73,11 @@ func genJSSetSection(cfg config.BuildConfig) string {
 			fmt.Fprintf(&out, `export function %s(input) {
     const b = _b(input);
     _resize(b.length);
-    const outBuf = new Int32Array(_mem.buffer, _outBase, 2);
+    const outBuf = new Int32Array(_mem.buffer, _outBase, 3);
     _mem.set(b, _inBase);
     const n = _exp['%s'](_inBase, b.length, _outBase, 1);
     if (n <= 0) return null;
-    return { patternId: outBuf[0], start: 0, end: outBuf[1] };
+    return { patternId: outBuf[0], start: outBuf[1], end: outBuf[1]+outBuf[2] };
 }
 `, s.Match, s.Match)
 		}

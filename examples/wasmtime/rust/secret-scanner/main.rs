@@ -59,27 +59,21 @@ fn main() -> Result<()> {
         .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "scan_secrets")
         .map_err(|e| anyhow!("'scan_secrets' export not found: {}", e))?;
 
-    // Memory layout for standalone WASM:
-    //   pages 0–1: DFA tables for 10 patterns (≤128 KB for this set)
-    //   page  2:   input buffer  (offset 131072)
-    //   page  3:   output buffer (offset 196608)
-    const IN_BASE: i32 = 131_072; // page 2
-    const OUT_BASE: i32 = 196_608; // page 3
     const OUT_CAP: i32 = 64; // up to 64 matches per batch
 
-    // Grow memory to 4 pages (256 KB) to fit tables + input + output.
-    let needed: u64 = 4;
-    let current = memory.size(&store);
-    if current < needed {
-        memory.grow(&mut store, needed - current)?;
-    }
+    // Derive input/output bases from the module's actual initial memory size.
+    // The initial pages cover all DFA table data; input and output go in the
+    // two pages grown immediately after, regardless of how large the tables are.
+    let in_base: i32 = (memory.size(&store) * 65536) as i32;
+    memory.grow(&mut store, 2)?; // 1 page for input, 1 page for output
+    let out_base: i32 = in_base + 65536;
 
-    // Write input into WASM memory (input page: [IN_BASE, OUT_BASE)).
-    let max_input = (OUT_BASE - IN_BASE) as usize;
+    // Write input into WASM memory (input page: [in_base, out_base)).
+    let max_input = (out_base - in_base) as usize;
     if input.len() > max_input {
         return Err(anyhow!("input too large: {} bytes (max {} bytes)", input.len(), max_input));
     }
-    memory.write(&mut store, IN_BASE as usize, &input)
+    memory.write(&mut store, in_base as usize, &input)
         .map_err(|e| anyhow!("memory write failed: {}", e))?;
 
     // Scan: call find_all in batches until exhausted.
@@ -87,7 +81,7 @@ fn main() -> Result<()> {
     let mut total_matches = 0;
 
     loop {
-        let count = scan_fn.call(&mut store, (IN_BASE, input.len() as i32, OUT_BASE, OUT_CAP, start_pos))?;
+        let count = scan_fn.call(&mut store, (in_base, input.len() as i32, out_base, OUT_CAP, start_pos))?;
         if count == 0 {
             break;
         }
@@ -95,7 +89,7 @@ fn main() -> Result<()> {
         // Read match tuples: each is (pattern_id i32, start i32, length i32) = 12 bytes.
         let mem_data = memory.data(&store);
         for i in 0..count as usize {
-            let base = OUT_BASE as usize + i * 12;
+            let base = out_base as usize + i * 12;
             let pid    = i32::from_le_bytes(mem_data[base..base+4].try_into()?);
             let mstart = i32::from_le_bytes(mem_data[base+4..base+8].try_into()?);
             let mlen   = i32::from_le_bytes(mem_data[base+8..base+12].try_into()?);
@@ -111,7 +105,7 @@ fn main() -> Result<()> {
         }
 
         // Advance start_pos past the last match.
-        let last = OUT_BASE as usize + (count as usize - 1) * 12;
+        let last = out_base as usize + (count as usize - 1) * 12;
         let last_start = i32::from_le_bytes(mem_data[last+4..last+8].try_into()?);
         let last_len   = i32::from_le_bytes(mem_data[last+8..last+12].try_into()?);
         start_pos = last_start + last_len.max(1);

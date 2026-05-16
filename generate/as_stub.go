@@ -67,19 +67,40 @@ func genASSetSection(cfg config.BuildConfig) string {
 			fmt.Fprintf(&out, "@external(\"%s\", \"%s\")\ndeclare function ffi_%s(ptr: usize, len: i32, out: usize, cap: i32, start: i32): i32;\n\n",
 				cfg.ImportModule, wasmExport, wasmExport)
 			if s.FindAll != "" {
-				fmt.Fprintf(&out, `export function* %s(input: ArrayBuffer): Generator<SetMatch> {
-    const buf = new StaticArray<i32>(%d*3);
-    let startPos: i32 = 0;
-    while (true) {
-        const n = ffi_%s(changetype<usize>(input), input.byteLength, changetype<usize>(buf), %d, startPos);
-        if (n <= 0) break;
-        for (let i: i32 = 0; i < n; i++) {
-            yield new SetMatch(buf[i*3], buf[i*3+1], buf[i*3+1]+buf[i*3+2]);
-        }
-        const l = buf[(n-1)*3+2]; startPos = buf[(n-1)*3+1] + (l > 0 ? l : 1);
+				// cap must be >= number of buckets so that all patterns matching
+				// the same start position fit in one WASM call (same-start fan-out).
+				// 64 is a safe floor — realistic sets have far fewer buckets.
+				cap := max(bs, 64)
+				fn := s.FindAll
+				fmt.Fprintf(&out, `const _buf_%s = new StaticArray<i32>(%d*3);
+let _start_%s: i32 = 0; let _bufN_%s: i32 = 0; let _bufI_%s: i32 = 0;
+/** Returns next match tuple or null when exhausted. Call %s_reset() before reusing on a new input. */
+export function %s_next(input: ArrayBuffer): SetMatch | null {
+    if (_bufI_%s >= _bufN_%s) {
+        const n = ffi_%s(changetype<usize>(input), input.byteLength, changetype<usize>(_buf_%s), %d, _start_%s);
+        if (n <= 0) { _bufN_%s = 0; _bufI_%s = 0; return null; }
+        _bufN_%s = n; _bufI_%s = 0;
+        const last = (n - 1) * 3;
+        const lastLen = _buf_%s[last + 2];
+        _start_%s = _buf_%s[last + 1] + (lastLen > 0 ? lastLen : 1);
     }
+    const i = _bufI_%s++ * 3;
+    return new SetMatch(_buf_%s[i], _buf_%s[i + 1], _buf_%s[i + 1] + _buf_%s[i + 2]);
 }
-`, s.FindAll, bs, wasmExport, bs)
+export function %s_reset(): void { _start_%s = 0; _bufN_%s = 0; _bufI_%s = 0; }
+`,
+					fn, cap,
+					fn, fn, fn,
+					fn,
+					fn,
+					fn, fn,
+					wasmExport, fn, cap, fn,
+					fn, fn,
+					fn, fn,
+					fn, fn, fn,
+					fn,
+					fn, fn, fn, fn,
+					fn, fn, fn, fn)
 			}
 			if s.FindAny != "" {
 				anyFFI := "ffi_" + s.FindAny
@@ -98,9 +119,9 @@ func genASSetSection(cfg config.BuildConfig) string {
 			fmt.Fprintf(&out, "@external(\"%s\", \"%s\")\ndeclare function ffi_%s(ptr: usize, len: i32, out: usize, cap: i32): i32;\n\n",
 				cfg.ImportModule, s.Match, s.Match)
 			fmt.Fprintf(&out, `export function %s(input: ArrayBuffer): SetAnchorMatch | null {
-    const buf = new StaticArray<i32>(2);
+    const buf = new StaticArray<i32>(3);
     if (ffi_%s(changetype<usize>(input), input.byteLength, changetype<usize>(buf), 1) <= 0) return null;
-    return new SetAnchorMatch(buf[0], buf[1]);
+    return new SetAnchorMatch(buf[0], buf[1] + buf[2]);
 }
 `, s.Match, s.Match)
 		}
