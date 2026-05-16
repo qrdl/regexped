@@ -147,8 +147,21 @@ The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
 > 9–64 literals with cost proportional to ⌈N/8⌉ passes, outperforming AC for
 > moderate-sized sets. See plan note in `plans/COMPOSING_PATTERNS_PLAN.md`.
 
+## Limitation: anchored `match` and case-insensitive patterns
+
+The anchored `match` export only fires for patterns that have a mandatory literal
+(a fixed byte sequence present in every match). Case-insensitive patterns (those
+using `(?i)`) never have a mandatory literal because their literals have
+`FoldCase` set and are excluded from literal extraction. Such patterns land in the
+fallback bucket and are **silently skipped** by the anchored match function —
+they will never match via `match`, only via `find_any` / `find_all`.
+
+To use anchored set validation with a fixed keyword vocabulary (e.g. SQL
+keywords), write the patterns without `(?i)` and use uppercase literals directly.
+
 ## Examples
 
-- [examples/wasmtime/rust/sql-validator/](../examples/wasmtime/rust/sql-validator/) — anchored `match`, SQL statement classification
-- [examples/wasmtime/rust/secret-scanner/](../examples/wasmtime/rust/secret-scanner/) — `find_all`, secret detection
-- [examples/wasmtime/rust/crs-scanner/](../examples/wasmtime/rust/crs-scanner/) — `find_all`, OWASP CRS WAF rules
+- [examples/node/sql-validator/](../examples/node/sql-validator/) — anchored `match`, SQL statement validation (Node.js / TypeScript)
+- [examples/wasmtime/go/secret-scanner/](../examples/wasmtime/go/secret-scanner/) — `find_all`, secret detection (Go wasip1)
+- [examples/wasmtime/rust/secret-scanner/](../examples/wasmtime/rust/secret-scanner/) — `find_all`, secret detection (native Rust host)
+- [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `find_any`, URL/header/body rule matching (FastEdge)

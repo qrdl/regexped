@@ -1350,12 +1350,12 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 
 		// SIMD path: if lPos + 15 < pInLen
 		b = append(b, 0x20, lPos, 0x41, 15, 0x6A, 0x20, pInLen, 0x49) // lt_u
-		b = append(b, 0x04, 0x40)                                        // if (void)
+		b = append(b, 0x04, 0x40)                                     // if (void)
 
 		// Load 16-byte chunk from memory[0] (input)
 		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
 		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-		b = append(b, 0x22, lChunk)            // local.tee lChunk
+		b = append(b, 0x22, lChunk)           // local.tee lChunk
 
 		// Compute bitmask: OR of bitmask(eq(chunk, splat(fb))) for each first byte.
 		b = append(b, 0x41, 0x00) // accumulator = 0
@@ -1371,30 +1371,30 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
 
 		// if mask != 0: candidate found at lPos + ctz(mask)
-		b = append(b, 0x04, 0x40)                                                   // if (void)
-		b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos)         // lPos += ctz(mask)
-		b = append(b, 0x0C, 0x03)                                                   // br 3 → $skip_done
-		b = append(b, 0x0B)                                                          // end if mask
+		b = append(b, 0x04, 0x40)                                          // if (void)
+		b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos) // lPos += ctz(mask)
+		b = append(b, 0x0C, 0x03)                                          // br 3 → $skip_done
+		b = append(b, 0x0B)                                                // end if mask
 
 		// No candidate: advance 16 and restart
 		b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos) // lPos += 16
-		b = append(b, 0x0C, 0x01)                                 // br 1 → restart $skip_loop
-		b = append(b, 0x0B)                                       // end if (SIMD path)
+		b = append(b, 0x0C, 0x01)                               // br 1 → restart $skip_loop
+		b = append(b, 0x0B)                                     // end if (SIMD path)
 
 		// Scalar tail: check firstByteFlags[input[lPos]]
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, cs.acFirstByteFlagsOff)       // firstByteFlags base
+		b = utils.AppendSLEB128(b, cs.acFirstByteFlagsOff)              // firstByteFlags base
 		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x2D, 0x00, 0x00) // + input[lPos]
-		b = append(b, 0x6A)                                               // add → flags address
-		b = appendTableLoad8u(b, tableMemIdx)                             // load flag byte
-		b = append(b, 0x04, 0x40)                                         // if (void) non-zero
-		b = append(b, 0x0C, 0x02)                                         // br 2 → $skip_done (candidate at lPos)
-		b = append(b, 0x0B)                                               // end if
+		b = append(b, 0x6A)                                             // add → flags address
+		b = appendTableLoad8u(b, tableMemIdx)                           // load flag byte
+		b = append(b, 0x04, 0x40)                                       // if (void) non-zero
+		b = append(b, 0x0C, 0x02)                                       // br 2 → $skip_done (candidate at lPos)
+		b = append(b, 0x0B)                                             // end if
 
 		b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
-		b = append(b, 0x0C, 0x00)                                 // br 0 → restart $skip_loop
-		b = append(b, 0x0B)                                       // end loop $skip_loop
-		b = append(b, 0x0B)                                       // end block $skip_done
+		b = append(b, 0x0C, 0x00)                               // br 0 → restart $skip_loop
+		b = append(b, 0x0B)                                     // end loop $skip_loop
+		b = append(b, 0x0B)                                     // end block $skip_done
 
 		b = append(b, 0x0B) // end if lACState == 0
 

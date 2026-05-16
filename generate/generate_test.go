@@ -145,7 +145,7 @@ func TestGenJSStubFile(t *testing.T) {
 	for _, sub := range []string{
 		"url_match", "url_find",
 		"tok_groups", "tok_named",
-		"export async function init", "WebAssembly.instantiate", "_SLOTS",
+		"export async function init", "WebAssembly.instantiate", "_inBase", "_outBase",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genJSStubFile: output missing %q", sub)
@@ -173,7 +173,7 @@ func TestGenTSStubFile(t *testing.T) {
 		"WebAssembly.Module", "WebAssembly.instantiate",
 		"Generator<[number, number]>",
 		"Generator<Record<string, [number, number]>>",
-		"_SLOTS",
+		"_inBase", "_outBase",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genTSStubFile: output missing %q", sub)

@@ -1,6 +1,6 @@
 # fastedge/validate — email, URL, and XSS validation
 
-A Gcore FastEdge application that validates email, URL, and description fields in a JSON request body. Uses **DFA anchored match** for email and URL validation and **DFA find** for XSS detection.
+A FastEdge application that validates email, URL, and description fields in a JSON request body. Uses **DFA anchored match** for email and URL validation and **DFA find** for XSS detection.
 
 See [docs/fastedge.md](../../../docs/fastedge.md) for the full guide.
 

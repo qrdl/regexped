@@ -16,6 +16,7 @@ max_tdfa_regs:  32         # optional; max TDFA registers before falling back to
 
 regexps:
   - pattern: 'https?://...' # RE2 regex pattern
+    name: "my_pattern"      # required when referenced by sets: patterns list
 
     # One or more func fields — only those set are compiled and stubbed.
     # The func name becomes both the WASM export name and the generated function name.
@@ -24,6 +25,14 @@ regexps:
     find_func:         "url_find"          # non-anchored find
     groups_func:       "url_groups"        # anchored match with all capture groups
     named_groups_func: "url_named_groups"  # anchored match with named capture groups
+
+sets:
+  - name: "my_set"             # unique set name
+    find_all: "scan_all"       # non-anchored: all matches, streamed in batches
+    find_any: "scan_first"     # non-anchored: first match only (optional)
+    match: "validate"          # anchored at position 0 (optional)
+    emit_name_map: true        # emit patternName(id) lookup helper in stubs
+    patterns: all              # "all" or list of name: values from regexps:
 ```
 
 All paths in the config file are resolved relative to the config file's directory.
@@ -141,7 +150,7 @@ Generates a single ES module. Exports an `init(wasm)` function that must be call
 
 | Config field | Generated JS export | Returns |
 |---|---|---|
-| `match_func` | `function <func>(input)` | `boolean` — true if full input matches |
+| `match_func` | `function <func>(input)` | `[number, boolean]` — `[endPos, matched]` |
 | `find_func` | `function* <func>(input)` | generator yielding `[start, end]` per match |
 | `groups_func` | `function* <func>(input)` | generator yielding `Array<[start,end]\|null>` per match |
 | `named_groups_func` | `function* <func>(input)` | generator yielding `Object` (name→`[start,end]`) per match |

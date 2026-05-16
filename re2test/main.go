@@ -147,7 +147,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 
 		case line == "strings":
 			if setsMode && !inStrings && len(setBlockEntries) >= 2 {
-				p, f, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+				p, f, _, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
 				prevPassSet := npassSet
 				npassSet += p
 				nfailSet += f
@@ -675,7 +675,7 @@ done:
 
 	// Test the final block (not triggered by a "strings" line).
 	if setsMode && !stopped && !inStrings && len(setBlockEntries) >= 2 {
-		p, f, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+		p, f, _, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
 		prevPassSet := npassSet
 		npassSet += p
 		nfailSet += f
@@ -744,15 +744,19 @@ const (
 // testSetBlock compiles all patterns in entries as a set and runs find_all against
 // each string, comparing results against the per-pattern col4 (all matches) or col1
 // (first match) expected values from the re2 test data.
+// testSetBlockStats carries diagnostic counters from testSetBlock.
+type testSetBlockStats struct {
+	hasNonGreedy bool // at least one eligible pattern has a non-greedy quantifier
+	ran          bool // block compiled and ran (not silently skipped)
+}
+
 func testSetBlock(
 	entries []setBlockEntry,
 	testStrings []string,
 	engine *wasmtime.Engine,
 	wd *watchdog,
 	verbose bool,
-) (npass, nfail int, err error) {
-	// Only include patterns with a mandatory literal — patterns without one go to
-	// the fallback bucket which is currently not scanned by emitSetMatchFnFinal.
+) (npass, nfail int, stats testSetBlockStats, err error) {
 	type eligibleEntry struct {
 		orig  int // index into entries
 		entry setBlockEntry
@@ -766,6 +770,9 @@ func testSetBlock(
 			continue // skip unsupported syntax (\C etc.)
 		}
 		eligible = append(eligible, eligibleEntry{orig: i, entry: e})
+		if strings.Contains(e.pattern, "+?") || strings.Contains(e.pattern, "*?") || strings.Contains(e.pattern, "??") {
+			stats.hasNonGreedy = true
+		}
 	}
 	if len(eligible) < 2 {
 		return // not enough patterns to form a set
@@ -786,6 +793,7 @@ func testSetBlock(
 	if compErr != nil {
 		return // skip this block silently on compile error
 	}
+	stats.ran = true
 
 	mod, modErr := wasmtime.NewModule(engine, wasmBytes)
 	if modErr != nil {

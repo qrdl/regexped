@@ -29,6 +29,7 @@ type SetDiag struct {
 	Buckets               []BucketDiag   `json:"buckets"`
 	Conflicts             []ConflictDiag `json:"conflicts"`
 	CaptureBearingDropped []PatternRef   `json:"capture_bearing_dropped"`
+	StateLimitDropped     []PatternRef   `json:"state_limit_dropped,omitempty"`
 }
 
 // BucketDiag describes one merged bucket.

@@ -35,5 +35,8 @@ $(FINAL_WASM): $(APP_WASM) $(SECRET_WASM) regexped.yaml
 
 merge: $(FINAL_WASM)
 
+run: $(FINAL_WASM)
+	echo "token: ghp_abc123456789012345678901234567890xyz" | wasmtime $(FINAL_WASM)
+
 clean:
 	rm -f $(APP_WASM) $(SECRET_WASM) $(FINAL_WASM) $(STUB)

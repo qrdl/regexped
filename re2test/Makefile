@@ -3,6 +3,7 @@
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
 CUSTOM       := custom-tests.txt
+CUSTOM_SETS  := custom-sets.txt
 ADJUSTED     := re2-adjusted.txt
 
 $(TESTDATA): $(TESTDATA_BZ2)
@@ -30,6 +31,7 @@ test: exhaustive custom adjusted force-backtrack sets
 
 sets: $(TESTDATA)
 	go run . --sets $(TESTDATA)
+	go run . --sets $(CUSTOM_SETS)
 
 clean:
 	rm -f $(TESTDATA) $(ADJUSTED)

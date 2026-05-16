@@ -21,7 +21,17 @@ build: $(TS_STUB)
 # Requires Node.js 22+ (--experimental-strip-types) or tsx (npm install -g tsx)
 TSX ?= npx --yes tsx
 run: build
-	@printf 'SELECT * FROM users WHERE id = 1\nINSERT INTO logs VALUES (1)\nDROP TABLE secrets\n' | $(TSX) main.ts
+	@printf '%s\n' \
+		'SELECT * FROM users WHERE id = 1' \
+		'SELECT FROM users' \
+		'SELECT id, name FROM accounts WHERE active = 1' \
+		'INSERT INTO logs (msg) VALUES ("hello")' \
+		'INSERT users VALUES (1)' \
+		'UPDATE users SET active = 0 WHERE id = 1' \
+		'UPDATE users active = 0' \
+		'DELETE FROM users WHERE id = 1' \
+		'DELETE users' \
+		| $(TSX) main.ts
 
 clean:
 	rm -f $(PATTERN_WASM) $(TS_STUB)

@@ -137,4 +137,4 @@ The standalone WASM (no `output` field in config):
 - Exports each regex function under its `_func` name (e.g. `email_match`, `url_match`)
 - The generated `regex.js` instantiates it with no imports and accesses exports directly
 
-Input strings are written to memory at address 0; capture group output buffers are placed at offset 1024. Both areas are well within the module's minimum memory.
+Input strings and capture group output buffers are placed in separate WASM memory pages allocated by the generated stub's `init()` function — specifically, in the two pages grown immediately after the DFA table pages. User code does not need to manage memory placement.

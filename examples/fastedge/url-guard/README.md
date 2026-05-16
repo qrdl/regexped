@@ -1,6 +1,6 @@
 # fastedge/url-guard — OWASP URL attack detection
 
-A Gcore FastEdge application that scans incoming request URLs for OWASP Top 10
+A FastEdge application that scans incoming request URLs for OWASP Top 10
 attack patterns and blocks matching requests with a 403 response.
 
 Uses **set composition**: 8 attack patterns are compiled into a single WASM set.

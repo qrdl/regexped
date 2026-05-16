@@ -4,22 +4,19 @@ stub_file:     "stubs.ts"
 
 regexps:
   - name: "select"
-    pattern: '(?i)select'
+    pattern: 'SELECT\s+.+\s+FROM\s+\w[\w.]*(\s+.*)?'
+
   - name: "insert"
-    pattern: '(?i)insert'
+    pattern: 'INSERT\s+INTO\s+\w[\w.]*\s*(?:\([^)]*\)\s*)?VALUES\s*\(.*\)(\s+.*)?'
+
   - name: "update"
-    pattern: '(?i)update'
+    pattern: 'UPDATE\s+\w[\w.]*\s+SET\s+\w.*'
+
   - name: "delete"
-    pattern: '(?i)delete'
-  - name: "drop"
-    pattern: '(?i)drop'
-  - name: "create"
-    pattern: '(?i)create'
-  - name: "alter"
-    pattern: '(?i)alter'
+    pattern: 'DELETE\s+FROM\s+\w[\w.]*(\s+.*)?'
 
 sets:
-  - name: "statement_type"
-    find_any: "classify_statement"
+  - name: "sql"
+    match: "validate_sql"
     emit_name_map: true
-    patterns: all
+    patterns: ["select", "insert", "update", "delete"]

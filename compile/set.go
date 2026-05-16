@@ -383,6 +383,7 @@ type CompileSetOptions struct {
 	BudgetBytes           int // max merged DFA table bytes per bucket; default 65536
 	BudgetStates          int // max DFA states per merged bucket; default 512
 	BudgetStatesPreFilter int // pre-filter: suffixStates * combinedClassCount; default 65536
+	MaxFallbackStates     int // max DFA states for a single-pattern fallback bucket; default 1024
 	TableMemIdx           int // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
 }
 
@@ -412,6 +413,13 @@ func (o CompileSetOptions) budgetStatesPreFilter() int {
 		return o.BudgetStatesPreFilter
 	}
 	return 65536
+}
+
+func (o CompileSetOptions) maxFallbackStates() int {
+	if o.MaxFallbackStates > 0 {
+		return o.MaxFallbackStates
+	}
+	return 1024
 }
 
 // mergeSuffixASTs builds a canonical union AST from suffix sub-trees.
@@ -995,6 +1003,12 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 					isolatedDFA = t
 				}
 			}
+			if isolatedDFA.numStates > opts.maxFallbackStates() {
+				if diag != nil {
+					diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
+				}
+				continue
+			}
 			isolatedCM, _, isolatedNC := computeByteClasses(isolatedDFA)
 			nb := &bucket{
 				literal:      "",
@@ -1045,6 +1059,12 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 				if t, _, mergeErr := mergeSuffixDFA([]*syntax.Regexp{ast}, opts); mergeErr == nil {
 					nbDFA = t
 				}
+			}
+			if nbDFA.numStates > opts.maxFallbackStates() {
+				if diag != nil {
+					diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
+				}
+				continue
 			}
 			nbCM, _, nbNC := computeByteClasses(nbDFA)
 			nb := &bucket{
