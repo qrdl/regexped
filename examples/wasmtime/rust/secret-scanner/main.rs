@@ -109,6 +109,12 @@ fn main() -> Result<()> {
         // exits at the top of the next iteration, so only positions <= last.start
         // have been visited. Advancing by last_len would skip positions inside
         // the last match's span that the scan has not yet seen.
+        //
+        // Short batch (count < OUT_CAP) means the WASM exited because the input
+        // was fully scanned, not because the buffer filled — no need to resume.
+        if count < OUT_CAP {
+            break;
+        }
         let last = out_base as usize + (count as usize - 1) * 12;
         let last_start = i32::from_le_bytes(mem_data[last+4..last+8].try_into()?);
         start_pos = last_start + 1;

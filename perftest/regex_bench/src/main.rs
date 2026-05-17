@@ -81,14 +81,11 @@ pub extern "C" fn regex_bench_set_find(input_len: i32, iters: i32) {
     let mut prev = std::time::Instant::now();
     for i in 0..iters as usize {
         // Pass 1: which patterns match? (no positions)
-        let matched: Vec<usize> = state.set
-            .matches(std::hint::black_box(input))
-            .into_iter()
-            .collect();
-        // Pass 2: for each matched pattern, re-scan for positions
+        // Pass 2: for each matched pattern, re-scan for positions.
+        // Iterate the SetMatches directly to avoid a per-iteration Vec allocation.
         let mut total: usize = 0;
-        for pat_idx in &matched {
-            for m in state.patterns[*pat_idx].find_iter(input) {
+        for pat_idx in state.set.matches(std::hint::black_box(input)).iter() {
+            for m in state.patterns[pat_idx].find_iter(input) {
                 let _ = std::hint::black_box((m.start(), m.end(), pat_idx));
                 total += 1;
             }

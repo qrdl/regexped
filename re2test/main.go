@@ -829,11 +829,24 @@ func testSetBlock(
 		return
 	}
 
-	// Place input after DFA tables (page-aligned), output after input.
+	// Place input after DFA tables (page-aligned), output after the longest
+	// input (page-aligned). Sizing outBase from the max input length avoids
+	// the input buffer overlapping the find_all tuple buffer when a single
+	// test string is larger than one page.
 	const pageSize = 65536
 	dataTop, _ := utils.ParseDataSectionBytes(wasmBytes)
 	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	outBase := inBase + int32(pageSize) // one page after input
+	maxInLen := 0
+	for _, s := range testStrings {
+		if len(s) > maxInLen {
+			maxInLen = len(s)
+		}
+	}
+	inputSpan := int32((maxInLen + pageSize - 1) / pageSize * pageSize)
+	if inputSpan < int32(pageSize) {
+		inputSpan = int32(pageSize)
+	}
+	outBase := inBase + inputSpan
 	outBytes := int64(setOutCap * setOutTupleBytes)
 
 	neededPages := uint64((int64(outBase) + outBytes + pageSize - 1) / pageSize)
