@@ -55,11 +55,11 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if len(cfg.Regexes) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(cfg.Regexes))
+	if len(cfg.Regexps) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(cfg.Regexps))
 	}
-	if cfg.Regexes[0].MatchFunc != "foo_match" {
-		t.Errorf("MatchFunc = %q, want foo_match", cfg.Regexes[0].MatchFunc)
+	if cfg.Regexps[0].MatchFunc != "foo_match" {
+		t.Errorf("MatchFunc = %q, want foo_match", cfg.Regexps[0].MatchFunc)
 	}
 }
 
@@ -83,7 +83,7 @@ func TestLoadConfigNoRegexes(t *testing.T) {
 	}
 	_, err := LoadConfig(path)
 	if err == nil {
-		t.Fatal("expected error for config with no regexes, got nil")
+		t.Fatal("expected error for config with no regexps, got nil")
 	}
 }
 
@@ -191,7 +191,7 @@ func TestPatternSelector_UnmarshalYAML_Invalid(t *testing.T) {
 
 func TestValidateSets_Valid(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "p1", Pattern: "foo"}, {Name: "p2", Pattern: "bar"}},
+		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}, {Name: "p2", Pattern: "bar"}},
 		Sets: []SetConfig{
 			{Name: "s1", FindAny: "s1_any", Patterns: PatternSelector{All: true}},
 			{Name: "s2", FindAll: "s2_all", Patterns: PatternSelector{Names: []string{"p1"}}},
@@ -204,7 +204,7 @@ func TestValidateSets_Valid(t *testing.T) {
 
 func TestValidateSets_DuplicateRegexName(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "dup", Pattern: "foo"}, {Name: "dup", Pattern: "bar"}},
+		Regexps: []RegexEntry{{Name: "dup", Pattern: "foo"}, {Name: "dup", Pattern: "bar"}},
 		Sets:    []SetConfig{{Name: "s", FindAny: "ma", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -214,7 +214,7 @@ func TestValidateSets_DuplicateRegexName(t *testing.T) {
 
 func TestValidateSets_DuplicateSetName(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "p", Pattern: "foo"}},
+		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
 		Sets: []SetConfig{
 			{Name: "same", FindAny: "a", Patterns: PatternSelector{All: true}},
 			{Name: "same", FindAll: "b", Patterns: PatternSelector{All: true}},
@@ -227,7 +227,7 @@ func TestValidateSets_DuplicateSetName(t *testing.T) {
 
 func TestValidateSets_UnknownPatternRef(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "known", Pattern: "foo"}},
+		Regexps: []RegexEntry{{Name: "known", Pattern: "foo"}},
 		Sets:    []SetConfig{{Name: "s", FindAny: "ma", Patterns: PatternSelector{Names: []string{"unknown"}}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -237,7 +237,7 @@ func TestValidateSets_UnknownPatternRef(t *testing.T) {
 
 func TestValidateSets_NoExportField(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "p", Pattern: "foo"}},
+		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
 		Sets:    []SetConfig{{Name: "s", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -247,7 +247,7 @@ func TestValidateSets_NoExportField(t *testing.T) {
 
 func TestValidateSets_MissingSetName(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "p", Pattern: "foo"}},
+		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
 		Sets:    []SetConfig{{FindAny: "ma", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -257,7 +257,7 @@ func TestValidateSets_MissingSetName(t *testing.T) {
 
 func TestValidateSets_EmptySets(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "p", Pattern: "foo"}},
+		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
 	}
 	if err := ValidateSets(cfg); err != nil {
 		t.Errorf("ValidateSets empty sets: %v", err)
@@ -304,19 +304,19 @@ func TestPatternSelector_UnmarshalYAML_NonStringListItem(t *testing.T) {
 
 func TestValidateSets_DuplicateRegexExportName(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{
+		Regexps: []RegexEntry{
 			{Name: "p1", Pattern: "foo", MatchFunc: "dup"},
 			{Name: "p2", Pattern: "bar", FindFunc: "dup"},
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
-		t.Error("expected duplicate WASM export name error among regexes, got nil")
+		t.Error("expected duplicate WASM export name error among regexps, got nil")
 	}
 }
 
 func TestValidateSets_RegexSetExportCollision(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "p1", Pattern: "foo", MatchFunc: "shared"}},
+		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo", MatchFunc: "shared"}},
 		Sets: []SetConfig{
 			{Name: "s1", FindAll: "shared", Patterns: PatternSelector{All: true}},
 		},
@@ -328,7 +328,7 @@ func TestValidateSets_RegexSetExportCollision(t *testing.T) {
 
 func TestValidateSets_MissingPatternsField(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "p1", Pattern: "foo"}},
+		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}},
 		Sets: []SetConfig{
 			{Name: "s1", FindAny: "s1_any"}, // patterns omitted entirely
 		},
@@ -340,7 +340,7 @@ func TestValidateSets_MissingPatternsField(t *testing.T) {
 
 func TestValidateSets_DuplicatePatternInSet(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexes: []RegexEntry{{Name: "p1", Pattern: "foo"}},
+		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}},
 		Sets: []SetConfig{
 			{Name: "s1", FindAny: "s1_any", Patterns: PatternSelector{Names: []string{"p1", "p1"}}},
 		},

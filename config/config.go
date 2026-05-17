@@ -19,7 +19,7 @@ type BuildConfig struct {
 	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
 	MaxDFAStates int          `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int          `yaml:"max_tdfa_regs"`  // 0 = default (32)
-	Regexes      []RegexEntry `yaml:"regexps"`
+	Regexps      []RegexEntry `yaml:"regexps"`
 	Sets         []SetConfig  `yaml:"sets"` // optional set composition entries
 }
 
@@ -30,7 +30,7 @@ type SetConfig struct {
 	FindAll     string          `yaml:"find_all"`      // export name for find_all (non-anchored, all matches)
 	Match       string          `yaml:"match"`         // export name for match (anchored at position 0)
 	BatchSize   int             `yaml:"batch_size"`    // output buffer hint (default 256); stub-gen only
-	Patterns    PatternSelector `yaml:"patterns"`      // which regexes belong to this set
+	Patterns    PatternSelector `yaml:"patterns"`      // which regexps belong to this set
 	EmitNameMap bool            `yaml:"emit_name_map"` // generate pattern_name / patternName helper in stubs (does not change WASM)
 }
 
@@ -74,8 +74,8 @@ func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error
 // is empty.
 func ValidateSets(cfg *BuildConfig) error {
 	// Build name → index map.
-	nameIdx := make(map[string]int, len(cfg.Regexes))
-	for i, re := range cfg.Regexes {
+	nameIdx := make(map[string]int, len(cfg.Regexps))
+	for i, re := range cfg.Regexps {
 		if re.Name != "" {
 			if _, dup := nameIdx[re.Name]; dup {
 				return fmt.Errorf("duplicate regex name %q", re.Name)
@@ -87,7 +87,7 @@ func ValidateSets(cfg *BuildConfig) error {
 	setNames := make(map[string]bool)
 	exportNames := make(map[string]string) // export name → owner ("set X" or "regex Y")
 	// Seed with per-regex export names so set exports can't collide with them.
-	for _, re := range cfg.Regexes {
+	for _, re := range cfg.Regexps {
 		owner := "regex"
 		if re.Name != "" {
 			owner = fmt.Sprintf("regex %q", re.Name)
@@ -192,7 +192,7 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return BuildConfig{}, fmt.Errorf("parse config %s: %w", configPath, err)
 	}
-	if len(cfg.Regexes) == 0 {
+	if len(cfg.Regexps) == 0 {
 		return BuildConfig{}, fmt.Errorf("config %s has no regexps", configPath)
 	}
 

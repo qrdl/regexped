@@ -12,7 +12,7 @@ import (
 // rustStub generates a Rust stub file for all regex entries and sets in cfg.
 // out is the full output path or "-" for stdout.
 func rustStub(cfg config.BuildConfig, out string) error {
-	singleInner, err := genRustStubsInner(cfg.Regexes, cfg.ImportModule)
+	singleInner, err := genRustStubsInner(cfg.Regexps, cfg.ImportModule)
 	if err != nil {
 		return fmt.Errorf("generate Rust stub: %w", err)
 	}
@@ -155,7 +155,7 @@ pub fn %s(input: &[u8]) -> Option<SetMatch> {
 	}
 	if hasEmitNameMap(cfg) {
 		out.WriteString("pub fn pattern_name(id: usize) -> &'static str {\n    match id {\n")
-		for i, re := range cfg.Regexes {
+		for i, re := range cfg.Regexps {
 			fmt.Fprintf(&out, "        %d => %q,\n", i, re.Name)
 		}
 		out.WriteString("        _ => \"\",\n    }\n}\n\n")

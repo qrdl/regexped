@@ -113,13 +113,17 @@ match is not batched — one call returns all matching patterns, up to `out_cap`
 Each tuple occupies 12 bytes; decode three little-endian i32s at offsets 0, 4,
 and 8. `end = start + length` (with `start = 0`).
 
-> **Stub behaviour.** The generated stubs (Rust, Go, JS, TS, AssemblyScript, C)
-> call the anchored `match` export with `out_cap = 1` and surface only the
-> first matching pattern (`Option<SetMatch>` / `*SetMatch` / `SetMatch | null`).
-> This is a deliberate ergonomic choice for the common "which pattern matches
-> here?" use case. Hosts that need every pattern matching at position 0 must
-> call the WASM export directly with `out_cap ≥ patterns_in_set` and decode
-> the tuple buffer as described above.
+> **Stub behaviour.** The generated stubs call the anchored `match` export
+> with `out_cap = 1` and surface only the first matching pattern. Rust, Go,
+> JavaScript, and TypeScript reuse the same `SetMatch { pattern_id, start, end }`
+> shape used for `find_all`/`find_any` (with `start == 0`). The C and
+> AssemblyScript stubs use a dedicated anchored type — `rx_set_anchor_t`
+> (`{ pattern_id, end }`) and `SetAnchorMatch` (`{ patternId, end }`)
+> respectively — which omits the always-zero `start` field. This is a
+> deliberate ergonomic choice for the common "which pattern matches here?"
+> use case. Hosts that need every pattern matching at position 0 must call
+> the WASM export directly with `out_cap ≥ patterns_in_set` and decode the
+> tuple buffer as described above.
 
 ## Batched streaming and batch_size
 
@@ -218,4 +222,4 @@ faster — but it is not required for correctness.
 - [examples/node/sql-validator/](../examples/node/sql-validator/) — anchored `match`, SQL statement validation (Node.js / TypeScript)
 - [examples/wasmtime/go/secret-scanner/](../examples/wasmtime/go/secret-scanner/) — `find_all`, secret detection (Go wasip1)
 - [examples/wasmtime/rust/secret-scanner/](../examples/wasmtime/rust/secret-scanner/) — `find_all`, secret detection (native Rust host)
-- [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `find_all`, URL rule matching (FastEdge)
+- [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `find_any`, URL rule matching (FastEdge)

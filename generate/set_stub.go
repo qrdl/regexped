@@ -23,13 +23,13 @@ func hasEmitNameMap(cfg config.BuildConfig) bool {
 }
 
 // patternsInSet returns the number of patterns in s. For sets.patterns: "all"
-// this is len(cfg.Regexes); otherwise it is len(s.Patterns.Names). The count
+// this is len(cfg.Regexps); otherwise it is len(s.Patterns.Names). The count
 // is a safe upper bound on how many matches the WASM function can emit at a
 // single start position (each global pattern ID can emit at most once per
 // start in the find_all output).
 func patternsInSet(s config.SetConfig, cfg config.BuildConfig) int {
 	if s.Patterns.All {
-		return len(cfg.Regexes)
+		return len(cfg.Regexps)
 	}
 	return len(s.Patterns.Names)
 }

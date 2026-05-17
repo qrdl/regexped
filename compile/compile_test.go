@@ -502,7 +502,7 @@ func TestCmdCompile(t *testing.T) {
 	t.Run("file output standalone", func(t *testing.T) {
 		dir := t.TempDir()
 		out := filepath.Join(dir, "out.wasm")
-		cfg := config.BuildConfig{Regexes: entries} // no Output field → standalone
+		cfg := config.BuildConfig{Regexps: entries} // no Output field → standalone
 		if err := CmdCompile(cfg, out); err != nil {
 			t.Fatalf("CmdCompile: %v", err)
 		}
@@ -518,7 +518,7 @@ func TestCmdCompile(t *testing.T) {
 	t.Run("file output embedded", func(t *testing.T) {
 		dir := t.TempDir()
 		out := filepath.Join(dir, "out.wasm")
-		cfg := config.BuildConfig{Regexes: entries, Output: "final.wasm"} // Output set → embedded
+		cfg := config.BuildConfig{Regexps: entries, Output: "final.wasm"} // Output set → embedded
 		if err := CmdCompile(cfg, out); err != nil {
 			t.Fatalf("CmdCompile: %v", err)
 		}
@@ -539,7 +539,7 @@ func TestCmdCompile(t *testing.T) {
 		orig := os.Stdout
 		os.Stdout = w
 
-		cfg := config.BuildConfig{Regexes: entries}
+		cfg := config.BuildConfig{Regexps: entries}
 		compErr := CmdCompile(cfg, "-")
 
 		w.Close()

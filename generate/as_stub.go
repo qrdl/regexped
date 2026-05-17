@@ -27,7 +27,7 @@ func asStub(cfg config.BuildConfig, out string) error {
 // genASStubFile generates the content of an AssemblyScript stub file.
 func genASStubFile(cfg config.BuildConfig) (string, error) {
 	var parts []string
-	for _, re := range cfg.Regexes {
+	for _, re := range cfg.Regexps {
 		part, err := genASStubsForEntry(re, cfg.ImportModule)
 		if err != nil {
 			return "", err
@@ -128,8 +128,8 @@ export function %[1]s_reset(): void { _start_%[1]s = 0; _bufN_%[1]s = 0; _bufI_%
 		}
 	}
 	if hasEmitNameMap(cfg) {
-		names := make([]string, len(cfg.Regexes))
-		for i, re := range cfg.Regexes {
+		names := make([]string, len(cfg.Regexps))
+		for i, re := range cfg.Regexps {
 			names[i] = fmt.Sprintf("%q", re.Name)
 		}
 		fmt.Fprintf(&out, "const _patternNames: string[] = [%s];\n", strings.Join(names, ", "))

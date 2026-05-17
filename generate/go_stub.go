@@ -18,7 +18,7 @@ func goStub(cfg config.BuildConfig, out string) error {
 	if filepath.Base(filepath.Dir(out)) != cfg.ImportModule {
 		pkgName = "main"
 	}
-	singleBody, needsIter, err := genGoStubsBody(cfg.Regexes, cfg.ImportModule)
+	singleBody, needsIter, err := genGoStubsBody(cfg.Regexps, cfg.ImportModule)
 	if err != nil {
 		return fmt.Errorf("generate Go stub: %w", err)
 	}
@@ -133,7 +133,7 @@ func %s(input []byte) *SetMatch {
 	if hasEmitNameMap(cfg) {
 		out.WriteString("// PatternName returns the name of the pattern with the given ID.\n")
 		out.WriteString("func PatternName(id int) string {\n\tswitch id {\n")
-		for i, re := range cfg.Regexes {
+		for i, re := range cfg.Regexps {
 			if re.Name != "" {
 				fmt.Fprintf(&out, "\tcase %d: return %q\n", i, re.Name)
 			}

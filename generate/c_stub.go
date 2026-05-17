@@ -81,7 +81,7 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 // cStubWithSets updates genCStubFiles to also handle sets.
 func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, cContent string, err error) {
 	hasIndividual := false
-	for _, re := range cfg.Regexes {
+	for _, re := range cfg.Regexps {
 		if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
 			hasIndividual = true
 			break
@@ -90,7 +90,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 	if !hasIndividual && !hasSetExports(cfg) {
 		return "", "", nil
 	}
-	hContent, cContent, err = genCStubFiles(cfg.Regexes, cfg.ImportModule, hBasename)
+	hContent, cContent, err = genCStubFiles(cfg.Regexps, cfg.ImportModule, hBasename)
 	if err != nil {
 		return
 	}
@@ -176,7 +176,7 @@ int %s(const char *input, int len, rx_set_anchor_t *out);
 	if hasEmitNameMap(cfg) {
 		hb.WriteString("const char *pattern_name(int id);\n\n")
 		cb.WriteString("static const char *_pattern_names[] = {")
-		for i, re := range cfg.Regexes {
+		for i, re := range cfg.Regexps {
 			if i > 0 {
 				cb.WriteString(", ")
 			}

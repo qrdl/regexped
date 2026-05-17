@@ -15,7 +15,7 @@ import (
 type PatternInfo struct {
 	fullPattern string
 	name        string         // YAML name: field; empty when not set
-	globalID    int            // index into cfg.Regexes
+	globalID    int            // index into cfg.Regexps
 	prefixAST   *syntax.Regexp // AST before the mandatory literal; nil when trivial
 	suffixAST   *syntax.Regexp // AST after the mandatory literal; nil when trivial
 	mandLit     *mandatoryLit  // from findMandatoryLitRec

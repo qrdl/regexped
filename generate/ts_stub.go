@@ -68,7 +68,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("    }\n")
 	sb.WriteString("}\n\n")
 
-	for _, re := range cfg.Regexes {
+	for _, re := range cfg.Regexps {
 		if re.MatchFunc != "" {
 			sb.WriteString(genTSMatchFunc(re.MatchFunc))
 		}
@@ -161,7 +161,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 	}
 	if hasEmitNameMap(cfg) {
 		out.WriteString("const _patternNames: string[] = [")
-		for i, re := range cfg.Regexes {
+		for i, re := range cfg.Regexps {
 			if i > 0 {
 				out.WriteString(", ")
 			}

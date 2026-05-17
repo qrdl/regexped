@@ -784,12 +784,12 @@ func testSetBlock(
 		return // not enough patterns to form a set
 	}
 
-	regexes := make([]config.RegexEntry, len(eligible))
+	regexps := make([]config.RegexEntry, len(eligible))
 	for i, e := range eligible {
-		regexes[i] = config.RegexEntry{Pattern: e.entry.pattern}
+		regexps[i] = config.RegexEntry{Pattern: e.entry.pattern}
 	}
 	cfg := config.BuildConfig{
-		Regexes: regexes,
+		Regexps: regexps,
 		Sets: []config.SetConfig{
 			{Name: "test", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
 		},

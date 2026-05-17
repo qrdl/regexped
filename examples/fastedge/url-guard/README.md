@@ -60,9 +60,11 @@ regexped merge      →  merge app + patterns into final.wasm
 
 `lib.rs` intercepts every HTTP request at the `on_http_request_headers` phase,
 extracts the `:path` header, and passes it to the generated `patterns::scan_url()`
-iterator. If any pattern matches, the request is blocked immediately with a 403
-and the matched attack category is logged. If no pattern matches, the request
-continues to the origin.
+function. `scan_url` is declared as `find_any` in `regexped.yaml`, so the
+generated Rust wrapper returns `Option<SetMatch>` — the first matching
+pattern, if any. If a match is found, the request is blocked immediately
+with a 403 and the matched attack category is logged. If no pattern matches,
+the request continues to the origin.
 
 The calling code is minimal — the generated `stubs.rs` hides all WASM FFI details:
 

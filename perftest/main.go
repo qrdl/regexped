@@ -1914,7 +1914,7 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 		entries[i] = config.RegexEntry{Pattern: p}
 	}
 	cfg := config.BuildConfig{
-		Regexes: entries,
+		Regexps: entries,
 		Sets: []config.SetConfig{
 			{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
@@ -2034,7 +2034,7 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 		entries[i] = config.RegexEntry{Pattern: p}
 	}
 	cfg := config.BuildConfig{
-		Regexes: entries,
+		Regexps: entries,
 		Sets: []config.SetConfig{
 			{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
@@ -2285,7 +2285,7 @@ func runSizeOnlySets() {
 			entries[i] = config.RegexEntry{Pattern: p}
 		}
 		cfg := config.BuildConfig{
-			Regexes: entries,
+			Regexps: entries,
 			Sets: []config.SetConfig{
 				{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
 			},
@@ -2390,7 +2390,7 @@ func runCompareSetSize(baselinePath string) bool {
 			entries[i] = config.RegexEntry{Pattern: p}
 		}
 		cfg := config.BuildConfig{
-			Regexes: entries,
+			Regexps: entries,
 			Sets: []config.SetConfig{
 				{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
 			},

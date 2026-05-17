@@ -822,7 +822,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 // Mode is auto-selected from cfg.Output: empty → standalone; non-empty → embedded.
 func CmdCompile(cfg config.BuildConfig, output string) error {
 	outPath := output
-	slog.Info("Compiling regexps", "count", len(cfg.Regexes), "output", outPath)
+	slog.Info("Compiling regexps", "count", len(cfg.Regexps), "output", outPath)
 
 	var wasmBytes []byte
 	if len(cfg.Sets) > 0 {
@@ -838,7 +838,7 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 		}
 		standalone := cfg.Output == ""
 		var err error
-		wasmBytes, _, err = Compile(cfg.Regexes, 0, standalone, compOpts)
+		wasmBytes, _, err = Compile(cfg.Regexps, 0, standalone, compOpts)
 		if err != nil {
 			return fmt.Errorf("compile: %w", err)
 		}
@@ -868,17 +868,17 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 	// Gather diagnostics by re-running CompileFile (it already computed them;
 	// for simplicity we re-run rather than threading Diagnostics through CmdCompile).
 	var prefixPool, suffixPool dfaPool
-	nameIdx := make(map[string]int, len(cfg.Regexes))
-	for i, re := range cfg.Regexes {
+	nameIdx := make(map[string]int, len(cfg.Regexps))
+	for i, re := range cfg.Regexps {
 		if re.Name != "" {
 			nameIdx[re.Name] = i
 		}
 	}
-	diag := Diagnostics{PatternsTotal: len(cfg.Regexes)}
+	diag := Diagnostics{PatternsTotal: len(cfg.Regexps)}
 	for _, sc := range cfg.Sets {
 		var selectedIdx []int
 		if sc.Patterns.All {
-			for i := range cfg.Regexes {
+			for i := range cfg.Regexps {
 				selectedIdx = append(selectedIdx, i)
 			}
 		} else {
@@ -892,7 +892,7 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		var globalIDs []int
 		var droppedRefs []PatternRef
 		for _, idx := range selectedIdx {
-			re := cfg.Regexes[idx]
+			re := cfg.Regexps[idx]
 			if re.CaptureStubsRequested() {
 				diag.CaptureBearing++
 				droppedRefs = append(droppedRefs, PatternRef{ID: idx, Name: re.Name})

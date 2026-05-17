@@ -316,7 +316,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		if len(ac.nodes) <= 32 {
 			acL = buildACLayout(ac, prefixTableOffset)
 			acDataBytes = emitACDataSegments(acL)
-			acDataSegCount = 3 // goto, failure, output segments
+			acDataSegCount = 2 // goto, combined nodeOut+output
 
 			// Build firstByteFlags[256] table for SIMD prefilter.
 			fbFlags := make([]byte, 256)
@@ -675,7 +675,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	if !standalone {
 		opts.tableMemIdx = 1
 	}
-	for _, re := range cfg.Regexes {
+	for _, re := range cfg.Regexps {
 		p, err := compilePattern(re, tableBase, 0, opts)
 		if err != nil {
 			return nil, 0, err
@@ -698,8 +698,8 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 
 	// Resolve and compile sets.
 	// Build name→index map.
-	nameIdx := make(map[string]int, len(cfg.Regexes))
-	for i, re := range cfg.Regexes {
+	nameIdx := make(map[string]int, len(cfg.Regexps))
+	for i, re := range cfg.Regexps {
 		if re.Name != "" {
 			nameIdx[re.Name] = i
 		}
@@ -712,7 +712,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		// Resolve patterns.
 		var selectedIdx []int
 		if sc.Patterns.All {
-			for i := range cfg.Regexes {
+			for i := range cfg.Regexps {
 				selectedIdx = append(selectedIdx, i)
 			}
 		} else {
@@ -725,7 +725,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		var infos []*PatternInfo
 		var globalIDs []int
 		for _, idx := range selectedIdx {
-			re := cfg.Regexes[idx]
+			re := cfg.Regexps[idx]
 			if re.CaptureStubsRequested() {
 				continue // drop capture-bearing
 			}

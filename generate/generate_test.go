@@ -133,7 +133,7 @@ func TestGenJSStubFile(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regex.js",
-		Regexes: []config.RegexEntry{
+		Regexps: []config.RegexEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
 			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
 		},
@@ -157,7 +157,7 @@ func TestGenTSStubFile(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regex.ts",
-		Regexes: []config.RegexEntry{
+		Regexps: []config.RegexEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
 			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
 		},
@@ -483,7 +483,7 @@ func TestGenJSStubFileWithNamedPattern(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regex.js",
-		Regexes: []config.RegexEntry{{
+		Regexps: []config.RegexEntry{{
 			NamedGroupsFunc: "url_named",
 			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
 		}},
@@ -503,7 +503,7 @@ func TestGenTSStubFileWithNamedPattern(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regex.ts",
-		Regexes: []config.RegexEntry{{
+		Regexps: []config.RegexEntry{{
 			NamedGroupsFunc: "url_named",
 			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
 		}},
@@ -595,7 +595,7 @@ func TestGenASStubNamedGroupsFuncError(t *testing.T) {
 	entries := []config.RegexEntry{
 		{NamedGroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
 	}
-	_, err := genASStubFile(config.BuildConfig{Regexes: entries, ImportModule: "mymod"})
+	_, err := genASStubFile(config.BuildConfig{Regexps: entries, ImportModule: "mymod"})
 	if err == nil {
 		t.Fatal("genASStubFile: expected error for named_groups_func, got nil")
 	}
@@ -605,7 +605,7 @@ func TestGenASStubFileGroupsFunc(t *testing.T) {
 	entries := []config.RegexEntry{
 		{GroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
 	}
-	out, err := genASStubFile(config.BuildConfig{Regexes: entries, ImportModule: "mymod"})
+	out, err := genASStubFile(config.BuildConfig{Regexps: entries, ImportModule: "mymod"})
 	if err != nil {
 		t.Fatalf("genASStubFile: %v", err)
 	}
@@ -631,7 +631,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 			cfg: config.BuildConfig{
 				StubType:     "rust",
 				ImportModule: "mymod",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -640,7 +640,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 			cfg: config.BuildConfig{
 				StubType:     "go",
 				ImportModule: "mymod",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -650,7 +650,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 				StubType:     "js",
 				ImportModule: "mymod",
 				Output:       "merged.wasm",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -660,7 +660,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 				StubType:     "ts",
 				ImportModule: "mymod",
 				Output:       "merged.wasm",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -670,7 +670,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 				StubType:     "c",
 				ImportModule: "mymod",
 				StubFile:     "stub.h",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -679,7 +679,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 			cfg: config.BuildConfig{
 				StubType:     "as",
 				ImportModule: "mymod",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 	}
@@ -715,7 +715,7 @@ func TestWriteStub(t *testing.T) {
 func setTestCfg() config.BuildConfig {
 	return config.BuildConfig{
 		ImportModule: "mymod",
-		Regexes: []config.RegexEntry{
+		Regexps: []config.RegexEntry{
 			{Name: "pat_a", Pattern: `foo\d+`},
 			{Name: "pat_b", Pattern: `bar\w+`},
 		},
@@ -862,7 +862,7 @@ func TestGenASSetSection(t *testing.T) {
 
 func TestRustStub_WithSets(t *testing.T) {
 	cfg := setTestCfg()
-	inner, err := genRustStubsInner(cfg.Regexes, cfg.ImportModule)
+	inner, err := genRustStubsInner(cfg.Regexps, cfg.ImportModule)
 	if err != nil {
 		t.Fatalf("genRustStubsInner: %v", err)
 	}
@@ -877,7 +877,7 @@ func TestRustStub_WithSets(t *testing.T) {
 }
 
 func TestSetSection_NoSets_Empty(t *testing.T) {
-	cfg := config.BuildConfig{ImportModule: "m", Regexes: []config.RegexEntry{{Pattern: `foo`}}}
+	cfg := config.BuildConfig{ImportModule: "m", Regexps: []config.RegexEntry{{Pattern: `foo`}}}
 	if s := genRustSetInner(cfg); s != "" {
 		t.Errorf("genRustSetInner with no sets: got non-empty %q", s)
 	}
@@ -898,7 +898,7 @@ func TestSetSection_NoSets_Empty(t *testing.T) {
 func TestSetSection_FindAllOnly(t *testing.T) {
 	cfg := config.BuildConfig{
 		ImportModule: "m",
-		Regexes:      []config.RegexEntry{{Pattern: `foo`}},
+		Regexps:      []config.RegexEntry{{Pattern: `foo`}},
 		Sets: []config.SetConfig{
 			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
