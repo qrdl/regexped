@@ -1,0 +1,19 @@
+# conflict_001: bitmask_overflow
+# 9 patterns all sharing mandatory literal "foo" (variable-length suffix).
+# bitmaskWidth=8: bucket 0 fills at 8 patterns; pattern 9 → bucket 1.
+options:
+  bitmask_width: 8
+patterns:
+  - pattern: 'foo\d+'
+  - pattern: 'foo\w+'
+  - pattern: 'foo[a-z]+'
+  - pattern: 'foo[A-Z]+'
+  - pattern: 'foo[0-9]+'
+  - pattern: 'foo[a-zA-Z]+'
+  - pattern: 'foo[a-z0-9]+'
+  - pattern: 'foo[A-Z0-9]+'
+  - pattern: 'foo[^a-z]+'
+expect:
+  bucket_count: 2
+  conflict_reasons:
+    - bitmask_cap_full

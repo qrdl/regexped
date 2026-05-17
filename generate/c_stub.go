@@ -20,7 +20,7 @@ func cStub(cfg config.BuildConfig, out string) error {
 		hBase = filepath.Base(base + ".h")
 	}
 
-	hContent, cContent, err := genCStubFiles(cfg.Regexes, cfg.ImportModule, hBase)
+	hContent, cContent, err := genCStubFilesWithSets(cfg, hBase)
 	if err != nil {
 		return fmt.Errorf("generate C stub: %w", err)
 	}
@@ -52,9 +52,6 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 			parts = append(parts, entryParts{h, c})
 		}
 	}
-	if len(parts) == 0 {
-		return "", "", nil
-	}
 
 	var hb, cb strings.Builder
 
@@ -65,6 +62,8 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 	hb.WriteString("#define REGEXPED_TYPES_DEFINED\n")
 	hb.WriteString("typedef struct { int start; int end; } rx_match_t;\n")
 	hb.WriteString("typedef struct { int start; int end; const char *name; } rx_group_t;\n")
+	hb.WriteString("typedef struct { int pattern_id; int start; int end; } rx_set_match_t;\n")
+	hb.WriteString("typedef struct { int pattern_id; int end; } rx_set_anchor_t;\n")
 	hb.WriteString("#endif\n\n")
 
 	// .c file
@@ -77,6 +76,117 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 	}
 
 	return hb.String(), cb.String(), nil
+}
+
+// cStubWithSets updates genCStubFiles to also handle sets.
+func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, cContent string, err error) {
+	hasIndividual := false
+	for _, re := range cfg.Regexps {
+		if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
+			hasIndividual = true
+			break
+		}
+	}
+	if !hasIndividual && !hasSetExports(cfg) {
+		return "", "", nil
+	}
+	hContent, cContent, err = genCStubFiles(cfg.Regexps, cfg.ImportModule, hBasename)
+	if err != nil {
+		return
+	}
+	if !hasSetExports(cfg) {
+		return
+	}
+	var hb, cb strings.Builder
+	hb.WriteString(hContent)
+	cb.WriteString(cContent)
+	for _, s := range cfg.Sets {
+		if s.FindAll != "" || s.FindAny != "" {
+			bs := batchSize(s, cfg)
+			wasmExport := s.FindAll
+			if wasmExport == "" {
+				wasmExport = s.FindAny
+			}
+			fmt.Fprintf(&hb, `__attribute__((import_module("%s"), import_name("%s")))
+int ffi_%s(const char *ptr, int len, int *out, int cap, int start);
+`, cfg.ImportModule, wasmExport, wasmExport)
+			if s.FindAll != "" {
+				fmt.Fprintf(&hb, "int %s_next(const char *input, int len, rx_set_match_t *out);\nvoid %s_reset(void);\n\n", s.FindAll, s.FindAll)
+				fmt.Fprintf(&cb, `static int _start_%[1]s = 0; static int _buf_%[1]s[%[2]d*3]; static int _buf_n_%[1]s = 0; static int _buf_i_%[1]s = 0;
+int %[1]s_next(const char *input, int len, rx_set_match_t *out) {
+    if (_buf_i_%[1]s >= _buf_n_%[1]s) {
+        /* _start_<fn> < 0 is a sentinel meaning "input exhausted on the previous
+           call" — when ffi returned n < cap. Do not call ffi again. */
+        if (_start_%[1]s < 0) { _buf_n_%[1]s = 0; _buf_i_%[1]s = 0; return 0; }
+        int n = ffi_%[3]s(input, len, _buf_%[1]s, %[2]d, _start_%[1]s);
+        if (n <= 0) { _buf_n_%[1]s = 0; _buf_i_%[1]s = 0; return 0; }
+        _buf_n_%[1]s = n; _buf_i_%[1]s = 0;
+        /* find_all returns when EITHER the buffer is full (n == cap) OR the
+           input has been fully scanned (n < cap). Only the buffer-full case
+           needs a resume; otherwise mark this iterator exhausted. */
+        if (n < %[2]d) {
+            _start_%[1]s = -1;
+        } else {
+            int last = (n-1)*3;
+            /* Advance by exactly one position past the last reported start:
+               the WASM scan is position-by-position and only positions
+               <= last.start have been visited when the buffer fills,
+               regardless of last.length. */
+            _start_%[1]s = _buf_%[1]s[last+1] + 1;
+        }
+    }
+    int i = _buf_i_%[1]s++ * 3;
+    out->pattern_id = _buf_%[1]s[i]; out->start = _buf_%[1]s[i+1]; out->end = _buf_%[1]s[i+1]+_buf_%[1]s[i+2];
+    return 1;
+}
+void %[1]s_reset(void) { _start_%[1]s = 0; _buf_n_%[1]s = 0; _buf_i_%[1]s = 0; }
+`,
+					s.FindAll, bs, wasmExport)
+			}
+			if s.FindAny != "" {
+				anyFFI := "ffi_" + s.FindAny
+				if s.FindAll != "" {
+					anyFFI = "ffi_" + s.FindAll
+				}
+				fmt.Fprintf(&hb, "int %s(const char *input, int len, rx_set_match_t *out);\n\n", s.FindAny)
+				fmt.Fprintf(&cb, `int %s(const char *input, int len, rx_set_match_t *out) {
+    int buf[3];
+    if (%s(input, len, buf, 1, 0) <= 0) return 0;
+    out->pattern_id = buf[0]; out->start = buf[1]; out->end = buf[1]+buf[2];
+    return 1;
+}
+`, s.FindAny, anyFFI)
+			}
+		}
+		if s.Match != "" {
+			fmt.Fprintf(&hb, `__attribute__((import_module("%s"), import_name("%s")))
+int ffi_%s(const char *ptr, int len, int *out, int cap);
+int %s(const char *input, int len, rx_set_anchor_t *out);
+
+`, cfg.ImportModule, s.Match, s.Match, s.Match)
+			fmt.Fprintf(&cb, `int %s(const char *input, int len, rx_set_anchor_t *out) {
+    int buf[3];
+    if (ffi_%s(input, len, buf, 1) <= 0) return 0;
+    out->pattern_id = buf[0]; out->end = buf[1] + buf[2];
+    return 1;
+}
+`, s.Match, s.Match)
+		}
+	}
+	if hasEmitNameMap(cfg) {
+		hb.WriteString("const char *pattern_name(int id);\n\n")
+		cb.WriteString("static const char *_pattern_names[] = {")
+		for i, re := range cfg.Regexps {
+			if i > 0 {
+				cb.WriteString(", ")
+			}
+			fmt.Fprintf(&cb, "%q", re.Name)
+		}
+		cb.WriteString("};\nconst char *pattern_name(int id) { int n=sizeof(_pattern_names)/sizeof(*_pattern_names); return (id>=0&&id<n)?_pattern_names[id]:\"\"; }\n")
+	}
+	hContent = hb.String()
+	cContent = cb.String()
+	return
 }
 
 // genCPartsForEntry generates the .h and .c fragments for one regex entry.

@@ -3,7 +3,7 @@ wasm_file:     "regexps.wasm"
 import_module: "regexps"
 stub_file:     "stubs.rs"
 
-regexes:
+regexps:
   - pattern:   '^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$'
     match_func: "match_email"
 

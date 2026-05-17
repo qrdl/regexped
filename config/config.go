@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"github.com/goccy/go-yaml"
 )
 
 // BuildConfig is the top-level structure of the YAML config file.
@@ -19,13 +19,136 @@ type BuildConfig struct {
 	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
 	MaxDFAStates int          `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int          `yaml:"max_tdfa_regs"`  // 0 = default (32)
-	Regexes      []RegexEntry `yaml:"regexes"`
+	Regexps      []RegexEntry `yaml:"regexps"`
+	Sets         []SetConfig  `yaml:"sets"` // optional set composition entries
+}
+
+// SetConfig describes one `sets:` entry in the YAML config.
+type SetConfig struct {
+	Name        string          `yaml:"name"`          // set name; must be unique within the file
+	FindAny     string          `yaml:"find_any"`      // export name for find_any (non-anchored, first match)
+	FindAll     string          `yaml:"find_all"`      // export name for find_all (non-anchored, all matches)
+	Match       string          `yaml:"match"`         // export name for match (anchored at position 0)
+	BatchSize   int             `yaml:"batch_size"`    // output buffer hint (default 256); stub-gen only
+	Patterns    PatternSelector `yaml:"patterns"`      // which regexps belong to this set
+	EmitNameMap bool            `yaml:"emit_name_map"` // generate pattern_name / patternName helper in stubs (does not change WASM)
+}
+
+// PatternSelector selects patterns for a set. It can be the scalar string "all"
+// or a list of pattern names.
+type PatternSelector struct {
+	All   bool     // true when the YAML value was the scalar "all"
+	Names []string // pattern names when All is false
+}
+
+// UnmarshalYAML implements yaml.InterfaceUnmarshaler for PatternSelector.
+// Accepts either the scalar string "all" or a sequence of strings.
+func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var raw interface{}
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+	switch v := raw.(type) {
+	case string:
+		if v == "all" {
+			p.All = true
+			return nil
+		}
+		return fmt.Errorf("patterns: expected \"all\" or a list of pattern names, got %q", v)
+	case []interface{}:
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return fmt.Errorf("patterns: list items must be strings")
+			}
+			p.Names = append(p.Names, s)
+		}
+		return nil
+	}
+	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names")
+}
+
+// ValidateSets validates the `sets:` block against the `regexps:` list.
+// Returns an error if any set name is not unique, any pattern reference is
+// unknown, a set entry has none of find_any/find_all/match set, or patterns
+// is empty.
+func ValidateSets(cfg *BuildConfig) error {
+	// Build name → index map.
+	nameIdx := make(map[string]int, len(cfg.Regexps))
+	for i, re := range cfg.Regexps {
+		if re.Name != "" {
+			if _, dup := nameIdx[re.Name]; dup {
+				return fmt.Errorf("duplicate regex name %q", re.Name)
+			}
+			nameIdx[re.Name] = i
+		}
+	}
+
+	setNames := make(map[string]bool)
+	exportNames := make(map[string]string) // export name → owner ("set X" or "regex Y")
+	// Seed with per-regex export names so set exports can't collide with them.
+	for _, re := range cfg.Regexps {
+		owner := "regex"
+		if re.Name != "" {
+			owner = fmt.Sprintf("regex %q", re.Name)
+		} else if re.Pattern != "" {
+			owner = fmt.Sprintf("regex %q", re.Pattern)
+		}
+		for _, name := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc, re.NamedGroupsFunc} {
+			if name == "" {
+				continue
+			}
+			if prior, dup := exportNames[name]; dup {
+				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
+			}
+			exportNames[name] = owner
+		}
+	}
+	for _, s := range cfg.Sets {
+		if s.Name == "" {
+			return fmt.Errorf("sets entry missing required name field")
+		}
+		if setNames[s.Name] {
+			return fmt.Errorf("duplicate set name %q", s.Name)
+		}
+		setNames[s.Name] = true
+		if s.FindAny == "" && s.FindAll == "" && s.Match == "" {
+			return fmt.Errorf("set %q: at least one of find_any, find_all, or match must be set", s.Name)
+		}
+		owner := fmt.Sprintf("set %q", s.Name)
+		for _, name := range []string{s.FindAny, s.FindAll, s.Match} {
+			if name == "" {
+				continue
+			}
+			if prior, dup := exportNames[name]; dup {
+				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
+			}
+			exportNames[name] = owner
+		}
+		if !s.Patterns.All && len(s.Patterns.Names) == 0 {
+			return fmt.Errorf("set %q: patterns is required (use \"all\" or a non-empty list of pattern names)", s.Name)
+		}
+		if !s.Patterns.All {
+			seen := make(map[string]bool, len(s.Patterns.Names))
+			for _, pname := range s.Patterns.Names {
+				if _, ok := nameIdx[pname]; !ok {
+					return fmt.Errorf("set %q: unknown pattern name %q", s.Name, pname)
+				}
+				if seen[pname] {
+					return fmt.Errorf("set %q: pattern %q listed more than once", s.Name, pname)
+				}
+				seen[pname] = true
+			}
+		}
+	}
+	return nil
 }
 
 // RegexEntry describes a single regex pattern and the functions to generate for it.
 // One or more of the Func fields must be set; only those stubs are generated.
 // The WASM export names are derived automatically from the function type.
 type RegexEntry struct {
+	Name    string `yaml:"name"` // optional; used by sets: for pattern selection
 	Pattern string `yaml:"pattern"`
 
 	// Optional function names — only those set are compiled and stubbed.
@@ -69,8 +192,8 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return BuildConfig{}, fmt.Errorf("parse config %s: %w", configPath, err)
 	}
-	if len(cfg.Regexes) == 0 {
-		return BuildConfig{}, fmt.Errorf("config %s has no regexes", configPath)
+	if len(cfg.Regexps) == 0 {
+		return BuildConfig{}, fmt.Errorf("config %s has no regexps", configPath)
 	}
 
 	// Resolve all paths relative to the config file's directory.
@@ -78,6 +201,10 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	cfg.WasmFile = resolveFilePath(configDir, cfg.WasmFile)
 	cfg.StubFile = resolveFilePath(configDir, cfg.StubFile)
 	cfg.WasmMerge = resolveFilePath(configDir, cfg.WasmMerge)
+
+	if err := ValidateSets(&cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
 
 	return cfg, nil
 }

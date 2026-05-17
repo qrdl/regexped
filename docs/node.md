@@ -10,7 +10,7 @@ wasm_file:     "urls.wasm"
 import_module: "urls"
 stub_file:     "regex.ts"    # .ts → TypeScript stub; use .js for plain JS
 
-regexes:
+regexps:
   - pattern:           'https?://(?P<host>[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?'
     named_groups_func: "extract_domain"
 ```

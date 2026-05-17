@@ -14,8 +14,9 @@ stub_type: "rust"          # optional; overrides extension-based type inference:
 max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
 
-regexes:
+regexps:
   - pattern: 'https?://...' # RE2 regex pattern
+    name: "my_pattern"      # required when referenced by sets: patterns list
 
     # One or more func fields — only those set are compiled and stubbed.
     # The func name becomes both the WASM export name and the generated function name.
@@ -24,6 +25,14 @@ regexes:
     find_func:         "url_find"          # non-anchored find
     groups_func:       "url_groups"        # anchored match with all capture groups
     named_groups_func: "url_named_groups"  # anchored match with named capture groups
+
+sets:
+  - name: "my_set"             # unique set name
+    find_all: "scan_all"       # non-anchored: all matches, streamed in batches
+    find_any: "scan_first"     # non-anchored: first match only (optional)
+    match: "validate"          # anchored at position 0 (optional)
+    emit_name_map: true        # emit patternName(id) lookup helper in stubs
+    patterns: all              # "all" or list of name: values from regexps:
 ```
 
 All paths in the config file are resolved relative to the config file's directory.
@@ -141,7 +150,7 @@ Generates a single ES module. Exports an `init(wasm)` function that must be call
 
 | Config field | Generated JS export | Returns |
 |---|---|---|
-| `match_func` | `function <func>(input)` | `boolean` — true if full input matches |
+| `match_func` | `function <func>(input)` | `[number, boolean]` — `[endPos, matched]` |
 | `find_func` | `function* <func>(input)` | generator yielding `[start, end]` per match |
 | `groups_func` | `function* <func>(input)` | generator yielding `Array<[start,end]\|null>` per match |
 | `named_groups_func` | `function* <func>(input)` | generator yielding `Object` (name→`[start,end]`) per match |
@@ -197,15 +206,56 @@ Compiles each regex pattern to a single WASM module. The output mode is selected
 |---|---|---|
 | `--config` | `regexped.yaml` | YAML config file |
 | `--output`, `-o` | config `wasm_file` | Output WASM file; `-` writes to stdout |
+| `--diag-json` | (none) | Write set-composition diagnostics as JSON to this path; `-` for stdout |
 
 **Required config fields:**
 
 | Field | Notes |
 |---|---|
 | `wasm_file` | Required unless `--output` is given |
-| `regexes` | One or more patterns to compile |
+| `regexps` | One or more patterns to compile |
 
-Entries with no `_func` fields are silently skipped.
+Entries with no `_func` fields produce no individual exports. If such an
+entry is also not referenced by any `sets:` block, it is silently skipped;
+otherwise it participates only as a member of the set(s) that select it.
+
+#### `sets:` block — multi-pattern set composition
+
+When the config contains a `sets:` block, `compile` also emits multi-pattern set-match functions. Each set entry produces up to three exported WASM functions.
+
+```yaml
+regexps:
+  - name: aws_key      # name is required for sets: pattern references
+    pattern: 'AKIA[0-9A-Z]{16}'
+  - name: github_pat
+    pattern: 'ghp_[0-9a-zA-Z]{36}'
+
+sets:
+  - name: secret_scanner
+    find_all: scan_secrets   # non-anchored: returns all matches with positions
+    find_any: scan_first     # non-anchored: returns first match only (optional)
+    match: validate_secret   # anchored at position 0 (optional)
+    batch_size: 256          # output buffer size (stub-gen knob; default 256)
+    emit_name_map: true      # emit pattern_name(id) helper in stubs
+    patterns:
+      - aws_key              # list of regexps.name values
+      - github_pat
+      # or: patterns: "all" to include every entry in regexps:
+```
+
+| `sets:` field | Required | Description |
+|---|---|---|
+| `name` | Yes | Unique set name |
+| `find_all` | At least one | Export name for non-anchored all-matches function |
+| `find_any` | At least one | Export name for non-anchored first-match function |
+| `match` | At least one | Export name for anchored match function (position 0) |
+| `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
+| `batch_size` | No | Output buffer hint for stub iterators (default 256) |
+| `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
+
+The `name:` field on `regexps:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
+
+See [sets.md](sets.md) for full pipeline details and output tuple formats.
 
 ---
 

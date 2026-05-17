@@ -1,0 +1,129 @@
+# Custom set-mode tests for regexped.
+# Run with: go run . --sets custom-sets.txt
+#
+# Each block has >=2 patterns and test strings where greedy and non-greedy
+# semantics produce different match extents, verifying that isolatedFallback
+# patterns (non-greedy) use leftmostFirst=true DFA and return correct results.
+#
+# Note: the set reports overlapping matches (one per start position), unlike
+# Go's FindAllStringIndex which is non-overlapping. Expected col4 values
+# include all matches at every start position where the pattern fires.
+# The key distinguishing inputs are:
+#   "axbxb": a.*?b=0-3 (stops at first b) vs a.*b=0-5 (extends to last b)
+#   "aXaYa": a.*?a=0-3,2-5 (short overlapping) vs a.*a=0-5,2-5
+#
+# Format: col0=anchored; col1=first find; col2="-"; col3="-"; col4=all finds.
+# Sets mode uses col4 (preferred) or col1 (fallback) for validation.
+# ============================================================
+# Category S1: Non-greedy .*? vs greedy .* in sets
+# ============================================================
+SetNonGreedyDotStar
+strings
+""
+"ab"
+"axb"
+"axbxb"
+"axbaxb"
+"axbaxbaxb"
+regexps
+"a.*?b"
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;0-3;-;-;0-3
+-;0-3;-;-;0-3
+-;0-3;-;-;0-3,3-6
+-;0-3;-;-;0-3,3-6,6-9
+"a.*b"
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;0-3;-;-;0-3
+-;0-5;-;-;0-5
+-;0-6;-;-;0-6,3-6
+-;0-9;-;-;0-9,3-9,6-9
+# ============================================================
+# Category S2: Non-greedy .*? between identical delimiters
+# ============================================================
+SetNonGreedyDelim
+strings
+""
+"aa"
+"aXa"
+"aXaYa"
+"aXaYaZa"
+regexps
+"a.*?a"
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;0-3;-;-;0-3
+-;0-3;-;-;0-3,2-5
+-;0-3;-;-;0-3,2-5,4-7
+"a.*a"
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;0-3;-;-;0-3
+-;0-5;-;-;0-5,2-5
+-;0-7;-;-;0-7,2-7,4-7
+# ============================================================
+# Category S3: SQL classifier — case-insensitive, ^-anchored
+# ============================================================
+# Mirrors compile/testdata/set/sql_validator/patterns.yaml. These patterns
+# carry (?i) so they have no mandatory literal and route to the fallback
+# bucket. find_all must still report exactly one match per pattern at the
+# anchored position (or none), verifying that fallback patterns are not
+# silently dropped by the set-find code path.
+SetSQLClassifier
+strings
+"SELECT 1"
+"  SELECT * FROM t"
+"select 1"
+"INSERT INTO t VALUES(1)"
+"UPDATE t SET x=1"
+"DELETE FROM t"
+"BEGIN"
+"NOTAKEYWORD"
+regexps
+"(?i)^\\s*SELECT\\b"
+-;0-6;-;-;0-6
+-;0-8;-;-;0-8
+-;0-6;-;-;0-6
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)^\\s*INSERT\\s+INTO\\b"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-11;-;-;0-11
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)^\\s*UPDATE\\s+\\w"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-8;-;-;0-8
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)^\\s*DELETE\\s+FROM\\b"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-11;-;-;0-11
+-;-;-;-;-
+-;-;-;-;-
+"(?i)^\\s*BEGIN\\b"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-5;-;-;0-5
+-;-;-;-;-

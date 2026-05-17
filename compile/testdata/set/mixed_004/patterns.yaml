@@ -1,0 +1,104 @@
+# mixed_004: real-world WAF-style pattern set
+# Combines patterns exercising multiple code paths:
+#   - patterns sharing the same mandatory literal (suffix merge)
+#   - patterns with distinct literals (separate literal buckets)
+#   - patterns with no mandatory literal (fallback buckets)
+#   - anchored patterns (trivial prefix)
+# Source: inspired by common WAF rules and the perftest corpus.
+patterns:
+  # Secret scanning — distinct literals, find_all path
+  - name: aws_key
+    pattern: 'AKIA[0-9A-Z]{16}'
+  - name: aws_secret
+    pattern: 'aws_secret_access_key\s*=\s*[0-9a-zA-Z/+]{40}'
+  - name: github_pat
+    pattern: 'ghp_[0-9a-zA-Z]{36}'
+  - name: github_oauth
+    pattern: 'gho_[0-9a-zA-Z]{36}'
+  - name: github_app
+    pattern: 'ghu_[0-9a-zA-Z]{36}'
+  - name: jwt_header
+    pattern: 'eyJ[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]{20,}\.'
+  - name: slack_token
+    pattern: 'xox[baprs]-[0-9a-zA-Z\-]{10,}'
+  - name: stripe_live
+    pattern: 'sk_live_[0-9a-zA-Z]{24,}'
+  - name: stripe_test
+    pattern: 'sk_test_[0-9a-zA-Z]{24,}'
+  - name: google_api
+    pattern: 'AIza[0-9A-Za-z\-_]{35}'
+
+  # URL patterns — shared "http" literal prefix (suffix merge exercised)
+  - name: http_url
+    pattern: 'https?://[a-zA-Z0-9.\-]+'
+  - name: http_url_path
+    pattern: 'https?://[a-zA-Z0-9.\-]+/[^\s]*'
+  - name: http_basic_auth
+    pattern: 'https?://[^:]+:[^@]+@[a-zA-Z0-9.\-]+'
+
+  # Email patterns — shared "@" and "." structure
+  - name: email
+    pattern: '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+
+  # IP addresses — shared digit patterns
+  - name: ipv4
+    pattern: '\b(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+
+  # Path traversal — WAF-style, no mandatory literal (fallback)
+  - name: path_traversal_dots
+    pattern: '\.{2,}/'
+  - name: path_traversal_encoded
+    pattern: '%2[eE]%2[eE]'
+
+  # SQL injection keywords — fallback (alternation, no single mandatory literal)
+  - name: sqli_union
+    pattern: '(?i)\bUNION\s+(?:ALL\s+)?SELECT\b'
+  - name: sqli_comment
+    pattern: '--[^\n]*|/\*.*?\*/'
+
+  # XSS patterns — shared "<script" literal
+  - name: xss_script_tag
+    pattern: '<[Ss][Cc][Rr][Ii][Pp][Tt][^>]*>'
+  - name: xss_onload
+    pattern: '\bon[a-zA-Z]+\s*=\s*[^\s>]+'
+
+sets:
+  - name: secret_scanner
+    find_all: scan_secrets
+    emit_name_map: true
+    patterns:
+      - aws_key
+      - aws_secret
+      - github_pat
+      - github_oauth
+      - github_app
+      - jwt_header
+      - slack_token
+      - stripe_live
+      - stripe_test
+      - google_api
+
+  - name: waf_scanner
+    find_all: scan_waf
+    emit_name_map: true
+    patterns:
+      - http_url
+      - http_url_path
+      - http_basic_auth
+      - email
+      - ipv4
+      - path_traversal_dots
+      - path_traversal_encoded
+      - sqli_union
+      - sqli_comment
+      - xss_script_tag
+      - xss_onload
+
+  - name: url_validator
+    match: validate_url
+    patterns:
+      - http_url
+      - http_url_path
+
+expect:
+  set_count: 3

@@ -147,3 +147,119 @@ TDFA uses the same DFA table format described above (u8 or u16 state IDs,
 with optional byte-class compression). Capture register operations are emitted
 as inline WASM locals and `br_table` dispatch in the function body — they are
 not stored in the table.
+
+---
+
+## Set composition exports
+
+When the config contains a `sets:` block, `regexped compile` emits additional
+WASM functions for multi-pattern matching.
+
+### find_any / find_all — non-anchored set match
+
+```wasm
+;; Set find function (one body; exported under find_any and/or find_all names).
+;; Scans input from start_pos, writes up to out_cap match tuples to out_ptr,
+;; returns count of tuples written (0 = exhausted).
+(func $find_all
+    (param $in_ptr i32) (param $in_len i32)
+    (param $out_ptr i32) (param $out_cap i32)
+    (param $start_pos i32)
+    (result i32))
+```
+
+Each tuple written to `out_ptr` is 12 bytes (3 × i32):
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0 | `pattern_id` i32 | Global YAML order index of the matching pattern |
+| +4 | `start` i32 | Absolute byte offset of the match start |
+| +8 | `length` i32 | Byte length of the match |
+
+Tuples within a batch are emitted in non-decreasing `start` order.
+
+**Capacity precondition.** The caller MUST size `out_cap` to be at least the
+maximum same-start fan-out — that is, the maximum number of tuples the
+function may produce at a single `start` position. A safe upper bound is the
+number of patterns in the set (each global pattern ID can appear at most
+once per `start` in `find_all` output), so `out_cap ≥ patterns_in_set` is
+always sufficient. Generated stubs enforce this floor automatically; custom
+hosts must enforce it themselves.
+
+**Resume rule.** After a batch of `count` tuples, the host advances
+
+```
+start_pos = last.start + 1
+```
+
+and re-calls until the function returns 0. The WASM scan is
+position-by-position: when the buffer fills it exits at the top of the next
+iteration, so the only positions guaranteed to have been visited are those
+`≤ last.start`. Advancing by `last.length` (or `end`) would skip positions
+inside the last match's span that the scan has not yet visited, silently
+dropping matches at those positions.
+
+The capacity precondition above guarantees that when the buffer fills it
+does so on a position boundary (no mid-position truncation), so a single
+`+1` step is sufficient to resume without losing same-position matches.
+Hosts that bypass the precondition and use a smaller `out_cap` must dedupe
+`(pattern_id, start)` pairs across batches to handle mid-position
+truncation; the ABI provides no continuation token.
+
+`find_any` uses the same function body with `out_cap=1, start_pos=0` and is
+exempt from the precondition because it stops at the first match.
+
+### match — anchored set match
+
+```wasm
+;; Anchored match: tries all patterns from position 0.
+;; Writes up to out_cap match tuples to out_ptr, returns count.
+(func $match
+    (param $in_ptr i32) (param $in_len i32)
+    (param $out_ptr i32) (param $out_cap i32)
+    (result i32))
+```
+
+Each tuple written to `out_ptr` is 12 bytes (3 × i32), the same layout as
+`find_all`/`find_any`:
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0 | `pattern_id` i32 | Global YAML order index |
+| +4 | `start` i32 | Always 0 for anchored match |
+| +8 | `length` i32 | Byte length of the match |
+
+Returns the number of matching patterns written (0 if none match anchored
+at position 0). Anchored match is not batched — one call returns all matching
+patterns, up to `out_cap`. To receive every matching pattern, callers must
+size `out_cap` to hold the maximum same-position fan-out;
+`out_cap ≥ patterns_in_set` is always sufficient.
+
+> **Note.** The generated `match` wrappers in the Rust/Go/JS/TS/AS/C stubs
+> are deliberately "first match" convenience APIs: they call the WASM export
+> with `out_cap = 1` and return a single match (or none). This mirrors the
+> relationship between `find_any` (first occurrence) and `find_all` (every
+> occurrence). Hosts that need every anchored match should call the WASM
+> export directly with a larger `out_cap` and decode the tuple buffer as
+> described above.
+
+### Suffix DFA functions (internal)
+
+Each literal bucket gets one suffix DFA function. It writes match tuples
+directly into the caller's output buffer and returns the count written:
+
+```wasm
+;; Runs the merged suffix DFA starting at lPos.
+;; Writes (pattern_id i32, start i32, length i32) tuples to out_ptr.
+;; May write multiple tuples per call: a bucket can hold several patterns,
+;; and every pattern in the bucket whose suffix matches at lPos emits one
+;; tuple (up to out_cap and subject to valid_mask). Returns the count.
+(func $suffix_dfa_N
+    (param $ptr i32) (param $start i32) (param $len i32)
+    (param $lPos i32) (param $out_ptr i32) (param $out_cap i32)
+    (param $valid_mask i32)
+    (result i32))
+```
+
+These are called via direct `call` (not `call_indirect`) from the set match
+body using statically known function indices, and are not exported.

@@ -2,7 +2,7 @@ wasm_file:     "regexps.wasm"
 import_module: "regexps"
 stub_file:     "regex.js"
 
-regexes:
+regexps:
   - pattern:   'ghp_[A-Za-z0-9]{36}'
     find_func: "find_github_token"
 

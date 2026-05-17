@@ -1,0 +1,12 @@
+# conflict_007: non_splittable_in_alternate
+# Patterns where the only literal candidates are inside alternations —
+# findMandatoryLitRec returns nil for OpAlternate, so mandLit==nil.
+# These route to compileFallback.
+options:
+  budget_states: 1
+patterns:
+  - pattern: '(?:error|warn|fatal)'
+  - pattern: '(?:foo|bar|baz)\d+'
+expect:
+  bucket_count: 2
+  fallback_count: 2

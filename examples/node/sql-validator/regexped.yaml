@@ -1,0 +1,22 @@
+wasm_file:     "patterns.wasm"
+import_module: "sql"
+stub_file:     "stubs.ts"
+
+regexps:
+  - name: "select"
+    pattern: 'SELECT\s+.+\s+FROM\s+\w[\w.]*(\s+.*)?'
+
+  - name: "insert"
+    pattern: 'INSERT\s+INTO\s+\w[\w.]*\s*(?:\([^)]*\)\s*)?VALUES\s*\(.*\)(\s+.*)?'
+
+  - name: "update"
+    pattern: 'UPDATE\s+\w[\w.]*\s+SET\s+\w.*'
+
+  - name: "delete"
+    pattern: 'DELETE\s+FROM\s+\w[\w.]*(\s+.*)?'
+
+sets:
+  - name: "sql"
+    match: "validate_sql"
+    emit_name_map: true
+    patterns: ["select", "insert", "update", "delete"]

@@ -133,7 +133,7 @@ func TestGenJSStubFile(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regex.js",
-		Regexes: []config.RegexEntry{
+		Regexps: []config.RegexEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
 			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
 		},
@@ -145,7 +145,7 @@ func TestGenJSStubFile(t *testing.T) {
 	for _, sub := range []string{
 		"url_match", "url_find",
 		"tok_groups", "tok_named",
-		"export async function init", "WebAssembly.instantiate", "_SLOTS",
+		"export async function init", "WebAssembly.instantiate", "_inBase", "_outBase",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genJSStubFile: output missing %q", sub)
@@ -157,7 +157,7 @@ func TestGenTSStubFile(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regex.ts",
-		Regexes: []config.RegexEntry{
+		Regexps: []config.RegexEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
 			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
 		},
@@ -173,7 +173,7 @@ func TestGenTSStubFile(t *testing.T) {
 		"WebAssembly.Module", "WebAssembly.instantiate",
 		"Generator<[number, number]>",
 		"Generator<Record<string, [number, number]>>",
-		"_SLOTS",
+		"_inBase", "_outBase",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genTSStubFile: output missing %q", sub)
@@ -483,7 +483,7 @@ func TestGenJSStubFileWithNamedPattern(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regex.js",
-		Regexes: []config.RegexEntry{{
+		Regexps: []config.RegexEntry{{
 			NamedGroupsFunc: "url_named",
 			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
 		}},
@@ -503,7 +503,7 @@ func TestGenTSStubFileWithNamedPattern(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regex.ts",
-		Regexes: []config.RegexEntry{{
+		Regexps: []config.RegexEntry{{
 			NamedGroupsFunc: "url_named",
 			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
 		}},
@@ -595,7 +595,7 @@ func TestGenASStubNamedGroupsFuncError(t *testing.T) {
 	entries := []config.RegexEntry{
 		{NamedGroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
 	}
-	_, err := genASStubFile(entries, "mymod")
+	_, err := genASStubFile(config.BuildConfig{Regexps: entries, ImportModule: "mymod"})
 	if err == nil {
 		t.Fatal("genASStubFile: expected error for named_groups_func, got nil")
 	}
@@ -605,7 +605,7 @@ func TestGenASStubFileGroupsFunc(t *testing.T) {
 	entries := []config.RegexEntry{
 		{GroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
 	}
-	out, err := genASStubFile(entries, "mymod")
+	out, err := genASStubFile(config.BuildConfig{Regexps: entries, ImportModule: "mymod"})
 	if err != nil {
 		t.Fatalf("genASStubFile: %v", err)
 	}
@@ -631,7 +631,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 			cfg: config.BuildConfig{
 				StubType:     "rust",
 				ImportModule: "mymod",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -640,7 +640,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 			cfg: config.BuildConfig{
 				StubType:     "go",
 				ImportModule: "mymod",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -650,7 +650,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 				StubType:     "js",
 				ImportModule: "mymod",
 				Output:       "merged.wasm",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -660,7 +660,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 				StubType:     "ts",
 				ImportModule: "mymod",
 				Output:       "merged.wasm",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -670,7 +670,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 				StubType:     "c",
 				ImportModule: "mymod",
 				StubFile:     "stub.h",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -679,7 +679,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 			cfg: config.BuildConfig{
 				StubType:     "as",
 				ImportModule: "mymod",
-				Regexes:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
 			},
 		},
 	}
@@ -704,5 +704,210 @@ func TestWriteStub(t *testing.T) {
 	}
 	if string(data) != "hello" {
 		t.Errorf("writeStub: got %q, want %q", string(data), "hello")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Set stub tests (Phase 5)
+
+// setTestCfg builds a BuildConfig with two named patterns and one set that
+// exercises all three export types: find_all, find_any, and match.
+func setTestCfg() config.BuildConfig {
+	return config.BuildConfig{
+		ImportModule: "mymod",
+		Regexps: []config.RegexEntry{
+			{Name: "pat_a", Pattern: `foo\d+`},
+			{Name: "pat_b", Pattern: `bar\w+`},
+		},
+		Sets: []config.SetConfig{
+			{
+				Name:        "scanner",
+				FindAll:     "scan_all",
+				FindAny:     "scan_any",
+				Match:       "validate",
+				EmitNameMap: true,
+				Patterns:    config.PatternSelector{All: true},
+			},
+		},
+	}
+}
+
+func TestGenRustSetInner(t *testing.T) {
+	cfg := setTestCfg()
+	out := genRustSetInner(cfg)
+	required := []string{
+		"SetMatch",
+		"range(self)",
+		"scan_all",
+		"scan_any",
+		"validate",
+		"pattern_name",
+		"\"pat_a\"",
+		"\"pat_b\"",
+		"ffi_scan_all",
+		"ffi_validate",
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genRustSetInner: missing %q", s)
+		}
+	}
+	if strings.Contains(out, "SetAnchorMatch") {
+		t.Error("genRustSetInner: should not contain SetAnchorMatch (removed in 5.4.1)")
+	}
+}
+
+func TestGenGoSetSection(t *testing.T) {
+	cfg := setTestCfg()
+	out := genGoSetSection(cfg, "mymod")
+	required := []string{
+		"SetMatch",
+		"ScanAll",
+		"ScanAny",
+		"Validate",
+		"PatternName",
+		"scan_all", // wasmimport directive
+		"validate", // wasmimport directive
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genGoSetSection: missing %q", s)
+		}
+	}
+}
+
+func TestGenJSSetSection(t *testing.T) {
+	cfg := setTestCfg()
+	out := genJSSetSection(cfg)
+	required := []string{
+		"scan_all",
+		"scan_any",
+		"validate",
+		"patternName",
+		"patternId",
+		"_exp",
+		"_mem",
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genJSSetSection: missing %q", s)
+		}
+	}
+	if strings.Contains(out, "_inst") {
+		t.Errorf("genJSSetSection: should not contain _inst")
+	}
+}
+
+func TestGenTSSetSection(t *testing.T) {
+	cfg := setTestCfg()
+	out := genTSSetSection(cfg)
+	required := []string{
+		"SetMatch",
+		"scan_all",
+		"scan_any",
+		"validate",
+		"patternName",
+		"_exp",
+		"_mem",
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genTSSetSection: missing %q", s)
+		}
+	}
+	if strings.Contains(out, "_inst") {
+		t.Errorf("genTSSetSection: should not contain _inst")
+	}
+	if strings.Contains(out, "SetAnchorMatch") {
+		t.Errorf("genTSSetSection: SetAnchorMatch should be removed (unified into SetMatch)")
+	}
+}
+
+func TestGenCStubFilesWithSets(t *testing.T) {
+	cfg := setTestCfg()
+	h, c, err := genCStubFilesWithSets(cfg, "stub.h")
+	if err != nil {
+		t.Fatalf("genCStubFilesWithSets: %v", err)
+	}
+	for _, s := range []string{"rx_set_match_t", "rx_set_anchor_t", "scan_all", "validate", "pattern_name"} {
+		if !strings.Contains(h, s) && !strings.Contains(c, s) {
+			t.Errorf("genCStubFilesWithSets: missing %q in output", s)
+		}
+	}
+}
+
+func TestGenASSetSection(t *testing.T) {
+	cfg := setTestCfg()
+	out := genASSetSection(cfg)
+	required := []string{
+		"SetMatch",
+		"scan_all_next",
+		"scan_all_reset",
+		"scan_any",
+		"validate",
+		"patternName",
+	}
+	disallowed := []string{"Generator<", "function*", "yield"}
+	for _, s := range disallowed {
+		if strings.Contains(out, s) {
+			t.Errorf("genASSetSection: must not contain %q (AS has no generator support)", s)
+		}
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("genASSetSection: missing %q", s)
+		}
+	}
+}
+
+func TestRustStub_WithSets(t *testing.T) {
+	cfg := setTestCfg()
+	inner, err := genRustStubsInner(cfg.Regexps, cfg.ImportModule)
+	if err != nil {
+		t.Fatalf("genRustStubsInner: %v", err)
+	}
+	inner += genRustSetInner(cfg)
+	out := wrapRustModule(inner, cfg.ImportModule)
+	if !strings.Contains(out, "SetMatch") {
+		t.Error("rust stub with sets: missing SetMatch type")
+	}
+	if !strings.Contains(out, "pub mod "+cfg.ImportModule) {
+		t.Error("rust stub with sets: missing module wrapper")
+	}
+}
+
+func TestSetSection_NoSets_Empty(t *testing.T) {
+	cfg := config.BuildConfig{ImportModule: "m", Regexps: []config.RegexEntry{{Pattern: `foo`}}}
+	if s := genRustSetInner(cfg); s != "" {
+		t.Errorf("genRustSetInner with no sets: got non-empty %q", s)
+	}
+	if s := genGoSetSection(cfg, "m"); s != "" {
+		t.Errorf("genGoSetSection with no sets: got non-empty %q", s)
+	}
+	if s := genJSSetSection(cfg); s != "" {
+		t.Errorf("genJSSetSection with no sets: got non-empty %q", s)
+	}
+	if s := genTSSetSection(cfg); s != "" {
+		t.Errorf("genTSSetSection with no sets: got non-empty %q", s)
+	}
+	if s := genASSetSection(cfg); s != "" {
+		t.Errorf("genASSetSection with no sets: got non-empty %q", s)
+	}
+}
+
+func TestSetSection_FindAllOnly(t *testing.T) {
+	cfg := config.BuildConfig{
+		ImportModule: "m",
+		Regexps:      []config.RegexEntry{{Pattern: `foo`}},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	rust := genRustSetInner(cfg)
+	if !strings.Contains(rust, "find_all") {
+		t.Error("find_all not in Rust set stub")
+	}
+	if strings.Contains(rust, "fn validate") || strings.Contains(rust, "ffi_find_any") {
+		t.Error("unexpected exports in find_all-only Rust stub")
 	}
 }

@@ -1,6 +1,6 @@
 GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/*/*.go merge/*.go))
 
-.PHONY: re2test perftest examples clean unittest lint fmt
+.PHONY: re2test perftest perftest-check examples clean unittest lint fmt
 
 build: regexped
 
@@ -12,6 +12,9 @@ re2test: build
 
 perftest: build
 	$(MAKE) -C perftest
+
+perftest-check: build
+	$(MAKE) -C perftest perftest-check
 
 examples: build
 	$(MAKE) -C examples

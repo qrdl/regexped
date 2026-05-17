@@ -1,0 +1,12 @@
+[package]
+name = "secret-scanner"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "secret-scanner"
+path = "main.rs"
+
+[dependencies]
+wasmtime = "25"
+anyhow = "1"

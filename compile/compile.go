@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -368,8 +369,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					revDFA := newDFA(revProg, false, false)
 					revTable := dfaTableFrom(revDFA)
 					if revTable.numStates+1 <= 256 &&
-						(lap.anchored || (!revTable.acceptStates[revTable.startState] &&
-							!revTable.midAcceptStates[revTable.startState])) {
+						(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
+							revTable.midAcceptStates[revTable.startState] == 0)) {
 						revTableBase := utils.PageAlign(l.tableEnd)
 						revL := buildDFALayout(revTable, revTableBase, true, false, 0)
 						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
@@ -814,22 +815,33 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	return assembleModule(compiled, memPages, standalone), lastTableEnd, nil
 }
 
-// CmdCompile compiles all regex patterns from cfg to a single WASM module.
+// CmdCompile compiles all regex patterns (and optional sets) from cfg to a
+// single WASM module. When cfg.Sets is non-empty, CompileFile is used instead
+// of the bare Compile path, so set-match functions are included in the output.
 // output is the output path (absolute, relative to cwd, or "-" for stdout).
-// Mode is auto-selected from cfg.Output: empty → standalone (own memory, exported as "memory");
-// non-empty → embedded (imports "main" memory + own memory for tables, for use with regexped merge).
+// Mode is auto-selected from cfg.Output: empty → standalone; non-empty → embedded.
 func CmdCompile(cfg config.BuildConfig, output string) error {
 	outPath := output
-	slog.Info("Compiling regexes", "count", len(cfg.Regexes), "output", outPath)
+	slog.Info("Compiling regexps", "count", len(cfg.Regexps), "output", outPath)
 
-	compOpts := CompileOptions{
-		MaxDFAStates: cfg.MaxDFAStates,
-		MaxTDFARegs:  cfg.MaxTDFARegs,
-	}
-	standalone := cfg.Output == ""
-	wasmBytes, _, err := Compile(cfg.Regexes, 0, standalone, compOpts)
-	if err != nil {
-		return fmt.Errorf("compile: %w", err)
+	var wasmBytes []byte
+	if len(cfg.Sets) > 0 {
+		var err error
+		wasmBytes, _, err = CompileFile(cfg, output)
+		if err != nil {
+			return fmt.Errorf("compile: %w", err)
+		}
+	} else {
+		compOpts := CompileOptions{
+			MaxDFAStates: cfg.MaxDFAStates,
+			MaxTDFARegs:  cfg.MaxTDFARegs,
+		}
+		standalone := cfg.Output == ""
+		var err error
+		wasmBytes, _, err = Compile(cfg.Regexps, 0, standalone, compOpts)
+		if err != nil {
+			return fmt.Errorf("compile: %w", err)
+		}
 	}
 
 	if outPath == "-" {
@@ -844,6 +856,88 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 	}
 	slog.Info("Done", "bytes", len(wasmBytes))
 	return nil
+}
+
+// CmdWriteDiagJSON re-runs CompileFile, collects set diagnostics, and writes
+// the Diagnostics structure as JSON to diagPath (or stdout if diagPath == "-").
+// Independent of slog level — the JSON is always complete.
+func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
+	if len(cfg.Sets) == 0 {
+		return nil
+	}
+	// Gather diagnostics by re-running CompileFile (it already computed them;
+	// for simplicity we re-run rather than threading Diagnostics through CmdCompile).
+	var prefixPool, suffixPool dfaPool
+	nameIdx := make(map[string]int, len(cfg.Regexps))
+	for i, re := range cfg.Regexps {
+		if re.Name != "" {
+			nameIdx[re.Name] = i
+		}
+	}
+	diag := Diagnostics{PatternsTotal: len(cfg.Regexps)}
+	for _, sc := range cfg.Sets {
+		var selectedIdx []int
+		if sc.Patterns.All {
+			for i := range cfg.Regexps {
+				selectedIdx = append(selectedIdx, i)
+			}
+		} else {
+			for _, name := range sc.Patterns.Names {
+				if idx, ok := nameIdx[name]; ok {
+					selectedIdx = append(selectedIdx, idx)
+				}
+			}
+		}
+		var infos []*PatternInfo
+		var globalIDs []int
+		var droppedRefs []PatternRef
+		for _, idx := range selectedIdx {
+			re := cfg.Regexps[idx]
+			if re.CaptureStubsRequested() {
+				diag.CaptureBearing++
+				droppedRefs = append(droppedRefs, PatternRef{ID: idx, Name: re.Name})
+				continue
+			}
+			info, err := analyzePattern(re, &prefixPool, &suffixPool)
+			if err != nil {
+				continue
+			}
+			info.globalID = idx
+			info.name = re.Name
+			infos = append(infos, info)
+			globalIDs = append(globalIDs, idx)
+		}
+		spec := SetSpec{
+			Name:       sc.Name,
+			FindAny:    sc.FindAny,
+			FindAll:    sc.FindAll,
+			Match:      sc.Match,
+			Patterns:   infos,
+			PatternIDs: globalIDs,
+		}
+		cs, err := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
+		if err != nil {
+			continue
+		}
+		if cs.diag != nil {
+			cs.diag.CaptureBearingDropped = droppedRefs
+			diag.Sets = append(diag.Sets, *cs.diag)
+		}
+		diag.InSet += len(infos)
+	}
+	diag.PrefixDedupPoolSize = len(prefixPool.tables)
+
+	data, err := json.MarshalIndent(diag, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal diag JSON: %w", err)
+	}
+	data = append(data, '\n')
+
+	if diagPath == "-" {
+		_, err = os.Stdout.Write(data)
+		return err
+	}
+	return os.WriteFile(diagPath, data, 0o644)
 }
 
 // stripCaptures converts all capture groups in the regexp tree to non-capturing

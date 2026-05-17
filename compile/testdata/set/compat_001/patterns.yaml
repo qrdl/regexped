@@ -1,0 +1,10 @@
+# compat_001: identical_suffix_dedup
+# 5 patterns sharing the suffix [^\n]* — all should get the same suffixID.
+patterns:
+  - pattern: 'alpha[^\n]*'
+  - pattern: 'beta[^\n]*'
+  - pattern: 'gamma[^\n]*'
+  - pattern: 'delta[^\n]*'
+  - pattern: 'epsilon[^\n]*'
+expect:
+  suffix_dedup_pool_size: 1

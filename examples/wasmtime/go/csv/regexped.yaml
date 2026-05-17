@@ -4,7 +4,7 @@ import_module: "csvregex"
 stub_file:     "stub.go"
 stub_type:     "go"
 
-regexes:
+regexps:
   # Finds any row that looks like 3-column CSV (including rows with invalid emails).
   - pattern:   '"?[0-9]+"?,[^,\n]+,[^\n]+'
     find_func: "find_csv_row"

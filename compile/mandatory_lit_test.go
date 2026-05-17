@@ -85,7 +85,7 @@ func TestFindMandatoryLitRecDegenerate(t *testing.T) {
 		{"plus_no_sub", &syntax.Regexp{Op: syntax.OpPlus}},
 	}
 	for _, c := range cases {
-		got := findMandatoryLitRec(c.re, 0, 0)
+		got, _ := findMandatoryLitRec(c.re, 0, 0)
 		if got != nil {
 			t.Errorf("findMandatoryLitRec(%s): got %v, want nil", c.name, got)
 		}
@@ -171,6 +171,28 @@ func TestFindMandatoryLit(t *testing.T) {
 		}
 		if got.maxOff < got.minOff {
 			t.Errorf("findMandatoryLit(%q): maxOff %d < minOff %d", c.pattern, got.maxOff, got.minOff)
+		}
+	}
+}
+
+func TestHasMandatoryLit(t *testing.T) {
+	cases := []struct {
+		pattern string
+		want    bool
+	}{
+		{"foo", true},
+		{"foo.*bar", true},
+		{`[a-z]{0,3}foo`, true}, // bounded prefix; literal still mandatory
+		{`\d+foo`, false},       // unbounded prefix → maxOff -1 rejects literal
+		{"a|b", false},
+		{"a*", false},
+		{"(?i)foo", false}, // FoldCase strips the literal
+		{"[a-z]+", false},
+		{"[invalid", false}, // parse error
+	}
+	for _, c := range cases {
+		if got := HasMandatoryLit(c.pattern); got != c.want {
+			t.Errorf("HasMandatoryLit(%q) = %v, want %v", c.pattern, got, c.want)
 		}
 	}
 }

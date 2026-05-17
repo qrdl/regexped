@@ -17,6 +17,7 @@ Supports RE2/Perl (leftmost-first) semantics. Unicode not yet supported.
 - **DFA engine** — O(n) anchored matching and non-anchored find, word boundary assertions (`\b`, `\B`), byte class compression, SIMD prefix scan (Teddy algorithm)
 - **TDFA engine** — O(n) capture group tracking via Laurikari’s tagged DFA; register-based slot updates on DFA transitions
 - **Backtracking engine** — capture group tracking for non-TDFA-eligible patterns, BitState memoization for O(n) worst-case on zero-matchable loops
+- **Pattern sets** — compile multiple patterns into a single merged DFA; a single `find_all`/`find_any`/`match` call scans for all patterns simultaneously and returns `(pattern_id, start, length)` tuples; uses SIMD Teddy or Aho-Corasick literal scanning for O(n) throughput regardless of set size
 - Stub generation for **Rust**, **Go** (wasip1), **C**, **JavaScript**, **TypeScript**, and **AssemblyScript** — with iterator/generator support (match, find, groups, named groups)
 - WASM module merging via `wasm-merge` — WASM Component Model support coming soon
 - Configurable via YAML
@@ -69,6 +70,9 @@ See [docker.md](docker.md) for full Docker usage and workflow examples.
 - [Cloudflare Workers](workers.md) — standalone WASM, JS module import, isolate-level init
 - [Gcore FastEdge](fastedge.md) — embedded WASM, Rust stubs, merge workflow
 
+**Sets**
+- [Pattern sets](sets.md) — multi-pattern composition, YAML schema, output format, frontend selection
+
 **Internals**
 - [Engines](engines.md) — DFA, TDFA, Backtracking, engine selection
 - [RE2 test coverage](re2.md) — pass/skip counts per engine and skip reasons
@@ -107,10 +111,13 @@ See [`examples/README.md`](../examples/README.md) for more details.
 - **No WASM Component Model** — generated modules use the core WASM ABI (linear memory + exported functions). WASM Component Model support is planned.
 - **Not thread-safe** — the C, JS, TS, and AS stubs are not safe for concurrent use. Only the Rust and Go stubs are thread-safe.
 
-## Requirements
+## Dependencies
 
-- Go 1.25 (build only)
-- `wasm-merge` from [Binaryen](https://github.com/WebAssembly/binaryen) (for `merge` command)
+Regexped is almost dependency-free. The only compile-time dependency is [`github.com/goccy/go-yaml`](https://github.com/goccy/go-yaml) for YAML config parsing. All regex compilation, WASM emission, and stub generation are implemented from scratch with no external libraries.
+
+The `wasmtime-go` binding is used only in `re2test/` and `perftest/` testing tools and is not a part of the main tool.
+
+[`wasm-merge`](https://github.com/WebAssembly/binaryen) (from the Binaryen toolkit) is an external binary required only for the `merge` command. It must be installed separately using `get_wasm_merge.sh` shell script.
 
 ## License
 

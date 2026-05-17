@@ -11,7 +11,7 @@ wasm_file:     "regexps.wasm"  # compiled regex WASM (intermediate)
 import_module: "regexps"       # Rust module name in generated stubs
 stub_file:     "stubs.rs"      # generated Rust FFI stubs
 
-regexes:
+regexps:
   - pattern:    '^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$'
     match_func: "match_email"
 
