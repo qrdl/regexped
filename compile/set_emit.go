@@ -660,10 +660,19 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	}
 
 	standalone := cfg.Output == ""
-	tableBase := int64(0)
-	if !standalone {
-		tableBase = 0
+
+	// No sets: delegate to Compile so the output is byte-identical (including
+	// per-pattern page alignment and final memory page count). Replicating
+	// that logic here is bug-prone — earlier versions produced under-sized
+	// memory for standalone modules whose DFA tables exceeded 64 KiB.
+	if len(cfg.Sets) == 0 {
+		return Compile(cfg.Regexps, 0, standalone, CompileOptions{
+			MaxDFAStates: cfg.MaxDFAStates,
+			MaxTDFARegs:  cfg.MaxTDFARegs,
+		})
 	}
+
+	tableBase := int64(0)
 
 	// Compile per-pattern entries (existing path).
 	var compiled []*compiledPattern
@@ -685,15 +694,6 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	}
 	if len(compiled) > 0 {
 		lastTableEnd = compiled[len(compiled)-1].tableEnd
-	}
-
-	// If no sets: same as Compile().
-	if len(cfg.Sets) == 0 {
-		var memPages int32 = 1
-		if !standalone && lastTableEnd > 0 {
-			memPages = int32((lastTableEnd + 65535) / 65536)
-		}
-		return assembleModule(compiled, memPages, standalone), lastTableEnd, nil
 	}
 
 	// Resolve and compile sets.

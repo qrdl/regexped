@@ -215,7 +215,9 @@ Compiles each regex pattern to a single WASM module. The output mode is selected
 | `wasm_file` | Required unless `--output` is given |
 | `regexps` | One or more patterns to compile |
 
-Entries with no `_func` fields are silently skipped.
+Entries with no `_func` fields produce no individual exports. If such an
+entry is also not referenced by any `sets:` block, it is silently skipped;
+otherwise it participates only as a member of the set(s) that select it.
 
 #### `sets:` block — multi-pattern set composition
 

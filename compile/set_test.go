@@ -1179,21 +1179,30 @@ func TestConfig_MissingFindAnyAndAll_Rejected(t *testing.T) {
 }
 
 func TestCompileFile_NoSets_ByteIdentical(t *testing.T) {
-	// CompileFile with no sets must produce byte-identical output to Compile.
-	patterns := []config.RegexEntry{
-		{Pattern: `[a-z]+`, FindFunc: "find"},
+	// CompileFile with no sets must produce byte-identical output to Compile,
+	// including across multi-pattern page alignment and the final memory page
+	// count for standalone modules with large DFA tables.
+	patternSets := map[string][]config.RegexEntry{
+		"single":      {{Pattern: `[a-z]+`, FindFunc: "find"}},
+		"multi":       {{Pattern: `[a-z]+`, FindFunc: "find1"}, {Pattern: `\d+`, FindFunc: "find2"}},
+		"large_table": {{Pattern: `[a-zA-Z0-9_]{8,}`, FindFunc: "find"}},
 	}
-	wasmA, _, err := Compile(patterns, 0, true)
-	if err != nil {
-		t.Fatalf("Compile: %v", err)
-	}
-	cfg := config.BuildConfig{Regexps: patterns}
-	wasmB, _, err := CompileFile(cfg, "")
-	if err != nil {
-		t.Fatalf("CompileFile: %v", err)
-	}
-	if len(wasmA) != len(wasmB) {
-		t.Errorf("byte lengths differ: Compile=%d CompileFile=%d", len(wasmA), len(wasmB))
+	for name, patterns := range patternSets {
+		t.Run(name, func(t *testing.T) {
+			wasmA, _, err := Compile(patterns, 0, true)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			cfg := config.BuildConfig{Regexps: patterns}
+			wasmB, _, err := CompileFile(cfg, "")
+			if err != nil {
+				t.Fatalf("CompileFile: %v", err)
+			}
+			if !bytes.Equal(wasmA, wasmB) {
+				t.Errorf("WASM differs: Compile=%d bytes, CompileFile=%d bytes", len(wasmA), len(wasmB))
+			}
+			assertDataSectionConsistent(t, wasmB)
+		})
 	}
 }
 
