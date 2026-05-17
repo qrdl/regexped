@@ -17,7 +17,7 @@ Supports RE2/Perl (leftmost-first) semantics. Unicode not yet supported.
 - **DFA engine** — O(n) anchored matching and non-anchored find, word boundary assertions (`\b`, `\B`), byte class compression, SIMD prefix scan (Teddy algorithm)
 - **TDFA engine** — O(n) capture group tracking via Laurikari’s tagged DFA; register-based slot updates on DFA transitions
 - **Backtracking engine** — capture group tracking for non-TDFA-eligible patterns, BitState memoization for O(n) worst-case on zero-matchable loops
-- **Pattern sets** — compile multiple patterns into a single merged DFA; a single `find_all`/`find_any`/`match` call scans for all patterns simultaneously and returns `(pattern_id, start, length)` tuples; uses SIMD Teddy or Aho-Corasick literal scanning for O(n) throughput regardless of set size
+- **Pattern sets** — compile multiple patterns into a single merged DFA; a single `find_all`/`find_any`/`match` call scans for all patterns simultaneously and returns `(pattern_id, start, length)` tuples; SIMD Teddy (≤16 literals) or Aho-Corasick (≤32 literals) literal frontends keep per-byte cost near-constant in set size, with a scalar DFA fallback for sets without mandatory literals
 - Stub generation for **Rust**, **Go** (wasip1), **C**, **JavaScript**, **TypeScript**, and **AssemblyScript** — with iterator/generator support (match, find, groups, named groups)
 - WASM module merging via `wasm-merge` — WASM Component Model support coming soon
 - Configurable via YAML

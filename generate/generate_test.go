@@ -911,3 +911,75 @@ func TestSetSection_FindAllOnly(t *testing.T) {
 		t.Error("unexpected exports in find_all-only Rust stub")
 	}
 }
+
+func TestPatternsInSet_Names(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "a", Pattern: "a"},
+			{Name: "b", Pattern: "b"},
+			{Name: "c", Pattern: "c"},
+		},
+	}
+	s := config.SetConfig{
+		Patterns: config.PatternSelector{Names: []string{"a", "c"}},
+	}
+	if got := patternsInSet(s, cfg); got != 2 {
+		t.Errorf("patternsInSet(Names): got %d, want 2", got)
+	}
+}
+
+func TestBatchSize_Bounds(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "a", Pattern: "a"}},
+	}
+	// BatchSize below the 64 floor must be raised.
+	s1 := config.SetConfig{
+		BatchSize: 10,
+		Patterns:  config.PatternSelector{All: true},
+	}
+	if got := batchSize(s1, cfg); got != 64 {
+		t.Errorf("batchSize(10): got %d, want 64", got)
+	}
+	// BatchSize below patternsInSet must be raised to n.
+	bigCfg := config.BuildConfig{Regexps: make([]config.RegexEntry, 300)}
+	for i := range bigCfg.Regexps {
+		bigCfg.Regexps[i] = config.RegexEntry{Name: "p", Pattern: "x"}
+	}
+	s2 := config.SetConfig{
+		BatchSize: 100,
+		Patterns:  config.PatternSelector{All: true},
+	}
+	if got := batchSize(s2, bigCfg); got != 300 {
+		t.Errorf("batchSize(n>bs): got %d, want 300", got)
+	}
+	// Default (BatchSize=0) stays at 256 when patternsInSet is small.
+	s3 := config.SetConfig{Patterns: config.PatternSelector{All: true}}
+	if got := batchSize(s3, cfg); got != 256 {
+		t.Errorf("batchSize(default): got %d, want 256", got)
+	}
+}
+
+func TestCmdGenerateStub_ResolveError(t *testing.T) {
+	cfg := config.BuildConfig{StubType: "bogus"}
+	if err := CmdGenerateStub(cfg, "-"); err == nil {
+		t.Fatal("CmdGenerateStub(bogus stub_type): expected error, got nil")
+	}
+}
+
+func TestExtractGroupInfo_ParseError(t *testing.T) {
+	if _, _, err := extractGroupInfo("(unclosed"); err == nil {
+		t.Fatal("extractGroupInfo(invalid): expected error, got nil")
+	}
+}
+
+func TestWriteStub_MkdirError(t *testing.T) {
+	// Create a file, then try to write into a path that treats it as a parent dir.
+	tmp := t.TempDir()
+	blocker := tmp + "/blocker"
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if err := writeStub(blocker+"/inner/file.txt", []byte("data")); err == nil {
+		t.Fatal("writeStub: expected mkdir error, got nil")
+	}
+}
