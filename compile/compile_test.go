@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp/syntax"
+	"strings"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
@@ -977,4 +978,140 @@ func TestT3Triggered(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCompile_ParseError(t *testing.T) {
+	if _, err := compile("[invalid"); err == nil {
+		t.Error("compile(invalid): expected parse error, got nil")
+	}
+}
+
+func TestCompile_UnicodeWithoutOpt(t *testing.T) {
+	if _, err := compile(`\p{Greek}`); err == nil {
+		t.Error("compile(\\p{Greek}): want Unicode error, got nil")
+	}
+}
+
+func TestCompile_EngineNotSupported(t *testing.T) {
+	// Force TDFA / CompiledDFA via ForceEngine → compile() switch falls through
+	// to the "not yet supported" error path.
+	_, err := compile("abc", CompileOptions{ForceEngine: EngineTDFA})
+	if err == nil || !strings.Contains(err.Error(), "not yet supported") {
+		t.Errorf("compile(force TDFA): want 'not yet supported' error, got %v", err)
+	}
+	_, err = compile("abc", CompileOptions{ForceEngine: EngineCompiledDFA})
+	if err == nil || !strings.Contains(err.Error(), "not yet supported") {
+		t.Errorf("compile(force CompiledDFA): want 'not yet supported' error, got %v", err)
+	}
+}
+
+func TestNeedsUnicodeSupport(t *testing.T) {
+	mkProg := func(t *testing.T, p string) *syntax.Prog {
+		t.Helper()
+		re, err := syntax.Parse(p, syntax.Perl)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", p, err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatalf("Compile(%q): %v", p, err)
+		}
+		return prog
+	}
+
+	// Non-ASCII only (\p{Greek}) → hasNonASCII && !hasASCII → true.
+	if !needsUnicodeSupport(mkProg(t, `\p{Greek}`)) {
+		t.Error("needsUnicodeSupport(\\p{Greek}) = false, want true")
+	}
+	// Pure ASCII → false.
+	if needsUnicodeSupport(mkProg(t, `[a-z]`)) {
+		t.Error("needsUnicodeSupport([a-z]) = true, want false")
+	}
+	// Mixed ASCII+non-ASCII char class → both flags set → false.
+	if needsUnicodeSupport(mkProg(t, `[a-é]`)) {
+		t.Error("needsUnicodeSupport([a-é]) = true, want false")
+	}
+}
+
+func TestCmdCompile_WithSets(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.wasm")
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "p", Pattern: `foo\w+`}},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "s_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	if err := CmdCompile(cfg, out); err != nil {
+		t.Fatalf("CmdCompile(sets): %v", err)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.HasPrefix(data, wasmMagic) {
+		t.Error("output is not valid WASM")
+	}
+}
+
+func TestCmdWriteDiagJSON(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "p1", Pattern: `foo\w+`},
+			{Name: "p2", Pattern: `bar\d+`},
+			// Capture-bearing pattern, must be dropped from sets.
+			{Name: "p3", Pattern: `(quux)`, GroupsFunc: "qg"},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s1", FindAll: "s1_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s2", FindAny: "s2_any", Patterns: config.PatternSelector{Names: []string{"p1", "p2"}}},
+		},
+	}
+
+	t.Run("no_sets_returns_nil", func(t *testing.T) {
+		empty := config.BuildConfig{Regexps: cfg.Regexps}
+		if err := CmdWriteDiagJSON(empty, "", ""); err != nil {
+			t.Errorf("expected nil, got %v", err)
+		}
+	})
+
+	t.Run("file_output", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "diag.json")
+		if err := CmdWriteDiagJSON(cfg, "", path); err != nil {
+			t.Fatalf("CmdWriteDiagJSON: %v", err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if !bytes.Contains(data, []byte(`"patterns_total"`)) {
+			t.Errorf("diag JSON missing expected key, got: %s", data)
+		}
+		if !bytes.Contains(data, []byte(`"capture_bearing"`)) {
+			t.Errorf("diag JSON missing capture_bearing key: %s", data)
+		}
+	})
+
+	t.Run("stdout_output", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		orig := os.Stdout
+		os.Stdout = w
+		writeErr := CmdWriteDiagJSON(cfg, "", "-")
+		w.Close()
+		os.Stdout = orig
+		if writeErr != nil {
+			t.Fatalf("CmdWriteDiagJSON(stdout): %v", writeErr)
+		}
+		var buf bytes.Buffer
+		if _, err := buf.ReadFrom(r); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(buf.Bytes(), []byte(`"patterns_total"`)) {
+			t.Errorf("stdout diag missing key: %s", buf.Bytes())
+		}
+	})
 }

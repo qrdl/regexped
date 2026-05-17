@@ -2,6 +2,7 @@ package compile
 
 import (
 	"regexp/syntax"
+	"strings"
 	"testing"
 )
 
@@ -308,4 +309,95 @@ func TestGetFirstRuneSet(t *testing.T) {
 			t.Errorf("getFirstRuneSet(out-of-bounds) = %v, want empty", got)
 		}
 	})
+
+	// Synthetic InstRune with odd-length Rune slice → returns empty.
+	t.Run("odd rune len", func(t *testing.T) {
+		prog := &syntax.Prog{
+			Inst: []syntax.Inst{
+				{Op: syntax.InstRune, Rune: []rune{'a'}}, // odd length
+				{Op: syntax.InstMatch},
+			},
+			Start: 0,
+		}
+		got := getFirstRuneSet(prog, 0)
+		if len(got) != 0 {
+			t.Errorf("getFirstRuneSet(odd len) = %v, want empty", got)
+		}
+	})
+
+	// InstRune with totalChars > 256 → returns empty (covers selector.go:557).
+	t.Run("rune range too wide", func(t *testing.T) {
+		// One range spanning > 256 runes.
+		prog := &syntax.Prog{
+			Inst: []syntax.Inst{
+				{Op: syntax.InstRune, Rune: []rune{0x100, 0x300}},
+				{Op: syntax.InstMatch},
+			},
+			Start: 0,
+		}
+		got := getFirstRuneSet(prog, 0)
+		if len(got) != 0 {
+			t.Errorf("getFirstRuneSet(wide range) = %v, want empty", got)
+		}
+	})
+
+	// InstMatch directly → collect returns false → empty.
+	t.Run("direct match inst", func(t *testing.T) {
+		prog := &syntax.Prog{
+			Inst:  []syntax.Inst{{Op: syntax.InstMatch}},
+			Start: 0,
+		}
+		got := getFirstRuneSet(prog, 0)
+		if len(got) != 0 {
+			t.Errorf("getFirstRuneSet(InstMatch) = %v, want empty", got)
+		}
+	})
+
+	// InstNop chain to InstRune1 → succeeds (covers InstNop branch).
+	t.Run("nop chain", func(t *testing.T) {
+		prog := &syntax.Prog{
+			Inst: []syntax.Inst{
+				{Op: syntax.InstNop, Out: 1},
+				{Op: syntax.InstRune1, Rune: []rune{'z'}, Out: 2},
+				{Op: syntax.InstMatch},
+			},
+			Start: 0,
+		}
+		got := getFirstRuneSet(prog, 0)
+		if !got['z'] || len(got) != 1 {
+			t.Errorf("getFirstRuneSet(nop→z) = %v, want {z}", got)
+		}
+	})
+}
+
+func TestSelectEngine_HighAlternations(t *testing.T) {
+	// 12 alternations: hits both the "High alternations" branch (>5) and the
+	// estimateDFAComplexity multiplier cap (1 + n*0.2 > 3.0 → n > 10).
+	got, err := SelectEngine("a|b|c|d|e|f|g|h|i|j|k|l", CompileOptions{})
+	if err != nil {
+		t.Fatalf("SelectEngine: %v", err)
+	}
+	if got != EngineDFA && got != EngineCompiledDFA {
+		t.Errorf("SelectEngine(many alts) = %v, want DFA/CompiledDFA", got)
+	}
+}
+
+func TestSelectEngine_ParseError(t *testing.T) {
+	if _, err := SelectEngine("[invalid", CompileOptions{}); err == nil {
+		t.Error("SelectEngine(invalid): expected parse error, got nil")
+	}
+}
+
+func TestSelectEngine_UnicodeWithoutOpt(t *testing.T) {
+	// \p{Greek} compiles to a non-ASCII-only InstRune → needsUnicode=true.
+	_, err := SelectEngine(`\p{Greek}`, CompileOptions{})
+	if err == nil || !strings.Contains(err.Error(), "Unicode") {
+		t.Errorf("SelectEngine(\\p{Greek}): want Unicode error, got %v", err)
+	}
+}
+
+func TestSelectEngine_UnicodeWithOpt(t *testing.T) {
+	if _, err := SelectEngine(`\p{Greek}`, CompileOptions{Unicode: true}); err != nil {
+		t.Errorf("SelectEngine(\\p{Greek}, Unicode=true): unexpected error %v", err)
+	}
 }

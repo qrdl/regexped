@@ -1879,6 +1879,227 @@ func TestSetMatch_Anchored_LargeFallback(t *testing.T) {
 	}
 }
 
+// TestSetMatch_Anchored_NoLiteralFallback_Large exercises the n>32 clamp in the
+// fallback bucket branch of emitSetMatchFnAnchored. It builds >32 patterns that
+// have no extractable mandatory literal so they all land in the same fallback
+// bucket.
+func TestSetMatch_Anchored_NoLiteralFallback_Large(t *testing.T) {
+	const n = 35
+	cfg := config.BuildConfig{
+		Regexps: make([]config.RegexEntry, n),
+		Sets: []config.SetConfig{
+			{Name: "s", Match: "m", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	// Patterns with no mandatory literal: character classes / quantified.
+	classes := []string{`\d+`, `\w+`, `\s+`, `[ab]+`, `[xy]+`, `[0-9]+`, `[A-Z]+`}
+	for i := 0; i < n; i++ {
+		cfg.Regexps[i] = config.RegexEntry{
+			Pattern: classes[i%len(classes)],
+		}
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestSetMatch_Anchored_TrivialPrefixMultiByte exercises the trivial-prefix
+// branch of emitSetMatchFnAnchored with literal length >= 2, hitting the
+// `li > 0` offset-add path inside the literal-byte-check loop.
+func TestSetMatch_Anchored_TrivialPrefixMultiByte(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "p1", Pattern: `foobar.*`}, // literal "foobar" at offset 0
+			{Name: "p2", Pattern: `quux.+`},   // literal "quux" at offset 0
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", Match: "m", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestSetMatch_Anchored_VarLenEmpty exercises the variable-length prefix +
+// empty-suffix path (isEmpty branch) in emitSetMatchFnAnchored. The prefix
+// must be BOUNDED (maxLen <= 256) so the mandatory literal extractor can
+// locate the literal — unbounded prefixes like `\d+foo` are rejected by
+// findMandatoryLitRec and route to the fallback bucket instead.
+func TestSetMatch_Anchored_VarLenEmpty(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "p1", Pattern: `[ab]?foo`},     // bounded varlen prefix, empty suffix
+			{Name: "p2", Pattern: `[xy]{0,3}bar`}, // bounded varlen prefix, empty suffix
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestSetMatch_Anchored_VarLenNonEmpty exercises the variable-length prefix +
+// non-empty-suffix path (isNonempty branch) in emitSetMatchFnAnchored.
+// Requires a bounded varlen prefix (so the literal is found) and a non-empty
+// suffix following the literal.
+func TestSetMatch_Anchored_VarLenNonEmpty(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "p1", Pattern: `[ab]?foo[xy]`},     // bounded varlen prefix, non-empty suffix
+			{Name: "p2", Pattern: `[cd]{0,2}bar[zz]`}, // bounded varlen prefix, non-empty suffix
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestSetFind_AC_VarLenPrefix exercises the variable-length prefix path inside
+// emitSetMatchFnFinalAC (the emitVarLenAt closure). The AC frontend is chosen
+// when the set has >16 unique literals; each pattern uses a bounded varlen
+// prefix (`[ab]?`) so its bucket has varLenMasks bits set.
+func TestSetFind_AC_VarLenPrefix(t *testing.T) {
+	const n = 20
+	regs := make([]config.RegexEntry, n)
+	for i := 0; i < n; i++ {
+		// Bounded varlen prefix + unique 4-byte literal. The {0,1} form
+		// yields varLenEmptySuffix for half the patterns and we add a tail
+		// charclass on the rest to exercise varLenNonEmptySuffix too.
+		var pat string
+		if i%2 == 0 {
+			pat = fmt.Sprintf(`[ab]?lit%02d`, i)
+		} else {
+			pat = fmt.Sprintf(`[cd]{0,2}wrd%02d[xy]`, i)
+		}
+		regs[i] = config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: pat}
+	}
+	cfg := config.BuildConfig{
+		Regexps: regs,
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestSetWithIndividualFuncs exercises the per-pattern function/export emit
+// branches inside assembleModuleWithSets: a config that has both `Sets:` and
+// individual pattern stubs (match_func / find_func / groups_func /
+// named_groups_func) so the assembler walks both pattern bodies and set
+// bodies.
+func TestSetWithIndividualFuncs(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "p1", Pattern: `foo\d+`, MatchFunc: "p1_match", FindFunc: "p1_find"},
+			{Name: "p2", Pattern: `(?P<n>bar)(?P<m>\d+)`, GroupsFunc: "p2_groups", NamedGroupsFunc: "p2_named"},
+			{Name: "p3", Pattern: `baz\w+`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "set_find", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestSetFind_Scalar_StartAnchorVarLen exercises uncovered branches in
+// emitSetMatchFnFinalScalar: the start-anchor mask path (sam != 0) and the
+// scalar-path varlen-prefix emit (emitVarLen). A fallback pattern forces the
+// scalar frontend (Teddy with fallback buckets routes to scalar).
+func TestSetFind_Scalar_StartAnchorVarLen(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "anchored", Pattern: `^foo`},          // start-anchor literal
+			{Name: "varlen_e", Pattern: `[ab]?bar`},      // varlen-empty
+			{Name: "varlen_ne", Pattern: `[cd]?baz[xy]`}, // varlen-nonempty
+			{Name: "lit", Pattern: `quux`},               // plain literal
+			{Name: "fallback", Pattern: `\d+`},           // no mandatory literal → fallback bucket → scalar frontend
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestCompileFile_ValidateError covers the ValidateSets error path in
+// CompileFile (early return on invalid config).
+func TestCompileFile_ValidateError(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "p", Pattern: "foo"}},
+		Sets: []config.SetConfig{
+			// Empty set name is invalid.
+			{Name: "", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	_, _, err := CompileFile(cfg, "")
+	if err == nil {
+		t.Fatalf("expected ValidateSets error, got nil")
+	}
+}
+
+// TestCompileFile_Embedded covers the embedded mode in CompileFile
+// (cfg.Output != "" → standalone=false → opts.tableMemIdx = 1 and
+// setOpts.TableMemIdx = 1).
+func TestCompileFile_Embedded(t *testing.T) {
+	cfg := config.BuildConfig{
+		Output: "ignored.wasm", // non-empty → embedded mode
+		Regexps: []config.RegexEntry{
+			{Name: "p1", Pattern: `foo`},
+			{Name: "p2", Pattern: `bar`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
 func TestValidateSets_MatchOnly(t *testing.T) {
 	cfg := &config.BuildConfig{
 		Regexps: []config.RegexEntry{{Name: "p", Pattern: "foo"}},
