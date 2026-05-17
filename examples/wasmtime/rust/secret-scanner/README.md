@@ -43,11 +43,11 @@ Expected output (abbreviated):
 [aws_key] at 26..46: AKIAIOSFODNN7EXAMPLE
 
 === GitHub PAT ===
-[github_pat] at 22..62: ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab
+[github_pat] at 22..62: ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789
 
 === multiple secrets (all reported in one scan pass) ===
 [aws_key] at 4..24: AKIAIOSFODNN7EXAMPLE
-[github_pat] at 31..71: ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab
+[github_pat] at 31..71: ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789
 [stripe_live] at 79..107: sk_live_AbCdEfGhIjKlMnOpQrStUvWx
 ```
 

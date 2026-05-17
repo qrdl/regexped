@@ -101,16 +101,14 @@ func newACNode() acNode {
 // acLayout describes the memory layout of the AC tables.
 type acLayout struct {
 	gotoOff    int32 // offset of goto table: [numNodes][256]int16 (little-endian)
-	failureOff int32 // offset of failure table: [numNodes]int16
 	nodeOutOff int32 // offset of per-node output start offsets: [numNodes+1]int16
 	// (entry i = start index into the output array for node i;
 	//  entry numNodes = total output count = end sentinel)
 	outputOff int32 // offset of flat output array: [total]int16 of literal IDs,
 	// indexed by [nodeOut[i] .. nodeOut[i+1]) for node i
 
-	gotoBytes    []byte
-	failureBytes []byte
-	outputBytes  []byte // concatenation of nodeOut offsets and flat litID array
+	gotoBytes   []byte
+	outputBytes []byte // concatenation of nodeOut offsets and flat litID array
 
 	numNodes int
 	tableEnd int32
@@ -121,7 +119,9 @@ func buildACLayout(ac *acAutomaton, tableBase int32) *acLayout {
 	n := len(ac.nodes)
 	l := &acLayout{numNodes: n}
 
-	// Goto table: [n][256]int16 = n*512 bytes.
+	// Goto table: [n][256]int16 = n*512 bytes. buildAC has already filled in
+	// failure transitions on every missing edge, so the goto table is a fully
+	// completed DFA — the WASM matcher needs no separate failure table.
 	l.gotoOff = tableBase
 	l.gotoBytes = make([]byte, n*512)
 	for i, node := range ac.nodes {
@@ -130,15 +130,8 @@ func buildACLayout(ac *acAutomaton, tableBase int32) *acLayout {
 		}
 	}
 
-	// Failure table: [n]int16 = n*2 bytes.
-	l.failureOff = l.gotoOff + int32(len(l.gotoBytes))
-	l.failureBytes = make([]byte, n*2)
-	for i, node := range ac.nodes {
-		binary.LittleEndian.PutUint16(l.failureBytes[i*2:], uint16(node.failure))
-	}
-
 	// Per-node output start offsets: [n+1]int16 (last entry = total output count).
-	l.nodeOutOff = l.failureOff + int32(len(l.failureBytes))
+	l.nodeOutOff = l.gotoOff + int32(len(l.gotoBytes))
 	startOffsets := make([]int, n+1)
 	total := 0
 	for i, node := range ac.nodes {
@@ -175,7 +168,6 @@ func buildACLayout(ac *acAutomaton, tableBase int32) *acLayout {
 func emitACDataSegments(l *acLayout) []byte {
 	var ds []byte
 	ds = appendDataSegment(ds, l.gotoOff, l.gotoBytes)
-	ds = appendDataSegment(ds, l.failureOff, l.failureBytes)
 	ds = appendDataSegment(ds, l.nodeOutOff, l.outputBytes)
 	return ds
 }

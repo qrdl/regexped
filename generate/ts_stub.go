@@ -123,10 +123,17 @@ func genTSSetSection(cfg config.BuildConfig) string {
         for (let i = 0; i < n; i++) {
             yield { patternId: outBuf[i*3], start: outBuf[i*3+1], end: outBuf[i*3+1]+outBuf[i*3+2] };
         }
-        const l = outBuf[(n-1)*3+2]; startPos = outBuf[(n-1)*3+1] + (l > 0 ? l : 1);
+        // find_all returns when EITHER the buffer is full (n == cap) OR the
+        // input has been fully scanned (n < cap). Only the buffer-full case
+        // needs a resume; otherwise we're done with this input.
+        if (n < %d) break;
+        // Advance by exactly one position past the last reported start: the WASM
+        // scan is position-by-position and only positions <= last.start have been
+        // visited when the buffer fills, regardless of last.length.
+        startPos = outBuf[(n-1)*3+1] + 1;
     }
 }
-`, s.FindAll, bs, bs, wasmExport, bs)
+`, s.FindAll, bs, bs, wasmExport, bs, bs)
 			}
 			if s.FindAny != "" {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): SetMatch | null {

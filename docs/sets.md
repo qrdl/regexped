@@ -73,29 +73,29 @@ receives `count` (tuples written). Tuples within a batch are emitted in
 strictly non-decreasing `start` order.
 
 **Resume rule.** After a batch of `count` tuples, let `last` be the final
-tuple. If `count < out_cap` the batch is complete for all positions up to and
-including `last.start`; advance with
+tuple. To resume the scan, advance with
 
 ```
-start_pos = last.start + max(last.length, 1)
+start_pos = last.start + 1
 ```
 
-If `count == out_cap` the batch may have been truncated mid-position (the
-suffix DFA respects the remaining capacity and stops writing as soon as the
-buffer is full, even when more patterns match at `last.start`). To resume
-safely in this case the host must either:
+The WASM scan is position-by-position: it visits each input position in turn,
+emits all matches anchored there, then increments. When the buffer fills it
+exits at the *top* of the next iteration, so the only positions guaranteed to
+have been visited in the batch are those `≤ last.start`. Advancing by
+`last.length` (or `end`) would skip positions inside the last match's span
+that the WASM has not yet scanned, silently dropping matches at those
+positions.
 
-- size `out_cap ≥ (number of patterns in the set)` — guaranteeing no single
-  start position can produce more matches than the buffer holds, after which
-  the advance formula above is always safe; **or**
-- resume at `start_pos = last.start` and dedupe any `(pattern_id, start)`
-  pairs already emitted in the previous batch.
-
-Generated stubs use the first option: the stub generator floors the effective
-capacity at `max(batch_size, 64, patterns_in_set)` (see "Batched streaming and
-batch_size" below), so generated stubs are always safe regardless of set size.
-Custom hosts that do not apply this floor must use the dedupe-on-truncation
-resume rule, or risk missing same-position matches.
+**Mid-position truncation.** When `count == out_cap` the suffix DFA respects
+the remaining capacity and stops writing as soon as the buffer is full, even
+if more patterns match at `last.start`. To avoid losing same-position
+matches, size `out_cap ≥ (number of patterns in the set)` — this guarantees
+no single start position can produce more matches than the buffer holds, so
+when the buffer fills it does so on a position boundary. Generated stubs
+floor the effective capacity at `max(batch_size, 64, patterns_in_set)`, so
+they always satisfy this. Hosts that bypass the generated stubs and want to
+use a smaller buffer must dedupe `(pattern_id, start)` pairs across batches.
 
 ### match — match tuples (12 bytes each)
 
@@ -113,6 +113,14 @@ match is not batched — one call returns all matching patterns, up to `out_cap`
 Each tuple occupies 12 bytes; decode three little-endian i32s at offsets 0, 4,
 and 8. `end = start + length` (with `start = 0`).
 
+> **Stub behaviour.** The generated stubs (Rust, Go, JS, TS, AssemblyScript, C)
+> call the anchored `match` export with `out_cap = 1` and surface only the
+> first matching pattern (`Option<SetMatch>` / `*SetMatch` / `SetMatch | null`).
+> This is a deliberate ergonomic choice for the common "which pattern matches
+> here?" use case. Hosts that need every pattern matching at position 0 must
+> call the WASM export directly with `out_cap ≥ patterns_in_set` and decode
+> the tuple buffer as described above.
+
 ## Batched streaming and batch_size
 
 `find_all` iterators are batched: the WASM function writes up to `out_cap`
@@ -125,10 +133,10 @@ used in generated stubs (default 256). Tune it:
 
 The stub generator always raises the effective capacity to at least
 `max(64, patterns_in_set)`, so a single start position can never overflow the
-buffer and the standard advance rule (`last.start + max(last.length, 1)`)
+buffer and the `last.start + 1` advance rule (see "Resume rule" above)
 remains safe regardless of the configured `batch_size`. Custom hosts that
-bypass the generated stubs must apply the same floor themselves or use the
-dedupe-on-truncation resume rule described above.
+bypass the generated stubs and use a smaller `out_cap` must dedupe
+`(pattern_id, start)` pairs to handle mid-position truncation.
 
 `batch_size` is a stub-generation knob and does not affect the WASM binary.
 

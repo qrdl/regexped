@@ -16,6 +16,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
@@ -134,10 +135,22 @@ func runCompileCmd(args []string) {
 		os.Exit(1)
 	}
 
-	// Validate stdout conflict before writing any output.
-	if *diagJSON != "" && len(cfg.Sets) > 0 && outPath == "-" && *diagJSON == "-" {
-		fmt.Fprintln(os.Stderr, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
-		os.Exit(1)
+	// Validate output conflict before writing any output: refuse to send both
+	// streams to the same destination (stdout/stdout, or the same filesystem
+	// path), which would silently corrupt the WASM with the JSON diagnostics.
+	if *diagJSON != "" && len(cfg.Sets) > 0 {
+		if outPath == "-" && *diagJSON == "-" {
+			fmt.Fprintln(os.Stderr, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
+			os.Exit(1)
+		}
+		if outPath != "-" && *diagJSON != "-" {
+			absOut, err1 := filepath.Abs(outPath)
+			absDiag, err2 := filepath.Abs(*diagJSON)
+			if err1 == nil && err2 == nil && absOut == absDiag {
+				fmt.Fprintf(os.Stderr, "compile: --output and --diag-json resolve to the same path (%s); use distinct paths\n", absOut)
+				os.Exit(1)
+			}
+		}
 	}
 
 	if err := compile.CmdCompile(cfg, outPath); err != nil {

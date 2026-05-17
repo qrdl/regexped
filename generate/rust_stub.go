@@ -96,8 +96,19 @@ impl<'a> Iterator for %s<'a> {
             if n <= 0 { return None; }
             self.count = n;
             self.idx = 0;
-            let last = self.buf[(n-1) as usize];
-            self.start_pos = last[1] + if last[2] > 0 { last[2] } else { 1 };
+            // find_all returns when EITHER the buffer is full (n == cap) OR the
+            // input has been fully scanned (n < cap). Only the buffer-full case
+            // needs a resume; otherwise we mark the iterator exhausted so the
+            // next outer iteration returns None after the buffer is drained.
+            if n < %d {
+                self.start_pos = -1;
+            } else {
+                // Advance by exactly one position past the last reported start:
+                // the WASM scan is position-by-position and only positions
+                // <= last.start have been visited when the buffer fills,
+                // regardless of last.length.
+                self.start_pos = self.buf[(n-1) as usize][1] + 1;
+            }
         }
     }
 }
@@ -106,7 +117,7 @@ pub fn %s(input: &[u8]) -> %s<'_> {
     %s { input, start_pos: 0, buf: [[0;3]; %d], count: 0, idx: 0 }
 }
 
-`, iterName, bs, iterName, ffiName, bs, s.FindAll, iterName, iterName, bs)
+`, iterName, bs, iterName, ffiName, bs, bs, s.FindAll, iterName, iterName, bs)
 			}
 			if s.FindAny != "" {
 				anyFfiName := ffiName

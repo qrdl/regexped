@@ -112,31 +112,36 @@ int ffi_%s(const char *ptr, int len, int *out, int cap, int start);
 `, cfg.ImportModule, wasmExport, wasmExport)
 			if s.FindAll != "" {
 				fmt.Fprintf(&hb, "int %s_next(const char *input, int len, rx_set_match_t *out);\nvoid %s_reset(void);\n\n", s.FindAll, s.FindAll)
-				fmt.Fprintf(&cb, `static int _start_%s = 0; static int _buf_%s[%d*3]; static int _buf_n_%s = 0; static int _buf_i_%s = 0;
-int %s_next(const char *input, int len, rx_set_match_t *out) {
-    if (_buf_i_%s >= _buf_n_%s) {
-        int n = ffi_%s(input, len, _buf_%s, %d, _start_%s);
-        if (n <= 0) { _buf_n_%s = 0; _buf_i_%s = 0; return 0; }
-        _buf_n_%s = n; _buf_i_%s = 0;
-        int last = (n-1)*3;
-        _start_%s = _buf_%s[last+1] + (_buf_%s[last+2] > 0 ? _buf_%s[last+2] : 1);
+				fmt.Fprintf(&cb, `static int _start_%[1]s = 0; static int _buf_%[1]s[%[2]d*3]; static int _buf_n_%[1]s = 0; static int _buf_i_%[1]s = 0;
+int %[1]s_next(const char *input, int len, rx_set_match_t *out) {
+    if (_buf_i_%[1]s >= _buf_n_%[1]s) {
+        /* _start_<fn> < 0 is a sentinel meaning "input exhausted on the previous
+           call" — when ffi returned n < cap. Do not call ffi again. */
+        if (_start_%[1]s < 0) { _buf_n_%[1]s = 0; _buf_i_%[1]s = 0; return 0; }
+        int n = ffi_%[3]s(input, len, _buf_%[1]s, %[2]d, _start_%[1]s);
+        if (n <= 0) { _buf_n_%[1]s = 0; _buf_i_%[1]s = 0; return 0; }
+        _buf_n_%[1]s = n; _buf_i_%[1]s = 0;
+        /* find_all returns when EITHER the buffer is full (n == cap) OR the
+           input has been fully scanned (n < cap). Only the buffer-full case
+           needs a resume; otherwise mark this iterator exhausted. */
+        if (n < %[2]d) {
+            _start_%[1]s = -1;
+        } else {
+            int last = (n-1)*3;
+            /* Advance by exactly one position past the last reported start:
+               the WASM scan is position-by-position and only positions
+               <= last.start have been visited when the buffer fills,
+               regardless of last.length. */
+            _start_%[1]s = _buf_%[1]s[last+1] + 1;
+        }
     }
-    int i = _buf_i_%s++ * 3;
-    out->pattern_id = _buf_%s[i]; out->start = _buf_%s[i+1]; out->end = _buf_%s[i+1]+_buf_%s[i+2];
+    int i = _buf_i_%[1]s++ * 3;
+    out->pattern_id = _buf_%[1]s[i]; out->start = _buf_%[1]s[i+1]; out->end = _buf_%[1]s[i+1]+_buf_%[1]s[i+2];
     return 1;
 }
-void %s_reset(void) { _start_%s = 0; _buf_n_%s = 0; _buf_i_%s = 0; }
+void %[1]s_reset(void) { _start_%[1]s = 0; _buf_n_%[1]s = 0; _buf_i_%[1]s = 0; }
 `,
-					s.FindAll, s.FindAll, bs, s.FindAll, s.FindAll,
-					s.FindAll,
-					s.FindAll, s.FindAll,
-					wasmExport, s.FindAll, bs, s.FindAll,
-					s.FindAll, s.FindAll,
-					s.FindAll, s.FindAll,
-					s.FindAll, s.FindAll, s.FindAll, s.FindAll,
-					s.FindAll,
-					s.FindAll, s.FindAll, s.FindAll, s.FindAll,
-					s.FindAll, s.FindAll, s.FindAll, s.FindAll)
+					s.FindAll, bs, wasmExport)
 			}
 			if s.FindAny != "" {
 				anyFFI := "ffi_" + s.FindAny

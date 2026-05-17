@@ -39,11 +39,10 @@ func patternsInSet(s config.SetConfig, cfg config.BuildConfig) int {
 //   - the user-configured batch_size (default 256),
 //   - 64 (minimum amortisation floor),
 //   - patternsInSet(s, cfg) — so a single start position can never emit more
-//     matches than the buffer holds. This is required for the "advance to
-//     last.start + max(last.length, 1)" resume rule used by the generated
-//     wrappers: when out_cap == count the batch may have been truncated
-//     mid-position, but with out_cap >= patternsInSet that truncation
-//     cannot happen.
+//     matches than the buffer holds. This guarantees the WASM scan never
+//     truncates mid-position: each call returns a whole-number-of-positions
+//     worth of tuples, which is what the generated iterators' "advance by
+//     last.start + 1" resume rule relies on for correctness.
 func batchSize(s config.SetConfig, cfg config.BuildConfig) int {
 	bs := s.BatchSize
 	if bs <= 0 {

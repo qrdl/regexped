@@ -3,9 +3,10 @@
 A FastEdge application that scans incoming request URLs for OWASP Top 10
 attack patterns and blocks matching requests with a 403 response.
 
-Uses **set composition**: 21 attack patterns are compiled into a single WASM set.
-One `scan_url()` call checks all patterns simultaneously; `.next()` returns the
-first match (if any) so blocked requests incur minimal overhead.
+Uses **set composition**: 22 attack patterns are compiled into a single WASM set.
+One `scan_url()` call checks all patterns simultaneously and returns the first
+match (if any), stopping as soon as one is found, so blocked requests incur
+minimal overhead.
 
 ## Attack patterns detected
 
@@ -51,7 +52,7 @@ make
 ```
 regexped generate   →  generate Rust FFI stubs (stubs.rs)
 cargo build         →  compile Rust app to WASM
-regexped compile    →  compile 21 attack patterns to WASM
+regexped compile    →  compile 22 attack patterns to WASM
 regexped merge      →  merge app + patterns into final.wasm
 ```
 
@@ -66,7 +67,7 @@ continues to the origin.
 The calling code is minimal — the generated `stubs.rs` hides all WASM FFI details:
 
 ```rust
-if let Some(m) = patterns::scan_url(url.as_bytes()).next() {
+if let Some(m) = patterns::scan_url(url.as_bytes()) {
     let attack = patterns::pattern_name(m.pattern_id);
     // block with 403
 }

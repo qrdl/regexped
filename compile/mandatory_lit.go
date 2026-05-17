@@ -29,9 +29,14 @@ type mandatoryLit struct {
 	maxOff int32 // maximum byte distance from match start to literal start
 }
 
-// HasMandatoryLit reports whether pattern has a non-empty mandatory literal
-// that can anchor it in set composition. Patterns without one go to the
-// fallback bucket scanned at every position by the scalar/AC set match paths.
+// HasMandatoryLit reports whether pattern contains a non-empty mandatory
+// literal that the analyser can locate. This is a necessary but NOT
+// sufficient condition for using the pattern as an anchor in set
+// composition: the AST path to the literal must also be splittable
+// (see splitAtPath), which excludes literals reached only through OpPlus,
+// OpRepeat, or OpAlternate. The set router applies that additional check
+// itself; callers that need a yes/no answer on "is this pattern usable as
+// a set anchor?" must do the same.
 func HasMandatoryLit(pattern string) bool {
 	return findMandatoryLit(pattern) != nil
 }

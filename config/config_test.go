@@ -283,3 +283,86 @@ func TestResolveFilePath(t *testing.T) {
 		}
 	}
 }
+
+func TestPatternSelector_UnmarshalYAML_InvalidString(t *testing.T) {
+	var s struct {
+		P PatternSelector `yaml:"patterns"`
+	}
+	if err := yaml.Unmarshal([]byte("patterns: \"some\"\n"), &s); err == nil {
+		t.Error("expected error for scalar value other than \"all\", got nil")
+	}
+}
+
+func TestPatternSelector_UnmarshalYAML_NonStringListItem(t *testing.T) {
+	var s struct {
+		P PatternSelector `yaml:"patterns"`
+	}
+	if err := yaml.Unmarshal([]byte("patterns:\n  - 42\n"), &s); err == nil {
+		t.Error("expected error for non-string list item, got nil")
+	}
+}
+
+func TestValidateSets_DuplicateRegexExportName(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{
+			{Name: "p1", Pattern: "foo", MatchFunc: "dup"},
+			{Name: "p2", Pattern: "bar", FindFunc: "dup"},
+		},
+	}
+	if err := ValidateSets(cfg); err == nil {
+		t.Error("expected duplicate WASM export name error among regexes, got nil")
+	}
+}
+
+func TestValidateSets_RegexSetExportCollision(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "p1", Pattern: "foo", MatchFunc: "shared"}},
+		Sets: []SetConfig{
+			{Name: "s1", FindAll: "shared", Patterns: PatternSelector{All: true}},
+		},
+	}
+	if err := ValidateSets(cfg); err == nil {
+		t.Error("expected duplicate WASM export name error between regex and set, got nil")
+	}
+}
+
+func TestValidateSets_MissingPatternsField(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "p1", Pattern: "foo"}},
+		Sets: []SetConfig{
+			{Name: "s1", FindAny: "s1_any"}, // patterns omitted entirely
+		},
+	}
+	if err := ValidateSets(cfg); err == nil {
+		t.Error("expected missing-patterns error, got nil")
+	}
+}
+
+func TestValidateSets_DuplicatePatternInSet(t *testing.T) {
+	cfg := &BuildConfig{
+		Regexes: []RegexEntry{{Name: "p1", Pattern: "foo"}},
+		Sets: []SetConfig{
+			{Name: "s1", FindAny: "s1_any", Patterns: PatternSelector{Names: []string{"p1", "p1"}}},
+		},
+	}
+	if err := ValidateSets(cfg); err == nil {
+		t.Error("expected duplicate-pattern error, got nil")
+	}
+}
+
+func TestLoadConfig_ValidateSetsError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "regexped.yaml")
+	yamlData := "regexps:\n" +
+		"  - name: p1\n    pattern: 'foo'\n" +
+		"sets:\n" +
+		"  - name: s1\n" +
+		"    find_any: any1\n" +
+		"    patterns:\n      - unknown_name\n"
+	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Error("expected ValidateSets error to surface through LoadConfig, got nil")
+	}
+}

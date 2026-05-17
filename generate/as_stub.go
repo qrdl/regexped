@@ -72,35 +72,36 @@ func genASSetSection(cfg config.BuildConfig) string {
 				// 64 is a safe floor — realistic sets have far fewer buckets.
 				cap := max(bs, 64)
 				fn := s.FindAll
-				fmt.Fprintf(&out, `const _buf_%s = new StaticArray<i32>(%d*3);
-let _start_%s: i32 = 0; let _bufN_%s: i32 = 0; let _bufI_%s: i32 = 0;
-/** Returns next match tuple or null when exhausted. Call %s_reset() before reusing on a new input. */
-export function %s_next(input: ArrayBuffer): SetMatch | null {
-    if (_bufI_%s >= _bufN_%s) {
-        const n = ffi_%s(changetype<usize>(input), input.byteLength, changetype<usize>(_buf_%s), %d, _start_%s);
-        if (n <= 0) { _bufN_%s = 0; _bufI_%s = 0; return null; }
-        _bufN_%s = n; _bufI_%s = 0;
-        const last = (n - 1) * 3;
-        const lastLen = _buf_%s[last + 2];
-        _start_%s = _buf_%s[last + 1] + (lastLen > 0 ? lastLen : 1);
+				fmt.Fprintf(&out, `const _buf_%[1]s = new StaticArray<i32>(%[2]d*3);
+let _start_%[1]s: i32 = 0; let _bufN_%[1]s: i32 = 0; let _bufI_%[1]s: i32 = 0;
+/** Returns next match tuple or null when exhausted. Call %[1]s_reset() before reusing on a new input. */
+export function %[1]s_next(input: ArrayBuffer): SetMatch | null {
+    if (_bufI_%[1]s >= _bufN_%[1]s) {
+        // _start_<fn> < 0 is a sentinel meaning "input exhausted on the previous
+        // call" — when ffi returned n < cap. Do not call ffi again.
+        if (_start_%[1]s < 0) { _bufN_%[1]s = 0; _bufI_%[1]s = 0; return null; }
+        const n = ffi_%[3]s(changetype<usize>(input), input.byteLength, changetype<usize>(_buf_%[1]s), %[2]d, _start_%[1]s);
+        if (n <= 0) { _bufN_%[1]s = 0; _bufI_%[1]s = 0; return null; }
+        _bufN_%[1]s = n; _bufI_%[1]s = 0;
+        // find_all returns when EITHER the buffer is full (n == cap) OR the
+        // input has been fully scanned (n < cap). Only the buffer-full case
+        // needs a resume; otherwise mark this iterator exhausted.
+        if (n < %[2]d) {
+            _start_%[1]s = -1;
+        } else {
+            const last = (n - 1) * 3;
+            // Advance by exactly one position past the last reported start: the WASM
+            // scan is position-by-position and only positions <= last.start have been
+            // visited when the buffer fills, regardless of last.length.
+            _start_%[1]s = _buf_%[1]s[last + 1] + 1;
+        }
     }
-    const i = _bufI_%s++ * 3;
-    return new SetMatch(_buf_%s[i], _buf_%s[i + 1], _buf_%s[i + 1] + _buf_%s[i + 2]);
+    const i = _bufI_%[1]s++ * 3;
+    return new SetMatch(_buf_%[1]s[i], _buf_%[1]s[i + 1], _buf_%[1]s[i + 1] + _buf_%[1]s[i + 2]);
 }
-export function %s_reset(): void { _start_%s = 0; _bufN_%s = 0; _bufI_%s = 0; }
+export function %[1]s_reset(): void { _start_%[1]s = 0; _bufN_%[1]s = 0; _bufI_%[1]s = 0; }
 `,
-					fn, cap,
-					fn, fn, fn,
-					fn,
-					fn,
-					fn, fn,
-					wasmExport, fn, cap, fn,
-					fn, fn,
-					fn, fn,
-					fn, fn, fn,
-					fn,
-					fn, fn, fn, fn,
-					fn, fn, fn, fn)
+					fn, cap, wasmExport)
 			}
 			if s.FindAny != "" {
 				anyFFI := "ffi_" + s.FindAny

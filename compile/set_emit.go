@@ -1626,26 +1626,60 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	b = append(b, 0x21, lLitID)
 	b = append(b, 0x20, lOutIdx, 0x41, 0x01, 0x6A, 0x21, lOutIdx)
 
-	// Dispatch on lLitID: handle each literal ID (may dispatch to multiple buckets).
-	for k, buckets := range cs.litToBuckets {
-		litLen := cs.litLens[k]
-		b = append(b, 0x20, lLitID, 0x41)
-		b = utils.AppendSLEB128(b, int32(k))
-		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
-		// lMatchPos = lPos - (litLen - 1)
-		if litLen <= 1 {
-			b = append(b, 0x20, lPos, 0x21, lMatchPos)
-		} else {
-			b = append(b, 0x20, lPos, 0x41)
-			b = utils.AppendSLEB128(b, int32(litLen-1))
-			b = append(b, 0x6B, 0x21, lMatchPos)
+	// Dispatch on lLitID via br_table: O(1) jump instead of an O(K) linear
+	// if-chain. Structure (case 0 outermost, case K-1 innermost):
+	//   block $end
+	//     block $default
+	//       block $case0
+	//         …
+	//           block $caseK-1
+	//             local.get lLitID
+	//             br_table K-1 K-2 … 1 0 K   ;; default → K = $default
+	//           end $caseK-1
+	//           ;; case K-1 handler ; br $end
+	//         …
+	//         end $case0
+	//         ;; case 0 handler ; br $end
+	//       end $default
+	//     end $end
+	K := len(cs.litToBuckets)
+	if K > 0 {
+		b = append(b, 0x02, 0x40) // block $end
+		b = append(b, 0x02, 0x40) // block $default
+		for i := 0; i < K; i++ {  // K nested case blocks
+			b = append(b, 0x02, 0x40)
 		}
-		for _, bucketIdx := range buckets {
-			b = emitValidMaskAt(b, bucketIdx, lMatchPos)
-			b = emitCallSuffixAt(b, litLen, bucketIdx, lMatchPos)
-			b = emitVarLenAt(b, bucketIdx, lMatchPos)
+		b = append(b, 0x20, lLitID)           // local.get lLitID
+		b = append(b, 0x0E)                   // br_table
+		b = utils.AppendULEB128(b, uint32(K)) // count
+		for i := 0; i < K; i++ {
+			b = utils.AppendULEB128(b, uint32(K-1-i))
 		}
-		b = append(b, 0x0B) // end if
+		b = utils.AppendULEB128(b, uint32(K)) // default depth → $default
+		for i := K - 1; i >= 0; i-- {
+			b = append(b, 0x0B) // end $case_i
+			buckets := cs.litToBuckets[i]
+			if len(buckets) > 0 {
+				litLen := cs.litLens[i]
+				// lMatchPos = lPos - (litLen - 1)
+				if litLen <= 1 {
+					b = append(b, 0x20, lPos, 0x21, lMatchPos)
+				} else {
+					b = append(b, 0x20, lPos, 0x41)
+					b = utils.AppendSLEB128(b, int32(litLen-1))
+					b = append(b, 0x6B, 0x21, lMatchPos)
+				}
+				for _, bucketIdx := range buckets {
+					b = emitValidMaskAt(b, bucketIdx, lMatchPos)
+					b = emitCallSuffixAt(b, litLen, bucketIdx, lMatchPos)
+					b = emitVarLenAt(b, bucketIdx, lMatchPos)
+				}
+			}
+			b = append(b, 0x0C) // br depth (i+1) → $end
+			b = utils.AppendULEB128(b, uint32(i+1))
+		}
+		b = append(b, 0x0B) // end $default
+		b = append(b, 0x0B) // end $end
 	}
 
 	b = append(b, 0x0C, 0x00) // br 0 → restart $outputs

@@ -1,4 +1,4 @@
-# wasmtime/as/inject-scanner — Injections payload scanner with two pattern sets
+# wasmtime/as/inject-scanner — Injection payload scanner with two pattern sets
 
 Scans HTTP request payloads for SQL injection and XSS threats using **two
 independent pattern sets** compiled into a single WASM module.

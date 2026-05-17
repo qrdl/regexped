@@ -84,14 +84,19 @@ func %s(input []byte) iter.Seq[SetMatch] {
 				m := SetMatch{PatternID: int(buf[i][0]), Start: int(buf[i][1]), End: int(buf[i][1]+buf[i][2])}
 				if !yield(m) { return }
 			}
-			last := buf[n-1]
-			adv := last[2]; if adv <= 0 { adv = 1 }
-			startPos = last[1] + adv
+			// find_all returns when EITHER the buffer is full (n == cap) OR the
+			// input has been fully scanned (n < cap). Only the buffer-full case
+			// needs a resume; otherwise we're done with this input.
+			if n < %d { return }
+			// Advance by exactly one position past the last reported start:
+			// the WASM scan is position-by-position and only positions <= last.start
+			// have been visited when the buffer fills, regardless of last.length.
+			startPos = buf[n-1][1] + 1
 		}
 	}
 }
 
-`, pubName, pubName, bs, ffiName, bs)
+`, pubName, pubName, bs, ffiName, bs, bs)
 			}
 			if s.FindAny != "" {
 				pubName := goPublicName(s.FindAny)

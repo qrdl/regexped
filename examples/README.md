@@ -16,7 +16,7 @@
 | SQL statement validation | Node.js | TypeScript | set | [node/sql-validator](node/sql-validator) |
 | Credential scanner edge API | Cloudflare Workers | JavaScript | individual | [workers](workers) |
 | Email extraction with captures | wasmtime | AssemblyScript | individual | [wasmtime/as/find-email](wasmtime/as/find-email) |
-| Injections scanner | wasmtime | AssemblyScript | 2 sets | [wasmtime/as/inject-scanner](wasmtime/as/inject-scanner) |
+| Injection scanner | wasmtime | AssemblyScript | 2 sets | [wasmtime/as/inject-scanner](wasmtime/as/inject-scanner) |
 
 Run `make` in any example directory to build and run end-to-end.
 

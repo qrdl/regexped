@@ -147,10 +147,11 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 
 		case line == "strings":
 			if setsMode && !inStrings && len(setBlockEntries) >= 2 {
-				p, f, _, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+				p, f, setStats, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
 				prevPassSet := npassSet
 				npassSet += p
 				nfailSet += f
+				skipCount[skipTimeout] += setStats.nTimeout
 				if testErr != nil {
 					return testErr
 				}
@@ -675,10 +676,11 @@ done:
 
 	// Test the final block (not triggered by a "strings" line).
 	if setsMode && !stopped && !inStrings && len(setBlockEntries) >= 2 {
-		p, f, _, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+		p, f, setStats, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
 		prevPassSet := npassSet
 		npassSet += p
 		nfailSet += f
+		skipCount[skipTimeout] += setStats.nTimeout
 		if testErr != nil {
 			return testErr
 		}
@@ -751,6 +753,7 @@ const (
 type testSetBlockStats struct {
 	hasNonGreedy bool // at least one eligible pattern has a non-greedy quantifier
 	ran          bool // block compiled and ran (not silently skipped)
+	nTimeout     int  // number of test strings where find_all timed out
 }
 
 func testSetBlock(
@@ -795,6 +798,11 @@ func testSetBlock(
 	wasmBytes, _, compErr := compile.CompileFile(cfg, "")
 	if compErr != nil {
 		nfail += len(eligible) * len(testStrings)
+		fmt.Printf("FAIL  set block compile error: %v\n      %d eligible pattern(s) in block:\n",
+			compErr, len(eligible))
+		for _, e := range eligible {
+			fmt.Printf("        [%d] %q\n", e.orig, e.entry.pattern)
+		}
 		return
 	}
 	stats.ran = true
@@ -856,26 +864,49 @@ nextString:
 			result, callErr := findAllFn.Call(store, inBase, int32(len(text)), outBase, int32(setOutCap), startPos)
 			wd.Disarm()
 			if callErr != nil {
-				continue nextString // timeout or error — skip string
+				if isTimeout(callErr) {
+					stats.nTimeout++
+					// Report only the first timeout per block to avoid flooding
+					// output when a giant set (e.g. re2-exhaustive's full pattern
+					// list) trips the 2s watchdog on every input. Subsequent
+					// timeouts are aggregated into stats.nTimeout and surfaced
+					// by the caller as skipTimeout entries.
+					if stats.nTimeout == 1 {
+						fmt.Printf("SKIP  set find_all TIMEOUT input=%q startPos=%d (%d eligible patterns; further timeouts in this block suppressed)\n",
+							text, startPos, len(eligible))
+					}
+					continue nextString
+				}
+				err = fmt.Errorf("set block find_all call (input=%q startPos=%d): %w", text, startPos, callErr)
+				return
 			}
 			count := result.(int32)
 			if count == 0 {
 				break
 			}
-			var lastStart, lastLen int32
+			var lastStart int32
 			for i := int32(0); i < count; i++ {
 				base := int(outBase) + int(i)*setOutTupleBytes
 				pid := int32(buf[base]) | int32(buf[base+1])<<8 | int32(buf[base+2])<<16 | int32(buf[base+3])<<24
 				start := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
 				length := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
 				gotMatches[pid] = append(gotMatches[pid], [2]int{int(start), int(start + length)})
-				lastStart, lastLen = start, length
+				lastStart = start
 			}
-			if lastLen > 0 {
-				startPos = lastStart + lastLen
-			} else {
-				startPos = lastStart + 1
+			// find_all returns when EITHER the buffer is full (count == out_cap)
+			// OR the input has been fully scanned (count < out_cap). Only the
+			// buffer-full case needs a resume; otherwise we're done with this
+			// input. Without this guard we would re-scan [lastStart+1, inLen]
+			// after every successful scan, re-emitting the same matches and
+			// looping forever.
+			if int(count) < setOutCap {
+				break
 			}
+			// Resume one position past last.start: the WASM scan is
+			// position-by-position, so only positions <= lastStart have been
+			// visited. Advancing by last_len would skip positions inside the
+			// last match's span and miss overlapping matches.
+			startPos = lastStart + 1
 		}
 
 		// Compare against each eligible pattern's expected results.

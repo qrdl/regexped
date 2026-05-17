@@ -5,7 +5,7 @@ import { scan_sqli, scan_xss, patternName } from "./stub";
 
 function check(label: string, payload: string): void {
   const buf = String.UTF8.encode(payload);
-  console.log("payload: " + payload);
+  console.log("[" + label + "] payload: " + payload);
 
   const sqli = scan_sqli(buf);
   if (sqli) {
