@@ -8,5 +8,5 @@ name = "secret-scanner"
 path = "main.rs"
 
 [dependencies]
-wasmtime = "25"
+wasmtime = "36"
 anyhow = "1"
