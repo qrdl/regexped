@@ -8,7 +8,7 @@
 
 Regexped (pronounced reg-exped, short for REGexp EXPEDited) compiles regular expression patterns into standalone WebAssembly modules. It analyses your patterns, picks the best engine (DFA, TDFA, or Backtracking/BitState), emits WASM bytecode, and generates ready-to-use stubs for Rust, Go, C, JavaScript, TypeScript, and AssemblyScript.
 
-Embed high-performance regex matchers directly into WASM applications — no full regex engine needed at runtime.
+Embed high-performance regexp matchers directly into WASM applications — no full regexp engine needed at runtime.
 
 Supports RE2/Perl (leftmost-first) semantics. Unicode not yet supported.
 
@@ -67,6 +67,7 @@ See [docker.md](docker.md) for full Docker usage and workflow examples.
 **Environments**
 - [Browser embedding](browser.md) — standalone WASM, JS/TS stub, no merge needed
 - [Node.js](node.md) — standalone WASM, TypeScript stub, `readFileSync` + `init()`
+- [wasmtime](wasmtime.md) — embedded WASM merged with a Rust/Go/C/AssemblyScript host, run via the `wasmtime` CLI or any wasmtime embedding
 - [Cloudflare Workers](workers.md) — standalone WASM, JS module import, isolate-level init
 - [Gcore FastEdge](fastedge.md) — embedded WASM, Rust stubs, merge workflow
 
@@ -104,6 +105,7 @@ See [`examples/README.md`](../examples/README.md) for more details.
 | TDFA capture groups (URL parse) | 2.3–6.9× less | 3.0–5.1× faster |
 | Backtracking capture groups | 1.9–12.3× less | 1.7–21.4× faster |
 | No-match fast-reject | up to 21.9× less | up to 12.7× faster |
+| Pattern sets vs `RegexSet`+rescan (8–20 patterns, 100 KB) | — | 2.0–18.5× faster |
 
 ## Limitations
 
@@ -113,7 +115,7 @@ See [`examples/README.md`](../examples/README.md) for more details.
 
 ## Dependencies
 
-Regexped is almost dependency-free. The only compile-time dependency is [`github.com/goccy/go-yaml`](https://github.com/goccy/go-yaml) for YAML config parsing. All regex compilation, WASM emission, and stub generation are implemented from scratch with no external libraries.
+Regexped is almost dependency-free. The only compile-time dependency is [`github.com/goccy/go-yaml`](https://github.com/goccy/go-yaml) for YAML config parsing. All regexp compilation, WASM emission, and stub generation are implemented from scratch with no external libraries.
 
 The `wasmtime-go` binding is used only in `re2test/` and `perftest/` testing tools and is not a part of the main tool.
 

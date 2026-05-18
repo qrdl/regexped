@@ -1,13 +1,13 @@
 # regexped must be built first: run `make` in the repo root.
 REGEXPED    := ../../regexped
 REGEX_WASMS := regexps.wasm
-JS_STUB     := regex.js
+JS_STUB     := regexp.js
 
 .PHONY: all build run clean
 
 all: build
 
-# Step 1 – compile regex patterns to WASM
+# Step 1 – compile regexp patterns to WASM
 $(REGEX_WASMS): regexped.yaml
 	$(REGEXPED) compile --config=regexped.yaml
 

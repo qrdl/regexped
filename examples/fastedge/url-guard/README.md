@@ -32,7 +32,7 @@ minimal overhead.
 | `request_smuggling` | HTTP header names (`transfer-encoding:`, `content-length:`) in path |
 | `ldap_injection` | LDAP filter metacharacters (`)(`, `*)(`, `,uid=`) |
 | `xpath_injection` | XPath injection probes (`' or '1'='1`, `contains(`, `substring(`) |
-| `nosql_injection` | MongoDB/NoSQL operator injection (`$where`, `$gt`, `$regex`, etc.) |
+| `nosql_injection` | MongoDB/NoSQL operator injection (`$where`, `$gt`, `$regexp`, etc.) |
 | `unicode_normalization` | Overlong UTF-8 encodings of `/` and `.` used to bypass path filters |
 
 ## Prerequisites

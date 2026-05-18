@@ -8,7 +8,7 @@
 // Response: JSON { findings: [{ type, start, end, value }] }
 
 import wasm from './regexps.wasm';
-import { init, find_github_token, find_jwt_token, find_aws_key } from './regex.js';
+import { init, find_github_token, find_jwt_token, find_aws_key } from './regexp.js';
 
 // Instantiate once at module load time (outside the fetch handler).
 // CF Workers reuse the isolate across requests, so this runs only once per isolate.

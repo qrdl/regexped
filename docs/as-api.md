@@ -1,8 +1,8 @@
 # Generated AssemblyScript API
 
-Regexped generates an AssemblyScript stub file that imports compiled WASM regex
+Regexped generates an AssemblyScript stub file that imports compiled WASM regexp
 functions and re-exports them with a higher-level interface. Because AssemblyScript
-compiles to WASM itself, the stubs are merged with the regex modules via
+compiles to WASM itself, the stubs are merged with the regexp modules via
 `wasm-merge` into a single final `.wasm` binary.
 
 ## Requirements
@@ -14,10 +14,10 @@ compiles to WASM itself, the stubs are merged with the regex modules via
 ## Project setup
 
 ```sh
-regexped compile  --config regexped.yaml   # compile regex WASM files
+regexped compile  --config regexped.yaml   # compile regexp WASM files
 regexped generate --config regexped.yaml   # write stub.ts (or the path from stub_file)
 asc index.ts --target release              # compile AS → main.wasm
-regexped merge    --config regexped.yaml   # merge main.wasm + regex WASMs → output.wasm
+regexped merge    --config regexped.yaml   # merge main.wasm + regexp WASMs → output.wasm
 ```
 
 Specify `stub_type: "as"` in your config to opt into AssemblyScript stubs. Without

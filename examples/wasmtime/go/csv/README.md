@@ -1,6 +1,6 @@
 # csv — CSV parsing and validation
 
-Reads a CSV file with three columns (ID, name, email) from stdin. Uses two regex patterns:
+Reads a CSV file with three columns (ID, name, email) from stdin. Uses two regexp patterns:
 
 - **`find_csv_row`** (DFA find) — counts all rows with three columns, including those with an invalid email
 - **`parse_csv_row`** (TDFA named groups) — extracts `id`, `name`, and `email` from rows that pass email validation
@@ -33,7 +33,7 @@ id="5"       name=Carol Brown                     email=carol@somewhere.net
 ```
 regexped generate      →  generate Go stub (//go:wasmimport)
 go build (GOOS=wasip1) →  compile Go to WASM
-regexped compile       →  compile regex patterns to WASM
-regexped merge         →  merge Go WASM + regex WASM into final binary
+regexped compile       →  compile regexp patterns to WASM
+regexped merge         →  merge Go WASM + regexp WASM into final binary
 wasmtime               →  execute
 ```

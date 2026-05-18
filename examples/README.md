@@ -24,12 +24,12 @@ Run `make` in any example directory to build and run end-to-end.
 
 All examples except `wasmtime/rust/secret-scanner` use the **merged WASM**
 pattern: the host application is itself compiled to WASM (wasip1 or wasm32),
-the regex module is compiled separately, and `regexped merge` (or `wasm-merge`)
+the regexp module is compiled separately, and `regexped merge` (or `wasm-merge`)
 links them into a single `.wasm` file. The final binary runs entirely inside a
 WASM runtime (`wasmtime`, a browser, or a CDN worker).
 
 `wasmtime/rust/secret-scanner` demonstrates the **native host** pattern: the
-host is a native Rust binary that loads a standalone regex `.wasm` file at
+host is a native Rust binary that loads a standalone regexp `.wasm` file at
 runtime using the `wasmtime` crate. No merge step, no WASI, no generated stub —
 the host talks directly to the WASM ABI. This is the approach to use when
 embedding regexped into a native server, CLI tool, or daemon.

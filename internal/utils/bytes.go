@@ -82,7 +82,7 @@ func DecodeSLEB128(data []byte) (int64, int) {
 // the initial value of the mutable i32 global (the shadow-stack pointer in
 // Rust/C outputs), and the memory section's minimum page count × 64 KiB.
 // The memory minimum is included because runtimes like Go reserve the entire
-// initial memory at startup for heap/stack use, so regex tables must be placed
+// initial memory at startup for heap/stack use, so regexp tables must be placed
 // above that range even if the static data only occupies a fraction of it.
 func WasmMemTop(path string) (int64, error) {
 	raw, err := os.ReadFile(path)
@@ -130,7 +130,7 @@ func WasmMemTop(path string) (int64, error) {
 // ParseDataSectionBytes scans a complete WASM binary (in memory) and returns
 // the highest byte address across all active data segments. Unlike WasmMemTop
 // it does not consult globals or the memory section — it is intended for
-// measuring the table footprint of a freshly compiled regex WASM where there
+// measuring the table footprint of a freshly compiled regexp WASM where there
 // is no host stack/heap to account for.
 func ParseDataSectionBytes(raw []byte) (int64, error) {
 	if len(raw) < 8 || string(raw[:4]) != "\x00asm" {
@@ -157,7 +157,7 @@ func ParseDataSectionBytes(raw []byte) (int64, error) {
 // ParseMemorySection returns the total byte size of the minimum memory
 // reservation (minPages × 64 KiB) across all memories in the section.
 // This represents the maximum address that the runtime may use at startup
-// without calling memory.grow, so regex tables must be placed above it.
+// without calling memory.grow, so regexp tables must be placed above it.
 func ParseMemorySection(data []byte) (int64, error) {
 	off := 0
 	count, n := DecodeULEB128(data[off:])

@@ -132,7 +132,7 @@ func TestGenRustStubFileMultiple(t *testing.T) {
 func TestGenJSStubFile(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
-		StubFile: "regex.js",
+		StubFile: "regexp.js",
 		Regexps: []config.RegexEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
 			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
@@ -156,7 +156,7 @@ func TestGenJSStubFile(t *testing.T) {
 func TestGenTSStubFile(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
-		StubFile: "regex.ts",
+		StubFile: "regexp.ts",
 		Regexps: []config.RegexEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
 			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
@@ -482,7 +482,7 @@ func TestGenCStubFilesWithNamedGroups(t *testing.T) {
 func TestGenJSStubFileWithNamedPattern(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
-		StubFile: "regex.js",
+		StubFile: "regexp.js",
 		Regexps: []config.RegexEntry{{
 			NamedGroupsFunc: "url_named",
 			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
@@ -502,7 +502,7 @@ func TestGenJSStubFileWithNamedPattern(t *testing.T) {
 func TestGenTSStubFileWithNamedPattern(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
-		StubFile: "regex.ts",
+		StubFile: "regexp.ts",
 		Regexps: []config.RegexEntry{{
 			NamedGroupsFunc: "url_named",
 			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",

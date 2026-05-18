@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { init, extract_domain } from './regex.ts';
+import { init, extract_domain } from './regexp.ts';
 
 // Load and instantiate the WASM module.
 const wasmPath = fileURLToPath(new URL('./urls.wasm', import.meta.url));

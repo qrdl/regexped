@@ -1,13 +1,13 @@
 # Generated TypeScript API
 
-Regexped generates a TypeScript ES module stub that loads a compiled WASM regex module and exports typed wrapper functions. The TypeScript stub is identical in behaviour to the JavaScript stub but adds full type annotations.
+Regexped generates a TypeScript ES module stub that loads a compiled WASM regexp module and exports typed wrapper functions. The TypeScript stub is identical in behaviour to the JavaScript stub but adds full type annotations.
 
 ## Including stubs in your project
 
 The stub is a single `.ts` ES module file. Import it directly:
 
 ```ts
-import { init, url_match, find_token } from './regex.ts';
+import { init, url_match, find_token } from './regexp.ts';
 ```
 
 The stub requires the merged WASM file (produced by `regexped merge`) to be loaded at startup via `init()`. The module exports one `init` function plus one function per configured `_func` field.

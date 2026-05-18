@@ -1,4 +1,4 @@
-# re2test — Regex Exhaustive Test Runner
+# re2test — Regexp Exhaustive Test Runner
 
 Tests regexped WASM modules against a test file, optionally validating expectations against Go stdlib.
 

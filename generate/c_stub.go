@@ -10,7 +10,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// cStub generates C stub files (.h and .c) for all regex entries in cfg.
+// cStub generates C stub files (.h and .c) for all regexp entries in cfg.
 // out is the stub file path from config (e.g. "stub.h"); both .h and .c are derived from it.
 // If out == "-", both files' content is written concatenated to stdout.
 func cStub(cfg config.BuildConfig, out string) error {
@@ -189,7 +189,7 @@ int %s(const char *input, int len, rx_set_anchor_t *out);
 	return
 }
 
-// genCPartsForEntry generates the .h and .c fragments for one regex entry.
+// genCPartsForEntry generates the .h and .c fragments for one regexp entry.
 func genCPartsForEntry(re config.RegexEntry, importModule string) (hPart, cPart string, err error) {
 	if re.NamedGroupsFunc != "" {
 		return "", "", fmt.Errorf("named_groups_func is not supported for C stubs; use groups_func instead")

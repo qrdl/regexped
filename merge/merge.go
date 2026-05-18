@@ -11,13 +11,13 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// CmdMerge merges the main WASM module with the regex WASM modules using wasm-merge.
+// CmdMerge merges the main WASM module with the regexp WASM modules using wasm-merge.
 // mainWasm is the path to the host main module.
-// regexWasms are the regex WASM files to merge (at least one required).
+// regexWasms are the regexp WASM files to merge (at least one required).
 //
 // This is a thin wrapper around wasm-merge. Users may invoke wasm-merge directly:
 //
-//	wasm-merge --enable-multimemory --enable-simd <main.wasm> main <regex.wasm> <module> \
+//	wasm-merge --enable-multimemory --enable-simd <main.wasm> main <regexp.wasm> <module> \
 //	           --rename-export-conflicts -o output
 //
 // resolveWasmMerge returns the wasm-merge binary path using the lookup order:
@@ -42,7 +42,7 @@ func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []stri
 
 	// Feature flags must precede input files so Binaryen applies them during parsing.
 	// Main module is listed first so it keeps memory index 0 in the merged output
-	// (wasm-merge assigns memory indices in argument order). Regex modules come after
+	// (wasm-merge assigns memory indices in argument order). Regexp modules come after
 	// and get renumbered to higher indices by wasm-merge.
 	mergeArgs := []string{"--enable-multimemory", "--enable-simd", "--enable-bulk-memory", "--enable-bulk-memory-opt"}
 	mergeArgs = append(mergeArgs, mainWasm, "main")

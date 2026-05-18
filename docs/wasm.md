@@ -2,7 +2,7 @@
 
 ## Generated WASM exports
 
-Each regex WASM module exports one or more functions depending on which `_func` fields were set in the config:
+Each regexp WASM module exports one or more functions depending on which `_func` fields were set in the config:
 
 ```wasm
 ;; Anchored match: returns end position [0, len] on match, or -1 on no match.
@@ -16,9 +16,9 @@ Each regex WASM module exports one or more functions depending on which `_func` 
 (func $groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (result i32))
 ```
 
-**Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regex WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regex module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
+**Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regexp WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regexp module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
 
-**Standalone mode** (produced when `output` is absent, for JS/TS/browser direct load): the regex WASM declares and exports its own single memory as `"memory"` (`memory[0]`). No import.
+**Standalone mode** (produced when `output` is absent, for JS/TS/browser direct load): the regexp WASM declares and exports its own single memory as `"memory"` (`memory[0]`). No import.
 
 For standalone use (JS/TS/browser), the compiled WASM is used directly with no merging. Memory index 0 is exported as `"memory"` so the JS host can read input/output.
 
@@ -29,7 +29,7 @@ For standalone use (JS/TS/browser), the compiled WASM is used directly with no m
 ### Embedded (Rust/Go via wasm-merge)
 
 ```
-Regex module's own memory (index 1 after merge):
+Regexp module's own memory (index 1 after merge):
 ┌─────────────────┬─────────────────┬─────┐
 │  DFA Table 1    │  DFA Table 2    │ ... │
 └─────────────────┴─────────────────┴─────┘
@@ -43,7 +43,7 @@ Host module's memory (index 0):
 0               memTop
 ```
 
-Tables start at address 0 of the regex module's own memory. Each subsequent table starts at `PageAlign(prevTableEnd)`. The host memory is completely separate — no coordination needed.
+Tables start at address 0 of the regexp module's own memory. Each subsequent table starts at `PageAlign(prevTableEnd)`. The host memory is completely separate — no coordination needed.
 
 ### Standalone (JS/TS/browser)
 

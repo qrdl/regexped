@@ -9,7 +9,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// tsStub generates a TypeScript ES module stub file for all regex entries in cfg.
+// tsStub generates a TypeScript ES module stub file for all regexp entries in cfg.
 // out is the full output path or "-" for stdout.
 func tsStub(cfg config.BuildConfig, out string) error {
 	content, err := genTSStubFile(cfg)
@@ -24,7 +24,7 @@ func tsStub(cfg config.BuildConfig, out string) error {
 }
 
 // genTSStubFile generates the content of a TypeScript ES module stub that
-// exports typed wrapper functions for every regex entry in cfg.
+// exports typed wrapper functions for every regexp entry in cfg.
 // The caller is responsible for loading the WASM file and passing the bytes
 // (or a WebAssembly.Module) to the exported init() function.
 func genTSStubFile(cfg config.BuildConfig) (string, error) {

@@ -42,7 +42,7 @@ input: no emails here
 ```
 regexped generate   →  generate AS stub (stub.ts)
 npx asc             →  compile AssemblyScript to WASM (main.wasm)
-regexped compile    →  compile regex pattern to WASM (email.wasm)
+regexped compile    →  compile regexp pattern to WASM (email.wasm)
 regexped merge      →  merge main.wasm + email.wasm → final.wasm
 wasmtime run        →  execute
 ```

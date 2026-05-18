@@ -1,6 +1,6 @@
 wasm_file:     "regexps.wasm"
 import_module: "regexps"
-stub_file:     "regex.js"
+stub_file:     "regexp.js"
 
 regexps:
   - pattern:   'ghp_[A-Za-z0-9]{36}'

@@ -37,6 +37,6 @@ Response:
 ## Build pipeline
 
 ```
-regexped compile    →  compile regex patterns to WASM
+regexped compile    →  compile regexp patterns to WASM
 regexped generate   →  generate JS ES module stub
 ```

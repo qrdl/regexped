@@ -1,6 +1,6 @@
 wasm_file:     "urls.wasm"
 import_module: "urls"
-stub_file:     "regex.ts"
+stub_file:     "regexp.ts"
 
 regexps:
   - pattern:          'https?://(?P<host>[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?' 

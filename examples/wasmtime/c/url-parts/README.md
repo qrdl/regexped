@@ -36,7 +36,7 @@ URL:
 ```
 regexped generate   →  generate C header stub (stub.h)
 clang               →  compile C to WASM (wasm32-wasi, no sysroot)
-regexped compile    →  compile regex pattern to WASM
-regexped merge      →  merge C WASM + regex WASM into final binary
+regexped compile    →  compile regexp pattern to WASM
+regexped merge      →  merge C WASM + regexp WASM into final binary
 wasmtime run        →  execute
 ```

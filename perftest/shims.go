@@ -70,7 +70,7 @@ func shimStr(s string) []byte {
 // shimTypeSection builds type section with three types:
 //
 //	type 0: (i32, i64, i32) → i32   clock_time_get
-//	type 1: fnParams → fnResults     the regex function
+//	type 1: fnParams → fnResults     the regexp function
 //	type 2: benchParams → void       the bench function
 func shimTypeSection(fnParams, fnResults, benchParams []byte) []byte {
 	c := []byte{0x03} // 3 types
@@ -78,7 +78,7 @@ func shimTypeSection(fnParams, fnResults, benchParams []byte) []byte {
 	// type 0: clock_time_get (i32, i64, i32) → i32
 	c = append(c, 0x60, 0x03, 0x7F, 0x7E, 0x7F, 0x01, 0x7F)
 
-	// type 1: regex fn
+	// type 1: regexp fn
 	c = append(c, 0x60)
 	c = utils.AppendULEB128(c, uint32(len(fnParams)))
 	c = append(c, fnParams...)
@@ -94,7 +94,7 @@ func shimTypeSection(fnParams, fnResults, benchParams []byte) []byte {
 	return shimSection(0x01, c)
 }
 
-// shimImportSection imports clock_time_get (type 0) and the regex fn (type 1).
+// shimImportSection imports clock_time_get (type 0) and the regexp fn (type 1).
 func shimImportSection(fnModule, fnName string) []byte {
 	c := []byte{0x02} // 2 imports
 	// import 0: wasi_snapshot_preview1.clock_time_get = func type 0

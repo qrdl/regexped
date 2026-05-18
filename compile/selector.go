@@ -6,7 +6,7 @@ import (
 	"regexp/syntax"
 )
 
-// selectBestEngine analyses the compiled regex pattern and selects the optimal engine type.
+// selectBestEngine analyses the compiled regexp pattern and selects the optimal engine type.
 // It considers pattern complexity, feature requirements (captures, word boundaries),
 // and estimated resource usage to choose between Backtrack, DFA, TDFA, or CompiledDFA.
 //
@@ -334,7 +334,7 @@ func estimateDFAMemory(states int) int {
 // --------------------------------------------------------------------------
 // Pattern analysis
 
-// patternAnalysis contains metrics about a regex pattern.
+// patternAnalysis contains metrics about a regexp pattern.
 type patternAnalysis struct {
 	// Program metrics
 	NumInstructions int

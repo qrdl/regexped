@@ -20,6 +20,11 @@ make test             # from re2test/
 
 Test data is unpacked automatically from the Go standard library.
 
+The `test` target chains four sub-targets: `exhaustive`, `custom`, `adjusted`,
+`force-backtrack`, and `sets`. The first four exercise single-pattern compilation
+across the four engines; `sets` exercises the multi-pattern composition pipeline
+described in [sets.md](sets.md).
+
 ---
 
 ## Current results
@@ -98,6 +103,23 @@ Examples of patterns handled by Backtracking:
 - `(a|ab)c` — overlapping alternation branches
 - `(a+)(a+)` — adjacent greedy quantifiers
 - `(.*)(foo)(.*)` — greedy capture consuming into next group
+
+### Sets (`make sets`)
+
+Set composition is validated by replaying multi-pattern blocks from the RE2
+exhaustive suite and a curated `custom-sets.txt` file through the set pipeline
+described in [sets.md](sets.md). For every block with at least two patterns the
+runner:
+
+1. Compiles all patterns as a single set via `CompileFile` with `find_all`.
+2. Runs the resulting WASM against every test input in the block.
+3. Verifies that the returned `(pattern_id, start, length)` tuples cover all
+   per-pattern matches expected by columns 4 / 1 of the RE2 test format.
+
+This exercises all set frontends — SIMD Teddy (≤ 16 literals), Aho-Corasick
+(17–32 literals), and the scalar DFA fallback — together with bucket dispatch
+and the isolated-fallback path for non-greedy patterns. Set tests currently run
+clean with **0 failures**.
 
 ---
 

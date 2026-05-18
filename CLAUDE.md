@@ -2,9 +2,9 @@
 
 ## Purpose
 
-**Regexped** is a Go-based compiler that transforms regular expression patterns into standalone WebAssembly (WASM) modules. It analyzes regex patterns, compiles them to optimized DFA, TDFA, or Backtracking engine implementations, generates WASM bytecode, and produces language-specific stubs for integration with host applications.
+**Regexped** is a Go-based compiler that transforms regular expression patterns into standalone WebAssembly (WASM) modules. It analyzes regexp patterns, compiles them to optimized DFA, TDFA, or Backtracking engine implementations, generates WASM bytecode, and produces language-specific stubs for integration with host applications.
 
-The project enables embedding high-performance regex matchers directly into WASM applications without shipping a full regex engine, reducing binary size and improving performance predictability.
+The project enables embedding high-performance regexp matchers directly into WASM applications without shipping a full regexp engine, reducing binary size and improving performance predictability.
 
 ## Architecture
 
@@ -89,7 +89,7 @@ regexped/
     │   ├── validate/          # FastEdge CDN app: email, URL, XSS validation via regexped WASM stubs
     │   ├── url-guard/         # FastEdge: URL filtering
     │   ├── dryrun/            # FastEdge: dry-run harness
-    │   ├── regex_auto_full/   # FastEdge: full automatic regex pipeline demo
+    │   ├── regex_auto_full/   # FastEdge: full automatic regexp pipeline demo
     │   ├── regex_auto_gen/    # FastEdge: stub generation step
     │   └── regex_auto_use/    # FastEdge: consuming generated stubs
     └── wasmtime/
@@ -294,7 +294,7 @@ wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk
   --rename-export-conflicts -o output
 ```
 
-Main module is listed first so it keeps `memory[0]` in the merged output; regex modules follow and get renumbered to `memory[1]` and above by wasm-merge.
+Main module is listed first so it keeps `memory[0]` in the merged output; regexp modules follow and get renumbered to `memory[1]` and above by wasm-merge.
 
 ### 5. Utilities (`internal/utils/`)
 
@@ -344,10 +344,10 @@ Harnesses must be pre-built with `make harnesses` if changed.
 
 ### Embedded (Rust/Go/C via wasm-merge)
 
-Each regex WASM module has **two memories** after merging:
+Each regexp WASM module has **two memories** after merging:
 
 ```
-Host memory (memory[0]):                 Regex module's own memory (memory[1]):
+Host memory (memory[0]):                 Regexp module's own memory (memory[1]):
 ┌─────────────────┬──────────┐           ┌─────────────────┬─────────────────┬─────┐
 │  Stack/Globals  │   Heap   │           │  DFA Table 1    │  DFA Table 2    │ ... │
 └─────────────────┴──────────┘           └─────────────────┴─────────────────┴─────┘
@@ -355,7 +355,7 @@ Host memory (memory[0]):                 Regex module's own memory (memory[1]):
 ```
 
 - Host memory is completely separate — no coordination needed.
-- DFA tables start at address 0 of the regex module's own memory. Each subsequent table starts at `PageAlign(prevTableEnd)`.
+- DFA tables start at address 0 of the regexp module's own memory. Each subsequent table starts at `PageAlign(prevTableEnd)`.
 - The embedded WASM **imports** `"main"` memory as `memory[0]` for reading input; its own memory (for tables) becomes `memory[1]` after wasm-merge.
 
 ### Standalone (JS/TS/browser)

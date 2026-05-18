@@ -652,7 +652,7 @@ func appendTableLoad64(b []byte, tableMemIdx int) []byte {
 // --------------------------------------------------------------------------
 // CompileFile — orchestrates all patterns and sets into one WASM module.
 
-// CompileFile compiles all regex patterns and sets from cfg into a single WASM module.
+// CompileFile compiles all regexp patterns and sets from cfg into a single WASM module.
 // When cfg.Sets is empty, it is byte-identical to the existing Compile() path.
 func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	if err := config.ValidateSets(&cfg); err != nil {

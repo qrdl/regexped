@@ -22,13 +22,13 @@ $(MAIN_WASM): main.rs stubs.rs Cargo.toml
 
 build: $(MAIN_WASM)
 
-# Step 3 – compile all regex patterns to WASM
+# Step 3 – compile all regexp patterns to WASM
 $(REGEX_WASMS): regexped.yaml
 	$(REGEXPED) compile --config=regexped.yaml
 
 compile: $(REGEX_WASMS)
 
-# Step 4 – merge main WASM and all regex WASMs into a single module
+# Step 4 – merge main WASM and all regexp WASMs into a single module
 $(FINAL_WASM): $(MAIN_WASM) $(REGEX_WASMS) regexped.yaml
 	$(REGEXPED) merge --config=regexped.yaml --main=$(MAIN_WASM) $(REGEX_WASMS)
 

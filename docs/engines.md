@@ -1,4 +1,4 @@
-# Regex Engines
+# Regexp Engines
 
 Regexped implements four engines: **Compiled DFA**, **DFA**, **TDFA**, and **Backtracking**. The right engine is selected automatically at compile time based on the pattern and the requested function types.
 
