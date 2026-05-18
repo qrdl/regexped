@@ -147,10 +147,13 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	const localPos = uint32(3)
 	const localClass = uint32(4)
 
+	var localCell uint32
 	if l.useCompression {
-		b = append(b, 0x01, 0x03, 0x7F) // 3 locals: state, pos, class
+		b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7F) // 3 i32 + 1 i32(cell): state, pos, class, cell
+		localCell = 5
 	} else {
-		b = append(b, 0x01, 0x02, 0x7F) // 2 locals: state, pos
+		b = append(b, 0x02, 0x02, 0x7F, 0x01, 0x7F) // 2 i32 + 1 i32(cell): state, pos, cell
+		localCell = 4
 	}
 
 	// Literal chain prefix.
@@ -185,10 +188,24 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(chain[len(chain)-1].nextWS))
 		b = append(b, 0x21, byte(localState))
+		// Init cellLocal with accept bit of the post-chain state.
+		chainEndAccBit := byte(0)
+		if t.acceptStates[int(chain[len(chain)-1].nextWS)-1] != 0 {
+			chainEndAccBit = 1
+		}
+		b = append(b, 0x41, chainEndAccBit)
+		b = append(b, 0x21, byte(localCell))
 	} else {
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(l.wasmStart))
 		b = append(b, 0x21, byte(localState))
+		// Init cellLocal with accept bit of the initial state.
+		startAccBit := byte(0)
+		if t.acceptStates[int(l.wasmStart)-1] != 0 {
+			startAccBit = 1
+		}
+		b = append(b, 0x41, startAccBit)
+		b = append(b, 0x21, byte(localCell))
 	}
 
 	b = append(b, 0x02, 0x40) // block $done
@@ -223,6 +240,9 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 		b = append(b, 0x20, byte(localClass))
 		b = append(b, 0x6A)
 		b = appendTableLoad8u(b, tableMemIdx) // TABLE: table[state*numClasses+class]
+		b = append(b, 0x22, byte(localCell)) // tee_local cellLocal
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x76) // i32.shr_u
 		b = append(b, 0x21, byte(localState))
 	} else {
 		// state = table[tableOff + (state<<8) + mem[ptr+pos]]
@@ -238,6 +258,9 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 		b = append(b, 0x2D, 0x00, 0x00) // INPUT: mem[ptr+pos]
 		b = append(b, 0x6A)
 		b = appendTableLoad8u(b, tableMemIdx) // TABLE: table[state*256+input_byte]
+		b = append(b, 0x22, byte(localCell)) // tee_local cellLocal
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x76) // i32.shr_u
 		b = append(b, 0x21, byte(localState))
 	}
 
@@ -272,12 +295,10 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	b = append(b, 0x0B)       // end loop $main
 	b = append(b, 0x0B)       // end block $done
 
-	// accept[state] != 0 ? pos : -1
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.acceptOff)
-	b = append(b, 0x20, byte(localState))
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // TABLE: accept[state]
+	// cell & 1 ? pos : -1
+	b = append(b, 0x20, byte(localCell))
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x71) // i32.and
 	b = append(b, 0x04, 0x7F)
 	b = append(b, 0x20, byte(localPos))
 	b = append(b, 0x05)
@@ -295,12 +316,13 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 // Row deduplication is guaranteed to be disabled for the hybrid path (enforced in
 // buildDFALayout), so rowMapOff/useRowDedup are always the zero values.
 func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
+	startStateAccept := t.acceptStates[int(l.wasmStart)-1] != 0
 	return buildAnchoredFindBody(
-		l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff,
+		l.wasmStart, l.tableOff, l.midAcceptOff,
 		l.classMapOff, l.numClasses, l.useU8, l.useCompression,
 		l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept,
 		l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff,
-		l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, t.hasNewlineBoundary, tableMemIdx,
+		l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, t.hasNewlineBoundary, startStateAccept, tableMemIdx,
 	)
 }
 
@@ -312,9 +334,14 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 // dispatch, so no restructuring is required for the find hot path.
 // Row deduplication is guaranteed disabled for the hybrid path.
 func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
+	startAccept := t.acceptStates[int(l.wasmStart)-1] != 0
+	midStartAccept := t.acceptStates[int(l.wasmMidStart)-1] != 0
+	midStartWordAccept := t.acceptStates[int(l.wasmMidStartWord)-1] != 0
+	midStartNewlineAccept := t.acceptStates[int(l.wasmMidStartNewline)-1] != 0
+	prefixEndAccept := l.wasmPrefixEnd > 0 && t.acceptStates[int(l.wasmPrefixEnd)-1] != 0
 	return buildFindBody(
 		l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
-		l.wasmMidStartNewline, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff,
+		l.wasmMidStartNewline, l.wasmPrefixEnd, l.tableOff, l.midAcceptOff,
 		l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
 		l.useU8, l.useCompression, l.startBeginAccept,
 		l.immediateAcceptOff, l.hasImmAccept,
@@ -325,6 +352,7 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0,
 		l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0,
 		l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
-		mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, tableMemIdx,
+		mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
+		startAccept, midStartAccept, midStartWordAccept, midStartNewlineAccept, prefixEndAccept, tableMemIdx,
 	)
 }

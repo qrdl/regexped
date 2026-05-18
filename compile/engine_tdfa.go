@@ -728,8 +728,8 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	var b []byte
 
 	numCapRegs := tt.numRegs
-	// Locals: pos(1) + state(1) + prevState(1) + byte(1) + capture regs.
-	extraLocals := 4 + numCapRegs
+	// Locals: pos(1) + state(1) + prevState(1) + byte(1) + cell(1) + capture regs.
+	extraLocals := 5 + numCapRegs
 	b = utils.AppendULEB128(b, uint32(1)) // 1 local declaration
 	b = utils.AppendULEB128(b, uint32(extraLocals))
 	b = append(b, 0x7F) // i32
@@ -739,7 +739,8 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		localState     = uint32(4)
 		localPrevState = uint32(5)
 		localByte      = uint32(6)
-		localCapBase   = uint32(7)
+		localCell      = uint32(7)
+		localCapBase   = uint32(8)
 	)
 
 	// Initialise capture registers to -1.
@@ -761,6 +762,14 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x21, byte(localState))
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x21, byte(localPos))
+
+	// Initialise cellLocal with accept bit of startState.
+	startAccBit := byte(0)
+	if tt.acceptStates[int(l.wasmStart)-1] != 0 {
+		startAccBit = 1
+	}
+	b = append(b, 0x41, startAccBit)
+	b = append(b, 0x21, byte(localCell))
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $main
@@ -788,17 +797,40 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x6A)
 	b = append(b, 0x21, byte(localPos))
 
-	// state = table[tableOff + prevState<<8 + byte]
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.tableOff)
-	b = append(b, 0x20, byte(localPrevState))
-	b = append(b, 0x41, 0x08)
-	b = append(b, 0x74) // i32.shl (prevState<<8)
-	b = append(b, 0x6A)
-	b = append(b, 0x20, byte(localByte))
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // table load → new state
-	b = append(b, 0x21, byte(localState))
+	// state = table[tableOff + prevState<<8 + byte] (u8) or table[tableOff + (prevState*256+byte)*2] (u16)
+	if l.useU8 {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.tableOff)
+		b = append(b, 0x20, byte(localPrevState))
+		b = append(b, 0x41, 0x08)
+		b = append(b, 0x74) // i32.shl (prevState<<8)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, byte(localByte))
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx)     // table load → packed cell
+		b = append(b, 0x22, byte(localCell))      // tee_local cell
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x76)                       // i32.shr_u (cell >> 1 = state)
+		b = append(b, 0x21, byte(localState))
+	} else {
+		// u16: addr = tableOff + (prevState*256 + byte) * 2
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.tableOff)
+		b = append(b, 0x20, byte(localPrevState))
+		b = append(b, 0x41, 0x08)
+		b = append(b, 0x74) // i32.shl (prevState<<8)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, byte(localByte))
+		b = append(b, 0x6A)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x74) // i32.shl (*2)
+		b = append(b, 0x6A)
+		b = appendTableLoad16u(b, tableMemIdx)    // packed cell (u16)
+		b = append(b, 0x22, byte(localCell))      // tee_local cell
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x76)                       // i32.shr_u (cell >> 1 = state)
+		b = append(b, 0x21, byte(localState))
+	}
 
 	// if state == 0: return -1 (dead)
 	b = append(b, 0x20, byte(localState))
@@ -829,12 +861,10 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x0B)       // end loop
 	b = append(b, 0x0B)       // end block $done
 
-	// EOF accept check.
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.acceptOff)
-	b = append(b, 0x20, byte(localState))
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // accept[state]
+	// EOF accept check: cell & 1 != 0 ?
+	b = append(b, 0x20, byte(localCell))
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x71) // i32.and
 	b = append(b, 0x04, 0x7F)             // if [i32]: then-branch returns, else-branch leaves i32
 	b = emitTDFAAcceptEOF(tt, b, localState, localPos, localCapBase)
 	b = append(b, 0x05)       // else

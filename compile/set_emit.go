@@ -250,9 +250,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	tableOffset := opts.TableBase // data segment base for this set's tables
 
 	for bi, bkt := range buckets {
-		fnBody, dataBytes, dataSegs := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi])
+		fnBody, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi])
 		suffixFnBodies[bi] = fnBody
-		tableOffset += int32(len(dataBytes))
+		tableOffset = nextOffset // use actual memory end, not encoded size
 		allDataBytes = append(allDataBytes, dataBytes...)
 		totalDataSegs += dataSegs
 	}
