@@ -268,7 +268,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			prefixID := p.prefixID
 			fnIdx, ok := prefixPoolToFnIdx[prefixID]
 			if !ok {
-				revL := buildDFALayout(p.prefixDFA, int64(prefixTableOffset), false, false, 0)
+				revL := buildDFALayout(p.prefixDFA, int64(prefixTableOffset), false, false, 0, false)
 				body := buildLitAnchorBackScanBody(revL, p.prefixDFA, opts.TableMemIdx)
 				fnIdx = len(prefixFnBodies)
 				prefixFnBodies = append(prefixFnBodies, body)

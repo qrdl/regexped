@@ -259,7 +259,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, 8, btMemoBase, useMemo, buildOpts.tableMemIdx)
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
-			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts))
+			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false)
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
 			matchData = rawM
@@ -285,7 +285,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 	var l *dfaLayout
 	if !dfaTooLarge {
-		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(&buildOpts))
+		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(&buildOpts), false)
 	}
 	patMandLit := findMandatoryLit(re.Pattern)
 
@@ -372,7 +372,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
 							revTable.midAcceptStates[revTable.startState] == 0)) {
 						revTableBase := utils.PageAlign(l.tableEnd)
-						revL := buildDFALayout(revTable, revTableBase, true, false, 0)
+						revL := buildDFALayout(revTable, revTableBase, true, false, 0, false)
 						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
 
 						var litFirstBytes []byte
@@ -519,7 +519,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		} else {
 			p.isTDFA = true
 			tdfaBase := utils.PageAlign(p.tableEnd)
-			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(&buildOpts))
+			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(&buildOpts), true)
 			p.numGroups = tt.numGroups
 			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx)
 			// TDFA only needs the transition table (no stack/memo).

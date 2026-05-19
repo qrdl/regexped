@@ -807,11 +807,9 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		b = append(b, 0x6A)
 		b = append(b, 0x20, byte(localByte))
 		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx)     // table load → packed cell
-		b = append(b, 0x22, byte(localCell))      // tee_local cell
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x76)                       // i32.shr_u (cell >> 1 = state)
+		b = appendTableLoad8u(b, tableMemIdx) // table load → cell (next+1, == state)
 		b = append(b, 0x21, byte(localState))
+		_ = localCell
 	} else {
 		// u16: addr = tableOff + (prevState*256 + byte) * 2
 		b = append(b, 0x41)
@@ -825,10 +823,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		b = append(b, 0x41, 0x01)
 		b = append(b, 0x74) // i32.shl (*2)
 		b = append(b, 0x6A)
-		b = appendTableLoad16u(b, tableMemIdx)    // packed cell (u16)
-		b = append(b, 0x22, byte(localCell))      // tee_local cell
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x76)                       // i32.shr_u (cell >> 1 = state)
+		b = appendTableLoad16u(b, tableMemIdx) // cell (u16, next+1, == state)
 		b = append(b, 0x21, byte(localState))
 	}
 
@@ -861,11 +856,15 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x0B)       // end loop
 	b = append(b, 0x0B)       // end block $done
 
-	// EOF accept check: cell & 1 != 0 ?
-	b = append(b, 0x20, byte(localCell))
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x71) // i32.and
-	b = append(b, 0x04, 0x7F)             // if [i32]: then-branch returns, else-branch leaves i32
+	// EOF accept check (TDFA): read per-state side table at l.acceptOff.
+	// (State-ID partitioning is not applied to TDFA tables because state IDs
+	// are tied to tag-op indices.)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, l.acceptOff)
+	b = append(b, 0x20, byte(localState))
+	b = append(b, 0x6A) // i32.add
+	b = appendTableLoad8u(b, tableMemIdx)
+	b = append(b, 0x04, 0x7F) // if [i32]: then-branch returns, else-branch leaves i32
 	b = emitTDFAAcceptEOF(tt, b, localState, localPos, localCapBase)
 	b = append(b, 0x05)       // else
 	b = append(b, 0x41, 0x7F) // -1

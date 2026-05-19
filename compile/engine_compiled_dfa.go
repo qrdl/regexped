@@ -239,10 +239,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 		b = append(b, 0x6A)
 		b = append(b, 0x20, byte(localClass))
 		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // TABLE: table[state*numClasses+class]
-		b = append(b, 0x22, byte(localCell)) // tee_local cellLocal
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x76) // i32.shr_u
+		b = appendTableLoad8u(b, tableMemIdx) // TABLE: table[state*numClasses+class] (== state)
 		b = append(b, 0x21, byte(localState))
 	} else {
 		// state = table[tableOff + (state<<8) + mem[ptr+pos]]
@@ -257,10 +254,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 		b = append(b, 0x6A)
 		b = append(b, 0x2D, 0x00, 0x00) // INPUT: mem[ptr+pos]
 		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // TABLE: table[state*256+input_byte]
-		b = append(b, 0x22, byte(localCell)) // tee_local cellLocal
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x76) // i32.shr_u
+		b = appendTableLoad8u(b, tableMemIdx) // TABLE: table[state*256+input_byte] (== state)
 		b = append(b, 0x21, byte(localState))
 	}
 
@@ -272,13 +266,16 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
 
-	// Immediate-accept check.
+	// Immediate-accept check (Option D state-compare):
+	//   if state u<= immAcceptLimit: return pos
+	// Relies on reorderAcceptFirst placing immediate-accepting WASM IDs in
+	// 1..immAcceptLimit. The dead state (0) is excluded by the preceding
+	// `state == 0` early return.
 	if hasImmAccept {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
 		b = append(b, 0x20, byte(localState))
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // TABLE: immediateAccept[state]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.immAcceptLimit)
+		b = append(b, 0x4D) // i32.le_u
 		b = append(b, 0x04, 0x40)
 		b = append(b, 0x20, byte(localPos))
 		b = append(b, 0x0F)
@@ -295,10 +292,13 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	b = append(b, 0x0B)       // end loop $main
 	b = append(b, 0x0B)       // end block $done
 
-	// cell & 1 ? pos : -1
-	b = append(b, 0x20, byte(localCell))
+	// EOF accept (Option D): accepting iff (state-1) u< acceptLimit ? pos : -1
+	b = append(b, 0x20, byte(localState))
 	b = append(b, 0x41, 0x01)
-	b = append(b, 0x71) // i32.and
+	b = append(b, 0x6B) // i32.sub (state - 1)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, l.acceptLimit)
+	b = append(b, 0x49) // i32.lt_u
 	b = append(b, 0x04, 0x7F)
 	b = append(b, 0x20, byte(localPos))
 	b = append(b, 0x05)
@@ -319,8 +319,8 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 	startStateAccept := t.acceptStates[int(l.wasmStart)-1] != 0
 	return buildAnchoredFindBody(
 		l.wasmStart, l.tableOff, l.midAcceptOff,
-		l.classMapOff, l.numClasses, l.useU8, l.useCompression,
-		l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept,
+		l.classMapOff, l.numClasses, l.useU8, l.useCompression, false, l.acceptLimit,
+		l.startBeginAccept, l.immAcceptLimit, l.hasImmAccept,
 		l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff,
 		l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, t.hasNewlineBoundary, startStateAccept, tableMemIdx,
 	)
@@ -343,8 +343,8 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
 		l.wasmMidStartNewline, l.wasmPrefixEnd, l.tableOff, l.midAcceptOff,
 		l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
-		l.useU8, l.useCompression, l.startBeginAccept,
-		l.immediateAcceptOff, l.hasImmAccept,
+		l.useU8, l.useCompression, false, l.acceptLimit, l.startBeginAccept,
+		l.immAcceptLimit, l.hasImmAccept,
 		l.wordCharTableOff, l.needWordCharTable,
 		l.midAcceptNWOff, l.midAcceptWOff, t.hasNewlineBoundary,
 		l.firstByteFlags, l.firstBytes,

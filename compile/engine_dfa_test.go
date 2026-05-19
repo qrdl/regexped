@@ -113,10 +113,12 @@ func TestDFATableBytes(t *testing.T) {
 		numStates int
 		want      int
 	}{
-		{1, 2 * 256},     // u8: numWASM=2, packed cells no separate accept
+		{1, 2 * 256},     // u8: numWASM=2
 		{5, 6 * 256},     // u8: numWASM=6
-		{127, 128 * 256}, // u8: numWASM=128, boundary
-		{128, 129 * 512}, // u16: numWASM=129, just over u8 boundary (state*256 entries, 2 bytes each)
+		{127, 128 * 256}, // u8: numWASM=128
+		{128, 129 * 256}, // u8: numWASM=129 (no accept side table any more)
+		{255, 256 * 256}, // u8: numWASM=256, upper boundary
+		{256, 257 * 512}, // u16: numWASM=257, just over u8 limit
 		{300, 301 * 512}, // u16: numWASM=301
 	}
 	for _, c := range cases {
