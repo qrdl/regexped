@@ -316,13 +316,12 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 // Row deduplication is guaranteed to be disabled for the hybrid path (enforced in
 // buildDFALayout), so rowMapOff/useRowDedup are always the zero values.
 func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
-	startStateAccept := t.acceptStates[int(l.wasmStart)-1] != 0
 	return buildAnchoredFindBody(
 		l.wasmStart, l.tableOff, l.midAcceptOff,
-		l.classMapOff, l.numClasses, l.useU8, l.useCompression, false, l.acceptLimit,
+		l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
 		l.startBeginAccept, l.immAcceptLimit, l.hasImmAccept,
 		l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff,
-		l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, t.hasNewlineBoundary, startStateAccept, tableMemIdx,
+		l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, t.hasNewlineBoundary, tableMemIdx,
 	)
 }
 
@@ -334,16 +333,11 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 // dispatch, so no restructuring is required for the find hot path.
 // Row deduplication is guaranteed disabled for the hybrid path.
 func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
-	startAccept := t.acceptStates[int(l.wasmStart)-1] != 0
-	midStartAccept := t.acceptStates[int(l.wasmMidStart)-1] != 0
-	midStartWordAccept := t.acceptStates[int(l.wasmMidStartWord)-1] != 0
-	midStartNewlineAccept := t.acceptStates[int(l.wasmMidStartNewline)-1] != 0
-	prefixEndAccept := l.wasmPrefixEnd > 0 && t.acceptStates[int(l.wasmPrefixEnd)-1] != 0
 	return buildFindBody(
 		l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
 		l.wasmMidStartNewline, l.wasmPrefixEnd, l.tableOff, l.midAcceptOff,
 		l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
-		l.useU8, l.useCompression, false, l.acceptLimit, l.startBeginAccept,
+		l.useU8, l.useCompression, l.acceptLimit, l.startBeginAccept,
 		l.immAcceptLimit, l.hasImmAccept,
 		l.wordCharTableOff, l.needWordCharTable,
 		l.midAcceptNWOff, l.midAcceptWOff, t.hasNewlineBoundary,
@@ -353,6 +347,6 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0,
 		l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 		mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
-		startAccept, midStartAccept, midStartWordAccept, midStartNewlineAccept, prefixEndAccept, tableMemIdx,
+		tableMemIdx,
 	)
 }
