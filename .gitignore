@@ -43,7 +43,7 @@ re2test/re2test
 perftest/perftest
 examples/**/*.wasm
 examples/**/stub*.*
-examples/**/regex.*s
+examples/**/regexp.*s
 Cargo.lock
 wasm-merge
 examples/workers/.wrangler

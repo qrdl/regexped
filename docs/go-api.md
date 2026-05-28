@@ -1,6 +1,6 @@
 # Generated Go API
 
-Regexped generates Go stubs that call into compiled WASM regex modules via `//go:wasmimport`. This document explains how to include the stubs in your project and how to use the generated functions.
+Regexped generates Go stubs that call into compiled WASM regexp modules via `//go:wasmimport`. This document explains how to include the stubs in your project and how to use the generated functions.
 
 ## Requirements
 

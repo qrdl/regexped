@@ -1,10 +1,10 @@
 # Generated Rust API
 
-Regexped generates Rust FFI stubs that call into compiled WASM regex modules. This document explains how to include the stubs in your project and how to use the generated functions.
+Regexped generates Rust FFI stubs that call into compiled WASM regexp modules. This document explains how to include the stubs in your project and how to use the generated functions.
 
 ## Including stubs in your project
 
-Each stub file is a plain Rust source file intended to be pulled in with `include!`. Because all regex WASM modules export functions with the same names (`match`, `find`, `groups`), each stub must live in its own `mod` block to avoid FFI name collisions:
+Each stub file is a plain Rust source file intended to be pulled in with `include!`. Because all regexp WASM modules export functions with the same names (`match`, `find`, `groups`), each stub must live in its own `mod` block to avoid FFI name collisions:
 
 ```rust
 // When you have multiple patterns, wrap each in a module:

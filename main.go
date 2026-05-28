@@ -1,4 +1,4 @@
-// Command regexped compiles regex patterns to WASM match functions.
+// Command regexped compiles regexp patterns to WASM match functions.
 //
 // Usage:
 //
@@ -64,7 +64,7 @@ Global flags:
 
 Commands:
   generate  Generate language stubs (Rust/Go/JS/TS/AS) from a config file
-  compile   Compile regex patterns to a standalone WASM module
+  compile   Compile regexp patterns to a standalone WASM module
   merge     Merge WASM modules into a single binary (thin wrapper around wasm-merge)
 
 Run 'regexped <command> -h' for command-specific options.
@@ -180,7 +180,7 @@ func runMergeCmd(args []string) {
 
 	regexWasms := fs.Args()
 	if len(regexWasms) == 0 {
-		fmt.Fprintln(os.Stderr, "merge: at least one regex WASM file is required as a positional argument")
+		fmt.Fprintln(os.Stderr, "merge: at least one regexp WASM file is required as a positional argument")
 		os.Exit(1)
 	}
 

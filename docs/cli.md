@@ -15,7 +15,7 @@ max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back t
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
 
 regexps:
-  - pattern: 'https?://...' # RE2 regex pattern
+  - pattern: 'https?://...' # RE2 regexp pattern
     name: "my_pattern"      # required when referenced by sets: patterns list
 
     # One or more func fields — only those set are compiled and stubbed.
@@ -195,7 +195,7 @@ See [as-api.md](as-api.md) for full usage examples and slot layout.
 regexped [--debug] compile [--config=<file>] [--output=<file>|-]
 ```
 
-Compiles each regex pattern to a single WASM module. The output mode is selected automatically based on the config:
+Compiles each regexp pattern to a single WASM module. The output mode is selected automatically based on the config:
 
 - **Standalone** (no `output` field in config) — the module owns its memory, DFA/TDFA tables start at address 0. Load directly in JS/TS without merging.
 - **Embedded** (`output` field present) — the module imports memory from a `"main"` host module. Use `regexped merge` to combine with a Rust/Go/C host binary.
@@ -265,13 +265,13 @@ See [sets.md](sets.md) for full pipeline details and output tuple formats.
 regexped [--debug] merge [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
 ```
 
-Merges the host main WASM with one or more regex WASM modules into a single binary using `wasm-merge`. Each regex module's memory is kept separate (multi-memory) and renumbered by wasm-merge.
+Merges the host main WASM with one or more regexp WASM modules into a single binary using `wasm-merge`. Each regexp module's memory is kept separate (multi-memory) and renumbered by wasm-merge.
 
 This command is a thin wrapper around `wasm-merge`. You may invoke wasm-merge directly with:
 
 ```
 wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk-memory-opt \
-  <main.wasm> main <regex.wasm> <module_name> ... \
+  <main.wasm> main <regexp.wasm> <module_name> ... \
   --rename-export-conflicts -o output.wasm
 ```
 
@@ -283,7 +283,7 @@ wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk
 | `--main` | — | Host main WASM file **(required)** |
 | `--output`, `-o` | config `output` | Output WASM file; `-` writes to stdout |
 
-**Positional arguments:** one or more regex WASM files (at least one required).
+**Positional arguments:** one or more regexp WASM files (at least one required).
 
 **Required config fields:**
 
@@ -291,7 +291,7 @@ wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk
 |---|---|
 | `output` | Required unless `--output` is given |
 | `wasm_merge` | Optional; path to wasm-merge binary; defaults to `$WASM_MERGE` env var, then `wasm-merge` in $PATH |
-| `import_module` | Optional; module name passed to wasm-merge; defaults to basename of the regex WASM |
+| `import_module` | Optional; module name passed to wasm-merge; defaults to basename of the regexp WASM |
 
 ---
 
@@ -306,7 +306,7 @@ regexped generate --config=regexped.yaml
 # 2. Build your Rust project to WASM
 cargo build --target wasm32-wasip1 --release
 
-# 3. Compile regex patterns to WASM (no --main needed)
+# 3. Compile regexp patterns to WASM (no --main needed)
 regexped compile --config=regexped.yaml
 
 # 4. Merge into a single binary
@@ -319,20 +319,20 @@ regexped merge --config=regexped.yaml --main=target/wasm32-wasip1/release/app.wa
 # 1. Generate Go stubs
 regexped generate --config=regexped.yaml
 
-# 2. Compile regex patterns to WASM (no --main needed)
+# 2. Compile regexp patterns to WASM (no --main needed)
 regexped compile --config=regexped.yaml
 
 # 3. Build your Go project to WASM
 GOOS=wasip1 GOARCH=wasm go build -o app.wasm .
 
 # 4. Merge into a single binary
-regexped merge --config=regexped.yaml --main=app.wasm regex.wasm
+regexped merge --config=regexped.yaml --main=app.wasm regexp.wasm
 ```
 
 ### JS / Browser / Cloudflare Worker deployment
 
 ```bash
-# 1. Compile regex patterns to WASM (standalone, no merge needed)
+# 1. Compile regexp patterns to WASM (standalone, no merge needed)
 regexped compile --config=regexped.yaml
 
 # 2. Generate JS/TS stub

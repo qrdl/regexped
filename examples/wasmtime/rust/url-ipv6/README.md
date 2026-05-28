@@ -38,7 +38,7 @@ Valid IPv6 URL (matched 29 bytes)
 ```
 regexped generate   →  generate Rust FFI stub
 cargo build         →  compile Rust to WASM (wasm32-wasip1)
-regexped compile    →  compile regex pattern to WASM
-regexped merge      →  merge Rust WASM + regex WASM into final binary
+regexped compile    →  compile regexp pattern to WASM
+regexped merge      →  merge Rust WASM + regexp WASM into final binary
 wasmtime run        →  execute
 ```

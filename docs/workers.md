@@ -8,7 +8,7 @@ Cloudflare Workers support WASM modules as first-class ES module imports. The wo
 # regexped.yaml
 wasm_file:     "regexps.wasm"
 import_module: "regexps"
-stub_file:     "regex.js"
+stub_file:     "regexp.js"
 
 regexps:
   - pattern:   'ghp_[A-Za-z0-9]{36}'
@@ -27,7 +27,7 @@ No `output` field → standalone WASM, no merge step needed.
 
 ```bash
 regexped compile --config=regexped.yaml   # → regexps.wasm
-regexped generate --config=regexped.yaml  # → regex.js
+regexped generate --config=regexped.yaml  # → regexp.js
 ```
 
 See [`examples/workers/Makefile`](../examples/workers/Makefile) for a complete Makefile including `wrangler dev` and `wrangler deploy` targets.
@@ -37,7 +37,7 @@ See [`examples/workers/Makefile`](../examples/workers/Makefile) for a complete M
 ```js
 // Import WASM as a module — Workers bundles it automatically.
 import wasm from './regexps.wasm';
-import { init, find_github_token, find_jwt_token, find_aws_key } from './regex.js';
+import { init, find_github_token, find_jwt_token, find_aws_key } from './regexp.js';
 
 // Instantiate once at module load time, outside the fetch handler.
 // Workers reuse the isolate across requests, so this runs only once per isolate.

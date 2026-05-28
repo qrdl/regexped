@@ -788,17 +788,34 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x6A)
 	b = append(b, 0x21, byte(localPos))
 
-	// state = table[tableOff + prevState<<8 + byte]
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.tableOff)
-	b = append(b, 0x20, byte(localPrevState))
-	b = append(b, 0x41, 0x08)
-	b = append(b, 0x74) // i32.shl (prevState<<8)
-	b = append(b, 0x6A)
-	b = append(b, 0x20, byte(localByte))
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // table load → new state
-	b = append(b, 0x21, byte(localState))
+	// state = table[tableOff + prevState<<8 + byte] (u8) or table[tableOff + (prevState*256+byte)*2] (u16)
+	if l.useU8 {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.tableOff)
+		b = append(b, 0x20, byte(localPrevState))
+		b = append(b, 0x41, 0x08)
+		b = append(b, 0x74) // i32.shl (prevState<<8)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, byte(localByte))
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // table load → next+1 == state
+		b = append(b, 0x21, byte(localState))
+	} else {
+		// u16: addr = tableOff + (prevState*256 + byte) * 2
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.tableOff)
+		b = append(b, 0x20, byte(localPrevState))
+		b = append(b, 0x41, 0x08)
+		b = append(b, 0x74) // i32.shl (prevState<<8)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, byte(localByte))
+		b = append(b, 0x6A)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x74) // i32.shl (*2)
+		b = append(b, 0x6A)
+		b = appendTableLoad16u(b, tableMemIdx) // cell (u16, next+1, == state)
+		b = append(b, 0x21, byte(localState))
+	}
 
 	// if state == 0: return -1 (dead)
 	b = append(b, 0x20, byte(localState))
@@ -829,13 +846,15 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x0B)       // end loop
 	b = append(b, 0x0B)       // end block $done
 
-	// EOF accept check.
+	// EOF accept check (TDFA): read per-state side table at l.acceptOff.
+	// (State-ID partitioning is not applied to TDFA tables because state IDs
+	// are tied to tag-op indices.)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, l.acceptOff)
 	b = append(b, 0x20, byte(localState))
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // accept[state]
-	b = append(b, 0x04, 0x7F)             // if [i32]: then-branch returns, else-branch leaves i32
+	b = append(b, 0x6A) // i32.add
+	b = appendTableLoad8u(b, tableMemIdx)
+	b = append(b, 0x04, 0x7F) // if [i32]: then-branch returns, else-branch leaves i32
 	b = emitTDFAAcceptEOF(tt, b, localState, localPos, localCapBase)
 	b = append(b, 0x05)       // else
 	b = append(b, 0x41, 0x7F) // -1

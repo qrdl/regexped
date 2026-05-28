@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish draft release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build regexped
+        run: go build -trimpath -ldflags "-s -w" -o regexped .
+
+      - name: Determine previous tag
+        id: prev
+        run: |
+          current="${GITHUB_REF_NAME}"
+          prev=$(git tag --sort=-creatordate | grep -v "^${current}$" | head -n1 || true)
+          echo "previous=${prev}" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREV: ${{ steps.prev.outputs.previous }}
+        run: |
+          set -euo pipefail
+          args=(
+            "${GITHUB_REF_NAME}"
+            --draft
+            --title "${GITHUB_REF_NAME}"
+            --generate-notes
+          )
+          if [ -n "${PREV}" ]; then
+            args+=(--notes-start-tag "${PREV}")
+          fi
+          gh release create "${args[@]}" regexped

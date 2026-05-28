@@ -7,7 +7,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// asStub generates an AssemblyScript stub file for all regex entries in cfg.
+// asStub generates an AssemblyScript stub file for all regexp entries in cfg.
 // out is the full output path or "-" for stdout.
 func asStub(cfg config.BuildConfig, out string) error {
 	content, err := genASStubFile(cfg)
@@ -138,7 +138,7 @@ export function %[1]s_reset(): void { _start_%[1]s = 0; _bufN_%[1]s = 0; _bufI_%
 	return out.String()
 }
 
-// genASStubsForEntry generates the AS stub content for a single regex entry.
+// genASStubsForEntry generates the AS stub content for a single regexp entry.
 func genASStubsForEntry(re config.RegexEntry, importModule string) (string, error) {
 	if re.NamedGroupsFunc != "" {
 		return "", fmt.Errorf("named_groups_func is not supported for AS stubs; use groups_func instead")

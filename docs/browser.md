@@ -1,22 +1,22 @@
 # Embedding Regexped in a Browser Application
 
-This guide covers compiling regex patterns to a standalone WASM file and generating a JS module for use in a browser, with no Rust, WASI runtime, or wasm-merge required.
+This guide covers compiling regexp patterns to a standalone WASM file and generating a JS module for use in a browser, with no Rust, WASI runtime, or wasm-merge required.
 
 ## Overview
 
 The browser workflow produces two files:
 
-- **`regexps.wasm`** — standalone WASM containing all regex engines with their own memory
-- **`regex.js`** — generated ES module that loads `regexps.wasm` and exports typed JS wrapper functions
+- **`regexps.wasm`** — standalone WASM containing all regexp engines with their own memory
+- **`regexp.js`** — generated ES module that loads `regexps.wasm` and exports typed JS wrapper functions
 
-The `index.html` imports `regex.js` as an ES module and calls the exported functions directly.
+The `index.html` imports `regexp.js` as an ES module and calls the exported functions directly.
 
 ## Configuration
 
 ```yaml
 # regexped.yaml
 wasm_file:     "regexps.wasm"   # compiled standalone WASM output
-stub_file:     "regex.js"       # generated JS module
+stub_file:     "regexp.js"       # generated JS module
 import_module: "regexps"        # module name used in generated stubs
 
 regexps:
@@ -32,7 +32,7 @@ No `output` field means standalone mode: the compiled WASM owns its own memory a
 ## Build Steps
 
 ```bash
-# 1. Compile regex patterns to a standalone WASM module
+# 1. Compile regexp patterns to a standalone WASM module
 regexped compile --config=regexped.yaml
 
 # 2. Generate the JS ES module stub
@@ -43,10 +43,10 @@ See [`examples/browser/Makefile`](../examples/browser/Makefile) for a complete M
 
 ## Generated JS API
 
-`regex.js` is an ES module. Call `init()` with the WASM bytes before using any exported function:
+`regexp.js` is an ES module. Call `init()` with the WASM bytes before using any exported function:
 
 ```js
-import { init, email_match, url_match } from './regex.js';
+import { init, email_match, url_match } from './regexp.js';
 
 await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
 ```
@@ -65,7 +65,7 @@ Returns `[endPos, matched]`. `matched` is true if the pattern matched; `endPos` 
 ### `find_func` — scan for all matches
 
 ```js
-import { url_find } from './regex.js';
+import { url_find } from './regexp.js';
 
 for (const [start, end] of url_find(text)) {
     console.log(text.slice(start, end));
@@ -80,7 +80,7 @@ Returns a generator that yields `[start, end]` absolute byte positions for each 
 ### `groups_func` — indexed capture groups
 
 ```js
-import { parse_record } from './regex.js';
+import { parse_record } from './regexp.js';
 
 for (const groups of parse_record(text)) {
     // groups[0] = full match [start, end]
@@ -93,7 +93,7 @@ Returns a generator yielding `Array<[start, end] | null>` per match. Index 0 is 
 ### `named_groups_func` — named capture groups
 
 ```js
-import { parse_url } from './regex.js';
+import { parse_url } from './regexp.js';
 
 for (const parts of parse_url(text)) {
     const [s, e] = parts['host'] ?? [0, 0];
@@ -113,7 +113,7 @@ Returns a generator yielding a plain object mapping group name → `[start, end]
 </head>
 <body>
   <script type="module">
-    import { init, email_match, url_match } from './regex.js';
+    import { init, email_match, url_match } from './regexp.js';
 
     await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
 
@@ -134,7 +134,7 @@ The page must be served over HTTP (not `file://`) so that `fetch` can load `rege
 
 The standalone WASM (no `output` field in config):
 - Owns its own memory — no JS memory setup needed
-- Exports each regex function under its `_func` name (e.g. `email_match`, `url_match`)
-- The generated `regex.js` instantiates it with no imports and accesses exports directly
+- Exports each regexp function under its `_func` name (e.g. `email_match`, `url_match`)
+- The generated `regexp.js` instantiates it with no imports and accesses exports directly
 
 Input strings and capture group output buffers are placed in separate WASM memory pages allocated by the generated stub's `init()` function — specifically, in the two pages grown immediately after the DFA table pages. User code does not need to manage memory placement.

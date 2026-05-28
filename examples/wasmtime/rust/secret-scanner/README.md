@@ -5,8 +5,8 @@ loaded directly by a native Rust binary via the `wasmtime` crate.
 
 This example is architecturally different from all other regexped examples.
 In every other example the host application is itself compiled to WASM and
-merged with the regex module so that all code runs inside a single WASM
-process. Here the host is a **native Rust binary** and the regex module is a
+merged with the regexp module so that all code runs inside a single WASM
+process. Here the host is a **native Rust binary** and the regexp module is a
 standalone `.wasm` file loaded at runtime — the same pattern you would use
 when embedding regexped into a native server, CLI tool, or daemon.
 

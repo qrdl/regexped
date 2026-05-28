@@ -118,7 +118,7 @@ func TestBtFoldRune(t *testing.T) {
 
 // TestBtCheckRune1FoldDirect exercises the isFold=true branch in btCheckRune1
 // by calling it with a manually constructed InstRune1+FoldCase instruction.
-// Go's regex compiler never produces InstRune1 with FoldCase (it expands case-
+// Go's regexp compiler never produces InstRune1 with FoldCase (it expands case-
 // insensitive single chars to InstRune with a character class), so this branch
 // is only reachable via a directly constructed instruction.
 func TestBtCheckRune1FoldDirect(t *testing.T) {

@@ -11,7 +11,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// EngineType represents the type of regex engine implementation.
+// EngineType represents the type of regexp engine implementation.
 type EngineType byte
 
 const (
@@ -37,7 +37,7 @@ func (e EngineType) String() string {
 	}
 }
 
-// matcher is the common interface implemented by all regex engines.
+// matcher is the common interface implemented by all regexp engines.
 type matcher interface {
 	Type() EngineType
 }
@@ -259,7 +259,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, 8, btMemoBase, useMemo, buildOpts.tableMemIdx)
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
-			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts))
+			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false)
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
 			matchData = rawM
@@ -285,7 +285,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 	var l *dfaLayout
 	if !dfaTooLarge {
-		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(&buildOpts))
+		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(&buildOpts), false)
 	}
 	patMandLit := findMandatoryLit(re.Pattern)
 
@@ -372,7 +372,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
 							revTable.midAcceptStates[revTable.startState] == 0)) {
 						revTableBase := utils.PageAlign(l.tableEnd)
-						revL := buildDFALayout(revTable, revTableBase, true, false, 0)
+						revL := buildDFALayout(revTable, revTableBase, true, false, 0, false)
 						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
 
 						var litFirstBytes []byte
@@ -519,7 +519,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		} else {
 			p.isTDFA = true
 			tdfaBase := utils.PageAlign(p.tableEnd)
-			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(&buildOpts))
+			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(&buildOpts), true)
 			p.numGroups = tt.numGroups
 			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx)
 			// TDFA only needs the transition table (no stack/memo).
@@ -772,7 +772,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	return out
 }
 
-// Compile compiles multiple regex patterns to a single WASM module.
+// Compile compiles multiple regexp patterns to a single WASM module.
 //   - standalone=false: module imports "main" memory as memory[0] (input) and declares its own memory for DFA tables (becomes memory[1] after wasm-merge)
 //   - standalone=true:  module declares its own memory and exports it as "memory" (for JS/TS/browser direct use)
 //   - tableBase: starting address for DFA/capture tables within the module's memory; use 0 for
@@ -815,7 +815,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	return assembleModule(compiled, memPages, standalone), lastTableEnd, nil
 }
 
-// CmdCompile compiles all regex patterns (and optional sets) from cfg to a
+// CmdCompile compiles all regexp patterns (and optional sets) from cfg to a
 // single WASM module. When cfg.Sets is non-empty, CompileFile is used instead
 // of the bare Compile path, so set-match functions are included in the output.
 // output is the output path (absolute, relative to cwd, or "-" for stdout).

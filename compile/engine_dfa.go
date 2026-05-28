@@ -884,6 +884,7 @@ func dfaTableFrom(d *dfa) *dfaTable {
 		hasNewlineBoundary:    d.hasNewlineBoundary,
 	}
 	minimizeDFA(t)
+	reorderAcceptFirst(t)
 	return t
 }
 
@@ -896,6 +897,10 @@ func dfaTableFrom(d *dfa) *dfaTable {
 func dfaTableFromCanonical(d *dfa) *dfaTable {
 	t := dfaTableFrom(d)
 	bfsRelabelDFA(t)
+	// Re-apply accept-first ordering: bfs reshuffles by discovery order, and we
+	// want accepting states at the bottom of the ID range so the runtime can
+	// check "is accept?" with a single state-ID compare.
+	reorderAcceptFirst(t)
 	return t
 }
 
@@ -950,6 +955,62 @@ func bfsRelabelDFA(t *dfaTable) {
 		}
 	}
 
+	applyStateRemap(t, oldToNew)
+}
+
+// reorderAcceptFirst partitions DFA states into three contiguous ID ranges:
+//
+//	[0 .. immK-1]      : immediate-accepting states (subset of accepting)
+//	[immK .. accK-1]   : accepting but not immediate-accepting
+//	[accK .. n-1]      : non-accepting
+//
+// In WASM-ID space (state = goID + 1, 0 = dead) this becomes:
+//
+//	1 .. immK            : immediate-accepting
+//	immK+1 .. accK       : accepting (non-immediate)
+//	accK+1 .. numWASM-1  : non-accepting
+//
+// This enables two compile-time-encoded runtime checks:
+//   - EOF accept:        (state - 1) u< acceptLimit   (acceptLimit = accK)
+//   - Immediate-accept:  state u<= immAcceptLimit     (immAcceptLimit = immK)
+func reorderAcceptFirst(t *dfaTable) {
+	n := t.numStates
+	if n <= 1 {
+		return
+	}
+	oldToNew := make([]int, n)
+	for s := range oldToNew {
+		oldToNew[s] = -1
+	}
+	newID := 0
+	// Pass 1: immediate-accepting (subset of accepting).
+	for s := 0; s < n; s++ {
+		if t.immediateAcceptStates[s] != 0 {
+			oldToNew[s] = newID
+			newID++
+		}
+	}
+	// Pass 2: accepting but not immediate.
+	for s := 0; s < n; s++ {
+		if oldToNew[s] < 0 && t.acceptStates[s] != 0 {
+			oldToNew[s] = newID
+			newID++
+		}
+	}
+	// Pass 3: non-accepting.
+	for s := 0; s < n; s++ {
+		if oldToNew[s] < 0 {
+			oldToNew[s] = newID
+			newID++
+		}
+	}
+	applyStateRemap(t, oldToNew)
+}
+
+// applyStateRemap rewrites every state-ID reference inside t using oldToNew.
+// oldToNew must be a permutation of [0, t.numStates).
+func applyStateRemap(t *dfaTable, oldToNew []int) {
+	n := t.numStates
 	newTrans := make([]int, n*256)
 	for i := range newTrans {
 		newTrans[i] = -1
@@ -1217,6 +1278,13 @@ type dfaLayout struct {
 	wasmStart      uint32
 	useU8          bool
 	useCompression bool
+	// useAcceptSideTable selects the EOF accept-check strategy:
+	//   false (DFA): WASM state IDs are partitioned (states 1..acceptLimit are
+	//                accepting) — accept check is `(state-1) u< acceptLimit`.
+	//   true  (TDFA): state IDs cannot be repartitioned (tied to tag-op tables),
+	//                so a per-state side table `acceptBytes[state]` is emitted
+	//                at acceptOff and read at EOF.
+	useAcceptSideTable bool
 
 	// Transition table
 	tableOff    int32
@@ -1236,14 +1304,29 @@ type dfaLayout struct {
 	acceptOff   int32
 	acceptBytes []byte
 
+	// acceptLimit is the largest WASM state ID that is eof-accepting. After
+	// reorderAcceptFirst, WASM states 1..acceptLimit are accepting and states
+	// (acceptLimit+1)..(numWASM-1) are not. State 0 is the implicit dead state.
+	// Enables runtime accept checks via a single state-ID compare ("state ≤ K"
+	// in WASM-ID space). Mirrors regex-automata's special-state ID partition
+	// and Hyperscan mcclellan's accept_limit.
+	acceptLimit int32
+
 	// Find-mode flags
 	midAcceptOff   int32
 	midAcceptBytes []byte
 
-	// LeftmostFirst immediate-accept flags (both match and find)
+	// LeftmostFirst immediate-accept flags (both match and find).
+	// The side table (immediateAcceptOff/Bytes) is kept populated for TDFA
+	// (whose state IDs are not partitioned). DFA + CompiledDFA paths use
+	// immAcceptLimit instead: after reorderAcceptFirst, WASM states
+	// 1..immAcceptLimit are exactly the immediate-accepting states, so the
+	// per-byte check becomes `state u<= immAcceptLimit` — one fewer op than
+	// the side-table load.
 	immediateAcceptOff   int32
 	immediateAcceptBytes []byte
 	hasImmAccept         bool
+	immAcceptLimit       int32
 
 	// Word-boundary tables (find mode only)
 	needWordCharTable  bool
@@ -1294,32 +1377,57 @@ type dfaLayout struct {
 }
 
 // dfaTableBytes returns the upper-bound byte footprint of the runtime transition
-// and accept tables for a minimised DFA (uncompressed size for u8 tables, exact
-// for u16). Used to enforce MaxDFAMemory before committing to a DFA layout.
+// tables for a minimised DFA. Encodings (Option D, always unpacked):
+//   - numWASM ≤ 256 : u8  → n*256
+//   - numWASM > 256 : u16 → n*512
+//
+// Used to enforce MaxDFAMemory before committing to a DFA layout.
 func dfaTableBytes(t *dfaTable) int {
 	n := t.numStates + 1 // +1 for the implicit dead state at index 0
 	if n <= 256 {
-		return n * 257 // u8: transitions(n*256) + accept(n)
+		return n * 256
 	}
-	return n * 513 // u16: transitions(n*256*2) + accept(n)
+	return n * 512
 }
 
 // buildDFALayout computes all DFA table data and offsets. needFind must be true
 // when a find function will be emitted (computes extra tables for find mode).
 // compiledDFAThreshold is the resolved threshold (0 = disabled, 1..256 = active).
+// useAcceptSideTable: when true, emit a per-state accept side table at acceptOff
+// (used by TDFA, whose state IDs are not partitioned and cannot use acceptLimit).
 // forceWordChar (optional): force word-char table computation even when needFind=false.
-func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, forceWordChar ...bool) *dfaLayout {
+func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, useAcceptSideTable bool, forceWordChar ...bool) *dfaLayout {
 	wantWordChar := needFind || (len(forceWordChar) > 0 && forceWordChar[0])
 	l := &dfaLayout{}
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
+	// acceptLimit: WASM-state ID K such that "state in [1, K]" iff the DFA state
+	// is eof-accepting. Relies on reorderAcceptFirst having placed accepting DFA
+	// states at the low end of the ID range. Used to replace the per-cell
+	// accept-bit (Option A1/B) with a single state-ID compare in emit code.
+	{
+		k := 0
+		for s := 0; s < t.numStates; s++ {
+			if t.acceptStates[s] != 0 {
+				k++
+			}
+		}
+		l.acceptLimit = int32(k)
+	}
+	// Cell encoding (Option D): all cells store the raw destination WASM state
+	// as next+1 (zero = dead). The eof-accept partition is encoded in the
+	// state-ID ordering itself (reorderAcceptFirst) for DFA-built tables, so
+	// the per-byte transition has no shift/tee overhead.
+	//
+	// TDFA-built tables are not partitioned (state IDs are tied to tag-op
+	// indices), so they fall back to a per-state accept side table at
+	// l.acceptOff (useAcceptSideTable=true).
 	l.useU8 = l.numWASM <= 256
+	l.useAcceptSideTable = useAcceptSideTable
+	// Byte-class compression applies when the u8 table would exceed 32 KB.
 	l.useCompression = l.useU8 && l.numWASM*256 > 32*1024
 
-	// Hybrid dispatch: active when useU8 and state count fits within threshold.
-	// Uses the natural compression decision (does NOT force compression).
-	// When the table is uncompressed, classMap is still computed at Go time for
-	// literalChain analysis but is not emitted to the WASM data segment.
+	// Hybrid dispatch (compiled-DFA chain): active for the u8 path.
 	if l.useU8 && compiledDFAThreshold > 0 && l.numWASM <= compiledDFAThreshold {
 		l.useHybridDispatch = true
 		if !l.useCompression {
@@ -1343,7 +1451,11 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 		}
 	}
 
-	// Transition table.
+	// Transition table. Cell encoding (Option D, always unpacked):
+	//   u8  (n ≤ 256, no compression):  cell = byte(next+1)
+	//   u8  (n ≤ 256, byte-class compressed): cell = byte(next+1) at row*numClasses+class
+	//   u16 (n > 256):                  cell = uint16(next+1) (little-endian)
+	// Dead transitions store 0.
 	if l.useCompression {
 		l.classMapOff = int32(tableBase) + wordCharTableSize
 		l.tableOff = int32(tableBase) + wordCharTableSize + 256
@@ -1425,18 +1537,23 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 		}
 	}
 
-	// EOF accept flags — u8 per state (1 = any pattern accepts, 0 = none).
-	// Multi-pattern wider encoding (u32/u64) is deferred to Phase 4c.
+	// Accept side table.
+	//   DFA-built tables: not emitted; accept check uses the state-ID partition
+	//     and acceptLimit (one-compare runtime cost).
+	//   TDFA-built tables (useAcceptSideTable): one byte per WASM state encoding
+	//     acceptance, read at EOF only.
 	l.acceptOff = l.tableOff + int32(len(l.tableBytes))
-	l.acceptBytes = make([]byte, l.numWASM)
-	for gs, bits := range t.acceptStates {
-		if bits != 0 {
-			l.acceptBytes[gs+1] = 1
+	if l.useAcceptSideTable {
+		l.acceptBytes = make([]byte, l.numWASM)
+		for gs := 0; gs < t.numStates; gs++ {
+			if t.acceptStates[gs] != 0 {
+				l.acceptBytes[gs+1] = 1
+			}
 		}
 	}
 
-	// Mid-scan accept flags.
-	l.midAcceptOff = l.acceptOff + int32(l.numWASM)
+	// Mid-scan accept flags (first standalone table after transitions+accept).
+	l.midAcceptOff = l.acceptOff + int32(len(l.acceptBytes))
 	l.midAcceptBytes = make([]byte, l.numWASM)
 	for gs, bits := range t.midAcceptStates {
 		if bits != 0 {
@@ -1445,19 +1562,37 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	}
 
 	// Immediate-accept flags (LeftmostFirst, both match and find).
+	//
+	// hasImmAccept and immAcceptLimit are runtime-essential (consumed by
+	// emitImmAcceptCheck*); they must be set regardless of dispatch path.
+	// The immediateAcceptBytes side table is only consulted by TDFA-built
+	// tables (useAcceptSideTable=true). For DFA-only patterns the accept
+	// check uses the state-ID partition (Option D) and the bytes/offset are
+	// never read, so we skip both the allocation and the memory reservation.
 	if leftmostFirst && len(t.immediateAcceptStates) > 0 {
 		l.hasImmAccept = true
 		l.immediateAcceptOff = l.midAcceptOff + int32(l.numWASM)
-		l.immediateAcceptBytes = make([]byte, l.numWASM)
-		for gs, bits := range t.immediateAcceptStates {
-			if bits != 0 {
-				l.immediateAcceptBytes[gs+1] = 1
+		k := 0
+		if l.useAcceptSideTable {
+			l.immediateAcceptBytes = make([]byte, l.numWASM)
+			for gs, bits := range t.immediateAcceptStates {
+				if bits != 0 {
+					l.immediateAcceptBytes[gs+1] = 1
+					k++
+				}
+			}
+		} else {
+			for _, bits := range t.immediateAcceptStates {
+				if bits != 0 {
+					k++
+				}
 			}
 		}
+		l.immAcceptLimit = int32(k)
 	}
 
 	immAcceptSize := int32(0)
-	if l.hasImmAccept {
+	if l.hasImmAccept && l.useAcceptSideTable {
 		immAcceptSize = int32(l.numWASM)
 	}
 
@@ -1670,13 +1805,17 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	}
 
 	// Compute tableEnd: highest memory address used by any table.
-	tableEnd := int64(l.acceptOff) + int64(l.numWASM)
+	// DFA paths: no accept side table — accept is encoded via the state-ID partition.
+	// TDFA paths: acceptBytes side table (useAcceptSideTable=true) follows transitions.
+	// midAccept is the first standalone find-mode table after transitions (and after
+	// the optional TDFA acceptBytes table).
+	tableEnd := int64(l.midAcceptOff) + int64(l.numWASM)
 	maxEnd := func(off int32, size int64) {
 		if e := int64(off) + size; e > tableEnd {
 			tableEnd = e
 		}
 	}
-	if l.hasImmAccept {
+	if l.hasImmAccept && l.useAcceptSideTable {
 		maxEnd(l.immediateAcceptOff, int64(l.numWASM))
 	}
 	if l.needWordCharTable {
@@ -1712,14 +1851,20 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 // dfaDataSegments builds the raw data-section payload (count byte + segments)
 // for a DFA layout. needFind controls whether find-mode-only tables are emitted.
 func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
+	// DFA paths (useAcceptSideTable=false): no accept side table; acceptLimit
+	// partitions state IDs so the runtime check is `(state-1) u< acceptLimit`.
+	// TDFA path (useAcceptSideTable=true): state IDs are not partitioned, so a
+	// per-state side table is emitted at acceptOff and read at EOF.
 	emitFindSegs := func(ds, transSegs []byte) []byte {
 		if l.needWordCharTable {
 			ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
 		}
 		ds = append(ds, transSegs...)
-		ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
+		if l.useAcceptSideTable {
+			ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
+		}
 		ds = appendDataSegment(ds, l.midAcceptOff, l.midAcceptBytes)
-		if l.hasImmAccept {
+		if l.hasImmAccept && l.useAcceptSideTable {
 			ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
 		}
 		if l.needWordCharTable {
@@ -1733,7 +1878,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 	}
 	findSegCount := func(base int) byte {
 		n := byte(base)
-		if l.hasImmAccept {
+		if l.hasImmAccept && l.useAcceptSideTable {
 			n++
 		}
 		if l.needWordCharTable {
@@ -1744,6 +1889,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 		}
 		if l.useRowDedup {
 			n++
+		}
+		if l.useAcceptSideTable {
+			n++ // accept side table (TDFA only)
 		}
 		return n
 	}
@@ -1771,7 +1919,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			}
 			transSegs = appendDataSegment(transSegs, l.tableOff, l.tableBytes)
 			if len(l.prefix) == 0 {
-				ds = append(ds, findSegCount(5)+teddyExtraSegs)
+				ds = append(ds, findSegCount(4)+teddyExtraSegs) // classMap+table+midAccept+firstByte
 				ds = emitFindSegs(ds, transSegs)
 				ds = appendDataSegment(ds, l.firstByteOff, l.firstByteFlags[:])
 				if len(l.teddyLoBytes) > 0 {
@@ -1791,13 +1939,16 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 					}
 				}
 			} else {
-				ds = append(ds, findSegCount(4))
+				ds = append(ds, findSegCount(3)) // classMap+table+midAccept (prefix path)
 				ds = emitFindSegs(ds, transSegs)
 			}
 		} else {
-			count := byte(4) // classMap + transitions + accept + midAccept
-			if l.hasImmAccept {
+			count := byte(3) // classMap + transitions + midAccept
+			if l.hasImmAccept && l.useAcceptSideTable {
 				count++
+			}
+			if l.useAcceptSideTable {
+				count++ // accept side table (TDFA only)
 			}
 			if l.useRowDedup {
 				count++
@@ -1814,9 +1965,11 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 				ds = appendDataSegment(ds, l.rowMapOff, l.rowMapBytes)
 			}
 			ds = appendDataSegment(ds, l.tableOff, l.tableBytes)
-			ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
+			if l.useAcceptSideTable {
+				ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
+			}
 			ds = appendDataSegment(ds, l.midAcceptOff, l.midAcceptBytes)
-			if l.hasImmAccept {
+			if l.hasImmAccept && l.useAcceptSideTable {
 				ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
 			}
 			if l.needWordCharTable {
@@ -1832,7 +1985,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			}
 			transSegs = appendDataSegment(transSegs, l.tableOff, l.tableBytes)
 			if len(l.prefix) == 0 {
-				ds = append(ds, findSegCount(4)+teddyExtraSegs)
+				ds = append(ds, findSegCount(3)+teddyExtraSegs) // table+midAccept+firstByte
 				ds = emitFindSegs(ds, transSegs)
 				ds = appendDataSegment(ds, l.firstByteOff, l.firstByteFlags[:])
 				if len(l.teddyLoBytes) > 0 {
@@ -1852,12 +2005,16 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 					}
 				}
 			} else {
-				ds = append(ds, findSegCount(3))
+				ds = append(ds, findSegCount(2)) // table+midAccept (prefix path)
 				ds = emitFindSegs(ds, transSegs)
 			}
 		} else {
-			count := byte(2)
-			if l.hasImmAccept {
+			// Non-find path: transitions + accept side table (TDFA only).
+			count := byte(1) // transitions
+			if l.useAcceptSideTable {
+				count++ // accept side table
+			}
+			if l.hasImmAccept && l.useAcceptSideTable {
 				count++
 			}
 			if l.useRowDedup {
@@ -1874,8 +2031,10 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 				ds = appendDataSegment(ds, l.rowMapOff, l.rowMapBytes)
 			}
 			ds = appendDataSegment(ds, l.tableOff, l.tableBytes)
-			ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
-			if l.hasImmAccept {
+			if l.useAcceptSideTable {
+				ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
+			}
+			if l.hasImmAccept && l.useAcceptSideTable {
 				ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
 			}
 			if l.needWordCharTable {
@@ -1906,7 +2065,8 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 // patternIDs[k] is the global pattern ID written into the output tuple for bit k.
 // tableBase is the memory address at which this DFA's data will be placed.
 // tableMemIdx is 0 for standalone modules (single memory).
-func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int) (funcBody []byte, dataBytes []byte, dataSegCount int) {
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int) (funcBody []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+	nextTableOffset = int32(tableBase)
 	if t == nil || t.numStates == 0 {
 		// Empty DFA: return 0 (no matches).
 		body := []byte{0x01, 0x01, 0x7F} // 1 local i32
@@ -1917,7 +2077,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		return
 	}
 
-	l := buildDFALayout(t, tableBase, false, true, 0, t.hasWordBoundary)
+	l := buildDFALayout(t, tableBase, false, true, 0, false, t.hasWordBoundary)
 
 	// Four 8-byte-per-state bitmask tables placed after all layout data.
 	midBitmaskOff := int32(l.tableEnd)
@@ -1965,10 +2125,12 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	dataBytes = append(dataBytes, appendDataSegment(nil, immBitmaskOff, writeBitmask(t.immediateAcceptStates))...)
 	dataBytes = append(dataBytes, appendDataSegment(nil, eofMidBitmaskOff, writeMidEofBitmask())...)
 	dataSegCount = layoutCount + 4
+	nextTableOffset = eofMidBitmaskOff + int32(l.numWASM)*8
 	if t.hasWordBoundary {
 		dataBytes = append(dataBytes, appendDataSegment(nil, wbNWBitmaskOff, writeBitmask(t.midAcceptNWStates))...)
 		dataBytes = append(dataBytes, appendDataSegment(nil, wbWBitmaskOff, writeBitmask(t.midAcceptWStates))...)
 		dataSegCount += 2
+		nextTableOffset = wbWBitmaskOff + int32(l.numWASM)*8
 	}
 
 	// Use wasmStart for lPos==0 (allows ^ anchors to fire), wasmMidStart otherwise.
@@ -2317,12 +2479,29 @@ func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, hasImmAccept boo
 	if l.useHybridDispatch {
 		body = buildHybridMatchBody(t, l, hasImmAccept, tableMemIdx)
 	} else {
-		body = buildMatchBody(l.wasmStart, l.tableOff, l.acceptOff, l.classMapOff,
-			l.numClasses, l.useU8, l.useCompression,
-			l.immediateAcceptOff, hasImmAccept, l.rowMapOff, l.useRowDedup, tableMemIdx)
+		body = buildMatchBody(l.wasmStart, l.tableOff, l.classMapOff,
+			l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
+			l.immAcceptLimit, hasImmAccept, l.rowMapOff, l.useRowDedup, tableMemIdx)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
+}
+
+// emitAcceptBitOnStack pushes the accept indicator (0 or 1 i32) on the WASM stack.
+//
+// Option D: accept-status is encoded into the state-ID partition by
+// reorderAcceptFirst. A WASM state s is eof-accepting iff 1 ≤ s ≤ acceptLimit.
+// We emit ((stateLocal-1) u< acceptLimit), which correctly returns 0 for the
+// dead state (state == 0 underflows to 0xFFFFFFFF, which is not u< acceptLimit)
+// and 1 for any state in the accepting partition.
+func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
+	b = append(b, 0x20, stateLocal) // local.get state
+	b = append(b, 0x41, 0x01)       // i32.const 1
+	b = append(b, 0x6B)             // i32.sub
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, acceptLimit) // i32.const acceptLimit
+	b = append(b, 0x49)                     // i32.lt_u
+	return b
 }
 
 // appendFindCodeEntry appends a size-prefixed find function body to cs.
@@ -2336,17 +2515,17 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			body = buildHybridFindBody(t, l, mandatoryLit, tableMemIdx)
 		}
 	} else if isAnchoredFind(t) {
-		body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.acceptOff, l.midAcceptOff,
-			l.classMapOff, l.numClasses, l.useU8, l.useCompression,
-			l.startBeginAccept, l.immediateAcceptOff, l.hasImmAccept,
+		body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.midAcceptOff,
+			l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
+			l.startBeginAccept, l.immAcceptLimit, l.hasImmAccept,
 			l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff,
 			l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, t.hasNewlineBoundary, tableMemIdx)
 	} else {
 		body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
-			l.wasmMidStartNewline, l.wasmPrefixEnd, l.tableOff, l.acceptOff, l.midAcceptOff,
+			l.wasmMidStartNewline, l.wasmPrefixEnd, l.tableOff, l.midAcceptOff,
 			l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
-			l.useU8, l.useCompression, l.startBeginAccept,
-			l.immediateAcceptOff, l.hasImmAccept,
+			l.useU8, l.useCompression, l.acceptLimit, l.startBeginAccept,
+			l.immAcceptLimit, l.hasImmAccept,
 			l.wordCharTableOff, l.needWordCharTable,
 			l.midAcceptNWOff, l.midAcceptWOff, t.hasNewlineBoundary,
 			l.firstByteFlags, l.firstBytes,
@@ -2354,7 +2533,8 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0,
 			l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0,
 			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
-			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, tableMemIdx)
+			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
+			tableMemIdx)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -2363,12 +2543,12 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 // emitCompressedU8Transition emits the compressed u8 DFA transition:
 //
 //	class = classMap[classMapOff + byte]
-//	state = table[tableOff + row*numClasses + class]
+//	state = table[tableOff + row*numClasses + class]  (raw next+1; 0 = dead)
 //
 // where byte is loaded from mem[ptrLocal+posLocal] when byteLocal==0xff,
 // or taken from byteLocal otherwise (byte already in a local).
 // row = rowMap[state] when useRowDedup, otherwise row = state.
-// classLocal receives the class value; stateLocal is updated with the new state.
+// classLocal receives the class value; stateLocal is updated with the loaded state.
 func emitCompressedU8Transition(b []byte,
 	tableOff, classMapOff int32, numClasses int,
 	useRowDedup bool, rowMapOff int32,
@@ -2406,19 +2586,19 @@ func emitCompressedU8Transition(b []byte,
 	b = append(b, 0x6A)                   // i32.add
 	b = append(b, 0x20, classLocal)       // local.get class
 	b = append(b, 0x6A)                   // i32.add
-	b = appendTableLoad8u(b, tableMemIdx) // table[row*numClasses+class]
+	b = appendTableLoad8u(b, tableMemIdx) // cell = table[row*numClasses+class] (== state)
 	b = append(b, 0x21, stateLocal)
 	return b
 }
 
 // emitSimpleU8Transition emits the simple u8 DFA transition:
 //
-//	state = table[tableOff + row*256 + byte]
+//	cell = table[..]; state = cell (cell value is the destination state)
 //
 // where byte is loaded from mem[ptrLocal+posLocal] when byteLocal==0xff,
 // or taken from byteLocal otherwise.
 // row = rowMap[state] when useRowDedup, otherwise row = state.
-// stateLocal is updated with the new state.
+// stateLocal is updated with the loaded state.
 func emitSimpleU8Transition(b []byte,
 	tableOff int32,
 	useRowDedup bool, rowMapOff int32,
@@ -2449,18 +2629,18 @@ func emitSimpleU8Transition(b []byte,
 		b = append(b, 0x20, byteLocal)
 	}
 	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // table[row*256+byte]
+	b = appendTableLoad8u(b, tableMemIdx) // cell = table[row*256+byte] (== state)
 	b = append(b, 0x21, stateLocal)
 	return b
 }
 
 // emitU16Transition emits the u16 DFA transition:
 //
-//	state = u16(table[tableOff + row*512 + byteLocal*2])
+//	cell = u16(table[tableOff + row*512 + byteLocal*2])  (cell value is the destination state)
 //
 // byteLocal must be a pre-loaded i32 local containing the input byte.
 // row = rowMap[state] when useRowDedup, otherwise row = state.
-// stateLocal is updated with the new state.
+// stateLocal is updated with the loaded state.
 func emitU16Transition(b []byte,
 	tableOff int32,
 	useRowDedup bool, rowMapOff int32,
@@ -2484,71 +2664,75 @@ func emitU16Transition(b []byte,
 	b = append(b, 0x41, 0x01) // i32.const 1
 	b = append(b, 0x74)       // i32.shl (byte * 2)
 	b = append(b, 0x6A)
-	b = appendTableLoad16u(b, tableMemIdx) // i32.load16_u
+	b = appendTableLoad16u(b, tableMemIdx) // cell = i32.load16_u (== state)
 	b = append(b, 0x21, stateLocal)
 	return b
 }
 
-// emitImmAcceptCheckMatch emits: if immediateAccept[state]: return pos.
+// emitImmAcceptCheckMatch emits: if state u<= immAcceptLimit: return pos.
 // Used in match mode. No-op when hasImmAccept is false.
-func emitImmAcceptCheckMatch(b []byte, immediateAcceptOff int32,
+//
+// Relies on reorderAcceptFirst placing immediate-accepting states at WASM IDs
+// 1..immAcceptLimit. The state==0 (dead) case is guarded by an earlier check
+// in the caller, so we use u<= (not <) here.
+func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 	hasImmAccept bool, stateLocal, posLocal byte, tableMemIdx int) []byte {
 	if !hasImmAccept {
 		return b
 	}
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, immediateAcceptOff)
-	b = append(b, 0x20, stateLocal)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx)
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x20, posLocal)
-	b = append(b, 0x0F) // return
-	b = append(b, 0x0B) // end if
+	_ = tableMemIdx
+	b = append(b, 0x20, stateLocal)            // local.get state
+	b = append(b, 0x41)                        // i32.const immAcceptLimit
+	b = utils.AppendSLEB128(b, immAcceptLimit) //
+	b = append(b, 0x4D)                        // i32.le_u
+	b = append(b, 0x04, 0x40)                  // if (void)
+	b = append(b, 0x20, posLocal)              // local.get pos
+	b = append(b, 0x0F)                        // return
+	b = append(b, 0x0B)                        // end if
 	return b
 }
 
-// emitImmAcceptCheckFindMid emits: if immediateAccept[state]: last_accept=pos+1; br brDepth.
+// emitImmAcceptCheckFindMid emits: if state u<= immAcceptLimit: last_accept=pos+1; br brDepth.
 // Used mid-scan in find mode. No-op when hasImmAccept is false.
-func emitImmAcceptCheckFindMid(b []byte, immediateAcceptOff int32,
+func emitImmAcceptCheckFindMid(b []byte, immAcceptLimit int32,
 	hasImmAccept bool, stateLocal, posLocal, lastAcceptLocal byte,
 	brDepth byte, tableMemIdx int) []byte {
 	if !hasImmAccept {
 		return b
 	}
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, immediateAcceptOff)
+	_ = tableMemIdx
 	b = append(b, 0x20, stateLocal)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx)
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x20, posLocal)
-	b = append(b, 0x41, 0x01) // i32.const 1
-	b = append(b, 0x6A)       // pos + 1
-	b = append(b, 0x21, lastAcceptLocal)
-	b = append(b, 0x0C, brDepth) // br brDepth
-	b = append(b, 0x0B)          // end if
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, immAcceptLimit)
+	b = append(b, 0x4D)                  // i32.le_u
+	b = append(b, 0x04, 0x40)            // if (void)
+	b = append(b, 0x20, posLocal)        //
+	b = append(b, 0x41, 0x01)            // i32.const 1
+	b = append(b, 0x6A)                  // i32.add (pos + 1)
+	b = append(b, 0x21, lastAcceptLocal) //
+	b = append(b, 0x0C, brDepth)         // br brDepth
+	b = append(b, 0x0B)                  // end if
 	return b
 }
 
-// emitImmAcceptCheckFindStart emits: if immediateAccept[state]: last_accept=pos; br brDepth.
+// emitImmAcceptCheckFindStart emits: if state u<= immAcceptLimit: last_accept=pos; br brDepth.
 // Used at the start of each attempt in find mode. No-op when hasImmAccept is false.
-func emitImmAcceptCheckFindStart(b []byte, immediateAcceptOff int32,
+func emitImmAcceptCheckFindStart(b []byte, immAcceptLimit int32,
 	hasImmAccept bool, stateLocal, posLocal, lastAcceptLocal byte,
 	brDepth byte, tableMemIdx int) []byte {
 	if !hasImmAccept {
 		return b
 	}
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, immediateAcceptOff)
+	_ = tableMemIdx
 	b = append(b, 0x20, stateLocal)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx)
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x20, posLocal)
-	b = append(b, 0x21, lastAcceptLocal)
-	b = append(b, 0x0C, brDepth) // br brDepth
-	b = append(b, 0x0B)          // end if
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, immAcceptLimit)
+	b = append(b, 0x4D)                  // i32.le_u
+	b = append(b, 0x04, 0x40)            // if (void)
+	b = append(b, 0x20, posLocal)        //
+	b = append(b, 0x21, lastAcceptLocal) //
+	b = append(b, 0x0C, brDepth)         // br brDepth
+	b = append(b, 0x0B)                  // end if
 	return b
 }
 
@@ -2557,16 +2741,12 @@ func emitImmAcceptCheckFindStart(b []byte, immediateAcceptOff int32,
 // When hasRetry is false (anchored mode): unconditionally br foundDepth → $found.
 // When hasRetry is true (full find mode): br_if foundDepth → $found if last_accept>=0,
 // otherwise increment attemptStartLocal and br outerDepth → $outer.
-func emitEofHandler(b []byte, eofAcceptOff int32,
-	stateLocal, posLocal, lastAcceptLocal, attemptStartLocal byte,
+func emitEofHandler(b []byte, stateLocal byte,
+	posLocal, lastAcceptLocal, attemptStartLocal byte,
 	foundDepth byte, hasRetry bool, outerDepth byte,
-	tableMemIdx int) []byte {
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, eofAcceptOff)
-	b = append(b, 0x20, stateLocal)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx)
-	b = append(b, 0x04, 0x40) // if eofAccept[state]
+	acceptLimit int32) []byte {
+	b = emitAcceptBitOnStack(b, stateLocal, acceptLimit)
+	b = append(b, 0x04, 0x40) // if eofAccept
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x21, lastAcceptLocal)
 	b = append(b, 0x0B) // end if
@@ -2684,17 +2864,39 @@ func emitNLPreAcceptCheck(b []byte, midAcceptNLOff int32,
 //
 // u8 compressed (useU8=true, useCompression=true):
 //
-//	Local indices: 0=ptr 1=len 2=state 3=pos 4=class
+//	Local indices: 0=ptr 1=len 2=state 3=pos 4=class 5=cell
 //
 // u8 simple (useU8=true, useCompression=false):
 //
-//	Local indices: 0=ptr 1=len 2=state 3=pos
+//	Local indices: 0=ptr 1=len 2=state 3=pos 4=cell
 //
 // u16 (useU8=false):
 //
-//	Local indices: 0=ptr 1=len 2=state 3=pos 4=byte
-func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, immediateAcceptOff int32, hasImmAccept bool, rowMapOff int32, useRowDedup bool, tableMemIdx int) []byte {
+//	Local indices: 0=ptr 1=len 2=state 3=pos 4=byte 5=cell
+//
+// startStateAccept: true when the DFA start state itself is an accepting state
+// (handles the empty-input case where no transition is ever taken).
+func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, immAcceptLimit int32, hasImmAccept bool, rowMapOff int32, useRowDedup bool, tableMemIdx int) []byte {
 	var b []byte
+
+	// emitAcceptCheck emits the final post-loop accept check:
+	//   accept != 0 ? return pos : return -1
+	// Option D: accept = (state-1) u< acceptLimit (state-ID partition).
+	emitAcceptCheck := func(b []byte, stateLocal, posLocal byte) []byte {
+		b = emitAcceptBitOnStack(b, stateLocal, acceptLimit)
+		b = append(b, 0x04, 0x7F)     // if (result i32): accept
+		b = append(b, 0x20, posLocal) // local.get pos
+		b = append(b, 0x05)           // else
+		b = append(b, 0x41, 0x7F)     // i32.const -1
+		b = append(b, 0x0B)           // end if
+		b = append(b, 0x0B)           // end function
+		return b
+	}
+
+	// startCellInit emits: cell = startStateAccept ? 1 : 0 (packed paths only).
+	// This seeds the accept bit for the empty-input case. For the unpacked path
+	// the EOF check reads accept from the side table indexed by state, so cell
+	// initialisation is unnecessary.
 
 	if useU8 && useCompression {
 		// ── u8 compressed path ────────────────────────────────────────────────
@@ -2723,7 +2925,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckMatch(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, tableMemIdx)
+		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -2734,18 +2936,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x0B)       // end loop
 		b = append(b, 0x0B)       // end block $done
 
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, acceptOff)
-		b = append(b, 0x20, 0x02)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // accept check
-		b = append(b, 0x04, 0x7F)
-		b = append(b, 0x20, 0x03)
-		b = append(b, 0x05)
-		b = append(b, 0x41, 0x7F)
-		b = append(b, 0x0B)
-		b = append(b, 0x0B) // end function
-		return b
+		return emitAcceptCheck(b, 0x02, 0x03)
 	}
 
 	if useU8 {
@@ -2774,7 +2965,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckMatch(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, tableMemIdx)
+		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -2785,18 +2976,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 		b = append(b, 0x0B) // end loop
 		b = append(b, 0x0B) // end block $done
 
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, acceptOff)
-		b = append(b, 0x20, 0x02)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // accept check
-		b = append(b, 0x04, 0x7F)
-		b = append(b, 0x20, 0x03)
-		b = append(b, 0x05)
-		b = append(b, 0x41, 0x7F)
-		b = append(b, 0x0B)
-		b = append(b, 0x0B) // end function
-		return b
+		return emitAcceptCheck(b, 0x02, 0x03)
 	}
 
 	// ── u16 path ─────────────────────────────────────────────────────────────
@@ -2831,7 +3011,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
 
-	b = emitImmAcceptCheckMatch(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, tableMemIdx)
+	b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)
@@ -2842,20 +3022,7 @@ func buildMatchBody(startState uint32, tableOff, acceptOff, classMapOff int32, n
 	b = append(b, 0x0B) // end loop
 	b = append(b, 0x0B) // end block $done
 
-	// accept check: mem[acceptOff + state] != 0 ? pos : -1
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, acceptOff)
-	b = append(b, 0x20, 0x02)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // i32.load8_u
-	b = append(b, 0x04, 0x7F)
-	b = append(b, 0x20, 0x03)
-	b = append(b, 0x05)
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x0B)
-
-	b = append(b, 0x0B) // end function
-	return b
+	return emitAcceptCheck(b, 0x02, 0x03)
 }
 
 // computePrefix returns the longest literal byte prefix shared by all matches,
@@ -2962,7 +3129,7 @@ func isAnchoredFind(t *dfaTable) bool {
 //	  if last_accept >= 0: return packed i64
 //	end $no_match
 //	i64.const -1
-func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, hasNewlineBoundary bool, tableMemIdx int) []byte {
+func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, hasNewlineBoundary bool, tableMemIdx int) []byte {
 	var b []byte
 
 	// emitPrologue: state=startState, pos=0 (default), last_accept=-1, midAccept check.
@@ -3018,14 +3185,14 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitPrologue(b)
-		b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		b = append(b, 0x20, 0x03) // pos
 		b = append(b, 0x20, 0x01) // len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, false, 0, tableMemIdx)
+		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit)
 		b = append(b, 0x0B)
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -3052,7 +3219,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x21, 0x05)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -3071,14 +3238,14 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitPrologue(b)
-		b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		b = append(b, 0x20, 0x03)
 		b = append(b, 0x20, 0x01)
 		b = append(b, 0x4F)
 		b = append(b, 0x04, 0x40)
-		b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, false, 0, tableMemIdx)
+		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit)
 		b = append(b, 0x0B)
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -3104,7 +3271,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 		b = append(b, 0x21, 0x05)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 		b = append(b, 0x20, 0x03)
 		b = append(b, 0x41, 0x01)
@@ -3123,14 +3290,14 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x02, 0x40) // block $found
 	b = emitPrologue(b)
-	b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+	b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 	b = append(b, 0x03, 0x40) // loop $scan
 
 	b = append(b, 0x20, 0x03)
 	b = append(b, 0x20, 0x01)
 	b = append(b, 0x4F)
 	b = append(b, 0x04, 0x40)
-	b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, false, 0, tableMemIdx)
+	b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit)
 	b = append(b, 0x0B)
 
 	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -3163,7 +3330,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, eofAcceptOff, midAcceptO
 	b = append(b, 0x21, 0x05)
 	b = append(b, 0x0B)
 
-	b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+	b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 	b = append(b, 0x20, 0x03)
 	b = append(b, 0x41, 0x01)
@@ -3240,18 +3407,14 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x48)       // i32.lt_s
 	b = append(b, 0x04, 0x40) // if (void) — depth 0
-	// if acceptOff[state] != 0: last_accept = 0 (match starts at text start)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, revL.acceptOff)
-	b = append(b, 0x20, 0x02) // local.get state
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // accept[state]
-	b = append(b, 0x04, 0x40)             // if (void)
-	b = append(b, 0x41, 0x00)             // i32.const 0
-	b = append(b, 0x21, 0x04)             // local.set last_accept
-	b = append(b, 0x0B)                   // end if
-	b = append(b, 0x0C, 0x02)             // br 2 → $done (0=outer_if, 1=$rev, 2=$done)
-	b = append(b, 0x0B)                   // end if pos<0
+	// if accept[state] != 0: last_accept = 0 (match starts at text start)
+	b = emitAcceptBitOnStack(b, 0x02, revL.acceptLimit)
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x41, 0x00) // i32.const 0
+	b = append(b, 0x21, 0x04) // local.set last_accept
+	b = append(b, 0x0B)       // end if
+	b = append(b, 0x0C, 0x02) // br 2 → $done (0=outer_if, 1=$rev, 2=$done)
+	b = append(b, 0x0B)       // end if pos<0
 
 	// byte = mem[ptr + pos]; local.tee byte(5) leaves it on stack for '\n' check.
 	b = append(b, 0x20, 0x00) // local.get ptr
@@ -3582,14 +3745,14 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	// We open $fwd_done first, then emit the start immAccept check inside it.
 	b = append(b, 0x02, 0x40) // block $fwd_done
 	if l.hasImmAccept {
+		// state-ID partition: WASM states 1..immAcceptLimit are imm-accepting.
+		b = append(b, 0x20, locState) // local.get state
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
-		b = append(b, 0x20, locState)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // immediateAccept[state]
-		b = append(b, 0x04, 0x40)             // if (void)
-		b = append(b, 0x0C, 0x01)             // br 1 → $fwd_done (0=if, 1=$fwd_done)
-		b = append(b, 0x0B)                   // end if
+		b = utils.AppendSLEB128(b, l.immAcceptLimit) // i32.const immAcceptLimit
+		b = append(b, 0x4D)                          // i32.le_u
+		b = append(b, 0x04, 0x40)                    // if (void)
+		b = append(b, 0x0C, 0x01)                    // br 1 → $fwd_done
+		b = append(b, 0x0B)                          // end if
 	}
 
 	// Inner forward DFA scan loop.
@@ -3602,13 +3765,9 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x20, locLen)
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x04, 0x40) // if (void)
-	// if acceptOff[state]: last_accept = pos (EOF accept)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.acceptOff)
-	b = append(b, 0x20, locState)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // accept[state]
-	b = append(b, 0x04, 0x40)             // if (void)
+	// if accept[state] != 0: last_accept = pos (EOF accept)
+	b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
+	b = append(b, 0x04, 0x40) // if (void)
 	b = append(b, 0x20, locPos)
 	b = append(b, 0x21, locLastAccept) // last_accept = pos
 	b = append(b, 0x0B)                // end if accept
@@ -3645,7 +3804,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x21, locLastAccept)
 	b = append(b, 0x0B) // end if midAccept
 
-	b = emitImmAcceptCheckFindMid(b, l.immediateAcceptOff, l.hasImmAccept, locState, locPos, locLastAccept, 2, tableMemIdx)
+	b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, locLastAccept, 2, tableMemIdx)
 
 	// pos++; restart scan.
 	b = append(b, 0x20, locPos)
@@ -3714,7 +3873,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState uint32, tableOff, eofAcceptOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, startBeginAccept bool, immediateAcceptOff int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int) []byte {
 	var b []byte
 
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
@@ -3851,6 +4010,10 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 					b = append(b, 0x20, 0x04) // local.get attempt_start
 					b = append(b, 0x21, 0x03) // local.set pos
 				}
+				// Initialise last_accept for the start state before entering the scan loop.
+				// Handles empty-input and immediate-accept cases: if midAccept[startState]
+				// is set the pattern can match starting here; startBeginAccept covers
+				// patterns that accept at the very beginning of the input.
 				// last_accept = -1
 				b = append(b, 0x41, 0x7F) // i32.const -1
 				b = append(b, 0x21, 0x05) // local.set last_accept
@@ -4093,7 +4256,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkScanLocal = 10
 			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 		} else {
-			// 6 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),simdMask(7),chunk(8),...,chunk2(14),t2Lo(15),t2Hi(16)
+			// 6 i32 + N v128
 			simdMaskLocal = 7
 			chunkLocal = 8
 			tLoLocal = 9
@@ -4111,6 +4274,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				t3HiLocal = 19
 				b = append(b, 0x02, 0x06, 0x7F, 0x0C, 0x7B)
 			} else {
+				// 6 i32 + 9 v128
 				b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
 			}
 		}
@@ -4122,7 +4286,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			b = emitOuterPrologue(b)
 		}
 		b = append(b, 0x02, 0x40) // block $found
-		b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		// pos >= len?
@@ -4130,7 +4294,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, true, 3, tableMemIdx)
+		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit)
 		b = append(b, 0x0B) // end if
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -4159,7 +4323,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x21, 0x05)             // local.set last_accept
 		b = append(b, 0x0B)                   // end if
 
-		b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -4183,7 +4347,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkScanLocal = 9
 			b = append(b, 0x02, 0x07, 0x7F, 0x01, 0x7B)
 		} else {
-			// 5 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),simdMask(6),chunk(7),...,chunk2(13),t2Lo(14),t2Hi(15)
+			// 5 i32 + N v128
 			simdMaskLocal = 6
 			chunkLocal = 7
 			tLoLocal = 8
@@ -4201,6 +4365,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				t3HiLocal = 18
 				b = append(b, 0x02, 0x05, 0x7F, 0x0C, 0x7B)
 			} else {
+				// 5 i32 + 9 v128
 				b = append(b, 0x02, 0x05, 0x7F, 0x09, 0x7B)
 			}
 		}
@@ -4212,7 +4377,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			b = emitOuterPrologue(b)
 		}
 		b = append(b, 0x02, 0x40) // block $found
-		b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		// pos >= len?
@@ -4220,7 +4385,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, true, 3, tableMemIdx)
+		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit)
 		b = append(b, 0x0B) // end if
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -4248,7 +4413,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x21, 0x05) // local.set last_accept
 		b = append(b, 0x0B)       // end if
 
-		b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -4271,7 +4436,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		chunkScanLocal = 10
 		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 	} else {
-		// 6 i32 + 9 v128: state(2),pos(3),attempt_start(4),last_accept(5),byte(6),simdMask(7),chunk(8),...,chunk2(14),t2Lo(15),t2Hi(16)
+		// 6 i32 + N v128
 		simdMaskLocal = 7
 		chunkLocal = 8
 		tLoLocal = 9
@@ -4289,6 +4454,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			t3HiLocal = 19
 			b = append(b, 0x02, 0x06, 0x7F, 0x0C, 0x7B)
 		} else {
+			// 6 i32 + 9 v128
 			b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
 		}
 	}
@@ -4300,7 +4466,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitOuterPrologue(b)
 	}
 	b = append(b, 0x02, 0x40) // block $found
-	b = emitImmAcceptCheckFindStart(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+	b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
 	b = append(b, 0x03, 0x40) // loop $scan
 
 	// pos >= len?
@@ -4308,7 +4474,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitEofHandler(b, eofAcceptOff, 0x02, 0x03, 0x05, 0x04, 2, true, 3, tableMemIdx)
+	b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit)
 	b = append(b, 0x0B) // end if
 
 	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -4343,7 +4509,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x21, 0x05) // local.set last_accept
 	b = append(b, 0x0B)       // end if
 
-	b = emitImmAcceptCheckFindMid(b, immediateAcceptOff, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+	b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)

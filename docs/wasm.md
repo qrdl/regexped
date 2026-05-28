@@ -2,7 +2,7 @@
 
 ## Generated WASM exports
 
-Each regex WASM module exports one or more functions depending on which `_func` fields were set in the config:
+Each regexp WASM module exports one or more functions depending on which `_func` fields were set in the config:
 
 ```wasm
 ;; Anchored match: returns end position [0, len] on match, or -1 on no match.
@@ -16,9 +16,9 @@ Each regex WASM module exports one or more functions depending on which `_func` 
 (func $groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (result i32))
 ```
 
-**Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regex WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regex module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
+**Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regexp WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regexp module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
 
-**Standalone mode** (produced when `output` is absent, for JS/TS/browser direct load): the regex WASM declares and exports its own single memory as `"memory"` (`memory[0]`). No import.
+**Standalone mode** (produced when `output` is absent, for JS/TS/browser direct load): the regexp WASM declares and exports its own single memory as `"memory"` (`memory[0]`). No import.
 
 For standalone use (JS/TS/browser), the compiled WASM is used directly with no merging. Memory index 0 is exported as `"memory"` so the JS host can read input/output.
 
@@ -29,7 +29,7 @@ For standalone use (JS/TS/browser), the compiled WASM is used directly with no m
 ### Embedded (Rust/Go via wasm-merge)
 
 ```
-Regex module's own memory (index 1 after merge):
+Regexp module's own memory (index 1 after merge):
 ┌─────────────────┬─────────────────┬─────┐
 │  DFA Table 1    │  DFA Table 2    │ ... │
 └─────────────────┴─────────────────┴─────┘
@@ -43,7 +43,7 @@ Host module's memory (index 0):
 0               memTop
 ```
 
-Tables start at address 0 of the regex module's own memory. Each subsequent table starts at `PageAlign(prevTableEnd)`. The host memory is completely separate — no coordination needed.
+Tables start at address 0 of the regexp module's own memory. Each subsequent table starts at `PageAlign(prevTableEnd)`. The host memory is completely separate — no coordination needed.
 
 ### Standalone (JS/TS/browser)
 
@@ -61,11 +61,16 @@ The caller writes input into low pages and passes the pointer. Tables start at `
 
 ## DFA table formats
 
+State IDs are partitioned by `reorderAcceptFirst`: WASM states `1..acceptLimit` are
+accepting and `(acceptLimit+1)..n` are not. The EOF accept check is
+`(state-1) u< acceptLimit` — no separate accept array is emitted for DFA paths.
+TDFA paths (`useAcceptSideTable=true`) cannot use this partition and instead emit a
+per-state `acceptBytes` side table at `acceptOff`.
+
 ### u8, no compression (≤ 256 states, table ≤ 32 KB)
 
 ```
 [transitions: u8[numStates * 256]]   // state × byte → next_state  (0 = dead)
-[accept:      u8[numStates]]         // 1 if accepting state
 ```
 
 ### u8, byte-class compressed (≤ 256 states, table > 32 KB)
@@ -75,14 +80,12 @@ Many bytes share identical transition rows. Byte-class compression maps 256 byte
 ```
 [class_map:   u8[256]]                       // byte → equivalence class index
 [transitions: u8[numStates * numClasses]]
-[accept:      u8[numStates]]
 ```
 
 ### u16 (> 256 states)
 
 ```
 [transitions: u16[numStates * 256]]
-[accept:      u8[numStates]]
 ```
 
 ### u16 with row deduplication
@@ -95,7 +98,6 @@ table stores only the unique rows, reducing size from `numStates × 512` bytes t
 ```
 [rowMap:      u8[numStates]]                 // state → row index (0-254)
 [transitions: u16[numUniqueRows * 256]]
-[accept:      u8[numStates]]
 ```
 
 Runtime lookup: `row = rowMap[state]; state = transitions[row * 256 + byte]`.
@@ -108,9 +110,17 @@ Find mode appends additional arrays after the base table:
 |---|---|---|
 | `midAccept` | `u8[numStates]` | 1 if state is accepting mid-scan |
 | `firstByteFlags` or Teddy tables | varies | fast prefix skip (see below) |
-| `immediateAccept` | `u8[numStates]` | 1 if state requires immediate stop (non-greedy) |
 | `wordCharTable` | `u8[256]` | `\w` lookup (word-boundary patterns only) |
 | `midAcceptNW`, `midAcceptW` | `u8[numStates]` each | word-boundary variants of midAccept |
+
+For TDFA paths (`useAcceptSideTable=true`) only:
+
+| Array | Size | Purpose |
+|---|---|---|
+| `acceptBytes` | `u8[numStates]` | 1 if state is EOF-accepting |
+| `immediateAccept` | `u8[numStates]` | 1 if state requires immediate stop (non-greedy) |
+
+DFA paths use `immAcceptLimit` (state-ID partition, `state u<= immAcceptLimit`) instead of a separate `immediateAccept` array.
 
 ---
 

@@ -78,21 +78,21 @@ func ValidateSets(cfg *BuildConfig) error {
 	for i, re := range cfg.Regexps {
 		if re.Name != "" {
 			if _, dup := nameIdx[re.Name]; dup {
-				return fmt.Errorf("duplicate regex name %q", re.Name)
+				return fmt.Errorf("duplicate regexp name %q", re.Name)
 			}
 			nameIdx[re.Name] = i
 		}
 	}
 
 	setNames := make(map[string]bool)
-	exportNames := make(map[string]string) // export name → owner ("set X" or "regex Y")
-	// Seed with per-regex export names so set exports can't collide with them.
+	exportNames := make(map[string]string) // export name → owner ("set X" or "regexp Y")
+	// Seed with per-regexp export names so set exports can't collide with them.
 	for _, re := range cfg.Regexps {
-		owner := "regex"
+		owner := "regexp"
 		if re.Name != "" {
-			owner = fmt.Sprintf("regex %q", re.Name)
+			owner = fmt.Sprintf("regexp %q", re.Name)
 		} else if re.Pattern != "" {
-			owner = fmt.Sprintf("regex %q", re.Pattern)
+			owner = fmt.Sprintf("regexp %q", re.Pattern)
 		}
 		for _, name := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc, re.NamedGroupsFunc} {
 			if name == "" {
@@ -144,7 +144,7 @@ func ValidateSets(cfg *BuildConfig) error {
 	return nil
 }
 
-// RegexEntry describes a single regex pattern and the functions to generate for it.
+// RegexEntry describes a single regexp pattern and the functions to generate for it.
 // One or more of the Func fields must be set; only those stubs are generated.
 // The WASM export names are derived automatically from the function type.
 type RegexEntry struct {

@@ -1,6 +1,6 @@
 wasm_file:     "regexps.wasm"
 import_module: "regexps"
-stub_file:     "regex.js"
+stub_file:     "regexp.js"
 
 regexps:
   - pattern:    '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'

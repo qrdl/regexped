@@ -1,6 +1,6 @@
 # browser — email and URL validation
 
-A single-page demo that validates an email address and URL as the user types, powered entirely by compiled WASM — no JS regex engine. Uses **DFA anchored match** for both patterns.
+A single-page demo that validates an email address and URL as the user types, powered entirely by compiled WASM — no JS regexp engine. Uses **DFA anchored match** for both patterns.
 
 See [docs/browser.md](../../docs/browser.md) for the full guide.
 
@@ -19,13 +19,13 @@ make run
 ## Usage in your own page
 
 ```js
-import { init, email_match, url_match } from './regex.js';
+import { init, email_match, url_match } from './regexp.js';
 await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
 ```
 
 ## Build pipeline
 
 ```
-regexped compile    →  compile regex patterns to standalone WASM
+regexped compile    →  compile regexp patterns to standalone WASM
 regexped generate   →  generate JS ES module stub
 ```

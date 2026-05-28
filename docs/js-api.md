@@ -1,13 +1,13 @@
 # Generated JavaScript API
 
-Regexped generates a JavaScript ES module stub that loads a compiled WASM regex module and exports wrapper functions. This document explains how to initialise the module and use the generated functions.
+Regexped generates a JavaScript ES module stub that loads a compiled WASM regexp module and exports wrapper functions. This document explains how to initialise the module and use the generated functions.
 
 ## Including stubs in your project
 
 The stub is a single `.js` ES module file. Import it directly from your application:
 
 ```js
-import { init, url_match, find_token } from './regex.js';
+import { init, url_match, find_token } from './regexp.js';
 ```
 
 The stub requires the merged WASM file (produced by `regexped merge`) to be loaded at startup via `init()`. The module exports one `init` function plus one function per configured `_func` field.

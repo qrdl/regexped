@@ -56,7 +56,7 @@ docker run --rm -v /path/to/your/project:/work -w /work --user $(id -u):$(id -g)
   compile --config=regexped.yaml
 ```
 
-Compiles all regex patterns in the config to a single WASM file at the path specified by `wasm_file` in the config.
+Compiles all regexp patterns in the config to a single WASM file at the path specified by `wasm_file` in the config.
 
 - If the config has no `output` field, the module is **standalone** (owns its memory; load directly in JS/TS without merging).
 - If the config has an `output` field, the module is **embedded** (imports memory from `"main"`; must be merged with a host binary).
@@ -70,7 +70,7 @@ docker run --rm -v /path/to/your/project:/work -w /work --user $(id -u):$(id -g)
   merge --config=regexped.yaml --main=target/wasm32-wasip1/release/app.wasm regexps.wasm
 ```
 
-Merges the host main WASM with one or more regex WASM modules into a single binary. The output path is taken from the `output` field in the config, or overridden with `--output`.
+Merges the host main WASM with one or more regexp WASM modules into a single binary. The output path is taken from the `output` field in the config, or overridden with `--output`.
 
 `wasm-merge` is available in `$PATH` inside the container — no extra configuration needed.
 
@@ -88,7 +88,7 @@ docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
 # 2. Build your Rust project to WASM (outside the container — needs cargo)
 cargo build --target wasm32-wasip1 --release
 
-# 3. Compile regex patterns to WASM
+# 3. Compile regexp patterns to WASM
 docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
   compile --config=regexped.yaml
 
@@ -104,7 +104,7 @@ docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
 docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
   generate --config=regexped.yaml
 
-# 2. Compile regex patterns to WASM
+# 2. Compile regexp patterns to WASM
 docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
   compile --config=regexped.yaml
 
@@ -119,7 +119,7 @@ docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
 ### JavaScript / TypeScript (no merge needed)
 
 ```bash
-# 1. Compile regex patterns to WASM (standalone mode — no output field in config)
+# 1. Compile regexp patterns to WASM (standalone mode — no output field in config)
 docker run --rm -v $(pwd):/work -w /work --user $(id -u):$(id -g) regexped \
   compile --config=regexped.yaml
 

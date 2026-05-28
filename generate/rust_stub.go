@@ -9,7 +9,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// rustStub generates a Rust stub file for all regex entries and sets in cfg.
+// rustStub generates a Rust stub file for all regexp entries and sets in cfg.
 // out is the full output path or "-" for stdout.
 func rustStub(cfg config.BuildConfig, out string) error {
 	singleInner, err := genRustStubsInner(cfg.Regexps, cfg.ImportModule)

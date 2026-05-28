@@ -8,7 +8,7 @@ Node.js supports WASM natively. The workflow is identical to the browser: compil
 # regexped.yaml
 wasm_file:     "urls.wasm"
 import_module: "urls"
-stub_file:     "regex.ts"    # .ts → TypeScript stub; use .js for plain JS
+stub_file:     "regexp.ts"    # .ts → TypeScript stub; use .js for plain JS
 
 regexps:
   - pattern:           'https?://(?P<host>[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?'
@@ -21,7 +21,7 @@ No `output` field → standalone WASM, no merge step needed.
 
 ```bash
 regexped compile --config=regexped.yaml   # → urls.wasm
-regexped generate --config=regexped.yaml  # → regex.ts
+regexped generate --config=regexped.yaml  # → regexp.ts
 ```
 
 See [`examples/node/Makefile`](../examples/node/Makefile) for a complete Makefile.
@@ -31,7 +31,7 @@ See [`examples/node/Makefile`](../examples/node/Makefile) for a complete Makefil
 ```ts
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { init, extract_domain } from './regex.ts';
+import { init, extract_domain } from './regexp.ts';
 
 const wasmPath = fileURLToPath(new URL('./urls.wasm', import.meta.url));
 await init(readFileSync(wasmPath));

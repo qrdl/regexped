@@ -1046,19 +1046,19 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 	t0 := time.Now()
 	mod, err := wasmtime.NewModule(engine, regexWasmBytes)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  regex NewModule(%s): %v\n", tc.name, err)
+		fmt.Fprintf(os.Stderr, "  regexp NewModule(%s): %v\n", tc.name, err)
 		return benchResult{}
 	}
 	linker := wasmtime.NewLinker(engine)
 	if err = linker.DefineWasi(); err != nil {
-		fmt.Fprintf(os.Stderr, "  regex DefineWasi(%s): %v\n", tc.name, err)
+		fmt.Fprintf(os.Stderr, "  regexp DefineWasi(%s): %v\n", tc.name, err)
 		return benchResult{}
 	}
 	store := wasmtime.NewStore(engine)
 	store.SetWasi(wasmtime.NewWasiConfig())
 	inst, err := linker.Instantiate(store, mod)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  regex Instantiate(%s): %v\n", tc.name, err)
+		fmt.Fprintf(os.Stderr, "  regexp Instantiate(%s): %v\n", tc.name, err)
 		return benchResult{}
 	}
 	instantiation := time.Since(t0)
@@ -1081,26 +1081,26 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 		benchExecFn = inst.GetFunc(store, "regex_bench_groups")
 	}
 	if mem == nil || getPtrFn == nil || getTimingsPtrFn == nil || initFn == nil || benchExecFn == nil {
-		fmt.Fprintf(os.Stderr, "  regex: missing export for %s\n", tc.name)
+		fmt.Fprintf(os.Stderr, "  regexp: missing export for %s\n", tc.name)
 		return benchResult{instantiation: instantiation}
 	}
 
 	// Get the addresses of the static input and timings buffers inside WASM.
 	ptrRes, err := getPtrFn.Call(store)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  regex get_input_ptr(%s): %v\n", tc.name, err)
+		fmt.Fprintf(os.Stderr, "  regexp get_input_ptr(%s): %v\n", tc.name, err)
 		return benchResult{instantiation: instantiation}
 	}
 	timPtrRes, err := getTimingsPtrFn.Call(store)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  regex get_timings_ptr(%s): %v\n", tc.name, err)
+		fmt.Fprintf(os.Stderr, "  regexp get_timings_ptr(%s): %v\n", tc.name, err)
 		return benchResult{instantiation: instantiation}
 	}
 	inputPtr := int(ptrRes.(int32))
 	timingsPtr := int(timPtrRes.(int32))
 	buf := mem.UnsafeData(store)
 
-	// Write pattern and time regex compilation.
+	// Write pattern and time regexp compilation.
 	pat := tc.pattern
 	if tc.mode == anchored {
 		pat = "^(?:" + tc.pattern + ")$"
@@ -1127,7 +1127,7 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 
 	_, callErr := benchExecFn.Call(store, inputLen, int32(benchIters))
 	if callErr != nil {
-		fmt.Fprintf(os.Stderr, "  regex bench(%s): %v\n", tc.name, callErr)
+		fmt.Fprintf(os.Stderr, "  regexp bench(%s): %v\n", tc.name, callErr)
 		return benchResult{instantiation: instantiation, compilation: compilation}
 	}
 
@@ -1195,7 +1195,7 @@ func printResults(tc testCase, engineName string, rxp, rped benchResult, inputs 
 		modeStr = "groups"
 	}
 	fmt.Printf("\n=== %s  [%s, %s] ===\n", tc.name, engineName, modeStr)
-	fmt.Printf("  %-26s  %14s  %14s  %8s\n", "", "regex", "regexped", "ratio")
+	fmt.Printf("  %-26s  %14s  %14s  %8s\n", "", "regexp", "regexped", "ratio")
 	if full {
 		fmt.Printf("  %-26s  %14s  %14s  %8s\n",
 			"instantiation:",
@@ -1292,7 +1292,7 @@ func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (u
 	return before - after, true
 }
 
-// measFuelRegex instantiates the regex harness, compiles the pattern, warms up the
+// measFuelRegex instantiates the regexp harness, compiles the pattern, warms up the
 // lazy DFA with one uncounted call, then measures fuel for a single direct match call.
 // Uses regex_match/find/groups directly (no bench wrapper) to avoid Instant::now overhead.
 func measFuelRegex(regexWasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime.Engine) (uint64, bool) {
@@ -1355,7 +1355,7 @@ func measFuelRegex(regexWasmBytes []byte, tc testCase, input string, fuelEngine 
 	// Measure a single steady-state call.
 	before, _ := store.GetFuel()
 	if _, err = execFn.Call(store, int32(len(input))); err != nil {
-		fmt.Fprintf(os.Stderr, "  fuel regex call(%s): %v\n", tc.name, err)
+		fmt.Fprintf(os.Stderr, "  fuel regexp call(%s): %v\n", tc.name, err)
 		return 0, false
 	}
 	after, _ := store.GetFuel()
@@ -1386,7 +1386,7 @@ func printFuelResults(tc testCase, engineName string, inputs []fuelInputResult) 
 		modeStr = "groups"
 	}
 	fmt.Printf("\n=== %s  [%s, %s] ===\n", tc.name, engineName, modeStr)
-	fmt.Printf("  %-26s  %14s  %14s  %8s\n", "", "regex", "regexped", "ratio")
+	fmt.Printf("  %-26s  %14s  %14s  %8s\n", "", "regexp", "regexped", "ratio")
 	for _, inp := range inputs {
 		fmt.Printf("\n  input: %s (%d bytes)\n", inp.label, inp.size)
 		ratio := "n/a"

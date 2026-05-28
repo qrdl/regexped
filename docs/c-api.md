@@ -1,7 +1,7 @@
 # Generated C API
 
 Regexped generates a pair of C stub files (`.h` and `.c`) that declare and implement
-wrapper functions for compiled WASM regex modules. No libc or sysroot is required;
+wrapper functions for compiled WASM regexp modules. No libc or sysroot is required;
 the stubs compile cleanly with `--target=wasm32-wasi -nostdlib`.
 
 ## Including stubs in your project

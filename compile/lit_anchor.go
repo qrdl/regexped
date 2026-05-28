@@ -2,7 +2,7 @@ package compile
 
 import "regexp/syntax"
 
-// litAnchorPoint describes a three-way literal-anchored split of a regex pattern:
+// litAnchorPoint describes a three-way literal-anchored split of a regexp pattern:
 //
 //	PREFIX · LitSet · SUFFIX
 //

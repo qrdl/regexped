@@ -9,7 +9,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// jsStub generates a JS ES module stub file for all regex entries and sets in cfg.
+// jsStub generates a JS ES module stub file for all regexp entries and sets in cfg.
 // out is the full output path or "-" for stdout.
 func jsStub(cfg config.BuildConfig, out string) error {
 	content, err := genJSStubFile(cfg)
@@ -103,7 +103,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 }
 
 // genJSStubFile generates the content of an ES module JS stub that exports
-// wrapper functions for every regex entry in cfg.  The caller is responsible
+// wrapper functions for every regexp entry in cfg.  The caller is responsible
 // for loading the WASM file and passing the bytes (or a WebAssembly.Module)
 // to the exported init() function before calling any matcher.
 func genJSStubFile(cfg config.BuildConfig) (string, error) {

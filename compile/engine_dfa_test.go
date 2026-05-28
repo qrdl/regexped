@@ -113,11 +113,13 @@ func TestDFATableBytes(t *testing.T) {
 		numStates int
 		want      int
 	}{
-		{1, 2 * 257},     // u8: n=2
-		{5, 6 * 257},     // u8: n=6
-		{255, 256 * 257}, // u8: n=256, boundary
-		{256, 257 * 513}, // u16: n=257, just over boundary
-		{300, 301 * 513}, // u16: n=301
+		{1, 2 * 256},     // u8: numWASM=2
+		{5, 6 * 256},     // u8: numWASM=6
+		{127, 128 * 256}, // u8: numWASM=128
+		{128, 129 * 256}, // u8: numWASM=129 (no accept side table any more)
+		{255, 256 * 256}, // u8: numWASM=256, upper boundary
+		{256, 257 * 512}, // u16: numWASM=257, just over u8 limit
+		{300, 301 * 512}, // u16: numWASM=301
 	}
 	for _, c := range cases {
 		got := dfaTableBytes(&dfaTable{numStates: c.numStates})

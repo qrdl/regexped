@@ -24,6 +24,6 @@ foo.org
 ## Build pipeline
 
 ```
-regexped compile    →  compile regex pattern to WASM
+regexped compile    →  compile regexp pattern to WASM
 regexped generate   →  generate TypeScript ES module stub
 ```

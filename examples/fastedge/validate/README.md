@@ -21,6 +21,6 @@ make
 ```
 regexped generate   →  generate Rust FFI stubs
 cargo build         →  compile Rust app to WASM
-regexped compile    →  compile regex patterns to WASM
-regexped merge      →  merge app WASM + regex WASM into final.wasm
+regexped compile    →  compile regexp patterns to WASM
+regexped merge      →  merge app WASM + regexp WASM into final.wasm
 ```

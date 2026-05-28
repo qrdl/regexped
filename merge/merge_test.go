@@ -173,7 +173,7 @@ func TestCmdMerge(t *testing.T) {
 		t.Helper()
 		dir := t.TempDir()
 		mainWasm := filepath.Join(dir, "main.wasm")
-		regexWasm := filepath.Join(dir, "regex.wasm")
+		regexWasm := filepath.Join(dir, "regexp.wasm")
 		output := filepath.Join(dir, "out.wasm")
 		if err := os.WriteFile(mainWasm, []byte("mock"), 0o644); err != nil {
 			t.Fatal(err)

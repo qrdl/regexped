@@ -1144,7 +1144,7 @@ func TestConfig_DuplicateName_Rejected(t *testing.T) {
 		},
 	}
 	if err := config.ValidateSets(&cfg); err == nil {
-		t.Error("expected error for duplicate regex name, got nil")
+		t.Error("expected error for duplicate regexp name, got nil")
 	}
 }
 

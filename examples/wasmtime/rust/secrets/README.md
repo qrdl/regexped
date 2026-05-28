@@ -38,7 +38,7 @@ AWS key at 26..46: AKIAIOSFODNN7EXAMPLE
 ```
 regexped generate   →  generate Rust FFI stubs (all patterns into one file)
 cargo build         →  compile Rust to WASM (wasm32-wasip1)
-regexped compile    →  compile all regex patterns to WASM
-regexped merge      →  merge Rust WASM + regex WASM into final binary
+regexped compile    →  compile all regexp patterns to WASM
+regexped merge      →  merge Rust WASM + regexp WASM into final binary
 wasmtime run        →  execute
 ```

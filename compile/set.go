@@ -1092,7 +1092,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 
 // patternSuffixAST returns the suffix AST for p.
 // When suffixAST is nil and the pattern was splittable, the mandatory literal
-// covers the whole pattern (empty suffix) — return an empty regex so the
+// covers the whole pattern (empty suffix) — return an empty regexp so the
 // suffix DFA accepts immediately at suffix_start.
 // When the pattern was not splittable, fall back to the full pattern AST.
 func patternSuffixAST(p *PatternInfo) *syntax.Regexp {

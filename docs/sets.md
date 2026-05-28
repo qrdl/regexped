@@ -1,6 +1,6 @@
 # Set Composition
 
-Set composition lets you compile multiple regex patterns into a single
+Set composition lets you compile multiple regexp patterns into a single
 multi-pattern matcher that scans the input once and reports all matches with
 their positions and pattern IDs.
 

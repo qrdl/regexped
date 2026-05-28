@@ -208,7 +208,7 @@ func TestValidateSets_DuplicateRegexName(t *testing.T) {
 		Sets:    []SetConfig{{Name: "s", FindAny: "ma", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
-		t.Error("expected error for duplicate regex name, got nil")
+		t.Error("expected error for duplicate regexp name, got nil")
 	}
 }
 
@@ -322,7 +322,7 @@ func TestValidateSets_RegexSetExportCollision(t *testing.T) {
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
-		t.Error("expected duplicate WASM export name error between regex and set, got nil")
+		t.Error("expected duplicate WASM export name error between regexp and set, got nil")
 	}
 }
 

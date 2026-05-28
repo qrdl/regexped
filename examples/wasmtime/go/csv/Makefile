@@ -23,13 +23,13 @@ $(APP_WASM): main.go $(STUB) go.mod
 
 build: $(APP_WASM)
 
-# Step 3 – compile regex patterns to WASM
+# Step 3 – compile regexp patterns to WASM
 $(REGEX_WASM): regexped.yaml
 	$(REGEXPED) compile --config=regexped.yaml
 
 compile: $(REGEX_WASM)
 
-# Step 4 – merge Go WASM and regex WASM into a single module
+# Step 4 – merge Go WASM and regexp WASM into a single module
 $(FINAL_WASM): $(APP_WASM) $(REGEX_WASM) regexped.yaml
 	$(REGEXPED) merge --config=regexped.yaml --main=$(APP_WASM) $(REGEX_WASM)
 

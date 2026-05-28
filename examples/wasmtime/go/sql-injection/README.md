@@ -22,7 +22,7 @@ make
 ```
 regexped generate      →  generate Go stub (//go:wasmimport)
 go build (GOOS=wasip1) →  compile Go to WASM
-regexped compile       →  compile regex pattern to WASM
-regexped merge         →  merge Go WASM + regex WASM into final binary
+regexped compile       →  compile regexp pattern to WASM
+regexped merge         →  merge Go WASM + regexp WASM into final binary
 wasmtime               →  execute
 ```

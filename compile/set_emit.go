@@ -250,9 +250,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	tableOffset := opts.TableBase // data segment base for this set's tables
 
 	for bi, bkt := range buckets {
-		fnBody, dataBytes, dataSegs := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi])
+		fnBody, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi])
 		suffixFnBodies[bi] = fnBody
-		tableOffset += int32(len(dataBytes))
+		tableOffset = nextOffset // use actual memory end, not encoded size
 		allDataBytes = append(allDataBytes, dataBytes...)
 		totalDataSegs += dataSegs
 	}
@@ -268,7 +268,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			prefixID := p.prefixID
 			fnIdx, ok := prefixPoolToFnIdx[prefixID]
 			if !ok {
-				revL := buildDFALayout(p.prefixDFA, int64(prefixTableOffset), false, false, 0)
+				revL := buildDFALayout(p.prefixDFA, int64(prefixTableOffset), false, false, 0, false)
 				body := buildLitAnchorBackScanBody(revL, p.prefixDFA, opts.TableMemIdx)
 				fnIdx = len(prefixFnBodies)
 				prefixFnBodies = append(prefixFnBodies, body)
@@ -652,7 +652,7 @@ func appendTableLoad64(b []byte, tableMemIdx int) []byte {
 // --------------------------------------------------------------------------
 // CompileFile — orchestrates all patterns and sets into one WASM module.
 
-// CompileFile compiles all regex patterns and sets from cfg into a single WASM module.
+// CompileFile compiles all regexp patterns and sets from cfg into a single WASM module.
 // When cfg.Sets is empty, it is byte-identical to the existing Compile() path.
 func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	if err := config.ValidateSets(&cfg); err != nil {
