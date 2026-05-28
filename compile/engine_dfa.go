@@ -958,16 +958,6 @@ func bfsRelabelDFA(t *dfaTable) {
 	applyStateRemap(t, oldToNew)
 }
 
-// reorderAcceptFirst renumbers DFA states so the "primary accept" states (per
-// t.acceptStates) occupy the lowest IDs [0, K) and non-accepting states occupy
-// [K, n). Within each bucket the previous relative ordering is preserved, so
-// when this is called after bfsRelabelDFA the result is still canonical for
-// fingerprinting (BFS order within each accept-class).
-//
-// This makes runtime accept checks expressible as a single state-ID compare
-// (state ≤ K in WASM-ID space, where WASM state 0 is the implicit dead state
-// and accepting WASM states are 1..K). It is the basis of Option D — replacing
-// the per-cell accept-bit packing with a state-ID partition.
 // reorderAcceptFirst partitions DFA states into three contiguous ID ranges:
 //
 //	[0 .. immK-1]      : immediate-accepting states (subset of accepting)
@@ -1403,10 +1393,10 @@ func dfaTableBytes(t *dfaTable) int {
 // buildDFALayout computes all DFA table data and offsets. needFind must be true
 // when a find function will be emitted (computes extra tables for find mode).
 // compiledDFAThreshold is the resolved threshold (0 = disabled, 1..256 = active).
-// forcePacked: when true, emit a per-state accept side table at acceptOff (used by
-// TDFA, whose state IDs are not partitioned and cannot use the acceptLimit check).
+// useAcceptSideTable: when true, emit a per-state accept side table at acceptOff
+// (used by TDFA, whose state IDs are not partitioned and cannot use acceptLimit).
 // forceWordChar (optional): force word-char table computation even when needFind=false.
-func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, forcePacked bool, forceWordChar ...bool) *dfaLayout {
+func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, useAcceptSideTable bool, forceWordChar ...bool) *dfaLayout {
 	wantWordChar := needFind || (len(forceWordChar) > 0 && forceWordChar[0])
 	l := &dfaLayout{}
 	l.numWASM = t.numStates + 1
@@ -1431,10 +1421,9 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	//
 	// TDFA-built tables are not partitioned (state IDs are tied to tag-op
 	// indices), so they fall back to a per-state accept side table at
-	// l.acceptOff. The `forcePacked` parameter (legacy name) now selects this
-	// mode: forcePacked=true → emit acceptBytes side table.
+	// l.acceptOff (useAcceptSideTable=true).
 	l.useU8 = l.numWASM <= 256
-	l.useAcceptSideTable = forcePacked
+	l.useAcceptSideTable = useAcceptSideTable
 	// Byte-class compression applies when the u8 table would exceed 32 KB.
 	l.useCompression = l.useU8 && l.numWASM*256 > 32*1024
 
