@@ -1805,7 +1805,10 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	}
 
 	// Compute tableEnd: highest memory address used by any table.
-	// Accept bits are packed into cells; midAccept is the first standalone table.
+	// DFA paths: no accept side table — accept is encoded via the state-ID partition.
+	// TDFA paths: acceptBytes side table (useAcceptSideTable=true) follows transitions.
+	// midAccept is the first standalone find-mode table after transitions (and after
+	// the optional TDFA acceptBytes table).
 	tableEnd := int64(l.midAcceptOff) + int64(l.numWASM)
 	maxEnd := func(off int32, size int64) {
 		if e := int64(off) + size; e > tableEnd {
@@ -2540,8 +2543,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 // emitCompressedU8Transition emits the compressed u8 DFA transition:
 //
 //	class = classMap[classMapOff + byte]
-//	cell  = table[tableOff + row*numClasses + class]  (packed: (next+1)<<1 | accept)
-//	state = cell >> 1
+//	state = table[tableOff + row*numClasses + class]  (raw next+1; 0 = dead)
 //
 // where byte is loaded from mem[ptrLocal+posLocal] when byteLocal==0xff,
 // or taken from byteLocal otherwise (byte already in a local).

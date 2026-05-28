@@ -20,10 +20,9 @@ make test             # from re2test/
 
 Test data is unpacked automatically from the Go standard library.
 
-The `test` target chains four sub-targets: `exhaustive`, `custom`, `adjusted`,
-`force-backtrack`, and `sets`. The first four exercise single-pattern compilation
-across the four engines; `sets` exercises the multi-pattern composition pipeline
-described in [sets.md](sets.md).
+The `test` target chains four single-pattern sub-targets — `exhaustive`, `custom`,
+`adjusted`, and `force-backtrack` — plus `sets`, which exercises the multi-pattern
+composition pipeline described in [sets.md](sets.md).
 
 ---
 
