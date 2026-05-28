@@ -61,11 +61,16 @@ The caller writes input into low pages and passes the pointer. Tables start at `
 
 ## DFA table formats
 
+State IDs are partitioned by `reorderAcceptFirst`: WASM states `1..acceptLimit` are
+accepting and `(acceptLimit+1)..n` are not. The EOF accept check is
+`(state-1) u< acceptLimit` — no separate accept array is emitted for DFA paths.
+TDFA paths (`useAcceptSideTable=true`) cannot use this partition and instead emit a
+per-state `acceptBytes` side table at `acceptOff`.
+
 ### u8, no compression (≤ 256 states, table ≤ 32 KB)
 
 ```
 [transitions: u8[numStates * 256]]   // state × byte → next_state  (0 = dead)
-[accept:      u8[numStates]]         // 1 if accepting state
 ```
 
 ### u8, byte-class compressed (≤ 256 states, table > 32 KB)
@@ -75,14 +80,12 @@ Many bytes share identical transition rows. Byte-class compression maps 256 byte
 ```
 [class_map:   u8[256]]                       // byte → equivalence class index
 [transitions: u8[numStates * numClasses]]
-[accept:      u8[numStates]]
 ```
 
 ### u16 (> 256 states)
 
 ```
 [transitions: u16[numStates * 256]]
-[accept:      u8[numStates]]
 ```
 
 ### u16 with row deduplication
@@ -95,7 +98,6 @@ table stores only the unique rows, reducing size from `numStates × 512` bytes t
 ```
 [rowMap:      u8[numStates]]                 // state → row index (0-254)
 [transitions: u16[numUniqueRows * 256]]
-[accept:      u8[numStates]]
 ```
 
 Runtime lookup: `row = rowMap[state]; state = transitions[row * 256 + byte]`.
@@ -108,9 +110,17 @@ Find mode appends additional arrays after the base table:
 |---|---|---|
 | `midAccept` | `u8[numStates]` | 1 if state is accepting mid-scan |
 | `firstByteFlags` or Teddy tables | varies | fast prefix skip (see below) |
-| `immediateAccept` | `u8[numStates]` | 1 if state requires immediate stop (non-greedy) |
 | `wordCharTable` | `u8[256]` | `\w` lookup (word-boundary patterns only) |
 | `midAcceptNW`, `midAcceptW` | `u8[numStates]` each | word-boundary variants of midAccept |
+
+For TDFA paths (`useAcceptSideTable=true`) only:
+
+| Array | Size | Purpose |
+|---|---|---|
+| `acceptBytes` | `u8[numStates]` | 1 if state is EOF-accepting |
+| `immediateAccept` | `u8[numStates]` | 1 if state requires immediate stop (non-greedy) |
+
+DFA paths use `immAcceptLimit` (state-ID partition, `state u<= immAcceptLimit`) instead of a separate `immediateAccept` array.
 
 ---
 

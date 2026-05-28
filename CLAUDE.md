@@ -372,30 +372,29 @@ The caller writes input into low pages and passes the pointer. Tables start at `
 
 ### DFA Table Format
 
+State IDs are partitioned by `reorderAcceptFirst`: WASM states `1..acceptLimit` are accepting, `(acceptLimit+1)..n` are not. The EOF accept check is `(state-1) u< acceptLimit` — no separate accept array is emitted for DFA paths.
+
 **u8, no compression** (≤ 256 states, small table):
 ```
 [transitions: u8[numStates * 256]]   // state × byte → next_state (0 = dead)
-[accept: u8[numStates]]              // 1 if accepting state
 ```
 
 **u8, compressed** (≤ 256 states, table > 32KB):
 ```
 [class_map: u8[256]]                 // byte → equivalence class
 [transitions: u8[numStates * numClasses]]
-[accept: u8[numStates]]
 ```
 
 **u16** (> 256 states):
 ```
 [transitions: u16[numStates * 256]]
-[accept: u8[numStates]]
 ```
 
-Find mode appends additional arrays: `midAccept`, `firstByteFlags` (or Teddy tables), `immediateAccept`, and (for word-boundary patterns) `wordCharTable`, `midAcceptNW`, `midAcceptW`.
+Find mode appends additional arrays: `midAccept`, `firstByteFlags` (or Teddy tables), and (for word-boundary patterns) `wordCharTable`, `midAcceptNW`, `midAcceptW`. The immediate-accept check for DFA uses the `immAcceptLimit` partition (`state u<= immAcceptLimit`) — no `immediateAccept` side table is emitted for DFA.
 
 ### TDFA Table Format
 
-TDFA uses the same DFA table layout as the DFA engine (u8 or u16 state IDs, optional byte-class compression). Capture register operations are stored as `tagOp`/`regOp` structs in Go memory during compilation and emitted as inline WASM locals and `br_table` dispatch — they are not present in the runtime table.
+TDFA uses the same DFA table layout as the DFA engine (u8 or u16 state IDs, optional byte-class compression). Because TDFA state IDs are tied to tag-op indices and cannot be partitioned, a per-state `acceptBytes` side table is emitted at `acceptOff`, and a `immediateAccept` side table is emitted when needed. Capture register operations are stored as `tagOp`/`regOp` structs in Go memory during compilation and emitted as inline WASM locals and `br_table` dispatch — they are not present in the runtime table.
 
 ## Design Principles
 

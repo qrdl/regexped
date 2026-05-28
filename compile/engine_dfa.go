@@ -1403,8 +1403,8 @@ func dfaTableBytes(t *dfaTable) int {
 // buildDFALayout computes all DFA table data and offsets. needFind must be true
 // when a find function will be emitted (computes extra tables for find mode).
 // compiledDFAThreshold is the resolved threshold (0 = disabled, 1..256 = active).
-// forcePacked: when true, cells are packed regardless of state count (used by TDFA,
-// whose emit code only knows the packed cell format).
+// forcePacked: when true, emit a per-state accept side table at acceptOff (used by
+// TDFA, whose state IDs are not partitioned and cannot use the acceptLimit check).
 // forceWordChar (optional): force word-char table computation even when needFind=false.
 func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, forcePacked bool, forceWordChar ...bool) *dfaLayout {
 	wantWordChar := needFind || (len(forceWordChar) > 0 && forceWordChar[0])
@@ -1859,8 +1859,10 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 // dfaDataSegments builds the raw data-section payload (count byte + segments)
 // for a DFA layout. needFind controls whether find-mode-only tables are emitted.
 func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
-	// Packed paths (u8 packed, u16 packed): accept bit lives in each cell.
-	// Unpacked u8 path (129..256 states): accept is a separate side table at acceptOff.
+	// DFA paths (useAcceptSideTable=false): no accept side table; acceptLimit
+	// partitions state IDs so the runtime check is `(state-1) u< acceptLimit`.
+	// TDFA path (useAcceptSideTable=true): state IDs are not partitioned, so a
+	// per-state side table is emitted at acceptOff and read at EOF.
 	emitFindSegs := func(ds, transSegs []byte) []byte {
 		if l.needWordCharTable {
 			ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
@@ -3369,8 +3371,8 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 	var b []byte
 
 	// ── local declarations ────────────────────────────────────────────────────
-	// 5 extra i32 locals beyond the 2 params: state(2), pos(3), last_accept(4), byte/class(5), cell(6)
-	b = append(b, 0x01, 0x05, 0x7F)
+	// 4 extra i32 locals beyond the 2 params: state(2), pos(3), last_accept(4), byte/class(5)
+	b = append(b, 0x01, 0x04, 0x7F)
 
 	// state = revL.wasmStart
 	b = append(b, 0x41)
@@ -3384,14 +3386,6 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 	// last_accept = -1
 	b = append(b, 0x41, 0x7F)
 	b = append(b, 0x21, 0x04) // local.set last_accept
-
-	// cell = accept bit of start state (for empty-input EOF check)
-	startAccBit := byte(0)
-	if revTable.acceptStates[int(revL.wasmStart)-1] != 0 {
-		startAccBit = 1
-	}
-	b = append(b, 0x41, startAccBit)
-	b = append(b, 0x21, 0x06) // cell = startState accept bit
 
 	// Initial midAccept check: if revMidAccept[wasmStart], the reversed prefix
 	// matches the empty string, so the forward match starts at scan_end + 1.
@@ -4025,9 +4019,10 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 					b = append(b, 0x20, 0x04) // local.get attempt_start
 					b = append(b, 0x21, 0x03) // local.set pos
 				}
-				// Init cellLocal with accept bit for the initial state (handles empty-input EOF).
-				// Only applies to the packed-cell paths; for the unpacked u8 path the EOF
-				// handler reads accept from the side table indexed by state.
+				// Initialise last_accept for the start state before entering the scan loop.
+				// Handles empty-input and immediate-accept cases: if midAccept[startState]
+				// is set the pattern can match starting here; startBeginAccept covers
+				// patterns that accept at the very beginning of the input.
 				// last_accept = -1
 				b = append(b, 0x41, 0x7F) // i32.const -1
 				b = append(b, 0x21, 0x05) // local.set last_accept

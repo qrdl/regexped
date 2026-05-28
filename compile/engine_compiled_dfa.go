@@ -147,13 +147,10 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	const localPos = uint32(3)
 	const localClass = uint32(4)
 
-	var localCell uint32
 	if l.useCompression {
-		b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7F) // 3 i32 + 1 i32(cell): state, pos, class, cell
-		localCell = 5
+		b = append(b, 0x01, 0x03, 0x7F) // 3 i32: state, pos, class
 	} else {
-		b = append(b, 0x02, 0x02, 0x7F, 0x01, 0x7F) // 2 i32 + 1 i32(cell): state, pos, cell
-		localCell = 4
+		b = append(b, 0x01, 0x02, 0x7F) // 2 i32: state, pos
 	}
 
 	// Literal chain prefix.
@@ -188,24 +185,10 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(chain[len(chain)-1].nextWS))
 		b = append(b, 0x21, byte(localState))
-		// Init cellLocal with accept bit of the post-chain state.
-		chainEndAccBit := byte(0)
-		if t.acceptStates[int(chain[len(chain)-1].nextWS)-1] != 0 {
-			chainEndAccBit = 1
-		}
-		b = append(b, 0x41, chainEndAccBit)
-		b = append(b, 0x21, byte(localCell))
 	} else {
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(l.wasmStart))
 		b = append(b, 0x21, byte(localState))
-		// Init cellLocal with accept bit of the initial state.
-		startAccBit := byte(0)
-		if t.acceptStates[int(l.wasmStart)-1] != 0 {
-			startAccBit = 1
-		}
-		b = append(b, 0x41, startAccBit)
-		b = append(b, 0x21, byte(localCell))
 	}
 
 	b = append(b, 0x02, 0x40) // block $done
