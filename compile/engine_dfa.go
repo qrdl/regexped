@@ -4522,3 +4522,1688 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = emitReturn(b)
 	return b
 }
+
+// ============================================================================
+// Lit-chain optimisation (LIKELY.md Opt 2 — counted linear chain)
+//
+// Detects patterns of shape  <literal_prefix><charclass>{N,N}  and emits a
+// specialised match/find body that:
+//   - uses the existing SIMD hybrid prefix scan to locate the literal (find mode),
+//   - then verifies the N class bytes with a single nibble-table lookup per byte
+//     in 16-byte SIMD chunks, bypassing the per-byte DFA loop entirely.
+//
+// All SIMD lookup tables (Tlo, Pow2, lane mask) are materialised inline as
+// v128.const — the lit-chain bodies emit zero data segments.
+//
+// Gated by CompileOptions.LikelyMode == LikelyMatch in compilePattern.
+// ============================================================================
+
+// litChainPattern is the structural shape recognised by analyseLitChain.
+type litChainPattern struct {
+	literal     []byte   // K-byte literal prefix (K >= 1)
+	tlo         [16]byte // nibble table: bit h of Tlo[l] set iff byte (h<<4|l) ∈ class
+	count       int      // N — chain length (N >= 1, K+N >= 16)
+	startAnchor anchorType
+	endAnchor   anchorType
+}
+
+// litChainBranchInfo is the analysis result for a single lit-chain branch.
+// Returned by analyseLitChainBranch *without* applying the N≥24 single-pattern
+// gate — callers decide per-context (single-pattern gate vs. per-branch gate
+// inside an alternation).
+type litChainBranchInfo struct {
+	literal []byte
+	bitmap  [32]byte // 256-bit byte-class bitmap (for scalar verify)
+	tlo     [16]byte // nibble table (for SIMD verify)
+	count   int
+
+	// Optional anchors. `(?m)^` / `(?m)$` (multiline) are NOT supported and
+	// cause analyseLitChainBranch to reject. `\A`/`\z` and (default-Perl) `^`/`$`
+	// both map to anchorBeginText/anchorEndText.
+	startAnchor anchorType // anchor BEFORE the literal
+	endAnchor   anchorType // anchor AFTER the class chain
+}
+
+// anchorType represents the kind of boundary anchor attached to a lit-chain branch.
+type anchorType int
+
+const (
+	anchorNone           anchorType = iota
+	anchorBeginText                 // ^ (default Perl OneLine) or \A → match start position == 0
+	anchorEndText                   // $ (default Perl OneLine) or \z → match end position == len
+	anchorWordBoundary              // \b
+	anchorNoWordBoundary            // \B
+)
+
+// analyseLitChain parses the pattern and returns a litChainPattern when the
+// pattern matches the strict shape <literal><charclass>{N,N} with all of:
+//   - literal is ASCII (no FoldCase, no rune > 127), K >= 1
+//   - class is OpCharClass / OpLiteral / OpAnyCharNotNL / OpAnyChar, ASCII-only
+//   - N >= 1 (counted, not range)
+//   - K + N >= 16 (so the SIMD overlap-load tail covers all class bytes)
+func analyseLitChain(pattern string) (*litChainPattern, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	return analyseLitChainRe(re)
+}
+
+func analyseLitChainRe(re *syntax.Regexp) (*litChainPattern, bool) {
+	info, ok := analyseLitChainBranch(re)
+	if !ok {
+		return nil, false
+	}
+	// N≥24 single-pattern gate. Empirically (wasmtime 42 / Cranelift), inline
+	// SIMD class verify pessimises register allocation for the scan loop when
+	// the verify is small — a ~70% wall-time regression appears at N=16 despite
+	// fuel parity. The win flips clearly positive by N=36 and grows with N. 24
+	// is the empirical threshold. (Per-branch gate inside alternations applies
+	// separately in analyseLitChainAlt.)
+	if info.count < 24 {
+		return nil, false
+	}
+	return &litChainPattern{
+		literal:     info.literal,
+		tlo:         info.tlo,
+		count:       info.count,
+		startAnchor: info.startAnchor,
+		endAnchor:   info.endAnchor,
+	}, true
+}
+
+// litChainAltBranch is one branch inside a lit-chain alternation, plus a
+// per-branch decision about whether to use SIMD or scalar class verify.
+type litChainAltBranch struct {
+	literal     []byte
+	bitmap      [32]byte // 256-bit byte-class bitmap (for scalar verify when useSIMD=false)
+	tlo         [16]byte // nibble table (for SIMD verify when useSIMD=true)
+	count       int
+	useSIMD     bool // N >= 24 → SIMD chunks; else scalar byte-by-byte
+	startAnchor anchorType
+	endAnchor   anchorType
+}
+
+// litChainAltPattern is an alternation of lit-chain branches recognised by
+// analyseLitChainAlt. All branches qualify under analyseLitChainBranch; the
+// per-branch useSIMD bit selects the verify kernel for each branch.
+type litChainAltPattern struct {
+	branches []litChainAltBranch
+}
+
+// analyseLitChainAlt parses pattern and returns a litChainAltPattern when the
+// pattern is an OpAlternate of two or more <literal><class>{N,N} branches
+// (strict mode — every branch must qualify). Returns nil otherwise.
+func analyseLitChainAlt(pattern string) (*litChainAltPattern, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpAlternate || len(re.Sub) < 2 {
+		return nil, false
+	}
+	branches := make([]litChainAltBranch, 0, len(re.Sub))
+	for _, sub := range re.Sub {
+		info, ok := analyseLitChainBranch(sub)
+		if !ok {
+			return nil, false // strict: every branch must qualify
+		}
+		branches = append(branches, litChainAltBranch{
+			literal:     info.literal,
+			bitmap:      info.bitmap,
+			tlo:         info.tlo,
+			count:       info.count,
+			useSIMD:     info.count >= 24,
+			startAnchor: info.startAnchor,
+			endAnchor:   info.endAnchor,
+		})
+	}
+	return &litChainAltPattern{branches: branches}, true
+}
+
+// analyseLitChainBranch inspects a single <literal><class>{N,N} sub-expression
+// (after stripping any OpCapture wrapper) and returns full per-branch info.
+// Does NOT apply the N≥24 gate — that decision belongs to the caller.
+// Constraints enforced: ASCII-only class, K>=1, N>=1 (fixed count), K+N>=16.
+func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpConcat || len(re.Sub) < 2 {
+		return nil, false
+	}
+
+	// Peel optional start anchor (Sub[0]) and end anchor (Sub[N-1]).
+	subs := re.Sub
+	startAnchor := anchorNone
+	endAnchor := anchorNone
+
+	classifyAnchor := func(n *syntax.Regexp) (anchorType, bool) {
+		switch n.Op {
+		case syntax.OpBeginText:
+			return anchorBeginText, true
+		case syntax.OpEndText:
+			return anchorEndText, true
+		case syntax.OpWordBoundary:
+			return anchorWordBoundary, true
+		case syntax.OpNoWordBoundary:
+			return anchorNoWordBoundary, true
+		case syntax.OpBeginLine, syntax.OpEndLine:
+			// (?m)^ or (?m)$ — multiline anchors are out of scope.
+			return anchorNone, false
+		}
+		return anchorNone, false
+	}
+	// Reject if a multiline anchor appears anywhere in subs.
+	for _, sub := range subs {
+		if sub.Op == syntax.OpBeginLine || sub.Op == syntax.OpEndLine {
+			return nil, false
+		}
+	}
+	// Strip leading anchor.
+	if a, ok := classifyAnchor(subs[0]); ok {
+		startAnchor = a
+		subs = subs[1:]
+	}
+	// Strip trailing anchor.
+	if len(subs) > 0 {
+		if a, ok := classifyAnchor(subs[len(subs)-1]); ok {
+			endAnchor = a
+			subs = subs[:len(subs)-1]
+		}
+	}
+	if len(subs) != 2 {
+		return nil, false
+	}
+	litNode := subs[0]
+	if litNode.Op != syntax.OpLiteral {
+		return nil, false
+	}
+	if litNode.Flags&syntax.FoldCase != 0 {
+		return nil, false
+	}
+	literal := make([]byte, 0, len(litNode.Rune))
+	for _, r := range litNode.Rune {
+		if r > 127 {
+			return nil, false
+		}
+		literal = append(literal, byte(r))
+	}
+	if len(literal) == 0 {
+		return nil, false
+	}
+
+	chainNode := subs[1]
+	for chainNode.Op == syntax.OpCapture && len(chainNode.Sub) == 1 {
+		chainNode = chainNode.Sub[0]
+	}
+	if chainNode.Op != syntax.OpRepeat {
+		return nil, false
+	}
+	if chainNode.Min != chainNode.Max || chainNode.Min < 1 {
+		return nil, false
+	}
+	if len(chainNode.Sub) != 1 {
+		return nil, false
+	}
+	child := chainNode.Sub[0]
+	for child.Op == syntax.OpCapture && len(child.Sub) == 1 {
+		child = child.Sub[0]
+	}
+
+	var bitmap [32]byte
+	switch child.Op {
+	case syntax.OpCharClass:
+		for i := 0; i+1 < len(child.Rune); i += 2 {
+			lo, hi := child.Rune[i], child.Rune[i+1]
+			if lo > 127 || hi > 127 {
+				return nil, false
+			}
+			for r := lo; r <= hi; r++ {
+				bitmap[r>>3] |= 1 << uint(r&7)
+			}
+		}
+	case syntax.OpLiteral:
+		if len(child.Rune) != 1 || child.Rune[0] > 127 {
+			return nil, false
+		}
+		r := child.Rune[0]
+		bitmap[r>>3] |= 1 << uint(r&7)
+	default:
+		return nil, false
+	}
+
+	empty := true
+	for _, b := range bitmap {
+		if b != 0 {
+			empty = false
+			break
+		}
+	}
+	if empty {
+		return nil, false
+	}
+	for i := 16; i < 32; i++ {
+		if bitmap[i] != 0 {
+			return nil, false
+		}
+	}
+
+	count := chainNode.Min
+	if len(literal)+count < 16 {
+		// Overlap-load tail requires K+N >= 16. Tiny patterns: defer.
+		return nil, false
+	}
+
+	var tlo [16]byte
+	for b := 0; b < 128; b++ {
+		if bitmap[b>>3]&(1<<uint(b&7)) != 0 {
+			tlo[b&0xF] |= 1 << uint(b>>4)
+		}
+	}
+
+	return &litChainBranchInfo{
+		literal:     literal,
+		bitmap:      bitmap,
+		tlo:         tlo,
+		count:       count,
+		startAnchor: startAnchor,
+		endAnchor:   endAnchor,
+	}, true
+}
+
+// isWordByte reports whether byte b is in [A-Za-z0-9_] (Perl \w semantics for ASCII).
+func isWordByte(b byte) bool {
+	return ('A' <= b && b <= 'Z') ||
+		('a' <= b && b <= 'z') ||
+		('0' <= b && b <= '9') ||
+		b == '_'
+}
+
+// emitIsWordByte expects an i32 byte value on the stack and replaces it with
+// 1 (word char) or 0 (non-word char). Uses tmpLocal (i32) as scratch.
+//
+// All i32.const values use AppendSLEB128 — values 0x40..0x7F have bit 6 set
+// and would otherwise be sign-extended into negative numbers by single-byte
+// SLEB128.
+func emitIsWordByte(b []byte, tmpLocal byte) []byte {
+	// Stack: byte_val
+	b = append(b, 0x22, tmpLocal) // local.tee tmp (byte stays on stack)
+
+	// (byte - 'A') < 26 → upper case
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, 'A')
+	b = append(b, 0x6B) // i32.sub
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, 26)
+	b = append(b, 0x49) // i32.lt_u
+
+	// OR with (byte - 'a') < 26 → lower case
+	b = append(b, 0x20, tmpLocal)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, 'a')
+	b = append(b, 0x6B)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, 26)
+	b = append(b, 0x49)
+	b = append(b, 0x72) // i32.or
+
+	// OR with (byte - '0') < 10 → digit
+	b = append(b, 0x20, tmpLocal)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, '0')
+	b = append(b, 0x6B)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, 10)
+	b = append(b, 0x49)
+	b = append(b, 0x72)
+
+	// OR with (byte == '_')
+	b = append(b, 0x20, tmpLocal)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, '_')
+	b = append(b, 0x46) // i32.eq
+	b = append(b, 0x72)
+	return b
+}
+
+// emitStartAnchorCheck emits a check at the start position (attempt_start) and
+// br_if's to failBrDepth on anchor failure. Falls through on success.
+//   - anchorBeginText: requires attempt_start == 0.
+//   - anchorWordBoundary / anchorNoWordBoundary: requires (or rejects) a word
+//     boundary between input[attempt_start-1] (or non-word if at start) and
+//     literalFirstByte (known at compile time).
+//   - anchorEndText as start anchor is impossible for a non-empty match;
+//     emits an unconditional fail.
+func emitStartAnchorCheck(b []byte, anchor anchorType, literalFirstByte byte,
+	locPtr, locAttemptStart, tmpLocal byte, failBrDepth byte) []byte {
+	switch anchor {
+	case anchorNone:
+		return b
+	case anchorBeginText:
+		// br_if (attempt_start != 0) → fail
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x0D, failBrDepth)
+		return b
+	case anchorEndText:
+		// Impossible — match has at least 1 byte. Unconditional fail.
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x0D, failBrDepth)
+		return b
+	case anchorWordBoundary, anchorNoWordBoundary:
+		// Push leftWord = (attempt_start > 0) ? is_word(input[attempt_start-1]) : 0
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x45)           // i32.eqz
+		b = append(b, 0x04, 0x7F)     // if (result i32)
+		b = append(b, 0x41, 0x00)     // attempt_start == 0 → 0
+		b = append(b, 0x05)           // else
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6B)           // attempt_start - 1
+		b = append(b, 0x6A)           // ptr + ...
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = emitIsWordByte(b, tmpLocal)
+		b = append(b, 0x0B)           // end if
+
+		// XOR with compile-time is_word(literalFirstByte)
+		var rightWord int32
+		if isWordByte(literalFirstByte) {
+			rightWord = 1
+		}
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, rightWord)
+		b = append(b, 0x73)           // i32.xor → boundary (0 or 1)
+
+		if anchor == anchorWordBoundary {
+			b = append(b, 0x45)       // i32.eqz: fail if !boundary
+		}
+		b = append(b, 0x0D, failBrDepth)
+		return b
+	}
+	return b
+}
+
+// emitEndAnchorCheck emits a check at end_pos = attempt_start + total and
+// br_if's to failBrDepth on anchor failure.
+//   - anchorEndText: requires end_pos == len.
+//   - anchorWordBoundary / anchorNoWordBoundary: checks boundary between
+//     input[end_pos-1] (last class byte, loaded at runtime) and input[end_pos]
+//     (or non-word if end_pos == len).
+//   - anchorBeginText as end anchor is impossible for a non-empty match;
+//     emits an unconditional fail.
+func emitEndAnchorCheck(b []byte, anchor anchorType,
+	locPtr, locAttemptStart byte, total int32,
+	locLen, tmpLocal byte, failBrDepth byte) []byte {
+	switch anchor {
+	case anchorNone:
+		return b
+	case anchorBeginText:
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x0D, failBrDepth)
+		return b
+	case anchorEndText:
+		// br_if (attempt_start + total != len) → fail
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, locLen)
+		b = append(b, 0x47)           // i32.ne
+		b = append(b, 0x0D, failBrDepth)
+		return b
+	case anchorWordBoundary, anchorNoWordBoundary:
+		// leftWord = is_word(input[attempt_start + total - 1])
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total-1)
+		b = append(b, 0x6A)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = emitIsWordByte(b, tmpLocal)
+
+		// rightWord = (end_pos < len) ? is_word(input[end_pos]) : 0
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, locLen)
+		b = append(b, 0x49)           // i32.lt_u
+		b = append(b, 0x04, 0x7F)     // if (result i32)
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total)
+		b = append(b, 0x6A)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = emitIsWordByte(b, tmpLocal)
+		b = append(b, 0x05)           // else
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x0B)           // end if
+
+		b = append(b, 0x73)           // i32.xor → boundary
+
+		if anchor == anchorWordBoundary {
+			b = append(b, 0x45)       // i32.eqz: fail if !boundary
+		}
+		b = append(b, 0x0D, failBrDepth)
+		return b
+	}
+	return b
+}
+
+// pow2VecConst is the v128.const payload for the high-nibble power-of-two lookup.
+// Pow2[h] = 1<<h for h in 0..7; 0 for h in 8..15 (would mean byte > 127).
+var pow2VecConst = [16]byte{1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0}
+
+// litChainChunk describes one 16-byte SIMD chunk in the class-verify span.
+//   - offset: position in the match (from match start) where the chunk loads.
+//   - laneMask: which lanes carry class bytes that must be checked (0xFFFF =
+//     all 16 lanes; reduced for the overlap chunk in K+N<16 fallback paths).
+type litChainChunk struct {
+	offset   int
+	laneMask uint16
+}
+
+// planLitChainChunks returns the chunk plan covering bytes [K, K+N-1] of the
+// match. Strategy: full 16-byte chunks aligned at K; if N%16 != 0 add one
+// overlap chunk anchored at the end of the match (which re-checks some bytes
+// already verified by prior chunks — guaranteed in-class).
+//
+// Precondition (enforced by analyseLitChain): K+N >= 16.
+func planLitChainChunks(k, n int) []litChainChunk {
+	var chunks []litChainChunk
+	if n >= 16 {
+		nFull := n / 16
+		for i := 0; i < nFull; i++ {
+			chunks = append(chunks, litChainChunk{offset: k + i*16, laneMask: 0xFFFF})
+		}
+		if n%16 != 0 {
+			chunks = append(chunks, litChainChunk{offset: k + n - 16, laneMask: 0xFFFF})
+		}
+		return chunks
+	}
+	// N < 16 with K+N >= 16: single chunk anchored at end of match. The first
+	// 16-N lanes hold trailing literal bytes (not class); mask them out.
+	firstClassLane := 16 - n
+	mask := uint16(0xFFFF) << uint(firstClassLane)
+	return []litChainChunk{{offset: k + n - 16, laneMask: mask}}
+}
+
+// emitV128Const appends a v128.const instruction with the given 16-byte value.
+func emitV128Const(b []byte, value [16]byte) []byte {
+	b = append(b, 0xFD, 0x0C)
+	return append(b, value[:]...)
+}
+
+// emitLitChainChunkLoadAndCompare appends WASM that pushes onto the stack an
+// i32 bitmask where bit i is set iff byte i of the chunk is NOT in the class.
+// Inputs: ptrLocal, baseLocal (match start), chunkOff (compile-time byte
+// offset of this chunk from the match start), chunkLocal (v128 scratch),
+// tLoLocal, pow2Local (v128 locals pre-loaded with the lookup tables).
+func emitLitChainChunkLoadAndCompare(b []byte,
+	ptrLocal, baseLocal byte, chunkOff int,
+	chunkLocal, tLoLocal, pow2Local byte) []byte {
+
+	// chunk = v128.load(ptr + base + chunkOff)
+	b = append(b, 0x20, ptrLocal)
+	b = append(b, 0x20, baseLocal)
+	b = append(b, 0x6A) // i32.add
+	if chunkOff != 0 {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(chunkOff))
+		b = append(b, 0x6A)
+	}
+	b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+	b = append(b, 0x21, chunkLocal)       // local.set chunk
+
+	// tlo_picks = swizzle(tLo, chunk & 0x0F)
+	b = append(b, 0x20, tLoLocal)
+	b = append(b, 0x20, chunkLocal)
+	b = append(b, 0x41, 0x0F)
+	b = append(b, 0xFD, 0x0F) // i8x16.splat 0x0F
+	b = append(b, 0xFD, 0x4E) // v128.and  → lo_nibbles
+	b = append(b, 0xFD, 0x0E) // i8x16.swizzle  → tlo_picks
+
+	// pow_picks = swizzle(pow2, chunk >>u 4)
+	b = append(b, 0x20, pow2Local)
+	b = append(b, 0x20, chunkLocal)
+	b = append(b, 0x41, 0x04)
+	b = append(b, 0xFD, 0x6D) // i8x16.shr_u
+	b = append(b, 0xFD, 0x0E) // i8x16.swizzle  → pow_picks
+
+	b = append(b, 0xFD, 0x4E) // v128.and  → intersect (nonzero lane = in class)
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0xFD, 0x0F) // i8x16.splat 0
+	b = append(b, 0xFD, 0x23) // i8x16.eq      → out-of-class lanes = 0xFF
+	b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32 (bit i set if byte i NOT in class)
+	return b
+}
+
+// emitLitChainClassVerify appends WASM that pushes onto the stack an i32 that
+// is 0 iff every class byte in the match span is in the class, and non-zero
+// if any class byte is out of class.
+//
+// Stack effect: net +1 (i32).
+func emitLitChainClassVerify(b []byte, lcp *litChainPattern,
+	ptrLocal, baseLocal, chunkLocal, tLoLocal, pow2Local byte) []byte {
+
+	chunks := planLitChainChunks(len(lcp.literal), lcp.count)
+	for i, ch := range chunks {
+		b = emitLitChainChunkLoadAndCompare(b, ptrLocal, baseLocal, ch.offset,
+			chunkLocal, tLoLocal, pow2Local)
+		if ch.laneMask != 0xFFFF {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(ch.laneMask))
+			b = append(b, 0x71) // i32.and
+		}
+		if i > 0 {
+			b = append(b, 0x72) // i32.or with previous chunks' bad-mask
+		}
+	}
+	return b
+}
+
+// buildLitChainMatchBody emits the WASM body for an anchored match against a
+// lit-chain pattern. Signature: (ptr i32, len i32) → i32 (end pos, or -1).
+//
+// Locals:  0=ptr 1=len  2=chunk 3=tLo 4=pow2 (v128)
+func buildLitChainMatchBody(lcp *litChainPattern) []byte {
+	var b []byte
+
+	// Local declarations: 3 v128.
+	b = append(b, 0x01)       // 1 local group
+	b = append(b, 0x03, 0x7B) // 3 × v128
+
+	const (
+		locPtr   byte = 0
+		locLen   byte = 1
+		locChunk byte = 2
+		locTLo   byte = 3
+		locPow2  byte = 4
+	)
+
+	// Materialise tLo and pow2 from inline v128.const into locals.
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+
+	k := int32(len(lcp.literal))
+	total := k + int32(lcp.count)
+
+	// Bounds: if len < K+N → return -1.
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x49)       // i32.lt_u
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x41, 0x7F) // i32.const -1
+	b = append(b, 0x0F)       // return
+	b = append(b, 0x0B)       // end if
+
+	// Literal verify: K scalar byte compares against input[0..K-1].
+	for kk, byt := range lcp.literal {
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x2D, 0x00) // i32.load8_u align=0
+		b = utils.AppendULEB128(b, uint32(kk))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(byt))
+		b = append(b, 0x47)       // i32.ne
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x0F)       // return
+		b = append(b, 0x0B)       // end if
+	}
+
+	// Class verify: SIMD chunks. Push i32 bad_mask. Use baseLocal = ptr (we want
+	// chunks starting at ptr + chunkOff, where chunkOff already includes K).
+	// emitLitChainClassVerify uses (ptrLocal, baseLocal) = (ptr, len-K-N start),
+	// but for anchored match, base = 0. We achieve that by passing a synthetic
+	// zero base via a const-offset add. Simpler: temporarily use locLen as base
+	// — no, that breaks. Instead emit chunks with ptrLocal + chunkOff directly
+	// by inlining a base-zero path. Re-use the helper with a literal-0 base
+	// requires a free i32 local; declare one.
+	//
+	// To avoid adding another local: emit chunks inline here using a fixed
+	// match-start of 0 (chunks address = ptr + chunkOff).
+	chunks := planLitChainChunks(int(k), lcp.count)
+	for i, ch := range chunks {
+		// chunk = v128.load(ptr + chunkOff)
+		b = append(b, 0x20, locPtr)
+		if ch.offset != 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(ch.offset))
+			b = append(b, 0x6A) // i32.add
+		}
+		b = append(b, 0xFD, 0x00, 0x00, 0x00)
+		b = append(b, 0x21, locChunk)
+
+		b = append(b, 0x20, locTLo)
+		b = append(b, 0x20, locChunk)
+		b = append(b, 0x41, 0x0F)
+		b = append(b, 0xFD, 0x0F)
+		b = append(b, 0xFD, 0x4E)
+		b = append(b, 0xFD, 0x0E)
+
+		b = append(b, 0x20, locPow2)
+		b = append(b, 0x20, locChunk)
+		b = append(b, 0x41, 0x04)
+		b = append(b, 0xFD, 0x6D)
+		b = append(b, 0xFD, 0x0E)
+
+		b = append(b, 0xFD, 0x4E)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0xFD, 0x0F)
+		b = append(b, 0xFD, 0x23)
+		b = append(b, 0xFD, 0x64) // bitmask → i32
+
+		if ch.laneMask != 0xFFFF {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(ch.laneMask))
+			b = append(b, 0x71)
+		}
+		if i > 0 {
+			b = append(b, 0x72)
+		}
+	}
+
+	// bad_mask on stack. If non-zero → return -1.
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// All good — return K+N as the end position.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x0B) // end function
+	return b
+}
+
+// appendLitChainMatchCodeEntry appends a size-prefixed lit-chain match body.
+func appendLitChainMatchCodeEntry(cs []byte, lcp *litChainPattern) []byte {
+	body := buildLitChainMatchBody(lcp)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildLitChainFindBody emits the WASM body for non-anchored find against a
+// lit-chain pattern. Signature: (ptr i32, len i32) → i64 (packed start<<32|end, or -1).
+//
+// Structure:
+//   block $no_match
+//     loop $lit_outer
+//       emitPrefixScan with Prefix=literal, EngineDepth=2  // scan exits on exhaust
+//       ; attempt_start = candidate position (literal already verified by scan)
+//       ; bounds check: attempt_start + K + N <= len, else $no_match
+//       ; SIMD class verify of next N bytes
+//       ; if mismatch: attempt_start++; br $lit_outer
+//       ; return packed (attempt_start << 32 | attempt_start + K + N)
+//     end loop
+//   end block $no_match
+//   return -1
+func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
+	var b []byte
+
+	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
+
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locAttemptStart byte = 2
+		locSimdMask     byte = 3
+		locTmp          byte = 4 // word-byte check scratch (only used when anchors present)
+		locChunk        byte = 5 // shared between prefix scan and class verify
+		locTLo          byte = 6
+		locPow2         byte = 7
+	)
+
+	// Local declarations: 3 i32 + 3 v128.
+	// locTmp is declared regardless (cheap) so the local indices stay stable
+	// across hasAnchors variants.
+	b = append(b, 0x02)
+	b = append(b, 0x03, 0x7F) // 3 × i32
+	b = append(b, 0x03, 0x7B) // 3 × v128
+
+	k := int32(len(lcp.literal))
+	total := k + int32(lcp.count)
+
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $lit_outer
+
+	scan := prefixScanParams{
+		Prefix:      lcp.literal,
+		EngineDepth: 2,
+		TableMemIdx: tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	// Bounds check: attempt_start + K + N > len → $no_match.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x6A)       // i32.add
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4B)       // i32.gt_u
+	b = append(b, 0x0D, 0x01) // br_if 1 → $no_match
+
+	// When anchors are present, wrap the post-scan path in a $next_attempt
+	// block: anchor/verify failures br to depth 0 and the code after the block
+	// advances attempt_start and restarts. Without anchors, the existing
+	// if-then structure for class verify is kept (byte-identical to the
+	// pre-anchor emission for those patterns).
+	if hasAnchors {
+		b = append(b, 0x02, 0x40) // block $next_attempt
+
+		b = emitStartAnchorCheck(b, lcp.startAnchor, lcp.literal[0],
+			locPtr, locAttemptStart, locTmp, 0)
+	}
+
+	// Materialise nibble tables and do SIMD class verify inline.
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+	b = emitLitChainClassVerify(b, lcp,
+		locPtr, locAttemptStart, locChunk, locTLo, locPow2)
+
+	if hasAnchors {
+		// bad_mask on stack → br_if 0 → $next_attempt on failure.
+		b = append(b, 0x0D, 0x00)
+
+		b = emitEndAnchorCheck(b, lcp.endAnchor,
+			locPtr, locAttemptStart, total, locLen, locTmp, 0)
+	} else {
+		// Existing if-then structure: on bad, advance & restart.
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, locAttemptStart)
+		b = append(b, 0x0C, 0x01) // br 1 → $lit_outer (0=if, 1=$lit_outer)
+		b = append(b, 0x0B)       // end if
+	}
+
+	// Match — return packed (attempt_start << 32 | attempt_start + K + N).
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0xAD)       // i64.extend_i32_u
+	b = append(b, 0x42, 0x20) // i64.const 32
+	b = append(b, 0x86)       // i64.shl
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x6A) // i32.add → end pos
+	b = append(b, 0xAD) // i64.extend_i32_u
+	b = append(b, 0x84) // i64.or
+	b = append(b, 0x0F) // return
+
+	if hasAnchors {
+		b = append(b, 0x0B) // end $next_attempt
+		// advance + restart
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, locAttemptStart)
+		b = append(b, 0x0C, 0x00) // br 0 → $lit_outer
+	}
+
+	b = append(b, 0x0B) // end loop $lit_outer
+	b = append(b, 0x0B) // end block $no_match
+
+	// No match.
+	b = append(b, 0x42, 0x7F) // i64.const -1
+	b = append(b, 0x0B)       // end function
+	return b
+}
+
+// appendLitChainFindCodeEntry appends a size-prefixed lit-chain find body.
+func appendLitChainFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) []byte {
+	body := buildLitChainFindBody(lcp, tableMemIdx)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// ============================================================================
+// Lit-chain alternation (Phase 2 of LIKELY.md Opt 2).
+//
+// Recognises OpAlternate of strict <literal><class>{N,N} branches; each branch
+// independently uses SIMD class verify (when N≥24) or scalar bitmap verify
+// (when N<24). All branches share a single SIMD first-byte scan (Teddy 1-byte
+// table built from the per-branch first bytes).
+//
+// Output layout (data segments, in this order, starting at tableBase):
+//   firstByteFlags : 256-byte flag table (1 if byte is a first-byte of some branch)
+//   teddyLo        : 16-byte Teddy low-nibble table
+//   teddyHi        : 16-byte Teddy high-nibble table
+//   For each scalar branch i (useSIMD=false), in branch order:
+//     classBitmap_i : 32-byte byte-class bitmap
+// ============================================================================
+
+// litChainAltLayout holds the data-segment offsets computed for an alternation
+// pattern. branchBitmapOff[i] is the bitmap offset for branch i (only valid when
+// !branches[i].useSIMD; -1 otherwise).
+type litChainAltLayout struct {
+	firstByteOff    int32
+	teddyLoOff      int32
+	teddyHiOff      int32
+	branchBitmapOff []int32
+	tableEnd        int64
+}
+
+// planLitChainAltLayout computes data-segment offsets for the alternation
+// tables starting at tableBase, in the order described above.
+func planLitChainAltLayout(altp *litChainAltPattern, tableBase int64) litChainAltLayout {
+	l := litChainAltLayout{
+		branchBitmapOff: make([]int32, len(altp.branches)),
+	}
+	cur := tableBase
+	l.firstByteOff = int32(cur)
+	cur += 256
+	l.teddyLoOff = int32(cur)
+	cur += 16
+	l.teddyHiOff = int32(cur)
+	cur += 16
+	for i, br := range altp.branches {
+		if br.useSIMD {
+			l.branchBitmapOff[i] = -1
+			continue
+		}
+		l.branchBitmapOff[i] = int32(cur)
+		cur += 32
+	}
+	l.tableEnd = cur
+	return l
+}
+
+// buildLitChainAltDataSegments returns the raw data-segment bytes (no count
+// prefix) for the alternation layout, plus the segment count.
+func buildLitChainAltDataSegments(altp *litChainAltPattern, l litChainAltLayout) ([]byte, int) {
+	// firstByteFlags table (256 bytes).
+	var fb [256]byte
+	for _, br := range altp.branches {
+		fb[br.literal[0]] = 1
+	}
+	// Teddy 1-byte tables.
+	var teddyLo, teddyHi [16]byte
+	for i, br := range altp.branches {
+		if i >= 8 {
+			break // Teddy 1-byte supports up to 8 patterns
+		}
+		first := br.literal[0]
+		teddyLo[first&0x0F] |= byte(1 << uint(i))
+		teddyHi[first>>4] |= byte(1 << uint(i))
+	}
+
+	var segs []byte
+	segCount := 0
+	segs = appendDataSegment(segs, l.firstByteOff, fb[:])
+	segCount++
+	segs = appendDataSegment(segs, l.teddyLoOff, teddyLo[:])
+	segCount++
+	segs = appendDataSegment(segs, l.teddyHiOff, teddyHi[:])
+	segCount++
+	for i, br := range altp.branches {
+		if br.useSIMD {
+			continue
+		}
+		segs = appendDataSegment(segs, l.branchBitmapOff[i], br.bitmap[:])
+		segCount++
+	}
+	return segs, segCount
+}
+
+// buildLitChainAltFindBody emits the find body for an alternation of
+// lit-chain branches. Signature: (ptr i32, len i32) → i64.
+//
+// Locals layout:
+//   0  ptr            (param i32)
+//   1  len            (param i32)
+//   2  attempt_start  (i32)
+//   3  simdMask       (i32) — scan
+//   4  scalarIdx      (i32) — scalar verify loop counter
+//   5  chunk          (v128) — scan + SIMD verify (reused)
+//   6  teddyLo        (v128) — scan
+//   7  teddyHi        (v128) — scan
+//   8  verifyTlo      (v128) — SIMD verify (loaded per branch)
+//   9  verifyPow2     (v128) — SIMD verify (loaded once)
+func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locAttemptStart byte = 2
+		locSimdMask     byte = 3
+		locScalarIdx    byte = 4
+		locChunk        byte = 5
+		locTeddyLo      byte = 6
+		locTeddyHi      byte = 7
+		locVerifyTlo    byte = 8
+		locVerifyPow2   byte = 9
+	)
+
+	var b []byte
+
+	// Local declarations: 3 i32 + 5 v128.
+	b = append(b, 0x02)       // 2 local groups
+	b = append(b, 0x03, 0x7F) // 3 × i32
+	b = append(b, 0x05, 0x7B) // 5 × v128
+
+	// Outer control flow.
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $lit_outer
+
+	// Build the FirstByteSet (deduplicated) for emitPrefixScan.
+	seen := [256]bool{}
+	var firstByteSet []byte
+	var firstByteFlags [256]byte
+	for _, br := range altp.branches {
+		firstByteFlags[br.literal[0]] = 1
+		if !seen[br.literal[0]] {
+			seen[br.literal[0]] = true
+			firstByteSet = append(firstByteSet, br.literal[0])
+		}
+	}
+
+	scan := prefixScanParams{
+		FirstByteSet:   firstByteSet,
+		FirstByteFlags: firstByteFlags,
+		FirstByteOff:   l.firstByteOff,
+		TeddyLoOff:     l.teddyLoOff,
+		TeddyHiOff:     l.teddyHiOff,
+		TeddyTwoByte:   false,
+		EngineDepth:    2,
+		TableMemIdx:    tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+			TLo:          locTeddyLo,
+			THi:          locTeddyHi,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	// attempt_start = candidate position. Try each branch in turn.
+	for i, br := range altp.branches {
+		total := int32(len(br.literal) + br.count)
+
+		b = append(b, 0x02, 0x40) // block $next_branch_i
+
+		// Branch dispatch by first byte: if input[attempt_start] != literal_i[0], skip.
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(br.literal[0]))
+		b = append(b, 0x47)       // i32.ne
+		b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
+
+		// Bounds check: attempt_start + K + N <= len?
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, locLen)
+		b = append(b, 0x4B)       // i32.gt_u
+		b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
+
+		// Verify remaining literal bytes (1..K-1).
+		for k := 1; k < len(br.literal); k++ {
+			b = append(b, 0x20, locPtr)
+			b = append(b, 0x20, locAttemptStart)
+			b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00)
+			b = utils.AppendULEB128(b, uint32(k))
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(br.literal[k]))
+			b = append(b, 0x47)       // i32.ne
+			b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
+		}
+
+		// Class verify.
+		if br.useSIMD {
+			// Load tLo for this branch + pow2.
+			b = emitV128Const(b, br.tlo)
+			b = append(b, 0x21, locVerifyTlo)
+			b = emitV128Const(b, pow2VecConst)
+			b = append(b, 0x21, locVerifyPow2)
+			// Emit SIMD chunks → bad_mask i32 on stack.
+			lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count}
+			b = emitLitChainClassVerify(b, lcp,
+				locPtr, locAttemptStart, locChunk, locVerifyTlo, locVerifyPow2)
+			b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i (bad)
+		} else {
+			// Scalar verify. Block + loop nesting so we can break OUT of the
+			// loop (success) and out of the whole branch (failure):
+			//   block $loop_done                    (+1)
+			//     loop $vloop                       (+2)
+			//       if scalarIdx >= N: br $loop_done    (br 1)
+			//       byte_val = input[attempt+K+scalarIdx]
+			//       bit = (bitmap[byte>>3] >> (byte&7)) & 1
+			//       if bit == 0: br $next_branch_i      (br 2)
+			//       scalarIdx++; br $vloop              (br 0)
+			//     end loop
+			//   end block       (fall-through = success)
+			//
+			// Depths inside the loop body:
+			//   0 = $vloop, 1 = $loop_done, 2 = $next_branch_i
+			b = append(b, 0x02, 0x40) // block $loop_done
+
+			b = append(b, 0x41, 0x00)
+			b = append(b, 0x21, locScalarIdx)
+
+			b = append(b, 0x03, 0x40) // loop $vloop
+
+			// if scalarIdx >= N: br 1 → $loop_done (loop exit = success)
+			b = append(b, 0x20, locScalarIdx)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(br.count))
+			b = append(b, 0x4E)       // i32.ge_s
+			b = append(b, 0x0D, 0x01) // br_if 1 → $loop_done
+
+			// byte_val = input[attempt_start + K + scalarIdx]
+			b = append(b, 0x20, locPtr)
+			b = append(b, 0x20, locAttemptStart)
+			b = append(b, 0x6A)
+			b = append(b, 0x20, locScalarIdx)
+			b = append(b, 0x6A)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(len(br.literal)))
+			b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+			b = append(b, 0x22, locSimdMask) // tee → save byte_val in simdMask (free here)
+
+			// bitmap[byte_val >> 3]
+			b = append(b, 0x41, 0x03)
+			b = append(b, 0x76) // shr_u 3 → byte_val>>3
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, l.branchBitmapOff[i])
+			b = append(b, 0x6A)                   // bitmapOff + (byte>>3)
+			b = appendTableLoad8u(b, tableMemIdx) // load bitmap byte
+
+			// >> (byte_val & 7), & 1, eqz
+			b = append(b, 0x20, locSimdMask)
+			b = append(b, 0x41, 0x07)
+			b = append(b, 0x71) // byte_val & 7
+			b = append(b, 0x76) // bitmap_byte >> (byte&7)
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x71) // ... & 1
+			b = append(b, 0x45) // i32.eqz → 1 if byte NOT in class
+
+			// br_if 2 → $next_branch_i (branch fails)
+			b = append(b, 0x0D, 0x02)
+
+			// scalarIdx++; br 0 → restart $vloop
+			b = append(b, 0x20, locScalarIdx)
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x6A)
+			b = append(b, 0x21, locScalarIdx)
+			b = append(b, 0x0C, 0x00) // br 0 → $vloop
+
+			b = append(b, 0x0B) // end loop $vloop
+			b = append(b, 0x0B) // end block $loop_done
+		}
+
+		// Verify succeeded — return packed (attempt_start << 32 | attempt_start + K + N).
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0xAD)
+		b = append(b, 0x42, 0x20)
+		b = append(b, 0x86) // i64.shl
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total)
+		b = append(b, 0x6A)
+		b = append(b, 0xAD)
+		b = append(b, 0x84) // i64.or
+		b = append(b, 0x0F) // return
+
+		b = append(b, 0x0B) // end $next_branch_i
+	}
+
+	// All branches failed at this position — advance and restart.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x0C, 0x00) // br 0 → $lit_outer
+
+	b = append(b, 0x0B) // end loop $lit_outer
+	b = append(b, 0x0B) // end block $no_match
+
+	// No match.
+	b = append(b, 0x42, 0x7F)
+	b = append(b, 0x0B) // end function
+	return b
+}
+
+// ============================================================================
+// Phase 2a — Lenient lit-chain alternation: literal-first DFA branches.
+//
+// Lenient mode accepts alternations where every branch starts with an
+// OpLiteral, but the trailing structure need not be a counted class chain.
+// Non-lit-chain branches compile to a small anchored DFA that runs inline
+// from the candidate position after the frontend scan locates the literal.
+//
+// Coverage example: AKIA[A-Z0-9]{16}|aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40}
+//   - Branch 1: lit-chain shape          → SIMD/scalar bitmap verify
+//   - Branch 2: starts with literal      → inline anchored DFA from candidate
+// ============================================================================
+
+// lenAltBranch is one branch of a lenient alternation. Exactly one of the
+// two-mode flags is true: isLitChain (use the existing lit-chain verify) or
+// !isLitChain (use the inline DFA verify).
+type lenAltBranch struct {
+	literal []byte // literal prefix; required (used as frontend scan trigger)
+
+	// Lit-chain branch fields (valid when isLitChain == true).
+	isLitChain  bool
+	bitmap      [32]byte
+	tlo         [16]byte
+	count       int  // N for {N,N}
+	useSIMD     bool // count >= 24
+	startAnchor anchorType
+	endAnchor   anchorType
+
+	// DFA branch fields (valid when isLitChain == false). The DFA already
+	// encodes any anchors inside the compiled branch, so startAnchor/endAnchor
+	// above are not used for DFA branches.
+	dfaTable     *dfaTable
+	dfaLayout    *dfaLayout
+	dfaDataBytes []byte // size-counted: data segments for this branch's DFA
+	dfaSegCount  int
+}
+
+// lenAltPattern is a lenient alternation recognised by analyseLitChainAltLenient.
+// At least one branch is a DFA branch — otherwise analyseLitChainAlt (strict)
+// would already have matched and lenient should not engage.
+type lenAltPattern struct {
+	branches []lenAltBranch
+}
+
+// analyseLitChainAltLenient detects an OpAlternate whose every branch begins
+// with an OpLiteral and where at least one branch is NOT lit-chain shape (else
+// the strict path is preferred). Each non-lit-chain branch is compiled as an
+// anchored DFA (leftmost-longest, leftmostFirst=false), capped at 256 states.
+//
+// Caller still gates by LikelyMatch + no-captures.
+func analyseLitChainAltLenient(pattern string) (*lenAltPattern, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpAlternate || len(re.Sub) < 2 {
+		return nil, false
+	}
+
+	branches := make([]lenAltBranch, 0, len(re.Sub))
+	dfaCount := 0
+	for _, sub := range re.Sub {
+		if info, ok := analyseLitChainBranch(sub); ok {
+			branches = append(branches, lenAltBranch{
+				literal:     info.literal,
+				isLitChain:  true,
+				bitmap:      info.bitmap,
+				tlo:         info.tlo,
+				count:       info.count,
+				useSIMD:     info.count >= 24,
+				startAnchor: info.startAnchor,
+				endAnchor:   info.endAnchor,
+			})
+			continue
+		}
+		// Phase 2a: require OpConcat starting with OpLiteral.
+		cur := sub
+		for cur.Op == syntax.OpCapture && len(cur.Sub) == 1 {
+			cur = cur.Sub[0]
+		}
+		if cur.Op != syntax.OpConcat || len(cur.Sub) < 2 {
+			return nil, false
+		}
+		litNode := cur.Sub[0]
+		if litNode.Op != syntax.OpLiteral {
+			return nil, false
+		}
+		if litNode.Flags&syntax.FoldCase != 0 {
+			return nil, false
+		}
+		literal := make([]byte, 0, len(litNode.Rune))
+		for _, r := range litNode.Rune {
+			if r > 127 {
+				return nil, false
+			}
+			literal = append(literal, byte(r))
+		}
+		if len(literal) == 0 {
+			return nil, false
+		}
+		// Compile the FULL branch (including literal) to an anchored DFA.
+		simplified := cur.Simplify()
+		prog, err := syntax.Compile(simplified)
+		if err != nil {
+			return nil, false
+		}
+		if needsUnicodeSupport(prog) {
+			return nil, false
+		}
+		d := newDFA(prog, false, false)
+		dt := dfaTableFrom(d)
+		if dt.numStates+1 > 256 {
+			return nil, false // keep inline DFA small (u8 table)
+		}
+		branches = append(branches, lenAltBranch{
+			literal:    literal,
+			isLitChain: false,
+			dfaTable:   dt,
+		})
+		dfaCount++
+	}
+	if dfaCount == 0 {
+		// All branches lit-chain — let the strict path handle it.
+		return nil, false
+	}
+	return &lenAltPattern{branches: branches}, true
+}
+
+// planLenAltLayout computes data-segment offsets for a lenient alternation:
+//   firstByteFlags, teddyLo, teddyHi, then per-branch tables (lit-chain bitmaps
+//   for scalar branches OR full DFA tables for DFA branches).
+type lenAltLayout struct {
+	firstByteOff int32
+	teddyLoOff   int32
+	teddyHiOff   int32
+	// Per-branch: bitmap offset for scalar lit-chain branches; -1 otherwise.
+	branchBitmapOff []int32
+	tableEnd        int64
+}
+
+func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
+	l := lenAltLayout{
+		branchBitmapOff: make([]int32, len(altp.branches)),
+	}
+	cur := tableBase
+	l.firstByteOff = int32(cur)
+	cur += 256
+	l.teddyLoOff = int32(cur)
+	cur += 16
+	l.teddyHiOff = int32(cur)
+	cur += 16
+	for i, br := range altp.branches {
+		l.branchBitmapOff[i] = -1
+		if br.isLitChain {
+			if !br.useSIMD {
+				l.branchBitmapOff[i] = int32(cur)
+				cur += 32
+			}
+			continue
+		}
+		// DFA branch: build its layout starting at cur.
+		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false)
+		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
+		raw, segCount := stripSegCount(dfaDataSegments(br.dfaLayout, false))
+		br.dfaDataBytes = raw
+		br.dfaSegCount = segCount
+		cur = br.dfaLayout.tableEnd
+		// Persist back to the pattern.
+		altp.branches[i] = br
+	}
+	l.tableEnd = cur
+	return l
+}
+
+// buildLenAltDataSegments emits the raw data-segment bytes (no count prefix)
+// for a lenient alternation, plus the segment count.
+func buildLenAltDataSegments(altp *lenAltPattern, l lenAltLayout) ([]byte, int) {
+	var fb [256]byte
+	for _, br := range altp.branches {
+		fb[br.literal[0]] = 1
+	}
+	var teddyLo, teddyHi [16]byte
+	for i, br := range altp.branches {
+		if i >= 8 {
+			break
+		}
+		first := br.literal[0]
+		teddyLo[first&0x0F] |= byte(1 << uint(i))
+		teddyHi[first>>4] |= byte(1 << uint(i))
+	}
+
+	var segs []byte
+	segCount := 0
+	segs = appendDataSegment(segs, l.firstByteOff, fb[:])
+	segCount++
+	segs = appendDataSegment(segs, l.teddyLoOff, teddyLo[:])
+	segCount++
+	segs = appendDataSegment(segs, l.teddyHiOff, teddyHi[:])
+	segCount++
+	for i, br := range altp.branches {
+		if br.isLitChain {
+			if !br.useSIMD {
+				segs = appendDataSegment(segs, l.branchBitmapOff[i], br.bitmap[:])
+				segCount++
+			}
+			continue
+		}
+		// DFA branch — append its data segments (already encoded).
+		segs = append(segs, br.dfaDataBytes...)
+		segCount += br.dfaSegCount
+	}
+	return segs, segCount
+}
+
+// emitInlineAnchoredDFAVerify emits the WASM bytes for an inline anchored DFA
+// verifier: it runs the DFA over the input starting at posLocal (initially set
+// to attempt_start), and:
+//   - on accept (some input position causes accept): writes the end position
+//     to locOutEnd and returns; fall-through reaches the success path.
+//   - on dead state / EOF without accept: br to nextBranchDepth → $next_branch_i.
+//
+// Locals used (must be declared in caller):
+//   locPtr, locLen      — outer i32
+//   locState            — i32 scratch (state)
+//   locPos              — i32 scratch (pos, init to attempt_start)
+//   locClass            — i32 scratch (class lookup)
+//   locOutEnd           — i32 (output: position one past last accepted byte)
+//
+// Constraint: dfaLayout.useU8 must be true (we capped DFA at 256 states).
+func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout, t *dfaTable,
+	locPtr, locLen, locState, locPos, locClass, locOutEnd byte,
+	tableMemIdx int, nextBranchDepth byte) []byte {
+
+	// Initialize: state = wasmStart; last_accept (locOutEnd) = -1.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(dl.wasmStart))
+	b = append(b, 0x21, locState)
+	b = append(b, 0x41, 0x7F) // i32.const -1
+	b = append(b, 0x21, locOutEnd)
+
+	// loop $dfa
+	//   if pos >= len: break (check accept and finish)
+	//   state = transition(state, input[pos])
+	//   if state == 0 (dead): break
+	//   if accept[state]: last_accept = pos + 1
+	//   pos++; br $dfa
+	//
+	// Structure: block $dfa_done { loop $dfa { ... } }
+	b = append(b, 0x02, 0x40) // block $dfa_done
+	b = append(b, 0x03, 0x40) // loop $dfa
+
+	// if pos >= len: br 1 → $dfa_done
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4F)       // i32.ge_u
+	b = append(b, 0x0D, 0x01) // br_if 1 → $dfa_done
+
+	// Transition: state = table[state * numClasses + class(input[pos])].
+	if dl.useCompression {
+		b = emitCompressedU8Transition(b, dl.tableOff, dl.classMapOff, dl.numClasses,
+			dl.useRowDedup, dl.rowMapOff,
+			locState, locClass, locPtr, locPos, 0xff, tableMemIdx)
+	} else {
+		b = emitSimpleU8Transition(b, dl.tableOff,
+			dl.useRowDedup, dl.rowMapOff,
+			locState, locPtr, locPos, 0xff, tableMemIdx)
+	}
+
+	// if state == 0 (dead): br 1 → $dfa_done
+	b = append(b, 0x20, locState)
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x0D, 0x01) // br_if 1 → $dfa_done
+
+	// if accept[state]: last_accept = pos + 1
+	b = emitAcceptBitOnStack(b, locState, dl.acceptLimit)
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locOutEnd)
+	b = append(b, 0x0B) // end if
+
+	// pos++; br 0 → $dfa
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locPos)
+	b = append(b, 0x0C, 0x00) // br 0 → $dfa
+
+	b = append(b, 0x0B) // end loop $dfa
+	b = append(b, 0x0B) // end block $dfa_done
+
+	// If last_accept < 0: branch failed → br to $next_branch_i.
+	b = append(b, 0x20, locOutEnd)
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x48) // i32.lt_s
+	// Depth from here: nextBranchDepth refers to $next_branch_i.
+	b = append(b, 0x0D, nextBranchDepth)
+	return b
+}
+
+// buildLitChainAltLenientFindBody emits the find body for a lenient alternation.
+// Same scan + dispatch structure as the strict path, with extra DFA-verify
+// branches inlined.
+func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) []byte {
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locAttemptStart byte = 2
+		locSimdMask     byte = 3
+		locScalarIdx    byte = 4
+		locDFAState     byte = 5
+		locDFAPos       byte = 6
+		locDFAClass     byte = 7
+		locDFAOutEnd    byte = 8
+		locChunk        byte = 9
+		locTeddyLo      byte = 10
+		locTeddyHi      byte = 11
+		locVerifyTlo    byte = 12
+		locVerifyPow2   byte = 13
+	)
+
+	var b []byte
+	// Local declarations: 7 i32 + 5 v128.
+	b = append(b, 0x02)       // 2 local groups
+	b = append(b, 0x07, 0x7F) // 7 × i32
+	b = append(b, 0x05, 0x7B) // 5 × v128
+
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $lit_outer
+
+	// Frontend scan over the union of branches' first bytes.
+	seen := [256]bool{}
+	var firstByteSet []byte
+	var firstByteFlags [256]byte
+	for _, br := range altp.branches {
+		firstByteFlags[br.literal[0]] = 1
+		if !seen[br.literal[0]] {
+			seen[br.literal[0]] = true
+			firstByteSet = append(firstByteSet, br.literal[0])
+		}
+	}
+	scan := prefixScanParams{
+		FirstByteSet:   firstByteSet,
+		FirstByteFlags: firstByteFlags,
+		FirstByteOff:   l.firstByteOff,
+		TeddyLoOff:     l.teddyLoOff,
+		TeddyHiOff:     l.teddyHiOff,
+		TeddyTwoByte:   false,
+		EngineDepth:    2,
+		TableMemIdx:    tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+			TLo:          locTeddyLo,
+			THi:          locTeddyHi,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	// Per-branch dispatch.
+	for i, br := range altp.branches {
+		b = append(b, 0x02, 0x40) // block $next_branch_i
+
+		// Dispatch by first byte: if input[attempt_start] != literal[0], skip.
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x6A)
+		b = append(b, 0x2D, 0x00, 0x00)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(br.literal[0]))
+		b = append(b, 0x47)
+		b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
+
+		if br.isLitChain {
+			total := int32(len(br.literal) + br.count)
+			// Bounds + remaining literal bytes + class verify (identical to strict).
+			b = append(b, 0x20, locAttemptStart)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, total)
+			b = append(b, 0x6A)
+			b = append(b, 0x20, locLen)
+			b = append(b, 0x4B)
+			b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
+
+			for k := 1; k < len(br.literal); k++ {
+				b = append(b, 0x20, locPtr)
+				b = append(b, 0x20, locAttemptStart)
+				b = append(b, 0x6A)
+				b = append(b, 0x2D, 0x00)
+				b = utils.AppendULEB128(b, uint32(k))
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(br.literal[k]))
+				b = append(b, 0x47)
+				b = append(b, 0x0D, 0x00)
+			}
+
+			if br.useSIMD {
+				b = emitV128Const(b, br.tlo)
+				b = append(b, 0x21, locVerifyTlo)
+				b = emitV128Const(b, pow2VecConst)
+				b = append(b, 0x21, locVerifyPow2)
+				lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count}
+				b = emitLitChainClassVerify(b, lcp,
+					locPtr, locAttemptStart, locChunk, locVerifyTlo, locVerifyPow2)
+				b = append(b, 0x0D, 0x00)
+			} else {
+				b = append(b, 0x02, 0x40) // block $loop_done
+				b = append(b, 0x41, 0x00)
+				b = append(b, 0x21, locScalarIdx)
+				b = append(b, 0x03, 0x40) // loop $vloop
+
+				b = append(b, 0x20, locScalarIdx)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(br.count))
+				b = append(b, 0x4E)
+				b = append(b, 0x0D, 0x01)
+
+				b = append(b, 0x20, locPtr)
+				b = append(b, 0x20, locAttemptStart)
+				b = append(b, 0x6A)
+				b = append(b, 0x20, locScalarIdx)
+				b = append(b, 0x6A)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(len(br.literal)))
+				b = append(b, 0x6A)
+				b = append(b, 0x2D, 0x00, 0x00)
+				b = append(b, 0x22, locSimdMask)
+
+				b = append(b, 0x41, 0x03)
+				b = append(b, 0x76)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, l.branchBitmapOff[i])
+				b = append(b, 0x6A)
+				b = appendTableLoad8u(b, tableMemIdx)
+
+				b = append(b, 0x20, locSimdMask)
+				b = append(b, 0x41, 0x07)
+				b = append(b, 0x71)
+				b = append(b, 0x76)
+				b = append(b, 0x41, 0x01)
+				b = append(b, 0x71)
+				b = append(b, 0x45)
+
+				b = append(b, 0x0D, 0x02)
+
+				b = append(b, 0x20, locScalarIdx)
+				b = append(b, 0x41, 0x01)
+				b = append(b, 0x6A)
+				b = append(b, 0x21, locScalarIdx)
+				b = append(b, 0x0C, 0x00)
+
+				b = append(b, 0x0B) // end $vloop
+				b = append(b, 0x0B) // end $loop_done
+			}
+
+			// Lit-chain success — return packed (attempt_start, attempt_start+K+N).
+			b = append(b, 0x20, locAttemptStart)
+			b = append(b, 0xAD)
+			b = append(b, 0x42, 0x20)
+			b = append(b, 0x86)
+			b = append(b, 0x20, locAttemptStart)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, total)
+			b = append(b, 0x6A)
+			b = append(b, 0xAD)
+			b = append(b, 0x84)
+			b = append(b, 0x0F) // return
+		} else {
+			// DFA branch: initialize DFA pos = attempt_start, run inline.
+			b = append(b, 0x20, locAttemptStart)
+			b = append(b, 0x21, locDFAPos)
+			// emitInlineAnchoredDFAVerify either falls through (with locDFAOutEnd
+			// holding the end position) on success, or br's to $next_branch_i on
+			// failure. nextBranchDepth = 0 because we're directly inside the
+			// $next_branch_i block at this point.
+			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout, br.dfaTable,
+				locPtr, locLen, locDFAState, locDFAPos, locDFAClass, locDFAOutEnd,
+				tableMemIdx, 0)
+			// Success — return packed (attempt_start, locDFAOutEnd).
+			b = append(b, 0x20, locAttemptStart)
+			b = append(b, 0xAD)
+			b = append(b, 0x42, 0x20)
+			b = append(b, 0x86)
+			b = append(b, 0x20, locDFAOutEnd)
+			b = append(b, 0xAD)
+			b = append(b, 0x84)
+			b = append(b, 0x0F) // return
+		}
+
+		b = append(b, 0x0B) // end $next_branch_i
+	}
+
+	// All branches failed — advance attempt_start by 1 and restart.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x0C, 0x00) // br 0 → $lit_outer
+
+	b = append(b, 0x0B) // end loop $lit_outer
+	b = append(b, 0x0B) // end block $no_match
+
+	b = append(b, 0x42, 0x7F)
+	b = append(b, 0x0B)
+	return b
+}

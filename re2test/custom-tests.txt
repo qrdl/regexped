@@ -1630,3 +1630,23 @@ regexps
 0-2 0-1;0-2;-;-
 -;1-2;-;-;;1-2 1-1
 -;1-3;-;-;;1-3 1-2
+# ============================================================
+# Category 26: Word-boundary at literal-anchor candidate position
+# Documents a known bug in the lit-anchor DFA find path: when a pattern is
+# `\bLITERAL...` and the SIMD prefix scan locates LITERAL at a position p
+# where the preceding byte input[p-1] is a word char (so `\b` should fail at
+# p), regexped's neutral DFA find incorrectly returns a match at p.
+# Verified against Go stdlib regexp.FindStringIndex.
+# ============================================================
+Cat26LitAnchorWordBoundaryBug
+strings
+"Xghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+"see ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 here"
+" ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 "
+"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+regexps
+"\\bghp_[A-Za-z0-9]{36}\\b"
+-;42-82;-;-
+-;4-44;-;-
+-;1-41;-;-
+0-40;0-40;-;-

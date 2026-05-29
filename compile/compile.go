@@ -42,6 +42,33 @@ type matcher interface {
 	Type() EngineType
 }
 
+// LikelyMode hints which suffix-DFA optimisation path the compiler should
+// favour for a pattern. See plans/LIKELY.md for the underlying structural
+// optimisations (SIMD counted-chain verifier, SIMD dominant-self-loop skip).
+//
+// The field is presently a stub: it is plumbed through CompileOptions but does
+// not yet alter WASM emission, so all three modes produce identical output. It
+// exists so the likelytest harness can compile every pattern in three modes
+// without depending on optimisation work that lands later.
+type LikelyMode int
+
+const (
+	LikelyNeutral  LikelyMode = iota // default; no structural hint
+	LikelyMatch                      // bias for fast-accept (counted-chain SIMD verify)
+	LikelyNoMatch                    // bias for fast-reject (dominant-self-loop SIMD skip)
+)
+
+func (m LikelyMode) String() string {
+	switch m {
+	case LikelyMatch:
+		return "likely-match"
+	case LikelyNoMatch:
+		return "likely-nomatch"
+	default:
+		return "neutral"
+	}
+}
+
 // CompileOptions contains optional parameters for engine selection.
 type CompileOptions struct {
 	// MaxDFAStates is the maximum number of states allowed when building a DFA
@@ -57,6 +84,9 @@ type CompileOptions struct {
 	Unicode       bool       // Enable Unicode support
 	ForceEngine   EngineType // If non-zero, skip engine selection and use this engine type
 	LeftmostFirst bool       // Use leftmost-first (RE2/Perl) semantics for alternations
+	// LikelyMode hints which suffix-DFA structural optimisation to favour.
+	// Currently no-op; reserved for the LIKELY.md fast-accept / fast-reject paths.
+	LikelyMode LikelyMode
 	// CompiledDFAThreshold is the maximum minimised WASM state count for which the
 	// compiled dispatch path (EngineCompiledDFA) is used instead of the table-driven
 	// interpreter. 0 means use the default (256). Capped at 256 (u8 state index
@@ -208,6 +238,70 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 	if !needMatch && !needFind && !needGroups {
 		return &compiledPattern{tableEnd: tableBase}, nil
+	}
+
+	// LikelyMatch early gate: counted-chain SIMD verifier (LIKELY.md Opt 2).
+	// Replaces the DFA match/find bodies entirely when the pattern matches the
+	// strict <literal><charclass>{N,N} shape or a strict alternation of such
+	// branches. Captures fall back to the DFA path (needGroups handled below
+	// as usual).
+	if buildOpts.LikelyMode == LikelyMatch && !needGroups {
+		if lcp, ok := analyseLitChain(re.Pattern); ok {
+			p := &compiledPattern{
+				matchExport: re.MatchFunc,
+				findExport:  re.FindFunc,
+				anchored:    false,
+				tableEnd:    tableBase,
+			}
+			if needMatch {
+				p.matchBody = appendLitChainMatchCodeEntry(nil, lcp)
+			}
+			if needFind {
+				p.findBody = appendLitChainFindCodeEntry(nil, lcp, buildOpts.tableMemIdx)
+			}
+			return p, nil
+		}
+		// Phase 2: alternation of strict lit-chain branches. Find-mode only;
+		// anchored match is not yet specialised for alternation.
+		if needFind && !needMatch {
+			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
+				layout := planLitChainAltLayout(altp, tableBase)
+				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
+				body := buildLitChainAltFindBody(altp, layout, buildOpts.tableMemIdx)
+				var findBody []byte
+				findBody = utils.AppendULEB128(findBody, uint32(len(body)))
+				findBody = append(findBody, body...)
+				p := &compiledPattern{
+					findExport:   re.FindFunc,
+					anchored:     false,
+					findBody:     findBody,
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
+					tableEnd:     layout.tableEnd,
+				}
+				return p, nil
+			}
+			// Phase 2a: lenient alternation — at least one branch is non-lit-chain
+			// but starts with a literal. DFA branches are inlined as anchored DFA
+			// verifies from the candidate position.
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern); ok {
+				layout := planLenAltLayout(lenAltp, tableBase)
+				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
+				body := buildLitChainAltLenientFindBody(lenAltp, layout, buildOpts.tableMemIdx)
+				var findBody []byte
+				findBody = utils.AppendULEB128(findBody, uint32(len(body)))
+				findBody = append(findBody, body...)
+				p := &compiledPattern{
+					findExport:   re.FindFunc,
+					anchored:     false,
+					findBody:     findBody,
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
+					tableEnd:     layout.tableEnd,
+				}
+				return p, nil
+			}
+		}
 	}
 
 	maxStates := resolveMaxDFAStates(&buildOpts)
