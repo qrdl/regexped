@@ -252,6 +252,32 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// scan-to-find-extent → fill-captures pipeline and adjusts slot positions
 	// by the match start.
 	if buildOpts.LikelyMode == LikelyMatch && needGroups {
+		// Gap C: single-pattern range with captures (greedy).
+		if lcp, lcc, ok := analyseLitChainGroupsRange(re.Pattern); ok {
+			p := &compiledPattern{
+				tableEnd:  tableBase,
+				numGroups: lcc.numGroups,
+				anchored:  true,
+			}
+			p.groupsExport = re.GroupsFunc
+			if re.NamedGroupsFunc != "" {
+				p.namedGroupsExport = re.NamedGroupsFunc
+			}
+			if needFind {
+				p.findExport = re.FindFunc
+				p.findBody = appendLitChainRangeFindCodeEntry(nil, lcp, buildOpts.tableMemIdx)
+			}
+			if needMatch {
+				p.matchExport = re.MatchFunc
+				p.matchBody = appendLitChainRangeMatchCodeEntry(nil, lcp)
+			}
+			p.captureBody = appendLitChainRangeFindGroupsCodeEntry(nil, lcp, lcc, buildOpts.tableMemIdx)
+			parsed, perr := syntax.Parse(re.Pattern, syntax.Perl)
+			if perr == nil {
+				p.groupNames = extractGroupNames(parsed)
+			}
+			return p, nil
+		}
 		if lcp, lcc, ok := analyseLitChainGroups(re.Pattern); ok {
 			p := &compiledPattern{
 				tableEnd:  tableBase,
@@ -388,6 +414,37 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			}
 			return p, nil
 		}
+		// Gap C: single-pattern range `{N,M}`.
+		if lcp, ok := analyseLitChainRange(re.Pattern, true); ok {
+			// Greedy and non-greedy paths split by function:
+			//   anchored match: greedy/non-greedy same → range match body
+			//   find/groups greedy: range find/groups body
+			//   find/groups non-greedy: collapses to {N,N} via existing emission
+			//   (just normalise countMax = count and use buildLitChainFindBody)
+			p := &compiledPattern{
+				matchExport: re.MatchFunc,
+				findExport:  re.FindFunc,
+				anchored:    false,
+				tableEnd:    tableBase,
+			}
+			if needMatch {
+				p.matchBody = appendLitChainRangeMatchCodeEntry(nil, lcp)
+			}
+			if needFind {
+				if lcp.greedy {
+					p.findBody = appendLitChainRangeFindCodeEntry(nil, lcp, buildOpts.tableMemIdx)
+				} else {
+					// Non-greedy find: match length is fixed at K+N. Reuse the
+					// {N,N} emission with countMax normalised to count.
+					normalised := *lcp
+					normalised.countMax = normalised.count
+					p.findBody = appendLitChainFindCodeEntry(nil, &normalised, buildOpts.tableMemIdx)
+				}
+			}
+			if needMatch || needFind {
+				return p, nil
+			}
+		}
 		// Gap B: anchored match for strict lit-chain alternation.
 		if needMatch && !needFind {
 			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
@@ -429,6 +486,20 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					findExport:   re.FindFunc,
 					anchored:     false,
 					findBody:     findBody,
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
+					tableEnd:     layout.tableEnd,
+				}
+				return p, nil
+			}
+			// Gap C: strict alt of lit-chain branches with at least one range.
+			if altp, ok := analyseLitChainAltRange(re.Pattern, true); ok {
+				layout := planLitChainAltLayout(altp, tableBase)
+				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
+				p := &compiledPattern{
+					findExport:   re.FindFunc,
+					anchored:     false,
+					findBody:     appendLitChainAltRangeFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx),
 					dataBytes:    dataBytes,
 					dataSegCount: segCount,
 					tableEnd:     layout.tableEnd,

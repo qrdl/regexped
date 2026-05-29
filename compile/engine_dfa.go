@@ -4601,7 +4601,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 type litChainPattern struct {
 	literal     []byte   // K-byte literal prefix (K >= 1)
 	tlo         [16]byte // nibble table: bit h of Tlo[l] set iff byte (h<<4|l) ∈ class
-	count       int      // N — chain length (N >= 1, K+N >= 16)
+	count       int      // N — minimum chain length (N >= 1, K+N >= 16)
+	countMax    int      // M — maximum chain length (M >= N). Equals count for {N,N}.
+	greedy      bool     // false for `{N,M}?`; only matters when count < countMax
 	startAnchor anchorType
 	endAnchor   anchorType
 }
@@ -4611,10 +4613,12 @@ type litChainPattern struct {
 // gate — callers decide per-context (single-pattern gate vs. per-branch gate
 // inside an alternation).
 type litChainBranchInfo struct {
-	literal []byte
-	bitmap  [32]byte // 256-bit byte-class bitmap (for scalar verify)
-	tlo     [16]byte // nibble table (for SIMD verify)
-	count   int
+	literal  []byte
+	bitmap   [32]byte // 256-bit byte-class bitmap (for scalar verify)
+	tlo      [16]byte // nibble table (for SIMD verify)
+	count    int      // N (min)
+	countMax int      // M (max); equals count for {N,N}
+	greedy   bool     // false for `{N,M}?`
 
 	// Optional anchors. `(?m)^` / `(?m)$` (multiline) are NOT supported and
 	// cause analyseLitChainBranch to reject. `\A`/`\z` and (default-Perl) `^`/`$`
@@ -4653,6 +4657,11 @@ func analyseLitChainRe(re *syntax.Regexp) (*litChainPattern, bool) {
 	if !ok {
 		return nil, false
 	}
+	// Existing {N,N} emission only — ranges (countMax > count) handled by the
+	// range-aware analyser. Non-greedy {N,N} (degenerate) is fine.
+	if info.countMax != info.count {
+		return nil, false
+	}
 	// N≥24 single-pattern gate. Empirically (wasmtime 42 / Cranelift), inline
 	// SIMD class verify pessimises register allocation for the scan loop when
 	// the verify is small — a ~70% wall-time regression appears at N=16 despite
@@ -4666,6 +4675,8 @@ func analyseLitChainRe(re *syntax.Regexp) (*litChainPattern, bool) {
 		literal:     info.literal,
 		tlo:         info.tlo,
 		count:       info.count,
+		countMax:    info.countMax,
+		greedy:      info.greedy,
 		startAnchor: info.startAnchor,
 		endAnchor:   info.endAnchor,
 	}, true
@@ -4677,8 +4688,10 @@ type litChainAltBranch struct {
 	literal     []byte
 	bitmap      [32]byte // 256-bit byte-class bitmap (for scalar verify when useSIMD=false)
 	tlo         [16]byte // nibble table (for SIMD verify when useSIMD=true)
-	count       int
-	useSIMD     bool // N >= 24 → SIMD chunks; else scalar byte-by-byte
+	count       int      // N (min)
+	countMax    int      // M (max); equals count for {N,N}
+	greedy      bool     // false for `{N,M}?`
+	useSIMD     bool     // N >= 24 → SIMD chunks; else scalar byte-by-byte
 	startAnchor anchorType
 	endAnchor   anchorType
 }
@@ -4688,6 +4701,89 @@ type litChainAltBranch struct {
 // per-branch useSIMD bit selects the verify kernel for each branch.
 type litChainAltPattern struct {
 	branches []litChainAltBranch
+}
+
+// analyseLitChainRange parses pattern as a single lit-chain branch with a
+// range count `{N,M}` where N < M. Only **greedy** ranges qualify here; non-
+// greedy `{N,M}?` collapses to `{N,N}` in find/groups context and is handled
+// by the standard analyser. Anchored match treats greedy and non-greedy the
+// same; callers requesting the anchored path use this analyser for both.
+//
+// Gate: N ≥ 24 (same scan-loop register-pressure concern as {N,N}).
+func analyseLitChainRange(pattern string, allowNonGreedy bool) (*litChainPattern, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	info, ok := analyseLitChainBranch(re)
+	if !ok {
+		return nil, false
+	}
+	if info.countMax <= info.count {
+		return nil, false // not a range
+	}
+	if !info.greedy && !allowNonGreedy {
+		return nil, false
+	}
+	if info.count < 24 {
+		return nil, false
+	}
+	return &litChainPattern{
+		literal:     info.literal,
+		tlo:         info.tlo,
+		count:       info.count,
+		countMax:    info.countMax,
+		greedy:      info.greedy,
+		startAnchor: info.startAnchor,
+		endAnchor:   info.endAnchor,
+	}, true
+}
+
+// analyseLitChainAltRange parses pattern as an OpAlternate of lit-chain
+// branches, where at least one branch is a range `{N,M}`. All branches must
+// qualify under analyseLitChainBranch (count ≥ 1, K+min ≥ 16, ASCII class).
+// For non-greedy branches in find/groups context, callers normalise per
+// branch via the existing collapse-to-{N,N} mechanism.
+func analyseLitChainAltRange(pattern string, allowNonGreedy bool) (*litChainAltPattern, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpAlternate || len(re.Sub) < 2 {
+		return nil, false
+	}
+	branches := make([]litChainAltBranch, 0, len(re.Sub))
+	hasRange := false
+	for _, sub := range re.Sub {
+		info, ok := analyseLitChainBranch(sub)
+		if !ok {
+			return nil, false
+		}
+		if !info.greedy && !allowNonGreedy {
+			return nil, false
+		}
+		if info.countMax > info.count {
+			hasRange = true
+		}
+		branches = append(branches, litChainAltBranch{
+			literal:     info.literal,
+			bitmap:      info.bitmap,
+			tlo:         info.tlo,
+			count:       info.count,
+			countMax:    info.countMax,
+			greedy:      info.greedy,
+			useSIMD:     info.count >= 24,
+			startAnchor: info.startAnchor,
+			endAnchor:   info.endAnchor,
+		})
+	}
+	if !hasRange {
+		return nil, false // pure {N,N} alternation — handled by analyseLitChainAlt
+	}
+	return &litChainAltPattern{branches: branches}, true
 }
 
 // analyseLitChainAlt parses pattern and returns a litChainAltPattern when the
@@ -4710,11 +4806,16 @@ func analyseLitChainAlt(pattern string) (*litChainAltPattern, bool) {
 		if !ok {
 			return nil, false // strict: every branch must qualify
 		}
+		if info.countMax != info.count {
+			return nil, false // ranges handled by analyseLitChainAltRange
+		}
 		branches = append(branches, litChainAltBranch{
 			literal:     info.literal,
 			bitmap:      info.bitmap,
 			tlo:         info.tlo,
 			count:       info.count,
+			countMax:    info.countMax,
+			greedy:      info.greedy,
 			useSIMD:     info.count >= 24,
 			startAnchor: info.startAnchor,
 			endAnchor:   info.endAnchor,
@@ -4812,9 +4913,10 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 	if chainNode.Op != syntax.OpRepeat {
 		return nil, false
 	}
-	if chainNode.Min != chainNode.Max || chainNode.Min < 1 {
+	if chainNode.Min < 1 || chainNode.Max < chainNode.Min {
 		return nil, false
 	}
+	greedy := (chainNode.Flags & syntax.NonGreedy) == 0
 	if len(chainNode.Sub) != 1 {
 		return nil, false
 	}
@@ -4862,6 +4964,7 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 	}
 
 	count := chainNode.Min
+	countMax := chainNode.Max
 	if len(literal)+count < 16 {
 		// Overlap-load tail requires K+N >= 16. Tiny patterns: defer.
 		return nil, false
@@ -4879,6 +4982,8 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 		bitmap:      bitmap,
 		tlo:         tlo,
 		count:       count,
+		countMax:    countMax,
+		greedy:      greedy,
 		startAnchor: startAnchor,
 		endAnchor:   endAnchor,
 	}, true
@@ -5243,12 +5348,11 @@ func emitLitChainAltLitBranchBody(b []byte, br litChainAltBranch,
 	// Literal verify (bytes 1..K-1; byte 0 already covered by first-byte dispatch).
 	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
 
-	// Class verify.
+	// Class verify. Caller must pre-load locals.VerifyPow2 with pow2VecConst
+	// (hoisted out of the scan loop for Cranelift JIT codegen).
 	if br.useSIMD {
 		b = emitV128Const(b, br.tlo)
 		b = append(b, 0x21, locals.VerifyTlo)
-		b = emitV128Const(b, pow2VecConst)
-		b = append(b, 0x21, locals.VerifyPow2)
 		lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count}
 		b = emitLitChainClassVerify(b, lcp,
 			locals.Ptr, locals.AttemptStart, locals.Chunk, locals.VerifyTlo, locals.VerifyPow2)
@@ -5265,6 +5369,142 @@ func emitLitChainAltLitBranchBody(b []byte, br litChainAltBranch,
 
 	// Success — return packed (attempt_start << 32 | attempt_start + total).
 	b = emitReturnPackedI64(b, locals.AttemptStart, total)
+	return b
+}
+
+// emitLitChainAltLitBranchBodyRange is the range-counted counterpart of
+// emitLitChainAltLitBranchBody. Same per-branch verify shape, but the class
+// verify uses the branch-free range algorithm (computes match_len in
+// [count..countMax]). On success, returns packed (attempt_start, attempt_start
+// + K + match_len).
+func emitLitChainAltLitBranchBodyRange(b []byte, br litChainAltBranch,
+	branchBitmapOff int32, locals litChainBranchLocals,
+	locMatchLen, locTmp byte,
+	tableMemIdx int) []byte {
+
+	const failDepth byte = 0
+	k := int32(len(br.literal))
+	countMin := int32(br.count)
+
+	// First-byte dispatch.
+	b = append(b, 0x20, locals.Ptr)
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(br.literal[0]))
+	b = append(b, 0x47)
+	b = append(b, 0x0D, failDepth)
+
+	// Bounds: attempt_start + K + countMin > len → fail.
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k+countMin)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locals.Len)
+	b = append(b, 0x4B)
+	b = append(b, 0x0D, failDepth)
+
+	// Start anchor.
+	if br.startAnchor != anchorNone {
+		b = emitStartAnchorCheck(b, br.startAnchor, br.literal[0],
+			locals.Ptr, locals.AttemptStart, locals.ScalarIdx, failDepth)
+	}
+
+	// Literal verify (bytes 1..K-1).
+	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
+
+	// Range class verify (branch-free). Caller pre-loaded VerifyPow2.
+	b = emitV128Const(b, br.tlo)
+	b = append(b, 0x21, locals.VerifyTlo)
+	lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count, countMax: br.countMax, greedy: br.greedy}
+	b = emitRangeClassVerify(b, lcp,
+		locals.Ptr, locals.AttemptStart, locals.Chunk, locals.VerifyTlo, locals.VerifyPow2, locMatchLen, locTmp)
+
+	// Runtime cap: max_avail = len - attempt_start - K. match_len = min(match_len, max_avail).
+	b = append(b, 0x20, locals.Len)
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x6B)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k)
+	b = append(b, 0x6B)
+	b = append(b, 0x21, locTmp) // max_avail
+
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x20, locTmp)
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x20, locTmp)
+	b = append(b, 0x49)
+	b = append(b, 0x1B) // select
+	b = append(b, 0x21, locMatchLen)
+
+	// If match_len < countMin → fail this branch.
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, countMin)
+	b = append(b, 0x49) // i32.lt_u
+	b = append(b, 0x0D, failDepth)
+
+	// End anchor at end_pos = attempt_start + K + match_len.
+	if br.endAnchor != anchorNone {
+		// Compute end_pos into locTmp.
+		b = append(b, 0x20, locals.AttemptStart)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, k)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, locMatchLen)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, locTmp)
+
+		switch br.endAnchor {
+		case anchorBeginText:
+			// end_pos == 0 — impossible (countMin >= 1, K >= 1).
+			b = append(b, 0x0C, failDepth)
+		case anchorEndText:
+			b = append(b, 0x20, locTmp)
+			b = append(b, 0x20, locals.Len)
+			b = append(b, 0x47)
+			b = append(b, 0x0D, failDepth)
+		case anchorWordBoundary, anchorNoWordBoundary:
+			// leftWord = is_word(input[end_pos-1])
+			b = append(b, 0x20, locals.Ptr)
+			b = append(b, 0x20, locTmp)
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x6B)
+			b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00)
+			b = emitIsWordByte(b, locals.ScalarIdx)
+			// rightWord = (end_pos < len) ? is_word(input[end_pos]) : 0
+			b = append(b, 0x20, locTmp)
+			b = append(b, 0x20, locals.Len)
+			b = append(b, 0x49)
+			b = append(b, 0x04, 0x7F)
+			b = append(b, 0x20, locals.Ptr)
+			b = append(b, 0x20, locTmp)
+			b = append(b, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00)
+			b = emitIsWordByte(b, locals.ScalarIdx)
+			b = append(b, 0x05)
+			b = append(b, 0x41, 0x00)
+			b = append(b, 0x0B)
+			b = append(b, 0x73) // boundary
+			if br.endAnchor == anchorWordBoundary {
+				b = append(b, 0x45)
+			}
+			b = append(b, 0x0D, failDepth)
+		}
+	}
+
+	// Success — return packed (attempt_start, attempt_start + K + match_len).
+	// end_pos = attempt_start + K + match_len → store in locTmp (or recompute).
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locTmp)
+	b = emitReturnPackedI64FromLocal(b, locals.AttemptStart, locTmp)
 	return b
 }
 
@@ -5306,11 +5546,10 @@ func emitLitChainAltLitBranchGroupsBody(b []byte, br litChainAltBranch,
 
 	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
 
+	// Class verify. Caller must pre-load locals.VerifyPow2 with pow2VecConst.
 	if br.useSIMD {
 		b = emitV128Const(b, br.tlo)
 		b = append(b, 0x21, locals.VerifyTlo)
-		b = emitV128Const(b, pow2VecConst)
-		b = append(b, 0x21, locals.VerifyPow2)
 		lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count}
 		b = emitLitChainClassVerify(b, lcp,
 			locals.Ptr, locals.AttemptStart, locals.Chunk, locals.VerifyTlo, locals.VerifyPow2)
@@ -5749,6 +5988,9 @@ func analyseLitChainGroups(pattern string) (*litChainPattern, *litChainCaptures,
 	if !ok {
 		return nil, nil, false
 	}
+	if info.countMax != info.count {
+		return nil, nil, false // ranges handled by analyseLitChainGroupsRange
+	}
 	if info.count < 24 {
 		return nil, nil, false
 	}
@@ -5765,11 +6007,58 @@ func analyseLitChainGroups(pattern string) (*litChainPattern, *litChainCaptures,
 		literal:     info.literal,
 		tlo:         info.tlo,
 		count:       info.count,
+		countMax:    info.countMax,
+		greedy:      info.greedy,
 		startAnchor: info.startAnchor,
 		endAnchor:   info.endAnchor,
 	}
 	lcc := &litChainCaptures{
 		numGroups: maxGroup + 1, // +1 for group 0 (whole match)
+		groups:    caps,
+	}
+	return lcp, lcc, true
+}
+
+// analyseLitChainGroupsRange parses pattern as a single lit-chain branch with
+// a range count and compile-time-resolvable captures. Mirrors
+// analyseLitChainGroups but accepts countMax > count (greedy ranges only;
+// non-greedy in find/groups collapses to {N,N}).
+func analyseLitChainGroupsRange(pattern string) (*litChainPattern, *litChainCaptures, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, nil, false
+	}
+	info, ok := analyseLitChainBranch(re)
+	if !ok {
+		return nil, nil, false
+	}
+	if info.countMax <= info.count {
+		return nil, nil, false // not a range
+	}
+	if !info.greedy {
+		return nil, nil, false // collapse to {N,N} via existing path
+	}
+	if info.count < 24 {
+		return nil, nil, false
+	}
+	caps, maxGroup, ok := extractLitChainCaptures(re)
+	if !ok {
+		return nil, nil, false
+	}
+	if maxGroup == 0 {
+		return nil, nil, false
+	}
+	lcp := &litChainPattern{
+		literal:     info.literal,
+		tlo:         info.tlo,
+		count:       info.count,
+		countMax:    info.countMax,
+		greedy:      info.greedy,
+		startAnchor: info.startAnchor,
+		endAnchor:   info.endAnchor,
+	}
+	lcc := &litChainCaptures{
+		numGroups: maxGroup + 1,
 		groups:    caps,
 	}
 	return lcp, lcc, true
@@ -5806,6 +6095,9 @@ func analyseLitChainAltGroups(pattern string) (*litChainAltPattern, []*litChainC
 		if !ok {
 			return nil, nil, false
 		}
+		if info.countMax != info.count {
+			return nil, nil, false // ranges handled by range-aware analyser
+		}
 		caps, m, ok := extractLitChainCaptures(sub)
 		if !ok {
 			return nil, nil, false
@@ -5821,6 +6113,8 @@ func analyseLitChainAltGroups(pattern string) (*litChainAltPattern, []*litChainC
 			bitmap:      info.bitmap,
 			tlo:         info.tlo,
 			count:       info.count,
+			countMax:    info.countMax,
+			greedy:      info.greedy,
 			useSIMD:     true, // groups path always SIMD (no scan-loop pressure)
 			startAnchor: info.startAnchor,
 			endAnchor:   info.endAnchor,
@@ -6085,6 +6379,80 @@ func buildLitChainGroupsBody(lcp *litChainPattern, lcc *litChainCaptures) []byte
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, total)
 	b = append(b, 0x0B) // end function
+	return b
+}
+
+// emitLitChainRangeGroupSlotWrites emits slot writes for range patterns
+// where the chain length is determined at runtime by locMatchLen. Captures
+// whose endOffset coincides with K + countMax (i.e., end at the chain end)
+// use attemptStart + K + match_len; other endOffsets are compile-time.
+func emitLitChainRangeGroupSlotWrites(b []byte, lcc *litChainCaptures,
+	outPtrLocal, attemptStartLocal, matchLenLocal byte, k, countMax int) []byte {
+
+	populated := make(map[int]captureGroup, len(lcc.groups))
+	for _, cg := range lcc.groups {
+		populated[cg.group] = cg
+	}
+
+	chainEnd := k + countMax
+
+	// Helper: write (attemptStart + offset) to out_ptr at slotOff.
+	writeAttemptPlus := func(b []byte, slotOff uint32, offset int) []byte {
+		b = append(b, 0x20, outPtrLocal)
+		b = append(b, 0x20, attemptStartLocal)
+		if offset != 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(offset))
+			b = append(b, 0x6A)
+		}
+		b = append(b, 0x36, 0x00)
+		b = utils.AppendULEB128(b, slotOff)
+		return b
+	}
+
+	// Helper: write (attemptStart + K + match_len) to out_ptr at slotOff.
+	writeAttemptPlusKPlusMatchLen := func(b []byte, slotOff uint32) []byte {
+		b = append(b, 0x20, outPtrLocal)
+		b = append(b, 0x20, attemptStartLocal)
+		if k != 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(k))
+			b = append(b, 0x6A)
+		}
+		b = append(b, 0x20, matchLenLocal)
+		b = append(b, 0x6A)
+		b = append(b, 0x36, 0x00)
+		b = utils.AppendULEB128(b, slotOff)
+		return b
+	}
+
+	writeMinusOne := func(b []byte, slotOff uint32) []byte {
+		b = append(b, 0x20, outPtrLocal)
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x36, 0x00)
+		b = utils.AppendULEB128(b, slotOff)
+		return b
+	}
+
+	// Group 0: whole match. start = attemptStart, end = attemptStart + K + match_len.
+	b = writeAttemptPlus(b, 0, 0)
+	b = writeAttemptPlusKPlusMatchLen(b, 4)
+
+	for g := 1; g < lcc.numGroups; g++ {
+		startSlot := uint32(g * 8)
+		endSlot := uint32(g*8 + 4)
+		if cg, ok := populated[g]; ok {
+			b = writeAttemptPlus(b, startSlot, cg.startOffset)
+			if cg.endOffset == chainEnd {
+				b = writeAttemptPlusKPlusMatchLen(b, endSlot)
+			} else {
+				b = writeAttemptPlus(b, endSlot, cg.endOffset)
+			}
+		} else {
+			b = writeMinusOne(b, startSlot)
+			b = writeMinusOne(b, endSlot)
+		}
+	}
 	return b
 }
 
@@ -6645,6 +7013,15 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 	k := int32(len(lcp.literal))
 	total := k + int32(lcp.count)
 
+	// Hoist nibble-table materialisation outside the scan loop — loop-invariant
+	// values do not need to be re-loaded on every iteration. (Cranelift JIT
+	// regression workaround: keeping these out of the loop body reduces scan-
+	// loop register pressure.)
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $lit_outer
 
@@ -6684,11 +7061,6 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 			locPtr, locAttemptStart, locTmp, 0)
 	}
 
-	// Materialise nibble tables and do SIMD class verify inline.
-	b = emitV128Const(b, lcp.tlo)
-	b = append(b, 0x21, locTLo)
-	b = emitV128Const(b, pow2VecConst)
-	b = append(b, 0x21, locPow2)
 	b = emitLitChainClassVerify(b, lcp,
 		locPtr, locAttemptStart, locChunk, locTLo, locPow2)
 
@@ -6856,6 +7228,550 @@ func appendLitChainFindGroupsCodeEntry(cs []byte, lcp *litChainPattern, lcc *lit
 	return append(cs, body...)
 }
 
+// buildLitChainRangeFindGroupsBody emits the find-with-captures body for a
+// single lit-chain with range `{N,M}` greedy. Signature: (ptr,len,out_ptr) → i32.
+// Combines the range-find SIMD scan + branch-free verify with inline slot
+// writes (chain-end slots use runtime match_len).
+func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, tableMemIdx int) []byte {
+	var b []byte
+
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locOutPtr       byte = 2
+		locAttemptStart byte = 3
+		locSimdMask     byte = 4
+		locMatchLen     byte = 5
+		locTmp          byte = 6
+		locChunk        byte = 7
+		locTLo          byte = 8
+		locPow2         byte = 9
+	)
+
+	// 4 × i32 + 3 × v128.
+	b = append(b, 0x02)
+	b = append(b, 0x04, 0x7F)
+	b = append(b, 0x03, 0x7B)
+
+	k := int32(len(lcp.literal))
+	countMin := int32(lcp.count)
+
+	// Hoist nibble tables.
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+
+	b = append(b, 0x02, 0x40)
+	b = append(b, 0x03, 0x40)
+
+	scan := prefixScanParams{
+		Prefix:      lcp.literal,
+		EngineDepth: 2,
+		TableMemIdx: tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	// Bounds: attempt_start + K + countMin > len → $no_match.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k+countMin)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4B)
+	b = append(b, 0x0D, 0x01)
+
+	// Range class verify.
+	b = emitRangeClassVerify(b, lcp, locPtr, locAttemptStart, locChunk, locTLo, locPow2, locMatchLen, locTmp)
+
+	// Runtime cap: max_avail = len - attempt_start - K.
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x6B)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k)
+	b = append(b, 0x6B)
+	b = append(b, 0x21, locSimdMask)
+
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x20, locSimdMask)
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x20, locSimdMask)
+	b = append(b, 0x49)
+	b = append(b, 0x1B) // select
+	b = append(b, 0x21, locMatchLen)
+
+	// If match_len < countMin → advance attempt_start, restart.
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, countMin)
+	b = append(b, 0x49)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x0C, 0x01)
+	b = append(b, 0x0B)
+
+	// Match — write slots and return end position (attempt_start + K + match_len).
+	b = emitLitChainRangeGroupSlotWrites(b, lcc, locOutPtr, locAttemptStart, locMatchLen, int(k), lcp.countMax)
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x6A)
+	b = append(b, 0x0F) // return
+
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block
+
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0B)
+	return b
+}
+
+// appendLitChainRangeFindGroupsCodeEntry appends a size-prefixed range groups body.
+func appendLitChainRangeFindGroupsCodeEntry(cs []byte, lcp *litChainPattern, lcc *litChainCaptures, tableMemIdx int) []byte {
+	body := buildLitChainRangeFindGroupsBody(lcp, lcc, tableMemIdx)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// rangeChunk is the chunk plan for range `{N,M}` class verify: chunks are
+// disjoint (non-overlapping, unlike the {N,N} overlap-tail plan), so ctz on
+// each chunk's bad_mask gives a position monotonically increasing across
+// chunks — the first non-zero chunk pins down the first bad byte.
+type rangeChunk struct {
+	offset      int    // byte offset from match start (attempt_start + offset = chunk address)
+	offsetFromK int    // byte offset from end of literal (position in chain)
+	laneMask    uint16 // bits 0..lane-1 active (lane = bytes-in-chain covered by this chunk)
+}
+
+// planRangeChunks plans disjoint SIMD chunks covering [K..K+countMax).
+func planRangeChunks(k, countMax int) []rangeChunk {
+	var chunks []rangeChunk
+	nFull := countMax / 16
+	for i := 0; i < nFull; i++ {
+		chunks = append(chunks, rangeChunk{
+			offset:      k + i*16,
+			offsetFromK: i * 16,
+			laneMask:    0xFFFF,
+		})
+	}
+	tail := countMax % 16
+	if tail != 0 {
+		chunks = append(chunks, rangeChunk{
+			offset:      k + nFull*16,
+			offsetFromK: nFull * 16,
+			laneMask:    uint16(1<<uint(tail)) - 1,
+		})
+	}
+	return chunks
+}
+
+// emitRangeClassVerify emits WASM that runs class verify on `countMax` bytes
+// and writes the match length (count of class-matching bytes from K, in
+// [0..countMax]) to `locMatchLen`.
+//
+// Branch-free algorithm: each chunk's bad_mask is OR'd with a sentinel
+// (bit 16) before `i32.ctz`, so the per-chunk match length is either the
+// real first-bad index (`< lane_count`) or 16 (no bad in this chunk).
+// Chunks are folded in REVERSE order via `select`: earlier chunks override
+// later ones. Avoids per-chunk `block`+`if`+`br` patterns that Cranelift's
+// register allocator handles poorly across the surrounding scan loop.
+func emitRangeClassVerify(b []byte, lcp *litChainPattern,
+	locPtr, locBase, locChunk, locTLo, locPow2, locMatchLen, locTmp byte) []byte {
+
+	chunks := planRangeChunks(len(lcp.literal), lcp.countMax)
+	countMax := int32(lcp.countMax)
+
+	// Initialise accumulator (final match_len) to countMax sentinel.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, countMax)
+	b = append(b, 0x21, locMatchLen)
+
+	// Iterate in REVERSE so earlier chunks' results override later ones via
+	// the cascading select-fold.
+	for i := len(chunks) - 1; i >= 0; i-- {
+		ch := chunks[i]
+		// Lane count (real chain bytes covered by this chunk).
+		laneCount := int32(0)
+		for m := uint16(ch.laneMask); m != 0; m &= m - 1 {
+			laneCount++
+		}
+
+		// Load chunk.
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x20, locBase)
+		b = append(b, 0x6A)
+		if ch.offset != 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(ch.offset))
+			b = append(b, 0x6A)
+		}
+		b = append(b, 0xFD, 0x00, 0x00, 0x00)
+		b = append(b, 0x21, locChunk)
+
+		b = append(b, 0x20, locTLo)
+		b = append(b, 0x20, locChunk)
+		b = append(b, 0x41, 0x0F)
+		b = append(b, 0xFD, 0x0F)
+		b = append(b, 0xFD, 0x4E)
+		b = append(b, 0xFD, 0x0E)
+
+		b = append(b, 0x20, locPow2)
+		b = append(b, 0x20, locChunk)
+		b = append(b, 0x41, 0x04)
+		b = append(b, 0xFD, 0x6D)
+		b = append(b, 0xFD, 0x0E)
+
+		b = append(b, 0xFD, 0x4E)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0xFD, 0x0F)
+		b = append(b, 0xFD, 0x23)
+		b = append(b, 0xFD, 0x64) // i32 bad_mask
+
+		if ch.laneMask != 0xFFFF {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(ch.laneMask))
+			b = append(b, 0x71)
+		}
+
+		// OR with sentinel 0x10000 (bit 16), then ctz → ml_i in [0..16].
+		b = append(b, 0x41, 0x80, 0x80, 0x04) // i32.const 0x10000 (SLEB128)
+		b = append(b, 0x72)                   // i32.or
+		b = append(b, 0x68)                   // i32.ctz
+		b = append(b, 0x22, locTmp)           // local.tee tmp (ml_i)
+
+		// Push (offsetFromK + ml_i) — v1.
+		if ch.offsetFromK > 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(ch.offsetFromK))
+			b = append(b, 0x6A) // i32.add
+		}
+
+		// v2 = current acc.
+		b = append(b, 0x20, locMatchLen)
+
+		// cond = ml_i < laneCount.
+		b = append(b, 0x20, locTmp)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, laneCount)
+		b = append(b, 0x49) // i32.lt_u
+
+		b = append(b, 0x1B) // select
+		b = append(b, 0x21, locMatchLen)
+	}
+	_ = countMax
+	return b
+}
+
+// buildLitChainRangeFindBody emits the find body for a single-pattern lit-chain
+// with a greedy range count `{N,M}`. Signature: (ptr,len) → i64.
+//
+// Algorithm:
+//   loop $lit_outer:
+//     prefix scan for literal → attempt_start
+//     if attempt_start + K + N > len: $no_match
+//     SIMD range class verify → match_len (count of class-matching bytes in [K..K+M))
+//     match_len = min(match_len, len - attempt_start - K)   // runtime cap
+//     if match_len < N: advance attempt_start; restart
+//     return packed (attempt_start, attempt_start + K + match_len)
+func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
+	var b []byte
+
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locAttemptStart byte = 2
+		locSimdMask     byte = 3
+		locMatchLen     byte = 4
+		locChunk        byte = 5
+		locTLo          byte = 6
+		locPow2         byte = 7
+	)
+
+	// 3 × i32 + 3 × v128.
+	b = append(b, 0x02)
+	b = append(b, 0x03, 0x7F)
+	b = append(b, 0x03, 0x7B)
+
+	k := int32(len(lcp.literal))
+	countMin := int32(lcp.count)
+	totalMin := k + countMin
+
+	// Hoist nibble tables outside the scan loop (Cranelift JIT regression
+	// workaround — keeping these out of the loop body reduces scan-loop
+	// register pressure).
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $lit_outer
+
+	scan := prefixScanParams{
+		Prefix:      lcp.literal,
+		EngineDepth: 2,
+		TableMemIdx: tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	// Bounds: attempt_start + K + countMin > len → $no_match.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, totalMin)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4B) // i32.gt_u
+	b = append(b, 0x0D, 0x01)
+
+	// match_len = chain class verify (writes locMatchLen).
+	// Use attempt_start as base.
+	b = emitRangeClassVerify(b, lcp, locPtr, locAttemptStart, locChunk, locTLo, locPow2, locMatchLen, locSimdMask)
+
+	// Runtime cap: max_avail = len - attempt_start - K. Use locSimdMask as scratch.
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x6B)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k)
+	b = append(b, 0x6B)
+	b = append(b, 0x21, locSimdMask)
+
+	// match_len = min(match_len, max_avail) via select.
+	b = append(b, 0x20, locMatchLen) // v1
+	b = append(b, 0x20, locSimdMask) // v2
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x20, locSimdMask)
+	b = append(b, 0x49) // match_len < max_avail
+	b = append(b, 0x1B) // select
+	b = append(b, 0x21, locMatchLen)
+
+	// If match_len < countMin → advance attempt_start, restart.
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, countMin)
+	b = append(b, 0x49) // i32.lt_u
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x0C, 0x01) // br $lit_outer
+	b = append(b, 0x0B)
+
+	// Match — return packed (attempt_start, attempt_start + K + match_len).
+	// end_pos = attempt_start + K + match_len
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x6A) // attempt_start + K + match_len
+	b = append(b, 0x21, locMatchLen)
+	b = emitReturnPackedI64FromLocal(b, locAttemptStart, locMatchLen)
+
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block $no_match
+
+	b = append(b, 0x42, 0x7F) // i64.const -1
+	b = append(b, 0x0B)
+	return b
+}
+
+// appendLitChainRangeFindCodeEntry appends a size-prefixed range find body.
+func appendLitChainRangeFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) []byte {
+	body := buildLitChainRangeFindBody(lcp, tableMemIdx)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildLitChainRangeMatchBody emits the anchored full-input match body for a
+// single lit-chain with range count `{N,M}` (greedy or non-greedy — both have
+// identical semantics for anchored match because the input length forces
+// the count). Signature: (ptr,len) → i32.
+//
+// Algorithm:
+//   - Bounds: len in [K+N, K+M], else return -1.
+//   - Literal verify, start/end anchors.
+//   - SIMD class verify (branch-free, same as range find).
+//   - Require match_len >= (len - K) for full input consumption.
+//   - Return len (= K + match_len, but match_len is at least len-K).
+func buildLitChainRangeMatchBody(lcp *litChainPattern) []byte {
+	var b []byte
+
+	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
+
+	const (
+		locPtr         byte = 0
+		locLen         byte = 1
+		locMatchLen    byte = 2
+		locScratch     byte = 3 // for tmp in verify
+		locAttemptZero byte = 4 // zero-init; used by emitEndAnchorCheck
+		locTmp         byte = 5 // is_word scratch
+		locChunk       byte = 6
+		locTLo         byte = 7
+		locPow2        byte = 8
+	)
+
+	// 4 × i32 (locMatchLen, locScratch, locAttemptZero, locTmp) + 3 × v128.
+	b = append(b, 0x02)
+	b = append(b, 0x04, 0x7F)
+	b = append(b, 0x03, 0x7B)
+
+	k := int32(len(lcp.literal))
+	countMin := int32(lcp.count)
+	countMax := int32(lcp.countMax)
+
+	// Materialise nibble tables.
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+
+	// Bounds: len < K+N → -1.
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k+countMin)
+	b = append(b, 0x49) // i32.lt_u
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+	// Bounds: len > K+M → -1.
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k+countMax)
+	b = append(b, 0x4B) // i32.gt_u
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// Compile-time start anchor check (at pos 0).
+	startFailsAtCompileTime := false
+	switch lcp.startAnchor {
+	case anchorEndText:
+		startFailsAtCompileTime = true
+	case anchorWordBoundary:
+		if !isWordByte(lcp.literal[0]) {
+			startFailsAtCompileTime = true
+		}
+	case anchorNoWordBoundary:
+		if isWordByte(lcp.literal[0]) {
+			startFailsAtCompileTime = true
+		}
+	}
+	if startFailsAtCompileTime {
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x0F)
+	}
+
+	// Literal verify (K bytes).
+	for kk, byt := range lcp.literal {
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x2D, 0x00)
+		b = utils.AppendULEB128(b, uint32(kk))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(byt))
+		b = append(b, 0x47)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x0F)
+		b = append(b, 0x0B)
+	}
+
+	// SIMD range class verify (branch-free).
+	b = emitRangeClassVerify(b, lcp, locPtr, locAttemptZero, locChunk, locTLo, locPow2, locMatchLen, locScratch)
+
+	// Require match_len >= (len - K) for full input consumption.
+	b = append(b, 0x20, locMatchLen)
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, k)
+	b = append(b, 0x6B) // i32.sub → required = len - K
+	b = append(b, 0x49) // match_len < required
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// End anchor check.
+	if lcp.endAnchor != anchorNone {
+		b = append(b, 0x02, 0x40) // block $bad
+		switch lcp.endAnchor {
+		case anchorBeginText:
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x0D, 0x00)
+		default:
+			// end_pos = len (we consumed full input). For emitEndAnchorCheck,
+			// total = len - attempt_start_zero = len. But the helper takes a
+			// compile-time `total`. Inline the check instead.
+			switch lcp.endAnchor {
+			case anchorEndText:
+				// Always pass (end_pos = len).
+			case anchorWordBoundary, anchorNoWordBoundary:
+				// leftWord = is_word(input[len-1])
+				b = append(b, 0x20, locPtr)
+				b = append(b, 0x20, locLen)
+				b = append(b, 0x41, 0x01)
+				b = append(b, 0x6B)
+				b = append(b, 0x6A)
+				b = append(b, 0x2D, 0x00, 0x00)
+				b = emitIsWordByte(b, locTmp)
+				// rightWord = 0 (end_pos == len)
+				b = append(b, 0x41, 0x00)
+				b = append(b, 0x73) // i32.xor → boundary
+				if lcp.endAnchor == anchorWordBoundary {
+					b = append(b, 0x45) // i32.eqz: fail if !boundary
+				}
+				b = append(b, 0x0D, 0x00) // br_if 0 → $bad
+			}
+		}
+		// Success.
+		b = append(b, 0x20, locLen)
+		b = append(b, 0x0F)
+		b = append(b, 0x0B) // end $bad
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x0B)
+		return b
+	}
+
+	_ = hasAnchors
+
+	// No end anchor: return len.
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x0B)
+	return b
+}
+
+// appendLitChainRangeMatchCodeEntry appends a size-prefixed range match body.
+func appendLitChainRangeMatchCodeEntry(cs []byte, lcp *litChainPattern) []byte {
+	body := buildLitChainRangeMatchBody(lcp)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
 // appendLitChainFindCodeEntry appends a size-prefixed lit-chain find body.
 func appendLitChainFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) []byte {
 	body := buildLitChainFindBody(lcp, tableMemIdx)
@@ -6886,6 +7802,9 @@ type litChainAltLayout struct {
 	firstByteOff    int32
 	teddyLoOff      int32
 	teddyHiOff      int32
+	teddyT1LoOff    int32 // 2-byte Teddy second-byte tables (0 if useTwoByteTeddy=false)
+	teddyT1HiOff    int32
+	useTwoByteTeddy bool  // true when all branches have K≥2 (so second byte is fixed literal)
 	branchBitmapOff []int32
 	tableEnd        int64
 }
@@ -6896,6 +7815,18 @@ func planLitChainAltLayout(altp *litChainAltPattern, tableBase int64) litChainAl
 	l := litChainAltLayout{
 		branchBitmapOff: make([]int32, len(altp.branches)),
 	}
+	// 2-byte Teddy needs a fixed second byte per branch — only applicable when
+	// every branch's literal has K ≥ 2 AND branch count ≤ 8 (Teddy-bit limit).
+	useTwoByteTeddy := len(altp.branches) <= 8
+	if useTwoByteTeddy {
+		for _, br := range altp.branches {
+			if len(br.literal) < 2 {
+				useTwoByteTeddy = false
+				break
+			}
+		}
+	}
+	l.useTwoByteTeddy = useTwoByteTeddy
 	cur := tableBase
 	l.firstByteOff = int32(cur)
 	cur += 256
@@ -6903,6 +7834,12 @@ func planLitChainAltLayout(altp *litChainAltPattern, tableBase int64) litChainAl
 	cur += 16
 	l.teddyHiOff = int32(cur)
 	cur += 16
+	if useTwoByteTeddy {
+		l.teddyT1LoOff = int32(cur)
+		cur += 16
+		l.teddyT1HiOff = int32(cur)
+		cur += 16
+	}
 	for i, br := range altp.branches {
 		if br.useSIMD {
 			l.branchBitmapOff[i] = -1
@@ -6933,6 +7870,19 @@ func buildLitChainAltDataSegments(altp *litChainAltPattern, l litChainAltLayout)
 		teddyLo[first&0x0F] |= byte(1 << uint(i))
 		teddyHi[first>>4] |= byte(1 << uint(i))
 	}
+	// 2-byte Teddy tables (when all branches have K ≥ 2): T1 indexes the
+	// literal's second byte per branch.
+	var teddyT1Lo, teddyT1Hi [16]byte
+	if l.useTwoByteTeddy {
+		for i, br := range altp.branches {
+			if i >= 8 {
+				break
+			}
+			second := br.literal[1]
+			teddyT1Lo[second&0x0F] |= byte(1 << uint(i))
+			teddyT1Hi[second>>4] |= byte(1 << uint(i))
+		}
+	}
 
 	var segs []byte
 	segCount := 0
@@ -6942,6 +7892,12 @@ func buildLitChainAltDataSegments(altp *litChainAltPattern, l litChainAltLayout)
 	segCount++
 	segs = appendDataSegment(segs, l.teddyHiOff, teddyHi[:])
 	segCount++
+	if l.useTwoByteTeddy {
+		segs = appendDataSegment(segs, l.teddyT1LoOff, teddyT1Lo[:])
+		segCount++
+		segs = appendDataSegment(segs, l.teddyT1HiOff, teddyT1Hi[:])
+		segCount++
+	}
 	for i, br := range altp.branches {
 		if br.useSIMD {
 			continue
@@ -6976,16 +7932,25 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 		locChunk        byte = 5
 		locTeddyLo      byte = 6
 		locTeddyHi      byte = 7
-		locVerifyTlo    byte = 8
-		locVerifyPow2   byte = 9
+		locTeddyT1Lo    byte = 8
+		locTeddyT1Hi    byte = 9
+		// locVerifyTlo doubles as locTeddyChunk1 during scan (different phases).
+		locVerifyTlo    byte = 10
+		locTeddyChunk1  byte = 10
+		locVerifyPow2   byte = 11
 	)
 
 	var b []byte
 
-	// Local declarations: 3 i32 + 5 v128.
+	// Local declarations: 3 i32 + 7 v128 (T0/T1 Teddy + chunk + chunk1/verifyTlo + verifyPow2).
 	b = append(b, 0x02)       // 2 local groups
 	b = append(b, 0x03, 0x7F) // 3 × i32
-	b = append(b, 0x05, 0x7B) // 5 × v128
+	b = append(b, 0x07, 0x7B) // 7 × v128
+
+	// Hoist pow2 outside the scan loop (Cranelift JIT workaround). Per-branch
+	// tlo stays inline.
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locVerifyPow2)
 
 	// Outer control flow.
 	b = append(b, 0x02, 0x40) // block $no_match
@@ -7009,7 +7974,9 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 		FirstByteOff:   l.firstByteOff,
 		TeddyLoOff:     l.teddyLoOff,
 		TeddyHiOff:     l.teddyHiOff,
-		TeddyTwoByte:   false,
+		TeddyT1LoOff:   l.teddyT1LoOff,
+		TeddyT1HiOff:   l.teddyT1HiOff,
+		TeddyTwoByte:   l.useTwoByteTeddy,
 		EngineDepth:    2,
 		TableMemIdx:    tableMemIdx,
 		Locals: prefixScanLocals{
@@ -7020,6 +7987,9 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 			Chunk:        locChunk,
 			TLo:          locTeddyLo,
 			THi:          locTeddyHi,
+			T1Lo:         locTeddyT1Lo,
+			T1Hi:         locTeddyT1Hi,
+			Chunk1:       locTeddyChunk1,
 		},
 		OnMatch: nil,
 	}
@@ -7070,16 +8040,23 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 		locChunk        byte = 6
 		locTeddyLo      byte = 7
 		locTeddyHi      byte = 8
-		locVerifyTlo    byte = 9
-		locVerifyPow2   byte = 10
+		locTeddyT1Lo    byte = 9
+		locTeddyT1Hi    byte = 10
+		locVerifyTlo    byte = 11
+		locTeddyChunk1  byte = 11 // alias: doubles as Chunk1 during scan
+		locVerifyPow2   byte = 12
 	)
 
 	var b []byte
 
-	// 3 i32 + 5 v128.
+	// 3 i32 + 7 v128.
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F)
-	b = append(b, 0x05, 0x7B)
+	b = append(b, 0x07, 0x7B)
+
+	// Hoist pow2 outside the scan loop (Cranelift JIT workaround).
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locVerifyPow2)
 
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $lit_outer
@@ -7101,7 +8078,9 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 		FirstByteOff:   l.firstByteOff,
 		TeddyLoOff:     l.teddyLoOff,
 		TeddyHiOff:     l.teddyHiOff,
-		TeddyTwoByte:   false,
+		TeddyT1LoOff:   l.teddyT1LoOff,
+		TeddyT1HiOff:   l.teddyT1HiOff,
+		TeddyTwoByte:   l.useTwoByteTeddy,
 		EngineDepth:    2,
 		TableMemIdx:    tableMemIdx,
 		Locals: prefixScanLocals{
@@ -7112,6 +8091,9 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 			Chunk:        locChunk,
 			TLo:          locTeddyLo,
 			THi:          locTeddyHi,
+			T1Lo:         locTeddyT1Lo,
+			T1Hi:         locTeddyT1Hi,
+			Chunk1:       locTeddyChunk1,
 		},
 		OnMatch: nil,
 	}
@@ -7150,6 +8132,119 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 func appendLitChainAltFindGroupsCodeEntry(cs []byte, altp *litChainAltPattern,
 	branchCaps []*litChainCaptures, l litChainAltLayout, tableMemIdx int) []byte {
 	body := buildLitChainAltFindGroupsBody(altp, branchCaps, l, tableMemIdx)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildLitChainAltRangeFindBody emits the find body for a strict alternation
+// where at least one branch is a range `{N,M}`. Per-branch dispatch uses the
+// branch-free range verify when the branch is range, the {N,N} verify
+// otherwise. Signature: (ptr,len) → i64.
+func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locAttemptStart byte = 2
+		locSimdMask     byte = 3
+		locScalarIdx    byte = 4
+		locMatchLen     byte = 5
+		locTmp          byte = 6
+		locChunk        byte = 7
+		locTeddyLo      byte = 8
+		locTeddyHi      byte = 9
+		locTeddyT1Lo    byte = 10
+		locTeddyT1Hi    byte = 11
+		locVerifyTlo    byte = 12
+		locTeddyChunk1  byte = 12 // alias: doubles as Chunk1 during scan
+		locVerifyPow2   byte = 13
+	)
+
+	var b []byte
+	b = append(b, 0x02)
+	b = append(b, 0x05, 0x7F)
+	b = append(b, 0x07, 0x7B)
+
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locVerifyPow2)
+
+	b = append(b, 0x02, 0x40)
+	b = append(b, 0x03, 0x40)
+
+	seen := [256]bool{}
+	var firstByteSet []byte
+	var firstByteFlags [256]byte
+	for _, br := range altp.branches {
+		firstByteFlags[br.literal[0]] = 1
+		if !seen[br.literal[0]] {
+			seen[br.literal[0]] = true
+			firstByteSet = append(firstByteSet, br.literal[0])
+		}
+	}
+
+	scan := prefixScanParams{
+		FirstByteSet:   firstByteSet,
+		FirstByteFlags: firstByteFlags,
+		FirstByteOff:   l.firstByteOff,
+		TeddyLoOff:     l.teddyLoOff,
+		TeddyHiOff:     l.teddyHiOff,
+		TeddyT1LoOff:   l.teddyT1LoOff,
+		TeddyT1HiOff:   l.teddyT1HiOff,
+		TeddyTwoByte:   l.useTwoByteTeddy,
+		EngineDepth:    2,
+		TableMemIdx:    tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+			TLo:          locTeddyLo,
+			THi:          locTeddyHi,
+			T1Lo:         locTeddyT1Lo,
+			T1Hi:         locTeddyT1Hi,
+			Chunk1:       locTeddyChunk1,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	locals := litChainBranchLocals{
+		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
+		SimdMask: locSimdMask, ScalarIdx: locScalarIdx,
+		Chunk: locChunk, VerifyTlo: locVerifyTlo, VerifyPow2: locVerifyPow2,
+	}
+	for i, br := range altp.branches {
+		b = append(b, 0x02, 0x40)
+		useBr := br
+		// Non-greedy in find: treat as {N,N}.
+		if !useBr.greedy && useBr.countMax > useBr.count {
+			useBr.countMax = useBr.count
+		}
+		if useBr.countMax > useBr.count {
+			b = emitLitChainAltLitBranchBodyRange(b, useBr, l.branchBitmapOff[i], locals, locMatchLen, locTmp, tableMemIdx)
+		} else {
+			b = emitLitChainAltLitBranchBody(b, useBr, l.branchBitmapOff[i], locals, tableMemIdx)
+		}
+		b = append(b, 0x0B)
+	}
+
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x0C, 0x00)
+
+	b = append(b, 0x0B)
+	b = append(b, 0x0B)
+
+	b = append(b, 0x42, 0x7F)
+	b = append(b, 0x0B)
+	return b
+}
+
+// appendLitChainAltRangeFindCodeEntry appends a size-prefixed alt-range find body.
+func appendLitChainAltRangeFindCodeEntry(cs []byte, altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
+	body := buildLitChainAltRangeFindBody(altp, l, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -7219,7 +8314,7 @@ func analyseLitChainAltLenient(pattern string) (*lenAltPattern, bool) {
 	branches := make([]lenAltBranch, 0, len(re.Sub))
 	dfaCount := 0
 	for _, sub := range re.Sub {
-		if info, ok := analyseLitChainBranch(sub); ok {
+		if info, ok := analyseLitChainBranch(sub); ok && info.countMax == info.count {
 			branches = append(branches, lenAltBranch{
 				literal:     info.literal,
 				isLitChain:  true,
@@ -7505,7 +8600,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 		FirstByteOff:   l.firstByteOff,
 		TeddyLoOff:     l.teddyLoOff,
 		TeddyHiOff:     l.teddyHiOff,
-		TeddyTwoByte:   false,
+		TeddyTwoByte:   false, // lenient-alt uses lenAltLayout; 2-byte Teddy not wired here
 		EngineDepth:    2,
 		TableMemIdx:    tableMemIdx,
 		Locals: prefixScanLocals{

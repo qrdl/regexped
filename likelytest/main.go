@@ -325,6 +325,58 @@ var tests = []testCase{
 		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
 		nomatchInput: "this_is_not_a_secret_value_at_all_42_chr",
 	},
+	{
+		// Gap C: range-counted chain `{N,M}` with N < M. Greedy find — should
+		// match the longest valid chain (up to M bytes) when literal hits.
+		// Today: falls through to DFA. After C: SIMD verify up to M bytes,
+		// rightmost-zero in bad-mask gives match length.
+		name:         "range-find-greedy",
+		pattern:      `secret_[A-Za-z0-9]{24,40}`,
+		mode:         modeFind,
+		notes:        "range-counted chain {24,40} — Gap C greedy find",
+		matchInput:   configInput([]string{"secret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Gap C non-greedy: returns shortest valid chain (exactly N bytes
+		// after literal). Same pattern as above but with `?`.
+		name:         "range-find-nongreedy",
+		pattern:      `secret_[A-Za-z0-9]{24,40}?`,
+		mode:         modeFind,
+		notes:        "range-counted chain {24,40}? — Gap C non-greedy find",
+		matchInput:   configInput([]string{"secret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Gap C anchored: input length must be in [K+N, K+M] AND class match.
+		// matchInput is 39 bytes (K=7 + 32 chars in class) — in range.
+		name:         "range-anchored",
+		pattern:      `secret_[A-Za-z0-9]{24,40}`,
+		mode:         modeAnchored,
+		notes:        "range-counted chain {24,40} — Gap C anchored",
+		matchInput:   "secret_AbCdEfGhIjKlMnOpQrStUvWxYz012345",
+		nomatchInput: "not_a_secret_value_at_all_x_y_z_a_b_c__",
+	},
+	{
+		// Gap C groups: range-counted chain with capture. Group 1's end
+		// position depends on runtime match length, not a compile-time
+		// offset.
+		name:         "range-groups",
+		pattern:      `(?P<key>secret_[A-Za-z0-9]{24,40})`,
+		mode:         modeGroups,
+		notes:        "range-counted chain with capture — Gap C groups",
+		matchInput:   configInput([]string{"secret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Gap C strict-alt with range counts on each branch.
+		name:         "range-strict-alt-find",
+		pattern:      `secret_[A-Za-z0-9]{24,40}|token_[a-z0-9]{24,32}`,
+		mode:         modeFind,
+		notes:        "strict-alt of range-counted chains — Gap C strict-alt find",
+		matchInput:   configInput([]string{"secret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
+		nomatchInput: configInput(nil),
+	},
 }
 
 // --------------------------------------------------------------------------
