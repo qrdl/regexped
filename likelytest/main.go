@@ -227,6 +227,52 @@ var tests = []testCase{
 		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab" + configInput(nil),
 		nomatchInput: configInput(nil),
 	},
+	{
+		// Strict-alt of \b-bounded lit-chains, each carrying a named capture.
+		// Currently rejected by analyseLitChainAltGroups (anchor check) — falls
+		// through to TDFA. Gap A.2: extend alt-groups emitter to handle per-
+		// branch anchors. matchInput leads with the ghp_ secret followed by a
+		// newline so the trailing \b on that branch matches.
+		name:    "secrets-combined-bounded-grouped",
+		pattern: `\b(?P<aws>AKIA[A-Z0-9]{16})\b|\b(?P<ghp>ghp_[A-Za-z0-9]{36})\b`,
+		mode:    modeGroups,
+		notes:   "strict-alt with per-branch \\b anchors + captures — Gap A.2 target",
+		matchInput: "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab\n" +
+			configInput(nil),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Same pattern shape as secrets-github-grouped, but with the secret
+		// buried mid-buffer instead of at offset 0. Anchored groups_func
+		// returns -1 immediately today (no scan). Gap A.3 adds find-with-
+		// captures so the function locates the buried secret itself. Baseline
+		// numbers here will be artificially fast on both inputs (anchored
+		// short-circuit) — the post-A.3 numbers reflect real scan work.
+		name:    "secrets-github-grouped-buried",
+		pattern: `(?P<key>ghp_[A-Za-z0-9]{36})`,
+		mode:    modeGroups,
+		notes:   "buried secret needs find-with-captures — Gap A.3 target",
+		matchInput: configInput([]string{
+			"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
+		}),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Mixed-shape alt with captures on BOTH branches: one lit-chain branch
+		// (ghp_) plus one DFA branch (aws_secret_access_key = ...). Currently
+		// rejected by both analyseLitChainAltGroups (mixed shapes) and lenient-
+		// alt (no capture support). Falls through to TDFA. Gap A.4 adds lit-
+		// chain SIMD slot writes for the lit-chain branch and an inline tagged-
+		// DFA trace for the DFA branch. matchInput starts with the DFA-branch
+		// shape to exercise the harder path.
+		name:    "secrets-mixed-alt-grouped",
+		pattern: `(?P<ghp>ghp_[A-Za-z0-9]{36})|aws_secret_access_key\s*=\s*(?P<aws>[0-9a-zA-Z/+]{40})`,
+		mode:    modeGroups,
+		notes:   "lenient-alt (lit-chain + DFA branches) with captures — Gap A.4 target",
+		matchInput: "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY12" +
+			configInput(nil),
+		nomatchInput: configInput(nil),
+	},
 }
 
 // --------------------------------------------------------------------------

@@ -1650,3 +1650,24 @@ regexps
 -;4-44;-;-
 -;1-41;-;-
 0-40;0-40;-;-
+# ============================================================
+# Category 27: Lit-chain capture path — non-anchored find with captures.
+# Surfaces a correctness gap in Gap A.1: the lit-chain capture body is
+# anchored-only (returns -1 when the match is not at offset 0). Under
+# --likelymatch these patterns route through the lit-chain capture body and
+# fail; under default (neutral) they go through TDFA wrapper which scans.
+# ============================================================
+Cat27LitChainBuriedCaptures
+strings
+"prefix ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 suffix"
+"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+"no secret here"
+regexps
+"(?P<key>ghp_[A-Za-z0-9]{36})"
+-;7-47;-;-;;7-47 7-47
+0-40 0-40;0-40;-;-
+-;-;-;-
+"(?P<aws>AKIA[A-Z0-9]{16})|(?P<ghp>ghp_[A-Za-z0-9]{36})"
+-;7-47;-;-;;7-47 - 7-47
+0-40 - 0-40;0-40;-;-
+-;-;-;-

@@ -5664,8 +5664,9 @@ func extractLitChainCaptures(re *syntax.Regexp) ([]captureGroup, int, bool) {
 
 // analyseLitChainGroups parses pattern and verifies it as a single lit-chain
 // branch with compile-time-resolvable captures. The N≥24 single-pattern gate
-// does NOT apply: lit-chain groups is anchored, so the find-mode scan-loop
-// codegen quirk that motivated the gate is not present here.
+// applies here too: groups now composes find_internal + captureBody via the
+// standard wrapper, so the find-mode scan-loop codegen quirk that motivated
+// the gate still affects this path.
 func analyseLitChainGroups(pattern string) (*litChainPattern, *litChainCaptures, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -5673,6 +5674,9 @@ func analyseLitChainGroups(pattern string) (*litChainPattern, *litChainCaptures,
 	}
 	info, ok := analyseLitChainBranch(re)
 	if !ok {
+		return nil, nil, false
+	}
+	if info.count < 24 {
 		return nil, nil, false
 	}
 	caps, maxGroup, ok := extractLitChainCaptures(re)

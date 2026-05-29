@@ -246,43 +246,72 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// branches.
 
 	// Capture path (groups_func / named_groups_func): if the pattern is a
-	// lit-chain shape with compile-time-resolvable capture offsets, emit the
-	// SIMD verify body with slot writes. Otherwise fall through to the
-	// standard TDFA/Backtracking pipeline below.
-	if buildOpts.LikelyMode == LikelyMatch && needGroups && !needMatch && !needFind {
+	// lit-chain shape with compile-time-resolvable capture offsets, emit a
+	// lit-chain findBody alongside an anchored lit-chain captureBody and let
+	// the standard groups wrapper compose them. The wrapper handles the
+	// scan-to-find-extent → fill-captures pipeline and adjusts slot positions
+	// by the match start.
+	if buildOpts.LikelyMode == LikelyMatch && needGroups {
 		if lcp, lcc, ok := analyseLitChainGroups(re.Pattern); ok {
 			p := &compiledPattern{
 				tableEnd:  tableBase,
 				numGroups: lcc.numGroups,
-				anchored:  true, // captureBody IS the exported groups function — no wrapper
 			}
 			p.groupsExport = re.GroupsFunc
 			if re.NamedGroupsFunc != "" {
 				p.namedGroupsExport = re.NamedGroupsFunc
 			}
+			// Expose match/find publicly only if the caller asked for them.
+			if needMatch {
+				p.matchExport = re.MatchFunc
+				p.matchBody = appendLitChainMatchCodeEntry(nil, lcp)
+			}
+			if needFind {
+				p.findExport = re.FindFunc
+			}
+			// Find body is required internally (wrapper calls it as find_internal).
+			p.findBody = appendLitChainFindCodeEntry(nil, lcp, buildOpts.tableMemIdx)
+			p.captureBody = appendLitChainGroupsCodeEntry(nil, lcp, lcc)
 			parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
 			if err == nil {
 				p.groupNames = extractGroupNames(parsed)
 			}
-			p.captureBody = appendLitChainGroupsCodeEntry(nil, lcp, lcc)
 			return p, nil
 		}
 		if altp, branchCaps, ok := analyseLitChainAltGroups(re.Pattern); ok {
-			p := &compiledPattern{
-				tableEnd:  tableBase,
-				numGroups: branchCaps[0].numGroups,
-				anchored:  true,
+			if needMatch {
+				// Anchored alt match for the capture path is not specialised
+				// (Gap B). Fall through to the standard pipeline.
+			} else {
+				p := &compiledPattern{
+					tableEnd:  tableBase,
+					numGroups: branchCaps[0].numGroups,
+				}
+				p.groupsExport = re.GroupsFunc
+				if re.NamedGroupsFunc != "" {
+					p.namedGroupsExport = re.NamedGroupsFunc
+				}
+				if needFind {
+					p.findExport = re.FindFunc
+				}
+				// Internal find body + data segments (alt Teddy frontend).
+				layout := planLitChainAltLayout(altp, tableBase)
+				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
+				findBodyInner := buildLitChainAltFindBody(altp, layout, buildOpts.tableMemIdx)
+				var findBody []byte
+				findBody = utils.AppendULEB128(findBody, uint32(len(findBodyInner)))
+				findBody = append(findBody, findBodyInner...)
+				p.findBody = findBody
+				p.dataBytes = dataBytes
+				p.dataSegCount = segCount
+				p.tableEnd = layout.tableEnd
+				p.captureBody = appendLitChainAltGroupsCodeEntry(nil, altp, branchCaps)
+				parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
+				if err == nil {
+					p.groupNames = extractGroupNames(parsed)
+				}
+				return p, nil
 			}
-			p.groupsExport = re.GroupsFunc
-			if re.NamedGroupsFunc != "" {
-				p.namedGroupsExport = re.NamedGroupsFunc
-			}
-			parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
-			if err == nil {
-				p.groupNames = extractGroupNames(parsed)
-			}
-			p.captureBody = appendLitChainAltGroupsCodeEntry(nil, altp, branchCaps)
-			return p, nil
 		}
 	}
 

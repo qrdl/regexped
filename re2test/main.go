@@ -58,6 +58,7 @@ func main() {
 	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find (sets MaxDFAStates=1 so DFA always overflows to BT)")
 	setsMode := flag.Bool("sets", false, "test set find_all: compile each regexps block as a set and verify all matches against col4/col1 expected results")
 	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
+	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -65,13 +66,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch); err != nil {
+	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *groupsOnly); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool) error {
+func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool, groupsOnly bool) error {
 	f, err := os.Open(testFile)
 	if err != nil {
 		return err
@@ -246,12 +247,22 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 
 			// Compile a single standalone WASM module containing all functions.
-			re := config.RegexEntry{
-				Pattern:   pattern,
-				MatchFunc: "match",
-				FindFunc:  "find",
+			// --groups-only applies only to patterns that actually have captures;
+			// other patterns retain the usual match+find setup.
+			patternHasCaptures := false
+			if groupsOnly {
+				if parsed, perr := syntax.Parse(pattern, syntax.Perl); perr == nil && parsed.MaxCap() > 0 {
+					patternHasCaptures = true
+				}
 			}
-			if !forceBacktrack && (engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA) {
+			re := config.RegexEntry{
+				Pattern: pattern,
+			}
+			if !patternHasCaptures {
+				re.MatchFunc = "match"
+				re.FindFunc = "find"
+			}
+			if patternHasCaptures || (!forceBacktrack && (engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA)) {
 				re.GroupsFunc = "groups"
 			}
 			var compileOpts compile.CompileOptions
