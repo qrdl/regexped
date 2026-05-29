@@ -273,6 +273,21 @@ var tests = []testCase{
 			configInput(nil),
 		nomatchInput: configInput(nil),
 	},
+	{
+		// Same mixed-shape alt as above, but with the secret buried mid-buffer
+		// instead of at offset 0. Today the TDFA wrapper scans the full ~10 KB
+		// buffer to locate the match. Gap A.4 should replace that scan with the
+		// lenient-alt Teddy frontend (much faster) while still producing correct
+		// captures.
+		name:    "secrets-mixed-alt-grouped-buried",
+		pattern: `(?P<ghp>ghp_[A-Za-z0-9]{36})|aws_secret_access_key\s*=\s*(?P<aws>[0-9a-zA-Z/+]{40})`,
+		mode:    modeGroups,
+		notes:   "lenient-alt buried secret needs Teddy scan + captures — Gap A.4 target",
+		matchInput: configInput([]string{
+			"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY12",
+		}),
+		nomatchInput: configInput(nil),
+	},
 }
 
 // --------------------------------------------------------------------------

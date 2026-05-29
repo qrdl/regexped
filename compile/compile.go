@@ -315,6 +315,61 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				return p, nil
 			}
 		}
+
+		// Gap A.4: lenient alternation with captures. Composes the lit-chain
+		// lenient-alt findBody (fast Teddy + per-branch verify) with the
+		// standard TDFA captureBody via the groups wrapper. Win: replace
+		// TDFA's find phase (linear DFA scan) with the Teddy frontend; keep
+		// TDFA-correct capture semantics for DFA branches.
+		if !needMatch {
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern); ok {
+				parsed, perr := syntax.Parse(re.Pattern, syntax.Perl)
+				if perr == nil && parsed.MaxCap() > 0 {
+					prog, cerr := syntax.Compile(parsed.Simplify())
+					if cerr == nil && !needsUnicodeSupport(prog) {
+						tt, tok := newTDFA(prog, resolveMaxDFAStates(&buildOpts))
+						if tok && tt.numRegs <= resolveMaxTDFARegs(&buildOpts) {
+							p := &compiledPattern{
+								tableEnd:  tableBase,
+								numGroups: tt.numGroups,
+								isTDFA:    true,
+							}
+							p.groupsExport = re.GroupsFunc
+							if re.NamedGroupsFunc != "" {
+								p.namedGroupsExport = re.NamedGroupsFunc
+							}
+							p.groupNames = extractGroupNames(parsed)
+
+							// Lenient-alt data + find body.
+							lenLayout := planLenAltLayout(lenAltp, tableBase)
+							lenData, lenSeg := buildLenAltDataSegments(lenAltp, lenLayout)
+							if needFind {
+								p.findExport = re.FindFunc
+							}
+							findBodyInner := buildLitChainAltLenientFindBody(lenAltp, lenLayout, buildOpts.tableMemIdx)
+							var findBody []byte
+							findBody = utils.AppendULEB128(findBody, uint32(len(findBodyInner)))
+							findBody = append(findBody, findBodyInner...)
+							p.findBody = findBody
+							p.dataBytes = lenData
+							p.dataSegCount = lenSeg
+
+							// TDFA capture body placed after lenient-alt tables.
+							tdfaBase := utils.PageAlign(lenLayout.tableEnd)
+							tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true,
+								resolveCompiledDFAThreshold(&buildOpts), true)
+							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx)
+							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false))
+							p.dataBytes = append(p.dataBytes, rawTDFA...)
+							p.dataSegCount += cntTDFA
+							p.tableEnd = tdfaLayout.tableEnd
+							// p.anchored stays false → wrapper composes find + capture.
+							return p, nil
+						}
+					}
+				}
+			}
+		}
 	}
 
 	if buildOpts.LikelyMode == LikelyMatch && !needGroups {
