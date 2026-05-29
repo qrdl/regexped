@@ -4774,6 +4774,13 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 			subs = subs[:len(subs)-1]
 		}
 	}
+	// Patterns like `\b(literal class{N})\b` leave a single OpCapture wrapping
+	// the inner OpConcat after the anchors are peeled. Unwrap so the shape
+	// check below sees the [OpLiteral, OpRepeat] children directly.
+	if len(subs) == 1 && subs[0].Op == syntax.OpCapture && len(subs[0].Sub) == 1 &&
+		subs[0].Sub[0].Op == syntax.OpConcat {
+		subs = subs[0].Sub[0].Sub
+	}
 	if len(subs) != 2 {
 		return nil, false
 	}
@@ -5261,6 +5268,72 @@ func emitLitChainAltLitBranchBody(b []byte, br litChainAltBranch,
 	return b
 }
 
+// emitLitChainAltLitBranchGroupsBody is the groups-mode counterpart of
+// emitLitChainAltLitBranchBody. Same per-branch verify; on success writes
+// captures via slot writes (absolute positions) and returns end position
+// as i32.
+func emitLitChainAltLitBranchGroupsBody(b []byte, br litChainAltBranch,
+	branchBitmapOff int32, locals litChainBranchLocals,
+	lcc *litChainCaptures, outPtrLocal byte,
+	tableMemIdx int) []byte {
+
+	const failDepth byte = 0
+	total := int32(len(br.literal) + br.count)
+
+	// First-byte dispatch.
+	b = append(b, 0x20, locals.Ptr)
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(br.literal[0]))
+	b = append(b, 0x47)
+	b = append(b, 0x0D, failDepth)
+
+	// Bounds.
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locals.Len)
+	b = append(b, 0x4B)
+	b = append(b, 0x0D, failDepth)
+
+	if br.startAnchor != anchorNone {
+		b = emitStartAnchorCheck(b, br.startAnchor, br.literal[0],
+			locals.Ptr, locals.AttemptStart, locals.ScalarIdx, failDepth)
+	}
+
+	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
+
+	if br.useSIMD {
+		b = emitV128Const(b, br.tlo)
+		b = append(b, 0x21, locals.VerifyTlo)
+		b = emitV128Const(b, pow2VecConst)
+		b = append(b, 0x21, locals.VerifyPow2)
+		lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count}
+		b = emitLitChainClassVerify(b, lcp,
+			locals.Ptr, locals.AttemptStart, locals.Chunk, locals.VerifyTlo, locals.VerifyPow2)
+		b = append(b, 0x0D, failDepth)
+	} else {
+		b = emitScalarBitmapVerify(b, br.literal, br.count, branchBitmapOff, locals, tableMemIdx, failDepth)
+	}
+
+	if br.endAnchor != anchorNone {
+		b = emitEndAnchorCheck(b, br.endAnchor,
+			locals.Ptr, locals.AttemptStart, total, locals.Len, locals.ScalarIdx, failDepth)
+	}
+
+	// Success — write slots (absolute) and return attempt_start + total as i32.
+	b = emitLitChainGroupSlotWrites(b, lcc, outPtrLocal, locals.AttemptStart, int(total))
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x6A) // i32.add
+	b = append(b, 0x0F) // return
+	return b
+}
+
 // pow2VecConst is the v128.const payload for the high-nibble power-of-two lookup.
 // Pow2[h] = 1<<h for h in 0..7; 0 for h in 8..15 (would mean byte > 127).
 var pow2VecConst = [16]byte{1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -5707,9 +5780,11 @@ func analyseLitChainGroups(pattern string) (*litChainPattern, *litChainCaptures,
 // numbered globally across branches (Go regexp convention). Each entry in
 // branchCaptures corresponds to the same index in altp.branches.
 //
-// Step-1 scope: rejects any branch carrying an anchor. Anchored alt-groups
-// emission needs an extra i32 local and explicit end-anchor wiring; left for
-// a follow-up step.
+// Per-branch anchors (`\b`, `\B`, `^`/`\A`, `$`/`\z`) are accepted: the
+// lit-chain alt findBody verifies anchors during scan, so by the time the
+// wrapper passes the matched substring to captureBody, the anchors are
+// already satisfied. captureBody only needs to identify the winning branch
+// via literal + class verify.
 func analyseLitChainAltGroups(pattern string) (*litChainAltPattern, []*litChainCaptures, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -5729,9 +5804,6 @@ func analyseLitChainAltGroups(pattern string) (*litChainAltPattern, []*litChainC
 	for _, sub := range re.Sub {
 		info, ok := analyseLitChainBranch(sub)
 		if !ok {
-			return nil, nil, false
-		}
-		if info.startAnchor != anchorNone || info.endAnchor != anchorNone {
 			return nil, nil, false
 		}
 		caps, m, ok := extractLitChainCaptures(sub)
@@ -6306,6 +6378,131 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 	return b
 }
 
+// buildLitChainFindGroupsBody emits the WASM body for non-anchored
+// find-with-captures against a lit-chain pattern. Signature:
+// `(ptr i32, len i32, out_ptr i32) → i32` returning end position on match
+// or -1 on no match.
+//
+// Native single-function variant of Gap A.3: combines the find body's
+// SIMD scan + verify with inline slot writes. Eliminates the function-call
+// boundary and redundant verify of the wrapper-composition path.
+func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, tableMemIdx int) []byte {
+	var b []byte
+
+	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
+
+	// out_ptr is param 2, so all locals from the find-body shift by +1.
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locOutPtr       byte = 2
+		locAttemptStart byte = 3
+		locSimdMask     byte = 4
+		locTmp          byte = 5 // word-byte scratch (only used when anchors present)
+		locChunk        byte = 6
+		locTLo          byte = 7
+		locPow2         byte = 8
+	)
+
+	// 3 × i32 + 3 × v128 (locTmp declared regardless for stable indices).
+	b = append(b, 0x02)
+	b = append(b, 0x03, 0x7F) // 3 × i32
+	b = append(b, 0x03, 0x7B) // 3 × v128
+
+	k := int32(len(lcp.literal))
+	total := k + int32(lcp.count)
+
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $lit_outer
+
+	scan := prefixScanParams{
+		Prefix:      lcp.literal,
+		EngineDepth: 2,
+		TableMemIdx: tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	// Bounds: attempt_start + K + N > len → $no_match.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4B)
+	b = append(b, 0x0D, 0x01) // br_if 1 → $no_match
+
+	if hasAnchors {
+		b = append(b, 0x02, 0x40) // block $next_attempt
+		b = emitStartAnchorCheck(b, lcp.startAnchor, lcp.literal[0],
+			locPtr, locAttemptStart, locTmp, 0)
+	}
+
+	// SIMD class verify.
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+	b = emitLitChainClassVerify(b, lcp,
+		locPtr, locAttemptStart, locChunk, locTLo, locPow2)
+
+	if hasAnchors {
+		b = append(b, 0x0D, 0x00) // br_if 0 → $next_attempt on bad
+		b = emitEndAnchorCheck(b, lcp.endAnchor,
+			locPtr, locAttemptStart, total, locLen, locTmp, 0)
+	} else {
+		// On bad: advance attempt_start, restart loop.
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, locAttemptStart)
+		b = append(b, 0x0C, 0x01) // br 1 → $lit_outer
+		b = append(b, 0x0B)       // end if
+	}
+
+	// Match — write slots (absolute positions) and return end position.
+	b = emitLitChainGroupSlotWrites(b, lcc, locOutPtr, locAttemptStart, int(total))
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x6A)       // i32.add
+	b = append(b, 0x0F)       // return
+
+	if hasAnchors {
+		b = append(b, 0x0B) // end $next_attempt
+		// Advance + restart.
+		b = append(b, 0x20, locAttemptStart)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, locAttemptStart)
+		b = append(b, 0x0C, 0x00) // br 0 → $lit_outer
+	}
+
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block $no_match
+
+	// No match.
+	b = append(b, 0x41, 0x7F) // i32.const -1
+	b = append(b, 0x0B)       // end function
+	return b
+}
+
+// appendLitChainFindGroupsCodeEntry appends a size-prefixed lit-chain
+// find-with-captures body.
+func appendLitChainFindGroupsCodeEntry(cs []byte, lcp *litChainPattern, lcc *litChainCaptures, tableMemIdx int) []byte {
+	body := buildLitChainFindGroupsBody(lcp, lcc, tableMemIdx)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
 // appendLitChainFindCodeEntry appends a size-prefixed lit-chain find body.
 func appendLitChainFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) []byte {
 	body := buildLitChainFindBody(lcp, tableMemIdx)
@@ -6501,6 +6698,107 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 	b = append(b, 0x42, 0x7F)
 	b = append(b, 0x0B) // end function
 	return b
+}
+
+// buildLitChainAltFindGroupsBody emits the WASM body for non-anchored
+// find-with-captures over a strict lit-chain alternation. Signature:
+// `(ptr, len, out_ptr) → i32`. Native single-function variant — combines the
+// Teddy frontend scan with per-branch verify and inline slot writes.
+func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litChainCaptures,
+	l litChainAltLayout, tableMemIdx int) []byte {
+
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locOutPtr       byte = 2
+		locAttemptStart byte = 3
+		locSimdMask     byte = 4
+		locScalarIdx    byte = 5
+		locChunk        byte = 6
+		locTeddyLo      byte = 7
+		locTeddyHi      byte = 8
+		locVerifyTlo    byte = 9
+		locVerifyPow2   byte = 10
+	)
+
+	var b []byte
+
+	// 3 i32 + 5 v128.
+	b = append(b, 0x02)
+	b = append(b, 0x03, 0x7F)
+	b = append(b, 0x05, 0x7B)
+
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $lit_outer
+
+	seen := [256]bool{}
+	var firstByteSet []byte
+	var firstByteFlags [256]byte
+	for _, br := range altp.branches {
+		firstByteFlags[br.literal[0]] = 1
+		if !seen[br.literal[0]] {
+			seen[br.literal[0]] = true
+			firstByteSet = append(firstByteSet, br.literal[0])
+		}
+	}
+
+	scan := prefixScanParams{
+		FirstByteSet:   firstByteSet,
+		FirstByteFlags: firstByteFlags,
+		FirstByteOff:   l.firstByteOff,
+		TeddyLoOff:     l.teddyLoOff,
+		TeddyHiOff:     l.teddyHiOff,
+		TeddyTwoByte:   false,
+		EngineDepth:    2,
+		TableMemIdx:    tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+			TLo:          locTeddyLo,
+			THi:          locTeddyHi,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	locals := litChainBranchLocals{
+		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
+		SimdMask: locSimdMask, ScalarIdx: locScalarIdx,
+		Chunk: locChunk, VerifyTlo: locVerifyTlo, VerifyPow2: locVerifyPow2,
+	}
+	for i, br := range altp.branches {
+		b = append(b, 0x02, 0x40) // block $next_branch_i
+		b = emitLitChainAltLitBranchGroupsBody(b, br, l.branchBitmapOff[i], locals,
+			branchCaps[i], locOutPtr, tableMemIdx)
+		b = append(b, 0x0B) // end $next_branch_i
+	}
+
+	// All branches failed at this position — advance and restart.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x0C, 0x00) // br 0 → $lit_outer
+
+	b = append(b, 0x0B) // end loop $lit_outer
+	b = append(b, 0x0B) // end block $no_match
+
+	// No match.
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0B) // end function
+	return b
+}
+
+// appendLitChainAltFindGroupsCodeEntry appends a size-prefixed alt
+// find-with-captures body.
+func appendLitChainAltFindGroupsCodeEntry(cs []byte, altp *litChainAltPattern,
+	branchCaps []*litChainCaptures, l litChainAltLayout, tableMemIdx int) []byte {
+	body := buildLitChainAltFindGroupsBody(altp, branchCaps, l, tableMemIdx)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
 }
 
 // ============================================================================

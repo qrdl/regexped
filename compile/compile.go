@@ -256,22 +256,23 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			p := &compiledPattern{
 				tableEnd:  tableBase,
 				numGroups: lcc.numGroups,
+				anchored:  true, // captureBody IS the exported groups function (native A.3 path)
 			}
 			p.groupsExport = re.GroupsFunc
 			if re.NamedGroupsFunc != "" {
 				p.namedGroupsExport = re.NamedGroupsFunc
 			}
-			// Expose match/find publicly only if the caller asked for them.
 			if needMatch {
 				p.matchExport = re.MatchFunc
 				p.matchBody = appendLitChainMatchCodeEntry(nil, lcp)
 			}
 			if needFind {
 				p.findExport = re.FindFunc
+				p.findBody = appendLitChainFindCodeEntry(nil, lcp, buildOpts.tableMemIdx)
 			}
-			// Find body is required internally (wrapper calls it as find_internal).
-			p.findBody = appendLitChainFindCodeEntry(nil, lcp, buildOpts.tableMemIdx)
-			p.captureBody = appendLitChainGroupsCodeEntry(nil, lcp, lcc)
+			// Native find-with-captures body — replaces the find+capture wrapper
+			// composition. Single SIMD pass with inline slot writes.
+			p.captureBody = appendLitChainFindGroupsCodeEntry(nil, lcp, lcc, buildOpts.tableMemIdx)
 			parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
 			if err == nil {
 				p.groupNames = extractGroupNames(parsed)
@@ -286,26 +287,27 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				p := &compiledPattern{
 					tableEnd:  tableBase,
 					numGroups: branchCaps[0].numGroups,
+					anchored:  true, // captureBody IS the exported groups function (native A.3 path)
 				}
 				p.groupsExport = re.GroupsFunc
 				if re.NamedGroupsFunc != "" {
 					p.namedGroupsExport = re.NamedGroupsFunc
 				}
-				if needFind {
-					p.findExport = re.FindFunc
-				}
-				// Internal find body + data segments (alt Teddy frontend).
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
-				findBodyInner := buildLitChainAltFindBody(altp, layout, buildOpts.tableMemIdx)
-				var findBody []byte
-				findBody = utils.AppendULEB128(findBody, uint32(len(findBodyInner)))
-				findBody = append(findBody, findBodyInner...)
-				p.findBody = findBody
+				if needFind {
+					p.findExport = re.FindFunc
+					findBodyInner := buildLitChainAltFindBody(altp, layout, buildOpts.tableMemIdx)
+					var findBody []byte
+					findBody = utils.AppendULEB128(findBody, uint32(len(findBodyInner)))
+					findBody = append(findBody, findBodyInner...)
+					p.findBody = findBody
+				}
 				p.dataBytes = dataBytes
 				p.dataSegCount = segCount
 				p.tableEnd = layout.tableEnd
-				p.captureBody = appendLitChainAltGroupsCodeEntry(nil, altp, branchCaps)
+				// Native single-function alt find-with-captures.
+				p.captureBody = appendLitChainAltFindGroupsCodeEntry(nil, altp, branchCaps, layout, buildOpts.tableMemIdx)
 				parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
 				if err == nil {
 					p.groupNames = extractGroupNames(parsed)
