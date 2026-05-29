@@ -1,4 +1,4 @@
-.PHONY: test exhaustive custom adjusted sets clean
+.PHONY: test exhaustive custom adjusted sets likelymatch clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -27,7 +27,16 @@ force-backtrack: $(ADJUSTED)
 	go run . --force-backtrack --validate-groups $(ADJUSTED)
 	go run . --force-backtrack --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack sets
+# Run every test under LikelyMode=LikelyMatch. Patterns matching the lit-chain
+# shape (literal + counted class) take the Opt 2 emission path; others fall
+# through to the standard DFA. Confirms LikelyMatch correctness across the
+# full corpus.
+likelymatch: $(ADJUSTED)
+	go run . --likelymatch $(TESTDATA)
+	go run . --likelymatch --validate-groups $(ADJUSTED)
+	go run . --likelymatch --validate-groups $(CUSTOM)
+
+test: exhaustive custom adjusted force-backtrack likelymatch sets
 
 sets: $(TESTDATA)
 	go run . --sets $(TESTDATA)

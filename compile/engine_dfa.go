@@ -5056,6 +5056,208 @@ func emitEndAnchorCheck(b []byte, anchor anchorType,
 	return b
 }
 
+// litChainBranchLocals identifies the WASM local indices used by the shared
+// lit-chain branch dispatch emission. Each emission site (single-pattern find,
+// strict-alt, lenient-alt) declares locals at different indices and supplies a
+// populated struct to `emitLitChainAltLitBranchBody`.
+type litChainBranchLocals struct {
+	Ptr          byte // i32 param: input base address
+	Len          byte // i32 param: input length
+	AttemptStart byte // i32: candidate position from the frontend scan
+	SimdMask     byte // i32: scan bitmask AND scalar-verify byte tmp
+	ScalarIdx    byte // i32: scalar-verify counter AND anchor-check word-byte tmp
+	Chunk        byte // v128: SIMD class-verify chunk
+	VerifyTlo    byte // v128: per-branch tLo nibble table
+	VerifyPow2   byte // v128: power-of-two table for hi nibble
+}
+
+// emitLiteralByteVerify emits scalar byte compares for literal bytes
+// [startK..len(literal)-1] against input[posLocal+k]. On any mismatch, br_if
+// failBrDepth. Used by alternation branch dispatch (start byte is dispatched
+// separately via the first-byte filter).
+func emitLiteralByteVerify(b []byte, literal []byte, startK int,
+	ptrLocal, posLocal, failBrDepth byte) []byte {
+	for k := startK; k < len(literal); k++ {
+		b = append(b, 0x20, ptrLocal)
+		b = append(b, 0x20, posLocal)
+		b = append(b, 0x6A) // i32.add
+		b = append(b, 0x2D, 0x00)
+		b = utils.AppendULEB128(b, uint32(k))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(literal[k]))
+		b = append(b, 0x47) // i32.ne
+		b = append(b, 0x0D, failBrDepth)
+	}
+	return b
+}
+
+// emitReturnPackedI64 emits the WASM sequence to return packed (start<<32|end)
+// where end = startLocal + endOffset (constant).
+func emitReturnPackedI64(b []byte, startLocal byte, endOffset int32) []byte {
+	b = append(b, 0x20, startLocal)
+	b = append(b, 0xAD)       // i64.extend_i32_u
+	b = append(b, 0x42, 0x20) // i64.const 32
+	b = append(b, 0x86)       // i64.shl
+	b = append(b, 0x20, startLocal)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, endOffset)
+	b = append(b, 0x6A) // i32.add → end pos
+	b = append(b, 0xAD) // i64.extend_i32_u
+	b = append(b, 0x84) // i64.or
+	b = append(b, 0x0F) // return
+	return b
+}
+
+// emitReturnPackedI64FromLocal emits the WASM sequence to return packed
+// (startLocal<<32 | endLocal).
+func emitReturnPackedI64FromLocal(b []byte, startLocal, endLocal byte) []byte {
+	b = append(b, 0x20, startLocal)
+	b = append(b, 0xAD)
+	b = append(b, 0x42, 0x20)
+	b = append(b, 0x86)
+	b = append(b, 0x20, endLocal)
+	b = append(b, 0xAD)
+	b = append(b, 0x84)
+	b = append(b, 0x0F)
+	return b
+}
+
+// emitScalarBitmapVerify emits the scalar class-verify loop for an alternation
+// branch where useSIMD=false. Reads N bytes after the literal, indexes into
+// the bitmap data segment, and br_if's to branchFailDepth on the first byte
+// out of class. Returns with stack unchanged (falls through on success).
+//
+// Block + loop nesting (depths from inside loop body):
+//   0 = $vloop (loop), 1 = $loop_done (block), 2..N = caller's blocks.
+// branchFailDepth is the caller-block depth that should be reached on
+// verification failure (typically 0 = $next_branch_i from the alt dispatch).
+func emitScalarBitmapVerify(b []byte, literal []byte, count int,
+	branchBitmapOff int32, locals litChainBranchLocals,
+	tableMemIdx int, branchFailDepth byte) []byte {
+
+	b = append(b, 0x02, 0x40) // block $loop_done
+
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x21, locals.ScalarIdx)
+
+	b = append(b, 0x03, 0x40) // loop $vloop
+
+	// if scalarIdx >= N: br 1 → $loop_done (success)
+	b = append(b, 0x20, locals.ScalarIdx)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(count))
+	b = append(b, 0x4E)       // i32.ge_s
+	b = append(b, 0x0D, 0x01) // br_if 1
+
+	// byte_val = input[attempt_start + K + scalarIdx]
+	b = append(b, 0x20, locals.Ptr)
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locals.ScalarIdx)
+	b = append(b, 0x6A)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(len(literal)))
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00)
+	b = append(b, 0x22, locals.SimdMask) // save byte_val
+
+	// bit = (bitmap[byte>>3] >> (byte&7)) & 1
+	b = append(b, 0x41, 0x03)
+	b = append(b, 0x76)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, branchBitmapOff)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx)
+
+	b = append(b, 0x20, locals.SimdMask)
+	b = append(b, 0x41, 0x07)
+	b = append(b, 0x71)
+	b = append(b, 0x76)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x71)
+	b = append(b, 0x45) // eqz: 1 if NOT in class
+
+	// br_if (branchFailDepth + 2) → caller's branchFail target
+	b = append(b, 0x0D, branchFailDepth+2)
+
+	// scalarIdx++; br 0 → restart $vloop
+	b = append(b, 0x20, locals.ScalarIdx)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locals.ScalarIdx)
+	b = append(b, 0x0C, 0x00)
+
+	b = append(b, 0x0B) // end loop $vloop
+	b = append(b, 0x0B) // end block $loop_done
+	return b
+}
+
+// emitLitChainAltLitBranchBody emits the body of an alternation lit-chain
+// branch (everything inside `block $next_branch_i` from first-byte dispatch
+// through return-packed). The caller has already opened the block and
+// supplies the per-branch bitmap data-segment offset (for scalar verify).
+// All failure paths br_if 0 → $next_branch_i (the enclosing block).
+func emitLitChainAltLitBranchBody(b []byte, br litChainAltBranch,
+	branchBitmapOff int32, locals litChainBranchLocals,
+	tableMemIdx int) []byte {
+
+	const failDepth byte = 0 // = $next_branch_i, the enclosing block
+
+	total := int32(len(br.literal) + br.count)
+
+	// First-byte dispatch: input[attempt_start] != literal[0] → next branch.
+	b = append(b, 0x20, locals.Ptr)
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(br.literal[0]))
+	b = append(b, 0x47)
+	b = append(b, 0x0D, failDepth)
+
+	// Bounds check: attempt_start + K + N > len → next branch.
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locals.Len)
+	b = append(b, 0x4B)
+	b = append(b, 0x0D, failDepth)
+
+	// Start anchor (runs before literal/class verify to skip expensive work).
+	if br.startAnchor != anchorNone {
+		b = emitStartAnchorCheck(b, br.startAnchor, br.literal[0],
+			locals.Ptr, locals.AttemptStart, locals.ScalarIdx, failDepth)
+	}
+
+	// Literal verify (bytes 1..K-1; byte 0 already covered by first-byte dispatch).
+	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
+
+	// Class verify.
+	if br.useSIMD {
+		b = emitV128Const(b, br.tlo)
+		b = append(b, 0x21, locals.VerifyTlo)
+		b = emitV128Const(b, pow2VecConst)
+		b = append(b, 0x21, locals.VerifyPow2)
+		lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count}
+		b = emitLitChainClassVerify(b, lcp,
+			locals.Ptr, locals.AttemptStart, locals.Chunk, locals.VerifyTlo, locals.VerifyPow2)
+		b = append(b, 0x0D, failDepth)
+	} else {
+		b = emitScalarBitmapVerify(b, br.literal, br.count, branchBitmapOff, locals, tableMemIdx, failDepth)
+	}
+
+	// End anchor.
+	if br.endAnchor != anchorNone {
+		b = emitEndAnchorCheck(b, br.endAnchor,
+			locals.Ptr, locals.AttemptStart, total, locals.Len, locals.ScalarIdx, failDepth)
+	}
+
+	// Success — return packed (attempt_start << 32 | attempt_start + total).
+	b = emitReturnPackedI64(b, locals.AttemptStart, total)
+	return b
+}
+
 // pow2VecConst is the v128.const payload for the high-nibble power-of-two lookup.
 // Pow2[h] = 1<<h for h in 0..7; 0 for h in 8..15 (would mean byte > 127).
 var pow2VecConst = [16]byte{1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -5175,17 +5377,31 @@ func emitLitChainClassVerify(b []byte, lcp *litChainPattern,
 func buildLitChainMatchBody(lcp *litChainPattern) []byte {
 	var b []byte
 
-	// Local declarations: 3 v128.
-	b = append(b, 0x01)       // 1 local group
-	b = append(b, 0x03, 0x7B) // 3 × v128
+	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
 
+	// Local declarations. Add i32 locals (attempt_start=0 sentinel + tmp) only
+	// when end-anchor check needs the helpers, to keep the no-anchor WASM
+	// byte-identical to the pre-anchor emission.
 	const (
 		locPtr   byte = 0
 		locLen   byte = 1
 		locChunk byte = 2
 		locTLo   byte = 3
 		locPow2  byte = 4
+		// When hasAnchors:
+		locAttemptZero byte = 5
+		locTmp         byte = 6
 	)
+	// Declare v128 group first so existing local indices (locChunk=2..) stay
+	// stable whether or not the anchor i32 locals are present.
+	if hasAnchors {
+		b = append(b, 0x02)
+		b = append(b, 0x03, 0x7B) // 3 × v128
+		b = append(b, 0x02, 0x7F) // 2 × i32 (attempt-zero sentinel + tmp)
+	} else {
+		b = append(b, 0x01)
+		b = append(b, 0x03, 0x7B)
+	}
 
 	// Materialise tLo and pow2 from inline v128.const into locals.
 	b = emitV128Const(b, lcp.tlo)
@@ -5196,15 +5412,40 @@ func buildLitChainMatchBody(lcp *litChainPattern) []byte {
 	k := int32(len(lcp.literal))
 	total := k + int32(lcp.count)
 
-	// Bounds: if len < K+N → return -1.
+	// Bounds: anchored match must consume the entire input — len != total → -1.
+	// (Lit-chain patterns are fixed-length K+N; any other length cannot match.)
 	b = append(b, 0x20, locLen)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, total)
-	b = append(b, 0x49)       // i32.lt_u
+	b = append(b, 0x47)       // i32.ne
 	b = append(b, 0x04, 0x40) // if (void)
 	b = append(b, 0x41, 0x7F) // i32.const -1
 	b = append(b, 0x0F)       // return
 	b = append(b, 0x0B)       // end if
+
+	// Start anchor at pos 0 — fully resolvable at compile time.
+	// anchorBeginText: pos==0, always pass.
+	// anchorEndText: pos==len at start requires K+N==0, impossible — emit fail.
+	// anchorWordBoundary: leftWord=0 (no prev), rightWord=is_word(literal[0]).
+	//   boundary = rightWord. \b passes iff literal[0] is a word char.
+	// anchorNoWordBoundary: \B passes iff literal[0] is NOT a word char.
+	startFailsAtCompileTime := false
+	switch lcp.startAnchor {
+	case anchorEndText:
+		startFailsAtCompileTime = true
+	case anchorWordBoundary:
+		if !isWordByte(lcp.literal[0]) {
+			startFailsAtCompileTime = true
+		}
+	case anchorNoWordBoundary:
+		if isWordByte(lcp.literal[0]) {
+			startFailsAtCompileTime = true
+		}
+	}
+	if startFailsAtCompileTime {
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x0F)       // return
+	}
 
 	// Literal verify: K scalar byte compares against input[0..K-1].
 	for kk, byt := range lcp.literal {
@@ -5277,6 +5518,32 @@ func buildLitChainMatchBody(lcp *litChainPattern) []byte {
 	b = append(b, 0x41, 0x7F)
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
+
+	// End anchor check at end_pos = total. Wrap in `block $bad` so a failing
+	// br_if (depth 0) lands at the post-block "return -1" path; success falls
+	// through to the success return inside the block.
+	if lcp.endAnchor != anchorNone {
+		b = append(b, 0x02, 0x40) // block $bad
+		switch lcp.endAnchor {
+		case anchorBeginText:
+			// end_pos must be 0, impossible — unconditionally fail.
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x0D, 0x00) // br_if 0 → $bad (true)
+		default:
+			// Use the helper with a 0-initialised attempt_start sentinel.
+			// (locAttemptZero is zero by virtue of WASM locals init.)
+			b = emitEndAnchorCheck(b, lcp.endAnchor,
+				locPtr, locAttemptZero, total, locLen, locTmp, 0)
+		}
+		// Anchor passed — return total.
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total)
+		b = append(b, 0x0F)       // return
+		b = append(b, 0x0B)       // end $bad
+		b = append(b, 0x41, 0x7F) // i32.const -1 (anchor failed path)
+		b = append(b, 0x0B)       // end function
+		return b
+	}
 
 	// All good — return K+N as the end position.
 	b = append(b, 0x41)
@@ -5398,17 +5665,7 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 	}
 
 	// Match — return packed (attempt_start << 32 | attempt_start + K + N).
-	b = append(b, 0x20, locAttemptStart)
-	b = append(b, 0xAD)       // i64.extend_i32_u
-	b = append(b, 0x42, 0x20) // i64.const 32
-	b = append(b, 0x86)       // i64.shl
-	b = append(b, 0x20, locAttemptStart)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, total)
-	b = append(b, 0x6A) // i32.add → end pos
-	b = append(b, 0xAD) // i64.extend_i32_u
-	b = append(b, 0x84) // i64.or
-	b = append(b, 0x0F) // return
+	b = emitReturnPackedI64(b, locAttemptStart, total)
 
 	if hasAnchors {
 		b = append(b, 0x0B) // end $next_attempt
@@ -5599,140 +5856,14 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 	b = emitPrefixScan(b, scan)
 
 	// attempt_start = candidate position. Try each branch in turn.
+	locals := litChainBranchLocals{
+		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
+		SimdMask: locSimdMask, ScalarIdx: locScalarIdx,
+		Chunk: locChunk, VerifyTlo: locVerifyTlo, VerifyPow2: locVerifyPow2,
+	}
 	for i, br := range altp.branches {
-		total := int32(len(br.literal) + br.count)
-
 		b = append(b, 0x02, 0x40) // block $next_branch_i
-
-		// Branch dispatch by first byte: if input[attempt_start] != literal_i[0], skip.
-		b = append(b, 0x20, locPtr)
-		b = append(b, 0x20, locAttemptStart)
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(br.literal[0]))
-		b = append(b, 0x47)       // i32.ne
-		b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
-
-		// Bounds check: attempt_start + K + N <= len?
-		b = append(b, 0x20, locAttemptStart)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, total)
-		b = append(b, 0x6A)
-		b = append(b, 0x20, locLen)
-		b = append(b, 0x4B)       // i32.gt_u
-		b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
-
-		// Verify remaining literal bytes (1..K-1).
-		for k := 1; k < len(br.literal); k++ {
-			b = append(b, 0x20, locPtr)
-			b = append(b, 0x20, locAttemptStart)
-			b = append(b, 0x6A)
-			b = append(b, 0x2D, 0x00)
-			b = utils.AppendULEB128(b, uint32(k))
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(br.literal[k]))
-			b = append(b, 0x47)       // i32.ne
-			b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
-		}
-
-		// Class verify.
-		if br.useSIMD {
-			// Load tLo for this branch + pow2.
-			b = emitV128Const(b, br.tlo)
-			b = append(b, 0x21, locVerifyTlo)
-			b = emitV128Const(b, pow2VecConst)
-			b = append(b, 0x21, locVerifyPow2)
-			// Emit SIMD chunks → bad_mask i32 on stack.
-			lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count}
-			b = emitLitChainClassVerify(b, lcp,
-				locPtr, locAttemptStart, locChunk, locVerifyTlo, locVerifyPow2)
-			b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i (bad)
-		} else {
-			// Scalar verify. Block + loop nesting so we can break OUT of the
-			// loop (success) and out of the whole branch (failure):
-			//   block $loop_done                    (+1)
-			//     loop $vloop                       (+2)
-			//       if scalarIdx >= N: br $loop_done    (br 1)
-			//       byte_val = input[attempt+K+scalarIdx]
-			//       bit = (bitmap[byte>>3] >> (byte&7)) & 1
-			//       if bit == 0: br $next_branch_i      (br 2)
-			//       scalarIdx++; br $vloop              (br 0)
-			//     end loop
-			//   end block       (fall-through = success)
-			//
-			// Depths inside the loop body:
-			//   0 = $vloop, 1 = $loop_done, 2 = $next_branch_i
-			b = append(b, 0x02, 0x40) // block $loop_done
-
-			b = append(b, 0x41, 0x00)
-			b = append(b, 0x21, locScalarIdx)
-
-			b = append(b, 0x03, 0x40) // loop $vloop
-
-			// if scalarIdx >= N: br 1 → $loop_done (loop exit = success)
-			b = append(b, 0x20, locScalarIdx)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(br.count))
-			b = append(b, 0x4E)       // i32.ge_s
-			b = append(b, 0x0D, 0x01) // br_if 1 → $loop_done
-
-			// byte_val = input[attempt_start + K + scalarIdx]
-			b = append(b, 0x20, locPtr)
-			b = append(b, 0x20, locAttemptStart)
-			b = append(b, 0x6A)
-			b = append(b, 0x20, locScalarIdx)
-			b = append(b, 0x6A)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(len(br.literal)))
-			b = append(b, 0x6A)
-			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
-			b = append(b, 0x22, locSimdMask) // tee → save byte_val in simdMask (free here)
-
-			// bitmap[byte_val >> 3]
-			b = append(b, 0x41, 0x03)
-			b = append(b, 0x76) // shr_u 3 → byte_val>>3
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, l.branchBitmapOff[i])
-			b = append(b, 0x6A)                   // bitmapOff + (byte>>3)
-			b = appendTableLoad8u(b, tableMemIdx) // load bitmap byte
-
-			// >> (byte_val & 7), & 1, eqz
-			b = append(b, 0x20, locSimdMask)
-			b = append(b, 0x41, 0x07)
-			b = append(b, 0x71) // byte_val & 7
-			b = append(b, 0x76) // bitmap_byte >> (byte&7)
-			b = append(b, 0x41, 0x01)
-			b = append(b, 0x71) // ... & 1
-			b = append(b, 0x45) // i32.eqz → 1 if byte NOT in class
-
-			// br_if 2 → $next_branch_i (branch fails)
-			b = append(b, 0x0D, 0x02)
-
-			// scalarIdx++; br 0 → restart $vloop
-			b = append(b, 0x20, locScalarIdx)
-			b = append(b, 0x41, 0x01)
-			b = append(b, 0x6A)
-			b = append(b, 0x21, locScalarIdx)
-			b = append(b, 0x0C, 0x00) // br 0 → $vloop
-
-			b = append(b, 0x0B) // end loop $vloop
-			b = append(b, 0x0B) // end block $loop_done
-		}
-
-		// Verify succeeded — return packed (attempt_start << 32 | attempt_start + K + N).
-		b = append(b, 0x20, locAttemptStart)
-		b = append(b, 0xAD)
-		b = append(b, 0x42, 0x20)
-		b = append(b, 0x86) // i64.shl
-		b = append(b, 0x20, locAttemptStart)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, total)
-		b = append(b, 0x6A)
-		b = append(b, 0xAD)
-		b = append(b, 0x84) // i64.or
-		b = append(b, 0x0F) // return
-
+		b = emitLitChainAltLitBranchBody(b, br, l.branchBitmapOff[i], locals, tableMemIdx)
 		b = append(b, 0x0B) // end $next_branch_i
 	}
 
@@ -6120,133 +6251,39 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	b = emitPrefixScan(b, scan)
 
 	// Per-branch dispatch.
+	locals := litChainBranchLocals{
+		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
+		SimdMask: locSimdMask, ScalarIdx: locScalarIdx,
+		Chunk: locChunk, VerifyTlo: locVerifyTlo, VerifyPow2: locVerifyPow2,
+	}
 	for i, br := range altp.branches {
 		b = append(b, 0x02, 0x40) // block $next_branch_i
 
-		// Dispatch by first byte: if input[attempt_start] != literal[0], skip.
-		b = append(b, 0x20, locPtr)
-		b = append(b, 0x20, locAttemptStart)
-		b = append(b, 0x6A)
-		b = append(b, 0x2D, 0x00, 0x00)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(br.literal[0]))
-		b = append(b, 0x47)
-		b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
-
 		if br.isLitChain {
-			total := int32(len(br.literal) + br.count)
-			// Bounds + remaining literal bytes + class verify (identical to strict).
+			chainBr := litChainAltBranch{
+				literal: br.literal, bitmap: br.bitmap, tlo: br.tlo,
+				count: br.count, useSIMD: br.useSIMD,
+				startAnchor: br.startAnchor, endAnchor: br.endAnchor,
+			}
+			b = emitLitChainAltLitBranchBody(b, chainBr, l.branchBitmapOff[i], locals, tableMemIdx)
+		} else {
+			// DFA branch: first-byte dispatch + inline DFA from attempt_start.
+			b = append(b, 0x20, locPtr)
 			b = append(b, 0x20, locAttemptStart)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, total)
 			b = append(b, 0x6A)
-			b = append(b, 0x20, locLen)
-			b = append(b, 0x4B)
+			b = append(b, 0x2D, 0x00, 0x00)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(br.literal[0]))
+			b = append(b, 0x47)
 			b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
 
-			for k := 1; k < len(br.literal); k++ {
-				b = append(b, 0x20, locPtr)
-				b = append(b, 0x20, locAttemptStart)
-				b = append(b, 0x6A)
-				b = append(b, 0x2D, 0x00)
-				b = utils.AppendULEB128(b, uint32(k))
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(br.literal[k]))
-				b = append(b, 0x47)
-				b = append(b, 0x0D, 0x00)
-			}
-
-			if br.useSIMD {
-				b = emitV128Const(b, br.tlo)
-				b = append(b, 0x21, locVerifyTlo)
-				b = emitV128Const(b, pow2VecConst)
-				b = append(b, 0x21, locVerifyPow2)
-				lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count}
-				b = emitLitChainClassVerify(b, lcp,
-					locPtr, locAttemptStart, locChunk, locVerifyTlo, locVerifyPow2)
-				b = append(b, 0x0D, 0x00)
-			} else {
-				b = append(b, 0x02, 0x40) // block $loop_done
-				b = append(b, 0x41, 0x00)
-				b = append(b, 0x21, locScalarIdx)
-				b = append(b, 0x03, 0x40) // loop $vloop
-
-				b = append(b, 0x20, locScalarIdx)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(br.count))
-				b = append(b, 0x4E)
-				b = append(b, 0x0D, 0x01)
-
-				b = append(b, 0x20, locPtr)
-				b = append(b, 0x20, locAttemptStart)
-				b = append(b, 0x6A)
-				b = append(b, 0x20, locScalarIdx)
-				b = append(b, 0x6A)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(len(br.literal)))
-				b = append(b, 0x6A)
-				b = append(b, 0x2D, 0x00, 0x00)
-				b = append(b, 0x22, locSimdMask)
-
-				b = append(b, 0x41, 0x03)
-				b = append(b, 0x76)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, l.branchBitmapOff[i])
-				b = append(b, 0x6A)
-				b = appendTableLoad8u(b, tableMemIdx)
-
-				b = append(b, 0x20, locSimdMask)
-				b = append(b, 0x41, 0x07)
-				b = append(b, 0x71)
-				b = append(b, 0x76)
-				b = append(b, 0x41, 0x01)
-				b = append(b, 0x71)
-				b = append(b, 0x45)
-
-				b = append(b, 0x0D, 0x02)
-
-				b = append(b, 0x20, locScalarIdx)
-				b = append(b, 0x41, 0x01)
-				b = append(b, 0x6A)
-				b = append(b, 0x21, locScalarIdx)
-				b = append(b, 0x0C, 0x00)
-
-				b = append(b, 0x0B) // end $vloop
-				b = append(b, 0x0B) // end $loop_done
-			}
-
-			// Lit-chain success — return packed (attempt_start, attempt_start+K+N).
-			b = append(b, 0x20, locAttemptStart)
-			b = append(b, 0xAD)
-			b = append(b, 0x42, 0x20)
-			b = append(b, 0x86)
-			b = append(b, 0x20, locAttemptStart)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, total)
-			b = append(b, 0x6A)
-			b = append(b, 0xAD)
-			b = append(b, 0x84)
-			b = append(b, 0x0F) // return
-		} else {
-			// DFA branch: initialize DFA pos = attempt_start, run inline.
 			b = append(b, 0x20, locAttemptStart)
 			b = append(b, 0x21, locDFAPos)
-			// emitInlineAnchoredDFAVerify either falls through (with locDFAOutEnd
-			// holding the end position) on success, or br's to $next_branch_i on
-			// failure. nextBranchDepth = 0 because we're directly inside the
-			// $next_branch_i block at this point.
 			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout, br.dfaTable,
 				locPtr, locLen, locDFAState, locDFAPos, locDFAClass, locDFAOutEnd,
 				tableMemIdx, 0)
 			// Success — return packed (attempt_start, locDFAOutEnd).
-			b = append(b, 0x20, locAttemptStart)
-			b = append(b, 0xAD)
-			b = append(b, 0x42, 0x20)
-			b = append(b, 0x86)
-			b = append(b, 0x20, locDFAOutEnd)
-			b = append(b, 0xAD)
-			b = append(b, 0x84)
-			b = append(b, 0x0F) // return
+			b = emitReturnPackedI64FromLocal(b, locAttemptStart, locDFAOutEnd)
 		}
 
 		b = append(b, 0x0B) // end $next_branch_i

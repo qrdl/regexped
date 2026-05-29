@@ -110,6 +110,32 @@ var tests = []testCase{
 		nomatchInput: configInput(nil),
 	},
 	{
+		// Word-boundary anchored lit-chain — canonical secret-detection idiom.
+		// Tests start \b + end \b on the single-pattern find path.
+		name:         "secrets-github-bounded",
+		pattern:      `\bghp_[A-Za-z0-9]{36}\b`,
+		mode:         modeFind,
+		notes:        "ghp_ secret with \\b at both ends — anchor support target",
+		matchInput:   configInput([]string{"see ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 here"}),
+		nomatchInput: configInput([]string{"Xghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Y"}),
+	},
+	{
+		// Strict alternation of two word-boundary anchored secrets. Exercises
+		// the anchor checks in buildLitChainAltFindBody.
+		name:    "secrets-combined-bounded",
+		pattern: `\bAKIA[A-Z0-9]{16}\b|\bghp_[A-Za-z0-9]{36}\b`,
+		mode:    modeFind,
+		notes:   "alternation of two \\b-bounded counted chains — strict-alt anchor target",
+		matchInput: configInput([]string{
+			"see AKIAIOSFODNN7EXAMPLE here",
+			"and ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab next",
+		}),
+		nomatchInput: configInput([]string{
+			"XAKIAIOSFODNN7EXAMPLEY",
+			"Xghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Y",
+		}),
+	},
+	{
 		// Mixed-shape alternation: one branch is lit-chain shape (ghp_...{36}),
 		// the other is NOT (has \s* between literal segments). Under strict
 		// alternation detection (current behaviour) this falls through to the

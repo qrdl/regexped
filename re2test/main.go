@@ -57,6 +57,7 @@ func main() {
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
 	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find (sets MaxDFAStates=1 so DFA always overflows to BT)")
 	setsMode := flag.Bool("sets", false, "test set find_all: compile each regexps block as a set and verify all matches against col4/col1 expected results")
+	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -64,13 +65,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode); err != nil {
+	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool) error {
+func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool) error {
 	f, err := os.Open(testFile)
 	if err != nil {
 		return err
@@ -256,6 +257,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			var compileOpts compile.CompileOptions
 			if forceBacktrack {
 				compileOpts.ForceEngine = compile.EngineBacktrack
+			}
+			if likelyMatch {
+				compileOpts.LikelyMode = compile.LikelyMatch
 			}
 			wasmBytes, _, compErr := compile.Compile([]config.RegexEntry{re}, tableBase, true, compileOpts)
 			if compErr != nil {
