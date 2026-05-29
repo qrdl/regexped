@@ -4778,6 +4778,9 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 		return nil, false
 	}
 	litNode := subs[0]
+	for litNode.Op == syntax.OpCapture && len(litNode.Sub) == 1 {
+		litNode = litNode.Sub[0]
+	}
 	if litNode.Op != syntax.OpLiteral {
 		return nil, false
 	}
@@ -5555,6 +5558,619 @@ func buildLitChainMatchBody(lcp *litChainPattern) []byte {
 // appendLitChainMatchCodeEntry appends a size-prefixed lit-chain match body.
 func appendLitChainMatchCodeEntry(cs []byte, lcp *litChainPattern) []byte {
 	body := buildLitChainMatchBody(lcp)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// captureGroup describes one capture group whose extent is fully determined at
+// compile time by the lit-chain shape. Offsets are relative to the candidate
+// match start position.
+type captureGroup struct {
+	group       int    // 1-based group index
+	name        string // empty if unnamed
+	startOffset int    // bytes from match start (≥ 0)
+	endOffset   int    // bytes from match start (> startOffset for non-empty)
+}
+
+// litChainCaptures attaches capture-group information to a lit-chain branch.
+// numGroups is the total group count for the WHOLE pattern (including group 0
+// and unmatched groups from sibling branches); groups holds only the groups
+// populated when this branch matches.
+type litChainCaptures struct {
+	numGroups int            // total groups in pattern (incl. group 0)
+	groups    []captureGroup // groups this branch populates (excludes group 0)
+}
+
+// hasOpCapture reports whether the subtree contains any OpCapture node.
+func hasOpCapture(re *syntax.Regexp) bool {
+	if re.Op == syntax.OpCapture {
+		return true
+	}
+	for _, sub := range re.Sub {
+		if hasOpCapture(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractLitChainCaptures walks a lit-chain parse tree and records each
+// OpCapture's compile-time offset. Returns (captures, maxGroup, ok). Rejects
+// captures inside an OpRepeat body (capture-the-last-occurrence semantics
+// cannot be reconstructed from compile-time offsets).
+func extractLitChainCaptures(re *syntax.Regexp) ([]captureGroup, int, bool) {
+	var caps []captureGroup
+	maxGroup := 0
+	ok := true
+
+	var walk func(node *syntax.Regexp, offset int) int
+	walk = func(node *syntax.Regexp, offset int) int {
+		if !ok {
+			return 0
+		}
+		switch node.Op {
+		case syntax.OpCapture:
+			startOff := offset
+			w := walk(node.Sub[0], offset)
+			caps = append(caps, captureGroup{
+				group:       node.Cap,
+				name:        node.Name,
+				startOffset: startOff,
+				endOffset:   startOff + w,
+			})
+			if node.Cap > maxGroup {
+				maxGroup = node.Cap
+			}
+			return w
+		case syntax.OpConcat:
+			total := 0
+			for _, child := range node.Sub {
+				total += walk(child, offset+total)
+			}
+			return total
+		case syntax.OpLiteral:
+			return len(node.Rune)
+		case syntax.OpRepeat:
+			if hasOpCapture(node.Sub[0]) {
+				ok = false
+				return 0
+			}
+			childW := 0
+			child := node.Sub[0]
+			switch child.Op {
+			case syntax.OpLiteral:
+				childW = len(child.Rune)
+			case syntax.OpCharClass, syntax.OpAnyChar, syntax.OpAnyCharNotNL:
+				childW = 1
+			}
+			return node.Min * childW
+		case syntax.OpCharClass, syntax.OpAnyChar, syntax.OpAnyCharNotNL:
+			return 1
+		case syntax.OpBeginText, syntax.OpEndText,
+			syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+			return 0
+		case syntax.OpBeginLine, syntax.OpEndLine:
+			ok = false
+			return 0
+		}
+		return 0
+	}
+	_ = walk(re, 0)
+	if !ok {
+		return nil, 0, false
+	}
+	return caps, maxGroup, true
+}
+
+// analyseLitChainGroups parses pattern and verifies it as a single lit-chain
+// branch with compile-time-resolvable captures. The N≥24 single-pattern gate
+// does NOT apply: lit-chain groups is anchored, so the find-mode scan-loop
+// codegen quirk that motivated the gate is not present here.
+func analyseLitChainGroups(pattern string) (*litChainPattern, *litChainCaptures, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, nil, false
+	}
+	info, ok := analyseLitChainBranch(re)
+	if !ok {
+		return nil, nil, false
+	}
+	caps, maxGroup, ok := extractLitChainCaptures(re)
+	if !ok {
+		return nil, nil, false
+	}
+	if maxGroup == 0 {
+		// Pattern has groups_func set but no actual capture groups. Fall through
+		// to the standard pipeline.
+		return nil, nil, false
+	}
+	lcp := &litChainPattern{
+		literal:     info.literal,
+		tlo:         info.tlo,
+		count:       info.count,
+		startAnchor: info.startAnchor,
+		endAnchor:   info.endAnchor,
+	}
+	lcc := &litChainCaptures{
+		numGroups: maxGroup + 1, // +1 for group 0 (whole match)
+		groups:    caps,
+	}
+	return lcp, lcc, true
+}
+
+// analyseLitChainAltGroups parses pattern as an OpAlternate of lit-chain
+// branches, each potentially carrying its own captures. Captures are
+// numbered globally across branches (Go regexp convention). Each entry in
+// branchCaptures corresponds to the same index in altp.branches.
+//
+// Step-1 scope: rejects any branch carrying an anchor. Anchored alt-groups
+// emission needs an extra i32 local and explicit end-anchor wiring; left for
+// a follow-up step.
+func analyseLitChainAltGroups(pattern string) (*litChainAltPattern, []*litChainCaptures, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, nil, false
+	}
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		// Outer capture wrapping the alternation — record it separately later.
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpAlternate || len(re.Sub) < 2 {
+		return nil, nil, false
+	}
+	branches := make([]litChainAltBranch, 0, len(re.Sub))
+	branchCaps := make([]*litChainCaptures, 0, len(re.Sub))
+	maxGroup := 0
+	hasAnyCap := false
+	for _, sub := range re.Sub {
+		info, ok := analyseLitChainBranch(sub)
+		if !ok {
+			return nil, nil, false
+		}
+		if info.startAnchor != anchorNone || info.endAnchor != anchorNone {
+			return nil, nil, false
+		}
+		caps, m, ok := extractLitChainCaptures(sub)
+		if !ok {
+			return nil, nil, false
+		}
+		if m > maxGroup {
+			maxGroup = m
+		}
+		if len(caps) > 0 {
+			hasAnyCap = true
+		}
+		branches = append(branches, litChainAltBranch{
+			literal:     info.literal,
+			bitmap:      info.bitmap,
+			tlo:         info.tlo,
+			count:       info.count,
+			useSIMD:     true, // groups path always SIMD (no scan-loop pressure)
+			startAnchor: info.startAnchor,
+			endAnchor:   info.endAnchor,
+		})
+		branchCaps = append(branchCaps, &litChainCaptures{
+			groups: caps,
+		})
+	}
+	if !hasAnyCap {
+		return nil, nil, false
+	}
+	numGroups := maxGroup + 1
+	for _, bc := range branchCaps {
+		bc.numGroups = numGroups
+	}
+	return &litChainAltPattern{branches: branches}, branchCaps, true
+}
+
+// emitLitChainGroupSlotWrites emits WASM that writes capture slots to
+// out_ptr (param 2) at compile-time offsets, given attempt_start in a local.
+// Writes:
+//   - group 0: (attemptStart, attemptStart + total)
+//   - each capture in lcc.groups: (attemptStart + startOffset, attemptStart + endOffset)
+//   - other groups (gaps in [1..numGroups-1]): (-1, -1)
+//
+// outPtrLocal: WASM local holding out_ptr (param 2 in groups signature).
+// attemptStartLocal: WASM local holding the attempt-start byte offset.
+// total: K+N (the full lit-chain length).
+func emitLitChainGroupSlotWrites(b []byte, lcc *litChainCaptures,
+	outPtrLocal, attemptStartLocal byte, total int) []byte {
+
+	// Build a map of group → captureGroup for fast lookup of populated groups.
+	populated := make(map[int]captureGroup, len(lcc.groups))
+	for _, cg := range lcc.groups {
+		populated[cg.group] = cg
+	}
+
+	// Helper: write i32 to out_ptr at offset.
+	writeSlot := func(b []byte, slotOff uint32, valueIsConst bool, value int32) []byte {
+		b = append(b, 0x20, outPtrLocal)
+		if valueIsConst {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, value)
+		} else {
+			// value is attemptStart + value (offset into match) — pushed onto stack
+			// by caller before this function. We do not handle this here.
+			panic("unreachable")
+		}
+		b = append(b, 0x36, 0x00) // i32.store align=0
+		b = utils.AppendULEB128(b, slotOff)
+		return b
+	}
+	_ = writeSlot
+
+	// Helper: write (attemptStart + offset) to out_ptr at slotOff.
+	writeAttemptPlus := func(b []byte, slotOff uint32, offset int) []byte {
+		b = append(b, 0x20, outPtrLocal)
+		b = append(b, 0x20, attemptStartLocal)
+		if offset != 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(offset))
+			b = append(b, 0x6A) // i32.add
+		}
+		b = append(b, 0x36, 0x00) // i32.store align=0
+		b = utils.AppendULEB128(b, slotOff)
+		return b
+	}
+
+	// Helper: write -1 (unmatched group sentinel) to out_ptr at slotOff.
+	writeMinusOne := func(b []byte, slotOff uint32) []byte {
+		b = append(b, 0x20, outPtrLocal)
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x36, 0x00)
+		b = utils.AppendULEB128(b, slotOff)
+		return b
+	}
+
+	// Group 0: whole match. start = attemptStart, end = attemptStart + total.
+	b = writeAttemptPlus(b, 0, 0)
+	b = writeAttemptPlus(b, 4, total)
+
+	// Groups 1..numGroups-1.
+	for g := 1; g < lcc.numGroups; g++ {
+		startSlot := uint32(g * 8)
+		endSlot := uint32(g*8 + 4)
+		if cg, ok := populated[g]; ok {
+			b = writeAttemptPlus(b, startSlot, cg.startOffset)
+			b = writeAttemptPlus(b, endSlot, cg.endOffset)
+		} else {
+			b = writeMinusOne(b, startSlot)
+			b = writeMinusOne(b, endSlot)
+		}
+	}
+	return b
+}
+
+// buildLitChainGroupsBody emits the anchored-match WASM body that ALSO writes
+// capture slots to out_ptr on success. Mirrors buildLitChainMatchBody for the
+// shape/anchor checks; on success, writes group 0 + per-capture slots before
+// returning total.
+//
+// Signature: (ptr i32, len i32, out_ptr i32) → i32.  Returns total on match,
+// -1 on mismatch.
+func buildLitChainGroupsBody(lcp *litChainPattern, lcc *litChainCaptures) []byte {
+	var b []byte
+
+	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
+
+	// Params: ptr=0, len=1, out_ptr=2. Locals shift +1 vs match body.
+	const (
+		locPtr    byte = 0
+		locLen    byte = 1
+		locOutPtr byte = 2
+		locChunk  byte = 3
+		locTLo    byte = 4
+		locPow2   byte = 5
+		// When hasAnchors:
+		locAttemptZero byte = 6
+		locTmp         byte = 7
+	)
+	if hasAnchors {
+		b = append(b, 0x02)
+		b = append(b, 0x03, 0x7B) // 3 × v128
+		b = append(b, 0x02, 0x7F) // 2 × i32
+	} else {
+		b = append(b, 0x01)
+		b = append(b, 0x03, 0x7B)
+	}
+
+	// Materialise tLo and pow2.
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+
+	k := int32(len(lcp.literal))
+	total := k + int32(lcp.count)
+
+	// Bounds: groups_func is anchored-start, partial-end. Need at least `total`
+	// bytes to fit the lit-chain; remaining tail is OK.
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x49)       // i32.lt_u (len < total)
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x41, 0x7F) // i32.const -1
+	b = append(b, 0x0F)       // return
+	b = append(b, 0x0B)       // end if
+
+	// Compile-time start anchor failure (same logic as match body).
+	startFailsAtCompileTime := false
+	switch lcp.startAnchor {
+	case anchorEndText:
+		startFailsAtCompileTime = true
+	case anchorWordBoundary:
+		if !isWordByte(lcp.literal[0]) {
+			startFailsAtCompileTime = true
+		}
+	case anchorNoWordBoundary:
+		if isWordByte(lcp.literal[0]) {
+			startFailsAtCompileTime = true
+		}
+	}
+	if startFailsAtCompileTime {
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x0F)
+	}
+
+	// Literal verify: K scalar byte compares.
+	for kk, byt := range lcp.literal {
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x2D, 0x00)
+		b = utils.AppendULEB128(b, uint32(kk))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(byt))
+		b = append(b, 0x47)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x0F)
+		b = append(b, 0x0B)
+	}
+
+	// Class verify: SIMD chunks. Same logic as match body, just with shifted
+	// chunk-local index.
+	chunks := planLitChainChunks(int(k), lcp.count)
+	for i, ch := range chunks {
+		b = append(b, 0x20, locPtr)
+		if ch.offset != 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(ch.offset))
+			b = append(b, 0x6A)
+		}
+		b = append(b, 0xFD, 0x00, 0x00, 0x00)
+		b = append(b, 0x21, locChunk)
+
+		b = append(b, 0x20, locTLo)
+		b = append(b, 0x20, locChunk)
+		b = append(b, 0x41, 0x0F)
+		b = append(b, 0xFD, 0x0F)
+		b = append(b, 0xFD, 0x4E)
+		b = append(b, 0xFD, 0x0E)
+
+		b = append(b, 0x20, locPow2)
+		b = append(b, 0x20, locChunk)
+		b = append(b, 0x41, 0x04)
+		b = append(b, 0xFD, 0x6D)
+		b = append(b, 0xFD, 0x0E)
+
+		b = append(b, 0xFD, 0x4E)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0xFD, 0x0F)
+		b = append(b, 0xFD, 0x23)
+		b = append(b, 0xFD, 0x64)
+
+		if ch.laneMask != 0xFFFF {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(ch.laneMask))
+			b = append(b, 0x71)
+		}
+		if i > 0 {
+			b = append(b, 0x72)
+		}
+	}
+
+	// bad_mask on stack. If non-zero → return -1.
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// End anchor check.
+	if lcp.endAnchor != anchorNone {
+		b = append(b, 0x02, 0x40) // block $bad
+		switch lcp.endAnchor {
+		case anchorBeginText:
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x0D, 0x00)
+		default:
+			b = emitEndAnchorCheck(b, lcp.endAnchor,
+				locPtr, locAttemptZero, total, locLen, locTmp, 0)
+		}
+		// Anchor passed: write slots and return total.
+		b = emitLitChainGroupSlotWrites(b, lcc, locOutPtr, locAttemptZero, int(total))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total)
+		b = append(b, 0x0F) // return
+		b = append(b, 0x0B) // end $bad
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x0B)
+		return b
+	}
+
+	// No end anchor: write slots and return total. attempt_start = 0 for
+	// anchored mode; emit a zero literal in the writeAttemptPlus helper.
+	// Since locAttemptZero is only present when hasAnchors is true, fall back
+	// to inlining literal zeros for the no-anchor path.
+	if hasAnchors {
+		b = emitLitChainGroupSlotWrites(b, lcc, locOutPtr, locAttemptZero, int(total))
+	} else {
+		b = emitLitChainGroupSlotWritesConstStart(b, lcc, locOutPtr, int(total))
+	}
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x0B) // end function
+	return b
+}
+
+// emitLitChainGroupSlotWritesConstStart emits slot writes for anchored mode
+// where attempt_start is known to be 0 at compile time (no spare local needed).
+func emitLitChainGroupSlotWritesConstStart(b []byte, lcc *litChainCaptures,
+	outPtrLocal byte, total int) []byte {
+
+	populated := make(map[int]captureGroup, len(lcc.groups))
+	for _, cg := range lcc.groups {
+		populated[cg.group] = cg
+	}
+
+	writeConst := func(b []byte, slotOff uint32, value int32) []byte {
+		b = append(b, 0x20, outPtrLocal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, value)
+		b = append(b, 0x36, 0x00)
+		b = utils.AppendULEB128(b, slotOff)
+		return b
+	}
+
+	// Group 0: start=0, end=total.
+	b = writeConst(b, 0, 0)
+	b = writeConst(b, 4, int32(total))
+
+	for g := 1; g < lcc.numGroups; g++ {
+		startSlot := uint32(g * 8)
+		endSlot := uint32(g*8 + 4)
+		if cg, ok := populated[g]; ok {
+			b = writeConst(b, startSlot, int32(cg.startOffset))
+			b = writeConst(b, endSlot, int32(cg.endOffset))
+		} else {
+			b = writeConst(b, startSlot, -1)
+			b = writeConst(b, endSlot, -1)
+		}
+	}
+	return b
+}
+
+// appendLitChainGroupsCodeEntry appends a size-prefixed lit-chain groups body.
+func appendLitChainGroupsCodeEntry(cs []byte, lcp *litChainPattern, lcc *litChainCaptures) []byte {
+	body := buildLitChainGroupsBody(lcp, lcc)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildLitChainAltGroupsBody emits the anchored-groups body for a strict
+// alternation of lit-chain branches. Signature: (ptr,len,out_ptr)→i32. Each
+// branch is tried in order from position 0; on first success writes the
+// branch's slots and returns its total. Always uses SIMD class verify (no
+// scan-loop register-pressure concern at this site). Branches must be
+// anchor-free; analyseLitChainAltGroups enforces that.
+func buildLitChainAltGroupsBody(altp *litChainAltPattern, branchCaps []*litChainCaptures) []byte {
+	var b []byte
+
+	const (
+		locPtr    byte = 0
+		locLen    byte = 1
+		locOutPtr byte = 2
+		locChunk  byte = 3
+		locTLo    byte = 4
+		locPow2   byte = 5
+	)
+
+	// 3 × v128 locals.
+	b = append(b, 0x01)
+	b = append(b, 0x03, 0x7B)
+
+	// Materialise pow2 once.
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+
+	for i, br := range altp.branches {
+		k := int32(len(br.literal))
+		total := k + int32(br.count)
+
+		b = append(b, 0x02, 0x40) // block $next_i
+
+		// Bounds: need at least `total` bytes; if len < total → next branch.
+		b = append(b, 0x20, locLen)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total)
+		b = append(b, 0x49)       // i32.lt_u
+		b = append(b, 0x0D, 0x00) // br_if $next_i
+
+		// Literal verify.
+		for kk, byt := range br.literal {
+			b = append(b, 0x20, locPtr)
+			b = append(b, 0x2D, 0x00)
+			b = utils.AppendULEB128(b, uint32(kk))
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(byt))
+			b = append(b, 0x47)       // i32.ne
+			b = append(b, 0x0D, 0x00) // br_if $next_i
+		}
+
+		// Load this branch's tlo into the shared local.
+		b = emitV128Const(b, br.tlo)
+		b = append(b, 0x21, locTLo)
+
+		// SIMD class verify chunks.
+		chunks := planLitChainChunks(int(k), br.count)
+		for ci, ch := range chunks {
+			b = append(b, 0x20, locPtr)
+			if ch.offset != 0 {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(ch.offset))
+				b = append(b, 0x6A)
+			}
+			b = append(b, 0xFD, 0x00, 0x00, 0x00)
+			b = append(b, 0x21, locChunk)
+
+			b = append(b, 0x20, locTLo)
+			b = append(b, 0x20, locChunk)
+			b = append(b, 0x41, 0x0F)
+			b = append(b, 0xFD, 0x0F)
+			b = append(b, 0xFD, 0x4E)
+			b = append(b, 0xFD, 0x0E)
+
+			b = append(b, 0x20, locPow2)
+			b = append(b, 0x20, locChunk)
+			b = append(b, 0x41, 0x04)
+			b = append(b, 0xFD, 0x6D)
+			b = append(b, 0xFD, 0x0E)
+
+			b = append(b, 0xFD, 0x4E)
+			b = append(b, 0x41, 0x00)
+			b = append(b, 0xFD, 0x0F)
+			b = append(b, 0xFD, 0x23)
+			b = append(b, 0xFD, 0x64)
+
+			if ch.laneMask != 0xFFFF {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(ch.laneMask))
+				b = append(b, 0x71)
+			}
+			if ci > 0 {
+				b = append(b, 0x72)
+			}
+		}
+		// bad_mask on stack — fail if non-zero.
+		b = append(b, 0x0D, 0x00) // br_if $next_i
+
+		// Success: write slots for this branch and return total.
+		b = emitLitChainGroupSlotWritesConstStart(b, branchCaps[i], locOutPtr, int(total))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, total)
+		b = append(b, 0x0F) // return
+
+		b = append(b, 0x0B) // end $next_i
+	}
+
+	// All branches failed.
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0B) // end function
+	return b
+}
+
+// appendLitChainAltGroupsCodeEntry appends a size-prefixed alt-groups body.
+func appendLitChainAltGroupsCodeEntry(cs []byte, altp *litChainAltPattern, branchCaps []*litChainCaptures) []byte {
+	body := buildLitChainAltGroupsBody(altp, branchCaps)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

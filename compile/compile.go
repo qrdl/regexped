@@ -243,8 +243,49 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// LikelyMatch early gate: counted-chain SIMD verifier (LIKELY.md Opt 2).
 	// Replaces the DFA match/find bodies entirely when the pattern matches the
 	// strict <literal><charclass>{N,N} shape or a strict alternation of such
-	// branches. Captures fall back to the DFA path (needGroups handled below
-	// as usual).
+	// branches.
+
+	// Capture path (groups_func / named_groups_func): if the pattern is a
+	// lit-chain shape with compile-time-resolvable capture offsets, emit the
+	// SIMD verify body with slot writes. Otherwise fall through to the
+	// standard TDFA/Backtracking pipeline below.
+	if buildOpts.LikelyMode == LikelyMatch && needGroups && !needMatch && !needFind {
+		if lcp, lcc, ok := analyseLitChainGroups(re.Pattern); ok {
+			p := &compiledPattern{
+				tableEnd:  tableBase,
+				numGroups: lcc.numGroups,
+				anchored:  true, // captureBody IS the exported groups function — no wrapper
+			}
+			p.groupsExport = re.GroupsFunc
+			if re.NamedGroupsFunc != "" {
+				p.namedGroupsExport = re.NamedGroupsFunc
+			}
+			parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
+			if err == nil {
+				p.groupNames = extractGroupNames(parsed)
+			}
+			p.captureBody = appendLitChainGroupsCodeEntry(nil, lcp, lcc)
+			return p, nil
+		}
+		if altp, branchCaps, ok := analyseLitChainAltGroups(re.Pattern); ok {
+			p := &compiledPattern{
+				tableEnd:  tableBase,
+				numGroups: branchCaps[0].numGroups,
+				anchored:  true,
+			}
+			p.groupsExport = re.GroupsFunc
+			if re.NamedGroupsFunc != "" {
+				p.namedGroupsExport = re.NamedGroupsFunc
+			}
+			parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
+			if err == nil {
+				p.groupNames = extractGroupNames(parsed)
+			}
+			p.captureBody = appendLitChainAltGroupsCodeEntry(nil, altp, branchCaps)
+			return p, nil
+		}
+	}
+
 	if buildOpts.LikelyMode == LikelyMatch && !needGroups {
 		if lcp, ok := analyseLitChain(re.Pattern); ok {
 			p := &compiledPattern{

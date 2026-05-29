@@ -36,8 +36,8 @@ import (
 
 const (
 	inputBase  = int32(0)
-	tableBase  = int64(131072) // page 2; pages 0-1 reserved for input
-	slotsBase  = int32(512)
+	slotsBase  = int32(65536) // page 1: keep clear of input (up to 64 KiB at offset 0)
+	tableBase  = int64(131072) // page 2; pages 0-1 reserved for input + slots
 	benchIters = 10_000
 	fuelBudget = uint64(10_000_000_000)
 )
@@ -50,11 +50,15 @@ type matchMode int
 const (
 	modeFind matchMode = iota
 	modeAnchored
+	modeGroups
 )
 
 func (m matchMode) String() string {
-	if m == modeAnchored {
+	switch m {
+	case modeAnchored:
 		return "anchored"
+	case modeGroups:
+		return "groups"
 	}
 	return "find"
 }
@@ -187,6 +191,41 @@ var tests = []testCase{
 			"/*\n * Copyright 2026 Example Corp.\n * Licensed under the Apache License, Version 2.0.\n */",
 			"/* TODO: replace with proper error handling once the new\n   error framework is merged into main branch */"),
 		nomatchInput: sourceWithBlockComments(false),
+	},
+	{
+		// Capture variant of secrets-github: whole-match named group around the
+		// lit-chain. Anchored captures (groups_func semantics). matchInput leads
+		// with the secret so the anchored call succeeds once per outer iteration.
+		// Gap A target: single-pattern, whole-match capture.
+		name:         "secrets-github-grouped",
+		pattern:      `(?P<key>ghp_[A-Za-z0-9]{36})`,
+		mode:         modeGroups,
+		notes:        "lit-chain with named whole-match capture — Gap A target",
+		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab" + configInput(nil),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Capture variant with multi-piece captures: literal and chain captured
+		// separately. Exercises the multi-group write path on the lit-chain.
+		// Gap A target: single-pattern, any captures.
+		name:         "secrets-aws-pieces",
+		pattern:      `(AKIA)([A-Z0-9]{16})`,
+		mode:         modeGroups,
+		notes:        "lit-chain with two captures (literal, chain) — Gap A target",
+		matchInput:   "AKIAIOSFODNN7EXAMPLE" + configInput(nil),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Capture variant of secrets-combined: strict alternation of two
+		// lit-chain branches, each wrapped in a named capture. Exercises the
+		// per-branch group layout with unmatched groups set to (-1, -1).
+		// Gap A target: strict alternation with captures.
+		name:         "secrets-combined-grouped",
+		pattern:      `(?P<aws>AKIA[A-Z0-9]{16})|(?P<ghp>ghp_[A-Za-z0-9]{36})`,
+		mode:         modeGroups,
+		notes:        "strict-alt of two captured lit-chains — Gap A target",
+		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab" + configInput(nil),
+		nomatchInput: configInput(nil),
 	},
 }
 
@@ -321,8 +360,9 @@ func spread(base string, items []string, sep string) string {
 // Bench shim WASM modules (reuse perftest's shim builders)
 
 var (
-	matchBenchShim = buildMatchBenchShim()
-	findBenchShim  = buildFindBenchShim()
+	matchBenchShim  = buildMatchBenchShim()
+	findBenchShim   = buildFindBenchShim()
+	groupsBenchShim = buildGroupsBenchShim()
 )
 
 // --------------------------------------------------------------------------
@@ -343,6 +383,8 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		re.MatchFunc = "match"
 	case modeFind:
 		re.FindFunc = "find"
+	case modeGroups:
+		re.GroupsFunc = "groups"
 	}
 	opts := compile.CompileOptions{LikelyMode: mode}
 	wasm, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true, opts)
@@ -368,6 +410,8 @@ func benchTime(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Eng
 		fnExport = "match"
 	case modeFind:
 		fnExport = "find"
+	case modeGroups:
+		fnExport = "groups"
 	}
 	mem := inst.GetExport(store, "memory").Memory()
 	rpdFn := inst.GetFunc(store, fnExport)
@@ -381,6 +425,8 @@ func benchTime(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Eng
 		shimBytes = matchBenchShim
 	case modeFind:
 		shimBytes = findBenchShim
+	case modeGroups:
+		shimBytes = groupsBenchShim
 	}
 	shimMod, err := wasmtime.NewModule(engine, shimBytes)
 	if err != nil {
@@ -407,11 +453,21 @@ func benchTime(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Eng
 	// 50 ms warmup.
 	warmupEnd := time.Now().Add(50 * time.Millisecond)
 	for time.Now().Before(warmupEnd) {
-		benchFn.Call(store, inputBase, inputLen, int32(benchIters)) //nolint:errcheck
+		if tc.mode == modeGroups {
+			benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters)) //nolint:errcheck
+		} else {
+			benchFn.Call(store, inputBase, inputLen, int32(benchIters)) //nolint:errcheck
+		}
 	}
 
-	if _, err := benchFn.Call(store, inputBase, inputLen, int32(benchIters)); err != nil {
-		return 0, fmt.Errorf("bench call: %w", err)
+	var benchErr error
+	if tc.mode == modeGroups {
+		_, benchErr = benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters))
+	} else {
+		_, benchErr = benchFn.Call(store, inputBase, inputLen, int32(benchIters))
+	}
+	if benchErr != nil {
+		return 0, fmt.Errorf("bench call: %w", benchErr)
 	}
 	shimBuf := shimMem.UnsafeData(store)
 	return computeStat(shimBuf[:timingsBytes], 50), nil
@@ -437,6 +493,8 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 		fnExport = "match"
 	case modeFind:
 		fnExport = "find"
+	case modeGroups:
+		fnExport = "groups"
 	}
 	mem := inst.GetExport(store, "memory").Memory()
 	fn := inst.GetFunc(store, fnExport)
@@ -445,8 +503,14 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 	inputLen := int32(len(input))
 
 	before, _ := store.GetFuel()
-	if _, err := fn.Call(store, inputBase, inputLen); err != nil {
-		return 0, err
+	var callErr error
+	if tc.mode == modeGroups {
+		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase)
+	} else {
+		_, callErr = fn.Call(store, inputBase, inputLen)
+	}
+	if callErr != nil {
+		return 0, callErr
 	}
 	after, _ := store.GetFuel()
 	return before - after, nil
