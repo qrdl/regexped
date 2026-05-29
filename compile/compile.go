@@ -388,8 +388,35 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			}
 			return p, nil
 		}
+		// Gap B: anchored match for strict lit-chain alternation.
+		if needMatch && !needFind {
+			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
+				p := &compiledPattern{
+					matchExport: re.MatchFunc,
+					anchored:    false,
+					tableEnd:    tableBase,
+				}
+				p.matchBody = appendLitChainAltMatchCodeEntry(nil, altp)
+				return p, nil
+			}
+			// Gap B lenient: anchored match for mixed lit-chain + DFA branches.
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern); ok {
+				layout := planLenAltLayout(lenAltp, tableBase)
+				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
+				p := &compiledPattern{
+					matchExport:  re.MatchFunc,
+					anchored:     false,
+					tableEnd:     layout.tableEnd,
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
+				}
+				p.matchBody = appendLenAltMatchCodeEntry(nil, lenAltp, layout, buildOpts.tableMemIdx)
+				return p, nil
+			}
+		}
+
 		// Phase 2: alternation of strict lit-chain branches. Find-mode only;
-		// anchored match is not yet specialised for alternation.
+		// anchored match is handled above.
 		if needFind && !needMatch {
 			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
 				layout := planLitChainAltLayout(altp, tableBase)

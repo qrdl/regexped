@@ -288,6 +288,43 @@ var tests = []testCase{
 		}),
 		nomatchInput: configInput(nil),
 	},
+	{
+		// Anchored full-input match on a strict lit-chain alternation. Today
+		// match_func on `lit1|lit2` falls through to DFA. Gap B should give us
+		// per-branch SIMD verify at pos 0 + strict len == K+N check.
+		name:         "secrets-combined-anchored",
+		pattern:      `AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}`,
+		mode:         modeAnchored,
+		notes:        "anchored match on strict-alt — Gap B target",
+		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+		nomatchInput: "this_is_not_a_secret_value_at_all_42_chr",
+	},
+	{
+		// Same as above but with per-branch \b anchors. At pos 0 the leading
+		// \b is satisfied (text-start is non-word, literal[0] is word); at pos
+		// K+N the trailing \b is satisfied (last char is word, text-end is
+		// non-word). Gap B should handle per-branch anchors in the alt path.
+		name:         "secrets-combined-bounded-anchored",
+		pattern:      `\bAKIA[A-Z0-9]{16}\b|\bghp_[A-Za-z0-9]{36}\b`,
+		mode:         modeAnchored,
+		notes:        "anchored match on strict-alt with \\b anchors — Gap B target",
+		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+		nomatchInput: "this_is_not_a_secret_value_at_all_42_chr",
+	},
+	{
+		// Lenient-alt anchored match: one lit-chain branch (ghp_) plus one
+		// DFA-shape branch (aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40}).
+		// Today match_func falls through to DFA. Gap B lenient should give
+		// lit-chain SIMD verify for the lit-chain branch + inline anchored
+		// DFA for the DFA branch, checking last_accept == len for full
+		// input consumption.
+		name:         "secrets-mixed-alt-anchored",
+		pattern:      `ghp_[A-Za-z0-9]{36}|aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40}`,
+		mode:         modeAnchored,
+		notes:        "anchored match on lenient-alt — Gap B lenient target",
+		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+		nomatchInput: "this_is_not_a_secret_value_at_all_42_chr",
+	},
 }
 
 // --------------------------------------------------------------------------
