@@ -3,6 +3,7 @@ package compile
 import (
 	"encoding/binary"
 	"regexp/syntax"
+	"sort"
 	"unicode"
 
 	"github.com/qrdl/regexped/internal/utils"
@@ -1377,6 +1378,26 @@ type dfaLayout struct {
 	// useHybridDispatch is true when the hybrid path is chosen: table-driven
 	// state transitions combined with compiled self-loop inner blocks.
 	useHybridDispatch bool
+
+	// Opt 1 — LikelyNoMatch dominant self-loop detection (Phase 1).
+	//
+	// dominantState (WASM ID) is the state where ≥ 240/256 byte classes
+	// transition back to itself. dominantExitBytes lists the bytes that do
+	// NOT self-loop (in sorted order). When the find body enters this state,
+	// a SIMD bulk-skip can consume the dominant self-loop in 16-byte strides
+	// until an exit byte is encountered.
+	//
+	// dominantState == 0 means no qualifying state was found (0 is the
+	// implicit dead state, never dominant). Phase 1 records a SINGLE
+	// dominant state per DFA; phase 3 will extend to multiple states.
+	//
+	// dominantIsMidAccept is true when dominantState appears in the find-mode
+	// mid-accept set (every byte while in this state is a valid match end).
+	// Required by phase 2 emission so the bulk-skip can update last_accept
+	// in one go.
+	dominantState       int32
+	dominantExitBytes   []byte
+	dominantIsMidAccept bool
 }
 
 // dfaTableBytes returns the upper-bound byte footprint of the runtime transition
@@ -1866,7 +1887,121 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	}
 	l.tableEnd = tableEnd
 
+	// Opt 1 — LikelyNoMatch dominant self-loop detection (Phase 1).
+	// Detection is unconditional and cheap (one pass over the WASM transition
+	// table); emission is gated separately at the call site.
+	detectDominantSelfLoop(l)
+
 	return l
+}
+
+// detectDominantSelfLoop scans the WASM-space transition table for a state
+// whose byte-class transitions self-loop on ≥ 240/256 bytes. Records the
+// first such state and its exit-byte set in `l.dominantState`/
+// `l.dominantExitBytes`. Phase 1 caps the recorded exit set at ≤ 4 bytes
+// (the simple SIMD bulk-skip path) — larger sets are detected but not
+// recorded yet.
+func detectDominantSelfLoop(l *dfaLayout) {
+	const threshold = 240
+	const maxExitBytes = 4
+
+	if l.numWASM <= 1 {
+		return
+	}
+
+	// Cell width and stride.
+	cellsPerState := 256
+	if l.useCompression {
+		cellsPerState = l.numClasses
+	}
+
+	// Byte count per class (needed when compression is on; otherwise 1:1).
+	var classByteCount [256]int
+	if l.useCompression {
+		for b := 0; b < 256; b++ {
+			classByteCount[l.classMap[b]]++
+		}
+	}
+
+	// Reader for the table cell (u8 or u16) at a given (state, classOrByte).
+	readCell := func(state, idx int) int32 {
+		// When row dedup is on, map state → row index first.
+		row := state
+		if l.useRowDedup {
+			row = int(l.rowMapBytes[state])
+		}
+		off := row*cellsPerState + idx
+		if l.useU8 {
+			return int32(l.tableBytes[off])
+		}
+		// u16, little-endian.
+		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
+	}
+
+	for state := int32(1); state < int32(l.numWASM); state++ {
+		selfBytes := 0
+		var exitBytes []byte
+		hitCap := false
+		for c := 0; c < cellsPerState; c++ {
+			next := readCell(int(state), c)
+			bytesInClass := 1
+			if l.useCompression {
+				bytesInClass = classByteCount[c]
+			}
+			if next == state {
+				selfBytes += bytesInClass
+			} else {
+				if l.useCompression {
+					for b := 0; b < 256; b++ {
+						if int(l.classMap[b]) == c {
+							exitBytes = append(exitBytes, byte(b))
+							if len(exitBytes) > maxExitBytes {
+								hitCap = true
+								break
+							}
+						}
+					}
+					if hitCap {
+						break
+					}
+				} else {
+					exitBytes = append(exitBytes, byte(c))
+					if len(exitBytes) > maxExitBytes {
+						hitCap = true
+						break
+					}
+				}
+			}
+		}
+		if selfBytes < threshold || hitCap {
+			continue
+		}
+		// Sort exit bytes (stable across runs).
+		sort.Slice(exitBytes, func(i, j int) bool { return exitBytes[i] < exitBytes[j] })
+		l.dominantState = state
+		l.dominantExitBytes = exitBytes
+		// Mid-accept lookup: the midAcceptBytes side table (if populated) holds
+		// a non-zero byte for each accepting state. Empty/nil ⇒ no mid-accept
+		// state in this DFA.
+		if int(state) < len(l.midAcceptBytes) && l.midAcceptBytes[state] != 0 {
+			l.dominantIsMidAccept = true
+			// Opt 1 — piggyback on midAccept[state] lookup. Encode "is
+			// dominant" in the value itself: 0 = none, 1 = mid-accept,
+			// 2 = mid-accept + dominant self-loop. The find-mode hot loop
+			// already loads this byte to update last_accept; the emitter
+			// reuses the cached value to gate the SIMD bulk-skip without
+			// an extra `local.get state + i32.const K + i32.eq` chain.
+			//
+			// Value 2 is still truthy, so the existing midAccept branch
+			// (`if midAccept[state]:`) continues to work in non-LNM
+			// modes — the extra byte value is harmless when no emitter
+			// consults it.
+			if len(exitBytes) == 1 {
+				l.midAcceptBytes[state] = 2
+			}
+		}
+		return
+	}
 }
 
 // dfaDataSegments builds the raw data-section payload (count byte + segments)
@@ -2556,7 +2691,8 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0,
 			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
-			tableMemIdx)
+			tableMemIdx,
+			l.dominantState, l.dominantExitBytes, l.dominantIsMidAccept)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -2711,6 +2847,110 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 	b = append(b, 0x20, posLocal)              // local.get pos
 	b = append(b, 0x0F)                        // return
 	b = append(b, 0x0B)                        // end if
+	return b
+}
+
+// emitDominantBulkSkip emits the LikelyNoMatch SIMD bulk-skip block for a
+// state with a single-byte exit set. Inserts INSIDE the find-mode inner
+// scan loop, AFTER the per-byte transition and midAccept update, BEFORE
+// pos++.
+//
+// Contract:
+//   - Caller MUST guard the call so it only runs when state ==
+//     dominantState. Option 1 emission piggybacks on the midAccept[state]
+//     lookup (which is loaded anyway for `last_accept`): the dominant
+//     state's `midAcceptBytes` value is encoded as 2 (mid-accept + dominant)
+//     and the caller branches on it via the cached value.
+//   - Requires the dominant state to be mid-accepting: every byte while
+//     in it is a valid match end. Detection sets the encoding only when
+//     this holds.
+//   - Single-byte exit (`len(exitBytes) == 1`); detection-checked.
+//   - Uses 1 i32 scratch local (`tmpLocal`) and 1 v128 scratch (`chunkLocal`),
+//     both must be safe to clobber at this point (e.g. the Teddy-scan-phase
+//     locals which are unused inside the DFA scan loop).
+//
+// Layout (caller has already gated on state being dominant; `pos` is the
+// position of the byte just consumed):
+//
+//   block $bulk_done:
+//     loop $bulk_outer:
+//       if pos + 17 > len: br $bulk_done   // not enough room for 16-byte SIMD
+//       chunk = v128.load(ptr + pos + 1)
+//       m = i8x16.bitmask(i8x16.eq(chunk, splat(exitByte)))
+//       if m == 0:
+//         pos += 16
+//         br $bulk_outer  // continue loop
+//       else:
+//         pos += i32.ctz(m)
+//         last_accept = pos + 1
+//         br $bulk_done
+//     end loop
+//   end block
+//
+// After the block, pos is positioned so the next pos++ takes execution
+// past the self-loop bytes and onto the first exit byte (which the next
+// scan iteration will transition on).
+func emitDominantBulkSkip(b []byte, exitByte byte,
+	posLocal, lenLocal, lastAcceptLocal,
+	ptrLocal, chunkLocal, tmpLocal byte) []byte {
+
+	// block $bulk_done
+	b = append(b, 0x02, 0x40)
+	// loop $bulk_outer
+	b = append(b, 0x03, 0x40)
+
+	// if pos + 17 > len: br $bulk_done (depth 1)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x41, 0x11) // i32.const 17
+	b = append(b, 0x6A)
+	b = append(b, 0x20, lenLocal)
+	b = append(b, 0x4B)       // i32.gt_u
+	b = append(b, 0x0D, 0x01) // br_if $bulk_done
+
+	// chunk = v128.load(ptr + pos + 1)
+	b = append(b, 0x20, ptrLocal)
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x6A)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0xFD, 0x00, 0x00, 0x00)
+	b = append(b, 0x21, chunkLocal)
+
+	// m = i8x16.bitmask(i8x16.eq(chunk, splat(exitByte)))
+	b = append(b, 0x20, chunkLocal)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(exitByte))
+	b = append(b, 0xFD, 0x0F) // i8x16.splat
+	b = append(b, 0xFD, 0x23) // i8x16.eq
+	b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+
+	// local.tee tmpLocal (keep mask on stack)
+	b = append(b, 0x22, tmpLocal)
+	b = append(b, 0x45)       // i32.eqz: 1 if m == 0
+	b = append(b, 0x04, 0x40) // if (void) — "no exit found in this chunk"
+	//   pos += 16
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x41, 0x10) // i32.const 16
+	b = append(b, 0x6A)
+	b = append(b, 0x21, posLocal)
+	//   continue loop: br $bulk_outer (depth 1 from inside if)
+	b = append(b, 0x0C, 0x01)
+	b = append(b, 0x05) // else
+	//   pos += ctz(m); last_accept = pos + 1; break to $bulk_done
+	b = append(b, 0x20, tmpLocal)
+	b = append(b, 0x68)           // i32.ctz
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x6A)           // i32.add
+	b = append(b, 0x22, posLocal) // local.tee posLocal (keep on stack)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A) // pos + 1
+	b = append(b, 0x21, lastAcceptLocal)
+	//   br $bulk_done (depth 2 from inside if-else)
+	b = append(b, 0x0C, 0x02)
+	b = append(b, 0x0B) // end if
+
+	b = append(b, 0x0B) // end loop $bulk_outer
+	b = append(b, 0x0B) // end block $bulk_done
 	return b
 }
 
@@ -3895,7 +4135,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantState int32, dominantExitBytes []byte, dominantIsMidAccept bool) []byte {
 	var b []byte
 
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
@@ -4370,17 +4610,41 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x0B) // end if
 
 		// if midAccept[state]: last_accept = pos + 1
+		// Opt 1 piggyback: when LNM emission is active, the loaded midAccept
+		// byte carries value 2 for the dominant state (1 for other accepting
+		// states). We tee it into local 6 (class, free post-transition) so
+		// the bulk-skip branch can be nested inside this already-taken
+		// midAccept branch without a fresh `state == K` test in the hot
+		// loop.
+		emitOpt1 := !useMandatoryLit && dominantState > 0 && dominantIsMidAccept &&
+			len(dominantExitBytes) == 1
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, midAcceptOff)
 		b = append(b, 0x20, 0x02)             // local.get state
 		b = append(b, 0x6A)                   // i32.add
 		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-		b = append(b, 0x04, 0x40)             // if (void)
-		b = append(b, 0x20, 0x03)             // local.get pos
-		b = append(b, 0x41, 0x01)             // i32.const 1
-		b = append(b, 0x6A)                   // i32.add
-		b = append(b, 0x21, 0x05)             // local.set last_accept
-		b = append(b, 0x0B)                   // end if
+		if emitOpt1 {
+			b = append(b, 0x22, 0x06) // local.tee class — cache midAccept value
+		}
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, 0x03) // local.get pos
+		b = append(b, 0x41, 0x01) // i32.const 1
+		b = append(b, 0x6A)       // i32.add
+		b = append(b, 0x21, 0x05) // local.set last_accept
+		if emitOpt1 {
+			// Nested bulk-skip gate: if cached midAccept value == 2, the
+			// state is the dominant self-loop state. Otherwise skip.
+			b = append(b, 0x20, 0x06)  // local.get class (cached midAccept)
+			b = append(b, 0x41, 0x02)  // i32.const 2
+			b = append(b, 0x46)        // i32.eq
+			b = append(b, 0x04, 0x40)  // if (void)
+			b = emitDominantBulkSkip(b, dominantExitBytes[0],
+				/*pos=*/ 0x03, /*len=*/ 0x01,
+				/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
+				/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ 0x06)
+			b = append(b, 0x0B) // end if (bulk-skip gate)
+		}
+		b = append(b, 0x0B) // end if (midAccept)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
@@ -4460,17 +4724,36 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x0B) // end if
 
 		// if midAccept[state]: last_accept = pos + 1
+		// Opt 1 piggyback: cache midAccept byte in simdMaskLocal (free
+		// post-Teddy-scan) and nest the bulk-skip gate inside the
+		// already-taken midAccept branch.
+		emitOpt1 := !useMandatoryLit && dominantState > 0 && dominantIsMidAccept &&
+			len(dominantExitBytes) == 1
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, midAcceptOff)
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x6A)
 		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-		b = append(b, 0x04, 0x40)             // if (void)
-		b = append(b, 0x20, 0x03)             // local.get pos
+		if emitOpt1 {
+			b = append(b, 0x22, simdMaskLocal) // local.tee — cache midAccept value
+		}
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, 0x03) // local.get pos
 		b = append(b, 0x41, 0x01)
 		b = append(b, 0x6A)
 		b = append(b, 0x21, 0x05) // local.set last_accept
-		b = append(b, 0x0B)       // end if
+		if emitOpt1 {
+			b = append(b, 0x20, simdMaskLocal) // local.get cached midAccept
+			b = append(b, 0x41, 0x02)          // i32.const 2
+			b = append(b, 0x46)                // i32.eq
+			b = append(b, 0x04, 0x40)          // if (void)
+			b = emitDominantBulkSkip(b, dominantExitBytes[0],
+				/*pos=*/ 0x03, /*len=*/ 0x01,
+				/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
+				/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ simdMaskLocal)
+			b = append(b, 0x0B) // end if (bulk-skip gate)
+		}
+		b = append(b, 0x0B) // end if (midAccept)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 

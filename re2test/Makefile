@@ -1,4 +1,4 @@
-.PHONY: test exhaustive custom adjusted sets likelymatch clean
+.PHONY: test exhaustive custom adjusted sets likelymatch likelynomatch clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -36,7 +36,16 @@ likelymatch: $(ADJUSTED)
 	go run . --likelymatch --validate-groups $(ADJUSTED)
 	go run . --likelymatch --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack likelymatch sets
+# Run every test under LikelyMode=LikelyNoMatch. Patterns with a dominant
+# self-loop (≥240/256 byte classes back to itself, ≤4 exit bytes,
+# mid-accepting) take the Opt 1 SIMD bulk-skip path; others fall through to
+# the standard DFA. Confirms LikelyNoMatch correctness across the full corpus.
+likelynomatch: $(ADJUSTED)
+	go run . --likelynomatch $(TESTDATA)
+	go run . --likelynomatch --validate-groups $(ADJUSTED)
+	go run . --likelynomatch --validate-groups $(CUSTOM)
+
+test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch sets
 
 sets: $(TESTDATA)
 	go run . --sets $(TESTDATA)

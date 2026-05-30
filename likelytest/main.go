@@ -170,6 +170,18 @@ var tests = []testCase{
 		nomatchInput: sourceInput(false),
 	},
 	{
+		// LNM amplifier: ~50 KB with a handful of very long comment lines.
+		// Each `//` hit enters the [^\n]+ self-loop state and must scan
+		// hundreds of bytes before the next \n. Bulk-skip should turn each
+		// in-comment scan from per-byte DFA into 16-byte SIMD strides.
+		name:         "comment-line-large",
+		pattern:      `//[^\n]+`,
+		mode:         modeFind,
+		notes:        "long-line comments — Opt 1 bulk-skip amplifier",
+		matchInput:   longCommentLineInput(true),
+		nomatchInput: longCommentLineInput(false),
+	},
+	{
 		// URL find: [^\s]+ self-loop after https?://. Slightly less dominant
 		// than [^\n]+ but still ~250/256 transitions self-loop.
 		name:         "url-suffix",
@@ -485,6 +497,39 @@ func sourceInput(withComments bool) string {
 		"// release pooled connection back to the manager",
 	}
 	return spread(base, comments, "\n")
+}
+
+// longCommentLineInput returns ~50 KB of source-like text. When withComments
+// is true, the buffer contains a handful of VERY long single-line `// …`
+// comments (~5–10 KB each, no embedded newlines) — designed to amplify
+// the [^\n]+ bulk-skip path. When false, no `//` substring appears.
+func longCommentLineInput(withComments bool) string {
+	const targetSize = 50 * 1024
+	if !withComments {
+		// Plain text without "//" anywhere.
+		var b []byte
+		filler := []byte("The quick brown fox jumps over the lazy dog. ")
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	// Five very-long comment lines, each ~9 KB of non-newline characters.
+	var b []byte
+	for i := 0; i < 5; i++ {
+		b = append(b, '/', '/')
+		filler := []byte(" lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua")
+		for j := 0; j < 75; j++ { // ~9 KB per comment
+			b = append(b, filler...)
+		}
+		b = append(b, '\n')
+	}
+	// Pad with non-`//` filler to reach target.
+	filler := []byte("plain text with no slashes at all and certainly nothing resembling a comment marker here\n")
+	for len(b) < targetSize {
+		b = append(b, filler...)
+	}
+	return string(b[:targetSize])
 }
 
 // sourceWithBlockComments returns ~10KB of C-style source code with optional

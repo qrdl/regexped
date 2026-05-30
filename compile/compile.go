@@ -815,6 +815,16 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				}
 			}
 			if p.litAnchorBackScanBody == nil {
+				// Opt 1 — LikelyNoMatch dominant-self-loop bulk-skip emission
+				// is gated on the LikelyNoMatch mode. Detection always runs
+				// (cheap); zero out the layout's dominant-state field when
+				// LNM isn't selected so the emitter falls back to the
+				// classic per-byte DFA loop.
+				if buildOpts.LikelyMode != LikelyNoMatch {
+					l.dominantState = 0
+					l.dominantExitBytes = nil
+					l.dominantIsMidAccept = false
+				}
 				p.findBody = appendFindCodeEntry(nil, l, table, patMandLit, buildOpts.tableMemIdx)
 			}
 
