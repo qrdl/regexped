@@ -377,6 +377,56 @@ var tests = []testCase{
 		matchInput:   configInput([]string{"secret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
 		nomatchInput: configInput(nil),
 	},
+	{
+		// Gap E: mixed prefix shape `<class>{M}<literal><class>{N}`. Today
+		// detection requires literal at position 0 — patterns like this fall
+		// through to DFA. After Gap E: scan for literal, back up M bytes,
+		// verify class-prefix, verify class-suffix.
+		name:    "gap-e-find",
+		pattern: `[0-9]{8}ghp_[A-Za-z0-9]{36}`,
+		mode:    modeFind,
+		notes:   "class prefix + literal + class suffix — Gap E target",
+		matchInput: configInput([]string{
+			"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
+		}),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Gap E anchored: input length must equal M+K+N exactly. matchInput
+		// is exactly 48 bytes (8+4+36).
+		name:         "gap-e-anchored",
+		pattern:      `[0-9]{8}ghp_[A-Za-z0-9]{36}`,
+		mode:         modeAnchored,
+		notes:        "anchored mixed-prefix shape — Gap E anchored target",
+		matchInput:   "12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+		nomatchInput: "12345678not_a_secret_at_all_value_or_anything_x",
+	},
+	{
+		// Gap E groups: captures wrap class-prefix and class-suffix pieces.
+		// Group offsets must account for the prefix (group d at 0..8, group
+		// k at 12..48 after the K=4 ghp_ literal).
+		name:    "gap-e-groups",
+		pattern: `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
+		mode:    modeGroups,
+		notes:   "mixed-prefix shape with captures — Gap E groups target",
+		matchInput: configInput([]string{
+			"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
+		}),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Gap E strict-alt: alternation of two mixed-prefix branches. Both
+		// branches have a class prefix + literal + class suffix. Different
+		// literals and different prefix classes.
+		name:    "gap-e-strict-alt-find",
+		pattern: `[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`,
+		mode:    modeFind,
+		notes:   "strict-alt of mixed-prefix shapes — Gap E strict-alt target",
+		matchInput: configInput([]string{
+			"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
+		}),
+		nomatchInput: configInput(nil),
+	},
 }
 
 // --------------------------------------------------------------------------

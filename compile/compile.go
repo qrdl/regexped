@@ -399,6 +399,22 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	if buildOpts.LikelyMode == LikelyMatch && !needGroups {
+		// Gap E: mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
+		if lcp, ok := analyseLitChainPrefixed(re.Pattern); ok {
+			p := &compiledPattern{
+				matchExport: re.MatchFunc,
+				findExport:  re.FindFunc,
+				anchored:    false,
+				tableEnd:    tableBase,
+			}
+			if needMatch {
+				p.matchBody = appendLitChainPrefixedMatchCodeEntry(nil, lcp)
+			}
+			if needFind {
+				p.findBody = appendLitChainPrefixedFindCodeEntry(nil, lcp, buildOpts.tableMemIdx)
+			}
+			return p, nil
+		}
 		if lcp, ok := analyseLitChain(re.Pattern); ok {
 			p := &compiledPattern{
 				matchExport: re.MatchFunc,
@@ -468,6 +484,23 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					dataSegCount: segCount,
 				}
 				p.matchBody = appendLenAltMatchCodeEntry(nil, lenAltp, layout, buildOpts.tableMemIdx)
+				return p, nil
+			}
+		}
+
+		// Gap E: strict alt of mixed-prefix branches.
+		if needFind && !needMatch {
+			if altp, ok := analyseLitChainAltPrefixed(re.Pattern); ok {
+				layout := planLitChainAltLayout(altp, tableBase)
+				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
+				p := &compiledPattern{
+					findExport:   re.FindFunc,
+					anchored:     false,
+					findBody:     appendLitChainAltPrefixedFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx),
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
+					tableEnd:     layout.tableEnd,
+				}
 				return p, nil
 			}
 		}

@@ -4604,27 +4604,40 @@ type litChainPattern struct {
 	count       int      // N — minimum chain length (N >= 1, K+N >= 16)
 	countMax    int      // M — maximum chain length (M >= N). Equals count for {N,N}.
 	greedy      bool     // false for `{N,M}?`; only matters when count < countMax
-	startAnchor anchorType
-	endAnchor   anchorType
+	// Gap E: optional class prefix `<class>{prefixCount}` BEFORE the literal.
+	prefixCount  int      // 0 = no prefix (classic shape)
+	prefixBitmap [32]byte // scalar prefix verify
+	prefixTlo    [16]byte // SIMD prefix verify
+	startAnchor  anchorType
+	endAnchor    anchorType
 }
 
 // litChainBranchInfo is the analysis result for a single lit-chain branch.
 // Returned by analyseLitChainBranch *without* applying the N≥24 single-pattern
 // gate — callers decide per-context (single-pattern gate vs. per-branch gate
 // inside an alternation).
+//
+// Gap E: optional class prefix `<class>{prefixCount}` BEFORE the literal.
+// prefixCount == 0 → original `<literal><class>{N,N}` shape.
+// prefixCount > 0  → mixed-prefix shape `<class>{prefixCount}<literal><class>{N,N}`.
 type litChainBranchInfo struct {
 	literal  []byte
-	bitmap   [32]byte // 256-bit byte-class bitmap (for scalar verify)
-	tlo      [16]byte // nibble table (for SIMD verify)
+	bitmap   [32]byte // 256-bit byte-class bitmap (for scalar SUFFIX verify)
+	tlo      [16]byte // nibble table (for SIMD SUFFIX verify)
 	count    int      // N (min)
 	countMax int      // M (max); equals count for {N,N}
 	greedy   bool     // false for `{N,M}?`
 
+	// Gap E: prefix-class fields. prefixCount == 0 means no prefix.
+	prefixCount  int      // M_prefix (fixed; ranges deferred)
+	prefixBitmap [32]byte // 256-bit byte-class bitmap (scalar prefix verify)
+	prefixTlo    [16]byte // nibble table (SIMD prefix verify)
+
 	// Optional anchors. `(?m)^` / `(?m)$` (multiline) are NOT supported and
 	// cause analyseLitChainBranch to reject. `\A`/`\z` and (default-Perl) `^`/`$`
 	// both map to anchorBeginText/anchorEndText.
-	startAnchor anchorType // anchor BEFORE the literal
-	endAnchor   anchorType // anchor AFTER the class chain
+	startAnchor anchorType // anchor BEFORE the prefix (or literal if prefixCount==0)
+	endAnchor   anchorType // anchor AFTER the suffix class chain
 }
 
 // anchorType represents the kind of boundary anchor attached to a lit-chain branch.
@@ -4654,7 +4667,7 @@ func analyseLitChain(pattern string) (*litChainPattern, bool) {
 
 func analyseLitChainRe(re *syntax.Regexp) (*litChainPattern, bool) {
 	info, ok := analyseLitChainBranch(re)
-	if !ok {
+	if !ok || info.prefixCount > 0 {
 		return nil, false
 	}
 	// Existing {N,N} emission only — ranges (countMax > count) handled by the
@@ -4692,8 +4705,12 @@ type litChainAltBranch struct {
 	countMax    int      // M (max); equals count for {N,N}
 	greedy      bool     // false for `{N,M}?`
 	useSIMD     bool     // N >= 24 → SIMD chunks; else scalar byte-by-byte
-	startAnchor anchorType
-	endAnchor   anchorType
+	// Gap E: optional class prefix.
+	prefixCount  int
+	prefixBitmap [32]byte
+	prefixTlo    [16]byte
+	startAnchor  anchorType
+	endAnchor    anchorType
 }
 
 // litChainAltPattern is an alternation of lit-chain branches recognised by
@@ -4716,7 +4733,7 @@ func analyseLitChainRange(pattern string, allowNonGreedy bool) (*litChainPattern
 		return nil, false
 	}
 	info, ok := analyseLitChainBranch(re)
-	if !ok {
+	if !ok || info.prefixCount > 0 {
 		return nil, false
 	}
 	if info.countMax <= info.count {
@@ -4759,7 +4776,7 @@ func analyseLitChainAltRange(pattern string, allowNonGreedy bool) (*litChainAltP
 	hasRange := false
 	for _, sub := range re.Sub {
 		info, ok := analyseLitChainBranch(sub)
-		if !ok {
+		if !ok || info.prefixCount > 0 {
 			return nil, false
 		}
 		if !info.greedy && !allowNonGreedy {
@@ -4786,6 +4803,56 @@ func analyseLitChainAltRange(pattern string, allowNonGreedy bool) (*litChainAltP
 	return &litChainAltPattern{branches: branches}, true
 }
 
+// analyseLitChainAltPrefixed parses pattern as a strict alternation where
+// every branch matches Gap E mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
+// All branches must have prefixCount > 0 (otherwise the classic strict-alt
+// path handles it).
+func analyseLitChainAltPrefixed(pattern string) (*litChainAltPattern, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpAlternate || len(re.Sub) < 2 {
+		return nil, false
+	}
+	branches := make([]litChainAltBranch, 0, len(re.Sub))
+	allPrefixed := true
+	for _, sub := range re.Sub {
+		info, ok := analyseLitChainBranch(sub)
+		if !ok {
+			return nil, false
+		}
+		if info.countMax != info.count {
+			return nil, false // ranges not supported with prefix yet
+		}
+		if info.prefixCount == 0 {
+			allPrefixed = false
+			break
+		}
+		branches = append(branches, litChainAltBranch{
+			literal:      info.literal,
+			bitmap:       info.bitmap,
+			tlo:          info.tlo,
+			count:        info.count,
+			countMax:     info.countMax,
+			greedy:       info.greedy,
+			useSIMD:      info.count >= 24,
+			prefixCount:  info.prefixCount,
+			prefixBitmap: info.prefixBitmap,
+			prefixTlo:    info.prefixTlo,
+			startAnchor:  info.startAnchor,
+			endAnchor:    info.endAnchor,
+		})
+	}
+	if !allPrefixed || len(branches) < 2 {
+		return nil, false
+	}
+	return &litChainAltPattern{branches: branches}, true
+}
+
 // analyseLitChainAlt parses pattern and returns a litChainAltPattern when the
 // pattern is an OpAlternate of two or more <literal><class>{N,N} branches
 // (strict mode — every branch must qualify). Returns nil otherwise.
@@ -4803,7 +4870,7 @@ func analyseLitChainAlt(pattern string) (*litChainAltPattern, bool) {
 	branches := make([]litChainAltBranch, 0, len(re.Sub))
 	for _, sub := range re.Sub {
 		info, ok := analyseLitChainBranch(sub)
-		if !ok {
+		if !ok || info.prefixCount > 0 {
 			return nil, false // strict: every branch must qualify
 		}
 		if info.countMax != info.count {
@@ -4882,10 +4949,26 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 		subs[0].Sub[0].Op == syntax.OpConcat {
 		subs = subs[0].Sub[0].Sub
 	}
-	if len(subs) != 2 {
+	// Accepted shapes (after anchor strip + capture unwrap):
+	//   2 elements: [OpLiteral, OpRepeat(class)]                    — classic lit-chain
+	//   3 elements: [OpRepeat(class), OpLiteral, OpRepeat(class)]   — Gap E mixed-prefix
+	if len(subs) != 2 && len(subs) != 3 {
 		return nil, false
 	}
-	litNode := subs[0]
+	hasPrefix := len(subs) == 3
+	var prefixNode *syntax.Regexp
+	var litIdx int
+	if hasPrefix {
+		prefixNode = subs[0]
+		for prefixNode.Op == syntax.OpCapture && len(prefixNode.Sub) == 1 {
+			prefixNode = prefixNode.Sub[0]
+		}
+		if prefixNode.Op != syntax.OpRepeat {
+			return nil, false
+		}
+		litIdx = 1
+	}
+	litNode := subs[litIdx]
 	for litNode.Op == syntax.OpCapture && len(litNode.Sub) == 1 {
 		litNode = litNode.Sub[0]
 	}
@@ -4906,7 +4989,7 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 		return nil, false
 	}
 
-	chainNode := subs[1]
+	chainNode := subs[litIdx+1]
 	for chainNode.Op == syntax.OpCapture && len(chainNode.Sub) == 1 {
 		chainNode = chainNode.Sub[0]
 	}
@@ -4977,7 +5060,7 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 		}
 	}
 
-	return &litChainBranchInfo{
+	info := &litChainBranchInfo{
 		literal:     literal,
 		bitmap:      bitmap,
 		tlo:         tlo,
@@ -4986,7 +5069,75 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 		greedy:      greedy,
 		startAnchor: startAnchor,
 		endAnchor:   endAnchor,
-	}, true
+	}
+
+	// Gap E: parse the prefix class chain if present.
+	if hasPrefix {
+		// Fixed count `{M,M}` only for now; ranges deferred.
+		if prefixNode.Min != prefixNode.Max || prefixNode.Min < 1 {
+			return nil, false
+		}
+		// Non-greedy on the prefix is degenerate when Min==Max; accept either.
+		if len(prefixNode.Sub) != 1 {
+			return nil, false
+		}
+		prefChild := prefixNode.Sub[0]
+		for prefChild.Op == syntax.OpCapture && len(prefChild.Sub) == 1 {
+			prefChild = prefChild.Sub[0]
+		}
+		var prefixBitmap [32]byte
+		switch prefChild.Op {
+		case syntax.OpCharClass:
+			for i := 0; i+1 < len(prefChild.Rune); i += 2 {
+				lo, hi := prefChild.Rune[i], prefChild.Rune[i+1]
+				if lo > 127 || hi > 127 {
+					return nil, false
+				}
+				for r := lo; r <= hi; r++ {
+					prefixBitmap[r>>3] |= 1 << uint(r&7)
+				}
+			}
+		case syntax.OpLiteral:
+			if len(prefChild.Rune) != 1 || prefChild.Rune[0] > 127 {
+				return nil, false
+			}
+			r := prefChild.Rune[0]
+			prefixBitmap[r>>3] |= 1 << uint(r&7)
+		default:
+			return nil, false
+		}
+		emptyP := true
+		for _, b := range prefixBitmap {
+			if b != 0 {
+				emptyP = false
+				break
+			}
+		}
+		if emptyP {
+			return nil, false
+		}
+		for i := 16; i < 32; i++ {
+			if prefixBitmap[i] != 0 {
+				return nil, false
+			}
+		}
+		// Prefix length M: keep small enough that a single SIMD chunk verifies
+		// it. M ≤ 16 is the simplest case.
+		if prefixNode.Min > 16 {
+			return nil, false
+		}
+		var prefixTlo [16]byte
+		for b := 0; b < 128; b++ {
+			if prefixBitmap[b>>3]&(1<<uint(b&7)) != 0 {
+				prefixTlo[b&0xF] |= 1 << uint(b>>4)
+			}
+		}
+		info.prefixCount = prefixNode.Min
+		info.prefixBitmap = prefixBitmap
+		info.prefixTlo = prefixTlo
+	}
+
+	return info, true
 }
 
 // isWordByte reports whether byte b is in [A-Za-z0-9_] (Perl \w semantics for ASCII).
@@ -5508,6 +5659,82 @@ func emitLitChainAltLitBranchBodyRange(b []byte, br litChainAltBranch,
 	return b
 }
 
+// emitLitChainAltLitBranchBodyPrefixed is the Gap E counterpart of
+// emitLitChainAltLitBranchBody for mixed-prefix branches `<class>{M}<literal><class>{N}`.
+// Caller pre-loads VerifyPow2; this function loads br.prefixTlo for prefix
+// verify, then br.tlo for suffix verify, into locVerifyTlo.
+func emitLitChainAltLitBranchBodyPrefixed(b []byte, br litChainAltBranch,
+	branchBitmapOff int32, locals litChainBranchLocals,
+	tableMemIdx int) []byte {
+
+	const failDepth byte = 0
+	k := int32(len(br.literal))
+	m := int32(br.prefixCount)
+	n := int32(br.count)
+	suffixEnd := k + n
+
+	// First-byte dispatch (literal[0] at attempt_start).
+	b = append(b, 0x20, locals.Ptr)
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(br.literal[0]))
+	b = append(b, 0x47)
+	b = append(b, 0x0D, failDepth)
+
+	// Bounds: attempt_start < M → fail (no prefix room).
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, m)
+	b = append(b, 0x49)
+	b = append(b, 0x0D, failDepth)
+
+	// Bounds: attempt_start + K + N > len → fail.
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, suffixEnd)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locals.Len)
+	b = append(b, 0x4B)
+	b = append(b, 0x0D, failDepth)
+
+	// Literal verify (bytes 1..K-1; byte 0 already covered).
+	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
+
+	// Prefix verify: load br.prefixTlo, single SIMD chunk at attempt_start-M.
+	b = emitV128Const(b, br.prefixTlo)
+	b = append(b, 0x21, locals.VerifyTlo)
+	b = emitPrefixClassVerify(b, int(m), locals.Ptr, locals.AttemptStart, locals.Chunk, locals.VerifyTlo, locals.VerifyPow2)
+
+	// Suffix verify: load br.tlo, multi-chunk via emitLitChainClassVerify.
+	b = emitV128Const(b, br.tlo)
+	b = append(b, 0x21, locals.VerifyTlo)
+	lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count}
+	b = emitLitChainClassVerify(b, lcp, locals.Ptr, locals.AttemptStart, locals.Chunk, locals.VerifyTlo, locals.VerifyPow2)
+
+	// OR prefix and suffix bad-masks.
+	b = append(b, 0x72) // i32.or
+	b = append(b, 0x0D, failDepth)
+
+	// Success — return packed (attempt_start - M, attempt_start + K + N).
+	// Compute end into locals.ScalarIdx as a scratch (reused; alt has it).
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, m)
+	b = append(b, 0x6B) // i32.sub → fullStart
+	b = append(b, 0x21, locals.ScalarIdx)
+
+	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, suffixEnd)
+	b = append(b, 0x6A) // i32.add → end
+	b = append(b, 0x21, locals.SimdMask)
+
+	b = emitReturnPackedI64FromLocal(b, locals.ScalarIdx, locals.SimdMask)
+	return b
+}
+
 // emitLitChainAltLitBranchGroupsBody is the groups-mode counterpart of
 // emitLitChainAltLitBranchBody. Same per-branch verify; on success writes
 // captures via slot writes (absolute positions) and returns end position
@@ -5684,6 +5911,311 @@ func emitLitChainClassVerify(b []byte, lcp *litChainPattern,
 	}
 	return b
 }
+
+// emitPrefixClassVerify emits the SIMD class verify for a `<class>{M}`
+// prefix (M ≤ 16). Loads 16 bytes from `ptr + base - M`, checks the first
+// M lanes against the prefix nibble table, leaves prefix bad_mask (i32) on
+// stack. Lanes ≥ M are masked off.
+//
+// `base` is the i32 local holding the literal-hit position (attempt_start
+// in the find body). The full-match start is at `base - M`.
+func emitPrefixClassVerify(b []byte, m int,
+	locPtr, locBase, locChunk, locPrefixTlo, locPow2 byte) []byte {
+
+	// chunk = v128.load(ptr + base - M)
+	b = append(b, 0x20, locPtr)
+	b = append(b, 0x20, locBase)
+	b = append(b, 0x6A) // i32.add → ptr + base
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(-m))
+	b = append(b, 0x6A) // i32.add → ptr + base - M
+	b = append(b, 0xFD, 0x00, 0x00, 0x00)
+	b = append(b, 0x21, locChunk)
+
+	// SIMD class check (same shape as the suffix verify).
+	b = append(b, 0x20, locPrefixTlo)
+	b = append(b, 0x20, locChunk)
+	b = append(b, 0x41, 0x0F)
+	b = append(b, 0xFD, 0x0F)
+	b = append(b, 0xFD, 0x4E)
+	b = append(b, 0xFD, 0x0E)
+
+	b = append(b, 0x20, locPow2)
+	b = append(b, 0x20, locChunk)
+	b = append(b, 0x41, 0x04)
+	b = append(b, 0xFD, 0x6D)
+	b = append(b, 0xFD, 0x0E)
+
+	b = append(b, 0xFD, 0x4E)
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0xFD, 0x0F)
+	b = append(b, 0xFD, 0x23)
+	b = append(b, 0xFD, 0x64) // bitmask → i32
+
+	// Mask off lanes ≥ M.
+	laneMask := int32((1 << uint(m)) - 1)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, laneMask)
+	b = append(b, 0x71) // i32.and
+
+	return b
+}
+
+// buildLitChainPrefixedFindBody emits the find body for a Gap E mixed-prefix
+// pattern `<class>{M}<literal><class>{N}`. Signature: (ptr,len) → i64.
+//
+// The Teddy frontend scans for the literal; on hit, attempt_start is at the
+// literal's position. The full match starts at (attempt_start - M). Verify
+// pulls the M prefix bytes (single SIMD chunk) AND the N suffix bytes
+// (existing multi-chunk verify), ORs the bad-masks, advances on mismatch.
+func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
+	var b []byte
+
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locAttemptStart byte = 2
+		locSimdMask     byte = 3
+		locChunk        byte = 4
+		locTLo          byte = 5 // suffix class table
+		locPow2         byte = 6
+		locPrefixTlo    byte = 7
+	)
+
+	// 2 × i32 + 4 × v128.
+	b = append(b, 0x02)
+	b = append(b, 0x02, 0x7F)
+	b = append(b, 0x04, 0x7B)
+
+	// Hoist all three v128 tables.
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+	b = emitV128Const(b, lcp.prefixTlo)
+	b = append(b, 0x21, locPrefixTlo)
+
+	k := int32(len(lcp.literal))
+	m := int32(lcp.prefixCount)
+	n := int32(lcp.count)
+	suffixEnd := k + n
+
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $lit_outer
+
+	scan := prefixScanParams{
+		Prefix:      lcp.literal,
+		EngineDepth: 2,
+		TableMemIdx: tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	// Bounds A: attempt_start < M → no prefix room, advance & retry.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, m)
+	b = append(b, 0x49) // i32.lt_u
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x0C, 0x01) // br $lit_outer
+	b = append(b, 0x0B)
+
+	// Bounds B: attempt_start + K + N > len → $no_match.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, suffixEnd)
+	b = append(b, 0x6A)
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4B) // i32.gt_u
+	b = append(b, 0x0D, 0x01)
+
+	// Prefix verify (single SIMD chunk).
+	b = emitPrefixClassVerify(b, int(m), locPtr, locAttemptStart, locChunk, locPrefixTlo, locPow2)
+	// Suffix verify (existing multi-chunk helper).
+	b = emitLitChainClassVerify(b, lcp, locPtr, locAttemptStart, locChunk, locTLo, locPow2)
+	// OR the two bad-masks → final bad_mask on stack.
+	b = append(b, 0x72) // i32.or
+
+	// On bad: advance attempt_start, restart loop.
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x0C, 0x01)
+	b = append(b, 0x0B)
+
+	// Match — return packed (attempt_start - M, attempt_start + K + N).
+	// Compute start = attempt_start - M (i32), end = attempt_start + K + N (i32).
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, m)
+	b = append(b, 0x6B)         // i32.sub → start
+	b = append(b, 0xAD)         // i64.extend_i32_u
+	b = append(b, 0x42, 0x20)   // i64.const 32
+	b = append(b, 0x86)         // i64.shl
+
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, suffixEnd)
+	b = append(b, 0x6A) // i32.add → end
+	b = append(b, 0xAD) // i64.extend_i32_u
+	b = append(b, 0x84) // i64.or
+	b = append(b, 0x0F) // return
+
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block
+
+	b = append(b, 0x42, 0x7F) // i64.const -1
+	b = append(b, 0x0B)
+	return b
+}
+
+// appendLitChainPrefixedFindCodeEntry appends a size-prefixed mixed-prefix
+// find body (Gap E single-pattern, find mode).
+func appendLitChainPrefixedFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) []byte {
+	body := buildLitChainPrefixedFindBody(lcp, tableMemIdx)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildLitChainPrefixedMatchBody emits the anchored full-input match body
+// for a Gap E mixed-prefix pattern. Signature: (ptr,len) → i32. Requires
+// `len == M + K + N` and the entire input to verify against `<class>{M}<lit><class>{N}`.
+func buildLitChainPrefixedMatchBody(lcp *litChainPattern) []byte {
+	var b []byte
+
+	const (
+		locPtr       byte = 0
+		locLen       byte = 1
+		locBase      byte = 2 // holds M; gives the "attempt_start" frame for shared helpers
+		locChunk     byte = 3
+		locTLo       byte = 4
+		locPow2      byte = 5
+		locPrefixTlo byte = 6
+	)
+
+	// 1 × i32 + 4 × v128.
+	b = append(b, 0x02)
+	b = append(b, 0x01, 0x7F)
+	b = append(b, 0x04, 0x7B)
+
+	k := int32(len(lcp.literal))
+	m := int32(lcp.prefixCount)
+	n := int32(lcp.count)
+	total := m + k + n
+
+	// locBase = M (constant; shared with helpers).
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, m)
+	b = append(b, 0x21, locBase)
+
+	// Hoist v128 tables.
+	b = emitV128Const(b, lcp.tlo)
+	b = append(b, 0x21, locTLo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+	b = emitV128Const(b, lcp.prefixTlo)
+	b = append(b, 0x21, locPrefixTlo)
+
+	// Bounds: len != total → -1.
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x47)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// Literal verify at offset M.
+	for kk, byt := range lcp.literal {
+		b = append(b, 0x20, locPtr)
+		b = append(b, 0x2D, 0x00)
+		b = utils.AppendULEB128(b, uint32(int(m)+kk))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(byt))
+		b = append(b, 0x47)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x0F)
+		b = append(b, 0x0B)
+	}
+
+	// Prefix + suffix verify (base = M; emitPrefixClassVerify reads ptr+base-M
+	// = ptr+0; emitLitChainClassVerify reads ptr+base+K+i*16 = ptr+M+K+i*16).
+	b = emitPrefixClassVerify(b, int(m), locPtr, locBase, locChunk, locPrefixTlo, locPow2)
+	b = emitLitChainClassVerify(b, lcp, locPtr, locBase, locChunk, locTLo, locPow2)
+	b = append(b, 0x72) // i32.or
+
+	// If non-zero → -1.
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// Match — return total.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, total)
+	b = append(b, 0x0B)
+	return b
+}
+
+// appendLitChainPrefixedMatchCodeEntry appends a size-prefixed match body.
+func appendLitChainPrefixedMatchCodeEntry(cs []byte, lcp *litChainPattern) []byte {
+	body := buildLitChainPrefixedMatchBody(lcp)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// analyseLitChainPrefixed parses pattern and returns the lit-chain pattern
+// when it has shape `<class>{M}<literal><class>{N,N}`. Reuses
+// analyseLitChainBranch (which accepts the 3-element mixed-prefix form);
+// adds the N≥24 gate and rejects non-mixed-prefix patterns (they go through
+// the classic path).
+func analyseLitChainPrefixed(pattern string) (*litChainPattern, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	info, ok := analyseLitChainBranch(re)
+	if !ok {
+		return nil, false
+	}
+	if info.prefixCount == 0 {
+		return nil, false // classic shape → existing path
+	}
+	if info.countMax != info.count {
+		return nil, false // ranges not yet supported on Gap E
+	}
+	if info.count < 24 {
+		return nil, false
+	}
+	return &litChainPattern{
+		literal:      info.literal,
+		tlo:          info.tlo,
+		count:        info.count,
+		countMax:     info.countMax,
+		greedy:       info.greedy,
+		prefixCount:  info.prefixCount,
+		prefixBitmap: info.prefixBitmap,
+		prefixTlo:    info.prefixTlo,
+		startAnchor:  info.startAnchor,
+		endAnchor:    info.endAnchor,
+	}, true
+}
+
 
 // buildLitChainMatchBody emits the WASM body for an anchored match against a
 // lit-chain pattern. Signature: (ptr i32, len i32) → i32 (end pos, or -1).
@@ -5985,7 +6517,7 @@ func analyseLitChainGroups(pattern string) (*litChainPattern, *litChainCaptures,
 		return nil, nil, false
 	}
 	info, ok := analyseLitChainBranch(re)
-	if !ok {
+	if !ok || info.prefixCount > 0 {
 		return nil, nil, false
 	}
 	if info.countMax != info.count {
@@ -6029,7 +6561,7 @@ func analyseLitChainGroupsRange(pattern string) (*litChainPattern, *litChainCapt
 		return nil, nil, false
 	}
 	info, ok := analyseLitChainBranch(re)
-	if !ok {
+	if !ok || info.prefixCount > 0 {
 		return nil, nil, false
 	}
 	if info.countMax <= info.count {
@@ -6092,7 +6624,7 @@ func analyseLitChainAltGroups(pattern string) (*litChainAltPattern, []*litChainC
 	hasAnyCap := false
 	for _, sub := range re.Sub {
 		info, ok := analyseLitChainBranch(sub)
-		if !ok {
+		if !ok || info.prefixCount > 0 {
 			return nil, nil, false
 		}
 		if info.countMax != info.count {
@@ -8136,6 +8668,107 @@ func appendLitChainAltFindGroupsCodeEntry(cs []byte, altp *litChainAltPattern,
 	return append(cs, body...)
 }
 
+// buildLitChainAltPrefixedFindBody emits the find body for a strict
+// alternation where every branch is mixed-prefix shape (Gap E). Signature:
+// (ptr,len) → i64. Per-branch dispatch uses emitLitChainAltLitBranchBodyPrefixed.
+func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
+	const (
+		locPtr          byte = 0
+		locLen          byte = 1
+		locAttemptStart byte = 2
+		locSimdMask     byte = 3
+		locScalarIdx    byte = 4
+		locChunk        byte = 5
+		locTeddyLo      byte = 6
+		locTeddyHi      byte = 7
+		locTeddyT1Lo    byte = 8
+		locTeddyT1Hi    byte = 9
+		locVerifyTlo    byte = 10
+		locTeddyChunk1  byte = 10
+		locVerifyPow2   byte = 11
+	)
+
+	var b []byte
+	b = append(b, 0x02)
+	b = append(b, 0x03, 0x7F)
+	b = append(b, 0x07, 0x7B)
+
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locVerifyPow2)
+
+	b = append(b, 0x02, 0x40)
+	b = append(b, 0x03, 0x40)
+
+	seen := [256]bool{}
+	var firstByteSet []byte
+	var firstByteFlags [256]byte
+	for _, br := range altp.branches {
+		firstByteFlags[br.literal[0]] = 1
+		if !seen[br.literal[0]] {
+			seen[br.literal[0]] = true
+			firstByteSet = append(firstByteSet, br.literal[0])
+		}
+	}
+
+	scan := prefixScanParams{
+		FirstByteSet:   firstByteSet,
+		FirstByteFlags: firstByteFlags,
+		FirstByteOff:   l.firstByteOff,
+		TeddyLoOff:     l.teddyLoOff,
+		TeddyHiOff:     l.teddyHiOff,
+		TeddyT1LoOff:   l.teddyT1LoOff,
+		TeddyT1HiOff:   l.teddyT1HiOff,
+		TeddyTwoByte:   l.useTwoByteTeddy,
+		EngineDepth:    2,
+		TableMemIdx:    tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdMask,
+			Chunk:        locChunk,
+			TLo:          locTeddyLo,
+			THi:          locTeddyHi,
+			T1Lo:         locTeddyT1Lo,
+			T1Hi:         locTeddyT1Hi,
+			Chunk1:       locTeddyChunk1,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, scan)
+
+	locals := litChainBranchLocals{
+		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
+		SimdMask: locSimdMask, ScalarIdx: locScalarIdx,
+		Chunk: locChunk, VerifyTlo: locVerifyTlo, VerifyPow2: locVerifyPow2,
+	}
+	for i, br := range altp.branches {
+		b = append(b, 0x02, 0x40) // block $next_branch_i
+		b = emitLitChainAltLitBranchBodyPrefixed(b, br, l.branchBitmapOff[i], locals, tableMemIdx)
+		b = append(b, 0x0B)
+	}
+
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x0C, 0x00)
+
+	b = append(b, 0x0B)
+	b = append(b, 0x0B)
+
+	b = append(b, 0x42, 0x7F)
+	b = append(b, 0x0B)
+	return b
+}
+
+// appendLitChainAltPrefixedFindCodeEntry appends a size-prefixed body.
+func appendLitChainAltPrefixedFindCodeEntry(cs []byte, altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
+	body := buildLitChainAltPrefixedFindBody(altp, l, tableMemIdx)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
 // buildLitChainAltRangeFindBody emits the find body for a strict alternation
 // where at least one branch is a range `{N,M}`. Per-branch dispatch uses the
 // branch-free range verify when the branch is range, the {N,N} verify
@@ -8314,7 +8947,7 @@ func analyseLitChainAltLenient(pattern string) (*lenAltPattern, bool) {
 	branches := make([]lenAltBranch, 0, len(re.Sub))
 	dfaCount := 0
 	for _, sub := range re.Sub {
-		if info, ok := analyseLitChainBranch(sub); ok && info.countMax == info.count {
+		if info, ok := analyseLitChainBranch(sub); ok && info.countMax == info.count && info.prefixCount == 0 {
 			branches = append(branches, lenAltBranch{
 				literal:     info.literal,
 				isLitChain:  true,
