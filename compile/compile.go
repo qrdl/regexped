@@ -142,6 +142,9 @@ type compiledPattern struct {
 	litAnchorTeddyT1LoBytes []byte
 	litAnchorTeddyT1HiBytes []byte
 	litAnchorLitSet         [][]byte // raw literals for post-Teddy scalar verification
+	// Non-mid-accept bulk-skip helper fields (nonMidHelperBody,
+	// findBodyCallSites) were extracted to
+	// plans/non_mid_extension.go.archive (Section 10).
 }
 
 // funcCount returns the number of WASM functions this pattern contributes.
@@ -164,6 +167,7 @@ func (p *compiledPattern) funcCount() int {
 			n++
 		} // named_groups_wrapper
 	}
+	// LNM non-mid bulk-skip helper count was here — see archive Section 11.
 	return n
 }
 
@@ -200,6 +204,10 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 	}
 	return
 }
+
+// patchPaddedLEB128CallSites and nonMidHelperOff were extracted to
+// plans/non_mid_extension.go.archive (Sections 12-13) along with the
+// rest of the non-mid bulk-skip helper infrastructure.
 
 // stripSegCount strips the LEB128 count prefix from a data section payload,
 // returning the raw segment bytes and the count.
@@ -815,17 +823,34 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				}
 			}
 			if p.litAnchorBackScanBody == nil {
-				// Opt 1 — LikelyNoMatch dominant-self-loop bulk-skip emission
-				// is gated on the LikelyNoMatch mode. Detection always runs
-				// (cheap); zero out the layout's dominant-state field when
-				// LNM isn't selected so the emitter falls back to the
-				// classic per-byte DFA loop.
-				if buildOpts.LikelyMode != LikelyNoMatch {
-					l.dominantState = 0
-					l.dominantExitBytes = nil
-					l.dominantIsMidAccept = false
+				// Opt 1 — dominant-self-loop SIMD bulk-skip. Despite being
+				// historically named "LikelyNoMatch", this optimisation
+				// accelerates the MATCH path (long stretches in a dominant
+				// self-loop state during a successful match — e.g. the body
+				// of `[^\n]+` after `//`). It is therefore gated under
+				// LikelyMatch, alongside the lit-chain Opt 2. LikelyNoMatch
+				// is currently unused; see TODO task 7 for the revisit plan
+				// (the original no-match optimisation it was meant to
+				// represent — initial-state self-loop bulk-skip — is
+				// already covered by the Teddy / firstByteFlags prefix
+				// scan).
+				//
+				// Skipped for anchored find — that path uses a different
+				// builder (`buildAnchoredFindBody`) whose midAccept
+				// consumers don't know about the encoding.
+				canEmitOpt1 := buildOpts.LikelyMode == LikelyMatch &&
+					!isAnchoredFind(table)
+				if canEmitOpt1 {
+					applyDominantStateEncoding(l)
+				} else {
+					l.dominantStates = nil
 				}
 				p.findBody = appendFindCodeEntry(nil, l, table, patMandLit, buildOpts.tableMemIdx)
+				// The smarter-gate (first-byte-rarity heuristic) and the
+				// non-mid bulk-skip helper construction were extracted to
+				// plans/non_mid_extension.go.archive (Section 17). Detection
+				// now records only mid-accept dominants, and there's no
+				// helper to build.
 			}
 
 			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))
@@ -965,6 +990,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	out = append(out, 0x01, 0x00, 0x00, 0x00)
 
 	// Type section: 3 fixed types (match, find, capture/groups).
+	// (The 4th type — for the LNM non-mid bulk-skip helper — was extracted
+	// to plans/non_mid_extension.go.archive Section 14.)
 	typeSection := []byte{
 		0x03,
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0: (i32,i32)→i32
@@ -1009,6 +1036,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				fs = append(fs, 0x02)
 			}
 		}
+		// LNM non-mid bulk-skip helper function-section entry was here —
+		// see archive Section 15.
 	}
 	out = appendSection(out, 3, fs)
 
@@ -1098,6 +1127,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			cs = utils.AppendULEB128(cs, uint32(len(litAnchorFindBody)))
 			cs = append(cs, litAnchorFindBody...)
 		} else if p.findBody != nil {
+			// LNM non-mid bulk-skip helper call-site patching was here —
+			// see archive Section 16.
 			cs = append(cs, p.findBody...)
 		}
 		if p.captureBody != nil {
@@ -1111,6 +1142,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				cs = appendNamedGroupsWrapperCodeEntry(cs, base+captureOff)
 			}
 		}
+		// LNM non-mid bulk-skip helper body append was here —
+		// see archive Section 16.
 	}
 	out = appendSection(out, 10, cs)
 

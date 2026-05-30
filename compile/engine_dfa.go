@@ -1379,25 +1379,44 @@ type dfaLayout struct {
 	// state transitions combined with compiled self-loop inner blocks.
 	useHybridDispatch bool
 
-	// Opt 1 — LikelyNoMatch dominant self-loop detection (Phase 1).
+	// Opt 1 — LikelyNoMatch dominant self-loop detection (Phases 1–3).
 	//
-	// dominantState (WASM ID) is the state where ≥ 240/256 byte classes
-	// transition back to itself. dominantExitBytes lists the bytes that do
-	// NOT self-loop (in sorted order). When the find body enters this state,
-	// a SIMD bulk-skip can consume the dominant self-loop in 16-byte strides
-	// until an exit byte is encountered.
+	// dominantStates lists every DFA state that qualifies for SIMD bulk-skip:
+	//   - ≥ 240/256 byte classes self-loop;
+	//   - exit set has exactly 1 byte (Phase 2 constraint; Phase 5 lifts);
+	//   - state is mid-accepting (Option 1 piggyback requires it).
 	//
-	// dominantState == 0 means no qualifying state was found (0 is the
-	// implicit dead state, never dominant). Phase 1 records a SINGLE
-	// dominant state per DFA; phase 3 will extend to multiple states.
+	// Slice order matches the encoded midAccept byte value: the i-th entry
+	// has `midAcceptBytes[entry.state] == byte(2 + i)`. Non-dominant
+	// accepting states stay at 1; non-accepting stay at 0. The find-body
+	// emitter reads the cached midAccept value and dispatches via a chain
+	// of `i32.const K + i32.eq` tests inside the already-taken
+	// `if midAccept != 0` branch — so no per-iteration overhead is added
+	// on the no-match path.
 	//
-	// dominantIsMidAccept is true when dominantState appears in the find-mode
-	// mid-accept set (every byte while in this state is a valid match end).
-	// Required by phase 2 emission so the bulk-skip can update last_accept
-	// in one go.
-	dominantState       int32
-	dominantExitBytes   []byte
-	dominantIsMidAccept bool
+	// Cap: detection stops after `maxDominantStates` (defined locally) to
+	// bound WASM growth.
+	dominantStates []dominantInfo
+	// Non-mid-accept dominant extension fields (nonMidDominantBytes,
+	// nonMidDominantOff) and the supporting infrastructure were extracted
+	// to plans/non_mid_extension.go.archive — see Section 2 of that file
+	// for reinstatement instructions.
+}
+
+// dominantInfo describes one dominant self-loop state recorded by
+// detectDominantSelfLoop.
+//
+// The non-mid-accept extension (LNM.md Action 2, archived in
+// plans/non_mid_extension.go.archive) added an `isMidAccept bool` field
+// to differentiate mid- from non-mid-accept dominants. With non-mid
+// emission archived, all entries are mid-accept and the flag is
+// unnecessary. Reinstatement must restore the field (Section 3 of the
+// archive) along with the filter conditionals in the dispatch loops
+// (Sections 7-8).
+type dominantInfo struct {
+	state       int32 // WASM state ID (> 0)
+	exitByte    byte  // single-byte exit (Phase 2 constraint)
+	encodedByte byte  // the value stored in midAcceptBytes[state]
 }
 
 // dfaTableBytes returns the upper-bound byte footprint of the runtime transition
@@ -1895,12 +1914,20 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	return l
 }
 
-// detectDominantSelfLoop scans the WASM-space transition table for a state
-// whose byte-class transitions self-loop on ≥ 240/256 bytes. Records the
-// first such state and its exit-byte set in `l.dominantState`/
-// `l.dominantExitBytes`. Phase 1 caps the recorded exit set at ≤ 4 bytes
-// (the simple SIMD bulk-skip path) — larger sets are detected but not
-// recorded yet.
+// detectDominantSelfLoop scans the WASM-space transition table for states
+// whose byte-class transitions self-loop on ≥ 240/256 bytes. Records each
+// qualifying state in `l.dominantStates` and encodes its slice index in
+// `l.midAcceptBytes[state]` as `byte(2 + idx)` so the find-body emitter
+// can dispatch via the already-loaded midAccept value.
+//
+// Phase 2 emission constraints applied at detection time:
+//   - exit set must be exactly 1 byte (Phase 5 will lift to ≤ 16 via nibble);
+//   - state must be mid-accepting (every byte while in it is a valid
+//     match end — required by the bulk-skip's `last_accept = pos + 1`).
+//
+// Non-eligible states (multi-byte exit, non-mid-accept) keep their
+// existing midAccept value (1 if accepting, 0 otherwise) and are not
+// added to the slice. Detection caps at `maxDominantStates` per DFA.
 func detectDominantSelfLoop(l *dfaLayout) {
 	const threshold = 240
 	const maxExitBytes = 4
@@ -1976,31 +2003,59 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		if selfBytes < threshold || hitCap {
 			continue
 		}
-		// Sort exit bytes (stable across runs).
-		sort.Slice(exitBytes, func(i, j int) bool { return exitBytes[i] < exitBytes[j] })
-		l.dominantState = state
-		l.dominantExitBytes = exitBytes
-		// Mid-accept lookup: the midAcceptBytes side table (if populated) holds
-		// a non-zero byte for each accepting state. Empty/nil ⇒ no mid-accept
-		// state in this DFA.
-		if int(state) < len(l.midAcceptBytes) && l.midAcceptBytes[state] != 0 {
-			l.dominantIsMidAccept = true
-			// Opt 1 — piggyback on midAccept[state] lookup. Encode "is
-			// dominant" in the value itself: 0 = none, 1 = mid-accept,
-			// 2 = mid-accept + dominant self-loop. The find-mode hot loop
-			// already loads this byte to update last_accept; the emitter
-			// reuses the cached value to gate the SIMD bulk-skip without
-			// an extra `local.get state + i32.const K + i32.eq` chain.
-			//
-			// Value 2 is still truthy, so the existing midAccept branch
-			// (`if midAccept[state]:`) continues to work in non-LNM
-			// modes — the extra byte value is harmless when no emitter
-			// consults it.
-			if len(exitBytes) == 1 {
-				l.midAcceptBytes[state] = 2
-			}
+		// Phase 2 constraint: single-byte exit (Phase 5 will lift via
+		// nibble lookup). Multi-byte-exit states are detected but skipped.
+		if len(exitBytes) != 1 {
+			continue
 		}
-		return
+		// Mid-accept-only detection. The non-mid-accept variant (which
+		// detected states with midAcceptBytes[state] == 0 and recorded
+		// them with isMidAccept=false) was extracted to
+		// plans/non_mid_extension.go.archive (Section 3). See that file
+		// for the dual-channel detection code.
+		if int(state) >= len(l.midAcceptBytes) || l.midAcceptBytes[state] == 0 {
+			continue
+		}
+		sort.Slice(exitBytes, func(i, j int) bool { return exitBytes[i] < exitBytes[j] })
+		l.dominantStates = append(l.dominantStates, dominantInfo{
+			state:    state,
+			exitByte: exitBytes[0],
+		})
+	}
+
+	// Encoding pass — mid-accept dominants piggyback on midAccept[state]:
+	//   encodedByte = 2 + idx (range 2..127). The existing
+	//   `if midAccept[state] != 0` truthiness check fires correctly
+	//   (last_accept update remains valid).
+	//
+	// The previous dual-channel encoding (mid + non-mid in a separate
+	// side table) was extracted to plans/non_mid_extension.go.archive
+	// (Section 4).
+	const maxDominantStates = 126
+	out := l.dominantStates[:0]
+	for i, info := range l.dominantStates {
+		if i >= maxDominantStates {
+			break
+		}
+		info.encodedByte = byte(2 + i)
+		out = append(out, info)
+	}
+	l.dominantStates = out
+}
+
+// applyDominantStateEncoding writes each dominantInfo's encoded byte into
+// l.midAcceptBytes (mid-accept piggyback). Called from compile.go ONLY
+// when LikelyMode == LikelyMatch, so other modes see the unmodified
+// midAccept table.
+//
+// The dual-channel variant that also wrote non-mid-accept entries into a
+// separate side table was extracted to plans/non_mid_extension.go.archive
+// (Section 4 — see the second code block there).
+func applyDominantStateEncoding(l *dfaLayout) {
+	for _, info := range l.dominantStates {
+		if int(info.state) < len(l.midAcceptBytes) {
+			l.midAcceptBytes[info.state] = info.encodedByte
+		}
 	}
 }
 
@@ -2030,6 +2085,8 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 		if l.midAcceptNLBytes != nil {
 			ds = appendDataSegment(ds, l.midAcceptNLOff, l.midAcceptNLBytes)
 		}
+		// Non-mid-accept dominant data segment emission was extracted to
+		// plans/non_mid_extension.go.archive (Section 5).
 		return ds
 	}
 	findSegCount := func(base int) byte {
@@ -2043,6 +2100,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 		if l.midAcceptNLBytes != nil {
 			n++
 		}
+		// Non-mid-accept segment count was here — see archive Section 5.
 		if l.useRowDedup {
 			n++
 		}
@@ -2662,6 +2720,13 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 
 // appendFindCodeEntry appends a size-prefixed find function body to cs.
 // Uses buildAnchoredFindBody when isAnchoredFind(t), else buildFindBody.
+//
+// The non-mid-accept-dispatch variant (which also returned the list of
+// call-site offsets for assembleModule-time patching of the helper
+// function index) was extracted to plans/non_mid_extension.go.archive
+// (Section 9). To reinstate, change the signature to
+// `([]byte, []int)`, restore the `callSites` plumbing, and update both
+// callers.
 func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
 	var body []byte
 	if l.useHybridDispatch {
@@ -2692,7 +2757,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
 			tableMemIdx,
-			l.dominantState, l.dominantExitBytes, l.dominantIsMidAccept)
+			l.dominantStates)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -2748,6 +2813,10 @@ func emitCompressedU8Transition(b []byte,
 	b = append(b, 0x21, stateLocal)
 	return b
 }
+
+// buildNonMidBulkSkipHelperBody was extracted to
+// plans/non_mid_extension.go.archive (Section 6) along with the rest of
+// the LNM non-mid-accept dispatch infrastructure.
 
 // emitSimpleU8Transition emits the simple u8 DFA transition:
 //
@@ -2890,7 +2959,7 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 // After the block, pos is positioned so the next pos++ takes execution
 // past the self-loop bytes and onto the first exit byte (which the next
 // scan iteration will transition on).
-func emitDominantBulkSkip(b []byte, exitByte byte,
+func emitDominantBulkSkip(b []byte, exitByte byte, updateLastAccept bool,
 	posLocal, lenLocal, lastAcceptLocal,
 	ptrLocal, chunkLocal, tmpLocal byte) []byte {
 
@@ -2936,15 +3005,19 @@ func emitDominantBulkSkip(b []byte, exitByte byte,
 	//   continue loop: br $bulk_outer (depth 1 from inside if)
 	b = append(b, 0x0C, 0x01)
 	b = append(b, 0x05) // else
-	//   pos += ctz(m); last_accept = pos + 1; break to $bulk_done
+	//   pos += ctz(m); [optionally last_accept = pos + 1]; break to $bulk_done
 	b = append(b, 0x20, tmpLocal)
 	b = append(b, 0x68)           // i32.ctz
 	b = append(b, 0x20, posLocal)
-	b = append(b, 0x6A)           // i32.add
-	b = append(b, 0x22, posLocal) // local.tee posLocal (keep on stack)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x6A) // pos + 1
-	b = append(b, 0x21, lastAcceptLocal)
+	b = append(b, 0x6A) // i32.add
+	if updateLastAccept {
+		b = append(b, 0x22, posLocal) // local.tee posLocal (keep on stack)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A) // pos + 1
+		b = append(b, 0x21, lastAcceptLocal)
+	} else {
+		b = append(b, 0x21, posLocal) // local.set posLocal (no last_accept update)
+	}
 	//   br $bulk_done (depth 2 from inside if-else)
 	b = append(b, 0x0C, 0x02)
 	b = append(b, 0x0B) // end if
@@ -4135,7 +4208,11 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantState int32, dominantExitBytes []byte, dominantIsMidAccept bool) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo) []byte {
+	// The non-mid-accept dispatch tracked call-site offsets for later
+	// patching at assembleModule time. That extension (along with the
+	// `nonMidDominantOff` parameter and the `[]int` return slot) was
+	// extracted to plans/non_mid_extension.go.archive (Sections 7-9).
 	var b []byte
 
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
@@ -4317,6 +4394,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				b = append(b, 0x41, 0x7F) // i32.const -1
 				b = append(b, 0x21, 0x05) // local.set last_accept
 				// if midAccept[state]: last_accept = pos
+				// Opt 1 keeps midAccept's mid-accept-only semantics (values
+				// 0/1/2..127); non-mid-accept dominants live in a separate
+				// side table, so no gate is needed here.
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, midAcceptOff)
 				b = append(b, 0x20, 0x02)             // local.get state
@@ -4610,20 +4690,22 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x0B) // end if
 
 		// if midAccept[state]: last_accept = pos + 1
-		// Opt 1 piggyback: when LNM emission is active, the loaded midAccept
-		// byte carries value 2 for the dominant state (1 for other accepting
-		// states). We tee it into local 6 (class, free post-transition) so
-		// the bulk-skip branch can be nested inside this already-taken
-		// midAccept branch without a fresh `state == K` test in the hot
-		// loop.
-		emitOpt1 := !useMandatoryLit && dominantState > 0 && dominantIsMidAccept &&
-			len(dominantExitBytes) == 1
+		// Opt 1 — mid-accept dominants piggyback on the midAccept lookup
+		// (cached for dispatch).
+		//
+		// Non-mid-accept dominants used a SECOND dispatch path below
+		// (extracted to plans/non_mid_extension.go.archive Section 7).
+		// With non-mid emission archived, every entry in dominantStates
+		// is mid-accept; the `hasMidDom` discriminator and per-entry
+		// `if info.isMidAccept` filters from that variant are no longer
+		// needed.
+		emitMidDom := !useMandatoryLit && len(dominantStates) > 0
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, midAcceptOff)
 		b = append(b, 0x20, 0x02)             // local.get state
 		b = append(b, 0x6A)                   // i32.add
 		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-		if emitOpt1 {
+		if emitMidDom {
 			b = append(b, 0x22, 0x06) // local.tee class — cache midAccept value
 		}
 		b = append(b, 0x04, 0x40) // if (void)
@@ -4631,20 +4713,25 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x41, 0x01) // i32.const 1
 		b = append(b, 0x6A)       // i32.add
 		b = append(b, 0x21, 0x05) // local.set last_accept
-		if emitOpt1 {
-			// Nested bulk-skip gate: if cached midAccept value == 2, the
-			// state is the dominant self-loop state. Otherwise skip.
-			b = append(b, 0x20, 0x06)  // local.get class (cached midAccept)
-			b = append(b, 0x41, 0x02)  // i32.const 2
-			b = append(b, 0x46)        // i32.eq
-			b = append(b, 0x04, 0x40)  // if (void)
-			b = emitDominantBulkSkip(b, dominantExitBytes[0],
-				/*pos=*/ 0x03, /*len=*/ 0x01,
-				/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
-				/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ 0x06)
-			b = append(b, 0x0B) // end if (bulk-skip gate)
+		if emitMidDom {
+			for _, info := range dominantStates {
+				b = append(b, 0x20, 0x06) // local.get class
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(info.encodedByte))
+				b = append(b, 0x46)       // i32.eq
+				b = append(b, 0x04, 0x40) // if (void)
+				b = emitDominantBulkSkip(b, info.exitByte, true,
+					/*pos=*/ 0x03, /*len=*/ 0x01,
+					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
+					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ 0x06)
+				b = append(b, 0x0B) // end if (bulk-skip gate)
+			}
 		}
 		b = append(b, 0x0B) // end if (midAccept)
+
+		// Non-mid-accept dominant dispatch was here — extracted to
+		// plans/non_mid_extension.go.archive (Section 7, u8+compressed
+		// path).
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
@@ -4724,17 +4811,17 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x0B) // end if
 
 		// if midAccept[state]: last_accept = pos + 1
-		// Opt 1 piggyback: cache midAccept byte in simdMaskLocal (free
-		// post-Teddy-scan) and nest the bulk-skip gate inside the
-		// already-taken midAccept branch.
-		emitOpt1 := !useMandatoryLit && dominantState > 0 && dominantIsMidAccept &&
-			len(dominantExitBytes) == 1
+		// Opt 1 — mid-accept dominants piggyback on midAccept lookup.
+		// See the matching u8+compressed path above for details, and
+		// plans/non_mid_extension.go.archive Section 8 for the non-mid
+		// counterpart this used to coexist with.
+		emitMidDom := !useMandatoryLit && len(dominantStates) > 0
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, midAcceptOff)
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x6A)
 		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-		if emitOpt1 {
+		if emitMidDom {
 			b = append(b, 0x22, simdMaskLocal) // local.tee — cache midAccept value
 		}
 		b = append(b, 0x04, 0x40) // if (void)
@@ -4742,18 +4829,24 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x41, 0x01)
 		b = append(b, 0x6A)
 		b = append(b, 0x21, 0x05) // local.set last_accept
-		if emitOpt1 {
-			b = append(b, 0x20, simdMaskLocal) // local.get cached midAccept
-			b = append(b, 0x41, 0x02)          // i32.const 2
-			b = append(b, 0x46)                // i32.eq
-			b = append(b, 0x04, 0x40)          // if (void)
-			b = emitDominantBulkSkip(b, dominantExitBytes[0],
-				/*pos=*/ 0x03, /*len=*/ 0x01,
-				/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
-				/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ simdMaskLocal)
-			b = append(b, 0x0B) // end if (bulk-skip gate)
+		if emitMidDom {
+			for _, info := range dominantStates {
+				b = append(b, 0x20, simdMaskLocal) // local.get cached midAccept
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(info.encodedByte))
+				b = append(b, 0x46)       // i32.eq
+				b = append(b, 0x04, 0x40) // if (void)
+				b = emitDominantBulkSkip(b, info.exitByte, true,
+					/*pos=*/ 0x03, /*len=*/ 0x01,
+					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
+					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ simdMaskLocal)
+				b = append(b, 0x0B) // end if (bulk-skip gate)
+			}
 		}
 		b = append(b, 0x0B) // end if (midAccept)
+
+		// Non-mid-accept dominant dispatch was here — extracted to
+		// plans/non_mid_extension.go.archive (Section 8, u8+simple path).
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 

@@ -205,6 +205,77 @@ var tests = []testCase{
 		nomatchInput: sourceWithBlockComments(false),
 	},
 	{
+		// Phase 3 amplifier: long-line comments AND multi-KB block comments
+		// in the same input. The block-comment body sits in the second
+		// dominant self-loop state (`.*?` until `*/`); Phase 2 only
+		// accelerates the line-comment state, so this case demonstrates
+		// the gap that Phase 3 (multi-state dispatch) closes.
+		name:         "comments-mixed-large",
+		pattern:      `//[^\n]+|/\*(?s:.*?)\*/`,
+		mode:         modeFind,
+		notes:        "long line + long block comments — Phase 3 multi-state amplifier",
+		matchInput:   longCommentsMixedInput(true),
+		nomatchInput: longCommentsMixedInput(false),
+	},
+	// ── First-byte selectivity sweep (LNM smarter-gate research) ────────
+	// Five patterns sharing the shape `<lit><non-mid body><lit>` so the
+	// DFA has a non-mid-accept dominant body state. The first byte of the
+	// literal prefix varies from very-rare to very-common; the question
+	// the smarter-gate research wants answered is "where on this spectrum
+	// does the bulk-skip win exceed the per-iter dispatch cost on no-match
+	// input?"
+	{
+		// Very rare: control character first byte. Never appears in ASCII
+		// prose, so Teddy false-positives on no-match input are ~zero.
+		// Bulk-skip should win on match, no regression possible on no-match.
+		name:         "ctrl-delim",
+		pattern:      `\x01[^\x02]+\x02`,
+		mode:         modeFind,
+		notes:        "very-rare first byte (\\x01) — Teddy false-positives ≈ 0",
+		matchInput:   delimitedBodyInput(true, 0x01, 0x02, 5, 9000),
+		nomatchInput: delimitedBodyInput(false, 0x01, 0x02, 0, 0),
+	},
+	{
+		// Rare-ish: `<` is mid-rare in prose, common in HTML/XML. On prose
+		// no-match input Teddy fires occasionally; on HTML it fires often.
+		name:         "xml-tag",
+		pattern:      `<[^>]+>`,
+		mode:         modeFind,
+		notes:        "rare first byte (<) — moderate Teddy false-positives on prose",
+		matchInput:   delimitedBodyInput(true, '<', '>', 5, 9000),
+		nomatchInput: delimitedBodyInput(false, '<', '>', 0, 0),
+	},
+	{
+		// Mid-frequency: `[` appears occasionally in prose (citations,
+		// brackets). Borderline case.
+		name:         "bracket-content",
+		pattern:      `\[[^\]]+\]`,
+		mode:         modeFind,
+		notes:        "mid-rare first byte ([) — borderline selectivity",
+		matchInput:   delimitedBodyInput(true, '[', ']', 5, 9000),
+		nomatchInput: delimitedBodyInput(false, '[', ']', 0, 0),
+	},
+	{
+		// Common: `(` is moderately common in prose. Expect non-mid
+		// dispatch to be lossy here.
+		name:         "paren-block",
+		pattern:      `\([^)]+\)`,
+		mode:         modeFind,
+		notes:        "common first byte (() — Teddy false-positives expected",
+		matchInput:   delimitedBodyInput(true, '(', ')', 5, 9000),
+		nomatchInput: delimitedBodyInput(false, '(', ')', 0, 0),
+	},
+	{
+		// Very common: ASCII letter `a`. Fires Teddy on nearly every word.
+		// Should be the worst-case regression if non-mid is emitted.
+		name:         "letter-delim",
+		pattern:      `a[^b]+b`,
+		mode:         modeFind,
+		notes:        "very-common first byte (a) — worst-case false-positive rate",
+		matchInput:   delimitedBodyInput(true, 'a', 'b', 5, 9000),
+		nomatchInput: delimitedBodyInput(false, 'a', 'b', 0, 0),
+	},
+	{
 		// Capture variant of secrets-github: whole-match named group around the
 		// lit-chain. Anchored captures (groups_func semantics). matchInput leads
 		// with the secret so the anchored call succeeds once per outer iteration.
@@ -528,6 +599,128 @@ func longCommentLineInput(withComments bool) string {
 	filler := []byte("plain text with no slashes at all and certainly nothing resembling a comment marker here\n")
 	for len(b) < targetSize {
 		b = append(b, filler...)
+	}
+	return string(b[:targetSize])
+}
+
+// longCommentsMixedInput returns ~50 KB of source-like text containing BOTH
+// very long single-line `//` comments AND multi-KB `/* … */` block comments.
+// Phase 2 of Opt 1 bulk-skips the line-comment self-loop only; Phase 3 must
+// also bulk-skip the block-comment self-loop. When withMatches is false,
+// neither `//` nor `/*` appears.
+func longCommentsMixedInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		var b []byte
+		filler := []byte("The quick brown fox jumps over the lazy dog. ")
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	var b []byte
+	// Two ~9 KB single-line comments.
+	for i := 0; i < 2; i++ {
+		b = append(b, '/', '/')
+		filler := []byte(" lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua")
+		for j := 0; j < 75; j++ {
+			b = append(b, filler...)
+		}
+		b = append(b, '\n')
+	}
+	// Two ~9 KB block comments (newlines inside are fine — `.*?` is DOTALL).
+	for i := 0; i < 2; i++ {
+		b = append(b, '/', '*')
+		filler := []byte(" Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam,\n feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper.\n")
+		for j := 0; j < 45; j++ {
+			b = append(b, filler...)
+		}
+		b = append(b, '*', '/', '\n')
+	}
+	// Pad with non-comment filler.
+	filler := []byte("plain text with no slashes at all and certainly nothing resembling a comment marker here\n")
+	for len(b) < targetSize {
+		b = append(b, filler...)
+	}
+	return string(b[:targetSize])
+}
+
+// delimitedBodyInput builds an input for the first-byte selectivity sweep.
+//
+// When withMatches is true, the buffer contains `bodies` × (`bodyLen` bytes)
+// matches shaped `<open>[non-close-byte body]<close>`. The body byte fills
+// repeatedly using a "lorem ipsum"-style filler with the close byte
+// stripped out, so the match length actually reaches `bodyLen`. Total
+// buffer is padded with plain ASCII prose to ~50 KB.
+//
+// When withMatches is false, the buffer is pure ASCII prose (lorem ipsum
+// + the quick-brown-fox sentence) with the `open` byte stripped out so
+// no Teddy false-positives from the literal can occur EXCEPT when `open`
+// is a natural ASCII letter (in which case stripping it would change the
+// prose; for those we accept the natural occurrence rate as the test
+// signal). Total buffer ~50 KB.
+//
+// This produces:
+//   - matchInput: bulk-skip-friendly. Each match has a long body where
+//     the dominant self-loop fires repeatedly.
+//   - nomatchInput: stresses Teddy at the natural frequency of `open` in
+//     prose. Whether non-mid bulk-skip helps or hurts here is exactly
+//     the question the smarter gate must answer.
+func delimitedBodyInput(withMatches bool, open, close byte, bodies, bodyLen int) string {
+	const targetSize = 50 * 1024
+	filler := []byte(" lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua quisque vel libero")
+	stripBytes := func(s []byte, drop byte) []byte {
+		out := s[:0:len(s)]
+		for _, c := range s {
+			if c != drop {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	bodyFiller := stripBytes(append([]byte(nil), filler...), close)
+	if !withMatches {
+		var b []byte
+		prose := stripBytes(append([]byte(nil), filler...), open)
+		// Also strip the close byte so a stray pair can't form unintended matches.
+		prose = stripBytes(prose, close)
+		// If both bytes happen to be ASCII letters that gut the prose, fall
+		// back to a different sentence.
+		if len(prose) < 20 {
+			prose = []byte("The quick brown fox jumps over the lazy dog. ")
+			prose = stripBytes(prose, open)
+			prose = stripBytes(prose, close)
+		}
+		for len(b) < targetSize {
+			b = append(b, prose...)
+		}
+		return string(b[:targetSize])
+	}
+	var b []byte
+	for i := 0; i < bodies; i++ {
+		b = append(b, open)
+		for len(b)%bodyLen != bodyLen-1 && len(b) < targetSize-2 {
+			// Inner loop bound is approximate; we just want roughly bodyLen
+			// bytes of body before the close.
+			b = append(b, bodyFiller...)
+			if len(b) >= bodyLen*(i+1) {
+				break
+			}
+		}
+		b = append(b, close)
+		b = append(b, '\n')
+	}
+	// Pad with prose (stripped of `open` so we don't accidentally start new
+	// matches mid-pad).
+	pad := stripBytes(append([]byte(nil), filler...), open)
+	pad = stripBytes(pad, close)
+	if len(pad) < 20 {
+		pad = []byte("plain padding text without delimiters here at all\n")
+		pad = stripBytes(pad, open)
+		pad = stripBytes(pad, close)
+	}
+	for len(b) < targetSize {
+		b = append(b, pad...)
 	}
 	return string(b[:targetSize])
 }
