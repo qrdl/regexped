@@ -1406,6 +1406,10 @@ type dfaLayout struct {
 // dominantInfo describes one dominant self-loop state recorded by
 // detectDominantSelfLoop.
 //
+// `exitBytes` holds 1..8 bytes (Shufti cap; see Phase 5 below). When
+// len(exitBytes) == 1 the emitter uses the Phase 2 splat+eq fast path;
+// when 2..8 it uses a Shufti-style nibble-table lookup.
+//
 // The non-mid-accept extension (LNM.md Action 2, archived in
 // plans/non_mid_extension.go.archive) added an `isMidAccept bool` field
 // to differentiate mid- from non-mid-accept dominants. With non-mid
@@ -1414,9 +1418,9 @@ type dfaLayout struct {
 // archive) along with the filter conditionals in the dispatch loops
 // (Sections 7-8).
 type dominantInfo struct {
-	state       int32 // WASM state ID (> 0)
-	exitByte    byte  // single-byte exit (Phase 2 constraint)
-	encodedByte byte  // the value stored in midAcceptBytes[state]
+	state       int32  // WASM state ID (> 0)
+	exitBytes   []byte // 1..8 exit bytes (Shufti cap)
+	encodedByte byte   // the value stored in midAcceptBytes[state]
 }
 
 // dfaTableBytes returns the upper-bound byte footprint of the runtime transition
@@ -1930,7 +1934,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 // added to the slice. Detection caps at `maxDominantStates` per DFA.
 func detectDominantSelfLoop(l *dfaLayout) {
 	const threshold = 240
-	const maxExitBytes = 4
+	const maxExitBytes = 8 // Shufti nibble-lookup cap (Phase 5)
 
 	if l.numWASM <= 1 {
 		return
@@ -2003,9 +2007,9 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		if selfBytes < threshold || hitCap {
 			continue
 		}
-		// Phase 2 constraint: single-byte exit (Phase 5 will lift via
-		// nibble lookup). Multi-byte-exit states are detected but skipped.
-		if len(exitBytes) != 1 {
+		// Phase 5: 1..8 exit bytes (Shufti cap). The maxExitBytes loop
+		// guard ensures we never reach here with more.
+		if len(exitBytes) < 1 || len(exitBytes) > maxExitBytes {
 			continue
 		}
 		// Mid-accept-only detection. The non-mid-accept variant (which
@@ -2018,8 +2022,8 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		}
 		sort.Slice(exitBytes, func(i, j int) bool { return exitBytes[i] < exitBytes[j] })
 		l.dominantStates = append(l.dominantStates, dominantInfo{
-			state:    state,
-			exitByte: exitBytes[0],
+			state:     state,
+			exitBytes: exitBytes,
 		})
 	}
 
@@ -2920,20 +2924,37 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 }
 
 // emitDominantBulkSkip emits the LikelyNoMatch SIMD bulk-skip block for a
-// state with a single-byte exit set. Inserts INSIDE the find-mode inner
+// state with a 1..8-byte exit set. Inserts INSIDE the find-mode inner
 // scan loop, AFTER the per-byte transition and midAccept update, BEFORE
 // pos++.
 //
+// Two emission paths based on `len(exitBytes)`:
+//
+//   • Single-byte (Phase 2): `i8x16.splat + i8x16.eq + i8x16.bitmask`.
+//     Three SIMD ops; the splat constant is folded by JIT into the
+//     loop preamble. Fast path for patterns like `//[^\n]+`.
+//
+//   • Multi-byte (Phase 5, ≤ 8 bytes): Shufti-style nibble lookup.
+//     Build two 16-byte tables T_lo and T_hi where bit i of T_lo[lo]
+//     (resp. T_hi[hi]) is set iff exit byte i has low (resp. high)
+//     nibble equal to lo (resp. hi). Per chunk:
+//       lo_bits = swizzle(T_lo, chunk & 0x0F)
+//       hi_bits = swizzle(T_hi, chunk >> 4)
+//       match  = lo_bits & hi_bits        ; non-zero lanes = exit bytes
+//       mask   = bitmask(match != 0)
+//     Eight SIMD ops; tables inlined as v128.const. Unlocks patterns
+//     like `https?://[^\s]+` (6-byte `\s` exit) and `<[^>]+>` if
+//     a future revisit broadens.
+//
 // Contract:
-//   - Caller MUST guard the call so it only runs when state ==
-//     dominantState. Option 1 emission piggybacks on the midAccept[state]
-//     lookup (which is loaded anyway for `last_accept`): the dominant
-//     state's `midAcceptBytes` value is encoded as 2 (mid-accept + dominant)
-//     and the caller branches on it via the cached value.
+//   - Caller MUST guard the call so it only runs when state == dominantState.
+//     Option 1 piggybacks on the midAccept[state] lookup; the dominant
+//     state's `midAcceptBytes` value is encoded uniquely and the caller
+//     branches on the cached value.
 //   - Requires the dominant state to be mid-accepting: every byte while
 //     in it is a valid match end. Detection sets the encoding only when
 //     this holds.
-//   - Single-byte exit (`len(exitBytes) == 1`); detection-checked.
+//   - exitBytes length is 1..8 (Shufti cap). Detection enforces this.
 //   - Uses 1 i32 scratch local (`tmpLocal`) and 1 v128 scratch (`chunkLocal`),
 //     both must be safe to clobber at this point (e.g. the Teddy-scan-phase
 //     locals which are unused inside the DFA scan loop).
@@ -2945,7 +2966,7 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 //     loop $bulk_outer:
 //       if pos + 17 > len: br $bulk_done   // not enough room for 16-byte SIMD
 //       chunk = v128.load(ptr + pos + 1)
-//       m = i8x16.bitmask(i8x16.eq(chunk, splat(exitByte)))
+//       m = <single-byte or Shufti match → i32 bitmask>
 //       if m == 0:
 //         pos += 16
 //         br $bulk_outer  // continue loop
@@ -2959,7 +2980,7 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 // After the block, pos is positioned so the next pos++ takes execution
 // past the self-loop bytes and onto the first exit byte (which the next
 // scan iteration will transition on).
-func emitDominantBulkSkip(b []byte, exitByte byte, updateLastAccept bool,
+func emitDominantBulkSkip(b []byte, exitBytes []byte, updateLastAccept bool,
 	posLocal, lenLocal, lastAcceptLocal,
 	ptrLocal, chunkLocal, tmpLocal byte) []byte {
 
@@ -2985,13 +3006,49 @@ func emitDominantBulkSkip(b []byte, exitByte byte, updateLastAccept bool,
 	b = append(b, 0xFD, 0x00, 0x00, 0x00)
 	b = append(b, 0x21, chunkLocal)
 
-	// m = i8x16.bitmask(i8x16.eq(chunk, splat(exitByte)))
-	b = append(b, 0x20, chunkLocal)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(exitByte))
-	b = append(b, 0xFD, 0x0F) // i8x16.splat
-	b = append(b, 0xFD, 0x23) // i8x16.eq
-	b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+	if len(exitBytes) == 1 {
+		// Phase 2 single-byte: m = bitmask(eq(chunk, splat(exit))).
+		b = append(b, 0x20, chunkLocal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(exitBytes[0]))
+		b = append(b, 0xFD, 0x0F) // i8x16.splat
+		b = append(b, 0xFD, 0x23) // i8x16.eq
+		b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+	} else {
+		// Phase 5 multi-byte: Shufti nibble lookup.
+		// Build T_lo and T_hi: bit i is set in T_lo[lo] iff exitBytes[i] has low nibble lo.
+		var tLo, tHi [16]byte
+		for i, eb := range exitBytes {
+			bit := byte(1) << uint(i)
+			tLo[eb&0x0F] |= bit
+			tHi[eb>>4] |= bit
+		}
+		// v128.const T_lo (16 bytes inline) then swizzle(T_lo, chunk & 0x0F).
+		b = append(b, 0xFD, 0x0C) // v128.const
+		b = append(b, tLo[:]...)
+		b = append(b, 0x20, chunkLocal)
+		b = append(b, 0x41, 0x0F) // i32.const 0x0F
+		b = append(b, 0xFD, 0x0F) // i8x16.splat
+		b = append(b, 0xFD, 0x4E) // v128.and  → chunk & 0x0F
+		b = append(b, 0xFD, 0x0E) // i8x16.swizzle → T_lo[chunk & 0x0F]
+
+		// swizzle(T_hi, chunk >> 4).
+		b = append(b, 0xFD, 0x0C) // v128.const
+		b = append(b, tHi[:]...)
+		b = append(b, 0x20, chunkLocal)
+		b = append(b, 0x41, 0x04) // i32.const 4
+		b = append(b, 0xFD, 0x6D) // i8x16.shr_u → chunk >> 4
+		b = append(b, 0xFD, 0x0E) // i8x16.swizzle → T_hi[chunk >> 4]
+
+		// match = lo_bits & hi_bits.
+		b = append(b, 0xFD, 0x4E) // v128.and
+
+		// m = bitmask(match != 0).
+		b = append(b, 0x41, 0x00) // i32.const 0
+		b = append(b, 0xFD, 0x0F) // i8x16.splat
+		b = append(b, 0xFD, 0x24) // i8x16.ne
+		b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+	}
 
 	// local.tee tmpLocal (keep mask on stack)
 	b = append(b, 0x22, tmpLocal)
@@ -4720,7 +4777,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				b = utils.AppendSLEB128(b, int32(info.encodedByte))
 				b = append(b, 0x46)       // i32.eq
 				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info.exitByte, true,
+				b = emitDominantBulkSkip(b, info.exitBytes, true,
 					/*pos=*/ 0x03, /*len=*/ 0x01,
 					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
 					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ 0x06)
@@ -4836,7 +4893,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				b = utils.AppendSLEB128(b, int32(info.encodedByte))
 				b = append(b, 0x46)       // i32.eq
 				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info.exitByte, true,
+				b = emitDominantBulkSkip(b, info.exitBytes, true,
 					/*pos=*/ 0x03, /*len=*/ 0x01,
 					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
 					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ simdMaskLocal)

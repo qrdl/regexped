@@ -400,6 +400,99 @@ var tests = []testCase{
 			{"long match", strings.Repeat("abcdefghij", 100)},
 		},
 	},
+
+	// ── LNM / Opt 1 coverage on 100 KB workloads ─────────────────────────────
+	// These three patterns surface the wins (or absence thereof) of recent
+	// shipping work on a realistic-scale perftest. See plans/LIKELY.md (Opt 1)
+	// and plans/LNM.md (Shufti prefix scan) for the implementation history.
+	{
+		// Phase 5 amplifier: mid-accept dominant body with a multi-byte exit
+		// set. Pattern matches URLs delimited by whitespace, comma, or
+		// semicolon. Body `[^\s,;]+` is mid-accept (every byte while in
+		// it is a valid match end) and has 8-byte exit set
+		// (\t\n\v\f\r space , ;) → triggers Phase 5's Shufti-style nibble-
+		// table SIMD bulk-skip in `emitDominantBulkSkip`. Without Phase 5
+		// the body would scan byte-by-byte at DFA per-byte cost.
+		name:    "phase5-url-find-100kb",
+		pattern: `http://[^\s,;]+`,
+		mode:    find,
+		inputs: []namedInput{
+			{"5 urls 100KB", urlProseInput([]string{
+				"http://example.com/path/to/page?q=hello&lang=en",
+				"http://api.internal/v2/users/42/profile/settings",
+				"http://cdn.example.net/static/js/bundle.min.js?v=8a3f1b",
+				"http://auth.example.com/oauth2/token?grant_type=client_credentials&scope=read",
+				"http://logs.internal.example.org/api/v1/query?start=now-1h&limit=1000&format=json",
+			})},
+			{"no-url 100KB", urlProseInput(nil)},
+		},
+	},
+	{
+		// Shufti 9..16 first-byte-set amplifier (shipped portion of LNM
+		// Action 3). Pattern's first-byte set is `[0-9a-f]` (exactly 16
+		// chars) — before Shufti, the prefix scan emitted 4*16=64 multi-
+		// eq SIMD ops per chunk; Shufti reduces to ~17 ops/chunk. On 100KB
+		// log-like input with sparse hex strings, this exercises both the
+		// scan throughput and verifier path.
+		name:    "shufti-hex-find-100kb",
+		pattern: `[0-9a-f]{32,}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"5 hashes 100KB", hexHashInput([]string{
+				"a3f7c8b9d2e4501f6a8b9c0d1e2f3456789abcdef0123456789abcdef0123456",
+				"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+				"01234567890abcdef01234567890abcdef01234567890abcdef0123456789ab",
+				"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+				"abc123def456789012345678901234567890abcdef01234567890abcdef0123",
+			})},
+			{"no-hash 100KB", hexHashInput(nil)},
+		},
+	},
+	{
+		// Density-heuristic-NEGATIVE case: `[A-Z]` is 26 chars and each
+		// uppercase letter is rarity class 2 → rarity sum = 52 ≥ threshold
+		// 40, so the density heuristic keeps this on scalar (correctly:
+		// uppercase is sparse enough in prose that scalar's per-byte
+		// early-exit beats Shufti's fixed per-chunk SIMD cost). Pattern
+		// kept as a regression guard: if the heuristic later flips this
+		// to Shufti, expect ~no-change or modest regression.
+		name:    "shufti-upper-find-100kb",
+		pattern: `[A-Z]{8,}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"5 runs 100KB", uppercaseRunInput([]string{
+				"HELLOWORLD",
+				"FOOBARBAZQUX",
+				"SOMECONSTANTNAME",
+				"ANOTHER_LONG_RUN",
+				"YETMOREUPPERCASE",
+			})},
+			{"no-runs 100KB", uppercaseRunInput(nil)},
+		},
+	},
+	{
+		// Density-heuristic-POSITIVE case (deferred portion of LNM Action 3,
+		// shipped 2026-06-17): `[\x00-\x1f]` is 32 chars, all control
+		// bytes, every byte rarity class 0 → sum = 0 < threshold 40 →
+		// Shufti emitted. Scalar would scan every byte (no early exit
+		// since prose has zero control bytes); Shufti's 4-half nibble
+		// lookup at 16 bytes/chunk should crush it. This is the canonical
+		// "narrow-but-large first-byte set" the density-heuristic was
+		// designed to surface.
+		name:    "shufti-ctrl-find-100kb",
+		pattern: `[\x00-\x1f]{4,}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"5 runs 100KB", controlByteRunInput([]string{
+				"\x01\x02\x03\x04\x05",
+				"\x10\x11\x12\x13\x14",
+				"\x07\x08\x0b\x0c\x0e",
+				"\x06\x09\x0a\x0d\x0f",
+				"\x00\x01\x02\x03\x04",
+			})},
+			{"no-runs 100KB", controlByteRunInput(nil)},
+		},
+	},
 }
 
 // secretBaseInput returns a ~10KB environment/config file with many 'e', 'g', 'A'
@@ -663,6 +756,94 @@ All field names are case sensitive and must match the schema definition exactly.
 			pos = len(result)
 		}
 		line := []byte("See " + url + " for details.\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
+// hexHashInput returns ~100 KB of prose with optional hex hashes
+// embedded. The prose is engineered to have very few raw hex characters
+// (0-9, a-f) so the Shufti prefix scan candidate-rate is sparse — the
+// scan-throughput end of the engine dominates, not the DFA verifier.
+func hexHashInput(hashes []string) string {
+	const block = `The quick orange wolf jumps over the lazy puppy. ` +
+		`This sentence has no overlap with the hex alphabet. ` +
+		`Strong intuition pumps lots of work into the system. ` +
+		`Outputs trip the inspector while running through tests. ` +
+		`So-so reports unify the project structure with the goals. `
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+	if len(hashes) == 0 {
+		return base
+	}
+	result := []byte(base)
+	step := len(result) / (len(hashes) + 1)
+	offset := 0
+	for i, h := range hashes {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte("hash: " + h + " end\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
+// controlByteRunInput returns ~100 KB of pure ASCII prose with optional
+// control-byte runs (`[\x00-\x1f]`) embedded. Prose contains zero
+// control bytes, so scalar firstByteFlags scans every byte without
+// finding a candidate — maximum work case. Shufti at 16 bytes/chunk
+// should crush this on no-match input.
+func controlByteRunInput(runs []string) string {
+	const block = `Plain ASCII prose with letters digits punctuation. ` +
+		`No control bytes here at all, only printable seven bit chars. ` +
+		`The scan should walk every byte without finding a candidate. `
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+	if len(runs) == 0 {
+		return base
+	}
+	result := []byte(base)
+	step := len(result) / (len(runs) + 1)
+	offset := 0
+	for i, r := range runs {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte("ctrl: " + r + " end\n")
+		result = append(result[:pos], append(line, result[pos:]...)...)
+		offset += len(line)
+	}
+	return string(result)
+}
+
+// uppercaseRunInput returns ~100 KB of mostly-lowercase prose with
+// optional uppercase runs embedded. Uppercase density on the base
+// (without runs) is ~3 %, matching typical English prose.
+func uppercaseRunInput(runs []string) string {
+	const block = `the quick brown fox jumps over the lazy dog. ` +
+		`this is a fairly standard prose paragraph. ` +
+		`there are occasional capital letters but mostly lowercase. ` +
+		`scan rates and selectivity matter here, not match content. ` +
+		`our pattern is uppercase runs of at least eight characters. `
+	repeat := (100 * 1024) / len(block)
+	base := strings.Repeat(block, repeat)
+	if len(runs) == 0 {
+		return base
+	}
+	result := []byte(base)
+	step := len(result) / (len(runs) + 1)
+	offset := 0
+	for i, r := range runs {
+		pos := (i+1)*step + offset
+		if pos > len(result) {
+			pos = len(result)
+		}
+		line := []byte("token: " + r + " end\n")
 		result = append(result[:pos], append(line, result[pos:]...)...)
 		offset += len(line)
 	}

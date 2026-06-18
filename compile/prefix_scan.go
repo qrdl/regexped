@@ -2,6 +2,106 @@ package compile
 
 import "github.com/qrdl/regexped/internal/utils"
 
+// emitShuftiPrefixCheck emits a SIMD byte-set-membership test (Shufti)
+// against the 16-byte chunk currently in `chunkLocal`. Leaves an i32
+// bitmask on the stack: bit `k` set ⇔ lane k of the chunk is a byte in
+// `firstByteSet`.
+//
+// Used by `EmitPrefixScan` (LNM Action 3) as the SIMD strategy for
+// first-byte sets of 9..64 bytes, replacing the older multi-eq emission
+// that did 4×N ops/chunk. Shufti does ~8 SIMD ops per half-of-8-bytes,
+// scaling sub-linearly with N.
+//
+// Encoding (one half, ≤ 8 bytes):
+//
+//	for i, b := range half {
+//	  bit := byte(1) << i              // each set member gets a unique bit position
+//	  T_lo[b & 0x0F] |= bit            // mark low nibble
+//	  T_hi[b >> 4]   |= bit            // mark high nibble
+//	}
+//
+// For each lane: `T_lo[chunk_lo] & T_hi[chunk_hi]` is non-zero iff the
+// chunk byte's (lo, hi) nibble pair matches a set member's. Across
+// multiple halves of ≤ 8 each, we OR the per-half results.
+//
+// Final reduction:
+//
+//	merged   = (half_0 | half_1 | … | half_{n-1})
+//	non_zero = i8x16.ne(merged, splat(0))      ; lane = 0xFF where set, else 0
+//	mask     = i8x16.bitmask(non_zero)          ; i32 bitmask
+//
+// Tables are inlined as `v128.const` (18 bytes each); Cranelift JIT
+// hoists them out of the scan loop, so per-iter work is just the SIMD
+// ops, not the constant decode.
+//
+// Pre-conditions:
+//   - `chunkLocal` is a v128 local holding the input bytes for the chunk.
+//   - `firstByteSet` has 1..64 distinct bytes; the upper bound matches
+//     EmitPrefixScan's `useSIMD` gate. (More than 8 just means more halves;
+//     more than 64 falls through to scalar.)
+//
+// Post-conditions:
+//   - i32 bitmask on top of stack.
+//   - `chunkLocal` unchanged.
+//   - No other locals written.
+func emitShuftiPrefixCheck(b []byte, firstByteSet []byte, chunkLocal byte) []byte {
+	if len(firstByteSet) == 0 {
+		// No candidates — push 0 onto stack as a trivial bitmask.
+		// (Caller's useSIMD gate makes this unreachable in practice.)
+		return append(b, 0x41, 0x00)
+	}
+
+	halves := (len(firstByteSet) + 7) / 8 // ceil(N/8)
+	for h := 0; h < halves; h++ {
+		start := h * 8
+		end := start + 8
+		if end > len(firstByteSet) {
+			end = len(firstByteSet)
+		}
+		half := firstByteSet[start:end]
+
+		// Build the per-half nibble tables.
+		var tLo, tHi [16]byte
+		for i, fb := range half {
+			bit := byte(1) << uint(i)
+			tLo[fb&0x0F] |= bit
+			tHi[fb>>4] |= bit
+		}
+
+		// swizzle(T_lo, chunk & 0x0F)
+		b = append(b, 0xFD, 0x0C) // v128.const
+		b = append(b, tLo[:]...)
+		b = append(b, 0x20, chunkLocal)
+		b = append(b, 0x41, 0x0F)
+		b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
+		b = append(b, 0xFD, 0x4E) // v128.and  → chunk & 0x0F
+		b = append(b, 0xFD, 0x0E) // i8x16.swizzle → T_lo[chunk & 0x0F]
+
+		// swizzle(T_hi, chunk >> 4)
+		b = append(b, 0xFD, 0x0C) // v128.const
+		b = append(b, tHi[:]...)
+		b = append(b, 0x20, chunkLocal)
+		b = append(b, 0x41, 0x04)
+		b = append(b, 0xFD, 0x6D) // i8x16.shr_u → chunk >> 4
+		b = append(b, 0xFD, 0x0E) // i8x16.swizzle → T_hi[chunk >> 4]
+
+		// half_result = lo_bits & hi_bits
+		b = append(b, 0xFD, 0x4E) // v128.and
+
+		if h > 0 {
+			// merged = merged | half_result
+			b = append(b, 0xFD, 0x50) // v128.or
+		}
+	}
+
+	// Reduce to i32 bitmask of non-zero lanes.
+	b = append(b, 0x41, 0x00) // i32.const 0
+	b = append(b, 0xFD, 0x0F) // i8x16.splat
+	b = append(b, 0xFD, 0x24) // i8x16.ne
+	b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+	return b
+}
+
 // prefixScanLocals holds the WASM local variable indices used by emitPrefixScan.
 // These indices differ per engine because each engine declares its own local layout.
 type prefixScanLocals struct {
@@ -203,8 +303,19 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		// ── firstByteFlags / SIMD fast-skip ──────────────────────────────────
 		// Strategy based on len(p.FirstByteSet):
 		//   <= 8:    2-byte Teddy (when TeddyTwoByte) or 1-byte Teddy
-		//   9..16:   multi-eq SIMD
-		//   > 16:    scalar 256-byte flag table
+		//   9..16:   Shufti — 2-half nibble lookup (LNM Action 3, shipped)
+		//   17..64:  Shufti when `shuftiBeatsScalar(set)`, else scalar
+		//            (LNM Action 3 deferred portion — density heuristic)
+		//   > 64:    scalar 256-byte flag table
+		//
+		// Shufti for 9..16 strictly beats the prior multi-eq emission
+		// (4N ops vs ~17 ops per chunk). For 17..64 we use a byte-rarity
+		// classifier (`shuftiBeatsScalar`, [byte_rarity.go]) to predict
+		// whether scalar's per-chunk early-exit beats Shufti's fixed cost.
+		// Sets whose bytes are individually rare in typical input (sum of
+		// per-byte rarities below a threshold) ⇒ Shufti — scalar would
+		// scan ~all bytes per chunk before exiting. Sets whose bytes are
+		// dense ⇒ scalar — early-exit wins.
 		//
 		// SIMD block nesting (depths from $simd_outer):
 		//   0=$simd_outer 1=$simd_exhausted 2=$found_candidate [engine]
@@ -214,7 +325,14 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		// Scalar tail depths from $skip (scalar-only path):
 		//   0=$skip 1=$skipdone [engine]
 
-		useSIMD := len(p.FirstByteSet) > 0 && len(p.FirstByteSet) <= 16
+		useSIMD := false
+		if n := len(p.FirstByteSet); n > 0 {
+			if n <= 16 {
+				useSIMD = true
+			} else if n <= 64 && shuftiBeatsScalar(p.FirstByteSet) {
+				useSIMD = true
+			}
+		}
 
 		if useSIMD {
 			// Pre-load Teddy tables (loop-invariant).
@@ -388,17 +506,12 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 				b = append(b, 0xFD, 0x24) // i8x16.ne
 				b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
 			} else {
-				// Multi-eq: OR of bitmask(eq(chunk, splat(b))) for each b in FirstByteSet.
-				b = append(b, 0x41, 0x00) // i32.const 0 (accumulator)
-				for _, fb := range p.FirstByteSet {
-					b = append(b, 0x20, l.Chunk)
-					b = append(b, 0x41)
-					b = utils.AppendSLEB128(b, int32(fb))
-					b = append(b, 0xFD, 0x0F) // i8x16.splat
-					b = append(b, 0xFD, 0x23) // i8x16.eq
-					b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
-					b = append(b, 0x72)       // i32.or
-				}
+				// Shufti: multi-half nibble lookup for FirstByteSet of 9..64 bytes.
+				// Each half of ≤ 8 bytes gets its own (T_lo, T_hi) 16-byte
+				// bitmap pair; the SIMD test ORs all halves and reduces to a
+				// per-lane non-zero check. See LNM Action 3 / LIKELY.md Phase 5
+				// for the broader history of Shufti adoption in regexped.
+				b = emitShuftiPrefixCheck(b, p.FirstByteSet, l.Chunk)
 			}
 
 			// mask on stack → tee + if mask != 0.

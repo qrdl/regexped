@@ -1671,3 +1671,52 @@ regexps
 -;7-47;-;-;;7-47 - 7-47
 0-40 - 0-40;0-40;-;-
 -;-;-;-
+# ============================================================
+# Category 28: First-byte set in 17..64 byte band
+# Exercises the density-heuristic Shufti routing in
+# emitPrefixScan (compile/prefix_scan.go:332). Without these,
+# re2 corpus may not contain patterns hitting the new branch.
+#   "[A-Z]{8,}"        n=26 sum=52 → scalar firstByteFlags
+#   "[\x00-\x1f]{4,}" n=32 sum=9  → Shufti SIMD (NEW path)
+# ============================================================
+Cat28FirstByteSet17to64
+strings
+""
+"abc"
+"ABCDEFG"
+"ABCDEFGH"
+"HELLO WORLD"
+"prefix ABCDEFGHIJ suffix"
+"abcDEFGHIJKLMxyz"
+"\x01\x02\x03"
+"\x01\x02\x03\x04"
+"a\x00\x00\x00\x00b"
+"prefix\t\t\t\t\tsuffix"
+"hello\x1f\x1f\x1f\x1f world"
+regexps
+"[A-Z]{8,}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-8;0-8;-;-
+-;-;-;-
+-;7-17;-;-
+-;3-13;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"[\\x00-\\x1f]{4,}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-4;0-4;-;-
+-;1-5;-;-
+-;6-11;-;-
+-;5-9;-;-

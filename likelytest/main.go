@@ -192,6 +192,53 @@ var tests = []testCase{
 		nomatchInput: proseInput(nil),
 	},
 	{
+		// Phase 5 amplifier: long URL bodies between literal `://` and a
+		// whitespace exit. Exit set `\s` = `\t\n\v\f\r ` (6 bytes), so
+		// Phase 2's single-byte bulk-skip can't fire. Phase 5's Shufti-
+		// style nibble-table SIMD lookup is needed.
+		name:         "url-suffix-large",
+		pattern:      `https?://[^\s]+`,
+		mode:         modeFind,
+		notes:        "multi-byte exit set (\\s) — Phase 5 nibble-lookup target",
+		matchInput:   longURLInput(true),
+		nomatchInput: longURLInput(false),
+	},
+	// ── Shufti prefix-scan targets (LNM Action 3) ───────────────────────
+	// Patterns with no usable literal anchor (no mandatoryLit) and a
+	// first-byte set of varying size. Today these fall to multi-eq SIMD
+	// (set size 5..16) or the scalar firstByteFlags loop (set > 16).
+	// Shufti should accelerate the prefix scan in both cases.
+	{
+		// 16-byte first-set (hex chars) — currently multi-eq SIMD
+		// (4*N=64 ops/chunk). Shufti should be ~8 ops/chunk.
+		name:         "hex-run",
+		pattern:      `[0-9a-f]{32}`,
+		mode:         modeFind,
+		notes:        "16-byte first-set (hex) — multi-eq → Shufti target",
+		matchInput:   classRunInput(true, "0123456789abcdef", 32, 5),
+		nomatchInput: classRunInput(false, "", 0, 0),
+	},
+	{
+		// 52-byte first-set (letters) — currently scalar firstByteFlags
+		// (1 byte/cycle). Shufti should be ~16 bytes/cycle.
+		name:         "alpha-run",
+		pattern:      `[a-zA-Z]{20,}`,
+		mode:         modeFind,
+		notes:        "52-byte first-set (letters) — scalar → Shufti target",
+		matchInput:   classRunInput(true, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 20, 5),
+		nomatchInput: classRunInput(false, "", 0, 0),
+	},
+	{
+		// 63-byte first-set (word chars + underscore). Same shape as
+		// alpha-run but slightly broader; scalar today.
+		name:         "word-run",
+		pattern:      `[a-zA-Z0-9_]{20,}`,
+		mode:         modeFind,
+		notes:        "63-byte first-set (word chars) — scalar → Shufti target",
+		matchInput:   classRunInput(true, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", 20, 5),
+		nomatchInput: classRunInput(false, "", 0, 0),
+	},
+	{
 		// Mixed: comment-line OR block-comment. Both branches have self-loop
 		// suffix states; block comment can be hundreds of bytes long. Stresses
 		// both Opt 1 (self-loop bulk skip) and Teddy frontend.
@@ -641,6 +688,87 @@ func longCommentsMixedInput(withMatches bool) string {
 	filler := []byte("plain text with no slashes at all and certainly nothing resembling a comment marker here\n")
 	for len(b) < targetSize {
 		b = append(b, filler...)
+	}
+	return string(b[:targetSize])
+}
+
+// classRunInput builds ~50 KB of input for the Shufti prefix-scan sweep.
+//
+// When withMatches is true, the buffer contains `runs` × (`runLen`
+// consecutive chars from `class`) embedded in prose so the pattern
+// `[class]{runLen,}` matches. When false, pure prose (no run of `runLen`
+// consecutive class chars).
+//
+// The no-match input intentionally contains plenty of letters/digits
+// that ARE in many classes (so Teddy/firstByte filters fire often) but
+// without the run length needed to complete a match. That stresses the
+// prefix-scan throughput end of the engine: scan-rate dominates, DFA
+// verification trips early.
+func classRunInput(withMatches bool, class string, runLen, runs int) string {
+	const targetSize = 50 * 1024
+	prose := []byte("The quick brown fox jumps over the lazy dog. ")
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, prose...)
+		}
+		return string(b[:targetSize])
+	}
+	var b []byte
+	classBytes := []byte(class)
+	for i := 0; i < runs; i++ {
+		// Embed a leading word boundary (space) so the run is clearly
+		// delimited.
+		b = append(b, ' ')
+		for j := 0; j < runLen; j++ {
+			b = append(b, classBytes[j%len(classBytes)])
+		}
+		b = append(b, ' ')
+	}
+	for len(b) < targetSize {
+		b = append(b, prose...)
+	}
+	return string(b[:targetSize])
+}
+
+// longURLInput returns ~50 KB of prose-like text with optional long URL
+// matches for `https?://[^\s]+`.
+//
+// When withMatches is true: 5 URLs are embedded, each with a body of
+// ~9 KB of URL-shaped characters (alphanumerics + `/`, `?`, `&`, `=`,
+// `_`, `-`, `.`, `%`) followed by a space. The body's first byte is
+// not whitespace so `[^\s]+` consumes the full ~9 KB, exercising the
+// bulk-skip SIMD path for the 6-byte exit set `\s` = `\t\n\v\f\r `.
+//
+// When withMatches is false: pure prose with no `http` or `https`
+// substrings (and no `://` either), so Teddy never fires; tests for
+// no-match regression introduced by Phase 5's larger emission.
+func longURLInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		var b []byte
+		filler := []byte("The quick brown fox jumps over the lazy dog. ")
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	var b []byte
+	for i := 0; i < 5; i++ {
+		b = append(b, []byte("https://example.com/")...)
+		// ~9 KB of URL-body characters (no whitespace).
+		bodyFiller := []byte("path/to/resource?key=value&id=12345_abc.json/api/v2/users-list%20foo/bar/baz/qux/quux/corge/grault/garply/")
+		for j := 0; j < 90; j++ { // ~9 KB per URL
+			b = append(b, bodyFiller...)
+		}
+		// Whitespace ends the match.
+		b = append(b, ' ')
+		b = append(b, '\n')
+	}
+	// Pad with non-URL prose.
+	pad := []byte("plain prose without any URL markers here at all\n")
+	for len(b) < targetSize {
+		b = append(b, pad...)
 	}
 	return string(b[:targetSize])
 }
