@@ -838,8 +838,12 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				// Skipped for anchored find — that path uses a different
 				// builder (`buildAnchoredFindBody`) whose midAccept
 				// consumers don't know about the encoding.
-				canEmitOpt1 := buildOpts.LikelyMode == LikelyMatch &&
-					!isAnchoredFind(table)
+				// TODO task 7 step 1: Opt 1 (mid-accept dominant only) is
+				// regression-free and now defaults on for all modes. The
+				// previous LikelyMatch-only gate is removed; isAnchoredFind
+				// is still excluded (buildAnchoredFindBody doesn't decode
+				// the dominantStates encoding).
+				canEmitOpt1 := !isAnchoredFind(table)
 				if canEmitOpt1 {
 					applyDominantStateEncoding(l)
 				} else {
