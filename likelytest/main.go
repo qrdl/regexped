@@ -557,6 +557,20 @@ var tests = []testCase{
 		}),
 		nomatchInput: configInput(nil),
 	},
+	{
+		// LNM Action 5 amplifier: pattern accepts only [a-zA-Z] (52-byte
+		// set, routed to scalar by Action 3 density heuristic). Input is
+		// dominated by digits/punctuation/whitespace — bytes that no
+		// state can consume ("impossible bytes"). Scalar firstByteFlags
+		// pays 1 byte/cycle through long impossible runs; Action 5's
+		// SIMD impossible-byte skip should cut that to ~16 bytes/cycle.
+		name:         "alpha-run-impossible-bytes",
+		pattern:      `[a-zA-Z]{8,}`,
+		mode:         modeFind,
+		notes:        "52-byte first-set in mostly-impossible-byte input — LNM Action 5 target",
+		matchInput:   impossibleRunInput(true),
+		nomatchInput: impossibleRunInput(false),
+	},
 }
 
 // --------------------------------------------------------------------------
@@ -727,6 +741,42 @@ func classRunInput(withMatches bool, class string, runLen, runs int) string {
 	}
 	for len(b) < targetSize {
 		b = append(b, prose...)
+	}
+	return string(b[:targetSize])
+}
+
+// impossibleRunInput builds ~50 KB of input dominated by bytes outside
+// the [a-zA-Z] class — digits, punctuation, whitespace. For the LNM
+// Action 5 (impossible-byte SIMD skip) demonstration.
+//
+// When withMatches is true: 5 letter runs (≥8 chars) embedded between
+// long blocks of impossible bytes. The scalar prefix scan crawls
+// through the impossible runs byte-by-byte; Action 5 should
+// SIMD-skip them.
+// When withMatches is false: pure impossible bytes, no letter runs.
+func impossibleRunInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	filler := []byte("0123456789.,;:!?@#$%^&*()-+=[]{}|\\/<> \t01234567")
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	var b []byte
+	run := []byte("ABCDEFGHIJKLMN")
+	chunkSize := targetSize / 6
+	for i := 0; i < 5; i++ {
+		for len(b) < (i+1)*chunkSize {
+			b = append(b, filler...)
+		}
+		b = append(b, ' ')
+		b = append(b, run...)
+		b = append(b, ' ')
+	}
+	for len(b) < targetSize {
+		b = append(b, filler...)
 	}
 	return string(b[:targetSize])
 }

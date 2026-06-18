@@ -845,6 +845,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				} else {
 					l.dominantStates = nil
 				}
+				l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
 				p.findBody = appendFindCodeEntry(nil, l, table, patMandLit, buildOpts.tableMemIdx)
 				// The smarter-gate (first-byte-rarity heuristic) and the
 				// non-mid bulk-skip helper construction were extracted to

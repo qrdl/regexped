@@ -150,6 +150,12 @@ type prefixScanParams struct {
 	// 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables).
 	TableMemIdx int
 
+	// LikelyNoMatch (LNM Action 5 — impossible-byte SIMD skip):
+	// when true, the 17..64-byte first-byte set gate ignores the density
+	// heuristic and forces Shufti. Set from buildOpts.LikelyMode ==
+	// LikelyNoMatch.
+	LikelyNoMatch bool
+
 	Locals prefixScanLocals
 
 	// OnMatch is called after the scan finds a candidate and all scan blocks
@@ -329,7 +335,7 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		if n := len(p.FirstByteSet); n > 0 {
 			if n <= 16 {
 				useSIMD = true
-			} else if n <= 64 && shuftiBeatsScalar(p.FirstByteSet) {
+			} else if n <= 64 && (p.LikelyNoMatch || shuftiBeatsScalar(p.FirstByteSet)) {
 				useSIMD = true
 			}
 		}
