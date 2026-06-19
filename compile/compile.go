@@ -620,6 +620,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false)
+			// Phase 4: enable mid-accept dominant bulk-skip in match body.
+			// Same recipe as find-body Opt 1 (now default-on for all modes;
+			// anchored-find doesn't apply to the LL DFA used by anchored match).
+			applyDominantStateEncoding(lm)
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
 			matchData = rawM

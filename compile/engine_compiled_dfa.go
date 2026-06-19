@@ -147,10 +147,21 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	const localPos = uint32(3)
 	const localClass = uint32(4)
 
+	// Phase 4: when mid-accept dominants exist, add v128 chunk local
+	// (and tmp i32 for the non-compressed path, which lacks a class local).
+	emitMidDom := len(l.dominantStates) > 0
 	if l.useCompression {
-		b = append(b, 0x01, 0x03, 0x7F) // 3 i32: state, pos, class
+		if emitMidDom {
+			b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7B) // 3 i32 + 1 v128
+		} else {
+			b = append(b, 0x01, 0x03, 0x7F) // 3 i32: state, pos, class
+		}
 	} else {
-		b = append(b, 0x01, 0x02, 0x7F) // 2 i32: state, pos
+		if emitMidDom {
+			b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7B) // 3 i32 (+tmp) + 1 v128
+		} else {
+			b = append(b, 0x01, 0x02, 0x7F) // 2 i32: state, pos
+		}
 	}
 
 	// Literal chain prefix.
@@ -264,6 +275,11 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 	}
+
+	// Phase 4 dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
+	// or extra i32 added by the locals declaration above).
+	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx,
+		byte(localState), byte(localPos), 0x01, 0x00, 0x05, byte(localClass))
 
 	// pos++
 	b = append(b, 0x20, byte(localPos))

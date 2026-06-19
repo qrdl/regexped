@@ -571,6 +571,24 @@ var tests = []testCase{
 		matchInput:   impossibleRunInput(true),
 		nomatchInput: impossibleRunInput(false),
 	},
+	{
+		// LIKELY.md Phase 4 amplifier: anchored match `[^\n]*` on ~50 KB of
+		// newline-free text. The DFA sits in the dominant self-loop body
+		// state for the entire input. Phase 2/3/5 already optimize this
+		// shape in find mode (see `comment-line-large` — −95% fuel);
+		// Phase 4 extends the bulk-skip to `buildMatchBody`.
+		//
+		// Match input: ~50 KB no newlines → anchored match consumes all,
+		// DFA stays in self-loop body across the full input.
+		// No-match input: one '\n' near the middle → DFA self-loops half
+		// the input, hits '\n', dies, anchored match fails.
+		name:         "anchored-self-loop-large",
+		pattern:      `[^\n]*`,
+		mode:         modeAnchored,
+		notes:        "anchored [^\\n]* — LIKELY.md Phase 4 (match-body bulk-skip) target",
+		matchInput:   noNewlineInput(true),
+		nomatchInput: noNewlineInput(false),
+	},
 }
 
 // --------------------------------------------------------------------------
@@ -743,6 +761,29 @@ func classRunInput(withMatches bool, class string, runLen, runs int) string {
 		b = append(b, prose...)
 	}
 	return string(b[:targetSize])
+}
+
+// noNewlineInput builds ~50 KB of newline-free prose for the Phase 4
+// (anchored match-body bulk-skip) amplifier on `[^\n]*`.
+//
+// When withMatch is true: pure newline-free text — anchored match
+// consumes all input, DFA stays in the dominant self-loop body state
+// across the full 50 KB.
+// When false: identical text with a single '\n' near the middle —
+// DFA self-loops up to the newline, dies, anchored match fails. Used
+// to verify the no-match path remains regression-free.
+func noNewlineInput(withMatch bool) string {
+	const targetSize = 50 * 1024
+	base := []byte("The quick brown fox jumps over the lazy dog. ")
+	var b []byte
+	for len(b) < targetSize {
+		b = append(b, base...)
+	}
+	b = b[:targetSize]
+	if !withMatch {
+		b[targetSize/2] = '\n'
+	}
+	return string(b)
 }
 
 // impossibleRunInput builds ~50 KB of input dominated by bytes outside
