@@ -621,8 +621,17 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false)
 			// Phase 4: enable mid-accept dominant bulk-skip in match body.
-			// Same recipe as find-body Opt 1 (now default-on for all modes;
-			// anchored-find doesn't apply to the LL DFA used by anchored match).
+			// Mid-accept default-on; non-mid-accept gated under LikelyMatch
+			// (mirroring the find-body gate at the canEmitOpt1 site).
+			if buildOpts.LikelyMode != LikelyMatch {
+				filtered := lm.dominantStates[:0]
+				for _, info := range lm.dominantStates {
+					if info.isMidAccept {
+						filtered = append(filtered, info)
+					}
+				}
+				lm.dominantStates = filtered
+			}
 			applyDominantStateEncoding(lm)
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
@@ -849,6 +858,22 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				// the dominantStates encoding).
 				canEmitOpt1 := !isAnchoredFind(table)
 				if canEmitOpt1 {
+					// Non-mid-accept dominant dispatch is gated under
+					// LikelyMatch (task 7 step 2). It produces large
+					// match wins (-94..-98%) but adds a +48% no-match
+					// regression to patterns that emit it. LM users have
+					// signalled match-heavy workloads and accept the
+					// trade-off; neutral users keep the no-regression
+					// shipped behaviour.
+					if buildOpts.LikelyMode != LikelyMatch {
+						filtered := l.dominantStates[:0]
+						for _, info := range l.dominantStates {
+							if info.isMidAccept {
+								filtered = append(filtered, info)
+							}
+						}
+						l.dominantStates = filtered
+					}
 					applyDominantStateEncoding(l)
 				} else {
 					l.dominantStates = nil
