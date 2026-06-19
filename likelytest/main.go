@@ -589,6 +589,24 @@ var tests = []testCase{
 		matchInput:   noNewlineInput(true),
 		nomatchInput: noNewlineInput(false),
 	},
+	{
+		// Task 7 step 2 + Phase 4 synergy: anchored match `<[^>]+>` on
+		// ~50 KB. The body state `[^>]+` is a NON-mid-accept dominant
+		// self-loop (must see closing `>` before accepting). Phase 4
+		// today only dispatches mid-accept dominants in `buildMatchBody`
+		// /`buildHybridMatchBody`; this case won't fire bulk-skip until
+		// we extend non-mid dispatch to the match-body paths under the
+		// same LikelyMatch gate as the find-body extension.
+		//
+		// Match input: `<` + ~51 KB non-`>` body + `>`.
+		// No-match input: `<` + ~51 KB non-`>` body, no closing `>`.
+		name:         "anchored-xml-tag-large",
+		pattern:      `<[^>]+>`,
+		mode:         modeAnchored,
+		notes:        "anchored <[^>]+> — non-mid dominant body, match-body extension target",
+		matchInput:   xmlTagWrappedInput(true),
+		nomatchInput: xmlTagWrappedInput(false),
+	},
 }
 
 // --------------------------------------------------------------------------
@@ -761,6 +779,24 @@ func classRunInput(withMatches bool, class string, runLen, runs int) string {
 		b = append(b, prose...)
 	}
 	return string(b[:targetSize])
+}
+
+// xmlTagWrappedInput builds a ~50 KB string for anchored `<[^>]+>`.
+// When wrapped is true: `<` + 51,198 non-`>` body bytes + `>` (matches).
+// When false: `<` + 51,199 non-`>` body bytes, no closing `>` (DFA
+// scans the full body, dies at end-of-input without seeing `>`).
+func xmlTagWrappedInput(wrapped bool) string {
+	const targetSize = 50 * 1024
+	body := make([]byte, targetSize-2)
+	filler := []byte("abcdefghijklmnopqrstuvwxyz0123456789 ")
+	for i := range body {
+		body[i] = filler[i%len(filler)]
+	}
+	if wrapped {
+		return "<" + string(body) + ">"
+	}
+	// One extra body byte to keep total length equal to the match case.
+	return "<" + string(body) + "x"
 }
 
 // noNewlineInput builds ~50 KB of newline-free prose for the Phase 4

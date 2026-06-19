@@ -278,7 +278,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 
 	// Phase 4 dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
 	// or extra i32 added by the locals declaration above).
-	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx,
+	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, l.nonMidDominantOff, tableMemIdx,
 		byte(localState), byte(localPos), 0x01, 0x00, 0x05, byte(localClass))
 
 	// pos++

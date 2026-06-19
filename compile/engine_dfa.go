@@ -2206,10 +2206,15 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			}
 		} else {
 			// Non-find path: transitions + (optional) midAccept for Phase 4
-			// match-body bulk-skip dispatch + TDFA accept tables.
+			// match-body bulk-skip dispatch + (optional) nonMidDominantBytes
+			// for the LM-gated non-mid match-body dispatch + TDFA accept tables.
 			emitMidAccept := len(l.dominantStates) > 0
+			emitNonMid := l.nonMidDominantBytes != nil
 			count := byte(2) // classMap + transitions
 			if emitMidAccept {
+				count++
+			}
+			if emitNonMid {
 				count++
 			}
 			if l.hasImmAccept && l.useAcceptSideTable {
@@ -2238,6 +2243,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			}
 			if emitMidAccept {
 				ds = appendDataSegment(ds, l.midAcceptOff, l.midAcceptBytes)
+			}
+			if emitNonMid {
+				ds = appendDataSegment(ds, l.nonMidDominantOff, l.nonMidDominantBytes)
 			}
 			if l.hasImmAccept && l.useAcceptSideTable {
 				ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
@@ -2280,10 +2288,15 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			}
 		} else {
 			// Non-find path: transitions + (optional) midAccept for Phase 4
-			// match-body bulk-skip + TDFA accept tables.
+			// match-body bulk-skip + (optional) nonMidDominantBytes for the
+			// LM-gated non-mid match-body dispatch + TDFA accept tables.
 			emitMidAccept := len(l.dominantStates) > 0
+			emitNonMid := l.nonMidDominantBytes != nil
 			count := byte(1) // transitions
 			if emitMidAccept {
+				count++
+			}
+			if emitNonMid {
 				count++
 			}
 			if l.useAcceptSideTable {
@@ -2311,6 +2324,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			}
 			if emitMidAccept {
 				ds = appendDataSegment(ds, l.midAcceptOff, l.midAcceptBytes)
+			}
+			if emitNonMid {
+				ds = appendDataSegment(ds, l.nonMidDominantOff, l.nonMidDominantBytes)
 			}
 			if l.hasImmAccept && l.useAcceptSideTable {
 				ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
@@ -2760,7 +2776,7 @@ func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, hasImmAccept boo
 		body = buildMatchBody(l.wasmStart, l.tableOff, l.classMapOff,
 			l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
 			l.immAcceptLimit, hasImmAccept, l.rowMapOff, l.useRowDedup, tableMemIdx,
-			l.midAcceptOff, l.dominantStates)
+			l.midAcceptOff, l.nonMidDominantOff, l.dominantStates)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -3041,39 +3057,80 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 // After the block, pos is positioned so the next pos++ takes execution
 // past the self-loop bytes and onto the first exit byte (which the next
 // scan iteration will transition on).
-// emitPhase4Dispatch emits the Phase 4 match-body bulk-skip dispatch:
-// load midAccept[state]; if non-zero, for each dominant state compare
-// against its encoded byte and on match call emitDominantBulkSkip.
-// updateLastAccept is always false in match mode (no last_accept tracking).
+// emitPhase4Dispatch emits the Phase 4 match-body bulk-skip dispatch.
+// Two dispatch blocks emitted in sequence (each gated on its own table
+// load):
+//   - mid-accept dominants  → midAcceptBytes[state] piggyback
+//   - non-mid-accept doms   → nonMidDominantBytes[state] side table
+//                             (only when nonMidDominantOff != 0)
+// updateLastAccept is always false in match mode.
 //
 // Uses 1 v128 local (chunk) and 1 i32 local (tmp). Callers that already
 // have a scratch i32 (e.g. class/byte locals) reuse it as tmp.
 func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
-	midAcceptOff int32, tableMemIdx int,
+	midAcceptOff, nonMidDominantOff int32, tableMemIdx int,
 	stateLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal byte) []byte {
 	if len(dominantStates) == 0 {
 		return b
 	}
-	// tmp = midAccept[state]
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, midAcceptOff)
-	b = append(b, 0x20, stateLocal)
-	b = append(b, 0x6A) // i32.add
-	b = appendTableLoad8u(b, tableMemIdx)
-	b = append(b, 0x22, tmpLocal) // local.tee tmp
-	b = append(b, 0x04, 0x40)     // if (midAccept != 0)
+	// Count entries per channel to skip emission when one channel is empty.
+	hasMid, hasNonMid := false, false
 	for _, info := range dominantStates {
-		b = append(b, 0x20, tmpLocal)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(info.encodedByte))
-		b = append(b, 0x46)       // i32.eq
-		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDominantBulkSkip(b, info.exitBytes, false,
-			posLocal, lenLocal, /*lastAccept=*/ 0x00, ptrLocal,
-			chunkLocal, tmpLocal)
-		b = append(b, 0x0B) // end if (per-dominant gate)
+		if info.isMidAccept {
+			hasMid = true
+		} else {
+			hasNonMid = true
+		}
 	}
-	b = append(b, 0x0B) // end if (midAccept != 0)
+	if hasMid {
+		// tmp = midAccept[state]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptOff)
+		b = append(b, 0x20, stateLocal)
+		b = append(b, 0x6A) // i32.add
+		b = appendTableLoad8u(b, tableMemIdx)
+		b = append(b, 0x22, tmpLocal) // local.tee tmp
+		b = append(b, 0x04, 0x40)     // if (midAccept != 0)
+		for _, info := range dominantStates {
+			if !info.isMidAccept {
+				continue
+			}
+			b = append(b, 0x20, tmpLocal)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(info.encodedByte))
+			b = append(b, 0x46)       // i32.eq
+			b = append(b, 0x04, 0x40) // if (void)
+			b = emitDominantBulkSkip(b, info.exitBytes, false,
+				posLocal, lenLocal, /*lastAccept=*/ 0x00, ptrLocal,
+				chunkLocal, tmpLocal)
+			b = append(b, 0x0B) // end if (per-dominant gate)
+		}
+		b = append(b, 0x0B) // end if (midAccept != 0)
+	}
+	if hasNonMid && nonMidDominantOff != 0 {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, nonMidDominantOff)
+		b = append(b, 0x20, stateLocal)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx)
+		b = append(b, 0x22, tmpLocal) // tmp = nonMidDominantBytes[state]
+		b = append(b, 0x04, 0x40)     // if (nonMidDominant != 0)
+		for _, info := range dominantStates {
+			if info.isMidAccept {
+				continue
+			}
+			b = append(b, 0x20, tmpLocal)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(info.encodedByte))
+			b = append(b, 0x46)
+			b = append(b, 0x04, 0x40)
+			b = emitDominantBulkSkip(b, info.exitBytes, false,
+				posLocal, lenLocal, /*lastAccept=*/ 0x00, ptrLocal,
+				chunkLocal, tmpLocal)
+			b = append(b, 0x0B)
+		}
+		b = append(b, 0x0B) // end if (nonMidDominant != 0)
+	}
 	return b
 }
 
@@ -3365,7 +3422,7 @@ func emitNLPreAcceptCheck(b []byte, midAcceptNLOff int32,
 //
 // startStateAccept: true when the DFA start state itself is an accepting state
 // (handles the empty-input case where no transition is ever taken).
-func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, immAcceptLimit int32, hasImmAccept bool, rowMapOff int32, useRowDedup bool, tableMemIdx int, midAcceptOff int32, dominantStates []dominantInfo) []byte {
+func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, immAcceptLimit int32, hasImmAccept bool, rowMapOff int32, useRowDedup bool, tableMemIdx int, midAcceptOff, nonMidDominantOff int32, dominantStates []dominantInfo) []byte {
 	var b []byte
 
 	// emitAcceptCheck emits the final post-loop accept check:
@@ -3423,7 +3480,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse class).
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04)
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, nonMidDominantOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -3470,7 +3527,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		// Phase 4 dispatch: tmp=local 4, chunk=local 5.
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04)
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, nonMidDominantOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -3523,7 +3580,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 	b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 	// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse byte).
-	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04)
+	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, nonMidDominantOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)
