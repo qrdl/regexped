@@ -834,59 +834,32 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					}
 				}
 			}
-			if p.litAnchorBackScanBody == nil {
-				// Opt 1 — dominant-self-loop SIMD bulk-skip. Despite being
-				// historically named "LikelyNoMatch", this optimisation
-				// accelerates the MATCH path (long stretches in a dominant
-				// self-loop state during a successful match — e.g. the body
-				// of `[^\n]+` after `//`). It is therefore gated under
-				// LikelyMatch, alongside the lit-chain Opt 2. LikelyNoMatch
-				// is currently unused; see TODO task 7 for the revisit plan
-				// (the original no-match optimisation it was meant to
-				// represent — initial-state self-loop bulk-skip — is
-				// already covered by the Teddy / firstByteFlags prefix
-				// scan).
-				//
-				// Skipped for anchored find — that path uses a different
-				// builder (`buildAnchoredFindBody`) whose midAccept
-				// consumers don't know about the encoding.
-				// TODO task 7 step 1: Opt 1 (mid-accept dominant only) is
-				// regression-free and now defaults on for all modes. The
-				// previous LikelyMatch-only gate is removed; isAnchoredFind
-				// is still excluded (buildAnchoredFindBody doesn't decode
-				// the dominantStates encoding).
-				canEmitOpt1 := !isAnchoredFind(table)
-				if canEmitOpt1 {
-					// Non-mid dispatch (state-ID compare emission) is
-					// gated under LikelyMatch. Investigation showed the
-					// state-ID workaround eliminates the +47% no-match
-					// regression for 4 of 6 canonical patterns but two
-					// (rare-first-byte / multi-dominant) still regress
-					// from microarchitectural / Cranelift effects we
-					// cannot address from the WASM layer. LM users have
-					// signalled "matches likely" and accept the cold-path
-					// trade-off; neutral / LikelyNoMatch users keep the
-					// no-regression baseline.
-					if buildOpts.LikelyMode != LikelyMatch {
-						filtered := l.dominantStates[:0]
-						for _, info := range l.dominantStates {
-							if info.isMidAccept {
-								filtered = append(filtered, info)
-							}
+			// Opt 1 — dominant-self-loop SIMD bulk-skip. The mid-accept
+			// channel is default-on for all modes; non-mid is LM-gated.
+			// Anchored find uses a separate builder (buildAnchoredFindBody)
+			// whose midAccept consumers don't decode the encoding, so we
+			// skip it there. Lit-anchor's forward DFA scan
+			// (buildLitAnchorFindBody) DOES decode it, so we apply the
+			// encoding regardless of whether p.litAnchorBackScanBody is
+			// set — both paths benefit.
+			canEmitOpt1 := !isAnchoredFind(table)
+			if canEmitOpt1 {
+				if buildOpts.LikelyMode != LikelyMatch {
+					filtered := l.dominantStates[:0]
+					for _, info := range l.dominantStates {
+						if info.isMidAccept {
+							filtered = append(filtered, info)
 						}
-						l.dominantStates = filtered
 					}
-					applyDominantStateEncoding(l)
-				} else {
-					l.dominantStates = nil
+					l.dominantStates = filtered
 				}
-				l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
+				applyDominantStateEncoding(l)
+			} else {
+				l.dominantStates = nil
+			}
+			l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
+			if p.litAnchorBackScanBody == nil {
 				p.findBody = appendFindCodeEntry(nil, l, table, patMandLit, buildOpts.tableMemIdx)
-				// The smarter-gate (first-byte-rarity heuristic) and the
-				// non-mid bulk-skip helper construction were extracted to
-				// plans/non_mid_extension.go.archive (Section 17). Detection
-				// now records only mid-accept dominants, and there's no
-				// helper to build.
 			}
 
 			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))

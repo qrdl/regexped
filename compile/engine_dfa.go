@@ -4316,17 +4316,66 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x0B)       // end if dead
 
 	// if midAccept[state]: last_accept = pos + 1
+	// Suggestion 3: dispatch dominant bulk-skip from inside lit-anchor's
+	// forward DFA scan. Mid-accept entries piggyback on the midAccept load
+	// (same shape as buildFindBody). Non-mid entries use state-ID compares
+	// outside the midAccept block (LM-gated via dominantStates filtering
+	// in compile.go).
+	hasMidDom := false
+	hasNonMidDom := false
+	for _, info := range l.dominantStates {
+		if info.isMidAccept {
+			hasMidDom = true
+		} else {
+			hasNonMidDom = true
+		}
+	}
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, l.midAcceptOff)
 	b = append(b, 0x20, locState)
 	b = append(b, 0x6A)
 	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-	b = append(b, 0x04, 0x40)             // if (void)
+	if hasMidDom {
+		b = append(b, 0x22, locSimdOrClass) // local.tee — cache value
+	}
+	b = append(b, 0x04, 0x40) // if (void)
 	b = append(b, 0x20, locPos)
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6A) // pos + 1
 	b = append(b, 0x21, locLastAccept)
+	if hasMidDom {
+		for _, info := range l.dominantStates {
+			if !info.isMidAccept {
+				continue
+			}
+			b = append(b, 0x20, locSimdOrClass)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(info.encodedByte))
+			b = append(b, 0x46)       // i32.eq
+			b = append(b, 0x04, 0x40) // if (void)
+			b = emitDominantBulkSkip(b, info.exitBytes, true,
+				locPos, locLen, locLastAccept, locPtr,
+				locChunk, locSimdOrClass)
+			b = append(b, 0x0B) // end if (per-dominant gate)
+		}
+	}
 	b = append(b, 0x0B) // end if midAccept
+	if hasNonMidDom {
+		for _, info := range l.dominantStates {
+			if info.isMidAccept {
+				continue
+			}
+			b = append(b, 0x20, locState)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, info.state)
+			b = append(b, 0x46)       // i32.eq
+			b = append(b, 0x04, 0x40) // if (void)
+			b = emitDominantBulkSkip(b, info.exitBytes, false,
+				locPos, locLen, locLastAccept, locPtr,
+				locChunk, locSimdOrClass)
+			b = append(b, 0x0B) // end if (state == K)
+		}
+	}
 
 	b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, locLastAccept, 2, tableMemIdx)
 

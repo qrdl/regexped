@@ -607,6 +607,23 @@ var tests = []testCase{
 		matchInput:   xmlTagWrappedInput(true),
 		nomatchInput: xmlTagWrappedInput(false),
 	},
+	{
+		// Suggestion 3 target: lit-anchored find with a dominant self-loop
+		// body. Lit-anchor (`findLitAnchorPoint`) requires a 2+ byte
+		// literal CHILD with a non-empty prefix whose reverse DFA's start
+		// state is non-accepting. Counted-chain `{4}` qualifies; unbounded
+		// `+` does not (reverse accepts empty). Pattern shape:
+		//   prefix `[0-9]{4}` (non-empty, fixed-length) + literal `INFO:`
+		//   (5 bytes) + body `[^\n]+` (mid-accept dominant self-loop).
+		// Today buildLitAnchorFindBody doesn't dispatch dominant bulk-skip
+		// inside its forward DFA, so the body scan is byte-by-byte.
+		name:         "lit-anchor-dominant-body",
+		pattern:      `[0-9]{4}INFO:[^\n]+`,
+		mode:         modeFind,
+		notes:        "lit-anchor + mid-accept dominant body — buildLitAnchorFindBody extension target",
+		matchInput:   litAnchorDominantBodyInput(true),
+		nomatchInput: litAnchorDominantBodyInput(false),
+	},
 }
 
 // --------------------------------------------------------------------------
@@ -774,6 +791,41 @@ func classRunInput(withMatches bool, class string, runLen, runs int) string {
 			b = append(b, classBytes[j%len(classBytes)])
 		}
 		b = append(b, ' ')
+	}
+	for len(b) < targetSize {
+		b = append(b, prose...)
+	}
+	return string(b[:targetSize])
+}
+
+// litAnchorDominantBodyInput builds a ~50 KB input for `[0-9]{4}INFO:[^\n]+`.
+// Goes through the lit-anchor find path: Teddy scans for `INFO:`, reverse
+// DFA verifies preceding digits, forward DFA scans the long body.
+//
+// When withMatches is true: 2 long matches embedded:
+//   `0001INFO:` + ~24 KB non-newline body + `\n` + filler +
+//   `0002INFO:` + ~24 KB non-newline body + `\n`.
+// When false: pure prose with no `INFO:` substring (no Teddy hits).
+func litAnchorDominantBodyInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	prose := []byte("The quick brown fox jumps over the lazy dog. ")
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, prose...)
+		}
+		return string(b[:targetSize])
+	}
+	var b []byte
+	bodyFiller := []byte("abcdefghijklmpqrstuvwxyz0123456789 ,.;:-_/=+*<>()[]{}|")
+	for i := 0; i < 2; i++ {
+		b = append(b, '0', '0', '0', '0'+byte(i+1)) // 4 digits, matches [0-9]{4}
+		b = append(b, []byte("INFO:")...)
+		bodyStart := len(b)
+		for len(b)-bodyStart < 24*1024 {
+			b = append(b, bodyFiller...)
+		}
+		b = append(b, '\n')
 	}
 	for len(b) < targetSize {
 		b = append(b, prose...)
