@@ -278,7 +278,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 
 	// Phase 4 dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
 	// or extra i32 added by the locals declaration above).
-	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, l.nonMidDominantOff, tableMemIdx,
+	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx,
 		byte(localState), byte(localPos), 0x01, 0x00, 0x05, byte(localClass))
 
 	// pos++
@@ -348,6 +348,6 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 		mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
 		tableMemIdx,
-		l.dominantStates, l.lnmAction5, l.nonMidDominantOff,
+		l.dominantStates, l.lnmAction5,
 	)
 }

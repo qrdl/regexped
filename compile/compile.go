@@ -620,9 +620,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false)
-			// Phase 4: enable mid-accept dominant bulk-skip in match body.
-			// Mid-accept default-on; non-mid-accept gated under LikelyMatch
-			// (mirroring the find-body gate at the canEmitOpt1 site).
+			// Phase 4: mid-accept default-on; non-mid gated under
+			// LikelyMatch (mirrors the find-body gate above).
 			if buildOpts.LikelyMode != LikelyMatch {
 				filtered := lm.dominantStates[:0]
 				for _, info := range lm.dominantStates {
@@ -858,13 +857,16 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				// the dominantStates encoding).
 				canEmitOpt1 := !isAnchoredFind(table)
 				if canEmitOpt1 {
-					// Non-mid-accept dominant dispatch is gated under
-					// LikelyMatch (task 7 step 2). It produces large
-					// match wins (-94..-98%) but adds a +48% no-match
-					// regression to patterns that emit it. LM users have
-					// signalled match-heavy workloads and accept the
-					// trade-off; neutral users keep the no-regression
-					// shipped behaviour.
+					// Non-mid dispatch (state-ID compare emission) is
+					// gated under LikelyMatch. Investigation showed the
+					// state-ID workaround eliminates the +47% no-match
+					// regression for 4 of 6 canonical patterns but two
+					// (rare-first-byte / multi-dominant) still regress
+					// from microarchitectural / Cranelift effects we
+					// cannot address from the WASM layer. LM users have
+					// signalled "matches likely" and accept the cold-path
+					// trade-off; neutral / LikelyNoMatch users keep the
+					// no-regression baseline.
 					if buildOpts.LikelyMode != LikelyMatch {
 						filtered := l.dominantStates[:0]
 						for _, info := range l.dominantStates {
