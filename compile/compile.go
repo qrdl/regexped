@@ -703,7 +703,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					Locals: prefixScanLocals{
 						Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8, Chunk: 9,
 					},
-					EngineDepth: 2,
+					EngineDepth:   2,
+					LikelyNoMatch: buildOpts.LikelyMode == LikelyNoMatch,
 				}
 			} else if patMandLit != nil {
 				// Mandatory interior literal: two-level outer loop; no first-byte tables needed.
@@ -713,6 +714,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
 				btScanParams, btScanDataBytes, btScanSegCnt = buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
 				btScanParams.TableMemIdx = buildOpts.tableMemIdx
+				btScanParams.LikelyNoMatch = buildOpts.LikelyMode == LikelyNoMatch
 			}
 			p.dataBytes = append(p.dataBytes, btScanDataBytes...)
 			p.dataSegCount += btScanSegCnt

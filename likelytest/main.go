@@ -624,6 +624,29 @@ var tests = []testCase{
 		matchInput:   litAnchorDominantBodyInput(true),
 		nomatchInput: litAnchorDominantBodyInput(false),
 	},
+	{
+		// Gap G target: BT find body with a 17..64-byte first-byte set on
+		// impossible-byte-heavy input. Pattern requirements to exercise
+		// the right BT path:
+		//   - non-greedy capture → ambiguous, TDFA-ineligible → BT
+		//   - no mandatory literal substring → BT uses the
+		//     nfaFirstBytes/Teddy/Shufti fallback (where Action 5 lives),
+		//     not the mlScan literal-prefix path
+		//   - 17..64-byte first-byte set → Action 5 has something to act on
+		// `([a-zA-Z]+?)\d` satisfies all three: `\d` exit is a class
+		// (no literal), capture is non-greedy, first-byte set is 52.
+		//
+		// Match input: digit/punct/space filler with embedded letter runs
+		// each followed by a digit (so the BT body completes a match).
+		// No-match input: pure impossible bytes (no letters at all) —
+		// prefix scan loop runs the whole input, never enters BT body.
+		name:         "bt-action5-target",
+		pattern:      `([a-zA-Z]+?)\d`,
+		mode:         modeGroups,
+		notes:        "BT find + 17..64-byte first-byte set — Gap G (LNM Action 5 for BT) target",
+		matchInput:   btAction5Input(true),
+		nomatchInput: btAction5Input(false),
+	},
 }
 
 // --------------------------------------------------------------------------
@@ -794,6 +817,48 @@ func classRunInput(withMatches bool, class string, runLen, runs int) string {
 	}
 	for len(b) < targetSize {
 		b = append(b, prose...)
+	}
+	return string(b[:targetSize])
+}
+
+// btAction5Input builds a ~50 KB input for `([a-zA-Z]+?)\d`. The
+// pattern compiles to Backtracking (non-greedy quantifier inside a
+// capture = TDFA-ineligible). The first-byte set is `[a-zA-Z]` (52
+// bytes), placing it in the 17..64-byte band where Action 5
+// (force-Shufti) helps.
+//
+// When withMatches is true: 5 letter runs immediately followed by a
+// digit, embedded in punct/space filler (digits stripped from filler
+// so the embedded run is the only digit per neighbourhood — keeps the
+// BT body cost predictable).
+// When false: pure non-letter filler (digits/punct/space), no letters
+// → prefix scan loop runs the entire input without entering the BT
+// body.
+func btAction5Input(withMatches bool) string {
+	const targetSize = 50 * 1024
+	// Filler contains no letters. Includes digits, punctuation, whitespace.
+	filler := []byte("0123456789.,;:!?@#$%^&*()-+=[]{}|\\/<> \t01234567")
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	var b []byte
+	chunkSize := targetSize / 6
+	// Letters-then-digit shape so the pattern `([a-zA-Z]+?)\d` matches.
+	run := []byte("alpha7")
+	for i := 0; i < 5; i++ {
+		for len(b) < (i+1)*chunkSize {
+			b = append(b, filler...)
+		}
+		b = append(b, ' ')
+		b = append(b, run...)
+		b = append(b, ' ')
+	}
+	for len(b) < targetSize {
+		b = append(b, filler...)
 	}
 	return string(b[:targetSize])
 }
