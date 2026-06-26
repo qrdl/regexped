@@ -80,6 +80,11 @@ type compiledSet struct {
 	teddyDataBytes    []byte
 	teddyDataSegCount int
 
+	// Shufti frontend (fe == frontendShufti): distinct first bytes of all
+	// literal buckets. Tables are inlined as v128.const in the emission,
+	// so no data segment is needed.
+	shuftiFirstByteSet []byte
+
 	// litToBuckets[litID] = list of bucket indices sharing this literal.
 	// Multiple buckets can share a literal when bin-packing splits large groups.
 	litToBuckets [][]int
@@ -354,6 +359,32 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 	}
 
+	// LIKELY.md Gap H.3: density-heuristic / Action 5 Shufti for the
+	// scalar fallback case. Requires zero fallback buckets (Shufti can't
+	// skip positions that fallback patterns must visit) and a first-byte
+	// union in the 17..64 band. The selection trigger is either the
+	// rarity-based density heuristic or set-level LikelyNoMatch (Action 5).
+	var shuftiFirstByteSet []byte
+	if fe == frontendScalar {
+		hasFallback := false
+		for _, b := range buckets {
+			if b.isFallback {
+				hasFallback = true
+				break
+			}
+		}
+		if !hasFallback {
+			union := litUnionFirstBytes(lits)
+			if len(union) >= 17 && len(union) <= 64 {
+				lnm := opts.LikelyMode == LikelyNoMatch
+				if lnm || shuftiBeatsScalar(union) {
+					fe = frontendShufti
+					shuftiFirstByteSet = union
+				}
+			}
+		}
+	}
+
 	// Record the frontend actually used (after any fallback to scalar).
 	diag.Frontend = fe.String()
 
@@ -389,6 +420,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		teddyDataOffset:     teddyDataOffset,
 		teddyDataBytes:      teddyDataBytes,
 		teddyDataSegCount:   teddyDataSegCount,
+		shuftiFirstByteSet:  shuftiFirstByteSet,
 		litToBuckets:        litToBuckets,
 		litLens:             litLens,
 		diag:                diag,
@@ -1124,6 +1156,11 @@ func emitSetMatchFnFinal(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMe
 		if !hasSetFallbackBuckets(cs) {
 			return emitSetMatchFnFinalTeddy(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx)
 		}
+	case frontendShufti:
+		// Selection guarantees no fallback buckets — see set_emit.go gap H.3 block.
+		if !hasSetFallbackBuckets(cs) {
+			return emitSetMatchFnFinalShufti(cs, suffixFnBase, prefixFnBaseIdx)
+		}
 	}
 	return emitSetMatchFnFinalScalar(cs, suffixFnBase, prefixFnBaseIdx)
 }
@@ -1366,6 +1403,260 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase int, prefixFnBaseId
 	b = append(b, 0x20, lOutCount, 0x0B)
 
 	_ = lTmp
+	funcBody := utils.AppendULEB128(nil, uint32(len(b)))
+	funcBody = append(funcBody, b...)
+	return funcBody
+}
+
+// emitSetMatchFnFinalShufti emits the set match function body using a SIMD
+// Shufti first-byte pre-filter (LIKELY.md Gap H.3). The per-position bucket
+// check is identical to the scalar path — the only addition is a 16-bytes-
+// per-chunk SIMD skip loop at the top of each iteration that advances lPos
+// to the next position where any literal's first byte appears.
+//
+// Selection in CompileSet guarantees:
+//   - no fallback buckets (otherwise we'd need to visit every position),
+//   - 17 ≤ |shuftiFirstByteSet| ≤ 64 (matches emitShuftiPrefixCheck's bounds),
+//   - rarity-based density supports Shufti OR set-level LikelyNoMatch is set.
+func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase int, prefixFnBaseIdx int) []byte {
+	var b []byte
+	// locals: 6 × i32 (lPos, lOutCount, lTmp, lValidMask, lOutBase, lSkipMask), 1 × v128 (lChunk)
+	b = append(b, 0x02)              // 2 local groups
+	b = append(b, 0x06, 0x7F)        // 6 × i32
+	b = append(b, 0x01, 0x7B)        // 1 × v128
+
+	const (
+		pInPtr     = byte(0)
+		pInLen     = byte(1)
+		pOutPtr    = byte(2)
+		pOutCap    = byte(3)
+		pStartPos  = byte(4)
+		lPos       = byte(5)
+		lOutCount  = byte(6)
+		lTmp       = byte(7)
+		lValidMask = byte(8)
+		lOutBase   = byte(9)
+		lSkipMask  = byte(10)
+		lChunk     = byte(11)
+	)
+
+	b = append(b, 0x41, 0x00, 0x21, lOutCount)
+	b = append(b, 0x20, pStartPos, 0x21, lPos)
+
+	b = append(b, 0x02, 0x40) // block $batch_done
+	b = append(b, 0x03, 0x40) // loop $scan
+
+	// Exit conditions.
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01)         // lPos > pInLen
+	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)   // outCount >= cap
+
+	// --- SIMD pre-filter: advance lPos to the next candidate position ---
+	// Block depths inside the prefilter:
+	//   loop $scan (0), block $batch_done (1)
+	// After entering $skip_done block, $skip_loop loop:
+	//   loop $skip_loop (0), block $skip_done (1), loop $scan (2), block $batch_done (3)
+	b = append(b, 0x02, 0x40) // block $skip_done
+	b = append(b, 0x03, 0x40) // loop $skip_loop
+
+	// If lPos >= pInLen: exit $skip_done.
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+
+	// SIMD path: lPos + 15 < pInLen → load 16 bytes.
+	// Depths inside this `if` (innermost outward):
+	//   0=SIMD if, 1=$skip_loop, 2=$skip_done.
+	b = append(b, 0x20, lPos, 0x41, 15, 0x6A, 0x20, pInLen, 0x49) // lt_u
+	b = append(b, 0x04, 0x40)                                    // if (void)
+	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)                // pInPtr + lPos
+	b = append(b, 0xFD, 0x00, 0x00, 0x00)                        // v128.load align=0 offset=0
+	b = append(b, 0x21, lChunk)                                  // local.set lChunk
+	b = emitShuftiPrefixCheck(b, cs.shuftiFirstByteSet, lChunk)
+	b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
+	b = append(b, 0x04, 0x40)      // if mask != 0  (adds one more depth)
+	// Inside the nested mask `if`: 0=mask if, 1=SIMD if, 2=$skip_loop, 3=$skip_done.
+	// Candidate found: lPos += ctz(mask); exit $skip_done.
+	b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, 0x03) // br 3 → $skip_done
+	b = append(b, 0x0B)       // end if mask != 0
+	// No candidate in chunk: lPos += 16, continue $skip_loop.
+	b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, 0x01) // br 1 → $skip_loop
+	b = append(b, 0x0B)       // end if SIMD path
+
+	// Scalar tail: byte-by-byte. For simplicity check membership via the
+	// inline byte set (≤ 64 entries) — emit a chained i32.eq + br.
+	// At this depth: loop $skip_loop (0), block $skip_done (1).
+	// We need to: if input[lPos] ∈ set → br 1 ($skip_done); else lPos++; br 0.
+	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x2D, 0x00, 0x00, 0x21, lTmp) // lTmp = input[lPos]
+	for _, fb := range cs.shuftiFirstByteSet {
+		b = append(b, 0x20, lTmp, 0x41)
+		b = utils.AppendSLEB128(b, int32(fb))
+		b = append(b, 0x46)       // i32.eq
+		b = append(b, 0x0D, 0x01) // br_if 1 → $skip_done
+	}
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
+	b = append(b, 0x0C, 0x00)                               // br 0 → $skip_loop
+
+	b = append(b, 0x0B) // end loop $skip_loop
+	b = append(b, 0x0B) // end block $skip_done
+
+	// Re-check bounds: prefilter may have walked to lPos >= pInLen with no hit.
+	// $batch_done is at depth 1 from loop $scan.
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+
+	// --- emitComputeValidMask / emitCallSuffix / emitVarLen (copy of scalar helpers) ---
+	emitComputeValidMask := func(b []byte, bi int) []byte {
+		tm := cs.trivialPrefixMasks[bi]
+		sam := cs.startAnchorMasks[bi]
+		tmNoAnchor := tm &^ sam
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(tmNoAnchor))
+		b = append(b, 0x21, lValidMask)
+		if sam != 0 {
+			b = append(b, 0x20, lPos, 0x45, 0x04, 0x40)
+			b = append(b, 0x20, lValidMask, 0x41)
+			b = utils.AppendSLEB128(b, int32(sam))
+			b = append(b, 0x72, 0x21, lValidMask)
+			b = append(b, 0x0B)
+		}
+		for k, fnIdx := range cs.prefixFnIdx[bi] {
+			if k >= 32 || fnIdx < 0 {
+				continue
+			}
+			bit := uint32(1) << uint(k)
+			if cs.varLenMasks[bi]&bit != 0 || cs.varLenNonemptyMasks[bi]&bit != 0 {
+				continue
+			}
+			globalIdx := prefixFnBaseIdx + fnIdx
+			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x41, 0x01, 0x6B)
+			b = append(b, 0x10)
+			b = utils.AppendULEB128(b, uint32(globalIdx))
+			b = append(b, 0x22, lTmp, 0x41, 0x00, 0x4E, 0x04, 0x40)
+			b = append(b, 0x20, lValidMask, 0x41)
+			b = utils.AppendSLEB128(b, int32(bit))
+			b = append(b, 0x72, 0x21, lValidMask)
+			b = append(b, 0x0B)
+		}
+		return b
+	}
+
+	emitVarLen := func(b []byte, bi int) []byte {
+		if cs.varLenMasks[bi]|cs.varLenNonemptyMasks[bi] == 0 {
+			return b
+		}
+		litLen := len(cs.buckets[bi].literal)
+		for k, fnIdx := range cs.prefixFnIdx[bi] {
+			if k >= 32 || fnIdx < 0 {
+				continue
+			}
+			bit := uint32(1) << uint(k)
+			isVarLenEmpty := cs.varLenMasks[bi]&bit != 0
+			isVarLenNonempty := cs.varLenNonemptyMasks[bi]&bit != 0
+			if !isVarLenEmpty && !isVarLenNonempty {
+				continue
+			}
+			globalIdx := prefixFnBaseIdx + fnIdx
+			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x41, 0x01, 0x6B)
+			b = append(b, 0x10)
+			b = utils.AppendULEB128(b, uint32(globalIdx))
+			b = append(b, 0x22, lTmp, 0x41, 0x00, 0x4E, 0x04, 0x40)
+			if isVarLenEmpty {
+				b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x49, 0x04, 0x40)
+				b = append(b, 0x20, pOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A, 0x21, lOutBase)
+				b = append(b, 0x20, lOutBase, 0x41)
+				b = utils.AppendSLEB128(b, int32(cs.patternIDs[bi][k]))
+				b = append(b, 0x36, 0x02, 0x00)
+				b = append(b, 0x20, lOutBase, 0x20, lTmp, 0x36, 0x02, 0x04)
+				b = append(b, 0x20, lOutBase, 0x20, lPos, 0x41)
+				b = utils.AppendSLEB128(b, int32(litLen))
+				b = append(b, 0x6A, 0x20, lTmp, 0x6B, 0x36, 0x02, 0x08)
+				b = append(b, 0x20, lOutCount, 0x41, 0x01, 0x6A, 0x21, lOutCount)
+				b = append(b, 0x0B)
+			} else {
+				b = append(b, 0x20, pInPtr, 0x20, lPos, 0x41)
+				b = utils.AppendSLEB128(b, int32(litLen))
+				b = append(b, 0x6A, 0x20, pInLen, 0x20, lTmp)
+				b = append(b, 0x20, pOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A)
+				b = append(b, 0x20, pOutCap, 0x20, lOutCount, 0x6B)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(bit))
+				b = append(b, 0x10)
+				b = utils.AppendULEB128(b, uint32(suffixFnBase+bi))
+				b = append(b, 0x20, lOutCount, 0x6A, 0x21, lOutCount)
+			}
+			b = append(b, 0x0B)
+		}
+		return b
+	}
+
+	emitCallSuffix := func(b []byte, litLen, bi int) []byte {
+		b = append(b, 0x20, pInPtr)
+		b = append(b, 0x20, lPos, 0x41)
+		b = utils.AppendSLEB128(b, int32(litLen))
+		b = append(b, 0x6A)
+		b = append(b, 0x20, pInLen)
+		b = append(b, 0x20, lPos)
+		b = append(b, 0x20, pOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A)
+		b = append(b, 0x20, pOutCap, 0x20, lOutCount, 0x6B)
+		b = append(b, 0x20, lValidMask)
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(suffixFnBase+bi))
+		b = append(b, 0x20, lOutCount, 0x6A, 0x21, lOutCount)
+		return b
+	}
+
+	// Literal buckets only (selection requires no fallback). Single-char first
+	// for the same ordering reason as the scalar path.
+	litOrder := make([]int, 0, len(cs.buckets))
+	for bi, bkt := range cs.buckets {
+		if !bkt.isFallback && bkt.literal != "" {
+			litOrder = append(litOrder, bi)
+		}
+	}
+	sort.SliceStable(litOrder, func(i, j int) bool {
+		li := len(cs.buckets[litOrder[i]].literal)
+		lj := len(cs.buckets[litOrder[j]].literal)
+		if li != lj {
+			return li < lj
+		}
+		return litOrder[i] > litOrder[j]
+	})
+	for _, bi := range litOrder {
+		bkt := cs.buckets[bi]
+		lit := []byte(bkt.literal)
+		litLen := len(lit)
+
+		b = append(b, 0x02, 0x40)
+		b = append(b, 0x20, lPos, 0x41)
+		b = utils.AppendSLEB128(b, int32(litLen))
+		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
+
+		for li, lb := range lit {
+			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
+			if li > 0 {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(li))
+				b = append(b, 0x6A)
+			}
+			b = append(b, 0x2D, 0x00, 0x00)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(lb))
+			b = append(b, 0x47, 0x0D, 0x00)
+		}
+
+		b = emitComputeValidMask(b, bi)
+		b = emitCallSuffix(b, litLen, bi)
+		b = emitVarLen(b, bi)
+
+		b = append(b, 0x0B)
+	}
+
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
+	b = append(b, 0x0C, 0x00)                               // br $scan
+	b = append(b, 0x0B)                                     // end loop $scan
+	b = append(b, 0x0B)                                     // end block $batch_done
+
+	b = append(b, 0x20, lOutCount, 0x0B)
+
 	funcBody := utils.AppendULEB128(nil, uint32(len(b)))
 	funcBody = append(funcBody, b...)
 	return funcBody

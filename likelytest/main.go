@@ -675,6 +675,30 @@ var tests = []testCase{
 		matchInput:   setLogLineInput(true),
 		nomatchInput: setLogLineInput(false),
 	},
+	{
+		// H.3 target: 21 literal-prefixed patterns with distinct uppercase
+		// first bytes [A..U]. AC builds ~63 nodes which exceeds the 32-node
+		// cap → frontend falls back to scalar. With H.3, set-level
+		// LikelyNoMatch forces Shufti (rarity sum = 42 > 40 threshold, so
+		// the density heuristic alone would keep scalar — LNM is the
+		// trigger here). Under neutral/LM the set stays on scalar.
+		//
+		// No-match input is pure lowercase prose — Shufti never finds a
+		// candidate, SIMD-skips the entire 50 KB in 16-byte chunks. Match
+		// input has letter density too high for SIMD to help much.
+		name: "set-shufti-lnm",
+		setPatterns: []string{
+			`A1:[^\n]+`, `B1:[^\n]+`, `C1:[^\n]+`, `D1:[^\n]+`, `E1:[^\n]+`,
+			`F1:[^\n]+`, `G1:[^\n]+`, `H1:[^\n]+`, `I1:[^\n]+`, `J1:[^\n]+`,
+			`K1:[^\n]+`, `L1:[^\n]+`, `M1:[^\n]+`, `N1:[^\n]+`, `O1:[^\n]+`,
+			`P1:[^\n]+`, `Q1:[^\n]+`, `R1:[^\n]+`, `S1:[^\n]+`, `T1:[^\n]+`,
+			`U1:[^\n]+`,
+		},
+		mode:         modeSet,
+		notes:        "set with 21 [A-U]-prefixed literals — H.3 (LNM forces Shufti over scalar)",
+		matchInput:   setShuftiLNMInput(true),
+		nomatchInput: setShuftiLNMInput(false),
+	},
 }
 
 // --------------------------------------------------------------------------
@@ -959,6 +983,45 @@ func setLogLineInput(withMatches bool) string {
 		}
 		b = append(b, '\n')
 		// Some inter-match prose so consecutive matches aren't adjacent.
+		b = append(b, prose...)
+		idx++
+	}
+	return string(b[:targetSize])
+}
+
+// setShuftiLNMInput builds ~50 KB for the H.3 set-shufti-lnm case.
+//
+// When withMatches is true: lowercase prose with occasional uppercase
+// "<Letter>1:<body>\n" log lines mixed in. Shufti finds a candidate in
+// roughly every chunk so SIMD skip rarely fires; scalar/Shufti perform
+// similarly.
+// When withMatches is false: pure lowercase prose, ZERO uppercase letters.
+// Under LNM the forced Shufti SIMD-skips all 50 KB in 16-byte chunks
+// without ever finding a candidate — clean win vs scalar's byte-by-byte
+// per-bucket comparison loop.
+func setShuftiLNMInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	prose := []byte("the quick brown fox jumps over the lazy dog and they all live happily ever after. ")
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, prose...)
+		}
+		return string(b[:targetSize])
+	}
+	bodyFiller := []byte("the operation completed normally with no observable side effects on subsystem state. ")
+	letters := []byte("ABCDEFGHIJKLMNOPQRSTU")
+	var b []byte
+	idx := 0
+	for len(b) < targetSize {
+		// Periodic match: "<Letter>1:<200-byte body>\n"
+		b = append(b, letters[idx%len(letters)])
+		b = append(b, '1', ':')
+		bodyStart := len(b)
+		for len(b)-bodyStart < 200 {
+			b = append(b, bodyFiller...)
+		}
+		b = append(b, '\n')
 		b = append(b, prose...)
 		idx++
 	}

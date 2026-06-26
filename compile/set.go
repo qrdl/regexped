@@ -600,6 +600,15 @@ const (
 	frontendTeddy  frontendKind = iota // 1–16 literals, any length (>4 bytes: probe first 4, verify rest)
 	frontendAC                         // 17–32 literals → Aho-Corasick (capped at 32 nodes)
 	frontendScalar                     // fallback: byte-by-byte scan
+	// frontendShufti: SIMD first-byte pre-filter wrapping the scalar
+	// per-position bucket check. Picked when:
+	//   - the set would otherwise have used the scalar path,
+	//   - 17 ≤ |unionFirstBytes| ≤ 64,
+	//   - AND either `shuftiBeatsScalar(unionFirstBytes)` (density wins)
+	//     or set-level LikelyMode is LikelyNoMatch (Gap H.3 Action 5).
+	// Requires zero fallback buckets — fallback runs at every position
+	// so a first-byte SIMD skip can't safely advance past it.
+	frontendShufti
 )
 
 func (f frontendKind) String() string {
@@ -608,6 +617,8 @@ func (f frontendKind) String() string {
 		return "teddy"
 	case frontendAC:
 		return "ac"
+	case frontendShufti:
+		return "shufti"
 	default:
 		return "scalar"
 	}
@@ -751,6 +762,27 @@ func teddyGroupABytes(t *teddyTables) int32 {
 		n += 32
 	}
 	return n
+}
+
+// litUnionFirstBytes returns the sorted distinct first bytes across `lits`.
+// Empty literals are skipped (their first byte is undefined; the standard
+// frontend selection already rejects sets with empty literals before this
+// helper is called for the Shufti decision in H.3).
+func litUnionFirstBytes(lits [][]byte) []byte {
+	var seen [256]bool
+	for _, lit := range lits {
+		if len(lit) == 0 {
+			continue
+		}
+		seen[lit[0]] = true
+	}
+	out := make([]byte, 0, 64)
+	for b := 0; b < 256; b++ {
+		if seen[b] {
+			out = append(out, byte(b))
+		}
+	}
+	return out
 }
 
 // chooseLiteralFrontend selects the scan strategy for a set of mandatory literals.
