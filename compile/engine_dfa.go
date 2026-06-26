@@ -1410,6 +1410,16 @@ type dfaLayout struct {
 	// into prefixScanParams.LikelyNoMatch by appendFindCodeEntry so the
 	// 17..64-byte first-byte set Shufti gate ignores the density heuristic.
 	lnmAction5 bool
+
+	// skipSafeOnDead (Task 8 — dead-state skip): true when every byte that
+	// causes a dead transition from any DFA state also causes a dead
+	// transition from midStart. Under this condition, when the find loop's
+	// scan dies at position p starting from attempt position k, all
+	// intermediate attempts from k+1..p-1 would either die at or before p
+	// — so we can safely set attempt_start = p+1 instead of advancing by
+	// one. Collapses O(N²) find-mode worst case on near-miss greedy
+	// patterns to O(N). See plans/TODO.md task 8.
+	skipSafeOnDead bool
 }
 
 // dominantInfo describes one dominant self-loop state recorded by
@@ -1925,7 +1935,168 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	// table); emission is gated separately at the call site.
 	detectDominantSelfLoop(l)
 
+	// Task 8 — dead-state skip safety analysis. Sets l.skipSafeOnDead.
+	// Only meaningful in find mode (needFind=true); for non-find layouts
+	// the value is computed but never read.
+	if needFind {
+		detectSkipSafeOnDead(l)
+	}
+
 	return l
+}
+
+// detectSkipSafeOnDead computes l.skipSafeOnDead via a conservative
+// "single-successor self-loop" condition. Task 8's safety argument requires
+// that intermediate attempts (starting between attempt_start and the dead
+// position) also die at or before the same position. The conservative
+// sufficient condition: starting at midStart and consuming any sequence of
+// midStart-accepted bytes stays in a single, stable "scanning" state.
+//
+// Concrete check:
+//
+//	(a) midStart's accept class is non-empty.
+//	(b) For every byte b in midStart's accept class, transition(midStart, b)
+//	    is the same state `succ` (or `succ == midStart`).
+//	(c) For every byte b in midStart's accept class,
+//	    transition(succ, b) == succ — i.e. succ self-loops on the same class.
+//	(d) Neither midStart nor succ is mid-accept. (A mid-accept state would
+//	    have set last_accept ≥ 0 by the time the dead handler runs, sending
+//	    the find body to $found instead of the skip path — but we only
+//	    need to verify safety along the path the skip optimization controls,
+//	    which is the no-accept-yet path.)
+//
+// If these hold, intermediate attempts from positions K+1..P-1 follow the
+// same trajectory as the original attempt: midStart → succ → succ → ...
+// → dead at P. The "skip to P+1" advance is sound.
+//
+// Patterns this accepts:
+//   - `[a-zA-Z]+\d` — letters loop on succ, digit transitions to accept.
+//   - `[a-z]+@` — letters loop on succ, '@' transitions to accept.
+//   - `\w+;` — word chars loop on succ.
+//
+// Patterns this rejects (correctly):
+//   - `(a.)*$` — midStart on 'a' goes to X; X on 'a' goes back to midStart,
+//     not self-loop. Different trajectories from intermediate positions.
+//   - `[ab][cd]\d` — succ doesn't self-loop on midStart's accept class;
+//     intermediate attempts can reach further than the original.
+//   - `abc|d` — midStart accepts 'a' and 'd' but they have different
+//     successors, so (b) fails.
+//
+// The check is intentionally conservative: it's easier to add more patterns
+// to the skip-safe set later than to debug a wrong-answer regression.
+func detectSkipSafeOnDead(l *dfaLayout) {
+	if l.numWASM <= 1 {
+		return
+	}
+	cellsPerState := 256
+	if l.useCompression {
+		cellsPerState = l.numClasses
+	}
+	readCell := func(state, idx int) int32 {
+		row := state
+		if l.useRowDedup {
+			row = int(l.rowMapBytes[state])
+		}
+		off := row*cellsPerState + idx
+		if l.useU8 {
+			return int32(l.tableBytes[off])
+		}
+		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
+	}
+	transitionOn := func(state int, b int) int32 {
+		cell := b
+		if l.useCompression {
+			cell = int(l.classMap[b])
+		}
+		return readCell(state, cell)
+	}
+
+	midStartIdx := int(l.wasmMidStart)
+	if midStartIdx <= 0 || midStartIdx >= int(l.numWASM) {
+		return
+	}
+
+	// (a) midStart's accept class.
+	var midStartAccepts [256]bool
+	anyAccept := false
+	for b := 0; b < 256; b++ {
+		if transitionOn(midStartIdx, b) != 0 {
+			midStartAccepts[b] = true
+			anyAccept = true
+		}
+	}
+	if !anyAccept {
+		return
+	}
+
+	// (b) Single successor for every midStart-accepted byte.
+	succ := int32(-1)
+	for b := 0; b < 256; b++ {
+		if !midStartAccepts[b] {
+			continue
+		}
+		t := transitionOn(midStartIdx, b)
+		if succ < 0 {
+			succ = t
+		} else if t != succ {
+			return // multiple successors → not stable
+		}
+	}
+	if succ <= 0 || int(succ) >= int(l.numWASM) {
+		return
+	}
+
+	// (c) succ self-loops on midStart's accept class.
+	for b := 0; b < 256; b++ {
+		if !midStartAccepts[b] {
+			continue
+		}
+		if transitionOn(int(succ), b) != succ {
+			return // not self-loop → not stable
+		}
+	}
+
+	// (d) Neither midStart nor succ is mid-accept on the path before any
+	// match has been recorded.
+	if midStartIdx < len(l.midAcceptBytes) && l.midAcceptBytes[midStartIdx] != 0 {
+		return
+	}
+	if int(succ) < len(l.midAcceptBytes) && l.midAcceptBytes[succ] != 0 {
+		return
+	}
+
+	// (e) For non-class bytes (those midStart REJECTS), both midStart and
+	// succ must transition to either dead or a mid-accept state. Any
+	// transition into a third scanning (non-mid-accept, non-dead) state
+	// means the DFA can leave the "midStart → succ → succ → ..." stable
+	// trajectory on a non-class byte and reach an accept later (via EOF or
+	// further bytes) at a position the original attempt's trajectory did
+	// not visit — breaking the safety invariant. See e.g. `(.+)\n$`, where
+	// succ='consuming-non-newline' transitions on '\n' to a non-mid-accept
+	// state that later EOF-accepts; attempts starting mid-run can reach
+	// that accept while the original attempt died.
+	isAcceptingExit := func(target int32) bool {
+		if target == 0 {
+			return true // dead is fine
+		}
+		if int(target) < len(l.midAcceptBytes) && l.midAcceptBytes[target] != 0 {
+			return true // mid-accept is fine (sets last_accept → $found)
+		}
+		return false
+	}
+	for b := 0; b < 256; b++ {
+		if midStartAccepts[b] {
+			continue
+		}
+		if !isAcceptingExit(transitionOn(midStartIdx, b)) {
+			return
+		}
+		if !isAcceptingExit(transitionOn(int(succ), b)) {
+			return
+		}
+	}
+
+	l.skipSafeOnDead = true
 }
 
 // detectDominantSelfLoop scans the WASM-space transition table for states
@@ -2872,7 +3043,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
 			tableMemIdx,
-			l.dominantStates, l.lnmAction5)
+			l.dominantStates, l.lnmAction5, l.skipSafeOnDead)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -3347,10 +3518,13 @@ func emitEofHandler(b []byte, stateLocal byte,
 // emitDeadHandler emits the dead-state handler inside the DFA scan loop.
 // When hasRetry is false (anchored mode): unconditionally br foundDepth → $found.
 // When hasRetry is true (full find mode): br_if foundDepth → $found if last_accept>=0,
-// otherwise increment attemptStartLocal and br outerDepth → $outer.
+// otherwise advance attemptStartLocal and br outerDepth → $outer. Advance
+// is `pos + 1` when skipSafeOnDead (Task 8 dead-state skip) or `+1` otherwise.
+// posLocal is ignored when skipSafeOnDead is false.
 func emitDeadHandler(b []byte,
 	lastAcceptLocal, attemptStartLocal byte,
-	foundDepth byte, hasRetry bool, outerDepth byte) []byte {
+	foundDepth byte, hasRetry bool, outerDepth byte,
+	posLocal byte, skipSafeOnDead bool) []byte {
 	if !hasRetry {
 		b = append(b, 0x0C, foundDepth) // br → $found (unconditional, anchored)
 	} else {
@@ -3358,10 +3532,19 @@ func emitDeadHandler(b []byte,
 		b = append(b, 0x41, 0x00)
 		b = append(b, 0x4E)             // i32.ge_s
 		b = append(b, 0x0D, foundDepth) // br_if → $found
-		b = append(b, 0x20, attemptStartLocal)
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x6A)
-		b = append(b, 0x21, attemptStartLocal)
+		if skipSafeOnDead {
+			// Task 8: attempt_start = pos + 1. Skips intermediate attempts
+			// from K+1..pos-1 since they would also die at pos (or earlier).
+			b = append(b, 0x20, posLocal)
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x6A)
+			b = append(b, 0x21, attemptStartLocal)
+		} else {
+			b = append(b, 0x20, attemptStartLocal)
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x6A)
+			b = append(b, 0x21, attemptStartLocal)
+		}
 		b = append(b, 0x0C, outerDepth) // br → $outer
 	}
 	return b
@@ -3805,7 +3988,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = append(b, 0x20, 0x02) // dead?
 		b = append(b, 0x45)
 		b = append(b, 0x04, 0x40)
-		b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0)
+		b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0, 0x00, false)
 		b = append(b, 0x0B)
 
 		b = append(b, 0x41)
@@ -3857,7 +4040,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = append(b, 0x20, 0x02)
 		b = append(b, 0x45)
 		b = append(b, 0x04, 0x40)
-		b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0)
+		b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0, 0x00, false)
 		b = append(b, 0x0B)
 
 		b = append(b, 0x41)
@@ -3916,7 +4099,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 	b = append(b, 0x20, 0x02)
 	b = append(b, 0x45)
 	b = append(b, 0x04, 0x40)
-	b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0)
+	b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0, 0x00, false)
 	b = append(b, 0x0B)
 
 	b = append(b, 0x41)
@@ -4523,7 +4706,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool) []byte {
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
 	// `nonMidDominantOff` parameter and the `[]int` return slot) was
@@ -5002,7 +5185,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3)
+		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3, 0x03, skipSafeOnDead)
 		b = append(b, 0x0B) // end if
 
 		// if midAccept[state]: last_accept = pos + 1
@@ -5146,7 +5329,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3)
+		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3, 0x03, skipSafeOnDead)
 		b = append(b, 0x0B) // end if
 
 		// if midAccept[state]: last_accept = pos + 1
@@ -5286,7 +5469,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x20, 0x02) // local.get state
 	b = append(b, 0x45)       // i32.eqz
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3)
+	b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3, 0x03, skipSafeOnDead)
 	b = append(b, 0x0B) // end if
 
 	// if midAccept[state]: last_accept = pos + 1

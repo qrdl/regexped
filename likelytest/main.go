@@ -676,6 +676,23 @@ var tests = []testCase{
 		nomatchInput: setLogLineInput(false),
 	},
 	{
+		// Task 8 target: pattern with greedy class quantifier followed by a
+		// required suffix that doesn't appear anywhere. From every starting
+		// position the DFA self-loops through the same letter run and dies
+		// at the same delimiter — O(N²) work without dead-state skip.
+		//
+		// Pattern is non-capture-bearing → plain DFA find body (or hybrid
+		// CompiledDFA which delegates to buildFindBody). Skip-safe by the
+		// disjoint-byte-class check: midStart accepts [a-zA-Z]; dead
+		// triggers happen on bytes that aren't letters or digits.
+		name:         "deadskip-near-miss",
+		pattern:      `[a-zA-Z]+\d`,
+		mode:         modeFind,
+		notes:        "near-miss greedy quantifier — Task 8 (dead-state skip) target",
+		matchInput:   deadSkipNearMissInput(true),
+		nomatchInput: deadSkipNearMissInput(false),
+	},
+	{
 		// H.3 target: 21 literal-prefixed patterns with distinct uppercase
 		// first bytes [A..U]. AC builds ~63 nodes which exceeds the 32-node
 		// cap → frontend falls back to scalar. With H.3, set-level
@@ -987,6 +1004,33 @@ func setLogLineInput(withMatches bool) string {
 		idx++
 	}
 	return string(b[:targetSize])
+}
+
+// deadSkipNearMissInput builds ~10 KB of letter runs separated by spaces.
+// Pattern `[a-zA-Z]+\d` is the find target.
+//
+// When withMatches is true: same letter-run layout but with a single digit
+// at the end of the LAST block — find returns the (start,end) of that
+// match. Without dead-state skip the path-to-match still does O(N²) work
+// for every preceding block; with skip, each block is touched once.
+// When false: pure letter runs + spaces, no digits anywhere. Find returns
+// -1 (no match). Without skip: O(N²) per block scanning. With skip:
+// each block scanned once then jumped past the delimiter.
+func deadSkipNearMissInput(withMatches bool) string {
+	const blockLen = 100
+	const numBlocks = 100
+	letters := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	var b []byte
+	for blk := 0; blk < numBlocks; blk++ {
+		for i := 0; i < blockLen; i++ {
+			b = append(b, letters[(blk*blockLen+i)%len(letters)])
+		}
+		if withMatches && blk == numBlocks-1 {
+			b = append(b, '7') // single digit at the end of the last block
+		}
+		b = append(b, ' ')
+	}
+	return string(b)
 }
 
 // setShuftiLNMInput builds ~50 KB for the H.3 set-shufti-lnm case.
