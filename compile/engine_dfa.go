@@ -2330,6 +2330,23 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 
 	l := buildDFALayout(t, tableBase, false, true, 0, false, t.hasWordBoundary)
 
+	// LIKELY.md Gap H.2: keep only mid-accept dominants for the
+	// buildSetSuffixBody bulk-skip dispatch. Non-mid-accept dominants would
+	// need a separate LM-gated path (task 7 step 2 precedent) and a per-set
+	// LikelyMode plumbed through to this layer — deferred until H.2 mid path
+	// is proven to win. detectDominantSelfLoop already ran inside
+	// buildDFALayout above; we just filter the recorded slice.
+	if len(l.dominantStates) > 0 {
+		filtered := l.dominantStates[:0]
+		for _, info := range l.dominantStates {
+			if info.isMidAccept {
+				filtered = append(filtered, info)
+			}
+		}
+		l.dominantStates = filtered
+	}
+	applyDominantStateEncoding(l)
+
 	// Four 8-byte-per-state bitmask tables placed after all layout data.
 	midBitmaskOff := int32(l.tableEnd)
 	eofBitmaskOff := midBitmaskOff + int32(l.numWASM)*8
@@ -2434,13 +2451,23 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 	lBits := byte(14 + n)
 	lResult := byte(15 + n)
 	lStartResult := byte(16 + n)
+	// Bulk-skip chunk local (v128); only declared when dominants exist.
+	lBulkChunk := byte(17 + n)
+	haveDominants := len(l.dominantStates) > 0
 
 	var b []byte
-	// Local declaration: (7 + n) × i32, 3 × i64
-	b = append(b, 0x02)
+	// Local declaration: (7 + n) × i32, 3 × i64, optionally 1 × v128.
+	if haveDominants {
+		b = append(b, 0x03) // 3 groups
+	} else {
+		b = append(b, 0x02) // 2 groups
+	}
 	b = utils.AppendULEB128(b, uint32(7+n))
 	b = append(b, 0x7F)       // i32
 	b = append(b, 0x03, 0x7E) // 3 × i64
+	if haveDominants {
+		b = append(b, 0x01, 0x7B) // 1 × v128
+	}
 
 	// Initial state: wasmStart when lPos==0; for word-boundary DFAs also select
 	// wasmMidStartWord when the previous byte was a word char.
@@ -2633,6 +2660,56 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 		b = append(b, 0x71, 0x04, 0x40)                                   // if bit k fired
 		b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, endPosK(k)) // endPos_k = scanPos+1
 		b = append(b, 0x0B)
+	}
+
+	// LIKELY.md Gap H.2: dominant-state SIMD bulk-skip dispatch.
+	// Mirrors emitPhase4Dispatch's mid-accept channel but operates on
+	// per-pattern endPos. The encoded byte in midAcceptBytes[state] is
+	// 2+idx for dominant states (0/1 for non-dominant); we dispatch via
+	// state-compare against each dominant's encoded byte.
+	//
+	// After bulk-skip advances lScanPos by k bytes, every pattern whose
+	// midAccept bit is set at the dominant state has its endPos_k bumped
+	// to lScanPos+1 — the position right after the last self-loop byte,
+	// matching the per-byte update the elided iterations would have done.
+	// lBitsScratch is preserved across emitDominantBulkSkip (it only
+	// clobbers lByteClass/lBulkChunk), so we re-read it for the update.
+	if haveDominants {
+		// tmp = midAcceptBytes[state]; if (tmp != 0) { ... }
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptOff)
+		b = append(b, 0x20, lState)
+		b = append(b, 0x6A) // i32.add
+		b = appendTableLoad8u(b, tableMemIdx)
+		b = append(b, 0x22, lByteClass) // local.tee lByteClass (reused as tmp)
+		b = append(b, 0x04, 0x40)       // if (midAccept != 0)
+		for _, info := range l.dominantStates {
+			if !info.isMidAccept {
+				continue
+			}
+			b = append(b, 0x20, lByteClass)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(info.encodedByte))
+			b = append(b, 0x46)       // i32.eq
+			b = append(b, 0x04, 0x40) // if (encoded byte match)
+			b = emitDominantBulkSkip(b, info.exitBytes, false,
+				lScanPos, paramLen, 0x00, paramPtr,
+				lBulkChunk, lByteClass)
+			// Re-update endPos_k for each pattern in lBitsScratch.
+			for k := range patternIDs {
+				if k >= 32 {
+					break
+				}
+				bit := uint32(1) << uint(k)
+				b = append(b, 0x20, lBitsScratch, 0x41)
+				b = utils.AppendSLEB128(b, int32(bit))
+				b = append(b, 0x71, 0x04, 0x40)                                   // if bit k set
+				b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, endPosK(k)) // endPos_k = scanPos+1
+				b = append(b, 0x0B)
+			}
+			b = append(b, 0x0B) // end if encoded byte match
+		}
+		b = append(b, 0x0B) // end if midAccept != 0
 	}
 
 	// Per-pattern immediateAccept: write immediately when pattern k is done.

@@ -388,6 +388,15 @@ type CompileSetOptions struct {
 	MaxFallbackStates     int   // max DFA states for a single-pattern fallback bucket; default 1024
 	TableBase             int32 // byte offset where this set's DFA tables start in memory; default 0
 	TableMemIdx           int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
+	// LikelyMode is the resolved set-level LikelyMode hint. Currently inert:
+	// reserved for the set-frontend density-gate (H.3) and the set-wide
+	// suffix-body fallback (H.2 precedence chain).
+	LikelyMode LikelyMode
+	// PatternLikelyModes is the resolved per-pattern LikelyMode for each
+	// pattern in the set, indexed by the same position as spec.Patterns when
+	// passed to CompileSet. nil/empty means all patterns use LikelyNeutral.
+	// Currently inert: reserved for the suffix-body bulk-skip (H.2).
+	PatternLikelyModes []LikelyMode
 }
 
 func (o CompileSetOptions) bitmaskWidth() int {

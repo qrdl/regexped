@@ -401,6 +401,56 @@ TDFA uses the same DFA table layout as the DFA engine (u8 or u16 state IDs, opti
 - **RE2/Perl semantics only.** All engines implement leftmost-first (Perl/RE2) match semantics. POSIX leftmost-longest is not supported and must not be introduced.
 - **Runtime over compile time.** Pattern compilation happens once and its cost is irrelevant. Every design and implementation decision should minimise the runtime cost of matching — prefer larger tables, more WASM locals, additional compile-time passes, or any other compile-time complexity if it makes the generated code faster.
 
+## Load-bearing engine-selection gates — DO NOT relax without measurement
+
+Some engine-selection checks in `compile/selector.go` *look* overly
+conservative ("the detector is wrong, this pattern is clearly
+deterministic, it should reach TDFA"). They are deliberately kept.
+Relaxing them has been tried and **caused measurable performance
+regressions**. Always measure per-byte fuel on representative patterns
+before removing or weakening any gate. See `plans/LIKELY.md` "Gap I"
+for the full diagnosis.
+
+### `hasAmbiguousCaptures` / `getFirstRuneSet` for inverted classes (Gap I)
+
+`getFirstRuneSet` in [compile/selector.go](compile/selector.go) returns
+false on InstRune instructions whose Unicode range exceeds 256
+codepoints. For inverted byte classes (`[^>]`, `[^,]`, `\S`, `[^\n]`,
+etc.) syntax.Prog encodes the class as such a wide range. The detector
+treats them as ambiguous and routes the patterns to Backtracking.
+
+**This is correct behaviour, not a bug.** Investigated and reverted
+2026-06-24:
+
+- **Before:** patterns like `<([^>]+)>`, `([^,]+),`, `KEY=([^&]+)&`
+  compile to BT. BT captureBody costs ~40 fuel/byte for these
+  patterns (deterministic in practice, no actual backtracking).
+- **After (Gap I fix applied):** patterns reach TDFA cleanly, captures
+  correct under re2 `--validate-groups`. TDFA captureBody costs ~77
+  fuel/byte. Measured regressions: `<([^>]+)>` neutral +73%, LM +466%,
+  WASM size +69%.
+
+**The lesson.** TDFA is not intrinsically faster than BT. TDFA wins
+only when BT actually backtracks. For clean greedy patterns whose
+runtime path is deterministic, BT's tight NFA switch is *faster* than
+TDFA's table-driven transition + `br_table` tag-op dispatch +
+accept-side-table lookup per byte. Engine class is not a substitute for
+measurement.
+
+**Constraints on revisiting.** Do not re-attempt to relax this gate
+unless TDFA captureBody per-byte cost is *first* reduced below BT's on
+the affected pattern family. That requires (at minimum) replacing
+`br_table` tag-op dispatch with state-ID compare for dominant groups,
+eliminating the TDFA accept side-table, and inlining single-tag-op
+register writes. Even then, the change must be measured on
+representative patterns (`<([^>]+)>`, `([^,]+),`, etc.) and the new
+TDFA fuel cost confirmed at parity or better before any detector
+relaxation.
+
+The same per-byte-cost concern applies to any future plan that moves
+capture-tracking patterns from BT to TDFA on correctness grounds
+alone. Always measure first.
+
 ## Technical Decisions
 
 ### Why DFA?

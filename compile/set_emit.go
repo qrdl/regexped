@@ -669,6 +669,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		return Compile(cfg.Regexps, 0, standalone, CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,
 			MaxTDFARegs:  cfg.MaxTDFARegs,
+			LikelyMode:   resolveLikelyMode(cfg.LikelyMode),
 		})
 	}
 
@@ -680,6 +681,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	opts := CompileOptions{
 		MaxDFAStates: cfg.MaxDFAStates,
 		MaxTDFARegs:  cfg.MaxTDFARegs,
+		LikelyMode:   resolveLikelyMode(cfg.LikelyMode),
 	}
 	if !standalone {
 		opts.tableMemIdx = 1
@@ -751,7 +753,22 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 			Patterns:   infos,
 			PatternIDs: globalIDs,
 		}
-		setOpts := CompileSetOptions{}
+		setOpts := CompileSetOptions{
+			// Set-level LikelyMode precedence: set > global > neutral.
+			// Used by H.3 (frontend density gate) and as the per-pattern
+			// fallback for unhinted patterns when H.2 reads PatternLikelyModes.
+			LikelyMode: resolveLikelyMode(sc.LikelyMode, cfg.LikelyMode),
+		}
+		// Per-pattern LikelyMode (within this set) precedence:
+		// pattern > set > global > neutral. Lights up for H.2's suffix-DFA
+		// bulk-skip; currently inert beyond storage.
+		if len(infos) > 0 {
+			setOpts.PatternLikelyModes = make([]LikelyMode, len(infos))
+			for i, idx := range globalIDs {
+				re := cfg.Regexps[idx]
+				setOpts.PatternLikelyModes[i] = resolveLikelyMode(re.LikelyMode, sc.LikelyMode, cfg.LikelyMode)
+			}
+		}
 		if !standalone {
 			setOpts.TableMemIdx = 1
 		}

@@ -29,6 +29,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------
@@ -51,6 +52,7 @@ const (
 	modeFind matchMode = iota
 	modeAnchored
 	modeGroups
+	modeSet // CompileFile with cfg.Sets; driven via find_all exhaustion loop
 )
 
 func (m matchMode) String() string {
@@ -59,13 +61,16 @@ func (m matchMode) String() string {
 		return "anchored"
 	case modeGroups:
 		return "groups"
+	case modeSet:
+		return "set"
 	}
 	return "find"
 }
 
 type testCase struct {
 	name         string
-	pattern      string
+	pattern      string   // unset when mode == modeSet
+	setPatterns  []string // only set when mode == modeSet; passed as separate RegexEntry per pattern
 	mode         matchMode
 	notes        string // one-line description of which optimisation it targets
 	matchInput   string
@@ -647,6 +652,29 @@ var tests = []testCase{
 		matchInput:   btAction5Input(true),
 		nomatchInput: btAction5Input(false),
 	},
+	{
+		// H.2 target: set of patterns each with a dominant `[^\n]+` body
+		// after a distinct literal prefix. Each pattern buckets separately
+		// (different first byte: 'E', 'W', 'I'). Without H.2 the suffix DFA
+		// loop scans the body byte-by-byte. With H.2 the dominant-state
+		// mid-accept dispatch should bulk-skip non-newline bytes 16 at a
+		// time, mirroring the single-pattern `comment-line-large` win.
+		//
+		// Patterns are non-capture-bearing (sets drop capture-bearing
+		// patterns at registration time). Mode-independent: H.2 mid-accept
+		// portion is default-on, same precedent as task 7 step 1 in
+		// single-pattern mode.
+		name: "set-log-line-bodies",
+		setPatterns: []string{
+			`ERROR:[^\n]+`,
+			`WARN:[^\n]+`,
+			`INFO:[^\n]+`,
+		},
+		mode:         modeSet,
+		notes:        "set of dominant-body log lines — H.2 (buildSetSuffixBody bulk-skip) target",
+		matchInput:   setLogLineInput(true),
+		nomatchInput: setLogLineInput(false),
+	},
 }
 
 // --------------------------------------------------------------------------
@@ -894,6 +922,45 @@ func litAnchorDominantBodyInput(withMatches bool) string {
 	}
 	for len(b) < targetSize {
 		b = append(b, prose...)
+	}
+	return string(b[:targetSize])
+}
+
+// setLogLineInput builds ~50 KB of mixed text for the H.2 set test case.
+// When withMatches is true: blocks of ERROR:/WARN:/INFO: log lines with long
+// (~200 byte) bodies interleaved with prose. The dominant `[^\n]+` body
+// inside each pattern's suffix DFA spans the entire log-line body, so the
+// bulk-skip dispatch has bytes to chew.
+// When false: pure prose without any of the three literal prefixes. The
+// set frontend's Teddy/AC scan never fires, the suffix DFA never enters.
+// Used to confirm the no-match path remains regression-free.
+func setLogLineInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	prose := []byte("The quick brown fox jumps over the lazy dog. ")
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, prose...)
+		}
+		return string(b[:targetSize])
+	}
+	// Mix of log lines with long bodies.
+	// Each line: "<PREFIX>:<200 bytes of body>\n"
+	prefixes := []string{"ERROR", "WARN", "INFO"}
+	bodyFiller := []byte("the operation completed normally with no observable side effects on the surrounding subsystem state. retrying in 50ms. ")
+	var b []byte
+	idx := 0
+	for len(b) < targetSize {
+		b = append(b, []byte(prefixes[idx%len(prefixes)])...)
+		b = append(b, ':')
+		bodyStart := len(b)
+		for len(b)-bodyStart < 200 {
+			b = append(b, bodyFiller...)
+		}
+		b = append(b, '\n')
+		// Some inter-match prose so consecutive matches aren't adjacent.
+		b = append(b, prose...)
+		idx++
 	}
 	return string(b[:targetSize])
 }
@@ -1187,6 +1254,9 @@ type cell struct {
 
 // compileMode compiles tc.pattern under the given LikelyMode and returns the WASM bytes.
 func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
+	if tc.mode == modeSet {
+		return compileSetMode(tc, mode)
+	}
 	re := config.RegexEntry{Pattern: tc.pattern}
 	switch tc.mode {
 	case modeAnchored:
@@ -1199,6 +1269,44 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	opts := compile.CompileOptions{LikelyMode: mode}
 	wasm, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true, opts)
 	return wasm, err
+}
+
+// compileSetMode compiles tc.setPatterns as a regexped set under the given
+// LikelyMode and returns standalone WASM exporting find_all. The mode is
+// applied at the global config level — H.1 plumbing routes it through both
+// per-pattern (effective default) and per-set (frontend hint) fallbacks.
+func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
+	entries := make([]config.RegexEntry, len(tc.setPatterns))
+	for i, p := range tc.setPatterns {
+		entries[i] = config.RegexEntry{Pattern: p}
+	}
+	cfg := config.BuildConfig{
+		Regexps:    entries,
+		LikelyMode: likelyModeYAML(mode),
+		Sets: []config.SetConfig{
+			{
+				Name:     "bench_set",
+				FindAll:  "find_all",
+				Patterns: config.PatternSelector{All: true},
+			},
+		},
+	}
+	// Output empty → standalone.
+	wasm, _, err := compile.CompileFile(cfg, "")
+	return wasm, err
+}
+
+// likelyModeYAML maps the compile.LikelyMode enum back to its YAML string form
+// so compileSetMode can stuff it into a BuildConfig field. Empty string ⇒
+// caller-side neutral default.
+func likelyModeYAML(m compile.LikelyMode) string {
+	switch m {
+	case compile.LikelyMatch:
+		return "match"
+	case compile.LikelyNoMatch:
+		return "nomatch"
+	}
+	return ""
 }
 
 // benchTime times benchIters calls via the WASM shim and returns the p50 of
@@ -1332,6 +1440,17 @@ func measure(tc testCase, mode compile.LikelyMode, input string, engine, fuelEng
 	if err != nil {
 		return cell{}, fmt.Errorf("compile %s: %w", mode, err)
 	}
+	if tc.mode == modeSet {
+		t, err := benchTimeSet(wasm, input, engine)
+		if err != nil {
+			return cell{}, fmt.Errorf("bench time %s: %w", mode, err)
+		}
+		f, err := benchFuelSet(wasm, input, fuelEngine)
+		if err != nil {
+			return cell{}, fmt.Errorf("bench fuel %s: %w", mode, err)
+		}
+		return cell{timeP50: t, fuel: f, size: len(wasm)}, nil
+	}
 	t, err := benchTime(wasm, tc, input, engine)
 	if err != nil {
 		return cell{}, fmt.Errorf("bench time %s: %w", mode, err)
@@ -1341,6 +1460,156 @@ func measure(tc testCase, mode compile.LikelyMode, input string, engine, fuelEng
 		return cell{}, fmt.Errorf("bench fuel %s: %w", mode, err)
 	}
 	return cell{timeP50: t, fuel: f, size: len(wasm)}, nil
+}
+
+// Set bench layout: tables live at the bottom of memory (CompileFile places
+// them starting at offset 0). Input is written AFTER all table data, with the
+// output buffer further past the input. Without this gap the input write
+// silently overwrites the frontend Teddy/AC tables and the set match function
+// produces garbage.
+const (
+	setOutCap   = int32(256)  // output capacity in tuples (12 B each)
+	setIterTime = 1000        // exhaustion passes per p50 sample
+)
+
+// setMemPlan holds the resolved memory offsets for one set's bench.
+type setMemPlan struct {
+	inputBase  int32
+	outputBase int32
+}
+
+// planSetMem computes input/output offsets that don't overlap with the set's
+// data segments. Mirrors perftest's approach.
+func planSetMem(wasmBytes []byte, inputLen int) (setMemPlan, error) {
+	const pageSize = 65536
+	actualTop := int64(0)
+	if top, err := utils.ParseDataSectionBytes(wasmBytes); err == nil && top > actualTop {
+		actualTop = top
+	}
+	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
+	outBase := inBase + int32(inputLen) + 4096
+	return setMemPlan{inputBase: inBase, outputBase: outBase}, nil
+}
+
+// benchTimeSet times the cost of one full find_all exhaustion pass over
+// `input` and returns the p50 over setIterTime samples.
+func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time.Duration, error) {
+	plan, err := planSetMem(wasmBytes, len(input))
+	if err != nil {
+		return 0, err
+	}
+	mod, err := wasmtime.NewModule(engine, wasmBytes)
+	if err != nil {
+		return 0, fmt.Errorf("module: %w", err)
+	}
+	store := wasmtime.NewStore(engine)
+	store.SetWasi(wasmtime.NewWasiConfig())
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		return 0, fmt.Errorf("instance: %w", err)
+	}
+	mem := inst.GetExport(store, "memory").Memory()
+	findFn := inst.GetFunc(store, "find_all")
+	if mem == nil || findFn == nil {
+		return 0, fmt.Errorf("missing exports")
+	}
+	if err := writeSetInput(store, mem, plan, input); err != nil {
+		return 0, err
+	}
+
+	// Warmup: a few exhaustion passes.
+	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
+		runSetExhaust(store, findFn, mem, plan, int32(len(input)))
+	}
+
+	timings := make([]time.Duration, setIterTime)
+	for i := range timings {
+		t0 := time.Now()
+		runSetExhaust(store, findFn, mem, plan, int32(len(input)))
+		timings[i] = time.Since(t0)
+	}
+	// p50.
+	ns := make([]byte, setIterTime*4)
+	for i, d := range timings {
+		v := uint32(d.Nanoseconds())
+		ns[i*4] = byte(v)
+		ns[i*4+1] = byte(v >> 8)
+		ns[i*4+2] = byte(v >> 16)
+		ns[i*4+3] = byte(v >> 24)
+	}
+	return computeStat(ns, 50), nil
+}
+
+// benchFuelSet measures fuel for one full find_all exhaustion pass.
+func benchFuelSet(wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (uint64, error) {
+	plan, err := planSetMem(wasmBytes, len(input))
+	if err != nil {
+		return 0, err
+	}
+	mod, err := wasmtime.NewModule(fuelEngine, wasmBytes)
+	if err != nil {
+		return 0, err
+	}
+	store := wasmtime.NewStore(fuelEngine)
+	if err := store.SetFuel(fuelBudget); err != nil {
+		return 0, err
+	}
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		return 0, err
+	}
+	mem := inst.GetExport(store, "memory").Memory()
+	findFn := inst.GetFunc(store, "find_all")
+	if mem == nil || findFn == nil {
+		return 0, fmt.Errorf("missing exports")
+	}
+	if err := writeSetInput(store, mem, plan, input); err != nil {
+		return 0, err
+	}
+	before, _ := store.GetFuel()
+	runSetExhaust(store, findFn, mem, plan, int32(len(input)))
+	after, _ := store.GetFuel()
+	return before - after, nil
+}
+
+func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan, input string) error {
+	const pageSize = 65536
+	needTop := uint64(plan.outputBase) + uint64(setOutCap)*12 + 4096
+	neededPages := (needTop + pageSize - 1) / pageSize
+	curPages := mem.Size(store)
+	if neededPages > curPages {
+		if _, err := mem.Grow(store, neededPages-curPages); err != nil {
+			return fmt.Errorf("mem grow: %w", err)
+		}
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[plan.inputBase:], []byte(input))
+	return nil
+}
+
+// runSetExhaust drives find_all in a loop until it returns 0 (no more matches),
+// advancing startPos past the last match each iteration.
+func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) {
+	startPos := int32(0)
+	for {
+		n, err := findFn.Call(store, plan.inputBase, inputLen, plan.outputBase, setOutCap, startPos)
+		if err != nil {
+			return
+		}
+		count := n.(int32)
+		if count <= 0 {
+			return
+		}
+		buf := mem.UnsafeData(store)
+		last := int(count - 1)
+		base := int(plan.outputBase) + last*12
+		s := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
+		l := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
+		if l <= 0 {
+			l = 1
+		}
+		startPos = s + l
+	}
 }
 
 // --------------------------------------------------------------------------

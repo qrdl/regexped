@@ -69,6 +69,38 @@ func (m LikelyMode) String() string {
 	}
 }
 
+// parseLikelyMode converts the YAML string form into a LikelyMode value and a
+// "set" flag indicating whether the input was non-empty (i.e. the caller
+// expressed an explicit choice). Unknown strings are rejected at config load
+// (config.ValidLikelyMode), so we treat anything other than the four valid
+// forms here as LikelyNeutral defensively.
+func parseLikelyMode(s string) (mode LikelyMode, set bool) {
+	switch s {
+	case "":
+		return LikelyNeutral, false
+	case "match":
+		return LikelyMatch, true
+	case "nomatch":
+		return LikelyNoMatch, true
+	case "neutral":
+		return LikelyNeutral, true
+	}
+	return LikelyNeutral, false
+}
+
+// resolveLikelyMode applies the LikelyMode precedence chain. The first
+// non-empty entry wins; an empty trailing fallback resolves to LikelyNeutral.
+// Order is significant — pass strings in highest-priority-first order
+// (typically pattern, then enclosing set, then global default).
+func resolveLikelyMode(chain ...string) LikelyMode {
+	for _, s := range chain {
+		if mode, set := parseLikelyMode(s); set {
+			return mode
+		}
+	}
+	return LikelyNeutral
+}
+
 // CompileOptions contains optional parameters for engine selection.
 type CompileOptions struct {
 	// MaxDFAStates is the maximum number of states allowed when building a DFA
@@ -246,6 +278,15 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 	if !needMatch && !needFind && !needGroups {
 		return &compiledPattern{tableEnd: tableBase}, nil
+	}
+
+	// Per-pattern LikelyMode (from YAML) overrides whatever the caller passed
+	// in buildOpts.LikelyMode. The caller is expected to have already folded
+	// the global default into buildOpts.LikelyMode (e.g. CmdCompile does this
+	// from cfg.LikelyMode), so the precedence resolves to pattern > caller's
+	// effective default. See plans/LIKELY.md gap H.1.
+	if mode, set := parseLikelyMode(re.LikelyMode); set {
+		buildOpts.LikelyMode = mode
 	}
 
 	// LikelyMatch early gate: counted-chain SIMD verifier (LIKELY.md Opt 2).
@@ -1241,6 +1282,7 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 		compOpts := CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,
 			MaxTDFARegs:  cfg.MaxTDFARegs,
+			LikelyMode:   resolveLikelyMode(cfg.LikelyMode),
 		}
 		standalone := cfg.Output == ""
 		var err error

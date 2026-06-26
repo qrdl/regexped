@@ -19,8 +19,13 @@ type BuildConfig struct {
 	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
 	MaxDFAStates int          `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int          `yaml:"max_tdfa_regs"`  // 0 = default (32)
-	Regexps      []RegexEntry `yaml:"regexps"`
-	Sets         []SetConfig  `yaml:"sets"` // optional set composition entries
+	// LikelyMode is the global default LikelyMode for any regexp or set that
+	// does not specify its own. Accepted values: "" (unset / neutral),
+	// "neutral", "match", "nomatch". Unknown values are rejected at config
+	// load. See plans/LIKELY.md.
+	LikelyMode string       `yaml:"likely_mode"`
+	Regexps    []RegexEntry `yaml:"regexps"`
+	Sets       []SetConfig  `yaml:"sets"` // optional set composition entries
 }
 
 // SetConfig describes one `sets:` entry in the YAML config.
@@ -32,6 +37,11 @@ type SetConfig struct {
 	BatchSize   int             `yaml:"batch_size"`    // output buffer hint (default 256); stub-gen only
 	Patterns    PatternSelector `yaml:"patterns"`      // which regexps belong to this set
 	EmitNameMap bool            `yaml:"emit_name_map"` // generate pattern_name / patternName helper in stubs (does not change WASM)
+	// LikelyMode hints which set-frontend optimisation to favour. Also serves
+	// as the per-set default for unhinted patterns in this set when they reach
+	// the set's suffix DFA body. Accepted values: "" (unset / falls back to
+	// global), "neutral", "match", "nomatch". See plans/LIKELY.md gap H.
+	LikelyMode string `yaml:"likely_mode"`
 }
 
 // PatternSelector selects patterns for a set. It can be the scalar string "all"
@@ -66,6 +76,40 @@ func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error
 		return nil
 	}
 	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names")
+}
+
+// ValidLikelyMode reports whether s is a valid likely_mode value. Empty string
+// is valid (means "unset, fall back through precedence chain"). Otherwise the
+// value must be one of "neutral", "match", "nomatch".
+func ValidLikelyMode(s string) bool {
+	switch s {
+	case "", "neutral", "match", "nomatch":
+		return true
+	}
+	return false
+}
+
+// validateLikelyModes checks all likely_mode fields in cfg. Returns an error
+// listing the first unknown value found.
+func validateLikelyModes(cfg *BuildConfig) error {
+	if !ValidLikelyMode(cfg.LikelyMode) {
+		return fmt.Errorf("likely_mode: unknown value %q (want \"\", \"neutral\", \"match\", or \"nomatch\")", cfg.LikelyMode)
+	}
+	for _, re := range cfg.Regexps {
+		if !ValidLikelyMode(re.LikelyMode) {
+			label := re.Name
+			if label == "" {
+				label = re.Pattern
+			}
+			return fmt.Errorf("regexp %q: likely_mode: unknown value %q (want \"\", \"neutral\", \"match\", or \"nomatch\")", label, re.LikelyMode)
+		}
+	}
+	for _, sc := range cfg.Sets {
+		if !ValidLikelyMode(sc.LikelyMode) {
+			return fmt.Errorf("set %q: likely_mode: unknown value %q (want \"\", \"neutral\", \"match\", or \"nomatch\")", sc.Name, sc.LikelyMode)
+		}
+	}
+	return nil
 }
 
 // ValidateSets validates the `sets:` block against the `regexps:` list.
@@ -156,6 +200,12 @@ type RegexEntry struct {
 	FindFunc        string `yaml:"find_func"`         // non-anchored find → Option<(usize,usize)>
 	GroupsFunc      string `yaml:"groups_func"`       // anchored + captures → Option<Vec<Option<(usize,usize)>>>
 	NamedGroupsFunc string `yaml:"named_groups_func"` // anchored + named captures → Option<HashMap<&'static str,(usize,usize)>>
+
+	// LikelyMode hints which suffix-DFA optimisation path to favour for this
+	// specific pattern. Accepted values: "" (unset / falls back through
+	// enclosing set then global), "neutral", "match", "nomatch". See
+	// plans/LIKELY.md.
+	LikelyMode string `yaml:"likely_mode"`
 }
 
 // CaptureStubsRequested reports whether any capture-returning stub is requested.
@@ -203,6 +253,9 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	cfg.WasmMerge = resolveFilePath(configDir, cfg.WasmMerge)
 
 	if err := ValidateSets(&cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
+	if err := validateLikelyModes(&cfg); err != nil {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 	}
 
