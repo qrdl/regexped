@@ -3464,8 +3464,17 @@ func emitImmAcceptCheckFindMid(b []byte, immAcceptLimit int32,
 	return b
 }
 
-// emitImmAcceptCheckFindStart emits: if state u<= immAcceptLimit: last_accept=pos; br brDepth.
+// emitImmAcceptCheckFindStart emits: if (state-1) u< immAcceptLimit: last_accept=pos; br brDepth.
 // Used at the start of each attempt in find mode. No-op when hasImmAccept is false.
+//
+// The check must reject state=0 (dead). A naive `state u<= immAcceptLimit` is
+// TRUE for state=0 whenever immAcceptLimit >= 0 (always), which incorrectly
+// fires the imm-accept branch for a dead state — this happens in find mode
+// when the SIMD prefix scan's OnMatch sets state=prefixEndStateWord=0 for
+// `\b<wordchar>` patterns where the previous byte is a word char (Task 9).
+// The unsigned-underflow trick `(state-1) u< immAcceptLimit` matches
+// emitAcceptBitOnStack and handles state=0 correctly: state-1 underflows to
+// 0xFFFFFFFF which is NOT u< immAcceptLimit.
 func emitImmAcceptCheckFindStart(b []byte, immAcceptLimit int32,
 	hasImmAccept bool, stateLocal, posLocal, lastAcceptLocal byte,
 	brDepth byte, tableMemIdx int) []byte {
@@ -3474,9 +3483,11 @@ func emitImmAcceptCheckFindStart(b []byte, immAcceptLimit int32,
 	}
 	_ = tableMemIdx
 	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6B) // i32.sub → state - 1
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, immAcceptLimit)
-	b = append(b, 0x4D)                  // i32.le_u
+	b = append(b, 0x49)                  // i32.lt_u (unsigned)
 	b = append(b, 0x04, 0x40)            // if (void)
 	b = append(b, 0x20, posLocal)        //
 	b = append(b, 0x21, lastAcceptLocal) //

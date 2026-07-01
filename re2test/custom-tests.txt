@@ -1631,12 +1631,18 @@ regexps
 -;1-2;-;-;;1-2 1-1
 -;1-3;-;-;;1-3 1-2
 # ============================================================
-# Category 26: Word-boundary at literal-anchor candidate position
-# Documents a known bug in the lit-anchor DFA find path: when a pattern is
-# `\bLITERAL...` and the SIMD prefix scan locates LITERAL at a position p
-# where the preceding byte input[p-1] is a word char (so `\b` should fail at
-# p), regexped's neutral DFA find incorrectly returns a match at p.
-# Verified against Go stdlib regexp.FindStringIndex.
+# Category 26: Word-boundary at DFA find candidate position
+# Was originally scoped as a lit-anchor bug in the neutral DFA find path,
+# but 2026-06-30 re-investigation traced it to `emitImmAcceptCheckFindStart`:
+# the check `state u<= immAcceptLimit` incorrectly returned TRUE for state=0
+# (dead) whenever immAcceptLimit >= 0 (always). When the SIMD prefix scan's
+# OnMatch set state = prefixEndStateWord = 0 (dead) for `\b<wordchar>`
+# patterns at candidate positions with word-char predecessors, the imm-accept
+# fast path fired and returned a wrong match. Fixed via `(state-1) u< limit`
+# — same unsigned-underflow trick used by emitAcceptBitOnStack.
+#
+# Cases below cover both `\b<literal>...\b` (originally suspected) and the
+# stricter `\b<literal>` (no trailing anchor) that surfaces the bug.
 # ============================================================
 Cat26LitAnchorWordBoundaryBug
 strings
@@ -1650,6 +1656,35 @@ regexps
 -;4-44;-;-
 -;1-41;-;-
 0-40;0-40;-;-
+# Same shape without trailing \b — routes through the actual buggy code path.
+# One pattern per block; 4 result rows (one per string in the strings block).
+Cat26PrefixBOnlyMinimal
+strings
+"Xg"
+"Xghp"
+"Xghp_ stuff"
+"Xghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+regexps
+"\\bg"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;42-43;-;-
+"\\bghp"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;42-45;-;-
+"\\bghp_"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;42-46;-;-
+"\\bghp_[A-Za-z0-9]{36}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;42-82;-;-
 # ============================================================
 # Category 27: Lit-chain capture path — non-anchored find with captures.
 # Surfaces a correctness gap in Gap A.1: the lit-chain capture body is
