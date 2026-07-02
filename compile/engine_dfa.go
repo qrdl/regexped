@@ -3443,6 +3443,16 @@ func emitDominantBulkSkip(b []byte, exitBytes []byte, updateLastAccept bool,
 
 // emitImmAcceptCheckFindMid emits: if state u<= immAcceptLimit: last_accept=pos+1; br brDepth.
 // Used mid-scan in find mode. No-op when hasImmAccept is false.
+//
+// Relies on reorderAcceptFirst placing immediate-accepting WASM state IDs at
+// 1..immAcceptLimit. The state==0 (dead) case is excluded by an upstream
+// dead-state guard: every caller of this helper runs `emitDeadHandler` (which
+// br's out of the current scan iteration on state==0) after the DFA
+// transition, so by the time we reach this check, state != 0 is guaranteed.
+//
+// If a new caller is added that doesn't have such a guard upstream, use the
+// `(state-1) u< immAcceptLimit` unsigned-underflow pattern instead (compare
+// emitImmAcceptCheckFindStart, which needed exactly that fix for Task 9).
 func emitImmAcceptCheckFindMid(b []byte, immAcceptLimit int32,
 	hasImmAccept bool, stateLocal, posLocal, lastAcceptLocal byte,
 	brDepth byte, tableMemIdx int) []byte {

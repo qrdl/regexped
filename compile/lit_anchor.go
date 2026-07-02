@@ -205,3 +205,29 @@ func findLitAnchorPoint(pattern string) *litAnchorPoint {
 	}
 	return nil
 }
+
+// prefixContainsWordBoundary reports whether re (or any subtree) contains an
+// OpWordBoundary (`\b`) or OpNoWordBoundary (`\B`) node. Used to gate the
+// lit-anchor optimisation: the reversed-prefix DFA construction does not
+// evaluate word boundaries in the backward direction and the backward-scan
+// body does not verify them at candidate positions, so lit-anchor is unsafe
+// for any prefix that mentions `\b`/`\B`. Task 10 (2026-06-30) — makes the
+// gate at compile.go's lit-anchor activation explicit; previously the
+// rejection relied on the incidental behaviour that a reversed-`\b`-only DFA
+// happens to have an accepting start state, which was fragile against future
+// DFA-construction changes.
+func prefixContainsWordBoundary(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	switch re.Op {
+	case syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+		return true
+	}
+	for _, sub := range re.Sub {
+		if prefixContainsWordBoundary(sub) {
+			return true
+		}
+	}
+	return false
+}

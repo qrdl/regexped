@@ -775,7 +775,15 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
 			lap := findLitAnchorPoint(re.Pattern)
-			if lap != nil && l.useU8 && !table.hasWordBoundary {
+			// Task 10: reject prefixes containing `\b`/`\B` explicitly. The
+			// reversed-prefix DFA doesn't evaluate word boundaries backward,
+			// and the lit-anchor find body doesn't verify them at candidate
+			// positions. Previously this was blocked only incidentally by
+			// the acceptStates[startState] check below (a reversed `\b`-only
+			// DFA accepts at its start), but that gate is fragile against
+			// future DFA-construction changes.
+			if lap != nil && l.useU8 && !table.hasWordBoundary &&
+				!prefixContainsWordBoundary(lap.prefixRe) {
 				// Compile the reversed prefix DFA for the backward scan.
 				revRe := reverseRegexp(lap.prefixRe)
 				revSimplified := revRe.Simplify()
