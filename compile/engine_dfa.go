@@ -1420,6 +1420,16 @@ type dfaLayout struct {
 	// one. Collapses O(N²) find-mode worst case on near-miss greedy
 	// patterns to O(N). See plans/TODO.md task 8.
 	skipSafeOnDead bool
+
+	// patternMinLen (Task 8 follow-up #1 — EOF-without-match): compile-time
+	// minimum byte length of any accepting match, computed via
+	// regexpMinMaxLen on the parsed regex. When non-zero the find body's
+	// outer-loop bound check tightens from `attempt_start > len` to
+	// `attempt_start + patternMinLen > len`, letting patterns with
+	// insufficient remaining input short-circuit before running the DFA.
+	// Zero means "no floor" (e.g. patterns that can match empty) and the
+	// check reduces to the existing behaviour.
+	patternMinLen int32
 }
 
 // dominantInfo describes one dominant self-loop state recorded by
@@ -3043,7 +3053,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
 			tableMemIdx,
-			l.dominantStates, l.lnmAction5, l.skipSafeOnDead)
+			l.dominantStates, l.lnmAction5, l.skipSafeOnDead, l.patternMinLen)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -4727,7 +4737,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, patternMinLen int32) []byte {
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
 	// `nonMidDominantOff` parameter and the `[]int` return slot) was
@@ -4792,6 +4802,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			TeddyFourByte:  teddyFourByte,
 			TableMemIdx:    tableMemIdx,
 			LikelyNoMatch:  lnmAction5,
+			MinPatternLen:  patternMinLen,
 			EngineDepth:    2, // loop $outer + block $no_match
 			Locals: prefixScanLocals{
 				Ptr:          0,
@@ -5101,6 +5112,10 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitPrefixScan(b, prefixScanParams{
 			Prefix:      mandatoryLit.bytes,
 			EngineDepth: 2, // loop $lit_outer + block $no_match
+			// MinPatternLen NOT set: scanStartLocal is a mandatory-lit scan
+			// cursor (not attempt_start), so the tightened check would use
+			// the wrong operand. Task 8 follow-up #1 fires only via
+			// emitOuterPrologue where AttemptStart is the true attempt_start.
 			Locals: prefixScanLocals{
 				Ptr:          0,
 				Len:          1,

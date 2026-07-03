@@ -693,6 +693,25 @@ var tests = []testCase{
 		nomatchInput: deadSkipNearMissInput(false),
 	},
 	{
+		// Task 8 follow-up #1 target: EOF-without-match. Pattern requires
+		// 500 x's followed by a y (min-length 501 bytes). No-match input is
+		// 300 x's — pattern min-length > input length, so no attempt at any
+		// starting position can succeed. Without the fix the SIMD prefix
+		// scan finds x-candidates at every position and each triggers a
+		// full DFA walk to EOF: O(N²). With the fix the outer-loop bound
+		// check tightens to `attempt_start + patternMinLen > len` and
+		// the whole scan short-circuits after finding the first candidate.
+		//
+		// Match input has 500 x's + 'y' + filler — regexped and stdlib
+		// should both return the same match; the fix must not disturb it.
+		name:         "eof-min-len-short",
+		pattern:      `x{500}y`,
+		mode:         modeFind,
+		notes:        "insufficient input — Task 8 follow-up #1 (EOF-without-match)",
+		matchInput:   eofMinLenInput(true),
+		nomatchInput: eofMinLenInput(false),
+	},
+	{
 		// H.3 target: 21 literal-prefixed patterns with distinct uppercase
 		// first bytes [A..U]. AC builds ~63 nodes which exceeds the 32-node
 		// cap → frontend falls back to scalar. With H.3, set-level
@@ -1029,6 +1048,40 @@ func deadSkipNearMissInput(withMatches bool) string {
 			b = append(b, '7') // single digit at the end of the last block
 		}
 		b = append(b, ' ')
+	}
+	return string(b)
+}
+
+// eofMinLenInput builds input for the Task 8 follow-up #1 test case
+// (pattern `x{500}y`, min-length 501).
+//
+// withMatches=true: 500 x's + 'y' + filler = 1001 bytes. Pattern matches
+// at position 0 with length 501. The min-length check must NOT trip here;
+// both baseline and post-fix should report the same match. Regression guard.
+//
+// withMatches=false: 300 x's (nothing else). Pattern min-length 501 exceeds
+// the 300-byte input. No match possible from any position. Baseline: SIMD
+// prefix scan finds x-candidates at every position (300 of them), each
+// triggering a DFA walk that consumes remaining x's until EOF without
+// accepting — O(N²). Post-fix: the tightened bound check fires on the
+// first candidate and short-circuits to no-match — O(1).
+func eofMinLenInput(withMatches bool) string {
+	if withMatches {
+		var b []byte
+		for i := 0; i < 500; i++ {
+			b = append(b, 'x')
+		}
+		b = append(b, 'y')
+		// Filler after the match — patterns without trailing anchors don't
+		// care, but longer input exercises whatever comes after the accept.
+		for i := 0; i < 500; i++ {
+			b = append(b, 'z')
+		}
+		return string(b)
+	}
+	var b []byte
+	for i := 0; i < 300; i++ {
+		b = append(b, 'x')
 	}
 	return string(b)
 }

@@ -348,6 +348,6 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 		mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
 		tableMemIdx,
-		l.dominantStates, l.lnmAction5, l.skipSafeOnDead,
+		l.dominantStates, l.lnmAction5, l.skipSafeOnDead, l.patternMinLen,
 	)
 }
