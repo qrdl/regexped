@@ -218,93 +218,106 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		// From $scalar (depths):
 		//   0=$scalar  1=$prefix_matched  [engine blocks]
 		//   → br_if (1+ed) = $no_match
+		//
+		// Phase B verifies prefix[1..N-1] entirely from the single v128 chunk
+		// loaded for Phase A (16 bytes). For len(prefix) > 16 this can't work:
+		// `i32.shr_u k` for k >= 16 zero-shifts the bitmask, silently
+		// collapsing the accumulator to 0 and reporting "no candidate" even
+		// where one exists (TODO.md Task 11). Gate Phase A/B to prefixes that
+		// fit in one chunk; longer prefixes fall straight through to the
+		// scalar tail below, which verifies the full prefix byte-by-byte and
+		// has no such length limit.
 
 		prefix := p.Prefix
-		step := 17 - len(prefix)
-		if step < 1 {
-			step = 1
-		}
 
 		b = append(b, 0x02, 0x40) // block $prefix_matched (void)
-		b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
-		b = append(b, 0x03, 0x40) // loop $simd_outer (void)
 
-		// if attempt_start + 15 >= len: br 1 → $simd_exhausted
-		b = append(b, 0x20, l.AttemptStart)
-		b = append(b, 0x41, 0x0F) // i32.const 15
-		b = append(b, 0x6A)       // i32.add
-		b = append(b, 0x20, l.Len)
-		b = append(b, 0x4F)       // i32.ge_u
-		b = append(b, 0x0D, 0x01) // br_if 1 → $simd_exhausted
+		if len(prefix) <= 16 {
+			step := 17 - len(prefix)
+			if step < 1 {
+				step = 1
+			}
 
-		// Load 16 bytes once into v128 local.
-		b = append(b, 0x20, l.Ptr)
-		b = append(b, 0x20, l.AttemptStart)
-		b = append(b, 0x6A)                   // i32.add
-		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-		b = append(b, 0x21, l.Chunk)          // local.set chunk
+			b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
+			b = append(b, 0x03, 0x40) // loop $simd_outer (void)
 
-		// Phase A: bitmask for prefix[0].
-		b = append(b, 0x20, l.Chunk)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(prefix[0]))
-		b = append(b, 0xFD, 0x0F)       // i8x16.splat
-		b = append(b, 0xFD, 0x23)       // i8x16.eq
-		b = append(b, 0xFD, 0x64)       // i8x16.bitmask → i32
-		b = append(b, 0x22, l.SimdMask) // local.tee simdMask
+			// if attempt_start + 15 >= len: br 1 → $simd_exhausted
+			b = append(b, 0x20, l.AttemptStart)
+			b = append(b, 0x41, 0x0F) // i32.const 15
+			b = append(b, 0x6A)       // i32.add
+			b = append(b, 0x20, l.Len)
+			b = append(b, 0x4F)       // i32.ge_u
+			b = append(b, 0x0D, 0x01) // br_if 1 → $simd_exhausted
 
-		// if mask != 0: prefix[0] found → Phase B
-		b = append(b, 0x04, 0x40) // if (void): outer if
+			// Load 16 bytes once into v128 local.
+			b = append(b, 0x20, l.Ptr)
+			b = append(b, 0x20, l.AttemptStart)
+			b = append(b, 0x6A)                   // i32.add
+			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+			b = append(b, 0x21, l.Chunk)          // local.set chunk
 
-		// Phase B: refine with prefix[1..] from same v128 local.
-		for k := 1; k < len(prefix); k++ {
+			// Phase A: bitmask for prefix[0].
 			b = append(b, 0x20, l.Chunk)
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(prefix[k]))
-			b = append(b, 0xFD, 0x0F) // i8x16.splat
-			b = append(b, 0xFD, 0x23) // i8x16.eq
-			b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(k))
-			b = append(b, 0x76) // i32.shr_u (align with prefix[0] positions)
+			b = utils.AppendSLEB128(b, int32(prefix[0]))
+			b = append(b, 0xFD, 0x0F)       // i8x16.splat
+			b = append(b, 0xFD, 0x23)       // i8x16.eq
+			b = append(b, 0xFD, 0x64)       // i8x16.bitmask → i32
+			b = append(b, 0x22, l.SimdMask) // local.tee simdMask
+
+			// if mask != 0: prefix[0] found → Phase B
+			b = append(b, 0x04, 0x40) // if (void): outer if
+
+			// Phase B: refine with prefix[1..] from same v128 local.
+			for k := 1; k < len(prefix); k++ {
+				b = append(b, 0x20, l.Chunk)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(prefix[k]))
+				b = append(b, 0xFD, 0x0F) // i8x16.splat
+				b = append(b, 0xFD, 0x23) // i8x16.eq
+				b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(k))
+				b = append(b, 0x76) // i32.shr_u (align with prefix[0] positions)
+				b = append(b, 0x20, l.SimdMask)
+				b = append(b, 0x71) // i32.and
+				b = append(b, 0x21, l.SimdMask)
+			}
+
+			// if combined != 0: exact match at ctz position — inner if
 			b = append(b, 0x20, l.SimdMask)
-			b = append(b, 0x71) // i32.and
-			b = append(b, 0x21, l.SimdMask)
+			b = append(b, 0x04, 0x40) // if (void): inner if
+			b = append(b, 0x20, l.AttemptStart)
+			b = append(b, 0x20, l.SimdMask)
+			b = append(b, 0x68) // i32.ctz
+			b = append(b, 0x6A) // i32.add
+			b = append(b, 0x21, l.AttemptStart)
+			// br 4 exits $prefix_matched (self-contained depth: 0=innerif 1=outerif
+			// 2=$simd_outer 3=$simd_exhausted 4=$prefix_matched)
+			b = append(b, 0x0C, 0x04) // br 4 → exit $prefix_matched
+			b = append(b, 0x0B)       // end inner if
+
+			// combined == 0: advance by step (overlap) and restart.
+			b = append(b, 0x20, l.AttemptStart)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(step))
+			b = append(b, 0x6A) // i32.add
+			b = append(b, 0x21, l.AttemptStart)
+			b = append(b, 0x0C, 0x01) // br 1 → restart $simd_outer
+			b = append(b, 0x0B)       // end outer if
+
+			// Phase A fast path: no prefix[0] in chunk → advance 16.
+			b = append(b, 0x20, l.AttemptStart)
+			b = append(b, 0x41, 0x10) // i32.const 16
+			b = append(b, 0x6A)
+			b = append(b, 0x21, l.AttemptStart)
+			b = append(b, 0x0C, 0x00) // br 0 → restart $simd_outer
+
+			b = append(b, 0x0B) // end loop $simd_outer
+			b = append(b, 0x0B) // end block $simd_exhausted
 		}
 
-		// if combined != 0: exact match at ctz position — inner if
-		b = append(b, 0x20, l.SimdMask)
-		b = append(b, 0x04, 0x40) // if (void): inner if
-		b = append(b, 0x20, l.AttemptStart)
-		b = append(b, 0x20, l.SimdMask)
-		b = append(b, 0x68) // i32.ctz
-		b = append(b, 0x6A) // i32.add
-		b = append(b, 0x21, l.AttemptStart)
-		// br 4 exits $prefix_matched (self-contained depth: 0=innerif 1=outerif
-		// 2=$simd_outer 3=$simd_exhausted 4=$prefix_matched)
-		b = append(b, 0x0C, 0x04) // br 4 → exit $prefix_matched
-		b = append(b, 0x0B)       // end inner if
-
-		// combined == 0: advance by step (overlap) and restart.
-		b = append(b, 0x20, l.AttemptStart)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(step))
-		b = append(b, 0x6A) // i32.add
-		b = append(b, 0x21, l.AttemptStart)
-		b = append(b, 0x0C, 0x01) // br 1 → restart $simd_outer
-		b = append(b, 0x0B)       // end outer if
-
-		// Phase A fast path: no prefix[0] in chunk → advance 16.
-		b = append(b, 0x20, l.AttemptStart)
-		b = append(b, 0x41, 0x10) // i32.const 16
-		b = append(b, 0x6A)
-		b = append(b, 0x21, l.AttemptStart)
-		b = append(b, 0x0C, 0x00) // br 0 → restart $simd_outer
-
-		b = append(b, 0x0B) // end loop $simd_outer
-		b = append(b, 0x0B) // end block $simd_exhausted
-
-		// ── Scalar tail (< 16 bytes remaining) ───────────────────────────────
+		// ── Scalar tail (< 16 bytes remaining, or prefix > 16 bytes) ─────────
 		// Depths from $scalar: 0=$scalar 1=$prefix_matched [engine blocks]
 		// → br_if (1+ed) goes to $no_match.
 		b = append(b, 0x03, 0x40) // loop $scalar (void)
