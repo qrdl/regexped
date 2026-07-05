@@ -177,6 +177,51 @@ type compiledPattern struct {
 	// Non-mid-accept bulk-skip helper fields (nonMidHelperBody,
 	// findBodyCallSites) were extracted to
 	// plans/non_mid_extension.go.archive (Section 10).
+
+	// Alternation literal-anchored matching fields (Task 6 v1, 2026-07-05).
+	// altLitAnchorBranches != nil means this pattern's top-level op is
+	// OpAlternate with every branch independently literal-anchored and
+	// sharing the same fixed prefix length (see findAltLitAnchorPoints).
+	// Mutually exclusive with litAnchorBackScanBody (OpConcat vs
+	// OpAlternate top-level gates never both fire for the same pattern).
+	//
+	// Unlike the single-pattern case (one backward_scan + one deferred
+	// lit_anchor_find), this needs N backward_scan_i + N forward_verify_i
+	// functions (both fully built during compilePattern, since neither
+	// calls another function by index) plus ONE deferred dispatcher built
+	// at assembleModule time once all branch function indices are known
+	// (same reason litAnchorFindBody is deferred today).
+	altLitAnchorBranches       []altLitAnchorCompiledBranch
+	altLitAnchorFixedPrefixLen int32 // same P for every branch (v1 restriction)
+
+	// Shared Teddy/first-byte frontend over the union of all branches'
+	// literals — same field shape as litAnchorFirstByte*/litAnchorTeddy*
+	// above, computed over the union set instead of one pattern's litSet.
+	altLitAnchorFirstByteOff   int32
+	altLitAnchorFirstByteFlags [256]byte
+	altLitAnchorFirstBytes     []byte
+	altLitAnchorTeddyLoOff     int32
+	altLitAnchorTeddyHiOff     int32
+	altLitAnchorTeddyLoBytes   []byte
+	altLitAnchorTeddyHiBytes   []byte
+	altLitAnchorTeddyT1LoOff   int32
+	altLitAnchorTeddyT1HiOff   int32
+	altLitAnchorTeddyT1LoBytes []byte
+	altLitAnchorTeddyT1HiBytes []byte
+	// altLitAnchorFindBody (the dispatcher) is NOT a field here — like
+	// litAnchorFindBody, it's built at assembleModule time and appended
+	// directly, since it calls branch functions by index.
+}
+
+// altLitAnchorCompiledBranch holds one alternation branch's precomputed WASM
+// bodies and literal set (Task 6 v1). backScanBody and forwardVerifyBody are
+// both fully built during compilePattern — unlike the dispatcher, neither
+// calls another function in this module by index, so both can be built
+// eagerly instead of deferred to assembleModule time.
+type altLitAnchorCompiledBranch struct {
+	litSet            [][]byte // this branch's own literal(s), for the scalar verify chain
+	backScanBody      []byte   // size-prefixed; built by buildLitAnchorBackScanBody, reused unchanged
+	forwardVerifyBody []byte   // size-prefixed; built by buildAltLitAnchorForwardVerifyBody
 }
 
 // funcCount returns the number of WASM functions this pattern contributes.
@@ -185,7 +230,9 @@ func (p *compiledPattern) funcCount() int {
 	if p.matchBody != nil {
 		n++
 	}
-	if p.litAnchorBackScanBody != nil {
+	if p.altLitAnchorBranches != nil {
+		n += 1 + 2*len(p.altLitAnchorBranches) // dispatcher + (backward_scan_i, forward_verify_i) per branch
+	} else if p.litAnchorBackScanBody != nil {
 		n += 2 // backward_scan + lit_anchor_find
 	} else if p.findBody != nil {
 		n++
@@ -207,6 +254,11 @@ func (p *compiledPattern) funcCount() int {
 // backwardScanOff is the index of backward_scan (-1 if no split).
 // findOff is the index of the find function (normal or lit_anchor_find, -1 if absent).
 // Returns -1 for absent functions.
+//
+// When p.altLitAnchorBranches != nil, backwardScanOff is left -1 — there is
+// no single backward-scan slot for the multi-branch case (N of them);
+// altLitAnchorBranchFuncIdx addresses those individually. findOff is the
+// dispatcher, laid out after all branch functions.
 func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, captureOff, wrapperOff, namedWrapperOff int) {
 	matchOff, backwardScanOff, findOff, captureOff, wrapperOff, namedWrapperOff = -1, -1, -1, -1, -1, -1
 	idx := 0
@@ -214,7 +266,11 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 		matchOff = idx
 		idx++
 	}
-	if p.litAnchorBackScanBody != nil {
+	if p.altLitAnchorBranches != nil {
+		idx += 2 * len(p.altLitAnchorBranches) // all branch helpers laid out first
+		findOff = idx
+		idx++
+	} else if p.litAnchorBackScanBody != nil {
 		backwardScanOff = idx
 		idx++
 		findOff = idx
@@ -235,6 +291,20 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 		}
 	}
 	return
+}
+
+// altLitAnchorBranchFuncIdx returns the (local, pattern-relative) function
+// indices of branch i's backward_scan and forward_verify functions — the
+// offset to add to baseIdx[patternIndex] in assembleModule. Layout: after
+// an optional matchBody slot, branches are laid out as
+// [backward_scan_0, forward_verify_0, backward_scan_1, forward_verify_1, ...],
+// dispatcher last (see offsets() above).
+func (p *compiledPattern) altLitAnchorBranchFuncIdx(i int) (backOff, fwdOff int) {
+	base := 0
+	if p.matchBody != nil {
+		base = 1
+	}
+	return base + 2*i, base + 2*i + 1
 }
 
 // patchPaddedLEB128CallSites and nonMidHelperOff were extracted to
@@ -893,6 +963,39 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					}
 				}
 			}
+
+			// Alternation lit-anchor (Task 6 v1, 2026-07-05) — only tried
+			// when the single-pattern check above didn't fire (their
+			// top-level Op gates, OpConcat vs OpAlternate, are mutually
+			// exclusive, so this check is defensive) and only for find-only
+			// patterns (captures are out of scope for v1, matching TODO.md's
+			// own non-conflict note). See findAltLitAnchorPoints for the
+			// equal-fixed-prefix-length restriction and why it's required
+			// for v1's simple "return on first success" dispatch to be
+			// correct.
+			if p.litAnchorBackScanBody == nil && !needGroups {
+				if altBranches, ok := findAltLitAnchorPoints(re.Pattern); ok {
+					if altCompiled, altOK := compileAltLitAnchorBranches(altBranches, l.tableEnd, buildOpts); altOK {
+						p.altLitAnchorBranches = altCompiled.branches
+						p.altLitAnchorFixedPrefixLen = altCompiled.fixedPrefixLen
+						p.altLitAnchorFirstByteOff = altCompiled.firstByteOff
+						p.altLitAnchorFirstByteFlags = altCompiled.firstByteFlags
+						p.altLitAnchorFirstBytes = altCompiled.firstBytes
+						p.altLitAnchorTeddyLoOff = altCompiled.teddyLoOff
+						p.altLitAnchorTeddyHiOff = altCompiled.teddyHiOff
+						p.altLitAnchorTeddyLoBytes = altCompiled.teddyLoBytes
+						p.altLitAnchorTeddyHiBytes = altCompiled.teddyHiBytes
+						p.altLitAnchorTeddyT1LoOff = altCompiled.teddyT1LoOff
+						p.altLitAnchorTeddyT1HiOff = altCompiled.teddyT1HiOff
+						p.altLitAnchorTeddyT1LoBytes = altCompiled.teddyT1LoBytes
+						p.altLitAnchorTeddyT1HiBytes = altCompiled.teddyT1HiBytes
+						p.dataBytes = append(p.dataBytes, altCompiled.dataBytes...)
+						p.dataSegCount += altCompiled.dataSegCount
+						p.tableEnd = altCompiled.tableEnd
+					}
+				}
+			}
+
 			// Opt 1 — dominant-self-loop SIMD bulk-skip. Default-on for all
 			// modes, mid-accept and non-mid-accept alike (Task 7 Step 2,
 			// 2026-07-05 — see plans/TODO.md task 7). Non-mid was
@@ -915,14 +1018,24 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				l.dominantStates = nil
 			}
 			l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
-			if p.litAnchorBackScanBody == nil {
+			if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
 				p.findBody = appendFindCodeEntry(nil, l, table, patMandLit, buildOpts.tableMemIdx)
 			}
 
+			// Note the asymmetry with the single-pattern lit-anchor case just
+			// above: that path unconditionally emits l/table's data segments
+			// because it REUSES the whole pattern's forward LF DFA for its
+			// own Phase 3 (litAnchorFindLayout/litAnchorFindTable = l/table).
+			// The alternation path does NOT reuse l/table at all — each
+			// branch compiles its own independent forward DFA inside
+			// compileAltLitAnchorBranches — so l's combined-alternation
+			// tables would be dead weight here and are skipped.
 			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))
-			p.dataBytes = append(p.dataBytes, rawData...)
-			p.dataSegCount += segCount
-			if p.litAnchorBackScanBody == nil {
+			if p.altLitAnchorBranches == nil {
+				p.dataBytes = append(p.dataBytes, rawData...)
+				p.dataSegCount += segCount
+			}
+			if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
 				p.tableEnd = l.tableEnd
 			}
 		}
@@ -1055,14 +1168,17 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	out = append(out, 0x00, 0x61, 0x73, 0x6D)
 	out = append(out, 0x01, 0x00, 0x00, 0x00)
 
-	// Type section: 3 fixed types (match, find, capture/groups).
-	// (The 4th type — for the LNM non-mid bulk-skip helper — was extracted
-	// to plans/non_mid_extension.go.archive Section 14.)
+	// Type section: 4 fixed types (match, find, capture/groups, and
+	// alt-lit-anchor's forward_verify_i — Task 6 v1, 2026-07-05).
+	// (A different 4th type — for the LNM non-mid bulk-skip helper — was
+	// extracted to plans/non_mid_extension.go.archive Section 14; this is
+	// an unrelated, newly-added type reusing the same slot number.)
 	typeSection := []byte{
-		0x03,
+		0x04,
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0: (i32,i32)→i32
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E, // type 1: (i32,i32)→i64
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 2: (i32,i32,i32)→i32
+		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 3: (i32,i32,i32)→i64 — alt-lit-anchor forward_verify_i
 	}
 	out = appendSection(out, 1, typeSection)
 
@@ -1087,7 +1203,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		if p.matchBody != nil {
 			fs = append(fs, 0x00)
 		}
-		if p.litAnchorBackScanBody != nil {
+		if p.altLitAnchorBranches != nil {
+			for range p.altLitAnchorBranches {
+				fs = append(fs, 0x00) // backward_scan_i: (i32,i32)->i32
+				fs = append(fs, 0x03) // forward_verify_i: (i32,i32,i32)->i64
+			}
+			fs = append(fs, 0x01) // dispatcher: (i32,i32)->i64
+		} else if p.litAnchorBackScanBody != nil {
 			fs = append(fs, 0x00) // backward_scan: (i32,i32)->i32
 			fs = append(fs, 0x01) // lit_anchor_find: (i32,i32)->i64
 		} else if p.findBody != nil {
@@ -1182,7 +1304,25 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		if p.matchBody != nil {
 			cs = append(cs, p.matchBody...)
 		}
-		if p.litAnchorBackScanBody != nil {
+		if p.altLitAnchorBranches != nil {
+			for _, br := range p.altLitAnchorBranches {
+				cs = append(cs, br.backScanBody...)
+				cs = append(cs, br.forwardVerifyBody...)
+			}
+			// Generate the dispatcher body now that function indices are known.
+			tableMemIdx := 0
+			if !standalone {
+				tableMemIdx = 1
+			}
+			branchFuncIdxs := make([]altLitAnchorFuncIdx, len(p.altLitAnchorBranches))
+			for j := range p.altLitAnchorBranches {
+				backOff, fwdOff := p.altLitAnchorBranchFuncIdx(j)
+				branchFuncIdxs[j] = altLitAnchorFuncIdx{backScan: base + backOff, forwardVerify: base + fwdOff}
+			}
+			altDispatchBody := buildAltLitAnchorFindBody(p, branchFuncIdxs, tableMemIdx)
+			cs = utils.AppendULEB128(cs, uint32(len(altDispatchBody)))
+			cs = append(cs, altDispatchBody...)
+		} else if p.litAnchorBackScanBody != nil {
 			cs = append(cs, p.litAnchorBackScanBody...)
 			// Generate lit_anchor_find body now that function indices are known.
 			tableMemIdx := 0

@@ -563,6 +563,25 @@ var tests = []testCase{
 		nomatchInput: configInput(nil),
 	},
 	{
+		// Task 6 v1 target: same pattern shape as gap-e-strict-alt-find
+		// (both branches share the {8} fixed prefix length), but this case
+		// exists to demonstrate the NEUTRAL/LikelyNoMatch path specifically
+		// — findAltLitAnchorPoints' alt-lit-anchor mechanism fires for every
+		// LikelyMode unconditionally (no flag required), unlike Gap E which
+		// stays LikelyMatch-only. The LikelyMatch column here should be
+		// unchanged (still hitting Gap E, since Gap E's own check runs
+		// first and returns early on success) — only neutral/LikelyNoMatch
+		// should show the win.
+		name:    "alt-lit-anchor-neutral",
+		pattern: `[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`,
+		mode:    modeFind,
+		notes:   "per-branch lit-anchor alternation, equal 8-char prefixes — Task 6 v1 (neutral/LNM path; see gap-e-strict-alt-find for the LikelyMatch analogue)",
+		matchInput: configInput([]string{
+			"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
+		}),
+		nomatchInput: configInput(nil),
+	},
+	{
 		// LNM Action 5 amplifier: pattern accepts only [a-zA-Z] (52-byte
 		// set, routed to scalar by Action 3 density heuristic). Input is
 		// dominated by digits/punctuation/whitespace — bytes that no

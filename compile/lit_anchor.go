@@ -162,6 +162,15 @@ func findLitAnchorPoint(pattern string) *litAnchorPoint {
 	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
 		re = re.Sub[0]
 	}
+	return findLitAnchorPointInRegexp(re)
+}
+
+// findLitAnchorPointInRegexp is findLitAnchorPoint's body, operating on an
+// already-parsed, already-capture-stripped node. Split out so the
+// alternation-of-branches detector (findAltLitAnchorPoints) can apply the
+// same single-branch qualification logic to each branch of an OpAlternate
+// without re-parsing or re-stripping captures per branch.
+func findLitAnchorPointInRegexp(re *syntax.Regexp) *litAnchorPoint {
 	if re.Op != syntax.OpConcat {
 		return nil
 	}
@@ -230,4 +239,78 @@ func prefixContainsWordBoundary(re *syntax.Regexp) bool {
 		}
 	}
 	return false
+}
+
+// altLitAnchorBranch pairs one alternation branch's litAnchorPoint with the
+// branch's own (capture-stripped) regexp node. compile.go uses branchRe to
+// re-enter the standard compile() pipeline and build the branch's own
+// forward LF DFA, independent of the whole alternation's combined DFA.
+type altLitAnchorBranch struct {
+	lap      *litAnchorPoint
+	branchRe *syntax.Regexp
+}
+
+// maxAltLitAnchorBranches bounds the branch count to the same 8-alternative
+// cap extractLitSet already applies to literal-alternation anchor points and
+// Gap E's layout planner applies to its own branch count — keeps 2-byte
+// Teddy available for the common case and bounds compile-time work.
+const maxAltLitAnchorBranches = 8
+
+// findAltLitAnchorPoints parses pattern as a top-level OpAlternate (after
+// stripping outer OpCapture) where EVERY branch independently qualifies for
+// findLitAnchorPointInRegexp AND every branch's prefixRe has the SAME exact,
+// finite length.
+//
+// The equal-fixed-prefix-length requirement is a v1 restriction, not a
+// fundamental one (see plans/TODO.md task 6 for the general
+// bounded-lookahead version that lifts it). With every branch's prefix at
+// the same fixed length P, match_start = literal_pos - P for every branch,
+// so scan order (the order the shared Teddy frontend discovers branch
+// literals in) and match-start order coincide — this is what makes it safe
+// for the caller's dispatcher to return on the FIRST branch that verifies
+// successfully. Without this restriction that isn't true in general: Go
+// stdlib's `LITA|.{10}LITB` on "01234LITA0LITB" returns [0,14] (the
+// `.{10}LITB` branch, matching from position 0), not [5,9] (the `LITA`
+// branch, whose literal is discovered earlier in a left-to-right scan) —
+// leftmost-first semantics are decided by match START position, not by
+// which branch's anchor literal is found first while scanning.
+//
+// Returns (nil, false) on ANY rejection — callers must fall through cleanly
+// to the standard combined-DFA find path, exactly as they already do when
+// findLitAnchorPoint returns nil for the single-pattern case.
+func findAltLitAnchorPoints(pattern string) ([]altLitAnchorBranch, bool) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpAlternate || len(re.Sub) < 2 || len(re.Sub) > maxAltLitAnchorBranches {
+		return nil, false
+	}
+
+	branches := make([]altLitAnchorBranch, 0, len(re.Sub))
+	fixedPrefixLen := -1
+	for _, sub := range re.Sub {
+		branchRe := sub
+		for branchRe.Op == syntax.OpCapture && len(branchRe.Sub) == 1 {
+			branchRe = branchRe.Sub[0]
+		}
+		lap := findLitAnchorPointInRegexp(branchRe)
+		if lap == nil {
+			return nil, false
+		}
+		minLen, maxLen := regexpMinMaxLen(lap.prefixRe)
+		if minLen != maxLen || maxLen < 0 {
+			return nil, false // not a fixed-length prefix
+		}
+		if fixedPrefixLen < 0 {
+			fixedPrefixLen = minLen
+		} else if minLen != fixedPrefixLen {
+			return nil, false // prefix length differs from an earlier branch
+		}
+		branches = append(branches, altLitAnchorBranch{lap: lap, branchRe: branchRe})
+	}
+	return branches, true
 }

@@ -4919,6 +4919,409 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	return b
 }
 
+// altLitAnchorFuncIdx holds one alternation branch's function indices
+// (Task 6 v1), resolved at assembleModule time once all prior patterns'
+// function counts are known.
+type altLitAnchorFuncIdx struct {
+	backScan      int
+	forwardVerify int
+}
+
+// buildAltLitAnchorForwardVerifyBody is buildLitAnchorFindBody's Phase 3
+// (forward DFA scan from a confirmed match start) extracted into its own
+// function, for the alternation lit-anchor path (Task 6 v1). Unlike the
+// single-pattern case, rev_result arrives as a PARAMETER (the caller — the
+// shared dispatcher in buildAltLitAnchorFindBody — already called this
+// branch's own backward_scan and confirmed rev_result >= 0) rather than
+// being produced by an inline backward_scan call inside this function.
+//
+// Signature: (ptr i32, len i32, rev_result i32) → i64
+// Returns (rev_result << 32 | match_end) on success, -1 (no match from this
+// rev_result) on failure. Unlike buildLitAnchorFindBody's Phase 3, failure
+// here does NOT retry at a later attempt_start — that retry loop lives in
+// the caller (the dispatcher tries the next literal/branch, or advances
+// attempt_start itself), since this function only verifies ONE candidate.
+func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
+	var b []byte
+
+	const (
+		locPtr         = 0
+		locLen         = 1
+		locRevResult   = 2
+		locState       = 3
+		locPos         = 4
+		locLastAccept  = 5
+		locSimdOrClass = 6
+		locChunk       = 7 // v128; only declared/used when dominant-state bulk-skip applies
+	)
+
+	hasMidDom := false
+	hasNonMidDom := false
+	for _, info := range l.dominantStates {
+		if info.isMidAccept {
+			hasMidDom = true
+		} else {
+			hasNonMidDom = true
+		}
+	}
+	needChunk := hasMidDom || hasNonMidDom
+
+	// ── local declarations ────────────────────────────────────────────────
+	if needChunk {
+		b = append(b, 0x02)       // 2 local groups
+		b = append(b, 0x04, 0x7F) // 4 × i32: state, pos, last_accept, simdOrClass
+		b = append(b, 0x01, 0x7B) // 1 × v128: chunk
+	} else {
+		b = append(b, 0x01)       // 1 local group
+		b = append(b, 0x04, 0x7F) // 4 × i32
+	}
+
+	// Initial state, from rev_result (parameter, not a local computation):
+	//   rev_result == 0           → wasmStart (match starts at input begin)
+	//   ptr[rev_result-1] == '\n' → wasmMidStartNewline
+	//   otherwise                 → wasmMidStart
+	b = append(b, 0x20, locRevResult) // local.get rev_result
+	b = append(b, 0x45)               // i32.eqz
+	b = append(b, 0x04, 0x7F)         // if (result i32) — start of input
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(l.wasmStart))
+	b = append(b, 0x05) // else
+	b = append(b, 0x20, locPtr)       // local.get ptr
+	b = append(b, 0x20, locRevResult) // local.get rev_result
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6B)             // i32.sub (rev_result - 1)
+	b = append(b, 0x6A)             // i32.add (ptr + rev_result - 1)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+	b = append(b, 0x41, 0x0A)       // i32.const '\n'
+	b = append(b, 0x46)             // i32.eq
+	b = append(b, 0x04, 0x7F)       // if (result i32) — preceded by '\n'
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(l.wasmMidStartNewline))
+	b = append(b, 0x05) // else
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(l.wasmMidStart))
+	b = append(b, 0x0B)           // end if newline
+	b = append(b, 0x0B)           // end if start
+	b = append(b, 0x21, locState) // local.set state
+
+	b = append(b, 0x20, locRevResult)
+	b = append(b, 0x21, locPos) // local.set pos = rev_result
+
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x21, locLastAccept) // last_accept = -1
+
+	// Initial midAccept check at start position.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, l.midAcceptOff)
+	b = append(b, 0x20, locState)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+	b = append(b, 0x04, 0x40)             // if (void)
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x21, locLastAccept) // last_accept = pos
+	b = append(b, 0x0B)                // end if
+
+	// Optional immediateAccept check at start position.
+	b = append(b, 0x02, 0x40) // block $fwd_done
+	if l.hasImmAccept {
+		b = append(b, 0x20, locState) // local.get state
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.immAcceptLimit) // i32.const immAcceptLimit
+		b = append(b, 0x4D)                          // i32.le_u
+		b = append(b, 0x04, 0x40)                    // if (void)
+		b = append(b, 0x0C, 0x01)                    // br 1 → $fwd_done
+		b = append(b, 0x0B)                          // end if
+	}
+
+	// Inner forward DFA scan loop.
+	b = append(b, 0x03, 0x40) // loop $fwd_scan
+
+	// if pos >= len: EOF check, then exit $fwd_done.
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4F)       // i32.ge_u
+	b = append(b, 0x04, 0x40) // if (void)
+	b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x21, locLastAccept) // last_accept = pos
+	b = append(b, 0x0B)                // end if accept
+	b = append(b, 0x0C, 0x02)          // br 2 → $fwd_done
+	b = append(b, 0x0B)                // end if pos>=len
+
+	b = emitNLPreAcceptCheck(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPtr, locPos, locState, locLastAccept, tableMemIdx)
+
+	// DFA transition.
+	if l.useCompression {
+		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
+			false, 0, locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
+	} else {
+		b = emitSimpleU8Transition(b, l.tableOff, false, 0, locState, locPtr, locPos, 0xff, tableMemIdx)
+	}
+
+	// if state == 0 (dead): exit $fwd_done.
+	b = append(b, 0x20, locState)
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x0C, 0x02) // br 2 → $fwd_done
+	b = append(b, 0x0B)       // end if dead
+
+	// if midAccept[state]: last_accept = pos + 1 (+ dominant bulk-skip dispatch)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, l.midAcceptOff)
+	b = append(b, 0x20, locState)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+	if hasMidDom {
+		b = append(b, 0x22, locSimdOrClass) // local.tee — cache value
+	}
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A) // pos + 1
+	b = append(b, 0x21, locLastAccept)
+	if hasMidDom {
+		for _, info := range l.dominantStates {
+			if !info.isMidAccept {
+				continue
+			}
+			b = append(b, 0x20, locSimdOrClass)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(info.encodedByte))
+			b = append(b, 0x46)       // i32.eq
+			b = append(b, 0x04, 0x40) // if (void)
+			b = emitDominantBulkSkip(b, info.exitBytes, true,
+				locPos, locLen, locLastAccept, locPtr,
+				locChunk, locSimdOrClass)
+			b = append(b, 0x0B) // end if (per-dominant gate)
+		}
+	}
+	b = append(b, 0x0B) // end if midAccept
+	if hasNonMidDom {
+		for _, info := range l.dominantStates {
+			if info.isMidAccept {
+				continue
+			}
+			b = append(b, 0x20, locState)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, info.state)
+			b = append(b, 0x46)       // i32.eq
+			b = append(b, 0x04, 0x40) // if (void)
+			b = emitDominantBulkSkip(b, info.exitBytes, false,
+				locPos, locLen, locLastAccept, locPtr,
+				locChunk, locSimdOrClass)
+			b = append(b, 0x0B) // end if (state == K)
+		}
+	}
+
+	b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, locLastAccept, 2, tableMemIdx)
+
+	// pos++; restart scan.
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locPos) // pos++
+	b = append(b, 0x0C, 0x00)   // br 0 → $fwd_scan
+	b = append(b, 0x0B)         // end loop $fwd_scan
+	b = append(b, 0x0B)         // end block $fwd_done
+
+	// if last_accept >= 0: return packed i64 (rev_result << 32 | last_accept).
+	b = append(b, 0x20, locLastAccept)
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x4E)       // i32.ge_s
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, locRevResult)
+	b = append(b, 0xAD)       // i64.extend_i32_u
+	b = append(b, 0x42, 0x20) // i64.const 32
+	b = append(b, 0x86)       // i64.shl
+	b = append(b, 0x20, locLastAccept)
+	b = append(b, 0xAD) // i64.extend_i32_u
+	b = append(b, 0x84) // i64.or
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B) // end if last_accept >= 0
+
+	// No accept found from this rev_result: fail. The caller (the shared
+	// dispatcher) tries the next literal/branch or advances attempt_start —
+	// this function never retries on its own.
+	b = append(b, 0x42, 0x7F) // i64.const -1
+	b = append(b, 0x0B)       // end function
+
+	sz := utils.AppendULEB128(nil, uint32(len(b)))
+	return append(sz, b...)
+}
+
+// buildAltLitAnchorFindBody is the shared dispatcher for the alternation
+// lit-anchor path (Task 6 v1). It runs ONE Teddy/first-byte scan over the
+// union of all branches' literals, and on each candidate position tries
+// every branch's literal in declaration order (byte-for-byte verify →
+// branch's own backward_scan_i → branch's own forward_verify_i), returning
+// on the first branch that verifies successfully.
+//
+// Returning on first success is correct ONLY because findAltLitAnchorPoints
+// requires every branch to share the same fixed prefix length: with a
+// shared prefix length P, match_start = literal_pos - P for every branch,
+// so the scan order (the order the shared frontend discovers candidate
+// positions in) and match-start order coincide. See findAltLitAnchorPoints'
+// doc comment for the counterexample this restriction avoids. A future
+// generalisation to unequal prefix lengths (TODO.md task 6 follow-up) would
+// need a bounded-lookahead/best-of-window loop here instead.
+//
+// Signature: (ptr i32, len i32) → i64. Returns -1 on no match.
+func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchorFuncIdx, tableMemIdx int) []byte {
+	var b []byte
+
+	hasT0 := len(p.altLitAnchorTeddyLoBytes) > 0
+	hasT1 := len(p.altLitAnchorTeddyT1LoBytes) > 0
+	numI32Locals := 3 // attempt_start(2), simdMask_or_class(3), rev_result(4)
+	var numV128Locals int
+	switch {
+	case hasT1:
+		numV128Locals = 6 // chunk, tLo, tHi, chunk1, t1Lo, t1Hi
+	case hasT0:
+		numV128Locals = 3 // chunk, tLo, tHi
+	case len(p.altLitAnchorFirstBytes) > 0 && len(p.altLitAnchorFirstBytes) <= 64:
+		numV128Locals = 1 // chunk (multi-eq SIMD or Shufti, per emitPrefixScan's useSIMD gate)
+	default:
+		numV128Locals = 0
+	}
+
+	const (
+		locPtr          = 0
+		locLen          = 1
+		locAttemptStart = 2
+		locSimdOrClass  = 3
+		locRevResult    = 4
+		locPacked       = 5 // i64
+		locChunk        = 6
+		locTLo          = 7
+		locTHi          = 8
+		locChunk1       = 9
+		locT1Lo         = 10
+		locT1Hi         = 11
+	)
+
+	// ── local declarations ────────────────────────────────────────────────
+	if numV128Locals > 0 {
+		b = append(b, 0x03)                      // 3 local groups
+		b = append(b, byte(numI32Locals), 0x7F)  // i32 × numI32Locals
+		b = append(b, 0x01, 0x7E)                // i64 × 1 (packed)
+		b = append(b, byte(numV128Locals), 0x7B) // v128 × numV128Locals
+	} else {
+		b = append(b, 0x02)                     // 2 local groups
+		b = append(b, byte(numI32Locals), 0x7F) // i32 × numI32Locals
+		b = append(b, 0x01, 0x7E)               // i64 × 1 (packed)
+	}
+
+	// ── outer control flow ────────────────────────────────────────────────
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $outer
+
+	// ── Shared Teddy/first-byte scan over the union of all literals ───────
+	simdParams := prefixScanParams{
+		FirstByteSet:   p.altLitAnchorFirstBytes,
+		FirstByteFlags: p.altLitAnchorFirstByteFlags,
+		FirstByteOff:   p.altLitAnchorFirstByteOff,
+		TeddyLoOff:     p.altLitAnchorTeddyLoOff,
+		TeddyHiOff:     p.altLitAnchorTeddyHiOff,
+		TeddyTwoByte:   hasT1,
+		TeddyT1LoOff:   p.altLitAnchorTeddyT1LoOff,
+		TeddyT1HiOff:   p.altLitAnchorTeddyT1HiOff,
+		EngineDepth:    2, // loop $outer + block $no_match
+		TableMemIdx:    tableMemIdx,
+		Locals: prefixScanLocals{
+			Ptr:          locPtr,
+			Len:          locLen,
+			AttemptStart: locAttemptStart,
+			SimdMask:     locSimdOrClass,
+			Chunk:        locChunk,
+			TLo:          locTLo,
+			THi:          locTHi,
+			Chunk1:       locChunk1,
+			T1Lo:         locT1Lo,
+			T1Hi:         locT1Hi,
+		},
+		OnMatch: nil,
+	}
+	b = emitPrefixScan(b, simdParams)
+
+	// ── Per-branch verify chain ─────────────────────────────────────────────
+	// Teddy has false positives, so every candidate is verified byte-for-byte
+	// against every branch's literal(s) before trusting it. Declaration
+	// order is the same-position tie-break (mirrors the existing $try_litN
+	// chain in buildLitAnchorFindBody and Gap E's $next_branch_i chain).
+	//
+	// Control-flow depths at this point (outside any nested block):
+	//   0 = $outer (loop — br 0 restarts it), 1 = $no_match (block)
+	// Inside block $try_lit:
+	//   0 = $try_lit, 1 = $outer, 2 = $no_match
+	for bi, br := range p.altLitAnchorBranches {
+		funcIdx := branchFuncIdxs[bi]
+		for _, lit := range br.litSet {
+			b = append(b, 0x02, 0x40) // block $try_lit
+			for k, byt := range lit {
+				b = append(b, 0x20, locPtr)           // local.get ptr
+				b = append(b, 0x20, locAttemptStart)  // local.get attempt_start
+				b = append(b, 0x6A)                   // i32.add
+				b = append(b, 0x2D, 0x00)             // i32.load8_u align=0
+				b = utils.AppendULEB128(b, uint32(k)) // offset = k
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(byt))
+				b = append(b, 0x47)       // i32.ne
+				b = append(b, 0x0D, 0x00) // br_if 0 → exit $try_lit (mismatch, try next literal/branch)
+			}
+
+			// Literal matched at attempt_start — call this branch's own
+			// backward_scan(ptr, attempt_start - 1).
+			b = append(b, 0x20, locPtr)
+			b = append(b, 0x20, locAttemptStart)
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x6B) // i32.sub (attempt_start - 1)
+			b = append(b, 0x10)
+			b = utils.AppendULEB128(b, uint32(funcIdx.backScan))
+			b = append(b, 0x21, locRevResult) // local.set rev_result
+
+			// if rev_result < 0: br_if 0 → exit $try_lit
+			b = append(b, 0x20, locRevResult)
+			b = append(b, 0x41, 0x00)
+			b = append(b, 0x48)       // i32.lt_s
+			b = append(b, 0x0D, 0x00) // br_if 0
+
+			// Call this branch's own forward_verify(ptr, len, rev_result).
+			b = append(b, 0x20, locPtr)
+			b = append(b, 0x20, locLen)
+			b = append(b, 0x20, locRevResult)
+			b = append(b, 0x10)
+			b = utils.AppendULEB128(b, uint32(funcIdx.forwardVerify))
+			b = append(b, 0x22, locPacked) // local.tee packed
+
+			// if packed == -1 (i64 fail sentinel): br_if 0 → exit $try_lit
+			b = append(b, 0x42, 0x7F) // i64.const -1
+			b = append(b, 0x51)       // i64.eq
+			b = append(b, 0x0D, 0x00) // br_if 0
+
+			// Success: return packed.
+			b = append(b, 0x20, locPacked)
+			b = append(b, 0x0F) // return
+			b = append(b, 0x0B) // end $try_lit
+		}
+	}
+
+	// No branch verified at this candidate: advance attempt_start and retry.
+	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locAttemptStart) // attempt_start++
+	b = append(b, 0x0C, 0x00)            // br 0 → restart $outer
+	b = append(b, 0x0B)                  // end loop $outer (unreachable)
+	b = append(b, 0x0B)                  // end block $no_match
+
+	// No match at all: return -1.
+	b = append(b, 0x42, 0x7F) // i64.const -1
+	b = append(b, 0x0B)       // end function
+
+	return b
+}
+
 // buildFindBody returns the WASM function body for find mode.
 // The function scans for the leftmost-longest match and returns a packed i64:
 //

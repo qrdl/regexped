@@ -1882,3 +1882,153 @@ regexps
 -;-;-;-
 -;-;-;-
 -;10-43;-;-
+# ============================================================
+# Category 30: Alternation lit-anchor v1 (Task 6)
+# compile/alt_lit_anchor.go generalises the single-pattern
+# lit-anchor find strategy (Teddy scan -> backward DFA -> forward
+# DFA) to alternations where every branch has its own literal
+# anchor AND all branches share the same exact prefix length —
+# the restriction that makes 'return on first branch that
+# verifies' provably correct (equal prefix length means scan
+# order == match-start order; see findAltLitAnchorPoints).
+# ============================================================
+Cat30AltLitAnchorV1
+strings
+"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"abcdefabsecret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"prefix 12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab suffix"
+"prefix abcdefabsecret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"no secret here at all"
+"1234567ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"abcdeabsecret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"1234ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"abcdefabcdefabcdsecret_AbCdEfGhIjKlMnOpQrStUvWx"
+"no secrets here"
+"12ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"01LITAaaaaaaaaaaaaaaaaaaaaLITB"
+"01LITA"
+"aaaaaaaaaaaaaaaaaaaaLITB"
+"no match at all"
+"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"aaaaaaaaaaaaaaaaaaaa"
+"no match here"
+"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"abcdefabgzork1234"
+"no match"
+"prefix abcdefabgzork5678 suffix"
+regexps
+"[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}"
+-;0-48;-;-
+-;0-51;-;-
+-;7-55;-;-
+-;7-58;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-48;-;-
+-;-;-;-
+-;-;-;-
+-;0-48;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"[0-9]{4}ghp_[A-Za-z0-9]{36}|[a-f]{16}secret_[A-Za-z0-9]{20}"
+-;4-48;-;-
+-;-;-;-
+-;11-55;-;-
+-;-;-;-
+-;-;-;-
+-;3-47;-;-
+-;-;-;-
+-;0-44;-;-
+-;0-43;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;4-48;-;-
+-;-;-;-
+-;-;-;-
+-;4-48;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"[0-9]{2}LITA|[a-z]{20}LITB"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-6;-;-
+0-6;0-6;-;-
+0-24;0-24;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f0-9]{20}"
+-;0-48;-;-
+-;-;-;-
+-;7-55;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;6-26;-;-
+-;-;-;-
+-;0-20;-;-
+-;-;-;-
+-;0-48;-;-
+0-20;0-20;-;-
+-;-;-;-
+-;0-48;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}gzork[0-9]{4}"
+-;0-48;-;-
+-;-;-;-
+-;7-55;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-48;-;-
+-;-;-;-
+-;-;-;-
+-;0-48;-;-
+0-17;0-17;-;-
+-;-;-;-
+-;7-24;-;-
