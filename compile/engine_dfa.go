@@ -1430,6 +1430,16 @@ type dfaLayout struct {
 	// Zero means "no floor" (e.g. patterns that can match empty) and the
 	// check reduces to the existing behaviour.
 	patternMinLen int32
+
+	// eofSkipSafe (Task 8 follow-up #2 — min-length quantifier skip): true
+	// when reaching EOF mid-scan without ever recording an accept proves no
+	// later start position can match either (see detectEOFSkipSafe). When
+	// true, the find body's EOF handler branches straight to $no_match
+	// instead of advancing attempt_start by one and retrying. Collapses the
+	// O(N²) worst case for counted-quantifier patterns like
+	// `[a-z]{50,}[0-9]` whose body class runs to EOF without ever
+	// containing the suffix. See plans/TODO.md task 8 follow-up #2.
+	eofSkipSafe bool
 }
 
 // dominantInfo describes one dominant self-loop state recorded by
@@ -1950,6 +1960,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	// the value is computed but never read.
 	if needFind {
 		detectSkipSafeOnDead(l)
+		detectEOFSkipSafe(l)
 	}
 
 	return l
@@ -2107,6 +2118,196 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 	}
 
 	l.skipSafeOnDead = true
+}
+
+// detectEOFSkipSafe computes l.eofSkipSafe via a conservative multi-hop
+// generalisation of detectSkipSafeOnDead's single-hop "stable scanning
+// chain" check (Task 8 follow-up #2 — min-length quantifier skip).
+//
+// detectSkipSafeOnDead proves "positions K+1..P-1 also die at P" when
+// midStart's accept class self-loops in a SINGLE hop. Counted quantifiers
+// like `[a-z]{50,}[0-9]` don't self-loop in one hop — they walk a chain of
+// N distinct "still counting" states before reaching a self-loop-capable
+// state, so midStart's own successor (state1's successor on 'a' is state2,
+// which doesn't self-loop on 'a') already fails detectSkipSafeOnDead's
+// condition (c). That check is about SKIPPING PAST a dead byte, though —
+// a different question from this one, which is about what to do when the
+// scan runs out of input (EOF) without a dead byte ever appearing.
+//
+// This function walks the full chain (midStart → state1 → ... → terminal
+// self-loop state) and verifies, at every hop, the same three conditions
+// detectSkipSafeOnDead verifies for its single hop, plus one more this
+// function needs that detectSkipSafeOnDead doesn't (see below):
+//   - no chain state — including midStart and the terminal state — is
+//     EOF-accepting;
+//   - every state's accept class matches the same fixed set C (midStart's),
+//     with a single, predictable successor for every byte in C (the next
+//     chain hop, or — at the terminal state — itself);
+//   - no chain state is mid-accept;
+//   - every byte NOT in C, from every chain state, transitions to dead or
+//     to a mid-accept state (never to a third, unanalysed scanning state).
+//
+// Why this makes EOF-without-match safe to terminate immediately: the find
+// body's EOF handler only takes the "no match yet" branch when
+// last_accept is still < 0, meaning no mid-accept transition has fired
+// during this ENTIRE attempt. Given the conditions above, the only way to
+// still be on the chain with last_accept < 0 is if every byte consumed
+// from attempt_start to EOF belonged to C (any off-class byte would have
+// gone to dead — Task 8's existing handler — or to mid-accept, which
+// would have set last_accept and taken the $found branch instead). A
+// later start position s consumes a suffix of that same homogeneous run,
+// follows the identical chain, and also reaches EOF without ever seeing
+// an off-class byte — so no later attempt can succeed either. The find
+// body can skip straight to $no_match instead of retrying attempt_start
+// +1, +2, ... one byte at a time (O(N²) on a homogeneous near-miss run).
+//
+// Why every chain state (not just the terminal one) must be checked for
+// EOF-acceptance: a later start position s doesn't necessarily walk the
+// SAME NUMBER of hops before hitting EOF — it has less remaining input,
+// so it may reach EOF at an EARLIER point in the chain than the original
+// attempt did. For patterns whose EOF-acceptance depends on the exact
+// remaining length rather than merely "far enough into the chain" —
+// bounded-repeat shapes like `(?:a{3,4})+$`, where whether $ can fire
+// depends on whether the remaining length is expressible as a sum of 3s
+// and 4s — an intermediate chain state can be EOF-accepting even though
+// the terminal self-loop state is not (5 remaining a's fails, but 4
+// remaining a's — one hop earlier in the SAME chain — succeeds). The
+// original attempt's own EOF-accept check (emitAcceptBitOnStack, which
+// runs before this optimization's branch) already covers ITS OWN
+// terminating state; this per-hop check exists to protect every OTHER
+// attempt this optimization would otherwise skip without ever running.
+//
+// Conservative bail-outs: word-boundary/newline-boundary patterns are
+// excluded outright (their pre-accept side-tables can set last_accept
+// without leaving the chain, which this analysis doesn't model). The walk
+// also bails on: empty accept class, non-uniform successors, non-trivial
+// cycles, mid-accept chain states, any EOF-accepting chain state, or any
+// off-class byte leading to a third scanning state. `[a-zA-Z]+\d` (chain
+// length 1) and `[a-z]{50,}[0-9]` (chain length 50) both qualify;
+// alternations, patterns with multiple distinct first-byte successors,
+// and bounded-repeat-group patterns like `(?:a{3,4})+$` do not.
+func detectEOFSkipSafe(l *dfaLayout) {
+	if l.numWASM <= 1 {
+		return
+	}
+	if l.needWordCharTable || l.midAcceptNLBytes != nil {
+		return
+	}
+	cellsPerState := 256
+	if l.useCompression {
+		cellsPerState = l.numClasses
+	}
+	readCell := func(state, idx int) int32 {
+		row := state
+		if l.useRowDedup {
+			row = int(l.rowMapBytes[state])
+		}
+		off := row*cellsPerState + idx
+		if l.useU8 {
+			return int32(l.tableBytes[off])
+		}
+		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
+	}
+	transitionOn := func(state int, b int) int32 {
+		cell := b
+		if l.useCompression {
+			cell = int(l.classMap[b])
+		}
+		return readCell(state, cell)
+	}
+	isMidAccept := func(state int) bool {
+		return state < len(l.midAcceptBytes) && l.midAcceptBytes[state] != 0
+	}
+	isAcceptingExit := func(target int32) bool {
+		if target == 0 {
+			return true // dead is fine
+		}
+		return isMidAccept(int(target)) // mid-accept is fine (sets last_accept → $found)
+	}
+	// isEofAccept mirrors emitAcceptBitOnStack's (state-1) u< acceptLimit
+	// check: true when reaching EOF in this state alone (no mid-accept
+	// ever recorded) still succeeds.
+	isEofAccept := func(state int) bool {
+		return state-1 < int(l.acceptLimit)
+	}
+
+	midStartIdx := int(l.wasmMidStart)
+	if midStartIdx <= 0 || midStartIdx >= int(l.numWASM) {
+		return
+	}
+	if isMidAccept(midStartIdx) {
+		return
+	}
+
+	// Class C: bytes midStart accepts (non-dead transition).
+	var classC [256]bool
+	anyAccept := false
+	for b := 0; b < 256; b++ {
+		if transitionOn(midStartIdx, b) != 0 {
+			classC[b] = true
+			anyAccept = true
+		}
+	}
+	if !anyAccept {
+		return
+	}
+
+	visited := map[int]bool{midStartIdx: true}
+	cur := midStartIdx
+	for steps := 0; steps <= int(l.numWASM); steps++ {
+		// No chain state may be EOF-accepting. Every later start position
+		// restarts fresh at midStart and re-walks this SAME chain, but the
+		// LENGTH of its own remaining input may put it at a DIFFERENT
+		// chain state when it reaches EOF (e.g. bounded-repeat patterns
+		// like `(a{3,4})+$`, where whether $ can fire at EOF depends on
+		// the exact remaining length, not just "far enough into the
+		// chain"). If any state along the chain — not just midStart — can
+		// accept at EOF, a later attempt reaching exactly that state must
+		// still be allowed to run; bail rather than risk skipping it.
+		if isEofAccept(cur) {
+			return
+		}
+
+		// Uniform successor for every C byte.
+		succ := int32(-1)
+		for b := 0; b < 256; b++ {
+			if !classC[b] {
+				continue
+			}
+			t := transitionOn(cur, b)
+			if succ < 0 {
+				succ = t
+			} else if t != succ {
+				return // non-uniform successor → chain doesn't hold
+			}
+		}
+		if succ <= 0 || int(succ) >= int(l.numWASM) {
+			return
+		}
+
+		// Off-class bytes must be dead or mid-accept — never a third state.
+		for b := 0; b < 256; b++ {
+			if classC[b] {
+				continue
+			}
+			if !isAcceptingExit(transitionOn(cur, b)) {
+				return
+			}
+		}
+
+		if int(succ) == cur {
+			l.eofSkipSafe = true // terminal self-loop state found
+			return
+		}
+		if visited[int(succ)] {
+			return // non-trivial cycle, unsupported
+		}
+		if isMidAccept(int(succ)) {
+			return
+		}
+		visited[int(succ)] = true
+		cur = int(succ)
+	}
 }
 
 // detectDominantSelfLoop scans the WASM-space transition table for states
@@ -3053,7 +3254,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
 			tableMemIdx,
-			l.dominantStates, l.lnmAction5, l.skipSafeOnDead, l.patternMinLen)
+			l.dominantStates, l.lnmAction5, l.skipSafeOnDead, l.patternMinLen, l.eofSkipSafe)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -3520,11 +3721,15 @@ func emitImmAcceptCheckFindStart(b []byte, immAcceptLimit int32,
 // Checks eofAccept[state]; if set, updates last_accept = pos.
 // When hasRetry is false (anchored mode): unconditionally br foundDepth → $found.
 // When hasRetry is true (full find mode): br_if foundDepth → $found if last_accept>=0,
-// otherwise increment attemptStartLocal and br outerDepth → $outer.
+// otherwise:
+//   - eofSkipSafe (Task 8 follow-up #2): br directly to $no_match (depth
+//     outerDepth+1) — reaching EOF without ever recording an accept proves
+//     no later start position can match either (see detectEOFSkipSafe).
+//   - otherwise: increment attemptStartLocal and br outerDepth → $outer.
 func emitEofHandler(b []byte, stateLocal byte,
 	posLocal, lastAcceptLocal, attemptStartLocal byte,
 	foundDepth byte, hasRetry bool, outerDepth byte,
-	acceptLimit int32) []byte {
+	acceptLimit int32, eofSkipSafe bool) []byte {
 	b = emitAcceptBitOnStack(b, stateLocal, acceptLimit)
 	b = append(b, 0x04, 0x40) // if eofAccept
 	b = append(b, 0x20, posLocal)
@@ -3537,11 +3742,15 @@ func emitEofHandler(b []byte, stateLocal byte,
 		b = append(b, 0x41, 0x00)
 		b = append(b, 0x4E)             // i32.ge_s
 		b = append(b, 0x0D, foundDepth) // br_if → $found
-		b = append(b, 0x20, attemptStartLocal)
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x6A)
-		b = append(b, 0x21, attemptStartLocal)
-		b = append(b, 0x0C, outerDepth) // br → $outer
+		if eofSkipSafe {
+			b = append(b, 0x0C, outerDepth+1) // br → $no_match
+		} else {
+			b = append(b, 0x20, attemptStartLocal)
+			b = append(b, 0x41, 0x01)
+			b = append(b, 0x6A)
+			b = append(b, 0x21, attemptStartLocal)
+			b = append(b, 0x0C, outerDepth) // br → $outer
+		}
 	}
 	return b
 }
@@ -4007,7 +4216,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = append(b, 0x20, 0x01) // len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit)
+		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit, false)
 		b = append(b, 0x0B)
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -4060,7 +4269,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = append(b, 0x20, 0x01)
 		b = append(b, 0x4F)
 		b = append(b, 0x04, 0x40)
-		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit)
+		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit, false)
 		b = append(b, 0x0B)
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -4112,7 +4321,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 	b = append(b, 0x20, 0x01)
 	b = append(b, 0x4F)
 	b = append(b, 0x04, 0x40)
-	b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit)
+	b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit, false)
 	b = append(b, 0x0B)
 
 	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -4737,7 +4946,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, patternMinLen int32) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, patternMinLen int32, eofSkipSafe bool) []byte {
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
 	// `nonMidDominantOff` parameter and the `[]int` return slot) was
@@ -5208,7 +5417,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit)
+		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit, eofSkipSafe)
 		b = append(b, 0x0B) // end if
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -5353,7 +5562,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit)
+		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit, eofSkipSafe)
 		b = append(b, 0x0B) // end if
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -5486,7 +5695,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit)
+	b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit, eofSkipSafe)
 	b = append(b, 0x0B) // end if
 
 	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)

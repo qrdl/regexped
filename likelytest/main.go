@@ -712,6 +712,39 @@ var tests = []testCase{
 		nomatchInput: eofMinLenInput(false),
 	},
 	{
+		// Task 8 follow-up #2 target: min-length quantifier skip. Pattern
+		// requires >=50 lowercase letters followed by a digit. Suffix is a
+		// character CLASS, not a literal, so no mandatory-literal frontend
+		// applies (confirmed by probe: fuel scales linearly for an
+		// equivalent literal-suffix pattern like `x{500}y`, but quadratically
+		// here) — the find loop falls through to the naive per-position DFA
+		// retry path.
+		//
+		// No-match input is 2000 lowercase letters with no digit anywhere:
+		// the DFA never dies (stays in-class the whole way) and never runs
+		// short of input (Task 8's dead-state skip and follow-up #1's
+		// EOF-without-match check both stay silent), so every attempt from
+		// position k scans forward to EOF before failing — the pattern is
+		// entirely captured by neither prior fix. Confirmed via direct fuel
+		// probe (bypassing likelytest's benchIters wall-clock loop): fuel
+		// quadruples with each doubling of N (500→4.1M, 1000→16.5M,
+		// 2000→66M, 4000→264M fuel) — textbook O(N²). With the fix,
+		// attempt_start should jump by (scanned - minBodyLen + 1) on each
+		// EOF-without-match failure instead of by 1, collapsing this to
+		// O(N).
+		//
+		// Match input has a real digit early (1500 letters + digit + 500
+		// filler letters) — found on the very first attempt already, so
+		// this is a same-cost regression guard rather than a perf target;
+		// the important thing is the fix must not disturb it.
+		name:         "minlen-quantifier-skip",
+		pattern:      `[a-z]{50,}[0-9]`,
+		mode:         modeFind,
+		notes:        "no mandatory literal, never dies, never runs short — Task 8 follow-up #2 target",
+		matchInput:   minLenQuantifierSkipInput(true),
+		nomatchInput: minLenQuantifierSkipInput(false),
+	},
+	{
 		// H.3 target: 21 literal-prefixed patterns with distinct uppercase
 		// first bytes [A..U]. AC builds ~63 nodes which exceeds the 32-node
 		// cap → frontend falls back to scalar. With H.3, set-level
@@ -1082,6 +1115,28 @@ func eofMinLenInput(withMatches bool) string {
 	var b []byte
 	for i := 0; i < 300; i++ {
 		b = append(b, 'x')
+	}
+	return string(b)
+}
+
+// minLenQuantifierSkipInput builds inputs for the Task 8 follow-up #2
+// target (pattern `[a-z]{50,}[0-9]`, no-match input never dies and never
+// runs short of input — see likelytest case "minlen-quantifier-skip").
+func minLenQuantifierSkipInput(withMatches bool) string {
+	if withMatches {
+		var b []byte
+		for i := 0; i < 1500; i++ {
+			b = append(b, 'a')
+		}
+		b = append(b, '5')
+		for i := 0; i < 500; i++ {
+			b = append(b, 'a')
+		}
+		return string(b)
+	}
+	var b []byte
+	for i := 0; i < 2000; i++ {
+		b = append(b, 'a')
 	}
 	return string(b)
 }
