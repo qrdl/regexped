@@ -661,17 +661,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false)
-			// Phase 4: mid-accept default-on; non-mid gated under
-			// LikelyMatch (mirrors the find-body gate above).
-			if buildOpts.LikelyMode != LikelyMatch {
-				filtered := lm.dominantStates[:0]
-				for _, info := range lm.dominantStates {
-					if info.isMidAccept {
-						filtered = append(filtered, info)
-					}
-				}
-				lm.dominantStates = filtered
-			}
+			// Task 7 Step 2 (2026-07-05): Opt 1 default-on for all modes,
+			// mid-accept and non-mid-accept alike (mirrors the find-body
+			// gate above). Previously non-mid was gated to LikelyMatch
+			// because the original side-table dispatch caused a 48-57%
+			// no-match regression; that dispatch was replaced with a
+			// state-ID-compare emission (commit dbb4dfa9) — see
+			// plans/TODO.md task 7 for the re-measurement that justified
+			// removing the gate.
 			applyDominantStateEncoding(lm)
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
@@ -896,8 +893,15 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					}
 				}
 			}
-			// Opt 1 — dominant-self-loop SIMD bulk-skip. The mid-accept
-			// channel is default-on for all modes; non-mid is LM-gated.
+			// Opt 1 — dominant-self-loop SIMD bulk-skip. Default-on for all
+			// modes, mid-accept and non-mid-accept alike (Task 7 Step 2,
+			// 2026-07-05 — see plans/TODO.md task 7). Non-mid was
+			// previously LM-gated because the original side-table dispatch
+			// caused a 48-57% no-match regression; replaced with a
+			// state-ID-compare emission (commit dbb4dfa9) that shrinks the
+			// no-match cost to ~18-21% wall time (0% fuel) on the patterns
+			// that show it at all — a real, measured trade-off against a
+			// much larger match-path win, not a fully regression-free win.
 			// Anchored find uses a separate builder (buildAnchoredFindBody)
 			// whose midAccept consumers don't decode the encoding, so we
 			// skip it there. Lit-anchor's forward DFA scan
@@ -906,15 +910,6 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// set — both paths benefit.
 			canEmitOpt1 := !isAnchoredFind(table)
 			if canEmitOpt1 {
-				if buildOpts.LikelyMode != LikelyMatch {
-					filtered := l.dominantStates[:0]
-					for _, info := range l.dominantStates {
-						if info.isMidAccept {
-							filtered = append(filtered, info)
-						}
-					}
-					l.dominantStates = filtered
-				}
 				applyDominantStateEncoding(l)
 			} else {
 				l.dominantStates = nil
