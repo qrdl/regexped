@@ -26,7 +26,7 @@ const (
 | Mode | Intent | Effect summary |
 |---|---|---|
 | `LikelyNeutral` | no hint; assume balanced | Gets every default-on optimisation. No mode-specific code paths fire. |
-| `LikelyMatch` | "matches expected, no-match is the cold path" | Unlocks aggressive match-path emissions (counted-chain SIMD verifier, lit-chain bodies, non-mid-accept dominant bulk-skip). Two of those add a ~+48% wall-clock cost on the no-match path of certain pattern shapes — see *Known regressions* below. |
+| `LikelyMatch` | "matches expected, no-match is the cold path" | Unlocks the counted-chain SIMD verifier (Opt 2, lit-chain bodies). The non-mid-accept dominant bulk-skip this row used to unlock is now default-on for every mode (Task 7 Step 2, 2026-07-05) — three pattern shapes pay a ~+18-24% no-match wall-clock cost for it regardless of which mode is set; see *Known gaps* §5 below. |
 | `LikelyNoMatch` | "matches rare, scan-and-exit is the hot path" | Forces SIMD prefix-scan routing for first-byte sets in the 17..64-byte band that the density heuristic would otherwise route to scalar. Helps patterns with wide first-byte sets on inputs dominated by "impossible" bytes. |
 
 The three modes are mutually exclusive. `LikelyMatch` does **not** include
@@ -81,6 +81,46 @@ emitted unconditionally and the hint just confirms the default:
 | Phase 4 — same dispatch in match body | `buildMatchBody` / `buildHybridMatchBody` → `emitPhase4Dispatch` | Anchored-match counterpart of Phase 2/3/5 |
 | Lit-anchor body bulk-skip | `buildLitAnchorFindBody` | Mid-accept dispatch inside the lit-anchor forward DFA scan loop |
 | LNM Action 3 — density-heuristic Shufti | `EmitPrefixScan` in [compile/prefix_scan.go](../compile/prefix_scan.go) | 17..64-byte first-byte sets route through Shufti when `shuftiBeatsScalar` returns true |
+| Opt 1 — non-mid-accept dominant dispatch, find body | `buildFindBody` non-mid branch, [compile/compile.go:999](../compile/compile.go) | Default-on for all modes since Task 7 Step 2 (2026-07-05) — see *Known trade-off* below |
+| Opt 1 — non-mid-accept dominant dispatch, match body | `buildMatchBody` / `buildHybridMatchBody`, [compile/compile.go:734](../compile/compile.go) | Same change, match-body counterpart |
+| Opt 1 — non-mid-accept dominant dispatch, lit-anchor body | `buildLitAnchorFindBody` non-mid branch | Shares the same `l.dominantStates` encoding as the find body; benefits from the same change |
+| Gap F — TDFA capture-body bulk-skip | `detectTDFABulkSkip` / `emitTDFABulkSkip` in [compile/tdfa_bulk_skip.go](../compile/tdfa_bulk_skip.go) | Shipped 2026-07-06, unconditional for every mode — see *Gap F* section below |
+
+**Non-mid-accept dominant dispatch (moved here from `LikelyMatch` on
+2026-07-05, Task 7 Step 2).** Originally gated to `LikelyMatch` because the
+first implementation (a memory-side-table dispatch) caused a 48-57%
+no-match wall-time regression on some patterns. That dispatch was replaced
+with **state-ID compare emission** (`local.get state; i32.const STATE;
+i32.eq; if; emitDominantBulkSkip; end` per non-mid entry — see
+[plans/non_mid_extension.go.archive](../plans/non_mid_extension.go.archive)
+for the reverted side-table variant), which shrank the no-match cost enough
+that re-measurement justified making it default-on for every `LikelyMode`,
+not just `LikelyMatch`. The remaining no-match cost is documented in
+*Known trade-off* below — it is now a fact of the optimisation itself, not
+something users opt into via the hint.
+
+**Known trade-off (was "Known regression" under `LikelyMatch` before
+2026-07-05).** Three patterns show a real, reproducible no-match wall-time
+cost with 0% fuel change, now identical across all three `LikelyMode`s
+(confirmed via `likelytest`: `wasm size` and every `Δ%` column are 0% across
+neutral/likely-match/likely-nomatch for these patterns):
+
+| Pattern | Match time | No-match time | No-match fuel |
+|---|---|---|---|
+| `ctrl-delim` (`\x01[^\x02]+\x02`) | ~4.7-5.0 µs | ~5.1-5.2 µs | 73,618 |
+| `comments-mixed` (`//[^\n]+\|/\*(?s:.*?)\*/`, 10 KB) | ~1.2 µs | ~1.1 µs | 14,632 |
+| `comments-mixed-large` (same pattern, 50 KB) | ~3.8 µs | ~5.1 µs | 73,618 |
+
+(Current per-mode `likelytest` runs on these three show 0% `Δ%` across
+neutral/likely-match/likely-nomatch — confirming the WASM is byte-identical
+across modes; the small run-to-run µs variation above is measurement noise,
+not a mode effect.) The no-match wall-time cost for these three, measured
+against the pre-Opt-1-non-mid baseline when the gate was removed (Task 7
+Step 2, 2026-07-05), is ~18-24% (fuel unchanged — a Cranelift JIT codegen
+artefact, not extra emitted work; see *Known gaps* §5 below) — a real
+reduction from the original 48-57% side-table regression. `xml-tag`,
+`bracket-content`, `paren-block`, and `letter-delim` show ~0% no-match cost
+and are unaffected.
 
 ### `LikelyMatch`
 
@@ -88,24 +128,14 @@ Adds, on top of neutral:
 
 | Optimisation | Where | Gate | Patterns affected |
 |---|---|---|---|
-| Opt 2 — counted-chain SIMD verifier (no captures) | [compile/compile.go:409](../compile/compile.go) | `LikelyMode == LikelyMatch && !needGroups` | Strict `<lit><charclass>{N}` and strict alts of same |
-| Opt 2 — counted-chain SIMD verifier (with captures) | [compile/compile.go:262](../compile/compile.go) | `LikelyMode == LikelyMatch && needGroups` | Same shape, capture path |
-| Non-mid-accept dominant dispatch — find body | `buildFindBody` non-mid branch | `LikelyMode == LikelyMatch` | Patterns with a dominant self-loop body state that is NOT mid-accepting (`<[^>]+>`, `/\*.*?\*/`, etc.) |
-| Non-mid-accept dominant dispatch — match body | `buildMatchBody` / `buildHybridMatchBody` | `LikelyMode == LikelyMatch` | Anchored match counterpart |
-| Non-mid-accept dominant dispatch — lit-anchor body | `buildLitAnchorFindBody` non-mid branch | `LikelyMode == LikelyMatch` | Lit-anchored patterns with non-mid dominant body |
+| Opt 2 — counted-chain SIMD verifier (no captures) | [compile/compile.go:520](../compile/compile.go) | `LikelyMode == LikelyMatch && !needGroups` | Strict `<lit><charclass>{N}` and strict alts of same |
+| Opt 2 — counted-chain SIMD verifier (with captures) | [compile/compile.go:373](../compile/compile.go) | `LikelyMode == LikelyMatch && needGroups` | Same shape, capture path |
 
-The non-mid dispatch uses **state-ID compare emission** (`local.get state;
-i32.const STATE; i32.eq; if; emitDominantBulkSkip; end` per non-mid entry) —
-not a memory-side-table lookup. The side-table variant was tried and reverted;
-see [plans/non_mid_extension.go.archive](../plans/non_mid_extension.go.archive).
-
-**Known regression**: for two of six canonical non-mid pattern shapes
-(`ctrl-delim` rare-byte literal, `comments-mixed-large` multi-dominant
-alternation), enabling the non-mid dispatch adds ~+48% wall-clock on the
-no-match path while keeping ~-98% match-path speedup. This is a Cranelift JIT
-codegen artefact confirmed by cross-patch isolation and is not addressable from
-the WASM layer. `LikelyMatch` users opt into this trade by signalling
-"matches likely".
+> As of 2026-07-05 (Task 7 Step 2), the non-mid-accept dominant dispatch
+> that used to be listed here is **default-on for every `LikelyMode`** — see
+> the `LikelyNeutral` section above, including its *Known trade-off* note.
+> `LikelyMatch`'s own unique contribution is now just Opt 2 (the counted-chain
+> SIMD verifier).
 
 ### `LikelyNoMatch`
 
@@ -127,9 +157,9 @@ Adds, on top of neutral:
 
 | Engine | LikelyNeutral | LikelyMatch | LikelyNoMatch |
 |---|---|---|---|
-| DFA | ✅ all defaults | ✅ all LM-gated opts active | ✅ Action 5 active |
+| DFA | ✅ all defaults | ✅ Opt 2 active | ✅ Action 5 active |
 | Compiled DFA | ✅ | ✅ | ✅ |
-| TDFA | ✅ (defaults only) | ⚠️ no TDFA-specific code; LM only affects the *DFA fallback path* if a lit-chain shape matches before TDFA is chosen | ❌ no LNM-specific code |
+| TDFA | ✅ defaults + Gap F bulk-skip (mode-independent) | ⚠️ LM only affects the *DFA fallback path* if a lit-chain shape matches before TDFA is chosen; no LM-specific TDFA code | ❌ no LNM-specific code |
 | Backtracking | ✅ (defaults only — Phase 2/3/5 don't apply since BT is structurally different) | ❌ no BT-specific code | ❌ no BT-specific code |
 
 **Compiled DFA** is the DFA emission with hybrid (literal-chain) dispatch
@@ -138,20 +168,66 @@ applied; it inherits every LM/LNM code path the DFA engine has.
 **TDFA** (Laurikari tagged DFA) is selected for capture-track patterns that
 qualify (no non-greedy, no line anchors, no word boundaries, no ambiguous
 alternations, ≤ `MaxDFAStates`, ≤ `MaxTDFARegs`). The TDFA emission itself
-contains no `LikelyMode` checks. However, the compile pipeline tries the
-LM lit-chain capture path *before* falling through to TDFA — so for patterns
-where a lit-chain capture body exists, `LikelyMatch` replaces the TDFA emission
-entirely with a faster lit-chain emission. If the pattern doesn't qualify for
-lit-chain, TDFA is used and the hint has no further effect.
+contains no `LikelyMode` checks — but since 2026-07-06 (Gap F) it does have
+its own optimisation, a SIMD bulk-skip for capture patterns with a single
+dominant self-loop state (`(\w+)`, `<([a-z]+)>`, etc. — see the *Gap F*
+section below). Gap F fires whenever a pattern qualifies, for **every**
+`LikelyMode`, the same unconditional-by-design choice as Task 7's Opt 1 —
+it is not part of the `LikelyMode` hint mechanism at all. Separately, the
+compile pipeline tries the LM lit-chain capture path *before* falling
+through to TDFA — so for patterns where a lit-chain capture body exists,
+`LikelyMatch` replaces the TDFA emission entirely with a faster lit-chain
+emission. If the pattern doesn't qualify for lit-chain, TDFA (with Gap F
+applied automatically, if eligible) is used and the hint has no further
+effect.
 
 **Backtracking** is selected for patterns the DFA/TDFA can't handle (e.g.
 non-greedy quantifiers, large state count, ambiguous captures). The
 backtracking emission contains no `LikelyMode` checks. The hint has no
 effect.
 
-> **Gap (see *Known gaps* §3):** TDFA and Backtracking engines have no
-> mode-specific optimisations. Users running these engines see no benefit from
-> the hint, and there's no compile-time warning to that effect.
+> **Gap (see *Known gaps* §3):** the `LikelyMode` *hint* has no mode-specific
+> effect on TDFA or Backtracking. Users running these engines see no benefit
+> from setting the hint (Gap F is an unconditional engine-level improvement,
+> not something the hint unlocks), and there's no compile-time warning to
+> that effect.
+
+---
+
+## Gap F: TDFA capture-body bulk-skip
+
+Shipped 2026-07-06. Not part of the `LikelyMode` hint mechanism — included
+in this doc because it lives in the same performance-optimisation
+workstream and because *Known gaps* §3 above depends on understanding it:
+TDFA now has a real optimisation, it's just not something `LikelyMode`
+controls.
+
+**What it does.** A TDFA capture pattern that compiles down to a single
+dominant self-loop state — one state that loops on 8-64 distinct bytes,
+firing a uniform, set-to-pos-only tag-op batch on every one of them — gets
+a SIMD bulk-skip: `detectTDFABulkSkip` finds the qualifying state at
+compile time, `emitTDFABulkSkip` (both in
+[compile/tdfa_bulk_skip.go](../compile/tdfa_bulk_skip.go)) emits a 16-byte
+chunked scan (`emitShuftiPrefixCheck`, the same SIMD primitive Action 3
+uses) that skips the whole self-loop run and fires the tag-op batch once,
+instead of once per byte. Hooked into `newTDFA` (detection) and
+`buildTDFAMatchBody` (emission) in
+[compile/engine_tdfa.go](../compile/engine_tdfa.go).
+
+**Scope (v1).** One dominant state per pattern; copy-ops (register
+reconciliation) on the self-loop are excluded, only set-to-pos ops qualify.
+Both are documented, intentional limits, not oversights — see
+[plans/TODO.md](../plans/TODO.md) task 15.
+
+**Qualifying patterns:** `(\w+)`, `<([a-z]+)>`, `X([a-zA-Z]+)#`. Note the
+trailing-literal-inside-the-class shape (`X([a-zA-Z]+)Y`) doesn't reach
+TDFA at all by default — it's routed to Backtracking via
+`hasAmbiguousCaptures` (see [plans/TODO.md](../plans/TODO.md) task 13,
+open). Gap F only fires for patterns that actually reach TDFA.
+
+**Measured wins** and **unconditional, every-mode** framing: see the Gap F
+entries under *What each mode unlocks* → `LikelyNeutral`, the *Engine
+support matrix* TDFA row, and *Known performance numbers* above.
 
 ---
 
@@ -171,9 +247,9 @@ regexps:
 
 | Host function | LikelyNeutral | LikelyMatch | LikelyNoMatch |
 |---|---|---|---|
-| `match_func` | All Phase 4 + Action 3 defaults | Lit-chain match body (Opt 2) + non-mid dominant dispatch | Action 5 |
-| `find_func` | All Phase 2/3/5 + lit-anchor + Action 3 defaults | Lit-chain find body (Opt 2) + non-mid dominant dispatch + lit-chain capture body if find+groups combo | Action 5 |
-| `groups_func` | TDFA or Backtracking — no LM/LNM effect *unless* the pattern is a lit-chain capture shape | Lit-chain capture body (Opt 2 with captures) replaces TDFA/BT entirely | No effect (still TDFA / BT) |
+| `match_func` | All Phase 4 + Action 3 defaults + non-mid dominant dispatch | Lit-chain match body (Opt 2) | Action 5 |
+| `find_func` | All Phase 2/3/5 + lit-anchor + Action 3 defaults + non-mid dominant dispatch | Lit-chain find body (Opt 2) + lit-chain capture body if find+groups combo | Action 5 |
+| `groups_func` | TDFA (+ Gap F bulk-skip if eligible) or Backtracking — no LM/LNM hint effect *unless* the pattern is a lit-chain capture shape | Lit-chain capture body (Opt 2 with captures) replaces TDFA/BT entirely | No hint effect (still TDFA / BT; Gap F still applies if eligible) |
 | `named_groups_func` | Same as `groups_func` | Same as `groups_func` | Same as `groups_func` |
 
 For capture-returning host functions the rule of thumb is: **`LikelyMatch` is
@@ -209,9 +285,24 @@ This means:
 For the hint to have a measurable effect, the pattern must match one of these
 shapes:
 
+### Shapes benefiting from Opt 1 (unconditional — every `LikelyMode`, since 2026-07-05)
+
+**Non-mid-accept dominant body (state-ID compare dispatch):**
+- `<lit>[^<exit>]+<lit>` shape — `<[^>]+>`, `/\*.*?\*/`, `"[^"]+"`,
+  `\x01[^\x02]+\x02`
+- Lit-anchored variant — `<lit-2+-bytes>[^<exit>]+<lit-2+-bytes>` (anchored
+  variant where `findLitAnchorPoint` recognises the 2+ byte literal child;
+  e.g. `[0-9]{4}INFO:[^\n]+`)
+
+This is not gated by the `LikelyMode` hint at all — patterns matching this
+shape get the optimisation regardless of what mode you set (or don't set).
+Listed here (not under `LikelyMatch`/`LikelyNoMatch` below) because it used
+to be a `LikelyMatch`-only target before Task 7 Step 2.
+
 ### `LikelyMatch` targets
 
-**Counted-chain (Opt 2, lit-chain):**
+**Counted-chain (Opt 2, lit-chain):** — the only shape where the
+`LikelyMatch` hint itself still makes a difference.
 - `<lit><charclass>{N}` — `AKIA[A-Z0-9]{16}`, `ghp_[A-Za-z0-9]{36}`
 - `<lit><charclass>{N,M}` — `AKIA[A-Z0-9]{8,16}`, `secret_[A-Za-z0-9]{24,40}`
 - Strict alt of same — `AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}`
@@ -221,13 +312,6 @@ shapes:
 - Lenient alt (mixed lit-chain + non-lit-chain branches) — only the lit-chain
   branches benefit
 
-**Non-mid-accept dominant body (state-ID compare dispatch):**
-- `<lit>[^<exit>]+<lit>` shape — `<[^>]+>`, `/\*.*?\*/`, `"[^"]+"`,
-  `\x01[^\x02]+\x02`
-- Lit-anchored variant — `<lit-2+-bytes>[^<exit>]+<lit-2+-bytes>` (anchored
-  variant where `findLitAnchorPoint` recognises the 2+ byte literal child;
-  e.g. `[0-9]{4}INFO:[^\n]+`)
-
 ### `LikelyNoMatch` targets
 
 **17..64-byte first-byte set in find mode:**
@@ -236,27 +320,57 @@ shapes:
   by bytes outside the set (so the SIMD scan amortises better than the
   byte-by-byte scalar early-exit).
 
-If your pattern doesn't match one of these shapes, the hint will compile
-fine but produce bit-identical WASM to `LikelyNeutral`.
+### Shapes benefiting from Gap F (unconditional — every `LikelyMode`, TDFA only, since 2026-07-06)
+
+**TDFA capture pattern with a single dominant self-loop state, 8-64 bytes,
+uniform set-to-pos tag ops:**
+- `(\w+)`, `<([a-z]+)>`, `X([a-zA-Z]+)#` — see the *Gap F* section below.
+
+Not gated by the hint either — see the *Gap F* section for details and the
+scope restrictions (single dominant state, no copy-ops).
+
+If your pattern doesn't match one of these shapes, the `LikelyMode` hint
+will compile fine but produce bit-identical WASM to `LikelyNeutral` — though
+note Opt 1 and Gap F can still change the WASM relative to *older* versions
+of regexped regardless of the hint, since neither is hint-gated anymore.
 
 ---
 
 ## Known performance numbers
 
-From the [likelytest](../likelytest/) benchmark on 50 KB inputs:
+From the [likelytest](../likelytest/) benchmark on 50 KB inputs (unless noted).
 
-### `LikelyMatch` wins (vs `LikelyNeutral` baseline)
+### Opt 1 wins (unconditional, every `LikelyMode`, since Task 7 Step 2 2026-07-05)
+
+Deltas below are against the pre-Opt-1-non-mid baseline (i.e. what
+`LikelyNeutral` looked like before 2026-07-05) — **not** a comparison
+between today's three modes, which now produce byte-identical WASM for
+every pattern in this table:
 
 | Pattern | Match Δ | No-match Δ |
 |---|---|---|
-| `ctrl-delim` (`\x01[^\x02]+\x02`) | **-98%** time | **+48%** time |
+| `ctrl-delim` (`\x01[^\x02]+\x02`) | **-98%** time | **+18-24%** time |
 | `xml-tag` (`<[^>]+>`) | **-98%** time | 0% |
 | `bracket-content` (`\[[^\]]+\]`) | **-98%** time | 0% |
 | `paren-block` (`\([^)]+\)`) | **-97%** time | 0% |
 | `letter-delim` (`a[^b]+b`) | **-98%** time | 0% |
-| `comments-mixed-large` (`//[^\n]+|/\*(?s:.*?)\*/`) | **-94%** time | **+48%** time |
+| `comments-mixed` (`//[^\n]+\|/\*(?s:.*?)\*/`, 10 KB) | not separately recorded vs pre-Opt-1 baseline | **+18-24%** time |
+| `comments-mixed-large` (same pattern, 50 KB) | **-94%** time | **+18-24%** time |
 | `anchored-xml-tag-large` (anchored `<[^>]+>`) | **-97%** time | **-97%** time |
 | `lit-anchor-dominant-body` (`[0-9]{4}INFO:[^\n]+`) | -45% fuel | 0% |
+
+The `+48%` figure previously recorded here was from before commit
+`dbb4dfa9` replaced the side-table non-mid dispatch with state-ID-compare
+emission; `+18-24%` is the correct current figure for the 3 patterns that
+show any regression at all.
+
+### `LikelyMatch` wins (Opt 2 — counted-chain SIMD verifier)
+
+No dedicated `likelytest` numbers are recorded in this doc yet for Opt 2
+specifically (a documentation gap, not a performance gap — Opt 2 predates
+this doc's numbers section). See
+[compile/compile_lm_lnm_test.go](../compile/compile_lm_lnm_test.go) for
+correctness coverage of the shape.
 
 ### `LikelyNoMatch` wins
 
@@ -264,21 +378,33 @@ From the [likelytest](../likelytest/) benchmark on 50 KB inputs:
 |---|---|---|
 | `alpha-run-impossible-bytes` (`[a-zA-Z]{8,}` on prose with impossible bytes) | -21% time / -59% fuel | -19% time / -59% fuel |
 
+### Gap F wins (unconditional, every `LikelyMode`, TDFA only, since 2026-07-06)
+
+10.2-10.4 KB all-self-loop `matchInput`, anchored capture (`groups_func`):
+
+| Pattern | Self-loop size | Fuel Δ | Time Δ |
+|---|---|---|---|
+| `(\w+)` | 63 bytes | **-39.5%** | **-42.7%** |
+| `<([a-z]+)>` | 26 bytes | **-50.9%** | **-44.9%** |
+| `X([a-zA-Z]+)#` | 52 bytes | **-47.7%** | **-41.9%** |
+
+No-match (anchored fail at pos 0) fuel/time unaffected in all three cases.
+
 ---
 
 ## Implementation references (for contributors)
 
 - **Type definition + gate:** [compile/compile.go](../compile/compile.go) —
   `LikelyMode` type at line 53; `CompileOptions.LikelyMode` at line 89;
-  per-pattern gates at lines 262, 409, 625, 870.
-- **Lit-chain capture path:** [compile/compile.go:262](../compile/compile.go#L262) — `LikelyMode == LikelyMatch && needGroups`.
-- **Lit-chain match/find path:** [compile/compile.go:409](../compile/compile.go#L409) — `LikelyMode == LikelyMatch && !needGroups`.
-- **Non-mid dominant gate (find layout):** [compile/compile.go:870](../compile/compile.go#L870) — filters non-mid entries out of `l.dominantStates` for non-LM modes.
-- **Non-mid dominant gate (match layout):** [compile/compile.go:625](../compile/compile.go#L625) — same filter for `lm.dominantStates`.
+  the two remaining `LikelyMode`-gated sites (Opt 2 only) at lines 373, 520.
+- **Lit-chain capture path:** [compile/compile.go:373](../compile/compile.go#L373) — `LikelyMode == LikelyMatch && needGroups`.
+- **Lit-chain match/find path:** [compile/compile.go:520](../compile/compile.go#L520) — `LikelyMode == LikelyMatch && !needGroups`.
+- **Opt 1 default-on sites (no `LikelyMode` gate; the only gate left is `isAnchoredFind(table)`, which is unrelated to the hint):** [compile/compile.go:734](../compile/compile.go#L734) (match layout) and [compile/compile.go:999-1018](../compile/compile.go#L999) (find layout, also feeds the lit-anchor body).
 - **LNM Action 5 flag:** `dfaLayout.lnmAction5` in [compile/engine_dfa.go](../compile/engine_dfa.go); threaded into `prefixScanParams.LikelyNoMatch` consumed by `EmitPrefixScan` in [compile/prefix_scan.go](../compile/prefix_scan.go).
 - **Phase 4 dispatch:** `emitPhase4Dispatch` in [compile/engine_dfa.go](../compile/engine_dfa.go).
 - **State-ID compare emission for non-mid:** inline in `buildFindBody`, `buildMatchBody`, `buildLitAnchorFindBody`, `emitPhase4Dispatch` — one block per non-mid entry of the form `local.get state; i32.const STATE; i32.eq; if; emitDominantBulkSkip; end`.
 - **Dominant detection:** `detectDominantSelfLoop` and `applyDominantStateEncoding` in [compile/engine_dfa.go](../compile/engine_dfa.go).
+- **Gap F detection + emission:** `detectTDFABulkSkip` / `emitTDFABulkSkip` in [compile/tdfa_bulk_skip.go](../compile/tdfa_bulk_skip.go); hooked into `newTDFA` / `buildTDFAMatchBody` in [compile/engine_tdfa.go](../compile/engine_tdfa.go).
 - **Mode-dispatching test harness:** [re2test/main.go](../re2test/main.go) — `--likelymatch` / `--likelynomatch` flags; [likelytest/main.go](../likelytest/main.go) — three-mode matrix output.
 - **Pattern coverage tests:** [compile/compile_lm_lnm_test.go](../compile/compile_lm_lnm_test.go) — covers every LM/LNM lit-chain pattern shape.
 - **Archived implementation alternatives:** [plans/non_mid_extension.go.archive](../plans/non_mid_extension.go.archive) — the side-table dispatch variant that was reverted in favour of state-ID compares.
@@ -315,12 +441,22 @@ density heuristic — it doesn't compute or use the body accept set.
 The real impossible-byte-SIMD scan was not shipped; it remains a candidate
 for future work.
 
-### 3. TDFA and Backtracking engines ignore `LikelyMode`
+### 3. TDFA and Backtracking engines ignore the `LikelyMode` hint
 
-The hint has no effect on patterns that compile to TDFA or Backtracking.
-There is no compile-time warning, log line, or doc note pointing this out to
-users when they set the hint on a pattern that ends up on one of those
-engines.
+The `LikelyMode` *hint* has no effect on patterns that compile to TDFA or
+Backtracking — setting `LikelyMatch`/`LikelyNoMatch` produces bit-identical
+WASM to `LikelyNeutral` for these engines (outside the lit-chain fallback
+case noted in the engine matrix above). There is no compile-time warning,
+log line, or doc note pointing this out to users when they set the hint on
+a pattern that ends up on one of those engines.
+
+This is a gap in the *hint mechanism* specifically, not in TDFA's
+optimisation coverage generally — TDFA gained a real, mode-independent
+optimisation of its own (Gap F, 2026-07-06) that fires automatically for
+qualifying capture patterns regardless of what `LikelyMode` is set. A user
+relying on the hint to know whether TDFA output will be optimised would
+still be misled (the hint tells them nothing either way), which is the
+actual gap.
 
 Users can determine which engine a pattern uses via
 `compile.SelectEngine(pattern, opts)`. There is currently no mechanism to
@@ -337,19 +473,25 @@ no-sets path, the sets path would still discard it.
 This is a one-line fix in `CompileFile` once gap 1 is resolved (read
 `cfg.LikelyMode` and copy it into `opts.LikelyMode`).
 
-### 5. Two LM pattern shapes still regress on the no-match path
+### 5. Three Opt-1-eligible pattern shapes regress on the no-match path — for every mode, not just `LikelyMatch`
 
-`ctrl-delim` (rare-byte literal) and `comments-mixed-large` (multi-dominant
-alternation) reproduce a +48% no-match wall-time regression even with the
-state-ID-compare dispatch workaround. Cross-patch isolation showed this is a
-Cranelift JIT codegen quirk tied to specific operand and data-segment byte
-values; same WASM op count, same loop structure, different machine code
-quality. Not addressable from the WASM layer.
+`ctrl-delim` (rare-byte literal), `comments-mixed`, and `comments-mixed-large`
+(multi-dominant alternation) reproduce an +18-24% no-match wall-time
+regression (0% fuel change) even with the state-ID-compare dispatch that
+replaced the original side-table version (which caused +48-57%). Cross-patch
+isolation showed this is a Cranelift JIT codegen quirk tied to specific
+operand and data-segment byte values; same WASM op count, same loop
+structure, different machine code quality. Not addressable from the WASM
+layer.
 
-`LikelyMatch` users opt into this trade by signalling "matches expected", so
-the regression is contractually acceptable. But it's worth documenting
-explicitly — users running these shapes on no-match-heavy workloads with
-`LikelyMatch` set will see a regression.
+As of Task 7 Step 2 (2026-07-05) this is **no longer an opt-in trade** —
+since the non-mid dispatch is unconditional for every `LikelyMode`, all
+users of these three pattern shapes see this regression regardless of which
+hint they set, including `LikelyNeutral` (the default). This was a
+deliberate decision (the re-measured cost was judged acceptable against the
+much larger match-path win once the side-table dispatch was fixed) but it
+means the framing changed: it's a property of the pattern shape now, not
+something users "opt into" via `LikelyMatch`.
 
 ### 6. `LikelyMode` is per-Compile-call, not per-pattern
 
@@ -387,6 +529,9 @@ frontend wants one bias and individual patterns want another.
   status.
 - [plans/LNM.md](../plans/LNM.md) — original LikelyNoMatch action plan
   (Actions 3, 4, 5, 6).
-- [plans/TODO.md](../plans/TODO.md) — task 7 (default-on rollout) decisions.
+- [plans/TODO.md](../plans/TODO.md) — task 7 (default-on rollout) decisions;
+  task 12 (Gap F pre-implementation measurement); task 13 (open —
+  `hasAmbiguousCaptures` possibly over-conservative for
+  `X([a-zA-Z]+)Y`-shaped patterns); task 15 (Gap F implementation record).
 - [plans/non_mid_extension.go.archive](../plans/non_mid_extension.go.archive) — archived side-table non-mid dispatch (replaced by state-ID compares).
 - [docs/engines.md](engines.md) — engine selection rules.
