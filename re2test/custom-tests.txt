@@ -2054,6 +2054,16 @@ regexps
 #
 # Expected values cross-checked against Go's regexp package (--validate-go)
 # before being committed to this fixture.
+#
+# col0 caveat (see plans/TODO.md task 14, retracted-bug postmortem): under
+# `--force-backtrack` (without `--groups-only`), col0 validates against
+# match_func (full-string match by design, compile.go:700-706) instead of
+# groups_func (prefix-anchored). The (\w+) rows on S5/S6/S7 have trailing
+# content beyond the \w+ match, so their col0 is "-" (correct under
+# full-match) even though groups_func correctly finds a prefix match there
+# (validated separately via col1 and by direct wasmtime testing during
+# implementation). Every other row here has no trailing content, so col0
+# is unambiguous.
 # ============================================================
 Cat31TDFABulkSkipGapF
 strings
@@ -2072,9 +2082,9 @@ regexps
 0-16 0-16;0-16;-;-
 0-17 0-17;0-17;-;-
 -;1-27;-;-
-0-16 0-16;0-16;-;-
-0-53 0-53;0-53;-;-
-0-20 0-20;0-20;-;-
+-;0-16;-;-
+-;0-53;-;-
+-;0-20;-;-
 0-31 0-31;0-31;-;-
 0-32 0-32;0-32;-;-
 "<([a-z]+)>"
