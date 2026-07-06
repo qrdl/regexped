@@ -53,6 +53,10 @@ type tdfaTable struct {
 	numRegs      int         // total WASM locals allocated for capture registers
 	numGroups    int         // number of capture groups (including group 0)
 	entryOps     []tdfaTagOp // ops emitted at function entry (before first byte is consumed)
+
+	// bulkSkip describes a single dominant self-loop state eligible for SIMD
+	// bulk-skip in the match body (Gap F); nil when no qualifying state exists.
+	bulkSkip *tdfaBulkSkipInfo
 }
 
 // --------------------------------------------------------------------------
@@ -678,6 +682,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		entryOps:     entryOps,
 	}
 	tt = minimizeTDFARegisters(tt)
+	tt.bulkSkip = detectTDFABulkSkip(tt)
 	return tt, true
 }
 
@@ -728,9 +733,16 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	var b []byte
 
 	numCapRegs := tt.numRegs
-	// Locals: pos(1) + state(1) + prevState(1) + byte(1) + capture regs.
+	// Locals: pos(1) + state(1) + prevState(1) + byte(1) + capture regs
+	// [+ bulk-skip locals: chunk(v128) + mask(i32) + skipStart(i32)].
 	extraLocals := 4 + numCapRegs
-	b = utils.AppendULEB128(b, uint32(1)) // 1 local declaration
+	hasBulkSkip := enableTDFABulkSkip && tt.bulkSkip != nil
+
+	if hasBulkSkip {
+		b = utils.AppendULEB128(b, uint32(3)) // 3 local declaration groups
+	} else {
+		b = utils.AppendULEB128(b, uint32(1)) // 1 local declaration group
+	}
 	b = utils.AppendULEB128(b, uint32(extraLocals))
 	b = append(b, 0x7F) // i32
 
@@ -741,6 +753,16 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		localByte      = uint32(6)
 		localCapBase   = uint32(7)
 	)
+	localChunk := localCapBase + uint32(numCapRegs)
+	localMask := localChunk + 1
+	localSkipStart := localMask + 1
+
+	if hasBulkSkip {
+		b = utils.AppendULEB128(b, uint32(1))
+		b = append(b, 0x7B) // v128
+		b = utils.AppendULEB128(b, uint32(2))
+		b = append(b, 0x7F) // i32
+	}
 
 	// Initialise capture registers to -1.
 	for i := 0; i < numCapRegs; i++ {
@@ -770,6 +792,17 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x0D, 0x01) // br_if $done
+
+	if hasBulkSkip {
+		// if state == bulkSkip.wasmState: SIMD-skip the self-loop run (Gap F)
+		b = append(b, 0x20, byte(localState))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, tt.bulkSkip.wasmState)
+		b = append(b, 0x46)       // i32.eq
+		b = append(b, 0x04, 0x40) // if (void)
+		b = emitTDFABulkSkip(b, tt.bulkSkip, localPos, localChunk, localMask, localSkipStart, localCapBase)
+		b = append(b, 0x0B) // end if
+	}
 
 	// prevState = state
 	b = append(b, 0x20, byte(localState))

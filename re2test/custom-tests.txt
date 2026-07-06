@@ -2010,6 +2010,8 @@ regexps
 -;-;-;-
 -;-;-;-
 "[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}gzork[0-9]{4}"
+# (22 rows below, one per declared string — a missing 22nd row here was
+# found and fixed 2026-07-06 while adding Cat31; see the last row.)
 -;0-48;-;-
 -;-;-;-
 -;7-55;-;-
@@ -2032,3 +2034,76 @@ regexps
 0-17;0-17;-;-
 -;-;-;-
 -;7-24;-;-
+# ============================================================
+# Category 31: Gap F TDFA capture-body bulk-skip — chunk-boundary edge cases
+#
+# (\w+), <([a-z]+)>, X([a-zA-Z]+)#, and (\w+) (\w+) all compile to a TDFA
+# with a single dominant self-loop state that qualifies for the Gap F SIMD
+# bulk-skip (detectTDFABulkSkip / emitTDFABulkSkip). These cases target the
+# risks called out in the Gap F plan: exact 16-byte SIMD chunk boundaries
+# (16/17/31/32 bytes), the K==0 case where the exit byte is the very first
+# byte of a freshly-loaded chunk (S5: 16 self-loop bytes + delimiter + 15
+# more bytes, so the second v128.load succeeds but immediately hits the
+# delimiter at lane 0), a case where the self-loop class itself contains
+# 'X' as an ordinary member so \w+ and X([a-zA-Z]+)# both fire on the same
+# string (S6), and cross-run register contamination between two capture
+# groups at different chunk alignments (S7, via localSkipStart re-snapshot).
+# Note: X([a-zA-Z]+)Y (trailing literal inside the self-loop class) would
+# route to Backtracking via hasAmbiguousCaptures, not TDFA — see task 13 in
+# plans/TODO.md — so the trailing delimiter here is '#', not a letter.
+#
+# Expected values cross-checked against Go's regexp package (--validate-go)
+# before being committed to this fixture.
+# ============================================================
+Cat31TDFABulkSkipGapF
+strings
+""
+"aaaaaaaaaaaaaaaa"
+"aaaaaaaaaaaaaaaaa"
+"<qwertyuiopasdfghjklzxcvbnm>"
+"aaaaaaaaaaaaaaaa bbbbbbbbbbbbbbb"
+"XabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ#"
+"aaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbb"
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+regexps
+"(\\w+)"
+-;-;-;-
+0-16 0-16;0-16;-;-
+0-17 0-17;0-17;-;-
+-;1-27;-;-
+0-16 0-16;0-16;-;-
+0-53 0-53;0-53;-;-
+0-20 0-20;0-20;-;-
+0-31 0-31;0-31;-;-
+0-32 0-32;0-32;-;-
+"<([a-z]+)>"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-28 1-27;0-28;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"X([a-zA-Z]+)#"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-54 1-53;0-54;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"(\\w+) (\\w+)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-32 0-16 17-32;0-32;-;-
+-;-;-;-
+0-44 0-20 21-44;0-44;-;-
+-;-;-;-
+-;-;-;-

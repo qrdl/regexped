@@ -787,6 +787,44 @@ var tests = []testCase{
 		matchInput:   setShuftiLNMInput(true),
 		nomatchInput: setShuftiLNMInput(false),
 	},
+	{
+		// Gap F target: (\w+) TDFA capture body is a single state that
+		// self-loops on 63 of 256 bytes with a uniform set-to-pos tag op.
+		// matchInput anchors a 10 KB run of \w bytes so the SIMD bulk-skip
+		// dominates the scan; nomatchInput starts with a non-word byte so
+		// the anchored capture fails immediately at pos 0.
+		name:         "tdfa-bulk-skip-word-class",
+		pattern:      `(\w+)`,
+		mode:         modeGroups,
+		notes:        "TDFA dominant self-loop on \\w (63 bytes) — Gap F target",
+		matchInput:   strings.Repeat("aB3_", 2560) + "!",
+		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
+	},
+	{
+		// Gap F target: <([a-z]+)> — smaller self-loop class (26 bytes)
+		// than the \w case, closer to the detector's min-size floor.
+		name:         "tdfa-bulk-skip-lower-class",
+		pattern:      `<([a-z]+)>`,
+		mode:         modeGroups,
+		notes:        "TDFA dominant self-loop on [a-z] (26 bytes) — Gap F target",
+		matchInput:   "<" + strings.Repeat("qwertyuiopasdfghjklzxcvbnm", 400) + ">",
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Gap F target: X([a-zA-Z]+)# — 52-byte self-loop class, exercises
+		// a larger Shufti table (7 halves-of-8) than the \w case's 8 halves.
+		// Trailing delimiter deliberately NOT a member of [a-zA-Z] (unlike a
+		// literal Y, which overlaps the class and routes to Backtracking via
+		// hasAmbiguousCaptures — see plans/TODO.md task 13's open finding on
+		// X([a-zA-Z]+)Y-shaped patterns; this case must stay off that gate to
+		// actually exercise TDFA/Gap F).
+		name:         "tdfa-bulk-skip-letter-class",
+		pattern:      `X([a-zA-Z]+)#`,
+		mode:         modeGroups,
+		notes:        "TDFA dominant self-loop on [a-zA-Z] (52 bytes) — Gap F target",
+		matchInput:   "X" + strings.Repeat("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 200) + "#",
+		nomatchInput: configInput(nil),
+	},
 }
 
 // --------------------------------------------------------------------------
