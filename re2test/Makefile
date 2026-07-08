@@ -1,4 +1,4 @@
-.PHONY: test exhaustive custom adjusted sets likelymatch likelynomatch clean
+.PHONY: test exhaustive custom adjusted sets likelymatch likelynomatch force-backtrack-likelynomatch clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -45,7 +45,22 @@ likelynomatch: $(ADJUSTED)
 	go run . --likelynomatch --validate-groups $(ADJUSTED)
 	go run . --likelynomatch --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch sets
+# Run every test with the DFA forced to overflow (--force-backtrack, so
+# find/match always fall back to Backtracking) AND under
+# LikelyMode=LikelyNoMatch. This is the combination that exercises BT's own
+# Action 5 prefix-scan path (compile/engine_backtrack.go buildBTFindBody)
+# across the full corpus: --force-backtrack alone never sets LikelyNoMatch,
+# and --likelynomatch alone rarely forces BT (only for patterns whose DFA
+# already overflows MaxDFAStates), so neither flag on its own reaches this
+# code path at any real scale. Regression test for plans/TODO.md task 16
+# (buildBTFindBody's v128-local allocation silently emitted invalid WASM for
+# first-byte sets of 17..64 bytes routed through the Shufti path).
+force-backtrack-likelynomatch: $(ADJUSTED)
+	go run . --force-backtrack --likelynomatch $(TESTDATA)
+	go run . --force-backtrack --likelynomatch --validate-groups $(ADJUSTED)
+	go run . --force-backtrack --likelynomatch --validate-groups $(CUSTOM)
+
+test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch sets
 
 sets: $(TESTDATA)
 	go run . --sets $(TESTDATA)

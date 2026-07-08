@@ -159,8 +159,8 @@ Adds, on top of neutral:
 |---|---|---|---|
 | DFA | ✅ all defaults | ✅ Opt 2 active | ✅ Action 5 active |
 | Compiled DFA | ✅ | ✅ | ✅ |
-| TDFA | ✅ defaults + Gap F bulk-skip (mode-independent) | ⚠️ LM only affects the *DFA fallback path* if a lit-chain shape matches before TDFA is chosen; no LM-specific TDFA code | ❌ no LNM-specific code |
-| Backtracking | ✅ (defaults only — Phase 2/3/5 don't apply since BT is structurally different) | ❌ no BT-specific code | ❌ no BT-specific code |
+| TDFA | ✅ defaults + Gap F bulk-skip (mode-independent) | ⚠️ LM only affects the *DFA fallback path* if a lit-chain shape matches before TDFA is chosen; no LM-specific TDFA code, and none is needed — see *why LM doesn't need TDFA-specific code* below | ✅ Action 5 active — not via TDFA-specific code, but via the shared DFA **find wrapper** that locates the candidate start for non-anchored capture patterns before TDFA extracts captures; see *the find-wrapper mechanism* below |
+| Backtracking | ✅ (defaults only — Phase 2/3/5 don't apply since BT is structurally different) | ❌ no BT-specific code, and none is needed — see *why LM doesn't need BT-specific code* below | ✅ Action 5 active on two independent paths — BT's own `find_func`-only DFA-too-large fallback, and the same shared find wrapper TDFA uses for non-anchored capture patterns; see below |
 
 **Compiled DFA** is the DFA emission with hybrid (literal-chain) dispatch
 applied; it inherits every LM/LNM code path the DFA engine has.
@@ -178,19 +178,95 @@ compile pipeline tries the LM lit-chain capture path *before* falling
 through to TDFA — so for patterns where a lit-chain capture body exists,
 `LikelyMatch` replaces the TDFA emission entirely with a faster lit-chain
 emission. If the pattern doesn't qualify for lit-chain, TDFA (with Gap F
-applied automatically, if eligible) is used and the hint has no further
-effect.
+applied automatically, if eligible) is used and `LikelyMatch` has no
+further effect (verified: `LikelyNeutral` and `LikelyMatch` produce
+byte-identical WASM for TDFA-routed patterns that need a find wrapper —
+Opt 1, the only thing that could differ, is already unconditional).
+`LikelyNoMatch` is a different story — see *the find-wrapper mechanism*
+below.
 
 **Backtracking** is selected for patterns the DFA/TDFA can't handle (e.g.
 non-greedy quantifiers, large state count, ambiguous captures). The
-backtracking emission contains no `LikelyMode` checks. The hint has no
-effect.
+backtracking capture-body/match-body emission contains no `LikelyMode`
+checks, and — for `match_func`/`groups_func` on an anchored pattern — the
+hint genuinely has no effect, since anchored bodies start at position 0 and
+never run a scan for the hint to influence. But BT's `find_func`-only path
+(used when the pattern's DFA exceeds `MaxDFAStates`/`MaxDFAMemory`) *does*
+run a scan, via the same shared `emitPrefixScan` the DFA engine uses
+(`compile.go:836` threads `LikelyMode == LikelyNoMatch` into
+`btScanParams.LikelyNoMatch`) — see *the find-wrapper mechanism* below for
+why this was broken until 2026-07-08.
 
-> **Gap (see *Known gaps* §3):** the `LikelyMode` *hint* has no mode-specific
-> effect on TDFA or Backtracking. Users running these engines see no benefit
-> from setting the hint (Gap F is an unconditional engine-level improvement,
-> not something the hint unlocks), and there's no compile-time warning to
-> that effect.
+### The find-wrapper mechanism (why LNM reaches TDFA and Backtracking capture patterns too)
+
+A capture pattern that isn't inherently anchored (`needGroups && !anchored`
+in `compilePattern`, [compile/compile.go:761](../compile/compile.go)) gets
+**two** compiled bodies, not one: a `findBody` that scans for the candidate
+match start, and a separate `captureBody` (TDFA or Backtracking) that
+re-runs anchored from that candidate to fill in capture slots. The
+`findBody` is always the standard DFA find emission
+(`appendFindCodeEntry`, [compile/compile.go:1022](../compile/compile.go)) —
+completely independent of which engine ends up handling `captureBody` — and
+it sets `l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch`
+unconditionally ([compile/compile.go:1020](../compile/compile.go)), exactly
+like a plain `find_func`-only pattern.
+
+This means **`LikelyNoMatch` has a real, measurable effect on patterns
+whose captures are extracted by TDFA or Backtracking** — just not through
+any TDFA/BT-specific code. Confirmed by direct compilation:
+`[a-zA-Z]{20}(\d+)` (routes captures to TDFA, needs a find wrapper) compiles
+to 13,812 B under `LikelyNeutral` vs 14,278 B under `LikelyNoMatch`
+(byte-different — Action 5 fired); `[a-zA-Z]{20}([^,]+),` (ambiguous
+capture, routes to Backtracking) compiles to 9,473 B vs 9,939 B, same
+effect. `LikelyMatch` produces byte-identical output to `LikelyNeutral` in
+both cases (Opt 1 is already unconditional; Opt 2 doesn't apply outside the
+lit-chain shape). This mechanism is exercised across the whole re2-adjusted
+corpus by `re2test --likelynomatch --validate-groups` (1,878,840 cases, 0
+failures) — it just wasn't called out in this doc, or in the engine/host
+support matrices, before 2026-07-08.
+
+### Why LM doesn't need TDFA-specific code
+
+`LikelyMatch`'s only unique contribution is Opt 2, the counted-chain SIMD
+verifier for `<lit><charclass>{N}`-shaped bodies. The compile pipeline
+checks for that shape and intercepts it — replacing the emission entirely —
+*before* the engine selector ever considers TDFA
+([compile/compile.go:373](../compile/compile.go), gated on
+`LikelyMode == LikelyMatch && needGroups`, runs ahead of the TDFA/BT
+selection logic). So by construction, any capture pattern that actually
+reaches TDFA already isn't lit-chain-shaped — Opt 2's condition and "reaches
+TDFA" are mutually exclusive. There is no missing optimisation to port into
+TDFA; the shape LM targets is siphoned off earlier in the pipeline.
+
+### Why LM doesn't need BT-specific code
+
+Investigated directly (see [plans/TODO.md](../plans/TODO.md) task 16). LM's
+two mechanisms — the counted-chain SIMD verifier and the dominant
+self-loop bulk-skip — both require a DFA-style transition table to detect
+"this state is dominant" or "this is a fixed-length class chain." BT is
+reached specifically for patterns that already failed those exact
+structural gates (ambiguous captures, non-greedy quantifiers, huge state
+counts) — precisely the population least likely to have a clean
+single-state self-loop or counted chain left to exploit; that's *why* they
+fell through past DFA/TDFA in the first place. Porting either mechanism to
+BT would mean writing new detection and emission logic from scratch against
+BT's stack-based per-instruction dispatch, with no code reuse from the
+existing DFA/TDFA implementations, for a payoff nobody has observed yet.
+CLAUDE.md's own "Gap I" lesson is the relevant caution here: "looks like an
+obvious win" has repeatedly cost real engineering time on this exact
+population once actually measured. Confirmed empirically: BT fuel/time was
+byte-identical between `LikelyNeutral` and `LikelyMatch` in every
+measurement taken during the task 16 investigation. Declined pending a
+concrete BT-routed pattern shape that would make the detection cheap.
+
+> **Gap (see *Known gaps* §3):** there is no compile-time warning when a
+> user sets `LikelyMatch` on a pattern that ends up on TDFA or Backtracking
+> with no lit-chain shape — the hint is silently a no-op beyond what's
+> already unconditional. `LikelyNoMatch`, by contrast, is *not* a no-op for
+> either engine (see *the find-wrapper mechanism* above), so this gap is
+> narrower than it used to be: it's specifically "no warning that
+> `LikelyMatch` did nothing extra," not "no warning that the hint did
+> nothing at all."
 
 ---
 
@@ -249,15 +325,17 @@ regexps:
 |---|---|---|---|
 | `match_func` | All Phase 4 + Action 3 defaults + non-mid dominant dispatch | Lit-chain match body (Opt 2) | Action 5 |
 | `find_func` | All Phase 2/3/5 + lit-anchor + Action 3 defaults + non-mid dominant dispatch | Lit-chain find body (Opt 2) + lit-chain capture body if find+groups combo | Action 5 |
-| `groups_func` | TDFA (+ Gap F bulk-skip if eligible) or Backtracking — no LM/LNM hint effect *unless* the pattern is a lit-chain capture shape | Lit-chain capture body (Opt 2 with captures) replaces TDFA/BT entirely | No hint effect (still TDFA / BT; Gap F still applies if eligible) |
+| `groups_func` | TDFA (+ Gap F bulk-skip if eligible) or Backtracking — `LikelyMatch` has no effect *unless* the pattern is a lit-chain capture shape; `LikelyNoMatch` (Action 5) *does* apply, via the shared find wrapper, whenever the pattern isn't fully anchored (needs a scan to locate the candidate before TDFA/BT extracts captures) | Lit-chain capture body (Opt 2 with captures) replaces TDFA/BT entirely | Action 5 on the find wrapper for non-anchored patterns (no effect on fully-anchored patterns — nothing to scan); see *the find-wrapper mechanism* in the *Engine support matrix* section |
 | `named_groups_func` | Same as `groups_func` | Same as `groups_func` | Same as `groups_func` |
 
-For capture-returning host functions the rule of thumb is: **`LikelyMatch` is
-the only setting that has any effect**, and only when the pattern is one of the
-lit-chain capture shapes (strict alternation of `<lit><charclass>{N,M}` with
-captures, prefixed lit-chain `<class>{N}<lit>...`, etc.). All other capture
-patterns fall through to TDFA or Backtracking, both of which ignore
-`LikelyMode`.
+For capture-returning host functions the rule of thumb is: **`LikelyMatch`
+only has an effect** when the pattern is one of the lit-chain capture shapes
+(strict alternation of `<lit><charclass>{N,M}` with captures, prefixed
+lit-chain `<class>{N}<lit>...`, etc.) — all other capture patterns fall
+through to TDFA or Backtracking, both of which ignore `LikelyMatch`.
+**`LikelyNoMatch` is different**: it has an effect on any capture pattern
+that isn't fully anchored, regardless of which engine (TDFA or Backtracking)
+ends up extracting the captures — see *the find-wrapper mechanism* above.
 
 ---
 
@@ -319,6 +397,12 @@ to be a `LikelyMatch`-only target before Task 7 Step 2.
   size band the density heuristic would route to scalar, on inputs dominated
   by bytes outside the set (so the SIMD scan amortises better than the
   byte-by-byte scalar early-exit).
+
+**Same first-byte-set shape, on a non-anchored capture pattern** — e.g.
+`[a-zA-Z]{20}(\d+)` or `[a-zA-Z]{20}([^,]+),`: the shared find wrapper that
+locates the candidate before TDFA/Backtracking extracts captures uses the
+exact same density heuristic and Action 5 override. See *the find-wrapper
+mechanism* in the *Engine support matrix* section.
 
 ### Shapes benefiting from Gap F (unconditional — every `LikelyMode`, TDFA only, since 2026-07-06)
 
@@ -413,21 +497,30 @@ No-match (anchored fail at pos 0) fuel/time unaffected in all three cases.
 
 ## Known gaps
 
-### 1. No user-facing way to set the hint
+### 1. No CLI flag to set the hint (corrected 2026-07-08 — the YAML field already shipped)
 
-`LikelyMode` is reachable only through Go API (`compile.CompileOptions`).
-Neither `config.BuildConfig` nor `config.RegexEntry` has a `likely_mode` (or
-similar) field, and the `regexped compile` CLI accepts no `--likely-match` /
-`--likely-no-match` flag.
+An earlier version of this doc claimed there was no user-facing way to set
+`LikelyMode` at all. That's stale — sub-task H.1 from
+[plans/LIKELY.md](../plans/LIKELY.md) (Gap H — Sets) has already shipped,
+verified directly against the code (2026-07-08): `config.RegexEntry`,
+`config.SetConfig`, and `config.BuildConfig` all have a `likely_mode` YAML
+field ([config/config.go](../config/config.go), lines 26/44/208), validated
+by `ValidLikelyMode`/`validateLikelyModes`, and resolved via the
+`resolveLikelyMode` precedence chain (pattern → enclosing set → global
+default → `LikelyNeutral`) in both `CmdCompile`
+([compile/compile.go:1439](../compile/compile.go)) and `CompileFile`'s
+per-pattern and per-set loops
+([compile/set_emit.go:704,716,792,801](../compile/set_emit.go)). The
+per-pattern override also applies inside `compilePattern` itself
+([compile/compile.go:358](../compile/compile.go)) unconditionally — so it
+works for direct `compile.Compile()` callers too, not just YAML-driven
+`CmdCompile`, as long as the caller populates `RegexEntry.LikelyMode`.
 
-`CmdCompile` ([compile/compile.go:1227](../compile/compile.go#L1227)) builds
-`CompileOptions` from only `MaxDFAStates` and `MaxTDFARegs`.
-
-**Planned fix:** sub-task H.1 in [plans/LIKELY.md](../plans/LIKELY.md) (Gap
-H — Sets). Adds three optional `likely_mode` fields — on `RegexEntry`
-(per-pattern), on `SetConfig` (per-set, controls frontend strategy), and on
-`BuildConfig` (global default) — resolved by a layered precedence rule.
-Same change closes gap #6 below.
+What's genuinely still missing: **no CLI flag.** `regexped compile` accepts
+no `--likely-match` / `--likely-no-match` flag — the hint is YAML-only
+(`likely_mode: match|nomatch|neutral` in the config file). For a tool whose
+primary interface is YAML config rather than ad-hoc CLI flags, this is a
+narrow gap, not the "no user-facing way at all" originally claimed.
 
 ### 2. `Action 5` doesn't match the original LNM.md spec
 
@@ -441,37 +534,78 @@ density heuristic — it doesn't compute or use the body accept set.
 The real impossible-byte-SIMD scan was not shipped; it remains a candidate
 for future work.
 
-### 3. TDFA and Backtracking engines ignore the `LikelyMode` hint
+### 3. `LikelyMatch` is a no-op on TDFA/Backtracking-routed patterns outside the lit-chain shape (corrected 2026-07-08 — `LikelyNoMatch` is *not* a no-op)
 
-The `LikelyMode` *hint* has no effect on patterns that compile to TDFA or
-Backtracking — setting `LikelyMatch`/`LikelyNoMatch` produces bit-identical
-WASM to `LikelyNeutral` for these engines (outside the lit-chain fallback
-case noted in the engine matrix above). There is no compile-time warning,
-log line, or doc note pointing this out to users when they set the hint on
-a pattern that ends up on one of those engines.
+An earlier version of this doc claimed the `LikelyMode` hint "has no effect"
+on patterns that compile to TDFA or Backtracking. That was wrong for
+`LikelyNoMatch`, and the wrongness hid a real bug (see [plans/TODO.md](../plans/TODO.md)
+task 16). Two things are actually true, and they're different for the two
+non-neutral modes:
 
-This is a gap in the *hint mechanism* specifically, not in TDFA's
-optimisation coverage generally — TDFA gained a real, mode-independent
-optimisation of its own (Gap F, 2026-07-06) that fires automatically for
-qualifying capture patterns regardless of what `LikelyMode` is set. A user
-relying on the hint to know whether TDFA output will be optimised would
-still be misled (the hint tells them nothing either way), which is the
-actual gap.
+- **`LikelyMatch`** genuinely is a no-op on TDFA/Backtracking-routed
+  patterns, outside the lit-chain interception case already covered by the
+  engine matrix above — see *why LM doesn't need TDFA-specific code* / *why
+  LM doesn't need BT-specific code* in the *Engine support matrix* section.
+  Setting it produces bit-identical WASM to `LikelyNeutral` for these
+  engines in every other case.
+- **`LikelyNoMatch`** is *not* a no-op. It reaches TDFA- and
+  Backtracking-routed patterns through the shared DFA find-wrapper (for
+  non-anchored capture patterns) and, for Backtracking specifically, through
+  BT's own `find_func`-only DFA-too-large fallback — see *the find-wrapper
+  mechanism* in the *Engine support matrix* section above for the mechanism
+  and measured WASM-size deltas.
+
+The remaining gap is narrower than originally stated: there is no
+compile-time warning, log line, or doc note telling a user whether
+`LikelyMatch` did anything for their specific pattern (since whether it did
+depends on the lit-chain shape check, which the user can't easily predict
+without calling `compile.SelectEngine`). There's no such ambiguity for
+`LikelyNoMatch` — it either changes the WASM (find-mode or non-anchored
+capture patterns) or the pattern is fully anchored and never scans, in which
+case no hint could have an effect regardless of engine.
+
+This is also a gap in the *hint-transparency* mechanism specifically, not
+in TDFA's optimisation coverage generally — TDFA gained a real,
+mode-independent optimisation of its own (Gap F, 2026-07-06) that fires
+automatically for qualifying capture patterns regardless of what
+`LikelyMode` is set. A user relying on `LikelyMatch` to know whether TDFA
+output will be optimised would still be misled (the hint tells them nothing
+either way about Gap F), which is the actual remaining gap.
 
 Users can determine which engine a pattern uses via
 `compile.SelectEngine(pattern, opts)`. There is currently no mechanism to
-emit a "hint ignored" warning, e.g. through `slog`.
+emit a "hint had no additional effect" warning, e.g. through `slog`.
 
-### 4. Sets path drops `LikelyMode`
+### 4. Sets frontend has the hint; sets suffix bodies don't consume their per-pattern hint yet (corrected 2026-07-08)
 
-When the YAML config contains a `sets:` block, the entire compile path —
-including per-pattern entries — goes through `CompileFile` which builds
-`CompileOptions` from only `MaxDFAStates` and `MaxTDFARegs`. Even if gap 1
-were fixed and `LikelyMode` were threaded through `CmdCompile` for the
-no-sets path, the sets path would still discard it.
+An earlier version of this doc claimed the sets path drops `LikelyMode`
+entirely. That's stale — verified directly against the code (2026-07-08):
+`CompileFile` reads `cfg.LikelyMode`, `sc.LikelyMode` (per-set), and
+`re.LikelyMode` (per-pattern) and resolves all three through the same
+precedence chain as the no-sets path
+([compile/set_emit.go:704,716,792,801](../compile/set_emit.go)) — this is
+sub-task H.1 from [plans/LIKELY.md](../plans/LIKELY.md) Gap H, shipped. The
+per-pattern suffix-DFA bodies (compiled via the same `compilePattern` as
+non-set patterns, [compile/set_emit.go:722](../compile/set_emit.go)) get
+their own hint correctly. The **set frontend** (Teddy/AC/Shufti/scalar
+selection over the union of literal prefixes) also has it — H.3's
+density-gate Action 5 override is live (`frontendShufti` in
+[compile/set.go:611](../compile/set.go), gated on
+`shuftiBeatsScalar(...) || setLikelyMode == LikelyNoMatch`).
 
-This is a one-line fix in `CompileFile` once gap 1 is resolved (read
-`cfg.LikelyMode` and copy it into `opts.LikelyMode`).
+What's genuinely still missing: **sub-task H.2** — `buildSetSuffixBody`
+(the per-pattern-in-a-set DFA loop that finds match boundaries within a
+set, [compile/engine_dfa.go:2405](../compile/engine_dfa.go)) doesn't have
+the dominant-self-loop bulk-skip that single-pattern `buildFindBody` has
+had since Task 7. The per-pattern resolved hint is computed and stored on
+`CompileSetOptions.PatternLikelyModes`
+([compile/set_emit.go:797-802](../compile/set_emit.go)) but nothing reads
+it yet — the field exists only as plumbing for H.2, which was never
+implemented. This is a real, open, narrow gap: sets containing long-body
+patterns (e.g. `ERROR:[^\n]+` as a set member) don't get the bulk-skip win
+that the same pattern would get compiled standalone. Not tracked as its own
+entry in [plans/TODO.md](../plans/TODO.md) — worth adding if this is picked
+up.
 
 ### 5. Three Opt-1-eligible pattern shapes regress on the no-match path — for every mode, not just `LikelyMatch`
 
@@ -493,22 +627,24 @@ much larger match-path win once the side-table dispatch was fixed) but it
 means the framing changed: it's a property of the pattern shape now, not
 something users "opt into" via `LikelyMatch`.
 
-### 6. `LikelyMode` is per-Compile-call, not per-pattern
+### 6. RESOLVED 2026-07-08 — `LikelyMode` is per-pattern, not just per-Compile-call
 
-A single `compile.Compile` invocation applies one `LikelyMode` to every entry
-in the call. If a user has 50 patterns and one of them is match-heavy while
-the other 49 are no-match-heavy, they'd need to split the patterns across
-multiple Compile calls (and merged WASM modules) to apply different hints.
-
-**Planned fix:** sub-task H.1 in [plans/LIKELY.md](../plans/LIKELY.md) (Gap
-H — Sets). Per-pattern `likely_mode` on `RegexEntry` lets each pattern
-carry its own hint; `compilePattern` derives `opts.LikelyMode` from a
-precedence chain (pattern → enclosing set → global default) instead of
-from a single per-call value. Same change closes gap #1 above. For sets,
-the dual-level design (per-pattern + per-set hints) lets the set frontend
-and per-pattern suffix bodies pick their best strategies independently —
-the canonical motivating use case is mixed-priority sets where the
-frontend wants one bias and individual patterns want another.
+An earlier version of this doc claimed a single `compile.Compile` invocation
+applies one `LikelyMode` to every entry, forcing users with mixed
+match-heavy/no-match-heavy patterns to split them across multiple `Compile`
+calls. That's stale — sub-task H.1 shipped: `config.RegexEntry.LikelyMode`
+lets each pattern carry its own hint, and `compilePattern` applies it
+unconditionally ([compile/compile.go:358](../compile/compile.go)) — this
+runs for *every* caller of `compilePattern`, including direct
+`compile.Compile()` callers who never go through YAML/`CmdCompile` at all,
+as long as they populate `RegexEntry.LikelyMode` on each entry.
+`CompileOptions.LikelyMode` remains a single per-call value, but it's now
+correctly just the *fallback default* for entries that don't set their own
+`LikelyMode` — not a hard per-call ceiling. For sets, the dual-level design
+(per-pattern + per-set hints, both live — see gap #4 above) lets the set
+frontend and per-pattern suffix bodies pick independently, closing the
+"mixed-priority sets" motivating case too (modulo H.2 not yet consuming the
+per-pattern hint for the suffix-body bulk-skip itself).
 
 ---
 
@@ -532,6 +668,9 @@ frontend wants one bias and individual patterns want another.
 - [plans/TODO.md](../plans/TODO.md) — task 7 (default-on rollout) decisions;
   task 12 (Gap F pre-implementation measurement); task 13 (open —
   `hasAmbiguousCaptures` possibly over-conservative for
-  `X([a-zA-Z]+)Y`-shaped patterns); task 15 (Gap F implementation record).
+  `X([a-zA-Z]+)Y`-shaped patterns); task 15 (Gap F implementation record);
+  task 16 (BT's `LikelyNoMatch` find-fallback bug found and fixed; the
+  find-wrapper mechanism uncovered as a side effect; `LikelyMatch` on BT
+  investigated and declined).
 - [plans/non_mid_extension.go.archive](../plans/non_mid_extension.go.archive) — archived side-table non-mid dispatch (replaced by state-ID compares).
 - [docs/engines.md](engines.md) — engine selection rules.
