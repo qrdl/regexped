@@ -150,7 +150,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 
 		case line == "strings":
 			if setsMode && !inStrings && len(setBlockEntries) >= 2 {
-				p, f, setStats, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+				p, f, setStats, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose, likelyMatch, likelyNoMatch)
 				prevPassSet := npassSet
 				npassSet += p
 				nfailSet += f
@@ -695,7 +695,7 @@ done:
 
 	// Test the final block (not triggered by a "strings" line).
 	if setsMode && !stopped && !inStrings && len(setBlockEntries) >= 2 {
-		p, f, setStats, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose)
+		p, f, setStats, testErr := testSetBlock(setBlockEntries, setBlockStrings, engine, wd, verbose, likelyMatch, likelyNoMatch)
 		prevPassSet := npassSet
 		npassSet += p
 		nfailSet += f
@@ -781,6 +781,8 @@ func testSetBlock(
 	engine *wasmtime.Engine,
 	wd *watchdog,
 	verbose bool,
+	likelyMatch bool,
+	likelyNoMatch bool,
 ) (npass, nfail int, stats testSetBlockStats, err error) {
 	type eligibleEntry struct {
 		orig  int // index into entries
@@ -807,8 +809,15 @@ func testSetBlock(
 	for i, e := range eligible {
 		regexps[i] = config.RegexEntry{Pattern: e.entry.pattern}
 	}
+	likelyMode := ""
+	if likelyMatch {
+		likelyMode = "match"
+	} else if likelyNoMatch {
+		likelyMode = "nomatch"
+	}
 	cfg := config.BuildConfig{
-		Regexps: regexps,
+		Regexps:    regexps,
+		LikelyMode: likelyMode,
 		Sets: []config.SetConfig{
 			{Name: "test", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
 		},

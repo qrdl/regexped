@@ -716,6 +716,22 @@ var tests = []testCase{
 		nomatchInput: setCountedChainInput(false),
 	},
 	{
+		// Task 17 target: non-mid-accept dominant body in a set. `<[^>]+>`'s
+		// suffix DFA has one dominant self-loop state (on non-'>') that is
+		// NOT itself an accept point — you need the closing '>' before any
+		// match completes, unlike set-log-line-bodies' `[^\n]+` (mid-accept,
+		// already unconditional per Gap H.2's mid path). This is the
+		// LikelyMatch-gated remainder: buildSetSuffixBody's non-mid dispatch
+		// only fires when at least one pattern in the bucket resolves to
+		// LikelyMatch.
+		name:         "set-nonmid-dominant-tags",
+		setPatterns:  []string{`<[^>]+>`},
+		mode:         modeSet,
+		notes:        "set with non-mid-accept dominant body — task 17 (Gap H.2 non-mid remainder) target",
+		matchInput:   setNonMidDominantInput(true),
+		nomatchInput: setNonMidDominantInput(false),
+	},
+	{
 		// Task 8 target: pattern with greedy class quantifier followed by a
 		// required suffix that doesn't appear anywhere. From every starting
 		// position the DFA self-loops through the same letter run and dies
@@ -1166,6 +1182,33 @@ func setCountedChainInput(withMatches bool) string {
 		b = append(b, []byte(secrets[idx%len(secrets)])...)
 		b = append(b, ' ')
 		idx++
+	}
+	return string(b[:targetSize])
+}
+
+// setNonMidDominantInput builds ~50 KB of mixed text for the task 17 set
+// test case (`<[^>]+>`).
+// When withMatches is true: many small HTML-ish tags interleaved with
+// prose, so the dominant non-mid-accept body (self-loop on non-'>') has
+// bytes to bulk-skip across many separate tags.
+// When false: prose with no '<' at all, so the DFA never enters the
+// dominant state — used to confirm the no-match path's cost (a real,
+// small, expected regression per Task 7 step 2 precedent) is measured
+// accurately, not accidentally masked by matches.
+func setNonMidDominantInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	prose := "the quick brown fox jumps over the lazy dog. "
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, prose...)
+		}
+		return string(b[:targetSize])
+	}
+	var b []byte
+	for len(b) < targetSize {
+		b = append(b, prose...)
+		b = append(b, `<div class="container-fluid-wrapper">`...)
 	}
 	return string(b[:targetSize])
 }

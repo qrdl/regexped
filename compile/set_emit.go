@@ -165,19 +165,29 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	buckets := binPack(spec.Patterns, opts, diag)
 
 	// Build per-bucket pattern-ID mapping: patternIDs[bucketIdx][bitPos] = globalID.
+	// likelyModes[bucketIdx][bitPos] mirrors it with the pattern's resolved
+	// LikelyMode (task 17 / Gap H.2 remainder — non-mid dominant bulk-skip
+	// gate), read from opts.PatternLikelyModes at the same spec.Patterns
+	// index k used to resolve the global ID.
 	patternIDs := make([][]int, len(buckets))
+	likelyModes := make([][]LikelyMode, len(buckets))
 	for bi, b := range buckets {
 		ids := make([]int, len(b.patterns))
+		modes := make([]LikelyMode, len(b.patterns))
 		for j, p := range b.patterns {
 			// Find this pattern in spec.Patterns to get its global ID.
 			for k, sp := range spec.Patterns {
 				if sp == p {
 					ids[j] = spec.PatternIDs[k]
+					if k < len(opts.PatternLikelyModes) {
+						modes[j] = opts.PatternLikelyModes[k]
+					}
 					break
 				}
 			}
 		}
 		patternIDs[bi] = ids
+		likelyModes[bi] = modes
 	}
 
 	// Determine frontend and collect unique literals.
@@ -255,7 +265,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	tableOffset := opts.TableBase // data segment base for this set's tables
 
 	for bi, bkt := range buckets {
-		fnBody, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi])
+		fnBody, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], likelyModes[bi])
 		suffixFnBodies[bi] = fnBody
 		tableOffset = nextOffset // use actual memory end, not encoded size
 		allDataBytes = append(allDataBytes, dataBytes...)

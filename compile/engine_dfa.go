@@ -2698,7 +2698,7 @@ count := byte(1) // transitions
 // patternIDs[k] is the global pattern ID written into the output tuple for bit k.
 // tableBase is the memory address at which this DFA's data will be placed.
 // tableMemIdx is 0 for standalone modules (single memory).
-func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int) (funcBody []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, patternLikelyModes []LikelyMode) (funcBody []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
 	nextTableOffset = int32(tableBase)
 	if t == nil || t.numStates == 0 {
 		// Empty DFA: return 0 (no matches).
@@ -2729,16 +2729,26 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 
 	l := buildDFALayout(t, tableBase, false, true, 0, false, t.hasWordBoundary)
 
-	// LIKELY.md Gap H.2: keep only mid-accept dominants for the
-	// buildSetSuffixBody bulk-skip dispatch. Non-mid-accept dominants would
-	// need a separate LM-gated path (task 7 step 2 precedent) and a per-set
-	// LikelyMode plumbed through to this layer — deferred until H.2 mid path
-	// is proven to win. detectDominantSelfLoop already ran inside
-	// buildDFALayout above; we just filter the recorded slice.
+	// LIKELY.md Gap H.2: mid-accept dominants are always kept for the
+	// buildSetSuffixBody bulk-skip dispatch (default-on, task 7 step 1
+	// precedent — no LikelyMode check needed). Non-mid-accept dominants
+	// (task 17, Gap H.2 remainder) carry the same no-match Cranelift-codegen
+	// cost that made Task 7 step 2's non-mid extension LikelyMatch-gated for
+	// single-pattern find bodies, so they're kept here only when at least
+	// one pattern in the bucket opted into LikelyMatch. detectDominantSelfLoop
+	// already ran inside buildDFALayout above; we just filter the recorded
+	// slice.
 	if len(l.dominantStates) > 0 {
+		allowNonMid := false
+		for _, m := range patternLikelyModes {
+			if m == LikelyMatch {
+				allowNonMid = true
+				break
+			}
+		}
 		filtered := l.dominantStates[:0]
 		for _, info := range l.dominantStates {
-			if info.isMidAccept {
+			if info.isMidAccept || allowNonMid {
 				filtered = append(filtered, info)
 			}
 		}
@@ -3109,6 +3119,34 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 			b = append(b, 0x0B) // end if encoded byte match
 		}
 		b = append(b, 0x0B) // end if midAccept != 0
+
+		// Task 17 (Gap H.2 remainder): non-mid-accept dominant dispatch.
+		// Pure state-ID compare (Task 7 step 2 precedent — no side-table
+		// load), and pure position advancement: updateLastAccept=false, no
+		// per-pattern endPos update here. These states aren't accept points
+		// for any pattern, so bulk-skipping through them doesn't complete
+		// anyone's match — it just moves lScanPos forward faster. Whichever
+		// pattern's match actually completes later (mid/eof/imm-accept,
+		// already handled elsewhere in this loop) picks up the advanced
+		// position naturally. Only present in l.dominantStates when
+		// genSuffixWASM's caller opted at least one bucket pattern into
+		// LikelyMatch (see the allowNonMid filter there) — that's the
+		// no-match Cranelift-codegen cost/benefit trade this mirrors from
+		// Task 7 step 2's single-pattern non-mid extension.
+		for _, info := range l.dominantStates {
+			if info.isMidAccept {
+				continue
+			}
+			b = append(b, 0x20, lState)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, info.state)
+			b = append(b, 0x46)       // i32.eq
+			b = append(b, 0x04, 0x40) // if (state == K)
+			b = emitDominantBulkSkip(b, info.exitBytes, false,
+				lScanPos, paramLen, 0x00, paramPtr,
+				lBulkChunk, lByteClass)
+			b = append(b, 0x0B) // end if
+		}
 	}
 
 	// Per-pattern immediateAccept: write immediately when pattern k is done.
