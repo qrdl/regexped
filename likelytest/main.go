@@ -695,6 +695,27 @@ var tests = []testCase{
 		nomatchInput: setLogLineInput(false),
 	},
 	{
+		// Task 5 target: counted linear chains after a literal anchor —
+		// each pattern's suffix (after the literal) is exactly N states,
+		// each with a single non-dead transition on the same class, no
+		// branching. AKIA[A-Z0-9]{16} is 16 states in [A-Z0-9]; ghp_ is 36
+		// states in [A-Za-z0-9]. Today: literal dispatch (AC/Teddy) finds
+		// the literal, then buildSetSuffixBody walks the suffix DFA table
+		// one byte at a time via genSuffixWASM. Task 5 target: detect the
+		// pure-chain shape and replace that per-byte walk with a single
+		// SIMD nibble-verify (~1 load + 3 ops per 16 bytes instead of
+		// N x table lookups).
+		name: "set-counted-chain-secrets",
+		setPatterns: []string{
+			`AKIA[A-Z0-9]{16}`,
+			`ghp_[A-Za-z0-9]{36}`,
+		},
+		mode:         modeSet,
+		notes:        "set of counted-chain secrets after literal anchor — task 5 (SIMD counted-chain verify) target",
+		matchInput:   setCountedChainInput(true),
+		nomatchInput: setCountedChainInput(false),
+	},
+	{
 		// Task 8 target: pattern with greedy class quantifier followed by a
 		// required suffix that doesn't appear anywhere. From every starting
 		// position the DFA self-loops through the same letter run and dies
@@ -1110,6 +1131,40 @@ func setLogLineInput(withMatches bool) string {
 		b = append(b, '\n')
 		// Some inter-match prose so consecutive matches aren't adjacent.
 		b = append(b, prose...)
+		idx++
+	}
+	return string(b[:targetSize])
+}
+
+// setCountedChainInput builds ~50 KB of mixed text for the task 5 set test
+// case (AKIA[A-Z0-9]{16} / ghp_[A-Za-z0-9]{36}).
+// When withMatches is true: valid secrets of each shape interleaved with
+// prose, so the AC/Teddy literal dispatch fires and the suffix verify
+// (today: per-byte DFA walk; task 5 target: SIMD counted-chain verify) runs
+// to completion on real matches.
+// When false: prose that never contains "AKIA" or "ghp_" as a substring, so
+// the literal dispatch never fires and the suffix verify never runs — used
+// to confirm the no-match path stays regression-free.
+func setCountedChainInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	prose := []byte("the quick brown fox jumps over the lazy dog and they all live happily ever after. ")
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, prose...)
+		}
+		return string(b[:targetSize])
+	}
+	secrets := []string{
+		"AKIAIOSFODNN7EXAMPLE",
+		"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
+	}
+	var b []byte
+	idx := 0
+	for len(b) < targetSize {
+		b = append(b, prose...)
+		b = append(b, []byte(secrets[idx%len(secrets)])...)
+		b = append(b, ' ')
 		idx++
 	}
 	return string(b[:targetSize])

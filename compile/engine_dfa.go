@@ -2710,6 +2710,23 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		return
 	}
 
+	// Task 5 (LIKELY.md opt 2 / Hyperscan "SoME"): a pure counted linear
+	// class chain doesn't need a DFA table walk at all — verify the whole
+	// suffix via SIMD in one shot. Scoped to single-pattern buckets for now
+	// (see isCountedClassChain's doc comment).
+	if len(patternIDs) == 1 {
+		if class, n, ok := isCountedClassChain(t); ok {
+			prefixMaxLen := 0
+			if len(prefixFixedLens) == 1 {
+				prefixMaxLen = prefixFixedLens[0]
+			}
+			body := buildCountedChainSuffixBody(class, n, patternIDs[0], prefixMaxLen)
+			funcBody = utils.AppendULEB128(nil, uint32(len(body)))
+			funcBody = append(funcBody, body...)
+			return funcBody, nil, 0, int32(tableBase)
+		}
+	}
+
 	l := buildDFALayout(t, tableBase, false, true, 0, false, t.hasWordBoundary)
 
 	// LIKELY.md Gap H.2: keep only mid-accept dominants for the

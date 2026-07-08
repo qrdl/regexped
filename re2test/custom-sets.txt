@@ -127,3 +127,38 @@ regexps
 -;-;-;-;-
 -;0-5;-;-;0-5
 -;-;-;-;-
+# ============================================================
+# Category S-Task5: counted-class-chain after literal anchor
+# (TODO.md task 5 — SIMD counted-chain verifier, e.g.
+# genSuffixWASM's isCountedClassChain/buildCountedChainSuffixBody
+# fast path for single-pattern buckets).
+# ============================================================
+SetCountedChainSecrets
+strings
+""
+"no secrets here"
+"AKIAIOSFODNN7EXAMPLE"
+"key=AKIAIOSFODNN7EXAMPLE end"
+"AKIAIOSFODNN7EXAMPL"
+"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+"token ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab here"
+"both AKIAIOSFODNN7EXAMPLE and ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab together"
+regexps
+"AKIA[A-Z0-9]{16}"
+-;-;-;-;-
+-;-;-;-;-
+-;0-20;-;-;0-20
+-;4-24;-;-;4-24
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;5-25;-;-;5-25
+"ghp_[A-Za-z0-9]{36}"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-40;-;-;0-40
+-;6-46;-;-;6-46
+-;30-70;-;-;30-70
