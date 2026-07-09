@@ -4573,6 +4573,82 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 	return append(sz, b...)
 }
 
+// buildSimplePrefixCheckBody is a drop-in replacement for
+// buildLitAnchorBackScanBody, used when the lit-anchor prefix qualifies as
+// simpleClassPrefix (a bare `[class]{M}`, M in [1,16] — see lit_anchor.go).
+// Same signature and return semantics as buildLitAnchorBackScanBody —
+// (ptr i32, scan_end i32) → i32, returning the match-start position on
+// success or -1 on failure — so callers (buildLitAnchorFindBody's `call
+// revFuncIdx`) don't need to know which implementation they're calling.
+//
+// Instead of walking backward one byte at a time through a reverse DFA,
+// this verifies all M bytes in one shot with the same SIMD nibble-lookup
+// technique Gap E's emitPrefixClassVerify already uses for
+// `<class>{M}<literal><class>{N}` patterns — reused here unchanged, just
+// reached from the generic lit-anchor path instead of Gap E's bespoke one
+// (see simpleClassPrefix's doc comment for why Gap E's own analyser can't
+// reach this shape when the suffix is unbounded, e.g. `[^\n]+`).
+//
+// LikelyNoMatch-gated at the call site (compile.go) rather than always-on:
+// this is a strict improvement over the generic walk with no runtime
+// trade-off, but it's new code on a path re2test exercises comparatively
+// rarely, so it ships gated first and can be promoted to default-on later
+// once measured across more of the corpus (same rollout precedent as Opt 1).
+func buildSimplePrefixCheckBody(tlo [16]byte, count int) []byte {
+	var b []byte
+
+	// Locals beyond the 2 params: base(2) i32; chunk(3), prefixTlo(4), pow2(5) v128.
+	const (
+		locPtr       = 0
+		locScanEnd   = 1
+		locBase      = 2
+		locChunk     = 3
+		locPrefixTlo = 4
+		locPow2      = 5
+	)
+	b = append(b, 0x02, 0x01, 0x7F, 0x03, 0x7B)
+
+	// base = scan_end + 1  (the position right after the last byte to verify —
+	// same role as `attempt_start` in emitPrefixClassVerify's other caller).
+	b = append(b, 0x20, locScanEnd)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locBase)
+
+	// Hoist v128 tables.
+	b = emitV128Const(b, tlo)
+	b = append(b, 0x21, locPrefixTlo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
+
+	// Bounds: base < count → not enough room for the prefix → -1.
+	b = append(b, 0x20, locBase)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(count))
+	b = append(b, 0x49) // i32.lt_u
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// Class verify (single SIMD chunk); non-zero bad_mask → -1.
+	b = emitPrefixClassVerify(b, count, locPtr, locBase, locChunk, locPrefixTlo, locPow2)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// Match — return base - count (start of the M-byte prefix window).
+	b = append(b, 0x20, locBase)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(count))
+	b = append(b, 0x6B)
+	b = append(b, 0x0B) // end function
+
+	sz := utils.AppendULEB128(nil, uint32(len(b)))
+	return append(sz, b...)
+}
+
 // buildLitAnchorFindBody returns the WASM function body for the literal-anchored find
 // optimisation.  It performs three phases for each candidate position:
 //
@@ -10832,6 +10908,15 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	b = append(b, 0x02)       // 2 local groups
 	b = append(b, 0x07, 0x7F) // 7 × i32
 	b = append(b, 0x05, 0x7B) // 5 × v128
+
+	// Hoist the power-of-two lookup vector once, shared by every lit-chain
+	// branch's class verify (emitLitChainAltLitBranchBody requires the
+	// caller to pre-load VerifyPow2 with pow2VecConst — see its doc
+	// comment). Each branch's VerifyTlo differs per-class and is set
+	// inside emitLitChainAltLitBranchBody itself; VerifyPow2 is the same
+	// constant for all of them, so it belongs here, not per-branch.
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locVerifyPow2)
 
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $lit_outer

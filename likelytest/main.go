@@ -632,21 +632,45 @@ var tests = []testCase{
 		nomatchInput: xmlTagWrappedInput(false),
 	},
 	{
-		// Suggestion 3 target: lit-anchored find with a dominant self-loop
-		// body. Lit-anchor (`findLitAnchorPoint`) requires a 2+ byte
-		// literal CHILD with a non-empty prefix whose reverse DFA's start
-		// state is non-accepting. Counted-chain `{4}` qualifies; unbounded
-		// `+` does not (reverse accepts empty). Pattern shape:
+		// Suggestion 3 target (RESOLVED — see plans/TODO.md task 23,
+		// retracted 2026-07-08): lit-anchored find with a dominant
+		// self-loop body. Lit-anchor (`findLitAnchorPoint`) requires a 2+
+		// byte literal CHILD with a non-empty prefix whose reverse DFA's
+		// start state is non-accepting. Counted-chain `{4}` qualifies;
+		// unbounded `+` does not (reverse accepts empty). Pattern shape:
 		//   prefix `[0-9]{4}` (non-empty, fixed-length) + literal `INFO:`
 		//   (5 bytes) + body `[^\n]+` (mid-accept dominant self-loop).
-		// Today buildLitAnchorFindBody doesn't dispatch dominant bulk-skip
-		// inside its forward DFA, so the body scan is byte-by-byte.
+		// buildLitAnchorFindBody already dispatches dominant bulk-skip
+		// inside its forward DFA (unconditionally, all LikelyMode values) —
+		// that's why the match-side columns below are flat across modes,
+		// not because the optimisation is missing. The genuinely open gap
+		// on this pattern is the no-match side: verifying the `[0-9]{4}`
+		// prefix after an `INFO:` literal hit still walks backward one byte
+		// at a time with no SIMD (plans/TODO.md task 22).
 		name:         "lit-anchor-dominant-body",
 		pattern:      `[0-9]{4}INFO:[^\n]+`,
 		mode:         modeFind,
-		notes:        "lit-anchor + mid-accept dominant body — buildLitAnchorFindBody extension target",
+		notes:        "lit-anchor + mid-accept dominant body — task 22 (backward prefix-scan) target",
 		matchInput:   litAnchorDominantBodyInput(true),
 		nomatchInput: litAnchorDominantBodyInput(false),
+	},
+	{
+		// Task 22 target: a bounded-but-larger class-count prefix
+		// (`{16}`, a trace-ID-style sequence number) before the same
+		// `INFO:` literal + dominant-body suffix shape. A SHORT bounded
+		// count like lit-anchor-dominant-body's `{4}` doesn't actually
+		// stress buildLitAnchorBackScanBody's scalar reverse walk — its
+		// reverse DFA dies after at most 5 steps regardless of how much
+		// digit-class text precedes it, so there's no scaling cost to
+		// show. `{16}` plus a no-match input with 15-digit near-misses
+		// (one short of the required 16) forces the walk through its
+		// full length on every failed candidate before dying.
+		name:         "lit-anchor-false-positive-literal",
+		pattern:      `[0-9]{16}INFO:[^\n]+`,
+		mode:         modeFind,
+		notes:        "lit-anchor backward prefix-scan, 15-digit near-miss false-positives — task 22 target",
+		matchInput:   litAnchorLongPrefixMatchInput(),
+		nomatchInput: litAnchorFalsePositiveInput(),
 	},
 	{
 		// Gap G target: BT find body with a 17..64-byte first-byte set on
@@ -1109,6 +1133,52 @@ func litAnchorDominantBodyInput(withMatches bool) string {
 	}
 	for len(b) < targetSize {
 		b = append(b, prose...)
+	}
+	return string(b[:targetSize])
+}
+
+// litAnchorLongPrefixMatchInput builds ~50 KB of match input for
+// `[0-9]{16}INFO:[^\n]+` (task 22): 2 long matches, each with a full
+// 16-digit prefix immediately before "INFO:".
+func litAnchorLongPrefixMatchInput() string {
+	const targetSize = 50 * 1024
+	prose := []byte("The quick brown fox jumps over the lazy dog. ")
+	bodyFiller := []byte("abcdefghijklmpqrstuvwxyz0123456789 ,.;:-_/=+*<>()[]{}|")
+	var b []byte
+	for i := 0; i < 2; i++ {
+		b = append(b, []byte(fmt.Sprintf("%016d", i+1))...) // 16 digits, matches [0-9]{16}
+		b = append(b, []byte("INFO:")...)
+		bodyStart := len(b)
+		for len(b)-bodyStart < 24*1024 {
+			b = append(b, bodyFiller...)
+		}
+		b = append(b, '\n')
+	}
+	for len(b) < targetSize {
+		b = append(b, prose...)
+	}
+	return string(b[:targetSize])
+}
+
+// litAnchorFalsePositiveInput builds ~50 KB of no-match input for
+// `[0-9]{16}INFO:[^\n]+` (task 22). Scatters "INFO:" occurrences through
+// digit-free filler, each preceded by exactly 15 consecutive digits — one
+// short of the 16 required, so [0-9]{16}INFO: never actually matches, but
+// buildLitAnchorBackScanBody's scalar reverse walk must still consume all 15
+// digit bytes before hitting the non-digit filler and dying. Filler is
+// digit-free so an inserted 15-digit run can never accidentally extend to
+// length >= 16 at a concatenation boundary (which would flip it to a real
+// match — same class of bug as an over-long run always containing a valid
+// trailing window).
+func litAnchorFalsePositiveInput() string {
+	const targetSize = 50 * 1024
+	filler := []byte("the quick brown fox jumps over the lazy dog and other filler words go here forever ")
+	nearMissPrefix := []byte("123456789012345") // 15 digits, one short of 16
+	var b []byte
+	for len(b) < targetSize {
+		b = append(b, filler...)
+		b = append(b, nearMissPrefix...)
+		b = append(b, []byte("INFO:")...)
 	}
 	return string(b[:targetSize])
 }

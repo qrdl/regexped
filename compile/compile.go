@@ -875,6 +875,18 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						revTableBase := utils.PageAlign(l.tableEnd)
 						revL := buildDFALayout(revTable, revTableBase, true, false, 0, false)
 						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
+						// Task 22: when the prefix is a bare `[class]{M}` (M<=16),
+						// a single SIMD chunk verify replaces the scalar reverse
+						// walk above with no runtime trade-off. LikelyNoMatch-gated
+						// for this initial landing (see buildSimplePrefixCheckBody's
+						// doc comment); the unused reverse-DFA table bytes computed
+						// above are harmless dead weight when this fires, not wired
+						// into anything the WASM module executes.
+						if buildOpts.LikelyMode == LikelyNoMatch {
+							if tlo, count, ok := simpleClassPrefix(lap.prefixRe); ok {
+								bsBody = buildSimplePrefixCheckBody(tlo, count)
+							}
+						}
 
 						var litFirstBytes []byte
 						var litFirstByteFlags [256]byte

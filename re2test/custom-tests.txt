@@ -2117,3 +2117,35 @@ regexps
 0-44 0-20 21-44;0-44;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category: lenient alternation (lit-chain branch + DFA branch)
+# ============================================================
+# LenientAltMissingPow2: regression for a LikelyMatch-only bug where
+# buildLitChainAltLenientFindBody's lit-chain branch verify (SIMD path,
+# count>=24) never initialised the shared VerifyPow2 local with
+# pow2VecConst, leaving it zero and making the class verify fail on every
+# byte -- the lit-chain branch (ghp_...) could never match under
+# LikelyMatch, while the DFA branch (aws_secret_access_key...) still
+# worked. Fixed by hoisting emitV128Const(pow2VecConst) once at the top
+# of buildLitChainAltLenientFindBody. This pattern only exercises the
+# affected code path under --likelymatch (Phase 2a: lenient alternation,
+# compile.go's `LikelyMode == LikelyMatch` block) -- run under
+# --likelymatch specifically to catch regressions here, not just neutral.
+LenientAltMissingPow2
+strings
+""
+"ghp_Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01"
+"aws_secret_access_key = wJalrXUtnFEMI7K7wJalrXUtnFEMI7K7wJalrXUt"
+"ghp_Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01!"
+"ghp_Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab0"
+"aws_secret_access_key = wJalrXUtnFEMI7K7wJalrXUtnFEMI7K7wJalrXUt ghp_Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01"
+"ghp_Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01 aws_secret_access_key = wJalrXUtnFEMI7K7wJalrXUtnFEMI7K7wJalrXUt"
+regexps
+"ghp_[A-Za-z0-9]{36}|aws_secret_access_key\\s*=\\s*[0-9a-zA-Z/+]{40}"
+-;-;-;-
+0-40;0-40;-;-
+0-64;0-64;-;-
+-;0-40;-;-
+-;-;-;-
+-;0-64;-;-
+-;0-40;-;-

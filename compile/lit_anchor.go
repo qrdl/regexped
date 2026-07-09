@@ -20,6 +20,74 @@ type litAnchorPoint struct {
 	anchored bool
 }
 
+// simpleClassPrefix reports whether re is a bare `[class]{M}` exact-count
+// repeat (no anchors, no nested concat — just a single class repeated a
+// fixed number of times) with M in [1,16]. This is the shape
+// buildSimplePrefixCheckBody can verify with a single SIMD chunk load
+// instead of buildLitAnchorBackScanBody's generic scalar per-byte reverse
+// walk (plans/TODO.md task 22). Returns the class's SIMD nibble-lookup
+// table (same encoding as litChainBranchInfo.tlo — see analyseLitChainBranch
+// in engine_dfa.go) and M on success.
+//
+// Deliberately narrower than analyseLitChainBranch's prefix handling: that
+// function requires the pattern's *suffix* to also be a bounded class-chain
+// (Gap E), which excludes any prefix ahead of an unbounded suffix like
+// `[^\n]+` (parsed as OpPlus, not OpRepeat) — exactly the shape lit-anchor
+// patterns commonly have. simpleClassPrefix only looks at the prefix, so it
+// applies regardless of what the suffix looks like.
+func simpleClassPrefix(re *syntax.Regexp) (tlo [16]byte, count int, ok bool) {
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpRepeat || re.Min != re.Max || re.Min < 1 || re.Min > 16 {
+		return tlo, 0, false
+	}
+	if len(re.Sub) != 1 {
+		return tlo, 0, false
+	}
+	child := re.Sub[0]
+	for child.Op == syntax.OpCapture && len(child.Sub) == 1 {
+		child = child.Sub[0]
+	}
+	var bitmap [32]byte
+	switch child.Op {
+	case syntax.OpCharClass:
+		for i := 0; i+1 < len(child.Rune); i += 2 {
+			lo, hi := child.Rune[i], child.Rune[i+1]
+			if lo > 127 || hi > 127 {
+				return tlo, 0, false
+			}
+			for r := lo; r <= hi; r++ {
+				bitmap[r>>3] |= 1 << uint(r&7)
+			}
+		}
+	case syntax.OpLiteral:
+		if len(child.Rune) != 1 || child.Rune[0] > 127 {
+			return tlo, 0, false
+		}
+		r := child.Rune[0]
+		bitmap[r>>3] |= 1 << uint(r&7)
+	default:
+		return tlo, 0, false
+	}
+	empty := true
+	for _, b := range bitmap {
+		if b != 0 {
+			empty = false
+			break
+		}
+	}
+	if empty {
+		return tlo, 0, false
+	}
+	for b := 0; b < 128; b++ {
+		if bitmap[b>>3]&(1<<uint(b&7)) != 0 {
+			tlo[b&0xF] |= 1 << uint(b>>4)
+		}
+	}
+	return tlo, re.Min, true
+}
+
 // extractLitSet returns the literal set encoded by re, or nil when re is not
 // a qualifying literal or alternation of literals.
 //
