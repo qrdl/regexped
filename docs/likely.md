@@ -422,7 +422,7 @@ of regexped regardless of the hint, since neither is hint-gated anymore.
 
 ## Known performance numbers
 
-From the [likelytest](../likelytest/) benchmark on 50 KB inputs (unless noted).
+From the [likelytest](../tools/likelytest/) benchmark on 50 KB inputs (unless noted).
 
 ### Opt 1 wins (unconditional, every `LikelyMode`, since Task 7 Step 2 2026-07-05)
 
@@ -489,7 +489,7 @@ No-match (anchored fail at pos 0) fuel/time unaffected in all three cases.
 - **State-ID compare emission for non-mid:** inline in `buildFindBody`, `buildMatchBody`, `buildLitAnchorFindBody`, `emitPhase4Dispatch` — one block per non-mid entry of the form `local.get state; i32.const STATE; i32.eq; if; emitDominantBulkSkip; end`.
 - **Dominant detection:** `detectDominantSelfLoop` and `applyDominantStateEncoding` in [compile/engine_dfa.go](../compile/engine_dfa.go).
 - **Gap F detection + emission:** `detectTDFABulkSkip` / `emitTDFABulkSkip` in [compile/tdfa_bulk_skip.go](../compile/tdfa_bulk_skip.go); hooked into `newTDFA` / `buildTDFAMatchBody` in [compile/engine_tdfa.go](../compile/engine_tdfa.go).
-- **Mode-dispatching test harness:** [re2test/main.go](../re2test/main.go) — `--likelymatch` / `--likelynomatch` flags; [likelytest/main.go](../likelytest/main.go) — three-mode matrix output.
+- **Mode-dispatching test harness:** [re2test/main.go](../re2test/main.go) — `--likelymatch` / `--likelynomatch` flags; [likelytest/main.go](../tools/likelytest/main.go) — three-mode matrix output.
 - **Pattern coverage tests:** [compile/compile_lm_lnm_test.go](../compile/compile_lm_lnm_test.go) — covers every LM/LNM lit-chain pattern shape.
 - **Archived implementation alternatives:** [plans/non_mid_extension.go.archive](../plans/non_mid_extension.go.archive) — the side-table dispatch variant that was reverted in favour of state-ID compares.
 

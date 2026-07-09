@@ -19,6 +19,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -78,17 +79,6 @@ type testCase struct {
 }
 
 var tests = []testCase{
-	{
-		// Counted chain: AKIA + [A-Z0-9]{16}. 17-state linear chain — textbook Opt 2.
-		// Expected once Opt 2 lands: likely-match faster on match-input; no effect on
-		// no-match (Teddy frontend never fires there).
-		name:         "secrets-aws",
-		pattern:      `AKIA[A-Z0-9]{16}`,
-		mode:         modeFind,
-		notes:        "17-state counted chain after literal — Opt 2 target",
-		matchInput:   configInput([]string{"export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"}),
-		nomatchInput: configInput(nil),
-	},
 	{
 		// Counted chain: ghp_ + [A-Za-z0-9]{36}. 37-state chain — Opt 2 target.
 		name:         "secrets-github",
@@ -163,66 +153,11 @@ var tests = []testCase{
 		}),
 		nomatchInput: configInput(nil),
 	},
-	{
-		// Pure dominant self-loop after a literal prefix: [^\n]+ self-loops on
-		// 255/256 byte classes — Opt 1 should bulk-skip those bytes via SIMD.
-		// Match input has many comment lines; no-match has none.
-		name:         "comment-line",
-		pattern:      `//[^\n]+`,
-		mode:         modeFind,
-		notes:        "dominant-self-loop suffix [^\\n]+ — Opt 1 target",
-		matchInput:   sourceInput(true),
-		nomatchInput: sourceInput(false),
-	},
-	{
-		// LNM amplifier: ~50 KB with a handful of very long comment lines.
-		// Each `//` hit enters the [^\n]+ self-loop state and must scan
-		// hundreds of bytes before the next \n. Bulk-skip should turn each
-		// in-comment scan from per-byte DFA into 16-byte SIMD strides.
-		name:         "comment-line-large",
-		pattern:      `//[^\n]+`,
-		mode:         modeFind,
-		notes:        "long-line comments — Opt 1 bulk-skip amplifier",
-		matchInput:   longCommentLineInput(true),
-		nomatchInput: longCommentLineInput(false),
-	},
-	{
-		// URL find: [^\s]+ self-loop after https?://. Slightly less dominant
-		// than [^\n]+ but still ~250/256 transitions self-loop.
-		name:         "url-suffix",
-		pattern:      `https?://[^\s]+`,
-		mode:         modeFind,
-		notes:        "self-loop suffix [^\\s]+ after literal — Opt 1 target",
-		matchInput:   proseInput([]string{"https://example.com/path/to/resource?x=1", "http://api.internal/v2/users/42"}),
-		nomatchInput: proseInput(nil),
-	},
-	{
-		// Phase 5 amplifier: long URL bodies between literal `://` and a
-		// whitespace exit. Exit set `\s` = `\t\n\v\f\r ` (6 bytes), so
-		// Phase 2's single-byte bulk-skip can't fire. Phase 5's Shufti-
-		// style nibble-table SIMD lookup is needed.
-		name:         "url-suffix-large",
-		pattern:      `https?://[^\s]+`,
-		mode:         modeFind,
-		notes:        "multi-byte exit set (\\s) — Phase 5 nibble-lookup target",
-		matchInput:   longURLInput(true),
-		nomatchInput: longURLInput(false),
-	},
 	// ── Shufti prefix-scan targets (LNM Action 3) ───────────────────────
 	// Patterns with no usable literal anchor (no mandatoryLit) and a
 	// first-byte set of varying size. Today these fall to multi-eq SIMD
 	// (set size 5..16) or the scalar firstByteFlags loop (set > 16).
 	// Shufti should accelerate the prefix scan in both cases.
-	{
-		// 16-byte first-set (hex chars) — currently multi-eq SIMD
-		// (4*N=64 ops/chunk). Shufti should be ~8 ops/chunk.
-		name:         "hex-run",
-		pattern:      `[0-9a-f]{32}`,
-		mode:         modeFind,
-		notes:        "16-byte first-set (hex) — multi-eq → Shufti target",
-		matchInput:   classRunInput(true, "0123456789abcdef", 32, 5),
-		nomatchInput: classRunInput(false, "", 0, 0),
-	},
 	{
 		// 52-byte first-set (letters) — currently scalar firstByteFlags
 		// (1 byte/cycle). Shufti should be ~16 bytes/cycle.
@@ -243,32 +178,6 @@ var tests = []testCase{
 		matchInput:   classRunInput(true, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", 20, 5),
 		nomatchInput: classRunInput(false, "", 0, 0),
 	},
-	{
-		// Mixed: comment-line OR block-comment. Both branches have self-loop
-		// suffix states; block comment can be hundreds of bytes long. Stresses
-		// both Opt 1 (self-loop bulk skip) and Teddy frontend.
-		name:    "comments-mixed",
-		pattern: `//[^\n]+|/\*(?s:.*?)\*/`,
-		mode:    modeFind,
-		notes:   "two dominant self-loop states — Opt 1 target (mixed)",
-		matchInput: sourceWithBlockComments(true,
-			"/*\n * Copyright 2026 Example Corp.\n * Licensed under the Apache License, Version 2.0.\n */",
-			"/* TODO: replace with proper error handling once the new\n   error framework is merged into main branch */"),
-		nomatchInput: sourceWithBlockComments(false),
-	},
-	{
-		// Phase 3 amplifier: long-line comments AND multi-KB block comments
-		// in the same input. The block-comment body sits in the second
-		// dominant self-loop state (`.*?` until `*/`); Phase 2 only
-		// accelerates the line-comment state, so this case demonstrates
-		// the gap that Phase 3 (multi-state dispatch) closes.
-		name:         "comments-mixed-large",
-		pattern:      `//[^\n]+|/\*(?s:.*?)\*/`,
-		mode:         modeFind,
-		notes:        "long line + long block comments — Phase 3 multi-state amplifier",
-		matchInput:   longCommentsMixedInput(true),
-		nomatchInput: longCommentsMixedInput(false),
-	},
 	// ── First-byte selectivity sweep (LNM smarter-gate research) ────────
 	// Five patterns sharing the shape `<lit><non-mid body><lit>` so the
 	// DFA has a non-mid-accept dominant body state. The first byte of the
@@ -276,57 +185,6 @@ var tests = []testCase{
 	// the smarter-gate research wants answered is "where on this spectrum
 	// does the bulk-skip win exceed the per-iter dispatch cost on no-match
 	// input?"
-	{
-		// Very rare: control character first byte. Never appears in ASCII
-		// prose, so Teddy false-positives on no-match input are ~zero.
-		// Bulk-skip should win on match, no regression possible on no-match.
-		name:         "ctrl-delim",
-		pattern:      `\x01[^\x02]+\x02`,
-		mode:         modeFind,
-		notes:        "very-rare first byte (\\x01) — Teddy false-positives ≈ 0",
-		matchInput:   delimitedBodyInput(true, 0x01, 0x02, 5, 9000),
-		nomatchInput: delimitedBodyInput(false, 0x01, 0x02, 0, 0),
-	},
-	{
-		// Rare-ish: `<` is mid-rare in prose, common in HTML/XML. On prose
-		// no-match input Teddy fires occasionally; on HTML it fires often.
-		name:         "xml-tag",
-		pattern:      `<[^>]+>`,
-		mode:         modeFind,
-		notes:        "rare first byte (<) — moderate Teddy false-positives on prose",
-		matchInput:   delimitedBodyInput(true, '<', '>', 5, 9000),
-		nomatchInput: delimitedBodyInput(false, '<', '>', 0, 0),
-	},
-	{
-		// Mid-frequency: `[` appears occasionally in prose (citations,
-		// brackets). Borderline case.
-		name:         "bracket-content",
-		pattern:      `\[[^\]]+\]`,
-		mode:         modeFind,
-		notes:        "mid-rare first byte ([) — borderline selectivity",
-		matchInput:   delimitedBodyInput(true, '[', ']', 5, 9000),
-		nomatchInput: delimitedBodyInput(false, '[', ']', 0, 0),
-	},
-	{
-		// Common: `(` is moderately common in prose. Expect non-mid
-		// dispatch to be lossy here.
-		name:         "paren-block",
-		pattern:      `\([^)]+\)`,
-		mode:         modeFind,
-		notes:        "common first byte (() — Teddy false-positives expected",
-		matchInput:   delimitedBodyInput(true, '(', ')', 5, 9000),
-		nomatchInput: delimitedBodyInput(false, '(', ')', 0, 0),
-	},
-	{
-		// Very common: ASCII letter `a`. Fires Teddy on nearly every word.
-		// Should be the worst-case regression if non-mid is emitted.
-		name:         "letter-delim",
-		pattern:      `a[^b]+b`,
-		mode:         modeFind,
-		notes:        "very-common first byte (a) — worst-case false-positive rate",
-		matchInput:   delimitedBodyInput(true, 'a', 'b', 5, 9000),
-		nomatchInput: delimitedBodyInput(false, 'a', 'b', 0, 0),
-	},
 	{
 		// Capture variant of secrets-github: whole-match named group around the
 		// lit-chain. Anchored captures (groups_func semantics). matchInput leads
@@ -337,17 +195,6 @@ var tests = []testCase{
 		mode:         modeGroups,
 		notes:        "lit-chain with named whole-match capture — Gap A target",
 		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab" + configInput(nil),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Capture variant with multi-piece captures: literal and chain captured
-		// separately. Exercises the multi-group write path on the lit-chain.
-		// Gap A target: single-pattern, any captures.
-		name:         "secrets-aws-pieces",
-		pattern:      `(AKIA)([A-Z0-9]{16})`,
-		mode:         modeGroups,
-		notes:        "lit-chain with two captures (literal, chain) — Gap A target",
-		matchInput:   "AKIAIOSFODNN7EXAMPLE" + configInput(nil),
 		nomatchInput: configInput(nil),
 	},
 	{
@@ -596,42 +443,6 @@ var tests = []testCase{
 		nomatchInput: impossibleRunInput(false),
 	},
 	{
-		// LIKELY.md Phase 4 amplifier: anchored match `[^\n]*` on ~50 KB of
-		// newline-free text. The DFA sits in the dominant self-loop body
-		// state for the entire input. Phase 2/3/5 already optimize this
-		// shape in find mode (see `comment-line-large` — −95% fuel);
-		// Phase 4 extends the bulk-skip to `buildMatchBody`.
-		//
-		// Match input: ~50 KB no newlines → anchored match consumes all,
-		// DFA stays in self-loop body across the full input.
-		// No-match input: one '\n' near the middle → DFA self-loops half
-		// the input, hits '\n', dies, anchored match fails.
-		name:         "anchored-self-loop-large",
-		pattern:      `[^\n]*`,
-		mode:         modeAnchored,
-		notes:        "anchored [^\\n]* — LIKELY.md Phase 4 (match-body bulk-skip) target",
-		matchInput:   noNewlineInput(true),
-		nomatchInput: noNewlineInput(false),
-	},
-	{
-		// Task 7 step 2 + Phase 4 synergy: anchored match `<[^>]+>` on
-		// ~50 KB. The body state `[^>]+` is a NON-mid-accept dominant
-		// self-loop (must see closing `>` before accepting). Phase 4
-		// today only dispatches mid-accept dominants in `buildMatchBody`
-		// /`buildHybridMatchBody`; this case won't fire bulk-skip until
-		// we extend non-mid dispatch to the match-body paths under the
-		// same LikelyMatch gate as the find-body extension.
-		//
-		// Match input: `<` + ~51 KB non-`>` body + `>`.
-		// No-match input: `<` + ~51 KB non-`>` body, no closing `>`.
-		name:         "anchored-xml-tag-large",
-		pattern:      `<[^>]+>`,
-		mode:         modeAnchored,
-		notes:        "anchored <[^>]+> — non-mid dominant body, match-body extension target",
-		matchInput:   xmlTagWrappedInput(true),
-		nomatchInput: xmlTagWrappedInput(false),
-	},
-	{
 		// Suggestion 3 target (RESOLVED — see plans/TODO.md task 23,
 		// retracted 2026-07-08): lit-anchored find with a dominant
 		// self-loop body. Lit-anchor (`findLitAnchorPoint`) requires a 2+
@@ -696,50 +507,6 @@ var tests = []testCase{
 		nomatchInput: btAction5Input(false),
 	},
 	{
-		// H.2 target: set of patterns each with a dominant `[^\n]+` body
-		// after a distinct literal prefix. Each pattern buckets separately
-		// (different first byte: 'E', 'W', 'I'). Without H.2 the suffix DFA
-		// loop scans the body byte-by-byte. With H.2 the dominant-state
-		// mid-accept dispatch should bulk-skip non-newline bytes 16 at a
-		// time, mirroring the single-pattern `comment-line-large` win.
-		//
-		// Patterns are non-capture-bearing (sets drop capture-bearing
-		// patterns at registration time). Mode-independent: H.2 mid-accept
-		// portion is default-on, same precedent as task 7 step 1 in
-		// single-pattern mode.
-		name: "set-log-line-bodies",
-		setPatterns: []string{
-			`ERROR:[^\n]+`,
-			`WARN:[^\n]+`,
-			`INFO:[^\n]+`,
-		},
-		mode:         modeSet,
-		notes:        "set of dominant-body log lines — H.2 (buildSetSuffixBody bulk-skip) target",
-		matchInput:   setLogLineInput(true),
-		nomatchInput: setLogLineInput(false),
-	},
-	{
-		// Task 5 target: counted linear chains after a literal anchor —
-		// each pattern's suffix (after the literal) is exactly N states,
-		// each with a single non-dead transition on the same class, no
-		// branching. AKIA[A-Z0-9]{16} is 16 states in [A-Z0-9]; ghp_ is 36
-		// states in [A-Za-z0-9]. Today: literal dispatch (AC/Teddy) finds
-		// the literal, then buildSetSuffixBody walks the suffix DFA table
-		// one byte at a time via genSuffixWASM. Task 5 target: detect the
-		// pure-chain shape and replace that per-byte walk with a single
-		// SIMD nibble-verify (~1 load + 3 ops per 16 bytes instead of
-		// N x table lookups).
-		name: "set-counted-chain-secrets",
-		setPatterns: []string{
-			`AKIA[A-Z0-9]{16}`,
-			`ghp_[A-Za-z0-9]{36}`,
-		},
-		mode:         modeSet,
-		notes:        "set of counted-chain secrets after literal anchor — task 5 (SIMD counted-chain verify) target",
-		matchInput:   setCountedChainInput(true),
-		nomatchInput: setCountedChainInput(false),
-	},
-	{
 		// Task 17 target: non-mid-accept dominant body in a set. `<[^>]+>`'s
 		// suffix DFA has one dominant self-loop state (on non-'>') that is
 		// NOT itself an accept point — you need the closing '>' before any
@@ -771,25 +538,6 @@ var tests = []testCase{
 		notes:        "near-miss greedy quantifier — Task 8 (dead-state skip) target",
 		matchInput:   deadSkipNearMissInput(true),
 		nomatchInput: deadSkipNearMissInput(false),
-	},
-	{
-		// Task 8 follow-up #1 target: EOF-without-match. Pattern requires
-		// 500 x's followed by a y (min-length 501 bytes). No-match input is
-		// 300 x's — pattern min-length > input length, so no attempt at any
-		// starting position can succeed. Without the fix the SIMD prefix
-		// scan finds x-candidates at every position and each triggers a
-		// full DFA walk to EOF: O(N²). With the fix the outer-loop bound
-		// check tightens to `attempt_start + patternMinLen > len` and
-		// the whole scan short-circuits after finding the first candidate.
-		//
-		// Match input has 500 x's + 'y' + filler — regexped and stdlib
-		// should both return the same match; the fix must not disturb it.
-		name:         "eof-min-len-short",
-		pattern:      `x{500}y`,
-		mode:         modeFind,
-		notes:        "insufficient input — Task 8 follow-up #1 (EOF-without-match)",
-		matchInput:   eofMinLenInput(true),
-		nomatchInput: eofMinLenInput(false),
 	},
 	{
 		// Task 8 follow-up #2 target: min-length quantifier skip. Pattern
@@ -861,31 +609,6 @@ var tests = []testCase{
 		matchInput:   strings.Repeat("aB3_", 2560) + "!",
 		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
 	},
-	{
-		// Gap F target: <([a-z]+)> — smaller self-loop class (26 bytes)
-		// than the \w case, closer to the detector's min-size floor.
-		name:         "tdfa-bulk-skip-lower-class",
-		pattern:      `<([a-z]+)>`,
-		mode:         modeGroups,
-		notes:        "TDFA dominant self-loop on [a-z] (26 bytes) — Gap F target",
-		matchInput:   "<" + strings.Repeat("qwertyuiopasdfghjklzxcvbnm", 400) + ">",
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Gap F target: X([a-zA-Z]+)# — 52-byte self-loop class, exercises
-		// a larger Shufti table (7 halves-of-8) than the \w case's 8 halves.
-		// Trailing delimiter deliberately NOT a member of [a-zA-Z] (unlike a
-		// literal Y, which overlaps the class and routes to Backtracking via
-		// hasAmbiguousCaptures — see plans/TODO.md task 13's open finding on
-		// X([a-zA-Z]+)Y-shaped patterns; this case must stay off that gate to
-		// actually exercise TDFA/Gap F).
-		name:         "tdfa-bulk-skip-letter-class",
-		pattern:      `X([a-zA-Z]+)#`,
-		mode:         modeGroups,
-		notes:        "TDFA dominant self-loop on [a-zA-Z] (52 bytes) — Gap F target",
-		matchInput:   "X" + strings.Repeat("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 200) + "#",
-		nomatchInput: configInput(nil),
-	},
 }
 
 // --------------------------------------------------------------------------
@@ -914,111 +637,6 @@ export AWS_S3_BUCKET=example-data-bucket
 `
 	base := strings.Repeat(block, (10*1024)/len(block))
 	return spread(base, secrets, "\n")
-}
-
-// sourceInput returns ~10KB of C-style source code, with optional `// comment` lines.
-func sourceInput(withComments bool) string {
-	const block = `int processRequest(Request *req, Response *resp) {
-    if (req == NULL || resp == NULL) return ERR_INVALID_ARG;
-    int status = validateHeaders(req->headers, req->headerCount);
-    if (status != OK) { resp->statusCode = 400; return status; }
-    Connection *conn = poolAcquire(globalPool, POOL_TIMEOUT_MS);
-    if (conn == NULL) { resp->statusCode = 503; return ERR_NO_CONNECTION; }
-    QueryResult result = executeQuery(conn, req->path, req->params);
-    poolRelease(globalPool, conn);
-    resp->statusCode = 200;
-    resp->body = result.data;
-    return OK;
-}
-
-`
-	base := strings.Repeat(block, (10*1024)/len(block))
-	if !withComments {
-		return base
-	}
-	comments := []string{
-		"// initialise connection pool",
-		"// retry with exponential backoff",
-		"// validate request parameters",
-		"// guard against null pointer access",
-		"// release pooled connection back to the manager",
-	}
-	return spread(base, comments, "\n")
-}
-
-// longCommentLineInput returns ~50 KB of source-like text. When withComments
-// is true, the buffer contains a handful of VERY long single-line `// …`
-// comments (~5–10 KB each, no embedded newlines) — designed to amplify
-// the [^\n]+ bulk-skip path. When false, no `//` substring appears.
-func longCommentLineInput(withComments bool) string {
-	const targetSize = 50 * 1024
-	if !withComments {
-		// Plain text without "//" anywhere.
-		var b []byte
-		filler := []byte("The quick brown fox jumps over the lazy dog. ")
-		for len(b) < targetSize {
-			b = append(b, filler...)
-		}
-		return string(b[:targetSize])
-	}
-	// Five very-long comment lines, each ~9 KB of non-newline characters.
-	var b []byte
-	for i := 0; i < 5; i++ {
-		b = append(b, '/', '/')
-		filler := []byte(" lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua")
-		for j := 0; j < 75; j++ { // ~9 KB per comment
-			b = append(b, filler...)
-		}
-		b = append(b, '\n')
-	}
-	// Pad with non-`//` filler to reach target.
-	filler := []byte("plain text with no slashes at all and certainly nothing resembling a comment marker here\n")
-	for len(b) < targetSize {
-		b = append(b, filler...)
-	}
-	return string(b[:targetSize])
-}
-
-// longCommentsMixedInput returns ~50 KB of source-like text containing BOTH
-// very long single-line `//` comments AND multi-KB `/* … */` block comments.
-// Phase 2 of Opt 1 bulk-skips the line-comment self-loop only; Phase 3 must
-// also bulk-skip the block-comment self-loop. When withMatches is false,
-// neither `//` nor `/*` appears.
-func longCommentsMixedInput(withMatches bool) string {
-	const targetSize = 50 * 1024
-	if !withMatches {
-		var b []byte
-		filler := []byte("The quick brown fox jumps over the lazy dog. ")
-		for len(b) < targetSize {
-			b = append(b, filler...)
-		}
-		return string(b[:targetSize])
-	}
-	var b []byte
-	// Two ~9 KB single-line comments.
-	for i := 0; i < 2; i++ {
-		b = append(b, '/', '/')
-		filler := []byte(" lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua")
-		for j := 0; j < 75; j++ {
-			b = append(b, filler...)
-		}
-		b = append(b, '\n')
-	}
-	// Two ~9 KB block comments (newlines inside are fine — `.*?` is DOTALL).
-	for i := 0; i < 2; i++ {
-		b = append(b, '/', '*')
-		filler := []byte(" Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam,\n feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper.\n")
-		for j := 0; j < 45; j++ {
-			b = append(b, filler...)
-		}
-		b = append(b, '*', '/', '\n')
-	}
-	// Pad with non-comment filler.
-	filler := []byte("plain text with no slashes at all and certainly nothing resembling a comment marker here\n")
-	for len(b) < targetSize {
-		b = append(b, filler...)
-	}
-	return string(b[:targetSize])
 }
 
 // classRunInput builds ~50 KB of input for the Shufti prefix-scan sweep.
@@ -1183,79 +801,6 @@ func litAnchorFalsePositiveInput() string {
 	return string(b[:targetSize])
 }
 
-// setLogLineInput builds ~50 KB of mixed text for the H.2 set test case.
-// When withMatches is true: blocks of ERROR:/WARN:/INFO: log lines with long
-// (~200 byte) bodies interleaved with prose. The dominant `[^\n]+` body
-// inside each pattern's suffix DFA spans the entire log-line body, so the
-// bulk-skip dispatch has bytes to chew.
-// When false: pure prose without any of the three literal prefixes. The
-// set frontend's Teddy/AC scan never fires, the suffix DFA never enters.
-// Used to confirm the no-match path remains regression-free.
-func setLogLineInput(withMatches bool) string {
-	const targetSize = 50 * 1024
-	prose := []byte("The quick brown fox jumps over the lazy dog. ")
-	if !withMatches {
-		var b []byte
-		for len(b) < targetSize {
-			b = append(b, prose...)
-		}
-		return string(b[:targetSize])
-	}
-	// Mix of log lines with long bodies.
-	// Each line: "<PREFIX>:<200 bytes of body>\n"
-	prefixes := []string{"ERROR", "WARN", "INFO"}
-	bodyFiller := []byte("the operation completed normally with no observable side effects on the surrounding subsystem state. retrying in 50ms. ")
-	var b []byte
-	idx := 0
-	for len(b) < targetSize {
-		b = append(b, []byte(prefixes[idx%len(prefixes)])...)
-		b = append(b, ':')
-		bodyStart := len(b)
-		for len(b)-bodyStart < 200 {
-			b = append(b, bodyFiller...)
-		}
-		b = append(b, '\n')
-		// Some inter-match prose so consecutive matches aren't adjacent.
-		b = append(b, prose...)
-		idx++
-	}
-	return string(b[:targetSize])
-}
-
-// setCountedChainInput builds ~50 KB of mixed text for the task 5 set test
-// case (AKIA[A-Z0-9]{16} / ghp_[A-Za-z0-9]{36}).
-// When withMatches is true: valid secrets of each shape interleaved with
-// prose, so the AC/Teddy literal dispatch fires and the suffix verify
-// (today: per-byte DFA walk; task 5 target: SIMD counted-chain verify) runs
-// to completion on real matches.
-// When false: prose that never contains "AKIA" or "ghp_" as a substring, so
-// the literal dispatch never fires and the suffix verify never runs — used
-// to confirm the no-match path stays regression-free.
-func setCountedChainInput(withMatches bool) string {
-	const targetSize = 50 * 1024
-	prose := []byte("the quick brown fox jumps over the lazy dog and they all live happily ever after. ")
-	if !withMatches {
-		var b []byte
-		for len(b) < targetSize {
-			b = append(b, prose...)
-		}
-		return string(b[:targetSize])
-	}
-	secrets := []string{
-		"AKIAIOSFODNN7EXAMPLE",
-		"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
-	}
-	var b []byte
-	idx := 0
-	for len(b) < targetSize {
-		b = append(b, prose...)
-		b = append(b, []byte(secrets[idx%len(secrets)])...)
-		b = append(b, ' ')
-		idx++
-	}
-	return string(b[:targetSize])
-}
-
 // setNonMidDominantInput builds ~50 KB of mixed text for the task 17 set
 // test case (`<[^>]+>`).
 // When withMatches is true: many small HTML-ish tags interleaved with
@@ -1310,39 +855,6 @@ func deadSkipNearMissInput(withMatches bool) string {
 	return string(b)
 }
 
-// eofMinLenInput builds input for the Task 8 follow-up #1 test case
-// (pattern `x{500}y`, min-length 501).
-//
-// withMatches=true: 500 x's + 'y' + filler = 1001 bytes. Pattern matches
-// at position 0 with length 501. The min-length check must NOT trip here;
-// both baseline and post-fix should report the same match. Regression guard.
-//
-// withMatches=false: 300 x's (nothing else). Pattern min-length 501 exceeds
-// the 300-byte input. No match possible from any position. Baseline: SIMD
-// prefix scan finds x-candidates at every position (300 of them), each
-// triggering a DFA walk that consumes remaining x's until EOF without
-// accepting — O(N²). Post-fix: the tightened bound check fires on the
-// first candidate and short-circuits to no-match — O(1).
-func eofMinLenInput(withMatches bool) string {
-	if withMatches {
-		var b []byte
-		for i := 0; i < 500; i++ {
-			b = append(b, 'x')
-		}
-		b = append(b, 'y')
-		// Filler after the match — patterns without trailing anchors don't
-		// care, but longer input exercises whatever comes after the accept.
-		for i := 0; i < 500; i++ {
-			b = append(b, 'z')
-		}
-		return string(b)
-	}
-	var b []byte
-	for i := 0; i < 300; i++ {
-		b = append(b, 'x')
-	}
-	return string(b)
-}
 
 // minLenQuantifierSkipInput builds inputs for the Task 8 follow-up #2
 // target (pattern `[a-z]{50,}[0-9]`, no-match input never dies and never
@@ -1405,47 +917,6 @@ func setShuftiLNMInput(withMatches bool) string {
 	return string(b[:targetSize])
 }
 
-// xmlTagWrappedInput builds a ~50 KB string for anchored `<[^>]+>`.
-// When wrapped is true: `<` + 51,198 non-`>` body bytes + `>` (matches).
-// When false: `<` + 51,199 non-`>` body bytes, no closing `>` (DFA
-// scans the full body, dies at end-of-input without seeing `>`).
-func xmlTagWrappedInput(wrapped bool) string {
-	const targetSize = 50 * 1024
-	body := make([]byte, targetSize-2)
-	filler := []byte("abcdefghijklmnopqrstuvwxyz0123456789 ")
-	for i := range body {
-		body[i] = filler[i%len(filler)]
-	}
-	if wrapped {
-		return "<" + string(body) + ">"
-	}
-	// One extra body byte to keep total length equal to the match case.
-	return "<" + string(body) + "x"
-}
-
-// noNewlineInput builds ~50 KB of newline-free prose for the Phase 4
-// (anchored match-body bulk-skip) amplifier on `[^\n]*`.
-//
-// When withMatch is true: pure newline-free text — anchored match
-// consumes all input, DFA stays in the dominant self-loop body state
-// across the full 50 KB.
-// When false: identical text with a single '\n' near the middle —
-// DFA self-loops up to the newline, dies, anchored match fails. Used
-// to verify the no-match path remains regression-free.
-func noNewlineInput(withMatch bool) string {
-	const targetSize = 50 * 1024
-	base := []byte("The quick brown fox jumps over the lazy dog. ")
-	var b []byte
-	for len(b) < targetSize {
-		b = append(b, base...)
-	}
-	b = b[:targetSize]
-	if !withMatch {
-		b[targetSize/2] = '\n'
-	}
-	return string(b)
-}
-
 // impossibleRunInput builds ~50 KB of input dominated by bytes outside
 // the [a-zA-Z] class — digits, punctuation, whitespace. For the LNM
 // Action 5 (impossible-byte SIMD skip) demonstration.
@@ -1480,177 +951,6 @@ func impossibleRunInput(withMatches bool) string {
 		b = append(b, filler...)
 	}
 	return string(b[:targetSize])
-}
-
-// longURLInput returns ~50 KB of prose-like text with optional long URL
-// matches for `https?://[^\s]+`.
-//
-// When withMatches is true: 5 URLs are embedded, each with a body of
-// ~9 KB of URL-shaped characters (alphanumerics + `/`, `?`, `&`, `=`,
-// `_`, `-`, `.`, `%`) followed by a space. The body's first byte is
-// not whitespace so `[^\s]+` consumes the full ~9 KB, exercising the
-// bulk-skip SIMD path for the 6-byte exit set `\s` = `\t\n\v\f\r `.
-//
-// When withMatches is false: pure prose with no `http` or `https`
-// substrings (and no `://` either), so Teddy never fires; tests for
-// no-match regression introduced by Phase 5's larger emission.
-func longURLInput(withMatches bool) string {
-	const targetSize = 50 * 1024
-	if !withMatches {
-		var b []byte
-		filler := []byte("The quick brown fox jumps over the lazy dog. ")
-		for len(b) < targetSize {
-			b = append(b, filler...)
-		}
-		return string(b[:targetSize])
-	}
-	var b []byte
-	for i := 0; i < 5; i++ {
-		b = append(b, []byte("https://example.com/")...)
-		// ~9 KB of URL-body characters (no whitespace).
-		bodyFiller := []byte("path/to/resource?key=value&id=12345_abc.json/api/v2/users-list%20foo/bar/baz/qux/quux/corge/grault/garply/")
-		for j := 0; j < 90; j++ { // ~9 KB per URL
-			b = append(b, bodyFiller...)
-		}
-		// Whitespace ends the match.
-		b = append(b, ' ')
-		b = append(b, '\n')
-	}
-	// Pad with non-URL prose.
-	pad := []byte("plain prose without any URL markers here at all\n")
-	for len(b) < targetSize {
-		b = append(b, pad...)
-	}
-	return string(b[:targetSize])
-}
-
-// delimitedBodyInput builds an input for the first-byte selectivity sweep.
-//
-// When withMatches is true, the buffer contains `bodies` × (`bodyLen` bytes)
-// matches shaped `<open>[non-close-byte body]<close>`. The body byte fills
-// repeatedly using a "lorem ipsum"-style filler with the close byte
-// stripped out, so the match length actually reaches `bodyLen`. Total
-// buffer is padded with plain ASCII prose to ~50 KB.
-//
-// When withMatches is false, the buffer is pure ASCII prose (lorem ipsum
-// + the quick-brown-fox sentence) with the `open` byte stripped out so
-// no Teddy false-positives from the literal can occur EXCEPT when `open`
-// is a natural ASCII letter (in which case stripping it would change the
-// prose; for those we accept the natural occurrence rate as the test
-// signal). Total buffer ~50 KB.
-//
-// This produces:
-//   - matchInput: bulk-skip-friendly. Each match has a long body where
-//     the dominant self-loop fires repeatedly.
-//   - nomatchInput: stresses Teddy at the natural frequency of `open` in
-//     prose. Whether non-mid bulk-skip helps or hurts here is exactly
-//     the question the smarter gate must answer.
-func delimitedBodyInput(withMatches bool, open, close byte, bodies, bodyLen int) string {
-	const targetSize = 50 * 1024
-	filler := []byte(" lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua quisque vel libero")
-	stripBytes := func(s []byte, drop byte) []byte {
-		out := s[:0:len(s)]
-		for _, c := range s {
-			if c != drop {
-				out = append(out, c)
-			}
-		}
-		return out
-	}
-	bodyFiller := stripBytes(append([]byte(nil), filler...), close)
-	if !withMatches {
-		var b []byte
-		prose := stripBytes(append([]byte(nil), filler...), open)
-		// Also strip the close byte so a stray pair can't form unintended matches.
-		prose = stripBytes(prose, close)
-		// If both bytes happen to be ASCII letters that gut the prose, fall
-		// back to a different sentence.
-		if len(prose) < 20 {
-			prose = []byte("The quick brown fox jumps over the lazy dog. ")
-			prose = stripBytes(prose, open)
-			prose = stripBytes(prose, close)
-		}
-		for len(b) < targetSize {
-			b = append(b, prose...)
-		}
-		return string(b[:targetSize])
-	}
-	var b []byte
-	for i := 0; i < bodies; i++ {
-		b = append(b, open)
-		for len(b)%bodyLen != bodyLen-1 && len(b) < targetSize-2 {
-			// Inner loop bound is approximate; we just want roughly bodyLen
-			// bytes of body before the close.
-			b = append(b, bodyFiller...)
-			if len(b) >= bodyLen*(i+1) {
-				break
-			}
-		}
-		b = append(b, close)
-		b = append(b, '\n')
-	}
-	// Pad with prose (stripped of `open` so we don't accidentally start new
-	// matches mid-pad).
-	pad := stripBytes(append([]byte(nil), filler...), open)
-	pad = stripBytes(pad, close)
-	if len(pad) < 20 {
-		pad = []byte("plain padding text without delimiters here at all\n")
-		pad = stripBytes(pad, open)
-		pad = stripBytes(pad, close)
-	}
-	for len(b) < targetSize {
-		b = append(b, pad...)
-	}
-	return string(b[:targetSize])
-}
-
-// sourceWithBlockComments returns ~10KB of C-style source code with optional
-// `// comments` and optional `/* block comments */`.
-func sourceWithBlockComments(withMatches bool, blockComments ...string) string {
-	const block = `int processRequest(Request *req, Response *resp) {
-    if (req == NULL || resp == NULL) return ERR_INVALID_ARG;
-    int status = validateHeaders(req->headers, req->headerCount);
-    if (status != OK) { resp->statusCode = 400; return status; }
-    Connection *conn = poolAcquire(globalPool, POOL_TIMEOUT_MS);
-    if (conn == NULL) { resp->statusCode = 503; return ERR_NO_CONNECTION; }
-    QueryResult result = executeQuery(conn, req->path, req->params);
-    poolRelease(globalPool, conn);
-    resp->statusCode = 200;
-    return OK;
-}
-
-`
-	base := strings.Repeat(block, (10*1024)/len(block))
-	if !withMatches {
-		return base
-	}
-	all := []string{
-		"// initialise connection pool",
-		"// retry with exponential backoff",
-		"// validate request parameters",
-	}
-	all = append(all, blockComments...)
-	return spread(base, all, "\n")
-}
-
-// proseInput returns ~10KB of natural-language prose, optionally interleaved with URLs.
-func proseInput(urls []string) string {
-	const block = `The application encountered an error while processing the request from the
-client. The server returned status code four hundred and three, indicating that
-the user does not have permission to access the requested resource. Please
-contact your system administrator if you believe this is a mistake. The event
-has been logged for review by the security team. Timestamp of the failure was
-recorded along with the originating address and the affected service name.
-`
-	base := strings.Repeat(block, (10*1024)/len(block))
-	if len(urls) == 0 {
-		return base
-	}
-	wrapped := make([]string, len(urls))
-	for i, u := range urls {
-		wrapped[i] = "See " + u + " for details."
-	}
-	return spread(base, wrapped, "\n")
 }
 
 // spread inserts `items` evenly through `base`, separated by `sep`.
@@ -1690,6 +990,14 @@ type cell struct {
 	timeP50 time.Duration
 	fuel    uint64
 	size    int
+	// identical is true when this mode's compiled wasm is byte-identical to
+	// neutral's — the compiler emitted the same code regardless of the
+	// LikelyMode hint, so any wall-time difference between them can only be
+	// measurement noise (see TODO.md task 25 investigation: identical wasm
+	// still showed swings up to +137% run to run on sub-microsecond cases).
+	// Benchmarking is skipped entirely for these; printMatrix shows a single
+	// "identical WASM" message instead of numbers.
+	identical bool
 }
 
 // compileMode compiles tc.pattern under the given LikelyMode and returns the WASM bytes.
@@ -1751,7 +1059,7 @@ func likelyModeYAML(m compile.LikelyMode) string {
 
 // benchTime times benchIters calls via the WASM shim and returns the p50 of
 // those 10k internal samples — already statistically tight.
-func benchTime(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Engine) (time.Duration, error) {
+func benchTime(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Engine, debugMode ...string) (time.Duration, error) {
 	mod, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
 		return 0, fmt.Errorf("module: %w", err)
@@ -1828,6 +1136,17 @@ func benchTime(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Eng
 		return 0, fmt.Errorf("bench call: %w", benchErr)
 	}
 	shimBuf := shimMem.UnsafeData(store)
+	if os.Getenv("DEBUG_STATS") != "" {
+		p50 := computeStat(shimBuf[:timingsBytes], 50)
+		p90 := computeStat(shimBuf[:timingsBytes], 90)
+		p99 := computeStat(shimBuf[:timingsBytes], 99)
+		mean := computeStat(shimBuf[:timingsBytes], 0)
+		m := ""
+		if len(debugMode) > 0 {
+			m = debugMode[0]
+		}
+		fmt.Fprintf(os.Stderr, "    [%s mode=%s len=%d] p50=%s p90=%s p99=%s mean=%s\n", tc.name, m, len(input), p50, p90, p99, mean)
+	}
 	return computeStat(shimBuf[:timingsBytes], 50), nil
 }
 
@@ -1874,12 +1193,12 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 	return before - after, nil
 }
 
-// measure compiles + runs (tc, mode, input) and returns one cell.
-func measure(tc testCase, mode compile.LikelyMode, input string, engine, fuelEngine *wasmtime.Engine) (cell, error) {
-	wasm, err := compileMode(tc, mode)
-	if err != nil {
-		return cell{}, fmt.Errorf("compile %s: %w", mode, err)
-	}
+// measureWasm runs (tc, input) against an already-compiled wasm module and
+// returns one cell. Split out from measure so callers that already know the
+// mode's wasm is byte-identical to neutral's (see main's identical-WASM gate)
+// can skip compiling twice and skip benchmarking a module they've already
+// measured under a different mode label.
+func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string, engine, fuelEngine *wasmtime.Engine) (cell, error) {
 	if tc.mode == modeSet {
 		t, err := benchTimeSet(wasm, input, engine)
 		if err != nil {
@@ -1891,7 +1210,7 @@ func measure(tc testCase, mode compile.LikelyMode, input string, engine, fuelEng
 		}
 		return cell{timeP50: t, fuel: f, size: len(wasm)}, nil
 	}
-	t, err := benchTime(wasm, tc, input, engine)
+	t, err := benchTime(wasm, tc, input, engine, mode.String())
 	if err != nil {
 		return cell{}, fmt.Errorf("bench time %s: %w", mode, err)
 	}
@@ -2115,6 +1434,14 @@ func printMatrix(tc testCase, rows [3]cell, rowsNo [3]cell) {
 	baseTn, baseFn := float64(rowsNo[0].timeP50), float64(rowsNo[0].fuel)
 
 	for i := 0; i < 3; i++ {
+		if rows[i].identical {
+			// TODO.md task 25 investigation: identical wasm still showed
+			// wall-time swings up to +137% run to run on sub-microsecond
+			// cases — comparing timings across byte-identical code is pure
+			// noise, so skip the run entirely rather than report it.
+			fmt.Printf("  %-16s  identical WASM — same as neutral, timing/fuel run skipped\n", modes[i])
+			continue
+		}
 		rT, rF := float64(rows[i].timeP50), float64(rows[i].fuel)
 		nT, nF := float64(rowsNo[i].timeP50), float64(rowsNo[i].fuel)
 		gT, gF := "   —", "   —"
@@ -2165,17 +1492,42 @@ func main() {
 
 	fmt.Println("likelytest — LikelyMode 3x3 matrix (p50 over 10k inner iterations per cell)")
 
+	filter := os.Getenv("LIKELYTEST_FILTER")
 	for _, tc := range tests {
+		if filter != "" && !strings.Contains(tc.name, filter) {
+			continue
+		}
 		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
 		var rowsMatch, rowsNoMatch [3]cell
+		var neutralWasm []byte
 		for i, m := range modes {
-			c, err := measure(tc, m, tc.matchInput, engine, fuelEngine)
+			wasm, err := compileMode(tc, m)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  compile %s: %v\n", m, err)
+				continue
+			}
+			if i == 0 {
+				neutralWasm = wasm
+			}
+			// Identical-WASM gate (TODO.md task 25 investigation): if this
+			// mode compiled to byte-identical wasm to neutral, the compiler
+			// ignored the LikelyMode hint for this pattern entirely — any
+			// wall-time delta we'd measure is guaranteed noise, not signal.
+			// Skip benchmarking, reuse nothing (deliberately re-derive size
+			// from this mode's own wasm rather than assuming it), and mark
+			// both rows so printMatrix shows a message instead of numbers.
+			if i > 0 && bytes.Equal(wasm, neutralWasm) {
+				rowsMatch[i] = cell{size: len(wasm), identical: true}
+				rowsNoMatch[i] = cell{size: len(wasm), identical: true}
+				continue
+			}
+			c, err := measureWasm(tc, wasm, m, tc.matchInput, engine, fuelEngine)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  measure %s match: %v\n", m, err)
 				continue
 			}
 			rowsMatch[i] = c
-			c, err = measure(tc, m, tc.nomatchInput, engine, fuelEngine)
+			c, err = measureWasm(tc, wasm, m, tc.nomatchInput, engine, fuelEngine)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  measure %s no-match: %v\n", m, err)
 				continue

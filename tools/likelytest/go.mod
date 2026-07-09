@@ -1,8 +1,8 @@
-module github.com/qrdl/regexped/likelytest
+module github.com/qrdl/regexped/tools/likelytest
 
 go 1.25
 
-replace github.com/qrdl/regexped => ../
+replace github.com/qrdl/regexped => ../../
 
 require (
 	github.com/bytecodealliance/wasmtime-go/v42 v42.0.0

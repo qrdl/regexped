@@ -117,7 +117,31 @@ type prefixScanLocals struct {
 	T2Lo, T2Hi   byte // v128 locals: T2_lo, T2_hi (3-byte Teddy, pre-loaded)
 	Chunk3       byte // v128 local: 16-byte chunk at attempt_start+3 (4-byte Teddy)
 	T3Lo, T3Hi   byte // v128 locals: T3_lo, T3_hi (4-byte Teddy, pre-loaded)
+
+	// DenseCounter / DenseSkipFlag (TODO.md task 25 v1 — adaptive dense-data
+	// switch, combined with the v128 dead-local trim): only read/written
+	// when emitPrefixScan's `adaptive` gate is active (LikelyNoMatch forcing
+	// Shufti past what shuftiBeatsScalar would otherwise pick for a
+	// 17..64-byte first-byte set). Callers that never hit that combination
+	// may leave these at their zero value.
+	//
+	// DenseCounter persists across attempts (outer-loop re-entries): it
+	// counts consecutive attempts where Shufti found a candidate in the
+	// very first chunk it loaded, i.e. gained no 16-byte skip. Once it
+	// crosses denseSwitchThreshold, the scan stops probing SIMD for the
+	// rest of this call and falls straight through to the scalar tail.
+	// DenseSkipFlag is transient scratch reset at the top of each attempt's
+	// gated SIMD section, set when a "no candidate, advance 16" iteration
+	// runs, and read once a candidate is found to decide whether to bump or
+	// reset DenseCounter.
+	DenseCounter, DenseSkipFlag byte
 }
+
+// denseSwitchThreshold is the number of consecutive no-skip Shufti attempts
+// (TODO.md task 25) that trip the adaptive switch to scalar. Chosen by
+// initial measurement; see likelytest's alpha-run/word-run/deadskip-near-miss
+// cases for the workloads this tunes against.
+const denseSwitchThreshold int32 = 8
 
 // prefixScanParams configures emitPrefixScan.
 type prefixScanParams struct {
@@ -155,6 +179,16 @@ type prefixScanParams struct {
 	// heuristic and forces Shufti. Set from buildOpts.LikelyMode ==
 	// LikelyNoMatch.
 	LikelyNoMatch bool
+
+	// AllowDenseSwitch (TODO.md task 25): opts into the adaptive
+	// dense-data switch for the LikelyNoMatch-forced-Shufti case (17..64
+	// byte first-byte set, static heuristic says scalar would win).
+	// Requires the caller to have allocated real, non-colliding WASM
+	// local indices for Locals.DenseCounter and Locals.DenseSkipFlag —
+	// their zero value aliases Locals.Ptr (index 0), so leaving this
+	// false (the default) for callers that haven't reserved those locals
+	// is required for correctness, not just an optimisation choice.
+	AllowDenseSwitch bool
 
 	// MinPatternLen (Task 8 follow-up #1 — EOF-without-match): compile-time
 	// minimum byte length of any accepting match. When > 0 the post-scan
@@ -365,8 +399,20 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		// scan ~all bytes per chunk before exiting. Sets whose bytes are
 		// dense ⇒ scalar — early-exit wins.
 		//
+		// TODO.md task 25: `p.LikelyNoMatch` can override the static
+		// heuristic and force Shufti even when it predicts scalar wins —
+		// by design, since the caller's runtime-only knowledge is exactly
+		// what the hint is for. But the static heuristic can't distinguish
+		// "same byte class, sparse runtime data" (override genuinely wins)
+		// from "same byte class, dense runtime data" (override regresses).
+		// `adaptive` marks that override case; the emission below adds a
+		// runtime counter that detects density directly and falls back to
+		// scalar once it's confirmed, instead of trusting the static guess
+		// for the whole scan.
+		//
 		// SIMD block nesting (depths from $simd_outer):
 		//   0=$simd_outer 1=$simd_exhausted 2=$found_candidate [engine]
+		//   (adaptive: 2=$dense_gate 3=$found_candidate [engine])
 		//
 		// Scalar tail depths from $skip (SIMD path):
 		//   0=$skip 1=$skipdone 2=$found_candidate [engine]
@@ -374,11 +420,20 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		//   0=$skip 1=$skipdone [engine]
 
 		useSIMD := false
+		adaptive := false
 		if n := len(p.FirstByteSet); n > 0 {
 			if n <= 16 {
 				useSIMD = true
-			} else if n <= 64 && (p.LikelyNoMatch || shuftiBeatsScalar(p.FirstByteSet)) {
-				useSIMD = true
+			} else if n <= 64 {
+				rare := shuftiBeatsScalar(p.FirstByteSet)
+				if p.LikelyNoMatch {
+					useSIMD = true
+					// only adapt when overriding the static heuristic, and
+					// only when the caller has reserved real locals for it
+					adaptive = !rare && p.AllowDenseSwitch
+				} else if rare {
+					useSIMD = true
+				}
 			}
 		}
 
@@ -426,6 +481,20 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 			}
 
 			b = append(b, 0x02, 0x40) // block $found_candidate (void)
+
+			if adaptive {
+				// Task 25: DenseCounter < threshold? Else skip SIMD entirely
+				// for this attempt and fall straight through to the scalar
+				// tail below.
+				b = append(b, 0x20, l.DenseCounter)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, denseSwitchThreshold)
+				b = append(b, 0x48)       // i32.lt_s
+				b = append(b, 0x04, 0x40) // if $dense_gate (void)
+				b = append(b, 0x41, 0x00)
+				b = append(b, 0x21, l.DenseSkipFlag) // reset per-attempt skip flag
+			}
+
 			b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
 			b = append(b, 0x03, 0x40) // loop $simd_outer (void)
 
@@ -565,16 +634,42 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 			// mask on stack → tee + if mask != 0.
 			b = append(b, 0x22, l.SimdMask) // local.tee simdMask
 			b = append(b, 0x04, 0x40)       // if (void)
+			if adaptive {
+				// No skip yet this attempt (DenseSkipFlag==0) → this probe
+				// bought nothing, bump the streak. Otherwise a skip already
+				// happened this attempt → SIMD paid off, reset the streak.
+				b = append(b, 0x20, l.DenseSkipFlag)
+				b = append(b, 0x45)       // i32.eqz
+				b = append(b, 0x04, 0x40) // if (void)
+				b = append(b, 0x20, l.DenseCounter)
+				b = append(b, 0x41, 0x01)
+				b = append(b, 0x6A) // i32.add
+				b = append(b, 0x21, l.DenseCounter)
+				b = append(b, 0x05) // else
+				b = append(b, 0x41, 0x00)
+				b = append(b, 0x21, l.DenseCounter)
+				b = append(b, 0x0B) // end if
+			}
 			b = append(b, 0x20, l.AttemptStart)
 			b = append(b, 0x20, l.SimdMask)
 			b = append(b, 0x68) // i32.ctz
 			b = append(b, 0x6A) // i32.add
 			b = append(b, 0x21, l.AttemptStart)
-			// br 3 exits $found_candidate (0=if 1=$simd_outer 2=$simd_exhausted 3=$found_candidate)
-			b = append(b, 0x0C, 0x03) // br 3 → $found_candidate
-			b = append(b, 0x0B)       // end if
+			// br exits $found_candidate: 0=if 1=$simd_outer 2=$simd_exhausted
+			// 3=$found_candidate (non-adaptive), or 3=$dense_gate
+			// 4=$found_candidate (adaptive, one extra wrapping block).
+			if adaptive {
+				b = append(b, 0x0C, 0x04) // br 4 → $found_candidate
+			} else {
+				b = append(b, 0x0C, 0x03) // br 3 → $found_candidate
+			}
+			b = append(b, 0x0B) // end if
 
 			// No candidate: advance 16.
+			if adaptive {
+				b = append(b, 0x41, 0x01)
+				b = append(b, 0x21, l.DenseSkipFlag) // this attempt did skip ≥16 bytes
+			}
 			b = append(b, 0x20, l.AttemptStart)
 			b = append(b, 0x41, 0x10) // i32.const 16
 			b = append(b, 0x6A)
@@ -583,6 +678,9 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 
 			b = append(b, 0x0B) // end loop $simd_outer
 			b = append(b, 0x0B) // end block $simd_exhausted
+			if adaptive {
+				b = append(b, 0x0B) // end if $dense_gate
+			}
 		}
 
 		// ── Scalar tail / full scalar ──────────────────────────────────────────

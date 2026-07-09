@@ -5519,6 +5519,124 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	var t3LoLocal byte
 	var t3HiLocal byte
 
+	// numV128ForScan computes how many v128 locals emitPrefixScan will
+	// actually reference for this pattern's scan strategy, plus whether
+	// Opt 1's dominant-self-loop bulk-skip needs its own `chunk` register
+	// independent of the scan. buildFindBody previously reserved up to 12
+	// v128 locals unconditionally (the full Teddy shape) even when the
+	// Shufti/multi-eq or literal-prefix strategies — which reference only
+	// `chunk` — were what actually got emitted, or when no SIMD scan ran
+	// at all. Declaring dead v128 locals is pure register-allocator noise;
+	// this mirrors emitPrefixScan's own strategy-selection logic exactly
+	// (prefix_scan.go's useSIMD gate) so the two stay in sync — if that
+	// logic changes, this must change with it.
+	numV128ForScan := 0
+	switch {
+	case len(prefix) >= 1:
+		numV128ForScan = 1 // hybrid SIMD prefix scan: only `chunk`
+	case len(firstBytes) >= 1 && len(firstBytes) <= 8:
+		// Teddy: chunk,tLo,tHi always; +3 per extra byte tier.
+		numV128ForScan = 3
+		if teddyTwoByte {
+			numV128ForScan = 6
+		}
+		if teddyThreeByte {
+			numV128ForScan = 9
+		}
+		if teddyFourByte {
+			numV128ForScan = 12
+		}
+	case len(firstBytes) > 8 && len(firstBytes) <= 16:
+		numV128ForScan = 1 // Shufti, unconditional for 9..16
+	case len(firstBytes) > 16 && len(firstBytes) <= 64:
+		if lnmAction5 || shuftiBeatsScalar(firstBytes) {
+			numV128ForScan = 1 // Shufti: density-gated or LikelyNoMatch-forced
+		}
+		// else: scalar firstByteFlags — no SIMD locals needed
+	}
+	if len(dominantStates) > 0 && numV128ForScan == 0 {
+		numV128ForScan = 1 // Opt 1 bulk-skip needs its own `chunk` register
+	}
+	// needsDenseSwitch (TODO.md task 25): this pattern hits the exact
+	// LikelyNoMatch-forced override task 25 targets (17..64-byte
+	// first-byte set, static heuristic would otherwise pick scalar) —
+	// always implies numV128ForScan==1 (the Shufti branch above fires
+	// whenever lnmAction5 is true in that byte range).
+	needsDenseSwitch := lnmAction5 && len(firstBytes) > 16 && len(firstBytes) <= 64 && !shuftiBeatsScalar(firstBytes)
+	var denseCounterLocal, denseSkipFlagLocal byte
+
+	// assignV128Locals assigns sequential indices starting at base to
+	// exactly the v128 locals numV128ForScan implies are live, leaving
+	// the rest at their zero value (never referenced, so never declared).
+	// When needsDenseSwitch, also assigns the 2 dense-switch i32 locals
+	// immediately after the v128 group.
+	assignV128Locals := func(base byte) {
+		next := base
+		if numV128ForScan >= 1 {
+			chunkLocal = next
+			next++
+		}
+		if numV128ForScan >= 3 {
+			tLoLocal = next
+			next++
+			tHiLocal = next
+			next++
+		}
+		if numV128ForScan >= 6 {
+			chunk1Local = next
+			next++
+			t1LoLocal = next
+			next++
+			t1HiLocal = next
+			next++
+		}
+		if numV128ForScan >= 9 {
+			chunk2Local = next
+			next++
+			t2LoLocal = next
+			next++
+			t2HiLocal = next
+			next++
+		}
+		if numV128ForScan >= 12 {
+			chunk3Local = next
+			next++
+			t3LoLocal = next
+			next++
+			t3HiLocal = next
+			next++
+		}
+		if needsDenseSwitch {
+			denseCounterLocal = next
+			next++
+			denseSkipFlagLocal = next
+			next++
+		}
+	}
+	// appendLocalGroups appends the i32 group (count i32Count), then, only
+	// if numV128ForScan > 0, a v128 group, then, only if needsDenseSwitch,
+	// a third i32 group (2 locals) for the dense-switch counter/flag —
+	// matching the existing "skip the group entirely when count is 0"
+	// convention used elsewhere in this codebase (e.g. buildBTFindBody in
+	// engine_backtrack.go).
+	appendLocalGroups := func(b []byte, i32Count byte) []byte {
+		numGroups := byte(1)
+		if numV128ForScan > 0 {
+			numGroups++
+		}
+		if needsDenseSwitch {
+			numGroups++
+		}
+		b = append(b, numGroups, i32Count, 0x7F)
+		if numV128ForScan > 0 {
+			b = append(b, byte(numV128ForScan), 0x7B)
+		}
+		if needsDenseSwitch {
+			b = append(b, 0x02, 0x7F)
+		}
+		return b
+	}
+
 	// Mandatory-lit locals (set in each path branch when useMandatoryLit):
 	var litPosLocal, scanStartLocal, simdMaskScanLocal, chunkScanLocal byte
 
@@ -5543,27 +5661,30 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			TeddyT3LoOff:   teddyT3LoOff,
 			TeddyT3HiOff:   teddyT3HiOff,
 			TeddyFourByte:  teddyFourByte,
-			TableMemIdx:    tableMemIdx,
-			LikelyNoMatch:  lnmAction5,
-			MinPatternLen:  patternMinLen,
-			EngineDepth:    2, // loop $outer + block $no_match
+			TableMemIdx:      tableMemIdx,
+			LikelyNoMatch:    lnmAction5,
+			AllowDenseSwitch: needsDenseSwitch,
+			MinPatternLen:    patternMinLen,
+			EngineDepth:      2, // loop $outer + block $no_match
 			Locals: prefixScanLocals{
-				Ptr:          0,
-				Len:          1,
-				AttemptStart: 4,
-				SimdMask:     simdMaskLocal,
-				Chunk:        chunkLocal,
-				TLo:          tLoLocal,
-				THi:          tHiLocal,
-				Chunk1:       chunk1Local,
-				T1Lo:         t1LoLocal,
-				T1Hi:         t1HiLocal,
-				Chunk2:       chunk2Local,
-				T2Lo:         t2LoLocal,
-				T2Hi:         t2HiLocal,
-				Chunk3:       chunk3Local,
-				T3Lo:         t3LoLocal,
-				T3Hi:         t3HiLocal,
+				Ptr:           0,
+				Len:           1,
+				AttemptStart:  4,
+				SimdMask:      simdMaskLocal,
+				Chunk:         chunkLocal,
+				TLo:           tLoLocal,
+				THi:           tHiLocal,
+				Chunk1:        chunk1Local,
+				T1Lo:          t1LoLocal,
+				T1Hi:          t1HiLocal,
+				Chunk2:        chunk2Local,
+				T2Lo:          t2LoLocal,
+				T2Hi:          t2HiLocal,
+				Chunk3:        chunk3Local,
+				T3Lo:          t3LoLocal,
+				T3Hi:          t3HiLocal,
+				DenseCounter:  denseCounterLocal,
+				DenseSkipFlag: denseSkipFlagLocal,
 			},
 			OnMatch: func(b []byte) []byte {
 				if len(prefix) >= 1 {
@@ -5913,27 +6034,10 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkScanLocal = 10
 			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 		} else {
-			// 6 i32 + N v128
+			// 6 i32 + N v128 (N sized to what's actually used — see numV128ForScan)
 			simdMaskLocal = 7
-			chunkLocal = 8
-			tLoLocal = 9
-			tHiLocal = 10
-			chunk1Local = 11
-			t1LoLocal = 12
-			t1HiLocal = 13
-			chunk2Local = 14
-			t2LoLocal = 15
-			t2HiLocal = 16
-			if teddyFourByte {
-				// 6 i32 + 12 v128: adds chunk3(17),t3Lo(18),t3Hi(19)
-				chunk3Local = 17
-				t3LoLocal = 18
-				t3HiLocal = 19
-				b = append(b, 0x02, 0x06, 0x7F, 0x0C, 0x7B)
-			} else {
-				// 6 i32 + 9 v128
-				b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
-			}
+			assignV128Locals(8)
+			b = appendLocalGroups(b, 0x06)
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
 		if useMandatoryLit {
@@ -6058,27 +6162,10 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkScanLocal = 9
 			b = append(b, 0x02, 0x07, 0x7F, 0x01, 0x7B)
 		} else {
-			// 5 i32 + N v128
+			// 5 i32 + N v128 (N sized to what's actually used — see numV128ForScan)
 			simdMaskLocal = 6
-			chunkLocal = 7
-			tLoLocal = 8
-			tHiLocal = 9
-			chunk1Local = 10
-			t1LoLocal = 11
-			t1HiLocal = 12
-			chunk2Local = 13
-			t2LoLocal = 14
-			t2HiLocal = 15
-			if teddyFourByte {
-				// 5 i32 + 12 v128: adds chunk3(16),t3Lo(17),t3Hi(18)
-				chunk3Local = 16
-				t3LoLocal = 17
-				t3HiLocal = 18
-				b = append(b, 0x02, 0x05, 0x7F, 0x0C, 0x7B)
-			} else {
-				// 5 i32 + 9 v128
-				b = append(b, 0x02, 0x05, 0x7F, 0x09, 0x7B)
-			}
+			assignV128Locals(7)
+			b = appendLocalGroups(b, 0x05)
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
 		if useMandatoryLit {
@@ -6191,27 +6278,10 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		chunkScanLocal = 10
 		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 	} else {
-		// 6 i32 + N v128
+		// 6 i32 + N v128 (N sized to what's actually used — see numV128ForScan)
 		simdMaskLocal = 7
-		chunkLocal = 8
-		tLoLocal = 9
-		tHiLocal = 10
-		chunk1Local = 11
-		t1LoLocal = 12
-		t1HiLocal = 13
-		chunk2Local = 14
-		t2LoLocal = 15
-		t2HiLocal = 16
-		if teddyFourByte {
-			// 6 i32 + 12 v128: adds chunk3(17),t3Lo(18),t3Hi(19)
-			chunk3Local = 17
-			t3LoLocal = 18
-			t3HiLocal = 19
-			b = append(b, 0x02, 0x06, 0x7F, 0x0C, 0x7B)
-		} else {
-			// 6 i32 + 9 v128
-			b = append(b, 0x02, 0x06, 0x7F, 0x09, 0x7B)
-		}
+		assignV128Locals(8)
+		b = appendLocalGroups(b, 0x06)
 	}
 	b = append(b, 0x02, 0x40) // block $no_match
 	if useMandatoryLit {
