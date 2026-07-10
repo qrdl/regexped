@@ -2149,3 +2149,37 @@ regexps
 -;-;-;-
 -;0-64;-;-
 -;0-40;-;-
+# LenientAltMaskWindowHang: regression for a task-24 bug in
+# buildLitChainAltLenientFindBody's SIMD-window mask-persistence rewrite
+# (compile/engine_dfa.go). The rewrite computes a candidate bitmask once
+# per 16-byte window and iterates its set bits (via ctz + clear-lowest-bit)
+# instead of reloading/rescanning per candidate -- but the first version
+# never advanced windowBase once a window's mask was fully exhausted. The
+# next refill then reloaded the SAME window at the SAME windowBase,
+# recomputed the IDENTICAL mask, and looped forever retrying the same
+# already-rejected false-positive candidates -- an infinite hang, not a
+# wrong answer, caught by a wasmtime-execution test timing out (not by
+# Compile()-only checks, which can't detect a malformed control-flow loop).
+# Fixed by advancing windowBase by 16 as soon as the mask hits zero.
+# These strings are dense in the pattern's first-byte set {'e','g','A'}
+# (from the "eyJ..." JWT / "ghp_..." / "AKIA..." branches) with NO valid
+# continuation for several bytes in a row -- enough false positives
+# clustered in one 16-byte window to exhaust its mask before any real
+# match is found, and (for the third/JWT case) spanning two windows so the
+# fix's windowBase advance is exercised across a refill too.
+LenientAltMaskWindowHang
+strings
+""
+"eeggAAeeggAA"
+"eeggAAeeggAAeeggAAeeggAA"
+"eeggAAeeggAAghp_Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01Ab01"
+"eeggAAeeggAAAKIAIOSFODNN7EXAMPLE01234567"
+"eeggAAeeggAAeeggAAeeggAAeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+regexps
+"eyJ[A-Za-z0-9+/\\-_]+\\.[A-Za-z0-9+/\\-_]+\\.[A-Za-z0-9+/\\-_]+|ghp_[A-Za-z0-9]{36}|AKIA[A-Z0-9]{16}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;12-52;-;-
+-;12-32;-;-
+-;24-132;-;-

@@ -359,10 +359,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		buildOpts.LikelyMode = mode
 	}
 
-	// LikelyMatch early gate: counted-chain SIMD verifier (LIKELY.md Opt 2).
-	// Replaces the DFA match/find bodies entirely when the pattern matches the
-	// strict <literal><charclass>{N,N} shape or a strict alternation of such
-	// branches.
+	// Counted-chain SIMD verifier (LIKELY.md Opt 2), default-on for every
+	// LikelyMode (task 24 — promoted 2026-07-10 after a clean broad sweep;
+	// see plans/TODO.md task 24). Replaces the DFA match/find bodies
+	// entirely when the pattern matches the strict <literal><charclass>{N,N}
+	// shape or a strict alternation of such branches.
 
 	// Capture path (groups_func / named_groups_func): if the pattern is a
 	// lit-chain shape with compile-time-resolvable capture offsets, emit a
@@ -370,7 +371,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// the standard groups wrapper compose them. The wrapper handles the
 	// scan-to-find-extent → fill-captures pipeline and adjusts slot positions
 	// by the match start.
-	if buildOpts.LikelyMode == LikelyMatch && needGroups {
+	if needGroups {
 		// Gap C: single-pattern range with captures (greedy).
 		if lcp, lcc, ok := analyseLitChainGroupsRange(re.Pattern); ok {
 			p := &compiledPattern{
@@ -517,7 +518,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 	}
 
-	if buildOpts.LikelyMode == LikelyMatch && !needGroups {
+	if !needGroups {
 		// Gap E: mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
 		if lcp, ok := analyseLitChainPrefixed(re.Pattern); ok {
 			p := &compiledPattern{

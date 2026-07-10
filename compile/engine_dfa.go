@@ -9238,6 +9238,19 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 			b = append(b, 0x47)
 			b = append(b, 0x0D, 0x00) // br_if $next_branch_i
 
+			// Cheap reject on the rest of the literal before the (relatively
+			// expensive) per-byte inline DFA verify below — see the matching
+			// comment in buildLitChainAltLenientFindBody (task 24 regression).
+			if len(br.literal) > 1 {
+				b = append(b, 0x20, locLen)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(len(br.literal)))
+				b = append(b, 0x4B)      // i32.lt_u
+				b = append(b, 0x0D, 0x00) // br_if $next_branch_i (literal can't fit)
+
+				b = emitLiteralByteVerify(b, br.literal, 1, locPtr, locAttemptZero, 0)
+			}
+
 			// pos = 0; run inline anchored DFA verify (on no-accept br to depth 0).
 			b = append(b, 0x41, 0x00)
 			b = append(b, 0x21, locPos)
@@ -10955,29 +10968,47 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout, t *dfaTable,
 // buildLitChainAltLenientFindBody emits the find body for a lenient alternation.
 // Same scan + dispatch structure as the strict path, with extra DFA-verify
 // branches inlined.
+// buildLitChainAltLenientFindBody's frontend persists the SIMD candidate
+// bitmask across a 16-byte window instead of recomputing it (and reloading
+// an overlapping chunk) on every failed candidate. Originally this function
+// called the shared emitPrefixScan once per $lit_outer iteration — correct,
+// but on every branch-dispatch failure it restarted the ENTIRE scan from
+// attempt_start+1, reloading a mostly-identical 16-byte chunk and
+// recomputing the whole SIMD candidate mask from scratch. For a corpus
+// with a dense first-byte set (e.g. 'e','g','A' in ordinary English/config
+// text — ~1 candidate every 9-10 bytes), that per-candidate restart cost
+// dominated: measured at ~45 fuel/candidate, accounting for most of the
+// task-24 promotion regression on `secrets-combined` even after fixing the
+// separate per-branch DFA-verify cost (see that fix a few lines below).
+// See plans/TODO.md task 24's promotion-regression writeup for the full
+// investigation.
 func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) []byte {
 	const (
 		locPtr          byte = 0
 		locLen          byte = 1
 		locAttemptStart byte = 2
-		locSimdMask     byte = 3
+		locMask         byte = 3 // persistent SIMD candidate bitmask for the current 16-byte window
 		locScalarIdx    byte = 4
 		locDFAState     byte = 5
 		locDFAPos       byte = 6
 		locDFAClass     byte = 7
 		locDFAOutEnd    byte = 8
 		locChunk        byte = 9
-		locTeddyLo      byte = 10
-		locTeddyHi      byte = 11
 		locVerifyTlo    byte = 12
 		locVerifyPow2   byte = 13
+		locWindowBase   byte = 14 // base of the currently-loaded 16-byte SIMD window
 	)
 
 	var b []byte
-	// Local declarations: 7 i32 + 5 v128.
-	b = append(b, 0x02)       // 2 local groups
+	// Local declarations: 7 i32 + 5 v128 + 1 i32 (locWindowBase, added on top
+	// to avoid renumbering the existing i32/v128 groups above).
+	b = append(b, 0x03)       // 3 local groups
 	b = append(b, 0x07, 0x7F) // 7 × i32
-	b = append(b, 0x05, 0x7B) // 5 × v128
+	b = append(b, 0x05, 0x7B) // 5 × v128 (indices 10,11 — formerly Teddy table
+	// locals — are now unused: emitShuftiPrefixCheck below inlines its
+	// nibble tables as v128.const, so no pre-loaded per-call Teddy table is
+	// needed. Left declared to avoid renumbering locVerifyTlo/locVerifyPow2.)
+	b = append(b, 0x01, 0x7F) // 1 × i32 (locWindowBase)
 
 	// Hoist the power-of-two lookup vector once, shared by every lit-chain
 	// branch's class verify (emitLitChainAltLitBranchBody requires the
@@ -10988,49 +11019,108 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	b = emitV128Const(b, pow2VecConst)
 	b = append(b, 0x21, locVerifyPow2)
 
-	b = append(b, 0x02, 0x40) // block $no_match
-	b = append(b, 0x03, 0x40) // loop $lit_outer
-
-	// Frontend scan over the union of branches' first bytes.
+	// Union of branches' first bytes (compile-time only).
 	seen := [256]bool{}
 	var firstByteSet []byte
-	var firstByteFlags [256]byte
 	for _, br := range altp.branches {
-		firstByteFlags[br.literal[0]] = 1
 		if !seen[br.literal[0]] {
 			seen[br.literal[0]] = true
 			firstByteSet = append(firstByteSet, br.literal[0])
 		}
 	}
-	scan := prefixScanParams{
-		FirstByteSet:   firstByteSet,
-		FirstByteFlags: firstByteFlags,
-		FirstByteOff:   l.firstByteOff,
-		TeddyLoOff:     l.teddyLoOff,
-		TeddyHiOff:     l.teddyHiOff,
-		TeddyTwoByte:   false, // lenient-alt uses lenAltLayout; 2-byte Teddy not wired here
-		EngineDepth:    2,
-		TableMemIdx:    tableMemIdx,
-		Locals: prefixScanLocals{
-			Ptr:          locPtr,
-			Len:          locLen,
-			AttemptStart: locAttemptStart,
-			SimdMask:     locSimdMask,
-			Chunk:        locChunk,
-			TLo:          locTeddyLo,
-			THi:          locTeddyHi,
-		},
-		OnMatch: nil,
-	}
-	b = emitPrefixScan(b, scan)
 
-	// Per-branch dispatch.
+	b = append(b, 0x02, 0x40) // block $no_match
+	b = append(b, 0x03, 0x40) // loop $lit_outer
+
+	b = append(b, 0x02, 0x40) // block $mask_ready
+	// if mask != 0: br 0 → $mask_ready (skip refill, a candidate is already queued)
+	b = append(b, 0x20, locMask)
+	b = append(b, 0x0D, 0x00)
+
+	// ---- refill: scan forward in 16-byte windows for the next nonzero mask ----
+	b = append(b, 0x03, 0x40) // loop $window_scan
+	// if windowBase + 15 >= len: br 3 → exit $no_match entirely (go to tail scan)
+	// Depths from here: 0=$window_scan 1=$mask_ready 2=$lit_outer 3=$no_match.
+	b = append(b, 0x20, locWindowBase)
+	b = append(b, 0x41, 0x0F) // 15
+	b = append(b, 0x6A)       // i32.add
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4F)       // i32.ge_u
+	b = append(b, 0x0D, 0x03) // br_if 3 → exits $no_match, lands at tail scan below
+
+	// Load chunk @ windowBase.
+	b = append(b, 0x20, locPtr)
+	b = append(b, 0x20, locWindowBase)
+	b = append(b, 0x6A)
+	b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+	b = append(b, 0x21, locChunk)
+
+	// mask = per-lane bitmask of candidate bytes in this chunk (bit k set ⇔
+	// chunk byte k is in firstByteSet). Tables inlined as v128.const —
+	// nothing to pre-load per call, unlike the old Teddy-locals approach.
+	b = emitShuftiPrefixCheck(b, firstByteSet, locChunk)
+	b = append(b, 0x21, locMask)
+
+	// if mask != 0: br 1 → $mask_ready (candidate found in this window)
+	b = append(b, 0x20, locMask)
+	b = append(b, 0x0D, 0x01)
+
+	// else: windowBase += 16; keep scanning
+	b = append(b, 0x20, locWindowBase)
+	b = append(b, 0x41, 0x10) // 16
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locWindowBase)
+	b = append(b, 0x0C, 0x00) // br 0 → continue $window_scan
+
+	b = append(b, 0x0B) // end loop $window_scan
+	b = append(b, 0x0B) // end block $mask_ready
+
+	// mask != 0 guaranteed here (either carried over from a prior iteration,
+	// or just found by the refill above).
+	// attempt_start = windowBase + ctz(mask)
+	b = append(b, 0x20, locWindowBase)
+	b = append(b, 0x20, locMask)
+	b = append(b, 0x68) // i32.ctz
+	b = append(b, 0x6A) // i32.add
+	b = append(b, 0x21, locAttemptStart)
+
+	// mask &= mask - 1 (clear the lowest set bit — next iteration either
+	// finds the next candidate in this same window for free, or refills).
+	b = append(b, 0x20, locMask)
+	b = append(b, 0x20, locMask)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6B) // i32.sub
+	b = append(b, 0x71) // i32.and
+	b = append(b, 0x21, locMask)
+
+	// If that was the last candidate in this window, advance windowBase past
+	// it now. Without this, a subsequent refill (triggered by mask==0) would
+	// reload the SAME window at the SAME windowBase, recompute the identical
+	// mask, and loop forever on the same already-tried candidates.
+	b = append(b, 0x20, locMask)
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, locWindowBase)
+	b = append(b, 0x41, 0x10) // 16
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locWindowBase)
+	b = append(b, 0x0B) // end if
+
+	// Per-branch dispatch on locAttemptStart (unchanged from the original
+	// per-branch bodies — factored into a closure since the tail scan below
+	// needs the identical dispatch code).
 	locals := litChainBranchLocals{
 		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
-		SimdMask: locSimdMask, ScalarIdx: locScalarIdx,
+		SimdMask: locScalarIdx, ScalarIdx: locScalarIdx,
 		Chunk: locChunk, VerifyTlo: locVerifyTlo, VerifyPow2: locVerifyPow2,
 	}
-	for i, br := range altp.branches {
+	// emitBranch emits the dispatch code for exactly one branch (its own
+	// first-byte check included — cheap enough to leave in place even when
+	// the caller already knows the byte matches via the group dispatch
+	// below, and keeping it means this function needn't change shape
+	// between its two call sites).
+	emitBranch := func(b []byte, idx int) []byte {
+		br := altp.branches[idx]
 		b = append(b, 0x02, 0x40) // block $next_branch_i
 
 		if br.isLitChain {
@@ -11039,7 +11129,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 				count: br.count, useSIMD: br.useSIMD,
 				startAnchor: br.startAnchor, endAnchor: br.endAnchor,
 			}
-			b = emitLitChainAltLitBranchBody(b, chainBr, l.branchBitmapOff[i], locals, tableMemIdx)
+			b = emitLitChainAltLitBranchBody(b, chainBr, l.branchBitmapOff[idx], locals, tableMemIdx)
 		} else {
 			// DFA branch: first-byte dispatch + inline DFA from attempt_start.
 			b = append(b, 0x20, locPtr)
@@ -11051,6 +11141,24 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 			b = append(b, 0x47)
 			b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i
 
+			// Cheap reject on the rest of the literal before the (relatively
+			// expensive) per-byte inline DFA verify below. Without this, a
+			// false hit on just literal[0] (e.g. 'e' for "eyJ...", one of the
+			// most common bytes in ordinary text) pays for a full DFA
+			// simulation every time instead of a couple of byte compares —
+			// see plans/TODO.md task 24's promotion-regression writeup.
+			if len(br.literal) > 1 {
+				b = append(b, 0x20, locAttemptStart)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(len(br.literal)))
+				b = append(b, 0x6A)
+				b = append(b, 0x20, locLen)
+				b = append(b, 0x4B)       // i32.gt_u
+				b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i (literal can't fit)
+
+				b = emitLiteralByteVerify(b, br.literal, 1, locPtr, locAttemptStart, 0)
+			}
+
 			b = append(b, 0x20, locAttemptStart)
 			b = append(b, 0x21, locDFAPos)
 			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout, br.dfaTable,
@@ -11061,17 +11169,133 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 		}
 
 		b = append(b, 0x0B) // end $next_branch_i
+		return b
+	}
+	emitDispatch := func(b []byte) []byte {
+		for i := range altp.branches {
+			b = emitBranch(b, i)
+		}
+		return b
 	}
 
-	// All branches failed — advance attempt_start by 1 and restart.
+	// Group branches by literal[0] (almost always one branch per group —
+	// distinct literals rarely share a first byte) and dispatch straight to
+	// the matching group via br_table on the candidate byte value, instead
+	// of trying every branch's first-byte check in sequence. This is the
+	// second half of the task-24 fix: fix #1 (cheap literal pre-check) and
+	// fix #2 (mask persistence) address the cost of a false-positive
+	// candidate; this addresses the cost of a TRUE-positive one still
+	// having to walk past every other branch's first-byte compare before
+	// reaching the right one. See plans/TODO.md task 24.
+	type group struct {
+		firstByte byte
+		branches  []int
+	}
+	var groups []group
+	groupOf := [256]int{}
+	for i := range groupOf {
+		groupOf[i] = -1
+	}
+	for i, br := range altp.branches {
+		fb := br.literal[0]
+		if gi := groupOf[fb]; gi >= 0 {
+			groups[gi].branches = append(groups[gi].branches, i)
+			continue
+		}
+		groupOf[fb] = len(groups)
+		groups = append(groups, group{firstByte: fb, branches: []int{i}})
+	}
+	n := len(groups)
+
+	// Open n nested blocks: group 0 innermost (closest to br_table), group
+	// n-1 outermost. Label i (from br_table's position) exits block i,
+	// landing exactly at group i's dispatch code; label n reaches past all
+	// of them to $lit_outer (used as br_table's default — unreachable in
+	// practice, since Shufti's candidate test is exact, not approximate).
+	for i := 0; i < n; i++ {
+		b = append(b, 0x02, 0x40) // block $group_i
+	}
+
+	b = append(b, 0x20, locPtr)
 	b = append(b, 0x20, locAttemptStart)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x6A)
-	b = append(b, 0x21, locAttemptStart)
+	b = append(b, 0x6A)             // i32.add
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u — candidate byte value
+	b = append(b, 0x0E)             // br_table
+	b = utils.AppendULEB128(b, 256)
+	for v := 0; v < 256; v++ {
+		target := n
+		if gi := groupOf[v]; gi >= 0 {
+			target = gi
+		}
+		b = utils.AppendULEB128(b, uint32(target))
+	}
+	b = utils.AppendULEB128(b, uint32(n)) // default (unreachable)
+
+	for i := 0; i < n; i++ {
+		b = append(b, 0x0B) // end block $group_i — lands here for label i
+		for _, idx := range groups[i].branches {
+			b = emitBranch(b, idx)
+		}
+		if i < n-1 {
+			// Skip the remaining (definitely-wrong-first-byte) groups —
+			// without this, falling through would wrongly re-try this
+			// candidate against a group whose first byte doesn't match.
+			b = append(b, 0x0C, byte(n-1-i)) // br (n-1-i) → continue $lit_outer
+		}
+		// i == n-1: natural fallthrough into the existing "br 0 →
+		// $lit_outer" below reaches the same place.
+	}
+
+	// All groups failed at this candidate — loop back. mask was already
+	// advanced above, so the next iteration either tries the next candidate
+	// bit in the same window for free, or refills once mask is exhausted.
 	b = append(b, 0x0C, 0x00) // br 0 → $lit_outer
 
 	b = append(b, 0x0B) // end loop $lit_outer
 	b = append(b, 0x0B) // end block $no_match
+
+	// ---- tail: scalar scan of the remaining <16 bytes ----
+	// Reached when the SIMD window scan ran out of room for a full 16-byte
+	// load. At most 15 bytes remain, so a plain scalar scan (not
+	// perf-critical) suffices — reuses the same firstByteFlags data segment
+	// the old emitPrefixScan-based scalar tail used. locWindowBase is
+	// repurposed here as the scalar scan cursor.
+	b = append(b, 0x02, 0x40) // block $tail_done
+	b = append(b, 0x03, 0x40) // loop $tail_scan
+
+	// if windowBase >= len: br 1 → $tail_done (exhausted, no match)
+	b = append(b, 0x20, locWindowBase)
+	b = append(b, 0x20, locLen)
+	b = append(b, 0x4F)       // i32.ge_u
+	b = append(b, 0x0D, 0x01) // br_if 1 → $tail_done
+
+	b = append(b, 0x02, 0x40) // block $not_a_candidate
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, l.firstByteOff)
+	b = append(b, 0x20, locPtr)
+	b = append(b, 0x20, locWindowBase)
+	b = append(b, 0x6A)                     // i32.add
+	b = append(b, 0x2D, 0x00, 0x00)         // i32.load8_u (input byte)
+	b = append(b, 0x6A)                     // firstByteOff + byte
+	b = appendTableLoad8u(b, tableMemIdx)   // i32.load8_u (flag)
+	b = append(b, 0x45)                     // i32.eqz
+	b = append(b, 0x0D, 0x00)               // br_if 0 → $not_a_candidate (skip dispatch)
+
+	b = append(b, 0x20, locWindowBase)
+	b = append(b, 0x21, locAttemptStart)
+	b = emitDispatch(b)
+	// (falls through here only if every branch failed at this position)
+
+	b = append(b, 0x0B) // end block $not_a_candidate
+
+	b = append(b, 0x20, locWindowBase)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, locWindowBase)
+	b = append(b, 0x0C, 0x00) // br 0 → continue $tail_scan
+
+	b = append(b, 0x0B) // end loop $tail_scan
+	b = append(b, 0x0B) // end block $tail_done
 
 	b = append(b, 0x42, 0x7F)
 	b = append(b, 0x0B)

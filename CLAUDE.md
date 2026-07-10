@@ -60,6 +60,13 @@ regexped/
 ├── perftest/
 │   ├── main.go                # Performance benchmarks vs regex crate
 │   └── Makefile               # Builds harnesses, runs benchmarks
+├── tools/
+│   ├── likelytest/
+│   │   ├── main.go            # LikelyMode 3-way benchmark matrix (see Testing below)
+│   │   └── Makefile           # Runs the matrix, captures baseline
+│   └── pattest/
+│       ├── main.go            # Single-pattern ad-hoc LikelyMode benchmarking CLI (see Testing below)
+│       └── Makefile           # Runs against a pattern/mode/input file; example targets
 ├── docs/
 │   ├── cli.md                 # CLI reference: commands, flags, config schema
 │   ├── rust-api.md            # Generated Rust API: function signatures, iterators
@@ -340,6 +347,40 @@ make run        # from perftest/
 Benchmarks regexped vs regex crate (via wasmtime), showing per-pattern ns/op and speedup factor.
 Harnesses must be pre-built with `make harnesses` if changed.
 
+### LikelyMode benchmark matrix (`tools/likelytest/`)
+
+```bash
+make run        # from tools/likelytest/
+make baseline   # captures current numbers to baseline_likely.txt
+```
+
+Compiles a hand-picked set of patterns under all three `LikelyMode` values (neutral,
+likely-match, likely-nomatch) and prints a per-pattern matrix of wall-clock time, fuel,
+and WASM size for each mode against both a matching and a non-matching input, with Δ%
+vs. neutral. Time is the **p50** (median, not mean) of 10,000 in-WASM timing samples per
+cell — see `computeStat` in `shims.go`.
+
+When a mode's compiled WASM is byte-identical to neutral's, that row prints `identical
+WASM — same as neutral, timing/fuel run skipped` instead of numbers: comparing wall-time
+across identical code is pure measurement noise, not signal (confirmed empirically —
+swings up to +137% between runs of literally the same bytes on sub-microsecond cases).
+Debugging env vars: `LIKELYTEST_FILTER=<substring>` runs only matching test cases;
+`DEBUG_STATS=1` prints p50/p90/p99/mean side by side per measurement.
+
+### Single-pattern ad-hoc benchmarking (`tools/pattest/`)
+
+```bash
+make run ARGS="-pattern '[a-z]+' -mode find -inputs myinputs.txt"   # from tools/pattest/
+```
+
+CLI tool for benchmarking one user-supplied pattern under all three `LikelyMode` values
+against a caller-provided list of candidate inputs (one per line), bucketed into
+matching/non-matching via Go stdlib `regexp` as ground truth. Reports fuel (single
+measurement) and average wall-clock time (100,000 iterations) per mode per bucket — use
+this for quick, targeted investigation of a specific pattern shape rather than
+`likelytest`'s fixed curated set. `make example-lm` / `make example-lnm` /
+`make example-combined` run pre-built demonstration patterns.
+
 ## Memory Layout
 
 ### Embedded (Rust/Go/C via wasm-merge)
@@ -482,12 +523,12 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 - **Go 1.25.9+**
 - **gopkg.in/yaml.v3** — YAML parsing
-- **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (re2test only)
+- **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (re2test, `tools/likelytest`, `tools/pattest`, perftest only — not a dependency of the compiler itself)
 - **wasm-merge** (external, Binaryen) — for `merge` command and perftest
 
 ---
 
-**Last Updated:** 2026-05-17
+**Last Updated:** 2026-07-09
 **CLI commands:** `generate` (stubs), `compile`, `merge`, `diag` (write set composition diagnostics JSON via `CmdWriteDiagJSON`)
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition)
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

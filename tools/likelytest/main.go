@@ -89,6 +89,19 @@ var tests = []testCase{
 		nomatchInput: configInput(nil),
 	},
 	{
+		// Task 24: worst-case no-match input for promoting Opt 2 to
+		// unconditional. "ghp_" false positives each 1 byte short of a full
+		// match, forcing the full 35-byte chain walk to fail every time —
+		// unlike secrets-github's nomatchInput above (no "ghp_" at all, so
+		// Opt 2 never even engages past the literal-prefix scan).
+		name:         "secrets-github-false-positive",
+		pattern:      `ghp_[A-Za-z0-9]{36}`,
+		mode:         modeFind,
+		notes:        "near-miss ghp_ false positives (35/36 chars) — Opt 2 promotion worst case",
+		matchInput:   configInput([]string{"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
+		nomatchInput: secretsFalsePositiveInput(),
+	},
+	{
 		// Long synthetic counted chain — amplifies Opt 2's win as N grows.
 		// 65-state chain after a 4-byte literal.
 		name:         "long-counted-chain",
@@ -150,6 +163,30 @@ var tests = []testCase{
 		matchInput: configInput([]string{
 			"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
 			"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY12",
+		}),
+		nomatchInput: configInput(nil),
+	},
+	{
+		// Task 24 promotion regression, found via perftest's "secrets-combined"
+		// (JWT + GitHub PAT + AWS key). The JWT branch ("eyJ...") is a DFA
+		// branch (three unbounded segments, not a lit-chain shape): its first
+		// byte 'e' is one of the most common letters in ordinary text/config
+		// filler (812 occurrences in a 10 KB realistic env-file corpus), and
+		// every occurrence pays a full emitInlineAnchoredDFAVerify call —
+		// unlike the ghp_/AKIA lit-chain branches, which reject a false
+		// first-byte hit in a couple of cheap literal-byte compares before
+		// ever reaching expensive verification. Root-caused and reported in
+		// plans/TODO.md task 24's promotion follow-up; this case reproduces
+		// perftest's measured ~3x fuel regression in likelytest so the fix
+		// has a tracked, repeatable benchmark.
+		name:    "secrets-combined-jwt-mixed-alt",
+		pattern: `eyJ[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+|ghp_[A-Za-z0-9]{36}|AKIA[A-Z0-9]{16}`,
+		mode:    modeFind,
+		notes:   "3-way alt with a JWT (non-lit-chain) branch — task 24 regression target",
+		matchInput: configInput([]string{
+			"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+			"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
+			"AKIAIOSFODNN7EXAMPLE",
 		}),
 		nomatchInput: configInput(nil),
 	},
@@ -797,6 +834,32 @@ func litAnchorFalsePositiveInput() string {
 		b = append(b, filler...)
 		b = append(b, nearMissPrefix...)
 		b = append(b, []byte("INFO:")...)
+	}
+	return string(b[:targetSize])
+}
+
+// secretsFalsePositiveInput builds ~50 KB of no-match input for
+// `ghp_[A-Za-z0-9]{36}` (task 24: promoting the Opt 2 counted-chain SIMD
+// verifier from LikelyMatch-gated to unconditional). Scatters "ghp_"
+// occurrences through filler text, each followed by exactly 35 valid
+// [A-Za-z0-9] bytes — one short of the 36 required — so the pattern never
+// actually matches, but both the plain DFA's counted-chain walk and Opt 2's
+// SIMD chain-verify must consume all 35 valid bytes before the 36th
+// (non-alnum) byte proves failure. This is the worst case for Opt 2: unlike
+// a false positive that dies within the first byte or two, this one forces
+// the full chain-length comparison every time, which is exactly the
+// scenario where a regression from unconditional promotion would show up
+// if one exists. Filler is alnum-free so a 35-byte near-miss run can never
+// accidentally extend past 36 bytes at a concatenation boundary.
+func secretsFalsePositiveInput() string {
+	const targetSize = 50 * 1024
+	filler := []byte(", the quick brown fox jumps over the lazy dog - filler text goes here forever; ")
+	nearMissSuffix := []byte("AbCdEfGhIjKlMnOpQrStUvWxYz012345678") // 35 chars, one short of 36
+	var b []byte
+	for len(b) < targetSize {
+		b = append(b, filler...)
+		b = append(b, []byte("ghp_")...)
+		b = append(b, nearMissSuffix...)
 	}
 	return string(b[:targetSize])
 }
