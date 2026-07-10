@@ -54,13 +54,13 @@ regexped/
 ├── internal/
 │   └── utils/
 │       └── bytes.go           # LEB128, page alignment, WasmMemTop
-├── re2test/
-│   ├── main.go                # RE2 exhaustive test runner (wasmtime-based)
-│   └── Makefile               # Unpacks test data, runs tests
-├── perftest/
-│   ├── main.go                # Performance benchmarks vs regex crate
-│   └── Makefile               # Builds harnesses, runs benchmarks
 ├── tools/
+│   ├── re2test/
+│   │   ├── main.go            # RE2 exhaustive test runner (wasmtime-based)
+│   │   └── Makefile           # Unpacks test data, runs tests
+│   ├── perftest/
+│   │   ├── main.go            # Performance benchmarks vs regex crate
+│   │   └── Makefile           # Builds harnesses, runs benchmarks
 │   ├── likelytest/
 │   │   ├── main.go            # LikelyMode 3-way benchmark matrix (see Testing below)
 │   │   └── Makefile           # Runs the matrix, captures baseline
@@ -314,12 +314,12 @@ Main module is listed first so it keeps `memory[0]` in the merged output; regexp
 
 ## Testing
 
-### RE2 exhaustive test (`re2test/`)
+### RE2 exhaustive test (`tools/re2test/`)
 
 ```bash
 make re2test     # from repo root
 # or
-make test        # from re2test/
+make test        # from tools/re2test/
 ```
 
 Test data is unpacked from `$GOROOT/src/regexp/testdata/re2-exhaustive.txt.bz2`.
@@ -336,12 +336,12 @@ Each pattern is compiled and tested for:
 - Col 1: non-anchored find (LeftmostFirst DFA)
 - Col 5: non-anchored find with captures (with --validate-groups)
 
-### Performance benchmarks (`perftest/`)
+### Performance benchmarks (`tools/perftest/`)
 
 ```bash
 make perftest   # from repo root
 # or
-make run        # from perftest/
+make run        # from tools/perftest/
 ```
 
 Benchmarks regexped vs regex crate (via wasmtime), showing per-pattern ns/op and speedup factor.
@@ -523,12 +523,12 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 - **Go 1.25.9+**
 - **gopkg.in/yaml.v3** — YAML parsing
-- **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (re2test, `tools/likelytest`, `tools/pattest`, perftest only — not a dependency of the compiler itself)
-- **wasm-merge** (external, Binaryen) — for `merge` command and perftest
+- **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (`tools/re2test`, `tools/likelytest`, `tools/pattest`, `tools/perftest` only — not a dependency of the compiler itself)
+- **wasm-merge** (external, Binaryen) — for `merge` command and `tools/perftest`
 
 ---
 
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-07-10
 **CLI commands:** `generate` (stubs), `compile`, `merge`, `diag` (write set composition diagnostics JSON via `CmdWriteDiagJSON`)
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition)
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

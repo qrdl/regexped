@@ -8,13 +8,13 @@ regexped: $(GO_SRCS) go.mod go.sum
 	go build -o regexped .
 
 re2test: build
-	$(MAKE) -C re2test test
+	$(MAKE) -C tools/re2test test
 
 perftest: build
-	$(MAKE) -C perftest
+	$(MAKE) -C tools/perftest
 
 perftest-check: build
-	$(MAKE) -C perftest perftest-check
+	$(MAKE) -C tools/perftest perftest-check
 
 examples: build
 	$(MAKE) -C examples
@@ -36,6 +36,6 @@ fmt:
 
 clean:
 	rm -f regexped
-	$(MAKE) -C re2test clean
-	$(MAKE) -C perftest clean
+	$(MAKE) -C tools/re2test clean
+	$(MAKE) -C tools/perftest clean
 	$(MAKE) -C examples clean

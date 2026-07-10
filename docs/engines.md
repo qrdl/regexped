@@ -256,7 +256,7 @@ Regexped implements **RE2 syntax with Perl/RE2 semantics** (leftmost-first match
 
 ## RE2 Test Coverage
 
-The RE2 exhaustive test suite (`re2test/`) reports:
+The RE2 exhaustive test suite (`tools/re2test/`) reports:
 
 - **~4.94M passing** (DFA + Compiled DFA; match and find)
 - **~4.94M passing** (Backtracking engine forced via `--force-backtrack`; match and find)

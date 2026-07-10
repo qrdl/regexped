@@ -1,8 +1,8 @@
-module github.com/qrdl/regexped/perftest
+module github.com/qrdl/regexped/tools/re2test
 
-go 1.25
+go 1.25.9
 
-replace github.com/qrdl/regexped => ../
+replace github.com/qrdl/regexped => ../../
 
 require (
 	github.com/bytecodealliance/wasmtime-go/v42 v42.0.0

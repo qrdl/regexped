@@ -15,7 +15,7 @@ slot positions).
 ```bash
 make re2test          # from repo root
 # or
-make test             # from re2test/
+make test             # from tools/re2test/
 ```
 
 Test data is unpacked automatically from the Go standard library.

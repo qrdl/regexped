@@ -45,7 +45,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Run RE2 test suite
-        working-directory: re2test
+        working-directory: tools/re2test
         run: make test
 
   docker:
