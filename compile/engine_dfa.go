@@ -1458,9 +1458,20 @@ type dfaLayout struct {
 // (Sections 7-8).
 type dominantInfo struct {
 	state       int32  // WASM state ID (> 0)
-	exitBytes   []byte // 1..8 exit bytes (Shufti cap)
-	encodedByte byte   // the value stored in midAcceptBytes[state] (mid) or nonMidDominantBytes[state] (non-mid)
-	isMidAccept bool   // true → encodedByte in midAcceptBytes; false → in nonMidDominantBytes
+	exitBytes   []byte // 1..8 exit bytes (Shufti cap); mutually exclusive with selfLoopSet
+	// selfLoopSet (task 26, plans/TODO.md): 9..64 bytes — the self-loop
+	// membership set itself, for states recorded by detectShuftiSelfLoop
+	// rather than detectDominantSelfLoop. Used instead of exitBytes when
+	// the SELF-LOOP side is the small (≤64, Shufti-cap) side rather than
+	// the exit side — e.g. a 62-byte `[a-zA-Z0-9]` self-loop with a huge
+	// (194-byte) exit set, which detectDominantSelfLoop's ≤8-exit-byte gate
+	// can never reach. emitDominantBulkSkip tests membership in this set
+	// directly and inverts the mask (stop at the first byte NOT a member)
+	// instead of testing membership in exitBytes directly. Always
+	// mid-accept in the current implementation (see detectShuftiSelfLoop).
+	selfLoopSet []byte
+	encodedByte byte // the value stored in midAcceptBytes[state] (mid) or nonMidDominantBytes[state] (non-mid)
+	isMidAccept bool // true → encodedByte in midAcceptBytes; false → in nonMidDominantBytes
 }
 
 // dfaTableBytes returns the upper-bound byte footprint of the runtime transition
@@ -1955,6 +1966,11 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 	// table); emission is gated separately at the call site.
 	detectDominantSelfLoop(l)
 
+	// Task 26 — Shufti-membership self-loop detection. Complements the
+	// above (states it claims are skipped by detectShuftiSelfLoop); also
+	// unconditional and cheap, appends into the same l.dominantStates.
+	detectShuftiSelfLoop(l)
+
 	// Task 8 — dead-state skip safety analysis. Sets l.skipSafeOnDead.
 	// Only meaningful in find mode (needFind=true); for non-find layouts
 	// the value is computed but never read.
@@ -2445,6 +2461,106 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		out = append(out, info)
 	}
 	l.dominantStates = out
+}
+
+// detectShuftiSelfLoop (task 26, plans/TODO.md) scans the WASM-space
+// transition table for mid-accept states whose self-loop set is 9..64
+// bytes — below detectDominantSelfLoop's 240-byte/≤8-exit-byte gate (which
+// requires the EXIT set to be the small side), but within
+// emitShuftiPrefixCheck's ≤64-byte Shufti membership cap on the SELF-LOOP
+// set directly. Complements detectDominantSelfLoop rather than overlapping
+// it: states it already claimed are skipped, and matches are appended
+// directly into l.dominantStates using the same dominantInfo type (with
+// selfLoopSet set instead of exitBytes), so every existing consumer of
+// l.dominantStates (buildMatchBody, buildFindBody, buildLitAnchorFindBody,
+// genSuffixWASM, alt_lit_anchor.go) picks these up for free via
+// emitDominantBulkSkip's selfLoopSet branch — no separate dispatch wiring
+// needed.
+//
+// v1 scope: mid-accept only (reuses the same midAcceptBytes piggyback as
+// detectDominantSelfLoop's mid channel; every state this project's Task 20
+// audit identified as a motivating case — e.g. `ID:[a-zA-Z0-9]{10,}`'s
+// self-loop state — is mid-accept). Non-mid-accept states with a
+// moderately-wide self-loop are out of scope for v1.
+//
+// Encoding: midAcceptBytes[state] = 128 + idx, a third sub-range alongside
+// detectDominantSelfLoop's own 2..127 (mid dominants) — 0 = nothing,
+// 1 = plain mid-accept, 2..127 = exit-based dominant idx, 128..253 = Shufti
+// self-loop idx. Capped at 126 entries, matching the existing per-kind cap.
+func detectShuftiSelfLoop(l *dfaLayout) {
+	const minWidth = 9
+	const maxWidth = 64
+	const maxStates = 126
+
+	if l.numWASM <= 1 {
+		return
+	}
+
+	already := make(map[int32]bool, len(l.dominantStates))
+	for _, info := range l.dominantStates {
+		already[info.state] = true
+	}
+
+	cellsPerState := 256
+	if l.useCompression {
+		cellsPerState = l.numClasses
+	}
+	var classByteCount [256]int
+	if l.useCompression {
+		for b := 0; b < 256; b++ {
+			classByteCount[l.classMap[b]]++
+		}
+	}
+	readCell := func(state, idx int) int32 {
+		row := state
+		if l.useRowDedup {
+			row = int(l.rowMapBytes[state])
+		}
+		off := row*cellsPerState + idx
+		if l.useU8 {
+			return int32(l.tableBytes[off])
+		}
+		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
+	}
+
+	idx := 0
+	for state := int32(1); state < int32(l.numWASM); state++ {
+		if already[state] {
+			continue
+		}
+		if int(state) >= len(l.midAcceptBytes) || l.midAcceptBytes[state] == 0 {
+			continue // v1 is mid-accept only
+		}
+		var selfSet []byte
+		for c := 0; c < cellsPerState; c++ {
+			if readCell(int(state), c) != state {
+				continue
+			}
+			if l.useCompression {
+				for b := 0; b < 256; b++ {
+					if int(l.classMap[b]) == c {
+						selfSet = append(selfSet, byte(b))
+					}
+				}
+			} else {
+				selfSet = append(selfSet, byte(c))
+			}
+		}
+		if len(selfSet) < minWidth || len(selfSet) > maxWidth {
+			continue
+		}
+		if idx >= maxStates {
+			continue
+		}
+		sort.Slice(selfSet, func(i, j int) bool { return selfSet[i] < selfSet[j] })
+		l.dominantStates = append(l.dominantStates, dominantInfo{
+			state:       state,
+			selfLoopSet: selfSet,
+			encodedByte: byte(128 + idx),
+			isMidAccept: true,
+		})
+		idx++
+	}
 }
 
 // applyDominantStateEncoding writes each mid-accept dominantInfo's encoded
@@ -3101,7 +3217,7 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 			b = utils.AppendSLEB128(b, int32(info.encodedByte))
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (encoded byte match)
-			b = emitDominantBulkSkip(b, info.exitBytes, false,
+			b = emitDominantBulkSkip(b, info, false,
 				lScanPos, paramLen, 0x00, paramPtr,
 				lBulkChunk, lByteClass)
 			// Re-update endPos_k for each pattern in lBitsScratch.
@@ -3142,7 +3258,7 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 			b = utils.AppendSLEB128(b, info.state)
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (state == K)
-			b = emitDominantBulkSkip(b, info.exitBytes, false,
+			b = emitDominantBulkSkip(b, info, false,
 				lScanPos, paramLen, 0x00, paramPtr,
 				lBulkChunk, lByteClass)
 			b = append(b, 0x0B) // end if
@@ -3472,17 +3588,28 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 }
 
 // emitDominantBulkSkip emits the LikelyNoMatch SIMD bulk-skip block for a
-// state with a 1..8-byte exit set. Inserts INSIDE the find-mode inner
-// scan loop, AFTER the per-byte transition and midAccept update, BEFORE
-// pos++.
+// dominant self-loop state. Inserts INSIDE the find-mode inner scan loop,
+// AFTER the per-byte transition and midAccept update, BEFORE pos++.
 //
-// Two emission paths based on `len(exitBytes)`:
+// Three emission paths, chosen by which of `info.selfLoopSet` /
+// `info.exitBytes` is populated (mutually exclusive):
 //
-//   • Single-byte (Phase 2): `i8x16.splat + i8x16.eq + i8x16.bitmask`.
-//     Three SIMD ops; the splat constant is folded by JIT into the
-//     loop preamble. Fast path for patterns like `//[^\n]+`.
+//   • Task 26 — self-loop-set Shufti (info.selfLoopSet, 9..64 bytes):
+//     the self-loop set itself is the small side. Tests membership in it
+//     directly via the shared emitShuftiPrefixCheck primitive and inverts
+//     the resulting bitmask (XOR 0xFFFF) so "stop" bits mark bytes NOT in
+//     the self-loop class. Used when the exit set is too large for the
+//     paths below (e.g. a 62-byte `[a-zA-Z0-9]` self-loop with a 194-byte
+//     exit set — detectDominantSelfLoop's ≤8-exit-byte gate can never
+//     reach this shape). See detectShuftiSelfLoop.
 //
-//   • Multi-byte (Phase 5, ≤ 8 bytes): Shufti-style nibble lookup.
+//   • Single exit byte (Phase 2, info.exitBytes len 1):
+//     `i8x16.splat + i8x16.eq + i8x16.bitmask`. Three SIMD ops; the splat
+//     constant is folded by JIT into the loop preamble. Fast path for
+//     patterns like `//[^\n]+`.
+//
+//   • Multi exit byte (Phase 5, info.exitBytes len 2..8): Shufti-style
+//     nibble lookup on the EXIT set (the small side in this case).
 //     Build two 16-byte tables T_lo and T_hi where bit i of T_lo[lo]
 //     (resp. T_hi[hi]) is set iff exit byte i has low (resp. high)
 //     nibble equal to lo (resp. hi). Per chunk:
@@ -3494,6 +3621,10 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 //     like `https?://[^\s]+` (6-byte `\s` exit) and `<[^>]+>` if
 //     a future revisit broadens.
 //
+// All three paths converge on the same "stop" bitmask semantics (bit k set
+// ⇔ lane k is where the self-loop run ends), so the ctz/pos-advance tail
+// below is shared regardless of which path built the mask.
+//
 // Contract:
 //   - Caller MUST guard the call so it only runs when state == dominantState.
 //     Option 1 piggybacks on the midAccept[state] lookup; the dominant
@@ -3502,7 +3633,9 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 //   - Requires the dominant state to be mid-accepting: every byte while
 //     in it is a valid match end. Detection sets the encoding only when
 //     this holds.
-//   - exitBytes length is 1..8 (Shufti cap). Detection enforces this.
+//   - exitBytes length is 1..8 (Shufti cap); selfLoopSet length is 9..64
+//     (emitShuftiPrefixCheck's cap) when used instead. Detection enforces
+//     both bounds and their mutual exclusivity.
 //   - Uses 1 i32 scratch local (`tmpLocal`) and 1 v128 scratch (`chunkLocal`),
 //     both must be safe to clobber at this point (e.g. the Teddy-scan-phase
 //     locals which are unused inside the DFA scan loop).
@@ -3571,7 +3704,7 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 			b = utils.AppendSLEB128(b, int32(info.encodedByte))
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info.exitBytes, false,
+			b = emitDominantBulkSkip(b, info, false,
 				posLocal, lenLocal, /*lastAccept=*/ 0x00, ptrLocal,
 				chunkLocal, tmpLocal)
 			b = append(b, 0x0B) // end if (per-dominant gate)
@@ -3594,7 +3727,7 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 			b = utils.AppendSLEB128(b, info.state)
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info.exitBytes, false,
+			b = emitDominantBulkSkip(b, info, false,
 				posLocal, lenLocal, /*lastAccept=*/ 0x00, ptrLocal,
 				chunkLocal, tmpLocal)
 			b = append(b, 0x0B) // end if
@@ -3603,9 +3736,10 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 	return b
 }
 
-func emitDominantBulkSkip(b []byte, exitBytes []byte, updateLastAccept bool,
+func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	posLocal, lenLocal, lastAcceptLocal,
 	ptrLocal, chunkLocal, tmpLocal byte) []byte {
+	exitBytes := info.exitBytes
 
 	// block $bulk_done
 	b = append(b, 0x02, 0x40)
@@ -3629,7 +3763,18 @@ func emitDominantBulkSkip(b []byte, exitBytes []byte, updateLastAccept bool,
 	b = append(b, 0xFD, 0x00, 0x00, 0x00)
 	b = append(b, 0x21, chunkLocal)
 
-	if len(exitBytes) == 1 {
+	if len(info.selfLoopSet) > 0 {
+		// Task 26: self-loop set is the small (≤64, Shufti-cap) side, not
+		// the exit side. Test membership in it directly via the shared
+		// Shufti primitive (leaves an i32 bitmask, bit k set ⇔ lane k IS a
+		// member) and invert: a "stop" bit means the byte is NOT a member
+		// — the first byte outside the self-loop class, which is exactly
+		// what the ctz/pos-advance logic below needs.
+		b = emitShuftiPrefixCheck(b, info.selfLoopSet, chunkLocal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(0xFFFF))
+		b = append(b, 0x73) // i32.xor — invert the 16 relevant bits
+	} else if len(exitBytes) == 1 {
 		// Phase 2 single-byte: m = bitmask(eq(chunk, splat(exit))).
 		b = append(b, 0x20, chunkLocal)
 		b = append(b, 0x41)
@@ -4984,7 +5129,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 			b = utils.AppendSLEB128(b, int32(info.encodedByte))
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info.exitBytes, true,
+			b = emitDominantBulkSkip(b, info, true,
 				locPos, locLen, locLastAccept, locPtr,
 				locChunk, locSimdOrClass)
 			b = append(b, 0x0B) // end if (per-dominant gate)
@@ -5001,7 +5146,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 			b = utils.AppendSLEB128(b, info.state)
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info.exitBytes, false,
+			b = emitDominantBulkSkip(b, info, false,
 				locPos, locLen, locLastAccept, locPtr,
 				locChunk, locSimdOrClass)
 			b = append(b, 0x0B) // end if (state == K)
@@ -5221,7 +5366,7 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 			b = utils.AppendSLEB128(b, int32(info.encodedByte))
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info.exitBytes, true,
+			b = emitDominantBulkSkip(b, info, true,
 				locPos, locLen, locLastAccept, locPtr,
 				locChunk, locSimdOrClass)
 			b = append(b, 0x0B) // end if (per-dominant gate)
@@ -5238,7 +5383,7 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 			b = utils.AppendSLEB128(b, info.state)
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info.exitBytes, false,
+			b = emitDominantBulkSkip(b, info, false,
 				locPos, locLen, locLastAccept, locPtr,
 				locChunk, locSimdOrClass)
 			b = append(b, 0x0B) // end if (state == K)
@@ -6102,7 +6247,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				b = utils.AppendSLEB128(b, int32(info.encodedByte))
 				b = append(b, 0x46)       // i32.eq
 				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info.exitBytes, true,
+				b = emitDominantBulkSkip(b, info, true,
 					/*pos=*/ 0x03, /*len=*/ 0x01,
 					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
 					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ 0x06)
@@ -6130,7 +6275,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				b = utils.AppendSLEB128(b, info.state)
 				b = append(b, 0x46)       // i32.eq
 				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info.exitBytes, false,
+				b = emitDominantBulkSkip(b, info, false,
 					/*pos=*/ 0x03, /*len=*/ 0x01,
 					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
 					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ 0x06)
@@ -6224,7 +6369,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				b = utils.AppendSLEB128(b, int32(info.encodedByte))
 				b = append(b, 0x46)       // i32.eq
 				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info.exitBytes, true,
+				b = emitDominantBulkSkip(b, info, true,
 					/*pos=*/ 0x03, /*len=*/ 0x01,
 					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
 					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ simdMaskLocal)
@@ -6247,7 +6392,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				b = utils.AppendSLEB128(b, info.state)
 				b = append(b, 0x46)       // i32.eq
 				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info.exitBytes, false,
+				b = emitDominantBulkSkip(b, info, false,
 					/*pos=*/ 0x03, /*len=*/ 0x01,
 					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
 					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ simdMaskLocal)

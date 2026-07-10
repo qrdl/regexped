@@ -646,6 +646,33 @@ var tests = []testCase{
 		matchInput:   strings.Repeat("aB3_", 2560) + "!",
 		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
 	},
+	{
+		// Task 26 target (task 20 follow-up): moderately-wide post-literal
+		// self-loop below detectDominantSelfLoop's 240/256-byte,
+		// <=8-exit-byte threshold. `[a-zA-Z0-9]` is 62 bytes — nowhere near
+		// dominant — so once Teddy finds "ID:", the forward scan through
+		// the ID value falls through to a plain scalar per-byte DFA walk
+		// with zero acceleration under any LikelyMode (confirmed via
+		// tools/pattest during task 20's audit: ~30-34 fuel/byte, flat
+		// across neutral/LM/LNM).
+		//
+		// Because the quantifier is open-ended (`{10,}`) and `find` returns
+		// on the first match, repeating "ID:<value>" wouldn't stress
+		// anything beyond the first hit — the real cost is in walking ONE
+		// long alnum run to its end. Match input is "ID:" + one alnum run
+		// spanning almost the whole buffer (no trailing non-alnum, so the
+		// greedy self-loop walks to EOF, ~50 KB). No-match input is plain
+		// "ID:"-free prose — the floor; there's no way to force a long
+		// self-loop walk on the no-match side for this pattern without
+		// changing its shape into Task 8's dead-end-retry territory
+		// instead.
+		name:         "post-literal-wide-self-loop",
+		pattern:      `ID:[a-zA-Z0-9]{10,}`,
+		mode:         modeFind,
+		notes:        "62-byte post-literal self-loop below dominant-bulk-skip threshold — task 26 target",
+		matchInput:   postLiteralWideSelfLoopInput(true),
+		nomatchInput: postLiteralWideSelfLoopInput(false),
+	},
 }
 
 // --------------------------------------------------------------------------
@@ -939,6 +966,36 @@ func minLenQuantifierSkipInput(withMatches bool) string {
 		b = append(b, 'a')
 	}
 	return string(b)
+}
+
+// postLiteralWideSelfLoopInput builds ~50 KB for `ID:[a-zA-Z0-9]{10,}`
+// (task 26). `find` returns on the FIRST match, so repeating "ID:<value> "
+// many times would only exercise the self-loop walk once (the first hit) —
+// no good as a cumulative stress test. Instead, when withMatches is true:
+// a single "ID:" followed by one alnum run spanning almost the entire
+// buffer, forcing the greedy `{10,}` self-loop to scalar-walk the full
+// ~50 KB to find where the run ends (no trailing non-alnum byte, so it
+// walks to EOF) — directly measuring the per-byte cost this task targets.
+// When false: plain "ID:"-free prose of the same size — the literal never
+// fires, so the post-hit self-loop scan never runs at all (the floor; see
+// the case's own comment for why the no-match side can't otherwise stress
+// this gap for an open-ended `{10,}` quantifier).
+func postLiteralWideSelfLoopInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	prose := []byte("the quick brown fox jumps over the lazy dog and other filler text goes here. ")
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, prose...)
+		}
+		return string(b[:targetSize])
+	}
+	alnum := []byte("aB3xR9mLq2ZpW7cD5nE8fH1jK4sT6vU0")
+	b := []byte("ID:")
+	for len(b) < targetSize {
+		b = append(b, alnum...)
+	}
+	return string(b[:targetSize])
 }
 
 // setShuftiLNMInput builds ~50 KB for the H.3 set-shufti-lnm case.
