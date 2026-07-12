@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -79,117 +80,6 @@ type testCase struct {
 }
 
 var tests = []testCase{
-	{
-		// Counted chain: ghp_ + [A-Za-z0-9]{36}. 37-state chain — Opt 2 target.
-		name:         "secrets-github",
-		pattern:      `ghp_[A-Za-z0-9]{36}`,
-		mode:         modeFind,
-		notes:        "37-state counted chain after literal — Opt 2 target",
-		matchInput:   configInput([]string{"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Task 24: worst-case no-match input for promoting Opt 2 to
-		// unconditional. "ghp_" false positives each 1 byte short of a full
-		// match, forcing the full 35-byte chain walk to fail every time —
-		// unlike secrets-github's nomatchInput above (no "ghp_" at all, so
-		// Opt 2 never even engages past the literal-prefix scan).
-		name:         "secrets-github-false-positive",
-		pattern:      `ghp_[A-Za-z0-9]{36}`,
-		mode:         modeFind,
-		notes:        "near-miss ghp_ false positives (35/36 chars) — Opt 2 promotion worst case",
-		matchInput:   configInput([]string{"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
-		nomatchInput: secretsFalsePositiveInput(),
-	},
-	{
-		// Long synthetic counted chain — amplifies Opt 2's win as N grows.
-		// 65-state chain after a 4-byte literal.
-		name:         "long-counted-chain",
-		pattern:      `KEYX[A-Z0-9]{64}`,
-		mode:         modeFind,
-		notes:        "65-state counted chain — Opt 2 amplification",
-		matchInput:   configInput([]string{"KEYXABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWX1234"}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Alternation of two counted chains. AC frontend buckets by literal prefix,
-		// then each bucket dispatches to its own counted-chain verifier.
-		name:         "secrets-combined",
-		pattern:      `AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}`,
-		mode:         modeFind,
-		notes:        "alternation of two counted chains — Opt 2 via bucket dispatch",
-		matchInput:   configInput([]string{"AKIAIOSFODNN7EXAMPLE", "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Word-boundary anchored lit-chain — canonical secret-detection idiom.
-		// Tests start \b + end \b on the single-pattern find path.
-		name:         "secrets-github-bounded",
-		pattern:      `\bghp_[A-Za-z0-9]{36}\b`,
-		mode:         modeFind,
-		notes:        "ghp_ secret with \\b at both ends — anchor support target",
-		matchInput:   configInput([]string{"see ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 here"}),
-		nomatchInput: configInput([]string{"Xghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Y"}),
-	},
-	{
-		// Strict alternation of two word-boundary anchored secrets. Exercises
-		// the anchor checks in buildLitChainAltFindBody.
-		name:    "secrets-combined-bounded",
-		pattern: `\bAKIA[A-Z0-9]{16}\b|\bghp_[A-Za-z0-9]{36}\b`,
-		mode:    modeFind,
-		notes:   "alternation of two \\b-bounded counted chains — strict-alt anchor target",
-		matchInput: configInput([]string{
-			"see AKIAIOSFODNN7EXAMPLE here",
-			"and ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab next",
-		}),
-		nomatchInput: configInput([]string{
-			"XAKIAIOSFODNN7EXAMPLEY",
-			"Xghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Y",
-		}),
-	},
-	{
-		// Mixed-shape alternation: one branch is lit-chain shape (ghp_...{36}),
-		// the other is NOT (has \s* between literal segments). Under strict
-		// alternation detection (current behaviour) this falls through to the
-		// DFA entirely — none of the 3 modes will diverge. Under lenient
-		// alternation (Phase 2.5, not yet implemented) the ghp_ branch would
-		// use lit-chain SIMD verify while the aws_secret_access_key branch
-		// would fall back to a per-branch DFA verifier inside the bucket
-		// dispatch. Test case here to document the gap.
-		name:    "secrets-mixed-alt",
-		pattern: `ghp_[A-Za-z0-9]{36}|aws_secret_access_key\s*=\s*[0-9a-zA-Z/+]{40}`,
-		mode:    modeFind,
-		notes:   "mixed alternation: lit-chain branch + non-lit-chain branch — needs lenient mode",
-		matchInput: configInput([]string{
-			"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
-			"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY12",
-		}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Task 24 promotion regression, found via perftest's "secrets-combined"
-		// (JWT + GitHub PAT + AWS key). The JWT branch ("eyJ...") is a DFA
-		// branch (three unbounded segments, not a lit-chain shape): its first
-		// byte 'e' is one of the most common letters in ordinary text/config
-		// filler (812 occurrences in a 10 KB realistic env-file corpus), and
-		// every occurrence pays a full emitInlineAnchoredDFAVerify call —
-		// unlike the ghp_/AKIA lit-chain branches, which reject a false
-		// first-byte hit in a couple of cheap literal-byte compares before
-		// ever reaching expensive verification. Root-caused and reported in
-		// plans/TODO.md task 24's promotion follow-up; this case reproduces
-		// perftest's measured ~3x fuel regression in likelytest so the fix
-		// has a tracked, repeatable benchmark.
-		name:    "secrets-combined-jwt-mixed-alt",
-		pattern: `eyJ[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+|ghp_[A-Za-z0-9]{36}|AKIA[A-Z0-9]{16}`,
-		mode:    modeFind,
-		notes:   "3-way alt with a JWT (non-lit-chain) branch — task 24 regression target",
-		matchInput: configInput([]string{
-			"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
-			"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
-			"AKIAIOSFODNN7EXAMPLE",
-		}),
-		nomatchInput: configInput(nil),
-	},
 	// ── Shufti prefix-scan targets (LNM Action 3) ───────────────────────
 	// Patterns with no usable literal anchor (no mandatoryLit) and a
 	// first-byte set of varying size. Today these fall to multi-eq SIMD
@@ -215,211 +105,6 @@ var tests = []testCase{
 		matchInput:   classRunInput(true, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", 20, 5),
 		nomatchInput: classRunInput(false, "", 0, 0),
 	},
-	// ── First-byte selectivity sweep (LNM smarter-gate research) ────────
-	// Five patterns sharing the shape `<lit><non-mid body><lit>` so the
-	// DFA has a non-mid-accept dominant body state. The first byte of the
-	// literal prefix varies from very-rare to very-common; the question
-	// the smarter-gate research wants answered is "where on this spectrum
-	// does the bulk-skip win exceed the per-iter dispatch cost on no-match
-	// input?"
-	{
-		// Capture variant of secrets-github: whole-match named group around the
-		// lit-chain. Anchored captures (groups_func semantics). matchInput leads
-		// with the secret so the anchored call succeeds once per outer iteration.
-		// Gap A target: single-pattern, whole-match capture.
-		name:         "secrets-github-grouped",
-		pattern:      `(?P<key>ghp_[A-Za-z0-9]{36})`,
-		mode:         modeGroups,
-		notes:        "lit-chain with named whole-match capture — Gap A target",
-		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab" + configInput(nil),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Capture variant of secrets-combined: strict alternation of two
-		// lit-chain branches, each wrapped in a named capture. Exercises the
-		// per-branch group layout with unmatched groups set to (-1, -1).
-		// Gap A target: strict alternation with captures.
-		name:         "secrets-combined-grouped",
-		pattern:      `(?P<aws>AKIA[A-Z0-9]{16})|(?P<ghp>ghp_[A-Za-z0-9]{36})`,
-		mode:         modeGroups,
-		notes:        "strict-alt of two captured lit-chains — Gap A target",
-		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab" + configInput(nil),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Strict-alt of \b-bounded lit-chains, each carrying a named capture.
-		// Currently rejected by analyseLitChainAltGroups (anchor check) — falls
-		// through to TDFA. Gap A.2: extend alt-groups emitter to handle per-
-		// branch anchors. matchInput leads with the ghp_ secret followed by a
-		// newline so the trailing \b on that branch matches.
-		name:    "secrets-combined-bounded-grouped",
-		pattern: `\b(?P<aws>AKIA[A-Z0-9]{16})\b|\b(?P<ghp>ghp_[A-Za-z0-9]{36})\b`,
-		mode:    modeGroups,
-		notes:   "strict-alt with per-branch \\b anchors + captures — Gap A.2 target",
-		matchInput: "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab\n" +
-			configInput(nil),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Same pattern shape as secrets-github-grouped, but with the secret
-		// buried mid-buffer instead of at offset 0. Anchored groups_func
-		// returns -1 immediately today (no scan). Gap A.3 adds find-with-
-		// captures so the function locates the buried secret itself. Baseline
-		// numbers here will be artificially fast on both inputs (anchored
-		// short-circuit) — the post-A.3 numbers reflect real scan work.
-		name:    "secrets-github-grouped-buried",
-		pattern: `(?P<key>ghp_[A-Za-z0-9]{36})`,
-		mode:    modeGroups,
-		notes:   "buried secret needs find-with-captures — Gap A.3 target",
-		matchInput: configInput([]string{
-			"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
-		}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Mixed-shape alt with captures on BOTH branches: one lit-chain branch
-		// (ghp_) plus one DFA branch (aws_secret_access_key = ...). Currently
-		// rejected by both analyseLitChainAltGroups (mixed shapes) and lenient-
-		// alt (no capture support). Falls through to TDFA. Gap A.4 adds lit-
-		// chain SIMD slot writes for the lit-chain branch and an inline tagged-
-		// DFA trace for the DFA branch. matchInput starts with the DFA-branch
-		// shape to exercise the harder path.
-		name:    "secrets-mixed-alt-grouped",
-		pattern: `(?P<ghp>ghp_[A-Za-z0-9]{36})|aws_secret_access_key\s*=\s*(?P<aws>[0-9a-zA-Z/+]{40})`,
-		mode:    modeGroups,
-		notes:   "lenient-alt (lit-chain + DFA branches) with captures — Gap A.4 target",
-		matchInput: "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY12" +
-			configInput(nil),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Same mixed-shape alt as above, but with the secret buried mid-buffer
-		// instead of at offset 0. Today the TDFA wrapper scans the full ~10 KB
-		// buffer to locate the match. Gap A.4 should replace that scan with the
-		// lenient-alt Teddy frontend (much faster) while still producing correct
-		// captures.
-		name:    "secrets-mixed-alt-grouped-buried",
-		pattern: `(?P<ghp>ghp_[A-Za-z0-9]{36})|aws_secret_access_key\s*=\s*(?P<aws>[0-9a-zA-Z/+]{40})`,
-		mode:    modeGroups,
-		notes:   "lenient-alt buried secret needs Teddy scan + captures — Gap A.4 target",
-		matchInput: configInput([]string{
-			"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY12",
-		}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Anchored full-input match on a strict lit-chain alternation. Today
-		// match_func on `lit1|lit2` falls through to DFA. Gap B should give us
-		// per-branch SIMD verify at pos 0 + strict len == K+N check.
-		name:         "secrets-combined-anchored",
-		pattern:      `AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}`,
-		mode:         modeAnchored,
-		notes:        "anchored match on strict-alt — Gap B target",
-		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
-		nomatchInput: "this_is_not_a_secret_value_at_all_42_chr",
-	},
-	{
-		// Same as above but with per-branch \b anchors. At pos 0 the leading
-		// \b is satisfied (text-start is non-word, literal[0] is word); at pos
-		// K+N the trailing \b is satisfied (last char is word, text-end is
-		// non-word). Gap B should handle per-branch anchors in the alt path.
-		name:         "secrets-combined-bounded-anchored",
-		pattern:      `\bAKIA[A-Z0-9]{16}\b|\bghp_[A-Za-z0-9]{36}\b`,
-		mode:         modeAnchored,
-		notes:        "anchored match on strict-alt with \\b anchors — Gap B target",
-		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
-		nomatchInput: "this_is_not_a_secret_value_at_all_42_chr",
-	},
-	{
-		// Lenient-alt anchored match: one lit-chain branch (ghp_) plus one
-		// DFA-shape branch (aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40}).
-		// Today match_func falls through to DFA. Gap B lenient should give
-		// lit-chain SIMD verify for the lit-chain branch + inline anchored
-		// DFA for the DFA branch, checking last_accept == len for full
-		// input consumption.
-		name:         "secrets-mixed-alt-anchored",
-		pattern:      `ghp_[A-Za-z0-9]{36}|aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40}`,
-		mode:         modeAnchored,
-		notes:        "anchored match on lenient-alt — Gap B lenient target",
-		matchInput:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
-		nomatchInput: "this_is_not_a_secret_value_at_all_42_chr",
-	},
-	{
-		// Gap C: range-counted chain `{N,M}` with N < M. Greedy find — should
-		// match the longest valid chain (up to M bytes) when literal hits.
-		// Today: falls through to DFA. After C: SIMD verify up to M bytes,
-		// rightmost-zero in bad-mask gives match length.
-		name:         "range-find-greedy",
-		pattern:      `secret_[A-Za-z0-9]{24,40}`,
-		mode:         modeFind,
-		notes:        "range-counted chain {24,40} — Gap C greedy find",
-		matchInput:   configInput([]string{"secret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Gap C non-greedy: returns shortest valid chain (exactly N bytes
-		// after literal). Same pattern as above but with `?`.
-		name:         "range-find-nongreedy",
-		pattern:      `secret_[A-Za-z0-9]{24,40}?`,
-		mode:         modeFind,
-		notes:        "range-counted chain {24,40}? — Gap C non-greedy find",
-		matchInput:   configInput([]string{"secret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Gap C anchored: input length must be in [K+N, K+M] AND class match.
-		// matchInput is 39 bytes (K=7 + 32 chars in class) — in range.
-		name:         "range-anchored",
-		pattern:      `secret_[A-Za-z0-9]{24,40}`,
-		mode:         modeAnchored,
-		notes:        "range-counted chain {24,40} — Gap C anchored",
-		matchInput:   "secret_AbCdEfGhIjKlMnOpQrStUvWxYz012345",
-		nomatchInput: "not_a_secret_value_at_all_x_y_z_a_b_c__",
-	},
-	{
-		// Gap C groups: range-counted chain with capture. Group 1's end
-		// position depends on runtime match length, not a compile-time
-		// offset.
-		name:         "range-groups",
-		pattern:      `(?P<key>secret_[A-Za-z0-9]{24,40})`,
-		mode:         modeGroups,
-		notes:        "range-counted chain with capture — Gap C groups",
-		matchInput:   configInput([]string{"secret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Gap C strict-alt with range counts on each branch.
-		name:         "range-strict-alt-find",
-		pattern:      `secret_[A-Za-z0-9]{24,40}|token_[a-z0-9]{24,32}`,
-		mode:         modeFind,
-		notes:        "strict-alt of range-counted chains — Gap C strict-alt find",
-		matchInput:   configInput([]string{"secret_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Gap E: mixed prefix shape `<class>{M}<literal><class>{N}`. Today
-		// detection requires literal at position 0 — patterns like this fall
-		// through to DFA. After Gap E: scan for literal, back up M bytes,
-		// verify class-prefix, verify class-suffix.
-		name:    "gap-e-find",
-		pattern: `[0-9]{8}ghp_[A-Za-z0-9]{36}`,
-		mode:    modeFind,
-		notes:   "class prefix + literal + class suffix — Gap E target",
-		matchInput: configInput([]string{
-			"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
-		}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Gap E anchored: input length must equal M+K+N exactly. matchInput
-		// is exactly 48 bytes (8+4+36).
-		name:         "gap-e-anchored",
-		pattern:      `[0-9]{8}ghp_[A-Za-z0-9]{36}`,
-		mode:         modeAnchored,
-		notes:        "anchored mixed-prefix shape — Gap E anchored target",
-		matchInput:   "12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
-		nomatchInput: "12345678not_a_secret_at_all_value_or_anything_x",
-	},
 	{
 		// Gap E groups: captures wrap class-prefix and class-suffix pieces.
 		// Group offsets must account for the prefix (group d at 0..8, group
@@ -428,38 +113,6 @@ var tests = []testCase{
 		pattern: `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
 		mode:    modeGroups,
 		notes:   "mixed-prefix shape with captures — Gap E groups target",
-		matchInput: configInput([]string{
-			"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
-		}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Gap E strict-alt: alternation of two mixed-prefix branches. Both
-		// branches have a class prefix + literal + class suffix. Different
-		// literals and different prefix classes.
-		name:    "gap-e-strict-alt-find",
-		pattern: `[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`,
-		mode:    modeFind,
-		notes:   "strict-alt of mixed-prefix shapes — Gap E strict-alt target",
-		matchInput: configInput([]string{
-			"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
-		}),
-		nomatchInput: configInput(nil),
-	},
-	{
-		// Task 6 v1 target: same pattern shape as gap-e-strict-alt-find
-		// (both branches share the {8} fixed prefix length), but this case
-		// exists to demonstrate the NEUTRAL/LikelyNoMatch path specifically
-		// — findAltLitAnchorPoints' alt-lit-anchor mechanism fires for every
-		// LikelyMode unconditionally (no flag required), unlike Gap E which
-		// stays LikelyMatch-only. The LikelyMatch column here should be
-		// unchanged (still hitting Gap E, since Gap E's own check runs
-		// first and returns early on success) — only neutral/LikelyNoMatch
-		// should show the win.
-		name:    "alt-lit-anchor-neutral",
-		pattern: `[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`,
-		mode:    modeFind,
-		notes:   "per-branch lit-anchor alternation, equal 8-char prefixes — Task 6 v1 (neutral/LNM path; see gap-e-strict-alt-find for the LikelyMatch analogue)",
 		matchInput: configInput([]string{
 			"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
 		}),
@@ -645,33 +298,6 @@ var tests = []testCase{
 		notes:        "TDFA dominant self-loop on \\w (63 bytes) — Gap F target",
 		matchInput:   strings.Repeat("aB3_", 2560) + "!",
 		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
-	},
-	{
-		// Task 26 target (task 20 follow-up): moderately-wide post-literal
-		// self-loop below detectDominantSelfLoop's 240/256-byte,
-		// <=8-exit-byte threshold. `[a-zA-Z0-9]` is 62 bytes — nowhere near
-		// dominant — so once Teddy finds "ID:", the forward scan through
-		// the ID value falls through to a plain scalar per-byte DFA walk
-		// with zero acceleration under any LikelyMode (confirmed via
-		// tools/pattest during task 20's audit: ~30-34 fuel/byte, flat
-		// across neutral/LM/LNM).
-		//
-		// Because the quantifier is open-ended (`{10,}`) and `find` returns
-		// on the first match, repeating "ID:<value>" wouldn't stress
-		// anything beyond the first hit — the real cost is in walking ONE
-		// long alnum run to its end. Match input is "ID:" + one alnum run
-		// spanning almost the whole buffer (no trailing non-alnum, so the
-		// greedy self-loop walks to EOF, ~50 KB). No-match input is plain
-		// "ID:"-free prose — the floor; there's no way to force a long
-		// self-loop walk on the no-match side for this pattern without
-		// changing its shape into Task 8's dead-end-retry territory
-		// instead.
-		name:         "post-literal-wide-self-loop",
-		pattern:      `ID:[a-zA-Z0-9]{10,}`,
-		mode:         modeFind,
-		notes:        "62-byte post-literal self-loop below dominant-bulk-skip threshold — task 26 target",
-		matchInput:   postLiteralWideSelfLoopInput(true),
-		nomatchInput: postLiteralWideSelfLoopInput(false),
 	},
 }
 
@@ -1267,7 +893,16 @@ func benchTime(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Eng
 		}
 		fmt.Fprintf(os.Stderr, "    [%s mode=%s len=%d] p50=%s p90=%s p99=%s mean=%s\n", tc.name, m, len(input), p50, p90, p99, mean)
 	}
-	return computeStat(shimBuf[:timingsBytes], 50), nil
+	result := computeStat(shimBuf[:timingsBytes], 50)
+	// shimBuf is a raw pointer into wasmtime's native memory (UnsafeData), not
+	// a Go-tracked reference to store — without this, store (and the
+	// wasmtime.Memory it owns) becomes GC-eligible as soon as it's no longer
+	// referenced by name above, and a GC cycle landing between that point and
+	// the last shimBuf read can free the backing memory out from under a
+	// still-in-flight read, causing a segfault (observed intermittently,
+	// especially under DEBUG_STATS's extra computeStat calls).
+	runtime.KeepAlive(store)
+	return result, nil
 }
 
 // benchFuel measures fuel for a single call.
@@ -1463,6 +1098,10 @@ func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan,
 	}
 	buf := mem.UnsafeData(store)
 	copy(buf[plan.inputBase:], []byte(input))
+	// See benchTime's comment on the same pattern: buf is a raw pointer into
+	// wasmtime's native memory, not a Go reference to store, so store must be
+	// kept alive explicitly through the last use of buf.
+	runtime.KeepAlive(store)
 	return nil
 }
 
@@ -1487,6 +1126,9 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 		if l <= 0 {
 			l = 1
 		}
+		// See benchTime's comment on the same pattern: buf is a raw pointer
+		// into wasmtime's native memory, not a Go reference to store.
+		runtime.KeepAlive(store)
 		startPos = s + l
 	}
 }

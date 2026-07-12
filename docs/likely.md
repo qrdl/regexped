@@ -341,20 +341,31 @@ ends up extracting the captures — see *the find-wrapper mechanism* above.
 
 ## Sets support
 
-> **Gap (see *Known gaps* §4):** `LikelyMode` is **not** propagated to set
-> compilation.
+`LikelyMode` is fully propagated to set compilation ([plans/LIKELY.md](../plans/LIKELY.md)
+Gap H, all three sub-tasks shipped 2026-06-26/2026-07-08). Three independent
+hint layers, same precedence chain as the no-sets path (pattern → enclosing
+set → global default → `LikelyNeutral`):
 
-When the YAML config contains a `sets:` block, `compile.CmdCompile` dispatches
-to `compile.CompileFile` ([compile/set_emit.go:657](../compile/set_emit.go#L657)),
-which builds `CompileOptions` from only `MaxDFAStates` and `MaxTDFARegs`.
-The `LikelyMode` field is not set anywhere in the sets path.
+- **`config.RegexEntry.LikelyMode`** (per-pattern) and **`config.SetConfig.LikelyMode`**
+  (per-set), resolved by `CompileFile` for both the per-pattern suffix-DFA
+  bodies and the set frontend
+  ([compile/set_emit.go:704,716,792,801](../compile/set_emit.go)).
+- **Set frontend** (Teddy/AC/Shufti/scalar selection over the union of
+  literal prefixes): set-level `LikelyNoMatch` force-selects Shufti for a
+  17..64-byte first-byte union that would otherwise fall back to scalar
+  (`compile/set.go` density gate, gated on
+  `shuftiBeatsScalar(...) || setLikelyMode == LikelyNoMatch`).
+- **Per-pattern suffix-DFA bodies** (`buildSetSuffixBody`,
+  [compile/engine_dfa.go:2405](../compile/engine_dfa.go#L2405)): mid-accept
+  dominant bulk-skip is default-on; the non-mid-accept extension is gated
+  per-bucket on `LikelyMode == LikelyMatch` via
+  `CompileSetOptions.PatternLikelyModes`, consumed in `genSuffixWASM`
+  ([compile/engine_dfa.go:2857-2872](../compile/engine_dfa.go#L2857-L2872)).
 
-This means:
-- Set-mode exports (`find_any`, `find_all`, `match`) get only `LikelyNeutral`
-  optimisations regardless of intent.
-- The per-pattern entries that the set is built from are *also* compiled with
-  `LikelyNeutral` when sets are present, even though the same patterns would
-  see LM/LNM hints if compiled outside a set.
+One narrow gap remains: the runtime-adaptive dense-data switch added to the
+single-pattern LNM Action 5 scan (avoids a wall-time regression on dense
+matching data — see [plans/TODO.md](../plans/TODO.md), "dense data" no-match
+fix) has not been back-ported to the set frontend's Shufti call site.
 
 ---
 
@@ -492,6 +503,9 @@ No-match (anchored fail at pos 0) fuel/time unaffected in all three cases.
 - **Mode-dispatching test harness:** [tools/re2test/main.go](../tools/re2test/main.go) — `--likelymatch` / `--likelynomatch` flags; [likelytest/main.go](../tools/likelytest/main.go) — three-mode matrix output.
 - **Pattern coverage tests:** [compile/compile_lm_lnm_test.go](../compile/compile_lm_lnm_test.go) — covers every LM/LNM lit-chain pattern shape.
 - **Archived implementation alternatives:** [plans/non_mid_extension.go.archive](../plans/non_mid_extension.go.archive) — the side-table dispatch variant that was reverted in favour of state-ID compares.
+- **Sets — per-pattern/per-set precedence (H.1):** `resolveLikelyMode` calls in `CompileFile` at [compile/set_emit.go:704,716,792,801](../compile/set_emit.go).
+- **Sets — suffix-DFA bulk-skip (H.2):** `genSuffixWASM` in [compile/engine_dfa.go:2817-2872](../compile/engine_dfa.go#L2817-L2872), fed by the per-bucket `likelyModes` slice built in `CompileSet` ([compile/set_emit.go:168-190](../compile/set_emit.go#L168-L190)).
+- **Sets — frontend density gate (H.3):** density-gate selection in [compile/set_emit.go:386-395](../compile/set_emit.go#L386-L395).
 
 ---
 
@@ -576,36 +590,43 @@ Users can determine which engine a pattern uses via
 `compile.SelectEngine(pattern, opts)`. There is currently no mechanism to
 emit a "hint had no additional effect" warning, e.g. through `slog`.
 
-### 4. Sets frontend has the hint; sets suffix bodies don't consume their per-pattern hint yet (corrected 2026-07-08)
+### 4. RESOLVED 2026-07-08 — Sets: frontend, per-pattern hints, and suffix-body bulk-skip all consume `LikelyMode`
 
 An earlier version of this doc claimed the sets path drops `LikelyMode`
-entirely. That's stale — verified directly against the code (2026-07-08):
-`CompileFile` reads `cfg.LikelyMode`, `sc.LikelyMode` (per-set), and
-`re.LikelyMode` (per-pattern) and resolves all three through the same
-precedence chain as the no-sets path
-([compile/set_emit.go:704,716,792,801](../compile/set_emit.go)) — this is
-sub-task H.1 from [plans/LIKELY.md](../plans/LIKELY.md) Gap H, shipped. The
-per-pattern suffix-DFA bodies (compiled via the same `compilePattern` as
-non-set patterns, [compile/set_emit.go:722](../compile/set_emit.go)) get
-their own hint correctly. The **set frontend** (Teddy/AC/Shufti/scalar
-selection over the union of literal prefixes) also has it — H.3's
-density-gate Action 5 override is live (`frontendShufti` in
-[compile/set.go:611](../compile/set.go), gated on
-`shuftiBeatsScalar(...) || setLikelyMode == LikelyNoMatch`).
+entirely, then (corrected 2026-07-08) that the frontend and per-pattern
+hints worked but sub-task H.2's suffix-body bulk-skip didn't consume its
+per-pattern hint yet. Both claims are now stale — verified directly
+against the code:
 
-What's genuinely still missing: **sub-task H.2** — `buildSetSuffixBody`
-(the per-pattern-in-a-set DFA loop that finds match boundaries within a
-set, [compile/engine_dfa.go:2405](../compile/engine_dfa.go)) doesn't have
-the dominant-self-loop bulk-skip that single-pattern `buildFindBody` has
-had since Task 7. The per-pattern resolved hint is computed and stored on
-`CompileSetOptions.PatternLikelyModes`
-([compile/set_emit.go:797-802](../compile/set_emit.go)) but nothing reads
-it yet — the field exists only as plumbing for H.2, which was never
-implemented. This is a real, open, narrow gap: sets containing long-body
-patterns (e.g. `ERROR:[^\n]+` as a set member) don't get the bulk-skip win
-that the same pattern would get compiled standalone. Not tracked as its own
-entry in [plans/TODO.md](../plans/TODO.md) — worth adding if this is picked
-up.
+- `CompileFile` reads `cfg.LikelyMode`, `sc.LikelyMode` (per-set), and
+  `re.LikelyMode` (per-pattern) and resolves all three through the same
+  precedence chain as the no-sets path
+  ([compile/set_emit.go:704,716,792,801](../compile/set_emit.go)) — sub-task
+  H.1 from [plans/LIKELY.md](../plans/LIKELY.md) Gap H.
+- The per-pattern suffix-DFA bodies (compiled via the same `compilePattern`
+  as non-set patterns, [compile/set_emit.go:722](../compile/set_emit.go))
+  get their own hint correctly.
+- The **set frontend** (Teddy/AC/Shufti/scalar selection over the union of
+  literal prefixes) has H.3's density-gate Action 5 override
+  (`compile/set_emit.go:386-395`, gated on
+  `shuftiBeatsScalar(...) || setLikelyMode == LikelyNoMatch`).
+- **Sub-task H.2** — `buildSetSuffixBody`
+  ([compile/engine_dfa.go:2405](../compile/engine_dfa.go)) has the same
+  mid-accept dominant bulk-skip `buildFindBody` has had since Task 7,
+  default-on. The non-mid-accept extension, gated on
+  `LikelyMode == LikelyMatch` per bucket via `CompileSetOptions.PatternLikelyModes`
+  ([compile/set_emit.go:797-802](../compile/set_emit.go)), shipped 2026-07-08
+  in `genSuffixWASM`
+  ([compile/engine_dfa.go:2857-2872](../compile/engine_dfa.go#L2857-L2872)) —
+  see [plans/TODO.md](../plans/TODO.md) task 17 for the measured numbers
+  (match fuel -74.1%, match time -44.7%) and correctness verification
+  (new re2test category `SetNonMidDominantTags`, 92/92 passing; full
+  exhaustive corpus under `--sets --likelymatch` re-run clean).
+
+What's genuinely still missing (narrow, not part of Gap H's original
+scope): the runtime-adaptive dense-data switch added to the single-pattern
+LNM Action 5 scan hasn't been back-ported to the set frontend's Shufti call
+site — see the note at the end of the *Sets support* section above.
 
 ### 5. Three Opt-1-eligible pattern shapes regress on the no-match path — for every mode, not just `LikelyMatch`
 
@@ -643,8 +664,9 @@ correctly just the *fallback default* for entries that don't set their own
 `LikelyMode` — not a hard per-call ceiling. For sets, the dual-level design
 (per-pattern + per-set hints, both live — see gap #4 above) lets the set
 frontend and per-pattern suffix bodies pick independently, closing the
-"mixed-priority sets" motivating case too (modulo H.2 not yet consuming the
-per-pattern hint for the suffix-body bulk-skip itself).
+"mixed-priority sets" motivating case too — including the suffix-body
+bulk-skip itself, which now consumes the per-pattern hint (H.2, shipped
+2026-07-08, see gap #4 above).
 
 ---
 

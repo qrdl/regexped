@@ -388,14 +388,16 @@ type CompileSetOptions struct {
 	MaxFallbackStates     int   // max DFA states for a single-pattern fallback bucket; default 1024
 	TableBase             int32 // byte offset where this set's DFA tables start in memory; default 0
 	TableMemIdx           int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
-	// LikelyMode is the resolved set-level LikelyMode hint. Currently inert:
-	// reserved for the set-frontend density-gate (H.3) and the set-wide
-	// suffix-body fallback (H.2 precedence chain).
+	// LikelyMode is the resolved set-level LikelyMode hint: consumed by the
+	// set-frontend density gate (H.3, shipped — forces Shufti for a 17..64-byte
+	// first-byte union under LikelyNoMatch) and used as the per-pattern
+	// fallback when resolving PatternLikelyModes below.
 	LikelyMode LikelyMode
 	// PatternLikelyModes is the resolved per-pattern LikelyMode for each
 	// pattern in the set, indexed by the same position as spec.Patterns when
 	// passed to CompileSet. nil/empty means all patterns use LikelyNeutral.
-	// Currently inert: reserved for the suffix-body bulk-skip (H.2).
+	// Consumed by genSuffixWASM (H.2, shipped) to gate the non-mid-accept
+	// dominant bulk-skip per bucket.
 	PatternLikelyModes []LikelyMode
 }
 

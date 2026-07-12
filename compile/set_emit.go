@@ -802,8 +802,8 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 			LikelyMode: resolveLikelyMode(sc.LikelyMode, cfg.LikelyMode),
 		}
 		// Per-pattern LikelyMode (within this set) precedence:
-		// pattern > set > global > neutral. Lights up for H.2's suffix-DFA
-		// bulk-skip; currently inert beyond storage.
+		// pattern > set > global > neutral. Consumed by H.2's suffix-DFA
+		// non-mid-accept dominant bulk-skip (genSuffixWASM), shipped 2026-07-08.
 		if len(infos) > 0 {
 			setOpts.PatternLikelyModes = make([]LikelyMode, len(infos))
 			for i, idx := range globalIDs {
