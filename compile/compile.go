@@ -1020,12 +1020,59 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// much larger match-path win, not a fully regression-free win.
 			// Anchored find uses a separate builder (buildAnchoredFindBody)
 			// whose midAccept consumers don't decode the encoding, so we
-			// skip it there. Lit-anchor's forward DFA scan
-			// (buildLitAnchorFindBody) DOES decode it, so we apply the
-			// encoding regardless of whether p.litAnchorBackScanBody is
-			// set — both paths benefit.
+			// skip it there.
+			//
+			// Lit-anchor's forward DFA scan (buildLitAnchorFindBody) also
+			// decodes the encoding, but — unlike buildFindBody's call site —
+			// this one was never validated as regression-free across every
+			// dominant-state shape. perftest data (both 100KB-scale, so
+			// large enough to be conclusive):
+			//   - url-find-100kb (`[a-zA-Z]{2,8}://[^\s]+`): 1 dominant
+			//     state, `[^\s]+`, MID-ACCEPT. Enabling it here regresses
+			//     wall time ~40-50% with ~0% fuel change — a Cranelift-
+			//     codegen tax, not real work.
+			//   - bt-find-mand-lit (`(\w+)\[(\d+)\] .*(ERROR|FAILURE|CRASH):
+			//     (.+)`): 2 dominant states — the trailing `.+` (MID-ACCEPT,
+			//     1 exit byte) and the `.*` before the alternation (NON-MID,
+			//     4 exit bytes: `\n`+the three keywords' first letters).
+			//     Enabling both cuts fuel ~58% and time ~75-77%: a real win,
+			//     not a codegen artefact — but it comes almost entirely from
+			//     the NON-MID state (the `.*` before the alternation runs on
+			//     every attempt, including ones where the alternation never
+			//     matches; the trailing `.+` only runs when it does).
+			//
+			// Tried gating on exit-byte-set width first (narrower ⇒ bigger
+			// per-invocation win, simpler emitted bytecode) — measured
+			// wrong: it happened to keep only bt-find-mand-lit's low-value
+			// MID-ACCEPT state and drop its high-value NON-MID one, barely
+			// recovering any of the real benefit. Measuring per-state
+			// isMidAccept directly instead cleanly separates the two cases:
+			// url-find-100kb's only state is mid-accept (drop it, fixing
+			// the regression); bt-find-mand-lit's high-value state is
+			// non-mid (keep it, preserving ~99% of the fuel win — a small
+			// ~17-21% wall-time cost remains on the mid-accept state's
+			// removal alone, far smaller than the regression it replaces).
+			//
+			// A tried-and-measured fix at the sibling non-mid call site
+			// (plans/non_mid_extension.go.archive) shows this class of
+			// Cranelift tax is tied to the presence of dispatch code, not
+			// how often it executes — so gating on the *anchor literal's*
+			// expected frequency doesn't work there either (their "smarter
+			// gate" experiment still regressed on rare-literal patterns).
+			// Restrict this call site to non-mid-accept dominant states
+			// only; buildFindBody's own call site (already measured
+			// regression-free for both channels) is untouched.
 			canEmitOpt1 := !isAnchoredFind(table)
 			if canEmitOpt1 {
+				if p.litAnchorBackScanBody != nil {
+					filtered := l.dominantStates[:0]
+					for _, info := range l.dominantStates {
+						if !info.isMidAccept {
+							filtered = append(filtered, info)
+						}
+					}
+					l.dominantStates = filtered
+				}
 				applyDominantStateEncoding(l)
 			} else {
 				l.dominantStates = nil
