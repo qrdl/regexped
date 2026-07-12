@@ -5663,6 +5663,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	var chunk3Local byte
 	var t3LoLocal byte
 	var t3HiLocal byte
+	// scanLenLocal (Task 8 follow-up #1 fold-in, see emitScanLenSetup below):
+	// only assigned (to a real local index) when patternMinLen > 0. Zero
+	// value is never read in that case since emitOuterPrologue falls back
+	// to the raw len local directly when patternMinLen == 0.
+	var scanLenLocal byte
 
 	// numV128ForScan computes how many v128 locals emitPrefixScan will
 	// actually reference for this pattern's scan strategy, plus whether
@@ -5785,11 +5790,55 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	// Mandatory-lit locals (set in each path branch when useMandatoryLit):
 	var litPosLocal, scanStartLocal, simdMaskScanLocal, chunkScanLocal byte
 
+	// emitScanLenSetup (Task 8 follow-up #1 fold-in): a ONE-TIME (not
+	// per-iteration) EOF-shortcut check, run once before `loop $outer`
+	// starts, inside `block $no_match` (so `br_if 0` here lands correctly
+	// at $no_match's end). If the input is shorter than patternMinLen, no
+	// match is possible from any position — branch out immediately.
+	// Otherwise precompute scanLen = len - patternMinLen once; the scan's
+	// own existing bound checks (which already run every iteration,
+	// comparing attempt_start against a length local) then naturally stop
+	// once attempt_start reaches scanLen, equivalent to the tightened
+	// `attempt_start + patternMinLen > len` check — but via a value fed
+	// into checks that already exist, not a new standalone check added to
+	// the hot loop.
+	//
+	// The original version of this fix added exactly that new standalone
+	// check at the top of emitPrefixScan, executed on every outer-loop
+	// iteration. Measured via perftest: fuel unchanged (~0%) but wall time
+	// up 33-117% on comments-100kb / word-boundary — a Cranelift-codegen
+	// tax from the new branch near a hot loop, not real added work (same
+	// class of issue as this session's other two fixes). This rewrite
+	// removes the standalone check entirely in favour of adjusting what
+	// value the existing scan bound checks already compare against.
+	emitScanLenSetup := func(b []byte) []byte {
+		if patternMinLen == 0 {
+			return b
+		}
+		// if len < patternMinLen: br 0 → $no_match
+		b = append(b, 0x20, 0x01) // local.get len
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, patternMinLen)
+		b = append(b, 0x49)       // i32.lt_u
+		b = append(b, 0x0D, 0x00) // br_if 0 → $no_match
+		// scanLen = len - patternMinLen (non-negative: guarded above)
+		b = append(b, 0x20, 0x01) // local.get len
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, patternMinLen)
+		b = append(b, 0x6B) // i32.sub
+		b = append(b, 0x21, scanLenLocal)
+		return b
+	}
+
 	// ── helper: outer loop prologue ──────────────────────────────────────────
 	// Emits: if attempt_start >= len: br $no_match
 	//        state=startState, pos=attempt_start, last_accept=-1
 	//        if accept[state]: last_accept=pos  (start-state empty-match check)
 	emitOuterPrologue := func(b []byte) []byte {
+		lenForScan := byte(1) // raw len param, unless patternMinLen > 0
+		if patternMinLen > 0 {
+			lenForScan = scanLenLocal
+		}
 		params := prefixScanParams{
 			Prefix:         prefix,
 			FirstByteSet:   firstBytes,
@@ -5809,11 +5858,10 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			TableMemIdx:      tableMemIdx,
 			LikelyNoMatch:    lnmAction5,
 			AllowDenseSwitch: needsDenseSwitch,
-			MinPatternLen:    patternMinLen,
 			EngineDepth:      2, // loop $outer + block $no_match
 			Locals: prefixScanLocals{
 				Ptr:           0,
-				Len:           1,
+				Len:           lenForScan,
 				AttemptStart:  4,
 				SimdMask:      simdMaskLocal,
 				Chunk:         chunkLocal,
@@ -6179,15 +6227,25 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkScanLocal = 10
 			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 		} else {
-			// 6 i32 + N v128 (N sized to what's actually used — see numV128ForScan)
+			// 6 i32 (+1 more when patternMinLen > 0, for scanLenLocal — see
+			// emitScanLenSetup) + N v128 (N sized to what's actually used —
+			// see numV128ForScan)
 			simdMaskLocal = 7
-			assignV128Locals(8)
-			b = appendLocalGroups(b, 0x06)
+			v128Base := byte(8)
+			i32Count := byte(6)
+			if patternMinLen > 0 {
+				scanLenLocal = 8
+				v128Base = 9
+				i32Count = 7
+			}
+			assignV128Locals(v128Base)
+			b = appendLocalGroups(b, i32Count)
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
 		if useMandatoryLit {
 			b = emitMLOuterSetup(b)
 		} else {
+			b = emitScanLenSetup(b)
 			b = append(b, 0x03, 0x40) // loop $outer
 			b = emitOuterPrologue(b)
 		}
@@ -6307,15 +6365,25 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkScanLocal = 9
 			b = append(b, 0x02, 0x07, 0x7F, 0x01, 0x7B)
 		} else {
-			// 5 i32 + N v128 (N sized to what's actually used — see numV128ForScan)
+			// 5 i32 (+1 more when patternMinLen > 0, for scanLenLocal — see
+			// emitScanLenSetup) + N v128 (N sized to what's actually used —
+			// see numV128ForScan)
 			simdMaskLocal = 6
-			assignV128Locals(7)
-			b = appendLocalGroups(b, 0x05)
+			v128Base := byte(7)
+			i32Count := byte(5)
+			if patternMinLen > 0 {
+				scanLenLocal = 7
+				v128Base = 8
+				i32Count = 6
+			}
+			assignV128Locals(v128Base)
+			b = appendLocalGroups(b, i32Count)
 		}
 		b = append(b, 0x02, 0x40) // block $no_match
 		if useMandatoryLit {
 			b = emitMLOuterSetup(b)
 		} else {
+			b = emitScanLenSetup(b)
 			b = append(b, 0x03, 0x40) // loop $outer
 			b = emitOuterPrologue(b)
 		}
@@ -6423,15 +6491,25 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		chunkScanLocal = 10
 		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 	} else {
-		// 6 i32 + N v128 (N sized to what's actually used — see numV128ForScan)
+		// 6 i32 (+1 more when patternMinLen > 0, for scanLenLocal — see
+		// emitScanLenSetup) + N v128 (N sized to what's actually used —
+		// see numV128ForScan)
 		simdMaskLocal = 7
-		assignV128Locals(8)
-		b = appendLocalGroups(b, 0x06)
+		v128Base := byte(8)
+		i32Count := byte(6)
+		if patternMinLen > 0 {
+			scanLenLocal = 8
+			v128Base = 9
+			i32Count = 7
+		}
+		assignV128Locals(v128Base)
+		b = appendLocalGroups(b, i32Count)
 	}
 	b = append(b, 0x02, 0x40) // block $no_match
 	if useMandatoryLit {
 		b = emitMLOuterSetup(b)
 	} else {
+		b = emitScanLenSetup(b)
 		b = append(b, 0x03, 0x40) // loop $outer
 		b = emitOuterPrologue(b)
 	}
@@ -6762,6 +6840,106 @@ func analyseLitChainAltPrefixed(pattern string) (*litChainAltPattern, bool) {
 		return nil, false
 	}
 	return &litChainAltPattern{branches: branches}, true
+}
+
+// shouldTryLitChainAlt reports whether the lit-chain-alt/lenient family of
+// analysis functions (analyseLitChainAlt/Range/Lenient) should even be
+// attempted for pattern, when it's a strict find-mode alternation. Returns
+// false only for the one shape measured to regress badly there: every
+// branch is a SIMPLE chain (literal/class/repeat concatenation, no internal
+// alternation or optionality) AND at least one such branch is unbounded
+// (`+`, `*`, or open `{N,}`) — e.g. a JWT-style `<lit><class>+.<lit>
+// <class>+...` branch. For that shape, falling through to the classic DFA
+// below is measured to be cheaper. Returns true (try lit-chain-alt as
+// before) in every other case, including when it doesn't apply at all.
+//
+// Measured via perftest (secrets-combined-range / probe-sparse-allbounded
+// vs. secrets-combined / probe-sparse-hasunbounded, a dense- and a
+// sparse-first-byte variant of each): when every branch is a bounded {N,M}
+// simple chain, lit-chain-alt/lenient costs 74-175% LESS fuel than the
+// classic DFA (a clear win), regardless of first-byte density. When at
+// least one SIMPLE-chain branch is unbounded, the classic DFA is cheaper on
+// dense first-byte sets (~29% less fuel) and roughly tied on sparse ones
+// (~3% less) — DFA is never worse there.
+//
+// The "simple chain" restriction is load-bearing, not cosmetic: an earlier
+// version of this check flagged a branch as "unbounded" the moment it found
+// ANY unbounded repeat anywhere in the subtree, with no regard for what
+// else was in that branch. sql-inject's first branch,
+// `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+`, has an unbounded `\s*` sitting
+// right next to an internal `(?:OR|AND)` alternation — the naive check
+// found the `\s*` first and flagged the whole pattern as "route to DFA",
+// which regressed sql-inject +126-140% fuel (it was already correctly
+// matching analyseLitChainAltLenient and winning there). sql-inject's
+// branches are a structurally different, more complex shape (internal
+// alternation/optionality) than the validated JWT-chain case, and were
+// never part of the measurement that justified this gate — hence the
+// explicit hasComplexStructure check below, which disqualifies a branch
+// from the "route to DFA" decision the moment it contains its own
+// OpAlternate or OpQuest anywhere, before ever looking for unbounded
+// repeats. An earlier, unrelated attempt to gate on first-byte rarity
+// (mirroring compile/byte_rarity.go's shuftiBeatsScalar) also gave the
+// wrong answer on secrets-combined-range specifically — density isn't the
+// signal here, branch shape is.
+//
+// Returns true for anything that isn't a plain top-level alternation (so
+// the caller behaves exactly as before) — harmless, since
+// analyseLitChainAlt/Range/Lenient all require OpAlternate themselves and
+// would refuse such patterns anyway; this never affects single-branch
+// lit-chain patterns or non-alternation shapes.
+func shouldTryLitChainAlt(pattern string) bool {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return true
+	}
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpAlternate || len(re.Sub) < 2 {
+		return true
+	}
+
+	var hasComplexStructure func(*syntax.Regexp) bool
+	hasComplexStructure = func(n *syntax.Regexp) bool {
+		if n.Op == syntax.OpAlternate || n.Op == syntax.OpQuest {
+			return true
+		}
+		for _, sub := range n.Sub {
+			if hasComplexStructure(sub) {
+				return true
+			}
+		}
+		return false
+	}
+	var hasUnbounded func(*syntax.Regexp) bool
+	hasUnbounded = func(n *syntax.Regexp) bool {
+		switch n.Op {
+		case syntax.OpStar, syntax.OpPlus:
+			return true
+		case syntax.OpRepeat:
+			if n.Max < 0 {
+				return true
+			}
+		}
+		for _, sub := range n.Sub {
+			if hasUnbounded(sub) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, branch := range re.Sub {
+		if hasComplexStructure(branch) {
+			// Not the validated simple-chain shape — don't force DFA,
+			// leave the existing analysis to decide as before.
+			return true
+		}
+		if hasUnbounded(branch) {
+			return false // simple chain, unbounded — route to classic DFA
+		}
+	}
+	return true // every branch is a simple, fully-bounded chain — keep lit-chain-alt eligible
 }
 
 // analyseLitChainAlt parses pattern and returns a litChainAltPattern when the

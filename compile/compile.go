@@ -626,8 +626,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 
 		// Phase 2: alternation of strict lit-chain branches. Find-mode only;
-		// anchored match is handled above.
-		if needFind && !needMatch {
+		// anchored match is handled above. Skipped (falls through to the
+		// classic DFA below) only for the specific shape measured to regress
+		// there — every branch a simple chain with at least one unbounded
+		// (`+`/`*`/open `{N,}`) segment; see shouldTryLitChainAlt.
+		if needFind && !needMatch && shouldTryLitChainAlt(re.Pattern) {
 			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)

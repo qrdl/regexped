@@ -147,6 +147,71 @@ var tests = []testCase{
 		},
 	},
 	{
+		// Same 3-way secret-detection shape as secrets-combined, but the
+		// JWT branch is replaced with a Stripe-style key using an explicit
+		// {N,M} range on a SINGLE <literal><class> segment. This is the
+		// shape analyseLitChainAltRange actually accepts (branches must be
+		// exactly [literal, repeat(class)] or the Gap E 3-element mixed-
+		// prefix shape) — secrets-combined's JWT branch is a multi-segment
+		// chain (literal, class+, literal ".", class+, literal ".", class+)
+		// that analyseLitChainAltRange rejects outright (only 2- or
+		// 3-element branches allowed), so that pattern actually falls
+		// through to analyseLitChainAltLenient instead. This case exists
+		// to exercise buildLitChainAltRangeFindBody specifically (confirmed
+		// via compile-time instrumentation: secrets-combined never reaches
+		// it, so it was otherwise untested by any perftest/re2test case).
+		name:    "secrets-combined-range",
+		pattern: `ghp_[A-Za-z0-9]{36}|AKIA[A-Z0-9]{16}|sk_live_[a-zA-Z0-9]{20,40}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-secret ~10KB", secretBaseInput("")},
+			{"GitHub ~10KB", secretBaseInput("ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab")},
+			{"AWS ~10KB", secretBaseInput("export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE")},
+			{"Stripe ~10KB", secretBaseInput("export STRIPE_KEY=sk_live_aBcD1234EfGh5678IjKl90mN")},
+		},
+	},
+	{
+		// TEMP probe (not yet decided as permanent): same all-bounded,
+		// no-unbounded-branch shape as secrets-combined-range, but with
+		// rare control-byte literal prefixes instead of common 'g'/'A'/'s' —
+		// isolates whether DFA-vs-lit-chain-alt routing depends on
+		// first-byte density or on branch composition (all-bounded vs
+		// has-an-unbounded-branch).
+		name:    "probe-sparse-allbounded",
+		pattern: "\x01[A-Za-z0-9]{36}|\x02[A-Z0-9]{16}|\x03[a-zA-Z0-9]{20,40}",
+		mode:    find,
+		inputs: []namedInput{
+			{"no-secret ~10KB", secretBaseInput("")},
+		},
+	},
+	{
+		// TEMP probe: sparse first bytes AND an unbounded branch (mirrors
+		// secrets-combined's composition but with rare literal prefixes) —
+		// isolates whether "has an unbounded branch" alone predicts a DFA
+		// win regardless of density, completing the 2x2.
+		name:    "probe-sparse-hasunbounded",
+		pattern: "\x01" + `[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+|` + "\x02" + `[A-Za-z0-9]{36}|` + "\x03" + `[A-Z0-9]{16}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-secret ~10KB", secretBaseInput("")},
+		},
+	},
+	{
+		// 100KB counterpart of secrets-combined-range, mirroring
+		// secrets-combined-100kb.
+		name:    "secrets-combined-range-100kb",
+		pattern: `ghp_[A-Za-z0-9]{36}|AKIA[A-Z0-9]{16}|sk_live_[a-zA-Z0-9]{20,40}`,
+		mode:    find,
+		inputs: []namedInput{
+			{"no-secret 100KB", secretLargeInput(nil)},
+			{"3 secrets 100KB", secretLargeInput([]string{
+				"ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
+				"export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+				"export STRIPE_KEY=sk_live_aBcD1234EfGh5678IjKl90mN",
+			})},
+		},
+	},
+	{
 		// URL find in prose — benchmarks non-prefix mandatory literal extraction.
 		// First-byte set [a-zA-Z] matches ~20% of bytes in typical text, but
 		// "://" is very rare. This is the ideal pattern for mandatory-literal

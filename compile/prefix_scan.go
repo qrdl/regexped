@@ -190,14 +190,6 @@ type prefixScanParams struct {
 	// is required for correctness, not just an optimisation choice.
 	AllowDenseSwitch bool
 
-	// MinPatternLen (Task 8 follow-up #1 — EOF-without-match): compile-time
-	// minimum byte length of any accepting match. When > 0 the post-scan
-	// bound check tightens from `attempt_start > len` to
-	// `attempt_start + MinPatternLen > len`, letting patterns with
-	// insufficient remaining input short-circuit before running the
-	// engine-specific OnMatch body. Zero = disabled (existing behaviour).
-	MinPatternLen int32
-
 	Locals prefixScanLocals
 
 	// OnMatch is called after the scan finds a candidate and all scan blocks
@@ -218,26 +210,15 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 	l := p.Locals
 	ed := p.EngineDepth
 
-	// Task 8 follow-up #1 (EOF-without-match): if the pattern's minimum
-	// byte length exceeds the input remaining from attempt_start, no match
-	// is possible from THIS or any later start position. Short-circuit to
-	// $no_match before any scan work. Applies to both the prefix branch
-	// (below at line ~192) and the firstByteFlags branch (else, at line
-	// ~322) — checking at the top avoids duplicating the tightening in
-	// each branch's own end-checks.
-	//
-	// Depth from emitPrefixScan's entry: (ed-1) reaches $no_match, since
-	// the caller wraps the scan in `block $no_match; loop $outer` with
-	// engine depth = ed.
-	if p.MinPatternLen > 0 {
-		b = append(b, 0x20, l.AttemptStart)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, p.MinPatternLen)
-		b = append(b, 0x6A) // i32.add
-		b = append(b, 0x20, l.Len)
-		b = append(b, 0x4B)       // i32.gt_u
-		b = append(b, 0x0D, ed-1) // br_if → $no_match
-	}
+	// Task 8 follow-up #1 (EOF-without-match) used to add a standalone
+	// per-iteration check here (measured to cost a Cranelift-codegen wall-
+	// time regression despite ~0% fuel change — see comments-100kb /
+	// word-boundary in perftest). The fix now lives entirely in the
+	// caller: when the caller wants the EOF shortcut, it passes an
+	// already-adjusted (len - patternMinLen) value as p.Locals.Len instead
+	// of the raw length, via a one-time (not per-iteration) setup emitted
+	// before this function is called — see emitScanLenSetup in
+	// compile/engine_dfa.go. Every l.Len usage below is unchanged.
 
 	if len(p.Prefix) >= 1 {
 		// ── Hybrid SIMD prefix scan ───────────────────────────────────────────
@@ -723,9 +704,10 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		}
 
 		// After scan: if attempt_start > len, branch to $no_match.
-		// Depth from $outer: (ed-1) to $no_match.
-		// (The tightened MinPatternLen check runs at emitPrefixScan entry;
-		// this check remains as a natural end-of-scan bound.)
+		// Depth from $outer: (ed-1) to $no_match. When the caller passed an
+		// already-adjusted (len - patternMinLen) value as l.Len (see
+		// emitScanLenSetup in engine_dfa.go), this check IS the Task 8
+		// follow-up #1 EOF shortcut — no separate check needed.
 		b = append(b, 0x20, l.AttemptStart)
 		b = append(b, 0x20, l.Len)
 		b = append(b, 0x4B)       // i32.gt_u
