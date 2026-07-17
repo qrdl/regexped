@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1773,10 +1774,71 @@ func parseTimeBaseline(path string) (map[string]timeBaseline, error) {
 	return result, scanner.Err()
 }
 
-// runCompareTime measures speedup ratio (rxp/rped) and compares against baseline.
-// Patterns where min(rxp_base, rped_base) < 1µs are skipped — too noisy.
-// Tolerance: ±10%.
-func runCompareTime(baselinePath string, regexWasmBytes []byte, engine *wasmtime.Engine) bool {
+// benchMedianPair measures the (regexp, regexped) timing pair `runs` times and
+// returns the pair whose speedup ratio (rxp/rped) is the median. This is the
+// same noise suppression the -compare-time gate uses (see runCompareTime),
+// applied to the benchmark-table / baseline path so a captured baseline is not
+// a single noisy shot — a noisy baseline entry is worse than a noisy current
+// measurement because it is frozen into the file and can silently mask a real
+// regression. rxp and rped are measured back-to-back each iteration so they
+// share the run's instantaneous machine state (that co-location is what makes
+// the ratio cancel per-run noise). runs<=1 measures once (original behaviour).
+func benchMedianPair(regexWasmBytes []byte, tc testCase, input string, engine *wasmtime.Engine, pct, runs int) (benchResult, benchResult) {
+	if runs < 1 {
+		runs = 1
+	}
+	type pair struct {
+		rxp, rped benchResult
+		ratio     float64
+	}
+	pairs := make([]pair, 0, runs)
+	for r := 0; r < runs; r++ {
+		rxp := benchRegex(regexWasmBytes, tc, input, engine, pct)
+		rped := benchRegexped(tc, input, engine, pct)
+		var ratio float64
+		if rxp.avgExec > 0 && rped.avgExec > 0 {
+			ratio = float64(rxp.avgExec) / float64(rped.avgExec)
+		}
+		pairs = append(pairs, pair{rxp, rped, ratio})
+	}
+	// Pick the pair whose ratio is the median. Failed measurements (ratio==0)
+	// sort to the front and are only selected if every run failed.
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].ratio < pairs[j].ratio })
+	med := pairs[len(pairs)/2]
+	return med.rxp, med.rped
+}
+
+// medianFloat returns the median of xs (xs is copied, not mutated). Empty → 0.
+func medianFloat(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	s := append([]float64(nil), xs...)
+	sort.Float64s(s)
+	n := len(s)
+	if n%2 == 1 {
+		return s[n/2]
+	}
+	return (s[n/2-1] + s[n/2]) / 2
+}
+
+// runCompareTime measures the speedup ratio (rxp/rped) and compares against a
+// baseline. Patterns where min(rxp_base, rped_base) < 1µs are skipped — too
+// noisy. Tolerance: ±10%.
+//
+// Noise handling: absolute wall-time drifts between process invocations (CPU
+// frequency scaling, contention, JIT variance) by as much as ±100% on the same
+// binary. The ratio to the regex-crate reference — measured back-to-back with
+// regexped in the SAME invocation — cancels that per-run machine-speed factor,
+// because both measurements share it multiplicatively (ratio = rxp_work/rped_work,
+// independent of the run's speed). That leaves only a small residual per-run
+// variance in the ratio itself (~4% observed). `runs` repeats the (rxp, rped)
+// pair N times and uses the MEDIAN ratio, suppressing that residual plus any
+// one-off transient (a scheduler preemption landing in a single measurement).
+// runs=1 reproduces the original single-shot behaviour. The reported spread
+// (max-min over the N ratios, as ± half-range) exposes the live noise floor so
+// a flagged drift can be read against it.
+func runCompareTime(baselinePath string, regexWasmBytes []byte, engine *wasmtime.Engine, runs int) bool {
 	baseline, err := parseTimeBaseline(baselinePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "compare-time: cannot read baseline %s: %v\n", baselinePath, err)
@@ -1786,7 +1848,11 @@ func runCompareTime(baselinePath string, regexWasmBytes []byte, engine *wasmtime
 	const pct = 50
 	const tolerance = 0.10
 	const minBaseline = 1 * time.Microsecond
+	if runs < 1 {
+		runs = 1
+	}
 	ok := true
+	nCompared, nFlagged := 0, 0
 
 	for _, tc := range tests {
 		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
@@ -1802,20 +1868,51 @@ func runCompareTime(baselinePath string, regexWasmBytes []byte, engine *wasmtime
 				continue // too noisy
 			}
 			baseRatio := float64(base.rxp) / float64(base.rped)
-			rxp := benchRegex(regexWasmBytes, tc, inp.value, engine, pct)
-			rped := benchRegexped(tc, inp.value, engine, pct)
-			if rxp.avgExec <= 0 || rped.avgExec <= 0 {
+
+			// Collect `runs` ratio samples. rxp and rped are measured
+			// back-to-back within each iteration so they share the same
+			// instantaneous machine state — that co-location is what makes
+			// the ratio cancel per-run noise.
+			ratios := make([]float64, 0, runs)
+			for r := 0; r < runs; r++ {
+				rxp := benchRegex(regexWasmBytes, tc, inp.value, engine, pct)
+				rped := benchRegexped(tc, inp.value, engine, pct)
+				if rxp.avgExec <= 0 || rped.avgExec <= 0 {
+					continue
+				}
+				ratios = append(ratios, float64(rxp.avgExec)/float64(rped.avgExec))
+			}
+			if len(ratios) == 0 {
 				continue
 			}
-			curRatio := float64(rxp.avgExec) / float64(rped.avgExec)
-			drift := math.Abs(curRatio-baseRatio) / baseRatio
-			if drift > tolerance {
-				fmt.Printf("REGRESSION %s input=%q: baseline ratio=%.2fx current=%.2fx (%.1f%% drift, limit ±%.0f%%)\n",
-					tc.name, inp.label, baseRatio, curRatio, drift*100, tolerance*100)
-				ok = false
+			med := medianFloat(ratios)
+			lo, hi := ratios[0], ratios[0]
+			for _, v := range ratios {
+				if v < lo {
+					lo = v
+				}
+				if v > hi {
+					hi = v
+				}
 			}
+			spreadPct := (hi - lo) / med * 100 // full range as % of median
+			drift := (med - baseRatio) / baseRatio
+			nCompared++
+
+			status := "ok"
+			if math.Abs(drift) > tolerance {
+				status = "REGRESSION"
+				ok = false
+				nFlagged++
+				fmt.Printf("REGRESSION %s input=%q: baseline ratio=%.2fx median=%.2fx over %d runs (%.1f%% drift, spread ±%.1f%%, limit ±%.0f%%)\n",
+					tc.name, inp.label, baseRatio, med, runs, drift*100, spreadPct/2, tolerance*100)
+			}
+			fmt.Fprintf(os.Stderr, "  %-30s base=%6.2fx med=%6.2fx drift=%+6.1f%% spread=±%4.1f%% [%s]\n",
+				inp.label, baseRatio, med, drift*100, spreadPct/2, status)
 		}
 	}
+	fmt.Fprintf(os.Stderr, "compare-time: %d cases compared, %d flagged (runs=%d, tolerance ±%.0f%%)\n",
+		nCompared, nFlagged, runs, tolerance*100)
 	return ok
 }
 
@@ -2677,6 +2774,7 @@ func main() {
 	compareSetsFuel := flag.String("compare-sets-fuel", "", "compare set fuel counts against baseline file; exit 1 if outside ±5%")
 	compareSetsSizeFlag := flag.String("compare-sets-size", "", "compare set WASM sizes against baseline file; exit 1 if outside ±5%")
 	compareTime := flag.String("compare-time", "", "compare speedup ratio (rxp/rped p50) against baseline file; exit 1 if outside ±10%")
+	compareRuns := flag.Int("runs", 3, "repeat each timing N times and use the median-ratio run (noise suppression; governs both the -p benchmark/baseline table and -compare-time; 1 = original single-shot)")
 	compareFuel := flag.String("compare-fuel", "", "compare fuel counts against baseline file; exit 1 if outside ±20% (TDFA non-determinism budget)")
 	compareSize := flag.String("compare-size", "", "compare WASM sizes against baseline file; exit 1 if outside ±5%")
 	flag.Parse()
@@ -2722,7 +2820,7 @@ func main() {
 
 	// -compare-time measures speedup ratio and compares against a baseline.
 	if *compareTime != "" {
-		if !runCompareTime(*compareTime, regexWasmBytes, engine) {
+		if !runCompareTime(*compareTime, regexWasmBytes, engine, *compareRuns) {
 			os.Exit(1)
 		}
 		return
@@ -2797,8 +2895,7 @@ func main() {
 		var inputResults []inputResult
 
 		for i, inp := range tc.inputs {
-			rxp := benchRegex(regexWasmBytes, tc, inp.value, engine, *pct)
-			rped := benchRegexped(tc, inp.value, engine, *pct)
+			rxp, rped := benchMedianPair(regexWasmBytes, tc, inp.value, engine, *pct, *compareRuns)
 			if i == 0 {
 				rxpInst = rxp
 				rpedInst = rped

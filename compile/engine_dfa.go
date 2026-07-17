@@ -2487,12 +2487,29 @@ func detectDominantSelfLoop(l *dfaLayout) {
 // detectDominantSelfLoop's own 2..127 (mid dominants) — 0 = nothing,
 // 1 = plain mid-accept, 2..127 = exit-based dominant idx, 128..253 = Shufti
 // self-loop idx. Capped at 126 entries, matching the existing per-kind cap.
+//
+// Task 34 (plans/TODO.md): gated on len(l.prefix) > 0 — the same
+// computePrefix-derived signal buildFindBody already uses to decide between
+// the literal-chain Teddy scan and the broader firstByteFlags scan. A
+// non-empty l.prefix means this DFA is only entered (in the byte-by-byte
+// sense that matters for this state) after a Teddy/literal front-end has
+// already consumed a required byte chain — the "genuinely post-literal-
+// anchor" scope this optimisation was designed for (motivating case
+// `ID:[a-zA-Z0-9]{10,}`, l.prefix = "ID:"). An empty l.prefix means the
+// pattern has no literal gate at all, so any wide self-loop state is
+// reachable directly from a scan restart — bare, high-frequency entry,
+// where the fixed SIMD chunk-scan overhead costs more than the scalar loop
+// it replaces (measured: `shufti-upper-find-100kb`, bare `[A-Z]{8,}`, -49%
+// wall time vs main before this gate).
 func detectShuftiSelfLoop(l *dfaLayout) {
 	const minWidth = 9
 	const maxWidth = 64
 	const maxStates = 126
 
 	if l.numWASM <= 1 {
+		return
+	}
+	if len(l.prefix) == 0 {
 		return
 	}
 
