@@ -735,14 +735,27 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false)
-			// Task 7 Step 2 (2026-07-05): Opt 1 default-on for all modes,
-			// mid-accept and non-mid-accept alike (mirrors the find-body
-			// gate above). Previously non-mid was gated to LikelyMatch
-			// because the original side-table dispatch caused a 48-57%
-			// no-match regression; that dispatch was replaced with a
-			// state-ID-compare emission (commit dbb4dfa9) — see
-			// plans/TODO.md task 7 for the re-measurement that justified
-			// removing the gate.
+			// Task 36 (2026-07-18): re-gated to LikelyMatch-only. Task 7
+			// Step 2's default-on promotion (state-ID-compare emission,
+			// commit dbb4dfa9) traded a "narrow, fuel-neutral" no-match
+			// regression for a broad match-path win, measured only on the
+			// curated likelytest set. The full perftest suite (likely-vs-
+			// main, 2026-07-16) showed the non-mid channel's Cranelift
+			// codegen tax is broader than that implied — comments-100kb,
+			// secrets-combined(-100kb), secrets-jwt regress -12% to -33%
+			// wall time (0% fuel) under neutral/LikelyNoMatch. Mid-accept
+			// stays default-on (task 7's own measurement found it
+			// regression-free); only non-mid is gated back, mirroring the
+			// sets suffix-DFA gate (engine_dfa.go's genSuffixWASM).
+			if buildOpts.LikelyMode != LikelyMatch {
+				filtered := lm.dominantStates[:0]
+				for _, info := range lm.dominantStates {
+					if info.isMidAccept {
+						filtered = append(filtered, info)
+					}
+				}
+				lm.dominantStates = filtered
+			}
 			applyDominantStateEncoding(lm)
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
@@ -1052,14 +1065,32 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// expected frequency doesn't work there either (their "smarter
 			// gate" experiment still regressed on rare-literal patterns).
 			// Restrict this call site to non-mid-accept dominant states
-			// only; buildFindBody's own call site (already measured
-			// regression-free for both channels) is untouched.
+			// only.
+			//
+			// Task 36 (2026-07-18): buildFindBody's own call site (the
+			// litAnchorBackScanBody == nil branch below) was NOT actually
+			// regression-free at corpus scale, despite the comment that
+			// used to say so — perftest likely-vs-main (2026-07-16) found
+			// comments-100kb/secrets-combined/secrets-jwt (all confirmed via
+			// a temporary debug check to take this exact general path, not
+			// the lit-anchor or alt-lit-anchor paths) regress -12% to -33% wall
+			// time under neutral/LikelyNoMatch with 0% fuel change. Re-gated
+			// non-mid to LikelyMatch-only here too, same as the match-body
+			// site above and the sets suffix-DFA gate.
 			canEmitOpt1 := !isAnchoredFind(table)
 			if canEmitOpt1 {
 				if p.litAnchorBackScanBody != nil {
 					filtered := l.dominantStates[:0]
 					for _, info := range l.dominantStates {
 						if !info.isMidAccept {
+							filtered = append(filtered, info)
+						}
+					}
+					l.dominantStates = filtered
+				} else if buildOpts.LikelyMode != LikelyMatch {
+					filtered := l.dominantStates[:0]
+					for _, info := range l.dominantStates {
+						if info.isMidAccept {
 							filtered = append(filtered, info)
 						}
 					}
