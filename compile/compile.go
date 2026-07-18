@@ -770,17 +770,6 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	var l *dfaLayout
 	if !dfaTooLarge {
 		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(&buildOpts), false)
-		// Compute compile-time pattern minimum length for the outer-loop
-		// bound-check tightening (Task 8 follow-up #1, EOF-without-match).
-		// Only useful in find mode where the loop iterates attempt_start;
-		// harmless otherwise.
-		if needFindBody {
-			if parsed, err := syntax.Parse(re.Pattern, syntax.Perl); err == nil {
-				if minLen, _ := regexpMinMaxLen(parsed); minLen > 0 {
-					l.patternMinLen = int32(minLen)
-				}
-			}
-		}
 	}
 	patMandLit := findMandatoryLit(re.Pattern)
 

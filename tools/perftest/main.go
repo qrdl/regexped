@@ -2779,6 +2779,29 @@ func main() {
 	compareSize := flag.String("compare-size", "", "compare WASM sizes against baseline file; exit 1 if outside ±5%")
 	flag.Parse()
 
+	// PERFTEST_FILTER (debugging env var, mirrors likelytest's LIKELYTEST_FILTER):
+	// comma-separated substrings; only test cases whose name contains one of
+	// them are run. Unset/empty runs the full suite (default behaviour).
+	if filter := os.Getenv("PERFTEST_FILTER"); filter != "" {
+		terms := strings.Split(filter, ",")
+		var filtered []testCase
+		for _, tc := range tests {
+			for _, term := range terms {
+				// "=name" matches tc.name exactly; otherwise substring match.
+				if exact, ok := strings.CutPrefix(term, "="); ok {
+					if tc.name == exact {
+						filtered = append(filtered, tc)
+						break
+					}
+				} else if strings.Contains(tc.name, term) {
+					filtered = append(filtered, tc)
+					break
+				}
+			}
+		}
+		tests = filtered
+	}
+
 	// Sets-specific modes that don't need the regex_bench.wasm harness.
 	if *sizeOnlySets {
 		runSizeOnlySets()

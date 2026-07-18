@@ -1421,16 +1421,6 @@ type dfaLayout struct {
 	// patterns to O(N). See plans/TODO.md task 8.
 	skipSafeOnDead bool
 
-	// patternMinLen (Task 8 follow-up #1 — EOF-without-match): compile-time
-	// minimum byte length of any accepting match, computed via
-	// regexpMinMaxLen on the parsed regex. When non-zero the find body's
-	// outer-loop bound check tightens from `attempt_start > len` to
-	// `attempt_start + patternMinLen > len`, letting patterns with
-	// insufficient remaining input short-circuit before running the DFA.
-	// Zero means "no floor" (e.g. patterns that can match empty) and the
-	// check reduces to the existing behaviour.
-	patternMinLen int32
-
 	// eofSkipSafe (Task 8 follow-up #2 — min-length quantifier skip): true
 	// when reaching EOF mid-scan without ever recording an accept proves no
 	// later start position can match either (see detectEOFSkipSafe). When
@@ -3442,7 +3432,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
 			tableMemIdx,
-			l.dominantStates, l.lnmAction5, l.skipSafeOnDead, l.patternMinLen, l.eofSkipSafe)
+			l.dominantStates, l.lnmAction5, l.skipSafeOnDead, l.eofSkipSafe)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -5642,7 +5632,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, patternMinLen int32, eofSkipSafe bool) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, eofSkipSafe bool) []byte {
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
 	// `nonMidDominantOff` parameter and the `[]int` return slot) was
@@ -5680,11 +5670,6 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	var chunk3Local byte
 	var t3LoLocal byte
 	var t3HiLocal byte
-	// scanLenLocal (Task 8 follow-up #1 fold-in, see emitScanLenSetup below):
-	// only assigned (to a real local index) when patternMinLen > 0. Zero
-	// value is never read in that case since emitOuterPrologue falls back
-	// to the raw len local directly when patternMinLen == 0.
-	var scanLenLocal byte
 
 	// numV128ForScan computes how many v128 locals emitPrefixScan will
 	// actually reference for this pattern's scan strategy, plus whether
@@ -5807,55 +5792,12 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	// Mandatory-lit locals (set in each path branch when useMandatoryLit):
 	var litPosLocal, scanStartLocal, simdMaskScanLocal, chunkScanLocal byte
 
-	// emitScanLenSetup (Task 8 follow-up #1 fold-in): a ONE-TIME (not
-	// per-iteration) EOF-shortcut check, run once before `loop $outer`
-	// starts, inside `block $no_match` (so `br_if 0` here lands correctly
-	// at $no_match's end). If the input is shorter than patternMinLen, no
-	// match is possible from any position — branch out immediately.
-	// Otherwise precompute scanLen = len - patternMinLen once; the scan's
-	// own existing bound checks (which already run every iteration,
-	// comparing attempt_start against a length local) then naturally stop
-	// once attempt_start reaches scanLen, equivalent to the tightened
-	// `attempt_start + patternMinLen > len` check — but via a value fed
-	// into checks that already exist, not a new standalone check added to
-	// the hot loop.
-	//
-	// The original version of this fix added exactly that new standalone
-	// check at the top of emitPrefixScan, executed on every outer-loop
-	// iteration. Measured via perftest: fuel unchanged (~0%) but wall time
-	// up 33-117% on comments-100kb / word-boundary — a Cranelift-codegen
-	// tax from the new branch near a hot loop, not real added work (same
-	// class of issue as this session's other two fixes). This rewrite
-	// removes the standalone check entirely in favour of adjusting what
-	// value the existing scan bound checks already compare against.
-	emitScanLenSetup := func(b []byte) []byte {
-		if patternMinLen == 0 {
-			return b
-		}
-		// if len < patternMinLen: br 0 → $no_match
-		b = append(b, 0x20, 0x01) // local.get len
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, patternMinLen)
-		b = append(b, 0x49)       // i32.lt_u
-		b = append(b, 0x0D, 0x00) // br_if 0 → $no_match
-		// scanLen = len - patternMinLen (non-negative: guarded above)
-		b = append(b, 0x20, 0x01) // local.get len
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, patternMinLen)
-		b = append(b, 0x6B) // i32.sub
-		b = append(b, 0x21, scanLenLocal)
-		return b
-	}
-
 	// ── helper: outer loop prologue ──────────────────────────────────────────
 	// Emits: if attempt_start >= len: br $no_match
 	//        state=startState, pos=attempt_start, last_accept=-1
 	//        if accept[state]: last_accept=pos  (start-state empty-match check)
 	emitOuterPrologue := func(b []byte) []byte {
-		lenForScan := byte(1) // raw len param, unless patternMinLen > 0
-		if patternMinLen > 0 {
-			lenForScan = scanLenLocal
-		}
+		lenForScan := byte(1) // raw len param
 		params := prefixScanParams{
 			Prefix:         prefix,
 			FirstByteSet:   firstBytes,
@@ -6244,17 +6186,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkScanLocal = 10
 			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 		} else {
-			// 6 i32 (+1 more when patternMinLen > 0, for scanLenLocal — see
-			// emitScanLenSetup) + N v128 (N sized to what's actually used —
-			// see numV128ForScan)
+			// 6 i32 + N v128 (N sized to what's actually used — see
+			// numV128ForScan)
 			simdMaskLocal = 7
 			v128Base := byte(8)
 			i32Count := byte(6)
-			if patternMinLen > 0 {
-				scanLenLocal = 8
-				v128Base = 9
-				i32Count = 7
-			}
 			assignV128Locals(v128Base)
 			b = appendLocalGroups(b, i32Count)
 		}
@@ -6262,7 +6198,6 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		if useMandatoryLit {
 			b = emitMLOuterSetup(b)
 		} else {
-			b = emitScanLenSetup(b)
 			b = append(b, 0x03, 0x40) // loop $outer
 			b = emitOuterPrologue(b)
 		}
@@ -6382,17 +6317,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkScanLocal = 9
 			b = append(b, 0x02, 0x07, 0x7F, 0x01, 0x7B)
 		} else {
-			// 5 i32 (+1 more when patternMinLen > 0, for scanLenLocal — see
-			// emitScanLenSetup) + N v128 (N sized to what's actually used —
-			// see numV128ForScan)
+			// 5 i32 + N v128 (N sized to what's actually used — see
+			// numV128ForScan)
 			simdMaskLocal = 6
 			v128Base := byte(7)
 			i32Count := byte(5)
-			if patternMinLen > 0 {
-				scanLenLocal = 7
-				v128Base = 8
-				i32Count = 6
-			}
 			assignV128Locals(v128Base)
 			b = appendLocalGroups(b, i32Count)
 		}
@@ -6400,7 +6329,6 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		if useMandatoryLit {
 			b = emitMLOuterSetup(b)
 		} else {
-			b = emitScanLenSetup(b)
 			b = append(b, 0x03, 0x40) // loop $outer
 			b = emitOuterPrologue(b)
 		}
@@ -6508,17 +6436,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		chunkScanLocal = 10
 		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 	} else {
-		// 6 i32 (+1 more when patternMinLen > 0, for scanLenLocal — see
-		// emitScanLenSetup) + N v128 (N sized to what's actually used —
-		// see numV128ForScan)
+		// 6 i32 + N v128 (N sized to what's actually used — see
+		// numV128ForScan)
 		simdMaskLocal = 7
 		v128Base := byte(8)
 		i32Count := byte(6)
-		if patternMinLen > 0 {
-			scanLenLocal = 8
-			v128Base = 9
-			i32Count = 7
-		}
 		assignV128Locals(v128Base)
 		b = appendLocalGroups(b, i32Count)
 	}
@@ -6526,7 +6448,6 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	if useMandatoryLit {
 		b = emitMLOuterSetup(b)
 	} else {
-		b = emitScanLenSetup(b)
 		b = append(b, 0x03, 0x40) // loop $outer
 		b = emitOuterPrologue(b)
 	}

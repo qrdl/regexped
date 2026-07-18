@@ -210,16 +210,6 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 	l := p.Locals
 	ed := p.EngineDepth
 
-	// Task 8 follow-up #1 (EOF-without-match) used to add a standalone
-	// per-iteration check here (measured to cost a Cranelift-codegen wall-
-	// time regression despite ~0% fuel change — see comments-100kb /
-	// word-boundary in perftest). The fix now lives entirely in the
-	// caller: when the caller wants the EOF shortcut, it passes an
-	// already-adjusted (len - patternMinLen) value as p.Locals.Len instead
-	// of the raw length, via a one-time (not per-iteration) setup emitted
-	// before this function is called — see emitScanLenSetup in
-	// compile/engine_dfa.go. Every l.Len usage below is unchanged.
-
 	if len(p.Prefix) >= 1 {
 		// ── Hybrid SIMD prefix scan ───────────────────────────────────────────
 		// Phase A: find prefix[0] in 16-byte chunks.
@@ -704,10 +694,7 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		}
 
 		// After scan: if attempt_start > len, branch to $no_match.
-		// Depth from $outer: (ed-1) to $no_match. When the caller passed an
-		// already-adjusted (len - patternMinLen) value as l.Len (see
-		// emitScanLenSetup in engine_dfa.go), this check IS the Task 8
-		// follow-up #1 EOF shortcut — no separate check needed.
+		// Depth from $outer: (ed-1) to $no_match.
 		b = append(b, 0x20, l.AttemptStart)
 		b = append(b, 0x20, l.Len)
 		b = append(b, 0x4B)       // i32.gt_u
