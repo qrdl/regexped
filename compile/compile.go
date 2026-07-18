@@ -1028,66 +1028,34 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// skip it there.
 			//
 			// Lit-anchor's forward DFA scan (buildLitAnchorFindBody) also
-			// decodes the encoding, but — unlike buildFindBody's call site —
-			// this one was never validated as regression-free across every
-			// dominant-state shape. perftest data (both 100KB-scale, so
-			// large enough to be conclusive):
-			//   - url-find-100kb (`[a-zA-Z]{2,8}://[^\s]+`): 1 dominant
-			//     state, `[^\s]+`, MID-ACCEPT. Enabling it here regresses
-			//     wall time ~40-50% with ~0% fuel change — a Cranelift-
-			//     codegen tax, not real work.
-			//   - bt-find-mand-lit (`(\w+)\[(\d+)\] .*(ERROR|FAILURE|CRASH):
-			//     (.+)`): 2 dominant states — the trailing `.+` (MID-ACCEPT,
-			//     1 exit byte) and the `.*` before the alternation (NON-MID,
-			//     4 exit bytes: `\n`+the three keywords' first letters).
-			//     Enabling both cuts fuel ~58% and time ~75-77%: a real win,
-			//     not a codegen artefact — but it comes almost entirely from
-			//     the NON-MID state (the `.*` before the alternation runs on
-			//     every attempt, including ones where the alternation never
-			//     matches; the trailing `.+` only runs when it does).
-			//
-			// Tried gating on exit-byte-set width first (narrower ⇒ bigger
-			// per-invocation win, simpler emitted bytecode) — measured
-			// wrong: it happened to keep only bt-find-mand-lit's low-value
-			// MID-ACCEPT state and drop its high-value NON-MID one, barely
-			// recovering any of the real benefit. Measuring per-state
-			// isMidAccept directly instead cleanly separates the two cases:
-			// url-find-100kb's only state is mid-accept (drop it, fixing
-			// the regression); bt-find-mand-lit's high-value state is
-			// non-mid (keep it, preserving ~99% of the fuel win — a small
-			// ~17-21% wall-time cost remains on the mid-accept state's
-			// removal alone, far smaller than the regression it replaces).
-			//
-			// A tried-and-measured fix at the sibling non-mid call site
-			// (plans/non_mid_extension.go.archive) shows this class of
-			// Cranelift tax is tied to the presence of dispatch code, not
-			// how often it executes — so gating on the *anchor literal's*
-			// expected frequency doesn't work there either (their "smarter
-			// gate" experiment still regressed on rare-literal patterns).
-			// Restrict this call site to non-mid-accept dominant states
-			// only.
+			// decodes the encoding; both channels (mid + non-mid) are kept
+			// unconditionally there. History: commit 36f91ab (2026-07-12)
+			// dropped the MID channel at this site to fix a fuel-flat
+			// wall-time regression on url-find-100kb — that delta was later
+			// proven to be instruction-placement noise on the Kaby Lake dev
+			// machine (2026-07-18 padding-scan experiment, see plans/TODO.md
+			// task 36), and the drop cost a real 20x fuel / ~40x time
+			// regression on lit-anchor patterns whose post-literal body IS
+			// the mid-accept dominant state (likelytest
+			// lit-anchor-dominant-body, `[0-9]{4}INFO:[^\n]+`: match fuel
+			// 40,600 -> 813,127, bisect-confirmed to that commit). Reverted
+			// 2026-07-18. The non-mid channel here carries bt-find-mand-lit's
+			// genuine -58% fuel win (the `.*` before its alternation), so it
+			// stays too.
 			//
 			// Task 36 (2026-07-18): buildFindBody's own call site (the
-			// litAnchorBackScanBody == nil branch below) was NOT actually
-			// regression-free at corpus scale, despite the comment that
-			// used to say so — perftest likely-vs-main (2026-07-16) found
-			// comments-100kb/secrets-combined/secrets-jwt (all confirmed via
-			// a temporary debug check to take this exact general path, not
-			// the lit-anchor or alt-lit-anchor paths) regress -12% to -33% wall
-			// time under neutral/LikelyNoMatch with 0% fuel change. Re-gated
-			// non-mid to LikelyMatch-only here too, same as the match-body
-			// site above and the sets suffix-DFA gate.
+			// litAnchorBackScanBody == nil branch below) keeps mid-accept
+			// default-on but gates NON-mid to LikelyMatch, same as the
+			// match-body site above and the sets suffix-DFA gate. Fuel
+			// evidence: non-mid firing on short-run inputs costs real work
+			// (html-tags +5.7-7x fuel with it on), while its long-run wins
+			// are exactly what LikelyMatch exists to opt into. The wall-time
+			// "codegen tax" previously attributed to this channel
+			// (comments-100kb etc., flat fuel) is placement noise per the
+			// same padding-scan proof.
 			canEmitOpt1 := !isAnchoredFind(table)
 			if canEmitOpt1 {
-				if p.litAnchorBackScanBody != nil {
-					filtered := l.dominantStates[:0]
-					for _, info := range l.dominantStates {
-						if !info.isMidAccept {
-							filtered = append(filtered, info)
-						}
-					}
-					l.dominantStates = filtered
-				} else if buildOpts.LikelyMode != LikelyMatch {
+				if p.litAnchorBackScanBody == nil && buildOpts.LikelyMode != LikelyMatch {
 					filtered := l.dominantStates[:0]
 					for _, info := range l.dominantStates {
 						if info.isMidAccept {
