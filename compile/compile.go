@@ -735,28 +735,26 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false)
-			// Task 36 (2026-07-18): re-gated to LikelyMatch-only. Task 7
-			// Step 2's default-on promotion (state-ID-compare emission,
-			// commit dbb4dfa9) traded a "narrow, fuel-neutral" no-match
-			// regression for a broad match-path win, measured only on the
-			// curated likelytest set. The full perftest suite (likely-vs-
-			// main, 2026-07-16) showed the non-mid channel's Cranelift
-			// codegen tax is broader than that implied — comments-100kb,
-			// secrets-combined(-100kb), secrets-jwt regress -12% to -33%
-			// wall time (0% fuel) under neutral/LikelyNoMatch. Mid-accept
-			// stays default-on (task 7's own measurement found it
-			// regression-free); only non-mid is gated back, mirroring the
-			// sets suffix-DFA gate (engine_dfa.go's genSuffixWASM).
-			if buildOpts.LikelyMode != LikelyMatch {
-				filtered := lm.dominantStates[:0]
-				for _, info := range lm.dominantStates {
-					if info.isMidAccept {
-						filtered = append(filtered, info)
-					}
-				}
-				lm.dominantStates = filtered
-			}
-			applyDominantStateEncoding(lm)
+			// Task 38 (2026-07-18): non-mid dominants are default-on for
+			// every LikelyMode again, replacing task 36's LikelyMatch-only
+			// gate, which was lossy in both directions — neutral callers
+			// lost the −90% long-run fuel win, LikelyMatch callers still
+			// paid the short-run penalty. Two runtime mechanisms make this
+			// safe (fuel-verified):
+			//   1. encodeNonMid=true: non-mid dispatch piggybacks on the
+			//      midAccept[state] load via reserved values 254+, so
+			//      bytes outside the dominant state pay zero (the old
+			//      per-byte `state == K` compare chain was the dominant
+			//      harm — perftest html-tags +474% with zero attempts).
+			//   2. emitHystBulkSkip: after nonMidHystStreak consecutive
+			//      attempts advancing < 16 bytes, dispatch self-disables
+			//      for the rest of the call (bounds attempt waste on
+			//      dense short-run inputs).
+			// The wall-time "codegen tax" that originally motivated the
+			// gate was proven to be instruction-placement noise
+			// (padding-scan experiment, 2026-07-18); decisions here are
+			// gated on fuel only.
+			applyDominantStateEncoding(lm, true)
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
 			matchData = rawM
@@ -1043,28 +1041,25 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// genuine -58% fuel win (the `.*` before its alternation), so it
 			// stays too.
 			//
-			// Task 36 (2026-07-18): buildFindBody's own call site (the
-			// litAnchorBackScanBody == nil branch below) keeps mid-accept
-			// default-on but gates NON-mid to LikelyMatch, same as the
-			// match-body site above and the sets suffix-DFA gate. Fuel
-			// evidence: non-mid firing on short-run inputs costs real work
-			// (html-tags +5.7-7x fuel with it on), while its long-run wins
-			// are exactly what LikelyMatch exists to opt into. The wall-time
-			// "codegen tax" previously attributed to this channel
-			// (comments-100kb etc., flat fuel) is placement noise per the
-			// same padding-scan proof.
+			// Task 38 (2026-07-18): buildFindBody's own call site (the
+			// litAnchorBackScanBody == nil branch below) emits the
+			// non-mid channel for every LikelyMode again, replacing task
+			// 36's LikelyMatch-only gate. The short-run fuel harm that
+			// gate protected against (dense short runs in the dominant
+			// state — an input property no compile-time gate can see) is
+			// now handled at runtime by the hysteresis wrapped around the
+			// dispatch (emitNonMidBulkSkipHyst), so neutral callers keep
+			// the −90% long-run win and short-run inputs self-disable the
+			// channel after nonMidHystStreak wasted attempts.
 			canEmitOpt1 := !isAnchoredFind(table)
 			if canEmitOpt1 {
-				if p.litAnchorBackScanBody == nil && buildOpts.LikelyMode != LikelyMatch {
-					filtered := l.dominantStates[:0]
-					for _, info := range l.dominantStates {
-						if info.isMidAccept {
-							filtered = append(filtered, info)
-						}
-					}
-					l.dominantStates = filtered
-				}
-				applyDominantStateEncoding(l)
+				// encodeNonMid only when buildFindBody is the consumer of
+				// this layout's midAcceptBytes — the lit-anchor forward
+				// scan and alt-lit branches read the table with plain
+				// `!= 0` accept semantics and dispatch non-mid via
+				// state-ID compares (unchanged by task 38).
+				applyDominantStateEncoding(l,
+					p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil)
 			} else {
 				l.dominantStates = nil
 			}

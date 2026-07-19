@@ -149,17 +149,31 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 
 	// Phase 4: when mid-accept dominants exist, add v128 chunk local
 	// (and tmp i32 for the non-compressed path, which lacks a class local).
+	// Task 38: non-mid dominants additionally need 2 i32 hysteresis locals
+	// (counter at 6, scratch at 7).
 	emitMidDom := len(l.dominantStates) > 0
+	hystDom := false
+	for _, info := range l.dominantStates {
+		if !info.isMidAccept {
+			hystDom = true
+		}
+	}
 	if l.useCompression {
-		if emitMidDom {
+		switch {
+		case hystDom:
+			b = append(b, 0x03, 0x03, 0x7F, 0x01, 0x7B, 0x02, 0x7F) // 3 i32 + 1 v128 + 2 i32 (hyst)
+		case emitMidDom:
 			b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7B) // 3 i32 + 1 v128
-		} else {
+		default:
 			b = append(b, 0x01, 0x03, 0x7F) // 3 i32: state, pos, class
 		}
 	} else {
-		if emitMidDom {
+		switch {
+		case hystDom:
+			b = append(b, 0x03, 0x03, 0x7F, 0x01, 0x7B, 0x02, 0x7F) // 3 i32 (+tmp) + 1 v128 + 2 i32 (hyst)
+		case emitMidDom:
 			b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7B) // 3 i32 (+tmp) + 1 v128
-		} else {
+		default:
 			b = append(b, 0x01, 0x02, 0x7F) // 2 i32: state, pos
 		}
 	}
@@ -277,9 +291,9 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	}
 
 	// Phase 4 dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
-	// or extra i32 added by the locals declaration above).
+	// or extra i32 added by the locals declaration above), hyst=6/7.
 	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx,
-		byte(localState), byte(localPos), 0x01, 0x00, 0x05, byte(localClass))
+		byte(localState), byte(localPos), 0x01, 0x00, 0x05, byte(localClass), 0x06, 0x07)
 
 	// pos++
 	b = append(b, 0x20, byte(localPos))

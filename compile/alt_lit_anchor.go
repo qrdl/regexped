@@ -93,7 +93,11 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 
 		// Opt 1 (Task 7) — default-on for every mode, same as the
 		// single-pattern and whole-alternation find/match bodies.
-		applyDominantStateEncoding(l)
+		// encodeNonMid=false: the forward-verify body dispatches non-mid
+		// via state-ID compares and reads midAccept with plain `!= 0`
+		// accept semantics (task 38's 254+ value encoding is decoded only
+		// by buildFindBody/emitPhase4Dispatch consumers).
+		applyDominantStateEncoding(l, false)
 		fvBody := buildAltLitAnchorForwardVerifyBody(table, l, buildOpts.tableMemIdx)
 
 		fwdRaw, fwdSegCnt := stripSegCount(dfaDataSegments(l, true))

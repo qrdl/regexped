@@ -2426,26 +2426,35 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		})
 	}
 
-	// Dual-channel encoding pass:
-	//   mid-accept dominants    → midAcceptBytes[state]      = 2 + mid_idx
-	//                             (range 2..127)
-	//   non-mid-accept dominants → nonMidDominantBytes[state] = 1 + nonMid_idx
-	//                             (range 1..127)
-	const maxPerKind = 126
+	// Dual-channel encoding pass. All channels share the single
+	// midAcceptBytes value space (task 38 v2):
+	//   0         — nothing
+	//   1         — plain mid-accept (no dominant)
+	//   2..127    — mid-accept dominant idx (this pass)
+	//   128..253  — Shufti self-loop idx (detectShuftiSelfLoop, mid-only)
+	//   254..255  — NON-mid-accept dominant idx (this pass; cap 2)
+	// Non-mid entries are written into the table only by
+	// applyDominantStateEncoding(l, true) — call sites whose emitted body
+	// decodes the `>= 254` sub-range (buildFindBody, emitPhase4Dispatch).
+	// Everywhere else (sets suffix, lit-anchor forward scan, alt-lit
+	// branches) passes false and keeps state-ID-compare dispatch, so their
+	// plain `midAccept[state] != 0 → accept` reads stay correct.
+	const maxMid = 126
+	const maxNonMid = 2
 	midIdx, nonMidIdx := 0, 0
 	out := l.dominantStates[:0]
 	for _, info := range l.dominantStates {
 		if info.isMidAccept {
-			if midIdx >= maxPerKind {
+			if midIdx >= maxMid {
 				continue
 			}
 			info.encodedByte = byte(2 + midIdx)
 			midIdx++
 		} else {
-			if nonMidIdx >= maxPerKind {
+			if nonMidIdx >= maxNonMid {
 				continue
 			}
-			info.encodedByte = byte(1 + nonMidIdx)
+			info.encodedByte = byte(254 + nonMidIdx)
 			nonMidIdx++
 		}
 		out = append(out, info)
@@ -2574,12 +2583,27 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 // byte into l.midAcceptBytes (the find-body hot loop reads this for the
 // last_accept update and dispatches via the cached value).
 //
-// Non-mid-accept dominants don't need a side table: emission uses pure
-// state-ID compares against the dominantInfo.state constant. The encoded
-// byte for non-mid entries is unused at runtime.
-func applyDominantStateEncoding(l *dfaLayout) {
+// encodeNonMid (task 38 v2) additionally writes non-mid-accept dominants
+// as reserved values 254..255 into the SAME table, so the non-mid dispatch
+// can piggyback on the midAccept[state] load the scan loop already
+// performs every byte — eliminating the per-scanned-byte `state == K`
+// compare chain that was measured as the dominant fuel cost of the
+// old state-ID-compare emission (perftest html-tags: the compare alone
+// was +5,470 fuel on input whose dominant state is never entered).
+//
+// Pass encodeNonMid=true ONLY when every emitted body that reads this
+// layout's midAcceptBytes decodes the `>= 254` sub-range (buildFindBody,
+// buildMatchBody/buildHybridMatchBody via emitPhase4Dispatch). Sites whose
+// bodies do a plain `midAccept[state] != 0 → accept` (sets suffix,
+// lit-anchor forward scan, alt-lit branches) MUST pass false — their
+// non-mid dispatch stays on state-ID compares and a 254 value in the
+// table would corrupt their accept tracking.
+func applyDominantStateEncoding(l *dfaLayout, encodeNonMid bool) {
 	for _, info := range l.dominantStates {
-		if info.isMidAccept && int(info.state) < len(l.midAcceptBytes) {
+		if int(info.state) >= len(l.midAcceptBytes) {
+			continue
+		}
+		if info.isMidAccept || encodeNonMid {
 			l.midAcceptBytes[info.state] = info.encodedByte
 		}
 	}
@@ -2877,7 +2901,11 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		}
 		l.dominantStates = filtered
 	}
-	applyDominantStateEncoding(l)
+	// encodeNonMid=false: buildSetSuffixBody dispatches non-mid via
+	// state-ID compares and reads midAccept[state] with plain `!= 0`
+	// accept semantics — reserved 254+ values would corrupt it (task 27
+	// keeps the sets channel LikelyMatch-gated and untouched by task 38).
+	applyDominantStateEncoding(l, false)
 
 	// Four 8-byte-per-state bitmask tables placed after all layout data.
 	midBitmaskOff := int32(l.tableEnd)
@@ -3668,44 +3696,246 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 // After the block, pos is positioned so the next pos++ takes execution
 // past the self-loop bytes and onto the first exit byte (which the next
 // scan iteration will transition on).
+// nonMidHystStreak is the task 38 hysteresis threshold: after this many
+// CONSECUTIVE non-mid bulk-skip attempts that each advanced < 16 bytes
+// (i.e. the exit byte was already inside the first SIMD chunk — the
+// attempt bought less than one chunk's worth of skipping), the non-mid
+// dispatch stops trying for the rest of the call. A single productive
+// attempt (advance ≥ 16) resets the streak. This converts the non-mid
+// channel's bimodal run-length behaviour — −90% fuel on long runs,
+// +27% and worse on dense short runs — into "long-run win kept, short-run
+// harm bounded at N wasted attempts per call", making it safe to emit
+// under every LikelyMode instead of LikelyMatch-only (task 36's gate).
+const nonMidHystStreak = 2
+
+// emitHystBulkSkip emits one non-mid-accept dominant's bulk-skip attempt,
+// wrapped in the task 38 runtime hysteresis. The caller has already
+// established that the current state IS this dominant (via the 254+
+// midAcceptBytes value dispatch — see emitNonMidValDispatch), so no state
+// compare is emitted here:
+//
+//	if hystCounter < N:           ; still enabled this call
+//	  hystPos = pos
+//	  <emitDominantBulkSkip>
+//	  if pos - hystPos < 16: hystCounter++ else: hystCounter = 0
+//
+// hystCounter is a per-call i32 local (zero-initialised by WASM), shared
+// across all non-mid dominants of the function; hystPos is scratch. Once
+// the counter reaches nonMidHystStreak the gate never passes again
+// (nothing resets the counter once dispatch stops running), so the
+// channel stays off for the rest of the call. The gate runs only on
+// dominant-state bytes — everything else pays nothing at all.
+//
+// The bounds-exit path of emitDominantBulkSkip (pos+17 > len) can bump
+// the counter with advance < 16 even though nothing was learned about
+// run length; it fires at most once per call, at EOF, and is harmless.
+func emitHystBulkSkip(b []byte, info dominantInfo,
+	posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+	hystCounterLocal, hystPosLocal byte) []byte {
+	// if hystCounter < N (channel still enabled)
+	b = append(b, 0x20, hystCounterLocal)
+	b = append(b, 0x41, nonMidHystStreak)
+	b = append(b, 0x49)       // i32.lt_u
+	b = append(b, 0x04, 0x40) // if (void)
+	// hystPos = pos
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x21, hystPosLocal)
+	b = emitDominantBulkSkip(b, info, false,
+		posLocal, lenLocal, /*lastAccept=*/ 0x00, ptrLocal,
+		chunkLocal, tmpLocal)
+	// hystCounter = (pos - hystPos < 16) ? hystCounter + 1 : 0
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x20, hystPosLocal)
+	b = append(b, 0x6B)       // i32.sub
+	b = append(b, 0x41, 0x10) // i32.const 16
+	b = append(b, 0x49)       // i32.lt_u
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, hystCounterLocal)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A) // i32.add
+	b = append(b, 0x21, hystCounterLocal)
+	b = append(b, 0x05) // else
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x21, hystCounterLocal)
+	b = append(b, 0x0B) // end if (counter update)
+	b = append(b, 0x0B) // end if (hystCounter < N)
+	return b
+}
+
+// emitNonMidValDispatch emits the non-mid dominant dispatch bodies. The
+// caller has already branched on `val >= 254` (val = the cached
+// midAcceptBytes[state] load), so with a single non-mid entry no further
+// compare is needed; with two entries (the encoding cap) a single
+// `val == 254` if/else discriminates them. This is what makes the task 38
+// v2 design free on the hot path: bytes in states with midAccept == 0
+// never reach here, and the load they DO pay was already emitted for the
+// mid-accept last_accept update.
+func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
+	valLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+	hystCounterLocal, hystPosLocal byte) []byte {
+	switch len(nonMid) {
+	case 1:
+		b = emitHystBulkSkip(b, nonMid[0],
+			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			hystCounterLocal, hystPosLocal)
+	case 2:
+		// val is 254 or 255 here; one compare discriminates. The else
+		// branch runs before any tmp/val clobber can happen, so the
+		// discrimination is safe.
+		b = append(b, 0x20, valLocal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(nonMid[0].encodedByte))
+		b = append(b, 0x46)       // i32.eq
+		b = append(b, 0x04, 0x40) // if (void)
+		b = emitHystBulkSkip(b, nonMid[0],
+			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			hystCounterLocal, hystPosLocal)
+		b = append(b, 0x05) // else
+		b = emitHystBulkSkip(b, nonMid[1],
+			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			hystCounterLocal, hystPosLocal)
+		b = append(b, 0x0B) // end if
+	}
+	return b
+}
+
+// emitFindMidAcceptDispatch emits the find-scan-loop midAccept block shared
+// by buildFindBody's u8 paths: the last_accept update plus both dominant
+// dispatch channels, all fed by ONE midAcceptBytes[state] load (task 38 v2):
+//
+//	val = midAccept[state]
+//	if val != 0:
+//	  if val < 254:                  ; only when non-mid values are in the table
+//	    last_accept = pos + 1
+//	    [mid dominant dispatch — per-entry val==enc compares]
+//	  else:                          ; val is a reserved 254+ non-mid encoding
+//	    [non-mid dispatch — emitNonMidValDispatch + hysteresis; NO last_accept]
+//
+// When the pattern has no non-mid entries the split is not emitted and the
+// sequence is byte-identical to the pre-task-38 mid-only emission. Under
+// useMandatoryLit the dominant dispatches are suppressed (pre-existing
+// behaviour) but the val < 254 split is still REQUIRED whenever non-mid
+// values are present in the table — without it a plain `!= 0` check would
+// treat the 254+ encodings as accepting states and corrupt last_accept.
+//
+// valLocal doubles as the bulk-skip scratch (tmp), matching the previous
+// emission's reuse of the class/simdMask local.
+func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
+	useMandatoryLit bool, midAcceptOff int32, tableMemIdx int,
+	stateLocal, posLocal, lenLocal, lastAcceptLocal, ptrLocal,
+	chunkLocal, valLocal, hystCounterLocal, hystPosLocal byte) []byte {
+
+	var mid, nonMid []dominantInfo
+	for _, info := range dominantStates {
+		if info.isMidAccept {
+			mid = append(mid, info)
+		} else {
+			nonMid = append(nonMid, info)
+		}
+	}
+	emitMidDom := !useMandatoryLit && len(mid) > 0
+	dispatchNonMid := !useMandatoryLit && len(nonMid) > 0
+	hasNonMidVals := len(nonMid) > 0
+
+	emitAccept := func(b []byte) []byte {
+		b = append(b, 0x20, posLocal)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)                  // pos + 1
+		b = append(b, 0x21, lastAcceptLocal) // local.set last_accept
+		return b
+	}
+	emitMidChain := func(b []byte) []byte {
+		for _, info := range mid {
+			b = append(b, 0x20, valLocal)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(info.encodedByte))
+			b = append(b, 0x46)       // i32.eq
+			b = append(b, 0x04, 0x40) // if (void)
+			b = emitDominantBulkSkip(b, info, true,
+				posLocal, lenLocal, lastAcceptLocal, ptrLocal,
+				chunkLocal, valLocal)
+			b = append(b, 0x0B) // end if (per-dominant gate)
+		}
+		return b
+	}
+
+	// val = midAccept[state]
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midAcceptOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx)
+	if emitMidDom || hasNonMidVals {
+		b = append(b, 0x22, valLocal) // local.tee — cache val
+	}
+	b = append(b, 0x04, 0x40) // if (val != 0)
+	if hasNonMidVals {
+		b = append(b, 0x20, valLocal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, 254)
+		b = append(b, 0x49)       // i32.lt_u
+		b = append(b, 0x04, 0x40) // if (val < 254)
+		b = emitAccept(b)
+		if emitMidDom {
+			b = emitMidChain(b)
+		}
+		if dispatchNonMid {
+			b = append(b, 0x05) // else — val >= 254: non-mid dominant
+			b = emitNonMidValDispatch(b, nonMid,
+				valLocal, posLocal, lenLocal, ptrLocal, chunkLocal, valLocal,
+				hystCounterLocal, hystPosLocal)
+		}
+		b = append(b, 0x0B) // end if (val < 254)
+	} else {
+		b = emitAccept(b)
+		if emitMidDom {
+			b = emitMidChain(b)
+		}
+	}
+	b = append(b, 0x0B) // end if (val != 0)
+	return b
+}
+
 // emitPhase4Dispatch emits the Phase 4 match-body bulk-skip dispatch.
-// Two dispatch blocks emitted in sequence (each gated on its own table
-// load):
-//   - mid-accept dominants  → midAcceptBytes[state] piggyback
-//   - non-mid-accept doms   → nonMidDominantBytes[state] side table
-//                             (only when nonMidDominantOff != 0)
+// One table load feeds both channels (task 38 v2):
+//
+//	val = midAcceptBytes[state]
+//	if val != 0:
+//	  if val < 254:  [mid dispatch — per-entry val==enc compares]
+//	  else:          [non-mid dispatch — emitNonMidValDispatch + hysteresis]
+//
+// The val < 254 split exists only when both channels are present; with a
+// single channel the branch collapses to that channel's body. Bytes in
+// states with midAccept == 0 (the vast majority on harm-shaped inputs)
+// pay only the load+branch — which the mid channel always required — and
+// nothing for the non-mid channel; this replaces the per-byte `state == K`
+// compare chain that was measured as the dominant fuel cost of the old
+// emission (perftest html-tags +474% with zero attempts executed).
+//
 // updateLastAccept is always false in match mode.
 //
 // Uses 1 v128 local (chunk) and 1 i32 local (tmp). Callers that already
-// have a scratch i32 (e.g. class/byte locals) reuse it as tmp.
+// have a scratch i32 (e.g. class/byte locals) reuse it as tmp. When any
+// non-mid dominant is present, callers must additionally declare 2 i32
+// locals (hysteresis counter + scratch) and pass their indices; both are
+// ignored when every entry is mid-accept.
 func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 	midAcceptOff int32, tableMemIdx int,
-	stateLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal byte) []byte {
+	stateLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+	hystCounterLocal, hystPosLocal byte) []byte {
 	if len(dominantStates) == 0 {
 		return b
 	}
-	// Count entries per channel to skip emission when one channel is empty.
-	hasMid, hasNonMid := false, false
+	var mid, nonMid []dominantInfo
 	for _, info := range dominantStates {
 		if info.isMidAccept {
-			hasMid = true
+			mid = append(mid, info)
 		} else {
-			hasNonMid = true
+			nonMid = append(nonMid, info)
 		}
 	}
-	if hasMid {
-		// tmp = midAccept[state]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptOff)
-		b = append(b, 0x20, stateLocal)
-		b = append(b, 0x6A) // i32.add
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x22, tmpLocal) // local.tee tmp
-		b = append(b, 0x04, 0x40)     // if (midAccept != 0)
-		for _, info := range dominantStates {
-			if !info.isMidAccept {
-				continue
-			}
+	emitMidChain := func(b []byte) []byte {
+		for _, info := range mid {
 			b = append(b, 0x20, tmpLocal)
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(info.encodedByte))
@@ -3716,30 +3946,45 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 				chunkLocal, tmpLocal)
 			b = append(b, 0x0B) // end if (per-dominant gate)
 		}
-		b = append(b, 0x0B) // end if (midAccept != 0)
+		return b
 	}
-	if hasNonMid {
-		// Pure state-ID compare emission (no memory load on the hot path).
-		// Workaround for the +47% no-match regression observed when
-		// dispatching via a separate nonMidDominantBytes side table —
-		// the extra memory load on the hot loop disrupts Cranelift
-		// register-allocation in the surrounding outer scan loop. Each
-		// non-mid entry becomes one `state == K` compare + bulk-skip.
-		for _, info := range dominantStates {
-			if info.isMidAccept {
-				continue
-			}
-			b = append(b, 0x20, stateLocal)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, info.state)
-			b = append(b, 0x46)       // i32.eq
-			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info, false,
-				posLocal, lenLocal, /*lastAccept=*/ 0x00, ptrLocal,
-				chunkLocal, tmpLocal)
-			b = append(b, 0x0B) // end if
-		}
+	// val = midAccept[state] (tee'd into tmp)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midAcceptOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A) // i32.add
+	b = appendTableLoad8u(b, tableMemIdx)
+	b = append(b, 0x22, tmpLocal) // local.tee tmp
+	b = append(b, 0x04, 0x40)     // if (val != 0)
+	switch {
+	case len(mid) > 0 && len(nonMid) > 0:
+		b = append(b, 0x20, tmpLocal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, 254)
+		b = append(b, 0x49)       // i32.lt_u
+		b = append(b, 0x04, 0x40) // if (val < 254)
+		b = emitMidChain(b)
+		b = append(b, 0x05) // else — val >= 254: non-mid dominant
+		b = emitNonMidValDispatch(b, nonMid,
+			tmpLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			hystCounterLocal, hystPosLocal)
+		b = append(b, 0x0B) // end if (val < 254)
+	case len(mid) > 0:
+		b = emitMidChain(b)
+	default:
+		// Only non-mid entries. Table values for accept states are 1
+		// (plain mid-accept) — the val >= 254 check below excludes them.
+		b = append(b, 0x20, tmpLocal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, 254)
+		b = append(b, 0x4F)       // i32.ge_u
+		b = append(b, 0x04, 0x40) // if (val >= 254)
+		b = emitNonMidValDispatch(b, nonMid,
+			tmpLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			hystCounterLocal, hystPosLocal)
+		b = append(b, 0x0B) // end if (val >= 254)
 	}
+	b = append(b, 0x0B) // end if (val != 0)
 	return b
 }
 
@@ -4102,6 +4347,29 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 	}
 
 	emitMidDom := len(dominantStates) > 0
+	// Task 38: non-mid dominants need 2 extra i32 locals (hysteresis
+	// counter + scratch, locals 6/7 in every path below).
+	hystDom := false
+	for _, info := range dominantStates {
+		if !info.isMidAccept {
+			hystDom = true
+		}
+	}
+
+	// appendMatchLocals appends the locals declaration shared by all three
+	// paths: i32Count i32 locals, then (only with dominants) 1 v128, then
+	// (only with non-mid dominants) the 2 hysteresis i32 locals.
+	appendMatchLocals := func(b []byte, i32Count byte) []byte {
+		switch {
+		case hystDom:
+			b = append(b, 0x03, i32Count, 0x7F, 0x01, 0x7B, 0x02, 0x7F)
+		case emitMidDom:
+			b = append(b, 0x02, i32Count, 0x7F, 0x01, 0x7B)
+		default:
+			b = append(b, 0x01, i32Count, 0x7F)
+		}
+		return b
+	}
 
 	// startCellInit emits: cell = startStateAccept ? 1 : 0 (packed paths only).
 	// This seeds the accept bit for the empty-input case. For the unpacked path
@@ -4110,12 +4378,9 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 	if useU8 && useCompression {
 		// ── u8 compressed path ────────────────────────────────────────────────
-		// Locals: state (2), pos (3), class (4). Phase 4 adds chunk (v128, 5).
-		if emitMidDom {
-			b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7B) // 3 i32 + 1 v128
-		} else {
-			b = append(b, 0x01, 0x03, 0x7F)
-		}
+		// Locals: state (2), pos (3), class (4). Phase 4 adds chunk (v128, 5);
+		// non-mid dominants add hystCounter (6) + hystPos (7).
+		b = appendMatchLocals(b, 0x03)
 
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(startState))
@@ -4141,8 +4406,9 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
-		// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse class).
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04)
+		// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse class),
+		// hysteresis counter/scratch = locals 6/7 (only with non-mid).
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04, 0x06, 0x07)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -4158,9 +4424,10 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 	if useU8 {
 		// ── u8 simple path ────────────────────────────────────────────────────
-		// Locals: state (2), pos (3). Phase 4 adds tmp (4, i32) + chunk (5, v128).
+		// Locals: state (2), pos (3). Phase 4 adds tmp (4, i32) + chunk (5, v128);
+		// non-mid dominants add hystCounter (6) + hystPos (7).
 		if emitMidDom {
-			b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7B) // 3 i32 + 1 v128
+			b = appendMatchLocals(b, 0x03)
 		} else {
 			b = append(b, 0x01, 0x02, 0x7F)
 		}
@@ -4188,8 +4455,8 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
-		// Phase 4 dispatch: tmp=local 4, chunk=local 5.
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04)
+		// Phase 4 dispatch: tmp=local 4, chunk=local 5, hyst=6/7.
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04, 0x06, 0x07)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -4204,12 +4471,9 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 	}
 
 	// ── u16 path ─────────────────────────────────────────────────────────────
-	// Locals: state (2), pos (3), byte (4). Phase 4 adds chunk (v128, 5).
-	if emitMidDom {
-		b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7B) // 3 i32 + 1 v128
-	} else {
-		b = append(b, 0x01, 0x03, 0x7F)
-	}
+	// Locals: state (2), pos (3), byte (4). Phase 4 adds chunk (v128, 5);
+	// non-mid dominants add hystCounter (6) + hystPos (7).
+	b = appendMatchLocals(b, 0x03)
 
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(startState))
@@ -4241,8 +4505,8 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 	b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
-	// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse byte).
-	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04)
+	// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse byte), hyst=6/7.
+	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04, 0x06, 0x07)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)
@@ -5717,11 +5981,27 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	needsDenseSwitch := lnmAction5 && len(firstBytes) > 16 && len(firstBytes) <= 64 && !shuftiBeatsScalar(firstBytes)
 	var denseCounterLocal, denseSkipFlagLocal byte
 
+	// needsBulkHyst (TODO.md task 38): any non-mid-accept dominant present
+	// → the dispatch below wraps its bulk-skip in the runtime hysteresis,
+	// which needs 2 extra i32 locals (streak counter + pos scratch). The
+	// non-mid dispatch is skipped entirely under useMandatoryLit, so no
+	// locals are needed there either.
+	needsBulkHyst := false
+	if !useMandatoryLit {
+		for _, info := range dominantStates {
+			if !info.isMidAccept {
+				needsBulkHyst = true
+			}
+		}
+	}
+	var bulkHystCounterLocal, bulkHystPosLocal byte
+
 	// assignV128Locals assigns sequential indices starting at base to
 	// exactly the v128 locals numV128ForScan implies are live, leaving
 	// the rest at their zero value (never referenced, so never declared).
 	// When needsDenseSwitch, also assigns the 2 dense-switch i32 locals
-	// immediately after the v128 group.
+	// immediately after the v128 group; when needsBulkHyst, the 2
+	// hysteresis i32 locals follow.
 	assignV128Locals := func(base byte) {
 		next := base
 		if numV128ForScan >= 1 {
@@ -5764,27 +6044,41 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			denseSkipFlagLocal = next
 			next++
 		}
+		if needsBulkHyst {
+			bulkHystCounterLocal = next
+			next++
+			bulkHystPosLocal = next
+			next++
+		}
 	}
 	// appendLocalGroups appends the i32 group (count i32Count), then, only
-	// if numV128ForScan > 0, a v128 group, then, only if needsDenseSwitch,
-	// a third i32 group (2 locals) for the dense-switch counter/flag —
-	// matching the existing "skip the group entirely when count is 0"
-	// convention used elsewhere in this codebase (e.g. buildBTFindBody in
-	// engine_backtrack.go).
+	// if numV128ForScan > 0, a v128 group, then, only if needsDenseSwitch
+	// or needsBulkHyst, a third i32 group (2 or 4 locals) for the
+	// dense-switch counter/flag and/or the task 38 hysteresis
+	// counter/scratch — matching the existing "skip the group entirely
+	// when count is 0" convention used elsewhere in this codebase (e.g.
+	// buildBTFindBody in engine_backtrack.go).
 	appendLocalGroups := func(b []byte, i32Count byte) []byte {
+		trailingI32 := byte(0)
+		if needsDenseSwitch {
+			trailingI32 += 2
+		}
+		if needsBulkHyst {
+			trailingI32 += 2
+		}
 		numGroups := byte(1)
 		if numV128ForScan > 0 {
 			numGroups++
 		}
-		if needsDenseSwitch {
+		if trailingI32 > 0 {
 			numGroups++
 		}
 		b = append(b, numGroups, i32Count, 0x7F)
 		if numV128ForScan > 0 {
 			b = append(b, byte(numV128ForScan), 0x7B)
 		}
-		if needsDenseSwitch {
-			b = append(b, 0x02, 0x7F)
+		if trailingI32 > 0 {
+			b = append(b, trailingI32, 0x7F)
 		}
 		return b
 	}
@@ -5941,18 +6235,51 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 				b = append(b, 0x41, 0x7F) // i32.const -1
 				b = append(b, 0x21, 0x05) // local.set last_accept
 				// if midAccept[state]: last_accept = pos
-				// Opt 1 keeps midAccept's mid-accept-only semantics (values
-				// 0/1/2..127); non-mid-accept dominants live in a separate
-				// side table, so no gate is needed here.
+				//
+				// Task 38 v2 fix: non-mid dominants are encoded as reserved
+				// values 254/255 in this SAME table (see
+				// applyDominantStateEncoding / emitFindMidAcceptDispatch) —
+				// the plain `val != 0` check this site used to have (a
+				// leftover from the pre-v2 design, where non-mid dominants
+				// lived in a separate side table) wrongly treated a non-mid-
+				// dominant start state as already-accepting, recording a
+				// spurious empty match at the attempt's start position.
+				// Found via `(?:(?:(?:(?:^)|.)*))$` on inputs containing
+				// `\n`: the pattern's single DFA state is simultaneously the
+				// start state and a non-mid dominant (midAccept[state]=254),
+				// so the old check fired at attempt_start=0 when it should
+				// only fire at true EOF. Guard with the same `(val-1) u<
+				// 253` idiom already used by the u16 accept path — true iff
+				// 1<=val<=253 (plain mid-accept, mid dominant, or Shufti
+				// self-loop, all genuinely accepting; false for 0=nothing
+				// and 254/255=non-mid dominant). Only emitted when non-mid
+				// values can appear in the table at all (mirrors
+				// emitFindMidAcceptDispatch's hasNonMidVals gate) — for
+				// every other pattern this is byte-identical to the
+				// pre-fix emission.
+				hasNonMidValsAtStart := false
+				for _, info := range dominantStates {
+					if !info.isMidAccept {
+						hasNonMidValsAtStart = true
+						break
+					}
+				}
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, midAcceptOff)
 				b = append(b, 0x20, 0x02)             // local.get state
 				b = append(b, 0x6A)                   // i32.add
 				b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-				b = append(b, 0x04, 0x40)             // if (void)
-				b = append(b, 0x20, 0x03)             // local.get pos
-				b = append(b, 0x21, 0x05)             // local.set last_accept
-				b = append(b, 0x0B)                   // end if
+				if hasNonMidValsAtStart {
+					b = append(b, 0x41, 0x01)
+					b = append(b, 0x6B) // val - 1
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, int32(253))
+					b = append(b, 0x49) // (val-1) u< 253
+				}
+				b = append(b, 0x04, 0x40) // if (void)
+				b = append(b, 0x20, 0x03) // local.get pos
+				b = append(b, 0x21, 0x05) // local.set last_accept
+				b = append(b, 0x0B)       // end if
 				if startBeginAccept {
 					b = append(b, 0x20, 0x04) // local.get attempt_start
 					b = append(b, 0x45)       // i32.eqz
@@ -6179,12 +6506,27 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	if useU8 && useCompression {
 		// ── u8 compressed find path ───────────────────────────────────────────
 		if useMandatoryLit {
-			// 8 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),lit_pos(7),scan_start(8),simdMask_scan(9),chunk_scan(10)
+			// 9 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),class(6),lit_pos(7),scan_start(8),simdMask_scan(9),simdMask(10),chunk_scan(11)
+			//
+			// simdMaskLocal (task 38 v2 fix): emitFindMidAcceptDispatch's
+			// hasNonMidVals gate is independent of useMandatoryLit (it only
+			// checks whether the pattern has a non-mid dominant state at
+			// all), so the "cache midAccept[state] into valLocal" sequence
+			// still gets emitted even though the actual dominant dispatch
+			// bodies are suppressed here. Without this assignment
+			// simdMaskLocal stayed at its Go zero-value (0 = the `ptr`
+			// parameter), so every DFA transition on a dominant-state
+			// pattern clobbered `ptr` with the loaded table value —
+			// corrupting every subsequent ptr+pos memory address for the
+			// rest of the scan. Found via `(?m:^(foo.*)$)`: the match ran
+			// past the newline to EOF instead of stopping at the line
+			// boundary, because `ptr` got overwritten mid-scan.
 			litPosLocal = 7
 			scanStartLocal = 8
 			simdMaskScanLocal = 9
-			chunkScanLocal = 10
-			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
+			simdMaskLocal = 10
+			chunkScanLocal = 11
+			b = append(b, 0x02, 0x09, 0x7F, 0x01, 0x7B)
 		} else {
 			// 6 i32 + N v128 (N sized to what's actually used — see
 			// numV128ForScan)
@@ -6226,72 +6568,21 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3, 0x03, skipSafeOnDead)
 		b = append(b, 0x0B) // end if
 
-		// if midAccept[state]: last_accept = pos + 1
-		// Opt 1 — mid-accept dominants piggyback on the midAccept lookup
-		// (cached for dispatch).
-		//
-		// Non-mid-accept dominants used a SECOND dispatch path below
-		// (extracted to plans/non_mid_extension.go.archive Section 7).
-		// With non-mid emission archived, every entry in dominantStates
-		// is mid-accept; the `hasMidDom` discriminator and per-entry
-		// `if info.isMidAccept` filters from that variant are no longer
-		// needed.
-		emitMidDom := !useMandatoryLit && len(dominantStates) > 0
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptOff)
-		b = append(b, 0x20, 0x02)             // local.get state
-		b = append(b, 0x6A)                   // i32.add
-		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-		if emitMidDom {
-			b = append(b, 0x22, 0x06) // local.tee class — cache midAccept value
-		}
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x41, 0x01) // i32.const 1
-		b = append(b, 0x6A)       // i32.add
-		b = append(b, 0x21, 0x05) // local.set last_accept
-		if emitMidDom {
-			for _, info := range dominantStates {
-				b = append(b, 0x20, 0x06) // local.get class
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(info.encodedByte))
-				b = append(b, 0x46)       // i32.eq
-				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info, true,
-					/*pos=*/ 0x03, /*len=*/ 0x01,
-					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
-					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ 0x06)
-				b = append(b, 0x0B) // end if (bulk-skip gate)
-			}
-		}
-		b = append(b, 0x0B) // end if (midAccept)
-
-		// Non-mid-accept dominant dispatch (separate side-table channel).
-		// Mirrors the mid-accept dispatch shape: load nonMidDominantBytes
-		// [state], gate on non-zero, per-entry compare + bulk-skip.
-		// updateLastAccept=false because non-mid states must not update
-		// last_accept during the skip.
-		//
-		// Workaround for the +47% no-match regression: instead of a table
-		// load + dispatch chain, emit pure state-ID compares (no extra
-		// memory access on the hot path).
-		if !useMandatoryLit {
-			for _, info := range dominantStates {
-				if info.isMidAccept {
-					continue
-				}
-				b = append(b, 0x20, 0x02) // local.get state
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, info.state)
-				b = append(b, 0x46)       // i32.eq
-				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info, false,
-					/*pos=*/ 0x03, /*len=*/ 0x01,
-					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
-					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ 0x06)
-				b = append(b, 0x0B) // end if (state == K)
-			}
-		}
+		// Opt 1 (task 38 v2): one midAccept[state] load feeds the accept
+		// update AND both dominant channels via the value ranges written
+		// by applyDominantStateEncoding(l, true):
+		//   val == 0       → nothing
+		//   1 <= val < 254 → mid-accept: last_accept = pos+1 (+ mid dispatch)
+		//   val >= 254     → non-mid dominant dispatch (NO last_accept)
+		// The val < 254 split is emitted only when non-mid values are in
+		// the table, so mid-only patterns keep the exact pre-task-38
+		// instruction sequence.
+		b = emitFindMidAcceptDispatch(b, dominantStates, useMandatoryLit,
+			midAcceptOff, tableMemIdx,
+			/*state=*/ 0x02, /*pos=*/ 0x03, /*len=*/ 0x01,
+			/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
+			chunkLocal, /*val+tmp=*/ 0x06,
+			bulkHystCounterLocal, bulkHystPosLocal)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
@@ -6310,12 +6601,16 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	if useU8 {
 		// ── u8 simple find path ───────────────────────────────────────────────
 		if useMandatoryLit {
-			// 7 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),lit_pos(6),scan_start(7),simdMask_scan(8),chunk_scan(9)
+			// 8 i32 + 1 v128: state(2),pos(3),attempt_start(4),last_accept(5),lit_pos(6),scan_start(7),simdMask_scan(8),simdMask(9),chunk_scan(10)
+			//
+			// simdMaskLocal: see the identical fix + explanation in the
+			// u8-compressed path above (task 38 v2 fix, `ptr`-clobber bug).
 			litPosLocal = 6
 			scanStartLocal = 7
 			simdMaskScanLocal = 8
-			chunkScanLocal = 9
-			b = append(b, 0x02, 0x07, 0x7F, 0x01, 0x7B)
+			simdMaskLocal = 9
+			chunkScanLocal = 10
+			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
 		} else {
 			// 5 i32 + N v128 (N sized to what's actually used — see
 			// numV128ForScan)
@@ -6356,62 +6651,15 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3, 0x03, skipSafeOnDead)
 		b = append(b, 0x0B) // end if
 
-		// if midAccept[state]: last_accept = pos + 1
-		// Opt 1 — mid-accept dominants piggyback on midAccept lookup.
-		// See the matching u8+compressed path above for details, and
-		// plans/non_mid_extension.go.archive Section 8 for the non-mid
-		// counterpart this used to coexist with.
-		emitMidDom := !useMandatoryLit && len(dominantStates) > 0
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptOff)
-		b = append(b, 0x20, 0x02) // local.get state
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-		if emitMidDom {
-			b = append(b, 0x22, simdMaskLocal) // local.tee — cache midAccept value
-		}
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x20, 0x03) // local.get pos
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x6A)
-		b = append(b, 0x21, 0x05) // local.set last_accept
-		if emitMidDom {
-			for _, info := range dominantStates {
-				b = append(b, 0x20, simdMaskLocal) // local.get cached midAccept
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(info.encodedByte))
-				b = append(b, 0x46)       // i32.eq
-				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info, true,
-					/*pos=*/ 0x03, /*len=*/ 0x01,
-					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
-					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ simdMaskLocal)
-				b = append(b, 0x0B) // end if (bulk-skip gate)
-			}
-		}
-		b = append(b, 0x0B) // end if (midAccept)
-
-		// Non-mid-accept dominant dispatch (separate side-table channel),
-		// u8+simple variant. Pure state-ID compare emission (no memory load
-		// on the hot path) — workaround for the +47% Cranelift no-match
-		// regression observed with the original side-table-based dispatch.
-		if !useMandatoryLit {
-			for _, info := range dominantStates {
-				if info.isMidAccept {
-					continue
-				}
-				b = append(b, 0x20, 0x02) // local.get state
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, info.state)
-				b = append(b, 0x46)       // i32.eq
-				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info, false,
-					/*pos=*/ 0x03, /*len=*/ 0x01,
-					/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
-					/*chunkLocal=*/ chunkLocal, /*tmpLocal=*/ simdMaskLocal)
-				b = append(b, 0x0B) // end if (state == K)
-			}
-		}
+		// Opt 1 (task 38 v2): one midAccept[state] load feeds the accept
+		// update and both dominant channels — see the u8+compressed path
+		// above and emitFindMidAcceptDispatch for the value-range scheme.
+		b = emitFindMidAcceptDispatch(b, dominantStates, useMandatoryLit,
+			midAcceptOff, tableMemIdx,
+			/*state=*/ 0x02, /*pos=*/ 0x03, /*len=*/ 0x01,
+			/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
+			chunkLocal, /*val+tmp=*/ simdMaskLocal,
+			bulkHystCounterLocal, bulkHystPosLocal)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
 
@@ -6483,13 +6731,30 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x0B) // end if
 
 	// if midAccept[state]: last_accept = pos + 1
+	// The u16 path emits no dominant dispatch, but when non-mid entries
+	// exist the table carries their reserved 254+ encodings (task 38 v2),
+	// which must NOT be treated as accepting: `(val-1) u< 253` accepts
+	// exactly the 1..253 range in a single unsigned compare.
+	hasNonMidU16 := false
+	for _, info := range dominantStates {
+		if !info.isMidAccept {
+			hasNonMidU16 = true
+		}
+	}
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, midAcceptOff)
 	b = append(b, 0x20, 0x02) // local.get state
 	b = append(b, 0x6A)
 	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-	b = append(b, 0x04, 0x40)             // if (void)
-	b = append(b, 0x20, 0x03)             // local.get pos
+	if hasNonMidU16 {
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6B) // i32.sub (val - 1)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, 253)
+		b = append(b, 0x49) // i32.lt_u — true iff val in 1..253
+	}
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, 0x03) // local.get pos
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6A)
 	b = append(b, 0x21, 0x05) // local.set last_accept
