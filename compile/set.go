@@ -390,15 +390,8 @@ type CompileSetOptions struct {
 	TableMemIdx           int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
 	// LikelyMode is the resolved set-level LikelyMode hint: consumed by the
 	// set-frontend density gate (H.3, shipped — forces Shufti for a 17..64-byte
-	// first-byte union under LikelyNoMatch) and used as the per-pattern
-	// fallback when resolving PatternLikelyModes below.
+	// first-byte union under LikelyNoMatch).
 	LikelyMode LikelyMode
-	// PatternLikelyModes is the resolved per-pattern LikelyMode for each
-	// pattern in the set, indexed by the same position as spec.Patterns when
-	// passed to CompileSet. nil/empty means all patterns use LikelyNeutral.
-	// Consumed by genSuffixWASM (H.2, shipped) to gate the non-mid-accept
-	// dominant bulk-skip per bucket.
-	PatternLikelyModes []LikelyMode
 }
 
 func (o CompileSetOptions) bitmaskWidth() int {

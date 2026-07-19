@@ -197,22 +197,6 @@ var tests = []testCase{
 		nomatchInput: btAction5Input(false),
 	},
 	{
-		// Task 17 target: non-mid-accept dominant body in a set. `<[^>]+>`'s
-		// suffix DFA has one dominant self-loop state (on non-'>') that is
-		// NOT itself an accept point — you need the closing '>' before any
-		// match completes, unlike set-log-line-bodies' `[^\n]+` (mid-accept,
-		// already unconditional per Gap H.2's mid path). This is the
-		// LikelyMatch-gated remainder: buildSetSuffixBody's non-mid dispatch
-		// only fires when at least one pattern in the bucket resolves to
-		// LikelyMatch.
-		name:         "set-nonmid-dominant-tags",
-		setPatterns:  []string{`<[^>]+>`},
-		mode:         modeSet,
-		notes:        "set with non-mid-accept dominant body — task 17 (Gap H.2 non-mid remainder) target",
-		matchInput:   setNonMidDominantInput(true),
-		nomatchInput: setNonMidDominantInput(false),
-	},
-	{
 		// Task 8 target: pattern with greedy class quantifier followed by a
 		// required suffix that doesn't appear anywhere. From every starting
 		// position the DFA self-loops through the same letter run and dies
@@ -299,55 +283,6 @@ var tests = []testCase{
 		matchInput:   strings.Repeat("aB3_", 2560) + "!",
 		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
 	},
-	// ── Non-mid dominant bulk-skip: run-length bimodality (task 38) ─────
-	// Restored 2026-07-18 (trimmed at 3751bf9 as "identical WASM across
-	// modes" — true under task 7 step 2's default-on, no longer true after
-	// task 36 re-gated the non-mid channel). These two are the WIN side:
-	// long runs in the dominant state where one bulk-skip attempt SIMD-skips
-	// thousands of bytes. Reference numbers preserved in
-	// baseline_likely.txt.old_stale.
-	{
-		// Very rare: control character first byte. Never appears in ASCII
-		// prose, so Teddy false-positives on no-match input are ~zero.
-		// Bulk-skip should win on match, no regression possible on no-match.
-		name:         "ctrl-delim",
-		pattern:      `\x01[^\x02]+\x02`,
-		mode:         modeFind,
-		notes:        "very-rare first byte (\\x01), 9KB bodies — non-mid bulk-skip win side",
-		matchInput:   delimitedBodyInput(true, 0x01, 0x02, 5, 9000),
-		nomatchInput: delimitedBodyInput(false, 0x01, 0x02, 0, 0),
-	},
-	{
-		// Rare-ish: `<` is mid-rare in prose, common in HTML/XML. On prose
-		// no-match input Teddy fires occasionally; on HTML it fires often.
-		name:         "xml-tag",
-		pattern:      `<[^>]+>`,
-		mode:         modeFind,
-		notes:        "rare first byte (<), 9KB bodies — non-mid bulk-skip win side",
-		matchInput:   delimitedBodyInput(true, '<', '>', 5, 9000),
-		nomatchInput: delimitedBodyInput(false, '<', '>', 0, 0),
-	},
-	{
-		// Task 38 HARM side — dense short runs in the dominant state. The
-		// pattern needs `]` + digit to complete, so a `[short]` bracket
-		// without a trailing digit sends the find loop back to scanning:
-		// one call passes through MANY short dominant-state runs, and
-		// every bulk-skip attempt finds the `]` exit byte inside its
-		// first SIMD chunk (advance < 16 bytes — pure overhead vs the
-		// scalar per-byte path). `<[^>]+>` can't exercise this within one
-		// call: its exit byte completes the match, ending the call after
-		// a single attempt. The tail must be a CLASS, not a literal
-		// (`\]:` forms a 2-byte mandatory literal and reroutes the whole
-		// pattern to the lit-anchor path, which is out of task 38's
-		// scope). The runtime hysteresis must catch the unproductive
-		// streak and disable the channel for the rest of the call.
-		name:         "bracket-ref-short-run",
-		pattern:      `\[[^\]]+\][0-9]`,
-		mode:         modeFind,
-		notes:        "dense 2-4-byte bracket bodies, no digit after ] — non-mid bulk-skip harm side (task 38)",
-		matchInput:   shortRunBracketInput(true),
-		nomatchInput: shortRunBracketInput(false),
-	},
 }
 
 // --------------------------------------------------------------------------
@@ -415,116 +350,6 @@ func classRunInput(withMatches bool, class string, runLen, runs int) string {
 		b = append(b, prose...)
 	}
 	return string(b[:targetSize])
-}
-
-// delimitedBodyInput builds an input for the non-mid dominant bulk-skip
-// long-run (win-side) cases. Restored 2026-07-18 from git 3751bf9~1 for
-// task 38.
-//
-// When withMatches is true, the buffer contains `bodies` × (`bodyLen` bytes)
-// matches shaped `<open>[non-close-byte body]<close>`. The body byte fills
-// repeatedly using a "lorem ipsum"-style filler with the close byte
-// stripped out, so the match length actually reaches `bodyLen`. Total
-// buffer is padded with plain ASCII prose to ~50 KB.
-//
-// When withMatches is false, the buffer is pure ASCII prose (lorem ipsum
-// + the quick-brown-fox sentence) with the `open` byte stripped out so
-// no Teddy false-positives from the literal can occur EXCEPT when `open`
-// is a natural ASCII letter (in which case stripping it would change the
-// prose; for those we accept the natural occurrence rate as the test
-// signal). Total buffer ~50 KB.
-//
-// This produces:
-//   - matchInput: bulk-skip-friendly. Each match has a long body where
-//     the dominant self-loop fires repeatedly.
-//   - nomatchInput: stresses Teddy at the natural frequency of `open` in
-//     prose.
-func delimitedBodyInput(withMatches bool, open, close byte, bodies, bodyLen int) string {
-	const targetSize = 50 * 1024
-	filler := []byte(" lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua quisque vel libero")
-	stripBytes := func(s []byte, drop byte) []byte {
-		out := s[:0:len(s)]
-		for _, c := range s {
-			if c != drop {
-				out = append(out, c)
-			}
-		}
-		return out
-	}
-	bodyFiller := stripBytes(append([]byte(nil), filler...), close)
-	if !withMatches {
-		var b []byte
-		prose := stripBytes(append([]byte(nil), filler...), open)
-		// Also strip the close byte so a stray pair can't form unintended matches.
-		prose = stripBytes(prose, close)
-		// If both bytes happen to be ASCII letters that gut the prose, fall
-		// back to a different sentence.
-		if len(prose) < 20 {
-			prose = []byte("The quick brown fox jumps over the lazy dog. ")
-			prose = stripBytes(prose, open)
-			prose = stripBytes(prose, close)
-		}
-		for len(b) < targetSize {
-			b = append(b, prose...)
-		}
-		return string(b[:targetSize])
-	}
-	var b []byte
-	for i := 0; i < bodies; i++ {
-		b = append(b, open)
-		for len(b)%bodyLen != bodyLen-1 && len(b) < targetSize-2 {
-			// Inner loop bound is approximate; we just want roughly bodyLen
-			// bytes of body before the close.
-			b = append(b, bodyFiller...)
-			if len(b) >= bodyLen*(i+1) {
-				break
-			}
-		}
-		b = append(b, close)
-		b = append(b, '\n')
-	}
-	// Pad with prose (stripped of `open` so we don't accidentally start new
-	// matches mid-pad).
-	pad := stripBytes(append([]byte(nil), filler...), open)
-	pad = stripBytes(pad, close)
-	if len(pad) < 20 {
-		pad = []byte("plain padding text without delimiters here at all\n")
-		pad = stripBytes(pad, open)
-		pad = stripBytes(pad, close)
-	}
-	for len(b) < targetSize {
-		b = append(b, pad...)
-	}
-	return string(b[:targetSize])
-}
-
-// shortRunBracketInput builds a ~50 KB input of densely packed short
-// bracket bodies for `\[[^\]]+\][0-9]` — the task 38 harm-side case.
-// Every `[..]` body is 2-4 bytes, so a bulk-skip attempt at the first
-// body byte always finds the `]` exit inside its first 16-byte SIMD
-// chunk. The filler contains no digits, so no bracket completes a match
-// mid-stream.
-//
-// When withMatches is true, a single `[ref]7` match sits at the very
-// end, so the first find call scans the full dense-short-run stretch
-// before completing. When false, no digit ever follows a bracket — the
-// call scans everything and fails.
-func shortRunBracketInput(withMatches bool) string {
-	const targetSize = 50 * 1024
-	unit := []byte("[a] [b] [c] [d] ")
-	var b []byte
-	limit := targetSize
-	if withMatches {
-		limit = targetSize - 8 // leave room for the trailing match
-	}
-	for len(b) < limit {
-		b = append(b, unit...)
-	}
-	b = b[:limit]
-	if withMatches {
-		b = append(b, []byte("[ref]7 x")...)
-	}
-	return string(b)
 }
 
 // btAction5Input builds a ~50 KB input for `([a-zA-Z]+?)\d`. The
@@ -672,33 +497,6 @@ func secretsFalsePositiveInput() string {
 		b = append(b, filler...)
 		b = append(b, []byte("ghp_")...)
 		b = append(b, nearMissSuffix...)
-	}
-	return string(b[:targetSize])
-}
-
-// setNonMidDominantInput builds ~50 KB of mixed text for the task 17 set
-// test case (`<[^>]+>`).
-// When withMatches is true: many small HTML-ish tags interleaved with
-// prose, so the dominant non-mid-accept body (self-loop on non-'>') has
-// bytes to bulk-skip across many separate tags.
-// When false: prose with no '<' at all, so the DFA never enters the
-// dominant state — used to confirm the no-match path's cost (a real,
-// small, expected regression per Task 7 step 2 precedent) is measured
-// accurately, not accidentally masked by matches.
-func setNonMidDominantInput(withMatches bool) string {
-	const targetSize = 50 * 1024
-	prose := "the quick brown fox jumps over the lazy dog. "
-	if !withMatches {
-		var b []byte
-		for len(b) < targetSize {
-			b = append(b, prose...)
-		}
-		return string(b[:targetSize])
-	}
-	var b []byte
-	for len(b) < targetSize {
-		b = append(b, prose...)
-		b = append(b, `<div class="container-fluid-wrapper">`...)
 	}
 	return string(b[:targetSize])
 }
