@@ -39,7 +39,7 @@ import (
 
 const (
 	inputBase  = int32(0)
-	slotsBase  = int32(65536) // page 1: keep clear of input (up to 64 KiB at offset 0)
+	slotsBase  = int32(65536)  // page 1: keep clear of input (up to 64 KiB at offset 0)
 	tableBase  = int64(131072) // page 2; pages 0-1 reserved for input + slots
 	benchIters = 10_000
 	fuelBudget = uint64(10_000_000_000)
@@ -271,6 +271,35 @@ var tests = []testCase{
 		nomatchInput: setShuftiLNMInput(false),
 	},
 	{
+		// Task 28 target: same 21-pattern [A-U] set as set-shufti-lnm, but
+		// the no-match input is DENSE in the tracked first-byte set instead
+		// of sparse — the "rarely matches" assumption LikelyNoMatch bakes
+		// into forcing Shufti doesn't hold here. Mirrors alpha-run/word-run
+		// (task 25's single-pattern version of this same footgun), which
+		// EmitPrefixScan's DenseCounter/DenseSkipFlag adaptive switch
+		// already protects against — buildSetSuffixBody's Shufti frontend
+		// (emitSetMatchFnFinalShufti) has no equivalent protection yet.
+		//
+		// No-match input is solid A-U letters with no gaps at all: every
+		// SIMD chunk's bitmask is all-1s, so ctz always returns 0 and the
+		// skip loop can never advance by more than one position per
+		// attempt — forcing the scalar membership-check tail on literally
+		// every position, on top of the SIMD overhead itself. None of the
+		// letters are ever followed by "1:" so nothing matches.
+		name: "set-shufti-dense-harm",
+		setPatterns: []string{
+			`A1:[^\n]+`, `B1:[^\n]+`, `C1:[^\n]+`, `D1:[^\n]+`, `E1:[^\n]+`,
+			`F1:[^\n]+`, `G1:[^\n]+`, `H1:[^\n]+`, `I1:[^\n]+`, `J1:[^\n]+`,
+			`K1:[^\n]+`, `L1:[^\n]+`, `M1:[^\n]+`, `N1:[^\n]+`, `O1:[^\n]+`,
+			`P1:[^\n]+`, `Q1:[^\n]+`, `R1:[^\n]+`, `S1:[^\n]+`, `T1:[^\n]+`,
+			`U1:[^\n]+`,
+		},
+		mode:         modeSet,
+		notes:        "set with 21 [A-U]-prefixed literals, DENSE no-match data — task 28 (Shufti dense-data harm) target",
+		matchInput:   setShuftiDenseHarmInput(true),
+		nomatchInput: setShuftiDenseHarmInput(false),
+	},
+	{
 		// Gap F target: (\w+) TDFA capture body is a single state that
 		// self-loops on 63 of 256 bytes with a uniform set-to-pos tag op.
 		// matchInput anchors a 10 KB run of \w bytes so the SIMD bulk-skip
@@ -399,8 +428,10 @@ func btAction5Input(withMatches bool) string {
 // DFA verifies preceding digits, forward DFA scans the long body.
 //
 // When withMatches is true: 2 long matches embedded:
-//   `0001INFO:` + ~24 KB non-newline body + `\n` + filler +
-//   `0002INFO:` + ~24 KB non-newline body + `\n`.
+//
+//	`0001INFO:` + ~24 KB non-newline body + `\n` + filler +
+//	`0002INFO:` + ~24 KB non-newline body + `\n`.
+//
 // When false: pure prose with no `INFO:` substring (no Teddy hits).
 func litAnchorDominantBodyInput(withMatches bool) string {
 	const targetSize = 50 * 1024
@@ -528,7 +559,6 @@ func deadSkipNearMissInput(withMatches bool) string {
 	return string(b)
 }
 
-
 // minLenQuantifierSkipInput builds inputs for the Task 8 follow-up #2
 // target (pattern `[a-z]{50,}[0-9]`, no-match input never dies and never
 // runs short of input — see likelytest case "minlen-quantifier-skip").
@@ -615,6 +645,50 @@ func setShuftiLNMInput(withMatches bool) string {
 		}
 		b = append(b, '\n')
 		b = append(b, prose...)
+		idx++
+	}
+	return string(b[:targetSize])
+}
+
+// setShuftiDenseHarmInput builds ~50 KB for the task 28 set-shufti-dense-harm
+// case — the harm-side counterpart to setShuftiLNMInput's win-side prose.
+//
+// When withMatches is false: solid A-U letters with no gaps at all (no
+// spaces, no other bytes) — every byte in the buffer is a Shufti
+// candidate, so the SIMD skip loop's bitmask is always all-1s and ctz
+// always returns 0, forcing the scalar membership-check tail on every
+// single position. None of the letters are followed by "1:" so nothing
+// ever matches.
+// When withMatches is true: the same dense A-U filler with a handful of
+// real "<Letter>1:<body>\n" matches spliced in, so the match path is
+// exercised under the same dense-first-byte-set conditions.
+func setShuftiDenseHarmInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	letters := []byte("ABCDEFGHIJKLMNOPQRSTU")
+	if !withMatches {
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, letters...)
+		}
+		return string(b[:targetSize])
+	}
+	bodyFiller := []byte("VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV")
+	var b []byte
+	idx := 0
+	for len(b) < targetSize {
+		for i := 0; i < 400; i++ {
+			b = append(b, letters...)
+		}
+		// Real match: "<Letter>1:<200-byte body>\n" — body uses 'V' (not
+		// in the tracked A-U set) so it can't itself extend a neighbouring
+		// dense run into a spurious match.
+		b = append(b, letters[idx%len(letters)])
+		b = append(b, '1', ':')
+		bodyStart := len(b)
+		for len(b)-bodyStart < 200 {
+			b = append(b, bodyFiller...)
+		}
+		b = append(b, '\n')
 		idx++
 	}
 	return string(b[:targetSize])
@@ -939,8 +1013,8 @@ func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string
 // silently overwrites the frontend Teddy/AC tables and the set match function
 // produces garbage.
 const (
-	setOutCap   = int32(256)  // output capacity in tuples (12 B each)
-	setIterTime = 1000        // exhaustion passes per p50 sample
+	setOutCap   = int32(256) // output capacity in tuples (12 B each)
+	setIterTime = 1000       // exhaustion passes per p50 sample
 )
 
 // setMemPlan holds the resolved memory offsets for one set's bench.
@@ -1130,7 +1204,6 @@ func gain(cur, base float64) string {
 	}
 	return fmt.Sprintf("%+4.0f%%", pct)
 }
-
 
 // printMatrix prints the 3x{2 inputs × 2 metrics} table for one pattern.
 // rows: neutral, likely-match, likely-nomatch.

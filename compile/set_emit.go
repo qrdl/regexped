@@ -85,6 +85,17 @@ type compiledSet struct {
 	// so no data segment is needed.
 	shuftiFirstByteSet []byte
 
+	// shuftiAdaptive (task 28): true when Shufti was selected ONLY because
+	// set-level LikelyNoMatch overrode a static verdict that scalar would
+	// win (shuftiBeatsScalar(union) == false). Mirrors EmitPrefixScan's
+	// `adaptive` gate (TODO.md task 25) for the single-pattern path: the
+	// static heuristic can't tell "sparse runtime data" (override
+	// genuinely wins) from "dense runtime data" (override regresses), so
+	// emitSetMatchFnFinalShufti adds a runtime DenseCounter/DenseSkipFlag
+	// switch that falls back to the scalar tail once density is confirmed,
+	// instead of trusting the static override for the whole scan.
+	shuftiAdaptive bool
+
 	// litToBuckets[litID] = list of bucket indices sharing this literal.
 	// Multiple buckets can share a literal when bin-packing splits large groups.
 	litToBuckets [][]int
@@ -365,6 +376,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// union in the 17..64 band. The selection trigger is either the
 	// rarity-based density heuristic or set-level LikelyNoMatch (Action 5).
 	var shuftiFirstByteSet []byte
+	var shuftiAdaptive bool
 	if fe == frontendScalar {
 		hasFallback := false
 		for _, b := range buckets {
@@ -377,9 +389,11 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			union := litUnionFirstBytes(lits)
 			if len(union) >= 17 && len(union) <= 64 {
 				lnm := opts.LikelyMode == LikelyNoMatch
-				if lnm || shuftiBeatsScalar(union) {
+				rare := shuftiBeatsScalar(union)
+				if lnm || rare {
 					fe = frontendShufti
 					shuftiFirstByteSet = union
+					shuftiAdaptive = lnm && !rare
 				}
 			}
 		}
@@ -421,6 +435,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		teddyDataBytes:      teddyDataBytes,
 		teddyDataSegCount:   teddyDataSegCount,
 		shuftiFirstByteSet:  shuftiFirstByteSet,
+		shuftiAdaptive:      shuftiAdaptive,
 		litToBuckets:        litToBuckets,
 		litLens:             litLens,
 		diag:                diag,
@@ -1407,83 +1422,190 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase int, prefixFnBaseId
 //   - no fallback buckets (otherwise we'd need to visit every position),
 //   - 17 ≤ |shuftiFirstByteSet| ≤ 64 (matches emitShuftiPrefixCheck's bounds),
 //   - rarity-based density supports Shufti OR set-level LikelyNoMatch is set.
+//
+// When cs.shuftiAdaptive (task 28 — ported from EmitPrefixScan's task 25
+// DenseCounter/DenseSkipFlag switch): adds a runtime density counter that
+// disables the SIMD probe for the rest of the call once `denseSwitchThreshold`
+// consecutive "attempts" (one $scan iteration each) found a candidate in the
+// very first chunk probed, i.e. gained no real 16-byte skip. Non-adaptive
+// sets (rarity-based Shufti selection, no LikelyNoMatch override) emit
+// byte-identical code to before this existed — the extra locals and gating
+// only appear when shuftiAdaptive is true.
 func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase int, prefixFnBaseIdx int) []byte {
 	var b []byte
-	// locals: 6 × i32 (lPos, lOutCount, lTmp, lValidMask, lOutBase, lSkipMask), 1 × v128 (lChunk)
-	b = append(b, 0x02)              // 2 local groups
-	b = append(b, 0x06, 0x7F)        // 6 × i32
-	b = append(b, 0x01, 0x7B)        // 1 × v128
+	adaptive := cs.shuftiAdaptive
+	// locals: 6 × i32 (lPos, lOutCount, lTmp, lValidMask, lOutBase, lSkipMask), 1 × v128 (lChunk),
+	// + task 28: 2 × i32 (lDenseCounter, lDenseSkipFlag) when adaptive.
+	if adaptive {
+		b = append(b, 0x03)       // 3 local groups
+		b = append(b, 0x06, 0x7F) // 6 × i32
+		b = append(b, 0x01, 0x7B) // 1 × v128
+		b = append(b, 0x02, 0x7F) // 2 × i32
+	} else {
+		b = append(b, 0x02)       // 2 local groups
+		b = append(b, 0x06, 0x7F) // 6 × i32
+		b = append(b, 0x01, 0x7B) // 1 × v128
+	}
 
 	const (
-		pInPtr     = byte(0)
-		pInLen     = byte(1)
-		pOutPtr    = byte(2)
-		pOutCap    = byte(3)
-		pStartPos  = byte(4)
-		lPos       = byte(5)
-		lOutCount  = byte(6)
-		lTmp       = byte(7)
-		lValidMask = byte(8)
-		lOutBase   = byte(9)
-		lSkipMask  = byte(10)
-		lChunk     = byte(11)
+		pInPtr         = byte(0)
+		pInLen         = byte(1)
+		pOutPtr        = byte(2)
+		pOutCap        = byte(3)
+		pStartPos      = byte(4)
+		lPos           = byte(5)
+		lOutCount      = byte(6)
+		lTmp           = byte(7)
+		lValidMask     = byte(8)
+		lOutBase       = byte(9)
+		lSkipMask      = byte(10)
+		lChunk         = byte(11)
+		lDenseCounter  = byte(12)
+		lDenseSkipFlag = byte(13)
 	)
 
 	b = append(b, 0x41, 0x00, 0x21, lOutCount)
 	b = append(b, 0x20, pStartPos, 0x21, lPos)
+	if adaptive {
+		b = append(b, 0x41, 0x00, 0x21, lDenseCounter) // DenseCounter = 0
+	}
 
 	b = append(b, 0x02, 0x40) // block $batch_done
 	b = append(b, 0x03, 0x40) // loop $scan
 
 	// Exit conditions.
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01)         // lPos > pInLen
-	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)   // outCount >= cap
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01)       // lPos > pInLen
+	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01) // outCount >= cap
+
+	if adaptive {
+		// Reset once per attempt (one $scan iteration = one search for the
+		// next candidate position), NOT per $skip_loop retry — mirrors
+		// EmitPrefixScan's reset site, which sits outside its retry loop
+		// for the same reason.
+		b = append(b, 0x41, 0x00, 0x21, lDenseSkipFlag)
+	}
 
 	// --- SIMD pre-filter: advance lPos to the next candidate position ---
-	// Block depths inside the prefilter:
+	// Block depths inside the prefilter (non-adaptive):
 	//   loop $scan (0), block $batch_done (1)
 	// After entering $skip_done block, $skip_loop loop:
 	//   loop $skip_loop (0), block $skip_done (1), loop $scan (2), block $batch_done (3)
+	// When adaptive, the $dense_gate if wraps the SIMD-if (opened below,
+	// inside $skip_loop) and adds one level to every depth computed from
+	// inside it.
 	b = append(b, 0x02, 0x40) // block $skip_done
 	b = append(b, 0x03, 0x40) // loop $skip_loop
 
 	// If lPos >= pInLen: exit $skip_done.
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
 
+	if adaptive {
+		// Task 28: DenseCounter < threshold? If so, try SIMD (+ its scalar
+		// tail below, unmodified). Once tripped, the else branch skips
+		// BOTH the SIMD probe and the scalar tail's own candidate-membership
+		// chain entirely and treats the current lPos as the candidate
+		// directly — this is what makes the fallback actually as cheap as
+		// the plain scalar frontend: emitSetMatchFnFinalScalar has no
+		// first-byte pre-filter of its own at all, it goes straight into
+		// the per-bucket check loop below for every position. Falling back
+		// to this function's own "scalar tail" instead would re-pay a
+		// second full first-byte membership chain on top of the per-bucket
+		// loop's own first-byte compares — redundant, and would erase most
+		// of the savings this switch exists to deliver.
+		b = append(b, 0x20, lDenseCounter)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, denseSwitchThreshold)
+		b = append(b, 0x48)       // i32.lt_s
+		b = append(b, 0x04, 0x40) // if $dense_gate (void)
+	}
+
 	// SIMD path: lPos + 15 < pInLen → load 16 bytes.
-	// Depths inside this `if` (innermost outward):
+	// Depths inside this `if` (innermost outward), non-adaptive:
 	//   0=SIMD if, 1=$skip_loop, 2=$skip_done.
+	// Adaptive adds $dense_gate between SIMD-if and $skip_loop/$skip_done.
 	b = append(b, 0x20, lPos, 0x41, 15, 0x6A, 0x20, pInLen, 0x49) // lt_u
-	b = append(b, 0x04, 0x40)                                    // if (void)
-	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)                // pInPtr + lPos
-	b = append(b, 0xFD, 0x00, 0x00, 0x00)                        // v128.load align=0 offset=0
-	b = append(b, 0x21, lChunk)                                  // local.set lChunk
+	b = append(b, 0x04, 0x40)                                     // if (void)
+	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)                 // pInPtr + lPos
+	b = append(b, 0xFD, 0x00, 0x00, 0x00)                         // v128.load align=0 offset=0
+	b = append(b, 0x21, lChunk)                                   // local.set lChunk
 	b = emitShuftiPrefixCheck(b, cs.shuftiFirstByteSet, lChunk)
 	b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
 	b = append(b, 0x04, 0x40)      // if mask != 0  (adds one more depth)
-	// Inside the nested mask `if`: 0=mask if, 1=SIMD if, 2=$skip_loop, 3=$skip_done.
+	if adaptive {
+		// No skip yet this attempt (DenseSkipFlag==0) → this probe bought
+		// nothing, bump the streak. Otherwise a skip already happened this
+		// attempt → SIMD paid off, reset the streak.
+		b = append(b, 0x20, lDenseSkipFlag)
+		b = append(b, 0x45)       // i32.eqz
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, lDenseCounter)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A) // i32.add
+		b = append(b, 0x21, lDenseCounter)
+		b = append(b, 0x05) // else
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x21, lDenseCounter)
+		b = append(b, 0x0B) // end if
+	}
+	// Inside the nested mask `if`, non-adaptive: 0=mask if, 1=SIMD if,
+	// 2=$skip_loop, 3=$skip_done. Adaptive: 0=mask if, 1=SIMD if,
+	// 2=$dense_gate, 3=$skip_loop, 4=$skip_done.
 	// Candidate found: lPos += ctz(mask); exit $skip_done.
 	b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos)
-	b = append(b, 0x0C, 0x03) // br 3 → $skip_done
-	b = append(b, 0x0B)       // end if mask != 0
+	if adaptive {
+		b = append(b, 0x0C, 0x04) // br 4 → $skip_done
+	} else {
+		b = append(b, 0x0C, 0x03) // br 3 → $skip_done
+	}
+	b = append(b, 0x0B) // end if mask != 0
 	// No candidate in chunk: lPos += 16, continue $skip_loop.
+	if adaptive {
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x21, lDenseSkipFlag) // this attempt did skip ≥16 bytes
+	}
 	b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos)
-	b = append(b, 0x0C, 0x01) // br 1 → $skip_loop
-	b = append(b, 0x0B)       // end if SIMD path
+	if adaptive {
+		b = append(b, 0x0C, 0x02) // br 2 → $skip_loop (SIMD if, $dense_gate, $skip_loop)
+	} else {
+		b = append(b, 0x0C, 0x01) // br 1 → $skip_loop
+	}
+	b = append(b, 0x0B) // end if SIMD path
 
 	// Scalar tail: byte-by-byte. For simplicity check membership via the
 	// inline byte set (≤ 64 entries) — emit a chained i32.eq + br.
-	// At this depth: loop $skip_loop (0), block $skip_done (1).
-	// We need to: if input[lPos] ∈ set → br 1 ($skip_done); else lPos++; br 0.
+	// Non-adaptive depths: loop $skip_loop (0), block $skip_done (1).
+	// Adaptive: this now lives INSIDE $dense_gate's then-branch (a sibling
+	// of the SIMD if above, not a peer of $skip_loop) — depths become
+	// $dense_gate (0), $skip_loop (1), $skip_done (2).
+	// We need to: if input[lPos] ∈ set → br to $skip_done; else lPos++; br to $skip_loop.
+	skipDoneFromTail := byte(0x01)
+	skipLoopFromTail := byte(0x00)
+	if adaptive {
+		skipDoneFromTail = 0x02
+		skipLoopFromTail = 0x01
+	}
 	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x2D, 0x00, 0x00, 0x21, lTmp) // lTmp = input[lPos]
 	for _, fb := range cs.shuftiFirstByteSet {
 		b = append(b, 0x20, lTmp, 0x41)
 		b = utils.AppendSLEB128(b, int32(fb))
-		b = append(b, 0x46)       // i32.eq
-		b = append(b, 0x0D, 0x01) // br_if 1 → $skip_done
+		b = append(b, 0x46)                   // i32.eq
+		b = append(b, 0x0D, skipDoneFromTail) // br_if → $skip_done
 	}
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
-	b = append(b, 0x0C, 0x00)                               // br 0 → $skip_loop
+	b = append(b, 0x0C, skipLoopFromTail)                   // br → $skip_loop
+
+	if adaptive {
+		// Dense-confirmed: skip both the SIMD probe and the chained
+		// membership check above entirely. lPos already points at the
+		// position to process — the per-bucket loop below does its own
+		// first-byte compares regardless, exactly like the plain scalar
+		// frontend (emitSetMatchFnFinalScalar) which never pre-filters at
+		// all. Depths from the else branch: $dense_gate (0, current),
+		// $skip_loop (1), $skip_done (2).
+		b = append(b, 0x05)       // else
+		b = append(b, 0x0C, 0x02) // br 2 → $skip_done
+		b = append(b, 0x0B)       // end if $dense_gate
+	}
 
 	b = append(b, 0x0B) // end loop $skip_loop
 	b = append(b, 0x0B) // end block $skip_done
