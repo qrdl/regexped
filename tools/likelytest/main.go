@@ -77,6 +77,15 @@ type testCase struct {
 	notes        string // one-line description of which optimisation it targets
 	matchInput   string
 	nomatchInput string
+	// exhaustive drives the single-pattern find/groups export to exhaustion
+	// (advance past each match, repeat until EOF or no match — see
+	// runFindExhaust/runGroupsExhaust) instead of measuring one call. A
+	// single find()/groups() call only scans to the FIRST match — bytes
+	// after it are never touched — so "match-dense" inputs (LM_TODO.md
+	// LM-0) are meaningless under single-call measurement; this flag is
+	// what makes them actually exercise the whole buffer. modeSet cases
+	// always exhaust via find_all regardless of this flag.
+	exhaustive bool
 }
 
 var tests = []testCase{
@@ -311,6 +320,95 @@ var tests = []testCase{
 		notes:        "TDFA dominant self-loop on \\w (63 bytes) — Gap F target",
 		matchInput:   strings.Repeat("aB3_", 2560) + "!",
 		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
+	},
+
+	// ── LM-0: match-dense cases (plans/LM_TODO.md) ──────────────────────
+	// All prior cases above bury a single match in 10-50 KB — scan-to-first-
+	// match dominates total fuel, so any per-hit/per-run optimisation is
+	// diluted to ~0% in the matrix. These cases exhaust the whole buffer
+	// (exhaustive: true) so per-match cost actually shows up in the total.
+	{
+		// LM-1 companion / regression guard: N=36 already clears the
+		// existing N>=24 lit-chain SIMD-verify gate, so this is NOT an LM-1
+		// win case — it's a dense-workload guard for whatever already
+		// applies to this shape today, and a target for LM-2 (host-call
+		// amortisation via batched find).
+		name:         "dense-secrets",
+		pattern:      `ghp_[A-Za-z0-9]{36}`,
+		mode:         modeFind,
+		notes:        "dense ghp_ tokens (N=36, already >=24 lit-chain gate) — dense-workload guard / LM-2 target",
+		matchInput:   denseSecretsInput(true),
+		nomatchInput: denseSecretsInput(false),
+		exhaustive:   true,
+	},
+	{
+		// LM-1 primary target: N=16 < 24, currently rejected by
+		// analyseLitChain's single-pattern gate (compile/engine_dfa.go),
+		// falls back to plain DFA. This is the case LM-1's measurement plan
+		// names as primary.
+		name:         "dense-akia",
+		pattern:      `AKIA[A-Z0-9]{16}`,
+		mode:         modeFind,
+		notes:        "dense AKIA tokens (N=16 < 24) — LM-1 primary target (lit-chain SIMD-verify gate relaxation)",
+		matchInput:   denseAkiaInput(true),
+		nomatchInput: denseAkiaInput(false),
+		exhaustive:   true,
+	},
+	{
+		// Many short \w+ runs per pass (a word every ~6 bytes) instead of
+		// tdfa-bulk-skip-word-class's one long homogeneous run — stresses
+		// TDFA bulk-skip entry/exit frequency and, once batched find lands,
+		// is a natural LM-2 host-call-amortisation target.
+		name:         "dense-words-grouped",
+		pattern:      `(\w+)`,
+		mode:         modeGroups,
+		notes:        "dense short \\w+ runs (word every ~6 bytes) — TDFA bulk-skip entry/exit frequency, LM-2 target",
+		matchInput:   denseWordsInput(true),
+		nomatchInput: denseWordsInput(false),
+		exhaustive:   true,
+	},
+	{
+		// LM-3 target: non-mid-accept 9-64-byte self-loop body
+		// (`[^>]+` after a 1-byte literal `<`), dense tags every ~20 bytes.
+		// Today's Shufti self-loop bulk-skip (task 26) is mid-accept only;
+		// this shape's accept state sits at `>`, one byte AFTER the
+		// self-loop, i.e. non-mid — uncovered until LM-3.
+		name:         "dense-tags",
+		pattern:      `<[^>]+>`,
+		mode:         modeFind,
+		notes:        "dense HTML-ish tags every ~20 bytes, non-mid-accept self-loop — LM-3 target",
+		matchInput:   denseTagsInput(true),
+		nomatchInput: denseTagsInput(false),
+		exhaustive:   true,
+	},
+	{
+		// LM-4 target: bare (no literal prefix) 9-64-byte-class self-loop —
+		// detectShuftiSelfLoop bails on len(l.prefix)==0 today (task 34's
+		// gate). Runs vary 10-30 bytes so the self-loop is exercised
+		// repeatedly rather than as one giant run.
+		name:         "dense-bare-upper",
+		pattern:      `[A-Z]{8,}`,
+		mode:         modeFind,
+		notes:        "dense bare uppercase runs, 10-30 bytes, no literal prefix — LM-4 target",
+		matchInput:   denseBareUpperInput(true),
+		nomatchInput: denseBareUpperInput(false),
+		exhaustive:   true,
+	},
+	{
+		// LM-6 sizing case: two counted-chain-eligible patterns bucketed
+		// under set composition. Confirms whether binPack actually merges
+		// them (losing task 5's SIMD verify) before LM-6 implements the
+		// LM-gated refusal. modeSet already exhausts via find_all —
+		// exhaustive flag not needed here.
+		name: "dense-set-chains",
+		setPatterns: []string{
+			`AKIA[A-Z0-9]{16}`,
+			`ghp_[A-Za-z0-9]{36}`,
+		},
+		mode:         modeSet,
+		notes:        "AKIA + ghp_ set, dense mixed tokens — LM-6 sizing case (does binPack merge these into one bucket?)",
+		matchInput:   denseSetChainsInput(true),
+		nomatchInput: denseSetChainsInput(false),
 	},
 }
 
@@ -730,6 +828,168 @@ func impossibleRunInput(withMatches bool) string {
 	return string(b[:targetSize])
 }
 
+// denseSecretsInput builds ~50 KB for LM-0's dense-secrets case
+// (`ghp_[A-Za-z0-9]{36}`). When withMatches, packs back-to-back valid
+// tokens separated by ", " so an exhaustion-driven find() pass visits
+// hundreds of matches instead of scanning past just one. When false, the
+// same size of "ghp_"-free filler.
+func denseSecretsInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		filler := []byte(", the quick brown fox jumps over the lazy dog and other filler text goes here forever")
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	alnum := []byte("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789")
+	var b []byte
+	for i := 0; len(b) < targetSize; i++ {
+		b = append(b, "ghp_"...)
+		for j := 0; j < 36; j++ {
+			b = append(b, alnum[(i+j)%len(alnum)])
+		}
+		b = append(b, ',', ' ')
+	}
+	return string(b[:targetSize])
+}
+
+// denseAkiaInput builds ~50 KB for LM-0's dense-akia case
+// (`AKIA[A-Z0-9]{16}`) — LM-1's primary measurement target (N=16 < 24).
+// Same shape as denseSecretsInput, sized for this token's length.
+func denseAkiaInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		filler := []byte(", the quick brown fox jumps over the lazy dog and other filler text goes here forever")
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	alnum := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	var b []byte
+	for i := 0; len(b) < targetSize; i++ {
+		b = append(b, "AKIA"...)
+		for j := 0; j < 16; j++ {
+			b = append(b, alnum[(i+j)%len(alnum)])
+		}
+		b = append(b, ',', ' ')
+	}
+	return string(b[:targetSize])
+}
+
+// denseWordsInput builds ~50 KB for LM-0's dense-words-grouped case
+// (`(\w+)` groups mode). When withMatches, English-like prose (a word
+// every ~6 bytes on average); when false, 50 KB of punctuation with no
+// \w byte at all, so the internal find() never has anything to report.
+func denseWordsInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		punct := []byte(",;.! ")
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, punct...)
+		}
+		return string(b[:targetSize])
+	}
+	prose := []byte("the quick brown fox jumps over lazy dogs while owls sit near old oak trees at dusk and count stars above quiet fields ")
+	var b []byte
+	for len(b) < targetSize {
+		b = append(b, prose...)
+	}
+	return string(b[:targetSize])
+}
+
+// denseTagsInput builds ~50 KB for LM-0's dense-tags case (`<[^>]+>`) —
+// LM-3's target (non-mid-accept self-loop: the accept state sits at `>`,
+// one byte after the self-loop body). Tags every ~20 bytes when
+// withMatches; no-match input has no `<` byte anywhere.
+func denseTagsInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		filler := []byte("the quick brown fox jumps over the lazy dog with no angle brackets anywhere here ")
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	tags := []string{"div", "span", "p", "a", "b", "i", "ul", "li", "h1", "h2"}
+	var b []byte
+	for i := 0; len(b) < targetSize; i++ {
+		b = append(b, '<')
+		b = append(b, tags[i%len(tags)]...)
+		b = append(b, ` class="x">`...)
+	}
+	return string(b[:targetSize])
+}
+
+// denseBareUpperInput builds ~50 KB for LM-0's dense-bare-upper case
+// (`[A-Z]{8,}`) — LM-4's target (bare self-loop, no literal prefix; today
+// detectShuftiSelfLoop bails on len(l.prefix)==0). Run lengths cycle
+// 10..30 bytes, separated by single spaces, when withMatches; no-match
+// input is plain lowercase prose.
+func denseBareUpperInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		prose := []byte("the quick brown fox jumps over the lazy dog and other filler text goes here. ")
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, prose...)
+		}
+		return string(b[:targetSize])
+	}
+	upper := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	var b []byte
+	runLen := 10
+	for len(b) < targetSize {
+		for j := 0; j < runLen; j++ {
+			b = append(b, upper[j%len(upper)])
+		}
+		b = append(b, ' ')
+		runLen++
+		if runLen > 30 {
+			runLen = 10
+		}
+	}
+	return string(b[:targetSize])
+}
+
+// denseSetChainsInput builds ~50 KB for LM-0's dense-set-chains case
+// (AKIA + ghp_ set) — LM-6's sizing case. Alternates valid AKIA and ghp_
+// tokens when withMatches; token-free filler of the same size otherwise.
+func denseSetChainsInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		filler := []byte(", the quick brown fox jumps over the lazy dog and other filler text goes here forever")
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	akiaAlnum := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	ghpAlnum := []byte("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789")
+	var b []byte
+	for i := 0; len(b) < targetSize; i++ {
+		if i%2 == 0 {
+			b = append(b, "AKIA"...)
+			for j := 0; j < 16; j++ {
+				b = append(b, akiaAlnum[(i+j)%len(akiaAlnum)])
+			}
+		} else {
+			b = append(b, "ghp_"...)
+			for j := 0; j < 36; j++ {
+				b = append(b, ghpAlnum[(i+j)%len(ghpAlnum)])
+			}
+		}
+		b = append(b, ',', ' ')
+	}
+	return string(b[:targetSize])
+}
+
 // spread inserts `items` evenly through `base`, separated by `sep`.
 func spread(base string, items []string, sep string) string {
 	if len(items) == 0 {
@@ -979,6 +1239,170 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 	return before - after, nil
 }
 
+// findExhaustIterTime is the timing-sample count for exhaustive find/groups
+// measurement (LM_TODO.md LM-0). Lower than setIterTime (1000): a dense
+// find/groups pass can visit far more matches per pass than the set cases
+// do (e.g. dense-words-grouped's ~8k words), so fewer reps keeps wall-clock
+// reasonable while still giving a stable p50.
+const findExhaustIterTime = 200
+
+// runFindExhaust drives a single-pattern find() export to exhaustion over
+// inputLen bytes at inputBase, mirroring the host stubs' iteration loop
+// (generate/js_stub.go genJSFindFunc): re-call with a shrinking window
+// (inputBase+off, inputLen-off), advance off past each match (or by 1 for
+// a zero-length match) until no match or EOF.
+func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
+	off := int32(0)
+	for off <= inputLen {
+		r, err := fn.Call(store, inputBase+off, inputLen-off)
+		if err != nil {
+			return
+		}
+		packed := r.(int64)
+		if packed < 0 {
+			return
+		}
+		relStart := int32(packed >> 32)
+		relEnd := int32(packed & 0xFFFFFFFF)
+		if relEnd > relStart {
+			off += relEnd
+		} else {
+			off += relStart + 1
+		}
+	}
+}
+
+// runGroupsExhaust drives a single-pattern groups() export to exhaustion,
+// mirroring generate/js_stub.go genJSGroupsFunc's advance-by-matchEnd
+// logic. Unlike the JS stub, this stops immediately when no match is
+// found rather than retrying at off+1: the groups wrapper calls find()
+// internally first, so a negative result already means no match exists
+// anywhere in the remaining window — retrying smaller windows would only
+// re-derive the same answer, which is stub-loop waste, not engine cost
+// this benchmark should measure.
+func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, slotsPtr, inputLen int32) {
+	off := int32(0)
+	for off <= inputLen {
+		r, err := fn.Call(store, inputBase+off, inputLen-off, slotsPtr)
+		if err != nil {
+			return
+		}
+		if r.(int32) < 0 {
+			return
+		}
+		buf := mem.UnsafeData(store)
+		matchEnd := int32(buf[slotsPtr+4]) | int32(buf[slotsPtr+5])<<8 | int32(buf[slotsPtr+6])<<16 | int32(buf[slotsPtr+7])<<24
+		runtime.KeepAlive(store)
+		if matchEnd > 0 {
+			off += matchEnd
+		} else {
+			off++
+		}
+	}
+}
+
+// benchTimeExhaust times findExhaustIterTime full exhaustion passes (Go-level
+// loop, mirrors benchTimeSet's approach for sets) and returns the p50.
+func benchTimeExhaust(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Engine) (time.Duration, error) {
+	mod, err := wasmtime.NewModule(engine, wasmBytes)
+	if err != nil {
+		return 0, fmt.Errorf("module: %w", err)
+	}
+	store := wasmtime.NewStore(engine)
+	store.SetWasi(wasmtime.NewWasiConfig())
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		return 0, fmt.Errorf("instance: %w", err)
+	}
+	var fnExport string
+	switch tc.mode {
+	case modeFind:
+		fnExport = "find"
+	case modeGroups:
+		fnExport = "groups"
+	}
+	mem := inst.GetExport(store, "memory").Memory()
+	fn := inst.GetFunc(store, fnExport)
+	if mem == nil || fn == nil {
+		return 0, fmt.Errorf("missing exports")
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	runtime.KeepAlive(store)
+	inputLen := int32(len(input))
+
+	run := func() {
+		if tc.mode == modeGroups {
+			runGroupsExhaust(store, fn, mem, slotsBase, inputLen)
+		} else {
+			runFindExhaust(store, fn, inputLen)
+		}
+	}
+
+	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
+		run()
+	}
+
+	timings := make([]time.Duration, findExhaustIterTime)
+	for i := range timings {
+		t0 := time.Now()
+		run()
+		timings[i] = time.Since(t0)
+	}
+	ns := make([]byte, findExhaustIterTime*4)
+	for i, d := range timings {
+		v := uint32(d.Nanoseconds())
+		ns[i*4] = byte(v)
+		ns[i*4+1] = byte(v >> 8)
+		ns[i*4+2] = byte(v >> 16)
+		ns[i*4+3] = byte(v >> 24)
+	}
+	result := computeStat(ns, 50)
+	runtime.KeepAlive(store)
+	return result, nil
+}
+
+// benchFuelExhaust measures fuel for one full exhaustion pass.
+func benchFuelExhaust(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime.Engine) (uint64, error) {
+	mod, err := wasmtime.NewModule(fuelEngine, wasmBytes)
+	if err != nil {
+		return 0, err
+	}
+	store := wasmtime.NewStore(fuelEngine)
+	if err := store.SetFuel(fuelBudget); err != nil {
+		return 0, err
+	}
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		return 0, err
+	}
+	var fnExport string
+	switch tc.mode {
+	case modeFind:
+		fnExport = "find"
+	case modeGroups:
+		fnExport = "groups"
+	}
+	mem := inst.GetExport(store, "memory").Memory()
+	fn := inst.GetFunc(store, fnExport)
+	if mem == nil || fn == nil {
+		return 0, fmt.Errorf("missing exports")
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	runtime.KeepAlive(store)
+	inputLen := int32(len(input))
+
+	before, _ := store.GetFuel()
+	if tc.mode == modeGroups {
+		runGroupsExhaust(store, fn, mem, slotsBase, inputLen)
+	} else {
+		runFindExhaust(store, fn, inputLen)
+	}
+	after, _ := store.GetFuel()
+	return before - after, nil
+}
+
 // measureWasm runs (tc, input) against an already-compiled wasm module and
 // returns one cell. Split out from measure so callers that already know the
 // mode's wasm is byte-identical to neutral's (see main's identical-WASM gate)
@@ -991,6 +1415,17 @@ func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string
 			return cell{}, fmt.Errorf("bench time %s: %w", mode, err)
 		}
 		f, err := benchFuelSet(wasm, input, fuelEngine)
+		if err != nil {
+			return cell{}, fmt.Errorf("bench fuel %s: %w", mode, err)
+		}
+		return cell{timeP50: t, fuel: f, size: len(wasm)}, nil
+	}
+	if tc.exhaustive {
+		t, err := benchTimeExhaust(wasm, tc, input, engine)
+		if err != nil {
+			return cell{}, fmt.Errorf("bench time %s: %w", mode, err)
+		}
+		f, err := benchFuelExhaust(wasm, tc, input, fuelEngine)
 		if err != nil {
 			return cell{}, fmt.Errorf("bench fuel %s: %w", mode, err)
 		}

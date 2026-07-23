@@ -1340,6 +1340,14 @@ type dfaLayout struct {
 	midAcceptWBytes    []byte
 	midAcceptNLBytes   []byte
 
+	// lmBareShufti (LM_TODO.md LM-4) lifts detectShuftiSelfLoop's
+	// len(l.prefix)==0 bail for bare (no literal-anchor) moderately-wide
+	// self-loop bodies, e.g. `[A-Z]{8,}`. Set from
+	// buildOpts.LikelyMode == LikelyMatch at the find/groups DFA layout
+	// call site only — see detectShuftiSelfLoop's doc comment for why the
+	// gate exists and why LikelyMatch is the right scope for lifting it.
+	lmBareShufti bool
+
 	// Fast-skip / SIMD (find mode only)
 	prefix         []byte
 	firstByteOff   int32
@@ -1484,9 +1492,10 @@ func dfaTableBytes(t *dfaTable) int {
 // useAcceptSideTable: when true, emit a per-state accept side table at acceptOff
 // (used by TDFA, whose state IDs are not partitioned and cannot use acceptLimit).
 // forceWordChar (optional): force word-char table computation even when needFind=false.
-func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, useAcceptSideTable bool, forceWordChar ...bool) *dfaLayout {
+func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, useAcceptSideTable bool, lmBareShufti bool, forceWordChar ...bool) *dfaLayout {
 	wantWordChar := needFind || (len(forceWordChar) > 0 && forceWordChar[0])
 	l := &dfaLayout{}
+	l.lmBareShufti = lmBareShufti
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
 	// acceptLimit: WASM-state ID K such that "state in [1, K]" iff the DFA state
@@ -2500,6 +2509,23 @@ func detectDominantSelfLoop(l *dfaLayout) {
 // where the fixed SIMD chunk-scan overhead costs more than the scalar loop
 // it replaces (measured: `shufti-upper-find-100kb`, bare `[A-Z]{8,}`, -49%
 // wall time vs main before this gate).
+//
+// LM_TODO.md LM-4: task 34's own investigation found the regression that
+// motivated this gate was actually caused by patternMinLen (removed in
+// task 37), not by this detector — the gate itself "did not recover the
+// case at all". Under LikelyMatch (l.lmBareShufti), the bail is lifted:
+// dense/long-run match input is exactly what LM promises to bias for, and
+// task 38's hysteresis (shared by every l.dominantStates consumer) bounds
+// the damage if a run turns out short.
+//
+// l.lmBareShufti is only set true (see lmBareShuftiEligible) when the
+// pattern additionally has a compile-time-guaranteed minimum match length
+// — `[A-Z]{8,}` (min 8) measured a clean -39% dense-match fuel win, but
+// `(\w+)` (min 1, no lower bound at all) measured a +7% dense-match fuel
+// REGRESSION: the fixed SIMD chunk-scan setup this lifts costs more than
+// it saves when the typical match is a handful of bytes, exactly the
+// frequency argument the original (pre-LM-4) gate's doc comment made.
+// minLMBareShuftiLen draws the line between those two measured outcomes.
 func detectShuftiSelfLoop(l *dfaLayout) {
 	const minWidth = 9
 	const maxWidth = 64
@@ -2508,7 +2534,7 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 	if l.numWASM <= 1 {
 		return
 	}
-	if len(l.prefix) == 0 {
+	if len(l.prefix) == 0 && !l.lmBareShufti {
 		return
 	}
 
@@ -2577,6 +2603,30 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 		})
 		idx++
 	}
+}
+
+// minLMBareShuftiLen is the compile-time-guaranteed minimum match length
+// (regexpMinMaxLen) required before lmBareShuftiEligible allows LM-4's
+// bare-prefix gate to lift. See detectShuftiSelfLoop's doc comment for the
+// measurements behind this threshold: 8 keeps the confirmed win
+// (`[A-Z]{8,}`, min 8) while excluding the confirmed regression
+// (`(\w+)`, min 1).
+const minLMBareShuftiLen = 8
+
+// lmBareShuftiEligible reports whether pattern has a compile-time-guaranteed
+// minimum match length of at least minLMBareShuftiLen bytes — the
+// additional per-pattern check gating l.lmBareShufti (LM_TODO.md LM-4)
+// beyond LikelyMode alone. An unparseable pattern is conservatively
+// ineligible (this recomputes syntax.Parse; compilePattern's caller has
+// already validated the pattern earlier in the pipeline, so failure here
+// should not happen in practice).
+func lmBareShuftiEligible(pattern string) bool {
+	parsed, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return false
+	}
+	minLen, _ := regexpMinMaxLen(parsed)
+	return minLen >= minLMBareShuftiLen
 }
 
 // applyDominantStateEncoding writes each mid-accept dominantInfo's encoded
@@ -2874,7 +2924,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		}
 	}
 
-	l := buildDFALayout(t, tableBase, false, true, 0, false, t.hasWordBoundary)
+	l := buildDFALayout(t, tableBase, false, true, 0, false, false, t.hasWordBoundary)
 
 	// LIKELY.md Gap H.2: both mid-accept and non-mid-accept dominants are
 	// always kept for the buildSetSuffixBody bulk-skip dispatch (default-on
@@ -11334,7 +11384,7 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 			continue
 		}
 		// DFA branch: build its layout starting at cur.
-		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false)
+		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false, false)
 		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
 		raw, segCount := stripSegCount(dfaDataSegments(br.dfaLayout, false))
 		br.dfaDataBytes = raw
