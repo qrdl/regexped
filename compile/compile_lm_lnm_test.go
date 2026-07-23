@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1356,4 +1357,82 @@ func TestCompileLikelyNoMatch(t *testing.T) {
 			mustCompileEntries(t, c.entries, lnm)
 		})
 	}
+}
+
+// TestLM2BatchExportGating exercises the LM-2 batch find/groups export gate
+// (plans/LM_TODO.md LM-2): the "_batch" export must appear exactly when
+// LikelyMode == LikelyMatch and the pattern's own find_func/groups_func was
+// requested, and must NOT appear for anchored (native lit-chain) groups
+// bodies — that shape is out of v1 scope (see the compiledPattern field doc
+// next to batchGroupsExport).
+func TestLM2BatchExportGating(t *testing.T) {
+	findEntries := []config.RegexEntry{{
+		Pattern:  `x*`,
+		FindFunc: "find_x",
+	}}
+	// (a)(b)? has no lit-chain shape, so it compiles via the standard
+	// find+capture composition (TDFA/BT) — the non-anchored case batch
+	// groups targets.
+	groupsEntries := []config.RegexEntry{{
+		Pattern:    `(a)(b)?`,
+		GroupsFunc: "groups_ab",
+	}}
+	// (AKIA[A-Z0-9]{24}) is a lit-chain groups shape (Gap C, count>=24 so
+	// analyseLitChainGroups accepts it — capture-path analysers are not
+	// LM-1-relaxed, unlike the plain match/find analysers) — anchored:
+	// captureBody IS the exported groups function directly, no separate
+	// find+capture composition to batch over.
+	anchoredGroupsEntries := []config.RegexEntry{{
+		Pattern:    `(AKIA[A-Z0-9]{24})`,
+		GroupsFunc: "akia_groups",
+	}}
+
+	t.Run("find_batch_present_under_LikelyMatch", func(t *testing.T) {
+		wasm, _, err := Compile(findEntries, 0, true, CompileOptions{LikelyMode: LikelyMatch})
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Contains(wasm, []byte("find_x_batch")) {
+			t.Error("expected find_x_batch export under LikelyMatch, not found")
+		}
+	})
+	t.Run("find_batch_absent_under_neutral", func(t *testing.T) {
+		wasm, _, err := Compile(findEntries, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if bytes.Contains(wasm, []byte("find_x_batch")) {
+			t.Error("find_x_batch export present under neutral LikelyMode, should be absent")
+		}
+	})
+	t.Run("groups_batch_present_under_LikelyMatch", func(t *testing.T) {
+		wasm, _, err := Compile(groupsEntries, 0, true, CompileOptions{LikelyMode: LikelyMatch})
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Contains(wasm, []byte("groups_ab_batch")) {
+			t.Error("expected groups_ab_batch export under LikelyMatch, not found")
+		}
+	})
+	t.Run("groups_batch_absent_under_neutral", func(t *testing.T) {
+		wasm, _, err := Compile(groupsEntries, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if bytes.Contains(wasm, []byte("groups_ab_batch")) {
+			t.Error("groups_ab_batch export present under neutral LikelyMode, should be absent")
+		}
+	})
+	t.Run("anchored_groups_batch_absent_even_under_LikelyMatch", func(t *testing.T) {
+		wasm, _, err := Compile(anchoredGroupsEntries, 0, true, CompileOptions{LikelyMode: LikelyMatch})
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if bytes.Contains(wasm, []byte("akia_groups_batch")) {
+			t.Error("akia_groups_batch export present for anchored lit-chain groups body — out of v1 scope")
+		}
+		if !bytes.Contains(wasm, []byte("akia_groups")) {
+			t.Error("expected akia_groups (non-batch) export to still be present")
+		}
+	})
 }

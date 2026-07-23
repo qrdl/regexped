@@ -191,17 +191,48 @@ export function %s(input) {
 `, funcName, funcName, funcName)
 }
 
+// lm2BatchCap is the per-refill match capacity used by the JS find/groups
+// generators' LM-2 batch path (plans/LM_TODO.md LM-2). Not user-configurable
+// in v1 — see set stubs' batchSize for the analogous, config-driven sizing
+// used by sets.
+const lm2BatchCap = 256
+
 // genJSFindFunc generates a JS generator for non-anchored find.
 // Yields [start, end] absolute byte positions for each non-overlapping match.
+//
+// Prefers the LM-2 batch export (funcName+"_batch") when the loaded WASM
+// provides one — draining lm2BatchCap matches per host call instead of one
+// — and falls back to the standard one-call-per-match loop otherwise. The
+// feature-detect (typeof check, once per generator invocation) makes this
+// stub work unmodified whether the pattern was compiled under LikelyMatch
+// or not, so it doesn't need to replicate the compiler's LikelyMode
+// precedence chain.
 func genJSFindFunc(funcName string) string {
-	return fmt.Sprintf(`// %s — yields [start, end] for each non-overlapping match.
-export function* %s(input) {
+	return fmt.Sprintf(`// %[1]s — yields [start, end] for each non-overlapping match.
+export function* %[1]s(input) {
     const b = _b(input);
+    if (typeof _exp['%[1]s_batch'] === 'function') {
+        _resize(b.length, %[2]d * 8);
+        _mem.set(b, _inBase);
+        const outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
+        let startPos = 0;
+        while (true) {
+            const n = _exp['%[1]s_batch'](_inBase, b.length, _outBase, %[2]d, startPos);
+            if (n <= 0) break;
+            for (let i = 0; i < n; i++) {
+                yield [outBuf[i * 2], outBuf[i * 2 + 1]];
+            }
+            if (n < %[2]d) break;
+            const lastStart = outBuf[(n - 1) * 2], lastEnd = outBuf[(n - 1) * 2 + 1];
+            startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
+        }
+        return;
+    }
     _resize(b.length);
+    _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        _mem.set(b.subarray(off), _inBase);
-        const r = _exp['%s'](_inBase, b.length - off);
+        const r = _exp['%[1]s'](_inBase + off, b.length - off);
         if (r < 0n) break;
         const relStart = Number(r >> 32n);
         const relEnd   = Number(r & 0xFFFFFFFFn);
@@ -210,33 +241,65 @@ export function* %s(input) {
     }
 }
 
-`, funcName, funcName, funcName)
+`, funcName, lm2BatchCap)
 }
 
 // genJSGroupsFunc generates a JS generator for indexed capture groups.
 // Yields an array per match; each element is [start, end] or null for
 // unmatched groups. Index 0 is the full match.
+//
+// Prefers the LM-2 batch export (funcName+"_batch") the same way
+// genJSFindFunc does — see its doc comment. The batch record layout is
+// [start, end, group0_start, group0_end, ...] (recSize ints; group 0
+// duplicates start/end — see buildBatchGroupsWrapperBody's doc comment in
+// compile/compile.go).
 func genJSGroupsFunc(funcName string, numGroups int) string {
 	slotCount := numGroups * 2
-	return fmt.Sprintf(`// %s — yields capture group arrays per match.
+	recSize := 2 + slotCount // ints per batch record
+	recBytes := recSize * 4  // bytes per batch record
+	return fmt.Sprintf(`// %[1]s — yields capture group arrays per match.
 // Each element is [start, end] (absolute) or null for unmatched groups.
 // Index 0 is the full match.
-export function* %s(input) {
+export function* %[1]s(input) {
     const b = _b(input);
+    if (typeof _exp['%[1]s_batch'] === 'function') {
+        _resize(b.length, %[2]d * %[4]d);
+        _mem.set(b, _inBase);
+        const outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
+        let startPos = 0;
+        while (true) {
+            const n = _exp['%[1]s_batch'](_inBase, b.length, _outBase, %[2]d, startPos);
+            if (n <= 0) break;
+            for (let i = 0; i < n; i++) {
+                const base = i * %[3]d;
+                const result = [];
+                for (let g = 0; g < %[5]d; g++) {
+                    const s = outBuf[base + 2 + g * 2], e = outBuf[base + 2 + g * 2 + 1];
+                    result.push(s < 0 ? null : [s, e]);
+                }
+                yield result;
+            }
+            if (n < %[2]d) break;
+            const lastBase = (n - 1) * %[3]d;
+            const lastStart = outBuf[lastBase], lastEnd = outBuf[lastBase + 1];
+            startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
+        }
+        return;
+    }
     _resize(b.length);
+    _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        _mem.set(b.subarray(off), _inBase);
-        const slots = new Int32Array(_mem.buffer, _outBase, %d);
+        const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
         slots.fill(-1);
-        if (_exp['%s'](_inBase, b.length - off, _outBase) < 0) {
+        if (_exp['%[1]s'](_inBase + off, b.length - off, _outBase) < 0) {
             if (off === b.length) break;
             off++;
             continue;
         }
         const matchEnd = slots[1] >= 0 ? slots[1] : 0;
         const result = [];
-        for (let i = 0; i < %d; i++) {
+        for (let i = 0; i < %[5]d; i++) {
             const s = slots[i * 2], e = slots[i * 2 + 1];
             result.push(s < 0 ? null : [off + s, off + e]);
         }
@@ -245,7 +308,7 @@ export function* %s(input) {
     }
 }
 
-`, funcName, funcName, slotCount, funcName, numGroups)
+`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount)
 }
 
 // genJSNamedGroupsFunc generates a JS generator for named capture groups.
@@ -276,12 +339,12 @@ func genJSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 export function* %s(input) {
     const b = _b(input);
     _resize(b.length);
+    _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        _mem.set(b.subarray(off), _inBase);
         const slots = new Int32Array(_mem.buffer, _outBase, %d);
         slots.fill(-1);
-        if (_exp['%s'](_inBase, b.length - off, _outBase) < 0) {
+        if (_exp['%s'](_inBase + off, b.length - off, _outBase) < 0) {
             if (off === b.length) break;
             off++;
             continue;

@@ -211,6 +211,18 @@ type compiledPattern struct {
 	// altLitAnchorFindBody (the dispatcher) is NOT a field here — like
 	// litAnchorFindBody, it's built at assembleModule time and appended
 	// directly, since it calls branch functions by index.
+
+	// LM-2: batch find/groups exports (multiple matches per host call,
+	// modelled on the set find_all ABI). Set by compileAll (not
+	// compilePattern) once findExport/groupsExport are known, gated on
+	// this pattern's effective LikelyMode == LikelyMatch. Empty = not
+	// requested. batchGroupsExport is only ever set when !anchored — the
+	// native lit-chain groups bodies (Gap C/A.3) are out of v1 scope, since
+	// they don't expose a separate find+capture composition to loop over.
+	// Always laid out last (see batchOffsets); not wired into the sets
+	// path (assembleModuleWithSets) in v1 — sets already have find_all.
+	batchFindExport   string
+	batchGroupsExport string
 }
 
 // altLitAnchorCompiledBranch holds one alternation branch's precomputed WASM
@@ -247,7 +259,51 @@ func (p *compiledPattern) funcCount() int {
 		} // named_groups_wrapper
 	}
 	// LNM non-mid bulk-skip helper count was here — see archive Section 11.
+	if p.batchFindExport != "" {
+		n++
+	}
+	if p.batchGroupsExport != "" {
+		n++
+	}
 	return n
+}
+
+// batchOffsets returns the sub-indices of the optional LM-2 batch wrapper
+// functions, which are always laid out last (after everything offsets()
+// accounts for). -1 if the corresponding export was not requested. Kept
+// separate from offsets() so its widely-shared 4-return signature (used by
+// both assembleModule and assembleModuleWithSets) does not need to change
+// for a feature the sets path doesn't wire up.
+func (p *compiledPattern) batchOffsets() (batchFindOff, batchGroupsOff int) {
+	idx := 0
+	if p.matchBody != nil {
+		idx++
+	}
+	if p.altLitAnchorBranches != nil {
+		idx += 1 + 2*len(p.altLitAnchorBranches)
+	} else if p.litAnchorBackScanBody != nil {
+		idx += 2
+	} else if p.findBody != nil {
+		idx++
+	}
+	if p.captureBody != nil {
+		idx++
+		if !p.anchored {
+			idx++
+		}
+		if p.namedGroupsExport != "" {
+			idx++
+		}
+	}
+	batchFindOff, batchGroupsOff = -1, -1
+	if p.batchFindExport != "" {
+		batchFindOff = idx
+		idx++
+	}
+	if p.batchGroupsExport != "" {
+		batchGroupsOff = idx
+	}
+	return
 }
 
 // offsets returns the sub-indices of each function within this pattern.
@@ -1222,16 +1278,33 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	out = append(out, 0x01, 0x00, 0x00, 0x00)
 
 	// Type section: 4 fixed types (match, find, capture/groups, and
-	// alt-lit-anchor's forward_verify_i — Task 6 v1, 2026-07-05).
+	// alt-lit-anchor's forward_verify_i — Task 6 v1, 2026-07-05), plus an
+	// optional 5th (the LM-2 batch find/groups wrapper signature) — added
+	// only when some pattern actually has a batch export, so modules with
+	// no LM-2 usage (including LikelyMatch modules where every pattern's
+	// batch shape is out of v1 scope) don't pay its few bytes. Nothing else
+	// ever references type index 4, so omitting it is always safe.
 	// (A different 4th type — for the LNM non-mid bulk-skip helper — was
 	// extracted to plans/non_mid_extension.go.archive Section 14; this is
 	// an unrelated, newly-added type reusing the same slot number.)
+	anyBatch := false
+	for _, p := range patterns {
+		if p.batchFindExport != "" || p.batchGroupsExport != "" {
+			anyBatch = true
+			break
+		}
+	}
 	typeSection := []byte{
 		0x04,
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0: (i32,i32)→i32
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E, // type 1: (i32,i32)→i64
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 2: (i32,i32,i32)→i32
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 3: (i32,i32,i32)→i64 — alt-lit-anchor forward_verify_i
+	}
+	if anyBatch {
+		typeSection[0] = 0x05
+		typeSection = append(typeSection,
+			0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F) // type 4: (i32,i32,i32,i32,i32)→i32 — LM-2 batch wrapper
 	}
 	out = appendSection(out, 1, typeSection)
 
@@ -1279,6 +1352,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		}
 		// LNM non-mid bulk-skip helper function-section entry was here —
 		// see archive Section 15.
+		if p.batchFindExport != "" {
+			fs = append(fs, 0x04)
+		}
+		if p.batchGroupsExport != "" {
+			fs = append(fs, 0x04)
+		}
 	}
 	out = appendSection(out, 3, fs)
 
@@ -1307,6 +1386,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			numExports++
 		}
 		if p.namedGroupsExport != "" {
+			numExports++
+		}
+		if p.batchFindExport != "" {
+			numExports++
+		}
+		if p.batchGroupsExport != "" {
 			numExports++
 		}
 	}
@@ -1344,6 +1429,17 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			es = appendString(es, p.namedGroupsExport)
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+namedWrapperOff))
+		}
+		batchFindOff, batchGroupsOff := p.batchOffsets()
+		if p.batchFindExport != "" && batchFindOff >= 0 {
+			es = appendString(es, p.batchFindExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(base+batchFindOff))
+		}
+		if p.batchGroupsExport != "" && batchGroupsOff >= 0 {
+			es = appendString(es, p.batchGroupsExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(base+batchGroupsOff))
 		}
 	}
 	out = appendSection(out, 7, es)
@@ -1403,6 +1499,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		}
 		// LNM non-mid bulk-skip helper body append was here —
 		// see archive Section 16.
+		if p.batchFindExport != "" {
+			cs = appendBatchFindWrapperCodeEntry(cs, base+findOff)
+		}
+		if p.batchGroupsExport != "" {
+			cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups)
+		}
 	}
 	out = appendSection(out, 10, cs)
 
@@ -1452,6 +1554,24 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 		p, err := compilePattern(re, cur, forceGroupsEngine, opts)
 		if err != nil {
 			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
+		}
+		// LM-2: batch find/groups exports, gated on this pattern's effective
+		// LikelyMode (per-pattern YAML override takes precedence over opts,
+		// same precedence chain compilePattern itself applies — see
+		// plans/LIKELY.md Gap H.1). v1 scope: find_func always eligible;
+		// groups_func only for the non-anchored (composed find+capture)
+		// shape — see the compiledPattern field doc.
+		effMode := opts.LikelyMode
+		if m, set := parseLikelyMode(re.LikelyMode); set {
+			effMode = m
+		}
+		if effMode == LikelyMatch {
+			if p.findExport != "" {
+				p.batchFindExport = p.findExport + "_batch"
+			}
+			if p.groupsExport != "" && !p.anchored {
+				p.batchGroupsExport = p.groupsExport + "_batch"
+			}
 		}
 		compiled = append(compiled, p)
 		if p.tableEnd > cur {
@@ -1762,6 +1882,226 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups int) []byte {
 // appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
 func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups int) []byte {
 	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildBatchFindWrapperBody emits the WASM body for the LM-2 batch find
+// export (plans/LM_TODO.md LM-2). Signature (type 4):
+//
+//	(ptr i32, len i32, out_ptr i32, out_cap i32, start_pos i32) → i32 (count)
+//
+// Loops calling the existing find function (findFuncIdx, type 1:
+// (i32,i32)→i64, unchanged) at successive scan positions, writing each
+// match as a (start, end) u32 pair — absolute, i.e. relative to ptr, same
+// convention as a single find call — at out_ptr + count*8, until out_cap
+// matches have been written or the scan reaches len or no-match. The
+// empty-match advance rule (relEnd > relStart ? relEnd : relStart+1)
+// mirrors the host-side loop in the JS/TS find generators exactly.
+//
+// Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
+// 8=relStart i32, 9=relEnd i32.
+func buildBatchFindWrapperBody(findFuncIdx int) []byte {
+	var b []byte
+	// Locals: 2×i32 (pos, count), 1×i64 (r), 2×i32 (relStart, relEnd).
+	b = append(b, 0x03)
+	b = append(b, 0x02, 0x7F)
+	b = append(b, 0x01, 0x7E)
+	b = append(b, 0x02, 0x7F)
+
+	// pos = start_pos; count = 0
+	b = append(b, 0x20, 0x04, 0x21, 0x05)
+	b = append(b, 0x41, 0x00, 0x21, 0x06)
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $L
+
+	// if count >= out_cap: br $done
+	b = append(b, 0x20, 0x06, 0x20, 0x03, 0x4F, 0x0D, 0x01)
+	// if pos > len: br $done
+	b = append(b, 0x20, 0x05, 0x20, 0x01, 0x4B, 0x0D, 0x01)
+
+	// r = call find(ptr+pos, len-pos)
+	b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A)
+	b = append(b, 0x20, 0x01, 0x20, 0x05, 0x6B)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(findFuncIdx))
+	b = append(b, 0x21, 0x07)
+
+	// if r < 0: br $done
+	b = append(b, 0x20, 0x07, 0x42, 0x00, 0x53, 0x0D, 0x01)
+
+	// relStart = wrap(r >> 32u); relEnd = wrap(r)
+	b = append(b, 0x20, 0x07, 0x42, 0x20, 0x88, 0xA7, 0x21, 0x08)
+	b = append(b, 0x20, 0x07, 0xA7, 0x21, 0x09)
+
+	// store absolute start at out_ptr + count*8
+	b = append(b, 0x20, 0x02, 0x20, 0x06, 0x41, 0x08, 0x6C, 0x6A)
+	b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A)
+	b = append(b, 0x36, 0x02, 0x00)
+	// store absolute end at out_ptr + count*8 + 4
+	b = append(b, 0x20, 0x02, 0x20, 0x06, 0x41, 0x08, 0x6C, 0x6A)
+	b = append(b, 0x20, 0x05, 0x20, 0x09, 0x6A)
+	b = append(b, 0x36, 0x02, 0x04)
+
+	// count += 1
+	b = append(b, 0x20, 0x06, 0x41, 0x01, 0x6A, 0x21, 0x06)
+
+	// pos = relEnd > relStart ? pos+relEnd : pos+relStart+1
+	b = append(b, 0x20, 0x09, 0x20, 0x08, 0x4B)
+	b = append(b, 0x04, 0x7F)
+	b = append(b, 0x20, 0x05, 0x20, 0x09, 0x6A)
+	b = append(b, 0x05)
+	b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x41, 0x01, 0x6A)
+	b = append(b, 0x0B)
+	b = append(b, 0x21, 0x05)
+
+	b = append(b, 0x0C, 0x00) // br $L (continue)
+	b = append(b, 0x0B)       // end loop
+	b = append(b, 0x0B)       // end block $done
+
+	b = append(b, 0x20, 0x06) // return count
+	b = append(b, 0x0B)       // end function
+	return b
+}
+
+// appendBatchFindWrapperCodeEntry appends a size-prefixed batch find wrapper body to cs.
+func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int) []byte {
+	body := buildBatchFindWrapperBody(findFuncIdx)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildBatchGroupsWrapperBody emits the WASM body for the LM-2 batch groups
+// export (plans/LM_TODO.md LM-2). Signature (type 4), same as the batch
+// find wrapper:
+//
+//	(ptr i32, len i32, out_ptr i32, out_cap i32, start_pos i32) → i32 (count)
+//
+// v1 scope: only for the non-anchored (composed find+capture) shape —
+// same restriction as buildGroupsWrapperBody itself. Calls findFuncIdx
+// (type 1) and captureFuncIdx (type 2, (i32,i32,i32)→i32 — absStart,
+// matchLen, slots_out_ptr) directly per match, exactly mirroring
+// buildGroupsWrapperBody's composition, but inside a loop writing
+// fixed-size records into a caller-provided batch buffer instead of a
+// single fixed out_ptr.
+//
+// Record layout at out_ptr + count*recordSize, recordSize = 8 + numGroups*8:
+//
+//	[0:4]  start (absolute, i.e. relative to ptr — same convention as find)
+//	[4:8]  end
+//	[8:]   numGroups*2 × i32 slot values (group i = [8+i*8 : 8+i*8+8]);
+//	       group 0 is the whole match, duplicating [0:4]/[4:8] — kept for a
+//	       uniform per-group access pattern in the consuming stub.
+//
+// Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
+// 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
+// 12=recBase i32, 13=capRes i32, 14=adj i32, 15=slotVal i32.
+func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups int) []byte {
+	recordSize := 8 + numGroups*8
+
+	var b []byte
+	// Locals: 2×i32 (pos, count), 1×i64 (r), 8×i32 (relStart, relEnd,
+	// absStart, matchLen, recBase, capRes, adj, slotVal).
+	b = append(b, 0x03)
+	b = append(b, 0x02, 0x7F)
+	b = append(b, 0x01, 0x7E)
+	b = append(b, 0x08, 0x7F)
+
+	// pos = start_pos; count = 0
+	b = append(b, 0x20, 0x04, 0x21, 0x05)
+	b = append(b, 0x41, 0x00, 0x21, 0x06)
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $L
+
+	// if count >= out_cap: br $done
+	b = append(b, 0x20, 0x06, 0x20, 0x03, 0x4F, 0x0D, 0x01)
+	// if pos > len: br $done
+	b = append(b, 0x20, 0x05, 0x20, 0x01, 0x4B, 0x0D, 0x01)
+
+	// r = call find(ptr+pos, len-pos)
+	b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A)
+	b = append(b, 0x20, 0x01, 0x20, 0x05, 0x6B)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(findFuncIdx))
+	b = append(b, 0x21, 0x07)
+
+	// if r < 0: br $done
+	b = append(b, 0x20, 0x07, 0x42, 0x00, 0x53, 0x0D, 0x01)
+
+	// relStart = wrap(r >> 32u); relEnd = wrap(r)
+	b = append(b, 0x20, 0x07, 0x42, 0x20, 0x88, 0xA7, 0x21, 0x08)
+	b = append(b, 0x20, 0x07, 0xA7, 0x21, 0x09)
+
+	// absStart = ptr + pos + relStart
+	b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A, 0x20, 0x08, 0x6A, 0x21, 0x0A)
+	// matchLen = relEnd - relStart
+	b = append(b, 0x20, 0x09, 0x20, 0x08, 0x6B, 0x21, 0x0B)
+	// recBase = out_ptr + count*recordSize
+	b = append(b, 0x20, 0x02, 0x20, 0x06, 0x41)
+	b = utils.AppendSLEB128(b, int32(recordSize))
+	b = append(b, 0x6C, 0x6A, 0x21, 0x0C)
+
+	// capRes = call capture(absStart, matchLen, recBase+8)
+	b = append(b, 0x20, 0x0A, 0x20, 0x0B)
+	b = append(b, 0x20, 0x0C, 0x41, 0x08, 0x6A)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
+	b = append(b, 0x21, 0x0D)
+
+	// if capRes < 0: br $done
+	b = append(b, 0x20, 0x0D, 0x41, 0x00, 0x48, 0x0D, 0x01)
+
+	// adj = pos + relStart
+	b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x0E)
+
+	// Adjust each of numGroups*2 slot ints at recBase+8+g*4 by +adj (skip
+	// unmatched groups, encoded as -1).
+	for g := 0; g < numGroups*2; g++ {
+		off := uint32(8 + g*4)
+		b = append(b, 0x20, 0x0C)
+		b = append(b, 0x28, 0x02)
+		b = utils.AppendULEB128(b, off)
+		b = append(b, 0x22, 0x0F) // tee slotVal
+		b = append(b, 0x41, 0x00, 0x4E)
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, 0x0C)
+		b = append(b, 0x20, 0x0F, 0x20, 0x0E, 0x6A)
+		b = append(b, 0x36, 0x02)
+		b = utils.AppendULEB128(b, off)
+		b = append(b, 0x0B) // end if
+	}
+
+	// Copy the (now-adjusted) whole-match slot0/slot1 into the record's
+	// start/end prefix.
+	b = append(b, 0x20, 0x0C, 0x20, 0x0C, 0x28, 0x02, 0x08, 0x36, 0x02, 0x00)
+	b = append(b, 0x20, 0x0C, 0x20, 0x0C, 0x28, 0x02, 0x0C, 0x36, 0x02, 0x04)
+
+	// count += 1
+	b = append(b, 0x20, 0x06, 0x41, 0x01, 0x6A, 0x21, 0x06)
+
+	// pos = relEnd > relStart ? pos+relEnd : pos+relStart+1
+	b = append(b, 0x20, 0x09, 0x20, 0x08, 0x4B)
+	b = append(b, 0x04, 0x7F)
+	b = append(b, 0x20, 0x05, 0x20, 0x09, 0x6A)
+	b = append(b, 0x05)
+	b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x41, 0x01, 0x6A)
+	b = append(b, 0x0B)
+	b = append(b, 0x21, 0x05)
+
+	b = append(b, 0x0C, 0x00) // br $L (continue)
+	b = append(b, 0x0B)       // end loop
+	b = append(b, 0x0B)       // end block $done
+
+	b = append(b, 0x20, 0x06) // return count
+	b = append(b, 0x0B)       // end function
+	return b
+}
+
+// appendBatchGroupsWrapperCodeEntry appends a size-prefixed batch groups wrapper body to cs.
+func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups int) []byte {
+	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
