@@ -1027,10 +1027,10 @@ func TestCompileAltGroupsWithMatch(t *testing.T) {
 // non-strict alts, etc.) so the rejection branches are exercised.
 func TestLitChainAnalysersRejection(t *testing.T) {
 	t.Run("invalid_syntax", func(t *testing.T) {
-		if _, ok := analyseLitChain(`[`); ok {
+		if _, ok := analyseLitChain(`[`, 24); ok {
 			t.Errorf("analyseLitChain accepted invalid syntax")
 		}
-		if _, ok := analyseLitChainRange(`[`, true); ok {
+		if _, ok := analyseLitChainRange(`[`, true, 24); ok {
 			t.Errorf("analyseLitChainRange accepted invalid syntax")
 		}
 		if _, _, ok := analyseLitChainGroupsRange(`[`); ok {
@@ -1057,11 +1057,12 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 	})
 
 	t.Run("too_small_count", func(t *testing.T) {
-		// N < 24 should reject for single-pattern analysers.
-		if _, ok := analyseLitChain(`AKIA[A-Z0-9]{4}`); ok {
+		// N < 24 should reject for single-pattern analysers under the
+		// neutral/LikelyNoMatch gate (minCount=24).
+		if _, ok := analyseLitChain(`AKIA[A-Z0-9]{4}`, 24); ok {
 			t.Errorf("analyseLitChain accepted N=4")
 		}
-		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{4,8}`, true); ok {
+		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{4,8}`, true, 24); ok {
 			t.Errorf("analyseLitChainRange accepted N=4")
 		}
 		if _, _, ok := analyseLitChainGroups(`(AKIA[A-Z0-9]{4})`); ok {
@@ -1072,9 +1073,21 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		}
 	})
 
+	t.Run("too_small_count_lm1", func(t *testing.T) {
+		// LM-1: under LikelyMatch, callers pass minCount=1 — N=4 now
+		// qualifies (K=4, N=4, K+N=8 < 16 still rejects; use N=12 so
+		// K+N=16 satisfies the overlap-load precondition).
+		if _, ok := analyseLitChain(`AKIA[A-Z0-9]{12}`, 1); !ok {
+			t.Errorf("analyseLitChain rejected N=12 under minCount=1")
+		}
+		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{12,20}`, true, 1); !ok {
+			t.Errorf("analyseLitChainRange rejected N=12 under minCount=1")
+		}
+	})
+
 	t.Run("not_a_range", func(t *testing.T) {
 		// analyseLitChainRange wants countMax > count.
-		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{24}`, true); ok {
+		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{24}`, true, 24); ok {
 			t.Errorf("analyseLitChainRange accepted exact count")
 		}
 		if _, _, ok := analyseLitChainGroupsRange(`(AKIA[A-Z0-9]{24})`); ok {

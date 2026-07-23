@@ -6882,15 +6882,17 @@ const (
 //   - class is OpCharClass / OpLiteral / OpAnyCharNotNL / OpAnyChar, ASCII-only
 //   - N >= 1 (counted, not range)
 //   - K + N >= 16 (so the SIMD overlap-load tail covers all class bytes)
-func analyseLitChain(pattern string) (*litChainPattern, bool) {
+//   - N >= minCount (LM-1: callers pass 24 under neutral/LikelyNoMatch, 1
+//     under LikelyMatch — see plans/LM_TODO.md LM-1)
+func analyseLitChain(pattern string, minCount int) (*litChainPattern, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, false
 	}
-	return analyseLitChainRe(re)
+	return analyseLitChainRe(re, minCount)
 }
 
-func analyseLitChainRe(re *syntax.Regexp) (*litChainPattern, bool) {
+func analyseLitChainRe(re *syntax.Regexp, minCount int) (*litChainPattern, bool) {
 	info, ok := analyseLitChainBranch(re)
 	if !ok || info.prefixCount > 0 {
 		return nil, false
@@ -6900,13 +6902,18 @@ func analyseLitChainRe(re *syntax.Regexp) (*litChainPattern, bool) {
 	if info.countMax != info.count {
 		return nil, false
 	}
-	// N≥24 single-pattern gate. Empirically (wasmtime 42 / Cranelift), inline
-	// SIMD class verify pessimises register allocation for the scan loop when
-	// the verify is small — a ~70% wall-time regression appears at N=16 despite
-	// fuel parity. The win flips clearly positive by N=36 and grows with N. 24
-	// is the empirical threshold. (Per-branch gate inside alternations applies
-	// separately in analyseLitChainAlt.)
-	if info.count < 24 {
+	// N≥24 single-pattern gate (neutral/LikelyNoMatch). Empirically (wasmtime
+	// 42 / Cranelift), inline SIMD class verify pessimises register
+	// allocation for the scan loop when the verify is small — a ~70%
+	// wall-time regression appears at N=16 despite fuel parity. The win
+	// flips clearly positive by N=36 and grows with N. 24 is the empirical
+	// threshold. (Per-branch gate inside alternations applies separately in
+	// analyseLitChainAlt.) LM-1: under LikelyMatch, the wall-time-only
+	// regression that justified 24 is suspected to be placement noise (see
+	// plans/LM_TODO.md LM-1) rather than a fuel cost, so callers pass a lower
+	// minCount to trade a possible sparse-input wall-time cost for a large
+	// dense-input fuel win.
+	if info.count < minCount {
 		return nil, false
 	}
 	return &litChainPattern{
@@ -6951,8 +6958,10 @@ type litChainAltPattern struct {
 // by the standard analyser. Anchored match treats greedy and non-greedy the
 // same; callers requesting the anchored path use this analyser for both.
 //
-// Gate: N ≥ 24 (same scan-loop register-pressure concern as {N,N}).
-func analyseLitChainRange(pattern string, allowNonGreedy bool) (*litChainPattern, bool) {
+// Gate: N ≥ minCount (same scan-loop register-pressure concern as {N,N};
+// callers pass 24 under neutral/LikelyNoMatch, 1 under LikelyMatch — LM-1,
+// see plans/LM_TODO.md).
+func analyseLitChainRange(pattern string, allowNonGreedy bool, minCount int) (*litChainPattern, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, false
@@ -6967,7 +6976,7 @@ func analyseLitChainRange(pattern string, allowNonGreedy bool) (*litChainPattern
 	if !info.greedy && !allowNonGreedy {
 		return nil, false
 	}
-	if info.count < 24 {
+	if info.count < minCount {
 		return nil, false
 	}
 	return &litChainPattern{

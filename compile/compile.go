@@ -535,7 +535,13 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			}
 			return p, nil
 		}
-		if lcp, ok := analyseLitChain(re.Pattern); ok {
+		// LM-1: relax the N≥24 single-pattern gate to N≥1 under LikelyMatch.
+		// See plans/LM_TODO.md LM-1.
+		litChainMinCount := 24
+		if buildOpts.LikelyMode == LikelyMatch {
+			litChainMinCount = 1
+		}
+		if lcp, ok := analyseLitChain(re.Pattern, litChainMinCount); ok {
 			p := &compiledPattern{
 				matchExport: re.MatchFunc,
 				findExport:  re.FindFunc,
@@ -551,7 +557,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			return p, nil
 		}
 		// Gap C: single-pattern range `{N,M}`.
-		if lcp, ok := analyseLitChainRange(re.Pattern, true); ok {
+		if lcp, ok := analyseLitChainRange(re.Pattern, true, litChainMinCount); ok {
 			// Greedy and non-greedy paths split by function:
 			//   anchored match: greedy/non-greedy same → range match body
 			//   find/groups greedy: range find/groups body
