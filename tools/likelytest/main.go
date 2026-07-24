@@ -439,6 +439,26 @@ var tests = []testCase{
 		matchInput:   denseSetChainsInput(true),
 		nomatchInput: denseSetChainsInput(false),
 	},
+	{
+		// LM-6 primary target: two counted-chain-eligible patterns that
+		// DO share a mandatory literal ("eyJ", a base64 JSON-header
+		// prefix — two JWT-segment-length variants). Unlike dense-set-chains
+		// above (AKIA/ghp_ never share a literal, so binPack never even
+		// considers merging them — confirmed via diag JSON sizing, always
+		// two singleton buckets regardless of LikelyMode), this pair lands
+		// in the same bucketByLiteral group and binPack's constraint checks
+		// merge them under neutral, losing task 5's single-pattern SIMD
+		// suffix body for both. LM-6 gates a refusal on this exact shape.
+		name: "dense-set-shared-prefix",
+		setPatterns: []string{
+			`eyJ[A-Za-z0-9_-]{20}`,
+			`eyJ[A-Za-z0-9_-]{40}`,
+		},
+		mode:         modeSet,
+		notes:        "eyJ-prefixed set, two counted-chain lengths sharing a literal — LM-6 primary target (binPack merge refusal)",
+		matchInput:   denseSetSharedPrefixInput(true),
+		nomatchInput: denseSetSharedPrefixInput(false),
+	},
 }
 
 // --------------------------------------------------------------------------
@@ -1050,6 +1070,36 @@ func denseSetChainsInput(withMatches bool) string {
 			for j := 0; j < 36; j++ {
 				b = append(b, ghpAlnum[(i+j)%len(ghpAlnum)])
 			}
+		}
+		b = append(b, ',', ' ')
+	}
+	return string(b[:targetSize])
+}
+
+// denseSetSharedPrefixInput builds ~50 KB for the dense-set-shared-prefix
+// case (two eyJ-prefixed counted-chain patterns, N=20 and N=40) — LM-6's
+// primary measurement target. Alternates the two token lengths when
+// withMatches; token-free filler of the same size otherwise.
+func denseSetSharedPrefixInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		filler := []byte(", the quick brown fox jumps over the lazy dog and other filler text goes here forever")
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	alnum := []byte("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-")
+	var b []byte
+	for i := 0; len(b) < targetSize; i++ {
+		n := 20
+		if i%2 == 1 {
+			n = 40
+		}
+		b = append(b, "eyJ"...)
+		for j := 0; j < n; j++ {
+			b = append(b, alnum[(i+j)%len(alnum)])
 		}
 		b = append(b, ',', ' ')
 	}

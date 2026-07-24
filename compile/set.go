@@ -876,6 +876,36 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 			placed := false
 
 			for bi, b := range litBuckets {
+				// Constraint 0 (LM-6, LikelyMatch only): don't merge two
+				// counted-chain-eligible patterns. isCountedClassChain requires
+				// a single-pattern suffix DFA (see its doc comment), so merging
+				// them loses task 5's single-pattern SIMD-verify suffix body for
+				// both — under LikelyMatch (match-dense callers) that loss is
+				// assumed to outweigh the shared-literal-dispatch win. Checked
+				// against each pattern's own isolated suffixDFA (built by
+				// analyzePattern, never mutated by merging), not the bucket's
+				// merged table.
+				if opts.LikelyMode == LikelyMatch {
+					if _, _, pOK := isCountedClassChain(p.suffixDFA); pOK {
+						conflict := false
+						for _, bp := range b.patterns {
+							if _, _, bpOK := isCountedClassChain(bp.suffixDFA); bpOK {
+								conflict = true
+								break
+							}
+						}
+						if conflict {
+							if diag != nil {
+								diag.Conflicts = append(diag.Conflicts, ConflictDiag{
+									Pattern: pRef, CandidateBucket: len(buckets) + bi,
+									Reason: "lm_counted_chain_split",
+								})
+							}
+							continue
+						}
+					}
+				}
+
 				// Constraint 1: bitmask capacity.
 				if len(b.patterns) >= bw {
 					if diag != nil {
