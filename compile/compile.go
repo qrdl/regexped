@@ -559,7 +559,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 							// TDFA capture body placed after lenient-alt tables.
 							tdfaBase := utils.PageAlign(lenLayout.tableEnd)
 							tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true,
-								resolveCompiledDFAThreshold(&buildOpts), true, false, false)
+								resolveCompiledDFAThreshold(&buildOpts), true, false, false, false)
 							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx)
 							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false))
 							p.dataBytes = append(p.dataBytes, rawTDFA...)
@@ -797,7 +797,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false, false,
-				buildOpts.LikelyMode == LikelyMatch)
+				buildOpts.LikelyMode == LikelyMatch, buildOpts.LikelyMode == LikelyMatch)
 			// Task 38 (2026-07-18): non-mid dominants are default-on for
 			// every LikelyMode again, replacing task 36's LikelyMatch-only
 			// gate, which was lossy in both directions — neutral callers
@@ -845,6 +845,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if !dfaTooLarge {
 		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(&buildOpts), false,
 			buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern),
+			buildOpts.LikelyMode == LikelyMatch,
 			buildOpts.LikelyMode == LikelyMatch)
 	}
 	patMandLit := findMandatoryLit(re.Pattern)
@@ -942,7 +943,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
 							revTable.midAcceptStates[revTable.startState] == 0)) {
 						revTableBase := utils.PageAlign(l.tableEnd)
-						revL := buildDFALayout(revTable, revTableBase, true, false, 0, false, false, false)
+						revL := buildDFALayout(revTable, revTableBase, true, false, 0, false, false, false, false)
 						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
 						// Task 22: when the prefix is a bare `[class]{M}` (M<=16),
 						// a single SIMD chunk verify replaces the scalar reverse
@@ -1196,7 +1197,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		} else {
 			p.isTDFA = true
 			tdfaBase := utils.PageAlign(p.tableEnd)
-			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(&buildOpts), true, false, false)
+			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(&buildOpts), true, false, false, false)
 			p.numGroups = tt.numGroups
 			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx)
 			// TDFA only needs the transition table (no stack/memo).

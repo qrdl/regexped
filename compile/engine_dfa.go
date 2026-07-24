@@ -1359,6 +1359,18 @@ type dfaLayout struct {
 	// detectShuftiSelfLoop's doc comment.
 	lmNonMidShufti bool
 
+	// lmWideShufti (LM_TODO.md LM-5) widens detectShuftiSelfLoop's self-loop
+	// class-width cap from 64 to 239 bytes. Set from
+	// buildOpts.LikelyMode == LikelyMatch at the match and find/groups DFA
+	// layout call sites — same scope as lmNonMidShufti. Sized with pattest
+	// on a hand-built `:[ -~]{10,}` pattern (95-byte class) before
+	// implementation, per the task's own instruction: dense/long runs
+	// measured -41%..-55% fuel; a run right at the pattern's own minimum
+	// length measured +12% (bounded "LM contract cost" residual, same shape
+	// as LM-3/LM-4's short-run guard cases, covered by the shared task-38
+	// hysteresis).
+	lmWideShufti bool
+
 	// Fast-skip / SIMD (find mode only)
 	prefix         []byte
 	firstByteOff   int32
@@ -1504,11 +1516,12 @@ func dfaTableBytes(t *dfaTable) int {
 // useAcceptSideTable: when true, emit a per-state accept side table at acceptOff
 // (used by TDFA, whose state IDs are not partitioned and cannot use acceptLimit).
 // forceWordChar (optional): force word-char table computation even when needFind=false.
-func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, useAcceptSideTable bool, lmBareShufti bool, lmNonMidShufti bool, forceWordChar ...bool) *dfaLayout {
+func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, useAcceptSideTable bool, lmBareShufti bool, lmNonMidShufti bool, lmWideShufti bool, forceWordChar ...bool) *dfaLayout {
 	wantWordChar := needFind || (len(forceWordChar) > 0 && forceWordChar[0])
 	l := &dfaLayout{}
 	l.lmBareShufti = lmBareShufti
 	l.lmNonMidShufti = lmNonMidShufti
+	l.lmWideShufti = lmWideShufti
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
 	// acceptLimit: WASM-state ID K such that "state in [1, K]" iff the DFA state
@@ -2555,8 +2568,14 @@ func detectDominantSelfLoop(l *dfaLayout) {
 func detectShuftiSelfLoop(l *dfaLayout) {
 	const minWidth = 9
 	const maxWidth = 64
+	const maxWidthLM = 239 // LM_TODO.md LM-5, gated on l.lmWideShufti
 	const maxStates = 126
 	const maxNonMid = 2 // shared 254/255 encoding space with detectDominantSelfLoop
+
+	width := maxWidth
+	if l.lmWideShufti {
+		width = maxWidthLM
+	}
 
 	if l.numWASM <= 1 {
 		return
@@ -2625,7 +2644,7 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 				selfSet = append(selfSet, byte(c))
 			}
 		}
-		if len(selfSet) < minWidth || len(selfSet) > maxWidth {
+		if len(selfSet) < minWidth || len(selfSet) > width {
 			continue
 		}
 		sort.Slice(selfSet, func(i, j int) bool { return selfSet[i] < selfSet[j] })
@@ -2971,7 +2990,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		}
 	}
 
-	l := buildDFALayout(t, tableBase, false, true, 0, false, false, false, t.hasWordBoundary)
+	l := buildDFALayout(t, tableBase, false, true, 0, false, false, false, false, t.hasWordBoundary)
 
 	// LIKELY.md Gap H.2: both mid-accept and non-mid-accept dominants are
 	// always kept for the buildSetSuffixBody bulk-skip dispatch (default-on
@@ -11440,7 +11459,7 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 			continue
 		}
 		// DFA branch: build its layout starting at cur.
-		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false, false, false)
+		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false, false, false, false)
 		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
 		raw, segCount := stripSegCount(dfaDataSegments(br.dfaLayout, false))
 		br.dfaDataBytes = raw

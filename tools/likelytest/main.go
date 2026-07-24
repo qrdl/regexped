@@ -424,6 +424,34 @@ var tests = []testCase{
 		exhaustive:   true,
 	},
 	{
+		// LM-5 target: 65-239-byte-class self-loop, above Shufti's
+		// pre-LM-5 64-byte cap. `:[ -~]{10,}` after a literal `:` — a
+		// 95-byte printable class. Sized with pattest before
+		// implementation (`:[ -~]{10,}` over 20-60 and 100-200-byte runs
+		// measured -41%/-55% fuel); this case uses long runs (65-150
+		// bytes) to land solidly inside the newly-widened band.
+		name:         "dense-printable",
+		pattern:      `:[ -~]{10,}`,
+		mode:         modeFind,
+		notes:        "dense printable runs, 65-150 bytes, 95-byte class width — LM-5 target (widened Shufti band)",
+		matchInput:   densePrintableInput(true, false),
+		nomatchInput: densePrintableInput(false, false),
+		exhaustive:   true,
+	},
+	{
+		// LM-5 harm/guard case: same pattern, runs 10-15 bytes (right at
+		// the pattern's own `{10,}` minimum) — pattest measured +12% here,
+		// the bounded "LM contract cost" residual task-38's hysteresis is
+		// meant to contain, same shape as dense-quoted-short/alpha-run.
+		name:         "dense-printable-short",
+		pattern:      `:[ -~]{10,}`,
+		mode:         modeFind,
+		notes:        "dense printable runs, 10-15 bytes (at pattern minimum) — LM-5 harm/hysteresis guard",
+		matchInput:   densePrintableInput(true, true),
+		nomatchInput: densePrintableInput(false, true),
+		exhaustive:   true,
+	},
+	{
 		// LM-6 sizing case: two counted-chain-eligible patterns bucketed
 		// under set composition. Confirms whether binPack actually merges
 		// them (losing task 5's SIMD verify) before LM-6 implements the
@@ -1004,6 +1032,46 @@ func denseQuotedInput(withMatches, short bool) string {
 			b = append(b, alnum[j%len(alnum)])
 		}
 		b = append(b, '"', ' ')
+		runLen++
+		if runLen > maxLen {
+			runLen = minLen
+		}
+	}
+	return string(b[:targetSize])
+}
+
+// densePrintableInput builds ~50 KB for the dense-printable /
+// dense-printable-short cases (`:[ -~]{10,}`) — LM-5's target (65-239-byte
+// Shufti band). Tokens are a literal ':' followed by a run cycling over
+// the full printable range 0x20..0x7e; run length cycles 65..150 bytes
+// (long, short=false) or 10..15 bytes (at the pattern's own minimum,
+// short=true). Tokens are separated by '\n' (0x0A) — NOT '\x20' — since
+// the class itself includes the space character; a space separator would
+// let the match run straight through into the next token instead of
+// terminating, collapsing "many dense tokens" into one giant match. No-match
+// input has no ':' anywhere.
+func densePrintableInput(withMatches, short bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		filler := []byte("the quick brown fox jumps over the lazy dog with no colon anywhere in here\n")
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	minLen, maxLen := 65, 150
+	if short {
+		minLen, maxLen = 10, 15
+	}
+	var b []byte
+	runLen := minLen
+	for len(b) < targetSize {
+		b = append(b, ':')
+		for j := 0; j < runLen; j++ {
+			b = append(b, byte(0x20+j%(0x7f-0x20)))
+		}
+		b = append(b, '\n')
 		runLen++
 		if runLen > maxLen {
 			runLen = minLen
