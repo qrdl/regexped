@@ -382,6 +382,35 @@ var tests = []testCase{
 		exhaustive:   true,
 	},
 	{
+		// LM-3 primary target: non-mid-accept self-loop with LONG runs
+		// (20-50 bytes per token, well over the 16-byte SIMD chunk width),
+		// unlike dense-tags above whose ~14-byte tag bodies are short enough
+		// to trip the task-38 hysteresis (advance < 16 -> unproductive) on
+		// nearly every attempt. This is the case expected to show the actual
+		// win from lifting the non-mid gate on a 9-64-byte class.
+		name:         "dense-quoted",
+		pattern:      `"[a-z0-9]+"`,
+		mode:         modeFind,
+		notes:        "dense quoted alnum tokens, 20-50 bytes each — LM-3 primary target (long non-mid self-loop runs)",
+		matchInput:   denseQuotedInput(true, false),
+		nomatchInput: denseQuotedInput(false, false),
+		exhaustive:   true,
+	},
+	{
+		// LM-3 harm/guard case: same pattern, but tokens are 3-6 bytes —
+		// every attempt advances < 16 bytes, so the task-38 hysteresis
+		// should self-disable the channel after nonMidHystStreak wasted
+		// attempts and hold fuel roughly flat vs neutral for the rest of
+		// the buffer.
+		name:         "dense-quoted-short",
+		pattern:      `"[a-z0-9]+"`,
+		mode:         modeFind,
+		notes:        "dense quoted alnum tokens, 3-6 bytes each — LM-3 harm/hysteresis guard (short non-mid self-loop runs)",
+		matchInput:   denseQuotedInput(true, true),
+		nomatchInput: denseQuotedInput(false, true),
+		exhaustive:   true,
+	},
+	{
 		// LM-4 target: bare (no literal prefix) 9-64-byte-class self-loop —
 		// detectShuftiSelfLoop bails on len(l.prefix)==0 today (task 34's
 		// gate). Runs vary 10-30 bytes so the self-loop is exercised
@@ -922,6 +951,43 @@ func denseTagsInput(withMatches bool) string {
 		b = append(b, '<')
 		b = append(b, tags[i%len(tags)]...)
 		b = append(b, ` class="x">`...)
+	}
+	return string(b[:targetSize])
+}
+
+// denseQuotedInput builds ~50 KB for the dense-quoted / dense-quoted-short
+// cases (`"[a-z0-9]+"`) — LM-3's target and harm/hysteresis guard. When
+// short is false, tokens cycle 20..50 bytes (multiple 16-byte SIMD chunks
+// per run); when short is true, tokens cycle 3..6 bytes (every bulk-skip
+// attempt advances < 16 bytes, exercising the task-38 hysteresis). No-match
+// input contains no `"` at all.
+func denseQuotedInput(withMatches, short bool) string {
+	const targetSize = 50 * 1024
+	if !withMatches {
+		filler := []byte("the quick brown fox jumps over the lazy dog with no quotes anywhere in here ")
+		var b []byte
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	alnum := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
+	minLen, maxLen := 20, 50
+	if short {
+		minLen, maxLen = 3, 6
+	}
+	var b []byte
+	runLen := minLen
+	for len(b) < targetSize {
+		b = append(b, '"')
+		for j := 0; j < runLen; j++ {
+			b = append(b, alnum[j%len(alnum)])
+		}
+		b = append(b, '"', ' ')
+		runLen++
+		if runLen > maxLen {
+			runLen = minLen
+		}
 	}
 	return string(b[:targetSize])
 }

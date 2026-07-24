@@ -1348,6 +1348,17 @@ type dfaLayout struct {
 	// gate exists and why LikelyMatch is the right scope for lifting it.
 	lmBareShufti bool
 
+	// lmNonMidShufti (LM_TODO.md LM-3) enables detectShuftiSelfLoop's
+	// non-mid-accept detection branch — moderately-wide (9..64 byte)
+	// self-loop bodies that are NOT accept states themselves (a mandatory
+	// trailing literal/class follows, e.g. `KEY=[a-z0-9/+]+;`). Set from
+	// buildOpts.LikelyMode == LikelyMatch at the match and find/groups DFA
+	// layout call sites. Gated separately from lmBareShufti because the
+	// non-mid channel shares the 254/255 encoded-byte space with
+	// detectDominantSelfLoop's own non-mid channel (cap 2 total) — see
+	// detectShuftiSelfLoop's doc comment.
+	lmNonMidShufti bool
+
 	// Fast-skip / SIMD (find mode only)
 	prefix         []byte
 	firstByteOff   int32
@@ -1465,8 +1476,9 @@ type dominantInfo struct {
 	// (194-byte) exit set, which detectDominantSelfLoop's ≤8-exit-byte gate
 	// can never reach. emitDominantBulkSkip tests membership in this set
 	// directly and inverts the mask (stop at the first byte NOT a member)
-	// instead of testing membership in exitBytes directly. Always
-	// mid-accept in the current implementation (see detectShuftiSelfLoop).
+	// instead of testing membership in exitBytes directly. Mid-accept by
+	// default; LM_TODO.md LM-3 adds a LikelyMatch-gated non-mid-accept
+	// channel (see detectShuftiSelfLoop).
 	selfLoopSet []byte
 	encodedByte byte // the value stored in midAcceptBytes[state] (mid) or nonMidDominantBytes[state] (non-mid)
 	isMidAccept bool // true → encodedByte in midAcceptBytes; false → in nonMidDominantBytes
@@ -1492,10 +1504,11 @@ func dfaTableBytes(t *dfaTable) int {
 // useAcceptSideTable: when true, emit a per-state accept side table at acceptOff
 // (used by TDFA, whose state IDs are not partitioned and cannot use acceptLimit).
 // forceWordChar (optional): force word-char table computation even when needFind=false.
-func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, useAcceptSideTable bool, lmBareShufti bool, forceWordChar ...bool) *dfaLayout {
+func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, useAcceptSideTable bool, lmBareShufti bool, lmNonMidShufti bool, forceWordChar ...bool) *dfaLayout {
 	wantWordChar := needFind || (len(forceWordChar) > 0 && forceWordChar[0])
 	l := &dfaLayout{}
 	l.lmBareShufti = lmBareShufti
+	l.lmNonMidShufti = lmNonMidShufti
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
 	// acceptLimit: WASM-state ID K such that "state in [1, K]" iff the DFA state
@@ -2488,13 +2501,26 @@ func detectDominantSelfLoop(l *dfaLayout) {
 // v1 scope: mid-accept only (reuses the same midAcceptBytes piggyback as
 // detectDominantSelfLoop's mid channel; every state this project's Task 20
 // audit identified as a motivating case — e.g. `ID:[a-zA-Z0-9]{10,}`'s
-// self-loop state — is mid-accept). Non-mid-accept states with a
-// moderately-wide self-loop are out of scope for v1.
+// self-loop state — is mid-accept).
+//
+// LM_TODO.md LM-3 adds a non-mid-accept channel (delimited bodies whose
+// loop state cannot accept until a mandatory trailing literal/class arrives,
+// e.g. `KEY=[a-z0-9/+]+;`), gated on l.lmNonMidShufti (set from
+// buildOpts.LikelyMode == LikelyMatch at the match/find DFA layout call
+// sites). Non-mid entries piggyback on detectDominantSelfLoop's own 254/255
+// reserved-value non-mid channel (see applyDominantStateEncoding's doc
+// comment) rather than the mid-accept 128..253 sub-range, so they share that
+// channel's hard cap of 2 total non-mid entries per DFA — detection here
+// continues the index from however many detectDominantSelfLoop already
+// claimed (it always runs first; see buildDFALayout).
 //
 // Encoding: midAcceptBytes[state] = 128 + idx, a third sub-range alongside
 // detectDominantSelfLoop's own 2..127 (mid dominants) — 0 = nothing,
 // 1 = plain mid-accept, 2..127 = exit-based dominant idx, 128..253 = Shufti
-// self-loop idx. Capped at 126 entries, matching the existing per-kind cap.
+// self-loop idx, 254..255 = non-mid dominant (exit-based OR, under LM-3,
+// Shufti self-loop). Mid channel capped at 126 entries, matching the
+// existing per-kind cap; non-mid channel capped at 2 (shared with
+// detectDominantSelfLoop, task 38's encoding constraint).
 //
 // Task 34 (plans/TODO.md): gated on len(l.prefix) > 0 — the same
 // computePrefix-derived signal buildFindBody already uses to decide between
@@ -2530,6 +2556,7 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 	const minWidth = 9
 	const maxWidth = 64
 	const maxStates = 126
+	const maxNonMid = 2 // shared 254/255 encoding space with detectDominantSelfLoop
 
 	if l.numWASM <= 1 {
 		return
@@ -2539,8 +2566,12 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 	}
 
 	already := make(map[int32]bool, len(l.dominantStates))
+	nonMidIdx := 0
 	for _, info := range l.dominantStates {
 		already[info.state] = true
+		if !info.isMidAccept {
+			nonMidIdx++
+		}
 	}
 
 	cellsPerState := 256
@@ -2570,8 +2601,14 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 		if already[state] {
 			continue
 		}
-		if int(state) >= len(l.midAcceptBytes) || l.midAcceptBytes[state] == 0 {
-			continue // v1 is mid-accept only
+		isMid := int(state) < len(l.midAcceptBytes) && l.midAcceptBytes[state] != 0
+		if !isMid {
+			// LM-3: non-mid-accept channel, LikelyMatch-gated, shares the
+			// 254/255 encoding space with detectDominantSelfLoop's non-mid
+			// entries.
+			if !l.lmNonMidShufti || nonMidIdx >= maxNonMid {
+				continue
+			}
 		}
 		var selfSet []byte
 		for c := 0; c < cellsPerState; c++ {
@@ -2591,17 +2628,27 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 		if len(selfSet) < minWidth || len(selfSet) > maxWidth {
 			continue
 		}
-		if idx >= maxStates {
-			continue
-		}
 		sort.Slice(selfSet, func(i, j int) bool { return selfSet[i] < selfSet[j] })
-		l.dominantStates = append(l.dominantStates, dominantInfo{
-			state:       state,
-			selfLoopSet: selfSet,
-			encodedByte: byte(128 + idx),
-			isMidAccept: true,
-		})
-		idx++
+		if isMid {
+			if idx >= maxStates {
+				continue
+			}
+			l.dominantStates = append(l.dominantStates, dominantInfo{
+				state:       state,
+				selfLoopSet: selfSet,
+				encodedByte: byte(128 + idx),
+				isMidAccept: true,
+			})
+			idx++
+		} else {
+			l.dominantStates = append(l.dominantStates, dominantInfo{
+				state:       state,
+				selfLoopSet: selfSet,
+				encodedByte: byte(254 + nonMidIdx),
+				isMidAccept: false,
+			})
+			nonMidIdx++
+		}
 	}
 }
 
@@ -2924,7 +2971,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		}
 	}
 
-	l := buildDFALayout(t, tableBase, false, true, 0, false, false, t.hasWordBoundary)
+	l := buildDFALayout(t, tableBase, false, true, 0, false, false, false, t.hasWordBoundary)
 
 	// LIKELY.md Gap H.2: both mid-accept and non-mid-accept dominants are
 	// always kept for the buildSetSuffixBody bulk-skip dispatch (default-on
@@ -11393,7 +11440,7 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 			continue
 		}
 		// DFA branch: build its layout starting at cur.
-		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false, false)
+		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false, false, false)
 		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
 		raw, segCount := stripSegCount(dfaDataSegments(br.dfaLayout, false))
 		br.dfaDataBytes = raw

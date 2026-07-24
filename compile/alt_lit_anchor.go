@@ -64,7 +64,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 			return nil, false
 		}
 
-		l := buildDFALayout(table, cur, true, true, resolveCompiledDFAThreshold(&buildOpts), false, false)
+		l := buildDFALayout(table, cur, true, true, resolveCompiledDFAThreshold(&buildOpts), false, false, false)
 		if !l.useU8 {
 			return nil, false
 		}
@@ -88,7 +88,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		}
 
 		revTableBase := utils.PageAlign(l.tableEnd)
-		revL := buildDFALayout(revTable, revTableBase, true, false, 0, false, false)
+		revL := buildDFALayout(revTable, revTableBase, true, false, 0, false, false, false)
 		bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
 
 		// Opt 1 (Task 7) — default-on for every mode, same as the
