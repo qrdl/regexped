@@ -321,6 +321,21 @@ var tests = []testCase{
 		matchInput:   strings.Repeat("aB3_", 2560) + "!",
 		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
 	},
+	{
+		// Task 41 BT-routed sibling of tdfa-bulk-skip-word-class above:
+		// `([^,]+)` is also a whole-pattern single capture, but the
+		// inverted class trips hasAmbiguousCaptures (task 13) and routes
+		// to Backtracking instead of TDFA. Same shape (10 KB self-loop
+		// run + one-byte offset between match/nomatch inputs) confirms
+		// the task 41 shortcut's fuel win isn't TDFA-specific — it should
+		// eliminate BT's ~40 fuel/byte captureBody re-walk here too.
+		name:         "bt-groups-whole-capture-inverted-class",
+		pattern:      `([^,]+)`,
+		mode:         modeGroups,
+		notes:        "BT-routed whole-pattern single capture (inverted class) — task 41 BT sibling",
+		matchInput:   strings.Repeat("aB3_", 2560) + ",",
+		nomatchInput: "," + strings.Repeat("aB3_", 2560),
+	},
 
 	// ── LM-0: match-dense cases (plans/LM_TODO.md) ──────────────────────
 	// All prior cases above bury a single match in 10-50 KB — scan-to-first-

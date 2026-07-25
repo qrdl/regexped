@@ -1181,6 +1181,20 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	p.groupNames = extractGroupNames(parsed)
+
+	// Task 41: whole-pattern single-capture shortcut. Only valid on the
+	// find-wrapper composition path (captureBody re-traverses the
+	// wrapper-supplied [start,end) substring, so group 0 there is always
+	// (0,len) — a sole capture spanning the whole match is therefore
+	// always (0,len) too, with no TDFA/BT re-walk needed). Native/anchored
+	// paths above (where captureBody IS the exported groups function) are
+	// out of scope and unaffected.
+	if !anchored && isWholePatternSingleCapture(parsed) {
+		p.numGroups = 2
+		p.captureBody = appendTrivialSingleCaptureCodeEntry(nil)
+		return p, nil
+	}
+
 	groupsEngine := selectBestEngine(prog, &buildOpts)
 	if forceGroupsEngine != 0 {
 		groupsEngine = forceGroupsEngine
