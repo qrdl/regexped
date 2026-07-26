@@ -2183,3 +2183,97 @@ regexps
 -;12-52;-;-
 -;12-32;-;-
 -;24-132;-;-
+# ============================================================
+# Category 32: fold-case (?i) find no-match past a length threshold
+# (task 43 in plans/TODO.md).
+#
+# buildDFALayout's Teddy chain construction (compile/engine_dfa.go, the
+# useTwoByte/useThreeByte/useFourByte tier loops) walked DFA transitions
+# from each firstByte candidate to build per-tier candidate bitmasks, but
+# never checked whether a candidate's walk reached a terminal state (zero
+# outgoing transitions -- i.e. the literal already fully matched) before
+# the tier's byte offset. When that happened the tier's loop body never
+# executed for that candidate, silently leaving an all-zero bitmask
+# instead of disqualifying the tier -- so the SIMD AND-reduction across
+# tiers always evaluated to zero and no candidate could ever be found.
+# mandatory_lit.go/lit_anchor.go both exclude FoldCase literals from the
+# fast literal-anchor path, so any short (?i) literal (1-3 bytes; a 4-byte
+# literal exactly fills the 4-byte Teddy chain with no premature terminal
+# state) falls back to this buggy firstByte/Teddy path. The SIMD entry
+# guard only engages once len(input) >= 16 + tier_depth, which is why the
+# bug is invisible on short inputs and only appears once trailing content
+# (irrelevant to the match itself) pushes the total length past that
+# threshold -- 19 bytes for the 2-byte-literal case below.
+#
+# Fixed by disqualifying the tier outright (matching the existing
+# validCount > 64 disqualification) as soon as any candidate's walk hits
+# a zero-outgoing-transition state before the tier's byte offset.
+#
+# Expected values cross-checked against Go's regexp package; confirmed
+# these specific (pattern, string) pairs reproduce -1/no-match on the
+# pre-fix build via a throwaway wasmtime harness (not checked in).
+# ============================================================
+Cat32FoldCaseFindLengthThreshold
+strings
+""
+"ZA9_X0Zaaa#9 _#a"
+"ZA9_X0Zaaa#9 _#aa"
+"ZA9_X0Zaaa#9 _#aaa"
+"ZA9_X0Zaaa#9 _#aaaa"
+"ZA9_X0Zaaa#9 _#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+regexps
+"(?i:X)"
+-;-;-;-
+-;4-5;-;-
+-;4-5;-;-
+-;4-5;-;-
+-;4-5;-;-
+-;4-5;-;-
+Cat32FoldCaseFindLengthThreshold2Byte
+strings
+""
+"ZA9_XXY0Zaaa#9 _#a"
+"ZA9_XXY0Zaaa#9 _#aa"
+"ZA9_XXY0Zaaa#9 _#aaa"
+"ZA9_XXY0Zaaa#9 _#aaaa"
+"ZA9_XXY0Zaaa#9 _#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+regexps
+"(?i:XY)"
+-;-;-;-
+-;5-7;-;-
+-;5-7;-;-
+-;5-7;-;-
+-;5-7;-;-
+-;5-7;-;-
+Cat32FoldCaseFindLengthThreshold3Byte
+strings
+""
+"ZA9_WWXY0Zaaa#9 _#a"
+"ZA9_WWXY0Zaaa#9 _#aa"
+"ZA9_WWXY0Zaaa#9 _#aaa"
+"ZA9_WWXY0Zaaa#9 _#aaaa"
+"ZA9_WWXY0Zaaa#9 _#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+regexps
+"(?i:WXY)"
+-;-;-;-
+-;5-8;-;-
+-;5-8;-;-
+-;5-8;-;-
+-;5-8;-;-
+-;5-8;-;-
+Cat32FoldCaseFindLengthThreshold4Byte
+strings
+""
+"ZA9_VVWXY0Zaaa#9 _#a"
+"ZA9_VVWXY0Zaaa#9 _#aa"
+"ZA9_VVWXY0Zaaa#9 _#aaa"
+"ZA9_VVWXY0Zaaa#9 _#aaaa"
+"ZA9_VVWXY0Zaaa#9 _#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+regexps
+"(?i:VWXY)"
+-;-;-;-
+-;5-9;-;-
+-;5-9;-;-
+-;5-9;-;-
+-;5-9;-;-
+-;5-9;-;-

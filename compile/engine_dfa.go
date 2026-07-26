@@ -1820,7 +1820,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 						t1Hi[b2>>4] |= byte(1 << uint(i))
 					}
 				}
-				if validCount > 64 {
+				if validCount == 0 || validCount > 64 {
 					useTwoByte = false
 					break
 				}
@@ -1855,7 +1855,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 								t2Hi[b3>>4] |= byte(1 << uint(i))
 							}
 						}
-						if validCount3 > 64 {
+						if validCount3 == 0 || validCount3 > 64 {
 							useThreeByte = false
 							break outerThreeByte
 						}
@@ -1896,7 +1896,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 										t3Hi[b4>>4] |= byte(1 << uint(i))
 									}
 								}
-								if validCount4 > 64 {
+								if validCount4 == 0 || validCount4 > 64 {
 									useFourByte = false
 									break outerFourByte
 								}
