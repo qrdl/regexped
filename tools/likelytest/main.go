@@ -467,31 +467,18 @@ var tests = []testCase{
 		exhaustive:   true,
 	},
 	{
-		// LM-6 sizing case: two counted-chain-eligible patterns bucketed
-		// under set composition. Confirms whether binPack actually merges
-		// them (losing task 5's SIMD verify) before LM-6 implements the
-		// LM-gated refusal. modeSet already exhausts via find_all —
-		// exhaustive flag not needed here.
-		name: "dense-set-chains",
-		setPatterns: []string{
-			`AKIA[A-Z0-9]{16}`,
-			`ghp_[A-Za-z0-9]{36}`,
-		},
-		mode:         modeSet,
-		notes:        "AKIA + ghp_ set, dense mixed tokens — LM-6 sizing case (does binPack merge these into one bucket?)",
-		matchInput:   denseSetChainsInput(true),
-		nomatchInput: denseSetChainsInput(false),
-	},
-	{
 		// LM-6 primary target: two counted-chain-eligible patterns that
 		// DO share a mandatory literal ("eyJ", a base64 JSON-header
-		// prefix — two JWT-segment-length variants). Unlike dense-set-chains
-		// above (AKIA/ghp_ never share a literal, so binPack never even
-		// considers merging them — confirmed via diag JSON sizing, always
-		// two singleton buckets regardless of LikelyMode), this pair lands
-		// in the same bucketByLiteral group and binPack's constraint checks
-		// merge them under neutral, losing task 5's single-pattern SIMD
-		// suffix body for both. LM-6 gates a refusal on this exact shape.
+		// prefix — two JWT-segment-length variants). An AKIA/ghp_ variant
+		// of this case (patterns sharing no literal) was tried and removed:
+		// binPack never even considers merging disjoint-literal patterns,
+		// confirmed via diag JSON sizing — always two singleton buckets
+		// regardless of LikelyMode, so that shape produces byte-identical
+		// WASM across all three modes and exercises nothing. This pair, by
+		// contrast, lands in the same bucketByLiteral group and binPack's
+		// constraint checks merge them under neutral, losing task 5's
+		// single-pattern SIMD suffix body for both. LM-6 gates a refusal on
+		// this exact shape.
 		name: "dense-set-shared-prefix",
 		setPatterns: []string{
 			`eyJ[A-Za-z0-9_-]{20}`,
@@ -1122,39 +1109,6 @@ func denseBareUpperInput(withMatches bool) string {
 		if runLen > 30 {
 			runLen = 10
 		}
-	}
-	return string(b[:targetSize])
-}
-
-// denseSetChainsInput builds ~50 KB for LM-0's dense-set-chains case
-// (AKIA + ghp_ set) — LM-6's sizing case. Alternates valid AKIA and ghp_
-// tokens when withMatches; token-free filler of the same size otherwise.
-func denseSetChainsInput(withMatches bool) string {
-	const targetSize = 50 * 1024
-	if !withMatches {
-		filler := []byte(", the quick brown fox jumps over the lazy dog and other filler text goes here forever")
-		var b []byte
-		for len(b) < targetSize {
-			b = append(b, filler...)
-		}
-		return string(b[:targetSize])
-	}
-	akiaAlnum := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-	ghpAlnum := []byte("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789")
-	var b []byte
-	for i := 0; len(b) < targetSize; i++ {
-		if i%2 == 0 {
-			b = append(b, "AKIA"...)
-			for j := 0; j < 16; j++ {
-				b = append(b, akiaAlnum[(i+j)%len(akiaAlnum)])
-			}
-		} else {
-			b = append(b, "ghp_"...)
-			for j := 0; j < 36; j++ {
-				b = append(b, ghpAlnum[(i+j)%len(ghpAlnum)])
-			}
-		}
-		b = append(b, ',', ' ')
 	}
 	return string(b[:targetSize])
 }

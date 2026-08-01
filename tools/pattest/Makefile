@@ -5,32 +5,42 @@
 run:
 	go run . $(ARGS)
 
-# Clear LikelyMatch win on the matching-inputs table (literal-anchored
-# counted-chain suffix; see plans/TODO.md task 5 / LIKELY.md Opt 2). A
-# content-addressed URL (SHA-256 hex digest as the last path segment, no
-# trailing literal) — realistic shape for CDN/blob-storage/image-digest
-# URLs. Buffers are short (~100 bytes of filler before the URL/absent)
-# deliberately: at large buffer sizes the fixed literal-scan cost (shared
-# by every mode) dilutes Opt 2's relative fuel win down to ~1-2%, since
-# Opt 2 only accelerates the class-verify step, not the literal search.
+# Clear LikelyMatch win on the matching-inputs table (LM-1: relaxes the
+# lit-chain SIMD-verify gate from N>=24 to N>=1; see plans/LM_TODO.md
+# LM-1, and tools/likelytest's "dense-akia" case). AKIA[A-Z0-9]{16} has
+# count N=16, below the neutral/LikelyNoMatch gate of 24 but above
+# LikelyMatch's gate of 1 — under neutral this pattern falls back to a
+# plain scalar DFA scan/verify; under LikelyMatch it takes the SIMD
+# counted-chain verify path instead. The old example here
+# (https://cdn\.io/[0-9a-f]{64}, N=64) was already >=24 under neutral,
+# so LikelyMatch never changed its codegen and the win was always 0% —
+# it predates LM-1 lowering the gate and was never revisited.
 example-lm:
-	go run . -pattern 'https://cdn\.io/[0-9a-f]{64}' -mode find -inputs examples/lm_url_inputs.txt $(ARGS)
+	go run . -pattern 'AKIA[A-Z0-9]{16}' -mode find -inputs examples/lm_akia_inputs.txt $(ARGS)
 
 # Clear LikelyNoMatch win on the non-matching-inputs table (no literal
 # anchor, wide first-byte class; see plans/TODO.md LNM Action 5).
 example-lnm:
 	go run . -pattern '[a-zA-Z]{8,}' -mode find -inputs examples/lnm_inputs.txt $(ARGS)
 
-# Both wins in one pattern, by fuel: LikelyMatch gains on match, LikelyNoMatch
-# gains on no-match, each mode flat-or-worse in the other's bucket. NOT
-# realistic (a 200-char suffix is not a real secret format) — the 200-count
-# is deliberately oversized so Gap E's unconditional (non-short-circuiting)
-# suffix verify becomes expensive enough on rejected candidates to flip from
-# "harmless side benefit" (as it is at a realistic count like 36) to a
-# measurable regression on the no-match bucket, isolating each mode's win to
-# its own bucket. See conversation notes / plans/TODO.md tasks 5, 22.
+# Both wins in one pattern, by fuel: LikelyMatch gains on the matching bucket,
+# LikelyNoMatch gains on the non-matching bucket, each mode flat in the
+# other's bucket. Bare (no literal anchor) `[A-Z]{8,}` hits two independent
+# LikelyMode-gated detectors in engine_dfa.go that share the same DFA find
+# layout but are gated in opposite directions:
+#   - detectShuftiSelfLoop's bare-pattern bail (len(l.prefix)==0) is lifted
+#     only when l.lmBareShufti (LikelyMatch + minLen>=8, see
+#     lmBareShuftiEligible) — SIMD self-loop bulk-skip through a long run of
+#     matching bytes, big win on dense matching input, no effect on
+#     non-matching input (self-loop is never entered).
+#   - LikelyNoMatch's dominant-state SIMD bulk-skip (Opt 1) speeds up
+#     scanning through bytes outside the first-byte class, big win on
+#     non-matching input, no effect once inside a real match run.
+# The old example here (`[0-9]{8}ghp_[A-Za-z0-9]{200}`) relied on Gap E
+# (analyseLitChainPrefixed), which is not LikelyMode-gated at all — it always
+# emits identical code regardless of mode, so the win was always 0%/0%.
 example-combined:
-	go run . -pattern '[0-9]{8}ghp_[A-Za-z0-9]{200}' -mode find -inputs examples/lm_lnm_combined_inputs.txt $(ARGS)
+	go run . -pattern '[A-Z]{8,}' -mode find -inputs examples/lm_lnm_combined_inputs.txt $(ARGS)
 
 examples: example-lm example-lnm example-combined
 

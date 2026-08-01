@@ -34,6 +34,37 @@ The three modes are mutually exclusive. `LikelyMatch` does **not** include
 
 ---
 
+## `LikelyMatch`/`LikelyNoMatch` can be slower than neutral
+
+Both non-neutral modes are hints, not guarantees: they force a strategy
+(SIMD bulk-skip, forced Shufti routing, etc.) that pays off when the
+caller's assumption about their own workload holds, and costs *more* than
+neutral's default-on heuristics when it doesn't. This is expected, measured
+behaviour, not a bug — `tools/likelytest`'s matrix reproduces several such
+regressions on its fixed benchmark corpus, documented in
+[`tools/likelytest/README.md`](../tools/likelytest/README.md#known-regression-cases).
+The clearest example: a bare `[a-zA-Z]{20,}`-style pattern under
+`LikelyNoMatch` gains up to -58% fuel when the real no-match data is sparse
+in that byte class (binary/control-byte data), but *regresses* when the real
+no-match data is dense in it (ordinary prose) — same pattern, same compiled
+byte class, opposite result, because only the caller's actual runtime data
+distinguishes the two cases and the compiler has no way to see it.
+
+**Before setting `LikelyMode` on a pattern you intend to ship, benchmark it
+with `tools/pattest` against a representative sample of your own inputs**
+rather than assuming the hint that matches your intuition will help:
+
+```bash
+cd tools/pattest
+make run ARGS="-pattern '<your pattern>' -mode find -inputs your_inputs.txt"
+```
+
+This compiles your exact pattern under all three modes and reports fuel and
+wall-clock time for each, bucketed into matching/non-matching inputs using
+your own sample data — see `tools/pattest/Makefile` for runnable examples.
+
+---
+
 ## How to set the hint
 
 > **Gap (see *Known gaps* §1):** there is currently no per-pattern YAML field
