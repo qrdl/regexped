@@ -466,6 +466,23 @@ var tests = []testCase{
 			{"long match", strings.Repeat("abcdefghij", 100)},
 		},
 	},
+	{
+		// TODO.md task 13 population: quantifier-loop class whose terminator
+		// overlaps the class itself. hasAmbiguousCaptures flags the loop's
+		// InstAlt as ambiguous (continue-vs-exit can't be resolved by
+		// first-byte lookahead alone) and routes this to Backtracking today,
+		// even though Task 12 measured forced-TDFA as faster on this exact
+		// shape (68.07 vs 114.12 fuel/byte, -40%). This case exists to
+		// measure that population at scale if/when the gate is narrowed —
+		// not to demonstrate a win yet.
+		name:    "overlap-terminator-groups",
+		pattern: `X([a-zA-Z]+)Y`,
+		mode:    anchoredGroups,
+		inputs: []namedInput{
+			{"match", "X" + strings.Repeat("aB", 500) + "Y"},
+			{"no-match missing terminator", "X" + strings.Repeat("aB", 500)},
+		},
+	},
 
 	// ── LNM / Opt 1 coverage on 100 KB workloads ─────────────────────────────
 	// These three patterns surface the wins (or absence thereof) of recent

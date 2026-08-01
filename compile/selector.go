@@ -251,11 +251,37 @@ func hasLineAnchors(prog *syntax.Prog) bool {
 // capture group's quantifier, TDFA's LeftmostFirst priority causes the greedy
 // loop to over-consume and record wrong capture positions. These patterns must
 // use backtracking instead.
+//
+// Quantifier-loop Alts (Out < PC for the backward loop body, Arg >= PC for the
+// forward exit — the same test hasNonLoopAlternations/hasNestedQuantifiers
+// use) get a narrower version of the check: isAlternationDeterministic still
+// rejects an INDETERMINATE branch (empty first-rune set, e.g. an inverted
+// class wider than 256 codepoints — this is Gap I's protection, see
+// CLAUDE.md "Load-bearing engine-selection gates", and must not be relaxed
+// here). It only skips the disjoint-ness requirement once both branches are
+// computable, since TDFA's LeftmostFirst priority always prefers the loop
+// body over the exit — "does this byte continue the loop or start the exit"
+// resolves correctly even when the exit's first-byte set overlaps the loop's
+// own class (e.g. X([a-zA-Z]+)Y, where Y is itself a class member) — see
+// plans/TODO.md task 13. This used to also require no further quantifier loop
+// reachable past the exit branch, working around a bug where a second loop
+// over an overlapping alphabet corrupted TDFA's tag-op register-copy
+// ordering (e.g. ([a-z]+)(er)([a-z]+)); that bug is now fixed at its root in
+// engine_tdfa.go's getOrAddState (sequentializeCopies), so the extra
+// exclusion is no longer needed. Genuine user alternations, including one
+// nested inside a loop body (e.g. (?:cat|car)+), are a separate InstAlt
+// instruction and are still checked in full.
 func hasAmbiguousCaptures(prog *syntax.Prog) bool {
 	for pc, inst := range prog.Inst {
 		switch inst.Op {
-		case syntax.InstAlt, syntax.InstAltMatch:
-			if !isAlternationDeterministic(prog, pc) {
+		case syntax.InstAlt:
+			pcU32 := uint32(pc)
+			isQuantifierLoop := inst.Out < pcU32 && inst.Arg >= pcU32
+			if !isAlternationDeterministic(prog, pc, isQuantifierLoop) {
+				return true
+			}
+		case syntax.InstAltMatch:
+			if !isAlternationDeterministic(prog, pc, false) {
 				return true
 			}
 		}
@@ -466,7 +492,15 @@ func isEpsilonAccept(prog *syntax.Prog, pc int) bool {
 
 // isAlternationDeterministic checks if an alternation has distinct first characters
 // in each branch, making it deterministic.
-func isAlternationDeterministic(prog *syntax.Prog, altPC int) bool {
+//
+// quantifierLoop is true when altPC is a quantifier-loop Alt (see
+// hasAmbiguousCaptures' doc comment). For those, an INDETERMINATE branch
+// (empty first-rune set — Gap I's inverted-class signal, CLAUDE.md
+// "Load-bearing engine-selection gates") is still treated as ambiguous; only
+// the disjoint-ness requirement between two otherwise-computable branches is
+// skipped (task 13), since TDFA's LeftmostFirst priority resolves that case
+// correctly regardless of overlap.
+func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop bool) bool {
 	if altPC >= len(prog.Inst) {
 		return false
 	}
@@ -492,7 +526,11 @@ func isAlternationDeterministic(prog *syntax.Prog, altPC int) bool {
 	rightRunes := getFirstRuneSet(prog, int(alt.Arg))
 
 	if len(leftRunes) == 0 || len(rightRunes) == 0 {
-		return false // can't determine first chars for at least one branch
+		return false // can't determine first chars for at least one branch — ambiguous even for quantifier loops (Gap I)
+	}
+
+	if quantifierLoop {
+		return true // both sides computable; overlap alone doesn't matter for a greedy loop (task 13)
 	}
 
 	for r := range leftRunes {
