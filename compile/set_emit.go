@@ -716,7 +716,6 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		return Compile(cfg.Regexps, 0, standalone, CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,
 			MaxTDFARegs:  cfg.MaxTDFARegs,
-			LikelyMode:   resolveLikelyMode(cfg.LikelyMode),
 		})
 	}
 
@@ -728,7 +727,6 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	opts := CompileOptions{
 		MaxDFAStates: cfg.MaxDFAStates,
 		MaxTDFARegs:  cfg.MaxTDFARegs,
-		LikelyMode:   resolveLikelyMode(cfg.LikelyMode),
 	}
 	if !standalone {
 		opts.tableMemIdx = 1
@@ -801,9 +799,9 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 			PatternIDs: globalIDs,
 		}
 		setOpts := CompileSetOptions{
-			// Set-level LikelyMode precedence: set > global > neutral.
+			// Set-level LikelyMode precedence: set hints > neutral.
 			// Used by H.3 (frontend density gate).
-			LikelyMode: resolveLikelyMode(sc.LikelyMode, cfg.LikelyMode),
+			LikelyMode: resolveHints(sc.Hints),
 		}
 		if !standalone {
 			setOpts.TableMemIdx = 1

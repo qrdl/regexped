@@ -1211,21 +1211,23 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 
 // compileSetMode compiles tc.setPatterns as a regexped set under the given
 // LikelyMode and returns standalone WASM exporting find_all. The mode is
-// applied at the global config level — H.1 plumbing routes it through both
-// per-pattern (effective default) and per-set (frontend hint) fallbacks.
+// applied via the set's own `hints:` field — the set's resolveHints(sc.Hints)
+// call is what actually consumes it (H.3 frontend density gate); none of
+// these entries carry their own _func fields, so there is no per-pattern
+// fallback to plumb.
 func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	entries := make([]config.RegexEntry, len(tc.setPatterns))
 	for i, p := range tc.setPatterns {
 		entries[i] = config.RegexEntry{Pattern: p}
 	}
 	cfg := config.BuildConfig{
-		Regexps:    entries,
-		LikelyMode: likelyModeYAML(mode),
+		Regexps: entries,
 		Sets: []config.SetConfig{
 			{
 				Name:     "bench_set",
 				FindAll:  "find_all",
 				Patterns: config.PatternSelector{All: true},
+				Hints:    hintsYAML(mode),
 			},
 		},
 	}
@@ -1234,17 +1236,17 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	return wasm, err
 }
 
-// likelyModeYAML maps the compile.LikelyMode enum back to its YAML string form
-// so compileSetMode can stuff it into a BuildConfig field. Empty string ⇒
+// hintsYAML maps the compile.LikelyMode enum back to its YAML `hints:` list
+// form so compileSetMode can stuff it into a SetConfig field. Nil ⇒
 // caller-side neutral default.
-func likelyModeYAML(m compile.LikelyMode) string {
+func hintsYAML(m compile.LikelyMode) []string {
 	switch m {
 	case compile.LikelyMatch:
-		return "match"
+		return []string{"prefer-match"}
 	case compile.LikelyNoMatch:
-		return "nomatch"
+		return []string{"prefer-no-match"}
 	}
-	return ""
+	return nil
 }
 
 // benchTime times benchIters calls via the WASM shim and returns the p50 of

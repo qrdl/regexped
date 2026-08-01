@@ -809,17 +809,16 @@ func testSetBlock(
 	for i, e := range eligible {
 		regexps[i] = config.RegexEntry{Pattern: e.entry.pattern}
 	}
-	likelyMode := ""
+	var hints []string
 	if likelyMatch {
-		likelyMode = "match"
+		hints = []string{"prefer-match"}
 	} else if likelyNoMatch {
-		likelyMode = "nomatch"
+		hints = []string{"prefer-no-match"}
 	}
 	cfg := config.BuildConfig{
-		Regexps:    regexps,
-		LikelyMode: likelyMode,
+		Regexps: regexps,
 		Sets: []config.SetConfig{
-			{Name: "test", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "test", FindAll: "find_all", Patterns: config.PatternSelector{All: true}, Hints: hints},
 		},
 	}
 

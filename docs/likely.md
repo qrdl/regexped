@@ -67,10 +67,38 @@ your own sample data — see `tools/pattest/Makefile` for runnable examples.
 
 ## How to set the hint
 
-> **Gap (see *Known gaps* §1):** there is currently no per-pattern YAML field
-> and no CLI flag to set `LikelyMode`. The hint is reachable only from Go code
-> via `compile.CompileOptions`. End users invoking `regexped compile` cannot
-> activate `LikelyMatch` or `LikelyNoMatch`.
+**YAML config:** both `regexps:` entries and `sets:` entries accept a
+`hints:` list. The only accepted values are `prefer-match` (→ `LikelyMatch`)
+and `prefer-no-match` (→ `LikelyNoMatch`); they are mutually exclusive
+(both in the same list is a config-load error). An absent or empty `hints:`
+resolves to `LikelyNeutral`.
+
+```yaml
+regexps:
+  - pattern: 'AKIA[A-Z0-9]{16}'
+    match_func: aws_key_match
+    hints: [prefer-match]
+
+sets:
+  - name: creds
+    find_all: creds_find_all
+    patterns: "all"
+    hints: [prefer-no-match]
+```
+
+Precedence is per-pattern only for a pattern's own compiled body (there is
+no enclosing-set or global fallback): a `regexps:` entry's `hints:` governs
+its own `match_func`/`find_func`/`groups_func`/`named_groups_func` bodies.
+A `sets:` entry's `hints:` governs that set's frontend/suffix-body
+optimisation choices (H.3 density gate, H.2 suffix bulk-skip) — it is
+*not* inherited by the member patterns' own directly-exported bodies.
+There is no global default any more; each entry that wants a non-neutral
+hint must set its own `hints:`.
+
+> **Gap (see *Known gaps* §1):** there is still no CLI flag to set
+> `LikelyMode` — `regexped compile` has no `--likely-match` /
+> `--likely-no-match` flag. The hint is YAML-only (`hints:`) or, for direct
+> Go callers, via `compile.CompileOptions`.
 
 **Programmatic (Go):**
 
@@ -468,14 +496,16 @@ captures — see *the find-wrapper mechanism* above.
 ## Sets support
 
 `LikelyMode` is fully propagated to set compilation ([plans/LIKELY.md](../plans/LIKELY.md)
-Gap H, all three sub-tasks shipped 2026-06-26/2026-07-08). Three independent
-hint layers, same precedence chain as the no-sets path (pattern → enclosing
-set → global default → `LikelyNeutral`):
+Gap H, all three sub-tasks shipped 2026-06-26/2026-07-08). Two independent
+hint layers, each resolved from its own `hints:` field with no fallback
+between them (no enclosing-set or global default, since 2026-08-01 — see
+Known gaps §1):
 
-- **`config.RegexEntry.LikelyMode`** (per-pattern) and **`config.SetConfig.LikelyMode`**
-  (per-set), resolved by `CompileFile` for both the per-pattern suffix-DFA
-  bodies and the set frontend
-  ([compile/set_emit.go:719,731,806](../compile/set_emit.go)).
+- **`config.RegexEntry.Hints`** (per-pattern) governs that pattern's own
+  compiled body — resolved unconditionally inside `compilePattern`. **
+  `config.SetConfig.Hints`** (per-set) governs the set frontend and
+  suffix-body bulk-skip decisions — resolved by `CompileFile`
+  ([compile/set_emit.go:804](../compile/set_emit.go#L804)).
 - **Set frontend** (Teddy/AC/Shufti/scalar selection over the union of
   literal prefixes): set-level `LikelyNoMatch` force-selects Shufti for a
   17..64-byte first-byte union that would otherwise fall back to scalar
@@ -778,30 +808,32 @@ function/field if they've moved again.*
 
 ## Known gaps
 
-### 1. No CLI flag to set the hint (corrected 2026-07-08 — the YAML field already shipped)
+### 1. No CLI flag to set the hint (corrected 2026-07-08 — the YAML field already shipped; syntax changed to `hints:` 2026-08-01)
 
 An earlier version of this doc claimed there was no user-facing way to set
 `LikelyMode` at all. That's stale — sub-task H.1 from
 [plans/LIKELY.md](../plans/LIKELY.md) (Gap H — Sets) has already shipped,
-verified directly against the code (2026-07-08): `config.RegexEntry`,
-`config.SetConfig`, and `config.BuildConfig` all have a `likely_mode` YAML
-field ([config/config.go](../config/config.go), lines 26/44/208), validated
-by `ValidLikelyMode`/`validateLikelyModes`, and resolved via the
-`resolveLikelyMode` precedence chain (pattern → enclosing set → global
-default → `LikelyNeutral`) in both `CmdCompile`
-([compile/compile.go:1597](../compile/compile.go#L1597)) and `CompileFile`'s
-per-pattern and per-set loops
-([compile/set_emit.go:719,731,806](../compile/set_emit.go)). The
-per-pattern override also applies inside `compilePattern` itself
-([compile/compile.go:414](../compile/compile.go#L414)) unconditionally — so it
-works for direct `compile.Compile()` callers too, not just YAML-driven
-`CmdCompile`, as long as the caller populates `RegexEntry.LikelyMode`.
+verified directly against the code: `config.RegexEntry` and
+`config.SetConfig` each have a `hints:` YAML field
+([config/config.go](../config/config.go)), a `[]string` accepting
+`"prefer-match"` or `"prefer-no-match"` (mutually exclusive), validated by
+`ValidHints`/`validateHints`, and resolved via the `resolveHints` precedence
+helper in `compilePattern`
+([compile/compile.go:411](../compile/compile.go#L411), per-pattern,
+unconditional) and in `CompileFile`'s per-set loop
+([compile/set_emit.go:804](../compile/set_emit.go#L804), set-level only).
+There is no global config-level default and no enclosing-set fallback for a
+pattern's own compiled body — each entry that wants a non-neutral hint sets
+its own `hints:`. (2026-08-01: the field was renamed from the earlier
+`likely_mode: match|nomatch|neutral` scalar to `hints: [prefer-match]` /
+`hints: [prefer-no-match]`, and the top-level `BuildConfig`-wide default was
+removed entirely — see *How to set the hint* above.)
 
 What's genuinely still missing: **no CLI flag.** `regexped compile` accepts
 no `--likely-match` / `--likely-no-match` flag — the hint is YAML-only
-(`likely_mode: match|nomatch|neutral` in the config file). For a tool whose
-primary interface is YAML config rather than ad-hoc CLI flags, this is a
-narrow gap, not the "no user-facing way at all" originally claimed.
+(`hints:` in the config file). For a tool whose primary interface is YAML
+config rather than ad-hoc CLI flags, this is a narrow gap, not the "no
+user-facing way at all" originally claimed.
 
 ### 2. `Action 5` doesn't match the original LNM.md spec
 
@@ -883,11 +915,12 @@ hints worked but sub-task H.2's suffix-body bulk-skip didn't consume its
 per-pattern hint yet. Both claims are now stale — verified directly
 against the code:
 
-- `CompileFile` reads `cfg.LikelyMode`, `sc.LikelyMode` (per-set), and
-  `re.LikelyMode` (per-pattern) and resolves all three through the same
-  precedence chain as the no-sets path
-  ([compile/set_emit.go:719,731,806](../compile/set_emit.go)) — sub-task
-  H.1 from [plans/LIKELY.md](../plans/LIKELY.md) Gap H.
+- `CompileFile` reads `sc.Hints` (per-set) and `re.Hints` (per-pattern,
+  consumed unconditionally inside `compilePattern` itself) and resolves each
+  via `resolveHints`/`parseHints`
+  ([compile/set_emit.go:804](../compile/set_emit.go#L804)) — sub-task
+  H.1 from [plans/LIKELY.md](../plans/LIKELY.md) Gap H. (2026-08-01: there is
+  no longer a global `cfg`-level hint to fold in — see Known gaps §1.)
 - The per-pattern suffix-DFA bodies (compiled via the same `compilePattern`
   as non-set patterns) get their own hint correctly.
 - The **set frontend** (Teddy/AC/Shufti/scalar selection over the union of
@@ -951,15 +984,15 @@ no a priori reason to expect it moved these numbers either way.
 An earlier version of this doc claimed a single `compile.Compile` invocation
 applies one `LikelyMode` to every entry, forcing users with mixed
 match-heavy/no-match-heavy patterns to split them across multiple `Compile`
-calls. That's stale — sub-task H.1 shipped: `config.RegexEntry.LikelyMode`
+calls. That's stale — sub-task H.1 shipped: `config.RegexEntry.Hints`
 lets each pattern carry its own hint, and `compilePattern` applies it
-unconditionally ([compile/compile.go:414](../compile/compile.go#L414)) — this
+unconditionally ([compile/compile.go:411](../compile/compile.go#L411)) — this
 runs for *every* caller of `compilePattern`, including direct
 `compile.Compile()` callers who never go through YAML/`CmdCompile` at all,
-as long as they populate `RegexEntry.LikelyMode` on each entry.
+as long as they populate `RegexEntry.Hints` on each entry.
 `CompileOptions.LikelyMode` remains a single per-call value, but it's now
 correctly just the *fallback default* for entries that don't set their own
-`LikelyMode` — not a hard per-call ceiling. For sets, the dual-level design
+`Hints` — not a hard per-call ceiling. For sets, the dual-level design
 (per-pattern + per-set hints, both live — see gap #4 above) lets the set
 frontend and per-pattern suffix bodies pick independently, closing the
 "mixed-priority sets" motivating case too — including the suffix-body

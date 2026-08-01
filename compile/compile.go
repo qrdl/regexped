@@ -69,32 +69,29 @@ func (m LikelyMode) String() string {
 	}
 }
 
-// parseLikelyMode converts the YAML string form into a LikelyMode value and a
-// "set" flag indicating whether the input was non-empty (i.e. the caller
-// expressed an explicit choice). Unknown strings are rejected at config load
-// (config.ValidLikelyMode), so we treat anything other than the four valid
-// forms here as LikelyNeutral defensively.
-func parseLikelyMode(s string) (mode LikelyMode, set bool) {
-	switch s {
-	case "":
-		return LikelyNeutral, false
-	case "match":
-		return LikelyMatch, true
-	case "nomatch":
-		return LikelyNoMatch, true
-	case "neutral":
-		return LikelyNeutral, true
+// parseHints converts the YAML `hints:` list form into a LikelyMode value and
+// a "set" flag indicating whether the list expressed an explicit choice.
+// Unknown/contradictory hints are rejected at config load (config.ValidHints),
+// so we treat anything else here as unset defensively.
+func parseHints(hints []string) (mode LikelyMode, set bool) {
+	for _, h := range hints {
+		switch h {
+		case "prefer-match":
+			return LikelyMatch, true
+		case "prefer-no-match":
+			return LikelyNoMatch, true
+		}
 	}
 	return LikelyNeutral, false
 }
 
-// resolveLikelyMode applies the LikelyMode precedence chain. The first
-// non-empty entry wins; an empty trailing fallback resolves to LikelyNeutral.
-// Order is significant — pass strings in highest-priority-first order
-// (typically pattern, then enclosing set, then global default).
-func resolveLikelyMode(chain ...string) LikelyMode {
-	for _, s := range chain {
-		if mode, set := parseLikelyMode(s); set {
+// resolveHints applies the hints precedence chain. The first entry expressing
+// an explicit choice wins; if none do, resolves to LikelyNeutral. Order is
+// significant — pass hint lists in highest-priority-first order (typically
+// pattern, then enclosing set).
+func resolveHints(chain ...[]string) LikelyMode {
+	for _, hints := range chain {
+		if mode, set := parseHints(hints); set {
 			return mode
 		}
 	}
@@ -406,12 +403,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		return &compiledPattern{tableEnd: tableBase}, nil
 	}
 
-	// Per-pattern LikelyMode (from YAML) overrides whatever the caller passed
-	// in buildOpts.LikelyMode. The caller is expected to have already folded
-	// the global default into buildOpts.LikelyMode (e.g. CmdCompile does this
-	// from cfg.LikelyMode), so the precedence resolves to pattern > caller's
-	// effective default. See plans/LIKELY.md gap H.1.
-	if mode, set := parseLikelyMode(re.LikelyMode); set {
+	// Per-pattern hints (from YAML `hints:`) override whatever the caller
+	// passed in buildOpts.LikelyMode, so the precedence resolves to
+	// pattern > caller's default. See plans/LIKELY.md gap H.1.
+	if mode, set := parseHints(re.Hints); set {
 		buildOpts.LikelyMode = mode
 	}
 
@@ -1573,13 +1568,13 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
 		}
 		// LM-2: batch find/groups exports, gated on this pattern's effective
-		// LikelyMode (per-pattern YAML override takes precedence over opts,
-		// same precedence chain compilePattern itself applies — see
+		// LikelyMode (per-pattern hints take precedence over opts, same
+		// precedence chain compilePattern itself applies — see
 		// plans/LIKELY.md Gap H.1). v1 scope: find_func always eligible;
 		// groups_func only for the non-anchored (composed find+capture)
 		// shape — see the compiledPattern field doc.
 		effMode := opts.LikelyMode
-		if m, set := parseLikelyMode(re.LikelyMode); set {
+		if m, set := parseHints(re.Hints); set {
 			effMode = m
 		}
 		if effMode == LikelyMatch {
@@ -1626,7 +1621,6 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 		compOpts := CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,
 			MaxTDFARegs:  cfg.MaxTDFARegs,
-			LikelyMode:   resolveLikelyMode(cfg.LikelyMode),
 		}
 		standalone := cfg.Output == ""
 		var err error
