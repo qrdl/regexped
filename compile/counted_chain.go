@@ -201,15 +201,43 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 			bytesInChunk = 16
 		}
 
-		// chunk = v128.load(ptr + start + chunkOff)
-		b = append(b, 0x20, paramPtr, 0x20, paramStart, 0x6A)
-		if chunkOff > 0 {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(chunkOff))
-			b = append(b, 0x6A)
+		if bytesInChunk == 16 {
+			// Full chunk: chunkOff+16 <= n <= endPos <= len (checked above),
+			// so this load can never cross the verified boundary.
+			// chunk = v128.load(ptr + start + chunkOff)
+			b = append(b, 0x20, paramPtr, 0x20, paramStart, 0x6A)
+			if chunkOff > 0 {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(chunkOff))
+				b = append(b, 0x6A)
+			}
+			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+			b = append(b, 0x21, lChunk)
+		} else {
+			// Final partial chunk (n % 16 != 0): a plain 16-byte v128.load
+			// here would read up to 15 bytes past endPos, which can be
+			// outside valid memory even though endPos <= len holds — the
+			// bytes past endPos aren't guaranteed to exist. Build the chunk
+			// lane-by-lane from bytesInChunk individual scalar loads
+			// instead; each load address is < endPos <= len, so it's always
+			// in bounds. Unfilled lanes stay zero and are masked off below.
+			b = append(b, 0xFD, 0x0C) // v128.const 0
+			b = append(b, make([]byte, 16)...)
+			b = append(b, 0x21, lChunk)
+			for j := 0; j < bytesInChunk; j++ {
+				b = append(b, 0x20, lChunk) // local.get chunk
+				b = append(b, 0x20, paramPtr, 0x20, paramStart, 0x6A)
+				byteOff := chunkOff + j
+				if byteOff > 0 {
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, int32(byteOff))
+					b = append(b, 0x6A)
+				}
+				b = append(b, 0x2D, 0x00, 0x00)    // i32.load8_u align=0 offset=0
+				b = append(b, 0xFD, 0x17, byte(j)) // i8x16.replace_lane j
+				b = append(b, 0x21, lChunk)        // local.set chunk
+			}
 		}
-		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-		b = append(b, 0x21, lChunk)
 
 		b = emitShuftiPrefixCheck(b, class, lChunk) // → i32 bitmask, bit k = lane k is a class member
 
@@ -242,7 +270,7 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 		b = utils.AppendSLEB128(b, int32(prefixMaxLen))
 		b = append(b, 0x6A, 0x36, 0x02, 0x08) // matchLength = (endPos - lPos) + prefixMaxLen
 	} else {
-		b = append(b, 0x20, lOutBase, 0x20, paramLPos, 0x36, 0x02, 0x04)                     // matchStart = lPos
+		b = append(b, 0x20, lOutBase, 0x20, paramLPos, 0x36, 0x02, 0x04)                      // matchStart = lPos
 		b = append(b, 0x20, lOutBase, 0x20, lEndPos, 0x20, paramLPos, 0x6B, 0x36, 0x02, 0x08) // matchLength = endPos - lPos
 	}
 

@@ -164,8 +164,9 @@ while (true) {
 Each slot entry is a 4-byte `i32`, so consecutive groups are at `slots + 0`,
 `slots + 4`, `slots + 8`, etc.
 
-> **Warning:** the slot buffer is **static and overwritten on each call**. Read all
-> slot values before calling the same function again.
+> **Warning:** the slot buffer is **static and overwritten on each call**, and is
+> **not thread-safe** — concurrent calls on the same module instance will race
+> on the buffer. Read all slot values before calling the same function again.
 
 ---
 
@@ -177,6 +178,32 @@ returns an error if this field is set.
 Use `groups_func` instead and access groups by their numeric index. Named groups keep
 their original order in the pattern, so the mapping from name to index is stable and
 known at compile time.
+
+---
+
+## Sets
+
+When the config has a `sets:` block, the generator also emits, per set (see
+[sets.md](sets.md) for the full config schema and wire format):
+
+```ts
+class SetMatch { constructor(public patternId: i32, public start: i32, public end: i32) {} }
+class SetAnchorMatch { constructor(public patternId: i32, public end: i32) {} }
+
+export function <find_all>_next(input: ArrayBuffer): SetMatch | null
+export function <find_all>_reset(): void
+
+export function <find_any>(input: ArrayBuffer): SetMatch | null
+export function <match>(input: ArrayBuffer): SetAnchorMatch | null
+
+// only if any set in the config sets emit_name_map: true
+export function patternName(id: i32): string
+```
+
+`<find_all>_next` streams non-overlapping matches from an internal static
+buffer, refilling it from WASM as needed; call `<find_all>_reset()` before
+starting a new scan over different input. `patternName` is a single shared
+lookup across every set in the config that requested `emit_name_map: true`.
 
 ---
 

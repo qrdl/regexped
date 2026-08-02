@@ -1567,24 +1567,28 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 		if err != nil {
 			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
 		}
-		// LM-2: batch find/groups exports, gated on this pattern's effective
-		// LikelyMode (per-pattern hints take precedence over opts, same
-		// precedence chain compilePattern itself applies — see
-		// plans/LIKELY.md Gap H.1). v1 scope: find_func always eligible;
+		// LM-2 batch find/groups export trigger — DISABLED 2026-08-02,
+		// parked pending plans/TODO.md task 44 (see that entry for why and
+		// for exact revert instructions). Uncomment to restore: this was the
+		// sole trigger for batchFindExport/batchGroupsExport, gated on this
+		// pattern's effective LikelyMode (per-pattern hints take precedence
+		// over opts, same precedence chain compilePattern itself applies —
+		// see plans/LIKELY.md Gap H.1). v1 scope: find_func always eligible;
 		// groups_func only for the non-anchored (composed find+capture)
 		// shape — see the compiledPattern field doc.
-		effMode := opts.LikelyMode
-		if m, set := parseHints(re.Hints); set {
-			effMode = m
-		}
-		if effMode == LikelyMatch {
-			if p.findExport != "" {
-				p.batchFindExport = p.findExport + "_batch"
-			}
-			if p.groupsExport != "" && !p.anchored {
-				p.batchGroupsExport = p.groupsExport + "_batch"
-			}
-		}
+		//
+		// effMode := opts.LikelyMode
+		// if m, set := parseHints(re.Hints); set {
+		// 	effMode = m
+		// }
+		// if effMode == LikelyMatch {
+		// 	if p.findExport != "" {
+		// 		p.batchFindExport = p.findExport + "_batch"
+		// 	}
+		// 	if p.groupsExport != "" && !p.anchored {
+		// 		p.batchGroupsExport = p.groupsExport + "_batch"
+		// 	}
+		// }
 		compiled = append(compiled, p)
 		if p.tableEnd > cur {
 			cur = utils.PageAlign(p.tableEnd)

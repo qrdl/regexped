@@ -1,6 +1,10 @@
 package compile
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/qrdl/regexped/config"
+)
 
 func TestFindAltLitAnchorPoints(t *testing.T) {
 	t.Run("accepts_equal_fixed_prefix", func(t *testing.T) {
@@ -73,4 +77,39 @@ func TestFindAltLitAnchorPoints(t *testing.T) {
 			t.Errorf("accepted more than %d branches", maxAltLitAnchorBranches)
 		}
 	})
+}
+
+// TestCompileAltLitAnchorDispatch exercises the full Task 6 v1 pipeline —
+// compileAltLitAnchorBranches, buildAltLitAnchorFindBody, and
+// compiledPattern.altLitAnchorBranchFuncIdx (all 0% covered without this) —
+// by compiling a find-only alternation whose branches have an UNBOUNDED
+// suffix (`[^\s]+`). Bounded-suffix branches like the ones
+// TestFindAltLitAnchorPoints uses are caught earlier by Gap E's
+// analyseLitChainAltPrefixed (compile.go), which returns before the
+// alt-lit-anchor block is ever reached; an unbounded suffix isn't a lit-chain
+// shape, so it falls through to this path instead.
+func TestCompileAltLitAnchorDispatch(t *testing.T) {
+	pattern := `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`
+	entry := config.RegexEntry{Pattern: pattern, FindFunc: "f"}
+
+	p, err := compilePattern(entry, 0, 0, CompileOptions{})
+	if err != nil {
+		t.Fatalf("compilePattern: %v", err)
+	}
+	if p.altLitAnchorBranches == nil {
+		t.Fatalf("compilePattern did not take the alt-lit-anchor path for %q", pattern)
+	}
+	if len(p.altLitAnchorBranches) != 3 {
+		t.Fatalf("altLitAnchorBranches: got %d branches, want 3", len(p.altLitAnchorBranches))
+	}
+	// Exercise altLitAnchorBranchFuncIdx for every branch index (i>0 covers
+	// the per-branch offset arithmetic beyond the first pair).
+	for i := range p.altLitAnchorBranches {
+		back, fwd := p.altLitAnchorBranchFuncIdx(i)
+		if fwd != back+1 {
+			t.Errorf("altLitAnchorBranchFuncIdx(%d) = (%d, %d), want fwd == back+1", i, back, fwd)
+		}
+	}
+
+	mustCompileEntries(t, []config.RegexEntry{entry})
 }

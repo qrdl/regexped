@@ -26,6 +26,8 @@ regexps:
     groups_func:       "url_groups"        # anchored match with all capture groups
     named_groups_func: "url_named_groups"  # anchored match with named capture groups
 
+    hints: [prefer-match]   # optional; biases this pattern's emitted code shape (see below)
+
 sets:
   - name: "my_set"             # unique set name
     find_all: "scan_all"       # non-anchored: all matches, streamed in batches
@@ -33,6 +35,7 @@ sets:
     match: "validate"          # anchored at position 0 (optional)
     emit_name_map: true        # emit patternName(id) lookup helper in stubs
     patterns: all              # "all" or list of name: values from regexps:
+    hints: [prefer-no-match]   # optional; per-set default, see below
 ```
 
 All paths in the config file are resolved relative to the config file's directory.
@@ -46,6 +49,26 @@ Setting `groups_func` or `named_groups_func` triggers capture-tracking compilati
 Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
+
+### `hints:` — LikelyMode compile hints
+
+Both `regexps:` entries and `sets:` entries accept an optional `hints:` list
+that biases which code-shape optimisation the compiler favours for that
+pattern (or set): `[prefer-match]` (bias for fast-accept) or
+`[prefer-no-match]` (bias for fast-reject). The two are mutually exclusive;
+an absent or empty `hints:` list keeps the default (`LikelyNeutral`)
+behaviour. The hint never affects match correctness — only which
+optimisation path is emitted.
+
+A pattern's own `hints:` takes precedence over its enclosing set's `hints:`
+(and a set's own suffix-body compilation falls back to its `hints:` when a
+member pattern doesn't set its own). Setting `hints: [prefer-match]` on a
+`regexps:` entry also adds a `<func>_batch` WASM export for `find_func` and
+non-anchored `groups_func`, which the generated JS stub automatically
+prefers to reduce host↔WASM call overhead.
+
+See [likely.md](likely.md) for the full mechanism, per-mode effects, and
+task history.
 
 ### Pattern support
 
@@ -113,7 +136,7 @@ Generates a stub file (Rust, JS, TypeScript, Go, or C) from the config. The stub
 |---|---|
 | `stub_file` | Required unless `--output` is given |
 | `stub_type` or `stub_file` extension | Determines output language |
-| `import_module` | Required for Rust, Go, C, and AS stubs |
+| `import_module` | Required for Rust, Go, C, and AS stubs; validated upfront |
 
 #### Rust stubs
 
@@ -252,6 +275,7 @@ sets:
 | `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
 | `batch_size` | No | Output buffer hint for stub iterators (default 256) |
 | `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
+| `hints` | No | `[prefer-match]` or `[prefer-no-match]`; per-set LikelyMode default — see [`hints:`](#hints--likelymode-compile-hints) above |
 
 The `name:` field on `regexps:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
 

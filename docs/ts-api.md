@@ -1,6 +1,6 @@
 # Generated TypeScript API
 
-Regexped generates a TypeScript ES module stub that loads a compiled WASM regexp module and exports typed wrapper functions. The TypeScript stub is identical in behaviour to the JavaScript stub but adds full type annotations.
+Regexped generates a TypeScript ES module stub that loads a compiled WASM regexp module and exports typed wrapper functions. The TypeScript stub matches the JavaScript stub's external API and behaviour, with one internal exception noted in [Notes](#notes) below (JS's `find_func`/`groups_func` generators have an internal fast path the TS stub doesn't yet have).
 
 ## Including stubs in your project
 
@@ -163,4 +163,4 @@ Generated export names match the config field values exactly (no case conversion
 - `init()` must be awaited before calling any matcher. Calling a matcher before `init()` will throw.
 - The stub is designed for ES module environments (browser, Node.js with `"type": "module"`, Cloudflare Workers, Deno).
 - `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. The stub is not re-entrant: do not call two generators concurrently on the same stub module instance.
-- The TypeScript stub and the JavaScript stub are generated from the same template; the only differences are the type annotations on `init`, `_mem`, `_exp`, and each exported function signature.
+- The TypeScript and JavaScript stubs are independent generators (`generate/ts_stub.go` / `generate/js_stub.go`) that produce the same external API, typed vs. untyped. One current internal difference: the JS stub's `find_func`/`groups_func` generators auto-detect and drain an internal `<func>_batch` WASM export (present when the pattern was compiled with `hints: [prefer-match]`) to reduce host↔WASM call overhead — the TS stub does not yet do this and always issues one call per match. This has no effect on the output shape, only on call overhead under `prefer-match`.

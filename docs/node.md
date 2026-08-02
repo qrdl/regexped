@@ -24,7 +24,7 @@ regexped compile --config=regexped.yaml   # → urls.wasm
 regexped generate --config=regexped.yaml  # → regexp.ts
 ```
 
-See [`examples/node/Makefile`](../examples/node/Makefile) for a complete Makefile.
+See [`examples/node/domain-extract/Makefile`](../examples/node/domain-extract/Makefile) for a complete Makefile (`examples/node/Makefile` itself just dispatches into each subdirectory's own Makefile).
 
 ## Usage
 
@@ -53,4 +53,32 @@ node --experimental-strip-types main.ts
 npx tsx main.ts
 ```
 
-See [`examples/node/`](../examples/node/) for the complete example.
+See [`examples/node/domain-extract/`](../examples/node/domain-extract/) for the complete example above (a single pattern with `named_groups_func`).
+
+## Set composition example
+
+[`examples/node/sql-validator/`](../examples/node/sql-validator/) demonstrates the `sets:` composition feature instead — classifying SQL statements by which of four patterns matches, via an anchored `match` set with `emit_name_map: true`:
+
+```yaml
+regexps:
+  - name: "select"
+    pattern: 'SELECT\s+.+\s+FROM\s+\w[\w.]*(\s+.*)?'
+  # ... insert, update, delete
+
+sets:
+  - name: "sql"
+    match: "validate_sql"
+    emit_name_map: true
+    patterns: ["select", "insert", "update", "delete"]
+```
+
+```ts
+import { init, validate_sql, patternName } from './stubs.ts';
+
+const m = validate_sql(sql);
+if (m) {
+    console.log(`${patternName(m.patternId)}: ${sql}`);
+}
+```
+
+See [sets.md](sets.md) for the full `sets:` schema and output format.

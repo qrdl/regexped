@@ -211,7 +211,7 @@ func genJSFindFunc(funcName string) string {
 	return fmt.Sprintf(`// %[1]s — yields [start, end] for each non-overlapping match.
 export function* %[1]s(input) {
     const b = _b(input);
-    if (typeof _exp['%[1]s_batch'] === 'function') {
+    if (false && typeof _exp['%[1]s_batch'] === 'function') { // DISABLED 2026-08-02, plans/TODO.md task 44 — remove "false && " to restore
         _resize(b.length, %[2]d * 8);
         _mem.set(b, _inBase);
         const outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
@@ -262,7 +262,7 @@ func genJSGroupsFunc(funcName string, numGroups int) string {
 // Index 0 is the full match.
 export function* %[1]s(input) {
     const b = _b(input);
-    if (typeof _exp['%[1]s_batch'] === 'function') {
+    if (false && typeof _exp['%[1]s_batch'] === 'function') { // DISABLED 2026-08-02, plans/TODO.md task 44 — remove "false && " to restore
         _resize(b.length, %[2]d * %[4]d);
         _mem.set(b, _inBase);
         const outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);

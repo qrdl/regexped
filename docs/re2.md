@@ -20,9 +20,12 @@ make test             # from tools/re2test/
 
 Test data is unpacked automatically from the Go standard library.
 
-The `test` target chains four single-pattern sub-targets — `exhaustive`, `custom`,
-`adjusted`, and `force-backtrack` — plus `sets`, which exercises the multi-pattern
-composition pipeline described in [sets.md](sets.md).
+The `test` target chains seven single-pattern sub-targets — `exhaustive`, `custom`,
+`adjusted`, `force-backtrack`, `likelymatch`, `likelynomatch`, and
+`force-backtrack-likelynomatch` (the last three re-run the corpus under each
+`LikelyMode` to verify the mode never changes match correctness, only emitted
+code shape — see [likely.md](likely.md)) — plus `sets`, which exercises the
+multi-pattern composition pipeline described in [sets.md](sets.md).
 
 ---
 
@@ -77,7 +80,9 @@ verifies both the match end position and all capture slot positions.
 Examples of patterns handled by TDFA:
 - `(?P<scheme>https?)://(?P<host>[^/:?#]+)...` — disjoint scheme alternatives
 - `(\d{4})-(\d{2})-(\d{2})` — date capture with fixed delimiters
-- `(GET|POST|PUT):\s+(.+)` — keyword alternatives with disjoint first bytes
+- `([a-z]+)(er)([a-z]+)` — a quantifier loop whose exit overlaps its own
+  class no longer disqualifies TDFA on its own (task 13, 2026-08-01); see
+  [engines.md](engines.md#engine-selection)
 
 ### Backtracking (~267K passing, via `--validate-groups`)
 
@@ -99,9 +104,11 @@ match), not Perl semantics (shortest match), while keeping all matching logic
 inside WASM.
 
 Examples of patterns handled by Backtracking:
-- `(a|ab)c` — overlapping alternation branches
-- `(a+)(a+)` — adjacent greedy quantifiers
-- `(.*)(foo)(.*)` — greedy capture consuming into next group
+- `<([^>]+)>` — the loop's exit branch has an indeterminate first-byte set
+  (inverted class wider than 256 codepoints), which stays ambiguous
+  regardless of the task 13 quantifier-loop relaxation
+- `(.*)(foo)(.*)` — greedy capture consuming into next group (same
+  indeterminate-branch reason: `.` can't be resolved to a finite first-byte set)
 
 ### Sets (`make sets`)
 
@@ -116,8 +123,11 @@ runner:
    per-pattern matches expected by columns 4 / 1 of the RE2 test format.
 
 This exercises all set frontends — SIMD Teddy (≤ 16 literals), Aho-Corasick
-(17–32 literals), and the scalar DFA fallback — together with bucket dispatch
-and the isolated-fallback path for non-greedy patterns. Set tests currently run
+(17+ literals, capped by automaton node count rather than literal count),
+SIMD Shufti (density/hint-selected first-byte prefilter), and the scalar DFA
+fallback — together with bucket dispatch and the isolated-fallback path for
+non-greedy patterns. See [sets.md](sets.md) for the exact frontend-selection
+rules. Set tests currently run
 clean with **0 failures**.
 
 ---

@@ -14,6 +14,10 @@ Each regexp WASM module exports one or more functions depending on which `_func`
 ;; Anchored groups: writes numGroups*2 i32 slots to out_ptr, returns end position or -1.
 ;; Slots layout: [start0, end0, start1, end1, ...]  (group 0 = full match)
 (func $groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (result i32))
+
+;; Named groups: same ABI and slot layout as $groups above.
+;; The name→slot-index mapping is resolved in the generated host stub, not in WASM.
+(func $named_groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (result i32))
 ```
 
 **Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regexp WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regexp module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
@@ -109,16 +113,17 @@ Find mode appends additional arrays after the base table:
 | Array | Size | Purpose |
 |---|---|---|
 | `midAccept` | `u8[numStates]` | 1 if state is accepting mid-scan |
-| `firstByteFlags` or Teddy tables | varies | fast prefix skip (see below) |
+| `firstByteFlags` or Teddy/Shufti tables | varies | fast prefix skip (see below) |
 | `wordCharTable` | `u8[256]` | `\w` lookup (word-boundary patterns only) |
 | `midAcceptNW`, `midAcceptW` | `u8[numStates]` each | word-boundary variants of midAccept |
+| `midAcceptNL` | `u8[numStates]` | 1 if state accepts immediately before a `\n` byte — multiline `(?m:$)` patterns only |
 
 For TDFA paths (`useAcceptSideTable=true`) only:
 
 | Array | Size | Purpose |
 |---|---|---|
 | `acceptBytes` | `u8[numStates]` | 1 if state is EOF-accepting |
-| `immediateAccept` | `u8[numStates]` | 1 if state requires immediate stop (non-greedy) |
+| `immediateAccept` | `u8[numStates]` | 1 if state is an immediate (leftmost-first) accept — the engine must stop here rather than continue scanning, whether from a non-greedy quantifier or a higher-priority alternation branch completing before a lower-priority one consumes a byte |
 
 DFA paths use `immAcceptLimit` (state-ID partition, `state u<= immAcceptLimit`) instead of a separate `immediateAccept` array.
 
@@ -135,11 +140,17 @@ Applied when the match starts at the scanned position:
 | Strategy | Condition | Description |
 |---|---|---|
 | **Hybrid prefix** | literal prefix ≥ 1 byte | SIMD check for full prefix within a 16-byte window |
+| **4-byte Teddy** | ≤ 8 first bytes, selective 3rd and 4th bytes | nibble tables check bytes 0–3 simultaneously |
 | **3-byte Teddy** | ≤ 8 first bytes, selective 3rd byte | nibble tables check bytes 0, 1, 2 simultaneously |
 | **2-byte Teddy** | ≤ 8 first bytes | nibble tables check bytes 0 and 1 simultaneously |
 | **1-byte Teddy** | 1-byte prefix, multiple candidates | T_lo/T_hi nibble tables |
-| **Multi-eq SIMD** | small first-byte set | `i8x16.eq` + bitmask per candidate |
-| **Scalar** | wide first-byte set | byte-by-byte scan |
+| **Shufti** | 9–16 first bytes (unconditional), or 17–64 (rarity heuristic predicts a win, or `hints: [prefer-no-match]` forces it) | nibble-table SIMD set-membership test over the whole candidate set (supersedes an older per-candidate `i8x16.eq`+bitmask emission) |
+| **Scalar** | 0 first bytes, > 64, or a 17–64 set the rarity heuristic predicts scalar wins for | byte-by-byte scan; the 17–64 Shufti path also self-disables back to scalar at runtime if the heuristic guessed wrong and match data turns out denser than expected |
+
+Each Teddy tier promotion (1-byte → 2-byte → 3-byte → 4-byte) additionally
+requires every first-byte candidate's next byte to lead to a state with at
+least one live transition — a candidate that dead-ends right after its
+first byte disqualifies the whole tier (task 43, 2026-07-26).
 
 ### Mandatory literal extraction
 

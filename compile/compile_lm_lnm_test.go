@@ -1366,6 +1366,7 @@ func TestCompileLikelyNoMatch(t *testing.T) {
 // bodies — that shape is out of v1 scope (see the compiledPattern field doc
 // next to batchGroupsExport).
 func TestLM2BatchExportGating(t *testing.T) {
+	t.Skip("LM-2 batch export trigger disabled 2026-08-02, parked pending plans/TODO.md task 44 — remove this Skip when the trigger in compile.go's compileAll is restored")
 	findEntries := []config.RegexEntry{{
 		Pattern:  `x*`,
 		FindFunc: "find_x",

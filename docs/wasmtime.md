@@ -28,6 +28,8 @@ involve `wasm-merge`.
 
 ## Configuration
 
+A simplified illustrative config (see [`rust/url-ipv6/`](../examples/wasmtime/rust/url-ipv6/) below for the actual, more elaborate example this is based on):
+
 ```yaml
 # regexped.yaml
 output:        "final.wasm"      # merged output — triggers embedded mode
@@ -62,7 +64,8 @@ regexped generate --config=regexped.yaml          # → stubs.rs
 cargo build --target wasm32-wasip1 --release      # → target/.../app.wasm
 regexped compile  --config=regexped.yaml          # → regexps.wasm
 regexped merge    --config=regexped.yaml \
-    --main=target/wasm32-wasip1/release/app.wasm  # → final.wasm
+    --main=target/wasm32-wasip1/release/app.wasm \
+    regexps.wasm                                  # → final.wasm
 wasmtime run final.wasm
 ```
 
@@ -112,8 +115,13 @@ Per-language wasmtime examples live under [`examples/wasmtime/`](../examples/was
 | AssemblyScript | [`as/find-email/`](../examples/wasmtime/as/find-email/) | TDFA | Email extraction with `user`/`domain` groups |
 | AssemblyScript | [`as/inject-scanner/`](../examples/wasmtime/as/inject-scanner/) | Set | Injection pattern scanner |
 
-Each example has a `Makefile` that runs the full `generate → host build →
-compile → merge → wasmtime run` pipeline.
+Most examples have a `Makefile` that runs the full `generate → host build →
+compile → merge → wasmtime run` pipeline shown above. `rust/secret-scanner/`
+is the exception: it's a standalone (no `output` field, no merge step)
+example that embeds wasmtime as a library instead — a native `cargo build`
+host binary loads `secrets.wasm` directly via the `wasmtime` crate and runs
+with `cargo run --release`, the same pattern described in
+[Embedding wasmtime as a library](#embedding-wasmtime-as-a-library) above.
 
 ## Related
 

@@ -68,4 +68,26 @@ if regexps::find_xss(p.descr.as_bytes()).next().is_some() {
 
 See [rust-api.md](rust-api.md) for the full Rust API reference.
 
-See [`examples/fastedge/validate/`](../examples/fastedge/validate/) for the complete example.
+See [`examples/fastedge/validate/`](../examples/fastedge/validate/) for the complete example above (individual `match_func`/`find_func` patterns).
+
+## Set composition example: multi-pattern URL filtering
+
+[`examples/fastedge/url-guard/`](../examples/fastedge/url-guard/) demonstrates the `sets:` composition feature instead — scanning a URL against 8 attack-signature patterns (SQL injection, path traversal, XSS, etc.) in one pass via `find_any`:
+
+```yaml
+sets:
+  - name: "attacks"
+    find_any: "scan_url"    # non-anchored: first match only
+    emit_name_map: true      # so pattern_name(id) can name the attack type
+    patterns: all
+```
+
+```rust
+// scan_url stops at the first match — minimal overhead to block.
+if let Some(m) = patterns::scan_url(&url) {
+    let attack = patterns::pattern_name(m.pattern_id);
+    // block, log `attack`, etc.
+}
+```
+
+See [sets.md](sets.md) for the full `sets:` schema and output format.

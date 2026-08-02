@@ -28,7 +28,9 @@ regexps: [p1, p2, ..., pN]
     binPack()              ← merge compatible suffix DFAs within each bucket
             │
             ▼
-    chooseLiteralFrontend() ← Teddy (≤16 literals) or AC (17–32) or scalar
+    chooseLiteralFrontend() ← Teddy (≤16), AC (17+, downgrades to scalar
+                               past a node-count cap), or Shufti (density/
+                               hint-selected prefilter over the scalar path)
             │
             ▼
     assembleModuleWithSets() ← emit WASM: suffix DFAs + set match function
@@ -50,6 +52,7 @@ sets:
     match: validate         # export name for the anchored match function
     batch_size: 256         # output buffer size (stub-gen knob; default 256)
     emit_name_map: true     # emit pattern_name(id) helper in generated stubs
+    hints: [prefer-no-match] # optional; this set's LikelyMode default (see below)
     patterns:
       - aws_key
       - github_pat
@@ -57,6 +60,25 @@ sets:
 ```
 
 At least one of `find_all`, `find_any`, or `match` must be set per entry.
+
+### `hints:` — this set's LikelyMode default
+
+`hints: [prefer-match]` or `hints: [prefer-no-match]` (mutually exclusive)
+biases the set's own compiled code shape — see [likely.md](likely.md) for
+the full mechanism. Concretely, for sets this affects:
+
+- the [literal scan frontend](#literal-scan-frontend) selection below
+  (`prefer-no-match` forces Shufti over scalar for a 17–64-byte first-byte
+  union, regardless of the density heuristic);
+- the [bin-packing](#bin-packing-and-merge-constraints) gate that avoids
+  merging counted-class-chain-eligible patterns together under
+  `prefer-match`.
+
+**Per-pattern `hints:` on individual `regexps:` entries are not consulted
+for patterns placed inside a set** — only the set's own `hints:` field is
+read when compiling set members. A pattern's `hints:` only takes effect
+when that pattern is also compiled standalone (via its own `match_func`/
+`find_func`/`groups_func`/`named_groups_func`).
 
 ## Output tuple formats
 
@@ -170,9 +192,22 @@ suffix DFAs within each group:
 | Max merged DFA table bytes | 64 KB | `budget_bytes` (internal) |
 | Max merged DFA states | 512 | `budget_states` (internal) |
 | Pre-filter (states × combined classes) | 65536 | `budget_states_prefilter` (internal) |
+| Max fallback-bucket DFA states | 1024 | `max_fallback_states` (internal) |
 
 Patterns that cannot be merged (no mandatory literal, literal inside quantifier,
 budget exceeded) route to fallback buckets that scan every input position.
+Under the set's own `hints: [prefer-match]`, two patterns that are each
+individually eligible for the single-pattern counted-class-chain
+optimisation (e.g. `[0-9]{8}`-style bounded class runs) are never merged
+into the same bucket, even if they'd otherwise fit — recorded as conflict
+reason `lm_counted_chain_split` in diagnostics.
+
+**Fallback buckets can drop patterns, not just deprioritize them.** A
+fallback bucket's own merged DFA is still subject to the `max_fallback_states`
+budget above; a pattern that would push it over that limit is skipped
+entirely rather than merged — it does not appear in the set's compiled
+output at all. Check `state_limit_dropped` in diagnostics (see below) to
+find any patterns this happened to.
 
 ## Diagnostics
 
@@ -184,18 +219,45 @@ regexped compile --config=regexped.yaml --diag-json=diag.json
 ```
 
 The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
-`prefix_dedup_pool_size`, and per-set `buckets` and `conflicts` arrays.
+`in_set` (patterns actually placed into a set), `prefix_dedup_pool_size`,
+and per-set `frontend` (`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
+`conflicts`, `capture_bearing_dropped`, and `state_limit_dropped` (patterns
+dropped for exceeding a fallback bucket's state budget — see
+[Bin-packing](#bin-packing-and-merge-constraints) above) arrays.
 
 ## Literal scan frontend
 
 | Condition | Frontend |
 |---|---|
 | 1–16 distinct literals | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch |
-| 17–32 distinct literals | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count; capped at 32 automaton nodes |
-| >32 literals, or no mandatory literals | **Scalar** — position-by-position check |
+| 17+ distinct literals | **Aho-Corasick** attempted first — byte-at-a-time, O(n) regardless of literal count |
+| (AC automaton exceeds 32 trie nodes) | **Scalar** — AC is capped by *automaton node count*, not literal count; a set of 17+ literals sharing no common prefixes can blow past 32 nodes and downgrade, while literals with heavy shared prefixes could in principle stay under the cap well past 32 |
+| No mandatory literal at all | **Scalar** |
 
 For 9–16 literals Teddy uses two groups of 8 (`TwoGroups=true`), ORing the
 results of two independent nibble probes per 16-byte chunk.
+
+### Shufti — SIMD first-byte prefilter for the scalar case
+
+When the frontend would otherwise be scalar (no mandatory literal, or AC
+downgraded per the table above), a fourth frontend — **Shufti** — is
+considered instead of going straight to scalar. It requires:
+
+- **zero fallback buckets** in the set (Shufti can't skip positions that a
+  fallback bucket's full-pattern DFA still has to visit for correctness);
+- the **union of first bytes** across all bucket literals falls in the
+  17–64 range (below 17 it's not worth a dedicated table; above 64 the
+  SIMD membership test itself gets expensive);
+- and then either a **byte-rarity heuristic** predicts Shufti beats scalar
+  for this specific byte set (sum of per-byte rarity scores below a
+  threshold — rare bytes mean scalar can't exit early enough to win), **or**
+  the set's own `hints: [prefer-no-match]` forces Shufti on regardless of
+  what the heuristic predicts.
+
+Shufti tests set membership against the whole first-byte union in one SIMD
+nibble-table lookup, rather than a per-candidate comparison. See
+[likely.md](likely.md) for the full density-heuristic rationale and the
+`hints:` mechanism.
 
 ## Anchored `match` and patterns without a mandatory literal
 

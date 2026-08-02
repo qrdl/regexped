@@ -1332,6 +1332,62 @@ func TestCompileFile_ACFrontend(t *testing.T) {
 	assertDataSectionConsistent(t, wasm)
 }
 
+// TestCompileFile_ShuftiFrontend exercises emitSetMatchFnFinalShufti and
+// litUnionFirstBytes (both 0% covered without this). Reaching the Shufti
+// frontend (LIKELY.md Gap H.3) requires, in order:
+//  1. chooseLiteralFrontend initially picks AC (17+ unique literals);
+//  2. the AC automaton itself exceeds the 32-node cap, so CompileSet
+//     downgrades fe back to frontendScalar (see the "Cap: fall back to
+//     scalar" block in set_emit.go) — 33 literals sharing no common prefix
+//     reliably blows past 32 trie nodes;
+//  3. zero fallback buckets (every pattern has a splittable mandatory
+//     literal, here guaranteed by the unbounded `[a-z]+` suffix);
+//  4. the union of first bytes across all literals falls in [17, 64] — each
+//     pattern here uses a distinct leading byte, so the union is exactly 33;
+//  5. the set-level "prefer-no-match" hint forces Shufti regardless of the
+//     rarity heuristic (Action 5).
+func TestCompileFile_ShuftiFrontend(t *testing.T) {
+	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	n := 33
+	pats := make([]config.RegexEntry, n)
+	for i := range pats {
+		pats[i] = config.RegexEntry{Pattern: fmt.Sprintf("%cq%02dx[a-z]+", alphabet[i], i)}
+	}
+	cfg := config.BuildConfig{
+		Regexps: pats,
+		Sets: []config.SetConfig{
+			{
+				Name:     "s",
+				FindAll:  "find_all",
+				Patterns: config.PatternSelector{All: true},
+				Hints:    []string{"prefer-no-match"},
+			},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile Shufti frontend: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Errorf("invalid WASM magic")
+	}
+	assertDataSectionConsistent(t, wasm)
+}
+
+// TestLitUnionFirstBytes exercises litUnionFirstBytes directly across its
+// documented edge cases: empty literals are skipped, duplicates collapse,
+// and output is sorted.
+func TestLitUnionFirstBytes(t *testing.T) {
+	got := litUnionFirstBytes([][]byte{[]byte("zzz"), {}, []byte("apple"), []byte("ant")})
+	want := []byte{'a', 'z'}
+	if string(got) != string(want) {
+		t.Errorf("litUnionFirstBytes = %v, want %v", got, want)
+	}
+	if got := litUnionFirstBytes(nil); len(got) != 0 {
+		t.Errorf("litUnionFirstBytes(nil) = %v, want empty", got)
+	}
+}
+
 // TestCompileFile_TeddyTwoGroups exercises the TwoGroups path in emitSetMatchFnFinalTeddy.
 // 10 unique 1-byte literals → ≤16, TwoGroups=true.
 func TestCompileFile_TeddyTwoGroups(t *testing.T) {

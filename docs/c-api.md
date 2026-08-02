@@ -35,7 +35,12 @@ included without conflicts:
 ```c
 typedef struct { int start; int end; } rx_match_t;
 typedef struct { int start; int end; const char *name; } rx_group_t;
+typedef struct { int pattern_id; int start; int end; } rx_set_match_t;
+typedef struct { int pattern_id; int end; } rx_set_anchor_t;
 ```
+
+The last two are always emitted alongside the first two, even when the
+config has no `sets:` block — see [Sets](#sets) below.
 
 ---
 
@@ -100,8 +105,8 @@ All entries have `start == -1` and `end == -1` when no match is found starting f
 > return an error. Use `groups_func` and identify groups by their index constants
 > (`<FUNC_UPPER>_GROUP_<NAME>`) instead.
 
-**Group name constants** are declared as `extern const char <FUNC_UPPER>_GROUP_<NAME>[]`
-and defined in `stub.c`. Use `==` (pointer identity) for fast group name comparison:
+**Group name constants** are declared as `extern const char * const <FUNC_UPPER>_GROUP_<NAME>`
+(a pointer variable, not an array) and defined in `stub.c`. Use `==` (pointer identity) for fast group name comparison:
 
 ```c
 for (int i = 0; i < PARSE_URL_GROUPS; i++) {
@@ -134,6 +139,34 @@ while (off <= len) {
 | `find_func` | `rx_match_t <func>(input, len, offset)` | `{start, end}` absolute, or `{-1,-1}` |
 | `groups_func` | `const rx_group_t *<func>(input, len, offset)` | static array of `rx_group_t` |
 | `named_groups_func` | **not supported** — generator returns an error | — |
+
+---
+
+## Sets
+
+When the config has a `sets:` block, the generator also emits, per set (see
+[sets.md](sets.md) for the full config schema and wire format):
+
+```c
+/* find_all: streaming iterator over a static result buffer */
+int <find_all>_next(const char *input, int len, rx_set_match_t *out);
+void <find_all>_reset(void);
+
+/* find_any: single result, or a struct with start<0 if no match */
+int <find_any>(const char *input, int len, rx_set_match_t *out);
+
+/* match: anchored at position 0 */
+int <match>(const char *input, int len, rx_set_anchor_t *out);
+
+/* only if any set in the config sets emit_name_map: true */
+const char *pattern_name(int id);
+```
+
+`<find_all>_next` returns non-overlapping matches one at a time from an
+internal static buffer, refilling it from WASM as needed; call
+`<find_all>_reset()` before starting a new scan over different input.
+`pattern_name` is a single shared lookup across every set in the config
+that requested `emit_name_map: true`, not one per set.
 
 ---
 

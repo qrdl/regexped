@@ -1,6 +1,5 @@
 # Regexped
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/qrdl/regexped)](https://goreportcard.com/report/github.com/qrdl/regexped)
 [![Build](https://github.com/qrdl/regexped/actions/workflows/ci.yml/badge.svg)](https://github.com/qrdl/regexped/actions/workflows/ci.yml)
 [![Scan](https://github.com/qrdl/regexped/actions/workflows/codeql.yml/badge.svg)](https://github.com/qrdl/regexped/actions/workflows/codeql.yml)
 [![codecov](https://codecov.io/github/qrdl/regexped/graph/badge.svg)](https://codecov.io/github/qrdl/regexped)
@@ -17,7 +16,7 @@ Supports RE2/Perl (leftmost-first) semantics. Unicode not yet supported.
 - **DFA engine** — O(n) anchored matching and non-anchored find, word boundary assertions (`\b`, `\B`), byte class compression, SIMD prefix scan (Teddy algorithm)
 - **TDFA engine** — O(n) capture group tracking via Laurikari’s tagged DFA; register-based slot updates on DFA transitions
 - **Backtracking engine** — capture group tracking for non-TDFA-eligible patterns, BitState memoization for O(n) worst-case on zero-matchable loops
-- **Pattern sets** — compile multiple patterns into a single merged DFA; a single `find_all`/`find_any`/`match` call scans for all patterns simultaneously and returns `(pattern_id, start, length)` tuples; SIMD Teddy (≤16 literals) or Aho-Corasick (≤32 literals) literal frontends keep per-byte cost near-constant in set size, with a scalar DFA fallback for sets without mandatory literals
+- **Pattern sets** — compile multiple patterns into a single merged DFA; a single `find_all`/`find_any`/`match` call scans for all patterns simultaneously and returns `(pattern_id, start, length)` tuples; SIMD Teddy (≤16 literals), Aho-Corasick (17+ literals), or a density/hint-selected SIMD Shufti prefilter keep per-byte cost near-constant in set size, with a scalar DFA fallback for sets without mandatory literals
 - Stub generation for **Rust**, **Go** (wasip1), **C**, **JavaScript**, **TypeScript**, and **AssemblyScript** — with iterator/generator support (match, find, groups, named groups)
 - WASM module merging via `wasm-merge` — WASM Component Model support coming soon
 - Configurable via YAML
@@ -117,7 +116,7 @@ See [`examples/README.md`](../examples/README.md) for more details.
 
 Regexped is almost dependency-free. The only compile-time dependency is [`github.com/goccy/go-yaml`](https://github.com/goccy/go-yaml) for YAML config parsing. All regexp compilation, WASM emission, and stub generation are implemented from scratch with no external libraries.
 
-The `wasmtime-go` binding is used only in `tools/re2test/` and `tools/perftest/` testing tools and is not a part of the main tool.
+The `wasmtime-go` binding is used only in the `tools/re2test/`, `tools/perftest/`, `tools/likelytest/`, and `tools/pattest/` testing tools and is not a part of the main tool.
 
 [`wasm-merge`](https://github.com/WebAssembly/binaryen) (from the Binaryen toolkit) is an external binary required only for the `merge` command. It must be installed separately using `get_wasm_merge.sh` shell script.
 

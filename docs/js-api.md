@@ -147,6 +147,26 @@ if (first?.host) {
 
 ---
 
+## Set composition exports
+
+When the config has a `sets:` block, the stub also exports up to three
+functions per set (see [sets.md](sets.md) for the full config schema and
+wire format):
+
+```js
+export function* <find_all>(input): Generator<{patternId: number, start: number, end: number}>
+export function <find_any>(input): {patternId: number, start: number, end: number} | null
+export function <match>(input): {patternId: number, start: number, end: number} | null
+export function patternName(id): string   // only if any set sets emit_name_map: true
+```
+
+`find_all` yields every non-overlapping match across all patterns in the
+set, batched internally for efficiency; `find_any` and `match` return a
+single result object or `null`. `patternName` is a single shared lookup
+across every set in the config that requested `emit_name_map: true`.
+
+---
+
 ## Summary table
 
 | Config field | Generated export | Returns |
@@ -165,3 +185,4 @@ Generated export names match the config field values exactly (no case conversion
 - `init()` must be awaited before calling any matcher. Calling a matcher before `init()` will throw.
 - The stub uses top-level `await` internally — it is designed for ES module environments (browser, Node.js with `"type": "module"`, Cloudflare Workers).
 - `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. The stub is not re-entrant: do not call two generators concurrently on the same stub module instance.
+- `find_func` and non-anchored `groups_func` generators automatically detect and use an internal `<func>_batch` WASM export when present, draining several matches per host↔WASM call instead of one. This export only exists when the pattern was compiled with `hints: [prefer-match]` (see [`hints:`](cli.md#hints--likelymode-compile-hints)); it's purely an internal performance path and doesn't change the generator's external `[start,end]` / capture-array output.

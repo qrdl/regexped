@@ -8,7 +8,7 @@ Regexped implements four engines: **Compiled DFA**, **DFA**, **TDFA**, and **Bac
 
 Selection priority (highest first):
 
-1. **TDFA** — pattern has capture groups AND qualifies for tagged-DFA (no non-greedy quantifiers inside captures, no line anchors, no word boundaries, no ambiguous alternations) AND TDFA has ≤ `MaxDFAStates` states AND ≤ `MaxTDFARegs` registers
+1. **TDFA** — pattern has capture groups AND qualifies for tagged-DFA (no non-greedy quantifiers, no line anchors, no word boundaries, no ambiguous alternations) AND TDFA has ≤ `MaxDFAStates` states AND ≤ `MaxTDFARegs` registers
 2. **Backtracking** — pattern has capture groups but fails the TDFA check
 3. **Compiled DFA** — no captures; minimised DFA has ≤ 256 states (default threshold)
 4. **DFA** — no captures; minimised DFA ≤ `MaxDFAStates` states
@@ -16,11 +16,38 @@ Selection priority (highest first):
 
 A pattern qualifies for TDFA if it has no:
 - Non-greedy quantifiers (`*?`, `+?`, `??`) anywhere in the pattern
-- Line anchors (`^`, `$`) inside the pattern
-- Word boundaries (`\b`, `\B`) inside capture groups
-- Alternations with overlapping first-character sets in branches that affect captures
+- Line anchors (`^`, `$`) anywhere in the pattern
+- Word boundaries (`\b`, `\B`) anywhere in the pattern
+- Ambiguous alternations — see below
 
-If a pattern has captures but fails the TDFA check (e.g. `(a|ab)c`, `(a*)(a*)`, `(.*)(foo)`), the Backtracking engine is used automatically.
+**"Ambiguous alternation" is narrower than "any alternation with overlapping
+branches."** The disjoint-first-character requirement only applies to
+*genuine* user alternations (a real `|` between two separately captured
+branches, e.g. `((cat)|(car))`, where each branch's own capture prevents
+factoring out the shared `ca` prefix — not `(a|ab)c`, which Go's own
+regexp/syntax parser normalises into a disjoint form before it ever reaches
+engine selection). A user alternation nested inside a quantifier loop, e.g.
+`(cat|car)+`, is still checked in full since the `|` itself is a separate
+`InstAlt` from the loop's own back-edge — it's TDFA-eligible here too, but
+because `cat`/`car` are still distinguishable by their second byte, not
+because of the quantifier-loop relaxation described next. A quantifier
+loop's own back-edge (e.g. the `+` in `[a-z]+`) is *also* internally an
+alternation between "continue the loop" and "exit," but overlap between
+those two branches alone no longer disqualifies TDFA (task 13, 2026-08-01) — TDFA's
+LeftmostFirst priority always prefers continuing the loop over exiting it,
+so `([a-z]+)(er)([a-z]+)` now selects TDFA even though the loop's exit
+(into `er`) starts with a byte the loop's own class also matches. It used
+to select Backtracking before this fix, which also corrected a real
+register-copy-ordering bug that this pattern shape had been triggering (see
+[Register minimization and copy ordering](#register-minimization-and-copy-ordering)
+below). The one case that still disqualifies a quantifier loop regardless
+of overlap: either branch's first-byte set is *indeterminate* — e.g. an
+inverted class wider than 256 codepoints (`[^>]`, `.`) — because TDFA can't
+resolve "continue or exit" without knowing what the loop's exit needs.
+
+If a pattern has captures but fails the TDFA check (e.g. `<([^>]+)>`,
+`([^,]+),`, `(.*)(foo)` — all disqualified by the indeterminate-branch rule
+above, not by mere overlap), the Backtracking engine is used automatically.
 
 ---
 
@@ -106,7 +133,7 @@ The NFA produced from the pattern is converted to a DFA via subset construction.
 
 State IDs fit in u8 when ≤ 256 states, u16 otherwise. When the table would exceed 32 KB, byte-class compression is applied: many bytes share identical transition rows and are mapped to a smaller set of equivalence classes, shrinking the table significantly. For u16 DFAs, row deduplication is additionally applied: states with identical transition rows share one row via a u8 rowMap, dramatically reducing large tables (e.g. 512KB → 52KB for a 1000-state DFA with 100 unique rows).
 
-Find mode stores additional arrays alongside the transition table: `midAccept` (accepting states reachable mid-scan), `firstByteFlags` or Teddy nibble tables (for the SIMD prefix scan), `immediateAccept`, and word-boundary variants.
+Find mode stores additional arrays alongside the transition table: `midAccept` (accepting states reachable mid-scan), `firstByteFlags`/Teddy/Shufti nibble tables (for the SIMD prefix scan), `immediateAccept`, and word-boundary variants.
 
 **Anchor-aware find mode**: when a pattern is anchored at the start (e.g. `^foo.*$`), `midStartState` has no live transitions. In this case a simplified find body is emitted that runs the DFA exactly once from position 0 rather than scanning the input.
 
@@ -119,11 +146,24 @@ In find mode, a compile-time-selected fast-skip prologue avoids testing every by
 | Strategy | Condition |
 |---|---|
 | **Hybrid prefix** | literal prefix ≥ 1 byte — SIMD check for full prefix within a 16-byte window |
-| **3-byte Teddy** | alternation patterns with ≤ 8 first bytes AND selective 3rd byte |
-| **2-byte Teddy** | alternation patterns with ≤ 8 first bytes |
-| **1-byte Teddy** | single-byte prefix with multiple candidates |
-| **Multi-eq SIMD** | small first-byte set — `i8x16.eq` + bitmask per candidate |
-| **Scalar** | fallback for wide first-byte sets |
+| **Teddy (1/2/3/4-byte tiers)** | 1–8 first-byte candidates; tier picked by how many leading bytes are jointly selective (nibble-table SIMD lookup per tier) |
+| **Shufti** | 9–16 first-byte candidates (unconditional), or 17–64 (only when a byte-rarity heuristic predicts it beats scalar, or the pattern was compiled with `hints: [prefer-no-match]`, which forces it regardless of the heuristic) — nibble-table SIMD set-membership test over the candidate set itself, not per-candidate comparisons |
+| **Scalar** | 0 first-byte candidates, > 64 candidates, or a 17–64-candidate set the rarity heuristic predicts scalar wins for |
+
+Every Teddy tier promotion (1-byte → 2-byte → 3-byte → 4-byte) additionally
+requires that **no** first-byte candidate's next byte lead to a
+terminal/dead-end state — a candidate with no further live transitions
+after its first byte disqualifies the whole tier and the builder falls back
+to the tier below (fixed in task 43, 2026-07-26; previously this could
+silently build an all-zero nibble table and produce wrong scan results for
+shorter alternates in a mixed-length alternation).
+
+The 17–64-candidate Shufti path also has a **runtime adaptive fallback**:
+if the compile-time rarity heuristic guessed wrong and Shufti is running
+against unexpectedly dense match data, the scan self-disables back to
+scalar after a bounded number of unproductive attempts, so a wrong guess
+only costs a bounded amount rather than paying Shufti's fixed per-chunk
+cost for the rest of the input.
 
 **2. Mandatory literal extraction** (applied when the prefix is noisy but a selective literal exists deeper in the pattern): `FindMandatoryLit` analyzes the pattern's syntax tree to find the best fixed byte sequence that must appear in every match (e.g. `://` in `[a-zA-Z]{2,8}://[^\s]+`). The SIMD scan searches for that literal instead; a two-level outer loop (`$lit_outer` / `$outer`) adjusts candidate start positions using the literal's known min/max offset from the match start.
 
@@ -192,9 +232,15 @@ TDFA implements Laurikari's tagged DFA algorithm. The NFA is extended with "tag"
 
 Capture slot values are reconstructed from registers at match acceptance time. The WASM function signature is `(ptr i32, len i32, out_ptr i32) → i32`; output slots are written as `[start0, end0, start1, end1, ...]` at `out_ptr`.
 
-**TDFA eligibility:** TDFA is used when the pattern has no non-greedy quantifiers, no line anchors (`^`/`$`), no word boundaries, and no ambiguous alternations (overlapping first-character sets that affect capture slot assignment). Patterns that fail any of these checks use the Backtracking engine instead.
+**TDFA eligibility:** TDFA is used when the pattern has no non-greedy quantifiers, no line anchors (`^`/`$`), no word boundaries, and no ambiguous alternations — see [Engine Selection](#engine-selection) above for what "ambiguous" actually excludes (it's narrower than "any alternation with overlapping branches"). Patterns that fail any of these checks use the Backtracking engine instead.
+
+**Whole-match single-capture shortcut:** when a pattern's only capture group spans the entire match (e.g. `(foo.*bar)`), both TDFA and Backtracking skip re-walking the capture body after the scan — the single group's bounds are just the match's own start/end, so no tag ops or capture-tracking NFA pass are needed at all.
+
+#### Register minimization and copy ordering
 
 **Register minimization:** after table construction, a liveness-based graph-coloring pass merges registers whose live ranges do not overlap, reducing WASM local count.
+
+**Copy ordering (`sequentializeCopies`):** when a transition has more than one register-to-register copy tag op, they must take effect as one atomic parallel assignment — every copy reads its source's value from *before* the transition, never a value an earlier copy in the same batch already overwrote. A single fixed emission order (e.g. always descending by destination register) only produces correct results for copy chains that happen to run in that direction; a chain running the other way silently reads an already-clobbered value. `sequentializeCopies` instead walks the actual destination→source dependency graph, emitting each copy only once nothing else still pending needs to read its destination first, and breaks any remaining dependency cycle by spilling one copy through a scratch register. This fixed a real capture-corruption bug (task 13, 2026-08-01) that patterns like `([a-z]+)(er)([a-z]+)` had been triggering.
 
 **Tag-op emission:** each DFA state's per-byte tag operations are emitted as a `br_table` dispatch in the WASM function body. A majority-group optimization encodes only the minority of differing transitions explicitly; the dominant operation is emitted unconditionally, keeping WASM bytecode size small.
 
