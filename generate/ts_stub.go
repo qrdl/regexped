@@ -191,10 +191,10 @@ func genTSFindFunc(funcName string) string {
 export function* %s(input: string | Uint8Array): Generator<[number, number]> {
     const b = _b(input);
     _resize(b.length);
+    _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        _mem.set(b.subarray(off), _inBase);
-        const r = (_exp['%s'] as CallableFunction)(_inBase, b.length - off) as bigint;
+        const r = (_exp['%s'] as CallableFunction)(_inBase + off, b.length - off) as bigint;
         if (r < 0n) break;
         const relStart = Number(r >> 32n);
         const relEnd   = Number(r & 0xFFFFFFFFn);
@@ -214,12 +214,12 @@ func genTSGroupsFunc(funcName string, numGroups int) string {
 export function* %s(input: string | Uint8Array): Generator<Array<[number, number] | null>> {
     const b = _b(input);
     _resize(b.length);
+    _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        _mem.set(b.subarray(off), _inBase);
         const slots = new Int32Array(_mem.buffer, _outBase, %d);
         slots.fill(-1);
-        if ((_exp['%s'] as CallableFunction)(_inBase, b.length - off, _outBase) < 0) {
+        if ((_exp['%s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) < 0) {
             if (off === b.length) break;
             off++;
             continue;
@@ -263,12 +263,12 @@ func genTSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 export function* %s(input: string | Uint8Array): Generator<Record<string, [number, number]>> {
     const b = _b(input);
     _resize(b.length);
+    _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        _mem.set(b.subarray(off), _inBase);
         const slots = new Int32Array(_mem.buffer, _outBase, %d);
         slots.fill(-1);
-        if ((_exp['%s'] as CallableFunction)(_inBase, b.length - off, _outBase) < 0) {
+        if ((_exp['%s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) < 0) {
             if (off === b.length) break;
             off++;
             continue;

@@ -959,7 +959,7 @@ func TestT3Triggered(t *testing.T) {
 			}
 			dfa := newDFA(prog, false, true)
 			tbl := dfaTableFrom(dfa)
-			l := buildDFALayout(tbl, 0, true, true, 0, false)
+			l := buildDFALayout(tbl, 0, true, true, 0, false, false, false, false)
 
 			gotT1 := len(l.teddyT1LoBytes) > 0
 			gotT2 := len(l.teddyT2LoBytes) > 0

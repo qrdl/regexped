@@ -1,0 +1,6 @@
+2026-07-08T12:00:00Z INFO iam.audit action=AssumeRole actor=svc-deploy key=AKIAABCDEF0123456789 result=allowed
+2026-07-08T12:00:01Z INFO iam.audit action=AssumeRole actor=svc-deploy key=AKIA9F8E7D6C5B4A3210 result=allowed
+2026-07-08T12:00:02Z INFO iam.audit action=AssumeRole actor=svc-deploy key=AKIA00112233445566AA result=allowed
+2026-07-08T12:00:03Z INFO iam.audit action=AssumeRole actor=svc-deploy key=none result=denied reason=missing_credentials
+2026-07-08T12:00:04Z INFO iam.audit action=AssumeRole actor=svc-deploy key=none result=denied reason=missing_credentials
+2026-07-08T12:00:05Z INFO iam.audit action=AssumeRole actor=svc-deploy key=none result=denied reason=missing_credentials

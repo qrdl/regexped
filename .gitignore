@@ -35,12 +35,12 @@ go.work.sum
 tmp
 regexped
 target
-perftest/out
-perftest/*.txt
-re2test/re2-exhaustive.txt
-re2test/re2-adjusted.txt
-re2test/re2test
-perftest/perftest
+tools/perftest/out
+tools/perftest/*.txt
+tools/re2test/re2-exhaustive.txt
+tools/re2test/re2-adjusted.txt
+tools/re2test/re2test
+tools/perftest/perftest
 examples/**/*.wasm
 examples/**/stub*.*
 examples/**/regexp.*s
@@ -50,3 +50,4 @@ examples/workers/.wrangler
 node_modules
 package-lock.json
 plans/
+tools/likelytest/likelytest

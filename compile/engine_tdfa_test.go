@@ -95,6 +95,123 @@ func TestTDFATagOpsEqual(t *testing.T) {
 	}
 }
 
+// applySequentialCopies simulates executing ops in order against vals,
+// treating scratchRegSentinel as its own slot separate from the real
+// register bank. Mirrors exactly what the WASM emitter does with
+// sequentializeCopies' output: each op reads its current source (which may
+// itself be the scratch slot) and writes its destination.
+func applySequentialCopies(vals map[int]int, ops []tdfaTagOp) map[int]int {
+	out := make(map[int]int, len(vals))
+	for k, v := range vals {
+		out[k] = v
+	}
+	var scratch int
+	read := func(reg int) int {
+		if reg == scratchRegSentinel {
+			return scratch
+		}
+		return out[reg]
+	}
+	for _, op := range ops {
+		v := read(op.src)
+		if op.dst == scratchRegSentinel {
+			scratch = v
+		} else {
+			out[op.dst] = v
+		}
+	}
+	return out
+}
+
+// TestSequentializeCopies verifies sequentializeCopies (5.3% covered without
+// this — only the len<=1 early return was reached) against its documented
+// contract: the returned sequential order must reproduce the effect of one
+// atomic parallel register-to-register move, for both acyclic chains
+// (in either dependency direction) and cycles requiring a scratch spill.
+func TestSequentializeCopies(t *testing.T) {
+	// expectedParallel computes what an atomic parallel copy would produce:
+	// every dst gets its src's PRE-transition value, all at once.
+	expectedParallel := func(initial map[int]int, ops []tdfaTagOp) map[int]int {
+		out := make(map[int]int, len(initial))
+		for k, v := range initial {
+			out[k] = v
+		}
+		for _, op := range ops {
+			out[op.dst] = initial[op.src]
+		}
+		return out
+	}
+
+	cases := []struct {
+		name    string
+		ops     []tdfaTagOp
+		initial map[int]int
+	}{
+		{
+			name:    "empty",
+			ops:     nil,
+			initial: map[int]int{1: 10},
+		},
+		{
+			name:    "single",
+			ops:     []tdfaTagOp{{dst: 1, src: 2}},
+			initial: map[int]int{1: 10, 2: 20},
+		},
+		{
+			name: "acyclic_chain_forward",
+			// dst=1 depends on nothing; safe to run in dst-ascending order.
+			ops:     []tdfaTagOp{{dst: 1, src: 2}, {dst: 2, src: 3}, {dst: 3, src: 4}},
+			initial: map[int]int{1: 100, 2: 200, 3: 300, 4: 400},
+		},
+		{
+			name: "acyclic_chain_reverse",
+			// dst=4 depends on nothing; a fixed ascending-dst order would
+			// wrongly overwrite reg 2 (needed by dst=3) before it's read —
+			// this is exactly the "chain running the other way" case the
+			// function's doc comment warns a fixed sort direction breaks.
+			ops:     []tdfaTagOp{{dst: 2, src: 1}, {dst: 3, src: 2}, {dst: 4, src: 3}},
+			initial: map[int]int{1: 100, 2: 200, 3: 300, 4: 400},
+		},
+		{
+			name:    "two_cycle_swap",
+			ops:     []tdfaTagOp{{dst: 1, src: 2}, {dst: 2, src: 1}},
+			initial: map[int]int{1: 10, 2: 20},
+		},
+		{
+			name:    "three_cycle",
+			ops:     []tdfaTagOp{{dst: 1, src: 2}, {dst: 2, src: 3}, {dst: 3, src: 1}},
+			initial: map[int]int{1: 10, 2: 20, 3: 30},
+		},
+		{
+			name: "cycle_plus_independent_chain",
+			ops: []tdfaTagOp{
+				{dst: 1, src: 2}, {dst: 2, src: 1}, // 2-cycle
+				{dst: 5, src: 6}, {dst: 6, src: 7}, // independent acyclic chain
+			},
+			initial: map[int]int{1: 10, 2: 20, 5: 50, 6: 60, 7: 70},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := sequentializeCopies(c.ops)
+			if len(c.ops) <= 1 {
+				if len(got) != len(c.ops) {
+					t.Fatalf("len(sequentializeCopies) = %d, want %d for len<=1 input", len(got), len(c.ops))
+				}
+			}
+			want := expectedParallel(c.initial, c.ops)
+			gotVals := applySequentialCopies(c.initial, got)
+			for dst, wantVal := range want {
+				if gotVals[dst] != wantVal {
+					t.Errorf("register %d = %d after sequential replay, want %d (parallel semantics)\n  ops=%v\n  sequentialized=%v",
+						dst, gotVals[dst], wantVal, c.ops, got)
+				}
+			}
+		})
+	}
+}
+
 func TestMinimizeTDFARegistersLowRegs(t *testing.T) {
 	// numRegs <= 1 → early return, no minimization attempted.
 	base := &dfaTable{numStates: 1, transitions: make([]int, 256), acceptStates: map[int]uint64{0: 1}}

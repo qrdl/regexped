@@ -233,6 +233,46 @@ func TestIsAlternationDeterministicPaths(t *testing.T) {
 	}
 }
 
+// TestIsAlternationDeterministicQuantifierLoop exercises the quantifierLoop=true
+// branch added by task 13 (commit c9436b8): a quantifier-loop InstAlt whose
+// continuation and exit first-byte sets overlap is now TDFA-eligible (the
+// overlap alone no longer forces Backtracking, since TDFA's LeftmostFirst
+// priority always prefers the loop body over the exit regardless of overlap).
+// This branch had 0 direct test coverage — the pre-task-13 exclusion this
+// replaced was itself only ever exercised via re2test, not `go test`.
+func TestIsAlternationDeterministicQuantifierLoop(t *testing.T) {
+	cases := []struct {
+		pattern string
+		want    EngineType
+		note    string
+	}{
+		// ([a-z]+)(er)([a-z]+): the first loop's continuation ([a-z]) and its
+		// own exit (into "er", which starts with 'e' — itself in [a-z]) overlap.
+		// Pre-task-13 this was forced to Backtracking; the fix's own example.
+		{`([a-z]+)(er)([a-z]+)`, EngineTDFA, "overlapping-terminator loop now TDFA-eligible"},
+		// (cat|car)+: a genuine user alternation NESTED INSIDE a quantifier
+		// loop is still a separate InstAlt, checked in full (non-quantifier
+		// path) — must remain unaffected by the quantifier-loop relaxation.
+		{`(cat|car)+`, EngineTDFA, "nested user alternation inside a loop, no captures inside it"},
+		// Gap I (CLAUDE.md "Load-bearing engine-selection gates"): an inverted
+		// class wider than 256 codepoints inside a quantifier loop still has an
+		// INDETERMINATE (empty) first-rune-set for getFirstRuneSet, so it must
+		// remain ambiguous → Backtracking, even though it's a quantifier loop.
+		// This must NOT be relaxed — see CLAUDE.md's explicit warning.
+		{`<([^>]+)>`, EngineBacktrack, "Gap I: indeterminate branch inside quantifier loop stays ambiguous"},
+	}
+	for _, c := range cases {
+		got, err := SelectEngine(c.pattern, CompileOptions{})
+		if err != nil {
+			t.Errorf("SelectEngine(%q) [%s]: %v", c.pattern, c.note, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("SelectEngine(%q) [%s] = %v, want %v", c.pattern, c.note, got, c.want)
+		}
+	}
+}
+
 // TestSelectEngineLineAnchorCapture verifies that capture patterns with line anchors
 // or word boundaries are routed to Backtrack (not TDFA).
 func TestSelectEngineLineAnchorCapture(t *testing.T) {

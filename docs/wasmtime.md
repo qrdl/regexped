@@ -5,8 +5,9 @@ WebAssembly. It runs WASI modules from the command line and can also be
 embedded as a library (`wasmtime-go`, `wasmtime-rs`, `wasmtime-py`, …) into a
 host application. Regexped's compiled regexp modules run unmodified on
 wasmtime — there is no runtime-specific shim — and wasmtime is the runtime
-used by Regexped's own [`re2test/`](../re2test/) and [`perftest/`](../perftest/)
-harnesses for validation and benchmarking.
+used by Regexped's own [`tools/re2test/`](../tools/re2test/) and
+[`tools/perftest/`](../tools/perftest/) harnesses for validation and
+benchmarking.
 
 This page covers the **embedded** workflow: a Rust / Go / C / AssemblyScript
 program that calls Regexped-generated stubs and is executed by `wasmtime run`.
@@ -26,6 +27,8 @@ involve `wasm-merge`.
   - **AssemblyScript** — Node.js 18+ (`npx asc`)
 
 ## Configuration
+
+A simplified illustrative config (see [`rust/url-ipv6/`](../examples/wasmtime/rust/url-ipv6/) below for the actual, more elaborate example this is based on):
 
 ```yaml
 # regexped.yaml
@@ -61,7 +64,8 @@ regexped generate --config=regexped.yaml          # → stubs.rs
 cargo build --target wasm32-wasip1 --release      # → target/.../app.wasm
 regexped compile  --config=regexped.yaml          # → regexps.wasm
 regexped merge    --config=regexped.yaml \
-    --main=target/wasm32-wasip1/release/app.wasm  # → final.wasm
+    --main=target/wasm32-wasip1/release/app.wasm \
+    regexps.wasm                                  # → final.wasm
 wasmtime run final.wasm
 ```
 
@@ -88,8 +92,8 @@ The merged module is a standard WASI module, so it can be loaded directly from
 any wasmtime embedding (Rust, Go, Python, C API, …). Regexped's own test
 harnesses use `wasmtime-go`:
 
-- [`re2test/main.go`](../re2test/main.go) — exhaustive RE2 conformance via wasmtime-go
-- [`perftest/main.go`](../perftest/main.go) — fuel-metered benchmarks via wasmtime-go
+- [`tools/re2test/main.go`](../tools/re2test/main.go) — exhaustive RE2 conformance via wasmtime-go
+- [`tools/perftest/main.go`](../tools/perftest/main.go) — fuel-metered benchmarks via wasmtime-go
 
 These are good references for callers that need to load a merged WASM module
 into a wasmtime `Store`, write the input bytes into the WASM's linear memory,
@@ -111,8 +115,13 @@ Per-language wasmtime examples live under [`examples/wasmtime/`](../examples/was
 | AssemblyScript | [`as/find-email/`](../examples/wasmtime/as/find-email/) | TDFA | Email extraction with `user`/`domain` groups |
 | AssemblyScript | [`as/inject-scanner/`](../examples/wasmtime/as/inject-scanner/) | Set | Injection pattern scanner |
 
-Each example has a `Makefile` that runs the full `generate → host build →
-compile → merge → wasmtime run` pipeline.
+Most examples have a `Makefile` that runs the full `generate → host build →
+compile → merge → wasmtime run` pipeline shown above. `rust/secret-scanner/`
+is the exception: it's a standalone (no `output` field, no merge step)
+example that embeds wasmtime as a library instead — a native `cargo build`
+host binary loads `secrets.wasm` directly via the `wasmtime` crate and runs
+with `cargo run --release`, the same pattern described in
+[Embedding wasmtime as a library](#embedding-wasmtime-as-a-library) above.
 
 ## Related
 

@@ -1623,7 +1623,16 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		numV128Locals = 6
 	} else if len(scanParams.FirstByteSet) > 0 && len(scanParams.FirstByteSet) <= 8 {
 		numV128Locals = 3
-	} else if len(scanParams.FirstByteSet) > 0 && len(scanParams.FirstByteSet) <= 16 {
+	} else if len(scanParams.FirstByteSet) > 0 && len(scanParams.FirstByteSet) <= 64 {
+		// 9..64: Shufti (emitPrefixScan's useSIMD gate — either unconditional
+		// for 9..16, or shuftiBeatsScalar/LikelyNoMatch-gated for 17..64).
+		// Only needs the single "chunk" v128 local; emitShuftiPrefixCheck
+		// inlines its nibble tables as v128.const operands. This upper bound
+		// must track emitPrefixScan's own useSIMD ceiling (prefix_scan.go) —
+		// previously capped at 16, a stale bound from before LNM Action 3
+		// extended Shufti coverage to 64 bytes, which left FirstByteSet
+		// 17..64 emitting zero v128 locals while emitShuftiPrefixCheck still
+		// used one, producing invalid WASM ("expected i32, found v128").
 		numV128Locals = 1
 	}
 

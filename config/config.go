@@ -32,6 +32,12 @@ type SetConfig struct {
 	BatchSize   int             `yaml:"batch_size"`    // output buffer hint (default 256); stub-gen only
 	Patterns    PatternSelector `yaml:"patterns"`      // which regexps belong to this set
 	EmitNameMap bool            `yaml:"emit_name_map"` // generate pattern_name / patternName helper in stubs (does not change WASM)
+	// Hints biases which suffix-DFA optimisation path to favour for this set.
+	// Also serves as the per-set default for unhinted patterns in this set
+	// when they reach the set's suffix DFA body. Accepted values: nil/empty
+	// (no hint), ["prefer-match"], or ["prefer-no-match"] — mutually
+	// exclusive. See plans/LIKELY.md gap H.
+	Hints []string `yaml:"hints"`
 }
 
 // PatternSelector selects patterns for a set. It can be the scalar string "all"
@@ -66,6 +72,54 @@ func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error
 		return nil
 	}
 	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names")
+}
+
+// ValidHints reports whether hints is a valid `hints:` list: every entry must
+// be "prefer-match" or "prefer-no-match", and the two are mutually exclusive
+// (both cannot appear in the same list). An empty or nil list is valid (means
+// "no hint").
+func ValidHints(hints []string) bool {
+	return validateHintList(hints) == nil
+}
+
+// validateHintList returns a descriptive error for the first problem found in
+// hints, or nil if the list is valid.
+func validateHintList(hints []string) error {
+	var hasMatch, hasNoMatch bool
+	for _, h := range hints {
+		switch h {
+		case "prefer-match":
+			hasMatch = true
+		case "prefer-no-match":
+			hasNoMatch = true
+		default:
+			return fmt.Errorf("unknown value %q (want \"prefer-match\" or \"prefer-no-match\")", h)
+		}
+	}
+	if hasMatch && hasNoMatch {
+		return fmt.Errorf("\"prefer-match\" and \"prefer-no-match\" are mutually exclusive")
+	}
+	return nil
+}
+
+// validateHints checks the hints fields of every regexp and set entry in
+// cfg. Returns an error naming the first offending entry and problem found.
+func validateHints(cfg *BuildConfig) error {
+	for _, re := range cfg.Regexps {
+		if err := validateHintList(re.Hints); err != nil {
+			label := re.Name
+			if label == "" {
+				label = re.Pattern
+			}
+			return fmt.Errorf("regexp %q: hints: %w", label, err)
+		}
+	}
+	for _, sc := range cfg.Sets {
+		if err := validateHintList(sc.Hints); err != nil {
+			return fmt.Errorf("set %q: hints: %w", sc.Name, err)
+		}
+	}
+	return nil
 }
 
 // ValidateSets validates the `sets:` block against the `regexps:` list.
@@ -156,6 +210,12 @@ type RegexEntry struct {
 	FindFunc        string `yaml:"find_func"`         // non-anchored find → Option<(usize,usize)>
 	GroupsFunc      string `yaml:"groups_func"`       // anchored + captures → Option<Vec<Option<(usize,usize)>>>
 	NamedGroupsFunc string `yaml:"named_groups_func"` // anchored + named captures → Option<HashMap<&'static str,(usize,usize)>>
+
+	// Hints biases which suffix-DFA optimisation path to favour for this
+	// specific pattern. Accepted values: nil/empty (no hint, falls back to
+	// the enclosing set's hints), ["prefer-match"], or ["prefer-no-match"] —
+	// mutually exclusive. See plans/LIKELY.md.
+	Hints []string `yaml:"hints"`
 }
 
 // CaptureStubsRequested reports whether any capture-returning stub is requested.
@@ -203,6 +263,9 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	cfg.WasmMerge = resolveFilePath(configDir, cfg.WasmMerge)
 
 	if err := ValidateSets(&cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
+	if err := validateHints(&cfg); err != nil {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 	}
 

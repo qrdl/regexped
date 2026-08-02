@@ -3,7 +3,43 @@ package compile
 import (
 	"regexp/syntax"
 	"testing"
+
+	"github.com/qrdl/regexped/internal/utils"
 )
+
+// TestEmitImmAcceptCheckMatch exercises emitImmAcceptCheckMatch directly
+// (16.7% covered without this — only the hasImmAccept=false no-op branch
+// was reached via the general match-body test suite). Verifies both the
+// no-op path and the emitted `if state u<= limit: return pos` structure.
+func TestEmitImmAcceptCheckMatch(t *testing.T) {
+	t.Run("no_op_when_disabled", func(t *testing.T) {
+		before := []byte{0xAA, 0xBB}
+		got := emitImmAcceptCheckMatch(append([]byte(nil), before...), 5, false, 2, 3, 0)
+		if string(got) != string(before) {
+			t.Errorf("emitImmAcceptCheckMatch(hasImmAccept=false) modified input: got %v, want %v", got, before)
+		}
+	})
+
+	t.Run("emits_check_when_enabled", func(t *testing.T) {
+		const (
+			stateLocal = 2
+			posLocal   = 3
+			limit      = 7
+		)
+		got := emitImmAcceptCheckMatch(nil, limit, true, stateLocal, posLocal, 0)
+		want := []byte{0x20, stateLocal}
+		want = append(want, 0x41)
+		want = utils.AppendSLEB128(want, limit)
+		want = append(want, 0x4D)       // i32.le_u
+		want = append(want, 0x04, 0x40) // if (void)
+		want = append(want, 0x20, posLocal)
+		want = append(want, 0x0F) // return
+		want = append(want, 0x0B) // end if
+		if string(got) != string(want) {
+			t.Errorf("emitImmAcceptCheckMatch(hasImmAccept=true) =\n  %#v\nwant\n  %#v", got, want)
+		}
+	})
+}
 
 func compileTestDFA(t *testing.T, pattern string, leftmostFirst bool) *dfaTable {
 	t.Helper()

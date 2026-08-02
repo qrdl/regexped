@@ -147,10 +147,35 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	const localPos = uint32(3)
 	const localClass = uint32(4)
 
+	// Phase 4: when mid-accept dominants exist, add v128 chunk local
+	// (and tmp i32 for the non-compressed path, which lacks a class local).
+	// Task 38: non-mid dominants additionally need 2 i32 hysteresis locals
+	// (counter at 6, scratch at 7).
+	emitMidDom := len(l.dominantStates) > 0
+	hystDom := false
+	for _, info := range l.dominantStates {
+		if !info.isMidAccept {
+			hystDom = true
+		}
+	}
 	if l.useCompression {
-		b = append(b, 0x01, 0x03, 0x7F) // 3 i32: state, pos, class
+		switch {
+		case hystDom:
+			b = append(b, 0x03, 0x03, 0x7F, 0x01, 0x7B, 0x02, 0x7F) // 3 i32 + 1 v128 + 2 i32 (hyst)
+		case emitMidDom:
+			b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7B) // 3 i32 + 1 v128
+		default:
+			b = append(b, 0x01, 0x03, 0x7F) // 3 i32: state, pos, class
+		}
 	} else {
-		b = append(b, 0x01, 0x02, 0x7F) // 2 i32: state, pos
+		switch {
+		case hystDom:
+			b = append(b, 0x03, 0x03, 0x7F, 0x01, 0x7B, 0x02, 0x7F) // 3 i32 (+tmp) + 1 v128 + 2 i32 (hyst)
+		case emitMidDom:
+			b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7B) // 3 i32 (+tmp) + 1 v128
+		default:
+			b = append(b, 0x01, 0x02, 0x7F) // 2 i32: state, pos
+		}
 	}
 
 	// Literal chain prefix.
@@ -265,6 +290,11 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 		b = append(b, 0x0B)
 	}
 
+	// Phase 4 dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
+	// or extra i32 added by the locals declaration above), hyst=6/7.
+	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx,
+		byte(localState), byte(localPos), 0x01, 0x00, 0x05, byte(localClass), 0x06, 0x07)
+
 	// pos++
 	b = append(b, 0x20, byte(localPos))
 	b = append(b, 0x41, 0x01)
@@ -318,7 +348,8 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
 	return buildFindBody(
 		l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
-		l.wasmMidStartNewline, l.wasmPrefixEnd, l.tableOff, l.midAcceptOff,
+		l.wasmMidStartNewline, l.wasmPrefixEnd, l.wasmPrefixEndWord,
+		l.tableOff, l.midAcceptOff,
 		l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
 		l.useU8, l.useCompression, l.acceptLimit, l.startBeginAccept,
 		l.immAcceptLimit, l.hasImmAccept,
@@ -331,5 +362,7 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
 		mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
 		tableMemIdx,
+		l.dominantStates, l.lnmAction5, l.skipSafeOnDead,
+		l.eofSkipSafe,
 	)
 }

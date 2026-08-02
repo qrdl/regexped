@@ -350,6 +350,73 @@ func TestValidateSets_DuplicatePatternInSet(t *testing.T) {
 	}
 }
 
+func TestValidHints(t *testing.T) {
+	cases := []struct {
+		hints []string
+		want  bool
+	}{
+		{nil, true},
+		{[]string{}, true},
+		{[]string{"prefer-match"}, true},
+		{[]string{"prefer-no-match"}, true},
+		{[]string{"prefer-match", "prefer-no-match"}, false},
+		{[]string{"bogus"}, false},
+	}
+	for _, c := range cases {
+		if got := ValidHints(c.hints); got != c.want {
+			t.Errorf("ValidHints(%v) = %v, want %v", c.hints, got, c.want)
+		}
+	}
+}
+
+func TestLoadConfig_HintsMutuallyExclusive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "regexped.yaml")
+	yamlData := "regexps:\n" +
+		"  - pattern: 'foo'\n" +
+		"    match_func: foo_match\n" +
+		"    hints: [prefer-match, prefer-no-match]\n"
+	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Error("expected error for mutually exclusive hints, got nil")
+	}
+}
+
+func TestLoadConfig_HintsUnknownValue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "regexped.yaml")
+	yamlData := "regexps:\n" +
+		"  - pattern: 'foo'\n" +
+		"    match_func: foo_match\n" +
+		"    hints: [bogus]\n"
+	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Error("expected error for unknown hint value, got nil")
+	}
+}
+
+func TestLoadConfig_SetHintsMutuallyExclusive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "regexped.yaml")
+	yamlData := "regexps:\n" +
+		"  - name: p1\n    pattern: 'foo'\n" +
+		"sets:\n" +
+		"  - name: s1\n" +
+		"    find_any: any1\n" +
+		"    patterns: \"all\"\n" +
+		"    hints: [prefer-match, prefer-no-match]\n"
+	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Error("expected error for mutually exclusive set hints, got nil")
+	}
+}
+
 func TestLoadConfig_ValidateSetsError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "regexped.yaml")

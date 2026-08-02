@@ -388,6 +388,10 @@ type CompileSetOptions struct {
 	MaxFallbackStates     int   // max DFA states for a single-pattern fallback bucket; default 1024
 	TableBase             int32 // byte offset where this set's DFA tables start in memory; default 0
 	TableMemIdx           int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
+	// LikelyMode is the resolved set-level LikelyMode hint: consumed by the
+	// set-frontend density gate (H.3, shipped — forces Shufti for a 17..64-byte
+	// first-byte union under LikelyNoMatch).
+	LikelyMode LikelyMode
 }
 
 func (o CompileSetOptions) bitmaskWidth() int {
@@ -591,6 +595,15 @@ const (
 	frontendTeddy  frontendKind = iota // 1–16 literals, any length (>4 bytes: probe first 4, verify rest)
 	frontendAC                         // 17–32 literals → Aho-Corasick (capped at 32 nodes)
 	frontendScalar                     // fallback: byte-by-byte scan
+	// frontendShufti: SIMD first-byte pre-filter wrapping the scalar
+	// per-position bucket check. Picked when:
+	//   - the set would otherwise have used the scalar path,
+	//   - 17 ≤ |unionFirstBytes| ≤ 64,
+	//   - AND either `shuftiBeatsScalar(unionFirstBytes)` (density wins)
+	//     or set-level LikelyMode is LikelyNoMatch (Gap H.3 Action 5).
+	// Requires zero fallback buckets — fallback runs at every position
+	// so a first-byte SIMD skip can't safely advance past it.
+	frontendShufti
 )
 
 func (f frontendKind) String() string {
@@ -599,6 +612,8 @@ func (f frontendKind) String() string {
 		return "teddy"
 	case frontendAC:
 		return "ac"
+	case frontendShufti:
+		return "shufti"
 	default:
 		return "scalar"
 	}
@@ -744,6 +759,27 @@ func teddyGroupABytes(t *teddyTables) int32 {
 	return n
 }
 
+// litUnionFirstBytes returns the sorted distinct first bytes across `lits`.
+// Empty literals are skipped (their first byte is undefined; the standard
+// frontend selection already rejects sets with empty literals before this
+// helper is called for the Shufti decision in H.3).
+func litUnionFirstBytes(lits [][]byte) []byte {
+	var seen [256]bool
+	for _, lit := range lits {
+		if len(lit) == 0 {
+			continue
+		}
+		seen[lit[0]] = true
+	}
+	out := make([]byte, 0, 64)
+	for b := 0; b < 256; b++ {
+		if seen[b] {
+			out = append(out, byte(b))
+		}
+	}
+	return out
+}
+
 // chooseLiteralFrontend selects the scan strategy for a set of mandatory literals.
 // Teddy is used for ≤16 non-empty literals of any length (literals >4 bytes use
 // their first 4 bytes as the probe; the dispatch verifies remaining bytes).
@@ -840,6 +876,36 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 			placed := false
 
 			for bi, b := range litBuckets {
+				// Constraint 0 (LM-6, LikelyMatch only): don't merge two
+				// counted-chain-eligible patterns. isCountedClassChain requires
+				// a single-pattern suffix DFA (see its doc comment), so merging
+				// them loses task 5's single-pattern SIMD-verify suffix body for
+				// both — under LikelyMatch (match-dense callers) that loss is
+				// assumed to outweigh the shared-literal-dispatch win. Checked
+				// against each pattern's own isolated suffixDFA (built by
+				// analyzePattern, never mutated by merging), not the bucket's
+				// merged table.
+				if opts.LikelyMode == LikelyMatch {
+					if _, _, pOK := isCountedClassChain(p.suffixDFA); pOK {
+						conflict := false
+						for _, bp := range b.patterns {
+							if _, _, bpOK := isCountedClassChain(bp.suffixDFA); bpOK {
+								conflict = true
+								break
+							}
+						}
+						if conflict {
+							if diag != nil {
+								diag.Conflicts = append(diag.Conflicts, ConflictDiag{
+									Pattern: pRef, CandidateBucket: len(buckets) + bi,
+									Reason: "lm_counted_chain_split",
+								})
+							}
+							continue
+						}
+					}
+				}
+
 				// Constraint 1: bitmask capacity.
 				if len(b.patterns) >= bw {
 					if diag != nil {

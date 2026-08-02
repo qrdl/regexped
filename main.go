@@ -100,9 +100,9 @@ func runGenerateCmd(args []string) {
 		log.Fatal(err)
 	}
 
-	// Rust and AS stubs require import_module for the FFI module name.
-	if (stubType == "rust" || stubType == "as") && cfg.ImportModule == "" {
-		fmt.Fprintln(os.Stderr, "generate: import_module is required in config for Rust and AS stubs")
+	// Rust, Go, C, and AS stubs require import_module for the FFI/WASM import module name.
+	if (stubType == "rust" || stubType == "go" || stubType == "c" || stubType == "as") && cfg.ImportModule == "" {
+		fmt.Fprintln(os.Stderr, "generate: import_module is required in config for Rust, Go, C, and AS stubs")
 		os.Exit(1)
 	}
 

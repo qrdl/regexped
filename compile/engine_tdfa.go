@@ -53,6 +53,10 @@ type tdfaTable struct {
 	numRegs      int         // total WASM locals allocated for capture registers
 	numGroups    int         // number of capture groups (including group 0)
 	entryOps     []tdfaTagOp // ops emitted at function entry (before first byte is consumed)
+
+	// bulkSkip describes a single dominant self-loop state eligible for SIMD
+	// bulk-skip in the match body (Gap F); nil when no qualifying state exists.
+	bulkSkip *tdfaBulkSkipInfo
 }
 
 // --------------------------------------------------------------------------
@@ -70,6 +74,92 @@ type tdfaThread struct {
 type tdfaStateKey struct {
 	threads     []tdfaThread
 	prevWasWord bool
+}
+
+// scratchRegSentinel marks a dst/src slot that refers to the cycle-breaking
+// scratch register (see sequentializeCopies). It is resolved to a concrete
+// register index in a fixup pass once nextReg's final value is known — see
+// the "resolve scratch register" step at the end of newTDFA. It must not
+// collide with -1 (tdfaTagOp's own "assign from pos" marker) or any real
+// (non-negative) register index.
+const scratchRegSentinel = -2
+
+// sequentializeCopies orders a set of register-to-register copies (each
+// produced from a bijective rename map, so every dst is distinct and every
+// src is distinct) so that executing them in the returned order reproduces
+// the effect of one atomic parallel assignment: every op reads its source's
+// pre-transition value, never a value some earlier op in this same batch
+// already overwrote.
+//
+// This is the classic "parallel copy" (a.k.a. "parallel move") sequencing
+// problem from register-allocation theory. A single fixed sort direction
+// (e.g. descending dst) only produces a correct order for chains that happen
+// to run in that direction; a chain running the other way silently reads an
+// already-clobbered value. This instead walks the actual dst→src dependency
+// graph: an op is safe to emit once no other still-pending op needs to read
+// its destination first. When only cycles remain (A needs B's slot, B needs
+// A's), one is broken by spilling to a scratch register.
+func sequentializeCopies(copyOps []tdfaTagOp) []tdfaTagOp {
+	if len(copyOps) <= 1 {
+		return append([]tdfaTagOp(nil), copyOps...)
+	}
+
+	srcOf := make(map[int]int, len(copyOps))
+	dsts := make([]int, 0, len(copyOps))
+	for _, op := range copyOps {
+		srcOf[op.dst] = op.src
+		dsts = append(dsts, op.dst)
+	}
+	sort.Ints(dsts) // deterministic iteration/tie-break order
+
+	remaining := make(map[int]bool, len(dsts))
+	for _, d := range dsts {
+		remaining[d] = true
+	}
+
+	result := make([]tdfaTagOp, 0, len(copyOps)+2)
+	for len(remaining) > 0 {
+		needed := make(map[int]bool, len(remaining))
+		for _, d := range dsts {
+			if remaining[d] {
+				needed[srcOf[d]] = true
+			}
+		}
+
+		progressed := false
+		for _, d := range dsts {
+			if !remaining[d] || needed[d] {
+				continue
+			}
+			result = append(result, tdfaTagOp{dst: d, src: srcOf[d]})
+			delete(remaining, d)
+			progressed = true
+		}
+		if progressed {
+			continue
+		}
+
+		// Only cycles remain: nothing is currently safe to overwrite. Break
+		// the lowest-numbered pending one via the scratch register, then
+		// redirect whichever op depended on its original value to read the
+		// scratch register instead. The now-freed slot becomes safe next round.
+		var breakDst int
+		for _, d := range dsts {
+			if remaining[d] {
+				breakDst = d
+				break
+			}
+		}
+		result = append(result, tdfaTagOp{dst: scratchRegSentinel, src: breakDst})
+		result = append(result, tdfaTagOp{dst: breakDst, src: srcOf[breakDst]})
+		delete(remaining, breakDst)
+		for _, d := range dsts {
+			if remaining[d] && srcOf[d] == breakDst {
+				srcOf[d] = scratchRegSentinel
+			}
+		}
+	}
+	return result
 }
 
 // keyString serialises a tdfaStateKey to a map-friendly string.
@@ -224,6 +314,10 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	stateMap := make(map[string]int) // keyString → state id
 	nextStateID := 0
 	nextReg := 0 // monotonically allocated register counter
+	// usedScratchReg is true once any transition's copy sequencing needed the
+	// cycle-breaking scratch register (see sequentializeCopies). Resolved to
+	// a concrete register index in a fixup pass once nextReg is final.
+	usedScratchReg := false
 
 	// Per-state data accumulated during construction.
 	type stateData struct {
@@ -337,9 +431,11 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		// Compute ops for this transition:
 		//   orig >= sentinelBase → was a freshly-captured tag → reg[can] = pos
 		//   orig <  sentinelBase, orig != can → inherited but renumbered → reg[can] = reg[orig]
-		// Copies are sorted by descending dst to avoid clobbering chains (A←B←C emits C←B first).
-		// Set-ops are sorted by ascending dst to ensure deterministic WASM emission independent
-		// of Go's non-deterministic map iteration order over `rename`.
+		// Copies are ordered by sequentializeCopies (dependency-safe — a fixed
+		// sort direction is NOT sufficient here, see its doc comment and
+		// plans/TODO.md task 13's investigation). Set-ops are sorted by
+		// ascending dst to ensure deterministic WASM emission independent of
+		// Go's non-deterministic map iteration order over `rename`.
 		var copyOps, setOps []tdfaTagOp
 		for orig, can := range rename {
 			if orig >= sentinelBase {
@@ -348,7 +444,15 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 				copyOps = append(copyOps, tdfaTagOp{dst: can, src: orig}) // copy
 			}
 		}
-		sort.Slice(copyOps, func(i, j int) bool { return copyOps[i].dst > copyOps[j].dst })
+		copyOps = sequentializeCopies(copyOps)
+		if !usedScratchReg {
+			for _, op := range copyOps {
+				if op.dst == scratchRegSentinel || op.src == scratchRegSentinel {
+					usedScratchReg = true
+					break
+				}
+			}
+		}
 		sort.Slice(setOps, func(i, j int) bool { return setOps[i].dst < setOps[j].dst })
 		ops := append(copyOps, setOps...)
 
@@ -653,6 +757,32 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		acceptRegMapTable = append(acceptRegMapTable, nil)
 	}
 
+	// Resolve the scratch register: sequentializeCopies may have used
+	// scratchRegSentinel as a placeholder for a cycle-break (see its doc
+	// comment) before nextReg's final value was known. Give it one concrete
+	// register beyond every real capture register and rewrite every
+	// occurrence. acceptOpTable is never populated (always nil) so it needs
+	// no fixup; entryOps goes through the same getOrAddState machinery as
+	// tagOpTable so it can in principle contain the sentinel too.
+	if usedScratchReg {
+		scratchReg := nextReg
+		nextReg++
+		resolve := func(ops []tdfaTagOp) {
+			for i := range ops {
+				if ops[i].dst == scratchRegSentinel {
+					ops[i].dst = scratchReg
+				}
+				if ops[i].src == scratchRegSentinel {
+					ops[i].src = scratchReg
+				}
+			}
+		}
+		for _, ops := range tagOpTable {
+			resolve(ops)
+		}
+		resolve(entryOps)
+	}
+
 	dt := &dfaTable{
 		startState:            0,
 		midStartState:         0, // TDFA is always called anchored; mid-start states are unused
@@ -678,6 +808,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		entryOps:     entryOps,
 	}
 	tt = minimizeTDFARegisters(tt)
+	tt.bulkSkip = detectTDFABulkSkip(tt)
 	return tt, true
 }
 
@@ -728,9 +859,16 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	var b []byte
 
 	numCapRegs := tt.numRegs
-	// Locals: pos(1) + state(1) + prevState(1) + byte(1) + capture regs.
+	// Locals: pos(1) + state(1) + prevState(1) + byte(1) + capture regs
+	// [+ bulk-skip locals: chunk(v128) + mask(i32) + skipStart(i32)].
 	extraLocals := 4 + numCapRegs
-	b = utils.AppendULEB128(b, uint32(1)) // 1 local declaration
+	hasBulkSkip := enableTDFABulkSkip && tt.bulkSkip != nil
+
+	if hasBulkSkip {
+		b = utils.AppendULEB128(b, uint32(3)) // 3 local declaration groups
+	} else {
+		b = utils.AppendULEB128(b, uint32(1)) // 1 local declaration group
+	}
 	b = utils.AppendULEB128(b, uint32(extraLocals))
 	b = append(b, 0x7F) // i32
 
@@ -741,6 +879,16 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		localByte      = uint32(6)
 		localCapBase   = uint32(7)
 	)
+	localChunk := localCapBase + uint32(numCapRegs)
+	localMask := localChunk + 1
+	localSkipStart := localMask + 1
+
+	if hasBulkSkip {
+		b = utils.AppendULEB128(b, uint32(1))
+		b = append(b, 0x7B) // v128
+		b = utils.AppendULEB128(b, uint32(2))
+		b = append(b, 0x7F) // i32
+	}
 
 	// Initialise capture registers to -1.
 	for i := 0; i < numCapRegs; i++ {
@@ -770,6 +918,17 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x0D, 0x01) // br_if $done
+
+	if hasBulkSkip {
+		// if state == bulkSkip.wasmState: SIMD-skip the self-loop run (Gap F)
+		b = append(b, 0x20, byte(localState))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, tt.bulkSkip.wasmState)
+		b = append(b, 0x46)       // i32.eq
+		b = append(b, 0x04, 0x40) // if (void)
+		b = emitTDFABulkSkip(b, tt.bulkSkip, localPos, localChunk, localMask, localSkipStart, localCapBase)
+		b = append(b, 0x0B) // end if
+	}
 
 	// prevState = state
 	b = append(b, 0x20, byte(localState))

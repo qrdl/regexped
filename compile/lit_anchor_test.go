@@ -3,6 +3,9 @@ package compile
 import (
 	"regexp/syntax"
 	"testing"
+
+	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 func TestPrefixStartsWithLineAnchor(t *testing.T) {
@@ -171,4 +174,191 @@ func TestFindLitAnchorPoint_ParseError(t *testing.T) {
 	if got := findLitAnchorPoint("[a-z]"); got != nil {
 		t.Errorf("findLitAnchorPoint([a-z]) = %+v, want nil", got)
 	}
+}
+
+// TestSimpleClassPrefix exercises simpleClassPrefix directly (0% covered
+// without this) across its qualifying and rejecting shapes.
+func TestSimpleClassPrefix(t *testing.T) {
+	parse := func(t *testing.T, p string) *syntax.Regexp {
+		t.Helper()
+		re, err := syntax.Parse(p, syntax.Perl)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", p, err)
+		}
+		return re
+	}
+
+	t.Run("char_class_exact_count", func(t *testing.T) {
+		re := parse(t, `[0-9]{8}`)
+		tlo, count, ok := simpleClassPrefix(re)
+		if !ok {
+			t.Fatal("expected ok=true for [0-9]{8}")
+		}
+		if count != 8 {
+			t.Errorf("count = %d, want 8", count)
+		}
+		// Every digit '0'-'9' should set its bit in the nibble-lookup table.
+		for _, r := range "0123456789" {
+			lo, hi := byte(r)&0xF, byte(r)>>4
+			if tlo[lo]&(1<<hi) == 0 {
+				t.Errorf("tlo table missing bit for %q", r)
+			}
+		}
+	})
+
+	t.Run("literal_char_exact_count", func(t *testing.T) {
+		// A repeated single-char literal ("aaa") folds to OpLiteral under Repeat's child.
+		re := &syntax.Regexp{
+			Op:  syntax.OpRepeat,
+			Min: 3, Max: 3,
+			Sub: []*syntax.Regexp{{Op: syntax.OpLiteral, Rune: []rune{'a'}}},
+		}
+		tlo, count, ok := simpleClassPrefix(re)
+		if !ok || count != 3 {
+			t.Fatalf("simpleClassPrefix(literal 'a'{3}) = (ok=%v, count=%d), want (true, 3)", ok, count)
+		}
+		if tlo['a'&0xF]&(1<<('a'>>4)) == 0 {
+			t.Error("tlo table missing bit for 'a'")
+		}
+	})
+
+	t.Run("capture_wrapped", func(t *testing.T) {
+		re := parse(t, `([a-f]{4})`)
+		_, count, ok := simpleClassPrefix(re)
+		if !ok || count != 4 {
+			t.Fatalf("simpleClassPrefix((capture)) = (ok=%v, count=%d), want (true, 4)", ok, count)
+		}
+	})
+
+	t.Run("rejects_ranged_count", func(t *testing.T) {
+		re := parse(t, `[0-9]{4,8}`)
+		if _, _, ok := simpleClassPrefix(re); ok {
+			t.Error("accepted a ranged {M,N} repeat")
+		}
+	})
+
+	t.Run("rejects_count_above_16", func(t *testing.T) {
+		re := parse(t, `[0-9]{17}`)
+		if _, _, ok := simpleClassPrefix(re); ok {
+			t.Error("accepted a repeat count > 16")
+		}
+	})
+
+	t.Run("rejects_non_repeat", func(t *testing.T) {
+		re := parse(t, `[0-9]`)
+		if _, _, ok := simpleClassPrefix(re); ok {
+			t.Error("accepted a non-OpRepeat node")
+		}
+	})
+
+	t.Run("rejects_non_class_child", func(t *testing.T) {
+		// Repeat of a concat body (nested structure) is neither OpCharClass nor OpLiteral.
+		re := &syntax.Regexp{
+			Op:  syntax.OpRepeat,
+			Min: 2, Max: 2,
+			Sub: []*syntax.Regexp{{
+				Op:  syntax.OpConcat,
+				Sub: []*syntax.Regexp{{Op: syntax.OpLiteral, Rune: []rune{'a'}}, {Op: syntax.OpLiteral, Rune: []rune{'b'}}},
+			}},
+		}
+		if _, _, ok := simpleClassPrefix(re); ok {
+			t.Error("accepted a non-class, non-literal repeat body")
+		}
+	})
+
+	t.Run("rejects_non_ascii_class", func(t *testing.T) {
+		re := parse(t, `[\x{100}-\x{200}]{4}`)
+		if _, _, ok := simpleClassPrefix(re); ok {
+			t.Error("accepted a class with runes above ASCII")
+		}
+	})
+
+	t.Run("rejects_non_ascii_literal", func(t *testing.T) {
+		re := &syntax.Regexp{
+			Op:  syntax.OpRepeat,
+			Min: 2, Max: 2,
+			Sub: []*syntax.Regexp{{Op: syntax.OpLiteral, Rune: []rune{'Ā'}}},
+		}
+		if _, _, ok := simpleClassPrefix(re); ok {
+			t.Error("accepted a literal rune above ASCII")
+		}
+	})
+
+	t.Run("rejects_multi_rune_literal", func(t *testing.T) {
+		re := &syntax.Regexp{
+			Op:  syntax.OpRepeat,
+			Min: 2, Max: 2,
+			Sub: []*syntax.Regexp{{Op: syntax.OpLiteral, Rune: []rune{'a', 'b'}}},
+		}
+		if _, _, ok := simpleClassPrefix(re); ok {
+			t.Error("accepted a multi-rune OpLiteral child")
+		}
+	})
+}
+
+// TestBuildSimplePrefixCheckBody calls buildSimplePrefixCheckBody directly
+// (0% covered without this): verifies the returned bytes are a well-formed
+// LEB128-size-prefixed WASM function body ending in the `end` opcode.
+func TestBuildSimplePrefixCheckBody(t *testing.T) {
+	re, err := syntax.Parse(`[0-9]{8}`, syntax.Perl)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	tlo, count, ok := simpleClassPrefix(re)
+	if !ok {
+		t.Fatal("simpleClassPrefix rejected [0-9]{8}")
+	}
+	body := buildSimplePrefixCheckBody(tlo, count)
+
+	sz, n := utils.DecodeULEB128(body)
+	if int(sz) != len(body)-n {
+		t.Fatalf("size prefix = %d, want %d (len(body)-%d)", sz, len(body)-n, n)
+	}
+	if body[len(body)-1] != 0x0B {
+		t.Errorf("body does not end with the `end` opcode (0x0B): got 0x%02X", body[len(body)-1])
+	}
+}
+
+// TestCompileLikelyNoMatchSimpleClassPrefix exercises the integration path
+// (compile.go) that gates buildSimplePrefixCheckBody on
+// LikelyMode == LikelyNoMatch: a bare `[class]{M}` prefix ahead of an
+// UNBOUNDED literal-anchored suffix. A bounded suffix (e.g. `{36}`) is
+// instead caught earlier by Gap E's analyseLitChainPrefixed and never
+// reaches this path — see the alt-lit-anchor dispatch test for the analogous
+// alternation case.
+func TestCompileLikelyNoMatchSimpleClassPrefix(t *testing.T) {
+	entry := config.RegexEntry{Pattern: `[0-9]{8}ghp_[^\s]+`, FindFunc: "f"}
+
+	p, err := compilePattern(entry, 0, 0, CompileOptions{LikelyMode: LikelyNoMatch})
+	if err != nil {
+		t.Fatalf("compilePattern: %v", err)
+	}
+	if p.litAnchorBackScanBody == nil {
+		t.Fatal("compilePattern did not take the lit-anchor path")
+	}
+	re, _ := syntax.Parse(entry.Pattern, syntax.Perl)
+	lap := findLitAnchorPointInRegexp(re)
+	if lap == nil {
+		t.Fatal("findLitAnchorPointInRegexp returned nil")
+	}
+	tlo, count, ok := simpleClassPrefix(lap.prefixRe)
+	if !ok {
+		t.Fatal("simpleClassPrefix rejected the pattern's prefix")
+	}
+	want := buildSimplePrefixCheckBody(tlo, count)
+	if string(p.litAnchorBackScanBody) != string(want) {
+		t.Error("litAnchorBackScanBody does not match buildSimplePrefixCheckBody's output")
+	}
+
+	// LikelyNeutral must NOT take the SIMD-verify shortcut (falls back to the
+	// generic scalar backward-scan body instead).
+	pNeutral, err := compilePattern(entry, 0, 0, CompileOptions{})
+	if err != nil {
+		t.Fatalf("compilePattern (neutral): %v", err)
+	}
+	if string(pNeutral.litAnchorBackScanBody) == string(want) {
+		t.Error("LikelyNeutral unexpectedly took the buildSimplePrefixCheckBody shortcut")
+	}
+
+	mustCompileEntries(t, []config.RegexEntry{entry}, CompileOptions{LikelyMode: LikelyNoMatch})
 }
