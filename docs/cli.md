@@ -26,7 +26,7 @@ regexps:
     groups_func:       "url_groups"        # anchored match with all capture groups
     named_groups_func: "url_named_groups"  # anchored match with named capture groups
 
-    hints: [prefer-match]   # optional; biases this pattern's emitted code shape (see below)
+    hints: [prefer-match, batch-find]   # optional; see "hints:" below
 
 sets:
   - name: "my_set"             # unique set name
@@ -35,7 +35,7 @@ sets:
     match: "validate"          # anchored at position 0 (optional)
     emit_name_map: true        # emit patternName(id) lookup helper in stubs
     patterns: all              # "all" or list of name: values from regexps:
-    hints: [prefer-no-match]   # optional; per-set default, see below
+    hints: [prefer-no-match]   # optional; per-set default; "batch-find" is not valid here, see below
 ```
 
 All paths in the config file are resolved relative to the config file's directory.
@@ -50,25 +50,57 @@ Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture gr
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
 
-### `hints:` — LikelyMode compile hints
+### `hints:` — LikelyMode and batch-find compile hints
 
-Both `regexps:` entries and `sets:` entries accept an optional `hints:` list
-that biases which code-shape optimisation the compiler favours for that
-pattern (or set): `[prefer-match]` (bias for fast-accept) or
-`[prefer-no-match]` (bias for fast-reject). The two are mutually exclusive;
-an absent or empty `hints:` list keeps the default (`LikelyNeutral`)
-behaviour. The hint never affects match correctness — only which
-optimisation path is emitted.
+Both `regexps:` entries and `sets:` entries accept an optional `hints:` list.
+Three values are recognised; `batch-find` is independent of the other two and
+may be combined with either (or neither) — the "mutually exclusive" rule only
+ever applies between `prefer-match` and `prefer-no-match`:
 
-A pattern's own `hints:` takes precedence over its enclosing set's `hints:`
-(and a set's own suffix-body compilation falls back to its `hints:` when a
-member pattern doesn't set its own). Setting `hints: [prefer-match]` on a
-`regexps:` entry also adds a `<func>_batch` WASM export for `find_func` and
-non-anchored `groups_func`, which the generated JS stub automatically
-prefers to reduce host↔WASM call overhead.
+- **`prefer-match`** — biases the compiler's code-shape choice for fast-accept.
+- **`prefer-no-match`** — biases for fast-reject. Mutually exclusive with
+  `prefer-match`.
+- **`batch-find`** — requests a `<func>_batch` WASM export for this pattern's
+  `find_func` and/or `groups_func` (see below). **Valid only on `regexps:`
+  entries** — it is a load-time error on a `sets:` entry (sets have their own
+  `find_all` batching via `batch_size`, a separate mechanism).
 
-See [likely.md](likely.md) for the full mechanism, per-mode effects, and
-task history.
+An absent or empty `hints:` list keeps the default (`LikelyNeutral`, no batch
+export). The `prefer-match`/`prefer-no-match` choice never affects match
+correctness — only which optimisation path is emitted.
+
+A pattern's own `prefer-match`/`prefer-no-match` takes precedence over its
+enclosing set's `hints:` (and a set's own suffix-body compilation falls back
+to its `hints:` when a member pattern doesn't set its own). `batch-find` has
+no set-level fallback to resolve, since it's rejected on `sets:` entries
+outright.
+
+See [prefer-hints.md](prefer-hints.md) for the full `prefer-match`/
+`prefer-no-match` mechanism, which pattern shapes benefit, and how to
+measure the effect on your own patterns with `tools/pattest`.
+
+#### `batch-find` — batched multi-match export (JS/TS only)
+
+Setting `hints: [batch-find]` on a `regexps:` entry adds a `<func>_batch` WASM
+export — `(ptr, len, out_ptr, out_cap, start_pos) → count` — that drains
+multiple matches per host call instead of one, for `find_func` and
+`groups_func` (`named_groups_func` shares `groups_func`'s batch export when
+both are set on the same entry, or gets its own — named after itself — when
+`named_groups_func` is the only capture export requested).
+
+**⚠ This hint is effective for the JS and TS generators only.** The generated
+JS/TS `find_func`/`groups_func`/`named_groups_func` consumer feature-detects
+the `_batch` export at runtime and prefers it automatically — no stub-side
+configuration needed, and the same generated stub works unmodified whether or
+not `batch-find` was set. **Setting `batch-find` has no effect on stubs
+generated for Rust, Go, C, or AssemblyScript** — those generators never look
+for a `_batch` export, so the WASM module gains the extra export but nothing
+in those stubs ever calls it. This is deliberate, not an oversight: for those
+four, the host and the regexp module are fused into one module by
+`wasm-merge`, so the `_batch` call would be an ordinary intra-module call, not
+the JS↔WASM boundary crossing the batching amortises — there is no
+projected win to justify the static-import decidability problems it would
+introduce. Don't set `batch-find` expecting a Rust/Go/C/AS speedup.
 
 ### Pattern support
 
@@ -275,7 +307,7 @@ sets:
 | `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
 | `batch_size` | No | Output buffer hint for stub iterators (default 256) |
 | `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
-| `hints` | No | `[prefer-match]` or `[prefer-no-match]`; per-set LikelyMode default — see [`hints:`](#hints--likelymode-compile-hints) above |
+| `hints` | No | `[prefer-match]` or `[prefer-no-match]`; per-set LikelyMode default. `batch-find` is rejected here — see [`hints:`](#hints--likelymode-and-batch-find-compile-hints) above |
 
 The `name:` field on `regexps:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
 

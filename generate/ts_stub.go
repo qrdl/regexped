@@ -186,15 +186,42 @@ export function %s(input: string | Uint8Array): [number, boolean] {
 `, funcName, funcName, funcName)
 }
 
+// genTSFindFunc generates a TS generator for non-anchored find.
+// Yields [start, end] absolute byte positions for each non-overlapping match.
+//
+// Prefers the batch export (funcName+"_batch", requested via the
+// "batch-find" hint — plans/TODO.md task 44) when the loaded WASM provides
+// one — draining lm2BatchCap matches per host call instead of one — and
+// falls back to the standard one-call-per-match loop otherwise. Ported from
+// genJSFindFunc (generate/js_stub.go) — see its doc comment for the full
+// rationale; TS uses the same `_exp['<name>']` dynamic lookup, so the
+// feature-detect carries over unchanged.
 func genTSFindFunc(funcName string) string {
-	return fmt.Sprintf(`// %s — yields [start, end] for each non-overlapping match.
-export function* %s(input: string | Uint8Array): Generator<[number, number]> {
+	return fmt.Sprintf(`// %[1]s — yields [start, end] for each non-overlapping match.
+export function* %[1]s(input: string | Uint8Array): Generator<[number, number]> {
     const b = _b(input);
+    if (typeof _exp['%[1]s_batch'] === 'function') {
+        _resize(b.length, %[2]d * 8);
+        _mem.set(b, _inBase);
+        const outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
+        let startPos = 0;
+        while (true) {
+            const n = (_exp['%[1]s_batch'] as CallableFunction)(_inBase, b.length, _outBase, %[2]d, startPos) as number;
+            if (n <= 0) break;
+            for (let i = 0; i < n; i++) {
+                yield [outBuf[i * 2], outBuf[i * 2 + 1]];
+            }
+            if (n < %[2]d) break;
+            const lastStart = outBuf[(n - 1) * 2], lastEnd = outBuf[(n - 1) * 2 + 1];
+            startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
+        }
+        return;
+    }
     _resize(b.length);
     _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        const r = (_exp['%s'] as CallableFunction)(_inBase + off, b.length - off) as bigint;
+        const r = (_exp['%[1]s'] as CallableFunction)(_inBase + off, b.length - off) as bigint;
         if (r < 0n) break;
         const relStart = Number(r >> 32n);
         const relEnd   = Number(r & 0xFFFFFFFFn);
@@ -203,30 +230,64 @@ export function* %s(input: string | Uint8Array): Generator<[number, number]> {
     }
 }
 
-`, funcName, funcName, funcName)
+`, funcName, lm2BatchCap)
 }
 
+// genTSGroupsFunc generates a TS generator for capture groups.
+// Yields an array per match, index 0 = full match, null for unmatched groups.
+//
+// Prefers the batch export (funcName+"_batch", requested via the
+// "batch-find" hint — plans/TODO.md task 44) when the loaded WASM provides
+// one, same as genTSFindFunc. Ported from genJSGroupsFunc
+// (generate/js_stub.go) — see compile/compile.go's buildBatchGroupsWrapperBody
+// for the record layout: [start, end, group0_start, group0_end, ...].
 func genTSGroupsFunc(funcName string, numGroups int) string {
 	slotCount := numGroups * 2
-	return fmt.Sprintf(`// %s — yields capture group arrays per match.
+	recSize := 2 + slotCount // ints per batch record
+	recBytes := recSize * 4  // bytes per batch record
+	return fmt.Sprintf(`// %[1]s — yields capture group arrays per match.
 // Each element is [start, end] (absolute) or null for unmatched groups.
 // Index 0 is the full match.
-export function* %s(input: string | Uint8Array): Generator<Array<[number, number] | null>> {
+export function* %[1]s(input: string | Uint8Array): Generator<Array<[number, number] | null>> {
     const b = _b(input);
+    if (typeof _exp['%[1]s_batch'] === 'function') {
+        _resize(b.length, %[2]d * %[4]d);
+        _mem.set(b, _inBase);
+        const outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
+        let startPos = 0;
+        while (true) {
+            const n = (_exp['%[1]s_batch'] as CallableFunction)(_inBase, b.length, _outBase, %[2]d, startPos) as number;
+            if (n <= 0) break;
+            for (let i = 0; i < n; i++) {
+                const base = i * %[3]d;
+                const result: Array<[number, number] | null> = [];
+                for (let g = 0; g < %[5]d; g++) {
+                    const s = outBuf[base + 2 + g * 2], e = outBuf[base + 2 + g * 2 + 1];
+                    result.push(s < 0 ? null : [s, e]);
+                }
+                yield result;
+            }
+            if (n < %[2]d) break;
+            const lastBase = (n - 1) * %[3]d;
+            const lastStart = outBuf[lastBase], lastEnd = outBuf[lastBase + 1];
+            startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
+        }
+        return;
+    }
     _resize(b.length);
     _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        const slots = new Int32Array(_mem.buffer, _outBase, %d);
+        const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
         slots.fill(-1);
-        if ((_exp['%s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) < 0) {
+        if ((_exp['%[1]s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) < 0) {
             if (off === b.length) break;
             off++;
             continue;
         }
         const matchEnd = slots[1] >= 0 ? slots[1] : 0;
         const result: Array<[number, number] | null> = [];
-        for (let i = 0; i < %d; i++) {
+        for (let i = 0; i < %[5]d; i++) {
             const s = slots[i * 2], e = slots[i * 2 + 1];
             result.push(s < 0 ? null : [off + s, off + e]);
         }
@@ -235,11 +296,21 @@ export function* %s(input: string | Uint8Array): Generator<Array<[number, number
     }
 }
 
-`, funcName, funcName, slotCount, funcName, numGroups)
+`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount)
 }
 
+// genTSNamedGroupsFunc generates a TS generator for named capture groups.
+// Yields a plain object per match with name → [start, end] entries.
+//
+// Prefers the batch export (exportName+"_batch", requested via the
+// "batch-find" hint — plans/TODO.md task 44) when the loaded WASM provides
+// one, same as genTSGroupsFunc. Ported from genJSNamedGroupsFunc
+// (generate/js_stub.go) — see its doc comment for why feature-detection is
+// keyed on exportName rather than funcName.
 func genTSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroups map[string]int) string {
 	slotCount := numGroups * 2
+	recSize := 2 + slotCount // ints per batch record
+	recBytes := recSize * 4  // bytes per batch record
 
 	type entry struct {
 		name  string
@@ -258,27 +329,54 @@ func genTSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 			e.index*2, e.name, e.index*2, e.index*2+1)
 	}
 
-	return fmt.Sprintf(`// %s — yields named capture group objects per match.
+	var batchInserts strings.Builder
+	for _, e := range entries {
+		fmt.Fprintf(&batchInserts,
+			"                if (outBuf[base + 2 + %d] >= 0) result['%s'] = [outBuf[base + 2 + %d], outBuf[base + 2 + %d]];\n",
+			e.index*2, e.name, e.index*2, e.index*2+1)
+	}
+
+	return fmt.Sprintf(`// %[1]s — yields named capture group objects per match.
 // Each object maps name → [start, end] (absolute) for participating groups.
-export function* %s(input: string | Uint8Array): Generator<Record<string, [number, number]>> {
+export function* %[1]s(input: string | Uint8Array): Generator<Record<string, [number, number]>> {
     const b = _b(input);
+    if (typeof _exp['%[2]s_batch'] === 'function') {
+        _resize(b.length, %[3]d * %[4]d);
+        _mem.set(b, _inBase);
+        const outBuf = new Int32Array(_mem.buffer, _outBase, %[3]d * %[5]d);
+        let startPos = 0;
+        while (true) {
+            const n = (_exp['%[2]s_batch'] as CallableFunction)(_inBase, b.length, _outBase, %[3]d, startPos) as number;
+            if (n <= 0) break;
+            for (let i = 0; i < n; i++) {
+                const base = i * %[5]d;
+                const result: Record<string, [number, number]> = {};
+%[6]s                yield result;
+            }
+            if (n < %[3]d) break;
+            const lastBase = (n - 1) * %[5]d;
+            const lastStart = outBuf[lastBase], lastEnd = outBuf[lastBase + 1];
+            startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
+        }
+        return;
+    }
     _resize(b.length);
     _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        const slots = new Int32Array(_mem.buffer, _outBase, %d);
+        const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
         slots.fill(-1);
-        if ((_exp['%s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) < 0) {
+        if ((_exp['%[2]s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) < 0) {
             if (off === b.length) break;
             off++;
             continue;
         }
         const matchEnd = slots[1] >= 0 ? slots[1] : 0;
         const result: Record<string, [number, number]> = {};
-%s        off += matchEnd > 0 ? matchEnd : 1;
+%[8]s        off += matchEnd > 0 ? matchEnd : 1;
         yield result;
     }
 }
 
-`, funcName, funcName, slotCount, exportName, inserts.String())
+`, funcName, exportName, lm2BatchCap, recBytes, recSize, batchInserts.String(), slotCount, inserts.String())
 }

@@ -1478,8 +1478,8 @@ type dfaLayout struct {
 // archive) along with the filter conditionals in the dispatch loops
 // (Sections 7-8).
 type dominantInfo struct {
-	state       int32  // WASM state ID (> 0)
-	exitBytes   []byte // 1..8 exit bytes (Shufti cap); mutually exclusive with selfLoopSet
+	state     int32  // WASM state ID (> 0)
+	exitBytes []byte // 1..8 exit bytes (Shufti cap); mutually exclusive with selfLoopSet
 	// selfLoopSet (task 26, plans/TODO.md): 9..64 bytes — the self-loop
 	// membership set itself, for states recorded by detectShuftiSelfLoop
 	// rather than detectDominantSelfLoop. Used instead of exitBytes when
@@ -2900,7 +2900,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			// match-body bulk-skip + (optional) nonMidDominantBytes for the
 			// LM-gated non-mid match-body dispatch + TDFA accept tables.
 			emitMidAccept := len(l.dominantStates) > 0
-count := byte(1) // transitions
+			count := byte(1) // transitions
 			if emitMidAccept {
 				count++
 			}
@@ -3728,7 +3728,7 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 // Three emission paths, chosen by which of `info.selfLoopSet` /
 // `info.exitBytes` is populated (mutually exclusive):
 //
-//   • Task 26 — self-loop-set Shufti (info.selfLoopSet, 9..64 bytes):
+//   - Task 26 — self-loop-set Shufti (info.selfLoopSet, 9..64 bytes):
 //     the self-loop set itself is the small side. Tests membership in it
 //     directly via the shared emitShuftiPrefixCheck primitive and inverts
 //     the resulting bitmask (XOR 0xFFFF) so "stop" bits mark bytes NOT in
@@ -3737,20 +3737,20 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 //     exit set — detectDominantSelfLoop's ≤8-exit-byte gate can never
 //     reach this shape). See detectShuftiSelfLoop.
 //
-//   • Single exit byte (Phase 2, info.exitBytes len 1):
+//   - Single exit byte (Phase 2, info.exitBytes len 1):
 //     `i8x16.splat + i8x16.eq + i8x16.bitmask`. Three SIMD ops; the splat
 //     constant is folded by JIT into the loop preamble. Fast path for
 //     patterns like `//[^\n]+`.
 //
-//   • Multi exit byte (Phase 5, info.exitBytes len 2..8): Shufti-style
+//   - Multi exit byte (Phase 5, info.exitBytes len 2..8): Shufti-style
 //     nibble lookup on the EXIT set (the small side in this case).
 //     Build two 16-byte tables T_lo and T_hi where bit i of T_lo[lo]
 //     (resp. T_hi[hi]) is set iff exit byte i has low (resp. high)
 //     nibble equal to lo (resp. hi). Per chunk:
-//       lo_bits = swizzle(T_lo, chunk & 0x0F)
-//       hi_bits = swizzle(T_hi, chunk >> 4)
-//       match  = lo_bits & hi_bits        ; non-zero lanes = exit bytes
-//       mask   = bitmask(match != 0)
+//     lo_bits = swizzle(T_lo, chunk & 0x0F)
+//     hi_bits = swizzle(T_hi, chunk >> 4)
+//     match  = lo_bits & hi_bits        ; non-zero lanes = exit bytes
+//     mask   = bitmask(match != 0)
 //     Eight SIMD ops; tables inlined as v128.const. Unlocks patterns
 //     like `https?://[^\s]+` (6-byte `\s` exit) and `<[^>]+>` if
 //     a future revisit broadens.
@@ -3777,20 +3777,20 @@ func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
 // Layout (caller has already gated on state being dominant; `pos` is the
 // position of the byte just consumed):
 //
-//   block $bulk_done:
-//     loop $bulk_outer:
-//       if pos + 17 > len: br $bulk_done   // not enough room for 16-byte SIMD
-//       chunk = v128.load(ptr + pos + 1)
-//       m = <single-byte or Shufti match → i32 bitmask>
-//       if m == 0:
-//         pos += 16
-//         br $bulk_outer  // continue loop
-//       else:
-//         pos += i32.ctz(m)
-//         last_accept = pos + 1
-//         br $bulk_done
-//     end loop
-//   end block
+//	block $bulk_done:
+//	  loop $bulk_outer:
+//	    if pos + 17 > len: br $bulk_done   // not enough room for 16-byte SIMD
+//	    chunk = v128.load(ptr + pos + 1)
+//	    m = <single-byte or Shufti match → i32 bitmask>
+//	    if m == 0:
+//	      pos += 16
+//	      br $bulk_outer  // continue loop
+//	    else:
+//	      pos += i32.ctz(m)
+//	      last_accept = pos + 1
+//	      br $bulk_done
+//	  end loop
+//	end block
 //
 // After the block, pos is positioned so the next pos++ takes execution
 // past the self-loop bytes and onto the first exit byte (which the next
@@ -3840,7 +3840,7 @@ func emitHystBulkSkip(b []byte, info dominantInfo,
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x21, hystPosLocal)
 	b = emitDominantBulkSkip(b, info, false,
-		posLocal, lenLocal, /*lastAccept=*/ 0x00, ptrLocal,
+		posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
 		chunkLocal, tmpLocal)
 	// hystCounter = (pos - hystPos < 16) ? hystCounter + 1 : 0
 	b = append(b, 0x20, posLocal)
@@ -4041,7 +4041,7 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (void)
 			b = emitDominantBulkSkip(b, info, false,
-				posLocal, lenLocal, /*lastAccept=*/ 0x00, ptrLocal,
+				posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
 				chunkLocal, tmpLocal)
 			b = append(b, 0x0B) // end if (per-dominant gate)
 		}
@@ -4183,7 +4183,7 @@ func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	b = append(b, 0x05) // else
 	//   pos += ctz(m); [optionally last_accept = pos + 1]; break to $bulk_done
 	b = append(b, 0x20, tmpLocal)
-	b = append(b, 0x68)           // i32.ctz
+	b = append(b, 0x68) // i32.ctz
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x6A) // i32.add
 	if updateLastAccept {
@@ -5631,7 +5631,7 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 	b = append(b, 0x04, 0x7F)         // if (result i32) — start of input
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(l.wasmStart))
-	b = append(b, 0x05) // else
+	b = append(b, 0x05)               // else
 	b = append(b, 0x20, locPtr)       // local.get ptr
 	b = append(b, 0x20, locRevResult) // local.get rev_result
 	b = append(b, 0x41, 0x01)
@@ -6192,21 +6192,21 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	emitOuterPrologue := func(b []byte) []byte {
 		lenForScan := byte(1) // raw len param
 		params := prefixScanParams{
-			Prefix:         prefix,
-			FirstByteSet:   firstBytes,
-			FirstByteFlags: firstByteFlags,
-			FirstByteOff:   firstByteOff,
-			TeddyLoOff:     teddyLoOff,
-			TeddyHiOff:     teddyHiOff,
-			TeddyT1LoOff:   teddyT1LoOff,
-			TeddyT1HiOff:   teddyT1HiOff,
-			TeddyTwoByte:   teddyTwoByte,
-			TeddyT2LoOff:   teddyT2LoOff,
-			TeddyT2HiOff:   teddyT2HiOff,
-			TeddyThreeByte: teddyThreeByte,
-			TeddyT3LoOff:   teddyT3LoOff,
-			TeddyT3HiOff:   teddyT3HiOff,
-			TeddyFourByte:  teddyFourByte,
+			Prefix:           prefix,
+			FirstByteSet:     firstBytes,
+			FirstByteFlags:   firstByteFlags,
+			FirstByteOff:     firstByteOff,
+			TeddyLoOff:       teddyLoOff,
+			TeddyHiOff:       teddyHiOff,
+			TeddyT1LoOff:     teddyT1LoOff,
+			TeddyT1HiOff:     teddyT1HiOff,
+			TeddyTwoByte:     teddyTwoByte,
+			TeddyT2LoOff:     teddyT2LoOff,
+			TeddyT2HiOff:     teddyT2HiOff,
+			TeddyThreeByte:   teddyThreeByte,
+			TeddyT3LoOff:     teddyT3LoOff,
+			TeddyT3HiOff:     teddyT3HiOff,
+			TeddyFourByte:    teddyFourByte,
 			TableMemIdx:      tableMemIdx,
 			LikelyNoMatch:    lnmAction5,
 			AllowDenseSwitch: needsDenseSwitch,
@@ -6678,9 +6678,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		// instruction sequence.
 		b = emitFindMidAcceptDispatch(b, dominantStates, useMandatoryLit,
 			midAcceptOff, tableMemIdx,
-			/*state=*/ 0x02, /*pos=*/ 0x03, /*len=*/ 0x01,
-			/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
-			chunkLocal, /*val+tmp=*/ 0x06,
+			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
+			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
+			chunkLocal /*val+tmp=*/, 0x06,
 			bulkHystCounterLocal, bulkHystPosLocal)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
@@ -6755,9 +6755,9 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		// above and emitFindMidAcceptDispatch for the value-range scheme.
 		b = emitFindMidAcceptDispatch(b, dominantStates, useMandatoryLit,
 			midAcceptOff, tableMemIdx,
-			/*state=*/ 0x02, /*pos=*/ 0x03, /*len=*/ 0x01,
-			/*lastAccept=*/ 0x05, /*ptr=*/ 0x00,
-			chunkLocal, /*val+tmp=*/ simdMaskLocal,
+			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
+			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
+			chunkLocal /*val+tmp=*/, simdMaskLocal,
 			bulkHystCounterLocal, bulkHystPosLocal)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
@@ -6890,11 +6890,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 
 // litChainPattern is the structural shape recognised by analyseLitChain.
 type litChainPattern struct {
-	literal     []byte   // K-byte literal prefix (K >= 1)
-	tlo         [16]byte // nibble table: bit h of Tlo[l] set iff byte (h<<4|l) ∈ class
-	count       int      // N — minimum chain length (N >= 1, K+N >= 16)
-	countMax    int      // M — maximum chain length (M >= N). Equals count for {N,N}.
-	greedy      bool     // false for `{N,M}?`; only matters when count < countMax
+	literal  []byte   // K-byte literal prefix (K >= 1)
+	tlo      [16]byte // nibble table: bit h of Tlo[l] set iff byte (h<<4|l) ∈ class
+	count    int      // N — minimum chain length (N >= 1, K+N >= 16)
+	countMax int      // M — maximum chain length (M >= N). Equals count for {N,N}.
+	greedy   bool     // false for `{N,M}?`; only matters when count < countMax
 	// Gap E: optional class prefix `<class>{prefixCount}` BEFORE the literal.
 	prefixCount  int      // 0 = no prefix (classic shape)
 	prefixBitmap [32]byte // scalar prefix verify
@@ -6996,13 +6996,13 @@ func analyseLitChainRe(re *syntax.Regexp, minCount int) (*litChainPattern, bool)
 // litChainAltBranch is one branch inside a lit-chain alternation, plus a
 // per-branch decision about whether to use SIMD or scalar class verify.
 type litChainAltBranch struct {
-	literal     []byte
-	bitmap      [32]byte // 256-bit byte-class bitmap (for scalar verify when useSIMD=false)
-	tlo         [16]byte // nibble table (for SIMD verify when useSIMD=true)
-	count       int      // N (min)
-	countMax    int      // M (max); equals count for {N,N}
-	greedy      bool     // false for `{N,M}?`
-	useSIMD     bool     // N >= 24 → SIMD chunks; else scalar byte-by-byte
+	literal  []byte
+	bitmap   [32]byte // 256-bit byte-class bitmap (for scalar verify when useSIMD=false)
+	tlo      [16]byte // nibble table (for SIMD verify when useSIMD=true)
+	count    int      // N (min)
+	countMax int      // M (max); equals count for {N,N}
+	greedy   bool     // false for `{N,M}?`
+	useSIMD  bool     // N >= 24 → SIMD chunks; else scalar byte-by-byte
 	// Gap E: optional class prefix.
 	prefixCount  int
 	prefixBitmap [32]byte
@@ -7621,18 +7621,18 @@ func emitStartAnchorCheck(b []byte, anchor anchorType, literalFirstByte byte,
 	case anchorWordBoundary, anchorNoWordBoundary:
 		// Push leftWord = (attempt_start > 0) ? is_word(input[attempt_start-1]) : 0
 		b = append(b, 0x20, locAttemptStart)
-		b = append(b, 0x45)           // i32.eqz
-		b = append(b, 0x04, 0x7F)     // if (result i32)
-		b = append(b, 0x41, 0x00)     // attempt_start == 0 → 0
-		b = append(b, 0x05)           // else
+		b = append(b, 0x45)       // i32.eqz
+		b = append(b, 0x04, 0x7F) // if (result i32)
+		b = append(b, 0x41, 0x00) // attempt_start == 0 → 0
+		b = append(b, 0x05)       // else
 		b = append(b, 0x20, locPtr)
 		b = append(b, 0x20, locAttemptStart)
 		b = append(b, 0x41, 0x01)
-		b = append(b, 0x6B)           // attempt_start - 1
-		b = append(b, 0x6A)           // ptr + ...
+		b = append(b, 0x6B) // attempt_start - 1
+		b = append(b, 0x6A) // ptr + ...
 		b = append(b, 0x2D, 0x00, 0x00)
 		b = emitIsWordByte(b, tmpLocal)
-		b = append(b, 0x0B)           // end if
+		b = append(b, 0x0B) // end if
 
 		// XOR with compile-time is_word(literalFirstByte)
 		var rightWord int32
@@ -7641,10 +7641,10 @@ func emitStartAnchorCheck(b []byte, anchor anchorType, literalFirstByte byte,
 		}
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, rightWord)
-		b = append(b, 0x73)           // i32.xor → boundary (0 or 1)
+		b = append(b, 0x73) // i32.xor → boundary (0 or 1)
 
 		if anchor == anchorWordBoundary {
-			b = append(b, 0x45)       // i32.eqz: fail if !boundary
+			b = append(b, 0x45) // i32.eqz: fail if !boundary
 		}
 		b = append(b, 0x0D, failBrDepth)
 		return b
@@ -7677,7 +7677,7 @@ func emitEndAnchorCheck(b []byte, anchor anchorType,
 		b = utils.AppendSLEB128(b, total)
 		b = append(b, 0x6A)
 		b = append(b, 0x20, locLen)
-		b = append(b, 0x47)           // i32.ne
+		b = append(b, 0x47) // i32.ne
 		b = append(b, 0x0D, failBrDepth)
 		return b
 	case anchorWordBoundary, anchorNoWordBoundary:
@@ -7697,8 +7697,8 @@ func emitEndAnchorCheck(b []byte, anchor anchorType,
 		b = utils.AppendSLEB128(b, total)
 		b = append(b, 0x6A)
 		b = append(b, 0x20, locLen)
-		b = append(b, 0x49)           // i32.lt_u
-		b = append(b, 0x04, 0x7F)     // if (result i32)
+		b = append(b, 0x49)       // i32.lt_u
+		b = append(b, 0x04, 0x7F) // if (result i32)
 		b = append(b, 0x20, locPtr)
 		b = append(b, 0x20, locAttemptStart)
 		b = append(b, 0x41)
@@ -7707,14 +7707,14 @@ func emitEndAnchorCheck(b []byte, anchor anchorType,
 		b = append(b, 0x6A)
 		b = append(b, 0x2D, 0x00, 0x00)
 		b = emitIsWordByte(b, tmpLocal)
-		b = append(b, 0x05)           // else
+		b = append(b, 0x05) // else
 		b = append(b, 0x41, 0x00)
-		b = append(b, 0x0B)           // end if
+		b = append(b, 0x0B) // end if
 
-		b = append(b, 0x73)           // i32.xor → boundary
+		b = append(b, 0x73) // i32.xor → boundary
 
 		if anchor == anchorWordBoundary {
-			b = append(b, 0x45)       // i32.eqz: fail if !boundary
+			b = append(b, 0x45) // i32.eqz: fail if !boundary
 		}
 		b = append(b, 0x0D, failBrDepth)
 		return b
@@ -7794,7 +7794,9 @@ func emitReturnPackedI64FromLocal(b []byte, startLocal, endLocal byte) []byte {
 // out of class. Returns with stack unchanged (falls through on success).
 //
 // Block + loop nesting (depths from inside loop body):
-//   0 = $vloop (loop), 1 = $loop_done (block), 2..N = caller's blocks.
+//
+//	0 = $vloop (loop), 1 = $loop_done (block), 2..N = caller's blocks.
+//
 // branchFailDepth is the caller-block depth that should be reached on
 // verification failure (typically 0 = $next_branch_i from the alt dispatch).
 func emitScalarBitmapVerify(b []byte, literal []byte, count int,
@@ -8461,10 +8463,10 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) []byte
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, m)
-	b = append(b, 0x6B)         // i32.sub → start
-	b = append(b, 0xAD)         // i64.extend_i32_u
-	b = append(b, 0x42, 0x20)   // i64.const 32
-	b = append(b, 0x86)         // i64.shl
+	b = append(b, 0x6B)       // i32.sub → start
+	b = append(b, 0xAD)       // i64.extend_i32_u
+	b = append(b, 0x42, 0x20) // i64.const 32
+	b = append(b, 0x86)       // i64.shl
 
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41)
@@ -8615,7 +8617,6 @@ func analyseLitChainPrefixed(pattern string) (*litChainPattern, bool) {
 		endAnchor:    info.endAnchor,
 	}, true
 }
-
 
 // buildLitChainMatchBody emits the WASM body for an anchored match against a
 // lit-chain pattern. Signature: (ptr i32, len i32) → i32 (end pos, or -1).
@@ -9879,7 +9880,7 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 				b = append(b, 0x20, locLen)
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, int32(len(br.literal)))
-				b = append(b, 0x4B)      // i32.lt_u
+				b = append(b, 0x4B)       // i32.lt_u
 				b = append(b, 0x0D, 0x00) // br_if $next_branch_i (literal can't fit)
 
 				b = emitLiteralByteVerify(b, br.literal, 1, locPtr, locAttemptZero, 0)
@@ -9921,17 +9922,18 @@ func appendLenAltMatchCodeEntry(cs []byte, altp *lenAltPattern, l lenAltLayout, 
 // lit-chain pattern. Signature: (ptr i32, len i32) → i64 (packed start<<32|end, or -1).
 //
 // Structure:
-//   block $no_match
-//     loop $lit_outer
-//       emitPrefixScan with Prefix=literal, EngineDepth=2  // scan exits on exhaust
-//       ; attempt_start = candidate position (literal already verified by scan)
-//       ; bounds check: attempt_start + K + N <= len, else $no_match
-//       ; SIMD class verify of next N bytes
-//       ; if mismatch: attempt_start++; br $lit_outer
-//       ; return packed (attempt_start << 32 | attempt_start + K + N)
-//     end loop
-//   end block $no_match
-//   return -1
+//
+//	block $no_match
+//	  loop $lit_outer
+//	    emitPrefixScan with Prefix=literal, EngineDepth=2  // scan exits on exhaust
+//	    ; attempt_start = candidate position (literal already verified by scan)
+//	    ; bounds check: attempt_start + K + N <= len, else $no_match
+//	    ; SIMD class verify of next N bytes
+//	    ; if mismatch: attempt_start++; br $lit_outer
+//	    ; return packed (attempt_start << 32 | attempt_start + K + N)
+//	  end loop
+//	end block $no_match
+//	return -1
 func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 	var b []byte
 
@@ -9989,7 +9991,7 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, total)
-	b = append(b, 0x6A)       // i32.add
+	b = append(b, 0x6A) // i32.add
 	b = append(b, 0x20, locLen)
 	b = append(b, 0x4B)       // i32.gt_u
 	b = append(b, 0x0D, 0x01) // br_if 1 → $no_match
@@ -10143,8 +10145,8 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, total)
-	b = append(b, 0x6A)       // i32.add
-	b = append(b, 0x0F)       // return
+	b = append(b, 0x6A) // i32.add
+	b = append(b, 0x0F) // return
 
 	if hasAnchors {
 		b = append(b, 0x0B) // end $next_attempt
@@ -10425,13 +10427,14 @@ func emitRangeClassVerify(b []byte, lcp *litChainPattern,
 // with a greedy range count `{N,M}`. Signature: (ptr,len) → i64.
 //
 // Algorithm:
-//   loop $lit_outer:
-//     prefix scan for literal → attempt_start
-//     if attempt_start + K + N > len: $no_match
-//     SIMD range class verify → match_len (count of class-matching bytes in [K..K+M))
-//     match_len = min(match_len, len - attempt_start - K)   // runtime cap
-//     if match_len < N: advance attempt_start; restart
-//     return packed (attempt_start, attempt_start + K + match_len)
+//
+//	loop $lit_outer:
+//	  prefix scan for literal → attempt_start
+//	  if attempt_start + K + N > len: $no_match
+//	  SIMD range class verify → match_len (count of class-matching bytes in [K..K+M))
+//	  match_len = min(match_len, len - attempt_start - K)   // runtime cap
+//	  if match_len < N: advance attempt_start; restart
+//	  return packed (attempt_start, attempt_start + K + match_len)
 func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 	var b []byte
 
@@ -10749,7 +10752,7 @@ type litChainAltLayout struct {
 	teddyHiOff      int32
 	teddyT1LoOff    int32 // 2-byte Teddy second-byte tables (0 if useTwoByteTeddy=false)
 	teddyT1HiOff    int32
-	useTwoByteTeddy bool  // true when all branches have K≥2 (so second byte is fixed literal)
+	useTwoByteTeddy bool // true when all branches have K≥2 (so second byte is fixed literal)
 	branchBitmapOff []int32
 	tableEnd        int64
 }
@@ -10857,16 +10860,17 @@ func buildLitChainAltDataSegments(altp *litChainAltPattern, l litChainAltLayout)
 // lit-chain branches. Signature: (ptr i32, len i32) → i64.
 //
 // Locals layout:
-//   0  ptr            (param i32)
-//   1  len            (param i32)
-//   2  attempt_start  (i32)
-//   3  simdMask       (i32) — scan
-//   4  scalarIdx      (i32) — scalar verify loop counter
-//   5  chunk          (v128) — scan + SIMD verify (reused)
-//   6  teddyLo        (v128) — scan
-//   7  teddyHi        (v128) — scan
-//   8  verifyTlo      (v128) — SIMD verify (loaded per branch)
-//   9  verifyPow2     (v128) — SIMD verify (loaded once)
+//
+//	0  ptr            (param i32)
+//	1  len            (param i32)
+//	2  attempt_start  (i32)
+//	3  simdMask       (i32) — scan
+//	4  scalarIdx      (i32) — scalar verify loop counter
+//	5  chunk          (v128) — scan + SIMD verify (reused)
+//	6  teddyLo        (v128) — scan
+//	7  teddyHi        (v128) — scan
+//	8  verifyTlo      (v128) — SIMD verify (loaded per branch)
+//	9  verifyPow2     (v128) — SIMD verify (loaded once)
 func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
 	const (
 		locPtr          byte = 0
@@ -10880,9 +10884,9 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 		locTeddyT1Lo    byte = 8
 		locTeddyT1Hi    byte = 9
 		// locVerifyTlo doubles as locTeddyChunk1 during scan (different phases).
-		locVerifyTlo    byte = 10
-		locTeddyChunk1  byte = 10
-		locVerifyPow2   byte = 11
+		locVerifyTlo   byte = 10
+		locTeddyChunk1 byte = 10
+		locVerifyPow2  byte = 11
 	)
 
 	var b []byte
@@ -11427,8 +11431,9 @@ func analyseLitChainAltLenient(pattern string) (*lenAltPattern, bool) {
 }
 
 // planLenAltLayout computes data-segment offsets for a lenient alternation:
-//   firstByteFlags, teddyLo, teddyHi, then per-branch tables (lit-chain bitmaps
-//   for scalar branches OR full DFA tables for DFA branches).
+//
+//	firstByteFlags, teddyLo, teddyHi, then per-branch tables (lit-chain bitmaps
+//	for scalar branches OR full DFA tables for DFA branches).
 type lenAltLayout struct {
 	firstByteOff int32
 	teddyLoOff   int32
@@ -11520,11 +11525,12 @@ func buildLenAltDataSegments(altp *lenAltPattern, l lenAltLayout) ([]byte, int) 
 //   - on dead state / EOF without accept: br to nextBranchDepth → $next_branch_i.
 //
 // Locals used (must be declared in caller):
-//   locPtr, locLen      — outer i32
-//   locState            — i32 scratch (state)
-//   locPos              — i32 scratch (pos, init to attempt_start)
-//   locClass            — i32 scratch (class lookup)
-//   locOutEnd           — i32 (output: position one past last accepted byte)
+//
+//	locPtr, locLen      — outer i32
+//	locState            — i32 scratch (state)
+//	locPos              — i32 scratch (pos, init to attempt_start)
+//	locClass            — i32 scratch (class lookup)
+//	locOutEnd           — i32 (output: position one past last accepted byte)
 //
 // Constraint: dfaLayout.useU8 must be true (we capped DFA at 256 states).
 func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout, t *dfaTable,
@@ -11908,12 +11914,12 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	b = utils.AppendSLEB128(b, l.firstByteOff)
 	b = append(b, 0x20, locPtr)
 	b = append(b, 0x20, locWindowBase)
-	b = append(b, 0x6A)                     // i32.add
-	b = append(b, 0x2D, 0x00, 0x00)         // i32.load8_u (input byte)
-	b = append(b, 0x6A)                     // firstByteOff + byte
-	b = appendTableLoad8u(b, tableMemIdx)   // i32.load8_u (flag)
-	b = append(b, 0x45)                     // i32.eqz
-	b = append(b, 0x0D, 0x00)               // br_if 0 → $not_a_candidate (skip dispatch)
+	b = append(b, 0x6A)                   // i32.add
+	b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u (input byte)
+	b = append(b, 0x6A)                   // firstByteOff + byte
+	b = appendTableLoad8u(b, tableMemIdx) // i32.load8_u (flag)
+	b = append(b, 0x45)                   // i32.eqz
+	b = append(b, 0x0D, 0x00)             // br_if 0 → $not_a_candidate (skip dispatch)
 
 	b = append(b, 0x20, locWindowBase)
 	b = append(b, 0x21, locAttemptStart)

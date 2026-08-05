@@ -191,8 +191,9 @@ export function %s(input) {
 `, funcName, funcName, funcName)
 }
 
-// lm2BatchCap is the per-refill match capacity used by the JS find/groups
-// generators' LM-2 batch path (plans/LM_TODO.md LM-2). Not user-configurable
+// lm2BatchCap is the per-refill match capacity used by the JS/TS find/groups
+// generators' batch path (originally LM-2, plans/LM_TODO.md LM-2; the trigger
+// is now the "batch-find" hint, plans/TODO.md task 44). Not user-configurable
 // in v1 — see set stubs' batchSize for the analogous, config-driven sizing
 // used by sets.
 const lm2BatchCap = 256
@@ -200,18 +201,18 @@ const lm2BatchCap = 256
 // genJSFindFunc generates a JS generator for non-anchored find.
 // Yields [start, end] absolute byte positions for each non-overlapping match.
 //
-// Prefers the LM-2 batch export (funcName+"_batch") when the loaded WASM
-// provides one — draining lm2BatchCap matches per host call instead of one
-// — and falls back to the standard one-call-per-match loop otherwise. The
-// feature-detect (typeof check, once per generator invocation) makes this
-// stub work unmodified whether the pattern was compiled under LikelyMatch
-// or not, so it doesn't need to replicate the compiler's LikelyMode
-// precedence chain.
+// Prefers the batch export (funcName+"_batch", requested via the "batch-find"
+// hint — plans/TODO.md task 44) when the loaded WASM provides one — draining
+// lm2BatchCap matches per host call instead of one — and falls back to the
+// standard one-call-per-match loop otherwise. The feature-detect (typeof
+// check, once per generator invocation) makes this stub work unmodified
+// whether or not the pattern's hints requested a batch export, so it doesn't
+// need to replicate the compiler's hint-resolution logic.
 func genJSFindFunc(funcName string) string {
 	return fmt.Sprintf(`// %[1]s — yields [start, end] for each non-overlapping match.
 export function* %[1]s(input) {
     const b = _b(input);
-    if (false && typeof _exp['%[1]s_batch'] === 'function') { // DISABLED 2026-08-02, plans/TODO.md task 44 — remove "false && " to restore
+    if (typeof _exp['%[1]s_batch'] === 'function') {
         _resize(b.length, %[2]d * 8);
         _mem.set(b, _inBase);
         const outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
@@ -262,7 +263,7 @@ func genJSGroupsFunc(funcName string, numGroups int) string {
 // Index 0 is the full match.
 export function* %[1]s(input) {
     const b = _b(input);
-    if (false && typeof _exp['%[1]s_batch'] === 'function') { // DISABLED 2026-08-02, plans/TODO.md task 44 — remove "false && " to restore
+    if (typeof _exp['%[1]s_batch'] === 'function') {
         _resize(b.length, %[2]d * %[4]d);
         _mem.set(b, _inBase);
         const outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
@@ -314,8 +315,19 @@ export function* %[1]s(input) {
 // genJSNamedGroupsFunc generates a JS generator for named capture groups.
 // Yields a plain object per match with name → [start, end] entries.
 // Only groups that participated in the match are included.
+//
+// Prefers the batch export (exportName+"_batch", requested via the
+// "batch-find" hint — plans/TODO.md task 44) when the loaded WASM provides
+// one, same as genJSGroupsFunc. Feature-detection and the record layout are
+// keyed on exportName — the WASM export this pattern's groups_func and
+// named_groups_func share (config.RegexEntry.GroupsExportName) — not on
+// funcName, so a named_groups_func-only pattern (no groups_func) still finds
+// its batch export, and a pattern requesting both gets one batch export
+// consumed by two independent generators.
 func genJSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroups map[string]int) string {
 	slotCount := numGroups * 2
+	recSize := 2 + slotCount // ints per batch record
+	recBytes := recSize * 4  // bytes per batch record
 
 	type entry struct {
 		name  string
@@ -334,27 +346,54 @@ func genJSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 			e.index*2, e.name, e.index*2, e.index*2+1)
 	}
 
-	return fmt.Sprintf(`// %s — yields named capture group objects per match.
+	var batchInserts strings.Builder
+	for _, e := range entries {
+		fmt.Fprintf(&batchInserts,
+			"                if (outBuf[base + 2 + %d] >= 0) result['%s'] = [outBuf[base + 2 + %d], outBuf[base + 2 + %d]];\n",
+			e.index*2, e.name, e.index*2, e.index*2+1)
+	}
+
+	return fmt.Sprintf(`// %[1]s — yields named capture group objects per match.
 // Each object maps name → [start, end] (absolute) for participating groups.
-export function* %s(input) {
+export function* %[1]s(input) {
     const b = _b(input);
+    if (typeof _exp['%[2]s_batch'] === 'function') {
+        _resize(b.length, %[3]d * %[4]d);
+        _mem.set(b, _inBase);
+        const outBuf = new Int32Array(_mem.buffer, _outBase, %[3]d * %[5]d);
+        let startPos = 0;
+        while (true) {
+            const n = _exp['%[2]s_batch'](_inBase, b.length, _outBase, %[3]d, startPos);
+            if (n <= 0) break;
+            for (let i = 0; i < n; i++) {
+                const base = i * %[5]d;
+                const result = {};
+%[6]s                yield result;
+            }
+            if (n < %[3]d) break;
+            const lastBase = (n - 1) * %[5]d;
+            const lastStart = outBuf[lastBase], lastEnd = outBuf[lastBase + 1];
+            startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
+        }
+        return;
+    }
     _resize(b.length);
     _mem.set(b, _inBase);
     let off = 0;
     while (off <= b.length) {
-        const slots = new Int32Array(_mem.buffer, _outBase, %d);
+        const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
         slots.fill(-1);
-        if (_exp['%s'](_inBase + off, b.length - off, _outBase) < 0) {
+        if (_exp['%[2]s'](_inBase + off, b.length - off, _outBase) < 0) {
             if (off === b.length) break;
             off++;
             continue;
         }
         const matchEnd = slots[1] >= 0 ? slots[1] : 0;
         const result = {};
-%s        off += matchEnd > 0 ? matchEnd : 1;
+%[8]s        off += matchEnd > 0 ? matchEnd : 1;
         yield result;
     }
 }
 
-`, funcName, funcName, slotCount, exportName, inserts.String())
+`, funcName, exportName, lm2BatchCap, recBytes, recSize, batchInserts.String(), slotCount, inserts.String())
 }

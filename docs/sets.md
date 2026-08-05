@@ -64,8 +64,8 @@ At least one of `find_all`, `find_any`, or `match` must be set per entry.
 ### `hints:` — this set's LikelyMode default
 
 `hints: [prefer-match]` or `hints: [prefer-no-match]` (mutually exclusive)
-biases the set's own compiled code shape — see [likely.md](likely.md) for
-the full mechanism. Concretely, for sets this affects:
+biases the set's own compiled code shape — see [prefer-hints.md](prefer-hints.md)
+for the full mechanism. Concretely, for sets this affects:
 
 - the [literal scan frontend](#literal-scan-frontend) selection below
   (`prefer-no-match` forces Shufti over scalar for a 17–64-byte first-byte
@@ -79,6 +79,15 @@ for patterns placed inside a set** — only the set's own `hints:` field is
 read when compiling set members. A pattern's `hints:` only takes effect
 when that pattern is also compiled standalone (via its own `match_func`/
 `find_func`/`groups_func`/`named_groups_func`).
+
+**`batch-find` (docs/cli.md) is a separate, per-pattern-only mechanism and is
+rejected outright on a `sets:` entry's `hints:`** — it is a load-time error,
+not a silent no-op. Sets already have their own batching for `find_all` via
+`batch_size` (see [Output tuple formats](#output-tuple-formats) below); the
+two are unrelated and not interchangeable. A pattern's own `batch-find` hint
+still applies normally to that pattern's *own* standalone exports even if the
+pattern is also a set member — the set's `find_all`/`find_any`/`match`
+exports are unaffected either way.
 
 ## Output tuple formats
 
@@ -256,8 +265,8 @@ considered instead of going straight to scalar. It requires:
 
 Shufti tests set membership against the whole first-byte union in one SIMD
 nibble-table lookup, rather than a per-candidate comparison. See
-[likely.md](likely.md) for the full density-heuristic rationale and the
-`hints:` mechanism.
+[prefer-hints.md](prefer-hints.md) for the `hints:` mechanism and which
+shapes it affects.
 
 ## Anchored `match` and patterns without a mandatory literal
 

@@ -139,3 +139,4 @@ All positions are byte offsets (not character indices). Input is `&[u8]`.
 - Stub functions are safe Rust wrappers; the `unsafe` FFI call is hidden inside the stub.
 - The WASM module must be loaded before calling any stub function. In `wasip1` targets, all imports are resolved at link time by the runtime.
 - Internally, FFI declarations use an `ffi_<func>` name with `#[link_name = "<func>"]` to avoid colliding with the public wrapper of the same name — you never see or need to reference `ffi_<func>` yourself.
+- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for Rust: it's effective for the JS and TS generators only. Setting it does not change the generated Rust stub or its performance.

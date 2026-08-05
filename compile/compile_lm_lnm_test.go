@@ -618,13 +618,13 @@ func TestCompileLikelyMatch(t *testing.T) {
 // produced.
 func TestLitChainGroupsBodyHelpers(t *testing.T) {
 	patterns := []string{
-		`(AKIA[A-Z0-9]{24})`,                   // no anchors
-		`(\bAKIA[A-Z0-9]{24}\b)`,               // word-boundary start + end
-		`(\BAKIA[A-Z0-9]{24}\B)`,               // no-word-boundary start + end
-		`(\AAKIA[A-Z0-9]{24}\z)`,               // text anchors
-		`(AKIA[A-Z0-9]{24}\b)`,                 // end word boundary only
-		`(\bAKIA[A-Z0-9]{24})`,                 // start word boundary only
-		`(AKIA[A-Z0-9]{24}\z)`,                 // end text anchor only
+		`(AKIA[A-Z0-9]{24})`,     // no anchors
+		`(\bAKIA[A-Z0-9]{24}\b)`, // word-boundary start + end
+		`(\BAKIA[A-Z0-9]{24}\B)`, // no-word-boundary start + end
+		`(\AAKIA[A-Z0-9]{24}\z)`, // text anchors
+		`(AKIA[A-Z0-9]{24}\b)`,   // end word boundary only
+		`(\bAKIA[A-Z0-9]{24})`,   // start word boundary only
+		`(AKIA[A-Z0-9]{24}\z)`,   // end text anchor only
 	}
 	for _, p := range patterns {
 		p := p
@@ -1365,75 +1365,160 @@ func TestCompileLikelyNoMatch(t *testing.T) {
 // requested, and must NOT appear for anchored (native lit-chain) groups
 // bodies — that shape is out of v1 scope (see the compiledPattern field doc
 // next to batchGroupsExport).
-func TestLM2BatchExportGating(t *testing.T) {
-	t.Skip("LM-2 batch export trigger disabled 2026-08-02, parked pending plans/TODO.md task 44 — remove this Skip when the trigger in compile.go's compileAll is restored")
+// TestBatchExportGating covers the "batch-find" hint (plans/TODO.md task 44)
+// as the sole trigger for the _batch export — independent of LikelyMode, and
+// covering both the composed (!anchored) and native lit-chain ("Path B",
+// anchored) groups shapes, plus named_groups_func-only naming.
+func TestBatchExportGating(t *testing.T) {
 	findEntries := []config.RegexEntry{{
 		Pattern:  `x*`,
 		FindFunc: "find_x",
+		Hints:    []string{"batch-find"},
 	}}
 	// (a)(b)? has no lit-chain shape, so it compiles via the standard
-	// find+capture composition (TDFA/BT) — the non-anchored case batch
-	// groups targets.
+	// find+capture composition (TDFA/BT) — Path A.
 	groupsEntries := []config.RegexEntry{{
 		Pattern:    `(a)(b)?`,
 		GroupsFunc: "groups_ab",
+		Hints:      []string{"batch-find"},
 	}}
 	// (AKIA[A-Z0-9]{24}) is a lit-chain groups shape (Gap C, count>=24 so
 	// analyseLitChainGroups accepts it — capture-path analysers are not
 	// LM-1-relaxed, unlike the plain match/find analysers) — anchored:
-	// captureBody IS the exported groups function directly, no separate
-	// find+capture composition to batch over.
+	// captureBody IS the exported groups function directly ("Path B"), so
+	// batching goes through buildBatchLitChainGroupsWrapperBody, not
+	// buildBatchGroupsWrapperBody.
 	anchoredGroupsEntries := []config.RegexEntry{{
 		Pattern:    `(AKIA[A-Z0-9]{24})`,
 		GroupsFunc: "akia_groups",
+		Hints:      []string{"batch-find"},
+	}}
+	// named_groups_func ONLY (no groups_func) — the batch export name must
+	// fall back to namedGroupsExport (GroupsExportName priority), since
+	// p.groupsExport is empty here.
+	namedOnlyEntries := []config.RegexEntry{{
+		Pattern:         `(a)(b)?`,
+		NamedGroupsFunc: "named_ab",
+		Hints:           []string{"batch-find"},
 	}}
 
-	t.Run("find_batch_present_under_LikelyMatch", func(t *testing.T) {
-		wasm, _, err := Compile(findEntries, 0, true, CompileOptions{LikelyMode: LikelyMatch})
-		if err != nil {
-			t.Fatalf("Compile: %v", err)
-		}
-		if !bytes.Contains(wasm, []byte("find_x_batch")) {
-			t.Error("expected find_x_batch export under LikelyMatch, not found")
-		}
-	})
-	t.Run("find_batch_absent_under_neutral", func(t *testing.T) {
+	t.Run("find_batch_present_with_hint", func(t *testing.T) {
 		wasm, _, err := Compile(findEntries, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
-		if bytes.Contains(wasm, []byte("find_x_batch")) {
-			t.Error("find_x_batch export present under neutral LikelyMode, should be absent")
+		if !bytes.Contains(wasm, []byte("find_x_batch")) {
+			t.Error("expected find_x_batch export with batch-find hint, not found")
 		}
 	})
-	t.Run("groups_batch_present_under_LikelyMatch", func(t *testing.T) {
-		wasm, _, err := Compile(groupsEntries, 0, true, CompileOptions{LikelyMode: LikelyMatch})
+	t.Run("find_batch_absent_without_hint", func(t *testing.T) {
+		unhinted := []config.RegexEntry{{Pattern: `x*`, FindFunc: "find_x"}}
+		wasm, _, err := Compile(unhinted, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
-		if !bytes.Contains(wasm, []byte("groups_ab_batch")) {
-			t.Error("expected groups_ab_batch export under LikelyMatch, not found")
+		if bytes.Contains(wasm, []byte("find_x_batch")) {
+			t.Error("find_x_batch export present without batch-find hint, should be absent")
 		}
 	})
-	t.Run("groups_batch_absent_under_neutral", func(t *testing.T) {
+	t.Run("find_batch_absent_under_LikelyMatch_alone", func(t *testing.T) {
+		// LikelyMode is no longer the trigger — batch-find is.
+		unhinted := []config.RegexEntry{{Pattern: `x*`, FindFunc: "find_x"}}
+		wasm, _, err := Compile(unhinted, 0, true, CompileOptions{LikelyMode: LikelyMatch})
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if bytes.Contains(wasm, []byte("find_x_batch")) {
+			t.Error("find_x_batch export present under LikelyMatch without batch-find hint — LikelyMode must not trigger batching")
+		}
+	})
+	t.Run("groups_batch_present_with_hint_PathA", func(t *testing.T) {
 		wasm, _, err := Compile(groupsEntries, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
-		if bytes.Contains(wasm, []byte("groups_ab_batch")) {
-			t.Error("groups_ab_batch export present under neutral LikelyMode, should be absent")
+		if !bytes.Contains(wasm, []byte("groups_ab_batch")) {
+			t.Error("expected groups_ab_batch export with batch-find hint, not found")
 		}
 	})
-	t.Run("anchored_groups_batch_absent_even_under_LikelyMatch", func(t *testing.T) {
-		wasm, _, err := Compile(anchoredGroupsEntries, 0, true, CompileOptions{LikelyMode: LikelyMatch})
+	t.Run("groups_batch_absent_without_hint", func(t *testing.T) {
+		unhinted := []config.RegexEntry{{Pattern: `(a)(b)?`, GroupsFunc: "groups_ab"}}
+		wasm, _, err := Compile(unhinted, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if bytes.Contains(wasm, []byte("groups_ab_batch")) {
+			t.Error("groups_ab_batch export present without batch-find hint, should be absent")
+		}
+	})
+	t.Run("anchored_groups_batch_present_with_hint_PathB", func(t *testing.T) {
+		wasm, _, err := Compile(anchoredGroupsEntries, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Contains(wasm, []byte("akia_groups_batch")) {
+			t.Error("expected akia_groups_batch export for anchored (Path B) lit-chain groups body — task 44 goal 4")
+		}
+		if !bytes.Contains(wasm, []byte("akia_groups")) {
+			t.Error("expected akia_groups (non-batch) export to still be present")
+		}
+	})
+	t.Run("anchored_groups_batch_absent_without_hint", func(t *testing.T) {
+		unhinted := []config.RegexEntry{{Pattern: `(AKIA[A-Z0-9]{24})`, GroupsFunc: "akia_groups"}}
+		wasm, _, err := Compile(unhinted, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
 		if bytes.Contains(wasm, []byte("akia_groups_batch")) {
-			t.Error("akia_groups_batch export present for anchored lit-chain groups body — out of v1 scope")
+			t.Error("akia_groups_batch export present without batch-find hint, should be absent")
 		}
-		if !bytes.Contains(wasm, []byte("akia_groups")) {
-			t.Error("expected akia_groups (non-batch) export to still be present")
+	})
+	t.Run("named_only_batch_export_named_after_namedGroupsFunc", func(t *testing.T) {
+		wasm, _, err := Compile(namedOnlyEntries, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Contains(wasm, []byte("named_ab_batch")) {
+			t.Error("expected named_ab_batch export (GroupsExportName falls back to NamedGroupsFunc), not found")
+		}
+	})
+	t.Run("groups_and_named_share_one_batch_export", func(t *testing.T) {
+		both := []config.RegexEntry{{
+			Pattern:         `(a)(b)?`,
+			GroupsFunc:      "g1",
+			NamedGroupsFunc: "g2",
+			Hints:           []string{"batch-find"},
+		}}
+		wasm, _, err := Compile(both, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Contains(wasm, []byte("g1_batch")) {
+			t.Error("expected g1_batch export (GroupsFunc takes priority), not found")
+		}
+		if bytes.Contains(wasm, []byte("g2_batch")) {
+			t.Error("g2_batch export present — named_groups_func should share GroupsFunc's batch export, not get its own")
+		}
+	})
+	t.Run("neutral_wasm_size_unaffected_by_hint_plumbing", func(t *testing.T) {
+		// Regression guard for the LM-2 "anyBatch" bug this task's doc calls
+		// out explicitly: a pattern that never requests batch-find must
+		// produce byte-identical output regardless of how "no batch-find" is
+		// spelled (nil Hints vs an empty-but-non-nil slice).
+		base := config.RegexEntry{Pattern: `(a)(b)?`, GroupsFunc: "g"}
+		emptyHints := base
+		emptyHints.Hints = []string{}
+
+		w1, _, err := Compile([]config.RegexEntry{base}, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		w2, _, err := Compile([]config.RegexEntry{emptyHints}, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Equal(w1, w2) {
+			t.Error("expected byte-identical WASM for nil vs empty Hints, neither requests batch-find")
 		}
 	})
 }

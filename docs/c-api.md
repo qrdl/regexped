@@ -180,3 +180,4 @@ that requested `emit_name_map: true`, not one per set.
   including group 0 (full match). Use it to size loops or slot arrays.
 - No heap allocation or libc is required. The stubs are self-contained and suitable
   for embedded WASM environments.
+- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for C: it's effective for the JS and TS generators only. Setting it does not change the generated header or its performance.

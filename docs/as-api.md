@@ -215,3 +215,7 @@ lookup across every set in the config that requested `emit_name_map: true`.
 | `find_func` | `<func>(input: ArrayBuffer, offset: i32): i64` | packed `(absStart << 32 \| absEnd)`, or `-1` |
 | `groups_func` | `<func>(input: ArrayBuffer, offset: i32): i32` | `dataStart` pointer to slot buffer, or `0` |
 | `named_groups_func` | **not supported** — generator returns an error | — |
+
+## Notes
+
+- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for AssemblyScript: it's effective for the JS and TS generators only. Setting it does not change the generated stub or its performance.

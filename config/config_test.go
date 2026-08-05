@@ -361,11 +361,34 @@ func TestValidHints(t *testing.T) {
 		{[]string{"prefer-no-match"}, true},
 		{[]string{"prefer-match", "prefer-no-match"}, false},
 		{[]string{"bogus"}, false},
+		// batch-find (task 44): valid alone and combined with either of the
+		// other two, since it's orthogonal to the prefer-match/prefer-no-match
+		// exclusion.
+		{[]string{"batch-find"}, true},
+		{[]string{"batch-find", "prefer-match"}, true},
+		{[]string{"batch-find", "prefer-no-match"}, true},
+		{[]string{"batch-find", "prefer-match", "prefer-no-match"}, false},
 	}
 	for _, c := range cases {
 		if got := ValidHints(c.hints); got != c.want {
 			t.Errorf("ValidHints(%v) = %v, want %v", c.hints, got, c.want)
 		}
+	}
+}
+
+// TestValidateHintList_BatchFindRejectedForSets verifies validateHintList's
+// isSet parameter: "batch-find" is a load-time error on a sets: entry (sets
+// have their own find_all batching), distinct from being merely unrecognised.
+func TestValidateHintList_BatchFindRejectedForSets(t *testing.T) {
+	if err := validateHintList([]string{"batch-find"}, false); err != nil {
+		t.Errorf("validateHintList(batch-find, isSet=false) = %v, want nil", err)
+	}
+	err := validateHintList([]string{"batch-find"}, true)
+	if err == nil {
+		t.Fatal("validateHintList(batch-find, isSet=true) = nil, want error")
+	}
+	if got := err.Error(); got != `"batch-find" is not valid for sets` {
+		t.Errorf("validateHintList(batch-find, isSet=true) error = %q, want the sets-specific message", got)
 	}
 }
 
@@ -414,6 +437,44 @@ func TestLoadConfig_SetHintsMutuallyExclusive(t *testing.T) {
 	}
 	if _, err := LoadConfig(path); err == nil {
 		t.Error("expected error for mutually exclusive set hints, got nil")
+	}
+}
+
+// TestLoadConfig_BatchFindInvalidForSets verifies "batch-find" (task 44) is a
+// load-time error on a sets: entry — sets have their own find_all batching
+// (batch_size) and don't wire up the per-pattern _batch export mechanism.
+func TestLoadConfig_BatchFindInvalidForSets(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "regexped.yaml")
+	yamlData := "regexps:\n" +
+		"  - name: p1\n    pattern: 'foo'\n" +
+		"sets:\n" +
+		"  - name: s1\n" +
+		"    find_any: any1\n" +
+		"    patterns: \"all\"\n" +
+		"    hints: [batch-find]\n"
+	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Error("expected error for batch-find on a sets: entry, got nil")
+	}
+}
+
+// TestLoadConfig_BatchFindValidForRegexps verifies "batch-find" loads cleanly
+// on a regexps: entry, alone or combined with prefer-match/prefer-no-match.
+func TestLoadConfig_BatchFindValidForRegexps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "regexped.yaml")
+	yamlData := "regexps:\n" +
+		"  - pattern: 'foo'\n" +
+		"    find_func: foo_find\n" +
+		"    hints: [batch-find, prefer-match]\n"
+	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err != nil {
+		t.Errorf("expected batch-find + prefer-match to load cleanly, got %v", err)
 	}
 }
 

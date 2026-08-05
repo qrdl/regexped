@@ -53,9 +53,9 @@ type matcher interface {
 type LikelyMode int
 
 const (
-	LikelyNeutral  LikelyMode = iota // default; no structural hint
-	LikelyMatch                      // bias for fast-accept (counted-chain SIMD verify)
-	LikelyNoMatch                    // bias for fast-reject (dominant-self-loop SIMD skip)
+	LikelyNeutral LikelyMode = iota // default; no structural hint
+	LikelyMatch                     // bias for fast-accept (counted-chain SIMD verify)
+	LikelyNoMatch                   // bias for fast-reject (dominant-self-loop SIMD skip)
 )
 
 func (m LikelyMode) String() string {
@@ -96,6 +96,23 @@ func resolveHints(chain ...[]string) LikelyMode {
 		}
 	}
 	return LikelyNeutral
+}
+
+// hasBatchHint reports whether hints contains "batch-find" (plans/TODO.md
+// task 44) — the sole trigger for emitting a pattern's `_batch` WASM export.
+// Unlike LikelyMode, this is not a chain/precedence value: it's a per-pattern
+// opt-in with no set-level fallback (config.validateHintList rejects
+// "batch-find" on a sets: entry, so there is nothing to resolve down from).
+// Unknown/contradictory hints are rejected at config load (config.ValidHints),
+// so unrecognised entries are silently ignored here, same discipline as
+// parseHints.
+func hasBatchHint(hints []string) bool {
+	for _, h := range hints {
+		if h == "batch-find" {
+			return true
+		}
+	}
+	return false
 }
 
 // CompileOptions contains optional parameters for engine selection.
@@ -209,15 +226,27 @@ type compiledPattern struct {
 	// litAnchorFindBody, it's built at assembleModule time and appended
 	// directly, since it calls branch functions by index.
 
-	// LM-2: batch find/groups exports (multiple matches per host call,
-	// modelled on the set find_all ABI). Set by compileAll (not
-	// compilePattern) once findExport/groupsExport are known, gated on
-	// this pattern's effective LikelyMode == LikelyMatch. Empty = not
-	// requested. batchGroupsExport is only ever set when !anchored — the
-	// native lit-chain groups bodies (Gap C/A.3) are out of v1 scope, since
-	// they don't expose a separate find+capture composition to loop over.
-	// Always laid out last (see batchOffsets); not wired into the sets
-	// path (assembleModuleWithSets) in v1 — sets already have find_all.
+	// Batch find/groups exports (multiple matches per host call, modelled on
+	// the set find_all ABI; originally LM-2, now task 44). Set by compileAll
+	// (not compilePattern) once findExport/groupsExport/namedGroupsExport are
+	// known, gated on the pattern's "batch-find" hint (see hasBatchHint) —
+	// independent of LikelyMode. Empty = not requested.
+	//
+	// batchGroupsExport's base name prefers groupsExport, falling back to
+	// namedGroupsExport (same priority as config.RegexEntry.GroupsExportName)
+	// — a named_groups_func-only pattern gets a batch export too, since at
+	// the WASM level namedGroupsExport is always a pass-through wrapper over
+	// the same captureFuncIdx (see appendNamedGroupsWrapperCodeEntry), so one
+	// batch export correctly serves both consumers.
+	//
+	// batchGroupsExport covers both shapes: !anchored (composed find+capture,
+	// buildBatchGroupsWrapperBody) and anchored (native lit-chain groups body
+	// IS captureBody, buildBatchLitChainGroupsWrapperBody — task 44 goal 4,
+	// "Path B"); assembleModule's code-section emission branches on
+	// p.anchored to pick the right wrapper builder.
+	//
+	// Always laid out last (see batchOffsets); not wired into the sets path
+	// (assembleModuleWithSets) — sets already have find_all.
 	batchFindExport   string
 	batchGroupsExport string
 }
@@ -1515,7 +1544,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			cs = appendBatchFindWrapperCodeEntry(cs, base+findOff)
 		}
 		if p.batchGroupsExport != "" {
-			cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups)
+			if p.anchored {
+				// Path B (task 44 goal 4): captureBody IS the exported groups
+				// function — no separate find function to compose over.
+				cs = appendBatchLitChainGroupsWrapperCodeEntry(cs, base+captureOff, p.numGroups)
+			} else {
+				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups)
+			}
 		}
 	}
 	out = appendSection(out, 10, cs)
@@ -1567,28 +1602,23 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 		if err != nil {
 			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
 		}
-		// LM-2 batch find/groups export trigger — DISABLED 2026-08-02,
-		// parked pending plans/TODO.md task 44 (see that entry for why and
-		// for exact revert instructions). Uncomment to restore: this was the
-		// sole trigger for batchFindExport/batchGroupsExport, gated on this
-		// pattern's effective LikelyMode (per-pattern hints take precedence
-		// over opts, same precedence chain compilePattern itself applies —
-		// see plans/LIKELY.md Gap H.1). v1 scope: find_func always eligible;
-		// groups_func only for the non-anchored (composed find+capture)
-		// shape — see the compiledPattern field doc.
-		//
-		// effMode := opts.LikelyMode
-		// if m, set := parseHints(re.Hints); set {
-		// 	effMode = m
-		// }
-		// if effMode == LikelyMatch {
-		// 	if p.findExport != "" {
-		// 		p.batchFindExport = p.findExport + "_batch"
-		// 	}
-		// 	if p.groupsExport != "" && !p.anchored {
-		// 		p.batchGroupsExport = p.groupsExport + "_batch"
-		// 	}
-		// }
+		// Batch find/groups export trigger (plans/TODO.md task 44). Sole
+		// trigger for batchFindExport/batchGroupsExport — independent of
+		// LikelyMode. find_func is always eligible; groups_func is eligible
+		// for both the composed (!anchored) and native lit-chain (anchored,
+		// "Path B") shapes — see the compiledPattern field doc.
+		if hasBatchHint(re.Hints) {
+			if p.findExport != "" {
+				p.batchFindExport = p.findExport + "_batch"
+			}
+			groupsBatchName := p.groupsExport
+			if groupsBatchName == "" {
+				groupsBatchName = p.namedGroupsExport
+			}
+			if groupsBatchName != "" {
+				p.batchGroupsExport = groupsBatchName + "_batch"
+			}
+		}
 		compiled = append(compiled, p)
 		if p.tableEnd > cur {
 			cur = utils.PageAlign(p.tableEnd)
@@ -2117,6 +2147,121 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups int) []b
 // appendBatchGroupsWrapperCodeEntry appends a size-prefixed batch groups wrapper body to cs.
 func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups int) []byte {
 	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups)
+	cs = utils.AppendULEB128(cs, uint32(len(body)))
+	return append(cs, body...)
+}
+
+// buildBatchLitChainGroupsWrapperBody emits the WASM body for the batch
+// groups export over a Path B native lit-chain groups body (plans/TODO.md
+// task 44, goal 4). Signature (type 4), same ABI as buildBatchGroupsWrapperBody:
+//
+//	(ptr i32, len i32, out_ptr i32, out_cap i32, start_pos i32) → i32 (count)
+//
+// Unlike buildBatchGroupsWrapperBody there is only one function to call:
+// captureFuncIdx (type 2, (i32,i32,i32)→i32 meaning (ptr,len,out_ptr), NOT
+// buildGroupsWrapperBody's captureFuncIdx meaning (absStart,matchLen,
+// slots_out_ptr) — same WASM type, different convention, hence a dedicated
+// wrapper rather than reusing buildBatchGroupsWrapperBody) IS the exported
+// groups function for this pattern shape (compiledPattern.anchored's native
+// A.3 meaning — see appendLitChainFindGroupsCodeEntry and siblings).
+//
+// captureFuncIdx returns the match end position relative to the ptr passed
+// to IT, or -1. It writes group 0 (the whole match) at slots [0:8) — start
+// relative to its own ptr, end likewise — exactly like buildGroupsWrapperBody's
+// out_ptr convention, so writing directly into the record's slot area
+// (recBase+8) lines group 0 up with the record's [8:16) group-0 slots for
+// free. This wrapper then adjusts every slot (group 0 included) by the
+// running scan offset (pos) and copies the adjusted group-0 start/end into
+// the record's [0:8) header — same record layout buildBatchGroupsWrapperBody
+// produces, so the JS/TS consumer needs no path-specific branching.
+//
+// Every lit-chain shape contains at least one literal byte
+// (buildLitChainFindGroupsBody, buildLitChainRangeFindGroupsBody and
+// buildLitChainAltFindGroupsBody's branches all require a non-empty literal),
+// so a match here is never zero-length: the returned end position is always
+// > the call's own attempt-start, so pos += r always strictly advances — no
+// relEnd>relStart branch is needed (contrast buildBatchGroupsWrapperBody's
+// advance rule, which must handle the general zero-length case).
+//
+// Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=recBase i32,
+// 8=r i32, 9=slotVal i32.
+func buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups int) []byte {
+	recordSize := 8 + numGroups*8
+
+	var b []byte
+	// Locals: 5 × i32 (pos, count, recBase, r, slotVal).
+	b = append(b, 0x01)
+	b = append(b, 0x05, 0x7F)
+
+	// pos = start_pos; count = 0
+	b = append(b, 0x20, 0x04, 0x21, 0x05)
+	b = append(b, 0x41, 0x00, 0x21, 0x06)
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $L
+
+	// if count >= out_cap: br $done
+	b = append(b, 0x20, 0x06, 0x20, 0x03, 0x4F, 0x0D, 0x01)
+	// if pos > len: br $done
+	b = append(b, 0x20, 0x05, 0x20, 0x01, 0x4B, 0x0D, 0x01)
+
+	// recBase = out_ptr + count*recordSize
+	b = append(b, 0x20, 0x02, 0x20, 0x06, 0x41)
+	b = utils.AppendSLEB128(b, int32(recordSize))
+	b = append(b, 0x6C, 0x6A, 0x21, 0x07)
+
+	// r = call capture(ptr+pos, len-pos, recBase+8)
+	b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A)
+	b = append(b, 0x20, 0x01, 0x20, 0x05, 0x6B)
+	b = append(b, 0x20, 0x07, 0x41, 0x08, 0x6A)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
+	b = append(b, 0x21, 0x08)
+
+	// if r < 0: br $done
+	b = append(b, 0x20, 0x08, 0x41, 0x00, 0x48, 0x0D, 0x01)
+
+	// Adjust each of numGroups*2 slot ints at recBase+8+g*4 by +pos (skip
+	// unmatched groups, encoded as -1).
+	for g := 0; g < numGroups*2; g++ {
+		off := uint32(8 + g*4)
+		b = append(b, 0x20, 0x07)
+		b = append(b, 0x28, 0x02)
+		b = utils.AppendULEB128(b, off)
+		b = append(b, 0x22, 0x09) // tee slotVal
+		b = append(b, 0x41, 0x00, 0x4E)
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, 0x07)
+		b = append(b, 0x20, 0x09, 0x20, 0x05, 0x6A)
+		b = append(b, 0x36, 0x02)
+		b = utils.AppendULEB128(b, off)
+		b = append(b, 0x0B) // end if
+	}
+
+	// Copy the (now-adjusted) whole-match slot0/slot1 into the record's
+	// start/end prefix.
+	b = append(b, 0x20, 0x07, 0x20, 0x07, 0x28, 0x02, 0x08, 0x36, 0x02, 0x00)
+	b = append(b, 0x20, 0x07, 0x20, 0x07, 0x28, 0x02, 0x0C, 0x36, 0x02, 0x04)
+
+	// count += 1
+	b = append(b, 0x20, 0x06, 0x41, 0x01, 0x6A, 0x21, 0x06)
+
+	// pos = pos + r (always advances — see doc comment on the guarantee).
+	b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x05)
+
+	b = append(b, 0x0C, 0x00) // br $L (continue)
+	b = append(b, 0x0B)       // end loop
+	b = append(b, 0x0B)       // end block $done
+
+	b = append(b, 0x20, 0x06) // return count
+	b = append(b, 0x0B)       // end function
+	return b
+}
+
+// appendBatchLitChainGroupsWrapperCodeEntry appends a size-prefixed Path B
+// batch groups wrapper body to cs.
+func appendBatchLitChainGroupsWrapperCodeEntry(cs []byte, captureFuncIdx, numGroups int) []byte {
+	body := buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

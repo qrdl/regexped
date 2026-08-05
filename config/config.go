@@ -36,7 +36,10 @@ type SetConfig struct {
 	// Also serves as the per-set default for unhinted patterns in this set
 	// when they reach the set's suffix DFA body. Accepted values: nil/empty
 	// (no hint), ["prefer-match"], or ["prefer-no-match"] — mutually
-	// exclusive. See plans/LIKELY.md gap H.
+	// exclusive with each other. See plans/LIKELY.md gap H.
+	// "batch-find" (plans/TODO.md task 44) is NOT accepted here — it is a
+	// per-pattern, JS/TS-only hint and is a load-time error on a sets: entry;
+	// sets already have their own find_all batching (BatchSize above).
 	Hints []string `yaml:"hints"`
 }
 
@@ -74,17 +77,21 @@ func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error
 	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names")
 }
 
-// ValidHints reports whether hints is a valid `hints:` list: every entry must
-// be "prefer-match" or "prefer-no-match", and the two are mutually exclusive
-// (both cannot appear in the same list). An empty or nil list is valid (means
-// "no hint").
+// ValidHints reports whether hints is a valid `hints:` list for a regexp
+// entry: every entry must be "prefer-match", "prefer-no-match", or
+// "batch-find"; "prefer-match" and "prefer-no-match" are mutually exclusive
+// (both cannot appear in the same list) but "batch-find" may combine with
+// either. An empty or nil list is valid (means "no hint"). Sets have a
+// narrower valid list — see validateHintList's isSet parameter.
 func ValidHints(hints []string) bool {
-	return validateHintList(hints) == nil
+	return validateHintList(hints, false) == nil
 }
 
 // validateHintList returns a descriptive error for the first problem found in
-// hints, or nil if the list is valid.
-func validateHintList(hints []string) error {
+// hints, or nil if the list is valid. isSet selects the sets: context, where
+// "batch-find" is rejected outright (sets have their own find_all batching;
+// see SetConfig.BatchSize) rather than being merely unrecognised.
+func validateHintList(hints []string, isSet bool) error {
 	var hasMatch, hasNoMatch bool
 	for _, h := range hints {
 		switch h {
@@ -92,8 +99,12 @@ func validateHintList(hints []string) error {
 			hasMatch = true
 		case "prefer-no-match":
 			hasNoMatch = true
+		case "batch-find":
+			if isSet {
+				return fmt.Errorf("\"batch-find\" is not valid for sets")
+			}
 		default:
-			return fmt.Errorf("unknown value %q (want \"prefer-match\" or \"prefer-no-match\")", h)
+			return fmt.Errorf("unknown value %q (want \"prefer-match\", \"prefer-no-match\", or \"batch-find\")", h)
 		}
 	}
 	if hasMatch && hasNoMatch {
@@ -106,7 +117,7 @@ func validateHintList(hints []string) error {
 // cfg. Returns an error naming the first offending entry and problem found.
 func validateHints(cfg *BuildConfig) error {
 	for _, re := range cfg.Regexps {
-		if err := validateHintList(re.Hints); err != nil {
+		if err := validateHintList(re.Hints, false); err != nil {
 			label := re.Name
 			if label == "" {
 				label = re.Pattern
@@ -115,7 +126,7 @@ func validateHints(cfg *BuildConfig) error {
 		}
 	}
 	for _, sc := range cfg.Sets {
-		if err := validateHintList(sc.Hints); err != nil {
+		if err := validateHintList(sc.Hints, true); err != nil {
 			return fmt.Errorf("set %q: hints: %w", sc.Name, err)
 		}
 	}
@@ -212,9 +223,14 @@ type RegexEntry struct {
 	NamedGroupsFunc string `yaml:"named_groups_func"` // anchored + named captures → Option<HashMap<&'static str,(usize,usize)>>
 
 	// Hints biases which suffix-DFA optimisation path to favour for this
-	// specific pattern. Accepted values: nil/empty (no hint, falls back to
-	// the enclosing set's hints), ["prefer-match"], or ["prefer-no-match"] —
-	// mutually exclusive. See plans/LIKELY.md.
+	// specific pattern, and/or requests extra WASM exports. Accepted values:
+	// nil/empty (no hint, falls back to the enclosing set's hints for the
+	// suffix-DFA choice), "prefer-match", "prefer-no-match" — mutually
+	// exclusive with each other, see plans/LIKELY.md — and "batch-find"
+	// (plans/TODO.md task 44), which is independent of the other two and may
+	// be combined with either (or neither): it requests a `<func>_batch` WASM
+	// export for this pattern's find_func/groups_func, consumed only by the
+	// JS and TS generators (a no-op for Rust/Go/C/AS stubs).
 	Hints []string `yaml:"hints"`
 }
 

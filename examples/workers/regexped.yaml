@@ -3,11 +3,19 @@ import_module: "regexps"
 stub_file:     "regexp.js"
 
 regexps:
+  # hints: [batch-find] on all three — a pasted log or diff can easily
+  # contain more than one leaked secret, and the worker rescans the whole
+  # POST body for every pattern, so batching drains matches per host↔WASM
+  # call instead of one at a time. worker.js needs no changes: the generated
+  # find_* generators feature-detect the batch export at runtime.
   - pattern:   'ghp_[A-Za-z0-9]{36}'
     find_func: "find_github_token"
+    hints:     [batch-find]
 
   - pattern:   'eyJ[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+'
     find_func: "find_jwt_token"
+    hints:     [batch-find]
 
   - pattern:   'AKIA[A-Z0-9]{16}'
     find_func: "find_aws_key"
+    hints:     [batch-find]

@@ -24,7 +24,7 @@ The `test` target chains seven single-pattern sub-targets — `exhaustive`, `cus
 `adjusted`, `force-backtrack`, `likelymatch`, `likelynomatch`, and
 `force-backtrack-likelynomatch` (the last three re-run the corpus under each
 `LikelyMode` to verify the mode never changes match correctness, only emitted
-code shape — see [likely.md](likely.md)) — plus `sets`, which exercises the
+code shape — see [prefer-hints.md](prefer-hints.md)) — plus `sets`, which exercises the
 multi-pattern composition pipeline described in [sets.md](sets.md).
 
 ---

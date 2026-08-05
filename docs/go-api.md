@@ -136,3 +136,4 @@ Function names are the `snake_case` config values converted to `PascalCase`: `ur
 - The `unsafe` FFI call is hidden inside the generated stub; your application code only sees safe Go functions.
 - The WASM module must be loaded before calling any stub function. In `wasip1` targets, all imports are resolved at link time by the runtime (e.g. wasmtime).
 - The stub file imports `"iter"` and `"unsafe"` automatically; do not add them manually.
+- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for Go: it's effective for the JS and TS generators only. Setting it does not change the generated Go stub or its performance.
