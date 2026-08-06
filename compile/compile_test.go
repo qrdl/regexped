@@ -957,7 +957,10 @@ func TestT3Triggered(t *testing.T) {
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			dfa := newDFA(prog, false, true)
+			dfa, ok := newDFA(prog, false, true, maxHelperDFAStates)
+			if !ok {
+				t.Fatalf("newDFA: state limit exceeded")
+			}
 			tbl := dfaTableFrom(dfa)
 			l := buildDFALayout(tbl, 0, true, true, 0, false, false, false, false)
 
@@ -1112,6 +1115,169 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 		}
 		if !bytes.Contains(buf.Bytes(), []byte(`"patterns_total"`)) {
 			t.Errorf("stdout diag missing key: %s", buf.Bytes())
+		}
+	})
+}
+
+// TestCompileLenientAltFindBody exercises the Phase 2a lenient-alternation
+// find body in compilePattern, reached when analyseLitChainAltLenient
+// succeeds after the strict analysers fail, gated by
+// shouldTryLitChainAlt(pattern) — TEST.md T33. The real sql-inject perftest
+// pattern's first branch contains a nested (?:OR|AND) alternation
+// (OpAlternate), which makes shouldTryLitChainAlt bail out early and keep
+// the pattern lit-chain-alt-eligible; confirmed live that
+// compile_lm_lnm_test.go's "lenient_alt_find_only" case does NOT trip this
+// gate (its second branch's \s* is unbounded with no nested OpAlternate/
+// OpQuest, so shouldTryLitChainAlt short-circuits to false first).
+func TestCompileLenientAltFindBody(t *testing.T) {
+	const pattern = `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`
+	if !shouldTryLitChainAlt(pattern) {
+		t.Fatalf("shouldTryLitChainAlt(%q) = false, want true (test pattern no longer trips the T33 gate)", pattern)
+	}
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "sql_inject_find"}})
+}
+
+// TestCompileTDFARegLimitExceededForced exercises the
+// "ok && tt.numRegs > resolveMaxTDFARegs(&buildOpts)" fallback-to-Backtrack
+// re-check in compilePattern — TEST.md T34. Only reachable when
+// forceGroupsEngine bypasses the selector's own register estimate (unlike
+// TestCompileTDFARegLimit, which goes through the normal, unforced
+// selectBestEngine path and so never reaches TDFA construction at all for a
+// register-starved MaxTDFARegs).
+func TestCompileTDFARegLimitExceededForced(t *testing.T) {
+	_, err := compilePattern(
+		config.RegexEntry{Pattern: "(a)(b)(c)(d)(e)(f)", GroupsFunc: "g"},
+		0, EngineTDFA, CompileOptions{MaxTDFARegs: 1},
+	)
+	if err != nil {
+		t.Fatalf("compilePattern: %v", err)
+	}
+}
+
+// TestCompileBTCaptureWithMemoTwoGroups exercises the useMemo=true
+// initialization block in buildBacktrackBody for the capture path —
+// TEST.md T35. TestCompileBTCaptureWithMemo's pattern ((?:a?)+?) has a
+// single capture spanning the whole pattern (MaxCap()==1) and is not
+// itself ^-anchored, so task 41's whole-pattern-single-capture shortcut
+// (compile.go, isWholePatternSingleCapture) now intercepts it before it
+// ever reaches TDFA/BT selection — confirmed live via isAnchoredFind/
+// isWholePatternSingleCapture probing. ((?:a?)+?)(b) has two capture
+// groups, so the shortcut's MaxCap()==1 requirement fails and the pattern
+// reaches Backtracking's needsBitState=true memo-init path as originally
+// intended.
+func TestCompileBTCaptureWithMemoTwoGroups(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "((?:a?)+?)(b)", GroupsFunc: "g"}})
+}
+
+// TestCompileEmbeddedLitAnchorTableMemIdx exercises the tableMemIdx = 1
+// branch (!standalone) inside both the single-pattern lit-anchor and the
+// alt-lit-anchor dispatch-body-generation paths in assembleModule —
+// TEST.md T36. All existing lit-anchor/alt-lit-anchor tests use
+// standalone=true; this compiles the same pattern shapes with
+// standalone=false.
+func TestCompileEmbeddedLitAnchorTableMemIdx(t *testing.T) {
+	wasm, _, err := Compile([]config.RegexEntry{
+		{Pattern: `[0-9]{8}ghp_[^\s]+`, FindFunc: "f1"},
+		{Pattern: `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`, FindFunc: "f2"},
+	}, 0, false)
+	if err != nil {
+		t.Fatalf("Compile(embedded lit-anchor): %v", err)
+	}
+	if !bytes.HasPrefix(wasm, wasmMagic) {
+		t.Fatal("output is not a valid WASM module")
+	}
+}
+
+// TestCmdCompile_ErrorPaths exercises the four distinct error/IO branches in
+// CmdCompile — TEST.md T37.
+func TestCmdCompile_ErrorPaths(t *testing.T) {
+	t.Run("compile_file_error_with_sets", func(t *testing.T) {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{{Name: "bad", Pattern: `[`}},
+			Sets: []config.SetConfig{
+				{Name: "s", FindAny: "f", Patterns: config.PatternSelector{All: true}},
+			},
+		}
+		if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "out.wasm")); err == nil {
+			t.Fatal("expected CompileFile error, got nil")
+		}
+	})
+	t.Run("compile_error_no_sets", func(t *testing.T) {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{{Pattern: "[", MatchFunc: "m"}},
+		}
+		if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "out.wasm")); err == nil {
+			t.Fatal("expected Compile error, got nil")
+		}
+	})
+	t.Run("stdout_write_failure", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Close()
+		w.Close() // both ends closed before use — write to w now fails safely, no SIGPIPE
+		orig := os.Stdout
+		os.Stdout = w
+		cfg := config.BuildConfig{Regexps: []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}}
+		compErr := CmdCompile(cfg, "-")
+		os.Stdout = orig
+		if compErr == nil {
+			t.Fatal("expected stdout write error, got nil")
+		}
+	})
+	t.Run("write_file_failure", func(t *testing.T) {
+		cfg := config.BuildConfig{Regexps: []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}}
+		badPath := filepath.Join(t.TempDir(), "nonexistent-dir", "out.wasm")
+		if err := CmdCompile(cfg, badPath); err == nil {
+			t.Fatal("expected os.WriteFile error, got nil")
+		}
+	})
+}
+
+// TestCmdWriteDiagJSON_DroppedPatternError exercises the analyzePattern
+// error path in CmdWriteDiagJSON, propagated as `continue` (silently
+// dropping the pattern from the set's diagnostics) — TEST.md T38.
+func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "bad", Pattern: `[`},
+			{Name: "good", Pattern: `foo`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "diag.json")
+	if err := CmdWriteDiagJSON(cfg, "", path); err != nil {
+		t.Fatalf("CmdWriteDiagJSON: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"patterns_total": 2`)) {
+		t.Errorf("diag JSON missing expected patterns_total: %s", data)
+	}
+}
+
+// TestCompileAutoSelectEngine exercises the `else { engineType =
+// selectBestEngine(prog, &options) }` branch in compile() — calling the
+// private compile() helper WITHOUT an explicit ForceEngine, unlike every
+// production caller (which always sets ForceEngine: EngineDFA) — TEST.md
+// T39.
+func TestCompileAutoSelectEngine(t *testing.T) {
+	t.Run("backtrack_via_gap_i", func(t *testing.T) {
+		// <([^>]+)> routes to Backtrack via the Gap I inverted-class gate
+		// (see CLAUDE.md "Load-bearing engine-selection gates").
+		if _, err := compile(`<([^>]+)>`); err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+	})
+	t.Run("plain_dfa", func(t *testing.T) {
+		if _, err := compile(`a{500}`); err != nil {
+			t.Fatalf("compile: %v", err)
 		}
 	})
 }

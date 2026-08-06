@@ -77,7 +77,10 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		if revCompErr != nil || needsUnicodeSupport(revProg) {
 			return nil, false
 		}
-		revDFA := newDFA(revProg, false, false)
+		revDFA, revOk := newDFA(revProg, false, false, maxHelperDFAStates)
+		if !revOk {
+			return nil, false
+		}
 		revTable := dfaTableFrom(revDFA)
 		if revTable.numStates+1 > 256 {
 			return nil, false

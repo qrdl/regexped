@@ -224,3 +224,140 @@ func TestBTCompileDeterminism(t *testing.T) {
 		})
 	}
 }
+
+// TestBTMemoInitNeedsBitState exercises the BitState memo-init path in
+// buildBacktrackBody (memo locals + bitset zero-init/memory.fill, gated on
+// needsBitState) — TEST.md T19. ((a?)*?) has a nested capture group ((a?)
+// inside the outer capture), so MaxCap()==2 — task 41's whole-pattern-
+// single-capture shortcut (which requires MaxCap()==1) does not intercept
+// it, unlike its close cousin ((?:a?)+?) — confirmed live via
+// isWholePatternSingleCapture/isAnchoredFind probing.
+func TestBTMemoInitNeedsBitState(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "((a?)*?)", GroupsFunc: "g"}})
+}
+
+// TestBTNonLoopAltPushContinue exercises the plain-alternation (non-loop
+// InstAlt) push-frame-and-continue path in emitBTInstHandler — TEST.md T20.
+// (a)\B(?:x|y): the capture plus \B word-boundary force Backtracking (both
+// are TDFA-exclusion gates in selectBestEngine); (?:x|y) is a non-loop
+// InstAlt.
+func TestBTNonLoopAltPushContinue(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a)\B(?:x|y)`, GroupsFunc: "g"}})
+}
+
+// TestBTWordBoundaryFalse exercises the \B case dispatch and the
+// wantBoundary=false fail-if-boundary-present logic in btWordBoundary —
+// TEST.md T21. A second capture group ((c)) is added to the doc's original
+// (a)\B suggestion: confirmed live that (a)\B alone (MaxCap==1, one capture
+// spanning past a zero-width-only assertion) trips task 41's whole-pattern-
+// single-capture shortcut and never reaches BT capture compilation at all;
+// the second group makes isWholePatternSingleCapture reject it.
+func TestBTWordBoundaryFalse(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a)\B(c)`, GroupsFunc: "g"}})
+}
+
+// TestBTInstNop exercises the InstNop case in emitBTInstHandler, only
+// reachable when the NFA program contains an InstNop (emitted by
+// regexp/syntax.Compile for an empty alternation branch) — TEST.md T22. As
+// with T21, a second capture group is added: (a|)\B alone (MaxCap==1) trips
+// the task 41 shortcut (confirmed live), so (a|)\B(c) is used instead —
+// confirmed live to still produce an InstNop instruction and route to
+// Backtracking.
+func TestBTInstNop(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a|)\B(c)`, GroupsFunc: "g"}})
+}
+
+// TestBTInvertedClassNonASCIISkip exercises the Unicode-range skip
+// (if lo > 0x7F { continue/return }) in btCheckRuneRanges/btEmitSingleRange,
+// triggered by an inverted class whose compiled ranges include a
+// [0xE000, 0x10FFFF]-style tail — TEST.md T23. This is exactly the pattern
+// family CLAUDE.md's "Load-bearing engine-selection gates" section
+// documents (hasAmbiguousCaptures routes inverted-class captures to
+// Backtracking, deliberately, not a bug).
+func TestBTInvertedClassNonASCIISkip(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `<([^>]+)>`, GroupsFunc: "g"}})
+}
+
+// TestBTInstCaptureNoCapturesFallback exercises the InstCapture no-captures
+// branch end-to-end via the no-capture match/find BT fallback path
+// (compilePattern's DFA-too-large fallback) — TEST.md T24. Go's
+// syntax.Compile always emits an implicit group-0 InstCapture even though
+// no user captures are requested (MatchFunc/FindFunc only); MaxDFAStates: 1
+// forces the DFA-too-large fallback to Backtracking.
+func TestBTInstCaptureNoCapturesFallback(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[^a]+", FindFunc: "f"}},
+		CompileOptions{MaxDFAStates: 1})
+}
+
+// TestNfaFirstBytesCaseFold exercises the case-insensitive alt-byte
+// computation in nfaFirstBytes, for both a singleton (InstRune1) and a
+// class (InstRune) instruction, plus the len(firstBytes)==0 && !allBytes
+// branch for an entirely-non-ASCII first-byte set — TEST.md T25. Existing
+// TestNfaFirstBytes cases have no (?i) at all.
+func TestNfaFirstBytesCaseFold(t *testing.T) {
+	t.Run("singleton_fold", func(t *testing.T) {
+		prog := compileBTTestProg(t, "(?i)cat|dog")
+		first, _, allBytes := nfaFirstBytes(prog)
+		if allBytes {
+			t.Fatalf("nfaFirstBytes((?i)cat|dog): allBytes = true, want false")
+		}
+		firstSet := make(map[byte]bool)
+		for _, b := range first {
+			firstSet[b] = true
+		}
+		for _, b := range []byte{'c', 'C', 'd', 'D'} {
+			if !firstSet[b] {
+				t.Errorf("nfaFirstBytes((?i)cat|dog): missing fold byte %q", b)
+			}
+		}
+	})
+	t.Run("class_fold", func(t *testing.T) {
+		prog := compileBTTestProg(t, "(?i)[a-c]+")
+		first, _, allBytes := nfaFirstBytes(prog)
+		if allBytes {
+			t.Fatalf("nfaFirstBytes((?i)[a-c]+): allBytes = true, want false")
+		}
+		firstSet := make(map[byte]bool)
+		for _, b := range first {
+			firstSet[b] = true
+		}
+		for _, b := range []byte{'a', 'A', 'b', 'B', 'c', 'C'} {
+			if !firstSet[b] {
+				t.Errorf("nfaFirstBytes((?i)[a-c]+): missing fold byte %q", b)
+			}
+		}
+	})
+	t.Run("all_non_ascii", func(t *testing.T) {
+		prog := compileBTTestProg(t, `[^\x00-\x7F]+`)
+		first, _, allBytes := nfaFirstBytes(prog)
+		if allBytes {
+			t.Errorf("nfaFirstBytes([^\\x00-\\x7F]+): allBytes = true, want false (first-byte set entirely non-ASCII)")
+		}
+		if len(first) != 0 {
+			t.Errorf("nfaFirstBytes([^\\x00-\\x7F]+): first = %v, want empty", first)
+		}
+	})
+}
+
+// TestBTFindMandatoryLitCluster exercises the loop-local reset, memo
+// zero-init, and overflowFind closure body inside buildBTFindBody's
+// mandLit != nil branch — TEST.md T26. [a-z]{1,3}SECRET(?:b?)*? has: a
+// variable-offset mandatory literal "SECRET" (minOff=1, maxOff=3, so it
+// isn't a trivial fixed-offset literal-chain prefix), a loop on both sides,
+// and needsBitState=true (non-greedy loop over an optional body) —
+// confirmed live via findMandatoryLit/needsBitState direct calls.
+// MaxDFAStates: 1 forces the DFA-too-large fallback to BT find.
+func TestBTFindMandatoryLitCluster(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{1,3}SECRET(?:b?)*?", FindFunc: "f"}},
+		CompileOptions{MaxDFAStates: 1})
+}
+
+// TestLoopBodyCanMatchEmptyVisitedGuard exercises the visited-guard in
+// loopBodyCanMatchEmpty for a loop body with path reconvergence before
+// reaching loopPC (two ?-quantified sub-terms in sequence, where both arms
+// of the first rejoin before the second) — TEST.md T27. ((a?b?)*?) has a
+// nested capture, so MaxCap()==2 and task 41's single-capture shortcut
+// (confirmed live) does not intercept it.
+func TestLoopBodyCanMatchEmptyVisitedGuard(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "((a?b?)*?)", GroupsFunc: "g"}})
+}

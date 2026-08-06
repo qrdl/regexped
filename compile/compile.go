@@ -2,6 +2,7 @@ package compile
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,17 @@ import (
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
 )
+
+// errDFAStateLimitExceeded is returned by compile() when EngineDFA subset
+// construction (newDFA) hits its internal state cap. Callers with a BT
+// fallback (compile.go's match/find DFA construction) must treat this the
+// same as the existing "table.numStates > maxStates" post-construction
+// check — NOT as a hard compile failure — since it signals exactly the same
+// outcome the post-check exists to catch, just detected earlier and
+// cheaply. Callers with an all-or-nothing "fall through cleanly on
+// rejection" contract (e.g. compileAltLitAnchorBranches) already handle any
+// non-nil error from compile() correctly with no changes needed.
+var errDFAStateLimitExceeded = errors.New("compile: DFA state limit exceeded during construction")
 
 // EngineType represents the type of regexp engine implementation.
 type EngineType byte
@@ -795,11 +807,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// This matches Go stdlib semantics: regexp.MustCompile("^(a|aa)$").MatchString("aa") = true.
 		llOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: false}
 		llMatch, llErr := compile(re.Pattern, llOpts)
-		if llErr != nil {
+		if llErr != nil && !errors.Is(llErr, errDFAStateLimitExceeded) {
 			return nil, fmt.Errorf("compile match DFA: %w", llErr)
 		}
-		llTable := dfaTableFrom(llMatch.(*dfa))
-		if llTable.numStates > maxStates || (memLimit > 0 && dfaTableBytes(llTable) > memLimit) {
+		var llTable *dfaTable
+		if llErr == nil {
+			llTable = dfaTableFrom(llMatch.(*dfa))
+		}
+		if llErr != nil || llTable.numStates > maxStates || (memLimit > 0 && dfaTableBytes(llTable) > memLimit) {
 			// DFA too large — fall back to Backtracking match.
 			btProg := compileBTProg(re.Pattern)
 			bt := newBacktrack(btProg)
@@ -851,16 +866,31 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// LF DFA for find and/or groups.
 	lfOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: true}
 	matcher, err := compile(re.Pattern, lfOpts)
-	if err != nil {
+	if err != nil && !errors.Is(err, errDFAStateLimitExceeded) {
 		return nil, fmt.Errorf("compile DFA: %w", err)
 	}
-	table := dfaTableFrom(matcher.(*dfa))
-
-	anchored := isAnchoredFind(table)
-	needFindBody := needFind || (needGroups && !anchored)
+	// dfaStateLimitExceeded: newDFA's own internal cap already fired, so
+	// there is no table to inspect — treat it the same as the ordinary
+	// "table.numStates > maxStates" post-construction check below (both
+	// mean "DFA too large, fall back to BT"), rather than as a hard error.
+	dfaStateLimitExceeded := errors.Is(err, errDFAStateLimitExceeded)
+	var table *dfaTable
+	var anchored, needFindBody bool
+	if !dfaStateLimitExceeded {
+		table = dfaTableFrom(matcher.(*dfa))
+		anchored = isAnchoredFind(table)
+		needFindBody = needFind || (needGroups && !anchored)
+	} else {
+		// anchored is unknowable without a table; assume false (the safe
+		// direction — it only widens needFindBody, it never narrows it, so
+		// a genuinely-anchored pattern just gets a find body it technically
+		// didn't strictly need, never a missing one for a genuinely
+		// non-anchored needGroups-only pattern).
+		needFindBody = needFind || needGroups
+	}
 
 	// Check if the LF DFA exceeds the state limit — if so, use BT find body.
-	dfaTooLarge := table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit)
+	dfaTooLarge := dfaStateLimitExceeded || table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit)
 
 	var l *dfaLayout
 	if !dfaTooLarge {
@@ -902,7 +932,15 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			var btScanDataBytes []byte
 			var btScanSegCnt int
 			var btMandLit *mandatoryLit
-			btPrefix := computePrefix(table) // table is always available (even when too large)
+			// table is nil only in the rare dfaStateLimitExceeded backstop
+			// case (construction itself was too expensive to finish, not
+			// just "too many states to use as the primary engine") — no
+			// prefix optimisation is available then, falls through to
+			// btMandLit/nfaFirstBytes below.
+			var btPrefix []byte
+			if table != nil {
+				btPrefix = computePrefix(table)
+			}
 			if len(btPrefix) >= 2 {
 				// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
 				btScanParams = prefixScanParams{
@@ -955,9 +993,12 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				revSimplified := revRe.Simplify()
 				revProg, revCompErr := syntax.Compile(revSimplified)
 				if revCompErr == nil && !needsUnicodeSupport(revProg) {
-					revDFA := newDFA(revProg, false, false)
-					revTable := dfaTableFrom(revDFA)
-					if revTable.numStates+1 <= 256 &&
+					revDFA, revOk := newDFA(revProg, false, false, maxHelperDFAStates)
+					var revTable *dfaTable
+					if revOk {
+						revTable = dfaTableFrom(revDFA)
+					}
+					if revOk && revTable.numStates+1 <= 256 &&
 						(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
 							revTable.midAcceptStates[revTable.startState] == 0)) {
 						revTableBase := utils.PageAlign(l.tableEnd)
@@ -1201,7 +1242,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// always (0,len) too, with no TDFA/BT re-walk needed). Native/anchored
 	// paths above (where captureBody IS the exported groups function) are
 	// out of scope and unaffected.
-	if !anchored && isWholePatternSingleCapture(parsed) {
+	//
+	// !dfaStateLimitExceeded is required too: in that (rare, pathological)
+	// case `anchored` is a conservative default, not a real answer — firing
+	// this shortcut on an actually-anchored pattern would silently produce
+	// wrong (0,len) captures instead of the correct native-anchored body.
+	// Falling through to normal TDFA/BT capture construction is always
+	// correct regardless of anchoring, just without this fast path.
+	if !dfaStateLimitExceeded && !anchored && isWholePatternSingleCapture(parsed) {
 		p.numGroups = 2
 		p.captureBody = appendTrivialSingleCaptureCodeEntry(nil)
 		return p, nil
@@ -1797,7 +1845,16 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 
 	switch engineType {
 	case EngineDFA:
-		return newDFA(prog, options.Unicode, options.LeftmostFirst), nil
+		// maxHelperDFAStates, NOT resolveMaxDFAStates(&options): callers
+		// (compile.go's match/find construction) deliberately set
+		// MaxDFAStates arbitrarily low to force a BT fallback while still
+		// expecting a real (if oversized) table back for prefix-extraction
+		// optimisations — see maxHelperDFAStates' doc comment.
+		d, ok := newDFA(prog, options.Unicode, options.LeftmostFirst, maxHelperDFAStates)
+		if !ok {
+			return nil, errDFAStateLimitExceeded
+		}
+		return d, nil
 	case EngineBacktrack:
 		return newBacktrack(prog), nil
 	default:

@@ -444,6 +444,14 @@ func TestCompileLikelyMatch(t *testing.T) {
 			}},
 		},
 		// ---------- Lenient alt: find only ----------
+		// NOTE: despite the name, this pattern does NOT trip the lenient-alt
+		// (Phase 2a) find body in compilePattern. Its second branch's \s* is
+		// unbounded with no nested OpAlternate/OpQuest, so
+		// shouldTryLitChainAlt short-circuits to false before
+		// analyseLitChainAltLenient is ever tried (confirmed live) — this
+		// case only exercises the general LikelyMatch compile sweep for this
+		// pattern shape. See TestCompileLenientAltFindBody (TEST.md T33) for
+		// a pattern that actually reaches that code.
 		{
 			"lenient_alt_find_only",
 			[]config.RegexEntry{{

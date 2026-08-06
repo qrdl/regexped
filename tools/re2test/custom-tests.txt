@@ -2277,3 +2277,51 @@ regexps
 -;5-9;-;-
 -;5-9;-;-
 -;5-9;-;-
+# ============================================================
+# Category 33: two independent bounded-repetition inverted classes
+# straddling an ambiguous literal split point.
+#
+# Bug found 2026-08-06: [^,]{250,}X[^;]{250,} made newDFA's subset
+# construction explode to 40,000+ states with no plateau in sight (any byte,
+# including 'X' itself, is valid inside BOTH classes, so the DFA had to track
+# many candidate "how far past a past X am I" positions simultaneously).
+# CompileOptions.MaxDFAStates was powerless to stop it: it was only checked
+# on newDFA's *output*, after the (now unbounded-in-practice) construction
+# already ran. Fixed by giving newDFA its own internal state cap
+# (maxHelperDFAStates, decoupled from MaxDFAStates), matching newTDFA's
+# existing convention.
+#
+# TestDFAStateLimitBailsOutFast (compile package) guards the actual bug at
+# its original scale (n=250): asserts newDFA bails out fast and Compile()
+# still falls back to Backtracking rather than hanging. That test is
+# compile-only — it doesn't check that the resulting WASM actually matches
+# correctly. This fixture closes that gap at a human-readable scale (n=5):
+# same structural shape (two inverted classes, ambiguous split point), run
+# under both the naturally-selected engine (plain `make custom`, currently
+# Compiled DFA at this size) and forced Backtracking (`make force-backtrack`,
+# which sets MaxDFAStates=1) — the exact fallback engine the real bug
+# resolves to at scale. All expected positions below are cross-checked
+# against Go stdlib regexp (ground truth), not hand-derived.
+# ============================================================
+DoSPatternInvertedClassBoundedRepeat
+strings
+"aaaaaXbbbbb"
+"aaaaXbbbbb"
+"aaaaaaaaXbbbbbbbb"
+",aaaaaXbbbbb"
+"aaaaaXaaaaXbbbbb"
+"aaaaaXaaaaXbb;bbbbb"
+regexps
+"[^,]{5,}X[^;]{5,}"
+# case 1 (len=11): boundary positive: n non-comma + X + n non-semicolon
+0-11;0-11;-;-
+# case 2 (len=10): one short on the left: no match anywhere
+-;-;-;-
+# case 3 (len=17): comfortably over the boundary both sides (greedy)
+0-17;0-17;-;-
+# case 4 (len=12): leading comma: anchored fails, find succeeds at pos 1
+-;1-12;-;-
+# case 5 (len=16): two X's present: 2nd run absorbs the 2nd X (X is [^;] too); full-string match either way
+0-16;0-16;-;-
+# case 6 (len=19): two X's + trailing ';': find still matches by absorbing the 2nd X and stopping at ';'; anchored fails (doesn't reach end of string)
+-;0-13;-;-

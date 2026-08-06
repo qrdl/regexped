@@ -153,6 +153,31 @@ func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptio
 	return EngineDFA
 }
 
+// maxHelperDFAStates is a hard safety ceiling for newDFA construction,
+// deliberately DECOUPLED from the user-facing CompileOptions.MaxDFAStates
+// threshold. It exists purely to bound worst-case subset-construction cost
+// against pathological patterns (e.g. two independent bounded-repetition
+// inverted classes straddling an ambiguous split point, which makes the
+// number of distinct reachable NFA-state subsets explode with no plateau
+// in sight — confirmed live: 40,000+ states in 12s, no sign of leveling
+// off). It must stay well above any MaxDFAStates value legitimate callers
+// configure (including deliberately tiny values like 1 or 4, used by
+// several existing tests to force the "DFA too large, fall back to BT"
+// path) — those callers still need a REAL, if oversized, dfaTable back:
+// buildBTMatchBody/buildBTFindBody's mandatory-literal-prefix optimisation
+// (computePrefix) reads that table even when it's far too large to serve as
+// the primary matching engine. Using MaxDFAStates itself as this cap would
+// silently break that optimisation (and crash on a nil table) for every
+// such caller. maxHelperDFAStates is only meant to catch constructions that
+// are not just "too large to use as DFA" but "too large to have finished
+// computing in reasonable time at all" — comfortably above every state
+// count produced by any pattern in this package's test suite (the largest,
+// TestCompileLargeStateDFA / a{512}-style patterns, stay in the low
+// hundreds to ~1000 states) — 2048 gives 2x headroom above that while
+// keeping worst-case pathological construction cost to ~370ms (measured),
+// rather than the multi-second-and-climbing cost of a higher ceiling.
+const maxHelperDFAStates = 2048
+
 // resolveMaxDFAStates returns the effective DFA/TDFA state limit from opts.
 // Zero → default (1024). Negative → disabled (0, meaning TDFA is never used).
 func resolveMaxDFAStates(opts *CompileOptions) int {

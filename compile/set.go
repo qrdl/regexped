@@ -315,7 +315,10 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		if err != nil {
 			return nil, fmt.Errorf("analyzePattern: compile prefix %q: %w", re.Pattern, err)
 		}
-		revD := newDFA(revProg, false, false)
+		revD, revOk := newDFA(revProg, false, false, maxHelperDFAStates)
+		if !revOk {
+			return nil, fmt.Errorf("analyzePattern: prefix %q exceeds DFA state limit", re.Pattern)
+		}
 		prefixTable := dfaTableFromCanonical(revD)
 		info.prefixDFA = prefixTable
 		info.prefixID = prefixPool.Add(prefixTable)
@@ -334,7 +337,10 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	if err != nil {
 		return nil, fmt.Errorf("analyzePattern: compile suffix %q: %w", re.Pattern, err)
 	}
-	d := newDFA(prog, false, false)
+	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	if !ok {
+		return nil, fmt.Errorf("analyzePattern: suffix %q exceeds DFA state limit", re.Pattern)
+	}
 	suffixTable := dfaTableFromCanonical(d)
 	info.suffixDFA = suffixTable
 	info.suffixStates = suffixTable.numStates
@@ -458,7 +464,17 @@ func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, A
 	// Build union NFA manually so each pattern gets a distinct InstMatch.
 	unionProg, patternBits := buildUnionProg(progs, bw)
 
-	d := newDFA(unionProg, false, true, patternBits)
+	// maxHelperDFAStates, NOT opts.budgetStates(): callers (binPack) expect
+	// a REAL, if over-budget, table back so they can record a precise
+	// "state_count_exceeded" diagnostic (merged_states/budget_states) for
+	// the common case of a legitimately-large-but-finite merge — the same
+	// contract compile.go's primary DFA construction has with
+	// resolveMaxDFAStates. Only pathological, effectively-unbounded
+	// constructions (beyond maxHelperDFAStates) hit errDFAStateLimitExceeded.
+	d, ok := newDFA(unionProg, false, true, maxHelperDFAStates, patternBits)
+	if !ok {
+		return nil, 0, errDFAStateLimitExceeded
+	}
 	t := dfaTableFromCanonical(d)
 	return t, AcceptBitmask, nil
 }

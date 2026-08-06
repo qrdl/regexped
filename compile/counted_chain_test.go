@@ -80,7 +80,10 @@ func TestIsCountedClassChain_RealPatterns(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d := newDFA(prog, false, true)
+		d, dOk := newDFA(prog, false, true, maxHelperDFAStates)
+		if !dOk {
+			t.Fatalf("newDFA: state limit exceeded")
+		}
 		full := dfaTableFrom(d)
 		_, n, ok := isCountedClassChain(full)
 		if ok {

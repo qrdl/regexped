@@ -345,7 +345,18 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool, 
 // patternBitsArg is optional: if provided, patternBitsArg[0][pc] gives the bitmask
 // for NFA instruction pc; InstMatch instructions accumulate their bits into the accept maps.
 // When absent, any InstMatch contributes bit 1 (single-pattern mode).
-func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, patternBitsArg ...[]uint64) *dfa {
+//
+// maxStates bounds subset-construction cost: the BFS bails out and returns
+// (nil, false) once the number of distinct DFA states discovered exceeds it,
+// mirroring newTDFA's limit parameter. This is not optional — some patterns
+// (e.g. two independent bounded-repetition inverted classes straddling an
+// ambiguous split point, like `[^,]{250,}X[^;]{250,}`) make the subset
+// construction produce tens of thousands of states with no plateau in
+// sight; without an internal cap, CompileOptions.MaxDFAStates cannot do its
+// documented job of bounding compile-time cost, because it was previously
+// only checked on newDFA's *output*, after the unbounded construction had
+// already run to completion (or exhausted memory/CPU trying to).
+func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates int, patternBitsArg ...[]uint64) (*dfa, bool) {
 	dfa := &dfa{
 		accepting:          make(map[int]uint64),
 		midAccepting:       make(map[int]uint64),
@@ -633,6 +644,9 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, patternBit
 
 	// Process work queue
 	for len(queue) > 0 {
+		if nextStateID > maxStates {
+			return nil, false
+		}
 		item := queue[0]
 		queue = queue[1:]
 
@@ -830,7 +844,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, patternBit
 		}
 	}
 
-	return dfa
+	return dfa, true
 }
 
 // isWordCharByte reports whether b is a \w word character ([A-Za-z0-9_]).
@@ -11062,7 +11076,10 @@ func analyseLitChainAltLenient(pattern string) (*lenAltPattern, bool) {
 		if needsUnicodeSupport(prog) {
 			return nil, false
 		}
-		d := newDFA(prog, false, false)
+		d, dOk := newDFA(prog, false, false, maxHelperDFAStates)
+		if !dOk {
+			return nil, false
+		}
 		dt := dfaTableFrom(d)
 		if dt.numStates+1 > 256 {
 			return nil, false // keep inline DFA small (u8 table)
