@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"regexp/syntax"
 	"testing"
 
@@ -191,5 +192,57 @@ func TestBtAllocSizes(t *testing.T) {
 	_, memoSize2 := btAllocSizes(bt, true, 0, 128*1024)
 	if memoSize2 != 128*1024 {
 		t.Errorf("btAllocSizes(useMemo=true): memoSize = %d, want 131072", memoSize2)
+	}
+}
+
+// TestBTCompileDeterminism guards against a class of bug found and fixed
+// 2026-08-06: buildBacktrackBody/buildBTMatchBody/buildBTFindBody built a
+// sorted loopPCsSorted slice for deterministic local assignment, but then
+// emitted the loop-local (and loop-capture-snapshot) zero-init instructions
+// by ranging directly over the loopLocalIdx/loopSnapBase maps instead of
+// over loopPCsSorted. Go randomizes map iteration order per process, so the
+// same pattern could compile to different (same-length) WASM bytes across
+// runs — mirrors TestTDFACompileDeterminism, which guards the equivalent
+// fix already made in the TDFA engine.
+func TestBTCompileDeterminism(t *testing.T) {
+	cases := []struct {
+		name string
+		re   config.RegexEntry
+		opts []CompileOptions
+	}{
+		// buildBacktrackBody (capture path): non-greedy loop wrapping a
+		// capture populates both loopLocalIdx and loopSnapBase.
+		{"capture_loop_snapshot", config.RegexEntry{Pattern: "((a?)*?)", GroupsFunc: "g"}, nil},
+		// buildBacktrackBody: 4 quantified sub-expressions give loopLocalIdx
+		// 4 entries with no snapshot locals.
+		{"capture_multi_loop", config.RegexEntry{Pattern: `(?i)(\bOR\b|\bAND\b)\s+[0-9]+\s*=\s*[0-9]+`, GroupsFunc: "g"}, nil},
+		// buildBTMatchBody (no-capture match, forced via DFA-too-large
+		// fallback): 2 independent loops.
+		{"match_bt_multi_loop", config.RegexEntry{Pattern: "[a-z]+[0-9]+", MatchFunc: "m"}, []CompileOptions{{MaxDFAStates: 1}}},
+		// buildBTFindBody, mandatory-literal branch (no-capture find,
+		// forced via DFA-too-large fallback): loops on both sides of a
+		// mandatory interior literal.
+		{"find_bt_mandlit", config.RegexEntry{Pattern: "[a-z]+SECRET[0-9]+", FindFunc: "f"}, []CompileOptions{{MaxDFAStates: 1}}},
+		// buildBTFindBody, general-scan (OnMatch closure) branch: same
+		// loop shape but no mandatory literal to anchor the scan.
+		{"find_bt_no_mandlit", config.RegexEntry{Pattern: "[a-z]+[0-9]+", FindFunc: "f"}, []CompileOptions{{MaxDFAStates: 1}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			first, _, err := Compile([]config.RegexEntry{c.re}, 0, true, c.opts...)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			const iterations = 20
+			for i := 0; i < iterations; i++ {
+				got, _, err := Compile([]config.RegexEntry{c.re}, 0, true, c.opts...)
+				if err != nil {
+					t.Fatalf("iteration %d: Compile: %v", i+1, err)
+				}
+				if !bytes.Equal(first, got) {
+					t.Errorf("iteration %d: WASM output differs from first (BT emission non-deterministic)", i+1)
+				}
+			}
+		})
 	}
 }

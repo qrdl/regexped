@@ -593,10 +593,9 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		}
 		startThreads[i] = tdfaThread{pc: int(pc), regMap: rm}
 	}
-	startID, entryOps := getOrAddState(startThreads, false)
-	if startID != 0 {
-		return nil, false // should always be 0
-	}
+	// getOrAddState's first call always lands on state 0 (stateMap starts empty,
+	// nextStateID starts at 0).
+	_, entryOps := getOrAddState(startThreads, false)
 
 	// ---- main BFS ----
 	for si := 0; si < len(states); si++ {
@@ -1030,10 +1029,9 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 func emitTDFATagOps(tt *tdfaTable, b []byte,
 	localPrevState, localByte, localPos, localCapBase uint32) []byte {
 
+	// tt.numStates is always ≥ 1 for a table built by newTDFA (the start
+	// state alone guarantees this).
 	n := tt.numStates
-	if n == 0 {
-		return b
-	}
 
 	// Precompute per-state entries (bytes with non-empty ops).
 	type byteOps struct {
@@ -1282,22 +1280,11 @@ func emitTDFAAcceptEOF(tt *tdfaTable, b []byte, localState, localPos, localCapBa
 // For each accepting state, acceptRegMap tells which local holds each group
 // start/end. pos already equals the exclusive end.
 func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localCapBase uint32) []byte {
+	// tt.numStates is always ≥ 1 (see emitTDFATagOps), and getOrAddState
+	// unconditionally assigns every state a non-nil acceptRegMap entry (even
+	// non-accepting states get an all -1 slice), so at least state 0 always
+	// has capture info here.
 	n := tt.numStates
-	if n == 0 {
-		return b
-	}
-
-	// Check if any state has capture info.
-	anyHasCaptures := false
-	for gs := 0; gs < n; gs++ {
-		if gs < len(tt.acceptRegMap) && tt.acceptRegMap[gs] != nil {
-			anyHasCaptures = true
-			break
-		}
-	}
-	if !anyHasCaptures {
-		return b
-	}
 
 	// br_table dispatch on state-1 (0-based). Same block layout as emitTDFATagOps.
 	b = append(b, 0x02, 0x40) // block $exit

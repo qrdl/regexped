@@ -1253,10 +1253,7 @@ func TestSetMatch_SingleBucket_Equivalence(t *testing.T) {
 		Patterns:   patterns,
 		PatternIDs: patternIDs,
 	}
-	cs, err := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
-	if err != nil {
-		t.Fatalf("CompileSet: %v", err)
-	}
+	cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
 	// matchFnBody is built at assemble time (assembleModuleWithSets), not in CompileSet.
 	if cs.numSuffixFns == 0 {
 		t.Error("expected at least one suffix function body")

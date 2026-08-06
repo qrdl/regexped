@@ -3293,9 +3293,9 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 	// DFA transition
 	if l.useU8 && l.useCompression {
 		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
-			l.useRowDedup, l.rowMapOff, lState, lByteClass, paramPtr, lScanPos, 0xff, tableMemIdx)
+			lState, lByteClass, paramPtr, lScanPos, 0xff, tableMemIdx)
 	} else if l.useU8 {
-		b = emitSimpleU8Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff,
+		b = emitSimpleU8Transition(b, l.tableOff,
 			lState, paramPtr, lScanPos, 0xff, tableMemIdx)
 	} else {
 		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A, 0x2D, 0x00, 0x00, 0x21, lByteClass)
@@ -3572,11 +3572,10 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 //
 // where byte is loaded from mem[ptrLocal+posLocal] when byteLocal==0xff,
 // or taken from byteLocal otherwise (byte already in a local).
-// row = rowMap[state] when useRowDedup, otherwise row = state.
+// row = state (row dedup applies only to u16 tables; see emitU16Transition).
 // classLocal receives the class value; stateLocal is updated with the loaded state.
 func emitCompressedU8Transition(b []byte,
 	tableOff, classMapOff int32, numClasses int,
-	useRowDedup bool, rowMapOff int32,
 	stateLocal, classLocal byte,
 	ptrLocal, posLocal byte,
 	byteLocal byte,
@@ -3596,15 +3595,7 @@ func emitCompressedU8Transition(b []byte,
 	b = append(b, 0x21, classLocal)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, tableOff)
-	if useRowDedup {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, rowMapOff)
-		b = append(b, 0x20, stateLocal)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // rowMap[state] → row
-	} else {
-		b = append(b, 0x20, stateLocal)
-	}
+	b = append(b, 0x20, stateLocal)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(numClasses))
 	b = append(b, 0x6C)                   // i32.mul
@@ -3626,26 +3617,17 @@ func emitCompressedU8Transition(b []byte,
 //
 // where byte is loaded from mem[ptrLocal+posLocal] when byteLocal==0xff,
 // or taken from byteLocal otherwise.
-// row = rowMap[state] when useRowDedup, otherwise row = state.
+// row = state (row dedup applies only to u16 tables; see emitU16Transition).
 // stateLocal is updated with the loaded state.
 func emitSimpleU8Transition(b []byte,
 	tableOff int32,
-	useRowDedup bool, rowMapOff int32,
 	stateLocal byte,
 	ptrLocal, posLocal byte,
 	byteLocal byte,
 	tableMemIdx int) []byte {
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, tableOff)
-	if useRowDedup {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, rowMapOff)
-		b = append(b, 0x20, stateLocal)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // rowMap[state] → row
-	} else {
-		b = append(b, 0x20, stateLocal)
-	}
+	b = append(b, 0x20, stateLocal)
 	b = append(b, 0x41, 0x08) // i32.const 8
 	b = append(b, 0x74)       // i32.shl (row * 256)
 	b = append(b, 0x6A)
@@ -4494,7 +4476,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x0D, 0x01) // br_if $done
 
 		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
-			useRowDedup, rowMapOff, 0x02, 0x04, 0x00, 0x03, 0xff, tableMemIdx)
+			0x02, 0x04, 0x00, 0x03, 0xff, tableMemIdx)
 
 		b = append(b, 0x20, 0x02)
 		b = append(b, 0x45)       // i32.eqz
@@ -4543,7 +4525,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x4F)
 		b = append(b, 0x0D, 0x01) // if pos >= len: br_if $done
 
-		b = emitSimpleU8Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
+		b = emitSimpleU8Transition(b, tableOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
 
 		b = append(b, 0x20, 0x02)
 		b = append(b, 0x45)
@@ -4793,7 +4775,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
 		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
-			useRowDedup, rowMapOff, 0x02, 0x06, 0x00, 0x03, 0xff, tableMemIdx)
+			0x02, 0x06, 0x00, 0x03, 0xff, tableMemIdx)
 
 		b = append(b, 0x20, 0x02) // dead?
 		b = append(b, 0x45)
@@ -4845,7 +4827,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
-		b = emitSimpleU8Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
+		b = emitSimpleU8Transition(b, tableOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
 
 		b = append(b, 0x20, 0x02)
 		b = append(b, 0x45)
@@ -4904,7 +4886,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
 	b = append(b, 0x21, 0x06)       // local.set byte
 
-	b = emitU16Transition(b, tableOff, false, 0, 0x02, 0x06, tableMemIdx)
+	b = emitU16Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x06, tableMemIdx)
 
 	b = append(b, 0x20, 0x02)
 	b = append(b, 0x45)
@@ -5046,9 +5028,9 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 	// ── DFA transition ────────────────────────────────────────────────────────
 	if revL.useCompression {
 		b = emitCompressedU8Transition(b, revL.tableOff, revL.classMapOff, revL.numClasses,
-			false, 0, 0x02, 0x05, 0, 0, 0x05, tableMemIdx)
+			0x02, 0x05, 0, 0, 0x05, tableMemIdx)
 	} else {
-		b = emitSimpleU8Transition(b, revL.tableOff, false, 0, 0x02, 0, 0, 0x05, tableMemIdx)
+		b = emitSimpleU8Transition(b, revL.tableOff, 0x02, 0, 0, 0x05, tableMemIdx)
 	}
 
 	// if state == 0 (dead state): exit $done
@@ -5449,9 +5431,9 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	// DFA transition.
 	if l.useCompression {
 		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
-			false, 0, locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
+			locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
 	} else {
-		b = emitSimpleU8Transition(b, l.tableOff, false, 0, locState, locPtr, locPos, 0xff, tableMemIdx)
+		b = emitSimpleU8Transition(b, l.tableOff, locState, locPtr, locPos, 0xff, tableMemIdx)
 	}
 
 	// if state == 0 (dead): exit $fwd_done.
@@ -5700,9 +5682,9 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 	// DFA transition.
 	if l.useCompression {
 		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
-			false, 0, locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
+			locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
 	} else {
-		b = emitSimpleU8Transition(b, l.tableOff, false, 0, locState, locPtr, locPos, 0xff, tableMemIdx)
+		b = emitSimpleU8Transition(b, l.tableOff, locState, locPtr, locPos, 0xff, tableMemIdx)
 	}
 
 	// if state == 0 (dead): exit $fwd_done.
@@ -6658,7 +6640,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
 		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
-			useRowDedup, rowMapOff, 0x02, 0x06, 0x00, 0x03, 0xff, tableMemIdx)
+			0x02, 0x06, 0x00, 0x03, 0xff, tableMemIdx)
 
 		// dead state?
 		b = append(b, 0x20, 0x02) // local.get state
@@ -6741,7 +6723,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 
-		b = emitSimpleU8Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
+		b = emitSimpleU8Transition(b, tableOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
 
 		// dead state?
 		b = append(b, 0x20, 0x02) // local.get state
@@ -9084,23 +9066,6 @@ func emitLitChainGroupSlotWrites(b []byte, lcc *litChainCaptures,
 	for _, cg := range lcc.groups {
 		populated[cg.group] = cg
 	}
-
-	// Helper: write i32 to out_ptr at offset.
-	writeSlot := func(b []byte, slotOff uint32, valueIsConst bool, value int32) []byte {
-		b = append(b, 0x20, outPtrLocal)
-		if valueIsConst {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, value)
-		} else {
-			// value is attemptStart + value (offset into match) — pushed onto stack
-			// by caller before this function. We do not handle this here.
-			panic("unreachable")
-		}
-		b = append(b, 0x36, 0x00) // i32.store align=0
-		b = utils.AppendULEB128(b, slotOff)
-		return b
-	}
-	_ = writeSlot
 
 	// Helper: write (attemptStart + offset) to out_ptr at slotOff.
 	writeAttemptPlus := func(b []byte, slotOff uint32, offset int) []byte {
@@ -11564,11 +11529,9 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout, t *dfaTable,
 	// Transition: state = table[state * numClasses + class(input[pos])].
 	if dl.useCompression {
 		b = emitCompressedU8Transition(b, dl.tableOff, dl.classMapOff, dl.numClasses,
-			dl.useRowDedup, dl.rowMapOff,
 			locState, locClass, locPtr, locPos, 0xff, tableMemIdx)
 	} else {
 		b = emitSimpleU8Transition(b, dl.tableOff,
-			dl.useRowDedup, dl.rowMapOff,
 			locState, locPtr, locPos, 0xff, tableMemIdx)
 	}
 

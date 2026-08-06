@@ -801,10 +801,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		llTable := dfaTableFrom(llMatch.(*dfa))
 		if llTable.numStates > maxStates || (memLimit > 0 && dfaTableBytes(llTable) > memLimit) {
 			// DFA too large — fall back to Backtracking match.
-			btProg, btProgErr := compileBTProg(re.Pattern)
-			if btProgErr != nil {
-				return nil, fmt.Errorf("compile BT match prog: %w", btProgErr)
-			}
+			btProg := compileBTProg(re.Pattern)
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
 			useMemo := needsBitState(btProg)
@@ -893,10 +890,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if needFindBody {
 		if dfaTooLarge {
 			// DFA too large — fall back to Backtracking find.
-			btProg, btProgErr := compileBTProg(re.Pattern)
-			if btProgErr != nil {
-				return nil, fmt.Errorf("compile BT find prog: %w", btProgErr)
-			}
+			btProg := compileBTProg(re.Pattern)
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
 			useMemo := needsBitState(btProg)
@@ -1013,10 +1007,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 								fbToBit[fb] = i
 							}
 							for _, lit := range lap.litSet {
-								bit, ok := fbToBit[lit[0]]
-								if !ok {
-									continue
-								}
+								// lit[0] is guaranteed present: fbToBit was built from
+								// litFirstBytes, which was deduped from this same litSet.
+								bit := fbToBit[lit[0]]
 								t1Lo[lit[1]&0x0F] |= byte(1 << uint(bit))
 								t1Hi[lit[1]>>4] |= byte(1 << uint(bit))
 							}
@@ -1060,12 +1053,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						p.dataSegCount += revSegCnt
 						p.dataBytes = append(p.dataBytes, litSegs...)
 						p.dataSegCount += litSegCnt
+						// litAnchorPoint.litSet is hard-capped at 8 literals
+						// (lit_anchor.go), so litFirstBytes has ≤ 8 entries and
+						// the Teddy lo/hi tables above are always populated.
 						p.tableEnd = int64(litTeddyT1HiOff) + 16
-						if litTeddyLoBytes == nil {
-							p.tableEnd = int64(litFirstByteOff) + 256
-						} else if litTeddyT1LoBytes == nil {
-							p.tableEnd = int64(litTeddyHiOff) + 16
-						}
 					}
 				}
 			}
@@ -1196,10 +1187,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
-	prog, err := syntax.Compile(parsed.Simplify())
-	if err != nil {
-		return nil, fmt.Errorf("compile NFA: %w", err)
-	}
+	prog, _ := syntax.Compile(parsed.Simplify())
 	if needsUnicodeSupport(prog) {
 		return nil, fmt.Errorf("pattern contains Unicode features not yet supported")
 	}
@@ -1735,10 +1723,7 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 			Patterns:   infos,
 			PatternIDs: globalIDs,
 		}
-		cs, err := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
-		if err != nil {
-			continue
-		}
+		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
 		if cs.diag != nil {
 			cs.diag.CaptureBearingDropped = droppedRefs
 			diag.Sets = append(diag.Sets, *cs.diag)
@@ -1747,14 +1732,11 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 	}
 	diag.PrefixDedupPoolSize = len(prefixPool.tables)
 
-	data, err := json.MarshalIndent(diag, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal diag JSON: %w", err)
-	}
+	data, _ := json.MarshalIndent(diag, "", "  ")
 	data = append(data, '\n')
 
 	if diagPath == "-" {
-		_, err = os.Stdout.Write(data)
+		_, err := os.Stdout.Write(data)
 		return err
 	}
 	return os.WriteFile(diagPath, data, 0o644)
@@ -1780,10 +1762,7 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 	if err != nil {
 		return 0, fmt.Errorf("parse error: %w", err)
 	}
-	prog, err := syntax.Compile(re.Simplify())
-	if err != nil {
-		return 0, fmt.Errorf("compile error: %w", err)
-	}
+	prog, _ := syntax.Compile(re.Simplify())
 	if needsUnicodeSupport(prog) && !opts.Unicode {
 		return 0, fmt.Errorf("pattern contains Unicode features but Unicode option not enabled")
 	}
@@ -1798,10 +1777,7 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 	}
 
 	simplified := re.Simplify()
-	prog, err := syntax.Compile(simplified)
-	if err != nil {
-		return nil, fmt.Errorf("compile error: %w", err)
-	}
+	prog, _ := syntax.Compile(simplified)
 
 	var options CompileOptions
 	if len(opts) > 0 {

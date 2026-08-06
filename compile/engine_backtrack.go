@@ -269,14 +269,22 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	}
 
 	// ── Initialise loop_pos locals to -1 ────────────────────────────────────
-	for _, loopLocal := range loopLocalIdx {
+	// Iterate loopPCsSorted, not loopLocalIdx directly — map iteration order
+	// is randomized per-process and would make the emitted WASM bytes
+	// non-deterministic (the instructions themselves are order-independent,
+	// but byte-for-byte reproducibility matters for caching/testing).
+	for _, pc := range loopPCsSorted {
 		body = append(body, 0x41, 0x7F) // i32.const -1
 		body = append(body, 0x21)       // local.set
-		body = utils.AppendULEB128(body, loopLocal)
+		body = utils.AppendULEB128(body, loopLocalIdx[pc])
 	}
 
 	// ── Initialise loop snapshot locals to -1 ───────────────────────────────
-	for pc, snapBase := range loopSnapBase {
+	for _, pc := range loopPCsSorted {
+		snapBase, ok := loopSnapBase[pc]
+		if !ok {
+			continue
+		}
 		for k := range loopSnapLocals[pc] {
 			body = append(body, 0x41, 0x7F) // i32.const -1
 			body = append(body, 0x21)
@@ -688,9 +696,6 @@ func emitBTInstHandler(
 
 		case emptyOp&syntax.EmptyNoWordBoundary != 0:
 			body = btWordBoundary(body, false, brRunNested)
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
-
-		default:
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 		}
 
@@ -1136,17 +1141,16 @@ func btFoldRune(r rune) rune {
 
 // compileBTProg parses pattern, strips captures, and compiles the NFA for use
 // in a no-capture BT match/find body.
-func compileBTProg(pattern string) (*syntax.Prog, error) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return nil, err
-	}
+// compileBTProg re-parses pattern into an NFA program with captures stripped.
+// Both call sites reach this only after the caller already parsed the same
+// pattern string successfully (via compile()/syntax.Parse earlier in
+// compilePattern), so the parse here cannot fail; syntax.Compile never
+// returns a non-nil error (see its stdlib source).
+func compileBTProg(pattern string) *syntax.Prog {
+	re, _ := syntax.Parse(pattern, syntax.Perl)
 	stripCaptures(re)
-	prog, err := syntax.Compile(re.Simplify())
-	if err != nil {
-		return nil, err
-	}
-	return prog, nil
+	prog, _ := syntax.Compile(re.Simplify())
+	return prog
 }
 
 // btAllocSizes returns (stackSize, memoSize) in bytes for a no-capture BT engine.
@@ -1481,9 +1485,10 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	body = utils.AppendSLEB128(body, int32(prog.Start))
 	body = append(body, 0x21, localState)
 
-	for _, ll := range loopLocalIdx {
+	// Iterate loopPCsSorted, not loopLocalIdx directly, for deterministic emission.
+	for _, pc := range loopPCsSorted {
 		body = append(body, 0x41, 0x7F, 0x21)
-		body = utils.AppendULEB128(body, ll)
+		body = utils.AppendULEB128(body, loopLocalIdx[pc])
 	}
 
 	if useMemo {
@@ -1802,9 +1807,9 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = append(body, 0x41)
 		body = utils.AppendSLEB128(body, int32(prog.Start))
 		body = append(body, 0x21, localState)
-		for _, ll := range loopLocalIdx {
+		for _, pc := range loopPCsSorted {
 			body = append(body, 0x41, 0x7F, 0x21)
-			body = utils.AppendULEB128(body, ll)
+			body = utils.AppendULEB128(body, loopLocalIdx[pc])
 		}
 		if useMemo {
 			body = emitBTMemoZeroInitTrimmed(body, memoTableBase, N, memoLenPlus1, memoZeroLen)
@@ -1868,9 +1873,9 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(prog.Start))
 		b = append(b, 0x21, localState)
-		for _, ll := range loopLocalIdx {
+		for _, pc := range loopPCsSorted {
 			b = append(b, 0x41, 0x7F, 0x21)
-			b = utils.AppendULEB128(b, ll)
+			b = utils.AppendULEB128(b, loopLocalIdx[pc])
 		}
 		if useMemo {
 			b = emitBTMemoZeroInitTrimmed(b, memoTableBase, N, memoLenPlus1, memoZeroLen)

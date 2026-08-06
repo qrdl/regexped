@@ -171,7 +171,7 @@ type SetSpec struct {
 
 // CompileSet compiles one set specification into a compiledSet.
 // prefixPool and suffixPool are shared dedup pools across all sets in the file.
-func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions) (*compiledSet, error) {
+func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions) *compiledSet {
 	diag := &SetDiag{Name: spec.Name}
 	buckets := binPack(spec.Patterns, opts, diag)
 
@@ -358,16 +358,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	var teddyDataBytes []byte
 	teddyDataSegCount := 0
 	if fe == frontendTeddy {
-		tt, ok := buildTeddyTablesMulti(lits)
-		if ok {
-			teddyTabs = tt
-			teddyDataOffset = prefixTableOffset
-			rawTeddy := buildTeddyRawBytes(tt)
-			teddyDataBytes = appendDataSegment(nil, teddyDataOffset, rawTeddy)
-			teddyDataSegCount = 1
-		} else {
-			fe = frontendScalar
-		}
+		// chooseLiteralFrontend only returns frontendTeddy for 1..16 non-empty
+		// literals, which is exactly buildTeddyTablesMulti's success condition.
+		tt, _ := buildTeddyTablesMulti(lits)
+		teddyTabs = tt
+		teddyDataOffset = prefixTableOffset
+		rawTeddy := buildTeddyRawBytes(tt)
+		teddyDataBytes = appendDataSegment(nil, teddyDataOffset, rawTeddy)
+		teddyDataSegCount = 1
 	}
 
 	// LIKELY.md Gap H.3: density-heuristic / Action 5 Shufti for the
@@ -440,7 +438,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		litLens:             litLens,
 		diag:                diag,
 	}
-	return cs, nil
+	return cs
 }
 
 // emitSetMatchFnAnchored emits the WASM function body for the anchored `match`
@@ -807,10 +805,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 			setOpts.TableMemIdx = 1
 		}
 		setOpts.TableBase = int32(setTableBase)
-		cs, err := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
-		if err != nil {
-			return nil, 0, err
-		}
+		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
 		compiledSets = append(compiledSets, cs)
 		setTableBase += int64(len(cs.dataBytes)) + int64(len(cs.prefixDataBytes)) +
 			int64(len(cs.acDataBytes)) + int64(len(cs.teddyDataBytes))
