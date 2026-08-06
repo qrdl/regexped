@@ -768,20 +768,6 @@ func TestCombinedClassCount_Orthogonal(t *testing.T) {
 	}
 }
 
-func TestMergeSuffixASTs_Empty(t *testing.T) {
-	if got := mergeSuffixASTs(nil); got != nil {
-		t.Errorf("mergeSuffixASTs(nil) = %v, want nil", got)
-	}
-}
-
-func TestMergeSuffixASTs_Single(t *testing.T) {
-	re := mustParse(t, `foo`)
-	got := mergeSuffixASTs([]*syntax.Regexp{re})
-	if got == nil {
-		t.Fatal("mergeSuffixASTs([one]) returned nil")
-	}
-}
-
 func TestMergeSuffixDFA_EmptyList(t *testing.T) {
 	_, _, err := mergeSuffixDFA(nil, CompileSetOptions{})
 	if err == nil {
@@ -804,17 +790,6 @@ func TestBuildUnionProg_SinglePattern(t *testing.T) {
 	}
 	if combined&1 == 0 {
 		t.Error("buildUnionProg (single): bit 0 not assigned to any instruction")
-	}
-}
-
-func TestMergeSuffixASTs_Sorted(t *testing.T) {
-	asts := []*syntax.Regexp{mustParse(t, `z`), mustParse(t, `a`)}
-	merged := mergeSuffixASTs(asts)
-	if merged == nil || merged.Op != syntax.OpAlternate || len(merged.Sub) != 2 {
-		t.Fatalf("mergeSuffixASTs: unexpected result %v", merged)
-	}
-	if merged.Sub[0].String() > merged.Sub[1].String() {
-		t.Errorf("not sorted: sub[0]=%q sub[1]=%q", merged.Sub[0], merged.Sub[1])
 	}
 }
 
@@ -2259,32 +2234,8 @@ func TestDiagJSON_Schema(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Anchor helper tests (endsWithBeginAnchor, isOnlyBeginAnchors,
-// hasBeginAnchor, hasBeginAnchorAtTopLevel)
-
-func TestEndsWithBeginAnchor(t *testing.T) {
-	cases := []struct {
-		pat  string
-		want bool
-	}{
-		{`^`, true},       // bare ^
-		{`\z^`, true},     // end-then-begin: ends with ^
-		{`(^^)*$`, false}, // ends with $, not ^
-		{`(?:a)`, false},  // no anchor
-		{`a^`, true},      // concat ending with ^
-		{`^a`, false},     // concat ending with 'a'
-		{`(^)`, true},     // capture wrapping ^
-	}
-	for _, tc := range cases {
-		re := mustParse(t, tc.pat)
-		if got := endsWithBeginAnchor(re); got != tc.want {
-			t.Errorf("endsWithBeginAnchor(%q) = %v, want %v", tc.pat, got, tc.want)
-		}
-	}
-	if endsWithBeginAnchor(nil) {
-		t.Error("endsWithBeginAnchor(nil) = true, want false")
-	}
-}
+// Anchor helper tests (isOnlyBeginAnchors, hasBeginAnchor,
+// hasBeginAnchorAtTopLevel)
 
 func TestIsOnlyBeginAnchors(t *testing.T) {
 	cases := []struct {

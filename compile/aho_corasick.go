@@ -156,7 +156,8 @@ func buildACLayout(ac *acAutomaton, tableBase int32) *acLayout {
 	}
 
 	// Combine nodeOut + output into one contiguous block for simplicity.
-	l.outputBytes = append(nodeOutBytes, outputBytes...)
+	nodeOutBytes = append(nodeOutBytes, outputBytes...)
+	l.outputBytes = nodeOutBytes
 	l.tableEnd = l.outputOff + int32(len(l.outputBytes))
 	return l
 }

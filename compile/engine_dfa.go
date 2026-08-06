@@ -2074,7 +2074,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 	}
 
 	midStartIdx := int(l.wasmMidStart)
-	if midStartIdx <= 0 || midStartIdx >= int(l.numWASM) {
+	if midStartIdx <= 0 || midStartIdx >= l.numWASM {
 		return
 	}
 
@@ -2104,7 +2104,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 			return // multiple successors → not stable
 		}
 	}
-	if succ <= 0 || int(succ) >= int(l.numWASM) {
+	if succ <= 0 || int(succ) >= l.numWASM {
 		return
 	}
 
@@ -2273,7 +2273,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 	}
 
 	midStartIdx := int(l.wasmMidStart)
-	if midStartIdx <= 0 || midStartIdx >= int(l.numWASM) {
+	if midStartIdx <= 0 || midStartIdx >= l.numWASM {
 		return
 	}
 	if isMidAccept(midStartIdx) {
@@ -2295,7 +2295,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 
 	visited := map[int]bool{midStartIdx: true}
 	cur := midStartIdx
-	for steps := 0; steps <= int(l.numWASM); steps++ {
+	for steps := 0; steps <= l.numWASM; steps++ {
 		// No chain state may be EOF-accepting. Every later start position
 		// restarts fresh at midStart and re-walks this SAME chain, but the
 		// LENGTH of its own remaining input may put it at a DIFFERENT
@@ -2322,7 +2322,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 				return // non-uniform successor → chain doesn't hold
 			}
 		}
-		if succ <= 0 || int(succ) >= int(l.numWASM) {
+		if succ <= 0 || int(succ) >= l.numWASM {
 			return
 		}
 
@@ -3142,7 +3142,7 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 	if hasWordChar {
 		// prevWasWord = wordChar[input[paramPtr + paramLPos - 1]]
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(wordCharOff[0]))
+		b = utils.AppendSLEB128(b, wordCharOff[0])
 		b = append(b, 0x20, paramPtr, 0x20, paramLPos, 0x41, 0x01, 0x6B, 0x6A) // paramPtr + paramLPos - 1
 		b = appendTableLoad8u(b, tableMemIdx)                                  // input[prev]
 		b = append(b, 0x6A)                                                    // wordCharOff + input[prev]
@@ -3172,7 +3172,7 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 		wbW := wordCharOff[2]
 		// Read wordChar[input[paramPtr + lScanPos]]
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(wordCharOff[0]))
+		b = utils.AppendSLEB128(b, wordCharOff[0])
 		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A) // paramPtr + lScanPos
 		b = appendTableLoad8u(b, tableMemIdx)               // input[lScanPos]
 		b = append(b, 0x6A)                                 // wordCharOff + byte
@@ -3180,14 +3180,14 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, eofMidBitmas
 		b = append(b, 0x04, 0x40)                           // if isWord (void)
 		// isWord: wbBits = wbWBitmask[lState]
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(wbW))
+		b = utils.AppendSLEB128(b, wbW)
 		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
 		b = appendTableLoad64(b, tableMemIdx)
 		b = append(b, 0x21, lBits)
 		b = append(b, 0x05) // else: !isWord
 		// !isWord: wbBits = wbNWBitmask[lState]
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(wbNW))
+		b = utils.AppendSLEB128(b, wbNW)
 		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
 		b = appendTableLoad64(b, tableMemIdx)
 		b = append(b, 0x21, lBits)
@@ -3542,7 +3542,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
 			l.startBeginAccept, l.immAcceptLimit, l.hasImmAccept,
 			l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff,
-			l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, t.hasNewlineBoundary, tableMemIdx)
+			l.midAcceptNLOff, t.hasNewlineBoundary, tableMemIdx)
 	} else {
 		body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
 			l.wasmMidStartNewline, l.wasmPrefixEnd, l.wasmPrefixEndWord,
@@ -3687,11 +3687,13 @@ func emitU16Transition(b []byte,
 // 1..immAcceptLimit. The state==0 (dead) case is guarded by an earlier check
 // in the caller, so we use u<= (not <) here.
 func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
-	hasImmAccept bool, stateLocal, posLocal byte, tableMemIdx int) []byte {
+	hasImmAccept bool, tableMemIdx int) []byte {
 	if !hasImmAccept {
 		return b
 	}
 	_ = tableMemIdx
+	const stateLocal = 0x02
+	const posLocal = 0x03
 	b = append(b, 0x20, stateLocal)            // local.get state
 	b = append(b, 0x41)                        // i32.const immAcceptLimit
 	b = utils.AppendSLEB128(b, immAcceptLimit) //
@@ -4001,12 +4003,18 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 // locals (hysteresis counter + scratch) and pass their indices; both are
 // ignored when every entry is mid-accept.
 func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
-	midAcceptOff int32, tableMemIdx int,
-	stateLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
-	hystCounterLocal, hystPosLocal byte) []byte {
+	midAcceptOff int32, tableMemIdx int) []byte {
 	if len(dominantStates) == 0 {
 		return b
 	}
+	const stateLocal = 0x02
+	const posLocal = 0x03
+	const lenLocal = 0x01
+	const ptrLocal = 0x00
+	const chunkLocal = 0x05
+	const tmpLocal = 0x04
+	const hystCounterLocal = 0x06
+	const hystPosLocal = 0x07
 	var mid, nonMid []dominantInfo
 	for _, info := range dominantStates {
 		if info.isMidAccept {
@@ -4198,12 +4206,14 @@ func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 // `(state-1) u< immAcceptLimit` unsigned-underflow pattern instead (compare
 // emitImmAcceptCheckFindStart, which needed exactly that fix for Task 9).
 func emitImmAcceptCheckFindMid(b []byte, immAcceptLimit int32,
-	hasImmAccept bool, stateLocal, posLocal, lastAcceptLocal byte,
-	brDepth byte, tableMemIdx int) []byte {
+	hasImmAccept bool, stateLocal, posLocal byte,
+	tableMemIdx int) []byte {
 	if !hasImmAccept {
 		return b
 	}
 	_ = tableMemIdx
+	const lastAcceptLocal = 0x05
+	const brDepth = 2
 	b = append(b, 0x20, stateLocal)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, immAcceptLimit)
@@ -4230,12 +4240,16 @@ func emitImmAcceptCheckFindMid(b []byte, immAcceptLimit int32,
 // emitAcceptBitOnStack and handles state=0 correctly: state-1 underflows to
 // 0xFFFFFFFF which is NOT u< immAcceptLimit.
 func emitImmAcceptCheckFindStart(b []byte, immAcceptLimit int32,
-	hasImmAccept bool, stateLocal, posLocal, lastAcceptLocal byte,
-	brDepth byte, tableMemIdx int) []byte {
+	hasImmAccept bool,
+	tableMemIdx int) []byte {
 	if !hasImmAccept {
 		return b
 	}
 	_ = tableMemIdx
+	const stateLocal = 0x02
+	const posLocal = 0x03
+	const lastAcceptLocal = 0x05
+	const brDepth = 1
 	b = append(b, 0x20, stateLocal)
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6B) // i32.sub → state - 1
@@ -4259,10 +4273,14 @@ func emitImmAcceptCheckFindStart(b []byte, immAcceptLimit int32,
 //     outerDepth+1) — reaching EOF without ever recording an accept proves
 //     no later start position can match either (see detectEOFSkipSafe).
 //   - otherwise: increment attemptStartLocal and br outerDepth → $outer.
-func emitEofHandler(b []byte, stateLocal byte,
-	posLocal, lastAcceptLocal, attemptStartLocal byte,
-	foundDepth byte, hasRetry bool, outerDepth byte,
+func emitEofHandler(b []byte,
+	hasRetry bool, outerDepth byte,
 	acceptLimit int32, eofSkipSafe bool) []byte {
+	const stateLocal = 0x02
+	const posLocal = 0x03
+	const lastAcceptLocal = 0x05
+	const attemptStartLocal = 0x04
+	const foundDepth = 2
 	b = emitAcceptBitOnStack(b, stateLocal, acceptLimit)
 	b = append(b, 0x04, 0x40) // if eofAccept
 	b = append(b, 0x20, posLocal)
@@ -4295,9 +4313,11 @@ func emitEofHandler(b []byte, stateLocal byte,
 // is `pos + 1` when skipSafeOnDead (Task 8 dead-state skip) or `+1` otherwise.
 // posLocal is ignored when skipSafeOnDead is false.
 func emitDeadHandler(b []byte,
-	lastAcceptLocal, attemptStartLocal byte,
-	foundDepth byte, hasRetry bool, outerDepth byte,
+	hasRetry bool, outerDepth byte,
 	posLocal byte, skipSafeOnDead bool) []byte {
+	const attemptStartLocal = 0x04
+	const lastAcceptLocal = 0x05
+	const foundDepth = 2
 	if !hasRetry {
 		b = append(b, 0x0C, foundDepth) // br → $found (unconditional, anchored)
 	} else {
@@ -4328,11 +4348,14 @@ func emitDeadHandler(b []byte,
 // No-op when hasWordBoundary is false.
 func emitWBPreAcceptCheck(b []byte, wordCharTableOff, midAcceptWOff, midAcceptNWOff int32,
 	hasWordBoundary bool,
-	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
 	tableMemIdx int) []byte {
 	if !hasWordBoundary {
 		return b
 	}
+	const ptrLocal = 0x00
+	const posLocal = 0x03
+	const stateLocal = 0x02
+	const lastAcceptLocal = 0x05
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, wordCharTableOff)
 	b = append(b, 0x20, ptrLocal)
@@ -4369,11 +4392,13 @@ func emitWBPreAcceptCheck(b []byte, wordCharTableOff, midAcceptWOff, midAcceptNW
 // and update last_accept = pos. No-op when hasNewlineBoundary is false.
 func emitNLPreAcceptCheck(b []byte, midAcceptNLOff int32,
 	hasNewlineBoundary bool,
-	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
+	posLocal, stateLocal byte,
 	tableMemIdx int) []byte {
 	if !hasNewlineBoundary {
 		return b
 	}
+	const ptrLocal = 0x00
+	const lastAcceptLocal = 0x05
 	b = append(b, 0x20, ptrLocal)
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x6A)
@@ -4485,11 +4510,11 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
+		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 
 		// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse class),
 		// hysteresis counter/scratch = locals 6/7 (only with non-mid).
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04, 0x06, 0x07)
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -4534,10 +4559,10 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
+		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 
 		// Phase 4 dispatch: tmp=local 4, chunk=local 5, hyst=6/7.
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04, 0x06, 0x07)
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -4584,10 +4609,10 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
 
-	b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
+	b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 
 	// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse byte), hyst=6/7.
-	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, 0x02, 0x03, 0x01, 0x00, 0x05, 0x04, 0x06, 0x07)
+	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)
@@ -4705,7 +4730,7 @@ func isAnchoredFind(t *dfaTable) bool {
 //	  if last_accept >= 0: return packed i64
 //	end $no_match
 //	i64.const -1
-func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, hasNewlineBoundary bool, tableMemIdx int) []byte {
+func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, midAcceptNLOff int32, hasNewlineBoundary bool, tableMemIdx int) []byte {
 	var b []byte
 
 	// emitPrologue: state=startState, pos=0 (default), last_accept=-1, midAccept check.
@@ -4761,18 +4786,18 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitPrologue(b)
-		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		b = append(b, 0x20, 0x03) // pos
 		b = append(b, 0x20, 0x01) // len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit, false)
+		b = emitEofHandler(b, false, 0, acceptLimit, false)
 		b = append(b, 0x0B)
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
-		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
 			0x02, 0x06, 0x00, 0x03, 0xff, tableMemIdx)
@@ -4780,7 +4805,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = append(b, 0x20, 0x02) // dead?
 		b = append(b, 0x45)
 		b = append(b, 0x04, 0x40)
-		b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0, 0x00, false)
+		b = emitDeadHandler(b, false, 0, 0x00, false)
 		b = append(b, 0x0B)
 
 		b = append(b, 0x41)
@@ -4795,7 +4820,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = append(b, 0x21, 0x05)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -4814,25 +4839,25 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = append(b, 0x02, 0x40) // block $no_match
 		b = append(b, 0x02, 0x40) // block $found
 		b = emitPrologue(b)
-		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		b = append(b, 0x20, 0x03)
 		b = append(b, 0x20, 0x01)
 		b = append(b, 0x4F)
 		b = append(b, 0x04, 0x40)
-		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit, false)
+		b = emitEofHandler(b, false, 0, acceptLimit, false)
 		b = append(b, 0x0B)
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
-		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 		b = emitSimpleU8Transition(b, tableOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
 
 		b = append(b, 0x20, 0x02)
 		b = append(b, 0x45)
 		b = append(b, 0x04, 0x40)
-		b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0, 0x00, false)
+		b = emitDeadHandler(b, false, 0, 0x00, false)
 		b = append(b, 0x0B)
 
 		b = append(b, 0x41)
@@ -4847,7 +4872,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = append(b, 0x21, 0x05)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		b = append(b, 0x20, 0x03)
 		b = append(b, 0x41, 0x01)
@@ -4866,18 +4891,18 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x02, 0x40) // block $found
 	b = emitPrologue(b)
-	b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+	b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 	b = append(b, 0x03, 0x40) // loop $scan
 
 	b = append(b, 0x20, 0x03)
 	b = append(b, 0x20, 0x01)
 	b = append(b, 0x4F)
 	b = append(b, 0x04, 0x40)
-	b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, false, 0, acceptLimit, false)
+	b = emitEofHandler(b, false, 0, acceptLimit, false)
 	b = append(b, 0x0B)
 
-	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
-	b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+	b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 	// byte = mem[ptr+pos]
 	b = append(b, 0x20, 0x00)
@@ -4886,12 +4911,12 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
 	b = append(b, 0x21, 0x06)       // local.set byte
 
-	b = emitU16Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x06, tableMemIdx)
+	b = emitU16Transition(b, tableOff, false, 0, 0x02, 0x06, tableMemIdx)
 
 	b = append(b, 0x20, 0x02)
 	b = append(b, 0x45)
 	b = append(b, 0x04, 0x40)
-	b = emitDeadHandler(b, 0x05, 0x04, 2, false, 0, 0x00, false)
+	b = emitDeadHandler(b, false, 0, 0x00, false)
 	b = append(b, 0x0B)
 
 	b = append(b, 0x41)
@@ -4906,7 +4931,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 	b = append(b, 0x21, 0x05)
 	b = append(b, 0x0B)
 
-	b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+	b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 	b = append(b, 0x20, 0x03)
 	b = append(b, 0x41, 0x01)
@@ -5426,7 +5451,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x0C, 0x02)          // br 2 → $fwd_done (0=eof_if, 1=$fwd_scan, 2=$fwd_done)
 	b = append(b, 0x0B)                // end if pos>=len
 
-	b = emitNLPreAcceptCheck(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPtr, locPos, locState, locLastAccept, tableMemIdx)
+	b = emitNLPreAcceptCheck(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPos, locState, tableMemIdx)
 
 	// DFA transition.
 	if l.useCompression {
@@ -5505,7 +5530,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		}
 	}
 
-	b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, locLastAccept, 2, tableMemIdx)
+	b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, tableMemIdx)
 
 	// pos++; restart scan.
 	b = append(b, 0x20, locPos)
@@ -5677,7 +5702,7 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 	b = append(b, 0x0C, 0x02)          // br 2 → $fwd_done
 	b = append(b, 0x0B)                // end if pos>=len
 
-	b = emitNLPreAcceptCheck(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPtr, locPos, locState, locLastAccept, tableMemIdx)
+	b = emitNLPreAcceptCheck(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPos, locState, tableMemIdx)
 
 	// DFA transition.
 	if l.useCompression {
@@ -5742,7 +5767,7 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 		}
 	}
 
-	b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, locLastAccept, 2, tableMemIdx)
+	b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, tableMemIdx)
 
 	// pos++; restart scan.
 	b = append(b, 0x20, locPos)
@@ -6129,7 +6154,6 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			bulkHystCounterLocal = next
 			next++
 			bulkHystPosLocal = next
-			next++
 		}
 	}
 	// appendLocalGroups appends the i32 group (count i32Count), then, only
@@ -6625,7 +6649,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			b = emitOuterPrologue(b)
 		}
 		b = append(b, 0x02, 0x40) // block $found
-		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		// pos >= len?
@@ -6633,11 +6657,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit, eofSkipSafe)
+		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe)
 		b = append(b, 0x0B) // end if
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
-		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
 			0x02, 0x06, 0x00, 0x03, 0xff, tableMemIdx)
@@ -6646,7 +6670,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3, 0x03, skipSafeOnDead)
+		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead)
 		b = append(b, 0x0B) // end if
 
 		// Opt 1 (task 38 v2): one midAccept[state] load feeds the accept
@@ -6665,7 +6689,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkLocal /*val+tmp=*/, 0x06,
 			bulkHystCounterLocal, bulkHystPosLocal)
 
-		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -6709,7 +6733,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			b = emitOuterPrologue(b)
 		}
 		b = append(b, 0x02, 0x40) // block $found
-		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+		b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 		b = append(b, 0x03, 0x40) // loop $scan
 
 		// pos >= len?
@@ -6717,11 +6741,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit, eofSkipSafe)
+		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe)
 		b = append(b, 0x0B) // end if
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
-		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 		b = emitSimpleU8Transition(b, tableOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
 
@@ -6729,7 +6753,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3, 0x03, skipSafeOnDead)
+		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead)
 		b = append(b, 0x0B) // end if
 
 		// Opt 1 (task 38 v2): one midAccept[state] load feeds the accept
@@ -6742,7 +6766,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 			chunkLocal /*val+tmp=*/, simdMaskLocal,
 			bulkHystCounterLocal, bulkHystPosLocal)
 
-		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -6781,7 +6805,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitOuterPrologue(b)
 	}
 	b = append(b, 0x02, 0x40) // block $found
-	b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 1, tableMemIdx)
+	b = emitImmAcceptCheckFindStart(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 	b = append(b, 0x03, 0x40) // loop $scan
 
 	// pos >= len?
@@ -6789,11 +6813,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitEofHandler(b, 0x02, 0x03, 0x05, 0x04, 2, true, 3, acceptLimit, eofSkipSafe)
+	b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe)
 	b = append(b, 0x0B) // end if
 
-	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
-	b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
+	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+	b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 	// byte = mem[ptr+pos]
 	b = append(b, 0x20, 0x00)
@@ -6808,7 +6832,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x20, 0x02) // local.get state
 	b = append(b, 0x45)       // i32.eqz
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitDeadHandler(b, 0x05, 0x04, 2, true, 3, 0x03, skipSafeOnDead)
+	b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead)
 	b = append(b, 0x0B) // end if
 
 	// if midAccept[state]: last_accept = pos + 1
@@ -6841,7 +6865,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = append(b, 0x21, 0x05) // local.set last_accept
 	b = append(b, 0x0B)       // end if
 
-	b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, 0x05, 2, tableMemIdx)
+	b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)
@@ -7009,7 +7033,7 @@ type litChainAltPattern struct {
 // Gate: N ≥ minCount (same scan-loop register-pressure concern as {N,N};
 // callers pass 24 under neutral/LikelyNoMatch, 1 under LikelyMatch — LM-1,
 // see plans/LM_TODO.md).
-func analyseLitChainRange(pattern string, allowNonGreedy bool, minCount int) (*litChainPattern, bool) {
+func analyseLitChainRange(pattern string, minCount int) (*litChainPattern, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, false
@@ -7020,9 +7044,6 @@ func analyseLitChainRange(pattern string, allowNonGreedy bool, minCount int) (*l
 	}
 	if info.countMax <= info.count {
 		return nil, false // not a range
-	}
-	if !info.greedy && !allowNonGreedy {
-		return nil, false
 	}
 	if info.count < minCount {
 		return nil, false
@@ -7043,7 +7064,7 @@ func analyseLitChainRange(pattern string, allowNonGreedy bool, minCount int) (*l
 // qualify under analyseLitChainBranch (count ≥ 1, K+min ≥ 16, ASCII class).
 // For non-greedy branches in find/groups context, callers normalise per
 // branch via the existing collapse-to-{N,N} mechanism.
-func analyseLitChainAltRange(pattern string, allowNonGreedy bool) (*litChainAltPattern, bool) {
+func analyseLitChainAltRange(pattern string) (*litChainAltPattern, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, false
@@ -7059,9 +7080,6 @@ func analyseLitChainAltRange(pattern string, allowNonGreedy bool) (*litChainAltP
 	for _, sub := range re.Sub {
 		info, ok := analyseLitChainBranch(sub)
 		if !ok || info.prefixCount > 0 {
-			return nil, false
-		}
-		if !info.greedy && !allowNonGreedy {
 			return nil, false
 		}
 		if info.countMax > info.count {
@@ -7586,7 +7604,8 @@ func emitIsWordByte(b []byte, tmpLocal byte) []byte {
 //   - anchorEndText as start anchor is impossible for a non-empty match;
 //     emits an unconditional fail.
 func emitStartAnchorCheck(b []byte, anchor anchorType, literalFirstByte byte,
-	locPtr, locAttemptStart, tmpLocal byte, failBrDepth byte) []byte {
+	locPtr, locAttemptStart, tmpLocal byte) []byte {
+	const failBrDepth = 0
 	switch anchor {
 	case anchorNone:
 		return b
@@ -7644,7 +7663,8 @@ func emitStartAnchorCheck(b []byte, anchor anchorType, literalFirstByte byte,
 //     emits an unconditional fail.
 func emitEndAnchorCheck(b []byte, anchor anchorType,
 	locPtr, locAttemptStart byte, total int32,
-	locLen, tmpLocal byte, failBrDepth byte) []byte {
+	locLen, tmpLocal byte) []byte {
+	const failBrDepth = 0
 	switch anchor {
 	case anchorNone:
 		return b
@@ -7723,8 +7743,10 @@ type litChainBranchLocals struct {
 // [startK..len(literal)-1] against input[posLocal+k]. On any mismatch, br_if
 // failBrDepth. Used by alternation branch dispatch (start byte is dispatched
 // separately via the first-byte filter).
-func emitLiteralByteVerify(b []byte, literal []byte, startK int,
-	ptrLocal, posLocal, failBrDepth byte) []byte {
+func emitLiteralByteVerify(b []byte, literal []byte,
+	ptrLocal, posLocal byte) []byte {
+	const startK = 1
+	const failBrDepth = 0
 	for k := startK; k < len(literal); k++ {
 		b = append(b, 0x20, ptrLocal)
 		b = append(b, 0x20, posLocal)
@@ -7877,11 +7899,11 @@ func emitLitChainAltLitBranchBody(b []byte, br litChainAltBranch,
 	// Start anchor (runs before literal/class verify to skip expensive work).
 	if br.startAnchor != anchorNone {
 		b = emitStartAnchorCheck(b, br.startAnchor, br.literal[0],
-			locals.Ptr, locals.AttemptStart, locals.ScalarIdx, failDepth)
+			locals.Ptr, locals.AttemptStart, locals.ScalarIdx)
 	}
 
 	// Literal verify (bytes 1..K-1; byte 0 already covered by first-byte dispatch).
-	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
+	b = emitLiteralByteVerify(b, br.literal, locals.Ptr, locals.AttemptStart)
 
 	// Class verify. Caller must pre-load locals.VerifyPow2 with pow2VecConst
 	// (hoisted out of the scan loop for Cranelift JIT codegen).
@@ -7899,7 +7921,7 @@ func emitLitChainAltLitBranchBody(b []byte, br litChainAltBranch,
 	// End anchor.
 	if br.endAnchor != anchorNone {
 		b = emitEndAnchorCheck(b, br.endAnchor,
-			locals.Ptr, locals.AttemptStart, total, locals.Len, locals.ScalarIdx, failDepth)
+			locals.Ptr, locals.AttemptStart, total, locals.Len, locals.ScalarIdx)
 	}
 
 	// Success — return packed (attempt_start << 32 | attempt_start + total).
@@ -7913,9 +7935,8 @@ func emitLitChainAltLitBranchBody(b []byte, br litChainAltBranch,
 // [count..countMax]). On success, returns packed (attempt_start, attempt_start
 // + K + match_len).
 func emitLitChainAltLitBranchBodyRange(b []byte, br litChainAltBranch,
-	branchBitmapOff int32, locals litChainBranchLocals,
-	locMatchLen, locTmp byte,
-	tableMemIdx int) []byte {
+	locals litChainBranchLocals,
+	locMatchLen, locTmp byte) []byte {
 
 	const failDepth byte = 0
 	k := int32(len(br.literal))
@@ -7943,11 +7964,11 @@ func emitLitChainAltLitBranchBodyRange(b []byte, br litChainAltBranch,
 	// Start anchor.
 	if br.startAnchor != anchorNone {
 		b = emitStartAnchorCheck(b, br.startAnchor, br.literal[0],
-			locals.Ptr, locals.AttemptStart, locals.ScalarIdx, failDepth)
+			locals.Ptr, locals.AttemptStart, locals.ScalarIdx)
 	}
 
 	// Literal verify (bytes 1..K-1).
-	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
+	b = emitLiteralByteVerify(b, br.literal, locals.Ptr, locals.AttemptStart)
 
 	// Range class verify (branch-free). Caller pre-loaded VerifyPow2.
 	b = emitV128Const(b, br.tlo)
@@ -8048,8 +8069,7 @@ func emitLitChainAltLitBranchBodyRange(b []byte, br litChainAltBranch,
 // Caller pre-loads VerifyPow2; this function loads br.prefixTlo for prefix
 // verify, then br.tlo for suffix verify, into locVerifyTlo.
 func emitLitChainAltLitBranchBodyPrefixed(b []byte, br litChainAltBranch,
-	branchBitmapOff int32, locals litChainBranchLocals,
-	tableMemIdx int) []byte {
+	locals litChainBranchLocals) []byte {
 
 	const failDepth byte = 0
 	k := int32(len(br.literal))
@@ -8084,7 +8104,7 @@ func emitLitChainAltLitBranchBodyPrefixed(b []byte, br litChainAltBranch,
 	b = append(b, 0x0D, failDepth)
 
 	// Literal verify (bytes 1..K-1; byte 0 already covered).
-	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
+	b = emitLiteralByteVerify(b, br.literal, locals.Ptr, locals.AttemptStart)
 
 	// Prefix verify: load br.prefixTlo, single SIMD chunk at attempt_start-M.
 	b = emitV128Const(b, br.prefixTlo)
@@ -8152,10 +8172,10 @@ func emitLitChainAltLitBranchGroupsBody(b []byte, br litChainAltBranch,
 
 	if br.startAnchor != anchorNone {
 		b = emitStartAnchorCheck(b, br.startAnchor, br.literal[0],
-			locals.Ptr, locals.AttemptStart, locals.ScalarIdx, failDepth)
+			locals.Ptr, locals.AttemptStart, locals.ScalarIdx)
 	}
 
-	b = emitLiteralByteVerify(b, br.literal, 1, locals.Ptr, locals.AttemptStart, failDepth)
+	b = emitLiteralByteVerify(b, br.literal, locals.Ptr, locals.AttemptStart)
 
 	// Class verify. Caller must pre-load locals.VerifyPow2 with pow2VecConst.
 	if br.useSIMD {
@@ -8171,7 +8191,7 @@ func emitLitChainAltLitBranchGroupsBody(b []byte, br litChainAltBranch,
 
 	if br.endAnchor != anchorNone {
 		b = emitEndAnchorCheck(b, br.endAnchor,
-			locals.Ptr, locals.AttemptStart, total, locals.Len, locals.ScalarIdx, failDepth)
+			locals.Ptr, locals.AttemptStart, total, locals.Len, locals.ScalarIdx)
 	}
 
 	// Success — write slots (absolute) and return attempt_start + total as i32.
@@ -8763,7 +8783,7 @@ func buildLitChainMatchBody(lcp *litChainPattern) []byte {
 			// Use the helper with a 0-initialised attempt_start sentinel.
 			// (locAttemptZero is zero by virtue of WASM locals init.)
 			b = emitEndAnchorCheck(b, lcp.endAnchor,
-				locPtr, locAttemptZero, total, locLen, locTmp, 0)
+				locPtr, locAttemptZero, total, locLen, locTmp)
 		}
 		// Anchor passed — return total.
 		b = append(b, 0x41)
@@ -9109,177 +9129,6 @@ func emitLitChainGroupSlotWrites(b []byte, lcc *litChainCaptures,
 	return b
 }
 
-// buildLitChainGroupsBody emits the anchored-match WASM body that ALSO writes
-// capture slots to out_ptr on success. Mirrors buildLitChainMatchBody for the
-// shape/anchor checks; on success, writes group 0 + per-capture slots before
-// returning total.
-//
-// Signature: (ptr i32, len i32, out_ptr i32) → i32.  Returns total on match,
-// -1 on mismatch.
-func buildLitChainGroupsBody(lcp *litChainPattern, lcc *litChainCaptures) []byte {
-	var b []byte
-
-	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
-
-	// Params: ptr=0, len=1, out_ptr=2. Locals shift +1 vs match body.
-	const (
-		locPtr    byte = 0
-		locLen    byte = 1
-		locOutPtr byte = 2
-		locChunk  byte = 3
-		locTLo    byte = 4
-		locPow2   byte = 5
-		// When hasAnchors:
-		locAttemptZero byte = 6
-		locTmp         byte = 7
-	)
-	if hasAnchors {
-		b = append(b, 0x02)
-		b = append(b, 0x03, 0x7B) // 3 × v128
-		b = append(b, 0x02, 0x7F) // 2 × i32
-	} else {
-		b = append(b, 0x01)
-		b = append(b, 0x03, 0x7B)
-	}
-
-	// Materialise tLo and pow2.
-	b = emitV128Const(b, lcp.tlo)
-	b = append(b, 0x21, locTLo)
-	b = emitV128Const(b, pow2VecConst)
-	b = append(b, 0x21, locPow2)
-
-	k := int32(len(lcp.literal))
-	total := k + int32(lcp.count)
-
-	// Bounds: groups_func is anchored-start, partial-end. Need at least `total`
-	// bytes to fit the lit-chain; remaining tail is OK.
-	b = append(b, 0x20, locLen)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, total)
-	b = append(b, 0x49)       // i32.lt_u (len < total)
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x41, 0x7F) // i32.const -1
-	b = append(b, 0x0F)       // return
-	b = append(b, 0x0B)       // end if
-
-	// Compile-time start anchor failure (same logic as match body).
-	startFailsAtCompileTime := false
-	switch lcp.startAnchor {
-	case anchorEndText:
-		startFailsAtCompileTime = true
-	case anchorWordBoundary:
-		if !isWordByte(lcp.literal[0]) {
-			startFailsAtCompileTime = true
-		}
-	case anchorNoWordBoundary:
-		if isWordByte(lcp.literal[0]) {
-			startFailsAtCompileTime = true
-		}
-	}
-	if startFailsAtCompileTime {
-		b = append(b, 0x41, 0x7F)
-		b = append(b, 0x0F)
-	}
-
-	// Literal verify: K scalar byte compares.
-	for kk, byt := range lcp.literal {
-		b = append(b, 0x20, locPtr)
-		b = append(b, 0x2D, 0x00)
-		b = utils.AppendULEB128(b, uint32(kk))
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(byt))
-		b = append(b, 0x47)
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x41, 0x7F)
-		b = append(b, 0x0F)
-		b = append(b, 0x0B)
-	}
-
-	// Class verify: SIMD chunks. Same logic as match body, just with shifted
-	// chunk-local index.
-	chunks := planLitChainChunks(int(k), lcp.count)
-	for i, ch := range chunks {
-		b = append(b, 0x20, locPtr)
-		if ch.offset != 0 {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(ch.offset))
-			b = append(b, 0x6A)
-		}
-		b = append(b, 0xFD, 0x00, 0x00, 0x00)
-		b = append(b, 0x21, locChunk)
-
-		b = append(b, 0x20, locTLo)
-		b = append(b, 0x20, locChunk)
-		b = append(b, 0x41, 0x0F)
-		b = append(b, 0xFD, 0x0F)
-		b = append(b, 0xFD, 0x4E)
-		b = append(b, 0xFD, 0x0E)
-
-		b = append(b, 0x20, locPow2)
-		b = append(b, 0x20, locChunk)
-		b = append(b, 0x41, 0x04)
-		b = append(b, 0xFD, 0x6D)
-		b = append(b, 0xFD, 0x0E)
-
-		b = append(b, 0xFD, 0x4E)
-		b = append(b, 0x41, 0x00)
-		b = append(b, 0xFD, 0x0F)
-		b = append(b, 0xFD, 0x23)
-		b = append(b, 0xFD, 0x64)
-
-		if ch.laneMask != 0xFFFF {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(ch.laneMask))
-			b = append(b, 0x71)
-		}
-		if i > 0 {
-			b = append(b, 0x72)
-		}
-	}
-
-	// bad_mask on stack. If non-zero → return -1.
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x0F)
-	b = append(b, 0x0B)
-
-	// End anchor check.
-	if lcp.endAnchor != anchorNone {
-		b = append(b, 0x02, 0x40) // block $bad
-		switch lcp.endAnchor {
-		case anchorBeginText:
-			b = append(b, 0x41, 0x01)
-			b = append(b, 0x0D, 0x00)
-		default:
-			b = emitEndAnchorCheck(b, lcp.endAnchor,
-				locPtr, locAttemptZero, total, locLen, locTmp, 0)
-		}
-		// Anchor passed: write slots and return total.
-		b = emitLitChainGroupSlotWrites(b, lcc, locOutPtr, locAttemptZero, int(total))
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, total)
-		b = append(b, 0x0F) // return
-		b = append(b, 0x0B) // end $bad
-		b = append(b, 0x41, 0x7F)
-		b = append(b, 0x0B)
-		return b
-	}
-
-	// No end anchor: write slots and return total. attempt_start = 0 for
-	// anchored mode; emit a zero literal in the writeAttemptPlus helper.
-	// Since locAttemptZero is only present when hasAnchors is true, fall back
-	// to inlining literal zeros for the no-anchor path.
-	if hasAnchors {
-		b = emitLitChainGroupSlotWrites(b, lcc, locOutPtr, locAttemptZero, int(total))
-	} else {
-		b = emitLitChainGroupSlotWritesConstStart(b, lcc, locOutPtr, int(total))
-	}
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, total)
-	b = append(b, 0x0B) // end function
-	return b
-}
-
 // emitLitChainRangeGroupSlotWrites emits slot writes for range patterns
 // where the chain length is determined at runtime by locMatchLen. Captures
 // whose endOffset coincides with K + countMax (i.e., end at the chain end)
@@ -9352,169 +9201,6 @@ func emitLitChainRangeGroupSlotWrites(b []byte, lcc *litChainCaptures,
 		}
 	}
 	return b
-}
-
-// emitLitChainGroupSlotWritesConstStart emits slot writes for anchored mode
-// where attempt_start is known to be 0 at compile time (no spare local needed).
-func emitLitChainGroupSlotWritesConstStart(b []byte, lcc *litChainCaptures,
-	outPtrLocal byte, total int) []byte {
-
-	populated := make(map[int]captureGroup, len(lcc.groups))
-	for _, cg := range lcc.groups {
-		populated[cg.group] = cg
-	}
-
-	writeConst := func(b []byte, slotOff uint32, value int32) []byte {
-		b = append(b, 0x20, outPtrLocal)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, value)
-		b = append(b, 0x36, 0x00)
-		b = utils.AppendULEB128(b, slotOff)
-		return b
-	}
-
-	// Group 0: start=0, end=total.
-	b = writeConst(b, 0, 0)
-	b = writeConst(b, 4, int32(total))
-
-	for g := 1; g < lcc.numGroups; g++ {
-		startSlot := uint32(g * 8)
-		endSlot := uint32(g*8 + 4)
-		if cg, ok := populated[g]; ok {
-			b = writeConst(b, startSlot, int32(cg.startOffset))
-			b = writeConst(b, endSlot, int32(cg.endOffset))
-		} else {
-			b = writeConst(b, startSlot, -1)
-			b = writeConst(b, endSlot, -1)
-		}
-	}
-	return b
-}
-
-// appendLitChainGroupsCodeEntry appends a size-prefixed lit-chain groups body.
-func appendLitChainGroupsCodeEntry(cs []byte, lcp *litChainPattern, lcc *litChainCaptures) []byte {
-	body := buildLitChainGroupsBody(lcp, lcc)
-	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
-}
-
-// buildLitChainAltGroupsBody emits the anchored-groups body for a strict
-// alternation of lit-chain branches. Signature: (ptr,len,out_ptr)→i32. Each
-// branch is tried in order from position 0; on first success writes the
-// branch's slots and returns its total. Always uses SIMD class verify (no
-// scan-loop register-pressure concern at this site). Branches must be
-// anchor-free; analyseLitChainAltGroups enforces that.
-func buildLitChainAltGroupsBody(altp *litChainAltPattern, branchCaps []*litChainCaptures) []byte {
-	var b []byte
-
-	const (
-		locPtr    byte = 0
-		locLen    byte = 1
-		locOutPtr byte = 2
-		locChunk  byte = 3
-		locTLo    byte = 4
-		locPow2   byte = 5
-	)
-
-	// 3 × v128 locals.
-	b = append(b, 0x01)
-	b = append(b, 0x03, 0x7B)
-
-	// Materialise pow2 once.
-	b = emitV128Const(b, pow2VecConst)
-	b = append(b, 0x21, locPow2)
-
-	for i, br := range altp.branches {
-		k := int32(len(br.literal))
-		total := k + int32(br.count)
-
-		b = append(b, 0x02, 0x40) // block $next_i
-
-		// Bounds: need at least `total` bytes; if len < total → next branch.
-		b = append(b, 0x20, locLen)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, total)
-		b = append(b, 0x49)       // i32.lt_u
-		b = append(b, 0x0D, 0x00) // br_if $next_i
-
-		// Literal verify.
-		for kk, byt := range br.literal {
-			b = append(b, 0x20, locPtr)
-			b = append(b, 0x2D, 0x00)
-			b = utils.AppendULEB128(b, uint32(kk))
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(byt))
-			b = append(b, 0x47)       // i32.ne
-			b = append(b, 0x0D, 0x00) // br_if $next_i
-		}
-
-		// Load this branch's tlo into the shared local.
-		b = emitV128Const(b, br.tlo)
-		b = append(b, 0x21, locTLo)
-
-		// SIMD class verify chunks.
-		chunks := planLitChainChunks(int(k), br.count)
-		for ci, ch := range chunks {
-			b = append(b, 0x20, locPtr)
-			if ch.offset != 0 {
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(ch.offset))
-				b = append(b, 0x6A)
-			}
-			b = append(b, 0xFD, 0x00, 0x00, 0x00)
-			b = append(b, 0x21, locChunk)
-
-			b = append(b, 0x20, locTLo)
-			b = append(b, 0x20, locChunk)
-			b = append(b, 0x41, 0x0F)
-			b = append(b, 0xFD, 0x0F)
-			b = append(b, 0xFD, 0x4E)
-			b = append(b, 0xFD, 0x0E)
-
-			b = append(b, 0x20, locPow2)
-			b = append(b, 0x20, locChunk)
-			b = append(b, 0x41, 0x04)
-			b = append(b, 0xFD, 0x6D)
-			b = append(b, 0xFD, 0x0E)
-
-			b = append(b, 0xFD, 0x4E)
-			b = append(b, 0x41, 0x00)
-			b = append(b, 0xFD, 0x0F)
-			b = append(b, 0xFD, 0x23)
-			b = append(b, 0xFD, 0x64)
-
-			if ch.laneMask != 0xFFFF {
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(ch.laneMask))
-				b = append(b, 0x71)
-			}
-			if ci > 0 {
-				b = append(b, 0x72)
-			}
-		}
-		// bad_mask on stack — fail if non-zero.
-		b = append(b, 0x0D, 0x00) // br_if $next_i
-
-		// Success: write slots for this branch and return total.
-		b = emitLitChainGroupSlotWritesConstStart(b, branchCaps[i], locOutPtr, int(total))
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, total)
-		b = append(b, 0x0F) // return
-
-		b = append(b, 0x0B) // end $next_i
-	}
-
-	// All branches failed.
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x0B) // end function
-	return b
-}
-
-// appendLitChainAltGroupsCodeEntry appends a size-prefixed alt-groups body.
-func appendLitChainAltGroupsCodeEntry(cs []byte, altp *litChainAltPattern, branchCaps []*litChainCaptures) []byte {
-	body := buildLitChainAltGroupsBody(altp, branchCaps)
-	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
 }
 
 // buildLitChainAltMatchBody emits the anchored-full-input match body for a
@@ -9658,7 +9344,7 @@ func buildLitChainAltMatchBody(altp *litChainAltPattern) []byte {
 				b = append(b, 0x0C, 0x00) // br $next_branch_i (unconditional)
 			default:
 				b = emitEndAnchorCheck(b, br.endAnchor,
-					locPtr, locAttemptZero, total, locLen, locTmp, 0)
+					locPtr, locAttemptZero, total, locLen, locTmp)
 			}
 		}
 
@@ -9817,7 +9503,7 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 					b = append(b, 0x0C, 0x00) // br $next_branch_i (impossible)
 				default:
 					b = emitEndAnchorCheck(b, br.endAnchor,
-						locPtr, locAttemptZero, total, locLen, locScalarIdx, 0)
+						locPtr, locAttemptZero, total, locLen, locScalarIdx)
 				}
 			}
 
@@ -9848,13 +9534,13 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 				b = append(b, 0x4B)       // i32.lt_u
 				b = append(b, 0x0D, 0x00) // br_if $next_branch_i (literal can't fit)
 
-				b = emitLiteralByteVerify(b, br.literal, 1, locPtr, locAttemptZero, 0)
+				b = emitLiteralByteVerify(b, br.literal, locPtr, locAttemptZero)
 			}
 
 			// pos = 0; run inline anchored DFA verify (on no-accept br to depth 0).
 			b = append(b, 0x41, 0x00)
 			b = append(b, 0x21, locPos)
-			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout, br.dfaTable,
+			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout,
 				locPtr, locLen, locState, locPos, locClass, locOutEnd,
 				tableMemIdx, 0)
 
@@ -9970,7 +9656,7 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 		b = append(b, 0x02, 0x40) // block $next_attempt
 
 		b = emitStartAnchorCheck(b, lcp.startAnchor, lcp.literal[0],
-			locPtr, locAttemptStart, locTmp, 0)
+			locPtr, locAttemptStart, locTmp)
 	}
 
 	b = emitLitChainClassVerify(b, lcp,
@@ -9981,7 +9667,7 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 		b = append(b, 0x0D, 0x00)
 
 		b = emitEndAnchorCheck(b, lcp.endAnchor,
-			locPtr, locAttemptStart, total, locLen, locTmp, 0)
+			locPtr, locAttemptStart, total, locLen, locTmp)
 	} else {
 		// Existing if-then structure: on bad, advance & restart.
 		b = append(b, 0x04, 0x40) // if (void)
@@ -10079,7 +9765,7 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 	if hasAnchors {
 		b = append(b, 0x02, 0x40) // block $next_attempt
 		b = emitStartAnchorCheck(b, lcp.startAnchor, lcp.literal[0],
-			locPtr, locAttemptStart, locTmp, 0)
+			locPtr, locAttemptStart, locTmp)
 	}
 
 	// SIMD class verify.
@@ -10093,7 +9779,7 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 	if hasAnchors {
 		b = append(b, 0x0D, 0x00) // br_if 0 → $next_attempt on bad
 		b = emitEndAnchorCheck(b, lcp.endAnchor,
-			locPtr, locAttemptStart, total, locLen, locTmp, 0)
+			locPtr, locAttemptStart, total, locLen, locTmp)
 	} else {
 		// On bad: advance attempt_start, restart loop.
 		b = append(b, 0x04, 0x40) // if (void)
@@ -10318,7 +10004,7 @@ func emitRangeClassVerify(b []byte, lcp *litChainPattern,
 		ch := chunks[i]
 		// Lane count (real chain bytes covered by this chunk).
 		laneCount := int32(0)
-		for m := uint16(ch.laneMask); m != 0; m &= m - 1 {
+		for m := ch.laneMask; m != 0; m &= m - 1 {
 			laneCount++
 		}
 
@@ -11124,9 +10810,9 @@ func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLay
 		SimdMask: locSimdMask, ScalarIdx: locScalarIdx,
 		Chunk: locChunk, VerifyTlo: locVerifyTlo, VerifyPow2: locVerifyPow2,
 	}
-	for i, br := range altp.branches {
+	for _, br := range altp.branches {
 		b = append(b, 0x02, 0x40) // block $next_branch_i
-		b = emitLitChainAltLitBranchBodyPrefixed(b, br, l.branchBitmapOff[i], locals, tableMemIdx)
+		b = emitLitChainAltLitBranchBodyPrefixed(b, br, locals)
 		b = append(b, 0x0B)
 	}
 
@@ -11236,7 +10922,7 @@ func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout
 			useBr.countMax = useBr.count
 		}
 		if useBr.countMax > useBr.count {
-			b = emitLitChainAltLitBranchBodyRange(b, useBr, l.branchBitmapOff[i], locals, locMatchLen, locTmp, tableMemIdx)
+			b = emitLitChainAltLitBranchBodyRange(b, useBr, locals, locMatchLen, locTmp)
 		} else {
 			b = emitLitChainAltLitBranchBody(b, useBr, l.branchBitmapOff[i], locals, tableMemIdx)
 		}
@@ -11498,7 +11184,7 @@ func buildLenAltDataSegments(altp *lenAltPattern, l lenAltLayout) ([]byte, int) 
 //	locOutEnd           — i32 (output: position one past last accepted byte)
 //
 // Constraint: dfaLayout.useU8 must be true (we capped DFA at 256 states).
-func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout, t *dfaTable,
+func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	locPtr, locLen, locState, locPos, locClass, locOutEnd byte,
 	tableMemIdx int, nextBranchDepth byte) []byte {
 
@@ -11759,12 +11445,12 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 				b = append(b, 0x4B)       // i32.gt_u
 				b = append(b, 0x0D, 0x00) // br_if 0 → $next_branch_i (literal can't fit)
 
-				b = emitLiteralByteVerify(b, br.literal, 1, locPtr, locAttemptStart, 0)
+				b = emitLiteralByteVerify(b, br.literal, locPtr, locAttemptStart)
 			}
 
 			b = append(b, 0x20, locAttemptStart)
 			b = append(b, 0x21, locDFAPos)
-			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout, br.dfaTable,
+			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout,
 				locPtr, locLen, locDFAState, locDFAPos, locDFAClass, locDFAOutEnd,
 				tableMemIdx, 0)
 			// Success — return packed (attempt_start, locDFAOutEnd).

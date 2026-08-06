@@ -816,12 +816,12 @@ func btCheckRune1(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 		// (scratch == r || scratch == altR) → if NOT → fail
 		b = append(b, 0x20, localScratch)
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(r))
+		b = utils.AppendSLEB128(b, r)
 		b = append(b, 0x46) // i32.eq
 
 		b = append(b, 0x20, localScratch)
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(altR))
+		b = utils.AppendSLEB128(b, altR)
 		b = append(b, 0x46) // i32.eq
 
 		b = append(b, 0x72)       // i32.or
@@ -832,7 +832,7 @@ func btCheckRune1(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 	} else {
 		b = append(b, 0x20, localScratch)
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(r))
+		b = utils.AppendSLEB128(b, r)
 		b = append(b, 0x47)       // i32.ne
 		b = append(b, 0x04, 0x40) // if void (no match)
 		b = btFail(b, brDepth)
@@ -911,12 +911,12 @@ func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 	}
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(lo))
+	b = utils.AppendSLEB128(b, lo)
 	b = append(b, 0x4F) // i32.ge_u
 
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(hi))
+	b = utils.AppendSLEB128(b, hi)
 	b = append(b, 0x4D) // i32.le_u
 
 	b = append(b, 0x71) // i32.and → 0 or 1
@@ -1167,16 +1167,6 @@ func btAllocSizes(bt *backtrack, useMemo bool, _ int, memoBudget int) (stackSize
 		memoSize = memoBudget
 	}
 	return
-}
-
-// btMemoMaxLenFor returns the maximum input length supported by BitState memo
-// for a prog with the given budget (bytes).
-func btMemoMaxLenFor(prog *syntax.Prog, memoBudget int) int {
-	N := len(prog.Inst)
-	if N == 0 {
-		return 0
-	}
-	return memoBudget*8/N - 1
 }
 
 // nfaFirstBytes walks the NFA from prog.Start via epsilon transitions and

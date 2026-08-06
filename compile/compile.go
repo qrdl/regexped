@@ -637,7 +637,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			return p, nil
 		}
 		// Gap C: single-pattern range `{N,M}`.
-		if lcp, ok := analyseLitChainRange(re.Pattern, true, litChainMinCount); ok {
+		if lcp, ok := analyseLitChainRange(re.Pattern, litChainMinCount); ok {
 			// Greedy and non-greedy paths split by function:
 			//   anchored match: greedy/non-greedy same → range match body
 			//   find/groups greedy: range find/groups body
@@ -735,7 +735,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				return p, nil
 			}
 			// Gap C: strict alt of lit-chain branches with at least one range.
-			if altp, ok := analyseLitChainAltRange(re.Pattern, true); ok {
+			if altp, ok := analyseLitChainAltRange(re.Pattern); ok {
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				p := &compiledPattern{

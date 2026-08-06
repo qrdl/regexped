@@ -188,28 +188,6 @@ func hasBeginAnchorAtTopLevel(re *syntax.Regexp) bool {
 	return false
 }
 
-// endsWithBeginAnchor reports whether the last mandatory element of re is a
-// begin-text or begin-line assertion at the top level (not inside *, ?, etc.).
-// e.g. \z^ returns true, (^^)*$ returns false.
-func endsWithBeginAnchor(re *syntax.Regexp) bool {
-	if re == nil {
-		return false
-	}
-	switch re.Op {
-	case syntax.OpBeginText, syntax.OpBeginLine:
-		return true
-	case syntax.OpConcat:
-		if len(re.Sub) > 0 {
-			return endsWithBeginAnchor(re.Sub[len(re.Sub)-1])
-		}
-	case syntax.OpCapture:
-		if len(re.Sub) > 0 {
-			return endsWithBeginAnchor(re.Sub[0])
-		}
-	}
-	return false
-}
-
 // isOnlyBeginAnchors reports whether re consists entirely of BeginText or
 // BeginLine assertions (possibly concatenated). Used to decide whether a
 // zero-length prefix can be safely stripped to just a startAnchor flag.
@@ -429,26 +407,6 @@ func (o CompileSetOptions) maxFallbackStates() int {
 	return 1024
 }
 
-// mergeSuffixASTs builds a canonical union AST from suffix sub-trees.
-// Sorts the inputs by re.String() before alternation so patterns sharing
-// prefixes converge in the NFA sooner, reducing DFA state count.
-func mergeSuffixASTs(asts []*syntax.Regexp) *syntax.Regexp {
-	if len(asts) == 0 {
-		return nil
-	}
-	if len(asts) == 1 {
-		return deepCopyRegexp(asts[0])
-	}
-	sorted := make([]*syntax.Regexp, len(asts))
-	for i, a := range asts {
-		sorted[i] = deepCopyRegexp(a)
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].String() < sorted[j].String()
-	})
-	return &syntax.Regexp{Op: syntax.OpAlternate, Sub: sorted}
-}
-
 // combinedClassCount returns the number of byte equivalence classes produced
 // by merging class maps a and b. Two bytes are in the same combined class only
 // if they are in the same class in both a and b.
@@ -468,6 +426,13 @@ func combinedClassCount(a, b [256]byte) int {
 // Bit k in the patternBits vector identifies pattern k.
 //
 // Returns error if len(asts) > BitmaskWidth (default 32).
+//
+// The AcceptKind return is always AcceptBitmask today; no caller uses it yet.
+// It exists so Phase 6 (plans/COMPOSING_PATTERNS_PLAN.md) can add
+// AcceptSparseSet for WAF-scale buckets (>BitmaskWidth patterns) without
+// changing this signature or any call site.
+//
+//nolint:unparam // second return value is a deliberate Phase 6 extensibility stub, see comment above
 func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, AcceptKind, error) {
 	bw := opts.BitmaskWidth
 	if bw == 0 {

@@ -79,28 +79,6 @@ func TestNfaFirstBytes(t *testing.T) {
 	}
 }
 
-func TestBtMemoMaxLenFor(t *testing.T) {
-	prog := compileBTTestProg(t, "(?:a?)*")
-	budget := 128 * 1024
-	maxLen := btMemoMaxLenFor(prog, budget)
-	if maxLen <= 0 {
-		t.Errorf("btMemoMaxLenFor: got %d, want > 0", maxLen)
-	}
-	N := len(prog.Inst)
-	expected := budget*8/N - 1
-	if maxLen != expected {
-		t.Errorf("btMemoMaxLenFor: got %d, want %d", maxLen, expected)
-	}
-}
-
-func TestBtMemoMaxLenForEmptyProg(t *testing.T) {
-	// N==0 early-return path: prog with no instructions returns 0.
-	empty := &syntax.Prog{}
-	if got := btMemoMaxLenFor(empty, 128*1024); got != 0 {
-		t.Errorf("btMemoMaxLenFor(empty prog) = %d, want 0", got)
-	}
-}
-
 func TestBtFoldRune(t *testing.T) {
 	cases := []struct {
 		r    rune

@@ -454,7 +454,8 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			}
 		}
 		sort.Slice(setOps, func(i, j int) bool { return setOps[i].dst < setOps[j].dst })
-		ops := append(copyOps, setOps...)
+		copyOps = append(copyOps, setOps...)
+		ops := copyOps
 
 		// Update global register high-water mark (canonical indices ARE WASM locals).
 		if counter > nextReg {

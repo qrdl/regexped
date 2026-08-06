@@ -14,7 +14,7 @@ import (
 func TestEmitImmAcceptCheckMatch(t *testing.T) {
 	t.Run("no_op_when_disabled", func(t *testing.T) {
 		before := []byte{0xAA, 0xBB}
-		got := emitImmAcceptCheckMatch(append([]byte(nil), before...), 5, false, 2, 3, 0)
+		got := emitImmAcceptCheckMatch(append([]byte(nil), before...), 5, false, 0)
 		if string(got) != string(before) {
 			t.Errorf("emitImmAcceptCheckMatch(hasImmAccept=false) modified input: got %v, want %v", got, before)
 		}
@@ -26,7 +26,7 @@ func TestEmitImmAcceptCheckMatch(t *testing.T) {
 			posLocal   = 3
 			limit      = 7
 		)
-		got := emitImmAcceptCheckMatch(nil, limit, true, stateLocal, posLocal, 0)
+		got := emitImmAcceptCheckMatch(nil, limit, true, 0)
 		want := []byte{0x20, stateLocal}
 		want = append(want, 0x41)
 		want = utils.AppendSLEB128(want, limit)

@@ -29,8 +29,8 @@ func TestLikelyModeString(t *testing.T) {
 //   - Strict-alt prefixed find (no match) → appendLitChainAltPrefixedFindCodeEntry.
 //   - Lenient-alt match (no find) → appendLenAltMatchCodeEntry.
 //   - Lenient-alt find  (no match) → buildLitChainAltLenientFindBody.
-//   - Strict-alt with groups (no match/find) → appendLitChainAltGroupsCodeEntry / find-groups composite.
-//   - Lit-chain anchored groups → appendLitChainGroupsCodeEntry.
+//   - Strict-alt with groups (no match/find) → appendLitChainAltFindGroupsCodeEntry.
+//   - Lit-chain anchored groups → appendLitChainFindGroupsCodeEntry.
 //   - Lit-chain range groups → appendLitChainRangeFindGroupsCodeEntry.
 //   - Word-boundary anchors → isWordByte / emitIsWordByte / emitStartAnchorCheck / emitEndAnchorCheck.
 func TestCompileLikelyMatch(t *testing.T) {
@@ -611,66 +611,6 @@ func TestCompileLikelyMatch(t *testing.T) {
 	}
 }
 
-// TestLitChainGroupsBodyHelpers directly invokes the lit-chain groups body
-// builders that are currently unreferenced from the production dispatcher but
-// still part of the package API. Each call exercises the body emission +
-// slot-write helpers; we only need to confirm a non-empty WASM body is
-// produced.
-func TestLitChainGroupsBodyHelpers(t *testing.T) {
-	patterns := []string{
-		`(AKIA[A-Z0-9]{24})`,     // no anchors
-		`(\bAKIA[A-Z0-9]{24}\b)`, // word-boundary start + end
-		`(\BAKIA[A-Z0-9]{24}\B)`, // no-word-boundary start + end
-		`(\AAKIA[A-Z0-9]{24}\z)`, // text anchors
-		`(AKIA[A-Z0-9]{24}\b)`,   // end word boundary only
-		`(\bAKIA[A-Z0-9]{24})`,   // start word boundary only
-		`(AKIA[A-Z0-9]{24}\z)`,   // end text anchor only
-	}
-	for _, p := range patterns {
-		p := p
-		t.Run("single_"+p, func(t *testing.T) {
-			lcp, lcc, ok := analyseLitChainGroups(p)
-			if !ok {
-				t.Skipf("analyseLitChainGroups: pattern %q not recognised", p)
-				return
-			}
-			body := buildLitChainGroupsBody(lcp, lcc)
-			if len(body) == 0 {
-				t.Fatalf("buildLitChainGroupsBody: empty body for %q", p)
-			}
-			entry := appendLitChainGroupsCodeEntry(nil, lcp, lcc)
-			if len(entry) == 0 {
-				t.Fatalf("appendLitChainGroupsCodeEntry: empty entry for %q", p)
-			}
-		})
-	}
-
-	altPatterns := []string{
-		`(AKIA[A-Z0-9]{24})|(ghp_[A-Za-z0-9]{36})`,
-		`(\bAKIA[A-Z0-9]{24}\b)|(\bghp_[A-Za-z0-9]{36}\b)`,
-		`(\AAKIA[A-Z0-9]{24}\z)|(\Aghp_[A-Za-z0-9]{36}\z)`,
-		`(\BAKIA[A-Z0-9]{24}\B)|(\Bghp_[A-Za-z0-9]{36}\B)`,
-	}
-	for _, p := range altPatterns {
-		p := p
-		t.Run("alt_"+p, func(t *testing.T) {
-			altp, branchCaps, ok := analyseLitChainAltGroups(p)
-			if !ok {
-				t.Skipf("analyseLitChainAltGroups: pattern %q not recognised", p)
-				return
-			}
-			body := buildLitChainAltGroupsBody(altp, branchCaps)
-			if len(body) == 0 {
-				t.Fatalf("buildLitChainAltGroupsBody: empty body for %q", p)
-			}
-			entry := appendLitChainAltGroupsCodeEntry(nil, altp, branchCaps)
-			if len(entry) == 0 {
-				t.Fatalf("appendLitChainAltGroupsCodeEntry: empty entry for %q", p)
-			}
-		})
-	}
-}
-
 // TestCompileLargeStateDFA exercises patterns that produce > 256 DFA states
 // to force the table-driven (non-compiled) DFA path with emitImmAcceptCheckMatch.
 func TestCompileLargeStateDFA(t *testing.T) {
@@ -1031,7 +971,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChain(`[`, 24); ok {
 			t.Errorf("analyseLitChain accepted invalid syntax")
 		}
-		if _, ok := analyseLitChainRange(`[`, true, 24); ok {
+		if _, ok := analyseLitChainRange(`[`, 24); ok {
 			t.Errorf("analyseLitChainRange accepted invalid syntax")
 		}
 		if _, _, ok := analyseLitChainGroupsRange(`[`); ok {
@@ -1046,7 +986,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChainAlt(`[`); ok {
 			t.Errorf("analyseLitChainAlt accepted invalid syntax")
 		}
-		if _, ok := analyseLitChainAltRange(`[`, true); ok {
+		if _, ok := analyseLitChainAltRange(`[`); ok {
 			t.Errorf("analyseLitChainAltRange accepted invalid syntax")
 		}
 		if _, ok := analyseLitChainAltPrefixed(`[`); ok {
@@ -1063,7 +1003,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChain(`AKIA[A-Z0-9]{4}`, 24); ok {
 			t.Errorf("analyseLitChain accepted N=4")
 		}
-		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{4,8}`, true, 24); ok {
+		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{4,8}`, 24); ok {
 			t.Errorf("analyseLitChainRange accepted N=4")
 		}
 		if _, _, ok := analyseLitChainGroups(`(AKIA[A-Z0-9]{4})`); ok {
@@ -1081,14 +1021,14 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChain(`AKIA[A-Z0-9]{12}`, 1); !ok {
 			t.Errorf("analyseLitChain rejected N=12 under minCount=1")
 		}
-		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{12,20}`, true, 1); !ok {
+		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{12,20}`, 1); !ok {
 			t.Errorf("analyseLitChainRange rejected N=12 under minCount=1")
 		}
 	})
 
 	t.Run("not_a_range", func(t *testing.T) {
 		// analyseLitChainRange wants countMax > count.
-		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{24}`, true, 24); ok {
+		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{24}`, 24); ok {
 			t.Errorf("analyseLitChainRange accepted exact count")
 		}
 		if _, _, ok := analyseLitChainGroupsRange(`(AKIA[A-Z0-9]{24})`); ok {
@@ -1101,7 +1041,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChainAlt(`AKIA[A-Z0-9]{16}`); ok {
 			t.Errorf("analyseLitChainAlt accepted single branch")
 		}
-		if _, ok := analyseLitChainAltRange(`AKIA[A-Z0-9]{16,24}`, true); ok {
+		if _, ok := analyseLitChainAltRange(`AKIA[A-Z0-9]{16,24}`); ok {
 			t.Errorf("analyseLitChainAltRange accepted single branch")
 		}
 		if _, ok := analyseLitChainAltPrefixed(`[0-9]{8}ghp_[A-Za-z0-9]{36}`); ok {
@@ -1115,7 +1055,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 	t.Run("alt_range_no_range_branch", func(t *testing.T) {
 		// All branches are exact — analyseLitChainAltRange should reject (only
 		// alts with at least one range branch qualify).
-		if _, ok := analyseLitChainAltRange(`AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}`, true); ok {
+		if _, ok := analyseLitChainAltRange(`AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}`); ok {
 			t.Errorf("analyseLitChainAltRange accepted pure-exact alt")
 		}
 	})
