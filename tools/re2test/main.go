@@ -435,11 +435,14 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 
 			if !validateGo {
-				// col1: non-anchored find (only when no anchored result expected, matching RE2 test convention).
-				if col0 == "-" && col1 != "-" {
+				// col1: non-anchored find. Tested whenever no anchored match is
+				// expected (col0 == "-") — including when col1 == "-" too: that
+				// combination used to fall through to the anchored-match check
+				// only (an else-if) and never called find, hiding bugs where
+				// find should report no match but doesn't.
+				if col0 == "-" {
 					if findFn == nil {
 						skipCount[skipNonAnchored]++
-						// Fall through to col4/col5 tests below.
 					} else {
 						got, callErr := callFind(wd, store, findFn, findMemory, text)
 						if callErr != nil {
@@ -479,7 +482,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 							}
 						}
 					}
-				} else if groupsFn != nil && validateGroups {
+				}
+
+				if groupsFn != nil && validateGroups {
 					// col0: anchored match with captures (only when --validate-groups is on).
 					// groups is now non-anchored; treat as no match if result doesn't start at 0.
 					endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)

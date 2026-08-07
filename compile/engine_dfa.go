@@ -535,7 +535,16 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// used for attempt_start > 0 in find mode when prev byte was not a word char.
 	midStartSet := epsilonClosure([]uint32{uint32(prog.Start)}, 0)
 	midStartKey := setToKey(midStartSet, false, nfaAcceptBits(midStartSet))
-	if id, exists := stateMap[midStartKey]; exists {
+	// midStart's rightful EOF-accept value excludes ecBegin (attempt_start>0
+	// is never at true text start). A raw key match against an
+	// already-registered id (e.g. the bootstrap start state) is only safe to
+	// reuse when that id's recorded accept value already agrees — otherwise
+	// the closure blocked at the same anchor node under both contexts (see
+	// FUZZER_BUGS.md §6/§7) and reusing the id would silently inherit the
+	// wrong (begin-inclusive) accept value. Recompute and compare rather
+	// than trusting the key alone.
+	midStartRightfulAccept := acceptBitsFor(midStartSet, ecEnd|ecNoWordBoundary)
+	if id, exists := stateMap[midStartKey]; exists && dfa.accepting[id] == midStartRightfulAccept {
 		dfa.midStart = id
 		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 			bits := nfaAcceptBits(midStartSet)
@@ -549,7 +558,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		stateMap[midStartKey] = nextStateID
 		nextStateID++
 		// midStart is prevWasWord=false: end-of-input → \B fires
-		orAccept(dfa.accepting, dfa.midStart, acceptBitsFor(midStartSet, ecEnd|ecNoWordBoundary))
+		orAccept(dfa.accepting, dfa.midStart, midStartRightfulAccept)
 		orAccept(dfa.midAccepting, dfa.midStart, acceptBitsFor(midStartSet, 0))
 		// midAcceptNW for midStart (prevWasWord=false): before non-word → \B fires
 		orAccept(dfa.midAcceptingNW, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary))
@@ -572,7 +581,11 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// Mid-string start state (prev=word): used when attempt_start > 0 and prev byte was a word char.
 	// Same NFA set as midStart but different prevWasWord context → different DFA state.
 	midStartWordKey := setToKey(midStartSet, true, nfaAcceptBits(midStartSet))
-	if id, exists := stateMap[midStartWordKey]; exists {
+	// Same collision guard as midStart above (FUZZER_BUGS.md §6/§7): don't
+	// trust a raw key match unless the found id's recorded accept value
+	// already agrees with what midStartWord is rightfully entitled to.
+	midStartWordRightfulAccept := acceptBitsFor(midStartSet, ecEnd|ecWordBoundary)
+	if id, exists := stateMap[midStartWordKey]; exists && dfa.accepting[id] == midStartWordRightfulAccept {
 		dfa.midStartWord = id
 		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 			bits := nfaAcceptBits(midStartSet)
@@ -586,7 +599,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		stateMap[midStartWordKey] = nextStateID
 		nextStateID++
 		// midStartWord is prevWasWord=true: end-of-input → \b fires
-		orAccept(dfa.accepting, dfa.midStartWord, acceptBitsFor(midStartSet, ecEnd|ecWordBoundary))
+		orAccept(dfa.accepting, dfa.midStartWord, midStartWordRightfulAccept)
 		orAccept(dfa.midAccepting, dfa.midStartWord, acceptBitsFor(midStartSet, 0))
 		// midAcceptNW for midStartWord (prevWasWord=true): before non-word → \b fires
 		orAccept(dfa.midAcceptingNW, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary))
@@ -611,7 +624,9 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	if dfa.hasNewlineBoundary {
 		midStartNewlineSet := epsilonClosure([]uint32{uint32(prog.Start)}, ecBeginLine)
 		midStartNewlineKey := setToKey(midStartNewlineSet, false, nfaAcceptBits(midStartNewlineSet), true) // prevWasWord=false, prevWasNewline=true
-		if id, exists := stateMap[midStartNewlineKey]; exists {
+		// Same collision guard as midStart above (FUZZER_BUGS.md §6/§7).
+		midStartNewlineRightfulAccept := acceptBitsFor(midStartNewlineSet, ecEnd|ecNoWordBoundary)
+		if id, exists := stateMap[midStartNewlineKey]; exists && dfa.accepting[id] == midStartNewlineRightfulAccept {
 			dfa.midStartNewline = id
 			if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
 				bits := nfaAcceptBits(midStartNewlineSet)
@@ -625,7 +640,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 			stateMap[midStartNewlineKey] = nextStateID
 			nextStateID++
 			// midStartNewline is prevWasNewline=true: ecBeginLine fires, ecNoWordBoundary fires (newline is non-word).
-			orAccept(dfa.accepting, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecEnd|ecNoWordBoundary))
+			orAccept(dfa.accepting, dfa.midStartNewline, midStartNewlineRightfulAccept)
 			orAccept(dfa.midAccepting, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, 0))
 			orAccept(dfa.midAcceptingNW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecNoWordBoundary))
 			orAccept(dfa.midAcceptingW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecWordBoundary))
@@ -705,18 +720,30 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		getOrAddState := func(nextSet []uint32, nextPrevWasWord bool, nextPrevWasNewline ...bool) int {
 			nlFlag := len(nextPrevWasNewline) > 0 && nextPrevWasNewline[0]
 			nextKey := setToKey(nextSet, nextPrevWasWord, nfaAcceptBits(nextSet), nlFlag)
+			var eofWBCtx int
+			if nextPrevWasWord {
+				eofWBCtx = ecWordBoundary
+			} else {
+				eofWBCtx = ecNoWordBoundary
+			}
+			rightfulAccept := acceptBitsFor(nextSet, ecEnd|eofWBCtx)
 			nextDFAState, exists := stateMap[nextKey]
+			// Defensive: a byte-reachable state's raw closure frontier could
+			// in principle collide with a bootstrap state's key (start/midStart/
+			// midStartWord/midStartNewline, whose recorded accept value may
+			// have been computed under a different, begin-anchor-sensitive
+			// context — see the analogous, confirmed collision in the
+			// midStart/midStartWord/midStartNewline guards above and
+			// FUZZER_BUGS.md §6/§7). Don't trust the key match unless the
+			// found id's recorded accept value already agrees.
+			if exists && dfa.accepting[nextDFAState] != rightfulAccept {
+				exists = false
+			}
 			if !exists {
 				nextDFAState = nextStateID
 				stateMap[nextKey] = nextStateID
 				nextStateID++
-				var eofWBCtx int
-				if nextPrevWasWord {
-					eofWBCtx = ecWordBoundary
-				} else {
-					eofWBCtx = ecNoWordBoundary
-				}
-				orAccept(dfa.accepting, nextDFAState, acceptBitsFor(nextSet, ecEnd|eofWBCtx))
+				orAccept(dfa.accepting, nextDFAState, rightfulAccept)
 				orAccept(dfa.midAccepting, nextDFAState, acceptBitsFor(nextSet, 0))
 				var nwCtx int
 				if nextPrevWasWord {
