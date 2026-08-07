@@ -2865,7 +2865,11 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			// match-body bulk-skip dispatch + TDFA accept tables. The non-mid
 			// channel uses state-ID compares (no side table) so no extra
 			// emission is needed here.
-			emitMidAccept := len(l.dominantStates) > 0
+			// useAcceptSideTable (TDFA-built tables only) also needs midAccept
+			// unconditionally: buildTDFAMatchBody's dead-transition handler
+			// reads it to fall back to a shorter, already-valid match instead
+			// of failing outright (plans/FUZZER_BUGS.md §10.2).
+			emitMidAccept := len(l.dominantStates) > 0 || l.useAcceptSideTable
 			count := byte(2) // classMap + transitions
 			if emitMidAccept {
 				count++
@@ -2940,7 +2944,11 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			// Non-find path: transitions + (optional) midAccept for Phase 4
 			// match-body bulk-skip + (optional) nonMidDominantBytes for the
 			// LM-gated non-mid match-body dispatch + TDFA accept tables.
-			emitMidAccept := len(l.dominantStates) > 0
+			// useAcceptSideTable (TDFA-built tables only) also needs midAccept
+			// unconditionally: buildTDFAMatchBody's dead-transition handler
+			// reads it to fall back to a shorter, already-valid match instead
+			// of failing outright (plans/FUZZER_BUGS.md §10.2).
+			emitMidAccept := len(l.dominantStates) > 0 || l.useAcceptSideTable
 			count := byte(1) // transitions
 			if emitMidAccept {
 				count++

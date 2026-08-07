@@ -13,7 +13,14 @@ import (
 	"regexp/syntax"
 	"strconv"
 	"strings"
+
+	"github.com/qrdl/regexped/compile"
 )
+
+// maxDFAStates mirrors tools/re2test/main.go's own constant of the same
+// name — SelectEngine's result (and therefore which of matchFn/groupsFn
+// main.go actually tests col0 against) depends on it.
+const maxDFAStates = 100000
 
 type regexpEntry struct {
 	pattern string
@@ -175,17 +182,46 @@ func main() {
 		nSections++
 
 		for _, rp := range sec.regexps {
-			re, parseErr := syntax.Parse(rp.pattern, syntax.Perl)
-			if parseErr != nil {
+			if _, parseErr := syntax.Parse(rp.pattern, syntax.Perl); parseErr != nil {
 				nSkipped++
 				continue
 			}
-			numGroups := re.MaxCap() + 1
 
 			goRe, compErr := regexp.Compile(rp.pattern)
 			if compErr != nil {
 				nSkipped++
 				continue
+			}
+
+			// Which of matchFn/groupsFn tools/re2test/main.go actually tests
+			// col0 against is NOT determined by whether the pattern
+			// syntactically has capture groups (numGroups) — it's determined
+			// by which engine compile.SelectEngine actually picks for it
+			// (main.go only wires up groupsFn when the selected engine is
+			// Backtrack or TDFA; e.g. `(?:(a){4,5}){0}` has a syntactic
+			// capture group but its body is provably unreachable, so the
+			// compiler still picks a non-capturing DFA engine and main.go
+			// tests it via matchFn instead). Mirror that decision exactly,
+			// not the syntactic capture count. See plans/FUZZER_BUGS.md §8.
+			engineType, selErr := compile.SelectEngine(rp.pattern, compile.CompileOptions{MaxDFAStates: maxDFAStates})
+			testedViaGroups := selErr == nil && (engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA)
+
+			// col0 for a matchFn-tested pattern requires full-input-
+			// consumption with leftmost-longest priority (compile/compile.go's
+			// needMatch path) — NOT "does the plain leftmost-first match
+			// happen to span the whole string". \A(?:...)\z forces the
+			// search to consider every full-consuming derivation, matching
+			// that contract; a plain unanchored FindStringIndex would miss
+			// full-consuming derivations that leftmost-first priority alone
+			// wouldn't reach (e.g. lazy quantifiers). See plans/FUZZER_BUGS.md §8.
+			var goReFull *regexp.Regexp
+			if !testedViaGroups {
+				var fullErr error
+				goReFull, fullErr = regexp.Compile(`\A(?:` + rp.pattern + `)\z`)
+				if fullErr != nil {
+					nSkipped++
+					continue
+				}
 			}
 
 			fmt.Fprintf(w, "%s\n", strconv.Quote(rp.pattern))
@@ -203,9 +239,13 @@ func main() {
 
 				// Recompute col0 using Go stdlib.
 				var col0 string
-				if numGroups > 1 {
+				if testedViaGroups {
+					// col0 here is tested against regexped's groupsFn, a
+					// non-anchored find-with-captures filtered only by
+					// start==0 (NOT also end==len(s) — groupsFn has no
+					// full-consumption requirement). See plans/FUZZER_BUGS.md §8.
 					m := goRe.FindStringSubmatchIndex(s)
-					if m == nil || m[0] != 0 || m[1] != len(s) {
+					if m == nil || m[0] != 0 {
 						col0 = "-"
 					} else {
 						var slots []string
@@ -219,8 +259,7 @@ func main() {
 						col0 = strings.Join(slots, " ")
 					}
 				} else {
-					m := goRe.FindStringIndex(s)
-					if m == nil || m[0] != 0 || m[1] != len(s) {
+					if m := goReFull.FindStringIndex(s); m == nil {
 						col0 = "-"
 					} else {
 						col0 = fmt.Sprintf("0-%d", m[1])

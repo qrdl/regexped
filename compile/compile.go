@@ -596,7 +596,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 							tdfaBase := utils.PageAlign(lenLayout.tableEnd)
 							tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true,
 								resolveCompiledDFAThreshold(&buildOpts), true, false, false, false)
-							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx)
+							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, false)
 							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false))
 							p.dataBytes = append(p.dataBytes, rawTDFA...)
 							p.dataSegCount += cntTDFA
@@ -1273,7 +1273,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			tdfaBase := utils.PageAlign(p.tableEnd)
 			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(&buildOpts), true, false, false, false)
 			p.numGroups = tt.numGroups
-			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx)
+			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored)
 			// TDFA only needs the transition table (no stack/memo).
 			p.tableEnd = tdfaLayout.tableEnd
 			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false))

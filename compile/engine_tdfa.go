@@ -817,8 +817,12 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 
 // appendTDFACodeEntry appends a size-prefixed TDFA anchored-match function body
 // to cs. The function has signature (ptr i32, len i32, out_ptr i32) → i32.
-func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
-	body := buildTDFAMatchBody(tt, l, tableMemIdx)
+// nativeAnchored must be true only when this body is exported directly as the
+// caller-facing groups function (compile.go:1568, p.anchored) — see
+// buildTDFAMatchBody's doc comment for why that changes what "len" means and
+// what code gets emitted.
+func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool) []byte {
+	body := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored)
 	var b []byte
 	b = utils.AppendULEB128(b, uint32(len(body)))
 	b = append(b, body...)
@@ -829,18 +833,20 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 //
 // Locals:
 //
-//	0 = ptr       (param i32)
-//	1 = len       (param i32)
-//	2 = out_ptr   (param i32)
-//	3 = pos       (i32)
-//	4 = state     (i32)
-//	5 = prevState (i32)
-//	6 = byte      (i32, the current input byte — saved before pos++)
-//	[7 .. 7+numRegs-1] = capture registers (i32), initialised to -1
+//	0 = ptr           (param i32)
+//	1 = len           (param i32)
+//	2 = out_ptr       (param i32)
+//	3 = pos           (i32)
+//	4 = state         (i32)
+//	5 = prevState     (i32)
+//	6 = byte          (i32, the current input byte — saved before pos++)
+//	7 = lastAcceptPos (i32, -1 = none; see hasMidAccept below)
+//	[8 .. 8+numRegs-1] = capture registers (i32), initialised to -1
 //
 // Loop structure (pos++ BEFORE tag ops so that pos = exclusive end when ops fire):
 //
 //	entry_ops (at pos=0, before loop)
+//	lastAcceptPos = -1; midAcceptCheck(wasmStart, 0)   [eager write, see below]
 //	block $done:
 //	  loop $main:
 //	    if pos >= len: br $done
@@ -848,20 +854,65 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 //	    byte = mem[ptr+pos]
 //	    pos++
 //	    state = table[prevState<<8 + byte]
-//	    if dead: return -1
+//	    if dead: return lastAcceptPos (or -1 if never set)
 //	    emitTagOps(prevState, byte)   ← pos = byte_index+1 = exclusive end
 //	    immediateAcceptCheck
+//	    midAcceptCheck(state, pos)
 //	    br $main
 //	  end loop
 //	end block $done
-//	EOF accept or return -1
-func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
+//	EOF accept, or lastAcceptPos fallback, or return -1
+//
+// midAcceptCheck(state, pos): if midAccept[state], EAGERLY write captures
+// via emitTDFAWriteCaptures(state, pos) (same as an immediate/EOF accept
+// would) and record lastAcceptPos=pos, but keep scanning instead of
+// returning. This mirrors the plain DFA find-loop's `last_accept` mechanism
+// (buildAnchoredFindBody) — needed because this body also serves as the
+// *native/anchored* exported groups function (compile.go:1568, no find-pass
+// narrowing `len` first), where a byte consumer can have higher priority
+// than an already-reachable Match (e.g. `^(a)?` vs "b", or `^(?:(a){2})?`
+// vs a string with fewer than 2 'a's) and the correct leftmost-first answer
+// is the earlier, lower-priority accept, not "no match". See
+// plans/FUZZER_BUGS.md §10.2/§10.2-followup.
+//
+// The write must happen EAGERLY (not deferred to whenever the fallback is
+// actually needed) because capture registers are live, mutable WASM locals:
+// a later, ultimately-failed continuation (e.g. attempting a 2nd iteration
+// of a `(a){2}*` loop that only gets 1 more 'a') runs its own tag ops on the
+// SAME registers (TDFA reuses registers across loop iterations by design)
+// before the dead-transition is even detected — reading them only at the
+// fallback point would return the failed attempt's partial values, not the
+// ones that were correct when this position was actually valid. Writing
+// eagerly to out_ptr (stable memory, not a register that keeps getting
+// overwritten) and simply re-reading/overwriting it on every subsequent
+// eager write sidesteps that entirely: whichever write happened last is
+// necessarily the most recent valid accept, exactly the invariant we want.
+//
+// Word-boundary/line-anchor context never applies here — TDFA is never
+// selected for patterns with \b/\B or (?m) anchors
+// (compile/selector.go's hasWordBoundary/hasLineAnchors gates route those to
+// Backtracking) — so a single ctx=0 midAccept table, with no NW/W/NL
+// variants, is sufficient.
+func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool) []byte {
 	var b []byte
 
 	numCapRegs := tt.numRegs
-	// Locals: pos(1) + state(1) + prevState(1) + byte(1) + capture regs
+	// The lastAccept fallback machinery only matters for the native/anchored
+	// call convention (see doc comment above) — for the wrapper-composed
+	// convention (nativeAnchored=false), `len` is already narrowed to the
+	// exact match end by an independent find pass, so a dead transition or
+	// non-accepting EOF state within that convention doesn't need — and
+	// shouldn't pay the per-byte cost for — this fallback. Skipping it
+	// entirely there keeps wrapper-composed capture bodies byte-identical to
+	// (and as fast as) before this fix.
+	hasMidAccept := nativeAnchored && len(tt.midAcceptStates) > 0
+	// Locals: pos(1) + state(1) + prevState(1) + byte(1) [+ lastAcceptPos(1)
+	// when hasMidAccept] + capture regs
 	// [+ bulk-skip locals: chunk(v128) + mask(i32) + skipStart(i32)].
 	extraLocals := 4 + numCapRegs
+	if hasMidAccept {
+		extraLocals++
+	}
 	hasBulkSkip := enableTDFABulkSkip && tt.bulkSkip != nil
 
 	if hasBulkSkip {
@@ -877,8 +928,15 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		localState     = uint32(4)
 		localPrevState = uint32(5)
 		localByte      = uint32(6)
-		localCapBase   = uint32(7)
 	)
+	// localLastAcceptPos only exists (and localCapBase only shifts up to make
+	// room for it) when hasMidAccept; otherwise capBase stays at 7, exactly
+	// matching this function's shape before this fix.
+	localLastAcceptPos := uint32(7)
+	localCapBase := uint32(7)
+	if hasMidAccept {
+		localCapBase = 8
+	}
 	localChunk := localCapBase + uint32(numCapRegs)
 	localMask := localChunk + 1
 	localSkipStart := localMask + 1
@@ -888,6 +946,25 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		b = append(b, 0x7B) // v128
 		b = utils.AppendULEB128(b, uint32(2))
 		b = append(b, 0x7F) // i32
+	}
+
+	// midAcceptCheck: if midAccept[state], eagerly write captures for
+	// (state, pos) and record lastAcceptPos=pos. No-op when !hasMidAccept.
+	midAcceptCheck := func(b []byte, stateLocal, posLocal uint32) []byte {
+		if !hasMidAccept {
+			return b
+		}
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptOff)
+		b = append(b, 0x20, byte(stateLocal))
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+		b = append(b, 0x04, 0x40)             // if midAccept[state]
+		b = emitTDFAWriteCaptures(tt, b, stateLocal, posLocal, localCapBase)
+		b = append(b, 0x20, byte(posLocal))
+		b = append(b, 0x21, byte(localLastAcceptPos))
+		b = append(b, 0x0B) // end if
+		return b
 	}
 
 	// Initialise capture registers to -1.
@@ -909,6 +986,16 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x21, byte(localState))
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x21, byte(localPos))
+
+	// lastAcceptPos = -1, then check wasmStart itself (pos=0) for mid-accept.
+	// (Guarded by hasMidAccept: when false, localLastAcceptPos aliases the
+	// first capture register — see its declaration above — so writing to it
+	// unconditionally here would corrupt that register's initial value.)
+	if hasMidAccept {
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x21, byte(localLastAcceptPos))
+	}
+	b = midAcceptCheck(b, localState, localPos)
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $main
@@ -976,13 +1063,29 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		b = append(b, 0x21, byte(localState))
 	}
 
-	// if state == 0: return -1 (dead)
+	// if state == 0 (dead): the byte just read has no valid transition. Fall
+	// back to the most recently, eagerly-written mid-accept (lastAcceptPos)
+	// if any, else -1 — e.g. `^(a)?` vs "b": state 0's threads are
+	// [Rune('a'), Match]; byte 'b' kills the Rune thread, but Match was
+	// already reachable from state 0 at pos=0, so the correct leftmost-first
+	// answer is an empty match at 0, not "no match". Or `^(?:(a){2})?` vs a
+	// string with fewer than 2 'a's: the dead transition can be several
+	// bytes past the last valid accept, not just one — hence tracking
+	// lastAcceptPos continuously through the scan (via midAcceptCheck)
+	// rather than only checking prevState. (This only matters for the
+	// native/anchored capture-body call convention — compile.go:1568 —
+	// where `len` is the caller's full input, not a find-pass-narrowed match
+	// end; see plans/FUZZER_BUGS.md §10.2.)
 	b = append(b, 0x20, byte(localState))
 	b = append(b, 0x45) // i32.eqz
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x0F) // return -1
-	b = append(b, 0x0B)
+	b = append(b, 0x04, 0x40) // if state==0 (void)
+	if hasMidAccept {
+		b = append(b, 0x20, byte(localLastAcceptPos))
+	} else {
+		b = append(b, 0x41, 0x7F) // i32.const -1
+	}
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B) // end if state==0
 
 	// Emit tag ops keyed on (prevState, byte).
 	// At this point pos = exclusive end of consumed byte.
@@ -1001,13 +1104,24 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		b = append(b, 0x0B)
 	}
 
+	// Record a fallback accept (eagerly writing captures) if the state we
+	// just transitioned into is mid-accepting. Only reached when
+	// immediateAccept didn't already fire and return above, so this never
+	// overrides a higher-priority immediate accept — it only ever matters if
+	// every higher-priority continuation from here eventually dies.
+	b = midAcceptCheck(b, localState, localPos)
+
 	b = append(b, 0x0C, 0x00) // br $main
 	b = append(b, 0x0B)       // end loop
 	b = append(b, 0x0B)       // end block $done
 
 	// EOF accept check (TDFA): read per-state side table at l.acceptOff.
 	// (State-ID partitioning is not applied to TDFA tables because state IDs
-	// are tied to tag-op indices.)
+	// are tied to tag-op indices.) If the final state itself isn't an
+	// EOF-accept, fall back to the last recorded mid-accept before giving up
+	// — e.g. `^(?:(?:(?:(a){2})?))` vs "a": the final state (mid-way through
+	// the required 2 a's) never becomes EOF-accepting, but the outer `?`'s
+	// skip branch was mid-accepting back at position 0.
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, l.acceptOff)
 	b = append(b, 0x20, byte(localState))
@@ -1015,9 +1129,13 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = appendTableLoad8u(b, tableMemIdx)
 	b = append(b, 0x04, 0x7F) // if [i32]: then-branch returns, else-branch leaves i32
 	b = emitTDFAAcceptEOF(tt, b, localState, localPos, localCapBase)
-	b = append(b, 0x05)       // else
-	b = append(b, 0x41, 0x7F) // -1
-	b = append(b, 0x0B)       // end if — i32 on stack becomes implicit return value
+	b = append(b, 0x05) // else
+	if hasMidAccept {
+		b = append(b, 0x20, byte(localLastAcceptPos)) // captures already written eagerly
+	} else {
+		b = append(b, 0x41, 0x7F) // -1
+	}
+	b = append(b, 0x0B) // end if — i32 on stack becomes implicit return value
 
 	b = append(b, 0x0B) // end function
 	return b
