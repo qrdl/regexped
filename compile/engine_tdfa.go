@@ -321,8 +321,27 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 
 	// Per-state data accumulated during construction.
 	type stateData struct {
-		key         tdfaStateKey
-		nfaPCs      []uint32 // bare NFA PCs (for epsilonClosure / accept checks)
+		key tdfaStateKey
+		// priorityPCs holds this state's live NFA PCs in true leftmost-first
+		// priority order (highest priority first) — the order threads were
+		// discovered in during subset construction, BEFORE canonicalise()
+		// re-sorted key.threads by ascending pc for canonical hashing.
+		//
+		// This order matters: nfaBuildInputMap (engine_dfa.go) prunes a
+		// Rune-consuming thread's transition once it has seen a higher-or-
+		// equal-priority InstMatch earlier in the list it's given (standard
+		// leftmost-first "kill lower-priority threads once a match is found"
+		// semantics — see plans/FUZZER_BUGS.md §12). Passing it key.threads'
+		// pc-sorted order instead would silently defeat that pruning whenever
+		// numeric pc order disagrees with true priority — which happens for
+		// backward loop edges, e.g. an outer repeat wrapping a range-quantified
+		// (`{m,n}` with m<n) capture group: the loop-continuation/optional-copy
+		// PCs are numerically smaller than the Match PC despite being lower
+		// priority than a Match reached earlier in the same state. A thread
+		// that should have died there instead survives into later states and
+		// produces a spurious extra accept at a wrong (too-late, lower-priority)
+		// position.
+		priorityPCs []uint32
 		prevWasWord bool
 	}
 	var states []stateData
@@ -475,6 +494,14 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		stateMap[ks] = id
 
 		pcs := keyToPCs(key)
+		// priorityPCs: true leftmost-first order, taken from the `threads`
+		// parameter as passed in by the caller — canonicalise() above sorts by
+		// pc for hashing (key.threads/pcs) and loses this order (see
+		// stateData.priorityPCs doc comment).
+		priorityPCs := make([]uint32, len(threads))
+		for i, t := range threads {
+			priorityPCs[i] = uint32(t.pc)
+		}
 		var eofWBCtx int
 		if prevWasWord {
 			eofWBCtx = ecWordBoundary
@@ -521,7 +548,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 
 		states = append(states, stateData{
 			key:         key,
-			nfaPCs:      pcs,
+			priorityPCs: priorityPCs,
 			prevWasWord: prevWasWord,
 		})
 
@@ -605,7 +632,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		}
 
 		sd := states[si]
-		pcSet := sd.nfaPCs
+		pcSet := sd.priorityPCs
 
 		// Expand for word/non-word contexts (same as newDFA).
 		var expandedWord, expandedNonWord []uint32

@@ -2391,3 +2391,91 @@ regexps
 -;-;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category (Backtracking native/anchored captures) — task 10.3/§9 fix.
+# A leading ^ makes the pattern p.anchored (isAnchoredFind): the compiled
+# groups function IS the Backtracking captureBody, exported directly with
+# the caller's full, un-narrowed input length (no independent find pass
+# bounds it first). InstMatch previously required pos==len unconditionally,
+# which is only correct under the wrapper-composed (!anchored) convention —
+# under native/anchored it wrongly forced full-input consumption, so lazy/
+# optional capture groups that should stop early (or fail) instead kept
+# backtracking past the correct leftmost-first answer.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+BacktrackNativeAnchoredCapture
+strings
+""
+"a"
+"b"
+"ba"
+"aaaaaa"
+regexps
+"^(a+?)"
+-;-;-;-
+0-1 0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+0-1 0-1;0-1;-;-
+"^(?:(?:(a){0,})*?)"
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+"^(?:(?:(?:(a){0,})*?))"
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+"^(a*)?"
+0-0 0-0;0-0;-;-
+0-1 0-1;0-1;-;-
+0-0 0-0;0-0;-;-
+0-0 0-0;0-0;-;-
+0-6 0-6;0-6;-;-
+# ============================================================
+# Category (TDFA native/anchored range-quantifier priority) — FUZZER_BUGS.md
+# §12. A leading ^ makes the pattern p.anchored (isAnchoredFind): the
+# compiled groups function IS the TDFA captureBody, exported directly with
+# the caller's full, un-narrowed input length. An outer repeat (`*`/`+`)
+# wrapping a range-quantified (`{m,n}`, m<n) capture group creates a state
+# whose live NFA threads include, simultaneously, a completed higher-
+# priority Match AND a lower-priority Rune-consumer continuing into a fresh
+# repetition (e.g. after the optional 4th copy of `(a){3,4}` is taken, one
+# thread reaches Match while another, lower-priority thread starts a new
+# repetition's mandatory copies). newTDFA's subset construction stored each
+# state's NFA PCs in canonical (pc-ascending, hash-friendly) order and reused
+# that order to decide which byte transitions survive — losing the true
+# leftmost-first priority order that the shared kill-lower-priority-after-
+# match pruning (nfaBuildInputMap) depends on. The lower-priority thread
+# survived when it should have died, letting a fresh, still-incomplete
+# repetition's later position get wrongly treated as accepting once it
+# happened to consume enough bytes to independently satisfy the {m,n} again
+# — reporting a match that extends past the correct (higher-priority,
+# earlier) leftmost-first answer.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+TDFANativeAnchoredRangeQuantifierPriority
+strings
+""
+"aaa"
+"aaaa"
+"aaaaa"
+"aaaaaa"
+"aaaaaaa"
+"aaaaaaaa"
+"aaaaaaaaa"
+"aaaaaaaaaa"
+regexps
+"^(?:(a){3,4})*"
+0-0 -;0-0;-;-
+0-3 2-3;0-3;-;-
+0-4 3-4;0-4;-;-
+0-4 3-4;0-4;-;-
+0-4 3-4;0-4;-;-
+0-7 6-7;0-7;-;-
+0-8 7-8;0-8;-;-
+0-8 7-8;0-8;-;-
+0-8 7-8;0-8;-;-

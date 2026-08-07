@@ -172,8 +172,8 @@ func loopCaptureLocals(prog *syntax.Prog, loopPC int) []uint32 {
 	return locals
 }
 
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
-	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int) []byte {
+	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -182,7 +182,13 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // The caller (wrapper) has already located the match extent via find_internal and
 // passes a bounded slice (ptr=match_start, len=match_length). This function runs
 // Phase 2 NFA only — no Phase 1 DFA traversal.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
+//
+// nativeAnchored is true when this captureBody is exported directly as the
+// pattern's groups function (compiledPattern.anchored, isAnchoredFind) instead
+// of being composed behind a find wrapper — in that case len is the caller's
+// full input length, not a DFA-narrowed match extent (see engine_tdfa.go's
+// identically-named parameter for the TDFA-side counterpart of this fix).
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 	numCaps := bt.numGroups
@@ -409,7 +415,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nil, nil, tableMemIdx)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -445,6 +451,7 @@ func emitBTInstHandler(
 	memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte uint32,
 	useMemo bool,
 	noCaptures bool,
+	nativeAnchored bool,
 	instMatchFn func([]byte, uint32) []byte,
 	overflowFn func([]byte) []byte,
 	tableMemIdx int,
@@ -708,14 +715,23 @@ func emitBTInstHandler(
 			body = instMatchFn(body, brRunNested)
 			break
 		}
-		// RE2 semantics: only accept if the full input slice is consumed.
-		// The caller sets len = DFA-determined end, so pos must equal len.
-		body = append(body, 0x20, localPos)
-		body = append(body, 0x20, localLen)
-		body = append(body, 0x47)       // i32.ne
-		body = append(body, 0x04, 0x40) // if void
-		body = btFail(body, brRunNested)
-		body = append(body, 0x0B) // end if
+		if !nativeAnchored {
+			// RE2 semantics: only accept if the full input slice is consumed.
+			// The caller sets len = DFA-determined end, so pos must equal len.
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x20, localLen)
+			body = append(body, 0x47)       // i32.ne
+			body = append(body, 0x04, 0x40) // if void
+			body = btFail(body, brRunNested)
+			body = append(body, 0x0B) // end if
+		}
+		// nativeAnchored: len is the caller's full, un-narrowed input length
+		// (no independent find pass has bounded it), so InstMatch must accept
+		// unconditionally here — any $/\z the pattern actually has was already
+		// enforced by the EmptyEndText/EmptyEndLine handlers earlier in this
+		// derivation, and BT's stack always explores the highest-priority
+		// (leftmost-first) derivation first, so the first InstMatch reached is
+		// the correct answer regardless of how much input remains unconsumed.
 
 		// Write captures to out_ptr and return pos.
 		// Group 0: start = 0 (anchored), end = pos.
@@ -1401,6 +1417,7 @@ func buildBTInnerDisp(
 			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
 			useMemo,
 			true,
+			false,
 			instMatchFn,
 			overflowFn,
 			tableMemIdx,
