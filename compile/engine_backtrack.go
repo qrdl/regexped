@@ -1506,8 +1506,16 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	body = append(body, 0x03, 0x40)
 
 	failEmpty := func(b []byte) []byte { return append(b, 0x41, 0x7F, 0x0F) } // i32.const -1; return
-	// matchFn: LF semantics — accept at first InstMatch, return pos.
-	matchFn := func(b []byte, _ uint32) []byte {
+	// matchFn: RE2 semantics — match_func requires full-input consumption,
+	// so only accept an InstMatch reached with pos == len; otherwise keep
+	// backtracking for a derivation that does consume the whole input.
+	matchFn := func(b []byte, brDepth uint32) []byte {
+		b = append(b, 0x20, localPos)
+		b = append(b, 0x20, localLen)
+		b = append(b, 0x47)       // i32.ne
+		b = append(b, 0x04, 0x40) // if void
+		b = btFail(b, brDepth)
+		b = append(b, 0x0B)                 // end if
 		b = append(b, 0x20, localPos, 0x0F) // local.get pos; return
 		return b
 	}
