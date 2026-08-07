@@ -55,7 +55,7 @@ func main() {
 	maxErrors := flag.Int("max-errors", 100, "stop after this many failures (0 = unlimited)")
 	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors, skips WASM testing)")
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
-	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find (sets MaxDFAStates=1 so DFA always overflows to BT)")
+	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find/groups (sets MaxDFAStates=-1 so DFA/TDFA always overflow to BT)")
 	setsMode := flag.Bool("sets", false, "test set find_all: compile each regexps block as a set and verify all matches against col4/col1 expected results")
 	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
 	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
@@ -220,31 +220,31 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				continue
 			}
 
-			var engineType compile.EngineType
-			if forceBacktrack {
-				engineType = compile.EngineBacktrack
-			} else {
-				selOpts := compile.CompileOptions{MaxDFAStates: maxDFAStates}
-				var selErr error
-				engineType, selErr = compile.SelectEngine(pattern, selOpts)
-				if selErr != nil {
-					errStr := selErr.Error()
-					reason := skipParseError
-					switch {
-					case strings.Contains(errStr, "Unicode"):
-						reason = skipUnicode
-					case strings.Contains(errStr, "invalid escape sequence"):
-						reason = skipBadSyntax
-					}
-					skipCount[reason] += len(testStrings)
-					input = append([]string(nil), testStrings...)
-					continue
+			// Always determine the naturally-selected engine, even under
+			// --force-backtrack: it's still needed to decide whether this
+			// pattern has genuinely-reachable capture groups (drives the
+			// groupsFn/matchFn dispatch below) and for the passed-test engine
+			// accounting further down. The actual compiled engine is forced
+			// separately, via compileOpts below.
+			selOpts := compile.CompileOptions{MaxDFAStates: maxDFAStates}
+			engineType, selErr := compile.SelectEngine(pattern, selOpts)
+			if selErr != nil {
+				errStr := selErr.Error()
+				reason := skipParseError
+				switch {
+				case strings.Contains(errStr, "Unicode"):
+					reason = skipUnicode
+				case strings.Contains(errStr, "invalid escape sequence"):
+					reason = skipBadSyntax
 				}
-				if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineBacktrack && engineType != compile.EngineTDFA {
-					skipCount["requires "+engineType.String()] += len(testStrings)
-					input = append([]string(nil), testStrings...)
-					continue
-				}
+				skipCount[reason] += len(testStrings)
+				input = append([]string(nil), testStrings...)
+				continue
+			}
+			if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineBacktrack && engineType != compile.EngineTDFA {
+				skipCount["requires "+engineType.String()] += len(testStrings)
+				input = append([]string(nil), testStrings...)
+				continue
 			}
 
 			// Compile a single standalone WASM module containing all functions.
@@ -263,12 +263,28 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				re.MatchFunc = "match"
 				re.FindFunc = "find"
 			}
-			if patternHasCaptures || (!forceBacktrack && (engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA)) {
+			if patternHasCaptures || engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA {
 				re.GroupsFunc = "groups"
 			}
 			var compileOpts compile.CompileOptions
+			var forceGroupsEngine compile.EngineType
 			if forceBacktrack {
-				compileOpts.ForceEngine = compile.EngineBacktrack
+				// Captures: force the groups engine for real, via
+				// CompileForced's forceGroupsEngine parameter (compile.go's
+				// compilePattern reads this directly to override
+				// selectBestEngine's TDFA-vs-Backtrack choice — no size
+				// limits involved).
+				forceGroupsEngine = compile.EngineBacktrack
+				// Match/find: there is no engine-selection axis to force —
+				// compilePattern's needMatch/needFindBody paths are always
+				// DFA, with Backtracking only as an overflow fallback when
+				// the DFA exceeds MaxDFAStates/MaxDFAMemory. MaxDFAStates: -1
+				// is the documented, tested way to make that fallback trigger
+				// unconditionally (resolveMaxDFAStates treats negative as 0,
+				// so any real DFA "overflows"; see compile_test.go's
+				// match_dfa_overflow/find_dfa_overflow cases for the same
+				// mechanism in production tests).
+				compileOpts.MaxDFAStates = -1
 			}
 			if likelyMatch {
 				compileOpts.LikelyMode = compile.LikelyMatch
@@ -276,7 +292,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			if likelyNoMatch {
 				compileOpts.LikelyMode = compile.LikelyNoMatch
 			}
-			wasmBytes, _, compErr := compile.Compile([]config.RegexEntry{re}, tableBase, true, compileOpts)
+			wasmBytes, _, compErr := compile.CompileForced([]config.RegexEntry{re}, tableBase, true, forceGroupsEngine, compileOpts)
 			if compErr != nil {
 				errStr := compErr.Error()
 				reason := skipOther
@@ -311,7 +327,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				groupsFn = inst.GetFunc(store, "groups")
 				groupsStore = store
 				groupsMemory = memory
-				groupsIsBacktrack = (engineType == compile.EngineBacktrack)
+				groupsIsBacktrack = forceBacktrack || (engineType == compile.EngineBacktrack)
 				if p2, p2Err := syntax.Parse(pattern, syntax.Perl); p2Err == nil {
 					numGroups = p2.MaxCap() + 1
 				}

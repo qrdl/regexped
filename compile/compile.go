@@ -1627,6 +1627,27 @@ func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool, use
 	return compileAll(patterns, tableBase, standalone, 0, opts)
 }
 
+// CompileForced is like Compile, but overrides engine selection for the
+// capture path (groups_func / named_groups_func) of every pattern that
+// requests one, forcing forceGroupsEngine (EngineTDFA or EngineBacktrack)
+// instead of letting selectBestEngine choose. Pass 0 for forceGroupsEngine
+// to get ordinary auto-selection (equivalent to Compile).
+//
+// This has no effect on match_func/find_func: those have no independent
+// engine-selection axis (always DFA, with Backtracking only as an overflow
+// fallback when the DFA exceeds CompileOptions.MaxDFAStates/MaxDFAMemory —
+// see the MaxDFAStates doc comment for forcing that path instead). It also
+// has no effect on capture-path patterns that hit one of compilePattern's
+// literal-chain fast paths (analyseLitChainGroupsRange and friends), which
+// bypass selectBestEngine entirely.
+func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, userOpts ...CompileOptions) ([]byte, int64, error) {
+	var opts CompileOptions
+	if len(userOpts) > 0 {
+		opts = userOpts[0]
+	}
+	return compileAll(patterns, tableBase, standalone, forceGroupsEngine, opts)
+}
+
 func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, error) {
 	if !standalone {
 		opts.tableMemIdx = 1

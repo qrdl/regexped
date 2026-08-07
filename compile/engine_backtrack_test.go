@@ -114,12 +114,12 @@ func TestBtCheckRune1FoldDirect(t *testing.T) {
 
 func TestBtCheckRune1CaseFold(t *testing.T) {
 	// (?i:a) compiled with BT engine exercises btCheckRune1 with isFold=true.
-	_, _, err := compileForced(
+	_, _, err := CompileForced(
 		[]config.RegexEntry{{Pattern: "(?i:a)", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced((?i:a) BT): %v", err)
+		t.Fatalf("CompileForced((?i:a) BT): %v", err)
 	}
 }
 

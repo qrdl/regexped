@@ -11,15 +11,6 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// compileForced is like Compile but forces the given engine for the capture path
-// of every entry that requests capture groups. Used in tests only.
-func compileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, userOpts ...CompileOptions) ([]byte, int64, error) {
-	var opts CompileOptions
-	if len(userOpts) > 0 {
-		opts = userOpts[0]
-	}
-	return compileAll(patterns, tableBase, standalone, forceGroupsEngine, opts)
-}
 
 func parseTestRe(t *testing.T, pattern string) *syntax.Regexp {
 	t.Helper()
@@ -177,21 +168,21 @@ func TestCompileIntegrationTDFA(t *testing.T) {
 
 func TestCompileIntegrationBacktrack(t *testing.T) {
 	t.Run("groups_forced", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT groups): %v", err)
+			t.Fatalf("CompileForced(BT groups): %v", err)
 		}
 	})
 	t.Run("named_groups_forced", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", NamedGroupsFunc: "ng"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT named_groups): %v", err)
+			t.Fatalf("CompileForced(BT named_groups): %v", err)
 		}
 	})
 	t.Run("natural_bt_nongreedy", func(t *testing.T) {
@@ -205,32 +196,32 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	})
 	// btCheckRuneRanges: char-class range in backtracking engine.
 	t.Run("bt_char_range", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "([a-z]+)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT char range): %v", err)
+			t.Fatalf("CompileForced(BT char range): %v", err)
 		}
 	})
 	// btWordBoundary: word-boundary assertion in backtracking engine.
 	t.Run("bt_word_boundary", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: `(\bfoo\b)`, GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT word boundary): %v", err)
+			t.Fatalf("CompileForced(BT word boundary): %v", err)
 		}
 	})
 	// btFoldRune: case-insensitive single-character match in backtracking engine.
 	t.Run("bt_case_fold_char", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "((?i:a)+)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT case-fold): %v", err)
+			t.Fatalf("CompileForced(BT case-fold): %v", err)
 		}
 	})
 	// buildBTScanTables: BT find mode (no-capture find path).
@@ -616,31 +607,31 @@ func TestCompileDFADataSegmentsNewlineBoundary(t *testing.T) {
 // TestCompileBTInstHandlerAnyRune exercises InstRuneAny and InstRuneAnyNotNL
 // in emitBTInstHandler. (?s:.+) uses InstRuneAny (DOTALL), .+ uses InstRuneAnyNotNL.
 func TestCompileBTInstHandlerAnyRune(t *testing.T) {
-	_, _, err := compileForced(
+	_, _, err := CompileForced(
 		[]config.RegexEntry{{Pattern: "(?s:.+)", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced((?s:.+) BT): %v", err)
+		t.Fatalf("CompileForced((?s:.+) BT): %v", err)
 	}
-	_, _, err = compileForced(
+	_, _, err = CompileForced(
 		[]config.RegexEntry{{Pattern: ".+", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced(.+ BT): %v", err)
+		t.Fatalf("CompileForced(.+ BT): %v", err)
 	}
 }
 
 // TestCompileBTInstHandlerNonLoopAlt exercises the non-loop alternation path
 // (btPushFrame) in emitBTInstHandler. (a|b) has an Alt that is not a loop.
 func TestCompileBTInstHandlerNonLoopAlt(t *testing.T) {
-	_, _, err := compileForced(
+	_, _, err := CompileForced(
 		[]config.RegexEntry{{Pattern: "(a|b)", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced((a|b) BT): %v", err)
+		t.Fatalf("CompileForced((a|b) BT): %v", err)
 	}
 }
 
@@ -754,12 +745,12 @@ func TestCompileEmbeddedFindPaths(t *testing.T) {
 // TestCompileEmbeddedBTMatch exercises appendTableStore32/Load32 with tableMemIdx=1
 // in the BT match (groups) path when compiled in embedded mode.
 func TestCompileEmbeddedBTMatch(t *testing.T) {
-	wasm, _, err := compileForced(
+	wasm, _, err := CompileForced(
 		[]config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}},
 		0, false, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced(embedded BT match): %v", err)
+		t.Fatalf("CompileForced(embedded BT match): %v", err)
 	}
 	if !bytes.HasPrefix(wasm, wasmMagic) {
 		t.Fatal("output is not a valid WASM module")
@@ -803,12 +794,12 @@ func TestCompileBTInstHandlerEmptyWidth(t *testing.T) {
 // loopCaptureLocals finds that capture, setting loopSnapBase. On zero-progress
 // (a? matches empty) the snapshot is restored.
 func TestCompileBTLoopCaptureSnapshot(t *testing.T) {
-	_, _, err := compileForced(
+	_, _, err := CompileForced(
 		[]config.RegexEntry{{Pattern: "((a?)+)", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced(((a?)+) BT): %v", err)
+		t.Fatalf("CompileForced(((a?)+) BT): %v", err)
 	}
 }
 
@@ -818,23 +809,23 @@ func TestCompileBTLoopBodyCanMatchEmpty(t *testing.T) {
 	// ((a|b)+?): inner alternation causes both 'a' and 'b' paths to enqueue the
 	// same merge-point PC, triggering the visited-cache path in loopBodyCanMatchEmpty.
 	t.Run("visited_cache", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "((a|b)+?)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(((a|b)+?) BT): %v", err)
+			t.Fatalf("CompileForced(((a|b)+?) BT): %v", err)
 		}
 	})
 	// ((a)+?): non-greedy + loop whose body contains an InstCapture instruction,
 	// which hits the default case in loopBodyCanMatchEmpty's switch.
 	t.Run("default_case", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "((a)+?)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(((a)+?) BT): %v", err)
+			t.Fatalf("CompileForced(((a)+?) BT): %v", err)
 		}
 	})
 }
