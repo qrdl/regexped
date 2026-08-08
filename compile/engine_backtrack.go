@@ -19,6 +19,12 @@ type backtrack struct {
 	loops         map[int]bool // set of InstAlt PCs that are genuine loop heads
 	nonGreedyLoop map[int]bool // loops[pc] subset: true if the loop body is inst.Arg (non-greedy)
 	idom          []int        // immediate-dominator PC per PC, from computeDominators
+
+	// emptyBodyGreedyLoop is the loops[] subset of greedy loops whose body can
+	// complete with zero width, e.g. the outer `*` in (?:a*|b*)*. See
+	// emitBTInstHandler's InstAlt case for why these need different
+	// zero-progress handling than every other loop.
+	emptyBodyGreedyLoop map[int]bool
 }
 
 func (b *backtrack) Type() EngineType { return EngineBacktrack }
@@ -27,11 +33,12 @@ func (b *backtrack) Type() EngineType { return EngineBacktrack }
 func newBacktrack(prog *syntax.Prog) *backtrack {
 	idom := computeDominators(prog)
 	bt := &backtrack{
-		prog:          prog,
-		numGroups:     prog.NumCap / 2,
-		loops:         make(map[int]bool),
-		nonGreedyLoop: make(map[int]bool),
-		idom:          idom,
+		prog:                prog,
+		numGroups:           prog.NumCap / 2,
+		loops:               make(map[int]bool),
+		nonGreedyLoop:       make(map[int]bool),
+		idom:                idom,
+		emptyBodyGreedyLoop: make(map[int]bool),
 	}
 	for pc, inst := range prog.Inst {
 		if inst.Op == syntax.InstAlt {
@@ -39,6 +46,9 @@ func newBacktrack(prog *syntax.Prog) *backtrack {
 			if bodyPC, _, isLoop := altLoopBody(prog, idom, pc); isLoop {
 				bt.loops[pc] = true
 				bt.nonGreedyLoop[pc] = bodyPC == int(inst.Arg)
+				if !bt.nonGreedyLoop[pc] && loopBodyCanMatchEmpty(prog, idom, pc) {
+					bt.emptyBodyGreedyLoop[pc] = true
+				}
 			}
 		}
 	}
@@ -591,7 +601,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, -1)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -631,6 +641,7 @@ func emitBTInstHandler(
 	instMatchFn func([]byte, uint32) []byte,
 	overflowFn func([]byte, uint32) []byte,
 	tableMemIdx int,
+	attemptStartLocal int32,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
@@ -742,9 +753,19 @@ func emitBTInstHandler(
 			// bt.nonGreedyLoop[p] was determined in newBacktrack via altLoopBody
 			// (an actual reachability check), not by comparing PC numbers.
 			// In both cases: preferred=inst.Out, retry=inst.Arg.
-			// Zero-progress: if pos == loop_pos_local, take the EXIT branch directly.
-			// Without this guard, non-greedy loops with zero-matchable bodies would
-			// take the body again and loop infinitely.
+			// Zero-progress: if pos == loop_pos_local, the preferred branch (Out)
+			// matched zero bytes and retrying it would loop forever.
+			restoreLoopSnap := func(b []byte) []byte {
+				if snapBase, ok := loopSnapBase[p]; ok {
+					for k, capLocal := range loopSnapLocals[p] {
+						b = append(b, 0x20)
+						b = utils.AppendULEB128(b, snapBase+uint32(k))
+						b = append(b, 0x21)
+						b = utils.AppendULEB128(b, capLocal)
+					}
+				}
+				return b
+			}
 
 			// if pos == loop_pos_local: take exit branch
 			body = append(body, 0x20, localPos)
@@ -752,22 +773,66 @@ func emitBTInstHandler(
 			body = utils.AppendULEB128(body, loopLocal)
 			body = append(body, 0x46)       // i32.eq
 			body = append(body, 0x04, 0x40) // if void
-			// Restore only the specific cap locals snapshotted for this loop.
-			if snapBase, ok := loopSnapBase[p]; ok {
-				for k, capLocal := range loopSnapLocals[p] {
-					body = append(body, 0x20)
-					body = utils.AppendULEB128(body, snapBase+uint32(k))
-					body = append(body, 0x21)
-					body = utils.AppendULEB128(body, capLocal)
-				}
-			}
-			// Exit = Arg for greedy loops, Out for non-greedy.
-			exitPC := inst.Arg
 			if bt.nonGreedyLoop[p] {
-				exitPC = inst.Out
+				// Exit is Out, which is never pushed as a retry candidate (only
+				// Arg=body is) — nothing to pop back to, branch directly.
+				body = restoreLoopSnap(body)
+				body = btSetStateAndBr(body, int32(inst.Out), brRunNested)
+			} else if bt.emptyBodyGreedyLoop[p] {
+				// Greedy loop whose body can match empty (e.g. the outer `*`
+				// in (?:a*|b*)*). Go stdlib's actual leftmost-first answer
+				// here depends on whether this specific attempt has made any
+				// real forward progress at all: compare the current position
+				// to attempt_start, the position where this top-level search
+				// attempt began (a constant 0 for match/groups bodies, since
+				// those always run from the start of their input slice; the
+				// find engine's own attempt_start local otherwise).
+				//
+				//   - pos == attempt_start (no bytes consumed by this attempt
+				//     at all yet): the loop's own exit legitimately wins
+				//     outright — branch directly, same as the non-greedy
+				//     case. Confirmed against the compiled syntax.Prog and
+				//     Go's actual output, not assumed: Go's compiler emits a
+				//     separate instruction for a loop's true first entry vs.
+				//     its later loop-back re-entries, and that split happens
+				//     to encode exactly this priority.
+				//   - pos != attempt_start (real progress happened at some
+				//     point during this attempt, even though *this*
+				//     iteration was zero-width): fail into the normal
+				//     backtrack-stack pop instead of exiting directly, so a
+				//     still-pending sibling alternative from within this same
+				//     doomed attempt (e.g. the "b*" side, pushed by the inner
+				//     non-loop alternation just before "a*" ran) gets tried
+				//     before the loop gives up. Branching straight to exit
+				//     here discarded that candidate, so `find` on inputs
+				//     like "aaab" stopped one byte early instead of
+				//     switching branches to consume the rest. btFail's own
+				//     restore already recovers captures from whichever frame
+				//     it lands on, so no manual snapshot restore is needed
+				//     on this path.
+				body = append(body, 0x20, localPos)
+				if attemptStartLocal < 0 {
+					body = append(body, 0x41, 0x00) // i32.const 0
+				} else {
+					body = append(body, 0x20)
+					body = utils.AppendULEB128(body, uint32(attemptStartLocal))
+				}
+				body = append(body, 0x46)       // i32.eq
+				body = append(body, 0x04, 0x40) // if void
+				body = restoreLoopSnap(body)
+				body = btSetStateAndBr(body, int32(inst.Arg), brRunNested+1)
+				body = append(body, 0x05) // else
+				body = btFail(body, brRunNested+1)
+				body = append(body, 0x0B) // end if (pos == attempt_start)
+			} else {
+				// Greedy loop whose body can never match empty: this branch
+				// can't actually be reached (every completed iteration
+				// consumed ≥1 byte, so pos always differs from loop_local),
+				// kept for structural symmetry with the general case.
+				body = restoreLoopSnap(body)
+				body = btSetStateAndBr(body, int32(inst.Arg), brRunNested)
 			}
-			body = btSetStateAndBr(body, int32(exitPC), brRunNested)
-			body = append(body, 0x0B) // end if
+			body = append(body, 0x0B) // end if (pos == loop_local)
 
 			// Progress: update loop_pos_local = pos
 			body = append(body, 0x20, localPos)
@@ -1539,6 +1604,7 @@ func buildBTInnerDisp(
 	instMatchFn func([]byte, uint32) []byte,
 	overflowFn func([]byte, uint32) []byte,
 	tableMemIdx int,
+	attemptStartLocal int32,
 ) []byte {
 	numCapLocals := 0
 	prog := bt.prog
@@ -1597,6 +1663,7 @@ func buildBTInnerDisp(
 			instMatchFn,
 			overflowFn,
 			tableMemIdx,
+			attemptStartLocal,
 		)
 	}
 	return body
@@ -1699,7 +1766,7 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	body = buildBTInnerDisp(body, bt, loopLocalIdx,
 		stackBase, stackLimit, frameSize,
 		memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
-		useMemo, failEmpty, matchFn, nil, tableMemIdx)
+		useMemo, failEmpty, matchFn, nil, tableMemIdx, -1)
 
 	body = append(body, 0x00)       // unreachable
 	body = append(body, 0x0B)       // end loop $run
@@ -2037,7 +2104,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = buildBTInnerDisp(body, bt, loopLocalIdx,
 			stackBase, stackLimit, frameSize,
 			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
-			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx)
+			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx, int32(locAttemptStart))
 		body = append(body, 0x00) // unreachable
 		body = append(body, 0x0B) // end loop $run
 		body = append(body, 0x0B) // end block $run_exit
@@ -2109,7 +2176,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		b = buildBTInnerDisp(b, bt, loopLocalIdx,
 			stackBase, stackLimit, frameSize,
 			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
-			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx)
+			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx, int32(locAttemptStart))
 
 		b = append(b, 0x00) // unreachable
 		b = append(b, 0x0B) // end loop $run

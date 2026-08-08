@@ -2594,3 +2594,44 @@ regexps
 -;-;-;-;-;-
 -;-;-;-;-;-
 0-5 2-5;0-5;-;-;-;0-5 2-5
+# ============================================================
+# Category (Backtracking greedy-loop zero-progress guard, FUZZER_BUGS.md
+# §20) — (?:a*|b*)*'s outer greedy loop has a body that can match empty via
+# EITHER alternative branch. When the higher-priority branch (a*) completes
+# a repeat attempt with zero width after at least one earlier iteration made
+# real progress, the old zero-progress guard branched straight to the
+# loop's exit, discarding the still-pending, higher-priority sibling
+# alternative (b*) that was pushed onto the backtrack stack for that same
+# iteration attempt. Fixed: the guard now fails into the normal
+# backtrack-stack pop (btFail) instead of a direct branch for greedy loops,
+# so that pending sibling is tried before the loop actually gives up.
+# No captures, so this pattern normally compiles to plain DFA; only
+# --force-backtrack exercises the fixed code path. All expected values
+# cross-checked against Go stdlib regexp (find = non-anchored
+# FindStringIndex; col0 = \A(?:PATTERN)\z, i.e. full-consumption anchored
+# match, matchFn's actual contract).
+# ============================================================
+BacktrackGreedyLoopAltZeroProgress
+strings
+""
+"a"
+"b"
+"ab"
+"ba"
+"aaab"
+"aabaaab"
+"bab"
+"aab"
+"abab"
+regexps
+"(?:a*|b*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+0-1;0-0;-;-
+0-2;0-2;-;-
+0-2;0-0;-;-
+0-4;0-4;-;-
+0-7;0-7;-;-
+0-3;0-0;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
