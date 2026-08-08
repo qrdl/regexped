@@ -828,7 +828,7 @@ func emitBTInstHandler(
 			body = append(body, 0x41, 0x0A)       // i32.const '\n'
 			body = append(body, 0x47)             // i32.ne
 			body = append(body, 0x04, 0x40)       // if void (prev != '\n'): fail
-			body = btFail(body, brRunNested)
+			body = btFail(body, brRunNested+1)    // +1: nested inside the outer if/else too
 			body = append(body, 0x0B) // end if prev != '\n'
 			body = append(body, 0x0B) // end if pos == 0
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
@@ -858,7 +858,7 @@ func emitBTInstHandler(
 			body = append(body, 0x41, 0x0A)       // i32.const '\n'
 			body = append(body, 0x47)             // i32.ne
 			body = append(body, 0x04, 0x40)       // if void (next != '\n'): fail
-			body = btFail(body, brRunNested)
+			body = btFail(body, brRunNested+1)    // +1: nested inside the outer if/else too
 			body = append(body, 0x0B) // end if next != '\n'
 			body = append(body, 0x0B) // end if pos == len
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)

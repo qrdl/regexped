@@ -2554,3 +2554,43 @@ regexps
 -;3-3;-;-
 0-3;0-3;-;-
 -;4-4;-;-
+# ============================================================
+# Category (Backtracking EmptyBeginLine/EmptyEndLine br-depth escape,
+# FUZZER_BUGS.md §19) — emitBTInstHandler's (?m:^)/(?m:$) cases nest
+# btFail's br two if-blocks deep (outer if/else, then a nested if for the
+# actual prev/next-byte check) but only escaped one level's worth of depth
+# (brRunNested = one-if-deep, not two). Under-escaping by exactly one level
+# lands the "fail" branch at the WASM state-dispatcher's very last handler
+# slot (InstMatch) instead of back at the loop restart -- so a correctly
+# detected assertion failure was silently converted into an immediate
+# accept at the current pos. Fixed: btFail(brRunNested+1) in both cases.
+# These patterns force Backtrack naturally (hasLineAnchors gate), no
+# --force-backtrack needed. All expected values cross-checked against Go
+# stdlib regexp.
+# ============================================================
+BacktrackEmptyLineBrDepth
+strings
+"foobar"
+"foo"
+"foo\nbar"
+"xbar"
+"x\nbar"
+regexps
+"^(?m:(foo)$)"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+0-3 0-3;0-3;-;-;-;0-3 0-3
+-;-;-;-;-;-
+-;-;-;-;-;-
+"^x(?m:^(bar))"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+"^x\\n(?m:^(bar))"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+0-5 2-5;0-5;-;-;-;0-5 2-5
