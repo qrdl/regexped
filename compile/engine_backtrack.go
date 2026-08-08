@@ -453,7 +453,7 @@ func emitBTInstHandler(
 	noCaptures bool,
 	nativeAnchored bool,
 	instMatchFn func([]byte, uint32) []byte,
-	overflowFn func([]byte) []byte,
+	overflowFn func([]byte, uint32) []byte,
 	tableMemIdx int,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
@@ -496,7 +496,7 @@ func emitBTInstHandler(
 		isLoop := bt.loops[p]
 		if !isLoop {
 			// Non-loop alternation: push retry=inst.Arg, continue with inst.Out
-			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, overflowFn, tableMemIdx)
+			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 		} else {
 			// Loop alternation: zero-progress guard
@@ -609,7 +609,7 @@ func emitBTInstHandler(
 			}
 
 			// Push retry=inst.Arg, continue with inst.Out
-			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, overflowFn, tableMemIdx)
+			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 		}
 
@@ -952,7 +952,7 @@ func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 // btPushFrame pushes a backtrack frame. stackLimit and frameSize are passed
 // so we can guard against stack overflow: if sp+frameSize > stackLimit, set
 // state=-1 (fail) and return instead of writing past allocated memory.
-func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSize int32, overflowFn func([]byte) []byte, tableMemIdx int) []byte {
+func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSize int32, brDepth uint32, overflowFn func([]byte, uint32) []byte, tableMemIdx int) []byte {
 	// Guard: if sp + frameSize > stackLimit → fail (treat as no-match).
 	b = append(b, 0x20, localSP)
 	b = append(b, 0x41)
@@ -963,7 +963,7 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSi
 	b = append(b, 0x4B)       // i32.gt_u
 	b = append(b, 0x04, 0x40) // if void
 	if overflowFn != nil {
-		b = overflowFn(b)
+		b = overflowFn(b, brDepth)
 	} else {
 		b = append(b, 0x41, 0x7F) // i32.const -1
 		b = append(b, 0x0F)       // return
@@ -1088,7 +1088,7 @@ func emitIsWordCharFromScratch(b []byte) []byte {
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('z'))
-	b = append(b, 0x4E)       // i32.le_u
+	b = append(b, 0x4D)       // i32.le_u
 	b = append(b, 0x71)       // i32.and
 	b = append(b, 0x04, 0x40) // if void
 	b = append(b, 0x41, 0x01) // i32.const 1
@@ -1103,7 +1103,7 @@ func emitIsWordCharFromScratch(b []byte) []byte {
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('Z'))
-	b = append(b, 0x4E)
+	b = append(b, 0x4D) // i32.le_u
 	b = append(b, 0x71)
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x41, 0x01)
@@ -1118,7 +1118,7 @@ func emitIsWordCharFromScratch(b []byte) []byte {
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('9'))
-	b = append(b, 0x4E)
+	b = append(b, 0x4D) // i32.le_u
 	b = append(b, 0x71)
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x41, 0x01)
@@ -1361,7 +1361,7 @@ func buildBTInnerDisp(
 	useMemo bool,
 	failEmptyStack func([]byte) []byte,
 	instMatchFn func([]byte, uint32) []byte,
-	overflowFn func([]byte) []byte,
+	overflowFn func([]byte, uint32) []byte,
 	tableMemIdx int,
 ) []byte {
 	numCapLocals := 0
@@ -1845,10 +1845,16 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			bb = append(bb, 0x0F) // return
 			return bb
 		}
-		overflowFind := func(bb []byte) []byte {
-			bb = append(bb, 0x42, 0x7F) // i64.const -1
-			bb = append(bb, 0x0F)
-			return bb
+		// Stack overflow: abandon this attempt_start entirely (branch straight
+		// out to $run_exit) rather than aborting the whole find. A "treat like
+		// any other failed alternative" pop-and-retry was tried first but can
+		// oscillate forever right at the stack ceiling for nested nullable-loop
+		// patterns backtracking through a mismatch — this exit is bounded by
+		// construction (at most one stack-fill per attempt) since it can never
+		// be re-entered from within the same attempt.
+		overflowFind := func(bb []byte, brDepth uint32) []byte {
+			bb = append(bb, 0x0C) // br
+			return utils.AppendULEB128(bb, brDepth+1)
 		}
 		body = append(body, 0x02, 0x40) // block $run_exit
 		body = append(body, 0x03, 0x40) // loop $run
@@ -1917,10 +1923,12 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			return bb
 		}
 
-		overflowFind := func(bb []byte) []byte {
-			bb = append(bb, 0x42, 0x7F) // i64.const -1
-			bb = append(bb, 0x0F)       // return
-			return bb
+		// Stack overflow: abandon this attempt_start entirely — see the
+		// mandLit branch's identical comment above for why (bounded vs. a
+		// pop-and-retry that can oscillate forever at the stack ceiling).
+		overflowFind := func(bb []byte, brDepth uint32) []byte {
+			bb = append(bb, 0x0C) // br
+			return utils.AppendULEB128(bb, brDepth+1)
 		}
 		b = buildBTInnerDisp(b, bt, loopLocalIdx,
 			stackBase, stackLimit, frameSize,

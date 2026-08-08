@@ -2479,3 +2479,78 @@ regexps
 0-8 7-8;0-8;-;-
 0-8 7-8;0-8;-;-
 0-8 7-8;0-8;-;-
+# ============================================================
+# Category (no-capture Backtracking find, FUZZER_BUGS.md §17) —
+# these patterns naturally select Compiled DFA (unaffected); the two bugs
+# below only ever fire under --force-backtrack, which overflows the DFA
+# and routes match/find through buildBTMatchBody/buildBTFindBody's
+# no-capture fallback. Kept here anyway (not force-backtrack-only) so the
+# rows also exercise the normal DFA path as a control.
+#
+# (a) emitIsWordCharFromScratch (engine_backtrack.go) appended opcode 0x4E
+#     for the upper-bound half of each [a-z]/[A-Z]/[0-9] range check,
+#     believing it to be i32.le_u — it is actually i32.ge_s (le_u is 0x4D).
+#     byte>=lower AND byte>=upper collapses to "byte>=upper", so isWordChar
+#     misclassified almost every byte in each range as non-word (only the
+#     exact top-of-range byte, or falling through to a later range, ever
+#     passed). Fixed: 0x4E -> 0x4D at the three upper-bound checks.
+# (b) buildBTFindBody's per-Alt zero-progress loop guard (a single shared
+#     "last seen pos" local per loop-Alt PC, reset once per attempt_start)
+#     gets corrupted by backtracking through nested nullable loops (e.g.
+#     `(?:a?)+`): a later stack-pop can re-enter a loop head at a pos the
+#     guard already associates with a *different* branch of the search,
+#     letting the pc2<->pc3 cycle regrow every time it's revisited instead
+#     of being cut off — stack usage climbs without bound until the
+#     overflow guard's unconditional "return -1" abandoned the whole find,
+#     not just the doomed attempt_start (visible whenever a genuine match
+#     exists only at a *later* attempt_start than the one that runs into
+#     this). Fixed: on overflow, abandon just this attempt_start (branch to
+#     $run_exit) instead of returning -1 from the whole function — bounded
+#     by construction, unlike an earlier "treat like any failed
+#     alternative" attempt which could oscillate forever at the stack
+#     ceiling.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+BacktrackNoCaptureWordBoundary
+strings
+"0"
+""
+"ab"
+" a"
+"m"
+"!"
+regexps
+"\\B"
+-;-;-;-
+0-0;0-0;-;-
+-;1-1;-;-
+-;0-0;-;-
+-;-;-;-
+-;0-0;-;-
+"\\b"
+-;0-0;-;-
+-;-;-;-
+-;0-0;-;-
+-;1-1;-;-
+-;0-0;-;-
+-;-;-;-
+BacktrackNoCaptureLoopGuardOverflow
+strings
+""
+"a"
+"b"
+"ab"
+"aa"
+"aab"
+"aaa"
+"aaab"
+regexps
+"(?:a?)+$"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;1-1;-;-
+-;2-2;-;-
+0-2;0-2;-;-
+-;3-3;-;-
+0-3;0-3;-;-
+-;4-4;-;-
