@@ -134,7 +134,7 @@ func TestLoopCaptureLocals(t *testing.T) {
 		}
 		foundCapture := false
 		for pc := range bt.loops {
-			locals := loopCaptureLocals(prog, pc)
+			locals := loopCaptureLocals(prog, bt.idom, pc)
 			if len(locals) > 0 {
 				foundCapture = true
 			}
@@ -149,7 +149,7 @@ func TestLoopCaptureLocals(t *testing.T) {
 		prog := compileBTTestProg(t, "(?:a)+")
 		bt := newBacktrack(prog)
 		for pc := range bt.loops {
-			locals := loopCaptureLocals(prog, pc)
+			locals := loopCaptureLocals(prog, bt.idom, pc)
 			if len(locals) != 0 {
 				t.Errorf("loopCaptureLocals: expected nil for (?:a)+, got %v", locals)
 			}

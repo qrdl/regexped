@@ -13,32 +13,205 @@ import (
 // backtrack is a compiled backtracking NFA.
 // It handles capture patterns that cannot be processed by TDFA.
 type backtrack struct {
-	prog      *syntax.Prog
-	numGroups int          // prog.NumCap / 2 (includes group 0)
-	numAlts   int          // count of InstAlt nodes — bounds stack depth
-	loops     map[int]bool // set of InstAlt PCs that are loop back-edges
+	prog          *syntax.Prog
+	numGroups     int          // prog.NumCap / 2 (includes group 0)
+	numAlts       int          // count of InstAlt nodes — bounds stack depth
+	loops         map[int]bool // set of InstAlt PCs that are genuine loop heads
+	nonGreedyLoop map[int]bool // loops[pc] subset: true if the loop body is inst.Arg (non-greedy)
+	idom          []int        // immediate-dominator PC per PC, from computeDominators
 }
 
 func (b *backtrack) Type() EngineType { return EngineBacktrack }
 
 // newBacktrack builds the backtrack struct from a compiled NFA program.
 func newBacktrack(prog *syntax.Prog) *backtrack {
+	idom := computeDominators(prog)
 	bt := &backtrack{
-		prog:      prog,
-		numGroups: prog.NumCap / 2,
-		loops:     make(map[int]bool),
+		prog:          prog,
+		numGroups:     prog.NumCap / 2,
+		loops:         make(map[int]bool),
+		nonGreedyLoop: make(map[int]bool),
+		idom:          idom,
 	}
 	for pc, inst := range prog.Inst {
 		if inst.Op == syntax.InstAlt {
 			bt.numAlts++
-			pcU32 := uint32(pc)
-			// Loop back-edge: Out < PC (greedy body goes backward) OR Arg < PC (non-greedy body backward)
-			if inst.Out < pcU32 || inst.Arg < pcU32 {
+			if bodyPC, _, isLoop := altLoopBody(prog, idom, pc); isLoop {
 				bt.loops[pc] = true
+				bt.nonGreedyLoop[pc] = bodyPC == int(inst.Arg)
 			}
 		}
 	}
 	return bt
+}
+
+// computeDominators returns, for each PC reachable from prog.Start, its
+// immediate dominator (idom[pc]); idom[prog.Start] == prog.Start, and
+// unreachable PCs get idom == -1. Uses the standard Cooper-Harvey-Kennedy
+// iterative algorithm.
+func computeDominators(prog *syntax.Prog) []int {
+	n := len(prog.Inst)
+	successors := func(pc int) []int {
+		inst := prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstFail, syntax.InstMatch:
+			return nil
+		case syntax.InstAlt, syntax.InstAltMatch:
+			return []int{int(inst.Out), int(inst.Arg)}
+		default:
+			return []int{int(inst.Out)}
+		}
+	}
+
+	start := prog.Start
+	visited := make([]bool, n)
+	visited[start] = true
+	var order []int // postorder
+	type frame struct {
+		pc    int
+		idx   int
+		succs []int
+	}
+	stack := []frame{{pc: start, succs: successors(start)}}
+	for len(stack) > 0 {
+		f := &stack[len(stack)-1]
+		if f.idx < len(f.succs) {
+			w := f.succs[f.idx]
+			f.idx++
+			if !visited[w] {
+				visited[w] = true
+				stack = append(stack, frame{pc: w, succs: successors(w)})
+			}
+			continue
+		}
+		order = append(order, f.pc)
+		stack = stack[:len(stack)-1]
+	}
+
+	postNum := make([]int, n)
+	for i := range postNum {
+		postNum[i] = -1
+	}
+	for i, pc := range order {
+		postNum[pc] = i
+	}
+	rpo := make([]int, len(order))
+	for i, pc := range order {
+		rpo[len(order)-1-i] = pc
+	}
+
+	var preds [][]int
+	preds = make([][]int, n)
+	for pc := 0; pc < n; pc++ {
+		if !visited[pc] {
+			continue
+		}
+		for _, s := range successors(pc) {
+			preds[s] = append(preds[s], pc)
+		}
+	}
+
+	idom := make([]int, n)
+	for i := range idom {
+		idom[i] = -1
+	}
+	idom[start] = start
+
+	intersect := func(a, b int) int {
+		for a != b {
+			for postNum[a] < postNum[b] {
+				a = idom[a]
+			}
+			for postNum[b] < postNum[a] {
+				b = idom[b]
+			}
+		}
+		return a
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for _, b := range rpo {
+			if b == start {
+				continue
+			}
+			newIdom := -1
+			for _, p := range preds[b] {
+				if idom[p] == -1 {
+					continue
+				}
+				if newIdom == -1 {
+					newIdom = p
+				} else {
+					newIdom = intersect(newIdom, p)
+				}
+			}
+			if newIdom != -1 && idom[b] != newIdom {
+				idom[b] = newIdom
+				changed = true
+			}
+		}
+	}
+	return idom
+}
+
+// dominates reports whether v dominates u: every path from prog.Start to u
+// passes through v. Both must be reachable (idom != -1).
+func dominates(idom []int, v, u int) bool {
+	if idom[u] == -1 || idom[v] == -1 {
+		return false
+	}
+	for {
+		if u == v {
+			return true
+		}
+		if idom[u] == u {
+			return false // reached the root without finding v
+		}
+		u = idom[u]
+	}
+}
+
+// altLoopBody reports whether the InstAlt at pc is a genuine loop head, and if
+// so which branch is the body (the back edge, closing a real cycle) and
+// which is the exit. idom is the dominator tree from computeDominators.
+//
+// A branch pc→w is a back edge — and thus pc a loop head with body=w — when w
+// dominates pc: every path from the program's start to pc necessarily passes
+// through w, which is exactly the condition for pc→w to close a cycle back to
+// an enclosing point rather than merely happening to reach it via some other
+// route. This is the standard compiler technique for identifying natural
+// loops and is precise even under arbitrary nesting, unlike two simpler tests
+// that were tried and both misfire:
+//   - A pure numeric PC comparison (Out<pc or Arg<pc) misidentifies unrolled
+//     bounded repeats (a{1,300}) as loops: the chain's "keep matching" edges
+//     point to numerically lower PCs purely as an artifact of how the
+//     unrolled instructions are numbered, with no actual cycle. This
+//     previously inflated the per-loop WASM local count (one dedicated local
+//     per misidentified "loop") past 256, silently corrupting an unrelated
+//     local index used by the BT find path's mandatory-literal scan
+//     (prefixScanLocals's byte-typed fields) and crashing with an OOB memory
+//     access.
+//   - A same-strongly-connected-component test (do pc and w lie on a shared
+//     cycle at all?) misidentifies plain forks nested inside a loop's body as
+//     loop heads, AND — the opposite failure — merges distinct nested loop
+//     levels into one component, making the true inner loop head look
+//     "ambiguous" (both branches "in the component") and get rejected. E.g.
+//     for (?:(?:(?:^)*)+), the inner star's Alt and the outer plus's Alt end
+//     up in the same SCC, so the inner one's own back edge is invisible to a
+//     component-level test; only edge-level dominance sees it.
+func altLoopBody(prog *syntax.Prog, idom []int, pc int) (bodyPC, exitPC int, isLoop bool) {
+	inst := prog.Inst[pc]
+	outIsBack := dominates(idom, int(inst.Out), pc)
+	argIsBack := dominates(idom, int(inst.Arg), pc)
+	switch {
+	case outIsBack && !argIsBack:
+		return int(inst.Out), int(inst.Arg), true
+	case argIsBack && !outIsBack:
+		return int(inst.Arg), int(inst.Out), true
+	default:
+		return 0, 0, false
+	}
 }
 
 // --------------------------------------------------------------------------
@@ -60,22 +233,20 @@ func capStartLocal(i int) uint32 { return uint32(7 + i*2) }
 func capEndLocal(i int) uint32   { return uint32(8 + i*2) }
 
 // loopBodyStart returns the PC of the first instruction inside the loop body
-// at loopPC (the backward-pointing branch).
-func loopBodyStart(prog *syntax.Prog, loopPC int) int {
-	inst := prog.Inst[loopPC]
-	pcU32 := uint32(loopPC)
-	if inst.Out < pcU32 {
-		return int(inst.Out) // greedy: body is Out (backward)
-	}
-	return int(inst.Arg) // non-greedy: body is Arg (backward)
+// at loopPC (the branch that cycles back to loopPC). Only meaningful when
+// loopPC is a genuine loop head — callers must have already established that
+// via altLoopBody/bt.loops.
+func loopBodyStart(prog *syntax.Prog, idom []int, loopPC int) int {
+	bodyPC, _, _ := altLoopBody(prog, idom, loopPC)
+	return bodyPC
 }
 
 // loopBodyCanMatchEmpty returns true if the body of the loop at loopPC can
 // execute a full iteration without consuming any byte.  It BFS-traverses all
 // NFA paths reachable from the body entry back to loopPC and returns true if
 // at least one path contains no byte-consuming instruction.
-func loopBodyCanMatchEmpty(prog *syntax.Prog, loopPC int) bool {
-	bodyStart := loopBodyStart(prog, loopPC)
+func loopBodyCanMatchEmpty(prog *syntax.Prog, idom []int, loopPC int) bool {
+	bodyStart := loopBodyStart(prog, idom, loopPC)
 	visited := make([]bool, len(prog.Inst))
 	type entry struct {
 		pc    int
@@ -119,12 +290,17 @@ func loopBodyCanMatchEmpty(prog *syntax.Prog, loopPC int) bool {
 // the canonical "catastrophic backtracking" pattern (?:a?)* has a greedy outer
 // loop: when a? matches empty the guard fires and the loop exits immediately.
 func needsBitState(prog *syntax.Prog) bool {
+	idom := computeDominators(prog)
 	for pc, inst := range prog.Inst {
 		if inst.Op != syntax.InstAlt && inst.Op != syntax.InstAltMatch {
 			continue
 		}
-		// Non-greedy: Arg < PC (body is Arg, backward pointing).
-		if inst.Arg < uint32(pc) && loopBodyCanMatchEmpty(prog, pc) {
+		// Non-greedy loop: body is Arg (the branch that cycles back to pc).
+		bodyPC, _, isLoop := altLoopBody(prog, idom, pc)
+		if !isLoop || bodyPC != int(inst.Arg) {
+			continue
+		}
+		if loopBodyCanMatchEmpty(prog, idom, pc) {
 			return true
 		}
 	}
@@ -136,9 +312,9 @@ func needsBitState(prog *syntax.Prog) bool {
 // modified inside the loop body at loopPC (reachable from inst.Out before
 // re-entering loopPC). Only those locals need snapshot save/restore.
 // Returns nil if no captures are inside the loop.
-func loopCaptureLocals(prog *syntax.Prog, loopPC int) []uint32 {
+func loopCaptureLocals(prog *syntax.Prog, idom []int, loopPC int) []uint32 {
 	visited := make([]bool, len(prog.Inst))
-	queue := []int{loopBodyStart(prog, loopPC)}
+	queue := []int{loopBodyStart(prog, idom, loopPC)}
 	seen := make(map[uint32]bool)
 	var locals []uint32
 	for len(queue) > 0 {
@@ -215,7 +391,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	loopSnapLocals := make(map[int][]uint32, len(loopPCsSorted)) // loop PC → which cap locals to snap
 	snapTotal := 0
 	for _, pc := range loopPCsSorted {
-		locals := loopCaptureLocals(prog, pc)
+		locals := loopCaptureLocals(prog, bt.idom, pc)
 		if len(locals) > 0 {
 			loopSnapBase[pc] = baseExtra + uint32(snapTotal)
 			loopSnapLocals[pc] = locals
@@ -507,7 +683,7 @@ func emitBTInstHandler(
 			// Greedy loops are correctly handled by the zero-progress guard below.
 			// From inside the if-block: depth 0 = this if, depth 1 = brRun depth.
 			// So brRunNested is the correct depth to restart $run from here.
-			if useMemo && inst.Arg < uint32(p) {
+			if useMemo && bt.nonGreedyLoop[p] {
 				// bitIdx = p * lenPlus1 + localPos
 				// (p is the compile-time PC, baked as i32.const)
 				body = append(body, 0x41)
@@ -562,11 +738,11 @@ func emitBTInstHandler(
 				body = appendTableStore8(body, tableMemIdx) // i32.store8 to memo table
 			}
 
-			// For greedy: Out < PC means body=Out(backward), exit=Arg(forward)
-			// For non-greedy: Arg < PC means body=Arg(backward), exit=Out(forward)
+			// For greedy loops: body=Out, exit=Arg. For non-greedy: body=Arg, exit=Out.
+			// bt.nonGreedyLoop[p] was determined in newBacktrack via altLoopBody
+			// (an actual reachability check), not by comparing PC numbers.
 			// In both cases: preferred=inst.Out, retry=inst.Arg.
 			// Zero-progress: if pos == loop_pos_local, take the EXIT branch directly.
-			// Greedy (Out < PC): exit = Arg.  Non-greedy (Arg < PC): exit = Out.
 			// Without this guard, non-greedy loops with zero-matchable bodies would
 			// take the body again and loop infinitely.
 
@@ -585,9 +761,9 @@ func emitBTInstHandler(
 					body = utils.AppendULEB128(body, capLocal)
 				}
 			}
-			// Exit = Arg for greedy (Out < PC), Out for non-greedy (Arg < PC).
+			// Exit = Arg for greedy loops, Out for non-greedy.
 			exitPC := inst.Arg
-			if inst.Arg < uint32(p) { // non-greedy: body=Arg, exit=Out
+			if bt.nonGreedyLoop[p] {
 				exitPC = inst.Out
 			}
 			body = btSetStateAndBr(body, int32(exitPC), brRunNested)
