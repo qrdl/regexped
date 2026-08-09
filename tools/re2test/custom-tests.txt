@@ -2635,3 +2635,66 @@ regexps
 0-3;0-0;-;-
 0-3;0-3;-;-
 0-4;0-4;-;-
+# ============================================================
+# Category (DFA find-mode computePrefix word/newline-boundary pre-accept
+# gap, FUZZER_BUGS.md §22) — computePrefix's bail-out check (used to derive
+# a mandatory-literal-prefix fast-skip for non-anchored find) only tested
+# plain accept/mid-accept state flags, not midAcceptWStates/midAcceptNWStates
+# (word-boundary pre-accept, checked against the byte about to be consumed
+# rather than the current state alone). For patterns like `0*\b`/`a*\b`
+# whose zero-width match at a candidate position depends purely on that
+# pre-accept check, computePrefix still walked the state graph's ordinary
+# byte transitions and derived a bogus single-byte "mandatory" literal
+# (e.g. "a" for `a*\b`), causing the SIMD fast-skip to skip straight past
+# any position not starting with that byte -- even positions where the
+# pattern already matches empty via the word-boundary check alone. Fixed:
+# bail out (return nil, disabling the fast-skip) when the mid-start state
+# has any of midAcceptWStates/midAcceptNWStates/midAcceptNLStates set, same
+# as the existing accept/midAccept bail-out. All expected values
+# cross-checked against Go stdlib regexp (find = non-anchored
+# FindStringIndex; col0 = \A(?:PATTERN)\z, i.e. full-consumption anchored
+# match, matchFn's actual contract). Found by tools/fuzz (crasher
+# 170149-ddf199b4967cf85a: `0*\b` vs "1").
+# ============================================================
+DFAFindPrefixSkipWordBoundary
+strings
+""
+"1"
+"0"
+"00"
+"0a"
+"a"
+" "
+"a1"
+"1a"
+regexps
+"0*\\b"
+-;-;-;-
+-;0-0;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;0-0;-;-
+-;0-0;-;-
+"a*\\b"
+-;-;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;0-0;-;-
+-;0-0;-;-
+"x*\\B"
+0-0;0-0;-;-
+-;-;-;-
+-;-;-;-
+-;1-1;-;-
+-;1-1;-;-
+-;-;-;-
+-;0-0;-;-
+-;1-1;-;-
+-;1-1;-;-

@@ -4681,8 +4681,9 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 // match empty string — no positions can safely be skipped).
 func computePrefix(t *dfaTable) []byte {
 	state := t.midStartState
-	if t.acceptStates[state] != 0 || t.midAcceptStates[state] != 0 {
-		return nil // accepting start state: pattern matches empty → can't skip
+	if t.acceptStates[state] != 0 || t.midAcceptStates[state] != 0 ||
+		t.midAcceptWStates[state] != 0 || t.midAcceptNWStates[state] != 0 || t.midAcceptNLStates[state] != 0 {
+		return nil // accepting start state (incl. word/newline-boundary pre-accept): pattern can match empty → can't skip
 	}
 	if t.startBeginAccept {
 		return nil // pattern matches empty at position 0 via begin anchor (e.g. a*^)
