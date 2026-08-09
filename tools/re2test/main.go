@@ -451,51 +451,51 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 
 			if !validateGo {
-				// col1: non-anchored find. Tested whenever no anchored match is
-				// expected (col0 == "-") — including when col1 == "-" too: that
-				// combination used to fall through to the anchored-match check
-				// only (an else-if) and never called find, hiding bugs where
-				// find should report no match but doesn't.
-				if col0 == "-" {
-					if findFn == nil {
-						skipCount[skipNonAnchored]++
-					} else {
-						got, callErr := callFind(wd, store, findFn, findMemory, text)
-						if callErr != nil {
-							if isTimeout(callErr) {
-								if forceBacktrack {
-									store, matchFn, memory = nil, nil, nil
-									findFn, findMemory = nil, nil
-									skipCount[skipTimeout]++
-									continue
-								}
-								return fmt.Errorf("TIMEOUT: find pattern=%q input=%q", pattern, text)
-							}
-							return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
-								testFile, lineno, pattern, text, callErr)
-						}
-						expected := parseCol1(col1)
-						if got == expected {
-							npass++
+				// col1: non-anchored find. Tested for every row with a findFn,
+				// regardless of col0 — a pattern's anchored match succeeding
+				// does not mean find() was ever exercised, and col1 is the
+				// correct find oracle either way. Previously gated behind
+				// `col0 == "-"`, which left find() completely unchecked for any
+				// row whose anchored match also succeeds, hiding real find-mode
+				// bugs (e.g. `a$00|^0` and `\b0|` vs "0" — see plans/FUZZER_BUGS.md).
+				if findFn == nil {
+					skipCount[skipNonAnchored]++
+				} else {
+					got, callErr := callFind(wd, store, findFn, findMemory, text)
+					if callErr != nil {
+						if isTimeout(callErr) {
 							if forceBacktrack {
-								npassBTMatchFind++
-							} else if isCompiledDFA {
-								npassCompiledDFA++
-							} else {
-								npassDFA++
+								store, matchFn, memory = nil, nil, nil
+								findFn, findMemory = nil, nil
+								skipCount[skipTimeout]++
+								continue
 							}
-							if verbose {
-								fmt.Printf("PASS %s:%d pattern=%q input=%q (find)\n", testFile, lineno, pattern, text)
-							}
+							return fmt.Errorf("TIMEOUT: find pattern=%q input=%q", pattern, text)
+						}
+						return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
+							testFile, lineno, pattern, text, callErr)
+					}
+					expected := parseCol1(col1)
+					if got == expected {
+						npass++
+						if forceBacktrack {
+							npassBTMatchFind++
+						} else if isCompiledDFA {
+							npassCompiledDFA++
 						} else {
-							nfail++
-							fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
-								pattern, text, fmtFindResult(expected), fmtFindResult(got))
-							if maxErrors > 0 && nfail >= maxErrors {
-								fmt.Printf("Stopping after %d failure(s)\n", nfail)
-								stopped = true
-								goto done
-							}
+							npassDFA++
+						}
+						if verbose {
+							fmt.Printf("PASS %s:%d pattern=%q input=%q (find)\n", testFile, lineno, pattern, text)
+						}
+					} else {
+						nfail++
+						fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
+							pattern, text, fmtFindResult(expected), fmtFindResult(got))
+						if maxErrors > 0 && nfail >= maxErrors {
+							fmt.Printf("Stopping after %d failure(s)\n", nfail)
+							stopped = true
+							goto done
 						}
 					}
 				}

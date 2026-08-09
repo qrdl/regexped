@@ -4699,17 +4699,57 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 // found by walking the DFA from midStartState while exactly one byte leads to a
 // non-dead state. Returns nil when the start state is accepting (pattern can
 // match empty string — no positions can safely be skipped).
+//
+// Also intersects with the walk from startState (attempt_start==0) when it
+// differs from midStartState: an anchor-guarded branch (e.g. `x|^0`) can be
+// live from startState only, via a path midStartState's epsilon closure never
+// reaches (anchors can't be satisfied at attempt_start>0). Such a branch may
+// require a completely different byte — or no byte at all — at the very
+// position where the literal prefix derived from midStartState alone would
+// wrongly be treated as mandatory, silently dropping matches that take that
+// branch (task 48, sibling of FUZZER_BUGS.md §23 — same "midStartState's
+// automaton isn't representative of attempt_start==0" family of bug, this
+// time in the prefix-existence check itself rather than in a post-prefix
+// resume state).
 func computePrefix(t *dfaTable) []byte {
-	state := t.midStartState
-	if t.acceptStates[state] != 0 || t.midAcceptStates[state] != 0 ||
-		t.midAcceptWStates[state] != 0 || t.midAcceptNWStates[state] != 0 || t.midAcceptNLStates[state] != 0 {
+	prefixMid, ok := computePrefixWalk(t, t.midStartState)
+	if !ok {
 		return nil // accepting start state (incl. word/newline-boundary pre-accept): pattern can match empty → can't skip
 	}
 	if t.startBeginAccept {
 		return nil // pattern matches empty at position 0 via begin anchor (e.g. a*^)
 	}
+	if t.startState == t.midStartState {
+		return prefixMid
+	}
+	prefixStart, ok := computePrefixWalk(t, t.startState)
+	if !ok {
+		return nil
+	}
+	n := len(prefixMid)
+	if len(prefixStart) < n {
+		n = len(prefixStart)
+	}
+	for i := 0; i < n; i++ {
+		if prefixMid[i] != prefixStart[i] {
+			return prefixMid[:i]
+		}
+	}
+	return prefixMid[:n]
+}
+
+// computePrefixWalk walks the DFA from start while exactly one byte leads to
+// a non-dead state, returning the literal byte sequence forced along that
+// walk. ok is false when start itself is accepting in any find-relevant
+// flavor (the pattern can match empty from start, so no prefix can safely be
+// assumed mandatory).
+func computePrefixWalk(t *dfaTable, start int) (prefix []byte, ok bool) {
+	state := start
+	if t.acceptStates[state] != 0 || t.midAcceptStates[state] != 0 ||
+		t.midAcceptWStates[state] != 0 || t.midAcceptNWStates[state] != 0 || t.midAcceptNLStates[state] != 0 {
+		return nil, false
+	}
 	visited := map[int]bool{state: true}
-	var prefix []byte
 	for {
 		only := -1
 		count := 0
@@ -4729,7 +4769,7 @@ func computePrefix(t *dfaTable) []byte {
 		}
 		visited[state] = true
 	}
-	return prefix
+	return prefix, true
 }
 
 // isAnchoredFind reports whether the DFA can only match starting at position 0.

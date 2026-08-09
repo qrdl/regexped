@@ -69,5 +69,6 @@ func seedCorpus(path string) []seedCase {
 			// Result line (e.g. "0-1;0-1;-;-") — not needed for seeding.
 		}
 	}
+	_ = scanner.Err() // a read error just yields fewer seeds, not a failure — see doc comment
 	return cases
 }
