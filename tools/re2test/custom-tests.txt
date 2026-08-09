@@ -2698,3 +2698,43 @@ regexps
 -;0-0;-;-
 -;1-1;-;-
 -;1-1;-;-
+# ============================================================
+# Category (DFA find-mode fast-skip prefixEndState derived unconditionally
+# from midStartState, FUZZER_BUGS.md §23) — buildDFALayout's prefix-scan
+# shortcut walked the mandatory-literal prefix from midStartState to
+# compute the post-prefix jump state (wasmPrefixEnd/prefixEndState) and
+# used it for every attempt position, including attempt_start==0. For
+# begin-anchored patterns like `0*^0` whose mid-string automaton is a
+# dead-end self-loop that isAnchoredFind's zero-live-transitions check
+# doesn't catch (the self-loop has a live transition to itself),
+# startState and midStartState are genuinely different automata: at
+# attempt_start==0 the correct post-prefix state comes from startState's
+# own chain, not midStartState's. Using midStartState's chain unconditionally
+# resumed the scan from a state that can never accept, silently losing the
+# real match at position 0. Fixed by computing a third state,
+# wasmPrefixEndStart (walked from startState), and selecting it in the
+# find loop's OnMatch callback whenever attempt_start==0 and it diverges
+# from prefixEndState -- mirroring the existing hasWordBoundary
+# prefixEndState/prefixEndStateWord split. All expected values
+# cross-checked against Go stdlib regexp (find = non-anchored
+# FindStringIndex; col0 = \A(?:PATTERN)\z). Found by tools/fuzz (crasher
+# 165348-82ca52482fd7d084: `0*^0` vs "00").
+# ============================================================
+DFAFindPrefixEndStateStart
+strings
+""
+"0"
+"00"
+"000"
+"10"
+"01"
+"1"
+regexps
+"0*^0"
+-;-;-;-
+0-1;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;-;-;-
+-;0-1;-;-
+-;-;-;-

@@ -347,7 +347,7 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
 	return buildFindBody(
 		l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
-		l.wasmMidStartNewline, l.wasmPrefixEnd, l.wasmPrefixEndWord,
+		l.wasmMidStartNewline, l.wasmPrefixEnd, l.wasmPrefixEndWord, l.wasmPrefixEndStart,
 		l.tableOff, l.midAcceptOff,
 		l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
 		l.useU8, l.useCompression, l.acceptLimit, l.startBeginAccept,

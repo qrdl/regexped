@@ -1442,6 +1442,12 @@ type dfaLayout struct {
 	wasmPrefixEndWord   uint32 // state after walking the prefix from midStartWordState (prev=word).
 	//                     Only populated when hasWordBoundary; otherwise == wasmPrefixEnd.
 	//                     Used in the prefix-scan shortcut to honour `\b` at the pattern start.
+	wasmPrefixEndStart uint32 // state after walking the prefix from startState (the true start,
+	//                     attempt_start==0). For begin-anchored patterns startState and
+	//                     midStartState are genuinely different automata, so walking the
+	//                     same prefix bytes can land in a different state (or die, giving
+	//                     WASM state 0). Equals wasmPrefixEnd when they don't diverge.
+	//                     See FUZZER_BUGS.md §23.
 	startBeginAccept bool
 
 	// tableEnd is the highest memory address used by any table in this layout.
@@ -1983,6 +1989,20 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 		} else {
 			l.wasmPrefixEndWord = l.wasmPrefixEnd
 		}
+		// Compute the equivalent end state when walking the prefix from the true
+		// start (attempt_start==0) rather than from midStartState. For patterns
+		// like `0*^0` (begin-anchor with a dead-end mid-string automaton), the two
+		// walks diverge even though both consume the same prefix bytes — see
+		// FUZZER_BUGS.md §23. Dies (→ WASM state 0) if startState has no live path
+		// through the prefix.
+		prefixEndStart := t.startState
+		for _, ch := range l.prefix {
+			prefixEndStart = t.transitions[prefixEndStart*256+int(ch)]
+			if prefixEndStart < 0 { // dead state — no path through prefix
+				break
+			}
+		}
+		l.wasmPrefixEndStart = uint32(prefixEndStart + 1)
 		l.startBeginAccept = t.startBeginAccept
 	}
 
@@ -3594,7 +3614,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			l.midAcceptNLOff, t.hasNewlineBoundary, tableMemIdx)
 	} else {
 		body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
-			l.wasmMidStartNewline, l.wasmPrefixEnd, l.wasmPrefixEndWord,
+			l.wasmMidStartNewline, l.wasmPrefixEnd, l.wasmPrefixEndWord, l.wasmPrefixEndStart,
 			l.tableOff, l.midAcceptOff,
 			l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
 			l.useU8, l.useCompression, l.acceptLimit, l.startBeginAccept,
@@ -6052,7 +6072,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, eofSkipSafe bool) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord, prefixEndStateStart uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, eofSkipSafe bool) []byte {
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
 	// `nonMidDominantOff` parameter and the `[]int` return slot) was
@@ -6301,7 +6321,25 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 					// that case — it will be the dead state (0) if `\b` fails
 					// at this position, causing the DFA loop to exit immediately
 					// and the find loop to advance to the next candidate.
-					if hasWordBoundary && prefixEndState != prefixEndStateWord {
+					//
+					// Independently, for begin-anchored patterns (e.g. `0*^0`,
+					// FUZZER_BUGS.md §23) startState and midStartState can be
+					// genuinely different automata, so walking the same prefix
+					// bytes from each can land in different states even though
+					// midStartState's dead-end chain has live transitions (i.e.
+					// isAnchoredFind doesn't catch it). At attempt_start==0 the
+					// correct post-prefix state is prefixEndStateStart (walked
+					// from startState), never prefixEndState — using the latter
+					// there resumes the scan from a state reachable only via
+					// midStartState's chain, silently losing a real match at
+					// position 0.
+					wordDiverges := hasWordBoundary && prefixEndState != prefixEndStateWord
+					startDiverges := prefixEndState != prefixEndStateStart
+					switch {
+					case !wordDiverges && !startDiverges:
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(prefixEndState))
+					case wordDiverges && !startDiverges:
 						b = append(b, 0x20, 0x04) // local.get attempt_start
 						b = append(b, 0x45)       // i32.eqz
 						b = append(b, 0x04, 0x7F) // if (result i32)
@@ -6326,9 +6364,41 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 						b = utils.AppendSLEB128(b, int32(prefixEndState))
 						b = append(b, 0x0B) // end if prev-is-word
 						b = append(b, 0x0B) // end if attempt_start == 0
-					} else {
+					case !wordDiverges && startDiverges:
+						b = append(b, 0x20, 0x04) // local.get attempt_start
+						b = append(b, 0x45)       // i32.eqz
+						b = append(b, 0x04, 0x7F) // if (result i32)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(prefixEndStateStart))
+						b = append(b, 0x05) // else
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, int32(prefixEndState))
+						b = append(b, 0x0B) // end if attempt_start == 0
+					default: // wordDiverges && startDiverges
+						b = append(b, 0x20, 0x04) // local.get attempt_start
+						b = append(b, 0x45)       // i32.eqz
+						b = append(b, 0x04, 0x7F) // if (result i32)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(prefixEndStateStart))
+						b = append(b, 0x05) // else
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, wordCharTableOff)
+						b = append(b, 0x20, 0x00) // local.get ptr
+						b = append(b, 0x20, 0x04) // local.get attempt_start
+						b = append(b, 0x6A)       // ptr + attempt_start
+						b = append(b, 0x41, 0x01)
+						b = append(b, 0x6B)                   // ... - 1
+						b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u prev byte
+						b = append(b, 0x6A)                   // wordCharTableOff + prev_byte
+						b = appendTableLoad8u(b, tableMemIdx) // wordChar[prev_byte]
+						b = append(b, 0x04, 0x7F)             // if (result i32) prev is word
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(prefixEndStateWord))
+						b = append(b, 0x05) // else
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(prefixEndState))
+						b = append(b, 0x0B) // end if prev-is-word
+						b = append(b, 0x0B) // end if attempt_start == 0
 					}
 					b = append(b, 0x21, 0x02) // state = ...
 					b = append(b, 0x20, 0x04) // local.get attempt_start
