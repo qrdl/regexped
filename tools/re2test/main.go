@@ -555,8 +555,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 							goto done
 						}
 					}
-				} else if matchFn != nil {
-					// col0: anchored match (no captures).
+				} else if matchFn != nil && groupsFn == nil {
+					// col0: anchored match (no captures). Skipped for capturing
+					// patterns (groupsFn != nil) even when --validate-groups is
+					// off: col0 is written for groupsFn's non-full-consumption
+					// contract, not matchFn's full-consumption one — see
+					// plans/TODO.md task 46.
 					got, callErr := callMatch(wd, store, matchFn, memory, text)
 					if callErr != nil {
 						if isTimeout(callErr) {
