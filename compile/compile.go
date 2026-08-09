@@ -1866,12 +1866,17 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 
 	switch engineType {
 	case EngineDFA:
-		// maxHelperDFAStates, NOT resolveMaxDFAStates(&options): callers
+		// max(maxHelperDFAStates, resolveMaxDFAStates(&options)): callers
 		// (compile.go's match/find construction) deliberately set
 		// MaxDFAStates arbitrarily low to force a BT fallback while still
 		// expecting a real (if oversized) table back for prefix-extraction
-		// optimisations — see maxHelperDFAStates' doc comment.
-		d, ok := newDFA(prog, options.Unicode, options.LeftmostFirst, maxHelperDFAStates)
+		// optimisations — see maxHelperDFAStates' doc comment. But a caller
+		// that configures a MaxDFAStates ABOVE maxHelperDFAStates (e.g.
+		// re2test's 100000) must have construction actually reach that
+		// budget, or the 2048 ceiling silently downgrades DFA-eligible
+		// patterns to Backtracking regardless of the configured threshold.
+		ceiling := max(maxHelperDFAStates, resolveMaxDFAStates(&options))
+		d, ok := newDFA(prog, options.Unicode, options.LeftmostFirst, ceiling)
 		if !ok {
 			return nil, errDFAStateLimitExceeded
 		}
