@@ -342,7 +342,12 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		// produces a spurious extra accept at a wrong (too-late, lower-priority)
 		// position.
 		priorityPCs []uint32
-		prevWasWord bool
+		// priorityThreads mirrors priorityPCs but carries each thread's final
+		// canonical regMap alongside its pc. The transition-building loop below
+		// (source-thread selection, "first contributing thread wins") needs both
+		// the priority order AND the register values, which bare pcs can't give it.
+		priorityThreads []tdfaThread
+		prevWasWord     bool
 	}
 	var states []stateData
 
@@ -375,10 +380,18 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	//    we sort by pc for a deterministic canonical key).
 	// 2. Renaming registers to 0, 1, 2, … in order of first appearance
 	//    scanning threads left-to-right, tags 0…numTags-1.
-	// Returns the canonical threads and a rename map: oldReg → newCanonicalReg.
-	// Newly allocated canonical registers (not yet backed by real registers) are
-	// assigned new indices from allocReg().
-	canonicalise := func(threads []tdfaThread) (canonical []tdfaThread, rename map[int]int, newRegs int) {
+	// Returns the canonical (pc-sorted) threads, a priority-ordered mirror of
+	// `threads` with the same register renaming applied, and a rename map:
+	// oldReg → newCanonicalReg. Newly allocated canonical registers (not yet
+	// backed by real registers) are assigned new indices from allocReg().
+	//
+	// The priority-ordered result exists because pc order and leftmost-first
+	// priority order disagree for backward loop edges (see stateData.priorityPCs
+	// doc comment below) — callers that need "the highest-priority thread"
+	// (accept-time regMap selection, transition source-thread selection) must
+	// use it instead of the pc-sorted `canonical` slice, or they silently pick a
+	// lower-priority thread's registers whenever the two orders diverge.
+	canonicalise := func(threads []tdfaThread) (canonical, priorityOrder []tdfaThread, rename map[int]int, newRegs int) {
 		sorted := make([]tdfaThread, len(threads))
 		copy(sorted, threads)
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i].pc < sorted[j].pc })
@@ -403,7 +416,22 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			}
 			sorted[i].regMap = newMap
 		}
-		return sorted, rename, counter
+
+		priorityOrder = make([]tdfaThread, len(threads))
+		for i, t := range threads {
+			newMap := make([]int, numTags)
+			for tag := 0; tag < numTags; tag++ {
+				old := t.regMap[tag]
+				if old < 0 {
+					newMap[tag] = -1
+				} else {
+					newMap[tag] = rename[old]
+				}
+			}
+			priorityOrder[i] = tdfaThread{pc: t.pc, regMap: newMap}
+		}
+
+		return sorted, priorityOrder, rename, counter
 	}
 
 	// ---- helper: getOrAddState ----
@@ -445,7 +473,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			workThreads[i] = tdfaThread{pc: t.pc, regMap: rm}
 		}
 
-		canonical, rename, counter := canonicalise(workThreads)
+		canonical, priorityCanonical, rename, counter := canonicalise(workThreads)
 
 		// Compute ops for this transition:
 		//   orig >= sentinelBase → was a freshly-captured tag → reg[can] = pos
@@ -533,12 +561,16 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		}
 
 		// Build acceptRegMap: which register holds each tag in the highest-priority
-		// accepting thread at accept time.
+		// accepting thread at accept time. Must scan priorityCanonical (leftmost-
+		// first order), not canonical (pc-sorted) — otherwise a backward loop edge
+		// (see stateData.priorityPCs doc comment) can make a lower-priority thread's
+		// regMap win here even though pruning elsewhere correctly favored the
+		// higher-priority one.
 		regMap := make([]int, numTags)
 		for i := range regMap {
 			regMap[i] = -1
 		}
-		for _, t := range canonical {
+		for _, t := range priorityCanonical {
 			if isAccepting([]uint32{uint32(t.pc)}, ecEnd|eofWBCtx) ||
 				isAccepting([]uint32{uint32(t.pc)}, 0) {
 				copy(regMap, t.regMap)
@@ -547,9 +579,10 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		}
 
 		states = append(states, stateData{
-			key:         key,
-			priorityPCs: priorityPCs,
-			prevWasWord: prevWasWord,
+			key:             key,
+			priorityPCs:     priorityPCs,
+			priorityThreads: priorityCanonical,
+			prevWasWord:     prevWasWord,
 		})
 
 		// Extend tables.
@@ -688,7 +721,13 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 					continue
 				}
 				var sourceRM []int
-				for _, srcThread := range sd.key.threads {
+				// Iterate in true leftmost-first priority order (sd.priorityThreads),
+				// NOT sd.key.threads (pc-sorted for canonical hashing) — "first
+				// contributing thread wins" below is only correct in priority order.
+				// A backward loop edge (see stateData.priorityPCs doc comment) can put
+				// a lower-priority thread earlier in pc order, which would otherwise
+				// make this loop copy captures from the wrong source thread.
+				for _, srcThread := range sd.priorityThreads {
 					// Only consider source threads whose byte consumer actually fired for b.
 					if !firedOutSet[int(prog.Inst[srcThread.pc].Out)] {
 						continue

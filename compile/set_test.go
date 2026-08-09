@@ -1213,6 +1213,39 @@ func TestCompileFile_WithSets_ValidWASM(t *testing.T) {
 	}
 }
 
+// TestCompileFile_WithSets_BatchFindStillWorks guards against a regression
+// where CompileFile's per-pattern loop (used whenever cfg.Sets is non-empty)
+// bypassed the "batch-find" hint trigger entirely, and assembleModuleWithSets
+// had no code to emit the batch wrapper even when the field was set — so a
+// pattern's own _batch export silently disappeared merely because the config
+// also had a sets: block. The set's own find_any export must NOT gain a
+// batch wrapper — sets already cover multi-match via find_all/find_any.
+func TestCompileFile_WithSets_BatchFindStillWorks(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "foo_pat", Pattern: `foo\d+`, FindFunc: "find_foo", Hints: []string{"batch-find"}},
+			{Name: "bar_pat", Pattern: `bar\w+`},
+		},
+		Sets: []config.SetConfig{
+			{
+				Name:     "test_set",
+				FindAny:  "test_match_any",
+				Patterns: config.PatternSelector{All: true},
+			},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if !bytes.Contains(wasm, []byte("find_foo_batch")) {
+		t.Error("expected find_foo_batch export with batch-find hint present alongside a sets: block, not found")
+	}
+	if bytes.Contains(wasm, []byte("test_match_any_batch")) {
+		t.Error("test_match_any_batch export present — set match functions must not gain a batch wrapper")
+	}
+}
+
 func TestSetMatch_SingleBucket_Equivalence(t *testing.T) {
 	// Verify that CompileSet produces a compiledSet with the expected structure.
 	var prefixPool, suffixPool dfaPool

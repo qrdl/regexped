@@ -257,8 +257,10 @@ type compiledPattern struct {
 	// "Path B"); assembleModule's code-section emission branches on
 	// p.anchored to pick the right wrapper builder.
 	//
-	// Always laid out last (see batchOffsets); not wired into the sets path
-	// (assembleModuleWithSets) — sets already have find_all.
+	// Always laid out last (see batchOffsets). Wired into both assembleModule
+	// and assembleModuleWithSets for a pattern's own find/groups exports; a
+	// compiledSet's own find_all/find_any/match are never given a batch
+	// wrapper — they already cover multi-match natively.
 	batchFindExport   string
 	batchGroupsExport string
 }
@@ -310,8 +312,7 @@ func (p *compiledPattern) funcCount() int {
 // functions, which are always laid out last (after everything offsets()
 // accounts for). -1 if the corresponding export was not requested. Kept
 // separate from offsets() so its widely-shared 4-return signature (used by
-// both assembleModule and assembleModuleWithSets) does not need to change
-// for a feature the sets path doesn't wire up.
+// both assembleModule and assembleModuleWithSets) does not need to change.
 func (p *compiledPattern) batchOffsets() (batchFindOff, batchGroupsOff int) {
 	idx := 0
 	if p.matchBody != nil {
@@ -2234,13 +2235,15 @@ func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, n
 // the record's [0:8) header — same record layout buildBatchGroupsWrapperBody
 // produces, so the JS/TS consumer needs no path-specific branching.
 //
-// Every lit-chain shape contains at least one literal byte
-// (buildLitChainFindGroupsBody, buildLitChainRangeFindGroupsBody and
-// buildLitChainAltFindGroupsBody's branches all require a non-empty literal),
-// so a match here is never zero-length: the returned end position is always
-// > the call's own attempt-start, so pos += r always strictly advances — no
-// relEnd>relStart branch is needed (contrast buildBatchGroupsWrapperBody's
-// advance rule, which must handle the general zero-length case).
+// assembleModule also routes here for the general native-anchored TDFA/
+// Backtracking capture body (compiledPattern.anchored set via isAnchoredFind
+// in compilePattern's non-lit-chain path) whenever it has a batch export —
+// that body shares this wrapper's (ptr,len,out_ptr)→i32 ABI but, unlike a
+// genuine lit-chain shape, CAN match zero-length (e.g. `^(a*)?` at the end of
+// the input). So the advance step cannot assume r always strictly advances;
+// it uses the same relEnd>relStart-guarded rule as buildBatchGroupsWrapperBody,
+// read back from the record's just-written, already-adjusted start/end
+// header (recBase+0/recBase+4) instead of pos+r directly.
 //
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=recBase i32,
 // 8=r i32, 9=slotVal i32.
@@ -2305,8 +2308,20 @@ func buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups int) []byte {
 	// count += 1
 	b = append(b, 0x20, 0x06, 0x41, 0x01, 0x6A, 0x21, 0x06)
 
-	// pos = pos + r (always advances — see doc comment on the guarantee).
-	b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x05)
+	// pos = adjEnd > adjStart ? adjEnd : adjStart + 1, reading the
+	// already-adjusted, absolute start/end just written to the record
+	// header at recBase+0/recBase+4 (see doc comment: zero-length matches
+	// are possible on the general native-anchored path, not just the
+	// guaranteed-non-empty lit-chain one).
+	b = append(b, 0x20, 0x07, 0x28, 0x02, 0x04) // adjEnd = mem32[recBase+4]
+	b = append(b, 0x20, 0x07, 0x28, 0x02, 0x00) // adjStart = mem32[recBase+0]
+	b = append(b, 0x4B)                         // i32.gt_u
+	b = append(b, 0x04, 0x7F)                   // if (result i32)
+	b = append(b, 0x20, 0x07, 0x28, 0x02, 0x04)
+	b = append(b, 0x05) // else
+	b = append(b, 0x20, 0x07, 0x28, 0x02, 0x00, 0x41, 0x01, 0x6A)
+	b = append(b, 0x0B) // end if
+	b = append(b, 0x21, 0x05)
 
 	b = append(b, 0x0C, 0x00) // br $L (continue)
 	b = append(b, 0x0B)       // end loop
