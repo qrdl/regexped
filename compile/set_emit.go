@@ -1255,7 +1255,8 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase int, prefixFnBaseId
 	// lPos > pInLen: allows position 0 to be processed on empty input (pInLen=0),
 	// so patterns like (aa)* that match "" get their zero-length match at position 0.
 	// For non-empty inputs, position pInLen is processed once (for EOF-anchored patterns
-	// like (aa)*$); the eofMidBitmask in buildSetSuffixBody avoids false positives.
+	// like (aa)*$); buildSetSuffixBody's eofBitmaskOff table (paired with newDFA's
+	// bootstrap-alias guard giving midStart its own correct accept bits) avoids false positives.
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01) // lPos > pInLen (i32.gt_u)
 	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)
 
