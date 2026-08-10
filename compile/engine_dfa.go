@@ -2045,6 +2045,14 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 				l.firstBytes = append(l.firstBytes, byte(bv))
 			}
 		}
+		// stateCanAcceptHere reports whether a match can already end at gs
+		// without consuming further bytes (any-position accept, or an
+		// EOF/anchor accept — either way, requiring a further live
+		// transition out of gs is unsound: the true match may be shorter
+		// than the tier being built). See FUZZER_BUGS.md #3.
+		stateCanAcceptHere := func(gs int) bool {
+			return t.midAcceptStates[gs] != 0 || t.acceptStates[gs] != 0
+		}
 		if len(l.firstBytes) <= 8 {
 			l.teddyLoOff = l.firstByteOff + 256
 			l.teddyHiOff = l.teddyLoOff + 16
@@ -2059,7 +2067,7 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 			useTwoByte := true
 			for i, fb := range l.firstBytes {
 				stateAfterFB := t.transitions[t.midStartState*256+int(fb)]
-				if stateAfterFB < 0 {
+				if stateAfterFB < 0 || stateCanAcceptHere(stateAfterFB) {
 					useTwoByte = false
 					break
 				}
@@ -2097,6 +2105,10 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 						stateAfterFB2 := t.transitions[stateAfterFB*256+b2]
 						if stateAfterFB2 < 0 {
 							continue
+						}
+						if stateCanAcceptHere(stateAfterFB2) {
+							useThreeByte = false
+							break outerThreeByte
 						}
 						validCount3 := 0
 						for b3 := 0; b3 < 256; b3++ {
@@ -2138,6 +2150,10 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 								stateAfterFB3 := t.transitions[stateAfterFB2*256+b3]
 								if stateAfterFB3 < 0 {
 									continue
+								}
+								if stateCanAcceptHere(stateAfterFB3) {
+									useFourByte = false
+									break outerFourByte
 								}
 								validCount4 := 0
 								for b4 := 0; b4 < 256; b4++ {
