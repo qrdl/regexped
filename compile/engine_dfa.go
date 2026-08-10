@@ -525,13 +525,17 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	orAccept(dfa.accepting, 0, acceptBitsFor(startSet, ecBegin|ecEnd|ecNoWordBoundary))
 	orAccept(dfa.midAccepting, 0, acceptBitsFor(startSet, 0))
 	// Pre-transition accept for start state (prevWasWord=false):
+	// ecBegin is unconditionally true at state 0 (true start of text), so it must be
+	// OR'd into every context below — a pending \b/\B node from the initial closure
+	// (line 517) can gate a nested ^/\A check that would otherwise never resolve
+	// (FUZZER_BUGS.md #1: \B^, \B\A).
 	// midAcceptNW: before non-word byte → \B fires (prev=non-word, next=non-word)
-	orAccept(dfa.midAcceptingNW, 0, acceptBitsFor(startSet, ecNoWordBoundary))
+	orAccept(dfa.midAcceptingNW, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary))
 	// midAcceptW: before word byte → \b fires (prev=non-word, next=word)
-	orAccept(dfa.midAcceptingW, 0, acceptBitsFor(startSet, ecWordBoundary))
+	orAccept(dfa.midAcceptingW, 0, acceptBitsFor(startSet, ecBegin|ecWordBoundary))
 	// midAcceptNL: before '\n' byte → (?m:$) fires (ecEndLine | \B since prev=non-word)
 	if dfa.hasNewlineBoundary {
-		orAccept(dfa.midAcceptingNL, 0, acceptBitsFor(startSet, ecNoWordBoundary|ecEndLine))
+		orAccept(dfa.midAcceptingNL, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary|ecEndLine))
 	}
 	// startBeginAccept: pattern matches empty at position 0 due to begin anchor (^/\A).
 	// Distinct from acceptStates (ecBegin|ecEnd) and midAcceptStates (ctx=0).
