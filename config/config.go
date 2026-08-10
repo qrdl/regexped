@@ -163,6 +163,9 @@ func ValidateSets(cfg *BuildConfig) error {
 			if name == "" {
 				continue
 			}
+			if strings.HasSuffix(name, "_batch") {
+				return fmt.Errorf("%s: export name %q must not end in \"_batch\" (reserved for the compiler-synthesized batch export)", owner, name)
+			}
 			if prior, dup := exportNames[name]; dup {
 				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
 			}
@@ -184,6 +187,9 @@ func ValidateSets(cfg *BuildConfig) error {
 		for _, name := range []string{s.FindAny, s.FindAll, s.Match} {
 			if name == "" {
 				continue
+			}
+			if strings.HasSuffix(name, "_batch") {
+				return fmt.Errorf("%s: export name %q must not end in \"_batch\" (reserved for the compiler-synthesized batch export)", owner, name)
 			}
 			if prior, dup := exportNames[name]; dup {
 				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)

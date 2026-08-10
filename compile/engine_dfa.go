@@ -55,6 +55,20 @@ func (d *dfa) Type() EngineType {
 //	|a start: [InstMatch, rune_a_suppressed_was_here] -> but NFA set = [InstMatch] after
 //	          suppression means just InstMatch first -> true
 //	a?|b start: NFA = [rune_a, InstMatch] (rune_b suppressed) -> rune_a before match -> false
+//
+// `states` is itself an epsilon closure computed under some ctx (see the ec*
+// constants). Every caller of isImmediateAccepting builds that closure with a
+// ctx that never resolves EmptyWordBoundary/EmptyNoWordBoundary (\b/\B) —
+// that resolution only happens later, per next-byte-class, once the actual
+// incoming byte is known. So a higher-priority \b/\B-gated branch's
+// continuation was pruned from `states` by the closure exactly as if it were
+// definitively dead — indistinguishable here from a branch that really
+// cannot ever succeed. Reporting immediate-accept in that case would let a
+// lower-priority empty branch win by default before the \b/\B branch gets a
+// chance to be resolved against the real byte (FUZZER_BUGS.md #24, e.g.
+// `\b0|` vs "0": \b0 is still alive, but the pruned closure only shows the
+// empty branch's Match). So an unresolved \b/\B assertion found ahead of
+// Match must block immediate-accept, the same as a live byte-consumer would.
 func isImmediateAccepting(states []uint32, prog *syntax.Prog) bool {
 	for _, pc := range states {
 		switch prog.Inst[pc].Op {
@@ -63,6 +77,10 @@ func isImmediateAccepting(states []uint32, prog *syntax.Prog) bool {
 		case syntax.InstRune, syntax.InstRune1,
 			syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
 			return false // byte consumer before match -> not immediate
+		case syntax.InstEmptyWidth:
+			if syntax.EmptyOp(prog.Inst[pc].Arg)&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary) != 0 {
+				return false // pending \b/\B: not yet resolvable here, treat as a live blocker
+			}
 		}
 	}
 	return false

@@ -2738,3 +2738,78 @@ regexps
 -;-;-;-
 -;0-1;-;-
 -;-;-;-
+# ============================================================
+# WordBoundaryAltPriority: a \b/\B-gated branch loses leftmost-first
+# priority to a later empty alternation branch (FUZZER_BUGS.md #24).
+# \b0|  vs "0": \b0 (higher priority, byte-consuming) should win over the
+#   empty branch -- expect find=[0,1), not the empty match [0,0).
+# \bx|  vs "x": same shape, different literal/boundary byte.
+# |\b0  and \B0|  are controls: the empty branch legitimately wins there
+#   (listed first, or the \B branch is genuinely dead at pos 0), so both
+#   were already correct before the fix and must stay correct after.
+# \b0   (no trailing alt) is a control that \b works fine in isolation.
+# All expected values cross-checked against Go stdlib regexp (col0 =
+# \A(?:PATTERN)\z, col1 = FindStringIndex).
+# ============================================================
+WordBoundaryAltPriority
+strings
+"0"
+"x"
+"00"
+"xx"
+""
+"0x"
+"x0"
+"10"
+"a0"
+regexps
+"\\b0|"
+0-1;0-1;-;-
+-;0-0;-;-
+-;0-1;-;-
+-;0-0;-;-
+0-0;0-0;-;-
+-;0-1;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"\\bx|"
+-;0-0;-;-
+0-1;0-1;-;-
+-;0-0;-;-
+-;0-1;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-1;-;-
+-;0-0;-;-
+-;0-0;-;-
+"|\\b0"
+0-1;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"\\B0|"
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"\\b0"
+0-1;0-1;-;-
+-;-;-;-
+-;0-1;-;-
+-;-;-;-
+-;-;-;-
+-;0-1;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-

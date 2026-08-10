@@ -1454,16 +1454,17 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		numExports++
 	}
 	for _, p := range patterns {
-		if p.matchExport != "" {
+		matchOff, _, findOff, captureOff, wrapperOff, namedWrapperOff := p.offsets()
+		if p.matchExport != "" && matchOff >= 0 {
 			numExports++
 		}
-		if p.findExport != "" {
+		if p.findExport != "" && findOff >= 0 {
 			numExports++
 		}
-		if p.groupsExport != "" {
+		if p.groupsExport != "" && ((p.anchored && captureOff >= 0) || (!p.anchored && wrapperOff >= 0)) {
 			numExports++
 		}
-		if p.namedGroupsExport != "" {
+		if p.namedGroupsExport != "" && namedWrapperOff >= 0 {
 			numExports++
 		}
 		if p.batchFindExport != "" {
@@ -1492,7 +1493,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+findOff))
 		}
-		if p.groupsExport != "" {
+		if p.groupsExport != "" && ((p.anchored && captureOff >= 0) || (!p.anchored && wrapperOff >= 0)) {
 			var groupsFuncIdx int
 			if p.anchored {
 				groupsFuncIdx = base + captureOff
@@ -1642,6 +1643,9 @@ func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool, use
 // literal-chain fast paths (analyseLitChainGroupsRange and friends), which
 // bypass selectBestEngine entirely.
 func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, userOpts ...CompileOptions) ([]byte, int64, error) {
+	if forceGroupsEngine != 0 && forceGroupsEngine != EngineTDFA && forceGroupsEngine != EngineBacktrack {
+		return nil, 0, fmt.Errorf("CompileForced: forceGroupsEngine must be 0, EngineTDFA, or EngineBacktrack, got %v", forceGroupsEngine)
+	}
 	var opts CompileOptions
 	if len(userOpts) > 0 {
 		opts = userOpts[0]
