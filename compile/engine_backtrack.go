@@ -290,6 +290,24 @@ func loopBodyCanMatchEmpty(prog *syntax.Prog, idom []int, loopPC int) bool {
 	return false
 }
 
+// btHasWordBoundary reports whether prog contains a \b/\B assertion —
+// used to decide whether a non-anchored captureBody needs the edge-scratch
+// mechanism (FUZZER_BUGS.md #26): patterns without any \b/\B never emit
+// btWordBoundary at all, so there's nothing for the scratch slot to fix and
+// reserving/writing it would be pure overhead.
+func btHasWordBoundary(prog *syntax.Prog) bool {
+	for _, inst := range prog.Inst {
+		if inst.Op != syntax.InstEmptyWidth {
+			continue
+		}
+		emptyOp := syntax.EmptyOp(inst.Arg)
+		if emptyOp&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // needsBitState returns true if prog contains a non-greedy loop whose body can
 // execute a full iteration without consuming a byte.  For such loops the
 // existing zero-progress guard incorrectly takes the body branch again (instead
@@ -358,8 +376,8 @@ func loopCaptureLocals(prog *syntax.Prog, idom []int, loopPC int) []uint32 {
 	return locals
 }
 
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int) []byte {
-	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, edgeScratchOff int32) []byte {
+	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, edgeScratchOff)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -374,7 +392,13 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // of being composed behind a find wrapper — in that case len is the caller's
 // full input length, not a DFA-narrowed match extent (see engine_tdfa.go's
 // identically-named parameter for the TDFA-side counterpart of this fix).
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int) []byte {
+//
+// edgeScratchOff (-1 when nativeAnchored, or when not applicable) is the
+// table-memory offset of an (origPtr,origEnd) pair the wrapper stashes
+// before calling this function, letting \b/\B checks (btWordBoundary) see
+// past the narrowed slice's edges into the true original input — see
+// FUZZER_BUGS.md #26.
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, edgeScratchOff int32) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 	numCaps := bt.numGroups
@@ -601,7 +625,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, -1)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, -1, edgeScratchOff)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -642,6 +666,7 @@ func emitBTInstHandler(
 	overflowFn func([]byte, uint32) []byte,
 	tableMemIdx int,
 	attemptStartLocal int32,
+	edgeScratchOff int32,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
@@ -939,11 +964,11 @@ func emitBTInstHandler(
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 
 		case emptyOp&syntax.EmptyWordBoundary != 0:
-			body = btWordBoundary(body, true, brRunNested)
+			body = btWordBoundary(body, true, brRunNested, tableMemIdx, edgeScratchOff)
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 
 		case emptyOp&syntax.EmptyNoWordBoundary != 0:
-			body = btWordBoundary(body, false, brRunNested)
+			body = btWordBoundary(body, false, brRunNested, tableMemIdx, edgeScratchOff)
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 		}
 
@@ -1246,14 +1271,37 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSi
 //
 // Uses scratch local to hold loaded bytes.
 // Computes: prevIsWord XOR nextIsWord; check against wantBoundary.
-func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32) []byte {
+//
+// edgeScratchOff (-1 = not applicable) is the table-memory offset of an
+// (origPtr,origEnd) pair stashed by the caller's wrapper before invoking
+// this captureBody. When the captureBody is composed behind a find
+// wrapper, its own (ptr,len) are already narrowed to the match slice, so
+// pos==0/pos==len here are edges of that slice, not necessarily the true
+// start/end of the original input — treating them as such silently drops
+// real \b context on the other side of the edge (FUZZER_BUGS.md #26).
+// When edgeScratchOff >= 0, pos==0 only counts as "no predecessor" if the
+// slice's ptr also equals the original ptr (i.e., the slice starts at true
+// position 0); otherwise it falls through to the normal ptr+pos-1 load,
+// which correctly reads the real preceding byte. Symmetric for pos==len
+// against origEnd.
+func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32, tableMemIdx int, edgeScratchOff int32) []byte {
+	useEdge := edgeScratchOff >= 0
+
 	// Compute prevIsWord (0 or 1) using block (result i32):
-	//   if pos == 0: push 0
+	//   if pos == 0 (and, if useEdge, ptr == origPtr): push 0
 	//   else: load input[pos-1]; isWordChar → push 0 or 1
 	b = append(b, 0x02, 0x7F) // block (result i32) $prevWord
 	b = append(b, 0x20, localPos)
-	b = append(b, 0x45)       // i32.eqz
-	b = append(b, 0x04, 0x40) // if void (pos == 0)
+	b = append(b, 0x45) // i32.eqz
+	if useEdge {
+		b = append(b, 0x20, localPtr)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, edgeScratchOff)
+		b = appendTableLoad32(b, tableMemIdx, 0) // origPtr
+		b = append(b, 0x46)                      // i32.eq (ptr == origPtr)
+		b = append(b, 0x71)                      // i32.and
+	}
+	b = append(b, 0x04, 0x40) // if void (pos == 0 [&& ptr == origPtr])
 	b = append(b, 0x41, 0x00) // i32.const 0
 	b = append(b, 0x0C, 0x01) // br 1 → out of $prevWord
 	b = append(b, 0x0B)       // end if
@@ -1272,8 +1320,18 @@ func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32) []byte {
 	b = append(b, 0x02, 0x7F) // block (result i32) $nextWord
 	b = append(b, 0x20, localPos)
 	b = append(b, 0x20, localLen)
-	b = append(b, 0x4F)       // i32.ge_u
-	b = append(b, 0x04, 0x40) // if void (pos >= len)
+	b = append(b, 0x4F) // i32.ge_u
+	if useEdge {
+		b = append(b, 0x20, localPtr)
+		b = append(b, 0x20, localLen)
+		b = append(b, 0x6A) // ptr + len
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, edgeScratchOff)
+		b = appendTableLoad32(b, tableMemIdx, 4) // origEnd
+		b = append(b, 0x46)                      // i32.eq (ptr+len == origEnd)
+		b = append(b, 0x71)                      // i32.and
+	}
+	b = append(b, 0x04, 0x40) // if void (pos >= len [&& ptr+len == origEnd])
 	b = append(b, 0x41, 0x00) // i32.const 0
 	b = append(b, 0x0C, 0x01) // br 1 → out of $nextWord
 	b = append(b, 0x0B)       // end if
@@ -1664,6 +1722,7 @@ func buildBTInnerDisp(
 			overflowFn,
 			tableMemIdx,
 			attemptStartLocal,
+			-1,
 		)
 	}
 	return body

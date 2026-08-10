@@ -1835,6 +1835,15 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 				if t.transitions[t.startState*256+b] >= 0 || t.transitions[t.midStartState*256+b] >= 0 {
 					l.firstByteFlags[b] = 1
 				}
+				// midStartWordState (prev=word context) can have live first
+				// bytes midStartState (prev=non-word context) doesn't share —
+				// e.g. `\b[-0]` wants '0' from midStartState but '-' only
+				// from midStartWordState. Miss this and the fast-skip never
+				// even looks at candidate bytes valid only under the word
+				// context (FUZZER_BUGS.md #26).
+				if t.hasWordBoundary && t.transitions[t.midStartWordState*256+b] >= 0 {
+					l.firstByteFlags[b] = 1
+				}
 				if wbAcceptWMid && isWordCharByte(byte(b)) {
 					l.firstByteFlags[b] = 1
 				}
@@ -4711,6 +4720,28 @@ func computePrefix(t *dfaTable) []byte {
 	prefixMid, ok := computePrefixWalk(t, t.midStartState)
 	if !ok {
 		return nil // accepting start state (incl. word/newline-boundary pre-accept): pattern can match empty → can't skip
+	}
+	// A leading \b/\B can make the mandatory first byte itself
+	// context-dependent: midStartState (prev=non-word) and
+	// midStartWordState (prev=word) can each require a DIFFERENT single
+	// byte (e.g. `\b[-0]` wants '0' from midStartState but '-' from
+	// midStartWordState — a non-word char only satisfies \b right after a
+	// word char, and vice versa). A single literal-byte fast-skip can't
+	// represent "look for '0' OR '-' depending on context", so deriving
+	// the prefix from midStartState alone silently drops every match
+	// reached via the other context (FUZZER_BUGS.md #26). Divergence can
+	// only appear at this first byte — once a byte is consumed, later
+	// transitions no longer depend on the external prevWasWord context,
+	// only on which (already-doubled) state it landed in — so checking
+	// just the first byte here is sufficient; wasmPrefixEndWord already
+	// safely handles the case where midStartWordState dies partway
+	// through walking prefixMid's own bytes.
+	if t.hasWordBoundary && len(prefixMid) > 0 {
+		for b := 0; b < 256; b++ {
+			if t.transitions[t.midStartWordState*256+b] >= 0 && b != int(prefixMid[0]) {
+				return nil
+			}
+		}
 	}
 	if t.startBeginAccept {
 		return nil // pattern matches empty at position 0 via begin anchor (e.g. a*^)

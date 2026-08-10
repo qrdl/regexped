@@ -1131,7 +1131,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		if p.captureBody != nil {
 			cs_bytes = append(cs_bytes, p.captureBody...)
 			if !p.anchored {
-				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups)
+				wrapperTableMemIdx := 0
+				if !standalone {
+					wrapperTableMemIdx = 1
+				}
+				edgeOff := int32(-1)
+				if !p.isTDFA {
+					edgeOff = p.edgeScratchOff
+				}
+				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, edgeOff)
 				if p.namedGroupsExport != "" {
 					cs_bytes = appendNamedGroupsWrapperCodeEntry(cs_bytes, base+wrapperOff)
 				}
@@ -1146,7 +1154,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			if p.anchored {
 				cs_bytes = appendBatchLitChainGroupsWrapperCodeEntry(cs_bytes, base+captureOff, p.numGroups)
 			} else {
-				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups)
+				batchTableMemIdx := 0
+				if !standalone {
+					batchTableMemIdx = 1
+				}
+				edgeOff := int32(-1)
+				if !p.isTDFA {
+					edgeOff = p.edgeScratchOff
+				}
+				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, edgeOff)
 			}
 		}
 	}
