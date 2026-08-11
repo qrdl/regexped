@@ -8,11 +8,14 @@
 package fuzz
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"regexp/syntax"
 	"strings"
 	"testing"
+
+	"github.com/qrdl/regexped/compile"
 )
 
 // seedFile is the shared re2test custom corpus, used as fuzz seeds.
@@ -31,7 +34,7 @@ func FuzzCorrectness(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, pat, input string) {
-		if hasUnsupportedUnicode(pat) || hasUnsupportedUnicode(input) {
+		if hasUnsupportedUnicode(input) {
 			t.Skip() // regexped's DFA/find path is byte-oriented; Unicode is out of scope (see CLAUDE.md)
 		}
 		if len(input) >= inputCap {
@@ -40,6 +43,13 @@ func FuzzCorrectness(f *testing.F) {
 		if _, err := syntax.Parse(pat, syntax.Perl); err != nil {
 			t.Skip() // not a regexp at all
 		}
+		// Use the compiler's own predicate rather than hasUnsupportedUnicode's
+		// raw-string scan: escapes like \x80 are pure ASCII text but denote a
+		// non-ASCII codepoint once parsed, which the raw scan can't see (see
+		// the \x80 fuzz failure this replaced).
+		if needsUnicode, err := compile.NeedsUnicodeSupport(pat); err != nil || needsUnicode {
+			t.Skip() // requires Unicode support — out of scope (see CLAUDE.md), or doesn't parse
+		}
 		ref, err := regexp.Compile(pat)
 		if err != nil {
 			t.Skip() // Go stdlib rejects it too — no oracle to compare against
@@ -47,7 +57,10 @@ func FuzzCorrectness(f *testing.F) {
 
 		wasmBytes, compErr := compileFind(pat)
 		if compErr != nil {
-			t.Skip() // unsupported syntax / engine state limit — not a regexped bug
+			if errors.Is(compErr, compile.ErrBTProgramTooLarge) {
+				t.Skip() // legitimate resource ceiling, no further fallback possible — not a regexped bug
+			}
+			t.Fatalf("compile error on a pattern Go stdlib accepts: pat=%q: %v", pat, compErr)
 		}
 
 		expected := ref.FindStringIndex(input)

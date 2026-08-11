@@ -262,6 +262,12 @@ The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps
 
 **Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns -1 (no match) rather than corrupting memory.
 
+### Program size cap
+
+The Backtracking engine's WASM emission is `br_table`-based with one case per NFA instruction, so emitted module size scales roughly linearly with the NFA program's instruction count (`len(prog.Inst)` after `regexp/syntax` compilation) — a confirmed pathological pattern (a large literal byte run repeated under an unbounded quantifier) produced a 123,695-instruction program and a 7,966,121-byte module, exceeding wasmtime's own ~7,654,321-byte function-body-size limit and failing to load at runtime.
+
+Every construction site that can route to Backtracking — the no-capture find/match fallback (taken when the primary DFA is rejected as too large), the capture-tracking fallback (taken when a capture pattern is not TDFA-eligible), and the general engine-executor path (`Compile`/`CompileForced`/`SelectEngine` callers, including explicit `ForceEngine: EngineBacktrack`) — checks `len(prog.Inst)` against `maxBTFallbackInstructions` (20,000) before emitting any WASM. Exceeding the cap fails compilation with a clear error (`errBTProgramTooLarge`) instead of silently producing an oversized module that only fails once a WASM runtime tries to load it. The 20,000 threshold assumes a 3x-worse bytes/instruction ratio than the confirmed repro, targeting a worst-case module size comfortably under wasmtime's limit — real-world patterns are nowhere near it; hand-written patterns typically compile to tens or low hundreds of NFA instructions, so the cap only rejects pathological inputs (e.g. fuzzer-generated giant literal runs), not practical usage.
+
 ### BitState memoization
 
 Memoization is only enabled when the pattern contains a **non-greedy loop whose body can match zero bytes** — the condition checked by `needsBitState`. Patterns like `(a+)*` or `(?:b*)*` do not need it; patterns like `(?:(?:(a){0,})*?)` do, because the inner loop body can succeed without consuming input, causing the engine to revisit the same `(state, position)` pair infinitely.

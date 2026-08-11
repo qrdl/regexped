@@ -23,28 +23,36 @@ import (
 // non-nil error from compile() correctly with no changes needed.
 var errDFAStateLimitExceeded = errors.New("compile: DFA state limit exceeded during construction")
 
-// errBTProgramTooLarge is returned when compile() would fall back to the
-// Backtracking engine (because the primary DFA was rejected as too large)
-// but the underlying NFA program is itself too large for the Backtracking
-// engine's br_table-per-instruction WASM emission to produce a module the
-// WASM runtime can load. Without this check, such patterns silently
-// compile to a WASM module that fails to even parse at load time (observed:
-// a 123,695-instruction program produced a 7,966,121-byte module, exceeding
-// wasmtime's own ~7,654,321-byte function-body-size limit) instead of
-// failing compilation with a clear error.
-var errBTProgramTooLarge = errors.New("compile: backtracking fallback program exceeds size limit")
+// ErrBTProgramTooLarge is returned whenever compile() would route a pattern
+// to the Backtracking engine — whether because the primary DFA was rejected
+// as too large, TDFA was ineligible for a capture pattern, or ForceEngine
+// requested it directly — but the underlying NFA program is itself too
+// large for the Backtracking engine's br_table-per-instruction WASM
+// emission to produce a module the WASM runtime can load. Without this
+// check, such patterns silently compile to a WASM module that fails to
+// even parse at load time (observed: a 123,695-instruction program
+// produced a 7,966,121-byte module, exceeding wasmtime's own
+// ~7,654,321-byte function-body-size limit) instead of failing compilation
+// with a clear error.
+//
+// Exported (unlike errDFAStateLimitExceeded) so external callers — e.g.
+// tools/fuzz's FuzzCorrectness — can distinguish this legitimate,
+// no-further-fallback-possible resource ceiling from any other compile
+// error via errors.Is.
+var ErrBTProgramTooLarge = errors.New("compile: backtracking fallback program exceeds size limit")
 
-// maxBTFallbackInstructions caps the NFA program size (len(prog.Inst)) the
-// Backtracking engine's find/match fallback path (taken when the primary
-// DFA is rejected as too large) is willing to turn into WASM.
-// buildBTFindBody/buildBTMatchBody emit one br_table case per instruction;
-// the confirmed pathological repro (123,695 instructions) produced ~64
-// bytes of WASM per instruction. This cap assumes a 3x-worse ratio (~200
-// bytes/instruction) and targets a worst-case body size comfortably below
-// wasmtime's ~7,654,321-byte function-body-size limit, while staying well
-// above any NFA program size this package's own test suite produces via
-// the legitimate (small-pattern, tiny-MaxDFAStates-forced) DFA-too-large
-// fallback path.
+// maxBTFallbackInstructions caps the NFA program size (len(prog.Inst)) any
+// Backtracking engine construction site — no-capture find/match fallback,
+// capture-tracking fallback when TDFA is ineligible, and the general
+// engine-executor path — is willing to turn into WASM.
+// buildBTFindBody/buildBTMatchBody/appendBT{Match,Find}CodeEntry emit one
+// br_table case per instruction; the confirmed pathological repro (123,695
+// instructions) produced ~64 bytes of WASM per instruction. This cap
+// assumes a 3x-worse ratio (~200 bytes/instruction) and targets a
+// worst-case body size comfortably below wasmtime's ~7,654,321-byte
+// function-body-size limit, while staying well above any NFA program size
+// this package's own test suite produces via the legitimate (small-pattern,
+// tiny-MaxDFAStates-forced) DFA-too-large fallback path.
 const maxBTFallbackInstructions = 20000
 
 // EngineType represents the type of regexp engine implementation.
@@ -855,7 +863,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// DFA too large — fall back to Backtracking match.
 			btProg := compileBTProg(re.Pattern)
 			if len(btProg.Inst) > maxBTFallbackInstructions {
-				return nil, errBTProgramTooLarge
+				return nil, ErrBTProgramTooLarge
 			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
@@ -962,7 +970,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// DFA too large — fall back to Backtracking find.
 			btProg := compileBTProg(re.Pattern)
 			if len(btProg.Inst) > maxBTFallbackInstructions {
-				return nil, errBTProgramTooLarge
+				return nil, ErrBTProgramTooLarge
 			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
@@ -1326,6 +1334,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	if groupsEngine == EngineBacktrack {
+		if len(prog.Inst) > maxBTFallbackInstructions {
+			return nil, ErrBTProgramTooLarge
+		}
 		bt := newBacktrack(prog)
 
 		// Stack placed directly after all find-mode DFA and lit-anchor tables.
@@ -1905,6 +1916,23 @@ func stripCaptures(re *syntax.Regexp) {
 	}
 }
 
+// NeedsUnicodeSupport reports whether pattern requires CompileOptions.Unicode
+// to compile — i.e. its NFA program contains a rune class reachable only via
+// non-ASCII codepoints (see needsUnicodeSupport). Exported so external
+// correctness harnesses (e.g. tools/fuzz) can pre-filter Unicode-requiring
+// patterns using the exact predicate compile() applies internally, instead
+// of approximating it by scanning the raw pattern string — which misses
+// escapes like `\x80` that are pure ASCII text but denote a non-ASCII
+// codepoint once parsed. Returns an error if the pattern cannot be parsed.
+func NeedsUnicodeSupport(pattern string) (bool, error) {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return false, fmt.Errorf("parse error: %w", err)
+	}
+	prog, _ := syntax.Compile(re.Simplify())
+	return needsUnicodeSupport(prog), nil
+}
+
 // SelectEngine returns the EngineType that would be chosen for the given pattern,
 // without actually compiling it. Returns an error if the pattern cannot be parsed
 // or compiled to NFA bytecode.
@@ -1964,6 +1992,9 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 		}
 		return d, nil
 	case EngineBacktrack:
+		if len(prog.Inst) > maxBTFallbackInstructions {
+			return nil, ErrBTProgramTooLarge
+		}
 		return newBacktrack(prog), nil
 	default:
 		return nil, fmt.Errorf("engine %v not yet supported by wasm compiler", engineType)

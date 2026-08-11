@@ -448,6 +448,19 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool, 
 	return m
 }
 
+// nfaStatesKey returns a byte-exact encoding of an NFA state-PC slice, used
+// to detect identical nextNFAStates values recurring across different input
+// bytes within a single DFA state's transition-building loop (see newDFA).
+// Plain fixed-width binary encoding — not string(rune(pc)) — avoids Unicode
+// surrogate-range collisions once PC values run into the tens of thousands.
+func nfaStatesKey(states []uint32) string {
+	buf := make([]byte, len(states)*4)
+	for i, pc := range states {
+		binary.LittleEndian.PutUint32(buf[i*4:], pc)
+	}
+	return string(buf)
+}
+
 // newDFA converts syntax.Prog (NFA bytecode) to DFA using subset construction.
 // patternBitsArg is optional: if provided, patternBitsArg[0][pc] gives the bitmask
 // for NFA instruction pc; InstMatch instructions accumulate their bits into the accept maps.
@@ -951,6 +964,19 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 			dfa.unicodeTrans[item.dfaState] = make(map[rune]int)
 		}
 
+		// Many bytes within a class (e.g. every non-excluded byte under `.`)
+		// share an identical nextNFAStates target set and therefore resolve to
+		// the identical epsilon closure and DFA state. Cache by that raw
+		// pre-closure key so repeats within this state's byte loop skip both
+		// the closure walk (nfaEpsilonClosure allocates a fresh map per call)
+		// and getOrAddState's own key-build/lookup work. Scoped per-item (reset
+		// every iteration of the outer queue loop): safe because epsilonClosure
+		// and getOrAddState are pure functions of (nextNFAStates content, ctx,
+		// flags), so caching cannot change which DFA states get created or the
+		// order they're first created in — only skips redundant recomputation.
+		wordClosureCache := make(map[string]int)
+		nonWordClosureCache := make(map[string]int)
+
 		// Process all 256 bytes in fixed order to ensure deterministic DFA state
 		// numbering. Iterating inputMapWord/inputMapNonWord as maps would create
 		// states in non-deterministic order (Go map iteration is randomised).
@@ -961,8 +987,13 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				if !ok {
 					continue
 				}
-				nextSet := epsilonClosure(nextNFAStates, 0)
-				nextDFAState := getOrAddState(nextSet, true)
+				key := nfaStatesKey(nextNFAStates)
+				nextDFAState, cached := wordClosureCache[key]
+				if !cached {
+					nextSet := epsilonClosure(nextNFAStates, 0)
+					nextDFAState = getOrAddState(nextSet, true)
+					wordClosureCache[key] = nextDFAState
+				}
 				dfa.unicodeTrans[item.dfaState][r] = nextDFAState
 			} else if dfa.hasNewlineBoundary && r == '\n' {
 				// '\n' is non-word; if newline-boundary is active, handle it separately
@@ -979,8 +1010,13 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				if !ok {
 					continue
 				}
-				nextSet := epsilonClosure(nextNFAStates, 0)
-				nextDFAState := getOrAddState(nextSet, false)
+				key := nfaStatesKey(nextNFAStates)
+				nextDFAState, cached := nonWordClosureCache[key]
+				if !cached {
+					nextSet := epsilonClosure(nextNFAStates, 0)
+					nextDFAState = getOrAddState(nextSet, false)
+					nonWordClosureCache[key] = nextDFAState
+				}
 				dfa.unicodeTrans[item.dfaState][r] = nextDFAState
 			}
 		}
