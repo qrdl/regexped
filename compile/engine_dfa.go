@@ -6739,11 +6739,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 					b = append(b, 0x6A)       // i32.add
 					b = append(b, 0x21, 0x03) // pos = attempt_start + prefix_len
 				} else {
-					// state = startState / midStartState / midStartWordState
-					if startState == midStartState && (!hasWordBoundary || midStartState == midStartWordState) {
+					// state = startState / midStartState / midStartWordState / midStartNewlineState
+					if startState == midStartState && (!hasWordBoundary || midStartState == midStartWordState) && (!hasNewlineBoundary || midStartState == midStartNewlineState) {
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, int32(startState))
-					} else if !hasWordBoundary {
+					} else if !hasWordBoundary && !hasNewlineBoundary {
 						b = append(b, 0x20, 0x04) // local.get attempt_start
 						b = append(b, 0x45)       // i32.eqz
 						b = append(b, 0x04, 0x7F) // if (result i32)
@@ -6753,8 +6753,34 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, int32(midStartState))
 						b = append(b, 0x0B) // end if
+					} else if hasNewlineBoundary && !hasWordBoundary {
+						// (?m:^)/(?m:$) without \b/\B: check whether the
+						// previous byte was '\n' to pick midStartNewlineState.
+						b = append(b, 0x20, 0x04) // local.get attempt_start
+						b = append(b, 0x45)       // i32.eqz
+						b = append(b, 0x04, 0x7F) // if (result i32)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(startState))
+						b = append(b, 0x05) // else
+						b = append(b, 0x20, 0x00) // local.get ptr
+						b = append(b, 0x20, 0x04) // local.get attempt_start
+						b = append(b, 0x6A)       // i32.add
+						b = append(b, 0x41, 0x01) // i32.const 1
+						b = append(b, 0x6B)       // i32.sub
+						b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (prev byte)
+						b = append(b, 0x41, 0x0A)       // '\n'
+						b = append(b, 0x46)             // i32.eq
+						b = append(b, 0x04, 0x7F)       // if (result i32)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(midStartNewlineState))
+						b = append(b, 0x05) // else
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(midStartState))
+						b = append(b, 0x0B) // end if prev=='\n'
+						b = append(b, 0x0B) // end if attempt_start == 0
 					} else {
-						// Word boundary: check previous byte.
+						// Word boundary (possibly combined with newline
+						// boundary): check previous byte.
 						b = append(b, 0x20, 0x04) // local.get attempt_start
 						b = append(b, 0x45)       // i32.eqz
 						b = append(b, 0x04, 0x7F) // if (result i32)
@@ -6775,8 +6801,25 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, int32(midStartWordState))
 						b = append(b, 0x05) // else
+						if hasNewlineBoundary {
+							b = append(b, 0x20, 0x00) // local.get ptr
+							b = append(b, 0x20, 0x04) // local.get attempt_start
+							b = append(b, 0x6A)       // i32.add
+							b = append(b, 0x41, 0x01) // i32.const 1
+							b = append(b, 0x6B)       // i32.sub
+							b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (prev byte)
+							b = append(b, 0x41, 0x0A)       // '\n'
+							b = append(b, 0x46)             // i32.eq
+							b = append(b, 0x04, 0x7F)       // if (result i32)
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32(midStartNewlineState))
+							b = append(b, 0x05) // else
+						}
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, int32(midStartState))
+						if hasNewlineBoundary {
+							b = append(b, 0x0B) // end if prev=='\n'
+						}
 						b = append(b, 0x0B) // end if isWordChar
 						b = append(b, 0x0B) // end if attempt_start == 0
 					}
