@@ -23,6 +23,30 @@ import (
 // non-nil error from compile() correctly with no changes needed.
 var errDFAStateLimitExceeded = errors.New("compile: DFA state limit exceeded during construction")
 
+// errBTProgramTooLarge is returned when compile() would fall back to the
+// Backtracking engine (because the primary DFA was rejected as too large)
+// but the underlying NFA program is itself too large for the Backtracking
+// engine's br_table-per-instruction WASM emission to produce a module the
+// WASM runtime can load. Without this check, such patterns silently
+// compile to a WASM module that fails to even parse at load time (observed:
+// a 123,695-instruction program produced a 7,966,121-byte module, exceeding
+// wasmtime's own ~7,654,321-byte function-body-size limit) instead of
+// failing compilation with a clear error.
+var errBTProgramTooLarge = errors.New("compile: backtracking fallback program exceeds size limit")
+
+// maxBTFallbackInstructions caps the NFA program size (len(prog.Inst)) the
+// Backtracking engine's find/match fallback path (taken when the primary
+// DFA is rejected as too large) is willing to turn into WASM.
+// buildBTFindBody/buildBTMatchBody emit one br_table case per instruction;
+// the confirmed pathological repro (123,695 instructions) produced ~64
+// bytes of WASM per instruction. This cap assumes a 3x-worse ratio (~200
+// bytes/instruction) and targets a worst-case body size comfortably below
+// wasmtime's ~7,654,321-byte function-body-size limit, while staying well
+// above any NFA program size this package's own test suite produces via
+// the legitimate (small-pattern, tiny-MaxDFAStates-forced) DFA-too-large
+// fallback path.
+const maxBTFallbackInstructions = 20000
+
 // EngineType represents the type of regexp engine implementation.
 type EngineType byte
 
@@ -830,6 +854,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		if llErr != nil || llTable.numStates > maxStates || (memLimit > 0 && dfaTableBytes(llTable) > memLimit) {
 			// DFA too large — fall back to Backtracking match.
 			btProg := compileBTProg(re.Pattern)
+			if len(btProg.Inst) > maxBTFallbackInstructions {
+				return nil, errBTProgramTooLarge
+			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
 			useMemo := needsBitState(btProg)
@@ -934,6 +961,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		if dfaTooLarge {
 			// DFA too large — fall back to Backtracking find.
 			btProg := compileBTProg(re.Pattern)
+			if len(btProg.Inst) > maxBTFallbackInstructions {
+				return nil, errBTProgramTooLarge
+			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
 			useMemo := needsBitState(btProg)
