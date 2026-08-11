@@ -2876,3 +2876,276 @@ regexps
 -;-;-;-;-;-
 -;-;-;-;-;-
 -;2-4;-;-;-;2-4 2-3
+# ============================================================
+# Category (FUZZER_BUGS.md #1): \B immediately before ^/\A loses the
+# begin-of-text context. state 0's mid-accept computation resolved \B
+# (ecNoWordBoundary/ecWordBoundary) without also carrying ecBegin, so the
+# chained ^/\A check behind it could never fire. \B^ / \B\A must match
+# empty at [0,0) on "" (both \B and ^/\A hold trivially at the true start
+# of an empty string) but must NOT match on any non-empty input starting
+# with a word char ("a", "0") or even a non-word char (" ") where \B holds
+# but the pattern can't consume anything, so anchored full-match always
+# fails on non-empty input. ^\B / \A\B (assertion order reversed) are
+# controls that were already correct before the fix and must stay correct.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug1AssertionOrder
+strings
+""
+" "
+"a"
+"0"
+regexps
+"\\B^"
+0-0;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"\\B\\A"
+0-0;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"^\\B"
+0-0;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"\\A\\B"
+0-0;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #2): a \b/\B branch's resolved empty-accept can
+# be silently overwritten by a lower-priority live branch. emitWBPreAcceptCheck
+# recorded last_accept on a mid-accept hit but fell through into the regular
+# byte-transition code instead of branching out of the scan loop, so a
+# later-position match from a lower-priority live branch (0*) could
+# overwrite the higher-priority \b branch's already-correct empty match.
+# \b|0* on "0": \b fires at pos 0 (crossing non-word->word), must win over
+# 0*'s greedy consumption -> expect [0,0), not [0,1). 0*|\b (branch order
+# reversed) is a control: 0* legitimately wins there since it's the
+# higher-priority branch. -(?:\b|0*) on "-0" reproduces one state deeper
+# (not state-0-specific).
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug2AltPriorityWordBoundary
+strings
+""
+"0"
+"-0"
+"x0"
+regexps
+"\\b|0*"
+0-0;0-0;-;-
+0-1;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"0*|\\b"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;0-0;-;-
+-;0-0;-;-
+"-(?:\\b|0*)"
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #3): Teddy lookahead-tier construction extends
+# past an already-accepting state. The 2-/3-/4-byte Teddy lookahead tiers
+# (find-mode, no fixed prefix, <=8 first-byte candidates) only checked
+# whether some byte continues from the lookahead state, never whether that
+# state can already end a match — requiring a further live byte past a
+# legitimate match end is unsound. [01]+ on a 20-byte input with a real
+# match of only 3 bytes ("0002...") wrongly extended into a later, longer
+# run instead of stopping at [0,3). (?i:A0*) on a similarly-sized input
+# whose true match never has 3+ trailing continuations wrongly reported no
+# match at all instead of [12,15). "00020" (no full 16-byte SIMD chunk) is
+# a control confirming the bug needs the SIMD-chunk path.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug3TeddyTierOverextension
+strings
+""
+"00020"
+"0002000000000000000"
+"000000000000A001000"
+regexps
+"[01]+"
+-;-;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-12;-;-
+"(?i:A0*)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;12-15;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #4): lenient-alt $-terminated branches accept
+# before reaching true end-of-text. emitInlineAnchoredDFAVerify's per-branch
+# DFA verify checked only the EOF-only acceptStates bitmap on every
+# iteration instead of splitting it from the mid-scan-safe midAccept table
+# — so a state that can only legitimately accept at true EOF got recorded
+# as a match as soon as it was merely reached. Reproduces whenever the
+# first alternative branch dies immediately and a later $-terminated
+# branch's accept gets recorded one byte early: 10$|0$ on "00", a$|b$ on
+# "aa", a$|0$ on "0a" all wrongly matched one byte short of the true end.
+# a$ (single branch) and x0$ (literal fails outright) are controls that
+# were already correct and must stay correct.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug4LenientAltEarlyAccept
+strings
+"00"
+"aa"
+"0a"
+"a"
+"0"
+regexps
+"10$|0$"
+-;1-2;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-1;0-1;-;-
+"a$|b$"
+-;-;-;-
+-;1-2;-;-
+-;1-2;-;-
+0-1;0-1;-;-
+-;-;-;-
+"a$|0$"
+-;1-2;-;-
+-;1-2;-;-
+-;1-2;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+"a$"
+-;-;-;-
+-;1-2;-;-
+-;1-2;-;-
+0-1;0-1;-;-
+-;-;-;-
+"x0$"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #5): dominant-self-loop bulk-skip leaves
+# last_accept stale across a 16-byte chunk boundary. emitDominantBulkSkip's
+# "no exit found in this chunk" branch advanced pos by 16 without also
+# advancing last_accept, even though every byte just confirmed exit-free is
+# itself a valid match end — normally self-healing on the next per-byte
+# iteration, but visible whenever that next byte is the exit byte itself.
+# Fires exactly when the self-loop run length is 16k+1 bytes (k>=1) before
+# the exit byte: [^\n]*/[^\n]+ on a 17-zero run + "\n" (len 18) and a
+# 33-zero run + "\n" (len 34, second boundary point) both under-matched to
+# a single byte instead of consuming the full run. a[^\n]* on "a" + 17
+# zeros + "\n" reproduces the same shape shifted by one byte (mandatory-
+# literal find path). A short (3-zero) run is a control confirming
+# correctness away from the 16k+1 boundary.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug5DominantBulkSkipStale
+strings
+"000\n"
+"00000000000000000\n"
+"000000000000000000000000000000000\n"
+"a00000000000000000\n"
+regexps
+"[^\\n]*"
+-;0-3;-;-
+-;0-17;-;-
+-;0-33;-;-
+-;0-18;-;-
+"[^\\n]+"
+-;0-3;-;-
+-;0-17;-;-
+-;0-33;-;-
+-;0-18;-;-
+"a[^\\n]*"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-18;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #6): multiline ^$ fails at true end-of-text
+# reached via the midStartNewline restart context. emitOuterPrologue's
+# no-mandatory-literal bootstrap-state selection never checked
+# hasNewlineBoundary / whether the preceding byte was '\n', so a restart
+# attempt right after a '\n' always picked the generic midStartState
+# (not accepting) instead of midStartNewlineState (accepting) — unlike the
+# sibling emitDFAPrologue path, which already handled this correctly.
+# (?m:^$) on "0\n": position 2 is true end-of-text immediately preceded by
+# '\n' — multiline ^ and $ both hold simultaneously, expect [2,2), not no
+# match. "" and "\n\n" resolve at attempt_start==0 (never touching the
+# buggy branch) and are controls. (?m:$) alone / a(?m:$) never need
+# midStartNewline (no ^ to require it) and are controls too.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug6MultilineNewlineRestart
+strings
+""
+"0\n"
+"\n\n"
+"0"
+"aa"
+regexps
+"(?m:^$)"
+0-0;0-0;-;-
+-;2-2;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"(?m:$)"
+0-0;0-0;-;-
+-;1-1;-;-
+-;0-0;-;-
+-;1-1;-;-
+-;2-2;-;-
+"a(?m:$)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;1-2;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #9): lenient-alt DFA-branch verify never emits
+# its midAccept data segment. planLenAltLayout's per-branch DFA layout
+# computed midAcceptOff/midAcceptBytes unconditionally but dfaDataSegments'
+# non-find branch only emitted the backing data segment when a dominant
+# self-loop or TDFA accept-side-table was present — neither holds for a
+# plain literal-then-trailing-no-op branch, so the reserved address read
+# back as zero and only the EOF-only accept check could ever record a
+# match for that branch. Reproduces when the second alternative is a
+# literal immediately followed by an empty trailing node and the branch's
+# own match can only be confirmed before true end-of-input: x$|a(?:) on
+# "a0" wrongly reported no match instead of [0,1) (the "a" branch's match
+# is confirmed at pos 1, one byte before the true end). "a" alone (single-
+# char input, match lands exactly at true EOF) and 00$|a(?:) (first branch
+# also viable) are controls. b0 (neither branch matches) rounds out the
+# no-match case.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug9LenientAltMissingMidAccept
+strings
+"a0"
+"a"
+"00"
+"b0"
+regexps
+"00$|a(?:)"
+-;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+-;-;-;-
+"x$|a(?:)"
+-;0-1;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
