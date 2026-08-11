@@ -11644,21 +11644,40 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	b = append(b, 0x21, locOutEnd)
 
 	// loop $dfa
-	//   if pos >= len: break (check accept and finish)
+	//   if pos >= len (true EOF): if acceptStates[state] (EOF-only accept):
+	//       last_accept = pos; break
 	//   state = transition(state, input[pos])
 	//   if state == 0 (dead): break
-	//   if accept[state]: last_accept = pos + 1
+	//   if midAccept[state] (accept valid at any position): last_accept = pos + 1
 	//   pos++; br $dfa
+	//
+	// midAccept and acceptStates are deliberately two different tables:
+	// acceptStates (dl.acceptLimit partition) means "accepting IF this were
+	// true end of input" — only sound to consult once pos>=len actually
+	// holds. midAccept (dl.midAcceptOff table) means "accepting regardless
+	// of position" — sound to consult on every iteration. A branch ending in
+	// an end-anchor ($/\z) has states that are acceptStates-true but
+	// midAccept-false; checking acceptStates unconditionally (as before)
+	// wrongly accepted such branches before reaching true end-of-input. See
+	// FUZZER_BUGS.md #4.
 	//
 	// Structure: block $dfa_done { loop $dfa { ... } }
 	b = append(b, 0x02, 0x40) // block $dfa_done
 	b = append(b, 0x03, 0x40) // loop $dfa
 
-	// if pos >= len: br 1 → $dfa_done
+	// if pos >= len (true EOF)
 	b = append(b, 0x20, locPos)
 	b = append(b, 0x20, locLen)
 	b = append(b, 0x4F)       // i32.ge_u
-	b = append(b, 0x0D, 0x01) // br_if 1 → $dfa_done
+	b = append(b, 0x04, 0x40) // if (void)   [depth: if=0, loop=1, block=2]
+	// if acceptStates[state] (EOF-only accept): last_accept = pos
+	b = emitAcceptBitOnStack(b, locState, dl.acceptLimit)
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x20, locPos)
+	b = append(b, 0x21, locOutEnd)
+	b = append(b, 0x0B)       // end if (EOF accept)
+	b = append(b, 0x0C, 0x02) // br 2 → $dfa_done (0=this if, 1=loop, 2=block)
+	b = append(b, 0x0B)       // end if (pos>=len)
 
 	// Transition: state = table[state * numClasses + class(input[pos])].
 	if dl.useCompression {
@@ -11674,9 +11693,13 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	b = append(b, 0x45)       // i32.eqz
 	b = append(b, 0x0D, 0x01) // br_if 1 → $dfa_done
 
-	// if accept[state]: last_accept = pos + 1
-	b = emitAcceptBitOnStack(b, locState, dl.acceptLimit)
-	b = append(b, 0x04, 0x40) // if (void)
+	// if midAccept[state]: last_accept = pos + 1
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, dl.midAcceptOff)
+	b = append(b, 0x20, locState)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+	b = append(b, 0x04, 0x40)             // if (void)
 	b = append(b, 0x20, locPos)
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6A)
