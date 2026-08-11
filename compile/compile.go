@@ -610,7 +610,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 							tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true,
 								resolveCompiledDFAThreshold(&buildOpts), true, false, false, false)
 							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, false)
-							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false))
+							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
 							p.dataBytes = append(p.dataBytes, rawTDFA...)
 							p.dataSegCount += cntTDFA
 							p.tableEnd = tdfaLayout.tableEnd
@@ -868,7 +868,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// gated on fuel only.
 			applyDominantStateEncoding(lm, true)
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
-			rawM, cntM := stripSegCount(dfaDataSegments(lm, false))
+			rawM, cntM := stripSegCount(dfaDataSegments(lm, false, false))
 			matchData = rawM
 			matchSegCnt = cntM
 			matchEnd = lm.tableEnd
@@ -1073,7 +1073,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 							litTeddyT1HiBytes = t1Hi
 						}
 
-						revRawData, revSegCnt := stripSegCount(dfaDataSegments(revL, true))
+						revRawData, revSegCnt := stripSegCount(dfaDataSegments(revL, true, false))
 						var litSegs []byte
 						litSegCnt := 1
 						litSegs = appendDataSegment(litSegs, litFirstByteOff, litFirstByteFlags[:])
@@ -1211,7 +1211,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// branch compiles its own independent forward DFA inside
 			// compileAltLitAnchorBranches — so l's combined-alternation
 			// tables would be dead weight here and are skipped.
-			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody))
+			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody, false))
 			if p.altLitAnchorBranches == nil {
 				p.dataBytes = append(p.dataBytes, rawData...)
 				p.dataSegCount += segCount
@@ -1222,7 +1222,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 	} else if !dfaTooLarge {
 		// needFindBody is false but we still need the DFA data segments (for match only).
-		rawData, segCount := stripSegCount(dfaDataSegments(l, false))
+		rawData, segCount := stripSegCount(dfaDataSegments(l, false, false))
 		p.dataBytes = append(p.dataBytes, rawData...)
 		p.dataSegCount += segCount
 		p.tableEnd = l.tableEnd
@@ -1289,7 +1289,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored)
 			// TDFA only needs the transition table (no stack/memo).
 			p.tableEnd = tdfaLayout.tableEnd
-			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false))
+			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
 			p.dataBytes = append(p.dataBytes, rawTDFA...)
 			p.dataSegCount += cntTDFA
 		}

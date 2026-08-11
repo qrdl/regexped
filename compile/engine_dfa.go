@@ -3008,7 +3008,13 @@ func applyDominantStateEncoding(l *dfaLayout, encodeNonMid bool) {
 
 // dfaDataSegments builds the raw data-section payload (count byte + segments)
 // for a DFA layout. needFind controls whether find-mode-only tables are emitted.
-func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
+// forceMidAccept overrides the dominant-state/TDFA gating on the non-find
+// midAccept segment: some callers (e.g. planLenAltLayout's per-branch
+// anchored-verify DFA, consumed by emitInlineAnchoredDFAVerify) read
+// l.midAcceptOff unconditionally regardless of dominant states, and need the
+// backing data segment emitted even though nothing else on this layout would
+// otherwise require it (FUZZER_BUGS.md #9).
+func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 	// DFA paths (useAcceptSideTable=false): no accept side table; acceptLimit
 	// partitions state IDs so the runtime check is `(state-1) u< acceptLimit`.
 	// TDFA path (useAcceptSideTable=true): state IDs are not partitioned, so a
@@ -3109,7 +3115,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			// unconditionally: buildTDFAMatchBody's dead-transition handler
 			// reads it to fall back to a shorter, already-valid match instead
 			// of failing outright (plans/FUZZER_BUGS.md §10.2).
-			emitMidAccept := len(l.dominantStates) > 0 || l.useAcceptSideTable
+			emitMidAccept := len(l.dominantStates) > 0 || l.useAcceptSideTable || forceMidAccept
 			count := byte(2) // classMap + transitions
 			if emitMidAccept {
 				count++
@@ -3188,7 +3194,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool) []byte {
 			// unconditionally: buildTDFAMatchBody's dead-transition handler
 			// reads it to fall back to a shorter, already-valid match instead
 			// of failing outright (plans/FUZZER_BUGS.md §10.2).
-			emitMidAccept := len(l.dominantStates) > 0 || l.useAcceptSideTable
+			emitMidAccept := len(l.dominantStates) > 0 || l.useAcceptSideTable || forceMidAccept
 			count := byte(1) // transitions
 			if emitMidAccept {
 				count++
@@ -3321,7 +3327,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	wbNWBitmaskOff := immBitmaskOff + int32(l.numWASM)*8
 	wbWBitmaskOff := wbNWBitmaskOff + int32(l.numWASM)*8
 
-	layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false))
+	layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false, false))
 	dataBytes = append(dataBytes, layoutRaw...)
 	dataBytes = append(dataBytes, appendDataSegment(nil, midBitmaskOff, writeBitmask(t.midAcceptStates))...)
 	dataBytes = append(dataBytes, appendDataSegment(nil, eofBitmaskOff, writeBitmask(t.acceptStates))...)
@@ -11615,7 +11621,10 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 		// DFA branch: build its layout starting at cur.
 		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false, false, false, false)
 		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
-		raw, segCount := stripSegCount(dfaDataSegments(br.dfaLayout, false))
+		// forceMidAccept=true: emitInlineAnchoredDFAVerify reads dl.midAcceptOff
+		// unconditionally (FUZZER_BUGS.md #4/#9) regardless of dominant states,
+		// so the backing data segment must always be emitted here.
+		raw, segCount := stripSegCount(dfaDataSegments(br.dfaLayout, false, true))
 		br.dfaDataBytes = raw
 		br.dfaSegCount = segCount
 		cur = br.dfaLayout.tableEnd

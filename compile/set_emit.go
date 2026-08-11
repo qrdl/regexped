@@ -289,7 +289,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				fnIdx = len(prefixFnBodies)
 				prefixFnBodies = append(prefixFnBodies, body)
 				prefixPoolToFnIdx[prefixID] = fnIdx
-				rawPfx, cnt := stripSegCount(dfaDataSegments(revL, false))
+				rawPfx, cnt := stripSegCount(dfaDataSegments(revL, false, false))
 				// buildLitAnchorBackScanBody reads midAcceptOff; emit it explicitly.
 				midAccSeg := appendDataSegment(nil, revL.midAcceptOff, revL.midAcceptBytes)
 				rawPfx = append(rawPfx, midAccSeg...)

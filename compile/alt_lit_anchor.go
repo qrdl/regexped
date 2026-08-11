@@ -103,8 +103,8 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		applyDominantStateEncoding(l, false)
 		fvBody := buildAltLitAnchorForwardVerifyBody(table, l, buildOpts.tableMemIdx)
 
-		fwdRaw, fwdSegCnt := stripSegCount(dfaDataSegments(l, true))
-		revRaw, revSegCnt := stripSegCount(dfaDataSegments(revL, true))
+		fwdRaw, fwdSegCnt := stripSegCount(dfaDataSegments(l, true, false))
+		revRaw, revSegCnt := stripSegCount(dfaDataSegments(revL, true, false))
 		result.dataBytes = append(result.dataBytes, fwdRaw...)
 		result.dataSegCount += fwdSegCnt
 		result.dataBytes = append(result.dataBytes, revRaw...)
