@@ -4442,25 +4442,32 @@ func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	//   continue loop: br $bulk_outer (depth 1 from inside if)
 	b = append(b, 0x0C, 0x01)
 	b = append(b, 0x05) // else
-	//   pos += ctz(m); [optionally last_accept = pos + 1]; break to $bulk_done
+	//   pos += ctz(m); break to $bulk_done
 	b = append(b, 0x20, tmpLocal)
 	b = append(b, 0x68) // i32.ctz
 	b = append(b, 0x20, posLocal)
-	b = append(b, 0x6A) // i32.add
-	if updateLastAccept {
-		b = append(b, 0x22, posLocal) // local.tee posLocal (keep on stack)
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x6A) // pos + 1
-		b = append(b, 0x21, lastAcceptLocal)
-	} else {
-		b = append(b, 0x21, posLocal) // local.set posLocal (no last_accept update)
-	}
+	b = append(b, 0x6A)           // i32.add
+	b = append(b, 0x21, posLocal) // local.set posLocal
 	//   br $bulk_done (depth 2 from inside if-else)
 	b = append(b, 0x0C, 0x02)
 	b = append(b, 0x0B) // end if
 
 	b = append(b, 0x0B) // end loop $bulk_outer
 	b = append(b, 0x0B) // end block $bulk_done
+
+	// Whichever branch exited the block above, posLocal now holds the
+	// position of the last byte confirmed to still be a self-loop member
+	// (bounds-exit: advanced by 16 per confirmed-clean lap; found-exit:
+	// advanced to just before the exit byte) — i.e. a valid match end in
+	// both cases. Republish it to last_accept exactly once per call here,
+	// rather than once per lap inside the loop or duplicated in both exit
+	// branches, since nothing reads last_accept until after this block.
+	if updateLastAccept {
+		b = append(b, 0x20, posLocal)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A) // pos + 1
+		b = append(b, 0x21, lastAcceptLocal)
+	}
 	return b
 }
 
