@@ -3341,3 +3341,60 @@ regexps
 -;0-1;-;-
 0-1;0-1;-;-
 -;-;-;-
+# ============================================================
+# FuzzBug15: unconditional (ctx=0) mid-accept has no dominance/priority
+# concept, so a self-looping lower-priority accept can overwrite an earlier,
+# correctly-recorded higher-priority word-boundary accept at the SAME DFA
+# state. 0*\b|0* on "01": the first branch's greedy 0* tentatively consumes
+# "0", but \b fails at pos 1 (both neighbours are word chars); backing off to
+# zero reps, \b holds at pos 0 (before=nothing, after='0') -- branch 1 wins
+# with the empty match [0,0), and branch 2 (0*, lower priority) is never
+# tried. The find-mode scan loop's ctx=0 midAccept check has no priority
+# concept at all: it fires again after consuming the '0' (self-loop back to
+# the same state) and unconditionally overwrites last_accept with branch 2's
+# own always-true accept at [0,1). "0000"/""/"1"/"10" are controls where the
+# defect can't manifest (either branch 2 legitimately extends further via
+# the SAME channel, or neither branch ever gets a competing higher-priority
+# record to begin with). "0001" repeats the same defect one byte further in.
+# 0*|0*\b (priority reversed) is a control confirming the non-buggy
+# direction still works (branch 1, now the unconditional one, legitimately
+# extends and is never outranked). -(?:0*\b|0*) repeats the family through
+# the mandatory-literal-prefix find path (a separate WASM emission function
+# from the bare-alternation case above) -- same defect, same fix.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug15UnconditionalMidAcceptPriority
+strings
+"01"
+"0"
+"0000"
+"0001"
+""
+"1"
+"10"
+regexps
+"0*\\b|0*"
+-;0-0;-;-
+0-1;0-1;-;-
+0-4;0-4;-;-
+-;0-0;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"0*|0*\\b"
+-;0-1;-;-
+0-1;0-1;-;-
+0-4;0-4;-;-
+-;0-3;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+strings
+"-01"
+"-0001"
+"-0"
+regexps
+"-(?:0*\\b|0*)"
+-;0-1;-;-
+-;0-1;-;-
+0-2;0-2;-;-

@@ -938,7 +938,15 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	// Check if the LF DFA exceeds the state limit — if so, use BT find body.
-	dfaTooLarge := dfaStateLimitExceeded || table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit)
+	// dfaHasOutrankedState (FUZZER_BUGS.md #15): a state whose boundary-gated
+	// mid-accept channel outranks the state's own unconditional (ctx=0)
+	// mid-accept, e.g. `0*\b|0*` — the find-mode scan loop's ctx=0 check has
+	// no priority concept and can let a later, lower-priority hit silently
+	// overwrite an already-correct higher-priority one. Routed to
+	// Backtracking (correct by construction) rather than patched in the DFA
+	// scan-loop codegen — see dfaHasOutrankedState's doc comment.
+	dfaTooLarge := dfaStateLimitExceeded || table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit) ||
+		dfaHasOutrankedState(table)
 
 	var l *dfaLayout
 	if !dfaTooLarge {

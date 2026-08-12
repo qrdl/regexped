@@ -37,7 +37,31 @@ type dfa struct {
 	midAcceptingNWDominant map[int]uint64
 	midAcceptingWDominant  map[int]uint64
 	midAcceptingNLDominant map[int]uint64
-	startBeginAccept       bool // true if start state accepts with ecBegin only (e.g. a*^)
+	// midAcceptingNWOutranked/W/NL[s] (FUZZER_BUGS.md #15): subset of
+	// midAcceptingNW/W/NL where the boundary assertion resolves to a Match at
+	// STRICTLY HIGHER priority than whatever the state's own ctx=0 midAccept
+	// would resolve to (see boundaryOutranksCtx0), while NOT being dominant.
+	// Every find-mode DFA/CompiledDFA scan-loop body's ctx=0 midAccept check
+	// is unconditional — it has no priority concept at all, so on a
+	// self-looping state it will happily let a LATER, lower-priority ctx=0
+	// hit overwrite an earlier, correctly-recorded higher-priority boundary
+	// hit (repro: `0*\b|0*` on "01", expected [0,0), got [0,1)). Patching
+	// that unconditional-overwrite defect would require touching every
+	// find-mode scan-loop shape in this file (five distinct WASM emission
+	// functions, each with independent local layouts) — evaluated and
+	// rejected as disproportionately invasive for how narrow this pattern
+	// family is. Instead, this flag is consulted only by
+	// dfaHasOutrankedState, a compile-time-only gate (see compile.go's
+	// dfaTooLarge) that routes affected patterns to the Backtracking engine,
+	// which resolves priority via genuine backtracking and has no equivalent
+	// defect. It is still tracked as a minimizeDFA/set.go-signature-relevant
+	// per-state flag (mirroring Dominant) purely so minimization doesn't
+	// merge two states whose only difference is this flag — that would
+	// silently make the gate's answer depend on minimization order.
+	midAcceptingNWOutranked map[int]uint64
+	midAcceptingWOutranked  map[int]uint64
+	midAcceptingNLOutranked map[int]uint64
+	startBeginAccept        bool // true if start state accepts with ecBegin only (e.g. a*^)
 
 	// transitions[state*256 + byte] = nextState (-1 = no transition)
 	transitions  []int                // Flat array: [numStates * 256]
@@ -172,6 +196,86 @@ func isDominantAccept(prog *syntax.Prog, states []uint32, ctx int) bool {
 			}
 			stack = append(stack, inst.Out)
 		}
+	}
+	return false
+}
+
+// boundaryOutranksCtx0 (FUZZER_BUGS.md #15) reports whether, in the
+// priority-ordered epsilon closure of `states`, some \b/\B/(?m:$) assertion
+// that resolves under `boundaryCtx` but would NOT resolve under ctx=0 is
+// reached before the Match that ctx=0's own (unconditional) closure would
+// find. When true, this specific boundary channel's accept is a genuinely
+// higher-priority resolution than anything the state's ctx=0 midAccept bit
+// could ever produce — e.g. `0*\b|0*`: the \b node is reached before
+// branch2's unconditional Match, so the W/NW channel that resolves it
+// outranks ctx=0 there. When false — e.g. the SAME merged state's OWN
+// midAcceptW channel for a state reached via a WORD-char predecessor, where
+// \b needs the OPPOSITE polarity (\B) to resolve and so the boundary node
+// stays unresolved just like it does under ctx=0 — the channel's accept
+// falls through to the exact same low-priority Match ctx=0 would find
+// anyway, and must NOT be treated as outranking (see repro `x0*\b|x0*`).
+//
+// Byte-consumers are deliberately NOT blockers here (unlike
+// isDominantAccept): ctx=0's own acceptBitsFor doesn't stop at a live
+// byte-consumer either — it just asks "is Match reachable at all" — so this
+// walk has to use the same rule to stay comparable and correctly identify
+// when the two ctx's *first found Match* differ.
+func boundaryOutranksCtx0(prog *syntax.Prog, states []uint32, boundaryCtx int) bool {
+	resolves := func(emptyOp syntax.EmptyOp, ctx int) bool {
+		follow := true
+		if emptyOp&syntax.EmptyBeginText != 0 {
+			follow = follow && (ctx&ecBegin) != 0
+		}
+		if emptyOp&syntax.EmptyBeginLine != 0 {
+			follow = follow && (ctx&(ecBegin|ecBeginLine)) != 0
+		}
+		if emptyOp&syntax.EmptyEndText != 0 {
+			follow = follow && (ctx&ecEnd) != 0
+		}
+		if emptyOp&syntax.EmptyEndLine != 0 {
+			follow = follow && (ctx&(ecEnd|ecEndLine)) != 0
+		}
+		if emptyOp&syntax.EmptyWordBoundary != 0 {
+			follow = follow && (ctx&ecWordBoundary) != 0
+		}
+		if emptyOp&syntax.EmptyNoWordBoundary != 0 {
+			follow = follow && (ctx&ecNoWordBoundary) != 0
+		}
+		return follow
+	}
+	visited := make(map[uint32]bool)
+	var stack []uint32
+	for i := len(states) - 1; i >= 0; i-- {
+		stack = append(stack, states[i])
+	}
+	for len(stack) > 0 {
+		pc := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if visited[pc] {
+			continue
+		}
+		visited[pc] = true
+		inst := &prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstMatch:
+			return false // ctx=0 already reaches Match here — nothing boundary-gated outranks it
+		case syntax.InstAlt:
+			stack = append(stack, inst.Arg, inst.Out)
+		case syntax.InstCapture, syntax.InstNop:
+			stack = append(stack, inst.Out)
+		case syntax.InstEmptyWidth:
+			emptyOp := syntax.EmptyOp(inst.Arg)
+			atCtx0 := resolves(emptyOp, 0)
+			atBoundary := resolves(emptyOp, boundaryCtx)
+			if atBoundary && !atCtx0 {
+				return true // resolved only once boundaryCtx is known: a genuinely higher-priority channel
+			}
+			if atCtx0 {
+				stack = append(stack, inst.Out) // matches ctx=0's own traversal exactly
+			}
+			// else: dead end under both ctx=0 and boundaryCtx, same as ctx=0's walk.
+		}
+		// byte-consumers: intentionally not a blocker here — see doc comment above.
 	}
 	return false
 }
@@ -478,17 +582,20 @@ func nfaStatesKey(states []uint32) string {
 // already run to completion (or exhausted memory/CPU trying to).
 func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates int, patternBitsArg ...[]uint64) (*dfa, bool) {
 	dfa := &dfa{
-		accepting:              make(map[int]uint64),
-		midAccepting:           make(map[int]uint64),
-		midAcceptingNW:         make(map[int]uint64),
-		midAcceptingW:          make(map[int]uint64),
-		midAcceptingNL:         make(map[int]uint64),
-		midAcceptingNWDominant: make(map[int]uint64),
-		midAcceptingWDominant:  make(map[int]uint64),
-		midAcceptingNLDominant: make(map[int]uint64),
-		unicodeTrans:           make(map[int]map[rune]int),
-		needsUnicode:           needsUnicode,
-		immediateAccepting:     make(map[int]uint64),
+		accepting:               make(map[int]uint64),
+		midAccepting:            make(map[int]uint64),
+		midAcceptingNW:          make(map[int]uint64),
+		midAcceptingW:           make(map[int]uint64),
+		midAcceptingNL:          make(map[int]uint64),
+		midAcceptingNWDominant:  make(map[int]uint64),
+		midAcceptingWDominant:   make(map[int]uint64),
+		midAcceptingNLDominant:  make(map[int]uint64),
+		midAcceptingNWOutranked: make(map[int]uint64),
+		midAcceptingWOutranked:  make(map[int]uint64),
+		midAcceptingNLOutranked: make(map[int]uint64),
+		unicodeTrans:            make(map[int]map[rune]int),
+		needsUnicode:            needsUnicode,
+		immediateAccepting:      make(map[int]uint64),
 	}
 
 	var pBits []uint64
@@ -594,6 +701,31 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		}
 	}
 
+	// markOutranked records, alongside an existing markDominant call with the
+	// SAME (states, ctx) pair, whether this channel's mid-accept hit resolves
+	// to a strictly higher-priority Match than the state's own ctx=0
+	// midAccept bit could ever produce (FUZZER_BUGS.md #15, boundaryOutranksCtx0).
+	//
+	// Gated on dfa.midAccepting[state] != 0 (already populated for this exact
+	// state by the orAccept(dfa.midAccepting, state, ...) call every one of
+	// this function's 5 call sites makes immediately before its
+	// markDominant/markOutranked calls): boundaryOutranksCtx0 only asks
+	// "does a boundary node resolve before ctx=0 would reach Match" — for an
+	// ordinary boundary-gated pattern with no competing unconditional
+	// alternative at all (e.g. `.+$`, `\bword\b` — the overwhelming majority
+	// of real patterns using \b/\B/(?m:$)), ctx=0 never reaches Match here in
+	// the first place, so there is nothing for a later ctx=0 hit to
+	// overwrite and this channel must not be flagged. Omitting this check
+	// was confirmed live to cause a large false-positive rate (e.g.
+	// `(?m:^...).*(?:ERROR|WARNING|FATAL): .+$)` — no alternation at all,
+	// just a plain `.+$` tail — routing perftest's log-capture to
+	// Backtracking and regressing its "no matches" case by ~48x).
+	markOutranked := func(m map[int]uint64, state int, states []uint32, ctx int) {
+		if dfa.midAccepting[state] != 0 && boundaryOutranksCtx0(prog, states, ctx) {
+			m[state] = 1
+		}
+	}
+
 	// nfaAcceptBits returns the combined bitmask for a set of NFA states at ctx=0.
 	nfaAcceptBits := func(states []uint32) uint64 {
 		return acceptBitsFor(states, 0)
@@ -665,13 +797,16 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// midAcceptNW: before non-word byte → \B fires (prev=non-word, next=non-word)
 	orAccept(dfa.midAcceptingNW, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary))
 	markDominant(dfa.midAcceptingNWDominant, 0, startSet, ecBegin|ecNoWordBoundary)
+	markOutranked(dfa.midAcceptingNWOutranked, 0, startSet, ecBegin|ecNoWordBoundary)
 	// midAcceptW: before word byte → \b fires (prev=non-word, next=word)
 	orAccept(dfa.midAcceptingW, 0, acceptBitsFor(startSet, ecBegin|ecWordBoundary))
 	markDominant(dfa.midAcceptingWDominant, 0, startSet, ecBegin|ecWordBoundary)
+	markOutranked(dfa.midAcceptingWOutranked, 0, startSet, ecBegin|ecWordBoundary)
 	// midAcceptNL: before '\n' byte → (?m:$) fires (ecEndLine | \B since prev=non-word)
 	if dfa.hasNewlineBoundary {
 		orAccept(dfa.midAcceptingNL, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary|ecEndLine))
 		markDominant(dfa.midAcceptingNLDominant, 0, startSet, ecBegin|ecNoWordBoundary|ecEndLine)
+		markOutranked(dfa.midAcceptingNLOutranked, 0, startSet, ecBegin|ecNoWordBoundary|ecEndLine)
 	}
 	// startBeginAccept: pattern matches empty at position 0 due to begin anchor (^/\A).
 	// Distinct from acceptStates (ecBegin|ecEnd) and midAcceptStates (ctx=0).
@@ -719,13 +854,16 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		// midAcceptNW for midStart (prevWasWord=false): before non-word → \B fires
 		orAccept(dfa.midAcceptingNW, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary))
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStart, midStartSet, ecNoWordBoundary)
+		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStart, midStartSet, ecNoWordBoundary)
 		// midAcceptW for midStart (prevWasWord=false): before word → \b fires
 		orAccept(dfa.midAcceptingW, dfa.midStart, acceptBitsFor(midStartSet, ecWordBoundary))
 		markDominant(dfa.midAcceptingWDominant, dfa.midStart, midStartSet, ecWordBoundary)
+		markOutranked(dfa.midAcceptingWOutranked, dfa.midStart, midStartSet, ecWordBoundary)
 		// midAcceptNL for midStart (prevWasWord=false): before '\n' → (?m:$) fires
 		if dfa.hasNewlineBoundary {
 			orAccept(dfa.midAcceptingNL, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary|ecEndLine))
 			markDominant(dfa.midAcceptingNLDominant, dfa.midStart, midStartSet, ecNoWordBoundary|ecEndLine)
+			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStart, midStartSet, ecNoWordBoundary|ecEndLine)
 		}
 		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 			bits := nfaAcceptBits(midStartSet)
@@ -763,13 +901,16 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		// midAcceptNW for midStartWord (prevWasWord=true): before non-word → \b fires
 		orAccept(dfa.midAcceptingNW, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary))
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStartWord, midStartSet, ecWordBoundary)
+		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartWord, midStartSet, ecWordBoundary)
 		// midAcceptW for midStartWord (prevWasWord=true): before word → \B fires
 		orAccept(dfa.midAcceptingW, dfa.midStartWord, acceptBitsFor(midStartSet, ecNoWordBoundary))
 		markDominant(dfa.midAcceptingWDominant, dfa.midStartWord, midStartSet, ecNoWordBoundary)
+		markOutranked(dfa.midAcceptingWOutranked, dfa.midStartWord, midStartSet, ecNoWordBoundary)
 		// midAcceptNL for midStartWord (prevWasWord=true): before '\n' → (?m:$) fires (\b since prev=word)
 		if dfa.hasNewlineBoundary {
 			orAccept(dfa.midAcceptingNL, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary|ecEndLine))
 			markDominant(dfa.midAcceptingNLDominant, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
+			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
 		}
 		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 			bits := nfaAcceptBits(midStartSet)
@@ -806,11 +947,14 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 			orAccept(dfa.midAccepting, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, 0))
 			orAccept(dfa.midAcceptingNW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecNoWordBoundary))
 			markDominant(dfa.midAcceptingNWDominant, dfa.midStartNewline, midStartNewlineSet, ecNoWordBoundary)
+			markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartNewline, midStartNewlineSet, ecNoWordBoundary)
 			orAccept(dfa.midAcceptingW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecWordBoundary))
 			markDominant(dfa.midAcceptingWDominant, dfa.midStartNewline, midStartNewlineSet, ecWordBoundary)
+			markOutranked(dfa.midAcceptingWOutranked, dfa.midStartNewline, midStartNewlineSet, ecWordBoundary)
 			// midAcceptNL for midStartNewline (prevWasWord=false): before '\n' → (?m:$) fires (\B since prev=newline=non-word)
 			orAccept(dfa.midAcceptingNL, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecNoWordBoundary|ecEndLine))
 			markDominant(dfa.midAcceptingNLDominant, dfa.midStartNewline, midStartNewlineSet, ecNoWordBoundary|ecEndLine)
+			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartNewline, midStartNewlineSet, ecNoWordBoundary|ecEndLine)
 			if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
 				bits := nfaAcceptBits(midStartNewlineSet)
 				if bits == 0 {
@@ -918,6 +1062,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				}
 				orAccept(dfa.midAcceptingNW, nextDFAState, acceptBitsFor(nextSet, nwCtx))
 				markDominant(dfa.midAcceptingNWDominant, nextDFAState, nextSet, nwCtx)
+				markOutranked(dfa.midAcceptingNWOutranked, nextDFAState, nextSet, nwCtx)
 				var wCtx int
 				if nextPrevWasWord {
 					wCtx = ecNoWordBoundary
@@ -926,9 +1071,11 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				}
 				orAccept(dfa.midAcceptingW, nextDFAState, acceptBitsFor(nextSet, wCtx))
 				markDominant(dfa.midAcceptingWDominant, nextDFAState, nextSet, wCtx)
+				markOutranked(dfa.midAcceptingWOutranked, nextDFAState, nextSet, wCtx)
 				if dfa.hasNewlineBoundary {
 					orAccept(dfa.midAcceptingNL, nextDFAState, acceptBitsFor(nextSet, nwCtx|ecEndLine))
 					markDominant(dfa.midAcceptingNLDominant, nextDFAState, nextSet, nwCtx|ecEndLine)
+					markOutranked(dfa.midAcceptingNLOutranked, nextDFAState, nextSet, nwCtx|ecEndLine)
 				}
 				if leftmostFirst {
 					if pBits != nil {
@@ -1094,34 +1241,42 @@ type dfaTable struct {
 	midAcceptNWStatesDominant map[int]uint64
 	midAcceptWStatesDominant  map[int]uint64
 	midAcceptNLStatesDominant map[int]uint64
-	transitions               []int // flat [state*256+byte] = nextState; -1 = dead
-	startBeginAccept          bool  // true if startState accepts with ecBegin only (e.g. a*^)
-	hasWordBoundary           bool  // true if pattern contains \b or \B
-	hasNewlineBoundary        bool  // true if pattern contains (?m:^) or (?m:$)
+	// midAcceptNWStatesOutranked/W/NL (FUZZER_BUGS.md #15): see
+	// dfa.midAcceptingNWOutranked/W/NL for the full explanation.
+	midAcceptNWStatesOutranked map[int]uint64
+	midAcceptWStatesOutranked  map[int]uint64
+	midAcceptNLStatesOutranked map[int]uint64
+	transitions                []int // flat [state*256+byte] = nextState; -1 = dead
+	startBeginAccept           bool  // true if startState accepts with ecBegin only (e.g. a*^)
+	hasWordBoundary            bool  // true if pattern contains \b or \B
+	hasNewlineBoundary         bool  // true if pattern contains (?m:^) or (?m:$)
 }
 
 // dfaTableFrom builds a dfaTable directly from a compiled dfa struct,
 // then applies Hopcroft DFA minimization.
 func dfaTableFrom(d *dfa) *dfaTable {
 	t := &dfaTable{
-		startState:                d.start,
-		midStartState:             d.midStart,
-		midStartWordState:         d.midStartWord,
-		midStartNewlineState:      d.midStartNewline,
-		numStates:                 d.numStates,
-		acceptStates:              d.accepting,
-		midAcceptStates:           d.midAccepting,
-		midAcceptNWStates:         d.midAcceptingNW,
-		midAcceptWStates:          d.midAcceptingW,
-		midAcceptNLStates:         d.midAcceptingNL,
-		midAcceptNWStatesDominant: d.midAcceptingNWDominant,
-		midAcceptWStatesDominant:  d.midAcceptingWDominant,
-		midAcceptNLStatesDominant: d.midAcceptingNLDominant,
-		immediateAcceptStates:     d.immediateAccepting,
-		transitions:               d.transitions,
-		startBeginAccept:          d.startBeginAccept,
-		hasWordBoundary:           d.hasWordBoundary,
-		hasNewlineBoundary:        d.hasNewlineBoundary,
+		startState:                 d.start,
+		midStartState:              d.midStart,
+		midStartWordState:          d.midStartWord,
+		midStartNewlineState:       d.midStartNewline,
+		numStates:                  d.numStates,
+		acceptStates:               d.accepting,
+		midAcceptStates:            d.midAccepting,
+		midAcceptNWStates:          d.midAcceptingNW,
+		midAcceptWStates:           d.midAcceptingW,
+		midAcceptNLStates:          d.midAcceptingNL,
+		midAcceptNWStatesDominant:  d.midAcceptingNWDominant,
+		midAcceptWStatesDominant:   d.midAcceptingWDominant,
+		midAcceptNLStatesDominant:  d.midAcceptingNLDominant,
+		midAcceptNWStatesOutranked: d.midAcceptingNWOutranked,
+		midAcceptWStatesOutranked:  d.midAcceptingWOutranked,
+		midAcceptNLStatesOutranked: d.midAcceptingNLOutranked,
+		immediateAcceptStates:      d.immediateAccepting,
+		transitions:                d.transitions,
+		startBeginAccept:           d.startBeginAccept,
+		hasWordBoundary:            d.hasWordBoundary,
+		hasNewlineBoundary:         d.hasNewlineBoundary,
 	}
 	minimizeDFA(t)
 	reorderAcceptFirst(t)
@@ -1289,6 +1444,9 @@ func applyStateRemap(t *dfaTable, oldToNew []int) {
 	t.midAcceptNWStatesDominant = remapMap(t.midAcceptNWStatesDominant)
 	t.midAcceptWStatesDominant = remapMap(t.midAcceptWStatesDominant)
 	t.midAcceptNLStatesDominant = remapMap(t.midAcceptNLStatesDominant)
+	t.midAcceptNWStatesOutranked = remapMap(t.midAcceptNWStatesOutranked)
+	t.midAcceptWStatesOutranked = remapMap(t.midAcceptWStatesOutranked)
+	t.midAcceptNLStatesOutranked = remapMap(t.midAcceptNLStatesOutranked)
 	t.immediateAcceptStates = remapMap(t.immediateAcceptStates)
 }
 
@@ -1329,6 +1487,7 @@ func minimizeDFA(t *dfaTable) {
 	type sigKey struct {
 		a, ma, maw, manw, manl, imm uint64
 		mawDom, manwDom, manlDom    uint64 // FUZZER_BUGS.md #2: dominance is part of the signature too
+		mawOut, manwOut, manlOut    uint64 // FUZZER_BUGS.md #15: outranked is part of the signature too
 	}
 	sigToClass := make(map[sigKey]int, 8)
 	classOf := make([]int, n)
@@ -1344,6 +1503,9 @@ func minimizeDFA(t *dfaTable) {
 			t.midAcceptWStatesDominant[s],
 			t.midAcceptNWStatesDominant[s],
 			t.midAcceptNLStatesDominant[s],
+			t.midAcceptWStatesOutranked[s],
+			t.midAcceptNWStatesOutranked[s],
+			t.midAcceptNLStatesOutranked[s],
 		}
 		c, ok := sigToClass[sk]
 		if !ok {
@@ -1461,6 +1623,9 @@ func minimizeDFA(t *dfaTable) {
 	newMidAcceptNWDominant := make(map[int]uint64)
 	newMidAcceptWDominant := make(map[int]uint64)
 	newMidAcceptNLDominant := make(map[int]uint64)
+	newMidAcceptNWOutranked := make(map[int]uint64)
+	newMidAcceptWOutranked := make(map[int]uint64)
+	newMidAcceptNLOutranked := make(map[int]uint64)
 	newImmAccept := make(map[int]uint64)
 	for s := 0; s < n; s++ {
 		c := classOf[s]
@@ -1488,6 +1653,15 @@ func minimizeDFA(t *dfaTable) {
 		if v := t.midAcceptNLStatesDominant[s]; v != 0 {
 			newMidAcceptNLDominant[c] |= v
 		}
+		if v := t.midAcceptNWStatesOutranked[s]; v != 0 {
+			newMidAcceptNWOutranked[c] |= v
+		}
+		if v := t.midAcceptWStatesOutranked[s]; v != 0 {
+			newMidAcceptWOutranked[c] |= v
+		}
+		if v := t.midAcceptNLStatesOutranked[s]; v != 0 {
+			newMidAcceptNLOutranked[c] |= v
+		}
 		if v := t.immediateAcceptStates[s]; v != 0 {
 			newImmAccept[c] |= v
 		}
@@ -1510,6 +1684,9 @@ func minimizeDFA(t *dfaTable) {
 	t.midAcceptNWStatesDominant = newMidAcceptNWDominant
 	t.midAcceptWStatesDominant = newMidAcceptWDominant
 	t.midAcceptNLStatesDominant = newMidAcceptNLDominant
+	t.midAcceptNWStatesOutranked = newMidAcceptNWOutranked
+	t.midAcceptWStatesOutranked = newMidAcceptWOutranked
+	t.midAcceptNLStatesOutranked = newMidAcceptNLOutranked
 	t.immediateAcceptStates = newImmAccept
 	// hasWordBoundary, hasNewlineBoundary and startBeginAccept are pattern-level flags, unchanged.
 }
@@ -5167,6 +5344,35 @@ func computePrefixWalk(t *dfaTable, start int) (prefix []byte, ok bool) {
 	return prefix, true
 }
 
+// dfaHasOutrankedState (FUZZER_BUGS.md #15) reports whether t has any state
+// whose W/NW/NL mid-accept channel resolves to a genuinely higher-priority
+// Match than the state's own ctx=0 midAccept bit (boundaryOutranksCtx0),
+// while not being dominant. dominant[s]==0 is checked defensively — by
+// construction a dominant hit's traversal reaches Match before any
+// unresolved node, so boundaryOutranksCtx0 (which shares that same
+// priority-ordered traversal) can never also report outranked for the same
+// (state, channel) — but the check costs nothing and documents the reasoning
+// inline rather than relying on a cross-function invariant holding silently.
+//
+// Compile-time only: called from compile.go's dfaTooLarge decision to route
+// affected find-mode patterns to Backtracking instead of patching the
+// unconditional ctx=0 overwrite in every DFA/CompiledDFA scan-loop shape —
+// see dfa.midAcceptingNWOutranked's comment for the full reasoning.
+func dfaHasOutrankedState(t *dfaTable) bool {
+	for s := 0; s < t.numStates; s++ {
+		if t.midAcceptNWStatesOutranked[s] != 0 && t.midAcceptNWStatesDominant[s] == 0 {
+			return true
+		}
+		if t.midAcceptWStatesOutranked[s] != 0 && t.midAcceptWStatesDominant[s] == 0 {
+			return true
+		}
+		if t.midAcceptNLStatesOutranked[s] != 0 && t.midAcceptNLStatesDominant[s] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // isAnchoredFind reports whether the DFA can only match starting at position 0.
 // This is true when midStartState (and midStartWordState for WB patterns) have
 // no live outgoing transitions and are not accepting. Patterns with a leading ^
@@ -6864,12 +7070,12 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 						b = append(b, 0x04, 0x7F) // if (result i32)
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, int32(startState))
-						b = append(b, 0x05) // else
-						b = append(b, 0x20, 0x00) // local.get ptr
-						b = append(b, 0x20, 0x04) // local.get attempt_start
-						b = append(b, 0x6A)       // i32.add
-						b = append(b, 0x41, 0x01) // i32.const 1
-						b = append(b, 0x6B)       // i32.sub
+						b = append(b, 0x05)             // else
+						b = append(b, 0x20, 0x00)       // local.get ptr
+						b = append(b, 0x20, 0x04)       // local.get attempt_start
+						b = append(b, 0x6A)             // i32.add
+						b = append(b, 0x41, 0x01)       // i32.const 1
+						b = append(b, 0x6B)             // i32.sub
 						b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (prev byte)
 						b = append(b, 0x41, 0x0A)       // '\n'
 						b = append(b, 0x46)             // i32.eq
@@ -6905,11 +7111,11 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 						b = utils.AppendSLEB128(b, int32(midStartWordState))
 						b = append(b, 0x05) // else
 						if hasNewlineBoundary {
-							b = append(b, 0x20, 0x00) // local.get ptr
-							b = append(b, 0x20, 0x04) // local.get attempt_start
-							b = append(b, 0x6A)       // i32.add
-							b = append(b, 0x41, 0x01) // i32.const 1
-							b = append(b, 0x6B)       // i32.sub
+							b = append(b, 0x20, 0x00)       // local.get ptr
+							b = append(b, 0x20, 0x04)       // local.get attempt_start
+							b = append(b, 0x6A)             // i32.add
+							b = append(b, 0x41, 0x01)       // i32.const 1
+							b = append(b, 0x6B)             // i32.sub
 							b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (prev byte)
 							b = append(b, 0x41, 0x0A)       // '\n'
 							b = append(b, 0x46)             // i32.eq
