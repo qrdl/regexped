@@ -3177,3 +3177,53 @@ regexps
 -;2-2;-;-
 0-1;0-1;-;-
 -;1-2;-;-
+# ============================================================
+# FuzzBug12: \b/\B immediately before (?m:^...) loses begin-of-line context
+# during transition construction. newDFA's main per-state worklist loop
+# calls expandWithWB with only a bare word-boundary context flag, for every
+# work item -- correct for ordinary states, but wrong for the `start` and
+# `midStartNewline` bootstrap items specifically, whose own closure was
+# built with ecBegin/ecBeginLine respectively. That begin-context flag
+# never survives into the expandWithWB call used to build the item's
+# *outgoing transitions*, so once a leading \b/\B resolves and the walk
+# reaches the nested (?m:^) node, its follow-check sees a bare
+# word-boundary ctx (no ecBegin/ecBeginLine bit) and stops -- the
+# transition for the byte beyond it is never established, and the whole
+# live-consuming match is lost.
+# \b(?m:^ba) on "ba": \b holds at pos 0 (before=nothing, after='b'=word),
+# (?m:^) holds at pos 0 (true start), "ba" should match -> [0,2). Same
+# pattern on "z\nba": \b holds at pos 2 (before='\n'=non-word, after='b'=
+# word), (?m:^) holds at pos 2 (prev byte is '\n') -> [2,4) via the
+# midStartNewline bootstrap. \B(?m:^ x) is the \B-flavored twin (rules out
+# "\b specifically"). \bba and (?m:^ba) are controls: dropping either the
+# leading assertion or the (?m:^) makes the pattern pass, confirming the
+# defect needs both chained together.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug12WordBoundaryBeginLineContext
+strings
+"ba"
+"z\nba"
+" x"
+"z\n x"
+regexps
+"\\b(?m:^ba)"
+0-2;0-2;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-
+"\\B(?m:^ x)"
+-;-;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;2-4;-;-
+"\\bba"
+0-2;0-2;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-
+"(?m:^ba)"
+0-2;0-2;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-

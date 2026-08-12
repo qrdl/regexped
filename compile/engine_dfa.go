@@ -521,6 +521,16 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		nfaSet         []uint32
 		prevWasWord    bool
 		prevWasNewline bool // true when previous byte was '\n' (for (?m:^) context)
+		// beginCtx carries a begin-of-text/begin-of-line flag that this item's own
+		// nfaSet was closed under (ecBegin for the `start` item, ecBeginLine for
+		// `midStartNewline`; 0 for every other item, which has no such context to
+		// inherit). It must be OR'd into every expandWithWB call made against
+		// this item's nfaSet below, mirroring what the mid-accept computations
+		// above already do for these same two bootstrap items (FUZZER_BUGS.md
+		// #12) — otherwise a pending \b/\B node resolved by expandWithWB can gate
+		// a nested ^/(?m:^) node whose begin-context was only ever recorded on
+		// the item's initial closure, not carried into its transition expansion.
+		beginCtx int
 	}
 	queue := []workItem{}
 
@@ -675,7 +685,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		dfa.immediateAccepting[0] |= bits
 	}
 
-	queue = append(queue, workItem{dfaState: 0, nfaSet: startSet, prevWasWord: false})
+	queue = append(queue, workItem{dfaState: 0, nfaSet: startSet, prevWasWord: false, beginCtx: ecBegin})
 
 	// Mid-string start state (prev=non-word): epsilon closure WITHOUT begin-anchors,
 	// used for attempt_start > 0 in find mode when prev byte was not a word char.
@@ -808,7 +818,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				}
 				dfa.immediateAccepting[dfa.midStartNewline] |= bits
 			}
-			queue = append(queue, workItem{dfaState: dfa.midStartNewline, nfaSet: midStartNewlineSet, prevWasNewline: true})
+			queue = append(queue, workItem{dfaState: dfa.midStartNewline, nfaSet: midStartNewlineSet, prevWasNewline: true, beginCtx: ecBeginLine})
 		}
 	}
 
@@ -834,13 +844,13 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		if item.prevWasWord {
 			// prev=word, curr=word    → \B fires (no boundary) → ecNoWordBoundary
 			// prev=word, curr=non-word → \b fires (boundary)   → ecWordBoundary
-			expandedForWordChar = expandWithWB(item.nfaSet, ecNoWordBoundary)
-			expandedForNonWordChar = expandWithWB(item.nfaSet, ecWordBoundary)
+			expandedForWordChar = expandWithWB(item.nfaSet, ecNoWordBoundary|item.beginCtx)
+			expandedForNonWordChar = expandWithWB(item.nfaSet, ecWordBoundary|item.beginCtx)
 		} else {
 			// prev=non-word, curr=word    → \b fires (boundary)   → ecWordBoundary
 			// prev=non-word, curr=non-word → \B fires (no boundary) → ecNoWordBoundary
-			expandedForWordChar = expandWithWB(item.nfaSet, ecWordBoundary)
-			expandedForNonWordChar = expandWithWB(item.nfaSet, ecNoWordBoundary)
+			expandedForWordChar = expandWithWB(item.nfaSet, ecWordBoundary|item.beginCtx)
+			expandedForNonWordChar = expandWithWB(item.nfaSet, ecNoWordBoundary|item.beginCtx)
 		}
 
 		// buildInputMap builds the rune→nextNFAStates map from an expanded NFA set.
@@ -859,7 +869,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 			} else {
 				nlWBCtx = ecNoWordBoundary | ecEndLine
 			}
-			expandedForNewline = expandWithWB(item.nfaSet, nlWBCtx)
+			expandedForNewline = expandWithWB(item.nfaSet, nlWBCtx|item.beginCtx)
 		}
 
 		inputMapWord := buildInputMap(expandedForWordChar)
