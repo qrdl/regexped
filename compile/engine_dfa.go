@@ -4720,19 +4720,17 @@ func emitDeadHandler(b []byte,
 //
 // br depth 4 assumes the call site's enclosing stack is exactly
 // [loop $scan, block $found, ...] with nothing between them — true at every
-// current caller (buildFindBody, buildAnchoredFindBody, and the lit-anchor
-// forward-scan helpers use $fwd_scan/$fwd_done in the same shape). If a new
+// current caller (buildFindBody, buildAnchoredFindBody, the lit-anchor
+// forward-scan helpers which use $fwd_scan/$fwd_done in the same shape, and
+// emitInlineAnchoredDFAVerify's [loop $dfa, block $dfa_done]). If a new
 // caller nests loop $scan differently, this depth must be recomputed.
 func emitWBPreAcceptCheck(b []byte, wordCharTableOff, midAcceptWOff, midAcceptNWOff int32,
 	hasWordBoundary bool,
+	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
 	tableMemIdx int) []byte {
 	if !hasWordBoundary {
 		return b
 	}
-	const ptrLocal = 0x00
-	const posLocal = 0x03
-	const stateLocal = 0x02
-	const lastAcceptLocal = 0x05
 	const foundBrDepth = 4
 	// emitDominantBr: re-load the table byte and br out iff it's the
 	// dominant-accept value (2). Only reached inside the "value != 0" if,
@@ -5303,7 +5301,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = emitEofHandler(b, false, 0, acceptLimit, false)
 		b = append(b, 0x0B)
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
@@ -5356,7 +5354,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 		b = emitEofHandler(b, false, 0, acceptLimit, false)
 		b = append(b, 0x0B)
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 		b = emitSimpleU8Transition(b, tableOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
@@ -5408,7 +5406,7 @@ func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOf
 	b = emitEofHandler(b, false, 0, acceptLimit, false)
 	b = append(b, 0x0B)
 
-	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 	b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 	// byte = mem[ptr+pos]
@@ -7260,7 +7258,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe)
 		b = append(b, 0x0B) // end if
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
@@ -7344,7 +7342,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe)
 		b = append(b, 0x0B) // end if
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 		b = emitSimpleU8Transition(b, tableOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
@@ -7416,7 +7414,7 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 	b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe)
 	b = append(b, 0x0B) // end if
 
-	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, tableMemIdx)
+	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
 	b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
 
 	// byte = mem[ptr+pos]
@@ -11717,8 +11715,13 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 			}
 			continue
 		}
-		// DFA branch: build its layout starting at cur.
-		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false, false, false, false)
+		// DFA branch: build its layout starting at cur. forceWordChar:
+		// emitInlineAnchoredDFAVerify now consults midAcceptW/NW (FUZZER_BUGS.md
+		// #14) for branches with \b/\B, so those tables must actually be built
+		// here — needFind is false for this layout, which would otherwise skip
+		// them (wantWordChar = needFind || forceWordChar[0]).
+		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false, false, false, false,
+			br.dfaTable.hasWordBoundary)
 		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
 		// forceMidAccept=true: emitInlineAnchoredDFAVerify reads dl.midAcceptOff
 		// unconditionally (FUZZER_BUGS.md #4/#9) regardless of dominant states,
@@ -11836,6 +11839,17 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	b = append(b, 0x0B)       // end if (EOF accept)
 	b = append(b, 0x0C, 0x02) // br 2 → $dfa_done (0=this if, 1=loop, 2=block)
 	b = append(b, 0x0B)       // end if (pos>=len)
+
+	// Word-boundary pre-transition accept: a pending \b/\B can resolve
+	// Match before the upcoming byte is even consumed (e.g. `\0\B`'s state
+	// right after `\0`). dl.needWordCharTable is set iff this branch's own
+	// DFA has \b/\B AND its layout was built with forceWordChar (see the
+	// buildDFALayout call in planLenAltLayout) — a no-op otherwise. This
+	// loop is directly [loop $dfa, block $dfa_done], the same shape
+	// emitWBPreAcceptCheck's hardcoded br depth 4 assumes. See
+	// FUZZER_BUGS.md #14.
+	b = emitWBPreAcceptCheck(b, dl.wordCharTableOff, dl.midAcceptWOff, dl.midAcceptNWOff,
+		dl.needWordCharTable, locPtr, locPos, locState, locOutEnd, tableMemIdx)
 
 	// Transition: state = table[state * numClasses + class(input[pos])].
 	if dl.useCompression {
