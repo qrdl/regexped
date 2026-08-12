@@ -5043,10 +5043,24 @@ func computePrefix(t *dfaTable) []byte {
 	// just the first byte here is sufficient; wasmPrefixEndWord already
 	// safely handles the case where midStartWordState dies partway
 	// through walking prefixMid's own bytes.
-	if t.hasWordBoundary && len(prefixMid) > 0 {
-		for b := 0; b < 256; b++ {
-			if t.transitions[t.midStartWordState*256+b] >= 0 && b != int(prefixMid[0]) {
-				return nil
+	//
+	// midStartWordState can also be accepting outright (e.g. `1*\b$` on
+	// prevWasWord=true: \b fires crossing into EOF's implicit non-word
+	// class, then $ holds) even though midStartState's own byte-consuming
+	// walk sees exactly one live byte ('1'). That byte isn't mandatory at
+	// all in that case — a retry landing on midStartWordState can complete
+	// the match with zero further bytes — so the same "already accepting"
+	// guard computePrefixWalk applies to its own start state must also be
+	// applied to midStartWordState here (FUZZER_BUGS.md #10).
+	if t.hasWordBoundary {
+		if stateAcceptsAny(t, t.midStartWordState) {
+			return nil
+		}
+		if len(prefixMid) > 0 {
+			for b := 0; b < 256; b++ {
+				if t.transitions[t.midStartWordState*256+b] >= 0 && b != int(prefixMid[0]) {
+					return nil
+				}
 			}
 		}
 	}
@@ -5072,6 +5086,18 @@ func computePrefix(t *dfaTable) []byte {
 	return prefixMid[:n]
 }
 
+// stateAcceptsAny reports whether state can end a match in any find-relevant
+// flavor: true end-of-input (acceptStates), any position (midAcceptStates),
+// or a word/non-word/newline-boundary pre-accept (midAcceptWStates/
+// midAcceptNWStates/midAcceptNLStates). Used to gate fast-skip prefix
+// computation — a state that can accept outright makes any subsequently
+// derived "mandatory" byte unsound, since a match can already be complete
+// without consuming it.
+func stateAcceptsAny(t *dfaTable, state int) bool {
+	return t.acceptStates[state] != 0 || t.midAcceptStates[state] != 0 ||
+		t.midAcceptWStates[state] != 0 || t.midAcceptNWStates[state] != 0 || t.midAcceptNLStates[state] != 0
+}
+
 // computePrefixWalk walks the DFA from start while exactly one byte leads to
 // a non-dead state, returning the literal byte sequence forced along that
 // walk. ok is false when start itself is accepting in any find-relevant
@@ -5079,8 +5105,7 @@ func computePrefix(t *dfaTable) []byte {
 // assumed mandatory).
 func computePrefixWalk(t *dfaTable, start int) (prefix []byte, ok bool) {
 	state := start
-	if t.acceptStates[state] != 0 || t.midAcceptStates[state] != 0 ||
-		t.midAcceptWStates[state] != 0 || t.midAcceptNWStates[state] != 0 || t.midAcceptNLStates[state] != 0 {
+	if stateAcceptsAny(t, state) {
 		return nil, false
 	}
 	visited := map[int]bool{state: true}

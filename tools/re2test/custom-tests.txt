@@ -3149,3 +3149,31 @@ regexps
 0-1;0-1;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# FuzzBug10: optional leading quantifier + \b chained into a deferred anchor.
+# 1*\b$ on "0": 1* matches zero occurrences, \b holds at pos 0 (before is
+# non-word, after is '0' which is a word char), but $ only holds at true
+# end-of-text (pos 1) -- the only correct match is empty at [1,1). The
+# find-mode fast-skip path (computePrefix/computePrefixWalk) wrongly treats
+# '1' as a mandatory byte (single-candidate optional-quantifier class fools
+# its transition-count check), so it SIMD-scans for '1', finds none, and
+# reports no match instead of trying the zero-occurrence path.
+# "1" is a control: \b never gets a chance to matter, matches at [0,1)
+# either way. "01" is a control: a live '1' remains after pos 0, so the
+# fast-skip path isn't fooled into skipping past the real match.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug10OptionalQuantifierWordBoundaryAnchor
+strings
+"0"
+"00"
+"10"
+"1"
+"01"
+regexps
+"1*\\b$"
+-;1-1;-;-
+-;2-2;-;-
+-;2-2;-;-
+0-1;0-1;-;-
+-;1-2;-;-
