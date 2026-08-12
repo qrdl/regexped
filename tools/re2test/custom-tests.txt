@@ -3227,3 +3227,80 @@ regexps
 -;2-4;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #13): computePrefixWalk treats a byte as
+# mandatory even when the state it lands on can already accept via a
+# word/newline-boundary pre-check. Its per-step continuation guard only
+# checked acceptStates/midAcceptStates (ctx=0 unconditional accept) before
+# deciding whether the next byte can also be folded into the "mandatory"
+# fast-skip literal -- it never checked midAcceptWStates/midAcceptNWStates/
+# midAcceptNLStates. So after consuming the true mandatory byte ('-' or
+# '0'), if the landing state can already end the match via \b/\B/(?m:$)
+# without consuming the (optional) following byte, the walk wrongly folds
+# that optional byte into the scan-for literal, and the SIMD/scalar
+# fast-skip prologue searches for a longer literal that need not appear at
+# all -- missing the real, shorter match entirely.
+# -1*\b on "-0": '-' is mandatory, then 1* is optional (0 reps) and \b
+# already fires right after '-' since '0' is a word char -> [0,1). "-1"/
+# "-11" are controls where the optional '1' really is present (unaffected,
+# any length still finds the trailing \b). "-(?:\b| 0)" / "-(?:\b| )" are
+# the alternation-shaped variant from the same repro family. "0000|0\B" is
+# the \B-flavored, non-'-' twin: the shorter '0\B' branch never gets tried
+# because the fast-skip is scanning for a mandatory-but-wrong-length
+# literal derived from the *other*, longer '0000' branch's shape.
+# "-(?:\b|x)" is a control that does NOT reproduce (branch order avoids the
+# defect the same way FUZZER_BUGS.md documents for bug 2's analogous
+# control) -- included to confirm the fix doesn't change already-correct
+# behavior.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug13MandatoryPrefixBoundaryPreAccept
+strings
+"-0"
+"-1"
+"-11"
+"-"
+regexps
+"-1*\\b"
+-;0-1;-;-
+0-2;0-2;-;-
+0-3;0-3;-;-
+-;-;-;-
+strings
+"-0"
+"- 0"
+"-x"
+"-"
+regexps
+"-(?:\\b| 0)"
+-;0-1;-;-
+0-3;0-3;-;-
+-;0-1;-;-
+-;-;-;-
+strings
+"-0"
+"- "
+"-x"
+regexps
+"-(?:\\b| )"
+-;0-1;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+strings
+"00"
+"0000"
+"01"
+"0"
+regexps
+"0000|0\\B"
+-;0-1;-;-
+0-4;0-4;-;-
+-;0-1;-;-
+-;-;-;-
+strings
+"-0"
+"-x"
+regexps
+"-(?:\\b|x)"
+-;0-1;-;-
+0-2;0-1;-;-

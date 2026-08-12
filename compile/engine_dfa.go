@@ -5161,7 +5161,7 @@ func computePrefixWalk(t *dfaTable, start int) (prefix []byte, ok bool) {
 		}
 		prefix = append(prefix, byte(only))
 		state = t.transitions[state*256+only]
-		if visited[state] || t.acceptStates[state] != 0 || t.midAcceptStates[state] != 0 {
+		if visited[state] || stateAcceptsAny(t, state) {
 			break // cycle or accepting state — prefix cannot extend further
 		}
 		visited[state] = true
