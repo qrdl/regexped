@@ -1282,7 +1282,30 @@ func applyStateRemap(t *dfaTable, oldToNew []int) {
 	t.immediateAcceptStates = remapMap(t.immediateAcceptStates)
 }
 
-// minimizeDFA applies Hopcroft's DFA minimization algorithm, merging
+// maxMinimizeDFAPasses bounds minimizeDFA's iterative partition-refinement
+// loop (FUZZER_BUGS.md #11). The loop is Moore-style, not Hopcroft's
+// algorithm despite this function's doc comment: it needs one full pass per
+// unit of "distinguishing depth", and a long near-linear-chain DFA (e.g. a
+// long literal or case-fold run — realistic secrets/URL-scanning patterns
+// stay in the tens of states; the fuzzer's 1656-character repro produced a
+// 1661-state, 1658-pass chain) forces close to n passes, each re-scanning
+// the not-yet-singleton remainder — O(n^2) total, independent of and
+// additional to newDFA's own (already memoized, see bug 7) subset-
+// construction cost. Past this many passes, minimization is abandoned
+// entirely: the function returns before ever mutating t, so the DFA is
+// emitted unminimized rather than partially refined — merging states from
+// an unconverged partition would be unsound (two states not yet proven
+// equivalent could still be distinguished by a later pass), so "stop early
+// and keep what we have" is not a safe option here; "stop early and change
+// nothing" is. This trades a handful of extra (unmerged) states in the
+// output table for bounded worst-case compile time — measured on the bug 11
+// repro (1661 states, 1658 passes to convergence): the fully-linear chain
+// only distinguishes states 1-for-1 (1661 states minimize to 1660 — one
+// merge, total), so skipping minimization past the cap costs nothing in
+// table size for this pattern family, only compile time.
+const maxMinimizeDFAPasses = 256
+
+// minimizeDFA applies Moore-style iterative partition refinement, merging
 // equivalent states (states that are indistinguishable from any starting
 // point). Modifies t in place.
 func minimizeDFA(t *dfaTable) {
@@ -1326,7 +1349,12 @@ func minimizeDFA(t *dfaTable) {
 	// transitions land in the same class.  Repeat until stable.
 	// Dead state (-1 in transitions) is treated as its own implicit class (-1).
 	buf := make([]byte, 256*4) // reusable key buffer: 4 bytes per byte position
+	passes := 0
 	for {
+		passes++
+		if passes > maxMinimizeDFAPasses {
+			return // Too many refinement passes — abandon minimization, leave t as-is (see maxMinimizeDFAPasses).
+		}
 		// Bucket states by current class.
 		classes := make([][]int, numClasses)
 		for s := 0; s < n; s++ {
