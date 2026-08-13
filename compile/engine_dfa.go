@@ -2102,6 +2102,11 @@ type dfaLayout struct {
 	//                     same prefix bytes can land in a different state (or die, giving
 	//                     WASM state 0). Equals wasmPrefixEnd when they don't diverge.
 	//                     See FUZZER_BUGS.md §23.
+	wasmPrefixEndNewline uint32 // state after walking the prefix from midStartNewlineState
+	//                     (prev byte == '\n'). Only populated when hasNewlineBoundary;
+	//                     otherwise == wasmPrefixEnd. Mirrors wasmPrefixEndWord's
+	//                     construction but for the (?m:^)/(?m:$) restart context —
+	//                     see FUZZER_BUGS.md §22.
 	startBeginAccept bool
 
 	// tableEnd is the highest memory address used by any table in this layout.
@@ -2701,6 +2706,25 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 			}
 		}
 		l.wasmPrefixEndStart = uint32(prefixEndStart + 1)
+		// Compute the equivalent end state when prev byte was '\n' (the
+		// (?m:^)/(?m:$) restart context). Mirrors the wasmPrefixEndWord
+		// computation above — see FUZZER_BUGS.md §22: this was previously
+		// missing entirely, so a mandatory-literal prefix walked from
+		// midStartState was used even when the true restart context was
+		// midStartNewlineState, silently losing matches whose `(?m:^)`
+		// depends on the preceding byte having been '\n'.
+		if t.hasNewlineBoundary {
+			prefixEndNewline := t.midStartNewlineState
+			for _, ch := range l.prefix {
+				prefixEndNewline = t.transitions[prefixEndNewline*256+int(ch)]
+				if prefixEndNewline < 0 { // dead state — no path through prefix
+					break
+				}
+			}
+			l.wasmPrefixEndNewline = uint32(prefixEndNewline + 1)
+		} else {
+			l.wasmPrefixEndNewline = l.wasmPrefixEnd
+		}
 		l.startBeginAccept = t.startBeginAccept
 	}
 
@@ -4301,6 +4325,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 	} else {
 		body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
 			l.wasmMidStartNewline, l.wasmPrefixEnd, l.wasmPrefixEndWord, l.wasmPrefixEndStart,
+			l.wasmPrefixEndNewline,
 			l.tableOff, l.midAcceptOff,
 			l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
 			l.useU8, l.useCompression, l.acceptLimit, l.startBeginAccept,
@@ -6951,7 +6976,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord, prefixEndStateStart uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, eofSkipSafe bool) []byte {
+func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord, prefixEndStateStart, prefixEndStateNewline uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, eofSkipSafe bool) []byte {
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
 	// `nonMidDominantOff` parameter and the `[]int` return slot) was
@@ -7212,38 +7237,25 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 					// there resumes the scan from a state reachable only via
 					// midStartState's chain, silently losing a real match at
 					// position 0.
+					//
+					// Symmetrically, for patterns with `(?m:^)`/`(?m:$)`, the
+					// walk from midStartState assumes the preceding byte
+					// wasn't '\n'; select prefixEndStateNewline (computed from
+					// midStartNewlineState) when it was — this is the
+					// FUZZER_BUGS.md §22 fix: this branch previously had no
+					// newline-divergence check at all, so any pattern with a
+					// mandatory literal prefix of 2+ bytes silently lost every
+					// match whose `(?m:^)` depended on the byte immediately
+					// before the prefix having been '\n'.
 					wordDiverges := hasWordBoundary && prefixEndState != prefixEndStateWord
+					newlineDiverges := hasNewlineBoundary && prefixEndState != prefixEndStateNewline
 					startDiverges := prefixEndState != prefixEndStateStart
+					needsByteRead := wordDiverges || newlineDiverges
 					switch {
-					case !wordDiverges && !startDiverges:
+					case !needsByteRead && !startDiverges:
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, int32(prefixEndState))
-					case wordDiverges && !startDiverges:
-						b = append(b, 0x20, 0x04) // local.get attempt_start
-						b = append(b, 0x45)       // i32.eqz
-						b = append(b, 0x04, 0x7F) // if (result i32)
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, int32(prefixEndState))
-						b = append(b, 0x05) // else
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, wordCharTableOff)
-						b = append(b, 0x20, 0x00) // local.get ptr
-						b = append(b, 0x20, 0x04) // local.get attempt_start
-						b = append(b, 0x6A)       // ptr + attempt_start
-						b = append(b, 0x41, 0x01)
-						b = append(b, 0x6B)                   // ... - 1
-						b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u prev byte
-						b = append(b, 0x6A)                   // wordCharTableOff + prev_byte
-						b = appendTableLoad8u(b, tableMemIdx) // wordChar[prev_byte]
-						b = append(b, 0x04, 0x7F)             // if (result i32) prev is word
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, int32(prefixEndStateWord))
-						b = append(b, 0x05) // else
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, int32(prefixEndState))
-						b = append(b, 0x0B) // end if prev-is-word
-						b = append(b, 0x0B) // end if attempt_start == 0
-					case !wordDiverges && startDiverges:
+					case !needsByteRead && startDiverges:
 						b = append(b, 0x20, 0x04) // local.get attempt_start
 						b = append(b, 0x45)       // i32.eqz
 						b = append(b, 0x04, 0x7F) // if (result i32)
@@ -7253,30 +7265,90 @@ func buildFindBody(startState, midStartState, midStartWordState, midStartNewline
 						b = append(b, 0x41)
 						b = utils.AppendSLEB128(b, int32(prefixEndState))
 						b = append(b, 0x0B) // end if attempt_start == 0
-					default: // wordDiverges && startDiverges
+					default: // needsByteRead — word and/or newline divergence,
+						// with or without start divergence. attempt_start==0
+						// is checked first regardless, both to pick the right
+						// begin-of-text value and to avoid reading ptr-1 (out
+						// of bounds) when attempt_start==0.
 						b = append(b, 0x20, 0x04) // local.get attempt_start
 						b = append(b, 0x45)       // i32.eqz
 						b = append(b, 0x04, 0x7F) // if (result i32)
 						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, int32(prefixEndStateStart))
+						if startDiverges {
+							b = utils.AppendSLEB128(b, int32(prefixEndStateStart))
+						} else {
+							b = utils.AppendSLEB128(b, int32(prefixEndState))
+						}
 						b = append(b, 0x05) // else
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, wordCharTableOff)
-						b = append(b, 0x20, 0x00) // local.get ptr
-						b = append(b, 0x20, 0x04) // local.get attempt_start
-						b = append(b, 0x6A)       // ptr + attempt_start
-						b = append(b, 0x41, 0x01)
-						b = append(b, 0x6B)                   // ... - 1
-						b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u prev byte
-						b = append(b, 0x6A)                   // wordCharTableOff + prev_byte
-						b = appendTableLoad8u(b, tableMemIdx) // wordChar[prev_byte]
-						b = append(b, 0x04, 0x7F)             // if (result i32) prev is word
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, int32(prefixEndStateWord))
-						b = append(b, 0x05) // else
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, int32(prefixEndState))
-						b = append(b, 0x0B) // end if prev-is-word
+						switch {
+						case wordDiverges && !newlineDiverges:
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, wordCharTableOff)
+							b = append(b, 0x20, 0x00) // local.get ptr
+							b = append(b, 0x20, 0x04) // local.get attempt_start
+							b = append(b, 0x6A)       // ptr + attempt_start
+							b = append(b, 0x41, 0x01)
+							b = append(b, 0x6B)                   // ... - 1
+							b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u prev byte
+							b = append(b, 0x6A)                   // wordCharTableOff + prev_byte
+							b = appendTableLoad8u(b, tableMemIdx) // wordChar[prev_byte]
+							b = append(b, 0x04, 0x7F)             // if (result i32) prev is word
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32(prefixEndStateWord))
+							b = append(b, 0x05) // else
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32(prefixEndState))
+							b = append(b, 0x0B) // end if prev-is-word
+						case !wordDiverges && newlineDiverges:
+							b = append(b, 0x20, 0x00)       // local.get ptr
+							b = append(b, 0x20, 0x04)       // local.get attempt_start
+							b = append(b, 0x6A)             // ptr + attempt_start
+							b = append(b, 0x41, 0x01)
+							b = append(b, 0x6B)             // ... - 1
+							b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u prev byte
+							b = append(b, 0x41, 0x0A)       // '\n'
+							b = append(b, 0x46)             // i32.eq
+							b = append(b, 0x04, 0x7F)       // if (result i32) prev == '\n'
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32(prefixEndStateNewline))
+							b = append(b, 0x05) // else
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32(prefixEndState))
+							b = append(b, 0x0B) // end if prev=='\n'
+						default: // wordDiverges && newlineDiverges — mutually
+							// exclusive at runtime ('\n' is never a word char),
+							// so check word first, newline as the else.
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, wordCharTableOff)
+							b = append(b, 0x20, 0x00) // local.get ptr
+							b = append(b, 0x20, 0x04) // local.get attempt_start
+							b = append(b, 0x6A)       // ptr + attempt_start
+							b = append(b, 0x41, 0x01)
+							b = append(b, 0x6B)                   // ... - 1
+							b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u prev byte
+							b = append(b, 0x6A)                   // wordCharTableOff + prev_byte
+							b = appendTableLoad8u(b, tableMemIdx) // wordChar[prev_byte]
+							b = append(b, 0x04, 0x7F)             // if (result i32) prev is word
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32(prefixEndStateWord))
+							b = append(b, 0x05) // else
+							b = append(b, 0x20, 0x00)       // local.get ptr
+							b = append(b, 0x20, 0x04)       // local.get attempt_start
+							b = append(b, 0x6A)             // ptr + attempt_start
+							b = append(b, 0x41, 0x01)
+							b = append(b, 0x6B)             // ... - 1
+							b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u prev byte
+							b = append(b, 0x41, 0x0A)       // '\n'
+							b = append(b, 0x46)             // i32.eq
+							b = append(b, 0x04, 0x7F)       // if (result i32) prev == '\n'
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32(prefixEndStateNewline))
+							b = append(b, 0x05) // else
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32(prefixEndState))
+							b = append(b, 0x0B) // end if prev=='\n'
+							b = append(b, 0x0B) // end if prev-is-word
+						}
 						b = append(b, 0x0B) // end if attempt_start == 0
 					}
 					b = append(b, 0x21, 0x02) // state = ...

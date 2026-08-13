@@ -60,7 +60,12 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 			return nil, false
 		}
 		table := dfaTableFrom(fwdMatcher)
-		if table.hasWordBoundary || prefixContainsWordBoundary(br.lap.prefixRe) {
+		// Same gates as the single-pattern lit-anchor path in compile.go:
+		// `\b`/`\B` (Task 10) and, per FUZZER_BUGS.md #22, `(?m:^)`/`(?m:$)`
+		// in the prefix — both leave the forward continuation unable to
+		// verify a position-dependent assertion it can't re-derive.
+		if table.hasWordBoundary || table.hasNewlineBoundary ||
+			prefixContainsWordBoundary(br.lap.prefixRe) || prefixContainsLineAnchor(br.lap.prefixRe) {
 			return nil, false
 		}
 

@@ -3788,3 +3788,107 @@ regexps
 0-5 1-4;0-5;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #22): multi-byte mandatory-literal prologue
+# never selects the newline-boundary restart state. `buildFindBody`'s
+# `len(prefix)>=1` branch (used once a 2+-byte mandatory literal engages
+# the SIMD literal-scan machinery) selects its post-prefix-scan restart
+# state via a 4-way switch on word-divergence/start-divergence only —
+# there is no newline-divergence check and `hasNewlineBoundary` is never
+# consulted, so any `(?m:^)` immediately after a mandatory `\D` (or any
+# other mandatory-literal-then-multiline-caret shape) silently loses the
+# match whenever the restart position is reached via the SIMD-scanned
+# prefix rather than the plain byte-by-byte bootstrap. Confirmed length
+# boundary: a 1-byte trailing literal (`\D(?m:^)x`) is unaffected (routed
+# through the already-fixed `len(prefix)==0` branch, FUZZER_BUGS.md #6);
+# 2-byte (`\D(?m:^)ab`) and 3-byte (`\D(?m:^)abc`) trailing literals both
+# reproduce. `\D(?m:^ x)` is the original raw fuzzer repro (2-byte
+# literal " x").
+# All expected values cross-checked against Go stdlib regexp
+# (FindStringIndex for col1; col0 kept only when the match starts at 0
+# AND consumes the entire input, matchFn's full-consumption contract).
+# ============================================================
+FuzzBug22MultiByteLitPrefixNewlineRestart
+strings
+""
+"\n"
+"\nx"
+"\n x"
+"\nab"
+"\nabc"
+"0ab"
+" ab"
+"\nAb"
+regexps
+"\\D(?m:^ x)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"\\D(?m:^)x"
+-;-;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"\\D(?m:^)ab"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"\\D(?m:^)abc"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-4;0-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Bug 22 side-check: does the same lit-anchor gap corrupt the
+# Backtracking engine's internal DFA-determines-extent phase for
+# capturing patterns shaped like `\D(?m:^)(LIT)`? Backtracking uses a
+# DFA to find the match extent before running the NFA to fill captures
+# (CLAUDE.md), and that internal extent-DFA goes through the same
+# compile.go lit-anchor gate as the standalone find_func path.
+# col5 = non-anchored find with captures, validated against Go stdlib.
+# ============================================================
+FuzzBug22SideCheckBacktrackCaptureExtent
+strings
+""
+"\n"
+"\nab"
+"\nabc"
+"0ab"
+" ab"
+regexps
+"\\D(?m:^)(ab)"
+-;-;-;-
+-;-;-;-
+0-3 1-3;0-3;-;-;-;0-3 1-3
+0-3 1-3;0-3;-;-;-;0-3 1-3
+-;-;-;-
+-;-;-;-
+"\\D(?m:^)(abc)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-4 1-4;0-4;-;-;-;0-4 1-4
+-;-;-;-
+-;-;-;-

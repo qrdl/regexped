@@ -309,6 +309,32 @@ func prefixContainsWordBoundary(re *syntax.Regexp) bool {
 	return false
 }
 
+// prefixContainsLineAnchor reports whether re (or any subtree) contains an
+// OpBeginLine (`(?m:^)`) or OpEndLine (`(?m:$)`) node. Used to gate the
+// lit-anchor optimisation the same way prefixContainsWordBoundary gates
+// `\b`/`\B` (Task 10): once the backward scan verifies a candidate match
+// start, the forward continuation resumes a freshly-compiled DFA for
+// suffixRe at that position with no way to learn whether the byte
+// immediately preceding it was '\n' — it always assumes the restart is a
+// fresh "prev wasn't '\n'" context, silently losing any match whose
+// `(?m:^)` depends on the preceding byte having actually been '\n'.
+// See FUZZER_BUGS.md §22.
+func prefixContainsLineAnchor(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	switch re.Op {
+	case syntax.OpBeginLine, syntax.OpEndLine:
+		return true
+	}
+	for _, sub := range re.Sub {
+		if prefixContainsLineAnchor(sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // altLitAnchorBranch pairs one alternation branch's litAnchorPoint with the
 // branch's own (capture-stripped) regexp node. compile.go uses branchRe to
 // re-enter the standard compile() pipeline and build the branch's own

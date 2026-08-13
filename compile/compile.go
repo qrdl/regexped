@@ -1052,8 +1052,16 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// the acceptStates[startState] check below (a reversed `\b`-only
 			// DFA accepts at its start), but that gate is fragile against
 			// future DFA-construction changes.
-			if lap != nil && l.useU8 && !table.hasWordBoundary &&
-				!prefixContainsWordBoundary(lap.prefixRe) {
+			//
+			// FUZZER_BUGS.md #22: the same class of gap exists for
+			// `(?m:^)`/`(?m:$)` in the prefix — reject those too. The forward
+			// continuation resumes suffixRe's own freshly-compiled DFA at the
+			// backward-verified match-start position with no independent way
+			// to re-derive whether that position's own newline-boundary
+			// context was correctly resolved, so a prefix containing a line
+			// anchor is rejected the same way one containing `\b`/`\B` is.
+			if lap != nil && l.useU8 && !table.hasWordBoundary && !table.hasNewlineBoundary &&
+				!prefixContainsWordBoundary(lap.prefixRe) && !prefixContainsLineAnchor(lap.prefixRe) {
 				// Compile the reversed prefix DFA for the backward scan.
 				revRe := reverseRegexp(lap.prefixRe)
 				revSimplified := revRe.Simplify()
