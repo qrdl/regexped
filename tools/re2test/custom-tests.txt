@@ -3497,3 +3497,84 @@ regexps
 -;-;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #18): nested greedy-loop backoff to satisfy a
+# trailing ^. "(?:a*)+^" must back off through two levels of greedy
+# nesting (a Star inside a Plus) to leave position 0 unconsumed, where ^
+# can fire. Go stdlib finds [0,0) on "a"/"aa"; regexped returned no match.
+# Root cause: dfaHasOutrankedState false-positive-rerouted this pattern
+# (no \b/\B anywhere in it) to Backtracking, whose own zero-progress guard
+# then broke down under two levels of greedy nesting. "a*^" (single level
+# of nesting) is an unaffected control that already worked; "(?:a+)+^" is
+# an unaffected control with no zero-width fallback at all (Go stdlib
+# agrees there's no match there, at any input).
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug18NestedGreedyLoopBackoffForCaret
+strings
+""
+"a"
+"aa"
+regexps
+"(?:a*)+^"
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"a*^"
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"(?:a+)+^"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #18, Backtracking-engine regression guard):
+# nested-loop shape with a NON-GREEDY inner loop instead of a greedy one
+# (contrast with FuzzBug18NestedGreedyLoopBackoffForCaret above, whose inner
+# `a*` is greedy). This pattern was never broken on any committed/shipped
+# code — it surfaced only as a self-inflicted regression during this
+# session's development of the bug-18 Backtracking fix: an early attempt at
+# fixing FuzzBug18NestedGreedyLoopBackoffForCaret's "(?:a*)+^" repro
+# memoised the OUTER loop head whenever its body contained any nested loop.
+# That fixed the greedy-inner repro above but broke THIS pattern (wrongly
+# consumed 'a's, e.g. end=1 instead of the correct end=0 on "a") — revisiting
+# the outer loop head at the same position, it turned out, is the very
+# mechanism its own zero-progress guard needs to detect "no progress since
+# last time", and memoising the outer head away broke that for this shape.
+# The landed fix (memoise the INNER pc via nestedLoopPC, not the outer loop
+# head) resolves both this pattern and the greedy-inner one without needing
+# to touch the outer loop's guard at all. Kept here as a permanent
+# regression guard against re-introducing the outer-loop-memoisation
+# mistake (see FUZZER_BUGS.md #18 "Fix" section for the full trace of why
+# that approach is unsound in general).
+#
+# col0 here is groupsFn's own contract: anchored at pos 0, NOT required to
+# consume all input (confirmed via tools/re2test/main.go's col0 handling,
+# not assumed) — since both patterns already start with `^`, col0 and col1
+# coincide with Go stdlib's plain (unwrapped) FindSubmatchIndex/FindStringIndex.
+# The `$`-suffixed variant is a control forcing full consumption, exercising
+# the identical memoised inner PC on a shape that must actually consume
+# input to succeed. All expected values cross-checked against Go stdlib
+# regexp (FindSubmatchIndex/FindStringIndex, no \A...\z wrapping).
+# ============================================================
+FuzzBug18NestedNonGreedyInnerLoopRegression
+strings
+""
+"a"
+"aa"
+"ab"
+"b"
+regexps
+"^(?:(?:(?:(a)*?){0,}))"
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+"^(?:(?:(?:(a)*?){0,}))$"
+0-0 -;0-0;-;-
+0-1 0-1;0-1;-;-
+0-2 1-2;0-2;-;-
+-;-;-;-
+-;-;-;-

@@ -200,27 +200,44 @@ func isDominantAccept(prog *syntax.Prog, states []uint32, ctx int) bool {
 	return false
 }
 
-// boundaryOutranksCtx0 (FUZZER_BUGS.md #15) reports whether, in the
+// boundaryOutranksCtx0 (FUZZER_BUGS.md #15, #18) reports whether, in the
 // priority-ordered epsilon closure of `states`, some \b/\B/(?m:$) assertion
-// that resolves under `boundaryCtx` but would NOT resolve under ctx=0 is
-// reached before the Match that ctx=0's own (unconditional) closure would
-// find. When true, this specific boundary channel's accept is a genuinely
-// higher-priority resolution than anything the state's ctx=0 midAccept bit
-// could ever produce — e.g. `0*\b|0*`: the \b node is reached before
-// branch2's unconditional Match, so the W/NW channel that resolves it
-// outranks ctx=0 there. When false — e.g. the SAME merged state's OWN
+// that resolves under `boundaryCtx` but would NOT resolve under the state's
+// own baseline `baseCtx` is reached before the Match that baseCtx's own
+// closure would find. When true, this specific boundary channel's accept is
+// a genuinely higher-priority resolution than anything the state's baseCtx
+// midAccept bit could ever produce — e.g. `0*\b|0*`: the \b node is reached
+// before branch2's unconditional Match, so the W/NW channel that resolves it
+// outranks baseCtx there. When false — e.g. the SAME merged state's OWN
 // midAcceptW channel for a state reached via a WORD-char predecessor, where
 // \b needs the OPPOSITE polarity (\B) to resolve and so the boundary node
-// stays unresolved just like it does under ctx=0 — the channel's accept
-// falls through to the exact same low-priority Match ctx=0 would find
+// stays unresolved just like it does under baseCtx — the channel's accept
+// falls through to the exact same low-priority Match baseCtx would find
 // anyway, and must NOT be treated as outranking (see repro `x0*\b|x0*`).
 //
+// `baseCtx` is the bootstrap state's own unconditionally-true bits — ecBegin
+// for state 0 (true start of text), ecBeginLine for midStartNewline (restart
+// after a '\n'), 0 for every other bootstrap/mid-scan state. It must match
+// whatever context that state's own plain midAccept bit (dfa.midAccepting)
+// is computed under, and it must be included in `boundaryCtx` too (callers
+// already do this — see e.g. state 0's `ecBegin|ecNoWordBoundary`). Passing
+// a bare 0 here regardless of the state's true baseline was FUZZER_BUGS.md
+// #18's cause (1): for `(?:a*)+^`, walking state 0's closure hits the `^`
+// node itself (not any \b/\B) — under boundaryCtx=ecBegin|ecNoWordBoundary
+// it resolves (ecBegin present), under a bare ctx=0 comparison it doesn't
+// (ecBegin absent), so the plain `^` node was wrongly read as a
+// higher-priority "boundary channel" even though no \b/\B is involved at
+// all, false-positive-rerouting any `{quantifier}^`-shaped pattern to
+// Backtracking. Using baseCtx=ecBegin for state 0 makes `^` resolve
+// identically on both sides of the comparison, so only a genuine \b/\B (or
+// (?m:$)) can still trigger the "outranks" result.
+//
 // Byte-consumers are deliberately NOT blockers here (unlike
-// isDominantAccept): ctx=0's own acceptBitsFor doesn't stop at a live
+// isDominantAccept): baseCtx's own acceptBitsFor doesn't stop at a live
 // byte-consumer either — it just asks "is Match reachable at all" — so this
 // walk has to use the same rule to stay comparable and correctly identify
 // when the two ctx's *first found Match* differ.
-func boundaryOutranksCtx0(prog *syntax.Prog, states []uint32, boundaryCtx int) bool {
+func boundaryOutranksCtx0(prog *syntax.Prog, states []uint32, baseCtx int, boundaryCtx int) bool {
 	resolves := func(emptyOp syntax.EmptyOp, ctx int) bool {
 		follow := true
 		if emptyOp&syntax.EmptyBeginText != 0 {
@@ -258,22 +275,22 @@ func boundaryOutranksCtx0(prog *syntax.Prog, states []uint32, boundaryCtx int) b
 		inst := &prog.Inst[pc]
 		switch inst.Op {
 		case syntax.InstMatch:
-			return false // ctx=0 already reaches Match here — nothing boundary-gated outranks it
+			return false // baseCtx already reaches Match here — nothing boundary-gated outranks it
 		case syntax.InstAlt:
 			stack = append(stack, inst.Arg, inst.Out)
 		case syntax.InstCapture, syntax.InstNop:
 			stack = append(stack, inst.Out)
 		case syntax.InstEmptyWidth:
 			emptyOp := syntax.EmptyOp(inst.Arg)
-			atCtx0 := resolves(emptyOp, 0)
+			atCtx0 := resolves(emptyOp, baseCtx)
 			atBoundary := resolves(emptyOp, boundaryCtx)
 			if atBoundary && !atCtx0 {
 				return true // resolved only once boundaryCtx is known: a genuinely higher-priority channel
 			}
 			if atCtx0 {
-				stack = append(stack, inst.Out) // matches ctx=0's own traversal exactly
+				stack = append(stack, inst.Out) // matches baseCtx's own traversal exactly
 			}
-			// else: dead end under both ctx=0 and boundaryCtx, same as ctx=0's walk.
+			// else: dead end under both baseCtx and boundaryCtx, same as baseCtx's walk.
 		}
 		// byte-consumers: intentionally not a blocker here — see doc comment above.
 	}
@@ -752,8 +769,8 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// `(?m:^...).*(?:ERROR|WARNING|FATAL): .+$)` — no alternation at all,
 	// just a plain `.+$` tail — routing perftest's log-capture to
 	// Backtracking and regressing its "no matches" case by ~48x).
-	markOutranked := func(m map[int]uint64, state int, states []uint32, ctx int) {
-		if dfa.midAccepting[state] != 0 && boundaryOutranksCtx0(prog, states, ctx) {
+	markOutranked := func(m map[int]uint64, state int, states []uint32, baseCtx int, ctx int) {
+		if dfa.midAccepting[state] != 0 && boundaryOutranksCtx0(prog, states, baseCtx, ctx) {
 			m[state] = 1
 		}
 	}
@@ -829,16 +846,16 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// midAcceptNW: before non-word byte → \B fires (prev=non-word, next=non-word)
 	orAccept(dfa.midAcceptingNW, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary))
 	markDominant(dfa.midAcceptingNWDominant, 0, startSet, ecBegin|ecNoWordBoundary)
-	markOutranked(dfa.midAcceptingNWOutranked, 0, startSet, ecBegin|ecNoWordBoundary)
+	markOutranked(dfa.midAcceptingNWOutranked, 0, startSet, ecBegin, ecBegin|ecNoWordBoundary)
 	// midAcceptW: before word byte → \b fires (prev=non-word, next=word)
 	orAccept(dfa.midAcceptingW, 0, acceptBitsFor(startSet, ecBegin|ecWordBoundary))
 	markDominant(dfa.midAcceptingWDominant, 0, startSet, ecBegin|ecWordBoundary)
-	markOutranked(dfa.midAcceptingWOutranked, 0, startSet, ecBegin|ecWordBoundary)
+	markOutranked(dfa.midAcceptingWOutranked, 0, startSet, ecBegin, ecBegin|ecWordBoundary)
 	// midAcceptNL: before '\n' byte → (?m:$) fires (ecEndLine | \B since prev=non-word)
 	if dfa.hasNewlineBoundary {
 		orAccept(dfa.midAcceptingNL, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary|ecEndLine))
 		markDominant(dfa.midAcceptingNLDominant, 0, startSet, ecBegin|ecNoWordBoundary|ecEndLine)
-		markOutranked(dfa.midAcceptingNLOutranked, 0, startSet, ecBegin|ecNoWordBoundary|ecEndLine)
+		markOutranked(dfa.midAcceptingNLOutranked, 0, startSet, ecBegin, ecBegin|ecNoWordBoundary|ecEndLine)
 	}
 	// startBeginAccept: pattern matches empty at position 0 due to begin anchor (^/\A).
 	// Distinct from acceptStates (ecBegin|ecEnd) and midAcceptStates (ctx=0).
@@ -889,16 +906,16 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		// midAcceptNW for midStart (prevWasWord=false): before non-word → \B fires
 		orAccept(dfa.midAcceptingNW, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary))
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStart, midStartSet, ecNoWordBoundary)
-		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStart, midStartSet, ecNoWordBoundary)
+		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStart, midStartSet, 0, ecNoWordBoundary)
 		// midAcceptW for midStart (prevWasWord=false): before word → \b fires
 		orAccept(dfa.midAcceptingW, dfa.midStart, acceptBitsFor(midStartSet, ecWordBoundary))
 		markDominant(dfa.midAcceptingWDominant, dfa.midStart, midStartSet, ecWordBoundary)
-		markOutranked(dfa.midAcceptingWOutranked, dfa.midStart, midStartSet, ecWordBoundary)
+		markOutranked(dfa.midAcceptingWOutranked, dfa.midStart, midStartSet, 0, ecWordBoundary)
 		// midAcceptNL for midStart (prevWasWord=false): before '\n' → (?m:$) fires
 		if dfa.hasNewlineBoundary {
 			orAccept(dfa.midAcceptingNL, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary|ecEndLine))
 			markDominant(dfa.midAcceptingNLDominant, dfa.midStart, midStartSet, ecNoWordBoundary|ecEndLine)
-			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStart, midStartSet, ecNoWordBoundary|ecEndLine)
+			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStart, midStartSet, 0, ecNoWordBoundary|ecEndLine)
 		}
 		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 			bits := nfaAcceptBits(midStartSet)
@@ -936,16 +953,16 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		// midAcceptNW for midStartWord (prevWasWord=true): before non-word → \b fires
 		orAccept(dfa.midAcceptingNW, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary))
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStartWord, midStartSet, ecWordBoundary)
-		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartWord, midStartSet, ecWordBoundary)
+		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary)
 		// midAcceptW for midStartWord (prevWasWord=true): before word → \B fires
 		orAccept(dfa.midAcceptingW, dfa.midStartWord, acceptBitsFor(midStartSet, ecNoWordBoundary))
 		markDominant(dfa.midAcceptingWDominant, dfa.midStartWord, midStartSet, ecNoWordBoundary)
-		markOutranked(dfa.midAcceptingWOutranked, dfa.midStartWord, midStartSet, ecNoWordBoundary)
+		markOutranked(dfa.midAcceptingWOutranked, dfa.midStartWord, midStartSet, 0, ecNoWordBoundary)
 		// midAcceptNL for midStartWord (prevWasWord=true): before '\n' → (?m:$) fires (\b since prev=word)
 		if dfa.hasNewlineBoundary {
 			orAccept(dfa.midAcceptingNL, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary|ecEndLine))
 			markDominant(dfa.midAcceptingNLDominant, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
-			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
+			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary|ecEndLine)
 		}
 		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 			bits := nfaAcceptBits(midStartSet)
@@ -987,14 +1004,14 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 			orAccept(dfa.midAccepting, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, 0))
 			orAccept(dfa.midAcceptingNW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary))
 			markDominant(dfa.midAcceptingNWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary)
-			markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary)
+			markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary)
 			orAccept(dfa.midAcceptingW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecWordBoundary))
 			markDominant(dfa.midAcceptingWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecWordBoundary)
-			markOutranked(dfa.midAcceptingWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecWordBoundary)
+			markOutranked(dfa.midAcceptingWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecWordBoundary)
 			// midAcceptNL for midStartNewline (prevWasWord=false): before '\n' → (?m:$) fires (\B since prev=newline=non-word)
 			orAccept(dfa.midAcceptingNL, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine))
 			markDominant(dfa.midAcceptingNLDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine)
-			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine)
+			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary|ecEndLine)
 			if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
 				bits := nfaAcceptBits(midStartNewlineSet)
 				if bits == 0 {
@@ -1102,7 +1119,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				}
 				orAccept(dfa.midAcceptingNW, nextDFAState, acceptBitsFor(nextSet, nwCtx))
 				markDominant(dfa.midAcceptingNWDominant, nextDFAState, nextSet, nwCtx)
-				markOutranked(dfa.midAcceptingNWOutranked, nextDFAState, nextSet, nwCtx)
+				markOutranked(dfa.midAcceptingNWOutranked, nextDFAState, nextSet, 0, nwCtx)
 				var wCtx int
 				if nextPrevWasWord {
 					wCtx = ecNoWordBoundary
@@ -1111,11 +1128,11 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				}
 				orAccept(dfa.midAcceptingW, nextDFAState, acceptBitsFor(nextSet, wCtx))
 				markDominant(dfa.midAcceptingWDominant, nextDFAState, nextSet, wCtx)
-				markOutranked(dfa.midAcceptingWOutranked, nextDFAState, nextSet, wCtx)
+				markOutranked(dfa.midAcceptingWOutranked, nextDFAState, nextSet, 0, wCtx)
 				if dfa.hasNewlineBoundary {
 					orAccept(dfa.midAcceptingNL, nextDFAState, acceptBitsFor(nextSet, nwCtx|ecEndLine))
 					markDominant(dfa.midAcceptingNLDominant, nextDFAState, nextSet, nwCtx|ecEndLine)
-					markOutranked(dfa.midAcceptingNLOutranked, nextDFAState, nextSet, nwCtx|ecEndLine)
+					markOutranked(dfa.midAcceptingNLOutranked, nextDFAState, nextSet, 0, nwCtx|ecEndLine)
 				}
 				if leftmostFirst {
 					if pBits != nil {

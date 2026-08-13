@@ -25,6 +25,47 @@ type backtrack struct {
 	// emitBTInstHandler's InstAlt case for why these need different
 	// zero-progress handling than every other loop.
 	emptyBodyGreedyLoop map[int]bool
+
+	// memoInnerLoop is a set of Alt/AltMatch PCs that are NOT genuine loop
+	// heads by altLoopBody's dominance-based test (so bt.loops[pc] is
+	// false and they're compiled as ordinary non-loop alternations), but
+	// that nonetheless cycle back to themselves — reached when a back edge
+	// lands on an instruction with more than one predecessor path, which
+	// dominance can't recognize (e.g. prog.Start itself, or a duplicate
+	// "first entry vs. loop-back" instruction Go's compiler emits — see
+	// nestedLoopPC's doc). Left as an ordinary non-loop alternation, such a
+	// PC re-pushes a fresh retry frame on every entry with no bound,
+	// because it has no zero-progress guard of any kind.
+	//
+	// That's harmless in isolation (each entry still corresponds to a
+	// distinct, legitimate backtracking choice), but becomes unbounded
+	// when this PC is *also* the sole, unconditional body of an enclosing
+	// emptyBodyGreedyLoop (FUZZER_BUGS.md #18, e.g. the inner `a*` inside
+	// the outer `+` in `(?:a*)+^`): the outer loop's own zero-progress
+	// scalar can be clobbered by an intervening re-entry at a different
+	// position before the outer loop is revisited at the position that
+	// would let it detect "no progress" — so this inner PC keeps
+	// re-pushing frames faster than the outer loop can ever converge,
+	// growing the backtrack stack without bound until it overflows and the
+	// whole attempt is silently abandoned.
+	//
+	// These PCs get BitState memoisation instead — memoising the INNER PC
+	// specifically, not the outer loop head. An earlier attempt memoised
+	// the outer loop head directly and was confirmed live to break both
+	// directions: (a) `(?:a*|b*)*` on "b" started returning a wrong
+	// non-empty match, because the outer loop's own re-entry at the same
+	// position is *also* how the "still-pending sibling branch" mechanism
+	// (task 20) works, and blocking it suppressed that sibling; (b) even
+	// where it produced the right answer (`(?:a*)+^`), it did so by
+	// accident — the trace showed it only worked because it happened not
+	// to disturb the specific revisit the zero-progress guard needed.
+	// Memoising the inner PC instead leaves the outer loop's own re-entry
+	// mechanism completely untouched, and only stops the true source of
+	// unbounded growth. See nestedLoopPC for the precise, narrow shape
+	// this is restricted to (deliberately excludes `(?:a*|b*)*`, where the
+	// outer body branches into multiple sibling alternatives rather than
+	// leading unconditionally into one inner self-looping PC).
+	memoInnerLoop map[int]bool
 }
 
 func (b *backtrack) Type() EngineType { return EngineBacktrack }
@@ -39,6 +80,7 @@ func newBacktrack(prog *syntax.Prog) *backtrack {
 		nonGreedyLoop:       make(map[int]bool),
 		idom:                idom,
 		emptyBodyGreedyLoop: make(map[int]bool),
+		memoInnerLoop:       make(map[int]bool),
 	}
 	for pc, inst := range prog.Inst {
 		if inst.Op == syntax.InstAlt {
@@ -48,6 +90,9 @@ func newBacktrack(prog *syntax.Prog) *backtrack {
 				bt.nonGreedyLoop[pc] = bodyPC == int(inst.Arg)
 				if !bt.nonGreedyLoop[pc] && loopBodyCanMatchEmpty(prog, idom, pc) {
 					bt.emptyBodyGreedyLoop[pc] = true
+					if innerPC, found := nestedLoopPC(prog, idom, pc); found {
+						bt.memoInnerLoop[innerPC] = true
+					}
 				}
 			}
 		}
@@ -290,6 +335,95 @@ func loopBodyCanMatchEmpty(prog *syntax.Prog, idom []int, loopPC int) bool {
 	return false
 }
 
+// nestedLoopPC looks for a single, unconditional nested loop directly inside
+// loopPC's body — the specific shape FUZZER_BUGS.md #18 needs memoised. It
+// walks the body linearly from bodyStart, following only non-branching
+// instructions (Capture/Nop), and stops at the FIRST Alt/AltMatch it finds:
+// if that instruction cycles back to itself, its PC is returned as the
+// nested loop; otherwise — including the case where it's a plain
+// (non-cycling) branch choosing between multiple sibling alternatives, e.g.
+// the top-level `a*|b*` choice in `(?:a*|b*)*` — this stops and reports
+// found=false rather than searching deeper.
+//
+// This conservatism is required, not just cautious: an earlier, broader
+// attempt (memoising the OUTER loop head itself whenever its body contained
+// any nested loop, transitively) was confirmed live to break `(?:a*|b*)*` on
+// "b" (wrongly returning end=1 instead of the correct end=0) — see
+// bt.memoInnerLoop's doc for the full trace of why. Restricting to the
+// single-unconditional-path shape, and memoising the inner PC rather than
+// the outer, avoids that failure mode entirely: `(?:a*|b*)*`'s outer body
+// (a plain branch between the a* and b* sub-loops) never matches this
+// shape, so it's never touched.
+//
+// The returned PC need NOT be a registered loop head in bt.loops:
+// altLoopBody's back-edge test is dominance-based (dominates(idom,
+// branchTarget, pc)), and dominance can never hold against a PC reached via
+// more than one distinct predecessor path — prog.Start itself (nothing but
+// start can "dominate" the root), or the duplicate "first entry vs.
+// loop-back re-entry" instruction Go's compiler sometimes emits for a
+// loop's true first iteration. `(?:a*)+^` produces the former (the inner
+// `a*`'s own Alt IS prog.Start); `(?:(?:(a)*?){0,})`-shaped patterns
+// produce the latter. Using pcReachesBounded's plain forward reachability
+// instead of dominates sidesteps both gaps without touching altLoopBody's
+// existing classification (used elsewhere for
+// bt.loops/nonGreedyLoop/emptyBodyGreedyLoop) at all. The reachability
+// check is bounded at loopPC so it doesn't "leak" through loopPC's own back
+// edge and false-positive on every enclosing loop.
+func nestedLoopPC(prog *syntax.Prog, idom []int, loopPC int) (innerPC int, found bool) {
+	pc := loopBodyStart(prog, idom, loopPC)
+	visited := make([]bool, len(prog.Inst))
+	for {
+		if pc == loopPC || visited[pc] {
+			return 0, false
+		}
+		visited[pc] = true
+		inst := prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstAlt, syntax.InstAltMatch:
+			if pcReachesBounded(prog, int(inst.Out), pc, loopPC) || pcReachesBounded(prog, int(inst.Arg), pc, loopPC) {
+				return pc, true
+			}
+			return 0, false
+		case syntax.InstCapture, syntax.InstNop:
+			pc = int(inst.Out)
+		default:
+			// Fail/Match/byte-consumer reached before any branching — no
+			// nested loop on this linear prefix.
+			return 0, false
+		}
+	}
+}
+
+// pcReachesBounded reports whether `target` is reachable from `from` via a
+// forward path through the NFA graph that never crosses `boundary` (reaching
+// boundary is treated as a dead end, not expanded further) — see
+// nestedLoopPC for why the bound is required.
+func pcReachesBounded(prog *syntax.Prog, from, target, boundary int) bool {
+	visited := make([]bool, len(prog.Inst))
+	queue := []int{from}
+	for len(queue) > 0 {
+		pc := queue[0]
+		queue = queue[1:]
+		if pc == target {
+			return true
+		}
+		if pc == boundary || visited[pc] {
+			continue
+		}
+		visited[pc] = true
+		inst := prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstFail, syntax.InstMatch:
+			// no successors
+		case syntax.InstAlt, syntax.InstAltMatch:
+			queue = append(queue, int(inst.Out), int(inst.Arg))
+		default:
+			queue = append(queue, int(inst.Out))
+		}
+	}
+	return false
+}
+
 // btHasWordBoundary reports whether prog contains a \b/\B assertion —
 // used to decide whether a non-anchored captureBody needs the edge-scratch
 // mechanism (FUZZER_BUGS.md #26): patterns without any \b/\B never emit
@@ -308,31 +442,40 @@ func btHasWordBoundary(prog *syntax.Prog) bool {
 	return false
 }
 
-// needsBitState returns true if prog contains a non-greedy loop whose body can
-// execute a full iteration without consuming a byte.  For such loops the
-// existing zero-progress guard incorrectly takes the body branch again (instead
-// of exiting), causing an infinite loop.  BitState memoisation breaks the cycle.
+// needsBitState returns true if prog contains a loop that the scalar
+// zero-progress guard alone cannot handle correctly, requiring BitState
+// memoisation to break a cycle:
 //
-// Greedy loops are already handled correctly by the zero-progress guard
-// (zero-progress → take exit), so they never need BitState.  In particular,
-// the canonical "catastrophic backtracking" pattern (?:a?)* has a greedy outer
-// loop: when a? matches empty the guard fires and the loop exits immediately.
+//   - A non-greedy loop whose body can execute a full iteration without
+//     consuming a byte. For such loops the existing zero-progress guard
+//     incorrectly takes the body branch again (instead of exiting), causing
+//     an infinite loop.
+//   - A PC that nestedLoopPC finds nested, unconditionally and alone, inside
+//     an emptyBodyGreedyLoop's body (bt.memoInnerLoop — FUZZER_BUGS.md #18,
+//     e.g. the inner `a*` inside the outer `+` in `(?:a*)+^`). Such a PC is
+//     never itself a registered loop head (altLoopBody's dominance-based
+//     back-edge test can't recognize it — see nestedLoopPC's doc), so it's
+//     compiled as an ordinary non-loop alternation with no zero-progress
+//     guard of any kind, re-pushing a fresh retry frame on every entry
+//     without bound. Left unmemoised, that unbounded growth outpaces the
+//     enclosing loop's own (otherwise-correct) zero-progress detection
+//     until the backtrack stack overflows and the whole attempt is silently
+//     abandoned.
+//
+// A greedy loop whose empty-matchable body does NOT have this shape (e.g.
+// the canonical "catastrophic backtracking" pattern (?:a?)*, or the
+// multi-branch (?:a*|b*)*) is already correctly handled by the scalar guard
+// alone and does not need BitState — see bt.memoInnerLoop's and
+// nestedLoopPC's docs for why memoising the OUTER loop head instead (an
+// earlier, broader attempt) is unsound in general.
 func needsBitState(prog *syntax.Prog) bool {
-	idom := computeDominators(prog)
-	for pc, inst := range prog.Inst {
-		if inst.Op != syntax.InstAlt && inst.Op != syntax.InstAltMatch {
-			continue
-		}
-		// Non-greedy loop: body is Arg (the branch that cycles back to pc).
-		bodyPC, _, isLoop := altLoopBody(prog, idom, pc)
-		if !isLoop || bodyPC != int(inst.Arg) {
-			continue
-		}
-		if loopBodyCanMatchEmpty(prog, idom, pc) {
+	bt := newBacktrack(prog)
+	for pc, nonGreedy := range bt.nonGreedyLoop {
+		if nonGreedy && loopBodyCanMatchEmpty(prog, bt.idom, pc) {
 			return true
 		}
 	}
-	return false
+	return len(bt.memoInnerLoop) > 0
 }
 
 // appendBacktrackCodeEntry appends a size-prefixed backtracking capture body to cs.
@@ -635,6 +778,69 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	return body
 }
 
+// emitBitStateGuard emits the shared BitState "already visited (p, pos)?
+// fail : mark visited" check — used both for non-greedy empty-body loop
+// heads (bt.nonGreedyLoop) and for bt.memoInnerLoop PCs (FUZZER_BUGS.md
+// #18). brDepth is the br depth to restart $run from inside this one
+// WASM-level if-block (callers pass brRunNested; the enclosing Go-level
+// `if useMemo && ...` around the call site is compile-time only and adds no
+// WASM nesting).
+func emitBitStateGuard(body []byte, p int, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte uint32, memoTableBase int32, tableMemIdx int, brDepth uint32) []byte {
+	// bitIdx = p * lenPlus1 + localPos
+	// (p is the compile-time PC, baked as i32.const)
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, int32(p))
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoLenPlus1Local)
+	body = append(body, 0x6C) // i32.mul
+	body = append(body, 0x20, localPos)
+	body = append(body, 0x6A) // i32.add
+	body = append(body, 0x22) // local.tee
+	body = utils.AppendULEB128(body, memoBitIdx)
+
+	// byteAddr = memoTableBase + bitIdx / 8
+	body = append(body, 0x41, 0x03)
+	body = append(body, 0x76) // i32.shr_u (/ 8)
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, memoTableBase)
+	body = append(body, 0x6A) // i32.add
+	body = append(body, 0x22) // local.tee
+	body = utils.AppendULEB128(body, memoByteAddr)
+
+	// memoByte = mem[byteAddr]
+	body = appendTableLoad8u(body, tableMemIdx) // i32.load8_u (memo byte)
+	body = append(body, 0x22)                   // local.tee
+	body = utils.AppendULEB128(body, memoMemoByte)
+
+	// check bit: (memoByte >> (bitIdx & 7)) & 1
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoBitIdx)
+	body = append(body, 0x41, 0x07)
+	body = append(body, 0x71) // i32.and (&7)
+	body = append(body, 0x76) // i32.shr_u
+	body = append(body, 0x41, 0x01)
+	body = append(body, 0x71)       // i32.and (&1)
+	body = append(body, 0x04, 0x40) // if void
+	// already visited → fail
+	body = btFail(body, brDepth)
+	body = append(body, 0x0B) // end if
+
+	// set bit: mem[byteAddr] = memoByte | (1 << (bitIdx & 7))
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoByteAddr)
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoMemoByte)
+	body = append(body, 0x41, 0x01) // i32.const 1  (value to shift)
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoBitIdx)
+	body = append(body, 0x41, 0x07)
+	body = append(body, 0x71)                   // i32.and (&7) (shift amount)
+	body = append(body, 0x74)                   // i32.shl: 1 << (bitIdx & 7)
+	body = append(body, 0x72)                   // i32.or
+	body = appendTableStore8(body, tableMemIdx) // i32.store8 to memo table
+	return body
+}
+
 // emitBTInstHandler emits WASM for a single NFA instruction handler.
 // brRun is the br depth (from handler top level) to restart $run.
 // memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte are the
@@ -707,7 +913,16 @@ func emitBTInstHandler(
 	case syntax.InstAlt, syntax.InstAltMatch:
 		isLoop := bt.loops[p]
 		if !isLoop {
-			// Non-loop alternation: push retry=inst.Arg, continue with inst.Out
+			// Non-loop alternation: push retry=inst.Arg, continue with inst.Out.
+			//
+			// bt.memoInnerLoop[p]: this PC nonetheless cycles back to itself
+			// (FUZZER_BUGS.md #18) but isn't a registered loop head, so it has
+			// no zero-progress guard at all — memoise it the same way a
+			// non-greedy empty-body loop head is memoised below, to bound the
+			// otherwise-unlimited retry growth. See bt.memoInnerLoop's doc.
+			if useMemo && bt.memoInnerLoop[p] {
+				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested)
+			}
 			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
 			body = btSetStateAndBr(body, int32(inst.Out), brRun)
 		} else {
@@ -717,61 +932,8 @@ func emitBTInstHandler(
 			// ── Part 4: BitState bit check/set ───────────────────────────────
 			// Only for non-greedy loop heads with zero-matchable bodies.
 			// Greedy loops are correctly handled by the zero-progress guard below.
-			// From inside the if-block: depth 0 = this if, depth 1 = brRun depth.
-			// So brRunNested is the correct depth to restart $run from here.
 			if useMemo && bt.nonGreedyLoop[p] {
-				// bitIdx = p * lenPlus1 + localPos
-				// (p is the compile-time PC, baked as i32.const)
-				body = append(body, 0x41)
-				body = utils.AppendSLEB128(body, int32(p))
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoLenPlus1Local)
-				body = append(body, 0x6C) // i32.mul
-				body = append(body, 0x20, localPos)
-				body = append(body, 0x6A) // i32.add
-				body = append(body, 0x22) // local.tee
-				body = utils.AppendULEB128(body, memoBitIdx)
-
-				// byteAddr = memoTableBase + bitIdx / 8
-				body = append(body, 0x41, 0x03)
-				body = append(body, 0x76) // i32.shr_u (/ 8)
-				body = append(body, 0x41)
-				body = utils.AppendSLEB128(body, memoTableBase)
-				body = append(body, 0x6A) // i32.add
-				body = append(body, 0x22) // local.tee
-				body = utils.AppendULEB128(body, memoByteAddr)
-
-				// memoByte = mem[byteAddr]
-				body = appendTableLoad8u(body, tableMemIdx) // i32.load8_u (memo byte)
-				body = append(body, 0x22)                   // local.tee
-				body = utils.AppendULEB128(body, memoMemoByte)
-
-				// check bit: (memoByte >> (bitIdx & 7)) & 1
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoBitIdx)
-				body = append(body, 0x41, 0x07)
-				body = append(body, 0x71) // i32.and (&7)
-				body = append(body, 0x76) // i32.shr_u
-				body = append(body, 0x41, 0x01)
-				body = append(body, 0x71)       // i32.and (&1)
-				body = append(body, 0x04, 0x40) // if void
-				// already visited → fail (brRunNested: depth 0=this if, +brRun=$run)
-				body = btFail(body, brRunNested)
-				body = append(body, 0x0B) // end if
-
-				// set bit: mem[byteAddr] = memoByte | (1 << (bitIdx & 7))
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoByteAddr)
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoMemoByte)
-				body = append(body, 0x41, 0x01) // i32.const 1  (value to shift)
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoBitIdx)
-				body = append(body, 0x41, 0x07)
-				body = append(body, 0x71)                   // i32.and (&7) (shift amount)
-				body = append(body, 0x74)                   // i32.shl: 1 << (bitIdx & 7)
-				body = append(body, 0x72)                   // i32.or
-				body = appendTableStore8(body, tableMemIdx) // i32.store8 to memo table
+				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested)
 			}
 
 			// For greedy loops: body=Out, exit=Arg. For non-greedy: body=Arg, exit=Out.
