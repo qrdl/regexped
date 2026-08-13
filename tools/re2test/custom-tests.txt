@@ -3459,3 +3459,41 @@ regexps
 "\\B(?:^ )"
 0-1;0-1;-;-
 -;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #17): (?m:$^) fails at true end-of-text
+# reached via the midStartNewline restart context. Reverse-order sibling
+# of already-fixed bug 6 ((?m:^$) on "0\n"): midStartNewline's EOF-accept
+# computation (acceptBitsFor(midStartNewlineSet, ecEnd|ecNoWordBoundary))
+# never OR's in ecBeginLine, unlike state 0's analogous ecBegin OR (bug 1's
+# fix). "0\n" at position 2 is true end-of-text immediately preceded by
+# '\n': multiline $ and ^ both hold simultaneously, expect [2,2), not no
+# match. "" and "\n\n" resolve at attempt_start==0 (never touching the
+# buggy branch) and are controls, as are the (?m:^)-only variants.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug17MidStartNewlineBeginLineMissing
+strings
+""
+"0\n"
+"\n\n"
+"0"
+"aa"
+regexps
+"(?m:$^)"
+0-0;0-0;-;-
+-;2-2;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"(?m:^)"
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"a(?m:^)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
