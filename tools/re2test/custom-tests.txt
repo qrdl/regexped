@@ -3719,3 +3719,72 @@ regexps
 0-4 1-4;0-4;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #21): DFA's isDominantAccept/nfaExpandWithWB
+# machinery gives up as soon as a boundary-resolved continuation hits ANY
+# byte-consumer, blind to the case where that byte-consumer is the SAME
+# mandatory-literal Rune already reachable via a separate, lower-priority
+# path (here, `0*`'s own zero-repetition exit) already present in the same
+# NFA state. ` (\b|0*)0`: after the mandatory leading space, `\b` resolves
+# (crossing the non-word→word boundary into the first `0`) and leftmost-first
+# semantics mean the group resolves via `\b` alone, empty — the trailing
+# mandatory `0` consumes exactly one more byte and the match ends at [0,2).
+# regexped instead greedily consumed every trailing `0` via the lower-
+# priority `0*` branch, exactly as if `\b` had never resolved.
+# Fix: a new compile-time detector (nfaBoundaryTargetIsAmbiguous) recognizes
+# this exact shape and routes the pattern to Backtracking, the same
+# precedent FUZZER_BUGS.md #15's dfaHasOutrankedState established for a
+# sibling DFA blind spot — Backtracking resolves priority via genuine
+# backtracking and has no equivalent defect, confirmed here for both the
+# find export and the real capturing group's own span via the "groups"
+# export.
+# Controls: ` (\b|0)0` (no nested quantifier in the group at all — `\b`'s
+# resolution and the mandatory literal already agree, nothing to overrun)
+# and ` (0*|\b)0` (branch order reversed — `0*` legitimately wins, greedily
+# consuming every trailing `0` before the mandatory literal takes the last
+# one) are both unaffected either way, confirmed unaffected by the new
+# detector (does not fire for either shape).
+# All expected values cross-checked against Go stdlib regexp
+# (FindStringIndex for col1; FindStringSubmatchIndex, kept only when it
+# starts at 0, for col0 — the "groups" export is a non-anchored find, not a
+# `\A...\z` full-consumption match, same convention as FUZZER_BUGS.md #20's
+# entries above).
+# ============================================================
+FuzzBug21DFABoundaryTargetAmbiguity
+strings
+""
+" "
+" 0"
+" 00"
+" 000"
+" 0000"
+"0"
+"00"
+regexps
+" (\\b|0*)0"
+-;-;-;-
+-;-;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+-;-;-;-
+-;-;-;-
+" (\\b|0)0"
+-;-;-;-
+-;-;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+-;-;-;-
+-;-;-;-
+" (0*|\\b)0"
+-;-;-;-
+-;-;-;-
+0-2 1-1;0-2;-;-
+0-3 1-2;0-3;-;-
+0-4 1-3;0-4;-;-
+0-5 1-4;0-5;-;-
+-;-;-;-
+-;-;-;-

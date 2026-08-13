@@ -945,8 +945,15 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// overwrite an already-correct higher-priority one. Routed to
 	// Backtracking (correct by construction) rather than patched in the DFA
 	// scan-loop codegen — see dfaHasOutrankedState's doc comment.
+	// dfaHasAmbiguousBoundaryTarget (FUZZER_BUGS.md #21): a sibling blind
+	// spot where resolving a \b/\B/(?m:$) assertion needs one more mandatory
+	// byte before Match, and that byte's own Rune is ALSO reachable via some
+	// other, already-live, lower-priority path in the same NFA set (e.g.
+	// ` (\b|0*)0`) — the ordinary transition table permanently loses the
+	// higher-priority derivation, with no dominant/outranked bit to catch
+	// it. See nfaBoundaryTargetIsAmbiguous's doc comment.
 	dfaTooLarge := dfaStateLimitExceeded || table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit) ||
-		dfaHasOutrankedState(table)
+		dfaHasOutrankedState(table) || dfaHasAmbiguousBoundaryTarget(table)
 
 	var l *dfaLayout
 	if !dfaTooLarge {

@@ -62,6 +62,15 @@ type dfa struct {
 	midAcceptingWOutranked  map[int]uint64
 	midAcceptingNLOutranked map[int]uint64
 	startBeginAccept        bool // true if start state accepts with ecBegin only (e.g. a*^)
+	// hasAmbiguousBoundaryTarget (FUZZER_BUGS.md #21): true if resolving some
+	// \b/\B/(?m:$) assertion during ordinary transition construction would
+	// need to promote an already-present, lower-priority element of that
+	// work item's NFA set to a higher-priority position — see
+	// nfaBoundaryTargetIsAmbiguous's doc comment for the full mechanism.
+	// Compile-time only; consulted by dfaHasAmbiguousBoundaryTarget to route
+	// affected patterns to Backtracking, mirroring dfaHasOutrankedState's
+	// (#15) established precedent.
+	hasAmbiguousBoundaryTarget bool
 
 	// transitions[state*256 + byte] = nextState (-1 = no transition)
 	transitions  []int                // Flat array: [numStates * 256]
@@ -467,6 +476,149 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 		}
 	}
 	return out
+}
+
+// nfaBoundaryTargetIsAmbiguous (FUZZER_BUGS.md #21) reports whether, for some
+// assertion in closedSet that is NEWLY resolved by wbCtx (i.e. it does NOT
+// already fire under baseCtx, the context closedSet was itself originally
+// closed under — see boundaryOutranksCtx0's doc comment for why this
+// baseCtx gate is required), following its resolution reaches a PC that is
+// ALSO already present later (at lower priority) in closedSet via some
+// other, unconditional path.
+//
+// The baseCtx gate is not optional: an assertion that ALREADY fires under
+// baseCtx was already followed when closedSet was originally built, so
+// anything reachable from it is there BECAUSE of that assertion, at
+// whatever index its own resolution put it — re-deriving the identical
+// resolution under wbCtx (which is baseCtx plus boundary bits, so anything
+// firing under baseCtx also fires under wbCtx) and flagging its own
+// already-correct target as "later, hence ambiguous" is a false positive,
+// not a new priority conflict. Confirmed live: omitting this gate flagged
+// `(?m:^(\d{4}...) .*(ERROR|WARNING|FATAL): (.+)$)` (perftest's
+// log-capture) — state 0's BeginLine assertion resolves via baseCtx=ecBegin
+// alone, same as boundaryOutranksCtx0's own `^` false-positive history
+// (FUZZER_BUGS.md #18) — and rerouted it to Backtracking, regressing its
+// "no matches" case by ~48x, the exact number and pattern
+// markOutranked's own doc comment already warns about for this reason.
+//
+// This mirrors nfaExpandWithWB's own insertion walk, but only to detect the
+// situation rather than to fix it: nfaExpandWithWB's `visited` map is seeded
+// with every element already in closedSet, so when the resolved assertion's
+// target turns out to be one of those elements, nfaExpandWithWB treats it as
+// "already there, nothing to insert" and leaves it at its original, lower
+// priority — silently discarding the boundary assertion's higher-priority
+// claim on it. That's harmless when the target is InstMatch and the state's
+// dedicated mid-accept "Dominant"/"Outranked" bits (isDominantAccept,
+// boundaryOutranksCtx0 — FUZZER_BUGS.md #2, #15) already capture the
+// priority via their own from-scratch traversal. It is NOT harmless when the
+// target instead needs one more mandatory byte before Match (e.g.
+// ` (\b|0*)0`, where \b's resolution and 0*'s own zero-repetition exit both
+// lead to the SAME trailing-literal Rune): there is no compensating
+// mechanism for the ordinary transition table itself, which permanently
+// loses the higher-priority derivation and lets the lower-priority one
+// (e.g. 0*'s own self-loop) win instead.
+//
+// Reworking nfaExpandWithWB to relocate such targets would fix this at the
+// source, but that function is shared by both the DFA and TDFA engines
+// across every \b/\B/(?m:$) pattern — too broad a surface to change without
+// the kind of fuel/correctness regression sweep this codebase's history
+// warns about (see CLAUDE.md's "Load-bearing engine-selection gates"). This
+// detector instead identifies the narrow set of patterns where the defect is
+// live, so dfaHasAmbiguousBoundaryTarget can route them to Backtracking,
+// which resolves priority via genuine backtracking and has no equivalent
+// defect — the same precedent FUZZER_BUGS.md #15's dfaHasOutrankedState
+// already established for a sibling blind spot.
+func nfaBoundaryTargetIsAmbiguous(prog *syntax.Prog, closedSet []uint32, baseCtx, wbCtx int, leftmostFirst bool) bool {
+	origIndex := make(map[uint32]int, len(closedSet))
+	for i, s := range closedSet {
+		if _, ok := origIndex[s]; !ok {
+			origIndex[s] = i
+		}
+	}
+	for i, pc := range closedSet {
+		inst := &prog.Inst[pc]
+		if inst.Op != syntax.InstEmptyWidth {
+			continue
+		}
+		emptyOp := syntax.EmptyOp(inst.Arg)
+		if emptyWidthFires(emptyOp, baseCtx) {
+			continue // already resolved when closedSet itself was built — not a new resolution
+		}
+		if !emptyWidthFires(emptyOp, wbCtx) {
+			continue
+		}
+		seen := make(map[uint32]bool)
+		if boundaryTargetReachesLaterState(prog, uint32(inst.Out), i, origIndex, seen, wbCtx, leftmostFirst) {
+			return true
+		}
+	}
+	return false
+}
+
+// emptyWidthFires reports whether an EmptyWidth instruction's assertion bits
+// resolve (follow) under ctx. Shared logic pattern with nfaEpsilonClosure's
+// and nfaExpandWithWB's own inline resolution — kept as an independent copy
+// here (rather than a shared extraction) to avoid touching either of those
+// already-verified call sites while adding this new, purely-additive check.
+func emptyWidthFires(emptyOp syntax.EmptyOp, ctx int) bool {
+	follow := true
+	if emptyOp&syntax.EmptyBeginText != 0 {
+		follow = follow && (ctx&ecBegin) != 0
+	}
+	if emptyOp&syntax.EmptyBeginLine != 0 {
+		follow = follow && (ctx&(ecBegin|ecBeginLine)) != 0
+	}
+	if emptyOp&syntax.EmptyEndText != 0 {
+		follow = follow && (ctx&ecEnd) != 0
+	}
+	if emptyOp&syntax.EmptyEndLine != 0 {
+		follow = follow && (ctx&(ecEnd|ecEndLine)) != 0
+	}
+	if emptyOp&syntax.EmptyWordBoundary != 0 {
+		follow = follow && (ctx&ecWordBoundary) != 0
+	}
+	if emptyOp&syntax.EmptyNoWordBoundary != 0 {
+		follow = follow && (ctx&ecNoWordBoundary) != 0
+	}
+	return follow
+}
+
+// boundaryTargetReachesLaterState walks the epsilon closure from pc (under
+// wbCtx, respecting leftmostFirst Alt priority) looking for a PC that
+// already occurs in origIndex at an index strictly after assertionIdx — see
+// nfaBoundaryTargetIsAmbiguous's doc comment. Stops descending as soon as it
+// hits ANY origIndex member (whether ambiguous or not): a member at or
+// before assertionIdx is already correctly prioritized by construction, and
+// either way, whatever lies beyond it was already reachable via closedSet's
+// own existing structure, independent of this specific assertion.
+func boundaryTargetReachesLaterState(prog *syntax.Prog, pc uint32, assertionIdx int, origIndex map[uint32]int, seen map[uint32]bool, wbCtx int, leftmostFirst bool) bool {
+	if seen[pc] {
+		return false
+	}
+	seen[pc] = true
+	if j, ok := origIndex[pc]; ok {
+		return j > assertionIdx
+	}
+	inst := &prog.Inst[pc]
+	switch inst.Op {
+	case syntax.InstAlt:
+		first, second := uint32(inst.Arg), uint32(inst.Out)
+		if leftmostFirst {
+			first, second = uint32(inst.Out), uint32(inst.Arg)
+		}
+		if boundaryTargetReachesLaterState(prog, first, assertionIdx, origIndex, seen, wbCtx, leftmostFirst) {
+			return true
+		}
+		return boundaryTargetReachesLaterState(prog, second, assertionIdx, origIndex, seen, wbCtx, leftmostFirst)
+	case syntax.InstCapture, syntax.InstNop:
+		return boundaryTargetReachesLaterState(prog, uint32(inst.Out), assertionIdx, origIndex, seen, wbCtx, leftmostFirst)
+	case syntax.InstEmptyWidth:
+		if !emptyWidthFires(syntax.EmptyOp(inst.Arg), wbCtx) {
+			return false
+		}
+		return boundaryTargetReachesLaterState(prog, uint32(inst.Out), assertionIdx, origIndex, seen, wbCtx, leftmostFirst)
+	}
+	return false
 }
 
 // nfaBuildInputMap builds a rune→nextNFAStates map from an expanded NFA set,
@@ -1041,17 +1193,28 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		// Pre-expand the NFA set through word boundary epsilon transitions.
 		// Use expandWithWB to preserve the original state ordering (critical for
 		// leftmostFirst suppression) while appending WB-reachable states.
-		var expandedForWordChar, expandedForNonWordChar []uint32
+		var wordCharWBCtx, nonWordCharWBCtx int
 		if item.prevWasWord {
 			// prev=word, curr=word    → \B fires (no boundary) → ecNoWordBoundary
 			// prev=word, curr=non-word → \b fires (boundary)   → ecWordBoundary
-			expandedForWordChar = expandWithWB(item.nfaSet, ecNoWordBoundary|item.beginCtx)
-			expandedForNonWordChar = expandWithWB(item.nfaSet, ecWordBoundary|item.beginCtx)
+			wordCharWBCtx = ecNoWordBoundary | item.beginCtx
+			nonWordCharWBCtx = ecWordBoundary | item.beginCtx
 		} else {
 			// prev=non-word, curr=word    → \b fires (boundary)   → ecWordBoundary
 			// prev=non-word, curr=non-word → \B fires (no boundary) → ecNoWordBoundary
-			expandedForWordChar = expandWithWB(item.nfaSet, ecWordBoundary|item.beginCtx)
-			expandedForNonWordChar = expandWithWB(item.nfaSet, ecNoWordBoundary|item.beginCtx)
+			wordCharWBCtx = ecWordBoundary | item.beginCtx
+			nonWordCharWBCtx = ecNoWordBoundary | item.beginCtx
+		}
+		expandedForWordChar := expandWithWB(item.nfaSet, wordCharWBCtx)
+		expandedForNonWordChar := expandWithWB(item.nfaSet, nonWordCharWBCtx)
+		// FUZZER_BUGS.md #21: see nfaBoundaryTargetIsAmbiguous's doc comment.
+		// Checked once per work item (cheap relative to the closures just
+		// computed above) and short-circuited once found, since only the
+		// pattern-wide yes/no answer is needed to route to Backtracking.
+		if !dfa.hasAmbiguousBoundaryTarget &&
+			(nfaBoundaryTargetIsAmbiguous(prog, item.nfaSet, item.beginCtx, wordCharWBCtx, leftmostFirst) ||
+				nfaBoundaryTargetIsAmbiguous(prog, item.nfaSet, item.beginCtx, nonWordCharWBCtx, leftmostFirst)) {
+			dfa.hasAmbiguousBoundaryTarget = true
 		}
 
 		// buildInputMap builds the rune→nextNFAStates map from an expanded NFA set.
@@ -1070,7 +1233,11 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 			} else {
 				nlWBCtx = ecNoWordBoundary | ecEndLine
 			}
-			expandedForNewline = expandWithWB(item.nfaSet, nlWBCtx|item.beginCtx)
+			nlWBCtx |= item.beginCtx
+			expandedForNewline = expandWithWB(item.nfaSet, nlWBCtx)
+			if !dfa.hasAmbiguousBoundaryTarget && nfaBoundaryTargetIsAmbiguous(prog, item.nfaSet, item.beginCtx, nlWBCtx, leftmostFirst) {
+				dfa.hasAmbiguousBoundaryTarget = true
+			}
 		}
 
 		inputMapWord := buildInputMap(expandedForWordChar)
@@ -1307,6 +1474,8 @@ type dfaTable struct {
 	startBeginAccept           bool  // true if startState accepts with ecBegin only (e.g. a*^)
 	hasWordBoundary            bool  // true if pattern contains \b or \B
 	hasNewlineBoundary         bool  // true if pattern contains (?m:^) or (?m:$)
+	// hasAmbiguousBoundaryTarget (FUZZER_BUGS.md #21): see dfa.hasAmbiguousBoundaryTarget.
+	hasAmbiguousBoundaryTarget bool
 }
 
 // dfaTableFrom builds a dfaTable directly from a compiled dfa struct,
@@ -1334,6 +1503,7 @@ func dfaTableFrom(d *dfa) *dfaTable {
 		startBeginAccept:           d.startBeginAccept,
 		hasWordBoundary:            d.hasWordBoundary,
 		hasNewlineBoundary:         d.hasNewlineBoundary,
+		hasAmbiguousBoundaryTarget: d.hasAmbiguousBoundaryTarget,
 	}
 	minimizeDFA(t)
 	reorderAcceptFirst(t)
@@ -5428,6 +5598,17 @@ func dfaHasOutrankedState(t *dfaTable) bool {
 		}
 	}
 	return false
+}
+
+// dfaHasAmbiguousBoundaryTarget (FUZZER_BUGS.md #21) reports whether t was
+// built from a pattern where nfaBoundaryTargetIsAmbiguous fired during
+// construction — see dfa.hasAmbiguousBoundaryTarget and
+// nfaBoundaryTargetIsAmbiguous's doc comments for the full mechanism.
+// Compile-time only: called from compile.go's dfaTooLarge decision to route
+// affected find-mode patterns to Backtracking, the same precedent
+// dfaHasOutrankedState (#15) established for a sibling blind spot.
+func dfaHasAmbiguousBoundaryTarget(t *dfaTable) bool {
+	return t.hasAmbiguousBoundaryTarget
 }
 
 // isAnchoredFind reports whether the DFA can only match starting at position 0.
