@@ -3398,3 +3398,64 @@ regexps
 -;0-1;-;-
 -;0-1;-;-
 0-2;0-2;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #16): midStart aliases start when a leading
+# \b/\B blocks both closures identically, wrongly inheriting ecBegin at
+# non-zero scan positions. startSet := epsilonClosure({Start}, ecBegin) and
+# midStartSet := epsilonClosure({Start}, 0) both get stuck at the same
+# pending \b/\B node (word-boundary can't resolve pre-byte), so they produce
+# byte-identical NFA sets and collide under the same key. The old collision
+# guard only compared EOF-accept bitmasks (both 0 here, since Match is
+# unreachable by pure epsilon/EOF unwinding), so it let midStart alias to
+# state 0 — silently inheriting state 0's ecBegin-inclusive transitions,
+# letting a trailing ^/\A wrongly fire at mid-scan restart positions.
+# \b(?:^b) on " b"/"z b" and \B(?:^ x) on "  x" and \B(?:^ ) on "! " must
+# all fail to match (the trailing ^/\A can only ever hold at true text
+# start); "b", " x", " " are true-position-0 controls where it legitimately
+# matches. "\bb" (no ^) is a control confirming ordinary \b-gated mid-scan
+# restarts still work; "^(?:\bb)" (assertion order reversed) and "^b" (no \b
+# at all) are controls confirming the aliasing never occurs when ^
+# resolves during the very first closure step instead of being blocked.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug16MidStartBeginAnchorAlias
+strings
+""
+"b"
+" b"
+"z b"
+regexps
+"\\b(?:^b)"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+"\\bb"
+-;-;-;-
+0-1;0-1;-;-
+-;1-2;-;-
+-;2-3;-;-
+"^(?:\\bb)"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+"^b"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+strings
+" x"
+"  x"
+regexps
+"\\B(?:^ x)"
+0-2;0-2;-;-
+-;-;-;-
+strings
+" "
+"! "
+regexps
+"\\B(?:^ )"
+0-1;0-1;-;-
+-;-;-;-

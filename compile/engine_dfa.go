@@ -666,6 +666,38 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		return nfaExpandWithWB(prog, closedSet, wbCtx, leftmostFirst)
 	}
 
+	// beginContextMatters (FUZZER_BUGS.md #16) reports whether further
+	// epsilon/word-boundary expansion of this raw NFA set would resolve
+	// differently depending on whether ecBegin is present in the context.
+	// A pending \b/\B node can block a following ^/\A from resolving during
+	// the initial epsilonClosure call (same mechanism as FUZZER_BUGS.md #1),
+	// so startSet (closed under ecBegin) and midStartSet (closed under 0)
+	// can end up byte-identical — both stuck at the same pending node — even
+	// though the two states are entitled to different beginCtx values at
+	// transition-build time (ecBegin only for true start, never for a
+	// mid-scan restart). The existing collision guard below only compares
+	// EOF-accept bitmasks, which are coincidentally equal (both 0) whenever
+	// Match is unreachable by pure epsilon/EOF unwinding — blind to the case
+	// where the pending anchor instead gates a live byte-consuming
+	// transition. Reusing the same DFA state id for both roles would bake in
+	// whichever beginCtx the shared workItem is queued with (`\b(?:^b)` on
+	// " b" wrongly matching [1,2) — the trailing `^` fires at a mid-scan
+	// restart because it inherited state 0's ecBegin-inclusive context).
+	beginContextMatters := func(states []uint32) bool {
+		wbCtxs := []int{ecWordBoundary, ecNoWordBoundary}
+		if dfa.hasNewlineBoundary {
+			wbCtxs = append(wbCtxs, ecWordBoundary|ecEndLine, ecNoWordBoundary|ecEndLine)
+		}
+		for _, wb := range wbCtxs {
+			without := expandWithWB(states, wb)
+			with := expandWithWB(states, wb|ecBegin)
+			if nfaStatesKey(without) != nfaStatesKey(with) {
+				return true
+			}
+		}
+		return false
+	}
+
 	// acceptBitsFor returns the combined accept bitmask for the epsilon closure of states
 	// under the given context. Each InstMatch instruction contributes its bits from pBits
 	// (or bit 1 when pBits is nil / index out of range / zero).
@@ -834,8 +866,11 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// FUZZER_BUGS.md §6/§7) and reusing the id would silently inherit the
 	// wrong (begin-inclusive) accept value. Recompute and compare rather
 	// than trusting the key alone.
+	// The accept-bits check alone is blind to the case where the pending
+	// anchor gates a live byte-consuming transition instead of Match/EOF —
+	// beginContextMatters closes that gap (FUZZER_BUGS.md #16).
 	midStartRightfulAccept := acceptBitsFor(midStartSet, ecEnd|ecNoWordBoundary)
-	if id, exists := stateMap[midStartKey]; exists && dfa.accepting[id] == midStartRightfulAccept {
+	if id, exists := stateMap[midStartKey]; exists && dfa.accepting[id] == midStartRightfulAccept && !beginContextMatters(midStartSet) {
 		dfa.midStart = id
 		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 			bits := nfaAcceptBits(midStartSet)
