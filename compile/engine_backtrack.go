@@ -26,6 +26,16 @@ type backtrack struct {
 	// zero-progress handling than every other loop.
 	emptyBodyGreedyLoop map[int]bool
 
+	// emptyBodyNoNestedLoop is the emptyBodyGreedyLoop[] subset whose body
+	// contains no OTHER registered loop head (FUZZER_BUGS.md #19). For
+	// these, a zero-width iteration can only have completed via a plain
+	// leaf-level assertion (or chain thereof) inside a non-loop
+	// alternation — a resolution that's final and unconditional for this
+	// iteration, never a "some other loop tried 0 repetitions this time"
+	// outcome. See emitBTInstHandler's InstAlt case for why that
+	// distinction changes the correct zero-progress action.
+	emptyBodyNoNestedLoop map[int]bool
+
 	// memoInnerLoop is a set of Alt/AltMatch PCs that are NOT genuine loop
 	// heads by altLoopBody's dominance-based test (so bt.loops[pc] is
 	// false and they're compiled as ordinary non-loop alternations), but
@@ -74,13 +84,14 @@ func (b *backtrack) Type() EngineType { return EngineBacktrack }
 func newBacktrack(prog *syntax.Prog) *backtrack {
 	idom := computeDominators(prog)
 	bt := &backtrack{
-		prog:                prog,
-		numGroups:           prog.NumCap / 2,
-		loops:               make(map[int]bool),
-		nonGreedyLoop:       make(map[int]bool),
-		idom:                idom,
-		emptyBodyGreedyLoop: make(map[int]bool),
-		memoInnerLoop:       make(map[int]bool),
+		prog:                  prog,
+		numGroups:             prog.NumCap / 2,
+		loops:                 make(map[int]bool),
+		nonGreedyLoop:         make(map[int]bool),
+		idom:                  idom,
+		emptyBodyGreedyLoop:   make(map[int]bool),
+		emptyBodyNoNestedLoop: make(map[int]bool),
+		memoInnerLoop:         make(map[int]bool),
 	}
 	for pc, inst := range prog.Inst {
 		if inst.Op == syntax.InstAlt {
@@ -95,6 +106,11 @@ func newBacktrack(prog *syntax.Prog) *backtrack {
 					}
 				}
 			}
+		}
+	}
+	for pc := range bt.emptyBodyGreedyLoop {
+		if !loopBodyHasNestedLoop(prog, idom, pc) {
+			bt.emptyBodyNoNestedLoop[pc] = true
 		}
 	}
 	return bt
@@ -416,6 +432,55 @@ func pcReachesBounded(prog *syntax.Prog, from, target, boundary int) bool {
 		case syntax.InstFail, syntax.InstMatch:
 			// no successors
 		case syntax.InstAlt, syntax.InstAltMatch:
+			queue = append(queue, int(inst.Out), int(inst.Arg))
+		default:
+			queue = append(queue, int(inst.Out))
+		}
+	}
+	return false
+}
+
+// loopBodyHasNestedLoop reports whether loopPC's body contains an
+// Alt/AltMatch PC with its own back edge to itself (a nested loop),
+// reachable without first returning to loopPC. See emitBTInstHandler's
+// InstAlt case (bt.emptyBodyNoNestedLoop) for why this distinguishes the two
+// shapes in FUZZER_BUGS.md #19: a body with no nested loop can only reach
+// zero width via a plain leaf-level assertion, whose success is final for
+// that iteration; a body containing another loop (e.g. `a*|b*`) can reach
+// zero width via that inner loop choosing 0 repetitions, which is merely one
+// candidate outcome among the inner loop's own retries, not a final
+// resolution — the caller must not assume it's safe to abandon the sibling
+// alternative pushed alongside it.
+//
+// Deliberately does NOT consult bt.loops (the dominance-based registry used
+// everywhere else in this file): for exactly the `a*|b*` shape this needs to
+// recognize, altLoopBody's dominance test fails to register a*/b* as loop
+// heads at all, because each is reachable via two distinct paths — directly
+// from the top-level start instruction on first entry, and via the outer
+// loop's own back edge on every re-entry — so neither branch dominates the
+// other (same gap nestedLoopPC's own doc describes, and the same reason it
+// uses pcReachesBounded instead of dominates). Using that same
+// reachability-based test here, rather than the registry, is what makes
+// this correctly identify a*/b* as nested loops regardless.
+func loopBodyHasNestedLoop(prog *syntax.Prog, idom []int, loopPC int) bool {
+	bodyStart := loopBodyStart(prog, idom, loopPC)
+	visited := make([]bool, len(prog.Inst))
+	queue := []int{bodyStart}
+	for len(queue) > 0 {
+		pc := queue[0]
+		queue = queue[1:]
+		if pc == loopPC || visited[pc] {
+			continue
+		}
+		visited[pc] = true
+		inst := prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstFail, syntax.InstMatch:
+			// no successors
+		case syntax.InstAlt, syntax.InstAltMatch:
+			if pcReachesBounded(prog, int(inst.Out), pc, loopPC) || pcReachesBounded(prog, int(inst.Arg), pc, loopPC) {
+				return true
+			}
 			queue = append(queue, int(inst.Out), int(inst.Arg))
 		default:
 			queue = append(queue, int(inst.Out))
@@ -997,20 +1062,46 @@ func emitBTInstHandler(
 				//     restore already recovers captures from whichever frame
 				//     it lands on, so no manual snapshot restore is needed
 				//     on this path.
-				body = append(body, 0x20, localPos)
-				if attemptStartLocal < 0 {
-					body = append(body, 0x41, 0x00) // i32.const 0
+				//
+				// The above is only sound when the body's zero-width
+				// completion can itself come from an INNER loop settling on
+				// 0 repetitions (bt.emptyBodyNoNestedLoop[p] == false, e.g.
+				// "a*|b*" above) — that inner loop's 0-rep outcome is just
+				// one candidate among its own retries, not a final
+				// resolution, so falling into the stack IS the right way to
+				// let a still-live sibling get its turn. When the body has
+				// NO nested loop (FUZZER_BUGS.md #19, e.g. ".(\b|0)*"), any
+				// zero-width completion instead came from a leaf-level
+				// EmptyWidth assertion succeeding outright inside a
+				// non-loop alternation (e.g. "\b" beating "0") — that
+				// success is unconditional and final for this iteration, so
+				// btFail here would wrongly pop and resurrect the
+				// already-outranked lower-priority sibling (e.g. "0") that
+				// only existed as a fallback for if the assertion *failed*.
+				// Always taking the direct exit leaves that sibling's retry
+				// frame untouched on the stack — if something later in the
+				// pattern does fail, ordinary backtracking finds it exactly
+				// when it's actually needed (see the custom-tests.txt entry
+				// for ".(\b|0)*$", which still resurrects "0" correctly).
+				if bt.emptyBodyNoNestedLoop[p] {
+					body = restoreLoopSnap(body)
+					body = btSetStateAndBr(body, int32(inst.Arg), brRunNested)
 				} else {
-					body = append(body, 0x20)
-					body = utils.AppendULEB128(body, uint32(attemptStartLocal))
+					body = append(body, 0x20, localPos)
+					if attemptStartLocal < 0 {
+						body = append(body, 0x41, 0x00) // i32.const 0
+					} else {
+						body = append(body, 0x20)
+						body = utils.AppendULEB128(body, uint32(attemptStartLocal))
+					}
+					body = append(body, 0x46)       // i32.eq
+					body = append(body, 0x04, 0x40) // if void
+					body = restoreLoopSnap(body)
+					body = btSetStateAndBr(body, int32(inst.Arg), brRunNested+1)
+					body = append(body, 0x05) // else
+					body = btFail(body, brRunNested+1)
+					body = append(body, 0x0B) // end if (pos == attempt_start)
 				}
-				body = append(body, 0x46)       // i32.eq
-				body = append(body, 0x04, 0x40) // if void
-				body = restoreLoopSnap(body)
-				body = btSetStateAndBr(body, int32(inst.Arg), brRunNested+1)
-				body = append(body, 0x05) // else
-				body = btFail(body, brRunNested+1)
-				body = append(body, 0x0B) // end if (pos == attempt_start)
 			} else {
 				// Greedy loop whose body can never match empty: this branch
 				// can't actually be reached (every completed iteration

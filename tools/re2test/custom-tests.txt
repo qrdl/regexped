@@ -3578,3 +3578,63 @@ regexps
 0-2 1-2;0-2;-;-
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #19): Backtracking's zero-progress loop guard
+# resurrects a same-iteration, lower-priority alternation sibling that a
+# higher-priority zero-width branch already suppressed. `.(?:\b|0)*` needs
+# a mandatory non-empty prefix (the leading `.`) so pos != attempt_start
+# when `\b` first resolves inside the loop body; when the loop's
+# zero-progress guard then fires, it pops the wrong (already-suppressed)
+# retry frame, wrongly resurrecting the lower-priority `0` branch. Go
+# stdlib finds [0,1) (leftmost-first: `\b` wins and the loop stops, greedy
+# star otherwise having no further length to add); regexped over-matched
+# through every trailing "0". Confirmed via both `*` and `+`.
+# Controls: `.(?:0|\b)*` (branch order reversed — `0` legitimately wins
+# first, no wrongly-suppressed sibling to resurrect) and `.\b*` (no
+# byte-consuming sibling in the loop body at all) are unaffected.
+# All expected values cross-checked against Go stdlib regexp (find via
+# FindStringIndex; col0 via `\A(?:pat)\z`.MatchString, i.e. does some
+# path anchored at 0 consume the entire input).
+# ============================================================
+FuzzBug19ZeroProgressGuardResurrectsSuppressedSibling
+strings
+""
+" "
+" 0"
+" 00"
+" 000"
+"0"
+"00"
+regexps
+".(?:\\b|0)*"
+-;-;-;-
+0-1;0-1;-;-
+0-2;0-1;-;-
+0-3;0-1;-;-
+0-4;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+".(?:\\b|0)+"
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-
+0-3;0-1;-;-
+0-4;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+".(?:0|\\b)*"
+-;-;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+".\\b*"
+-;-;-;-
+0-1;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+0-1;0-1;-;-
+-;0-1;-;-
