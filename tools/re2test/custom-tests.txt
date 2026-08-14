@@ -3960,3 +3960,63 @@ regexps
 -;1-2;-;-
 -;1-3;-;-
 -;1-3;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #25): midStartNewlineState is remapped
+# unconditionally at construction but left at its stale raw (pre-
+# minimization/reordering) value whenever hasNewlineBoundary is false.
+# buildLitAnchorFindBody unconditionally substitutes it in for
+# wasmMidStart whenever the byte immediately before a backward-verified
+# match start is '\n', regardless of hasNewlineBoundary. When
+# reorderAcceptFirst happens to claim the stale raw ID for the real
+# accept state, the lit-anchor body's initial midAccept check fires at
+# the verified start position and the immediate-accept short-circuit
+# returns a zero-length match before the mandatory trailing literal is
+# ever consumed. Trigger is purely "lit-anchor path taken" AND
+# "hasNewlineBoundary == false" AND "byte before the verified match
+# start is '\n'" -- independent of \D specifically or absolute position
+# (`X\nAab` confirms the last point). Patterns kept capture-free: this
+# path is reached via compile.Compile's find_func-only mode, which
+# strips captures before compilation regardless (bug's own scope table
+# confirms the capture group is not load-bearing). `\Da` is a control:
+# single-char trailing literal fails the lit-anchor's len(bs)>=2 gate,
+# so it never enters this path and must be unaffected. `0ab`/no-newline
+# cases confirm no false positives are introduced.
+# All expected values cross-checked against Go stdlib regexp
+# (FindStringIndex for col1; col0 kept only when the match starts at 0
+# AND consumes the entire input, matchFn's full-consumption contract).
+# ============================================================
+FuzzBug25StaleMidStartNewlineState
+strings
+""
+"\nAab"
+"Aab"
+"X\nAab"
+"0ab"
+regexps
+"\\Dab"
+-;-;-;-
+-;1-4;-;-
+0-3;0-3;-;-
+-;2-5;-;-
+-;-;-;-
+strings
+""
+"\nAbc"
+regexps
+"\\Dbc"
+-;-;-;-
+-;1-4;-;-
+strings
+""
+"\nAa"
+regexps
+"\\Da"
+-;-;-;-
+-;1-3;-;-
+strings
+""
+"\nAab"
+regexps
+"[^0-9]ab"
+-;-;-;-
+-;1-4;-;-

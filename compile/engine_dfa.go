@@ -1286,6 +1286,15 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 			}
 			queue = append(queue, workItem{dfaState: dfa.midStartNewline, nfaSet: midStartNewlineSet, prevWasNewline: true, beginCtx: ecBeginLine})
 		}
+	} else {
+		// No (?m:^)/(?m:$) in the pattern, so a restart after a '\n' behaves
+		// identically to a restart after any other non-word byte — alias
+		// midStartNewline to midStart rather than leaving it at its Go
+		// zero-value default. Without this, downstream state-remap passes
+		// (bfsRelabelDFA/applyStateRemap/minimizeDFA) have no valid raw id to
+		// remap, and buildLitAnchorFindBody's unconditional read of
+		// wasmMidStartNewline picks up a stale, colliding id (FUZZER_BUGS.md #25).
+		dfa.midStartNewline = dfa.midStart
 	}
 
 	// Process work queue
@@ -1668,9 +1677,7 @@ func bfsRelabelDFA(t *dfaTable) {
 	assign(t.startState)
 	assign(t.midStartState)
 	assign(t.midStartWordState)
-	if t.hasNewlineBoundary {
-		assign(t.midStartNewlineState)
-	}
+	assign(t.midStartNewlineState)
 
 	for len(queue) > 0 {
 		s := queue[0]
@@ -1772,9 +1779,7 @@ func applyStateRemap(t *dfaTable, oldToNew []int) {
 	t.startState = oldToNew[t.startState]
 	t.midStartState = oldToNew[t.midStartState]
 	t.midStartWordState = oldToNew[t.midStartWordState]
-	if t.hasNewlineBoundary {
-		t.midStartNewlineState = oldToNew[t.midStartNewlineState]
-	}
+	t.midStartNewlineState = oldToNew[t.midStartNewlineState]
 	t.transitions = newTrans
 	t.acceptStates = remapMap(t.acceptStates)
 	t.midAcceptStates = remapMap(t.midAcceptStates)
@@ -2011,9 +2016,7 @@ func minimizeDFA(t *dfaTable) {
 	t.startState = classOf[t.startState]
 	t.midStartState = classOf[t.midStartState]
 	t.midStartWordState = classOf[t.midStartWordState]
-	if t.hasNewlineBoundary {
-		t.midStartNewlineState = classOf[t.midStartNewlineState]
-	}
+	t.midStartNewlineState = classOf[t.midStartNewlineState]
 	t.numStates = numClasses
 	t.transitions = newTrans
 	t.acceptStates = newAccept
@@ -6479,8 +6482,10 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	//   rev_result == 0              → wasmStart (match starts at input begin)
 	//   ptr[rev_result-1] == '\n'    → wasmMidStartNewline
 	//   otherwise                    → wasmMidStart
-	// For patterns without word boundaries wasmMidStart == wasmMidStartNewline;
-	// the byte check is still emitted for correctness and future-proofing.
+	// For patterns without newline boundaries wasmMidStart == wasmMidStartNewline
+	// (dfa.midStartNewline aliases dfa.midStart at construction in that case,
+	// FUZZER_BUGS.md #25); the byte check is still emitted for correctness and
+	// future-proofing.
 	b = append(b, 0x20, locRevResult) // local.get rev_result
 	b = append(b, 0x45)               // i32.eqz
 	b = append(b, 0x04, 0x7F)         // if (result i32) — start of input

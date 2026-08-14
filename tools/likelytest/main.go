@@ -13,6 +13,11 @@
 //
 // Δ% is the gain/loss vs the neutral row.
 //
+// Before a case's numbers are trusted, every (pattern, mode, input)
+// combination is also checked against Go's regexp package as ground truth
+// (see the "Correctness checking against Go stdlib regexp" section below) —
+// a mismatch prints CORRECTNESS FAIL to stderr and the run exits non-zero.
+//
 // Note: LikelyMode is a stub today — all three modes produce identical WASM. The
 // columns will only diverge once the LIKELY.md optimisations land in compile/.
 // Run via `make run` from this directory.
@@ -24,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -1597,6 +1603,393 @@ func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string
 	return cell{timeP50: t, fuel: f, size: len(wasm)}, nil
 }
 
+// --------------------------------------------------------------------------
+// Correctness checking against Go stdlib regexp
+//
+// likelytest's corpus is hand-picked to stress specific compiler
+// optimisation gates, not for correctness — that's tools/re2test's job, run
+// over millions of RE2-corpus patterns. But a LikelyMode-specific
+// correctness bug can hide in exactly this corpus's blind spot: a "good"
+// fuel/time number looks identical whether the compiled WASM took a
+// legitimately cheaper path or is silently returning the wrong answer
+// (FUZZER_BUGS.md #25's gap-e-groups case is exactly this — a false
+// negative that went unnoticed here because nothing checked the return
+// value, only its cost). So every (pattern, mode, input) combination that
+// gets a fuel/time number here also gets checked against Go's regexp
+// package first — same RE2/Perl leftmost-first semantics as this project's
+// own engines (CLAUDE.md "Design Principles"), and the same ground-truth
+// source tools/re2test uses for its own --validate-go checks.
+//
+// modeSet is intentionally not checked here: tools/re2test's own --sets
+// mode already exhaustively validates set-composition correctness, and
+// decoding find_all's per-pattern tuple output against the right member of
+// a multi-pattern set is a different, more involved job than the
+// single-pattern checks below. Only 3 of this suite's cases use modeSet.
+
+// newPlainInstance instantiates wasmBytes on a fuel-free store and returns
+// its exported memory, ready for a single correctness call.
+func newPlainInstance(engine *wasmtime.Engine, wasmBytes []byte) (*wasmtime.Store, *wasmtime.Instance, *wasmtime.Memory, error) {
+	mod, err := wasmtime.NewModule(engine, wasmBytes)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("module: %w", err)
+	}
+	store := wasmtime.NewStore(engine)
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("instance: %w", err)
+	}
+	mem := inst.GetExport(store, "memory").Memory()
+	if mem == nil {
+		return nil, nil, nil, fmt.Errorf("missing memory export")
+	}
+	return store, inst, mem, nil
+}
+
+func readSlots(buf []byte, base int32, totalGroups int) []int {
+	slots := make([]int, totalGroups*2)
+	for i := range slots {
+		off := int(base) + i*4
+		v := int32(buf[off]) | int32(buf[off+1])<<8 | int32(buf[off+2])<<16 | int32(buf[off+3])<<24
+		slots[i] = int(v)
+	}
+	return slots
+}
+
+func equalIntSlices(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalPairs(a, b [][2]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalSlotSets(a, b [][]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !equalIntSlices(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func fmtPacked(v int64) string {
+	if v < 0 {
+		return "no-match"
+	}
+	return fmt.Sprintf("[%d,%d)", int32(v>>32), int32(v&0xFFFFFFFF))
+}
+
+// expectedMatch is the ground truth for a match_func call: buildMatchBody
+// (compile/engine_dfa.go) requires the WHOLE input to be consumed starting
+// at position 0 ("Bounds: anchored match must consume the entire input —
+// len != total → -1"), not just a leftmost-first prefix match. Mirrors
+// tools/re2test's own --validate-go col0 check.
+func expectedMatch(re *regexp.Regexp, input string) int32 {
+	loc := re.FindStringIndex(input)
+	if loc != nil && loc[0] == 0 && loc[1] == len(input) {
+		return int32(loc[1])
+	}
+	return -1
+}
+
+// checkMatch calls match() once and compares it against expectedMatch.
+func checkMatch(engine *wasmtime.Engine, wasmBytes []byte, input string, re *regexp.Regexp) error {
+	store, inst, mem, err := newPlainInstance(engine, wasmBytes)
+	if err != nil {
+		return err
+	}
+	fn := inst.GetExport(store, "match").Func()
+	if fn == nil {
+		return fmt.Errorf("missing match export")
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	r, err := fn.Call(store, inputBase, int32(len(input)))
+	if err != nil {
+		return fmt.Errorf("call: %w", err)
+	}
+	got := r.(int32)
+	runtime.KeepAlive(store)
+	if want := expectedMatch(re, input); got != want {
+		return fmt.Errorf("match(%q) = %d, want %d", input, got, want)
+	}
+	return nil
+}
+
+// expectedFind is the ground truth for a single find_func call: plain
+// leftmost-first search, no anchoring requirement — mirrors tools/re2test's
+// col1 check. Packed as (start<<32|end), matching find_func's own return
+// convention (see runFindExhaust's unpacking).
+func expectedFind(re *regexp.Regexp, input string) int64 {
+	loc := re.FindStringIndex(input)
+	if loc == nil {
+		return -1
+	}
+	return int64(loc[0])<<32 | int64(uint32(loc[1]))
+}
+
+func checkFind(engine *wasmtime.Engine, wasmBytes []byte, input string, re *regexp.Regexp) error {
+	store, inst, mem, err := newPlainInstance(engine, wasmBytes)
+	if err != nil {
+		return err
+	}
+	fn := inst.GetExport(store, "find").Func()
+	if fn == nil {
+		return fmt.Errorf("missing find export")
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	r, err := fn.Call(store, inputBase, int32(len(input)))
+	if err != nil {
+		return fmt.Errorf("call: %w", err)
+	}
+	got := r.(int64)
+	runtime.KeepAlive(store)
+	if want := expectedFind(re, input); got != want {
+		return fmt.Errorf("find(%q) = %s, want %s", input, fmtPacked(got), fmtPacked(want))
+	}
+	return nil
+}
+
+// expectedFindAll mirrors runFindExhaust's exact advance rule (advance past
+// a non-empty match's end, or past a zero-length match's start+1) so a
+// mismatch here reflects a real product bug, not a harness assumption gap.
+func expectedFindAll(re *regexp.Regexp, input string) [][2]int {
+	var all [][2]int
+	off := 0
+	for off <= len(input) {
+		m := re.FindStringIndex(input[off:])
+		if m == nil {
+			break
+		}
+		s, e := m[0]+off, m[1]+off
+		all = append(all, [2]int{s, e})
+		if e > s {
+			off = e
+		} else {
+			off = s + 1
+		}
+	}
+	return all
+}
+
+func checkFindExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, re *regexp.Regexp) error {
+	store, inst, mem, err := newPlainInstance(engine, wasmBytes)
+	if err != nil {
+		return err
+	}
+	fn := inst.GetExport(store, "find").Func()
+	if fn == nil {
+		return fmt.Errorf("missing find export")
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	inputLen := int32(len(input))
+
+	var got [][2]int
+	off := int32(0)
+	for off <= inputLen {
+		r, err := fn.Call(store, inputBase+off, inputLen-off)
+		if err != nil {
+			return fmt.Errorf("call at off=%d: %w", off, err)
+		}
+		packed := r.(int64)
+		if packed < 0 {
+			break
+		}
+		relStart := int32(packed >> 32)
+		relEnd := int32(packed & 0xFFFFFFFF)
+		got = append(got, [2]int{int(off + relStart), int(off + relEnd)})
+		if relEnd > relStart {
+			off += relEnd
+		} else {
+			off += relStart + 1
+		}
+	}
+	runtime.KeepAlive(store)
+	if want := expectedFindAll(re, input); !equalPairs(got, want) {
+		return fmt.Errorf("find-exhaust(%d bytes) = %v, want %v", len(input), got, want)
+	}
+	return nil
+}
+
+// expectedGroups is the ground truth for a single groups_func call. The
+// composition documented at compile.go's "Capture path" comment performs an
+// internal find (not a strict anchored-at-ptr check) for any shape that
+// doesn't hit the native lit-chain fast path — confirmed empirically for
+// FUZZER_BUGS.md #25's gap-e-groups repro, where a ptr=0 call over a 10KB
+// buffer found a match starting mid-buffer. Mirrors tools/re2test's col5
+// check: plain FindStringSubmatchIndex, no anchoring requirement.
+func expectedGroups(re *regexp.Regexp, input string) []int {
+	return re.FindStringSubmatchIndex(input)
+}
+
+func checkGroups(engine *wasmtime.Engine, wasmBytes []byte, input string, re *regexp.Regexp) error {
+	totalGroups := re.NumSubexp() + 1
+	store, inst, mem, err := newPlainInstance(engine, wasmBytes)
+	if err != nil {
+		return err
+	}
+	fn := inst.GetExport(store, "groups").Func()
+	if fn == nil {
+		return fmt.Errorf("missing groups export")
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	for i := 0; i < totalGroups*2*4; i++ {
+		buf[int(slotsBase)+i] = 0xFF // pre-init to -1, matching re2test's callGroups
+	}
+	r, err := fn.Call(store, inputBase, int32(len(input)), slotsBase)
+	if err != nil {
+		return fmt.Errorf("call: %w", err)
+	}
+	got := r.(int32)
+	buf = mem.UnsafeData(store)
+	slots := readSlots(buf, slotsBase, totalGroups)
+	runtime.KeepAlive(store)
+
+	want := expectedGroups(re, input)
+	if want == nil {
+		if got != -1 {
+			return fmt.Errorf("groups(%q) = %d (slots %v), want no match", input, got, slots)
+		}
+		return nil
+	}
+	if got != int32(want[1]) {
+		return fmt.Errorf("groups(%q) end = %d, want %d", input, got, want[1])
+	}
+	if !equalIntSlices(slots, want) {
+		return fmt.Errorf("groups(%q) slots = %v, want %v", input, slots, want)
+	}
+	return nil
+}
+
+// expectedGroupsAll mirrors runGroupsExhaust's exact advance rule: advance
+// by the match's own relative end (slots[1] before shifting), or off++ if
+// that's zero. This deliberately differs from expectedFindAll's "end>start"
+// rule — see runGroupsExhaust's doc comment for why groups' generated-stub
+// advance logic isn't the same as find's.
+func expectedGroupsAll(re *regexp.Regexp, input string) [][]int {
+	var all [][]int
+	off := 0
+	for off <= len(input) {
+		sub := re.FindStringSubmatchIndex(input[off:])
+		if sub == nil {
+			break
+		}
+		shifted := make([]int, len(sub))
+		for i, v := range sub {
+			if v < 0 {
+				shifted[i] = -1
+			} else {
+				shifted[i] = v + off
+			}
+		}
+		all = append(all, shifted)
+		if relEnd := sub[1]; relEnd > 0 {
+			off += relEnd
+		} else {
+			off++
+		}
+	}
+	return all
+}
+
+func checkGroupsExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, re *regexp.Regexp) error {
+	totalGroups := re.NumSubexp() + 1
+	store, inst, mem, err := newPlainInstance(engine, wasmBytes)
+	if err != nil {
+		return err
+	}
+	fn := inst.GetExport(store, "groups").Func()
+	if fn == nil {
+		return fmt.Errorf("missing groups export")
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	inputLen := int32(len(input))
+
+	var got [][]int
+	off := int32(0)
+	for off <= inputLen {
+		buf = mem.UnsafeData(store)
+		for i := 0; i < totalGroups*2*4; i++ {
+			buf[int(slotsBase)+i] = 0xFF
+		}
+		r, err := fn.Call(store, inputBase+off, inputLen-off, slotsBase)
+		if err != nil {
+			return fmt.Errorf("call at off=%d: %w", off, err)
+		}
+		if r.(int32) < 0 {
+			break
+		}
+		buf = mem.UnsafeData(store)
+		slots := readSlots(buf, slotsBase, totalGroups)
+		shifted := make([]int, len(slots))
+		for i, v := range slots {
+			if v < 0 {
+				shifted[i] = -1
+			} else {
+				shifted[i] = int(off) + v
+			}
+		}
+		got = append(got, shifted)
+		if relEnd := slots[1]; relEnd > 0 {
+			off += int32(relEnd)
+		} else {
+			off++
+		}
+	}
+	runtime.KeepAlive(store)
+	if want := expectedGroupsAll(re, input); !equalSlotSets(got, want) {
+		return fmt.Errorf("groups-exhaust(%d bytes) = %v, want %v", len(input), got, want)
+	}
+	return nil
+}
+
+// checkCorrectness validates one (tc, wasm, input) combination against Go
+// stdlib regexp, dispatching on tc.mode/tc.exhaustive exactly the way
+// measureWasm dispatches for performance measurement — every combination
+// that gets a fuel/time number also gets a correctness check using the
+// identical call convention. modeSet is not checked here (see the package
+// comment above this section).
+func checkCorrectness(tc testCase, wasm []byte, input string, re *regexp.Regexp, engine *wasmtime.Engine) error {
+	switch tc.mode {
+	case modeAnchored:
+		return checkMatch(engine, wasm, input, re)
+	case modeFind:
+		if tc.exhaustive {
+			return checkFindExhaust(engine, wasm, input, re)
+		}
+		return checkFind(engine, wasm, input, re)
+	case modeGroups:
+		if tc.exhaustive {
+			return checkGroupsExhaust(engine, wasm, input, re)
+		}
+		return checkGroups(engine, wasm, input, re)
+	}
+	return nil
+}
+
 // Set bench layout: tables live at the bottom of memory (CompileFile places
 // them starting at offset 0). Input is written AFTER all table data, with the
 // output buffer further past the input. Without this gap the input write
@@ -1875,11 +2268,28 @@ func main() {
 	fmt.Println("likelytest — LikelyMode 3x3 matrix (p50 over 10k inner iterations per cell)")
 
 	filter := os.Getenv("LIKELYTEST_FILTER")
+	totalChecks, totalFailures := 0, 0
 	for _, tc := range tests {
 		if filter != "" && !strings.Contains(tc.name, filter) {
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
+
+		// Ground truth for the correctness checks below. modeSet isn't
+		// checked here (see the "Correctness checking" section's package
+		// comment), and a handful of patterns may use RE2-only syntax Go's
+		// regexp package rejects — skip validation for those rather than
+		// failing the whole run, matching tools/re2test's --validate-go
+		// guard for the same situation.
+		var re *regexp.Regexp
+		if tc.mode != modeSet {
+			var reErr error
+			re, reErr = regexp.Compile(tc.pattern)
+			if reErr != nil {
+				fmt.Fprintf(os.Stderr, "  correctness: pattern rejected by Go stdlib, skipping validation: %v\n", reErr)
+			}
+		}
+
 		var rowsMatch, rowsNoMatch [3]cell
 		var neutralWasm []byte
 		for i, m := range modes {
@@ -1898,10 +2308,23 @@ func main() {
 			// Skip benchmarking, reuse nothing (deliberately re-derive size
 			// from this mode's own wasm rather than assuming it), and mark
 			// both rows so printMatrix shows a message instead of numbers.
+			// Correctness is skipped too: byte-identical WASM to an
+			// already-checked neutral build can't behave differently.
 			if i > 0 && bytes.Equal(wasm, neutralWasm) {
 				rowsMatch[i] = cell{size: len(wasm), identical: true}
 				rowsNoMatch[i] = cell{size: len(wasm), identical: true}
 				continue
+			}
+			if re != nil {
+				for _, in := range [2]struct {
+					label, input string
+				}{{"match-input", tc.matchInput}, {"no-match-input", tc.nomatchInput}} {
+					totalChecks++
+					if cErr := checkCorrectness(tc, wasm, in.input, re, engine); cErr != nil {
+						totalFailures++
+						fmt.Fprintf(os.Stderr, "  CORRECTNESS FAIL [%s/%s]: %v\n", m, in.label, cErr)
+					}
+				}
 			}
 			c, err := measureWasm(tc, wasm, m, tc.matchInput, engine, fuelEngine)
 			if err != nil {
@@ -1919,4 +2342,8 @@ func main() {
 		printMatrix(tc, rowsMatch, rowsNoMatch)
 	}
 	fmt.Println()
+	fmt.Fprintf(os.Stderr, "correctness: %d checks, %d failures\n", totalChecks, totalFailures)
+	if totalFailures > 0 {
+		os.Exit(1)
+	}
 }
