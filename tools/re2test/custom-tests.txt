@@ -4082,3 +4082,44 @@ regexps
 0-2;0-2;-;-
 -;0-1;-;-
 0-3;0-3;-;-
+# ============================================================
+# Category (DFA getOrAddState newline-transition ecBeginLine drop,
+# FUZZER_BUGS.md #27) — newDFA's dedicated '\n'-byte transition branch
+# (compile/engine_dfa.go, ~line 1501) resolves the immediate epsilon
+# closure with ecBeginLine, correctly firing an immediately-following
+# (?m:^). But when a (?m:$) sits between the '\n' transition and the
+# (?m:^) in program order (i.e. "$^", not "^$"), $ can't resolve yet
+# (needs ecEnd/ecEndLine) so ^'s PC is never pushed into nextSet at
+# transition time — it's left for getOrAddState's later accept-bitmask
+# computation. getOrAddState accepts an nlFlag param but only threads it
+# into the state's dedup key (setToKey), never into any ctx passed to
+# acceptBitsFor for accepting/midAccepting/midAcceptingNW/midAcceptingW/
+# midAcceptingNL — so ecBeginLine is missing exactly when needed to
+# resolve the deferred ^, and the match is silently dropped. Reversed
+# order ("^$") is unaffected because ^ resolves immediately during the
+# transition-time closure, before $ is even reached. All expected values
+# cross-checked against Go stdlib regexp (col0 = \A(?:PATTERN)\z,
+# col1 = FindStringIndex).
+# ============================================================
+NewlineTransitionDeferredBeginLine
+strings
+"\n"
+"\n\n"
+"ab\n"
+"ab\n\n"
+regexps
+"\n(?m:$^)"
+0-1;0-1;-;-
+-;0-1;-;-
+-;2-3;-;-
+-;2-3;-;-
+"ab\n(?m:$^)"
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;0-3;-;-
+"\n(?m:$)(?m:^)"
+0-1;0-1;-;-
+-;0-1;-;-
+-;2-3;-;-
+-;2-3;-;-

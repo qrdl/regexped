@@ -1375,13 +1375,22 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		getOrAddState := func(nextSet []uint32, nextPrevWasWord bool, nextPrevWasNewline ...bool) int {
 			nlFlag := len(nextPrevWasNewline) > 0 && nextPrevWasNewline[0]
 			nextKey := setToKey(nextSet, nextPrevWasWord, nfaAcceptBits(nextSet), nlFlag)
+			var nlCtx int
+			if nlFlag {
+				// This state is only ever reached by consuming a literal '\n',
+				// so ecBeginLine holds permanently for it — fold it into every
+				// accept-bitmask context below so a (?m:^) left unresolved at
+				// transition time (e.g. deferred behind a not-yet-resolvable
+				// (?m:$) in "$^" order) still fires. See FUZZER_BUGS.md #27.
+				nlCtx = ecBeginLine
+			}
 			var eofWBCtx int
 			if nextPrevWasWord {
 				eofWBCtx = ecWordBoundary
 			} else {
 				eofWBCtx = ecNoWordBoundary
 			}
-			rightfulAccept := acceptBitsFor(nextSet, ecEnd|eofWBCtx)
+			rightfulAccept := acceptBitsFor(nextSet, ecEnd|eofWBCtx|nlCtx)
 			nextDFAState, exists := stateMap[nextKey]
 			// Defensive: a byte-reachable state's raw closure frontier could
 			// in principle collide with a bootstrap state's key (start/midStart/
@@ -1399,29 +1408,31 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				stateMap[nextKey] = nextStateID
 				nextStateID++
 				orAccept(dfa.accepting, nextDFAState, rightfulAccept)
-				orAccept(dfa.midAccepting, nextDFAState, acceptBitsFor(nextSet, 0))
+				orAccept(dfa.midAccepting, nextDFAState, acceptBitsFor(nextSet, nlCtx))
 				var nwCtx int
 				if nextPrevWasWord {
 					nwCtx = ecWordBoundary
 				} else {
 					nwCtx = ecNoWordBoundary
 				}
+				nwCtx |= nlCtx
 				orAccept(dfa.midAcceptingNW, nextDFAState, acceptBitsFor(nextSet, nwCtx))
 				markDominant(dfa.midAcceptingNWDominant, nextDFAState, nextSet, nwCtx)
-				markOutranked(dfa.midAcceptingNWOutranked, nextDFAState, nextSet, 0, nwCtx)
+				markOutranked(dfa.midAcceptingNWOutranked, nextDFAState, nextSet, nlCtx, nwCtx)
 				var wCtx int
 				if nextPrevWasWord {
 					wCtx = ecNoWordBoundary
 				} else {
 					wCtx = ecWordBoundary
 				}
+				wCtx |= nlCtx
 				orAccept(dfa.midAcceptingW, nextDFAState, acceptBitsFor(nextSet, wCtx))
 				markDominant(dfa.midAcceptingWDominant, nextDFAState, nextSet, wCtx)
-				markOutranked(dfa.midAcceptingWOutranked, nextDFAState, nextSet, 0, wCtx)
+				markOutranked(dfa.midAcceptingWOutranked, nextDFAState, nextSet, nlCtx, wCtx)
 				if dfa.hasNewlineBoundary {
 					orAccept(dfa.midAcceptingNL, nextDFAState, acceptBitsFor(nextSet, nwCtx|ecEndLine))
 					markDominant(dfa.midAcceptingNLDominant, nextDFAState, nextSet, nwCtx|ecEndLine)
-					markOutranked(dfa.midAcceptingNLOutranked, nextDFAState, nextSet, 0, nwCtx|ecEndLine)
+					markOutranked(dfa.midAcceptingNLOutranked, nextDFAState, nextSet, nlCtx, nwCtx|ecEndLine)
 				}
 				if leftmostFirst {
 					if pBits != nil {
