@@ -362,12 +362,15 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 			col0 := strings.TrimSpace(results[0])
 			col1 := strings.TrimSpace(results[1])
-			var col4, col5 string
+			var col4, col5, col6 string
 			if len(results) >= 5 {
 				col4 = strings.TrimSpace(results[4])
 			}
 			if len(results) >= 6 {
 				col5 = strings.TrimSpace(results[5])
+			}
+			if len(results) >= 7 {
+				col6 = strings.TrimSpace(results[6])
 			}
 
 			// Skip cases where the input contains Unicode.
@@ -446,6 +449,18 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						nDataErrors++
 						fmt.Printf("DATA  pattern: %q\n      input:   %q\n      col5 expected: %s\n      col5 go:       %s\n",
 							pattern, text, fmtSlots(expSlots), fmtGoSub(goSub))
+					}
+				}
+				// col6 (groups exhaustive re-entry): validate if present.
+				// Mirrors the GroupsIter/generator advance-by-matchEnd
+				// convention — see tools/likelytest's expectedGroupsAll.
+				if col6 != "" && col6 != "-" {
+					goAll := expectedGroupsAllGo(re, text)
+					expAll := parseCol6(col6, re.NumSubexp()+1)
+					if !col6Equal(goAll, expAll) {
+						nDataErrors++
+						fmt.Printf("DATA  pattern: %q\n      input:   %q\n      col6 expected: %s\n      col6 go:       %s\n",
+							pattern, text, fmtCol6(expAll), fmtCol6(goAll))
 					}
 				}
 			}
@@ -700,6 +715,83 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 							fmt.Printf("Stopping after %d failure(s)\n", nfail)
 							stopped = true
 							goto done
+						}
+					}
+				}
+
+				// col6: groups exhaustive re-entry — repeatedly call groups(),
+				// advancing by the reported match's own relative end. This is
+				// the shape col5 never exercises (col5 always calls groups()
+				// at ptr=0): every generated stub's GroupsIter/generator
+				// re-enters at a nonzero ptr after the first match, and a bug
+				// in that composition (task 50: the whole-pattern
+				// single-capture shortcut left edgeScratchOff at its zero
+				// value instead of -1, so the groups wrapper scribbled an
+				// (origPtr,origEnd) scratch pair over table-memory offset 0
+				// on every call, corrupting the DFA table read by the next
+				// find()) is invisible to col0/col5 and only surfaces here.
+				if col6 != "" && col6 != "-" && groupsFn != nil {
+					expAll := parseCol6(col6, numGroups)
+					// Write the full text once; re-entry advances ptr into
+					// this same buffer rather than re-copying a substring to
+					// address 0 the way callGroups does — see callGroupsAt's
+					// doc comment for why that distinction is load-bearing
+					// here.
+					buf := groupsMemory.UnsafeData(groupsStore)
+					copy(buf[inputBase:], text)
+					var gotAll [][]int32
+					offset := int32(0)
+					textLen := int32(len(text))
+					for offset <= textLen {
+						endPos, slots, callErr := callGroupsAt(wd, groupsStore, groupsFn, groupsMemory, inputBase+offset, textLen-offset, numGroups)
+						if callErr != nil {
+							if isTimeout(callErr) {
+								if forceBacktrack {
+									groupsStore, groupsFn, groupsMemory = nil, nil, nil
+									skipCount[skipTimeout]++
+									goto nextResultLine
+								}
+								return fmt.Errorf("TIMEOUT: groups-exhaust pattern=%q input=%q", pattern, text)
+							}
+							return fmt.Errorf("%s:%d: wasm groups-exhaust call pattern=%q input=%q: %w",
+								testFile, lineno, pattern, text, callErr)
+						}
+						if endPos < 0 {
+							break
+						}
+						shifted := make([]int32, len(slots))
+						for i, v := range slots {
+							if v < 0 {
+								shifted[i] = -1
+							} else {
+								shifted[i] = offset + v
+							}
+						}
+						gotAll = append(gotAll, shifted)
+						if relEnd := slots[1]; relEnd > 0 {
+							offset += relEnd
+						} else {
+							offset++
+						}
+					}
+					if !col6Equal(gotAll, expAll) {
+						nfail++
+						fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      col6 expected: %s\n      col6 got:      %s\n",
+							pattern, text, fmtCol6(expAll), fmtCol6(gotAll))
+						if maxErrors > 0 && nfail >= maxErrors {
+							fmt.Printf("Stopping after %d failure(s)\n", nfail)
+							stopped = true
+							goto done
+						}
+					} else {
+						npass++
+						if groupsIsBacktrack {
+							npassBacktrack++
+						} else {
+							npassTDFA++
+						}
+						if verbose {
+							fmt.Printf("PASS %s:%d pattern=%q input=%q (groups-exhaust)\n", testFile, lineno, pattern, text)
 						}
 					}
 				}
@@ -1142,6 +1234,46 @@ func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *was
 	return endPos, slots, nil
 }
 
+// callGroupsAt invokes the groups function at an explicit (ptr,len) into
+// memory the caller has already populated — unlike callGroups, it does NOT
+// copy any text to inputBase first. This distinction matters for exhaustive
+// re-entry (col6): the real GroupsIter/generator convention every generated
+// stub uses (generate/js_stub.go's genJSGroupsFunc, generate/rust_stub.go's
+// iterator, etc.) calls groups() at successive nonzero ptr values into the
+// SAME underlying buffer — it never re-writes a substring back to address 0
+// between calls. callGroups' per-call re-copy makes every call start from a
+// pristine buffer, which is exactly what hides TODO.md task 50's bug class
+// (a wrapper-composition bug that corrupts memory at address 0 as a side
+// effect of one call, only visible on the NEXT call into the same,
+// un-rewritten buffer).
+func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, ptr, length int32, numGroups int) (int32, []int32, error) {
+	buf := mem.UnsafeData(store)
+	for i := 0; i < numGroups*2; i++ {
+		off := slotsBase + int32(i*4)
+		buf[off] = 0xFF
+		buf[off+1] = 0xFF
+		buf[off+2] = 0xFF
+		buf[off+3] = 0xFF
+	}
+	wd.Arm(store)
+	defer wd.Disarm()
+	result, err := fn.Call(store, ptr, length, slotsBase)
+	if err != nil {
+		return 0, nil, err
+	}
+	endPos := result.(int32)
+	if endPos < 0 {
+		return -1, nil, nil
+	}
+	buf = mem.UnsafeData(store)
+	slots := make([]int32, numGroups*2)
+	for i := range slots {
+		off := slotsBase + int32(i*4)
+		slots[i] = int32(buf[off]) | int32(buf[off+1])<<8 | int32(buf[off+2])<<16 | int32(buf[off+3])<<24
+	}
+	return endPos, slots, nil
+}
+
 // parseCaptures parses a col-0 result string that may include submatches.
 // Returns nil if no match. Otherwise returns []int32{start0,end0,start1,end1,...}
 // with -1,-1 for unmatched groups.
@@ -1347,6 +1479,81 @@ func fmtCol4GoAll(goAll [][]int) string {
 
 func fmtCol4Wasm(pairs [][2]int) string {
 	return fmtCol4(pairs)
+}
+
+// parseCol6 parses a col6 string like "0-3 0-3|4-9 4-9" (matches separated by
+// "|", each match's per-group spans space-separated like col5) into a slice
+// of per-match slot arrays, or nil for "-"/empty.
+func parseCol6(col string, numGroups int) [][]int32 {
+	if col == "" || col == "-" {
+		return nil
+	}
+	var all [][]int32
+	for _, part := range strings.Split(col, "|") {
+		all = append(all, parseCaptures(strings.TrimSpace(part), numGroups))
+	}
+	return all
+}
+
+// col6Equal compares two groups-exhaust match sequences — used for both the
+// Go-oracle validation (--validate-go) and the WASM-vs-expected check.
+func col6Equal(got [][]int32, exp [][]int32) bool {
+	if len(got) != len(exp) {
+		return false
+	}
+	for i := range got {
+		if len(got[i]) != len(exp[i]) {
+			return false
+		}
+		for j := range got[i] {
+			if got[i][j] != exp[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func fmtCol6(all [][]int32) string {
+	if all == nil {
+		return "no matches"
+	}
+	var parts []string
+	for _, m := range all {
+		parts = append(parts, fmtSlots(m))
+	}
+	return strings.Join(parts, "|")
+}
+
+// expectedGroupsAllGo is the Go-stdlib oracle for col6: mirrors the
+// GroupsIter/generator advance-by-matchEnd convention (advance by the
+// match's own relative end, or off++ if that's zero) rather than Go's
+// FindAllStringSubmatchIndex, which skips empty matches adjacent to the
+// previous one. Matches tools/likelytest's expectedGroupsAll.
+func expectedGroupsAllGo(re *regexp.Regexp, text string) [][]int32 {
+	var all [][]int32
+	off := 0
+	for off <= len(text) {
+		sub := re.FindStringSubmatchIndex(text[off:])
+		if sub == nil {
+			break
+		}
+		shifted := make([]int32, len(sub))
+		for i, v := range sub {
+			if v < 0 {
+				shifted[i] = -1
+			} else {
+				shifted[i] = int32(v + off)
+			}
+		}
+		all = append(all, shifted)
+		if relEnd := sub[1]; relEnd > 0 {
+			off += relEnd
+		} else {
+			off++
+		}
+	}
+	return all
 }
 
 // slotsEqualGo compares Go FindStringSubmatchIndex against expected slot pairs.

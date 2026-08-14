@@ -2,6 +2,14 @@
 # Format: col0=anchored-full-match(LL); col1=first-find(LF); col2="-"; col3="-"
 # Optional col4 (5th field): all find matches comma-separated.
 # Optional col5 (6th field): non-anchored find with captures.
+# Optional col6 (7th field): groups exhaustive re-entry — all matches produced
+# by repeatedly calling groups() and advancing by the reported match's own
+# relative end (the GroupsIter/generator advance-by-matchEnd convention every
+# generated stub uses, e.g. generate/js_stub.go's genJSGroupsFunc). Matches
+# are separated by "|"; each match's per-group spans are space-separated like
+# col5. This is the only column that exercises groups() at a nonzero ptr —
+# col0/col5 always call groups() at ptr=0 — so it's the only column that can
+# catch bugs specific to re-entry (see plans/TODO.md task 50).
 #
 # col0: standard DFA, must match from pos 0 consuming ALL input (leftmost-longest).
 #       Returns end=len(input) on success, or "-" for no match.
@@ -4020,3 +4028,27 @@ regexps
 "[^0-9]ab"
 -;-;-;-
 -;1-4;-;-
+# ============================================================
+# Category (TODO.md task 50): the whole-pattern single-capture shortcut
+# (isWholePatternSingleCapture, compile.go) left p.edgeScratchOff at its
+# zero-value default instead of an explicit -1. The groups-wrapper
+# emission call site only forces edgeOff=-1 when p.isTDFA, so this path
+# (!isTDFA && !anchored) read edgeScratchOff=0 and treated it as a real
+# table-memory offset — writing an 8-byte (origPtr,origEnd) scratch pair
+# over memory offset 0 on every groups() call (in a standalone module
+# that's the caller's own input buffer; in an embedded one, the DFA
+# table's own base). col0/col5 use callGroups, which re-copies the input
+# text to address 0 before every call — masking the corruption, since
+# each call starts from a pristine buffer regardless of what the
+# previous call scribbled. col6 (groups exhaustive re-entry) instead
+# writes the text once and calls groups() at successive nonzero ptr
+# values into that same, never-rewritten buffer — the real
+# GroupsIter/generator advance-by-matchEnd convention every generated
+# stub uses — which is what actually observes the corruption.
+# ============================================================
+GroupsExhaustReentryTrivialShortcut
+strings
+"the quick"
+regexps
+"(\\w+)"
+0-3 0-3;0-3;-;-;0-3,4-9;0-3 0-3;0-3 0-3|4-9 4-9

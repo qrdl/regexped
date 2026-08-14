@@ -1326,6 +1326,19 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if !dfaStateLimitExceeded && !anchored && isWholePatternSingleCapture(parsed) {
 		p.numGroups = 2
 		p.captureBody = appendTrivialSingleCaptureCodeEntry(nil)
+		// edgeScratchOff must be an explicit -1 here: the field's zero value
+		// is 0, a real table-memory offset, and this path is !isTDFA &&
+		// !anchored — exactly the combination the wrapper-emission call site
+		// (compile.go, appendWrapperCodeEntry's edgeOff) treats as "read
+		// p.edgeScratchOff", so leaving it unset made the wrapper scribble an
+		// 8-byte (origPtr,origEnd) scratch value over table-memory offset 0
+		// on every groups() call. In a standalone module (tableMemIdx 0) that
+		// memory IS the caller's own memory — offset 0 is the input buffer's
+		// own base — so this corrupted the caller's input text in place; in
+		// an embedded module (tableMemIdx 1) it corrupts the DFA table's own
+		// base instead. Either way, the next find()/groups() call in the
+		// same instance reads back garbage. See plans/TODO.md task 50.
+		p.edgeScratchOff = -1
 		return p, nil
 	}
 
