@@ -3892,3 +3892,71 @@ regexps
 0-4 1-4;0-4;-;-;-;0-4 1-4
 -;-;-;-
 -;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #24): computePrefix's hasWordBoundary
+# cross-check only catches midStartWordState accepting with ZERO bytes
+# consumed (bug #10) or diverging in byte VALUE on the first byte. It
+# never walks midStartWordState through the derived prefix looking for
+# an accepting state reached after FEWER bytes than the prefix requires
+# (walk-length divergence, N>=1) — nor a byte-value divergence at
+# position i>0. Both `0000|\B0` and `(\B|0)0` reach their expected match
+# only through midStartWordState (prev byte is a word char), landing on
+# an accepting state after consuming just one '0', while
+# computePrefix's midStartState-only walk derives a longer mandatory
+# literal ("0000"/"00" respectively) that the SIMD fast-skip searches
+# for verbatim and never finds in these inputs — producing a false
+# "no match" before the general per-byte DFA loop (which would find it)
+# ever runs. `ab|\Ba` covers the same shape with a non-digit literal;
+# "cab"/"cabc" are included even though they happen to also match via
+# branch 1 ("ab") to confirm those still succeed post-fix, matching the
+# bug's own scope table.
+# All expected values cross-checked against Go stdlib regexp
+# (FindStringIndex for col1; col0 kept only when the match starts at 0
+# AND consumes the entire input, matchFn's full-consumption contract).
+# ============================================================
+FuzzBug24WordBoundaryPrefixWalkLengthDivergence
+strings
+""
+"0"
+"00"
+"000"
+"0000"
+"00000"
+regexps
+"0000|\\B0"
+-;-;-;-
+-;-;-;-
+-;1-2;-;-
+-;1-2;-;-
+0-4;0-4;-;-
+-;0-4;-;-
+strings
+""
+"0"
+"00"
+"000"
+"1000"
+"a0"
+"10"
+regexps
+"(?:\\B|0)0"
+-;-;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;0-2;-;-
+-;1-2;-;-
+-;1-2;-;-
+-;1-2;-;-
+strings
+""
+"ca"
+"za"
+"cab"
+"cabc"
+regexps
+"ab|\\Ba"
+-;-;-;-
+-;1-2;-;-
+-;1-2;-;-
+-;1-3;-;-
+-;1-3;-;-

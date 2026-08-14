@@ -5634,11 +5634,30 @@ func computePrefix(t *dfaTable) []byte {
 		if stateAcceptsAny(t, t.midStartWordState) {
 			return nil
 		}
-		if len(prefixMid) > 0 {
-			for b := 0; b < 256; b++ {
-				if t.transitions[t.midStartWordState*256+b] >= 0 && b != int(prefixMid[0]) {
+		// Walk midStartWordState through prefixMid's own byte sequence,
+		// mirroring computePrefixWalk's loop but driven by the already-known
+		// bytes rather than rediscovering them. Bail (disable the fast-skip
+		// entirely) on either kind of divergence from midStartState's walk:
+		// a different live byte at any position (checked before consuming
+		// each byte, generalizing the old first-byte-only check), or landing
+		// on an accepting state after fewer bytes than prefixMid requires
+		// (FUZZER_BUGS.md #24) — both mean midStartWordState's own shorter or
+		// differently-shaped requirement isn't representable by the single
+		// midStartState-derived literal the SIMD scan searches for.
+		state := t.midStartWordState
+		for i, b := range prefixMid {
+			for c := 0; c < 256; c++ {
+				if t.transitions[state*256+c] >= 0 && c != int(b) {
 					return nil
 				}
+			}
+			next := t.transitions[state*256+int(b)]
+			if next < 0 {
+				break // midStartWordState's walk dies before completing prefixMid — nothing further to check along this path.
+			}
+			state = next
+			if i+1 < len(prefixMid) && stateAcceptsAny(t, state) {
+				return nil
 			}
 		}
 	}
