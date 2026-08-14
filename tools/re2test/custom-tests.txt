@@ -4052,3 +4052,33 @@ strings
 regexps
 "(\\w+)"
 0-3 0-3;0-3;-;-;0-3,4-9;0-3 0-3;0-3 0-3|4-9 4-9
+# ============================================================
+# Category (Backtracking altLoopBody dual-back-edge ambiguity,
+# FUZZER_BUGS.md #26) — the NFA for `(?m:0$*)*` has an InstAlt (the inner
+# `$*` loop head) whose two branches are SIMULTANEOUSLY a genuine inner-loop
+# back edge (the real `$*` cycle) and a trivial "back edge" to prog.Start
+# (which dominates everything, so it always tests positive). altLoopBody's
+# binary "exactly one of Out/Arg is a back edge" model can't represent that,
+# falls to default (isLoop=false), and the node gets zero zero-progress
+# protection — the resulting unguarded cycle overflows the backtrack stack,
+# and the existing overflow-abandon policy (bug #18's fix) discards the
+# whole attempt_start search, including an already-pushed correct match
+# frame. No captures, so this pattern is normally routed to Backtracking
+# directly via dfaHasOutrankedState/dfaHasAmbiguousBoundaryTarget (no
+# --force-backtrack needed). All expected values cross-checked against Go
+# stdlib regexp (col0 = \A(?:PATTERN)\z, col1 = FindStringIndex).
+# ============================================================
+AltLoopDualBackEdge
+strings
+""
+"0"
+"00"
+"0\n"
+"000"
+regexps
+"(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+0-3;0-3;-;-

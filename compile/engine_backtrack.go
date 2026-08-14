@@ -335,6 +335,21 @@ func altLoopBody(prog *syntax.Prog, idom []int, pc int) (bodyPC, exitPC int, isL
 		return int(inst.Out), int(inst.Arg), true
 	case argIsBack && !outIsBack:
 		return int(inst.Arg), int(inst.Out), true
+	case outIsBack && argIsBack:
+		// Both branches test as back edges: prog.Start trivially dominates
+		// every reachable instruction, so a branch targeting it always
+		// passes the dominance test regardless of whether it's a genuine
+		// cycle. When the OTHER branch also targets a real (non-Start)
+		// dominator, that one is the true, more-local inner-loop back edge
+		// (FUZZER_BUGS.md #26 — an InstAlt can simultaneously be an inner
+		// loop's back edge and, via prog.Start, an outer loop's).
+		if int(inst.Arg) == prog.Start && int(inst.Out) != prog.Start {
+			return int(inst.Out), int(inst.Arg), true
+		}
+		if int(inst.Out) == prog.Start && int(inst.Arg) != prog.Start {
+			return int(inst.Arg), int(inst.Out), true
+		}
+		return 0, 0, false
 	default:
 		return 0, 0, false
 	}
