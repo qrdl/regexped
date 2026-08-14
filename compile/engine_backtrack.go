@@ -672,6 +672,35 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		loopEntryLocalIdx[pc] = entryBase + uint32(j)
 	}
 
+	// extraFrameLocals: every loop_pos/loop_entry tracker, plus every
+	// per-loop capture snapshot slot (loopSnapBase/loopSnapLocals), saved
+	// into and restored from every backtrack frame like captures already
+	// are — see btPushFrame's and btNumLoopFrameLocals's docs and
+	// FUZZER_BUGS.md #28. The snapshot slots are included here (and not for
+	// the no-capture bodies, which have none) because they're per-loop-
+	// instance state read by the very same zero-progress guard
+	// (restoreLoopSnap) as the trackers, and go stale the same way.
+	//
+	// Narrowing this to only bt.emptyBodyGreedyLoop heads was tried and
+	// reverted: it broke non-greedy loops (e.g. `^(?:(?:(?:a*?){0,}))$`)
+	// and other loop shapes outside bug 28's specific repro class — see
+	// FUZZER_BUGS.md #28's "Confidence"/investigation notes. All bt.loops
+	// heads need this, not just the empty-body-greedy subset.
+	extraFrameLocals := make([]uint32, 0, len(loopPCsSorted)+len(entryPCsSorted)+snapTotal)
+	for _, pc := range loopPCsSorted {
+		extraFrameLocals = append(extraFrameLocals, loopLocalIdx[pc])
+	}
+	for _, pc := range entryPCsSorted {
+		extraFrameLocals = append(extraFrameLocals, loopEntryLocalIdx[pc])
+	}
+	for _, pc := range loopPCsSorted {
+		if snapBase, ok := loopSnapBase[pc]; ok {
+			for k := range loopSnapLocals[pc] {
+				extraFrameLocals = append(extraFrameLocals, snapBase+uint32(k))
+			}
+		}
+	}
+
 	// Memo locals (only when useMemo=true), placed after all existing locals.
 	memoLocalsBase := entryBase + uint32(len(entryPCsSorted))
 	var (
@@ -836,8 +865,19 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		body = utils.AppendULEB128(body, capStartLocal(0)+uint32(i))
 	}
 
-	// Restore retry PC from mem[sp + 4 + numCapLocals*4]
-	retryPCOffset := uint32(4 + numCapLocals*4)
+	// Restore extraFrameLocals (loop_pos/loop_entry trackers) from
+	// mem[sp+4+numCapLocals*4 ..] — see btPushFrame's doc and
+	// FUZZER_BUGS.md #28.
+	extraOff := uint32(4 + numCapLocals*4)
+	for i, localIdx := range extraFrameLocals {
+		body = append(body, 0x20, localSP)
+		body = appendTableLoad32(body, tableMemIdx, extraOff+uint32(i*4))
+		body = append(body, 0x21) // local.set
+		body = utils.AppendULEB128(body, localIdx)
+	}
+
+	// Restore retry PC from mem[sp + 4 + numCapLocals*4 + len(extraFrameLocals)*4]
+	retryPCOffset := extraOff + uint32(len(extraFrameLocals)*4)
 	body = append(body, 0x20, localSP)
 	body = appendTableLoad32(body, tableMemIdx, retryPCOffset)
 	body = append(body, 0x21, localState) // local.set state
@@ -879,7 +919,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopEntryLocalIdx, loopSnapBase, loopSnapLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, edgeScratchOff)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopEntryLocalIdx, loopSnapBase, loopSnapLocals, extraFrameLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, edgeScratchOff)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -973,6 +1013,7 @@ func emitBTInstHandler(
 	loopEntryLocalIdx map[int]uint32,
 	loopSnapBase map[int]uint32,
 	loopSnapLocals map[int][]uint32,
+	extraFrameLocals []uint32,
 	stackLimit, frameSize int32,
 	numCapLocals int,
 	memoTableBase int32,
@@ -1059,7 +1100,7 @@ func emitBTInstHandler(
 			if useMemo && bt.memoInnerLoop[p] {
 				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested)
 			}
-			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
+			body = btPushFrame(body, numCapLocals, extraFrameLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
 			body = contOut(body)
 		} else {
 			// Loop alternation: zero-progress guard
@@ -1170,7 +1211,7 @@ func emitBTInstHandler(
 			}
 
 			// Push retry=inst.Arg, continue with inst.Out
-			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
+			body = btPushFrame(body, numCapLocals, extraFrameLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
 			body = contOut(body)
 		}
 
@@ -1507,13 +1548,24 @@ func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 }
 
 // btPushFrame pushes a backtrack frame onto the stack:
-// mem[sp+0]               = pos
-// mem[sp+4..4+capLocals*4] = captures
-// mem[sp+retryPCOff]       = retryPC
+// mem[sp+0]                  = pos
+// mem[sp+4..4+capLocals*4]   = captures
+// mem[sp+extraOff..+extra*4] = extraLocals (loop_pos/loop_entry trackers)
+// mem[sp+retryPCOff]         = retryPC
 // btPushFrame pushes a backtrack frame. stackLimit and frameSize are passed
 // so we can guard against stack overflow: if sp+frameSize > stackLimit, set
 // state=-1 (fail) and return instead of writing past allocated memory.
-func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSize int32, brDepth uint32, overflowFn func([]byte, uint32) []byte, tableMemIdx int) []byte {
+//
+// extraLocals: local indices of every loop_pos/loop_entry tracker in the
+// program (in the same fixed order the caller uses everywhere else), saved
+// into and restored from every frame exactly like captures already are.
+// These are per-loop-instance state (FUZZER_BUGS.md #28): once a loop head
+// has updated its tracker, popping back to a frame pushed *before* that
+// update must undo it too, or the loop head's zero-progress guard compares
+// the restored `pos` against a stale tracker value left over from an
+// abandoned deeper attempt and misclassifies a fresh loop entry as "already
+// made progress," discarding the correct backtrack continuation.
+func btPushFrame(b []byte, numCapLocals int, extraLocals []uint32, retryPC uint32, stackLimit, frameSize int32, brDepth uint32, overflowFn func([]byte, uint32) []byte, tableMemIdx int) []byte {
 	// Guard: if sp + frameSize > stackLimit → fail (treat as no-match).
 	b = append(b, 0x20, localSP)
 	b = append(b, 0x41)
@@ -1544,8 +1596,17 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSi
 		b = appendTableStore32(b, tableMemIdx, uint32(4+i*4))
 	}
 
-	// retry PC at offset 4 + numCapLocals*4
-	retryOff := uint32(4 + numCapLocals*4)
+	// extraLocals (loop_pos/loop_entry trackers) at offsets 4+numCapLocals*4, ...
+	extraOff := uint32(4 + numCapLocals*4)
+	for i, localIdx := range extraLocals {
+		b = append(b, 0x20, localSP)
+		b = append(b, 0x20)
+		b = utils.AppendULEB128(b, localIdx)
+		b = appendTableStore32(b, tableMemIdx, extraOff+uint32(i*4))
+	}
+
+	// retry PC at offset 4 + numCapLocals*4 + len(extraLocals)*4
+	retryOff := extraOff + uint32(len(extraLocals)*4)
 	b = append(b, 0x20, localSP)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(retryPC))
@@ -1764,10 +1825,11 @@ func compileBTProg(pattern string) *syntax.Prog {
 }
 
 // btAllocSizes returns (stackSize, memoSize) in bytes for a no-capture BT engine.
-// frameSize is always 8 (pos + retryPC, no cap slots).
+// frameSize is 8 (pos + retryPC, no cap slots) plus 4 bytes per loop_pos/
+// loop_entry tracker (FUZZER_BUGS.md #28) — see btNumLoopFrameLocals.
 // memoBudget is the maximum bytes to allocate for the BitState bitset.
 func btAllocSizes(bt *backtrack, useMemo bool, _ int, memoBudget int) (stackSize, memoSize int) {
-	frameSize := 8 // pos(4) + retryPC(4)
+	frameSize := 8 + btNumLoopFrameLocals(bt, false)*4 // pos(4) + extraLocals + retryPC(4)
 	maxFrames := bt.numAlts * 4096
 	if maxFrames < 4096 {
 		maxFrames = 4096
@@ -1963,6 +2025,29 @@ func buildBTInnerDisp(
 	prog := bt.prog
 	N := len(prog.Inst)
 
+	// extraFrameLocals: every loop_pos/loop_entry tracker, saved into and
+	// restored from every backtrack frame like captures already are — see
+	// btPushFrame's doc and FUZZER_BUGS.md #28. Order must match the caller's
+	// loopLocalIdx/loopEntryLocalIdx local assignment: loopPCsSorted first
+	// (bt.loops keys, sorted), then entryLoopPCsSorted(bt).
+	//
+	// Narrowing this to only bt.emptyBodyGreedyLoop heads was tried and
+	// reverted: it broke non-greedy loops and other loop shapes outside
+	// bug 28's specific repro class — see buildBacktrackBody's matching note.
+	loopPCsSorted := make([]int, 0, len(bt.loops))
+	for pc := range bt.loops {
+		loopPCsSorted = append(loopPCsSorted, pc)
+	}
+	sort.Ints(loopPCsSorted)
+	entryPCsSorted := entryLoopPCsSorted(bt)
+	extraFrameLocals := make([]uint32, 0, len(loopPCsSorted)+len(entryPCsSorted))
+	for _, pc := range loopPCsSorted {
+		extraFrameLocals = append(extraFrameLocals, loopLocalIdx[pc])
+	}
+	for _, pc := range entryPCsSorted {
+		extraFrameLocals = append(extraFrameLocals, loopEntryLocalIdx[pc])
+	}
+
 	// ── FAIL handler (state == -1) ──
 	body = append(body, 0x20, localState, 0x41, 0x7F, 0x46, 0x04, 0x40) // state==-1; if void
 	body = append(body, 0x20, localSP, 0x41)
@@ -1978,8 +2063,16 @@ func buildBTInnerDisp(
 	body = append(body, 0x20, localSP)
 	body = appendTableLoad32(body, tableMemIdx, 0)
 	body = append(body, 0x21, localPos)
-	// Restore retryPC = mem[sp+4]
-	retryOff := uint32(4 + numCapLocals*4)
+	// Restore extraFrameLocals from mem[sp+4+numCapLocals*4 ..]
+	extraOff := uint32(4 + numCapLocals*4)
+	for i, localIdx := range extraFrameLocals {
+		body = append(body, 0x20, localSP)
+		body = appendTableLoad32(body, tableMemIdx, extraOff+uint32(i*4))
+		body = append(body, 0x21)
+		body = utils.AppendULEB128(body, localIdx)
+	}
+	// Restore retryPC = mem[sp+4+numCapLocals*4+len(extraFrameLocals)*4]
+	retryOff := extraOff + uint32(len(extraFrameLocals)*4)
 	body = append(body, 0x20, localSP)
 	body = appendTableLoad32(body, tableMemIdx, retryOff)
 	body = append(body, 0x21, localState)
@@ -2007,7 +2100,7 @@ func buildBTInnerDisp(
 		brRun := uint32(N - 1 - p)
 		body = emitBTInstHandler(
 			body, bt, p, inst, brRun,
-			loopLocalIdx, loopEntryLocalIdx, emptySnapBase, emptySnapLocals,
+			loopLocalIdx, loopEntryLocalIdx, emptySnapBase, emptySnapLocals, extraFrameLocals,
 			stackLimit, frameSize, numCapLocals,
 			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
 			useMemo,
@@ -2155,6 +2248,36 @@ func entryLoopPCsSorted(bt *backtrack) []int {
 	}
 	sort.Ints(pcs)
 	return pcs
+}
+
+// btNumLoopFrameLocals returns the number of extra i32 locals (loop_pos +
+// loop_entry trackers, plus per-loop capture snapshot slots when
+// withCaptureSnapshots is true) that every backtrack stack frame must
+// reserve space for, alongside pos/captures/retryPC — see btPushFrame's doc
+// and FUZZER_BUGS.md #28. Callers computing frameSize/stackSize before the
+// WASM body itself is built (compile.go, btAllocSizes) use this to stay in
+// sync with the per-loop-head local count each body builder actually emits.
+//
+// withCaptureSnapshots must be true only for the capture-tracking body
+// (buildBacktrackBody's loopSnapBase/loopSnapLocals) — the no-capture
+// bodies (buildBTMatchBody/buildBTFindBody via buildBTInnerDisp) never
+// allocate snapshot locals since there are no captures to snapshot.
+// loopSnapLocals are themselves per-loop-instance state read only by the
+// same zero-progress guard as loop_pos/loop_entry (restoreLoopSnap on the
+// direct "pos == loopEntry" exit branch) — like those, they go stale across
+// a backtrack pop if not saved/restored the same way.
+//
+// Narrowing this to only count bt.emptyBodyGreedyLoop heads was tried and
+// reverted (breaks non-greedy loops and other loop shapes outside bug 28's
+// specific repro class) — must count every bt.loops head.
+func btNumLoopFrameLocals(bt *backtrack, withCaptureSnapshots bool) int {
+	n := len(bt.loops) + len(bt.emptyBodyGreedyLoop)
+	if withCaptureSnapshots {
+		for pc := range bt.loops {
+			n += len(loopCaptureLocals(bt.prog, bt.idom, pc))
+		}
+	}
+	return n
 }
 
 // emitBTMemoZeroInit emits a memory.fill instruction to zero the memo bitset.

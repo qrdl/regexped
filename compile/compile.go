@@ -877,7 +877,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			if useMemo {
 				btMemoBase = btStackLimit
 			}
-			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, 8, btMemoBase, useMemo, buildOpts.tableMemIdx)
+			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx)
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false, false,
@@ -1039,7 +1039,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			if useMemo {
 				btMemoBase = btStackLimit
 			}
-			frameSize := int32(8) // pos + retryPC only (no cap slots)
+			frameSize := int32(8 + btNumLoopFrameLocals(bt, false)*4) // pos + loop trackers + retryPC (no cap slots)
 			p.findBody = appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx)
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
 		} else {
@@ -1380,7 +1380,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// using l.tableEnd would overlap those tables and corrupt them at runtime.
 		btBase := utils.PageAlign(p.tableEnd)
 		numCapLocs := bt.numGroups * 2
-		frameSize := 4 + numCapLocs*4 + 4
+		frameSize := 4 + numCapLocs*4 + btNumLoopFrameLocals(bt, true)*4 + 4
 		maxFrames := bt.numAlts * 4096
 		if maxFrames < 4096 {
 			maxFrames = 4096

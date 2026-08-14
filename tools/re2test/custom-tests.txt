@@ -4123,3 +4123,81 @@ regexps
 -;0-1;-;-
 -;2-3;-;-
 -;2-3;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #28): Backtracking's per-loop-head zero-progress
+# tracker (loop_pos local) and its zero-width-assertion reference tracker
+# (loop_entry local) are ordinary WASM locals that btPushFrame/btFail never
+# saved or restored across a backtrack-stack pop — unlike captures, which
+# always were. Popping back to a frame pushed *before* the loop's tracker
+# was last updated left it holding a stale value from the abandoned deeper
+# attempt, so the loop head's guard compared the restored `pos` against the
+# wrong reference and treated a fresh loop entry as "already made progress,"
+# discarding the correct (and only) continuation that would have produced a
+# match — an unbounded resurrection cycle terminated only by the backtrack
+# stack's own overflow-abandon escape hatch, i.e. total non-match instead of
+# the correct span. `(0\b|)*0` on "0": the loop's only real iteration
+# consumes "0" and resolves `\b` at end-of-input; that iteration's own
+# exit-retry frame is exactly the correct continuation (0 loop iterations,
+# final "0" matches at pos 0), but got discarded by the stale-tracker
+# misfire. `x(0\b|)*0` (mandatory prefix before the loop) confirms the same
+# defect independent of loop position. `+` variants confirm it's independent
+# of `*` vs `+`. All expected values cross-checked against Go stdlib regexp
+# (FindStringSubmatchIndex for col1; col0 kept only when the match starts at
+# 0, same convention as FUZZER_BUGS.md #20's block above).
+# ============================================================
+FuzzBug28StaleLoopTrackerAcrossBacktrackPop
+strings
+""
+" "
+"0"
+"00"
+"000"
+" 0"
+"x0"
+"x00"
+regexps
+"(0\\b|)*0"
+-;-;-;-
+-;-;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+"(0*\\b|)*0"
+-;-;-;-
+-;-;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+"(0\\b|)+0"
+-;-;-;-
+-;-;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+"(0*\\b|)+0"
+-;-;-;-
+-;-;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+"x(0\\b|)*0"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2 1-1;0-2 1-1;-;-
+0-2 1-1;0-2 1-1;-;-
