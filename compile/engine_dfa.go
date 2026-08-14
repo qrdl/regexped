@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"regexp/syntax"
 	"sort"
+	"strings"
 	"unicode"
 
 	"github.com/qrdl/regexped/internal/utils"
@@ -321,7 +322,7 @@ const (
 // respecting anchor context flags (ec* constants above).
 // With leftmostFirst=true, states are ordered by priority (lower PC = higher priority).
 func nfaEpsilonClosure(prog *syntax.Prog, states []uint32, ctx int, leftmostFirst bool) []uint32 {
-	visited := make(map[uint32]bool)
+	visited := make([]bool, len(prog.Inst))
 	result := []uint32{}
 	var stack []uint32
 	if leftmostFirst {
@@ -632,7 +633,84 @@ func boundaryTargetReachesLaterState(prog *syntax.Prog, pc uint32, assertionIdx 
 // pattern bits have already seen their InstMatch.  This prevents one
 // pattern's early match from suppressing transitions for other patterns.
 func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool, pBits []uint64) map[rune][]uint32 {
-	m := make(map[rune][]uint32)
+	// Pass 1: find which bytes need a private (non-shared) transition list —
+	// any byte named by a live InstRune/InstRune1 instruction (plus its
+	// case-folded siblings), and '\n' whenever an InstRuneAnyNotNL instruction
+	// is present (it alone excludes '\n' from an otherwise-shared wildcard
+	// contribution). Every other byte behaves identically to every other byte
+	// and can share one "default" list instead of each getting its own
+	// 256-entry-per-instruction fan-out.
+	//
+	// Overestimating this set is harmless: this pass ignores leftmostFirst
+	// suppression (a byte named only by a later-suppressed instruction still
+	// gets flagged special), but pass 2 below re-applies the exact same
+	// suppression logic when filling in values, so an over-included byte
+	// just ends up holding a private copy identical to the shared default.
+	//
+	// special is a membership set only — it must NOT be used to pre-create
+	// keys in the result map m. A byte whose only naming instruction gets
+	// suppressed in pass 2 must end up with NO entry in m at all (exactly
+	// like the original code, where a map key is only ever created by an
+	// actual append), not a present-but-empty one: callers distinguish
+	// "byte has no transition" from "byte transitions to the empty set" via
+	// the map's ok-result, so a premature key would wrongly turn a dead end
+	// into a live (if degenerate) transition.
+	special := make(map[rune]bool)
+	hasAnyNotNL := false
+	markFold := func(r rune, isFoldCase bool) {
+		special[r] = true
+		if !isFoldCase {
+			return
+		}
+		for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+			if folded >= 0 && folded <= 0xFF {
+				special[folded] = true
+			}
+		}
+	}
+	for _, pc := range expanded {
+		inst := &prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstRune1:
+			r := inst.Rune[0]
+			if r >= 0 && r <= 0xFF {
+				markFold(r, syntax.Flags(inst.Arg)&syntax.FoldCase != 0)
+			}
+		case syntax.InstRune:
+			isFoldCase := syntax.Flags(inst.Arg)&syntax.FoldCase != 0
+			for i := 0; i < len(inst.Rune); i += 2 {
+				var minRune, maxRune rune
+				if i+1 >= len(inst.Rune) {
+					minRune = inst.Rune[i]
+					maxRune = inst.Rune[i]
+				} else {
+					minRune = inst.Rune[i]
+					maxRune = inst.Rune[i+1]
+				}
+				lo := minRune
+				hi := maxRune
+				if hi > 0xFF {
+					hi = 0xFF
+				}
+				for r := lo; r <= hi; r++ {
+					markFold(r, isFoldCase)
+				}
+			}
+		case syntax.InstRuneAnyNotNL:
+			hasAnyNotNL = true
+		}
+	}
+	if hasAnyNotNL {
+		special['\n'] = true
+	}
+
+	m := make(map[rune][]uint32, len(special))
+
+	// Pass 2: the original single walk over `expanded`, unchanged in logic —
+	// only the InstRuneAny/InstRuneAnyNotNL cases now fan out over the (small)
+	// special set plus one shared defaultOut accumulator instead of looping
+	// over all 256 bytes individually.
+	var defaultOut []uint32
 	seenMatch := false       // single-pattern mode
 	var seenMatchBits uint64 // multi-pattern mode
 	multiPattern := leftmostFirst && pBits != nil
@@ -665,14 +743,18 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool, 
 		switch inst.Op {
 		case syntax.InstRune1:
 			r := inst.Rune[0]
-			m[r] = append(m[r], inst.Out)
+			if special[r] {
+				m[r] = append(m[r], inst.Out)
+			}
 			if syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
 				seen := make(map[rune]bool)
 				seen[r] = true
 				for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
 					if !seen[folded] {
 						seen[folded] = true
-						m[folded] = append(m[folded], inst.Out)
+						if special[folded] {
+							m[folded] = append(m[folded], inst.Out)
+						}
 					}
 				}
 			}
@@ -693,31 +775,54 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool, 
 					hi = 0xFF
 				}
 				for r := lo; r <= hi; r++ {
-					m[r] = append(m[r], inst.Out)
+					if special[r] {
+						m[r] = append(m[r], inst.Out)
+					}
 					if isFoldCase {
 						seen := make(map[rune]bool)
 						seen[r] = true
 						for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
 							if !seen[folded] && (folded < minRune || folded > maxRune) {
 								seen[folded] = true
-								m[folded] = append(m[folded], inst.Out)
+								if special[folded] {
+									m[folded] = append(m[folded], inst.Out)
+								}
 							}
 						}
 					}
 				}
 			}
 		case syntax.InstRuneAny:
-			for b := 0; b < 256; b++ {
-				m[rune(b)] = append(m[rune(b)], inst.Out)
+			defaultOut = append(defaultOut, inst.Out)
+			for r := range special {
+				m[r] = append(m[r], inst.Out)
 			}
 		case syntax.InstRuneAnyNotNL:
-			for b := 0; b < 256; b++ {
-				if b != '\n' {
-					m[rune(b)] = append(m[rune(b)], inst.Out)
+			defaultOut = append(defaultOut, inst.Out)
+			for r := range special {
+				if r != '\n' {
+					m[r] = append(m[r], inst.Out)
 				}
 			}
 		}
 	}
+
+	// Backfill only genuinely non-special bytes with the shared default list.
+	// Special bytes (literal targets, or '\n' under InstRuneAnyNotNL) already
+	// got their own accumulation above — including a legitimate "nothing
+	// appended" outcome, which must stay absent from m, not be papered over
+	// with defaultOut (e.g. '\n' must end up with NO entry at all when the
+	// only wildcard in scope is InstRuneAnyNotNL, which excludes it).
+	if len(defaultOut) > 0 {
+		for b := 0; b < 256; b++ {
+			r := rune(b)
+			if special[r] {
+				continue
+			}
+			m[r] = defaultOut
+		}
+	}
+
 	return m
 }
 
@@ -945,20 +1050,28 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// distinct DFA states because they resolve word boundary assertions differently.
 	// acceptBits is included so that states with different accept bitmasks get
 	// distinct keys (required for multi-pattern suffix DFA correctness).
+	// Every caller passes states fresh from epsilonClosure (or a set built
+	// directly from it), which already dedups via its own visited tracking —
+	// no separate dedup pass is needed here.
+	//
+	// A fresh strings.Builder per call is required, not a shared/reset one:
+	// Builder.String() hands back a string backed by the builder's own byte
+	// slice with no copy, and the returned key is retained long-term as a
+	// map key (stateMap) — reusing one builder's backing array across calls
+	// would let a later call silently mutate an earlier call's already-
+	// stored key.
 	setToKey := func(states []uint32, prevWasWord bool, acceptBits uint64, prevWasNewline ...bool) string {
-		key := ""
-		seen := make(map[uint32]bool)
+		var keyBuf strings.Builder
+		keyBuf.Grow(len(states)*2 + 10)
 		for _, s := range states {
-			if !seen[s] {
-				seen[s] = true
-				key += string(rune(s)) + ","
-			}
+			keyBuf.WriteRune(rune(s))
+			keyBuf.WriteByte(',')
 		}
 		if prevWasWord {
-			key += "W"
+			keyBuf.WriteByte('W')
 		}
 		if len(prevWasNewline) > 0 && prevWasNewline[0] {
-			key += "N"
+			keyBuf.WriteByte('N')
 		}
 		// Only include bitmask in multi-pattern mode (pBits != nil).
 		// For single-pattern callers (pBits == nil), the bitmask is uniquely
@@ -967,9 +1080,9 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		if acceptBits != 0 && pBits != nil {
 			var b8 [8]byte
 			binary.LittleEndian.PutUint64(b8[:], acceptBits)
-			key += string(b8[:])
+			keyBuf.Write(b8[:])
 		}
-		return key
+		return keyBuf.String()
 	}
 
 	// isAccepting reports whether any state in the epsilon closure is an accept state.

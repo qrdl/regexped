@@ -28,6 +28,28 @@ const seedFile = "../re2test/custom-tests.txt"
 // tested. Byte-mutation fuzzing essentially never needs inputs this long.
 const inputCap = int(tableBase)
 
+// maxNFAInsts bounds the unrolled NFA program size (regexp/syntax
+// instruction count) a pattern is allowed to reach before the fuzzer skips
+// it rather than compiling it. This is a fuzz-harness-only limitation, not
+// a regexped one (see CLAUDE.md's "runtime over compile time" design
+// principle) — it exists because a single go test -fuzz worker call covers
+// both compileFind and the WASM run, and Go's internal/fuzz worker treats
+// any call exceeding 10s as a hang and reports it as a crasher
+// (plans/FUZZER_BUGS.md #23).
+//
+// 5000 was picked empirically, live against the post-#23-fix compiler:
+// the worst NFA shape reachable at all (large bounded-repeat patterns
+// like (.|()){N}, which keep ~N NFA instructions simultaneously live per
+// DFA state) tops out around 7000 instructions — Go's own regexp/syntax
+// caps repeat counts at 1000 and tracks cumulative repeat products across
+// nesting, so nothing bigger is constructible — and that ceiling measured
+// at 4.3s single-threaded. 5000 sits below that ceiling with real margin
+// (go test -fuzz runs multiple workers in parallel sharing CPU, and
+// scaling for this pattern family is worse than linear), while staying
+// above every other measured pattern, so it only excludes the extreme
+// tail rather than typical fuzzer-generated patterns.
+const maxNFAInsts = 5000
+
 func FuzzCorrectness(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)
@@ -40,8 +62,12 @@ func FuzzCorrectness(f *testing.F) {
 		if len(input) >= inputCap {
 			t.Skip()
 		}
-		if _, err := syntax.Parse(pat, syntax.Perl); err != nil {
+		parsed, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
 			t.Skip() // not a regexp at all
+		}
+		if prog, err := syntax.Compile(parsed.Simplify()); err == nil && len(prog.Inst) > maxNFAInsts {
+			t.Skip() // NFA too large to compile within the fuzz worker's hang deadline — see maxNFAInsts
 		}
 		// Use the compiler's own predicate rather than hasUnsupportedUnicode's
 		// raw-string scan: escapes like \x80 are pure ASCII text but denote a
