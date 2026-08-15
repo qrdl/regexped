@@ -102,6 +102,69 @@ func checkBTMemoryBudget(base int64, extra int64) error {
 	return nil
 }
 
+// ErrBTLoopCountTooLarge is returned when a Backtracking construction's
+// loop-frame-local count (btNumLoopFrameLocals) is large enough that
+// wasmtime's JIT compilation of the resulting module becomes too slow for
+// tools/fuzz's `-fuzz` worker to tolerate (FUZZER_BUGS.md #33 — discovered
+// via FuzzCorrectness/092700-8c386fe83b176a61, a bug-31 regression-corpus
+// entry that still crashed under real `-fuzz` fuzzing, though not under
+// plain seed replay).
+//
+// Root cause, live-verified: this is NOT a Cranelift-internal complexity
+// cliff at a specific loop count, and NOT a regexped code-bloat defect.
+// The pattern family (?:$*<9-10 literal bytes>){N} (bug 31's repro shape)
+// stays on the cheap primary DFA/CompiledDFA path for N up to 113 (its
+// literal-chain state count stays under the default 1024-state cap), where
+// wasmtime.NewModule takes ~25-30ms regardless of table size. At N=114 the
+// chain crosses 1024 states and the pattern falls to the Backtracking
+// engine instead — a structurally different, much more expensive-to-JIT
+// body — producing the apparent "~50x jump" that first looked like a
+// loop-count-triggered cliff but is really an engine-selection regime
+// change coincident with this pattern family's specific literal length.
+//
+// Isolating pure Backtracking-path JIT cost (forcing early BT fallback via
+// a tiny MaxDFAStates, independent of the 1024-state crossover) shows
+// smooth, non-cliff growth: 78ms at 64 loop-frame locals, 294ms at 128,
+// mildly superlinear but not runaway. The real risk this check closes is
+// that once a pattern's *natural* structure (large bounded repeats,
+// independent loop constructs) pushes it into the Backtracking fallback,
+// BT's per-loop JIT cost is high enough per unit that a completely
+// ordinary-looking pattern can cost several seconds of uninterruptible
+// compile time with zero attribution — e.g. ~1.4s at 228 loop-frame locals,
+// ~6.2s at 400, ~12.1s at 510 (bug 32's own ErrBTStackTooLarge already
+// rejects this specific family beyond ~510). tools/fuzz's `-fuzz` worker
+// treats any single call over ~10s as a hang and reports it as a crasher
+// (the same mechanism documented on maxNFAInsts and bug 31); a real caller
+// compiling such a pattern at build time would just see an unexplained
+// multi-second stall.
+var ErrBTLoopCountTooLarge = errors.New("compile: backtracking loop-frame-local count exceeds JIT-safe limit")
+
+// maxBTLoopFrameLocals caps btNumLoopFrameLocals(bt, ...) at every
+// Backtracking code-generation site, before any WASM body is built. 64 is
+// chosen directly from live measurement (see ErrBTLoopCountTooLarge): at
+// exactly this loop-frame-local count, isolated Backtracking-path JIT time
+// is ~78ms — comfortably fast — while every measured case that actually
+// triggered the fuzz-worker crash (228 loop-frame locals and up) sits
+// 3.5x-8x above this cap. Ordinary patterns have at most a handful of
+// independent loop constructs; dozens-to-hundreds only arises from
+// pathological/adversarial or unrolled-large-{N}-repeat shapes like bug
+// 31's repro family, so this cap is not expected to reject realistic
+// patterns.
+const maxBTLoopFrameLocals = 64
+
+// checkBTLoopCount returns ErrBTLoopCountTooLarge if bt's loop-frame-local
+// count is large enough that wasmtime's JIT compilation of the resulting
+// Backtracking body risks costing multiple seconds with zero attribution
+// (see ErrBTLoopCountTooLarge). withCaptureSnapshots must match the value
+// the call site's own btNumLoopFrameLocals call uses (true only for the
+// capture-tracking body).
+func checkBTLoopCount(bt *backtrack, withCaptureSnapshots bool) error {
+	if btNumLoopFrameLocals(bt, withCaptureSnapshots) > maxBTLoopFrameLocals {
+		return ErrBTLoopCountTooLarge
+	}
+	return nil
+}
+
 // EngineType represents the type of regexp engine implementation.
 type EngineType byte
 
@@ -914,6 +977,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
+			if err := checkBTLoopCount(bt, false); err != nil {
+				return nil, err
+			}
 			useMemo := needsBitState(btProg)
 			btBase := utils.PageAlign(cur)
 			matchMemoBudget := resolveMemoBudget(&buildOpts)
@@ -1039,6 +1105,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
+			if err := checkBTLoopCount(bt, false); err != nil {
+				return nil, err
+			}
 			useMemo := needsBitState(btProg)
 			// Choose scan strategy (in priority order):
 			//   1. Multi-byte literal prefix from the (large) LF DFA — no data tables, pure SIMD.
@@ -1430,6 +1499,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			return nil, ErrBTProgramTooLarge
 		}
 		bt := newBacktrack(prog)
+		if err := checkBTLoopCount(bt, true); err != nil {
+			return nil, err
+		}
 
 		// Stack placed directly after all find-mode DFA and lit-anchor tables.
 		// p.tableEnd includes lit-anchor reversed-DFA and SIMD tables when active;

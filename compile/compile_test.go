@@ -1153,25 +1153,83 @@ func TestCompileTDFARegLimitExceededForced(t *testing.T) {
 // (65536·N·(N+1) for this exact shape) past WASM32's 4GiB linear-memory
 // ceiling at N=256. Before the fix this silently returned a WASM module
 // whose memory section was already invalid (fails at
-// wasmtime.NewModule/instantiation time); Compile must now reject it with
-// ErrBTStackTooLarge instead.
+// wasmtime.NewModule/instantiation time); Compile must now reject it.
+//
+// Superseded by FUZZER_BUGS.md #33 (checkBTLoopCount): this exact pattern
+// shape's stackSize growth is driven by the same per-loop frameSize term
+// that also drives its Backtracking-JIT cost, so N=256's 256 loop-frame
+// locals now trip the earlier, more specific ErrBTLoopCountTooLarge before
+// the stack-size arithmetic in checkBTMemoryBudget is even reached — not
+// ErrBTStackTooLarge anymore. checkBTMemoryBudget's own mechanism is
+// unchanged and still guards other pattern shapes that reach a large
+// stackSize without a large loop count.
 func TestCompileBTStackTooLarge(t *testing.T) {
 	pattern := strings.Repeat(`(?:$*llllllll0)`, 256)
 	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
-	if !errors.Is(err, ErrBTStackTooLarge) {
-		t.Fatalf("Compile: err = %v, want ErrBTStackTooLarge", err)
+	if !errors.Is(err, ErrBTLoopCountTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
 	}
 }
 
-// TestCompileBTStackWithinBudget confirms the same pattern shape at a size
-// just under the 4GiB ceiling (N=255) still compiles successfully — the new
-// check in checkBTMemoryBudget must not reject patterns that legitimately
-// fit.
+// TestCompileBTStackWithinBudget — originally confirmed the same pattern
+// shape at a size just under the 4GiB ceiling (N=255) still compiled
+// successfully. FUZZER_BUGS.md #33 supersedes that expectation: N=255 has
+// 255 loop-frame locals, an isolated live measurement of which cost ~12s of
+// wasmtime JIT time (see checkBTLoopCount's doc) — legitimately fitting
+// under WASM32's memory ceiling does not mean it is safe to compile, and
+// checkBTLoopCount now correctly rejects it for that independent reason
+// before checkBTMemoryBudget's arithmetic is reached.
 func TestCompileBTStackWithinBudget(t *testing.T) {
 	pattern := strings.Repeat(`(?:$*llllllll0)`, 255)
 	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
+	if !errors.Is(err, ErrBTLoopCountTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
+	}
+}
+
+// TestCompileBTLoopCountTooLarge — FUZZER_BUGS.md #33
+// (tools/fuzz/testdata/fuzz/FuzzCorrectness/092700-8c386fe83b176a61, itself
+// a bug-31 regression-corpus entry that still crashed real `-fuzz` fuzzing
+// via an unbounded wasmtime JIT-time cost). N=114 sequential
+// `(?:$*llllllll0)` repeats is the exact natural boundary — at the default
+// MaxDFAStates=1024, N=113 stays on the cheap primary DFA/CompiledDFA path
+// (its ~9-byte-per-repeat literal chain needs ~1019 states) while N=114
+// crosses 1024 states and falls to Backtracking, whose 228 loop-frame
+// locals now trip checkBTLoopCount before wasmtime ever sees the module.
+func TestCompileBTLoopCountTooLarge(t *testing.T) {
+	pattern := strings.Repeat(`(?:$*llllllll0)`, 114)
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
+	if !errors.Is(err, ErrBTLoopCountTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
+	}
+}
+
+// TestCompileBTLoopCountWithinBudget confirms N=113 of the same pattern
+// shape — one repeat short of the DFA-state-cap crossing — still compiles
+// successfully via the primary DFA path, unaffected by checkBTLoopCount
+// (which only runs once a pattern actually reaches Backtracking
+// construction).
+func TestCompileBTLoopCountWithinBudget(t *testing.T) {
+	pattern := strings.Repeat(`(?:$*llllllll0)`, 113)
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
+	}
+}
+
+// TestCompileFuzzRepro092700 directly regression-tests the fuzz-discovered
+// crash (FUZZER_BUGS.md #33): tools/fuzz/testdata/fuzz/FuzzCorrectness/
+// 092700-8c386fe83b176a61 crashed `go test -fuzz` because compiling
+// `(?:$*llllllll0){200}` succeeded but took ~6s of wasmtime JIT time with
+// no bound, exceeding the fuzz worker's hang-classification threshold under
+// coverage-instrumentation and multi-worker CPU contention. checkBTLoopCount
+// now rejects it at Compile() time instead, which tools/fuzz's existing
+// ErrBTProgramTooLarge/ErrBTStackTooLarge skip (fuzz_test.go) is extended to
+// also skip on.
+func TestCompileFuzzRepro092700(t *testing.T) {
+	_, _, err := Compile([]config.RegexEntry{{Pattern: `(?:$*llllllll0){200}`, FindFunc: "find"}}, 65536, true)
+	if !errors.Is(err, ErrBTLoopCountTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
 	}
 }
 
