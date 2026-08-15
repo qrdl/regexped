@@ -336,17 +336,22 @@ func altLoopBody(prog *syntax.Prog, idom []int, pc int) (bodyPC, exitPC int, isL
 	case argIsBack && !outIsBack:
 		return int(inst.Arg), int(inst.Out), true
 	case outIsBack && argIsBack:
-		// Both branches test as back edges: prog.Start trivially dominates
-		// every reachable instruction, so a branch targeting it always
-		// passes the dominance test regardless of whether it's a genuine
-		// cycle. When the OTHER branch also targets a real (non-Start)
-		// dominator, that one is the true, more-local inner-loop back edge
-		// (FUZZER_BUGS.md #26 — an InstAlt can simultaneously be an inner
-		// loop's back edge and, via prog.Start, an outer loop's).
-		if int(inst.Arg) == prog.Start && int(inst.Out) != prog.Start {
+		// Both branches test as back edges: pc is simultaneously an inner
+		// loop's own back edge and, via the other branch, an enclosing
+		// loop's continuation point (FUZZER_BUGS.md #26 — first found when
+		// the enclosing loop's continuation happened to be prog.Start
+		// itself, which trivially dominates everything). Discriminate by
+		// dominance between the two targets directly: whichever target
+		// dominates the OTHER target closes the more enclosing loop
+		// relative to this Alt, so the other, dominated target is the
+		// true, more-local inner-loop body (FUZZER_BUGS.md #29 — the
+		// original prog.Start-equality check was only a special case of
+		// this and misfires once a prefix construct pushes prog.Start
+		// outside the affected group).
+		if dominates(idom, int(inst.Arg), int(inst.Out)) {
 			return int(inst.Out), int(inst.Arg), true
 		}
-		if int(inst.Out) == prog.Start && int(inst.Arg) != prog.Start {
+		if dominates(idom, int(inst.Out), int(inst.Arg)) {
 			return int(inst.Arg), int(inst.Out), true
 		}
 		return 0, 0, false

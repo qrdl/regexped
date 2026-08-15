@@ -4201,3 +4201,95 @@ regexps
 -;-;-;-
 0-2 1-1;0-2 1-1;-;-
 0-2 1-1;0-2 1-1;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #29) — altLoopBody's dual-back-edge
+# discriminator (added by bug #26's fix) used `== prog.Start` as a proxy for
+# "this edge closes an enclosing loop, not the inner one" — valid only when
+# the enclosing loop happens to coincide with the whole program's entry
+# point. Once any construct ahead of `(?m:0$*)*` becomes its own NFA node
+# (`1*`, `a*`, `x?`, `1?`, or a bare literal `1`), prog.Start moves into that
+# prefix and the inner `$*` loop's Alt is neither Out==prog.Start nor
+# Arg==prog.Start, so the discriminator falls through to "not a loop",
+# leaving the cycle without a zero-progress guard: the backtrack stack
+# overflows and the overflow-abandon policy discards the correct match
+# frame. Fixed by discriminating via dominance between the two candidate
+# targets directly (whichever target dominates the OTHER is the enclosing
+# edge) instead of comparing either against prog.Start. `1*(?m:0$*)+`
+# (outer `+` instead of `*`) is included as a control: it never reproduces
+# the dual-back-edge shape at all (its own Alt is only reached from inside
+# its body), so it's unaffected by both the bug and the fix. All expected
+# values cross-checked against Go stdlib regexp (col0 = \A(?:PATTERN)\z,
+# col1 = FindStringIndex).
+# ============================================================
+FuzzBug29AltLoopBodyProgStartProxyDoesNotGeneralize
+strings
+""
+"0"
+"1"
+"00"
+"10"
+"01"
+"000"
+"100"
+"0\n"
+regexps
+"1*(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+-;0-1;-;-
+"a*(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;0-0;-;-
+0-2;0-2;-;-
+-;0-0;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+-;0-0;-;-
+-;0-1;-;-
+"x?(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;0-0;-;-
+0-2;0-2;-;-
+-;0-0;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+-;0-0;-;-
+-;0-1;-;-
+"1?(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+-;0-1;-;-
+"1(?m:0$*)*"
+-;-;-;-
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;1-2;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+"1*(?m:0$*)+"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-2;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+-;0-1;-;-
