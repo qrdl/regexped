@@ -83,7 +83,7 @@ func FuzzCorrectness(f *testing.F) {
 
 		wasmBytes, compErr := compileFind(pat)
 		if compErr != nil {
-			if errors.Is(compErr, compile.ErrBTProgramTooLarge) || errors.Is(compErr, compile.ErrBTStackTooLarge) || errors.Is(compErr, compile.ErrBTLoopCountTooLarge) {
+			if errors.Is(compErr, compile.ErrBTProgramTooLarge) || errors.Is(compErr, compile.ErrBTStackTooLarge) || errors.Is(compErr, compile.ErrBTLoopCountTooLarge) || errors.Is(compErr, compile.ErrBTEmptyBodyLoopChainTooLarge) {
 				t.Skip() // legitimate resource ceiling, no further fallback possible — not a regexped bug
 			}
 			t.Fatalf("compile error on a pattern Go stdlib accepts: pat=%q: %v", pat, compErr)

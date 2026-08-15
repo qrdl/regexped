@@ -1217,6 +1217,49 @@ func TestCompileBTLoopCountWithinBudget(t *testing.T) {
 	}
 }
 
+// TestCompileBTEmptyBodyLoopChainTooLarge — FUZZER_BUGS.md #34
+// (tools/fuzz/found/20260815-142901, five repros of
+// `(?m:$*$*...$*0$)`-shaped patterns). 16 chained `$*` compiles fine (well
+// under checkBTLoopCount's JIT-time cap) but takes over a second of
+// wasmtime *runtime* find-call time on a single-byte non-matching input —
+// checkBTEmptyBodyLoopChain now rejects it at Compile() time instead.
+func TestCompileBTEmptyBodyLoopChainTooLarge(t *testing.T) {
+	pattern := `(?m:` + strings.Repeat(`$*`, 16) + `0$)`
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 65536, true)
+	if !errors.Is(err, ErrBTEmptyBodyLoopChainTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTEmptyBodyLoopChainTooLarge", err)
+	}
+}
+
+// TestCompileBTEmptyBodyLoopChainWithinBudget confirms a chain of `$*`
+// exactly at maxBTEmptyBodyGreedyLoops still compiles successfully.
+func TestCompileBTEmptyBodyLoopChainWithinBudget(t *testing.T) {
+	pattern := `(?m:` + strings.Repeat(`$*`, maxBTEmptyBodyGreedyLoops) + `0$)`
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 65536, true)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+}
+
+// TestCompileFuzzRepro143548 directly regression-tests the fuzz-discovered
+// hang (FUZZER_BUGS.md #34):
+// tools/fuzz/found/20260815-142901/143548-4c06db1f6419e310 and four
+// byte-identical-root-cause siblings all hung `go test -fuzz` on
+// `(?m:$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*0$)` (16 chained `$*`) against a
+// single-byte input, because compiling it succeeded but each `find` call
+// took over a second — with no bound, since this project's "runtime over
+// compile time" design principle means find-mode calls have no watchdog in
+// production. checkBTEmptyBodyLoopChain now rejects it at Compile() time
+// instead, which tools/fuzz's existing error skip (fuzz_test.go) is
+// extended to also skip on.
+func TestCompileFuzzRepro143548(t *testing.T) {
+	pattern := `(?m:$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*0$)`
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "find"}}, 65536, true)
+	if !errors.Is(err, ErrBTEmptyBodyLoopChainTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTEmptyBodyLoopChainTooLarge", err)
+	}
+}
+
 // TestCompileFuzzRepro092700 directly regression-tests the fuzz-discovered
 // crash (FUZZER_BUGS.md #33): tools/fuzz/testdata/fuzz/FuzzCorrectness/
 // 092700-8c386fe83b176a61 crashed `go test -fuzz` because compiling

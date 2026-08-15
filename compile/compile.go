@@ -165,6 +165,78 @@ func checkBTLoopCount(bt *backtrack, withCaptureSnapshots bool) error {
 	return nil
 }
 
+// ErrBTEmptyBodyLoopChainTooLarge is returned when a Backtracking
+// construction's count of bt.emptyBodyGreedyLoop heads is large enough that
+// a single find/match/groups call risks costing multiple seconds at
+// *runtime* — a distinct failure mode from ErrBTLoopCountTooLarge, which
+// only bounds one-time JIT compile cost (FUZZER_BUGS.md #34, discovered via
+// tools/fuzz/found repros of `(?m:$*$*...$*0$)`-shaped patterns, e.g. 16
+// chained `$*`).
+//
+// Root cause, live-verified: every pushed backtrack frame snapshots *all*
+// loop_pos/loop_entry trackers (btNumLoopFrameLocals), not just the pushing
+// loop's own. Restoring an EARLIER loop's frame (e.g. during downstream
+// unwinding after a later, unrelated match failure) resets every LATER
+// loop's tracker back to its pre-visit ("unprimed") value, forcing each
+// later loop in the chain to redo its own push-and-resolve cycle from
+// scratch — including re-pushing its own first-entry twin frame, which is
+// itself indistinguishable from a genuine fresh entry once the trackers are
+// unprimed (an emptyBodyGreedyLoop's twin frame cannot be skipped
+// unconditionally: its body's "matches empty" branch can be a *conditional*
+// zero-width assertion — e.g. `\b` in `.(?:\b|0)*` — that legitimately fails
+// at a given position, in which case the twin's pushed frame is the only
+// path back to "zero iterations of this star", so removing it breaks
+// correctness; confirmed live by a reverted attempt at exactly this skip,
+// which produced a wrong "no match" for `.(?:\b|0)*` against `" "`, expected
+// `[0,1)`). For N loops chained in straight-line sequence with an
+// always-failing tail, the unprimed-replay cost compounds multiplicatively:
+// confirmed live via wasmtime call timing on `(?m:` + `$*`×N + `0$)` against
+// a non-matching single-byte input — call time crosses 33ms at N=13, 101ms
+// at N=14, 342ms at N=15, 1.03s at N=16, 9.9s at N=18 — all while compiled
+// WASM size and Compile() time itself stay small and linear, confirming the
+// blowup is execution-time-only, invisible to ErrBTLoopCountTooLarge's
+// JIT-time-based cap (which permits far more than 14 such loops for this
+// pattern shape, well past where runtime cost already becomes
+// unacceptable). Per CLAUDE.md's "runtime over compile time" principle, an
+// unbounded runtime cost is worse than an unbounded compile-time cost, so
+// this is rejected at compile time rather than left for a caller to
+// discover as an unexplained multi-second `find`/`match` call.
+//
+// Eliminating the underlying exponential (e.g. by memoising each
+// emptyBodyGreedyLoop head's resolved outcome per-position via the existing
+// BitState mechanism, or by snapshotting only the loop trackers actually
+// live past a given push instead of all of them) was not attempted here:
+// this exact loop-head logic has a documented history of subtle correctness
+// regressions from well-intentioned changes (see bt.memoInnerLoop's doc,
+// FUZZER_BUGS.md #18's two reverted fix attempts, and this bug's own
+// reverted twin-skip attempt above) and deserves its own carefully-measured
+// change, not a fix folded into an unrelated bug report. A compile-time cap
+// is the safe, narrowly-scoped mitigation for now.
+var ErrBTEmptyBodyLoopChainTooLarge = errors.New("compile: backtracking empty-body-loop chain length exceeds runtime-safe limit")
+
+// maxBTEmptyBodyGreedyLoops caps len(bt.emptyBodyGreedyLoop) at every
+// Backtracking code-generation site, before any WASM body is built. 12 is
+// chosen directly from live measurement (see
+// ErrBTEmptyBodyLoopChainTooLarge's doc): call time at N=12 chained `$*` is
+// ~9.5ms (comfortably fast, same bar bug 33 used for its own JIT-time cap),
+// while N=14 already reaches ~101ms and every couple of steps beyond
+// roughly triples again. Ordinary patterns have at most a handful of
+// independent nullable loops; a long straight-line chain of them only
+// arises from pathological/adversarial or mechanically-unrolled shapes, so
+// this cap is not expected to reject realistic patterns.
+const maxBTEmptyBodyGreedyLoops = 12
+
+// checkBTEmptyBodyLoopChain returns ErrBTEmptyBodyLoopChainTooLarge if bt
+// has more than maxBTEmptyBodyGreedyLoops emptyBodyGreedyLoop heads — see
+// ErrBTEmptyBodyLoopChainTooLarge's doc for the runtime-cost mechanism this
+// guards against.
+func checkBTEmptyBodyLoopChain(bt *backtrack) error {
+	if len(bt.emptyBodyGreedyLoop) > maxBTEmptyBodyGreedyLoops {
+		return ErrBTEmptyBodyLoopChainTooLarge
+	}
+	return nil
+}
+
 // EngineType represents the type of regexp engine implementation.
 type EngineType byte
 
@@ -980,6 +1052,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			if err := checkBTLoopCount(bt, false); err != nil {
 				return nil, err
 			}
+			if err := checkBTEmptyBodyLoopChain(bt); err != nil {
+				return nil, err
+			}
 			useMemo := needsBitState(btProg)
 			btBase := utils.PageAlign(cur)
 			matchMemoBudget := resolveMemoBudget(&buildOpts)
@@ -1106,6 +1181,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
 			if err := checkBTLoopCount(bt, false); err != nil {
+				return nil, err
+			}
+			if err := checkBTEmptyBodyLoopChain(bt); err != nil {
 				return nil, err
 			}
 			useMemo := needsBitState(btProg)
@@ -1500,6 +1578,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 		bt := newBacktrack(prog)
 		if err := checkBTLoopCount(bt, true); err != nil {
+			return nil, err
+		}
+		if err := checkBTEmptyBodyLoopChain(bt); err != nil {
 			return nil, err
 		}
 
