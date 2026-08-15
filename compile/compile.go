@@ -72,6 +72,36 @@ const maxBTFallbackInstructions = 20000
 // prefix.
 const maxBTFallbackPrefixLen = 64
 
+// ErrBTStackTooLarge is returned whenever the Backtracking engine's stack
+// reservation (btAllocSizes' stackSize, or the capture-tracking path's
+// equivalent inline computation) would push the module's own linear memory
+// requirement past what WASM32 can declare (65536 pages × 64KiB = 4GiB).
+// stackSize scales with bt.numAlts and per-loop frame-local count, both of
+// which grow with ordinary pattern structure (repeated groups, nested
+// loops) rather than anything pathological — an unremarkable-looking
+// bounded-repeat pattern can cross this ceiling well within this project's
+// normal pattern-size range. Without this check, Compile silently returns a
+// WASM module whose memory section is already invalid: it fails at
+// wasmtime.NewModule/instantiation time with a generic "memory size must be
+// at most 0x10000 pages" error instead of failing compilation with a clear,
+// attributable error (FUZZER_BUGS.md #32).
+var ErrBTStackTooLarge = errors.New("compile: backtracking stack reservation exceeds WASM's 4GiB memory limit")
+
+// maxWasmMemoryBytes is WASM32's hard linear-memory ceiling: a memory
+// section cannot declare more than 65536 pages of 65536 bytes each.
+const maxWasmMemoryBytes = 1 << 32
+
+// checkBTMemoryBudget returns ErrBTStackTooLarge if base+extra bytes would
+// require declaring more linear memory than maxWasmMemoryBytes allows.
+// base is the page-aligned address the reservation starts at (btBase);
+// extra is the reservation's own size (stack, plus memo table when present).
+func checkBTMemoryBudget(base int64, extra int64) error {
+	if base+extra > maxWasmMemoryBytes {
+		return ErrBTStackTooLarge
+	}
+	return nil
+}
+
 // EngineType represents the type of regexp engine implementation.
 type EngineType byte
 
@@ -888,6 +918,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			btBase := utils.PageAlign(cur)
 			matchMemoBudget := resolveMemoBudget(&buildOpts)
 			btStackSize, btMemoSize := btAllocSizes(bt, useMemo, 0, matchMemoBudget)
+			if err := checkBTMemoryBudget(btBase, int64(btStackSize)+int64(btMemoSize)); err != nil {
+				return nil, err
+			}
 			btStackBase := int32(btBase)
 			btStackLimit := btStackBase + int32(btStackSize)
 			var btMemoBase int32
@@ -1053,6 +1086,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			btBase := utils.PageAlign(cur + int64(len(btScanDataBytes)))
 			memoBudget := resolveMemoBudget(&buildOpts)
 			btStackSize, btMemoSize := btAllocSizes(bt, useMemo, 0, memoBudget)
+			if err := checkBTMemoryBudget(btBase, int64(btStackSize)+int64(btMemoSize)); err != nil {
+				return nil, err
+			}
 			btStackBase := int32(btBase)
 			btStackLimit := btStackBase + int32(btStackSize)
 			var btMemoBase int32
@@ -1406,6 +1442,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			maxFrames = 4096
 		}
 		stackSize := maxFrames * frameSize
+		if err := checkBTMemoryBudget(btBase, int64(stackSize)); err != nil {
+			return nil, err
+		}
 		stackBase := int32(btBase)
 		stackLimit := stackBase + int32(stackSize)
 

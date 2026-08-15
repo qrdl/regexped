@@ -2,6 +2,7 @@ package compile
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp/syntax"
@@ -1142,6 +1143,35 @@ func TestCompileTDFARegLimitExceededForced(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("compilePattern: %v", err)
+	}
+}
+
+// TestCompileBTStackTooLarge — FUZZER_BUGS.md #32. A no-capture find
+// pattern shaped like N sequential `(?:$*<literal>)` groups drives the
+// Backtracking find-fallback's DFA past MaxDFAStates (the DFA-too-large
+// gate that routes it to Backtracking), and btAllocSizes' stackSize formula
+// (65536·N·(N+1) for this exact shape) past WASM32's 4GiB linear-memory
+// ceiling at N=256. Before the fix this silently returned a WASM module
+// whose memory section was already invalid (fails at
+// wasmtime.NewModule/instantiation time); Compile must now reject it with
+// ErrBTStackTooLarge instead.
+func TestCompileBTStackTooLarge(t *testing.T) {
+	pattern := strings.Repeat(`(?:$*llllllll0)`, 256)
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
+	if !errors.Is(err, ErrBTStackTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTStackTooLarge", err)
+	}
+}
+
+// TestCompileBTStackWithinBudget confirms the same pattern shape at a size
+// just under the 4GiB ceiling (N=255) still compiles successfully — the new
+// check in checkBTMemoryBudget must not reject patterns that legitimately
+// fit.
+func TestCompileBTStackWithinBudget(t *testing.T) {
+	pattern := strings.Repeat(`(?:$*llllllll0)`, 255)
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
 	}
 }
 
