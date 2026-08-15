@@ -12593,18 +12593,28 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 		locVerifyTlo    byte = 12
 		locVerifyPow2   byte = 13
 		locWindowBase   byte = 14 // base of the currently-loaded 16-byte SIMD window
+		// locScalarByte is a same-iteration byte-value scratch for
+		// emitScalarBitmapVerify. It must NOT alias locMask: unlike the
+		// strict path (buildLitChainAltFindBody), where a failed branch
+		// verify loops back to a fresh emitPrefixScan that recomputes the
+		// mask from scratch, this lenient path persists locMask across
+		// $lit_outer iterations (the whole point of the window-scan
+		// optimisation above) — a branch verify that fails must leave
+		// locMask untouched so the next iteration can resume from it. See
+		// plans/FUZZER_BUGS.md bug 30.
+		locScalarByte byte = 15
 	)
 
 	var b []byte
-	// Local declarations: 7 i32 + 5 v128 + 1 i32 (locWindowBase, added on top
-	// to avoid renumbering the existing i32/v128 groups above).
+	// Local declarations: 7 i32 + 5 v128 + 2 i32 (locWindowBase, locScalarByte
+	// — added on top to avoid renumbering the existing i32/v128 groups above).
 	b = append(b, 0x03)       // 3 local groups
 	b = append(b, 0x07, 0x7F) // 7 × i32
 	b = append(b, 0x05, 0x7B) // 5 × v128 (indices 10,11 — formerly Teddy table
 	// locals — are now unused: emitShuftiPrefixCheck below inlines its
 	// nibble tables as v128.const, so no pre-loaded per-call Teddy table is
 	// needed. Left declared to avoid renumbering locVerifyTlo/locVerifyPow2.)
-	b = append(b, 0x01, 0x7F) // 1 × i32 (locWindowBase)
+	b = append(b, 0x02, 0x7F) // 2 × i32 (locWindowBase, locScalarByte)
 
 	// Hoist the power-of-two lookup vector once, shared by every lit-chain
 	// branch's class verify (emitLitChainAltLitBranchBody requires the
@@ -12707,7 +12717,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	// needs the identical dispatch code).
 	locals := litChainBranchLocals{
 		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
-		SimdMask: locScalarIdx, ScalarIdx: locScalarIdx,
+		SimdMask: locScalarByte, ScalarIdx: locScalarIdx,
 		Chunk: locChunk, VerifyTlo: locVerifyTlo, VerifyPow2: locVerifyPow2,
 	}
 	// emitBranch emits the dispatch code for exactly one branch (its own

@@ -4293,3 +4293,54 @@ regexps
 0-3;0-3;-;-
 0-3;0-3;-;-
 -;0-1;-;-
+# ============================================================
+# Category: Bug 30 — lenient lit-chain alternation scalar class-verify
+# aliases its byte scratch local onto its own loop counter
+# ============================================================
+# `(?:z0{15})|(?:00$0)` (non-capturing so --validate-groups doesn't also
+# check submatches, orthogonal to this bug): branch 1 is a lit-chain
+# (literal "z" + class {0} repeated 15 times, len+count=16 qualifies for
+# the lit-chain-alt lenient frontend); branch 2 (`00$0`) contains an unsatisfiable `\z` mid-pattern
+# and can never match, so expected behavior equals plain `z0{15}` alone.
+# buildLitChainAltLenientFindBody's litChainBranchLocals wired SimdMask
+# and ScalarIdx to the SAME local (engine_dfa.go); emitScalarBitmapVerify
+# uses SimdMask as a same-iteration byte-value scratch while ScalarIdx must
+# survive as the live loop counter — aliasing them corrupts the counter
+# after checking only the first repeated-class byte, causing the verify
+# loop to report success after verifying just 1 of the 15 required zeros.
+# `z100000000000000` covers immediate failure (wrong byte at rep 0);
+# `z000000000000001` is the minimized repro (14 correct zeros then a
+# mismatch at rep 14); `z000000000000000`/`z0000000000000000` confirm a
+# genuine full match still succeeds after the fix; `xxz000000000000000`
+# confirms the persistent-mask frontend scan still finds a non-zero-offset
+# match. All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug30LenientLitChainScalarVerifyLocalAliasing
+strings
+""
+"z"
+"z0"
+"z100000000000000"
+"z000000000000001"
+"z000000000000000"
+"z0000000000000000"
+"xxz000000000000000"
+regexps
+"(?:z0{15})|(?:00$0)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-16;0-16;-;-
+-;0-16;-;-
+-;2-18;-;-
+"(?:00$0)|(?:z0{15})"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-16;0-16;-;-
+-;0-16;-;-
+-;2-18;-;-
