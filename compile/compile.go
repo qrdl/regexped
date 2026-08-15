@@ -55,6 +55,23 @@ var ErrBTProgramTooLarge = errors.New("compile: backtracking fallback program ex
 // tiny-MaxDFAStates-forced) DFA-too-large fallback path.
 const maxBTFallbackInstructions = 20000
 
+// maxBTFallbackPrefixLen caps the length of the mandatory-literal prefix
+// (computePrefix's result) used to build the Backtracking find fallback's
+// SIMD/scalar prefix-scan optimisation (FUZZER_BUGS.md #31). The prefix is
+// purely a candidate pre-filter — the BT matcher re-verifies every
+// candidate position independently, so truncating it changes nothing about
+// correctness, only how many candidate positions the scan lets through.
+// Without a cap, computePrefix(table) can return the DFA-too-large table's
+// entire literal chain (confirmed: ~1800-2000 bytes on the repro patterns,
+// one DFA state per byte of chain), and emitPrefixScan's scalar tail
+// (prefix_scan.go) unrolls one fixed WASM comparison block per prefix byte
+// with no length cap of its own — ~24-27 bytes/prefix-byte, additive to
+// whatever maxBTFallbackInstructions already allows the rest of the BT
+// body to cost. 64 bytes keeps that addition negligible (~1.7KB worst
+// case) while still filtering effectively for any realistic literal
+// prefix.
+const maxBTFallbackPrefixLen = 64
+
 // EngineType represents the type of regexp engine implementation.
 type EngineType byte
 
@@ -1006,6 +1023,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			var btPrefix []byte
 			if table != nil {
 				btPrefix = computePrefix(table)
+				if len(btPrefix) > maxBTFallbackPrefixLen {
+					btPrefix = btPrefix[:maxBTFallbackPrefixLen]
+				}
 			}
 			if len(btPrefix) >= 2 {
 				// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
