@@ -289,9 +289,12 @@ export function* %[1]s(input) {
     }
     _resize(b.length);
     _mem.set(b, _inBase);
+    // Hoisted out of the loop: _mem.buffer and _outBase are both loop-invariant
+    // (_resize already ran, and nothing inside the loop grows the memory), so
+    // constructing the view per match was pure overhead. See plans/OPUS.md §N6a.
+    const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
     let off = 0;
     while (off <= b.length) {
-        const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
         slots.fill(-1);
         if (_exp['%[1]s'](_inBase + off, b.length - off, _outBase) < 0) {
             if (off === b.length) break;
@@ -379,9 +382,12 @@ export function* %[1]s(input) {
     }
     _resize(b.length);
     _mem.set(b, _inBase);
+    // Hoisted out of the loop: _mem.buffer and _outBase are both loop-invariant
+    // (_resize already ran, and nothing inside the loop grows the memory), so
+    // constructing the view per match was pure overhead. See plans/OPUS.md §N6a.
+    const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
     let off = 0;
     while (off <= b.length) {
-        const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
         slots.fill(-1);
         if (_exp['%[2]s'](_inBase + off, b.length - off, _outBase) < 0) {
             if (off === b.length) break;

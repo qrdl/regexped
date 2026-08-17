@@ -67,6 +67,23 @@ func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []stri
 
 // moduleNameForWasm returns the import_module name for a given WASM file.
 // Uses cfg.ImportModule if set; falls back to the basename without extension.
+//
+// When cfg.ImportModule is set, EVERY regex module is handed the same name.
+// That is deliberate and safe — do not "fix" it by deriving unique per-module
+// names. wasm-merge uses this name only to resolve imports *between* the merged
+// inputs, and a regexped regex module imports exactly one thing:
+// "main"."memory". Nothing imports the regex module's own name, so it is a
+// provider label with no consumers and duplicates cannot be ambiguous. The one
+// name that IS imported ("main", passed for the host module) is unique.
+//
+// Verified empirically against Binaryen 132: two distinct regex modules merged
+// under the same name produce a module whose exports each bind to their own DFA
+// tables and memory, confirmed by executing both under wasmtime including
+// negative cases. See plans/OPUS.md §N12.
+//
+// This rests on the import invariant above. If regex modules ever gain
+// inter-module imports, revisit: they would then need unique names, while still
+// exposing the host-facing import name the generated stubs expect.
 func moduleNameForWasm(cfg config.BuildConfig, path string) string {
 	if cfg.ImportModule != "" {
 		return cfg.ImportModule

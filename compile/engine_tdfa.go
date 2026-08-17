@@ -1,9 +1,9 @@
 package compile
 
 import (
-	"fmt"
 	"regexp/syntax"
 	"sort"
+	"strconv"
 
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -163,16 +163,27 @@ func sequentializeCopies(copyOps []tdfaTagOp) []tdfaTagOp {
 }
 
 // keyString serialises a tdfaStateKey to a map-friendly string.
+//
+// Uses strconv.AppendInt rather than fmt.Appendf: this function was measured at
+// 42% of total newTDFA wall time (pprof, 8-group CSV pattern — 88 ms to build a
+// 16-state automaton), essentially all of it inside fmt's reflection-based
+// integer formatting, called once per register per thread per state. See
+// plans/OPUS.md §N8. The emitted bytes are identical to what "%d" produced —
+// including negative register values, which regMap uses for "unset" (-1) and
+// scratchRegSentinel (-2) — so DFA state ordering and every downstream
+// fuel/size baseline are unaffected.
 func (k *tdfaStateKey) keyString() string {
 	// Format: repeated "(pc:[r0,r1,...])W?" sorted by pc.
 	b := make([]byte, 0, 64)
 	for _, t := range k.threads {
-		b = fmt.Appendf(b, "(%d:[", t.pc)
+		b = append(b, '(')
+		b = strconv.AppendInt(b, int64(t.pc), 10)
+		b = append(b, ':', '[')
 		for i, r := range t.regMap {
 			if i > 0 {
 				b = append(b, ',')
 			}
-			b = fmt.Appendf(b, "%d", r)
+			b = strconv.AppendInt(b, int64(r), 10)
 		}
 		b = append(b, ']', ')')
 	}
@@ -1287,10 +1298,17 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 			count int
 		}
 		var groups []opsGroup
+		// strconv.AppendInt, not fmt.Appendf — same reasoning as keyString's doc
+		// comment (plans/OPUS.md §N8), and this runs once per transition entry,
+		// i.e. up to 256 times per state. Byte-identical to "%d:%d," including
+		// negative dst/src (-1 = assign-from-pos, -2 = scratchRegSentinel).
 		keyFor := func(ops []tdfaTagOp) string {
 			s := make([]byte, 0, len(ops)*8)
 			for _, op := range ops {
-				s = fmt.Appendf(s, "%d:%d,", op.dst, op.src)
+				s = strconv.AppendInt(s, int64(op.dst), 10)
+				s = append(s, ':')
+				s = strconv.AppendInt(s, int64(op.src), 10)
+				s = append(s, ',')
 			}
 			return string(s)
 		}
