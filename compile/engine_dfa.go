@@ -10650,12 +10650,18 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 		locOutEnd      byte = 8 // DFA verify last_accept
 		locScalarIdx   byte = 9 // scalar bitmap verify counter / is_word scratch
 		locAttemptZero byte = 10
+		// locScalarByte is a same-iteration byte-value scratch for
+		// emitScalarBitmapVerify. It must NOT alias locScalarIdx, which
+		// must survive as the live loop counter across iterations — see
+		// plans/FUZZER_BUGS.md bug 38 (recurrence of bug 30's aliasing
+		// defect in this sibling anchored-match body).
+		locScalarByte byte = 11
 	)
 
-	// 3 × v128 + 6 × i32 locals.
+	// 3 × v128 + 7 × i32 locals.
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7B)
-	b = append(b, 0x06, 0x7F)
+	b = append(b, 0x07, 0x7F)
 
 	// Materialise pow2 once.
 	b = emitV128Const(b, pow2VecConst)
@@ -10663,7 +10669,7 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 
 	branchLocals := litChainBranchLocals{
 		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptZero,
-		SimdMask: locScalarIdx, ScalarIdx: locScalarIdx,
+		SimdMask: locScalarByte, ScalarIdx: locScalarIdx,
 		Chunk: locChunk, VerifyTlo: locTLo, VerifyPow2: locPow2,
 	}
 
@@ -10793,7 +10799,7 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 				b = append(b, 0x20, locLen)
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, int32(len(br.literal)))
-				b = append(b, 0x4B)       // i32.lt_u
+				b = append(b, 0x49)       // i32.lt_u
 				b = append(b, 0x0D, 0x00) // br_if $next_branch_i (literal can't fit)
 
 				b = emitLiteralByteVerify(b, br.literal, locPtr, locAttemptZero)
