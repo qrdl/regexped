@@ -787,7 +787,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// TDFA's find phase (linear DFA scan) with the Teddy frontend; keep
 		// TDFA-correct capture semantics for DFA branches.
 		if !needMatch {
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern); ok {
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok {
 				parsed, perr := syntax.Parse(re.Pattern, syntax.Perl)
 				if perr == nil && parsed.MaxCap() > 0 {
 					prog, cerr := syntax.Compile(parsed.Simplify())
@@ -918,7 +918,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				return p, nil
 			}
 			// Gap B lenient: anchored match for mixed lit-chain + DFA branches.
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern); ok {
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, false); ok {
 				layout := planLenAltLayout(lenAltp, tableBase)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				p := &compiledPattern{
@@ -990,7 +990,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// Phase 2a: lenient alternation — at least one branch is non-lit-chain
 			// but starts with a literal. DFA branches are inlined as anchored DFA
 			// verifies from the candidate position.
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern); ok {
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok {
 				layout := planLenAltLayout(lenAltp, tableBase)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				body := buildLitChainAltLenientFindBody(lenAltp, layout, buildOpts.tableMemIdx)

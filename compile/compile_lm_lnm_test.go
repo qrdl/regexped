@@ -1000,7 +1000,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChainAltPrefixed(`[`); ok {
 			t.Errorf("analyseLitChainAltPrefixed accepted invalid syntax")
 		}
-		if _, ok := analyseLitChainAltLenient(`[`); ok {
+		if _, ok := analyseLitChainAltLenient(`[`, true); ok {
 			t.Errorf("analyseLitChainAltLenient accepted invalid syntax")
 		}
 	})
@@ -1055,7 +1055,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChainAltPrefixed(`[0-9]{8}ghp_[A-Za-z0-9]{36}`); ok {
 			t.Errorf("analyseLitChainAltPrefixed accepted single branch")
 		}
-		if _, ok := analyseLitChainAltLenient(`ghp_[A-Za-z0-9]{36}`); ok {
+		if _, ok := analyseLitChainAltLenient(`ghp_[A-Za-z0-9]{36}`, true); ok {
 			t.Errorf("analyseLitChainAltLenient accepted single branch")
 		}
 	})

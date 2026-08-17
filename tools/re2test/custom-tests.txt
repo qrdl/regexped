@@ -4344,3 +4344,48 @@ regexps
 0-16;0-16;-;-
 -;0-16;-;-
 -;2-18;-;-
+# ============================================================
+# FuzzBug35LenientLitChainAltBranchLeftmostFirst: FUZZER_BUGS.md bug 35.
+# analyseLitChainAltLenient's per-branch helper DFA (the "lenient
+# literal-chain alternation" find fast path, engine_dfa.go) compiled each
+# non-lit-chain branch leftmost-*longest* instead of leftmost-*first*. A
+# branch with its own internal ambiguity (`0(|0)`'s empty alternative,
+# `a0??`'s zero-repetition preference) then picked the longest completion
+# instead of the RE2/Perl-correct shortest one. `0(|0)|1$0` / `0(|0)|1$`
+# reproduce via a second, always-dead-for-this-input branch containing an
+# assertion between two literals (`1$0`/`1$`) — purely a fusion-blocker for
+# Go's regexp/syntax literal-fusion pass, not itself relevant to the match;
+# `(0$|a0??)` / `a0??|1$` are the `a0??` sibling shape. The first three
+# patterns have a capture group, so this file's dispatch compiles them
+# groups-only (no separate matchFn) — col0 is therefore validated against
+# non-anchored groups() filtered to start==0 (this file's own
+# groupsFn-vs-matchFn contract, see main.go ~line 518-521), NOT full-string
+# anchored match; `a0??|1$` has no capture, compiles match+find, and col0
+# there really is anchored full-match (LL). All values cross-checked
+# against live `regexp.FindStringSubmatchIndex` (col0, filtered to
+# start==0, submatch spans space-separated) and `FindStringIndex` (col1) —
+# except `a0??|1$`'s col0, which is `\A(?:pattern)\z` (anchored, matches
+# the matchFn contract it actually compiles under).
+# ============================================================
+FuzzBug35LenientLitChainAltBranchLeftmostFirst
+strings
+""
+"00"
+"a0"
+regexps
+"0(|0)|1$0"
+-;-;-;-
+0-1 1-1;0-1;-;-
+-;1-2;-;-
+"0(|0)|1$"
+-;-;-;-
+0-1 1-1;0-1;-;-
+-;1-2;-;-
+"(0$|a0??)"
+-;-;-;-
+-;1-2;-;-
+0-1 0-1;0-1;-;-
+"a0??|1$"
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-

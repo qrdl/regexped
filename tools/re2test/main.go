@@ -60,6 +60,7 @@ func main() {
 	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
 	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
 	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
+	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's Gap B lenient path) that match+find-together dispatch never exercises — see plans/TODO.md task 52")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -67,13 +68,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly); err != nil {
+	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly, *matchOnly); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool, likelyNoMatch bool, groupsOnly bool) error {
+func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool, likelyNoMatch bool, groupsOnly bool, matchOnly bool) error {
 	f, err := os.Open(testFile)
 	if err != nil {
 		return err
@@ -261,7 +262,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 			if !patternHasCaptures {
 				re.MatchFunc = "match"
-				re.FindFunc = "find"
+				if !matchOnly {
+					re.FindFunc = "find"
+				}
 			}
 			if patternHasCaptures || engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA {
 				re.GroupsFunc = "groups"

@@ -12258,11 +12258,23 @@ type lenAltPattern struct {
 
 // analyseLitChainAltLenient detects an OpAlternate whose every branch begins
 // with an OpLiteral and where at least one branch is NOT lit-chain shape (else
-// the strict path is preferred). Each non-lit-chain branch is compiled as an
-// anchored DFA (leftmost-longest, leftmostFirst=false), capped at 256 states.
+// the strict path is preferred). Each non-lit-chain branch is compiled as its
+// own anchored DFA, capped at 256 states.
 //
-// Caller still gates by LikelyMatch + no-captures.
-func analyseLitChainAltLenient(pattern string) (*lenAltPattern, bool) {
+// leftmostFirst selects that helper DFA's semantics and must match the
+// caller's own acceptance contract: find-mode callers (leftmostFirst=true)
+// want RE2/Perl priority for a branch's own internal ambiguity (e.g.
+// `0(|0)`'s empty alternative or `a0??`'s zero-repetition preference) so the
+// immediate-accept-pruned DFA stops exactly where a real find would.
+// Anchored-match callers (leftmostFirst=false) need leftmost-*longest*
+// instead: a full-string match may require retrying a lower-priority
+// alternative when the higher-priority one doesn't reach end-of-string, and
+// leftmostFirst's immediate-accept pruning would kill that thread before it
+// gets the chance. See plans/FUZZER_BUGS.md bug 35 — this was previously
+// hard-coded false (leftmost-longest) for every caller, which silently
+// mismatched RE2/Perl semantics for find-mode callers whenever a branch had
+// its own internal ambiguity.
+func analyseLitChainAltLenient(pattern string, leftmostFirst bool) (*lenAltPattern, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, false
@@ -12324,7 +12336,7 @@ func analyseLitChainAltLenient(pattern string) (*lenAltPattern, bool) {
 		if needsUnicodeSupport(prog) {
 			return nil, false
 		}
-		d, dOk := newDFA(prog, false, false, maxHelperDFAStates)
+		d, dOk := newDFA(prog, false, leftmostFirst, maxHelperDFAStates)
 		if !dOk {
 			return nil, false
 		}
