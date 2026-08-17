@@ -4419,3 +4419,131 @@ regexps
 -;13-14;-;-
 -;14-15;-;-
 -;15-16;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #37): a preceding star/bounded-repeat that
+# altLoopBody misclassifies as a non-loop both skips its own zero-progress
+# guard and corrupts the *following* loop's zero-progress reference
+# position. Two compounding defects in compile/engine_backtrack.go:
+#
+# 1. altLoopBody's dominance test can never recognize a back edge into
+#    pc==prog.Start (computeDominators sets idom[prog.Start]==prog.Start —
+#    the root has no proper dominator — so dominates(idom, v, pc) can't
+#    succeed for any v != pc even when a genuine cycle loops back into pc).
+#    Any `*`/bounded-repeat/`.`-star/grouped-star sitting at the very start
+#    of a pattern lands its own Alt at prog.Start and is silently treated
+#    as a non-loop.
+# 2. bt.loopEntryOf (a single map, pre-fix) recorded a candidate PC as an
+#    external entry into a later emptyBodyGreedyLoop's body whenever
+#    EITHER of its Out/Arg edges targeted that loop's bodyStart, but the
+#    write was only ever emitted at the Out-edge transition site (contOut).
+#    Whenever the qualifying edge was actually Arg (the common case for a
+#    loop's own exit branch, or a chained non-loop Alt's fallthrough), the
+#    write fired on the wrong transition (or never fired on the right one),
+#    leaving `(\B|0)+`'s own zero-progress guard reading a stale position
+#    left over from an unrelated earlier write — wrongly concluding real
+#    progress happened and resurrecting the already-suppressed lower-
+#    priority `0` sibling that `\B`'s higher-priority resolution should
+#    have permanently ruled out.
+#
+# `1*`/`1{0,2}`/`[12]*`/`.*`/`(?:11)*` immediately before `(?:\B|0)+` each
+# hit defect 2 (chained non-loop Alts whose Arg edge feeds the following
+# loop); `1*` additionally hits defect 1 (its own Alt sits at prog.Start).
+# `1?` (no back edge at all), `1+` (mandatory predecessor, so its Alt's
+# idom already walks past prog.Start), and `11*` (mandatory `1` prefix
+# gives the star's Alt a real predecessor too) are included as controls —
+# structurally adjacent shapes confirmed unaffected by either defect.
+# All expected values cross-checked against Go stdlib regexp (col0 =
+# \A(?:PATTERN)\z.FindStringIndex; col1 = FindStringIndex).
+# ============================================================
+FuzzBug37AltLoopBodyMisclassifiedEntryPositionCorruption
+strings
+""
+"0"
+"1"
+"10"
+"11"
+"100"
+"1100"
+"12"
+"110"
+regexps
+"1*(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+"1{0,2}(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+"[12]*(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+".*(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+0-4;0-3;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+"(?:11)*(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;1-1;-;-
+-;1-1;-;-
+-;1-1;-;-
+0-4;0-2;-;-
+-;1-1;-;-
+0-3;0-2;-;-
+"1?(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+"1+(?:\\B|0)+"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+"11*(?:\\B|0)+"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-

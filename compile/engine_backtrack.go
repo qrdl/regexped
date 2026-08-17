@@ -67,8 +67,10 @@ type backtrack struct {
 	// leading unconditionally into one inner self-looping PC).
 	memoInnerLoop map[int]bool
 
-	// loopEntryOf maps a loop's first-entry twin PC to its registered loop
-	// head PC, for every emptyBodyGreedyLoop head. Go's compiler emits a
+	// loopEntryOutOf/loopEntryArgOf map a loop's first-entry twin PC to its
+	// registered loop head PC, for every emptyBodyGreedyLoop head — split by
+	// which of the candidate's two successor edges (Out or Arg) is the one
+	// that actually targets the loop's bodyStart. Go's compiler emits a
 	// separate, non-cyclic InstAlt for a captured star's very first entry
 	// (identical Out/Arg to the genuine, back-edged loop head, but not
 	// itself reached via a back edge, hence bt.loops[pc]==false for it) —
@@ -79,17 +81,27 @@ type backtrack struct {
 	// empty-matching iteration is this loop's very first (nothing to
 	// resurrect) or came after real progress (a same-iteration sibling must
 	// still get its turn). See emitBTInstHandler's InstAlt case.
-	loopEntryOf map[int]int
+	//
+	// The split matters because Out and Arg are instrumented at entirely
+	// different emission sites: an Out-edge candidate's transfer happens at
+	// contOut (immediate, unconditional); an Arg-edge candidate's transfer
+	// happens either via a direct exit branch or via a pushed-then-later-
+	// popped retry frame. A single unsplit map (the original design) always
+	// instrumented the Out site regardless of which edge actually matched,
+	// silently corrupting loopEntryLocalIdx whenever the qualifying edge was
+	// Arg — see FUZZER_BUGS.md #37.
+	loopEntryOutOf map[int]int
+	loopEntryArgOf map[int]int
 
 	// loopEntryAtStart is the emptyBodyGreedyLoop[] subset whose body starts
 	// at prog.Start itself — e.g. `(?:a??){1,}` with nothing preceding the
 	// loop at all. There, no instruction "flows into" the body from
-	// outside (loopEntryOf has no entry for this head): the very first
-	// dispatch sets state=prog.Start directly, entirely outside
-	// emitBTInstHandler's per-instruction logic, so there is no PC to
-	// instrument. For these heads the loop's own entry position is simply
-	// wherever this match attempt itself began (0 for match/groups bodies,
-	// the find engine's attempt_start local otherwise) — so their
+	// outside (loopEntryOutOf/loopEntryArgOf have no entry for this head):
+	// the very first dispatch sets state=prog.Start directly, entirely
+	// outside emitBTInstHandler's per-instruction logic, so there is no PC
+	// to instrument. For these heads the loop's own entry position is
+	// simply wherever this match attempt itself began (0 for match/groups
+	// bodies, the find engine's attempt_start local otherwise) — so their
 	// loopEntryLocalIdx local must be seeded with that value at
 	// declaration time instead of the usual -1 sentinel. See
 	// emitBTInstHandler's InstAlt case and FUZZER_BUGS.md #20.
@@ -138,8 +150,9 @@ func newBacktrack(prog *syntax.Prog) *backtrack {
 	// shape. A PC only counts as an external entry if it is NOT itself
 	// reachable from the body's start without first passing back through
 	// the loop head (i.e. it isn't one of the loop's own internal PCs
-	// re-entering via some other path). See loopEntryOf's doc.
-	bt.loopEntryOf = make(map[int]int, len(bt.emptyBodyGreedyLoop))
+	// re-entering via some other path). See loopEntryOutOf's doc.
+	bt.loopEntryOutOf = make(map[int]int, len(bt.emptyBodyGreedyLoop))
+	bt.loopEntryArgOf = make(map[int]int, len(bt.emptyBodyGreedyLoop))
 	bt.loopEntryAtStart = make(map[int]bool)
 	for headPC := range bt.emptyBodyGreedyLoop {
 		bodyStart := loopBodyStart(prog, idom, headPC)
@@ -155,16 +168,22 @@ func newBacktrack(prog *syntax.Prog) *backtrack {
 			if cand == headPC {
 				continue
 			}
-			var targetsBody bool
+			var outTargets, argTargets bool
 			switch inst.Op {
 			case syntax.InstFail, syntax.InstMatch:
 			case syntax.InstAlt, syntax.InstAltMatch:
-				targetsBody = int(inst.Out) == bodyStart || int(inst.Arg) == bodyStart
+				outTargets = int(inst.Out) == bodyStart
+				argTargets = int(inst.Arg) == bodyStart
 			default:
-				targetsBody = int(inst.Out) == bodyStart
+				outTargets = int(inst.Out) == bodyStart
 			}
-			if targetsBody && !pcReachesBounded(prog, bodyStart, cand, headPC) {
-				bt.loopEntryOf[cand] = headPC
+			if (outTargets || argTargets) && !pcReachesBounded(prog, bodyStart, cand, headPC) {
+				if outTargets {
+					bt.loopEntryOutOf[cand] = headPC
+				}
+				if argTargets {
+					bt.loopEntryArgOf[cand] = headPC
+				}
 			}
 		}
 	}
@@ -356,6 +375,33 @@ func altLoopBody(prog *syntax.Prog, idom []int, pc int) (bodyPC, exitPC int, isL
 		}
 		return 0, 0, false
 	default:
+		if pc == prog.Start {
+			// pc is the program's entry: computeDominators sets idom[pc]==pc
+			// for the root (it has no proper dominator), so dominates(idom,
+			// v, pc) can never succeed for any v != pc — the walk from pc
+			// terminates at the root on its very first step, before it could
+			// ever discover that a genuine back edge loops into pc from
+			// within the program (e.g. bare `x*` at the very start of a
+			// pattern: the back edge is body's last instruction -> pc, and
+			// pc IS the entry, so nothing "dominates" it despite the cycle
+			// being real). FUZZER_BUGS.md #37.
+			//
+			// Fall back to direct forward reachability from each branch back
+			// to pc. This is the same reachability test rejected above for
+			// the general case (misidentifies forks/merges nested loop
+			// levels), but it's safe here specifically because pc has no
+			// external predecessor to confuse it with: pc is the only entry
+			// to the whole program, so any path that reaches it again is
+			// necessarily an internal cycle, not an alternate external route.
+			outReachesBack := pcReachesBounded(prog, int(inst.Out), pc, pc)
+			argReachesBack := pcReachesBounded(prog, int(inst.Arg), pc, pc)
+			switch {
+			case outReachesBack && !argReachesBack:
+				return int(inst.Out), int(inst.Arg), true
+			case argReachesBack && !outReachesBack:
+				return int(inst.Arg), int(inst.Out), true
+			}
+		}
 		return 0, 0, false
 	}
 }
@@ -668,7 +714,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	}
 
 	// loopEntryLocalIdx[headPC] = local variable index holding the position
-	// at which that loop instance was entered — see loopEntryOf's doc and
+	// at which that loop instance was entered — see loopEntryOutOf's doc and
 	// FUZZER_BUGS.md #20. Placed after the snapshot locals.
 	entryPCsSorted := entryLoopPCsSorted(bt)
 	entryBase := baseExtra + uint32(snapTotal)
@@ -1034,28 +1080,50 @@ func emitBTInstHandler(
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
 
-	// bt.loopEntryOf[p]: this PC is an external entry point into an
-	// emptyBodyGreedyLoop's body (its first-entry twin for a `*`/`?`-shaped
-	// loop, or the mandatory predecessor for a `+`-shaped loop) — record
-	// the position at which this loop instance began, for that loop's own
-	// zero-progress guard to consult (FUZZER_BUGS.md #20). See
-	// loopEntryOf's doc.
+	// bt.loopEntryOutOf[p]/bt.loopEntryArgOf[p]: this PC is an external entry
+	// point into an emptyBodyGreedyLoop's body (its first-entry twin for a
+	// `*`/`?`-shaped loop, or the mandatory predecessor for a `+`-shaped
+	// loop) via its Out or Arg edge respectively — record the position at
+	// which this loop instance began, for that loop's own zero-progress
+	// guard to consult (FUZZER_BUGS.md #20). See loopEntryOutOf's doc.
 	//
-	// The write must happen at the point control actually transfers to
-	// inst.Out (bodyStart), not unconditionally at handler entry: p may
-	// fail its own check (bounds/rune/assertion) and btFail instead of
-	// reaching Out at all, in which case the loop is never entered on this
-	// path and writing early would leave a stale, wrong value behind for
-	// whenever the loop's own guard next reads it. contOut is the single
-	// choke point every case already uses to branch to inst.Out via brRun
-	// (never brRunNested — that's a different, nested exit), so gating the
-	// write there is exact regardless of instruction type.
-	contOut := func(b []byte) []byte {
-		if headPC, ok := bt.loopEntryOf[p]; ok {
+	// The write must happen at the point control actually transfers via the
+	// qualifying edge, not unconditionally at handler entry: p may fail its
+	// own check (bounds/rune/assertion) and btFail instead of reaching
+	// Out/Arg at all, in which case the loop is never entered on this path
+	// and writing early would leave a stale, wrong value behind for
+	// whenever the loop's own guard next reads it.
+	//
+	// Out always transfers immediately, so writeLoopEntryOut is folded into
+	// contOut, the single choke point every case already uses to branch to
+	// inst.Out via brRun (never brRunNested — that's a different, nested
+	// exit). Arg is different: it transfers either via a direct exit branch
+	// or via a pushed-then-later-popped retry frame — writeLoopEntryArg must
+	// be called explicitly at each such site (right before the branch, or
+	// right before the push: loopEntryLocalIdx is itself part of
+	// extraFrameLocals, saved/restored per frame, so writing it immediately
+	// before the push is exactly equivalent to writing it at the later pop).
+	// Conflating the two edges into one write keyed only on p — the original
+	// design — silently corrupted loopEntryLocalIdx whenever the qualifying
+	// edge was Arg instead of Out (FUZZER_BUGS.md #37).
+	writeLoopEntryOut := func(b []byte) []byte {
+		if headPC, ok := bt.loopEntryOutOf[p]; ok {
 			b = append(b, 0x20, localPos) // local.get pos (already past any consumed byte)
 			b = append(b, 0x21)           // local.set
 			b = utils.AppendULEB128(b, loopEntryLocalIdx[headPC])
 		}
+		return b
+	}
+	writeLoopEntryArg := func(b []byte) []byte {
+		if headPC, ok := bt.loopEntryArgOf[p]; ok {
+			b = append(b, 0x20, localPos) // local.get pos (already past any consumed byte)
+			b = append(b, 0x21)           // local.set
+			b = utils.AppendULEB128(b, loopEntryLocalIdx[headPC])
+		}
+		return b
+	}
+	contOut := func(b []byte) []byte {
+		b = writeLoopEntryOut(b)
 		return btSetStateAndBr(b, int32(inst.Out), brRun)
 	}
 
@@ -1105,6 +1173,7 @@ func emitBTInstHandler(
 			if useMemo && bt.memoInnerLoop[p] {
 				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested)
 			}
+			body = writeLoopEntryArg(body)
 			body = btPushFrame(body, numCapLocals, extraFrameLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
 			body = contOut(body)
 		} else {
@@ -1146,6 +1215,7 @@ func emitBTInstHandler(
 				// Exit is Out, which is never pushed as a retry candidate (only
 				// Arg=body is) — nothing to pop back to, branch directly.
 				body = restoreLoopSnap(body)
+				body = writeLoopEntryOut(body)
 				body = btSetStateAndBr(body, int32(inst.Out), brRunNested)
 			} else if bt.emptyBodyGreedyLoop[p] {
 				// Greedy loop whose body can match empty (e.g. the outer `*`
@@ -1160,7 +1230,7 @@ func emitBTInstHandler(
 				// before a later one resolves via a zero-width leaf
 				// assertion — #19). loopEntryLocalIdx[p] holds the position
 				// at which this loop's first-entry twin instruction last ran
-				// (see loopEntryOf's doc) — the correct, per-loop-instance
+				// (see loopEntryOutOf's doc) — the correct, per-loop-instance
 				// reference point, in place of both the old unconditional
 				// exit and the old attempt_start comparison:
 				//
@@ -1186,6 +1256,7 @@ func emitBTInstHandler(
 				body = append(body, 0x46)       // i32.eq
 				body = append(body, 0x04, 0x40) // if void
 				body = restoreLoopSnap(body)
+				body = writeLoopEntryArg(body)
 				body = btSetStateAndBr(body, int32(inst.Arg), brRunNested+1)
 				body = append(body, 0x05) // else
 				body = btFail(body, brRunNested+1)
@@ -1196,6 +1267,7 @@ func emitBTInstHandler(
 				// consumed ≥1 byte, so pos always differs from loop_local),
 				// kept for structural symmetry with the general case.
 				body = restoreLoopSnap(body)
+				body = writeLoopEntryArg(body)
 				body = btSetStateAndBr(body, int32(inst.Arg), brRunNested)
 			}
 			body = append(body, 0x0B) // end if (pos == loop_local)
@@ -1216,6 +1288,7 @@ func emitBTInstHandler(
 			}
 
 			// Push retry=inst.Arg, continue with inst.Out
+			body = writeLoopEntryArg(body)
 			body = btPushFrame(body, numCapLocals, extraFrameLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
 			body = contOut(body)
 		}
@@ -2245,7 +2318,7 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 }
 
 // entryLoopPCsSorted returns bt.emptyBodyGreedyLoop's keys in sorted order,
-// for deterministic local assignment — see loopEntryOf's doc.
+// for deterministic local assignment — see loopEntryOutOf's doc.
 func entryLoopPCsSorted(bt *backtrack) []int {
 	pcs := make([]int, 0, len(bt.emptyBodyGreedyLoop))
 	for pc := range bt.emptyBodyGreedyLoop {
@@ -2422,7 +2495,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		loopLocalIdx[pc] = loopLocalsBase + uint32(j)
 	}
 
-	// Entry-pos locals follow the loop_pos locals — see loopEntryOf's doc
+	// Entry-pos locals follow the loop_pos locals — see loopEntryOutOf's doc
 	// and FUZZER_BUGS.md #20.
 	entryPCsSorted := entryLoopPCsSorted(bt)
 	entryBase := loopLocalsBase + uint32(len(loopPCsSorted))
