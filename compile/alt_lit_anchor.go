@@ -62,8 +62,20 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		table := dfaTableFrom(fwdMatcher)
 		// Same gates as the single-pattern lit-anchor path in compile.go:
 		// `\b`/`\B` (Task 10) and, per FUZZER_BUGS.md #22, `(?m:^)`/`(?m:$)`
-		// in the prefix — both leave the forward continuation unable to
-		// verify a position-dependent assertion it can't re-derive.
+		// in the prefix.
+		//
+		// DELIBERATE DIVERGENCE (plans/TODO.md task 51, 2026-08-17): compile.go's
+		// copy of this gate is now narrower — it admits a prefix led by
+		// `^`/`(?m:^)` with nothing after the anchor able to consume a '\n'
+		// (lineAnchoredPrefixSafe, lit_anchor.go), a shape §22's defect never
+		// covered. That relaxation would be equally sound here: this path calls
+		// buildLitAnchorBackScanBody verbatim, and buildAltLitAnchorForwardVerifyBody
+		// duplicates buildLitAnchorFindBody's newline-aware start-state selection
+		// and its emitNLPreAcceptCheck call. It is left un-relaxed only because
+		// no perftest/likelytest case exercises a line-anchored alternation, so
+		// the widening would be unmeasured — the stricter gate is always safe,
+		// making this a missed optimisation, not an unfixed sibling of §22.
+		// plans/TODO.md task 53 tracks lifting it behind a shared predicate.
 		if table.hasWordBoundary || table.hasNewlineBoundary ||
 			prefixContainsWordBoundary(br.lap.prefixRe) || prefixContainsLineAnchor(br.lap.prefixRe) {
 			return nil, false

@@ -1263,8 +1263,20 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// to re-derive whether that position's own newline-boundary
 			// context was correctly resolved, so a prefix containing a line
 			// anchor is rejected the same way one containing `\b`/`\B` is.
-			if lap != nil && l.useU8 && !table.hasWordBoundary && !table.hasNewlineBoundary &&
-				!prefixContainsWordBoundary(lap.prefixRe) && !prefixContainsLineAnchor(lap.prefixRe) {
+			//
+			// ...unless the prefix is provably line-scoped (TODO.md task 51):
+			// a leading `^`/`(?m:^)` followed by nothing that can consume a
+			// '\n' makes the backward scan's stop-at-'\n' exact rather than
+			// premature, and the forward continuation is already newline-aware
+			// (phase 3 picks wasmMidStartNewline; the forward loop emits
+			// emitNLPreAcceptCheck). See lineAnchoredPrefixSafe.
+			lineAnchorOK := false
+			if lap != nil {
+				lineAnchorOK = (!table.hasNewlineBoundary && !prefixContainsLineAnchor(lap.prefixRe)) ||
+					lineAnchoredPrefixSafe(lap.prefixRe)
+			}
+			if lap != nil && l.useU8 && !table.hasWordBoundary && lineAnchorOK &&
+				!prefixContainsWordBoundary(lap.prefixRe) {
 				// Compile the reversed prefix DFA for the backward scan.
 				revRe := reverseRegexp(lap.prefixRe)
 				revSimplified := revRe.Simplify()

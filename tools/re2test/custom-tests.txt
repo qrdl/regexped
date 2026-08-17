@@ -4547,3 +4547,186 @@ regexps
 0-4;0-2;-;-
 -;0-1;-;-
 0-3;0-2;-;-
+# ============================================================
+# Task 51: line-scoped lit-anchor prefixes.
+#
+# FUZZER_BUGS.md §22 gated the lit-anchor optimisation off for ANY
+# prefix containing `(?m:^)`/`(?m:$)`. That gate is wider than the
+# defect: buildLitAnchorBackScanBody's stop-at-'\n' rule is exactly
+# sound when the prefix starts with `^`/`(?m:^)` and nothing after that
+# anchor can consume a '\n' (lineAnchoredPrefixSafe, lit_anchor.go).
+# These entries pin both sides of that boundary:
+#
+#   allowed (lit-anchor active):
+#     (?m:^)ab, (?m:^)a*XY, (?m:^)[^\n]*ERROR, (?m:^)ab(?m:$),
+#     (?m:^)\d+ab, and the log-capture-shaped capture patterns below
+#   still rejected (fallback path):
+#     (?m:^)[\s\S]*ab   — prefix can consume '\n', so the backward scan
+#                         would stop short of the true leftmost start
+#     \D(?m:^)ab        — §22's own repro; anchor is not leading
+#
+# All expected values generated from and cross-checked against Go
+# stdlib regexp (--validate-go clean).
+# ============================================================
+Task51LineScopedLitAnchorPrefix
+strings
+"ab"
+"xab"
+"\nab"
+"x\nab"
+"zaaaXY"
+"aaaXY"
+"\naaaXY"
+"aa\naaaXY"
+"no\nyes ERROR\n"
+"x ERROR"
+"ERROR"
+"ab\ncd"
+"cd\nab"
+"a\nb\nab\n"
+"x ab\n12ab"
+regexps
+"(?m:^)ab"
+0-2;0-2;-;-
+-;-;-;-
+-;1-3;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-2;-;-
+-;3-5;-;-
+-;4-6;-;-
+-;-;-;-
+"(?m:^)a*XY"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-5;0-5;-;-
+-;1-6;-;-
+-;3-8;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"(?m:^)[^\\n]*ERROR"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;3-12;-;-
+0-7;0-7;-;-
+0-5;0-5;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"(?m:^)ab(?m:$)"
+0-2;0-2;-;-
+-;-;-;-
+-;1-3;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-2;-;-
+-;3-5;-;-
+-;4-6;-;-
+-;-;-;-
+"(?m:^)[\\s\\S]*ab"
+0-2;0-2;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-2;-;-
+0-5;0-5;-;-
+-;0-6;-;-
+0-9;0-9;-;-
+"(?m:^)\\d+ab"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;5-9;-;-
+"\\D(?m:^)ab"
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;1-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;2-5;-;-
+-;3-6;-;-
+-;-;-;-
+Task51LineScopedLitAnchorCaptures
+strings
+"ERROR"
+"x ERROR"
+"\nx ERROR"
+"no ERR\nx ERROR"
+"ab"
+""
+"\n"
+regexps
+"(?m:^)([^\\n]*)(ERROR)"
+0-5 0-0 0-5;0-5;-;-;-;0-5 0-0 0-5
+0-7 0-2 2-7;0-7;-;-;-;0-7 0-2 2-7
+-;1-8;-;-;-;1-8 1-3 3-8
+-;7-14;-;-;-;7-14 7-9 9-14
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+Task51LineScopedLitAnchorLogShape
+strings
+"2026-01-02T03:04:05 x ERROR: boom"
+"z 2026-01-02T03:04:05 x ERROR: boom"
+"junk\n2026-01-02T03:04:05 x WARN: hi"
+"2026-01-02T03:04:05 x INFO: hi"
+"2026-01-02T03:04:05 x WARN: b"
+regexps
+"(?m:^(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}) [^\\n]*(ERROR|WARN): (.+)$)"
+0-33 0-19 22-27 29-33;0-33;-;-;-;0-33 0-19 22-27 29-33
+-;-;-;-;-;-
+-;5-35;-;-;-;5-35 5-24 27-31 33-35
+-;-;-;-;-;-
+0-29 0-19 22-26 28-29;0-29;-;-;-;0-29 0-19 22-26 28-29
