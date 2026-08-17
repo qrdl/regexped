@@ -2681,9 +2681,33 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 					useTwoByte = false
 					break
 				}
+				// midStartWordState (prev=word context) can resolve a leading
+				// \b/\B differently than midStartState, landing on a state
+				// with a divergent — or already-satisfied — continuation
+				// requirement after the same first byte fb. E.g. "a0|\Ba":
+				// from midStartState 'a' leaves only the "a0" thread alive
+				// (needs a following '0'); from midStartWordState \Ba
+				// completes the match right there, so no second byte is
+				// required at all. A single T1 filter bit can't express "any
+				// second byte OK in one context, only '0' in the other", so
+				// both possibilities must be unioned into the filter, and an
+				// immediate accept from either context makes any second-byte
+				// requirement unsound (FUZZER_BUGS.md #36, sibling of #3/#26).
+				stateAfterFBWord := -1
+				if t.hasWordBoundary {
+					stateAfterFBWord = t.transitions[t.midStartWordState*256+int(fb)]
+					if stateAfterFBWord >= 0 && stateCanAcceptHere(stateAfterFBWord) {
+						useTwoByte = false
+						break
+					}
+				}
 				validCount := 0
 				for b2 := 0; b2 < 256; b2++ {
-					if t.transitions[stateAfterFB*256+b2] >= 0 {
+					valid := t.transitions[stateAfterFB*256+b2] >= 0
+					if stateAfterFBWord >= 0 && t.transitions[stateAfterFBWord*256+b2] >= 0 {
+						valid = true
+					}
+					if valid {
 						validCount++
 						t1Lo[b2&0x0F] |= byte(1 << uint(i))
 						t1Hi[b2>>4] |= byte(1 << uint(i))
@@ -2700,7 +2724,9 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 				l.teddyT1LoOff = l.teddyHiOff + 16
 				l.teddyT1HiOff = l.teddyT1LoOff + 16
 
-				// Try T2 tables (third byte).
+				// Try T2 tables (third byte). Same midStartState/
+				// midStartWordState union as T1 above, threaded one byte
+				// further (FUZZER_BUGS.md #36).
 				t2Lo := make([]byte, 16)
 				t2Hi := make([]byte, 16)
 				useThreeByte := true
@@ -2711,18 +2737,38 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 						useThreeByte = false
 						break
 					}
+					stateAfterFBWord := -1
+					if t.hasWordBoundary {
+						stateAfterFBWord = t.transitions[t.midStartWordState*256+int(fb)]
+						if stateAfterFBWord >= 0 && stateCanAcceptHere(stateAfterFBWord) {
+							useThreeByte = false
+							break outerThreeByte
+						}
+					}
 					for b2 := 0; b2 < 256; b2++ {
 						stateAfterFB2 := t.transitions[stateAfterFB*256+b2]
-						if stateAfterFB2 < 0 {
+						stateAfterFB2Word := -1
+						if stateAfterFBWord >= 0 {
+							stateAfterFB2Word = t.transitions[stateAfterFBWord*256+b2]
+						}
+						if stateAfterFB2 < 0 && stateAfterFB2Word < 0 {
 							continue
 						}
-						if stateCanAcceptHere(stateAfterFB2) {
+						if stateAfterFB2 >= 0 && stateCanAcceptHere(stateAfterFB2) {
+							useThreeByte = false
+							break outerThreeByte
+						}
+						if stateAfterFB2Word >= 0 && stateCanAcceptHere(stateAfterFB2Word) {
 							useThreeByte = false
 							break outerThreeByte
 						}
 						validCount3 := 0
 						for b3 := 0; b3 < 256; b3++ {
-							if t.transitions[stateAfterFB2*256+b3] >= 0 {
+							valid := stateAfterFB2 >= 0 && t.transitions[stateAfterFB2*256+b3] >= 0
+							if stateAfterFB2Word >= 0 && t.transitions[stateAfterFB2Word*256+b3] >= 0 {
+								valid = true
+							}
+							if valid {
 								validCount3++
 								t2Lo[b3&0x0F] |= byte(1 << uint(i))
 								t2Hi[b3>>4] |= byte(1 << uint(i))
@@ -2740,7 +2786,8 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 					l.teddyT2LoOff = l.teddyT1HiOff + 16
 					l.teddyT2HiOff = l.teddyT2LoOff + 16
 
-					// Try T3 tables (fourth byte).
+					// Try T3 tables (fourth byte). Same union, threaded two
+					// bytes further (FUZZER_BUGS.md #36).
 					t3Lo := make([]byte, 16)
 					t3Hi := make([]byte, 16)
 					useFourByte := true
@@ -2751,23 +2798,58 @@ func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, 
 							useFourByte = false
 							break
 						}
+						stateAfterFBWord := -1
+						if t.hasWordBoundary {
+							stateAfterFBWord = t.transitions[t.midStartWordState*256+int(fb)]
+							if stateAfterFBWord >= 0 && stateCanAcceptHere(stateAfterFBWord) {
+								useFourByte = false
+								break outerFourByte
+							}
+						}
 						for b2 := 0; b2 < 256; b2++ {
 							stateAfterFB2 := t.transitions[stateAfterFB*256+b2]
-							if stateAfterFB2 < 0 {
+							stateAfterFB2Word := -1
+							if stateAfterFBWord >= 0 {
+								stateAfterFB2Word = t.transitions[stateAfterFBWord*256+b2]
+							}
+							if stateAfterFB2 < 0 && stateAfterFB2Word < 0 {
 								continue
 							}
+							if stateAfterFB2 >= 0 && stateCanAcceptHere(stateAfterFB2) {
+								useFourByte = false
+								break outerFourByte
+							}
+							if stateAfterFB2Word >= 0 && stateCanAcceptHere(stateAfterFB2Word) {
+								useFourByte = false
+								break outerFourByte
+							}
 							for b3 := 0; b3 < 256; b3++ {
-								stateAfterFB3 := t.transitions[stateAfterFB2*256+b3]
-								if stateAfterFB3 < 0 {
+								stateAfterFB3 := -1
+								if stateAfterFB2 >= 0 {
+									stateAfterFB3 = t.transitions[stateAfterFB2*256+b3]
+								}
+								stateAfterFB3Word := -1
+								if stateAfterFB2Word >= 0 {
+									stateAfterFB3Word = t.transitions[stateAfterFB2Word*256+b3]
+								}
+								if stateAfterFB3 < 0 && stateAfterFB3Word < 0 {
 									continue
 								}
-								if stateCanAcceptHere(stateAfterFB3) {
+								if stateAfterFB3 >= 0 && stateCanAcceptHere(stateAfterFB3) {
+									useFourByte = false
+									break outerFourByte
+								}
+								if stateAfterFB3Word >= 0 && stateCanAcceptHere(stateAfterFB3Word) {
 									useFourByte = false
 									break outerFourByte
 								}
 								validCount4 := 0
 								for b4 := 0; b4 < 256; b4++ {
-									if t.transitions[stateAfterFB3*256+b4] >= 0 {
+									valid := stateAfterFB3 >= 0 && t.transitions[stateAfterFB3*256+b4] >= 0
+									if stateAfterFB3Word >= 0 && t.transitions[stateAfterFB3Word*256+b4] >= 0 {
+										valid = true
+									}
+									if valid {
 										validCount4++
 										t3Lo[b4&0x0F] |= byte(1 << uint(i))
 										t3Hi[b4>>4] |= byte(1 << uint(i))

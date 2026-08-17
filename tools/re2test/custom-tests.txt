@@ -4389,3 +4389,33 @@ regexps
 -;-;-;-
 -;-;-;-
 0-2;0-1;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #36): Teddy 2/3/4-byte lookahead-tier
+# construction derives its lookahead filter only from midStartState,
+# ignoring midStartWordState's divergent transitions. "a0|\Ba": from
+# midStartState, consuming 'a' leaves only the "a0" thread alive (needs a
+# following '0'), so the T1 nibble filter demands second byte '0'. But from
+# midStartWordState (attempt start preceded by a word char — true at every
+# position here, since the byte before 'a' is always '0'), \Ba completes
+# the match after just 'a' — no second-byte requirement at all. The bogus
+# filter zeroes the SIMD match-mask bit whenever the candidate falls inside
+# a full 16-byte chunk the Teddy phase actually processes, so that chunk's
+# scan wrongly reports nothing and skips 16 bytes past the true match.
+# N=12 (candidate outside any full SIMD chunk) is a passing control; N=13
+# lands inside the first full 16-byte chunk and reproduces the bug.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug36TeddyMidStartWordDivergence
+strings
+""
+"000000000000a100"
+"0000000000000a100"
+"00000000000000a100"
+"000000000000000a100"
+regexps
+"a0|\\Ba"
+-;-;-;-
+-;12-13;-;-
+-;13-14;-;-
+-;14-15;-;-
+-;15-16;-;-
