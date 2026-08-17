@@ -5865,47 +5865,64 @@ func dfaHasAmbiguousBoundaryTarget(t *dfaTable) bool {
 }
 
 // isAnchoredFind reports whether the DFA can only match starting at position 0.
-// This is true when midStartState (and midStartWordState for WB patterns) have
-// no live outgoing transitions and are not accepting. Patterns with a leading ^
-// or \A anchor always satisfy this.
+// This is true when no state reachable from midStartState (plus the
+// word/newline-boundary mid-start variants, when those contexts exist) can
+// accept in any flavor. Patterns with a leading ^ or \A anchor always satisfy
+// this.
+//
+// TODO task 47: this is a reachability (BFS) check, not just a check on the
+// mid-start states themselves. The narrower "midStartState has zero live
+// outgoing transitions and is not accepting" test missed dead-end chains longer
+// than one step — a mid-start state whose transitions all lead into a cycle or
+// chain that can never accept. Those patterns are anchored-only in fact, and now
+// get the no-scan buildAnchoredFindBody path instead of the generic
+// buildFindBody + computePrefix scan loop.
+//
+// Every accept flavor is checked at every reachable state (not just the flavors
+// matching the pattern's boundary kinds): a missed flavor would let
+// buildAnchoredFindBody silently drop real matches at positions > 0. Nil-map
+// lookups return 0, so checking a flavor a pattern never populates is free and
+// can only make the answer more conservative.
 func isAnchoredFind(t *dfaTable) bool {
-	// midStartState must be a complete dead-end: no live transitions, not accepting
-	// in any mode (mid, eof, or immediate). If midStartState can accept, the pattern
-	// matches from non-zero positions (e.g. `$` matches at end-of-input).
-	if t.midAcceptStates[t.midStartState] != 0 ||
-		t.acceptStates[t.midStartState] != 0 ||
-		t.immediateAcceptStates[t.midStartState] != 0 {
-		return false
-	}
-	for b := 0; b < 256; b++ {
-		if t.transitions[t.midStartState*256+b] >= 0 {
-			return false
+	visited := make([]bool, t.numStates)
+	stack := make([]int, 0, t.numStates)
+
+	push := func(s int) {
+		if s >= 0 && s < t.numStates && !visited[s] {
+			visited[s] = true
+			stack = append(stack, s)
 		}
 	}
+
+	// Seed from the mid-start states that actually exist. midStartWordState /
+	// midStartNewlineState are only assigned when the pattern has the
+	// corresponding boundary kind; otherwise they hold their zero value, which
+	// is a valid but unrelated state ID and must not be walked.
+	push(t.midStartState)
 	if t.hasNewlineBoundary {
-		if t.midAcceptStates[t.midStartNewlineState] != 0 ||
-			t.acceptStates[t.midStartNewlineState] != 0 ||
-			t.immediateAcceptStates[t.midStartNewlineState] != 0 {
-			return false
-		}
-		for b := 0; b < 256; b++ {
-			if t.transitions[t.midStartNewlineState*256+b] >= 0 {
-				return false
-			}
-		}
+		push(t.midStartNewlineState)
 	}
 	if t.hasWordBoundary {
-		if t.midAcceptStates[t.midStartWordState] != 0 ||
-			t.acceptStates[t.midStartWordState] != 0 ||
-			t.immediateAcceptStates[t.midStartWordState] != 0 ||
-			t.midAcceptNWStates[t.midStartState] != 0 ||
-			t.midAcceptWStates[t.midStartWordState] != 0 {
+		push(t.midStartWordState)
+	}
+
+	for len(stack) > 0 {
+		s := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		// Accepting in any flavor at a state reachable from a mid-start state
+		// means the pattern can match starting at some position > 0.
+		if t.acceptStates[s] != 0 ||
+			t.midAcceptStates[s] != 0 ||
+			t.immediateAcceptStates[s] != 0 ||
+			t.midAcceptNWStates[s] != 0 ||
+			t.midAcceptWStates[s] != 0 ||
+			t.midAcceptNLStates[s] != 0 {
 			return false
 		}
+
 		for b := 0; b < 256; b++ {
-			if t.transitions[t.midStartWordState*256+b] >= 0 {
-				return false
-			}
+			push(t.transitions[s*256+b])
 		}
 	}
 	return true

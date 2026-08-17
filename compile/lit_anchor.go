@@ -310,15 +310,36 @@ func prefixContainsWordBoundary(re *syntax.Regexp) bool {
 }
 
 // prefixContainsLineAnchor reports whether re (or any subtree) contains an
-// OpBeginLine (`(?m:^)`) or OpEndLine (`(?m:$)`) node. Used to gate the
-// lit-anchor optimisation the same way prefixContainsWordBoundary gates
-// `\b`/`\B` (Task 10): once the backward scan verifies a candidate match
-// start, the forward continuation resumes a freshly-compiled DFA for
-// suffixRe at that position with no way to learn whether the byte
-// immediately preceding it was '\n' — it always assumes the restart is a
-// fresh "prev wasn't '\n'" context, silently losing any match whose
-// `(?m:^)` depends on the preceding byte having actually been '\n'.
-// See FUZZER_BUGS.md §22.
+// OpBeginLine (`(?m:^)`) or OpEndLine (`(?m:$)`) node.
+//
+// Gates the lit-anchor optimisation, roughly the way
+// prefixContainsWordBoundary gates `\b`/`\B` (Task 10), but for a different
+// underlying reason: what a line anchor in the prefix endangers is the
+// BACKWARD scan, not the forward continuation.
+// buildLitAnchorBackScanBody's `revTable.hasNewlineBoundary` branch
+// (engine_dfa.go) stops the reverse walk **unconditionally** at the first
+// '\n' it reads. When the prefix can itself consume a '\n' that stop is
+// premature and the real match start is never reached — FUZZER_BUGS.md §22's
+// repro `\D(?m:^)ab` on "\nab", where `\D` legitimately matches the very '\n'
+// the scan halts at.
+//
+// NOT a forward-continuation problem, contrary to what this comment claimed
+// before TODO.md task 51 (2026-08-17). The forward scan runs the WHOLE
+// pattern's DFA, not a freshly-compiled `suffixRe` DFA
+// (`p.litAnchorFindTable`/`p.litAnchorFindLayout` are the whole-pattern
+// table/layout), and it does establish the preceding byte's newline context:
+// buildLitAnchorFindBody's phase 3 loads `ptr[rev_result-1]` and picks
+// wasmStart / wasmMidStartNewline / wasmMidStart accordingly, and its forward
+// loop calls emitNLPreAcceptCheck for a trailing `(?m:$)`. That has been true
+// since lit-anchor's original landing.
+//
+// Consequently this predicate is NOT the whole gate: a true answer only
+// forces a fallback when lineAnchoredPrefixSafe also says no. That helper
+// admits the one shape the §22 defect cannot touch — a prefix led by
+// `^`/`(?m:^)` with nothing after the anchor able to consume a '\n', which
+// makes the stop-at-'\n' exact rather than premature. This function is also
+// reused inside lineAnchoredPrefixSafe to reject any FURTHER line anchor in
+// the remainder past that leading one.
 func prefixContainsLineAnchor(re *syntax.Regexp) bool {
 	if re == nil {
 		return false
