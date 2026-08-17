@@ -186,3 +186,13 @@ Generated export names match the config field values exactly (no case conversion
 - The stub uses top-level `await` internally — it is designed for ES module environments (browser, Node.js with `"type": "module"`, Cloudflare Workers).
 - `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. The stub is not re-entrant: do not call two generators concurrently on the same stub module instance.
 - `find_func`, `groups_func`, and `named_groups_func` generators automatically detect and use an internal `<func>_batch` WASM export when present, draining several matches per host↔WASM call instead of one. This export only exists when the pattern was compiled with `hints: [batch-find]` (see [`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)); it's purely an internal performance path and doesn't change the generator's external `[start,end]` / capture-array / named-object output. Covers every `groups_func`/`named_groups_func` shape, including the native lit-chain ("Path B") groups bodies. When both `groups_func` and `named_groups_func` are set on the same entry they share one batch export (named after `groups_func`); a `named_groups_func`-only entry gets its own, named after itself.
+
+---
+
+## Backtracking stack overflow
+
+Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
+
+The generated function **throws** an `Error` whose message names the function. Since the find/groups functions are generators, the throw surfaces from the `next()` call (i.e. from the `for...of` loop), not from the call that creates the generator.
+
+This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

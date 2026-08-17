@@ -9,6 +9,7 @@ import (
 	"regexp/syntax"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -2311,11 +2312,16 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(findFuncIdx))
 	b = append(b, 0x22, 0x06)
-	b = append(b, 0x42, 0x7F)
-	b = append(b, 0x51)
-	b = append(b, 0x04, 0x7F)
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x05)
+	// Any negative find result is forwarded verbatim (wrapped to i32), not
+	// collapsed to -1: a BT find body can return abi.BTStackOverflow (-2), and
+	// rewriting that to abi.NoMatch here would re-create §N1 one layer up. Both
+	// sentinels are small negatives, so i32.wrap_i64 preserves them exactly.
+	b = append(b, 0x42, 0x00) // i64.const 0
+	b = append(b, 0x53)       // i64.lt_s
+	b = append(b, 0x04, 0x7F) // if (result i32)
+	b = append(b, 0x20, 0x06) //   local.get r
+	b = append(b, 0xA7)       //   i32.wrap_i64
+	b = append(b, 0x05)       // else
 	if edgeScratchOff >= 0 {
 		// scratch[0] = origPtr (this wrapper's own ptr param, never shifted)
 		b = append(b, 0x41)
@@ -2346,11 +2352,14 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
 	b = append(b, 0x22, 0x04)
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x46)
-	b = append(b, 0x04, 0x7F)
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x05)
+	// Same rule as the find result above: forward the capture body's own
+	// negative verbatim so a BT captureBody's abi.BTStackOverflow survives to
+	// the export instead of being reported as abi.NoMatch (§N1).
+	b = append(b, 0x41, 0x00) // i32.const 0
+	b = append(b, 0x48)       // i32.lt_s
+	b = append(b, 0x04, 0x7F) // if (result i32)
+	b = append(b, 0x20, 0x04) //   local.get capRes
+	b = append(b, 0x05)       // else
 	for i := 0; i < numGroups*2; i++ {
 		offset := uint32(i * 4)
 		b = append(b, 0x20, 0x02)
@@ -2382,6 +2391,40 @@ func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, t
 	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, edgeScratchOff)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
+}
+
+// emitBTOverflowGuardI64 emits `if (local[idx] < -1) return abi.BTStackOverflow`
+// for an i64 local holding the result of a find call, in a function whose own
+// result type is i32.
+//
+// The test is `< -1` rather than `== -2` because it must stay correct if a
+// third sentinel is ever added: every failure value is negative and
+// abi.NoMatch (-1) is the only one that means "no match", so "more negative
+// than NoMatch" is exactly the set of values a batch count cannot represent.
+func emitBTOverflowGuardI64(b []byte, localIdx byte) []byte {
+	b = append(b, 0x20, localIdx) // local.get r
+	b = append(b, 0x42)           // i64.const abi.NoMatch
+	b = utils.AppendSLEB128(b, abi.NoMatch)
+	b = append(b, 0x53)       // i64.lt_s
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x41)       //   i32.const abi.BTStackOverflow
+	b = utils.AppendSLEB128(b, abi.BTStackOverflow)
+	b = append(b, 0x0F) //   return
+	return append(b, 0x0B)
+}
+
+// emitBTOverflowGuardI32 is emitBTOverflowGuardI64 for an i32 local holding the
+// result of a capture-body call.
+func emitBTOverflowGuardI32(b []byte, localIdx byte) []byte {
+	b = append(b, 0x20, localIdx) // local.get capRes
+	b = append(b, 0x41)           // i32.const abi.NoMatch
+	b = utils.AppendSLEB128(b, abi.NoMatch)
+	b = append(b, 0x48)       // i32.lt_s
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x41)       //   i32.const abi.BTStackOverflow
+	b = utils.AppendSLEB128(b, abi.BTStackOverflow)
+	b = append(b, 0x0F) //   return
+	return append(b, 0x0B)
 }
 
 // buildBatchFindWrapperBody emits the WASM body for the LM-2 batch find
@@ -2425,6 +2468,13 @@ func buildBatchFindWrapperBody(findFuncIdx int) []byte {
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(findFuncIdx))
 	b = append(b, 0x21, 0x07)
+
+	// if r < -1: return abi.BTStackOverflow. Must be tested BEFORE the
+	// r < 0 exit below, which would otherwise report the batch collected so
+	// far as a complete result — a silent truncation with no way for the host
+	// to tell it from a finished scan (§N1). The count return is non-negative
+	// for every successful call, so a negative count is unambiguous.
+	b = emitBTOverflowGuardI64(b, 0x07)
 
 	// if r < 0: br $done
 	b = append(b, 0x20, 0x07, 0x42, 0x00, 0x53, 0x0D, 0x01)
@@ -2548,6 +2598,10 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = utils.AppendULEB128(b, uint32(findFuncIdx))
 	b = append(b, 0x21, 0x07)
 
+	// if r < -1: return abi.BTStackOverflow — see the batch find wrapper's
+	// matching comment for why this precedes the r < 0 exit.
+	b = emitBTOverflowGuardI64(b, 0x07)
+
 	// if r < 0: br $done
 	b = append(b, 0x20, 0x07, 0x42, 0x00, 0x53, 0x0D, 0x01)
 
@@ -2570,6 +2624,10 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
 	b = append(b, 0x21, 0x0D)
+
+	// if capRes < -1: return abi.BTStackOverflow (before the capRes < 0 exit,
+	// same reason as the find result above).
+	b = emitBTOverflowGuardI32(b, 0x0D)
 
 	// if capRes < 0: br $done
 	b = append(b, 0x20, 0x0D, 0x41, 0x00, 0x48, 0x0D, 0x01)

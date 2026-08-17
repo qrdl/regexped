@@ -278,14 +278,20 @@ unsafe extern "C" {
 
 /// Returns the end position of the match (exclusive), or None if no match.
 /// The match is anchored: it starts at the beginning of input.
+///
+/// # Panics
+/// Panics if the pattern compiled to the Backtracking engine and the input
+/// exhausted its frame budget: the engine cannot tell whether the input
+/// matches, so None (a definite "no") would be a lie.
 pub fn %s(input: &[u8]) -> Option<usize> {
     match unsafe { %s(input.as_ptr(), input.len()) } {
         n if n >= 0 => Some(n as usize),
+        %d => panic!("%s"),
         _ => None,
     }
 }
 
-`, importModule, funcName, ffiName, funcName, ffiName)
+`, importModule, funcName, ffiName, funcName, ffiName, btOverflow, btOverflowMsg(funcName))
 }
 
 // genRustFindIterStub generates a find iterator.
@@ -314,6 +320,7 @@ impl<'a> Iterator for %s<'a> {
         }
         let remaining = &self.input[self.offset..];
         match unsafe { %s(remaining.as_ptr(), remaining.len()) } {
+            %d => panic!("%s"),
             -1 => None,
             n  => {
                 let start = (n as u64 >> 32) as usize;
@@ -330,11 +337,16 @@ impl<'a> Iterator for %s<'a> {
 /// Returns an iterator over all non-overlapping matches in input.
 /// Each item is an absolute (start, end) byte range.
 /// Use .next() to get only the first match.
+///
+/// # Panics
+/// next() panics if the pattern compiled to the Backtracking engine and the
+/// input exhausted its frame budget: the engine cannot tell whether the input
+/// matches, so ending iteration would be a lie.
 pub fn %s(input: &[u8]) -> %s<'_> {
     %s { input, offset: 0 }
 }
 
-`, importModule, funcName, ffiName, iterName, iterName, ffiName, funcName, iterName, iterName)
+`, importModule, funcName, ffiName, iterName, iterName, ffiName, btOverflow, btOverflowMsg(funcName), funcName, iterName, iterName)
 }
 
 // genRustGroupsIterStub generates a capture-groups iterator.
@@ -373,7 +385,11 @@ impl<'a> Iterator for %s<'a> {
             }
             let remaining = &self.input[self.offset..];
             let mut slots = [-1i32; %d];
-            if unsafe { %s(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) } < 0 {
+            let r = unsafe { %s(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) };
+            if r == %d {
+                panic!("%s");
+            }
+            if r < 0 {
                 if self.offset == self.input.len() {
                     return None;
                 }
@@ -401,7 +417,7 @@ pub fn %s(input: &[u8]) -> %s<'_> {
     %s { input, offset: 0 }
 }
 
-`, iterName, iterName, slotCount, ffiName, numGroups, numGroups, funcName, iterName, iterName)
+`, iterName, iterName, slotCount, ffiName, btOverflow, btOverflowMsg(funcName), numGroups, numGroups, funcName, iterName, iterName)
 }
 
 // genRustNamedGroupsIterStub generates a named-capture-groups iterator.
@@ -456,7 +472,11 @@ impl<'a> Iterator for %s<'a> {
             }
             let remaining = &self.input[self.offset..];
             let mut slots = [-1i32; %d];
-            if unsafe { %s(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) } < 0 {
+            let r = unsafe { %s(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) };
+            if r == %d {
+                panic!("%s");
+            }
+            if r < 0 {
                 if self.offset == self.input.len() {
                     return None;
                 }
@@ -479,5 +499,5 @@ pub fn %s(input: &[u8]) -> %s<'_> {
     %s { input, offset: 0 }
 }
 
-`, iterName, iterName, slotCount, ffiName, inserts.String(), funcName, iterName, iterName)
+`, iterName, iterName, slotCount, ffiName, btOverflow, btOverflowMsg(funcName), inserts.String(), funcName, iterName, iterName)
 }

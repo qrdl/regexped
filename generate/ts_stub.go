@@ -179,11 +179,12 @@ export function %s(input: string | Uint8Array): [number, boolean] {
     _resize(b.length);
     _mem.set(b, _inBase);
     const r = (_exp['%s'] as CallableFunction)(_inBase, b.length) as number;
+    if (r === %d) throw new Error("%s");
     if (r < 0) return [0, false];
     return [r, true];
 }
 
-`, funcName, funcName, funcName)
+`, funcName, funcName, funcName, btOverflow, btOverflowMsg(funcName))
 }
 
 // genTSFindFunc generates a TS generator for non-anchored find.
@@ -207,6 +208,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<[number, number]> 
         let startPos = 0;
         while (true) {
             const n = (_exp['%[1]s_batch'] as CallableFunction)(_inBase, b.length, _outBase, %[2]d, startPos) as number;
+            if (n === %[3]d) throw new Error("%[4]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
                 yield [outBuf[i * 2], outBuf[i * 2 + 1]];
@@ -222,6 +224,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<[number, number]> 
     let off = 0;
     while (off <= b.length) {
         const r = (_exp['%[1]s'] as CallableFunction)(_inBase + off, b.length - off) as bigint;
+        if (r === %[3]dn) throw new Error("%[4]s");
         if (r < 0n) break;
         const relStart = Number(r >> 32n);
         const relEnd   = Number(r & 0xFFFFFFFFn);
@@ -230,7 +233,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<[number, number]> 
     }
 }
 
-`, funcName, lm2BatchCap)
+`, funcName, lm2BatchCap, btOverflow, btOverflowMsg(funcName))
 }
 
 // genTSGroupsFunc generates a TS generator for capture groups.
@@ -257,6 +260,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<Array<[number, num
         let startPos = 0;
         while (true) {
             const n = (_exp['%[1]s_batch'] as CallableFunction)(_inBase, b.length, _outBase, %[2]d, startPos) as number;
+            if (n === %[7]d) throw new Error("%[8]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
                 const base = i * %[3]d;
@@ -283,7 +287,9 @@ export function* %[1]s(input: string | Uint8Array): Generator<Array<[number, num
     let off = 0;
     while (off <= b.length) {
         slots.fill(-1);
-        if ((_exp['%[1]s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) < 0) {
+        const r = (_exp['%[1]s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) as number;
+        if (r === %[7]d) throw new Error("%[8]s");
+        if (r < 0) {
             if (off === b.length) break;
             off++;
             continue;
@@ -299,7 +305,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<Array<[number, num
     }
 }
 
-`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount)
+`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName))
 }
 
 // genTSNamedGroupsFunc generates a TS generator for named capture groups.
@@ -350,6 +356,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<Record<string, [nu
         let startPos = 0;
         while (true) {
             const n = (_exp['%[2]s_batch'] as CallableFunction)(_inBase, b.length, _outBase, %[3]d, startPos) as number;
+            if (n === %[9]d) throw new Error("%[10]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
                 const base = i * %[5]d;
@@ -372,7 +379,9 @@ export function* %[1]s(input: string | Uint8Array): Generator<Record<string, [nu
     let off = 0;
     while (off <= b.length) {
         slots.fill(-1);
-        if ((_exp['%[2]s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) < 0) {
+        const r = (_exp['%[2]s'] as CallableFunction)(_inBase + off, b.length - off, _outBase) as number;
+        if (r === %[9]d) throw new Error("%[10]s");
+        if (r < 0) {
             if (off === b.length) break;
             off++;
             continue;
@@ -384,5 +393,5 @@ export function* %[1]s(input: string | Uint8Array): Generator<Record<string, [nu
     }
 }
 
-`, funcName, exportName, lm2BatchCap, recBytes, recSize, batchInserts.String(), slotCount, inserts.String())
+`, funcName, exportName, lm2BatchCap, recBytes, recSize, batchInserts.String(), slotCount, inserts.String(), btOverflow, btOverflowMsg(funcName))
 }

@@ -20,6 +20,21 @@ Each regexp WASM module exports one or more functions depending on which `_func`
 (func $named_groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (result i32))
 ```
 
+### Negative return values
+
+Every export signals failure with a negative value, and the values are disjoint so a host can tell "does not match" from "could not decide":
+
+| value | name | meaning |
+|---|---|---|
+| `-1` | `NoMatch` | the input does not match — an ordinary, reliable answer |
+| `-2` | `BTStackOverflow` | the Backtracking engine exhausted its compile-time frame budget; whether the input matches is **unknown** |
+
+The same two values apply to the `i64` find exports, sign-extended (`i64.const -1` / `-2`). No legitimate packed `(start << 32 | end)` result can be confused with either, because `start` is a non-negative `i32` so bit 63 is always clear.
+
+For the `_batch` exports, which return a match **count**, `-2` appears as a negative count; a successful call always returns a count ≥ 0. Returning the count collected so far would be a silent truncation the host could not distinguish from a completed scan.
+
+`-2` originates only in Backtracking bodies (the DFA, Compiled DFA and TDFA engines have no such ceiling) and only for a subset of pattern shapes — see [engines.md](engines.md) "Frame budget and the `-2` sentinel" for when it is reachable and how each generated stub surfaces it. The constants are defined once, in `internal/abi`, and shared by the compiler and the stub generators.
+
 **Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regexp WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regexp module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
 
 **Standalone mode** (produced when `output` is absent, for JS/TS/browser direct load): the regexp WASM declares and exports its own single memory as `"memory"` (`memory[0]`). No import.

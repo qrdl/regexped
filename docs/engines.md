@@ -260,7 +260,44 @@ The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps
 
 **Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. Stack is reserved at compile time in WASM linear memory immediately after the DFA tables.
 
-**Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns -1 (no match) rather than corrupting memory.
+**Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, execution returns the `-2` stack-overflow sentinel rather than corrupting memory — see the next section.
+
+### Frame budget and the `-2` sentinel
+
+The backtrack stack is sized **at compile time**:
+
+```
+maxFrames = max(numAlts × 4096, 4096)      # numAlts = InstAlt count in the NFA
+frameSize = 4 + numGroups × 2 × 4 + 4      # + 4 per loop_pos/loop_entry tracker
+stackSize = maxFrames × frameSize
+```
+
+The real requirement, however, scales with **input length**: a pattern that leaves one live backtrack frame per input byte exhausts a `numAlts × 4096` budget once the input passes that many bytes. So the ceiling is a function of the input, not just the pattern, and no compile-time check can predict it.
+
+When the budget runs out the engine has abandoned part of the search space and **does not know** whether the input matches. It therefore returns a distinct sentinel:
+
+| value | meaning |
+|---|---|
+| `-1` | the input does not match — an ordinary, reliable answer |
+| `-2` | the frame budget was exhausted; the result is **unknown**, not "no match" |
+
+`-2` is returned by every export shape that can host a Backtracking body: `match_func`, `find_func` (as `i64 -2`), `groups_func`, `named_groups_func`, and the `_batch` variants — for the batch exports as a negative count, since a successful call always returns a count ≥ 0. Wrapper functions propagate it instead of folding it into their own "negative means no match" test.
+
+**Which patterns can reach it.** The frame has to survive input being consumed, which means an untried *alternation* branch, not merely a quantifier: after `ab` matches in `(?:ab|cd)*?x`, the frame holding "try `cd` here instead" stays live. A non-greedy loop on its own does not accumulate, because its preferred branch fails against the next byte and the frame is popped straight back. The alternation must also survive `regexp/syntax` simplification — `a|b` becomes the char class `[ab]` and `aa|ab` is factored to `a[ab]`, and neither leaves an `InstAlt` to push a frame for. This combination is why the ceiling is rarely hit in practice, and why it went unnoticed: before this sentinel existed, crossing it returned `-1`, an input-length-dependent false negative with no diagnostic.
+
+**Host behaviour.** Generated stubs must surface `-2` as an error, never as "no match":
+
+| stub | behaviour |
+|---|---|
+| Rust, Go | panic |
+| JS, TS, AssemblyScript | throw |
+| C | returns the sentinel: `RX_ERR_BT_OVERFLOW` from a match function, `{RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW}` from a find function, `NULL` from a groups function |
+
+C differs because it has no unwinding, and its return types already carry integer error codes. The other languages' public types (`Option<usize>`, `(int, bool)`, generators) have no room for a third outcome, so an unwind is the only way to keep the distinction without redesigning every signature.
+
+**Raising the ceiling.** There is no runtime knob today. The options are to shorten the input, restructure the pattern so fewer alternation frames stay live, or make the engine grow its stack at runtime — the last being the only fix that makes such a pattern work on arbitrarily long input, and it is not implemented.
+
+Note the contrast with the **compile-time** ceilings (`ErrBTStackTooLarge`, `ErrBTProgramTooLarge`, and the program size cap below), which have always been reported as typed errors. This is the runtime counterpart, and it was the only one that used to be silent.
 
 ### Program size cap
 

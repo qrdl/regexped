@@ -91,6 +91,9 @@ func FuzzCorrectness(f *testing.F) {
 
 		expected := ref.FindStringIndex(input)
 		span, ok, hang, runErr := runWasmFind(wasmBytes, input)
+		if errors.Is(runErr, errBTOverflow) {
+			t.Skip("backtracking frame budget exhausted")
+		}
 		if runErr != nil {
 			t.Fatalf("wasm error: pat=%q input=%q: %v", pat, input, runErr)
 		}

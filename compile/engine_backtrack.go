@@ -4,6 +4,7 @@ import (
 	"regexp/syntax"
 	"sort"
 
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -1625,14 +1626,45 @@ func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 	return b
 }
 
+// btOverflowFindReturn is the overflowFn for the i64-returning BT find bodies:
+// it returns abi.BTStackOverflow instead of a packed (start << 32 | end).
+//
+// It replaced a `br $run_exit` that abandoned only the current attempt_start
+// and let the scan continue. That could not produce a truthful answer. find
+// reports the *leftmost* match and scans attempt_start upward, so an overflow
+// at position k is only ever reached after every earlier start has already
+// failed: a match subsequently found at some start > k is not provably
+// leftmost, and running off the end of the input reports no-match, which is a
+// false negative. Every exit reachable after an overflow would therefore have
+// to report -2 anyway, so returning here is equivalent and far simpler.
+//
+// It also keeps the property the old `br` was chosen for over a pop-and-retry
+// (which could oscillate forever at the stack ceiling for nested nullable-loop
+// patterns): a `return` cannot be re-entered at all, so it is trivially
+// bounded. brDepth is unused — a return needs no branch depth.
+func btOverflowFindReturn(bb []byte, _ uint32) []byte {
+	bb = append(bb, 0x42) // i64.const abi.BTStackOverflow
+	bb = utils.AppendSLEB128(bb, abi.BTStackOverflow)
+	return append(bb, 0x0F) // return
+}
+
 // btPushFrame pushes a backtrack frame onto the stack:
 // mem[sp+0]                  = pos
 // mem[sp+4..4+capLocals*4]   = captures
 // mem[sp+extraOff..+extra*4] = extraLocals (loop_pos/loop_entry trackers)
 // mem[sp+retryPCOff]         = retryPC
 // btPushFrame pushes a backtrack frame. stackLimit and frameSize are passed
-// so we can guard against stack overflow: if sp+frameSize > stackLimit, set
-// state=-1 (fail) and return instead of writing past allocated memory.
+// so we can guard against stack overflow: if sp+frameSize > stackLimit, bail
+// out instead of writing past allocated memory.
+//
+// The default bail-out (overflowFn == nil) returns abi.BTStackOverflow (-2),
+// NOT abi.NoMatch (-1). Overflow means the engine abandoned part of the search
+// space, so it does not know whether a match exists; returning -1 would report
+// a definite "no" it has not established. That was §N1 in plans/OPUS.md: a
+// false negative that appears once the input crosses numAlts*4096 bytes and is
+// indistinguishable from a real no-match at every layer above. Callers that
+// compose this body (the groups wrapper, the batch wrappers) must propagate -2
+// rather than folding it into their own "< 0 means no match" test.
 //
 // extraLocals: local indices of every loop_pos/loop_entry tracker in the
 // program (in the same fixed order the caller uses everywhere else), saved
@@ -1656,8 +1688,9 @@ func btPushFrame(b []byte, numCapLocals int, extraLocals []uint32, retryPC uint3
 	if overflowFn != nil {
 		b = overflowFn(b, brDepth)
 	} else {
-		b = append(b, 0x41, 0x7F) // i32.const -1
-		b = append(b, 0x0F)       // return
+		b = append(b, 0x41) // i32.const abi.BTStackOverflow
+		b = utils.AppendSLEB128(b, abi.BTStackOverflow)
+		b = append(b, 0x0F) // return
 	}
 	b = append(b, 0x0B) // end if
 
@@ -2691,17 +2724,11 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			bb = append(bb, 0x0F) // return
 			return bb
 		}
-		// Stack overflow: abandon this attempt_start entirely (branch straight
-		// out to $run_exit) rather than aborting the whole find. A "treat like
-		// any other failed alternative" pop-and-retry was tried first but can
-		// oscillate forever right at the stack ceiling for nested nullable-loop
-		// patterns backtracking through a mismatch — this exit is bounded by
-		// construction (at most one stack-fill per attempt) since it can never
-		// be re-entered from within the same attempt.
-		overflowFind := func(bb []byte, brDepth uint32) []byte {
-			bb = append(bb, 0x0C) // br
-			return utils.AppendULEB128(bb, brDepth+1)
-		}
+		// Stack overflow: report abi.BTStackOverflow and stop. See
+		// btOverflowFindReturn's doc for why abandoning just this
+		// attempt_start (what this used to do) cannot produce a truthful
+		// answer.
+		overflowFind := btOverflowFindReturn
 		body = append(body, 0x02, 0x40) // block $run_exit
 		body = append(body, 0x03, 0x40) // loop $run
 		body = buildBTInnerDisp(body, bt, loopLocalIdx, loopEntryLocalIdx,
@@ -2780,13 +2807,9 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			return bb
 		}
 
-		// Stack overflow: abandon this attempt_start entirely — see the
-		// mandLit branch's identical comment above for why (bounded vs. a
-		// pop-and-retry that can oscillate forever at the stack ceiling).
-		overflowFind := func(bb []byte, brDepth uint32) []byte {
-			bb = append(bb, 0x0C) // br
-			return utils.AppendULEB128(bb, brDepth+1)
-		}
+		// Stack overflow: report abi.BTStackOverflow and stop — see the
+		// mandLit branch's identical comment above.
+		overflowFind := btOverflowFindReturn
 		b = buildBTInnerDisp(b, bt, loopLocalIdx, loopEntryLocalIdx,
 			stackBase, stackLimit, frameSize,
 			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,

@@ -1,6 +1,7 @@
 package fuzz
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -9,7 +10,24 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
+
+// errBTOverflow reports that an export returned abi.BTStackOverflow: the
+// Backtracking engine exhausted its compile-time frame budget, so it does not
+// know whether the input matches (plans/OPUS.md §N1).
+//
+// Targets must SKIP on this, not fail. It is a documented runtime ceiling that
+// the engine reports honestly — comparing it against the oracle would flag a
+// "wrong answer" for an answer the engine explicitly declined to give, which is
+// the same class of harness mistake as treating a compile-time ceiling error as
+// a bug (see isResourceCeiling).
+//
+// Before the §N1 fix this was indistinguishable from a genuine no-match, so the
+// harness could not have skipped it even in principle — a long-input false
+// negative would simply have been reported as an engine bug, or worse, matched
+// the oracle by luck.
+var errBTOverflow = errors.New("backtracking stack overflow (abi.BTStackOverflow)")
 
 const (
 	// tableBase is the WASM memory offset where DFA tables start. Test
@@ -88,7 +106,10 @@ func runWasmFind(wasmBytes []byte, input string) (span [2]int, ok bool, hang boo
 	}
 
 	r := result.(int64)
-	if r == -1 {
+	if r == abi.BTStackOverflow {
+		return span, false, false, errBTOverflow
+	}
+	if r == abi.NoMatch {
 		return span, false, false, nil
 	}
 	span[0] = int(uint32(r >> 32))

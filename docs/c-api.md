@@ -181,3 +181,25 @@ that requested `emit_name_map: true`, not one per set.
 - No heap allocation or libc is required. The stubs are self-contained and suitable
   for embedded WASM environments.
 - The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for C: it's effective for the JS and TS generators only. Setting it does not change the generated header or its performance.
+
+---
+
+## Backtracking stack overflow
+
+Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
+
+C has no unwinding, so the sentinel is returned to the caller instead. The header defines it:
+
+```c
+#define RX_ERR_BT_OVERFLOW (-2)
+```
+
+| Function shape | Value on overflow |
+|---|---|
+| anchored match (`int`) | `RX_ERR_BT_OVERFLOW` |
+| find (`rx_match_t`) | `{RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW}` |
+| groups (`const rx_group_t *`) | `NULL` — never returned otherwise |
+
+Check for it wherever you currently check for `-1` / `{-1, -1}`: a plain `< 0` or `.start < 0` test silently treats overflow as "no match", which is the exact failure the sentinel exists to prevent.
+
+This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

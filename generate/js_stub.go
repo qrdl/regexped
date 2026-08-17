@@ -184,11 +184,12 @@ export function %s(input) {
     _resize(b.length);
     _mem.set(b, _inBase);
     const r = _exp['%s'](_inBase, b.length);
+    if (r === %d) throw new Error("%s");
     if (r < 0) return [0, false];
     return [r, true];
 }
 
-`, funcName, funcName, funcName)
+`, funcName, funcName, funcName, btOverflow, btOverflowMsg(funcName))
 }
 
 // lm2BatchCap is the per-refill match capacity used by the JS/TS find/groups
@@ -219,6 +220,7 @@ export function* %[1]s(input) {
         let startPos = 0;
         while (true) {
             const n = _exp['%[1]s_batch'](_inBase, b.length, _outBase, %[2]d, startPos);
+            if (n === %[3]d) throw new Error("%[4]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
                 yield [outBuf[i * 2], outBuf[i * 2 + 1]];
@@ -234,6 +236,7 @@ export function* %[1]s(input) {
     let off = 0;
     while (off <= b.length) {
         const r = _exp['%[1]s'](_inBase + off, b.length - off);
+        if (r === %[3]dn) throw new Error("%[4]s");
         if (r < 0n) break;
         const relStart = Number(r >> 32n);
         const relEnd   = Number(r & 0xFFFFFFFFn);
@@ -242,7 +245,7 @@ export function* %[1]s(input) {
     }
 }
 
-`, funcName, lm2BatchCap)
+`, funcName, lm2BatchCap, btOverflow, btOverflowMsg(funcName))
 }
 
 // genJSGroupsFunc generates a JS generator for indexed capture groups.
@@ -270,6 +273,7 @@ export function* %[1]s(input) {
         let startPos = 0;
         while (true) {
             const n = _exp['%[1]s_batch'](_inBase, b.length, _outBase, %[2]d, startPos);
+            if (n === %[7]d) throw new Error("%[8]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
                 const base = i * %[3]d;
@@ -296,7 +300,9 @@ export function* %[1]s(input) {
     let off = 0;
     while (off <= b.length) {
         slots.fill(-1);
-        if (_exp['%[1]s'](_inBase + off, b.length - off, _outBase) < 0) {
+        const r = _exp['%[1]s'](_inBase + off, b.length - off, _outBase);
+        if (r === %[7]d) throw new Error("%[8]s");
+        if (r < 0) {
             if (off === b.length) break;
             off++;
             continue;
@@ -312,7 +318,7 @@ export function* %[1]s(input) {
     }
 }
 
-`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount)
+`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName))
 }
 
 // genJSNamedGroupsFunc generates a JS generator for named capture groups.
@@ -367,6 +373,7 @@ export function* %[1]s(input) {
         let startPos = 0;
         while (true) {
             const n = _exp['%[2]s_batch'](_inBase, b.length, _outBase, %[3]d, startPos);
+            if (n === %[9]d) throw new Error("%[10]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
                 const base = i * %[5]d;
@@ -389,7 +396,9 @@ export function* %[1]s(input) {
     let off = 0;
     while (off <= b.length) {
         slots.fill(-1);
-        if (_exp['%[2]s'](_inBase + off, b.length - off, _outBase) < 0) {
+        const r = _exp['%[2]s'](_inBase + off, b.length - off, _outBase);
+        if (r === %[9]d) throw new Error("%[10]s");
+        if (r < 0) {
             if (off === b.length) break;
             off++;
             continue;
@@ -401,5 +410,5 @@ export function* %[1]s(input) {
     }
 }
 
-`, funcName, exportName, lm2BatchCap, recBytes, recSize, batchInserts.String(), slotCount, inserts.String())
+`, funcName, exportName, lm2BatchCap, recBytes, recSize, batchInserts.String(), slotCount, inserts.String(), btOverflow, btOverflowMsg(funcName))
 }
