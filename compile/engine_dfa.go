@@ -1328,15 +1328,32 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 			nonWordCharWBCtx = ecNoWordBoundary | item.beginCtx
 		}
 		expandedForWordChar := expandWithWB(item.nfaSet, wordCharWBCtx)
-		expandedForNonWordChar := expandWithWB(item.nfaSet, nonWordCharWBCtx)
-		// FUZZER_BUGS.md #21: see nfaBoundaryTargetIsAmbiguous's doc comment.
-		// Checked once per work item (cheap relative to the closures just
-		// computed above) and short-circuited once found, since only the
-		// pattern-wide yes/no answer is needed to route to Backtracking.
-		if !dfa.hasAmbiguousBoundaryTarget &&
-			(nfaBoundaryTargetIsAmbiguous(prog, item.nfaSet, item.beginCtx, wordCharWBCtx, leftmostFirst) ||
-				nfaBoundaryTargetIsAmbiguous(prog, item.nfaSet, item.beginCtx, nonWordCharWBCtx, leftmostFirst)) {
-			dfa.hasAmbiguousBoundaryTarget = true
+		// When the program contains no \b/\B, wordCharWBCtx and nonWordCharWBCtx
+		// differ ONLY in ecWordBoundary vs ecNoWordBoundary, and those two bits
+		// are read in exactly three places — nfaExpandWithWB's outer `fires`
+		// test, its inner `follow2` test, and emptyWidthFires — each of them
+		// guarded by `emptyOp & (EmptyWordBoundary|EmptyNoWordBoundary) != 0`.
+		// With no such instruction in prog those bits are never consulted, so
+		// the second expansion is provably identical to the first and the two
+		// ambiguity probes provably return false (every instruction either
+		// already fires under beginCtx alone, and is skipped as
+		// already-resolved, or does not fire under either context). Skipping
+		// them is a compile-time saving only: emitted WASM is unchanged.
+		// dfa.hasWordBoundary is the right predicate — it is set by a scan over
+		// every prog.Inst above, reachable or not, so `false` means the
+		// instruction is absent from the whole program. See plans/OPUS.md §N9.
+		expandedForNonWordChar := expandedForWordChar
+		if dfa.hasWordBoundary {
+			expandedForNonWordChar = expandWithWB(item.nfaSet, nonWordCharWBCtx)
+			// FUZZER_BUGS.md #21: see nfaBoundaryTargetIsAmbiguous's doc comment.
+			// Checked once per work item (cheap relative to the closures just
+			// computed above) and short-circuited once found, since only the
+			// pattern-wide yes/no answer is needed to route to Backtracking.
+			if !dfa.hasAmbiguousBoundaryTarget &&
+				(nfaBoundaryTargetIsAmbiguous(prog, item.nfaSet, item.beginCtx, wordCharWBCtx, leftmostFirst) ||
+					nfaBoundaryTargetIsAmbiguous(prog, item.nfaSet, item.beginCtx, nonWordCharWBCtx, leftmostFirst)) {
+				dfa.hasAmbiguousBoundaryTarget = true
+			}
 		}
 
 		// buildInputMap builds the rune→nextNFAStates map from an expanded NFA set.
@@ -1363,7 +1380,17 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		}
 
 		inputMapWord := buildInputMap(expandedForWordChar)
-		inputMapNonWord := buildInputMap(expandedForNonWordChar)
+		// Same argument as above: with no \b/\B the two expanded sets are the
+		// same slice, so the maps would be element-wise equal. Both maps are
+		// read-only from here on (the 256-byte loop below only does `m[r]`
+		// lookups, and nfaEpsilonClosure never writes through its input slice),
+		// so sharing one object is safe. nfaBuildInputMap is the expensive half
+		// of this loop — it re-walks the epsilon closure and allocates a fresh
+		// map per call.
+		inputMapNonWord := inputMapWord
+		if dfa.hasWordBoundary {
+			inputMapNonWord = buildInputMap(expandedForNonWordChar)
+		}
 		var inputMapNewline map[rune][]uint32
 		if dfa.hasNewlineBoundary {
 			inputMapNewline = buildInputMap(expandedForNewline)

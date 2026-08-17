@@ -284,6 +284,12 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	cfg.StubFile = resolveFilePath(configDir, cfg.StubFile)
 	cfg.WasmMerge = resolveFilePath(configDir, cfg.WasmMerge)
 
+	// Identifier validation runs first: every later stage interpolates these
+	// names into generated source, so nothing should touch them until they are
+	// known to be well-formed. See identifier.go.
+	if err := ValidateConfig(&cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
 	if err := ValidateSets(&cfg); err != nil {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 	}

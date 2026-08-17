@@ -1558,13 +1558,21 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		return p, nil
 	}
 
-	groupsEngine := selectBestEngine(prog, &buildOpts)
+	// selTDFA is the table the selector already built to decide eligibility; it
+	// is non-nil only when groupsEngine came back as EngineTDFA, so a
+	// forceGroupsEngine override onto TDFA still falls through to a fresh build
+	// below (CompileForced deliberately bypasses the eligibility gate, so the
+	// selector may never have attempted a table for this pattern).
+	groupsEngine, selTDFA := selectBestEngineWithTDFA(prog, &buildOpts)
 	if forceGroupsEngine != 0 {
 		groupsEngine = forceGroupsEngine
 	}
 
 	if groupsEngine == EngineTDFA {
-		tt, ok := newTDFA(prog, resolveMaxDFAStates(&buildOpts))
+		tt, ok := selTDFA, selTDFA != nil
+		if !ok {
+			tt, ok = newTDFA(prog, resolveMaxDFAStates(&buildOpts))
+		}
 		if ok && tt.numRegs > resolveMaxTDFARegs(&buildOpts) {
 			ok = false
 		}

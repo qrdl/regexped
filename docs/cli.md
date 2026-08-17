@@ -40,6 +40,35 @@ sets:
 
 All paths in the config file are resolved relative to the config file's directory.
 
+### Export-name rules
+
+Every `match_func`, `find_func`, `groups_func` and `named_groups_func` value, and every
+set's `find_any`, `find_all` and `match` value, becomes both a WASM export name and a
+function name in the generated stub. Because they are written verbatim into generated
+source, they are validated when the config is loaded, before any compile or generate work
+runs. A violation is a hard error: nothing is written and the exit status is non-zero.
+
+- **Shape** — must match `^[A-Za-z_][A-Za-z0-9_]*$`. ASCII only, no leading digit. This is
+  stricter than Rust, Go, JS and TS individually allow (all four accept some non-ASCII
+  identifiers), so that one config is portable across every `stub_type`.
+- **Reserved words** — the name must not be a reserved word in *any* of the six stub
+  languages (Rust, Go, C, JavaScript, TypeScript, AssemblyScript), regardless of which
+  `stub_type` is configured. The union is used so that changing `stub_type` cannot turn a
+  working config into a compile error in the caller's project. Notably this rejects
+  `match` (a Rust keyword), `find` and `groups` are fine.
+- Contextual keywords that are legal identifiers in their own language — TypeScript's
+  `type`, `from`, `of`, `get`, `set`, `string`, `number`, or Go's predeclared `len`/`cap` —
+  are **not** rejected.
+- **Not** covered: `regexps[].name` and `sets[].name`. Those are selection keys only, and
+  reach generated code as quoted string literals rather than identifiers, so reserved
+  words and punctuation are fine there.
+
+All offending names are reported in a single pass rather than one per run.
+
+Suffix `_batch` is separately reserved for the compiler-synthesized batch export (see
+`hints: [batch-find]` below), and export names must be unique across all `regexps:` and
+`sets:` entries.
+
 ### Engine selection
 
 Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation:

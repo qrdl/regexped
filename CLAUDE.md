@@ -238,7 +238,9 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 
 ### 3. Code Generation (`generate/`)
 
-**WASM export names = func names.** The value of `match_func`, `find_func`, `groups_func`, or `named_groups_func` is used directly as the WASM export name. This ensures unique export names in merged WASMs and removes the need for special-casing `match` (a Rust keyword).
+**WASM export names = func names.** The value of `match_func`, `find_func`, `groups_func`, or `named_groups_func` is used directly as the WASM export name. This ensures unique export names in merged WASMs.
+
+Because those values are also interpolated verbatim into generated source, `config.ValidateConfig` (`config/identifier.go`, called from `LoadConfig`) rejects any that is not `^[A-Za-z_][A-Za-z0-9_]*$` or is a reserved word in **any** of the six stub languages — `match` included, since the Rust generator emits `pub fn <func>` for the public wrapper. The check runs on the config-file path only, not inside `Compile`/`CompileFile`, so the internal harnesses (`tools/re2test`, `perftest`, `likelytest`, `pattest`, `tools/fuzz`) keep their bare `match`/`find`/`groups` names. See `docs/cli.md` "Export-name rules".
 
 **Rust stubs** (`generate/rust_stub.go`):
 

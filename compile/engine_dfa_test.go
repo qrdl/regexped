@@ -359,3 +359,69 @@ func TestDFASetsEmptyFallbackStrictPrefix(t *testing.T) {
 		t.Fatalf("CompileFile: %v", err)
 	}
 }
+
+// TestExpandWithWBIgnoresWordBitsWithoutWordBoundary pins the invariant
+// plans/OPUS.md §N9's optimisation rests on: when a program contains no
+// \b/\B instruction, expanding an NFA set under ecWordBoundary and under
+// ecNoWordBoundary produces identical results, so newDFA computes one
+// expansion (and one input map) instead of two.
+//
+// If a future change makes either context bit observable without an
+// EmptyWordBoundary/EmptyNoWordBoundary instruction being present, this test
+// fails here rather than silently producing a wrong DFA for every
+// word-boundary-free pattern in the corpus.
+func TestExpandWithWBIgnoresWordBitsWithoutWordBoundary(t *testing.T) {
+	// Every shape that reaches the loop: literals, classes, alternation,
+	// quantifiers, line anchors, text anchors, captures. None contains \b/\B.
+	patterns := []string{
+		`abc`,
+		`[a-z]+@[a-z]+\.[a-z]{2,}`,
+		`foo|bar|baz`,
+		`(?m:^foo$)`,
+		`^abc$`,
+		`(a)(b)?`,
+		`(?:[0-9]{1,3}\.){3}[0-9]{1,3}`,
+		`<(.+?)>`,
+		`(?i)select\s+.*\s+from`,
+		`a*b+c?`,
+	}
+	for _, pat := range patterns {
+		parsed, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatalf("parse %q: %v", pat, err)
+		}
+		prog, err := syntax.Compile(parsed.Simplify())
+		if err != nil {
+			t.Fatalf("compile %q: %v", pat, err)
+		}
+		// Sanity: the pattern really has no word-boundary instruction, so the
+		// test is exercising the branch it claims to.
+		for _, inst := range prog.Inst {
+			if inst.Op == syntax.InstEmptyWidth {
+				op := syntax.EmptyOp(inst.Arg)
+				if op&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary) != 0 {
+					t.Fatalf("%q unexpectedly contains \\b/\\B — pick a different pattern", pat)
+				}
+			}
+		}
+		for _, lf := range []bool{false, true} {
+			for _, beginCtx := range []int{0, ecBegin, ecBeginLine} {
+				set := nfaEpsilonClosure(prog, []uint32{uint32(prog.Start)}, beginCtx, lf)
+				word := nfaExpandWithWB(prog, set, ecWordBoundary|beginCtx, lf)
+				nonWord := nfaExpandWithWB(prog, set, ecNoWordBoundary|beginCtx, lf)
+				if nfaStatesKey(word) != nfaStatesKey(nonWord) {
+					t.Errorf("%q (leftmostFirst=%v, beginCtx=%d): word/non-word expansions differ:\n  word=%v\n  nonWord=%v",
+						pat, lf, beginCtx, word, nonWord)
+					continue
+				}
+				// The ambiguity probes must also be inert, since newDFA skips
+				// both of them on this branch.
+				if nfaBoundaryTargetIsAmbiguous(prog, set, beginCtx, ecWordBoundary|beginCtx, lf) ||
+					nfaBoundaryTargetIsAmbiguous(prog, set, beginCtx, ecNoWordBoundary|beginCtx, lf) {
+					t.Errorf("%q (leftmostFirst=%v, beginCtx=%d): boundary-ambiguity probe fired without any \\b/\\B",
+						pat, lf, beginCtx)
+				}
+			}
+		}
+	}
+}
