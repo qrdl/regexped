@@ -4847,3 +4847,173 @@ regexps
 -;2-2;-;-;2-2,4-4
 -;3-3;-;-;3-3
 -;0-0;-;-;0-0,1-1
+# ============================================================
+# Category: FABLE.md deep-review bugs B1-B5 (DFA find-path detectors and
+# newline-context transition construction). All five were live-reproduced
+# against Go stdlib regexp before any fix was written.
+# ============================================================
+# B1: detectSkipSafeOnDead's safety proof covers midStart/succ and the
+# alternative entry states (midStartWord/midStartNewline), but never the
+# DEATH TRAJECTORY of the original attempt. When attempt_start == 0 the
+# prologue starts in `startState`, which for a `^`/`\A`-anchored alternation
+# branch carries transitions midStart does not have. That attempt's death at
+# position P therefore proves nothing about positions 1..P, yet the skip
+# jumps straight to P+1. `^ab|c+d` on "acccd" reports 2-5 instead of 1-5:
+# the attempt at 1 (inside the anchored branch's 'a') is skipped.
+FableB1SkipSafeOnDeadAnchoredAltBranch
+strings
+"acccd"
+"accccccd"
+"cccd"
+"abcccd"
+"ab"
+"xcccd"
+regexps
+"^ab|c+d"
+-;1-5;-;-;1-5
+-;1-8;-;-;1-8
+0-4;0-4;-;-;0-4
+-;0-2;-;-;0-2,2-6
+0-2;0-2;-;-;0-2
+-;1-5;-;-;1-5
+"\\Aab|c+d"
+-;1-5;-;-;1-5
+-;1-8;-;-;1-8
+0-4;0-4;-;-;0-4
+-;0-2;-;-;0-2,2-6
+0-2;0-2;-;-;0-2
+-;1-5;-;-;1-5
+"^ab|c+d|q"
+-;1-5;-;-;1-5
+-;1-8;-;-;1-8
+0-4;0-4;-;-;0-4
+-;0-2;-;-;0-2,2-6
+0-2;0-2;-;-;0-2
+-;1-5;-;-;1-5
+# B2: detectEOFSkipSafe has the same hole from the other direction. Its
+# chain walk starts at midStartIdx and never inspects startState, so an
+# attempt riding a begin-anchored branch's states to EOF without accepting
+# wrongly proves "no later start can match". `^a[cd]*y|c+d` on "acccd"
+# returns NO MATCH (the EOF handler branches straight to $no_match) where
+# 1-5 is correct.
+FableB2EofSkipSafeAnchoredAltBranch
+strings
+"acccd"
+"accccccccd"
+"cccd"
+"aczy"
+"acdy"
+regexps
+"^a[cd]*y|c+d"
+-;1-5;-;-;1-5
+-;1-10;-;-;1-10
+0-4;0-4;-;-;0-4
+-;-;-;-
+0-4;0-4;-;-;0-4
+"\\Aa[cd]*y|c+d"
+-;1-5;-;-;1-5
+-;1-10;-;-;1-10
+0-4;0-4;-;-;0-4
+-;-;-;-
+0-4;0-4;-;-;0-4
+# B3: detectSkipSafeOnDead condition (f) case 2 allows an alternative entry
+# state's off-class byte to reach a MID-ACCEPT state. For midStart that
+# allowance is vacuous (off-class means dead by construction of C) and for
+# succ it is justified by the last_accept<0 contradiction, but a genuine
+# entry state like midStartWord is really entered at the death position, so
+# an attempt there would record a match the skip jumps over. `\Bz|x+y` on
+# "xz": C={x}; from midStartWord the `\B` resolves before the word char 'z'
+# and consumes it into Match, which isAcceptingExit wrongly accepts.
+FableB3SkipSafeOnDeadEntryOffClassMidAccept
+strings
+"xz"
+"xxz"
+"axxzb"
+"z"
+"xy"
+"axxy"
+regexps
+"\\Bz|x+y"
+-;1-2;-;-;1-2
+-;2-3;-;-;2-3
+-;3-4;-;-;3-4
+-;-;-;-
+0-2;0-2;-;-;0-2
+-;1-4;-;-;1-4
+"\\Bz|xx*y"
+-;1-2;-;-;1-2
+-;2-3;-;-;2-3
+-;3-4;-;-;3-4
+-;-;-;-
+0-2;0-2;-;-;0-2
+-;1-4;-;-;1-4
+# B4: getOrAddState queues workItem{dfaState, nfaSet, prevWasWord} with no
+# beginCtx, so although bug #27's fix folds nlCtx into the ACCEPT bitmasks of
+# '\n'-reached states, the TRANSITION build for those states runs
+# expandWithWB without ecBeginLine. A `\b`/`\B` resolved by the incoming
+# byte therefore cannot unlock a nested `(?m:^)` -- the transition-time
+# sibling of fixed bugs #12/#27. `\n\b(?m:^x)` on "\nx" returns no match.
+FableB4NewlineQueuedBeginLineContext
+strings
+"\nx"
+"a\nx"
+"\ny"
+"x"
+"\n\nx"
+regexps
+"\\n\\b(?m:^x)"
+0-2;0-2;-;-;0-2
+-;1-3;-;-;1-3
+-;-;-;-
+-;-;-;-
+-;1-3;-;-;1-3
+FableB4NewlineQueuedBeginLineContextNonWord
+strings
+"\n x"
+"a\n x"
+"\nx"
+"\n "
+regexps
+"\\n\\B(?m:^ x)"
+0-3;0-3;-;-;0-3
+-;1-4;-;-;1-4
+-;-;-;-
+-;-;-;-
+# B5: detectDominantSelfLoop decides mid-accept via
+# `l.midAcceptBytes[state] != 0`, consulting only the ctx=0 channel and never
+# midAcceptNLBytes. A state that accepts solely in the `(?m:$)` context is
+# therefore classified NON-mid dominant with '\n' inside its self-loop set,
+# so emitDominantBulkSkip advances past every '\n' without running the
+# newline pre-accept check and last_accept is never set. Sibling of
+# FUZZER_BUGS.md #41 (same channel blind spot, different skipper: #41 is the
+# inter-attempt advance, this is the intra-attempt SIMD skip).
+# The third input ("axx\nyyb", 7 bytes) is a CONTROL: below the bulk-skip's
+# pos+17>len bounds check it never engages, so it passed before the fix too.
+FableB5DominantBulkSkipMultilineEndAnchor
+strings
+"axxxxxxxxxxxxxxxxxxxx\nyyyb zzzzzzzzzz"
+"axx\nyybzzzzzzzzzzzzzzz"
+"axx\nyyb"
+"axxxxxxxxxxxxxxxxxxxx"
+"ab"
+regexps
+"a[^b]*(?m:$)"
+-;0-21;-;-;0-21
+-;0-3;-;-;0-3
+-;0-3;-;-;0-3
+0-21;0-21;-;-;0-21
+-;-;-;-
+FableB5DominantBulkSkipMultilineEndAnchorLitPrefix
+strings
+"foo:xxxxxxxxxxxxxxxxxxxx\nyyyb zzzzzzzzzz"
+"catxxxxxxxxxxxxxxxxxxxx\nyyyb zzzzzzzzzz"
+"dogxxxxxxxxxxxxxxxxxxxx\nyyyb zzzzzzzzzz"
+regexps
+"foo:[^b]*(?m:$)"
+-;0-24;-;-;0-24
+-;-;-;-
+-;-;-;-
+"(?:cat|dog)[^b]*(?m:$)"
+-;-;-;-
+-;0-23;-;-;0-23
+-;0-23;-;-;0-23

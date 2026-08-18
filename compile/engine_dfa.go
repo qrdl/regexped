@@ -1509,6 +1509,21 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 					dfaState:    nextDFAState,
 					nfaSet:      nextSet,
 					prevWasWord: nextPrevWasWord,
+					// Carry the '\n'-reached context into the queued item
+					// (FABLE.md B4). Bug #27's fix folds nlCtx into this
+					// state's ACCEPT bitmasks above, but the item drives the
+					// state's TRANSITION build on the next queue iteration,
+					// where expandWithWB runs under item.beginCtx. Without
+					// these two fields that expansion loses ecBeginLine, so a
+					// \b/\B resolved by the incoming byte cannot gate a
+					// nested (?m:^) — the transition-time sibling of the
+					// accept-time defects #12/#27. `\n\b(?m:^x)` on "\nx"
+					// found no match. Sound for the same reason #27 is:
+					// '\n'-reached states are distinct DFA states (setToKey's
+					// 'N' suffix) for which ecBeginLine genuinely always
+					// holds; every other item keeps beginCtx 0.
+					prevWasNewline: nlFlag,
+					beginCtx:       nlCtx,
 				})
 			}
 			return nextDFAState
@@ -3134,9 +3149,17 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 //     the attempt dies on its first byte having recorded nothing) or
 //     replicate midStart's own trajectory exactly.
 //
-// wasmStart is deliberately NOT in the entry set: the prologue selects it
-// only when attempt_start == 0, and the positions this optimization skips
-// are strictly greater than the original attempt's start.
+// wasmStart IS in the entry set, for a reason distinct from the other two
+// (FABLE.md B1). The other entry states matter because a SKIPPED attempt
+// could begin there. wasmStart matters because the ORIGINAL attempt can
+// begin there: when attempt_start == 0 the prologue selects it, and for a
+// `^`/`\A`-anchored alternation branch it carries transitions midStart does
+// not have. The whole optimization infers "positions attempt_start+1..P
+// cannot match" from the original attempt dying at P — an inference that
+// only holds if that attempt walked the midStart trajectory this analysis
+// proved stable. `^ab|c+d` on "acccd" is the counterexample: the attempt at
+// 0 rides the anchored branch and dies at 1, which says nothing about the
+// attempt at 1, and the skip jumped over the real 1-5 match.
 func detectSkipSafeOnDead(l *dfaLayout) {
 	if l.numWASM <= 1 {
 		return
@@ -3333,7 +3356,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 	// Anything else (a different class, a different successor, an off-class
 	// byte into a third scanning state) means the attempt can walk somewhere
 	// the original attempt never went, so bail.
-	for _, entry := range []uint32{l.wasmMidStartWord, l.wasmMidStartNewline} {
+	for _, entry := range []uint32{l.wasmStart, l.wasmMidStartWord, l.wasmMidStartNewline} {
 		es := int(entry)
 		if es == midStartIdx {
 			continue // aliased onto midStart — nothing extra to prove
@@ -3355,13 +3378,30 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 			continue // case 1: dies on its first byte, records nothing
 		}
 		// Case 2: must be indistinguishable from midStart.
+		//
+		// Off-class bytes must lead to DEAD here, not merely to
+		// "dead or mid-accept" as conditions (d)/(e) allow for
+		// midStart and succ (FABLE.md B3). That weaker test is sound
+		// for those two only because of arguments that do not carry
+		// over: from midStart an off-class byte is dead by
+		// construction of C, and for succ a mid-accept exit is
+		// excluded on the actual skip path by the last_accept < 0
+		// contradiction. A genuine alternative entry state is
+		// different — it really is entered at the death position P,
+		// so an attempt starting there would RECORD the mid-accept
+		// match that `attempt_start = pos + 1` then skips over.
+		// `\Bz|x+y` on "xz" is the counterexample: C={x}, and from
+		// midStartWord the `\B` resolves before the word char 'z',
+		// consuming it into Match. (`\b[a-z]+\b`'s midStartWord has
+		// an empty accept class, so it exits above via case 1 and is
+		// unaffected by this tightening.)
 		for b := 0; b < 256; b++ {
 			t := transitionOn(es, b)
 			if midStartAccepts[b] {
 				if t != succ {
 					return
 				}
-			} else if !isAcceptingExit(t) {
+			} else if t != 0 {
 				return
 			}
 		}
@@ -3487,6 +3527,35 @@ func detectEOFSkipSafe(l *dfaLayout) {
 	}
 	if isMidAccept(midStartIdx) {
 		return
+	}
+
+	// The chain walk below starts at midStart and proves "every later start
+	// re-walks this same chain and also reaches EOF without accepting". The
+	// ORIGINAL attempt, though, need not walk that chain at all: when
+	// attempt_start == 0 the prologue starts in startState, which for a
+	// `^`/`\A`-anchored alternation branch carries transitions midStart does
+	// not have (FABLE.md B2). Such an attempt can ride the anchored branch
+	// to EOF without accepting, at which point this optimization branches
+	// straight to $no_match on the strength of a trajectory it never
+	// analysed. `^a[cd]*y|c+d` on "acccd" loses the 1-5 match entirely.
+	//
+	// Two safe shapes, mirroring detectSkipSafeOnDead's condition (f):
+	// startState aliased onto midStart (every pattern without a
+	// begin-anchored branch, including the motivating `[a-z]{50,}[0-9]`
+	// family, so the O(N²) collapse is retained where it was designed to
+	// fire), or an inert startState that cannot consume anything — it then
+	// reaches the EOF handler only on empty input, where no later start
+	// position exists.
+	startIdx := int(l.wasmStart)
+	if startIdx != midStartIdx {
+		if startIdx <= 0 || startIdx >= l.numWASM {
+			return // unanalysable
+		}
+		for b := 0; b < 256; b++ {
+			if transitionOn(startIdx, b) != 0 {
+				return // startState can consume: trajectory unproven
+			}
+		}
 	}
 
 	// Class C: bytes midStart accepts (non-dead transition).
@@ -3662,6 +3731,52 @@ func detectDominantSelfLoop(l *dfaLayout) {
 			continue
 		}
 		isMidAccept := l.midAcceptBytes[state] != 0
+
+		// The mid/non-mid split above reads ONLY the ctx=0 channel, but a
+		// state can also record a match through the newline channel — that
+		// is exactly what `(?m:$)` compiles to (FABLE.md B5). Such a state
+		// looks non-mid here, so it is classified as a NON-mid dominant
+		// whose self-loop set includes '\n', and emitDominantBulkSkip then
+		// advances past every '\n' in one SIMD stride without ever running
+		// emitNLPreAcceptCheck. last_accept is never set, the scan dies at
+		// the exit byte, and the whole match is dropped:
+		// `a[^b]*(?m:$)` on "a"+"x"*20+"\nyyyb "+"z"*10 found nothing.
+		//
+		// Fixing it at detection time keeps every emitter untouched: force
+		// '\n' to be an EXIT byte, so the skip always stops there and the
+		// resumed per-byte loop runs the newline pre-accept check at that
+		// position. This is FUZZER_BUGS.md #41's channel blind spot in a
+		// different skipper (#41 is the inter-attempt advance; this is the
+		// intra-attempt SIMD skip).
+		//
+		// The word channels get the same treatment defensively. They are
+		// structurally hard to reach here — prevWasWord state-doubling caps
+		// a same-class self-loop well below the 240-byte threshold — but
+		// the gate costs nothing and removes the need to re-derive that
+		// argument whenever the threshold moves.
+		needsBoundaryExit := (int(state) < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[state] != 0) ||
+			(int(state) < len(l.midAcceptNWBytes) && l.midAcceptNWBytes[state] != 0) ||
+			(int(state) < len(l.midAcceptWBytes) && l.midAcceptWBytes[state] != 0)
+		if needsBoundaryExit {
+			alreadyExit := false
+			for _, b := range exitBytes {
+				if b == '\n' {
+					alreadyExit = true
+					break
+				}
+			}
+			if !alreadyExit {
+				if len(exitBytes)+1 > maxExitBytes {
+					continue // no room to carve '\n' out of the self-loop set
+				}
+				exitBytes = append(exitBytes, '\n')
+				selfBytes--
+				if selfBytes < threshold {
+					continue // no longer dominant once '\n' leaves the loop
+				}
+			}
+		}
+
 		sort.Slice(exitBytes, func(i, j int) bool { return exitBytes[i] < exitBytes[j] })
 		l.dominantStates = append(l.dominantStates, dominantInfo{
 			state:       state,
@@ -3852,6 +3967,26 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 			} else {
 				selfSet = append(selfSet, byte(c))
 			}
+		}
+		// Same boundary-channel blind spot as detectDominantSelfLoop, seen
+		// from the complement side (FABLE.md B5). `isMid` above reads only
+		// the ctx=0 channel, so a state that records matches through the
+		// newline channel — what `(?m:$)` compiles to — reaches the non-mid
+		// branch with '\n' still inside its self-loop set, and the emitted
+		// skip strides over newline positions without running the newline
+		// pre-accept check. Carve '\n' out of the self-loop set so the skip
+		// stops there; if that drops the set below the minimum width the
+		// state simply isn't worth accelerating.
+		if int(state) < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[state] != 0 ||
+			int(state) < len(l.midAcceptNWBytes) && l.midAcceptNWBytes[state] != 0 ||
+			int(state) < len(l.midAcceptWBytes) && l.midAcceptWBytes[state] != 0 {
+			filtered := selfSet[:0]
+			for _, b := range selfSet {
+				if b != '\n' {
+					filtered = append(filtered, b)
+				}
+			}
+			selfSet = filtered
 		}
 		if len(selfSet) < minWidth || len(selfSet) > width {
 			continue
