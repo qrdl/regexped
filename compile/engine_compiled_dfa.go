@@ -67,7 +67,7 @@ func buildStateDispatch(t *dfaTable, l *dfaLayout) []stateDispatchInfo {
 //   - the next state has not been visited already (no cycles)
 //
 // The chain ends as soon as any condition fails. Returns nil if no chain exists.
-func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, hasImmAccept bool, startWS uint32) []struct {
+func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, startWS uint32) []struct {
 	rawByte byte
 	nextWS  uint32
 } {
@@ -86,11 +86,10 @@ func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, hasImmAcc
 	for !visited[ws] { // until cycle detected
 		visited[ws] = true
 		gs := int(ws) - 1 // WASM state to DFA state
-		// Stop if accept or immediateAccept — we can't skip the accept check.
+		// Stop if accept — we can't skip the accept check. There is no
+		// immediateAccept case to stop on: match mode is compiled LL, so
+		// l.hasImmAccept is always false here (see buildMatchBody).
 		if t.acceptStates[gs] != 0 {
-			break
-		}
-		if hasImmAccept && t.immediateAcceptStates[gs] != 0 {
 			break
 		}
 		d := disp[gs]
@@ -136,12 +135,12 @@ func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, hasImmAcc
 //
 // This eliminates both the br_table overhead of the pure compiled path and the
 // forced-multiply overhead of the compressed-only previous hybrid implementation.
-func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMemIdx int) []byte {
+func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	var b []byte
 
 	// Class info must have been pre-computed in buildDFALayout for literalChain.
 	disp := buildStateDispatch(t, l)
-	chain := literalChain(t, l, disp, hasImmAccept, l.wasmStart)
+	chain := literalChain(t, l, disp, l.wasmStart)
 
 	const localState = uint32(2)
 	const localPos = uint32(3)
@@ -273,22 +272,6 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	b = append(b, 0x41, 0x7F)
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
-
-	// Immediate-accept check (Option D state-compare):
-	//   if state u<= immAcceptLimit: return pos
-	// Relies on reorderAcceptFirst placing immediate-accepting WASM IDs in
-	// 1..immAcceptLimit. The dead state (0) is excluded by the preceding
-	// `state == 0` early return.
-	if hasImmAccept {
-		b = append(b, 0x20, byte(localState))
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immAcceptLimit)
-		b = append(b, 0x4D) // i32.le_u
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, byte(localPos))
-		b = append(b, 0x0F)
-		b = append(b, 0x0B)
-	}
 
 	// Phase 4 dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
 	// or extra i32 added by the locals declaration above), hyst=6/7.

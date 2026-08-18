@@ -620,10 +620,10 @@ func TestCompileLikelyMatch(t *testing.T) {
 }
 
 // TestCompileLargeStateDFA exercises patterns that produce > 256 DFA states
-// to force the table-driven (non-compiled) DFA path with emitImmAcceptCheckMatch.
+// to force the table-driven (non-compiled) DFA path in buildMatchBody.
 func TestCompileLargeStateDFA(t *testing.T) {
 	// Disable the CompiledDFA optimisation so the DFA goes through the pure
-	// table-driven path (which calls emitImmAcceptCheckMatch).
+	// table-driven path.
 	opts := CompileOptions{CompiledDFAThreshold: -1}
 
 	cases := []struct {

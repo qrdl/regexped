@@ -523,7 +523,12 @@ func emitSetMatchFnAnchored(cs *compiledSet, suffixFnBase, prefixFnBaseIdx int) 
 				mask = (uint32(1) << uint(n)) - 1
 			}
 			if mask == 0 {
-				continue
+				// n == 0 means the bucket carries no patterns. binPack only
+				// ever creates a fallback bucket around a pattern and only
+				// grows it (compile/set.go compileFallback), so an empty
+				// bucket reaching the emitter is an upstream invariant
+				// violation, not a condition to skip silently.
+				panic(fmt.Sprintf("emitSetMatchFnAnchored: fallback bucket %d has no patterns — invariant violation", bi))
 			}
 			b = append(b, 0x02, 0x40) // block $skip_fb
 			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x00)

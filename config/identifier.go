@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"regexp/syntax"
+	"sort"
 	"strings"
 )
 
@@ -146,9 +148,10 @@ func ValidateIdentifier(name string) error {
 	return nil
 }
 
-// ValidateConfig checks every user-supplied export name in cfg. It reports all
-// violations found rather than stopping at the first, so a config with several
-// bad names is fixable in one pass.
+// ValidateConfig checks every user-supplied export name in cfg, and the
+// capture-group names of every entry that declares a named_groups_func. It
+// reports all violations found rather than stopping at the first, so a config
+// with several bad names is fixable in one pass.
 //
 // Called from LoadConfig, i.e. on the config-file path only. It is deliberately
 // NOT called from compile.Compile / compile.CompileFile: the internal
@@ -179,6 +182,12 @@ func ValidateConfig(cfg *BuildConfig) error {
 				problems = append(problems, fmt.Sprintf("%s: %s %q %v", owner, f.field, f.name, err))
 			}
 		}
+		if re.NamedGroupsFunc != "" {
+			for _, dup := range duplicateCaptureNames(re.Pattern) {
+				problems = append(problems, fmt.Sprintf("%s: capture group name %q is used more than once; "+
+					"named_groups_func maps names to slots, so only the last group of that name would be reachable", owner, dup))
+			}
+		}
 	}
 
 	for _, s := range cfg.Sets {
@@ -198,7 +207,47 @@ func ValidateConfig(cfg *BuildConfig) error {
 	}
 
 	if len(problems) > 0 {
-		return fmt.Errorf("invalid export name(s):\n  %s", strings.Join(problems, "\n  "))
+		return fmt.Errorf("invalid config:\n  %s", strings.Join(problems, "\n  "))
 	}
 	return nil
+}
+
+// duplicateCaptureNames returns, in sorted order, the capture-group names that
+// appear more than once in pattern.
+//
+// regexp/syntax accepts duplicate names — `(?P<a>x)(?P<a>y)` parses without
+// error — but generate.collectNamedGroups builds a name→slot map, so a repeated
+// name silently resolves to whichever group is visited last. That only changes
+// observable output for named_groups_func (groups_func is positional and
+// match_func / find_func ignore captures), so ValidateConfig applies this check
+// to named_groups_func entries only, rather than rejecting a pattern that is
+// legal and unambiguous everywhere else.
+//
+// A pattern that fails to parse yields no duplicates: reporting the syntax
+// error is compile's job, and doing it here too would double up the message.
+func duplicateCaptureNames(pattern string) []string {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil
+	}
+	counts := make(map[string]int)
+	var walk func(*syntax.Regexp)
+	walk = func(r *syntax.Regexp) {
+		if r.Op == syntax.OpCapture && r.Name != "" {
+			counts[r.Name]++
+		}
+		for _, sub := range r.Sub {
+			walk(sub)
+		}
+	}
+	walk(re)
+
+	var dups []string
+	for name, n := range counts {
+		if n > 1 {
+			dups = append(dups, name)
+		}
+	}
+	sort.Strings(dups)
+	return dups
 }

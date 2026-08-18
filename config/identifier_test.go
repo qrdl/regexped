@@ -174,3 +174,68 @@ func TestValidateConfig_AcceptsShippedExampleNames(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
+	// regexp/syntax accepts a repeated capture-group name, and
+	// generate.collectNamedGroups then maps the name to whichever group it
+	// visits last — so named_groups_func would silently expose only one of them.
+	t.Run("rejected_for_named_groups_func", func(t *testing.T) {
+		cfg := BuildConfig{Regexps: []RegexEntry{
+			{Pattern: `(?P<a>x)(?P<a>y)`, NamedGroupsFunc: "ng"},
+		}}
+		err := ValidateConfig(&cfg)
+		if err == nil {
+			t.Fatal("ValidateConfig = nil, want an error for a duplicated capture name")
+		}
+		if !strings.Contains(err.Error(), `capture group name "a" is used more than once`) {
+			t.Errorf("ValidateConfig = %v, want a message naming the duplicated group", err)
+		}
+	})
+
+	// The other three func kinds never resolve captures by name, so a repeated
+	// name is unambiguous for them and must stay legal.
+	t.Run("allowed_without_named_groups_func", func(t *testing.T) {
+		cfg := BuildConfig{Regexps: []RegexEntry{
+			{Pattern: `(?P<a>x)(?P<a>y)`, MatchFunc: "m"},
+			{Pattern: `(?P<a>x)(?P<a>y)`, FindFunc: "f"},
+			{Pattern: `(?P<a>x)(?P<a>y)`, GroupsFunc: "g"},
+		}}
+		if err := ValidateConfig(&cfg); err != nil {
+			t.Fatalf("ValidateConfig = %v, want nil (only named_groups_func resolves by name)", err)
+		}
+	})
+
+	t.Run("distinct_names_accepted", func(t *testing.T) {
+		cfg := BuildConfig{Regexps: []RegexEntry{
+			{Pattern: `(?P<a>x)(?P<b>y)`, NamedGroupsFunc: "ng"},
+		}}
+		if err := ValidateConfig(&cfg); err != nil {
+			t.Fatalf("ValidateConfig = %v, want nil", err)
+		}
+	})
+
+	// A syntax error is compile's to report; ValidateConfig must not duplicate it.
+	t.Run("unparseable_pattern_ignored", func(t *testing.T) {
+		cfg := BuildConfig{Regexps: []RegexEntry{
+			{Pattern: `(?P<a>x`, NamedGroupsFunc: "ng"},
+		}}
+		if err := ValidateConfig(&cfg); err != nil {
+			t.Fatalf("ValidateConfig = %v, want nil (parse errors are reported by compile)", err)
+		}
+	})
+
+	t.Run("multiple_duplicates_sorted", func(t *testing.T) {
+		cfg := BuildConfig{Regexps: []RegexEntry{
+			{Pattern: `(?P<z>1)(?P<z>2)(?P<a>3)(?P<a>4)`, NamedGroupsFunc: "ng"},
+		}}
+		err := ValidateConfig(&cfg)
+		if err == nil {
+			t.Fatal("ValidateConfig = nil, want an error")
+		}
+		ai := strings.Index(err.Error(), `"a"`)
+		zi := strings.Index(err.Error(), `"z"`)
+		if ai < 0 || zi < 0 || ai > zi {
+			t.Errorf("ValidateConfig = %v, want both names reported in sorted order", err)
+		}
+	})
+}

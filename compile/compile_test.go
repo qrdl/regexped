@@ -592,8 +592,16 @@ func TestCompileMatchBodyCompressed(t *testing.T) {
 		CompileOptions{MaxDFAStates: 100000, CompiledDFAThreshold: -1})
 }
 
-// TestCompileMatchBodyImmediateAccept exercises the hasImmAccept branch in buildMatchBody.
-// a* matches empty at start; the LL DFA start state has immediateAccept=true.
+// TestCompileMatchBodyImmediateAccept compiles a pattern whose start state is
+// immediate-accepting (a* matches empty at position 0) through the non-hybrid
+// match body.
+//
+// It does NOT exercise an immediate-accept check, despite the name: match mode
+// is compiled LL, and buildDFALayout raises hasImmAccept only under LF, so the
+// match body has never emitted one. (The original comment here claimed the
+// opposite; coverage showed the branch at 0.) The dead plumbing was removed in
+// 2026-08-18 — see plans/IMPROVEMENT_PLAN.md #7. Kept as a compile smoke test
+// for the empty-match-at-start shape.
 func TestCompileMatchBodyImmediateAccept(t *testing.T) {
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a*", MatchFunc: "m"}},
 		CompileOptions{CompiledDFAThreshold: -1})

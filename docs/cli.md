@@ -164,6 +164,24 @@ These flags must appear before the subcommand name.
 regexped --debug compile --config=regexped.yaml
 ```
 
+Errors are always printed regardless of `--debug`; the flag only controls the
+diagnostic chatter below warning level.
+
+---
+
+## Exit codes
+
+| Code | Meaning | Examples |
+|---|---|---|
+| `0` | Success. Also returned by `-h` on any subcommand. | |
+| `1` | Usage error — the command line is wrong. | No subcommand, unknown subcommand, unrecognised flag, missing `--main`/`--output`, `--output=-` and `--diag-json=-` both writing to stdout |
+| `2` | Config or build error — the command line was fine, the work was not. | Malformed YAML, invalid export name, duplicate capture-group name, missing `import_module`, compile/generate/merge failure |
+| `3` | I/O error — a file could not be read or written. | Config file does not exist, config file not readable, output path not writable |
+
+Codes `2` and `3` are distinguished by inspecting the error: anything carrying a
+filesystem failure reports `3`, everything else reports `2`. So a config file that is
+missing is `3`, while a config file that is present but invalid is `2`.
+
 ---
 
 ## Commands

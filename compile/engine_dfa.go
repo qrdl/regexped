@@ -4705,14 +4705,14 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOf
 
 // appendMatchCodeEntry appends a size-prefixed match function body to cs.
 // Uses the hybrid dispatch path when l.useHybridDispatch is true.
-func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, hasImmAccept bool, tableMemIdx int) []byte {
+func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, tableMemIdx int) []byte {
 	var body []byte
 	if l.useHybridDispatch {
-		body = buildHybridMatchBody(t, l, hasImmAccept, tableMemIdx)
+		body = buildHybridMatchBody(t, l, tableMemIdx)
 	} else {
 		body = buildMatchBody(l.wasmStart, l.tableOff, l.classMapOff,
 			l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
-			l.immAcceptLimit, hasImmAccept, l.rowMapOff, l.useRowDedup, tableMemIdx,
+			l.rowMapOff, l.useRowDedup, tableMemIdx,
 			l.midAcceptOff, l.dominantStates)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
@@ -4941,31 +4941,6 @@ func emitU16Transition(b []byte,
 	b = append(b, 0x6A)
 	b = appendTableLoad16u(b, tableMemIdx) // cell = i32.load16_u (== state)
 	b = append(b, 0x21, stateLocal)
-	return b
-}
-
-// emitImmAcceptCheckMatch emits: if state u<= immAcceptLimit: return pos.
-// Used in match mode. No-op when hasImmAccept is false.
-//
-// Relies on reorderAcceptFirst placing immediate-accepting states at WASM IDs
-// 1..immAcceptLimit. The state==0 (dead) case is guarded by an earlier check
-// in the caller, so we use u<= (not <) here.
-func emitImmAcceptCheckMatch(b []byte, immAcceptLimit int32,
-	hasImmAccept bool, tableMemIdx int) []byte {
-	if !hasImmAccept {
-		return b
-	}
-	_ = tableMemIdx
-	const stateLocal = 0x02
-	const posLocal = 0x03
-	b = append(b, 0x20, stateLocal)            // local.get state
-	b = append(b, 0x41)                        // i32.const immAcceptLimit
-	b = utils.AppendSLEB128(b, immAcceptLimit) //
-	b = append(b, 0x4D)                        // i32.le_u
-	b = append(b, 0x04, 0x40)                  // if (void)
-	b = append(b, 0x20, posLocal)              // local.get pos
-	b = append(b, 0x0F)                        // return
-	b = append(b, 0x0B)                        // end if
 	return b
 }
 
@@ -5765,7 +5740,12 @@ func emitNLPreAcceptCheck(b []byte, midAcceptNLOff int32,
 //
 // startStateAccept: true when the DFA start state itself is an accepting state
 // (handles the empty-input case where no transition is ever taken).
-func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, immAcceptLimit int32, hasImmAccept bool, rowMapOff int32, useRowDedup bool, tableMemIdx int, midAcceptOff int32, dominantStates []dominantInfo) []byte {
+// Match mode has no immediate-accept check. immediateAccept is an LF-only
+// concept (buildDFALayout sets hasImmAccept only when leftmostFirst is true),
+// and the match DFA is compiled LL by design so that `^(a|aa)$` matches "aa"
+// — see the LL/LF note in compile.go. The two are permanently mutually
+// exclusive, so no immAcceptLimit/hasImmAccept parameters are threaded here.
+func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, rowMapOff int32, useRowDedup bool, tableMemIdx int, midAcceptOff int32, dominantStates []dominantInfo) []byte {
 	var b []byte
 
 	// emitAcceptCheck emits the final post-loop accept check:
@@ -5840,8 +5820,6 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 
-		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, tableMemIdx)
-
 		// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse class),
 		// hysteresis counter/scratch = locals 6/7 (only with non-mid).
 		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
@@ -5888,8 +5866,6 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x41, 0x7F)
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
-
-		b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 
 		// Phase 4 dispatch: tmp=local 4, chunk=local 5, hyst=6/7.
 		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
@@ -5938,8 +5914,6 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 	b = append(b, 0x41, 0x7F)
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
-
-	b = emitImmAcceptCheckMatch(b, immAcceptLimit, hasImmAccept, tableMemIdx)
 
 	// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse byte), hyst=6/7.
 	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)

@@ -1125,7 +1125,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// (padding-scan experiment, 2026-07-18); decisions here are
 			// gated on fuel only.
 			applyDominantStateEncoding(lm, true)
-			matchBody = appendMatchCodeEntry(nil, lm, llTable, lm.hasImmAccept, buildOpts.tableMemIdx)
+			matchBody = appendMatchCodeEntry(nil, lm, llTable, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false, false))
 			matchData = rawM
 			matchSegCnt = cntM
