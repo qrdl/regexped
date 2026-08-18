@@ -4768,3 +4768,82 @@ regexps
 -;1-2;-;-;1-2;1-2 1-2 -
 0-1 - 0-1;0-1;-;-;0-1,1-2;0-1 - 0-1
 -;1-2;-;-;1-2;1-2 - 1-2
+# ============================================================
+# FUZZER_BUGS.md #41: detectSkipSafeOnDead's mid-accept test (conditions (d)
+# and (e)) reads only the unconditional l.midAcceptBytes channel and never the
+# context-dependent midAcceptNW/midAcceptW/midAcceptNL side tables. A
+# zero-width `\B`/`(?m:$)` alternative that accepts empty at an intermediate
+# position lives exclusively in those side channels, so midStart looked "not
+# mid-accept", skipSafeOnDead was wrongly enabled, and the Task 8 dead-state
+# skip jumped the find scan from attempt_start straight past the zero-width
+# match to the death position + 1.
+#
+# The shape needed is narrow: a zero-width-acceptable branch alternated with a
+# branch whose first byte's successor self-loops on the same byte class
+# (`X X* ...` / `X+ ...`). `\B|aab` (no star) and `\B|a*b` (two distinct
+# first-byte successors) do not qualify and were always correct.
+# Repro from tools/fuzz/found/20260817-183159/185212-655762916f481e30.
+FuzzBug41SkipSafeOnDeadWordBoundary
+strings
+""
+"11"
+"112"
+"1112"
+"1x"
+"11xx"
+"110"
+"x110"
+regexps
+"\\B|11*0"
+0-0;0-0;-;-;0-0
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1,3-3,4-4
+0-3;0-3;-;-;0-3,3-3
+-;1-1;-;-;1-1,2-4,4-4
+"\\B|aa*b"
+0-0;0-0;-;-;0-0
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+"\\B|a+b"
+0-0;0-0;-;-;0-0
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+# Same defect through the OTHER side channel: `(?m:$)` mid-accepts via
+# midAcceptNLBytes rather than midAcceptNW/midAcceptW. The two channels are
+# separate tables, so a fix could plausibly cover one and not the other.
+FuzzBug41SkipSafeOnDeadMultilineAnchor
+strings
+""
+"aa\nc"
+"aa\ncc"
+"11\n2"
+"aab"
+"\n"
+regexps
+"(?m:$)|aa*b"
+0-0;0-0;-;-;0-0
+-;2-2;-;-;2-2,4-4
+-;2-2;-;-;2-2,5-5
+-;2-2;-;-;2-2,4-4
+0-3;0-3;-;-;0-3,3-3
+-;0-0;-;-;0-0,1-1
+"(?m:$)|11*0"
+0-0;0-0;-;-;0-0
+-;2-2;-;-;2-2,4-4
+-;2-2;-;-;2-2,5-5
+-;2-2;-;-;2-2,4-4
+-;3-3;-;-;3-3
+-;0-0;-;-;0-0,1-1

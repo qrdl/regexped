@@ -3107,6 +3107,36 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 //
 // The check is intentionally conservative: it's easier to add more patterns
 // to the skip-safe set later than to debug a wrong-answer regression.
+//
+// FUZZER_BUGS.md #41 — two things the original formulation got wrong for
+// word-boundary and multiline-anchor patterns, both fixed below:
+//
+//   - (d) asked "is this state mid-accept?" but could only answer via
+//     l.midAcceptBytes, the UNCONDITIONAL channel. A state that accepts
+//     empty only under a context — `\b`/`\B` (l.midAcceptNWBytes /
+//     l.midAcceptWBytes, consulted by emitWBPreAcceptCheck at the top of
+//     each scan iteration) or `(?m:^)`/`(?m:$)` (l.midAcceptNLBytes) — has
+//     midAcceptBytes[state] == 0 and was invisible to it. `\B|11*0` on
+//     "112" is the repro: midStart IS mid-accept via midAcceptNW, (d)
+//     passed anyway, and the skip jumped from attempt_start straight past
+//     the zero-width `\B` match at 1 to the death position + 1. Condition
+//     (d) now consults all four channels, for succ as well as midStart.
+//
+//   - The trajectory argument assumed every attempt begins at
+//     l.wasmMidStart. It doesn't: for attempt_start > 0 the outer-loop
+//     prologue selects wasmMidStartWord when the previous byte is a word
+//     char and wasmMidStartNewline when it is '\n' (see the
+//     "state = startState / midStartState / midStartWordState /
+//     midStartNewlineState" emitter). An intermediate attempt landing on
+//     one of those walks transitions this analysis never inspected.
+//     Condition (f) below closes that: every alternative entry state must
+//     either be unable to consume anything at all (empty accept class, so
+//     the attempt dies on its first byte having recorded nothing) or
+//     replicate midStart's own trajectory exactly.
+//
+// wasmStart is deliberately NOT in the entry set: the prologue selects it
+// only when attempt_start == 0, and the positions this optimization skips
+// are strictly greater than the original attempt's start.
 func detectSkipSafeOnDead(l *dfaLayout) {
 	if l.numWASM <= 1 {
 		return
@@ -3132,6 +3162,30 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 			cell = int(l.classMap[b])
 		}
 		return readCell(state, cell)
+	}
+
+	// isAnyMidAccept answers "can this state record a zero-width match at an
+	// attempt's start position?" across every channel that can set
+	// last_accept without consuming a byte: the unconditional table plus the
+	// three context-dependent ones (nil whenever the pattern doesn't need
+	// them). Deliberately treats ANY non-zero entry as accepting, including
+	// the 254/255 non-mid-dominant values applyDominantStateEncoding packs
+	// into midAcceptBytes — that is the conservative direction here, and it
+	// matches what condition (d) already did before FUZZER_BUGS.md #41.
+	isAnyMidAccept := func(state int) bool {
+		if state < len(l.midAcceptBytes) && l.midAcceptBytes[state] != 0 {
+			return true
+		}
+		if state < len(l.midAcceptNWBytes) && l.midAcceptNWBytes[state] != 0 {
+			return true
+		}
+		if state < len(l.midAcceptWBytes) && l.midAcceptWBytes[state] != 0 {
+			return true
+		}
+		if state < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[state] != 0 {
+			return true
+		}
+		return false
 	}
 
 	midStartIdx := int(l.wasmMidStart)
@@ -3180,8 +3234,32 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 	}
 
 	// (d) Neither midStart nor succ is mid-accept on the path before any
-	// match has been recorded.
-	if midStartIdx < len(l.midAcceptBytes) && l.midAcceptBytes[midStartIdx] != 0 {
+	// match has been recorded. The two are checked against DIFFERENT sets of
+	// channels, and the asymmetry is load-bearing (FUZZER_BUGS.md #41):
+	//
+	//   - midStart is an ENTRY state. An intermediate attempt begins there at
+	//     position k, where the original attempt was sitting in succ instead.
+	//     Nothing the original attempt did says anything about what midStart
+	//     does at k, so every channel that can record a zero-width match must
+	//     be clear — including the context-dependent ones. This is the bug-41
+	//     repro: `\B|11*0`'s midStart is mid-accept via midAcceptNW only.
+	//
+	//   - succ is NOT an entry state; it is only ever occupied at positions
+	//     the original attempt also occupied it in. The original attempt held
+	//     succ across K+1..P and still reached the dead handler with
+	//     last_accept < 0; an intermediate attempt from k > K holds succ
+	//     across k+1..P, a strict subset of those same positions, with the
+	//     same bytes and therefore the same word/newline contexts. So a
+	//     CONTEXT-dependent accept on succ provably did not fire at any
+	//     position an intermediate attempt revisits, and need not be checked.
+	//     An UNCONDITIONAL one must still be, since it would fire anywhere.
+	//
+	// Widening succ's check to all four channels is what wrongly disqualified
+	// `\b[a-z]+\b`: its succ ("consumed ≥1 letter") is mid-accept via
+	// midAcceptNW, because that is precisely how the pattern's trailing `\b`
+	// is encoded. Doing so cost +192% fuel on a homogeneous-run input while
+	// buying no correctness.
+	if isAnyMidAccept(midStartIdx) {
 		return
 	}
 	if int(succ) < len(l.midAcceptBytes) && l.midAcceptBytes[succ] != 0 {
@@ -3216,6 +3294,67 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		}
 		if !isAcceptingExit(transitionOn(int(succ), b)) {
 			return
+		}
+	}
+
+	// (f) Alternative entry states (FUZZER_BUGS.md #41). For attempt_start
+	// > 0 the outer-loop prologue picks midStartWord when the previous byte
+	// is a word char and midStartNewline when it is '\n', so an
+	// intermediate attempt need not begin at midStart at all. Each such
+	// state is checked here; they are skipped when the pattern aliases them
+	// onto midStart (every pattern without the corresponding boundary
+	// construct does).
+	//
+	// Two ways an alternative entry state can be safe:
+	//
+	//   1. Empty accept class — it consumes nothing, so the attempt dies on
+	//      its very first byte. Every intermediate position k lies strictly
+	//      inside (attempt_start, death position), so a byte at k always
+	//      exists and the death is immediate. Combined with the
+	//      not-mid-accept check this means the attempt records nothing at
+	//      all. This is the `\b[a-z]+\b` case: from a word char, `\b`
+	//      demands a non-word char next while `[a-z]+` demands a letter, so
+	//      midStartWord is dead on every byte.
+	//
+	//   2. It replicates midStart exactly — same accept class C, same single
+	//      successor succ, same dead-or-mid-accept behaviour off-class — in
+	//      which case the trajectory argument already proved for midStart
+	//      covers it verbatim.
+	//
+	// Anything else (a different class, a different successor, an off-class
+	// byte into a third scanning state) means the attempt can walk somewhere
+	// the original attempt never went, so bail.
+	for _, entry := range []uint32{l.wasmMidStartWord, l.wasmMidStartNewline} {
+		es := int(entry)
+		if es == midStartIdx {
+			continue // aliased onto midStart — nothing extra to prove
+		}
+		if es >= l.numWASM {
+			return // out of range: unanalysable, bail
+		}
+		if isAnyMidAccept(es) {
+			return // could record a zero-width match the skip would jump over
+		}
+		entryAccepts := false
+		for b := 0; b < 256; b++ {
+			if transitionOn(es, b) != 0 {
+				entryAccepts = true
+				break
+			}
+		}
+		if !entryAccepts {
+			continue // case 1: dies on its first byte, records nothing
+		}
+		// Case 2: must be indistinguishable from midStart.
+		for b := 0; b < 256; b++ {
+			t := transitionOn(es, b)
+			if midStartAccepts[b] {
+				if t != succ {
+					return
+				}
+			} else if !isAcceptingExit(t) {
+				return
+			}
 		}
 	}
 
