@@ -4730,3 +4730,41 @@ regexps
 -;5-35;-;-;-;5-35 5-24 27-31 33-35
 -;-;-;-;-;-
 0-29 0-19 22-26 28-29;0-29;-;-;-;0-29 0-19 22-26 28-29
+# ============================================================
+# FuzzBug40GapA4TDFAEligibilityBypass: FUZZER_BUGS.md bug 40.
+# ============================================================
+# The Gap A.4 capture path (compile.go, "lenient alternation with captures")
+# called newTDFA directly instead of going through the selector, so a pattern
+# the TDFA eligibility gates exclude — here hasLineAnchors(prog), from the `$`
+# in the first branch — still got a TDFA capture body whenever it happened to
+# match analyseLitChainAltLenient's shape. groups() then returned no match on
+# inputs where find() on the very same module was correct. The shape needs an
+# end-anchored first branch plus a second branch that survives Go's
+# regexp/syntax literal-fusion pass as OpConcat (i.e. carries a quantifier:
+# `a0??`, `a0?`, `ab?` all qualify; a bare `a`/`a0` fuses to one OpLiteral, so
+# analyseLitChainAltLenient rejects the alternation and the bug never fires).
+# Both patterns below are groups-only in this file's dispatch, which is what
+# makes Gap A.4 reachable at all (it requires !needMatch) — col0 is therefore
+# non-anchored groups() filtered to start==0, per this file's groupsFn
+# contract. Values cross-checked against live regexp.FindStringSubmatchIndex
+# (col0/col5), FindStringIndex (col1) and FindAllStringIndex (col4).
+FuzzBug40GapA4TDFAEligibilityBypass
+strings
+""
+"0"
+"00"
+"a0"
+"0a"
+regexps
+"(0$|a0??)"
+-;-;-;-;-;-
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+-;1-2;-;-;1-2;1-2 1-2
+0-1 0-1;0-1;-;-;0-1,1-2;0-1 0-1
+-;1-2;-;-;1-2;1-2 1-2
+"(0$)|(a0??)"
+-;-;-;-;-;-
+0-1 0-1 -;0-1;-;-;0-1;0-1 0-1 -
+-;1-2;-;-;1-2;1-2 1-2 -
+0-1 - 0-1;0-1;-;-;0-1,1-2;0-1 - 0-1
+-;1-2;-;-;1-2;1-2 - 1-2

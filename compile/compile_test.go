@@ -954,7 +954,17 @@ func TestT3Triggered(t *testing.T) {
 				t.Fatalf("newDFA: state limit exceeded")
 			}
 			tbl := dfaTableFrom(dfa)
-			l := buildDFALayout(tbl, 0, true, true, 0, false, false, false, false)
+			l := buildDFALayout(dfaLayoutParams{
+				t:                    tbl,
+				tableBase:            0,
+				needFind:             true,
+				leftmostFirst:        true,
+				compiledDFAThreshold: 0,
+				useAcceptSideTable:   false,
+				lmBareShufti:         false,
+				lmNonMidShufti:       false,
+				lmWideShufti:         false,
+			})
 
 			gotT1 := len(l.teddyT1LoBytes) > 0
 			gotT2 := len(l.teddyT2LoBytes) > 0

@@ -793,8 +793,22 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				if perr == nil && parsed.MaxCap() > 0 {
 					prog, cerr := syntax.Compile(parsed.Simplify())
 					if cerr == nil && !needsUnicodeSupport(prog) {
-						tt, tok := newTDFA(prog, resolveMaxDFAStates(&buildOpts))
-						if tok && tt.numRegs <= resolveMaxTDFARegs(&buildOpts) {
+						// Go through the selector rather than calling newTDFA
+						// directly. newTDFA happily builds a table for patterns
+						// TDFA cannot express correctly — non-greedy
+						// quantifiers, line/text anchors, word boundaries,
+						// ambiguous greedy alternations — and its bool result
+						// only reports the state-count ceiling, not eligibility.
+						// selectBestEngineWithTDFA applies all four gates plus
+						// both limits and hands back the very table it built, so
+						// an ineligible pattern falls through to the standard
+						// pipeline (which routes it to Backtracking) instead of
+						// silently getting a wrong TDFA capture body here. See
+						// plans/FUZZER_BUGS.md #40: `(0$|a0??)` reached this
+						// path with hasLineAnchors(prog) == true and returned
+						// no match from groups() where find() was correct.
+						selEng, tt := selectBestEngineWithTDFA(prog, &buildOpts)
+						if selEng == EngineTDFA && tt != nil {
 							p := &compiledPattern{
 								tableEnd:  tableBase,
 								numGroups: tt.numGroups,
@@ -822,8 +836,17 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 							// TDFA capture body placed after lenient-alt tables.
 							tdfaBase := utils.PageAlign(lenLayout.tableEnd)
-							tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true,
-								resolveCompiledDFAThreshold(&buildOpts), true, false, false, false)
+							tdfaLayout := buildDFALayout(dfaLayoutParams{
+								t:                    tt.dfaTable,
+								tableBase:            tdfaBase,
+								needFind:             false,
+								leftmostFirst:        true,
+								compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
+								useAcceptSideTable:   true,
+								lmBareShufti:         false,
+								lmNonMidShufti:       false,
+								lmWideShufti:         false,
+							})
 							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, false)
 							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
 							p.dataBytes = append(p.dataBytes, rawTDFA...)
@@ -1072,8 +1095,17 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx)
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
-			lm := buildDFALayout(llTable, cur, false, false, resolveCompiledDFAThreshold(&buildOpts), false, false,
-				buildOpts.LikelyMode == LikelyMatch, buildOpts.LikelyMode == LikelyMatch)
+			lm := buildDFALayout(dfaLayoutParams{
+				t:                    llTable,
+				tableBase:            cur,
+				needFind:             false,
+				leftmostFirst:        false,
+				compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
+				useAcceptSideTable:   false,
+				lmBareShufti:         false,
+				lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
+				lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
+			})
 			// Task 38 (2026-07-18): non-mid dominants are default-on for
 			// every LikelyMode again, replacing task 36's LikelyMatch-only
 			// gate, which was lossy in both directions — neutral callers
@@ -1149,10 +1181,17 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 	var l *dfaLayout
 	if !dfaTooLarge {
-		l = buildDFALayout(table, cur, needFindBody, true, resolveCompiledDFAThreshold(&buildOpts), false,
-			buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern),
-			buildOpts.LikelyMode == LikelyMatch,
-			buildOpts.LikelyMode == LikelyMatch)
+		l = buildDFALayout(dfaLayoutParams{
+			t:                    table,
+			tableBase:            cur,
+			needFind:             needFindBody,
+			leftmostFirst:        true,
+			compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
+			useAcceptSideTable:   false,
+			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern),
+			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
+			lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
+		})
 	}
 	patMandLit := findMandatoryLit(re.Pattern)
 
@@ -1292,7 +1331,17 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
 							revTable.midAcceptStates[revTable.startState] == 0)) {
 						revTableBase := utils.PageAlign(l.tableEnd)
-						revL := buildDFALayout(revTable, revTableBase, true, false, 0, false, false, false, false)
+						revL := buildDFALayout(dfaLayoutParams{
+							t:                    revTable,
+							tableBase:            revTableBase,
+							needFind:             true,
+							leftmostFirst:        false,
+							compiledDFAThreshold: 0,
+							useAcceptSideTable:   false,
+							lmBareShufti:         false,
+							lmNonMidShufti:       false,
+							lmWideShufti:         false,
+						})
 						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
 						// Task 22: when the prefix is a bare `[class]{M}` (M<=16),
 						// a single SIMD chunk verify replaces the scalar reverse
@@ -1351,17 +1400,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						}
 
 						revRawData, revSegCnt := stripSegCount(dfaDataSegments(revL, true, false))
-						var litSegs []byte
-						litSegCnt := 1
-						litSegs = appendDataSegment(litSegs, litFirstByteOff, litFirstByteFlags[:])
+						var litSegs segAccum
+						litSegs.add(litFirstByteOff, litFirstByteFlags[:])
 						if litTeddyLoBytes != nil {
-							litSegs = appendDataSegment(litSegs, litTeddyLoOff, litTeddyLoBytes)
-							litSegs = appendDataSegment(litSegs, litTeddyHiOff, litTeddyHiBytes)
-							litSegCnt += 2
+							litSegs.add(litTeddyLoOff, litTeddyLoBytes)
+							litSegs.add(litTeddyHiOff, litTeddyHiBytes)
 							if litTeddyT1LoBytes != nil {
-								litSegs = appendDataSegment(litSegs, litTeddyT1LoOff, litTeddyT1LoBytes)
-								litSegs = appendDataSegment(litSegs, litTeddyT1HiOff, litTeddyT1HiBytes)
-								litSegCnt += 2
+								litSegs.add(litTeddyT1LoOff, litTeddyT1LoBytes)
+								litSegs.add(litTeddyT1HiOff, litTeddyT1HiBytes)
 							}
 						}
 
@@ -1382,12 +1428,18 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						p.litAnchorLitSet = lap.litSet
 						p.dataBytes = append(p.dataBytes, revRawData...)
 						p.dataSegCount += revSegCnt
-						p.dataBytes = append(p.dataBytes, litSegs...)
-						p.dataSegCount += litSegCnt
-						// litAnchorPoint.litSet is hard-capped at 8 literals
-						// (lit_anchor.go), so litFirstBytes has ≤ 8 entries and
-						// the Teddy lo/hi tables above are always populated.
-						p.tableEnd = int64(litTeddyT1HiOff) + 16
+						p.dataBytes = append(p.dataBytes, litSegs.bytes...)
+						p.dataSegCount += litSegs.count
+						// Derived from the segments actually appended, not from
+						// litTeddyT1HiOff: that offset is only assigned when
+						// len(litFirstBytes) <= 8, and while litAnchorPoint.litSet
+						// is hard-capped at 8 literals in lit_anchor.go, nothing
+						// links that invariant to this arithmetic. If it ever broke,
+						// tableEnd would silently collapse to 16 and the next
+						// pattern's tables would overwrite this one's. Every lit
+						// segment sits at or above revL.tableEnd (litFirstByteOff is
+						// exactly revL.tableEnd), so the reverse DFA is covered too.
+						p.tableEnd = litSegs.end
 					}
 				}
 			}
@@ -1582,7 +1634,17 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		} else {
 			p.isTDFA = true
 			tdfaBase := utils.PageAlign(p.tableEnd)
-			tdfaLayout := buildDFALayout(tt.dfaTable, tdfaBase, false, true, resolveCompiledDFAThreshold(&buildOpts), true, false, false, false)
+			tdfaLayout := buildDFALayout(dfaLayoutParams{
+				t:                    tt.dfaTable,
+				tableBase:            tdfaBase,
+				needFind:             false,
+				leftmostFirst:        true,
+				compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
+				useAcceptSideTable:   true,
+				lmBareShufti:         false,
+				lmNonMidShufti:       false,
+				lmWideShufti:         false,
+			})
 			p.numGroups = tt.numGroups
 			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored)
 			// TDFA only needs the transition table (no stack/memo).

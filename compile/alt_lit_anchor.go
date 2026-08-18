@@ -81,7 +81,17 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 			return nil, false
 		}
 
-		l := buildDFALayout(table, cur, true, true, resolveCompiledDFAThreshold(&buildOpts), false, false, false, false)
+		l := buildDFALayout(dfaLayoutParams{
+			t:                    table,
+			tableBase:            cur,
+			needFind:             true,
+			leftmostFirst:        true,
+			compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
+			useAcceptSideTable:   false,
+			lmBareShufti:         false,
+			lmNonMidShufti:       false,
+			lmWideShufti:         false,
+		})
 		if !l.useU8 {
 			return nil, false
 		}
@@ -108,7 +118,17 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		}
 
 		revTableBase := utils.PageAlign(l.tableEnd)
-		revL := buildDFALayout(revTable, revTableBase, true, false, 0, false, false, false, false)
+		revL := buildDFALayout(dfaLayoutParams{
+			t:                    revTable,
+			tableBase:            revTableBase,
+			needFind:             true,
+			leftmostFirst:        false,
+			compiledDFAThreshold: 0,
+			useAcceptSideTable:   false,
+			lmBareShufti:         false,
+			lmNonMidShufti:       false,
+			lmWideShufti:         false,
+		})
 		bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
 
 		// Opt 1 (Task 7) — default-on for every mode, same as the
@@ -213,21 +233,18 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		}
 	}
 
-	var teddySegs []byte
-	teddySegCnt := 1
-	teddySegs = appendDataSegment(teddySegs, firstByteOff, unionFirstByteFlags[:])
+	var teddySegs segAccum
+	teddySegs.add(firstByteOff, unionFirstByteFlags[:])
 	if teddyLoBytes != nil {
-		teddySegs = appendDataSegment(teddySegs, teddyLoOff, teddyLoBytes)
-		teddySegs = appendDataSegment(teddySegs, teddyHiOff, teddyHiBytes)
-		teddySegCnt += 2
+		teddySegs.add(teddyLoOff, teddyLoBytes)
+		teddySegs.add(teddyHiOff, teddyHiBytes)
 		if teddyT1LoBytes != nil {
-			teddySegs = appendDataSegment(teddySegs, teddyT1LoOff, teddyT1LoBytes)
-			teddySegs = appendDataSegment(teddySegs, teddyT1HiOff, teddyT1HiBytes)
-			teddySegCnt += 2
+			teddySegs.add(teddyT1LoOff, teddyT1LoBytes)
+			teddySegs.add(teddyT1HiOff, teddyT1HiBytes)
 		}
 	}
-	result.dataBytes = append(result.dataBytes, teddySegs...)
-	result.dataSegCount += teddySegCnt
+	result.dataBytes = append(result.dataBytes, teddySegs.bytes...)
+	result.dataSegCount += teddySegs.count
 
 	result.firstByteOff = firstByteOff
 	result.firstByteFlags = unionFirstByteFlags
@@ -241,12 +258,11 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 	result.teddyT1LoBytes = teddyT1LoBytes
 	result.teddyT1HiBytes = teddyT1HiBytes
 
-	result.tableEnd = int64(teddyT1HiOff) + 16
-	if teddyLoBytes == nil {
-		result.tableEnd = int64(firstByteOff) + 256
-	} else if teddyT1LoBytes == nil {
-		result.tableEnd = int64(teddyHiOff) + 16
-	}
+	// Derived from the segments actually appended rather than re-deduced from
+	// whichever Teddy offsets happen to be assigned — the three-way branch this
+	// replaces had to stay in lockstep with the emission above by hand. See
+	// plans/OPUS.md §N10.
+	result.tableEnd = teddySegs.end
 
 	return result, true
 }

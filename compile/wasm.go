@@ -24,6 +24,35 @@ func appendDataSegment(out []byte, offset int32, data []byte) []byte {
 	return append(out, data...)
 }
 
+// segAccum accumulates active data segments while tracking the highest address
+// one past the end of everything appended. It exists so a pattern's tableEnd can
+// be derived positively — from what was actually emitted — instead of being
+// recomputed from an offset variable that a conditional branch may have left at
+// its zero value.
+//
+// The recomputed form is fragile in a specific way: the lit-anchor and
+// alt-lit-anchor paths emit a *variable* number of Teddy tables, and the
+// invariant that decides how many (litSet is capped at 8 literals in
+// lit_anchor.go) lives in a different file from the arithmetic that depends on
+// it. Getting it wrong does not fail the build — it yields a tableEnd far below
+// the real end of the tables, and since the next pattern is laid out from
+// PageAlign(tableEnd), that pattern's tables would be written on top of this
+// one's. See plans/OPUS.md §N10.
+type segAccum struct {
+	bytes []byte
+	count int
+	end   int64 // one past the highest byte written by any appended segment
+}
+
+// add appends one active data segment and extends end to cover it.
+func (s *segAccum) add(offset int32, data []byte) {
+	s.bytes = appendDataSegment(s.bytes, offset, data)
+	s.count++
+	if e := int64(offset) + int64(len(data)); e > s.end {
+		s.end = e
+	}
+}
+
 // dataSegment holds one data segment's target address and raw bytes.
 // Used when building the non-standalone init function (passive segments).
 type dataSegment struct {

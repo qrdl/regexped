@@ -1054,6 +1054,18 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// directly from it), which already dedups via its own visited tracking —
 	// no separate dedup pass is needed here.
 	//
+	// PCs are encoded as fixed-width 4-byte little-endian, NOT via WriteRune.
+	// WriteRune replaces any argument that is not a valid Unicode scalar with
+	// utf8.RuneError, so every PC in the surrogate window 0xD800-0xDFFF (2048
+	// values) — and PC 0xFFFD — would encode to the same three bytes, merging
+	// distinct NFA state sets into one DFA state and emitting a silently wrong
+	// table. Programs that large are rare but reachable (a 110-char pattern can
+	// exceed 0xD800 syntax.Prog instructions), and the corruption happens during
+	// construction, so it produces a wrong DFA rather than a clean fallback.
+	// Fixed width also removes the need for a separator byte: the state prefix is
+	// exactly 4*len(states) bytes, so the 'W'/'N'/acceptBits suffix cannot be
+	// confused with state data.
+	//
 	// A fresh strings.Builder per call is required, not a shared/reset one:
 	// Builder.String() hands back a string backed by the builder's own byte
 	// slice with no copy, and the returned key is retained long-term as a
@@ -1062,10 +1074,11 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// stored key.
 	setToKey := func(states []uint32, prevWasWord bool, acceptBits uint64, prevWasNewline ...bool) string {
 		var keyBuf strings.Builder
-		keyBuf.Grow(len(states)*2 + 10)
+		keyBuf.Grow(len(states)*4 + 10)
+		var b4 [4]byte
 		for _, s := range states {
-			keyBuf.WriteRune(rune(s))
-			keyBuf.WriteByte(',')
+			binary.LittleEndian.PutUint32(b4[:], s)
+			keyBuf.Write(b4[:])
 		}
 		if prevWasWord {
 			keyBuf.WriteByte('W')
@@ -2376,8 +2389,37 @@ func dfaTableBytes(t *dfaTable) int {
 // useAcceptSideTable: when true, emit a per-state accept side table at acceptOff
 // (used by TDFA, whose state IDs are not partitioned and cannot use acceptLimit).
 // forceWordChar (optional): force word-char table computation even when needFind=false.
-func buildDFALayout(t *dfaTable, tableBase int64, needFind, leftmostFirst bool, compiledDFAThreshold int, useAcceptSideTable bool, lmBareShufti bool, lmNonMidShufti bool, lmWideShufti bool, forceWordChar ...bool) *dfaLayout {
-	wantWordChar := needFind || (len(forceWordChar) > 0 && forceWordChar[0])
+// dfaLayoutParams are the inputs to buildDFALayout. Grouped into a struct so
+// call sites are keyed rather than a run of bare positional booleans, where
+// transposing two would compile cleanly and emit a subtly wrong module.
+// See plans/OPUS.md §N11.
+type dfaLayoutParams struct {
+	t                    *dfaTable
+	tableBase            int64
+	needFind             bool
+	leftmostFirst        bool
+	compiledDFAThreshold int
+	useAcceptSideTable   bool
+	lmBareShufti         bool
+	lmNonMidShufti       bool
+	lmWideShufti         bool
+	forceWordChar        bool
+}
+
+func buildDFALayout(p dfaLayoutParams) *dfaLayout {
+	// Destructured once so the body below reads exactly as it did when these
+	// were positional parameters; the struct exists to make call sites keyed.
+	t := p.t
+	tableBase := p.tableBase
+	needFind := p.needFind
+	leftmostFirst := p.leftmostFirst
+	compiledDFAThreshold := p.compiledDFAThreshold
+	useAcceptSideTable := p.useAcceptSideTable
+	lmBareShufti := p.lmBareShufti
+	lmNonMidShufti := p.lmNonMidShufti
+	lmWideShufti := p.lmWideShufti
+	forceWordChar := p.forceWordChar
+	wantWordChar := needFind || forceWordChar
 	l := &dfaLayout{}
 	l.lmBareShufti = lmBareShufti
 	l.lmNonMidShufti = lmNonMidShufti
@@ -4023,7 +4065,18 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		}
 	}
 
-	l := buildDFALayout(t, tableBase, false, true, 0, false, false, false, false, t.hasWordBoundary)
+	l := buildDFALayout(dfaLayoutParams{
+		t:                    t,
+		tableBase:            tableBase,
+		needFind:             false,
+		leftmostFirst:        true,
+		compiledDFAThreshold: 0,
+		useAcceptSideTable:   false,
+		lmBareShufti:         false,
+		lmNonMidShufti:       false,
+		lmWideShufti:         false,
+		forceWordChar:        t.hasWordBoundary,
+	})
 
 	// LIKELY.md Gap H.2: both mid-accept and non-mid-accept dominants are
 	// always kept for the buildSetSuffixBody bulk-skip dispatch (default-on
@@ -4553,29 +4606,76 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			body = buildHybridFindBody(t, l, mandatoryLit, tableMemIdx)
 		}
 	} else if isAnchoredFind(t) {
-		body = buildAnchoredFindBody(l.wasmStart, l.tableOff, l.midAcceptOff,
-			l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
-			l.startBeginAccept, l.immAcceptLimit, l.hasImmAccept,
-			l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff,
-			l.midAcceptNLOff, t.hasNewlineBoundary, tableMemIdx)
+		body = buildAnchoredFindBody(anchoredFindBodyParams{
+			startState:         l.wasmStart,
+			tableOff:           l.tableOff,
+			midAcceptOff:       l.midAcceptOff,
+			classMapOff:        l.classMapOff,
+			numClasses:         l.numClasses,
+			useU8:              l.useU8,
+			useCompression:     l.useCompression,
+			acceptLimit:        l.acceptLimit,
+			startBeginAccept:   l.startBeginAccept,
+			immAcceptLimit:     l.immAcceptLimit,
+			hasImmAccept:       l.hasImmAccept,
+			wordCharTableOff:   l.wordCharTableOff,
+			hasWordBoundary:    l.needWordCharTable,
+			midAcceptNWOff:     l.midAcceptNWOff,
+			midAcceptWOff:      l.midAcceptWOff,
+			midAcceptNLOff:     l.midAcceptNLOff,
+			hasNewlineBoundary: t.hasNewlineBoundary,
+			tableMemIdx:        tableMemIdx,
+		})
 	} else {
-		body = buildFindBody(l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
-			l.wasmMidStartNewline, l.wasmPrefixEnd, l.wasmPrefixEndWord, l.wasmPrefixEndStart,
-			l.wasmPrefixEndNewline,
-			l.tableOff, l.midAcceptOff,
-			l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
-			l.useU8, l.useCompression, l.acceptLimit, l.startBeginAccept,
-			l.immAcceptLimit, l.hasImmAccept,
-			l.wordCharTableOff, l.needWordCharTable,
-			l.midAcceptNWOff, l.midAcceptWOff, t.hasNewlineBoundary,
-			l.firstByteFlags, l.firstBytes,
-			l.teddyLoOff, l.teddyHiOff,
-			l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0,
-			l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0,
-			l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
-			mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
-			tableMemIdx,
-			l.dominantStates, l.lnmAction5, l.skipSafeOnDead, l.eofSkipSafe)
+		body = buildFindBody(findBodyParams{
+			startState:            l.wasmStart,
+			midStartState:         l.wasmMidStart,
+			midStartWordState:     l.wasmMidStartWord,
+			midStartNewlineState:  l.wasmMidStartNewline,
+			prefixEndState:        l.wasmPrefixEnd,
+			prefixEndStateWord:    l.wasmPrefixEndWord,
+			prefixEndStateStart:   l.wasmPrefixEndStart,
+			prefixEndStateNewline: l.wasmPrefixEndNewline,
+			tableOff:              l.tableOff,
+			midAcceptOff:          l.midAcceptOff,
+			firstByteOff:          l.firstByteOff,
+			prefix:                l.prefix,
+			classMapOff:           l.classMapOff,
+			numClasses:            l.numClasses,
+			useU8:                 l.useU8,
+			useCompression:        l.useCompression,
+			acceptLimit:           l.acceptLimit,
+			startBeginAccept:      l.startBeginAccept,
+			immAcceptLimit:        l.immAcceptLimit,
+			hasImmAccept:          l.hasImmAccept,
+			wordCharTableOff:      l.wordCharTableOff,
+			hasWordBoundary:       l.needWordCharTable,
+			midAcceptNWOff:        l.midAcceptNWOff,
+			midAcceptWOff:         l.midAcceptWOff,
+			hasNewlineBoundary:    t.hasNewlineBoundary,
+			firstByteFlags:        l.firstByteFlags,
+			firstBytes:            l.firstBytes,
+			teddyLoOff:            l.teddyLoOff,
+			teddyHiOff:            l.teddyHiOff,
+			teddyT1LoOff:          l.teddyT1LoOff,
+			teddyT1HiOff:          l.teddyT1HiOff,
+			teddyTwoByte:          len(l.teddyT1LoBytes) > 0,
+			teddyT2LoOff:          l.teddyT2LoOff,
+			teddyT2HiOff:          l.teddyT2HiOff,
+			teddyThreeByte:        len(l.teddyT2LoBytes) > 0,
+			teddyT3LoOff:          l.teddyT3LoOff,
+			teddyT3HiOff:          l.teddyT3HiOff,
+			teddyFourByte:         len(l.teddyT3LoBytes) > 0,
+			mandatoryLit:          mandatoryLit,
+			rowMapOff:             l.rowMapOff,
+			useRowDedup:           l.useRowDedup,
+			midAcceptNLOff:        l.midAcceptNLOff,
+			tableMemIdx:           tableMemIdx,
+			dominantStates:        l.dominantStates,
+			lnmAction5:            l.lnmAction5,
+			skipSafeOnDead:        l.skipSafeOnDead,
+			eofSkipSafe:           l.eofSkipSafe,
+		})
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -5976,7 +6076,51 @@ func isAnchoredFind(t *dfaTable) bool {
 //	  if last_accept >= 0: return packed i64
 //	end $no_match
 //	i64.const -1
-func buildAnchoredFindBody(startState uint32, tableOff, midAcceptOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, midAcceptNLOff int32, hasNewlineBoundary bool, tableMemIdx int) []byte {
+//
+// anchoredFindBodyParams are the inputs to buildAnchoredFindBody. See
+// dfaLayoutParams for why these are a struct rather than positional.
+type anchoredFindBodyParams struct {
+	startState         uint32
+	tableOff           int32
+	midAcceptOff       int32
+	classMapOff        int32
+	numClasses         int
+	useU8              bool
+	useCompression     bool
+	acceptLimit        int32
+	startBeginAccept   bool
+	immAcceptLimit     int32
+	hasImmAccept       bool
+	wordCharTableOff   int32
+	hasWordBoundary    bool
+	midAcceptNWOff     int32
+	midAcceptWOff      int32
+	midAcceptNLOff     int32
+	hasNewlineBoundary bool
+	tableMemIdx        int
+}
+
+func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
+	// Destructured once so the body below reads exactly as it did when these
+	// were positional parameters; the struct exists to make call sites keyed.
+	startState := p.startState
+	tableOff := p.tableOff
+	midAcceptOff := p.midAcceptOff
+	classMapOff := p.classMapOff
+	numClasses := p.numClasses
+	useU8 := p.useU8
+	useCompression := p.useCompression
+	acceptLimit := p.acceptLimit
+	startBeginAccept := p.startBeginAccept
+	immAcceptLimit := p.immAcceptLimit
+	hasImmAccept := p.hasImmAccept
+	wordCharTableOff := p.wordCharTableOff
+	hasWordBoundary := p.hasWordBoundary
+	midAcceptNWOff := p.midAcceptNWOff
+	midAcceptWOff := p.midAcceptWOff
+	midAcceptNLOff := p.midAcceptNLOff
+	hasNewlineBoundary := p.hasNewlineBoundary
+	tableMemIdx := p.tableMemIdx
 	var b []byte
 
 	// emitPrologue: state=startState, pos=0 (default), last_accept=-1, midAccept check.
@@ -7250,7 +7394,110 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 //	end $no_match
 //	i64.const -1
 //	end function
-func buildFindBody(startState, midStartState, midStartWordState, midStartNewlineState, prefixEndState, prefixEndStateWord, prefixEndStateStart, prefixEndStateNewline uint32, tableOff, midAcceptOff, firstByteOff int32, prefix []byte, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, startBeginAccept bool, immAcceptLimit int32, hasImmAccept bool, wordCharTableOff int32, hasWordBoundary bool, midAcceptNWOff, midAcceptWOff int32, hasNewlineBoundary bool, firstByteFlags [256]byte, firstBytes []byte, teddyLoOff, teddyHiOff, teddyT1LoOff, teddyT1HiOff int32, teddyTwoByte bool, teddyT2LoOff, teddyT2HiOff int32, teddyThreeByte bool, teddyT3LoOff, teddyT3HiOff int32, teddyFourByte bool, mandatoryLit *mandatoryLit, rowMapOff int32, useRowDedup bool, midAcceptNLOff int32, tableMemIdx int, dominantStates []dominantInfo, lnmAction5 bool, skipSafeOnDead bool, eofSkipSafe bool) []byte {
+//
+// findBodyParams are the inputs to buildFindBody, which had grown to ~50
+// positional parameters — long runs of same-typed int32 offsets and bools that
+// no reviewer could check by eye. See dfaLayoutParams.
+type findBodyParams struct {
+	startState            uint32
+	midStartState         uint32
+	midStartWordState     uint32
+	midStartNewlineState  uint32
+	prefixEndState        uint32
+	prefixEndStateWord    uint32
+	prefixEndStateStart   uint32
+	prefixEndStateNewline uint32
+	tableOff              int32
+	midAcceptOff          int32
+	firstByteOff          int32
+	prefix                []byte
+	classMapOff           int32
+	numClasses            int
+	useU8                 bool
+	useCompression        bool
+	acceptLimit           int32
+	startBeginAccept      bool
+	immAcceptLimit        int32
+	hasImmAccept          bool
+	wordCharTableOff      int32
+	hasWordBoundary       bool
+	midAcceptNWOff        int32
+	midAcceptWOff         int32
+	hasNewlineBoundary    bool
+	firstByteFlags        [256]byte
+	firstBytes            []byte
+	teddyLoOff            int32
+	teddyHiOff            int32
+	teddyT1LoOff          int32
+	teddyT1HiOff          int32
+	teddyTwoByte          bool
+	teddyT2LoOff          int32
+	teddyT2HiOff          int32
+	teddyThreeByte        bool
+	teddyT3LoOff          int32
+	teddyT3HiOff          int32
+	teddyFourByte         bool
+	mandatoryLit          *mandatoryLit
+	rowMapOff             int32
+	useRowDedup           bool
+	midAcceptNLOff        int32
+	tableMemIdx           int
+	dominantStates        []dominantInfo
+	lnmAction5            bool
+	skipSafeOnDead        bool
+	eofSkipSafe           bool
+}
+
+func buildFindBody(p findBodyParams) []byte {
+	// Destructured once so the body below reads exactly as it did when these
+	// were positional parameters; the struct exists to make call sites keyed.
+	startState := p.startState
+	midStartState := p.midStartState
+	midStartWordState := p.midStartWordState
+	midStartNewlineState := p.midStartNewlineState
+	prefixEndState := p.prefixEndState
+	prefixEndStateWord := p.prefixEndStateWord
+	prefixEndStateStart := p.prefixEndStateStart
+	prefixEndStateNewline := p.prefixEndStateNewline
+	tableOff := p.tableOff
+	midAcceptOff := p.midAcceptOff
+	firstByteOff := p.firstByteOff
+	prefix := p.prefix
+	classMapOff := p.classMapOff
+	numClasses := p.numClasses
+	useU8 := p.useU8
+	useCompression := p.useCompression
+	acceptLimit := p.acceptLimit
+	startBeginAccept := p.startBeginAccept
+	immAcceptLimit := p.immAcceptLimit
+	hasImmAccept := p.hasImmAccept
+	wordCharTableOff := p.wordCharTableOff
+	hasWordBoundary := p.hasWordBoundary
+	midAcceptNWOff := p.midAcceptNWOff
+	midAcceptWOff := p.midAcceptWOff
+	hasNewlineBoundary := p.hasNewlineBoundary
+	firstByteFlags := p.firstByteFlags
+	firstBytes := p.firstBytes
+	teddyLoOff := p.teddyLoOff
+	teddyHiOff := p.teddyHiOff
+	teddyT1LoOff := p.teddyT1LoOff
+	teddyT1HiOff := p.teddyT1HiOff
+	teddyTwoByte := p.teddyTwoByte
+	teddyT2LoOff := p.teddyT2LoOff
+	teddyT2HiOff := p.teddyT2HiOff
+	teddyThreeByte := p.teddyThreeByte
+	teddyT3LoOff := p.teddyT3LoOff
+	teddyT3HiOff := p.teddyT3HiOff
+	teddyFourByte := p.teddyFourByte
+	mandatoryLit := p.mandatoryLit
+	rowMapOff := p.rowMapOff
+	useRowDedup := p.useRowDedup
+	midAcceptNLOff := p.midAcceptNLOff
+	tableMemIdx := p.tableMemIdx
+	dominantStates := p.dominantStates
+	lnmAction5 := p.lnmAction5
+	skipSafeOnDead := p.skipSafeOnDead
+	eofSkipSafe := p.eofSkipSafe
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
 	// `nonMidDominantOff` parameter and the `[]int` return slot) was
@@ -12528,8 +12775,18 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 		// #14) for branches with \b/\B, so those tables must actually be built
 		// here — needFind is false for this layout, which would otherwise skip
 		// them (wantWordChar = needFind || forceWordChar[0]).
-		br.dfaLayout = buildDFALayout(br.dfaTable, cur, false, false, 0, false, false, false, false,
-			br.dfaTable.hasWordBoundary)
+		br.dfaLayout = buildDFALayout(dfaLayoutParams{
+			t:                    br.dfaTable,
+			tableBase:            cur,
+			needFind:             false,
+			leftmostFirst:        false,
+			compiledDFAThreshold: 0,
+			useAcceptSideTable:   false,
+			lmBareShufti:         false,
+			lmNonMidShufti:       false,
+			lmWideShufti:         false,
+			forceWordChar:        br.dfaTable.hasWordBoundary,
+		})
 		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
 		// forceMidAccept=true: emitInlineAnchoredDFAVerify reads dl.midAcceptOff
 		// unconditionally (FUZZER_BUGS.md #4/#9) regardless of dominant states,
