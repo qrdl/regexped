@@ -5017,3 +5017,305 @@ regexps
 -;-;-;-
 -;0-23;-;-;0-23
 -;0-23;-;-;0-23
+# ============================================================
+# Category 36: FABLE.md wave 3 — lit-chain anchor / range gates
+# ============================================================
+# B6: the three Gap E mixed-prefix emitters
+# (buildLitChainPrefixedMatchBody, buildLitChainPrefixedFindBody,
+# emitLitChainAltLitBranchBodyPrefixed) never referenced startAnchor /
+# endAnchor even though analyseLitChainBranch peels and records them, so an
+# anchored `<class>{M}<literal><class>{N}` pattern matched as if unanchored.
+# The last pattern in each block is the unanchored control that must keep
+# taking the (correct) prefixed fast path.
+FableB6PrefixedAnchorsDropped
+strings
+"zzababXY012345678901234567890123"
+"ababXY012345678901234567890123"
+"ababXY012345678901234567890123z"
+"!!!!XY012345678901234567890123"
+"a!!!!XY012345678901234567890123"
+"cdcdZW012345678901234567890123"
+regexps
+"^[ab]{4}XY[0-9]{24}"
+-;-;-;-
+0-30;0-30;-;-
+-;0-30;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"[ab]{4}XY[0-9]{24}$"
+-;2-32;-;-
+0-30;0-30;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"\\b[!-,]{4}XY[0-9]{24}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;1-31;-;-
+-;-;-;-
+"[ab]{4}XY[0-9]{24}"
+-;2-32;-;-
+0-30;0-30;-;-
+-;0-30;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# B6 (alternation half) and B9. Both bodies below are only reachable with
+# find_func compiled alone (compile.go's `needFind && !needMatch` gate), so
+# these rows only discriminate under `make findonly`; under every other
+# target they exercise the classic DFA.
+#   pattern 1/2: anchored branches — B6.
+#   pattern 3:   branches with DIFFERENT prefix lengths (2 vs 4) — B9. The
+#                candidate scan finds literals in literal-position order but
+#                each branch reports a match start of attempt_start-prefixCount,
+#                so with unequal prefixes the emitted body returned branch 1's
+#                later-starting match ([1,19)) over branch 2's ([0,20)).
+#   pattern 4:   unanchored, equal prefix lengths — the control that must
+#                still take the alt-prefixed fast path.
+FableB6B9AltPrefixedFindOnly
+strings
+"zzababXY012345678901234567890123"
+"ababXY012345678901234567890123"
+"ababXY012345678901234567890123z"
+"cdcdZW012345678901234567890123"
+"123aZWkkkkkkkkkkkkkkk"
+"zzcdcdZW012345678901234567890123"
+regexps
+"^[ab]{4}XY[0-9]{24}|^[cd]{4}ZW[0-9]{24}"
+-;-;-;-
+0-30;0-30;-;-
+-;0-30;-;-
+0-30;0-30;-;-
+-;-;-;-
+-;-;-;-
+"[ab]{4}XY[0-9]{24}$|[cd]{4}ZW[0-9]{24}$"
+-;2-32;-;-
+0-30;0-30;-;-
+-;-;-;-
+0-30;0-30;-;-
+-;-;-;-
+-;2-32;-;-
+"[0-9]{2}a[A-Za-z]{15}|[0-9a]{4}ZW[A-Za-z]{14}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-20;-;-
+-;-;-;-
+"[ab]{4}XY[0-9]{24}|[cd]{4}ZW[0-9]{24}"
+-;2-32;-;-
+0-30;0-30;-;-
+-;0-30;-;-
+0-30;0-30;-;-
+-;-;-;-
+-;2-32;-;-
+# B7 and B10, single-pattern `{N,M}` find.
+#   patterns 1/2/4: buildLitChainRangeFindBody ignored startAnchor/endAnchor
+#                   (its fixed-count sibling has a full hasAnchors path).
+#   pattern 3:      non-greedy `{N,M}?` collapses to `{N,N}` in find mode, but
+#                   Perl lets it extend past N when a trailing anchor demands
+#                   it — B10.
+#   pattern 5:      unanchored control, must keep the range fast path.
+FableB7B10RangeFindAnchors
+strings
+"zzA012345678901234567890123456789"
+"A012345678901234567890123456789"
+"A0123456789012345678901234x"
+"A01234567890123456789012345"
+"A012345678901234567890123"
+"zzA012345678901234567890123x"
+regexps
+"^A[0-9]{24,30}"
+-;-;-;-
+0-31;0-31;-;-
+-;0-26;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;-;-;-
+"A[0-9]{24,30}$"
+-;2-33;-;-
+0-31;0-31;-;-
+-;-;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;-;-;-
+"A[0-9]{24,30}?$"
+-;2-33;-;-
+0-31;0-31;-;-
+-;-;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;-;-;-
+"^A[0-9]{24,30}$"
+-;-;-;-
+0-31;0-31;-;-
+-;-;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;-;-;-
+"A[0-9]{24,30}"
+-;2-33;-;-
+0-31;0-31;-;-
+-;0-26;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;2-27;-;-
+# B7, capture half: buildLitChainRangeFindGroupsBody had the same blind spot.
+# The discriminating row is `A([0-9]{24,30})$` on "A"+25 digits+"x", where the
+# body reported [0,26) with `$` unchecked.
+FableB7RangeGroupsAnchors
+strings
+"zzA012345678901234567890123456789"
+"A012345678901234567890123456789"
+"A012345678901234567890123"
+regexps
+"^A([0-9]{24,30})"
+-;-;-;-;-;-
+0-31 1-31;0-31;-;-;-;0-31 1-31
+0-25 1-25;0-25;-;-;-;0-25 1-25
+"A([0-9]{24,30})$"
+-;2-33;-;-;-;2-33 3-33
+0-31 1-31;0-31;-;-;-;0-31 1-31
+0-25 1-25;0-25;-;-;-;0-25 1-25
+# Separate block for the discriminating end-anchor input: the buggy body
+# returned [0,26) with `$` unchecked, so col0 "-" vs end=26 is the failure.
+# Kept out of the block above because col0 for a capturing pattern follows
+# groups()' start-at-0 contract, while --validate-go's col0 oracle requires
+# the match to span the whole input — the two disagree on
+# "^A([0-9]{24,30})" + this input, and only on it.
+FableB7RangeGroupsEndAnchor
+strings
+"A0123456789012345678901234x"
+"A012345678901234567890123456789"
+regexps
+"A([0-9]{24,30})$"
+-;-;-;-;-;-
+0-31 1-31;0-31;-;-;-;0-31 1-31
+# B8: extractLitChainCaptures gives every OpRepeat a Min-based width, and
+# emitLitChainRangeGroupSlotWrites re-derived "this capture ends at the chain"
+# by testing endOffset == K + countMax — an equality that can never hold for a
+# true range, so every chain-covering capture got a frozen attemptStart+K+Min
+# end. The flag is now recorded structurally by the walk. Fixed-count captures
+# (all offsets genuinely compile-time) are unaffected; the nested shapes pin
+# that the flag propagates through OpCapture and OpConcat.
+FableB8RangeGroupsChainEnd
+strings
+"A012345678901234567890123456789"
+"A012345678901234567890123"
+"A012345678901234567890123456"
+"zzA01234567890123456789012345678901234!"
+regexps
+"A([0-9]{24,30})"
+0-31 1-31;0-31;-;-;-;0-31 1-31
+0-25 1-25;0-25;-;-;-;0-25 1-25
+0-28 1-28;0-28;-;-;-;0-28 1-28
+-;2-33;-;-;-;2-33 3-33
+"(A[0-9]{24,30})"
+0-31 0-31;0-31;-;-;-;0-31 0-31
+0-25 0-25;0-25;-;-;-;0-25 0-25
+0-28 0-28;0-28;-;-;-;0-28 0-28
+-;2-33;-;-;-;2-33 2-33
+"(A)([0-9]{24,30})"
+0-31 0-1 1-31;0-31;-;-;-;0-31 0-1 1-31
+0-25 0-1 1-25;0-25;-;-;-;0-25 0-1 1-25
+0-28 0-1 1-28;0-28;-;-;-;0-28 0-1 1-28
+-;2-33;-;-;-;2-33 2-3 3-33
+"((A)[0-9]{24,30})"
+0-31 0-31 0-1;0-31;-;-;-;0-31 0-31 0-1
+0-25 0-25 0-1;0-25;-;-;-;0-25 0-25 0-1
+0-28 0-28 0-1;0-28;-;-;-;0-28 0-28 0-1
+-;2-33;-;-;-;2-33 2-33 2-3
+"(A([0-9]{24,30}))"
+0-31 0-31 1-31;0-31;-;-;-;0-31 0-31 1-31
+0-25 0-25 1-25;0-25;-;-;-;0-25 0-25 1-25
+0-28 0-28 1-28;0-28;-;-;-;0-28 0-28 1-28
+-;2-33;-;-;-;2-33 2-33 3-33
+# B10, alternation sibling. buildLitChainAltRangeFindBody collapses a
+# non-greedy branch to {N,N} and then emits the FIXED-COUNT body, which
+# checks the end anchor at exactly N — but Perl lets `{N,M}?` extend past N
+# when a trailing anchor demands it. Find-only, like the blocks above.
+# The controls block pins that a non-greedy range with only a start anchor,
+# or none, keeps the fast path.
+FableB10AltRangeNonGreedyEndAnchorFindOnly
+strings
+"A01234567890123456789012345"
+"A012345678901234567890123"
+"xxA01234567890123456789012345"
+"zz012345678901234567890123"
+regexps
+"A[0-9]{24,30}?$|zz[0-9]{24}"
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;2-29;-;-
+0-26;0-26;-;-
+"A[0-9]{24,30}?\\b|zz[0-9]{24}"
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;2-29;-;-
+0-26;0-26;-;-
+FableB10AltRangeNonGreedyControls
+strings
+"A012345678901234567890123"
+"xxA01234567890123456789012345"
+"zz012345678901234567890123"
+regexps
+"^A[0-9]{24,30}?|zz[0-9]{24}"
+0-25;0-25;-;-
+-;-;-;-
+0-26;0-26;-;-
+"A[0-9]{24,30}?|zz[0-9]{24}"
+0-25;0-25;-;-
+-;2-27;-;-
+0-26;0-26;-;-
+# B11: emitLitChainAltLitBranchBodyRange checks the end anchor only at the
+# MAXIMAL match length, but greedy `{N,M}` must back off while a trailing
+# assertion fails. Find-only, like the B6/B9 alt block above.
+#   pattern 1: `\b` with a class mixing word and non-word bytes ([a ]) —
+#              backoff to 24 satisfies `\b`, at-max (25, before ',') does not.
+#   pattern 2: `\B` with a homogeneous class — every INTERIOR length satisfies
+#              `\B` while the maximal one (end of text) does not, so `\B` is
+#              never safe at-max-only.
+#   pattern 3: `\b` with a homogeneous all-word class — the realistic secrets
+#              shape, still allowed on the fast path (backoff can never help).
+#   pattern 4: `$` — monotone in match length, immune, still allowed.
+FableB11AltRangeWordBoundaryFindOnly
+strings
+"qaaaaaaaaaaaaaaaaaaaaaaaa ,"
+"qaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"qaaaaaaaaaaaaaaaaaaaaaaaaa!"
+"AKIAABCDEFGHIJABCDEFGHIJ x"
+"AKIAABCDEFGHIJABCDEFGHIJABCDEFGHIJAB!"
+"zz012345678901234567890123"
+regexps
+"q[a ]{24,26}\\b|zz[0-9]{24}"
+-;0-25;-;-
+0-27;0-27;-;-
+-;0-26;-;-
+-;-;-;-
+-;-;-;-
+0-26;0-26;-;-
+"q[a-z]{24,26}\\B|zz[0-9]{24}"
+-;-;-;-
+-;0-26;-;-
+-;0-25;-;-
+-;-;-;-
+-;-;-;-
+0-26;0-26;-;-
+"AKIA[A-Z]{16,32}\\b|zz[0-9]{24}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-24;-;-
+-;0-36;-;-
+0-26;0-26;-;-
+"q[a ]{24,26}$|zz[0-9]{24}"
+-;-;-;-
+0-27;0-27;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-26;0-26;-;-

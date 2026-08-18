@@ -899,7 +899,24 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			return p, nil
 		}
 		// Gap C: single-pattern range `{N,M}`.
-		if lcp, ok := analyseLitChainRange(re.Pattern, litChainMinCount); ok {
+		//
+		// Anchored range shapes are excluded from the FIND half of this path
+		// (they fall through to the classic DFA below):
+		//
+		//   - FABLE B7: buildLitChainRangeFindBody never consults
+		//     startAnchor/endAnchor — unlike its fixed-count sibling, which
+		//     has a full hasAnchors path — so `^A[0-9]{24,30}` matched at any
+		//     position and `A[0-9]{24,30}$` matched without reaching len.
+		//   - FABLE B10: the non-greedy collapse below freezes countMax at
+		//     count, but Perl lets `{N,M}?` extend past N when a trailing
+		//     anchor demands it (`A[0-9]{24,30}?$` on "A"+26 digits matches in
+		//     Go, and the collapsed body reports no match).
+		//
+		// The anchored *match* body handles anchors correctly (it requires
+		// full input consumption, which also makes greedy and non-greedy
+		// equivalent), so a match-only compile keeps the fast path.
+		if lcp, ok := analyseLitChainRange(re.Pattern, litChainMinCount); ok &&
+			!(needFind && (lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone)) {
 			// Greedy and non-greedy paths split by function:
 			//   anchored match: greedy/non-greedy same → range match body
 			//   find/groups greedy: range find/groups body

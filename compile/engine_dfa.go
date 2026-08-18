@@ -8951,6 +8951,60 @@ func analyseLitChainRange(pattern string, minCount int) (*litChainPattern, bool)
 	}, true
 }
 
+// rangeEndAnchorSafe reports whether a greedy `{N,M}` (N<M) branch carrying
+// endAnchor can be emitted with an end-anchor check performed *only* at the
+// maximal match length — which is all emitLitChainAltLitBranchBodyRange does.
+//
+// FABLE B11. Perl/RE2 greedy semantics try the longest length first and back
+// off one byte at a time while the trailing assertion fails, so an at-max-only
+// check is correct only when no shorter length in [N, max) could satisfy the
+// anchor that the maximal length fails:
+//
+//   - anchorNone: nothing to check.
+//   - anchorEndText (`$`/`\z`): end_pos grows monotonically with match_len, so
+//     if the maximal length does not reach `len`, no shorter one does. Safe.
+//   - anchorBeginText as an END anchor: unsatisfiable at any length (K≥1,
+//     N≥1 ⇒ end_pos > 0). Safe (the emitter branches to fail unconditionally).
+//   - anchorWordBoundary (`\b`): at any *interior* length both the byte before
+//     and the byte after end_pos are class bytes. When the class is
+//     homogeneous in word-ness they are both word or both non-word, so no
+//     interior length is a boundary and backoff can never rescue a failed
+//     maximal check. For a mixed class (e.g. `[a ]`) it can — reject.
+//   - anchorNoWordBoundary (`\B`): the mirror image. Every interior length
+//     *does* satisfy `\B` for a homogeneous class, so a failed maximal check
+//     must back off by one. The emitter cannot, so reject unconditionally.
+//     (Repro: `q[a-z]{24,26}\B` on "q"+26×'a' → Go [0,26), emitter no match.)
+func rangeEndAnchorSafe(endAnchor anchorType, bitmap [32]byte) bool {
+	switch endAnchor {
+	case anchorNone, anchorEndText, anchorBeginText:
+		return true
+	case anchorWordBoundary:
+		return classWordHomogeneous(bitmap)
+	default: // anchorNoWordBoundary
+		return false
+	}
+}
+
+// classWordHomogeneous reports whether every byte in the 256-bit class bitmap
+// is a word byte, or every byte in it is a non-word byte.
+func classWordHomogeneous(bitmap [32]byte) bool {
+	sawWord, sawNonWord := false, false
+	for b := 0; b < 256; b++ {
+		if bitmap[b>>3]&(1<<uint(b&7)) == 0 {
+			continue
+		}
+		if isWordByte(byte(b)) {
+			sawWord = true
+		} else {
+			sawNonWord = true
+		}
+		if sawWord && sawNonWord {
+			return false
+		}
+	}
+	return true
+}
+
 // analyseLitChainAltRange parses pattern as an OpAlternate of lit-chain
 // branches, where at least one branch is a range `{N,M}`. All branches must
 // qualify under analyseLitChainBranch (count ≥ 1, K+min ≥ 16, ASCII class).
@@ -8976,6 +9030,21 @@ func analyseLitChainAltRange(pattern string) (*litChainAltPattern, bool) {
 		}
 		if info.countMax > info.count {
 			hasRange = true
+			if !info.greedy {
+				// FABLE B10, alternation sibling.
+				// buildLitChainAltRangeFindBody collapses a non-greedy branch
+				// to {N,N} and then emits the fixed-count body, which checks
+				// the end anchor at exactly N. Perl lets `{N,M}?` extend past
+				// N when a trailing anchor demands it, so the collapse loses
+				// matches: `A[0-9]{24,30}?$|zz[0-9]{24}` on "A"+26 digits is
+				// [0,27) in Go and no-match here. Start anchors are unaffected
+				// (they constrain the position, not the length).
+				if info.endAnchor != anchorNone {
+					return nil, false
+				}
+			} else if !rangeEndAnchorSafe(info.endAnchor, info.bitmap) {
+				return nil, false // FABLE B11
+			}
 		}
 		branches = append(branches, litChainAltBranch{
 			literal:     info.literal,
@@ -8999,6 +9068,20 @@ func analyseLitChainAltRange(pattern string) (*litChainAltPattern, bool) {
 // every branch matches Gap E mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
 // All branches must have prefixCount > 0 (otherwise the classic strict-alt
 // path handles it).
+//
+// Two shapes are rejected outright because the shared prefixed branch emitter
+// cannot express them:
+//
+//   - FABLE B6: any branch carrying a start or end anchor.
+//     emitLitChainAltLitBranchBodyPrefixed never references startAnchor /
+//     endAnchor, so anchors were silently dropped.
+//   - FABLE B9: branches whose prefixCount differs. The candidate scan
+//     discovers literals in *literal* position order, but each branch reports
+//     a match start of `attempt_start - prefixCount`. With unequal
+//     prefixCounts the two orders diverge and the emitted body can return a
+//     later-starting match while an earlier-starting one exists — the same
+//     hazard findAltLitAnchorPoints guards against (see lit_anchor.go's
+//     equal-offset requirement).
 func analyseLitChainAltPrefixed(pattern string) (*litChainAltPattern, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -9012,6 +9095,7 @@ func analyseLitChainAltPrefixed(pattern string) (*litChainAltPattern, bool) {
 	}
 	branches := make([]litChainAltBranch, 0, len(re.Sub))
 	allPrefixed := true
+	prefixCount := -1
 	for _, sub := range re.Sub {
 		info, ok := analyseLitChainBranch(sub)
 		if !ok {
@@ -9020,9 +9104,17 @@ func analyseLitChainAltPrefixed(pattern string) (*litChainAltPattern, bool) {
 		if info.countMax != info.count {
 			return nil, false // ranges not supported with prefix yet
 		}
+		if info.startAnchor != anchorNone || info.endAnchor != anchorNone {
+			return nil, false // B6
+		}
 		if info.prefixCount == 0 {
 			allPrefixed = false
 			break
+		}
+		if prefixCount == -1 {
+			prefixCount = info.prefixCount
+		} else if info.prefixCount != prefixCount {
+			return nil, false // B9
 		}
 		branches = append(branches, litChainAltBranch{
 			literal:      info.literal,
@@ -9867,7 +9959,7 @@ func emitLitChainAltLitBranchBodyRange(b []byte, br litChainAltBranch,
 	b = append(b, 0x21, locals.VerifyTlo)
 	lcp := &litChainPattern{literal: br.literal, tlo: br.tlo, count: br.count, countMax: br.countMax, greedy: br.greedy}
 	b = emitRangeClassVerify(b, lcp,
-		locals.Ptr, locals.AttemptStart, locals.Chunk, locals.VerifyTlo, locals.VerifyPow2, locMatchLen, locTmp)
+		locals.Ptr, locals.Len, locals.AttemptStart, locals.Chunk, locals.VerifyTlo, locals.VerifyPow2, locMatchLen, locTmp)
 
 	// Runtime cap: max_avail = len - attempt_start - K. match_len = min(match_len, max_avail).
 	b = append(b, 0x20, locals.Len)
@@ -10495,6 +10587,15 @@ func analyseLitChainPrefixed(pattern string) (*litChainPattern, bool) {
 	if info.countMax != info.count {
 		return nil, false // ranges not yet supported on Gap E
 	}
+	// FABLE B6: none of the three Gap E prefixed emitters
+	// (buildLitChainPrefixedMatchBody / buildLitChainPrefixedFindBody /
+	// emitLitChainAltLitBranchBodyPrefixed) consults startAnchor/endAnchor,
+	// so an anchored mixed-prefix pattern silently matched as if unanchored
+	// (`^[ab]{4}XY[0-9]{24}` found a match at position 2). Reject anchored
+	// shapes here and let the classic DFA path handle them correctly.
+	if info.startAnchor != anchorNone || info.endAnchor != anchorNone {
+		return nil, false
+	}
 	if info.count < 24 {
 		return nil, false
 	}
@@ -10709,6 +10810,14 @@ type captureGroup struct {
 	name        string // empty if unnamed
 	startOffset int    // bytes from match start (≥ 0)
 	endOffset   int    // bytes from match start (> startOffset for non-empty)
+
+	// endsAtVariableTail marks a capture whose extent runs to the end of a
+	// variable-length `{N,M}` repeat (N < M), so its end is only known at
+	// runtime and endOffset — a compile-time, Min-based figure — does not
+	// describe it. Recorded structurally by the walk; see FABLE B8.
+	// Always false for a fixed-count chain, where every offset really is
+	// compile-time.
+	endsAtVariableTail bool
 }
 
 // litChainCaptures attaches capture-group information to a lit-chain branch.
@@ -10737,42 +10846,61 @@ func hasOpCapture(re *syntax.Regexp) bool {
 // OpCapture's compile-time offset. Returns (captures, maxGroup, ok). Rejects
 // captures inside an OpRepeat body (capture-the-last-occurrence semantics
 // cannot be reconstructed from compile-time offsets).
+//
+// `walk` returns the subtree's compile-time width AND whether that subtree
+// *ends* in a variable-length `{N,M}` repeat. The width of such a repeat is
+// its minimum, which is right for positioning anything that follows it but
+// wrong as an end offset for a capture that closes on it — the runtime length
+// is what that capture ends at. Deriving "ends at the chain" from offset
+// arithmetic instead (`endOffset == K + countMax`) cannot work, because the
+// width is Min-based and Min ≠ Max is exactly what makes the chain a range:
+// the test never fired and every chain-covering capture got a frozen
+// `attemptStart + K + Min` end (FABLE B8, repro `A([0-9]{24,30})` on
+// "A"+30 digits → stdlib `[0 31 1 31]`, WASM `[0 31 1 25]`).
 func extractLitChainCaptures(re *syntax.Regexp) ([]captureGroup, int, bool) {
 	var caps []captureGroup
 	maxGroup := 0
 	ok := true
 
-	var walk func(node *syntax.Regexp, offset int) int
-	walk = func(node *syntax.Regexp, offset int) int {
+	var walk func(node *syntax.Regexp, offset int) (int, bool)
+	walk = func(node *syntax.Regexp, offset int) (int, bool) {
 		if !ok {
-			return 0
+			return 0, false
 		}
 		switch node.Op {
 		case syntax.OpCapture:
 			startOff := offset
-			w := walk(node.Sub[0], offset)
+			w, varTail := walk(node.Sub[0], offset)
 			caps = append(caps, captureGroup{
-				group:       node.Cap,
-				name:        node.Name,
-				startOffset: startOff,
-				endOffset:   startOff + w,
+				group:              node.Cap,
+				name:               node.Name,
+				startOffset:        startOff,
+				endOffset:          startOff + w,
+				endsAtVariableTail: varTail,
 			})
 			if node.Cap > maxGroup {
 				maxGroup = node.Cap
 			}
-			return w
+			return w, varTail
 		case syntax.OpConcat:
 			total := 0
+			varTail := false
 			for _, child := range node.Sub {
-				total += walk(child, offset+total)
+				w, v := walk(child, offset+total)
+				total += w
+				// Zero-width assertions after the chain (`(A[0-9]{24,30})\b`)
+				// must not clear the flag the repeat set.
+				if w != 0 || v {
+					varTail = v
+				}
 			}
-			return total
+			return total, varTail
 		case syntax.OpLiteral:
-			return len(node.Rune)
+			return len(node.Rune), false
 		case syntax.OpRepeat:
 			if hasOpCapture(node.Sub[0]) {
 				ok = false
-				return 0
+				return 0, false
 			}
 			childW := 0
 			child := node.Sub[0]
@@ -10782,19 +10910,21 @@ func extractLitChainCaptures(re *syntax.Regexp) ([]captureGroup, int, bool) {
 			case syntax.OpCharClass, syntax.OpAnyChar, syntax.OpAnyCharNotNL:
 				childW = 1
 			}
-			return node.Min * childW
+			// Max < 0 is an open-ended `{N,}` (rejected upstream by
+			// analyseLitChainBranch, but variable-length either way).
+			return node.Min * childW, node.Max < 0 || node.Max > node.Min
 		case syntax.OpCharClass, syntax.OpAnyChar, syntax.OpAnyCharNotNL:
-			return 1
+			return 1, false
 		case syntax.OpBeginText, syntax.OpEndText,
 			syntax.OpWordBoundary, syntax.OpNoWordBoundary:
-			return 0
+			return 0, false
 		case syntax.OpBeginLine, syntax.OpEndLine:
 			ok = false
-			return 0
+			return 0, false
 		}
-		return 0
+		return 0, false
 	}
-	_ = walk(re, 0)
+	_, _ = walk(re, 0)
 	if !ok {
 		return nil, 0, false
 	}
@@ -10864,6 +10994,13 @@ func analyseLitChainGroupsRange(pattern string) (*litChainPattern, *litChainCapt
 	}
 	if !info.greedy {
 		return nil, nil, false // collapse to {N,N} via existing path
+	}
+	// FABLE B7: buildLitChainRangeFindGroupsBody never consults
+	// startAnchor/endAnchor (unlike its fixed-count sibling, which has a
+	// full hasAnchors path), so anchored range shapes were matched as if
+	// unanchored. Reject them and let the DFA capture path handle them.
+	if info.startAnchor != anchorNone || info.endAnchor != anchorNone {
+		return nil, nil, false
 	}
 	if info.count < 24 {
 		return nil, nil, false
@@ -11023,17 +11160,16 @@ func emitLitChainGroupSlotWrites(b []byte, lcc *litChainCaptures,
 
 // emitLitChainRangeGroupSlotWrites emits slot writes for range patterns
 // where the chain length is determined at runtime by locMatchLen. Captures
-// whose endOffset coincides with K + countMax (i.e., end at the chain end)
-// use attemptStart + K + match_len; other endOffsets are compile-time.
+// flagged endsAtVariableTail by extractLitChainCaptures — those that close on
+// the `{N,M}` chain — use attemptStart + K + match_len; every other end
+// offset is compile-time.
 func emitLitChainRangeGroupSlotWrites(b []byte, lcc *litChainCaptures,
-	outPtrLocal, attemptStartLocal, matchLenLocal byte, k, countMax int) []byte {
+	outPtrLocal, attemptStartLocal, matchLenLocal byte, k int) []byte {
 
 	populated := make(map[int]captureGroup, len(lcc.groups))
 	for _, cg := range lcc.groups {
 		populated[cg.group] = cg
 	}
-
-	chainEnd := k + countMax
 
 	// Helper: write (attemptStart + offset) to out_ptr at slotOff.
 	writeAttemptPlus := func(b []byte, slotOff uint32, offset int) []byte {
@@ -11082,7 +11218,7 @@ func emitLitChainRangeGroupSlotWrites(b []byte, lcc *litChainCaptures,
 		endSlot := uint32(g*8 + 4)
 		if cg, ok := populated[g]; ok {
 			b = writeAttemptPlus(b, startSlot, cg.startOffset)
-			if cg.endOffset == chainEnd {
+			if cg.endsAtVariableTail {
 				b = writeAttemptPlusKPlusMatchLen(b, endSlot)
 			} else {
 				b = writeAttemptPlus(b, endSlot, cg.endOffset)
@@ -11786,7 +11922,7 @@ func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCapture
 	b = append(b, 0x0D, 0x01)
 
 	// Range class verify.
-	b = emitRangeClassVerify(b, lcp, locPtr, locAttemptStart, locChunk, locTLo, locPow2, locMatchLen, locTmp)
+	b = emitRangeClassVerify(b, lcp, locPtr, locLen, locAttemptStart, locChunk, locTLo, locPow2, locMatchLen, locTmp)
 
 	// Runtime cap: max_avail = len - attempt_start - K.
 	b = append(b, 0x20, locLen)
@@ -11819,7 +11955,7 @@ func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCapture
 	b = append(b, 0x0B)
 
 	// Match — write slots and return end position (attempt_start + K + match_len).
-	b = emitLitChainRangeGroupSlotWrites(b, lcc, locOutPtr, locAttemptStart, locMatchLen, int(k), lcp.countMax)
+	b = emitLitChainRangeGroupSlotWrites(b, lcc, locOutPtr, locAttemptStart, locMatchLen, int(k))
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, k)
@@ -11885,8 +12021,37 @@ func planRangeChunks(k, countMax int) []rangeChunk {
 // Chunks are folded in REVERSE order via `select`: earlier chunks override
 // later ones. Avoids per-chunk `block`+`if`+`br` patterns that Cranelift's
 // register allocator handles poorly across the surrounding scan loop.
+//
+// FABLE B12 — over-read guard. Every caller bounds-checks only
+// `base + K + countMin <= len`, but the chunk plan covers `[K, K+countMax)`
+// rounded up to a 16-byte multiple, so a chunk can read up to
+// `countMax - countMin + 15` bytes past `ptr+len`. The values read there
+// cannot corrupt the result (match_len is capped at `len - base - K` before
+// use) but the *load itself* can cross the end of linear memory and trap —
+// live-reproduced with an anchored `A[0-9]{24,60}` match on a 25-byte input
+// placed flush against the end of a one-page memory.
+//
+// A chunk is trap-safe without help iff `offsetFromK + 16 <= countMin`
+// (its last byte is inside the bounds-checked prefix). Any other chunk gets a
+// branch-free clamp: it is loaded at `min(base + off, len - 16)` instead, and
+// its 16-bit bad-mask is shifted right by the clamp distance `d` so bit j
+// still means "position base+off+j is not in the class". Lanes beyond the
+// input end become 0 (= "good"), which is exactly the don't-care the later
+// `min(match_len, len - base - K)` cap already assumes. `len >= K + countMin
+// >= 16` on every caller, so `len - 16` is never negative.
+//
+// `d >= 16` means the chunk starts at or past `len`, i.e. it contributes
+// nothing real. WASM masks shift counts mod 32, so such a chunk's mask is
+// garbage rather than zero once `d >= 32` — harmless, and worth spelling out
+// because it is the one case the shift does not fix up exactly. `d >= 16` is
+// equivalent to `base + K + offsetFromK >= len`, i.e.
+// `offsetFromK >= len - base - K = max_avail`, so whatever that chunk folds in
+// is `offsetFromK + ml_i >= max_avail` — at or above the cap, hence discarded
+// by it. And it can only reach the accumulator at all when no earlier chunk
+// found a bad byte, since the reverse-order select-fold lets earlier chunks
+// override later ones, and `d` is monotone in the chunk offset.
 func emitRangeClassVerify(b []byte, lcp *litChainPattern,
-	locPtr, locBase, locChunk, locTLo, locPow2, locMatchLen, locTmp byte) []byte {
+	locPtr, locLen, locBase, locChunk, locTLo, locPow2, locMatchLen, locTmp byte) []byte {
 
 	chunks := planRangeChunks(len(lcp.literal), lcp.countMax)
 	countMax := int32(lcp.countMax)
@@ -11906,7 +12071,29 @@ func emitRangeClassVerify(b []byte, lcp *litChainPattern,
 			laneCount++
 		}
 
-		// Load chunk.
+		// Does this chunk's last byte lie inside the bounds-checked prefix
+		// [base, base+K+countMin)? If so it can never over-read.
+		needClamp := ch.offsetFromK+16 > lcp.count
+
+		if needClamp {
+			// locTmp = d = max(0, base + off + 16 - len), the number of bytes
+			// this chunk would read past the end of the input.
+			b = append(b, 0x20, locBase)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(ch.offset+16))
+			b = append(b, 0x6A) // i32.add
+			b = append(b, 0x20, locLen)
+			b = append(b, 0x6B)         // i32.sub → x (may be negative)
+			b = append(b, 0x22, locTmp) // local.tee tmp; x stays on stack [v1]
+			b = append(b, 0x41, 0x00)   // i32.const 0                    [v2]
+			b = append(b, 0x20, locTmp)
+			b = append(b, 0x41, 0x00)
+			b = append(b, 0x4A)         // i32.gt_s → cond (x > 0)
+			b = append(b, 0x1B)         // select
+			b = append(b, 0x21, locTmp) // tmp = d
+		}
+
+		// Load chunk (at base+off, or base+off-d when clamped).
 		b = append(b, 0x20, locPtr)
 		b = append(b, 0x20, locBase)
 		b = append(b, 0x6A)
@@ -11914,6 +12101,10 @@ func emitRangeClassVerify(b []byte, lcp *litChainPattern,
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(ch.offset))
 			b = append(b, 0x6A)
+		}
+		if needClamp {
+			b = append(b, 0x20, locTmp)
+			b = append(b, 0x6B) // i32.sub
 		}
 		b = append(b, 0xFD, 0x00, 0x00, 0x00)
 		b = append(b, 0x21, locChunk)
@@ -11936,6 +12127,16 @@ func emitRangeClassVerify(b []byte, lcp *litChainPattern,
 		b = append(b, 0xFD, 0x0F)
 		b = append(b, 0xFD, 0x23)
 		b = append(b, 0xFD, 0x64) // i32 bad_mask
+
+		if needClamp {
+			// Undo the load clamp: loaded lane j holds position
+			// base+off-d+j, so shifting right by d makes bit j mean
+			// position base+off+j again. The vacated high bits become 0
+			// ("in class") — they are positions at or past `len`, already
+			// don't-care under the later match_len cap.
+			b = append(b, 0x20, locTmp)
+			b = append(b, 0x76) // i32.shr_u
+		}
 
 		if ch.laneMask != 0xFFFF {
 			b = append(b, 0x41)
@@ -12044,7 +12245,7 @@ func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 
 	// match_len = chain class verify (writes locMatchLen).
 	// Use attempt_start as base.
-	b = emitRangeClassVerify(b, lcp, locPtr, locAttemptStart, locChunk, locTLo, locPow2, locMatchLen, locSimdMask)
+	b = emitRangeClassVerify(b, lcp, locPtr, locLen, locAttemptStart, locChunk, locTLo, locPow2, locMatchLen, locSimdMask)
 
 	// Runtime cap: max_avail = len - attempt_start - K. Use locSimdMask as scratch.
 	b = append(b, 0x20, locLen)
@@ -12199,7 +12400,7 @@ func buildLitChainRangeMatchBody(lcp *litChainPattern) []byte {
 	}
 
 	// SIMD range class verify (branch-free).
-	b = emitRangeClassVerify(b, lcp, locPtr, locAttemptZero, locChunk, locTLo, locPow2, locMatchLen, locScratch)
+	b = emitRangeClassVerify(b, lcp, locPtr, locLen, locAttemptZero, locChunk, locTLo, locPow2, locMatchLen, locScratch)
 
 	// Require match_len >= (len - K) for full input consumption.
 	b = append(b, 0x20, locMatchLen)

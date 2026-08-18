@@ -1,4 +1,4 @@
-.PHONY: test exhaustive custom adjusted sets likelymatch likelynomatch force-backtrack-likelynomatch matchonly groupsonly clean
+.PHONY: test exhaustive custom adjusted sets likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -70,6 +70,17 @@ matchonly: $(ADJUSTED)
 	go run . --match-only --validate-groups $(ADJUSTED)
 	go run . --match-only --validate-groups $(CUSTOM)
 
+# Run every test with find_func compiled alone (no match_func) for
+# non-capturing patterns. Mirror of matchonly: reaches the
+# `needFind && !needMatch` call sites in compile.go — the Gap E alt-prefixed
+# find body, the Gap C alt-range find body, and the strict/lenient alt find
+# bodies — which the default combined match+find dispatch never reaches at
+# all. Regression test for plans/FABLE.md B6 (alt half), B9 and B11.
+findonly: $(ADJUSTED)
+	go run . --find-only $(TESTDATA)
+	go run . --find-only --validate-groups $(ADJUSTED)
+	go run . --find-only --validate-groups $(CUSTOM)
+
 # Run every test with only groups_func compiled (no match_func/find_func)
 # for capturing patterns. Surfaces lit-chain capture path bugs that depend
 # on the narrow needGroups-only gate (compile.go), which the default
@@ -79,7 +90,7 @@ groupsonly: $(ADJUSTED)
 	go run . --groups-only --validate-groups $(ADJUSTED)
 	go run . --groups-only --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly groupsonly sets
+test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets
 
 sets: $(TESTDATA)
 	go run . --sets $(TESTDATA)

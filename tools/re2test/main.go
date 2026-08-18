@@ -61,6 +61,7 @@ func main() {
 	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
 	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
 	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's Gap B lenient path) that match+find-together dispatch never exercises — see plans/TODO.md task 52")
+	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the Gap E alt-prefixed find body, the Gap C alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises (see plans/FABLE.md B6/B9/B11)")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -68,13 +69,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly, *matchOnly); err != nil {
+	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly, *matchOnly, *findOnly); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool, likelyNoMatch bool, groupsOnly bool, matchOnly bool) error {
+func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool, likelyNoMatch bool, groupsOnly bool, matchOnly bool, findOnly bool) error {
 	f, err := os.Open(testFile)
 	if err != nil {
 		return err
@@ -261,7 +262,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				Pattern: pattern,
 			}
 			if !patternHasCaptures {
-				re.MatchFunc = "match"
+				if !findOnly {
+					re.MatchFunc = "match"
+				}
 				if !matchOnly {
 					re.FindFunc = "find"
 				}
