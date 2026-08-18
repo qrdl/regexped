@@ -40,7 +40,7 @@ func skipPattern(pat, input string) string {
 	if err != nil {
 		return "not a regexp"
 	}
-	if prog, err := syntax.Compile(parsed.Simplify()); err == nil && len(prog.Inst) > maxNFAInsts {
+	if prog, err := syntax.Compile(parsed.Simplify()); err == nil && len(prog.Inst) > maxNFAInsts() {
 		return "NFA too large for the fuzz worker's hang deadline (see maxNFAInsts)"
 	}
 	// The compiler's own predicate, not a raw-string scan: escapes like \x80 are

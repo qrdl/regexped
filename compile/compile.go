@@ -444,8 +444,7 @@ type compiledPattern struct {
 	// calls another function by index) plus ONE deferred dispatcher built
 	// at assembleModule time once all branch function indices are known
 	// (same reason litAnchorFindBody is deferred today).
-	altLitAnchorBranches       []altLitAnchorCompiledBranch
-	altLitAnchorFixedPrefixLen int32 // same P for every branch (v1 restriction)
+	altLitAnchorBranches []altLitAnchorCompiledBranch
 
 	// Shared Teddy/first-byte frontend over the union of all branches'
 	// literals — same field shape as litAnchorFirstByte*/litAnchorTeddy*
@@ -1457,7 +1456,6 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				if altBranches, ok := findAltLitAnchorPoints(re.Pattern); ok {
 					if altCompiled, altOK := compileAltLitAnchorBranches(altBranches, l.tableEnd, buildOpts); altOK {
 						p.altLitAnchorBranches = altCompiled.branches
-						p.altLitAnchorFixedPrefixLen = altCompiled.fixedPrefixLen
 						p.altLitAnchorFirstByteOff = altCompiled.firstByteOff
 						p.altLitAnchorFirstByteFlags = altCompiled.firstByteFlags
 						p.altLitAnchorFirstBytes = altCompiled.firstBytes

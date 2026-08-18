@@ -3168,10 +3168,19 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 	// attempt's start position?" across every channel that can set
 	// last_accept without consuming a byte: the unconditional table plus the
 	// three context-dependent ones (nil whenever the pattern doesn't need
-	// them). Deliberately treats ANY non-zero entry as accepting, including
-	// the 254/255 non-mid-dominant values applyDominantStateEncoding packs
-	// into midAcceptBytes — that is the conservative direction here, and it
-	// matches what condition (d) already did before FUZZER_BUGS.md #41.
+	// them).
+	//
+	// A plain `!= 0` test is exact here, not merely conservative. The
+	// dominant-state encoding shares midAcceptBytes' value space (2..127
+	// mid-accept dominant, 128..253 Shufti, 254..255 NON-mid dominant, so a
+	// non-zero entry does not by itself imply "accepting"), but nothing has
+	// written those values yet at this point: detectDominantSelfLoop and
+	// detectShuftiSelfLoop only record encodedByte into l.dominantStates,
+	// and the sole writer into the table — applyDominantStateEncoding — runs
+	// at emission time, after buildDFALayout has returned. Every entry this
+	// closure can observe is a genuine mid-accept flag. The same holds for
+	// condition (e)'s isAcceptingExit below, which relies on a non-zero
+	// entry really meaning "reaching this state sets last_accept".
 	isAnyMidAccept := func(state int) bool {
 		if state < len(l.midAcceptBytes) && l.midAcceptBytes[state] != 0 {
 			return true

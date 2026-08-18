@@ -10,9 +10,12 @@ package fuzz
 import (
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"regexp/syntax"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/qrdl/regexped/compile"
@@ -37,18 +40,82 @@ const inputCap = int(tableBase)
 // any call exceeding 10s as a hang and reports it as a crasher
 // (plans/FUZZER_BUGS.md #23).
 //
-// 5000 was picked empirically, live against the post-#23-fix compiler:
-// the worst NFA shape reachable at all (large bounded-repeat patterns
-// like (.|()){N}, which keep ~N NFA instructions simultaneously live per
-// DFA state) tops out around 7000 instructions — Go's own regexp/syntax
-// caps repeat counts at 1000 and tracks cumulative repeat products across
-// nesting, so nothing bigger is constructible — and that ceiling measured
-// at 4.3s single-threaded. 5000 sits below that ceiling with real margin
-// (go test -fuzz runs multiple workers in parallel sharing CPU, and
-// scaling for this pattern family is worse than linear), while staying
-// above every other measured pattern, so it only excludes the extreme
-// tail rather than typical fuzzer-generated patterns.
-const maxNFAInsts = 5000
+// # Calibration
+//
+// The default of 2000 was derived on 2026-08-18 from 24238 timed calls
+// measured under the conditions that actually apply — an instrumented
+// go test -fuzz build, -parallel=4, real worker processes — not from solo
+// uninstrumented compiles. That distinction is the entire point: the
+// previous value of 5000 was calibrated solo and admitted calls of 9.2s
+// against the 10s deadline, which is plans/FUZZER_BUGS.md #42.
+//
+// Worst observed per-call wall clock among patterns each cap admits, on the
+// reference box (4 CPUs, Linux, Go 1.25.9):
+//
+//	cap    worst admitted call   headroom vs 10s
+//	1000   1594ms                6.3x
+//	1500   1906ms                5.2x
+//	2000   2825ms                3.5x   <- default
+//	2500   4450ms                2.2x
+//	3000   5863ms                1.7x
+//	4000   8323ms                1.2x
+//	5000   9246ms                1.1x   <- previous value, bug #42
+//	none   11927ms               0.8x
+//
+// Real fuzz-worker conditions cost roughly 3.5x the solo compile time:
+// (.|()){1000} measures 3.4s alone and 11.9s here. Any recalibration must
+// therefore be done under -fuzz, never with a standalone benchmark.
+//
+// # This is a proxy, not a bound
+//
+// Instruction count correlates with compile cost only loosely — cost per
+// instruction spans ~380x across NFA shapes ((a*){900} is 3602 insts and
+// 6ms; (.?){900} is 3602 insts and 2.07s). The cap bounds the tail, it does
+// not bound the cost: (.?)4.{450} is only 457 insts yet takes 1594ms, so
+// even a cap of 1000 has a ~1.6s worst case. 2000 is chosen for margin
+// rather than precision, which is why the headroom column above matters
+// more than the admitted-pattern count.
+//
+// # Overriding
+//
+// Set REGEXPED_FUZZ_MAX_NFA_INSTS to raise the cap on faster hardware,
+// where more of the pattern space fits under the deadline:
+//
+//	REGEXPED_FUZZ_MAX_NFA_INSTS=4000 go test -fuzz=FuzzCorrectness
+//
+// Compile cost for the worst family scales about n^1.5 over the measured
+// range, so a box K times faster sustains roughly K^0.67 times the cap
+// (2x faster ~ 3200, 4x faster ~ 5000). Re-measure before trusting that
+// estimate — deriving this number from an unrepresentative measurement is
+// exactly how the previous one went stale.
+//
+// Note that any cap only ever narrows fuzz coverage. On the real seed
+// corpus this is a thin slice (the largest seed is 601 insts, p50 is 8),
+// and the DFA-size-driven paths are unaffected because those come from
+// small NFAs ([ab]*a[ab]{20} is 25 insts), but the exclusion is real.
+// Resolved lazily, on first use inside a running test, rather than in a
+// package-level initialiser. go test's result cache only tracks environment
+// variables read after testing.M.Run installs its testlog hook; an init-time
+// read is invisible to it, so a changed REGEXPED_FUZZ_MAX_NFA_INSTS would
+// silently replay a stale cached result on non -fuzz replay runs.
+var maxNFAInsts = sync.OnceValue(envMaxNFAInsts)
+
+// envMaxNFAInsts returns the REGEXPED_FUZZ_MAX_NFA_INSTS override, or the
+// calibrated default. A malformed override panics rather than falling back
+// silently: a typo'd cap would otherwise run the whole fuzz session at the
+// wrong bound while looking like it had been applied.
+func envMaxNFAInsts() int {
+	const def = 2000
+	raw, ok := os.LookupEnv("REGEXPED_FUZZ_MAX_NFA_INSTS")
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		panic(fmt.Sprintf("REGEXPED_FUZZ_MAX_NFA_INSTS must be a positive integer, got %q", raw))
+	}
+	return n
+}
 
 func FuzzCorrectness(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
@@ -66,7 +133,7 @@ func FuzzCorrectness(f *testing.F) {
 		if err != nil {
 			t.Skip() // not a regexp at all
 		}
-		if prog, err := syntax.Compile(parsed.Simplify()); err == nil && len(prog.Inst) > maxNFAInsts {
+		if prog, err := syntax.Compile(parsed.Simplify()); err == nil && len(prog.Inst) > maxNFAInsts() {
 			t.Skip() // NFA too large to compile within the fuzz worker's hang deadline — see maxNFAInsts
 		}
 		// Use the compiler's own predicate rather than hasUnsupportedUnicode's
