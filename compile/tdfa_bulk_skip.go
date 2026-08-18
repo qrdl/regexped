@@ -126,7 +126,19 @@ func detectTDFABulkSkip(tt *tdfaTable) *tdfaBulkSkipInfo {
 // path handles the single next byte — guaranteed not to be a self-loop
 // byte in that case, since K==0 only happens when the very first byte
 // examined already failed the self-loop membership test.
-func emitTDFABulkSkip(b []byte, info *tdfaBulkSkipInfo, localPos, localChunk, localMask, localSkipStart, localCapBase uint32) []byte {
+//
+// midAcceptTail, when non-nil, is emitted just after info.ops in the K > 0
+// branch. It carries the per-byte mid-accept bookkeeping the scalar loop
+// does and this routine otherwise skips wholesale (plans/FABLE.md B16):
+// state is unchanged across the whole run, so if it is mid-accepting then
+// every skipped position was an accept of the same state and a single
+// check at the final position reproduces the scalar invariant exactly.
+// Without it, a dead exit byte after the run falls back to whatever
+// lastAcceptPos held before it — `^([a-z]+)` on "aaaa!…" reported [0 1].
+// The caller passes nil when the bulk state is not mid-accepting (or when
+// the whole lastAccept mechanism is off), so patterns that never needed
+// the bookkeeping keep their previous bytes.
+func emitTDFABulkSkip(b []byte, info *tdfaBulkSkipInfo, localPos, localChunk, localMask, localSkipStart, localCapBase uint32, midAcceptTail func([]byte) []byte) []byte {
 	// skipStart = pos
 	b = append(b, 0x20, byte(localPos))
 	b = append(b, 0x21, byte(localSkipStart))
@@ -188,6 +200,9 @@ func emitTDFABulkSkip(b []byte, info *tdfaBulkSkipInfo, localPos, localChunk, lo
 	b = append(b, 0x04, 0x40) // if (void)
 	for _, op := range info.ops {
 		b = emitTDFATagOp(op, b, localPos, localCapBase)
+	}
+	if midAcceptTail != nil {
+		b = midAcceptTail(b)
 	}
 	b = append(b, 0x0C, 0x02) // br 2 -> loop $main (see doc comment on depth assumption)
 	b = append(b, 0x0B)       // end if

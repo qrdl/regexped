@@ -983,11 +983,18 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	// entirely there keeps wrapper-composed capture bodies byte-identical to
 	// (and as fast as) before this fix.
 	hasMidAccept := nativeAnchored && len(tt.midAcceptStates) > 0
+	// The compressed-u8 encoding reads classMap[byte] into a scratch local
+	// before indexing the table, so that encoding — and only it — needs one
+	// more i32 (see the transition emission below).
+	needClassLocal := l.useU8 && l.useCompression
 	// Locals: pos(1) + state(1) + prevState(1) + byte(1) [+ lastAcceptPos(1)
-	// when hasMidAccept] + capture regs
+	// when hasMidAccept] [+ class(1) when needClassLocal] + capture regs
 	// [+ bulk-skip locals: chunk(v128) + mask(i32) + skipStart(i32)].
 	extraLocals := 4 + numCapRegs
 	if hasMidAccept {
+		extraLocals++
+	}
+	if needClassLocal {
 		extraLocals++
 	}
 	hasBulkSkip := enableTDFABulkSkip && tt.bulkSkip != nil
@@ -1006,14 +1013,22 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 		localPrevState = uint32(5)
 		localByte      = uint32(6)
 	)
-	// localLastAcceptPos only exists (and localCapBase only shifts up to make
-	// room for it) when hasMidAccept; otherwise capBase stays at 7, exactly
-	// matching this function's shape before this fix.
-	localLastAcceptPos := uint32(7)
-	localCapBase := uint32(7)
+	// localLastAcceptPos and localClass only exist (and localCapBase only
+	// shifts up to make room for them) when hasMidAccept / needClassLocal;
+	// with neither, capBase stays at 7, exactly matching this function's
+	// shape before these fixes. The capture registers must stay contiguous
+	// from localCapBase, so every optional scratch local is allocated below
+	// them.
+	nextLocal := uint32(7)
+	localLastAcceptPos := nextLocal
 	if hasMidAccept {
-		localCapBase = 8
+		nextLocal++
 	}
+	localClass := nextLocal
+	if needClassLocal {
+		nextLocal++
+	}
+	localCapBase := nextLocal
 	localChunk := localCapBase + uint32(numCapRegs)
 	localMask := localChunk + 1
 	localSkipStart := localMask + 1
@@ -1090,7 +1105,22 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 		b = utils.AppendSLEB128(b, tt.bulkSkip.wasmState)
 		b = append(b, 0x46)       // i32.eq
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitTDFABulkSkip(b, tt.bulkSkip, localPos, localChunk, localMask, localSkipStart, localCapBase)
+		// B16: hand the skip the mid-accept bookkeeping it would otherwise
+		// jump over. The state is known here at compile time (it is the very
+		// constant the `if` above compares against), so the runtime
+		// `if midAccept[state]` guard midAcceptCheck emits is decided now
+		// instead: nil tail when the bulk state is not mid-accepting, and no
+		// table load on the runs where it is.
+		var midAcceptTail func([]byte) []byte
+		if hasMidAccept && tt.midAcceptStates[int(tt.bulkSkip.wasmState)-1] != 0 {
+			midAcceptTail = func(b []byte) []byte {
+				b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase)
+				b = append(b, 0x20, byte(localPos))
+				b = append(b, 0x21, byte(localLastAcceptPos))
+				return b
+			}
+		}
+		b = emitTDFABulkSkip(b, tt.bulkSkip, localPos, localChunk, localMask, localSkipStart, localCapBase, midAcceptTail)
 		b = append(b, 0x0B) // end if
 	}
 
@@ -1111,33 +1141,32 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	b = append(b, 0x6A)
 	b = append(b, 0x21, byte(localPos))
 
-	// state = table[tableOff + prevState<<8 + byte] (u8) or table[tableOff + (prevState*256+byte)*2] (u16)
-	if l.useU8 {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.tableOff)
-		b = append(b, 0x20, byte(localPrevState))
-		b = append(b, 0x41, 0x08)
-		b = append(b, 0x74) // i32.shl (prevState<<8)
-		b = append(b, 0x6A)
-		b = append(b, 0x20, byte(localByte))
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // table load → next+1 == state
-		b = append(b, 0x21, byte(localState))
-	} else {
-		// u16: addr = tableOff + (prevState*256 + byte) * 2
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.tableOff)
-		b = append(b, 0x20, byte(localPrevState))
-		b = append(b, 0x41, 0x08)
-		b = append(b, 0x74) // i32.shl (prevState<<8)
-		b = append(b, 0x6A)
-		b = append(b, 0x20, byte(localByte))
-		b = append(b, 0x6A)
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x74) // i32.shl (*2)
-		b = append(b, 0x6A)
-		b = appendTableLoad16u(b, tableMemIdx) // cell (u16, next+1, == state)
-		b = append(b, 0x21, byte(localState))
+	// state = table[<the encoding buildDFALayout actually chose>].
+	//
+	// This MUST go through the same three shared emitters buildMatchBody
+	// dispatches to (plans/FABLE.md B15). The load used to be hand-rolled here
+	// as a plain `tableOff + prevState<<8 + byte` u8 index with a u16 sibling,
+	// which silently disagreed with the layout on both of the other encodings
+	// dfaDataSegments can emit: byte-class compression (chosen once
+	// numWASM*256 > 32KB, i.e. from ~128 states) writes classMap + a
+	// numClasses-wide table that the hand-rolled index never consulted, and the
+	// u16 branch's operand order never produced a valid module at all. Both are
+	// reachable inside the default MaxDFAStates=1024, e.g. `x(a{130})y` and
+	// `x(a{260})y`.
+	//
+	// localState is passed as the emitters' single state local: prevState was
+	// copied out of it a few instructions above, so reading and overwriting it
+	// in place is exactly the `state = table[prevState][byte]` this needs, and
+	// localPrevState still holds the old value for the tag ops below.
+	switch {
+	case l.useU8 && l.useCompression:
+		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
+			byte(localState), byte(localClass), 0, 0, byte(localByte), tableMemIdx)
+	case l.useU8:
+		b = emitSimpleU8Transition(b, l.tableOff, byte(localState), 0, 0, byte(localByte), tableMemIdx)
+	default:
+		b = emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff,
+			byte(localState), byte(localByte), tableMemIdx)
 	}
 
 	// if state == 0 (dead): the byte just read has no valid transition. Fall
@@ -1696,13 +1725,37 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 			}
 		}
 	}
-	// Per-batch dst edges: two registers written in the same op batch cannot
-	// share a physical register—merging them would produce two writes to the
-	// same local in the same batch and the surviving value would be wrong.
+	// Per-batch edges. Two kinds, both about what a batch means:
+	//
+	//   dst–dst: two registers written in the same op batch cannot share a
+	//   physical register — merging them would produce two writes to the same
+	//   local in the same batch and the surviving value would be wrong.
+	//
+	//   dst–src across DISTINCT ops: a batch is a set of *parallel* copies that
+	//   sequentializeCopies has already ordered (inserting the scratch register
+	//   where a cycle demanded it) on the assumption that its registers are
+	//   distinct. Coalescing one op's dst onto another op's src invents a
+	//   read-after-write dependency that did not exist when that order was
+	//   chosen, and remapOps never re-sequentializes — so op i's write silently
+	//   destroys the value op j was supposed to read. plans/FABLE.md B14:
+	//   `(b+){2}c` on "bbbc" had the correctly-sequentialized batch
+	//   [{0 3} {1 2}] coalesced to [{1 2} {0 1}], reporting group 1 as [2 2]
+	//   instead of [2 3]. Forbidding the coalesce is the cheap half of the fix
+	//   (the alternative being a re-sequentialization pass over every remapped
+	//   batch); an op whose own dst equals another's src is already the same
+	//   register, and addEdge ignores self-edges, so this only ever constrains
+	//   pairs that were genuinely distinct.
 	addBatchEdges := func(ops []tdfaTagOp) {
 		for i := 0; i < len(ops); i++ {
 			for j := i + 1; j < len(ops); j++ {
 				addEdge(ops[i].dst, ops[j].dst)
+			}
+		}
+		for i := 0; i < len(ops); i++ {
+			for j := 0; j < len(ops); j++ {
+				if i != j && ops[j].src >= 0 {
+					addEdge(ops[i].dst, ops[j].src)
+				}
 			}
 		}
 	}
@@ -1712,6 +1765,9 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	for _, ops := range tt.acceptOps {
 		addBatchEdges(ops)
 	}
+	// entryOps is remapped by the same remapOps below, so it needs the same
+	// protection even though it fires once, before the main loop.
+	addBatchEdges(tt.entryOps)
 
 	// ---- Step 3: greedy colouring ----
 	// Sort registers by interference degree descending (most-constrained first).

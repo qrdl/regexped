@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp/syntax"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
@@ -103,7 +105,53 @@ func TestSelectEnginePublic(t *testing.T) {
 // wasmMagic is the 4-byte WASM magic header.
 var wasmMagic = []byte{0x00, 0x61, 0x73, 0x6d}
 
-// mustCompileEntries calls Compile with standalone=true and fails on error.
+// wasmValidator locates a WASM validator once per test binary.
+//
+// plans/FABLE.md T4: this whole file used to accept any byte string starting
+// with the magic header as "a valid WASM module", which is how B15's u16 TDFA
+// table addressing — an operand order that never once produced a well-typed
+// function — sat behind a green TestTDFAU16TableAddressing. Compiling a module
+// nothing can instantiate is exactly the failure a compiler test suite exists
+// to catch, and the magic-prefix check cannot catch any of it.
+//
+// The main module deliberately has no wasmtime dependency (CLAUDE.md lists it
+// under tools/ only), so validation shells out instead. `wasm-tools validate`
+// is preferred; `wasmtime compile` is accepted as a fallback since it type-
+// checks the module on the way to Cranelift. Everything the emitters use —
+// simd, bulk-memory, multi-memory — is enabled by default in both, so no
+// feature flags are needed.
+var wasmValidator = sync.OnceValue(func() []string {
+	if p, err := exec.LookPath("wasm-tools"); err == nil {
+		return []string{p, "validate"}
+	}
+	if p, err := exec.LookPath("wasmtime"); err == nil {
+		return []string{p, "compile", "-o", os.DevNull}
+	}
+	return nil
+})
+
+// validateWASM type-checks a compiled module. Missing validator → the test
+// still runs, with a warning, rather than failing on a toolchain gap; the
+// point is that a machine which HAS the tool cannot miss an invalid module.
+func validateWASM(t *testing.T, wasm []byte) {
+	t.Helper()
+	argv := wasmValidator()
+	if argv == nil {
+		t.Log("neither wasm-tools nor wasmtime found in PATH: skipping WASM validation (see plans/FABLE.md T4)")
+		return
+	}
+	path := filepath.Join(t.TempDir(), "m.wasm")
+	if err := os.WriteFile(path, wasm, 0o600); err != nil {
+		t.Fatalf("write module for validation: %v", err)
+	}
+	cmd := exec.Command(argv[0], append(append([]string{}, argv[1:]...), path)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("emitted module fails %s: %v\n%s", argv[0], err, out)
+	}
+}
+
+// mustCompileEntries calls Compile with standalone=true, fails on error, and
+// validates the emitted module.
 func mustCompileEntries(t *testing.T, entries []config.RegexEntry, opts ...CompileOptions) {
 	t.Helper()
 	wasm, _, err := Compile(entries, 0, true, opts...)
@@ -113,6 +161,7 @@ func mustCompileEntries(t *testing.T, entries []config.RegexEntry, opts ...Compi
 	if !bytes.HasPrefix(wasm, wasmMagic) {
 		t.Fatalf("Compile: output is not a valid WASM module (len=%d)", len(wasm))
 	}
+	validateWASM(t, wasm)
 }
 
 func TestCompileIntegrationDFA(t *testing.T) {

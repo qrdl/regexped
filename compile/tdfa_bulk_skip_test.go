@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"regexp/syntax"
 	"testing"
+
+	"github.com/qrdl/regexped/config"
 )
 
 func newTDFAForPattern(t *testing.T, pattern string) *tdfaTable {
@@ -266,7 +268,7 @@ func TestEmitTDFABulkSkipShape(t *testing.T) {
 		localSkipStart = 12
 		localCapBase   = 7
 	)
-	b := emitTDFABulkSkip(nil, info, localPos, localChunk, localMask, localSkipStart, localCapBase)
+	b := emitTDFABulkSkip(nil, info, localPos, localChunk, localMask, localSkipStart, localCapBase, nil)
 
 	got := decodeControlFlow(t, b)
 	want := []string{
@@ -298,7 +300,7 @@ func TestEmitTDFABulkSkipShapeNoTagOps(t *testing.T) {
 		selfLoopBytes: bytesRange(10),
 		ops:           nil,
 	}
-	b := emitTDFABulkSkip(nil, info, 3, 10, 11, 12, 7)
+	b := emitTDFABulkSkip(nil, info, 3, 10, 11, 12, 7, nil)
 	got := decodeControlFlow(t, b)
 	want := []string{
 		"block", "loop", "br_if 1",
@@ -308,5 +310,38 @@ func TestEmitTDFABulkSkipShapeNoTagOps(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("control-flow shape mismatch:\ngot:  %v\nwant: %v", got, want)
+	}
+}
+
+// TestTDFABulkSkipMidAcceptModuleValid compiles whole modules for the
+// bulk-skip shapes end to end, so the B16 mid-accept tail is type-checked by
+// mustCompileEntries' validator (plans/FABLE.md T4) rather than only by the
+// control-flow shape decoder above.
+//
+// The tail is emitted INSIDE emitTDFABulkSkip's "if pos != skipStart" body and
+// is followed by `br 2` out to loop $main, so it has to be perfectly balanced:
+// emitTDFAWriteCaptures opens a block per TDFA state, and one missing `end`
+// would retarget that branch at the wrong label. Nothing in the unit tests
+// above would notice — the shape decoder is handed a nil tail.
+//
+// Behavioural coverage (right capture values, not just a well-formed module)
+// lives in tools/fuzz's TestTDFABulkSkipMidAccept, which needs wasmtime.
+func TestTDFABulkSkipMidAcceptModuleValid(t *testing.T) {
+	// Each pattern's dominant state self-loops on a class of 8..64 bytes AND
+	// is mid-accepting, which is exactly the combination that emits the tail.
+	for _, pattern := range []string{
+		`^([a-z]+)`,
+		`^([0-9]+)`,
+		`^([a-zA-Z]+)`,
+		`^(\w+)`,
+		`^([a-z]+)([0-9]*)`,
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			tt := newTDFAForPattern(t, pattern)
+			if detectTDFABulkSkip(tt) == nil {
+				t.Fatalf("pattern %q no longer has a bulk-skip state — this test would compile nothing relevant", pattern)
+			}
+			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+		})
 	}
 }
