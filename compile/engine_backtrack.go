@@ -580,6 +580,34 @@ func btHasWordBoundary(prog *syntax.Prog) bool {
 	return false
 }
 
+// btHasTextLineAnchors reports whether prog contains a \A, \z, (?m:^) or
+// (?m:$) assertion. Like btHasWordBoundary, these four assertions are
+// defined against the true input edges, which a captureBody handed a
+// narrowed match slice cannot see. Their presence is what switches the
+// groups wrappers into window mode (FABLE.md B13) — see
+// buildBacktrackBody's winScratchOff.
+func btHasTextLineAnchors(prog *syntax.Prog) bool {
+	const mask = syntax.EmptyBeginText | syntax.EmptyEndText |
+		syntax.EmptyBeginLine | syntax.EmptyEndLine
+	for _, inst := range prog.Inst {
+		if inst.Op != syntax.InstEmptyWidth {
+			continue
+		}
+		if syntax.EmptyOp(inst.Arg)&mask != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// btLocalGet appends `local.get idx` for an arbitrary local index.
+// Byte-identical to the hand-written `append(b, 0x20, localX)` form for
+// every index below 128.
+func btLocalGet(b []byte, idx uint32) []byte {
+	b = append(b, 0x20)
+	return utils.AppendULEB128(b, idx)
+}
+
 // needsBitState returns true if prog contains a loop that the scalar
 // zero-progress guard alone cannot handle correctly, requiring BitState
 // memoisation to break a cycle:
@@ -657,8 +685,8 @@ func loopCaptureLocals(prog *syntax.Prog, idom []int, loopPC int) []uint32 {
 	return locals
 }
 
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, edgeScratchOff int32) []byte {
-	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, edgeScratchOff)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32) []byte {
+	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, winScratchOff)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -674,12 +702,17 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // full input length, not a DFA-narrowed match extent (see engine_tdfa.go's
 // identically-named parameter for the TDFA-side counterpart of this fix).
 //
-// edgeScratchOff (-1 when nativeAnchored, or when not applicable) is the
-// table-memory offset of an (origPtr,origEnd) pair the wrapper stashes
-// before calling this function, letting \b/\B checks (btWordBoundary) see
-// past the narrowed slice's edges into the true original input — see
-// FUZZER_BUGS.md #26.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, edgeScratchOff int32) []byte {
+// winScratchOff (-1 = off) switches this body into WINDOW MODE, the fix for
+// FUZZER_BUGS.md #26 and FABLE.md B13. In window mode the wrapper stops
+// narrowing: it passes the caller's real (ptr,len) and stashes the match
+// window as an (startOff,endOff) pair at this table-memory offset. This
+// body then starts at pos=startOff, accepts at pos==endOff, and records
+// capture positions already relative to the true ptr — so \b/\B, \A, \z,
+// (?m:^) and (?m:$) all see the real input edges and need no side-channel
+// fix-up, and the wrapper needs no per-slot rebasing pass afterwards.
+// Byte consumption is still bounded by endOff (limitLocal), so window mode
+// explores exactly the same positions the narrowed slice used to.
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 	numCaps := bt.numGroups
@@ -770,13 +803,27 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		memoZeroLen = memoLocalsBase + 4
 	}
 
-	// Total non-param locals: pos, sp, state, scratch, cap0s, cap0e, ...,
-	// loop_pos..., loop_snap..., loop_entry..., (memo locals when useMemo)
+	// Window-mode locals (see winScratchOff): the match window's start and
+	// end offsets, loaded once from scratch at entry. Placed last so no
+	// existing local index shifts.
+	useWindow := winScratchOff >= 0
 	memoLocalsCount := 0
 	if useMemo {
 		memoLocalsCount = 5
 	}
-	totalLocals := 4 + numCapLocals + len(loopPCsSorted) + snapTotal + len(entryPCsSorted) + memoLocalsCount
+	winStartLocal := memoLocalsBase + uint32(memoLocalsCount)
+	winEndLocal := winStartLocal + 1
+	limitLocal := uint32(localLen)
+	winLocalsCount := 0
+	if useWindow {
+		limitLocal = winEndLocal
+		winLocalsCount = 2
+	}
+
+	// Total non-param locals: pos, sp, state, scratch, cap0s, cap0e, ...,
+	// loop_pos..., loop_snap..., loop_entry..., (memo locals when useMemo),
+	// (window locals when useWindow)
+	totalLocals := 4 + numCapLocals + len(loopPCsSorted) + snapTotal + len(entryPCsSorted) + memoLocalsCount + winLocalsCount
 
 	var body []byte
 
@@ -785,8 +832,29 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	body = utils.AppendULEB128(body, uint32(totalLocals))
 	body = append(body, 0x7F)
 
-	// ── Initialise pos=0, sp=stackBase, state=prog.Start ────────────────────
-	body = append(body, 0x41, 0x00)     // i32.const 0
+	// ── Window offsets (window mode only) ───────────────────────────────────
+	// Loaded once; winStart also seeds pos, and winEnd is the consumption
+	// limit every bounds check and InstMatch tests against.
+	if useWindow {
+		body = append(body, 0x41)
+		body = utils.AppendSLEB128(body, winScratchOff)
+		body = appendTableLoad32(body, tableMemIdx, 0) // startOff
+		body = append(body, 0x21)
+		body = utils.AppendULEB128(body, winStartLocal)
+
+		body = append(body, 0x41)
+		body = utils.AppendSLEB128(body, winScratchOff)
+		body = appendTableLoad32(body, tableMemIdx, 4) // endOff
+		body = append(body, 0x21)
+		body = utils.AppendULEB128(body, winEndLocal)
+	}
+
+	// ── Initialise pos=startOff, sp=stackBase, state=prog.Start ─────────────
+	if useWindow {
+		body = btLocalGet(body, winStartLocal)
+	} else {
+		body = append(body, 0x41, 0x00) // i32.const 0
+	}
 	body = append(body, 0x21, localPos) // local.set pos
 
 	body = append(body, 0x41)
@@ -830,12 +898,16 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 
 	// ── Initialise loop entry-pos locals ────────────────────────────────────
 	// -1 sentinel normally; loopEntryAtStart heads (no external entry PC —
-	// see its doc) get this attempt's own start position (0 — pos is
-	// initialised to 0 above) instead, since there's no instruction to
-	// write it for them at runtime.
+	// see its doc) get this attempt's own start position (whatever pos was
+	// initialised to above) instead, since there's no instruction to write
+	// it for them at runtime.
 	for _, pc := range entryPCsSorted {
 		if bt.loopEntryAtStart[pc] {
-			body = append(body, 0x41, 0x00) // i32.const 0
+			if useWindow {
+				body = btLocalGet(body, winStartLocal)
+			} else {
+				body = append(body, 0x41, 0x00) // i32.const 0
+			}
 		} else {
 			body = append(body, 0x41, 0x7F) // i32.const -1
 		}
@@ -845,8 +917,17 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 
 	// ── Part 3: Memo table zero-init and lenPlus1 pre-computation ───────────
 	if useMemo {
-		// lenPlus1 = localLen + 1
-		body = append(body, 0x20, localLen)
+		// lenPlus1 = window length + 1 (localLen + 1 outside window mode).
+		// Keeping the memo table window-sized, rather than input-sized, is
+		// what keeps window mode's memo zero-init cost identical to the
+		// narrowed slice's — positions are rebased by winStart at each probe.
+		if useWindow {
+			body = btLocalGet(body, winEndLocal)
+			body = btLocalGet(body, winStartLocal)
+			body = append(body, 0x6B) // i32.sub
+		} else {
+			body = append(body, 0x20, localLen)
+		}
 		body = append(body, 0x41, 0x01) // i32.const 1
 		body = append(body, 0x6A)       // i32.add
 		body = append(body, 0x21)
@@ -971,7 +1052,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopEntryLocalIdx, loopSnapBase, loopSnapLocals, extraFrameLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, edgeScratchOff)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopEntryLocalIdx, loopSnapBase, loopSnapLocals, extraFrameLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, limitLocal, winStartLocal, useWindow)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -988,15 +1069,20 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 // WASM-level if-block (callers pass brRunNested; the enclosing Go-level
 // `if useMemo && ...` around the call site is compile-time only and adds no
 // WASM nesting).
-func emitBitStateGuard(body []byte, p int, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte uint32, memoTableBase int32, tableMemIdx int, brDepth uint32) []byte {
-	// bitIdx = p * lenPlus1 + localPos
-	// (p is the compile-time PC, baked as i32.const)
+func emitBitStateGuard(body []byte, p int, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte uint32, memoTableBase int32, tableMemIdx int, brDepth uint32, winStartLocal uint32, useWindow bool) []byte {
+	// bitIdx = p * lenPlus1 + (localPos - winStart)
+	// (p is the compile-time PC, baked as i32.const; the winStart rebase is
+	// window mode's only per-probe cost — the table stays window-sized.)
 	body = append(body, 0x41)
 	body = utils.AppendSLEB128(body, int32(p))
 	body = append(body, 0x20)
 	body = utils.AppendULEB128(body, memoLenPlus1Local)
 	body = append(body, 0x6C) // i32.mul
 	body = append(body, 0x20, localPos)
+	if useWindow {
+		body = btLocalGet(body, winStartLocal)
+		body = append(body, 0x6B) // i32.sub (rebase into the window)
+	}
 	body = append(body, 0x6A) // i32.add
 	body = append(body, 0x22) // local.tee
 	body = utils.AppendULEB128(body, memoBitIdx)
@@ -1076,7 +1162,8 @@ func emitBTInstHandler(
 	instMatchFn func([]byte, uint32) []byte,
 	overflowFn func([]byte, uint32) []byte,
 	tableMemIdx int,
-	edgeScratchOff int32,
+	limitLocal, winStartLocal uint32,
+	useWindow bool,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
@@ -1130,24 +1217,24 @@ func emitBTInstHandler(
 
 	switch inst.Op {
 	case syntax.InstRune1:
-		body = btBoundsCheck(body, brRunNested)
+		body = btBoundsCheck(body, brRunNested, limitLocal)
 		body = btCheckRune1(body, inst, brRunNested)
 		body = btAdvancePos(body)
 		body = contOut(body)
 
 	case syntax.InstRune:
-		body = btBoundsCheck(body, brRunNested)
+		body = btBoundsCheck(body, brRunNested, limitLocal)
 		body = btCheckRuneRanges(body, inst, brRunNested)
 		body = btAdvancePos(body)
 		body = contOut(body)
 
 	case syntax.InstRuneAny:
-		body = btBoundsCheck(body, brRunNested)
+		body = btBoundsCheck(body, brRunNested, limitLocal)
 		body = btAdvancePos(body)
 		body = contOut(body)
 
 	case syntax.InstRuneAnyNotNL:
-		body = btBoundsCheck(body, brRunNested)
+		body = btBoundsCheck(body, brRunNested, limitLocal)
 		// if input[pos] == '\n' → fail
 		body = append(body, 0x20, localPtr)
 		body = append(body, 0x20, localPos)
@@ -1172,7 +1259,7 @@ func emitBTInstHandler(
 			// non-greedy empty-body loop head is memoised below, to bound the
 			// otherwise-unlimited retry growth. See bt.memoInnerLoop's doc.
 			if useMemo && bt.memoInnerLoop[p] {
-				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested)
+				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested, winStartLocal, useWindow)
 			}
 			body = writeLoopEntryArg(body)
 			body = btPushFrame(body, numCapLocals, extraFrameLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
@@ -1185,7 +1272,7 @@ func emitBTInstHandler(
 			// Only for non-greedy loop heads with zero-matchable bodies.
 			// Greedy loops are correctly handled by the zero-progress guard below.
 			if useMemo && bt.nonGreedyLoop[p] {
-				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested)
+				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested, winStartLocal, useWindow)
 			}
 
 			// For greedy loops: body=Out, exit=Arg. For non-greedy: body=Arg, exit=Out.
@@ -1320,6 +1407,8 @@ func emitBTInstHandler(
 		case emptyOp&syntax.EmptyBeginLine != 0:
 			// (?m:^): fires at pos==0 or when prev byte is '\n'
 			// Fail if: pos != 0 AND mem[ptr + pos - 1] != '\n'
+			// pos is a true input offset under window mode, so this needs no
+			// edge fix-up (FABLE.md B13).
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x45)       // i32.eqz
 			body = append(body, 0x04, 0x40) // if void (pos == 0): ok
@@ -1334,12 +1423,13 @@ func emitBTInstHandler(
 			body = append(body, 0x47)             // i32.ne
 			body = append(body, 0x04, 0x40)       // if void (prev != '\n'): fail
 			body = btFail(body, brRunNested+1)    // +1: nested inside the outer if/else too
-			body = append(body, 0x0B) // end if prev != '\n'
-			body = append(body, 0x0B) // end if pos == 0
+			body = append(body, 0x0B)             // end if prev != '\n'
+			body = append(body, 0x0B)             // end if pos == 0
 			body = contOut(body)
 
 		case emptyOp&syntax.EmptyBeginText != 0:
-			// \A: fires only at pos==0 (beginning of match slice)
+			// \A: fires only at pos==0, which under window mode is the true
+			// start of the input (FABLE.md B13).
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x45)       // i32.eqz
 			body = append(body, 0x45)       // i32.eqz (NOT: nonzero = fail)
@@ -1351,6 +1441,7 @@ func emitBTInstHandler(
 		case emptyOp&syntax.EmptyEndLine != 0:
 			// (?m:$): fires at pos==len or when next byte is '\n'
 			// Fail if: pos != len AND mem[ptr + pos] != '\n'
+			// len is the true input length under window mode (FABLE.md B13).
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x20, localLen)
 			body = append(body, 0x46)       // i32.eq
@@ -1364,12 +1455,13 @@ func emitBTInstHandler(
 			body = append(body, 0x47)             // i32.ne
 			body = append(body, 0x04, 0x40)       // if void (next != '\n'): fail
 			body = btFail(body, brRunNested+1)    // +1: nested inside the outer if/else too
-			body = append(body, 0x0B) // end if next != '\n'
-			body = append(body, 0x0B) // end if pos == len
+			body = append(body, 0x0B)             // end if next != '\n'
+			body = append(body, 0x0B)             // end if pos == len
 			body = contOut(body)
 
 		case emptyOp&syntax.EmptyEndText != 0:
-			// \z: fires only at pos==len (end of match slice)
+			// \z: fires only at pos==len, which under window mode is the true
+			// end of the input (FABLE.md B13).
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x20, localLen)
 			body = append(body, 0x47)       // i32.ne
@@ -1379,11 +1471,11 @@ func emitBTInstHandler(
 			body = contOut(body)
 
 		case emptyOp&syntax.EmptyWordBoundary != 0:
-			body = btWordBoundary(body, true, brRunNested, tableMemIdx, edgeScratchOff)
+			body = btWordBoundary(body, true, brRunNested)
 			body = contOut(body)
 
 		case emptyOp&syntax.EmptyNoWordBoundary != 0:
-			body = btWordBoundary(body, false, brRunNested, tableMemIdx, edgeScratchOff)
+			body = btWordBoundary(body, false, brRunNested)
 			body = contOut(body)
 		}
 
@@ -1397,10 +1489,12 @@ func emitBTInstHandler(
 			break
 		}
 		if !nativeAnchored {
-			// RE2 semantics: only accept if the full input slice is consumed.
-			// The caller sets len = DFA-determined end, so pos must equal len.
+			// RE2 semantics: only accept if the whole match window is
+			// consumed. limitLocal is localLen when the caller narrowed the
+			// slice, and the window end loaded from scratch under window
+			// mode (FABLE.md B13 option D).
 			body = append(body, 0x20, localPos)
-			body = append(body, 0x20, localLen)
+			body = btLocalGet(body, limitLocal)
 			body = append(body, 0x47)       // i32.ne
 			body = append(body, 0x04, 0x40) // if void
 			body = btFail(body, brRunNested)
@@ -1415,9 +1509,14 @@ func emitBTInstHandler(
 		// the correct answer regardless of how much input remains unconsumed.
 
 		// Write captures to out_ptr and return pos.
-		// Group 0: start = 0 (anchored), end = pos.
+		// Group 0: start = where this attempt began (0 when the caller
+		// narrowed the slice, the window start under window mode), end = pos.
 		body = append(body, 0x20, localOutPtr)
-		body = append(body, 0x41, 0x00)     // i32.const 0 (group 0 start)
+		if useWindow {
+			body = btLocalGet(body, winStartLocal)
+		} else {
+			body = append(body, 0x41, 0x00) // i32.const 0 (group 0 start)
+		}
 		body = append(body, 0x36, 0x02)     // i32.store align=2
 		body = utils.AppendULEB128(body, 0) // offset=0
 
@@ -1486,9 +1585,9 @@ func btAdvancePos(b []byte) []byte {
 }
 
 // btBoundsCheck emits: if pos >= len { fail(brDepth) }
-func btBoundsCheck(b []byte, brDepth uint32) []byte {
+func btBoundsCheck(b []byte, brDepth uint32, limitLocal uint32) []byte {
 	b = append(b, 0x20, localPos)
-	b = append(b, 0x20, localLen)
+	b = btLocalGet(b, limitLocal)
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x04, 0x40) // if void
 	b = btFail(b, brDepth)
@@ -1739,36 +1838,19 @@ func btPushFrame(b []byte, numCapLocals int, extraLocals []uint32, retryPC uint3
 // Uses scratch local to hold loaded bytes.
 // Computes: prevIsWord XOR nextIsWord; check against wantBoundary.
 //
-// edgeScratchOff (-1 = not applicable) is the table-memory offset of an
-// (origPtr,origEnd) pair stashed by the caller's wrapper before invoking
-// this captureBody. When the captureBody is composed behind a find
-// wrapper, its own (ptr,len) are already narrowed to the match slice, so
-// pos==0/pos==len here are edges of that slice, not necessarily the true
-// start/end of the original input — treating them as such silently drops
-// real \b context on the other side of the edge (FUZZER_BUGS.md #26).
-// When edgeScratchOff >= 0, pos==0 only counts as "no predecessor" if the
-// slice's ptr also equals the original ptr (i.e., the slice starts at true
-// position 0); otherwise it falls through to the normal ptr+pos-1 load,
-// which correctly reads the real preceding byte. Symmetric for pos==len
-// against origEnd.
-func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32, tableMemIdx int, edgeScratchOff int32) []byte {
-	useEdge := edgeScratchOff >= 0
-
+// The captureBody's (ptr,len) are always the caller's true input under
+// window mode (see buildBacktrackBody's winScratchOff), so pos==0 / pos==len
+// are true input edges here and no side-channel edge context is needed —
+// this is what FUZZER_BUGS.md #26's (origPtr,origEnd) scratch used to
+// reconstruct for a narrowed slice.
+func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32) []byte {
 	// Compute prevIsWord (0 or 1) using block (result i32):
-	//   if pos == 0 (and, if useEdge, ptr == origPtr): push 0
+	//   if pos == 0: push 0
 	//   else: load input[pos-1]; isWordChar → push 0 or 1
 	b = append(b, 0x02, 0x7F) // block (result i32) $prevWord
 	b = append(b, 0x20, localPos)
-	b = append(b, 0x45) // i32.eqz
-	if useEdge {
-		b = append(b, 0x20, localPtr)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, edgeScratchOff)
-		b = appendTableLoad32(b, tableMemIdx, 0) // origPtr
-		b = append(b, 0x46)                      // i32.eq (ptr == origPtr)
-		b = append(b, 0x71)                      // i32.and
-	}
-	b = append(b, 0x04, 0x40) // if void (pos == 0 [&& ptr == origPtr])
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x04, 0x40) // if void (pos == 0)
 	b = append(b, 0x41, 0x00) // i32.const 0
 	b = append(b, 0x0C, 0x01) // br 1 → out of $prevWord
 	b = append(b, 0x0B)       // end if
@@ -1787,18 +1869,8 @@ func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32, tableMemIdx int
 	b = append(b, 0x02, 0x7F) // block (result i32) $nextWord
 	b = append(b, 0x20, localPos)
 	b = append(b, 0x20, localLen)
-	b = append(b, 0x4F) // i32.ge_u
-	if useEdge {
-		b = append(b, 0x20, localPtr)
-		b = append(b, 0x20, localLen)
-		b = append(b, 0x6A) // ptr + len
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, edgeScratchOff)
-		b = appendTableLoad32(b, tableMemIdx, 4) // origEnd
-		b = append(b, 0x46)                      // i32.eq (ptr+len == origEnd)
-		b = append(b, 0x71)                      // i32.and
-	}
-	b = append(b, 0x04, 0x40) // if void (pos >= len [&& ptr+len == origEnd])
+	b = append(b, 0x4F)       // i32.ge_u
+	b = append(b, 0x04, 0x40) // if void (pos >= len)
 	b = append(b, 0x41, 0x00) // i32.const 0
 	b = append(b, 0x0C, 0x01) // br 1 → out of $nextWord
 	b = append(b, 0x0B)       // end if
@@ -2220,7 +2292,8 @@ func buildBTInnerDisp(
 			instMatchFn,
 			overflowFn,
 			tableMemIdx,
-			-1,
+			uint32(localLen), 0,
+			false,
 		)
 	}
 	return body

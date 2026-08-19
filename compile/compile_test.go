@@ -1470,3 +1470,37 @@ func TestCompileAutoSelectEngine(t *testing.T) {
 		}
 	})
 }
+
+// TestCompileBTCaptureBudgetIncludesMemoTable — FABLE.md B25. The BT
+// capture path checked only the stack against WASM32's 4GiB ceiling, then
+// went on to reserve the BitState memo table (up to MemoBudget) and, for
+// patterns needing true-input edge context, an 8-byte (origPtr,origEnd)
+// scratch. A reservation whose stack ended just below the ceiling therefore
+// passed the check yet declared memory past it — FUZZER_BUGS.md #32's
+// failure mode again (a generic wasmtime instantiation error instead of a
+// clear compile error).
+//
+// 245 `((a|b)*)` repeats put the BT capture stack at ~4.02GB, which alone
+// still fits under the ceiling; the trailing `(a*)*` is the only part that
+// makes needsBitState true, so the 512MB memo table is exactly what pushes
+// the reservation over. MemoBudget is raised from its 128KB default purely
+// to make that window wide enough to hit with a pattern that stays under
+// checkBTLoopCount and maxBTFallbackInstructions.
+func TestCompileBTCaptureBudgetIncludesMemoTable(t *testing.T) {
+	const stackOnly = 245 // repeats; ~4.02GB of BT capture stack
+	opts := CompileOptions{MemoBudget: 512 << 20}
+
+	// Control: identical stack, but no zero-width loop → no memo table →
+	// the reservation fits and compilation succeeds.
+	ctrl := config.RegexEntry{Pattern: strings.Repeat(`((a|b)*)`, stackOnly), GroupsFunc: "g"}
+	if _, err := compilePattern(ctrl, 0, EngineBacktrack, opts); err != nil {
+		t.Fatalf("control (no memo table): %v", err)
+	}
+
+	// Same stack plus a memo-requiring tail: the memo table takes it past
+	// the ceiling and compilation must say so.
+	entry := config.RegexEntry{Pattern: ctrl.Pattern + `(a*)*`, GroupsFunc: "g"}
+	if _, err := compilePattern(entry, 0, EngineBacktrack, opts); !errors.Is(err, ErrBTStackTooLarge) {
+		t.Fatalf("compilePattern: err = %v, want ErrBTStackTooLarge", err)
+	}
+}

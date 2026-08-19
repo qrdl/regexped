@@ -390,7 +390,7 @@ type compiledPattern struct {
 	isTDFA     bool     // true = TDFA capture; false = Backtracking (controls sentinel data segment)
 	groupNames []string // groupNames[i] = name for group i+1; "" = unnamed
 
-	// edgeScratchOff: table-memory offset of an 8-byte (origPtr,origEnd) scratch
+	// winScratchOff: table-memory offset of an 8-byte (startOff,endOff) scratch
 	// slot, written by the groups/batch-groups wrapper right before calling
 	// captureBody and read by captureBody's word-boundary (\b/\B) checks at the
 	// two edges of the DFA-narrowed match slice. Only meaningful when
@@ -400,7 +400,7 @@ type compiledPattern struct {
 	// start/end of the original input, losing real \b context beyond the
 	// match. Zero value (0) is never read unless isTDFA==false && anchored==false,
 	// in which case it always holds a real, explicitly-set offset.
-	edgeScratchOff int32
+	winScratchOff int32
 
 	dataSegCount int    // number of data segments in dataBytes
 	dataBytes    []byte // raw data segments (no count prefix)
@@ -1609,11 +1609,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if !dfaStateLimitExceeded && !anchored && isWholePatternSingleCapture(parsed) {
 		p.numGroups = 2
 		p.captureBody = appendTrivialSingleCaptureCodeEntry(nil)
-		// edgeScratchOff must be an explicit -1 here: the field's zero value
+		// winScratchOff must be an explicit -1 here: the field's zero value
 		// is 0, a real table-memory offset, and this path is !isTDFA &&
 		// !anchored — exactly the combination the wrapper-emission call site
-		// (compile.go, appendWrapperCodeEntry's edgeOff) treats as "read
-		// p.edgeScratchOff", so leaving it unset made the wrapper scribble an
+		// (compile.go, appendWrapperCodeEntry's winOff) treats as "read
+		// p.winScratchOff", so leaving it unset made the wrapper scribble an
 		// 8-byte (origPtr,origEnd) scratch value over table-memory offset 0
 		// on every groups() call. In a standalone module (tableMemIdx 0) that
 		// memory IS the caller's own memory — offset 0 is the input buffer's
@@ -1621,7 +1621,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// an embedded module (tableMemIdx 1) it corrupts the DFA table's own
 		// base instead. Either way, the next find()/groups() call in the
 		// same instance reads back garbage. See plans/TODO.md task 50.
-		p.edgeScratchOff = -1
+		p.winScratchOff = -1
 		return p, nil
 	}
 
@@ -1693,16 +1693,12 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			maxFrames = 4096
 		}
 		stackSize := maxFrames * frameSize
-		if err := checkBTMemoryBudget(btBase, int64(stackSize)); err != nil {
-			return nil, err
-		}
-		stackBase := int32(btBase)
-		stackLimit := stackBase + int32(stackSize)
 
 		// Memo table (BitState memoization) — only when the pattern has loops
 		// whose body can match zero bytes, which can cause infinite revisiting.
+		// Sized before the budget check below: the check has to cover
+		// everything this path reserves, not just the stack (FABLE.md B25).
 		useMemo := needsBitState(prog)
-		var memoTableBase int32
 		var memoMaxLen int32
 		var memoMaxSize int64
 		if useMemo {
@@ -1716,32 +1712,51 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						"increase CompileOptions.MemoBudget",
 					memoMaxSize, memoBudget)
 			}
+		}
+
+		// Window mode: patterns whose assertions are defined against the
+		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get an 8-byte
+		// (startOff,endOff) scratch slot, and the groups/batch-groups
+		// wrappers stop narrowing (ptr,len) for them entirely — see
+		// buildBacktrackBody, FUZZER_BUGS.md #26 and FABLE.md B13.
+		// Only needed when this captureBody is composed behind a find
+		// wrapper (!anchored); the native/anchored export already gets the
+		// caller's real ptr/len and has no such gap.
+		needWindow := !anchored && (btHasWordBoundary(prog) || btHasTextLineAnchors(prog))
+		var winScratchSize int64
+		if needWindow {
+			winScratchSize = 8
+		}
+
+		if err := checkBTMemoryBudget(btBase, int64(stackSize)+memoMaxSize+winScratchSize); err != nil {
+			return nil, err
+		}
+		stackBase := int32(btBase)
+		stackLimit := stackBase + int32(stackSize)
+		var memoTableBase int32
+		if useMemo {
 			memoTableBase = stackBase + int32(stackSize)
 		}
 
-		// Reserve an 8-byte (origPtr,origEnd) scratch slot for the groups/
-		// batch-groups wrapper to stash true-input edge context that
-		// captureBody's \b/\B checks need but can't derive from its own
-		// (narrowed ptr, narrowed len) params alone — see FUZZER_BUGS.md #26.
-		// Only needed when this captureBody is composed behind a find
-		// wrapper (!anchored); the native/anchored export sees the caller's
-		// real ptr/len directly and has no such gap.
-		edgeScratchOff := int32(-1)
-		var afterBT int64
+		winScratchOff := int32(-1)
+		// Kept in int64 throughout: memoTableBase is an int32 whose bit
+		// pattern is the right WASM address even past 2GiB, but
+		// sign-extending it back here would make the reservation's own end
+		// address negative and hide an over-ceiling reservation from the
+		// tableEnd bookkeeping (FABLE.md B25). Identical below 2GiB.
+		afterBT := btBase + int64(stackSize)
 		if useMemo {
-			afterBT = int64(memoTableBase) + memoMaxSize
-		} else {
-			afterBT = btBase + int64(stackSize)
+			afterBT += memoMaxSize
 		}
-		if !anchored && btHasWordBoundary(prog) {
-			edgeScratchOff = int32(afterBT)
+		if needWindow {
+			winScratchOff = int32(afterBT)
 			afterBT += 8
 		}
 		p.tableEnd = utils.PageAlign(afterBT)
 
 		p.numGroups = bt.numGroups
-		p.edgeScratchOff = edgeScratchOff
-		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, edgeScratchOff)
+		p.winScratchOff = winScratchOff
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winScratchOff)
 	}
 
 	return p, nil
@@ -1990,11 +2005,11 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !standalone {
 					wrapperTableMemIdx = 1
 				}
-				edgeOff := int32(-1)
+				winOff := int32(-1)
 				if !p.isTDFA {
-					edgeOff = p.edgeScratchOff
+					winOff = p.winScratchOff
 				}
-				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, edgeOff)
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff)
 				if p.namedGroupsExport != "" {
 					cs = appendNamedGroupsWrapperCodeEntry(cs, base+wrapperOff)
 				}
@@ -2017,11 +2032,11 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !standalone {
 					batchTableMemIdx = 1
 				}
-				edgeOff := int32(-1)
+				winOff := int32(-1)
 				if !p.isTDFA {
-					edgeOff = p.edgeScratchOff
+					winOff = p.winScratchOff
 				}
-				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, edgeOff)
+				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff)
 			}
 		}
 	}
@@ -2381,13 +2396,15 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 //
 // Signature: (ptr i32, len i32, out_ptr i32) → i32
 //
-// edgeScratchOff (-1 = not applicable, e.g. TDFA or a captureBody with no
-// \b/\B) is the table-memory offset of an 8-byte (origPtr,origEnd) scratch
-// slot; when set, this wrapper stashes the true (unnarrowed) input's edge
-// context there before calling captureFuncIdx, so its \b/\B checks can see
-// past the DFA-narrowed match slice — see FUZZER_BUGS.md #26 and
-// btWordBoundary in engine_backtrack.go.
-func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, edgeScratchOff int32) []byte {
+// winScratchOff (-1 = not applicable, e.g. TDFA or a captureBody with no
+// edge-sensitive assertion) turns on WINDOW MODE: instead of narrowing
+// (ptr,len) to the match extent, this wrapper passes the caller's real
+// (ptr,len) and writes the extent as an (startOff,endOff) pair to that
+// table-memory offset. The capture body then sees true input edges for
+// \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already
+// relative to ptr — see FUZZER_BUGS.md #26, FABLE.md B13, and
+// buildBacktrackBody in engine_backtrack.go.
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
 	var b []byte
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F) // 3 × i32
@@ -2407,32 +2424,38 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	b = append(b, 0x20, 0x06) //   local.get r
 	b = append(b, 0xA7)       //   i32.wrap_i64
 	b = append(b, 0x05)       // else
-	if edgeScratchOff >= 0 {
-		// scratch[0] = origPtr (this wrapper's own ptr param, never shifted)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, edgeScratchOff)
-		b = append(b, 0x20, 0x00)
-		b = appendTableStore32(b, tableMemIdx, 0)
-		// scratch[4] = origEnd (ptr+len)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, edgeScratchOff)
-		b = append(b, 0x20, 0x00)
-		b = append(b, 0x20, 0x01)
-		b = append(b, 0x6A)
-		b = appendTableStore32(b, tableMemIdx, 4)
-	}
+	// start = wrap(r >> 32)
 	b = append(b, 0x20, 0x06)
 	b = append(b, 0x42, 0x20)
 	b = append(b, 0x88)
 	b = append(b, 0xA7)
 	b = append(b, 0x21, 0x03)
-	b = append(b, 0x20, 0x00)
-	b = append(b, 0x20, 0x03)
-	b = append(b, 0x6A)
-	b = append(b, 0x20, 0x06)
-	b = append(b, 0xA7)
-	b = append(b, 0x20, 0x03)
-	b = append(b, 0x6B)
+	if winScratchOff >= 0 {
+		// Window mode: hand the capture body the caller's real (ptr,len)
+		// and pass the match extent out of band, so its \b/\A/\z/(?m:^)/
+		// (?m:$) checks see true input edges. Capture slots come back
+		// already relative to ptr, so no rebasing pass is needed below.
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, winScratchOff)
+		b = append(b, 0x20, 0x03) // startOff
+		b = appendTableStore32(b, tableMemIdx, 0)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, winScratchOff)
+		b = append(b, 0x20, 0x06)
+		b = append(b, 0xA7) // endOff = wrap(r)
+		b = appendTableStore32(b, tableMemIdx, 4)
+
+		b = append(b, 0x20, 0x00)
+		b = append(b, 0x20, 0x01)
+	} else {
+		b = append(b, 0x20, 0x00)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, 0x06)
+		b = append(b, 0xA7)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x6B)
+	}
 	b = append(b, 0x20, 0x02)
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
@@ -2445,26 +2468,32 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	b = append(b, 0x04, 0x7F) // if (result i32)
 	b = append(b, 0x20, 0x04) //   local.get capRes
 	b = append(b, 0x05)       // else
-	for i := 0; i < numGroups*2; i++ {
-		offset := uint32(i * 4)
-		b = append(b, 0x20, 0x02)
-		b = append(b, 0x28, 0x02)
-		b = utils.AppendULEB128(b, offset)
-		b = append(b, 0x22, 0x05)
-		b = append(b, 0x41, 0x00)
-		b = append(b, 0x4E)
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, 0x02)
-		b = append(b, 0x20, 0x05)
+	if winScratchOff >= 0 {
+		// Window mode: slots and the returned end are already relative to
+		// ptr — no per-slot rebasing pass.
+		b = append(b, 0x20, 0x04)
+	} else {
+		for i := 0; i < numGroups*2; i++ {
+			offset := uint32(i * 4)
+			b = append(b, 0x20, 0x02)
+			b = append(b, 0x28, 0x02)
+			b = utils.AppendULEB128(b, offset)
+			b = append(b, 0x22, 0x05)
+			b = append(b, 0x41, 0x00)
+			b = append(b, 0x4E)
+			b = append(b, 0x04, 0x40)
+			b = append(b, 0x20, 0x02)
+			b = append(b, 0x20, 0x05)
+			b = append(b, 0x20, 0x03)
+			b = append(b, 0x6A)
+			b = append(b, 0x36, 0x02)
+			b = utils.AppendULEB128(b, offset)
+			b = append(b, 0x0B)
+		}
+		b = append(b, 0x20, 0x04)
 		b = append(b, 0x20, 0x03)
 		b = append(b, 0x6A)
-		b = append(b, 0x36, 0x02)
-		b = utils.AppendULEB128(b, offset)
-		b = append(b, 0x0B)
 	}
-	b = append(b, 0x20, 0x04)
-	b = append(b, 0x20, 0x03)
-	b = append(b, 0x6A)
 	b = append(b, 0x0B)
 	b = append(b, 0x0B)
 	b = append(b, 0x0B)
@@ -2472,8 +2501,8 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 }
 
 // appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
-func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, edgeScratchOff int32) []byte {
-	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, edgeScratchOff)
+func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
+	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winScratchOff)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -2627,18 +2656,16 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int) []byte {
 //	       group 0 is the whole match, duplicating [0:4]/[4:8] — kept for a
 //	       uniform per-group access pattern in the consuming stub.
 //
-// edgeScratchOff (-1 = not applicable) is the table-memory offset of an
-// 8-byte (origPtr,origEnd) scratch slot; when set, this wrapper stashes
-// the true (unnarrowed) input's edge context there once, before the scan
-// loop, so captureFuncIdx's \b/\B checks can see past each narrowed match
-// slice — see FUZZER_BUGS.md #26 and buildGroupsWrapperBody above (this
-// wrapper's ptr/len params, unlike absStart/matchLen inside the loop, are
-// constant across all iterations, so the write happens exactly once).
+// winScratchOff (-1 = not applicable) turns on window mode, exactly as in
+// buildGroupsWrapperBody: the capture body is called with this wrapper's
+// own (ptr,len) and the per-match extent is written to the (startOff,endOff)
+// scratch inside the loop, once per match — see FUZZER_BUGS.md #26 and
+// FABLE.md B13.
 //
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
 // 12=recBase i32, 13=capRes i32, 14=adj i32, 15=slotVal i32.
-func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, edgeScratchOff int32) []byte {
+func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
 	recordSize := 8 + numGroups*8
 
 	var b []byte
@@ -2652,21 +2679,6 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	// pos = start_pos; count = 0
 	b = append(b, 0x20, 0x04, 0x21, 0x05)
 	b = append(b, 0x41, 0x00, 0x21, 0x06)
-
-	if edgeScratchOff >= 0 {
-		// scratch[0] = origPtr (param 0); scratch[4] = origEnd (ptr+len) —
-		// written once; constant across every iteration of the scan loop.
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, edgeScratchOff)
-		b = append(b, 0x20, 0x00)
-		b = appendTableStore32(b, tableMemIdx, 0)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, edgeScratchOff)
-		b = append(b, 0x20, 0x00)
-		b = append(b, 0x20, 0x01)
-		b = append(b, 0x6A)
-		b = appendTableStore32(b, tableMemIdx, 4)
-	}
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $L
@@ -2694,17 +2706,40 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = append(b, 0x20, 0x07, 0x42, 0x20, 0x88, 0xA7, 0x21, 0x08)
 	b = append(b, 0x20, 0x07, 0xA7, 0x21, 0x09)
 
-	// absStart = ptr + pos + relStart
-	b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A, 0x20, 0x08, 0x6A, 0x21, 0x0A)
-	// matchLen = relEnd - relStart
-	b = append(b, 0x20, 0x09, 0x20, 0x08, 0x6B, 0x21, 0x0B)
+	if winScratchOff >= 0 {
+		// Window mode: the capture body gets the caller's real (ptr,len)
+		// and this match's extent out of band — see buildGroupsWrapperBody.
+		// adj = pos + relStart (window start, also the slot rebase that
+		// window mode makes unnecessary below)
+		b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x0E)
+		// matchLen local reused as the window end = pos + relEnd
+		b = append(b, 0x20, 0x05, 0x20, 0x09, 0x6A, 0x21, 0x0B)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, winScratchOff)
+		b = append(b, 0x20, 0x0E)
+		b = appendTableStore32(b, tableMemIdx, 0)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, winScratchOff)
+		b = append(b, 0x20, 0x0B)
+		b = appendTableStore32(b, tableMemIdx, 4)
+	} else {
+		// absStart = ptr + pos + relStart
+		b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A, 0x20, 0x08, 0x6A, 0x21, 0x0A)
+		// matchLen = relEnd - relStart
+		b = append(b, 0x20, 0x09, 0x20, 0x08, 0x6B, 0x21, 0x0B)
+	}
 	// recBase = out_ptr + count*recordSize
 	b = append(b, 0x20, 0x02, 0x20, 0x06, 0x41)
 	b = utils.AppendSLEB128(b, int32(recordSize))
 	b = append(b, 0x6C, 0x6A, 0x21, 0x0C)
 
 	// capRes = call capture(absStart, matchLen, recBase+8)
-	b = append(b, 0x20, 0x0A, 0x20, 0x0B)
+	// (window mode: capture(ptr, len, recBase+8))
+	if winScratchOff >= 0 {
+		b = append(b, 0x20, 0x00, 0x20, 0x01)
+	} else {
+		b = append(b, 0x20, 0x0A, 0x20, 0x0B)
+	}
 	b = append(b, 0x20, 0x0C, 0x41, 0x08, 0x6A)
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
@@ -2718,11 +2753,14 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = append(b, 0x20, 0x0D, 0x41, 0x00, 0x48, 0x0D, 0x01)
 
 	// adj = pos + relStart
-	b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x0E)
+	// (window mode already computed it, and its slots need no adjusting)
+	if winScratchOff < 0 {
+		b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x0E)
+	}
 
 	// Adjust each of numGroups*2 slot ints at recBase+8+g*4 by +adj (skip
 	// unmatched groups, encoded as -1).
-	for g := 0; g < numGroups*2; g++ {
+	for g := 0; winScratchOff < 0 && g < numGroups*2; g++ {
 		off := uint32(8 + g*4)
 		b = append(b, 0x20, 0x0C)
 		b = append(b, 0x28, 0x02)
@@ -2764,8 +2802,8 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 }
 
 // appendBatchGroupsWrapperCodeEntry appends a size-prefixed batch groups wrapper body to cs.
-func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, edgeScratchOff int32) []byte {
-	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, edgeScratchOff)
+func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
+	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winScratchOff)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
