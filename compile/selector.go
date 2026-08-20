@@ -15,6 +15,28 @@ import (
 //
 // Returns the recommended EngineType for the given pattern.
 func selectBestEngine(prog *syntax.Prog, opts *CompileOptions) EngineType {
+	engine, _ := selectBestEngineWithTDFA(prog, opts)
+	return engine
+}
+
+// selectBestEngineWithTDFA is selectBestEngine plus the TDFA table it had to
+// build to answer the question.
+//
+// Deciding whether a capture pattern is TDFA-eligible requires actually
+// constructing the tagged DFA — the state and register limits are properties of
+// the built automaton, not of the pattern text. That table used to be thrown
+// away (`_ = tt`, "table will be built again in compilePattern"), so every TDFA
+// pattern paid for two identical constructions. newTDFA is the expensive step:
+// 88 ms for a 16-state automaton before the Wave 1 strconv fix, ~46 ms after.
+//
+// The second return value is non-nil ONLY when the returned engine is
+// EngineTDFA, i.e. only when the table passed both the state limit and the
+// register limit and is exactly the table compilePattern would have rebuilt
+// from the same prog and the same CompileOptions. Callers that override the
+// engine choice (CompileForced) must therefore still handle a nil table.
+//
+// See plans/OPUS.md §N8b and IMPROVEMENT_PLAN §8.
+func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineType, *tdfaTable) {
 	// Analyse pattern complexity and DFA viability
 	analysis := analysePattern(prog)
 
@@ -106,9 +128,11 @@ func selectBestEngine(prog *syntax.Prog, opts *CompileOptions) EngineType {
 				slog.Debug("Engine selected", "engine", "Backtrack", "reason", "TDFA register limit exceeded", "numRegs", tt.numRegs)
 			}
 			if ok {
-				_ = tt // table will be built again in compilePattern; here we only report engine type
+				// Handed back to compilePattern rather than discarded — this is
+				// the table it would otherwise rebuild verbatim. See this
+				// function's doc comment.
 				slog.Debug("Engine selected", "engine", "TDFA", "reason", "capture pattern within state limit")
-				return EngineTDFA
+				return EngineTDFA, tt
 			}
 			if tt != nil {
 				slog.Debug("Engine selected", "engine", "Backtrack", "reason", "TDFA state limit exceeded")
@@ -116,7 +140,7 @@ func selectBestEngine(prog *syntax.Prog, opts *CompileOptions) EngineType {
 		} else {
 			slog.Debug("Engine selected", "engine", "Backtrack", "reason", "non-greedy or line-anchor captures")
 		}
-		return EngineBacktrack
+		return EngineBacktrack, nil
 	}
 
 	// DFA handles everything else. Patterns with user alternations or nested quantifiers
@@ -127,11 +151,11 @@ func selectBestEngine(prog *syntax.Prog, opts *CompileOptions) EngineType {
 			opts.LeftmostFirst = true
 		}
 		slog.Debug("Engine selected", "engine", "DFA", "reason", "leftmost-first semantics for alternations/nested quantifiers", "complexity", complexity, "states", dfaStates)
-		return maybeCompiledDFA(EngineDFA, dfaStates, opts)
+		return maybeCompiledDFA(EngineDFA, dfaStates, opts), nil
 	}
 
 	slog.Debug("Engine selected", "engine", "DFA", "reason", "simple pattern", "complexity", complexity, "states", dfaStates)
-	return maybeCompiledDFA(EngineDFA, dfaStates, opts)
+	return maybeCompiledDFA(EngineDFA, dfaStates, opts), nil
 }
 
 // maybeCompiledDFA promotes engine from EngineDFA to EngineCompiledDFA when the
@@ -152,6 +176,31 @@ func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptio
 	}
 	return EngineDFA
 }
+
+// maxHelperDFAStates is a hard safety ceiling for newDFA construction,
+// deliberately DECOUPLED from the user-facing CompileOptions.MaxDFAStates
+// threshold. It exists purely to bound worst-case subset-construction cost
+// against pathological patterns (e.g. two independent bounded-repetition
+// inverted classes straddling an ambiguous split point, which makes the
+// number of distinct reachable NFA-state subsets explode with no plateau
+// in sight — confirmed live: 40,000+ states in 12s, no sign of leveling
+// off). It must stay well above any MaxDFAStates value legitimate callers
+// configure (including deliberately tiny values like 1 or 4, used by
+// several existing tests to force the "DFA too large, fall back to BT"
+// path) — those callers still need a REAL, if oversized, dfaTable back:
+// buildBTMatchBody/buildBTFindBody's mandatory-literal-prefix optimisation
+// (computePrefix) reads that table even when it's far too large to serve as
+// the primary matching engine. Using MaxDFAStates itself as this cap would
+// silently break that optimisation (and crash on a nil table) for every
+// such caller. maxHelperDFAStates is only meant to catch constructions that
+// are not just "too large to use as DFA" but "too large to have finished
+// computing in reasonable time at all" — comfortably above every state
+// count produced by any pattern in this package's test suite (the largest,
+// TestCompileLargeStateDFA / a{512}-style patterns, stay in the low
+// hundreds to ~1000 states) — 2048 gives 2x headroom above that while
+// keeping worst-case pathological construction cost to ~370ms (measured),
+// rather than the multi-second-and-climbing cost of a higher ceiling.
+const maxHelperDFAStates = 2048
 
 // resolveMaxDFAStates returns the effective DFA/TDFA state limit from opts.
 // Zero → default (1024). Negative → disabled (0, meaning TDFA is never used).

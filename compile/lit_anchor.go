@@ -309,6 +309,168 @@ func prefixContainsWordBoundary(re *syntax.Regexp) bool {
 	return false
 }
 
+// prefixContainsLineAnchor reports whether re (or any subtree) contains an
+// OpBeginLine (`(?m:^)`) or OpEndLine (`(?m:$)`) node.
+//
+// Gates the lit-anchor optimisation, roughly the way
+// prefixContainsWordBoundary gates `\b`/`\B` (Task 10), but for a different
+// underlying reason: what a line anchor in the prefix endangers is the
+// BACKWARD scan, not the forward continuation.
+// buildLitAnchorBackScanBody's `revTable.hasNewlineBoundary` branch
+// (engine_dfa.go) stops the reverse walk **unconditionally** at the first
+// '\n' it reads. When the prefix can itself consume a '\n' that stop is
+// premature and the real match start is never reached — FUZZER_BUGS.md §22's
+// repro `\D(?m:^)ab` on "\nab", where `\D` legitimately matches the very '\n'
+// the scan halts at.
+//
+// NOT a forward-continuation problem, contrary to what this comment claimed
+// before TODO.md task 51 (2026-08-17). The forward scan runs the WHOLE
+// pattern's DFA, not a freshly-compiled `suffixRe` DFA
+// (`p.litAnchorFindTable`/`p.litAnchorFindLayout` are the whole-pattern
+// table/layout), and it does establish the preceding byte's newline context:
+// buildLitAnchorFindBody's phase 3 loads `ptr[rev_result-1]` and picks
+// wasmStart / wasmMidStartNewline / wasmMidStart accordingly, and its forward
+// loop calls emitNLPreAcceptCheck for a trailing `(?m:$)`. That has been true
+// since lit-anchor's original landing.
+//
+// Consequently this predicate is NOT the whole gate: a true answer only
+// forces a fallback when lineAnchoredPrefixSafe also says no. That helper
+// admits the one shape the §22 defect cannot touch — a prefix led by
+// `^`/`(?m:^)` with nothing after the anchor able to consume a '\n', which
+// makes the stop-at-'\n' exact rather than premature. This function is also
+// reused inside lineAnchoredPrefixSafe to reject any FURTHER line anchor in
+// the remainder past that leading one.
+func prefixContainsLineAnchor(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	switch re.Op {
+	case syntax.OpBeginLine, syntax.OpEndLine:
+		return true
+	}
+	for _, sub := range re.Sub {
+		if prefixContainsLineAnchor(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripLeadingLineAnchor returns the portion of re that follows a leading
+// `^`/`\A`/`(?m:^)` anchor, together with whether re starts with one at all.
+// The returned node is for analysis only (canConsumeNewline /
+// prefixContainsLineAnchor) — the reverse-prefix DFA is still built from the
+// original, unstripped prefixRe.
+func stripLeadingLineAnchor(re *syntax.Regexp) (*syntax.Regexp, bool) {
+	if re == nil {
+		return nil, false
+	}
+	switch re.Op {
+	case syntax.OpBeginLine, syntax.OpBeginText:
+		return &syntax.Regexp{Op: syntax.OpEmptyMatch}, true
+
+	case syntax.OpCapture:
+		if len(re.Sub) == 1 {
+			return stripLeadingLineAnchor(re.Sub[0])
+		}
+
+	case syntax.OpConcat:
+		if len(re.Sub) == 0 {
+			return nil, false
+		}
+		rest, ok := stripLeadingLineAnchor(re.Sub[0])
+		if !ok {
+			return nil, false
+		}
+		sub := make([]*syntax.Regexp, 0, len(re.Sub))
+		sub = append(sub, rest)
+		sub = append(sub, re.Sub[1:]...)
+		return &syntax.Regexp{Op: syntax.OpConcat, Sub: sub, Flags: re.Flags}, true
+	}
+	return nil, false
+}
+
+// canConsumeNewline reports whether re can consume a '\n' input byte.
+// Unknown ops answer true (conservative): callers use this to prove that a
+// stretch of pattern can NEVER cross a line boundary.
+func canConsumeNewline(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	switch re.Op {
+	case syntax.OpNoMatch, syntax.OpEmptyMatch,
+		syntax.OpBeginLine, syntax.OpEndLine,
+		syntax.OpBeginText, syntax.OpEndText,
+		syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+		return false
+
+	case syntax.OpLiteral:
+		for _, r := range re.Rune {
+			if r == '\n' {
+				return true
+			}
+		}
+		return false
+
+	case syntax.OpCharClass:
+		for i := 0; i+1 < len(re.Rune); i += 2 {
+			if re.Rune[i] <= '\n' && '\n' <= re.Rune[i+1] {
+				return true
+			}
+		}
+		return false
+
+	case syntax.OpAnyCharNotNL:
+		return false
+
+	case syntax.OpAnyChar:
+		return true
+
+	case syntax.OpCapture, syntax.OpStar, syntax.OpPlus, syntax.OpQuest,
+		syntax.OpRepeat, syntax.OpConcat, syntax.OpAlternate:
+		for _, sub := range re.Sub {
+			if canConsumeNewline(sub) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// lineAnchoredPrefixSafe reports whether a lit-anchor prefix that DOES contain
+// a line anchor is nevertheless safe for the backward scan, so it need not be
+// rejected outright by FUZZER_BUGS.md §22's gate.
+//
+// The §22 defect is in buildLitAnchorBackScanBody's `revTable.hasNewlineBoundary`
+// branch, which stops the backward scan unconditionally at the first '\n' it
+// meets. That is only sound when no match's prefix portion can contain a '\n'
+// — otherwise the scan halts before reaching the real match start (§22's repro
+// `\D(?m:^)ab` on "\nab": `\D` legitimately consumes the '\n' the scan stops
+// at). It is exactly sound when:
+//
+//   - the prefix starts with `^`/`\A`/`(?m:^)`, so the match start is either
+//     position 0 or the byte after a '\n' — the two positions the backward scan
+//     terminates at and checks (accept[state] at pos<0, midAcceptNL[state] at
+//     the '\n'), and
+//   - nothing after that leading anchor can consume a '\n', so the '\n' the
+//     scan stops at is provably the one the leading anchor refers to, and no
+//     earlier (more leftmost) match start exists past it, and
+//   - no further line anchor appears in the prefix, whose backward evaluation
+//     would then depend on context the scan does not track.
+//
+// The forward continuation is already newline-aware independently of this:
+// buildLitAnchorFindBody phase 3 selects wasmMidStartNewline from the byte
+// preceding the recovered match start, and its forward loop calls
+// emitNLPreAcceptCheck for any trailing `(?m:$)`.
+func lineAnchoredPrefixSafe(re *syntax.Regexp) bool {
+	rest, ok := stripLeadingLineAnchor(re)
+	if !ok {
+		return false
+	}
+	return !prefixContainsLineAnchor(rest) && !canConsumeNewline(rest)
+}
+
 // altLitAnchorBranch pairs one alternation branch's litAnchorPoint with the
 // branch's own (capture-stripped) regexp node. compile.go uses branchRe to
 // re-enter the standard compile() pipeline and build the branch's own

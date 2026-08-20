@@ -29,8 +29,8 @@ func TestLikelyModeString(t *testing.T) {
 //   - Strict-alt prefixed find (no match) → appendLitChainAltPrefixedFindCodeEntry.
 //   - Lenient-alt match (no find) → appendLenAltMatchCodeEntry.
 //   - Lenient-alt find  (no match) → buildLitChainAltLenientFindBody.
-//   - Strict-alt with groups (no match/find) → appendLitChainAltGroupsCodeEntry / find-groups composite.
-//   - Lit-chain anchored groups → appendLitChainGroupsCodeEntry.
+//   - Strict-alt with groups (no match/find) → appendLitChainAltFindGroupsCodeEntry.
+//   - Lit-chain anchored groups → appendLitChainFindGroupsCodeEntry.
 //   - Lit-chain range groups → appendLitChainRangeFindGroupsCodeEntry.
 //   - Word-boundary anchors → isWordByte / emitIsWordByte / emitStartAnchorCheck / emitEndAnchorCheck.
 func TestCompileLikelyMatch(t *testing.T) {
@@ -444,6 +444,14 @@ func TestCompileLikelyMatch(t *testing.T) {
 			}},
 		},
 		// ---------- Lenient alt: find only ----------
+		// NOTE: despite the name, this pattern does NOT trip the lenient-alt
+		// (Phase 2a) find body in compilePattern. Its second branch's \s* is
+		// unbounded with no nested OpAlternate/OpQuest, so
+		// shouldTryLitChainAlt short-circuits to false before
+		// analyseLitChainAltLenient is ever tried (confirmed live) — this
+		// case only exercises the general LikelyMatch compile sweep for this
+		// pattern shape. See TestCompileLenientAltFindBody (TEST.md T33) for
+		// a pattern that actually reaches that code.
 		{
 			"lenient_alt_find_only",
 			[]config.RegexEntry{{
@@ -611,71 +619,11 @@ func TestCompileLikelyMatch(t *testing.T) {
 	}
 }
 
-// TestLitChainGroupsBodyHelpers directly invokes the lit-chain groups body
-// builders that are currently unreferenced from the production dispatcher but
-// still part of the package API. Each call exercises the body emission +
-// slot-write helpers; we only need to confirm a non-empty WASM body is
-// produced.
-func TestLitChainGroupsBodyHelpers(t *testing.T) {
-	patterns := []string{
-		`(AKIA[A-Z0-9]{24})`,                   // no anchors
-		`(\bAKIA[A-Z0-9]{24}\b)`,               // word-boundary start + end
-		`(\BAKIA[A-Z0-9]{24}\B)`,               // no-word-boundary start + end
-		`(\AAKIA[A-Z0-9]{24}\z)`,               // text anchors
-		`(AKIA[A-Z0-9]{24}\b)`,                 // end word boundary only
-		`(\bAKIA[A-Z0-9]{24})`,                 // start word boundary only
-		`(AKIA[A-Z0-9]{24}\z)`,                 // end text anchor only
-	}
-	for _, p := range patterns {
-		p := p
-		t.Run("single_"+p, func(t *testing.T) {
-			lcp, lcc, ok := analyseLitChainGroups(p)
-			if !ok {
-				t.Skipf("analyseLitChainGroups: pattern %q not recognised", p)
-				return
-			}
-			body := buildLitChainGroupsBody(lcp, lcc)
-			if len(body) == 0 {
-				t.Fatalf("buildLitChainGroupsBody: empty body for %q", p)
-			}
-			entry := appendLitChainGroupsCodeEntry(nil, lcp, lcc)
-			if len(entry) == 0 {
-				t.Fatalf("appendLitChainGroupsCodeEntry: empty entry for %q", p)
-			}
-		})
-	}
-
-	altPatterns := []string{
-		`(AKIA[A-Z0-9]{24})|(ghp_[A-Za-z0-9]{36})`,
-		`(\bAKIA[A-Z0-9]{24}\b)|(\bghp_[A-Za-z0-9]{36}\b)`,
-		`(\AAKIA[A-Z0-9]{24}\z)|(\Aghp_[A-Za-z0-9]{36}\z)`,
-		`(\BAKIA[A-Z0-9]{24}\B)|(\Bghp_[A-Za-z0-9]{36}\B)`,
-	}
-	for _, p := range altPatterns {
-		p := p
-		t.Run("alt_"+p, func(t *testing.T) {
-			altp, branchCaps, ok := analyseLitChainAltGroups(p)
-			if !ok {
-				t.Skipf("analyseLitChainAltGroups: pattern %q not recognised", p)
-				return
-			}
-			body := buildLitChainAltGroupsBody(altp, branchCaps)
-			if len(body) == 0 {
-				t.Fatalf("buildLitChainAltGroupsBody: empty body for %q", p)
-			}
-			entry := appendLitChainAltGroupsCodeEntry(nil, altp, branchCaps)
-			if len(entry) == 0 {
-				t.Fatalf("appendLitChainAltGroupsCodeEntry: empty entry for %q", p)
-			}
-		})
-	}
-}
-
 // TestCompileLargeStateDFA exercises patterns that produce > 256 DFA states
-// to force the table-driven (non-compiled) DFA path with emitImmAcceptCheckMatch.
+// to force the table-driven (non-compiled) DFA path in buildMatchBody.
 func TestCompileLargeStateDFA(t *testing.T) {
 	// Disable the CompiledDFA optimisation so the DFA goes through the pure
-	// table-driven path (which calls emitImmAcceptCheckMatch).
+	// table-driven path.
 	opts := CompileOptions{CompiledDFAThreshold: -1}
 
 	cases := []struct {
@@ -1031,7 +979,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChain(`[`, 24); ok {
 			t.Errorf("analyseLitChain accepted invalid syntax")
 		}
-		if _, ok := analyseLitChainRange(`[`, true, 24); ok {
+		if _, ok := analyseLitChainRange(`[`, 24); ok {
 			t.Errorf("analyseLitChainRange accepted invalid syntax")
 		}
 		if _, _, ok := analyseLitChainGroupsRange(`[`); ok {
@@ -1046,13 +994,13 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChainAlt(`[`); ok {
 			t.Errorf("analyseLitChainAlt accepted invalid syntax")
 		}
-		if _, ok := analyseLitChainAltRange(`[`, true); ok {
+		if _, ok := analyseLitChainAltRange(`[`); ok {
 			t.Errorf("analyseLitChainAltRange accepted invalid syntax")
 		}
 		if _, ok := analyseLitChainAltPrefixed(`[`); ok {
 			t.Errorf("analyseLitChainAltPrefixed accepted invalid syntax")
 		}
-		if _, ok := analyseLitChainAltLenient(`[`); ok {
+		if _, ok := analyseLitChainAltLenient(`[`, true); ok {
 			t.Errorf("analyseLitChainAltLenient accepted invalid syntax")
 		}
 	})
@@ -1063,7 +1011,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChain(`AKIA[A-Z0-9]{4}`, 24); ok {
 			t.Errorf("analyseLitChain accepted N=4")
 		}
-		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{4,8}`, true, 24); ok {
+		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{4,8}`, 24); ok {
 			t.Errorf("analyseLitChainRange accepted N=4")
 		}
 		if _, _, ok := analyseLitChainGroups(`(AKIA[A-Z0-9]{4})`); ok {
@@ -1081,14 +1029,14 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChain(`AKIA[A-Z0-9]{12}`, 1); !ok {
 			t.Errorf("analyseLitChain rejected N=12 under minCount=1")
 		}
-		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{12,20}`, true, 1); !ok {
+		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{12,20}`, 1); !ok {
 			t.Errorf("analyseLitChainRange rejected N=12 under minCount=1")
 		}
 	})
 
 	t.Run("not_a_range", func(t *testing.T) {
 		// analyseLitChainRange wants countMax > count.
-		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{24}`, true, 24); ok {
+		if _, ok := analyseLitChainRange(`AKIA[A-Z0-9]{24}`, 24); ok {
 			t.Errorf("analyseLitChainRange accepted exact count")
 		}
 		if _, _, ok := analyseLitChainGroupsRange(`(AKIA[A-Z0-9]{24})`); ok {
@@ -1101,13 +1049,13 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		if _, ok := analyseLitChainAlt(`AKIA[A-Z0-9]{16}`); ok {
 			t.Errorf("analyseLitChainAlt accepted single branch")
 		}
-		if _, ok := analyseLitChainAltRange(`AKIA[A-Z0-9]{16,24}`, true); ok {
+		if _, ok := analyseLitChainAltRange(`AKIA[A-Z0-9]{16,24}`); ok {
 			t.Errorf("analyseLitChainAltRange accepted single branch")
 		}
 		if _, ok := analyseLitChainAltPrefixed(`[0-9]{8}ghp_[A-Za-z0-9]{36}`); ok {
 			t.Errorf("analyseLitChainAltPrefixed accepted single branch")
 		}
-		if _, ok := analyseLitChainAltLenient(`ghp_[A-Za-z0-9]{36}`); ok {
+		if _, ok := analyseLitChainAltLenient(`ghp_[A-Za-z0-9]{36}`, true); ok {
 			t.Errorf("analyseLitChainAltLenient accepted single branch")
 		}
 	})
@@ -1115,7 +1063,7 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 	t.Run("alt_range_no_range_branch", func(t *testing.T) {
 		// All branches are exact — analyseLitChainAltRange should reject (only
 		// alts with at least one range branch qualify).
-		if _, ok := analyseLitChainAltRange(`AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}`, true); ok {
+		if _, ok := analyseLitChainAltRange(`AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}`); ok {
 			t.Errorf("analyseLitChainAltRange accepted pure-exact alt")
 		}
 	})
@@ -1365,75 +1313,160 @@ func TestCompileLikelyNoMatch(t *testing.T) {
 // requested, and must NOT appear for anchored (native lit-chain) groups
 // bodies — that shape is out of v1 scope (see the compiledPattern field doc
 // next to batchGroupsExport).
-func TestLM2BatchExportGating(t *testing.T) {
-	t.Skip("LM-2 batch export trigger disabled 2026-08-02, parked pending plans/TODO.md task 44 — remove this Skip when the trigger in compile.go's compileAll is restored")
+// TestBatchExportGating covers the "batch-find" hint (plans/TODO.md task 44)
+// as the sole trigger for the _batch export — independent of LikelyMode, and
+// covering both the composed (!anchored) and native lit-chain ("Path B",
+// anchored) groups shapes, plus named_groups_func-only naming.
+func TestBatchExportGating(t *testing.T) {
 	findEntries := []config.RegexEntry{{
 		Pattern:  `x*`,
 		FindFunc: "find_x",
+		Hints:    []string{"batch-find"},
 	}}
 	// (a)(b)? has no lit-chain shape, so it compiles via the standard
-	// find+capture composition (TDFA/BT) — the non-anchored case batch
-	// groups targets.
+	// find+capture composition (TDFA/BT) — Path A.
 	groupsEntries := []config.RegexEntry{{
 		Pattern:    `(a)(b)?`,
 		GroupsFunc: "groups_ab",
+		Hints:      []string{"batch-find"},
 	}}
 	// (AKIA[A-Z0-9]{24}) is a lit-chain groups shape (Gap C, count>=24 so
 	// analyseLitChainGroups accepts it — capture-path analysers are not
 	// LM-1-relaxed, unlike the plain match/find analysers) — anchored:
-	// captureBody IS the exported groups function directly, no separate
-	// find+capture composition to batch over.
+	// captureBody IS the exported groups function directly ("Path B"), so
+	// batching goes through buildBatchLitChainGroupsWrapperBody, not
+	// buildBatchGroupsWrapperBody.
 	anchoredGroupsEntries := []config.RegexEntry{{
 		Pattern:    `(AKIA[A-Z0-9]{24})`,
 		GroupsFunc: "akia_groups",
+		Hints:      []string{"batch-find"},
+	}}
+	// named_groups_func ONLY (no groups_func) — the batch export name must
+	// fall back to namedGroupsExport (GroupsExportName priority), since
+	// p.groupsExport is empty here.
+	namedOnlyEntries := []config.RegexEntry{{
+		Pattern:         `(a)(b)?`,
+		NamedGroupsFunc: "named_ab",
+		Hints:           []string{"batch-find"},
 	}}
 
-	t.Run("find_batch_present_under_LikelyMatch", func(t *testing.T) {
-		wasm, _, err := Compile(findEntries, 0, true, CompileOptions{LikelyMode: LikelyMatch})
-		if err != nil {
-			t.Fatalf("Compile: %v", err)
-		}
-		if !bytes.Contains(wasm, []byte("find_x_batch")) {
-			t.Error("expected find_x_batch export under LikelyMatch, not found")
-		}
-	})
-	t.Run("find_batch_absent_under_neutral", func(t *testing.T) {
+	t.Run("find_batch_present_with_hint", func(t *testing.T) {
 		wasm, _, err := Compile(findEntries, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
-		if bytes.Contains(wasm, []byte("find_x_batch")) {
-			t.Error("find_x_batch export present under neutral LikelyMode, should be absent")
+		if !bytes.Contains(wasm, []byte("find_x_batch")) {
+			t.Error("expected find_x_batch export with batch-find hint, not found")
 		}
 	})
-	t.Run("groups_batch_present_under_LikelyMatch", func(t *testing.T) {
-		wasm, _, err := Compile(groupsEntries, 0, true, CompileOptions{LikelyMode: LikelyMatch})
+	t.Run("find_batch_absent_without_hint", func(t *testing.T) {
+		unhinted := []config.RegexEntry{{Pattern: `x*`, FindFunc: "find_x"}}
+		wasm, _, err := Compile(unhinted, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
-		if !bytes.Contains(wasm, []byte("groups_ab_batch")) {
-			t.Error("expected groups_ab_batch export under LikelyMatch, not found")
+		if bytes.Contains(wasm, []byte("find_x_batch")) {
+			t.Error("find_x_batch export present without batch-find hint, should be absent")
 		}
 	})
-	t.Run("groups_batch_absent_under_neutral", func(t *testing.T) {
+	t.Run("find_batch_absent_under_LikelyMatch_alone", func(t *testing.T) {
+		// LikelyMode is no longer the trigger — batch-find is.
+		unhinted := []config.RegexEntry{{Pattern: `x*`, FindFunc: "find_x"}}
+		wasm, _, err := Compile(unhinted, 0, true, CompileOptions{LikelyMode: LikelyMatch})
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if bytes.Contains(wasm, []byte("find_x_batch")) {
+			t.Error("find_x_batch export present under LikelyMatch without batch-find hint — LikelyMode must not trigger batching")
+		}
+	})
+	t.Run("groups_batch_present_with_hint_PathA", func(t *testing.T) {
 		wasm, _, err := Compile(groupsEntries, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
-		if bytes.Contains(wasm, []byte("groups_ab_batch")) {
-			t.Error("groups_ab_batch export present under neutral LikelyMode, should be absent")
+		if !bytes.Contains(wasm, []byte("groups_ab_batch")) {
+			t.Error("expected groups_ab_batch export with batch-find hint, not found")
 		}
 	})
-	t.Run("anchored_groups_batch_absent_even_under_LikelyMatch", func(t *testing.T) {
-		wasm, _, err := Compile(anchoredGroupsEntries, 0, true, CompileOptions{LikelyMode: LikelyMatch})
+	t.Run("groups_batch_absent_without_hint", func(t *testing.T) {
+		unhinted := []config.RegexEntry{{Pattern: `(a)(b)?`, GroupsFunc: "groups_ab"}}
+		wasm, _, err := Compile(unhinted, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if bytes.Contains(wasm, []byte("groups_ab_batch")) {
+			t.Error("groups_ab_batch export present without batch-find hint, should be absent")
+		}
+	})
+	t.Run("anchored_groups_batch_present_with_hint_PathB", func(t *testing.T) {
+		wasm, _, err := Compile(anchoredGroupsEntries, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Contains(wasm, []byte("akia_groups_batch")) {
+			t.Error("expected akia_groups_batch export for anchored (Path B) lit-chain groups body — task 44 goal 4")
+		}
+		if !bytes.Contains(wasm, []byte("akia_groups")) {
+			t.Error("expected akia_groups (non-batch) export to still be present")
+		}
+	})
+	t.Run("anchored_groups_batch_absent_without_hint", func(t *testing.T) {
+		unhinted := []config.RegexEntry{{Pattern: `(AKIA[A-Z0-9]{24})`, GroupsFunc: "akia_groups"}}
+		wasm, _, err := Compile(unhinted, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
 		if bytes.Contains(wasm, []byte("akia_groups_batch")) {
-			t.Error("akia_groups_batch export present for anchored lit-chain groups body — out of v1 scope")
+			t.Error("akia_groups_batch export present without batch-find hint, should be absent")
 		}
-		if !bytes.Contains(wasm, []byte("akia_groups")) {
-			t.Error("expected akia_groups (non-batch) export to still be present")
+	})
+	t.Run("named_only_batch_export_named_after_namedGroupsFunc", func(t *testing.T) {
+		wasm, _, err := Compile(namedOnlyEntries, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Contains(wasm, []byte("named_ab_batch")) {
+			t.Error("expected named_ab_batch export (GroupsExportName falls back to NamedGroupsFunc), not found")
+		}
+	})
+	t.Run("groups_and_named_share_one_batch_export", func(t *testing.T) {
+		both := []config.RegexEntry{{
+			Pattern:         `(a)(b)?`,
+			GroupsFunc:      "g1",
+			NamedGroupsFunc: "g2",
+			Hints:           []string{"batch-find"},
+		}}
+		wasm, _, err := Compile(both, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Contains(wasm, []byte("g1_batch")) {
+			t.Error("expected g1_batch export (GroupsFunc takes priority), not found")
+		}
+		if bytes.Contains(wasm, []byte("g2_batch")) {
+			t.Error("g2_batch export present — named_groups_func should share GroupsFunc's batch export, not get its own")
+		}
+	})
+	t.Run("neutral_wasm_size_unaffected_by_hint_plumbing", func(t *testing.T) {
+		// Regression guard for the LM-2 "anyBatch" bug this task's doc calls
+		// out explicitly: a pattern that never requests batch-find must
+		// produce byte-identical output regardless of how "no batch-find" is
+		// spelled (nil Hints vs an empty-but-non-nil slice).
+		base := config.RegexEntry{Pattern: `(a)(b)?`, GroupsFunc: "g"}
+		emptyHints := base
+		emptyHints.Hints = []string{}
+
+		w1, _, err := Compile([]config.RegexEntry{base}, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		w2, _, err := Compile([]config.RegexEntry{emptyHints}, 0, true)
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		if !bytes.Equal(w1, w2) {
+			t.Error("expected byte-identical WASM for nil vs empty Hints, neither requests batch-find")
 		}
 	})
 }

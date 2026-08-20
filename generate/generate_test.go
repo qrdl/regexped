@@ -519,6 +519,85 @@ func TestGenTSStubFileWithNamedPattern(t *testing.T) {
 	}
 }
 
+// TestGenJSGroupsFuncHasBatchPath and its TS/named-groups siblings verify the
+// batch-detect-and-drain block (task 44) is emitted by every groups/find
+// generator, JS and TS, including named_groups_func — this is a structural
+// (source-text) check; the actual batch-vs-non-batch behavioural
+// equivalence was verified via a scratch wasmtime/Node differential harness
+// (not committed — see plans/TODO.md task 44's verification discipline).
+func TestGenJSFindFuncHasBatchPath(t *testing.T) {
+	out := genJSFindFunc("f")
+	for _, sub := range []string{`_exp['f_batch']`, `f_batch'](_inBase`} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genJSFindFunc: missing %q", sub)
+		}
+	}
+}
+
+func TestGenTSFindFuncHasBatchPath(t *testing.T) {
+	out := genTSFindFunc("f")
+	for _, sub := range []string{`_exp['f_batch']`, `f_batch'] as CallableFunction)(_inBase`} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genTSFindFunc: missing %q", sub)
+		}
+	}
+}
+
+func TestGenJSGroupsFuncHasBatchPath(t *testing.T) {
+	out := genJSGroupsFunc("g", 2)
+	for _, sub := range []string{`_exp['g_batch']`, `g_batch'](_inBase`} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genJSGroupsFunc: missing %q", sub)
+		}
+	}
+}
+
+func TestGenTSGroupsFuncHasBatchPath(t *testing.T) {
+	out := genTSGroupsFunc("g", 2)
+	for _, sub := range []string{`_exp['g_batch']`, `g_batch'] as CallableFunction)(_inBase`} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genTSGroupsFunc: missing %q", sub)
+		}
+	}
+}
+
+// TestGenJSNamedGroupsFuncBatchUsesExportName verifies the named-groups
+// generator's batch feature-detect is keyed on exportName (the WASM export
+// this pattern's groups_func/named_groups_func share), not funcName — so a
+// named_groups_func-only pattern (funcName != exportName) still finds its
+// batch export, which is named after exportName.
+func TestGenJSNamedGroupsFuncBatchUsesExportName(t *testing.T) {
+	out := genJSNamedGroupsFunc("named_ab", "plain_ab", 2, map[string]int{"g1": 1})
+	for _, sub := range []string{
+		`_exp['plain_ab_batch']`,
+		`plain_ab_batch'](_inBase`,
+		`result['g1']`,
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genJSNamedGroupsFunc: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, `named_ab_batch`) {
+		t.Error("genJSNamedGroupsFunc: batch export must be named after exportName, not funcName")
+	}
+}
+
+func TestGenTSNamedGroupsFuncBatchUsesExportName(t *testing.T) {
+	out := genTSNamedGroupsFunc("named_ab", "plain_ab", 2, map[string]int{"g1": 1})
+	for _, sub := range []string{
+		`_exp['plain_ab_batch']`,
+		`plain_ab_batch'] as CallableFunction)(_inBase`,
+		`result['g1']`,
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("genTSNamedGroupsFunc: missing %q", sub)
+		}
+	}
+	if strings.Contains(out, `named_ab_batch`) {
+		t.Error("genTSNamedGroupsFunc: batch export must be named after exportName, not funcName")
+	}
+}
+
 func TestResolveStubType(t *testing.T) {
 	cases := []struct {
 		cfg     config.BuildConfig
@@ -981,5 +1060,27 @@ func TestWriteStub_MkdirError(t *testing.T) {
 	}
 	if err := writeStub(blocker+"/inner/file.txt", []byte("data")); err == nil {
 		t.Fatal("writeStub: expected mkdir error, got nil")
+	}
+}
+
+// TestConfigPascalCaseMatchesGenerators guards the one duplicated transform in
+// the per-stub-type validation added for plans/FABLE.md B34. config cannot
+// import generate, so config.pascalCase is a hand copy of goPublicName (and of
+// iterTypeName minus its "Iter" suffix). If either generator's transform
+// changes, the collision check silently stops matching what is emitted — this
+// test fails instead.
+func TestConfigPascalCaseMatchesGenerators(t *testing.T) {
+	names := []string{
+		"url_match", "urlMatch", "UrlMatch", "set_match", "a_b_c",
+		"_leading", "x9", "find", "named_groups_func", "aB_cD",
+	}
+	for _, n := range names {
+		want := goPublicName(n)
+		if got := config.PascalCaseForValidation(n); got != want {
+			t.Errorf("config.PascalCaseForValidation(%q) = %q, but goPublicName = %q", n, got, want)
+		}
+		if got, wantIter := config.PascalCaseForValidation(n)+"Iter", iterTypeName(n); got != wantIter {
+			t.Errorf("config.PascalCaseForValidation(%q)+\"Iter\" = %q, but iterTypeName = %q", n, got, wantIter)
+		}
 	}
 }

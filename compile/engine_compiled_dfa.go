@@ -67,7 +67,7 @@ func buildStateDispatch(t *dfaTable, l *dfaLayout) []stateDispatchInfo {
 //   - the next state has not been visited already (no cycles)
 //
 // The chain ends as soon as any condition fails. Returns nil if no chain exists.
-func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, hasImmAccept bool, startWS uint32) []struct {
+func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, startWS uint32) []struct {
 	rawByte byte
 	nextWS  uint32
 } {
@@ -86,11 +86,10 @@ func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, hasImmAcc
 	for !visited[ws] { // until cycle detected
 		visited[ws] = true
 		gs := int(ws) - 1 // WASM state to DFA state
-		// Stop if accept or immediateAccept — we can't skip the accept check.
+		// Stop if accept — we can't skip the accept check. There is no
+		// immediateAccept case to stop on: match mode is compiled LL, so
+		// l.hasImmAccept is always false here (see buildMatchBody).
 		if t.acceptStates[gs] != 0 {
-			break
-		}
-		if hasImmAccept && t.immediateAcceptStates[gs] != 0 {
 			break
 		}
 		d := disp[gs]
@@ -136,12 +135,12 @@ func literalChain(t *dfaTable, l *dfaLayout, disp []stateDispatchInfo, hasImmAcc
 //
 // This eliminates both the br_table overhead of the pure compiled path and the
 // forced-multiply overhead of the compressed-only previous hybrid implementation.
-func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMemIdx int) []byte {
+func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	var b []byte
 
 	// Class info must have been pre-computed in buildDFALayout for literalChain.
 	disp := buildStateDispatch(t, l)
-	chain := literalChain(t, l, disp, hasImmAccept, l.wasmStart)
+	chain := literalChain(t, l, disp, l.wasmStart)
 
 	const localState = uint32(2)
 	const localPos = uint32(3)
@@ -274,26 +273,9 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
 
-	// Immediate-accept check (Option D state-compare):
-	//   if state u<= immAcceptLimit: return pos
-	// Relies on reorderAcceptFirst placing immediate-accepting WASM IDs in
-	// 1..immAcceptLimit. The dead state (0) is excluded by the preceding
-	// `state == 0` early return.
-	if hasImmAccept {
-		b = append(b, 0x20, byte(localState))
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immAcceptLimit)
-		b = append(b, 0x4D) // i32.le_u
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, byte(localPos))
-		b = append(b, 0x0F)
-		b = append(b, 0x0B)
-	}
-
 	// Phase 4 dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
 	// or extra i32 added by the locals declaration above), hyst=6/7.
-	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx,
-		byte(localState), byte(localPos), 0x01, 0x00, 0x05, byte(localClass), 0x06, 0x07)
+	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx)
 
 	// pos++
 	b = append(b, 0x20, byte(localPos))
@@ -329,13 +311,26 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, hasImmAccept bool, tableMem
 // Row deduplication is guaranteed to be disabled for the hybrid path (enforced in
 // buildDFALayout), so rowMapOff/useRowDedup are always the zero values.
 func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
-	return buildAnchoredFindBody(
-		l.wasmStart, l.tableOff, l.midAcceptOff,
-		l.classMapOff, l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
-		l.startBeginAccept, l.immAcceptLimit, l.hasImmAccept,
-		l.wordCharTableOff, l.needWordCharTable, l.midAcceptNWOff, l.midAcceptWOff,
-		l.rowMapOff, l.useRowDedup, l.midAcceptNLOff, t.hasNewlineBoundary, tableMemIdx,
-	)
+	return buildAnchoredFindBody(anchoredFindBodyParams{
+		startState:         l.wasmStart,
+		tableOff:           l.tableOff,
+		midAcceptOff:       l.midAcceptOff,
+		classMapOff:        l.classMapOff,
+		numClasses:         l.numClasses,
+		useU8:              l.useU8,
+		useCompression:     l.useCompression,
+		acceptLimit:        l.acceptLimit,
+		startBeginAccept:   l.startBeginAccept,
+		immAcceptLimit:     l.immAcceptLimit,
+		hasImmAccept:       l.hasImmAccept,
+		wordCharTableOff:   l.wordCharTableOff,
+		hasWordBoundary:    l.needWordCharTable,
+		midAcceptNWOff:     l.midAcceptNWOff,
+		midAcceptWOff:      l.midAcceptWOff,
+		midAcceptNLOff:     l.midAcceptNLOff,
+		hasNewlineBoundary: t.hasNewlineBoundary,
+		tableMemIdx:        tableMemIdx,
+	})
 }
 
 // buildHybridFindBody returns the WASM function body for the hybrid find path when the
@@ -346,23 +341,53 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 // dispatch, so no restructuring is required for the find hot path.
 // Row deduplication is guaranteed disabled for the hybrid path.
 func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
-	return buildFindBody(
-		l.wasmStart, l.wasmMidStart, l.wasmMidStartWord,
-		l.wasmMidStartNewline, l.wasmPrefixEnd, l.wasmPrefixEndWord,
-		l.tableOff, l.midAcceptOff,
-		l.firstByteOff, l.prefix, l.classMapOff, l.numClasses,
-		l.useU8, l.useCompression, l.acceptLimit, l.startBeginAccept,
-		l.immAcceptLimit, l.hasImmAccept,
-		l.wordCharTableOff, l.needWordCharTable,
-		l.midAcceptNWOff, l.midAcceptWOff, t.hasNewlineBoundary,
-		l.firstByteFlags, l.firstBytes,
-		l.teddyLoOff, l.teddyHiOff,
-		l.teddyT1LoOff, l.teddyT1HiOff, len(l.teddyT1LoBytes) > 0,
-		l.teddyT2LoOff, l.teddyT2HiOff, len(l.teddyT2LoBytes) > 0,
-		l.teddyT3LoOff, l.teddyT3HiOff, len(l.teddyT3LoBytes) > 0,
-		mandatoryLit, l.rowMapOff, l.useRowDedup, l.midAcceptNLOff,
-		tableMemIdx,
-		l.dominantStates, l.lnmAction5, l.skipSafeOnDead,
-		l.eofSkipSafe,
-	)
+	return buildFindBody(findBodyParams{
+		startState:            l.wasmStart,
+		midStartState:         l.wasmMidStart,
+		midStartWordState:     l.wasmMidStartWord,
+		midStartNewlineState:  l.wasmMidStartNewline,
+		prefixEndState:        l.wasmPrefixEnd,
+		prefixEndStateWord:    l.wasmPrefixEndWord,
+		prefixEndStateStart:   l.wasmPrefixEndStart,
+		prefixEndStateNewline: l.wasmPrefixEndNewline,
+		tableOff:              l.tableOff,
+		midAcceptOff:          l.midAcceptOff,
+		firstByteOff:          l.firstByteOff,
+		prefix:                l.prefix,
+		classMapOff:           l.classMapOff,
+		numClasses:            l.numClasses,
+		useU8:                 l.useU8,
+		useCompression:        l.useCompression,
+		acceptLimit:           l.acceptLimit,
+		startBeginAccept:      l.startBeginAccept,
+		immAcceptLimit:        l.immAcceptLimit,
+		hasImmAccept:          l.hasImmAccept,
+		wordCharTableOff:      l.wordCharTableOff,
+		hasWordBoundary:       l.needWordCharTable,
+		midAcceptNWOff:        l.midAcceptNWOff,
+		midAcceptWOff:         l.midAcceptWOff,
+		hasNewlineBoundary:    t.hasNewlineBoundary,
+		firstByteFlags:        l.firstByteFlags,
+		firstBytes:            l.firstBytes,
+		teddyLoOff:            l.teddyLoOff,
+		teddyHiOff:            l.teddyHiOff,
+		teddyT1LoOff:          l.teddyT1LoOff,
+		teddyT1HiOff:          l.teddyT1HiOff,
+		teddyTwoByte:          len(l.teddyT1LoBytes) > 0,
+		teddyT2LoOff:          l.teddyT2LoOff,
+		teddyT2HiOff:          l.teddyT2HiOff,
+		teddyThreeByte:        len(l.teddyT2LoBytes) > 0,
+		teddyT3LoOff:          l.teddyT3LoOff,
+		teddyT3HiOff:          l.teddyT3HiOff,
+		teddyFourByte:         len(l.teddyT3LoBytes) > 0,
+		mandatoryLit:          mandatoryLit,
+		rowMapOff:             l.rowMapOff,
+		useRowDedup:           l.useRowDedup,
+		midAcceptNLOff:        l.midAcceptNLOff,
+		tableMemIdx:           tableMemIdx,
+		dominantStates:        l.dominantStates,
+		lnmAction5:            l.lnmAction5,
+		skipSafeOnDead:        l.skipSafeOnDead,
+		eofSkipSafe:           l.eofSkipSafe,
+	})
 }

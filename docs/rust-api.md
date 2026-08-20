@@ -139,3 +139,14 @@ All positions are byte offsets (not character indices). Input is `&[u8]`.
 - Stub functions are safe Rust wrappers; the `unsafe` FFI call is hidden inside the stub.
 - The WASM module must be loaded before calling any stub function. In `wasip1` targets, all imports are resolved at link time by the runtime.
 - Internally, FFI declarations use an `ffi_<func>` name with `#[link_name = "<func>"]` to avoid colliding with the public wrapper of the same name — you never see or need to reference `ffi_<func>` yourself.
+- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for Rust: it's effective for the JS and TS generators only. Setting it does not change the generated Rust stub or its performance.
+
+---
+
+## Backtracking stack overflow
+
+Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
+
+The generated wrapper **panics** with a message naming the function. Rust's `Option<usize>` and the iterator protocol have no third state to report this in, so a panic is the only way to keep it distinguishable from `None` / end-of-iteration without changing every signature to `Result`.
+
+This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

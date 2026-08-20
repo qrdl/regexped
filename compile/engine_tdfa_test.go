@@ -431,3 +431,73 @@ func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
 		})
 	}
 }
+
+// TestTDFAAllZeroTagOpsSkip exercises the "if !anyHasOps { return b }" early
+// skip in emitTDFATagOps, reached when the whole TDFA transition table has
+// zero register-set/copy ops — TEST.md T28. ()a has one zero-width capture
+// group, resolved entirely via entry ops before the first byte-consuming
+// transition (anyHasOps=false).
+func TestTDFAAllZeroTagOpsSkip(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "()a", GroupsFunc: "g"}})
+}
+
+// TestTDFAMinimizeRegistersApplyColoring exercises the block in
+// minimizeTDFARegisters that rewrites tagOps/acceptOps/acceptRegMap after
+// graph coloring finds a real register-count reduction (guarded by
+// newNumRegs < numRegs) — TEST.md T29. Two alternated, order-swapped
+// capture groups inside a `+` loop give the construction-time canonical
+// register numbering more registers than liveness analysis actually needs.
+// Confirmed live: numRegs is minimised to 19 (well below the raw tag count),
+// and TestMinimizeTDFARegisters-style patterns never hit this because their
+// canonical numbering is already minimal.
+func TestTDFAMinimizeRegistersApplyColoring(t *testing.T) {
+	const pattern = `(?:(a+)(b+)|(b+)(a+))+`
+	numStates, numRegs, _, ok := tdfaStats(pattern)
+	if !ok {
+		t.Fatalf("tdfaStats(%q): pattern ineligible for TDFA", pattern)
+	}
+	t.Logf("numStates=%d numRegs=%d", numStates, numRegs)
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+}
+
+// TestTDFAU16TableAddressing exercises the useU8=false (2-byte state ID)
+// branch of buildTDFAMatchBody/emitTDFATagOps — TEST.md T30. Bounded
+// repetition unrolls into many states without necessarily blowing up
+// register count: confirmed live via newTDFA, this pattern has 511 states
+// (> 256, forcing u16) and 24 registers (within the default 32-register
+// limit) — only u8 TDFA tables were previously exercised.
+func TestTDFAU16TableAddressing(t *testing.T) {
+	const pattern = `(\w{1,10}-){1,20}(\d{1,10}){1,10}`
+	numStates, _, _, ok := tdfaStats(pattern)
+	if !ok {
+		t.Fatalf("tdfaStats(%q): pattern ineligible for TDFA", pattern)
+	}
+	if numStates <= 256 {
+		t.Fatalf("tdfaStats(%q): numStates = %d, want > 256 (u16 table)", pattern, numStates)
+	}
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+}
+
+// TestTDFAEpsWalkAltFallthrough exercises the "try inst.Arg after inst.Out
+// fails" fallback in tdfaEpsCapOps/tdfaEpsCapOpsTo's InstAlt handling —
+// TEST.md T31. (?:(a)|(b)): the nested alternation's Out branch doesn't
+// reach the target/capture being searched for, so the epsilon walk must
+// fall through to Arg. Top-level Op is OpAlternate (not OpCapture/OpConcat),
+// so task 41's whole-pattern-single-capture shortcut never applies
+// regardless of MaxCap — confirmed live.
+func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:(a)|(b))`, GroupsFunc: "g"}})
+}
+
+// TestTDFAStartThreadOffMainEntry exercises startThreads[i]'s capture-op
+// discovery via tdfaEpsCapOpsTo for a start PC that isn't the main entry
+// target (newTDFA's comment: "e.g. (a*) reaching InstMatch") — TEST.md T32.
+// (a*) alone reaches InstMatch via a pure-epsilon path from Start, exactly
+// the mechanism this targets — but it also trips task 41's whole-pattern-
+// single-capture shortcut (MaxCap()==1, confirmed live), which would bypass
+// TDFA construction entirely. (a*)(b*) keeps both groups nullable (so
+// InstMatch is still reachable via pure epsilon from Start, preserving the
+// mechanism) while MaxCap()==2 keeps clear of the shortcut.
+func TestTDFAStartThreadOffMainEntry(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a*)(b*)", GroupsFunc: "g"}})
+}

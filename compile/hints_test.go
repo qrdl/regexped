@@ -138,19 +138,13 @@ func TestSetHintsSelectsShuftiFrontend(t *testing.T) {
 	}
 
 	specHinted, prefixPool, suffixPool := buildSpec(t)
-	csHinted, err := CompileSet(specHinted, prefixPool, suffixPool, CompileSetOptions{LikelyMode: LikelyNoMatch})
-	if err != nil {
-		t.Fatalf("CompileSet (hinted): %v", err)
-	}
+	csHinted := CompileSet(specHinted, prefixPool, suffixPool, CompileSetOptions{LikelyMode: LikelyNoMatch})
 	if csHinted.fe != frontendShufti {
 		t.Errorf("CompileSet with LikelyNoMatch: fe = %v, want frontendShufti", csHinted.fe)
 	}
 
 	specUnhinted, prefixPool2, suffixPool2 := buildSpec(t)
-	csUnhinted, err := CompileSet(specUnhinted, prefixPool2, suffixPool2, CompileSetOptions{})
-	if err != nil {
-		t.Fatalf("CompileSet (unhinted): %v", err)
-	}
+	csUnhinted := CompileSet(specUnhinted, prefixPool2, suffixPool2, CompileSetOptions{})
 	if csUnhinted.fe == frontendShufti {
 		t.Error("CompileSet without a LikelyNoMatch hint unexpectedly selected frontendShufti (density heuristic alone shouldn't for this byte set)")
 	}

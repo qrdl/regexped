@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"regexp/syntax"
 	"sort"
 
@@ -188,28 +189,6 @@ func hasBeginAnchorAtTopLevel(re *syntax.Regexp) bool {
 	return false
 }
 
-// endsWithBeginAnchor reports whether the last mandatory element of re is a
-// begin-text or begin-line assertion at the top level (not inside *, ?, etc.).
-// e.g. \z^ returns true, (^^)*$ returns false.
-func endsWithBeginAnchor(re *syntax.Regexp) bool {
-	if re == nil {
-		return false
-	}
-	switch re.Op {
-	case syntax.OpBeginText, syntax.OpBeginLine:
-		return true
-	case syntax.OpConcat:
-		if len(re.Sub) > 0 {
-			return endsWithBeginAnchor(re.Sub[len(re.Sub)-1])
-		}
-	case syntax.OpCapture:
-		if len(re.Sub) > 0 {
-			return endsWithBeginAnchor(re.Sub[0])
-		}
-	}
-	return false
-}
-
 // isOnlyBeginAnchors reports whether re consists entirely of BeginText or
 // BeginLine assertions (possibly concatenated). Used to decide whether a
 // zero-length prefix can be safely stripped to just a startAnchor flag.
@@ -337,7 +316,10 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		if err != nil {
 			return nil, fmt.Errorf("analyzePattern: compile prefix %q: %w", re.Pattern, err)
 		}
-		revD := newDFA(revProg, false, false)
+		revD, revOk := newDFA(revProg, false, false, maxHelperDFAStates)
+		if !revOk {
+			return nil, fmt.Errorf("analyzePattern: prefix %q exceeds DFA state limit", re.Pattern)
+		}
 		prefixTable := dfaTableFromCanonical(revD)
 		info.prefixDFA = prefixTable
 		info.prefixID = prefixPool.Add(prefixTable)
@@ -356,7 +338,10 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	if err != nil {
 		return nil, fmt.Errorf("analyzePattern: compile suffix %q: %w", re.Pattern, err)
 	}
-	d := newDFA(prog, false, false)
+	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	if !ok {
+		return nil, fmt.Errorf("analyzePattern: suffix %q exceeds DFA state limit", re.Pattern)
+	}
 	suffixTable := dfaTableFromCanonical(d)
 	info.suffixDFA = suffixTable
 	info.suffixStates = suffixTable.numStates
@@ -429,26 +414,6 @@ func (o CompileSetOptions) maxFallbackStates() int {
 	return 1024
 }
 
-// mergeSuffixASTs builds a canonical union AST from suffix sub-trees.
-// Sorts the inputs by re.String() before alternation so patterns sharing
-// prefixes converge in the NFA sooner, reducing DFA state count.
-func mergeSuffixASTs(asts []*syntax.Regexp) *syntax.Regexp {
-	if len(asts) == 0 {
-		return nil
-	}
-	if len(asts) == 1 {
-		return deepCopyRegexp(asts[0])
-	}
-	sorted := make([]*syntax.Regexp, len(asts))
-	for i, a := range asts {
-		sorted[i] = deepCopyRegexp(a)
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].String() < sorted[j].String()
-	})
-	return &syntax.Regexp{Op: syntax.OpAlternate, Sub: sorted}
-}
-
 // combinedClassCount returns the number of byte equivalence classes produced
 // by merging class maps a and b. Two bytes are in the same combined class only
 // if they are in the same class in both a and b.
@@ -468,6 +433,13 @@ func combinedClassCount(a, b [256]byte) int {
 // Bit k in the patternBits vector identifies pattern k.
 //
 // Returns error if len(asts) > BitmaskWidth (default 32).
+//
+// The AcceptKind return is always AcceptBitmask today; no caller uses it yet.
+// It exists so Phase 6 (plans/COMPOSING_PATTERNS_PLAN.md) can add
+// AcceptSparseSet for WAF-scale buckets (>BitmaskWidth patterns) without
+// changing this signature or any call site.
+//
+//nolint:unparam // second return value is a deliberate Phase 6 extensibility stub, see comment above
 func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, AcceptKind, error) {
 	bw := opts.BitmaskWidth
 	if bw == 0 {
@@ -493,7 +465,17 @@ func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, A
 	// Build union NFA manually so each pattern gets a distinct InstMatch.
 	unionProg, patternBits := buildUnionProg(progs, bw)
 
-	d := newDFA(unionProg, false, true, patternBits)
+	// maxHelperDFAStates, NOT opts.budgetStates(): callers (binPack) expect
+	// a REAL, if over-budget, table back so they can record a precise
+	// "state_count_exceeded" diagnostic (merged_states/budget_states) for
+	// the common case of a legitimately-large-but-finite merge — the same
+	// contract compile.go's primary DFA construction has with
+	// resolveMaxDFAStates. Only pathological, effectively-unbounded
+	// constructions (beyond maxHelperDFAStates) hit errDFAStateLimitExceeded.
+	d, ok := newDFA(unionProg, false, true, maxHelperDFAStates, patternBits)
+	if !ok {
+		return nil, 0, errDFAStateLimitExceeded
+	}
 	t := dfaTableFromCanonical(d)
 	return t, AcceptBitmask, nil
 }
@@ -1073,6 +1055,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 				}
 			}
 			if isolatedDFA.numStates > opts.maxFallbackStates() {
+				warnPatternDropped(p, "isolated fallback bucket", isolatedDFA.numStates, opts.maxFallbackStates())
 				if diag != nil {
 					diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
 				}
@@ -1130,6 +1113,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 				}
 			}
 			if nbDFA.numStates > opts.maxFallbackStates() {
+				warnPatternDropped(p, "new fallback bucket", nbDFA.numStates, opts.maxFallbackStates())
 				if diag != nil {
 					diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
 				}
@@ -1176,6 +1160,31 @@ func patternSuffixAST(p *PatternInfo) *syntax.Regexp {
 	// The mandatory literal IS the whole pattern; suffix is empty.
 	empty, _ := syntax.Parse("", syntax.Perl)
 	return empty
+}
+
+// warnPatternDropped reports, at warning level, that a pattern has been
+// excluded from its set because its suffix DFA exceeded maxFallbackStates.
+//
+// This must not be nested inside the `if diag != nil` guards that surround the
+// StateLimitDropped bookkeeping: CompileSet creates a SetDiag unconditionally
+// (set_emit.go) so those guards always pass, but the resulting struct is
+// discarded unless the caller asked for --diag-json — its only consumer is
+// CmdWriteDiagJSON. Before this warning existed, a normal build dropped the
+// pattern with exit code 0 and no output at all, and the set silently never
+// matched it. See plans/OPUS.md §N3.
+//
+// Warn rather than error: erroring would be a behaviour change for configs that
+// build today, and the drop is a resource ceiling rather than a malformed
+// input. Promoting it to a hard failure belongs behind a --strict flag.
+func warnPatternDropped(p *PatternInfo, where string, states, limit int) {
+	ref := patternRefFor(p)
+	slog.Warn("Pattern dropped from set: suffix DFA exceeds state limit",
+		"pattern", ref.Name,
+		"id", ref.ID,
+		"where", where,
+		"states", states,
+		"limit", limit,
+		"hint", "raise max_dfa_states, simplify the pattern, or move it out of the set")
 }
 
 // patternRefFor builds a PatternRef from a PatternInfo.

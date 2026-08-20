@@ -238,7 +238,9 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 
 ### 3. Code Generation (`generate/`)
 
-**WASM export names = func names.** The value of `match_func`, `find_func`, `groups_func`, or `named_groups_func` is used directly as the WASM export name. This ensures unique export names in merged WASMs and removes the need for special-casing `match` (a Rust keyword).
+**WASM export names = func names.** The value of `match_func`, `find_func`, `groups_func`, or `named_groups_func` is used directly as the WASM export name. This ensures unique export names in merged WASMs.
+
+Because those values are also interpolated verbatim into generated source, `config.ValidateConfig` (`config/identifier.go`, called from `LoadConfig`) rejects any that is not `^[A-Za-z_][A-Za-z0-9_]*$` or is a reserved word in **any** of the six stub languages — `match` included, since the Rust generator emits `pub fn <func>` for the public wrapper. The check runs on the config-file path only, not inside `Compile`/`CompileFile`, so the internal harnesses (`tools/re2test`, `perftest`, `likelytest`, `pattest`, `tools/fuzz`) keep their bare `match`/`find`/`groups` names. See `docs/cli.md` "Export-name rules".
 
 **Rust stubs** (`generate/rust_stub.go`):
 
@@ -529,6 +531,6 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 ---
 
 **Last Updated:** 2026-07-10
-**CLI commands:** `generate` (stubs), `compile`, `merge`, `diag` (write set composition diagnostics JSON via `CmdWriteDiagJSON`)
+**CLI commands:** `generate` (stubs), `compile`, `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand.
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition)
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

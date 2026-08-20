@@ -192,13 +192,16 @@ func %s(input []byte) (int, bool) {
 		ptr = unsafe.Pointer(&input[0])
 	}
 	r := %s(ptr, uint32(len(input)))
+	if r == %d {
+		panic("%s")
+	}
 	if r < 0 {
 		return 0, false
 	}
 	return int(r), true
 }
 
-`, importModule, funcName, ffi, pub, pub, ffi)
+`, importModule, funcName, ffi, pub, pub, ffi, btOverflow, btOverflowMsg(pub))
 }
 
 // genGoFindStub generates a find iterator returning iter.Seq2[int,int].
@@ -220,6 +223,9 @@ func %s(input []byte) iter.Seq2[int, int] {
 				ptr = unsafe.Pointer(&input[pos])
 			}
 			r := %s(ptr, uint32(len(input)-pos))
+			if r == %d {
+				panic("%s")
+			}
 			if r < 0 {
 				break
 			}
@@ -228,16 +234,16 @@ func %s(input []byte) iter.Seq2[int, int] {
 			if !yield(start, end) {
 				break
 			}
-			if end > pos {
+			if end > start {
 				pos = end
 			} else {
-				pos++
+				pos = start + 1
 			}
 		}
 	}
 }
 
-`, importModule, funcName, ffi, pub, pub, ffi)
+`, importModule, funcName, ffi, pub, pub, ffi, btOverflow, btOverflowMsg(pub))
 }
 
 // genGoGroupsStub generates a groups iterator returning iter.Seq2[[][]int, bool].
@@ -271,6 +277,9 @@ func %s(input []byte) iter.Seq[[][]int] {
 			}
 			buf := make([]int32, %d)
 			r := %s(ptr, uint32(len(input)-pos), unsafe.Pointer(&buf[0]))
+			if r == %d {
+				panic("%s")
+			}
 			if r < 0 {
 				if pos == len(input) {
 					break
@@ -303,7 +312,7 @@ func %s(input []byte) iter.Seq[[][]int] {
 	}
 }
 
-`, pub, pub, slotCount, ffi, numGroups)
+`, pub, pub, slotCount, ffi, btOverflow, btOverflowMsg(pub), numGroups)
 }
 
 // genGoNamedGroupsStub generates a named-groups iterator that calls the FFI export directly.
@@ -352,6 +361,9 @@ func %s(input []byte) iter.Seq[map[string][]int] {
 			}
 			buf := make([]int32, %d)
 			r := %s(ptr, uint32(len(input)-pos), unsafe.Pointer(&buf[0]))
+			if r == %d {
+				panic("%s")
+			}
 			if r < 0 {
 				if pos == len(input) {
 					break
@@ -376,7 +388,7 @@ func %s(input []byte) iter.Seq[map[string][]int] {
 	}
 }
 
-`, pub, pub, slotCount, ffi, len(entries), assigns.String())
+`, pub, pub, slotCount, ffi, btOverflow, btOverflowMsg(pub), len(entries), assigns.String())
 }
 
 // genGoStubsBody returns the body (no header, no imports) for single-pattern stubs.

@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
@@ -44,37 +45,61 @@ func AppendSLEB128(out []byte, v int32) []byte {
 	return out
 }
 
+// maxLEB128Bytes bounds both decoders. A 64-bit value needs at most ten groups
+// of seven bits, so an eleventh continuation byte means the encoding is
+// over-long: its payload would be shifted past bit 63 and silently vanish (Go
+// defines x << 64 as 0 rather than leaving x unchanged), turning malformed
+// input into a plausible-looking wrong number. See plans/FABLE.md B39.
+const maxLEB128Bytes = 10
+
+// ErrMalformedLEB128 is returned for an encoding that is over-long (more than
+// maxLEB128Bytes) or truncated (the last byte available still has its
+// continuation bit set, including the empty-input case).
+var ErrMalformedLEB128 = errors.New("malformed LEB128: over-long or truncated encoding")
+
 // DecodeULEB128 reads an unsigned LEB128 from data and returns the value and
-// the number of bytes consumed.
-func DecodeULEB128(data []byte) (uint64, int) {
+// the number of bytes consumed, or ErrMalformedLEB128.
+//
+// Malformed input is an error rather than a best-effort value: every caller
+// uses the result as an offset or length into the same buffer, so a silently
+// truncated decode turns into an out-of-range index or a wrong memory layout
+// far from the actual fault.
+func DecodeULEB128(data []byte) (uint64, int, error) {
 	var v uint64
 	var shift uint
 	for i, b := range data {
+		if i >= maxLEB128Bytes {
+			return 0, 0, ErrMalformedLEB128
+		}
 		v |= uint64(b&0x7f) << shift
 		if b&0x80 == 0 {
-			return v, i + 1
+			return v, i + 1, nil
 		}
 		shift += 7
 	}
-	return v, len(data)
+	return 0, 0, ErrMalformedLEB128
 }
 
 // DecodeSLEB128 reads a signed LEB128 from data and returns the value and the
-// number of bytes consumed.
-func DecodeSLEB128(data []byte) (int64, int) {
+// number of bytes consumed, or ErrMalformedLEB128. Same bounds as
+// DecodeULEB128.
+func DecodeSLEB128(data []byte) (int64, int, error) {
 	var v int64
 	var shift uint
 	for i, b := range data {
+		if i >= maxLEB128Bytes {
+			return 0, 0, ErrMalformedLEB128
+		}
 		v |= int64(b&0x7f) << shift
 		shift += 7
 		if b&0x80 == 0 {
 			if shift < 64 && b&0x40 != 0 {
 				v |= ^0 << shift
 			}
-			return v, i + 1
+			return v, i + 1, nil
 		}
 	}
-	return v, len(data)
+	return 0, 0, ErrMalformedLEB128
 }
 
 // WasmMemTop scans the given WASM binary and returns the highest byte address
@@ -101,7 +126,10 @@ func WasmMemTop(path string) (int64, error) {
 		}
 		sectionID := raw[off]
 		off++
-		secSize, n := DecodeULEB128(raw[off:])
+		secSize, n, err := DecodeULEB128(raw[off:])
+		if err != nil {
+			return 0, err
+		}
 		off += n
 		secEnd := off + int(secSize)
 		if secEnd > len(raw) {
@@ -140,7 +168,10 @@ func ParseDataSectionBytes(raw []byte) (int64, error) {
 	for off < len(raw) {
 		sectionID := raw[off]
 		off++
-		secSize, n := DecodeULEB128(raw[off:])
+		secSize, n, err := DecodeULEB128(raw[off:])
+		if err != nil {
+			return 0, err
+		}
 		off += n
 		secEnd := off + int(secSize)
 		if secEnd > len(raw) {
@@ -160,17 +191,27 @@ func ParseDataSectionBytes(raw []byte) (int64, error) {
 // without calling memory.grow, so regexp tables must be placed above it.
 func ParseMemorySection(data []byte) (int64, error) {
 	off := 0
-	count, n := DecodeULEB128(data[off:])
+	count, n, err := DecodeULEB128(data[off:])
+	if err != nil {
+		return 0, err
+	}
 	off += n
 
 	var max int64
 	for i := uint64(0); i < count && off < len(data); i++ {
 		flags := uint64(data[off])
 		off++
-		minPages, n := DecodeULEB128(data[off:])
+		minPages, n, err := DecodeULEB128(data[off:])
+		if err != nil {
+			return max, err
+		}
 		off += n
 		if flags&1 != 0 {
-			_, n = DecodeULEB128(data[off:]) // skip max pages
+			var err error
+			_, n, err = DecodeULEB128(data[off:]) // skip max pages
+			if err != nil {
+				return max, err
+			}
 			off += n
 		}
 		size := int64(minPages) * WasmPageSize
@@ -186,7 +227,10 @@ func ParseMemorySection(data []byte) (int64, error) {
 // one and marks the top of the pre-allocated stack area.
 func ParseGlobalSection(data []byte) (int64, error) {
 	off := 0
-	count, n := DecodeULEB128(data[off:])
+	count, n, err := DecodeULEB128(data[off:])
+	if err != nil {
+		return 0, err
+	}
 	off += n
 
 	var max int64
@@ -202,7 +246,10 @@ func ParseGlobalSection(data []byte) (int64, error) {
 		}
 		if data[off] == 0x41 {
 			off++
-			val, n := DecodeSLEB128(data[off:])
+			val, n, err := DecodeSLEB128(data[off:])
+			if err != nil {
+				return max, err
+			}
 			off += n
 			off++ // end
 			if val > max {
@@ -238,7 +285,10 @@ func WasmTableBase(path string) (int64, error) {
 	for off < len(raw) {
 		sectionID := raw[off]
 		off++
-		secSize, n := DecodeULEB128(raw[off:])
+		secSize, n, err := DecodeULEB128(raw[off:])
+		if err != nil {
+			return 0, err
+		}
 		off += n
 		secEnd := off + int(secSize)
 		if secEnd > len(raw) {
@@ -257,10 +307,16 @@ func WasmTableBase(path string) (int64, error) {
 // whose first bytes match ReservationMagic and returns its memory offset.
 func findMagicInDataSection(data []byte) (int64, error) {
 	off := 0
-	count, n := DecodeULEB128(data[off:])
+	count, n, err := DecodeULEB128(data[off:])
+	if err != nil {
+		return 0, err
+	}
 	off += n
 	for i := uint64(0); i < count && off < len(data); i++ {
-		segType, n := DecodeULEB128(data[off:])
+		segType, n, err := DecodeULEB128(data[off:])
+		if err != nil {
+			return 0, err
+		}
 		off += n
 		switch segType {
 		case 0: // active, memory 0
@@ -268,10 +324,16 @@ func findMagicInDataSection(data []byte) (int64, error) {
 				return 0, fmt.Errorf("expected i32.const in data segment %d", i)
 			}
 			off++
-			segOffset, n := DecodeSLEB128(data[off:])
+			segOffset, n, err := DecodeSLEB128(data[off:])
+			if err != nil {
+				return 0, err
+			}
 			off += n
 			off++ // end (0x0b)
-			size, n := DecodeULEB128(data[off:])
+			size, n, err := DecodeULEB128(data[off:])
+			if err != nil {
+				return 0, err
+			}
 			off += n
 			if int(size) >= len(ReservationMagic) {
 				match := true
@@ -287,20 +349,32 @@ func findMagicInDataSection(data []byte) (int64, error) {
 			}
 			off += int(size)
 		case 1: // passive
-			size, n := DecodeULEB128(data[off:])
+			size, n, err := DecodeULEB128(data[off:])
+			if err != nil {
+				return 0, err
+			}
 			off += n
 			off += int(size)
 		case 2: // active, explicit memory index
-			_, n := DecodeULEB128(data[off:]) // memory index
+			_, n, err := DecodeULEB128(data[off:]) // memory index
+			if err != nil {
+				return 0, err
+			}
 			off += n
 			if off >= len(data) || data[off] != 0x41 {
 				return 0, fmt.Errorf("expected i32.const in data segment %d", i)
 			}
 			off++
-			segOffset, n := DecodeSLEB128(data[off:])
+			segOffset, n, err := DecodeSLEB128(data[off:])
+			if err != nil {
+				return 0, err
+			}
 			off += n
 			off++ // end
-			size, n := DecodeULEB128(data[off:])
+			size, n, err := DecodeULEB128(data[off:])
+			if err != nil {
+				return 0, err
+			}
 			off += n
 			if int(size) >= len(ReservationMagic) {
 				match := true
@@ -324,12 +398,18 @@ func findMagicInDataSection(data []byte) (int64, error) {
 // active data segments (type 0 = active, memory 0).
 func ParseDataSection(data []byte) (int64, error) {
 	off := 0
-	count, n := DecodeULEB128(data[off:])
+	count, n, err := DecodeULEB128(data[off:])
+	if err != nil {
+		return 0, err
+	}
 	off += n
 
 	var max int64
 	for i := uint64(0); i < count && off < len(data); i++ {
-		segType, n := DecodeULEB128(data[off:])
+		segType, n, err := DecodeULEB128(data[off:])
+		if err != nil {
+			return max, err
+		}
 		off += n
 
 		switch segType {
@@ -339,10 +419,16 @@ func ParseDataSection(data []byte) (int64, error) {
 				return max, fmt.Errorf("expected i32.const in data segment at %d", off)
 			}
 			off++
-			offset, n := DecodeSLEB128(data[off:])
+			offset, n, err := DecodeSLEB128(data[off:])
+			if err != nil {
+				return max, err
+			}
 			off += n
 			off++ // end (0x0b)
-			size, n := DecodeULEB128(data[off:])
+			size, n, err := DecodeULEB128(data[off:])
+			if err != nil {
+				return max, err
+			}
 			off += n
 			end := offset + int64(size)
 			if end > max {
@@ -351,21 +437,33 @@ func ParseDataSection(data []byte) (int64, error) {
 			off += int(size)
 
 		case 1: // passive – no offset
-			size, n := DecodeULEB128(data[off:])
+			size, n, err := DecodeULEB128(data[off:])
+			if err != nil {
+				return max, err
+			}
 			off += n
 			off += int(size)
 
 		case 2: // active, explicit memory index
-			_, n := DecodeULEB128(data[off:]) // memory index
+			_, n, err := DecodeULEB128(data[off:]) // memory index
+			if err != nil {
+				return max, err
+			}
 			off += n
 			if off >= len(data) || data[off] != 0x41 {
 				return max, fmt.Errorf("expected i32.const in data segment at %d", off)
 			}
 			off++
-			offset, n := DecodeSLEB128(data[off:])
+			offset, n, err := DecodeSLEB128(data[off:])
+			if err != nil {
+				return max, err
+			}
 			off += n
 			off++ // end
-			size, n := DecodeULEB128(data[off:])
+			size, n, err := DecodeULEB128(data[off:])
+			if err != nil {
+				return max, err
+			}
 			off += n
 			end := offset + int64(size)
 			if end > max {

@@ -26,7 +26,7 @@ regexps:
     groups_func:       "url_groups"        # anchored match with all capture groups
     named_groups_func: "url_named_groups"  # anchored match with named capture groups
 
-    hints: [prefer-match]   # optional; biases this pattern's emitted code shape (see below)
+    hints: [prefer-match, batch-find]   # optional; see "hints:" below
 
 sets:
   - name: "my_set"             # unique set name
@@ -35,10 +35,58 @@ sets:
     match: "validate"          # anchored at position 0 (optional)
     emit_name_map: true        # emit patternName(id) lookup helper in stubs
     patterns: all              # "all" or list of name: values from regexps:
-    hints: [prefer-no-match]   # optional; per-set default, see below
+    hints: [prefer-no-match]   # optional; per-set default; "batch-find" is not valid here, see below
 ```
 
 All paths in the config file are resolved relative to the config file's directory.
+A leading `~/` in `output`, `wasm_file`, `stub_file` or `wasm_merge` is expanded to
+the user's home directory (a bare `~` and the `~user` form are not expanded — only
+a shell can resolve another user's home).
+
+### Export-name rules
+
+Every `match_func`, `find_func`, `groups_func` and `named_groups_func` value, and every
+set's `find_any`, `find_all` and `match` value, becomes both a WASM export name and a
+function name in the generated stub. Because they are written verbatim into generated
+source, they are validated when the config is loaded, before any compile or generate work
+runs. A violation is a hard error: nothing is written and the exit status is non-zero.
+
+- **Shape** — must match `^[A-Za-z_][A-Za-z0-9_]*$`. ASCII only, no leading digit. This is
+  stricter than Rust, Go, JS and TS individually allow (all four accept some non-ASCII
+  identifiers), so that one config is portable across every `stub_type`.
+- **Reserved words** — the name must not be a reserved word in *any* of the six stub
+  languages (Rust, Go, C, JavaScript, TypeScript, AssemblyScript), regardless of which
+  `stub_type` is configured. The union is used so that changing `stub_type` cannot turn a
+  working config into a compile error in the caller's project. Notably this rejects
+  `match` (a Rust keyword), `find` and `groups` are fine.
+- Contextual keywords that are legal identifiers in their own language — TypeScript's
+  `type`, `from`, `of`, `get`, `set`, `string`, `number`, or Go's predeclared `len`/`cap` —
+  are **not** rejected.
+- **Not** covered: `regexps[].name` and `sets[].name`. Those are selection keys only, and
+  reach generated code as quoted string literals rather than identifiers, so reserved
+  words and punctuation are fine there.
+
+All offending names are reported in a single pass rather than one per run.
+
+Suffix `_batch` is separately reserved for the compiler-synthesized batch export (see
+`hints: [batch-find]` below), and export names must be unique across all `regexps:` and
+`sets:` entries.
+
+#### Rules that depend on `stub_type`
+
+The rules above are deliberately language-agnostic, so that changing `stub_type` never
+breaks a working config. A second, narrower set of checks is the opposite: they apply
+only to the generator the config actually targets, because enforcing them everywhere
+would reject configs that are perfectly valid. They are skipped entirely for a
+compile-only config (no `stub_type` and no `stub_file`), which generates no source.
+
+| Check | Applies to | Rationale |
+|---|---|---|
+| `import_module` must be a valid identifier and not a keyword of that language | `rust`, `go` | Emitted as `pub mod <name>` / `package <name>`. A hyphenated `import_module: "my-mod"` stays legal for `js`/`ts`, which never emit it. |
+| `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. |
+| Export names must not collide with a generator helper (`init`, `_w`, `_resize`, `_exp`, `_mem`, `_inBase`, `_outBase`, `_enc`, `_patternNames`, `patternName`, and `SetMatch` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not start with `ffi_` | `rust`, `go` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
+| Export names must not collide after the snake_case → PascalCase transform | `rust`, `go` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Go function / Rust iterator type. This also rejects a name that transforms to `SetMatch`, the struct the set stubs declare. |
 
 ### Engine selection
 
@@ -50,25 +98,57 @@ Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture gr
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
 
-### `hints:` — LikelyMode compile hints
+### `hints:` — LikelyMode and batch-find compile hints
 
-Both `regexps:` entries and `sets:` entries accept an optional `hints:` list
-that biases which code-shape optimisation the compiler favours for that
-pattern (or set): `[prefer-match]` (bias for fast-accept) or
-`[prefer-no-match]` (bias for fast-reject). The two are mutually exclusive;
-an absent or empty `hints:` list keeps the default (`LikelyNeutral`)
-behaviour. The hint never affects match correctness — only which
-optimisation path is emitted.
+Both `regexps:` entries and `sets:` entries accept an optional `hints:` list.
+Three values are recognised; `batch-find` is independent of the other two and
+may be combined with either (or neither) — the "mutually exclusive" rule only
+ever applies between `prefer-match` and `prefer-no-match`:
 
-A pattern's own `hints:` takes precedence over its enclosing set's `hints:`
-(and a set's own suffix-body compilation falls back to its `hints:` when a
-member pattern doesn't set its own). Setting `hints: [prefer-match]` on a
-`regexps:` entry also adds a `<func>_batch` WASM export for `find_func` and
-non-anchored `groups_func`, which the generated JS stub automatically
-prefers to reduce host↔WASM call overhead.
+- **`prefer-match`** — biases the compiler's code-shape choice for fast-accept.
+- **`prefer-no-match`** — biases for fast-reject. Mutually exclusive with
+  `prefer-match`.
+- **`batch-find`** — requests a `<func>_batch` WASM export for this pattern's
+  `find_func` and/or `groups_func` (see below). **Valid only on `regexps:`
+  entries** — it is a load-time error on a `sets:` entry (sets have their own
+  `find_all` batching via `batch_size`, a separate mechanism).
 
-See [likely.md](likely.md) for the full mechanism, per-mode effects, and
-task history.
+An absent or empty `hints:` list keeps the default (`LikelyNeutral`, no batch
+export). The `prefer-match`/`prefer-no-match` choice never affects match
+correctness — only which optimisation path is emitted.
+
+A pattern's own `prefer-match`/`prefer-no-match` takes precedence over its
+enclosing set's `hints:` (and a set's own suffix-body compilation falls back
+to its `hints:` when a member pattern doesn't set its own). `batch-find` has
+no set-level fallback to resolve, since it's rejected on `sets:` entries
+outright.
+
+See [prefer-hints.md](prefer-hints.md) for the full `prefer-match`/
+`prefer-no-match` mechanism, which pattern shapes benefit, and how to
+measure the effect on your own patterns with `tools/pattest`.
+
+#### `batch-find` — batched multi-match export (JS/TS only)
+
+Setting `hints: [batch-find]` on a `regexps:` entry adds a `<func>_batch` WASM
+export — `(ptr, len, out_ptr, out_cap, start_pos) → count` — that drains
+multiple matches per host call instead of one, for `find_func` and
+`groups_func` (`named_groups_func` shares `groups_func`'s batch export when
+both are set on the same entry, or gets its own — named after itself — when
+`named_groups_func` is the only capture export requested).
+
+**⚠ This hint is effective for the JS and TS generators only.** The generated
+JS/TS `find_func`/`groups_func`/`named_groups_func` consumer feature-detects
+the `_batch` export at runtime and prefers it automatically — no stub-side
+configuration needed, and the same generated stub works unmodified whether or
+not `batch-find` was set. **Setting `batch-find` has no effect on stubs
+generated for Rust, Go, C, or AssemblyScript** — those generators never look
+for a `_batch` export, so the WASM module gains the extra export but nothing
+in those stubs ever calls it. This is deliberate, not an oversight: for those
+four, the host and the regexp module are fused into one module by
+`wasm-merge`, so the `_batch` call would be an ordinary intra-module call, not
+the JS↔WASM boundary crossing the batching amortises — there is no
+projected win to justify the static-import decidability problems it would
+introduce. Don't set `batch-find` expecting a Rust/Go/C/AS speedup.
 
 ### Pattern support
 
@@ -102,6 +182,24 @@ These flags must appear before the subcommand name.
 ```bash
 regexped --debug compile --config=regexped.yaml
 ```
+
+Errors are always printed regardless of `--debug`; the flag only controls the
+diagnostic chatter below warning level.
+
+---
+
+## Exit codes
+
+| Code | Meaning | Examples |
+|---|---|---|
+| `0` | Success. Also returned by `-h` on any subcommand. | |
+| `1` | Usage error — the command line is wrong. | No subcommand, unknown subcommand, unrecognised flag, missing `--main`/`--output`, `--output=-` and `--diag-json=-` both writing to stdout |
+| `2` | Config or build error — the command line was fine, the work was not. | Malformed YAML, invalid export name, duplicate capture-group name, missing `import_module`, compile/generate/merge failure |
+| `3` | I/O error — a file could not be read or written. | Config file does not exist, config file not readable, output path not writable |
+
+Codes `2` and `3` are distinguished by inspecting the error: anything carrying a
+filesystem failure reports `3`, everything else reports `2`. So a config file that is
+missing is `3`, while a config file that is present but invalid is `2`.
 
 ---
 
@@ -275,7 +373,7 @@ sets:
 | `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
 | `batch_size` | No | Output buffer hint for stub iterators (default 256) |
 | `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
-| `hints` | No | `[prefer-match]` or `[prefer-no-match]`; per-set LikelyMode default — see [`hints:`](#hints--likelymode-compile-hints) above |
+| `hints` | No | `[prefer-match]` or `[prefer-no-match]`; per-set LikelyMode default. `batch-find` is rejected here — see [`hints:`](#hints--likelymode-and-batch-find-compile-hints) above |
 
 The `name:` field on `regexps:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
 
@@ -305,9 +403,13 @@ wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk
 |---|---|---|
 | `--config` | `regexped.yaml` | YAML config file |
 | `--main` | — | Host main WASM file **(required)** |
-| `--output`, `-o` | config `output` | Output WASM file; `-` writes to stdout |
+| `--output`, `-o` | config `output` | Output WASM file (must be a path; `-` is not accepted) |
 
 **Positional arguments:** one or more regexp WASM files (at least one required).
+
+Unlike `generate` and `compile`, `merge` does not accept `-` for stdout: the
+value is handed straight to `wasm-merge`, which would create a file literally
+named `-`.
 
 **Required config fields:**
 

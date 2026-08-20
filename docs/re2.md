@@ -20,12 +20,21 @@ make test             # from tools/re2test/
 
 Test data is unpacked automatically from the Go standard library.
 
-The `test` target chains seven single-pattern sub-targets — `exhaustive`, `custom`,
-`adjusted`, `force-backtrack`, `likelymatch`, `likelynomatch`, and
+The `test` target chains ten single-pattern sub-targets — `exhaustive`, `custom`,
+`adjusted`, `force-backtrack`, `likelymatch`, `likelynomatch`,
 `force-backtrack-likelynomatch` (the last three re-run the corpus under each
 `LikelyMode` to verify the mode never changes match correctness, only emitted
-code shape — see [likely.md](likely.md)) — plus `sets`, which exercises the
-multi-pattern composition pipeline described in [sets.md](sets.md).
+code shape — see [prefer-hints.md](prefer-hints.md)), and `matchonly`,
+`findonly`, `groupsonly` — plus `sets`, which exercises the multi-pattern
+composition pipeline described in [sets.md](sets.md).
+
+The last three compile each pattern with only one of `match_func`,
+`find_func`, `groups_func` set. That is not redundant with the default
+combined compile: `compile.go` has call sites gated on `needMatch &&
+!needFind` and on `needFind && !needMatch` (the Gap E alt-prefixed find body,
+the Gap C alt-range find body, the strict and lenient alt find bodies) which
+a match+find compile never reaches at all, so several emitters are invisible
+without them.
 
 ---
 

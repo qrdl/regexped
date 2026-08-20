@@ -4,6 +4,7 @@ import (
 	"regexp/syntax"
 	"sort"
 
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -13,32 +14,397 @@ import (
 // backtrack is a compiled backtracking NFA.
 // It handles capture patterns that cannot be processed by TDFA.
 type backtrack struct {
-	prog      *syntax.Prog
-	numGroups int          // prog.NumCap / 2 (includes group 0)
-	numAlts   int          // count of InstAlt nodes — bounds stack depth
-	loops     map[int]bool // set of InstAlt PCs that are loop back-edges
+	prog          *syntax.Prog
+	numGroups     int          // prog.NumCap / 2 (includes group 0)
+	numAlts       int          // count of InstAlt nodes — bounds stack depth
+	loops         map[int]bool // set of InstAlt PCs that are genuine loop heads
+	nonGreedyLoop map[int]bool // loops[pc] subset: true if the loop body is inst.Arg (non-greedy)
+	idom          []int        // immediate-dominator PC per PC, from computeDominators
+
+	// emptyBodyGreedyLoop is the loops[] subset of greedy loops whose body can
+	// complete with zero width, e.g. the outer `*` in (?:a*|b*)*. See
+	// emitBTInstHandler's InstAlt case for why these need different
+	// zero-progress handling than every other loop.
+	emptyBodyGreedyLoop map[int]bool
+
+	// memoInnerLoop is a set of Alt/AltMatch PCs that are NOT genuine loop
+	// heads by altLoopBody's dominance-based test (so bt.loops[pc] is
+	// false and they're compiled as ordinary non-loop alternations), but
+	// that nonetheless cycle back to themselves — reached when a back edge
+	// lands on an instruction with more than one predecessor path, which
+	// dominance can't recognize (e.g. prog.Start itself, or a duplicate
+	// "first entry vs. loop-back" instruction Go's compiler emits — see
+	// nestedLoopPC's doc). Left as an ordinary non-loop alternation, such a
+	// PC re-pushes a fresh retry frame on every entry with no bound,
+	// because it has no zero-progress guard of any kind.
+	//
+	// That's harmless in isolation (each entry still corresponds to a
+	// distinct, legitimate backtracking choice), but becomes unbounded
+	// when this PC is *also* the sole, unconditional body of an enclosing
+	// emptyBodyGreedyLoop (FUZZER_BUGS.md #18, e.g. the inner `a*` inside
+	// the outer `+` in `(?:a*)+^`): the outer loop's own zero-progress
+	// scalar can be clobbered by an intervening re-entry at a different
+	// position before the outer loop is revisited at the position that
+	// would let it detect "no progress" — so this inner PC keeps
+	// re-pushing frames faster than the outer loop can ever converge,
+	// growing the backtrack stack without bound until it overflows and the
+	// whole attempt is silently abandoned.
+	//
+	// These PCs get BitState memoisation instead — memoising the INNER PC
+	// specifically, not the outer loop head. An earlier attempt memoised
+	// the outer loop head directly and was confirmed live to break both
+	// directions: (a) `(?:a*|b*)*` on "b" started returning a wrong
+	// non-empty match, because the outer loop's own re-entry at the same
+	// position is *also* how the "still-pending sibling branch" mechanism
+	// (task 20) works, and blocking it suppressed that sibling; (b) even
+	// where it produced the right answer (`(?:a*)+^`), it did so by
+	// accident — the trace showed it only worked because it happened not
+	// to disturb the specific revisit the zero-progress guard needed.
+	// Memoising the inner PC instead leaves the outer loop's own re-entry
+	// mechanism completely untouched, and only stops the true source of
+	// unbounded growth. See nestedLoopPC for the precise, narrow shape
+	// this is restricted to (deliberately excludes `(?:a*|b*)*`, where the
+	// outer body branches into multiple sibling alternatives rather than
+	// leading unconditionally into one inner self-looping PC).
+	memoInnerLoop map[int]bool
+
+	// loopEntryOutOf/loopEntryArgOf map a loop's first-entry twin PC to its
+	// registered loop head PC, for every emptyBodyGreedyLoop head — split by
+	// which of the candidate's two successor edges (Out or Arg) is the one
+	// that actually targets the loop's bodyStart. Go's compiler emits a
+	// separate, non-cyclic InstAlt for a captured star's very first entry
+	// (identical Out/Arg to the genuine, back-edged loop head, but not
+	// itself reached via a back edge, hence bt.loops[pc]==false for it) —
+	// see FUZZER_BUGS.md #20. The entry twin is the only place that knows
+	// the position at which THIS SPECIFIC loop instance began; the loop
+	// head's own zero-progress guard needs that value (not the global
+	// attempt start, and not "unconditionally exit") to decide whether an
+	// empty-matching iteration is this loop's very first (nothing to
+	// resurrect) or came after real progress (a same-iteration sibling must
+	// still get its turn). See emitBTInstHandler's InstAlt case.
+	//
+	// The split matters because Out and Arg are instrumented at entirely
+	// different emission sites: an Out-edge candidate's transfer happens at
+	// contOut (immediate, unconditional); an Arg-edge candidate's transfer
+	// happens either via a direct exit branch or via a pushed-then-later-
+	// popped retry frame. A single unsplit map (the original design) always
+	// instrumented the Out site regardless of which edge actually matched,
+	// silently corrupting loopEntryLocalIdx whenever the qualifying edge was
+	// Arg — see FUZZER_BUGS.md #37.
+	loopEntryOutOf map[int]int
+	loopEntryArgOf map[int]int
+
+	// loopEntryAtStart is the emptyBodyGreedyLoop[] subset whose body starts
+	// at prog.Start itself — e.g. `(?:a??){1,}` with nothing preceding the
+	// loop at all. There, no instruction "flows into" the body from
+	// outside (loopEntryOutOf/loopEntryArgOf have no entry for this head):
+	// the very first dispatch sets state=prog.Start directly, entirely
+	// outside emitBTInstHandler's per-instruction logic, so there is no PC
+	// to instrument. For these heads the loop's own entry position is
+	// simply wherever this match attempt itself began (0 for match/groups
+	// bodies, the find engine's attempt_start local otherwise) — so their
+	// loopEntryLocalIdx local must be seeded with that value at
+	// declaration time instead of the usual -1 sentinel. See
+	// emitBTInstHandler's InstAlt case and FUZZER_BUGS.md #20.
+	loopEntryAtStart map[int]bool
 }
 
 func (b *backtrack) Type() EngineType { return EngineBacktrack }
 
 // newBacktrack builds the backtrack struct from a compiled NFA program.
 func newBacktrack(prog *syntax.Prog) *backtrack {
+	idom := computeDominators(prog)
 	bt := &backtrack{
-		prog:      prog,
-		numGroups: prog.NumCap / 2,
-		loops:     make(map[int]bool),
+		prog:                prog,
+		numGroups:           prog.NumCap / 2,
+		loops:               make(map[int]bool),
+		nonGreedyLoop:       make(map[int]bool),
+		idom:                idom,
+		emptyBodyGreedyLoop: make(map[int]bool),
+		memoInnerLoop:       make(map[int]bool),
 	}
 	for pc, inst := range prog.Inst {
 		if inst.Op == syntax.InstAlt {
 			bt.numAlts++
-			pcU32 := uint32(pc)
-			// Loop back-edge: Out < PC (greedy body goes backward) OR Arg < PC (non-greedy body backward)
-			if inst.Out < pcU32 || inst.Arg < pcU32 {
+			if bodyPC, _, isLoop := altLoopBody(prog, idom, pc); isLoop {
 				bt.loops[pc] = true
+				bt.nonGreedyLoop[pc] = bodyPC == int(inst.Arg)
+				if !bt.nonGreedyLoop[pc] && loopBodyCanMatchEmpty(prog, idom, pc) {
+					bt.emptyBodyGreedyLoop[pc] = true
+					if innerPC, found := nestedLoopPC(prog, idom, pc); found {
+						bt.memoInnerLoop[innerPC] = true
+					}
+				}
+			}
+		}
+	}
+
+	// Find each emptyBodyGreedyLoop head's external entry point(s): any PC
+	// outside the loop body whose successor edge targets the body's start.
+	// For a `*`/`?`-shaped loop this is Go's compiler-duplicated "first
+	// entry" twin InstAlt (identical Out/Arg to the genuine, back-edged
+	// loop head, reached only once per attempt at this loop). For a
+	// `+`-shaped loop there is no such twin — the body's mandatory first
+	// iteration is reached directly from whatever instruction precedes the
+	// repetition (of any Op, not necessarily InstAlt) — so this searches
+	// generically by successor-edge target rather than by instruction
+	// shape. A PC only counts as an external entry if it is NOT itself
+	// reachable from the body's start without first passing back through
+	// the loop head (i.e. it isn't one of the loop's own internal PCs
+	// re-entering via some other path). See loopEntryOutOf's doc.
+	bt.loopEntryOutOf = make(map[int]int, len(bt.emptyBodyGreedyLoop))
+	bt.loopEntryArgOf = make(map[int]int, len(bt.emptyBodyGreedyLoop))
+	bt.loopEntryAtStart = make(map[int]bool)
+	for headPC := range bt.emptyBodyGreedyLoop {
+		bodyStart := loopBodyStart(prog, idom, headPC)
+		if bodyStart == prog.Start {
+			// The loop's body IS the very first thing in the program (e.g.
+			// `(?:a??){1,}` with nothing preceding it) — there is no
+			// predecessor PC to instrument at all; the initial dispatch
+			// sets state=prog.Start directly. See loopEntryAtStart's doc.
+			bt.loopEntryAtStart[headPC] = true
+			continue
+		}
+		for cand, inst := range prog.Inst {
+			if cand == headPC {
+				continue
+			}
+			var outTargets, argTargets bool
+			switch inst.Op {
+			case syntax.InstFail, syntax.InstMatch:
+			case syntax.InstAlt, syntax.InstAltMatch:
+				outTargets = int(inst.Out) == bodyStart
+				argTargets = int(inst.Arg) == bodyStart
+			default:
+				outTargets = int(inst.Out) == bodyStart
+			}
+			if (outTargets || argTargets) && !pcReachesBounded(prog, bodyStart, cand, headPC) {
+				if outTargets {
+					bt.loopEntryOutOf[cand] = headPC
+				}
+				if argTargets {
+					bt.loopEntryArgOf[cand] = headPC
+				}
 			}
 		}
 	}
 	return bt
+}
+
+// computeDominators returns, for each PC reachable from prog.Start, its
+// immediate dominator (idom[pc]); idom[prog.Start] == prog.Start, and
+// unreachable PCs get idom == -1. Uses the standard Cooper-Harvey-Kennedy
+// iterative algorithm.
+func computeDominators(prog *syntax.Prog) []int {
+	n := len(prog.Inst)
+	successors := func(pc int) []int {
+		inst := prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstFail, syntax.InstMatch:
+			return nil
+		case syntax.InstAlt, syntax.InstAltMatch:
+			return []int{int(inst.Out), int(inst.Arg)}
+		default:
+			return []int{int(inst.Out)}
+		}
+	}
+
+	start := prog.Start
+	visited := make([]bool, n)
+	visited[start] = true
+	var order []int // postorder
+	type frame struct {
+		pc    int
+		idx   int
+		succs []int
+	}
+	stack := []frame{{pc: start, succs: successors(start)}}
+	for len(stack) > 0 {
+		f := &stack[len(stack)-1]
+		if f.idx < len(f.succs) {
+			w := f.succs[f.idx]
+			f.idx++
+			if !visited[w] {
+				visited[w] = true
+				stack = append(stack, frame{pc: w, succs: successors(w)})
+			}
+			continue
+		}
+		order = append(order, f.pc)
+		stack = stack[:len(stack)-1]
+	}
+
+	postNum := make([]int, n)
+	for i := range postNum {
+		postNum[i] = -1
+	}
+	for i, pc := range order {
+		postNum[pc] = i
+	}
+	rpo := make([]int, len(order))
+	for i, pc := range order {
+		rpo[len(order)-1-i] = pc
+	}
+
+	var preds [][]int
+	preds = make([][]int, n)
+	for pc := 0; pc < n; pc++ {
+		if !visited[pc] {
+			continue
+		}
+		for _, s := range successors(pc) {
+			preds[s] = append(preds[s], pc)
+		}
+	}
+
+	idom := make([]int, n)
+	for i := range idom {
+		idom[i] = -1
+	}
+	idom[start] = start
+
+	intersect := func(a, b int) int {
+		for a != b {
+			for postNum[a] < postNum[b] {
+				a = idom[a]
+			}
+			for postNum[b] < postNum[a] {
+				b = idom[b]
+			}
+		}
+		return a
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for _, b := range rpo {
+			if b == start {
+				continue
+			}
+			newIdom := -1
+			for _, p := range preds[b] {
+				if idom[p] == -1 {
+					continue
+				}
+				if newIdom == -1 {
+					newIdom = p
+				} else {
+					newIdom = intersect(newIdom, p)
+				}
+			}
+			if newIdom != -1 && idom[b] != newIdom {
+				idom[b] = newIdom
+				changed = true
+			}
+		}
+	}
+	return idom
+}
+
+// dominates reports whether v dominates u: every path from prog.Start to u
+// passes through v. Both must be reachable (idom != -1).
+func dominates(idom []int, v, u int) bool {
+	if idom[u] == -1 || idom[v] == -1 {
+		return false
+	}
+	for {
+		if u == v {
+			return true
+		}
+		if idom[u] == u {
+			return false // reached the root without finding v
+		}
+		u = idom[u]
+	}
+}
+
+// altLoopBody reports whether the InstAlt at pc is a genuine loop head, and if
+// so which branch is the body (the back edge, closing a real cycle) and
+// which is the exit. idom is the dominator tree from computeDominators.
+//
+// A branch pc→w is a back edge — and thus pc a loop head with body=w — when w
+// dominates pc: every path from the program's start to pc necessarily passes
+// through w, which is exactly the condition for pc→w to close a cycle back to
+// an enclosing point rather than merely happening to reach it via some other
+// route. This is the standard compiler technique for identifying natural
+// loops and is precise even under arbitrary nesting, unlike two simpler tests
+// that were tried and both misfire:
+//   - A pure numeric PC comparison (Out<pc or Arg<pc) misidentifies unrolled
+//     bounded repeats (a{1,300}) as loops: the chain's "keep matching" edges
+//     point to numerically lower PCs purely as an artifact of how the
+//     unrolled instructions are numbered, with no actual cycle. This
+//     previously inflated the per-loop WASM local count (one dedicated local
+//     per misidentified "loop") past 256, silently corrupting an unrelated
+//     local index used by the BT find path's mandatory-literal scan
+//     (prefixScanLocals's byte-typed fields) and crashing with an OOB memory
+//     access.
+//   - A same-strongly-connected-component test (do pc and w lie on a shared
+//     cycle at all?) misidentifies plain forks nested inside a loop's body as
+//     loop heads, AND — the opposite failure — merges distinct nested loop
+//     levels into one component, making the true inner loop head look
+//     "ambiguous" (both branches "in the component") and get rejected. E.g.
+//     for (?:(?:(?:^)*)+), the inner star's Alt and the outer plus's Alt end
+//     up in the same SCC, so the inner one's own back edge is invisible to a
+//     component-level test; only edge-level dominance sees it.
+func altLoopBody(prog *syntax.Prog, idom []int, pc int) (bodyPC, exitPC int, isLoop bool) {
+	inst := prog.Inst[pc]
+	outIsBack := dominates(idom, int(inst.Out), pc)
+	argIsBack := dominates(idom, int(inst.Arg), pc)
+	switch {
+	case outIsBack && !argIsBack:
+		return int(inst.Out), int(inst.Arg), true
+	case argIsBack && !outIsBack:
+		return int(inst.Arg), int(inst.Out), true
+	case outIsBack && argIsBack:
+		// Both branches test as back edges: pc is simultaneously an inner
+		// loop's own back edge and, via the other branch, an enclosing
+		// loop's continuation point (FUZZER_BUGS.md #26 — first found when
+		// the enclosing loop's continuation happened to be prog.Start
+		// itself, which trivially dominates everything). Discriminate by
+		// dominance between the two targets directly: whichever target
+		// dominates the OTHER target closes the more enclosing loop
+		// relative to this Alt, so the other, dominated target is the
+		// true, more-local inner-loop body (FUZZER_BUGS.md #29 — the
+		// original prog.Start-equality check was only a special case of
+		// this and misfires once a prefix construct pushes prog.Start
+		// outside the affected group).
+		if dominates(idom, int(inst.Arg), int(inst.Out)) {
+			return int(inst.Out), int(inst.Arg), true
+		}
+		if dominates(idom, int(inst.Out), int(inst.Arg)) {
+			return int(inst.Arg), int(inst.Out), true
+		}
+		return 0, 0, false
+	default:
+		if pc == prog.Start {
+			// pc is the program's entry: computeDominators sets idom[pc]==pc
+			// for the root (it has no proper dominator), so dominates(idom,
+			// v, pc) can never succeed for any v != pc — the walk from pc
+			// terminates at the root on its very first step, before it could
+			// ever discover that a genuine back edge loops into pc from
+			// within the program (e.g. bare `x*` at the very start of a
+			// pattern: the back edge is body's last instruction -> pc, and
+			// pc IS the entry, so nothing "dominates" it despite the cycle
+			// being real). FUZZER_BUGS.md #37.
+			//
+			// Fall back to direct forward reachability from each branch back
+			// to pc. This is the same reachability test rejected above for
+			// the general case (misidentifies forks/merges nested loop
+			// levels), but it's safe here specifically because pc has no
+			// external predecessor to confuse it with: pc is the only entry
+			// to the whole program, so any path that reaches it again is
+			// necessarily an internal cycle, not an alternate external route.
+			outReachesBack := pcReachesBounded(prog, int(inst.Out), pc, pc)
+			argReachesBack := pcReachesBounded(prog, int(inst.Arg), pc, pc)
+			switch {
+			case outReachesBack && !argReachesBack:
+				return int(inst.Out), int(inst.Arg), true
+			case argReachesBack && !outReachesBack:
+				return int(inst.Arg), int(inst.Out), true
+			}
+		}
+		return 0, 0, false
+	}
 }
 
 // --------------------------------------------------------------------------
@@ -60,22 +426,20 @@ func capStartLocal(i int) uint32 { return uint32(7 + i*2) }
 func capEndLocal(i int) uint32   { return uint32(8 + i*2) }
 
 // loopBodyStart returns the PC of the first instruction inside the loop body
-// at loopPC (the backward-pointing branch).
-func loopBodyStart(prog *syntax.Prog, loopPC int) int {
-	inst := prog.Inst[loopPC]
-	pcU32 := uint32(loopPC)
-	if inst.Out < pcU32 {
-		return int(inst.Out) // greedy: body is Out (backward)
-	}
-	return int(inst.Arg) // non-greedy: body is Arg (backward)
+// at loopPC (the branch that cycles back to loopPC). Only meaningful when
+// loopPC is a genuine loop head — callers must have already established that
+// via altLoopBody/bt.loops.
+func loopBodyStart(prog *syntax.Prog, idom []int, loopPC int) int {
+	bodyPC, _, _ := altLoopBody(prog, idom, loopPC)
+	return bodyPC
 }
 
 // loopBodyCanMatchEmpty returns true if the body of the loop at loopPC can
 // execute a full iteration without consuming any byte.  It BFS-traverses all
 // NFA paths reachable from the body entry back to loopPC and returns true if
 // at least one path contains no byte-consuming instruction.
-func loopBodyCanMatchEmpty(prog *syntax.Prog, loopPC int) bool {
-	bodyStart := loopBodyStart(prog, loopPC)
+func loopBodyCanMatchEmpty(prog *syntax.Prog, idom []int, loopPC int) bool {
+	bodyStart := loopBodyStart(prog, idom, loopPC)
 	visited := make([]bool, len(prog.Inst))
 	type entry struct {
 		pc    int
@@ -109,26 +473,175 @@ func loopBodyCanMatchEmpty(prog *syntax.Prog, loopPC int) bool {
 	return false
 }
 
-// needsBitState returns true if prog contains a non-greedy loop whose body can
-// execute a full iteration without consuming a byte.  For such loops the
-// existing zero-progress guard incorrectly takes the body branch again (instead
-// of exiting), causing an infinite loop.  BitState memoisation breaks the cycle.
+// nestedLoopPC looks for a single, unconditional nested loop directly inside
+// loopPC's body — the specific shape FUZZER_BUGS.md #18 needs memoised. It
+// walks the body linearly from bodyStart, following only non-branching
+// instructions (Capture/Nop), and stops at the FIRST Alt/AltMatch it finds:
+// if that instruction cycles back to itself, its PC is returned as the
+// nested loop; otherwise — including the case where it's a plain
+// (non-cycling) branch choosing between multiple sibling alternatives, e.g.
+// the top-level `a*|b*` choice in `(?:a*|b*)*` — this stops and reports
+// found=false rather than searching deeper.
 //
-// Greedy loops are already handled correctly by the zero-progress guard
-// (zero-progress → take exit), so they never need BitState.  In particular,
-// the canonical "catastrophic backtracking" pattern (?:a?)* has a greedy outer
-// loop: when a? matches empty the guard fires and the loop exits immediately.
-func needsBitState(prog *syntax.Prog) bool {
-	for pc, inst := range prog.Inst {
-		if inst.Op != syntax.InstAlt && inst.Op != syntax.InstAltMatch {
+// This conservatism is required, not just cautious: an earlier, broader
+// attempt (memoising the OUTER loop head itself whenever its body contained
+// any nested loop, transitively) was confirmed live to break `(?:a*|b*)*` on
+// "b" (wrongly returning end=1 instead of the correct end=0) — see
+// bt.memoInnerLoop's doc for the full trace of why. Restricting to the
+// single-unconditional-path shape, and memoising the inner PC rather than
+// the outer, avoids that failure mode entirely: `(?:a*|b*)*`'s outer body
+// (a plain branch between the a* and b* sub-loops) never matches this
+// shape, so it's never touched.
+//
+// The returned PC need NOT be a registered loop head in bt.loops:
+// altLoopBody's back-edge test is dominance-based (dominates(idom,
+// branchTarget, pc)), and dominance can never hold against a PC reached via
+// more than one distinct predecessor path — prog.Start itself (nothing but
+// start can "dominate" the root), or the duplicate "first entry vs.
+// loop-back re-entry" instruction Go's compiler sometimes emits for a
+// loop's true first iteration. `(?:a*)+^` produces the former (the inner
+// `a*`'s own Alt IS prog.Start); `(?:(?:(a)*?){0,})`-shaped patterns
+// produce the latter. Using pcReachesBounded's plain forward reachability
+// instead of dominates sidesteps both gaps without touching altLoopBody's
+// existing classification (used elsewhere for
+// bt.loops/nonGreedyLoop/emptyBodyGreedyLoop) at all. The reachability
+// check is bounded at loopPC so it doesn't "leak" through loopPC's own back
+// edge and false-positive on every enclosing loop.
+func nestedLoopPC(prog *syntax.Prog, idom []int, loopPC int) (innerPC int, found bool) {
+	pc := loopBodyStart(prog, idom, loopPC)
+	visited := make([]bool, len(prog.Inst))
+	for {
+		if pc == loopPC || visited[pc] {
+			return 0, false
+		}
+		visited[pc] = true
+		inst := prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstAlt, syntax.InstAltMatch:
+			if pcReachesBounded(prog, int(inst.Out), pc, loopPC) || pcReachesBounded(prog, int(inst.Arg), pc, loopPC) {
+				return pc, true
+			}
+			return 0, false
+		case syntax.InstCapture, syntax.InstNop:
+			pc = int(inst.Out)
+		default:
+			// Fail/Match/byte-consumer reached before any branching — no
+			// nested loop on this linear prefix.
+			return 0, false
+		}
+	}
+}
+
+// pcReachesBounded reports whether `target` is reachable from `from` via a
+// forward path through the NFA graph that never crosses `boundary` (reaching
+// boundary is treated as a dead end, not expanded further) — see
+// nestedLoopPC for why the bound is required.
+func pcReachesBounded(prog *syntax.Prog, from, target, boundary int) bool {
+	visited := make([]bool, len(prog.Inst))
+	queue := []int{from}
+	for len(queue) > 0 {
+		pc := queue[0]
+		queue = queue[1:]
+		if pc == target {
+			return true
+		}
+		if pc == boundary || visited[pc] {
 			continue
 		}
-		// Non-greedy: Arg < PC (body is Arg, backward pointing).
-		if inst.Arg < uint32(pc) && loopBodyCanMatchEmpty(prog, pc) {
+		visited[pc] = true
+		inst := prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstFail, syntax.InstMatch:
+			// no successors
+		case syntax.InstAlt, syntax.InstAltMatch:
+			queue = append(queue, int(inst.Out), int(inst.Arg))
+		default:
+			queue = append(queue, int(inst.Out))
+		}
+	}
+	return false
+}
+
+// btHasWordBoundary reports whether prog contains a \b/\B assertion —
+// used to decide whether a non-anchored captureBody needs the edge-scratch
+// mechanism (FUZZER_BUGS.md #26): patterns without any \b/\B never emit
+// btWordBoundary at all, so there's nothing for the scratch slot to fix and
+// reserving/writing it would be pure overhead.
+func btHasWordBoundary(prog *syntax.Prog) bool {
+	for _, inst := range prog.Inst {
+		if inst.Op != syntax.InstEmptyWidth {
+			continue
+		}
+		emptyOp := syntax.EmptyOp(inst.Arg)
+		if emptyOp&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary) != 0 {
 			return true
 		}
 	}
 	return false
+}
+
+// btHasTextLineAnchors reports whether prog contains a \A, \z, (?m:^) or
+// (?m:$) assertion. Like btHasWordBoundary, these four assertions are
+// defined against the true input edges, which a captureBody handed a
+// narrowed match slice cannot see. Their presence is what switches the
+// groups wrappers into window mode (FABLE.md B13) — see
+// buildBacktrackBody's winScratchOff.
+func btHasTextLineAnchors(prog *syntax.Prog) bool {
+	const mask = syntax.EmptyBeginText | syntax.EmptyEndText |
+		syntax.EmptyBeginLine | syntax.EmptyEndLine
+	for _, inst := range prog.Inst {
+		if inst.Op != syntax.InstEmptyWidth {
+			continue
+		}
+		if syntax.EmptyOp(inst.Arg)&mask != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// btLocalGet appends `local.get idx` for an arbitrary local index.
+// Byte-identical to the hand-written `append(b, 0x20, localX)` form for
+// every index below 128.
+func btLocalGet(b []byte, idx uint32) []byte {
+	b = append(b, 0x20)
+	return utils.AppendULEB128(b, idx)
+}
+
+// needsBitState returns true if prog contains a loop that the scalar
+// zero-progress guard alone cannot handle correctly, requiring BitState
+// memoisation to break a cycle:
+//
+//   - A non-greedy loop whose body can execute a full iteration without
+//     consuming a byte. For such loops the existing zero-progress guard
+//     incorrectly takes the body branch again (instead of exiting), causing
+//     an infinite loop.
+//   - A PC that nestedLoopPC finds nested, unconditionally and alone, inside
+//     an emptyBodyGreedyLoop's body (bt.memoInnerLoop — FUZZER_BUGS.md #18,
+//     e.g. the inner `a*` inside the outer `+` in `(?:a*)+^`). Such a PC is
+//     never itself a registered loop head (altLoopBody's dominance-based
+//     back-edge test can't recognize it — see nestedLoopPC's doc), so it's
+//     compiled as an ordinary non-loop alternation with no zero-progress
+//     guard of any kind, re-pushing a fresh retry frame on every entry
+//     without bound. Left unmemoised, that unbounded growth outpaces the
+//     enclosing loop's own (otherwise-correct) zero-progress detection
+//     until the backtrack stack overflows and the whole attempt is silently
+//     abandoned.
+//
+// A greedy loop whose empty-matchable body does NOT have this shape (e.g.
+// the canonical "catastrophic backtracking" pattern (?:a?)*, or the
+// multi-branch (?:a*|b*)*) is already correctly handled by the scalar guard
+// alone and does not need BitState — see bt.memoInnerLoop's and
+// nestedLoopPC's docs for why memoising the OUTER loop head instead (an
+// earlier, broader attempt) is unsound in general.
+func needsBitState(prog *syntax.Prog) bool {
+	bt := newBacktrack(prog)
+	for pc, nonGreedy := range bt.nonGreedyLoop {
+		if nonGreedy && loopBodyCanMatchEmpty(prog, bt.idom, pc) {
+			return true
+		}
+	}
+	return len(bt.memoInnerLoop) > 0
 }
 
 // appendBacktrackCodeEntry appends a size-prefixed backtracking capture body to cs.
@@ -136,9 +649,9 @@ func needsBitState(prog *syntax.Prog) bool {
 // modified inside the loop body at loopPC (reachable from inst.Out before
 // re-entering loopPC). Only those locals need snapshot save/restore.
 // Returns nil if no captures are inside the loop.
-func loopCaptureLocals(prog *syntax.Prog, loopPC int) []uint32 {
+func loopCaptureLocals(prog *syntax.Prog, idom []int, loopPC int) []uint32 {
 	visited := make([]bool, len(prog.Inst))
-	queue := []int{loopBodyStart(prog, loopPC)}
+	queue := []int{loopBodyStart(prog, idom, loopPC)}
 	seen := make(map[uint32]bool)
 	var locals []uint32
 	for len(queue) > 0 {
@@ -172,8 +685,8 @@ func loopCaptureLocals(prog *syntax.Prog, loopPC int) []uint32 {
 	return locals
 }
 
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
-	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32) []byte {
+	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, winScratchOff)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -182,7 +695,24 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // The caller (wrapper) has already located the match extent via find_internal and
 // passes a bounded slice (ptr=match_start, len=match_length). This function runs
 // Phase 2 NFA only — no Phase 1 DFA traversal.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
+//
+// nativeAnchored is true when this captureBody is exported directly as the
+// pattern's groups function (compiledPattern.anchored, isAnchoredFind) instead
+// of being composed behind a find wrapper — in that case len is the caller's
+// full input length, not a DFA-narrowed match extent (see engine_tdfa.go's
+// identically-named parameter for the TDFA-side counterpart of this fix).
+//
+// winScratchOff (-1 = off) switches this body into WINDOW MODE, the fix for
+// FUZZER_BUGS.md #26 and FABLE.md B13. In window mode the wrapper stops
+// narrowing: it passes the caller's real (ptr,len) and stashes the match
+// window as an (startOff,endOff) pair at this table-memory offset. This
+// body then starts at pos=startOff, accepts at pos==endOff, and records
+// capture positions already relative to the true ptr — so \b/\B, \A, \z,
+// (?m:^) and (?m:$) all see the real input edges and need no side-channel
+// fix-up, and the wrapper needs no per-slot rebasing pass afterwards.
+// Byte consumption is still bounded by endOff (limitLocal), so window mode
+// explores exactly the same positions the narrowed slice used to.
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32) []byte {
 	prog := bt.prog
 	N := len(prog.Inst)
 	numCaps := bt.numGroups
@@ -209,7 +739,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	loopSnapLocals := make(map[int][]uint32, len(loopPCsSorted)) // loop PC → which cap locals to snap
 	snapTotal := 0
 	for _, pc := range loopPCsSorted {
-		locals := loopCaptureLocals(prog, pc)
+		locals := loopCaptureLocals(prog, bt.idom, pc)
 		if len(locals) > 0 {
 			loopSnapBase[pc] = baseExtra + uint32(snapTotal)
 			loopSnapLocals[pc] = locals
@@ -217,8 +747,47 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		}
 	}
 
+	// loopEntryLocalIdx[headPC] = local variable index holding the position
+	// at which that loop instance was entered — see loopEntryOutOf's doc and
+	// FUZZER_BUGS.md #20. Placed after the snapshot locals.
+	entryPCsSorted := entryLoopPCsSorted(bt)
+	entryBase := baseExtra + uint32(snapTotal)
+	loopEntryLocalIdx := make(map[int]uint32, len(entryPCsSorted))
+	for j, pc := range entryPCsSorted {
+		loopEntryLocalIdx[pc] = entryBase + uint32(j)
+	}
+
+	// extraFrameLocals: every loop_pos/loop_entry tracker, plus every
+	// per-loop capture snapshot slot (loopSnapBase/loopSnapLocals), saved
+	// into and restored from every backtrack frame like captures already
+	// are — see btPushFrame's and btNumLoopFrameLocals's docs and
+	// FUZZER_BUGS.md #28. The snapshot slots are included here (and not for
+	// the no-capture bodies, which have none) because they're per-loop-
+	// instance state read by the very same zero-progress guard
+	// (restoreLoopSnap) as the trackers, and go stale the same way.
+	//
+	// Narrowing this to only bt.emptyBodyGreedyLoop heads was tried and
+	// reverted: it broke non-greedy loops (e.g. `^(?:(?:(?:a*?){0,}))$`)
+	// and other loop shapes outside bug 28's specific repro class — see
+	// FUZZER_BUGS.md #28's "Confidence"/investigation notes. All bt.loops
+	// heads need this, not just the empty-body-greedy subset.
+	extraFrameLocals := make([]uint32, 0, len(loopPCsSorted)+len(entryPCsSorted)+snapTotal)
+	for _, pc := range loopPCsSorted {
+		extraFrameLocals = append(extraFrameLocals, loopLocalIdx[pc])
+	}
+	for _, pc := range entryPCsSorted {
+		extraFrameLocals = append(extraFrameLocals, loopEntryLocalIdx[pc])
+	}
+	for _, pc := range loopPCsSorted {
+		if snapBase, ok := loopSnapBase[pc]; ok {
+			for k := range loopSnapLocals[pc] {
+				extraFrameLocals = append(extraFrameLocals, snapBase+uint32(k))
+			}
+		}
+	}
+
 	// Memo locals (only when useMemo=true), placed after all existing locals.
-	memoLocalsBase := baseExtra + uint32(snapTotal)
+	memoLocalsBase := entryBase + uint32(len(entryPCsSorted))
 	var (
 		memoLenPlus1 uint32 // localLen + 1, pre-computed at entry
 		memoBitIdx   uint32 // state * lenPlus1 + pos
@@ -234,13 +803,27 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		memoZeroLen = memoLocalsBase + 4
 	}
 
-	// Total non-param locals: pos, sp, state, scratch, cap0s, cap0e, ...,
-	// loop_pos..., loop_snap..., (memo locals when useMemo)
+	// Window-mode locals (see winScratchOff): the match window's start and
+	// end offsets, loaded once from scratch at entry. Placed last so no
+	// existing local index shifts.
+	useWindow := winScratchOff >= 0
 	memoLocalsCount := 0
 	if useMemo {
 		memoLocalsCount = 5
 	}
-	totalLocals := 4 + numCapLocals + len(loopPCsSorted) + snapTotal + memoLocalsCount
+	winStartLocal := memoLocalsBase + uint32(memoLocalsCount)
+	winEndLocal := winStartLocal + 1
+	limitLocal := uint32(localLen)
+	winLocalsCount := 0
+	if useWindow {
+		limitLocal = winEndLocal
+		winLocalsCount = 2
+	}
+
+	// Total non-param locals: pos, sp, state, scratch, cap0s, cap0e, ...,
+	// loop_pos..., loop_snap..., loop_entry..., (memo locals when useMemo),
+	// (window locals when useWindow)
+	totalLocals := 4 + numCapLocals + len(loopPCsSorted) + snapTotal + len(entryPCsSorted) + memoLocalsCount + winLocalsCount
 
 	var body []byte
 
@@ -249,8 +832,29 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	body = utils.AppendULEB128(body, uint32(totalLocals))
 	body = append(body, 0x7F)
 
-	// ── Initialise pos=0, sp=stackBase, state=prog.Start ────────────────────
-	body = append(body, 0x41, 0x00)     // i32.const 0
+	// ── Window offsets (window mode only) ───────────────────────────────────
+	// Loaded once; winStart also seeds pos, and winEnd is the consumption
+	// limit every bounds check and InstMatch tests against.
+	if useWindow {
+		body = append(body, 0x41)
+		body = utils.AppendSLEB128(body, winScratchOff)
+		body = appendTableLoad32(body, tableMemIdx, 0) // startOff
+		body = append(body, 0x21)
+		body = utils.AppendULEB128(body, winStartLocal)
+
+		body = append(body, 0x41)
+		body = utils.AppendSLEB128(body, winScratchOff)
+		body = appendTableLoad32(body, tableMemIdx, 4) // endOff
+		body = append(body, 0x21)
+		body = utils.AppendULEB128(body, winEndLocal)
+	}
+
+	// ── Initialise pos=startOff, sp=stackBase, state=prog.Start ─────────────
+	if useWindow {
+		body = btLocalGet(body, winStartLocal)
+	} else {
+		body = append(body, 0x41, 0x00) // i32.const 0
+	}
 	body = append(body, 0x21, localPos) // local.set pos
 
 	body = append(body, 0x41)
@@ -269,14 +873,22 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	}
 
 	// ── Initialise loop_pos locals to -1 ────────────────────────────────────
-	for _, loopLocal := range loopLocalIdx {
+	// Iterate loopPCsSorted, not loopLocalIdx directly — map iteration order
+	// is randomized per-process and would make the emitted WASM bytes
+	// non-deterministic (the instructions themselves are order-independent,
+	// but byte-for-byte reproducibility matters for caching/testing).
+	for _, pc := range loopPCsSorted {
 		body = append(body, 0x41, 0x7F) // i32.const -1
 		body = append(body, 0x21)       // local.set
-		body = utils.AppendULEB128(body, loopLocal)
+		body = utils.AppendULEB128(body, loopLocalIdx[pc])
 	}
 
 	// ── Initialise loop snapshot locals to -1 ───────────────────────────────
-	for pc, snapBase := range loopSnapBase {
+	for _, pc := range loopPCsSorted {
+		snapBase, ok := loopSnapBase[pc]
+		if !ok {
+			continue
+		}
 		for k := range loopSnapLocals[pc] {
 			body = append(body, 0x41, 0x7F) // i32.const -1
 			body = append(body, 0x21)
@@ -284,10 +896,38 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		}
 	}
 
+	// ── Initialise loop entry-pos locals ────────────────────────────────────
+	// -1 sentinel normally; loopEntryAtStart heads (no external entry PC —
+	// see its doc) get this attempt's own start position (whatever pos was
+	// initialised to above) instead, since there's no instruction to write
+	// it for them at runtime.
+	for _, pc := range entryPCsSorted {
+		if bt.loopEntryAtStart[pc] {
+			if useWindow {
+				body = btLocalGet(body, winStartLocal)
+			} else {
+				body = append(body, 0x41, 0x00) // i32.const 0
+			}
+		} else {
+			body = append(body, 0x41, 0x7F) // i32.const -1
+		}
+		body = append(body, 0x21) // local.set
+		body = utils.AppendULEB128(body, loopEntryLocalIdx[pc])
+	}
+
 	// ── Part 3: Memo table zero-init and lenPlus1 pre-computation ───────────
 	if useMemo {
-		// lenPlus1 = localLen + 1
-		body = append(body, 0x20, localLen)
+		// lenPlus1 = window length + 1 (localLen + 1 outside window mode).
+		// Keeping the memo table window-sized, rather than input-sized, is
+		// what keeps window mode's memo zero-init cost identical to the
+		// narrowed slice's — positions are rebased by winStart at each probe.
+		if useWindow {
+			body = btLocalGet(body, winEndLocal)
+			body = btLocalGet(body, winStartLocal)
+			body = append(body, 0x6B) // i32.sub
+		} else {
+			body = append(body, 0x20, localLen)
+		}
 		body = append(body, 0x41, 0x01) // i32.const 1
 		body = append(body, 0x6A)       // i32.add
 		body = append(body, 0x21)
@@ -358,8 +998,19 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		body = utils.AppendULEB128(body, capStartLocal(0)+uint32(i))
 	}
 
-	// Restore retry PC from mem[sp + 4 + numCapLocals*4]
-	retryPCOffset := uint32(4 + numCapLocals*4)
+	// Restore extraFrameLocals (loop_pos/loop_entry trackers) from
+	// mem[sp+4+numCapLocals*4 ..] — see btPushFrame's doc and
+	// FUZZER_BUGS.md #28.
+	extraOff := uint32(4 + numCapLocals*4)
+	for i, localIdx := range extraFrameLocals {
+		body = append(body, 0x20, localSP)
+		body = appendTableLoad32(body, tableMemIdx, extraOff+uint32(i*4))
+		body = append(body, 0x21) // local.set
+		body = utils.AppendULEB128(body, localIdx)
+	}
+
+	// Restore retry PC from mem[sp + 4 + numCapLocals*4 + len(extraFrameLocals)*4]
+	retryPCOffset := extraOff + uint32(len(extraFrameLocals)*4)
 	body = append(body, 0x20, localSP)
 	body = appendTableLoad32(body, tableMemIdx, retryPCOffset)
 	body = append(body, 0x21, localState) // local.set state
@@ -401,13 +1052,81 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopSnapBase, loopSnapLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nil, nil, tableMemIdx)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopEntryLocalIdx, loopSnapBase, loopSnapLocals, extraFrameLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, limitLocal, winStartLocal, useWindow)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
 	body = append(body, 0x0B)       // end loop $run
 	body = append(body, 0x41, 0x7F) // i32.const -1 (unreachable fallthrough)
 	body = append(body, 0x0B)       // end function
+	return body
+}
+
+// emitBitStateGuard emits the shared BitState "already visited (p, pos)?
+// fail : mark visited" check — used both for non-greedy empty-body loop
+// heads (bt.nonGreedyLoop) and for bt.memoInnerLoop PCs (FUZZER_BUGS.md
+// #18). brDepth is the br depth to restart $run from inside this one
+// WASM-level if-block (callers pass brRunNested; the enclosing Go-level
+// `if useMemo && ...` around the call site is compile-time only and adds no
+// WASM nesting).
+func emitBitStateGuard(body []byte, p int, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte uint32, memoTableBase int32, tableMemIdx int, brDepth uint32, winStartLocal uint32, useWindow bool) []byte {
+	// bitIdx = p * lenPlus1 + (localPos - winStart)
+	// (p is the compile-time PC, baked as i32.const; the winStart rebase is
+	// window mode's only per-probe cost — the table stays window-sized.)
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, int32(p))
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoLenPlus1Local)
+	body = append(body, 0x6C) // i32.mul
+	body = append(body, 0x20, localPos)
+	if useWindow {
+		body = btLocalGet(body, winStartLocal)
+		body = append(body, 0x6B) // i32.sub (rebase into the window)
+	}
+	body = append(body, 0x6A) // i32.add
+	body = append(body, 0x22) // local.tee
+	body = utils.AppendULEB128(body, memoBitIdx)
+
+	// byteAddr = memoTableBase + bitIdx / 8
+	body = append(body, 0x41, 0x03)
+	body = append(body, 0x76) // i32.shr_u (/ 8)
+	body = append(body, 0x41)
+	body = utils.AppendSLEB128(body, memoTableBase)
+	body = append(body, 0x6A) // i32.add
+	body = append(body, 0x22) // local.tee
+	body = utils.AppendULEB128(body, memoByteAddr)
+
+	// memoByte = mem[byteAddr]
+	body = appendTableLoad8u(body, tableMemIdx) // i32.load8_u (memo byte)
+	body = append(body, 0x22)                   // local.tee
+	body = utils.AppendULEB128(body, memoMemoByte)
+
+	// check bit: (memoByte >> (bitIdx & 7)) & 1
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoBitIdx)
+	body = append(body, 0x41, 0x07)
+	body = append(body, 0x71) // i32.and (&7)
+	body = append(body, 0x76) // i32.shr_u
+	body = append(body, 0x41, 0x01)
+	body = append(body, 0x71)       // i32.and (&1)
+	body = append(body, 0x04, 0x40) // if void
+	// already visited → fail
+	body = btFail(body, brDepth)
+	body = append(body, 0x0B) // end if
+
+	// set bit: mem[byteAddr] = memoByte | (1 << (bitIdx & 7))
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoByteAddr)
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoMemoByte)
+	body = append(body, 0x41, 0x01) // i32.const 1  (value to shift)
+	body = append(body, 0x20)
+	body = utils.AppendULEB128(body, memoBitIdx)
+	body = append(body, 0x41, 0x07)
+	body = append(body, 0x71)                   // i32.and (&7) (shift amount)
+	body = append(body, 0x74)                   // i32.shl: 1 << (bitIdx & 7)
+	body = append(body, 0x72)                   // i32.or
+	body = appendTableStore8(body, tableMemIdx) // i32.store8 to memo table
 	return body
 }
 
@@ -429,41 +1148,93 @@ func emitBTInstHandler(
 	inst syntax.Inst,
 	brRun uint32,
 	loopLocalIdx map[int]uint32,
+	loopEntryLocalIdx map[int]uint32,
 	loopSnapBase map[int]uint32,
 	loopSnapLocals map[int][]uint32,
+	extraFrameLocals []uint32,
 	stackLimit, frameSize int32,
 	numCapLocals int,
 	memoTableBase int32,
 	memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte uint32,
 	useMemo bool,
 	noCaptures bool,
+	nativeAnchored bool,
 	instMatchFn func([]byte, uint32) []byte,
-	overflowFn func([]byte) []byte,
+	overflowFn func([]byte, uint32) []byte,
 	tableMemIdx int,
+	limitLocal, winStartLocal uint32,
+	useWindow bool,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
 
+	// bt.loopEntryOutOf[p]/bt.loopEntryArgOf[p]: this PC is an external entry
+	// point into an emptyBodyGreedyLoop's body (its first-entry twin for a
+	// `*`/`?`-shaped loop, or the mandatory predecessor for a `+`-shaped
+	// loop) via its Out or Arg edge respectively — record the position at
+	// which this loop instance began, for that loop's own zero-progress
+	// guard to consult (FUZZER_BUGS.md #20). See loopEntryOutOf's doc.
+	//
+	// The write must happen at the point control actually transfers via the
+	// qualifying edge, not unconditionally at handler entry: p may fail its
+	// own check (bounds/rune/assertion) and btFail instead of reaching
+	// Out/Arg at all, in which case the loop is never entered on this path
+	// and writing early would leave a stale, wrong value behind for
+	// whenever the loop's own guard next reads it.
+	//
+	// Out always transfers immediately, so writeLoopEntryOut is folded into
+	// contOut, the single choke point every case already uses to branch to
+	// inst.Out via brRun (never brRunNested — that's a different, nested
+	// exit). Arg is different: it transfers either via a direct exit branch
+	// or via a pushed-then-later-popped retry frame — writeLoopEntryArg must
+	// be called explicitly at each such site (right before the branch, or
+	// right before the push: loopEntryLocalIdx is itself part of
+	// extraFrameLocals, saved/restored per frame, so writing it immediately
+	// before the push is exactly equivalent to writing it at the later pop).
+	// Conflating the two edges into one write keyed only on p — the original
+	// design — silently corrupted loopEntryLocalIdx whenever the qualifying
+	// edge was Arg instead of Out (FUZZER_BUGS.md #37).
+	writeLoopEntryOut := func(b []byte) []byte {
+		if headPC, ok := bt.loopEntryOutOf[p]; ok {
+			b = append(b, 0x20, localPos) // local.get pos (already past any consumed byte)
+			b = append(b, 0x21)           // local.set
+			b = utils.AppendULEB128(b, loopEntryLocalIdx[headPC])
+		}
+		return b
+	}
+	writeLoopEntryArg := func(b []byte) []byte {
+		if headPC, ok := bt.loopEntryArgOf[p]; ok {
+			b = append(b, 0x20, localPos) // local.get pos (already past any consumed byte)
+			b = append(b, 0x21)           // local.set
+			b = utils.AppendULEB128(b, loopEntryLocalIdx[headPC])
+		}
+		return b
+	}
+	contOut := func(b []byte) []byte {
+		b = writeLoopEntryOut(b)
+		return btSetStateAndBr(b, int32(inst.Out), brRun)
+	}
+
 	switch inst.Op {
 	case syntax.InstRune1:
-		body = btBoundsCheck(body, brRunNested)
+		body = btBoundsCheck(body, brRunNested, limitLocal)
 		body = btCheckRune1(body, inst, brRunNested)
 		body = btAdvancePos(body)
-		body = btSetStateAndBr(body, int32(inst.Out), brRun)
+		body = contOut(body)
 
 	case syntax.InstRune:
-		body = btBoundsCheck(body, brRunNested)
+		body = btBoundsCheck(body, brRunNested, limitLocal)
 		body = btCheckRuneRanges(body, inst, brRunNested)
 		body = btAdvancePos(body)
-		body = btSetStateAndBr(body, int32(inst.Out), brRun)
+		body = contOut(body)
 
 	case syntax.InstRuneAny:
-		body = btBoundsCheck(body, brRunNested)
+		body = btBoundsCheck(body, brRunNested, limitLocal)
 		body = btAdvancePos(body)
-		body = btSetStateAndBr(body, int32(inst.Out), brRun)
+		body = contOut(body)
 
 	case syntax.InstRuneAnyNotNL:
-		body = btBoundsCheck(body, brRunNested)
+		body = btBoundsCheck(body, brRunNested, limitLocal)
 		// if input[pos] == '\n' → fail
 		body = append(body, 0x20, localPtr)
 		body = append(body, 0x20, localPos)
@@ -475,14 +1246,24 @@ func emitBTInstHandler(
 		body = btFail(body, brRunNested)
 		body = append(body, 0x0B) // end if
 		body = btAdvancePos(body)
-		body = btSetStateAndBr(body, int32(inst.Out), brRun)
+		body = contOut(body)
 
 	case syntax.InstAlt, syntax.InstAltMatch:
 		isLoop := bt.loops[p]
 		if !isLoop {
-			// Non-loop alternation: push retry=inst.Arg, continue with inst.Out
-			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, overflowFn, tableMemIdx)
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			// Non-loop alternation: push retry=inst.Arg, continue with inst.Out.
+			//
+			// bt.memoInnerLoop[p]: this PC nonetheless cycles back to itself
+			// (FUZZER_BUGS.md #18) but isn't a registered loop head, so it has
+			// no zero-progress guard at all — memoise it the same way a
+			// non-greedy empty-body loop head is memoised below, to bound the
+			// otherwise-unlimited retry growth. See bt.memoInnerLoop's doc.
+			if useMemo && bt.memoInnerLoop[p] {
+				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested, winStartLocal, useWindow)
+			}
+			body = writeLoopEntryArg(body)
+			body = btPushFrame(body, numCapLocals, extraFrameLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
+			body = contOut(body)
 		} else {
 			// Loop alternation: zero-progress guard
 			loopLocal := loopLocalIdx[p]
@@ -490,70 +1271,27 @@ func emitBTInstHandler(
 			// ── Part 4: BitState bit check/set ───────────────────────────────
 			// Only for non-greedy loop heads with zero-matchable bodies.
 			// Greedy loops are correctly handled by the zero-progress guard below.
-			// From inside the if-block: depth 0 = this if, depth 1 = brRun depth.
-			// So brRunNested is the correct depth to restart $run from here.
-			if useMemo && inst.Arg < uint32(p) {
-				// bitIdx = p * lenPlus1 + localPos
-				// (p is the compile-time PC, baked as i32.const)
-				body = append(body, 0x41)
-				body = utils.AppendSLEB128(body, int32(p))
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoLenPlus1Local)
-				body = append(body, 0x6C) // i32.mul
-				body = append(body, 0x20, localPos)
-				body = append(body, 0x6A) // i32.add
-				body = append(body, 0x22) // local.tee
-				body = utils.AppendULEB128(body, memoBitIdx)
-
-				// byteAddr = memoTableBase + bitIdx / 8
-				body = append(body, 0x41, 0x03)
-				body = append(body, 0x76) // i32.shr_u (/ 8)
-				body = append(body, 0x41)
-				body = utils.AppendSLEB128(body, memoTableBase)
-				body = append(body, 0x6A) // i32.add
-				body = append(body, 0x22) // local.tee
-				body = utils.AppendULEB128(body, memoByteAddr)
-
-				// memoByte = mem[byteAddr]
-				body = appendTableLoad8u(body, tableMemIdx) // i32.load8_u (memo byte)
-				body = append(body, 0x22)                   // local.tee
-				body = utils.AppendULEB128(body, memoMemoByte)
-
-				// check bit: (memoByte >> (bitIdx & 7)) & 1
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoBitIdx)
-				body = append(body, 0x41, 0x07)
-				body = append(body, 0x71) // i32.and (&7)
-				body = append(body, 0x76) // i32.shr_u
-				body = append(body, 0x41, 0x01)
-				body = append(body, 0x71)       // i32.and (&1)
-				body = append(body, 0x04, 0x40) // if void
-				// already visited → fail (brRunNested: depth 0=this if, +brRun=$run)
-				body = btFail(body, brRunNested)
-				body = append(body, 0x0B) // end if
-
-				// set bit: mem[byteAddr] = memoByte | (1 << (bitIdx & 7))
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoByteAddr)
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoMemoByte)
-				body = append(body, 0x41, 0x01) // i32.const 1  (value to shift)
-				body = append(body, 0x20)
-				body = utils.AppendULEB128(body, memoBitIdx)
-				body = append(body, 0x41, 0x07)
-				body = append(body, 0x71)                   // i32.and (&7) (shift amount)
-				body = append(body, 0x74)                   // i32.shl: 1 << (bitIdx & 7)
-				body = append(body, 0x72)                   // i32.or
-				body = appendTableStore8(body, tableMemIdx) // i32.store8 to memo table
+			if useMemo && bt.nonGreedyLoop[p] {
+				body = emitBitStateGuard(body, p, memoLenPlus1Local, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested, winStartLocal, useWindow)
 			}
 
-			// For greedy: Out < PC means body=Out(backward), exit=Arg(forward)
-			// For non-greedy: Arg < PC means body=Arg(backward), exit=Out(forward)
+			// For greedy loops: body=Out, exit=Arg. For non-greedy: body=Arg, exit=Out.
+			// bt.nonGreedyLoop[p] was determined in newBacktrack via altLoopBody
+			// (an actual reachability check), not by comparing PC numbers.
 			// In both cases: preferred=inst.Out, retry=inst.Arg.
-			// Zero-progress: if pos == loop_pos_local, take the EXIT branch directly.
-			// Greedy (Out < PC): exit = Arg.  Non-greedy (Arg < PC): exit = Out.
-			// Without this guard, non-greedy loops with zero-matchable bodies would
-			// take the body again and loop infinitely.
+			// Zero-progress: if pos == loop_pos_local, the preferred branch (Out)
+			// matched zero bytes and retrying it would loop forever.
+			restoreLoopSnap := func(b []byte) []byte {
+				if snapBase, ok := loopSnapBase[p]; ok {
+					for k, capLocal := range loopSnapLocals[p] {
+						b = append(b, 0x20)
+						b = utils.AppendULEB128(b, snapBase+uint32(k))
+						b = append(b, 0x21)
+						b = utils.AppendULEB128(b, capLocal)
+					}
+				}
+				return b
+			}
 
 			// if pos == loop_pos_local: take exit branch
 			body = append(body, 0x20, localPos)
@@ -561,22 +1299,66 @@ func emitBTInstHandler(
 			body = utils.AppendULEB128(body, loopLocal)
 			body = append(body, 0x46)       // i32.eq
 			body = append(body, 0x04, 0x40) // if void
-			// Restore only the specific cap locals snapshotted for this loop.
-			if snapBase, ok := loopSnapBase[p]; ok {
-				for k, capLocal := range loopSnapLocals[p] {
-					body = append(body, 0x20)
-					body = utils.AppendULEB128(body, snapBase+uint32(k))
-					body = append(body, 0x21)
-					body = utils.AppendULEB128(body, capLocal)
-				}
+			if bt.nonGreedyLoop[p] {
+				// Exit is Out, which is never pushed as a retry candidate (only
+				// Arg=body is) — nothing to pop back to, branch directly.
+				body = restoreLoopSnap(body)
+				body = writeLoopEntryOut(body)
+				body = btSetStateAndBr(body, int32(inst.Out), brRunNested)
+			} else if bt.emptyBodyGreedyLoop[p] {
+				// Greedy loop whose body can match empty (e.g. the outer `*`
+				// in (?:a*|b*)*, or ` (\B|0)*`/` (\b|0*)*` —
+				// FUZZER_BUGS.md #19/#20). Go stdlib's actual leftmost-first
+				// answer here depends on whether THIS SPECIFIC LOOP has made
+				// any real forward progress since it was entered — not since
+				// the whole match attempt began (a mandatory prefix before
+				// the loop makes those two positions differ — #20), and not
+				// "never, unconditionally" (a body with no nested loop can
+				// still have made real progress in an earlier iteration
+				// before a later one resolves via a zero-width leaf
+				// assertion — #19). loopEntryLocalIdx[p] holds the position
+				// at which this loop's first-entry twin instruction last ran
+				// (see loopEntryOutOf's doc) — the correct, per-loop-instance
+				// reference point, in place of both the old unconditional
+				// exit and the old attempt_start comparison:
+				//
+				//   - pos == loopEntry (no bytes consumed by this loop
+				//     instance at all yet): the loop's own exit legitimately
+				//     wins outright — branch directly, same as the
+				//     non-greedy case.
+				//   - pos != loopEntry (real progress happened at some point
+				//     during this loop instance, even though *this*
+				//     iteration was zero-width): fail into the normal
+				//     backtrack-stack pop instead of exiting directly, so a
+				//     still-pending sibling alternative from within this same
+				//     doomed iteration (e.g. the "b*"/"0"/"0*" side, pushed
+				//     by the inner alternation just before the zero-width
+				//     branch ran) gets tried before the loop gives up.
+				//     Branching straight to exit here discarded that
+				//     candidate. btFail's own restore already recovers
+				//     captures from whichever frame it lands on, so no
+				//     manual snapshot restore is needed on this path.
+				body = append(body, 0x20, localPos)
+				body = append(body, 0x20)
+				body = utils.AppendULEB128(body, loopEntryLocalIdx[p])
+				body = append(body, 0x46)       // i32.eq
+				body = append(body, 0x04, 0x40) // if void
+				body = restoreLoopSnap(body)
+				body = writeLoopEntryArg(body)
+				body = btSetStateAndBr(body, int32(inst.Arg), brRunNested+1)
+				body = append(body, 0x05) // else
+				body = btFail(body, brRunNested+1)
+				body = append(body, 0x0B) // end if (pos == loopEntry)
+			} else {
+				// Greedy loop whose body can never match empty: this branch
+				// can't actually be reached (every completed iteration
+				// consumed ≥1 byte, so pos always differs from loop_local),
+				// kept for structural symmetry with the general case.
+				body = restoreLoopSnap(body)
+				body = writeLoopEntryArg(body)
+				body = btSetStateAndBr(body, int32(inst.Arg), brRunNested)
 			}
-			// Exit = Arg for greedy (Out < PC), Out for non-greedy (Arg < PC).
-			exitPC := inst.Arg
-			if inst.Arg < uint32(p) { // non-greedy: body=Arg, exit=Out
-				exitPC = inst.Out
-			}
-			body = btSetStateAndBr(body, int32(exitPC), brRunNested)
-			body = append(body, 0x0B) // end if
+			body = append(body, 0x0B) // end if (pos == loop_local)
 
 			// Progress: update loop_pos_local = pos
 			body = append(body, 0x20, localPos)
@@ -594,14 +1376,15 @@ func emitBTInstHandler(
 			}
 
 			// Push retry=inst.Arg, continue with inst.Out
-			body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, overflowFn, tableMemIdx)
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			body = writeLoopEntryArg(body)
+			body = btPushFrame(body, numCapLocals, extraFrameLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
+			body = contOut(body)
 		}
 
 	case syntax.InstCapture:
 		if noCaptures {
 			// No capture tracking — treat as NOP, follow inst.Out.
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			body = contOut(body)
 			break
 		}
 		// inst.Arg: even = open (store pos as group start), odd = close (store pos as group end)
@@ -616,7 +1399,7 @@ func emitBTInstHandler(
 		body = append(body, 0x20, localPos) // local.get pos
 		body = append(body, 0x21)           // local.set
 		body = utils.AppendULEB128(body, local)
-		body = btSetStateAndBr(body, int32(inst.Out), brRun)
+		body = contOut(body)
 
 	case syntax.InstEmptyWidth:
 		emptyOp := syntax.EmptyOp(inst.Arg)
@@ -624,6 +1407,8 @@ func emitBTInstHandler(
 		case emptyOp&syntax.EmptyBeginLine != 0:
 			// (?m:^): fires at pos==0 or when prev byte is '\n'
 			// Fail if: pos != 0 AND mem[ptr + pos - 1] != '\n'
+			// pos is a true input offset under window mode, so this needs no
+			// edge fix-up (FABLE.md B13).
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x45)       // i32.eqz
 			body = append(body, 0x04, 0x40) // if void (pos == 0): ok
@@ -637,24 +1422,26 @@ func emitBTInstHandler(
 			body = append(body, 0x41, 0x0A)       // i32.const '\n'
 			body = append(body, 0x47)             // i32.ne
 			body = append(body, 0x04, 0x40)       // if void (prev != '\n'): fail
-			body = btFail(body, brRunNested)
-			body = append(body, 0x0B) // end if prev != '\n'
-			body = append(body, 0x0B) // end if pos == 0
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			body = btFail(body, brRunNested+1)    // +1: nested inside the outer if/else too
+			body = append(body, 0x0B)             // end if prev != '\n'
+			body = append(body, 0x0B)             // end if pos == 0
+			body = contOut(body)
 
 		case emptyOp&syntax.EmptyBeginText != 0:
-			// \A: fires only at pos==0 (beginning of match slice)
+			// \A: fires only at pos==0, which under window mode is the true
+			// start of the input (FABLE.md B13).
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x45)       // i32.eqz
 			body = append(body, 0x45)       // i32.eqz (NOT: nonzero = fail)
 			body = append(body, 0x04, 0x40) // if void
 			body = btFail(body, brRunNested)
 			body = append(body, 0x0B) // end if
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			body = contOut(body)
 
 		case emptyOp&syntax.EmptyEndLine != 0:
 			// (?m:$): fires at pos==len or when next byte is '\n'
 			// Fail if: pos != len AND mem[ptr + pos] != '\n'
+			// len is the true input length under window mode (FABLE.md B13).
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x20, localLen)
 			body = append(body, 0x46)       // i32.eq
@@ -667,35 +1454,33 @@ func emitBTInstHandler(
 			body = append(body, 0x41, 0x0A)       // i32.const '\n'
 			body = append(body, 0x47)             // i32.ne
 			body = append(body, 0x04, 0x40)       // if void (next != '\n'): fail
-			body = btFail(body, brRunNested)
-			body = append(body, 0x0B) // end if next != '\n'
-			body = append(body, 0x0B) // end if pos == len
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			body = btFail(body, brRunNested+1)    // +1: nested inside the outer if/else too
+			body = append(body, 0x0B)             // end if next != '\n'
+			body = append(body, 0x0B)             // end if pos == len
+			body = contOut(body)
 
 		case emptyOp&syntax.EmptyEndText != 0:
-			// \z: fires only at pos==len (end of match slice)
+			// \z: fires only at pos==len, which under window mode is the true
+			// end of the input (FABLE.md B13).
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x20, localLen)
 			body = append(body, 0x47)       // i32.ne
 			body = append(body, 0x04, 0x40) // if void
 			body = btFail(body, brRunNested)
 			body = append(body, 0x0B) // end if
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			body = contOut(body)
 
 		case emptyOp&syntax.EmptyWordBoundary != 0:
 			body = btWordBoundary(body, true, brRunNested)
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			body = contOut(body)
 
 		case emptyOp&syntax.EmptyNoWordBoundary != 0:
 			body = btWordBoundary(body, false, brRunNested)
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
-
-		default:
-			body = btSetStateAndBr(body, int32(inst.Out), brRun)
+			body = contOut(body)
 		}
 
 	case syntax.InstNop:
-		body = btSetStateAndBr(body, int32(inst.Out), brRun)
+		body = contOut(body)
 
 	case syntax.InstMatch:
 		if noCaptures && instMatchFn != nil {
@@ -703,19 +1488,35 @@ func emitBTInstHandler(
 			body = instMatchFn(body, brRunNested)
 			break
 		}
-		// RE2 semantics: only accept if the full input slice is consumed.
-		// The caller sets len = DFA-determined end, so pos must equal len.
-		body = append(body, 0x20, localPos)
-		body = append(body, 0x20, localLen)
-		body = append(body, 0x47)       // i32.ne
-		body = append(body, 0x04, 0x40) // if void
-		body = btFail(body, brRunNested)
-		body = append(body, 0x0B) // end if
+		if !nativeAnchored {
+			// RE2 semantics: only accept if the whole match window is
+			// consumed. limitLocal is localLen when the caller narrowed the
+			// slice, and the window end loaded from scratch under window
+			// mode (FABLE.md B13 option D).
+			body = append(body, 0x20, localPos)
+			body = btLocalGet(body, limitLocal)
+			body = append(body, 0x47)       // i32.ne
+			body = append(body, 0x04, 0x40) // if void
+			body = btFail(body, brRunNested)
+			body = append(body, 0x0B) // end if
+		}
+		// nativeAnchored: len is the caller's full, un-narrowed input length
+		// (no independent find pass has bounded it), so InstMatch must accept
+		// unconditionally here — any $/\z the pattern actually has was already
+		// enforced by the EmptyEndText/EmptyEndLine handlers earlier in this
+		// derivation, and BT's stack always explores the highest-priority
+		// (leftmost-first) derivation first, so the first InstMatch reached is
+		// the correct answer regardless of how much input remains unconsumed.
 
 		// Write captures to out_ptr and return pos.
-		// Group 0: start = 0 (anchored), end = pos.
+		// Group 0: start = where this attempt began (0 when the caller
+		// narrowed the slice, the window start under window mode), end = pos.
 		body = append(body, 0x20, localOutPtr)
-		body = append(body, 0x41, 0x00)     // i32.const 0 (group 0 start)
+		if useWindow {
+			body = btLocalGet(body, winStartLocal)
+		} else {
+			body = append(body, 0x41, 0x00) // i32.const 0 (group 0 start)
+		}
 		body = append(body, 0x36, 0x02)     // i32.store align=2
 		body = utils.AppendULEB128(body, 0) // offset=0
 
@@ -784,9 +1585,9 @@ func btAdvancePos(b []byte) []byte {
 }
 
 // btBoundsCheck emits: if pos >= len { fail(brDepth) }
-func btBoundsCheck(b []byte, brDepth uint32) []byte {
+func btBoundsCheck(b []byte, brDepth uint32, limitLocal uint32) []byte {
 	b = append(b, 0x20, localPos)
-	b = append(b, 0x20, localLen)
+	b = btLocalGet(b, limitLocal)
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x04, 0x40) // if void
 	b = btFail(b, brDepth)
@@ -811,12 +1612,12 @@ func btCheckRune1(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 		// (scratch == r || scratch == altR) → if NOT → fail
 		b = append(b, 0x20, localScratch)
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(r))
+		b = utils.AppendSLEB128(b, r)
 		b = append(b, 0x46) // i32.eq
 
 		b = append(b, 0x20, localScratch)
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(altR))
+		b = utils.AppendSLEB128(b, altR)
 		b = append(b, 0x46) // i32.eq
 
 		b = append(b, 0x72)       // i32.or
@@ -827,7 +1628,7 @@ func btCheckRune1(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 	} else {
 		b = append(b, 0x20, localScratch)
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(r))
+		b = utils.AppendSLEB128(b, r)
 		b = append(b, 0x47)       // i32.ne
 		b = append(b, 0x04, 0x40) // if void (no match)
 		b = btFail(b, brDepth)
@@ -906,12 +1707,12 @@ func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 	}
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(lo))
+	b = utils.AppendSLEB128(b, lo)
 	b = append(b, 0x4F) // i32.ge_u
 
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(hi))
+	b = utils.AppendSLEB128(b, hi)
 	b = append(b, 0x4D) // i32.le_u
 
 	b = append(b, 0x71) // i32.and → 0 or 1
@@ -924,14 +1725,56 @@ func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 	return b
 }
 
+// btOverflowFindReturn is the overflowFn for the i64-returning BT find bodies:
+// it returns abi.BTStackOverflow instead of a packed (start << 32 | end).
+//
+// It replaced a `br $run_exit` that abandoned only the current attempt_start
+// and let the scan continue. That could not produce a truthful answer. find
+// reports the *leftmost* match and scans attempt_start upward, so an overflow
+// at position k is only ever reached after every earlier start has already
+// failed: a match subsequently found at some start > k is not provably
+// leftmost, and running off the end of the input reports no-match, which is a
+// false negative. Every exit reachable after an overflow would therefore have
+// to report -2 anyway, so returning here is equivalent and far simpler.
+//
+// It also keeps the property the old `br` was chosen for over a pop-and-retry
+// (which could oscillate forever at the stack ceiling for nested nullable-loop
+// patterns): a `return` cannot be re-entered at all, so it is trivially
+// bounded. brDepth is unused — a return needs no branch depth.
+func btOverflowFindReturn(bb []byte, _ uint32) []byte {
+	bb = append(bb, 0x42) // i64.const abi.BTStackOverflow
+	bb = utils.AppendSLEB128(bb, abi.BTStackOverflow)
+	return append(bb, 0x0F) // return
+}
+
 // btPushFrame pushes a backtrack frame onto the stack:
-// mem[sp+0]               = pos
-// mem[sp+4..4+capLocals*4] = captures
-// mem[sp+retryPCOff]       = retryPC
+// mem[sp+0]                  = pos
+// mem[sp+4..4+capLocals*4]   = captures
+// mem[sp+extraOff..+extra*4] = extraLocals (loop_pos/loop_entry trackers)
+// mem[sp+retryPCOff]         = retryPC
 // btPushFrame pushes a backtrack frame. stackLimit and frameSize are passed
-// so we can guard against stack overflow: if sp+frameSize > stackLimit, set
-// state=-1 (fail) and return instead of writing past allocated memory.
-func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSize int32, overflowFn func([]byte) []byte, tableMemIdx int) []byte {
+// so we can guard against stack overflow: if sp+frameSize > stackLimit, bail
+// out instead of writing past allocated memory.
+//
+// The default bail-out (overflowFn == nil) returns abi.BTStackOverflow (-2),
+// NOT abi.NoMatch (-1). Overflow means the engine abandoned part of the search
+// space, so it does not know whether a match exists; returning -1 would report
+// a definite "no" it has not established. That was §N1 in plans/OPUS.md: a
+// false negative that appears once the input crosses numAlts*4096 bytes and is
+// indistinguishable from a real no-match at every layer above. Callers that
+// compose this body (the groups wrapper, the batch wrappers) must propagate -2
+// rather than folding it into their own "< 0 means no match" test.
+//
+// extraLocals: local indices of every loop_pos/loop_entry tracker in the
+// program (in the same fixed order the caller uses everywhere else), saved
+// into and restored from every frame exactly like captures already are.
+// These are per-loop-instance state (FUZZER_BUGS.md #28): once a loop head
+// has updated its tracker, popping back to a frame pushed *before* that
+// update must undo it too, or the loop head's zero-progress guard compares
+// the restored `pos` against a stale tracker value left over from an
+// abandoned deeper attempt and misclassifies a fresh loop entry as "already
+// made progress," discarding the correct backtrack continuation.
+func btPushFrame(b []byte, numCapLocals int, extraLocals []uint32, retryPC uint32, stackLimit, frameSize int32, brDepth uint32, overflowFn func([]byte, uint32) []byte, tableMemIdx int) []byte {
 	// Guard: if sp + frameSize > stackLimit → fail (treat as no-match).
 	b = append(b, 0x20, localSP)
 	b = append(b, 0x41)
@@ -942,10 +1785,11 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSi
 	b = append(b, 0x4B)       // i32.gt_u
 	b = append(b, 0x04, 0x40) // if void
 	if overflowFn != nil {
-		b = overflowFn(b)
+		b = overflowFn(b, brDepth)
 	} else {
-		b = append(b, 0x41, 0x7F) // i32.const -1
-		b = append(b, 0x0F)       // return
+		b = append(b, 0x41) // i32.const abi.BTStackOverflow
+		b = utils.AppendSLEB128(b, abi.BTStackOverflow)
+		b = append(b, 0x0F) // return
 	}
 	b = append(b, 0x0B) // end if
 
@@ -962,8 +1806,17 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSi
 		b = appendTableStore32(b, tableMemIdx, uint32(4+i*4))
 	}
 
-	// retry PC at offset 4 + numCapLocals*4
-	retryOff := uint32(4 + numCapLocals*4)
+	// extraLocals (loop_pos/loop_entry trackers) at offsets 4+numCapLocals*4, ...
+	extraOff := uint32(4 + numCapLocals*4)
+	for i, localIdx := range extraLocals {
+		b = append(b, 0x20, localSP)
+		b = append(b, 0x20)
+		b = utils.AppendULEB128(b, localIdx)
+		b = appendTableStore32(b, tableMemIdx, extraOff+uint32(i*4))
+	}
+
+	// retry PC at offset 4 + numCapLocals*4 + len(extraLocals)*4
+	retryOff := extraOff + uint32(len(extraLocals)*4)
 	b = append(b, 0x20, localSP)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(retryPC))
@@ -984,6 +1837,12 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSi
 //
 // Uses scratch local to hold loaded bytes.
 // Computes: prevIsWord XOR nextIsWord; check against wantBoundary.
+//
+// The captureBody's (ptr,len) are always the caller's true input under
+// window mode (see buildBacktrackBody's winScratchOff), so pos==0 / pos==len
+// are true input edges here and no side-channel edge context is needed —
+// this is what FUZZER_BUGS.md #26's (origPtr,origEnd) scratch used to
+// reconstruct for a narrowed slice.
 func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32) []byte {
 	// Compute prevIsWord (0 or 1) using block (result i32):
 	//   if pos == 0: push 0
@@ -1067,7 +1926,7 @@ func emitIsWordCharFromScratch(b []byte) []byte {
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('z'))
-	b = append(b, 0x4E)       // i32.le_u
+	b = append(b, 0x4D)       // i32.le_u
 	b = append(b, 0x71)       // i32.and
 	b = append(b, 0x04, 0x40) // if void
 	b = append(b, 0x41, 0x01) // i32.const 1
@@ -1082,7 +1941,7 @@ func emitIsWordCharFromScratch(b []byte) []byte {
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('Z'))
-	b = append(b, 0x4E)
+	b = append(b, 0x4D) // i32.le_u
 	b = append(b, 0x71)
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x41, 0x01)
@@ -1097,7 +1956,7 @@ func emitIsWordCharFromScratch(b []byte) []byte {
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('9'))
-	b = append(b, 0x4E)
+	b = append(b, 0x4D) // i32.le_u
 	b = append(b, 0x71)
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x41, 0x01)
@@ -1136,24 +1995,24 @@ func btFoldRune(r rune) rune {
 
 // compileBTProg parses pattern, strips captures, and compiles the NFA for use
 // in a no-capture BT match/find body.
-func compileBTProg(pattern string) (*syntax.Prog, error) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return nil, err
-	}
+// compileBTProg re-parses pattern into an NFA program with captures stripped.
+// Both call sites reach this only after the caller already parsed the same
+// pattern string successfully (via compile()/syntax.Parse earlier in
+// compilePattern), so the parse here cannot fail; syntax.Compile never
+// returns a non-nil error (see its stdlib source).
+func compileBTProg(pattern string) *syntax.Prog {
+	re, _ := syntax.Parse(pattern, syntax.Perl)
 	stripCaptures(re)
-	prog, err := syntax.Compile(re.Simplify())
-	if err != nil {
-		return nil, err
-	}
-	return prog, nil
+	prog, _ := syntax.Compile(re.Simplify())
+	return prog
 }
 
 // btAllocSizes returns (stackSize, memoSize) in bytes for a no-capture BT engine.
-// frameSize is always 8 (pos + retryPC, no cap slots).
+// frameSize is 8 (pos + retryPC, no cap slots) plus 4 bytes per loop_pos/
+// loop_entry tracker (FUZZER_BUGS.md #28) — see btNumLoopFrameLocals.
 // memoBudget is the maximum bytes to allocate for the BitState bitset.
 func btAllocSizes(bt *backtrack, useMemo bool, _ int, memoBudget int) (stackSize, memoSize int) {
-	frameSize := 8 // pos(4) + retryPC(4)
+	frameSize := 8 + btNumLoopFrameLocals(bt, false)*4 // pos(4) + extraLocals + retryPC(4)
 	maxFrames := bt.numAlts * 4096
 	if maxFrames < 4096 {
 		maxFrames = 4096
@@ -1163,16 +2022,6 @@ func btAllocSizes(bt *backtrack, useMemo bool, _ int, memoBudget int) (stackSize
 		memoSize = memoBudget
 	}
 	return
-}
-
-// btMemoMaxLenFor returns the maximum input length supported by BitState memo
-// for a prog with the given budget (bytes).
-func btMemoMaxLenFor(prog *syntax.Prog, memoBudget int) int {
-	N := len(prog.Inst)
-	if N == 0 {
-		return 0
-	}
-	return memoBudget*8/N - 1
 }
 
 // nfaFirstBytes walks the NFA from prog.Start via epsilon transitions and
@@ -1345,18 +2194,42 @@ func buildBTInnerDisp(
 	body []byte,
 	bt *backtrack,
 	loopLocalIdx map[int]uint32,
+	loopEntryLocalIdx map[int]uint32,
 	stackBase, stackLimit, frameSize int32,
 	memoTableBase int32,
 	memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte uint32,
 	useMemo bool,
 	failEmptyStack func([]byte) []byte,
 	instMatchFn func([]byte, uint32) []byte,
-	overflowFn func([]byte) []byte,
+	overflowFn func([]byte, uint32) []byte,
 	tableMemIdx int,
 ) []byte {
 	numCapLocals := 0
 	prog := bt.prog
 	N := len(prog.Inst)
+
+	// extraFrameLocals: every loop_pos/loop_entry tracker, saved into and
+	// restored from every backtrack frame like captures already are — see
+	// btPushFrame's doc and FUZZER_BUGS.md #28. Order must match the caller's
+	// loopLocalIdx/loopEntryLocalIdx local assignment: loopPCsSorted first
+	// (bt.loops keys, sorted), then entryLoopPCsSorted(bt).
+	//
+	// Narrowing this to only bt.emptyBodyGreedyLoop heads was tried and
+	// reverted: it broke non-greedy loops and other loop shapes outside
+	// bug 28's specific repro class — see buildBacktrackBody's matching note.
+	loopPCsSorted := make([]int, 0, len(bt.loops))
+	for pc := range bt.loops {
+		loopPCsSorted = append(loopPCsSorted, pc)
+	}
+	sort.Ints(loopPCsSorted)
+	entryPCsSorted := entryLoopPCsSorted(bt)
+	extraFrameLocals := make([]uint32, 0, len(loopPCsSorted)+len(entryPCsSorted))
+	for _, pc := range loopPCsSorted {
+		extraFrameLocals = append(extraFrameLocals, loopLocalIdx[pc])
+	}
+	for _, pc := range entryPCsSorted {
+		extraFrameLocals = append(extraFrameLocals, loopEntryLocalIdx[pc])
+	}
 
 	// ── FAIL handler (state == -1) ──
 	body = append(body, 0x20, localState, 0x41, 0x7F, 0x46, 0x04, 0x40) // state==-1; if void
@@ -1373,8 +2246,16 @@ func buildBTInnerDisp(
 	body = append(body, 0x20, localSP)
 	body = appendTableLoad32(body, tableMemIdx, 0)
 	body = append(body, 0x21, localPos)
-	// Restore retryPC = mem[sp+4]
-	retryOff := uint32(4 + numCapLocals*4)
+	// Restore extraFrameLocals from mem[sp+4+numCapLocals*4 ..]
+	extraOff := uint32(4 + numCapLocals*4)
+	for i, localIdx := range extraFrameLocals {
+		body = append(body, 0x20, localSP)
+		body = appendTableLoad32(body, tableMemIdx, extraOff+uint32(i*4))
+		body = append(body, 0x21)
+		body = utils.AppendULEB128(body, localIdx)
+	}
+	// Restore retryPC = mem[sp+4+numCapLocals*4+len(extraFrameLocals)*4]
+	retryOff := extraOff + uint32(len(extraFrameLocals)*4)
 	body = append(body, 0x20, localSP)
 	body = appendTableLoad32(body, tableMemIdx, retryOff)
 	body = append(body, 0x21, localState)
@@ -1402,14 +2283,17 @@ func buildBTInnerDisp(
 		brRun := uint32(N - 1 - p)
 		body = emitBTInstHandler(
 			body, bt, p, inst, brRun,
-			loopLocalIdx, emptySnapBase, emptySnapLocals,
+			loopLocalIdx, loopEntryLocalIdx, emptySnapBase, emptySnapLocals, extraFrameLocals,
 			stackLimit, frameSize, numCapLocals,
 			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
 			useMemo,
 			true,
+			false,
 			instMatchFn,
 			overflowFn,
 			tableMemIdx,
+			uint32(localLen), 0,
+			false,
 		)
 	}
 	return body
@@ -1452,11 +2336,18 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 		loopLocalIdx[pc] = uint32(7 + j)
 	}
 
+	entryPCsSorted := entryLoopPCsSorted(bt)
+	entryBase := uint32(7 + len(loopPCsSorted))
+	loopEntryLocalIdx := make(map[int]uint32, len(entryPCsSorted))
+	for j, pc := range entryPCsSorted {
+		loopEntryLocalIdx[pc] = entryBase + uint32(j)
+	}
+
 	memoLocalsCount := 0
 	var memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen uint32
 	if useMemo {
 		memoLocalsCount = 5
-		base := uint32(7 + len(loopPCsSorted))
+		base := entryBase + uint32(len(entryPCsSorted))
 		memoLenPlus1 = base
 		memoBitIdx = base + 1
 		memoByteAddr = base + 2
@@ -1465,7 +2356,7 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	}
 
 	// +1 for fake out_ptr at index 2
-	totalLocals := 4 + len(loopPCsSorted) + memoLocalsCount + 1
+	totalLocals := 4 + len(loopPCsSorted) + len(entryPCsSorted) + memoLocalsCount + 1
 
 	var body []byte
 	body = append(body, 0x01)
@@ -1481,9 +2372,21 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	body = utils.AppendSLEB128(body, int32(prog.Start))
 	body = append(body, 0x21, localState)
 
-	for _, ll := range loopLocalIdx {
+	// Iterate loopPCsSorted, not loopLocalIdx directly, for deterministic emission.
+	for _, pc := range loopPCsSorted {
 		body = append(body, 0x41, 0x7F, 0x21)
-		body = utils.AppendULEB128(body, ll)
+		body = utils.AppendULEB128(body, loopLocalIdx[pc])
+	}
+	// loopEntryAtStart heads (no external entry PC — see its doc) are
+	// seeded with this attempt's start position (0, for match) instead of
+	// the usual -1 sentinel.
+	for _, pc := range entryPCsSorted {
+		if bt.loopEntryAtStart[pc] {
+			body = append(body, 0x41, 0x00, 0x21)
+		} else {
+			body = append(body, 0x41, 0x7F, 0x21)
+		}
+		body = utils.AppendULEB128(body, loopEntryLocalIdx[pc])
 	}
 
 	if useMemo {
@@ -1494,13 +2397,21 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	body = append(body, 0x03, 0x40)
 
 	failEmpty := func(b []byte) []byte { return append(b, 0x41, 0x7F, 0x0F) } // i32.const -1; return
-	// matchFn: LF semantics — accept at first InstMatch, return pos.
-	matchFn := func(b []byte, _ uint32) []byte {
+	// matchFn: RE2 semantics — match_func requires full-input consumption,
+	// so only accept an InstMatch reached with pos == len; otherwise keep
+	// backtracking for a derivation that does consume the whole input.
+	matchFn := func(b []byte, brDepth uint32) []byte {
+		b = append(b, 0x20, localPos)
+		b = append(b, 0x20, localLen)
+		b = append(b, 0x47)       // i32.ne
+		b = append(b, 0x04, 0x40) // if void
+		b = btFail(b, brDepth)
+		b = append(b, 0x0B)                 // end if
 		b = append(b, 0x20, localPos, 0x0F) // local.get pos; return
 		return b
 	}
 
-	body = buildBTInnerDisp(body, bt, loopLocalIdx,
+	body = buildBTInnerDisp(body, bt, loopLocalIdx, loopEntryLocalIdx,
 		stackBase, stackLimit, frameSize,
 		memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
 		useMemo, failEmpty, matchFn, nil, tableMemIdx)
@@ -1510,6 +2421,47 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	body = append(body, 0x41, 0x7F) // i32.const -1
 	body = append(body, 0x0B)       // end function
 	return body
+}
+
+// entryLoopPCsSorted returns bt.emptyBodyGreedyLoop's keys in sorted order,
+// for deterministic local assignment — see loopEntryOutOf's doc.
+func entryLoopPCsSorted(bt *backtrack) []int {
+	pcs := make([]int, 0, len(bt.emptyBodyGreedyLoop))
+	for pc := range bt.emptyBodyGreedyLoop {
+		pcs = append(pcs, pc)
+	}
+	sort.Ints(pcs)
+	return pcs
+}
+
+// btNumLoopFrameLocals returns the number of extra i32 locals (loop_pos +
+// loop_entry trackers, plus per-loop capture snapshot slots when
+// withCaptureSnapshots is true) that every backtrack stack frame must
+// reserve space for, alongside pos/captures/retryPC — see btPushFrame's doc
+// and FUZZER_BUGS.md #28. Callers computing frameSize/stackSize before the
+// WASM body itself is built (compile.go, btAllocSizes) use this to stay in
+// sync with the per-loop-head local count each body builder actually emits.
+//
+// withCaptureSnapshots must be true only for the capture-tracking body
+// (buildBacktrackBody's loopSnapBase/loopSnapLocals) — the no-capture
+// bodies (buildBTMatchBody/buildBTFindBody via buildBTInnerDisp) never
+// allocate snapshot locals since there are no captures to snapshot.
+// loopSnapLocals are themselves per-loop-instance state read only by the
+// same zero-progress guard as loop_pos/loop_entry (restoreLoopSnap on the
+// direct "pos == loopEntry" exit branch) — like those, they go stale across
+// a backtrack pop if not saved/restored the same way.
+//
+// Narrowing this to only count bt.emptyBodyGreedyLoop heads was tried and
+// reverted (breaks non-greedy loops and other loop shapes outside bug 28's
+// specific repro class) — must count every bt.loops head.
+func btNumLoopFrameLocals(bt *backtrack, withCaptureSnapshots bool) int {
+	n := len(bt.loops) + len(bt.emptyBodyGreedyLoop)
+	if withCaptureSnapshots {
+		for pc := range bt.loops {
+			n += len(loopCaptureLocals(bt.prog, bt.idom, pc))
+		}
+	}
+	return n
 }
 
 // emitBTMemoZeroInit emits a memory.fill instruction to zero the memo bitset.
@@ -1649,11 +2601,20 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		loopLocalIdx[pc] = loopLocalsBase + uint32(j)
 	}
 
+	// Entry-pos locals follow the loop_pos locals — see loopEntryOutOf's doc
+	// and FUZZER_BUGS.md #20.
+	entryPCsSorted := entryLoopPCsSorted(bt)
+	entryBase := loopLocalsBase + uint32(len(loopPCsSorted))
+	loopEntryLocalIdx := make(map[int]uint32, len(entryPCsSorted))
+	for j, pc := range entryPCsSorted {
+		loopEntryLocalIdx[pc] = entryBase + uint32(j)
+	}
+
 	memoLocalsCount := 0
 	var memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen uint32
 	if useMemo {
 		memoLocalsCount = 5
-		base := loopLocalsBase + uint32(len(loopPCsSorted))
+		base := entryBase + uint32(len(entryPCsSorted))
 		memoLenPlus1 = base
 		memoBitIdx = base + 1
 		memoByteAddr = base + 2
@@ -1665,15 +2626,15 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// how many loop or memo i32 locals follow:
 	//   Group 1: 7 fixed i32s (fake, pos, sp, state, scratch, attempt_start, simd_mask) → idx 2..8
 	//   Group 2: numV128Locals v128s → idx 9..9+numV128-1
-	//   Group 3: loop + memo i32s (+ lit_pos + scan_start when mandLit != nil) → idx 9+numV128..
+	//   Group 3: loop + entry + memo i32s (+ lit_pos + scan_start when mandLit != nil) → idx 9+numV128..
 	// This matches loopLocalsBase = 9 + numV128Locals exactly.
-	numLoopAndMemoLocals := len(loopPCsSorted) + memoLocalsCount
+	numLoopAndMemoLocals := len(loopPCsSorted) + len(entryPCsSorted) + memoLocalsCount
 	// When using mandatory-lit two-level loop, two extra i32 locals are appended:
-	//   lit_pos       = loopLocalsBase + len(loopPCsSorted) + memoLocalsCount
+	//   lit_pos       = loopLocalsBase + len(loopPCsSorted) + len(entryPCsSorted) + memoLocalsCount
 	//   scan_start    = lit_pos + 1
 	var litPosLocal, scanStartLocal uint32
 	if mandLit != nil {
-		litPosLocal = loopLocalsBase + uint32(len(loopPCsSorted)) + uint32(memoLocalsCount)
+		litPosLocal = loopLocalsBase + uint32(len(loopPCsSorted)) + uint32(len(entryPCsSorted)) + uint32(memoLocalsCount)
 		scanStartLocal = litPosLocal + 1
 		numLoopAndMemoLocals += 2
 	}
@@ -1802,9 +2763,20 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = append(body, 0x41)
 		body = utils.AppendSLEB128(body, int32(prog.Start))
 		body = append(body, 0x21, localState)
-		for _, ll := range loopLocalIdx {
+		for _, pc := range loopPCsSorted {
 			body = append(body, 0x41, 0x7F, 0x21)
-			body = utils.AppendULEB128(body, ll)
+			body = utils.AppendULEB128(body, loopLocalIdx[pc])
+		}
+		// loopEntryAtStart heads (no external entry PC — see its doc) are
+		// seeded with this attempt's own start position instead of the
+		// usual -1 sentinel.
+		for _, pc := range entryPCsSorted {
+			if bt.loopEntryAtStart[pc] {
+				body = append(body, 0x20, locAttemptStart, 0x21)
+			} else {
+				body = append(body, 0x41, 0x7F, 0x21)
+			}
+			body = utils.AppendULEB128(body, loopEntryLocalIdx[pc])
 		}
 		if useMemo {
 			body = emitBTMemoZeroInitTrimmed(body, memoTableBase, N, memoLenPlus1, memoZeroLen)
@@ -1825,14 +2797,14 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			bb = append(bb, 0x0F) // return
 			return bb
 		}
-		overflowFind := func(bb []byte) []byte {
-			bb = append(bb, 0x42, 0x7F) // i64.const -1
-			bb = append(bb, 0x0F)
-			return bb
-		}
+		// Stack overflow: report abi.BTStackOverflow and stop. See
+		// btOverflowFindReturn's doc for why abandoning just this
+		// attempt_start (what this used to do) cannot produce a truthful
+		// answer.
+		overflowFind := btOverflowFindReturn
 		body = append(body, 0x02, 0x40) // block $run_exit
 		body = append(body, 0x03, 0x40) // loop $run
-		body = buildBTInnerDisp(body, bt, loopLocalIdx,
+		body = buildBTInnerDisp(body, bt, loopLocalIdx, loopEntryLocalIdx,
 			stackBase, stackLimit, frameSize,
 			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
 			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx)
@@ -1868,9 +2840,20 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(prog.Start))
 		b = append(b, 0x21, localState)
-		for _, ll := range loopLocalIdx {
+		for _, pc := range loopPCsSorted {
 			b = append(b, 0x41, 0x7F, 0x21)
-			b = utils.AppendULEB128(b, ll)
+			b = utils.AppendULEB128(b, loopLocalIdx[pc])
+		}
+		// loopEntryAtStart heads (no external entry PC — see its doc) are
+		// seeded with this attempt's own start position instead of the
+		// usual -1 sentinel.
+		for _, pc := range entryPCsSorted {
+			if bt.loopEntryAtStart[pc] {
+				b = append(b, 0x20, locAttemptStart, 0x21)
+			} else {
+				b = append(b, 0x41, 0x7F, 0x21)
+			}
+			b = utils.AppendULEB128(b, loopEntryLocalIdx[pc])
 		}
 		if useMemo {
 			b = emitBTMemoZeroInitTrimmed(b, memoTableBase, N, memoLenPlus1, memoZeroLen)
@@ -1897,12 +2880,10 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			return bb
 		}
 
-		overflowFind := func(bb []byte) []byte {
-			bb = append(bb, 0x42, 0x7F) // i64.const -1
-			bb = append(bb, 0x0F)       // return
-			return bb
-		}
-		b = buildBTInnerDisp(b, bt, loopLocalIdx,
+		// Stack overflow: report abi.BTStackOverflow and stop — see the
+		// mandLit branch's identical comment above.
+		overflowFind := btOverflowFindReturn
+		b = buildBTInnerDisp(b, bt, loopLocalIdx, loopEntryLocalIdx,
 			stackBase, stackLimit, frameSize,
 			memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte,
 			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx)

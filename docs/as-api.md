@@ -215,3 +215,17 @@ lookup across every set in the config that requested `emit_name_map: true`.
 | `find_func` | `<func>(input: ArrayBuffer, offset: i32): i64` | packed `(absStart << 32 \| absEnd)`, or `-1` |
 | `groups_func` | `<func>(input: ArrayBuffer, offset: i32): i32` | `dataStart` pointer to slot buffer, or `0` |
 | `named_groups_func` | **not supported** — generator returns an error | — |
+
+## Notes
+
+- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for AssemblyScript: it's effective for the JS and TS generators only. Setting it does not change the generated stub or its performance.
+
+---
+
+## Backtracking stack overflow
+
+Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
+
+The generated function **throws** an `Error` whose message names the function. Note that in AssemblyScript an uncaught `throw` compiles to an abort, so the host sees a WASM trap.
+
+This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

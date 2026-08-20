@@ -327,9 +327,19 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		// → br_if (1+ed) goes to $no_match.
 		b = append(b, 0x03, 0x40) // loop $scalar (void)
 
+		// Bail unless the *entire* prefix fits before len — not just its
+		// start. attempt_start alone being < len isn't enough: the k-loop
+		// below reads len(prefix) bytes starting there, and without this
+		// check it would read past len whenever fewer than len(prefix)
+		// bytes remain, silently comparing against whatever garbage sits
+		// in WASM memory past the real input (regression test: custom-tests.txt
+		// NulByteLiteralOOBRead / x{16}/x{17} cases).
 		b = append(b, 0x20, l.AttemptStart)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(len(prefix)))
+		b = append(b, 0x6A)       // i32.add: attempt_start + len(prefix)
 		b = append(b, 0x20, l.Len)
-		b = append(b, 0x4F)       // i32.ge_u
+		b = append(b, 0x4B)       // i32.gt_u
 		b = append(b, 0x0D, 1+ed) // br_if (1+ed) → $no_match
 
 		for k := 0; k < len(prefix); k++ {

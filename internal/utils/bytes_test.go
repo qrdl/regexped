@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"errors"
 	"os"
 	"testing"
 )
@@ -27,7 +28,11 @@ func TestAppendDecodeULEB128(t *testing.T) {
 	cases := []uint32{0, 1, 63, 127, 128, 255, 256, 16383, 16384, 0xFFFFFFFF}
 	for _, v := range cases {
 		enc := AppendULEB128(nil, v)
-		got, n := DecodeULEB128(enc)
+		got, n, err := DecodeULEB128(enc)
+		if err != nil {
+			t.Errorf("ULEB128 roundtrip(%d): %v", v, err)
+			continue
+		}
 		if uint64(v) != got {
 			t.Errorf("ULEB128 roundtrip(%d): got %d", v, got)
 		}
@@ -41,7 +46,11 @@ func TestAppendDecodeSLEB128(t *testing.T) {
 	cases := []int32{0, 1, -1, 63, -64, 64, -65, 127, -128, 0x7FFFFFFF, -0x80000000}
 	for _, v := range cases {
 		enc := AppendSLEB128(nil, v)
-		got, n := DecodeSLEB128(enc)
+		got, n, err := DecodeSLEB128(enc)
+		if err != nil {
+			t.Errorf("SLEB128 roundtrip(%d): %v", v, err)
+			continue
+		}
 		if int64(v) != got {
 			t.Errorf("SLEB128 roundtrip(%d): got %d", v, got)
 		}
@@ -434,22 +443,57 @@ func TestWasmTableBaseType2Segment(t *testing.T) {
 	}
 }
 
-// TestDecodeULEB128Truncated exercises the fallback return when data ends without
-// a terminating byte (both bytes have the continuation bit set).
-func TestDecodeULEB128Truncated(t *testing.T) {
-	data := []byte{0x80, 0x80} // continuation bytes only, no terminator
-	_, n := DecodeULEB128(data)
-	if n != len(data) {
-		t.Errorf("DecodeULEB128 truncated: consumed %d bytes, want %d", n, len(data))
+// TestDecodeLEB128Malformed covers the two rejection classes added for
+// plans/FABLE.md B39: truncated input (runs out of bytes with the continuation
+// bit still set) and over-long input (more than ten bytes, whose payload would
+// be shifted past bit 63 and silently disappear).
+func TestDecodeLEB128Malformed(t *testing.T) {
+	overlong := make([]byte, 12)
+	for i := range overlong {
+		overlong[i] = 0x80
+	}
+	overlong[11] = 0x01
+
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{"empty", nil},
+		{"truncated", []byte{0x80, 0x80}},
+		{"single continuation byte", []byte{0x80}},
+		{"over-long", overlong},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if v, n, err := DecodeULEB128(c.data); err == nil {
+				t.Errorf("DecodeULEB128(%x) = (%d, %d, nil), want ErrMalformedLEB128", c.data, v, n)
+			} else if !errors.Is(err, ErrMalformedLEB128) {
+				t.Errorf("DecodeULEB128(%x): err = %v, want ErrMalformedLEB128", c.data, err)
+			}
+			if v, n, err := DecodeSLEB128(c.data); err == nil {
+				t.Errorf("DecodeSLEB128(%x) = (%d, %d, nil), want ErrMalformedLEB128", c.data, v, n)
+			} else if !errors.Is(err, ErrMalformedLEB128) {
+				t.Errorf("DecodeSLEB128(%x): err = %v, want ErrMalformedLEB128", c.data, err)
+			}
+		})
 	}
 }
 
-// TestDecodeSLEB128Truncated exercises the fallback return when data ends mid-sequence.
-func TestDecodeSLEB128Truncated(t *testing.T) {
-	data := []byte{0x80, 0x80} // continuation bytes only, no terminator
-	_, n := DecodeSLEB128(data)
-	if n != len(data) {
-		t.Errorf("DecodeSLEB128 truncated: consumed %d bytes, want %d", n, len(data))
+// TestDecodeLEB128MaxLength pins the boundary: a full ten-byte encoding is the
+// longest legal one and must still decode.
+func TestDecodeLEB128MaxLength(t *testing.T) {
+	// 0xFFFFFFFFFFFFFFFF encodes as nine 0xFF bytes plus a final 0x01.
+	enc := AppendULEB128(nil, 0xFFFFFFFF)
+	tenByte := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}
+	got, n, err := DecodeULEB128(tenByte)
+	if err != nil {
+		t.Fatalf("DecodeULEB128(ten-byte max): %v", err)
+	}
+	if n != 10 || got != ^uint64(0) {
+		t.Errorf("DecodeULEB128(ten-byte max) = (%#x, %d), want (%#x, 10)", got, n, ^uint64(0))
+	}
+	if _, n, err := DecodeULEB128(enc); err != nil || n != len(enc) {
+		t.Errorf("DecodeULEB128(%x) = (_, %d, %v), want (_, %d, nil)", enc, n, err, len(enc))
 	}
 }
 

@@ -7,12 +7,33 @@ comparing wall-clock time, fuel, and WASM size across the three modes against
 both a matching and a non-matching input.
 
 It exists to catch regressions and confirm wins as the `LikelyMode`
-optimisations in `compile/` evolve (see `docs/likely.md` and
-`plans/LM_TODO.md`/`plans/LNM.md` for the design history). It is **not** a
-tool for deciding whether *your* pattern should use `LikelyMatch`/
-`LikelyNoMatch` — for that, use `tools/pattest` against your own pattern and
-representative inputs (see "Before enabling a non-neutral mode on your own
-pattern" below).
+optimisations in `compile/` evolve (see `docs/prefer-hints.md` for the
+user-facing mechanism, or `plans/LM_TODO.md`/`plans/LNM.md` for the design
+history). It is **not** a tool for deciding whether *your* pattern should
+use `LikelyMatch`/`LikelyNoMatch` — for that, use `tools/pattest` against
+your own pattern and representative inputs (see "Before enabling a
+non-neutral mode on your own pattern" below).
+
+## Correctness checking
+
+Before a case's fuel/time numbers are trusted, every (pattern, mode, input)
+combination that gets measured is first checked against Go's `regexp`
+package (same RE2/Perl leftmost-first semantics as this project's own
+engines) — `match`/`find`/`groups` exports are called exactly the way the
+benchmark itself calls them (including the `exhaustive` re-entry loop for
+dense-workload cases), and the result is compared to Go's ground truth. A
+mismatch prints `CORRECTNESS FAIL [mode/input]: ...` to stderr and the run
+exits non-zero. `modeSet` cases are not checked here — `tools/re2test`'s own
+`--sets` mode already exhaustively covers set correctness.
+
+This exists because a `LikelyMode`-specific correctness bug can hide in
+exactly this corpus's blind spot: fuel/time numbers look "good" whether the
+compiled WASM took a legitimately cheap path or is silently returning the
+wrong answer cheaper than the correct one would cost. See
+`plans/FUZZER_BUGS.md` #25 for the case that motivated adding this check —
+a false negative in a groups-mode capture composition that had been sitting
+undetected in this benchmark's own `gap-e-groups` case because nothing
+here validated output, only cost.
 
 ## Running it
 
@@ -137,7 +158,8 @@ repeatedly for the next match), not just of the byte class:
 | `dense-words-grouped` | LNM (match) | +37% | `exhaustive: true`, `(\w+)` matching almost every ~6 bytes — each `find_all` call returns before the counter can accumulate anywhere near the ~8-attempt threshold, so the switch essentially never trips and the whole scan pays the Shufti tax. |
 
 `dense-bare-upper` and `dense-words-grouped`'s numbers are new findings (not
-previously written up in `docs/likely.md` or `plans/`) — same mechanism as
+previously written up in `docs/prefer-hints.md`, `docs/likely.md`, or
+`plans/`) — same mechanism as
 the `alpha-run`/`word-run` residual, just a larger instance of it because
 of how frequently their matches restart the per-call counter. This is a
 real, understood limitation of the task-25 mechanism (short/frequent

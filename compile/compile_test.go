@@ -2,24 +2,18 @@ package compile
 
 import (
 	"bytes"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp/syntax"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
 )
 
-// compileForced is like Compile but forces the given engine for the capture path
-// of every entry that requests capture groups. Used in tests only.
-func compileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, userOpts ...CompileOptions) ([]byte, int64, error) {
-	var opts CompileOptions
-	if len(userOpts) > 0 {
-		opts = userOpts[0]
-	}
-	return compileAll(patterns, tableBase, standalone, forceGroupsEngine, opts)
-}
 
 func parseTestRe(t *testing.T, pattern string) *syntax.Regexp {
 	t.Helper()
@@ -111,7 +105,53 @@ func TestSelectEnginePublic(t *testing.T) {
 // wasmMagic is the 4-byte WASM magic header.
 var wasmMagic = []byte{0x00, 0x61, 0x73, 0x6d}
 
-// mustCompileEntries calls Compile with standalone=true and fails on error.
+// wasmValidator locates a WASM validator once per test binary.
+//
+// plans/FABLE.md T4: this whole file used to accept any byte string starting
+// with the magic header as "a valid WASM module", which is how B15's u16 TDFA
+// table addressing — an operand order that never once produced a well-typed
+// function — sat behind a green TestTDFAU16TableAddressing. Compiling a module
+// nothing can instantiate is exactly the failure a compiler test suite exists
+// to catch, and the magic-prefix check cannot catch any of it.
+//
+// The main module deliberately has no wasmtime dependency (CLAUDE.md lists it
+// under tools/ only), so validation shells out instead. `wasm-tools validate`
+// is preferred; `wasmtime compile` is accepted as a fallback since it type-
+// checks the module on the way to Cranelift. Everything the emitters use —
+// simd, bulk-memory, multi-memory — is enabled by default in both, so no
+// feature flags are needed.
+var wasmValidator = sync.OnceValue(func() []string {
+	if p, err := exec.LookPath("wasm-tools"); err == nil {
+		return []string{p, "validate"}
+	}
+	if p, err := exec.LookPath("wasmtime"); err == nil {
+		return []string{p, "compile", "-o", os.DevNull}
+	}
+	return nil
+})
+
+// validateWASM type-checks a compiled module. Missing validator → the test
+// still runs, with a warning, rather than failing on a toolchain gap; the
+// point is that a machine which HAS the tool cannot miss an invalid module.
+func validateWASM(t *testing.T, wasm []byte) {
+	t.Helper()
+	argv := wasmValidator()
+	if argv == nil {
+		t.Log("neither wasm-tools nor wasmtime found in PATH: skipping WASM validation (see plans/FABLE.md T4)")
+		return
+	}
+	path := filepath.Join(t.TempDir(), "m.wasm")
+	if err := os.WriteFile(path, wasm, 0o600); err != nil {
+		t.Fatalf("write module for validation: %v", err)
+	}
+	cmd := exec.Command(argv[0], append(append([]string{}, argv[1:]...), path)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("emitted module fails %s: %v\n%s", argv[0], err, out)
+	}
+}
+
+// mustCompileEntries calls Compile with standalone=true, fails on error, and
+// validates the emitted module.
 func mustCompileEntries(t *testing.T, entries []config.RegexEntry, opts ...CompileOptions) {
 	t.Helper()
 	wasm, _, err := Compile(entries, 0, true, opts...)
@@ -121,6 +161,7 @@ func mustCompileEntries(t *testing.T, entries []config.RegexEntry, opts ...Compi
 	if !bytes.HasPrefix(wasm, wasmMagic) {
 		t.Fatalf("Compile: output is not a valid WASM module (len=%d)", len(wasm))
 	}
+	validateWASM(t, wasm)
 }
 
 func TestCompileIntegrationDFA(t *testing.T) {
@@ -177,21 +218,21 @@ func TestCompileIntegrationTDFA(t *testing.T) {
 
 func TestCompileIntegrationBacktrack(t *testing.T) {
 	t.Run("groups_forced", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT groups): %v", err)
+			t.Fatalf("CompileForced(BT groups): %v", err)
 		}
 	})
 	t.Run("named_groups_forced", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", NamedGroupsFunc: "ng"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT named_groups): %v", err)
+			t.Fatalf("CompileForced(BT named_groups): %v", err)
 		}
 	})
 	t.Run("natural_bt_nongreedy", func(t *testing.T) {
@@ -205,32 +246,32 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	})
 	// btCheckRuneRanges: char-class range in backtracking engine.
 	t.Run("bt_char_range", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "([a-z]+)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT char range): %v", err)
+			t.Fatalf("CompileForced(BT char range): %v", err)
 		}
 	})
 	// btWordBoundary: word-boundary assertion in backtracking engine.
 	t.Run("bt_word_boundary", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: `(\bfoo\b)`, GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT word boundary): %v", err)
+			t.Fatalf("CompileForced(BT word boundary): %v", err)
 		}
 	})
 	// btFoldRune: case-insensitive single-character match in backtracking engine.
 	t.Run("bt_case_fold_char", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "((?i:a)+)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(BT case-fold): %v", err)
+			t.Fatalf("CompileForced(BT case-fold): %v", err)
 		}
 	})
 	// buildBTScanTables: BT find mode (no-capture find path).
@@ -600,8 +641,16 @@ func TestCompileMatchBodyCompressed(t *testing.T) {
 		CompileOptions{MaxDFAStates: 100000, CompiledDFAThreshold: -1})
 }
 
-// TestCompileMatchBodyImmediateAccept exercises the hasImmAccept branch in buildMatchBody.
-// a* matches empty at start; the LL DFA start state has immediateAccept=true.
+// TestCompileMatchBodyImmediateAccept compiles a pattern whose start state is
+// immediate-accepting (a* matches empty at position 0) through the non-hybrid
+// match body.
+//
+// It does NOT exercise an immediate-accept check, despite the name: match mode
+// is compiled LL, and buildDFALayout raises hasImmAccept only under LF, so the
+// match body has never emitted one. (The original comment here claimed the
+// opposite; coverage showed the branch at 0.) The dead plumbing was removed in
+// 2026-08-18 — see plans/IMPROVEMENT_PLAN.md #7. Kept as a compile smoke test
+// for the empty-match-at-start shape.
 func TestCompileMatchBodyImmediateAccept(t *testing.T) {
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a*", MatchFunc: "m"}},
 		CompileOptions{CompiledDFAThreshold: -1})
@@ -616,31 +665,31 @@ func TestCompileDFADataSegmentsNewlineBoundary(t *testing.T) {
 // TestCompileBTInstHandlerAnyRune exercises InstRuneAny and InstRuneAnyNotNL
 // in emitBTInstHandler. (?s:.+) uses InstRuneAny (DOTALL), .+ uses InstRuneAnyNotNL.
 func TestCompileBTInstHandlerAnyRune(t *testing.T) {
-	_, _, err := compileForced(
+	_, _, err := CompileForced(
 		[]config.RegexEntry{{Pattern: "(?s:.+)", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced((?s:.+) BT): %v", err)
+		t.Fatalf("CompileForced((?s:.+) BT): %v", err)
 	}
-	_, _, err = compileForced(
+	_, _, err = CompileForced(
 		[]config.RegexEntry{{Pattern: ".+", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced(.+ BT): %v", err)
+		t.Fatalf("CompileForced(.+ BT): %v", err)
 	}
 }
 
 // TestCompileBTInstHandlerNonLoopAlt exercises the non-loop alternation path
 // (btPushFrame) in emitBTInstHandler. (a|b) has an Alt that is not a loop.
 func TestCompileBTInstHandlerNonLoopAlt(t *testing.T) {
-	_, _, err := compileForced(
+	_, _, err := CompileForced(
 		[]config.RegexEntry{{Pattern: "(a|b)", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced((a|b) BT): %v", err)
+		t.Fatalf("CompileForced((a|b) BT): %v", err)
 	}
 }
 
@@ -754,12 +803,12 @@ func TestCompileEmbeddedFindPaths(t *testing.T) {
 // TestCompileEmbeddedBTMatch exercises appendTableStore32/Load32 with tableMemIdx=1
 // in the BT match (groups) path when compiled in embedded mode.
 func TestCompileEmbeddedBTMatch(t *testing.T) {
-	wasm, _, err := compileForced(
+	wasm, _, err := CompileForced(
 		[]config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}},
 		0, false, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced(embedded BT match): %v", err)
+		t.Fatalf("CompileForced(embedded BT match): %v", err)
 	}
 	if !bytes.HasPrefix(wasm, wasmMagic) {
 		t.Fatal("output is not a valid WASM module")
@@ -803,12 +852,12 @@ func TestCompileBTInstHandlerEmptyWidth(t *testing.T) {
 // loopCaptureLocals finds that capture, setting loopSnapBase. On zero-progress
 // (a? matches empty) the snapshot is restored.
 func TestCompileBTLoopCaptureSnapshot(t *testing.T) {
-	_, _, err := compileForced(
+	_, _, err := CompileForced(
 		[]config.RegexEntry{{Pattern: "((a?)+)", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
-		t.Fatalf("compileForced(((a?)+) BT): %v", err)
+		t.Fatalf("CompileForced(((a?)+) BT): %v", err)
 	}
 }
 
@@ -818,23 +867,23 @@ func TestCompileBTLoopBodyCanMatchEmpty(t *testing.T) {
 	// ((a|b)+?): inner alternation causes both 'a' and 'b' paths to enqueue the
 	// same merge-point PC, triggering the visited-cache path in loopBodyCanMatchEmpty.
 	t.Run("visited_cache", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "((a|b)+?)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(((a|b)+?) BT): %v", err)
+			t.Fatalf("CompileForced(((a|b)+?) BT): %v", err)
 		}
 	})
 	// ((a)+?): non-greedy + loop whose body contains an InstCapture instruction,
 	// which hits the default case in loopBodyCanMatchEmpty's switch.
 	t.Run("default_case", func(t *testing.T) {
-		_, _, err := compileForced(
+		_, _, err := CompileForced(
 			[]config.RegexEntry{{Pattern: "((a)+?)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
-			t.Fatalf("compileForced(((a)+?) BT): %v", err)
+			t.Fatalf("CompileForced(((a)+?) BT): %v", err)
 		}
 	})
 }
@@ -957,9 +1006,22 @@ func TestT3Triggered(t *testing.T) {
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			dfa := newDFA(prog, false, true)
+			dfa, ok := newDFA(prog, false, true, maxHelperDFAStates)
+			if !ok {
+				t.Fatalf("newDFA: state limit exceeded")
+			}
 			tbl := dfaTableFrom(dfa)
-			l := buildDFALayout(tbl, 0, true, true, 0, false, false, false, false)
+			l := buildDFALayout(dfaLayoutParams{
+				t:                    tbl,
+				tableBase:            0,
+				needFind:             true,
+				leftmostFirst:        true,
+				compiledDFAThreshold: 0,
+				useAcceptSideTable:   false,
+				lmBareShufti:         false,
+				lmNonMidShufti:       false,
+				lmWideShufti:         false,
+			})
 
 			gotT1 := len(l.teddyT1LoBytes) > 0
 			gotT2 := len(l.teddyT2LoBytes) > 0
@@ -1114,4 +1176,331 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 			t.Errorf("stdout diag missing key: %s", buf.Bytes())
 		}
 	})
+}
+
+// TestCompileLenientAltFindBody exercises the Phase 2a lenient-alternation
+// find body in compilePattern, reached when analyseLitChainAltLenient
+// succeeds after the strict analysers fail, gated by
+// shouldTryLitChainAlt(pattern) — TEST.md T33. The real sql-inject perftest
+// pattern's first branch contains a nested (?:OR|AND) alternation
+// (OpAlternate), which makes shouldTryLitChainAlt bail out early and keep
+// the pattern lit-chain-alt-eligible; confirmed live that
+// compile_lm_lnm_test.go's "lenient_alt_find_only" case does NOT trip this
+// gate (its second branch's \s* is unbounded with no nested OpAlternate/
+// OpQuest, so shouldTryLitChainAlt short-circuits to false first).
+func TestCompileLenientAltFindBody(t *testing.T) {
+	const pattern = `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`
+	if !shouldTryLitChainAlt(pattern) {
+		t.Fatalf("shouldTryLitChainAlt(%q) = false, want true (test pattern no longer trips the T33 gate)", pattern)
+	}
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "sql_inject_find"}})
+}
+
+// TestCompileTDFARegLimitExceededForced exercises the
+// "ok && tt.numRegs > resolveMaxTDFARegs(&buildOpts)" fallback-to-Backtrack
+// re-check in compilePattern — TEST.md T34. Only reachable when
+// forceGroupsEngine bypasses the selector's own register estimate (unlike
+// TestCompileTDFARegLimit, which goes through the normal, unforced
+// selectBestEngine path and so never reaches TDFA construction at all for a
+// register-starved MaxTDFARegs).
+func TestCompileTDFARegLimitExceededForced(t *testing.T) {
+	_, err := compilePattern(
+		config.RegexEntry{Pattern: "(a)(b)(c)(d)(e)(f)", GroupsFunc: "g"},
+		0, EngineTDFA, CompileOptions{MaxTDFARegs: 1},
+	)
+	if err != nil {
+		t.Fatalf("compilePattern: %v", err)
+	}
+}
+
+// TestCompileBTStackTooLarge — FUZZER_BUGS.md #32. A no-capture find
+// pattern shaped like N sequential `(?:$*<literal>)` groups drives the
+// Backtracking find-fallback's DFA past MaxDFAStates (the DFA-too-large
+// gate that routes it to Backtracking), and btAllocSizes' stackSize formula
+// (65536·N·(N+1) for this exact shape) past WASM32's 4GiB linear-memory
+// ceiling at N=256. Before the fix this silently returned a WASM module
+// whose memory section was already invalid (fails at
+// wasmtime.NewModule/instantiation time); Compile must now reject it.
+//
+// Superseded by FUZZER_BUGS.md #33 (checkBTLoopCount): this exact pattern
+// shape's stackSize growth is driven by the same per-loop frameSize term
+// that also drives its Backtracking-JIT cost, so N=256's 256 loop-frame
+// locals now trip the earlier, more specific ErrBTLoopCountTooLarge before
+// the stack-size arithmetic in checkBTMemoryBudget is even reached — not
+// ErrBTStackTooLarge anymore. checkBTMemoryBudget's own mechanism is
+// unchanged and still guards other pattern shapes that reach a large
+// stackSize without a large loop count.
+func TestCompileBTStackTooLarge(t *testing.T) {
+	pattern := strings.Repeat(`(?:$*llllllll0)`, 256)
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
+	if !errors.Is(err, ErrBTLoopCountTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
+	}
+}
+
+// TestCompileBTStackWithinBudget — originally confirmed the same pattern
+// shape at a size just under the 4GiB ceiling (N=255) still compiled
+// successfully. FUZZER_BUGS.md #33 supersedes that expectation: N=255 has
+// 255 loop-frame locals, an isolated live measurement of which cost ~12s of
+// wasmtime JIT time (see checkBTLoopCount's doc) — legitimately fitting
+// under WASM32's memory ceiling does not mean it is safe to compile, and
+// checkBTLoopCount now correctly rejects it for that independent reason
+// before checkBTMemoryBudget's arithmetic is reached.
+func TestCompileBTStackWithinBudget(t *testing.T) {
+	pattern := strings.Repeat(`(?:$*llllllll0)`, 255)
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
+	if !errors.Is(err, ErrBTLoopCountTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
+	}
+}
+
+// TestCompileBTLoopCountTooLarge — FUZZER_BUGS.md #33
+// (tools/fuzz/testdata/fuzz/FuzzCorrectness/092700-8c386fe83b176a61, itself
+// a bug-31 regression-corpus entry that still crashed real `-fuzz` fuzzing
+// via an unbounded wasmtime JIT-time cost). N=114 sequential
+// `(?:$*llllllll0)` repeats is the exact natural boundary — at the default
+// MaxDFAStates=1024, N=113 stays on the cheap primary DFA/CompiledDFA path
+// (its ~9-byte-per-repeat literal chain needs ~1019 states) while N=114
+// crosses 1024 states and falls to Backtracking, whose 228 loop-frame
+// locals now trip checkBTLoopCount before wasmtime ever sees the module.
+func TestCompileBTLoopCountTooLarge(t *testing.T) {
+	pattern := strings.Repeat(`(?:$*llllllll0)`, 114)
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
+	if !errors.Is(err, ErrBTLoopCountTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
+	}
+}
+
+// TestCompileBTLoopCountWithinBudget confirms N=113 of the same pattern
+// shape — one repeat short of the DFA-state-cap crossing — still compiles
+// successfully via the primary DFA path, unaffected by checkBTLoopCount
+// (which only runs once a pattern actually reaches Backtracking
+// construction).
+func TestCompileBTLoopCountWithinBudget(t *testing.T) {
+	pattern := strings.Repeat(`(?:$*llllllll0)`, 113)
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+}
+
+// TestCompileBTEmptyBodyLoopChainTooLarge — FUZZER_BUGS.md #34
+// (tools/fuzz/found/20260815-142901, five repros of
+// `(?m:$*$*...$*0$)`-shaped patterns). 16 chained `$*` compiles fine (well
+// under checkBTLoopCount's JIT-time cap) but takes over a second of
+// wasmtime *runtime* find-call time on a single-byte non-matching input —
+// checkBTEmptyBodyLoopChain now rejects it at Compile() time instead.
+func TestCompileBTEmptyBodyLoopChainTooLarge(t *testing.T) {
+	pattern := `(?m:` + strings.Repeat(`$*`, 16) + `0$)`
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 65536, true)
+	if !errors.Is(err, ErrBTEmptyBodyLoopChainTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTEmptyBodyLoopChainTooLarge", err)
+	}
+}
+
+// TestCompileBTEmptyBodyLoopChainWithinBudget confirms a chain of `$*`
+// exactly at maxBTEmptyBodyGreedyLoops still compiles successfully.
+func TestCompileBTEmptyBodyLoopChainWithinBudget(t *testing.T) {
+	pattern := `(?m:` + strings.Repeat(`$*`, maxBTEmptyBodyGreedyLoops) + `0$)`
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 65536, true)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+}
+
+// TestCompileFuzzRepro143548 directly regression-tests the fuzz-discovered
+// hang (FUZZER_BUGS.md #34):
+// tools/fuzz/found/20260815-142901/143548-4c06db1f6419e310 and four
+// byte-identical-root-cause siblings all hung `go test -fuzz` on
+// `(?m:$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*0$)` (16 chained `$*`) against a
+// single-byte input, because compiling it succeeded but each `find` call
+// took over a second — with no bound, since this project's "runtime over
+// compile time" design principle means find-mode calls have no watchdog in
+// production. checkBTEmptyBodyLoopChain now rejects it at Compile() time
+// instead, which tools/fuzz's existing error skip (fuzz_test.go) is
+// extended to also skip on.
+func TestCompileFuzzRepro143548(t *testing.T) {
+	pattern := `(?m:$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*0$)`
+	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "find"}}, 65536, true)
+	if !errors.Is(err, ErrBTEmptyBodyLoopChainTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTEmptyBodyLoopChainTooLarge", err)
+	}
+}
+
+// TestCompileFuzzRepro092700 directly regression-tests the fuzz-discovered
+// crash (FUZZER_BUGS.md #33): tools/fuzz/testdata/fuzz/FuzzCorrectness/
+// 092700-8c386fe83b176a61 crashed `go test -fuzz` because compiling
+// `(?:$*llllllll0){200}` succeeded but took ~6s of wasmtime JIT time with
+// no bound, exceeding the fuzz worker's hang-classification threshold under
+// coverage-instrumentation and multi-worker CPU contention. checkBTLoopCount
+// now rejects it at Compile() time instead, which tools/fuzz's existing
+// ErrBTProgramTooLarge/ErrBTStackTooLarge skip (fuzz_test.go) is extended to
+// also skip on.
+func TestCompileFuzzRepro092700(t *testing.T) {
+	_, _, err := Compile([]config.RegexEntry{{Pattern: `(?:$*llllllll0){200}`, FindFunc: "find"}}, 65536, true)
+	if !errors.Is(err, ErrBTLoopCountTooLarge) {
+		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
+	}
+}
+
+// TestCompileBTCaptureWithMemoTwoGroups exercises the useMemo=true
+// initialization block in buildBacktrackBody for the capture path —
+// TEST.md T35. TestCompileBTCaptureWithMemo's pattern ((?:a?)+?) has a
+// single capture spanning the whole pattern (MaxCap()==1) and is not
+// itself ^-anchored, so task 41's whole-pattern-single-capture shortcut
+// (compile.go, isWholePatternSingleCapture) now intercepts it before it
+// ever reaches TDFA/BT selection — confirmed live via isAnchoredFind/
+// isWholePatternSingleCapture probing. ((?:a?)+?)(b) has two capture
+// groups, so the shortcut's MaxCap()==1 requirement fails and the pattern
+// reaches Backtracking's needsBitState=true memo-init path as originally
+// intended.
+func TestCompileBTCaptureWithMemoTwoGroups(t *testing.T) {
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: "((?:a?)+?)(b)", GroupsFunc: "g"}})
+}
+
+// TestCompileEmbeddedLitAnchorTableMemIdx exercises the tableMemIdx = 1
+// branch (!standalone) inside both the single-pattern lit-anchor and the
+// alt-lit-anchor dispatch-body-generation paths in assembleModule —
+// TEST.md T36. All existing lit-anchor/alt-lit-anchor tests use
+// standalone=true; this compiles the same pattern shapes with
+// standalone=false.
+func TestCompileEmbeddedLitAnchorTableMemIdx(t *testing.T) {
+	wasm, _, err := Compile([]config.RegexEntry{
+		{Pattern: `[0-9]{8}ghp_[^\s]+`, FindFunc: "f1"},
+		{Pattern: `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`, FindFunc: "f2"},
+	}, 0, false)
+	if err != nil {
+		t.Fatalf("Compile(embedded lit-anchor): %v", err)
+	}
+	if !bytes.HasPrefix(wasm, wasmMagic) {
+		t.Fatal("output is not a valid WASM module")
+	}
+}
+
+// TestCmdCompile_ErrorPaths exercises the four distinct error/IO branches in
+// CmdCompile — TEST.md T37.
+func TestCmdCompile_ErrorPaths(t *testing.T) {
+	t.Run("compile_file_error_with_sets", func(t *testing.T) {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{{Name: "bad", Pattern: `[`}},
+			Sets: []config.SetConfig{
+				{Name: "s", FindAny: "f", Patterns: config.PatternSelector{All: true}},
+			},
+		}
+		if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "out.wasm")); err == nil {
+			t.Fatal("expected CompileFile error, got nil")
+		}
+	})
+	t.Run("compile_error_no_sets", func(t *testing.T) {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{{Pattern: "[", MatchFunc: "m"}},
+		}
+		if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "out.wasm")); err == nil {
+			t.Fatal("expected Compile error, got nil")
+		}
+	})
+	t.Run("stdout_write_failure", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Close()
+		w.Close() // both ends closed before use — write to w now fails safely, no SIGPIPE
+		orig := os.Stdout
+		os.Stdout = w
+		cfg := config.BuildConfig{Regexps: []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}}
+		compErr := CmdCompile(cfg, "-")
+		os.Stdout = orig
+		if compErr == nil {
+			t.Fatal("expected stdout write error, got nil")
+		}
+	})
+	t.Run("write_file_failure", func(t *testing.T) {
+		cfg := config.BuildConfig{Regexps: []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}}
+		badPath := filepath.Join(t.TempDir(), "nonexistent-dir", "out.wasm")
+		if err := CmdCompile(cfg, badPath); err == nil {
+			t.Fatal("expected os.WriteFile error, got nil")
+		}
+	})
+}
+
+// TestCmdWriteDiagJSON_DroppedPatternError exercises the analyzePattern
+// error path in CmdWriteDiagJSON, propagated as `continue` (silently
+// dropping the pattern from the set's diagnostics) — TEST.md T38.
+func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "bad", Pattern: `[`},
+			{Name: "good", Pattern: `foo`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "diag.json")
+	if err := CmdWriteDiagJSON(cfg, "", path); err != nil {
+		t.Fatalf("CmdWriteDiagJSON: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"patterns_total": 2`)) {
+		t.Errorf("diag JSON missing expected patterns_total: %s", data)
+	}
+}
+
+// TestCompileAutoSelectEngine exercises the `else { engineType =
+// selectBestEngine(prog, &options) }` branch in compile() — calling the
+// private compile() helper WITHOUT an explicit ForceEngine, unlike every
+// production caller (which always sets ForceEngine: EngineDFA) — TEST.md
+// T39.
+func TestCompileAutoSelectEngine(t *testing.T) {
+	t.Run("backtrack_via_gap_i", func(t *testing.T) {
+		// <([^>]+)> routes to Backtrack via the Gap I inverted-class gate
+		// (see CLAUDE.md "Load-bearing engine-selection gates").
+		if _, err := compile(`<([^>]+)>`); err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+	})
+	t.Run("plain_dfa", func(t *testing.T) {
+		if _, err := compile(`a{500}`); err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+	})
+}
+
+// TestCompileBTCaptureBudgetIncludesMemoTable — FABLE.md B25. The BT
+// capture path checked only the stack against WASM32's 4GiB ceiling, then
+// went on to reserve the BitState memo table (up to MemoBudget) and, for
+// patterns needing true-input edge context, an 8-byte (origPtr,origEnd)
+// scratch. A reservation whose stack ended just below the ceiling therefore
+// passed the check yet declared memory past it — FUZZER_BUGS.md #32's
+// failure mode again (a generic wasmtime instantiation error instead of a
+// clear compile error).
+//
+// 245 `((a|b)*)` repeats put the BT capture stack at ~4.02GB, which alone
+// still fits under the ceiling; the trailing `(a*)*` is the only part that
+// makes needsBitState true, so the 512MB memo table is exactly what pushes
+// the reservation over. MemoBudget is raised from its 128KB default purely
+// to make that window wide enough to hit with a pattern that stays under
+// checkBTLoopCount and maxBTFallbackInstructions.
+func TestCompileBTCaptureBudgetIncludesMemoTable(t *testing.T) {
+	const stackOnly = 245 // repeats; ~4.02GB of BT capture stack
+	opts := CompileOptions{MemoBudget: 512 << 20}
+
+	// Control: identical stack, but no zero-width loop → no memo table →
+	// the reservation fits and compilation succeeds.
+	ctrl := config.RegexEntry{Pattern: strings.Repeat(`((a|b)*)`, stackOnly), GroupsFunc: "g"}
+	if _, err := compilePattern(ctrl, 0, EngineBacktrack, opts); err != nil {
+		t.Fatalf("control (no memo table): %v", err)
+	}
+
+	// Same stack plus a memo-requiring tail: the memo table takes it past
+	// the ceiling and compilation must say so.
+	entry := config.RegexEntry{Pattern: ctrl.Pattern + `(a*)*`, GroupsFunc: "g"}
+	if _, err := compilePattern(entry, 0, EngineBacktrack, opts); !errors.Is(err, ErrBTStackTooLarge) {
+		t.Fatalf("compilePattern: err = %v, want ErrBTStackTooLarge", err)
+	}
 }

@@ -4,6 +4,10 @@ A Cloudflare Worker that scans the POST body for leaked credentials (GitHub toke
 
 See [docs/workers.md](../../docs/workers.md) for the full guide.
 
+## Batched scanning
+
+All three patterns are compiled with `hints: [batch-find]` (see [`hints:`](../../docs/cli.md#hints--likelymode-and-batch-find-compile-hints) in the CLI reference) — a pasted log or diff often contains more than one leaked secret, and the worker rescans the whole POST body for every pattern, so draining several matches per host↔WASM call instead of one adds up. `worker.js` needs no changes for this: the generated `find_github_token`/`find_jwt_token`/`find_aws_key` generators feature-detect the `_batch` WASM export at runtime and prefer it automatically, falling back to the one-call-per-match loop unmodified if it's ever absent.
+
 ## Prerequisites
 
 - `regexped` binary (run `make` in the repo root)

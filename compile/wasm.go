@@ -1,6 +1,8 @@
 package compile
 
 import (
+	"fmt"
+
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -24,6 +26,35 @@ func appendDataSegment(out []byte, offset int32, data []byte) []byte {
 	return append(out, data...)
 }
 
+// segAccum accumulates active data segments while tracking the highest address
+// one past the end of everything appended. It exists so a pattern's tableEnd can
+// be derived positively — from what was actually emitted — instead of being
+// recomputed from an offset variable that a conditional branch may have left at
+// its zero value.
+//
+// The recomputed form is fragile in a specific way: the lit-anchor and
+// alt-lit-anchor paths emit a *variable* number of Teddy tables, and the
+// invariant that decides how many (litSet is capped at 8 literals in
+// lit_anchor.go) lives in a different file from the arithmetic that depends on
+// it. Getting it wrong does not fail the build — it yields a tableEnd far below
+// the real end of the tables, and since the next pattern is laid out from
+// PageAlign(tableEnd), that pattern's tables would be written on top of this
+// one's. See plans/OPUS.md §N10.
+type segAccum struct {
+	bytes []byte
+	count int
+	end   int64 // one past the highest byte written by any appended segment
+}
+
+// add appends one active data segment and extends end to cover it.
+func (s *segAccum) add(offset int32, data []byte) {
+	s.bytes = appendDataSegment(s.bytes, offset, data)
+	s.count++
+	if e := int64(offset) + int64(len(data)); e > s.end {
+		s.end = e
+	}
+}
+
 // dataSegment holds one data segment's target address and raw bytes.
 // Used when building the non-standalone init function (passive segments).
 type dataSegment struct {
@@ -33,6 +64,11 @@ type dataSegment struct {
 
 // parseDataSegments extracts all type-0 (active, memory-0) data segments
 // from a concatenation of segments encoded by appendDataSegment.
+//
+// Like stripSegCount, rawData is always appendDataSegment's own output, so a
+// LEB128 decode failure here is an internal invariant violation, not malformed
+// user input — see the note on stripSegCount in compile.go and plans/FABLE.md
+// B39.
 func parseDataSegments(rawData []byte) []dataSegment {
 	var segs []dataSegment
 	off := 0
@@ -45,10 +81,16 @@ func parseDataSegments(rawData []byte) []dataSegment {
 			break
 		}
 		off++
-		offset64, n := utils.DecodeSLEB128(rawData[off:])
+		offset64, n, err := utils.DecodeSLEB128(rawData[off:])
+		if err != nil {
+			panic(fmt.Sprintf("parseDataSegments: malformed segment offset in self-emitted data: %v — invariant violation", err))
+		}
 		off += n
 		off++ // 0x0b end
-		size, n := utils.DecodeULEB128(rawData[off:])
+		size, n, err := utils.DecodeULEB128(rawData[off:])
+		if err != nil {
+			panic(fmt.Sprintf("parseDataSegments: malformed segment size in self-emitted data: %v — invariant violation", err))
+		}
 		off += n
 		data := make([]byte, size)
 		copy(data, rawData[off:off+int(size)])
@@ -65,61 +107,79 @@ func appendString(out []byte, s string) []byte {
 
 // appendTableLoad8u emits i32.load8_u for a DFA table access.
 // tableMemIdx 0: implicit memory 0 encoding (3 bytes: 0x2D 0x00 0x00).
-// tableMemIdx 1: explicit memory 1 multi-memory encoding (4 bytes: 0x2D 0x40 0x01 0x00).
+// tableMemIdx > 0: explicit multi-memory encoding — align byte with the 0x40
+// memidx flag set, then the memory index as LEB128, then the offset. For
+// memidx 1 this is the same 4 bytes (0x2D 0x40 0x01 0x00) the fixed-width
+// encoding produced; LEB128 removes the implicit memidx < 128 assumption.
 func appendTableLoad8u(b []byte, tableMemIdx int) []byte {
 	if tableMemIdx == 0 {
 		return append(b, 0x2D, 0x00, 0x00)
 	}
-	return append(b, 0x2D, 0x40, byte(tableMemIdx), 0x00)
+	b = append(b, 0x2D, 0x40)
+	b = utils.AppendULEB128(b, uint32(tableMemIdx))
+	return append(b, 0x00)
 }
 
 // appendTableLoad16u emits i32.load16_u align=1 for a DFA table access.
-// tableMemIdx 0: 0x2F 0x01 0x00. tableMemIdx 1: 0x2F 0x41 0x01 0x00.
+// tableMemIdx 0: 0x2F 0x01 0x00. tableMemIdx 1: 0x2F 0x41 0x01 0x00
+// (memidx emitted as LEB128 — see appendTableLoad8u).
 func appendTableLoad16u(b []byte, tableMemIdx int) []byte {
 	if tableMemIdx == 0 {
 		return append(b, 0x2F, 0x01, 0x00)
 	}
-	return append(b, 0x2F, 0x41, byte(tableMemIdx), 0x00)
+	b = append(b, 0x2F, 0x41)
+	b = utils.AppendULEB128(b, uint32(tableMemIdx))
+	return append(b, 0x00)
 }
 
 // appendTableLoad32 emits i32.load align=2 for a stack/table access at the given offset.
-// tableMemIdx 0: 0x28 0x02 {offset}. tableMemIdx 1: 0x28 0x42 0x01 {offset}.
+// tableMemIdx 0: 0x28 0x02 {offset}. tableMemIdx 1: 0x28 0x42 0x01 {offset}
+// (memidx emitted as LEB128 — see appendTableLoad8u).
 func appendTableLoad32(b []byte, tableMemIdx int, offset uint32) []byte {
 	if tableMemIdx == 0 {
 		b = append(b, 0x28, 0x02)
 	} else {
-		b = append(b, 0x28, 0x42, byte(tableMemIdx))
+		b = append(b, 0x28, 0x42)
+		b = utils.AppendULEB128(b, uint32(tableMemIdx))
 	}
 	return utils.AppendULEB128(b, offset)
 }
 
 // appendTableVLoad emits v128.load align=0 offset=0 for a Teddy table access.
-// tableMemIdx 0: 0xFD 0x00 0x00 0x00. tableMemIdx 1: 0xFD 0x00 0x40 0x01 0x00.
+// tableMemIdx 0: 0xFD 0x00 0x00 0x00. tableMemIdx 1: 0xFD 0x00 0x40 0x01 0x00
+// (memidx emitted as LEB128 — see appendTableLoad8u).
 func appendTableVLoad(b []byte, tableMemIdx int) []byte {
 	if tableMemIdx == 0 {
 		return append(b, 0xFD, 0x00, 0x00, 0x00)
 	}
-	return append(b, 0xFD, 0x00, 0x40, byte(tableMemIdx), 0x00)
+	b = append(b, 0xFD, 0x00, 0x40)
+	b = utils.AppendULEB128(b, uint32(tableMemIdx))
+	return append(b, 0x00)
 }
 
 // appendTableStore32 emits i32.store align=2 for a stack/table write at the given offset.
-// tableMemIdx 0: 0x36 0x02 {offset}. tableMemIdx 1: 0x36 0x42 0x01 {offset}.
+// tableMemIdx 0: 0x36 0x02 {offset}. tableMemIdx 1: 0x36 0x42 0x01 {offset}
+// (memidx emitted as LEB128 — see appendTableLoad8u).
 func appendTableStore32(b []byte, tableMemIdx int, offset uint32) []byte {
 	if tableMemIdx == 0 {
 		b = append(b, 0x36, 0x02)
 	} else {
-		b = append(b, 0x36, 0x42, byte(tableMemIdx))
+		b = append(b, 0x36, 0x42)
+		b = utils.AppendULEB128(b, uint32(tableMemIdx))
 	}
 	return utils.AppendULEB128(b, offset)
 }
 
 // appendTableStore8 emits i32.store8 align=0 offset=0 for a memo table byte write.
-// tableMemIdx 0: 0x3A 0x00 0x00. tableMemIdx 1: 0x3A 0x40 0x01 0x00.
+// tableMemIdx 0: 0x3A 0x00 0x00. tableMemIdx 1: 0x3A 0x40 0x01 0x00
+// (memidx emitted as LEB128 — see appendTableLoad8u).
 func appendTableStore8(b []byte, tableMemIdx int) []byte {
 	if tableMemIdx == 0 {
 		return append(b, 0x3A, 0x00, 0x00)
 	}
-	return append(b, 0x3A, 0x40, byte(tableMemIdx), 0x00)
+	b = append(b, 0x3A, 0x40)
+	b = utils.AppendULEB128(b, uint32(tableMemIdx))
+	return append(b, 0x00)
 }
 
 // appendDataSegmentMem1 appends an active data segment targeting memory index 1.

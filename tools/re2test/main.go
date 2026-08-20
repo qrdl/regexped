@@ -55,11 +55,13 @@ func main() {
 	maxErrors := flag.Int("max-errors", 100, "stop after this many failures (0 = unlimited)")
 	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors, skips WASM testing)")
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
-	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find (sets MaxDFAStates=1 so DFA always overflows to BT)")
+	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find/groups (sets MaxDFAStates=-1 so DFA/TDFA always overflow to BT)")
 	setsMode := flag.Bool("sets", false, "test set find_all: compile each regexps block as a set and verify all matches against col4/col1 expected results")
 	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
 	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
 	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
+	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's Gap B lenient path) that match+find-together dispatch never exercises — see plans/TODO.md task 52")
+	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the Gap E alt-prefixed find body, the Gap C alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises (see plans/FABLE.md B6/B9/B11)")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -67,13 +69,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly); err != nil {
+	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly, *matchOnly, *findOnly); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool, likelyNoMatch bool, groupsOnly bool) error {
+func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool, likelyNoMatch bool, groupsOnly bool, matchOnly bool, findOnly bool) error {
 	f, err := os.Open(testFile)
 	if err != nil {
 		return err
@@ -220,31 +222,31 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				continue
 			}
 
-			var engineType compile.EngineType
-			if forceBacktrack {
-				engineType = compile.EngineBacktrack
-			} else {
-				selOpts := compile.CompileOptions{MaxDFAStates: maxDFAStates}
-				var selErr error
-				engineType, selErr = compile.SelectEngine(pattern, selOpts)
-				if selErr != nil {
-					errStr := selErr.Error()
-					reason := skipParseError
-					switch {
-					case strings.Contains(errStr, "Unicode"):
-						reason = skipUnicode
-					case strings.Contains(errStr, "invalid escape sequence"):
-						reason = skipBadSyntax
-					}
-					skipCount[reason] += len(testStrings)
-					input = append([]string(nil), testStrings...)
-					continue
+			// Always determine the naturally-selected engine, even under
+			// --force-backtrack: it's still needed to decide whether this
+			// pattern has genuinely-reachable capture groups (drives the
+			// groupsFn/matchFn dispatch below) and for the passed-test engine
+			// accounting further down. The actual compiled engine is forced
+			// separately, via compileOpts below.
+			selOpts := compile.CompileOptions{MaxDFAStates: maxDFAStates}
+			engineType, selErr := compile.SelectEngine(pattern, selOpts)
+			if selErr != nil {
+				errStr := selErr.Error()
+				reason := skipParseError
+				switch {
+				case strings.Contains(errStr, "Unicode"):
+					reason = skipUnicode
+				case strings.Contains(errStr, "invalid escape sequence"):
+					reason = skipBadSyntax
 				}
-				if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineBacktrack && engineType != compile.EngineTDFA {
-					skipCount["requires "+engineType.String()] += len(testStrings)
-					input = append([]string(nil), testStrings...)
-					continue
-				}
+				skipCount[reason] += len(testStrings)
+				input = append([]string(nil), testStrings...)
+				continue
+			}
+			if engineType != compile.EngineDFA && engineType != compile.EngineCompiledDFA && engineType != compile.EngineBacktrack && engineType != compile.EngineTDFA {
+				skipCount["requires "+engineType.String()] += len(testStrings)
+				input = append([]string(nil), testStrings...)
+				continue
 			}
 
 			// Compile a single standalone WASM module containing all functions.
@@ -260,15 +262,35 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				Pattern: pattern,
 			}
 			if !patternHasCaptures {
-				re.MatchFunc = "match"
-				re.FindFunc = "find"
+				if !findOnly {
+					re.MatchFunc = "match"
+				}
+				if !matchOnly {
+					re.FindFunc = "find"
+				}
 			}
-			if patternHasCaptures || (!forceBacktrack && (engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA)) {
+			if patternHasCaptures || engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA {
 				re.GroupsFunc = "groups"
 			}
 			var compileOpts compile.CompileOptions
+			var forceGroupsEngine compile.EngineType
 			if forceBacktrack {
-				compileOpts.ForceEngine = compile.EngineBacktrack
+				// Captures: force the groups engine for real, via
+				// CompileForced's forceGroupsEngine parameter (compile.go's
+				// compilePattern reads this directly to override
+				// selectBestEngine's TDFA-vs-Backtrack choice — no size
+				// limits involved).
+				forceGroupsEngine = compile.EngineBacktrack
+				// Match/find: there is no engine-selection axis to force —
+				// compilePattern's needMatch/needFindBody paths are always
+				// DFA, with Backtracking only as an overflow fallback when
+				// the DFA exceeds MaxDFAStates/MaxDFAMemory. MaxDFAStates: -1
+				// is the documented, tested way to make that fallback trigger
+				// unconditionally (resolveMaxDFAStates treats negative as 0,
+				// so any real DFA "overflows"; see compile_test.go's
+				// match_dfa_overflow/find_dfa_overflow cases for the same
+				// mechanism in production tests).
+				compileOpts.MaxDFAStates = -1
 			}
 			if likelyMatch {
 				compileOpts.LikelyMode = compile.LikelyMatch
@@ -276,7 +298,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			if likelyNoMatch {
 				compileOpts.LikelyMode = compile.LikelyNoMatch
 			}
-			wasmBytes, _, compErr := compile.Compile([]config.RegexEntry{re}, tableBase, true, compileOpts)
+			wasmBytes, _, compErr := compile.CompileForced([]config.RegexEntry{re}, tableBase, true, forceGroupsEngine, compileOpts)
 			if compErr != nil {
 				errStr := compErr.Error()
 				reason := skipOther
@@ -311,7 +333,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				groupsFn = inst.GetFunc(store, "groups")
 				groupsStore = store
 				groupsMemory = memory
-				groupsIsBacktrack = (engineType == compile.EngineBacktrack)
+				groupsIsBacktrack = forceBacktrack || (engineType == compile.EngineBacktrack)
 				if p2, p2Err := syntax.Parse(pattern, syntax.Perl); p2Err == nil {
 					numGroups = p2.MaxCap() + 1
 				}
@@ -346,12 +368,15 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 			col0 := strings.TrimSpace(results[0])
 			col1 := strings.TrimSpace(results[1])
-			var col4, col5 string
+			var col4, col5, col6 string
 			if len(results) >= 5 {
 				col4 = strings.TrimSpace(results[4])
 			}
 			if len(results) >= 6 {
 				col5 = strings.TrimSpace(results[5])
+			}
+			if len(results) >= 7 {
+				col6 = strings.TrimSpace(results[6])
 			}
 
 			// Skip cases where the input contains Unicode.
@@ -432,54 +457,71 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 							pattern, text, fmtSlots(expSlots), fmtGoSub(goSub))
 					}
 				}
+				// col6 (groups exhaustive re-entry): validate if present.
+				// Mirrors the GroupsIter/generator advance-by-matchEnd
+				// convention — see tools/likelytest's expectedGroupsAll.
+				if col6 != "" && col6 != "-" {
+					goAll := expectedGroupsAllGo(re, text)
+					expAll := parseCol6(col6, re.NumSubexp()+1)
+					if !col6Equal(goAll, expAll) {
+						nDataErrors++
+						fmt.Printf("DATA  pattern: %q\n      input:   %q\n      col6 expected: %s\n      col6 go:       %s\n",
+							pattern, text, fmtCol6(expAll), fmtCol6(goAll))
+					}
+				}
 			}
 
 			if !validateGo {
-				// col1: non-anchored find (only when no anchored result expected, matching RE2 test convention).
-				if col0 == "-" && col1 != "-" {
-					if findFn == nil {
-						skipCount[skipNonAnchored]++
-						// Fall through to col4/col5 tests below.
-					} else {
-						got, callErr := callFind(wd, store, findFn, findMemory, text)
-						if callErr != nil {
-							if isTimeout(callErr) {
-								if forceBacktrack {
-									store, matchFn, memory = nil, nil, nil
-									findFn, findMemory = nil, nil
-									skipCount[skipTimeout]++
-									continue
-								}
-								return fmt.Errorf("TIMEOUT: find pattern=%q input=%q", pattern, text)
-							}
-							return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
-								testFile, lineno, pattern, text, callErr)
-						}
-						expected := parseCol1(col1)
-						if got == expected {
-							npass++
+				// col1: non-anchored find. Tested for every row with a findFn,
+				// regardless of col0 — a pattern's anchored match succeeding
+				// does not mean find() was ever exercised, and col1 is the
+				// correct find oracle either way. Previously gated behind
+				// `col0 == "-"`, which left find() completely unchecked for any
+				// row whose anchored match also succeeds, hiding real find-mode
+				// bugs (e.g. `a$00|^0` and `\b0|` vs "0" — see plans/FUZZER_BUGS.md).
+				if findFn == nil {
+					skipCount[skipNonAnchored]++
+				} else {
+					got, callErr := callFind(wd, store, findFn, findMemory, text)
+					if callErr != nil {
+						if isTimeout(callErr) {
 							if forceBacktrack {
-								npassBTMatchFind++
-							} else if isCompiledDFA {
-								npassCompiledDFA++
-							} else {
-								npassDFA++
+								store, matchFn, memory = nil, nil, nil
+								findFn, findMemory = nil, nil
+								skipCount[skipTimeout]++
+								continue
 							}
-							if verbose {
-								fmt.Printf("PASS %s:%d pattern=%q input=%q (find)\n", testFile, lineno, pattern, text)
-							}
+							return fmt.Errorf("TIMEOUT: find pattern=%q input=%q", pattern, text)
+						}
+						return fmt.Errorf("%s:%d: wasm find call pattern=%q input=%q: %w",
+							testFile, lineno, pattern, text, callErr)
+					}
+					expected := parseCol1(col1)
+					if got == expected {
+						npass++
+						if forceBacktrack {
+							npassBTMatchFind++
+						} else if isCompiledDFA {
+							npassCompiledDFA++
 						} else {
-							nfail++
-							fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
-								pattern, text, fmtFindResult(expected), fmtFindResult(got))
-							if maxErrors > 0 && nfail >= maxErrors {
-								fmt.Printf("Stopping after %d failure(s)\n", nfail)
-								stopped = true
-								goto done
-							}
+							npassDFA++
+						}
+						if verbose {
+							fmt.Printf("PASS %s:%d pattern=%q input=%q (find)\n", testFile, lineno, pattern, text)
+						}
+					} else {
+						nfail++
+						fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      expected: %s\n      got:      %s\n",
+							pattern, text, fmtFindResult(expected), fmtFindResult(got))
+						if maxErrors > 0 && nfail >= maxErrors {
+							fmt.Printf("Stopping after %d failure(s)\n", nfail)
+							stopped = true
+							goto done
 						}
 					}
-				} else if groupsFn != nil && validateGroups {
+				}
+
+				if groupsFn != nil && validateGroups {
 					// col0: anchored match with captures (only when --validate-groups is on).
 					// groups is now non-anchored; treat as no match if result doesn't start at 0.
 					endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
@@ -534,8 +576,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 							goto done
 						}
 					}
-				} else if matchFn != nil {
-					// col0: anchored match (no captures).
+				} else if matchFn != nil && groupsFn == nil {
+					// col0: anchored match (no captures). Skipped for capturing
+					// patterns (groupsFn != nil) even when --validate-groups is
+					// off: col0 is written for groupsFn's non-full-consumption
+					// contract, not matchFn's full-consumption one — see
+					// plans/TODO.md task 46.
 					got, callErr := callMatch(wd, store, matchFn, memory, text)
 					if callErr != nil {
 						if isTimeout(callErr) {
@@ -675,6 +721,83 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 							fmt.Printf("Stopping after %d failure(s)\n", nfail)
 							stopped = true
 							goto done
+						}
+					}
+				}
+
+				// col6: groups exhaustive re-entry — repeatedly call groups(),
+				// advancing by the reported match's own relative end. This is
+				// the shape col5 never exercises (col5 always calls groups()
+				// at ptr=0): every generated stub's GroupsIter/generator
+				// re-enters at a nonzero ptr after the first match, and a bug
+				// in that composition (task 50: the whole-pattern
+				// single-capture shortcut left edgeScratchOff at its zero
+				// value instead of -1, so the groups wrapper scribbled an
+				// (origPtr,origEnd) scratch pair over table-memory offset 0
+				// on every call, corrupting the DFA table read by the next
+				// find()) is invisible to col0/col5 and only surfaces here.
+				if col6 != "" && col6 != "-" && groupsFn != nil {
+					expAll := parseCol6(col6, numGroups)
+					// Write the full text once; re-entry advances ptr into
+					// this same buffer rather than re-copying a substring to
+					// address 0 the way callGroups does — see callGroupsAt's
+					// doc comment for why that distinction is load-bearing
+					// here.
+					buf := groupsMemory.UnsafeData(groupsStore)
+					copy(buf[inputBase:], text)
+					var gotAll [][]int32
+					offset := int32(0)
+					textLen := int32(len(text))
+					for offset <= textLen {
+						endPos, slots, callErr := callGroupsAt(wd, groupsStore, groupsFn, groupsMemory, inputBase+offset, textLen-offset, numGroups)
+						if callErr != nil {
+							if isTimeout(callErr) {
+								if forceBacktrack {
+									groupsStore, groupsFn, groupsMemory = nil, nil, nil
+									skipCount[skipTimeout]++
+									goto nextResultLine
+								}
+								return fmt.Errorf("TIMEOUT: groups-exhaust pattern=%q input=%q", pattern, text)
+							}
+							return fmt.Errorf("%s:%d: wasm groups-exhaust call pattern=%q input=%q: %w",
+								testFile, lineno, pattern, text, callErr)
+						}
+						if endPos < 0 {
+							break
+						}
+						shifted := make([]int32, len(slots))
+						for i, v := range slots {
+							if v < 0 {
+								shifted[i] = -1
+							} else {
+								shifted[i] = offset + v
+							}
+						}
+						gotAll = append(gotAll, shifted)
+						if relEnd := slots[1]; relEnd > 0 {
+							offset += relEnd
+						} else {
+							offset++
+						}
+					}
+					if !col6Equal(gotAll, expAll) {
+						nfail++
+						fmt.Printf("FAIL  pattern: %q\n      input:   %q\n      col6 expected: %s\n      col6 got:      %s\n",
+							pattern, text, fmtCol6(expAll), fmtCol6(gotAll))
+						if maxErrors > 0 && nfail >= maxErrors {
+							fmt.Printf("Stopping after %d failure(s)\n", nfail)
+							stopped = true
+							goto done
+						}
+					} else {
+						npass++
+						if groupsIsBacktrack {
+							npassBacktrack++
+						} else {
+							npassTDFA++
+						}
+						if verbose {
+							fmt.Printf("PASS %s:%d pattern=%q input=%q (groups-exhaust)\n", testFile, lineno, pattern, text)
 						}
 					}
 				}
@@ -1117,6 +1240,46 @@ func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *was
 	return endPos, slots, nil
 }
 
+// callGroupsAt invokes the groups function at an explicit (ptr,len) into
+// memory the caller has already populated — unlike callGroups, it does NOT
+// copy any text to inputBase first. This distinction matters for exhaustive
+// re-entry (col6): the real GroupsIter/generator convention every generated
+// stub uses (generate/js_stub.go's genJSGroupsFunc, generate/rust_stub.go's
+// iterator, etc.) calls groups() at successive nonzero ptr values into the
+// SAME underlying buffer — it never re-writes a substring back to address 0
+// between calls. callGroups' per-call re-copy makes every call start from a
+// pristine buffer, which is exactly what hides TODO.md task 50's bug class
+// (a wrapper-composition bug that corrupts memory at address 0 as a side
+// effect of one call, only visible on the NEXT call into the same,
+// un-rewritten buffer).
+func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, ptr, length int32, numGroups int) (int32, []int32, error) {
+	buf := mem.UnsafeData(store)
+	for i := 0; i < numGroups*2; i++ {
+		off := slotsBase + int32(i*4)
+		buf[off] = 0xFF
+		buf[off+1] = 0xFF
+		buf[off+2] = 0xFF
+		buf[off+3] = 0xFF
+	}
+	wd.Arm(store)
+	defer wd.Disarm()
+	result, err := fn.Call(store, ptr, length, slotsBase)
+	if err != nil {
+		return 0, nil, err
+	}
+	endPos := result.(int32)
+	if endPos < 0 {
+		return -1, nil, nil
+	}
+	buf = mem.UnsafeData(store)
+	slots := make([]int32, numGroups*2)
+	for i := range slots {
+		off := slotsBase + int32(i*4)
+		slots[i] = int32(buf[off]) | int32(buf[off+1])<<8 | int32(buf[off+2])<<16 | int32(buf[off+3])<<24
+	}
+	return endPos, slots, nil
+}
+
 // parseCaptures parses a col-0 result string that may include submatches.
 // Returns nil if no match. Otherwise returns []int32{start0,end0,start1,end1,...}
 // with -1,-1 for unmatched groups.
@@ -1322,6 +1485,81 @@ func fmtCol4GoAll(goAll [][]int) string {
 
 func fmtCol4Wasm(pairs [][2]int) string {
 	return fmtCol4(pairs)
+}
+
+// parseCol6 parses a col6 string like "0-3 0-3|4-9 4-9" (matches separated by
+// "|", each match's per-group spans space-separated like col5) into a slice
+// of per-match slot arrays, or nil for "-"/empty.
+func parseCol6(col string, numGroups int) [][]int32 {
+	if col == "" || col == "-" {
+		return nil
+	}
+	var all [][]int32
+	for _, part := range strings.Split(col, "|") {
+		all = append(all, parseCaptures(strings.TrimSpace(part), numGroups))
+	}
+	return all
+}
+
+// col6Equal compares two groups-exhaust match sequences — used for both the
+// Go-oracle validation (--validate-go) and the WASM-vs-expected check.
+func col6Equal(got [][]int32, exp [][]int32) bool {
+	if len(got) != len(exp) {
+		return false
+	}
+	for i := range got {
+		if len(got[i]) != len(exp[i]) {
+			return false
+		}
+		for j := range got[i] {
+			if got[i][j] != exp[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func fmtCol6(all [][]int32) string {
+	if all == nil {
+		return "no matches"
+	}
+	var parts []string
+	for _, m := range all {
+		parts = append(parts, fmtSlots(m))
+	}
+	return strings.Join(parts, "|")
+}
+
+// expectedGroupsAllGo is the Go-stdlib oracle for col6: mirrors the
+// GroupsIter/generator advance-by-matchEnd convention (advance by the
+// match's own relative end, or off++ if that's zero) rather than Go's
+// FindAllStringSubmatchIndex, which skips empty matches adjacent to the
+// previous one. Matches tools/likelytest's expectedGroupsAll.
+func expectedGroupsAllGo(re *regexp.Regexp, text string) [][]int32 {
+	var all [][]int32
+	off := 0
+	for off <= len(text) {
+		sub := re.FindStringSubmatchIndex(text[off:])
+		if sub == nil {
+			break
+		}
+		shifted := make([]int32, len(sub))
+		for i, v := range sub {
+			if v < 0 {
+				shifted[i] = -1
+			} else {
+				shifted[i] = int32(v + off)
+			}
+		}
+		all = append(all, shifted)
+		if relEnd := sub[1]; relEnd > 0 {
+			off += relEnd
+		} else {
+			off++
+		}
+	}
+	return all
 }
 
 // slotsEqualGo compares Go FindStringSubmatchIndex against expected slot pairs.

@@ -171,7 +171,7 @@ type SetSpec struct {
 
 // CompileSet compiles one set specification into a compiledSet.
 // prefixPool and suffixPool are shared dedup pools across all sets in the file.
-func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions) (*compiledSet, error) {
+func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions) *compiledSet {
 	diag := &SetDiag{Name: spec.Name}
 	buckets := binPack(spec.Patterns, opts, diag)
 
@@ -284,12 +284,22 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			prefixID := p.prefixID
 			fnIdx, ok := prefixPoolToFnIdx[prefixID]
 			if !ok {
-				revL := buildDFALayout(p.prefixDFA, int64(prefixTableOffset), false, false, 0, false, false, false, false)
+				revL := buildDFALayout(dfaLayoutParams{
+					t:                    p.prefixDFA,
+					tableBase:            int64(prefixTableOffset),
+					needFind:             false,
+					leftmostFirst:        false,
+					compiledDFAThreshold: 0,
+					useAcceptSideTable:   false,
+					lmBareShufti:         false,
+					lmNonMidShufti:       false,
+					lmWideShufti:         false,
+				})
 				body := buildLitAnchorBackScanBody(revL, p.prefixDFA, opts.TableMemIdx)
 				fnIdx = len(prefixFnBodies)
 				prefixFnBodies = append(prefixFnBodies, body)
 				prefixPoolToFnIdx[prefixID] = fnIdx
-				rawPfx, cnt := stripSegCount(dfaDataSegments(revL, false))
+				rawPfx, cnt := stripSegCount(dfaDataSegments(revL, false, false))
 				// buildLitAnchorBackScanBody reads midAcceptOff; emit it explicitly.
 				midAccSeg := appendDataSegment(nil, revL.midAcceptOff, revL.midAcceptBytes)
 				rawPfx = append(rawPfx, midAccSeg...)
@@ -358,16 +368,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	var teddyDataBytes []byte
 	teddyDataSegCount := 0
 	if fe == frontendTeddy {
-		tt, ok := buildTeddyTablesMulti(lits)
-		if ok {
-			teddyTabs = tt
-			teddyDataOffset = prefixTableOffset
-			rawTeddy := buildTeddyRawBytes(tt)
-			teddyDataBytes = appendDataSegment(nil, teddyDataOffset, rawTeddy)
-			teddyDataSegCount = 1
-		} else {
-			fe = frontendScalar
-		}
+		// chooseLiteralFrontend only returns frontendTeddy for 1..16 non-empty
+		// literals, which is exactly buildTeddyTablesMulti's success condition.
+		tt, _ := buildTeddyTablesMulti(lits)
+		teddyTabs = tt
+		teddyDataOffset = prefixTableOffset
+		rawTeddy := buildTeddyRawBytes(tt)
+		teddyDataBytes = appendDataSegment(nil, teddyDataOffset, rawTeddy)
+		teddyDataSegCount = 1
 	}
 
 	// LIKELY.md Gap H.3: density-heuristic / Action 5 Shufti for the
@@ -440,7 +448,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		litLens:             litLens,
 		diag:                diag,
 	}
-	return cs, nil
+	return cs
 }
 
 // emitSetMatchFnAnchored emits the WASM function body for the anchored `match`
@@ -515,7 +523,12 @@ func emitSetMatchFnAnchored(cs *compiledSet, suffixFnBase, prefixFnBaseIdx int) 
 				mask = (uint32(1) << uint(n)) - 1
 			}
 			if mask == 0 {
-				continue
+				// n == 0 means the bucket carries no patterns. binPack only
+				// ever creates a fallback bucket around a pattern and only
+				// grows it (compile/set.go compileFallback), so an empty
+				// bucket reaching the emitter is an upstream invariant
+				// violation, not a condition to skip silently.
+				panic(fmt.Sprintf("emitSetMatchFnAnchored: fallback bucket %d has no patterns — invariant violation", bi))
 			}
 			b = append(b, 0x02, 0x40) // block $skip_fb
 			b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x00)
@@ -736,6 +749,24 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		if err != nil {
 			return nil, 0, err
 		}
+		// Batch find/groups export trigger (plans/TODO.md task 44) — same
+		// trigger compileAll applies; see compileAll's comment for the
+		// eligibility rules. Only the per-pattern exports get a batch
+		// wrapper here: a set's own find_all/find_any/match already cover
+		// multi-match, so assembleModuleWithSets does not add batch wrappers
+		// for compiledSet functions.
+		if hasBatchHint(re.Hints) {
+			if p.findExport != "" {
+				p.batchFindExport = p.findExport + "_batch"
+			}
+			groupsBatchName := p.groupsExport
+			if groupsBatchName == "" {
+				groupsBatchName = p.namedGroupsExport
+			}
+			if groupsBatchName != "" {
+				p.batchGroupsExport = groupsBatchName + "_batch"
+			}
+		}
 		tableBase = p.tableEnd
 		compiled = append(compiled, p)
 	}
@@ -807,10 +838,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 			setOpts.TableMemIdx = 1
 		}
 		setOpts.TableBase = int32(setTableBase)
-		cs, err := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
-		if err != nil {
-			return nil, 0, err
-		}
+		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
 		compiledSets = append(compiledSets, cs)
 		setTableBase += int64(len(cs.dataBytes)) + int64(len(cs.prefixDataBytes)) +
 			int64(len(cs.acDataBytes)) + int64(len(cs.teddyDataBytes))
@@ -950,6 +978,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				fs = append(fs, 0x02)
 			}
 		}
+		// Batch find/groups wrapper (task 44): same signature as the set
+		// match body — (i32,i32,i32,i32,i32)→i32 — so it reuses type 5
+		// rather than needing a dedicated type.
+		if p.batchFindExport != "" {
+			fs = append(fs, byte(setMatchTypeMatch))
+		}
+		if p.batchGroupsExport != "" {
+			fs = append(fs, byte(setMatchTypeMatch))
+		}
 	}
 	for _, cs := range sets {
 		if cs.findAny != "" || cs.findAll != "" {
@@ -994,6 +1031,12 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			numExports++
 		}
 		if p.namedGroupsExport != "" {
+			numExports++
+		}
+		if p.batchFindExport != "" {
+			numExports++
+		}
+		if p.batchGroupsExport != "" {
 			numExports++
 		}
 	}
@@ -1044,6 +1087,17 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+namedWrapperOff))
 		}
+		batchFindOff, batchGroupsOff := p.batchOffsets()
+		if p.batchFindExport != "" && batchFindOff >= 0 {
+			es = appendString(es, p.batchFindExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(base+batchFindOff))
+		}
+		if p.batchGroupsExport != "" && batchGroupsOff >= 0 {
+			es = appendString(es, p.batchGroupsExport)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(base+batchGroupsOff))
+		}
 	}
 	for si, cs := range sets {
 		base := setBaseIdx[si]
@@ -1092,12 +1146,38 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		if p.captureBody != nil {
 			cs_bytes = append(cs_bytes, p.captureBody...)
 			if !p.anchored {
-				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups)
+				wrapperTableMemIdx := 0
+				if !standalone {
+					wrapperTableMemIdx = 1
+				}
+				winOff := int32(-1)
+				if !p.isTDFA {
+					winOff = p.winScratchOff
+				}
+				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff)
 				if p.namedGroupsExport != "" {
 					cs_bytes = appendNamedGroupsWrapperCodeEntry(cs_bytes, base+wrapperOff)
 				}
 			} else if p.namedGroupsExport != "" {
 				cs_bytes = appendNamedGroupsWrapperCodeEntry(cs_bytes, base+captureOff)
+			}
+		}
+		if p.batchFindExport != "" {
+			cs_bytes = appendBatchFindWrapperCodeEntry(cs_bytes, base+findOff)
+		}
+		if p.batchGroupsExport != "" {
+			if p.anchored {
+				cs_bytes = appendBatchLitChainGroupsWrapperCodeEntry(cs_bytes, base+captureOff, p.numGroups)
+			} else {
+				batchTableMemIdx := 0
+				if !standalone {
+					batchTableMemIdx = 1
+				}
+				winOff := int32(-1)
+				if !p.isTDFA {
+					winOff = p.winScratchOff
+				}
+				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff)
 			}
 		}
 	}
@@ -1206,7 +1286,8 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase int, prefixFnBaseId
 	// lPos > pInLen: allows position 0 to be processed on empty input (pInLen=0),
 	// so patterns like (aa)* that match "" get their zero-length match at position 0.
 	// For non-empty inputs, position pInLen is processed once (for EOF-anchored patterns
-	// like (aa)*$); the eofMidBitmask in buildSetSuffixBody avoids false positives.
+	// like (aa)*$); buildSetSuffixBody's eofBitmaskOff table (paired with newDFA's
+	// bootstrap-alias guard giving midStart its own correct accept bits) avoids false positives.
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01) // lPos > pInLen (i32.gt_u)
 	b = append(b, 0x20, lOutCount, 0x20, pOutCap, 0x4F, 0x0D, 0x01)
 

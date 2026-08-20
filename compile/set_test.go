@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp/syntax"
+	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
@@ -203,7 +204,10 @@ func buildCanonicalDFA(t *testing.T, pattern string) *dfaTable {
 	if err != nil {
 		t.Fatalf("Compile(%q): %v", pattern, err)
 	}
-	d := newDFA(prog, false, false)
+	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	if !ok {
+		t.Fatalf("newDFA(%q): state limit exceeded", pattern)
+	}
 	return dfaTableFromCanonical(d)
 }
 
@@ -768,20 +772,6 @@ func TestCombinedClassCount_Orthogonal(t *testing.T) {
 	}
 }
 
-func TestMergeSuffixASTs_Empty(t *testing.T) {
-	if got := mergeSuffixASTs(nil); got != nil {
-		t.Errorf("mergeSuffixASTs(nil) = %v, want nil", got)
-	}
-}
-
-func TestMergeSuffixASTs_Single(t *testing.T) {
-	re := mustParse(t, `foo`)
-	got := mergeSuffixASTs([]*syntax.Regexp{re})
-	if got == nil {
-		t.Fatal("mergeSuffixASTs([one]) returned nil")
-	}
-}
-
 func TestMergeSuffixDFA_EmptyList(t *testing.T) {
 	_, _, err := mergeSuffixDFA(nil, CompileSetOptions{})
 	if err == nil {
@@ -804,17 +794,6 @@ func TestBuildUnionProg_SinglePattern(t *testing.T) {
 	}
 	if combined&1 == 0 {
 		t.Error("buildUnionProg (single): bit 0 not assigned to any instruction")
-	}
-}
-
-func TestMergeSuffixASTs_Sorted(t *testing.T) {
-	asts := []*syntax.Regexp{mustParse(t, `z`), mustParse(t, `a`)}
-	merged := mergeSuffixASTs(asts)
-	if merged == nil || merged.Op != syntax.OpAlternate || len(merged.Sub) != 2 {
-		t.Fatalf("mergeSuffixASTs: unexpected result %v", merged)
-	}
-	if merged.Sub[0].String() > merged.Sub[1].String() {
-		t.Errorf("not sorted: sub[0]=%q sub[1]=%q", merged.Sub[0], merged.Sub[1])
 	}
 }
 
@@ -1234,6 +1213,39 @@ func TestCompileFile_WithSets_ValidWASM(t *testing.T) {
 	}
 }
 
+// TestCompileFile_WithSets_BatchFindStillWorks guards against a regression
+// where CompileFile's per-pattern loop (used whenever cfg.Sets is non-empty)
+// bypassed the "batch-find" hint trigger entirely, and assembleModuleWithSets
+// had no code to emit the batch wrapper even when the field was set — so a
+// pattern's own _batch export silently disappeared merely because the config
+// also had a sets: block. The set's own find_any export must NOT gain a
+// batch wrapper — sets already cover multi-match via find_all/find_any.
+func TestCompileFile_WithSets_BatchFindStillWorks(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "foo_pat", Pattern: `foo\d+`, FindFunc: "find_foo", Hints: []string{"batch-find"}},
+			{Name: "bar_pat", Pattern: `bar\w+`},
+		},
+		Sets: []config.SetConfig{
+			{
+				Name:     "test_set",
+				FindAny:  "test_match_any",
+				Patterns: config.PatternSelector{All: true},
+			},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if !bytes.Contains(wasm, []byte("find_foo_batch")) {
+		t.Error("expected find_foo_batch export with batch-find hint present alongside a sets: block, not found")
+	}
+	if bytes.Contains(wasm, []byte("test_match_any_batch")) {
+		t.Error("test_match_any_batch export present — set match functions must not gain a batch wrapper")
+	}
+}
+
 func TestSetMatch_SingleBucket_Equivalence(t *testing.T) {
 	// Verify that CompileSet produces a compiledSet with the expected structure.
 	var prefixPool, suffixPool dfaPool
@@ -1253,10 +1265,7 @@ func TestSetMatch_SingleBucket_Equivalence(t *testing.T) {
 		Patterns:   patterns,
 		PatternIDs: patternIDs,
 	}
-	cs, err := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
-	if err != nil {
-		t.Fatalf("CompileSet: %v", err)
-	}
+	cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
 	// matchFnBody is built at assemble time (assembleModuleWithSets), not in CompileSet.
 	if cs.numSuffixFns == 0 {
 		t.Error("expected at least one suffix function body")
@@ -1289,14 +1298,20 @@ func assertDataSectionConsistent(t *testing.T, wasm []byte) {
 	for off < len(wasm) {
 		id := wasm[off]
 		off++
-		size, n := utils.DecodeULEB128(wasm[off:])
+		size, n, err := utils.DecodeULEB128(wasm[off:])
+		if err != nil {
+			t.Fatalf("decode section size at %d: %v", off, err)
+		}
 		off += n
 		body := wasm[off : off+int(size)]
 		off += int(size)
 		if id != 11 {
 			continue
 		}
-		declared, m := utils.DecodeULEB128(body)
+		declared, m, err := utils.DecodeULEB128(body)
+		if err != nil {
+			t.Fatalf("decode data-section segment count: %v", err)
+		}
 		segs := parseDataSegments(body[m:])
 		if uint64(len(segs)) != declared {
 			t.Errorf("data section: declared count=%d, parsed segments=%d", declared, len(segs))
@@ -2262,32 +2277,8 @@ func TestDiagJSON_Schema(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Anchor helper tests (endsWithBeginAnchor, isOnlyBeginAnchors,
-// hasBeginAnchor, hasBeginAnchorAtTopLevel)
-
-func TestEndsWithBeginAnchor(t *testing.T) {
-	cases := []struct {
-		pat  string
-		want bool
-	}{
-		{`^`, true},       // bare ^
-		{`\z^`, true},     // end-then-begin: ends with ^
-		{`(^^)*$`, false}, // ends with $, not ^
-		{`(?:a)`, false},  // no anchor
-		{`a^`, true},      // concat ending with ^
-		{`^a`, false},     // concat ending with 'a'
-		{`(^)`, true},     // capture wrapping ^
-	}
-	for _, tc := range cases {
-		re := mustParse(t, tc.pat)
-		if got := endsWithBeginAnchor(re); got != tc.want {
-			t.Errorf("endsWithBeginAnchor(%q) = %v, want %v", tc.pat, got, tc.want)
-		}
-	}
-	if endsWithBeginAnchor(nil) {
-		t.Error("endsWithBeginAnchor(nil) = true, want false")
-	}
-}
+// Anchor helper tests (isOnlyBeginAnchors, hasBeginAnchor,
+// hasBeginAnchorAtTopLevel)
 
 func TestIsOnlyBeginAnchors(t *testing.T) {
 	cases := []struct {
@@ -2431,5 +2422,261 @@ func TestAnalyzePattern_BeginSuffixFallback(t *testing.T) {
 	}
 	if info.splittable {
 		t.Error("expected splittable=false for a^ (begin-anchor in suffix)")
+	}
+}
+
+// lowRarityFirstBytes returns 33 distinct first bytes with a rarity sum well
+// under byte_rarity.go's threshold(40), so shuftiBeatsScalar is statically
+// true and Shufti is selected without needing a LikelyNoMatch override.
+// Confirmed live: firstByteSetRaritySum(lowRarityFirstBytes()) == 5.
+func lowRarityFirstBytes() []byte {
+	var out []byte
+	for b := byte(0x01); b < 0x20 && len(out) < 28; b++ {
+		if b == '\t' || b == '\n' || b == '\r' {
+			continue
+		}
+		out = append(out, b)
+	}
+	return append(out, '~', '@', '_', '%', '`')
+}
+
+// TestCompileFile_ShuftiNonAdaptive exercises the non-adaptive locals layout
+// in emitSetMatchFnFinalShufti (shuftiAdaptive = lnm && !rare — false here
+// because rare=true, i.e. shuftiBeatsScalar already selects Shufti
+// statically, so the LikelyNoMatch hint changes nothing) — TEST.md T12.
+// TestCompileFile_ShuftiFrontend's digit/uppercase alphabet always has
+// rare=false, so it can only ever reach adaptive=true; this uses a
+// low-rarity (control-byte/punctuation) first-byte alphabet instead.
+// Confirmed live via direct CompileSet probing: fe=shufti, adaptive=false,
+// both without and with the prefer-no-match hint.
+func TestCompileFile_ShuftiNonAdaptive(t *testing.T) {
+	alphabet := lowRarityFirstBytes()
+	pats := make([]config.RegexEntry, len(alphabet))
+	for i, c := range alphabet {
+		pats[i] = config.RegexEntry{Pattern: fmt.Sprintf("%cq%02dx[a-z]+", c, i)}
+	}
+	cfg := config.BuildConfig{
+		Regexps: pats,
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile Shufti non-adaptive: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Errorf("invalid WASM magic")
+	}
+	assertDataSectionConsistent(t, wasm)
+}
+
+// TestCompileFile_ShuftiVarLenAndAnchor exercises the startAnchorMasks
+// (sam != 0) branch, the prefixFnIdx fixed-prefix loop, and the emitVarLen
+// closure (both varLenEmptySuffix and varLenNonEmptySuffix) inside
+// emitSetMatchFnFinalShufti — TEST.md T13. TestCompileFile_ShuftiFrontend's
+// 33 trivial-prefix patterns never exercise any of these; this reuses the
+// same low-rarity first-byte alphabet (forcing the Shufti frontend
+// unconditionally) but rotates each pattern through 4 prefix shapes:
+// optional-prefix+empty-suffix (varLenMasks), ^-anchored (startAnchorMasks),
+// bounded-repeat-prefix+non-empty-suffix (varLenNonemptyMasks), and a
+// mandatory fixed-length class prefix (the plain prefixFnIdx loop).
+// Confirmed live via CompileSet probing: fe=shufti, and all four mask
+// fields (sam, varLen, varLenNE, prefixFnIdx) have non-zero/real entries.
+func TestCompileFile_ShuftiVarLenAndAnchor(t *testing.T) {
+	alphabet := lowRarityFirstBytes()
+	pats := make([]config.RegexEntry, len(alphabet))
+	for i, c := range alphabet {
+		var pat string
+		switch i % 4 {
+		case 0:
+			pat = fmt.Sprintf("[AB]?%cq%02dx", c, i) // varlen prefix, empty suffix
+		case 1:
+			pat = fmt.Sprintf("^%cq%02dx[a-z]+", c, i) // start-anchored, trivial prefix
+		case 2:
+			pat = fmt.Sprintf("[CD]{0,2}%cq%02dx[xy]", c, i) // varlen prefix, non-empty suffix
+		default:
+			pat = fmt.Sprintf("[EF]%cq%02dx[a-z]+", c, i) // fixed-length mandatory prefix
+		}
+		pats[i] = config.RegexEntry{Pattern: pat}
+	}
+	cfg := config.BuildConfig{
+		Regexps: pats,
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile Shufti varlen+anchor: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Errorf("invalid WASM magic")
+	}
+	assertDataSectionConsistent(t, wasm)
+}
+
+// TestCompileFile_ACStartAnchor exercises the start-anchor branch (sam != 0,
+// prefixFnIdx loop) in the AC frontend (emitSetMatchFnFinalAC) — TEST.md
+// T14. Extends TestSetFind_AC_VarLenPrefix's 20-pattern shape (which forces
+// the AC frontend, 17-32 unique literals) with one ^-anchored pattern.
+// Confirmed live via CompileSet probing: fe=ac, startAnchorMasks[0]=1.
+func TestCompileFile_ACStartAnchor(t *testing.T) {
+	const n = 20
+	regs := make([]config.RegexEntry, n)
+	for i := 0; i < n; i++ {
+		var pat string
+		switch {
+		case i == 0:
+			pat = fmt.Sprintf("^lit%02d", i)
+		case i%2 == 0:
+			pat = fmt.Sprintf(`[ab]?lit%02d`, i)
+		default:
+			pat = fmt.Sprintf(`[cd]{0,2}wrd%02d[xy]`, i)
+		}
+		regs[i] = config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: pat}
+	}
+	cfg := config.BuildConfig{
+		Regexps: regs,
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+}
+
+// TestCompileFile_TeddyTwoGroupsFourByte exercises the "Group B four-byte
+// lo/hi table load + nibble check" combination in emitSetMatchFnFinalTeddy
+// — TEST.md T15. TwoGroups requires > 8 literals; FourByte requires every
+// literal >= 4 bytes; existing tests only ever hit one condition at a time.
+// 9 patterns, each with a distinct 6-byte mandatory literal, stays under the
+// 16-literal Teddy cap while satisfying both. Confirmed live via CompileSet
+// probing: fe=teddy, teddyTabs.TwoGroups=true, teddyTabs.FourByte=true.
+func TestCompileFile_TeddyTwoGroupsFourByte(t *testing.T) {
+	const n = 9
+	pats := make([]config.RegexEntry, n)
+	for i := 0; i < n; i++ {
+		pats[i] = config.RegexEntry{Pattern: fmt.Sprintf("lit%02d_[a-z]+", i)}
+	}
+	cfg := config.BuildConfig{
+		Regexps: pats,
+		Sets: []config.SetConfig{
+			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile Teddy two-groups+four-byte: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Errorf("invalid WASM magic")
+	}
+	assertDataSectionConsistent(t, wasm)
+}
+
+// TestAssembleModuleWithSets_LitAnchorAndAnchoredGroups exercises the
+// litAnchorBackScanBody != nil branch and the anchored groupsExport branch
+// inside assembleModuleWithSets (the cfg.Sets-non-empty per-pattern
+// assembler), which are otherwise only exercised via assembleModule's
+// sets-less path — TEST.md T16. "secret_[A-Za-z0-9]+" qualifies for
+// lit-anchor find (confirmed live: findLitAnchorPoint returns non-nil, and
+// the pattern's small forward DFA has useU8=true); "^(a)(b)$" is an anchored
+// groups_func pattern. A trivial, unrelated Sets entry is present so
+// cfg.Sets is non-empty and assembleModuleWithSets (not assembleModule) is
+// used.
+func TestAssembleModuleWithSets_LitAnchorAndAnchoredGroups(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "lit_anchor", Pattern: `secret_[A-Za-z0-9]+`, FindFunc: "f1"},
+			{Name: "anchored_groups", Pattern: `^(a)(b)$`, GroupsFunc: "g1"},
+			{Name: "set_member", Pattern: `foo|bar`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", FindAny: "s_find", Patterns: config.PatternSelector{Names: []string{"set_member"}}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
+	}
+	assertDataSectionConsistent(t, wasm)
+}
+
+// TestCompileFile_ErrorPropagation exercises the two distinct error paths
+// through CompileFile's full config entry point (previously only unit-
+// tested at the analyzePattern level directly) — TEST.md T17.
+func TestCompileFile_ErrorPropagation(t *testing.T) {
+	t.Run("compilePattern_failure", func(t *testing.T) {
+		// Broken pattern WITH a func field set, alongside a non-empty Sets
+		// block: hits the compilePattern error path (CompileFile's
+		// per-pattern loop, before set resolution).
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{
+				{Name: "bad", Pattern: `[invalid`, MatchFunc: "m"},
+				{Name: "ok", Pattern: "foo"},
+			},
+			Sets: []config.SetConfig{
+				{Name: "s", FindAny: "f", Patterns: config.PatternSelector{Names: []string{"ok"}}},
+			},
+		}
+		_, _, err := CompileFile(cfg, "")
+		if err == nil {
+			t.Fatal("expected compilePattern error, got nil")
+		}
+	})
+	t.Run("analyzePattern_failure", func(t *testing.T) {
+		// Broken pattern with NO func fields, referenced only by a Sets
+		// entry: compilePattern returns nil,nil for it (no func fields to
+		// compile), so the error surfaces later via analyzePattern inside
+		// set resolution, wrapped as `set %q: pattern %q: %w`.
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{
+				{Name: "bad", Pattern: `[invalid`},
+			},
+			Sets: []config.SetConfig{
+				{Name: "myset", FindAny: "f", Patterns: config.PatternSelector{All: true}},
+			},
+		}
+		_, _, err := CompileFile(cfg, "")
+		if err == nil {
+			t.Fatal("expected analyzePattern error, got nil")
+		}
+		wantSubstr := `set "myset": pattern "bad":`
+		if !strings.Contains(err.Error(), wantSubstr) {
+			t.Errorf("error = %q, want substring %q", err.Error(), wantSubstr)
+		}
+	})
+}
+
+// TestSetMatch_ZeroWidthNonNilPrefix exercises the L <= 0 branch in
+// emitSetMatchFnAnchored — a pattern whose prefixAST is non-nil, not a
+// trivial prefix, and not variable-length, but whose fixed length is 0 (a
+// zero-width assertion, here \b, immediately before the mandatory literal)
+// — TEST.md T18. Confirmed live via analyzePattern/CompileSet probing:
+// prefixFnIdx=[0] (a real, non-trivial prefix function), prefixFixedLens=[0]
+// (zero-width), trivialPrefixMasks=[0] (not trivial) — exactly the L<=0,
+// fnIdx>=0 combination the doc flagged as needing verification.
+func TestSetMatch_ZeroWidthNonNilPrefix(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "p", Pattern: `\bfoo`}},
+		Sets: []config.SetConfig{
+			{Name: "s", Match: "s_match", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
+		t.Fatalf("invalid WASM")
 	}
 }

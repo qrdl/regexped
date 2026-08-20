@@ -48,12 +48,12 @@ func TestIsCountedClassChain_Accepts(t *testing.T) {
 
 func TestIsCountedClassChain_Rejects(t *testing.T) {
 	cases := []string{
-		`[A-Z0-9]{16,20}`,   // range, not exact — intermediate states also accept
-		`[A-Z0-9]{16,}`,     // open-ended
-		`[A-Z0-9]+`,         // unbounded self-loop (cycle)
-		`[A-Z]{8}[0-9]{8}`,  // class changes partway — not uniform C
+		`[A-Z0-9]{16,20}`,    // range, not exact — intermediate states also accept
+		`[A-Z0-9]{16,}`,      // open-ended
+		`[A-Z0-9]+`,          // unbounded self-loop (cycle)
+		`[A-Z]{8}[0-9]{8}`,   // class changes partway — not uniform C
 		`(?:AB|CD)[A-Z]{16}`, // branching before the chain
-		`[A-Z0-9]{16}\b`,    // word boundary
+		`[A-Z0-9]{16}\b`,     // word boundary
 	}
 	for _, pat := range cases {
 		table := chainTable(t, pat)
@@ -80,7 +80,10 @@ func TestIsCountedClassChain_RealPatterns(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d := newDFA(prog, false, true)
+		d, dOk := newDFA(prog, false, true, maxHelperDFAStates)
+		if !dOk {
+			t.Fatalf("newDFA: state limit exceeded")
+		}
 		full := dfaTableFrom(d)
 		_, n, ok := isCountedClassChain(full)
 		if ok {

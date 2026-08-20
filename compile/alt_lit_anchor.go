@@ -60,11 +60,38 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 			return nil, false
 		}
 		table := dfaTableFrom(fwdMatcher)
-		if table.hasWordBoundary || prefixContainsWordBoundary(br.lap.prefixRe) {
+		// Same gates as the single-pattern lit-anchor path in compile.go:
+		// `\b`/`\B` (Task 10) and, per FUZZER_BUGS.md #22, `(?m:^)`/`(?m:$)`
+		// in the prefix.
+		//
+		// DELIBERATE DIVERGENCE (plans/TODO.md task 51, 2026-08-17): compile.go's
+		// copy of this gate is now narrower — it admits a prefix led by
+		// `^`/`(?m:^)` with nothing after the anchor able to consume a '\n'
+		// (lineAnchoredPrefixSafe, lit_anchor.go), a shape §22's defect never
+		// covered. That relaxation would be equally sound here: this path calls
+		// buildLitAnchorBackScanBody verbatim, and buildAltLitAnchorForwardVerifyBody
+		// duplicates buildLitAnchorFindBody's newline-aware start-state selection
+		// and its emitNLPreAcceptCheck call. It is left un-relaxed only because
+		// no perftest/likelytest case exercises a line-anchored alternation, so
+		// the widening would be unmeasured — the stricter gate is always safe,
+		// making this a missed optimisation, not an unfixed sibling of §22.
+		// plans/TODO.md task 53 tracks lifting it behind a shared predicate.
+		if table.hasWordBoundary || table.hasNewlineBoundary ||
+			prefixContainsWordBoundary(br.lap.prefixRe) || prefixContainsLineAnchor(br.lap.prefixRe) {
 			return nil, false
 		}
 
-		l := buildDFALayout(table, cur, true, true, resolveCompiledDFAThreshold(&buildOpts), false, false, false, false)
+		l := buildDFALayout(dfaLayoutParams{
+			t:                    table,
+			tableBase:            cur,
+			needFind:             true,
+			leftmostFirst:        true,
+			compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
+			useAcceptSideTable:   false,
+			lmBareShufti:         false,
+			lmNonMidShufti:       false,
+			lmWideShufti:         false,
+		})
 		if !l.useU8 {
 			return nil, false
 		}
@@ -77,7 +104,10 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		if revCompErr != nil || needsUnicodeSupport(revProg) {
 			return nil, false
 		}
-		revDFA := newDFA(revProg, false, false)
+		revDFA, revOk := newDFA(revProg, false, false, maxHelperDFAStates)
+		if !revOk {
+			return nil, false
+		}
 		revTable := dfaTableFrom(revDFA)
 		if revTable.numStates+1 > 256 {
 			return nil, false
@@ -88,7 +118,17 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		}
 
 		revTableBase := utils.PageAlign(l.tableEnd)
-		revL := buildDFALayout(revTable, revTableBase, true, false, 0, false, false, false, false)
+		revL := buildDFALayout(dfaLayoutParams{
+			t:                    revTable,
+			tableBase:            revTableBase,
+			needFind:             true,
+			leftmostFirst:        false,
+			compiledDFAThreshold: 0,
+			useAcceptSideTable:   false,
+			lmBareShufti:         false,
+			lmNonMidShufti:       false,
+			lmWideShufti:         false,
+		})
 		bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
 
 		// Opt 1 (Task 7) — default-on for every mode, same as the
@@ -100,8 +140,8 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		applyDominantStateEncoding(l, false)
 		fvBody := buildAltLitAnchorForwardVerifyBody(table, l, buildOpts.tableMemIdx)
 
-		fwdRaw, fwdSegCnt := stripSegCount(dfaDataSegments(l, true))
-		revRaw, revSegCnt := stripSegCount(dfaDataSegments(revL, true))
+		fwdRaw, fwdSegCnt := stripSegCount(dfaDataSegments(l, true, false))
+		revRaw, revSegCnt := stripSegCount(dfaDataSegments(revL, true, false))
 		result.dataBytes = append(result.dataBytes, fwdRaw...)
 		result.dataSegCount += fwdSegCnt
 		result.dataBytes = append(result.dataBytes, revRaw...)
@@ -193,21 +233,18 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		}
 	}
 
-	var teddySegs []byte
-	teddySegCnt := 1
-	teddySegs = appendDataSegment(teddySegs, firstByteOff, unionFirstByteFlags[:])
+	var teddySegs segAccum
+	teddySegs.add(firstByteOff, unionFirstByteFlags[:])
 	if teddyLoBytes != nil {
-		teddySegs = appendDataSegment(teddySegs, teddyLoOff, teddyLoBytes)
-		teddySegs = appendDataSegment(teddySegs, teddyHiOff, teddyHiBytes)
-		teddySegCnt += 2
+		teddySegs.add(teddyLoOff, teddyLoBytes)
+		teddySegs.add(teddyHiOff, teddyHiBytes)
 		if teddyT1LoBytes != nil {
-			teddySegs = appendDataSegment(teddySegs, teddyT1LoOff, teddyT1LoBytes)
-			teddySegs = appendDataSegment(teddySegs, teddyT1HiOff, teddyT1HiBytes)
-			teddySegCnt += 2
+			teddySegs.add(teddyT1LoOff, teddyT1LoBytes)
+			teddySegs.add(teddyT1HiOff, teddyT1HiBytes)
 		}
 	}
-	result.dataBytes = append(result.dataBytes, teddySegs...)
-	result.dataSegCount += teddySegCnt
+	result.dataBytes = append(result.dataBytes, teddySegs.bytes...)
+	result.dataSegCount += teddySegs.count
 
 	result.firstByteOff = firstByteOff
 	result.firstByteFlags = unionFirstByteFlags
@@ -221,12 +258,11 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 	result.teddyT1LoBytes = teddyT1LoBytes
 	result.teddyT1HiBytes = teddyT1HiBytes
 
-	result.tableEnd = int64(teddyT1HiOff) + 16
-	if teddyLoBytes == nil {
-		result.tableEnd = int64(firstByteOff) + 256
-	} else if teddyT1LoBytes == nil {
-		result.tableEnd = int64(teddyHiOff) + 16
-	}
+	// Derived from the segments actually appended rather than re-deduced from
+	// whichever Teddy offsets happen to be assigned — the three-way branch this
+	// replaces had to stay in lockstep with the emission above by hand. See
+	// plans/OPUS.md §N10.
+	result.tableEnd = teddySegs.end
 
 	return result, true
 }

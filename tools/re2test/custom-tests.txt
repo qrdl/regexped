@@ -2,6 +2,14 @@
 # Format: col0=anchored-full-match(LL); col1=first-find(LF); col2="-"; col3="-"
 # Optional col4 (5th field): all find matches comma-separated.
 # Optional col5 (6th field): non-anchored find with captures.
+# Optional col6 (7th field): groups exhaustive re-entry — all matches produced
+# by repeatedly calling groups() and advancing by the reported match's own
+# relative end (the GroupsIter/generator advance-by-matchEnd convention every
+# generated stub uses, e.g. generate/js_stub.go's genJSGroupsFunc). Matches
+# are separated by "|"; each match's per-group spans are space-separated like
+# col5. This is the only column that exercises groups() at a nonzero ptr —
+# col0/col5 always call groups() at ptr=0 — so it's the only column that can
+# catch bugs specific to re-entry (see plans/TODO.md task 50).
 #
 # col0: standard DFA, must match from pos 0 consuming ALL input (leftmost-longest).
 #       Returns end=len(input) on success, or "-" for no match.
@@ -29,7 +37,7 @@ regexps
 -;-;-;-
 0-1;0-1;-;-
 -;-;-;-
--;0-1;-;-
+0-2;0-1;-;-
 -;1-2;-;-
 -;1-2;-;-
 -;0-1;-;-
@@ -61,7 +69,7 @@ regexps
 "a(?:b|bc)"
 -;-;-;-
 0-2;0-2;-;-
--;0-2;-;-
+0-3;0-2;-;-
 -;-;-;-
 -;-;-;-
 -;1-3;-;-
@@ -72,7 +80,7 @@ regexps
 -;-;-;-
 -;-;-;-
 0-3;0-3;-;-
--;0-3;-;-
+0-6;0-3;-;-
 -;-;-;-
 -;1-4;-;-
 -;0-3;-;-
@@ -92,7 +100,7 @@ regexps
 -;-;-;-
 0-1;0-1;-;-
 0-1;0-1;-;-
--;0-1;-;-
+0-2;0-1;-;-
 -;0-1;-;-
 -;1-2;-;-
 "ab|b|a"
@@ -123,7 +131,7 @@ regexps
 "a+?"
 -;-;-;-
 0-1;0-1;-;-
--;0-1;-;-
+0-3;0-1;-;-
 -;0-1;-;-
 -;-;-;-
 -;1-2;-;-
@@ -142,7 +150,7 @@ regexps
 -;-;-;-
 -;-;-;-
 0-2;0-2;-;-
--;0-2;-;-
+0-5;0-2;-;-
 -;0-2;-;-
 -;1-3;-;-
 # Cat2NonGreedySuffix: a+?b — non-greedy forces minimum "a"s before "b".
@@ -441,8 +449,8 @@ regexps
 0-3 0-0 0-3;0-3;-;-
 0-6 0-3 3-6;0-6;-;-
 -;-;-;-
--;0-4;-;-
--;0-2;-;-
+0-4 0-1 1-4;0-4;-;-
+0-2 0-1 1-2;0-2;-;-
 # ============================================================
 # Category 7: TDFA engine — capture edge cases
 # These patterns have deterministic alternation (disjoint first-char sets)
@@ -500,7 +508,7 @@ regexps
 -;-;-;-
 0-3 0-3 - -;0-3;-;-
 0-6 0-3 3-6 4-6;0-6;-;-
--;0-3;-;-
+0-3 0-3 - -;0-3;-;-
 -;-;-;-
 0-3 0-3 - -;0-3;-;-
 # ============================================================
@@ -545,8 +553,8 @@ regexps
 "(.*?)([0-9]+)"
 -;-;-;-;-;-
 -;-;-;-;-;-
--;0-4;-;-;0-4;0-4 0-1 1-4
--;0-2;-;-;0-2,2-4;0-2 0-1 1-2
+0-4 0-1 1-4;0-4;-;-;0-4;0-4 0-1 1-4
+0-2 0-1 1-2;0-2;-;-;0-2,2-4;0-2 0-1 1-2
 # ============================================================
 # Category 7 (TDFA) — non-anchored capture tests (col5).
 # ============================================================
@@ -574,10 +582,10 @@ regexps
 -;-;-;-;-;-
 -;-;-;-;-;-
 "([a-z]+)(-([0-9]+))?"
--;0-4;-;-;0-4;0-4 0-4 - -
--;0-4;-;-;0-4;0-4 0-4 - -
--;0-4;-;-;0-4,6-9,10-13;0-4 0-4 - -
--;0-4;-;-;0-4,6-7,8-9;0-4 0-4 - -
+0-4 0-4 - -;0-4;-;-;0-4;0-4 0-4 - -
+0-4 0-4 - -;0-4;-;-;0-4;0-4 0-4 - -
+0-4 0-4 - -;0-4;-;-;0-4,6-9,10-13;0-4 0-4 - -
+0-4 0-4 - -;0-4;-;-;0-4,6-7,8-9;0-4 0-4 - -
 -;4-10;-;-;4-10;4-10 4-7 7-10 8-10
 -;4-7;-;-;4-7;4-7 4-7 - -# ============================================================
 # Category 9: Mandatory literal extraction
@@ -794,14 +802,14 @@ regexps
 -;-;-;-
 0-1 -;0-1;-;-
 0-2 1-2;0-2;-;-
--;0-2;-;-
+0-2 1-2;0-2;-;-
 -;-;-;-
 -;1-3;-;-
 "(a)(b)?"
 -;-;-;-
 0-1 0-1 -;0-1;-;-
 0-2 0-1 1-2;0-2;-;-
--;0-2;-;-
+0-2 0-1 1-2;0-2;-;-
 -;-;-;-
 -;1-3;-;-
 Cat13TDFADeepOptional
@@ -818,8 +826,8 @@ regexps
 0-1 0-1 - -;0-1;-;-
 0-2 0-1 1-2 -;0-2;-;-
 0-3 0-1 1-2 2-3;0-3;-;-
--;0-2;-;-
--;0-1;-;-
+0-2 0-1 1-2 -;0-2;-;-
+0-1 0-1 - -;0-1;-;-
 Cat13TDFAFoldCase
 strings
 ""
@@ -860,15 +868,15 @@ regexps
 0-3 0-3 0-3;0-3;-;-
 0-4 0-4 0-4;0-4;-;-
 -;-;-;-
--;0-1;-;-
+0-1 0-1 0-1;0-1;-;-
 "((a*)+)"
 0-0 0-0 0-0;0-0;-;-
 0-1 0-1 0-1;0-1;-;-
 0-2 0-2 0-2;0-2;-;-
 0-3 0-3 0-3;0-3;-;-
 0-4 0-4 0-4;0-4;-;-
--;0-0;-;-
--;0-1;-;-
+0-0 0-0 0-0;0-0;-;-
+0-1 0-1 0-1;0-1;-;-
 Cat14BacktrackWordCapture
 strings
 ""
@@ -881,10 +889,10 @@ regexps
 "(\\b[a-z]+\\b)"
 -;-;-;-
 0-5 0-5;0-5;-;-
--;0-5;-;-
+0-5 0-5;0-5;-;-
 -;-;-;-
 -;-;-;-
--;0-3;-;-
+0-3 0-3;0-3;-;-
 Cat14BacktrackNonGreedyMulti
 strings
 ""
@@ -917,9 +925,9 @@ regexps
 ".*?(needle)"
 -;-;-;-;-
 0-6 0-6;0-6;-;-;0-6
--;0-15;-;-;0-15
+0-15 9-15;0-15;-;-;0-15
 -;-;-;-;-
--;0-7;-;-;0-7
+0-7 1-7;0-7;-;-;0-7
 -;-;-;-;-
 Cat9CaptureInMandatory
 strings
@@ -1002,9 +1010,9 @@ regexps
 "([a-z]+)\\s+([a-z]+)"
 -;-;-;-
 0-11 0-5 6-11;0-11;-;-
--;0-9;-;-
+0-9 0-3 4-9;0-9;-;-
 -;-;-;-
--;0-7;-;-
+0-7 0-3 4-7;0-7;-;-
 # ============================================================
 # Category 16: Multiline mode — (?m:^) and (?m:$) anchors
 # ============================================================
@@ -1018,13 +1026,13 @@ strings
 regexps
 "(?m:^foo)"
 -;-;-;-
--;0-3;-;-
+0-3;0-3;-;-
 -;4-7;-;-
 -;0-3;-;-
 -;4-7;-;-
 "(?m:foo$)"
 -;-;-;-
--;0-3;-;-
+0-3;0-3;-;-
 -;4-7;-;-
 -;-;-;-
 -;-;-;-
@@ -1105,7 +1113,7 @@ regexps
 -;-;-;-;-;-
 0-3 0-3;0-3;-;-;-;0-3 0-3
 -;4-7;-;-;-;4-7 4-7
--;0-3;-;-;-;0-3 0-3
+0-3 0-3;0-3;-;-;-;0-3 0-3
 -;4-7;-;-;-;4-7 4-7
 -;-;-;-;-;-
 -;-;-;-;-;-
@@ -1113,7 +1121,7 @@ regexps
 -;-;-;-;-;-
 0-3 0-3;0-3;-;-;-;0-3 0-3
 -;4-7;-;-;-;4-7 4-7
--;0-3;-;-;-;0-3 0-3
+0-3 0-3;0-3;-;-;-;0-3 0-3
 -;4-7;-;-;-;4-7 4-7
 -;-;-;-;-;-
 -;-;-;-;-;-
@@ -1121,7 +1129,7 @@ regexps
 -;-;-;-;-;-
 0-3 0-3;0-3;-;-;-;0-3 0-3
 -;4-7;-;-;-;4-7 4-7
--;0-3;-;-;-;0-3 0-3
+0-3 0-3;0-3;-;-;-;0-3 0-3
 -;4-7;-;-;-;4-7 4-7
 -;-;-;-;-;-
 -;-;-;-;-;-
@@ -1151,31 +1159,31 @@ strings
 regexps
 "(?i:foo)"
 -;-;-;-
--;0-3;-;-
--;0-3;-;-
--;0-3;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
 -;0-3;-;-
 -;0-3;-;-
 -;-;-;-
 -;-;-;-
 "(?i:foo|bar)"
 -;-;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
 -;0-3;-;-
 -;0-3;-;-
--;0-3;-;-
--;0-3;-;-
--;0-3;-;-
--;0-3;-;-
--;0-3;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
 "(?i:[a-z]+)"
 -;-;-;-
--;0-3;-;-
--;0-3;-;-
--;0-3;-;-
--;0-6;-;-
--;0-6;-;-
--;0-3;-;-
--;0-3;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+0-6;0-6;-;-
+0-6;0-6;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
 Cat19CaseInsensitiveGroups
 strings
 ""
@@ -1196,8 +1204,8 @@ regexps
 0-3 0-3;0-3;-;-
 0-3 0-3;0-3;-;-
 0-3 0-3;0-3;-;-
--;0-3;-;-
--;0-3;-;-
+0-3 0-3;0-3;-;-
+0-3 0-3;0-3;-;-
 -;1-4;-;-
 -;-;-;-
 -;-;-;-
@@ -1212,9 +1220,9 @@ regexps
 -;-;-;-
 -;-;-;-
 -;-;-;-
--;0-12;-;-
--;0-12;-;-
--;0-12;-;-
+0-12 0-4 5-12;0-12;-;-
+0-12 0-4 5-12;0-12;-;-
+0-12 0-4 5-12;0-12;-;-
 0-12 0-4 5-12;0-12;-;-
 0-12 0-4 5-12;0-12;-;-
 "(?i:(foo)(bar))"
@@ -1264,31 +1272,31 @@ strings
 regexps
 "(?s:.)"
 -;-;-;-
+0-1;0-1;-;-
 -;0-1;-;-
 -;0-1;-;-
 -;0-1;-;-
--;0-1;-;-
--;0-1;-;-
+0-1;0-1;-;-
 -;0-1;-;-
 -;0-1;-;-
 "(?s:a.b)"
 -;-;-;-
 -;-;-;-
 -;-;-;-
--;0-3;-;-
+0-3;0-3;-;-
 -;-;-;-
 -;-;-;-
 -;-;-;-
 -;1-4;-;-
 "(?s:.+)"
 -;-;-;-
--;0-1;-;-
--;0-2;-;-
--;0-3;-;-
--;0-4;-;-
--;0-1;-;-
--;0-4;-;-
--;0-5;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+0-1;0-1;-;-
+0-4;0-4;-;-
+0-5;0-5;-;-
 Cat20DotAllTDFA
 strings
 ""
@@ -1308,8 +1316,8 @@ regexps
 "(?s:(a)(.))"
 -;-;-;-
 0-2 0-1 1-2;0-2;-;-
--;0-2;-;-
--;0-2;-;-
+0-2 0-1 1-2;0-2;-;-
+0-2 0-1 1-2;0-2;-;-
 -;1-3;-;-
 -;1-3;-;-
 Cat20DotAllBacktrack
@@ -1324,7 +1332,7 @@ regexps
 -;-;-;-
 0-2 0-1 1-2;0-2;-;-
 0-3 0-2 2-3;0-3;-;-
--;0-5;-;-
+0-5 0-4 4-5;0-5;-;-
 -;-;-;-
 "(?s:(.*\n)(.+))"
 -;-;-;-
@@ -1349,22 +1357,22 @@ strings
 regexps
 "(?U:a+)"
 -;-;-;-
--;0-1;-;-
--;0-1;-;-
+0-1;0-1;-;-
+0-3;0-1;-;-
 -;0-1;-;-
 -;0-1;-;-
 "(?U:.+)"
 -;-;-;-
--;0-1;-;-
--;0-1;-;-
--;0-1;-;-
--;0-1;-;-
+0-1;0-1;-;-
+0-3;0-1;-;-
+0-2;0-1;-;-
+0-4;0-1;-;-
 "(?U:a+b+)"
 -;-;-;-
 -;-;-;-
 -;-;-;-
--;0-2;-;-
--;0-3;-;-
+0-2;0-2;-;-
+0-4;0-3;-;-
 Cat21UngreedyBacktrack
 strings
 ""
@@ -1376,21 +1384,21 @@ regexps
 "(?U:(a+))"
 -;-;-;-
 0-1 0-1;0-1;-;-
--;0-1;-;-
--;0-1;-;-
--;0-1;-;-
+0-1 0-1;0-1;-;-
+0-1 0-1;0-1;-;-
+0-1 0-1;0-1;-;-
 "(?U:(a+)(b+))"
 -;-;-;-
 -;-;-;-
 -;-;-;-
 0-2 0-1 1-2;0-2;-;-
--;0-4;-;-
+0-4 0-3 3-4;0-4;-;-
 "(?U:(a*)(b+))"
 -;-;-;-
 -;-;-;-
 -;-;-;-
 0-2 0-1 1-2;0-2;-;-
--;0-4;-;-
+0-4 0-3 3-4;0-4;-;-
 # ============================================================
 # Category 22: BitState memoization — zero-matchable loop bodies
 # Patterns with nested zero-matching quantifiers that would loop
@@ -1408,31 +1416,31 @@ regexps
 "((a*)*)"
 0-0 0-0 0-0;0-0;-;-
 0-1 0-1 0-1;0-1;-;-
--;0-0;-;-
+0-0 0-0 0-0;0-0;-;-
 0-2 0-2 0-2;0-2;-;-
--;0-1;-;-
+0-1 0-1 0-1;0-1;-;-
 0-3 0-3 0-3;0-3;-;-
 "((a+)*)"
 0-0 0-0 -;0-0;-;-
 0-1 0-1 0-1;0-1;-;-
--;0-0;-;-
+0-0 0-0 -;0-0;-;-
 0-2 0-2 0-2;0-2;-;-
--;0-1;-;-
+0-1 0-1 0-1;0-1;-;-
 0-3 0-3 0-3;0-3;-;-
 "(a*)"
 0-0 0-0;0-0;-;-
 0-1 0-1;0-1;-;-
--;0-0;-;-
+0-0 0-0;0-0;-;-
 0-2 0-2;0-2;-;-
--;0-1;-;-
+0-1 0-1;0-1;-;-
 0-3 0-3;0-3;-;-
 "(?:(?:(a){0,})*?)"
 0-0 -;0-0;-;-
--;0-0;-;-
--;0-0;-;-
--;0-0;-;-
--;0-0;-;-
--;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
 # ============================================================
 # Category 23: Backtracking — EmptyBeginLine / EmptyEndLine mid-pattern
 # Bug: BT EmptyBeginLine handler checks only pos==0; EmptyEndLine only pos==len.
@@ -1483,7 +1491,7 @@ regexps
 -;-;-;-;-;-
 0-3 0-3;0-3;-;-;-;0-3 0-3
 -;1-4;-;-;-;1-4 1-4
--;0-3;-;-;-;0-3 0-3
+0-3 0-3;0-3;-;-;-;0-3 0-3
 -;1-4;-;-;-;1-4 1-4
 "((?s).+)"
 -;-;-;-;-;-
@@ -2082,9 +2090,9 @@ regexps
 0-16 0-16;0-16;-;-
 0-17 0-17;0-17;-;-
 -;1-27;-;-
--;0-16;-;-
--;0-53;-;-
--;0-20;-;-
+0-16 0-16;0-16;-;-
+0-53 0-53;0-53;-;-
+0-20 0-20;0-20;-;-
 0-31 0-31;0-31;-;-
 0-32 0-32;0-32;-;-
 "<([a-z]+)>"
@@ -2277,3 +2285,3103 @@ regexps
 -;5-9;-;-
 -;5-9;-;-
 -;5-9;-;-
+# ============================================================
+# Category 33: two independent bounded-repetition inverted classes
+# straddling an ambiguous literal split point.
+#
+# Bug found 2026-08-06: [^,]{250,}X[^;]{250,} made newDFA's subset
+# construction explode to 40,000+ states with no plateau in sight (any byte,
+# including 'X' itself, is valid inside BOTH classes, so the DFA had to track
+# many candidate "how far past a past X am I" positions simultaneously).
+# CompileOptions.MaxDFAStates was powerless to stop it: it was only checked
+# on newDFA's *output*, after the (now unbounded-in-practice) construction
+# already ran. Fixed by giving newDFA its own internal state cap
+# (maxHelperDFAStates, decoupled from MaxDFAStates), matching newTDFA's
+# existing convention.
+#
+# TestDFAStateLimitBailsOutFast (compile package) guards the actual bug at
+# its original scale (n=250): asserts newDFA bails out fast and Compile()
+# still falls back to Backtracking rather than hanging. That test is
+# compile-only — it doesn't check that the resulting WASM actually matches
+# correctly. This fixture closes that gap at a human-readable scale (n=5):
+# same structural shape (two inverted classes, ambiguous split point), run
+# under both the naturally-selected engine (plain `make custom`, currently
+# Compiled DFA at this size) and forced Backtracking (`make force-backtrack`,
+# which sets MaxDFAStates=1) — the exact fallback engine the real bug
+# resolves to at scale. All expected positions below are cross-checked
+# against Go stdlib regexp (ground truth), not hand-derived.
+# ============================================================
+DoSPatternInvertedClassBoundedRepeat
+strings
+"aaaaaXbbbbb"
+"aaaaXbbbbb"
+"aaaaaaaaXbbbbbbbb"
+",aaaaaXbbbbb"
+"aaaaaXaaaaXbbbbb"
+"aaaaaXaaaaXbb;bbbbb"
+regexps
+"[^,]{5,}X[^;]{5,}"
+# case 1 (len=11): boundary positive: n non-comma + X + n non-semicolon
+0-11;0-11;-;-
+# case 2 (len=10): one short on the left: no match anywhere
+-;-;-;-
+# case 3 (len=17): comfortably over the boundary both sides (greedy)
+0-17;0-17;-;-
+# case 4 (len=12): leading comma: anchored fails, find succeeds at pos 1
+-;1-12;-;-
+# case 5 (len=16): two X's present: 2nd run absorbs the 2nd X (X is [^;] too); full-string match either way
+0-16;0-16;-;-
+# case 6 (len=19): two X's + trailing ';': find still matches by absorbing the 2nd X and stopping at ';'; anchored fails (doesn't reach end of string)
+-;0-13;-;-
+# ============================================================
+# Category 34: literal NUL byte in pattern — find body OOB read
+#
+# Bug found 2026-08-06 by tools/fuzz's Layer-1 fuzzer (plans/FUZZER.md):
+# pattern "a\x00" against 1-byte input "a" returned WASM match [0,2) — the
+# find body read one byte past the declared input length, and happened to
+# treat whatever it found there (uninitialized/zero WASM memory in the
+# fuzz harness) as a literal \x00 match.
+# "za" repeats the same shape at a non-zero find start position, to check
+# the OOB read isn't specific to position 0. "a\x00" / "za\x00" are
+# positive controls: the pattern must still match correctly when the NUL
+# byte is genuinely present within bounds.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+NulByteLiteralOOBRead
+strings
+""
+"a"
+"za"
+"a\x00"
+"za\x00"
+regexps
+"a\x00"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;1-3;-;-
+# ============================================================
+# Category 35: DFA find — end-anchor immediately followed by begin-anchor
+#
+# Bug found 2026-08-06 (plans/FUZZER_BUGS.md §6/§7): patterns shaped like
+# an end-anchor ($/\z) directly followed by a begin-anchor (^/\A), e.g.
+# "(?:(?:$)(?:^))", incorrectly reported an empty match at pos==len(input)
+# in find mode on non-empty input. Root cause: newDFA's midStart bootstrap
+# state got silently aliased onto the true start state whenever both
+# epsilon closures block at the same leading end-anchor instruction before
+# reaching anything gated on the begin-anchor — losing the begin-anchor
+# exclusivity that only the true start state (attempt_start==0) is
+# entitled to. Both conditions can only hold simultaneously on empty
+# input, so the correct answer is "match at 0-0" only for "" and "-"
+# (no match anywhere) for every non-empty input.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+EndAnchorThenBeginAnchor
+strings
+""
+"a"
+"ab"
+"baaa"
+regexps
+"(?:(?:$)(?:^))"
+0-0;0-0;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"(?:(?:\\z)(?:\\A))"
+0-0;0-0;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"(?:(?:(?:\\z)+)(?:\\A))"
+0-0;0-0;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (Backtracking native/anchored captures) — task 10.3/§9 fix.
+# A leading ^ makes the pattern p.anchored (isAnchoredFind): the compiled
+# groups function IS the Backtracking captureBody, exported directly with
+# the caller's full, un-narrowed input length (no independent find pass
+# bounds it first). InstMatch previously required pos==len unconditionally,
+# which is only correct under the wrapper-composed (!anchored) convention —
+# under native/anchored it wrongly forced full-input consumption, so lazy/
+# optional capture groups that should stop early (or fail) instead kept
+# backtracking past the correct leftmost-first answer.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+BacktrackNativeAnchoredCapture
+strings
+""
+"a"
+"b"
+"ba"
+"aaaaaa"
+regexps
+"^(a+?)"
+-;-;-;-
+0-1 0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+0-1 0-1;0-1;-;-
+"^(?:(?:(a){0,})*?)"
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+"^(?:(?:(?:(a){0,})*?))"
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+"^(a*)?"
+0-0 0-0;0-0;-;-
+0-1 0-1;0-1;-;-
+0-0 0-0;0-0;-;-
+0-0 0-0;0-0;-;-
+0-6 0-6;0-6;-;-
+# ============================================================
+# Category (TDFA native/anchored range-quantifier priority) — FUZZER_BUGS.md
+# §12. A leading ^ makes the pattern p.anchored (isAnchoredFind): the
+# compiled groups function IS the TDFA captureBody, exported directly with
+# the caller's full, un-narrowed input length. An outer repeat (`*`/`+`)
+# wrapping a range-quantified (`{m,n}`, m<n) capture group creates a state
+# whose live NFA threads include, simultaneously, a completed higher-
+# priority Match AND a lower-priority Rune-consumer continuing into a fresh
+# repetition (e.g. after the optional 4th copy of `(a){3,4}` is taken, one
+# thread reaches Match while another, lower-priority thread starts a new
+# repetition's mandatory copies). newTDFA's subset construction stored each
+# state's NFA PCs in canonical (pc-ascending, hash-friendly) order and reused
+# that order to decide which byte transitions survive — losing the true
+# leftmost-first priority order that the shared kill-lower-priority-after-
+# match pruning (nfaBuildInputMap) depends on. The lower-priority thread
+# survived when it should have died, letting a fresh, still-incomplete
+# repetition's later position get wrongly treated as accepting once it
+# happened to consume enough bytes to independently satisfy the {m,n} again
+# — reporting a match that extends past the correct (higher-priority,
+# earlier) leftmost-first answer.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+TDFANativeAnchoredRangeQuantifierPriority
+strings
+""
+"aaa"
+"aaaa"
+"aaaaa"
+"aaaaaa"
+"aaaaaaa"
+"aaaaaaaa"
+"aaaaaaaaa"
+"aaaaaaaaaa"
+regexps
+"^(?:(a){3,4})*"
+0-0 -;0-0;-;-
+0-3 2-3;0-3;-;-
+0-4 3-4;0-4;-;-
+0-4 3-4;0-4;-;-
+0-4 3-4;0-4;-;-
+0-7 6-7;0-7;-;-
+0-8 7-8;0-8;-;-
+0-8 7-8;0-8;-;-
+0-8 7-8;0-8;-;-
+# ============================================================
+# Category (no-capture Backtracking find, FUZZER_BUGS.md §17) —
+# these patterns naturally select Compiled DFA (unaffected); the two bugs
+# below only ever fire under --force-backtrack, which overflows the DFA
+# and routes match/find through buildBTMatchBody/buildBTFindBody's
+# no-capture fallback. Kept here anyway (not force-backtrack-only) so the
+# rows also exercise the normal DFA path as a control.
+#
+# (a) emitIsWordCharFromScratch (engine_backtrack.go) appended opcode 0x4E
+#     for the upper-bound half of each [a-z]/[A-Z]/[0-9] range check,
+#     believing it to be i32.le_u — it is actually i32.ge_s (le_u is 0x4D).
+#     byte>=lower AND byte>=upper collapses to "byte>=upper", so isWordChar
+#     misclassified almost every byte in each range as non-word (only the
+#     exact top-of-range byte, or falling through to a later range, ever
+#     passed). Fixed: 0x4E -> 0x4D at the three upper-bound checks.
+# (b) buildBTFindBody's per-Alt zero-progress loop guard (a single shared
+#     "last seen pos" local per loop-Alt PC, reset once per attempt_start)
+#     gets corrupted by backtracking through nested nullable loops (e.g.
+#     `(?:a?)+`): a later stack-pop can re-enter a loop head at a pos the
+#     guard already associates with a *different* branch of the search,
+#     letting the pc2<->pc3 cycle regrow every time it's revisited instead
+#     of being cut off — stack usage climbs without bound until the
+#     overflow guard's unconditional "return -1" abandoned the whole find,
+#     not just the doomed attempt_start (visible whenever a genuine match
+#     exists only at a *later* attempt_start than the one that runs into
+#     this). Fixed: on overflow, abandon just this attempt_start (branch to
+#     $run_exit) instead of returning -1 from the whole function — bounded
+#     by construction, unlike an earlier "treat like any failed
+#     alternative" attempt which could oscillate forever at the stack
+#     ceiling.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+BacktrackNoCaptureWordBoundary
+strings
+"0"
+""
+"ab"
+" a"
+"m"
+"!"
+regexps
+"\\B"
+-;-;-;-
+0-0;0-0;-;-
+-;1-1;-;-
+-;0-0;-;-
+-;-;-;-
+-;0-0;-;-
+"\\b"
+-;0-0;-;-
+-;-;-;-
+-;0-0;-;-
+-;1-1;-;-
+-;0-0;-;-
+-;-;-;-
+BacktrackNoCaptureLoopGuardOverflow
+strings
+""
+"a"
+"b"
+"ab"
+"aa"
+"aab"
+"aaa"
+"aaab"
+regexps
+"(?:a?)+$"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;1-1;-;-
+-;2-2;-;-
+0-2;0-2;-;-
+-;3-3;-;-
+0-3;0-3;-;-
+-;4-4;-;-
+# ============================================================
+# Category (Backtracking EmptyBeginLine/EmptyEndLine br-depth escape,
+# FUZZER_BUGS.md §19) — emitBTInstHandler's (?m:^)/(?m:$) cases nest
+# btFail's br two if-blocks deep (outer if/else, then a nested if for the
+# actual prev/next-byte check) but only escaped one level's worth of depth
+# (brRunNested = one-if-deep, not two). Under-escaping by exactly one level
+# lands the "fail" branch at the WASM state-dispatcher's very last handler
+# slot (InstMatch) instead of back at the loop restart -- so a correctly
+# detected assertion failure was silently converted into an immediate
+# accept at the current pos. Fixed: btFail(brRunNested+1) in both cases.
+# These patterns force Backtrack naturally (hasLineAnchors gate), no
+# --force-backtrack needed. All expected values cross-checked against Go
+# stdlib regexp.
+# ============================================================
+BacktrackEmptyLineBrDepth
+strings
+"foobar"
+"foo"
+"foo\nbar"
+"xbar"
+"x\nbar"
+regexps
+"^(?m:(foo)$)"
+-;-;-;-;-;-
+0-3 0-3;0-3;-;-;-;0-3 0-3
+0-3 0-3;0-3;-;-;-;0-3 0-3
+-;-;-;-;-;-
+-;-;-;-;-;-
+"^x(?m:^(bar))"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+"^x\\n(?m:^(bar))"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+0-5 2-5;0-5;-;-;-;0-5 2-5
+# ============================================================
+# Category (Backtracking greedy-loop zero-progress guard, FUZZER_BUGS.md
+# §20) — (?:a*|b*)*'s outer greedy loop has a body that can match empty via
+# EITHER alternative branch. When the higher-priority branch (a*) completes
+# a repeat attempt with zero width after at least one earlier iteration made
+# real progress, the old zero-progress guard branched straight to the
+# loop's exit, discarding the still-pending, higher-priority sibling
+# alternative (b*) that was pushed onto the backtrack stack for that same
+# iteration attempt. Fixed: the guard now fails into the normal
+# backtrack-stack pop (btFail) instead of a direct branch for greedy loops,
+# so that pending sibling is tried before the loop actually gives up.
+# No captures, so this pattern normally compiles to plain DFA; only
+# --force-backtrack exercises the fixed code path. All expected values
+# cross-checked against Go stdlib regexp (find = non-anchored
+# FindStringIndex; col0 = \A(?:PATTERN)\z, i.e. full-consumption anchored
+# match, matchFn's actual contract).
+# ============================================================
+BacktrackGreedyLoopAltZeroProgress
+strings
+""
+"a"
+"b"
+"ab"
+"ba"
+"aaab"
+"aabaaab"
+"bab"
+"aab"
+"abab"
+regexps
+"(?:a*|b*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+0-1;0-0;-;-
+0-2;0-2;-;-
+0-2;0-0;-;-
+0-4;0-4;-;-
+0-7;0-7;-;-
+0-3;0-0;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+# ============================================================
+# Category (DFA find-mode computePrefix word/newline-boundary pre-accept
+# gap, FUZZER_BUGS.md §22) — computePrefix's bail-out check (used to derive
+# a mandatory-literal-prefix fast-skip for non-anchored find) only tested
+# plain accept/mid-accept state flags, not midAcceptWStates/midAcceptNWStates
+# (word-boundary pre-accept, checked against the byte about to be consumed
+# rather than the current state alone). For patterns like `0*\b`/`a*\b`
+# whose zero-width match at a candidate position depends purely on that
+# pre-accept check, computePrefix still walked the state graph's ordinary
+# byte transitions and derived a bogus single-byte "mandatory" literal
+# (e.g. "a" for `a*\b`), causing the SIMD fast-skip to skip straight past
+# any position not starting with that byte -- even positions where the
+# pattern already matches empty via the word-boundary check alone. Fixed:
+# bail out (return nil, disabling the fast-skip) when the mid-start state
+# has any of midAcceptWStates/midAcceptNWStates/midAcceptNLStates set, same
+# as the existing accept/midAccept bail-out. All expected values
+# cross-checked against Go stdlib regexp (find = non-anchored
+# FindStringIndex; col0 = \A(?:PATTERN)\z, i.e. full-consumption anchored
+# match, matchFn's actual contract). Found by tools/fuzz (crasher
+# 170149-ddf199b4967cf85a: `0*\b` vs "1").
+# ============================================================
+DFAFindPrefixSkipWordBoundary
+strings
+""
+"1"
+"0"
+"00"
+"0a"
+"a"
+" "
+"a1"
+"1a"
+regexps
+"0*\\b"
+-;-;-;-
+-;0-0;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;0-0;-;-
+-;0-0;-;-
+"a*\\b"
+-;-;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;0-0;-;-
+-;0-0;-;-
+"x*\\B"
+0-0;0-0;-;-
+-;-;-;-
+-;-;-;-
+-;1-1;-;-
+-;1-1;-;-
+-;-;-;-
+-;0-0;-;-
+-;1-1;-;-
+-;1-1;-;-
+# ============================================================
+# Category (DFA find-mode fast-skip prefixEndState derived unconditionally
+# from midStartState, FUZZER_BUGS.md §23) — buildDFALayout's prefix-scan
+# shortcut walked the mandatory-literal prefix from midStartState to
+# compute the post-prefix jump state (wasmPrefixEnd/prefixEndState) and
+# used it for every attempt position, including attempt_start==0. For
+# begin-anchored patterns like `0*^0` whose mid-string automaton is a
+# dead-end self-loop that isAnchoredFind's zero-live-transitions check
+# doesn't catch (the self-loop has a live transition to itself),
+# startState and midStartState are genuinely different automata: at
+# attempt_start==0 the correct post-prefix state comes from startState's
+# own chain, not midStartState's. Using midStartState's chain unconditionally
+# resumed the scan from a state that can never accept, silently losing the
+# real match at position 0. Fixed by computing a third state,
+# wasmPrefixEndStart (walked from startState), and selecting it in the
+# find loop's OnMatch callback whenever attempt_start==0 and it diverges
+# from prefixEndState -- mirroring the existing hasWordBoundary
+# prefixEndState/prefixEndStateWord split. All expected values
+# cross-checked against Go stdlib regexp (find = non-anchored
+# FindStringIndex; col0 = \A(?:PATTERN)\z). Found by tools/fuzz (crasher
+# 165348-82ca52482fd7d084: `0*^0` vs "00").
+# ============================================================
+DFAFindPrefixEndStateStart
+strings
+""
+"0"
+"00"
+"000"
+"10"
+"01"
+"1"
+regexps
+"0*^0"
+-;-;-;-
+0-1;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;-;-;-
+-;0-1;-;-
+-;-;-;-
+# ============================================================
+# WordBoundaryAltPriority: a \b/\B-gated branch loses leftmost-first
+# priority to a later empty alternation branch (FUZZER_BUGS.md #24).
+# \b0|  vs "0": \b0 (higher priority, byte-consuming) should win over the
+#   empty branch -- expect find=[0,1), not the empty match [0,0).
+# \bx|  vs "x": same shape, different literal/boundary byte.
+# |\b0  and \B0|  are controls: the empty branch legitimately wins there
+#   (listed first, or the \B branch is genuinely dead at pos 0), so both
+#   were already correct before the fix and must stay correct after.
+# \b0   (no trailing alt) is a control that \b works fine in isolation.
+# All expected values cross-checked against Go stdlib regexp (col0 =
+# \A(?:PATTERN)\z, col1 = FindStringIndex).
+# ============================================================
+WordBoundaryAltPriority
+strings
+"0"
+"x"
+"00"
+"xx"
+""
+"0x"
+"x0"
+"10"
+"a0"
+regexps
+"\\b0|"
+0-1;0-1;-;-
+-;0-0;-;-
+-;0-1;-;-
+-;0-0;-;-
+0-0;0-0;-;-
+-;0-1;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"\\bx|"
+-;0-0;-;-
+0-1;0-1;-;-
+-;0-0;-;-
+-;0-1;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-1;-;-
+-;0-0;-;-
+-;0-0;-;-
+"|\\b0"
+0-1;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"\\B0|"
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"\\b0"
+0-1;0-1;-;-
+-;-;-;-
+-;0-1;-;-
+-;-;-;-
+-;-;-;-
+-;0-1;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category 27 (FUZZER_BUGS.md #26): \b inside a capturing group loses the
+# match entirely. Two distinct, unrelated root causes, both keyed on
+# whether the two \b contexts (prev=word vs prev=non-word) require a
+# DIFFERENT first byte — e.g. `\b[-0]` wants '0' after a non-word byte but
+# '-' after a word byte:
+#  1. compile/engine_dfa.go's find-mode fast-skip: computePrefix derived a
+#     single "mandatory" literal byte from midStartState alone (ignoring
+#     midStartWordState's possibly-different requirement), and the
+#     firstByteFlags/Teddy fallback only ever looked at midStartState's/
+#     startState's live bytes, never midStartWordState's — so the fast-skip
+#     scanned for only ONE of the two valid candidate bytes, silently
+#     skipping every match reached via the other context. repro:
+#     pat="(\b[-0])" input="1-" — groups_func (composed behind this find)
+#     wrongly reports no match. Exercises the DFA fix only: this pattern's
+#     sole capture spans the whole match (task 41's trivial shortcut), so
+#     no Backtracking captureBody re-walk happens at all.
+#  2. compile/engine_backtrack.go's captureBody, independently: its
+#     btWordBoundary treats pos==0/pos==len as the true start/end of the
+#     input, but when composed behind a find wrapper those are just the
+#     edges of the DFA-narrowed match slice — losing real \b context on
+#     the other side whenever the narrowed slice doesn't start/end at the
+#     original input's true edges. repro: pat="(\b[-0])x" input="1-x" —
+#     confirmed still failing with only the #1 fix applied (outer find
+#     correctly locates the match; captureBody's own re-check of \b at the
+#     match's own start then wrongly fails it). "(-\b)"/"a-1" pattern below
+#     is the symmetric case at the OTHER edge (nextIsWord).
+# ============================================================
+strings
+"1-"
+"x-"
+"-"
+"a-1"
+"a- "
+"-1"
+regexps
+"(\\b[-0])"
+-;1-2;-;-;-;1-2 1-2
+-;1-2;-;-;-;1-2 1-2
+-;-;-;-;-;-
+-;1-2;-;-;-;1-2 1-2
+-;1-2;-;-;-;1-2 1-2
+-;-;-;-;-;-
+"(-\\b)"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;1-2;-;-;-;1-2 1-2
+-;-;-;-;-;-
+0-1 0-1;0-1;-;-;-;0-1 0-1
+strings
+"1-x"
+"x-x"
+"-x"
+"10x"
+"1-0x"
+regexps
+"(\\b[-0])x"
+-;1-3;-;-;-;1-3 1-2
+-;1-3;-;-;-;1-3 1-2
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;2-4;-;-;-;2-4 2-3
+# ============================================================
+# Category (FUZZER_BUGS.md #1): \B immediately before ^/\A loses the
+# begin-of-text context. state 0's mid-accept computation resolved \B
+# (ecNoWordBoundary/ecWordBoundary) without also carrying ecBegin, so the
+# chained ^/\A check behind it could never fire. \B^ / \B\A must match
+# empty at [0,0) on "" (both \B and ^/\A hold trivially at the true start
+# of an empty string) but must NOT match on any non-empty input starting
+# with a word char ("a", "0") or even a non-word char (" ") where \B holds
+# but the pattern can't consume anything, so anchored full-match always
+# fails on non-empty input. ^\B / \A\B (assertion order reversed) are
+# controls that were already correct before the fix and must stay correct.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug1AssertionOrder
+strings
+""
+" "
+"a"
+"0"
+regexps
+"\\B^"
+0-0;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"\\B\\A"
+0-0;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"^\\B"
+0-0;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"\\A\\B"
+0-0;0-0;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #2): a \b/\B branch's resolved empty-accept can
+# be silently overwritten by a lower-priority live branch. emitWBPreAcceptCheck
+# recorded last_accept on a mid-accept hit but fell through into the regular
+# byte-transition code instead of branching out of the scan loop, so a
+# later-position match from a lower-priority live branch (0*) could
+# overwrite the higher-priority \b branch's already-correct empty match.
+# \b|0* on "0": \b fires at pos 0 (crossing non-word->word), must win over
+# 0*'s greedy consumption -> expect [0,0), not [0,1). 0*|\b (branch order
+# reversed) is a control: 0* legitimately wins there since it's the
+# higher-priority branch. -(?:\b|0*) on "-0" reproduces one state deeper
+# (not state-0-specific).
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug2AltPriorityWordBoundary
+strings
+""
+"0"
+"-0"
+"x0"
+regexps
+"\\b|0*"
+0-0;0-0;-;-
+0-1;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"0*|\\b"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;0-0;-;-
+-;0-0;-;-
+"-(?:\\b|0*)"
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #3): Teddy lookahead-tier construction extends
+# past an already-accepting state. The 2-/3-/4-byte Teddy lookahead tiers
+# (find-mode, no fixed prefix, <=8 first-byte candidates) only checked
+# whether some byte continues from the lookahead state, never whether that
+# state can already end a match — requiring a further live byte past a
+# legitimate match end is unsound. [01]+ on a 20-byte input with a real
+# match of only 3 bytes ("0002...") wrongly extended into a later, longer
+# run instead of stopping at [0,3). (?i:A0*) on a similarly-sized input
+# whose true match never has 3+ trailing continuations wrongly reported no
+# match at all instead of [12,15). "00020" (no full 16-byte SIMD chunk) is
+# a control confirming the bug needs the SIMD-chunk path.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug3TeddyTierOverextension
+strings
+""
+"00020"
+"0002000000000000000"
+"000000000000A001000"
+regexps
+"[01]+"
+-;-;-;-
+-;0-3;-;-
+-;0-3;-;-
+-;0-12;-;-
+"(?i:A0*)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;12-15;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #4): lenient-alt $-terminated branches accept
+# before reaching true end-of-text. emitInlineAnchoredDFAVerify's per-branch
+# DFA verify checked only the EOF-only acceptStates bitmap on every
+# iteration instead of splitting it from the mid-scan-safe midAccept table
+# — so a state that can only legitimately accept at true EOF got recorded
+# as a match as soon as it was merely reached. Reproduces whenever the
+# first alternative branch dies immediately and a later $-terminated
+# branch's accept gets recorded one byte early: 10$|0$ on "00", a$|b$ on
+# "aa", a$|0$ on "0a" all wrongly matched one byte short of the true end.
+# a$ (single branch) and x0$ (literal fails outright) are controls that
+# were already correct and must stay correct.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug4LenientAltEarlyAccept
+strings
+"00"
+"aa"
+"0a"
+"a"
+"0"
+regexps
+"10$|0$"
+-;1-2;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-1;0-1;-;-
+"a$|b$"
+-;-;-;-
+-;1-2;-;-
+-;1-2;-;-
+0-1;0-1;-;-
+-;-;-;-
+"a$|0$"
+-;1-2;-;-
+-;1-2;-;-
+-;1-2;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+"a$"
+-;-;-;-
+-;1-2;-;-
+-;1-2;-;-
+0-1;0-1;-;-
+-;-;-;-
+"x0$"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #5): dominant-self-loop bulk-skip leaves
+# last_accept stale across a 16-byte chunk boundary. emitDominantBulkSkip's
+# "no exit found in this chunk" branch advanced pos by 16 without also
+# advancing last_accept, even though every byte just confirmed exit-free is
+# itself a valid match end — normally self-healing on the next per-byte
+# iteration, but visible whenever that next byte is the exit byte itself.
+# Fires exactly when the self-loop run length is 16k+1 bytes (k>=1) before
+# the exit byte: [^\n]*/[^\n]+ on a 17-zero run + "\n" (len 18) and a
+# 33-zero run + "\n" (len 34, second boundary point) both under-matched to
+# a single byte instead of consuming the full run. a[^\n]* on "a" + 17
+# zeros + "\n" reproduces the same shape shifted by one byte (mandatory-
+# literal find path). A short (3-zero) run is a control confirming
+# correctness away from the 16k+1 boundary.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug5DominantBulkSkipStale
+strings
+"000\n"
+"00000000000000000\n"
+"000000000000000000000000000000000\n"
+"a00000000000000000\n"
+regexps
+"[^\\n]*"
+-;0-3;-;-
+-;0-17;-;-
+-;0-33;-;-
+-;0-18;-;-
+"[^\\n]+"
+-;0-3;-;-
+-;0-17;-;-
+-;0-33;-;-
+-;0-18;-;-
+"a[^\\n]*"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-18;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #6): multiline ^$ fails at true end-of-text
+# reached via the midStartNewline restart context. emitOuterPrologue's
+# no-mandatory-literal bootstrap-state selection never checked
+# hasNewlineBoundary / whether the preceding byte was '\n', so a restart
+# attempt right after a '\n' always picked the generic midStartState
+# (not accepting) instead of midStartNewlineState (accepting) — unlike the
+# sibling emitDFAPrologue path, which already handled this correctly.
+# (?m:^$) on "0\n": position 2 is true end-of-text immediately preceded by
+# '\n' — multiline ^ and $ both hold simultaneously, expect [2,2), not no
+# match. "" and "\n\n" resolve at attempt_start==0 (never touching the
+# buggy branch) and are controls. (?m:$) alone / a(?m:$) never need
+# midStartNewline (no ^ to require it) and are controls too.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug6MultilineNewlineRestart
+strings
+""
+"0\n"
+"\n\n"
+"0"
+"aa"
+regexps
+"(?m:^$)"
+0-0;0-0;-;-
+-;2-2;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"(?m:$)"
+0-0;0-0;-;-
+-;1-1;-;-
+-;0-0;-;-
+-;1-1;-;-
+-;2-2;-;-
+"a(?m:$)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;1-2;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #9): lenient-alt DFA-branch verify never emits
+# its midAccept data segment. planLenAltLayout's per-branch DFA layout
+# computed midAcceptOff/midAcceptBytes unconditionally but dfaDataSegments'
+# non-find branch only emitted the backing data segment when a dominant
+# self-loop or TDFA accept-side-table was present — neither holds for a
+# plain literal-then-trailing-no-op branch, so the reserved address read
+# back as zero and only the EOF-only accept check could ever record a
+# match for that branch. Reproduces when the second alternative is a
+# literal immediately followed by an empty trailing node and the branch's
+# own match can only be confirmed before true end-of-input: x$|a(?:) on
+# "a0" wrongly reported no match instead of [0,1) (the "a" branch's match
+# is confirmed at pos 1, one byte before the true end). "a" alone (single-
+# char input, match lands exactly at true EOF) and 00$|a(?:) (first branch
+# also viable) are controls. b0 (neither branch matches) rounds out the
+# no-match case.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug9LenientAltMissingMidAccept
+strings
+"a0"
+"a"
+"00"
+"b0"
+regexps
+"00$|a(?:)"
+-;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+-;-;-;-
+"x$|a(?:)"
+-;0-1;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# FuzzBug10: optional leading quantifier + \b chained into a deferred anchor.
+# 1*\b$ on "0": 1* matches zero occurrences, \b holds at pos 0 (before is
+# non-word, after is '0' which is a word char), but $ only holds at true
+# end-of-text (pos 1) -- the only correct match is empty at [1,1). The
+# find-mode fast-skip path (computePrefix/computePrefixWalk) wrongly treats
+# '1' as a mandatory byte (single-candidate optional-quantifier class fools
+# its transition-count check), so it SIMD-scans for '1', finds none, and
+# reports no match instead of trying the zero-occurrence path.
+# "1" is a control: \b never gets a chance to matter, matches at [0,1)
+# either way. "01" is a control: a live '1' remains after pos 0, so the
+# fast-skip path isn't fooled into skipping past the real match.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug10OptionalQuantifierWordBoundaryAnchor
+strings
+"0"
+"00"
+"10"
+"1"
+"01"
+regexps
+"1*\\b$"
+-;1-1;-;-
+-;2-2;-;-
+-;2-2;-;-
+0-1;0-1;-;-
+-;1-2;-;-
+# ============================================================
+# FuzzBug12: \b/\B immediately before (?m:^...) loses begin-of-line context
+# during transition construction. newDFA's main per-state worklist loop
+# calls expandWithWB with only a bare word-boundary context flag, for every
+# work item -- correct for ordinary states, but wrong for the `start` and
+# `midStartNewline` bootstrap items specifically, whose own closure was
+# built with ecBegin/ecBeginLine respectively. That begin-context flag
+# never survives into the expandWithWB call used to build the item's
+# *outgoing transitions*, so once a leading \b/\B resolves and the walk
+# reaches the nested (?m:^) node, its follow-check sees a bare
+# word-boundary ctx (no ecBegin/ecBeginLine bit) and stops -- the
+# transition for the byte beyond it is never established, and the whole
+# live-consuming match is lost.
+# \b(?m:^ba) on "ba": \b holds at pos 0 (before=nothing, after='b'=word),
+# (?m:^) holds at pos 0 (true start), "ba" should match -> [0,2). Same
+# pattern on "z\nba": \b holds at pos 2 (before='\n'=non-word, after='b'=
+# word), (?m:^) holds at pos 2 (prev byte is '\n') -> [2,4) via the
+# midStartNewline bootstrap. \B(?m:^ x) is the \B-flavored twin (rules out
+# "\b specifically"). \bba and (?m:^ba) are controls: dropping either the
+# leading assertion or the (?m:^) makes the pattern pass, confirming the
+# defect needs both chained together.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug12WordBoundaryBeginLineContext
+strings
+"ba"
+"z\nba"
+" x"
+"z\n x"
+regexps
+"\\b(?m:^ba)"
+0-2;0-2;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-
+"\\B(?m:^ x)"
+-;-;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;2-4;-;-
+"\\bba"
+0-2;0-2;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-
+"(?m:^ba)"
+0-2;0-2;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #13): computePrefixWalk treats a byte as
+# mandatory even when the state it lands on can already accept via a
+# word/newline-boundary pre-check. Its per-step continuation guard only
+# checked acceptStates/midAcceptStates (ctx=0 unconditional accept) before
+# deciding whether the next byte can also be folded into the "mandatory"
+# fast-skip literal -- it never checked midAcceptWStates/midAcceptNWStates/
+# midAcceptNLStates. So after consuming the true mandatory byte ('-' or
+# '0'), if the landing state can already end the match via \b/\B/(?m:$)
+# without consuming the (optional) following byte, the walk wrongly folds
+# that optional byte into the scan-for literal, and the SIMD/scalar
+# fast-skip prologue searches for a longer literal that need not appear at
+# all -- missing the real, shorter match entirely.
+# -1*\b on "-0": '-' is mandatory, then 1* is optional (0 reps) and \b
+# already fires right after '-' since '0' is a word char -> [0,1). "-1"/
+# "-11" are controls where the optional '1' really is present (unaffected,
+# any length still finds the trailing \b). "-(?:\b| 0)" / "-(?:\b| )" are
+# the alternation-shaped variant from the same repro family. "0000|0\B" is
+# the \B-flavored, non-'-' twin: the shorter '0\B' branch never gets tried
+# because the fast-skip is scanning for a mandatory-but-wrong-length
+# literal derived from the *other*, longer '0000' branch's shape.
+# "-(?:\b|x)" is a control that does NOT reproduce (branch order avoids the
+# defect the same way FUZZER_BUGS.md documents for bug 2's analogous
+# control) -- included to confirm the fix doesn't change already-correct
+# behavior.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug13MandatoryPrefixBoundaryPreAccept
+strings
+"-0"
+"-1"
+"-11"
+"-"
+regexps
+"-1*\\b"
+-;0-1;-;-
+0-2;0-2;-;-
+0-3;0-3;-;-
+-;-;-;-
+strings
+"-0"
+"- 0"
+"-x"
+"-"
+regexps
+"-(?:\\b| 0)"
+-;0-1;-;-
+0-3;0-3;-;-
+-;0-1;-;-
+-;-;-;-
+strings
+"-0"
+"- "
+"-x"
+regexps
+"-(?:\\b| )"
+-;0-1;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+strings
+"00"
+"0000"
+"01"
+"0"
+regexps
+"0000|0\\B"
+-;0-1;-;-
+0-4;0-4;-;-
+-;0-1;-;-
+-;-;-;-
+strings
+"-0"
+"-x"
+regexps
+"-(?:\\b|x)"
+-;0-1;-;-
+0-2;0-1;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #14): lenient-alternation per-branch inline DFA
+# verify never consults the word-boundary pre-accept tables.
+# emitInlineAnchoredDFAVerify (the tiny per-branch DFA loop
+# analyseLitChainAltLenient uses for alternation branches with no common
+# mandatory literal) only ever checked midAccept[state] (mid-scan, ctx=0) and
+# the EOF-only acceptStates table -- it never checked midAcceptW/NW[state],
+# so a branch whose own DFA can only accept mid-string via \b/\B was never
+# recognized as a match by this verify loop.
+# \0\B|0$0 on "\x00 ": the second branch (0$0) is a dead end (needs a
+# literal '0' after true end-of-text -- impossible), so only \0\B is
+# viable. \0 consumes the NUL byte, then \B fires at pos 1 (before=NUL,
+# after=' ', both non-word, no boundary crossed) -> [0,1).
+# \0\B alone (no alternation, so it never reaches the buggy per-branch
+# verify machinery -- the general shared scan loop already handles \b/\B
+# correctly per FUZZER_BUGS.md #1/#2) is a control confirming the expected
+# semantics in isolation.
+# Both patterns on bare "\x00" resolve via the EOF-only acceptStates path
+# instead (\B also holds at true end-of-text) -- untouched by this bug,
+# included to confirm the fix doesn't disturb it. Both patterns on " " (no
+# leading NUL) are controls with no match at all.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug14LenientAltWordBoundaryPreAccept
+strings
+"\x00 "
+"\x00"
+" "
+regexps
+"\\0\\B|0$0"
+-;0-1;-;-
+0-1;0-1;-;-
+-;-;-;-
+"\\0\\B"
+-;0-1;-;-
+0-1;0-1;-;-
+-;-;-;-
+# ============================================================
+# FuzzBug15: unconditional (ctx=0) mid-accept has no dominance/priority
+# concept, so a self-looping lower-priority accept can overwrite an earlier,
+# correctly-recorded higher-priority word-boundary accept at the SAME DFA
+# state. 0*\b|0* on "01": the first branch's greedy 0* tentatively consumes
+# "0", but \b fails at pos 1 (both neighbours are word chars); backing off to
+# zero reps, \b holds at pos 0 (before=nothing, after='0') -- branch 1 wins
+# with the empty match [0,0), and branch 2 (0*, lower priority) is never
+# tried. The find-mode scan loop's ctx=0 midAccept check has no priority
+# concept at all: it fires again after consuming the '0' (self-loop back to
+# the same state) and unconditionally overwrites last_accept with branch 2's
+# own always-true accept at [0,1). "0000"/""/"1"/"10" are controls where the
+# defect can't manifest (either branch 2 legitimately extends further via
+# the SAME channel, or neither branch ever gets a competing higher-priority
+# record to begin with). "0001" repeats the same defect one byte further in.
+# 0*|0*\b (priority reversed) is a control confirming the non-buggy
+# direction still works (branch 1, now the unconditional one, legitimately
+# extends and is never outranked). -(?:0*\b|0*) repeats the family through
+# the mandatory-literal-prefix find path (a separate WASM emission function
+# from the bare-alternation case above) -- same defect, same fix.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug15UnconditionalMidAcceptPriority
+strings
+"01"
+"0"
+"0000"
+"0001"
+""
+"1"
+"10"
+regexps
+"0*\\b|0*"
+-;0-0;-;-
+0-1;0-1;-;-
+0-4;0-4;-;-
+-;0-0;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"0*|0*\\b"
+-;0-1;-;-
+0-1;0-1;-;-
+0-4;0-4;-;-
+-;0-3;-;-
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+strings
+"-01"
+"-0001"
+"-0"
+regexps
+"-(?:0*\\b|0*)"
+-;0-1;-;-
+-;0-1;-;-
+0-2;0-2;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #16): midStart aliases start when a leading
+# \b/\B blocks both closures identically, wrongly inheriting ecBegin at
+# non-zero scan positions. startSet := epsilonClosure({Start}, ecBegin) and
+# midStartSet := epsilonClosure({Start}, 0) both get stuck at the same
+# pending \b/\B node (word-boundary can't resolve pre-byte), so they produce
+# byte-identical NFA sets and collide under the same key. The old collision
+# guard only compared EOF-accept bitmasks (both 0 here, since Match is
+# unreachable by pure epsilon/EOF unwinding), so it let midStart alias to
+# state 0 — silently inheriting state 0's ecBegin-inclusive transitions,
+# letting a trailing ^/\A wrongly fire at mid-scan restart positions.
+# \b(?:^b) on " b"/"z b" and \B(?:^ x) on "  x" and \B(?:^ ) on "! " must
+# all fail to match (the trailing ^/\A can only ever hold at true text
+# start); "b", " x", " " are true-position-0 controls where it legitimately
+# matches. "\bb" (no ^) is a control confirming ordinary \b-gated mid-scan
+# restarts still work; "^(?:\bb)" (assertion order reversed) and "^b" (no \b
+# at all) are controls confirming the aliasing never occurs when ^
+# resolves during the very first closure step instead of being blocked.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug16MidStartBeginAnchorAlias
+strings
+""
+"b"
+" b"
+"z b"
+regexps
+"\\b(?:^b)"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+"\\bb"
+-;-;-;-
+0-1;0-1;-;-
+-;1-2;-;-
+-;2-3;-;-
+"^(?:\\bb)"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+"^b"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+strings
+" x"
+"  x"
+regexps
+"\\B(?:^ x)"
+0-2;0-2;-;-
+-;-;-;-
+strings
+" "
+"! "
+regexps
+"\\B(?:^ )"
+0-1;0-1;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #17): (?m:$^) fails at true end-of-text
+# reached via the midStartNewline restart context. Reverse-order sibling
+# of already-fixed bug 6 ((?m:^$) on "0\n"): midStartNewline's EOF-accept
+# computation (acceptBitsFor(midStartNewlineSet, ecEnd|ecNoWordBoundary))
+# never OR's in ecBeginLine, unlike state 0's analogous ecBegin OR (bug 1's
+# fix). "0\n" at position 2 is true end-of-text immediately preceded by
+# '\n': multiline $ and ^ both hold simultaneously, expect [2,2), not no
+# match. "" and "\n\n" resolve at attempt_start==0 (never touching the
+# buggy branch) and are controls, as are the (?m:^)-only variants.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug17MidStartNewlineBeginLineMissing
+strings
+""
+"0\n"
+"\n\n"
+"0"
+"aa"
+regexps
+"(?m:$^)"
+0-0;0-0;-;-
+-;2-2;-;-
+-;0-0;-;-
+-;-;-;-
+-;-;-;-
+"(?m:^)"
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"a(?m:^)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #18): nested greedy-loop backoff to satisfy a
+# trailing ^. "(?:a*)+^" must back off through two levels of greedy
+# nesting (a Star inside a Plus) to leave position 0 unconsumed, where ^
+# can fire. Go stdlib finds [0,0) on "a"/"aa"; regexped returned no match.
+# Root cause: dfaHasOutrankedState false-positive-rerouted this pattern
+# (no \b/\B anywhere in it) to Backtracking, whose own zero-progress guard
+# then broke down under two levels of greedy nesting. "a*^" (single level
+# of nesting) is an unaffected control that already worked; "(?:a+)+^" is
+# an unaffected control with no zero-width fallback at all (Go stdlib
+# agrees there's no match there, at any input).
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug18NestedGreedyLoopBackoffForCaret
+strings
+""
+"a"
+"aa"
+regexps
+"(?:a*)+^"
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"a*^"
+0-0;0-0;-;-
+-;0-0;-;-
+-;0-0;-;-
+"(?:a+)+^"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #18, Backtracking-engine regression guard):
+# nested-loop shape with a NON-GREEDY inner loop instead of a greedy one
+# (contrast with FuzzBug18NestedGreedyLoopBackoffForCaret above, whose inner
+# `a*` is greedy). This pattern was never broken on any committed/shipped
+# code — it surfaced only as a self-inflicted regression during this
+# session's development of the bug-18 Backtracking fix: an early attempt at
+# fixing FuzzBug18NestedGreedyLoopBackoffForCaret's "(?:a*)+^" repro
+# memoised the OUTER loop head whenever its body contained any nested loop.
+# That fixed the greedy-inner repro above but broke THIS pattern (wrongly
+# consumed 'a's, e.g. end=1 instead of the correct end=0 on "a") — revisiting
+# the outer loop head at the same position, it turned out, is the very
+# mechanism its own zero-progress guard needs to detect "no progress since
+# last time", and memoising the outer head away broke that for this shape.
+# The landed fix (memoise the INNER pc via nestedLoopPC, not the outer loop
+# head) resolves both this pattern and the greedy-inner one without needing
+# to touch the outer loop's guard at all. Kept here as a permanent
+# regression guard against re-introducing the outer-loop-memoisation
+# mistake (see FUZZER_BUGS.md #18 "Fix" section for the full trace of why
+# that approach is unsound in general).
+#
+# col0 here is groupsFn's own contract: anchored at pos 0, NOT required to
+# consume all input (confirmed via tools/re2test/main.go's col0 handling,
+# not assumed) — since both patterns already start with `^`, col0 and col1
+# coincide with Go stdlib's plain (unwrapped) FindSubmatchIndex/FindStringIndex.
+# The `$`-suffixed variant is a control forcing full consumption, exercising
+# the identical memoised inner PC on a shape that must actually consume
+# input to succeed. All expected values cross-checked against Go stdlib
+# regexp (FindSubmatchIndex/FindStringIndex, no \A...\z wrapping).
+# ============================================================
+FuzzBug18NestedNonGreedyInnerLoopRegression
+strings
+""
+"a"
+"aa"
+"ab"
+"b"
+regexps
+"^(?:(?:(?:(a)*?){0,}))"
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+0-0 -;0-0;-;-
+"^(?:(?:(?:(a)*?){0,}))$"
+0-0 -;0-0;-;-
+0-1 0-1;0-1;-;-
+0-2 1-2;0-2;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #19): Backtracking's zero-progress loop guard
+# resurrects a same-iteration, lower-priority alternation sibling that a
+# higher-priority zero-width branch already suppressed. `.(?:\b|0)*` needs
+# a mandatory non-empty prefix (the leading `.`) so pos != attempt_start
+# when `\b` first resolves inside the loop body; when the loop's
+# zero-progress guard then fires, it pops the wrong (already-suppressed)
+# retry frame, wrongly resurrecting the lower-priority `0` branch. Go
+# stdlib finds [0,1) (leftmost-first: `\b` wins and the loop stops, greedy
+# star otherwise having no further length to add); regexped over-matched
+# through every trailing "0". Confirmed via both `*` and `+`.
+# Controls: `.(?:0|\b)*` (branch order reversed — `0` legitimately wins
+# first, no wrongly-suppressed sibling to resurrect) and `.\b*` (no
+# byte-consuming sibling in the loop body at all) are unaffected.
+# All expected values cross-checked against Go stdlib regexp (find via
+# FindStringIndex; col0 via `\A(?:pat)\z`.MatchString, i.e. does some
+# path anchored at 0 consume the entire input).
+# ============================================================
+FuzzBug19ZeroProgressGuardResurrectsSuppressedSibling
+strings
+""
+" "
+" 0"
+" 00"
+" 000"
+"0"
+"00"
+regexps
+".(?:\\b|0)*"
+-;-;-;-
+0-1;0-1;-;-
+0-2;0-1;-;-
+0-3;0-1;-;-
+0-4;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+".(?:\\b|0)+"
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-
+0-3;0-1;-;-
+0-4;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+".(?:0|\\b)*"
+-;-;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+".\\b*"
+-;-;-;-
+0-1;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+0-1;0-1;-;-
+-;0-1;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #20): Backtracking's zero-progress guard for an
+# empty-matchable loop compares `pos` against the wrong reference position.
+# ` (\B|0)*` has no nested loop in its body: the guard's no-nested-loop
+# branch unconditionally exits the outer loop the moment ANY iteration
+# resolves via the zero-width `\B` branch, discarding an already-pushed,
+# never-tried retry frame for that same iteration's `0` sibling — even
+# though an earlier iteration made real byte-consuming progress and the
+# leftmost-first answer needs that sibling explored to consume the rest of
+# the run. ` (\b|0*)*` has a nested loop (`0*`) in its body: the guard's
+# nested-loop branch compares `pos` to the *global* attempt start (always 0
+# here) instead of the position where this specific loop was entered (1,
+# right after the mandatory leading space) — so it wrongly concludes "real
+# progress happened" and falls into the backtrack stack, resurrecting a
+# sibling that must stay suppressed once `\b` succeeds at the loop's own
+# first zero-width iteration.
+# Controls ` (0|\B)*` and ` (0*|\b)*` (branch order reversed — the
+# byte-consumer legitimately wins first, no wrongly-decided guard needed)
+# are unaffected either way.
+# All expected values cross-checked against Go stdlib regexp
+# (FindStringIndex for col1; FindStringSubmatchIndex, kept only when it
+# starts at 0, for col0 — the "groups" export is a non-anchored find, not a
+# `\A...\z` full-consumption match, so col0 must NOT be derived from an
+# anchored regex here: ` (\b|0*)*`/` (0*|\b)*` on longer inputs are exactly
+# the cases where the anchored-full-consumption answer and the
+# non-anchored-find-starting-at-0 answer diverge, since forcing full
+# consumption can require a different, lower-priority derivation than
+# leftmost-first find ever needs to take). col0's second space-separated
+# token is group 1's expected capture span, required once --validate-groups
+# exercises these patterns' real capturing parens.
+# ============================================================
+FuzzBug20ZeroProgressGuardWrongReferencePosition
+strings
+""
+" "
+" 0"
+" 00"
+" 000"
+"0"
+"00"
+regexps
+" (\\B|0)*"
+-;-;-;-
+0-1 1-1;0-1;-;-
+0-2 1-2;0-2;-;-
+0-3 2-3;0-3;-;-
+0-4 3-4;0-4;-;-
+-;-;-;-
+-;-;-;-
+" (\\B|0)+"
+-;-;-;-
+0-1 1-1;0-1;-;-
+0-2 1-2;0-2;-;-
+0-3 2-3;0-3;-;-
+0-4 3-4;0-4;-;-
+-;-;-;-
+-;-;-;-
+" (0|\\B)*"
+-;-;-;-
+0-1 1-1;0-1;-;-
+0-2 1-2;0-2;-;-
+0-3 2-3;0-3;-;-
+0-4 3-4;0-4;-;-
+-;-;-;-
+-;-;-;-
+" (\\b|0*)*"
+-;-;-;-
+0-1 1-1;0-1;-;-
+0-1 1-1;0-1;-;-
+0-1 1-1;0-1;-;-
+0-1 1-1;0-1;-;-
+-;-;-;-
+-;-;-;-
+" (0*|\\b)*"
+-;-;-;-
+0-1 1-1;0-1;-;-
+0-2 1-2;0-2;-;-
+0-3 1-3;0-3;-;-
+0-4 1-4;0-4;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #21): DFA's isDominantAccept/nfaExpandWithWB
+# machinery gives up as soon as a boundary-resolved continuation hits ANY
+# byte-consumer, blind to the case where that byte-consumer is the SAME
+# mandatory-literal Rune already reachable via a separate, lower-priority
+# path (here, `0*`'s own zero-repetition exit) already present in the same
+# NFA state. ` (\b|0*)0`: after the mandatory leading space, `\b` resolves
+# (crossing the non-word→word boundary into the first `0`) and leftmost-first
+# semantics mean the group resolves via `\b` alone, empty — the trailing
+# mandatory `0` consumes exactly one more byte and the match ends at [0,2).
+# regexped instead greedily consumed every trailing `0` via the lower-
+# priority `0*` branch, exactly as if `\b` had never resolved.
+# Fix: a new compile-time detector (nfaBoundaryTargetIsAmbiguous) recognizes
+# this exact shape and routes the pattern to Backtracking, the same
+# precedent FUZZER_BUGS.md #15's dfaHasOutrankedState established for a
+# sibling DFA blind spot — Backtracking resolves priority via genuine
+# backtracking and has no equivalent defect, confirmed here for both the
+# find export and the real capturing group's own span via the "groups"
+# export.
+# Controls: ` (\b|0)0` (no nested quantifier in the group at all — `\b`'s
+# resolution and the mandatory literal already agree, nothing to overrun)
+# and ` (0*|\b)0` (branch order reversed — `0*` legitimately wins, greedily
+# consuming every trailing `0` before the mandatory literal takes the last
+# one) are both unaffected either way, confirmed unaffected by the new
+# detector (does not fire for either shape).
+# All expected values cross-checked against Go stdlib regexp
+# (FindStringIndex for col1; FindStringSubmatchIndex, kept only when it
+# starts at 0, for col0 — the "groups" export is a non-anchored find, not a
+# `\A...\z` full-consumption match, same convention as FUZZER_BUGS.md #20's
+# entries above).
+# ============================================================
+FuzzBug21DFABoundaryTargetAmbiguity
+strings
+""
+" "
+" 0"
+" 00"
+" 000"
+" 0000"
+"0"
+"00"
+regexps
+" (\\b|0*)0"
+-;-;-;-
+-;-;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+-;-;-;-
+-;-;-;-
+" (\\b|0)0"
+-;-;-;-
+-;-;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+0-2 1-1;0-2;-;-
+-;-;-;-
+-;-;-;-
+" (0*|\\b)0"
+-;-;-;-
+-;-;-;-
+0-2 1-1;0-2;-;-
+0-3 1-2;0-3;-;-
+0-4 1-3;0-4;-;-
+0-5 1-4;0-5;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #22): multi-byte mandatory-literal prologue
+# never selects the newline-boundary restart state. `buildFindBody`'s
+# `len(prefix)>=1` branch (used once a 2+-byte mandatory literal engages
+# the SIMD literal-scan machinery) selects its post-prefix-scan restart
+# state via a 4-way switch on word-divergence/start-divergence only —
+# there is no newline-divergence check and `hasNewlineBoundary` is never
+# consulted, so any `(?m:^)` immediately after a mandatory `\D` (or any
+# other mandatory-literal-then-multiline-caret shape) silently loses the
+# match whenever the restart position is reached via the SIMD-scanned
+# prefix rather than the plain byte-by-byte bootstrap. Confirmed length
+# boundary: a 1-byte trailing literal (`\D(?m:^)x`) is unaffected (routed
+# through the already-fixed `len(prefix)==0` branch, FUZZER_BUGS.md #6);
+# 2-byte (`\D(?m:^)ab`) and 3-byte (`\D(?m:^)abc`) trailing literals both
+# reproduce. `\D(?m:^ x)` is the original raw fuzzer repro (2-byte
+# literal " x").
+# All expected values cross-checked against Go stdlib regexp
+# (FindStringIndex for col1; col0 kept only when the match starts at 0
+# AND consumes the entire input, matchFn's full-consumption contract).
+# ============================================================
+FuzzBug22MultiByteLitPrefixNewlineRestart
+strings
+""
+"\n"
+"\nx"
+"\n x"
+"\nab"
+"\nabc"
+"0ab"
+" ab"
+"\nAb"
+regexps
+"\\D(?m:^ x)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"\\D(?m:^)x"
+-;-;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"\\D(?m:^)ab"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;0-3;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"\\D(?m:^)abc"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-4;0-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Bug 22 side-check: does the same lit-anchor gap corrupt the
+# Backtracking engine's internal DFA-determines-extent phase for
+# capturing patterns shaped like `\D(?m:^)(LIT)`? Backtracking uses a
+# DFA to find the match extent before running the NFA to fill captures
+# (CLAUDE.md), and that internal extent-DFA goes through the same
+# compile.go lit-anchor gate as the standalone find_func path.
+# col5 = non-anchored find with captures, validated against Go stdlib.
+# ============================================================
+FuzzBug22SideCheckBacktrackCaptureExtent
+strings
+""
+"\n"
+"\nab"
+"\nabc"
+"0ab"
+" ab"
+regexps
+"\\D(?m:^)(ab)"
+-;-;-;-
+-;-;-;-
+0-3 1-3;0-3;-;-;-;0-3 1-3
+0-3 1-3;0-3;-;-;-;0-3 1-3
+-;-;-;-
+-;-;-;-
+"\\D(?m:^)(abc)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-4 1-4;0-4;-;-;-;0-4 1-4
+-;-;-;-
+-;-;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #24): computePrefix's hasWordBoundary
+# cross-check only catches midStartWordState accepting with ZERO bytes
+# consumed (bug #10) or diverging in byte VALUE on the first byte. It
+# never walks midStartWordState through the derived prefix looking for
+# an accepting state reached after FEWER bytes than the prefix requires
+# (walk-length divergence, N>=1) — nor a byte-value divergence at
+# position i>0. Both `0000|\B0` and `(\B|0)0` reach their expected match
+# only through midStartWordState (prev byte is a word char), landing on
+# an accepting state after consuming just one '0', while
+# computePrefix's midStartState-only walk derives a longer mandatory
+# literal ("0000"/"00" respectively) that the SIMD fast-skip searches
+# for verbatim and never finds in these inputs — producing a false
+# "no match" before the general per-byte DFA loop (which would find it)
+# ever runs. `ab|\Ba` covers the same shape with a non-digit literal;
+# "cab"/"cabc" are included even though they happen to also match via
+# branch 1 ("ab") to confirm those still succeed post-fix, matching the
+# bug's own scope table.
+# All expected values cross-checked against Go stdlib regexp
+# (FindStringIndex for col1; col0 kept only when the match starts at 0
+# AND consumes the entire input, matchFn's full-consumption contract).
+# ============================================================
+FuzzBug24WordBoundaryPrefixWalkLengthDivergence
+strings
+""
+"0"
+"00"
+"000"
+"0000"
+"00000"
+regexps
+"0000|\\B0"
+-;-;-;-
+-;-;-;-
+-;1-2;-;-
+-;1-2;-;-
+0-4;0-4;-;-
+-;0-4;-;-
+strings
+""
+"0"
+"00"
+"000"
+"1000"
+"a0"
+"10"
+regexps
+"(?:\\B|0)0"
+-;-;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;0-2;-;-
+-;1-2;-;-
+-;1-2;-;-
+-;1-2;-;-
+strings
+""
+"ca"
+"za"
+"cab"
+"cabc"
+regexps
+"ab|\\Ba"
+-;-;-;-
+-;1-2;-;-
+-;1-2;-;-
+-;1-3;-;-
+-;1-3;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #25): midStartNewlineState is remapped
+# unconditionally at construction but left at its stale raw (pre-
+# minimization/reordering) value whenever hasNewlineBoundary is false.
+# buildLitAnchorFindBody unconditionally substitutes it in for
+# wasmMidStart whenever the byte immediately before a backward-verified
+# match start is '\n', regardless of hasNewlineBoundary. When
+# reorderAcceptFirst happens to claim the stale raw ID for the real
+# accept state, the lit-anchor body's initial midAccept check fires at
+# the verified start position and the immediate-accept short-circuit
+# returns a zero-length match before the mandatory trailing literal is
+# ever consumed. Trigger is purely "lit-anchor path taken" AND
+# "hasNewlineBoundary == false" AND "byte before the verified match
+# start is '\n'" -- independent of \D specifically or absolute position
+# (`X\nAab` confirms the last point). Patterns kept capture-free: this
+# path is reached via compile.Compile's find_func-only mode, which
+# strips captures before compilation regardless (bug's own scope table
+# confirms the capture group is not load-bearing). `\Da` is a control:
+# single-char trailing literal fails the lit-anchor's len(bs)>=2 gate,
+# so it never enters this path and must be unaffected. `0ab`/no-newline
+# cases confirm no false positives are introduced.
+# All expected values cross-checked against Go stdlib regexp
+# (FindStringIndex for col1; col0 kept only when the match starts at 0
+# AND consumes the entire input, matchFn's full-consumption contract).
+# ============================================================
+FuzzBug25StaleMidStartNewlineState
+strings
+""
+"\nAab"
+"Aab"
+"X\nAab"
+"0ab"
+regexps
+"\\Dab"
+-;-;-;-
+-;1-4;-;-
+0-3;0-3;-;-
+-;2-5;-;-
+-;-;-;-
+strings
+""
+"\nAbc"
+regexps
+"\\Dbc"
+-;-;-;-
+-;1-4;-;-
+strings
+""
+"\nAa"
+regexps
+"\\Da"
+-;-;-;-
+-;1-3;-;-
+strings
+""
+"\nAab"
+regexps
+"[^0-9]ab"
+-;-;-;-
+-;1-4;-;-
+# ============================================================
+# Category (TODO.md task 50): the whole-pattern single-capture shortcut
+# (isWholePatternSingleCapture, compile.go) left p.edgeScratchOff at its
+# zero-value default instead of an explicit -1. The groups-wrapper
+# emission call site only forces edgeOff=-1 when p.isTDFA, so this path
+# (!isTDFA && !anchored) read edgeScratchOff=0 and treated it as a real
+# table-memory offset — writing an 8-byte (origPtr,origEnd) scratch pair
+# over memory offset 0 on every groups() call (in a standalone module
+# that's the caller's own input buffer; in an embedded one, the DFA
+# table's own base). col0/col5 use callGroups, which re-copies the input
+# text to address 0 before every call — masking the corruption, since
+# each call starts from a pristine buffer regardless of what the
+# previous call scribbled. col6 (groups exhaustive re-entry) instead
+# writes the text once and calls groups() at successive nonzero ptr
+# values into that same, never-rewritten buffer — the real
+# GroupsIter/generator advance-by-matchEnd convention every generated
+# stub uses — which is what actually observes the corruption.
+# ============================================================
+GroupsExhaustReentryTrivialShortcut
+strings
+"the quick"
+regexps
+"(\\w+)"
+0-3 0-3;0-3;-;-;0-3,4-9;0-3 0-3;0-3 0-3|4-9 4-9
+# ============================================================
+# Category (Backtracking altLoopBody dual-back-edge ambiguity,
+# FUZZER_BUGS.md #26) — the NFA for `(?m:0$*)*` has an InstAlt (the inner
+# `$*` loop head) whose two branches are SIMULTANEOUSLY a genuine inner-loop
+# back edge (the real `$*` cycle) and a trivial "back edge" to prog.Start
+# (which dominates everything, so it always tests positive). altLoopBody's
+# binary "exactly one of Out/Arg is a back edge" model can't represent that,
+# falls to default (isLoop=false), and the node gets zero zero-progress
+# protection — the resulting unguarded cycle overflows the backtrack stack,
+# and the existing overflow-abandon policy (bug #18's fix) discards the
+# whole attempt_start search, including an already-pushed correct match
+# frame. No captures, so this pattern is normally routed to Backtracking
+# directly via dfaHasOutrankedState/dfaHasAmbiguousBoundaryTarget (no
+# --force-backtrack needed). All expected values cross-checked against Go
+# stdlib regexp (col0 = \A(?:PATTERN)\z, col1 = FindStringIndex).
+# ============================================================
+AltLoopDualBackEdge
+strings
+""
+"0"
+"00"
+"0\n"
+"000"
+regexps
+"(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+# ============================================================
+# Category (DFA getOrAddState newline-transition ecBeginLine drop,
+# FUZZER_BUGS.md #27) — newDFA's dedicated '\n'-byte transition branch
+# (compile/engine_dfa.go, ~line 1501) resolves the immediate epsilon
+# closure with ecBeginLine, correctly firing an immediately-following
+# (?m:^). But when a (?m:$) sits between the '\n' transition and the
+# (?m:^) in program order (i.e. "$^", not "^$"), $ can't resolve yet
+# (needs ecEnd/ecEndLine) so ^'s PC is never pushed into nextSet at
+# transition time — it's left for getOrAddState's later accept-bitmask
+# computation. getOrAddState accepts an nlFlag param but only threads it
+# into the state's dedup key (setToKey), never into any ctx passed to
+# acceptBitsFor for accepting/midAccepting/midAcceptingNW/midAcceptingW/
+# midAcceptingNL — so ecBeginLine is missing exactly when needed to
+# resolve the deferred ^, and the match is silently dropped. Reversed
+# order ("^$") is unaffected because ^ resolves immediately during the
+# transition-time closure, before $ is even reached. All expected values
+# cross-checked against Go stdlib regexp (col0 = \A(?:PATTERN)\z,
+# col1 = FindStringIndex).
+# ============================================================
+NewlineTransitionDeferredBeginLine
+strings
+"\n"
+"\n\n"
+"ab\n"
+"ab\n\n"
+regexps
+"\n(?m:$^)"
+0-1;0-1;-;-
+-;0-1;-;-
+-;2-3;-;-
+-;2-3;-;-
+"ab\n(?m:$^)"
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;0-3;-;-
+"\n(?m:$)(?m:^)"
+0-1;0-1;-;-
+-;0-1;-;-
+-;2-3;-;-
+-;2-3;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #28): Backtracking's per-loop-head zero-progress
+# tracker (loop_pos local) and its zero-width-assertion reference tracker
+# (loop_entry local) are ordinary WASM locals that btPushFrame/btFail never
+# saved or restored across a backtrack-stack pop — unlike captures, which
+# always were. Popping back to a frame pushed *before* the loop's tracker
+# was last updated left it holding a stale value from the abandoned deeper
+# attempt, so the loop head's guard compared the restored `pos` against the
+# wrong reference and treated a fresh loop entry as "already made progress,"
+# discarding the correct (and only) continuation that would have produced a
+# match — an unbounded resurrection cycle terminated only by the backtrack
+# stack's own overflow-abandon escape hatch, i.e. total non-match instead of
+# the correct span. `(0\b|)*0` on "0": the loop's only real iteration
+# consumes "0" and resolves `\b` at end-of-input; that iteration's own
+# exit-retry frame is exactly the correct continuation (0 loop iterations,
+# final "0" matches at pos 0), but got discarded by the stale-tracker
+# misfire. `x(0\b|)*0` (mandatory prefix before the loop) confirms the same
+# defect independent of loop position. `+` variants confirm it's independent
+# of `*` vs `+`. All expected values cross-checked against Go stdlib regexp
+# (FindStringSubmatchIndex for col1; col0 kept only when the match starts at
+# 0, same convention as FUZZER_BUGS.md #20's block above).
+# ============================================================
+FuzzBug28StaleLoopTrackerAcrossBacktrackPop
+strings
+""
+" "
+"0"
+"00"
+"000"
+" 0"
+"x0"
+"x00"
+regexps
+"(0\\b|)*0"
+-;-;-;-
+-;-;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+"(0*\\b|)*0"
+-;-;-;-
+-;-;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+"(0\\b|)+0"
+-;-;-;-
+-;-;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+"(0*\\b|)+0"
+-;-;-;-
+-;-;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+0-1 0-0;0-1 0-0;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+-;1-2 1-1;-;-
+"x(0\\b|)*0"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2 1-1;0-2 1-1;-;-
+0-2 1-1;0-2 1-1;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #29) — altLoopBody's dual-back-edge
+# discriminator (added by bug #26's fix) used `== prog.Start` as a proxy for
+# "this edge closes an enclosing loop, not the inner one" — valid only when
+# the enclosing loop happens to coincide with the whole program's entry
+# point. Once any construct ahead of `(?m:0$*)*` becomes its own NFA node
+# (`1*`, `a*`, `x?`, `1?`, or a bare literal `1`), prog.Start moves into that
+# prefix and the inner `$*` loop's Alt is neither Out==prog.Start nor
+# Arg==prog.Start, so the discriminator falls through to "not a loop",
+# leaving the cycle without a zero-progress guard: the backtrack stack
+# overflows and the overflow-abandon policy discards the correct match
+# frame. Fixed by discriminating via dominance between the two candidate
+# targets directly (whichever target dominates the OTHER is the enclosing
+# edge) instead of comparing either against prog.Start. `1*(?m:0$*)+`
+# (outer `+` instead of `*`) is included as a control: it never reproduces
+# the dual-back-edge shape at all (its own Alt is only reached from inside
+# its body), so it's unaffected by both the bug and the fix. All expected
+# values cross-checked against Go stdlib regexp (col0 = \A(?:PATTERN)\z,
+# col1 = FindStringIndex).
+# ============================================================
+FuzzBug29AltLoopBodyProgStartProxyDoesNotGeneralize
+strings
+""
+"0"
+"1"
+"00"
+"10"
+"01"
+"000"
+"100"
+"0\n"
+regexps
+"1*(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+-;0-1;-;-
+"a*(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;0-0;-;-
+0-2;0-2;-;-
+-;0-0;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+-;0-0;-;-
+-;0-1;-;-
+"x?(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;0-0;-;-
+0-2;0-2;-;-
+-;0-0;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+-;0-0;-;-
+-;0-1;-;-
+"1?(?m:0$*)*"
+0-0;0-0;-;-
+0-1;0-1;-;-
+0-1;0-1;-;-
+0-2;0-2;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+-;0-1;-;-
+"1(?m:0$*)*"
+-;-;-;-
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-2;-;-
+-;1-2;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;-;-;-
+"1*(?m:0$*)+"
+-;-;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-2;-;-
+0-2;0-2;-;-
+-;0-1;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+-;0-1;-;-
+# ============================================================
+# Category: Bug 30 — lenient lit-chain alternation scalar class-verify
+# aliases its byte scratch local onto its own loop counter
+# ============================================================
+# `(?:z0{15})|(?:00$0)` (non-capturing so --validate-groups doesn't also
+# check submatches, orthogonal to this bug): branch 1 is a lit-chain
+# (literal "z" + class {0} repeated 15 times, len+count=16 qualifies for
+# the lit-chain-alt lenient frontend); branch 2 (`00$0`) contains an unsatisfiable `\z` mid-pattern
+# and can never match, so expected behavior equals plain `z0{15}` alone.
+# buildLitChainAltLenientFindBody's litChainBranchLocals wired SimdMask
+# and ScalarIdx to the SAME local (engine_dfa.go); emitScalarBitmapVerify
+# uses SimdMask as a same-iteration byte-value scratch while ScalarIdx must
+# survive as the live loop counter — aliasing them corrupts the counter
+# after checking only the first repeated-class byte, causing the verify
+# loop to report success after verifying just 1 of the 15 required zeros.
+# `z100000000000000` covers immediate failure (wrong byte at rep 0);
+# `z000000000000001` is the minimized repro (14 correct zeros then a
+# mismatch at rep 14); `z000000000000000`/`z0000000000000000` confirm a
+# genuine full match still succeeds after the fix; `xxz000000000000000`
+# confirms the persistent-mask frontend scan still finds a non-zero-offset
+# match. All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug30LenientLitChainScalarVerifyLocalAliasing
+strings
+""
+"z"
+"z0"
+"z100000000000000"
+"z000000000000001"
+"z000000000000000"
+"z0000000000000000"
+"xxz000000000000000"
+regexps
+"(?:z0{15})|(?:00$0)"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-16;0-16;-;-
+-;0-16;-;-
+-;2-18;-;-
+"(?:00$0)|(?:z0{15})"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-16;0-16;-;-
+-;0-16;-;-
+-;2-18;-;-
+# ============================================================
+# FuzzBug35LenientLitChainAltBranchLeftmostFirst: FUZZER_BUGS.md bug 35.
+# analyseLitChainAltLenient's per-branch helper DFA (the "lenient
+# literal-chain alternation" find fast path, engine_dfa.go) compiled each
+# non-lit-chain branch leftmost-*longest* instead of leftmost-*first*. A
+# branch with its own internal ambiguity (`0(|0)`'s empty alternative,
+# `a0??`'s zero-repetition preference) then picked the longest completion
+# instead of the RE2/Perl-correct shortest one. `0(|0)|1$0` / `0(|0)|1$`
+# reproduce via a second, always-dead-for-this-input branch containing an
+# assertion between two literals (`1$0`/`1$`) — purely a fusion-blocker for
+# Go's regexp/syntax literal-fusion pass, not itself relevant to the match;
+# `(0$|a0??)` / `a0??|1$` are the `a0??` sibling shape. The first three
+# patterns have a capture group, so this file's dispatch compiles them
+# groups-only (no separate matchFn) — col0 is therefore validated against
+# non-anchored groups() filtered to start==0 (this file's own
+# groupsFn-vs-matchFn contract, see main.go ~line 518-521), NOT full-string
+# anchored match; `a0??|1$` has no capture, compiles match+find, and col0
+# there really is anchored full-match (LL). All values cross-checked
+# against live `regexp.FindStringSubmatchIndex` (col0, filtered to
+# start==0, submatch spans space-separated) and `FindStringIndex` (col1) —
+# except `a0??|1$`'s col0, which is `\A(?:pattern)\z` (anchored, matches
+# the matchFn contract it actually compiles under).
+# ============================================================
+FuzzBug35LenientLitChainAltBranchLeftmostFirst
+strings
+""
+"00"
+"a0"
+regexps
+"0(|0)|1$0"
+-;-;-;-
+0-1 1-1;0-1;-;-
+-;1-2;-;-
+"0(|0)|1$"
+-;-;-;-
+0-1 1-1;0-1;-;-
+-;1-2;-;-
+"(0$|a0??)"
+-;-;-;-
+-;1-2;-;-
+0-1 0-1;0-1;-;-
+"a0??|1$"
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #36): Teddy 2/3/4-byte lookahead-tier
+# construction derives its lookahead filter only from midStartState,
+# ignoring midStartWordState's divergent transitions. "a0|\Ba": from
+# midStartState, consuming 'a' leaves only the "a0" thread alive (needs a
+# following '0'), so the T1 nibble filter demands second byte '0'. But from
+# midStartWordState (attempt start preceded by a word char — true at every
+# position here, since the byte before 'a' is always '0'), \Ba completes
+# the match after just 'a' — no second-byte requirement at all. The bogus
+# filter zeroes the SIMD match-mask bit whenever the candidate falls inside
+# a full 16-byte chunk the Teddy phase actually processes, so that chunk's
+# scan wrongly reports nothing and skips 16 bytes past the true match.
+# N=12 (candidate outside any full SIMD chunk) is a passing control; N=13
+# lands inside the first full 16-byte chunk and reproduces the bug.
+# All expected values cross-checked against Go stdlib regexp.
+# ============================================================
+FuzzBug36TeddyMidStartWordDivergence
+strings
+""
+"000000000000a100"
+"0000000000000a100"
+"00000000000000a100"
+"000000000000000a100"
+regexps
+"a0|\\Ba"
+-;-;-;-
+-;12-13;-;-
+-;13-14;-;-
+-;14-15;-;-
+-;15-16;-;-
+# ============================================================
+# Category (FUZZER_BUGS.md #37): a preceding star/bounded-repeat that
+# altLoopBody misclassifies as a non-loop both skips its own zero-progress
+# guard and corrupts the *following* loop's zero-progress reference
+# position. Two compounding defects in compile/engine_backtrack.go:
+#
+# 1. altLoopBody's dominance test can never recognize a back edge into
+#    pc==prog.Start (computeDominators sets idom[prog.Start]==prog.Start —
+#    the root has no proper dominator — so dominates(idom, v, pc) can't
+#    succeed for any v != pc even when a genuine cycle loops back into pc).
+#    Any `*`/bounded-repeat/`.`-star/grouped-star sitting at the very start
+#    of a pattern lands its own Alt at prog.Start and is silently treated
+#    as a non-loop.
+# 2. bt.loopEntryOf (a single map, pre-fix) recorded a candidate PC as an
+#    external entry into a later emptyBodyGreedyLoop's body whenever
+#    EITHER of its Out/Arg edges targeted that loop's bodyStart, but the
+#    write was only ever emitted at the Out-edge transition site (contOut).
+#    Whenever the qualifying edge was actually Arg (the common case for a
+#    loop's own exit branch, or a chained non-loop Alt's fallthrough), the
+#    write fired on the wrong transition (or never fired on the right one),
+#    leaving `(\B|0)+`'s own zero-progress guard reading a stale position
+#    left over from an unrelated earlier write — wrongly concluding real
+#    progress happened and resurrecting the already-suppressed lower-
+#    priority `0` sibling that `\B`'s higher-priority resolution should
+#    have permanently ruled out.
+#
+# `1*`/`1{0,2}`/`[12]*`/`.*`/`(?:11)*` immediately before `(?:\B|0)+` each
+# hit defect 2 (chained non-loop Alts whose Arg edge feeds the following
+# loop); `1*` additionally hits defect 1 (its own Alt sits at prog.Start).
+# `1?` (no back edge at all), `1+` (mandatory predecessor, so its Alt's
+# idom already walks past prog.Start), and `11*` (mandatory `1` prefix
+# gives the star's Alt a real predecessor too) are included as controls —
+# structurally adjacent shapes confirmed unaffected by either defect.
+# All expected values cross-checked against Go stdlib regexp (col0 =
+# \A(?:PATTERN)\z.FindStringIndex; col1 = FindStringIndex).
+# ============================================================
+FuzzBug37AltLoopBodyMisclassifiedEntryPositionCorruption
+strings
+""
+"0"
+"1"
+"10"
+"11"
+"100"
+"1100"
+"12"
+"110"
+regexps
+"1*(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+"1{0,2}(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+"[12]*(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+".*(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+0-4;0-3;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+"(?:11)*(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+-;1-1;-;-
+-;1-1;-;-
+-;1-1;-;-
+0-4;0-2;-;-
+-;1-1;-;-
+0-3;0-2;-;-
+"1?(?:\\B|0)+"
+0-0;0-0;-;-
+0-1;0-1;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+-;0-1;-;-
+"1+(?:\\B|0)+"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+"11*(?:\\B|0)+"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-2;0-1;-;-
+-;0-1;-;-
+0-3;0-1;-;-
+0-4;0-2;-;-
+-;0-1;-;-
+0-3;0-2;-;-
+# ============================================================
+# Task 51: line-scoped lit-anchor prefixes.
+#
+# FUZZER_BUGS.md §22 gated the lit-anchor optimisation off for ANY
+# prefix containing `(?m:^)`/`(?m:$)`. That gate is wider than the
+# defect: buildLitAnchorBackScanBody's stop-at-'\n' rule is exactly
+# sound when the prefix starts with `^`/`(?m:^)` and nothing after that
+# anchor can consume a '\n' (lineAnchoredPrefixSafe, lit_anchor.go).
+# These entries pin both sides of that boundary:
+#
+#   allowed (lit-anchor active):
+#     (?m:^)ab, (?m:^)a*XY, (?m:^)[^\n]*ERROR, (?m:^)ab(?m:$),
+#     (?m:^)\d+ab, and the log-capture-shaped capture patterns below
+#   still rejected (fallback path):
+#     (?m:^)[\s\S]*ab   — prefix can consume '\n', so the backward scan
+#                         would stop short of the true leftmost start
+#     \D(?m:^)ab        — §22's own repro; anchor is not leading
+#
+# All expected values generated from and cross-checked against Go
+# stdlib regexp (--validate-go clean).
+# ============================================================
+Task51LineScopedLitAnchorPrefix
+strings
+"ab"
+"xab"
+"\nab"
+"x\nab"
+"zaaaXY"
+"aaaXY"
+"\naaaXY"
+"aa\naaaXY"
+"no\nyes ERROR\n"
+"x ERROR"
+"ERROR"
+"ab\ncd"
+"cd\nab"
+"a\nb\nab\n"
+"x ab\n12ab"
+regexps
+"(?m:^)ab"
+0-2;0-2;-;-
+-;-;-;-
+-;1-3;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-2;-;-
+-;3-5;-;-
+-;4-6;-;-
+-;-;-;-
+"(?m:^)a*XY"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-5;0-5;-;-
+-;1-6;-;-
+-;3-8;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"(?m:^)[^\\n]*ERROR"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;3-12;-;-
+0-7;0-7;-;-
+0-5;0-5;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"(?m:^)ab(?m:$)"
+0-2;0-2;-;-
+-;-;-;-
+-;1-3;-;-
+-;2-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-2;-;-
+-;3-5;-;-
+-;4-6;-;-
+-;-;-;-
+"(?m:^)[\\s\\S]*ab"
+0-2;0-2;-;-
+0-3;0-3;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-2;-;-
+0-5;0-5;-;-
+-;0-6;-;-
+0-9;0-9;-;-
+"(?m:^)\\d+ab"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;5-9;-;-
+"\\D(?m:^)ab"
+-;-;-;-
+-;-;-;-
+0-3;0-3;-;-
+-;1-4;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;2-5;-;-
+-;3-6;-;-
+-;-;-;-
+Task51LineScopedLitAnchorCaptures
+strings
+"ERROR"
+"x ERROR"
+"\nx ERROR"
+"no ERR\nx ERROR"
+"ab"
+""
+"\n"
+regexps
+"(?m:^)([^\\n]*)(ERROR)"
+0-5 0-0 0-5;0-5;-;-;-;0-5 0-0 0-5
+0-7 0-2 2-7;0-7;-;-;-;0-7 0-2 2-7
+-;1-8;-;-;-;1-8 1-3 3-8
+-;7-14;-;-;-;7-14 7-9 9-14
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+Task51LineScopedLitAnchorLogShape
+strings
+"2026-01-02T03:04:05 x ERROR: boom"
+"z 2026-01-02T03:04:05 x ERROR: boom"
+"junk\n2026-01-02T03:04:05 x WARN: hi"
+"2026-01-02T03:04:05 x INFO: hi"
+"2026-01-02T03:04:05 x WARN: b"
+regexps
+"(?m:^(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}) [^\\n]*(ERROR|WARN): (.+)$)"
+0-33 0-19 22-27 29-33;0-33;-;-;-;0-33 0-19 22-27 29-33
+-;-;-;-;-;-
+-;5-35;-;-;-;5-35 5-24 27-31 33-35
+-;-;-;-;-;-
+0-29 0-19 22-26 28-29;0-29;-;-;-;0-29 0-19 22-26 28-29
+# ============================================================
+# FuzzBug40GapA4TDFAEligibilityBypass: FUZZER_BUGS.md bug 40.
+# ============================================================
+# The Gap A.4 capture path (compile.go, "lenient alternation with captures")
+# called newTDFA directly instead of going through the selector, so a pattern
+# the TDFA eligibility gates exclude — here hasLineAnchors(prog), from the `$`
+# in the first branch — still got a TDFA capture body whenever it happened to
+# match analyseLitChainAltLenient's shape. groups() then returned no match on
+# inputs where find() on the very same module was correct. The shape needs an
+# end-anchored first branch plus a second branch that survives Go's
+# regexp/syntax literal-fusion pass as OpConcat (i.e. carries a quantifier:
+# `a0??`, `a0?`, `ab?` all qualify; a bare `a`/`a0` fuses to one OpLiteral, so
+# analyseLitChainAltLenient rejects the alternation and the bug never fires).
+# Both patterns below are groups-only in this file's dispatch, which is what
+# makes Gap A.4 reachable at all (it requires !needMatch) — col0 is therefore
+# non-anchored groups() filtered to start==0, per this file's groupsFn
+# contract. Values cross-checked against live regexp.FindStringSubmatchIndex
+# (col0/col5), FindStringIndex (col1) and FindAllStringIndex (col4).
+FuzzBug40GapA4TDFAEligibilityBypass
+strings
+""
+"0"
+"00"
+"a0"
+"0a"
+regexps
+"(0$|a0??)"
+-;-;-;-;-;-
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+-;1-2;-;-;1-2;1-2 1-2
+0-1 0-1;0-1;-;-;0-1,1-2;0-1 0-1
+-;1-2;-;-;1-2;1-2 1-2
+"(0$)|(a0??)"
+-;-;-;-;-;-
+0-1 0-1 -;0-1;-;-;0-1;0-1 0-1 -
+-;1-2;-;-;1-2;1-2 1-2 -
+0-1 - 0-1;0-1;-;-;0-1,1-2;0-1 - 0-1
+-;1-2;-;-;1-2;1-2 - 1-2
+# ============================================================
+# FUZZER_BUGS.md #41: detectSkipSafeOnDead's mid-accept test (conditions (d)
+# and (e)) reads only the unconditional l.midAcceptBytes channel and never the
+# context-dependent midAcceptNW/midAcceptW/midAcceptNL side tables. A
+# zero-width `\B`/`(?m:$)` alternative that accepts empty at an intermediate
+# position lives exclusively in those side channels, so midStart looked "not
+# mid-accept", skipSafeOnDead was wrongly enabled, and the Task 8 dead-state
+# skip jumped the find scan from attempt_start straight past the zero-width
+# match to the death position + 1.
+#
+# The shape needed is narrow: a zero-width-acceptable branch alternated with a
+# branch whose first byte's successor self-loops on the same byte class
+# (`X X* ...` / `X+ ...`). `\B|aab` (no star) and `\B|a*b` (two distinct
+# first-byte successors) do not qualify and were always correct.
+# Repro from tools/fuzz/found/20260817-183159/185212-655762916f481e30.
+FuzzBug41SkipSafeOnDeadWordBoundary
+strings
+""
+"11"
+"112"
+"1112"
+"1x"
+"11xx"
+"110"
+"x110"
+regexps
+"\\B|11*0"
+0-0;0-0;-;-;0-0
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1,3-3,4-4
+0-3;0-3;-;-;0-3,3-3
+-;1-1;-;-;1-1,2-4,4-4
+"\\B|aa*b"
+0-0;0-0;-;-;0-0
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+"\\B|a+b"
+0-0;0-0;-;-;0-0
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1,2-2
+-;1-1;-;-;1-1,3-3,4-4
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,3-3,4-4
+# Same defect through the OTHER side channel: `(?m:$)` mid-accepts via
+# midAcceptNLBytes rather than midAcceptNW/midAcceptW. The two channels are
+# separate tables, so a fix could plausibly cover one and not the other.
+FuzzBug41SkipSafeOnDeadMultilineAnchor
+strings
+""
+"aa\nc"
+"aa\ncc"
+"11\n2"
+"aab"
+"\n"
+regexps
+"(?m:$)|aa*b"
+0-0;0-0;-;-;0-0
+-;2-2;-;-;2-2,4-4
+-;2-2;-;-;2-2,5-5
+-;2-2;-;-;2-2,4-4
+0-3;0-3;-;-;0-3,3-3
+-;0-0;-;-;0-0,1-1
+"(?m:$)|11*0"
+0-0;0-0;-;-;0-0
+-;2-2;-;-;2-2,4-4
+-;2-2;-;-;2-2,5-5
+-;2-2;-;-;2-2,4-4
+-;3-3;-;-;3-3
+-;0-0;-;-;0-0,1-1
+# ============================================================
+# Category: FABLE.md deep-review bugs B1-B5 (DFA find-path detectors and
+# newline-context transition construction). All five were live-reproduced
+# against Go stdlib regexp before any fix was written.
+# ============================================================
+# B1: detectSkipSafeOnDead's safety proof covers midStart/succ and the
+# alternative entry states (midStartWord/midStartNewline), but never the
+# DEATH TRAJECTORY of the original attempt. When attempt_start == 0 the
+# prologue starts in `startState`, which for a `^`/`\A`-anchored alternation
+# branch carries transitions midStart does not have. That attempt's death at
+# position P therefore proves nothing about positions 1..P, yet the skip
+# jumps straight to P+1. `^ab|c+d` on "acccd" reports 2-5 instead of 1-5:
+# the attempt at 1 (inside the anchored branch's 'a') is skipped.
+FableB1SkipSafeOnDeadAnchoredAltBranch
+strings
+"acccd"
+"accccccd"
+"cccd"
+"abcccd"
+"ab"
+"xcccd"
+regexps
+"^ab|c+d"
+-;1-5;-;-;1-5
+-;1-8;-;-;1-8
+0-4;0-4;-;-;0-4
+-;0-2;-;-;0-2,2-6
+0-2;0-2;-;-;0-2
+-;1-5;-;-;1-5
+"\\Aab|c+d"
+-;1-5;-;-;1-5
+-;1-8;-;-;1-8
+0-4;0-4;-;-;0-4
+-;0-2;-;-;0-2,2-6
+0-2;0-2;-;-;0-2
+-;1-5;-;-;1-5
+"^ab|c+d|q"
+-;1-5;-;-;1-5
+-;1-8;-;-;1-8
+0-4;0-4;-;-;0-4
+-;0-2;-;-;0-2,2-6
+0-2;0-2;-;-;0-2
+-;1-5;-;-;1-5
+# B2: detectEOFSkipSafe has the same hole from the other direction. Its
+# chain walk starts at midStartIdx and never inspects startState, so an
+# attempt riding a begin-anchored branch's states to EOF without accepting
+# wrongly proves "no later start can match". `^a[cd]*y|c+d` on "acccd"
+# returns NO MATCH (the EOF handler branches straight to $no_match) where
+# 1-5 is correct.
+FableB2EofSkipSafeAnchoredAltBranch
+strings
+"acccd"
+"accccccccd"
+"cccd"
+"aczy"
+"acdy"
+regexps
+"^a[cd]*y|c+d"
+-;1-5;-;-;1-5
+-;1-10;-;-;1-10
+0-4;0-4;-;-;0-4
+-;-;-;-
+0-4;0-4;-;-;0-4
+"\\Aa[cd]*y|c+d"
+-;1-5;-;-;1-5
+-;1-10;-;-;1-10
+0-4;0-4;-;-;0-4
+-;-;-;-
+0-4;0-4;-;-;0-4
+# B3: detectSkipSafeOnDead condition (f) case 2 allows an alternative entry
+# state's off-class byte to reach a MID-ACCEPT state. For midStart that
+# allowance is vacuous (off-class means dead by construction of C) and for
+# succ it is justified by the last_accept<0 contradiction, but a genuine
+# entry state like midStartWord is really entered at the death position, so
+# an attempt there would record a match the skip jumps over. `\Bz|x+y` on
+# "xz": C={x}; from midStartWord the `\B` resolves before the word char 'z'
+# and consumes it into Match, which isAcceptingExit wrongly accepts.
+FableB3SkipSafeOnDeadEntryOffClassMidAccept
+strings
+"xz"
+"xxz"
+"axxzb"
+"z"
+"xy"
+"axxy"
+regexps
+"\\Bz|x+y"
+-;1-2;-;-;1-2
+-;2-3;-;-;2-3
+-;3-4;-;-;3-4
+-;-;-;-
+0-2;0-2;-;-;0-2
+-;1-4;-;-;1-4
+"\\Bz|xx*y"
+-;1-2;-;-;1-2
+-;2-3;-;-;2-3
+-;3-4;-;-;3-4
+-;-;-;-
+0-2;0-2;-;-;0-2
+-;1-4;-;-;1-4
+# B4: getOrAddState queues workItem{dfaState, nfaSet, prevWasWord} with no
+# beginCtx, so although bug #27's fix folds nlCtx into the ACCEPT bitmasks of
+# '\n'-reached states, the TRANSITION build for those states runs
+# expandWithWB without ecBeginLine. A `\b`/`\B` resolved by the incoming
+# byte therefore cannot unlock a nested `(?m:^)` -- the transition-time
+# sibling of fixed bugs #12/#27. `\n\b(?m:^x)` on "\nx" returns no match.
+FableB4NewlineQueuedBeginLineContext
+strings
+"\nx"
+"a\nx"
+"\ny"
+"x"
+"\n\nx"
+regexps
+"\\n\\b(?m:^x)"
+0-2;0-2;-;-;0-2
+-;1-3;-;-;1-3
+-;-;-;-
+-;-;-;-
+-;1-3;-;-;1-3
+FableB4NewlineQueuedBeginLineContextNonWord
+strings
+"\n x"
+"a\n x"
+"\nx"
+"\n "
+regexps
+"\\n\\B(?m:^ x)"
+0-3;0-3;-;-;0-3
+-;1-4;-;-;1-4
+-;-;-;-
+-;-;-;-
+# B5: detectDominantSelfLoop decides mid-accept via
+# `l.midAcceptBytes[state] != 0`, consulting only the ctx=0 channel and never
+# midAcceptNLBytes. A state that accepts solely in the `(?m:$)` context is
+# therefore classified NON-mid dominant with '\n' inside its self-loop set,
+# so emitDominantBulkSkip advances past every '\n' without running the
+# newline pre-accept check and last_accept is never set. Sibling of
+# FUZZER_BUGS.md #41 (same channel blind spot, different skipper: #41 is the
+# inter-attempt advance, this is the intra-attempt SIMD skip).
+# The third input ("axx\nyyb", 7 bytes) is a CONTROL: below the bulk-skip's
+# pos+17>len bounds check it never engages, so it passed before the fix too.
+FableB5DominantBulkSkipMultilineEndAnchor
+strings
+"axxxxxxxxxxxxxxxxxxxx\nyyyb zzzzzzzzzz"
+"axx\nyybzzzzzzzzzzzzzzz"
+"axx\nyyb"
+"axxxxxxxxxxxxxxxxxxxx"
+"ab"
+regexps
+"a[^b]*(?m:$)"
+-;0-21;-;-;0-21
+-;0-3;-;-;0-3
+-;0-3;-;-;0-3
+0-21;0-21;-;-;0-21
+-;-;-;-
+FableB5DominantBulkSkipMultilineEndAnchorLitPrefix
+strings
+"foo:xxxxxxxxxxxxxxxxxxxx\nyyyb zzzzzzzzzz"
+"catxxxxxxxxxxxxxxxxxxxx\nyyyb zzzzzzzzzz"
+"dogxxxxxxxxxxxxxxxxxxxx\nyyyb zzzzzzzzzz"
+regexps
+"foo:[^b]*(?m:$)"
+-;0-24;-;-;0-24
+-;-;-;-
+-;-;-;-
+"(?:cat|dog)[^b]*(?m:$)"
+-;-;-;-
+-;0-23;-;-;0-23
+-;0-23;-;-;0-23
+# ============================================================
+# Category 36: FABLE.md wave 3 — lit-chain anchor / range gates
+# ============================================================
+# B6: the three Gap E mixed-prefix emitters
+# (buildLitChainPrefixedMatchBody, buildLitChainPrefixedFindBody,
+# emitLitChainAltLitBranchBodyPrefixed) never referenced startAnchor /
+# endAnchor even though analyseLitChainBranch peels and records them, so an
+# anchored `<class>{M}<literal><class>{N}` pattern matched as if unanchored.
+# The last pattern in each block is the unanchored control that must keep
+# taking the (correct) prefixed fast path.
+FableB6PrefixedAnchorsDropped
+strings
+"zzababXY012345678901234567890123"
+"ababXY012345678901234567890123"
+"ababXY012345678901234567890123z"
+"!!!!XY012345678901234567890123"
+"a!!!!XY012345678901234567890123"
+"cdcdZW012345678901234567890123"
+regexps
+"^[ab]{4}XY[0-9]{24}"
+-;-;-;-
+0-30;0-30;-;-
+-;0-30;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"[ab]{4}XY[0-9]{24}$"
+-;2-32;-;-
+0-30;0-30;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"\\b[!-,]{4}XY[0-9]{24}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;1-31;-;-
+-;-;-;-
+"[ab]{4}XY[0-9]{24}"
+-;2-32;-;-
+0-30;0-30;-;-
+-;0-30;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+# B6 (alternation half) and B9. Both bodies below are only reachable with
+# find_func compiled alone (compile.go's `needFind && !needMatch` gate), so
+# these rows only discriminate under `make findonly`; under every other
+# target they exercise the classic DFA.
+#   pattern 1/2: anchored branches — B6.
+#   pattern 3:   branches with DIFFERENT prefix lengths (2 vs 4) — B9. The
+#                candidate scan finds literals in literal-position order but
+#                each branch reports a match start of attempt_start-prefixCount,
+#                so with unequal prefixes the emitted body returned branch 1's
+#                later-starting match ([1,19)) over branch 2's ([0,20)).
+#   pattern 4:   unanchored, equal prefix lengths — the control that must
+#                still take the alt-prefixed fast path.
+FableB6B9AltPrefixedFindOnly
+strings
+"zzababXY012345678901234567890123"
+"ababXY012345678901234567890123"
+"ababXY012345678901234567890123z"
+"cdcdZW012345678901234567890123"
+"123aZWkkkkkkkkkkkkkkk"
+"zzcdcdZW012345678901234567890123"
+regexps
+"^[ab]{4}XY[0-9]{24}|^[cd]{4}ZW[0-9]{24}"
+-;-;-;-
+0-30;0-30;-;-
+-;0-30;-;-
+0-30;0-30;-;-
+-;-;-;-
+-;-;-;-
+"[ab]{4}XY[0-9]{24}$|[cd]{4}ZW[0-9]{24}$"
+-;2-32;-;-
+0-30;0-30;-;-
+-;-;-;-
+0-30;0-30;-;-
+-;-;-;-
+-;2-32;-;-
+"[0-9]{2}a[A-Za-z]{15}|[0-9a]{4}ZW[A-Za-z]{14}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-20;-;-
+-;-;-;-
+"[ab]{4}XY[0-9]{24}|[cd]{4}ZW[0-9]{24}"
+-;2-32;-;-
+0-30;0-30;-;-
+-;0-30;-;-
+0-30;0-30;-;-
+-;-;-;-
+-;2-32;-;-
+# B7 and B10, single-pattern `{N,M}` find.
+#   patterns 1/2/4: buildLitChainRangeFindBody ignored startAnchor/endAnchor
+#                   (its fixed-count sibling has a full hasAnchors path).
+#   pattern 3:      non-greedy `{N,M}?` collapses to `{N,N}` in find mode, but
+#                   Perl lets it extend past N when a trailing anchor demands
+#                   it — B10.
+#   pattern 5:      unanchored control, must keep the range fast path.
+FableB7B10RangeFindAnchors
+strings
+"zzA012345678901234567890123456789"
+"A012345678901234567890123456789"
+"A0123456789012345678901234x"
+"A01234567890123456789012345"
+"A012345678901234567890123"
+"zzA012345678901234567890123x"
+regexps
+"^A[0-9]{24,30}"
+-;-;-;-
+0-31;0-31;-;-
+-;0-26;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;-;-;-
+"A[0-9]{24,30}$"
+-;2-33;-;-
+0-31;0-31;-;-
+-;-;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;-;-;-
+"A[0-9]{24,30}?$"
+-;2-33;-;-
+0-31;0-31;-;-
+-;-;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;-;-;-
+"^A[0-9]{24,30}$"
+-;-;-;-
+0-31;0-31;-;-
+-;-;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;-;-;-
+"A[0-9]{24,30}"
+-;2-33;-;-
+0-31;0-31;-;-
+-;0-26;-;-
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;2-27;-;-
+# B7, capture half: buildLitChainRangeFindGroupsBody had the same blind spot.
+# The discriminating row is `A([0-9]{24,30})$` on "A"+25 digits+"x", where the
+# body reported [0,26) with `$` unchecked.
+FableB7RangeGroupsAnchors
+strings
+"zzA012345678901234567890123456789"
+"A012345678901234567890123456789"
+"A012345678901234567890123"
+regexps
+"^A([0-9]{24,30})"
+-;-;-;-;-;-
+0-31 1-31;0-31;-;-;-;0-31 1-31
+0-25 1-25;0-25;-;-;-;0-25 1-25
+"A([0-9]{24,30})$"
+-;2-33;-;-;-;2-33 3-33
+0-31 1-31;0-31;-;-;-;0-31 1-31
+0-25 1-25;0-25;-;-;-;0-25 1-25
+# Separate block for the discriminating end-anchor input: the buggy body
+# returned [0,26) with `$` unchecked, so col0 "-" vs end=26 is the failure.
+# Kept out of the block above because col0 for a capturing pattern follows
+# groups()' start-at-0 contract, while --validate-go's col0 oracle requires
+# the match to span the whole input — the two disagree on
+# "^A([0-9]{24,30})" + this input, and only on it.
+FableB7RangeGroupsEndAnchor
+strings
+"A0123456789012345678901234x"
+"A012345678901234567890123456789"
+regexps
+"A([0-9]{24,30})$"
+-;-;-;-;-;-
+0-31 1-31;0-31;-;-;-;0-31 1-31
+# B8: extractLitChainCaptures gives every OpRepeat a Min-based width, and
+# emitLitChainRangeGroupSlotWrites re-derived "this capture ends at the chain"
+# by testing endOffset == K + countMax — an equality that can never hold for a
+# true range, so every chain-covering capture got a frozen attemptStart+K+Min
+# end. The flag is now recorded structurally by the walk. Fixed-count captures
+# (all offsets genuinely compile-time) are unaffected; the nested shapes pin
+# that the flag propagates through OpCapture and OpConcat.
+FableB8RangeGroupsChainEnd
+strings
+"A012345678901234567890123456789"
+"A012345678901234567890123"
+"A012345678901234567890123456"
+"zzA01234567890123456789012345678901234!"
+regexps
+"A([0-9]{24,30})"
+0-31 1-31;0-31;-;-;-;0-31 1-31
+0-25 1-25;0-25;-;-;-;0-25 1-25
+0-28 1-28;0-28;-;-;-;0-28 1-28
+-;2-33;-;-;-;2-33 3-33
+"(A[0-9]{24,30})"
+0-31 0-31;0-31;-;-;-;0-31 0-31
+0-25 0-25;0-25;-;-;-;0-25 0-25
+0-28 0-28;0-28;-;-;-;0-28 0-28
+-;2-33;-;-;-;2-33 2-33
+"(A)([0-9]{24,30})"
+0-31 0-1 1-31;0-31;-;-;-;0-31 0-1 1-31
+0-25 0-1 1-25;0-25;-;-;-;0-25 0-1 1-25
+0-28 0-1 1-28;0-28;-;-;-;0-28 0-1 1-28
+-;2-33;-;-;-;2-33 2-3 3-33
+"((A)[0-9]{24,30})"
+0-31 0-31 0-1;0-31;-;-;-;0-31 0-31 0-1
+0-25 0-25 0-1;0-25;-;-;-;0-25 0-25 0-1
+0-28 0-28 0-1;0-28;-;-;-;0-28 0-28 0-1
+-;2-33;-;-;-;2-33 2-33 2-3
+"(A([0-9]{24,30}))"
+0-31 0-31 1-31;0-31;-;-;-;0-31 0-31 1-31
+0-25 0-25 1-25;0-25;-;-;-;0-25 0-25 1-25
+0-28 0-28 1-28;0-28;-;-;-;0-28 0-28 1-28
+-;2-33;-;-;-;2-33 2-33 3-33
+# B10, alternation sibling. buildLitChainAltRangeFindBody collapses a
+# non-greedy branch to {N,N} and then emits the FIXED-COUNT body, which
+# checks the end anchor at exactly N — but Perl lets `{N,M}?` extend past N
+# when a trailing anchor demands it. Find-only, like the blocks above.
+# The controls block pins that a non-greedy range with only a start anchor,
+# or none, keeps the fast path.
+FableB10AltRangeNonGreedyEndAnchorFindOnly
+strings
+"A01234567890123456789012345"
+"A012345678901234567890123"
+"xxA01234567890123456789012345"
+"zz012345678901234567890123"
+regexps
+"A[0-9]{24,30}?$|zz[0-9]{24}"
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;2-29;-;-
+0-26;0-26;-;-
+"A[0-9]{24,30}?\\b|zz[0-9]{24}"
+0-27;0-27;-;-
+0-25;0-25;-;-
+-;2-29;-;-
+0-26;0-26;-;-
+FableB10AltRangeNonGreedyControls
+strings
+"A012345678901234567890123"
+"xxA01234567890123456789012345"
+"zz012345678901234567890123"
+regexps
+"^A[0-9]{24,30}?|zz[0-9]{24}"
+0-25;0-25;-;-
+-;-;-;-
+0-26;0-26;-;-
+"A[0-9]{24,30}?|zz[0-9]{24}"
+0-25;0-25;-;-
+-;2-27;-;-
+0-26;0-26;-;-
+# B11: emitLitChainAltLitBranchBodyRange checks the end anchor only at the
+# MAXIMAL match length, but greedy `{N,M}` must back off while a trailing
+# assertion fails. Find-only, like the B6/B9 alt block above.
+#   pattern 1: `\b` with a class mixing word and non-word bytes ([a ]) —
+#              backoff to 24 satisfies `\b`, at-max (25, before ',') does not.
+#   pattern 2: `\B` with a homogeneous class — every INTERIOR length satisfies
+#              `\B` while the maximal one (end of text) does not, so `\B` is
+#              never safe at-max-only.
+#   pattern 3: `\b` with a homogeneous all-word class — the realistic secrets
+#              shape, still allowed on the fast path (backoff can never help).
+#   pattern 4: `$` — monotone in match length, immune, still allowed.
+FableB11AltRangeWordBoundaryFindOnly
+strings
+"qaaaaaaaaaaaaaaaaaaaaaaaa ,"
+"qaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"qaaaaaaaaaaaaaaaaaaaaaaaaa!"
+"AKIAABCDEFGHIJABCDEFGHIJ x"
+"AKIAABCDEFGHIJABCDEFGHIJABCDEFGHIJAB!"
+"zz012345678901234567890123"
+regexps
+"q[a ]{24,26}\\b|zz[0-9]{24}"
+-;0-25;-;-
+0-27;0-27;-;-
+-;0-26;-;-
+-;-;-;-
+-;-;-;-
+0-26;0-26;-;-
+"q[a-z]{24,26}\\B|zz[0-9]{24}"
+-;-;-;-
+-;0-26;-;-
+-;0-25;-;-
+-;-;-;-
+-;-;-;-
+0-26;0-26;-;-
+"AKIA[A-Z]{16,32}\\b|zz[0-9]{24}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;0-24;-;-
+-;0-36;-;-
+0-26;0-26;-;-
+"q[a ]{24,26}$|zz[0-9]{24}"
+-;-;-;-
+0-27;0-27;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-26;0-26;-;-
+# ============================================================
+# Category 37: FABLE.md wave 4 — BT narrowed-slice text/line anchors
+# ============================================================
+# B13: the BT composed captureBody's InstEmptyWidth handlers for \A, \z,
+# (?m:^) and (?m:$) tested the narrowed (ptr,len) slice the groups wrapper
+# hands them (the DFA-found extent) instead of the true input edges, so a
+# higher-priority alternation branch that full-input semantics reject won
+# anyway. Extent stayed correct; only branch priority / capture content was
+# wrong. `(\ba)|a` is the control: \b already consults origPtr/origEnd via
+# the edgeScratchOff mechanism and must keep passing.
+FableB13BTNarrowedSliceAnchors
+strings
+"ab"
+"xa"
+"a"
+"xab"
+"aab"
+"ba"
+"b\na"
+"a\nb"
+regexps
+"(a)\\z|a"
+0-1 -;0-1;-;-;0-1;0-1 -
+-;1-2;-;-;1-2;1-2 1-2
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+-;1-2;-;-;1-2;1-2 -
+0-1 -;0-1;-;-;0-1,1-2;0-1 -
+-;1-2;-;-;1-2;1-2 1-2
+-;2-3;-;-;2-3;2-3 2-3
+0-1 -;0-1;-;-;0-1;0-1 -
+"\\A(a)|a"
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+-;1-2;-;-;1-2;1-2 -
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+-;1-2;-;-;1-2;1-2 -
+0-1 0-1;0-1;-;-;0-1,1-2;0-1 0-1
+-;1-2;-;-;1-2;1-2 -
+-;2-3;-;-;2-3;2-3 -
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+"(a)(?m:$)|a"
+0-1 -;0-1;-;-;0-1;0-1 -
+-;1-2;-;-;1-2;1-2 1-2
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+-;1-2;-;-;1-2;1-2 -
+0-1 -;0-1;-;-;0-1,1-2;0-1 -
+-;1-2;-;-;1-2;1-2 1-2
+-;2-3;-;-;2-3;2-3 2-3
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+"(?m:^(a))|(a)"
+0-1 0-1 -;0-1;-;-;0-1;0-1 0-1 -
+-;1-2;-;-;1-2;1-2 - 1-2
+0-1 0-1 -;0-1;-;-;0-1;0-1 0-1 -
+-;1-2;-;-;1-2;1-2 - 1-2
+0-1 0-1 -;0-1;-;-;0-1,1-2;0-1 0-1 -
+-;1-2;-;-;1-2;1-2 - 1-2
+-;2-3;-;-;2-3;2-3 2-3 -
+0-1 0-1 -;0-1;-;-;0-1;0-1 0-1 -
+"(\\ba)|a"
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+-;1-2;-;-;1-2;1-2 -
+0-1 0-1;0-1;-;-;0-1;0-1 0-1
+-;1-2;-;-;1-2;1-2 -
+0-1 0-1;0-1;-;-;0-1,1-2;0-1 0-1
+-;1-2;-;-;1-2;1-2 -
+-;2-3;-;-;2-3;2-3 2-3
+0-1 0-1;0-1;-;-;0-1;0-1 0-1

@@ -11,9 +11,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -24,12 +25,66 @@ import (
 	"github.com/qrdl/regexped/merge"
 )
 
-func main() {
-	log.SetFlags(0)
+// Exit codes. See plans/IMPROVEMENT_PLAN.md #24.
+//
+// Every failure path goes through failf, so these are the only non-zero codes
+// the tool produces. Note that this requires the flag sets to use
+// ContinueOnError: flag.ExitOnError exits with 2 of its own accord, which would
+// report a bad command line as a compile failure.
+const (
+	exitOK      = 0 // success
+	exitUsage   = 1 // bad command line: missing/unknown subcommand, missing or conflicting flags
+	exitCompile = 2 // config content rejected, or compile / generate / merge failed
+	exitIO      = 3 // filesystem failure: unreadable config, unwritable output
+)
 
+// failf reports a fatal error and exits with code.
+//
+// Errors go through slog rather than the log package. main used to call
+// log.Fatal, but slog.SetDefault routes the log package through the slog
+// handler at level INFO, and the handler's level is WARN unless --debug — so
+// every one of those messages was silently discarded and the tool exited
+// non-zero in complete silence. slog.Error is above the WARN threshold and
+// therefore always reaches the user.
+func failf(code int, format string, args ...any) {
+	slog.Error(fmt.Sprintf(format, args...))
+	os.Exit(code)
+}
+
+// exitCodeFor returns exitIO when err carries a filesystem failure, and
+// fallback otherwise. Every producer of these errors wraps with %w, so a
+// missing config file is reported as an I/O failure while a malformed or
+// invalid one is reported under the caller's own class.
+func exitCodeFor(err error, fallback int) int {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) ||
+		errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, fs.ErrPermission) {
+		return exitIO
+	}
+	return fallback
+}
+
+// parseFlags parses fs and terminates on anything other than success. The flag
+// package has already printed the message and usage by the time Parse returns,
+// so there is nothing to report here — only the exit code to set.
+func parseFlags(fset *flag.FlagSet, args []string) {
+	err := fset.Parse(args)
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, flag.ErrHelp):
+		os.Exit(exitOK)
+	default:
+		os.Exit(exitUsage)
+	}
+}
+
+func main() {
+	flag.CommandLine.Init(os.Args[0], flag.ContinueOnError)
 	debug := flag.Bool("debug", false, "enable debug logging")
 	flag.Usage = printUsage
-	flag.Parse()
+	parseFlags(flag.CommandLine, os.Args[1:])
 
 	level := slog.LevelWarn
 	if *debug {
@@ -39,7 +94,7 @@ func main() {
 
 	if flag.NArg() < 1 {
 		printUsage()
-		os.Exit(1)
+		os.Exit(exitUsage)
 	}
 
 	switch flag.Arg(0) {
@@ -50,9 +105,9 @@ func main() {
 	case "merge":
 		runMergeCmd(flag.Args()[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", flag.Arg(0))
+		slog.Error(fmt.Sprintf("unknown command: %s", flag.Arg(0)))
 		printUsage()
-		os.Exit(1)
+		os.Exit(exitUsage)
 	}
 }
 
@@ -72,16 +127,16 @@ Run 'regexped <command> -h' for command-specific options.
 }
 
 func runGenerateCmd(args []string) {
-	fs := flag.NewFlagSet("generate", flag.ExitOnError)
-	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
+	fset := flag.NewFlagSet("generate", flag.ContinueOnError)
+	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
 	var out string
-	fs.StringVar(&out, "output", "", "override stub output file from config; - writes to stdout")
-	fs.StringVar(&out, "o", "", "output file (alias for --output)")
-	fs.Parse(args)
+	fset.StringVar(&out, "output", "", "override stub output file from config; - writes to stdout")
+	fset.StringVar(&out, "o", "", "output file (alias for --output)")
+	parseFlags(fset, args)
 
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
-		log.Fatal(err)
+		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 
 	// Resolve effective output path.
@@ -90,39 +145,38 @@ func runGenerateCmd(args []string) {
 		outPath = cfg.StubFile
 	}
 	if outPath == "" {
-		fmt.Fprintln(os.Stderr, "generate: --output is required (or set stub_file in config)")
-		os.Exit(1)
+		failf(exitUsage, "generate: --output is required (or set stub_file in config)")
 	}
 
 	// Validate stub type before doing any work.
 	stubType, err := generate.ResolveStubType(cfg)
 	if err != nil {
-		log.Fatal(err)
+		failf(exitCompile, "%v", err)
 	}
 
 	// Rust, Go, C, and AS stubs require import_module for the FFI/WASM import module name.
+	// Config content rather than command line, hence exitCompile.
 	if (stubType == "rust" || stubType == "go" || stubType == "c" || stubType == "as") && cfg.ImportModule == "" {
-		fmt.Fprintln(os.Stderr, "generate: import_module is required in config for Rust, Go, C, and AS stubs")
-		os.Exit(1)
+		failf(exitCompile, "generate: import_module is required in config for Rust, Go, C, and AS stubs")
 	}
 
 	if err := generate.CmdGenerateStub(cfg, outPath); err != nil {
-		log.Fatal(err)
+		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 }
 
 func runCompileCmd(args []string) {
-	fs := flag.NewFlagSet("compile", flag.ExitOnError)
-	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	diagJSON := fs.String("diag-json", "", "write set-composition diagnostics as JSON to this path (- for stdout)")
+	fset := flag.NewFlagSet("compile", flag.ContinueOnError)
+	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
+	diagJSON := fset.String("diag-json", "", "write set-composition diagnostics as JSON to this path (- for stdout)")
 	var out string
-	fs.StringVar(&out, "output", "", "override wasm_file from config; - writes to stdout")
-	fs.StringVar(&out, "o", "", "output file (alias for --output)")
-	fs.Parse(args)
+	fset.StringVar(&out, "output", "", "override wasm_file from config; - writes to stdout")
+	fset.StringVar(&out, "o", "", "output file (alias for --output)")
+	parseFlags(fset, args)
 
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
-		log.Fatal(err)
+		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 
 	// Resolve effective output path.
@@ -131,8 +185,7 @@ func runCompileCmd(args []string) {
 		outPath = cfg.WasmFile
 	}
 	if outPath == "" {
-		fmt.Fprintln(os.Stderr, "compile: --output is required (or set wasm_file in config)")
-		os.Exit(1)
+		failf(exitUsage, "compile: --output is required (or set wasm_file in config)")
 	}
 
 	// Validate output conflict before writing any output: refuse to send both
@@ -140,53 +193,52 @@ func runCompileCmd(args []string) {
 	// path), which would silently corrupt the WASM with the JSON diagnostics.
 	if *diagJSON != "" && len(cfg.Sets) > 0 {
 		if outPath == "-" && *diagJSON == "-" {
-			fmt.Fprintln(os.Stderr, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
-			os.Exit(1)
+			failf(exitUsage, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
 		}
 		if outPath != "-" && *diagJSON != "-" {
 			absOut, err1 := filepath.Abs(outPath)
 			absDiag, err2 := filepath.Abs(*diagJSON)
 			if err1 == nil && err2 == nil && absOut == absDiag {
-				fmt.Fprintf(os.Stderr, "compile: --output and --diag-json resolve to the same path (%s); use distinct paths\n", absOut)
-				os.Exit(1)
+				failf(exitUsage, "compile: --output and --diag-json resolve to the same path (%s); use distinct paths", absOut)
 			}
 		}
 	}
 
 	if err := compile.CmdCompile(cfg, outPath); err != nil {
-		log.Fatal(err)
+		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 
 	if *diagJSON != "" && len(cfg.Sets) > 0 {
 		if err := compile.CmdWriteDiagJSON(cfg, outPath, *diagJSON); err != nil {
-			log.Fatal(err)
+			failf(exitCodeFor(err, exitCompile), "%v", err)
 		}
 	}
 }
 
 func runMergeCmd(args []string) {
-	fs := flag.NewFlagSet("merge", flag.ExitOnError)
-	configFile := fs.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	mainFlag := fs.String("main", "", "main WASM file to merge into (required)")
+	fset := flag.NewFlagSet("merge", flag.ContinueOnError)
+	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
+	mainFlag := fset.String("main", "", "main WASM file to merge into (required)")
 	var out string
-	fs.StringVar(&out, "output", "", "override output from config; - writes to stdout")
-	fs.StringVar(&out, "o", "", "output file (alias for --output)")
-	fs.Parse(args)
+	// No "- writes to stdout" here, unlike the generate and compile commands:
+	// merge shells out to wasm-merge, which is handed -o verbatim and would
+	// create a file literally named "-". See plans/FABLE.md B36.
+	fset.StringVar(&out, "output", "", "override output from config (must be a file path)")
+	fset.StringVar(&out, "o", "", "output file (alias for --output)")
+	parseFlags(fset, args)
 
 	if *mainFlag == "" {
-		fmt.Fprintln(os.Stderr, "merge: --main=<file> is required")
-		os.Exit(1)
+		failf(exitUsage, "merge: --main=<file> is required")
 	}
 
-	regexWasms := fs.Args()
+	regexWasms := fset.Args()
 	if len(regexWasms) == 0 {
-		fmt.Fprintln(os.Stderr, "merge: at least one regexp WASM file is required as a positional argument")
-		os.Exit(1)
+		failf(exitUsage, "merge: at least one regexp WASM file is required as a positional argument")
 	}
 
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
-		log.Fatal(err)
+		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 
 	// Resolve effective output path.
@@ -195,11 +247,10 @@ func runMergeCmd(args []string) {
 		outPath = cfg.Output
 	}
 	if outPath == "" {
-		fmt.Fprintln(os.Stderr, "merge: --output is required (or set output in config)")
-		os.Exit(1)
+		failf(exitUsage, "merge: --output is required (or set output in config)")
 	}
 
 	if err := merge.CmdMerge(cfg, *mainFlag, outPath, regexWasms); err != nil {
-		log.Fatal(err)
+		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 }

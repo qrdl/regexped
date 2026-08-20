@@ -64,6 +64,17 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 	hb.WriteString("typedef struct { int start; int end; const char *name; } rx_group_t;\n")
 	hb.WriteString("typedef struct { int pattern_id; int start; int end; } rx_set_match_t;\n")
 	hb.WriteString("typedef struct { int pattern_id; int end; } rx_set_anchor_t;\n")
+	hb.WriteString("\n")
+	hb.WriteString("/* Returned when the Backtracking engine exhausted its backtrack-frame\n")
+	hb.WriteString("   budget on this input. The engine abandoned part of the search space, so\n")
+	hb.WriteString("   whether the input matches is UNKNOWN -- this is NOT \"no match\". Treat it\n")
+	hb.WriteString("   as an error: shorten the input, or raise the pattern's frame budget.\n")
+	hb.WriteString("   Unlike the other language stubs (which throw or panic), C has no\n")
+	hb.WriteString("   unwinding, so the sentinel is returned to the caller: an int-returning\n")
+	hb.WriteString("   match function returns it directly, a find function returns\n")
+	hb.WriteString("   {RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW}, and a groups function returns\n")
+	hb.WriteString("   NULL (which it never does otherwise). See docs/engines.md. */\n")
+	fmt.Fprintf(&hb, "#define RX_ERR_BT_OVERFLOW (%d)\n", btOverflow)
 	hb.WriteString("#endif\n\n")
 
 	// .c file
@@ -221,7 +232,8 @@ func genCPartsForEntry(re config.RegexEntry, importModule string) (hPart, cPart 
 // genCMatchHPart generates the .h prototype for an anchored-match function.
 func genCMatchHPart(funcName string) string {
 	return fmt.Sprintf(
-		"/* %s: anchored match. Returns end position (>=0) or -1 if no match. */\n"+
+		"/* %s: anchored match. Returns end position (>=0), -1 if no match, or\n"+
+			"   RX_ERR_BT_OVERFLOW (see above) if the match result is unknown. */\n"+
 			"int %s(const unsigned char *input, unsigned int len);\n\n",
 		funcName, funcName)
 }
@@ -242,7 +254,11 @@ func genCMatchCPart(importModule, funcName string) string {
 func genCFindHPart(funcName string) string {
 	return fmt.Sprintf(
 		"/* %s: non-anchored find from offset.\n"+
-			"   Returns absolute {start, end}, or {-1, -1} if not found. */\n"+
+			"   Returns absolute {start, end}, {-1, -1} if not found, or\n"+
+			"   {RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW} if the result is unknown.\n"+
+			"   To iterate non-overlapping matches, advance past each match; a pattern\n"+
+			"   that can match empty needs the guard, or offset never moves:\n"+
+			"     off = m.end > m.start ? m.end : m.start + 1; */\n"+
 			"rx_match_t %s(const unsigned char *input, unsigned int len, unsigned int offset);\n\n",
 		funcName, funcName)
 }
@@ -256,6 +272,7 @@ func genCFindCPart(importModule, funcName string) string {
 	fmt.Fprintf(&sb, "rx_match_t %s(const unsigned char *input, unsigned int len, unsigned int offset) {\n", funcName)
 	sb.WriteString("    if (offset > len) return (rx_match_t){-1, -1};\n")
 	fmt.Fprintf(&sb, "    long long r = %s(input + offset, len - offset);\n", ffi)
+	sb.WriteString("    if (r == RX_ERR_BT_OVERFLOW) return (rx_match_t){RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW};\n")
 	sb.WriteString("    if (r < 0) return (rx_match_t){-1, -1};\n")
 	sb.WriteString("    unsigned int rel_s = (unsigned int)((unsigned long long)r >> 32);\n")
 	sb.WriteString("    unsigned int rel_e = (unsigned int)(r & 0xFFFFFFFFU);\n")
@@ -326,8 +343,12 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 			"   Named groups have their name field pointing to the corresponding %s_GROUP_* constant;\n"+
 			"   use == for identity comparison. Unnamed groups have name == NULL.\n"+
 			"   All entries are {-1, -1, ...} when no match is found starting from offset.\n"+
-			"   To iterate non-overlapping matches, advance offset to groups[0].end after\n"+
-			"   each successful call. */\n"+
+			"   Returns NULL (never returned otherwise) if the Backtracking engine\n"+
+			"   exhausted its frame budget -- see RX_ERR_BT_OVERFLOW above.\n"+
+			"   To iterate non-overlapping matches, advance past each match; a pattern\n"+
+			"   that can match empty needs the guard, or offset never moves:\n"+
+			"     off = groups[0].end > groups[0].start ? groups[0].end\n"+
+			"                                          : groups[0].start + 1; */\n"+
 			"const rx_group_t *%s(const unsigned char *input, unsigned int len, unsigned int offset);\n\n",
 		funcName, funcUpper, funcUpper, funcName)
 
@@ -368,6 +389,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	cb.WriteString("    while (pos <= len) {\n")
 	fmt.Fprintf(&cb, "        for (int i = 0; i < %d; i++) slots[i] = -1;\n", slotCount)
 	fmt.Fprintf(&cb, "        int r = %s(input + pos, len - pos, slots);\n", ffi)
+	cb.WriteString("        if (r == RX_ERR_BT_OVERFLOW) return (const rx_group_t *)0;\n")
 	cb.WriteString("        if (r >= 0) {\n")
 	fmt.Fprintf(&cb, "            for (int i = 0; i < %d; i++) {\n", numGroups)
 	fmt.Fprintf(&cb, "                %s[i].name = %s[i];\n", resultVar, namesVar)

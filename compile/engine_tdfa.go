@@ -1,9 +1,9 @@
 package compile
 
 import (
-	"fmt"
 	"regexp/syntax"
 	"sort"
+	"strconv"
 
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -163,16 +163,27 @@ func sequentializeCopies(copyOps []tdfaTagOp) []tdfaTagOp {
 }
 
 // keyString serialises a tdfaStateKey to a map-friendly string.
+//
+// Uses strconv.AppendInt rather than fmt.Appendf: this function was measured at
+// 42% of total newTDFA wall time (pprof, 8-group CSV pattern — 88 ms to build a
+// 16-state automaton), essentially all of it inside fmt's reflection-based
+// integer formatting, called once per register per thread per state. See
+// plans/OPUS.md §N8. The emitted bytes are identical to what "%d" produced —
+// including negative register values, which regMap uses for "unset" (-1) and
+// scratchRegSentinel (-2) — so DFA state ordering and every downstream
+// fuel/size baseline are unaffected.
 func (k *tdfaStateKey) keyString() string {
 	// Format: repeated "(pc:[r0,r1,...])W?" sorted by pc.
 	b := make([]byte, 0, 64)
 	for _, t := range k.threads {
-		b = fmt.Appendf(b, "(%d:[", t.pc)
+		b = append(b, '(')
+		b = strconv.AppendInt(b, int64(t.pc), 10)
+		b = append(b, ':', '[')
 		for i, r := range t.regMap {
 			if i > 0 {
 				b = append(b, ',')
 			}
-			b = fmt.Appendf(b, "%d", r)
+			b = strconv.AppendInt(b, int64(r), 10)
 		}
 		b = append(b, ']', ')')
 	}
@@ -321,9 +332,33 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 
 	// Per-state data accumulated during construction.
 	type stateData struct {
-		key         tdfaStateKey
-		nfaPCs      []uint32 // bare NFA PCs (for epsilonClosure / accept checks)
-		prevWasWord bool
+		key tdfaStateKey
+		// priorityPCs holds this state's live NFA PCs in true leftmost-first
+		// priority order (highest priority first) — the order threads were
+		// discovered in during subset construction, BEFORE canonicalise()
+		// re-sorted key.threads by ascending pc for canonical hashing.
+		//
+		// This order matters: nfaBuildInputMap (engine_dfa.go) prunes a
+		// Rune-consuming thread's transition once it has seen a higher-or-
+		// equal-priority InstMatch earlier in the list it's given (standard
+		// leftmost-first "kill lower-priority threads once a match is found"
+		// semantics — see plans/FUZZER_BUGS.md §12). Passing it key.threads'
+		// pc-sorted order instead would silently defeat that pruning whenever
+		// numeric pc order disagrees with true priority — which happens for
+		// backward loop edges, e.g. an outer repeat wrapping a range-quantified
+		// (`{m,n}` with m<n) capture group: the loop-continuation/optional-copy
+		// PCs are numerically smaller than the Match PC despite being lower
+		// priority than a Match reached earlier in the same state. A thread
+		// that should have died there instead survives into later states and
+		// produces a spurious extra accept at a wrong (too-late, lower-priority)
+		// position.
+		priorityPCs []uint32
+		// priorityThreads mirrors priorityPCs but carries each thread's final
+		// canonical regMap alongside its pc. The transition-building loop below
+		// (source-thread selection, "first contributing thread wins") needs both
+		// the priority order AND the register values, which bare pcs can't give it.
+		priorityThreads []tdfaThread
+		prevWasWord     bool
 	}
 	var states []stateData
 
@@ -356,10 +391,18 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	//    we sort by pc for a deterministic canonical key).
 	// 2. Renaming registers to 0, 1, 2, … in order of first appearance
 	//    scanning threads left-to-right, tags 0…numTags-1.
-	// Returns the canonical threads and a rename map: oldReg → newCanonicalReg.
-	// Newly allocated canonical registers (not yet backed by real registers) are
-	// assigned new indices from allocReg().
-	canonicalise := func(threads []tdfaThread) (canonical []tdfaThread, rename map[int]int, newRegs int) {
+	// Returns the canonical (pc-sorted) threads, a priority-ordered mirror of
+	// `threads` with the same register renaming applied, and a rename map:
+	// oldReg → newCanonicalReg. Newly allocated canonical registers (not yet
+	// backed by real registers) are assigned new indices from allocReg().
+	//
+	// The priority-ordered result exists because pc order and leftmost-first
+	// priority order disagree for backward loop edges (see stateData.priorityPCs
+	// doc comment below) — callers that need "the highest-priority thread"
+	// (accept-time regMap selection, transition source-thread selection) must
+	// use it instead of the pc-sorted `canonical` slice, or they silently pick a
+	// lower-priority thread's registers whenever the two orders diverge.
+	canonicalise := func(threads []tdfaThread) (canonical, priorityOrder []tdfaThread, rename map[int]int, newRegs int) {
 		sorted := make([]tdfaThread, len(threads))
 		copy(sorted, threads)
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i].pc < sorted[j].pc })
@@ -384,7 +427,22 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			}
 			sorted[i].regMap = newMap
 		}
-		return sorted, rename, counter
+
+		priorityOrder = make([]tdfaThread, len(threads))
+		for i, t := range threads {
+			newMap := make([]int, numTags)
+			for tag := 0; tag < numTags; tag++ {
+				old := t.regMap[tag]
+				if old < 0 {
+					newMap[tag] = -1
+				} else {
+					newMap[tag] = rename[old]
+				}
+			}
+			priorityOrder[i] = tdfaThread{pc: t.pc, regMap: newMap}
+		}
+
+		return sorted, priorityOrder, rename, counter
 	}
 
 	// ---- helper: getOrAddState ----
@@ -426,7 +484,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			workThreads[i] = tdfaThread{pc: t.pc, regMap: rm}
 		}
 
-		canonical, rename, counter := canonicalise(workThreads)
+		canonical, priorityCanonical, rename, counter := canonicalise(workThreads)
 
 		// Compute ops for this transition:
 		//   orig >= sentinelBase → was a freshly-captured tag → reg[can] = pos
@@ -454,7 +512,8 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			}
 		}
 		sort.Slice(setOps, func(i, j int) bool { return setOps[i].dst < setOps[j].dst })
-		ops := append(copyOps, setOps...)
+		copyOps = append(copyOps, setOps...)
+		ops := copyOps
 
 		// Update global register high-water mark (canonical indices ARE WASM locals).
 		if counter > nextReg {
@@ -474,6 +533,14 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		stateMap[ks] = id
 
 		pcs := keyToPCs(key)
+		// priorityPCs: true leftmost-first order, taken from the `threads`
+		// parameter as passed in by the caller — canonicalise() above sorts by
+		// pc for hashing (key.threads/pcs) and loses this order (see
+		// stateData.priorityPCs doc comment).
+		priorityPCs := make([]uint32, len(threads))
+		for i, t := range threads {
+			priorityPCs[i] = uint32(t.pc)
+		}
 		var eofWBCtx int
 		if prevWasWord {
 			eofWBCtx = ecWordBoundary
@@ -505,12 +572,16 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		}
 
 		// Build acceptRegMap: which register holds each tag in the highest-priority
-		// accepting thread at accept time.
+		// accepting thread at accept time. Must scan priorityCanonical (leftmost-
+		// first order), not canonical (pc-sorted) — otherwise a backward loop edge
+		// (see stateData.priorityPCs doc comment) can make a lower-priority thread's
+		// regMap win here even though pruning elsewhere correctly favored the
+		// higher-priority one.
 		regMap := make([]int, numTags)
 		for i := range regMap {
 			regMap[i] = -1
 		}
-		for _, t := range canonical {
+		for _, t := range priorityCanonical {
 			if isAccepting([]uint32{uint32(t.pc)}, ecEnd|eofWBCtx) ||
 				isAccepting([]uint32{uint32(t.pc)}, 0) {
 				copy(regMap, t.regMap)
@@ -519,9 +590,10 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		}
 
 		states = append(states, stateData{
-			key:         key,
-			nfaPCs:      pcs,
-			prevWasWord: prevWasWord,
+			key:             key,
+			priorityPCs:     priorityPCs,
+			priorityThreads: priorityCanonical,
+			prevWasWord:     prevWasWord,
 		})
 
 		// Extend tables.
@@ -593,10 +665,9 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		}
 		startThreads[i] = tdfaThread{pc: int(pc), regMap: rm}
 	}
-	startID, entryOps := getOrAddState(startThreads, false)
-	if startID != 0 {
-		return nil, false // should always be 0
-	}
+	// getOrAddState's first call always lands on state 0 (stateMap starts empty,
+	// nextStateID starts at 0).
+	_, entryOps := getOrAddState(startThreads, false)
 
 	// ---- main BFS ----
 	for si := 0; si < len(states); si++ {
@@ -605,7 +676,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		}
 
 		sd := states[si]
-		pcSet := sd.nfaPCs
+		pcSet := sd.priorityPCs
 
 		// Expand for word/non-word contexts (same as newDFA).
 		var expandedWord, expandedNonWord []uint32
@@ -661,7 +732,13 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 					continue
 				}
 				var sourceRM []int
-				for _, srcThread := range sd.key.threads {
+				// Iterate in true leftmost-first priority order (sd.priorityThreads),
+				// NOT sd.key.threads (pc-sorted for canonical hashing) — "first
+				// contributing thread wins" below is only correct in priority order.
+				// A backward loop edge (see stateData.priorityPCs doc comment) can put
+				// a lower-priority thread earlier in pc order, which would otherwise
+				// make this loop copy captures from the wrong source thread.
+				for _, srcThread := range sd.priorityThreads {
 					// Only consider source threads whose byte consumer actually fired for b.
 					if !firedOutSet[int(prog.Inst[srcThread.pc].Out)] {
 						continue
@@ -817,8 +894,12 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 
 // appendTDFACodeEntry appends a size-prefixed TDFA anchored-match function body
 // to cs. The function has signature (ptr i32, len i32, out_ptr i32) → i32.
-func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
-	body := buildTDFAMatchBody(tt, l, tableMemIdx)
+// nativeAnchored must be true only when this body is exported directly as the
+// caller-facing groups function (compile.go:1568, p.anchored) — see
+// buildTDFAMatchBody's doc comment for why that changes what "len" means and
+// what code gets emitted.
+func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool) []byte {
+	body := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored)
 	var b []byte
 	b = utils.AppendULEB128(b, uint32(len(body)))
 	b = append(b, body...)
@@ -829,18 +910,20 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 //
 // Locals:
 //
-//	0 = ptr       (param i32)
-//	1 = len       (param i32)
-//	2 = out_ptr   (param i32)
-//	3 = pos       (i32)
-//	4 = state     (i32)
-//	5 = prevState (i32)
-//	6 = byte      (i32, the current input byte — saved before pos++)
-//	[7 .. 7+numRegs-1] = capture registers (i32), initialised to -1
+//	0 = ptr           (param i32)
+//	1 = len           (param i32)
+//	2 = out_ptr       (param i32)
+//	3 = pos           (i32)
+//	4 = state         (i32)
+//	5 = prevState     (i32)
+//	6 = byte          (i32, the current input byte — saved before pos++)
+//	7 = lastAcceptPos (i32, -1 = none; see hasMidAccept below)
+//	[8 .. 8+numRegs-1] = capture registers (i32), initialised to -1
 //
 // Loop structure (pos++ BEFORE tag ops so that pos = exclusive end when ops fire):
 //
 //	entry_ops (at pos=0, before loop)
+//	lastAcceptPos = -1; midAcceptCheck(wasmStart, 0)   [eager write, see below]
 //	block $done:
 //	  loop $main:
 //	    if pos >= len: br $done
@@ -848,20 +931,72 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 //	    byte = mem[ptr+pos]
 //	    pos++
 //	    state = table[prevState<<8 + byte]
-//	    if dead: return -1
+//	    if dead: return lastAcceptPos (or -1 if never set)
 //	    emitTagOps(prevState, byte)   ← pos = byte_index+1 = exclusive end
 //	    immediateAcceptCheck
+//	    midAcceptCheck(state, pos)
 //	    br $main
 //	  end loop
 //	end block $done
-//	EOF accept or return -1
-func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
+//	EOF accept, or lastAcceptPos fallback, or return -1
+//
+// midAcceptCheck(state, pos): if midAccept[state], EAGERLY write captures
+// via emitTDFAWriteCaptures(state, pos) (same as an immediate/EOF accept
+// would) and record lastAcceptPos=pos, but keep scanning instead of
+// returning. This mirrors the plain DFA find-loop's `last_accept` mechanism
+// (buildAnchoredFindBody) — needed because this body also serves as the
+// *native/anchored* exported groups function (compile.go:1568, no find-pass
+// narrowing `len` first), where a byte consumer can have higher priority
+// than an already-reachable Match (e.g. `^(a)?` vs "b", or `^(?:(a){2})?`
+// vs a string with fewer than 2 'a's) and the correct leftmost-first answer
+// is the earlier, lower-priority accept, not "no match". See
+// plans/FUZZER_BUGS.md §10.2/§10.2-followup.
+//
+// The write must happen EAGERLY (not deferred to whenever the fallback is
+// actually needed) because capture registers are live, mutable WASM locals:
+// a later, ultimately-failed continuation (e.g. attempting a 2nd iteration
+// of a `(a){2}*` loop that only gets 1 more 'a') runs its own tag ops on the
+// SAME registers (TDFA reuses registers across loop iterations by design)
+// before the dead-transition is even detected — reading them only at the
+// fallback point would return the failed attempt's partial values, not the
+// ones that were correct when this position was actually valid. Writing
+// eagerly to out_ptr (stable memory, not a register that keeps getting
+// overwritten) and simply re-reading/overwriting it on every subsequent
+// eager write sidesteps that entirely: whichever write happened last is
+// necessarily the most recent valid accept, exactly the invariant we want.
+//
+// Word-boundary/line-anchor context never applies here — TDFA is never
+// selected for patterns with \b/\B or (?m) anchors
+// (compile/selector.go's hasWordBoundary/hasLineAnchors gates route those to
+// Backtracking) — so a single ctx=0 midAccept table, with no NW/W/NL
+// variants, is sufficient.
+func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool) []byte {
 	var b []byte
 
 	numCapRegs := tt.numRegs
-	// Locals: pos(1) + state(1) + prevState(1) + byte(1) + capture regs
+	// The lastAccept fallback machinery only matters for the native/anchored
+	// call convention (see doc comment above) — for the wrapper-composed
+	// convention (nativeAnchored=false), `len` is already narrowed to the
+	// exact match end by an independent find pass, so a dead transition or
+	// non-accepting EOF state within that convention doesn't need — and
+	// shouldn't pay the per-byte cost for — this fallback. Skipping it
+	// entirely there keeps wrapper-composed capture bodies byte-identical to
+	// (and as fast as) before this fix.
+	hasMidAccept := nativeAnchored && len(tt.midAcceptStates) > 0
+	// The compressed-u8 encoding reads classMap[byte] into a scratch local
+	// before indexing the table, so that encoding — and only it — needs one
+	// more i32 (see the transition emission below).
+	needClassLocal := l.useU8 && l.useCompression
+	// Locals: pos(1) + state(1) + prevState(1) + byte(1) [+ lastAcceptPos(1)
+	// when hasMidAccept] [+ class(1) when needClassLocal] + capture regs
 	// [+ bulk-skip locals: chunk(v128) + mask(i32) + skipStart(i32)].
 	extraLocals := 4 + numCapRegs
+	if hasMidAccept {
+		extraLocals++
+	}
+	if needClassLocal {
+		extraLocals++
+	}
 	hasBulkSkip := enableTDFABulkSkip && tt.bulkSkip != nil
 
 	if hasBulkSkip {
@@ -877,8 +1012,23 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		localState     = uint32(4)
 		localPrevState = uint32(5)
 		localByte      = uint32(6)
-		localCapBase   = uint32(7)
 	)
+	// localLastAcceptPos and localClass only exist (and localCapBase only
+	// shifts up to make room for them) when hasMidAccept / needClassLocal;
+	// with neither, capBase stays at 7, exactly matching this function's
+	// shape before these fixes. The capture registers must stay contiguous
+	// from localCapBase, so every optional scratch local is allocated below
+	// them.
+	nextLocal := uint32(7)
+	localLastAcceptPos := nextLocal
+	if hasMidAccept {
+		nextLocal++
+	}
+	localClass := nextLocal
+	if needClassLocal {
+		nextLocal++
+	}
+	localCapBase := nextLocal
 	localChunk := localCapBase + uint32(numCapRegs)
 	localMask := localChunk + 1
 	localSkipStart := localMask + 1
@@ -888,6 +1038,25 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		b = append(b, 0x7B) // v128
 		b = utils.AppendULEB128(b, uint32(2))
 		b = append(b, 0x7F) // i32
+	}
+
+	// midAcceptCheck: if midAccept[state], eagerly write captures for
+	// (state, pos) and record lastAcceptPos=pos. No-op when !hasMidAccept.
+	midAcceptCheck := func(b []byte, stateLocal, posLocal uint32) []byte {
+		if !hasMidAccept {
+			return b
+		}
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptOff)
+		b = append(b, 0x20, byte(stateLocal))
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+		b = append(b, 0x04, 0x40)             // if midAccept[state]
+		b = emitTDFAWriteCaptures(tt, b, stateLocal, posLocal, localCapBase)
+		b = append(b, 0x20, byte(posLocal))
+		b = append(b, 0x21, byte(localLastAcceptPos))
+		b = append(b, 0x0B) // end if
+		return b
 	}
 
 	// Initialise capture registers to -1.
@@ -910,6 +1079,16 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x21, byte(localPos))
 
+	// lastAcceptPos = -1, then check wasmStart itself (pos=0) for mid-accept.
+	// (Guarded by hasMidAccept: when false, localLastAcceptPos aliases the
+	// first capture register — see its declaration above — so writing to it
+	// unconditionally here would corrupt that register's initial value.)
+	if hasMidAccept {
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x21, byte(localLastAcceptPos))
+	}
+	b = midAcceptCheck(b, localState, localPos)
+
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $main
 
@@ -926,7 +1105,22 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		b = utils.AppendSLEB128(b, tt.bulkSkip.wasmState)
 		b = append(b, 0x46)       // i32.eq
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitTDFABulkSkip(b, tt.bulkSkip, localPos, localChunk, localMask, localSkipStart, localCapBase)
+		// B16: hand the skip the mid-accept bookkeeping it would otherwise
+		// jump over. The state is known here at compile time (it is the very
+		// constant the `if` above compares against), so the runtime
+		// `if midAccept[state]` guard midAcceptCheck emits is decided now
+		// instead: nil tail when the bulk state is not mid-accepting, and no
+		// table load on the runs where it is.
+		var midAcceptTail func([]byte) []byte
+		if hasMidAccept && tt.midAcceptStates[int(tt.bulkSkip.wasmState)-1] != 0 {
+			midAcceptTail = func(b []byte) []byte {
+				b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase)
+				b = append(b, 0x20, byte(localPos))
+				b = append(b, 0x21, byte(localLastAcceptPos))
+				return b
+			}
+		}
+		b = emitTDFABulkSkip(b, tt.bulkSkip, localPos, localChunk, localMask, localSkipStart, localCapBase, midAcceptTail)
 		b = append(b, 0x0B) // end if
 	}
 
@@ -947,42 +1141,57 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x6A)
 	b = append(b, 0x21, byte(localPos))
 
-	// state = table[tableOff + prevState<<8 + byte] (u8) or table[tableOff + (prevState*256+byte)*2] (u16)
-	if l.useU8 {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.tableOff)
-		b = append(b, 0x20, byte(localPrevState))
-		b = append(b, 0x41, 0x08)
-		b = append(b, 0x74) // i32.shl (prevState<<8)
-		b = append(b, 0x6A)
-		b = append(b, 0x20, byte(localByte))
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // table load → next+1 == state
-		b = append(b, 0x21, byte(localState))
-	} else {
-		// u16: addr = tableOff + (prevState*256 + byte) * 2
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.tableOff)
-		b = append(b, 0x20, byte(localPrevState))
-		b = append(b, 0x41, 0x08)
-		b = append(b, 0x74) // i32.shl (prevState<<8)
-		b = append(b, 0x6A)
-		b = append(b, 0x20, byte(localByte))
-		b = append(b, 0x6A)
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x74) // i32.shl (*2)
-		b = append(b, 0x6A)
-		b = appendTableLoad16u(b, tableMemIdx) // cell (u16, next+1, == state)
-		b = append(b, 0x21, byte(localState))
+	// state = table[<the encoding buildDFALayout actually chose>].
+	//
+	// This MUST go through the same three shared emitters buildMatchBody
+	// dispatches to (plans/FABLE.md B15). The load used to be hand-rolled here
+	// as a plain `tableOff + prevState<<8 + byte` u8 index with a u16 sibling,
+	// which silently disagreed with the layout on both of the other encodings
+	// dfaDataSegments can emit: byte-class compression (chosen once
+	// numWASM*256 > 32KB, i.e. from ~128 states) writes classMap + a
+	// numClasses-wide table that the hand-rolled index never consulted, and the
+	// u16 branch's operand order never produced a valid module at all. Both are
+	// reachable inside the default MaxDFAStates=1024, e.g. `x(a{130})y` and
+	// `x(a{260})y`.
+	//
+	// localState is passed as the emitters' single state local: prevState was
+	// copied out of it a few instructions above, so reading and overwriting it
+	// in place is exactly the `state = table[prevState][byte]` this needs, and
+	// localPrevState still holds the old value for the tag ops below.
+	switch {
+	case l.useU8 && l.useCompression:
+		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
+			byte(localState), byte(localClass), 0, 0, byte(localByte), tableMemIdx)
+	case l.useU8:
+		b = emitSimpleU8Transition(b, l.tableOff, byte(localState), 0, 0, byte(localByte), tableMemIdx)
+	default:
+		b = emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff,
+			byte(localState), byte(localByte), tableMemIdx)
 	}
 
-	// if state == 0: return -1 (dead)
+	// if state == 0 (dead): the byte just read has no valid transition. Fall
+	// back to the most recently, eagerly-written mid-accept (lastAcceptPos)
+	// if any, else -1 — e.g. `^(a)?` vs "b": state 0's threads are
+	// [Rune('a'), Match]; byte 'b' kills the Rune thread, but Match was
+	// already reachable from state 0 at pos=0, so the correct leftmost-first
+	// answer is an empty match at 0, not "no match". Or `^(?:(a){2})?` vs a
+	// string with fewer than 2 'a's: the dead transition can be several
+	// bytes past the last valid accept, not just one — hence tracking
+	// lastAcceptPos continuously through the scan (via midAcceptCheck)
+	// rather than only checking prevState. (This only matters for the
+	// native/anchored capture-body call convention — compile.go:1568 —
+	// where `len` is the caller's full input, not a find-pass-narrowed match
+	// end; see plans/FUZZER_BUGS.md §10.2.)
 	b = append(b, 0x20, byte(localState))
 	b = append(b, 0x45) // i32.eqz
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x0F) // return -1
-	b = append(b, 0x0B)
+	b = append(b, 0x04, 0x40) // if state==0 (void)
+	if hasMidAccept {
+		b = append(b, 0x20, byte(localLastAcceptPos))
+	} else {
+		b = append(b, 0x41, 0x7F) // i32.const -1
+	}
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B) // end if state==0
 
 	// Emit tag ops keyed on (prevState, byte).
 	// At this point pos = exclusive end of consumed byte.
@@ -1001,13 +1210,24 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 		b = append(b, 0x0B)
 	}
 
+	// Record a fallback accept (eagerly writing captures) if the state we
+	// just transitioned into is mid-accepting. Only reached when
+	// immediateAccept didn't already fire and return above, so this never
+	// overrides a higher-priority immediate accept — it only ever matters if
+	// every higher-priority continuation from here eventually dies.
+	b = midAcceptCheck(b, localState, localPos)
+
 	b = append(b, 0x0C, 0x00) // br $main
 	b = append(b, 0x0B)       // end loop
 	b = append(b, 0x0B)       // end block $done
 
 	// EOF accept check (TDFA): read per-state side table at l.acceptOff.
 	// (State-ID partitioning is not applied to TDFA tables because state IDs
-	// are tied to tag-op indices.)
+	// are tied to tag-op indices.) If the final state itself isn't an
+	// EOF-accept, fall back to the last recorded mid-accept before giving up
+	// — e.g. `^(?:(?:(?:(a){2})?))` vs "a": the final state (mid-way through
+	// the required 2 a's) never becomes EOF-accepting, but the outer `?`'s
+	// skip branch was mid-accepting back at position 0.
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, l.acceptOff)
 	b = append(b, 0x20, byte(localState))
@@ -1015,9 +1235,13 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = appendTableLoad8u(b, tableMemIdx)
 	b = append(b, 0x04, 0x7F) // if [i32]: then-branch returns, else-branch leaves i32
 	b = emitTDFAAcceptEOF(tt, b, localState, localPos, localCapBase)
-	b = append(b, 0x05)       // else
-	b = append(b, 0x41, 0x7F) // -1
-	b = append(b, 0x0B)       // end if — i32 on stack becomes implicit return value
+	b = append(b, 0x05) // else
+	if hasMidAccept {
+		b = append(b, 0x20, byte(localLastAcceptPos)) // captures already written eagerly
+	} else {
+		b = append(b, 0x41, 0x7F) // -1
+	}
+	b = append(b, 0x0B) // end if — i32 on stack becomes implicit return value
 
 	b = append(b, 0x0B) // end function
 	return b
@@ -1030,10 +1254,9 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int) []byte {
 func emitTDFATagOps(tt *tdfaTable, b []byte,
 	localPrevState, localByte, localPos, localCapBase uint32) []byte {
 
+	// tt.numStates is always ≥ 1 for a table built by newTDFA (the start
+	// state alone guarantees this).
 	n := tt.numStates
-	if n == 0 {
-		return b
-	}
 
 	// Precompute per-state entries (bytes with non-empty ops).
 	type byteOps struct {
@@ -1104,10 +1327,17 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 			count int
 		}
 		var groups []opsGroup
+		// strconv.AppendInt, not fmt.Appendf — same reasoning as keyString's doc
+		// comment (plans/OPUS.md §N8), and this runs once per transition entry,
+		// i.e. up to 256 times per state. Byte-identical to "%d:%d," including
+		// negative dst/src (-1 = assign-from-pos, -2 = scratchRegSentinel).
 		keyFor := func(ops []tdfaTagOp) string {
 			s := make([]byte, 0, len(ops)*8)
 			for _, op := range ops {
-				s = fmt.Appendf(s, "%d:%d,", op.dst, op.src)
+				s = strconv.AppendInt(s, int64(op.dst), 10)
+				s = append(s, ':')
+				s = strconv.AppendInt(s, int64(op.src), 10)
+				s = append(s, ',')
 			}
 			return string(s)
 		}
@@ -1282,22 +1512,11 @@ func emitTDFAAcceptEOF(tt *tdfaTable, b []byte, localState, localPos, localCapBa
 // For each accepting state, acceptRegMap tells which local holds each group
 // start/end. pos already equals the exclusive end.
 func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localCapBase uint32) []byte {
+	// tt.numStates is always ≥ 1 (see emitTDFATagOps), and getOrAddState
+	// unconditionally assigns every state a non-nil acceptRegMap entry (even
+	// non-accepting states get an all -1 slice), so at least state 0 always
+	// has capture info here.
 	n := tt.numStates
-	if n == 0 {
-		return b
-	}
-
-	// Check if any state has capture info.
-	anyHasCaptures := false
-	for gs := 0; gs < n; gs++ {
-		if gs < len(tt.acceptRegMap) && tt.acceptRegMap[gs] != nil {
-			anyHasCaptures = true
-			break
-		}
-	}
-	if !anyHasCaptures {
-		return b
-	}
 
 	// br_table dispatch on state-1 (0-based). Same block layout as emitTDFATagOps.
 	b = append(b, 0x02, 0x40) // block $exit
@@ -1506,13 +1725,37 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 			}
 		}
 	}
-	// Per-batch dst edges: two registers written in the same op batch cannot
-	// share a physical register—merging them would produce two writes to the
-	// same local in the same batch and the surviving value would be wrong.
+	// Per-batch edges. Two kinds, both about what a batch means:
+	//
+	//   dst–dst: two registers written in the same op batch cannot share a
+	//   physical register — merging them would produce two writes to the same
+	//   local in the same batch and the surviving value would be wrong.
+	//
+	//   dst–src across DISTINCT ops: a batch is a set of *parallel* copies that
+	//   sequentializeCopies has already ordered (inserting the scratch register
+	//   where a cycle demanded it) on the assumption that its registers are
+	//   distinct. Coalescing one op's dst onto another op's src invents a
+	//   read-after-write dependency that did not exist when that order was
+	//   chosen, and remapOps never re-sequentializes — so op i's write silently
+	//   destroys the value op j was supposed to read. plans/FABLE.md B14:
+	//   `(b+){2}c` on "bbbc" had the correctly-sequentialized batch
+	//   [{0 3} {1 2}] coalesced to [{1 2} {0 1}], reporting group 1 as [2 2]
+	//   instead of [2 3]. Forbidding the coalesce is the cheap half of the fix
+	//   (the alternative being a re-sequentialization pass over every remapped
+	//   batch); an op whose own dst equals another's src is already the same
+	//   register, and addEdge ignores self-edges, so this only ever constrains
+	//   pairs that were genuinely distinct.
 	addBatchEdges := func(ops []tdfaTagOp) {
 		for i := 0; i < len(ops); i++ {
 			for j := i + 1; j < len(ops); j++ {
 				addEdge(ops[i].dst, ops[j].dst)
+			}
+		}
+		for i := 0; i < len(ops); i++ {
+			for j := 0; j < len(ops); j++ {
+				if i != j && ops[j].src >= 0 {
+					addEdge(ops[i].dst, ops[j].src)
+				}
 			}
 		}
 	}
@@ -1522,6 +1765,9 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	for _, ops := range tt.acceptOps {
 		addBatchEdges(ops)
 	}
+	// entryOps is remapped by the same remapOps below, so it needs the same
+	// protection even though it fires once, before the main loop.
+	addBatchEdges(tt.entryOps)
 
 	// ---- Step 3: greedy colouring ----
 	// Sort registers by interference degree descending (most-constrained first).

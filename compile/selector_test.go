@@ -441,3 +441,83 @@ func TestSelectEngine_UnicodeWithOpt(t *testing.T) {
 		t.Errorf("SelectEngine(\\p{Greek}, Unicode=true): unexpected error %v", err)
 	}
 }
+
+// TestSelectBestEngineWithTDFA_TableReuse pins plans/OPUS.md §N8b's contract:
+// the selector hands back the TDFA table it had to build to answer the
+// eligibility question, and it does so exactly when it answers EngineTDFA.
+// compilePattern reuses that table instead of rebuilding it; a nil return on a
+// TDFA answer (or a non-nil return on any other answer) would silently
+// reintroduce the double build, or worse, hand a rejected table to the emitter.
+func TestSelectBestEngineWithTDFA_TableReuse(t *testing.T) {
+	cases := []struct {
+		pattern  string
+		wantTDFA bool
+		why      string
+	}{
+		{`([0-9]{4})-([0-9]{2})-([0-9]{2})`, true, "plain greedy captures"},
+		{`(?P<scheme>https?)://(?P<host>[^/:?#]+)`, true, "named captures"},
+		{`(a*)(a*)b`, true, "adjacent greedy stars are still TDFA-eligible"},
+		{`^([^,]*),([^,]*)$`, false, "line anchors excluded from TDFA"},
+		{`\b(\w+)@(\w+)\b`, false, "word boundary excluded from TDFA"},
+		{`<(.+?)>`, false, "non-greedy excluded from TDFA"},
+		{`([^,]+),`, false, "inverted-class ambiguity → Backtracking (CLAUDE.md Gap I)"},
+		{`[a-z]+`, false, "no captures at all — DFA path"},
+	}
+	for _, c := range cases {
+		parsed, err := syntax.Parse(c.pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("parse %q: %v", c.pattern, err)
+		}
+		prog, err := syntax.Compile(parsed.Simplify())
+		if err != nil {
+			t.Fatalf("compile %q: %v", c.pattern, err)
+		}
+		opts := CompileOptions{}
+		engine, tt := selectBestEngineWithTDFA(prog, &opts)
+		if c.wantTDFA {
+			if engine != EngineTDFA {
+				t.Errorf("%q (%s): engine = %v, want EngineTDFA", c.pattern, c.why, engine)
+				continue
+			}
+			if tt == nil {
+				t.Errorf("%q (%s): engine is TDFA but table is nil — compilePattern would rebuild it", c.pattern, c.why)
+			}
+		} else {
+			if engine == EngineTDFA {
+				t.Errorf("%q (%s): engine = EngineTDFA, want anything else", c.pattern, c.why)
+				continue
+			}
+			if tt != nil {
+				t.Errorf("%q (%s): non-TDFA engine %v returned a non-nil table; only an accepted table may be handed back", c.pattern, c.why, engine)
+			}
+		}
+	}
+}
+
+// TestSelectBestEngineWithTDFA_MatchesWrapper guards the thin wrapper: the
+// one-value selectBestEngine must keep answering exactly what the two-value
+// form does, since ~5 call sites still use it.
+func TestSelectBestEngineWithTDFA_MatchesWrapper(t *testing.T) {
+	for _, pat := range []string{
+		`([0-9]{4})-([0-9]{2})`, `^([^,]*),([^,]*)$`, `\b(\w+)\b`, `[a-z]+`,
+		`foo|bar`, `(?:a{3,4}){0,}`, `<(.+?)>`,
+	} {
+		parsed, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatalf("parse %q: %v", pat, err)
+		}
+		prog, err := syntax.Compile(parsed.Simplify())
+		if err != nil {
+			t.Fatalf("compile %q: %v", pat, err)
+		}
+		o1, o2 := CompileOptions{}, CompileOptions{}
+		want := selectBestEngine(prog, &o1)
+		got, _ := selectBestEngineWithTDFA(prog, &o2)
+		if got != want {
+			t.Errorf("%q: wrapper = %v, direct = %v", pat, want, got)
+		}
+		if o1.LeftmostFirst != o2.LeftmostFirst {
+			t.Errorf("%q: wrapper left LeftmostFirst=%v, direct left %v", pat, o1.LeftmostFirst, o2.LeftmostFirst)
+		}
+	}
+}
