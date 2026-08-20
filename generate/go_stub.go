@@ -234,10 +234,10 @@ func %s(input []byte) iter.Seq2[int, int] {
 			if !yield(start, end) {
 				break
 			}
-			if end > pos {
+			if end > start {
 				pos = end
 			} else {
-				pos++
+				pos = start + 1
 			}
 		}
 	}

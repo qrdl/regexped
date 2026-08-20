@@ -119,7 +119,7 @@ func TestLoadConfigWasmMergeResolution(t *testing.T) {
 		{"relative path", "tools/wasm-merge", filepath.Join(dir, "tools/wasm-merge")},
 		{"bare command", "wasm-merge", filepath.Join(dir, "wasm-merge")},
 		{"absolute path", "/usr/local/bin/wasm-merge", "/usr/local/bin/wasm-merge"},
-		{"home relative", "~/bin/wasm-merge", "~/bin/wasm-merge"},
+		{"home relative", "~/bin/wasm-merge", homeJoin("bin/wasm-merge")},
 		{"empty", "", ""},
 	}
 	for _, c := range cases {
@@ -264,6 +264,33 @@ func TestValidateSets_EmptySets(t *testing.T) {
 	}
 }
 
+// homeJoin builds the expected result of expanding "~/<rel>". Skips nothing:
+// os.UserHomeDir is always resolvable in the test environments this runs in,
+// and ExpandHome's fallback (return unchanged) is covered by the "~alice" case.
+func homeJoin(rel string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "~/" + rel
+	}
+	return filepath.Join(home, rel)
+}
+
+func TestExpandHome(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"~/x", homeJoin("x")},
+		{"~", "~"},
+		{"~alice/x", "~alice/x"},
+		{"/abs/~/x", "/abs/~/x"},
+		{"rel/path", "rel/path"},
+	}
+	for _, c := range cases {
+		if got := ExpandHome(c.in); got != c.want {
+			t.Errorf("ExpandHome(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestResolveFilePath(t *testing.T) {
 	base := "/home/user/project"
 	cases := []struct {
@@ -272,7 +299,8 @@ func TestResolveFilePath(t *testing.T) {
 	}{
 		{"", ""},
 		{"/absolute/path", "/absolute/path"},
-		{"~/bin/tool", "~/bin/tool"},
+		{"~/bin/tool", homeJoin("bin/tool")},
+		{"~alice/bin/tool", "/home/user/project/~alice/bin/tool"},
 		{"relative/file", "/home/user/project/relative/file"},
 		{"bare.wasm", "/home/user/project/bare.wasm"},
 	}

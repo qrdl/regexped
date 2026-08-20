@@ -310,7 +310,10 @@ func TestBuildSimplePrefixCheckBody(t *testing.T) {
 	}
 	body := buildSimplePrefixCheckBody(tlo, count)
 
-	sz, n := utils.DecodeULEB128(body)
+	sz, n, err := utils.DecodeULEB128(body)
+	if err != nil {
+		t.Fatalf("decode body size prefix: %v", err)
+	}
 	if int(sz) != len(body)-n {
 		t.Fatalf("size prefix = %d, want %d (len(body)-%d)", sz, len(body)-n, n)
 	}

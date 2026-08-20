@@ -1,6 +1,8 @@
 package compile
 
 import (
+	"fmt"
+
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -62,6 +64,11 @@ type dataSegment struct {
 
 // parseDataSegments extracts all type-0 (active, memory-0) data segments
 // from a concatenation of segments encoded by appendDataSegment.
+//
+// Like stripSegCount, rawData is always appendDataSegment's own output, so a
+// LEB128 decode failure here is an internal invariant violation, not malformed
+// user input — see the note on stripSegCount in compile.go and plans/FABLE.md
+// B39.
 func parseDataSegments(rawData []byte) []dataSegment {
 	var segs []dataSegment
 	off := 0
@@ -74,10 +81,16 @@ func parseDataSegments(rawData []byte) []dataSegment {
 			break
 		}
 		off++
-		offset64, n := utils.DecodeSLEB128(rawData[off:])
+		offset64, n, err := utils.DecodeSLEB128(rawData[off:])
+		if err != nil {
+			panic(fmt.Sprintf("parseDataSegments: malformed segment offset in self-emitted data: %v — invariant violation", err))
+		}
 		off += n
 		off++ // 0x0b end
-		size, n := utils.DecodeULEB128(rawData[off:])
+		size, n, err := utils.DecodeULEB128(rawData[off:])
+		if err != nil {
+			panic(fmt.Sprintf("parseDataSegments: malformed segment size in self-emitted data: %v — invariant violation", err))
+		}
 		off += n
 		data := make([]byte, size)
 		copy(data, rawData[off:off+int(size)])

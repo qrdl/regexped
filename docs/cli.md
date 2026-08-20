@@ -39,6 +39,9 @@ sets:
 ```
 
 All paths in the config file are resolved relative to the config file's directory.
+A leading `~/` in `output`, `wasm_file`, `stub_file` or `wasm_merge` is expanded to
+the user's home directory (a bare `~` and the `~user` form are not expanded — only
+a shell can resolve another user's home).
 
 ### Export-name rules
 
@@ -68,6 +71,22 @@ All offending names are reported in a single pass rather than one per run.
 Suffix `_batch` is separately reserved for the compiler-synthesized batch export (see
 `hints: [batch-find]` below), and export names must be unique across all `regexps:` and
 `sets:` entries.
+
+#### Rules that depend on `stub_type`
+
+The rules above are deliberately language-agnostic, so that changing `stub_type` never
+breaks a working config. A second, narrower set of checks is the opposite: they apply
+only to the generator the config actually targets, because enforcing them everywhere
+would reject configs that are perfectly valid. They are skipped entirely for a
+compile-only config (no `stub_type` and no `stub_file`), which generates no source.
+
+| Check | Applies to | Rationale |
+|---|---|---|
+| `import_module` must be a valid identifier and not a keyword of that language | `rust`, `go` | Emitted as `pub mod <name>` / `package <name>`. A hyphenated `import_module: "my-mod"` stays legal for `js`/`ts`, which never emit it. |
+| `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. |
+| Export names must not collide with a generator helper (`init`, `_w`, `_resize`, `_exp`, `_mem`, `_inBase`, `_outBase`, `_enc`, `_patternNames`, `patternName`, and `SetMatch` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not start with `ffi_` | `rust`, `go` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
+| Export names must not collide after the snake_case → PascalCase transform | `rust`, `go` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Go function / Rust iterator type. This also rejects a name that transforms to `SetMatch`, the struct the set stubs declare. |
 
 ### Engine selection
 
@@ -384,9 +403,13 @@ wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk
 |---|---|---|
 | `--config` | `regexped.yaml` | YAML config file |
 | `--main` | — | Host main WASM file **(required)** |
-| `--output`, `-o` | config `output` | Output WASM file; `-` writes to stdout |
+| `--output`, `-o` | config `output` | Output WASM file (must be a path; `-` is not accepted) |
 
 **Positional arguments:** one or more regexp WASM files (at least one required).
+
+Unlike `generate` and `compile`, `merge` does not accept `-` for stdout: the
+value is handed straight to `wasm-merge`, which would create a file literally
+named `-`.
 
 **Required config fields:**
 

@@ -1298,14 +1298,20 @@ func assertDataSectionConsistent(t *testing.T, wasm []byte) {
 	for off < len(wasm) {
 		id := wasm[off]
 		off++
-		size, n := utils.DecodeULEB128(wasm[off:])
+		size, n, err := utils.DecodeULEB128(wasm[off:])
+		if err != nil {
+			t.Fatalf("decode section size at %d: %v", off, err)
+		}
 		off += n
 		body := wasm[off : off+int(size)]
 		off += int(size)
 		if id != 11 {
 			continue
 		}
-		declared, m := utils.DecodeULEB128(body)
+		declared, m, err := utils.DecodeULEB128(body)
+		if err != nil {
+			t.Fatalf("decode data-section segment count: %v", err)
+		}
 		segs := parseDataSegments(body[m:])
 		if uint64(len(segs)) != declared {
 			t.Errorf("data section: declared count=%d, parsed segments=%d", declared, len(segs))

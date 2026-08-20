@@ -634,11 +634,23 @@ func (p *compiledPattern) altLitAnchorBranchFuncIdx(i int) (backOff, fwdOff int)
 
 // stripSegCount strips the LEB128 count prefix from a data section payload,
 // returning the raw segment bytes and the count.
+//
+// data is always a buffer this compiler produced microseconds earlier
+// (dfaDataSegments → appendDataSegment), never anything a user supplied, so a
+// decode failure is an internal invariant violation rather than bad input —
+// same class as emitSetMatchFnAnchored's fallback-bucket panic in set_emit.go.
+// Threading an error out instead would have to pass through six callers that
+// have no error return (assembleModule, CompileSet, genSuffixWASM,
+// planLenAltLayout, …), converting a compiler bug into a silent nil result.
+// The bound that makes this reachable at all is plans/FABLE.md B39.
 func stripSegCount(data []byte) ([]byte, int) {
 	if len(data) == 0 {
 		return nil, 0
 	}
-	count, n := utils.DecodeULEB128(data)
+	count, n, err := utils.DecodeULEB128(data)
+	if err != nil {
+		panic(fmt.Sprintf("stripSegCount: malformed segment count in self-emitted data section: %v — invariant violation", err))
+	}
 	return data[n:], int(count)
 }
 

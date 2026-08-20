@@ -46,7 +46,14 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	//   Node.js:            await init(readFileSync('./merged.wasm'))
 	//   Cloudflare Workers: import wasm from './merged.wasm'; await init(wasm)
 	sb.WriteString("export async function init(wasm: BufferSource | WebAssembly.Module): Promise<void> {\n")
-	sb.WriteString("    const { instance } = await WebAssembly.instantiate(wasm as BufferSource);\n")
+	// WebAssembly.instantiate resolves to an Instance when handed a Module, but
+	// to {module, instance} when handed a BufferSource. The BufferSource cast
+	// picks the latter overload for the type-checker, so the instanceof probe
+	// (and the assertion on the result) is what keeps the Module path — the
+	// Cloudflare Workers flow promised in the comment above — working at
+	// runtime. Mirrors genJSStubFile; see plans/FABLE.md B30.
+	sb.WriteString("    const r = await WebAssembly.instantiate(wasm as BufferSource);\n")
+	sb.WriteString("    const instance = (r instanceof WebAssembly.Instance ? r : r.instance) as WebAssembly.Instance;\n")
 	sb.WriteString("    _exp = instance.exports;\n")
 	sb.WriteString("    const _m = _exp.memory as WebAssembly.Memory;\n")
 	sb.WriteString("    _inBase = _m.buffer.byteLength; // first byte after DFA table pages\n")

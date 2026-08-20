@@ -220,7 +220,10 @@ func runMergeCmd(args []string) {
 	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
 	mainFlag := fset.String("main", "", "main WASM file to merge into (required)")
 	var out string
-	fset.StringVar(&out, "output", "", "override output from config; - writes to stdout")
+	// No "- writes to stdout" here, unlike the generate and compile commands:
+	// merge shells out to wasm-merge, which is handed -o verbatim and would
+	// create a file literally named "-". See plans/FABLE.md B36.
+	fset.StringVar(&out, "output", "", "override output from config (must be a file path)")
 	fset.StringVar(&out, "o", "", "output file (alias for --output)")
 	parseFlags(fset, args)
 

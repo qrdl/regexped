@@ -110,14 +110,13 @@ func checkTool(path string) error {
 	return nil
 }
 
-// expandHome replaces a leading "~/" with the user's home directory.
+// expandHome replaces a leading "~/" with the user's home directory. The
+// implementation lives in config so the config-file paths (output, wasm_file,
+// stub_file, wasm_merge) and this one — the wasm-merge binary, which can also
+// come from $WASM_MERGE and so never passes through config — expand
+// identically. See plans/FABLE.md B37.
 func expandHome(path string) string {
-	if strings.HasPrefix(path, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, path[2:])
-		}
-	}
-	return path
+	return config.ExpandHome(path)
 }
 
 // runCmd executes name with args, streaming stdout and stderr to the process's

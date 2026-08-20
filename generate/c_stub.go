@@ -255,7 +255,10 @@ func genCFindHPart(funcName string) string {
 	return fmt.Sprintf(
 		"/* %s: non-anchored find from offset.\n"+
 			"   Returns absolute {start, end}, {-1, -1} if not found, or\n"+
-			"   {RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW} if the result is unknown. */\n"+
+			"   {RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW} if the result is unknown.\n"+
+			"   To iterate non-overlapping matches, advance past each match; a pattern\n"+
+			"   that can match empty needs the guard, or offset never moves:\n"+
+			"     off = m.end > m.start ? m.end : m.start + 1; */\n"+
 			"rx_match_t %s(const unsigned char *input, unsigned int len, unsigned int offset);\n\n",
 		funcName, funcName)
 }
@@ -342,8 +345,10 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 			"   All entries are {-1, -1, ...} when no match is found starting from offset.\n"+
 			"   Returns NULL (never returned otherwise) if the Backtracking engine\n"+
 			"   exhausted its frame budget -- see RX_ERR_BT_OVERFLOW above.\n"+
-			"   To iterate non-overlapping matches, advance offset to groups[0].end after\n"+
-			"   each successful call. */\n"+
+			"   To iterate non-overlapping matches, advance past each match; a pattern\n"+
+			"   that can match empty needs the guard, or offset never moves:\n"+
+			"     off = groups[0].end > groups[0].start ? groups[0].end\n"+
+			"                                          : groups[0].start + 1; */\n"+
 			"const rx_group_t *%s(const unsigned char *input, unsigned int len, unsigned int offset);\n\n",
 		funcName, funcUpper, funcUpper, funcName)
 

@@ -300,10 +300,31 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	return cfg, nil
 }
 
-// resolveFilePath resolves path relative to base unless path is empty or absolute.
+// resolveFilePath resolves path relative to base unless path is empty or
+// absolute. A leading "~/" is expanded to the user's home directory rather
+// than being passed through: every caller of this function feeds the result
+// to os.MkdirAll/os.WriteFile/exec, none of which do shell expansion, so a
+// pass-through creates a literal "~" directory in cwd. See plans/FABLE.md B37.
 func resolveFilePath(base, path string) string {
-	if path == "" || filepath.IsAbs(path) || strings.HasPrefix(path, "~/") {
+	if path == "" || filepath.IsAbs(path) {
 		return path
 	}
+	if strings.HasPrefix(path, "~/") {
+		return ExpandHome(path)
+	}
 	return filepath.Join(base, path)
+}
+
+// ExpandHome replaces a leading "~/" with the user's home directory. A bare
+// "~" and the "~user" form are left alone: only the shell knows how to resolve
+// another user's home, and expanding "~" alone would silently turn a relative
+// path into an absolute one. If the home directory cannot be determined the
+// path is returned unchanged.
+func ExpandHome(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
 }

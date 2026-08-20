@@ -1062,3 +1062,25 @@ func TestWriteStub_MkdirError(t *testing.T) {
 		t.Fatal("writeStub: expected mkdir error, got nil")
 	}
 }
+
+// TestConfigPascalCaseMatchesGenerators guards the one duplicated transform in
+// the per-stub-type validation added for plans/FABLE.md B34. config cannot
+// import generate, so config.pascalCase is a hand copy of goPublicName (and of
+// iterTypeName minus its "Iter" suffix). If either generator's transform
+// changes, the collision check silently stops matching what is emitted — this
+// test fails instead.
+func TestConfigPascalCaseMatchesGenerators(t *testing.T) {
+	names := []string{
+		"url_match", "urlMatch", "UrlMatch", "set_match", "a_b_c",
+		"_leading", "x9", "find", "named_groups_func", "aB_cD",
+	}
+	for _, n := range names {
+		want := goPublicName(n)
+		if got := config.PascalCaseForValidation(n); got != want {
+			t.Errorf("config.PascalCaseForValidation(%q) = %q, but goPublicName = %q", n, got, want)
+		}
+		if got, wantIter := config.PascalCaseForValidation(n)+"Iter", iterTypeName(n); got != wantIter {
+			t.Errorf("config.PascalCaseForValidation(%q)+\"Iter\" = %q, but iterTypeName = %q", n, got, wantIter)
+		}
+	}
+}
