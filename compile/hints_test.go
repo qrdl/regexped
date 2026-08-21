@@ -117,16 +117,29 @@ func TestPatternHintsOverridesCallerLikelyMode(t *testing.T) {
 // shuftiBeatsScalar threshold — digits and uppercase letters are "mid"
 // rarity), so density alone would NOT select Shufti; only the LikelyNoMatch
 // hint does.
+//
+// Shufti is only ever reachable through the SCALAR branch, so this test has
+// to keep both literal frontends off the table to exercise the hint at all.
+// It originally reached Shufti by accident: 33 literals blew the old 32-NODE
+// AC cap and were silently demoted to scalar (plans/SETS.md §13 F1). Two
+// measured changes have since taken that route away — the budget now holds a
+// real automaton (§14 P1), and above the first-byte crossover bucketed Teddy
+// beats AC outright (§14.11) — so the set is built with more literals than
+// teddyMaxLiterals and compiled with ACBudgetBytes pinned to 1. What is
+// asserted is the hint→LikelyMode→Shufti wiring, not a frontend ranking that
+// measurement has overturned twice.
 func TestSetHintsSelectsShuftiFrontend(t *testing.T) {
 	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	n := 33
+	// Above teddyMaxLiterals so Teddy declines; first bytes cycle the 36-char
+	// alphabet, keeping the union inside Shufti's 17..64 band.
+	n := teddyMaxLiterals + 1
 	buildSpec := func(t *testing.T) (SetSpec, *dfaPool, *dfaPool) {
 		t.Helper()
 		var prefixPool, suffixPool dfaPool
 		var patterns []*PatternInfo
 		var patternIDs []int
 		for i := 0; i < n; i++ {
-			pat := fmt.Sprintf("%cq%02dx[a-z]+", alphabet[i], i)
+			pat := fmt.Sprintf("%cq%02dx[a-z]+", alphabet[i%len(alphabet)], i)
 			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern(%q): %v", pat, err)
@@ -137,15 +150,31 @@ func TestSetHintsSelectsShuftiFrontend(t *testing.T) {
 		return SetSpec{Name: "s", Find: "find_all", Patterns: patterns, PatternIDs: patternIDs}, &prefixPool, &suffixPool
 	}
 
+	// ACBudgetBytes: 1 puts AC out of budget so the scalar branch — the only
+	// place Shufti is selected — is reached. See the doc comment above.
+	noAC := func(lm LikelyMode) CompileSetOptions {
+		return CompileSetOptions{LikelyMode: lm, ACBudgetBytes: 1}
+	}
+
 	specHinted, prefixPool, suffixPool := buildSpec(t)
-	csHinted := CompileSet(specHinted, prefixPool, suffixPool, CompileSetOptions{LikelyMode: LikelyNoMatch})
+	csHinted := CompileSet(specHinted, prefixPool, suffixPool, noAC(LikelyNoMatch))
 	if csHinted.fe != frontendShufti {
 		t.Errorf("CompileSet with LikelyNoMatch: fe = %v, want frontendShufti", csHinted.fe)
 	}
 
 	specUnhinted, prefixPool2, suffixPool2 := buildSpec(t)
-	csUnhinted := CompileSet(specUnhinted, prefixPool2, suffixPool2, CompileSetOptions{})
+	csUnhinted := CompileSet(specUnhinted, prefixPool2, suffixPool2, noAC(LikelyNeutral))
 	if csUnhinted.fe == frontendShufti {
 		t.Error("CompileSet without a LikelyNoMatch hint unexpectedly selected frontendShufti (density heuristic alone shouldn't for this byte set)")
+	}
+
+	// The default build takes AC for this set (it is past teddyMaxLiterals),
+	// and the hint does not change that. Asserted explicitly so a future
+	// change to the budget or to chooseLiteralFrontend surfaces here rather
+	// than as a silent frontend downgrade (plans/SETS.md §14.5, §14.11).
+	specDefault, prefixPool3, suffixPool3 := buildSpec(t)
+	csDefault := CompileSet(specDefault, prefixPool3, suffixPool3, CompileSetOptions{LikelyMode: LikelyNoMatch})
+	if csDefault.fe != frontendAC {
+		t.Errorf("CompileSet with default budget: fe = %v, want frontendAC", csDefault.fe)
 	}
 }

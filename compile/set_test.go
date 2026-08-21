@@ -2,6 +2,7 @@ package compile
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -900,25 +901,62 @@ func TestMultiPatternTeddy_LaneToID(t *testing.T) {
 	if !ok {
 		t.Fatal("buildTeddyTablesMulti failed")
 	}
-	if len(tables.LaneToID) != 3 {
-		t.Fatalf("LaneToID len = %d, want 3", len(tables.LaneToID))
+	// LaneToIDs is indexed by LANE (8 or 16 slots), not by literal; lanes
+	// beyond the literal count are empty and emit no dispatch.
+	if len(tables.LaneToIDs) != 8 {
+		t.Fatalf("LaneToIDs len = %d, want 8 lanes", len(tables.LaneToIDs))
 	}
-	for i, id := range tables.LaneToID {
-		if id != i {
-			t.Errorf("LaneToID[%d] = %d, want %d", i, id, i)
+	if tables.Bucketed {
+		t.Error("3 literals must get one lane each, not a bucketed layout")
+	}
+	for i := 0; i < 3; i++ {
+		if got := tables.LaneToIDs[i]; len(got) != 1 || got[0] != i {
+			t.Errorf("LaneToIDs[%d] = %v, want [%d]", i, got, i)
+		}
+	}
+	for i := 3; i < 8; i++ {
+		if len(tables.LaneToIDs[i]) != 0 {
+			t.Errorf("LaneToIDs[%d] = %v, want empty", i, tables.LaneToIDs[i])
 		}
 	}
 }
 
 func TestMultiPatternTeddy_TooManyLiterals(t *testing.T) {
-	// 17 literals exceeds the new limit of 16 → ok=false
+	// 17 two-byte literals are now BUCKETED into the 16 lanes rather than
+	// rejected (plans/SETS.md §14 P4); the cap is teddyMaxLiterals.
 	lits := make([][]byte, 17)
 	for i := range lits {
 		lits[i] = []byte{byte('a' + i%26), byte('0' + i%10)}
 	}
-	_, ok := buildTeddyTablesMulti(lits)
-	if ok {
-		t.Error("buildTeddyTablesMulti: expected ok=false for 17 literals")
+	tt17, ok := buildTeddyTablesMulti(lits)
+	if !ok {
+		t.Fatal("buildTeddyTablesMulti: expected ok=true for 17 literals (bucketed)")
+	}
+	if !tt17.Bucketed {
+		t.Error("17 literals over 16 lanes must set Bucketed")
+	}
+	seen := 0
+	for _, ids := range tt17.LaneToIDs {
+		seen += len(ids)
+	}
+	if seen != 17 {
+		t.Errorf("lanes cover %d literals, want 17", seen)
+	}
+	// Over the cap → still ok=false.
+	over := make([][]byte, teddyMaxLiterals+1)
+	for i := range over {
+		over[i] = []byte{byte('a' + i%26), byte('0' + i%10), byte('A' + i%26)}
+	}
+	if _, ok := buildTeddyTablesMulti(over); ok {
+		t.Errorf("expected ok=false above teddyMaxLiterals (%d)", teddyMaxLiterals)
+	}
+	// A 1-byte shortest literal keeps the tighter cap.
+	single := make([][]byte, teddySingleByteMax+1)
+	for i := range single {
+		single[i] = []byte{byte('a' + i%26)}
+	}
+	if _, ok := buildTeddyTablesMulti(single); ok {
+		t.Errorf("expected ok=false above teddySingleByteMax (%d) with 1-byte literals", teddySingleByteMax)
 	}
 	// 9 literals ≤ 16 → ok=true (two groups)
 	lits9 := make([][]byte, 9)
@@ -966,7 +1004,9 @@ func TestChooseLiteralFrontend(t *testing.T) {
 		lits [][]byte
 		want frontendKind
 	}{nineLits, frontendTeddy})
-	// 17 literals > 16 → AC
+	// 17 literals with 17 DISTINCT first bytes → bucketed Teddy: above the
+	// first-byte crossover, Teddy's fixed-cost probe beats AC's prefilter
+	// (plans/SETS.md §14.11).
 	seventeenLits := make([][]byte, 17)
 	for i := range seventeenLits {
 		seventeenLits[i] = []byte{byte('a' + i%26), byte('0' + i%10)}
@@ -974,7 +1014,27 @@ func TestChooseLiteralFrontend(t *testing.T) {
 	cases = append(cases, struct {
 		lits [][]byte
 		want frontendKind
-	}{seventeenLits, frontendAC})
+	}{seventeenLits, frontendTeddy})
+	// The same count sharing ONE first byte stays on AC, where its prefilter
+	// skips well — the rule keys on first-byte diversity, not literal count.
+	seventeenShared := make([][]byte, 17)
+	for i := range seventeenShared {
+		seventeenShared[i] = []byte{'k', byte('a' + i%26), byte('0' + i%10)}
+	}
+	cases = append(cases, struct {
+		lits [][]byte
+		want frontendKind
+	}{seventeenShared, frontendAC})
+	// Above the crossover but with a 1-byte literal: Teddy's fingerprint is
+	// too weak, so AC takes it regardless of first-byte spread.
+	seventeenShort := make([][]byte, 17)
+	for i := range seventeenShort {
+		seventeenShort[i] = []byte{byte('a' + i%26)}
+	}
+	cases = append(cases, struct {
+		lits [][]byte
+		want frontendKind
+	}{seventeenShort, frontendAC})
 
 	for _, c := range cases {
 		got := chooseLiteralFrontend(c.lits)
@@ -1347,6 +1407,178 @@ func TestCompileFile_ACFrontend(t *testing.T) {
 	assertDataSectionConsistent(t, wasm)
 }
 
+// TestACBudget covers the frontend budget introduced by plans/SETS.md §14 P1,
+// which replaced a 32-NODE cap that silently demoted any set past ~17-26
+// literals (the exact count varied with prefix sharing) to the scalar path, at
+// 86-414x the scan fuel (§13 F1, §14.2).
+//
+// Three things are asserted, in the order they can break:
+//  1. Large literal sets KEEP an AC frontend under the default budget. This is
+//     the whole point of P1; a regression here is invisible at runtime except
+//     as a fuel cliff, which is how the original went unnoticed for months.
+//  2. Demotion still happens when the budget genuinely cannot hold the table.
+//  3. A demotion is REPORTED in SetDiag. The silent fallback is what hid the
+//     cliff; the diagnostic is the durable fix, independent of the constant.
+func TestACBudget(t *testing.T) {
+	// buildSet returns a spec whose literals share a prefix ("kw") or not,
+	// mirroring the two shapes measured in §14.2: prefix sharing is what
+	// decides AC node count, and therefore where any node-based cap bites.
+	buildSet := func(t *testing.T, n int, shared bool) (SetSpec, *dfaPool, *dfaPool) {
+		t.Helper()
+		var prefixPool, suffixPool dfaPool
+		var patterns []*PatternInfo
+		var ids []int
+		for i := 0; i < n; i++ {
+			var pat string
+			if shared {
+				pat = fmt.Sprintf("kw%03d[0-9a-z]{3}", i)
+			} else {
+				fb := "abcdefghijklmnopqrstuvwxyz0123456789"[i%36]
+				pat = fmt.Sprintf("%cQ%03d[0-9a-z]{3}", fb, i)
+			}
+			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			if err != nil {
+				t.Fatalf("analyzePattern(%q): %v", pat, err)
+			}
+			patterns = append(patterns, info)
+			ids = append(ids, i)
+		}
+		return SetSpec{Name: "s", Scan: "scan", Patterns: patterns, PatternIDs: ids}, &prefixPool, &suffixPool
+	}
+
+	// (1) The default budget holds the AC-selecting shape at every count that
+	// used to fall off the cliff. 17 and 26 are the two measured cliff edges.
+	//
+	// Only the SHARED-prefix shape is checked for AC: since §14.11 the
+	// diverse shape selects bucketed Teddy instead, which is a different
+	// (and measured-better) path, not a budget failure. It is asserted
+	// separately below so a silent swap in either direction is caught.
+	for _, n := range []int{17, 26, 32, 64, 128} {
+		spec, pp, sp := buildSet(t, n, true)
+		cs := CompileSet(spec, pp, sp, CompileSetOptions{})
+		if cs.fe != frontendAC {
+			t.Errorf("shared n=%d: fe = %v, want frontendAC (default budget must hold this set)", n, cs.fe)
+		}
+		if cs.diag != nil && cs.diag.FrontendDemotion != nil {
+			t.Errorf("shared n=%d: unexpected demotion %+v", n, cs.diag.FrontendDemotion)
+		}
+	}
+	for _, n := range []int{17, 26, 32, 64} {
+		spec, pp, sp := buildSet(t, n, false)
+		cs := CompileSet(spec, pp, sp, CompileSetOptions{})
+		if cs.fe != frontendTeddy {
+			t.Errorf("diverse n=%d: fe = %v, want frontendTeddy (above the first-byte crossover)", n, cs.fe)
+		}
+	}
+	// Past teddyMaxLiterals the diverse shape falls back to AC, which the
+	// budget must still hold.
+	specBig, ppBig, spBig := buildSet(t, 128, false)
+	if cs := CompileSet(specBig, ppBig, spBig, CompileSetOptions{}); cs.fe != frontendAC {
+		t.Errorf("diverse n=128: fe = %v, want frontendAC (above teddyMaxLiterals)", cs.fe)
+	}
+
+	// (2)+(3) A budget too small to hold the table demotes to scalar AND says so.
+	spec, pp, sp := buildSet(t, 32, true)
+	cs := CompileSet(spec, pp, sp, CompileSetOptions{ACBudgetBytes: 1})
+	if cs.fe != frontendScalar {
+		t.Errorf("ACBudgetBytes=1: fe = %v, want frontendScalar", cs.fe)
+	}
+	if cs.diag == nil || cs.diag.FrontendDemotion == nil {
+		t.Fatal("ACBudgetBytes=1: demotion not recorded in SetDiag — a silent frontend downgrade is exactly the §13 F1 failure mode")
+	}
+	d := cs.diag.FrontendDemotion
+	if d.From != "ac" || d.To != "scalar" || d.Reason != "ac_table_over_budget" {
+		t.Errorf("demotion diag = %+v, want from=ac to=scalar reason=ac_table_over_budget", d)
+	}
+	if got, ok := d.Detail["budget_bytes"].(int); !ok || got != 1 {
+		t.Errorf("demotion detail budget_bytes = %v, want 1", d.Detail["budget_bytes"])
+	}
+	if got, ok := d.Detail["table_bytes"].(int); !ok || got <= 1 {
+		t.Errorf("demotion detail table_bytes = %v, want the real (over-budget) size", d.Detail["table_bytes"])
+	}
+}
+
+// TestACLayoutBytes pins the accounting acBudgetBytes is compared against: it
+// must cover everything the frontend reserves, including the 256-byte
+// firstByteFlags table emitted after the layout, or the budget silently
+// under-counts. Non-zero table bases must not shift the answer.
+func TestACLayoutBytes(t *testing.T) {
+	ac := buildAC([][]byte{[]byte("ab"), []byte("cd")})
+	for _, base := range []int32{0, 4096, 1 << 20} {
+		l := buildACLayout(ac, base)
+		if got, want := l.bytes(), int(l.tableEnd-base)+256; got != want {
+			t.Errorf("base=%d: bytes() = %d, want %d", base, got, want)
+		}
+		if l.gotoOff != base {
+			t.Errorf("base=%d: gotoOff = %d, want the table base", base, l.gotoOff)
+		}
+	}
+	if b0, b1 := buildACLayout(ac, 0).bytes(), buildACLayout(ac, 1<<20).bytes(); b0 != b1 {
+		t.Errorf("bytes() depends on table base: %d vs %d", b0, b1)
+	}
+}
+
+// TestACByteClassCompression covers the compressed layout (plans/SETS.md §14
+// P3). Compression is a RE-INDEXING of the goto table, so the invariant that
+// matters is that every byte still reaches the same target from every node —
+// checked directly here, since a wrong class map would corrupt matching in a
+// way only some inputs reveal.
+func TestACByteClassCompression(t *testing.T) {
+	lits := [][]byte{[]byte("kw001"), []byte("kw002"), []byte("kw003"), []byte("zz9")}
+	ac := buildAC(lits)
+
+	plain := buildACLayoutMode(ac, 0, false)
+	if plain.compressed || plain.stride != 256 || plain.strideShift != 9 {
+		t.Fatalf("uncompressed layout: compressed=%v stride=%d shift=%d, want false/256/9",
+			plain.compressed, plain.stride, plain.strideShift)
+	}
+
+	packed := buildACLayoutMode(ac, 0, true)
+	if !packed.compressed {
+		t.Fatalf("this alphabet (a handful of distinct bytes) must compress; numClasses=%d", packed.numClasses)
+	}
+	if packed.stride != nextPow2(packed.numClasses) || 1<<packed.strideShift != packed.stride*2 {
+		t.Errorf("stride/shift inconsistent: stride=%d shift=%d classes=%d",
+			packed.stride, packed.strideShift, packed.numClasses)
+	}
+	if packed.bytes() >= plain.bytes() {
+		t.Errorf("compression did not shrink the layout: %d -> %d", plain.bytes(), packed.bytes())
+	}
+
+	// The invariant: for every node and every byte, the compressed table
+	// resolves to the same next node as the uncompressed one.
+	for i := range ac.nodes {
+		for b := 0; b < 256; b++ {
+			want := binary.LittleEndian.Uint16(plain.gotoBytes[(i*256+b)*2:])
+			col := int(packed.classMap[b])
+			got := binary.LittleEndian.Uint16(packed.gotoBytes[(i*packed.stride+col)*2:])
+			if got != want {
+				t.Fatalf("node %d byte %d: compressed goto = %d, want %d (class %d)", i, b, got, want, col)
+			}
+		}
+	}
+
+	// Bytes sharing a class must be genuinely interchangeable — otherwise the
+	// re-indexing above would be lossy rather than exact.
+	for b1 := 0; b1 < 256; b1++ {
+		for b2 := b1 + 1; b2 < 256; b2++ {
+			if packed.classMap[b1] != packed.classMap[b2] {
+				continue
+			}
+			for i := range ac.nodes {
+				if ac.nodes[i].gotoTable[b1] != ac.nodes[i].gotoTable[b2] {
+					t.Fatalf("bytes %d and %d share class %d but differ at node %d", b1, b2, packed.classMap[b1], i)
+				}
+			}
+		}
+	}
+
+	// One extra data segment carries the class map.
+	if got, want := acDataSegments(packed), acDataSegments(plain)+1; got != want {
+		t.Errorf("acDataSegments(compressed) = %d, want %d", got, want)
+	}
+}
+
 // TestCompileFile_ShuftiFrontend exercises emitSetMatchFnFinalShufti and
 // litUnionFirstBytes (both 0% covered without this). Reaching the Shufti
 // frontend (LIKELY.md Gap H.3) requires, in order:
@@ -1459,8 +1691,15 @@ func TestBuildTeddyTablesMulti_TwoGroups(t *testing.T) {
 	if !tt.TwoGroups {
 		t.Error("expected TwoGroups=true for 10 literals")
 	}
-	if len(tt.LaneToID) != 10 {
-		t.Errorf("LaneToID len = %d, want 10", len(tt.LaneToID))
+	if len(tt.LaneToIDs) != 16 {
+		t.Errorf("LaneToIDs len = %d, want 16 lanes", len(tt.LaneToIDs))
+	}
+	covered := 0
+	for _, ids := range tt.LaneToIDs {
+		covered += len(ids)
+	}
+	if covered != 10 {
+		t.Errorf("lanes cover %d literals, want 10", covered)
 	}
 	// Group B should have entries (literals 8-9 map to bit 0,1 of BT0Lo/BT0Hi)
 	if tt.BT0Lo['h'&0x0F] == 0 && tt.BT0Hi['h'>>4] == 0 {
@@ -3169,5 +3408,104 @@ func TestJumpIsProfitable(t *testing.T) {
 				t.Errorf("jumpIsProfitable() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestTeddyTwoGroupLaneExtraction pins the two-group lane-extraction hazard
+// fixed in plans/SETS.md §14.11.
+//
+// emitSetMatchFnFinalTeddy extracts a candidate byte using lLaneOff (the
+// position within the 16-byte chunk), but emitLitDispatch reuses lLaneOff as
+// scratch. Dispatching group A before extracting group B therefore fed group B
+// a lane index where a chunk position belonged, and every literal in lanes
+// 8..15 became unreachable whenever group A also had a candidate at that
+// position. It stayed latent for one-literal-per-lane sets — a group A
+// candidate there is a true fingerprint match, so collisions were rare — and
+// became routine once bucketing OR'd several literals into one lane bit.
+//
+// The property asserted is structural: both extractions must be emitted
+// before either dispatch. Byte-level behaviour is covered end-to-end by the
+// set corpora, but only for shapes that happen to collide, which is exactly
+// the fragility that hid this.
+func TestTeddyTwoGroupLaneExtraction(t *testing.T) {
+	// 17 two-byte literals: over 16, so lanes are bucketed and both groups
+	// are populated.
+	lits := make([][]byte, 17)
+	for i := range lits {
+		lits[i] = []byte{byte('a' + i%26), byte('0' + i%10)}
+	}
+	tt, ok := buildTeddyTablesMulti(lits)
+	if !ok {
+		t.Fatal("buildTeddyTablesMulti failed")
+	}
+	if !tt.TwoGroups {
+		t.Fatal("17 literals must populate both lane groups")
+	}
+	usedB := false
+	for lane := 8; lane < len(tt.LaneToIDs); lane++ {
+		if len(tt.LaneToIDs[lane]) > 0 {
+			usedB = true
+		}
+	}
+	if !usedB {
+		t.Fatal("no literal landed in lanes 8..15; the hazard would be unreachable")
+	}
+
+	// Every literal must be reachable from some lane — the symptom of the bug
+	// was literals present in the tables but absent from any dispatched lane.
+	seen := map[int]bool{}
+	for _, ids := range tt.LaneToIDs {
+		for _, id := range ids {
+			if seen[id] {
+				t.Errorf("literal %d appears in more than one lane", id)
+			}
+			seen[id] = true
+		}
+	}
+	for i := range lits {
+		if !seen[i] {
+			t.Errorf("literal %d (%q) is in no lane", i, lits[i])
+		}
+	}
+}
+
+// TestACLayoutNoGap pins that the AC layout reserves exactly what it writes.
+//
+// `outputBytes` is the CONCATENATION of the nodeOut offset array and the flat
+// output array, but `outputOff` already points past nodeOut — so computing
+// tableEnd as outputOff + len(outputBytes) counts the nodeOut region twice and
+// leaves a (numNodes+1)*2-byte hole before whatever is placed at tableEnd
+// (firstByteFlags, or the class map when compressed). Harmless but real: it
+// inflates every AC set's table footprint, and acBudgetBytes is measured
+// against that footprint, so the gap made the budget hold fewer literals than
+// it should (plans/SETS.md §14.14).
+func TestACLayoutNoGap(t *testing.T) {
+	cases := [][][]byte{
+		{[]byte("ab"), []byte("cd")},
+		{[]byte("kw001"), []byte("kw002"), []byte("kw003"), []byte("zz9")},
+		{[]byte("a")},
+	}
+	for _, lits := range cases {
+		ac := buildAC(lits)
+		for _, compress := range []bool{false, true} {
+			l := buildACLayoutMode(ac, 4096, compress)
+			// Every region must start exactly where the previous one ended.
+			if got, want := l.nodeOutOff, l.gotoOff+int32(len(l.gotoBytes)); got != want {
+				t.Errorf("lits=%d compress=%v: nodeOutOff = %d, want %d", len(lits), compress, got, want)
+			}
+			// outputBytes holds nodeOut ++ output, and outputOff points past
+			// nodeOut, so the block written from outputOff is the OUTPUT part
+			// alone. tableEnd must reflect that, not the whole concatenation.
+			nodeOutLen := int32(l.numNodes+1) * 2
+			outputLen := int32(len(l.outputBytes)) - nodeOutLen
+			wantEnd := l.outputOff + outputLen
+			if l.compressed {
+				wantEnd += 256 // class map
+			}
+			if l.tableEnd != wantEnd {
+				t.Errorf("lits=%d compress=%v: tableEnd = %d, want %d (a %d-byte gap)",
+					len(lits), compress, l.tableEnd, wantEnd, l.tableEnd-wantEnd)
+			}
+		}
 	}
 }

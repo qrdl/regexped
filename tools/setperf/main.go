@@ -63,6 +63,59 @@ const (
 	pageSize   = 65536
 	fuelBudget = 4_000_000_000
 	benchIters = 2000
+
+	// callBoundFuel is the fuel below which a wall-clock ratio describes the
+	// two HARNESSES rather than the two engines, so the ratio column is
+	// suppressed (plans/SETS.md §13 F3).
+	//
+	// Our side times one Go→wasmtime Func.Call per sample; theirs loops
+	// `iters` times INSIDE WASM and reports per-iteration nanoseconds. That
+	// call costs ~4-7 us (measured independently in §10.5), which is fixed
+	// per row. Every anchored row spends 52-58 WASM instructions — work that
+	// cannot take 4 us — and duly printed "~0.02x", reading as a 50x loss on
+	// capabilities where we are in fact spending almost nothing.
+	//
+	// 10,000 was chosen so the suppressed band is the one where the call
+	// dominates: at roughly a nanosecond per instruction, 10K fuel is ~10 us
+	// of real work, i.e. the first point at which the ~4-7 us call is a
+	// minority of the sample. Rows above it print a ratio; rows below print
+	// "call-bound" and still show both raw times.
+	callBoundFuel = 10_000
+
+	// overlappingTimedCap bounds the INPUT for the timed find(overlapping)
+	// row only (plans/SETS.md §13 F4).
+	//
+	// That body is the deliberate every-start-position enumeration of §7.10,
+	// so on a set with no mandatory literal it is O(n^2): greedy-3 over 50,000
+	// 'a's is ~1.25 BILLION DFA steps for ONE exhaustion, and measureTime
+	// wants benchIters of them. The default matrix therefore could not be run
+	// to completion — which is the mechanical reason §9.9's cross-engine
+	// numbers went unrecorded for the whole project (§13 F4/F5).
+	//
+	// Only the timed path is bounded. Fuel rows keep the full input: they do
+	// one exhaustion, which completes, and bounding them would silently
+	// change the committed fuel baselines. The consequence is that for a
+	// capped row the fuel column and the time column describe different input
+	// lengths, so the row is labelled to say so rather than quietly mixing
+	// them.
+	overlappingTimedCap = 2048
+
+	// timedFuelCap is the fuel above which the TIMED run switches to the
+	// shortened input (see overlappingTimedCap). benchIters samples of a row
+	// this expensive is minutes to hours of wall time.
+	//
+	// §13 F4 blamed the unrunnable matrix on find(overlapping) alone. That was
+	// the row it happened to be killed in; measuring showed the property is
+	// not specific to that capability but to "must visit every start position
+	// on a set with no mandatory literal", which on greedy-3 over 50,000 'a's
+	// makes scan_all and find quadratic too — all three exhaust even the fuel
+	// budget. Keying the bound on measured cost rather than on a capability
+	// name covers whichever rows actually turn out to be quadratic.
+	timedFuelCap = 50_000_000
+
+	// fuelExhausted marks a row whose single measurement ran out of fuel.
+	// Distinct from any real count, which is bounded by fuelBudget.
+	fuelExhausted = ^uint64(0)
 )
 
 // capability names the seven exports, in a fixed order.
@@ -182,6 +235,36 @@ func buildMatrix() []setCase {
 	out = append(out,
 		setCase{"secrets-4", secrets, corpusNoMatch(), "no-match 100KB"},
 		setCase{"secrets-4", secrets, corpusSparse(secrets), "sparse 100KB"},
+	)
+	// A set whose literals share NO first byte. Every keywords-* literal
+	// starts 'k', so before this the matrix could not see the AC frontend's
+	// first-byte prefilter at all: plans/SETS.md §14 P2 changed that prefilter
+	// from a per-byte compare chain to Shufti, cut this shape's scan fuel by
+	// 28%, and moved not one of the 146 committed rows (§14.6). Prefix sharing
+	// is also what decides AC's node count, so this is the shape that governs
+	// the table budget too (§14.1, sharpening 1).
+	diverse := make([]string, 32)
+	for i := range diverse {
+		diverse[i] = fmt.Sprintf("%cQ%03d[0-9a-z]{3}", "abcdefghijklmnopqrstuvwxyz0123456789"[i%36], i)
+	}
+	out = append(out,
+		setCase{"diverse-32", diverse, corpusNoMatch(), "no-match 100KB"},
+		setCase{"diverse-32", diverse, corpusSparse(diverse), "sparse 100KB"},
+	)
+	// A set whose patterns share one SUFFIX behind distinct literals. Every
+	// other set here has a counted-class-chain suffix ([0-9a-z]{3} and
+	// friends), which genSuffixWASM answers with SIMD and no table at all —
+	// so nothing in the matrix built a suffix table to begin with, and the
+	// dedup of plans/SETS.md §14 P7 moved zero rows despite cutting these
+	// shapes' modules by ~70% (§14.10). An alternation suffix does build a
+	// table, which is what makes this case load-bearing.
+	shared := make([]string, 32)
+	for i := range shared {
+		shared[i] = fmt.Sprintf("kw%03d(?:alpha|beta|gamma)", i)
+	}
+	out = append(out,
+		setCase{"sharedsuffix-32", shared, corpusNoMatch(), "no-match 100KB"},
+		setCase{"sharedsuffix-32", shared, corpusSparse(shared), "sparse 100KB"},
 	)
 	// A set with no mandatory literal at all: every position is visited, so
 	// this is where gating has the most to recover.
@@ -482,6 +565,14 @@ func measureFuelRow(c setCase) []row {
 		}
 		before, _ := r.store.GetFuel()
 		if err := r.call(cap, wide); err != nil {
+			// Almost always the fuel budget running out. Record that as a
+			// SENTINEL rather than dropping the row: a bare `continue` here
+			// is why greedy-3's scan_all/find/find(overlapping) had no fuel
+			// number anywhere — the map lookup then yielded 0, and the matrix
+			// printed "0 fuel" for the three most expensive rows it has
+			// (plans/SETS.md §14.7). printRows filters sentinels back out so
+			// the baseline files keep their exact-equality format.
+			out = append(out, row{rowKey(c, cap), fuelExhausted})
 			continue
 		}
 		after, _ := r.store.GetFuel()
@@ -506,8 +597,24 @@ func measureSizeRow(c setCase) []row {
 	return out
 }
 
+// timedCase returns the case to use for the TIMED measurement of cap, and
+// whether the input was shortened.
+//
+// ourFuel is the measured fuel for this row, or fuelExhausted when the single
+// measurement could not even complete. Rows are shortened on measured cost —
+// see timedFuelCap for why capability name is the wrong key.
+func timedCase(c setCase, cap capability, ourFuel uint64) (setCase, bool) {
+	quadratic := ourFuel == fuelExhausted || ourFuel > timedFuelCap
+	if !quadratic || len(c.input) <= overlappingTimedCap {
+		return c, false
+	}
+	c.input = c.input[:overlappingTimedCap]
+	return c, true
+}
+
 // measureTime returns the p50 of benchIters whole-input operations.
-func measureTime(engine *wasmtime.Engine, c setCase, cap capability) (time.Duration, error) {
+func measureTime(engine *wasmtime.Engine, c setCase, cap capability, ourFuel uint64) (time.Duration, error) {
+	c, _ = timedCase(c, cap, ourFuel)
 	wasm, err := compileCase(c, cap == capFindOverlapping)
 	if err != nil {
 		return 0, err
@@ -658,6 +765,11 @@ func runFullMatrix(cases []setCase) {
 	fmt.Println(strings.Repeat("─", 96))
 	fmt.Println("Fuel is EXACT within an engine and indicative ACROSS engines; wall-clock is")
 	fmt.Println("placement noise on this machine — compare the ratio, not the absolute.")
+	fmt.Printf("Ratios are withheld below %d fuel (\"call-bound\"): our harness times one\n", callBoundFuel)
+	fmt.Println("Go→wasmtime call per sample and theirs amortises the call inside WASM, so on")
+	fmt.Println("cheap capabilities the ratio compares the harnesses, not the engines (§13 F3).")
+	fmt.Printf("find(overlapping) is timed on at most %d bytes: it is the every-start-position\n", overlappingTimedCap)
+	fmt.Println("enumeration, quadratic on literal-less sets, and blocks the matrix otherwise (F4).")
 	fmt.Println()
 
 	for _, c := range cases {
@@ -677,34 +789,59 @@ func runFullMatrix(cases []setCase) {
 			fuel[r.key] = r.value
 		}
 
-		fmt.Printf("  %-18s %12s %12s %12s %9s\n", "capability", "our fuel", "our p50", "theirs p50", "ratio")
-		fmt.Println("  " + strings.Repeat("─", 68))
+		fmt.Printf("  %-18s %12s %12s %12s %11s  %s\n", "capability", "our fuel", "our p50", "theirs p50", "ratio", "note")
+		fmt.Println("  " + strings.Repeat("─", 82))
 		for _, cap := range allCaps {
-			ours, err := measureTime(engine, c, cap)
+			ourFuel := fuel[rowKey(c, cap)]
+			ours, err := measureTime(engine, c, cap, ourFuel)
 			if err != nil {
-				fmt.Printf("  %-18s %12s %12s %12s %9s\n", cap, "-", "error", "-", "-")
+				fmt.Printf("  %-18s %12s %12s %12s %11s\n", cap, "-", "error", "-", "-")
 				continue
 			}
-			f := fmtFuel(fuel[rowKey(c, cap)])
+			f := fmtFuel(ourFuel)
+			// F4: say so when the timed input was shortened, because then this
+			// row's fuel and time describe different input lengths.
+			var note string
+			if _, capped := timedCase(c, cap, ourFuel); capped {
+				note = fmt.Sprintf("time on %dB input; fuel on %dB", overlappingTimedCap, len(c.input))
+			}
+			if ourFuel == fuelExhausted {
+				f = "exhausted"
+				note = fmt.Sprintf("one call exceeds the %s fuel budget; time on %dB input", fmtFuel(fuelBudget), overlappingTimedCap)
+			}
 			pairing := raPairing(cap)
 			if pairing == "" || raErr != nil {
-				note := "no comparison"
+				reason := "no comparison"
 				if raErr != nil {
-					note = "harness error"
+					reason = "harness error"
 				}
-				fmt.Printf("  %-18s %12s %12s %12s %9s\n", cap, f, fmtDur(ours), note, "-")
+				fmt.Printf("  %-18s %12s %12s %12s %11s  %s\n", cap, f, fmtDur(ours), reason, "-", note)
 				continue
 			}
 			theirs, err := ra.bench(pairing, len(c.input))
 			if err != nil {
-				fmt.Printf("  %-18s %12s %12s %12s %9s\n", cap, f, fmtDur(ours), "error", "-")
+				fmt.Printf("  %-18s %12s %12s %12s %11s  %s\n", cap, f, fmtDur(ours), "error", "-", note)
 				continue
 			}
+			// A ratio is printed only when both sides did comparable work.
+			// F3: below callBoundFuel the sample is dominated by our harness's
+			// per-call cost. F4: a shortened timed input means our time covers
+			// a fraction of the bytes theirs does. Both print the raw times
+			// and withhold only the ratio.
+			_, capped := timedCase(c, cap, ourFuel)
 			ratio := "-"
-			if ours > 0 && theirs > 0 {
+			switch {
+			case capped:
+				ratio = "input differs"
+			case ourFuel > 0 && ourFuel < callBoundFuel:
+				ratio = "call-bound"
+				if note == "" {
+					note = fmt.Sprintf("our work is %s fuel; ratio would measure harness call overhead", f)
+				}
+			case ours > 0 && theirs > 0:
 				ratio = fmt.Sprintf("%.2fx", float64(theirs)/float64(ours))
 			}
-			fmt.Printf("  %-18s %12s %12s %12s %9s\n", cap, f, fmtDur(ours), fmtDur(theirs), ratio)
+			fmt.Printf("  %-18s %12s %12s %12s %11s  %s\n", cap, f, fmtDur(ours), fmtDur(theirs), ratio, note)
 		}
 		_ = fuelEngine
 	}
@@ -713,6 +850,13 @@ func runFullMatrix(cases []setCase) {
 func printRows(cases []setCase, measure func(setCase) []row, unit string) {
 	for _, c := range cases {
 		for _, r := range measure(c) {
+			if r.value == fuelExhausted {
+				// Not a number, so it cannot join an exact-equality baseline.
+				// Announced on stderr so `make baseline` (which redirects
+				// stdout only) still shows the gap rather than hiding it.
+				fmt.Fprintf(os.Stderr, "note: %s exceeded the %d fuel budget — no baseline row\n", r.key, uint64(fuelBudget))
+				continue
+			}
 			fmt.Printf("%s = %d %s\n", r.key, r.value, unit)
 		}
 	}
@@ -749,7 +893,19 @@ func runCompare(path string, cases []setCase, measure func(setCase) []row, unit 
 		for _, r := range measure(c) {
 			want, ok := base[r.key]
 			if !ok {
-				fmt.Fprintf(os.Stderr, "  no baseline for %q\n", r.key)
+				if r.value == fuelExhausted {
+					fmt.Fprintf(os.Stderr, "  %s: exceeds the fuel budget, no baseline (expected)\n", r.key)
+				} else {
+					fmt.Fprintf(os.Stderr, "  no baseline for %q\n", r.key)
+				}
+				continue
+			}
+			if r.value == fuelExhausted {
+				// Was measurable when the baseline was taken and is not now:
+				// a real regression, but printing the sentinel as a number
+				// would just look like corruption.
+				fmt.Fprintf(os.Stderr, "REGRESSION %s: baseline=%d current=exceeds the %d %s budget\n", r.key, want, uint64(fuelBudget), unit)
+				bad++
 				continue
 			}
 			if want != r.value {

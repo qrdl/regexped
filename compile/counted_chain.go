@@ -61,6 +61,25 @@ func isCountedClassChain(t *dfaTable) (class []byte, n int, ok bool) {
 		return nil, 0, false
 	}
 
+	// acceptsAnywhere: does state s accept at an ARBITRARY position, as
+	// opposed to only at end of input?
+	//
+	// acceptStates is the EOF-only map, and the emitted body never consults
+	// it — it verifies N class bytes with SIMD and reports a match, with no
+	// end-of-input test. So a terminal state that accepts ONLY at EOF makes
+	// the shortcut unsound: `.$` compiled to "one byte of any class matches
+	// here", and as a set member it reported a match at every position rather
+	// than only at the last one (`.$` over "00" yielded [0-1] and [1-2] where
+	// Go yields [1-2] alone). Found by tools/fuzz FuzzSet; see
+	// tools/re2test/custom-sets.txt Category S10 and plans/SETS.md §14.14.
+	//
+	// The intermediate-state test below deliberately stays broader
+	// (isAccepting): a mid-chain state accepting at EOF means a SHORTER input
+	// also matches, which this fixed-N body cannot express either.
+	acceptsAnywhere := func(s int) bool {
+		return t.midAcceptStates[s] != 0 || t.immediateAcceptStates[s] != 0
+	}
+
 	isAccepting := func(s int) bool {
 		if _, ok := t.acceptStates[s]; ok {
 			return true
@@ -102,8 +121,9 @@ func isCountedClassChain(t *dfaTable) (class []byte, n int, ok bool) {
 
 		if len(live) == 0 {
 			// Terminal: must be the (sole) accepting state, reached after
-			// at least one step.
-			if steps == 0 || !isAccepting(cur) {
+			// at least one step, and must accept at an arbitrary position
+			// rather than only at end of input.
+			if steps == 0 || !isAccepting(cur) || !acceptsAnywhere(cur) {
 				return nil, 0, false
 			}
 			return class, steps, true

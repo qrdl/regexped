@@ -35,7 +35,7 @@ regexped/
 │   ├── mandatory_lit.go       # Mandatory literal extraction (FindMandatoryLit)
 │   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
-│   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, 17–32 literals)
+│   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
 │   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets
 │   ├── set_emit.go            # Set WASM emission (CompileFile, the four frontend bodies: AC/Teddy/Shufti/scalar).
 │   │                          #   These bodies serve `find` AND the scan trio — setFindCtx.mode picks what

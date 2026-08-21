@@ -386,3 +386,43 @@ regexps
 -;0-0;-;-;0-0,1-1,2-2
 -;0-0;-;-;0-0,1-1,2-2,3-3
 -;0-0;-;-;0-0,1-1,2-2,3-3,4-4
+# ============================================================
+# ============================================================
+# Category S10: end-of-TEXT anchors in sets
+# ============================================================
+# Regression block for a set-mode bug found by tools/fuzz FuzzSet
+# (plans/SETS.md §14.14): the pair `.$` + `0` over input "00" reported TWO
+# matches for `.$`, [0-1] and [1-2], where only [1-2] is real. Go's `$`
+# without (?m) is end-of-TEXT (\z, not \Z), so a one-byte match ending at
+# offset 1 cannot satisfy it.
+#
+# Kept to the reproducing pair. Adding further patterns to the same set
+# changes the bucketing and MASKS the fault — an earlier draft of this block
+# carried five patterns and passed against the buggy engine.
+#
+# The multi-byte inputs are what distinguish: on a single byte the only
+# candidate position is also the end of text. Category S7 covers the (?m)
+# forms, which are a different mechanism.
+SetEndAnchor
+strings
+""
+"0"
+"00"
+"000"
+"a0"
+"a0b0"
+regexps
+".$"
+-;-;-;-;-
+-;0-1;-;-;0-1
+-;1-2;-;-;1-2
+-;2-3;-;-;2-3
+-;1-2;-;-;1-2
+-;3-4;-;-;3-4
+"0"
+-;-;-;-;-
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;0-1;-;-;0-1,1-2,2-3
+-;1-2;-;-;1-2
+-;1-2;-;-;1-2,3-4

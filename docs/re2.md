@@ -134,10 +134,13 @@ runner:
    per-pattern matches expected by columns 4 / 1 of the RE2 test format.
 
 This exercises all set frontends — SIMD Teddy (≤ 16 literals), Aho-Corasick
-(17+ literals, capped by automaton node count rather than literal count),
-SIMD Shufti (density/hint-selected first-byte prefilter), and the scalar DFA
-fallback — together with bucket dispatch and the isolated-fallback path for
-non-greedy patterns. See [sets.md](sets.md) for the exact frontend-selection
+(17+ literals, capped by table bytes rather than literal count), SIMD Shufti
+(density/hint-selected first-byte prefilter), and the scalar DFA fallback —
+together with bucket dispatch and the isolated-fallback path for non-greedy
+patterns. Note that the RE2 corpus's set blocks are small, so they cover the
+frontends' *semantics* rather than their scaling; per-shape scaling is
+measured separately by `tools/setperf` and the fuel ladder in
+[plans/SETS.md](../plans/SETS.md) §14. See [sets.md](sets.md) for the exact frontend-selection
 rules. Set tests currently run
 clean with **0 failures**.
 

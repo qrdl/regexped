@@ -70,6 +70,12 @@ type compiledSet struct {
 	prefixDataBytes    []byte
 	prefixDataSegCount int
 
+	// unionScan is the start-anywhere union automaton serving `scan` and the
+	// narrow `scan_all` when the set has no literal frontend to skip with
+	// (plans/SETS.md §14 P5). Nil when the set is ineligible or kept its
+	// per-position path.
+	unionScan *unionScanDFA
+
 	// prefixFnIdx[bi][k]: index into prefixFnBodies for pattern at bitPos k in bucket bi.
 	// -1 means trivial prefix (always passes; bit is always set in validMask).
 	prefixFnIdx [][]int
@@ -379,17 +385,55 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// not declare `find` therefore emits no suffix FUNCTIONS at all — only
 	// their DFA tables, which the probes share.
 	needSuffixFns := spec.Find != ""
+	// Suffix-table dedup (plans/SETS.md §14 P7). Buckets very often share a
+	// suffix: `kw%03d[0-9a-z]{3}` gives every pattern its own literal and its
+	// own bucket, but one identical `[0-9a-z]{3}` table, re-emitted once per
+	// bucket. The tables are the bulk of such a module.
+	//
+	// Sound because genSuffixWASM's DATA is a function of (table, base) alone:
+	// the bitmask tables are built from the table's own accept maps, whose bits
+	// are per-bucket BIT POSITIONS, not global pattern ids. Global ids and
+	// prefix lengths reach only the BODY, which is why each bucket still calls
+	// genSuffixWASM with its own — we reuse the address, never the body.
+	//
+	// Identity is dfaFingerprint + dfaTableEqual, the same exact test dfaPool
+	// uses. Both are exact rather than heuristic, so a table that is not
+	// canonical simply fails to dedup; it can never alias onto a different one.
+	type suffixSlot struct {
+		t    *dfaTable
+		base int32
+	}
+	suffixDedup := map[uint64][]suffixSlot{}
 	for bi, bkt := range buckets {
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(tableOffset), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], needScanProbes, gatedFind)
+		base, reused, fp := tableOffset, false, uint64(0)
+		if bkt.suffixDFA != nil {
+			fp = dfaFingerprint(bkt.suffixDFA)
+			for _, slot := range suffixDedup[fp] {
+				if dfaTableEqual(slot.t, bkt.suffixDFA) {
+					base, reused = slot.base, true
+					break
+				}
+			}
+		}
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], needScanProbes, gatedFind)
 		if needSuffixFns {
 			suffixFnBodies[bi] = art.fnBody
 		}
 		if needScanProbes {
 			scanProbeBodies[bi] = art.scanProbe
 		}
+		if reused {
+			// Bodies point at the tables emitted for the first bucket with
+			// this suffix; emitting the identical bytes again would only
+			// duplicate them. tableOffset must NOT advance.
+			continue
+		}
 		tableOffset = nextOffset // use actual memory end, not encoded size
 		allDataBytes = append(allDataBytes, dataBytes...)
 		totalDataSegs += dataSegs
+		if bkt.suffixDFA != nil {
+			suffixDedup[fp] = append(suffixDedup[fp], suffixSlot{bkt.suffixDFA, base})
+		}
 	}
 
 	// Second pass: build prefix DFA function bodies (after suffix data, to avoid address overlap).
@@ -456,12 +500,60 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	var acFirstByteFlagsOff int32
 	if fe == frontendAC {
 		ac := buildAC(lits)
-		// Cap: fall back to scalar if the automaton exceeds 32 nodes (goto table > 16 KB).
-		// Larger automata cause epoch timeouts during re2test instantiation.
-		if len(ac.nodes) <= 32 {
-			acL = buildACLayout(ac, prefixTableOffset)
+		// Cap: the AC goto table is the single largest table a set emits, so
+		// it gets its own byte budget rather than sharing the per-bucket one.
+		//
+		// The previous cap was 32 NODES, justified in-comment by "epoch
+		// timeouts during re2test instantiation" — a test-harness constraint
+		// shaping production codegen, and one that no longer reproduces:
+		// instantiating a 128-literal AC module measures ~8 us, flat in AC
+		// size (plans/SETS.md §14.1 F2, §14.2). What it cost was 86-414x the
+		// scan fuel, because past the cap the set silently lost its literal
+		// frontend entirely and visited every input position against every
+		// bucket (§13 F1). See acBudgetBytes for why this is denominated in
+		// bytes and why the default is what it is.
+		// Uncompressed first, byte-class compression only as a RESCUE
+		// (plans/SETS.md §14 P3). Compression costs one table load per input
+		// byte to map byte→class, so spending it on a set that already fits
+		// would trade fuel — this project's first-priority metric — for
+		// module bytes, its second. It earns that cost only against the
+		// alternative of losing the literal frontend altogether, which
+		// measures 86-414x worse (§13 F1, §14.5).
+		cand := buildACLayoutMode(ac, prefixTableOffset, false)
+		acBytes := cand.bytes()
+		if acBytes > opts.acBudgetBytes() {
+			if packed := buildACLayoutMode(ac, prefixTableOffset, true); packed.compressed && packed.bytes() <= opts.acBudgetBytes() {
+				cand = packed
+			}
+		}
+		// Node ids are u16 in the goto table. Compression can fit far more
+		// nodes than the id space addresses (see acMaxNodes), so this is
+		// checked alongside the budget rather than assumed away.
+		if len(ac.nodes) > acMaxNodes {
+			fe = frontendScalar
+			diag.FrontendDemotion = &FrontendDemotionDiag{
+				From:   frontendAC.String(),
+				To:     frontendScalar.String(),
+				Reason: "ac_nodes_exceed_u16",
+				Detail: map[string]interface{}{
+					"literals":  len(lits),
+					"ac_nodes":  len(ac.nodes),
+					"max_nodes": acMaxNodes,
+				},
+			}
+		} else if cand.bytes() <= opts.acBudgetBytes() {
+			acL = cand
 			acDataBytes = emitACDataSegments(acL)
-			acDataSegCount = 2 // goto, combined nodeOut+output
+			acDataSegCount = acDataSegments(acL)
+			diag.ACTable = &ACTableDiag{
+				Nodes:      acL.numNodes,
+				Bytes:      acL.bytes(),
+				Compressed: acL.compressed,
+			}
+			if acL.compressed {
+				diag.ACTable.ByteClasses = acL.numClasses
+				diag.ACTable.Stride = acL.stride
+			}
 
 			// Build firstByteFlags[256] table for SIMD prefilter.
 			fbFlags := make([]byte, 256)
@@ -479,6 +571,19 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			acDataSegCount++ // one more segment for firstByteFlags
 		} else {
 			fe = frontendScalar
+			diag.FrontendDemotion = &FrontendDemotionDiag{
+				From:   frontendAC.String(),
+				To:     frontendScalar.String(),
+				Reason: "ac_table_over_budget",
+				Detail: map[string]interface{}{
+					"literals":         len(lits),
+					"ac_nodes":         len(ac.nodes),
+					"table_bytes":      acBytes,
+					"compressed_bytes": cand.bytes(),
+					"byte_classes":     cand.numClasses,
+					"budget_bytes":     opts.acBudgetBytes(),
+				},
+			}
 		}
 	}
 
@@ -601,6 +706,22 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			cs.anchoredDataSegs += segs
 			anchoredOffset = next
 		}
+	}
+
+	// Start-anywhere union DFA for the scan trio (plans/SETS.md §14 P5).
+	//
+	// Built here, last, so its tables sit past every other region this set
+	// emits — the anchored automata are laid out immediately above AC/Teddy
+	// and would otherwise overlap.
+	//
+	// Restricted to sets that ended up on the SCALAR frontend. A literal
+	// frontend already skips input and beats a table lookup per byte; this
+	// path is for the sets that have nothing to skip with, where the
+	// alternative is visiting every position with every bucket.
+	if fe == frontendScalar && (spec.Scan != "" || spec.ScanAll != "") {
+		unionBase := prefixTableOffset + int32(len(acDataBytes)) + int32(len(teddyDataBytes)) +
+			int32(len(cs.anchoredDataBytes))
+		cs.unionScan = buildUnionScanDFA(spec, opts, unionBase)
 	}
 
 	// §9.4 first-position routing data, derived from the finished bucket list.
@@ -785,7 +906,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		compiledSets = append(compiledSets, cs)
 		setTableBase += int64(len(cs.dataBytes)) + int64(len(cs.prefixDataBytes)) +
 			int64(len(cs.acDataBytes)) + int64(len(cs.teddyDataBytes)) +
-			int64(len(cs.anchoredDataBytes))
+			int64(len(cs.anchoredDataBytes)) + int64(cs.unionScanDataLen())
 	}
 
 	// Compute required memory pages from the largest data address used.
@@ -829,12 +950,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	}
 	for _, cs := range sets {
 		totalSegs += cs.dataSegCount + cs.prefixDataSegCount + cs.acDataSegCount +
-			cs.teddyDataSegCount + cs.anchoredDataSegs
+			cs.teddyDataSegCount + cs.anchoredDataSegs + cs.unionScanDataSegs()
 		rawData = append(rawData, cs.dataBytes...)
 		rawData = append(rawData, cs.prefixDataBytes...)
 		rawData = append(rawData, cs.acDataBytes...)
 		rawData = append(rawData, cs.teddyDataBytes...)
 		rawData = append(rawData, cs.anchoredDataBytes...)
+		if cs.unionScan != nil {
+			rawData = append(rawData, cs.unionScan.dataBytes...)
+		}
 	}
 
 	// Assign function indices.
@@ -1134,7 +1258,14 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			case capMatch, capMatchAny, capMatchAll:
 				cs_bytes = append(cs_bytes, emitSetAnchoredCapBody(cs, c.kind, anchoredProbeBase)...)
 			default:
-				body := emitSetMatchFnFinal(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx, c.kind, scanProbeBase)
+				var body []byte
+				if cs.usesUnionScan(c.kind) {
+					// One pass over the start-anywhere automaton instead of
+					// the per-position bucket walk (plans/SETS.md §14 P5).
+					body = emitUnionScanBody(cs.unionScan, c.kind, cs.fullIDMask(), tableMemIdx)
+				} else {
+					body = emitSetMatchFnFinal(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx, c.kind, scanProbeBase)
+				}
 				cs_bytes = append(cs_bytes, body...)
 			}
 		}
@@ -1582,18 +1713,40 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		// Load 16-byte chunk from memory[0] (input)
 		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
 		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-		b = append(b, 0x22, lChunk)           // local.tee lChunk
 
-		// Compute bitmask: OR of bitmask(eq(chunk, splat(fb))) for each first byte.
-		b = append(b, 0x41, 0x00) // accumulator = 0
-		for _, fb := range cs.acFirstByteSet {
-			b = append(b, 0x20, lChunk)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(fb))
-			b = append(b, 0xFD, 0x0F) // i8x16.splat
-			b = append(b, 0xFD, 0x23) // i8x16.eq
-			b = append(b, 0xFD, 0x64) // i8x16.bitmask
-			b = append(b, 0x72)       // i32.or
+		// Candidate bitmask for this chunk, by one of two strategies.
+		//
+		// The compare chain below costs 4 SIMD ops PER DISTINCT FIRST BYTE
+		// per chunk, so it scales linearly in the size of the first-byte set:
+		// 36 distinct first bytes means ~144 ops to probe 16 input bytes,
+		// which is what made AC 7-10M fuel on the "diverse" shape against
+		// 0.4M on a shared-prefix one (plans/SETS.md §14.2). Shufti answers
+		// the same membership question in ~7 ops per 8 bytes of the SET —
+		// ~35 ops for those same 36 first bytes — because the set lives in
+		// nibble tables rather than in the instruction stream.
+		//
+		// Below the crossover the chain still wins: at 1-3 bytes it is 4-12
+		// ops against Shufti's ~7 plus its constant setup, and the chain
+		// needs no table constants. The cutoff mirrors aho-corasick's, which
+		// uses memchr/memchr2/memchr3 for 1-3 bytes and a different structure
+		// above (util/prefilter.rs). Sets at or below 3 first bytes therefore
+		// emit byte-identical code to before this split existed.
+		if len(cs.acFirstByteSet) > 3 {
+			b = append(b, 0x21, lChunk) // local.set lChunk
+			b = emitShuftiPrefixCheck(b, cs.acFirstByteSet, lChunk)
+		} else {
+			b = append(b, 0x22, lChunk) // local.tee lChunk
+			// Compute bitmask: OR of bitmask(eq(chunk, splat(fb))) for each first byte.
+			b = append(b, 0x41, 0x00) // accumulator = 0
+			for _, fb := range cs.acFirstByteSet {
+				b = append(b, 0x20, lChunk)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(fb))
+				b = append(b, 0xFD, 0x0F) // i8x16.splat
+				b = append(b, 0xFD, 0x23) // i8x16.eq
+				b = append(b, 0xFD, 0x64) // i8x16.bitmask
+				b = append(b, 0x72)       // i32.or
+			}
 		}
 		b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
 
@@ -1629,13 +1782,24 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x00) // ge_u → br 0 → exit $end_ac_pos
 	}
 
-	// lACState = goto_table[lACState * 512 + input[lPos] * 2] as u16
+	// lACState = goto_table[lACState * stride*2 + col(input[lPos]) * 2] as u16,
+	// where col is the byte itself, or its equivalence class when the table is
+	// byte-class compressed (one extra table load per input byte).
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, acL.gotoOff)
-	b = append(b, 0x20, lACState, 0x41, 0x09, 0x74, 0x6A) // + lACState * 512
-	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)         // pInPtr + lPos
-	b = append(b, 0x2D, 0x00, 0x00)                       // i32.load8_u 0 0 (input byte, memory 0)
-	b = append(b, 0x41, 0x01, 0x74, 0x6A)                 // * 2; add
+	b = append(b, 0x20, lACState, 0x41, byte(acL.strideShift), 0x74, 0x6A) // + lACState * stride*2
+	if acL.compressed {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, acL.classMapOff)
+		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A) // pInPtr + lPos
+		b = append(b, 0x2D, 0x00, 0x00)               // i32.load8_u (input byte, memory 0)
+		b = append(b, 0x6A)                           // classMapOff + byte
+		b = appendTableLoad8u(b, tableMemIdx)         // classMap[byte]
+	} else {
+		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A) // pInPtr + lPos
+		b = append(b, 0x2D, 0x00, 0x00)               // i32.load8_u 0 0 (input byte, memory 0)
+	}
+	b = append(b, 0x41, 0x01, 0x74, 0x6A) // * 2; add
 	b = appendTableLoad16u(b, tableMemIdx)
 	b = append(b, 0x21, lACState)
 
@@ -1841,7 +2005,7 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	// groupOffset is 0 for group A, 8 for group B.
 	// lLaneBitLocal is the local holding the lane bitmask for this group.
 	emitLitDispatch := func(b []byte, groupOffset int, lLaneBitLocal byte) []byte {
-		numInGroup := len(tt.LaneToID) - groupOffset
+		numInGroup := len(tt.LaneToIDs) - groupOffset
 		if numInGroup > 8 {
 			numInGroup = 8
 		}
@@ -1853,37 +2017,56 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 		b = append(b, 0x20, lLaneBitLocal, 0x20, lLaneBitLocal, 0x41, 0x01, 0x6B, 0x71, 0x21, lLaneBitLocal) // clear bit
 
 		for k := 0; k < numInGroup; k++ {
-			litID := tt.LaneToID[groupOffset+k]
-			litLen := cs.litLens[litID]
-			fullLit := litStr[litID]
+			lane := groupOffset + k
+			if lane >= len(tt.LaneToIDs) || len(tt.LaneToIDs[lane]) == 0 {
+				continue
+			}
 
 			b = append(b, 0x20, lLaneOff, 0x41)
 			b = utils.AppendSLEB128(b, int32(k))
 			b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
 
-			if litLen > tt.MinLen {
-				// Wrap in block so tail-verification can break out on mismatch.
-				b = append(b, 0x02, 0x40) // block $tail_ok
-				// Fit check: lMatchPos + litLen > pInLen → skip
-				b = append(b, 0x20, lMatchPos, 0x41)
-				b = utils.AppendSLEB128(b, int32(litLen))
-				b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00) // gt_u → br 0 ($tail_ok)
-				// Verify tail bytes MinLen..litLen-1
-				for j := tt.MinLen; j < litLen; j++ {
-					b = append(b, 0x20, pInPtr, 0x20, lMatchPos, 0x6A)
-					b = append(b, 0x2D, 0x00) // i32.load8_u align=0
-					b = utils.AppendULEB128(b, uint32(j))
-					b = append(b, 0x41)
-					b = utils.AppendSLEB128(b, int32(fullLit[j]))
-					b = append(b, 0x47, 0x0D, 0x00) // i32.ne; br_if 0 ($tail_ok)
+			// Every literal in the lane is checked. A lane bit means only
+			// "some member may start here": with one member that is exact on
+			// the probed bytes, but a bucketed lane's tables are ORs over its
+			// members, so the bit can survive a cross-product that matches no
+			// member at all — and, more importantly here, SEVERAL members can
+			// genuinely match the same position and every one of them owns
+			// patterns that must appear in the result bitmask. So this never
+			// stops at the first hit, unlike aho-corasick's verify_bucket,
+			// whose leftmost-first contract lets it return immediately.
+			for _, litID := range tt.LaneToIDs[lane] {
+				litLen := cs.litLens[litID]
+				fullLit := litStr[litID]
+				// Bucketed lanes must re-check the probe bytes too: the
+				// nibble tables no longer pin them for an individual member.
+				verifyFrom := tt.MinLen
+				if tt.Bucketed {
+					verifyFrom = 0
 				}
-				for _, bi := range cs.litToBuckets[litID] {
-					b = c.emitBucketAt(b, bi, litLen, lMatchPos)
-				}
-				b = append(b, 0x0B) // end block $tail_ok
-			} else {
-				for _, bi := range cs.litToBuckets[litID] {
-					b = c.emitBucketAt(b, bi, litLen, lMatchPos)
+				if verifyFrom < litLen {
+					// Wrap in block so verification can break out on mismatch.
+					b = append(b, 0x02, 0x40) // block $tail_ok
+					// Fit check: lMatchPos + litLen > pInLen → skip
+					b = append(b, 0x20, lMatchPos, 0x41)
+					b = utils.AppendSLEB128(b, int32(litLen))
+					b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00) // gt_u → br 0 ($tail_ok)
+					for j := verifyFrom; j < litLen; j++ {
+						b = append(b, 0x20, pInPtr, 0x20, lMatchPos, 0x6A)
+						b = append(b, 0x2D, 0x00) // i32.load8_u align=0
+						b = utils.AppendULEB128(b, uint32(j))
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(fullLit[j]))
+						b = append(b, 0x47, 0x0D, 0x00) // i32.ne; br_if 0 ($tail_ok)
+					}
+					for _, bi := range cs.litToBuckets[litID] {
+						b = c.emitBucketAt(b, bi, litLen, lMatchPos)
+					}
+					b = append(b, 0x0B) // end block $tail_ok
+				} else {
+					for _, bi := range cs.litToBuckets[litID] {
+						b = c.emitBucketAt(b, bi, litLen, lMatchPos)
+					}
 				}
 			}
 			b = append(b, 0x0B) // end if
@@ -2074,13 +2257,27 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	b = append(b, 0x20, lLaneMask, 0x20, lLaneMask, 0x41, 0x01, 0x6B, 0x71, 0x21, lLaneMask) // clear bit
 	b = append(b, 0x20, lPos, 0x20, lLaneOff, 0x6A, 0x21, lMatchPos)                         // lMatchPos = lPos + lLaneOff
 
-	// Group A dispatch
+	// Extract BOTH groups' lane bits before either is dispatched.
+	//
+	// emitExtractLane selects a byte of the candidate vector using lLaneOff,
+	// which at this point holds the position within the 16-byte chunk. But
+	// emitLitDispatch reuses lLaneOff as its own scratch (ctz of the lane
+	// bitmask), so running group A's dispatch first leaves a LANE INDEX
+	// there — and group B would then extract from the wrong chunk position
+	// and silently lose every literal in its lanes.
+	//
+	// The hazard predates bucketing: any set over 8 literals has two groups.
+	// It stayed invisible because with one literal per lane a group A
+	// candidate meant a true fingerprint match on all probed bytes, so the
+	// two groups rarely had candidates at the same position. Bucketed lanes
+	// OR several literals into one bit, group A candidates become common, and
+	// the clobber fires routinely (plans/SETS.md §14.11).
 	b = emitExtractLane(b, lCands, lLaneOff, lLaneBit)
-	b = emitLitDispatch(b, 0, lLaneBit)
-
-	// Group B dispatch (if TwoGroups)
 	if tt.TwoGroups {
 		b = emitExtractLane(b, lCandsB, lLaneOff, lLaneBitB)
+	}
+	b = emitLitDispatch(b, 0, lLaneBit)
+	if tt.TwoGroups {
 		b = emitLitDispatch(b, 8, lLaneBitB)
 	}
 

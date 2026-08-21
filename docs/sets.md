@@ -295,23 +295,47 @@ and per-set `frontend` (`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
 dropped for exceeding a fallback bucket's state budget — see
 [Bin-packing](#bin-packing-and-merge-constraints) above) arrays.
 
+If a set's frontend was **downgraded** from the one its literals selected, the
+per-set `frontend_demotion` object says so, with `from`, `to`, a machine-
+readable `reason`, and a `detail` object carrying the numbers behind the
+decision. This is worth checking whenever a set is slower than expected: the
+frontend is the difference between per-byte cost that is flat in set size and
+cost that grows with it, and a downgrade is otherwise invisible at runtime.
+
+```json
+"frontend_demotion": {
+  "from": "ac", "to": "scalar", "reason": "ac_table_over_budget",
+  "detail": {"literals": 400, "ac_nodes": 1600,
+             "table_bytes": 823296, "budget_bytes": 524288}
+}
+```
+
 ## Literal scan frontend
 
 | Condition | Frontend |
 |---|---|
 | 1–16 distinct literals | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch |
-| 17+ distinct literals | **Aho-Corasick** attempted first — byte-at-a-time, O(n) regardless of literal count |
-| (AC automaton exceeds 32 trie nodes) | **Scalar** — AC is capped by *automaton node count*, not literal count; a set of 17+ literals sharing no common prefixes can blow past 32 nodes and downgrade, while literals with heavy shared prefixes could in principle stay under the cap well past 32 |
+| 17+ distinct literals | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count, with a SIMD first-byte prefilter at the root state |
+| (AC tables exceed 512 KB) | **Scalar** — AC is capped by *table bytes*, not literal count. The budget holds ~1,000 trie nodes uncompressed, and no set of 128 literals tested so far comes close to it; literals sharing no common prefix consume nodes fastest, since each distinct first byte forks the trie at the root. A demotion is always reported in `--diag-json` as `frontend_demotion` |
 | No mandatory literal at all | **Scalar** |
 
 For 9–16 literals Teddy uses two groups of 8 (`TwoGroups=true`), ORing the
 results of two independent nibble probes per 16-byte chunk.
 
+Aho-Corasick's root-state prefilter skips ahead to the next position whose byte
+could begin some literal. With **1–3 distinct first bytes** it compares against
+each in turn; with **4 or more** it uses the same nibble-table membership test
+as Shufti below, whose cost depends on the size of the first-byte *set* rather
+than growing with every literal added.
+
 ### Shufti — SIMD first-byte prefilter for the scalar case
 
 When the frontend would otherwise be scalar (no mandatory literal, or AC
 downgraded per the table above), a fourth frontend — **Shufti** — is
-considered instead of going straight to scalar. It requires:
+considered instead of going straight to scalar. Note that since the AC budget
+became large enough to hold real automata, sets with literals reach AC rather
+than being downgraded into this path, so in practice Shufti now serves sets
+with **no mandatory literal**. It requires:
 
 - **zero fallback buckets** in the set (Shufti can't skip positions that a
   fallback bucket's full-pattern DFA still has to visit for correctness);

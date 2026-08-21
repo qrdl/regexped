@@ -478,6 +478,7 @@ type CompileSetOptions struct {
 	BudgetStates          int   // max DFA states per merged bucket; default 512
 	BudgetStatesPreFilter int   // pre-filter: suffixStates * combinedClassCount; default 65536
 	MaxFallbackStates     int   // max DFA states for a single-pattern fallback bucket; default 1024
+	ACBudgetBytes         int   // max Aho-Corasick table bytes for the whole set; default 524288
 	TableBase             int32 // byte offset where this set's DFA tables start in memory; default 0
 	TableMemIdx           int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
 	// LikelyMode is the resolved set-level LikelyMode hint: consumed by the
@@ -519,6 +520,27 @@ func (o CompileSetOptions) maxFallbackStates() int {
 		return o.MaxFallbackStates
 	}
 	return 1024
+}
+
+// acBudgetBytes is the ceiling on total Aho-Corasick table bytes for a set.
+//
+// It is deliberately much larger than budgetBytes(): that budget sizes ONE of
+// many per-bucket DFA tables, while this sizes the single table the whole set
+// shares. 512 KB covers every literal shape measured in plans/SETS.md §14.2 at
+// 128 literals with headroom — ~75 KB for a shared-prefix set, ~250 KB for the
+// expensive shape where every literal starts with a different byte — and keeps
+// the worst case well under the 1.5 MB a regex-automata module costs (§12.7),
+// so the size story survives even at the ceiling.
+//
+// Denominated in BYTES rather than nodes on purpose. Node count is a poor
+// proxy for cost and varies with prefix sharing by more than an order of
+// magnitude, which is exactly how the old 32-NODE cap came to bite at 17
+// literals for one shape and 26 for another (§14.1, sharpening 1).
+func (o CompileSetOptions) acBudgetBytes() int {
+	if o.ACBudgetBytes > 0 {
+		return o.ACBudgetBytes
+	}
+	return 512 * 1024
 }
 
 // combinedClassCount returns the number of byte equivalence classes produced
@@ -674,6 +696,46 @@ func buildUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uin
 	return union, patternBits
 }
 
+// buildStartAnywhereUnionProg wraps buildUnionProg's alternation in a
+// `(?s:.)*` prefix, turning the union into an automaton that can begin a match
+// at ANY position rather than only at the one it was started from.
+//
+// This is what lets the scan trio answer "does pattern k match somewhere?" in
+// a single left-to-right pass. Without it a set with no mandatory literal has
+// to restart every bucket's automaton at every position, which is quadratic on
+// unbounded patterns: `[^\n]*ERROR` re-scans to end of line from each of
+// 100,000 positions, and that is the 151M-fuel greedy-3 row (plans/SETS.md
+// §14.12).
+//
+// Two instructions are appended:
+//
+//	dotAlt: Alt(Out: <union alternation>, Arg: dotAny)
+//	dotAny: RuneAny(Out: dotAlt)
+//
+// and Start becomes dotAlt. Because the DFA is built with leftmostFirst=false,
+// the epsilon closure keeps BOTH arms live, so at every input position the set
+// of live NFA threads includes a fresh start of every pattern. The returned
+// patternBits are buildUnionProg's, extended with zeroes for the two new
+// instructions — they belong to no pattern and must never contribute an
+// accept bit.
+//
+// The prefix is deliberately `(?s:.)` (InstRuneAny, newline included): the
+// question is whether a match exists anywhere in the input, which does not
+// stop at line boundaries. Per-pattern `(?m:^)`/`(?m:$)` semantics are a
+// different matter and are excluded by the caller (§14.12).
+func buildStartAnywhereUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uint64) {
+	union, patternBits := buildUnionProg(progs, bitmaskWidth)
+	n := len(union.Inst)
+	dotAlt, dotAny := n, n+1
+	union.Inst = append(union.Inst,
+		syntax.Inst{Op: syntax.InstAlt, Out: uint32(union.Start), Arg: uint32(dotAny)},
+		syntax.Inst{Op: syntax.InstRuneAny, Out: uint32(dotAlt)},
+	)
+	patternBits = append(patternBits, 0, 0)
+	union.Start = dotAlt
+	return union, patternBits
+}
+
 // --------------------------------------------------------------------------
 // Phase 4a: multi-pattern Teddy + frontend strategy selection
 
@@ -682,7 +744,7 @@ type frontendKind int
 
 const (
 	frontendTeddy  frontendKind = iota // 1–16 literals, any length (>4 bytes: probe first 4, verify rest)
-	frontendAC                         // 17–32 literals → Aho-Corasick (capped at 32 nodes)
+	frontendAC                         // >16 literals → Aho-Corasick (capped by acBudgetBytes)
 	frontendScalar                     // fallback: byte-by-byte scan
 	// frontendShufti: SIMD first-byte pre-filter wrapping the scalar
 	// per-position bucket check. Picked when:
@@ -724,20 +786,138 @@ type teddyTables struct {
 	BT2Lo, BT2Hi [16]byte
 	BT3Lo, BT3Hi [16]byte
 
-	MinLen    int   // min(litLen, 4) across all literals — how many bytes Teddy probes
-	TwoByte   bool  // T1 tables valid (all literals ≥ 2 bytes)
-	ThreeByte bool  // T2 tables valid (all literals ≥ 3 bytes)
-	FourByte  bool  // T3 tables valid (all literals ≥ 4 bytes)
-	TwoGroups bool  // true when len(LaneToID) > 8
-	LaneToID  []int // LaneToID[k] = global literal index for lane k (0-based within its group)
+	MinLen    int  // min(litLen, 4) across all literals — how many bytes Teddy probes
+	TwoByte   bool // T1 tables valid (all literals ≥ 2 bytes)
+	ThreeByte bool // T2 tables valid (all literals ≥ 3 bytes)
+	FourByte  bool // T3 tables valid (all literals ≥ 4 bytes)
+	TwoGroups bool // true when lanes 8..15 are in use
+
+	// LaneToIDs[k] lists the literals assigned to lane k. Up to 16 lanes
+	// (two groups of 8); a lane bit in the Teddy candidate mask means "some
+	// literal of this lane may start here".
+	//
+	// At or below 16 literals each lane holds exactly one literal, and the
+	// assignment is the identity — lane k is literal k — which is what the
+	// pre-bucketing implementation did, so those sets emit unchanged code.
+	// Above 16, several literals share a lane and Bucketed is set.
+	LaneToIDs [][]int
+
+	// Bucketed reports that some lane holds more than one literal, so a
+	// surviving lane bit no longer identifies a literal and every member must
+	// be byte-verified from offset 0. See buildTeddyTablesMulti.
+	Bucketed bool
 }
 
-// buildTeddyTablesMulti builds nibble tables for up to 16 literals of any length.
-// Literals longer than 4 bytes are probed on their first 4 bytes; the caller
-// must verify the remaining bytes after a Teddy hit.
-// Returns (nil, false) only when len(literals) == 0, > 16, or any literal is empty.
+// teddyMaxLiterals is the most literals a bucketed Teddy will accept.
+//
+// 64 matches aho-corasick's packed Teddy, which takes up to 64 literals when
+// the shortest is ≥2 bytes and 16 when it is 1 byte (packed/teddy/builder.rs).
+// Hyperscan's equivalent limit is its TEDDY_BUCKET_LOAD of 6 literals per
+// bucket over 8 buckets, i.e. 48. The binding constraint is verification cost:
+// a lane bit only says "some literal in this lane may start here", so every
+// member of a hit lane is byte-compared, and lanes grow as literals do.
+const teddyMaxLiterals = 64
+
+// teddySingleByteMax is the cap when the shortest literal is one byte. A
+// 1-byte fingerprint cannot discriminate, so lane hits become frequent and
+// verification dominates; aho-corasick draws the same line at 16.
+const teddySingleByteMax = 16
+
+// teddyMinLenForBucketing is the shortest literal a bucketed Teddy will accept.
+// Below 2 bytes the fingerprint is one nibble pair and lane hits are constant,
+// so the AC automaton is the better structure however many literals there are.
+const teddyMinLenForBucketing = 2
+
+// teddyFirstByteCrossover is the number of DISTINCT FIRST BYTES at which
+// bucketed Teddy overtakes Aho-Corasick above 16 literals.
+//
+// Measured, not assumed (plans/SETS.md §14.11): at 32 literals over a 100KB
+// no-match corpus, AC leads 419K to 669K fuel at one distinct first byte, is
+// level at two and three, and falls behind from four onward — 1.19x at four,
+// 2.56x at eight, 6.32x at thirty-two — while Teddy stays flat at ~1.04M
+// regardless.
+//
+// It is the same boundary emitSetMatchFnFinalAC uses to switch its prefilter
+// from a compare chain to Shufti, and for the same underlying reason: at four
+// or more first bytes AC can no longer answer "could a literal start here?"
+// with a couple of compares, and its ability to skip input degrades from
+// there.
+const teddyFirstByteCrossover = 4
+
+// assignTeddyLanes maps each literal to one of 8 or 16 Teddy lanes.
+//
+// At or below 16 literals the mapping is the identity, preserving the exact
+// lane layout (and therefore the exact emitted code) of every set that
+// compiled before bucketing existed.
+//
+// Above 16, literals are grouped by the low nybbles of their probe bytes —
+// the same key aho-corasick's Teddy groups on (packed/teddy/generic.rs) —
+// so members of a lane agree on every T*Lo entry and only the T*Hi tables can
+// produce cross-product false positives. Distinct keys are then handed to the
+// least-loaded lane, which bounds the verification work a single lane hit can
+// trigger; aho-corasick instead assigns `(BUCKETS-1) - id%BUCKETS`, which it
+// needs because its verifier stops at the first match and must not let lane
+// order imply match priority. We verify every member of a hit lane, so match
+// semantics do not depend on lane order and balance is the only concern.
+func assignTeddyLanes(literals [][]byte, minProbe int) []int {
+	lanes := make([]int, len(literals))
+	if len(literals) <= 16 {
+		for i := range lanes {
+			lanes[i] = i
+		}
+		return lanes
+	}
+	const numLanes = 16
+	load := make([]int, numLanes)
+	keyLane := make(map[string]int, len(literals))
+	for i, lit := range literals {
+		n := minProbe
+		if n > len(lit) {
+			n = len(lit)
+		}
+		var kb [4]byte
+		for j := 0; j < n; j++ {
+			kb[j] = lit[j] & 0x0F
+		}
+		key := string(kb[:n])
+		lane, ok := keyLane[key]
+		if !ok {
+			lane = 0
+			for l := 1; l < numLanes; l++ {
+				if load[l] < load[lane] {
+					lane = l
+				}
+			}
+			keyLane[key] = lane
+		}
+		lanes[i] = lane
+		load[lane]++
+	}
+	return lanes
+}
+
+// buildTeddyTablesMulti builds nibble tables for up to teddyMaxLiterals
+// literals of any length. Literals longer than 4 bytes are probed on their
+// first 4 bytes; the caller must verify the remaining bytes after a hit.
+//
+// Up to 16 literals get one lane each (lane k = literal k), and a surviving
+// lane bit therefore identifies a literal exactly on the probed bytes.
+//
+// Above 16 the literals are BUCKETED into the 16 lanes, which is what lifts
+// the old hard ceiling. Literals sharing the low nybbles of their probe bytes
+// are placed in the same lane, so that lane's T*Lo tables stay exact for its
+// members; remaining lanes are handed out least-loaded-first to keep
+// verification cost even. A shared lane costs precision: the tables are ORs
+// over the lane's members, so bit k survives when SOME member matches the low
+// nybble at each position and SOME (possibly different) member matches the
+// high nybble — a cross-product false positive. Callers must therefore verify
+// a bucketed hit from byte 0, not from MinLen (t.Bucketed says which).
+//
+// Returns (nil, false) when the set is empty, over the cap, or contains an
+// empty literal. chooseLiteralFrontend applies the same conditions, so a
+// caller that trusts it will not see false.
 func buildTeddyTablesMulti(literals [][]byte) (*teddyTables, bool) {
-	if len(literals) == 0 || len(literals) > 16 {
+	if len(literals) == 0 || len(literals) > teddyMaxLiterals {
 		return nil, false
 	}
 	for _, lit := range literals {
@@ -746,10 +926,8 @@ func buildTeddyTablesMulti(literals [][]byte) (*teddyTables, bool) {
 		}
 	}
 
-	t := &teddyTables{LaneToID: make([]int, len(literals)), TwoGroups: len(literals) > 8}
 	minProbe := 4
-	for i, lit := range literals {
-		t.LaneToID[i] = i
+	for _, lit := range literals {
 		pl := len(lit)
 		if pl > 4 {
 			pl = 4
@@ -758,15 +936,38 @@ func buildTeddyTablesMulti(literals [][]byte) (*teddyTables, bool) {
 			minProbe = pl
 		}
 	}
+	if minProbe < 2 && len(literals) > teddySingleByteMax {
+		return nil, false
+	}
+
+	t := &teddyTables{}
 	t.MinLen = minProbe
 	t.TwoByte = minProbe >= 2
 	t.ThreeByte = minProbe >= 3
 	t.FourByte = minProbe >= 4
 
+	litLane := assignTeddyLanes(literals, minProbe)
+	numLanes := 8
+	for _, lane := range litLane {
+		if lane >= 8 {
+			numLanes = 16
+			break
+		}
+	}
+	t.TwoGroups = numLanes > 8
+	t.LaneToIDs = make([][]int, numLanes)
+	for litIdx, lane := range litLane {
+		t.LaneToIDs[lane] = append(t.LaneToIDs[lane], litIdx)
+		if len(t.LaneToIDs[lane]) > 1 {
+			t.Bucketed = true
+		}
+	}
+
 	for litIdx, lit := range literals {
-		k := litIdx % 8
+		lane := litLane[litIdx]
+		k := lane % 8
 		bit := byte(1 << uint(k))
-		if litIdx < 8 {
+		if lane < 8 {
 			// Group A
 			t.T0Lo[lit[0]&0x0F] |= bit
 			t.T0Hi[lit[0]>>4] |= bit
@@ -872,17 +1073,42 @@ func litUnionFirstBytes(lits [][]byte) []byte {
 // chooseLiteralFrontend selects the scan strategy for a set of mandatory literals.
 // Teddy is used for ≤16 non-empty literals of any length (literals >4 bytes use
 // their first 4 bytes as the probe; the dispatch verifies remaining bytes).
-// AC is used for 17-32 unique literals (capped at 32 AC nodes). Scalar otherwise.
+// AC is used above 16 literals; CompileSet demotes it to scalar if the
+// automaton's tables exceed acBudgetBytes, recording that in SetDiag.
 func chooseLiteralFrontend(literals [][]byte) frontendKind {
 	if len(literals) == 0 {
 		return frontendScalar
 	}
+	minLen := 1 << 30
+	var firstBytes [256]bool
+	distinctFirst := 0
 	for _, lit := range literals {
 		if len(lit) == 0 {
 			return frontendScalar // empty literal → scalar
 		}
+		if len(lit) < minLen {
+			minLen = len(lit)
+		}
+		if !firstBytes[lit[0]] {
+			firstBytes[lit[0]] = true
+			distinctFirst++
+		}
 	}
 	if len(literals) <= 16 {
+		return frontendTeddy
+	}
+	// Above 16, Teddy buckets several literals per lane (§14 P4) and both
+	// frontends are viable. Which wins is decided by FIRST-BYTE DIVERSITY,
+	// not by literal count: AC's speed comes from a root-state prefilter that
+	// skips input, and its selectivity decays as more bytes can start a
+	// literal, while Teddy probes 2-4 bytes at a fixed cost per chunk and is
+	// flat in both literal count and first-byte count.
+	//
+	// Measured at 32 literals on a 100KB no-match corpus (§14.11), AC is
+	// ahead at 1 distinct first byte (419K vs 669K), level at 2-3, and behind
+	// from 4 onward, by 1.19x at 4 bytes widening to 6.3x at 32.
+	if len(literals) <= teddyMaxLiterals && minLen >= teddyMinLenForBucketing &&
+		distinctFirst >= teddyFirstByteCrossover {
 		return frontendTeddy
 	}
 	return frontendAC
