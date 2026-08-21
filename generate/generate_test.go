@@ -821,8 +821,10 @@ func TestGenRustSetInner(t *testing.T) {
 	required := []string{
 		"SetMatch",
 		"range(self)",
-		"SCANNER_PATTERN_COUNT",               // D16: the emitted constant
-		"gates: [u32; SCANNER_PATTERN_COUNT]", // D14/D15: the iterator owns the gates
+		"SCANNER_PATTERN_COUNT",                  // D16: the emitted constant
+		"SCANNER_ID_SPACE",                       // §11 R1: the id-space constant
+		"buf: [[i32; 3]; SCANNER_PATTERN_COUNT]", // tuples: at most one per pattern per position
+		"gates: [u32; SCANNER_ID_SPACE]",         // D14/D15 + §11 R1: indexed by pattern id
 		"set_find", "probe_any", "probe_all", "probe",
 		"validate", "validate_any", "validate_all",
 		"pattern_name",

@@ -149,43 +149,16 @@ func dfaTableEqual(a, b *dfaTable) bool {
 		eqMaps(a.immediateAcceptStates, b.immediateAcceptStates)
 }
 
-// hasBeginAnchor reports whether re contains a BeginText or BeginLine assertion.
+// hasBeginAnchor reports whether re contains a BeginText or BeginLine
+// assertion anywhere, however deeply nested. Expressed through containsOp so
+// the two AST walks cannot drift apart.
+//
+// Note what this does NOT mean: an anchor nested inside *, ? or an alternation
+// does not restrict where the pattern can match. Use setTopLevelAnchor when
+// deciding eligibility masks; this is for "does the assertion appear at all",
+// e.g. rejecting a begin anchor inside a split suffix.
 func hasBeginAnchor(re *syntax.Regexp) bool {
-	if re == nil {
-		return false
-	}
-	switch re.Op {
-	case syntax.OpBeginText, syntax.OpBeginLine:
-		return true
-	}
-	for _, sub := range re.Sub {
-		if hasBeginAnchor(sub) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasBeginAnchorAtTopLevel reports whether the mandatory start of re is a
-// BeginText or BeginLine assertion — i.e. the anchor is NOT inside *, ?, +,
-// or alternation, so the pattern is truly restricted to position 0.
-func hasBeginAnchorAtTopLevel(re *syntax.Regexp) bool {
-	if re == nil {
-		return false
-	}
-	switch re.Op {
-	case syntax.OpBeginText, syntax.OpBeginLine:
-		return true
-	case syntax.OpConcat:
-		if len(re.Sub) > 0 {
-			return hasBeginAnchorAtTopLevel(re.Sub[0])
-		}
-	case syntax.OpCapture:
-		if len(re.Sub) > 0 {
-			return hasBeginAnchorAtTopLevel(re.Sub[0])
-		}
-	}
-	return false
+	return containsOp(re, syntax.OpBeginText) || containsOp(re, syntax.OpBeginLine)
 }
 
 // beginAnchorKind classifies a begin anchor for set eligibility masking.
@@ -327,7 +300,14 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		if compErr == nil && hasNonGreedyQuantifiers(prog) {
 			info.splittable = false
 			info.isolatedFallback = true
-			info.startAnchor = hasBeginAnchor(parsed)
+			// setTopLevelAnchor, not hasBeginAnchor: the eligibility mask is a
+			// pre-filter over a fallback DFA that already models the assertion,
+			// so it must never be STRICTER than the pattern. hasBeginAnchor is
+			// the anywhere-in-the-tree scan — it fires for anchors nested in
+			// *, ?, or an alternation (which restrict nothing) and collapses
+			// (?m:^) to "position 0 only", which is B43. This site was missed
+			// when the others were converted (plans/SETS.md §11 R3).
+			info.setTopLevelAnchor(parsed)
 			// suffixDFA is built later by compileFallback via mergeSuffixDFA.
 			return info, nil
 		}
@@ -1388,6 +1368,14 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 	for _, p := range patterns {
 		ast := patternFullAST(p)
 		if ast == nil {
+			// Defensive — analyzePattern parsed this once already — but a bare
+			// `continue` would drop the pattern from the anchored trio while
+			// `find` kept it, with nothing in --diag-json to explain the
+			// disagreement (plans/SETS.md §11 R9).
+			warnPatternDropped(p, "anchored bucket (unparseable)", 0, 0)
+			if diag != nil {
+				diag.UnparseableDropped = append(diag.UnparseableDropped, patternRefFor(p))
+			}
 			continue
 		}
 		placed := false

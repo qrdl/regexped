@@ -62,9 +62,12 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := pascalSet(s.Name) + "PatternCount"
+		idN := idSpaceSize(s, cfg)
+		idKonst := pascalSet(s.Name) + "IDSpace"
 		wide := wideAllForm(s, cfg)
 
-		fmt.Fprintf(&out, "// %s is the number of patterns in set %q. Every buffer below is sized from it.\nconst %s = %d\n\n", konst, s.Name, konst, n)
+		fmt.Fprintf(&out, "// %s is the number of patterns in set %q. It sizes the match buffer:\n// Find can report at most this many matches at one position.\nconst %s = %d\n\n", konst, s.Name, konst, n)
+		fmt.Fprintf(&out, "// %s is one past the largest pattern id set %q can report. Pattern ids\n// are global indices into regexps:, so a set holding a few late-declared\n// patterns has a small count and a large id space. Everything indexed BY an\n// id \u2014 the gate array, the _all bitmask \u2014 is sized from this.\nconst %s = %d\n\n", idKonst, s.Name, idKonst, idN)
 
 		imp := func(name, sig string) {
 			fmt.Fprintf(&out, "//go:wasmimport %s %s\n//go:noescape\nfunc ffi_%s%s\n\n", cfg.ImportModule, name, name, sig)
@@ -109,7 +112,7 @@ func %s(input []byte) []int {
 	return out
 }
 
-`, pub, pub, konst, s.MatchAll, konst)
+`, pub, pub, idKonst, s.MatchAll, idKonst)
 			} else {
 				imp(s.MatchAll, "("+inArgs+") int64")
 				fmt.Fprintf(&out, `// %s returns the ids of every pattern matching the whole input.
@@ -122,7 +125,7 @@ func %s(input []byte) []int {
 	return out
 }
 
-`, pub, pub, s.MatchAll, konst)
+`, pub, pub, s.MatchAll, idKonst)
 			}
 		}
 		if s.Scan != "" {
@@ -164,7 +167,7 @@ func %s(input []byte, from int) []int {
 	return out
 }
 
-`, pub, pub, konst, s.ScanAll, konst)
+`, pub, pub, idKonst, s.ScanAll, idKonst)
 			} else {
 				imp(s.ScanAll, "("+inArgs+", from int32) int64")
 				fmt.Fprintf(&out, `// %s returns the ids of every pattern matching somewhere at or after from.
@@ -177,7 +180,7 @@ func %s(input []byte, from int) []int {
 	return out
 }
 
-`, pub, pub, s.ScanAll, konst)
+`, pub, pub, s.ScanAll, idKonst)
 			}
 		}
 		if s.Find != "" {
@@ -186,7 +189,7 @@ func %s(input []byte, from int) []int {
 			gateDecl, gateArg, gateDoc := "", "", ""
 			if gatedFind(s) {
 				imp(s.Find, "("+inArgs+", from int32, gatePtr unsafe.Pointer, outPtr unsafe.Pointer, outCap int32) int32")
-				gateDecl = "\t\tgates := make([]uint32, " + konst + ")\n"
+				gateDecl = "\t\tgates := make([]uint32, " + idKonst + ")\n"
 				gateArg = "unsafe.Pointer(&gates[0]), "
 				gateDoc = " and a zeroed gate array"
 			} else {

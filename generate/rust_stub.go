@@ -59,9 +59,12 @@ impl SetMatch {
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
+		idN := idSpaceSize(s, cfg)
+		idKonst := screamingCase(s.Name) + "_ID_SPACE"
 		wide := wideAllForm(s, cfg)
 
-		fmt.Fprintf(&out, "/// Number of patterns in set %q. Every buffer below is sized from it.\npub const %s: usize = %d;\n\n", s.Name, konst, n)
+		fmt.Fprintf(&out, "/// Number of patterns in set %q. Sizes the match buffer: `find` can\n/// report at most this many matches at one position.\npub const %s: usize = %d;\n\n", s.Name, konst, n)
+		fmt.Fprintf(&out, "/// One past the largest pattern id set %q can report. Pattern ids are\n/// global indices into `regexps:`, so a set holding a few late-declared\n/// patterns has a small count and a large id space. Everything indexed BY an\n/// id — the gate array, the `_all` bitmask — is sized from this.\npub const %s: usize = %d;\n\n", s.Name, idKonst, idN)
 
 		fmt.Fprintf(&out, "#[link(wasm_import_module = %q)]\nunsafe extern \"C\" {\n", cfg.ImportModule)
 		decl := func(name, sig string) {
@@ -132,13 +135,13 @@ pub fn %s(input: &[u8]) -> Option<usize> {
     out
 }
 
-`, konst, s.MatchAll, konst)
+`, idKonst, s.MatchAll, idKonst)
 			} else {
 				fmt.Fprintf(&out, `    let mask = unsafe { ffi_%s(input.as_ptr(), input.len() as i32) } as u64;
     (0..%s).filter(|k| mask & (1u64 << k) != 0).collect()
 }
 
-`, s.MatchAll, konst)
+`, s.MatchAll, idKonst)
 			}
 		}
 		if s.Scan != "" {
@@ -174,21 +177,21 @@ pub fn %s(input: &[u8]) -> Option<usize> {
     out
 }
 
-`, konst, s.ScanAll, konst)
+`, idKonst, s.ScanAll, idKonst)
 			} else {
 				fmt.Fprintf(&out, `    let mask = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, from as i32) } as u64;
     (0..%s).filter(|k| mask & (1u64 << k) != 0).collect()
 }
 
-`, s.ScanAll, konst)
+`, s.ScanAll, idKonst)
 			}
 		}
 		if s.Find != "" {
 			iterName := iterTypeName(s.Find)
 			gateField, gateInit, gateArg, gateDoc := "", "", "", ""
 			if gatedFind(s) {
-				gateField = "    gates: [u32; " + konst + "],\n"
-				gateInit = " gates: [0u32; " + konst + "],"
+				gateField = "    gates: [u32; " + idKonst + "],\n"
+				gateInit = " gates: [0u32; " + idKonst + "],"
 				gateArg = "self.gates.as_mut_ptr(), "
 				gateDoc = " and a zeroed gate array"
 			}

@@ -360,6 +360,23 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	}, nil
 }
 
+// zeroBitmap clears the >64-pattern bitmap before a wide `_all` call.
+//
+// The wide body only ORs hit bits in and counts 0->1 transitions, so it
+// REQUIRES an all-zero bitmap on entry — every generated stub zeroes one
+// (Rust [0u8; N], JS .fill(0), Go a fresh slice, C = {0}). Measuring without
+// zeroing meant the warm-up call set every bit and each measured call then
+// skipped the store-and-count branch for every already-set pattern, so the
+// recorded fuel described a code path no real caller executes
+// (plans/SETS.md §11 R7).
+func (r *rxInstance) zeroBitmap() {
+	buf := r.mem.UnsafeData(r.store)
+	n := (r.npat + 7) / 8
+	for i := int32(0); i < n; i++ {
+		buf[r.bitmapPt+i] = 0
+	}
+}
+
 // call runs one whole-input operation for the given capability, exactly as a
 // caller would: the `_all` pair once, the boolean and `_any` pair once, and
 // `find` driven to exhaustion.
@@ -374,6 +391,7 @@ func (r *rxInstance) call(c capability, wide bool) error {
 		return err
 	case capMatchAll:
 		if wide {
+			r.zeroBitmap()
 			_, err := fn.Call(r.store, r.inBase, r.inLen, r.bitmapPt)
 			return err
 		}
@@ -384,6 +402,7 @@ func (r *rxInstance) call(c capability, wide bool) error {
 		return err
 	case capScanAll:
 		if wide {
+			r.zeroBitmap()
 			_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0), r.bitmapPt)
 			return err
 		}

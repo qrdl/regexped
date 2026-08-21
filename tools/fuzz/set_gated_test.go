@@ -7,6 +7,7 @@ import (
 	"sort"
 	"testing"
 
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -363,5 +364,105 @@ func TestGatedLadder(t *testing.T) {
 			t.Fatalf("n=%d: expected 0..%d, got %+v", n, n, run.matches[0])
 		}
 		t.Logf("n=%-5d calls=%d matches=%d", n, len(run.batches), len(run.matches))
+	}
+}
+
+// TestGatedLadderFuel is the complexity assertion TestGatedLadder above is
+// NOT — and the omission mattered.
+//
+// TestGatedLadder counts calls and matches, both of which are 1 at every n, so
+// it read as "linear, as predicted" (§10.5) while the gated body was in fact
+// still quadratic in WORK: §3.14's mask skip and jump were never emitted, so
+// the terminating call ran each suffix DFA to its full extent at every gated
+// position — 7.8M fuel at n=500 rising x4 per doubling to 1.98B at n=8000
+// (plans/SETS.md §11 R5).
+//
+// The lesson generalised in R-TESTS(3): when the CLAIM is a complexity bound,
+// the test has to measure work, not iterations. Fuel is deterministic, so this
+// is an exact assertion rather than a timing heuristic.
+func TestGatedLadderFuel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("ladder measurement")
+	}
+	cfg := wasmtime.NewConfig()
+	cfg.SetConsumeFuel(true)
+	engine := wasmtime.NewEngineWithConfig(cfg)
+
+	w, err := compileGatedSet([]string{`a+`})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	mod, err := wasmtime.NewModule(engine, w)
+	if err != nil {
+		t.Fatalf("module: %v", err)
+	}
+
+	fuelAt := func(n int) uint64 {
+		store := wasmtime.NewStore(engine)
+		if err := store.SetFuel(1 << 42); err != nil {
+			t.Fatalf("set fuel: %v", err)
+		}
+		inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+		if err != nil {
+			t.Fatalf("instantiate: %v", err)
+		}
+		mem := inst.GetExport(store, "memory").Memory()
+		const pageSize = 65536
+		inBase := int32(1 << 20)
+		gatePtr := inBase + int32((n/pageSize+2)*pageSize)
+		outPtr := gatePtr + pageSize
+		need := uint64((int64(outPtr) + 2*pageSize) / pageSize)
+		if cur := mem.Size(store); need > cur {
+			if _, err := mem.Grow(store, need-cur); err != nil {
+				t.Fatalf("grow: %v", err)
+			}
+		}
+		buf := mem.UnsafeData(store)
+		for i := 0; i < n; i++ {
+			buf[int(inBase)+i] = 'a'
+		}
+		for i := int32(0); i < 4; i++ {
+			buf[gatePtr+i] = 0
+		}
+		fn := inst.GetFunc(store, "gated_find")
+		var total uint64
+		from := int32(0)
+		for {
+			before, _ := store.GetFuel()
+			res, err := fn.Call(store, inBase, int32(n), from, gatePtr, outPtr, int32(1))
+			if err != nil {
+				t.Fatalf("gated_find: %v", err)
+			}
+			after, _ := store.GetFuel()
+			total += before - after
+			got := int(res.(int32))
+			if got <= 0 {
+				break
+			}
+			buf = mem.UnsafeData(store)
+			from = le32(buf[int(outPtr)+4:]) + 1
+		}
+		return total
+	}
+
+	prev := uint64(0)
+	prevN := 0
+	for _, n := range []int{500, 1000, 2000, 4000, 8000} {
+		f := fuelAt(n)
+		if prev != 0 {
+			// Linear would be x2 per doubling; quadratic x4. Assert well below
+			// the quadratic line so this catches a regression without being
+			// brittle about the exact constant.
+			ratio := float64(f) / float64(prev)
+			t.Logf("n=%-5d fuel=%-12d ratio vs n=%d: %.2fx", n, f, prevN, ratio)
+			if ratio > 3.0 {
+				t.Errorf("fuel grew %.2fx from n=%d to n=%d — that is the quadratic "+
+					"behaviour §3.14's mask skip and jump exist to remove "+
+					"(plans/SETS.md §11 R5)", ratio, prevN, n)
+			}
+		} else {
+			t.Logf("n=%-5d fuel=%d", n, f)
+		}
+		prev, prevN = f, n
 	}
 }

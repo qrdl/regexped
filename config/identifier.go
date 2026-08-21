@@ -294,8 +294,15 @@ var jsHelperNames = []string{
 	"_patternNames", "patternName",
 }
 
-// tsHelperNames is jsHelperNames plus the TS-only exported interface.
-var tsHelperNames = append(append([]string(nil), jsHelperNames...), "SetMatch")
+// tsHelperNames is jsHelperNames plus the TS-only exported interfaces.
+var tsHelperNames = append(append([]string(nil), jsHelperNames...), "SetMatch", "SetAnchor")
+
+// asHelperNames are the module-scope names the AssemblyScript generator emits
+// itself. It declares both classes unconditionally whenever a set exists, and
+// nothing checked them before (plans/SETS.md §11 R14): a user export named
+// SetMatch produced a file with both `class SetMatch` and
+// `export function SetMatch`, which asc rejects with no diagnostic from us.
+var asHelperNames = []string{"SetMatch", "SetAnchor"}
 
 // goTransformedReserved are Pascal-case names the Go generator emits itself,
 // compared against goPublicName(exportName). "SetMatch" is the struct
@@ -464,7 +471,7 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 	refs := allExportRefs(cfg)
 
 	// (1) Collisions with names the JS/TS generator emits for itself.
-	if helpers := map[string][]string{"js": jsHelperNames, "ts": tsHelperNames}[stubType]; helpers != nil {
+	if helpers := map[string][]string{"js": jsHelperNames, "ts": tsHelperNames, "as": asHelperNames}[stubType]; helpers != nil {
 		deny := map[string]bool{}
 		for _, h := range helpers {
 			deny[h] = true

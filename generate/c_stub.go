@@ -114,9 +114,12 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
+		idN := idSpaceSize(s, cfg)
+		idKonst := screamingCase(s.Name) + "_ID_SPACE"
 		wide := wideAllForm(s, cfg)
 
-		fmt.Fprintf(&hb, "/* Number of patterns in set %q. Every array below is sized from it. */\n#define %s %d\n\n", s.Name, konst, n)
+		fmt.Fprintf(&hb, "/* Number of patterns in set %q. Sizes the match buffer: the scanner can\n   receive at most this many matches at one position. */\n#define %s %d\n\n", s.Name, konst, n)
+		fmt.Fprintf(&hb, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id \u2014 the gate\n   array, the _all bitmap, and the out_ids array you pass to the _all calls \u2014\n   is sized from this. */\n#define %s %d\n\n", s.Name, idKonst, idN)
 
 		imp := func(name, sig string) {
 			fmt.Fprintf(&hb, "__attribute__((import_module(%q), import_name(%q)))\n%s\n", cfg.ImportModule, name, sig)
@@ -139,7 +142,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			} else {
 				imp(s.MatchAll, fmt.Sprintf("long long ffi_%s(const char *ptr, int len);", s.MatchAll))
 			}
-			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into out_ids (caller array of\n   %s ints) and returns how many. */\nint %s(const char *input, int len, int *out_ids);\n\n", konst, s.MatchAll)
+			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into out_ids (caller array of\n   %s ints) and returns how many. */\nint %s(const char *input, int len, int *out_ids);\n\n", idKonst, s.MatchAll)
 			if wide {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int *out_ids) {
     unsigned char bits[(%[2]s + 7) / 8] = {0};
@@ -148,7 +151,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
     for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) out_ids[c++] = k;
     return c;
 }
-`, s.MatchAll, konst)
+`, s.MatchAll, idKonst)
 			} else {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int *out_ids) {
     unsigned long long mask = (unsigned long long)ffi_%[1]s(input, len);
@@ -182,7 +185,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			} else {
 				imp(s.ScanAll, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, int from);", s.ScanAll))
 			}
-			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into out_ids (caller array of\n   %s ints) and returns how many. */\nint %s(const char *input, int len, int from, int *out_ids);\n\n", konst, s.ScanAll)
+			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into out_ids (caller array of\n   %s ints) and returns how many. */\nint %s(const char *input, int len, int from, int *out_ids);\n\n", idKonst, s.ScanAll)
 			if wide {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int from, int *out_ids) {
     unsigned char bits[(%[2]s + 7) / 8] = {0};
@@ -191,7 +194,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
     for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) out_ids[c++] = k;
     return c;
 }
-`, s.ScanAll, konst)
+`, s.ScanAll, idKonst)
 			} else {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int from, int *out_ids) {
     unsigned long long mask = (unsigned long long)ffi_%[1]s(input, len, from);
@@ -207,8 +210,8 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			gateField, gateInit, gateArg := "", "", ""
 			if gatedFind(s) {
 				imp(s.Find, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, unsigned *gates, int *out, int cap);", s.Find))
-				gateField = fmt.Sprintf("    unsigned gates[%s];\n", konst)
-				gateInit = fmt.Sprintf("    for (int k = 0; k < %s; k++) s->gates[k] = 0;\n", konst)
+				gateField = fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
+				gateInit = fmt.Sprintf("    for (int k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
 				gateArg = "s->gates, "
 			} else {
 				imp(s.Find, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, int *out, int cap);", s.Find))

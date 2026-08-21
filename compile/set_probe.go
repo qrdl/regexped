@@ -53,44 +53,12 @@ func buildSetProbeBody(p setSuffixParams, anchored bool) []byte {
 	var b []byte
 	b = append(b, 0x01, 0x04, 0x7F) // 4 x i32 locals
 
-	// Entry state, keyed on paramStart — same rule as buildSetSuffixBody.
-	b = append(b, 0x20, paramStart)
-	b = append(b, 0x45)
-	b = append(b, 0x04, 0x7F)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(p.wasmStart))
-	b = append(b, 0x05)
-	switch {
-	case p.hasWordChar:
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, p.wordCharTableOff)
-		b = append(b, 0x20, paramPtr, 0x20, paramStart, 0x41, 0x01, 0x6B, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x04, 0x7F)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(l.wasmMidStartWord))
-		b = append(b, 0x05)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(p.wasmMidStart))
-		b = append(b, 0x0B)
-	case p.hasNewlineBoundary:
-		b = append(b, 0x20, paramPtr, 0x20, paramStart, 0x41, 0x01, 0x6B, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx)
-		b = append(b, 0x41, 0x0A, 0x46)
-		b = append(b, 0x04, 0x7F)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(p.wasmMidStartNewline))
-		b = append(b, 0x05)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(p.wasmMidStart))
-		b = append(b, 0x0B)
-	default:
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(p.wasmMidStart))
-	}
-	b = append(b, 0x0B)
+	// Entry state, keyed on paramStart — shared with buildSetSuffixBody, which
+	// is where the rule (and the reason it keys on paramStart rather than the
+	// match start) is documented. This was a second copy until plans/SETS.md
+	// §11 R12; §11 R4 was present in BOTH copies, which is the argument for
+	// the extraction.
+	b = emitSetEntryState(b, p, paramPtr, paramStart)
 	b = append(b, 0x21, lState)
 	b = append(b, 0x20, paramStart, 0x21, lScanPos)
 	b = append(b, 0x41, 0x00, 0x21, lBits)
@@ -131,9 +99,9 @@ func buildSetProbeBody(p setSuffixParams, anchored bool) []byte {
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, p.wordCharTableOff)
 			b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
-			b = appendTableLoad8u(b, tableMemIdx)
-			b = append(b, 0x6A)
-			b = appendTableLoad8u(b, tableMemIdx)
+			b = appendInputLoad8u(b)              // INPUT: input[lScanPos]
+			b = append(b, 0x6A)                   // wordCharOff + byte
+			b = appendTableLoad8u(b, tableMemIdx) // TABLE: wordChar[byte]
 			b = append(b, 0x04, 0x40)
 			b = orTableBits(b, p.wbWBitmaskOff)
 			b = append(b, 0x05)
@@ -142,7 +110,7 @@ func buildSetProbeBody(p setSuffixParams, anchored bool) []byte {
 		}
 		if p.hasNewlineBoundary {
 			b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
-			b = appendTableLoad8u(b, tableMemIdx)
+			b = appendInputLoad8u(b) // INPUT byte, not a table read
 			b = append(b, 0x41, 0x0A, 0x46)
 			b = append(b, 0x04, 0x40)
 			b = orTableBits(b, p.nlBitmaskOff)
@@ -150,16 +118,8 @@ func buildSetProbeBody(p setSuffixParams, anchored bool) []byte {
 		}
 	}
 
-	// DFA transition.
-	if l.useU8 && l.useCompression {
-		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
-			lState, lByteClass, paramPtr, lScanPos, 0xff, tableMemIdx)
-	} else if l.useU8 {
-		b = emitSimpleU8Transition(b, l.tableOff, lState, paramPtr, lScanPos, 0xff, tableMemIdx)
-	} else {
-		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A, 0x2D, 0x00, 0x00, 0x21, lByteClass)
-		b = emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff, lState, lByteClass, tableMemIdx)
-	}
+	// DFA transition (shared with buildSetSuffixBody).
+	b = emitSetTransition(b, l, lState, lByteClass, paramPtr, lScanPos, tableMemIdx)
 
 	if !anchored {
 		b = orTableBits(b, p.midBitmaskOff)

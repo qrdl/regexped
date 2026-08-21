@@ -134,10 +134,18 @@ func genTSSetSection(cfg config.BuildConfig) string {
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := camelSet(s.Name) + "PatternCount"
+		idN := idSpaceSize(s, cfg)
+		idKonst := camelSet(s.Name) + "IdSpace"
 		wide := wideAllForm(s, cfg)
-		reserve := 16*n + (n+7)/8
+		// §4.9 standalone layout: tuples (12 x pattern count), gate array
+		// (4 x ID SPACE), >64-pattern bitmap (ceil(idSpace/8)). The two counts
+		// differ for a named-subset set (plans/SETS.md §11 R1).
+		reserve := 12*n + 4*idN + bitmapBytes(s, cfg)
+		gateBase := fmt.Sprintf("_outBase + 12*%s", konst)
+		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
 
-		fmt.Fprintf(&out, "// Number of patterns in set %q. Every buffer below is sized from it.\nexport const %s: number = %d;\n\n", s.Name, konst, n)
+		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the find generator\n// can receive at most this many matches at one position.\nexport const %s: number = %d;\n\n", s.Name, konst, n)
+		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: number = %d;\n\n", s.Name, idKonst, idN)
 
 		if s.Match != "" {
 			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): boolean {
@@ -158,7 +166,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			if wide {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): number[] {
     const len = _w(input, %d);
-    const bitmapBase = _outBase + 16*%s;
+    const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
     (_exp['%s'] as Function)(_inBase, len, bitmapBase);
     const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
@@ -166,7 +174,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.MatchAll, reserve, konst, konst, s.MatchAll, konst, konst)
+`, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, idKonst, idKonst)
 			} else {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): number[] {
     const len = _w(input);
@@ -177,7 +185,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
     for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
     return out;
 }
-`, s.MatchAll, s.MatchAll, konst)
+`, s.MatchAll, s.MatchAll, idKonst)
 			}
 		}
 		if s.Scan != "" {
@@ -200,7 +208,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			if wide {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): number[] {
     const len = _w(input, %d);
-    const bitmapBase = _outBase + 16*%s;
+    const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
     (_exp['%s'] as Function)(_inBase, len, from, bitmapBase);
     const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
@@ -208,7 +216,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.ScanAll, reserve, konst, konst, s.ScanAll, konst, konst)
+`, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, idKonst, idKonst)
 			} else {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): number[] {
     const len = _w(input);
@@ -217,24 +225,27 @@ func genTSSetSection(cfg config.BuildConfig) string {
     for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
     return out;
 }
-`, s.ScanAll, s.ScanAll, konst)
+`, s.ScanAll, s.ScanAll, idKonst)
 			}
 		}
 		if s.Find != "" {
 			gateSetup, gateArg := "", ""
 			if gatedFind(s) {
-				gateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*%s;
+				gateSetup = fmt.Sprintf(`    const gateBase = %s;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
-`, konst, konst)
+`, gateBase, idKonst)
 				gateArg = "gateBase, "
 			}
 			fmt.Fprintf(&out, `export function* %s(input: string | Uint8Array, from: number = 0): Generator<SetMatch> {
     const len = _w(input, %d);
 %s    let pos = from;
+    // Hoisted: _mem.buffer and _outBase are loop-invariant and the input is
+    // staged once above, so nothing detaches this view mid-scan. Building it
+    // per call allocated one typed array per matching position.
+    const buf = new Int32Array(_mem.buffer, _outBase, 3*%s);
     while (true) {
         const n = (_exp['%s'] as Function)(_inBase, len, pos, %s_outBase, %s) as number;
         if (n <= 0) break;
-        const buf = new Int32Array(_mem.buffer, _outBase, n*3);
         // Every tuple in one call shares a start; resume one past it.
         const next = buf[1] + 1;
         for (let i = 0; i < n; i++) {
@@ -243,7 +254,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
         pos = next;
     }
 }
-`, s.Find, reserve, gateSetup, s.Find, gateArg, konst)
+`, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst)
 		}
 		out.WriteString("\n")
 	}

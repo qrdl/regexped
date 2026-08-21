@@ -37,10 +37,15 @@ regexped/
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, 17–32 literals)
 │   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets
-│   ├── set_emit.go            # Set WASM emission (CompileFile, bucket dispatch, AC/Teddy/Shufti/scalar frontends)
-│   ├── set_find.go            # `find` body support: first-position drain, gate mask/write-back (§9.4, §3.14-3.16)
-│   ├── set_probe.go           # Bitmask-only bucket probes for the six non-`find` capabilities
-│   ├── set_caps.go            # The six capability bodies (match/match_any/match_all, scan/scan_any/scan_all)
+│   ├── set_emit.go            # Set WASM emission (CompileFile, the four frontend bodies: AC/Teddy/Shufti/scalar).
+│   │                          #   These bodies serve `find` AND the scan trio — setFindCtx.mode picks what
+│   │                          #   each records at a matching position. Scan-trio work belongs HERE + set_find.go.
+│   ├── set_find.go            # Shared per-candidate machinery for every non-anchored capability: setFindCtx,
+│   │                          #   first-position drain (§9.4), gate mask/jump/write-back (§3.14-3.16),
+│   │                          #   eligibility masks, probe recording
+│   ├── set_probe.go           # Bitmask-only bucket probes (scan + anchored flavours), genAnchoredWASM
+│   ├── set_caps.go            # ANCHORED trio bodies only (match/match_any/match_all) + the shared bit-recording
+│   │                          #   emitters and id-space helpers. The scan trio is NOT here — see set_emit.go.
 │   ├── diag.go                # Diagnostics structures (set composition diagnostics JSON)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/

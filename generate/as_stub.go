@@ -60,9 +60,12 @@ func genASSetSection(cfg config.BuildConfig) string {
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
+		idN := idSpaceSize(s, cfg)
+		idKonst := screamingCase(s.Name) + "_ID_SPACE"
 		wide := wideAllForm(s, cfg)
 
-		fmt.Fprintf(&out, "// Number of patterns in set %q. Every buffer below is sized from it.\nexport const %s: i32 = %d;\n\n", s.Name, konst, n)
+		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the iterator can\n// receive at most this many matches at one position.\nexport const %s: i32 = %d;\n\n", s.Name, konst, n)
+		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: i32 = %d;\n\n", s.Name, idKonst, idN)
 
 		decl := func(name, sig string) {
 			fmt.Fprintf(&out, "@external(%q, %q)\ndeclare function ffi_%s%s;\n\n", cfg.ImportModule, name, name, sig)
@@ -94,7 +97,7 @@ export function %s(input: ArrayBuffer): Array<i32> {
     for (let k = 0; k < %s; k++) if (bits[k >> 3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.MatchAll, konst, s.MatchAll, konst)
+`, s.MatchAll, idKonst, s.MatchAll, idKonst)
 			} else {
 				decl(s.MatchAll, "(ptr: usize, len: i32): i64")
 				fmt.Fprintf(&out, `/** Ids of every pattern matching the whole input. */
@@ -104,7 +107,7 @@ export function %s(input: ArrayBuffer): Array<i32> {
     for (let k = 0; k < %s; k++) if ((mask >> i64(k)) & 1) out.push(k);
     return out;
 }
-`, s.MatchAll, s.MatchAll, konst)
+`, s.MatchAll, s.MatchAll, idKonst)
 			}
 		}
 		if s.Scan != "" {
@@ -136,7 +139,7 @@ export function %s(input: ArrayBuffer, from: i32): Array<i32> {
     for (let k = 0; k < %s; k++) if (bits[k >> 3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.ScanAll, konst, s.ScanAll, konst)
+`, s.ScanAll, idKonst, s.ScanAll, idKonst)
 			} else {
 				decl(s.ScanAll, "(ptr: usize, len: i32, from: i32): i64")
 				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`from`"+`. */
@@ -146,7 +149,7 @@ export function %s(input: ArrayBuffer, from: i32): Array<i32> {
     for (let k = 0; k < %s; k++) if ((mask >> i64(k)) & 1) out.push(k);
     return out;
 }
-`, s.ScanAll, s.ScanAll, konst)
+`, s.ScanAll, s.ScanAll, idKonst)
 			}
 		}
 		if s.Find != "" {
@@ -155,7 +158,7 @@ export function %s(input: ArrayBuffer, from: i32): Array<i32> {
 			if gatedFind(s) {
 				decl(s.Find, "(ptr: usize, len: i32, from: i32, gates: usize, out: usize, cap: i32): i32")
 				gateField = "    gates: StaticArray<u32>;\n"
-				gateInit = "        this.gates = new StaticArray<u32>(" + konst + ");\n"
+				gateInit = "        this.gates = new StaticArray<u32>(" + idKonst + ");\n"
 				gateArg = "changetype<usize>(this.gates), "
 			} else {
 				decl(s.Find, "(ptr: usize, len: i32, from: i32, out: usize, cap: i32): i32")

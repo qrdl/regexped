@@ -100,8 +100,26 @@ func main() {
 		out = append(out, line)
 		section = ""
 	}
+	// Check the scanner BEFORE rewriting the corpus. Scan() stops on error
+	// (a line over the buffer limit gives bufio.ErrTooLong) by returning
+	// false, which is indistinguishable from a clean EOF at the loop — so
+	// without this the write below would truncate custom-sets.txt to whatever
+	// had been read and exit 0, silently gutting the oracle the whole set
+	// regression net depends on (plans/SETS.md §11 R8).
+	if err := sc.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "read %s: %v (corpus NOT rewritten)\n", path, err)
+		f.Close()
+		os.Exit(1)
+	}
 	f.Close()
-	if err := os.WriteFile(path, []byte(strings.Join(out, "\n")+"\n"), 0644); err != nil {
+	// Write via a temp file + rename so an interrupted write cannot leave a
+	// half-destroyed corpus either.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strings.Join(out, "\n")+"\n"), 0644); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

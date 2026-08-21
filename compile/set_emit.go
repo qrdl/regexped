@@ -29,6 +29,11 @@ type compiledSet struct {
 	// (false) is the gated, per-pattern non-overlapping body.
 	overlapping bool
 
+	// declaredIDSpace is SetSpec.IDSpaceSize — the id-space bound agreed with
+	// the stub generators (plans/SETS.md §11 R1). Zero means "derive it";
+	// read it through idSpaceSize(), never directly.
+	declaredIDSpace int
+
 	// maxLookback (M) is the largest distance between a mandatory literal and
 	// the match start it can serve, over every pattern in the set; -1 when any
 	// pattern's prefix is unbounded. It bounds the §9.4 first-position drain.
@@ -242,6 +247,15 @@ type SetSpec struct {
 	Find     string
 
 	Overlapping bool // §3.15 / D10: true = ungated `find` body
+
+	// IDSpaceSize is one past the largest pattern id this set can report —
+	// config.SetConfig.IDSpaceSize, the SAME function every stub generator
+	// calls, so the two sides provably agree on the size of everything
+	// indexed by pattern id (gate array, `_all` bitmap, and the narrow-vs-wide
+	// `_all` ABI). See plans/SETS.md §11 R1. Zero means "derive it from the
+	// pattern ids", which is what the internal harnesses that build a SetSpec
+	// directly (rather than from a config) get.
+	IDSpaceSize int
 
 	Patterns   []*PatternInfo // resolved, capture-bearing dropped
 	PatternIDs []int          // global indices into the regexps list
@@ -527,6 +541,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		scanAll:             spec.ScanAll,
 		find:                spec.Find,
 		overlapping:         spec.Overlapping,
+		declaredIDSpace:     spec.IDSpaceSize,
 		suffixFnBodies:      suffixFnBodies,
 		scanProbeBodies:     scanProbeBodies,
 		numSuffixFns:        len(suffixFnBodies),
@@ -593,8 +608,10 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	for bi := range buckets {
 		cs.prefixLenGroups[bi] = buildPrefixLenGroups(cs, bi)
 	}
+	cs.checkIDSpace()
 	cs.maxLookback = setMaxLookback(cs)
 	diag.MaxLookback = cs.maxLookback
+	diag.IDSpaceSize = cs.idSpaceSize()
 	diag.Overlapping = spec.Overlapping
 	for _, c := range []struct{ field, name string }{
 		{"match", spec.Match}, {"match_any", spec.MatchAny}, {"match_all", spec.MatchAll},
@@ -603,6 +620,17 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	} {
 		if c.name != "" {
 			diag.Capabilities = append(diag.Capabilities, c.field)
+		}
+	}
+	// The bare capabilities always get the bucketed shape: §3.20's union
+	// collapse is not built (§10.2(1)). Recording it rather than leaving the
+	// field absent is what makes that visible in --diag-json.
+	for _, c := range []struct{ field, name string }{{"match", spec.Match}, {"scan", spec.Scan}} {
+		if c.name != "" {
+			if diag.BareBodyShape == nil {
+				diag.BareBodyShape = map[string]string{}
+			}
+			diag.BareBodyShape[c.field] = "bucketed"
 		}
 	}
 	return cs
@@ -615,17 +643,6 @@ func appendTableLoad64(b []byte, tableMemIdx int) []byte {
 		return append(b, 0x29, 0x03, 0x00)
 	}
 	return append(b, 0x29, 0x43, byte(tableMemIdx), 0x00)
-}
-
-// checkSetCapabilitiesImplemented rejects set capabilities whose emitter has
-// not landed yet, so a config never silently gets a body with different
-// semantics from the one its keys ask for.
-//
-// plans/SETS.md §9.1: gating is the DEFAULT configuration but its body lands
-// at stage S5, so during S1-S4 every `find:` must opt into `overlapping: true`
-// and a plain `find:` is a clear error rather than a silently ungated body.
-func checkSetCapabilitiesImplemented(sc config.SetConfig) error {
-	return nil
 }
 
 // --------------------------------------------------------------------------
@@ -707,9 +724,6 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	var compiledSets []*compiledSet
 	setTableBase := lastTableEnd // each set's tables start after all preceding data
 	for _, sc := range cfg.Sets {
-		if err := checkSetCapabilitiesImplemented(sc); err != nil {
-			return nil, 0, err
-		}
 		// Resolve patterns.
 		var selectedIdx []int
 		if sc.Patterns.All {
@@ -754,6 +768,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 			ScanAll:     sc.ScanAll,
 			Find:        sc.Find,
 			Overlapping: sc.Overlapping,
+			IDSpaceSize: sc.IDSpaceSize(cfg),
 			Patterns:    infos,
 			PatternIDs:  globalIDs,
 		}
@@ -1210,7 +1225,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	c.perPositionDrain = true
 	c.lAcc = c.localBase + 8
 	lPos := c.lPos
-	pInPtr, pInLen := c.pInPtr, c.pInLen
+	pInLen := c.pInLen
 
 	b = c.emitFindPrologue(b, lPos)
 
@@ -1236,33 +1251,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 		b = c.emitBucketAt(b, bi, 0, lPos)
 	}
 
-	for _, bi := range litOrderFor(cs) {
-		bkt := cs.buckets[bi]
-		lit := []byte(bkt.literal)
-		litLen := len(lit)
-
-		b = append(b, 0x02, 0x40) // block $skip_bucket
-		b = append(b, 0x20, lPos, 0x41)
-		b = utils.AppendSLEB128(b, int32(litLen))
-		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
-
-		for li, lb := range lit {
-			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
-			if li > 0 {
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(li))
-				b = append(b, 0x6A)
-			}
-			b = append(b, 0x2D, 0x00, 0x00)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(lb))
-			b = append(b, 0x47, 0x0D, 0x00)
-		}
-
-		b = c.emitBucketAt(b, bi, litLen, lPos)
-
-		b = append(b, 0x0B) // end block $skip_bucket
-	}
+	b = c.emitLiteralBuckets(b, lPos)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
 	b = append(b, 0x0C, 0x00)
@@ -1489,33 +1478,7 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 
 	// Literal buckets only (selection requires no fallback). Shortest literal
 	// first for the same ordering reason as the scalar path.
-	for _, bi := range litOrderFor(cs) {
-		bkt := cs.buckets[bi]
-		lit := []byte(bkt.literal)
-		litLen := len(lit)
-
-		b = append(b, 0x02, 0x40) // block $skip_bucket
-		b = append(b, 0x20, lPos, 0x41)
-		b = utils.AppendSLEB128(b, int32(litLen))
-		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
-
-		for li, lb := range lit {
-			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
-			if li > 0 {
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(li))
-				b = append(b, 0x6A)
-			}
-			b = append(b, 0x2D, 0x00, 0x00)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(lb))
-			b = append(b, 0x47, 0x0D, 0x00)
-		}
-
-		b = c.emitBucketAt(b, bi, litLen, lPos)
-
-		b = append(b, 0x0B) // end block $skip_bucket
-	}
+	b = c.emitLiteralBuckets(b, lPos)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
 	b = append(b, 0x0C, 0x00)                               // br $scan

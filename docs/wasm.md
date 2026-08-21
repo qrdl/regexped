@@ -297,7 +297,14 @@ restores a clean scan from anywhere.
 - Zero-length matches are ordinary matches; `find` reports them as `(id, p, p)`.
 - `out_ptr` and `gate_ptr` must be 4-byte aligned.
 - The `>64` bitmap at `out_ptr` is `ceil(P/8)` bytes, little-endian bit order
-  (bit k = byte `k/8`, bit `k%8`); bytes past the last pattern are zeroed.
+  (bit k = byte `k/8`, bit `k%8`), where **P is the set's id space**, not its
+  pattern count — a set that selects patterns 68 and 69 of seventy needs a
+  9-byte bitmap, because a bit position IS a pattern id.
+- **The bitmap must be all-zero on entry.** The module only ORs hit bits in and
+  counts 0→1 transitions; it never writes a zero, and bytes past the last
+  pattern are not written at all. Reusing a dirty buffer therefore reports
+  stale patterns and returns a count that disagrees with the bits. Generated
+  stubs zero it for you; direct callers must.
 
 ### Suffix DFA functions (internal)
 

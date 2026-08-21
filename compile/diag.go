@@ -33,20 +33,38 @@ type SetDiag struct {
 	Overlapping bool `json:"overlapping"`
 	// MaxLookback is the set's first-position drain bound M (§9.4): the
 	// largest distance between a mandatory literal and the match start it can
-	// serve, or -1 when some pattern's prefix is unbounded and no bound
-	// exists. It is what decides whether a set behaves as §9.4 "class A"
+	// serve. It is what decides whether a set behaves as §9.4 "class A"
 	// (bounded drain, literal frontend intact) or "class B" (nothing can be
 	// skipped) — confirm a test set's class from here rather than by
 	// inspection.
+	//
+	// It is always finite: a variable-length prefix has no usable bound, so
+	// analyzePattern routes those patterns to a fallback bucket instead of
+	// letting them widen M (§10.4(a)). An earlier draft of this comment
+	// promised -1 for that case; setMaxLookback cannot return it.
 	MaxLookback int `json:"max_lookback"`
+	// IDSpaceSize is one past the largest pattern id this set can report
+	// (plans/SETS.md §11 R1). For `patterns: all` it equals the pattern count;
+	// for a named subset it is the largest selected pattern's global index
+	// plus one, and it — not the pattern count — is the size of the gate array
+	// and the `_all` bitmap, and what decides the narrow-vs-wide `_all` ABI.
+	IDSpaceSize int `json:"id_space_size"`
 	// BareBodyShape records which body shape each declared bare capability
-	// received (§3.20 / D9): "collapsed" for the union-automaton fast path,
-	// "bucketed" for the early-exit fallback. Keyed by capability name.
+	// received (§3.20 / D9), keyed by capability name. Only "bucketed" is
+	// emitted today: the union collapse of §3.20 is not built (§10.2(1)), so
+	// this field exists to make that visible rather than to be guessed at, and
+	// gains a "collapsed" value if the collapse ever lands.
 	BareBodyShape         map[string]string `json:"bare_body_shape,omitempty"`
 	Buckets               []BucketDiag      `json:"buckets"`
 	Conflicts             []ConflictDiag    `json:"conflicts"`
 	CaptureBearingDropped []PatternRef      `json:"capture_bearing_dropped"`
 	StateLimitDropped     []PatternRef      `json:"state_limit_dropped,omitempty"`
+	// UnparseableDropped lists patterns the anchored packer could not re-parse
+	// and therefore excluded from match/match_any/match_all while `find` kept
+	// them. Defensive — analyzePattern already parsed these once — but a
+	// silent `continue` there would leave the capabilities disagreeing with no
+	// diagnostic trail at all (plans/SETS.md §11 R9).
+	UnparseableDropped []PatternRef `json:"unparseable_dropped,omitempty"`
 }
 
 // BucketDiag describes one merged bucket.

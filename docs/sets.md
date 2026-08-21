@@ -219,10 +219,31 @@ overflow path is reachable only by a direct WASM caller who deliberately
 undersizes.
 
 `match_all` and `scan_all` return a **bitmask** — bit *k* set means pattern *k*
-matched — as an `i64` return value for sets of 64 patterns or fewer. Above 64,
-they take an `out_ptr` and write a `ceil(P/8)`-byte little-endian bitmap,
-returning the count instead. The generated stubs expand either form into the
-language's natural list of ids; the bitmask never reaches a stub user.
+matched — as an `i64` return value when the set's id space is 64 or fewer.
+Above that they take an `out_ptr` and write a `ceil(P/8)`-byte little-endian
+bitmap, returning the count instead. The generated stubs expand either form
+into the language's natural list of ids; the bitmask never reaches a stub user.
+A direct caller must pass an **all-zero** bitmap: the module only ORs bits in
+and counts 0→1 transitions, so a reused dirty buffer reports stale patterns.
+
+### Pattern ids and the two emitted constants
+
+A `pattern_id` is the pattern's **global** index into `regexps:`, so a set that
+selects a subset does not renumber: a set holding the last two of seventy
+patterns reports ids 68 and 69. Two constants therefore accompany every set,
+and they are not interchangeable:
+
+| constant | value | sizes |
+|---|---|---|
+| `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`) |
+| `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array, the `_all` bitmask/bitmap, and which `_all` ABI is exported |
+
+For `patterns: all` — the common case — the two are equal. They diverge only
+for a named subset, and using the wrong one there is a memory-safety bug: the
+gate array is indexed by pattern id, so sizing it at the pattern count lets the
+module write past the caller's array. Both constants are emitted in all six
+stub languages, and every generated declaration is written in terms of the
+right one.
 
 `scan_any` returns a packed `(start << 32) | pattern_id` as an `i64`, or `-1`.
 Both fields are below 2³¹, so `-1` is unambiguous. Stubs decompose it.

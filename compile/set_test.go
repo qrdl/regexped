@@ -2327,26 +2327,33 @@ func TestHasBeginAnchor(t *testing.T) {
 	}
 }
 
-func TestHasBeginAnchorAtTopLevel(t *testing.T) {
+// TestTopLevelBeginAnchorKind covers what hasBeginAnchorAtTopLevel used to:
+// whether the anchor is at the pattern's mandatory start. It additionally
+// pins the KIND, which is the part that matters for B43 — collapsing
+// (?m:^) onto \A restricts a pattern to position 0 that may legitimately
+// match at every line start.
+func TestTopLevelBeginAnchorKind(t *testing.T) {
 	cases := []struct {
 		pat  string
-		want bool
+		want beginAnchorKind
 	}{
-		{`^a`, true},      // ^ at mandatory start
-		{`\Aa`, true},     // \A at mandatory start
-		{`a^`, false},     // ^ after byte-consumer — not at top-level start
-		{`(^^)*$`, false}, // ^ inside *, not mandatory at top level
-		{`a+`, false},     // no anchor
-		{`(^a)`, true},    // ^ through capture
+		{`^a`, beginAnchorText},        // ^ at mandatory start (no (?m) → \A)
+		{`\Aa`, beginAnchorText},       // \A at mandatory start
+		{`(?m:^)a`, beginAnchorLine},   // (?m:^) is position-aware, not position 0
+		{`a^`, beginAnchorNone},        // ^ after byte-consumer — not at top-level start
+		{`(^^)*$`, beginAnchorNone},    // ^ inside *, not mandatory at top level
+		{`a+`, beginAnchorNone},        // no anchor
+		{`(^a)`, beginAnchorText},      // ^ through capture
+		{`(?:^x|y)z`, beginAnchorNone}, // ^ inside an alternation restricts nothing
 	}
 	for _, tc := range cases {
 		re := mustParse(t, tc.pat)
-		if got := hasBeginAnchorAtTopLevel(re); got != tc.want {
-			t.Errorf("hasBeginAnchorAtTopLevel(%q) = %v, want %v", tc.pat, got, tc.want)
+		if got := topLevelBeginAnchorKind(re); got != tc.want {
+			t.Errorf("topLevelBeginAnchorKind(%q) = %v, want %v", tc.pat, got, tc.want)
 		}
 	}
-	if hasBeginAnchorAtTopLevel(nil) {
-		t.Error("hasBeginAnchorAtTopLevel(nil) = true, want false")
+	if topLevelBeginAnchorKind(nil) != beginAnchorNone {
+		t.Error("topLevelBeginAnchorKind(nil) should be beginAnchorNone")
 	}
 }
 
@@ -2884,6 +2891,282 @@ func TestSetDiagRecordsRouting(t *testing.T) {
 			}
 			if len(cs.diag.Capabilities) != 1 || cs.diag.Capabilities[0] != "find" {
 				t.Errorf("diag capabilities = %v, want [find]", cs.diag.Capabilities)
+			}
+		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// plans/SETS.md §11 R1 / R-TESTS(1): subset selection.
+//
+// Every harness in this project builds sets that select ALL of the config's
+// patterns, which keeps global pattern ids dense and equal to set-local
+// indices — and that is precisely why §11 R1 survived 4.9M corpus cases. A
+// pattern id is the GLOBAL index into `regexps:`, so a set selecting a
+// non-prefix subset reports ids above its own pattern count, and everything
+// indexed by an id has to be sized for that.
+
+// setConfigSubset builds a config whose set selects `pick` (indices into
+// patterns) by name, leaving the rest of the regexps out of the set.
+func setConfigSubset(patterns []string, pick []int, caps ...string) config.BuildConfig {
+	entries := make([]config.RegexEntry, len(patterns))
+	for i, p := range patterns {
+		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+	}
+	var names []string
+	for _, i := range pick {
+		names = append(names, fmt.Sprintf("p%d", i))
+	}
+	sc := config.SetConfig{Name: "s", Patterns: config.PatternSelector{Names: names}}
+	for _, c := range caps {
+		switch c {
+		case "match_all":
+			sc.MatchAll = setCapNames[c]
+		case "scan_all":
+			sc.ScanAll = setCapNames[c]
+		case "scan_any":
+			sc.ScanAny = setCapNames[c]
+		case "find":
+			sc.Find = setCapNames[c]
+		default:
+			panic("unknown capability " + c)
+		}
+	}
+	return config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+}
+
+// TestSubsetIDSpace pins the two counts apart and checks that the compiler
+// sizes by the id space, not the pattern count.
+func TestSubsetIDSpace(t *testing.T) {
+	pats := make([]string, 70)
+	for i := range pats {
+		pats[i] = fmt.Sprintf("lit%dx", i)
+	}
+	cases := []struct {
+		name        string
+		pick        []int
+		wantCount   int
+		wantIDSpace int
+		wantWide    bool
+	}{
+		{"last-of-3", []int{2}, 1, 3, false},
+		{"two-late-of-70", []int{68, 69}, 2, 70, true},
+		{"first-two", []int{0, 1}, 2, 2, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := setConfigSubset(pats[:max(3, tc.pick[len(tc.pick)-1]+1)], tc.pick, "find", "scan_all")
+			s := cfg.Sets[0]
+			if got := s.PatternCount(cfg); got != tc.wantCount {
+				t.Errorf("PatternCount = %d, want %d", got, tc.wantCount)
+			}
+			if got := s.IDSpaceSize(cfg); got != tc.wantIDSpace {
+				t.Errorf("IDSpaceSize = %d, want %d", got, tc.wantIDSpace)
+			}
+			wasm, _, err := CompileFile(cfg, "")
+			if err != nil {
+				t.Fatalf("CompileFile: %v", err)
+			}
+			validateWASM(t, wasm)
+			// The compiler must agree with config.IDSpaceSize, since the stubs
+			// size the caller's gate array and bitmap from the latter.
+			cs := CompileSet(SetSpec{
+				Name: "s", Find: "f", ScanAll: "sa",
+				IDSpaceSize: s.IDSpaceSize(cfg),
+			}, &dfaPool{}, &dfaPool{}, CompileSetOptions{})
+			if got := cs.idSpaceSize(); got != tc.wantIDSpace {
+				t.Errorf("compiledSet.idSpaceSize() = %d, want %d", got, tc.wantIDSpace)
+			}
+			if got := cs.wideAll(); got != tc.wantWide {
+				t.Errorf("wideAll() = %v, want %v (the _all ABI must follow the id space)", got, tc.wantWide)
+			}
+		})
+	}
+}
+
+// TestSubsetAllABIMatchesIDSpace is the check that makes §11 R1's third
+// manifestation impossible to reintroduce: the narrow/wide `_all` signature
+// the module EXPORTS must be the one the generators would declare. The two
+// were derived from different counts, so a subset set could export
+// (i32,i32,i32,i32)->i32 while the stub declared (i32,i32,i32)->i64 and
+// instantiation failed on an import type mismatch.
+func TestSubsetAllABIMatchesIDSpace(t *testing.T) {
+	pats := make([]string, 70)
+	for i := range pats {
+		pats[i] = fmt.Sprintf("lit%dx", i)
+	}
+	for _, pick := range [][]int{{0, 1}, {68, 69}} {
+		cfg := setConfigSubset(pats, pick, "scan_all")
+		wasm, _, err := CompileFile(cfg, "")
+		if err != nil {
+			t.Fatalf("CompileFile: %v", err)
+		}
+		validateWASM(t, wasm)
+		wantWide := cfg.Sets[0].IDSpaceSize(cfg) > wideBitmapThreshold
+		// scan_all narrow is (ptr,len,from)->i64; wide is (ptr,len,from,out)->i32.
+		want := setTypeI32x3ToI64
+		if wantWide {
+			want = setTypeI32x4ToI32
+		}
+		got := exportTypeIndex(t, wasm, setCapNames["scan_all"])
+		if got != want {
+			t.Errorf("pick %v: id space %d exports scan_all with type %d, want %d "+
+				"(the stub declares its FFI from the same id space, so a mismatch "+
+				"fails instantiation)", pick, cfg.Sets[0].IDSpaceSize(cfg), got, want)
+		}
+	}
+}
+
+// TestIDSpaceAssertionHolds exercises the compile-time guard: no emitted
+// pattern id may exceed the id space the stubs allocate for.
+func TestIDSpaceAssertionHolds(t *testing.T) {
+	pats := []string{`alpha`, `beta`, `gamma`, `delta`}
+	for _, pick := range [][]int{{3}, {1, 3}, {0, 1, 2, 3}} {
+		cfg := setConfigSubset(pats, pick, "find", "scan_all", "match_all")
+		if _, _, err := CompileFile(cfg, ""); err != nil {
+			t.Fatalf("pick %v: %v", pick, err)
+		}
+	}
+}
+
+// exportTypeIndex returns the type-section index of the function exported
+// under `name`. The set path's type table is the fixed one written by
+// assembleModuleWithSets, so comparing against the setType* constants says
+// exactly which ABI capFns() chose.
+func exportTypeIndex(t *testing.T, wasm []byte, name string) int {
+	t.Helper()
+	u := func(b []byte, off int) (uint64, int) {
+		v, n, err := utils.DecodeULEB128(b[off:])
+		if err != nil {
+			t.Fatalf("bad LEB128 at %d: %v", off, err)
+		}
+		return v, off + n
+	}
+	var funcSec, exportSec []byte
+	numImportedFuncs := 0
+	for off := 8; off < len(wasm); {
+		id := wasm[off]
+		size, p := u(wasm, off+1)
+		body := wasm[p : p+int(size)]
+		switch id {
+		case 2: // imports: count any function imports toward the index space
+			n, q := u(body, 0)
+			for i := uint64(0); i < n; i++ {
+				var l uint64
+				l, q = u(body, q)
+				q += int(l) // module
+				l, q = u(body, q)
+				q += int(l) // field
+				kind := body[q]
+				q++
+				switch kind {
+				case 0x00:
+					_, q = u(body, q)
+					numImportedFuncs++
+				case 0x02: // memory
+					lim := body[q]
+					q++
+					_, q = u(body, q)
+					if lim == 0x01 {
+						_, q = u(body, q)
+					}
+				default:
+					t.Fatalf("unhandled import kind %#x", kind)
+				}
+			}
+		case 3:
+			funcSec = body
+		case 7:
+			exportSec = body
+		}
+		off = p + int(size)
+	}
+	if funcSec == nil || exportSec == nil {
+		t.Fatal("module missing function or export section")
+	}
+	// Export section: find the func index for `name`.
+	funcIdx := -1
+	n, q := u(exportSec, 0)
+	for i := uint64(0); i < n; i++ {
+		var l uint64
+		l, q = u(exportSec, q)
+		got := string(exportSec[q : q+int(l)])
+		q += int(l)
+		kind := exportSec[q]
+		q++
+		var idx uint64
+		idx, q = u(exportSec, q)
+		if kind == 0x00 && got == name {
+			funcIdx = int(idx)
+		}
+	}
+	if funcIdx < 0 {
+		t.Fatalf("module has no function export named %q", name)
+	}
+	// Function section: type index of that function.
+	cnt, r := u(funcSec, 0)
+	local := funcIdx - numImportedFuncs
+	if local < 0 || local >= int(cnt) {
+		t.Fatalf("export %q resolves to function %d, outside the module's own %d", name, funcIdx, cnt)
+	}
+	var ti uint64
+	for i := 0; i <= local; i++ {
+		ti, r = u(funcSec, r)
+	}
+	return int(ti)
+}
+
+// TestJumpIsProfitable pins the compile-time gate of plans/SETS.md §12.3: the
+// §3.14 jump is emitted only where it can actually fire.
+func TestJumpIsProfitable(t *testing.T) {
+	cases := []struct {
+		name string
+		pats []string
+		want bool
+	}{
+		{"single unbounded", []string{`a+`}, true},
+		{"single long literal", []string{`abcd`}, true},
+		{"single 2-byte", []string{`ab`}, true},
+		{"single unbounded tail", []string{`ERR\b[^\n]*`}, true},
+		{"single 1-byte class", []string{`[a-z]`}, false},
+		{"single 1-byte literal", []string{`a`}, false},
+		{"single any-char", []string{`.`}, false},
+		{"two patterns", []string{`a+`, `b+`}, false},
+		{"eight patterns", []string{`ERR\b[^\n]*`, `WRN\b[^\n]*`, `INF\b[^\n]*`, `DBG\b[^\n]*`,
+			`CRT\b[^\n]*`, `FAT\b[^\n]*`, `TRC\b[^\n]*`, `NOT\b[^\n]*`}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := make([]config.RegexEntry, len(tc.pats))
+			names := make([]string, len(tc.pats))
+			for i, p := range tc.pats {
+				names[i] = string(rune('a' + i))
+				entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+			}
+			cfg := config.BuildConfig{
+				Regexps: entries,
+				Sets: []config.SetConfig{{
+					Name: "s", Find: "f",
+					Patterns: config.PatternSelector{Names: names},
+				}},
+			}
+			var pp, sp dfaPool
+			var infos []*PatternInfo
+			var ids []int
+			for i, e := range entries {
+				info, err := analyzePattern(e, &pp, &sp)
+				if err != nil {
+					t.Fatalf("analyzePattern %q: %v", e.Pattern, err)
+				}
+				infos = append(infos, info)
+				ids = append(ids, i)
+			}
+			cs := CompileSet(SetSpec{
+				Name: "s", Find: "f", Patterns: infos, PatternIDs: ids,
+				IDSpaceSize: cfg.Sets[0].IDSpaceSize(cfg),
+			}, &pp, &sp, CompileSetOptions{})
+			if got := cs.jumpIsProfitable(); got != tc.want {
+				t.Errorf("jumpIsProfitable() = %v, want %v", got, tc.want)
 			}
 		})
 	}

@@ -101,9 +101,93 @@ func (s SetConfig) Capabilities() []SetCapability {
 // HasExports reports whether the set declares at least one capability.
 func (s SetConfig) HasExports() bool { return len(s.Capabilities()) > 0 }
 
-// Gated reports whether this set's `find` uses the default gated
-// (per-pattern non-overlapping) body. Meaningless when Find == "".
-func (s SetConfig) Gated() bool { return !s.Overlapping }
+// Gated reports whether this set emits the default gated (per-pattern
+// non-overlapping) `find` body, which threads a caller-owned gate array
+// through the suffix functions (plans/SETS.md §3.14-3.16). A set without
+// `find:` gates nothing.
+func (s SetConfig) Gated() bool { return s.Find != "" && !s.Overlapping }
+
+// SanitizeSetName turns a set name into an identifier stem for the constants
+// and types the stubs emit for it (<SET>_PATTERN_COUNT, <SET>_ID_SPACE, C's
+// scanner struct). `sets[].name` is deliberately not identifier-validated — it
+// is a selection key, and shipped configs use names like "sql-validator" — so
+// it cannot be interpolated verbatim.
+//
+// It lives here, rather than in generate/, so ValidateSets can reject two set
+// names that sanitize to the SAME stem before they become duplicate
+// declarations in generated code (plans/SETS.md §11 R14).
+func SanitizeSetName(name string) string {
+	var b []rune
+	for _, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			b = append(b, c)
+		default:
+			b = append(b, '_')
+		}
+	}
+	if len(b) == 0 {
+		return "SET"
+	}
+	if b[0] >= '0' && b[0] <= '9' {
+		b = append([]rune{'_'}, b...)
+	}
+	return string(b)
+}
+
+// PatternCount returns the number of patterns the set selects.
+//
+// This is the D16 <SET>_PATTERN_COUNT: the worst-case number of matches at a
+// single `find` position, and therefore the size of the tuple buffer. It is
+// NOT a bound on pattern id values — see IDSpaceSize.
+func (s SetConfig) PatternCount(cfg BuildConfig) int {
+	if s.Patterns.All {
+		return len(cfg.Regexps)
+	}
+	return len(s.Patterns.Names)
+}
+
+// IDSpaceSize returns one past the largest pattern id this set can report.
+//
+// A set's pattern_id is the GLOBAL index into `regexps:` in YAML order
+// (docs/sets.md), so a set selecting the last two of seventy patterns reports
+// ids 68 and 69 even though it holds two patterns. Everything indexed BY that
+// id — the gate array, the `_all` bitmask/bitmap, and hence the narrow-vs-wide
+// `_all` ABI choice — must be sized from this, not from PatternCount.
+//
+// Sizing them from PatternCount was plans/SETS.md §11 R1: the emitted WASM
+// wrote gate[68] into a stub-allocated two-slot array, `_all` decode loops
+// stopped before the bits the module had set, and the two sides could even
+// disagree about which `_all` signature the module exported.
+//
+// This is deliberately an UPPER BOUND computed from the config alone, and it
+// is THE definition for both sides: the compiler calls it (through
+// SetSpec.IDSpaceSize) and so does every stub generator, so the two cannot
+// drift. Patterns dropped later — capture-bearing ones, or ones over the DFA
+// state limit — only lower the ids actually emitted, never raise them, so an
+// upper bound stays safe. Deriving it instead from what survived compilation
+// would be tighter but unavailable to the generators, which never see the
+// compiled module.
+func (s SetConfig) IDSpaceSize(cfg BuildConfig) int {
+	if s.Patterns.All {
+		return len(cfg.Regexps)
+	}
+	idx := make(map[string]int, len(cfg.Regexps))
+	for i, re := range cfg.Regexps {
+		if re.Name != "" {
+			if _, dup := idx[re.Name]; !dup {
+				idx[re.Name] = i
+			}
+		}
+	}
+	max := -1
+	for _, name := range s.Patterns.Names {
+		if i, ok := idx[name]; ok && i > max {
+			max = i
+		}
+	}
+	return max + 1
+}
 
 // PatternSelector selects patterns for a set. It can be the scalar string "all"
 // or a list of pattern names.
@@ -215,6 +299,7 @@ func ValidateSets(cfg *BuildConfig) error {
 	}
 
 	setNames := make(map[string]bool)
+	setStems := make(map[string]string)    // sanitized stem → the set name that claimed it
 	exportNames := make(map[string]string) // export name → owner ("set X" or "regexp Y")
 	// Seed with per-regexp export names so set exports can't collide with them.
 	for _, re := range cfg.Regexps {
@@ -245,6 +330,17 @@ func ValidateSets(cfg *BuildConfig) error {
 			return fmt.Errorf("duplicate set name %q", s.Name)
 		}
 		setNames[s.Name] = true
+		// Two DISTINCT set names can sanitize to one identifier stem
+		// ("url-guard" and "url_guard" both give URL_GUARD), which emits the
+		// same <SET>_PATTERN_COUNT / <SET>_ID_SPACE constant twice and breaks
+		// the generated Rust/Go/C at compile time with no diagnostic from us
+		// (plans/SETS.md §11 R14).
+		stem := SanitizeSetName(s.Name)
+		if prior, dup := setStems[stem]; dup {
+			return fmt.Errorf("set names %q and %q both produce the identifier %q "+
+				"used for their generated constants; rename one", prior, s.Name, stem)
+		}
+		setStems[stem] = s.Name
 		caps := s.Capabilities()
 		if len(caps) == 0 {
 			return fmt.Errorf("set %q: at least one of match, match_any, match_all, scan, scan_any, scan_all, or find must be set", s.Name)
