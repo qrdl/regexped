@@ -134,6 +134,49 @@ All positions are byte offsets (not character indices). Input is `&[u8]`.
 
 ---
 
+---
+
+## Set composition exports
+
+When the config has a `sets:` block, the generator also emits, per set, one
+function per declared capability (see [sets.md](sets.md) for the full config
+schema and wire format):
+
+```rust
+pub const <SET>_PATTERN_COUNT: usize = 12;
+
+pub struct SetMatch { pub pattern_id: usize, pub start: usize, pub end: usize }
+
+// anchored: the pattern must match the WHOLE input
+pub fn <match>    (input: &[u8]) -> bool;
+pub fn <match_any>(input: &[u8]) -> Option<usize>;                      // pattern id
+pub fn <match_all>(input: &[u8]) -> Vec<usize>;
+
+// non-anchored: each takes a `from` position
+pub fn <scan>    (input: &[u8], from: usize) -> bool;
+pub fn <scan_any>(input: &[u8], from: usize) -> Option<(usize, usize)>; // (id, start)
+pub fn <scan_all>(input: &[u8], from: usize) -> Vec<usize>;
+
+pub fn <find>(input: &[u8], from: usize) -> <Find>Iter<'_>;
+impl Iterator for <Find>Iter<'_> { type Item = SetMatch; }
+```
+
+```rust
+for m in scan_secrets(input, 0) {
+    println!("{} {}..{}", m.pattern_id, m.start, m.end);
+}
+```
+
+The iterator owns one reusable buffer of `<SET>_PATTERN_COUNT` tuples and, for
+the default non-overlapping configuration, a zeroed gate array of the same
+length. It refills at each matching position and yields that position's matches
+one at a time before advancing, so steady-state iteration allocates nothing.
+Dropping and re-creating it restarts the scan; the gate array never appears in
+the public surface.
+
+`pattern_name(id)` is emitted once per config when any set sets
+`emit_name_map: true`.
+
 ## Notes
 
 - Stub functions are safe Rust wrappers; the `unsafe` FFI call is hidden inside the stub.

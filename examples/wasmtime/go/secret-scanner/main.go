@@ -18,7 +18,7 @@ func main() {
 	}
 
 	count := 0
-	for m := range ScanSecrets(input) {
+	for m := range ScanSecrets(input, 0) {
 		matched := string(input[m.Start:m.End])
 		fmt.Printf("[%s] at %d..%d: %s\n", PatternName(m.PatternID), m.Start, m.End, matched)
 		count++

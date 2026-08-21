@@ -148,23 +148,47 @@ When the config has a `sets:` block, the generator also emits, per set (see
 [sets.md](sets.md) for the full config schema and wire format):
 
 ```c
-/* find_all: streaming iterator over a static result buffer */
-int <find_all>_next(const char *input, int len, rx_set_match_t *out);
-void <find_all>_reset(void);
+#define <SET>_PATTERN_COUNT 12
+typedef struct { int pattern_id; int start; int end; } rx_set_match_t;
 
-/* find_any: single result, or a struct with start<0 if no match */
-int <find_any>(const char *input, int len, rx_set_match_t *out);
+/* anchored: the pattern must match the WHOLE input */
+int <match>    (const char *in, int len);                        /* 0 | 1    */
+int <match_any>(const char *in, int len);                        /* id or -1 */
+int <match_all>(const char *in, int len, int *out_ids);          /* count    */
 
-/* match: anchored at position 0 */
-int <match>(const char *input, int len, rx_set_anchor_t *out);
+/* non-anchored: each takes a `from` position */
+int <scan>    (const char *in, int len, int from);               /* 0 | 1    */
+int <scan_any>(const char *in, int len, int from, int *start);   /* id or -1 */
+int <scan_all>(const char *in, int len, int from, int *out_ids); /* count    */
+
+/* find: a caller-owned scanner struct — reentrant, header-only */
+typedef struct {
+    int from;
+    int done;
+    unsigned gates[<SET>_PATTERN_COUNT];   /* non-overlapping sets only */
+    int buf[<SET>_PATTERN_COUNT * 3];
+    int n, i;
+} rx_<set>_scanner_t;
+
+void <find>_init(rx_<set>_scanner_t *s, int from);
+int  <find>_next(rx_<set>_scanner_t *s, const char *in, int len, rx_set_match_t *out);
 
 /* only if any set in the config sets emit_name_map: true */
 const char *pattern_name(int id);
 ```
 
-`<find_all>_next` returns non-overlapping matches one at a time from an
-internal static buffer, refilling it from WASM as needed; call
-`<find_all>_reset()` before starting a new scan over different input.
+```c
+rx_<set>_scanner_t s;
+<find>_init(&s, 0);
+rx_set_match_t m;
+while (<find>_next(&s, input, len, &m))
+    printf("%d %d..%d\n", m.pattern_id, m.start, m.end);
+```
+
+Scanner state is **caller-owned**, so two scans can be in flight at once and
+re-initialising the struct restarts one. The `out_ids` arrays for
+`<match_all>`/`<scan_all>` must hold `<SET>_PATTERN_COUNT` ints.
+
 `pattern_name` is a single shared lookup across every set in the config
 that requested `emit_name_map: true`, not one per set.
 

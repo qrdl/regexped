@@ -1119,7 +1119,7 @@ func TestConfig_DuplicateName_Rejected(t *testing.T) {
 			{Name: "dup", Pattern: `bar`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAny: "ma", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "ma", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	if err := config.ValidateSets(&cfg); err == nil {
@@ -1135,7 +1135,7 @@ func TestConfig_UnknownPatternRef_Rejected(t *testing.T) {
 		Sets: []config.SetConfig{
 			{
 				Name:     "s",
-				FindAny:  "ma",
+				Find:     "ma",
 				Patterns: config.PatternSelector{Names: []string{"unknown_name"}},
 			},
 		},
@@ -1145,7 +1145,7 @@ func TestConfig_UnknownPatternRef_Rejected(t *testing.T) {
 	}
 }
 
-func TestConfig_MissingFindAnyAndAll_Rejected(t *testing.T) {
+func TestConfig_MissingCapabilities_Rejected(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: []config.RegexEntry{{Name: "p", Pattern: `foo`}},
 		Sets: []config.SetConfig{
@@ -1196,7 +1196,7 @@ func TestCompileFile_WithSets_ValidWASM(t *testing.T) {
 		Sets: []config.SetConfig{
 			{
 				Name:     "test_set",
-				FindAny:  "test_match_any",
+				Find:     "test_match_any",
 				Patterns: config.PatternSelector{All: true},
 			},
 		},
@@ -1229,7 +1229,7 @@ func TestCompileFile_WithSets_BatchFindStillWorks(t *testing.T) {
 		Sets: []config.SetConfig{
 			{
 				Name:     "test_set",
-				FindAny:  "test_match_any",
+				Find:     "test_match_any",
 				Patterns: config.PatternSelector{All: true},
 			},
 		},
@@ -1261,7 +1261,7 @@ func TestSetMatch_SingleBucket_Equivalence(t *testing.T) {
 	}
 	spec := SetSpec{
 		Name:       "test",
-		FindAny:    "test_any",
+		Find:       "test_any",
 		Patterns:   patterns,
 		PatternIDs: patternIDs,
 	}
@@ -1334,7 +1334,7 @@ func TestCompileFile_ACFrontend(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: pats,
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -1373,7 +1373,7 @@ func TestCompileFile_ShuftiFrontend(t *testing.T) {
 		Sets: []config.SetConfig{
 			{
 				Name:     "s",
-				FindAll:  "find_all",
+				Find:     "find_all",
 				Patterns: config.PatternSelector{All: true},
 				Hints:    []string{"prefer-no-match"},
 			},
@@ -1413,7 +1413,7 @@ func TestCompileFile_TeddyTwoGroups(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: pats,
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -1435,7 +1435,7 @@ func TestCompileFile_TeddyPartialProbe(t *testing.T) {
 			{Pattern: `gh_pat_[0-9a-zA-Z]{36}`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -1602,7 +1602,7 @@ func TestCompileFile_Embedded_WithSets(t *testing.T) {
 		Output:  "merged.wasm", // non-empty → embedded
 		Regexps: []config.RegexEntry{{Name: "p", Pattern: `bar\w+`}},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "s_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "s_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "out.wasm")
@@ -1621,7 +1621,7 @@ func TestAssembleModuleWithSets_ValidWASM(t *testing.T) {
 			{Name: "p1", Pattern: `foo\d+`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAny: "ma", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "ma", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -1814,7 +1814,7 @@ func TestSetMatch_Anchored_ValidWASM(t *testing.T) {
 func TestSetMatch_Anchored_FindOnlyCompiles(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: []config.RegexEntry{{Name: "p", Pattern: `foo\d+`}},
-		Sets:    []config.SetConfig{{Name: "s", FindAny: "find_foo", Patterns: config.PatternSelector{All: true}}},
+		Sets:    []config.SetConfig{{Name: "s", Find: "find_foo", Patterns: config.PatternSelector{All: true}}},
 	}
 	if _, _, err := CompileFile(cfg, ""); err != nil {
 		t.Fatalf("CompileFile find-only: %v", err)
@@ -1828,7 +1828,7 @@ func TestSetMatch_Anchored_BothExports(t *testing.T) {
 			{Name: "p2", Pattern: `bar\w+`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "both", FindAll: "find_all_fn", Match: "match_fn", Patterns: config.PatternSelector{All: true}},
+			{Name: "both", Find: "find_all_fn", Match: "match_fn", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -1870,7 +1870,7 @@ func TestSetMatch_Anchored_FixedLenPrefix(t *testing.T) {
 			{Name: "p2", Pattern: `[a-z]{2}bar`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -1891,7 +1891,7 @@ func TestSetMatch_Anchored_VarLenEmptySuffix(t *testing.T) {
 			{Name: "p1", Pattern: `\d+foo`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -1912,7 +1912,7 @@ func TestSetMatch_Anchored_VarLenNonEmptySuffix(t *testing.T) {
 			{Name: "p1", Pattern: `\d+foo\d+`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2012,7 +2012,7 @@ func TestSetMatch_Anchored_VarLenEmpty(t *testing.T) {
 			{Name: "p2", Pattern: `[xy]{0,3}bar`}, // bounded varlen prefix, empty suffix
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2035,7 +2035,7 @@ func TestSetMatch_Anchored_VarLenNonEmpty(t *testing.T) {
 			{Name: "p2", Pattern: `[cd]{0,2}bar[zz]`}, // bounded varlen prefix, non-empty suffix
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2069,7 +2069,7 @@ func TestSetFind_AC_VarLenPrefix(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: regs,
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2094,7 +2094,7 @@ func TestSetWithIndividualFuncs(t *testing.T) {
 			{Name: "p3", Pattern: `baz\w+`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "set_find", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2120,7 +2120,7 @@ func TestSetFind_Scalar_StartAnchorVarLen(t *testing.T) {
 			{Name: "fallback", Pattern: `\d+`},           // no mandatory literal → fallback bucket → scalar frontend
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2139,7 +2139,7 @@ func TestCompileFile_ValidateError(t *testing.T) {
 		Regexps: []config.RegexEntry{{Name: "p", Pattern: "foo"}},
 		Sets: []config.SetConfig{
 			// Empty set name is invalid.
-			{Name: "", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	_, _, err := CompileFile(cfg, "")
@@ -2159,7 +2159,7 @@ func TestCompileFile_Embedded(t *testing.T) {
 			{Name: "p2", Pattern: `bar`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2199,7 +2199,7 @@ func FuzzSetMatchEquivalence(f *testing.F) {
 		cfg := config.BuildConfig{
 			Regexps: []config.RegexEntry{{Name: "p", Pattern: pat, FindFunc: "find"}},
 			Sets: []config.SetConfig{
-				{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+				{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 			},
 		}
 		if err := config.ValidateSets(&cfg); err != nil {
@@ -2458,7 +2458,7 @@ func TestCompileFile_ShuftiNonAdaptive(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: pats,
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2503,7 +2503,7 @@ func TestCompileFile_ShuftiVarLenAndAnchor(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: pats,
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2539,7 +2539,7 @@ func TestCompileFile_ACStartAnchor(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: regs,
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2567,7 +2567,7 @@ func TestCompileFile_TeddyTwoGroupsFourByte(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: pats,
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2598,7 +2598,7 @@ func TestAssembleModuleWithSets_LitAnchorAndAnchoredGroups(t *testing.T) {
 			{Name: "set_member", Pattern: `foo|bar`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAny: "s_find", Patterns: config.PatternSelector{Names: []string{"set_member"}}},
+			{Name: "s", Find: "s_find", Patterns: config.PatternSelector{Names: []string{"set_member"}}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2625,7 +2625,7 @@ func TestCompileFile_ErrorPropagation(t *testing.T) {
 				{Name: "ok", Pattern: "foo"},
 			},
 			Sets: []config.SetConfig{
-				{Name: "s", FindAny: "f", Patterns: config.PatternSelector{Names: []string{"ok"}}},
+				{Name: "s", Find: "f", Patterns: config.PatternSelector{Names: []string{"ok"}}},
 			},
 		}
 		_, _, err := CompileFile(cfg, "")
@@ -2643,7 +2643,7 @@ func TestCompileFile_ErrorPropagation(t *testing.T) {
 				{Name: "bad", Pattern: `[invalid`},
 			},
 			Sets: []config.SetConfig{
-				{Name: "myset", FindAny: "f", Patterns: config.PatternSelector{All: true}},
+				{Name: "myset", Find: "f", Patterns: config.PatternSelector{All: true}},
 			},
 		}
 		_, _, err := CompileFile(cfg, "")
@@ -2678,5 +2678,213 @@ func TestSetMatch_ZeroWidthNonNilPrefix(t *testing.T) {
 	}
 	if len(wasm) < 8 || wasm[0] != 0x00 || wasm[1] != 0x61 {
 		t.Fatalf("invalid WASM")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// plans/SETS.md §9.6: the per-export-combination matrix.
+//
+// FABLE wave 3 found bugs visible only under --find-only, and the same is true
+// here: each capability emits a different body shape, and a set that declares
+// only one of them exercises a code path no other config reaches. Every row
+// below is one compiled config, checked for its exports and type-validated.
+
+// setCapNames maps a capability key to the export name used in these tests.
+// Names are deliberately non-prefix-free-safe: no name is a substring of
+// another, so a plain bytes.Contains check cannot confuse "cap_scan" with
+// "cap_scan_any".
+var setCapNames = map[string]string{
+	"match": "zmatchz", "match_any": "zmatchanyz", "match_all": "zmatchallz",
+	"scan": "zscanz", "scan_any": "zscananyz", "scan_all": "zscanallz",
+	"find": "zfindz",
+}
+
+// setConfigWith builds a config declaring exactly the named capabilities.
+func setConfigWith(patterns []string, overlapping bool, caps ...string) config.BuildConfig {
+	entries := make([]config.RegexEntry, len(patterns))
+	names := make([]string, len(patterns))
+	for i, p := range patterns {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+	}
+	sc := config.SetConfig{
+		Name:        "s",
+		Overlapping: overlapping,
+		Patterns:    config.PatternSelector{Names: names},
+	}
+	for _, c := range caps {
+		switch c {
+		case "match":
+			sc.Match = setCapNames[c]
+		case "match_any":
+			sc.MatchAny = setCapNames[c]
+		case "match_all":
+			sc.MatchAll = setCapNames[c]
+		case "scan":
+			sc.Scan = setCapNames[c]
+		case "scan_any":
+			sc.ScanAny = setCapNames[c]
+		case "scan_all":
+			sc.ScanAll = setCapNames[c]
+		case "find":
+			sc.Find = setCapNames[c]
+		default:
+			panic("unknown capability " + c)
+		}
+	}
+	return config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+}
+
+func TestSetCapabilityMatrix(t *testing.T) {
+	pats := []string{`AKIA[A-Z0-9]{4}`, `ghp_[a-z]+`, `a*`, `\bcat\b`, `(?m:^)log`}
+	all := []string{"match", "match_any", "match_all", "scan", "scan_any", "scan_all", "find"}
+
+	rows := []struct {
+		name        string
+		caps        []string
+		overlapping bool
+	}{
+		{"match-only", []string{"match"}, false},
+		{"match_any-only", []string{"match_any"}, false},
+		{"match_all-only", []string{"match_all"}, false},
+		{"scan-only", []string{"scan"}, false},
+		{"scan_any-only", []string{"scan_any"}, false},
+		{"scan_all-only", []string{"scan_all"}, false},
+		{"find-only-gated", []string{"find"}, false},
+		{"find-only-overlapping", []string{"find"}, true},
+		{"scan_any-without-find", []string{"scan_any", "scan"}, false},
+		{"scan_any-with-find", []string{"scan_any", "find"}, false},
+		{"all-seven-gated", all, false},
+		{"all-seven-overlapping", all, true},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			cfg := setConfigWith(pats, r.overlapping, r.caps...)
+			wasm, _, err := CompileFile(cfg, "")
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			validateWASM(t, wasm)
+			for _, c := range r.caps {
+				if !bytes.Contains(wasm, []byte(setCapNames[c])) {
+					t.Errorf("export %q missing from module", setCapNames[c])
+				}
+			}
+			// Undeclared capabilities must not be exported.
+			for _, c := range all {
+				declared := false
+				for _, d := range r.caps {
+					if c == d {
+						declared = true
+					}
+				}
+				if !declared && bytes.Contains(wasm, []byte(setCapNames[c])) {
+					t.Errorf("undeclared capability %q was exported", c)
+				}
+			}
+		})
+	}
+}
+
+// TestSetScanAnyWithoutFindIsSmaller pins the structural half of §5's
+// specialisation claim: a set that declares scan_any and NOT find never emits
+// the extent machinery, so its module is strictly smaller.
+func TestSetScanAnyWithoutFindIsSmaller(t *testing.T) {
+	pats := []string{`AKIA[A-Z0-9]{4}`, `ghp_[a-z]+`, `[a-z]+@example\.com`}
+	withFind, _, err := CompileFile(setConfigWith(pats, true, "scan_any", "find"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// `overlapping` is a load error on a set without find:, so this one omits it.
+	without, _, err := CompileFile(setConfigWith(pats, false, "scan_any"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(without) >= len(withFind) {
+		t.Errorf("scan_any without find should emit less: %d bytes vs %d with find",
+			len(without), len(withFind))
+	}
+}
+
+// TestSetWideAllForm covers the >64-pattern branch of match_all/scan_all,
+// which switches from an i64 bitmask return to an out_ptr bitmap (§3.13).
+func TestSetWideAllForm(t *testing.T) {
+	var pats []string
+	for i := 0; i < 70; i++ {
+		pats = append(pats, fmt.Sprintf("kw%02dX", i))
+	}
+	wasm, _, err := CompileFile(setConfigWith(pats, true, "match_all", "scan_all", "find"), "")
+	if err != nil {
+		t.Fatalf("compile 70-pattern set: %v", err)
+	}
+	validateWASM(t, wasm)
+}
+
+// TestSetOverlappingFlagChangesFindBody pins §3.15: the flag is a
+// compile-time property, and `overlapping: true` emits no gating code at all
+// — so the two bodies cannot be byte-identical.
+func TestSetOverlappingFlagChangesFindBody(t *testing.T) {
+	pats := []string{`a+`, `b`}
+	gated, _, err := CompileFile(setConfigWith(pats, false, "find"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ungated, _, err := CompileFile(setConfigWith(pats, true, "find"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(gated, ungated) {
+		t.Fatal("gated and overlapping find bodies are byte-identical; the flag emitted nothing")
+	}
+	if len(ungated) >= len(gated) {
+		t.Errorf("overlapping: true should emit no gating code, but produced %d bytes vs gated %d",
+			len(ungated), len(gated))
+	}
+}
+
+// TestSetDiagRecordsRouting pins the diagnostics §9.4 asks for: the class of a
+// set must be readable from --diag-json rather than inferred by inspection.
+func TestSetDiagRecordsRouting(t *testing.T) {
+	cases := []struct {
+		name       string
+		pats       []string
+		wantLookbk int
+	}{
+		// Literal at the match start: M = 0, the empty-drain case.
+		{"zero-lookback", []string{`AKIA[A-Z0-9]{4}`, `ghp_x`}, 0},
+		// `\d{3}` sits before the mandatory literal `foo`, so a candidate at
+		// position c serves a match starting at c-3: M = 3, and the body has
+		// a real drain to run rather than stopping at the first candidate.
+		{"fixed-lookback", []string{`\d{3}foo`, `foo`}, 3},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := setConfigWith(c.pats, true, "find")
+			var prefixPool, suffixPool dfaPool
+			var infos []*PatternInfo
+			var ids []int
+			for i, re := range cfg.Regexps {
+				info, err := analyzePattern(re, &prefixPool, &suffixPool)
+				if err != nil {
+					t.Fatal(err)
+				}
+				info.globalID = i
+				infos = append(infos, info)
+				ids = append(ids, i)
+			}
+			cs := CompileSet(SetSpec{
+				Name: "s", Find: "cap_find", Overlapping: true,
+				Patterns: infos, PatternIDs: ids,
+			}, &prefixPool, &suffixPool, CompileSetOptions{})
+			if cs.diag.MaxLookback != c.wantLookbk {
+				t.Errorf("MaxLookback = %d, want %d", cs.diag.MaxLookback, c.wantLookbk)
+			}
+			if !cs.diag.Overlapping {
+				t.Error("diag did not record overlapping: true")
+			}
+			if len(cs.diag.Capabilities) != 1 || cs.diag.Capabilities[0] != "find" {
+				t.Errorf("diag capabilities = %v, want [find]", cs.diag.Capabilities)
+			}
+		})
 	}
 }

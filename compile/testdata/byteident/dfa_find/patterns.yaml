@@ -1,0 +1,6 @@
+# Plain DFA find body: the state count must exceed 256 so maybeCompiledDFA
+# does NOT promote it to the direct-index CompiledDFA shape, and the
+# alternation forces LeftmostFirst on top.
+regexps:
+  - pattern: '(?:alpha|beta|gamma)[0-9a-f]{300}'
+    find_func: dfa_find

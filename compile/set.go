@@ -25,13 +25,12 @@ type PatternInfo struct {
 	prefixDFA *dfaTable // built from prefixAST (reversed); nil when trivial
 	prefixID  int       // index into dedup prefix pool; -1 = trivial
 
-	trivialPrefix        bool // true when prefixAST is nil
-	startAnchor          bool // true when original prefixAST (before trimming) had BeginText/BeginLine
-	prefixMaxLen         int  // max byte length of prefix (0=trivial, -1=unbounded)
-	prefixMinLen         int  // min byte length of prefix (0=trivial)
-	varLenEmptySuffix    bool // variable-length prefix + empty suffix: write match tuple directly
-	varLenNonEmptySuffix bool // variable-length prefix + non-empty suffix: call suffix DFA with corrected lPos
-	isolatedFallback     bool // non-greedy: isolate in own fallback bucket with leftmostFirst=false DFA
+	trivialPrefix    bool // true when prefixAST is nil
+	startAnchor      bool // \A / ^ : eligible only at input position 0
+	lineAnchor       bool // (?m:^): eligible at position 0 and after any newline
+	prefixMaxLen     int  // byte length of the (fixed-length) prefix; 0 = trivial
+	prefixMinLen     int  // always equal to prefixMaxLen — see analyzePattern
+	isolatedFallback bool // non-greedy: isolate in own fallback bucket with leftmostFirst=false DFA
 
 	suffixDFA      *dfaTable // built from suffixAST
 	suffixClasses  int       // numClasses after computeByteClasses (Phase 2)
@@ -189,6 +188,78 @@ func hasBeginAnchorAtTopLevel(re *syntax.Regexp) bool {
 	return false
 }
 
+// beginAnchorKind classifies a begin anchor for set eligibility masking.
+type beginAnchorKind int
+
+const (
+	beginAnchorNone beginAnchorKind = iota
+	// beginAnchorText is \A / non-multiline ^: the match can only start at
+	// input position 0, whatever `from` the caller passed.
+	beginAnchorText
+	// beginAnchorLine is (?m:^): the match can start at position 0 or at any
+	// position whose preceding byte is a newline. Collapsing this to
+	// "position 0 only" is plans/FABLE.md B43.
+	beginAnchorLine
+)
+
+// topLevelBeginAnchorKind classifies the mandatory start of re. Returns
+// beginAnchorNone when the leading assertion is not a begin anchor, or when
+// the anchor sits inside *, ?, + or an alternation and therefore does not
+// restrict the pattern at all.
+func topLevelBeginAnchorKind(re *syntax.Regexp) beginAnchorKind {
+	if re == nil {
+		return beginAnchorNone
+	}
+	switch re.Op {
+	case syntax.OpBeginText:
+		return beginAnchorText
+	case syntax.OpBeginLine:
+		return beginAnchorLine
+	case syntax.OpConcat:
+		if len(re.Sub) > 0 {
+			return topLevelBeginAnchorKind(re.Sub[0])
+		}
+	case syntax.OpCapture:
+		if len(re.Sub) > 0 {
+			return topLevelBeginAnchorKind(re.Sub[0])
+		}
+	}
+	return beginAnchorNone
+}
+
+// strippedAnchorKind classifies an only-begin-anchors prefix that is about to
+// be replaced by an eligibility mask. \A wins over (?m:^) when both appear,
+// because \A is the stricter of the two and the mask must not admit a
+// position \A forbids.
+func strippedAnchorKind(re *syntax.Regexp) beginAnchorKind {
+	if re == nil {
+		return beginAnchorNone
+	}
+	if containsOp(re, syntax.OpBeginText) {
+		return beginAnchorText
+	}
+	if containsOp(re, syntax.OpBeginLine) {
+		return beginAnchorLine
+	}
+	return beginAnchorNone
+}
+
+// containsOp reports whether re contains an operator of the given kind.
+func containsOp(re *syntax.Regexp, op syntax.Op) bool {
+	if re == nil {
+		return false
+	}
+	if re.Op == op {
+		return true
+	}
+	for _, sub := range re.Sub {
+		if containsOp(sub, op) {
+			return true
+		}
+	}
+	return false
+}
+
 // isOnlyBeginAnchors reports whether re consists entirely of BeginText or
 // BeginLine assertions (possibly concatenated). Used to decide whether a
 // zero-length prefix can be safely stripped to just a startAnchor flag.
@@ -210,6 +281,21 @@ func isOnlyBeginAnchors(re *syntax.Regexp) bool {
 		return len(re.Sub) == 1 && isOnlyBeginAnchors(re.Sub[0])
 	}
 	return false
+}
+
+// setTopLevelAnchor records the eligibility restriction implied by a fallback
+// pattern's leading anchor. The fallback bucket's DFA models the whole pattern
+// including the assertion, so this is a pre-filter that saves a DFA run rather
+// than the sole implementation of the anchor — but it must not be STRICTER
+// than the assertion, which is what collapsing (?m:^) to "position 0" did
+// (plans/FABLE.md B43).
+func (info *PatternInfo) setTopLevelAnchor(parsed *syntax.Regexp) {
+	switch topLevelBeginAnchorKind(parsed) {
+	case beginAnchorText:
+		info.startAnchor = true
+	case beginAnchorLine:
+		info.lineAnchor = true
+	}
 }
 
 // analyzePattern parses re.Pattern, finds the mandatory literal, splits the
@@ -254,7 +340,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	// degenerate DFAs with false EOF accepts — exclude them from sets entirely.
 	if minLen, _ := regexpMinMaxLen(parsed); minLen == 0 {
 		info.splittable = false
-		info.startAnchor = hasBeginAnchorAtTopLevel(parsed)
+		info.setTopLevelAnchor(parsed)
 		return info, nil
 	}
 
@@ -270,7 +356,12 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 			if prefixAST != nil {
 				if _, maxLen := regexpMinMaxLen(prefixAST); maxLen == 0 {
 					if isOnlyBeginAnchors(prefixAST) {
-						info.startAnchor = true
+						switch strippedAnchorKind(prefixAST) {
+						case beginAnchorLine:
+							info.lineAnchor = true
+						default:
+							info.startAnchor = true
+						}
 						prefixAST = nil
 					} else {
 						// Non-begin or mixed zero-length prefix: route to fallback.
@@ -283,13 +374,58 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 			if suffixAST != nil && hasBeginAnchor(suffixAST) {
 				info.splittable = false
 			}
-			info.prefixAST = prefixAST
-			info.suffixAST = suffixAST
+			// Keep the split ONLY if it survived every rejection above.
+			// Retaining prefixAST after a rejection is one of the two
+			// mechanisms behind plans/FABLE.md B40: a `\b` prefix is
+			// zero-length and not an only-begin-anchor, so the split is
+			// rejected — but the retained prefixAST still made the pattern
+			// look split, so it got a backward "prefix DFA" for a bare
+			// assertion (which accepts nothing) and a suffix DFA for a
+			// fragment rather than the whole pattern. The result was a
+			// pattern that silently never matched.
+			if info.splittable {
+				info.prefixAST = prefixAST
+				info.suffixAST = suffixAST
+			}
 		}
 		// Fallback patterns: only truly anchored if the begin-anchor is at the
 		// mandatory top level (not inside *, ?, etc.).
 		if !info.splittable {
-			info.startAnchor = hasBeginAnchorAtTopLevel(parsed)
+			info.setTopLevelAnchor(parsed)
+		}
+	}
+
+	// Variable-length prefixes route to fallback (plans/SETS.md §9.4).
+	//
+	// The split representation prefix.literal.suffix answers "where does a
+	// match starting at s end?" by finding a literal occurrence and walking
+	// the backward prefix DFA to recover s. That is exact only while each
+	// match start maps to exactly ONE literal position — i.e. while the
+	// prefix has a fixed length. With a variable-length prefix one start has
+	// several candidate literal positions with DIFFERENT extents, and which
+	// one RE2 picks depends on the prefix's greedy structure, which a
+	// backward DFA cannot express. Two failures follow directly, both
+	// observed on `a?a` over "aa":
+	//
+	//   - the backward DFA reports the LEFTMOST start it can reach, so the
+	//     match at start 1 is never generated at all (only 0-2 is);
+	//   - the same start is reported twice with different extents (0-1 from
+	//     the empty-prefix candidate, 0-2 from the one-char-prefix
+	//     candidate), where RE2 has exactly one answer, 0-2.
+	//
+	// This is the root cause behind plans/FABLE.md B41's back-dated tuples.
+	// Routing to fallback runs the whole pattern's DFA anchored at each
+	// position, which is the only construction that gets the extent right —
+	// and it is also what §9.4's class B says such a set must do, since a
+	// literal arbitrarily far to the right can serve a match starting here so
+	// nothing can be skipped anyway. The cost is the literal frontend, which
+	// a class-B set could not have used regardless.
+	if info.prefixAST != nil {
+		if minLen, maxLen := regexpMinMaxLen(info.prefixAST); minLen != maxLen {
+			info.splittable = false
+			info.prefixAST = nil
+			info.suffixAST = nil
+			info.setTopLevelAnchor(parsed)
 		}
 	}
 
@@ -297,16 +433,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	if !info.trivialPrefix && info.prefixAST != nil {
 		minLen, maxLen := regexpMinMaxLen(info.prefixAST)
 		info.prefixMinLen = minLen
-		info.prefixMaxLen = maxLen // -1 if unbounded
-		// Variable-length prefix: match start computed at runtime via backward DFA.
-		// Split by suffix presence for different handling in emitComputeValidMask.
-		if minLen != maxLen {
-			if info.suffixAST == nil {
-				info.varLenEmptySuffix = true
-			} else {
-				info.varLenNonEmptySuffix = true
-			}
-		}
+		info.prefixMaxLen = maxLen
 	}
 
 	// Build prefix DFA (reversed prefix AST).
@@ -1194,4 +1321,121 @@ func patternRefFor(p *PatternInfo) PatternRef {
 		name = p.fullPattern
 	}
 	return PatternRef{ID: p.globalID, Name: name}
+}
+
+// --------------------------------------------------------------------------
+// Anchored-capability automata (plans/SETS.md §3.3, §9.5 S3).
+//
+// `match`, `match_any` and `match_all` ask whether a pattern matches the WHOLE
+// input, which is `\A(?:p)\z` — and that is NOT a question a leftmost-first
+// automaton can answer. Leftmost-first prunes the search the moment the
+// highest-priority alternative accepts, so the DFA for `a|ab` has no
+// transition out of the state reached by "a", and `a+?` dies after one byte.
+// Both patterns match "ab" / "aaa" end-to-end, and both would be reported as
+// non-matching by the find-path DFAs.
+//
+// The anchored capabilities therefore get their own automata: the FULL pattern
+// (never the post-literal suffix), merged with leftmostFirst = false so every
+// alternative stays live to the end of the input. Compile time is free
+// (CLAUDE.md); correctness here is not negotiable.
+
+// patternFullAST returns the whole pattern's AST with captures stripped.
+func patternFullAST(p *PatternInfo) *syntax.Regexp {
+	re, err := syntax.Parse(p.fullPattern, syntax.Perl)
+	if err != nil {
+		return nil
+	}
+	stripCaptures(re)
+	return re
+}
+
+// mergeAnchoredDFA is mergeSuffixDFA with leftmostFirst disabled.
+func mergeAnchoredDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, error) {
+	bw := opts.bitmaskWidth()
+	if len(asts) == 0 {
+		return nil, fmt.Errorf("mergeAnchoredDFA: empty pattern list")
+	}
+	if len(asts) > bw {
+		return nil, fmt.Errorf("mergeAnchoredDFA: %d patterns exceed bitmaskWidth %d", len(asts), bw)
+	}
+	progs := make([]*syntax.Prog, len(asts))
+	for k, a := range asts {
+		p, err := syntax.Compile(a.Simplify())
+		if err != nil {
+			return nil, fmt.Errorf("mergeAnchoredDFA: compile pattern %d: %w", k, err)
+		}
+		progs[k] = p
+	}
+	unionProg, patternBits := buildUnionProg(progs, bw)
+	d, ok := newDFA(unionProg, false, false, maxHelperDFAStates, patternBits)
+	if !ok {
+		return nil, errDFAStateLimitExceeded
+	}
+	return dfaTableFromCanonical(d), nil
+}
+
+// compileAnchoredBuckets packs every pattern of the set into buckets whose
+// merged, non-leftmost-first DFA fits the state and byte budgets. Patterns are
+// taken in declaration order so a bucket's bit k maps to a stable global id.
+func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) ([]*bucket, [][]*PatternInfo) {
+	bw := opts.bitmaskWidth()
+	byteBudget := opts.budgetBytes()
+	stateBudget := opts.budgetStates()
+
+	var buckets []*bucket
+	var members [][]*PatternInfo
+
+	for _, p := range patterns {
+		ast := patternFullAST(p)
+		if ast == nil {
+			continue
+		}
+		placed := false
+		for bi := range buckets {
+			if len(members[bi]) >= bw {
+				continue
+			}
+			asts := make([]*syntax.Regexp, 0, len(members[bi])+1)
+			for _, m := range members[bi] {
+				asts = append(asts, patternFullAST(m))
+			}
+			asts = append(asts, ast)
+			merged, err := mergeAnchoredDFA(asts, opts)
+			if err != nil {
+				continue
+			}
+			if dfaTableBytes(merged) > byteBudget || merged.numStates > stateBudget {
+				continue
+			}
+			members[bi] = append(members[bi], p)
+			buckets[bi].suffixDFA = merged
+			buckets[bi].suffixStates = merged.numStates
+			buckets[bi].patterns = members[bi]
+			placed = true
+			break
+		}
+		if placed {
+			continue
+		}
+		solo, err := mergeAnchoredDFA([]*syntax.Regexp{ast}, opts)
+		if err != nil || solo.numStates > opts.maxFallbackStates() {
+			states := 0
+			if solo != nil {
+				states = solo.numStates
+			}
+			warnPatternDropped(p, "anchored bucket", states, opts.maxFallbackStates())
+			if diag != nil {
+				diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
+			}
+			continue
+		}
+		buckets = append(buckets, &bucket{
+			patterns:     []*PatternInfo{p},
+			suffixDFA:    solo,
+			suffixStates: solo.numStates,
+			isFallback:   true,
+		})
+		members = append(members, []*PatternInfo{p})
+	}
+	return buckets, members
 }

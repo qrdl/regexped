@@ -11,7 +11,8 @@ import (
 // Identifier validation for user-supplied export names.
 //
 // Every `match_func` / `find_func` / `groups_func` / `named_groups_func` value,
-// and every set's `find_any` / `find_all` / `match` value, is interpolated
+// and every set capability value (`match`, `match_any`, `match_all`, `scan`,
+// `scan_any`, `scan_all`, `find`), is interpolated
 // verbatim into generated source in all six stub languages (see generate/).
 // Without a check, a config file can plant arbitrary code in the caller's
 // crate/module — see plans/OPUS.md §N4, where this is demonstrated end to end.
@@ -198,16 +199,9 @@ func ValidateConfig(cfg *BuildConfig) error {
 
 	for _, s := range cfg.Sets {
 		owner := fmt.Sprintf("set %q", s.Name)
-		for _, f := range []struct{ field, name string }{
-			{"find_any", s.FindAny},
-			{"find_all", s.FindAll},
-			{"match", s.Match},
-		} {
-			if f.name == "" {
-				continue
-			}
-			if err := ValidateIdentifier(f.name); err != nil {
-				problems = append(problems, fmt.Sprintf("%s: %s %q %v", owner, f.field, f.name, err))
+		for _, c := range s.Capabilities() {
+			if err := ValidateIdentifier(c.Name); err != nil {
+				problems = append(problems, fmt.Sprintf("%s: %s %q %v", owner, c.Field, c.Name, err))
 			}
 		}
 	}
@@ -375,14 +369,8 @@ func allExportRefs(cfg *BuildConfig) []exportRef {
 	}
 	for _, s := range cfg.Sets {
 		owner := fmt.Sprintf("set %q", s.Name)
-		for _, f := range []struct{ field, name string }{
-			{"find_any", s.FindAny},
-			{"find_all", s.FindAll},
-			{"match", s.Match},
-		} {
-			if f.name != "" {
-				refs = append(refs, exportRef{owner, f.field, f.name})
-			}
+		for _, c := range s.Capabilities() {
+			refs = append(refs, exportRef{owner, c.Field, c.Name})
 		}
 	}
 	return refs

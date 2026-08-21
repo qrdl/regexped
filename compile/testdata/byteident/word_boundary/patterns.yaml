@@ -1,0 +1,4 @@
+# Word-boundary find: the prevWasWord context bit doubles the state space.
+regexps:
+  - pattern: '\bclass\b'
+    find_func: wb_find

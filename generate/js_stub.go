@@ -30,58 +30,145 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		return ""
 	}
 	var out strings.Builder
-	out.WriteString("\n// ---- set composition wrappers ----\n\n")
+	out.WriteString("\n// ---- set composition wrappers (plans/SETS.md §4.5) ----\n")
+	out.WriteString("//\n")
+	out.WriteString("// Return types are called out on every function because JavaScript cannot\n")
+	out.WriteString("// catch the predicate-versus-list misreading `_any`/`_all` invite: an empty\n")
+	out.WriteString("// array is truthy, so `if (setScanAll(x))` is ALWAYS true.\n")
+	out.WriteString("//\n")
+	out.WriteString("// Do not call other stub functions while an iterator is suspended: the\n")
+	out.WriteString("// staged input and the shared output region belong to whichever call ran\n")
+	out.WriteString("// last (see docs/js-api.md).\n\n")
 	for _, s := range cfg.Sets {
-		bs := batchSize(s, cfg)
-		if s.FindAll != "" || s.FindAny != "" {
-			wasmExport := s.FindAll
-			if wasmExport == "" {
-				wasmExport = s.FindAny
-			}
-			if s.FindAll != "" {
-				fmt.Fprintf(&out, `export function* %s(input) {
-    const len = _w(input, %d*12);
-    const outBuf = new Int32Array(_mem.buffer, _outBase, %d*3);
-    let startPos = 0;
-    while (true) {
-        const n = _exp['%s'](_inBase, len, _outBase, %d, startPos);
-        if (n <= 0) break;
-        for (let i = 0; i < n; i++) {
-            yield { patternId: outBuf[i*3], start: outBuf[i*3+1], end: outBuf[i*3+1]+outBuf[i*3+2] };
-        }
-        // find_all returns when EITHER the buffer is full (n == cap) OR the
-        // input has been fully scanned (n < cap). Only the buffer-full case
-        // needs a resume; otherwise we're done with this input.
-        if (n < %d) break;
-        // Advance by exactly one position past the last reported start: the WASM
-        // scan is position-by-position and only positions <= last.start have been
-        // visited when the buffer fills, regardless of last.length.
-        startPos = outBuf[(n-1)*3+1] + 1;
-    }
-}
-`, s.FindAll, bs, bs, wasmExport, bs, bs)
-			}
-			if s.FindAny != "" {
-				fmt.Fprintf(&out, `export function %s(input) {
-    const len = _w(input);
-    const outBuf = new Int32Array(_mem.buffer, _outBase, 3);
-    const n = _exp['%s'](_inBase, len, _outBase, 1, 0);
-    if (n <= 0) return null;
-    return { patternId: outBuf[0], start: outBuf[1], end: outBuf[1]+outBuf[2] };
-}
-`, s.FindAny, wasmExport)
-			}
-		}
+		n := patternsInSet(s, cfg)
+		konst := camelSet(s.Name) + "PatternCount"
+		wide := wideAllForm(s, cfg)
+		// §4.9 standalone layout: tuples, then the gate array, then the
+		// >64-pattern bitmap, all above _outBase.
+		reserve := 16*n + (n+7)/8
+
+		fmt.Fprintf(&out, "// Number of patterns in set %q. Every buffer below is sized from it.\nexport const %s = %d;\n\n", s.Name, konst, n)
+
 		if s.Match != "" {
-			fmt.Fprintf(&out, `export function %s(input) {
+			fmt.Fprintf(&out, `// -> boolean
+export function %s(input) {
     const len = _w(input);
-    const outBuf = new Int32Array(_mem.buffer, _outBase, 3);
-    const n = _exp['%s'](_inBase, len, _outBase, 1);
-    if (n <= 0) return null;
-    return { patternId: outBuf[0], start: outBuf[1], end: outBuf[1]+outBuf[2] };
+    return _exp['%s'](_inBase, len) !== 0;
 }
 `, s.Match, s.Match)
 		}
+		if s.MatchAny != "" {
+			fmt.Fprintf(&out, `// -> number | null   (a pattern id, NOT a boolean)
+export function %s(input) {
+    const len = _w(input);
+    const id = _exp['%s'](_inBase, len);
+    return id < 0 ? null : id;
+}
+`, s.MatchAny, s.MatchAny)
+		}
+		if s.MatchAll != "" {
+			if wide {
+				fmt.Fprintf(&out, `// -> number[]   (pattern ids, NOT a boolean)
+export function %s(input) {
+    const len = _w(input, %d);
+    const bitmapBase = _outBase + 16*%s;
+    new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
+    _exp['%s'](_inBase, len, bitmapBase);
+    const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
+    const out = [];
+    for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
+    return out;
+}
+`, s.MatchAll, reserve, konst, konst, s.MatchAll, konst, konst)
+			} else {
+				fmt.Fprintf(&out, `// -> number[]   (pattern ids, NOT a boolean)
+export function %s(input) {
+    const len = _w(input);
+    // The export returns an i64, which surfaces as a BigInt; it is decomposed
+    // here and never reaches the caller.
+    let mask = _exp['%s'](_inBase, len);
+    const out = [];
+    for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
+    return out;
+}
+`, s.MatchAll, s.MatchAll, konst)
+			}
+		}
+		if s.Scan != "" {
+			fmt.Fprintf(&out, `// -> boolean
+export function %s(input, from = 0) {
+    const len = _w(input);
+    return _exp['%s'](_inBase, len, from) !== 0;
+}
+`, s.Scan, s.Scan)
+		}
+		if s.ScanAny != "" {
+			fmt.Fprintf(&out, `// -> { patternId, start } | null   (NOT a boolean)
+export function %s(input, from = 0) {
+    const len = _w(input);
+    const packed = _exp['%s'](_inBase, len, from);
+    if (packed < 0n) return null;
+    return { patternId: Number(packed & 0xFFFFFFFFn), start: Number(packed >> 32n) };
+}
+`, s.ScanAny, s.ScanAny)
+		}
+		if s.ScanAll != "" {
+			if wide {
+				fmt.Fprintf(&out, `// -> number[]   (pattern ids, NOT a boolean)
+export function %s(input, from = 0) {
+    const len = _w(input, %d);
+    const bitmapBase = _outBase + 16*%s;
+    new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
+    _exp['%s'](_inBase, len, from, bitmapBase);
+    const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
+    const out = [];
+    for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
+    return out;
+}
+`, s.ScanAll, reserve, konst, konst, s.ScanAll, konst, konst)
+			} else {
+				fmt.Fprintf(&out, `// -> number[]   (pattern ids, NOT a boolean)
+export function %s(input, from = 0) {
+    const len = _w(input);
+    let mask = _exp['%s'](_inBase, len, from);
+    const out = [];
+    for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
+    return out;
+}
+`, s.ScanAll, s.ScanAll, konst)
+			}
+		}
+		if s.Find != "" {
+			gateSetup, gateArg, gateDoc := "", "", ""
+			if gatedFind(s) {
+				gateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*%s;
+    new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
+`, konst, konst)
+				gateArg = "gateBase, "
+				gateDoc = "// The generator owns the gate array for its lifetime: dropping it and\n" +
+					"// creating a new one restarts the scan with clean gates.\n"
+			}
+			fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }
+%sexport function* %s(input, from = 0) {
+    const len = _w(input, %d);
+%s    let pos = from;
+    while (true) {
+        const n = _exp['%s'](_inBase, len, pos, %s_outBase, %s);
+        if (n <= 0) break;
+        // The buffer is sized at the set's pattern count, the exact worst case
+        // for a single position, so n can never exceed it.
+        const buf = new Int32Array(_mem.buffer, _outBase, n*3);
+        // Every tuple in one call shares a start; resume one past it.
+        const next = buf[1] + 1;
+        for (let i = 0; i < n; i++) {
+            yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
+        }
+        pos = next;
+    }
+}
+`, gateDoc, s.Find, reserve, gateSetup, s.Find, gateArg, konst)
+		}
+		out.WriteString("\n")
 	}
 	if hasEmitNameMap(cfg) {
 		out.WriteString("const _patternNames = [")

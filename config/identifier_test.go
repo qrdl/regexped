@@ -117,7 +117,7 @@ func TestValidateConfig_ReportsAllProblems(t *testing.T) {
 			{Name: "p4", Pattern: "d", NamedGroupsFunc: "fine_name"},
 		},
 		Sets: []SetConfig{
-			{Name: "s1", FindAll: "delete"},
+			{Name: "s1", ScanAll: "delete"},
 		},
 	}
 	err := ValidateConfig(&cfg)

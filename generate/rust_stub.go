@@ -29,17 +29,21 @@ func rustStub(cfg config.BuildConfig, out string) error {
 	return writeStub(out, []byte(combined))
 }
 
-// genRustSetInner generates Rust wrappers for all sets in cfg.
-// Returns unindented content for placement INSIDE pub mod <importModule>.
-// Emits SetMatch type (once), per-set iterators/wrappers, and optional pattern_name().
-// SetMatch is used for all match operations (find_all, find_any, anchored match).
+// genRustSetInner generates Rust wrappers for all sets in cfg
+// (plans/SETS.md §4.3). Returns unindented content for placement INSIDE
+// pub mod <importModule>.
+//
+// D15: `find` is iterator-only and yields individual SetMatch values; the
+// iterator owns the reusable tuple buffer and, for a gated set, the gate
+// array, so gates never appear in the public surface. D16: every buffer is
+// declared in terms of the emitted <SET>_PATTERN_COUNT constant.
 func genRustSetInner(cfg config.BuildConfig) string {
 	if !hasSetExports(cfg) {
 		return ""
 	}
 	var out strings.Builder
-	out.WriteString(`/// A match from a set find_any, find_all, or anchored match operation.
-#[derive(Debug, Clone, Copy)]
+	out.WriteString("/// A match reported by a set `find` iterator.\n" +
+		`#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetMatch {
     pub pattern_id: usize,
     pub start: usize,
@@ -53,31 +57,149 @@ impl SetMatch {
 
 `)
 	for _, s := range cfg.Sets {
-		bs := batchSize(s, cfg)
-		if s.FindAll != "" || s.FindAny != "" {
-			ffiName := "ffi_" + s.FindAll
-			wasmExport := s.FindAll
-			if wasmExport == "" {
-				wasmExport = s.FindAny
-				ffiName = "ffi_" + s.FindAny
+		n := patternsInSet(s, cfg)
+		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
+		wide := wideAllForm(s, cfg)
+
+		fmt.Fprintf(&out, "/// Number of patterns in set %q. Every buffer below is sized from it.\npub const %s: usize = %d;\n\n", s.Name, konst, n)
+
+		fmt.Fprintf(&out, "#[link(wasm_import_module = %q)]\nunsafe extern \"C\" {\n", cfg.ImportModule)
+		decl := func(name, sig string) {
+			fmt.Fprintf(&out, "    #[link_name = %q]\n    fn ffi_%s%s;\n", name, name, sig)
+		}
+		if s.Match != "" {
+			decl(s.Match, "(ptr: *const u8, len: i32) -> i32")
+		}
+		if s.MatchAny != "" {
+			decl(s.MatchAny, "(ptr: *const u8, len: i32) -> i32")
+		}
+		if s.MatchAll != "" {
+			if wide {
+				decl(s.MatchAll, "(ptr: *const u8, len: i32, out: *mut u8) -> i32")
+			} else {
+				decl(s.MatchAll, "(ptr: *const u8, len: i32) -> i64")
 			}
-			iterName := iterTypeName(s.FindAll)
-			if s.FindAll == "" {
-				iterName = iterTypeName(s.FindAny)
+		}
+		if s.Scan != "" {
+			decl(s.Scan, "(ptr: *const u8, len: i32, from: i32) -> i32")
+		}
+		if s.ScanAny != "" {
+			decl(s.ScanAny, "(ptr: *const u8, len: i32, from: i32) -> i64")
+		}
+		if s.ScanAll != "" {
+			if wide {
+				decl(s.ScanAll, "(ptr: *const u8, len: i32, from: i32, out: *mut u8) -> i32")
+			} else {
+				decl(s.ScanAll, "(ptr: *const u8, len: i32, from: i32) -> i64")
 			}
-			fmt.Fprintf(&out, `#[link(wasm_import_module = "%s")]
-unsafe extern "C" {
-    #[link_name = "%s"]
-    fn %s(ptr: *const u8, len: i32, out: *mut i32, cap: i32, start: i32) -> i32;
+		}
+		if s.Find != "" {
+			if gatedFind(s) {
+				decl(s.Find, "(ptr: *const u8, len: i32, from: i32, gates: *mut u32, out: *mut i32, cap: i32) -> i32")
+			} else {
+				decl(s.Find, "(ptr: *const u8, len: i32, from: i32, out: *mut i32, cap: i32) -> i32")
+			}
+		}
+		out.WriteString("}\n\n")
+
+		if s.Match != "" {
+			fmt.Fprintf(&out, `/// Returns true when some pattern in the set matches the WHOLE input.
+pub fn %s(input: &[u8]) -> bool {
+    unsafe { ffi_%s(input.as_ptr(), input.len() as i32) != 0 }
 }
 
-`, cfg.ImportModule, wasmExport, ffiName)
+`, s.Match, s.Match)
+		}
+		if s.MatchAny != "" {
+			fmt.Fprintf(&out, `/// Returns the id of SOME pattern matching the whole input, or None.
+/// A set is unordered, so which id you get is unspecified when several match.
+pub fn %s(input: &[u8]) -> Option<usize> {
+    let r = unsafe { ffi_%s(input.as_ptr(), input.len() as i32) };
+    if r < 0 { None } else { Some(r as usize) }
+}
 
-			if s.FindAll != "" {
-				fmt.Fprintf(&out, `pub struct %s<'a> {
+`, s.MatchAny, s.MatchAny)
+		}
+		if s.MatchAll != "" {
+			fmt.Fprintf(&out, "/// Returns the ids of every pattern matching the whole input.\npub fn %s(input: &[u8]) -> Vec<usize> {\n", s.MatchAll)
+			if wide {
+				fmt.Fprintf(&out, `    let mut bits = [0u8; (%s + 7) / 8];
+    let n = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, bits.as_mut_ptr()) };
+    let mut out = Vec::with_capacity(n as usize);
+    for k in 0..%s {
+        if bits[k / 8] & (1u8 << (k %% 8)) != 0 { out.push(k); }
+    }
+    out
+}
+
+`, konst, s.MatchAll, konst)
+			} else {
+				fmt.Fprintf(&out, `    let mask = unsafe { ffi_%s(input.as_ptr(), input.len() as i32) } as u64;
+    (0..%s).filter(|k| mask & (1u64 << k) != 0).collect()
+}
+
+`, s.MatchAll, konst)
+			}
+		}
+		if s.Scan != "" {
+			fmt.Fprintf(&out, "/// Returns true when some pattern matches at a position at or after `from`.\n"+
+				`pub fn %s(input: &[u8], from: usize) -> bool {
+    unsafe { ffi_%s(input.as_ptr(), input.len() as i32, from as i32) != 0 }
+}
+
+`, s.Scan, s.Scan)
+		}
+		if s.ScanAny != "" {
+			fmt.Fprintf(&out, "/// Returns (pattern id, start) for the FIRST position at or after `from`\n"+
+				"/// where anything matches, or None. Which id you get is unspecified when\n"+
+				"/// several patterns match at that position.\n"+
+				`pub fn %s(input: &[u8], from: usize) -> Option<(usize, usize)> {
+    let packed = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, from as i32) };
+    if packed < 0 { return None; }
+    Some(((packed & 0xFFFF_FFFF) as usize, (packed >> 32) as usize))
+}
+
+`, s.ScanAny, s.ScanAny)
+		}
+		if s.ScanAll != "" {
+			fmt.Fprintf(&out, "/// Returns the ids of every pattern matching somewhere at or after `from`.\n"+
+				"pub fn %s(input: &[u8], from: usize) -> Vec<usize> {\n", s.ScanAll)
+			if wide {
+				fmt.Fprintf(&out, `    let mut bits = [0u8; (%s + 7) / 8];
+    let n = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, from as i32, bits.as_mut_ptr()) };
+    let mut out = Vec::with_capacity(n as usize);
+    for k in 0..%s {
+        if bits[k / 8] & (1u8 << (k %% 8)) != 0 { out.push(k); }
+    }
+    out
+}
+
+`, konst, s.ScanAll, konst)
+			} else {
+				fmt.Fprintf(&out, `    let mask = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, from as i32) } as u64;
+    (0..%s).filter(|k| mask & (1u64 << k) != 0).collect()
+}
+
+`, s.ScanAll, konst)
+			}
+		}
+		if s.Find != "" {
+			iterName := iterTypeName(s.Find)
+			gateField, gateInit, gateArg, gateDoc := "", "", "", ""
+			if gatedFind(s) {
+				gateField = "    gates: [u32; " + konst + "],\n"
+				gateInit = " gates: [0u32; " + konst + "],"
+				gateArg = "self.gates.as_mut_ptr(), "
+				gateDoc = " and a zeroed gate array"
+			}
+			fmt.Fprintf(&out, `/// Iterator over the set's matches. It owns a reusable tuple buffer%s,
+/// refills at each matching position and yields that position's matches one
+/// at a time before advancing. Dropping and re-creating it restarts the scan.
+pub struct %s<'a> {
     input: &'a [u8],
-    start_pos: i32,
-    buf: [[i32; 3]; %d],
+    from: i32,
+    done: bool,
+%s    buf: [[i32; 3]; %s],
     count: i32,
     idx: i32,
 }
@@ -89,68 +211,31 @@ impl<'a> Iterator for %s<'a> {
             if self.idx < self.count {
                 let e = self.buf[self.idx as usize];
                 self.idx += 1;
-                return Some(SetMatch { pattern_id: e[0] as usize, start: e[1] as usize, end: (e[1]+e[2]) as usize });
+                return Some(SetMatch { pattern_id: e[0] as usize, start: e[1] as usize, end: e[2] as usize });
             }
-            if self.start_pos < 0 { return None; }
-            let n = unsafe { %s(self.input.as_ptr(), self.input.len() as i32, self.buf.as_mut_ptr() as *mut i32, %d, self.start_pos) };
-            if n <= 0 { return None; }
+            if self.done { return None; }
+            let n = unsafe {
+                ffi_%s(self.input.as_ptr(), self.input.len() as i32, self.from,
+                    %sself.buf.as_mut_ptr() as *mut i32, %s as i32)
+            };
+            if n <= 0 { self.done = true; return None; }
+            // The buffer is sized at the set's pattern count, the exact worst
+            // case for a single position, so n can never exceed it.
             self.count = n;
             self.idx = 0;
-            // find_all returns when EITHER the buffer is full (n == cap) OR the
-            // input has been fully scanned (n < cap). Only the buffer-full case
-            // needs a resume; otherwise we mark the iterator exhausted so the
-            // next outer iteration returns None after the buffer is drained.
-            if n < %d {
-                self.start_pos = -1;
-            } else {
-                // Advance by exactly one position past the last reported start:
-                // the WASM scan is position-by-position and only positions
-                // <= last.start have been visited when the buffer fills,
-                // regardless of last.length.
-                self.start_pos = self.buf[(n-1) as usize][1] + 1;
-            }
+            // Every tuple in one call shares a start; resume one past it.
+            self.from = self.buf[0][1] + 1;
         }
     }
 }
 
-pub fn %s(input: &[u8]) -> %s<'_> {
-    %s { input, start_pos: 0, buf: [[0;3]; %d], count: 0, idx: 0 }
+`, gateDoc, iterName, gateField, konst, iterName, s.Find, gateArg, konst)
+			fmt.Fprintf(&out, "/// Starts a scan at `from`. Each step yields one match.\n"+
+				`pub fn %s(input: &[u8], from: usize) -> %s<'_> {
+    %s { input, from: from as i32, done: false,%s buf: [[0; 3]; %s], count: 0, idx: 0 }
 }
 
-`, iterName, bs, iterName, ffiName, bs, bs, s.FindAll, iterName, iterName, bs)
-			}
-			if s.FindAny != "" {
-				anyFfiName := ffiName
-				if s.FindAll != "" {
-					anyFfiName = "ffi_" + s.FindAll
-				}
-				fmt.Fprintf(&out, `pub fn %s(input: &[u8]) -> Option<SetMatch> {
-    let mut buf = [0i32; 3];
-    let n = unsafe { %s(input.as_ptr(), input.len() as i32, buf.as_mut_ptr(), 1, 0) };
-    if n <= 0 { return None; }
-    Some(SetMatch { pattern_id: buf[0] as usize, start: buf[1] as usize, end: (buf[1]+buf[2]) as usize })
-}
-
-`, s.FindAny, anyFfiName)
-			}
-		}
-		if s.Match != "" {
-			ffiName := "ffi_" + s.Match
-			fmt.Fprintf(&out, `#[link(wasm_import_module = "%s")]
-unsafe extern "C" {
-    #[link_name = "%s"]
-    fn %s(ptr: *const u8, len: i32, out: *mut i32, cap: i32) -> i32;
-}
-
-/// Anchored set match: returns the first matching pattern with start=0, or None.
-pub fn %s(input: &[u8]) -> Option<SetMatch> {
-    let mut buf = [0i32; 3];
-    let n = unsafe { %s(input.as_ptr(), input.len() as i32, buf.as_mut_ptr(), 1) };
-    if n <= 0 { return None; }
-    Some(SetMatch { pattern_id: buf[0] as usize, start: buf[1] as usize, end: (buf[1] + buf[2]) as usize })
-}
-
-`, cfg.ImportModule, s.Match, ffiName, s.Match, ffiName)
+`, s.Find, iterName, iterName, gateInit, konst)
 		}
 	}
 	if hasEmitNameMap(cfg) {

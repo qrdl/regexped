@@ -17,6 +17,6 @@ regexps:
 
 sets:
   - name: "sql"
-    match: "validate_sql"
+    match_any: "validate_sql"
     emit_name_map: true
     patterns: ["select", "insert", "update", "delete"]

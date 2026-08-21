@@ -14,7 +14,6 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-
 func parseTestRe(t *testing.T, pattern string) *syntax.Regexp {
 	t.Helper()
 	re, err := syntax.Parse(pattern, syntax.Perl)
@@ -1101,7 +1100,7 @@ func TestCmdCompile_WithSets(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: []config.RegexEntry{{Name: "p", Pattern: `foo\w+`}},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "s_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "s_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	if err := CmdCompile(cfg, out); err != nil {
@@ -1125,8 +1124,8 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 			{Name: "p3", Pattern: `(quux)`, GroupsFunc: "qg"},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s1", FindAll: "s1_all", Patterns: config.PatternSelector{All: true}},
-			{Name: "s2", FindAny: "s2_any", Patterns: config.PatternSelector{Names: []string{"p1", "p2"}}},
+			{Name: "s1", Find: "s1_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s2", Find: "s2_any", Patterns: config.PatternSelector{Names: []string{"p1", "p2"}}},
 		},
 	}
 
@@ -1384,7 +1383,7 @@ func TestCmdCompile_ErrorPaths(t *testing.T) {
 		cfg := config.BuildConfig{
 			Regexps: []config.RegexEntry{{Name: "bad", Pattern: `[`}},
 			Sets: []config.SetConfig{
-				{Name: "s", FindAny: "f", Patterns: config.PatternSelector{All: true}},
+				{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 			},
 		}
 		if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "out.wasm")); err == nil {
@@ -1434,7 +1433,7 @@ func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 			{Name: "good", Pattern: `foo`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	dir := t.TempDir()

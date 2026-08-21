@@ -97,7 +97,8 @@ func TestCountedChainEmission(t *testing.T) {
 	// table-free body) for the target patterns vs. a plain repeated class
 	// with no literal (used as a suffix, single pattern)?
 	table := chainTable(t, `[A-Z0-9]{16}`)
-	body, dataBytes, dataSegCount, _ := genSuffixWASM(table, 0, 0, []int{5}, []int{0})
+	art, dataBytes, dataSegCount, _ := genSuffixWASM(table, 0, 0, []int{5}, []int{0}, false, false)
+	body := art.fnBody
 	fmt.Printf("counted-chain suffix: bodyLen=%d dataBytesLen=%d dataSegCount=%d\n", len(body), len(dataBytes), dataSegCount)
 	if dataSegCount != 0 {
 		t.Errorf("expected 0 data segments (pure SIMD, no table), got %d", dataSegCount)

@@ -7,16 +7,19 @@ function check(label: string, payload: string): void {
   const buf = String.UTF8.encode(payload);
   console.log("[" + label + "] payload: " + payload);
 
-  const sqli = scan_sqli(buf);
+  // scan_any reports the FIRST position at or after `from` where anything in
+  // the set matches, plus one of the pattern ids matching there. It carries no
+  // extent — that is what makes it the cheap capability.
+  const sqli = scan_sqli(buf, 0);
   if (sqli) {
-    console.log("  [SQLI] " + patternName(sqli.patternId) + " at " + sqli.start.toString() + ".." + sqli.end.toString());
+    console.log("  [SQLI] " + patternName(sqli.patternId) + " at " + sqli.start.toString());
   } else {
     console.log("  [SQLI] clean");
   }
 
-  const xss = scan_xss(buf);
+  const xss = scan_xss(buf, 0);
   if (xss) {
-    console.log("  [XSS]  detected at " + xss.start.toString() + ".." + xss.end.toString());
+    console.log("  [XSS]  detected at " + xss.start.toString());
   } else {
     console.log("  [XSS]  clean");
   }

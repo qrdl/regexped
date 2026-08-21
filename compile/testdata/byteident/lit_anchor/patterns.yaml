@@ -1,0 +1,5 @@
+# Literal-anchored find: a mandatory literal with a variable-length prefix, so
+# the match start is recovered by a backward DFA.
+regexps:
+  - pattern: '[a-z]+@example\.com'
+    find_func: litanchor_find

@@ -19,6 +19,22 @@ func isCountedClassChain(t *dfaTable) (class []byte, n int, ok bool) {
 		return nil, 0, false
 	}
 
+	// The emitted body verifies N bytes with SIMD and never consults an entry
+	// state, so it behaves as if every run began at t.startState. That is only
+	// sound when starting mid-input is indistinguishable from starting at
+	// position 0 — i.e. when midStart IS startState.
+	//
+	// A pattern like `\A+a` breaks it: the chain walk from startState sees a
+	// one-step class chain and reports a match, silently discarding the `\A`
+	// that makes midStart a different (dead) state. Live-verified: as a set
+	// member, `\A+a` matched at position 1 of "0a", where Go and our own
+	// single-pattern path both correctly report no match. `\Aa` escapes the
+	// bug only because its anchor is stripped to a start-anchor MASK before
+	// the DFA is built, so it never reaches this detector.
+	if t.midStartState != t.startState {
+		return nil, 0, false
+	}
+
 	// Single-pattern only: exactly one distinct bit across every accept
 	// variant. A bucket merging 2+ patterns' suffix ASTs would need
 	// per-pattern chain tracking this detector doesn't attempt.
@@ -145,8 +161,9 @@ func sameByteSet(a, b []byte) bool {
 // i.e. bit 0, since this emitter only ever handles single-pattern buckets).
 // prefixMaxLen mirrors buildSetSuffixBody's emitWriteMatchK convention:
 // 0/-1 (trivial/variable) ⇒ matchStart = lPos; >0 (fixed) ⇒
-// matchStart = lPos - prefixMaxLen.
-func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLen int) []byte {
+// matchStart = lPos - prefixMaxLen. The tuple's third field is the absolute
+// end (plans/SETS.md §3.18), matching emitWriteMatchK.
+func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLen int, gated bool) []byte {
 	const (
 		paramPtr       = byte(0)
 		paramStart     = byte(1)
@@ -155,11 +172,22 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 		paramOutPtr    = byte(4)
 		paramOutCap    = byte(5)
 		paramValidMask = byte(6)
-		// Local group order below is i32 group first, then v128 group —
-		// these indices must track that order.
-		lEndPos  = byte(7) // i32: start + n
-		lOutBase = byte(8) // i32: output tuple base ptr
-		lChunk   = byte(9) // v128
+		// paramGate (7) exists only in the gated signature and is unused here:
+		// a counted chain consumes n >= 1 bytes, so its match can never be
+		// empty and §3.16's write-time empty-match filter is vacuous. The
+		// parameter is still declared so the function matches the gated suffix
+		// type every find body calls.
+	)
+	// Local group order below is i32 group first, then v128 group — these
+	// indices must track that order, and shift by one in the gated signature.
+	localBase := byte(7)
+	if gated {
+		localBase = 8
+	}
+	var (
+		lEndPos  = localBase     // i32: start + n
+		lOutBase = localBase + 1 // i32: output tuple base ptr
+		lChunk   = localBase + 2 // v128
 	)
 	const patternBit = 1 // bit 0 — single-pattern bucket only
 
@@ -174,11 +202,6 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 
 	// if (validMask & patternBit) == 0: return 0
 	b = append(b, 0x20, paramValidMask, 0x41, patternBit, 0x71, 0x45, 0x04, 0x40)
-	b = retZero(b)
-	b = append(b, 0x0B)
-
-	// if out_cap == 0: return 0
-	b = append(b, 0x20, paramOutCap, 0x45, 0x04, 0x40)
 	b = retZero(b)
 	b = append(b, 0x0B)
 
@@ -256,7 +279,12 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 	}
 
 	// Verified: write the tuple at out_ptr (this emitter never writes more
-	// than one tuple per call, so out_base == out_ptr).
+	// than one tuple per call, so out_base == out_ptr) — but only if the
+	// caller still has room. The return value is the count FOUND, so an
+	// overflowing call still reports its match towards the total
+	// (plans/SETS.md §3.11 / D2). paramOutCap is the signed remaining
+	// capacity and can be negative.
+	b = append(b, 0x41, 0x00, 0x20, paramOutCap, 0x48, 0x04, 0x40) // if 0 < cap (signed)
 	b = append(b, 0x20, paramOutPtr, 0x21, lOutBase)
 	b = append(b, 0x20, lOutBase, 0x41)
 	b = utils.AppendSLEB128(b, int32(patternID))
@@ -266,13 +294,12 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 		b = append(b, 0x20, lOutBase, 0x20, paramLPos, 0x41)
 		b = utils.AppendSLEB128(b, int32(prefixMaxLen))
 		b = append(b, 0x6B, 0x36, 0x02, 0x04) // matchStart = lPos - prefixMaxLen
-		b = append(b, 0x20, lOutBase, 0x20, lEndPos, 0x20, paramLPos, 0x6B, 0x41)
-		b = utils.AppendSLEB128(b, int32(prefixMaxLen))
-		b = append(b, 0x6A, 0x36, 0x02, 0x08) // matchLength = (endPos - lPos) + prefixMaxLen
 	} else {
-		b = append(b, 0x20, lOutBase, 0x20, paramLPos, 0x36, 0x02, 0x04)                      // matchStart = lPos
-		b = append(b, 0x20, lOutBase, 0x20, lEndPos, 0x20, paramLPos, 0x6B, 0x36, 0x02, 0x08) // matchLength = endPos - lPos
+		b = append(b, 0x20, lOutBase, 0x20, paramLPos, 0x36, 0x02, 0x04) // matchStart = lPos
 	}
+	// matchEnd = start + n (absolute), §3.18.
+	b = append(b, 0x20, lOutBase, 0x20, lEndPos, 0x36, 0x02, 0x08)
+	b = append(b, 0x0B) // end if room
 
 	b = append(b, 0x41, 0x01, 0x0F) // i32.const 1; return
 	b = append(b, 0x0B)             // end function

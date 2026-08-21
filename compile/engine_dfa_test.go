@@ -317,7 +317,7 @@ func TestDFASetsEmptyFallbackStrictPrefix(t *testing.T) {
 			{Name: "p_catalog", Pattern: "catalog"},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s1", FindAny: "s1_find", Patterns: config.PatternSelector{All: true}},
+			{Name: "s1", Find: "s1_find", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	if _, _, err := CompileFile(cfg, ""); err != nil {

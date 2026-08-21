@@ -1,0 +1,4 @@
+# Literal chain: a fixed literal followed by a counted class run.
+regexps:
+  - pattern: 'AKIA[A-Z0-9]{16}'
+    find_func: litchain_find

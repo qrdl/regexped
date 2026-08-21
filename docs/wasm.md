@@ -191,93 +191,113 @@ not stored in the table.
 When the config contains a `sets:` block, `regexped compile` emits additional
 WASM functions for multi-pattern matching.
 
-### find_any / find_all — non-anchored set match
+### The seven capability exports
 
 ```wasm
-;; Set find function (one body; exported under find_any and/or find_all names).
-;; Scans input from start_pos, writes up to out_cap match tuples to out_ptr,
-;; returns count of tuples written (0 = exhausted).
-(func $find_all
-    (param $in_ptr i32) (param $in_len i32)
+;; Anchored — the match must span the WHOLE input (0..len).
+(func $match     (param $in_ptr i32) (param $in_len i32) (result i32))            ;; 0 | 1
+(func $match_any (param $in_ptr i32) (param $in_len i32) (result i32))            ;; id, or -1
+(func $match_all (param $in_ptr i32) (param $in_len i32) (result i64))            ;; bitmask  (<= 64 patterns)
+(func $match_all (param $in_ptr i32) (param $in_len i32) (param $out_ptr i32) (result i32))  ;; count + bitmap (> 64)
+
+;; Non-anchored — all take a `from` position.
+(func $scan     (param $in_ptr i32) (param $in_len i32) (param $from i32) (result i32))  ;; 0 | 1
+(func $scan_any (param $in_ptr i32) (param $in_len i32) (param $from i32) (result i64))  ;; (start<<32)|id, or -1
+(func $scan_all (param $in_ptr i32) (param $in_len i32) (param $from i32) (result i64))  ;; bitmask (<= 64)
+(func $scan_all (param $in_ptr i32) (param $in_len i32) (param $from i32) (param $out_ptr i32) (result i32))
+
+;; find — DEFAULT (overlapping absent/false): per-pattern non-overlapping.
+(func $find
+    (param $in_ptr i32) (param $in_len i32) (param $from i32)
+    (param $gate_ptr i32) (param $out_ptr i32) (param $out_cap i32)
+    (result i32))   ;; TOTAL matches at the reported position
+
+;; find — overlapping: true. No gate parameter at all.
+(func $find
+    (param $in_ptr i32) (param $in_len i32) (param $from i32)
     (param $out_ptr i32) (param $out_cap i32)
-    (param $start_pos i32)
     (result i32))
 ```
 
-Each tuple written to `out_ptr` is 12 bytes (3 × i32):
+`in_ptr`/`in_len` always describe the **entire** input; `from` bounds only the
+search. Zero-width assertions (`\b`, `\B`, `(?m:^)`, `(?m:$)`) therefore see
+real context at any resume index — the same shape as `Input::span` in Rust's
+`regex-automata` and Go's internal `doExecute(s, pos)`.
+
+### find tuple layout
+
+Each tuple written to `out_ptr` is 12 bytes (3 × i32), 4-byte aligned:
 
 | Offset | Field | Notes |
 |---|---|---|
 | +0 | `pattern_id` i32 | Global YAML order index of the matching pattern |
-| +4 | `start` i32 | Absolute byte offset of the match start |
-| +8 | `length` i32 | Byte length of the match |
+| +4 | `start` i32 | Absolute byte offset — **the same for every tuple in one call** |
+| +8 | `end` i32 | Absolute byte offset of the match end (an END, not a length) |
 
-Tuples within a batch are emitted in non-decreasing `start` order.
+The order of tuples *within* one call is unspecified: not by pattern id, not by
+extent, not stable across compiler versions.
 
-**Capacity precondition.** The caller MUST size `out_cap` to be at least the
-maximum same-start fan-out — that is, the maximum number of tuples the
-function may produce at a single `start` position. A safe upper bound is the
-number of patterns in the set (each global pattern ID can appear at most
-once per `start` in `find_all` output), so `out_cap ≥ patterns_in_set` is
-always sufficient. Generated stubs enforce this floor automatically; custom
-hosts must enforce it themselves.
+### find return value and overflow
 
-**Resume rule.** After a batch of `count` tuples, the host advances
+The return value is the **total** number of matches at the position found — not
+the number written. `0` means nothing matches at or after `from`. The buffer
+receives `min(total, out_cap)` tuples.
 
 ```
-start_pos = last.start + 1
+n = find(input, len, from, gates, buf, cap)
+if n == 0   -> done
+if n > cap  -> grow buf to n, call again with the same `from`
+use buf[0 .. min(n, cap)]
 ```
 
-and re-calls until the function returns 0. The WASM scan is
-position-by-position: when the buffer fills it exits at the top of the next
-iteration, so the only positions guaranteed to have been visited are those
-`≤ last.start`. Advancing by `last.length` (or `end`) would skip positions
-inside the last match's span that the scan has not yet visited, silently
-dropping matches at those positions.
+`total > out_cap` is the "there is more" signal, so no flag bit or `-1`
+sentinel is needed and the caller learns exactly how much to allocate. The
+retry is deterministic: same input, same `from`, same tuples. `out_cap = 0` is
+a legal size probe — it returns the total and writes nothing.
 
-The capacity precondition above guarantees that when the buffer fills it
-does so on a position boundary (no mid-position truncation), so a single
-`+1` step is sufficient to resume without losing same-position matches.
-Hosts that bypass the precondition and use a smaller `out_cap` must dedupe
-`(pattern_id, start)` pairs across batches to handle mid-position
-truncation; the ABI provides no continuation token.
+`out_cap ≥ patterns_in_set` makes overflow impossible: each pattern can report
+at most one match per start, so that is the exact worst case for one position.
+Every generated stub sizes its buffer that way.
 
-`find_any` uses the same function body with `out_cap=1, start_pos=0` and is
-exempt from the precondition because it stops at the first match.
+### Resume rule
 
-### match — anchored set match
-
-```wasm
-;; Anchored match: tries all patterns from position 0.
-;; Writes up to out_cap match tuples to out_ptr, returns count.
-(func $match
-    (param $in_ptr i32) (param $in_len i32)
-    (param $out_ptr i32) (param $out_cap i32)
-    (result i32))
+```
+from = start + 1
 ```
 
-Each tuple written to `out_ptr` is 12 bytes (3 × i32), the same layout as
-`find_all`/`find_any`:
+Every tuple in one call shares a start, so reading the first tuple is enough.
+There is no continuation token and none is needed: a call returns one complete
+position, never a truncated one.
 
-| Offset | Field | Notes |
-|---|---|---|
-| +0 | `pattern_id` i32 | Global YAML order index |
-| +4 | `start` i32 | Always 0 for anchored match |
-| +8 | `length` i32 | Byte length of the match |
+### The gate array
 
-Returns the number of matching patterns written (0 if none match anchored
-at position 0). Anchored match is not batched — one call returns all matching
-patterns, up to `out_cap`. To receive every matching pattern, callers must
-size `out_cap` to hold the maximum same-position fan-out;
-`out_cap ≥ patterns_in_set` is always sufficient.
+The default `find` body takes `gate_ptr`, pointing at `patterns_in_set` u32s in
+the **caller's** memory (`memory[0]` — the same memory the input lives in).
 
-> **Note.** The generated `match` wrappers in the Rust/Go/JS/TS/AS/C stubs
-> are deliberately "first match" convenience APIs: they call the WASM export
-> with `out_cap = 1` and return a single match (or none). This mirrors the
-> relationship between `find_any` (first occurrence) and `find_all` (every
-> occurrence). Hosts that need every anchored match should call the WASM
-> export directly with a larger `out_cap` and decode the tuple buffer as
-> described above.
+- **All zeros = a clean scan.** That is the only operation a caller performs on
+  it; the encoding is opaque and will change.
+- WASM reads it to decide which patterns are still eligible at each position,
+  and writes it after a fully delivered position.
+- **An overflowing call writes nothing.** Write-back is gated on
+  `total ≤ out_cap`, so a call that overflowed leaves the array byte-for-byte
+  as it found it and the grown retry sees the identical world. The same rule
+  covers the `out_cap = 0` probe.
+
+Keeping this state in caller memory rather than inside the module is what makes
+`find` resumable at any index: nothing is hidden, and zeroing the array
+restores a clean scan from anywhere.
+
+### Edge contracts
+
+- `0 ≤ from ≤ len` (unsigned). `from == len` is a real position and IS
+  evaluated — end-anchored and empty-matchable patterns can match there.
+- `from > len` yields the capability's "nothing": `scan` 0, `scan_any` −1,
+  `scan_all` 0, `find` 0.
+- `len == 0`: position 0 is evaluated.
+- Zero-length matches are ordinary matches; `find` reports them as `(id, p, p)`.
+- `out_ptr` and `gate_ptr` must be 4-byte aligned.
+- The `>64` bitmap at `out_ptr` is `ceil(P/8)` bytes, little-endian bit order
+  (bit k = byte `k/8`, bit `k%8`); bytes past the last pattern are zeroed.
 
 ### Suffix DFA functions (internal)
 

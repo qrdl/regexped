@@ -45,6 +45,24 @@ func AppendSLEB128(out []byte, v int32) []byte {
 	return out
 }
 
+// AppendSLEB128_64 encodes v as a signed LEB128 over 64 bits. WASM's
+// i64.const operand is signed LEB128, so a 64-bit bitmask with bit 63 set has
+// to go through this rather than through the 32-bit encoder.
+func AppendSLEB128_64(out []byte, v int64) []byte {
+	more := true
+	for more {
+		b := byte(v & 0x7F)
+		v >>= 7
+		if (v == 0 && b&0x40 == 0) || (v == -1 && b&0x40 != 0) {
+			more = false
+		} else {
+			b |= 0x80
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
 // maxLEB128Bytes bounds both decoders. A 64-bit value needs at most ten groups
 // of seven bits, so an eleventh continuation byte means the encoding is
 // over-long: its payload would be shifted past bit 63 and silently vanish (Go

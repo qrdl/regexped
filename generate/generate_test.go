@@ -801,9 +801,13 @@ func setTestCfg() config.BuildConfig {
 		Sets: []config.SetConfig{
 			{
 				Name:        "scanner",
-				FindAll:     "scan_all",
-				FindAny:     "scan_any",
 				Match:       "validate",
+				MatchAny:    "validate_any",
+				MatchAll:    "validate_all",
+				Scan:        "probe",
+				ScanAny:     "probe_any",
+				ScanAll:     "probe_all",
+				Find:        "set_find",
 				EmitNameMap: true,
 				Patterns:    config.PatternSelector{All: true},
 			},
@@ -817,13 +821,14 @@ func TestGenRustSetInner(t *testing.T) {
 	required := []string{
 		"SetMatch",
 		"range(self)",
-		"scan_all",
-		"scan_any",
-		"validate",
+		"SCANNER_PATTERN_COUNT",               // D16: the emitted constant
+		"gates: [u32; SCANNER_PATTERN_COUNT]", // D14/D15: the iterator owns the gates
+		"set_find", "probe_any", "probe_all", "probe",
+		"validate", "validate_any", "validate_all",
 		"pattern_name",
 		"\"pat_a\"",
 		"\"pat_b\"",
-		"ffi_scan_all",
+		"ffi_set_find",
 		"ffi_validate",
 	}
 	for _, s := range required {
@@ -834,6 +839,10 @@ func TestGenRustSetInner(t *testing.T) {
 	if strings.Contains(out, "SetAnchorMatch") {
 		t.Error("genRustSetInner: should not contain SetAnchorMatch (removed in 5.4.1)")
 	}
+	// D24/D15: `find` is iterator-only; no stateless probe variant exists.
+	if strings.Contains(out, "set_findAt") {
+		t.Error("genRustSetInner: emitted a stateless find probe, which D24 removed")
+	}
 }
 
 func TestGenGoSetSection(t *testing.T) {
@@ -841,12 +850,13 @@ func TestGenGoSetSection(t *testing.T) {
 	out := genGoSetSection(cfg, "mymod")
 	required := []string{
 		"SetMatch",
-		"ScanAll",
-		"ScanAny",
-		"Validate",
+		"ScannerPatternCount",
+		"SetFind", "ProbeAny", "ProbeAll", "Probe",
+		"Validate", "ValidateAny", "ValidateAll",
 		"PatternName",
-		"scan_all", // wasmimport directive
+		"set_find", // wasmimport directive
 		"validate", // wasmimport directive
+		"iter.Seq[SetMatch]",
 	}
 	for _, s := range required {
 		if !strings.Contains(out, s) {
@@ -859,9 +869,10 @@ func TestGenJSSetSection(t *testing.T) {
 	cfg := setTestCfg()
 	out := genJSSetSection(cfg)
 	required := []string{
-		"scan_all",
-		"scan_any",
+		"set_find",
+		"probe_any",
 		"validate",
+		"scannerPatternCount",
 		"patternName",
 		"patternId",
 		"_exp",
@@ -882,9 +893,11 @@ func TestGenTSSetSection(t *testing.T) {
 	out := genTSSetSection(cfg)
 	required := []string{
 		"SetMatch",
-		"scan_all",
-		"scan_any",
+		"SetAnchor",
+		"set_find",
+		"probe_any",
 		"validate",
+		"scannerPatternCount",
 		"patternName",
 		"_exp",
 		"_mem",
@@ -908,7 +921,10 @@ func TestGenCStubFilesWithSets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("genCStubFilesWithSets: %v", err)
 	}
-	for _, s := range []string{"rx_set_match_t", "rx_set_anchor_t", "scan_all", "validate", "pattern_name"} {
+	for _, s := range []string{
+		"rx_set_match_t", "set_find_init", "set_find_next", "rx_scanner_scanner_t",
+		"SCANNER_PATTERN_COUNT", "validate", "probe_all", "pattern_name",
+	} {
 		if !strings.Contains(h, s) && !strings.Contains(c, s) {
 			t.Errorf("genCStubFilesWithSets: missing %q in output", s)
 		}
@@ -920,9 +936,10 @@ func TestGenASSetSection(t *testing.T) {
 	out := genASSetSection(cfg)
 	required := []string{
 		"SetMatch",
-		"scan_all_next",
-		"scan_all_reset",
-		"scan_any",
+		"SetAnchor",
+		"SCANNER_PATTERN_COUNT",
+		"class SetFindIter",
+		"probe_any",
 		"validate",
 		"patternName",
 	}
@@ -974,20 +991,23 @@ func TestSetSection_NoSets_Empty(t *testing.T) {
 	}
 }
 
-func TestSetSection_FindAllOnly(t *testing.T) {
+func TestSetSection_FindOnly(t *testing.T) {
 	cfg := config.BuildConfig{
 		ImportModule: "m",
 		Regexps:      []config.RegexEntry{{Pattern: `foo`}},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	rust := genRustSetInner(cfg)
-	if !strings.Contains(rust, "find_all") {
-		t.Error("find_all not in Rust set stub")
+	if !strings.Contains(rust, "fn set_find") {
+		t.Error("set_find not in Rust set stub")
 	}
-	if strings.Contains(rust, "fn validate") || strings.Contains(rust, "ffi_find_any") {
-		t.Error("unexpected exports in find_all-only Rust stub")
+	// A find-only set must not drag in any of the other six capabilities.
+	for _, unexpected := range []string{"fn validate", "ffi_probe", "ffi_validate"} {
+		if strings.Contains(rust, unexpected) {
+			t.Errorf("unexpected %q in a find-only Rust stub", unexpected)
+		}
 	}
 }
 
@@ -1004,37 +1024,6 @@ func TestPatternsInSet_Names(t *testing.T) {
 	}
 	if got := patternsInSet(s, cfg); got != 2 {
 		t.Errorf("patternsInSet(Names): got %d, want 2", got)
-	}
-}
-
-func TestBatchSize_Bounds(t *testing.T) {
-	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "a", Pattern: "a"}},
-	}
-	// BatchSize below the 64 floor must be raised.
-	s1 := config.SetConfig{
-		BatchSize: 10,
-		Patterns:  config.PatternSelector{All: true},
-	}
-	if got := batchSize(s1, cfg); got != 64 {
-		t.Errorf("batchSize(10): got %d, want 64", got)
-	}
-	// BatchSize below patternsInSet must be raised to n.
-	bigCfg := config.BuildConfig{Regexps: make([]config.RegexEntry, 300)}
-	for i := range bigCfg.Regexps {
-		bigCfg.Regexps[i] = config.RegexEntry{Name: "p", Pattern: "x"}
-	}
-	s2 := config.SetConfig{
-		BatchSize: 100,
-		Patterns:  config.PatternSelector{All: true},
-	}
-	if got := batchSize(s2, bigCfg); got != 300 {
-		t.Errorf("batchSize(n>bs): got %d, want 300", got)
-	}
-	// Default (BatchSize=0) stays at 256 when patternsInSet is small.
-	s3 := config.SetConfig{Patterns: config.PatternSelector{All: true}}
-	if got := batchSize(s3, cfg); got != 256 {
-		t.Errorf("batchSize(default): got %d, want 256", got)
 	}
 }
 

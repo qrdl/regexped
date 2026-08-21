@@ -1,6 +1,6 @@
 GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/*/*.go merge/*.go))
 
-.PHONY: re2test perftest perftest-check examples clean unittest lint fmt
+.PHONY: re2test perftest perftest-check setperf setperf-check byteident examples clean unittest lint fmt
 
 build: regexped
 
@@ -15,6 +15,19 @@ perftest: build
 
 perftest-check: build
 	$(MAKE) -C tools/perftest perftest-check
+
+setperf:
+	$(MAKE) -C tools/setperf run
+
+setperf-check:
+	$(MAKE) -C tools/setperf check
+
+# Byte-identical regression net for the single-pattern paths
+# (plans/SETS.md §9.0). One fixture per code path, compared byte for byte —
+# the evidence that a change to a shared emitter did not move single-pattern
+# output. See compile/testdata/byteident/README.md.
+byteident:
+	go test ./compile -run TestByteIdentical -v
 
 examples: build
 	$(MAKE) -C examples

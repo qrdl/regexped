@@ -51,4 +51,5 @@ name = "regex_bench"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "regex-automata",
 ]

@@ -126,7 +126,9 @@ exhaustive suite and a curated `custom-sets.txt` file through the set pipeline
 described in [sets.md](sets.md). For every block with at least two patterns the
 runner:
 
-1. Compiles all patterns as a single set via `CompileFile` with `find_all`.
+1. Compiles all patterns as a single set via `CompileFile` with the default
+   (per-pattern non-overlapping) `find`, whose contract is Go `FindAllIndex`'s
+   rule — which is exactly what col4 holds.
 2. Runs the resulting WASM against every test input in the block.
 3. Verifies that the returned `(pattern_id, start, length)` tuples cover all
    per-pattern matches expected by columns 4 / 1 of the RE2 test format.

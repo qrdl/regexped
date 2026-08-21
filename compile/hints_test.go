@@ -134,7 +134,7 @@ func TestSetHintsSelectsShuftiFrontend(t *testing.T) {
 			patterns = append(patterns, info)
 			patternIDs = append(patternIDs, i)
 		}
-		return SetSpec{Name: "s", FindAll: "find_all", Patterns: patterns, PatternIDs: patternIDs}, &prefixPool, &suffixPool
+		return SetSpec{Name: "s", Find: "find_all", Patterns: patterns, PatternIDs: patternIDs}, &prefixPool, &suffixPool
 	}
 
 	specHinted, prefixPool, suffixPool := buildSpec(t)

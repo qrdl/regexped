@@ -7,9 +7,11 @@ await init(readFileSync(wasmPath));
 
 const lines = readFileSync('/dev/stdin', 'utf8').split('\n').filter(l => l.trim());
 for (const sql of lines) {
-    const m = validate_sql(sql);
-    if (m) {
-        console.log(`[VALID ${patternName(m.patternId).toUpperCase()}] ${sql}`);
+    // match_any is anchored: the statement must match a pattern end to end.
+    // It returns a pattern id or null — NOT a boolean.
+    const id = validate_sql(sql);
+    if (id !== null) {
+        console.log(`[VALID ${patternName(id).toUpperCase()}] ${sql}`);
     } else {
         console.log(`[INVALID] ${sql}`);
     }

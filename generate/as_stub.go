@@ -54,78 +54,154 @@ func genASSetSection(cfg config.BuildConfig) string {
 		return ""
 	}
 	var out strings.Builder
-	out.WriteString("\n// ---- set composition wrappers ----\n\n")
+	out.WriteString("\n// ---- set composition wrappers (plans/SETS.md §4.6) ----\n\n")
 	out.WriteString("class SetMatch { constructor(public patternId: i32, public start: i32, public end: i32) {} }\n")
-	out.WriteString("class SetAnchorMatch { constructor(public patternId: i32, public end: i32) {} }\n\n")
+	out.WriteString("class SetAnchor { constructor(public patternId: i32, public start: i32) {} }\n\n")
 	for _, s := range cfg.Sets {
-		bs := batchSize(s, cfg)
-		if s.FindAll != "" || s.FindAny != "" {
-			wasmExport := s.FindAll
-			if wasmExport == "" {
-				wasmExport = s.FindAny
-			}
-			fmt.Fprintf(&out, "@external(\"%s\", \"%s\")\ndeclare function ffi_%s(ptr: usize, len: i32, out: usize, cap: i32, start: i32): i32;\n\n",
-				cfg.ImportModule, wasmExport, wasmExport)
-			if s.FindAll != "" {
-				// cap must be >= number of buckets so that all patterns matching
-				// the same start position fit in one WASM call (same-start fan-out).
-				// 64 is a safe floor — realistic sets have far fewer buckets.
-				cap := max(bs, 64)
-				fn := s.FindAll
-				fmt.Fprintf(&out, `const _buf_%[1]s = new StaticArray<i32>(%[2]d*3);
-let _start_%[1]s: i32 = 0; let _bufN_%[1]s: i32 = 0; let _bufI_%[1]s: i32 = 0;
-/** Returns next match tuple or null when exhausted. Call %[1]s_reset() before reusing on a new input. */
-export function %[1]s_next(input: ArrayBuffer): SetMatch | null {
-    if (_bufI_%[1]s >= _bufN_%[1]s) {
-        // _start_<fn> < 0 is a sentinel meaning "input exhausted on the previous
-        // call" — when ffi returned n < cap. Do not call ffi again.
-        if (_start_%[1]s < 0) { _bufN_%[1]s = 0; _bufI_%[1]s = 0; return null; }
-        const n = ffi_%[3]s(changetype<usize>(input), input.byteLength, changetype<usize>(_buf_%[1]s), %[2]d, _start_%[1]s);
-        if (n <= 0) { _bufN_%[1]s = 0; _bufI_%[1]s = 0; return null; }
-        _bufN_%[1]s = n; _bufI_%[1]s = 0;
-        // find_all returns when EITHER the buffer is full (n == cap) OR the
-        // input has been fully scanned (n < cap). Only the buffer-full case
-        // needs a resume; otherwise mark this iterator exhausted.
-        if (n < %[2]d) {
-            _start_%[1]s = -1;
-        } else {
-            const last = (n - 1) * 3;
-            // Advance by exactly one position past the last reported start: the WASM
-            // scan is position-by-position and only positions <= last.start have been
-            // visited when the buffer fills, regardless of last.length.
-            _start_%[1]s = _buf_%[1]s[last + 1] + 1;
-        }
-    }
-    const i = _bufI_%[1]s++ * 3;
-    return new SetMatch(_buf_%[1]s[i], _buf_%[1]s[i + 1], _buf_%[1]s[i + 1] + _buf_%[1]s[i + 2]);
-}
-export function %[1]s_reset(): void { _start_%[1]s = 0; _bufN_%[1]s = 0; _bufI_%[1]s = 0; }
-`,
-					fn, cap, wasmExport)
-			}
-			if s.FindAny != "" {
-				anyFFI := "ffi_" + s.FindAny
-				if s.FindAll != "" {
-					anyFFI = "ffi_" + s.FindAll
-				}
-				fmt.Fprintf(&out, `export function %s(input: ArrayBuffer): SetMatch | null {
-    const buf = new StaticArray<i32>(3);
-    if (%s(changetype<usize>(input), input.byteLength, changetype<usize>(buf), 1, 0) <= 0) return null;
-    return new SetMatch(buf[0], buf[1], buf[1]+buf[2]);
-}
-`, s.FindAny, anyFFI)
-			}
+		n := patternsInSet(s, cfg)
+		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
+		wide := wideAllForm(s, cfg)
+
+		fmt.Fprintf(&out, "// Number of patterns in set %q. Every buffer below is sized from it.\nexport const %s: i32 = %d;\n\n", s.Name, konst, n)
+
+		decl := func(name, sig string) {
+			fmt.Fprintf(&out, "@external(%q, %q)\ndeclare function ffi_%s%s;\n\n", cfg.ImportModule, name, name, sig)
 		}
 		if s.Match != "" {
-			fmt.Fprintf(&out, "@external(\"%s\", \"%s\")\ndeclare function ffi_%s(ptr: usize, len: i32, out: usize, cap: i32): i32;\n\n",
-				cfg.ImportModule, s.Match, s.Match)
-			fmt.Fprintf(&out, `export function %s(input: ArrayBuffer): SetAnchorMatch | null {
-    const buf = new StaticArray<i32>(3);
-    if (ffi_%s(changetype<usize>(input), input.byteLength, changetype<usize>(buf), 1) <= 0) return null;
-    return new SetAnchorMatch(buf[0], buf[1] + buf[2]);
+			decl(s.Match, "(ptr: usize, len: i32): i32")
+			fmt.Fprintf(&out, `/** True when some pattern in the set matches the WHOLE input. */
+export function %s(input: ArrayBuffer): bool {
+    return ffi_%s(changetype<usize>(input), input.byteLength) != 0;
 }
 `, s.Match, s.Match)
 		}
+		if s.MatchAny != "" {
+			decl(s.MatchAny, "(ptr: usize, len: i32): i32")
+			fmt.Fprintf(&out, `/** Id of SOME pattern matching the whole input, or -1. */
+export function %s(input: ArrayBuffer): i32 {
+    return ffi_%s(changetype<usize>(input), input.byteLength);
+}
+`, s.MatchAny, s.MatchAny)
+		}
+		if s.MatchAll != "" {
+			if wide {
+				decl(s.MatchAll, "(ptr: usize, len: i32, out: usize): i32")
+				fmt.Fprintf(&out, `/** Ids of every pattern matching the whole input. */
+export function %s(input: ArrayBuffer): Array<i32> {
+    const bits = new StaticArray<u8>((%s + 7) >> 3);
+    ffi_%s(changetype<usize>(input), input.byteLength, changetype<usize>(bits));
+    const out = new Array<i32>();
+    for (let k = 0; k < %s; k++) if (bits[k >> 3] & (1 << (k & 7))) out.push(k);
+    return out;
+}
+`, s.MatchAll, konst, s.MatchAll, konst)
+			} else {
+				decl(s.MatchAll, "(ptr: usize, len: i32): i64")
+				fmt.Fprintf(&out, `/** Ids of every pattern matching the whole input. */
+export function %s(input: ArrayBuffer): Array<i32> {
+    const mask = ffi_%s(changetype<usize>(input), input.byteLength);
+    const out = new Array<i32>();
+    for (let k = 0; k < %s; k++) if ((mask >> i64(k)) & 1) out.push(k);
+    return out;
+}
+`, s.MatchAll, s.MatchAll, konst)
+			}
+		}
+		if s.Scan != "" {
+			decl(s.Scan, "(ptr: usize, len: i32, from: i32): i32")
+			fmt.Fprintf(&out, `/** True when some pattern matches at a position at or after `+"`from`"+`. */
+export function %s(input: ArrayBuffer, from: i32): bool {
+    return ffi_%s(changetype<usize>(input), input.byteLength, from) != 0;
+}
+`, s.Scan, s.Scan)
+		}
+		if s.ScanAny != "" {
+			decl(s.ScanAny, "(ptr: usize, len: i32, from: i32): i64")
+			fmt.Fprintf(&out, `/** Pattern id and start of the FIRST matching position at or after `+"`from`"+`. */
+export function %s(input: ArrayBuffer, from: i32): SetAnchor | null {
+    const packed = ffi_%s(changetype<usize>(input), input.byteLength, from);
+    if (packed < 0) return null;
+    return new SetAnchor(i32(packed & 0xFFFFFFFF), i32(packed >> 32));
+}
+`, s.ScanAny, s.ScanAny)
+		}
+		if s.ScanAll != "" {
+			if wide {
+				decl(s.ScanAll, "(ptr: usize, len: i32, from: i32, out: usize): i32")
+				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`from`"+`. */
+export function %s(input: ArrayBuffer, from: i32): Array<i32> {
+    const bits = new StaticArray<u8>((%s + 7) >> 3);
+    ffi_%s(changetype<usize>(input), input.byteLength, from, changetype<usize>(bits));
+    const out = new Array<i32>();
+    for (let k = 0; k < %s; k++) if (bits[k >> 3] & (1 << (k & 7))) out.push(k);
+    return out;
+}
+`, s.ScanAll, konst, s.ScanAll, konst)
+			} else {
+				decl(s.ScanAll, "(ptr: usize, len: i32, from: i32): i64")
+				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`from`"+`. */
+export function %s(input: ArrayBuffer, from: i32): Array<i32> {
+    const mask = ffi_%s(changetype<usize>(input), input.byteLength, from);
+    const out = new Array<i32>();
+    for (let k = 0; k < %s; k++) if ((mask >> i64(k)) & 1) out.push(k);
+    return out;
+}
+`, s.ScanAll, s.ScanAll, konst)
+			}
+		}
+		if s.Find != "" {
+			iterName := config.PascalCaseForValidation(s.Find) + "Iter"
+			gateField, gateInit, gateArg := "", "", ""
+			if gatedFind(s) {
+				decl(s.Find, "(ptr: usize, len: i32, from: i32, gates: usize, out: usize, cap: i32): i32")
+				gateField = "    gates: StaticArray<u32>;\n"
+				gateInit = "        this.gates = new StaticArray<u32>(" + konst + ");\n"
+				gateArg = "changetype<usize>(this.gates), "
+			} else {
+				decl(s.Find, "(ptr: usize, len: i32, from: i32, out: usize, cap: i32): i32")
+			}
+			// AssemblyScript has no generators, so `find` is an explicit
+			// iterator object — caller-owned, so two scans can be in flight
+			// and re-creating it restarts the scan.
+			fmt.Fprintf(&out, `/** Iterator over the set's matches. next() returns null when exhausted. */
+export class %[1]s {
+    private input: ArrayBuffer;
+    private from: i32;
+    private done: bool = false;
+    private n: i32 = 0;
+    private i: i32 = 0;
+    private buf: StaticArray<i32>;
+%[2]s    constructor(input: ArrayBuffer, from: i32) {
+        this.input = input;
+        this.from = from;
+        this.buf = new StaticArray<i32>(%[3]s * 3);
+%[4]s    }
+    next(): SetMatch | null {
+        while (true) {
+            if (this.i < this.n) {
+                const o = this.i * 3;
+                this.i++;
+                return new SetMatch(this.buf[o], this.buf[o + 1], this.buf[o + 2]);
+            }
+            if (this.done) return null;
+            const got = ffi_%[5]s(changetype<usize>(this.input), this.input.byteLength, this.from,
+                %[6]schangetype<usize>(this.buf), %[3]s);
+            if (got <= 0) { this.done = true; return null; }
+            this.n = got;
+            this.i = 0;
+            // Every tuple in one call shares a start; resume one past it.
+            this.from = this.buf[1] + 1;
+        }
+    }
+}
+
+/** Starts a scan at `+"`from`"+`. Each next() call returns one match. */
+export function %[5]s(input: ArrayBuffer, from: i32): %[1]s {
+    return new %[1]s(input, from);
+}
+`, iterName, gateField, konst, gateInit, s.Find, gateArg)
+		}
+		out.WriteString("\n")
 	}
 	if hasEmitNameMap(cfg) {
 		names := make([]string, len(cfg.Regexps))
