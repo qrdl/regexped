@@ -128,6 +128,11 @@ type compiledSet struct {
 	// so no data segment is needed.
 	shuftiFirstByteSet []byte
 
+	// Packed-pair frontend (fe == frontendPackedPair): the two probe
+	// columns. Like Shufti this needs no data segment — the probe bytes are
+	// emitted as i32.const/i8x16.splat pairs hoisted out of the scan loop.
+	packedPair *packedPairPlan
+
 	// shuftiAdaptive (task 28): true when Shufti was selected ONLY because
 	// set-level LikelyNoMatch overrode a static verdict that scalar would
 	// win (shuftiBeatsScalar(union) == false). Mirrors EmitPrefixScan's
@@ -602,6 +607,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		teddyDataSegCount = 1
 	}
 
+	// Packed pair (§16 Task G1): no tables, so nothing is laid out here —
+	// only the plan the emitter reads. chooseLiteralFrontend returns this
+	// kind only when choosePackedPair succeeded on the same literals.
+	var packedPair *packedPairPlan
+	if fe == frontendPackedPair {
+		packedPair, _ = choosePackedPair(lits)
+	}
+
 	// LIKELY.md Gap H.3: density-heuristic / Action 5 Shufti for the
 	// scalar fallback case. Requires zero fallback buckets (Shufti can't
 	// skip positions that fallback patterns must visit) and a first-byte
@@ -673,6 +686,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		teddyDataBytes:      teddyDataBytes,
 		teddyDataSegCount:   teddyDataSegCount,
 		shuftiFirstByteSet:  shuftiFirstByteSet,
+		packedPair:          packedPair,
 		shuftiAdaptive:      shuftiAdaptive,
 		litToBuckets:        litToBuckets,
 		litLens:             litLens,
@@ -1328,6 +1342,14 @@ func emitSetMatchFnFinal(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMe
 		if !hasSetFallbackBuckets(cs) {
 			return emitSetMatchFnFinalShufti(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
 		}
+	case frontendPackedPair:
+		// Same fallback-bucket rule as Teddy: a fallback pattern must be tried
+		// at every position, so a prefilter that skips positions cannot serve
+		// it. cs.packedPair is nil only if selection and build disagreed;
+		// falling through to scalar is the safe answer if they ever do.
+		if !hasSetFallbackBuckets(cs) && cs.packedPair != nil {
+			return emitSetMatchFnFinalPackedPair(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+		}
 	}
 	return emitSetMatchFnFinalScalar(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
 }
@@ -1930,6 +1952,237 @@ func emitExtractLane(b []byte, lCands, lLaneOff, lLaneBit byte) []byte {
 	}
 	b = append(b, 0x0B) // end block $end_extract
 	return b
+}
+
+// emitSetMatchFnFinalPackedPair emits the set match body using a two-column
+// byte-equality SIMD prefilter (plans/SETS.md §16 Task G1).
+//
+// Per 16-byte chunk it loads the two probe columns, tests each against the
+// distinct bytes that column can hold, ANDs the two results and extracts a
+// lane mask — against Teddy's four chunk loads and four nibble-table swizzle
+// pairs for the same 16 positions. The pair pins only two bytes, so every
+// candidate is verified against EVERY literal from offset 0 before any bucket
+// runs; correctness therefore does not depend on the pair being selective,
+// only its speed does.
+//
+// Like the Teddy body, this serves `find` AND the scan trio through
+// setFindCtx.mode, and is only used when there are no fallback buckets.
+func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseIdx int, mode setCapKind, probeFnBase int) []byte {
+	pp := cs.packedPair
+	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
+	lPos := c.lPos
+	pInPtr, pInLen := c.pInPtr, c.pInLen
+	lLaneMask := c.localBase + 5
+	lMatchPos := c.localBase + 6
+	lLaneOff := c.localBase + 7
+	numI32 := 8
+
+	// Blocks of 16 bytes handled per loop iteration (§16 Task G2). The probe
+	// work scales linearly with this, but the per-iteration scaffolding —
+	// bounds guard, drain check, position bump, loop branch — does not, so
+	// widening amortises it. Two blocks fill a 32-bit lane mask exactly,
+	// which is why 2 is the measured optimum and 4 would need a second mask.
+	blocks := packedPairChunks
+
+	// v128 locals: two input chunks per block, then one hoisted splat per
+	// probe byte. Hoisting matters: the splats are loop-invariant and would
+	// otherwise cost an i32.const + i8x16.splat per chunk per byte.
+	v128Base := c.localBase + byte(numI32)
+	next := v128Base
+	lChunk1 := make([]byte, blocks)
+	lChunk2 := make([]byte, blocks)
+	for i := 0; i < blocks; i++ {
+		lChunk1[i], lChunk2[i] = next, next+1
+		next += 2
+	}
+	splat1 := make([]byte, len(pp.Bytes1))
+	splat2 := make([]byte, len(pp.Bytes2))
+	for i := range splat1 {
+		splat1[i] = next
+		next++
+	}
+	for i := range splat2 {
+		splat2[i] = next
+		next++
+	}
+	numV128 := 2*blocks + pp.splatCount()
+
+	// §9.4 first-position locals sit after the v128 group so the v128 indices
+	// above stay stable.
+	c.lMinStart = v128Base + byte(numV128)
+	c.lBase = c.lMinStart + 1
+	c.lStart = c.lMinStart + 2
+	c.lAcc = c.lMinStart + 3
+
+	var b []byte
+	// 8 i32, numV128 v128, 3 i32, then the scan_all i64 accumulator.
+	b = append(b, 0x04, byte(numI32), 0x7F, byte(numV128), 0x7B, 0x03, 0x7F, 0x01, 0x7E)
+
+	// Hoist the probe-byte splats.
+	emitSplat := func(b []byte, val, dst byte) []byte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(int8(val)))
+		b = append(b, 0xFD, 0x0F) // i8x16.splat
+		return append(b, 0x21, dst)
+	}
+	for i, v := range pp.Bytes1 {
+		b = emitSplat(b, v, splat1[i])
+	}
+	for i, v := range pp.Bytes2 {
+		b = emitSplat(b, v, splat2[i])
+	}
+
+	b = c.emitFindPrologue(b, lPos)
+
+	b = append(b, 0x02, 0x40) // block $batch_done
+	b = append(b, 0x03, 0x40) // loop $scan
+
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01) // lPos > pInLen → done
+	b = c.emitDrainCheck(b, lPos, 0x01)
+
+	// SIMD guard, identical in shape and reasoning to the Teddy body's: the
+	// last lane of the widest block is a literal occupying
+	// [lPos+span-1, lPos+span-1+MinLen), and all of it must be inside the
+	// input. This also covers every chunk load, whose furthest byte is
+	// lPos+span-1+Off2 <= lPos+span-2+MinLen. See the comment on Teddy's
+	// simdGuard — the off-by-one there was a real out-of-bounds read that
+	// produced a phantom match on a NUL literal.
+	span := 16 * blocks
+	simdGuard := int32(pp.MinLen + span - 1)
+
+	b = append(b, 0x02, 0x40) // block $not_simd
+	b = append(b, 0x20, lPos, 0x41)
+	b = utils.AppendSLEB128(b, simdGuard)
+	b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00) // lPos+guard > pInLen → $not_simd
+
+	// Load the two probe columns for each block.
+	emitChunkLoad := func(b []byte, off int, dst byte) []byte {
+		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
+		if off > 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(off))
+			b = append(b, 0x6A)
+		}
+		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+		return append(b, 0x21, dst)
+	}
+	// column mask = OR over the column's bytes of i8x16.eq(chunk, splat(b)).
+	emitColumnMask := func(b []byte, chunk byte, splats []byte) []byte {
+		for i, s := range splats {
+			b = append(b, 0x20, chunk, 0x20, s, 0xFD, 0x23) // i8x16.eq
+			if i > 0 {
+				b = append(b, 0xFD, 0x50) // v128.or
+			}
+		}
+		return b
+	}
+	for blk := 0; blk < blocks; blk++ {
+		b = emitChunkLoad(b, pp.Off1+16*blk, lChunk1[blk])
+		b = emitChunkLoad(b, pp.Off2+16*blk, lChunk2[blk])
+	}
+	// Fold each block's 16-bit bitmask into one lane mask, block k occupying
+	// bits [16k, 16k+16). ctz over the combined mask then yields the position
+	// offset from lPos directly, exactly as in the single-block case.
+	for blk := 0; blk < blocks; blk++ {
+		b = emitColumnMask(b, lChunk1[blk], splat1)
+		b = emitColumnMask(b, lChunk2[blk], splat2)
+		b = append(b, 0xFD, 0x4E) // v128.and — both columns must hit
+		// i8x16.eq lanes are 0xFF/0x00, so the bitmask (which reads each
+		// lane's high bit) needs no separate compare-against-zero step.
+		b = append(b, 0xFD, 0x64) // i8x16.bitmask
+		if blk > 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(16*blk))
+			b = append(b, 0x74, 0x72) // i32.shl; i32.or
+		}
+	}
+	b = append(b, 0x21, lLaneMask)
+
+	// Process candidate lanes.
+	b = append(b, 0x02, 0x40) // block $lanes_done
+	b = append(b, 0x03, 0x40) // loop $lanes
+	b = append(b, 0x20, lLaneMask, 0x45, 0x0D, 0x01)                                        // mask == 0 → done
+	b = append(b, 0x20, lLaneMask, 0x68, 0x21, lLaneOff)                                    // ctz
+	b = append(b, 0x20, lLaneMask, 0x20, lLaneMask, 0x41, 0x01, 0x6B, 0x71, 0x21, lLaneMask) // clear low bit
+	b = append(b, 0x20, lPos, 0x20, lLaneOff, 0x6A, 0x21, lMatchPos)                        // lMatchPos = lPos + lLaneOff
+
+	// Verify every literal at lMatchPos, from offset 0.
+	//
+	// Never stop at the first hit: several literals can genuinely match the
+	// same position and each owns buckets that must run. This is the rule
+	// bucketed Teddy applies for the same reason (see the comment in
+	// emitSetMatchFnFinalTeddy's lane dispatch), and unlike aho-corasick's
+	// verify_bucket we have no leftmost-first contract letting us return early.
+	for _, bi := range litOrderFor(cs) {
+		bkt := cs.buckets[bi]
+		lit := []byte(bkt.literal)
+		litLen := len(lit)
+		b = append(b, 0x02, 0x40) // block $lit_no
+		// Fit check: lMatchPos + litLen > pInLen → skip this literal.
+		b = append(b, 0x20, lMatchPos, 0x41)
+		b = utils.AppendSLEB128(b, int32(litLen))
+		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
+		for li, lb := range lit {
+			// The two probe columns are already known to match, so skip them.
+			if li == pp.Off1 || li == pp.Off2 {
+				continue
+			}
+			b = append(b, 0x20, pInPtr, 0x20, lMatchPos, 0x6A)
+			b = append(b, 0x2D, 0x00)
+			b = utils.AppendULEB128(b, uint32(li))
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(lb))
+			b = append(b, 0x47, 0x0D, 0x00) // i32.ne → skip
+		}
+		b = c.emitBucketAt(b, bi, litLen, lMatchPos)
+		b = append(b, 0x0B) // end $lit_no
+	}
+
+	b = append(b, 0x0C, 0x00) // br 0 → restart $lanes
+	b = append(b, 0x0B)       // end loop $lanes
+	b = append(b, 0x0B)       // end block $lanes_done
+
+	b = append(b, 0x20, lPos, 0x41)
+	b = utils.AppendSLEB128(b, int32(span))
+	b = append(b, 0x6A, 0x21, lPos) // lPos += span
+	b = append(b, 0x0C, 0x01)       // br 1 → restart $scan
+	b = append(b, 0x0B)             // end block $not_simd
+
+	// Scalar tail: check each literal at lPos, one position at a time.
+	for _, bi := range litOrderFor(cs) {
+		bkt := cs.buckets[bi]
+		lit := []byte(bkt.literal)
+		litLen := len(lit)
+		b = append(b, 0x02, 0x40)
+		b = append(b, 0x20, lPos, 0x41)
+		b = utils.AppendSLEB128(b, int32(litLen))
+		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
+		for li, lb := range lit {
+			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
+			if li > 0 {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(li))
+				b = append(b, 0x6A)
+			}
+			b = append(b, 0x2D, 0x00, 0x00, 0x41)
+			b = utils.AppendSLEB128(b, int32(lb))
+			b = append(b, 0x47, 0x0D, 0x00)
+		}
+		b = c.emitBucketAt(b, bi, litLen, lPos)
+		b = append(b, 0x0B)
+	}
+
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos += 1
+	b = append(b, 0x0C, 0x00)                               // br 0 → restart $scan
+	b = append(b, 0x0B)                                     // end loop $scan
+	b = append(b, 0x0B)                                     // end block $batch_done
+	b = c.emitGateWriteback(b, lPos)
+	b = c.emitEpilogue(b)
+	b = append(b, 0x0B)
+
+	funcBody := utils.AppendULEB128(nil, uint32(len(b)))
+	funcBody = append(funcBody, b...)
+	return funcBody
 }
 
 // emitSetMatchFnFinalTeddy emits the set match function body using SIMD Teddy

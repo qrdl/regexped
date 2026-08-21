@@ -36,6 +36,7 @@ regexped/
 │   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
+│   ├── byte_rank.go           # Packed-pair set frontend: byte-rarity ranks, two-column probe selection (<=16 literals)
 │   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets
 │   ├── set_emit.go            # Set WASM emission (CompileFile, the four frontend bodies: AC/Teddy/Shufti/scalar).
 │   │                          #   These bodies serve `find` AND the scan trio — setFindCtx.mode picks what
@@ -596,5 +597,7 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 **CLI commands:** `generate` (stubs), `compile`, `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand.
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition)
 **Set capabilities:** `match` / `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan` / `scan_any` / `scan_all` (non-anchored, bitmask probes, sharing `find`'s literal frontends), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration).
+
+**Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body), scalar.
 
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

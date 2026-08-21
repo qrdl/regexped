@@ -390,6 +390,24 @@ type rxInstance struct {
 	bitmapPt int32
 	npat     int32
 	inLen    int32
+	// fnCache holds resolved exports. Resolving inside the timed loop meant
+	// every measured operation paid a string-keyed export lookup that is
+	// neither engine work nor the wasmtime crossing — pure harness cost, and
+	// it inflated every one of our rows (plans/SETS.md §17.5).
+	fnCache map[capability]*wasmtime.Func
+}
+
+// fnFor resolves a capability's export once and caches it.
+func (r *rxInstance) fnFor(c capability) *wasmtime.Func {
+	if r.fnCache == nil {
+		r.fnCache = make(map[capability]*wasmtime.Func, len(allCaps))
+	}
+	if fn, ok := r.fnCache[c]; ok {
+		return fn
+	}
+	fn := r.inst.GetFunc(r.store, exportName(c))
+	r.fnCache[c] = fn
+	return fn
 }
 
 func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel bool) (*rxInstance, error) {
@@ -463,44 +481,48 @@ func (r *rxInstance) zeroBitmap() {
 // call runs one whole-input operation for the given capability, exactly as a
 // caller would: the `_all` pair once, the boolean and `_any` pair once, and
 // `find` driven to exhaustion.
-func (r *rxInstance) call(c capability, wide bool) error {
-	fn := r.inst.GetFunc(r.store, exportName(c))
+// call runs one whole-input operation and returns how many Go→wasmtime
+// crossings it took. The count is what lets measureTime subtract the harness
+// boundary cost: every crossing carries a fixed ~4 us that has nothing to do
+// with the engine, and `find` pays one per match (plans/SETS.md §17.5).
+func (r *rxInstance) call(c capability, wide bool) (int, error) {
+	fn := r.fnFor(c)
 	if fn == nil {
-		return fmt.Errorf("missing export %s", exportName(c))
+		return 0, fmt.Errorf("missing export %s", exportName(c))
 	}
 	switch c {
 	case capMatch, capMatchAny:
 		_, err := fn.Call(r.store, r.inBase, r.inLen)
-		return err
+		return 1, err
 	case capMatchAll:
 		if wide {
 			r.zeroBitmap()
 			_, err := fn.Call(r.store, r.inBase, r.inLen, r.bitmapPt)
-			return err
+			return 1, err
 		}
 		_, err := fn.Call(r.store, r.inBase, r.inLen)
-		return err
+		return 1, err
 	case capScan, capScanAny:
 		_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0))
-		return err
+		return 1, err
 	case capScanAll:
 		if wide {
 			r.zeroBitmap()
 			_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0), r.bitmapPt)
-			return err
+			return 1, err
 		}
 		_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0))
-		return err
+		return 1, err
 	case capFind:
 		return r.exhaustFind(fn, true)
 	case capFindOverlapping:
 		return r.exhaustFind(fn, false)
 	}
-	return fmt.Errorf("unknown capability %q", c)
+	return 0, fmt.Errorf("unknown capability %q", c)
 }
 
 // exhaustFind drives `find` to exhaustion the way a generated iterator does.
-func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) error {
+func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 	if gated {
 		buf := r.mem.UnsafeData(r.store)
 		for i := int32(0); i < r.npat*4; i++ {
@@ -509,19 +531,21 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) error {
 		runtime.KeepAlive(r.store)
 	}
 	from := int32(0)
+	calls := 0
 	for {
 		var res interface{}
 		var err error
+		calls++
 		if gated {
 			res, err = fn.Call(r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
 		} else {
 			res, err = fn.Call(r.store, r.inBase, r.inLen, from, r.outPtr, r.npat)
 		}
 		if err != nil {
-			return err
+			return calls, err
 		}
 		if res.(int32) <= 0 {
-			return nil
+			return calls, nil
 		}
 		buf := r.mem.UnsafeData(r.store)
 		start := int32(binary.LittleEndian.Uint32(buf[int(r.outPtr)+4:]))
@@ -559,12 +583,12 @@ func measureFuelRow(c setCase) []row {
 		}
 		wide := r.npat > 64
 		// Warm-up call, uncounted: the first call pays lazy compilation.
-		_ = r.call(cap, wide)
+		_, _ = r.call(cap, wide)
 		if err := r.store.SetFuel(fuelBudget); err != nil {
 			continue
 		}
 		before, _ := r.store.GetFuel()
-		if err := r.call(cap, wide); err != nil {
+		if _, err := r.call(cap, wide); err != nil {
 			// Almost always the fuel budget running out. Record that as a
 			// SENTINEL rather than dropping the row: a bare `continue` here
 			// is why greedy-3's scan_all/find/find(overlapping) had no fuel
@@ -612,33 +636,98 @@ func timedCase(c setCase, cap capability, ourFuel uint64) (setCase, bool) {
 	return c, true
 }
 
-// measureTime returns the p50 of benchIters whole-input operations.
-func measureTime(engine *wasmtime.Engine, c setCase, cap capability, ourFuel uint64) (time.Duration, error) {
+// measureTime returns the p50 of benchIters whole-input operations, together
+// with the number of Go→wasmtime crossings one operation costs.
+//
+// The crossing count is not incidental: it is the correction term that makes
+// this side comparable with the regex-automata side at all (plans/SETS.md
+// §17.5). Our sample brackets a host call; theirs is taken by the Rust
+// harness INSIDE wasm, around the engine work alone. Subtracting
+// crossings × callFloor from our p50 puts both on the same footing.
+func measureTime(engine *wasmtime.Engine, c setCase, cap capability, ourFuel uint64) (time.Duration, int, time.Duration, error) {
 	c, _ = timedCase(c, cap, ourFuel)
 	wasm, err := compileCase(c, cap == capFindOverlapping)
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, err
 	}
 	r, err := newRxInstance(engine, wasm, c, false)
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, err
 	}
+	floor := measureInstanceFloor(r)
 	wide := r.npat > 64
+	calls := 0
 	for end := time.Now().Add(50 * time.Millisecond); time.Now().Before(end); {
-		if err := r.call(cap, wide); err != nil {
-			return 0, err
+		if calls, err = r.call(cap, wide); err != nil {
+			return 0, 0, 0, err
 		}
 	}
 	samples := make([]time.Duration, benchIters)
 	for i := range samples {
 		t0 := time.Now()
-		if err := r.call(cap, wide); err != nil {
-			return 0, err
+		n, err := r.call(cap, wide)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		samples[i] = time.Since(t0)
+		calls = n
+	}
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	return samples[len(samples)/2], calls, floor, nil
+}
+
+// --------------------------------------------------------------------------
+// The harness-boundary correction (plans/SETS.md §17.5).
+
+// measureInstanceFloor times a call into THIS module that does essentially no
+// work: `cap_match` on a zero-length input, which enters the anchored probe
+// and returns within a couple of instructions.
+//
+// Measuring the boundary on the real module rather than on a synthetic empty
+// one matters. A hand-built noop module measured 2.0-3.0 us here with no
+// ordering by arity — i.e. dominated by noise — and it under-reported: the
+// cheapest real row in the matrix (greedy-3 / 50K a's / scan, 48 fuel, so
+// arithmetically no work at all) samples at 3.8 us. Module size, memory
+// footprint and the number of exports all move the crossing cost, so the
+// floor is taken per instance, against the very module being timed.
+//
+// The floor uses the SAME estimator as the rows it corrects — p50 over
+// benchIters samples, after an equal warm-up. That symmetry is the point: a
+// min-of-rounds floor is biased low, and subtracting a low-biased floor from
+// an unbiased p50 leaves a residual that looks like engine work but is not.
+// Calibration check: with matched estimators the anchored rows, which do
+// 54-60 fuel of work, correct to approximately zero.
+func measureInstanceFloor(r *rxInstance) time.Duration {
+	fn := r.fnFor(capMatch)
+	if fn == nil {
+		return 0
+	}
+	for end := time.Now().Add(50 * time.Millisecond); time.Now().Before(end); {
+		if _, err := fn.Call(r.store, r.inBase, int32(0)); err != nil {
+			return 0
+		}
+	}
+	samples := make([]time.Duration, benchIters)
+	for i := range samples {
+		t0 := time.Now()
+		if _, err := fn.Call(r.store, r.inBase, int32(0)); err != nil {
+			return 0
 		}
 		samples[i] = time.Since(t0)
 	}
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	return samples[len(samples)/2], nil
+	return samples[len(samples)/2]
+}
+
+// engineTime strips the harness boundary from a raw sample: one crossing per
+// call the operation made. Clamped at zero — when the correction exceeds the
+// sample the row was pure boundary, which is what call-bound means.
+func engineTime(raw time.Duration, calls int, floor time.Duration) time.Duration {
+	corrected := raw - time.Duration(calls)*floor
+	if corrected < 0 {
+		return 0
+	}
+	return corrected
 }
 
 // --------------------------------------------------------------------------
@@ -765,9 +854,15 @@ func runFullMatrix(cases []setCase) {
 	fmt.Println(strings.Repeat("─", 96))
 	fmt.Println("Fuel is EXACT within an engine and indicative ACROSS engines; wall-clock is")
 	fmt.Println("placement noise on this machine — compare the ratio, not the absolute.")
-	fmt.Printf("Ratios are withheld below %d fuel (\"call-bound\"): our harness times one\n", callBoundFuel)
-	fmt.Println("Go→wasmtime call per sample and theirs amortises the call inside WASM, so on")
-	fmt.Println("cheap capabilities the ratio compares the harnesses, not the engines (§13 F3).")
+	fmt.Println()
+	fmt.Println("BOTH SIDES ARE WASM: regex-automata is built for wasm32-wasip1 and runs in the")
+	fmt.Println("same wasmtime engine. What differs is where the clock sits (§17.5). Our sample")
+	fmt.Println("brackets a Go→wasmtime call; the Rust harness times itself INSIDE wasm. So our")
+	fmt.Println("raw p50 carries one crossing per call — and `find` makes one call per match.")
+	fmt.Println("`our engine` subtracts calls × the measured crossing cost for that arity, and")
+	fmt.Println("the ratio is computed from it, so both columns describe engine work alone.")
+	fmt.Printf("Ratios are still withheld below %d fuel (\"call-bound\"): once the correction\n", callBoundFuel)
+	fmt.Println("is the bulk of the sample, what remains is measurement noise, not a result.")
 	fmt.Printf("find(overlapping) is timed on at most %d bytes: it is the every-start-position\n", overlappingTimedCap)
 	fmt.Println("enumeration, quadratic on literal-less sets, and blocks the matrix otherwise (F4).")
 	fmt.Println()
@@ -789,15 +884,17 @@ func runFullMatrix(cases []setCase) {
 			fuel[r.key] = r.value
 		}
 
-		fmt.Printf("  %-18s %12s %12s %12s %11s  %s\n", "capability", "our fuel", "our p50", "theirs p50", "ratio", "note")
-		fmt.Println("  " + strings.Repeat("─", 82))
+		fmt.Printf("  %-18s %12s %11s %7s %11s %11s %9s  %s\n",
+			"capability", "our fuel", "our p50", "calls", "our engine", "theirs p50", "ratio", "note")
+		fmt.Println("  " + strings.Repeat("─", 100))
 		for _, cap := range allCaps {
 			ourFuel := fuel[rowKey(c, cap)]
-			ours, err := measureTime(engine, c, cap, ourFuel)
+			ours, calls, floor, err := measureTime(engine, c, cap, ourFuel)
 			if err != nil {
-				fmt.Printf("  %-18s %12s %12s %12s %11s\n", cap, "-", "error", "-", "-")
+				fmt.Printf("  %-18s %12s %11s %7s %11s %11s %9s\n", cap, "-", "error", "-", "-", "-", "-")
 				continue
 			}
+			ourEng := engineTime(ours, calls, floor)
 			f := fmtFuel(ourFuel)
 			// F4: say so when the timed input was shortened, because then this
 			// row's fuel and time describe different input lengths.
@@ -815,12 +912,14 @@ func runFullMatrix(cases []setCase) {
 				if raErr != nil {
 					reason = "harness error"
 				}
-				fmt.Printf("  %-18s %12s %12s %12s %11s  %s\n", cap, f, fmtDur(ours), reason, "-", note)
+				fmt.Printf("  %-18s %12s %11s %7d %11s %11s %9s  %s\n",
+					cap, f, fmtDur(ours), calls, fmtDur(ourEng), reason, "-", note)
 				continue
 			}
 			theirs, err := ra.bench(pairing, len(c.input))
 			if err != nil {
-				fmt.Printf("  %-18s %12s %12s %12s %11s  %s\n", cap, f, fmtDur(ours), "error", "-", note)
+				fmt.Printf("  %-18s %12s %11s %7d %11s %11s %9s  %s\n",
+					cap, f, fmtDur(ours), calls, fmtDur(ourEng), "error", "-", note)
 				continue
 			}
 			// A ratio is printed only when both sides did comparable work.
@@ -838,10 +937,20 @@ func runFullMatrix(cases []setCase) {
 				if note == "" {
 					note = fmt.Sprintf("our work is %s fuel; ratio would measure harness call overhead", f)
 				}
+			case ourEng > 0 && theirs > 0:
+				// Engine-vs-engine: both sides now exclude the host boundary.
+				ratio = fmt.Sprintf("%.2fx", float64(theirs)/float64(ourEng))
 			case ours > 0 && theirs > 0:
-				ratio = fmt.Sprintf("%.2fx", float64(theirs)/float64(ours))
+				// The correction consumed the whole sample — the row was
+				// boundary, not engine. Say so rather than dividing by zero.
+				ratio = "boundary"
+				if note == "" {
+					note = fmt.Sprintf("%d call(s) x %s crossing >= the %s sample",
+						calls, fmtDur(floor), fmtDur(ours))
+				}
 			}
-			fmt.Printf("  %-18s %12s %12s %12s %11s  %s\n", cap, f, fmtDur(ours), fmtDur(theirs), ratio, note)
+			fmt.Printf("  %-18s %12s %11s %7d %11s %11s %9s  %s\n",
+				cap, f, fmtDur(ours), calls, fmtDur(ourEng), fmtDur(theirs), ratio, note)
 		}
 		_ = fuelEngine
 	}

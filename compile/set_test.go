@@ -987,15 +987,22 @@ func TestChooseLiteralFrontend(t *testing.T) {
 		lits [][]byte
 		want frontendKind
 	}{
-		{[][]byte{[]byte("ab"), []byte("cd")}, frontendTeddy},
+		// At or below 16 literals, a qualifying two-column packed pair wins
+		// (plans/SETS.md §16 Task G1): two eq-splat columns cost far less per
+		// chunk than Teddy's four nibble-table probes, and both verify
+		// candidates identically.
+		{[][]byte{[]byte("ab"), []byte("cd")}, frontendPackedPair}, // cols {a,c} × {b,d} = 4, fits
+		{[][]byte{[]byte("abcd")}, frontendPackedPair},
+		{[][]byte{[]byte("abcde")}, frontendPackedPair},
+		{[][]byte{[]byte("sk_live_")}, frontendPackedPair},
+		// A single one-byte literal has only ONE probe column, so no pair
+		// exists and Teddy keeps it.
 		{[][]byte{[]byte("a")}, frontendTeddy},
-		{[][]byte{[]byte("abcd")}, frontendTeddy},     // 4 bytes → Teddy
-		{[][]byte{[]byte("abcde")}, frontendTeddy},    // 5 bytes → Teddy (partial probe)
-		{[][]byte{[]byte("sk_live_")}, frontendTeddy}, // 8 bytes → Teddy (partial probe)
 		{nil, frontendScalar},
 		{[][]byte{[]byte("")}, frontendScalar}, // empty literal → scalar
 	}
-	// 9 literals ≤ 16 → Teddy (two groups)
+	// 9 one-byte literals: still a single probe column, so still Teddy — the
+	// packed-pair rule keys on the probe WINDOW, not the literal count.
 	nineLits := make([][]byte, 9)
 	for i := range nineLits {
 		nineLits[i] = []byte{byte('a' + i)}
@@ -1004,6 +1011,28 @@ func TestChooseLiteralFrontend(t *testing.T) {
 		lits [][]byte
 		want frontendKind
 	}{nineLits, frontendTeddy})
+	// Eight two-byte literals with eight distinct bytes in BOTH columns:
+	// every candidate pair costs 8+8 bytes, far over packedPairByteBudget, so
+	// byte-equality would need sixteen i8x16.eq per chunk. Teddy's nibble
+	// tables absorb exactly this width at fixed cost, and keep the set.
+	wideCols := make([][]byte, 8)
+	for i := range wideCols {
+		wideCols[i] = []byte{byte('a' + i), byte('0' + i)}
+	}
+	cases = append(cases, struct {
+		lits [][]byte
+		want frontendKind
+	}{wideCols, frontendTeddy})
+	// The keywords-N shape §16 Task G1 exists for: literals sharing a "kw00"
+	// prefix. Columns 0 and 1 are one rare byte each, which is the ideal pair.
+	keywordShape := make([][]byte, 8)
+	for i := range keywordShape {
+		keywordShape[i] = []byte{'k', 'w', '0', '0', byte('0' + i)}
+	}
+	cases = append(cases, struct {
+		lits [][]byte
+		want frontendKind
+	}{keywordShape, frontendPackedPair})
 	// 17 literals with 17 DISTINCT first bytes → bucketed Teddy: above the
 	// first-byte crossover, Teddy's fixed-cost probe beats AC's prefilter
 	// (plans/SETS.md §14.11).

@@ -187,12 +187,12 @@ Declaring less emits less:
 
 A set that does not declare `find` emits no tuple-writing suffix functions at
 all — just the DFA tables, which the cheap bitmask probes share. A
-`match`-only set additionally emits no literal frontend: the Teddy/AC/Shufti
-tables and skip loop could never execute for it.
+`match`-only set additionally emits no literal frontend: the
+packed-pair/Teddy/AC/Shufti tables and skip loop could never execute for it.
 
 Measured on a 100KB no-match corpus with eight literal-prefixed patterns:
-`match` 52 fuel, `match_any`/`match_all` 82, `scan` 667K, `scan_any`/`scan_all`
-680K, `find` 680K. The anchored trio dies within a byte or two of position 0;
+`match` 54 fuel, `match_any`/`match_all` 84, `scan` 212K, `scan_any`/`scan_all`
+219K, `find` 219K. The anchored trio dies within a byte or two of position 0;
 the scan trio is frontend-bound, like `find`, because it shares `find`'s
 frontend. (An earlier draft gave the scan trio a scalar position-by-position
 scan instead, and measured 17x worse — the literal frontend is what makes
@@ -290,7 +290,8 @@ regexped compile --config=regexped.yaml --diag-json=diag.json
 
 The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
 `in_set` (patterns actually placed into a set), `prefix_dedup_pool_size`,
-and per-set `frontend` (`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
+and per-set `frontend`
+(`"packed-pair"`/`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
 `conflicts`, `capture_bearing_dropped`, and `state_limit_dropped` (patterns
 dropped for exceeding a fallback bucket's state budget — see
 [Bin-packing](#bin-packing-and-merge-constraints) above) arrays.
@@ -369,7 +370,8 @@ which is the trade this project makes everywhere (see CLAUDE.md's "Runtime over
 compile time").
 
 A consequence worth knowing: a `match`-only set emits no literal frontend at
-all — the Teddy/AC/Shufti tables and skip loop can never execute for it.
+all — the packed-pair/Teddy/AC/Shufti tables and skip loop can never execute
+for it.
 
 ## Variable-length prefixes route to fallback
 

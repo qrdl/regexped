@@ -755,6 +755,13 @@ const (
 	// Requires zero fallback buckets — fallback runs at every position
 	// so a first-byte SIMD skip can't safely advance past it.
 	frontendShufti
+	// frontendPackedPair: two-column byte-equality SIMD prefilter
+	// (plans/SETS.md §16 Task G1). Two v128 loads, one i8x16.eq per probe
+	// byte, one v128.and and one bitmask per 16-byte chunk — flat in literal
+	// count and far cheaper per byte than Teddy's four nibble-table lookups.
+	// Chosen for small literal sets whose probe window has a rare, narrow
+	// two-column signature; see chooseLiteralFrontend for the crossover.
+	frontendPackedPair
 )
 
 func (f frontendKind) String() string {
@@ -765,6 +772,8 @@ func (f frontendKind) String() string {
 		return "ac"
 	case frontendShufti:
 		return "shufti"
+	case frontendPackedPair:
+		return "packed-pair"
 	default:
 		return "scalar"
 	}
@@ -1095,6 +1104,28 @@ func chooseLiteralFrontend(literals [][]byte) frontendKind {
 		}
 	}
 	if len(literals) <= 16 {
+		// A two-column packed pair beats Teddy whenever one exists: it reads
+		// two 16-byte chunks and does one i8x16.eq per probe byte, against
+		// Teddy's four chunk loads and four nibble-table swizzle pairs. Both
+		// verify candidates the same way, so the pair's only cost is a higher
+		// false-positive rate, which choosePackedPair minimises by picking the
+		// rarest columns. Measured for plans/SETS.md §16 Task G1 on the
+		// keywords-2/8 shapes at 100KB: Teddy 6.5 fuel/byte, AC 4.1,
+		// packed-pair ~1.8 — see §16.4.
+		if _, ok := choosePackedPair(literals); ok {
+			return frontendPackedPair
+		}
+		// No qualifying pair: one-byte literals (a single probe column), or a
+		// probe window whose columns are too wide for byte-equality. Teddy's
+		// nibble tables absorb column width that eq-splats cannot, so it stays
+		// the fallback.
+		//
+		// Routing these to AC instead was measured and NOT adopted. On the
+		// keywords-2/8 shape AC does beat Teddy by ~37% (§16.4), but those
+		// sets now take packed-pair, so that measurement says nothing about
+		// the sets which actually reach this line — and extrapolating it here
+		// would put a single one-byte literal through a full Aho-Corasick
+		// automaton. Left as Teddy pending a measurement of this branch.
 		return frontendTeddy
 	}
 	// Above 16, Teddy buckets several literals per lane (§14 P4) and both

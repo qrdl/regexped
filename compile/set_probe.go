@@ -84,6 +84,63 @@ func buildSetProbeBody(p setSuffixParams, anchored bool) []byte {
 
 	// --- scan loop ---
 	b = append(b, 0x02, 0x40) // block $done
+
+	// Anchored fast path: unroll four transitions per iteration
+	// (plans/SETS.md §16 Task G5).
+	//
+	// The per-byte loop below is already minimal — 24 WASM instructions, with
+	// no accept-table load at all, because every orTableBits call in this
+	// function is guarded by !anchored. G5's original hypothesis (a per-byte
+	// accept load that only EOF needs) was therefore REFUTED by disassembly;
+	// the cost is simply that 24 instructions run per byte, of which 9 are
+	// loop scaffolding rather than the transition itself.
+	//
+	// Unrolling amortises the bounds test, the position increment and the
+	// backward branch across four bytes, and folds each byte's input offset
+	// into the load's own offset immediate so the position only advances once
+	// per block. What it deliberately does NOT amortise is the dead-state
+	// test: that stays per byte, so a pattern that dies at position 0 — the
+	// overwhelmingly common case for an anchored set, and the reason the
+	// keywords-* anchored rows cost 52 fuel — still exits immediately and
+	// pays nothing for the unrolling.
+	//
+	// Restricted to the uncompressed u8 layout: the compressed and u16 paths
+	// route the input byte through a class map or a scaled index, so their
+	// loads cannot take the offset immediate this depends on. They keep the
+	// per-byte loop unchanged.
+	unrollAnchored := anchored && l.useU8 && !l.useCompression
+	if unrollAnchored {
+		const unroll = 4
+		b = append(b, 0x02, 0x40) // block $tail
+		b = append(b, 0x03, 0x40) // loop $main4
+		// Need all `unroll` bytes in range: lScanPos + unroll > paramLen → tail.
+		b = append(b, 0x20, lScanPos, 0x41, unroll, 0x6A, 0x20, paramLen, 0x4B, 0x0D, 0x01)
+		for k := 0; k < unroll; k++ {
+			// table[state*256 + input[lScanPos + k]] — the +k rides in the
+			// load's offset immediate, which is why lScanPos is untouched
+			// until the block completes.
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, l.tableOff)
+			b = append(b, 0x20, lState, 0x41, 0x08, 0x74, 0x6A)
+			b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
+			b = append(b, 0x2D, 0x00)
+			b = utils.AppendULEB128(b, uint32(k)) // input load offset immediate
+			b = append(b, 0x6A)
+			b = appendTableLoad8u(b, tableMemIdx)
+			b = append(b, 0x21, lState)
+			// Dead state → $done. lScanPos is left at the block start, which
+			// is < paramLen, and that is all the anchored answer needs: the
+			// EOF check below is `lScanPos == paramLen`, so any early exit
+			// correctly reports "did not consume the whole input". The exact
+			// position is never read on this path.
+			b = append(b, 0x20, lState, 0x45, 0x0D, 0x02)
+		}
+		b = append(b, 0x20, lScanPos, 0x41, unroll, 0x6A, 0x21, lScanPos)
+		b = append(b, 0x0C, 0x00) // br 0 → restart $main4
+		b = append(b, 0x0B)       // end loop $main4
+		b = append(b, 0x0B)       // end block $tail
+	}
+
 	b = append(b, 0x03, 0x40) // loop $main
 	b = append(b, 0x20, lScanPos, 0x20, paramLen, 0x4F, 0x0D, 0x01)
 
