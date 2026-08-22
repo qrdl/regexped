@@ -499,6 +499,31 @@ which is both correct and what a set containing them would have to do anyway —
 a literal arbitrarily far to the right can serve a match starting here, so
 nothing can be skipped.
 
+## Zero-width assertions in a prefix route to fallback
+
+The same backward DFA is a plain *byte* automaton, so any zero-width assertion
+sitting between the match start and the mandatory literal has no representation
+in it. Rather than drop the assertion, such a pattern gives up the split and is
+compiled as a whole-pattern DFA evaluated at every position.
+
+Two flavours are disqualified:
+
+| in the prefix | example | why the backward walk cannot see it |
+|---|---|---|
+| `\b`, `\B` | `\B.KEY` | The walk carries no `prevWasWord` bit and never reads the wordChar table — a boundary at the prefix's left edge depends on the byte *before* the start, which a backward scan has not reached. |
+| `$`, `\z`, `(?m:$)` | `.$KEY` | End-of-text is not a byte, so the assertion simply has no encoding in a byte DFA. |
+
+The two fail in opposite directions, which is why both matter: dropping a `\b`
+*loses* matches, while dropping a `$` *invents* them — `.$0` cannot match any
+input at all, since nothing can follow end-of-text.
+
+Begin-anchors are **not** in this list and cost you nothing: `^`, `\A` and
+`(?m:^)` are modelled positively as per-pattern eligibility masks, so `^KEY`
+and `(?m:^)KEY` keep both their split and their literal frontend. An
+end-assertion *after* the literal is equally fine — `KEY$` is expressed by the
+forward suffix DFA's end-of-text channel — so only a prefix assertion
+disqualifies.
+
 ## Examples
 
 - [examples/node/sql-validator/](../examples/node/sql-validator/) — anchored `match_any`, SQL statement validation (Node.js / TypeScript)

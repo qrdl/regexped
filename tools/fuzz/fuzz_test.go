@@ -117,6 +117,58 @@ func envMaxNFAInsts() int {
 	return n
 }
 
+// maxSetOracleInput bounds the INPUT length FuzzSet admits, for the same 10s
+// worker deadline maxNFAInsts guards — but against a cost term that cap cannot
+// see (plans/FUZZER_BUGS.md bug 45). FuzzSetCaps needs no such variable: it
+// already caps input at 64 bytes for an unrelated reason, which is why only
+// FuzzSet ever reached the deadline.
+//
+// maxNFAInsts bounds the PATTERN's NFA. FuzzSet's dominant cost is neither the
+// pattern nor the engine: it is the harness oracle. allStartPositionMatches
+// calls regexp.Compile once per start position, on a pattern carrying a
+// `.{p}` prefix, so its cost grows superlinearly in INPUT length while the
+// pattern stays trivial. On the crasher that exposed this — patterns
+// `a(?:b|bc)` + `a\x00\x00b\)`, 1,903 bytes — compile was 0.33ms and the WASM
+// run 3.19ms against 405ms of oracle: 99% of the call.
+//
+// # Calibration
+//
+// Oracle wall clock for that pattern pair, measured 2026-08-22 on the
+// reference box (4 CPUs, Linux, Go 1.25.9), against the same 3.5x
+// solo→fuzz-worker factor maxNFAInsts documents:
+//
+//	input   oracle solo   x3.5      headroom vs 10s
+//	512     53ms          187ms     53x
+//	1024    216ms         756ms     13x
+//	2048    744ms         2.6s      3.8x   <- default
+//	4096    3.70s         12.9s     0.8x   (already over)
+//	8192    17.1s         60s       0.17x
+//	16384   80.2s         281s      0.04x
+//
+// Growth is ~n^2.2, so the cliff is sharp: every doubling past 2048 costs
+// ~4.6x. pathsInputCap (128 KB) is no bound at all here — it admits inputs
+// whose oracle alone would run for hours.
+//
+// This narrows coverage, and the loss is real: plans/SETS.md §18.7 records a
+// genuine oracle bug found on a 3,282-byte input, which this cap excludes.
+// Raise it deliberately (and re-measure) when hunting long-input behaviour:
+//
+//	REGEXPED_FUZZ_MAX_SET_INPUT=4096 go test -run='FuzzSet$' -fuzz='FuzzSet$'
+var maxSetOracleInput = sync.OnceValue(envMaxSetOracleInput)
+
+func envMaxSetOracleInput() int {
+	const def = 2048
+	raw, ok := os.LookupEnv("REGEXPED_FUZZ_MAX_SET_INPUT")
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		panic(fmt.Sprintf("REGEXPED_FUZZ_MAX_SET_INPUT must be a positive integer, got %q", raw))
+	}
+	return n
+}
+
 func FuzzCorrectness(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)

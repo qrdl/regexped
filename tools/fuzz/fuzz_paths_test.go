@@ -325,6 +325,12 @@ func FuzzSet(f *testing.F) {
 		if len(input) >= pathsInputCap {
 			t.Skip()
 		}
+		// The oracle below costs ~n^2.2 in input length and dominates the
+		// call, so pathsInputCap is no protection against the fuzz worker's
+		// 10s hang deadline — see maxSetOracleInput for the measurements.
+		if len(input) > maxSetOracleInput() {
+			t.Skip("input longer than the per-start-position oracle can price under the worker deadline")
+		}
 		// The whole-input oracle below counts RUNES in its `.{p}` prefix, so
 		// it is only exact on single-byte-rune input (plans/SETS.md §9.6).
 		for i := 0; i < len(input); i++ {

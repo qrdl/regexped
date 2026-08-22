@@ -100,6 +100,26 @@ func parseDataSegments(rawData []byte) []dataSegment {
 	return segs
 }
 
+// dataSegmentsTop returns one past the highest address any segment in rawData
+// writes, or 0 when there are none. It is segAccum's `end` recovered after the
+// fact, for blobs that were already encoded by the time the caller needs their
+// extent.
+//
+// Summing len(rawData) is NOT a substitute and never was: rawData holds ENCODED
+// segments (memory index, offset, LEB128 size, payload), and the payloads are
+// placed at explicit — not necessarily contiguous — offsets. A length sum both
+// counts the encoding overhead and ignores the gaps, and can land either side
+// of the truth. See plans/FUZZER_BUGS.md bug 44.
+func dataSegmentsTop(rawData []byte) int64 {
+	var top int64
+	for _, seg := range parseDataSegments(rawData) {
+		if e := int64(seg.offset) + int64(len(seg.data)); e > top {
+			top = e
+		}
+	}
+	return top
+}
+
 func appendString(out []byte, s string) []byte {
 	out = utils.AppendULEB128(out, uint32(len(s)))
 	return append(out, s...)

@@ -4466,11 +4466,13 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		dataSegCount++
 		nextTableOffset = nlBitmaskOff + int32(l.numWASM)*8
 	}
+	var futureWASM []uint64
 	if needFuture {
 		futureOff = nextTableOffset
 		dataBytes = append(dataBytes, appendDataSegment(nil, futureOff, futureAcceptsBytes(t, l.numWASM))...)
 		dataSegCount++
 		nextTableOffset = futureOff + int32(l.numWASM)*8
+		futureWASM = futureAcceptsWASM(t, l.numWASM)
 	}
 
 	p := setSuffixParams{
@@ -4483,6 +4485,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		// '\n', so a (?m:^) in a set fires at every line start rather than
 		// only at position 0 (plans/FABLE.md B40/B43, plans/SETS.md §9.5 S2).
 		futureOff:           futureOff,
+		future:              futureWASM,
 		wasmStart:           uint32(t.startState + 1),
 		wasmMidStart:        uint32(t.midStartState + 1),
 		wasmMidStartNewline: uint32(t.midStartNewlineState + 1),
@@ -4542,6 +4545,12 @@ type setSuffixParams struct {
 	// liveness exit; it is only emitted for sets a union preflight has
 	// narrowed, since otherwise it costs per byte and never fires (§16.5.2).
 	futureOff int32
+
+	// future is that same table in Go, indexed by WASM state id, populated
+	// exactly when futureOff != 0. G10 (§21.1) needs the value as a
+	// compile-time constant rather than a load: the bulk-skip's liveness
+	// guard sits on an arm whose state is already known statically.
+	future []uint64
 
 	l                             *dfaLayout
 	midBitmaskOff                 int32
@@ -5026,6 +5035,35 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	// matching the per-byte update the elided iterations would have done.
 	// lBitsScratch is preserved across emitDominantBulkSkip (it only
 	// clobbers lByteClass/lBulkChunk), so we re-read it for the update.
+	// G10 (plans/SETS.md §21.1): liveness guard on the bulk-skip.
+	//
+	// The G9 exit at the loop top is DEFEATED by the skip below it: on a
+	// corpus with no exception byte the skip runs to end of input inside the
+	// very iteration before the exit would have fired, and the loop re-enters
+	// at pos >= len. Since the skip's arm already knows its state D
+	// statically, future[D] is a compile-time constant and the guard is the
+	// same test the loop top does, minus the load.
+	//
+	// Branching to $done with lScanPos < len is exactly what the loop-top
+	// exit does one iteration later, and is safe for the same reason: the
+	// post-loop EOF check ORs eofBitmask[state] & validMask, and
+	// futureAccepts folds in every accept channel INCLUDING EOF, so a state
+	// whose future misses validMask entirely cannot accept at EOF either.
+	emitDominantLivenessGuard := func(b []byte, info dominantInfo, depth byte) []byte {
+		if p.futureOff == 0 || int(info.state) >= len(p.future) {
+			return b
+		}
+		// A bucket holds at most 32 patterns, so the low word is the whole
+		// mask — the same truncation the runtime check makes with i32.wrap_i64.
+		b = append(b, 0x20, paramValidMask)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(uint32(p.future[info.state])))
+		b = append(b, 0x71)        // i32.and
+		b = append(b, 0x45)        // i32.eqz
+		b = append(b, 0x0D, depth) // br_if $done
+		return b
+	}
+
 	if haveDominants {
 		// tmp = midAcceptBytes[state]; if (tmp != 0) { ... }
 		b = append(b, 0x41)
@@ -5044,6 +5082,9 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 			b = utils.AppendSLEB128(b, int32(info.encodedByte))
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (encoded byte match)
+			// Nesting here is block $done / loop $main / if midAccept!=0 /
+			// if encoded-match, so $done is br depth 3.
+			b = emitDominantLivenessGuard(b, info, 3)
 			b = emitDominantBulkSkip(b, info, false,
 				lScanPos, paramLen, 0x00, paramPtr,
 				lBulkChunk, lByteClass)
@@ -5082,6 +5123,8 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 			b = utils.AppendSLEB128(b, info.state)
 			b = append(b, 0x46)       // i32.eq
 			b = append(b, 0x04, 0x40) // if (state == K)
+			// block $done / loop $main / if state==K → $done is br depth 2.
+			b = emitDominantLivenessGuard(b, info, 2)
 			b = emitDominantBulkSkip(b, info, false,
 				lScanPos, paramLen, 0x00, paramPtr,
 				lBulkChunk, lByteClass)
@@ -5131,7 +5174,30 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	b = appendTableLoad64(b, tableMemIdx)
 	b = append(b, 0x21, lBits)
 	b = append(b, 0x20, lBits, 0x42, 0x00, 0x52, 0x04, 0x40) // if lBits != 0
-	// For eof-only patterns (no midAccept), set endPos_k = lScanPos
+	// Record the EOF accept as pattern k's end, UNCONDITIONALLY — exactly as
+	// the mid-accept channel does (`endPos_k = scanPos+1`, no guard).
+	//
+	// This used to be guarded by `endPos_k == 0`, reading 0 as "no end
+	// recorded yet" so an earlier accept would not be clobbered. Both halves
+	// were wrong (FUZZER_BUGS.md bug 43):
+	//
+	//   - 0 is a legitimate endPos, not a free sentinel — it is what the
+	//     start-state empty-accept writes at paramStart == 0. That collision
+	//     is why the defect was invisible at start position 0 for nullable
+	//     patterns and appeared only on mid-scan restarts.
+	//   - Preserving the earlier accept is the wrong rule anyway. Reaching a
+	//     later accept means the walk was still running, and under
+	//     leftmost-first a Match in the closure DROPS every lower-priority
+	//     thread — so a thread that survives to accept later is necessarily
+	//     HIGHER priority than the accept already recorded, and must win.
+	//     When the earlier accept is the one that should win, the state is
+	//     immediateAccepting: the imm channel has already written the tuple
+	//     and set its doneMask bit, so this update cannot resurrect it.
+	//
+	// lScanPos is len wherever this runs: the loop's other exits leave either
+	// the dead state (eofBitmask[0] == 0, so lBits == 0) or a state whose
+	// liveness guard fired, and futureAccepts subsumes the EOF channel, so
+	// eofBitmask & validMask is empty there too.
 	b = append(b, 0x20, lBits, 0xA7, 0x21, lBitsScratch)
 	b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch) // mask with validMask
 	for k := range patternIDs {
@@ -5141,11 +5207,9 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		bit := uint32(1) << uint(k)
 		b = append(b, 0x20, lBitsScratch, 0x41)
 		b = utils.AppendSLEB128(b, int32(bit))
-		b = append(b, 0x71, 0x04, 0x40)                   // if eof bit k fired
-		b = append(b, 0x20, endPosK(k), 0x45, 0x04, 0x40) // if endPos_k == 0
-		b = append(b, 0x20, lScanPos, 0x21, endPosK(k))   // endPos_k = lScanPos
-		b = append(b, 0x0B)                               // end if endPos_k==0
-		b = append(b, 0x0B)                               // end if eof bit k
+		b = append(b, 0x71, 0x04, 0x40)                 // if eof bit k fired
+		b = append(b, 0x20, lScanPos, 0x21, endPosK(k)) // endPos_k = lScanPos
+		b = append(b, 0x0B)                             // end if eof bit k
 	}
 	b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult)
 	b = append(b, 0x0B) // end if lBits != 0

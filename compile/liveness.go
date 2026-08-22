@@ -65,6 +65,24 @@ func futureAccepts(t *dfaTable) []uint64 {
 	return out
 }
 
+// futureAcceptsWASM returns futureAccepts re-indexed into the WASM state-id
+// space the emitters compare against: slot 0 is the dead state (nothing can
+// accept from dead), slot s+1 holds raw state s. It is the compile-time twin
+// of the table futureAcceptsBytes serialises, for emitters that know a state
+// at compile time and can therefore fold its future into a constant instead
+// of loading it (plans/SETS.md §21.1 / G10).
+func futureAcceptsWASM(t *dfaTable, numWASM int) []uint64 {
+	fa := futureAccepts(t)
+	out := make([]uint64, numWASM)
+	for s, bits := range fa {
+		if s+1 >= numWASM {
+			continue
+		}
+		out[s+1] = bits
+	}
+	return out
+}
+
 // futureAcceptsBytes serialises futureAccepts into the u64-per-WASM-state
 // layout the emitted tables use: slot 0 is the dead state and is left zero
 // (nothing can accept from dead), slot s+1 holds state s.

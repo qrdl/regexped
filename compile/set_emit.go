@@ -1136,9 +1136,16 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		setOpts.TableBase = int32(setTableBase)
 		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
 		compiledSets = append(compiledSets, cs)
-		setTableBase += int64(len(cs.dataBytes)) + int64(len(cs.prefixDataBytes)) +
-			int64(len(cs.acDataBytes)) + int64(len(cs.teddyDataBytes)) +
-			int64(len(cs.anchoredDataBytes)) + int64(cs.unionScanDataLen())
+		// Advance to where this set's tables ACTUALLY end (plans/FUZZER_BUGS.md
+		// bug 44). This used to add up the encoded blob lengths, which is not
+		// the extent of anything: the blobs carry per-segment headers, and
+		// CompileSet places tables at explicit offsets with alignment gaps.
+		// The sum ran short, which under-sized the module's memory whenever the
+		// shortfall straddled a page boundary — and would have laid a second
+		// set's tables on top of this one's.
+		if top := cs.dataTop(); top > setTableBase {
+			setTableBase = top
+		}
 	}
 
 	// Compute required memory pages from the largest data address used.

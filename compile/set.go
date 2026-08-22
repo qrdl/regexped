@@ -432,6 +432,31 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		info.setTopLevelAnchor(parsed)
 	}
 
+	// A prefix containing `$`, `\z` or `(?m:$)` routes to fallback, for the
+	// third instance of the same blindness (plans/FUZZER_BUGS.md bug 46).
+	//
+	// The backward prefix DFA is a plain byte automaton over the reversed
+	// prefix. End-of-text is not a byte, so reverseRegexp/newDFA simply drop
+	// the assertion, and the walk then accepts a prefix the pattern forbids.
+	// Unlike the `\b` case this does not lose matches — it INVENTS them, and
+	// the invention can be total: `.$0` cannot match anything at all (nothing
+	// follows end-of-text), yet the split reported [0,2) on "00" because the
+	// prefix check saw only `.`.
+	//
+	// Begin-anchors need no such guard and must not get one: `^`/`\A`/`(?m:^)`
+	// are modelled positively by startAnchor/lineAnchor and the eligibility
+	// masks built from them, which is why `^a0` is already correct.
+	//
+	// The suffix side is likewise fine — an end-assertion AFTER the literal is
+	// exactly what the forward suffix DFA's ecEnd channel expresses, so `0$`
+	// keeps its split and its literal frontend.
+	if info.prefixAST != nil && regexpHasEndAssertion(info.prefixAST) {
+		info.splittable = false
+		info.prefixAST = nil
+		info.suffixAST = nil
+		info.setTopLevelAnchor(parsed)
+	}
+
 	info.trivialPrefix = info.prefixAST == nil
 	if !info.trivialPrefix && info.prefixAST != nil {
 		minLen, maxLen := regexpMinMaxLen(info.prefixAST)
@@ -1720,6 +1745,27 @@ func regexpHasWordBoundary(re *syntax.Regexp) bool {
 	}
 	for _, sub := range re.Sub {
 		if regexpHasWordBoundary(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// regexpHasEndAssertion reports whether re contains `$`, `\z` or `(?m:$)`.
+//
+// Its counterpart regexpHasWordBoundary guards the same thing for the same
+// reason; the two are siblings, not duplicates, because the begin-anchor
+// flavours ARE representable and are handled positively above
+// (isOnlyBeginAnchors / setTopLevelAnchor).
+func regexpHasEndAssertion(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	if re.Op == syntax.OpEndText || re.Op == syntax.OpEndLine {
+		return true
+	}
+	for _, sub := range re.Sub {
+		if regexpHasEndAssertion(sub) {
 			return true
 		}
 	}

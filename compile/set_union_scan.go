@@ -294,6 +294,31 @@ func (cs *compiledSet) unionScanDataSegs() int {
 	return cs.unionScan.dataSegs
 }
 
+// dataTop returns one past the highest address this set's tables occupy,
+// derived from the segments actually emitted rather than from a running offset
+// or a length sum (plans/FUZZER_BUGS.md bug 44).
+//
+// The blob list MUST stay in step with the one assembleModuleWithSets
+// concatenates into rawData: a table missing here is a table the module writes
+// but does not account for, which under-sizes the memory and relocates the
+// NEXT set on top of this one.
+func (cs *compiledSet) dataTop() int64 {
+	blobs := [][]byte{
+		cs.dataBytes, cs.prefixDataBytes, cs.acDataBytes,
+		cs.teddyDataBytes, cs.anchoredDataBytes,
+	}
+	if cs.unionScan != nil {
+		blobs = append(blobs, cs.unionScan.dataBytes)
+	}
+	var top int64
+	for _, raw := range blobs {
+		if e := dataSegmentsTop(raw); e > top {
+			top = e
+		}
+	}
+	return top
+}
+
 // usesUnionScan reports whether capability kind is served by the one-pass
 // automaton rather than the per-position bucket walk.
 //
