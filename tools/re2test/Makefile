@@ -1,4 +1,4 @@
-.PHONY: test exhaustive custom adjusted sets set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
+.PHONY: test exhaustive custom adjusted sets sets-exhaustive set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -90,17 +90,62 @@ groupsonly: $(ADJUSTED)
 	go run . --groups-only --validate-groups $(ADJUSTED)
 	go run . --groups-only --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets set-batch
+test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets
+
+# ---------------------------------------------------------------------------
+# Set-capability coverage (plans/SETS.md §22, task G15).
+#
+# Two scales, and the difference between them is only --sample:
+#
+#   sets             the standing gate, part of `make test`. Every one of the
+#                    eight capabilities, both `find` modes, both find_batch
+#                    capacities and every capability profile — over a SAMPLE of
+#                    the corpus, in a few minutes.
+#   sets-exhaustive  the same coverage over the WHOLE corpus, plus the
+#                    whole-block configuration `--sets` used before §22. Hours.
+#                    Run it before a release or after touching a set emitter.
+#
+# Why the corpus is chunked: it has 27 blocks of 132..7020 patterns, so one set
+# per block never crosses the thresholds the compiler specialises on from below
+# (packed-pair <=16, Teddy <=64, AC >16, wide `_all` >64). --set-chunk fixes the
+# set size; --set-shuffle makes a set hold unrelated patterns instead of
+# variations of one generator family, which is the pattern INTERACTION §22.0
+# says the corpus cannot otherwise produce. --set-subset makes the set select a
+# NAMED SUBSET, the only configuration in which PATTERN_COUNT and ID_SPACE
+# differ — and confusing those two is a memory-safety bug, not a wrong answer
+# (plans/SETS.md §11 R1), which `patterns: all` can never expose.
+SET_PROFILES := all-profiles
 
 sets: $(TESTDATA)
-	go run . --sets $(TESTDATA)
-	go run . --sets $(CUSTOM_SETS)
+	go run . --sets --set-chunk=8  --sample=200 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=16 --sample=150 --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=70 --sample=60  --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=16 --sample=150 --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=70 --sample=60  --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . --sets --set-chunk=4  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . --sets --set-chunk=0  --set-subset --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 
-# The same corpus and the same col4 oracle, driving find_batch at a buffer
-# capacity of ONE so every multi-match position splits (plans/SETS.md §19.5).
+sets-exhaustive: $(TESTDATA)
+	go run . --sets --set-chunk=8  --set-profiles=all $(TESTDATA)
+	go run . --sets --set-chunk=32 --set-shuffle --set-profiles=all $(TESTDATA)
+	go run . --sets --set-chunk=70 --set-shuffle --set-profiles=all $(TESTDATA)
+	go run . --sets --set-chunk=32 --set-shuffle --set-subset --set-profiles=all $(TESTDATA)
+	go run . --sets --set-chunk=8  --sample=10 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=16 --sample=10 --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . --sets --set-chunk=4  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . --sets --set-chunk=0  --set-subset --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	$(MAKE) set-batch
+
+# The pre-§22 shape: ONE set per corpus block, `find` and `find_batch` only,
+# against the same col4 oracle — plans/SETS.md §22.5 requires this run to keep
+# passing unchanged, and it is the only configuration that compiles sets of
+# several thousand patterns. --set-batch drives find_batch at a buffer capacity
+# of ONE so every multi-match position splits (§19.5).
 set-batch: $(TESTDATA)
-	go run . --sets --set-batch $(TESTDATA)
-	go run . --sets --set-batch $(CUSTOM_SETS)
+	go run . --sets --set-chunk=0 --set-profiles=find $(TESTDATA)
+	go run . --sets --set-chunk=0 --set-batch --set-profiles=batch $(TESTDATA)
 
 clean:
 	rm -f $(TESTDATA) $(ADJUSTED)

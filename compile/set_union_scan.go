@@ -201,7 +201,22 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	b = append(b, 0x21, lState)
 	b = append(b, 0x0B) // end if
 	b = append(b, 0x20, pFrom, 0x21, lPos)
-	// A `from` past the end yields no match, which the loop guard handles.
+
+	// `from > len` yields the capability's "nothing" result (plans/SETS.md
+	// §4.2). The loop guard alone does NOT deliver that: the entry-state
+	// accept below and the end-of-input accept after the loop both run
+	// regardless of how the loop exited, so a `from` past the end still
+	// reported every nullable and every `\z`-anchored pattern. `from == len`
+	// is a REAL position and must still be evaluated, hence gt_u and not ge_u.
+	b = append(b, 0x20, pFrom, 0x20, pInLen, 0x4B, 0x04, 0x40) // if from > len (u)
+	switch mode {
+	case capScan:
+		b = append(b, 0x41, 0x00) // i32.const 0
+	default:
+		b = append(b, 0x42, 0x00) // i64.const 0
+	}
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B) // end if
 
 	// Record the ENTRY state's accepts before consuming anything: a pattern
 	// that matches EMPTY at `from` accepts here and nowhere else. The loop

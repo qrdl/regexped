@@ -100,6 +100,18 @@ must match from position 0 to `len`, i.e. `\A(?:p)\z`. A pattern matching a
 proper prefix does not count. This is the same rule the single-pattern
 `match_func` has always used.
 
+### The range of `from`
+
+Valid values are `0 <= from <= len`. `from == len` is a **real position and is
+evaluated**: end-anchored patterns (`…$`, `…\z`) and empty-matchable ones can
+match there. `from > len` yields the capability's "nothing" result — `scan` 0,
+`scan_any` −1, `scan_all` no ids, `find` 0, `find_batch` a finished cursor with
+count 0 — rather than being an error or wrapping around.
+
+`ptr`/`len` always describe the **whole** input; `from` bounds only the search.
+That is what lets `^`, `\A`, `\b` and `(?m:^)` judge their real neighbours when
+you resume a scan mid-input, instead of treating `from` as a new start of text.
+
 ### `find` — the positional capability
 
 ```
@@ -261,9 +273,15 @@ find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> i32
   performs on it: the encoding is opaque and will change.
 - WASM reads and writes it. Zeroing it restarts a scan; keeping it across calls
   continues one.
-- An **overflowing call writes nothing** — if the return value exceeds
-  `out_cap`, the gate array is left exactly as it was found, so growing the
-  buffer and calling again with the same `from` sees the identical world.
+- An **overflowing call reports no match as delivered** — if the return value
+  exceeds `out_cap`, no gate is recorded for the position, so growing the
+  buffer and calling again with the same `from` returns the same total and the
+  same matches. The guarantee is on the **answer**, not on the bytes: a call on
+  a fresh array may still write *eliminations* into it first (a pattern that
+  matches nowhere at or after `from` is gated out once, up front, instead of
+  being re-tested at every position). An eliminated pattern cannot match, so no
+  answer changes — but do not compare the array byte-for-byte and expect it to
+  be untouched. The same applies to an `out_cap = 0` size probe.
 
 The generated stubs own the gate array on your behalf; it never appears in
 their public surface. Only a direct WASM caller sees it.

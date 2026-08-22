@@ -15,7 +15,6 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/internal/utils"
 )
 
 const (
@@ -57,8 +56,13 @@ func main() {
 	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors, skips WASM testing)")
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
 	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find/groups (sets MaxDFAStates=-1 so DFA/TDFA always overflow to BT)")
-	setsMode := flag.Bool("sets", false, "test the set `find` capability: compile each regexps block as a set and verify its gated (per-pattern non-overlapping) output against col4/col1")
-	setBatch := flag.Bool("set-batch", false, "with --sets, drive `find_batch` instead of `find`, at a buffer capacity of ONE so every multi-match position splits and every §19 resume path is taken; the oracle is unchanged")
+	setsMode := flag.Bool("sets", false, "test the set capabilities: compile each regexps block's patterns as sets and verify every declared capability against a live Go oracle (plans/SETS.md §22)")
+	setBatch := flag.Bool("set-batch", false, "with --sets, drive `find_batch` ONLY at a buffer capacity of one, so every multi-match position splits and every §19 resume path is taken (default drives capacity 1 and capacity=pattern-count)")
+	setChunk := flag.Int("set-chunk", 32, "with --sets, patterns per compiled set (0 = one set per corpus block, which is what --sets did before §22). The RE2 corpus has 27 blocks of 132..7020 patterns, so without chunking the frontend and id-space thresholds (packed-pair <=16, Teddy <=64, AC >16, wide `_all` >64) are never crossed from below")
+	setShuffle := flag.Bool("set-shuffle", false, "with --sets, deterministically permute a block's patterns before chunking, so a set holds unrelated patterns instead of variations of one generator family")
+	setSampleN := flag.Int("sample", 1, "with --sets, test only every Nth chunk (1 = all). This is what separates the sampled gate from the exhaustive run")
+	setSubsetF := flag.Bool("set-subset", false, "with --sets, make each set select a NAMED SUBSET of the chunk's patterns (every second one, from index 1) instead of `patterns: all`; this is the only configuration in which PATTERN_COUNT and ID_SPACE differ, which is what sizes the gate array and the `_all` bitmap (plans/SETS.md §11 R1)")
+	setProfiles := flag.String("set-profiles", "all", "with --sets, comma-separated capability profiles to compile per chunk: all, anchored, scan, scan-any, find, find-ov, batch, batch-ov — or all-profiles")
 	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
 	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
 	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
@@ -71,14 +75,38 @@ func main() {
 		os.Exit(1)
 	}
 
-	// setBatchDrive is a package-level switch rather than a 13th parameter on
-	// run()/testSetBlock(): it changes only which export the set block DRIVES,
-	// not what is compared, and threading it through would double the width of
-	// two already-overlong signatures.
-	setBatchDrive = *setBatch
-	if *setBatch && !*setsMode {
-		fmt.Fprintln(os.Stderr, "--set-batch requires --sets")
+	// The set-mode switches are package-level rather than further parameters on
+	// run()/testSetBlock(): they change only what the set path COMPILES and
+	// DRIVES, and threading eight more through would double the width of two
+	// already-overlong signatures.
+	setBatchCap1Only = *setBatch
+	setSubset = *setSubsetF
+	setChunkSize = *setChunk
+	setShufflePats = *setShuffle
+	setSample = *setSampleN
+	setMaxPrint = *maxErrors
+	if *setSampleN < 1 {
+		fmt.Fprintln(os.Stderr, "--sample must be >= 1")
 		os.Exit(1)
+	}
+	for _, f := range []struct {
+		set  bool
+		name string
+	}{{*setBatch, "--set-batch"}, {*setChunk != 32, "--set-chunk"}, {*setShuffle, "--set-shuffle"},
+		{*setSampleN != 1, "--sample"}, {*setProfiles != "all", "--set-profiles"},
+		{*setSubsetF, "--set-subset"}} {
+		if f.set && !*setsMode {
+			fmt.Fprintf(os.Stderr, "%s requires --sets\n", f.name)
+			os.Exit(1)
+		}
+	}
+	if *setsMode {
+		profs, err := resolveSetProfiles(*setProfiles)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		activeSetProfiles = profs
 	}
 	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly, *matchOnly, *findOnly); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -871,9 +899,14 @@ done:
 	}
 
 	if setsMode {
-		fmt.Printf("\n=== Set Mode Results ===\n")
+		fmt.Printf("\n=== Set Mode Results (all driven capabilities) ===\n")
 		fmt.Printf("passed:  %d\n", npassSet)
 		fmt.Printf("failed:  %d\n", nfailSet)
+		setStats.report()
+		// nfailSet is already the same total, taken as a delta per block; this
+		// makes the exit status independent of that bookkeeping.
+		nfailSet = setStats.totalFail()
+		nDataErrors += setStats.dataErrs
 	}
 
 	if nDataErrors > 0 {
@@ -894,24 +927,8 @@ type setBlockEntry struct {
 	results []string // one result line per testString
 }
 
-const (
-	setOutTupleBytes = 12 // (pattern_id i32, start i32, end i32)
+const setOutTupleBytes = 12 // (pattern_id i32, start i32, end i32)
 
-	// setBatchCap is the buffer --set-batch drives find_batch with, in matches.
-	// ONE is deliberate and is the whole value of the mode: it makes every
-	// position with more than one match split, so the corpus exercises §19's
-	// resume path at every empty-match shape, anchor and extent it contains
-	// rather than only at the handful a hand-written test can think of.
-	setBatchCap = 1
-)
-
-// setBatchDrive selects find_batch over find inside a --sets run. See its
-// assignment in main() for why it is a package-level switch.
-var setBatchDrive bool
-
-// testSetBlock compiles all patterns in entries as a set and runs find_all against
-// each string, comparing results against the per-pattern col4 (all matches) or col1
-// (first match) expected values from the re2 test data.
 // testSetBlockStats carries diagnostic counters from testSetBlock.
 type testSetBlockStats struct {
 	hasNonGreedy bool // at least one eligible pattern has a non-greedy quantifier
@@ -919,6 +936,16 @@ type testSetBlockStats struct {
 	nTimeout     int  // number of test strings where find_all timed out
 }
 
+// testSetBlock drives every declared set capability over one corpus block.
+//
+// The block's eligible patterns are split into chunks (--set-chunk), each
+// chunk is compiled once per selected capability profile (--set-profiles), and
+// every capability that profile declares is checked against a Go oracle built
+// once per chunk. See plans/SETS.md §22 and the header of setcaps.go.
+//
+// The returned counts are this block's contribution to the run total, taken as
+// a delta of setStats so they cover every capability the profiles drove. The
+// per-capability breakdown is setStats' own summary table.
 func testSetBlock(
 	entries []setBlockEntry,
 	testStrings []string,
@@ -928,277 +955,123 @@ func testSetBlock(
 	likelyMatch bool,
 	likelyNoMatch bool,
 ) (npass, nfail int, stats testSetBlockStats, err error) {
-	type eligibleEntry struct {
-		orig  int // index into entries
-		entry setBlockEntry
-	}
-	var eligible []eligibleEntry
+	var (
+		pats []string
+		orig []int
+		cols [][]string
+	)
 	for i, e := range entries {
 		if preCheck(e.pattern) != "" {
 			continue // skip unicode etc.
 		}
-		if _, err := syntax.Parse(e.pattern, syntax.Perl); err != nil {
+		if _, perr := syntax.Parse(e.pattern, syntax.Perl); perr != nil {
 			continue // skip unsupported syntax (\C etc.)
 		}
-		eligible = append(eligible, eligibleEntry{orig: i, entry: e})
+		// The oracle is Go's own regexp, so a pattern Go will not compile
+		// cannot be given an expectation. syntax.Parse accepting it makes this
+		// unreachable in practice; it is here so a future divergence skips the
+		// pattern instead of panicking inside the oracle.
+		if _, cerr := regexp.Compile(e.pattern); cerr != nil {
+			continue
+		}
+		pats = append(pats, e.pattern)
+		orig = append(orig, i)
+		cols = append(cols, e.results)
 		if strings.Contains(e.pattern, "+?") || strings.Contains(e.pattern, "*?") || strings.Contains(e.pattern, "??") {
 			stats.hasNonGreedy = true
 		}
 	}
-	if len(eligible) < 2 {
+	if len(pats) < 2 {
 		return // not enough patterns to form a set
 	}
 
-	regexps := make([]config.RegexEntry, len(eligible))
-	for i, e := range eligible {
-		regexps[i] = config.RegexEntry{Pattern: e.entry.pattern}
-	}
 	var hints []string
 	if likelyMatch {
 		hints = []string{"prefer-match"}
 	} else if likelyNoMatch {
 		hints = []string{"prefer-no-match"}
 	}
-	cfg := config.BuildConfig{
-		Regexps: regexps,
-		Sets: []config.SetConfig{
-			// The DEFAULT (gated) find body: per-pattern non-overlapping
-			// output, which is exactly Go FindAllIndex's rule — and col4 is
-			// the corpus's Go-FindAll column, verified against Go itself by
-			// --validate-go. So the whole corpus becomes a check of the §3.16
-			// gate encoding, at every empty-match shape, anchor and extent it
-			// contains (plans/SETS.md §9.6.1 "corpus scale, nearly free").
-			// --set-batch declares find_batch INSTEAD of find, not alongside
-			// it: the point is to drive the batch bodies against the same
-			// oracle, and declaring both would leave it ambiguous which one
-			// the corpus actually covered.
-			{
-				Name:      "test",
-				Find:      setCapName(false),
-				FindBatch: setCapName(true),
-				Patterns:  config.PatternSelector{All: true},
-				Hints:     hints,
-			},
-		},
-	}
 
-	wasmBytes, _, compErr := compile.CompileFile(cfg, "")
-	if compErr != nil {
-		nfail += len(eligible) * len(testStrings)
-		fmt.Printf("FAIL  set block compile error: %v\n      %d eligible pattern(s) in block:\n",
-			compErr, len(eligible))
-		for _, e := range eligible {
-			fmt.Printf("        [%d] %q\n", e.orig, e.entry.pattern)
-		}
-		return
+	profiles := activeSetProfiles
+	if len(profiles) == 0 {
+		p, _ := lookupSetProfile("all")
+		profiles = []setProfile{p}
 	}
-	stats.ran = true
+	var needAnchored, needSPM, needFindAll bool
+	for _, p := range profiles {
+		a, s, f := p.needs()
+		needAnchored = needAnchored || a
+		needSPM = needSPM || s
+		needFindAll = needFindAll || f
+	}
+	// The col4 cross-check below needs Go's FindAll even when no selected
+	// profile drives a gated find, and it is cheap next to the start-position
+	// map. Keeping it on means every run re-validates the corpus column that
+	// --sets compared against before §22, rather than quietly dropping it.
+	needFindAll = true
 
-	mod, modErr := wasmtime.NewModule(engine, wasmBytes)
-	if modErr != nil {
-		err = fmt.Errorf("set block NewModule: %w", modErr)
-		return
-	}
-	store := wasmtime.NewStore(engine)
-	store.SetEpochDeadline(1)
-	inst, instErr := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
-	if instErr != nil {
-		err = fmt.Errorf("set block NewInstance: %w", instErr)
-		return
-	}
-	var mem *wasmtime.Memory
-	if exp := inst.GetExport(store, "memory"); exp != nil {
-		mem = exp.Memory()
-	}
-	exportName := "set_find"
-	if setBatchDrive {
-		exportName = "set_find_batch"
-	}
-	findFn := inst.GetFunc(store, exportName)
-	if mem == nil || findFn == nil {
-		err = fmt.Errorf("set block missing exports: memory=%v %s=%v", mem != nil, exportName, findFn != nil)
-		return
-	}
-
-	// Place input after DFA tables (page-aligned), output after the longest
-	// input (page-aligned). Sizing outBase from the max input length avoids
-	// the input buffer overlapping the find_all tuple buffer when a single
-	// test string is larger than one page.
-	const pageSize = 65536
-	dataTop, _ := utils.ParseDataSectionBytes(wasmBytes)
-	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	maxInLen := 0
-	for _, s := range testStrings {
-		if len(s) > maxInLen {
-			maxInLen = len(s)
-		}
-	}
-	inputSpan := int32((maxInLen + pageSize - 1) / pageSize * pageSize)
-	if inputSpan < int32(pageSize) {
-		inputSpan = int32(pageSize)
-	}
-	outBase := inBase + inputSpan
-	// out_cap is the set's pattern count: the exact worst case for a single
-	// position (plans/SETS.md §3.11), so a call can never overflow. The gate
-	// array (4 bytes per pattern) sits just above the tuple buffer.
-	outCap := int32(len(eligible))
-	if setBatchDrive {
-		outCap = setBatchCap
-	}
-	// The gate array is sized by PATTERN COUNT regardless of out_cap: it is
-	// indexed by pattern id, not by tuple slot (plans/SETS.md §11 R1).
-	gatePtr := outBase + outCap*int32(setOutTupleBytes)
-	outBytes := int64(outCap)*int64(setOutTupleBytes) + int64(len(eligible))*4
-
-	neededPages := uint64((int64(outBase) + outBytes + pageSize - 1) / pageSize)
-	if cur := mem.Size(store); neededPages > cur {
-		if _, growErr := mem.Grow(store, neededPages-cur); growErr != nil {
-			nfail += len(eligible) * len(testStrings)
-			err = fmt.Errorf("set block memory.Grow to %d pages: %w", neededPages, growErr)
-			return
-		}
-	}
-
-	buf := mem.UnsafeData(store)
-
-nextString:
-	for si, text := range testStrings {
-		if hasUnicode(text) {
+	timeoutsBefore := setStats.timeouts
+	passBefore, failBefore := setStats.totalPass(), setStats.totalFail()
+	for ci, chunk := range setChunksOf(pats, orig, cols) {
+		if ci%setSample != 0 {
+			setStats.skipped++
 			continue
 		}
-		if len(text) > 0 {
-			copy(buf[inBase:], []byte(text))
+		setStats.chunks++
+		orc, oerr := buildSetOracle(chunk.pats, testStrings, needAnchored, needSPM, needFindAll)
+		if oerr != nil {
+			return npass, nfail, stats, oerr
 		}
-
-		// Collect every match the gated scan reports, keyed by pattern id.
-		gotMatches := make(map[int32][][2]int, len(entries))
-		for i := 0; i < len(eligible)*4; i++ {
-			buf[int(gatePtr)+i] = 0 // a clean scan starts from an all-zero gate array
-		}
-		if setBatchDrive {
-			if !driveSetBatch(store, wd, findFn, mem, inBase, gatePtr, outBase, outCap,
-				text, len(eligible), gotMatches, &stats, &nfail) {
-				continue nextString
+		crossCheckCol4(chunk, testStrings, orc)
+		for _, prof := range profiles {
+			if perr := runSetProfile(engine, wd, chunk, testStrings, orc, prof, hints, verbose); perr != nil {
+				return npass, nfail, stats, perr
 			}
-		} else {
-			from := int32(0)
-			for {
-				wd.Arm(store)
-				result, callErr := findFn.Call(store, inBase, int32(len(text)), from, gatePtr, outBase, outCap)
-				wd.Disarm()
-				if callErr != nil {
-					if isTimeout(callErr) {
-						stats.nTimeout++
-						// Report only the first timeout per block to avoid flooding
-						// output when a giant set (e.g. re2-exhaustive's full pattern
-						// list) trips the 2s watchdog on every input. Subsequent
-						// timeouts are aggregated into stats.nTimeout and surfaced
-						// by the caller as skipTimeout entries.
-						if stats.nTimeout == 1 {
-							fmt.Printf("SKIP  set find TIMEOUT input=%q from=%d (%d eligible patterns; further timeouts in this block suppressed)\n",
-								text, from, len(eligible))
-						}
-						continue nextString
-					}
-					err = fmt.Errorf("set block find call (input=%q from=%d): %w", text, from, callErr)
-					return
-				}
-				count := result.(int32)
-				if count <= 0 {
-					break
-				}
-				if count > outCap {
-					nfail += len(eligible)
-					fmt.Printf("FAIL  set find reported %d tuples at one position, but the set has %d patterns (input=%q from=%d)\n",
-						count, outCap, text, from)
-					continue nextString
-				}
-				var start int32
-				for i := int32(0); i < count; i++ {
-					base := int(outBase) + int(i)*setOutTupleBytes
-					pid := int32(buf[base]) | int32(buf[base+1])<<8 | int32(buf[base+2])<<16 | int32(buf[base+3])<<24
-					st := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
-					en := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
-					if i == 0 {
-						start = st
-					} else if st != start {
-						nfail += len(eligible)
-						fmt.Printf("FAIL  set find tuples in one call disagree on start (%d vs %d) input=%q from=%d\n",
-							start, st, text, from)
-						continue nextString
-					}
-					gotMatches[pid] = append(gotMatches[pid], [2]int{int(st), int(en)})
-				}
-				// Every tuple in one call shares a start; resume one past it.
-				from = start + 1
-			}
+			stats.ran = true
 		}
+	}
+	stats.nTimeout = setStats.timeouts - timeoutsBefore
+	npass = setStats.totalPass() - passBefore
+	nfail = setStats.totalFail() - failBefore
+	return
+}
 
-		// Compare against each eligible pattern's expected results.
-		// pattern_id in the set output = index into eligible[].
-		for pi, el := range eligible {
-			if si >= len(el.entry.results) {
+// crossCheckCol4 compares the live Go oracle against the corpus's own col4
+// column wherever the corpus has one.
+//
+// This is §22.4's discipline made mechanical. The pre-§22 --sets run compared
+// the engine against col4; this file computes expectations from Go instead. If
+// the two ever disagree, one of them is wrong and the run must say so — a
+// silent switch of oracle would be exactly the FABLE B42 mistake, where the
+// comparison and its oracle were narrowed the same way and agreed while both
+// were wrong.
+func crossCheckCol4(chunk setChunk, strs []string, orc *setOracle) {
+	if orc.findAllByStr == nil {
+		return
+	}
+	for pi := range chunk.pats {
+		lines := chunk.cols[pi]
+		for si, text := range strs {
+			if si >= len(lines) || hasUnicode(text) {
 				continue
 			}
-			cols := strings.Split(el.entry.results[si], ";")
-
-			// Prefer col4 (all matches); fall back to col1 (first match).
-			var expected [][2]int
-			hasExpected := false
-			if len(cols) >= 5 {
-				col4 := strings.TrimSpace(cols[4])
-				if col4 != "" {
-					expected = parseCol4(col4)
-					hasExpected = true
-				}
+			c := strings.Split(lines[si], ";")
+			if len(c) < 5 {
+				continue
 			}
-			if !hasExpected && len(cols) >= 2 {
-				col1 := strings.TrimSpace(cols[1])
-				if col1 != "" && col1 != "-" {
-					if r := parseCol1(col1); r != -1 {
-						expected = [][2]int{{int(r >> 32), int(uint32(r))}}
-					}
-				}
-				hasExpected = true
+			col4 := strings.TrimSpace(c[4])
+			if col4 == "" {
+				continue
 			}
-			if !hasExpected {
-				continue // no expected data for this column
-			}
-
-			got := gotMatches[int32(pi)]
-			// Within one call the tuple order is unspecified (§3.10), so the
-			// comparison is by multiset. Across calls the starts strictly
-			// increase, so sorting by (start, end) recovers col4's order.
-			sortSpanPairs(got)
-			var matchOk bool
-			if len(cols) >= 5 && strings.TrimSpace(cols[4]) != "" {
-				// col4 available: exact match required.
-				matchOk = col4WasmEqual(got, expected)
-			} else if expected == nil {
-				// col1 = "-": no match expected.
-				matchOk = len(got) == 0
-			} else {
-				// col1 only: the expected first match must appear in got.
-				for _, g := range got {
-					if g == expected[0] {
-						matchOk = true
-						break
-					}
-				}
-			}
-			if matchOk {
-				npass++
-				if verbose {
-					fmt.Printf("PASS set pattern[%d] (orig %d): %q input=%q\n", pi, el.orig, el.entry.pattern, text)
-				}
-			} else {
-				nfail++
-				fmt.Printf("FAIL  set pattern[%d] (orig %d): %q\n      input:    %q\n      expected: %s\n      got:      %s\n",
-					pi, el.orig, el.entry.pattern, text, fmtCol4(expected), fmtCol4Wasm(got))
+			want := parseCol4(col4)
+			got := orc.findAllByStr[pi][si]
+			if !col4WasmEqual(got, want) {
+				setStats.dataErrs++
+				setFailf("DATA  set oracle disagrees with col4: pattern %q input %q\n      col4: %s\n      Go:   %s\n",
+					chunk.pats[pi], text, fmtCol4(want), fmtCol4(got))
 			}
 		}
 	}
-	return
 }
 
 const wasmCallTimeout = 2 * time.Second
@@ -1673,90 +1546,4 @@ func fmtGoSub(goSub []int) string {
 		}
 	}
 	return strings.Join(parts, " ")
-}
-
-// setCapName returns the export name for one of the two positional
-// capabilities, or "" when this run does not declare it. Exactly one is
-// declared: --set-batch swaps which.
-func setCapName(batch bool) string {
-	if batch == setBatchDrive {
-		if batch {
-			return "set_find_batch"
-		}
-		return "set_find"
-	}
-	return ""
-}
-
-// driveSetBatch runs one input through `find_batch` to exhaustion and records
-// every reported match into gotMatches, keyed by pattern id.
-//
-// It returns false when the caller should abandon this input (a watchdog
-// timeout, or a protocol violation already reported).
-//
-// The tuple-start invariant the `find` loop asserts is deliberately NOT checked
-// here: a batch call spans several positions by design, so its tuples do not
-// share a start. What replaces it is the oracle itself — the collected matches
-// still have to equal col4 for every pattern, which is a strictly stronger
-// statement than any within-call structural check.
-func driveSetBatch(
-	store *wasmtime.Store,
-	wd *watchdog,
-	fn *wasmtime.Func,
-	mem *wasmtime.Memory,
-	inBase, gatePtr, outBase, outCap int32,
-	text string,
-	npat int,
-	gotMatches map[int32][][2]int,
-	stats *testSetBlockStats,
-	nfail *int,
-) bool {
-	countMask := int64(1)<<uint(config.SetCursorCountBits(npat)) - 1
-	cursor := int64(0)
-	// A call either reports a match or ends the scan, so the call count is
-	// bounded by the match count. The cap turns a cursor that fails to advance
-	// into a reported failure instead of a hang.
-	maxCalls := 8*(len(text)+1)*(npat+1) + 16
-	for calls := 0; ; calls++ {
-		if calls > maxCalls {
-			*nfail += npat
-			fmt.Printf("FAIL  set find_batch did not terminate after %d calls (input=%q)\n", calls, text)
-			return false
-		}
-		wd.Arm(store)
-		result, callErr := fn.Call(store, inBase, int32(len(text)), cursor, gatePtr, outBase, outCap)
-		wd.Disarm()
-		if callErr != nil {
-			if isTimeout(callErr) {
-				stats.nTimeout++
-				if stats.nTimeout == 1 {
-					fmt.Printf("SKIP  set find_batch TIMEOUT input=%q (%d eligible patterns; further timeouts in this block suppressed)\n",
-						text, npat)
-				}
-				return false
-			}
-			*nfail += npat
-			fmt.Printf("FAIL  set find_batch call error (input=%q): %v\n", text, callErr)
-			return false
-		}
-		packed := result.(int64)
-		count := int32(packed & countMask)
-		if count < 0 || count > outCap {
-			*nfail += npat
-			fmt.Printf("FAIL  set find_batch reported count %d for a buffer of %d (input=%q)\n", count, outCap, text)
-			return false
-		}
-		buf := mem.UnsafeData(store)
-		for i := int32(0); i < count; i++ {
-			base := int(outBase) + int(i)*setOutTupleBytes
-			pid := int32(buf[base]) | int32(buf[base+1])<<8 | int32(buf[base+2])<<16 | int32(buf[base+3])<<24
-			st := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
-			en := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
-			gotMatches[pid] = append(gotMatches[pid], [2]int{int(st), int(en)})
-		}
-		if uint32(packed>>32) == 0xFFFFFFFF || count == 0 {
-			return true
-		}
-		cursor = packed
-	}
 }

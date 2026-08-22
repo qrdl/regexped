@@ -355,21 +355,51 @@ Each pattern is compiled and tested for:
 - Col 1: non-anchored find (LeftmostFirst DFA)
 - Col 5: non-anchored find with captures (with --validate-groups)
 
-**Set mode (`make sets`)** compiles each `regexps` block as a SET and drives
-its `find` capability in the default (gated, per-pattern non-overlapping)
-configuration, comparing against col4. That works because col4 is the corpus's
-Go-`FindAll` column and gating's contract IS Go's `FindAllIndex` rule — so the
-whole corpus becomes a check of the gate encoding at every empty-match shape,
-anchor and extent it contains. **Current: ~4.94M set cases, 0 failures.**
+**Set mode (`make setcaps` / `make sets`)** drives ALL EIGHT capabilities over
+the corpus (plans/SETS.md §22, task G15), not just gated `find`: the anchored
+trio, the scan trio at many `from` values, `find` and `find_batch` in both the
+gated and `overlapping: true` configurations at capacities 1 and P, `find`
+through an under-sized buffer (`out_cap = 0` and the transactional-overflow
+rule), and every capability at `from > len` (§4.2). Expectations are computed
+LIVE from Go via §9.6's whole-input probe `\A(?s:.{p})(?:pat)` — which gives
+the pattern its real left context, so `\b`/`(?m:^)` judge actual neighbours —
+and are cross-checked against col4 wherever the corpus has one, so neither
+oracle silently replaces the other (§22.4).
+
+Four knobs supply what the corpus cannot. The RE2 suite has only **27 blocks of
+132..7020 patterns**, so `--set-chunk` splits a block into sets of a chosen
+size (crossing packed-pair ≤16 / Teddy ≤64 / AC >16 / wide `_all` >64 from
+below) and `--set-shuffle` permutes first, so a set holds unrelated patterns
+rather than variations of one generator family. `--set-subset` makes the set
+select a NAMED SUBSET instead of `patterns: all` — the only configuration in
+which `PATTERN_COUNT` and `ID_SPACE` differ, which is a memory-safety hazard
+rather than a wrong answer (§11 R1). `--set-profiles` compiles each chunk under
+several capability configurations, because the compiler emits only the
+machinery the declared capabilities need — a `match`-only set emits no literal
+frontend at all.
+
+Two scales: **`make setcaps`** samples (`--sample`) and measures **2m58s for
+6.5M checks**, which is why it is in `make test`; **`make setcaps-exhaustive`**
+is the same coverage over every chunk and takes hours. **Current: 0 failures**;
+the whole-block gated-`find` leg still reports its historical 4,935,736.
+
 `custom-sets.txt` adds hand-picked blocks whose expectations are REGENERATED
 from Go (`go run ./make_sets custom-sets.txt`) rather than hand-maintained,
 which keeps them an independent oracle rather than a transcript of engine
-output.
+output. Its `SetG15*` blocks are the permanent regressions for
+FUZZER_BUGS.md 43/44/46/50/51 plus the §22.3 shapes.
 
-**`make set-batch`** replays the same corpus against the same oracle but drives
-`find_batch` at a buffer capacity of ONE, so every multi-match position splits
-and the corpus becomes a check of §19's resume path (delivered-tuple gating
-when gated, the `skip` parameter when overlapping).
+**`make set-batch`** is the pre-G15 shape, kept because it is the only
+configuration that compiles sets of several thousand patterns: ONE set per
+corpus block, gated `find` and then `find_batch` at a buffer capacity of ONE,
+so every multi-match position splits and the corpus becomes a check of §19's
+resume path (delivered-tuple gating when gated, the `skip` parameter when
+overlapping).
+
+A pattern the compiler legitimately drops from a set (fallback suffix DFA over
+`max_fallback_states`, warned and recorded in `--diag-json`'s
+`state_limit_dropped`) is excluded from the comparison and counted separately,
+so a documented exclusion cannot pass for either a pass or a failure.
 
 ### Byte-identical fixtures (`compile/testdata/byteident/`)
 

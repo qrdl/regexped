@@ -308,8 +308,16 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 	if hasSkip {
 		// §19: this emitter's only tuple has position-relative index 0, so it
 		// is written when 0 < cap AND skip <= 0.
+		//
+		// SIGNED. The caller rebases the position-level skip onto this call's
+		// tuple index space as `skip - lBase` (setFindCtx.emitSuffixCall), so
+		// the value is NEGATIVE whenever tuples are already committed at this
+		// position — which is precisely the "write everything" case. An
+		// unsigned compare reads -1 as 4294967295 and suppresses the write
+		// while `return 1` below still counts the tuple, so the batch call
+		// over-reports its count and the caller reads a stale buffer slot.
 		b = append(b, 0x41, 0x00, 0x20, paramOutCap, 0x48) // 0 < cap
-		b = append(b, 0x20, paramSkip, 0x41, 0x00, 0x4D)   // skip <= 0
+		b = append(b, 0x20, paramSkip, 0x41, 0x00, 0x4C)   // skip <= 0 (signed)
 		b = append(b, 0x71, 0x04, 0x40)                    // and; if
 	} else {
 		b = append(b, 0x41, 0x00, 0x20, paramOutCap, 0x48, 0x04, 0x40) // if 0 < cap (signed)

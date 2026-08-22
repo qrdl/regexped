@@ -17,6 +17,30 @@ go run . [options] <test-file>
 | `--validate-go` | false | Validate test expectations against Go stdlib; skips WASM testing |
 | `--validate-groups` | false | Enable col0 capture-groups validation (see below) |
 
+### Set-mode options (plans/SETS.md §22)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--sets` | false | Compile each block's patterns as SETS and drive every declared capability against a live Go oracle |
+| `--set-chunk N` | 32 | Patterns per compiled set; `0` = one set per corpus block (the pre-§22 shape) |
+| `--set-shuffle` | false | Deterministically permute a block's patterns before chunking |
+| `--sample N` | 1 | Test only every Nth chunk — the sampled gate vs the exhaustive run |
+| `--set-profiles` | `all` | Capability configurations per chunk: `all`, `anchored`, `scan`, `scan-any`, `find`, `find-ov`, `batch`, `batch-ov`, or `all-profiles` |
+| `--set-subset` | false | Select a NAMED SUBSET of the chunk's patterns instead of `patterns: all`, so `PATTERN_COUNT` and `ID_SPACE` differ |
+| `--set-batch` | false | Drive `find_batch` only at a buffer capacity of one |
+
+`--set-chunk` and `--set-shuffle` exist because the RE2 corpus has just **27
+blocks of 132..7020 patterns**: one set per block never crosses the thresholds
+the compiler specialises on from below (packed-pair ≤16, Teddy ≤64,
+Aho-Corasick >16, wide `_all` >64), and adjacent corpus patterns are
+near-duplicates from one generator family. `--set-profiles` exists because the
+compiler emits only the machinery the declared capabilities need, so the
+specialised emissions are unreachable from a set that declares everything.
+
+Two make targets wrap these: `make sets` (sampled, part of `make test`) and
+`make sets-exhaustive` (every chunk, hours). See
+[docs/re2.md](../../docs/re2.md) for what each capability is checked against.
+
 ### Test files
 
 - `re2-exhaustive.txt` — RE2 C++ exhaustive test suite. Run **without** `--validate-groups`.
