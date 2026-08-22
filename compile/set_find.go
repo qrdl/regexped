@@ -158,6 +158,22 @@ type setFindCtx struct {
 	gated bool
 	pGate byte
 
+	// batch marks this body as the hidden per-position WORKER of a
+	// find_batch export rather than the exported `find` (plans/SETS.md §19).
+	// Two things change:
+	//
+	//   - gated: gates are written for every tuple actually DELIVERED, not
+	//     only for a position that fitted whole. That is what lets the batch
+	//     loop resume a split position — the §3.16 pre-mask then excludes
+	//     exactly the patterns already handed to the caller. `find` keeps D2's
+	//     transactional rule, which is why this is a separate body.
+	//   - ungated: pSkip names a trailing parameter holding how many of this
+	//     position's tuples to count but not write. There is no gate array to
+	//     record the delivered ones, so the split has to be carried explicitly.
+	batch   bool
+	hasSkip bool
+	pSkip   byte
+
 	// Locals.
 	lTmp       byte // scratch (prefix-DFA result, suffix-call result)
 	lValidMask byte
@@ -450,13 +466,22 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 	if !c.gated {
 		return b
 	}
-	// if lTotal > 0 && lTotal <= out_cap
+	// if lTotal > 0 [&& lTotal <= out_cap]
 	b = append(b, 0x20, c.lTotal, 0x04, 0x40)
-	b = append(b, 0x20, c.lTotal, 0x20, c.pOutCap, 0x4C, 0x04, 0x40) // <= (signed)
+	if !c.batch {
+		b = append(b, 0x20, c.lTotal, 0x20, c.pOutCap, 0x4C, 0x04, 0x40) // <= (signed)
+	}
 	b = append(b, 0x41, 0x00, 0x21, lPos)
 	b = append(b, 0x02, 0x40)                                   // block $wb_done
 	b = append(b, 0x03, 0x40)                                   // loop $wb
 	b = append(b, 0x20, lPos, 0x20, c.lTotal, 0x4E, 0x0D, 0x01) // idx >= total → done
+	if c.batch {
+		// §19: the batch worker gates what it DELIVERED, so the loop also
+		// stops at the buffer. An overflowing position leaves the patterns it
+		// could not report ungated, and the §3.16 pre-mask lets exactly those
+		// match again when the caller resumes at this same position.
+		b = append(b, 0x20, lPos, 0x20, c.pOutCap, 0x4E, 0x0D, 0x01) // idx >= cap → done
+	}
 	b = append(b, 0x20, c.pOutPtr, 0x20, lPos, 0x41, 12, 0x6C, 0x6A, 0x21, c.lOutBase)
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x00, 0x21, c.lTmp)   // id
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x04, 0x21, c.lStart) // start
@@ -473,7 +498,9 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B) // end loop $wb
 	b = append(b, 0x0B) // end block $wb_done
-	b = append(b, 0x0B) // end if total <= cap
+	if !c.batch {
+		b = append(b, 0x0B) // end if total <= cap
+	}
 	b = append(b, 0x0B) // end if total > 0
 	return b
 }
@@ -732,6 +759,20 @@ func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mas
 	b = append(b, 0x71)
 	if c.gated {
 		b = append(b, 0x20, c.pGate)
+	} else if c.cs.suffixHasSkip {
+		// §19: rebase the position-level skip onto this call's tuple index
+		// space. lBase tuples are already committed at this position, so a
+		// tuple with local index i is position-index lBase+i and must be
+		// written when lBase+i >= skip. The suffix compares against `skip -
+		// lBase`, signed — negative simply means "write everything".
+		//
+		// The non-batch `find` body passes 0, which the same comparison reads
+		// as "no tuple is skipped": local indices are never negative.
+		if c.hasSkip {
+			b = append(b, 0x20, c.pSkip, 0x20, c.lBase, 0x6B)
+		} else {
+			b = append(b, 0x41, 0x00)
+		}
 	}
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(c.suffixFnBase+bi))
@@ -1014,7 +1055,10 @@ func (c *setFindCtx) probeIndex(bi int) int {
 }
 
 func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack int, mode setCapKind, probeFnBase int) *setFindCtx {
-	gated := mode == capFind && cs.find != "" && !cs.overlapping
+	gated := mode == capFind && cs.gatedFind()
+	batch := mode == capFind && cs.batchPos
+	// Only the ungated batch worker needs an explicit skip; see setFindCtx.
+	hasSkip := batch && !gated
 	c := &setFindCtx{
 		cs: cs, suffixFnBase: suffixFnBase, prefixFnBaseIdx: prefixFnBaseIdx,
 		mode: mode, probeFnBase: probeFnBase,
@@ -1023,8 +1067,10 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 		anyProbeBase: probeFnBase + len(cs.scanProbeBodies),
 		useAnyProbe:  mode == capScan || mode == capScanAny,
 		maxLookback:  cs.maxLookback, drainSlack: drainSlack,
-		gated:  gated,
-		pInPtr: 0, pInLen: 1, pFrom: 2,
+		gated:   gated,
+		batch:   batch,
+		hasSkip: hasSkip,
+		pInPtr:  0, pInLen: 1, pFrom: 2,
 	}
 	switch {
 	case mode != capFind:
@@ -1042,6 +1088,10 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 	default:
 		c.pOutPtr, c.pOutCap = 3, 4
 		c.localBase = 5
+		if hasSkip {
+			c.pSkip = 5
+			c.localBase = 6
+		}
 	}
 	c.lPos = c.localBase
 	c.lTotal = c.localBase + 1

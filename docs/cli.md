@@ -38,6 +38,7 @@ sets:
     scan_any:   "first_hit"    # non-anchored: one pattern id + its start
     scan_all:   "all_kinds"    # non-anchored: every pattern matching somewhere
     find:       "scan_all"     # non-anchored: the matches at the next matching position
+    find_batch: "scan_batch"   # non-anchored: the same, several positions per call
     overlapping: false         # optional; default false = per-pattern non-overlapping
     emit_name_map: true        # emit patternName(id) lookup helper in stubs
     patterns: all              # "all" or list of name: values from regexps:
@@ -47,7 +48,7 @@ sets:
 > **Config parsing is strict.** Any unknown key anywhere in the file is a
 > line-numbered load error. That catches typos (`mach_func:`) and the retired
 > set keys `find_any`, `find_all` and `batch_size`. It cannot catch the
-> `match:` meaning change — see [sets.md](sets.md#the-seven-capabilities).
+> `match:` meaning change — see [sets.md](sets.md#the-eight-capabilities).
 
 All paths in the config file are resolved relative to the config file's directory.
 A leading `~/` in `output`, `wasm_file`, `stub_file` or `wasm_merge` is expanded to
@@ -122,10 +123,9 @@ ever applies between `prefer-match` and `prefer-no-match`:
   `prefer-match`.
 - **`batch-find`** — requests a `<func>_batch` WASM export for this pattern's
   `find_func` and/or `groups_func` (see below). **Valid only on `regexps:`
-  entries** — it is a load-time error on a `sets:` entry, because there is no
-  set-level batching for it to request: a set's `find` returns one complete
-  position per call and the worst case for one position is the set's pattern
-  count, so there is nothing left for a batch knob to size.
+  entries** — it is a load-time error on a `sets:` entry. Sets batch through
+  the `find_batch:` capability instead, which is a declared export with its own
+  body rather than a hint, and whose buffer the caller sizes at run time.
 
 An absent or empty `hints:` list keeps the default (`LikelyNeutral`, no batch
 export). The `prefer-match`/`prefer-no-match` choice never affects match
@@ -368,6 +368,7 @@ regexps:
 sets:
   - name: secret_scanner
     find: scan_secrets       # non-anchored: matches at the next matching position
+    find_batch: scan_secrets_batch  # same matches, a bufferful per call (optional)
     scan: has_secret         # non-anchored: yes/no (optional)
     match_any: which_secret  # anchored (whole input): one pattern id (optional)
     emit_name_map: true      # emit pattern_name(id) helper in stubs
@@ -387,7 +388,8 @@ sets:
 | `scan_any` | At least one | Non-anchored: one pattern id plus its match start |
 | `scan_all` | At least one | Non-anchored: every pattern matching somewhere |
 | `find` | At least one | Non-anchored: every match at the next matching position |
-| `overlapping` | No | `false` (default) = per-pattern non-overlapping `find`; `true` = every start position. Only affects `find`; a load error without it |
+| `find_batch` | At least one | Non-anchored: the same matches, as many consecutive positions as the caller's buffer holds, resumed through an opaque cursor. Independent of `find` |
+| `overlapping` | No | `false` (default) = per-pattern non-overlapping; `true` = every start position. Affects `find` and `find_batch` only, and is silently ignored on a set declaring neither |
 | `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
 | `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
 | `hints` | No | `[prefer-match]` or `[prefer-no-match]`; per-set LikelyMode default. `batch-find` is rejected here — see [`hints:`](#hints--likelymode-and-batch-find-compile-hints) above |

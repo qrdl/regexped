@@ -140,7 +140,8 @@ function per declared capability (see [sets.md](sets.md) for the full config
 schema and wire format):
 
 ```go
-const <Set>PatternCount = 12
+const <Set>PatternCount = 12   // patterns in the set
+const <Set>IDSpace = 12        // largest reportable pattern id + 1
 
 type SetMatch struct{ PatternID, Start, End int }
 
@@ -155,21 +156,44 @@ func <ScanAny>(input []byte, from int) (id, start int, ok bool)
 func <ScanAll>(input []byte, from int) []int
 
 func <Find>(input []byte, from int) iter.Seq[SetMatch]
+type SetTuple [3]int32   // one slot of a batched scan's buffer
+func <FindBatch>(input []byte, from int, buf []SetTuple) iter.Seq[SetMatch]
 ```
 
 ```go
-for m := range scanSecrets(input, 0) {
+for m := range ScanSecrets(input, 0) {
     fmt.Println(m.PatternID, m.Start, m.End)
 }
 ```
 
-The sequence owns one reusable tuple buffer and, for the default
-non-overlapping configuration, a zeroed gate array — both sized from
-`<Set>PatternCount`. Each WASM call returns every match at one position before
+The sequence owns one reusable tuple buffer sized from `<Set>PatternCount` and,
+for the default non-overlapping configuration, a zeroed gate array sized from
+`<Set>IDSpace` — the gate array is indexed by global pattern id, so the two
+lengths differ for a named subset. Each WASM call returns every match at one position before
 the scan advances, so a step is not a call. Requires Go 1.23+ for `iter`.
 
 `PatternName(id)` is emitted once per config when any set sets
 `emit_name_map: true`.
+
+### `find_batch` — the same matches, a bufferful per call
+
+`find` crosses the host boundary once per matching position. `find_batch`
+reports the same matches in the same order but fills **your** buffer with as
+many consecutive positions as fit, so a caller who will consume the whole scan
+crosses once per bufferful instead. Use `find` when you may stop early — a
+batch call does the work for matches you never look at.
+
+The two are independent capabilities; declare either, both, or neither.
+
+You own the buffer: allocate one and reuse it for every scan, so batched
+iteration allocates nothing in the steady state. Its length is the batch size,
+capped at `<SET>_BATCH_MAX_COUNT`; a zero-length buffer yields nothing. Any
+length of 1 or more makes progress — a position whose matches do not all fit is
+delivered in part and resumed inside. Because of that, group by the match's
+`start` field rather than by call boundary if you need per-position grouping.
+
+The gate array and the resume cursor stay stub-owned and never appear in the
+public surface; only the buffer is yours, because only its size is your choice.
 
 ## Notes
 

@@ -121,6 +121,13 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		fmt.Fprintf(&hb, "/* Number of patterns in set %q. Sizes the match buffer: the scanner can\n   receive at most this many matches at one position. */\n#define %s %d\n\n", s.Name, konst, n)
 		fmt.Fprintf(&hb, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id \u2014 the gate\n   array, the _all bitmap, and the out_ids array you pass to the _all calls \u2014\n   is sized from this. */\n#define %s %d\n\n", s.Name, idKonst, idN)
 
+		if s.FindBatch != "" {
+			fmt.Fprintf(&hb, "/* Width of the count field in set %q's find_batch cursor. The count is\n   packed & ((1LL << bits) - 1); the scan is finished when the top 32 bits of\n   the cursor are all ones. Only a direct WASM caller needs these: the\n   generated scanner decodes the cursor for you. */\n#define %s %d\n\n",
+				s.Name, screamingCase(s.Name)+"_BATCH_COUNT_BITS", cursorCountBits(s, cfg))
+			fmt.Fprintf(&hb, "/* Largest tuple count one find_batch call can report for set %q. The module\n   clamps out_cap to it. */\n#define %s %d\n\n",
+				s.Name, screamingCase(s.Name)+"_BATCH_MAX_COUNT", cursorMaxCount(s, cfg))
+		}
+
 		imp := func(name, sig string) {
 			fmt.Fprintf(&hb, "__attribute__((import_module(%q), import_name(%q)))\n%s\n", cfg.ImportModule, name, sig)
 		}
@@ -159,7 +166,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
     for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) out_ids[c++] = k;
     return c;
 }
-`, s.MatchAll, konst)
+`, s.MatchAll, idKonst)
 			}
 		}
 		if s.Scan != "" {
@@ -202,7 +209,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
     for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) out_ids[c++] = k;
     return c;
 }
-`, s.ScanAll, konst)
+`, s.ScanAll, idKonst)
 			}
 		}
 		if s.Find != "" {
@@ -254,6 +261,78 @@ int %[1]s_next(%[2]s *s, const char *input, int len, rx_set_match_t *out) {
     }
 }
 `, s.Find, scannerType, gateInit, gateArg, konst)
+		}
+		if s.FindBatch != "" {
+			scannerType := "rx_" + setConstBase(s.Name) + "_batch_scanner_t"
+			gateField, gateInit, gateArg := "", "", ""
+			if gatedFind(s) {
+				// The gate array stays inside the struct: its length is the
+				// emitted id-space constant, not a size the caller chooses.
+				// Only the tuple buffer is the caller's, which is what lets
+				// the header carry no invented capacity at all.
+				imp(s.FindBatch, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, long long cursor, unsigned *gates, int *out, int cap);", s.FindBatch))
+				gateField = fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
+				gateInit = fmt.Sprintf("    for (int k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
+				gateArg = "s->gates, "
+			} else {
+				imp(s.FindBatch, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, long long cursor, int *out, int cap);", s.FindBatch))
+			}
+			fmt.Fprintf(&hb, `/* Caller-owned batched scanner for %[1]s. It reports the same matches in the
+   same order as the unbatched scanner, but refills the CALLER'S buffer a
+   bufferful at a time — one WASM call per bufferful instead of one per
+   position. Prefer it when the whole scan will be consumed; prefer the
+   unbatched scanner when you may stop early, since a batch call does the work
+   for matches you never look at.
+
+   The buffer is yours: 3 ints per match, cap matches. Declare it once and
+   reuse it for every scan. cap is capped at %[2]d; cap < 1 yields nothing.
+
+       int buf[512 * 3];
+       %[3]s sc;
+       %[1]s_init(&sc, 0, buf, 512);
+       while (%[1]s_next(&sc, input, len, &m)) { ... }  */
+typedef struct {
+    long long cursor;
+    int done;
+%[4]s    int *buf;
+    int cap;
+    int n, i;
+} %[3]s;
+
+void %[1]s_init(%[3]s *s, int from, int *buf, int cap);
+/* Writes the next match to *out; returns 1, or 0 when the scan is done. */
+int %[1]s_next(%[3]s *s, const char *input, int len, rx_set_match_t *out);
+
+`, s.FindBatch, cursorMaxCount(s, cfg), scannerType, gateField)
+			fmt.Fprintf(&cb, `void %[1]s_init(%[2]s *s, int from, int *buf, int cap) {
+    s->cursor = (long long)from << 32; s->done = 0; s->n = 0; s->i = 0;
+    s->buf = buf;
+    s->cap = cap > %[5]d ? %[5]d : cap;
+    if (s->cap < 1) s->done = 1;
+%[3]s}
+
+int %[1]s_next(%[2]s *s, const char *input, int len, rx_set_match_t *out) {
+    for (;;) {
+        if (s->i < s->n) {
+            int o = s->i * 3;
+            s->i++;
+            out->pattern_id = s->buf[o]; out->start = s->buf[o + 1]; out->end = s->buf[o + 2];
+            return 1;
+        }
+        if (s->done) return 0;
+        long long packed = ffi_%[1]s(input, len, s->cursor, %[4]ss->buf, s->cap);
+        /* The cursor is opaque: hand it back unchanged. Only its top 32 bits
+           are public — all ones means the scan is finished, and that arrives
+           on the same call as the last matches. */
+        s->n = (int)(packed & %[6]dLL);
+        s->i = 0;
+        if ((unsigned)((unsigned long long)packed >> 32) == 0xFFFFFFFFu) s->done = 1;
+        s->cursor = packed;
+        /* A call reports at least one match unless the scan is over. */
+        if (s->n == 0) { s->done = 1; return 0; }
+    }
+}
+`, s.FindBatch, scannerType, gateInit, gateArg, cursorMaxCount(s, cfg), cursorCountMask(s, cfg))
 		}
 	}
 	if hasEmitNameMap(cfg) {

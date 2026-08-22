@@ -36,6 +36,10 @@ const (
 	capScan
 	capScanAny
 	capScanAll
+	// capFindBatch is the exported multi-position loop (plans/SETS.md §19).
+	// Its per-position worker is emitted separately, as a hidden function,
+	// with mode capFind and compiledSet.batchPos set — see emitSetBatchFn.
+	capFindBatch
 )
 
 // wideBitmapThreshold is the pattern count above which the `_all` pair

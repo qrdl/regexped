@@ -58,6 +58,9 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 	var out strings.Builder
 	fmt.Fprintf(&out, "// ---- set composition wrappers (plans/SETS.md §4.4) ----\n\n")
 	fmt.Fprintf(&out, "// SetMatch is one match reported by a set Find iterator.\ntype SetMatch struct { PatternID, Start, End int }\n\n")
+	if hasFindBatch(cfg) {
+		fmt.Fprintf(&out, "// SetTuple is one slot of a batched scan's buffer, in the raw form the\n// module writes. Allocate a []SetTuple once and reuse it for every scan: the\n// batched iterator borrows it and never allocates.\ntype SetTuple [3]int32\n\n")
+	}
 	needsIter := false
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
@@ -68,6 +71,13 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 
 		fmt.Fprintf(&out, "// %s is the number of patterns in set %q. It sizes the match buffer:\n// Find can report at most this many matches at one position.\nconst %s = %d\n\n", konst, s.Name, konst, n)
 		fmt.Fprintf(&out, "// %s is one past the largest pattern id set %q can report. Pattern ids\n// are global indices into regexps:, so a set holding a few late-declared\n// patterns has a small count and a large id space. Everything indexed BY an\n// id \u2014 the gate array, the _all bitmask \u2014 is sized from this.\nconst %s = %d\n\n", idKonst, s.Name, idKonst, idN)
+
+		if s.FindBatch != "" {
+			bits := pascalSet(s.Name) + "BatchCountBits"
+			maxc := pascalSet(s.Name) + "BatchMaxCount"
+			fmt.Fprintf(&out, "// %s is the width of the count field in set %q's find_batch cursor.\n// The count is packed & ((1 << %s) - 1); the scan is finished when the top\n// 32 bits of the cursor are all ones. Only a direct WASM caller needs this —\n// the generated iterator decodes the cursor for you.\nconst %s = %d\n\n", bits, s.Name, bits, bits, cursorCountBits(s, cfg))
+			fmt.Fprintf(&out, "// %s is the largest tuple count one find_batch call can report for\n// set %q. The module clamps out_cap to it.\nconst %s = %d\n\n", maxc, s.Name, maxc, cursorMaxCount(s, cfg))
+		}
 
 		imp := func(name, sig string) {
 			fmt.Fprintf(&out, "//go:wasmimport %s %s\n//go:noescape\nfunc ffi_%s%s\n\n", cfg.ImportModule, name, name, sig)
@@ -216,6 +226,67 @@ func %s(input []byte, from int) iter.Seq[SetMatch] {
 }
 
 `, pub, gateDoc, pub, konst, gateDecl, s.Find, gateArg, konst)
+		}
+		if s.FindBatch != "" {
+			needsIter = true
+			pub := goPublicName(s.FindBatch)
+			maxKonst := pascalSet(s.Name) + "BatchMaxCount"
+			gateDecl, gateArg, gateDoc := "", "", ""
+			if gatedFind(s) {
+				// The gate array stays stub-owned and out of the public
+				// surface (docs/sets.md "The gate array"): its length is the
+				// emitted id-space constant, so it is not a size the caller
+				// chooses. Only the tuple buffer is.
+				imp(s.FindBatch, "("+inArgs+", cursor int64, gatePtr unsafe.Pointer, outPtr unsafe.Pointer, outCap int32) int64")
+				gateDecl = "\t\tgates := make([]uint32, " + idKonst + ")\n"
+				gateArg = "unsafe.Pointer(&gates[0]), "
+				gateDoc = " and a zeroed gate array"
+			} else {
+				imp(s.FindBatch, "("+inArgs+", cursor int64, outPtr unsafe.Pointer, outCap int32) int64")
+			}
+			// The comparison only names `find` when the set actually declares
+			// it; the two capabilities are independent.
+			peer := "the unbatched find"
+			if s.Find != "" {
+				peer = goPublicName(s.Find)
+			}
+			fmt.Fprintf(&out, `// %s iterates the set's matches from position from, refilling the CALLER'S
+// buffer a bufferful at a time.
+//
+// Same matches in the same order as %s — the difference is one host call per
+// bufferful instead of one per position. Prefer it when the whole scan will be
+// consumed; prefer %s when you may stop early, since a batch call does the
+// work for matches you never look at.
+//
+// len(buf) is the batch size, capped at %s; an empty buffer yields nothing.
+// The buffer is borrowed, not copied, so allocate one and reuse it for every
+// scan. The sequence owns only its cursor%s.
+func %s(input []byte, from int, buf []SetTuple) iter.Seq[SetMatch] {
+	return func(yield func(SetMatch) bool) {
+		n := len(buf)
+		if n < 1 { return }
+		if n > %s { n = %s }
+%s		cursor := int64(from) << 32
+		for {
+			packed := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), cursor, %sunsafe.Pointer(&buf[0]), int32(n))
+			// The cursor is opaque: hand it back unchanged. Only its top 32
+			// bits are public — all ones means the scan is finished, and that
+			// arrives on the same call as the last matches.
+			got := int32(packed & %d)
+			done := uint64(packed)>>32 == 0xFFFFFFFF
+			for i := int32(0); i < got; i++ {
+				if !yield(SetMatch{PatternID: int(buf[i][0]), Start: int(buf[i][1]), End: int(buf[i][2])}) { return }
+			}
+			// A call reports at least one match unless the scan is over.
+			if done || got == 0 { return }
+			cursor = packed
+		}
+	}
+}
+
+`, pub, peer, peer, maxKonst, gateDoc, pub,
+				maxKonst, maxKonst,
+				gateDecl, s.FindBatch, gateArg, cursorCountMask(s, cfg))
 		}
 	}
 	if hasEmitNameMap(cfg) {

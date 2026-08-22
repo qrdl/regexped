@@ -4331,6 +4331,9 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	soleFirstHit := len(probeFlags) > 1 && probeFlags[1] && needProbes
 	// probeFlags[2]: emit the G8 liveness table and exit.
 	needFuture := len(probeFlags) > 2 && probeFlags[2] && needProbes
+	// probeFlags[3]: the tuple-writing body carries §19's `skip` parameter.
+	// Independent of needProbes — it is about the WRITE path, not the probes.
+	needSkip := len(probeFlags) > 3 && probeFlags[3]
 	scanExit := probeExitMaskComplete
 	if soleFirstHit {
 		scanExit = probeExitFirstHit
@@ -4366,7 +4369,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 			if len(prefixFixedLens) == 1 {
 				prefixMaxLen = prefixFixedLens[0]
 			}
-			body := buildCountedChainSuffixBody(class, n, patternIDs[0], prefixMaxLen, gated)
+			body := buildCountedChainSuffixBody(class, n, patternIDs[0], prefixMaxLen, gated, needSkip)
 			art.fnBody = sizePrefixed(body)
 			if needProbes {
 				// A counted chain has no walk to exit early from — it is one
@@ -4489,6 +4492,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		prefixFixedLens:     prefixFixedLens,
 		tableMemIdx:         tableMemIdx,
 		gated:               gated,
+		hasSkip:             needSkip,
 	}
 	if t.hasWordBoundary && l.needWordCharTable {
 		p.hasWordChar = true
@@ -4555,6 +4559,18 @@ type setSuffixParams struct {
 	// gated adds a trailing gate-array parameter and the §3.16 write-time
 	// empty-match filter. Set for the default (non-overlapping) `find` body.
 	gated bool
+
+	// hasSkip adds a trailing `skip` parameter (plans/SETS.md §19): tuples
+	// whose position-relative index is below it are COUNTED but not written.
+	// It is how the overlapping batch body resumes a position whose tuples did
+	// not all fit in the caller's buffer; the gated body resumes through the
+	// gate array instead and never sets this.
+	//
+	// The value passed is the position-level skip minus the caller's running
+	// tuple base, so it is SIGNED and routinely negative — a negative skip
+	// means "this call is entirely past the resume point, write everything".
+	// Mutually exclusive with gated: no set needs both.
+	hasSkip bool
 }
 
 // appendInputLoad8u emits i32.load8_u against the INPUT memory, which is always
@@ -4700,10 +4716,12 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		paramOutCap    = byte(5)
 		paramValidMask = byte(6) // bitmask of patterns that passed prefix check
 		paramGate      = byte(7) // gate array pointer; gated bodies only
+		paramSkip      = byte(7) // §19 skip count; ungated batch bodies only
 	)
-	// Locals start after the parameters.
+	// Locals start after the parameters. gated and hasSkip are mutually
+	// exclusive, so at most one trailing parameter is present.
 	lBase := byte(7)
-	if p.gated {
+	if p.gated || p.hasSkip {
 		lBase = 8
 	}
 	var (
@@ -4839,7 +4857,16 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 			b = append(b, 0x0D, 0x01) // br_if $skip_tuple
 			b = append(b, 0x0B)       // end if empty
 		}
-		b = append(b, 0x20, lOutCount, 0x20, paramOutCap, 0x48, 0x04, 0x40) // if outCount < cap (signed)
+		if p.hasSkip {
+			// §19: (outCount < cap) & (outCount >= skip). The tuple is still
+			// counted below either way — the count is what tells the caller
+			// how much of this position remains.
+			b = append(b, 0x20, lOutCount, 0x20, paramOutCap, 0x48) // outCount < cap
+			b = append(b, 0x20, lOutCount, 0x20, paramSkip, 0x4E)   // outCount >= skip
+			b = append(b, 0x71, 0x04, 0x40)                         // and; if
+		} else {
+			b = append(b, 0x20, lOutCount, 0x20, paramOutCap, 0x48, 0x04, 0x40) // if outCount < cap (signed)
+		}
 		b = append(b, 0x20, paramOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A, 0x21, lOutBase)
 		b = append(b, 0x20, lOutBase, 0x41)
 		b = utils.AppendSLEB128(b, int32(globalID))

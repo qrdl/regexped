@@ -589,14 +589,53 @@ func TestLoadConfig_OverlappingRoundTrips(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_OverlappingWithoutFindIsError(t *testing.T) {
+// TestLoadConfig_OverlappingWithoutFindIsIgnored: `overlapping` selects
+// between two find bodies. On a set declaring neither `find` nor `find_batch`
+// there is no body to select, so the key has no effect and is accepted rather
+// than rejected — a harmless key should not be a build failure.
+func TestLoadConfig_OverlappingWithoutFindIsIgnored(t *testing.T) {
 	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan: sc\n    overlapping: true\n    patterns: all\n"
-	_, err := LoadConfig(writeCfg(t, yaml))
-	if err == nil {
-		t.Fatal("overlapping on a set without find: must be a load error (§3.15)")
+	cfg, err := LoadConfig(writeCfg(t, yaml))
+	if err != nil {
+		t.Fatalf("overlapping without find must be ignored, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "overlapping") {
-		t.Fatalf("error should mention overlapping, got: %v", err)
+	if cfg.Sets[0].Gated() {
+		t.Error("a set with no find capability gates nothing")
+	}
+	if cfg.Sets[0].HasFind() {
+		t.Error("HasFind must be false for a scan-only set")
+	}
+}
+
+// TestLoadConfig_FindBatchEnablesOverlapping: find_batch is a find capability
+// for every purpose overlapping cares about.
+func TestLoadConfig_FindBatchEnablesOverlapping(t *testing.T) {
+	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n"
+	cfg, err := LoadConfig(writeCfg(t, yaml))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Sets[0].HasFind() || !cfg.Sets[0].Gated() {
+		t.Error("a find_batch-only set has a find capability and is gated by default")
+	}
+	caps := cfg.Sets[0].Capabilities()
+	if len(caps) != 1 || caps[0].Field != "find_batch" || caps[0].Name != "fb" {
+		t.Errorf("find_batch missing from Capabilities: %+v", caps)
+	}
+}
+
+// TestLoadConfig_BatchNameCollision: the name the "batch-find" hint would
+// synthesize for a pattern is reserved, so a set capability cannot silently
+// claim it — but every OTHER name ending in _batch is now available, which is
+// what makes `find_batch: x_find_batch` legal.
+func TestLoadConfig_BatchNameCollision(t *testing.T) {
+	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n  - name: s\n    find_batch: ff_batch\n    patterns: all\n"
+	if _, err := LoadConfig(writeCfg(t, yaml)); err == nil {
+		t.Fatal("a set capability claiming a pattern's synthesized batch name must be rejected")
+	}
+	ok := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n  - name: s\n    find_batch: set_find_batch\n    patterns: all\n"
+	if _, err := LoadConfig(writeCfg(t, ok)); err != nil {
+		t.Fatalf("a non-colliding _batch name must be accepted, got: %v", err)
 	}
 }
 

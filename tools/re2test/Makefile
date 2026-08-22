@@ -1,4 +1,4 @@
-.PHONY: test exhaustive custom adjusted sets likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
+.PHONY: test exhaustive custom adjusted sets set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -90,11 +90,17 @@ groupsonly: $(ADJUSTED)
 	go run . --groups-only --validate-groups $(ADJUSTED)
 	go run . --groups-only --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets
+test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets set-batch
 
 sets: $(TESTDATA)
 	go run . --sets $(TESTDATA)
 	go run . --sets $(CUSTOM_SETS)
+
+# The same corpus and the same col4 oracle, driving find_batch at a buffer
+# capacity of ONE so every multi-match position splits (plans/SETS.md §19.5).
+set-batch: $(TESTDATA)
+	go run . --sets --set-batch $(TESTDATA)
+	go run . --sets --set-batch $(CUSTOM_SETS)
 
 clean:
 	rm -f $(TESTDATA) $(ADJUSTED)

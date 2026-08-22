@@ -1075,3 +1075,255 @@ func TestConfigPascalCaseMatchesGenerators(t *testing.T) {
 		}
 	}
 }
+
+// TestSetAllDecodesOverIDSpace covers the narrow (<=64 id) `_all` decode in
+// every generator. The i64 bitmask carries bit positions, and a bit position is
+// a GLOBAL pattern id — so the decode loop is bounded by the id space, not by
+// the set's pattern count. The two are equal for a whole-config set, which is
+// why the C generator's loop over PATTERN_COUNT went unnoticed; for a named
+// subset of two late-declared patterns it dropped every match.
+func TestSetAllDecodesOverIDSpace(t *testing.T) {
+	// Six patterns, of which the set selects only the last two: count 2,
+	// id space 6, ids 4 and 5. A loop bounded by the count never inspects
+	// either bit.
+	cfg := config.BuildConfig{
+		ImportModule: "mymod",
+		Regexps: []config.RegexEntry{
+			{Name: "p0", Pattern: "a"}, {Name: "p1", Pattern: "b"},
+			{Name: "p2", Pattern: "c"}, {Name: "p3", Pattern: "d"},
+			{Name: "p4", Pattern: "e"}, {Name: "p5", Pattern: "f"},
+		},
+		Sets: []config.SetConfig{{
+			Name:     "scanner",
+			MatchAll: "validate_all",
+			ScanAll:  "probe_all",
+			Patterns: config.PatternSelector{Names: []string{"p4", "p5"}},
+		}},
+	}
+	set := cfg.Sets[0]
+	if n, id := patternsInSet(set, cfg), idSpaceSize(set, cfg); n != 2 || id != 6 {
+		t.Fatalf("test set is not the sparse shape: count=%d idSpace=%d, want 2 and 6", n, id)
+	}
+	if wideAllForm(set, cfg) {
+		t.Fatal("test set took the wide _all form; this test must exercise the narrow bitmask decode")
+	}
+
+	hStub, cStub, err := genCStubFilesWithSets(cfg, "stubs.h")
+	if err != nil {
+		t.Fatalf("genCStubFilesWithSets: %v", err)
+	}
+	for _, lang := range []struct{ name, out, count, idSpace string }{
+		{"rust", genRustSetInner(cfg), "SCANNER_PATTERN_COUNT", "SCANNER_ID_SPACE"},
+		{"go", genGoSetSection(cfg, "mymod"), "ScannerPatternCount", "ScannerIDSpace"},
+		{"js", genJSSetSection(cfg), "scannerPatternCount", "scannerIdSpace"},
+		{"ts", genTSSetSection(cfg), "scannerPatternCount", "scannerIdSpace"},
+		{"as", genASSetSection(cfg), "SCANNER_PATTERN_COUNT", "SCANNER_ID_SPACE"},
+		{"c", hStub + cStub, "SCANNER_PATTERN_COUNT", "SCANNER_ID_SPACE"},
+	} {
+		for _, fn := range []string{"validate_all", "probe_all"} {
+			if lang.name == "go" {
+				fn = goPublicName(fn) // Go's public surface is Pascal-cased
+			}
+			body, ok := allDecodeBody(lang.out, fn)
+			if !ok {
+				t.Errorf("%s: no %s body found", lang.name, fn)
+				continue
+			}
+			if !strings.Contains(body, lang.idSpace) {
+				t.Errorf("%s: %s decodes without %s; a loop that stops at the pattern count "+
+					"never inspects the bits of a sparse subset's ids\n%s", lang.name, fn, lang.idSpace, body)
+			}
+			if strings.Contains(body, lang.count) {
+				t.Errorf("%s: %s decode is bounded by %s, but bit positions are global pattern ids\n%s",
+					lang.name, fn, lang.count, body)
+			}
+		}
+	}
+}
+
+// allDecodeBody extracts the emitted `_all` wrapper for fn — everything from
+// the line that names it up to the closing brace at that indentation — so the
+// bound can be asserted against the DECODE loop rather than against the whole
+// file, where the other constant is always present somewhere.
+func allDecodeBody(out, fn string) (string, bool) {
+	lines := strings.Split(out, "\n")
+	for i, ln := range lines {
+		// The definition line: names fn and opens a block. Import/extern
+		// declarations name it too, so require the brace.
+		if !strings.Contains(ln, fn) || !strings.Contains(ln, "{") || strings.Contains(ln, "ffi_"+fn) {
+			continue
+		}
+		for j := i + 1; j < len(lines) && j < i+30; j++ {
+			if strings.HasPrefix(strings.TrimSpace(lines[j]), "}") &&
+				len(lines[j])-len(strings.TrimLeft(lines[j], " \t")) == len(ln)-len(strings.TrimLeft(ln, " \t")) {
+				return strings.Join(lines[i:j+1], "\n"), true
+			}
+		}
+	}
+	return "", false
+}
+
+// TestConfigSetDerivedNamesMatchGenerators is the same guard for the per-set
+// constants. config.setDerivedNames reserves those names so a capability export
+// cannot collide with one, and a reservation that does not match what is
+// actually emitted protects nothing: too narrow and the collision still ships,
+// too wide and it rejects names no generator uses. The batch config is used
+// because it emits all four.
+func TestConfigSetDerivedNamesMatchGenerators(t *testing.T) {
+	cfg := setBatchTestCfg()
+	set := cfg.Sets[0]
+	hStub, cStub, err := genCStubFilesWithSets(cfg, "stubs.h")
+	if err != nil {
+		t.Fatalf("genCStubFilesWithSets: %v", err)
+	}
+	for _, lang := range []struct{ name, out string }{
+		{"rust", genRustSetInner(cfg)},
+		{"go", genGoSetSection(cfg, "mymod")},
+		{"js", genJSSetSection(cfg)},
+		{"ts", genTSSetSection(cfg)},
+		{"as", genASSetSection(cfg)},
+		{"c", hStub + cStub},
+	} {
+		names := config.SetDerivedNamesForValidation(set, lang.name)
+		if len(names) != 4 {
+			t.Errorf("%s: reserved %d names, want 4 (pattern count, id space, both cursor constants)", lang.name, len(names))
+		}
+		for _, n := range names {
+			if !strings.Contains(lang.out, n) {
+				t.Errorf("%s: reserves %q, but the generator emits no such name", lang.name, n)
+			}
+		}
+	}
+}
+
+// setBatchTestCfg is setTestCfg plus §19's find_batch, so the batch surface can
+// be asserted without changing what every other set test sees.
+func setBatchTestCfg() config.BuildConfig {
+	cfg := setTestCfg()
+	cfg.Sets[0].FindBatch = "set_find_batch"
+	return cfg
+}
+
+// TestSetFindBatchStubs: every generator must emit the batch entry point, the
+// two cursor constants, and — in the four languages where the caller can hold
+// storage — a BORROWED buffer rather than one the stub allocates. The last is
+// the point: find_batch exists to cut per-call overhead, so it must not add a
+// per-scan allocation (plans/SETS.md §19.6).
+func TestSetFindBatchStubs(t *testing.T) {
+	cfg := setBatchTestCfg()
+	cases := []struct {
+		lang     string
+		out      string
+		required []string
+	}{
+		{"rust", genRustSetInner(cfg), []string{
+			"SCANNER_BATCH_COUNT_BITS",
+			"SCANNER_BATCH_MAX_COUNT",
+			"ffi_set_find_batch",
+			"cursor: i64",
+			"pub type SetTuple = [i32; 3]",
+			"buf: &'b mut [SetTuple]",        // borrowed, not owned
+			"gates: [u32; SCANNER_ID_SPACE]", // fixed array: no allocation either
+		}},
+		{"go", genGoSetSection(cfg, "mymod"), []string{
+			"ScannerBatchCountBits",
+			"ScannerBatchMaxCount",
+			"SetFindBatch",
+			"cursor int64",
+			"type SetTuple [3]int32",
+			"buf []SetTuple",
+		}},
+		{"js", genJSSetSection(cfg), []string{
+			"scannerBatchCountBits",
+			"scannerBatchMaxCount",
+			"set_find_batch",
+			"BigInt(from) << 32n",
+			"capacity = 256",
+		}},
+		{"ts", genTSSetSection(cfg), []string{
+			"scannerBatchCountBits",
+			"scannerBatchMaxCount",
+			"set_find_batch",
+			"BigInt(from) << 32n",
+			"capacity: number = 256",
+		}},
+		{"as", genASSetSection(cfg), []string{
+			"SCANNER_BATCH_COUNT_BITS",
+			"SCANNER_BATCH_MAX_COUNT",
+			"ffi_set_find_batch",
+			"cursor: i64",
+			"buf: StaticArray<i32>",
+		}},
+	}
+	for _, c := range cases {
+		for _, want := range c.required {
+			if !strings.Contains(c.out, want) {
+				t.Errorf("%s set stub: missing %q", c.lang, want)
+			}
+		}
+	}
+	// The whole point of §19.6: no per-scan allocation of the tuple buffer.
+	// Scoped to the BATCH entry point — the unbatched `find` allocates in Go by
+	// design, and matching on the whole file would flag it.
+	forbidden := []struct{ lang, from, bad string }{
+		{"rust", "pub fn set_find_batch", "vec!"},
+		{"go", "func SetFindBatch(", "make([][3]int32"},
+	}
+	for _, f := range forbidden {
+		for _, c := range cases {
+			if c.lang != f.lang {
+				continue
+			}
+			i := strings.Index(c.out, f.from)
+			if i < 0 {
+				t.Errorf("%s set stub: batch entry point %q not found", f.lang, f.from)
+				continue
+			}
+			region := c.out[i:]
+			if j := strings.Index(region[1:], "\n}\n"); j >= 0 {
+				region = region[:j+2]
+			}
+			if strings.Contains(region, f.bad) {
+				t.Errorf("%s set stub: batch entry point allocates its tuple buffer (%q); it must borrow the caller's",
+					f.lang, f.bad)
+			}
+		}
+	}
+}
+
+// TestSetFindBatchCStubTakesBuffer: C has no allocator, so a stub-owned buffer
+// forced an invented capacity macro into the header. With the buffer passed in,
+// that constant is gone entirely (plans/SETS.md §19.6).
+func TestSetFindBatchCStubTakesBuffer(t *testing.T) {
+	h, c, err := genCStubFilesWithSets(setBatchTestCfg(), "stub.h")
+	if err != nil {
+		t.Fatalf("genCStubFilesWithSets: %v", err)
+	}
+	out := h + c
+	if !strings.Contains(out, "set_find_batch_init(rx_scanner_batch_scanner_t *s, int from, int *buf, int cap)") {
+		t.Error("C batch scanner does not take the caller's buffer")
+	}
+	if strings.Contains(out, "BATCH_CAP") {
+		t.Error("C header still defines an invented batch capacity")
+	}
+}
+
+// TestSetFindBatchAbsentWhenUndeclared: find_batch is an INDEPENDENT
+// capability, so a set that does not declare it must emit none of its surface.
+func TestSetFindBatchAbsentWhenUndeclared(t *testing.T) {
+	cfg := setTestCfg() // no FindBatch
+	outs := map[string]string{
+		"rust": genRustSetInner(cfg),
+		"go":   genGoSetSection(cfg, "mymod"),
+		"js":   genJSSetSection(cfg),
+		"ts":   genTSSetSection(cfg),
+		"as":   genASSetSection(cfg),
+	}
+	for lang, out := range outs {
+		for _, forbidden := range []string{"BATCH_COUNT_BITS", "BatchCountBits", "batchCountBits", "find_batch"} {
+			if strings.Contains(out, forbidden) {
+				t.Errorf("%s set stub: emitted %q for a set without find_batch", lang, forbidden)
+			}
+		}
+	}
+}

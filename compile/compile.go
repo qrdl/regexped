@@ -2259,9 +2259,12 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 			ScanAny:     sc.ScanAny,
 			ScanAll:     sc.ScanAll,
 			Find:        sc.Find,
+			FindBatch:   sc.FindBatch,
 			Overlapping: sc.Overlapping,
 			Patterns:    infos,
 			PatternIDs:  globalIDs,
+
+			DeclaredPatternCount: sc.PatternCount(cfg),
 		}
 		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
 		if cs.diag != nil {

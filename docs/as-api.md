@@ -204,6 +204,9 @@ export function <scan_all>(input: ArrayBuffer, from: i32): Array<i32>
 
 // AssemblyScript has no generators, so `find` is an explicit iterator object.
 export function <find>(input: ArrayBuffer, from: i32): <Find>Iter
+// find_batch: the same matches, a bufferful per call (see below).
+// buf holds 3 i32 per match, so its capacity is buf.length / 3.
+export function <find_batch>(input: ArrayBuffer, from: i32, buf: StaticArray<i32>): <FindBatch>Iter
 class <Find>Iter { next(): SetMatch | null }
 
 // only if any set in the config sets emit_name_map: true
@@ -230,6 +233,26 @@ requested `emit_name_map: true`.
 | `find_func` | `<func>(input: ArrayBuffer, offset: i32): i64` | packed `(absStart << 32 \| absEnd)`, or `-1` |
 | `groups_func` | `<func>(input: ArrayBuffer, offset: i32): i32` | `dataStart` pointer to slot buffer, or `0` |
 | `named_groups_func` | **not supported** — generator returns an error | — |
+
+### `find_batch` — the same matches, a bufferful per call
+
+`find` crosses the host boundary once per matching position. `find_batch`
+reports the same matches in the same order but fills **your** buffer with as
+many consecutive positions as fit, so a caller who will consume the whole scan
+crosses once per bufferful instead. Use `find` when you may stop early — a
+batch call does the work for matches you never look at.
+
+The two are independent capabilities; declare either, both, or neither.
+
+You own the buffer: allocate one and reuse it for every scan, so batched
+iteration allocates nothing in the steady state. Its length is the batch size,
+capped at `<SET>_BATCH_MAX_COUNT`; a zero-length buffer yields nothing. Any
+length of 1 or more makes progress — a position whose matches do not all fit is
+delivered in part and resumed inside. Because of that, group by the match's
+`start` field rather than by call boundary if you need per-position grouping.
+
+The gate array and the resume cursor stay stub-owned and never appear in the
+public surface; only the buffer is yours, because only its size is your choice.
 
 ## Notes
 

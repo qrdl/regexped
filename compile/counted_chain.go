@@ -183,7 +183,7 @@ func sameByteSet(a, b []byte) bool {
 // 0/-1 (trivial/variable) ⇒ matchStart = lPos; >0 (fixed) ⇒
 // matchStart = lPos - prefixMaxLen. The tuple's third field is the absolute
 // end (plans/SETS.md §3.18), matching emitWriteMatchK.
-func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLen int, gated bool) []byte {
+func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLen int, gated, hasSkip bool) []byte {
 	const (
 		paramPtr       = byte(0)
 		paramStart     = byte(1)
@@ -192,6 +192,7 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 		paramOutPtr    = byte(4)
 		paramOutCap    = byte(5)
 		paramValidMask = byte(6)
+		paramSkip      = byte(7) // §19 skip; ungated batch signature only
 		// paramGate (7) exists only in the gated signature and is unused here:
 		// a counted chain consumes n >= 1 bytes, so its match can never be
 		// empty and §3.16's write-time empty-match filter is vacuous. The
@@ -201,7 +202,7 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 	// Local group order below is i32 group first, then v128 group — these
 	// indices must track that order, and shift by one in the gated signature.
 	localBase := byte(7)
-	if gated {
+	if gated || hasSkip {
 		localBase = 8
 	}
 	var (
@@ -304,7 +305,15 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 	// overflowing call still reports its match towards the total
 	// (plans/SETS.md §3.11 / D2). paramOutCap is the signed remaining
 	// capacity and can be negative.
-	b = append(b, 0x41, 0x00, 0x20, paramOutCap, 0x48, 0x04, 0x40) // if 0 < cap (signed)
+	if hasSkip {
+		// §19: this emitter's only tuple has position-relative index 0, so it
+		// is written when 0 < cap AND skip <= 0.
+		b = append(b, 0x41, 0x00, 0x20, paramOutCap, 0x48) // 0 < cap
+		b = append(b, 0x20, paramSkip, 0x41, 0x00, 0x4D)   // skip <= 0
+		b = append(b, 0x71, 0x04, 0x40)                    // and; if
+	} else {
+		b = append(b, 0x41, 0x00, 0x20, paramOutCap, 0x48, 0x04, 0x40) // if 0 < cap (signed)
+	}
 	b = append(b, 0x20, paramOutPtr, 0x21, lOutBase)
 	b = append(b, 0x20, lOutBase, 0x41)
 	b = utils.AppendSLEB128(b, int32(patternID))

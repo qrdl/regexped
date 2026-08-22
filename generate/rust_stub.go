@@ -56,6 +56,12 @@ impl SetMatch {
 }
 
 `)
+	if hasFindBatch(cfg) {
+		out.WriteString("/// One slot of a batched scan's buffer, in the raw form the module writes.\n" +
+			"/// Allocate a Vec<SetTuple> (or a stack array) once and reuse it for every\n" +
+			"/// scan: the batched iterator borrows it and never allocates.\n" +
+			"pub type SetTuple = [i32; 3];\n\n")
+	}
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
@@ -65,6 +71,13 @@ impl SetMatch {
 
 		fmt.Fprintf(&out, "/// Number of patterns in set %q. Sizes the match buffer: `find` can\n/// report at most this many matches at one position.\npub const %s: usize = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "/// One past the largest pattern id set %q can report. Pattern ids are\n/// global indices into `regexps:`, so a set holding a few late-declared\n/// patterns has a small count and a large id space. Everything indexed BY an\n/// id — the gate array, the `_all` bitmask — is sized from this.\npub const %s: usize = %d;\n\n", s.Name, idKonst, idN)
+
+		if s.FindBatch != "" {
+			fmt.Fprintf(&out, "/// Width of the count field in set %[1]q's `find_batch` cursor. The count is\n/// `packed & ((1 << %[2]s) - 1)`; the scan is finished when the top 32 bits of\n/// the cursor are all ones. Only a direct WASM caller needs this — the\n/// generated iterator decodes the cursor for you.\npub const %[2]s: u32 = %[3]d;\n\n",
+				s.Name, screamingCase(s.Name)+"_BATCH_COUNT_BITS", cursorCountBits(s, cfg))
+			fmt.Fprintf(&out, "/// Largest tuple count one `find_batch` call can report for set %[1]q. The\n/// module clamps `out_cap` to it.\npub const %[2]s: usize = %[3]d;\n\n",
+				s.Name, screamingCase(s.Name)+"_BATCH_MAX_COUNT", cursorMaxCount(s, cfg))
+		}
 
 		fmt.Fprintf(&out, "#[link(wasm_import_module = %q)]\nunsafe extern \"C\" {\n", cfg.ImportModule)
 		decl := func(name, sig string) {
@@ -101,6 +114,13 @@ impl SetMatch {
 				decl(s.Find, "(ptr: *const u8, len: i32, from: i32, gates: *mut u32, out: *mut i32, cap: i32) -> i32")
 			} else {
 				decl(s.Find, "(ptr: *const u8, len: i32, from: i32, out: *mut i32, cap: i32) -> i32")
+			}
+		}
+		if s.FindBatch != "" {
+			if gatedFind(s) {
+				decl(s.FindBatch, "(ptr: *const u8, len: i32, cursor: i64, gates: *mut u32, out: *mut i32, cap: i32) -> i64")
+			} else {
+				decl(s.FindBatch, "(ptr: *const u8, len: i32, cursor: i64, out: *mut i32, cap: i32) -> i64")
 			}
 		}
 		out.WriteString("}\n\n")
@@ -239,6 +259,77 @@ impl<'a> Iterator for %s<'a> {
 }
 
 `, s.Find, iterName, iterName, gateInit, konst)
+		}
+		if s.FindBatch != "" {
+			iterName := iterTypeName(s.FindBatch)
+			maxKonst := screamingCase(s.Name) + "_BATCH_MAX_COUNT"
+			gateField, gateInit, gateArg, gateDoc := "", "", "", ""
+			if gatedFind(s) {
+				// The gate array stays stub-owned and out of the public
+				// surface (docs/sets.md "The gate array"), and it is a FIXED
+				// array rather than a Vec: its length is the emitted id-space
+				// constant, so it costs no allocation and needs no parameter.
+				// Only the tuple buffer's size is the caller's choice.
+				gateField = "    gates: [u32; " + idKonst + "],\n"
+				gateInit = " gates: [0u32; " + idKonst + "],"
+				gateArg = "self.gates.as_mut_ptr(), "
+				gateDoc = " and owns a zeroed gate array"
+			}
+			fmt.Fprintf(&out, `/// Iterator over the set's matches, refilled a BUFFERFUL at a time.
+///
+/// Same matches, in the same order, as the `+"`find`"+` iterator — the difference is
+/// one host call per bufferful instead of one per position. Use it when the
+/// whole scan will be consumed; use `+"`find`"+` when you may stop early, since a
+/// batch call does the work for matches you never look at.
+///
+/// It borrows the caller's buffer%s, so a scan allocates NOTHING: size the
+/// buffer once and reuse it for every scan.
+pub struct %s<'a, 'b> {
+    input: &'a [u8],
+    buf: &'b mut [SetTuple],
+    cursor: i64,
+    done: bool,
+%s    count: i32,
+    idx: i32,
+}
+
+impl<'a, 'b> Iterator for %s<'a, 'b> {
+    type Item = SetMatch;
+    fn next(&mut self) -> Option<SetMatch> {
+        loop {
+            if self.idx < self.count {
+                let e = self.buf[self.idx as usize];
+                self.idx += 1;
+                return Some(SetMatch { pattern_id: e[0] as usize, start: e[1] as usize, end: e[2] as usize });
+            }
+            if self.done { return None; }
+            let cap = self.buf.len().min(%s) as i32;
+            let packed = unsafe {
+                ffi_%s(self.input.as_ptr(), self.input.len() as i32, self.cursor,
+                    %sself.buf.as_mut_ptr() as *mut i32, cap)
+            };
+            // The cursor is opaque: hand it back unchanged. Its top 32 bits are
+            // the only public part — all ones means the scan is finished, and
+            // that arrives on the same call as the last matches.
+            self.count = (packed & %d) as i32;
+            self.idx = 0;
+            if (packed as u64) >> 32 == 0xFFFF_FFFF { self.done = true; }
+            self.cursor = packed;
+            // A call reports at least one match unless the scan is over.
+            if self.count == 0 { self.done = true; return None; }
+        }
+    }
+}
+
+`, gateDoc, iterName, gateField, iterName, maxKonst, s.FindBatch, gateArg, cursorCountMask(s, cfg))
+			fmt.Fprintf(&out, "/// Starts a batched scan at `from` over the caller's buffer. Its length is\n"+
+				"/// the batch size, capped at %s; an empty buffer yields nothing.\n"+
+				`pub fn %s<'a, 'b>(input: &'a [u8], from: usize, buf: &'b mut [SetTuple]) -> %s<'a, 'b> {
+    let done = buf.is_empty();
+    %s { input, buf, cursor: (from as i64) << 32, done,%s count: 0, idx: 0 }
+}
+
+`, maxKonst, s.FindBatch, iterName, iterName, gateInit)
 		}
 	}
 	if hasEmitNameMap(cfg) {

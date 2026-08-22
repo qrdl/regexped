@@ -521,7 +521,130 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 		}
 	}
 
+	// (4) Collisions with the constants a generator derives from a SET NAME.
+	// Unlike (1), these are not a fixed list: `<SET>_PATTERN_COUNT` and its
+	// three siblings are built from the set's own name, so what is reserved
+	// depends on the config. Without this check a TS config with a set named
+	// `scanner` and a capability exported as `scannerPatternCount` passes
+	// validation and then emits both `export const scannerPatternCount` and
+	// `export function scannerPatternCount`, which tsc rejects with no
+	// diagnostic from us. See setDerivedNames for why all four are reserved
+	// even when the set declares no find_batch.
+	//
+	// Compared against the same form the generator emits the export under:
+	// Go's public names are Pascal-cased, every other generator uses the
+	// export name verbatim.
+	{
+		deny := map[string]SetConfig{}
+		for _, s := range cfg.Sets {
+			for _, n := range setDerivedNames(s, stubType) {
+				deny[n] = s
+			}
+		}
+		for _, r := range refs {
+			emitted := r.name
+			if stubType == "go" {
+				emitted = pascalCase(r.name)
+			}
+			if s, clash := deny[emitted]; clash {
+				problems = append(problems, fmt.Sprintf("%s: %s %q generates %s %q, which is also the name of a constant the %s stub generator derives from set %q; rename one",
+					r.owner, r.field, r.name, stubType, emitted, stubType, s.Name))
+			}
+		}
+	}
+
 	return problems
+}
+
+// The three set-name stem transforms. Each generator names its per-set
+// constants by applying one of these to SanitizeSetName(set.Name); they live
+// here, and generate/set_stub.go delegates to them, for the reason
+// SanitizeSetName gives — a transform each side derives independently is a
+// transform that can drift, and setDerivedNames below has to reproduce the
+// generators' output EXACTLY or the check it feeds is theatre.
+
+// ScreamingSetName returns the SCREAMING_SNAKE_CASE stem the Rust, C and
+// AssemblyScript generators build their per-set constants from, inserting an
+// underscore at lower→upper transitions so "sqlValidator" becomes
+// "SQL_VALIDATOR" rather than "SQLVALIDATOR".
+func ScreamingSetName(name string) string {
+	base := SanitizeSetName(name)
+	var out []rune
+	for i, c := range base {
+		if i > 0 && c >= 'A' && c <= 'Z' {
+			prev := rune(base[i-1])
+			if prev >= 'a' && prev <= 'z' || prev >= '0' && prev <= '9' {
+				out = append(out, '_')
+			}
+		}
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		out = append(out, c)
+	}
+	return string(out)
+}
+
+// PascalSetName returns the PascalCase stem the Go generator uses.
+func PascalSetName(name string) string { return pascalCase(SanitizeSetName(name)) }
+
+// CamelSetName returns the camelCase stem the JS and TS generators use.
+func CamelSetName(name string) string {
+	p := PascalSetName(name)
+	if p == "" {
+		return p
+	}
+	r := []rune(p)
+	if r[0] >= 'A' && r[0] <= 'Z' {
+		r[0] += 'a' - 'A'
+	}
+	return string(r)
+}
+
+// setDerivedNames returns the module-scope names stubType's generator
+// synthesizes from one set's NAME — the pattern-count, id-space and
+// find_batch cursor constants (plans/SETS.md D16, §11 R1, §19).
+//
+// All four are returned whether or not the set declares find_batch today. The
+// batch constants are emitted only when it does, but conditioning the check on
+// that would mean adding `find_batch:` to a working config turns a valid export
+// name into a collision — the same churn jsHelperNames refuses to create, and
+// the reason that list is denied unconditionally.
+//
+// This check cannot be name-independent the way the others are: what a set is
+// called decides what its constants are called, so unlike the helper lists this
+// one has to be computed from cfg.Sets.
+func setDerivedNames(s SetConfig, stubType string) []string {
+	var stem string
+	var suffixes []string
+	switch stubType {
+	case "rust", "c", "as":
+		stem, suffixes = ScreamingSetName(s.Name), []string{
+			"_PATTERN_COUNT", "_ID_SPACE", "_BATCH_COUNT_BITS", "_BATCH_MAX_COUNT"}
+	case "go":
+		stem, suffixes = PascalSetName(s.Name), []string{
+			"PatternCount", "IDSpace", "BatchCountBits", "BatchMaxCount"}
+	case "js", "ts":
+		stem, suffixes = CamelSetName(s.Name), []string{
+			"PatternCount", "IdSpace", "BatchCountBits", "BatchMaxCount"}
+	default:
+		return nil
+	}
+	out := make([]string, len(suffixes))
+	for i, suf := range suffixes {
+		out[i] = stem + suf
+	}
+	return out
+}
+
+// SetDerivedNamesForValidation exposes setDerivedNames so the generate package
+// — which can import config, but not the reverse — can pin this list against
+// the constants the generators really emit. The stems cannot drift (the
+// generators call the transforms above), but the four SUFFIXES are written out
+// on both sides, and a reserved name that no generator emits is as broken as an
+// emitted one that is not reserved. Not part of the config API otherwise.
+func SetDerivedNamesForValidation(s SetConfig, stubType string) []string {
+	return setDerivedNames(s, stubType)
 }
 
 // PascalCaseForValidation exposes pascalCase so the generate package — which

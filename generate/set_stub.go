@@ -60,40 +60,22 @@ func setConstBase(name string) string {
 // screamingCase returns the SCREAMING_SNAKE_CASE form of a sanitised set name,
 // inserting an underscore at lower→upper transitions so "sqlValidator" becomes
 // "SQL_VALIDATOR" rather than "SQLVALIDATOR".
+//
+// Delegated, like setConstBase, so that ValidateExports — which must reserve
+// the constants these stems name (config.setDerivedNames) — cannot disagree
+// with what the generators actually emit.
 func screamingCase(name string) string {
-	base := setConstBase(name)
-	var out []rune
-	for i, c := range base {
-		if i > 0 && c >= 'A' && c <= 'Z' {
-			prev := rune(base[i-1])
-			if prev >= 'a' && prev <= 'z' || prev >= '0' && prev <= '9' {
-				out = append(out, '_')
-			}
-		}
-		if c >= 'a' && c <= 'z' {
-			c -= 'a' - 'A'
-		}
-		out = append(out, c)
-	}
-	return string(out)
+	return config.ScreamingSetName(name)
 }
 
 // pascalSet returns the PascalCase form of a sanitised set name.
 func pascalSet(name string) string {
-	return config.PascalCaseForValidation(setConstBase(name))
+	return config.PascalSetName(name)
 }
 
 // camelSet returns the camelCase form of a sanitised set name.
 func camelSet(name string) string {
-	p := pascalSet(name)
-	if p == "" {
-		return p
-	}
-	r := []rune(p)
-	if r[0] >= 'A' && r[0] <= 'Z' {
-		r[0] += 'a' - 'A'
-	}
-	return string(r)
+	return config.CamelSetName(name)
 }
 
 // wideAllForm reports whether a set's `_all` capabilities use the >64-pattern
@@ -115,3 +97,58 @@ func bitmapBytes(s config.SetConfig, cfg config.BuildConfig) int {
 // gatedFind reports whether a set's `find` is the default gated body, which
 // carries a gate-array parameter the stub must own and zero (§3.14).
 func gatedFind(s config.SetConfig) bool { return s.Gated() }
+
+// cursorCountBits is the width of the find_batch cursor's count field for this
+// set (plans/SETS.md §19).
+//
+// It calls the SAME config function the compiler encodes with, for the reason
+// idSpaceSize gives: a layout each side derives independently is a layout that
+// can drift. Do not re-derive it here.
+func cursorCountBits(s config.SetConfig, cfg config.BuildConfig) int {
+	return config.SetCursorCountBits(patternsInSet(s, cfg))
+}
+
+// cursorCountMask masks the count out of a find_batch return value.
+func cursorCountMask(s config.SetConfig, cfg config.BuildConfig) int64 {
+	return int64(1)<<uint(cursorCountBits(s, cfg)) - 1
+}
+
+// cursorMaxCount is the largest count one find_batch call can report. The
+// emitted body clamps out_cap to it, so a stub must not hand it a larger
+// capacity and then expect the extra slots to be filled.
+func cursorMaxCount(s config.SetConfig, cfg config.BuildConfig) int64 {
+	return int64(config.SetCursorMaxCount(patternsInSet(s, cfg)))
+}
+
+// defaultBatchCap is the buffer size a generated batch iterator uses when the
+// caller does not name one, in tuples.
+//
+// 256 is arbitrary but not accidental: at 12 bytes a tuple that is a 3 KB
+// buffer, small enough to be uninteresting to allocate and large enough that
+// the per-call host crossing find_batch exists to amortise is amortised over a
+// few hundred matches. Callers who care pass their own.
+//
+// It is never below one position's worst case, so a single call always makes
+// progress even on a set whose every pattern matches at one spot.
+func defaultBatchCap(s config.SetConfig, cfg config.BuildConfig) int {
+	n := patternsInSet(s, cfg)
+	if n < 256 {
+		n = 256
+	}
+	if max := int(cursorMaxCount(s, cfg)); n > max {
+		n = max
+	}
+	return n
+}
+
+// hasFindBatch reports whether any set in cfg declares find_batch. It gates the
+// SetTuple buffer type, which only a batched scan's caller needs — emitting it
+// unconditionally would put an unused public type into every set-bearing stub.
+func hasFindBatch(cfg config.BuildConfig) bool {
+	for _, s := range cfg.Sets {
+		if s.FindBatch != "" {
+			return true
+		}
+	}
+	return false
+}

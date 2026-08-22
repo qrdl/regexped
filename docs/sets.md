@@ -45,7 +45,7 @@ their own packing over the full patterns — see
 [below](#the-anchored-capabilities-use-their-own-automata) for why they have
 to.
 
-## The seven capabilities
+## The eight capabilities
 
 A set declares which questions it needs answered, and the compiler emits only
 the machinery those questions require. The **key** names the capability; the
@@ -69,14 +69,16 @@ sets:
     scan_any:   first_secret     # -> one pattern id + where it starts
     scan_all:   secret_kinds     # -> every pattern matching somewhere
     find:       scan_secrets     # -> the matches at the next matching position
+    find_batch: scan_secrets_batch # -> the same, several positions per call
     overlapping: false           # optional; see "Overlap policy" below
     patterns:   all
     emit_name_map: true
 ```
 
 The grid: `match_*` is anchored, `scan_*` is not; bare is a boolean, `_any` is
-one arbitrary matching pattern, `_all` is every matching pattern. `find` is the
-only capability that reports positions and extents.
+one arbitrary matching pattern, `_all` is every matching pattern. `find` and
+`find_batch` are the only capabilities that report positions and extents; they
+report the same matches and differ only in how many positions one call covers.
 
 At least one capability must be declared. Every capability value must be a
 valid identifier in all six stub languages (see
@@ -87,7 +89,9 @@ valid identifier in all six stub languages (see
 > parsing and silently changes capability — no parsing policy can catch that,
 > because the key stays valid. If you want the old meaning, use `match_any:`.
 > The retired keys `find_any`, `find_all` and `batch_size` are caught loudly:
-> config parsing is strict, so they fail as unknown-field errors.
+> config parsing is strict, so they fail as unknown-field errors. `batch_size`
+> is retired for good: batching is now `find_batch`, and its buffer is sized by
+> the CALLER at run time rather than by a compile-time knob.
 
 ### What "anchored" means here
 
@@ -117,6 +121,99 @@ The order of the matches *within* one call is unspecified — not by pattern id,
 not by extent, not stable across compiler versions. Sort what you collect if
 you need a specific order.
 
+### `find_batch` — the same matches, several positions per call
+
+```
+find_batch(input, cursor, buffer) -> as many matches as the buffer holds,
+                                     plus a cursor to resume from
+```
+
+`find` returns one position per call, which is the right shape for a caller who
+may stop early: nothing is computed for matches you never ask for. That costs
+one host-boundary crossing per position, and on a dense input the crossings
+dominate.
+
+`find_batch` makes the opposite trade. One call fills the caller's buffer with
+the matches of as many CONSECUTIVE positions as fit, so a caller who intends to
+consume everything crosses the boundary once per bufferful. It reports exactly
+the same matches, in the same order, under the same overlap policy.
+
+They are independent capabilities: declare either, both, or neither. Declaring
+both emits two separate bodies over shared machinery — batching speculates, and
+a `find` caller must not be charged for speculation it discards.
+
+**Which to use.** `find` when you may stop early (first hit, a bounded number
+of results, a user-cancellable scan). `find_batch` when the whole scan will be
+consumed.
+
+#### The cursor
+
+The cursor is one `i64`, and it is **opaque**: pass back the value the previous
+call returned, unchanged. A first call passes `from << 32`. Only two things
+about it are public:
+
+| field | meaning |
+|---|---|
+| bits 63..32 | `0xFFFFFFFF` means the scan is finished — otherwise this is internal |
+| low `<SET>_BATCH_COUNT_BITS` | `count` — how many tuples of the buffer are valid |
+
+The done flag arrives on the **same call that delivers the final matches**, so
+a finished scan costs no extra call. `count` is needed alongside it because the
+last call is normally a partial fill and the buffer is reused: the slots past
+`count` still hold tuples from the previous call.
+
+`0xFFFFFFFF` rather than `0` is the sentinel because **0 is a legal resume
+position** — a first call whose buffer fills on the matches at position 0 must
+resume at 0.
+
+#### The buffer is the caller's
+
+There is no `batch_size` config key. **You allocate the buffer and hand it to
+each scan**, because only you know whether you will consume everything, and how
+many scans you are about to do. Its length is the batch size:
+
+```rust
+let mut buf = vec![[0i32; 3]; 4096];       // once
+for doc in docs {
+    for m in rx::scan_secrets_batch(doc, 0, &mut buf) { ... }   // allocates nothing
+}
+```
+
+```go
+buf := make([]rx.SetTuple, 4096)           // once
+for _, doc := range docs {
+    for m := range rx.ScanSecretsBatch(doc, 0, buf) { ... }     // allocates nothing
+}
+```
+
+```c
+int buf[4096 * 3];                         /* once */
+rx_secrets_batch_scanner_t sc;
+scan_secrets_batch_init(&sc, 0, buf, 4096);
+while (scan_secrets_batch_next(&sc, input, len, &m)) { ... }
+```
+
+That is the whole reason the buffer is not stub-owned: `find_batch` exists to
+cut per-call overhead, and allocating one per scan would put overhead back at a
+different level. Rust, Go, AssemblyScript and C all reach zero allocations in
+the steady state. **JavaScript and TypeScript take a capacity number instead**
+(default 256) — their buffer lives inside WASM memory, so there is nothing for
+a JS caller to hand over.
+
+The gate array is *not* the caller's. Its length is `<SET>_ID_SPACE`, a
+compile-time constant, so it is not a size anyone chooses; the stubs keep
+owning it and it stays out of their public surface.
+
+**Any capacity of 1 or more makes progress.** A position whose matches do not
+all fit is delivered in part and resumed inside — an undersized buffer costs
+more calls, never a stall and never a lost match. (`find` is different: it is
+transactional, and an overflowing call writes nothing and asks you to grow the
+buffer.) The upper bound is `<SET>_BATCH_MAX_COUNT`; the module clamps to it,
+and a zero-length buffer yields nothing.
+
+Because tuples of one position can span two calls, group by the `start` field
+rather than by call boundary if you need per-position grouping.
+
 ### Overlap policy
 
 By default a set's `find` is **per-pattern non-overlapping**: each pattern
@@ -137,8 +234,9 @@ it is measurably faster to *emit* (no gating code at all) — but on greedy or
 unbounded-tail patterns it is quadratic in the input, because every start runs
 a DFA to its own extent. The default exists to avoid that.
 
-`overlapping` only affects `find`; declaring it on a set without `find:` is a
-load error.
+`overlapping` affects `find` and `find_batch` and nothing else. On a set
+declaring neither it is silently ignored — there is no find body for it to
+select, so it has no effect.
 
 The empty-match rule follows Go's: after a match ending at `e` the next match
 may start at `e`, except an empty match exactly at `e` is skipped; after an
@@ -156,7 +254,9 @@ inside the module:
 find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> i32
 ```
 
-- `gate_ptr` points at `patterns_in_set` u32s in the caller's memory.
+- `gate_ptr` points at `id_space_size` u32s in the caller's memory — the array
+  is indexed by global pattern id, so it is sized from the id space and not
+  from the pattern count (see the constants table below).
 - **All zeros means a clean scan.** That is the only operation a caller ever
   performs on it: the encoding is opaque and will change.
 - WASM reads and writes it. Zeroing it restarts a scan; keeping it across calls
@@ -173,6 +273,14 @@ array held inside the module would silently carry gates from an earlier scan
 into a caller that meant to start fresh.
 
 With `overlapping: true` there is no gate array and no gate parameter at all.
+
+`find_batch` carries the same gate array as `find` when gated, and none when
+overlapping. It differs in one respect, and only internally: it records gates
+for the matches it DELIVERED rather than only for a position that fitted whole.
+That is what lets it resume inside a split position — the patterns already
+handed to you are gated out, so re-entering the position yields exactly the
+remainder. Callers see no difference; `find`'s transactional rule above is
+unchanged.
 
 ## What each capability costs
 
@@ -235,7 +343,7 @@ and they are not interchangeable:
 
 | constant | value | sizes |
 |---|---|---|
-| `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`) |
+| `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`), and the width of the `find_batch` cursor's `k` field |
 | `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array, the `_all` bitmask/bitmap, and which `_all` ABI is exported |
 
 For `patterns: all` — the common case — the two are equal. They diverge only

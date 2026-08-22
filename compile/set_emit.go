@@ -24,6 +24,20 @@ type compiledSet struct {
 	scanAny  string // non-anchored, (start<<32)|id, or -1
 	scanAll  string // non-anchored, bitmask / bitmap of ids
 	find     string // non-anchored, tuples at the next matching position
+	// findBatch is the §19 multi-position export. Independent of find.
+	findBatch string
+	// patternCount is the worst-case number of tuples at ONE position, and
+	// therefore how many bits the §19 cursor reserves for its intra-position
+	// index. It is the same quantity the stubs know as <SET>_PATTERN_COUNT.
+	patternCount int
+	// batchPos is a transient emission flag: while it is set, the shared find
+	// emitters build the batch per-position WORKER rather than the exported
+	// `find` body. Set and cleared around one emitSetMatchFnFinal call by
+	// emitSetBatchPosBody; never read outside emission.
+	batchPos bool
+	// suffixHasSkip mirrors SetSpec.suffixNeedsSkip: the tuple-writing suffix
+	// functions carry a trailing `skip` parameter.
+	suffixHasSkip bool
 
 	// overlapping selects the ungated `find` body (§3.15 / D10). The default
 	// (false) is the gated, per-pattern non-overlapping body.
@@ -184,11 +198,14 @@ func (cs *compiledSet) capFns() []setCapFn {
 		scanAllType = setTypeI32x4ToI32
 	}
 	findType := byte(setTypeI32x6ToI32)
+	batchType := byte(setTypeBatchGated)
 	if cs.overlapping {
 		findType = setTypeI32x5ToI32
+		batchType = setTypeBatchUngated
 	}
 	all := []setCapFn{
 		{cs.find, capFind, findType},
+		{cs.findBatch, capFindBatch, batchType},
 		{cs.scan, capScan, setTypeI32x3ToI32},
 		{cs.scanAny, capScanAny, setTypeI32x3ToI64},
 		{cs.scanAll, capScanAll, scanAllType},
@@ -208,13 +225,15 @@ func (cs *compiledSet) capFns() []setCapFn {
 // funcCount returns the number of WASM functions contributed by this compiled set:
 // one per declared capability, plus the per-bucket suffix, prefix and probe helpers.
 func (cs *compiledSet) funcCount() int {
-	return len(cs.capFns()) + cs.numSuffixFns + len(cs.prefixFnBodies) +
+	return len(cs.capFns()) + cs.hiddenFnCount() + cs.numSuffixFns + len(cs.prefixFnBodies) +
 		len(cs.scanProbeBodies) + len(cs.scanProbeAnyBodies) + len(cs.anchoredProbeBodies)
 }
 
 // suffixFnBaseOffset returns the index of the first suffix function within this
 // set's functions (relative to the set's base).
-func (cs *compiledSet) suffixFnBaseOffset() int { return len(cs.capFns()) }
+func (cs *compiledSet) suffixFnBaseOffset() int {
+	return len(cs.capFns()) + cs.hiddenFnCount()
+}
 
 // prefixFnBaseOffset returns the index of the first backward-prefix function.
 func (cs *compiledSet) prefixFnBaseOffset() int {
@@ -249,12 +268,39 @@ const (
 	setTypeI32x3ToI64  = 7 // (i32,i32,i32)→i64  scan_any; scan_all <= 64 patterns
 	setTypeI32x6ToI32  = 8 // (i32×6)→i32        find, gated (default)
 	setTypeSuffixGated = 9 // (i32×8)→i32        suffix DFA with a gate pointer
+
+	// §19 find_batch. The cursor is an i64 in and an i64 out: the value the
+	// export returns is passed back verbatim as the next call's cursor.
+	setTypeBatchGated   = 10 // (i32,i32,i64,i32,i32,i32)→i64  find_batch, gated
+	setTypeBatchUngated = 11 // (i32,i32,i64,i32,i32)→i64      find_batch, overlapping
 )
+
+// batchPosFnOffset returns the index of the set's hidden per-position batch
+// worker, or -1 when the set declares no find_batch. It sits immediately after
+// the exported capability functions.
+func (cs *compiledSet) batchPosFnOffset() int {
+	if cs.findBatch == "" {
+		return -1
+	}
+	return len(cs.capFns())
+}
+
+// hiddenFnCount is how many non-exported functions the set contributes between
+// its capability functions and its suffix functions.
+func (cs *compiledSet) hiddenFnCount() int {
+	if cs.findBatch == "" {
+		return 0
+	}
+	return 1
+}
 
 // gatedFind reports whether this set emits the default (per-pattern
 // non-overlapping) `find` body, which threads a gate array through the suffix
 // functions (plans/SETS.md §3.14-3.16).
-func (cs *compiledSet) gatedFind() bool { return cs.find != "" && !cs.overlapping }
+func (cs *compiledSet) gatedFind() bool { return cs.hasFind() && !cs.overlapping }
+
+// hasFind reports whether either position-reporting capability is declared.
+func (cs *compiledSet) hasFind() bool { return cs.find != "" || cs.findBatch != "" }
 
 // setMatchTypeMatch is kept as the historical alias for the ungated find
 // signature, which the per-pattern batch wrappers also reuse.
@@ -272,6 +318,9 @@ type SetSpec struct {
 	ScanAny  string
 	ScanAll  string
 	Find     string
+	// FindBatch is the multi-position sibling of Find (plans/SETS.md §19).
+	// Independent of it: either, both or neither may be declared.
+	FindBatch string
 
 	Overlapping bool // §3.15 / D10: true = ungated `find` body
 
@@ -284,9 +333,46 @@ type SetSpec struct {
 	// directly (rather than from a config) get.
 	IDSpaceSize int
 
+	// DeclaredPatternCount is config.SetConfig.PatternCount — the number of
+	// patterns the set SELECTS, before any are dropped for carrying captures
+	// or exceeding the state limit. It sizes the stubs' tuple buffer, and with
+	// it the §19 cursor's k field, so it must be the DECLARED count both sides
+	// can compute rather than the surviving one only the compiler sees
+	// (the plans/SETS.md §11 R1 hazard). Zero means "use the resolved count",
+	// which is what the internal harnesses building a SetSpec directly get.
+	DeclaredPatternCount int
+
 	Patterns   []*PatternInfo // resolved, capture-bearing dropped
 	PatternIDs []int          // global indices into the regexps list
 }
+
+// patternCount is the count the §19 cursor and the stubs' buffer are sized
+// from: the declared one when the caller supplied it.
+func (s SetSpec) patternCount() int {
+	if s.DeclaredPatternCount > 0 {
+		return s.DeclaredPatternCount
+	}
+	return len(s.Patterns)
+}
+
+// HasFind reports whether the set declares either position-reporting
+// capability. Both need the tuple-writing suffix functions and both are
+// affected by Overlapping; nothing else is.
+func (s SetSpec) HasFind() bool { return s.Find != "" || s.FindBatch != "" }
+
+// gated reports whether the set's find bodies carry a gate array.
+func (s SetSpec) gated() bool { return s.HasFind() && !s.Overlapping }
+
+// suffixNeedsSkip reports whether the tuple-writing suffix functions carry the
+// §19 `skip` parameter. Only the OVERLAPPING batch body needs it: the gated
+// one resumes a split position through the gate array instead, since the
+// tuples it already delivered have gates recorded for them and the §3.16
+// pre-mask therefore excludes exactly those patterns on re-entry.
+//
+// The parameter is added for every caller of the suffix function once it
+// exists, not just the batch body — `find` passes a constant 0. One extra
+// argument and one signed compare, on the tuple-write path only.
+func (s SetSpec) suffixNeedsSkip() bool { return s.FindBatch != "" && s.Overlapping }
 
 // needsScanProbes reports whether the set declares one of the non-anchored
 // capabilities other than `find`. Those answer "which patterns match here?"
@@ -394,9 +480,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// Build suffix DFA function bodies, one per bucket.
 	// The suffix DFA now writes match tuples directly (Option C); no startMask needed.
 	needScanProbes := spec.needsScanProbes()
-	gatedFind := spec.Find != "" && !spec.Overlapping
+	gatedFind := spec.gated()
 	var suffixFnBodies [][]byte
-	if spec.Find != "" {
+	if spec.HasFind() {
 		suffixFnBodies = make([][]byte, len(buckets))
 	}
 	var scanProbeBodies [][]byte
@@ -418,7 +504,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// The last is what §18.4 asks to be asserted here rather than inherited:
 	// buildUnionScanDFA refuses such sets, so they would get the table and the
 	// per-byte check with no preflight to make it fire.
-	needLiveness := (spec.ScanAny != "" || (spec.Find != "" && !spec.Overlapping)) && fe == frontendScalar
+	needLiveness := (spec.ScanAny != "" || spec.gated()) && fe == frontendScalar
 	if needLiveness {
 		anyNeverDying, anyBoundary := false, false
 		for _, bkt := range buckets {
@@ -466,7 +552,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// answer their question from the bitmask probe instead. A set that does
 	// not declare `find` therefore emits no suffix FUNCTIONS at all — only
 	// their DFA tables, which the probes share.
-	needSuffixFns := spec.Find != ""
+	needSuffixFns := spec.HasFind()
 	// Suffix-table dedup (plans/SETS.md §14 P7). Buckets very often share a
 	// suffix: `kw%03d[0-9a-z]{3}` gives every pattern its own literal and its
 	// own bucket, but one identical `[0-9a-z]{3}` table, re-emitted once per
@@ -497,7 +583,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], needScanProbes, gatedFind, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness)
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], needScanProbes, gatedFind, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
 		if needSuffixFns {
 			suffixFnBodies[bi] = art.fnBody
 		}
@@ -614,6 +700,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// Node ids are u16 in the goto table. Compression can fit far more
 		// nodes than the id space addresses (see acMaxNodes), so this is
 		// checked alongside the budget rather than assumed away.
+		acOutputs := acTotalOutputs(ac)
 		if len(ac.nodes) > acMaxNodes {
 			fe = frontendScalar
 			diag.FrontendDemotion = &FrontendDemotionDiag{
@@ -624,6 +711,24 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 					"literals":  len(lits),
 					"ac_nodes":  len(ac.nodes),
 					"max_nodes": acMaxNodes,
+				},
+			}
+		} else if acOutputs > acMaxOutputs {
+			// Output OFFSETS are u16 too, and they are bounded by the
+			// propagated output count rather than by the node count — a nested
+			// literal family reaches the offset limit from a few hundred nodes
+			// (see acMaxOutputs). Passing acMaxNodes and acBudgetBytes says
+			// nothing about this one, so it gets its own arm.
+			fe = frontendScalar
+			diag.FrontendDemotion = &FrontendDemotionDiag{
+				From:   frontendAC.String(),
+				To:     frontendScalar.String(),
+				Reason: "ac_outputs_exceed_u16",
+				Detail: map[string]interface{}{
+					"literals":    len(lits),
+					"ac_nodes":    len(ac.nodes),
+					"ac_outputs":  acOutputs,
+					"max_outputs": acMaxOutputs,
 				},
 			}
 		} else if cand.bytes() <= opts.acBudgetBytes() {
@@ -761,6 +866,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		scanAny:             spec.ScanAny,
 		scanAll:             spec.ScanAll,
 		find:                spec.Find,
+		findBatch:           spec.FindBatch,
+		patternCount:        spec.patternCount(),
+		suffixHasSkip:       spec.suffixNeedsSkip(),
 		overlapping:         spec.Overlapping,
 		declaredIDSpace:     spec.IDSpaceSize,
 		suffixFnBodies:      suffixFnBodies,
@@ -859,6 +967,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		{"match", spec.Match}, {"match_any", spec.MatchAny}, {"match_all", spec.MatchAll},
 		{"scan", spec.Scan}, {"scan_any", spec.ScanAny}, {"scan_all", spec.ScanAll},
 		{"find", spec.Find},
+		{"find_batch", spec.FindBatch},
 	} {
 		if c.name != "" {
 			diag.Capabilities = append(diag.Capabilities, c.field)
@@ -1001,18 +1110,20 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 		}
 
 		spec := SetSpec{
-			Name:        sc.Name,
-			Match:       sc.Match,
-			MatchAny:    sc.MatchAny,
-			MatchAll:    sc.MatchAll,
-			Scan:        sc.Scan,
-			ScanAny:     sc.ScanAny,
-			ScanAll:     sc.ScanAll,
-			Find:        sc.Find,
-			Overlapping: sc.Overlapping,
-			IDSpaceSize: sc.IDSpaceSize(cfg),
-			Patterns:    infos,
-			PatternIDs:  globalIDs,
+			Name:                 sc.Name,
+			Match:                sc.Match,
+			MatchAny:             sc.MatchAny,
+			MatchAll:             sc.MatchAll,
+			Scan:                 sc.Scan,
+			ScanAny:              sc.ScanAny,
+			ScanAll:              sc.ScanAll,
+			Find:                 sc.Find,
+			FindBatch:            sc.FindBatch,
+			DeclaredPatternCount: sc.PatternCount(cfg),
+			Overlapping:          sc.Overlapping,
+			IDSpaceSize:          sc.IDSpaceSize(cfg),
+			Patterns:             infos,
+			PatternIDs:           globalIDs,
 		}
 		setOpts := CompileSetOptions{
 			// Set-level LikelyMode precedence: set hints > neutral.
@@ -1126,9 +1237,12 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// 6: (i32×4)→i32            bucket probe / bitmap-form _all
 	// 7: (i32×3)→i64            scan_any, scan_all (<= 64 patterns)
 	// 8: (i32×6)→i32            set find body, gated (default)
-	// 9: (i32×8)→i32            suffix DFA with a gate pointer
+	// 9: (i32×8)→i32            suffix DFA with a gate pointer; also the
+	//                            ungated suffix DFA carrying §19's `skip`
+	// 10: (i32,i32,i64,i32,i32,i32)→i64  find_batch, gated
+	// 11: (i32,i32,i64,i32,i32)→i64      find_batch, overlapping
 	typeSection := []byte{
-		0x0A,
+		0x0C,
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E, // type 1
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 2
@@ -1139,6 +1253,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 7
 		0x60, 0x06, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 8
 		0x60, 0x08, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 9
+		0x60, 0x06, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 10
+		0x60, 0x05, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x01, 0x7E, // type 11
 	}
 	out = appendSection(out, 1, typeSection)
 
@@ -1188,8 +1304,14 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, c := range cs.capFns() {
 			fs = append(fs, c.typeIdx)
 		}
+		// The hidden per-position batch worker. Gated it is `find`'s own
+		// signature; ungated it is that signature plus §19's `skip` — which
+		// is the same arity, so both are type 8.
+		if cs.findBatch != "" {
+			fs = append(fs, byte(setTypeI32x6ToI32))
+		}
 		suffixType := byte(setMatchTypeSuffix)
-		if cs.gatedFind() {
+		if cs.gatedFind() || cs.suffixHasSkip {
 			suffixType = setTypeSuffixGated
 		}
 		for range cs.suffixFnBodies {
@@ -1379,6 +1501,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			switch c.kind {
 			case capFind:
 				cs_bytes = append(cs_bytes, rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+			case capFindBatch:
+				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.batchPosFnOffset())...)
 			case capMatch, capMatchAny, capMatchAll:
 				cs_bytes = append(cs_bytes, emitSetAnchoredCapBody(cs, c.kind, anchoredProbeBase)...)
 			default:
@@ -1395,6 +1519,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				}
 				cs_bytes = append(cs_bytes, body...)
 			}
+		}
+		if cs.findBatch != "" {
+			cs_bytes = append(cs_bytes, emitSetBatchPosBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
 		}
 		for _, sfn := range cs.suffixFnBodies {
 			cs_bytes = append(cs_bytes, sfn...)

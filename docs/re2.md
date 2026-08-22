@@ -25,8 +25,8 @@ The `test` target chains ten single-pattern sub-targets — `exhaustive`, `custo
 `force-backtrack-likelynomatch` (the last three re-run the corpus under each
 `LikelyMode` to verify the mode never changes match correctness, only emitted
 code shape — see [prefer-hints.md](prefer-hints.md)), and `matchonly`,
-`findonly`, `groupsonly` — plus `sets`, which exercises the multi-pattern
-composition pipeline described in [sets.md](sets.md).
+`findonly`, `groupsonly` — plus `sets` and `set-batch`, which exercise the
+multi-pattern composition pipeline described in [sets.md](sets.md).
 
 The last three compile each pattern with only one of `match_func`,
 `find_func`, `groups_func` set. That is not redundant with the default
@@ -143,6 +143,16 @@ measured separately by `tools/setperf` and the fuel ladder in
 [plans/SETS.md](../plans/SETS.md) §14. See [sets.md](sets.md) for the exact frontend-selection
 rules. Set tests currently run
 clean with **0 failures**.
+
+### Batched sets (`make set-batch`)
+
+The same corpus, the same col4 oracle, driving `find_batch` instead of `find`
+at a buffer capacity of **one**. That capacity is the point: it makes every
+position with more than one match split, so the corpus exercises `find_batch`'s
+resume path — and with it the delivered-tuple gate rule of
+[plans/SETS.md](../plans/SETS.md) §19 — at every empty-match shape, anchor and
+extent it contains, rather than at the handful a hand-written test can think
+of. Also runs clean with **0 failures**.
 
 ---
 

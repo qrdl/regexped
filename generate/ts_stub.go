@@ -147,6 +147,13 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the find generator\n// can receive at most this many matches at one position.\nexport const %s: number = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: number = %d;\n\n", s.Name, idKonst, idN)
 
+		if s.FindBatch != "" {
+			fmt.Fprintf(&out, "// Width of the count field in set %q's find_batch cursor. The count is\n// packed & ((1n << BigInt(bits)) - 1n); the scan is finished when the top 32\n// bits of the cursor are all ones. Only a direct WASM caller needs this — the\n// generated iterator decodes the cursor for you.\nexport const %s: number = %d;\n\n",
+				s.Name, camelSet(s.Name)+"BatchCountBits", cursorCountBits(s, cfg))
+			fmt.Fprintf(&out, "// Largest tuple count one find_batch call can report for set %q. The module\n// clamps out_cap to it.\nexport const %s: number = %d;\n\n",
+				s.Name, camelSet(s.Name)+"BatchMaxCount", cursorMaxCount(s, cfg))
+		}
+
 		if s.Match != "" {
 			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): boolean {
     const len = _w(input);
@@ -255,6 +262,45 @@ func genTSSetSection(cfg config.BuildConfig) string {
     }
 }
 `, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst)
+		}
+		if s.FindBatch != "" {
+			// Sized at RUNTIME from the caller's capacity, so the reserve and
+			// the gate base above the buffer are computed in the generator.
+			gateSetup, gateArg := "", ""
+			if gatedFind(s) {
+				gateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*capacity;
+    new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
+`, idKonst)
+				gateArg = "gateBase, "
+			}
+			fmt.Fprintf(&out, `// Yields the set's matches a BUFFERFUL at a time: one WASM call per capacity
+// matches instead of one per position. Same matches in the same order as the
+// unbatched find. Prefer this when the whole scan will be consumed; prefer
+// find when you may stop early, since a batch call does the work for matches
+// you never look at. capacity is clamped into [1, %d].
+export function* %s(input: string | Uint8Array, from: number = 0, capacity: number = %d): Generator<SetMatch> {
+    capacity = Math.min(Math.max(capacity | 0, 1), %d);
+    const len = _w(input, 12*capacity + %d);
+%s    let cursor = BigInt(from) << 32n;
+    const buf = new Int32Array(_mem.buffer, _outBase, 3*capacity);
+    while (true) {
+        const packed = (_exp['%s'] as Function)(_inBase, len, cursor, %s_outBase, capacity) as bigint;
+        // The cursor is opaque: hand it back unchanged. Only its top 32 bits
+        // are public — all ones means the scan is finished, and that arrives
+        // on the same call as the last matches.
+        const n = Number(packed & %dn);
+        const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;
+        for (let i = 0; i < n; i++) {
+            yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
+        }
+        // A call reports at least one match unless the scan is over.
+        if (done || n === 0) break;
+        cursor = packed;
+    }
+}
+`, cursorMaxCount(s, cfg), s.FindBatch, defaultBatchCap(s, cfg),
+				cursorMaxCount(s, cfg), 4*idN+bitmapBytes(s, cfg), gateSetup,
+				s.FindBatch, gateArg, cursorCountMask(s, cfg))
 		}
 		out.WriteString("\n")
 	}

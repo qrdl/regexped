@@ -28,8 +28,8 @@ type BuildConfig struct {
 
 // SetConfig describes one `sets:` entry in the YAML config.
 //
-// The seven capability fields form a 2x3 grid plus `find` (plans/SETS.md
-// §3.12).  The KEY names the capability; the VALUE is the WASM export /
+// The eight capability fields form a 2x3 grid plus `find` and `find_batch`
+// (plans/SETS.md §3.12, §19).  The KEY names the capability; the VALUE is the WASM export /
 // generated-function name the user picks.
 //
 //	match_*  — anchored: the match must span the whole input (0..len).
@@ -37,8 +37,10 @@ type BuildConfig struct {
 //	bare     — boolean answer.
 //	_any     — one arbitrary matching pattern id (a set is unordered, §3.5).
 //	_all     — every matching pattern id.
-//	find     — the only capability reporting positions and extents, and the
-//	           only one `overlapping` affects.
+//	find      — reports positions and extents, one position per call.
+//	find_batch — the same information, several positions per call, resumed
+//	           through an opaque cursor.  `overlapping` affects these two and
+//	           nothing else.
 type SetConfig struct {
 	Name string `yaml:"name"` // set name; must be unique within the file
 
@@ -49,6 +51,14 @@ type SetConfig struct {
 	ScanAny  string `yaml:"scan_any"`  // non-anchored, (start<<32)|id, or -1
 	ScanAll  string `yaml:"scan_all"`  // non-anchored, bitmask / bitmap of ids
 	Find     string `yaml:"find"`      // non-anchored, tuples at the next matching position
+
+	// FindBatch is `find`'s amortised sibling: one call fills the caller's
+	// buffer with the matches of SEVERAL consecutive positions and returns an
+	// opaque cursor to resume from (plans/SETS.md §19). It is an independent
+	// capability — declaring it does not imply `find`, and vice versa — and it
+	// is emitted as a separate body, because a `find` caller may stop early
+	// and must not pay for lookahead it never consumes.
+	FindBatch string `yaml:"find_batch"`
 
 	// Overlapping selects which `find` body is emitted (plans/SETS.md
 	// §3.15, D10/D11). Absent or false (the DEFAULT) emits the gated body:
@@ -88,6 +98,7 @@ func (s SetConfig) Capabilities() []SetCapability {
 		{"scan_any", s.ScanAny},
 		{"scan_all", s.ScanAll},
 		{"find", s.Find},
+		{"find_batch", s.FindBatch},
 	}
 	out := all[:0:0]
 	for _, c := range all {
@@ -105,7 +116,14 @@ func (s SetConfig) HasExports() bool { return len(s.Capabilities()) > 0 }
 // non-overlapping) `find` body, which threads a caller-owned gate array
 // through the suffix functions (plans/SETS.md §3.14-3.16). A set without
 // `find:` gates nothing.
-func (s SetConfig) Gated() bool { return s.Find != "" && !s.Overlapping }
+func (s SetConfig) Gated() bool {
+	return (s.Find != "" || s.FindBatch != "") && !s.Overlapping
+}
+
+// HasFind reports whether the set declares either position-reporting
+// capability. `overlapping` is meaningful only for these two, and only they
+// emit the tuple-writing suffix functions.
+func (s SetConfig) HasFind() bool { return s.Find != "" || s.FindBatch != "" }
 
 // SanitizeSetName turns a set name into an identifier stem for the constants
 // and types the stubs emit for it (<SET>_PATTERN_COUNT, <SET>_ID_SPACE, C's
@@ -187,6 +205,35 @@ func (s SetConfig) IDSpaceSize(cfg BuildConfig) int {
 		}
 	}
 	return max + 1
+}
+
+// SetCursorKBits returns how many bits the §19 find_batch cursor reserves for
+// its intra-position resume index, for a set of patternCount patterns: the
+// smallest width holding every value in [0, patternCount].
+//
+// It lives here, next to IDSpaceSize and for the same reason (plans/SETS.md §11
+// R1): the compiler encodes the cursor and all six stub generators decode it,
+// so the layout must have ONE definition both sides call rather than two that
+// can drift.
+//
+// Capped at 24 so count keeps at least 8 bits. A set with more than 16M
+// patterns is pathological, and the cap costs a shorter batch rather than a
+// count that overflows into the k field.
+func SetCursorKBits(patternCount int) int {
+	kb := 0
+	for kb < 24 && (1<<uint(kb)) <= patternCount {
+		kb++
+	}
+	return kb
+}
+
+// SetCursorCountBits is the width of the find_batch cursor's count field.
+func SetCursorCountBits(patternCount int) int { return 32 - SetCursorKBits(patternCount) }
+
+// SetCursorMaxCount is the largest tuple count one find_batch call can report.
+// The emitted body clamps out_cap to it.
+func SetCursorMaxCount(patternCount int) int32 {
+	return int32(uint32(1)<<uint(SetCursorCountBits(patternCount))) - 1
 }
 
 // PatternSelector selects patterns for a set. It can be the scalar string "all"
@@ -284,8 +331,10 @@ func validateHints(cfg *BuildConfig) error {
 
 // ValidateSets validates the `sets:` block against the `regexps:` list.
 // Returns an error if any set name is not unique, any pattern reference is
-// unknown, a set entry declares none of the seven capabilities, `overlapping`
-// is set on a set without `find`, or patterns is empty.
+// unknown, a set entry declares none of the eight capabilities, or patterns is
+// empty. `overlapping` on a set with neither `find` nor `find_batch` is
+// ignored, not rejected — it selects between two find bodies, and with no find
+// body it simply has no effect.
 func ValidateSets(cfg *BuildConfig) error {
 	// Build name → index map.
 	nameIdx := make(map[string]int, len(cfg.Regexps))
@@ -320,6 +369,13 @@ func ValidateSets(cfg *BuildConfig) error {
 				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
 			}
 			exportNames[name] = owner
+			// Reserve the name the "batch-find" hint would synthesize for this
+			// entry, so a later set capability cannot silently claim it. This
+			// is why set names ending in "_batch" no longer need a blanket ban:
+			// only the names that can actually collide are taken, which leaves
+			// `find_batch: my_find_batch` — the obvious name for the §19
+			// capability — available.
+			exportNames[name+"_batch"] = owner + " (batch export)"
 		}
 	}
 	for _, s := range cfg.Sets {
@@ -343,17 +399,15 @@ func ValidateSets(cfg *BuildConfig) error {
 		setStems[stem] = s.Name
 		caps := s.Capabilities()
 		if len(caps) == 0 {
-			return fmt.Errorf("set %q: at least one of match, match_any, match_all, scan, scan_any, scan_all, or find must be set", s.Name)
+			return fmt.Errorf("set %q: at least one of match, match_any, match_all, scan, scan_any, scan_all, find, or find_batch must be set", s.Name)
 		}
-		if s.Overlapping && s.Find == "" {
-			return fmt.Errorf("set %q: overlapping only affects find, which this set does not declare", s.Name)
-		}
+		// `overlapping` on a set declaring neither find nor find_batch is
+		// silently IGNORED rather than rejected: it selects between two find
+		// bodies, and with no find body to select it simply has no effect.
+		// Rejecting it made a harmless key a build failure.
 		owner := fmt.Sprintf("set %q", s.Name)
 		for _, c := range caps {
 			name := c.Name
-			if strings.HasSuffix(name, "_batch") {
-				return fmt.Errorf("%s: export name %q must not end in \"_batch\" (reserved for the compiler-synthesized batch export)", owner, name)
-			}
 			if prior, dup := exportNames[name]; dup {
 				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
 			}

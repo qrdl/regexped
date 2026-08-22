@@ -1183,7 +1183,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	// where `len` is the caller's full input, not a find-pass-narrowed match
 	// end; see plans/FUZZER_BUGS.md §10.2.)
 	b = append(b, 0x20, byte(localState))
-	b = append(b, 0x45) // i32.eqz
+	b = append(b, 0x45)       // i32.eqz
 	b = append(b, 0x04, 0x40) // if state==0 (void)
 	if hasMidAccept {
 		b = append(b, 0x20, byte(localLastAcceptPos))

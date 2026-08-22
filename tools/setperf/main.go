@@ -129,6 +129,12 @@ const (
 	capScanAny  capability = "scan_any"
 	capScanAll  capability = "scan_all"
 	capFind     capability = "find"
+	// capFindBatch is §19's multi-position find. It is the row that makes the
+	// `find` comparison an honest one: ra_bench_find_gated runs its WHOLE
+	// enumeration inside ONE wasm call, while our `find` crosses the host
+	// boundary once per position. find_batch crosses once per BUFFERFUL, so
+	// the two sides finally differ by engine work rather than by call count.
+	capFindBatch capability = "find_batch"
 	// capFindOverlapping is the ungated `find`. regex-automata has no
 	// equivalent — per-start-position enumeration is not a search it can
 	// express — so it is measured but never compared.
@@ -138,8 +144,13 @@ const (
 var allCaps = []capability{
 	capMatch, capMatchAny, capMatchAll,
 	capScan, capScanAny, capScanAll,
-	capFind, capFindOverlapping,
+	capFind, capFindBatch, capFindOverlapping,
 }
+
+// batchCap is the tuple buffer the find_batch row is driven with, in matches.
+// It is the default the generated stubs pick, so the row measures what a stub
+// user actually gets rather than a best case tuned for the benchmark.
+const batchCap = 256
 
 // exportName is the WASM export each capability is compiled under.
 func exportName(c capability) string {
@@ -168,6 +179,11 @@ func raPairing(c capability) string {
 		// plans/SETS.md §9.6.1 oracle. regex-automata's own multi-pattern
 		// find_iter is SET-WIDE non-overlapping while our gated find is
 		// PER-PATTERN; pairing those directly would be confidently wrong.
+		return "ra_bench_find_gated"
+	case capFindBatch:
+		// The same pairing as `find`, and the fair one: both sides now make
+		// O(matches / buffer) host crossings instead of one side making O(1)
+		// and the other O(matches).
 		return "ra_bench_find_gated"
 	}
 	return ""
@@ -372,6 +388,7 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 		ScanAny:     "cap_scan_any",
 		ScanAll:     "cap_scan_all",
 		Find:        "cap_find",
+		FindBatch:   "cap_find_batch",
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
@@ -388,6 +405,7 @@ type rxInstance struct {
 	outPtr   int32
 	gatePtr  int32
 	bitmapPt int32
+	batchPtr int32
 	npat     int32
 	inLen    int32
 	// fnCache holds resolved exports. Resolving inside the timed loop meant
@@ -445,7 +463,9 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	outPtr := inBase + span
 	gatePtr := outPtr + npat*12
 	bitmapPt := gatePtr + npat*4
-	top := int64(bitmapPt) + int64(npat)/8 + 4096
+	// The batch buffer sits above the bitmap, 4 KB clear of it.
+	batchPtr := bitmapPt + int32(npat)/8 + 4096
+	top := int64(batchPtr) + int64(batchCap)*12 + 4096
 	needed := uint64((top + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -457,7 +477,8 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	return &rxInstance{
 		store: store, inst: inst, mem: mem,
 		inBase: inBase, outPtr: outPtr, gatePtr: gatePtr, bitmapPt: bitmapPt,
-		npat: npat, inLen: int32(len(c.input)),
+		batchPtr: batchPtr,
+		npat:     npat, inLen: int32(len(c.input)),
 	}, nil
 }
 
@@ -515,6 +536,8 @@ func (r *rxInstance) call(c capability, wide bool) (int, error) {
 		return 1, err
 	case capFind:
 		return r.exhaustFind(fn, true)
+	case capFindBatch:
+		return r.exhaustFindBatch(fn, true)
 	case capFindOverlapping:
 		return r.exhaustFind(fn, false)
 	}
@@ -551,6 +574,43 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 		start := int32(binary.LittleEndian.Uint32(buf[int(r.outPtr)+4:]))
 		runtime.KeepAlive(r.store)
 		from = start + 1
+	}
+}
+
+// exhaustFindBatch drives `find_batch` to exhaustion the way a generated batch
+// iterator does: start from cursor 0, hand the previous return value back
+// unchanged, stop when its top 32 bits are all ones.
+//
+// The count field is not decoded here. The driver only needs to know when to
+// stop, and reading the tuples would add harness work to a timed loop that is
+// meant to measure the engine.
+func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error) {
+	if gated {
+		buf := r.mem.UnsafeData(r.store)
+		for i := int32(0); i < r.npat*4; i++ {
+			buf[r.gatePtr+i] = 0
+		}
+		runtime.KeepAlive(r.store)
+	}
+	cursor := int64(0)
+	calls := 0
+	for {
+		var res interface{}
+		var err error
+		calls++
+		if gated {
+			res, err = fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap))
+		} else {
+			res, err = fn.Call(r.store, r.inBase, r.inLen, cursor, r.batchPtr, int32(batchCap))
+		}
+		if err != nil {
+			return calls, err
+		}
+		packed := res.(int64)
+		if uint32(packed>>32) == 0xFFFFFFFF {
+			return calls, nil
+		}
+		cursor = packed
 	}
 }
 
@@ -1003,10 +1063,20 @@ func runCompare(path string, cases []setCase, measure func(setCase) []row, unit 
 			want, ok := base[r.key]
 			if !ok {
 				if r.value == fuelExhausted {
+					// printRows deliberately emits no line for a row over the
+					// budget, so its absence is the expected state and not a
+					// gap in coverage.
 					fmt.Fprintf(os.Stderr, "  %s: exceeds the fuel budget, no baseline (expected)\n", r.key)
-				} else {
-					fmt.Fprintf(os.Stderr, "  no baseline for %q\n", r.key)
+					continue
 				}
+				// Any other missing row IS a failure. This gate exists to
+				// prove every measured row is unchanged; a row with nothing to
+				// compare against was not checked, and letting it pass meant
+				// an empty or stale baseline file could report success while
+				// checking almost nothing.
+				fmt.Fprintf(os.Stderr, "UNCHECKED %s: no baseline row (current=%d %s); re-run `make baseline` if the row is new\n",
+					r.key, r.value, unit)
+				bad++
 				continue
 			}
 			if r.value == fuelExhausted {
@@ -1066,6 +1136,54 @@ func runVerify(cases []setCase) int {
 		}
 		wide := r.npat > 64
 
+		// The anchored trio. regex-automata's Anchored::Yes over the whole
+		// haystack is exactly our `match` contract, and Anchored::Pattern(k)
+		// per pattern is exactly `match_all`'s, so both are honest pairings —
+		// they were simply never wired up here, which left four of the seven
+		// capabilities resting on `make sets` alone.
+		//
+		// Driven at several PREFIX LENGTHS rather than only at the full input.
+		// Both sides take the haystack length as a parameter, so this costs no
+		// restaging — and it is what makes the check bite. The corpora are
+		// 100 KB scan haystacks, so "does a pattern match the whole thing" is
+		// no on 22 of the 23 rows; comparing only that would be a check that
+		// agrees because both sides say no, which is the failure mode this
+		// whole block exists to fix. Short prefixes reach the anchored
+		// automaton's real answers, and length 0 covers the empty input.
+		anchoredMatches := 0
+		for _, n := range anchoredLens(len(c.input)) {
+			theirMatch := raCallI32(ra, "ra_match", int32(n))
+			ourMatch := rxCallI32(r, "cap_match", r.inBase, int32(n))
+			if (theirMatch != 0) != (ourMatch != 0) {
+				fmt.Printf("MISMATCH %s/%s match@%d: ours=%d theirs=%d\n", c.name, c.inputLbl, n, ourMatch, theirMatch)
+				bad++
+			}
+			if theirMatch != 0 {
+				anchoredMatches++
+			}
+
+			// match_all: exact set equality, and the oracle for match_any.
+			theirMatchIDs := raAllIDs(ra, "ra_match_all", int32(n))
+			ourMatchIDs := rxAllIDs(r, wide, "cap_match_all", int32(n))
+			if !sameIDs(theirMatchIDs, ourMatchIDs) {
+				fmt.Printf("MISMATCH %s/%s match_all@%d: ours=%v theirs=%v\n", c.name, c.inputLbl, n, ourMatchIDs, theirMatchIDs)
+				bad++
+			}
+
+			// match_any: which id you get is unspecified when several patterns
+			// match the whole input, so presence is the hard contract — but
+			// unlike scan_any the id DOES have an oracle here, since
+			// match_all's set is every legal answer.
+			ourMatchAny := rxCallI32(r, "cap_match_any", r.inBase, int32(n))
+			if (ourMatchAny >= 0) != (theirMatch != 0) {
+				fmt.Printf("MISMATCH %s/%s match_any@%d presence: ours=%d theirs=%d\n", c.name, c.inputLbl, n, ourMatchAny, theirMatch)
+				bad++
+			} else if ourMatchAny >= 0 && !containsID(theirMatchIDs, int(ourMatchAny)) {
+				fmt.Printf("MISMATCH %s/%s match_any@%d id: ours=%d, not in theirs=%v\n", c.name, c.inputLbl, n, ourMatchAny, theirMatchIDs)
+				bad++
+			}
+		}
+
 		// scan: a boolean, directly comparable.
 		theirScan := raCallI32(ra, "ra_scan", int32(len(c.input)), 0)
 		ourScan := rxCallI32(r, "cap_scan", r.inBase, r.inLen, 0)
@@ -1090,13 +1208,49 @@ func runVerify(cases []setCase) int {
 		}
 
 		// scan_all: exact set equality.
-		theirIDs := raScanAllIDs(ra, int32(len(c.input)))
-		ourIDs := rxScanAllIDs(r, wide)
+		theirIDs := raAllIDs(ra, "ra_scan_all", int32(len(c.input)), int32(0))
+		ourIDs := rxAllIDs(r, wide, "cap_scan_all", r.inLen, int32(0))
 		if !sameIDs(theirIDs, ourIDs) {
 			fmt.Printf("MISMATCH %s/%s scan_all: ours=%v theirs=%v\n", c.name, c.inputLbl, ourIDs, theirIDs)
 			bad++
 		}
-		fmt.Printf("ok   %s/%s\n", c.name, c.inputLbl)
+
+		// find (gated, the default body): ra_find_gated is the per-pattern
+		// merged find_iter — the same construction as the plans/SETS.md §9.6.1
+		// oracle, and the one raPairing already trusts for the fuel rows. This
+		// is the only capability here whose EXTENTS are checked, not just its
+		// ids, which is why leaving it out mattered.
+		ourFind := rxCollectFind(r)
+		if theirFind, complete := raFindGated(ra, int32(len(c.input))); !complete {
+			// The harness buffer is fixed, and ra_find_gated truncates rather
+			// than growing it. A truncated list is not a smaller answer, so
+			// comparing it would manufacture a mismatch.
+			fmt.Printf("SKIP %s/%s find: regex-automata output buffer full at %d tuples\n",
+				c.name, c.inputLbl, len(theirFind))
+		} else if !sameMatches(theirFind, ourFind) {
+			fmt.Printf("MISMATCH %s/%s find: ours=%d matches, theirs=%d\n",
+				c.name, c.inputLbl, len(ourFind), len(theirFind))
+			bad++
+		}
+
+		// find vs find_batch: the two are independent bodies over shared
+		// suffix functions and must report the identical multiset. The
+		// regex-automata pairing above bounds `find` itself; this one is
+		// internal because there is no pairing for the BATCHED shape, and it
+		// is what exercises §19's split-position resume, since batchCap is
+		// deliberately not "big enough for one call".
+		ourBatch := rxCollectFindBatch(r)
+		if !sameMatches(ourFind, ourBatch) {
+			fmt.Printf("MISMATCH %s/%s find vs find_batch: find=%d matches, batch=%d\n",
+				c.name, c.inputLbl, len(ourFind), len(ourBatch))
+			bad++
+		}
+
+		// The anchored hit count is printed, not just tallied: a row where no
+		// prefix matches proves only that both engines said no, and that is
+		// worth seeing rather than hiding behind "ok".
+		fmt.Printf("ok   %s/%s (anchored: %d/%d prefixes match, find: %d matches)\n",
+			c.name, c.inputLbl, anchoredMatches, len(anchoredLens(len(c.input))), len(ourFind))
 	}
 	if bad > 0 {
 		fmt.Printf("\n%d mismatch(es)\n", bad)
@@ -1104,6 +1258,113 @@ func runVerify(cases []setCase) int {
 	}
 	fmt.Println("\nregex-automata agrees on every honest pairing.")
 	return 0
+}
+
+// setTuple is one (pattern id, start, end) triple read back from a find or
+// find_batch buffer.
+type setTuple struct{ id, start, end int32 }
+
+// rxCollectFind drives the gated `find` to exhaustion and returns every tuple.
+func rxCollectFind(r *rxInstance) []setTuple {
+	fn := r.inst.GetFunc(r.store, "cap_find")
+	if fn == nil {
+		return nil
+	}
+	buf := r.mem.UnsafeData(r.store)
+	for i := int32(0); i < r.npat*4; i++ {
+		buf[r.gatePtr+i] = 0
+	}
+	runtime.KeepAlive(r.store)
+	var out []setTuple
+	from := int32(0)
+	for {
+		res, err := fn.Call(r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
+		if err != nil {
+			return out
+		}
+		n := res.(int32)
+		if n <= 0 {
+			return out
+		}
+		buf := r.mem.UnsafeData(r.store)
+		for i := int32(0); i < n && i < r.npat; i++ {
+			base := int(r.outPtr) + int(i)*12
+			out = append(out, setTuple{
+				int32(binary.LittleEndian.Uint32(buf[base:])),
+				int32(binary.LittleEndian.Uint32(buf[base+4:])),
+				int32(binary.LittleEndian.Uint32(buf[base+8:])),
+			})
+		}
+		start := int32(binary.LittleEndian.Uint32(buf[int(r.outPtr)+4:]))
+		runtime.KeepAlive(r.store)
+		from = start + 1
+	}
+}
+
+// rxCollectFindBatch drives `find_batch` to exhaustion and returns every tuple.
+func rxCollectFindBatch(r *rxInstance) []setTuple {
+	fn := r.inst.GetFunc(r.store, "cap_find_batch")
+	if fn == nil {
+		return nil
+	}
+	buf := r.mem.UnsafeData(r.store)
+	for i := int32(0); i < r.npat*4; i++ {
+		buf[r.gatePtr+i] = 0
+	}
+	runtime.KeepAlive(r.store)
+	countMask := int64(1)<<uint(config.SetCursorCountBits(int(r.npat))) - 1
+	var out []setTuple
+	cursor := int64(0)
+	for {
+		res, err := fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap))
+		if err != nil {
+			return out
+		}
+		packed := res.(int64)
+		n := int32(packed & countMask)
+		buf := r.mem.UnsafeData(r.store)
+		for i := int32(0); i < n; i++ {
+			base := int(r.batchPtr) + int(i)*12
+			out = append(out, setTuple{
+				int32(binary.LittleEndian.Uint32(buf[base:])),
+				int32(binary.LittleEndian.Uint32(buf[base+4:])),
+				int32(binary.LittleEndian.Uint32(buf[base+8:])),
+			})
+		}
+		runtime.KeepAlive(r.store)
+		if uint32(packed>>32) == 0xFFFFFFFF || n == 0 {
+			return out
+		}
+		cursor = packed
+	}
+}
+
+// sameMatches compares two tuple lists as multisets. Within-call tuple order
+// is unspecified (plans/SETS.md §3.10), so order must not be part of the test.
+func sameMatches(a, b []setTuple) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	key := func(v []setTuple) []setTuple {
+		c := append([]setTuple(nil), v...)
+		sort.Slice(c, func(i, j int) bool {
+			if c[i].id != c[j].id {
+				return c[i].id < c[j].id
+			}
+			if c[i].start != c[j].start {
+				return c[i].start < c[j].start
+			}
+			return c[i].end < c[j].end
+		})
+		return c
+	}
+	x, y := key(a), key(b)
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func raCallI32(h *raHarness, name string, args ...interface{}) int32 {
@@ -1154,8 +1415,11 @@ func rxCallI64(r *rxInstance, name string, args ...interface{}) int64 {
 	return v.(int64)
 }
 
-func raScanAllIDs(h *raHarness, inputLen int32) []int {
-	n := raCallI32(h, "ra_scan_all", inputLen, int32(0))
+// raAllIDs decodes an `_all` answer from the regex-automata harness, which
+// writes ids to RA_OUT_BUF and returns the count. `export` is "ra_scan_all"
+// (which takes a `from`, passed in extra) or "ra_match_all" (which does not).
+func raAllIDs(h *raHarness, export string, args ...interface{}) []int {
+	n := raCallI32(h, export, args...)
 	buf := h.mem.UnsafeData(h.store)
 	out := make([]int, 0, n)
 	for i := int32(0); i < n; i++ {
@@ -1166,7 +1430,12 @@ func raScanAllIDs(h *raHarness, inputLen int32) []int {
 	return out
 }
 
-func rxScanAllIDs(r *rxInstance, wide bool) []int {
+// rxAllIDs decodes one of our `_all` capabilities into an ascending id list.
+// `export` is "cap_scan_all" (whose `from` goes in extra) or "cap_match_all".
+// Both ABI forms are handled: an i64 bitmask return, or the >64-id out_ptr
+// bitmap, which the caller must zero because the module only sets bits.
+func rxAllIDs(r *rxInstance, wide bool, export string, inLen int32, extra ...interface{}) []int {
+	args := append([]interface{}{r.inBase, inLen}, extra...)
 	var out []int
 	if wide {
 		buf := r.mem.UnsafeData(r.store)
@@ -1174,7 +1443,7 @@ func rxScanAllIDs(r *rxInstance, wide bool) []int {
 			buf[r.bitmapPt+i] = 0
 		}
 		runtime.KeepAlive(r.store)
-		rxCallI32(r, "cap_scan_all", r.inBase, r.inLen, int32(0), r.bitmapPt)
+		rxCallI32(r, export, append(args, r.bitmapPt)...)
 		buf = r.mem.UnsafeData(r.store)
 		for k := int32(0); k < r.npat; k++ {
 			if buf[int(r.bitmapPt)+int(k)/8]&(1<<uint(k%8)) != 0 {
@@ -1184,13 +1453,64 @@ func rxScanAllIDs(r *rxInstance, wide bool) []int {
 		runtime.KeepAlive(r.store)
 		return out
 	}
-	mask := uint64(rxCallI64(r, "cap_scan_all", r.inBase, r.inLen, int32(0)))
+	mask := uint64(rxCallI64(r, export, args...))
 	for k := int32(0); k < r.npat && k < 64; k++ {
 		if mask&(1<<uint(k)) != 0 {
 			out = append(out, int(k))
 		}
 	}
 	return out
+}
+
+// raOutTuples is how many (id, start, end) triples RA_OUT_BUF holds. Keep it in
+// step with automata.rs — ra_find_gated silently stops filling at this count
+// rather than growing, so a returned count of exactly this is "at least this
+// many", not "this many".
+const raOutTuples = 65536
+
+// raFindGated collects regex-automata's per-pattern merged enumeration, the
+// pairing for our default gated `find`. complete is false when the harness
+// buffer filled, in which case the tuples are a prefix and cannot be compared.
+func raFindGated(h *raHarness, inputLen int32) (tuples []setTuple, complete bool) {
+	n := raCallI32(h, "ra_find_gated", inputLen, int32(0))
+	buf := h.mem.UnsafeData(h.store)
+	out := make([]setTuple, 0, n)
+	for i := int32(0); i < n; i++ {
+		base := int(h.outPtr) + int(i)*12
+		out = append(out, setTuple{
+			int32(binary.LittleEndian.Uint32(buf[base:])),
+			int32(binary.LittleEndian.Uint32(buf[base+4:])),
+			int32(binary.LittleEndian.Uint32(buf[base+8:])),
+		})
+	}
+	runtime.KeepAlive(h.store)
+	return out, n < raOutTuples
+}
+
+// anchoredLens returns the prefix lengths the anchored trio is compared at.
+//
+// Small lengths first, because "the whole input matches" is what the anchored
+// capabilities answer and a 100 KB scan corpus is not that: the short prefixes
+// are where the anchored automaton actually returns yes, and 0 covers the empty
+// input. The tail lengths keep the full-input case and one interior point.
+func anchoredLens(n int) []int {
+	var out []int
+	for _, k := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 32, 64, n / 2, n} {
+		if k >= 0 && k <= n && (len(out) == 0 || k != out[len(out)-1]) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// containsID reports whether an ascending id list holds id.
+func containsID(ids []int, id int) bool {
+	for _, v := range ids {
+		if v == id {
+			return true
+		}
+	}
+	return false
 }
 
 func sameIDs(a, b []int) bool {

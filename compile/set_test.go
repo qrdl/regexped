@@ -1527,6 +1527,78 @@ func TestACBudget(t *testing.T) {
 	}
 }
 
+// TestACOutputOverflow covers the third AC demotion arm: output OFFSETS are
+// u16, and they are bounded by the propagated output count rather than by the
+// node count or the table size, so passing acMaxNodes and acBudgetBytes proves
+// nothing about them.
+//
+// The shape that reaches it is a nested literal family. buildAC's failure-link
+// propagation copies every suffix literal's id into each node ending with it,
+// so L literals `a`, `aa`, ... produce L*(L+1)/2 outputs from only L+1 nodes.
+// The first overflowing count is 362: 65,703 outputs (over the 65,535 the
+// offsets address) from 363 nodes in ~318 KB — inside BOTH existing gates,
+// which is why it needed its own. Without the arm the emitted scanner reads a
+// wrapped output range and reports the wrong literals.
+func TestACOutputOverflow(t *testing.T) {
+	nested := func(t *testing.T, n int) (SetSpec, *dfaPool, *dfaPool) {
+		t.Helper()
+		var prefixPool, suffixPool dfaPool
+		var patterns []*PatternInfo
+		var ids []int
+		for i := 0; i < n; i++ {
+			pat := strings.Repeat("a", i+1) + "[0-9]"
+			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			if err != nil {
+				t.Fatalf("analyzePattern(%q): %v", pat, err)
+			}
+			patterns = append(patterns, info)
+			ids = append(ids, i)
+		}
+		return SetSpec{Name: "s", Scan: "scan", Patterns: patterns, PatternIDs: ids}, &prefixPool, &suffixPool
+	}
+
+	// The arithmetic the constant rests on, asserted directly so a change to
+	// buildAC's propagation cannot quietly move the crossover.
+	for _, tc := range []struct{ n, wantOutputs int }{{361, 65341}, {362, 65703}} {
+		ac := buildAC(func() [][]byte {
+			lits := make([][]byte, tc.n)
+			for i := range lits {
+				lits[i] = []byte(strings.Repeat("a", i+1))
+			}
+			return lits
+		}())
+		if got := acTotalOutputs(ac); got != tc.wantOutputs {
+			t.Errorf("acTotalOutputs(%d nested literals) = %d, want %d", tc.n, got, tc.wantOutputs)
+		}
+		if len(ac.nodes) > acMaxNodes {
+			t.Errorf("n=%d: %d nodes exceeds acMaxNodes — the node cap would mask this case", tc.n, len(ac.nodes))
+		}
+	}
+
+	// 361 fits and must keep its AC frontend; 362 overflows and must demote,
+	// with the reason recorded rather than silently downgraded (§13 F1).
+	spec, pp, sp := nested(t, 361)
+	if cs := CompileSet(spec, pp, sp, CompileSetOptions{}); cs.diag != nil && cs.diag.FrontendDemotion != nil {
+		t.Errorf("n=361: unexpected demotion %+v — 65,341 outputs fit the u16 offsets", cs.diag.FrontendDemotion)
+	}
+
+	spec, pp, sp = nested(t, 362)
+	cs := CompileSet(spec, pp, sp, CompileSetOptions{})
+	if cs.fe != frontendScalar {
+		t.Errorf("n=362: fe = %v, want frontendScalar", cs.fe)
+	}
+	if cs.diag == nil || cs.diag.FrontendDemotion == nil {
+		t.Fatal("n=362: demotion not recorded in SetDiag")
+	}
+	d := cs.diag.FrontendDemotion
+	if d.From != "ac" || d.To != "scalar" || d.Reason != "ac_outputs_exceed_u16" {
+		t.Errorf("demotion diag = %+v, want from=ac to=scalar reason=ac_outputs_exceed_u16", d)
+	}
+	if got, ok := d.Detail["ac_outputs"].(int); !ok || got <= acMaxOutputs {
+		t.Errorf("demotion detail ac_outputs = %v, want the real (overflowing) count", d.Detail["ac_outputs"])
+	}
+}
+
 // TestACLayoutBytes pins the accounting acBudgetBytes is compared against: it
 // must cover everything the frontend reserves, including the 256-byte
 // firstByteFlags table emitted after the layout, or the budget silently
@@ -3535,6 +3607,97 @@ func TestACLayoutNoGap(t *testing.T) {
 				t.Errorf("lits=%d compress=%v: tableEnd = %d, want %d (a %d-byte gap)",
 					len(lits), compress, l.tableEnd, wantEnd, l.tableEnd-wantEnd)
 			}
+		}
+	}
+}
+
+// TestSetFindBatch_Emission covers the structural half of plans/SETS.md §19:
+// the export exists, is independent of `find`, and declaring it does not
+// disturb the module for a set that doesn't ask for it. The BEHAVIOUR — the
+// cursor, the split-position resume — needs a WASM runtime and lives in
+// tools/fuzz/set_batch_test.go.
+func TestSetFindBatch_Emission(t *testing.T) {
+	entries := []config.RegexEntry{
+		{Name: "a", Pattern: `foo\d+`},
+		{Name: "b", Pattern: `bar\w+`},
+	}
+	build := func(s config.SetConfig) []byte {
+		t.Helper()
+		w, _, err := CompileFile(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{s}}, "")
+		if err != nil {
+			t.Fatalf("CompileFile: %v", err)
+		}
+		return w
+	}
+	all := config.PatternSelector{All: true}
+
+	t.Run("batch_only", func(t *testing.T) {
+		// find_batch does not imply find: the batch export must be there and
+		// the find export must not.
+		w := build(config.SetConfig{Name: "s", FindBatch: "fb", Patterns: all})
+		if !bytes.Contains(w, []byte("fb")) {
+			t.Error("find_batch export missing from a find_batch-only set")
+		}
+		if bytes.Contains(w, []byte("plain_find")) {
+			t.Error("a find_batch-only set exported a find")
+		}
+	})
+
+	t.Run("both", func(t *testing.T) {
+		w := build(config.SetConfig{Name: "s", Find: "plain_find", FindBatch: "fb", Patterns: all})
+		for _, name := range []string{"plain_find", "fb"} {
+			if !bytes.Contains(w, []byte(name)) {
+				t.Errorf("export %q missing when both capabilities are declared", name)
+			}
+		}
+		assertDataSectionConsistent(t, w)
+	})
+
+	t.Run("overlapping", func(t *testing.T) {
+		// The ungated body takes §19's skip parameter on its suffix functions;
+		// this is the path with no gate array to resume a split position with.
+		w := build(config.SetConfig{Name: "s", Find: "plain_find", FindBatch: "fb", Overlapping: true, Patterns: all})
+		if !bytes.Contains(w, []byte("fb")) {
+			t.Error("find_batch export missing from an overlapping set")
+		}
+		assertDataSectionConsistent(t, w)
+	})
+
+	t.Run("undeclared_is_unchanged", func(t *testing.T) {
+		// D6's rule one level up: a set that does not declare find_batch must
+		// compile to exactly what it compiled to before find_batch existed.
+		// Byte identity against the same set built through the same path is the
+		// strongest available statement of that here.
+		a := build(config.SetConfig{Name: "s", Find: "plain_find", Patterns: all})
+		b := build(config.SetConfig{Name: "s", Find: "plain_find", Patterns: all})
+		if !bytes.Equal(a, b) {
+			t.Fatal("compilation is not deterministic; the comparison below is meaningless")
+		}
+		c := build(config.SetConfig{Name: "s", Find: "plain_find", FindBatch: "fb", Patterns: all})
+		if len(c) <= len(a) {
+			t.Errorf("declaring find_batch did not add code: %d bytes vs %d", len(c), len(a))
+		}
+	})
+}
+
+// TestSetCursorLayout pins the cursor field widths (plans/SETS.md §19.1). They
+// are computed in config so the compiler and all six generators share ONE
+// definition; this asserts the definition itself, not either caller.
+func TestSetCursorLayout(t *testing.T) {
+	cases := []struct{ patterns, kBits int }{
+		{1, 1}, {2, 2}, {3, 2}, {4, 3}, {7, 3}, {8, 4},
+		{128, 8}, {255, 8}, {256, 9},
+	}
+	for _, c := range cases {
+		if got := config.SetCursorKBits(c.patterns); got != c.kBits {
+			t.Errorf("SetCursorKBits(%d) = %d, want %d", c.patterns, got, c.kBits)
+		}
+		// k must be representable for every value a position can produce.
+		if max := (1 << uint(config.SetCursorKBits(c.patterns))) - 1; max < c.patterns {
+			t.Errorf("kBits for %d patterns holds only up to %d", c.patterns, max)
+		}
+		if got := config.SetCursorCountBits(c.patterns) + config.SetCursorKBits(c.patterns); got != 32 {
+			t.Errorf("count+k widths for %d patterns = %d, want 32", c.patterns, got)
 		}
 	}
 }

@@ -337,7 +337,7 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		b = append(b, 0x20, l.AttemptStart)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(len(prefix)))
-		b = append(b, 0x6A)       // i32.add: attempt_start + len(prefix)
+		b = append(b, 0x6A) // i32.add: attempt_start + len(prefix)
 		b = append(b, 0x20, l.Len)
 		b = append(b, 0x4B)       // i32.gt_u
 		b = append(b, 0x0D, 1+ed) // br_if (1+ed) → $no_match

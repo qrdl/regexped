@@ -336,6 +336,72 @@ func TestValidateExports_HelperCollisions(t *testing.T) {
 	}
 }
 
+func TestValidateExports_SetDerivedConstantCollisions(t *testing.T) {
+	// Class 4: a user export named after a constant the generator DERIVES from
+	// a set's name. Unlike the helper lists this is config-dependent — the set
+	// is called "scanner", so the reserved names are its stem plus the four
+	// suffixes — which is why a fixed deny-list could not have caught it.
+	cases := []struct {
+		stubType  string
+		funcName  string
+		wantError bool
+	}{
+		{"ts", "scannerPatternCount", true},
+		{"js", "scannerIdSpace", true},
+		{"ts", "scannerBatchMaxCount", true}, // reserved even with no find_batch
+		{"rust", "SCANNER_PATTERN_COUNT", true},
+		{"c", "SCANNER_ID_SPACE", true},
+		{"as", "SCANNER_BATCH_COUNT_BITS", true},
+		{"go", "scanner_pattern_count", true}, // Go compares the Pascal-cased form
+		{"go", "ScannerIDSpace", true},
+
+		// The stems are per language: the TS constant is camelCase, so the
+		// SCREAMING form is unremarkable there and vice versa.
+		{"ts", "SCANNER_PATTERN_COUNT", false},
+		{"rust", "scannerPatternCount", false},
+		// A different set name reserves different constants.
+		{"ts", "otherPatternCount", false},
+		{"ts", "scanSecrets", false},
+	}
+	for _, c := range cases {
+		t.Run(c.stubType+"/"+c.funcName, func(t *testing.T) {
+			cfg := &BuildConfig{
+				StubType: c.stubType, ImportModule: "m",
+				Regexps: []RegexEntry{{Name: "p", Pattern: "a"}},
+				Sets: []SetConfig{{
+					Name:     "scanner",
+					Scan:     c.funcName,
+					Patterns: PatternSelector{All: true},
+				}},
+			}
+			err := ValidateConfig(cfg)
+			if c.wantError != (err != nil) {
+				t.Fatalf("stub_type %q scan %q: err = %v, wantError = %v", c.stubType, c.funcName, err, c.wantError)
+			}
+		})
+	}
+
+	// The collision is with the SET's constants, so a regexp export collides
+	// just as a set capability does.
+	cfg := &BuildConfig{
+		StubType: "ts", ImportModule: "m",
+		Regexps: []RegexEntry{{Name: "p", Pattern: "a", MatchFunc: "scannerPatternCount"}},
+		Sets:    []SetConfig{{Name: "scanner", Scan: "sc", Patterns: PatternSelector{All: true}}},
+	}
+	if err := ValidateConfig(cfg); err == nil {
+		t.Error("regexp match_func colliding with a set constant was accepted, want error")
+	}
+
+	// With no sets there is nothing to derive, so the name is fine.
+	cfg = &BuildConfig{
+		StubType: "ts", ImportModule: "m",
+		Regexps: []RegexEntry{{Name: "p", Pattern: "a", MatchFunc: "scannerPatternCount"}},
+	}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Errorf("no sets: rejected scannerPatternCount: %v", err)
+	}
+}
+
 func TestValidateExports_FFIPrefix(t *testing.T) {
 	// B34 class 3: `ffi_x` collides with the private binding generated for an
 	// export named `x`.

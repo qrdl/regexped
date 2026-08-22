@@ -167,6 +167,9 @@ export function <scan_any>(input, from = 0) // -> {patternId, start} | null
 export function <scan_all>(input, from = 0) // -> number[]        NOT a boolean
 
 export function* <find>(input, from = 0)    // yields {patternId, start, end}
+export function* <find_batch>(input, from = 0, capacity = 256)  // same, batched
+// JS is the exception: its buffer lives in WASM memory, so it takes a capacity
+// rather than a buffer. Every other language takes the buffer itself.
 
 export function patternName(id)             // only if any set sets emit_name_map: true
 ```
@@ -210,6 +213,26 @@ requested `emit_name_map: true`.
 Generated export names match the config field values exactly (no case conversion). All positions are byte offsets in the UTF-8 encoded form of the input. Input can be a `string` (UTF-8 encoded automatically) or a `Uint8Array`.
 
 ---
+
+### `find_batch` — the same matches, a bufferful per call
+
+`find` crosses the host boundary once per matching position. `find_batch`
+reports the same matches in the same order but fills **your** buffer with as
+many consecutive positions as fit, so a caller who will consume the whole scan
+crosses once per bufferful instead. Use `find` when you may stop early — a
+batch call does the work for matches you never look at.
+
+The two are independent capabilities; declare either, both, or neither.
+
+You own the buffer: allocate one and reuse it for every scan, so batched
+iteration allocates nothing in the steady state. Its length is the batch size,
+capped at `<SET>_BATCH_MAX_COUNT`; a zero-length buffer yields nothing. Any
+length of 1 or more makes progress — a position whose matches do not all fit is
+delivered in part and resumed inside. Because of that, group by the match's
+`start` field rather than by call boundary if you need per-position grouping.
+
+The gate array and the resume cursor stay stub-owned and never appear in the
+public surface; only the buffer is yours, because only its size is your choice.
 
 ## Notes
 

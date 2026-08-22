@@ -148,7 +148,8 @@ When the config has a `sets:` block, the generator also emits, per set (see
 [sets.md](sets.md) for the full config schema and wire format):
 
 ```c
-#define <SET>_PATTERN_COUNT 12
+#define <SET>_PATTERN_COUNT 12   /* patterns in the set */
+#define <SET>_ID_SPACE      12   /* largest reportable pattern id + 1 */
 typedef struct { int pattern_id; int start; int end; } rx_set_match_t;
 
 /* anchored: the pattern must match the WHOLE input */
@@ -165,13 +166,19 @@ int <scan_all>(const char *in, int len, int from, int *out_ids); /* count    */
 typedef struct {
     int from;
     int done;
-    unsigned gates[<SET>_PATTERN_COUNT];   /* non-overlapping sets only */
+    unsigned gates[<SET>_ID_SPACE];        /* non-overlapping sets only */
     int buf[<SET>_PATTERN_COUNT * 3];
     int n, i;
 } rx_<set>_scanner_t;
 
 void <find>_init(rx_<set>_scanner_t *s, int from);
 int  <find>_next(rx_<set>_scanner_t *s, const char *in, int len, rx_set_match_t *out);
+
+/* find_batch: the same matches, a bufferful per call. You own the buffer —
+   3 ints per match, cap matches — so declare it once and reuse it. There is no
+   capacity constant in the header. */
+void <find_batch>_init(rx_<set>_batch_scanner_t *s, int from, int *buf, int cap);
+int  <find_batch>_next(rx_<set>_batch_scanner_t *s, const char *in, int len, rx_set_match_t *out);
 
 /* only if any set in the config sets emit_name_map: true */
 const char *pattern_name(int id);
@@ -187,12 +194,38 @@ while (<find>_next(&s, input, len, &m))
 
 Scanner state is **caller-owned**, so two scans can be in flight at once and
 re-initialising the struct restarts one. The `out_ids` arrays for
-`<match_all>`/`<scan_all>` must hold `<SET>_PATTERN_COUNT` ints.
+`<match_all>`/`<scan_all>` must hold `<SET>_ID_SPACE` ints.
+
+The two constants differ for a named subset: `<SET>_PATTERN_COUNT` counts the
+set's patterns and sizes the tuple buffer, while `<SET>_ID_SPACE` is one past
+the largest id the set can report and sizes everything indexed *by* an id — the
+`gates` array and the `out_ids` arrays above. A set holding two late-declared
+patterns has a count of 2 and a much larger id space.
 
 `pattern_name` is a single shared lookup across every set in the config
 that requested `emit_name_map: true`, not one per set.
 
 ---
+
+### `find_batch` — the same matches, a bufferful per call
+
+`find` crosses the host boundary once per matching position. `find_batch`
+reports the same matches in the same order but fills **your** buffer with as
+many consecutive positions as fit, so a caller who will consume the whole scan
+crosses once per bufferful instead. Use `find` when you may stop early — a
+batch call does the work for matches you never look at.
+
+The two are independent capabilities; declare either, both, or neither.
+
+You own the buffer: allocate one and reuse it for every scan, so batched
+iteration allocates nothing in the steady state. Its length is the batch size,
+capped at `<SET>_BATCH_MAX_COUNT`; a zero-length buffer yields nothing. Any
+length of 1 or more makes progress — a position whose matches do not all fit is
+delivered in part and resumed inside. Because of that, group by the match's
+`start` field rather than by call boundary if you need per-position grouping.
+
+The gate array and the resume cursor stay stub-owned and never appear in the
+public surface; only the buffer is yours, because only its size is your choice.
 
 ## Notes
 

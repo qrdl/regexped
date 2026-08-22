@@ -99,6 +99,31 @@ func buildAC(literals [][]byte) *acAutomaton {
 // demotion case, not an assertion.
 const acMaxNodes = 65536
 
+// acMaxOutputs is the largest total propagated-output count buildACLayout can
+// encode: a node's output range is a pair of adjacent entries in the
+// nodeOut array, written as u16, with entry numNodes carrying the total as the
+// end sentinel. Index values 0..65535 are therefore addressable.
+//
+// Node count is not a proxy for this. buildAC copies every suffix literal's id
+// into each node that ends with it, so a nested family (`a`, `aa`, `aaa`, ...)
+// of L literals produces L*(L+1)/2 outputs from only L+1 nodes: ~362 such
+// literals overflow the offsets while passing both acMaxNodes and
+// acBudgetBytes with room to spare. Like acMaxNodes this is a demotion case,
+// not an assertion — the alternative, widening the whole output layout to u32,
+// would cost every AC set table bytes to serve a shape none of them has.
+const acMaxOutputs = 65535
+
+// acTotalOutputs counts the propagated outputs over every node — the length of
+// the flat output array buildACLayoutMode lays down, and the value its last
+// nodeOut entry has to hold.
+func acTotalOutputs(ac *acAutomaton) int {
+	total := 0
+	for i := range ac.nodes {
+		total += len(ac.nodes[i].output)
+	}
+	return total
+}
+
 func newACNode() acNode {
 	n := acNode{failure: 0}
 	for i := range n.gotoTable {

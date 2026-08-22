@@ -67,6 +67,13 @@ func genASSetSection(cfg config.BuildConfig) string {
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the iterator can\n// receive at most this many matches at one position.\nexport const %s: i32 = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: i32 = %d;\n\n", s.Name, idKonst, idN)
 
+		if s.FindBatch != "" {
+			fmt.Fprintf(&out, "// Width of the count field in set %q's find_batch cursor. The count is\n// packed & ((1 << bits) - 1); the scan is finished when the top 32 bits of\n// the cursor are all ones. Only a direct WASM caller needs this — the\n// generated iterator decodes the cursor for you.\nexport const %s: i32 = %d;\n\n",
+				s.Name, screamingCase(s.Name)+"_BATCH_COUNT_BITS", cursorCountBits(s, cfg))
+			fmt.Fprintf(&out, "// Largest tuple count one find_batch call can report for set %q. The module\n// clamps out_cap to it.\nexport const %s: i32 = %d;\n\n",
+				s.Name, screamingCase(s.Name)+"_BATCH_MAX_COUNT", cursorMaxCount(s, cfg))
+		}
+
 		decl := func(name, sig string) {
 			fmt.Fprintf(&out, "@external(%q, %q)\ndeclare function ffi_%s%s;\n\n", cfg.ImportModule, name, name, sig)
 		}
@@ -203,6 +210,79 @@ export function %[5]s(input: ArrayBuffer, from: i32): %[1]s {
     return new %[1]s(input, from);
 }
 `, iterName, gateField, konst, gateInit, s.Find, gateArg)
+		}
+		if s.FindBatch != "" {
+			iterName := config.PascalCaseForValidation(s.FindBatch) + "Iter"
+			gateField, gateInit, gateArg := "", "", ""
+			if gatedFind(s) {
+				// Gate array stays stub-owned: its length is the emitted
+				// id-space constant, not a size the caller chooses.
+				decl(s.FindBatch, "(ptr: usize, len: i32, cursor: i64, gates: usize, out: usize, cap: i32): i64")
+				gateField = "    gates: StaticArray<u32>;\n"
+				gateInit = "        this.gates = new StaticArray<u32>(" + idKonst + ");\n"
+				gateArg = "changetype<usize>(this.gates), "
+			} else {
+				decl(s.FindBatch, "(ptr: usize, len: i32, cursor: i64, out: usize, cap: i32): i64")
+			}
+			fmt.Fprintf(&out, `/**
+ * Iterator over the set's matches, refilling the CALLER'S buffer a bufferful at
+ * a time: one WASM call per bufferful instead of one per position. Same matches
+ * in the same order as the unbatched find. Prefer it when the whole scan will be
+ * consumed; prefer find when you may stop early, since a batch call does the
+ * work for matches you never look at.
+ *
+ * buf holds 3 i32 per match, so its capacity is buf.length / 3, capped at
+ * %[6]d. The buffer is borrowed: allocate one and reuse it for every scan.
+ * next() returns null when exhausted.
+ */
+export class %[1]s {
+    private input: ArrayBuffer;
+    private buf: StaticArray<i32>;
+    private cursor: i64;
+    private cap: i32;
+    private done: bool = false;
+    private n: i32 = 0;
+    private i: i32 = 0;
+%[2]s    constructor(input: ArrayBuffer, from: i32, buf: StaticArray<i32>) {
+        // The clamp lands in a LOCAL first: AssemblyScript's definite-assignment
+        // check rejects reading this.buf before every field is initialised.
+        let c: i32 = buf.length / 3;
+        if (c > %[6]d) c = %[6]d;
+        this.input = input;
+        this.buf = buf;
+        this.cursor = (<i64>from) << 32;
+        this.cap = c;
+        if (c < 1) this.done = true;
+%[3]s    }
+    next(): SetMatch | null {
+        while (true) {
+            if (this.i < this.n) {
+                const o = this.i * 3;
+                this.i++;
+                return new SetMatch(this.buf[o], this.buf[o + 1], this.buf[o + 2]);
+            }
+            if (this.done) return null;
+            const packed = ffi_%[4]s(changetype<usize>(this.input), this.input.byteLength, this.cursor,
+                %[5]schangetype<usize>(this.buf), this.cap);
+            // The cursor is opaque: hand it back unchanged. Only its top 32
+            // bits are public — all ones means the scan is finished, and that
+            // arrives on the same call as the last matches.
+            this.n = <i32>(packed & %[7]d);
+            this.i = 0;
+            if ((packed >>> 32) == 0xFFFFFFFF) this.done = true;
+            this.cursor = packed;
+            // A call reports at least one match unless the scan is over.
+            if (this.n == 0) { this.done = true; return null; }
+        }
+    }
+}
+
+/** Starts a batched scan at `+"`from`"+` over the caller's buffer. */
+export function %[4]s(input: ArrayBuffer, from: i32, buf: StaticArray<i32>): %[1]s {
+    return new %[1]s(input, from, buf);
+}
+`, iterName, gateField, gateInit, s.FindBatch, gateArg,
+				cursorMaxCount(s, cfg), cursorCountMask(s, cfg))
 		}
 		out.WriteString("\n")
 	}

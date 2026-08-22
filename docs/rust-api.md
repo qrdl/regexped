@@ -143,7 +143,8 @@ function per declared capability (see [sets.md](sets.md) for the full config
 schema and wire format):
 
 ```rust
-pub const <SET>_PATTERN_COUNT: usize = 12;
+pub const <SET>_PATTERN_COUNT: usize = 12;   // patterns in the set
+pub const <SET>_ID_SPACE: usize = 12;        // largest reportable pattern id + 1
 
 pub struct SetMatch { pub pattern_id: usize, pub start: usize, pub end: usize }
 
@@ -159,6 +160,10 @@ pub fn <scan_all>(input: &[u8], from: usize) -> Vec<usize>;
 
 pub fn <find>(input: &[u8], from: usize) -> <Find>Iter<'_>;
 impl Iterator for <Find>Iter<'_> { type Item = SetMatch; }
+
+pub type SetTuple = [i32; 3];   // one slot of a batched scan's buffer
+pub fn <find_batch><'a, 'b>(input: &'a [u8], from: usize, buf: &'b mut [SetTuple]) -> <FindBatch>Iter<'a, 'b>;
+impl Iterator for <FindBatch>Iter<'_, '_> { type Item = SetMatch; }
 ```
 
 ```rust
@@ -168,11 +173,33 @@ for m in scan_secrets(input, 0) {
 ```
 
 The iterator owns one reusable buffer of `<SET>_PATTERN_COUNT` tuples and, for
-the default non-overlapping configuration, a zeroed gate array of the same
-length. It refills at each matching position and yields that position's matches
+the default non-overlapping configuration, a zeroed gate array of
+`<SET>_ID_SPACE` entries — the gate array is indexed by global pattern id, so
+the two lengths differ for a named subset. It refills at each matching position
+and yields that position's matches
 one at a time before advancing, so steady-state iteration allocates nothing.
 Dropping and re-creating it restarts the scan; the gate array never appears in
 the public surface.
+
+### `find_batch` — the same matches, a bufferful per call
+
+`find` crosses the host boundary once per matching position. `find_batch`
+reports the same matches in the same order but fills its buffer with as many
+consecutive positions as fit, so a caller who will consume the whole scan
+crosses once per bufferful instead. Use `find` when you may stop early — a
+batch call does the work for matches you never look at.
+
+The two are independent capabilities; declare either, both, or neither. The
+buffer's length is the batch size, capped at `<SET>_BATCH_MAX_COUNT`, and any
+length of 1 or more makes progress: a position whose matches do not all fit is
+delivered in part and resumed inside. Because of that, group by the match's
+`start` field rather than by call boundary if you need per-position grouping.
+
+You own the buffer; the iterator borrows it, so batched iteration allocates
+nothing in the steady state — allocate one `Vec<SetTuple>` and reuse it for
+every scan. Its length is the batch size. The gate array and the cursor stay
+internal: the gate array's length is `<SET>_ID_SPACE`, a compile-time constant,
+so it is a fixed inline array and costs no allocation either.
 
 `pattern_name(id)` is emitted once per config when any set sets
 `emit_name_map: true`.

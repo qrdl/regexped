@@ -191,7 +191,7 @@ not stored in the table.
 When the config contains a `sets:` block, `regexped compile` emits additional
 WASM functions for multi-pattern matching.
 
-### The seven capability exports
+### The eight capability exports
 
 ```wasm
 ;; Anchored — the match must span the WHOLE input (0..len).
@@ -217,6 +217,19 @@ WASM functions for multi-pattern matching.
     (param $in_ptr i32) (param $in_len i32) (param $from i32)
     (param $out_ptr i32) (param $out_cap i32)
     (result i32))
+
+;; find_batch — the same matches, several consecutive positions per call.
+;; The cursor is an i64 in and an i64 out: pass the previous return value back
+;; unchanged. A first call passes `from << 32`.
+(func $find_batch                                    ;; gated (default)
+    (param $in_ptr i32) (param $in_len i32) (param $cursor i64)
+    (param $gate_ptr i32) (param $out_ptr i32) (param $out_cap i32)
+    (result i64))
+
+(func $find_batch                                    ;; overlapping: true
+    (param $in_ptr i32) (param $in_len i32) (param $cursor i64)
+    (param $out_ptr i32) (param $out_cap i32)
+    (result i64))
 ```
 
 `in_ptr`/`in_len` always describe the **entire** input; `from` bounds only the
@@ -236,6 +249,37 @@ Each tuple written to `out_ptr` is 12 bytes (3 × i32), 4-byte aligned:
 
 The order of tuples *within* one call is unspecified: not by pattern id, not by
 extent, not stable across compiler versions.
+
+### find_batch cursor layout
+
+The returned `i64` is both the answer and the resume token:
+
+| Bits | Field | Public? |
+|---|---|---|
+| 63..32 | resume position, or `0xFFFFFFFF` when the scan is finished | only the sentinel |
+| 31..`<SET>_BATCH_COUNT_BITS` | `k`, the intra-position resume index | no — opaque |
+| `<SET>_BATCH_COUNT_BITS`-1..0 | `count` — valid tuples in the buffer | yes |
+
+`<SET>_BATCH_COUNT_BITS` is `32 - kBits`, where `kBits` is the smallest width
+holding `[0, patterns_in_set]`; both it and `<SET>_BATCH_MAX_COUNT` are emitted
+as constants. Treat everything but the sentinel and `count` as opaque and hand
+the value straight back.
+
+The sentinel is `0xFFFFFFFF` rather than 0 because **0 is a legal resume
+position** — a first call whose buffer fills on the matches at position 0
+resumes at 0. The done flag arrives on the same call that delivers the final
+matches, so a finished scan costs no extra call.
+
+`count` is needed alongside the sentinel because the last call is normally a
+partial fill and the buffer is reused: slots past `count` still hold tuples from
+the previous call, and `(id=0, start=0, end=0)` is a legal tuple, so no
+in-buffer terminator could be unambiguous.
+
+Unlike `find`, `find_batch` is **not transactional**: a position whose tuples do
+not all fit is delivered in part and resumed inside, so any `out_cap >= 1` makes
+progress and tuples of one position may span two calls. `out_cap` is clamped to
+`<SET>_BATCH_MAX_COUNT`; `out_cap = 0` returns count 0 with a non-nil cursor and
+must not be looped on.
 
 ### find return value and overflow
 
@@ -271,8 +315,14 @@ position, never a truncated one.
 
 ### The gate array
 
-The default `find` body takes `gate_ptr`, pointing at `patterns_in_set` u32s in
+The default `find` body takes `gate_ptr`, pointing at `id_space_size` u32s in
 the **caller's** memory (`memory[0]` — the same memory the input lives in).
+
+It is indexed by **global pattern id**, not by position within the set, so it is
+sized from `id_space_size` and not from `patterns_in_set`. Those two differ for
+a named subset: a set holding two late-declared patterns has a count of 2 and an
+id space large enough to hold their ids. Sizing the array by the count makes the
+module write past its end.
 
 - **All zeros = a clean scan.** That is the only operation a caller performs on
   it; the encoding is opaque and will change.

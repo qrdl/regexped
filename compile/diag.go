@@ -25,7 +25,7 @@ type Diagnostics struct {
 // SetDiag holds diagnostics for one set.
 type SetDiag struct {
 	Name     string `json:"name"`
-	Frontend string `json:"frontend"` // "teddy", "ac", "shufti", "scalar"
+	Frontend string `json:"frontend"` // "packed-pair", "teddy", "ac", "shufti", "scalar"
 	// Capabilities lists the set's declared capability keys, in the
 	// plans/SETS.md §3.12 grid order.
 	Capabilities []string `json:"capabilities,omitempty"`
