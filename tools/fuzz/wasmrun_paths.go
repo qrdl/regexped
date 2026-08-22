@@ -97,32 +97,58 @@ func compileSet(pats []string) ([]byte, error) {
 	return w, err
 }
 
-// instantiate builds and instantiates a module, returning the store, instance
-// and its exported memory.
-func instantiate(wasmBytes []byte) (*wasmtime.Store, *wasmtime.Instance, *wasmtime.Memory, error) {
+// instantiate builds and instantiates a module, returning the store, instance,
+// its exported memory, and a release func the caller MUST call when done —
+// `defer release()` at the call site, so it runs after every use of the store,
+// instance and memory.
+//
+// Releasing explicitly is not optional housekeeping (plans/FUZZER_BUGS.md bug
+// 48). A Module owns JIT-compiled code and a Store owns the linear memory,
+// both allocated on the C side. Without Close they are freed only when a
+// runtime.SetFinalizer callback runs, and a fuzz iteration allocates almost no
+// GO memory — so the GC pacer, which sees only the Go heap, can idle while
+// C-side allocations pile up. Nothing here should depend on finalizer timing.
+//
+// Scope of the claim: this is a resource-management defect, established by
+// reading the API (wasmtime-go v42 does expose Store.Close and Module.Close;
+// we simply never called them). It is NOT known to cause any particular
+// observed failure — in particular it does not explain bug 49's worker aborts,
+// which survived this fix, and measurement afterwards showed 200 iterations of
+// a bug-49 repro sitting flat at 102 MB.
+//
+// Order matters: the store must go first, because the instance and memory live
+// inside it and the module's compiled code is what the instance runs.
+func instantiate(wasmBytes []byte) (*wasmtime.Store, *wasmtime.Instance, *wasmtime.Memory, func(), error) {
 	engine, _ := sharedEngine()
 	mod, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, func() {}, err
 	}
 	store := wasmtime.NewStore(engine)
 	store.SetEpochDeadline(1)
+	release := func() {
+		store.Close()
+		mod.Close()
+	}
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
-		return nil, nil, nil, err
+		release()
+		return nil, nil, nil, func() {}, err
 	}
 	memExp := inst.GetExport(store, "memory")
 	if memExp == nil || memExp.Memory() == nil {
-		return nil, nil, nil, fmt.Errorf("module has no exported memory")
+		release()
+		return nil, nil, nil, func() {}, fmt.Errorf("module has no exported memory")
 	}
-	return store, inst, memExp.Memory(), nil
+	return store, inst, memExp.Memory(), release, nil
 }
 
 // runWasmMatch calls the "match" export. Returns the end position on match,
 // ok=false for no match. hang=true means the watchdog interrupted a runaway
 // call.
 func runWasmMatch(wasmBytes []byte, input string) (end int, ok bool, hang bool, err error) {
-	store, inst, mem, err := instantiate(wasmBytes)
+	store, inst, mem, release, err := instantiate(wasmBytes)
+	defer release()
 	if err != nil {
 		return 0, false, false, err
 	}
@@ -158,7 +184,8 @@ func runWasmMatch(wasmBytes []byte, input string) (end int, ok bool, hang bool, 
 // Returns slots as []int{s0,e0,s1,e1,...} with -1 for unset, matching the
 // layout of Go's FindStringSubmatchIndex. ok=false means no match.
 func runWasmGroupsPath(wasmBytes []byte, input string, numGroups int) (slots []int, ok bool, hang bool, err error) {
-	store, inst, mem, err := instantiate(wasmBytes)
+	store, inst, mem, release, err := instantiate(wasmBytes)
+	defer release()
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -222,7 +249,8 @@ type setMatch struct {
 // for a single position, so an overflow here is an engine bug rather than a
 // harness limitation.
 func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []setMatch, hang bool, err error) {
-	store, inst, mem, err := instantiate(wasmBytes)
+	store, inst, mem, release, err := instantiate(wasmBytes)
+	defer release()
 	if err != nil {
 		return nil, false, err
 	}

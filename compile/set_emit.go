@@ -134,6 +134,14 @@ type compiledSet struct {
 	// Frontend strategy chosen for this set's literal scan.
 	fe frontendKind
 
+	// Literal-existence absence prefilter (plans/SETS.md §21.3 / G12).
+	// absenceLits carries one literal per pattern that has one; absenceAlive
+	// is the mask of patterns that have none and are therefore always reported
+	// alive. absenceOK is false when the prefilter cannot serve this set.
+	absenceLits  []absenceLit
+	absenceAlive uint64
+	absenceOK    bool
+
 	// AC frontend (fe == frontendAC): Aho-Corasick automaton tables.
 	acL                 *acLayout
 	acDataBytes         []byte
@@ -400,6 +408,10 @@ func (s SetSpec) needsAnchoredBuckets() bool {
 func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions) *compiledSet {
 	diag := &SetDiag{Name: spec.Name}
 	buckets := binPack(spec.Patterns, opts, diag)
+
+	// G12: per-pattern absence literals, used by the preflights in place of
+	// the union walk when available.
+	absLits, absAlive, absOK := buildAbsenceLits(spec)
 
 	// Build per-bucket pattern-ID mapping: patternIDs[bucketIdx][bitPos] = globalID.
 	patternIDs := make([][]int, len(buckets))
@@ -858,6 +870,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	}
 
 	cs := &compiledSet{
+		absenceLits:         absLits,
+		absenceAlive:        absAlive,
+		absenceOK:           absOK,
 		name:                spec.Name,
 		match:               spec.Match,
 		matchAny:            spec.MatchAny,
@@ -1630,8 +1645,15 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// drive and writes its result back as §3.16 gate sentinels.
 	findPreflight := mode == capFind && cs.usesGatedFindPreflight()
 
+	// G12: the absence prefilter needs one more i32 (its SIMD mask) and a
+	// v128 chunk; the union walk needs neither.
+	absence := (preflight || findPreflight) && cs.usesAbsencePrefilter()
+
 	var b []byte
-	if preflight || findPreflight {
+	if absence {
+		// 11 i32 (pos, search mask, simd mask), 2 i64 (acc, alive), 1 v128.
+		b = append(b, 0x03, 0x0B, 0x7F, 0x02, 0x7E, 0x01, 0x7B)
+	} else if preflight || findPreflight {
 		// 8 i32 + the union walk's state/pos, then i64 acc + i64 alive mask.
 		b = append(b, 0x02, 0x0A, 0x7F, 0x02, 0x7E)
 	} else {
@@ -1644,7 +1666,11 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	c.lAcc = c.localBase + 8
 	lPos := c.lPos
 	pInLen := c.pInLen
-	if preflight || findPreflight {
+	if absence {
+		c.lAcc = c.localBase + 11
+		c.aliveMask = c.localBase + 12
+		c.aliveReady = preflight
+	} else if preflight || findPreflight {
 		c.lAcc = c.localBase + 10
 		c.aliveMask = c.localBase + 11
 		c.aliveReady = preflight
@@ -1654,11 +1680,16 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 		// Before the prologue: emitGateJump reads the gate array, so the
 		// sentinels must already be in place for it to skip ahead correctly.
 		b = emitGatedFindPreflight(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
-			c.pGate, c.pInLen, tableMemIdx)
+			c.pGate, c.pInLen, tableMemIdx, absence, c.localBase+10, c.localBase+13)
 	}
 	b = c.emitFindPrologue(b, lPos)
 	if preflight {
-		b = emitUnionAliveMask(b, cs.unionScan, c.localBase+8, c.localBase+9, c.aliveMask, tableMemIdx)
+		if absence {
+			b = emitLiteralAbsenceMask(b, cs, c.localBase+8, c.localBase+9,
+				c.localBase+10, c.localBase+13, c.aliveMask)
+		} else {
+			b = emitUnionAliveMask(b, cs.unionScan, c.localBase+8, c.localBase+9, c.aliveMask, tableMemIdx)
+		}
 	}
 
 	b = append(b, 0x02, 0x40) // block $done
@@ -2402,8 +2433,26 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 		b = utils.AppendSLEB128(b, int32(litLen))
 		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
 		for li, lb := range lit {
-			// The two probe columns are already known to match, so skip them.
-			if li == pp.Off1 || li == pp.Off2 {
+			// A probe column may be skipped ONLY when its candidate set holds
+			// a single byte (plans/FUZZER_BUGS.md bug 51).
+			//
+			// The lane mask is an OR over every literal's probe bytes, so a
+			// set lane means "SOME literal's probe bytes matched here", not
+			// this one's. Skipping the column unconditionally therefore treats
+			// another literal's hit as proof of this literal's — and when a
+			// literal's bytes lie entirely inside the two probe columns,
+			// nothing is verified at all and every candidate lane fires.
+			// `01` + `00` over a run of '0' reported `01` at every SIMD-served
+			// start: column 1's set is {'0','1'}, so "00" lit the lane and
+			// "01" verified zero bytes.
+			//
+			// With a one-byte set the union IS this literal's byte, so the
+			// original reasoning holds and the skip is kept — which is the
+			// common case that made this pay.
+			if li == pp.Off1 && len(pp.Bytes1) == 1 {
+				continue
+			}
+			if li == pp.Off2 && len(pp.Bytes2) == 1 {
 				continue
 			}
 			b = append(b, 0x20, pInPtr, 0x20, lMatchPos, 0x6A)

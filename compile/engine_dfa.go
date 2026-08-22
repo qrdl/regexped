@@ -4486,6 +4486,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		// only at position 0 (plans/FABLE.md B40/B43, plans/SETS.md §9.5 S2).
 		futureOff:           futureOff,
 		future:              futureWASM,
+		memberSkip:          memberWalkStates(t),
 		wasmStart:           uint32(t.startState + 1),
 		wasmMidStart:        uint32(t.midStartState + 1),
 		wasmMidStartNewline: uint32(t.midStartNewlineState + 1),
@@ -4551,6 +4552,13 @@ type setSuffixParams struct {
 	// compile-time constant rather than a load: the bulk-skip's liveness
 	// guard sits on an arm whose state is already known statically.
 	future []uint64
+
+	// memberSkip lists small-self-loop states for the suffix body's INVERTED
+	// bulk skip (plans/SETS.md §21.2 / G11). Deliberately separate from
+	// l.dominantStates, which is shared with the single-pattern emitters:
+	// threading the member flavour through that slice would change
+	// single-pattern output and break byteident (D6).
+	memberSkip []dominantWalkState
 
 	l                             *dfaLayout
 	midBitmaskOff                 int32
@@ -4750,7 +4758,9 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	lStartResult := lBits + 2
 	// Bulk-skip chunk local (v128); only declared when dominants exist.
 	lBulkChunk := lBits + 3
-	haveDominants := len(l.dominantStates) > 0
+	// The v128 chunk local is shared by both skip flavours, so either one
+	// alone must still declare it.
+	haveDominants := len(l.dominantStates) > 0 || len(p.memberSkip) > 0
 
 	var b []byte
 	// Local declaration: (7 + n) × i32, 3 × i64, optionally 1 × v128.
@@ -5064,7 +5074,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		return b
 	}
 
-	if haveDominants {
+	if len(l.dominantStates) > 0 {
 		// tmp = midAcceptBytes[state]; if (tmp != 0) { ... }
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, l.midAcceptOff)
@@ -5130,6 +5140,92 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 				lBulkChunk, lByteClass)
 			b = append(b, 0x0B) // end if
 		}
+	}
+
+	// G11 (plans/SETS.md §21.2): the INVERTED bulk skip, for states whose
+	// SELF-LOOP is the small side. Dispatched by state-ID compare, like the
+	// non-mid arm above, because these states are not in midAcceptBytes'
+	// encoded value space at all — they come from memberWalkStates, which is
+	// threaded set-only precisely so l.dominantStates (shared with the
+	// single-pattern emitters) keeps its exact contents.
+	//
+	// emitDominantBulkSkip already implements this test: its selfLoopSet
+	// branch checks membership and inverts the mask, which task 26 built for
+	// 9..64-byte Shufti self-loops. A 1..2-byte set is the same shape, and no
+	// single-pattern path can produce one (detectShuftiSelfLoop's minWidth is
+	// 9), so reusing the branch changes nothing that already existed.
+	//
+	// These states are accepting by construction, so every skipped byte is a
+	// valid match end for whichever patterns accept there — hence the endPos
+	// bump, exactly as the mid-accept dominant arm does. lBitsScratch still
+	// holds midBitmask & validMask for the current state; the skip only
+	// clobbers lByteClass and lBulkChunk.
+	for _, m := range p.memberSkip {
+		info := dominantInfo{
+			state:       int32(m.WASMState),
+			selfLoopSet: m.Members,
+			isMidAccept: true,
+		}
+		b = append(b, 0x20, lState)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(m.WASMState))
+		b = append(b, 0x46)       // i32.eq
+		b = append(b, 0x04, 0x40) // if (state == M)
+		// block $done / loop $main / if state==M → $done is br depth 2.
+		b = emitDominantLivenessGuard(b, info, 2)
+		// Re-entry gate (§21.2's "thrash risk", made concrete by measurement).
+		//
+		// Member states are ENTERED far more often than they hold a run: on the
+		// greedy-3 no-match corpus the walk touches the a-run state at every
+		// stray 'a' in ordinary filler. Measured, the unguarded arm cost
+		// +135,926 fuel on that row, of which only +22,344 was the
+		// per-iteration state compare — the other +113,582 was failed chunk
+		// attempts, each paying a v128 load and a membership test to advance
+		// one byte.
+		//
+		// So peek at the single byte the chunk would examine first. A run long
+		// enough for the skip to pay starts with a member byte, and an
+		// isolated occurrence — the thrash case — fails here for the price of
+		// one load and one compare. On a real run this is amortised over the
+		// whole skip loop, not per chunk.
+		//
+		// Purely a performance gate: it can only suppress a skip, never
+		// authorise one, so the self-loop soundness argument is untouched.
+		b = append(b, 0x02, 0x40) // block $no_skip
+		// The skip's own first test is `pos + 17 > len`; short-circuit the
+		// same condition rather than loading a byte the skip would not use.
+		b = append(b, 0x20, lScanPos, 0x41, 0x11, 0x6A, 0x20, paramLen, 0x4B, 0x0D, 0x00)
+		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x6A)
+		b = appendInputLoad8u(b) // input[lScanPos + 1]
+		b = append(b, 0x22, lByteClass)
+		for mi, mb := range m.Members {
+			if mi > 0 {
+				b = append(b, 0x20, lByteClass)
+			}
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(mb))
+			b = append(b, 0x46) // i32.eq
+			if mi > 0 {
+				b = append(b, 0x72) // i32.or
+			}
+		}
+		b = append(b, 0x45, 0x0D, 0x00) // eqz -> br $no_skip
+		b = emitDominantBulkSkip(b, info, false,
+			lScanPos, paramLen, 0x00, paramPtr,
+			lBulkChunk, lByteClass)
+		for k := range patternIDs {
+			if k >= 32 {
+				break
+			}
+			bit := uint32(1) << uint(k)
+			b = append(b, 0x20, lBitsScratch, 0x41)
+			b = utils.AppendSLEB128(b, int32(bit))
+			b = append(b, 0x71, 0x04, 0x40)                                   // if bit k set
+			b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, endPosK(k)) // endPos_k = scanPos+1
+			b = append(b, 0x0B)
+		}
+		b = append(b, 0x0B) // end block $no_skip
+		b = append(b, 0x0B) // end if state == M
 	}
 
 	// Per-pattern immediateAccept: write immediately when pattern k is done.

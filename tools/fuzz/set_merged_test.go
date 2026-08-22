@@ -56,7 +56,8 @@ func compileSetBothModes(t *testing.T, pat string, caps func(*config.SetConfig))
 // runScanStandalone calls `scan` on a standalone module.
 func runScanStandalone(t *testing.T, w []byte, input string, from int32) bool {
 	t.Helper()
-	store, inst, mem, err := instantiate(w)
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
 	if err != nil {
 		t.Fatalf("instantiate standalone: %v", err)
 	}
@@ -85,7 +86,9 @@ func runScanEmbedded(t *testing.T, w []byte, input string, from int32) bool {
 	if err != nil {
 		t.Fatalf("embedded module: %v", err)
 	}
+	defer mod.Close()
 	store := wasmtime.NewStore(engine)
+	defer store.Close()
 	store.SetEpochDeadline(1)
 	const pages = 32
 	mt, err := wasmtime.NewMemoryType(pages, false, 0, false)
@@ -171,7 +174,9 @@ func runFindEmbedded(t *testing.T, w []byte, input string) [][2]int {
 	if err != nil {
 		t.Fatalf("embedded module: %v", err)
 	}
+	defer mod.Close()
 	store := wasmtime.NewStore(engine)
+	defer store.Close()
 	store.SetEpochDeadline(1)
 	mt, err := wasmtime.NewMemoryType(32, false, 0, false)
 	if err != nil {

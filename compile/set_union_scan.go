@@ -510,7 +510,7 @@ func (cs *compiledSet) usesGatedFindPreflight() bool {
 //     which §3.14 already requires.
 //
 // Both are documented in docs/sets.md.
-func emitGatedFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen byte, tableMemIdx int) []byte {
+func emitGatedFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
 	ids := setPatternIDs(cs)
 	if len(ids) == 0 {
 		return b
@@ -528,7 +528,13 @@ func emitGatedFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal,
 	b = append(b, 0x20, lState)
 	b = append(b, 0x04, 0x40) // if some gate is zero
 
-	b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, tableMemIdx)
+	if absence {
+		// G12: prove absence by literal search instead of walking the union
+		// automaton — same over-approximating contract, ~15x cheaper.
+		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal)
+	} else {
+		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, tableMemIdx)
+	}
 
 	// gate[id] = 2*len + 2 for every id the pass proved dead.
 	for _, gid := range ids {

@@ -197,8 +197,15 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 			b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
 			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
 			b = append(b, 0x21, lChunk)
+			// Both flavours build ONE mask with the same compare chain; only
+			// what the mask means, and therefore the test against it, differs
+			// (plans/SETS.md §21.2 / G11).
+			probe := d.Exceptions
+			if d.Members != nil {
+				probe = d.Members
+			}
 			b = append(b, 0x41, 0x00) // mask accumulator
-			for _, e := range d.Exceptions {
+			for _, e := range probe {
 				b = append(b, 0x20, lChunk)
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, int32(e))
@@ -208,12 +215,34 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 				b = append(b, 0x72)       // i32.or
 			}
 			b = append(b, 0x22, lSkipMask)
-			b = append(b, 0x45, 0x04, 0x40) // if mask == 0                (H)
+			if d.Members != nil {
+				// Member mode: the mask marks bytes that STAY. The whole chunk
+				// self-loops iff every lane is set.
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, 0xFFFF)
+				b = append(b, 0x46)       // i32.eq
+				b = append(b, 0x04, 0x40) // if mask == 0xFFFF            (H)
+			} else {
+				b = append(b, 0x45, 0x04, 0x40) // if mask == 0           (H)
+			}
 			b = append(b, 0x20, lScanPos, 0x41, 0x10, 0x6A, 0x21, lScanPos)
 			b = append(b, 0x0C, 0x01) // br 1 → restart $skip (G)
 			b = append(b, 0x0B)       // end if (H)
-			// An exception is in this chunk: resume at it and leave the skip.
-			b = append(b, 0x20, lScanPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lScanPos)
+			// A byte that leaves the state is in this chunk: resume AT it and
+			// leave the skip. Exception mode's mask already marks it; member
+			// mode's marks the complement, so invert within the 16 lanes
+			// first. ctz is in [0,15] on both paths because the all-stay case
+			// was consumed by the branch above — and a ctz of 0 still makes
+			// progress, since the walk below then consumes that byte and
+			// changes the state.
+			if d.Members != nil {
+				b = append(b, 0x20, lScanPos, 0x20, lSkipMask, 0x41)
+				b = utils.AppendSLEB128(b, 0xFFFF)
+				b = append(b, 0x73)                       // i32.xor
+				b = append(b, 0x68, 0x6A, 0x21, lScanPos) // ctz; add; set
+			} else {
+				b = append(b, 0x20, lScanPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lScanPos)
+			}
 			b = append(b, 0x0C, 0x01) // br 1 → $skip_done (F)
 			b = append(b, 0x0B)       // end loop $skip (G)
 			b = append(b, 0x0B)       // end block $skip_done (F)
@@ -478,8 +507,11 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx, numPatterns int)
 		// the returned mask, so an empty slice would mask every bit off.
 		patternIDs:  make([]int, numPatterns),
 		tableMemIdx: tableMemIdx,
-		// G7: states this anchored walk may bulk-skip through (§18.3).
-		dominantSkip: dominantWalkStates(t),
+		// G7 + G11: states this anchored walk may bulk-skip through — the
+		// wide-self-loop flavour (§18.3) followed by the small-self-loop one
+		// (§21.2). Exception mode goes first so it keeps the cheaper compare
+		// chain's position when both fire.
+		dominantSkip: append(dominantWalkStates(t), memberWalkStates(t)...),
 	}
 	raw := buildSetProbeBody(p, true)
 	body = utils.AppendULEB128(nil, uint32(len(raw)))

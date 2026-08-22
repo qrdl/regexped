@@ -55,7 +55,8 @@ const (
 // result widened to int64, so an i32 -2 and an i64 -2 compare the same way.
 func btRawCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs ...int32) int64 {
 	t.Helper()
-	store, inst, mem, err := instantiate(wasmBytes)
+	store, inst, mem, release, err := instantiate(wasmBytes)
+	defer release()
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}

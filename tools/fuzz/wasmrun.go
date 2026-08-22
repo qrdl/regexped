@@ -132,8 +132,7 @@ func newWatchdog(eng *wasmtime.Engine) *watchdog {
 		disarm: make(chan struct{}),
 	}
 	go func() {
-		for store := range w.arm {
-			store.SetEpochDeadline(1)
+		for range w.arm {
 			select {
 			case <-time.After(wasmCallTimeout):
 				eng.IncrementEpoch()
@@ -146,8 +145,27 @@ func newWatchdog(eng *wasmtime.Engine) *watchdog {
 	return w
 }
 
-func (w *watchdog) Arm(store *wasmtime.Store) { w.arm <- store }
-func (w *watchdog) Disarm()                   { w.disarm <- struct{}{} }
+// Arm sets the store's epoch deadline ON THE CALLING GOROUTINE, then starts
+// the timer.
+//
+// The deadline used to be set inside the watchdog goroutine, which is a data
+// race on the Store (plans/FUZZER_BUGS.md bug 47). `w.arm <- store` returns as
+// soon as the goroutine RECEIVES, not after it finishes with the store, so the
+// caller went straight into fn.Call while the goroutine was still inside
+// SetEpochDeadline on that same store. wasmtime.Store is not thread-safe, so
+// that is a race into cgo.
+//
+// Scope of the claim: the race is established by inspection. It is NOT known
+// to have caused any observed failure — it was found while investigating bug
+// 49's worker aborts, and those continued unchanged after this fix.
+//
+// Only eng.IncrementEpoch stays on the goroutine, which is the one operation
+// wasmtime explicitly documents as safe to call from another thread.
+func (w *watchdog) Arm(store *wasmtime.Store) {
+	store.SetEpochDeadline(1)
+	w.arm <- store
+}
+func (w *watchdog) Disarm() { w.disarm <- struct{}{} }
 
 // isTimeout reports whether a wasmtime error is an epoch interruption.
 func isTimeout(err error) bool {

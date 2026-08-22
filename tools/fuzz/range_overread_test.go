@@ -54,7 +54,8 @@ func TestRangeVerifyNoOverreadAtMemoryEnd(t *testing.T) {
 			t.Fatalf("pattern=%q compile: %v", c.pattern, err)
 		}
 		for _, export := range []string{"match", "find"} {
-			store, inst, mem, err := instantiate(wasmBytes)
+			store, inst, mem, release, err := instantiate(wasmBytes)
+			defer release()
 			if err != nil {
 				t.Fatalf("pattern=%q instantiate: %v", c.pattern, err)
 			}

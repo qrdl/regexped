@@ -55,7 +55,8 @@ func runBatchFind(t *testing.T, pats []string, input string, outCap int32, overl
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}
-	store, inst, mem, err := instantiate(w)
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}

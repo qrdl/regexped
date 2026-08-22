@@ -60,7 +60,8 @@ func runGatedFind(t *testing.T, pats []string, input string) gatedRun {
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}
-	store, inst, mem, err := instantiate(w)
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}
@@ -284,7 +285,8 @@ func TestGatedOverflowStoresNoState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, inst, mem, err := instantiate(w)
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,9 +398,11 @@ func TestGatedLadderFuel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("module: %v", err)
 	}
+	defer mod.Close()
 
 	fuelAt := func(n int) uint64 {
 		store := wasmtime.NewStore(engine)
+		defer store.Close()
 		if err := store.SetFuel(1 << 42); err != nil {
 			t.Fatalf("set fuel: %v", err)
 		}

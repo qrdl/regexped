@@ -1466,6 +1466,25 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 					isolatedDFA = t
 				}
 			}
+			// isolatedDFA can still be nil here, and dereferencing it was a
+			// crash (plans/FUZZER_BUGS.md bug 50). analyzePattern returns
+			// EARLY for a non-greedy pattern, leaving p.suffixDFA nil with the
+			// note that compileFallback will build it — so this is the only
+			// place it exists, and the assignment above happens only when the
+			// AST is recoverable AND the merge succeeds. `.*?0...........`
+			// fails the merge (too many states) and reached the deref.
+			//
+			// Treated as the drop it already is: an isolated pattern whose own
+			// DFA cannot be built is exactly the case the state-limit branch
+			// below covers, and is reported the same way.
+			if isolatedDFA == nil {
+				warnPatternDropped(p, "isolated fallback bucket (suffix DFA could not be built)",
+					0, opts.maxFallbackStates())
+				if diag != nil {
+					diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
+				}
+				continue
+			}
 			if isolatedDFA.numStates > opts.maxFallbackStates() {
 				warnPatternDropped(p, "isolated fallback bucket", isolatedDFA.numStates, opts.maxFallbackStates())
 				if diag != nil {

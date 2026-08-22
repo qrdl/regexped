@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"regexp/syntax"
 	"sort"
+	"strconv"
 	"testing"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
@@ -52,6 +53,19 @@ type capRunner struct {
 	inBase int32
 	outPtr int32
 	npat   int
+	// release frees the wasmtime Store and Module. The runner OUTLIVES
+	// newCapRunner, so this cannot be deferred there — every caller must
+	// `defer r.Close()` instead (plans/FUZZER_BUGS.md bug 48).
+	release func()
+}
+
+// Close frees the runner's wasmtime resources. Using the runner afterwards is
+// a use-after-free.
+func (r *capRunner) Close() {
+	if r != nil && r.release != nil {
+		r.release()
+		r.release = nil
+	}
 }
 
 func newCapRunner(t *testing.T, pats []string, input string, overlapping bool) *capRunner {
@@ -60,13 +74,15 @@ func newCapRunner(t *testing.T, pats []string, input string, overlapping bool) *
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}
-	store, inst, mem, err := instantiate(w)
+	store, inst, mem, release, err := instantiate(w)
 	if err != nil {
+		release()
 		t.Fatalf("instantiate: %v", err)
 	}
 	const pageSize = 65536
 	dataTop, err := utils.ParseDataSectionBytes(w)
 	if err != nil {
+		release()
 		t.Fatalf("parse data section: %v", err)
 	}
 	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
@@ -84,7 +100,7 @@ func newCapRunner(t *testing.T, pats []string, input string, overlapping bool) *
 	if len(input) > 0 {
 		copy(mem.UnsafeData(store)[inBase:], input)
 	}
-	return &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats)}
+	return &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats), release: release}
 }
 
 func (r *capRunner) call(t *testing.T, name string, args ...interface{}) interface{} {
@@ -157,9 +173,42 @@ func normalizeForOracle(pat string) string {
 	return parsed.String()
 }
 
-func matchesAt(pat, input string, p int) bool {
+// probeCache memoises the `\A.{p}(?:pat)` probes matchesAt builds.
+//
+// Without it the oracle is QUADRATIC in input length per fuzz call, and the
+// quadratic is pure waste: oracleScanAll calls startsMatching once per `from`,
+// and each of those loops p from `from` to len — so the very same (pat, p)
+// probe is recompiled once for every `from` at or below p. Only n distinct
+// probes per pattern exist; the old code built O(n^2) of them, each costing
+// time proportional to the PATTERN's size.
+//
+// That is what made a single fuzz call exceed the 10s deadline Go's worker
+// arms per call (internal/fuzz.RunFuzzWorker → `panic("deadlocked!")`, whose
+// own comment notes the message is never printed) — see plans/FUZZER_BUGS.md
+// bug 49. Memoising is exact: the probe for a given (pat, p) is a pure
+// function of those two values.
+//
+// Bounded by clearing wholesale: patterns change every fuzz iteration, so an
+// unbounded map would grow for the life of the worker.
+const probeCacheMax = 4096
+
+var probeCache = map[string]*regexp.Regexp{}
+
+func probeFor(pat string, p int) *regexp.Regexp {
+	key := strconv.Itoa(p) + "\x00" + pat
+	if re, ok := probeCache[key]; ok {
+		return re
+	}
+	if len(probeCache) >= probeCacheMax {
+		probeCache = make(map[string]*regexp.Regexp, probeCacheMax)
+	}
 	re := regexp.MustCompile(`\A` + dotPrefix(p) + `(?:` + normalizeForOracle(pat) + `)`)
-	return re.MatchString(input)
+	probeCache[key] = re
+	return re
+}
+
+func matchesAt(pat, input string, p int) bool {
+	return probeFor(pat, p).MatchString(input)
 }
 
 func startsMatching(pat, input string, from int) []int {
@@ -220,6 +269,7 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 		for _, input := range tc.inputs {
 			t.Run(tc.name+"/"+input, func(t *testing.T) {
 				r := newCapRunner(t, tc.pats, input, true)
+				defer r.Close()
 				n := int32(len(input))
 
 				// match: anchored, whole input.
@@ -340,6 +390,7 @@ func TestSetFindOverflowContract(t *testing.T) {
 	pats := []string{"ab", "a", "abc"}
 	input := "abc"
 	r := newCapRunner(t, pats, input, true)
+	defer r.Close()
 	n := int32(len(input))
 
 	full := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.outPtr, int32(len(pats))).(int32))
@@ -363,6 +414,7 @@ func TestSetFindOverflowContract(t *testing.T) {
 // TestSetFromOutOfRange pins the §4.2 edge contract for from > len.
 func TestSetFromOutOfRange(t *testing.T) {
 	r := newCapRunner(t, []string{"a", "b"}, "ab", true)
+	defer r.Close()
 	n := int32(2)
 	if got := r.call(t, "cap_scan", r.inBase, n, int32(99)).(int32); got != 0 {
 		t.Errorf("scan(from>len) = %d, want 0", got)
@@ -420,7 +472,8 @@ func FuzzSetCaps(f *testing.F) {
 			}
 			t.Fatalf("set compile error on patterns Go stdlib accepts: %q + %q: %v", pat1, pat2, err)
 		}
-		store, inst, mem, err := instantiate(w)
+		store, inst, mem, release, err := instantiate(w)
+		defer release()
 		if err != nil {
 			t.Fatalf("instantiate: %v", err)
 		}
@@ -531,7 +584,8 @@ func TestSetWideAllBitmap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	store, inst, mem, err := instantiate(w)
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}
