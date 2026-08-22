@@ -409,6 +409,29 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		}
 	}
 
+	// A prefix containing \b or \B routes to fallback for the same reason,
+	// by a different mechanism.
+	//
+	// The prefix is verified by walking a REVERSED DFA leftward from the
+	// literal (buildLitAnchorBackScanBody). That walk carries no word-boundary
+	// context: it has no prevWasWord bit and never reads the wordChar table,
+	// because a backward scan cannot see the byte at input[start-1] that a
+	// boundary sitting at the prefix's LEFT EDGE depends on. Emitting it
+	// anyway silently loses matches — `\B.0` over "000" splits into prefix
+	// `\B.` + literal "0" and returned NOTHING, where [1,3) is a real match
+	// (plans/SETS.md §18.10).
+	//
+	// The forward suffix walk is unaffected and needs no guard: it threads
+	// exactly that context through midAcceptNW/midAcceptW, which is what
+	// FABLE B40 built. Only the backward prefix scan is blind, so only a
+	// prefix boundary disqualifies the split.
+	if info.prefixAST != nil && regexpHasWordBoundary(info.prefixAST) {
+		info.splittable = false
+		info.prefixAST = nil
+		info.suffixAST = nil
+		info.setTopLevelAnchor(parsed)
+	}
+
 	info.trivialPrefix = info.prefixAST == nil
 	if !info.trivialPrefix && info.prefixAST != nil {
 		minLen, maxLen := regexpMinMaxLen(info.prefixAST)
@@ -1683,4 +1706,22 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 		members = append(members, []*PatternInfo{p})
 	}
 	return buckets, members
+}
+
+// regexpHasWordBoundary reports whether re contains a \b or \B assertion
+// anywhere. Used to keep such prefixes out of the backward-scan split, whose
+// traversal has no word-boundary context (see analyzePattern).
+func regexpHasWordBoundary(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	if re.Op == syntax.OpWordBoundary || re.Op == syntax.OpNoWordBoundary {
+		return true
+	}
+	for _, sub := range re.Sub {
+		if regexpHasWordBoundary(sub) {
+			return true
+		}
+	}
+	return false
 }

@@ -27,7 +27,37 @@ import "github.com/qrdl/regexped/internal/utils"
 //
 // and return the bucket-local bitmask of matching patterns, already masked by
 // validMask. Bits above 31 cannot occur: binPack caps a bucket at 32 patterns.
+// probeExit selects when a scan probe stops walking.
+//
+//   - probeExitMaskComplete: stop once every ELIGIBLE pattern has been seen.
+//     Required by `scan_all`, whose answer is the full bitmask at this start.
+//   - probeExitFirstHit: stop at the first bit. Legal for `scan` (boolean) and
+//     for `scan_any`, which owes the earliest matching START plus AN ARBITRARY
+//     id at that start (§3.5) — emitRecordProbe keys on c.lStart, not on walk
+//     progress, so exiting early changes at most WHICH arbitrary id is
+//     reported, which the contract permits. Using it for `scan_all` would
+//     silently drop bits.
+//
+// The first-hit test is also cheaper than the mask compare it replaces (one
+// br_if against three instructions), so scan walks improve even before the
+// first accept.
+type probeExit int
+
+const (
+	probeExitMaskComplete probeExit = iota
+	probeExitFirstHit
+)
+
 func buildSetProbeBody(p setSuffixParams, anchored bool) []byte {
+	return buildSetProbeBodyExit(p, anchored, probeExitMaskComplete)
+}
+
+func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []byte {
+	if anchored && exit == probeExitFirstHit {
+		// An anchored answer is not monotone: a mid-walk accept says nothing
+		// about reaching `len`, so there is no first bit to stop on.
+		panic("compile: first-hit exit is not valid for an anchored probe")
+	}
 	l := p.l
 	tableMemIdx := p.tableMemIdx
 	n := len(p.patternIDs)
@@ -50,8 +80,28 @@ func buildSetProbeBody(p setSuffixParams, anchored bool) []byte {
 		lBits          = byte(7) // i32 accumulator
 	)
 
+	// Dominant-state bulk skip (plans/SETS.md §18.3 / G7), anchored only.
+	//
+	// Restricted to the uncompressed u8 layout for the same reason G5's unroll
+	// is: the compressed and u16 paths route the input byte through a class
+	// map or a scaled index. Also skipped for compiled-DFA-style layouts that
+	// are not plain direct-index.
+	var dom []dominantWalkState
+	if anchored && l.useU8 && !l.useCompression && p.dominantSkip != nil {
+		dom = p.dominantSkip
+	}
+
 	var b []byte
-	b = append(b, 0x01, 0x04, 0x7F) // 4 x i32 locals
+	if len(dom) > 0 {
+		// 4 i32 + 1 i32 skip mask, then 1 v128 chunk.
+		b = append(b, 0x02, 0x05, 0x7F, 0x01, 0x7B)
+	} else {
+		b = append(b, 0x01, 0x04, 0x7F) // 4 x i32 locals
+	}
+	const (
+		lSkipMask = byte(8)
+		lChunk    = byte(9)
+	)
 
 	// Entry state, keyed on paramStart — shared with buildSetSuffixBody, which
 	// is where the rule (and the reason it keys on paramStart rather than the
@@ -113,6 +163,63 @@ func buildSetProbeBody(p setSuffixParams, anchored bool) []byte {
 		const unroll = 4
 		b = append(b, 0x02, 0x40) // block $tail
 		b = append(b, 0x03, 0x40) // loop $main4
+
+		// Dominant-state bulk skip (plans/SETS.md §18.3 / G7).
+		//
+		// Placed at the TOP OF THE WALK, not at function entry: lState only
+		// becomes a dominant state after some bytes have been consumed, so an
+		// entry-time check never fires (measured: +11 fuel and no skips).
+		//
+		// Sound by the self-loop property alone. Every byte other than one of
+		// this state's exceptions maps the state to itself, so a chunk with no
+		// exception leaves the state unchanged and nothing observable is
+		// skipped — the anchored probe records NOTHING mid-walk, since every
+		// orTableBits call in this function is !anchored-guarded. On a hit the
+		// walk resumes AT the first exception byte, whose transition then runs
+		// normally.
+		//
+		// lState is a WASM id (0 = dead, table index + 1) and
+		// dominantWalkState.WASMState is in the same space: reorderAcceptFirst
+		// has already relabelled the table, and the u8 direct-index path
+		// applies no further permutation.
+		//
+		// Progress is guaranteed: the no-exception arm advances a full chunk,
+		// and the exception arm advances by ctz and leaves, after which the
+		// unrolled body consumes that byte and changes the state.
+		for _, d := range dom {
+			b = append(b, 0x20, lState, 0x41)
+			b = utils.AppendSLEB128(b, int32(d.WASMState))
+			b = append(b, 0x46, 0x04, 0x40) // if lState == d.WASMState   (E)
+			b = append(b, 0x02, 0x40)       // block $skip_done            (F)
+			b = append(b, 0x03, 0x40)       // loop  $skip                 (G)
+			// Whole chunk must be in range, else leave the skip to the walk.
+			b = append(b, 0x20, lScanPos, 0x41, 0x10, 0x6A, 0x20, paramLen, 0x4B, 0x0D, 0x01)
+			b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
+			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+			b = append(b, 0x21, lChunk)
+			b = append(b, 0x41, 0x00) // mask accumulator
+			for _, e := range d.Exceptions {
+				b = append(b, 0x20, lChunk)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(e))
+				b = append(b, 0xFD, 0x0F) // i8x16.splat
+				b = append(b, 0xFD, 0x23) // i8x16.eq
+				b = append(b, 0xFD, 0x64) // i8x16.bitmask
+				b = append(b, 0x72)       // i32.or
+			}
+			b = append(b, 0x22, lSkipMask)
+			b = append(b, 0x45, 0x04, 0x40) // if mask == 0                (H)
+			b = append(b, 0x20, lScanPos, 0x41, 0x10, 0x6A, 0x21, lScanPos)
+			b = append(b, 0x0C, 0x01) // br 1 → restart $skip (G)
+			b = append(b, 0x0B)       // end if (H)
+			// An exception is in this chunk: resume at it and leave the skip.
+			b = append(b, 0x20, lScanPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lScanPos)
+			b = append(b, 0x0C, 0x01) // br 1 → $skip_done (F)
+			b = append(b, 0x0B)       // end loop $skip (G)
+			b = append(b, 0x0B)       // end block $skip_done (F)
+			b = append(b, 0x0B)       // end if lState == d (E)
+		}
+
 		// Need all `unroll` bytes in range: lScanPos + unroll > paramLen → tail.
 		b = append(b, 0x20, lScanPos, 0x41, unroll, 0x6A, 0x20, paramLen, 0x4B, 0x0D, 0x01)
 		for k := 0; k < unroll; k++ {
@@ -145,11 +252,34 @@ func buildSetProbeBody(p setSuffixParams, anchored bool) []byte {
 	b = append(b, 0x20, lScanPos, 0x20, paramLen, 0x4F, 0x0D, 0x01)
 
 	if !anchored {
-		// Early exit: every eligible pattern has already been seen to match,
-		// so nothing further can change the answer. Only worth it for the scan
-		// probe — the anchored probe's answer is not monotone (a mid-accept
-		// says nothing about reaching `len`).
-		b = append(b, 0x20, lBits, 0x20, paramValidMask, 0x46, 0x0D, 0x01)
+		// Early exit. Only worth it for the scan probe — the anchored probe's
+		// answer is not monotone (a mid-accept says nothing about reaching
+		// `len`). Which test applies is the caller's choice; see probeExit.
+		if p.futureOff != 0 {
+			// G8 liveness exit: stop once no WANTED pattern can still accept
+			// from here. Strictly stronger than the tests below — it subsumes
+			// "all wanted seen" and also fires when the remainder is
+			// unreachable. Over-approximating futureAccepts only delays this;
+			// see compile/liveness.go on why that direction is the safe one.
+			//
+			//   future[state] & validMask & ~lBits == 0  ->  done
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, p.futureOff)
+			b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+			b = appendTableLoad64(b, tableMemIdx)
+			b = append(b, 0xA7) // i32.wrap_i64 — buckets cap at 32 patterns
+			b = append(b, 0x20, paramValidMask, 0x71)
+			b = append(b, 0x20, lBits, 0x41, 0x7F, 0x73, 0x71) // &^ lBits
+			b = append(b, 0x45, 0x0D, 0x01)                    // eqz -> $done
+		}
+		if exit == probeExitFirstHit {
+			// Any bit settles the question (plans/SETS.md §18.2 / G6).
+			b = append(b, 0x20, lBits, 0x0D, 0x01)
+		} else {
+			// Every eligible pattern already seen: nothing further can change
+			// the answer.
+			b = append(b, 0x20, lBits, 0x20, paramValidMask, 0x46, 0x0D, 0x01)
+		}
 
 		// Zero-width pre-transition accepts, as in buildSetSuffixBody.
 		if p.hasWordChar {
@@ -348,6 +478,8 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx, numPatterns int)
 		// the returned mask, so an empty slice would mask every bit off.
 		patternIDs:  make([]int, numPatterns),
 		tableMemIdx: tableMemIdx,
+		// G7: states this anchored walk may bulk-skip through (§18.3).
+		dominantSkip: dominantWalkStates(t),
 	}
 	raw := buildSetProbeBody(p, true)
 	body = utils.AppendULEB128(nil, uint32(len(raw)))

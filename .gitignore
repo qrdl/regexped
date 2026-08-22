@@ -51,3 +51,6 @@ node_modules
 package-lock.json
 plans/
 tools/likelytest/likelytest
+tools/setperf/setperf
+tools/setperf/*.txt
+tools/fuzz/found

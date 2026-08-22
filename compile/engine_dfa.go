@@ -4319,7 +4319,22 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 // patternIDs[k] is the global pattern ID written into the output tuple for bit k.
 // tableBase is the memory address at which this DFA's data will be placed.
 // tableMemIdx is 0 for standalone modules (single memory).
-func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, needProbes, gated bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+// needFirstHitProbe asks genSuffixWASM for the second scan-probe variant that
+// stops at the first matching bit — see probeExit / plans/SETS.md §18.2.
+// Threaded alongside needProbes rather than derived, because only CompileSet
+// knows which capabilities the set declares.
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, needProbes, gated bool, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+	// probeFlags[0]: also build the first-hit variant (set wants both rules).
+	// probeFlags[1]: the SOLE probe is first-hit (no scan_all declared), so
+	// scanProbe itself gets the cheap exit and no second body is emitted.
+	firstHit := len(probeFlags) > 0 && probeFlags[0] && needProbes
+	soleFirstHit := len(probeFlags) > 1 && probeFlags[1] && needProbes
+	// probeFlags[2]: emit the G8 liveness table and exit.
+	needFuture := len(probeFlags) > 2 && probeFlags[2] && needProbes
+	scanExit := probeExitMaskComplete
+	if soleFirstHit {
+		scanExit = probeExitFirstHit
+	}
 	sizePrefixed := func(body []byte) []byte {
 		out := utils.AppendULEB128(nil, uint32(len(body)))
 		return append(out, body...)
@@ -4334,6 +4349,9 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		if needProbes {
 			zero := []byte{0x00, 0x41, 0x00, 0x0B} // no locals; i32.const 0; end
 			art.scanProbe = sizePrefixed(zero)
+			if firstHit {
+				art.scanProbeAny = sizePrefixed(zero)
+			}
 		}
 		return
 	}
@@ -4351,7 +4369,12 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 			body := buildCountedChainSuffixBody(class, n, patternIDs[0], prefixMaxLen, gated)
 			art.fnBody = sizePrefixed(body)
 			if needProbes {
+				// A counted chain has no walk to exit early from — it is one
+				// SIMD verification — so both variants are the same body.
 				art.scanProbe = sizePrefixed(buildCountedChainProbeBody(class, n, false))
+				if firstHit {
+					art.scanProbeAny = sizePrefixed(buildCountedChainProbeBody(class, n, false))
+				}
 			}
 			return art, nil, 0, int32(tableBase)
 		}
@@ -4416,6 +4439,12 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		nlBitmaskOff = wbWBitmaskOff + int32(l.numWASM)*8
 	}
 
+	// G8 liveness table, placed after every other per-state table.
+	futureOff := int32(0)
+	if needFuture {
+		futureOff = nlBitmaskOff + int32(l.numWASM)*8
+	}
+
 	layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false, false))
 	dataBytes = append(dataBytes, layoutRaw...)
 	dataBytes = append(dataBytes, appendDataSegment(nil, midBitmaskOff, writeBitmask(t.midAcceptStates))...)
@@ -4434,6 +4463,12 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		dataSegCount++
 		nextTableOffset = nlBitmaskOff + int32(l.numWASM)*8
 	}
+	if needFuture {
+		futureOff = nextTableOffset
+		dataBytes = append(dataBytes, appendDataSegment(nil, futureOff, futureAcceptsBytes(t, l.numWASM))...)
+		dataSegCount++
+		nextTableOffset = futureOff + int32(l.numWASM)*8
+	}
 
 	p := setSuffixParams{
 		l:             l,
@@ -4444,6 +4479,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		// otherwise — or wasmMidStartNewline when the byte before lPos is a
 		// '\n', so a (?m:^) in a set fires at every line start rather than
 		// only at position 0 (plans/FABLE.md B40/B43, plans/SETS.md §9.5 S2).
+		futureOff:           futureOff,
 		wasmStart:           uint32(t.startState + 1),
 		wasmMidStart:        uint32(t.midStartState + 1),
 		wasmMidStartNewline: uint32(t.midStartNewlineState + 1),
@@ -4462,7 +4498,10 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	}
 	art.fnBody = sizePrefixed(buildSetSuffixBody(p))
 	if needProbes {
-		art.scanProbe = sizePrefixed(buildSetProbeBody(p, false))
+		art.scanProbe = sizePrefixed(buildSetProbeBodyExit(p, false, scanExit))
+		if firstHit {
+			art.scanProbeAny = sizePrefixed(buildSetProbeBodyExit(p, false, probeExitFirstHit))
+		}
 	}
 	return
 }
@@ -4480,10 +4519,26 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 type suffixArtifacts struct {
 	fnBody    []byte
 	scanProbe []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
+	// scanProbeAny is the same probe with a first-hit exit, for `scan` and
+	// `scan_any` (plans/SETS.md §18.2). Nil unless the set declares one of
+	// them; `scan_all` must keep using scanProbe.
+	scanProbeAny []byte
 }
 
 // setSuffixParams describes one bucket's suffix DFA for buildSetSuffixBody.
 type setSuffixParams struct {
+	// dominantSkip lists the states the ANCHORED probe may bulk-skip through
+	// (plans/SETS.md §18.3 / G7). Nil disables the skip entirely; it is purely
+	// a performance router and the emitted skip re-derives its own soundness
+	// from the self-loop property.
+	dominantSkip []dominantWalkState
+
+	// futureOff is the offset of the per-state "patterns that can still
+	// accept from here" table (plans/SETS.md §18.4 / G8). Zero disables the
+	// liveness exit; it is only emitted for sets a union preflight has
+	// narrowed, since otherwise it costs per byte and never fires (§16.5.2).
+	futureOff int32
+
 	l                             *dfaLayout
 	midBitmaskOff                 int32
 	eofBitmaskOff                 int32
@@ -4882,6 +4937,26 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	b = append(b, 0x03, 0x40) // loop $main
 
 	b = append(b, 0x20, lScanPos, 0x20, paramLen, 0x4F, 0x0D, 0x01) // pos>=len: br $done
+
+	// G9 liveness exit (plans/SETS.md §18.5): stop when no pattern this call
+	// still WANTS can accept from here.
+	//
+	// `find` records extents rather than a bitmask, so unlike the probe there
+	// is no "already seen" set to subtract — the test is purely reachability
+	// against validMask. It fires only because B′'s preflight has already
+	// written a never-again sentinel into the gate of every pattern that
+	// matches nowhere, which the §3.16 pre-mask then keeps out of validMask;
+	// without that this is §16.5.2's Candidate A, costing every byte and
+	// never firing.
+	if p.futureOff != 0 {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, p.futureOff)
+		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+		b = appendTableLoad64(b, tableMemIdx)
+		b = append(b, 0xA7) // i32.wrap_i64 — a bucket holds at most 32 patterns
+		b = append(b, 0x20, paramValidMask, 0x71)
+		b = append(b, 0x45, 0x0D, 0x01) // eqz -> br $done
+	}
 
 	// Zero-width pre-transition accept checks (before consuming current byte).
 	b = emitWBCheck(b)

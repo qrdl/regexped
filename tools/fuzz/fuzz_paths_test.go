@@ -459,20 +459,25 @@ func allStartPositionMatches(re *regexp.Regexp, input string) [][2]int {
 //
 // The obvious `(?s:.{p})` hits regexp/syntax's maxRepeat ceiling of 1000 and
 // fails to compile for any longer input — silently, if the caller treats a
-// compile error as "no matches". Nesting a {1000} repeat inside another repeat
-// keeps every count within the limit and covers inputs up to a million bytes,
-// far past anything the fuzzer generates.
+// compile error as "no matches".
+//
+// NESTING a repeat inside another repeat does NOT lift that ceiling, contrary
+// to what this comment claimed until 2026-08-21: Go rejects on the PRODUCT of
+// nested counts, so `(?:.{1000}){2}` is an error just as `.{2000}` is, and the
+// oracle panicked on every input of 2000 bytes or more while `pathsInputCap`
+// admits 128 KB. Found by FuzzSet on a 3,282-byte input (plans/SETS.md §18.7).
+//
+// CONCATENATION has no such limit — each term is independently under the
+// ceiling — so p/1000 copies of `.{1000}` plus a remainder term is correct for
+// any length the fuzzer can produce, at the cost of a longer pattern string.
 func dotPrefix(p int) string {
 	q, r := p/1000, p%1000
 	out := "(?s:"
-	if q > 0 {
-		out += "(?:.{1000}){" + strconv.Itoa(q) + "}"
+	for i := 0; i < q; i++ {
+		out += ".{1000}"
 	}
 	if r > 0 {
 		out += ".{" + strconv.Itoa(r) + "}"
-	}
-	if q == 0 && r == 0 {
-		out += ""
 	}
 	return out + ")"
 }

@@ -203,6 +203,19 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	b = append(b, 0x20, pFrom, 0x21, lPos)
 	// A `from` past the end yields no match, which the loop guard handles.
 
+	// Record the ENTRY state's accepts before consuming anything: a pattern
+	// that matches EMPTY at `from` accepts here and nowhere else. The loop
+	// below only ORs after a transition, so without this `\A` (and `a*`, and
+	// any other nullable pattern) is silently dropped — found by
+	// tools/fuzz FuzzSetCaps on {`$`, `\A`} over "0", which reported only
+	// `$` (plans/SETS.md §18.7).
+	b = append(b, 0x20, lAcc)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, u.acceptOff)
+	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x84, 0x21, lAcc)
+
 	b = append(b, 0x02, 0x40)                                 // block $done
 	b = append(b, 0x03, 0x40)                                 // loop $scan
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01) // pos >= len → br $done
@@ -317,4 +330,199 @@ func (cs *compiledSet) fullIDMask() uint64 {
 		}
 	}
 	return m
+}
+
+// --------------------------------------------------------------------------
+// G8: union preflight for `scan_any` (plans/SETS.md §18.4)
+
+// usesScanAnyPreflight reports whether this set's `scan_any` body should run
+// the union automaton once up front and narrow every bucket's validMask with
+// the result.
+//
+// All three gates matter, and the third is what separates this from §16.5.2's
+// reverted Candidate A. That change emitted a liveness check unconditionally,
+// measured +37.5%, and could never fire — because greedy-3's wanted mask
+// contained a pattern that was simultaneously never-recorded and never-dead.
+// The preflight removes exactly such patterns from the wanted mask, so the
+// check fires; without a never-dying state there is nothing to remove and the
+// whole mechanism is cost with no benefit, so it is not emitted at all.
+func (cs *compiledSet) usesScanAnyPreflight(mode setCapKind) bool {
+	if mode != capScanAny || cs.unionScan == nil {
+		return false
+	}
+	if cs.fe != frontendScalar {
+		return false // a literal frontend already skips input
+	}
+	for _, b := range cs.buckets {
+		if b.suffixDFA != nil && hasNeverDyingState(b.suffixDFA) {
+			return true
+		}
+	}
+	return false
+}
+
+// needsLivenessTable reports whether bucket bi should carry the G8 future
+// table. Emitted only for the sets the preflight serves, so ineligible sets
+// stay byte-identical.
+func (cs *compiledSet) needsLivenessTable() bool {
+	return cs.scanAny != "" && cs.unionScan != nil && cs.fe == frontendScalar
+}
+
+// emitUnionAliveMask runs the start-anywhere union automaton over [from, len)
+// and leaves in aliveLocal the i64 mask of pattern ids that match SOMEWHERE in
+// that range.
+//
+// This is emitUnionScanBody's loop without the capability epilogue, and it
+// keeps that body's entry-state rule (plans/SETS.md §14.12): at from == 0 the
+// scan really is at start of text and `^`/\A may fire, so the begin-context
+// state is correct; at from > 0 it is not, and midStart is. Getting that wrong
+// is silent, which is why it is restated here rather than assumed.
+func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal byte, tableMemIdx int) []byte {
+	const (
+		pInPtr = 0
+		pInLen = 1
+		pFrom  = 2
+	)
+	b = append(b, 0x42, 0x00, 0x21, aliveLocal)
+	b = append(b, 0x20, pFrom, 0x45)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(u.startState))
+	b = append(b, 0x21, lState)
+	b = append(b, 0x05)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(u.midStartState))
+	b = append(b, 0x21, lState)
+	b = append(b, 0x0B)
+	b = append(b, 0x20, pFrom, 0x21, lPos)
+
+	// Entry-state accepts: a pattern matching EMPTY at `from` accepts here and
+	// nowhere else (the §18.7 fix, for the same reason as in the scan body).
+	b = append(b, 0x20, aliveLocal)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, u.acceptOff)
+	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x84, 0x21, aliveLocal)
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $scan
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, u.transOff)
+	b = append(b, 0x20, lState, 0x41, 0x09, 0x74, 0x6A)
+	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00)
+	b = append(b, 0x41, 0x01, 0x74, 0x6A)
+	b = appendTableLoad16u(b, tableMemIdx)
+	b = append(b, 0x21, lState)
+
+	b = append(b, 0x20, aliveLocal)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, u.acceptOff)
+	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x84, 0x21, aliveLocal)
+
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, 0x00)
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block
+
+	// End-of-input accepts.
+	b = append(b, 0x20, aliveLocal)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, u.eofOff)
+	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+	b = appendTableLoad64(b, tableMemIdx)
+	b = append(b, 0x84, 0x21, aliveLocal)
+	return b
+}
+
+// usesGatedFindPreflight reports whether this set's gated `find` should run
+// B′: one union preflight per drive, whose result is written back into the
+// caller's gate array as a never-again sentinel (plans/SETS.md §18.5 / G9).
+func (cs *compiledSet) usesGatedFindPreflight() bool {
+	if cs.find == "" || cs.overlapping || cs.unionScan == nil {
+		return false
+	}
+	if cs.fe != frontendScalar {
+		return false
+	}
+	for _, b := range cs.buckets {
+		if b.suffixDFA == nil {
+			continue
+		}
+		if b.suffixDFA.hasWordBoundary || b.suffixDFA.hasNewlineBoundary {
+			return false
+		}
+	}
+	for _, b := range cs.buckets {
+		if b.suffixDFA != nil && hasNeverDyingState(b.suffixDFA) {
+			return true
+		}
+	}
+	return false
+}
+
+// emitGatedFindPreflight emits B′ (plans/SETS.md §18.5 / G9).
+//
+// Only while some gate is still 0 — i.e. the first call of a drive — run the
+// union automaton over [from,len) and, for every pattern it proves matches
+// NOWHERE, write `gate[id] = 2*len + 2`.
+//
+// That value is already legal in the §3.16 encoding: it is what an empty match
+// at `len` writes, and the pre-mask `2p + 1 >= gate[k]` is false for every
+// p <= len, so the pattern is excluded for the rest of the drive. No new kind
+// of value is introduced — that is the whole reason B′ is preferable to B.
+//
+// TWO CONTRACT NOTES, per §18.5:
+//   - the sentinel is written at CALL ENTRY, independent of whether a position
+//     is fully delivered, so it sits outside D2's "only after a fully
+//     delivered position" rule;
+//   - a caller resuming at a smaller `from` must zero the gate array first,
+//     which §3.14 already requires.
+//
+// Both are documented in docs/sets.md.
+func emitGatedFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen byte, tableMemIdx int) []byte {
+	ids := setPatternIDs(cs)
+	if len(ids) == 0 {
+		return b
+	}
+	// Run only when some gate is still zero: a fresh drive.
+	b = append(b, 0x41, 0x00, 0x21, lState) // lState doubles as "any gate zero"
+	for _, gid := range ids {
+		b = append(b, 0x20, pGate, 0x28, 0x02)
+		b = utils.AppendULEB128(b, uint32(gid*4))
+		b = append(b, 0x45) // i32.eqz
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x41, 0x01, 0x21, lState)
+		b = append(b, 0x0B)
+	}
+	b = append(b, 0x20, lState)
+	b = append(b, 0x04, 0x40) // if some gate is zero
+
+	b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, tableMemIdx)
+
+	// gate[id] = 2*len + 2 for every id the pass proved dead.
+	for _, gid := range ids {
+		if gid >= 64 {
+			continue
+		}
+		b = append(b, 0x20, aliveLocal)
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(gid))
+		b = append(b, 0x88)
+		b = append(b, 0x42, 0x01, 0x83)
+		b = append(b, 0x50)       // not alive
+		b = append(b, 0x04, 0x40) // if
+		b = append(b, 0x20, pGate)
+		b = append(b, 0x20, pInLen, 0x41, 0x01, 0x74, 0x41, 0x02, 0x6A) // 2*len + 2
+		b = append(b, 0x36, 0x02)
+		b = utils.AppendULEB128(b, uint32(gid*4)) // i32.store offset=gid*4
+		b = append(b, 0x0B)
+	}
+	b = append(b, 0x0B) // end if some gate zero
+	return b
 }

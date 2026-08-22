@@ -51,6 +51,16 @@ type compiledSet struct {
 	// scan capabilities.
 	scanProbeBodies [][]byte
 
+	// scanProbeAnyBodies[i] is bucket i's first-hit-exit probe, used by `scan`
+	// and `scan_any` only (plans/SETS.md §18.2 / G6). Empty when the set
+	// declares neither; `scan_all` always uses scanProbeBodies.
+	scanProbeAnyBodies [][]byte
+
+	// anyProbeIdx[bucket] = slot in scanProbeAnyBodies, or -1 when that
+	// bucket has no separate first-hit body (single-pattern buckets, or a set
+	// that needs only one exit rule).
+	anyProbeIdx []int
+
 	// anchoredBuckets / anchoredIDs / anchoredProbeBodies belong to the
 	// anchored trio. They are a SEPARATE packing over the full patterns,
 	// merged without leftmost-first pruning, because full consumption is not
@@ -199,7 +209,7 @@ func (cs *compiledSet) capFns() []setCapFn {
 // one per declared capability, plus the per-bucket suffix, prefix and probe helpers.
 func (cs *compiledSet) funcCount() int {
 	return len(cs.capFns()) + cs.numSuffixFns + len(cs.prefixFnBodies) +
-		len(cs.scanProbeBodies) + len(cs.anchoredProbeBodies)
+		len(cs.scanProbeBodies) + len(cs.scanProbeAnyBodies) + len(cs.anchoredProbeBodies)
 }
 
 // suffixFnBaseOffset returns the index of the first suffix function within this
@@ -216,9 +226,15 @@ func (cs *compiledSet) scanProbeBaseOffset() int {
 	return cs.prefixFnBaseOffset() + len(cs.prefixFnBodies)
 }
 
+// scanProbeAnyBaseOffset returns the index of the first first-hit-exit probe.
+// Equal to anchoredProbeBaseOffset when the set emits none.
+func (cs *compiledSet) scanProbeAnyBaseOffset() int {
+	return cs.scanProbeBaseOffset() + len(cs.scanProbeBodies)
+}
+
 // anchoredProbeBaseOffset returns the index of the first anchored-probe function.
 func (cs *compiledSet) anchoredProbeBaseOffset() int {
-	return cs.scanProbeBaseOffset() + len(cs.scanProbeBodies)
+	return cs.scanProbeAnyBaseOffset() + len(cs.scanProbeAnyBodies)
 }
 
 // WASM type-section indices used by the set path. The full table is written
@@ -278,6 +294,13 @@ type SetSpec struct {
 // tuple-writing suffix function (plans/SETS.md §5).
 func (s SetSpec) needsScanProbes() bool {
 	return s.Scan != "" || s.ScanAny != "" || s.ScanAll != ""
+}
+
+// needsFirstHitProbes reports whether the set declares a capability that may
+// stop at the first matching bit (plans/SETS.md §18.2 / G6). `scan_all` is
+// deliberately absent: its answer is the full bitmask at a position.
+func (s SetSpec) needsFirstHitProbes() bool {
+	return s.Scan != "" || s.ScanAny != ""
 }
 
 // needsAnchoredBuckets reports whether the set declares one of the anchored
@@ -380,6 +403,60 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	if needScanProbes {
 		scanProbeBodies = make([][]byte, len(buckets))
 	}
+	// Two probe variants are only needed when the set wants BOTH exit rules.
+	// With no `scan_all` declared, nothing needs the mask-complete walk, so
+	// the single probe simply IS the first-hit one and no second body — and
+	// no module bytes — are spent (plans/SETS.md §18.2).
+	// G8's liveness table is only worth its per-byte cost where a preflight
+	// will narrow the wanted mask (§18.4); elsewhere it is §16.5.2's reverted
+	// Candidate A all over again — a check that costs every byte and can
+	// never fire.
+	//
+	// The gate therefore mirrors usesScanAnyPreflight's own eligibility as
+	// closely as it can this early: `scan_any` declared, scalar frontend, some
+	// bucket with a never-dying walk, and NO word-boundary or (?m) pattern.
+	// The last is what §18.4 asks to be asserted here rather than inherited:
+	// buildUnionScanDFA refuses such sets, so they would get the table and the
+	// per-byte check with no preflight to make it fire.
+	needLiveness := (spec.ScanAny != "" || (spec.Find != "" && !spec.Overlapping)) && fe == frontendScalar
+	if needLiveness {
+		anyNeverDying, anyBoundary := false, false
+		for _, bkt := range buckets {
+			if bkt.suffixDFA == nil {
+				continue
+			}
+			if hasNeverDyingState(bkt.suffixDFA) {
+				anyNeverDying = true
+			}
+			if bkt.suffixDFA.hasWordBoundary || bkt.suffixDFA.hasNewlineBoundary {
+				anyBoundary = true
+			}
+		}
+		needLiveness = anyNeverDying && !anyBoundary
+	}
+	needFirstHit := spec.needsFirstHitProbes()
+	soleFirstHit := needFirstHit && spec.ScanAll == ""
+	needBothProbes := needFirstHit && spec.ScanAll != ""
+	// ...and only for buckets where the two rules can actually differ. A
+	// SINGLE-pattern bucket has one bit in validMask, so `lBits == validMask`
+	// already fires at the first bit — the variant would be a byte-for-byte
+	// duplicate. keywords-* is entirely single-pattern buckets, which is why
+	// this check turns a ~21% module-size regression into ~0 there.
+	// anyProbeIdx[bi] is the bucket's slot in scanProbeAnyBodies, or -1 to
+	// use the ordinary probe.
+	var scanProbeAnyBodies [][]byte
+	anyProbeIdx := make([]int, len(buckets))
+	for bi := range anyProbeIdx {
+		anyProbeIdx[bi] = -1
+	}
+	if needScanProbes && needBothProbes {
+		for bi, bkt := range buckets {
+			if len(bkt.patterns) > 1 {
+				anyProbeIdx[bi] = len(scanProbeAnyBodies)
+				scanProbeAnyBodies = append(scanProbeAnyBodies, nil)
+			}
+		}
+	}
 	var allDataBytes []byte
 	var totalDataSegs int
 	tableOffset := opts.TableBase // data segment base for this set's tables
@@ -420,12 +497,15 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], needScanProbes, gatedFind)
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], needScanProbes, gatedFind, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness)
 		if needSuffixFns {
 			suffixFnBodies[bi] = art.fnBody
 		}
 		if needScanProbes {
 			scanProbeBodies[bi] = art.scanProbe
+			if needBothProbes && anyProbeIdx[bi] >= 0 {
+				scanProbeAnyBodies[anyProbeIdx[bi]] = art.scanProbeAny
+			}
 		}
 		if reused {
 			// Bodies point at the tables emitted for the first bucket with
@@ -593,6 +673,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	}
 
 	var teddyTabs *teddyTables
+	var teddyTableEnd int32
 	var teddyDataOffset int32
 	var teddyDataBytes []byte
 	teddyDataSegCount := 0
@@ -605,6 +686,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		rawTeddy := buildTeddyRawBytes(tt)
 		teddyDataBytes = appendDataSegment(nil, teddyDataOffset, rawTeddy)
 		teddyDataSegCount = 1
+		teddyTableEnd = teddyDataOffset + int32(len(rawTeddy))
 	}
 
 	// Packed pair (§16 Task G1): no tables, so nothing is laid out here —
@@ -649,6 +731,27 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 
 	// The set match function body is built at assemble time (when function table
 	// indices are known). Store nil here; assembleModuleWithSets fills it in.
+	// setTablesEnd is the first free address after every table laid out so
+	// far, and it is a REAL end-of-region, not a sum of serialized data-segment
+	// lengths.
+	//
+	// Those two differ. A data segment's bytes include its own header, which
+	// over-counts, but a REGION can also contain gaps between segments — the
+	// anchored automaton leaves one between its transition table and its
+	// eofBitmask — and the byte sum under-counts those. The proxy this
+	// replaces got it wrong in the unsafe direction: for a set declaring all
+	// seven capabilities it placed the union-scan table 8 bytes INSIDE the
+	// anchored eofBitmask, silently overwriting the last state's accept mask.
+	// That is plans/SETS.md §18.10 — an anchored false positive that appeared
+	// only when unrelated capabilities were also declared.
+	setTablesEnd := prefixTableOffset
+	if acL != nil {
+		setTablesEnd = acFirstByteFlagsOff + 256 // firstByteFlags is last
+	}
+	if teddyTableEnd > setTablesEnd {
+		setTablesEnd = teddyTableEnd
+	}
+
 	cs := &compiledSet{
 		name:                spec.Name,
 		match:               spec.Match,
@@ -662,6 +765,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		declaredIDSpace:     spec.IDSpaceSize,
 		suffixFnBodies:      suffixFnBodies,
 		scanProbeBodies:     scanProbeBodies,
+		scanProbeAnyBodies:  scanProbeAnyBodies,
+		anyProbeIdx:         anyProbeIdx,
 		numSuffixFns:        len(suffixFnBodies),
 		dataBytes:           allDataBytes,
 		dataSegCount:        totalDataSegs,
@@ -698,7 +803,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// Anchored tables go after every other table this set emits; the data
 		// segment bytes include their own headers, so this over-estimates the
 		// end of the preceding regions, which is harmless.
-		anchoredTableBase := prefixTableOffset + int32(len(acDataBytes)) + int32(len(teddyDataBytes))
+		anchoredTableBase := setTablesEnd
 		abuckets, _ := compileAnchoredBuckets(spec.Patterns, opts, diag)
 		cs.anchoredBuckets = abuckets
 		cs.anchoredIDs = make([][]int, len(abuckets))
@@ -720,6 +825,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			cs.anchoredDataSegs += segs
 			anchoredOffset = next
 		}
+		if anchoredOffset > setTablesEnd {
+			setTablesEnd = anchoredOffset
+		}
 	}
 
 	// Start-anywhere union DFA for the scan trio (plans/SETS.md §14 P5).
@@ -732,9 +840,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// frontend already skips input and beats a table lookup per byte; this
 	// path is for the sets that have nothing to skip with, where the
 	// alternative is visiting every position with every bucket.
-	if fe == frontendScalar && (spec.Scan != "" || spec.ScanAll != "") {
-		unionBase := prefixTableOffset + int32(len(acDataBytes)) + int32(len(teddyDataBytes)) +
-			int32(len(cs.anchoredDataBytes))
+	if fe == frontendScalar && (spec.Scan != "" || spec.ScanAll != "" || spec.ScanAny != "") {
+		unionBase := setTablesEnd
 		cs.unionScan = buildUnionScanDFA(spec, opts, unionBase)
 	}
 
@@ -1094,6 +1201,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for range cs.scanProbeBodies {
 			fs = append(fs, byte(setTypeI32x4ToI32))
 		}
+		for range cs.scanProbeAnyBodies {
+			fs = append(fs, byte(setTypeI32x4ToI32))
+		}
 		for range cs.anchoredProbeBodies {
 			fs = append(fs, byte(setTypeI32x4ToI32))
 		}
@@ -1278,6 +1388,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					// the per-position bucket walk (plans/SETS.md §14 P5).
 					body = emitUnionScanBody(cs.unionScan, c.kind, cs.fullIDMask(), tableMemIdx)
 				} else {
+					// `scan` / `scan_any` may stop at the first bit and get
+					// the first-hit probes; `scan_all` needs every bit at the
+					// position and keeps the mask-complete ones (§18.2).
 					body = emitSetMatchFnFinal(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx, c.kind, scanProbeBase)
 				}
 				cs_bytes = append(cs_bytes, body...)
@@ -1290,6 +1403,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = append(cs_bytes, pfn...)
 		}
 		for _, pb := range cs.scanProbeBodies {
+			cs_bytes = append(cs_bytes, pb...)
+		}
+		for _, pb := range cs.scanProbeAnyBodies {
 			cs_bytes = append(cs_bytes, pb...)
 		}
 		for _, pb := range cs.anchoredProbeBodies {
@@ -1351,7 +1467,7 @@ func emitSetMatchFnFinal(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMe
 			return emitSetMatchFnFinalPackedPair(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
 		}
 	}
-	return emitSetMatchFnFinalScalar(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+	return emitSetMatchFnFinalScalar(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
 }
 
 // hasSetFallbackBuckets reports whether any bucket in the set is a fallback (no literal gate).
@@ -1369,18 +1485,47 @@ func hasSetFallbackBuckets(cs *compiledSet) bool {
 // Signature (plans/SETS.md §4.1): (ptr, len, from, out_ptr, out_cap) -> i32,
 // returning the TOTAL number of matches at the first matching position at or
 // after `from`. See compile/set_find.go for the first-position machinery.
-func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx int, mode setCapKind, probeFnBase int) []byte {
+func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemIdx int, mode setCapKind, probeFnBase int) []byte {
+	// G8 (plans/SETS.md §18.4): when this set qualifies, `scan_any` runs the
+	// start-anywhere union automaton ONCE over [from,len) and uses the result
+	// to drop patterns that match nowhere from every bucket's validMask. The
+	// per-bucket walks then terminate through the G8 liveness exit instead of
+	// running to end of input behind a never-dying pattern.
+	preflight := cs.usesScanAnyPreflight(mode)
+	// G9 (§18.5): the gated `find` body runs the same union pass once per
+	// drive and writes its result back as §3.16 gate sentinels.
+	findPreflight := mode == capFind && cs.usesGatedFindPreflight()
+
 	var b []byte
-	// locals: 8 x i32, then the scan_all i64 accumulator.
-	b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7E)
+	if preflight || findPreflight {
+		// 8 i32 + the union walk's state/pos, then i64 acc + i64 alive mask.
+		b = append(b, 0x02, 0x0A, 0x7F, 0x02, 0x7E)
+	} else {
+		// locals: 8 x i32, then the scan_all i64 accumulator.
+		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7E)
+	}
 
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	c.perPositionDrain = true
 	c.lAcc = c.localBase + 8
 	lPos := c.lPos
 	pInLen := c.pInLen
+	if preflight || findPreflight {
+		c.lAcc = c.localBase + 10
+		c.aliveMask = c.localBase + 11
+		c.aliveReady = preflight
+	}
 
+	if findPreflight {
+		// Before the prologue: emitGateJump reads the gate array, so the
+		// sentinels must already be in place for it to skip ahead correctly.
+		b = emitGatedFindPreflight(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
+			c.pGate, c.pInLen, tableMemIdx)
+	}
 	b = c.emitFindPrologue(b, lPos)
+	if preflight {
+		b = emitUnionAliveMask(b, cs.unionScan, c.localBase+8, c.localBase+9, c.aliveMask, tableMemIdx)
+	}
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $scan
@@ -2099,12 +2244,12 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	b = append(b, 0x21, lLaneMask)
 
 	// Process candidate lanes.
-	b = append(b, 0x02, 0x40) // block $lanes_done
-	b = append(b, 0x03, 0x40) // loop $lanes
-	b = append(b, 0x20, lLaneMask, 0x45, 0x0D, 0x01)                                        // mask == 0 → done
-	b = append(b, 0x20, lLaneMask, 0x68, 0x21, lLaneOff)                                    // ctz
+	b = append(b, 0x02, 0x40)                                                                // block $lanes_done
+	b = append(b, 0x03, 0x40)                                                                // loop $lanes
+	b = append(b, 0x20, lLaneMask, 0x45, 0x0D, 0x01)                                         // mask == 0 → done
+	b = append(b, 0x20, lLaneMask, 0x68, 0x21, lLaneOff)                                     // ctz
 	b = append(b, 0x20, lLaneMask, 0x20, lLaneMask, 0x41, 0x01, 0x6B, 0x71, 0x21, lLaneMask) // clear low bit
-	b = append(b, 0x20, lPos, 0x20, lLaneOff, 0x6A, 0x21, lMatchPos)                        // lMatchPos = lPos + lLaneOff
+	b = append(b, 0x20, lPos, 0x20, lLaneOff, 0x6A, 0x21, lMatchPos)                         // lMatchPos = lPos + lLaneOff
 
 	// Verify every literal at lMatchPos, from offset 0.
 	//

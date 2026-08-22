@@ -426,3 +426,44 @@ regexps
 -;0-1;-;-;0-1,1-2,2-3
 -;1-2;-;-;1-2
 -;1-2;-;-;1-2,3-4
+# ============================================================
+# ============================================================
+# Category S11: word boundary in a literal PREFIX
+# ============================================================
+# Regression block for plans/SETS.md §18.10 bug 2. `\B.0` splits into prefix
+# `\B.` plus mandatory literal "0", and the prefix is verified by walking a
+# REVERSED DFA leftward from the literal. That walk carries no word-boundary
+# context — no prevWasWord bit, no wordChar read — because a backward scan
+# cannot see the input[start-1] byte that a boundary at the prefix's LEFT EDGE
+# depends on. The pattern silently returned NO matches over "000", where
+# [1,3) is real. Such patterns now route to a fallback bucket instead.
+#
+# Category S8 covers \b/\B reached through the fallback path already; this
+# block is specifically a boundary inside a SPLIT prefix, a different route
+# that had no coverage.
+SetWordBoundaryPrefix
+strings
+"000"
+"0"
+"a0b0"
+"00"
+"x0y0z"
+regexps
+"\\B.0"
+-;1-3;-;-;1-3
+-;-;-;-;-
+-;2-4;-;-;2-4
+-;-;-;-;-
+-;2-4;-;-;2-4
+"\\B0"
+-;1-2;-;-;1-2,2-3
+-;-;-;-;-
+-;1-2;-;-;1-2,3-4
+-;1-2;-;-;1-2
+-;1-2;-;-;1-2,3-4
+"\\b.0"
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;0-2;-;-;0-2
+-;0-2;-;-;0-2

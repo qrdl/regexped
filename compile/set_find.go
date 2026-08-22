@@ -122,8 +122,12 @@ type setFindCtx struct {
 	// skipped with Teddy.
 	mode        setCapKind
 	probeFnBase int
-	wideBitmap  bool // scan_all with > 64 patterns: write a bitmap, count hits
-	maxLookback int  // M
+	// anyProbeBase / useAnyProbe route `scan` and `scan_any` to a bucket's
+	// first-hit-exit probe where one was emitted (plans/SETS.md §18.2).
+	anyProbeBase int
+	useAnyProbe  bool
+	wideBitmap   bool // scan_all with > 64 patterns: write a bitmap, count hits
+	maxLookback  int  // M
 	// drainSlack is added to M in the drain test. It covers frontends whose
 	// loop variable trails the literal start: the AC body advances a cursor to
 	// the literal's LAST byte, so a candidate discovered at `pos` can have its
@@ -163,6 +167,12 @@ type setFindCtx struct {
 	lBase      byte // tuple index this call's writes start at
 	lStart     byte // the match start of the group currently being evaluated
 	lAcc       byte // i64 bitmask accumulator, scan_all only
+	// aliveMask is an i64 local holding the ids that match SOMEWHERE in
+	// [from,len), filled once by the G8 union preflight; aliveReady says it
+	// exists. When set, emitGroupMask intersects every bucket's validMask
+	// with it, which is what lets the liveness exit fire (§18.4).
+	aliveMask  byte
+	aliveReady bool
 }
 
 // minStartSentinel is lMinStart's "nothing found yet" value. It is larger than
@@ -185,6 +195,43 @@ func (c *setFindCtx) needMinStartCompare() bool {
 		return false
 	}
 	return c.maxLookback != 0 || !c.perPositionDrain
+}
+
+// emitAliveNarrow intersects lValidMask with the patterns the G8 preflight
+// proved can match somewhere in [from,len).
+//
+// Correctness: removing a pattern with NO match in the search range cannot
+// change `scan_any`'s answer (§3.5) — it alters neither the earliest matching
+// start nor the set of ids available at that start. It is a no-op when the
+// preflight was not emitted.
+//
+// The alive mask is in GLOBAL id space; bucket bi's validMask is bucket-local,
+// so each bit is tested against its own global id. That is up to 32 tests, but
+// they run once per candidate position rather than per byte, and only for the
+// literal-less sets this path serves.
+func (c *setFindCtx) emitAliveNarrow(b []byte, bi int) []byte {
+	if !c.aliveReady || bi >= len(c.cs.patternIDs) {
+		return b
+	}
+	ids := c.cs.patternIDs[bi]
+	for k, gid := range ids {
+		if k >= 32 || gid >= 64 {
+			continue
+		}
+		// if (alive >> gid) & 1 == 0 { validMask &^= 1<<k }
+		b = append(b, 0x20, c.aliveMask)
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(gid))
+		b = append(b, 0x88)             // i64.shr_u
+		b = append(b, 0x42, 0x01, 0x83) // i64.and 1
+		b = append(b, 0x50)             // i64.eqz -> not alive
+		b = append(b, 0x04, 0x40)       // if
+		b = append(b, 0x20, c.lValidMask, 0x41)
+		b = utils.AppendSLEB128(b, int32(^(uint32(1) << uint(k))))
+		b = append(b, 0x71, 0x21, c.lValidMask)
+		b = append(b, 0x0B)
+	}
+	return b
 }
 
 // emitGroupMask computes lValidMask for ONE prefix-length group of bucket bi
@@ -211,7 +258,7 @@ func (c *setFindCtx) emitGroupMask(b []byte, bi int, g prefixLenGroup, posLocal 
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(g.mask))
 		b = append(b, 0x21, c.lValidMask)
-		return b
+		return c.emitAliveNarrow(b, bi)
 	}
 	sam := cs.startAnchorMasks[bi] & g.mask
 	lam := cs.lineAnchorMasks[bi] & g.mask
@@ -219,6 +266,7 @@ func (c *setFindCtx) emitGroupMask(b []byte, bi int, g prefixLenGroup, posLocal 
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(base))
 	b = append(b, 0x21, c.lValidMask)
+	b = c.emitAliveNarrow(b, bi)
 	if sam != 0 {
 		b = append(b, 0x20, posLocal, 0x45, 0x04, 0x40) // if posLocal == 0
 		b = append(b, 0x20, c.lValidMask, 0x41)
@@ -763,7 +811,7 @@ func (c *setFindCtx) emitProbeCall(b []byte, bi, litLen int, posLocal byte, mask
 	b = utils.AppendSLEB128(b, int32(mask))
 	b = append(b, 0x71)
 	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(c.probeFnBase+bi))
+	b = utils.AppendULEB128(b, uint32(c.probeIndex(bi)))
 	b = append(b, 0x21, c.lTmp)
 	return b
 }
@@ -951,12 +999,30 @@ func litOrderFor(cs *compiledSet) []int {
 // The gated body carries one extra parameter, so every local index shifts by
 // one. Keeping that in one place is why the frontends compute their indices
 // from localBase rather than declaring constants.
+// probeIndex is the function index of the probe bucket bi should call.
+//
+// `scan` and `scan_any` take the first-hit-exit body where the bucket has one;
+// `scan_all` always takes the ordinary mask-complete body, because its answer
+// is the full bitmask at this position and an early exit would drop bits.
+// Single-pattern buckets have no separate body — their mask-complete test
+// already fires at the first bit — so both callers share one probe.
+func (c *setFindCtx) probeIndex(bi int) int {
+	if c.useAnyProbe && bi < len(c.cs.anyProbeIdx) && c.cs.anyProbeIdx[bi] >= 0 {
+		return c.anyProbeBase + c.cs.anyProbeIdx[bi]
+	}
+	return c.probeFnBase + bi
+}
+
 func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack int, mode setCapKind, probeFnBase int) *setFindCtx {
 	gated := mode == capFind && cs.find != "" && !cs.overlapping
 	c := &setFindCtx{
 		cs: cs, suffixFnBase: suffixFnBase, prefixFnBaseIdx: prefixFnBaseIdx,
 		mode: mode, probeFnBase: probeFnBase,
-		maxLookback: cs.maxLookback, drainSlack: drainSlack,
+		// probeFnBase is the scan-probe base; the first-hit bodies follow the
+		// ordinary ones, so their base is that plus however many there are.
+		anyProbeBase: probeFnBase + len(cs.scanProbeBodies),
+		useAnyProbe:  mode == capScan || mode == capScanAny,
+		maxLookback:  cs.maxLookback, drainSlack: drainSlack,
 		gated:  gated,
 		pInPtr: 0, pInLen: 1, pFrom: 2,
 	}
