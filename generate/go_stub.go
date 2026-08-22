@@ -56,78 +56,166 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 		return "", false
 	}
 	var out strings.Builder
-	fmt.Fprintf(&out, "// ---- set composition wrappers ----\n\n")
-	fmt.Fprintf(&out, "// SetMatch is a match from a set find_any, find_all, or anchored match call.\ntype SetMatch struct { PatternID, Start, End int }\n\n")
+	fmt.Fprintf(&out, "// ---- set composition wrappers (plans/SETS.md §4.4) ----\n\n")
+	fmt.Fprintf(&out, "// SetMatch is one match reported by a set Find iterator.\ntype SetMatch struct { PatternID, Start, End int }\n\n")
 	needsIter := false
 	for _, s := range cfg.Sets {
-		bs := batchSize(s, cfg)
-		if s.FindAll != "" || s.FindAny != "" {
-			wasmExport := s.FindAll
-			if wasmExport == "" {
-				wasmExport = s.FindAny
+		n := patternsInSet(s, cfg)
+		konst := pascalSet(s.Name) + "PatternCount"
+		idN := idSpaceSize(s, cfg)
+		idKonst := pascalSet(s.Name) + "IDSpace"
+		wide := wideAllForm(s, cfg)
+
+		fmt.Fprintf(&out, "// %s is the number of patterns in set %q. It sizes the match buffer:\n// Find can report at most this many matches at one position.\nconst %s = %d\n\n", konst, s.Name, konst, n)
+		fmt.Fprintf(&out, "// %s is one past the largest pattern id set %q can report. Pattern ids\n// are global indices into regexps:, so a set holding a few late-declared\n// patterns has a small count and a large id space. Everything indexed BY an\n// id \u2014 the gate array, the _all bitmask \u2014 is sized from this.\nconst %s = %d\n\n", idKonst, s.Name, idKonst, idN)
+
+		imp := func(name, sig string) {
+			fmt.Fprintf(&out, "//go:wasmimport %s %s\n//go:noescape\nfunc ffi_%s%s\n\n", cfg.ImportModule, name, name, sig)
+		}
+		const inArgs = "ptr unsafe.Pointer, length int32"
+
+		if s.Match != "" {
+			imp(s.Match, "("+inArgs+") int32")
+			pub := goPublicName(s.Match)
+			fmt.Fprintf(&out, `// %s reports whether some pattern in the set matches the WHOLE input.
+func %s(input []byte) bool {
+	return ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input))) != 0
+}
+
+`, pub, pub, s.Match)
+		}
+		if s.MatchAny != "" {
+			imp(s.MatchAny, "("+inArgs+") int32")
+			pub := goPublicName(s.MatchAny)
+			fmt.Fprintf(&out, `// %s returns the id of SOME pattern matching the whole input.
+// A set is unordered, so which id you get is unspecified when several match.
+func %s(input []byte) (int, bool) {
+	r := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)))
+	if r < 0 { return 0, false }
+	return int(r), true
+}
+
+`, pub, pub, s.MatchAny)
+		}
+		if s.MatchAll != "" {
+			pub := goPublicName(s.MatchAll)
+			if wide {
+				imp(s.MatchAll, "("+inArgs+", outPtr unsafe.Pointer) int32")
+				fmt.Fprintf(&out, `// %s returns the ids of every pattern matching the whole input.
+func %s(input []byte) []int {
+	bits := make([]byte, (%s+7)/8)
+	n := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), unsafe.Pointer(&bits[0]))
+	out := make([]int, 0, n)
+	for k := 0; k < %s; k++ {
+		if bits[k/8]&(1<<uint(k%%8)) != 0 { out = append(out, k) }
+	}
+	return out
+}
+
+`, pub, pub, idKonst, s.MatchAll, idKonst)
+			} else {
+				imp(s.MatchAll, "("+inArgs+") int64")
+				fmt.Fprintf(&out, `// %s returns the ids of every pattern matching the whole input.
+func %s(input []byte) []int {
+	mask := uint64(ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input))))
+	var out []int
+	for k := 0; k < %s; k++ {
+		if mask&(1<<uint(k)) != 0 { out = append(out, k) }
+	}
+	return out
+}
+
+`, pub, pub, s.MatchAll, idKonst)
 			}
-			ffiName := "ffi_" + wasmExport
-			fmt.Fprintf(&out, "//go:wasmimport %s %s\n//go:noescape\nfunc %s(ptr unsafe.Pointer, length int32, outPtr unsafe.Pointer, outCap int32, startPos int32) int32\n\n",
-				cfg.ImportModule, wasmExport, ffiName)
-			if s.FindAll != "" {
-				needsIter = true
-				pubName := goPublicName(s.FindAll)
-				fmt.Fprintf(&out, `// %s returns an iter.Seq[SetMatch] over all matches (may include overlapping matches at the same start position).
-func %s(input []byte) iter.Seq[SetMatch] {
+		}
+		if s.Scan != "" {
+			imp(s.Scan, "("+inArgs+", from int32) int32")
+			pub := goPublicName(s.Scan)
+			fmt.Fprintf(&out, `// %s reports whether some pattern matches at a position at or after from.
+func %s(input []byte, from int) bool {
+	return ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(from)) != 0
+}
+
+`, pub, pub, s.Scan)
+		}
+		if s.ScanAny != "" {
+			imp(s.ScanAny, "("+inArgs+", from int32) int64")
+			pub := goPublicName(s.ScanAny)
+			fmt.Fprintf(&out, `// %s returns the pattern id and start of the FIRST position at or after
+// from where anything matches. Which id you get is unspecified when several
+// patterns match at that position.
+func %s(input []byte, from int) (id, start int, ok bool) {
+	packed := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(from))
+	if packed < 0 { return 0, 0, false }
+	return int(packed & 0xFFFFFFFF), int(packed >> 32), true
+}
+
+`, pub, pub, s.ScanAny)
+		}
+		if s.ScanAll != "" {
+			pub := goPublicName(s.ScanAll)
+			if wide {
+				imp(s.ScanAll, "("+inArgs+", from int32, outPtr unsafe.Pointer) int32")
+				fmt.Fprintf(&out, `// %s returns the ids of every pattern matching somewhere at or after from.
+func %s(input []byte, from int) []int {
+	bits := make([]byte, (%s+7)/8)
+	n := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(from), unsafe.Pointer(&bits[0]))
+	out := make([]int, 0, n)
+	for k := 0; k < %s; k++ {
+		if bits[k/8]&(1<<uint(k%%8)) != 0 { out = append(out, k) }
+	}
+	return out
+}
+
+`, pub, pub, idKonst, s.ScanAll, idKonst)
+			} else {
+				imp(s.ScanAll, "("+inArgs+", from int32) int64")
+				fmt.Fprintf(&out, `// %s returns the ids of every pattern matching somewhere at or after from.
+func %s(input []byte, from int) []int {
+	mask := uint64(ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(from)))
+	var out []int
+	for k := 0; k < %s; k++ {
+		if mask&(1<<uint(k)) != 0 { out = append(out, k) }
+	}
+	return out
+}
+
+`, pub, pub, s.ScanAll, idKonst)
+			}
+		}
+		if s.Find != "" {
+			needsIter = true
+			pub := goPublicName(s.Find)
+			gateDecl, gateArg, gateDoc := "", "", ""
+			if gatedFind(s) {
+				imp(s.Find, "("+inArgs+", from int32, gatePtr unsafe.Pointer, outPtr unsafe.Pointer, outCap int32) int32")
+				gateDecl = "\t\tgates := make([]uint32, " + idKonst + ")\n"
+				gateArg = "unsafe.Pointer(&gates[0]), "
+				gateDoc = " and a zeroed gate array"
+			} else {
+				imp(s.Find, "("+inArgs+", from int32, outPtr unsafe.Pointer, outCap int32) int32")
+			}
+			fmt.Fprintf(&out, `// %s iterates the set's matches from position from. The sequence owns a
+// reusable tuple buffer%s; each step yields one match, and each WASM call
+// returns every match at one position before the scan advances.
+func %s(input []byte, from int) iter.Seq[SetMatch] {
 	return func(yield func(SetMatch) bool) {
-		buf := make([][3]int32, %d)
-		startPos := int32(0)
+		buf := make([][3]int32, %s)
+%s		pos := int32(from)
 		for {
-			n := %s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), unsafe.Pointer(&buf[0]), %d, startPos)
+			n := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), pos, %sunsafe.Pointer(&buf[0]), %s)
 			if n <= 0 { return }
+			// Every tuple in one call shares a start; resume one past it.
+			next := buf[0][1] + 1
 			for i := int32(0); i < n; i++ {
-				m := SetMatch{PatternID: int(buf[i][0]), Start: int(buf[i][1]), End: int(buf[i][1]+buf[i][2])}
-				if !yield(m) { return }
+				if !yield(SetMatch{PatternID: int(buf[i][0]), Start: int(buf[i][1]), End: int(buf[i][2])}) { return }
 			}
-			// find_all returns when EITHER the buffer is full (n == cap) OR the
-			// input has been fully scanned (n < cap). Only the buffer-full case
-			// needs a resume; otherwise we're done with this input.
-			if n < %d { return }
-			// Advance by exactly one position past the last reported start:
-			// the WASM scan is position-by-position and only positions <= last.start
-			// have been visited when the buffer fills, regardless of last.length.
-			startPos = buf[n-1][1] + 1
+			pos = next
 		}
 	}
 }
 
-`, pubName, pubName, bs, ffiName, bs, bs)
-			}
-			if s.FindAny != "" {
-				pubName := goPublicName(s.FindAny)
-				anyFfi := "ffi_" + s.FindAny
-				if s.FindAll != "" {
-					anyFfi = "ffi_" + s.FindAll
-				}
-				fmt.Fprintf(&out, `// %s returns the first match, or zero value and false if none.
-func %s(input []byte) (SetMatch, bool) {
-	var buf [1][3]int32
-	if %s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), unsafe.Pointer(&buf[0]), 1, 0) <= 0 { return SetMatch{}, false }
-	return SetMatch{PatternID: int(buf[0][0]), Start: int(buf[0][1]), End: int(buf[0][1]+buf[0][2])}, true
-}
-
-`, pubName, pubName, anyFfi)
-			}
-		}
-		if s.Match != "" {
-			ffiName := "ffi_" + s.Match
-			pubName := goPublicName(s.Match)
-			fmt.Fprintf(&out, "//go:wasmimport %s %s\n//go:noescape\nfunc %s(ptr unsafe.Pointer, length int32, outPtr unsafe.Pointer, outCap int32) int32\n\n",
-				cfg.ImportModule, s.Match, ffiName)
-			fmt.Fprintf(&out, `// %s anchored match: returns the first matching pattern with Start=0, or nil.
-func %s(input []byte) *SetMatch {
-	var buf [1][3]int32
-	if %s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), unsafe.Pointer(&buf[0]), 1) <= 0 { return nil }
-	m := SetMatch{PatternID: int(buf[0][0]), Start: int(buf[0][1]), End: int(buf[0][1]) + int(buf[0][2])}
-	return &m
-}
-
-`, pubName, pubName, ffiName)
+`, pub, gateDoc, pub, konst, gateDecl, s.Find, gateArg, konst)
 		}
 	}
 	if hasEmitNameMap(cfg) {

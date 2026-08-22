@@ -107,10 +107,10 @@ Per-language wasmtime examples live under [`examples/wasmtime/`](../examples/was
 |---|---|---|---|
 | Rust | [`rust/url-ipv6/`](../examples/wasmtime/rust/url-ipv6/) | DFA | Anchored match — validate IPv6 URLs |
 | Rust | [`rust/secrets/`](../examples/wasmtime/rust/secrets/) | DFA find | Three-pattern credential scan (GitHub PAT, JWT, AWS) |
-| Rust | [`rust/secret-scanner/`](../examples/wasmtime/rust/secret-scanner/) | Set `find_all` | Multi-pattern secret detection via the set pipeline |
+| Rust | [`rust/secret-scanner/`](../examples/wasmtime/rust/secret-scanner/) | Set `find` | Multi-pattern secret detection, calling the WASM export directly (gate array and all) |
 | Go | [`go/csv/`](../examples/wasmtime/go/csv/) | TDFA named groups | CSV parse + email validation |
 | Go | [`go/sql-injection/`](../examples/wasmtime/go/sql-injection/) | Backtracking | SQL injection capture groups |
-| Go | [`go/secret-scanner/`](../examples/wasmtime/go/secret-scanner/) | Set `find_all` | Set composition from Go (wasip1) |
+| Go | [`go/secret-scanner/`](../examples/wasmtime/go/secret-scanner/) | Set `find` | Set composition from Go (wasip1), via the generated `iter.Seq` |
 | C | [`c/url-parts/`](../examples/wasmtime/c/url-parts/) | TDFA named groups | Parse URLs into `scheme`/`host`/`port`/… |
 | AssemblyScript | [`as/find-email/`](../examples/wasmtime/as/find-email/) | TDFA | Email extraction with `user`/`domain` groups |
 | AssemblyScript | [`as/inject-scanner/`](../examples/wasmtime/as/inject-scanner/) | Set | Injection pattern scanner |

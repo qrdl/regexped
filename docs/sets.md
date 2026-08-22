@@ -8,8 +8,10 @@ their positions and pattern IDs.
 
 | Situation | Recommendation |
 |---|---|
-| Scanning text for any of N patterns (WAF, secret scanning, log analysis) | Use `find_all` set |
-| Classifying input by which pattern matches from position 0 (URL validation, SQL type detection) | Use `match` set |
+| Scanning text for any of N patterns, with positions (WAF, secret scanning, log analysis) | Declare `find` |
+| "Is anything in here at all?" | Declare `scan` — a boolean, no positions, no extents |
+| "Which patterns appear somewhere?" | Declare `scan_all` |
+| Classifying whole inputs by which pattern they match (URL validation, SQL type detection) | Declare `match_any` or `match_all` |
 | 1–3 patterns, simple scan | Individual `find_func` exports are sufficient |
 | N > 4 patterns, same corpus scanned repeatedly | Set composition pays off |
 
@@ -33,10 +35,21 @@ regexps: [p1, p2, ..., pN]
                                hint-selected prefilter over the scalar path)
             │
             ▼
-    assembleModuleWithSets() ← emit WASM: suffix DFAs + set match function
+    assembleModuleWithSets() ← emit WASM: DFA tables, per-capability bodies,
+                               plus a second anchored packing when a match_*
+                               capability is declared
 ```
 
-## YAML configuration
+Everything above is the NON-anchored pipeline. The anchored capabilities get
+their own packing over the full patterns — see
+[below](#the-anchored-capabilities-use-their-own-automata) for why they have
+to.
+
+## The seven capabilities
+
+A set declares which questions it needs answered, and the compiler emits only
+the machinery those questions require. The **key** names the capability; the
+**value** is the WASM export / generated-function name you choose.
 
 ```yaml
 regexps:
@@ -47,148 +60,196 @@ regexps:
 
 sets:
   - name: secret_scanner
-    find_all: scan_secrets  # export name for the non-anchored all-matches function
-    find_any: scan_first    # export name for the non-anchored first-match function
-    match: validate         # export name for the anchored match function
-    batch_size: 256         # output buffer size (stub-gen knob; default 256)
-    emit_name_map: true     # emit pattern_name(id) helper in generated stubs
-    hints: [prefer-no-match] # optional; this set's LikelyMode default (see below)
-    patterns:
-      - aws_key
-      - github_pat
-      # or: patterns: "all"   ← include every entry in regexps:
+    # ---- anchored: the match must span the WHOLE input (0..len) ----
+    match:      is_secret        # -> yes/no
+    match_any:  which_secret     # -> one pattern id, or none
+    match_all:  all_secret_kinds # -> every matching pattern id
+    # ---- non-anchored: each takes a `from` position ----
+    scan:       has_secret       # -> yes/no
+    scan_any:   first_secret     # -> one pattern id + where it starts
+    scan_all:   secret_kinds     # -> every pattern matching somewhere
+    find:       scan_secrets     # -> the matches at the next matching position
+    overlapping: false           # optional; see "Overlap policy" below
+    patterns:   all
+    emit_name_map: true
 ```
 
-At least one of `find_all`, `find_any`, or `match` must be set per entry.
+The grid: `match_*` is anchored, `scan_*` is not; bare is a boolean, `_any` is
+one arbitrary matching pattern, `_all` is every matching pattern. `find` is the
+only capability that reports positions and extents.
 
-### `hints:` — this set's LikelyMode default
+At least one capability must be declared. Every capability value must be a
+valid identifier in all six stub languages (see
+[cli.md](cli.md#export-name-rules)).
 
-`hints: [prefer-match]` or `hints: [prefer-no-match]` (mutually exclusive)
-biases the set's own compiled code shape — see [prefer-hints.md](prefer-hints.md)
-for the full mechanism. Concretely, for sets this affects:
+> **Migration trap.** `match:` used to mean "anchored, returns the matching
+> pattern id". It now means "anchored, yes/no". An existing config keeps
+> parsing and silently changes capability — no parsing policy can catch that,
+> because the key stays valid. If you want the old meaning, use `match_any:`.
+> The retired keys `find_any`, `find_all` and `batch_size` are caught loudly:
+> config parsing is strict, so they fail as unknown-field errors.
 
-- the [literal scan frontend](#literal-scan-frontend) selection below
-  (`prefer-no-match` forces Shufti over scalar for a 17–64-byte first-byte
-  union, regardless of the density heuristic);
-- the [bin-packing](#bin-packing-and-merge-constraints) gate that avoids
-  merging counted-class-chain-eligible patterns together under
-  `prefer-match`.
+### What "anchored" means here
 
-**Per-pattern `hints:` on individual `regexps:` entries are not consulted
-for patterns placed inside a set** — only the set's own `hints:` field is
-read when compiling set members. A pattern's `hints:` only takes effect
-when that pattern is also compiled standalone (via its own `match_func`/
-`find_func`/`groups_func`/`named_groups_func`).
+`match`, `match_any` and `match_all` require **full consumption**: the pattern
+must match from position 0 to `len`, i.e. `\A(?:p)\z`. A pattern matching a
+proper prefix does not count. This is the same rule the single-pattern
+`match_func` has always used.
 
-**`batch-find` (docs/cli.md) is a separate, per-pattern-only mechanism and is
-rejected outright on a `sets:` entry's `hints:`** — it is a load-time error,
-not a silent no-op. Sets already have their own batching for `find_all` via
-`batch_size` (see [Output tuple formats](#output-tuple-formats) below); the
-two are unrelated and not interchangeable. A pattern's own `batch-find` hint
-still applies normally to that pattern's *own* standalone exports even if the
-pattern is also a set member — the set's `find_all`/`find_any`/`match`
-exports are unaffected either way.
-
-## Output tuple formats
-
-### find_all / find_any — find tuples (12 bytes each)
+### `find` — the positional capability
 
 ```
-out_ptr + i*12 + 0 : pattern_id  i32   global YAML order index
-out_ptr + i*12 + 4 : start       i32   absolute byte offset of match start
-out_ptr + i*12 + 8 : length      i32   byte length of match
+find(input, from) -> the matches at the FIRST position at or after `from`
+                     where anything in the set matches
 ```
 
-The host calls with `(in_ptr, in_len, out_ptr, out_cap, start_pos)` and
-receives `count` (tuples written). Tuples within a batch are emitted in
-strictly non-decreasing `start` order.
+Two invariants make this easy to consume:
 
-**Resume rule.** After a batch of `count` tuples, let `last` be the final
-tuple. To resume the scan, advance with
+- **every match returned by one call shares the same start** — that position is
+  the answer to "where", so there is no separate locate step;
+- the return value is the **total** number of matches at that position, which
+  can exceed the buffer capacity; the buffer takes what fits.
 
-```
-start_pos = last.start + 1
-```
+Iterating is therefore "call, use, resume at `start + 1`". The generated stubs
+do exactly that and hand you one match at a time.
 
-The WASM scan is position-by-position: it visits each input position in turn,
-emits all matches anchored there, then increments. When the buffer fills it
-exits at the *top* of the next iteration, so the only positions guaranteed to
-have been visited in the batch are those `≤ last.start`. Advancing by
-`last.length` (or `end`) would skip positions inside the last match's span
-that the WASM has not yet scanned, silently dropping matches at those
-positions.
+The order of the matches *within* one call is unspecified — not by pattern id,
+not by extent, not stable across compiler versions. Sort what you collect if
+you need a specific order.
 
-**Mid-position truncation.** When `count == out_cap` the suffix DFA respects
-the remaining capacity and stops writing as soon as the buffer is full, even
-if more patterns match at `last.start`. To avoid losing same-position
-matches, size `out_cap ≥ (number of patterns in the set)` — this guarantees
-no single start position can produce more matches than the buffer holds, so
-when the buffer fills it does so on a position boundary. Generated stubs
-floor the effective capacity at `max(batch_size, 64, patterns_in_set)`, so
-they always satisfy this. Hosts that bypass the generated stubs and want to
-use a smaller buffer must dedupe `(pattern_id, start)` pairs across batches.
+### Overlap policy
 
-### match — match tuples (12 bytes each)
+By default a set's `find` is **per-pattern non-overlapping**: each pattern
+reports its matches the way Go's `FindAllIndex` does, independently of the
+others. `[a-z]+X` on `"abcX foo"` reports `0-4` once, not `0-4 1-4 2-4`.
 
-Same layout as `find_all`/`find_any`:
-
-```
-out_ptr + i*12 + 0 : pattern_id  i32   global YAML order index
-out_ptr + i*12 + 4 : start       i32   always 0 for anchored match
-out_ptr + i*12 + 8 : length      i32   byte length of match
+```yaml
+sets:
+  - name: s
+    find: scan_all_positions
+    overlapping: true      # every start position, no filtering
 ```
 
-The host calls with `(in_ptr, in_len, out_ptr, out_cap)` and receives `count`
-(tuples written; 0 if no pattern matches anchored at position 0). Anchored
-match is not batched — one call returns all matching patterns, up to `out_cap`.
-Each tuple occupies 12 bytes; decode three little-endian i32s at offsets 0, 4,
-and 8. `end = start + length` (with `start = 0`).
+`overlapping: true` opts into the full enumeration: for every start position,
+every pattern matching exactly there. It is the right choice when you genuinely
+want to see every possible match rather than a non-overlapping selection, and
+it is measurably faster to *emit* (no gating code at all) — but on greedy or
+unbounded-tail patterns it is quadratic in the input, because every start runs
+a DFA to its own extent. The default exists to avoid that.
 
-> **Stub behaviour.** The generated stubs call the anchored `match` export
-> with `out_cap = 1` and surface only the first matching pattern. Rust, Go,
-> JavaScript, and TypeScript reuse the same `SetMatch { pattern_id, start, end }`
-> shape used for `find_all`/`find_any` (with `start == 0`). The C and
-> AssemblyScript stubs use a dedicated anchored type — `rx_set_anchor_t`
-> (`{ pattern_id, end }`) and `SetAnchorMatch` (`{ patternId, end }`)
-> respectively — which omits the always-zero `start` field. This is a
-> deliberate ergonomic choice for the common "which pattern matches here?"
-> use case. Hosts that need every pattern matching at position 0 must call
-> the WASM export directly with `out_cap ≥ patterns_in_set` and decode the
-> tuple buffer as described above.
+`overlapping` only affects `find`; declaring it on a set without `find:` is a
+load error.
 
-## Batched streaming and batch_size
+The empty-match rule follows Go's: after a match ending at `e` the next match
+may start at `e`, except an empty match exactly at `e` is skipped; after an
+empty match at `e` the search resumes past it. We advance by one **byte** where
+Go advances by one rune — the same byte-orientation the single-pattern stub
+iterators document.
 
-`find_all` iterators are batched: the WASM function writes up to `out_cap`
-tuples per call. The `batch_size` YAML field controls the default buffer size
-used in generated stubs (default 256). Tune it:
+## The gate array
 
-- **Dense matches** (many matches per KB): increase `batch_size` to amortise
-  host↔WASM transition overhead
-- **Memory-tight environments**: reduce `batch_size`
+The default (non-overlapping) `find` needs to remember, per pattern, where that
+pattern may match again. That state lives in a **caller-owned array**, not
+inside the module:
 
-The stub generator always raises the effective capacity to at least
-`max(64, patterns_in_set)`, so a single start position can never overflow the
-buffer and the `last.start + 1` advance rule (see "Resume rule" above)
-remains safe regardless of the configured `batch_size`. Custom hosts that
-bypass the generated stubs and use a smaller `out_cap` must dedupe
-`(pattern_id, start)` pairs to handle mid-position truncation.
-
-`batch_size` is a stub-generation knob and does not affect the WASM binary.
-
-## pattern_name helper
-
-When any set has `emit_name_map: true`, the stub generator emits a single
-file-wide `pattern_name(id)` lookup function built from the `name:` fields
-in `regexps:`. The function maps a global pattern ID back to the name string.
-It is emitted exactly once even when multiple sets opt in; it is never
-set-prefixed since pattern IDs are file-wide YAML order indices.
-
-```rust
-// Example Rust usage
-for m in scan_secrets(input) {
-    println!("{} at {}..{}", pattern_name(m.pattern_id), m.start, m.end);
-}
 ```
+find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> i32
+```
+
+- `gate_ptr` points at `patterns_in_set` u32s in the caller's memory.
+- **All zeros means a clean scan.** That is the only operation a caller ever
+  performs on it: the encoding is opaque and will change.
+- WASM reads and writes it. Zeroing it restarts a scan; keeping it across calls
+  continues one.
+- An **overflowing call writes nothing** — if the return value exceeds
+  `out_cap`, the gate array is left exactly as it was found, so growing the
+  buffer and calling again with the same `from` sees the identical world.
+
+The generated stubs own the gate array on your behalf; it never appears in
+their public surface. Only a direct WASM caller sees it.
+
+Keeping the state visible is what makes `find` resumable at *any* index: an
+array held inside the module would silently carry gates from an earlier scan
+into a caller that meant to start fresh.
+
+With `overlapping: true` there is no gate array and no gate parameter at all.
+
+## What each capability costs
+
+Only `find` reports extents, and only it needs the machinery to resolve them.
+Declaring less emits less:
+
+| capability | literal frontend | backward prefix DFA | per-pattern extents | output |
+|---|---|---|---|---|
+| `match`, `match_any`, `match_all` | ✗ | ✗ | ✗ | bool / id / bitmask |
+| `scan`, `scan_any`, `scan_all` | ✓ | ✓ | ✗ | bool / packed id+start / bitmask |
+| `find` | ✓ | ✓ | ✓ | tuples (+ gates by default) |
+
+A set that does not declare `find` emits no tuple-writing suffix functions at
+all — just the DFA tables, which the cheap bitmask probes share. A
+`match`-only set additionally emits no literal frontend: the
+packed-pair/Teddy/AC/Shufti tables and skip loop could never execute for it.
+
+Measured on a 100KB no-match corpus with eight literal-prefixed patterns:
+`match` 54 fuel, `match_any`/`match_all` 84, `scan` 212K, `scan_any`/`scan_all`
+219K, `find` 219K. The anchored trio dies within a byte or two of position 0;
+the scan trio is frontend-bound, like `find`, because it shares `find`'s
+frontend. (An earlier draft gave the scan trio a scalar position-by-position
+scan instead, and measured 17x worse — the literal frontend is what makes
+these cheap, not the absence of extent tracking.)
+
+Do not use `scan_any` as a locate step for `find` — calling both at the same
+position duplicates one position's work. Pick one.
+
+## Output formats
+
+`find` writes 12-byte tuples, 4-byte aligned:
+
+| offset | field | type |
+|---|---|---|
+| 0 | `pattern_id` | i32 — index into `regexps:` in YAML order |
+| 4 | `start` | i32 — absolute, same for every tuple in one call |
+| 8 | `end` | i32 — absolute (an END, not a length) |
+
+`out_cap` is a tuple count. Sizing it at `patterns_in_set` makes overflow
+impossible: that is the exact worst case for a single position, since each
+pattern can report at most one match per start. Every generated stub sizes its
+buffer from the emitted `<SET>_PATTERN_COUNT` constant for that reason, and the
+overflow path is reachable only by a direct WASM caller who deliberately
+undersizes.
+
+`match_all` and `scan_all` return a **bitmask** — bit *k* set means pattern *k*
+matched — as an `i64` return value when the set's id space is 64 or fewer.
+Above that they take an `out_ptr` and write a `ceil(P/8)`-byte little-endian
+bitmap, returning the count instead. The generated stubs expand either form
+into the language's natural list of ids; the bitmask never reaches a stub user.
+A direct caller must pass an **all-zero** bitmap: the module only ORs bits in
+and counts 0→1 transitions, so a reused dirty buffer reports stale patterns.
+
+### Pattern ids and the two emitted constants
+
+A `pattern_id` is the pattern's **global** index into `regexps:`, so a set that
+selects a subset does not renumber: a set holding the last two of seventy
+patterns reports ids 68 and 69. Two constants therefore accompany every set,
+and they are not interchangeable:
+
+| constant | value | sizes |
+|---|---|---|
+| `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`) |
+| `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array, the `_all` bitmask/bitmap, and which `_all` ABI is exported |
+
+For `patterns: all` — the common case — the two are equal. They diverge only
+for a named subset, and using the wrong one there is a memory-safety bug: the
+gate array is indexed by pattern id, so sizing it at the pattern count lets the
+module write past the caller's array. Both constants are emitted in all six
+stub languages, and every generated declaration is written in terms of the
+right one.
+
+`scan_any` returns a packed `(start << 32) | pattern_id` as an `i64`, or `-1`.
+Both fields are below 2³¹, so `-1` is unambiguous. Stubs decompose it.
+
+`emit_name_map: true` additionally emits a `pattern_name(id)` helper mapping a
+pattern id back to its `name:` string.
 
 ## Bin-packing and merge constraints
 
@@ -229,28 +290,53 @@ regexped compile --config=regexped.yaml --diag-json=diag.json
 
 The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
 `in_set` (patterns actually placed into a set), `prefix_dedup_pool_size`,
-and per-set `frontend` (`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
+and per-set `frontend`
+(`"packed-pair"`/`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
 `conflicts`, `capture_bearing_dropped`, and `state_limit_dropped` (patterns
 dropped for exceeding a fallback bucket's state budget — see
 [Bin-packing](#bin-packing-and-merge-constraints) above) arrays.
+
+If a set's frontend was **downgraded** from the one its literals selected, the
+per-set `frontend_demotion` object says so, with `from`, `to`, a machine-
+readable `reason`, and a `detail` object carrying the numbers behind the
+decision. This is worth checking whenever a set is slower than expected: the
+frontend is the difference between per-byte cost that is flat in set size and
+cost that grows with it, and a downgrade is otherwise invisible at runtime.
+
+```json
+"frontend_demotion": {
+  "from": "ac", "to": "scalar", "reason": "ac_table_over_budget",
+  "detail": {"literals": 400, "ac_nodes": 1600,
+             "table_bytes": 823296, "budget_bytes": 524288}
+}
+```
 
 ## Literal scan frontend
 
 | Condition | Frontend |
 |---|---|
 | 1–16 distinct literals | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch |
-| 17+ distinct literals | **Aho-Corasick** attempted first — byte-at-a-time, O(n) regardless of literal count |
-| (AC automaton exceeds 32 trie nodes) | **Scalar** — AC is capped by *automaton node count*, not literal count; a set of 17+ literals sharing no common prefixes can blow past 32 nodes and downgrade, while literals with heavy shared prefixes could in principle stay under the cap well past 32 |
+| 17+ distinct literals | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count, with a SIMD first-byte prefilter at the root state |
+| (AC tables exceed 512 KB) | **Scalar** — AC is capped by *table bytes*, not literal count. The budget holds ~1,000 trie nodes uncompressed, and no set of 128 literals tested so far comes close to it; literals sharing no common prefix consume nodes fastest, since each distinct first byte forks the trie at the root. A demotion is always reported in `--diag-json` as `frontend_demotion` |
 | No mandatory literal at all | **Scalar** |
 
 For 9–16 literals Teddy uses two groups of 8 (`TwoGroups=true`), ORing the
 results of two independent nibble probes per 16-byte chunk.
 
+Aho-Corasick's root-state prefilter skips ahead to the next position whose byte
+could begin some literal. With **1–3 distinct first bytes** it compares against
+each in turn; with **4 or more** it uses the same nibble-table membership test
+as Shufti below, whose cost depends on the size of the first-byte *set* rather
+than growing with every literal added.
+
 ### Shufti — SIMD first-byte prefilter for the scalar case
 
 When the frontend would otherwise be scalar (no mandatory literal, or AC
 downgraded per the table above), a fourth frontend — **Shufti** — is
-considered instead of going straight to scalar. It requires:
+considered instead of going straight to scalar. Note that since the AC budget
+became large enough to hold real automata, sets with literals reach AC rather
+than being downgraded into this path, so in practice Shufti now serves sets
+with **no mandatory literal**. It requires:
 
 - **zero fallback buckets** in the set (Shufti can't skip positions that a
   fallback bucket's full-pattern DFA still has to visit for correctness);
@@ -268,29 +354,46 @@ nibble-table lookup, rather than a per-candidate comparison. See
 [prefer-hints.md](prefer-hints.md) for the `hints:` mechanism and which
 shapes it affects.
 
-## Anchored `match` and patterns without a mandatory literal
+## The anchored capabilities use their own automata
 
-The anchored `match` export classifies which pattern(s) in a set match the input
-starting at position 0. Patterns are routed at compile time into buckets keyed by
-their mandatory literal (a fixed byte sequence that must appear in every match).
-Patterns with no extractable mandatory literal — most commonly case-insensitive
-patterns (those using `(?i)`, whose literals carry `FoldCase` and are excluded
-from literal extraction) — route to a **fallback bucket** instead.
+`match`, `match_any` and `match_all` do NOT read their answer off the
+scan-path DFAs. Those are built leftmost-first, which prunes the search the
+moment the highest-priority alternative accepts — so the automaton for `a|ab`
+has no transition out of the state reached by `"a"`, and `a+?` stops after one
+byte. Both patterns match their inputs end to end, and both would be reported
+as non-matching.
 
-For `match`, fallback bucket patterns are evaluated at position 0 by running the
-bucket's combined suffix DFA directly: no literal scan is performed, but the
-bucket's patterns still participate in matching. They will be reported in the
-result tuples just like literal-bucket patterns.
+The anchored capabilities therefore get a second packing over the full
+patterns, merged *without* leftmost-first pruning, and answer "did the run from
+0 reach `len` in an accepting state". The cost is compile time and table space,
+which is the trade this project makes everywhere (see CLAUDE.md's "Runtime over
+compile time").
 
-The trade-off is purely a performance one: literal-bucket patterns benefit from
-the SIMD/Aho-Corasick prefilter, fallback-bucket patterns do not. For a fixed
-keyword vocabulary where you control the casing, writing patterns without `(?i)`
-and using a single uppercase literal lets them flow into literal buckets and run
-faster — but it is not required for correctness.
+A consequence worth knowing: a `match`-only set emits no literal frontend at
+all — the packed-pair/Teddy/AC/Shufti tables and skip loop can never execute
+for it.
+
+## Variable-length prefixes route to fallback
+
+A pattern whose mandatory literal sits a *variable* distance from the match
+start (`a?foo`, `[a-z]*KEY`, `.*end`) does not use the literal frontend. It is
+not a tuning choice: the split representation `prefix·literal·suffix` recovers
+the match start by walking a backward DFA from a literal occurrence, and that
+is exact only while each start maps to exactly one literal position. With a
+variable prefix one start has several candidate literal positions with
+different extents, and which one RE2 picks depends on the prefix's greedy
+structure — which a backward DFA cannot express. `a?a` over `"aa"` is the
+smallest case: the backward walk finds only the leftmost start, so the match at
+1 is never generated, and start 0 gets reported twice with different extents.
+
+Such patterns are compiled as whole-pattern DFAs evaluated at every position,
+which is both correct and what a set containing them would have to do anyway —
+a literal arbitrarily far to the right can serve a match starting here, so
+nothing can be skipped.
 
 ## Examples
 
-- [examples/node/sql-validator/](../examples/node/sql-validator/) — anchored `match`, SQL statement validation (Node.js / TypeScript)
-- [examples/wasmtime/go/secret-scanner/](../examples/wasmtime/go/secret-scanner/) — `find_all`, secret detection (Go wasip1)
-- [examples/wasmtime/rust/secret-scanner/](../examples/wasmtime/rust/secret-scanner/) — `find_all`, secret detection (native Rust host)
-- [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `find_any`, URL rule matching (FastEdge)
+- [examples/node/sql-validator/](../examples/node/sql-validator/) — anchored `match_any`, SQL statement validation (Node.js / TypeScript)
+- [examples/wasmtime/go/secret-scanner/](../examples/wasmtime/go/secret-scanner/) — `find`, secret detection (Go wasip1)
+- [examples/wasmtime/rust/secret-scanner/](../examples/wasmtime/rust/secret-scanner/) — `find` called directly from a native Rust host, gate array and all
+- [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `scan_any`, URL rule matching (FastEdge)

@@ -11,7 +11,8 @@ import (
 // Identifier validation for user-supplied export names.
 //
 // Every `match_func` / `find_func` / `groups_func` / `named_groups_func` value,
-// and every set's `find_any` / `find_all` / `match` value, is interpolated
+// and every set capability value (`match`, `match_any`, `match_all`, `scan`,
+// `scan_any`, `scan_all`, `find`), is interpolated
 // verbatim into generated source in all six stub languages (see generate/).
 // Without a check, a config file can plant arbitrary code in the caller's
 // crate/module — see plans/OPUS.md §N4, where this is demonstrated end to end.
@@ -198,16 +199,9 @@ func ValidateConfig(cfg *BuildConfig) error {
 
 	for _, s := range cfg.Sets {
 		owner := fmt.Sprintf("set %q", s.Name)
-		for _, f := range []struct{ field, name string }{
-			{"find_any", s.FindAny},
-			{"find_all", s.FindAll},
-			{"match", s.Match},
-		} {
-			if f.name == "" {
-				continue
-			}
-			if err := ValidateIdentifier(f.name); err != nil {
-				problems = append(problems, fmt.Sprintf("%s: %s %q %v", owner, f.field, f.name, err))
+		for _, c := range s.Capabilities() {
+			if err := ValidateIdentifier(c.Name); err != nil {
+				problems = append(problems, fmt.Sprintf("%s: %s %q %v", owner, c.Field, c.Name, err))
 			}
 		}
 	}
@@ -300,8 +294,15 @@ var jsHelperNames = []string{
 	"_patternNames", "patternName",
 }
 
-// tsHelperNames is jsHelperNames plus the TS-only exported interface.
-var tsHelperNames = append(append([]string(nil), jsHelperNames...), "SetMatch")
+// tsHelperNames is jsHelperNames plus the TS-only exported interfaces.
+var tsHelperNames = append(append([]string(nil), jsHelperNames...), "SetMatch", "SetAnchor")
+
+// asHelperNames are the module-scope names the AssemblyScript generator emits
+// itself. It declares both classes unconditionally whenever a set exists, and
+// nothing checked them before (plans/SETS.md §11 R14): a user export named
+// SetMatch produced a file with both `class SetMatch` and
+// `export function SetMatch`, which asc rejects with no diagnostic from us.
+var asHelperNames = []string{"SetMatch", "SetAnchor"}
 
 // goTransformedReserved are Pascal-case names the Go generator emits itself,
 // compared against goPublicName(exportName). "SetMatch" is the struct
@@ -375,14 +376,8 @@ func allExportRefs(cfg *BuildConfig) []exportRef {
 	}
 	for _, s := range cfg.Sets {
 		owner := fmt.Sprintf("set %q", s.Name)
-		for _, f := range []struct{ field, name string }{
-			{"find_any", s.FindAny},
-			{"find_all", s.FindAll},
-			{"match", s.Match},
-		} {
-			if f.name != "" {
-				refs = append(refs, exportRef{owner, f.field, f.name})
-			}
+		for _, c := range s.Capabilities() {
+			refs = append(refs, exportRef{owner, c.Field, c.Name})
 		}
 	}
 	return refs
@@ -476,7 +471,7 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 	refs := allExportRefs(cfg)
 
 	// (1) Collisions with names the JS/TS generator emits for itself.
-	if helpers := map[string][]string{"js": jsHelperNames, "ts": tsHelperNames}[stubType]; helpers != nil {
+	if helpers := map[string][]string{"js": jsHelperNames, "ts": tsHelperNames, "as": asHelperNames}[stubType]; helpers != nil {
 		deny := map[string]bool{}
 		for _, h := range helpers {
 			deny[h] = true

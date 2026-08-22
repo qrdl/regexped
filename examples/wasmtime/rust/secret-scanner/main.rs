@@ -55,18 +55,22 @@ fn main() -> Result<()> {
         .get_memory(&mut store, "memory")
         .ok_or_else(|| anyhow!("WASM module has no 'memory' export"))?;
 
+    // The default (gated) `find` body: (ptr, len, from, gate_ptr, out_ptr, out_cap) -> total
     let scan_fn = instance
-        .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "scan_secrets")
+        .get_typed_func::<(i32, i32, i32, i32, i32, i32), i32>(&mut store, "scan_secrets")
         .map_err(|e| anyhow!("'scan_secrets' export not found: {}", e))?;
 
-    const OUT_CAP: i32 = 64; // up to 64 matches per batch
+    // out_cap is the set's pattern count: the exact worst case for one
+    // position, so a call can never overflow.
+    const PATTERN_COUNT: i32 = 10;
 
     // Derive input/output bases from the module's actual initial memory size.
-    // The initial pages cover all DFA table data; input and output go in the
-    // two pages grown immediately after, regardless of how large the tables are.
+    // The initial pages cover all DFA table data; input, output and the gate
+    // array go in the two pages grown immediately after.
     let in_base: i32 = (memory.size(&store) * 65536) as i32;
-    memory.grow(&mut store, 2)?; // 1 page for input, 1 page for output
+    memory.grow(&mut store, 2)?; // 1 page for input, 1 page for output + gates
     let out_base: i32 = in_base + 65536;
+    let gate_base: i32 = out_base + PATTERN_COUNT * 12;
 
     // Write input into WASM memory (input page: [in_base, out_base)).
     let max_input = (out_base - in_base) as usize;
@@ -76,48 +80,49 @@ fn main() -> Result<()> {
     memory.write(&mut store, in_base as usize, &input)
         .map_err(|e| anyhow!("memory write failed: {}", e))?;
 
-    // Scan: call find_all in batches until exhausted.
-    let mut start_pos: i32 = 0;
+    // The gate array is the caller's: zero it for a clean scan. Its contents
+    // are opaque — zeroing is the only operation a caller ever performs on it.
+    memory.write(&mut store, gate_base as usize, &vec![0u8; (PATTERN_COUNT * 4) as usize])
+        .map_err(|e| anyhow!("gate array init failed: {}", e))?;
+
+    // Scan: each call returns every match at the next matching position.
+    let mut from: i32 = 0;
     let mut total_matches = 0;
 
     loop {
-        let count = scan_fn.call(&mut store, (in_base, input.len() as i32, out_base, OUT_CAP, start_pos))?;
+        let count = scan_fn.call(
+            &mut store,
+            (in_base, input.len() as i32, from, gate_base, out_base, PATTERN_COUNT),
+        )?;
         if count == 0 {
             break;
         }
 
-        // Read match tuples: each is (pattern_id i32, start i32, length i32) = 12 bytes.
+        // Read match tuples: each is (pattern_id i32, start i32, end i32) = 12 bytes.
+        // Every tuple in one call shares the same start.
         let mem_data = memory.data(&store);
+        let mut this_start = 0i32;
         for i in 0..count as usize {
             let base = out_base as usize + i * 12;
             let pid    = i32::from_le_bytes(mem_data[base..base+4].try_into()?);
             let mstart = i32::from_le_bytes(mem_data[base+4..base+8].try_into()?);
-            let mlen   = i32::from_le_bytes(mem_data[base+8..base+12].try_into()?);
-            let matched = &input[mstart as usize..(mstart + mlen) as usize];
+            let mend   = i32::from_le_bytes(mem_data[base+8..base+12].try_into()?);
+            this_start = mstart;
+            let matched = &input[mstart as usize..mend as usize];
             println!(
                 "[{}] at {}..{}: {}",
                 pattern_name(pid),
                 mstart,
-                mstart + mlen,
+                mend,
                 std::str::from_utf8(matched).unwrap_or("<non-utf8>")
             );
             total_matches += 1;
         }
 
-        // Advance start_pos by exactly one byte past the last reported start.
-        // The WASM scan visits positions one at a time; when the buffer fills it
-        // exits at the top of the next iteration, so only positions <= last.start
-        // have been visited. Advancing by last_len would skip positions inside
-        // the last match's span that the scan has not yet seen.
-        //
-        // Short batch (count < OUT_CAP) means the WASM exited because the input
-        // was fully scanned, not because the buffer filled — no need to resume.
-        if count < OUT_CAP {
-            break;
-        }
-        let last = out_base as usize + (count as usize - 1) * 12;
-        let last_start = i32::from_le_bytes(mem_data[last+4..last+8].try_into()?);
-        start_pos = last_start + 1;
+        // Resume one past the reported position. Gating (the default) makes
+        // the engine skip anything a pattern has already reported, so this
+        // yields Go FindAll semantics per pattern.
+        from = this_start + 1;
     }
 
     if total_matches == 0 {

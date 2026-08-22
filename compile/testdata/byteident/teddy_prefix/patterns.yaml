@@ -1,0 +1,5 @@
+# Teddy prefix scan: a multi-byte literal prefix drives the 2-byte nibble
+# fingerprint fast-skip.
+regexps:
+  - pattern: 'ghp_[A-Za-z0-9]{36}'
+    find_func: teddy_find

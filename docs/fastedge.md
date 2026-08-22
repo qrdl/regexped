@@ -72,12 +72,12 @@ See [`examples/fastedge/validate/`](../examples/fastedge/validate/) for the comp
 
 ## Set composition example: multi-pattern URL filtering
 
-[`examples/fastedge/url-guard/`](../examples/fastedge/url-guard/) demonstrates the `sets:` composition feature instead — scanning a URL against 8 attack-signature patterns (SQL injection, path traversal, XSS, etc.) in one pass via `find_any`:
+[`examples/fastedge/url-guard/`](../examples/fastedge/url-guard/) demonstrates the `sets:` composition feature instead — scanning a URL against 8 attack-signature patterns (SQL injection, path traversal, XSS, etc.) in one pass via `scan_any`:
 
 ```yaml
 sets:
   - name: "attacks"
-    find_any: "scan_url"    # non-anchored: first match only
+    scan_any: "scan_url"    # non-anchored: first matching position + pattern id
     emit_name_map: true      # so pattern_name(id) can name the attack type
     patterns: all
 ```

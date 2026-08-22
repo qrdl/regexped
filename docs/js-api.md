@@ -149,21 +149,52 @@ if (first?.host) {
 
 ## Set composition exports
 
-When the config has a `sets:` block, the stub also exports up to three
-functions per set (see [sets.md](sets.md) for the full config schema and
+When the config has a `sets:` block, the stub also exports one function per
+declared capability (see [sets.md](sets.md) for the full config schema and
 wire format):
 
 ```js
-export function* <find_all>(input): Generator<{patternId: number, start: number, end: number}>
-export function <find_any>(input): {patternId: number, start: number, end: number} | null
-export function <match>(input): {patternId: number, start: number, end: number} | null
-export function patternName(id): string   // only if any set sets emit_name_map: true
+export const <set>PatternCount = 12;
+
+// anchored: the pattern must match the WHOLE input
+export function <match>(input)              // -> boolean
+export function <match_any>(input)          // -> number | null   (a pattern id)
+export function <match_all>(input)          // -> number[]        NOT a boolean
+
+// non-anchored: each takes a `from` position
+export function <scan>(input, from = 0)     // -> boolean
+export function <scan_any>(input, from = 0) // -> {patternId, start} | null
+export function <scan_all>(input, from = 0) // -> number[]        NOT a boolean
+
+export function* <find>(input, from = 0)    // yields {patternId, start, end}
+
+export function patternName(id)             // only if any set sets emit_name_map: true
 ```
 
-`find_all` yields every non-overlapping match across all patterns in the
-set, batched internally for efficiency; `find_any` and `match` return a
-single result object or `null`. `patternName` is a single shared lookup
-across every set in the config that requested `emit_name_map: true`.
+**`_all` and `_any` return data, not predicates.** JavaScript cannot catch the
+misreading, and an empty array is truthy:
+
+```js
+if (scan_all(input)) { ... }   // ALWAYS true, even with zero matches
+if (scan_all(input).length) { ... }   // what you meant
+```
+
+The `find` generator owns the gate array for the default (non-overlapping)
+configuration: dropping it and creating a new one restarts the scan with clean
+gates. There is no stateless single-position probe — the generator is the only
+find surface, matching every other language.
+
+`scan_any` and the `_all` pair are backed by `i64` WASM returns, which surface
+as BigInt. The stub decomposes them; a BigInt never reaches you.
+
+**Do not call other stub functions while a generator is suspended.** The staged
+input and the shared output region belong to whichever call ran last, so an
+interleaved call makes the suspended generator scan the wrong bytes and report
+offsets against them, silently. The same constraint already applies to the
+single-pattern `find_func`/`groups_func`/`named_groups_func` generators.
+
+`patternName` is a single shared lookup across every set in the config that
+requested `emit_name_map: true`.
 
 ---
 

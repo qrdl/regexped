@@ -126,16 +126,21 @@ exhaustive suite and a curated `custom-sets.txt` file through the set pipeline
 described in [sets.md](sets.md). For every block with at least two patterns the
 runner:
 
-1. Compiles all patterns as a single set via `CompileFile` with `find_all`.
+1. Compiles all patterns as a single set via `CompileFile` with the default
+   (per-pattern non-overlapping) `find`, whose contract is Go `FindAllIndex`'s
+   rule — which is exactly what col4 holds.
 2. Runs the resulting WASM against every test input in the block.
 3. Verifies that the returned `(pattern_id, start, length)` tuples cover all
    per-pattern matches expected by columns 4 / 1 of the RE2 test format.
 
 This exercises all set frontends — SIMD Teddy (≤ 16 literals), Aho-Corasick
-(17+ literals, capped by automaton node count rather than literal count),
-SIMD Shufti (density/hint-selected first-byte prefilter), and the scalar DFA
-fallback — together with bucket dispatch and the isolated-fallback path for
-non-greedy patterns. See [sets.md](sets.md) for the exact frontend-selection
+(17+ literals, capped by table bytes rather than literal count), SIMD Shufti
+(density/hint-selected first-byte prefilter), and the scalar DFA fallback —
+together with bucket dispatch and the isolated-fallback path for non-greedy
+patterns. Note that the RE2 corpus's set blocks are small, so they cover the
+frontends' *semantics* rather than their scaling; per-shape scaling is
+measured separately by `tools/setperf` and the fuel ladder in
+[plans/SETS.md](../plans/SETS.md) §14. See [sets.md](sets.md) for the exact frontend-selection
 rules. Set tests currently run
 clean with **0 failures**.
 

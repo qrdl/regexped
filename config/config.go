@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,12 +27,37 @@ type BuildConfig struct {
 }
 
 // SetConfig describes one `sets:` entry in the YAML config.
+//
+// The seven capability fields form a 2x3 grid plus `find` (plans/SETS.md
+// §3.12).  The KEY names the capability; the VALUE is the WASM export /
+// generated-function name the user picks.
+//
+//	match_*  — anchored: the match must span the whole input (0..len).
+//	scan_*   — non-anchored: takes a `from` position.
+//	bare     — boolean answer.
+//	_any     — one arbitrary matching pattern id (a set is unordered, §3.5).
+//	_all     — every matching pattern id.
+//	find     — the only capability reporting positions and extents, and the
+//	           only one `overlapping` affects.
 type SetConfig struct {
-	Name        string          `yaml:"name"`          // set name; must be unique within the file
-	FindAny     string          `yaml:"find_any"`      // export name for find_any (non-anchored, first match)
-	FindAll     string          `yaml:"find_all"`      // export name for find_all (non-anchored, all matches)
-	Match       string          `yaml:"match"`         // export name for match (anchored at position 0)
-	BatchSize   int             `yaml:"batch_size"`    // output buffer hint (default 256); stub-gen only
+	Name string `yaml:"name"` // set name; must be unique within the file
+
+	Match    string `yaml:"match"`     // anchored, 0|1
+	MatchAny string `yaml:"match_any"` // anchored, pattern id or -1
+	MatchAll string `yaml:"match_all"` // anchored, bitmask / bitmap of ids
+	Scan     string `yaml:"scan"`      // non-anchored, 0|1
+	ScanAny  string `yaml:"scan_any"`  // non-anchored, (start<<32)|id, or -1
+	ScanAll  string `yaml:"scan_all"`  // non-anchored, bitmask / bitmap of ids
+	Find     string `yaml:"find"`      // non-anchored, tuples at the next matching position
+
+	// Overlapping selects which `find` body is emitted (plans/SETS.md
+	// §3.15, D10/D11). Absent or false (the DEFAULT) emits the gated body:
+	// per-pattern non-overlapping output matching Go FindAllIndex's rule.
+	// True emits the ungated body, which reports every start position and
+	// carries no gate-array parameter. It is a load error on a set without
+	// `find:`, since no other capability gates.
+	Overlapping bool `yaml:"overlapping"`
+
 	Patterns    PatternSelector `yaml:"patterns"`      // which regexps belong to this set
 	EmitNameMap bool            `yaml:"emit_name_map"` // generate pattern_name / patternName helper in stubs (does not change WASM)
 	// Hints biases which suffix-DFA optimisation path to favour for this set.
@@ -38,9 +66,127 @@ type SetConfig struct {
 	// (no hint), ["prefer-match"], or ["prefer-no-match"] — mutually
 	// exclusive with each other. See plans/LIKELY.md gap H.
 	// "batch-find" (plans/TODO.md task 44) is NOT accepted here — it is a
-	// per-pattern, JS/TS-only hint and is a load-time error on a sets: entry;
-	// sets already have their own find_all batching (BatchSize above).
+	// per-pattern, JS/TS-only hint and is a load-time error on a sets: entry.
 	Hints []string `yaml:"hints"`
+}
+
+// SetCapability is one (yaml key, export name) pair from a set entry.
+type SetCapability struct {
+	Field string // YAML key, e.g. "scan_any"
+	Name  string // user-chosen export / function name
+}
+
+// Capabilities returns the set's declared capabilities in a stable order
+// (the §3.12 grid order: match, match_any, match_all, scan, scan_any,
+// scan_all, find). Undeclared capabilities are omitted.
+func (s SetConfig) Capabilities() []SetCapability {
+	all := []SetCapability{
+		{"match", s.Match},
+		{"match_any", s.MatchAny},
+		{"match_all", s.MatchAll},
+		{"scan", s.Scan},
+		{"scan_any", s.ScanAny},
+		{"scan_all", s.ScanAll},
+		{"find", s.Find},
+	}
+	out := all[:0:0]
+	for _, c := range all {
+		if c.Name != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// HasExports reports whether the set declares at least one capability.
+func (s SetConfig) HasExports() bool { return len(s.Capabilities()) > 0 }
+
+// Gated reports whether this set emits the default gated (per-pattern
+// non-overlapping) `find` body, which threads a caller-owned gate array
+// through the suffix functions (plans/SETS.md §3.14-3.16). A set without
+// `find:` gates nothing.
+func (s SetConfig) Gated() bool { return s.Find != "" && !s.Overlapping }
+
+// SanitizeSetName turns a set name into an identifier stem for the constants
+// and types the stubs emit for it (<SET>_PATTERN_COUNT, <SET>_ID_SPACE, C's
+// scanner struct). `sets[].name` is deliberately not identifier-validated — it
+// is a selection key, and shipped configs use names like "sql-validator" — so
+// it cannot be interpolated verbatim.
+//
+// It lives here, rather than in generate/, so ValidateSets can reject two set
+// names that sanitize to the SAME stem before they become duplicate
+// declarations in generated code (plans/SETS.md §11 R14).
+func SanitizeSetName(name string) string {
+	var b []rune
+	for _, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			b = append(b, c)
+		default:
+			b = append(b, '_')
+		}
+	}
+	if len(b) == 0 {
+		return "SET"
+	}
+	if b[0] >= '0' && b[0] <= '9' {
+		b = append([]rune{'_'}, b...)
+	}
+	return string(b)
+}
+
+// PatternCount returns the number of patterns the set selects.
+//
+// This is the D16 <SET>_PATTERN_COUNT: the worst-case number of matches at a
+// single `find` position, and therefore the size of the tuple buffer. It is
+// NOT a bound on pattern id values — see IDSpaceSize.
+func (s SetConfig) PatternCount(cfg BuildConfig) int {
+	if s.Patterns.All {
+		return len(cfg.Regexps)
+	}
+	return len(s.Patterns.Names)
+}
+
+// IDSpaceSize returns one past the largest pattern id this set can report.
+//
+// A set's pattern_id is the GLOBAL index into `regexps:` in YAML order
+// (docs/sets.md), so a set selecting the last two of seventy patterns reports
+// ids 68 and 69 even though it holds two patterns. Everything indexed BY that
+// id — the gate array, the `_all` bitmask/bitmap, and hence the narrow-vs-wide
+// `_all` ABI choice — must be sized from this, not from PatternCount.
+//
+// Sizing them from PatternCount was plans/SETS.md §11 R1: the emitted WASM
+// wrote gate[68] into a stub-allocated two-slot array, `_all` decode loops
+// stopped before the bits the module had set, and the two sides could even
+// disagree about which `_all` signature the module exported.
+//
+// This is deliberately an UPPER BOUND computed from the config alone, and it
+// is THE definition for both sides: the compiler calls it (through
+// SetSpec.IDSpaceSize) and so does every stub generator, so the two cannot
+// drift. Patterns dropped later — capture-bearing ones, or ones over the DFA
+// state limit — only lower the ids actually emitted, never raise them, so an
+// upper bound stays safe. Deriving it instead from what survived compilation
+// would be tighter but unavailable to the generators, which never see the
+// compiled module.
+func (s SetConfig) IDSpaceSize(cfg BuildConfig) int {
+	if s.Patterns.All {
+		return len(cfg.Regexps)
+	}
+	idx := make(map[string]int, len(cfg.Regexps))
+	for i, re := range cfg.Regexps {
+		if re.Name != "" {
+			if _, dup := idx[re.Name]; !dup {
+				idx[re.Name] = i
+			}
+		}
+	}
+	max := -1
+	for _, name := range s.Patterns.Names {
+		if i, ok := idx[name]; ok && i > max {
+			max = i
+		}
+	}
+	return max + 1
 }
 
 // PatternSelector selects patterns for a set. It can be the scalar string "all"
@@ -89,8 +235,11 @@ func ValidHints(hints []string) bool {
 
 // validateHintList returns a descriptive error for the first problem found in
 // hints, or nil if the list is valid. isSet selects the sets: context, where
-// "batch-find" is rejected outright (sets have their own find_all batching;
-// see SetConfig.BatchSize) rather than being merely unrecognised.
+// "batch-find" is rejected outright rather than being merely unrecognised:
+// there is no set-level batching for it to request. A set's `find` returns
+// one complete position per call and the worst case for one position is
+// patterns_in_set, so there is nothing left for a batch knob to size
+// (plans/SETS.md §7.7 / D12 — a multi-position `find_batch` is deferred).
 func validateHintList(hints []string, isSet bool) error {
 	var hasMatch, hasNoMatch bool
 	for _, h := range hints {
@@ -135,8 +284,8 @@ func validateHints(cfg *BuildConfig) error {
 
 // ValidateSets validates the `sets:` block against the `regexps:` list.
 // Returns an error if any set name is not unique, any pattern reference is
-// unknown, a set entry has none of find_any/find_all/match set, or patterns
-// is empty.
+// unknown, a set entry declares none of the seven capabilities, `overlapping`
+// is set on a set without `find`, or patterns is empty.
 func ValidateSets(cfg *BuildConfig) error {
 	// Build name → index map.
 	nameIdx := make(map[string]int, len(cfg.Regexps))
@@ -150,6 +299,7 @@ func ValidateSets(cfg *BuildConfig) error {
 	}
 
 	setNames := make(map[string]bool)
+	setStems := make(map[string]string)    // sanitized stem → the set name that claimed it
 	exportNames := make(map[string]string) // export name → owner ("set X" or "regexp Y")
 	// Seed with per-regexp export names so set exports can't collide with them.
 	for _, re := range cfg.Regexps {
@@ -180,14 +330,27 @@ func ValidateSets(cfg *BuildConfig) error {
 			return fmt.Errorf("duplicate set name %q", s.Name)
 		}
 		setNames[s.Name] = true
-		if s.FindAny == "" && s.FindAll == "" && s.Match == "" {
-			return fmt.Errorf("set %q: at least one of find_any, find_all, or match must be set", s.Name)
+		// Two DISTINCT set names can sanitize to one identifier stem
+		// ("url-guard" and "url_guard" both give URL_GUARD), which emits the
+		// same <SET>_PATTERN_COUNT / <SET>_ID_SPACE constant twice and breaks
+		// the generated Rust/Go/C at compile time with no diagnostic from us
+		// (plans/SETS.md §11 R14).
+		stem := SanitizeSetName(s.Name)
+		if prior, dup := setStems[stem]; dup {
+			return fmt.Errorf("set names %q and %q both produce the identifier %q "+
+				"used for their generated constants; rename one", prior, s.Name, stem)
+		}
+		setStems[stem] = s.Name
+		caps := s.Capabilities()
+		if len(caps) == 0 {
+			return fmt.Errorf("set %q: at least one of match, match_any, match_all, scan, scan_any, scan_all, or find must be set", s.Name)
+		}
+		if s.Overlapping && s.Find == "" {
+			return fmt.Errorf("set %q: overlapping only affects find, which this set does not declare", s.Name)
 		}
 		owner := fmt.Sprintf("set %q", s.Name)
-		for _, name := range []string{s.FindAny, s.FindAll, s.Match} {
-			if name == "" {
-				continue
-			}
+		for _, c := range caps {
+			name := c.Name
 			if strings.HasSuffix(name, "_batch") {
 				return fmt.Errorf("%s: export name %q must not end in \"_batch\" (reserved for the compiler-synthesized batch export)", owner, name)
 			}
@@ -270,8 +433,14 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	if err != nil {
 		return BuildConfig{}, fmt.Errorf("read config %s: %w", configPath, err)
 	}
+	// Strict decoding (plans/SETS.md §3.19 / D5): every unknown YAML key
+	// anywhere in the file is a line-numbered load error. That catches the
+	// set keys retired by this redesign — find_any, find_all, batch_size —
+	// and all future typos (`mach_func:` …), with no tombstone fields and
+	// no targeted "renamed to" messages.
 	var cfg BuildConfig
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw), yaml.Strict())
+	if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 		return BuildConfig{}, fmt.Errorf("parse config %s: %w", configPath, err)
 	}
 	if len(cfg.Regexps) == 0 {

@@ -6,7 +6,7 @@
 #   - anchored patterns (trivial prefix)
 # Source: inspired by common WAF rules and the perftest corpus.
 patterns:
-  # Secret scanning — distinct literals, find_all path
+  # Secret scanning — distinct literals, find path
   - name: aws_key
     pattern: 'AKIA[0-9A-Z]{16}'
   - name: aws_secret
@@ -64,7 +64,7 @@ patterns:
 
 sets:
   - name: secret_scanner
-    find_all: scan_secrets
+    find: scan_secrets
     emit_name_map: true
     patterns:
       - aws_key
@@ -79,7 +79,7 @@ sets:
       - google_api
 
   - name: waf_scanner
-    find_all: scan_waf
+    find: scan_waf
     emit_name_map: true
     patterns:
       - http_url

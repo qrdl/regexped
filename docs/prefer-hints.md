@@ -32,7 +32,7 @@ regexps:
 
 sets:
   - name: creds
-    find_all: creds_find_all
+    find: creds_find
     patterns: "all"
     hints: [prefer-no-match]
 ```

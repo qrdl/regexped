@@ -4319,15 +4319,22 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 // patternIDs[k] is the global pattern ID written into the output tuple for bit k.
 // tableBase is the memory address at which this DFA's data will be placed.
 // tableMemIdx is 0 for standalone modules (single memory).
-func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int) (funcBody []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, needProbes, gated bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+	sizePrefixed := func(body []byte) []byte {
+		out := utils.AppendULEB128(nil, uint32(len(body)))
+		return append(out, body...)
+	}
 	nextTableOffset = int32(tableBase)
 	if t == nil || t.numStates == 0 {
-		// Empty DFA: return 0 (no matches).
+		// Empty DFA: return 0 (no matches / no bits).
 		body := []byte{0x01, 0x01, 0x7F} // 1 local i32
 		body = append(body, 0x41, 0x00)  // i32.const 0
 		body = append(body, 0x0B)        // end
-		funcBody = utils.AppendULEB128(nil, uint32(len(body)))
-		funcBody = append(funcBody, body...)
+		art.fnBody = sizePrefixed(body)
+		if needProbes {
+			zero := []byte{0x00, 0x41, 0x00, 0x0B} // no locals; i32.const 0; end
+			art.scanProbe = sizePrefixed(zero)
+		}
 		return
 	}
 
@@ -4341,10 +4348,12 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 			if len(prefixFixedLens) == 1 {
 				prefixMaxLen = prefixFixedLens[0]
 			}
-			body := buildCountedChainSuffixBody(class, n, patternIDs[0], prefixMaxLen)
-			funcBody = utils.AppendULEB128(nil, uint32(len(body)))
-			funcBody = append(funcBody, body...)
-			return funcBody, nil, 0, int32(tableBase)
+			body := buildCountedChainSuffixBody(class, n, patternIDs[0], prefixMaxLen, gated)
+			art.fnBody = sizePrefixed(body)
+			if needProbes {
+				art.scanProbe = sizePrefixed(buildCountedChainProbeBody(class, n, false))
+			}
+			return art, nil, 0, int32(tableBase)
 		}
 	}
 
@@ -4400,6 +4409,12 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// Only present when t.hasWordBoundary; placed after the standard 3 bitmask tables.
 	wbNWBitmaskOff := immBitmaskOff + int32(l.numWASM)*8
 	wbWBitmaskOff := wbNWBitmaskOff + int32(l.numWASM)*8
+	// Newline-boundary pre-transition accept bitmask ((?m:$) fires just before
+	// a '\n'). Placed after whichever of the above are present.
+	nlBitmaskOff := immBitmaskOff + int32(l.numWASM)*8
+	if t.hasWordBoundary {
+		nlBitmaskOff = wbWBitmaskOff + int32(l.numWASM)*8
+	}
 
 	layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false, false))
 	dataBytes = append(dataBytes, layoutRaw...)
@@ -4414,27 +4429,207 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		dataSegCount += 2
 		nextTableOffset = wbWBitmaskOff + int32(l.numWASM)*8
 	}
+	if t.hasNewlineBoundary {
+		dataBytes = append(dataBytes, appendDataSegment(nil, nlBitmaskOff, writeBitmask(t.midAcceptNLStates))...)
+		dataSegCount++
+		nextTableOffset = nlBitmaskOff + int32(l.numWASM)*8
+	}
 
-	// Use wasmStart for lPos==0 (allows ^ anchors to fire), wasmMidStart otherwise.
-	wasmMidStart := uint32(t.midStartState + 1)
-	wasmStart := uint32(t.startState + 1)
-	body := buildSetSuffixBody(l, midBitmaskOff, eofBitmaskOff, immBitmaskOff, wasmStart, wasmMidStart, patternIDs, prefixFixedLens, tableMemIdx,
-		l.wordCharTableOff, wbNWBitmaskOff, wbWBitmaskOff)
-	funcBody = utils.AppendULEB128(nil, uint32(len(body)))
-	funcBody = append(funcBody, body...)
+	p := setSuffixParams{
+		l:             l,
+		midBitmaskOff: midBitmaskOff,
+		eofBitmaskOff: eofBitmaskOff,
+		immBitmaskOff: immBitmaskOff,
+		// Use wasmStart for lPos==0 (allows ^ anchors to fire), wasmMidStart
+		// otherwise — or wasmMidStartNewline when the byte before lPos is a
+		// '\n', so a (?m:^) in a set fires at every line start rather than
+		// only at position 0 (plans/FABLE.md B40/B43, plans/SETS.md §9.5 S2).
+		wasmStart:           uint32(t.startState + 1),
+		wasmMidStart:        uint32(t.midStartState + 1),
+		wasmMidStartNewline: uint32(t.midStartNewlineState + 1),
+		hasNewlineBoundary:  t.hasNewlineBoundary,
+		nlBitmaskOff:        nlBitmaskOff,
+		patternIDs:          patternIDs,
+		prefixFixedLens:     prefixFixedLens,
+		tableMemIdx:         tableMemIdx,
+		gated:               gated,
+	}
+	if t.hasWordBoundary && l.needWordCharTable {
+		p.hasWordChar = true
+		p.wordCharTableOff = l.wordCharTableOff
+		p.wbNWBitmaskOff = wbNWBitmaskOff
+		p.wbWBitmaskOff = wbWBitmaskOff
+	}
+	art.fnBody = sizePrefixed(buildSetSuffixBody(p))
+	if needProbes {
+		art.scanProbe = sizePrefixed(buildSetProbeBody(p, false))
+	}
 	return
+}
+
+// suffixArtifacts holds the bodies one bucket contributes. fnBody is the
+// tuple-writing suffix function `find` calls; scanProbe is the cheap
+// bitmask-only variant the scan trio uses (plans/SETS.md §5: nothing but
+// `find` needs per-pattern extents).
+//
+// There is deliberately no anchored probe here. The anchored trio runs over a
+// SEPARATE packing built without leftmost-first pruning (§10.4(c)), so its
+// probes come from genAnchoredWASM over those buckets. This struct used to
+// carry one built from the find-path DFAs that nothing ever read
+// (plans/SETS.md §11 R11).
+type suffixArtifacts struct {
+	fnBody    []byte
+	scanProbe []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
+}
+
+// setSuffixParams describes one bucket's suffix DFA for buildSetSuffixBody.
+type setSuffixParams struct {
+	l                             *dfaLayout
+	midBitmaskOff                 int32
+	eofBitmaskOff                 int32
+	immBitmaskOff                 int32
+	wasmStart, wasmMidStart       uint32
+	wasmMidStartNewline           uint32
+	hasNewlineBoundary            bool
+	nlBitmaskOff                  int32
+	hasWordChar                   bool
+	wordCharTableOff              int32
+	wbNWBitmaskOff, wbWBitmaskOff int32
+	patternIDs, prefixFixedLens   []int
+	tableMemIdx                   int
+	// gated adds a trailing gate-array parameter and the §3.16 write-time
+	// empty-match filter. Set for the default (non-overlapping) `find` body.
+	gated bool
+}
+
+// appendInputLoad8u emits i32.load8_u against the INPUT memory, which is always
+// memory 0 — the host's memory in embedded builds, the module's own in
+// standalone ones.
+//
+// Do not reach for appendTableLoad8u here. That one targets tableMemIdx, which
+// is 1 in every embedded build, so using it for an input byte reads the DFA
+// tables instead of the caller's text. That was plans/SETS.md §11 R2: every
+// \b/\B/(?m:^)/(?m:$) set pattern silently gave wrong answers in exactly the
+// mode the Rust/Go/C/AS examples use, and the whole test surface missed it
+// because it runs standalone modules, where the two memories coincide.
+func appendInputLoad8u(b []byte) []byte {
+	return append(b, 0x2D, 0x00, 0x00)
+}
+
+// emitSetEntryState pushes the DFA entry state for a set body onto the stack,
+// keyed on paramStart — the position where this DFA begins CONSUMING bytes,
+// which is the literal's end for a split bucket and the match start for a
+// fallback bucket.
+//
+// Keying on the match start instead is wrong for split buckets, and is the
+// second mechanism behind plans/FABLE.md B40: a pattern like `foo\b` has its
+// `\b` in the suffix, so the entry context has to be the byte before the
+// SUFFIX (`input[paramStart-1]`, the literal's last byte) rather than the byte
+// before the match. Begin anchors cannot appear in a split suffix —
+// analyzePattern routes those to fallback — so paramStart == 0 implies
+// paramStart == paramLPos and the text-start state is only ever selected where
+// it is meaningful.
+//
+// The three prev-byte classes are checked in one nested chain rather than as
+// mutually exclusive cases. A first-match `switch` on hasWordChar /
+// hasNewlineBoundary was plans/SETS.md §11 R4: a bucket carrying BOTH kinds —
+// any bucket merging a \b pattern with a (?m:^) one — took the word-char arm
+// and could never reach midStartNewline, so `(?m:^)` failed at every mid-input
+// line start. '\n' is never a word character, so the classes really are
+// disjoint at runtime and the word test can front the newline test.
+//
+// Shared with buildSetProbeBody (compile/set_probe.go): this logic existed
+// there as a second copy, which is how R4 came to be present twice.
+func emitSetEntryState(b []byte, p setSuffixParams, paramPtr, paramStart byte) []byte {
+	l := p.l
+	tableMemIdx := p.tableMemIdx
+
+	// prevByte pushes input[paramPtr + paramStart - 1].
+	prevByte := func(b []byte) []byte {
+		b = append(b, 0x20, paramPtr, 0x20, paramStart, 0x41, 0x01, 0x6B, 0x6A)
+		return appendInputLoad8u(b)
+	}
+	// midOrNewline pushes midStartNewline when the previous byte is a newline,
+	// else midStart.
+	midOrNewline := func(b []byte) []byte {
+		if !p.hasNewlineBoundary {
+			b = append(b, 0x41)
+			return utils.AppendSLEB128(b, int32(p.wasmMidStart))
+		}
+		b = prevByte(b)
+		b = append(b, 0x41, 0x0A, 0x46) // == '\n'
+		b = append(b, 0x04, 0x7F)       // if (result i32)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(p.wasmMidStartNewline))
+		b = append(b, 0x05) // else
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(p.wasmMidStart))
+		b = append(b, 0x0B) // end if
+		return b
+	}
+
+	b = append(b, 0x20, paramStart)
+	b = append(b, 0x45)       // i32.eqz (start == 0)
+	b = append(b, 0x04, 0x7F) // if (result i32)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(p.wasmStart))
+	b = append(b, 0x05) // else: paramStart != 0
+	if p.hasWordChar {
+		// prevWasWord = wordChar[input[paramPtr + paramStart - 1]]
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, p.wordCharTableOff)
+		b = prevByte(b)
+		b = append(b, 0x6A)                   // wordCharOff + input[prev]
+		b = appendTableLoad8u(b, tableMemIdx) // TABLE: wordChar[prev]
+		b = append(b, 0x04, 0x7F)             // if prevWasWord (result i32)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(l.wasmMidStartWord))
+		b = append(b, 0x05) // else: not a word char — may still be a newline
+		b = midOrNewline(b)
+		b = append(b, 0x0B) // end inner if
+	} else {
+		b = midOrNewline(b)
+	}
+	b = append(b, 0x0B) // end outer if → i32 on stack
+	return b
+}
+
+// emitSetTransition emits one DFA transition step for a set body, dispatching
+// on the table layout. Shared with buildSetProbeBody, which carried a second
+// copy of this dispatch (plans/SETS.md §11 R12).
+func emitSetTransition(b []byte, l *dfaLayout, lState, lByteClass, paramPtr, lScanPos byte, tableMemIdx int) []byte {
+	switch {
+	case l.useU8 && l.useCompression:
+		return emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
+			lState, lByteClass, paramPtr, lScanPos, 0xff, tableMemIdx)
+	case l.useU8:
+		return emitSimpleU8Transition(b, l.tableOff, lState, paramPtr, lScanPos, 0xff, tableMemIdx)
+	default:
+		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
+		b = appendInputLoad8u(b)
+		b = append(b, 0x21, lByteClass)
+		return emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff, lState, lByteClass, tableMemIdx)
+	}
 }
 
 // buildSetSuffixBody generates the WASM function body for per-pattern set suffix scanning.
 // Signature: (ptr i32, start i32, len i32, lPos i32, out_ptr i32, out_cap i32, validMask i32) → i32
 //
 // validMask: bitmask of patterns whose prefix check passed. Only bits set here can produce output.
-// Writes (patternID, matchStart, matchLength) tuples directly to the output buffer.
-// Returns the count written.
+// Writes (patternID, matchStart, matchEnd) tuples directly to the output buffer
+// (plans/SETS.md §3.18). out_ptr/out_cap describe the *remaining* buffer at
+// this call — the caller offsets the pointer by the running total and passes
+// the signed remaining capacity, which may be negative once the buffer has
+// overflowed.
+// Returns the number of matches FOUND (which may exceed what fitted).
 //
 // Uses per-pattern endPos tracking to eliminate shared-endPos contamination.
-func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOff int32, wasmStart, wasmMidStart uint32, patternIDs, prefixFixedLens []int, tableMemIdx int, wordCharOff ...int32) []byte {
-	hasWordChar := len(wordCharOff) == 3 && l.needWordCharTable
+func buildSetSuffixBody(p setSuffixParams) []byte {
+	l := p.l
+	midBitmaskOff, eofBitmaskOff, immBitmaskOff := p.midBitmaskOff, p.eofBitmaskOff, p.immBitmaskOff
+	patternIDs, prefixFixedLens := p.patternIDs, p.prefixFixedLens
+	tableMemIdx := p.tableMemIdx
+	hasWordChar := p.hasWordChar
 	n := len(patternIDs)
 	if n > 32 {
 		n = 32
@@ -4449,24 +4644,30 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOf
 		paramOutPtr    = byte(4)
 		paramOutCap    = byte(5)
 		paramValidMask = byte(6) // bitmask of patterns that passed prefix check
-		// Fixed i32 locals: 7..13
-		lState       = byte(7)
-		lScanPos     = byte(8)
-		lByteClass   = byte(9)
-		lDoneMask    = byte(10)
-		lOutCount    = byte(11)
-		lBitsScratch = byte(12) // i32: low32 of bitmask
-		lOutBase     = byte(13) // i32: output tuple base ptr
+		paramGate      = byte(7) // gate array pointer; gated bodies only
 	)
-	// Per-pattern endPos locals: 14..14+n-1 (i32 each)
-	// i64 locals after: 14+n, 14+n+1, 14+n+2
-	endPosBase := byte(14)
+	// Locals start after the parameters.
+	lBase := byte(7)
+	if p.gated {
+		lBase = 8
+	}
+	var (
+		lState       = lBase
+		lScanPos     = lBase + 1
+		lByteClass   = lBase + 2
+		lDoneMask    = lBase + 3
+		lOutCount    = lBase + 4
+		lBitsScratch = lBase + 5 // i32: low32 of bitmask
+		lOutBase     = lBase + 6 // i32: output tuple base ptr
+	)
+	// Per-pattern endPos locals, then the i64 locals, then the bulk-skip v128.
+	endPosBase := lBase + 7
 	endPosK := func(k int) byte { return endPosBase + byte(k) }
-	lBits := byte(14 + n)
-	lResult := byte(15 + n)
-	lStartResult := byte(16 + n)
+	lBits := endPosBase + byte(n)
+	lResult := lBits + 1
+	lStartResult := lBits + 2
 	// Bulk-skip chunk local (v128); only declared when dominants exist.
-	lBulkChunk := byte(17 + n)
+	lBulkChunk := lBits + 3
 	haveDominants := len(l.dominantStates) > 0
 
 	var b []byte
@@ -4483,34 +4684,7 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOf
 		b = append(b, 0x01, 0x7B) // 1 × v128
 	}
 
-	// Initial state: wasmStart when lPos==0; for word-boundary DFAs also select
-	// wasmMidStartWord when the previous byte was a word char.
-	b = append(b, 0x20, paramLPos)
-	b = append(b, 0x45)       // i32.eqz (lPos == 0)
-	b = append(b, 0x04, 0x7F) // if (result i32)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(wasmStart))
-	b = append(b, 0x05) // else: paramLPos != 0
-	if hasWordChar {
-		// prevWasWord = wordChar[input[paramPtr + paramLPos - 1]]
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, wordCharOff[0])
-		b = append(b, 0x20, paramPtr, 0x20, paramLPos, 0x41, 0x01, 0x6B, 0x6A) // paramPtr + paramLPos - 1
-		b = appendTableLoad8u(b, tableMemIdx)                                  // input[prev]
-		b = append(b, 0x6A)                                                    // wordCharOff + input[prev]
-		b = appendTableLoad8u(b, tableMemIdx)                                  // wordChar[prev]
-		b = append(b, 0x04, 0x7F)                                              // if prevWasWord (result i32)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(l.wasmMidStartWord))
-		b = append(b, 0x05)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(wasmMidStart))
-		b = append(b, 0x0B) // end inner if
-	} else {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(wasmMidStart))
-	}
-	b = append(b, 0x0B) // end outer if → i32 on stack
+	b = emitSetEntryState(b, p, paramPtr, paramStart)
 	b = append(b, 0x21, lState)
 	b = append(b, 0x20, paramStart, 0x21, lScanPos)
 
@@ -4520,15 +4694,15 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOf
 		if !hasWordChar {
 			return b
 		}
-		wbNW := wordCharOff[1]
-		wbW := wordCharOff[2]
+		wbNW := p.wbNWBitmaskOff
+		wbW := p.wbWBitmaskOff
 		// Read wordChar[input[paramPtr + lScanPos]]
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, wordCharOff[0])
+		b = utils.AppendSLEB128(b, p.wordCharTableOff)
 		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A) // paramPtr + lScanPos
-		b = appendTableLoad8u(b, tableMemIdx)               // input[lScanPos]
+		b = appendInputLoad8u(b)                            // INPUT: input[lScanPos]
 		b = append(b, 0x6A)                                 // wordCharOff + byte
-		b = appendTableLoad8u(b, tableMemIdx)               // wordChar[byte] (isWord)
+		b = appendTableLoad8u(b, tableMemIdx)               // TABLE: wordChar[byte] (isWord)
 		b = append(b, 0x04, 0x40)                           // if isWord (void)
 		// isWord: wbBits = wbWBitmask[lState]
 		b = append(b, 0x41)
@@ -4567,31 +4741,65 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOf
 	// emitWriteMatchK: write match tuple for pattern k with compile-time prefix length.
 	// prefixMaxLen: max prefix length (0 = trivial, >0 = fixed, -1 = variable/unknown).
 	// matchStart = paramLPos - prefixMaxLen (for fixed-len prefix), else paramLPos.
+	//
+	// Tuple layout (plans/SETS.md §3.18 / D4): (pattern_id, start, end) — the
+	// third field is the absolute end, not a length. endPos_k already *is* the
+	// absolute end, so this deletes the subtract (and, on the fixed-prefix
+	// path, the prefixMaxLen re-add) the length convention needed.
+	//
+	// lOutCount is the number of matches *found*, not the number written
+	// (§3.11 / D2): the counter advances unconditionally and only the store is
+	// gated on remaining capacity, so a caller with an undersized buffer still
+	// learns the true total. paramOutCap is the capacity *remaining* at this
+	// call and can legitimately be negative once earlier buckets overflowed,
+	// hence the signed compare.
+	// emitStartK pushes pattern k's match start on the stack.
+	emitStartK := func(b []byte, prefixMaxLen int) []byte {
+		b = append(b, 0x20, paramLPos)
+		if prefixMaxLen > 0 {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(prefixMaxLen))
+			b = append(b, 0x6B)
+		}
+		return b
+	}
+
 	emitWriteMatchK := func(b []byte, bit uint32, globalID, k, prefixMaxLen int) []byte {
-		b = append(b, 0x20, lOutCount, 0x20, paramOutCap, 0x49, 0x04, 0x40) // if outCount < cap
+		b = append(b, 0x02, 0x40) // block $skip_tuple
+		if p.gated {
+			// §3.16 write-time filter: an EMPTY extent needs the stricter
+			// bound `2s >= gate[k]`. The pre-mask already proved the weaker
+			// `2s + 1 >= gate[k]`, so the two differ only when gate[k] is
+			// exactly 2s+1 — i.e. the pattern's previous match ended right
+			// here — which is precisely Go's "skip an empty match at the
+			// previous end" rule. One compare, and only on written tuples.
+			b = append(b, 0x20, endPosK(k))
+			b = emitStartK(b, prefixMaxLen)
+			b = append(b, 0x46, 0x04, 0x40) // if endPos == start (empty)
+			b = emitStartK(b, prefixMaxLen)
+			b = append(b, 0x41, 0x01, 0x74) // 2*start
+			b = append(b, 0x20, paramGate, 0x28, 0x02)
+			b = utils.AppendULEB128(b, uint32(globalID*4))
+			b = append(b, 0x49)       // i32.lt_u
+			b = append(b, 0x0D, 0x01) // br_if $skip_tuple
+			b = append(b, 0x0B)       // end if empty
+		}
+		b = append(b, 0x20, lOutCount, 0x20, paramOutCap, 0x48, 0x04, 0x40) // if outCount < cap (signed)
 		b = append(b, 0x20, paramOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A, 0x21, lOutBase)
 		b = append(b, 0x20, lOutBase, 0x41)
 		b = utils.AppendSLEB128(b, int32(globalID))
 		b = append(b, 0x36, 0x02, 0x00)
-		if prefixMaxLen > 0 {
-			// match start = paramLPos - prefixMaxLen
-			b = append(b, 0x20, lOutBase, 0x20, paramLPos, 0x41)
-			b = utils.AppendSLEB128(b, int32(prefixMaxLen))
-			b = append(b, 0x6B, 0x36, 0x02, 0x04) // i32.sub; i32.store
-			// length = endPos_k - (paramLPos - prefixMaxLen) = endPos_k - paramLPos + prefixMaxLen
-			b = append(b, 0x20, lOutBase, 0x20, endPosK(k), 0x20, paramLPos, 0x6B, 0x41)
-			b = utils.AppendSLEB128(b, int32(prefixMaxLen))
-			b = append(b, 0x6A, 0x36, 0x02, 0x08) // + prefixMaxLen; i32.store
-		} else {
-			// match start = paramLPos (trivial or variable-length prefix)
-			b = append(b, 0x20, lOutBase, 0x20, paramLPos, 0x36, 0x02, 0x04)
-			b = append(b, 0x20, lOutBase, 0x20, endPosK(k), 0x20, paramLPos, 0x6B, 0x36, 0x02, 0x08)
-		}
+		b = append(b, 0x20, lOutBase)
+		b = emitStartK(b, prefixMaxLen)
+		b = append(b, 0x36, 0x02, 0x04)
+		// match end = endPos_k (absolute)
+		b = append(b, 0x20, lOutBase, 0x20, endPosK(k), 0x36, 0x02, 0x08)
+		b = append(b, 0x0B) // end if room
 		b = append(b, 0x20, lOutCount, 0x41, 0x01, 0x6A, 0x21, lOutCount)
+		b = append(b, 0x0B) // end block $skip_tuple
 		b = append(b, 0x20, lDoneMask, 0x41)
 		b = utils.AppendSLEB128(b, int32(bit))
 		b = append(b, 0x72, 0x21, lDoneMask)
-		b = append(b, 0x0B) // end if
 		return b
 	}
 
@@ -4633,26 +4841,54 @@ func buildSetSuffixBody(l *dfaLayout, midBitmaskOff, eofBitmaskOff, immBitmaskOf
 		b = append(b, 0x0B)
 	}
 
+	// emitNLCheck emits the newline-boundary pre-transition accept check: a
+	// `(?m:$)` accepts at the position just BEFORE a '\n', which the
+	// post-transition midBitmask read cannot express. Mirrors emitWBCheck.
+	emitNLCheck := func(b []byte) []byte {
+		if !p.hasNewlineBoundary {
+			return b
+		}
+		// if input[lScanPos] == '\n'
+		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
+		b = appendInputLoad8u(b) // INPUT byte, not a table read
+		b = append(b, 0x41, 0x0A, 0x46)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, p.nlBitmaskOff)
+		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+		b = appendTableLoad64(b, tableMemIdx)
+		b = append(b, 0x21, lBits)
+		b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult)
+		b = append(b, 0x20, lBits, 0xA7, 0x21, lBitsScratch)
+		b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch)
+		// The accept is AT lScanPos (before consuming the newline).
+		for k := range patternIDs {
+			if k >= 32 {
+				break
+			}
+			bit := uint32(1) << uint(k)
+			b = append(b, 0x20, lBitsScratch, 0x41)
+			b = utils.AppendSLEB128(b, int32(bit))
+			b = append(b, 0x71, 0x04, 0x40)
+			b = append(b, 0x20, lScanPos, 0x21, endPosK(k))
+			b = append(b, 0x0B)
+		}
+		b = append(b, 0x0B) // end if byte == newline
+		return b
+	}
+
 	// --- Main scan loop ---
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $main
 
 	b = append(b, 0x20, lScanPos, 0x20, paramLen, 0x4F, 0x0D, 0x01) // pos>=len: br $done
 
-	// Word-boundary pre-transition accept check (before consuming current byte).
+	// Zero-width pre-transition accept checks (before consuming current byte).
 	b = emitWBCheck(b)
+	b = emitNLCheck(b)
 
 	// DFA transition
-	if l.useU8 && l.useCompression {
-		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
-			lState, lByteClass, paramPtr, lScanPos, 0xff, tableMemIdx)
-	} else if l.useU8 {
-		b = emitSimpleU8Transition(b, l.tableOff,
-			lState, paramPtr, lScanPos, 0xff, tableMemIdx)
-	} else {
-		b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A, 0x2D, 0x00, 0x00, 0x21, lByteClass)
-		b = emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff, lState, lByteClass, tableMemIdx)
-	}
+	b = emitSetTransition(b, l, lState, lByteClass, paramPtr, lScanPos, tableMemIdx)
 
 	// Load midBitmask and update per-pattern endPos for each bit that fires.
 	b = append(b, 0x41)
@@ -8078,9 +8314,9 @@ func buildFindBody(p findBodyParams) []byte {
 							b = utils.AppendSLEB128(b, int32(prefixEndState))
 							b = append(b, 0x0B) // end if prev-is-word
 						case !wordDiverges && newlineDiverges:
-							b = append(b, 0x20, 0x00)       // local.get ptr
-							b = append(b, 0x20, 0x04)       // local.get attempt_start
-							b = append(b, 0x6A)             // ptr + attempt_start
+							b = append(b, 0x20, 0x00) // local.get ptr
+							b = append(b, 0x20, 0x04) // local.get attempt_start
+							b = append(b, 0x6A)       // ptr + attempt_start
 							b = append(b, 0x41, 0x01)
 							b = append(b, 0x6B)             // ... - 1
 							b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u prev byte
@@ -8109,10 +8345,10 @@ func buildFindBody(p findBodyParams) []byte {
 							b = append(b, 0x04, 0x7F)             // if (result i32) prev is word
 							b = append(b, 0x41)
 							b = utils.AppendSLEB128(b, int32(prefixEndStateWord))
-							b = append(b, 0x05) // else
-							b = append(b, 0x20, 0x00)       // local.get ptr
-							b = append(b, 0x20, 0x04)       // local.get attempt_start
-							b = append(b, 0x6A)             // ptr + attempt_start
+							b = append(b, 0x05)       // else
+							b = append(b, 0x20, 0x00) // local.get ptr
+							b = append(b, 0x20, 0x04) // local.get attempt_start
+							b = append(b, 0x6A)       // ptr + attempt_start
 							b = append(b, 0x41, 0x01)
 							b = append(b, 0x6B)             // ... - 1
 							b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u prev byte

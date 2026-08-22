@@ -40,10 +40,6 @@ const (
 	// before the harness skips it, so the slot buffer cannot run into the
 	// tables. 128 groups = 256 slots = 1 KB, far inside the output window.
 	maxFuzzGroups = 128
-
-	// setBatchCap is how many (patternID, start, length) records a set
-	// find_all call may return per invocation. 3 i32s per record.
-	setBatchCap = 1024
 )
 
 // compileMatch compiles pat into a standalone module exporting a single
@@ -84,9 +80,12 @@ func compileSet(pats []string) ([]byte, error) {
 		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
 	}
 	sets := []config.SetConfig{{
-		Name:     "s",
-		FindAll:  "set_find_all",
-		Patterns: config.PatternSelector{Names: names},
+		Name: "s",
+		Find: "set_find",
+		// Ungated body: every start position is enumerated, which is what
+		// allStartPositionMatches models (plans/SETS.md §3.15).
+		Overlapping: true,
+		Patterns:    config.PatternSelector{Names: names},
 	}}
 	// CompileFile hard-codes tableBase = 0 for the sets path, so a set's
 	// tables always start at address 0 and the input CANNOT live at offset 0
@@ -202,25 +201,34 @@ func runWasmGroupsPath(wasmBytes []byte, input string, numGroups int) (slots []i
 	return slots, true, false, nil
 }
 
-// setMatch is one match reported by a set find_all call.
+// setMatch is one match reported by a set `find` call.
 type setMatch struct {
 	PatternID  int
 	Start, End int
 }
 
-// runWasmSetFindAll calls "set_find_all":
-// (ptr, len, out_ptr, out_cap, start_pos) -> i32 count, writing count records
-// of (patternID, start, length). Drains repeatedly so a full buffer does not
-// silently truncate the result — the same resume rule the generated Go/JS
-// stubs implement.
-func runWasmSetFindAll(wasmBytes []byte, input string) (matches []setMatch, hang bool, err error) {
+// runWasmSetFind drives "set_find" to exhaustion:
+//
+//	find(ptr, len, from, out_ptr, out_cap) -> i32 total
+//
+// Each call returns the TOTAL number of matches at the first matching position
+// at or after `from`, writing min(total, out_cap) (patternID, start, end)
+// tuples (plans/SETS.md §3.11, §3.18). Every tuple in one call shares a start,
+// so the resume rule is `from = start + 1` and no dedup guesswork is needed —
+// the ambiguity the old find_all harness had to skip on is gone by
+// construction.
+//
+// The buffer is sized at the set's pattern count, which is the exact worst case
+// for a single position, so an overflow here is an engine bug rather than a
+// harness limitation.
+func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []setMatch, hang bool, err error) {
 	store, inst, mem, err := instantiate(wasmBytes)
 	if err != nil {
 		return nil, false, err
 	}
-	fn := inst.GetFunc(store, "set_find_all")
+	fn := inst.GetFunc(store, "set_find")
 	if fn == nil {
-		return nil, false, fmt.Errorf("module missing set_find_all export")
+		return nil, false, fmt.Errorf("module missing set_find export")
 	}
 
 	// Set tables start at address 0 (see compileSet), so the layout has to be
@@ -238,7 +246,8 @@ func runWasmSetFindAll(wasmBytes []byte, input string) (matches []setMatch, hang
 		inputSpan = pageSize
 	}
 	outBase := inBase + inputSpan
-	outBytes := int64(setBatchCap) * 12
+	outCap := int32(numPatterns)
+	outBytes := int64(outCap) * 12
 
 	neededPages := uint64((int64(outBase) + outBytes + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); neededPages > cur {
@@ -251,48 +260,58 @@ func runWasmSetFindAll(wasmBytes []byte, input string) (matches []setMatch, hang
 	}
 
 	_, wd := sharedEngine()
-	wd.Arm(store)
-	res, callErr := fn.Call(store, inBase, int32(len(input)), outBase, int32(setBatchCap), int32(0))
-	wd.Disarm()
-	if callErr != nil {
-		if isTimeout(callErr) {
-			return nil, true, nil
+	from := int32(0)
+	prevStart := -1
+	for {
+		wd.Arm(store)
+		res, callErr := fn.Call(store, inBase, int32(len(input)), from, outBase, outCap)
+		wd.Disarm()
+		if callErr != nil {
+			if isTimeout(callErr) {
+				return nil, true, nil
+			}
+			return nil, false, callErr
 		}
-		return nil, false, callErr
+		n := int(res.(int32))
+		// Set frontends are DFA-only today, so BTStackOverflow is not
+		// currently reachable here. Checked anyway, and BEFORE the n <= 0 test
+		// that would otherwise read it as "no matches".
+		if n == abi.BTStackOverflow {
+			return nil, false, errBTOverflow
+		}
+		if n <= 0 {
+			return matches, false, nil
+		}
+		if n > int(outCap) {
+			return nil, false, fmt.Errorf("%w: %d tuples at one position, buffer holds %d",
+				errSetOutputTruncated, n, outCap)
+		}
+		buf := mem.UnsafeData(store)
+		start := -1
+		for i := 0; i < n; i++ {
+			base := int(outBase) + i*12
+			id := int(int32(binary.LittleEndian.Uint32(buf[base:])))
+			s := int(int32(binary.LittleEndian.Uint32(buf[base+4:])))
+			e := int(int32(binary.LittleEndian.Uint32(buf[base+8:])))
+			if i == 0 {
+				start = s
+			} else if s != start {
+				return nil, false, fmt.Errorf("tuples in one call disagree on start: %d vs %d", start, s)
+			}
+			matches = append(matches, setMatch{PatternID: id, Start: s, End: e})
+		}
+		if start < int(from) {
+			return nil, false, fmt.Errorf("reported start %d is before from=%d", start, from)
+		}
+		if start <= prevStart {
+			return nil, false, fmt.Errorf("start did not advance: %d after %d", start, prevStart)
+		}
+		prevStart = start
+		from = int32(start) + 1
 	}
-	n := int(res.(int32))
-	// Set frontends are DFA-only today (compile/set.go builds prefix/suffix
-	// DFAs and drops patterns it cannot handle), so BTStackOverflow is not
-	// currently reachable here. Checked anyway, and BEFORE the n <= 0 test
-	// that would otherwise read it as "no matches": if a set frontend ever
-	// gains a BT-hosting path, the failure mode without this line is a silent
-	// wrong answer that the oracle comparison would blame on the compiler.
-	if n == abi.BTStackOverflow {
-		return nil, false, errBTOverflow
-	}
-	if n <= 0 {
-		return nil, false, nil
-	}
-	if n >= setBatchCap {
-		// Buffer full. find_all's resume protocol (re-call with
-		// startPos = lastStart+1) can re-report matches whose start is inside
-		// the previous batch's span, and the dedup rule for that is not
-		// something this harness should be guessing at — a wrong guess shows up
-		// as a fuzz FAILURE against the oracle, i.e. a false accusation against
-		// the compiler. Deliberately report truncation and let the caller skip.
-		return nil, false, errSetOutputTruncated
-	}
-	buf := mem.UnsafeData(store)
-	for i := 0; i < n; i++ {
-		base := int(outBase) + i*12
-		id := int(int32(binary.LittleEndian.Uint32(buf[base:])))
-		s := int(int32(binary.LittleEndian.Uint32(buf[base+4:])))
-		l := int(int32(binary.LittleEndian.Uint32(buf[base+8:])))
-		matches = append(matches, setMatch{PatternID: id, Start: s, End: s + l})
-	}
-	return matches, false, nil
 }
 
-// errSetOutputTruncated signals that a set find_all call filled its output
-// buffer, so the result is incomplete and not comparable to the oracle.
-var errSetOutputTruncated = errors.New("set find_all output buffer full (truncated)")
+// errSetOutputTruncated signals that one `find` call reported more matches at a
+// single position than patterns_in_set, which the §3.11 contract says is
+// impossible.
+var errSetOutputTruncated = errors.New("set find reported more tuples at one position than the set has patterns")

@@ -187,23 +187,38 @@ When the config has a `sets:` block, the generator also emits, per set (see
 [sets.md](sets.md) for the full config schema and wire format):
 
 ```ts
-class SetMatch { constructor(public patternId: i32, public start: i32, public end: i32) {} }
-class SetAnchorMatch { constructor(public patternId: i32, public end: i32) {} }
+export const <SET>_PATTERN_COUNT: i32 = 12;
 
-export function <find_all>_next(input: ArrayBuffer): SetMatch | null
-export function <find_all>_reset(): void
+class SetMatch  { constructor(public patternId: i32, public start: i32, public end: i32) {} }
+class SetAnchor { constructor(public patternId: i32, public start: i32) {} }
 
-export function <find_any>(input: ArrayBuffer): SetMatch | null
-export function <match>(input: ArrayBuffer): SetAnchorMatch | null
+// anchored: the pattern must match the WHOLE input
+export function <match>(input: ArrayBuffer): bool
+export function <match_any>(input: ArrayBuffer): i32              // id, or -1
+export function <match_all>(input: ArrayBuffer): Array<i32>
+
+// non-anchored: each takes a `from` position
+export function <scan>(input: ArrayBuffer, from: i32): bool
+export function <scan_any>(input: ArrayBuffer, from: i32): SetAnchor | null
+export function <scan_all>(input: ArrayBuffer, from: i32): Array<i32>
+
+// AssemblyScript has no generators, so `find` is an explicit iterator object.
+export function <find>(input: ArrayBuffer, from: i32): <Find>Iter
+class <Find>Iter { next(): SetMatch | null }
 
 // only if any set in the config sets emit_name_map: true
 export function patternName(id: i32): string
 ```
 
-`<find_all>_next` streams non-overlapping matches from an internal static
-buffer, refilling it from WASM as needed; call `<find_all>_reset()` before
-starting a new scan over different input. `patternName` is a single shared
-lookup across every set in the config that requested `emit_name_map: true`.
+The iterator is caller-owned: two scans can be in flight at once, and creating
+a new one restarts the scan. It owns its tuple buffer and — for the default
+non-overlapping `find` — its gate array, so gates never appear here.
+
+`<match_all>`/`<scan_all>` return an `Array<i32>` of pattern ids, **not** a
+boolean. `<scan_any>` decomposes the engine's packed `i64` for you.
+
+`patternName` is a single shared lookup across every set in the config that
+requested `emit_name_map: true`.
 
 ---
 

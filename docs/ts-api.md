@@ -158,6 +158,44 @@ Generated export names match the config field values exactly (no case conversion
 
 ---
 
+---
+
+## Set composition exports
+
+When the config has a `sets:` block, the stub also exports one function per
+declared capability (see [sets.md](sets.md) for the full config schema and wire
+format):
+
+```ts
+export const <set>PatternCount: number;
+
+export interface SetMatch  { patternId: number; start: number; end: number; }
+export interface SetAnchor { patternId: number; start: number; }
+
+// anchored: the pattern must match the WHOLE input
+export function <match>(input: string | Uint8Array): boolean
+export function <match_any>(input: string | Uint8Array): number | null
+export function <match_all>(input: string | Uint8Array): number[]
+
+// non-anchored: each takes a `from` position
+export function <scan>(input: string | Uint8Array, from?: number): boolean
+export function <scan_any>(input: string | Uint8Array, from?: number): SetAnchor | null
+export function <scan_all>(input: string | Uint8Array, from?: number): number[]
+
+export function* <find>(input: string | Uint8Array, from?: number): Generator<SetMatch>
+```
+
+The types make the `_any`/`_all` shapes explicit, which is the difference from
+the JavaScript stub — there, `if (scanAll(x))` is always true because an empty
+array is truthy. The `find` generator owns the gate array for the default
+non-overlapping configuration; creating a new one restarts the scan.
+
+**Do not call other stub functions while a generator is suspended** — the
+staged input and the shared output region belong to whichever call ran last.
+
+`patternName(id)` is emitted once per config when any set sets
+`emit_name_map: true`.
+
 ## Notes
 
 - `init()` must be awaited before calling any matcher. Calling a matcher before `init()` will throw.

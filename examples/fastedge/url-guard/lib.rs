@@ -31,9 +31,10 @@ impl HttpContext for Guard {
             None => return Action::Continue,
         };
 
-        // scan_url stops at the first match — minimal overhead to block.
-        if let Some(m) = patterns::scan_url(&url) {
-            let attack = patterns::pattern_name(m.pattern_id);
+        // scan_any stops at the first matching position and carries no
+        // extent — minimal overhead to block.
+        if let Some((pattern_id, _start)) = patterns::scan_url(&url, 0) {
+            let attack = patterns::pattern_name(pattern_id);
             self.send_http_response(
                 403,
                 vec![("Content-Type", "text/plain")],

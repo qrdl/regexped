@@ -131,6 +131,46 @@ Function names are the `snake_case` config values converted to `PascalCase`: `ur
 
 ---
 
+---
+
+## Set composition exports
+
+When the config has a `sets:` block, the generator also emits, per set, one
+function per declared capability (see [sets.md](sets.md) for the full config
+schema and wire format):
+
+```go
+const <Set>PatternCount = 12
+
+type SetMatch struct{ PatternID, Start, End int }
+
+// anchored: the pattern must match the WHOLE input
+func <Match>   (input []byte) bool
+func <MatchAny>(input []byte) (int, bool)
+func <MatchAll>(input []byte) []int
+
+// non-anchored: each takes a `from` position
+func <Scan>   (input []byte, from int) bool
+func <ScanAny>(input []byte, from int) (id, start int, ok bool)
+func <ScanAll>(input []byte, from int) []int
+
+func <Find>(input []byte, from int) iter.Seq[SetMatch]
+```
+
+```go
+for m := range scanSecrets(input, 0) {
+    fmt.Println(m.PatternID, m.Start, m.End)
+}
+```
+
+The sequence owns one reusable tuple buffer and, for the default
+non-overlapping configuration, a zeroed gate array — both sized from
+`<Set>PatternCount`. Each WASM call returns every match at one position before
+the scan advances, so a step is not a call. Requires Go 1.23+ for `iter`.
+
+`PatternName(id)` is emitted once per config when any set sets
+`emit_name_map: true`.
+
 ## Notes
 
 - The `unsafe` FFI call is hidden inside the generated stub; your application code only sees safe Go functions.

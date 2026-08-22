@@ -1,0 +1,5 @@
+# (?i) case folding: literals carry FoldCase and are excluded from literal
+# extraction, so this exercises the no-mandatory-literal find shape.
+regexps:
+  - pattern: '(?i)select\s+.*\s+from'
+    find_func: fold_find

@@ -72,6 +72,6 @@ regexps:
 
 sets:
   - name: "attacks"
-    find_any: "scan_url"
+    scan_any: "scan_url"
     emit_name_map: true
     patterns: all

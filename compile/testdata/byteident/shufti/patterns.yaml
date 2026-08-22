@@ -1,0 +1,6 @@
+# Shufti: a wide first-byte set (17..64 members) with prefer-no-match, which is
+# what forces the SIMD membership prefilter over the scalar path.
+regexps:
+  - pattern: '[a-p][0-9]{4}END'
+    find_func: shufti_find
+    hints: [prefer-no-match]

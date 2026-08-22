@@ -1,0 +1,4 @@
+# A bounded counted repeat, the {N,M} shape rather than an exact chain.
+regexps:
+  - pattern: 'x[a-f]{3,10}y'
+    find_func: counted_find

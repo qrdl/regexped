@@ -8,6 +8,10 @@ name = "regex_bench"
 
 [dependencies]
 regex = "1"
+# Promoted from a transitive dependency of `regex` to a direct one so
+# tools/setperf can benchmark the layer underneath the `regex` facade
+# (plans/SETS.md D21 / §9.9).
+regex-automata = "0.4"
 
 [profile.release]
 opt-level = 3

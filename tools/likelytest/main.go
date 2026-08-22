@@ -60,7 +60,7 @@ const (
 	modeFind matchMode = iota
 	modeAnchored
 	modeGroups
-	modeSet // CompileFile with cfg.Sets; driven via find_all exhaustion loop
+	modeSet // CompileFile with cfg.Sets; driven via the `find` exhaustion loop
 )
 
 func (m matchMode) String() string {
@@ -90,7 +90,7 @@ type testCase struct {
 	// after it are never touched — so "match-dense" inputs (LM_TODO.md
 	// LM-0) are meaningless under single-call measurement; this flag is
 	// what makes them actually exercise the whole buffer. modeSet cases
-	// always exhaust via find_all regardless of this flag.
+	// always exhaust via the set `find` regardless of this flag.
 	exhaustive bool
 }
 
@@ -1216,7 +1216,7 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 }
 
 // compileSetMode compiles tc.setPatterns as a regexped set under the given
-// LikelyMode and returns standalone WASM exporting find_all. The mode is
+// LikelyMode and returns standalone WASM exporting the set `find`. The mode is
 // applied via the set's own `hints:` field — the set's resolveHints(sc.Hints)
 // call is what actually consumes it (H.3 frontend density gate); none of
 // these entries carry their own _func fields, so there is no per-pattern
@@ -1231,7 +1231,7 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		Sets: []config.SetConfig{
 			{
 				Name:     "bench_set",
-				FindAll:  "find_all",
+				Find:     "set_find",
 				Patterns: config.PatternSelector{All: true},
 				Hints:    hintsYAML(mode),
 			},
@@ -1622,8 +1622,8 @@ func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string
 //
 // modeSet is intentionally not checked here: tools/re2test's own --sets
 // mode already exhaustively validates set-composition correctness, and
-// decoding find_all's per-pattern tuple output against the right member of
-// a multi-pattern set is a different, more involved job than the
+// decoding the set `find`'s per-pattern tuple output against the right member
+// of a multi-pattern set is a different, more involved job than the
 // single-pattern checks below. Only 3 of this suite's cases use modeSet.
 
 // newPlainInstance instantiates wasmBytes on a fuel-free store and returns
@@ -2019,7 +2019,7 @@ func planSetMem(wasmBytes []byte, inputLen int) (setMemPlan, error) {
 	return setMemPlan{inputBase: inBase, outputBase: outBase}, nil
 }
 
-// benchTimeSet times the cost of one full find_all exhaustion pass over
+// benchTimeSet times the cost of one full set-`find` exhaustion pass over
 // `input` and returns the p50 over setIterTime samples.
 func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time.Duration, error) {
 	plan, err := planSetMem(wasmBytes, len(input))
@@ -2037,7 +2037,7 @@ func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time
 		return 0, fmt.Errorf("instance: %w", err)
 	}
 	mem := inst.GetExport(store, "memory").Memory()
-	findFn := inst.GetFunc(store, "find_all")
+	findFn := inst.GetFunc(store, "set_find")
 	if mem == nil || findFn == nil {
 		return 0, fmt.Errorf("missing exports")
 	}
@@ -2068,7 +2068,7 @@ func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time
 	return computeStat(ns, 50), nil
 }
 
-// benchFuelSet measures fuel for one full find_all exhaustion pass.
+// benchFuelSet measures fuel for one full set-`find` exhaustion pass.
 func benchFuelSet(wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (uint64, error) {
 	plan, err := planSetMem(wasmBytes, len(input))
 	if err != nil {
@@ -2087,7 +2087,7 @@ func benchFuelSet(wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (
 		return 0, err
 	}
 	mem := inst.GetExport(store, "memory").Memory()
-	findFn := inst.GetFunc(store, "find_all")
+	findFn := inst.GetFunc(store, "set_find")
 	if mem == nil || findFn == nil {
 		return 0, fmt.Errorf("missing exports")
 	}
@@ -2102,7 +2102,8 @@ func benchFuelSet(wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (
 
 func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan, input string) error {
 	const pageSize = 65536
-	needTop := uint64(plan.outputBase) + uint64(setOutCap)*12 + 4096
+	// Tuples, then the gate array, both above outputBase.
+	needTop := uint64(plan.outputBase) + uint64(setOutCap)*16 + 4096
 	neededPages := (needTop + pageSize - 1) / pageSize
 	curPages := mem.Size(store)
 	if neededPages > curPages {
@@ -2119,12 +2120,23 @@ func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan,
 	return nil
 }
 
-// runSetExhaust drives find_all in a loop until it returns 0 (no more matches),
-// advancing startPos past the last match each iteration.
+// runSetExhaust drives the set `find` export to exhaustion, the way a
+// generated iterator does (plans/SETS.md §4.8): zero the gate array, then call
+//
+//	find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> total at that position
+//
+// advancing `from` to start+1 each time. Every tuple in one call shares a
+// start, so reading the first tuple is enough to resume.
 func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) {
-	startPos := int32(0)
+	gatePtr := plan.outputBase + setOutCap*12
+	buf := mem.UnsafeData(store)
+	for i := int32(0); i < setOutCap*4; i++ {
+		buf[gatePtr+i] = 0
+	}
+	runtime.KeepAlive(store)
+	from := int32(0)
 	for {
-		n, err := findFn.Call(store, plan.inputBase, inputLen, plan.outputBase, setOutCap, startPos)
+		n, err := findFn.Call(store, plan.inputBase, inputLen, from, gatePtr, plan.outputBase, setOutCap)
 		if err != nil {
 			return
 		}
@@ -2133,17 +2145,12 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 			return
 		}
 		buf := mem.UnsafeData(store)
-		last := int(count - 1)
-		base := int(plan.outputBase) + last*12
+		base := int(plan.outputBase)
 		s := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
-		l := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
-		if l <= 0 {
-			l = 1
-		}
 		// See benchTime's comment on the same pattern: buf is a raw pointer
 		// into wasmtime's native memory, not a Go reference to store.
 		runtime.KeepAlive(store)
-		startPos = s + l
+		from = s + 1
 	}
 }
 

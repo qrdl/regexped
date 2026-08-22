@@ -465,7 +465,7 @@ type compiledPattern struct {
 	// directly, since it calls branch functions by index.
 
 	// Batch find/groups exports (multiple matches per host call, modelled on
-	// the set find_all ABI; originally LM-2, now task 44). Set by compileAll
+	// the set find ABI; originally LM-2, now task 44). Set by compileAll
 	// (not compilePattern) once findExport/groupsExport/namedGroupsExport are
 	// known, gated on the pattern's "batch-find" hint (see hasBatchHint) —
 	// independent of LikelyMode. Empty = not requested.
@@ -485,7 +485,7 @@ type compiledPattern struct {
 	//
 	// Always laid out last (see batchOffsets). Wired into both assembleModule
 	// and assembleModuleWithSets for a pattern's own find/groups exports; a
-	// compiledSet's own find_all/find_any/match are never given a batch
+	// compiledSet's own capabilities are never given a batch
 	// wrapper — they already cover multi-match natively.
 	batchFindExport   string
 	batchGroupsExport string
@@ -2251,12 +2251,17 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 			globalIDs = append(globalIDs, idx)
 		}
 		spec := SetSpec{
-			Name:       sc.Name,
-			FindAny:    sc.FindAny,
-			FindAll:    sc.FindAll,
-			Match:      sc.Match,
-			Patterns:   infos,
-			PatternIDs: globalIDs,
+			Name:        sc.Name,
+			Match:       sc.Match,
+			MatchAny:    sc.MatchAny,
+			MatchAll:    sc.MatchAll,
+			Scan:        sc.Scan,
+			ScanAny:     sc.ScanAny,
+			ScanAll:     sc.ScanAll,
+			Find:        sc.Find,
+			Overlapping: sc.Overlapping,
+			Patterns:    infos,
+			PatternIDs:  globalIDs,
 		}
 		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
 		if cs.diag != nil {

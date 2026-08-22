@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"regexp/syntax"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -56,7 +57,7 @@ func main() {
 	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors, skips WASM testing)")
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
 	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find/groups (sets MaxDFAStates=-1 so DFA/TDFA always overflow to BT)")
-	setsMode := flag.Bool("sets", false, "test set find_all: compile each regexps block as a set and verify all matches against col4/col1 expected results")
+	setsMode := flag.Bool("sets", false, "test the set `find` capability: compile each regexps block as a set and verify its gated (per-pattern non-overlapping) output against col4/col1")
 	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
 	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
 	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
@@ -884,8 +885,7 @@ type setBlockEntry struct {
 }
 
 const (
-	setOutCap        = 65536 // max tuples per find_all batch
-	setOutTupleBytes = 12    // (pattern_id i32, start i32, length i32)
+	setOutTupleBytes = 12 // (pattern_id i32, start i32, end i32)
 )
 
 // testSetBlock compiles all patterns in entries as a set and runs find_all against
@@ -941,7 +941,13 @@ func testSetBlock(
 	cfg := config.BuildConfig{
 		Regexps: regexps,
 		Sets: []config.SetConfig{
-			{Name: "test", FindAll: "find_all", Patterns: config.PatternSelector{All: true}, Hints: hints},
+			// The DEFAULT (gated) find body: per-pattern non-overlapping
+			// output, which is exactly Go FindAllIndex's rule — and col4 is
+			// the corpus's Go-FindAll column, verified against Go itself by
+			// --validate-go. So the whole corpus becomes a check of the §3.16
+			// gate encoding, at every empty-match shape, anchor and extent it
+			// contains (plans/SETS.md §9.6.1 "corpus scale, nearly free").
+			{Name: "test", Find: "set_find", Patterns: config.PatternSelector{All: true}, Hints: hints},
 		},
 	}
 
@@ -973,9 +979,9 @@ func testSetBlock(
 	if exp := inst.GetExport(store, "memory"); exp != nil {
 		mem = exp.Memory()
 	}
-	findAllFn := inst.GetFunc(store, "find_all")
-	if mem == nil || findAllFn == nil {
-		err = fmt.Errorf("set block missing exports: memory=%v find_all=%v", mem != nil, findAllFn != nil)
+	findFn := inst.GetFunc(store, "set_find")
+	if mem == nil || findFn == nil {
+		err = fmt.Errorf("set block missing exports: memory=%v set_find=%v", mem != nil, findFn != nil)
 		return
 	}
 
@@ -997,7 +1003,12 @@ func testSetBlock(
 		inputSpan = int32(pageSize)
 	}
 	outBase := inBase + inputSpan
-	outBytes := int64(setOutCap * setOutTupleBytes)
+	// out_cap is the set's pattern count: the exact worst case for a single
+	// position (plans/SETS.md §3.11), so a call can never overflow. The gate
+	// array (4 bytes per pattern) sits just above the tuple buffer.
+	outCap := int32(len(eligible))
+	gatePtr := outBase + outCap*int32(setOutTupleBytes)
+	outBytes := int64(outCap)*int64(setOutTupleBytes) + int64(outCap)*4
 
 	neededPages := uint64((int64(outBase) + outBytes + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); neededPages > cur {
@@ -1019,12 +1030,15 @@ nextString:
 			copy(buf[inBase:], []byte(text))
 		}
 
-		// Collect all find_all matches: gotMatches[patternID] = [][2]int{start,end}
+		// Collect every match the gated scan reports, keyed by pattern id.
 		gotMatches := make(map[int32][][2]int, len(entries))
-		startPos := int32(0)
+		for i := int32(0); i < outCap*4; i++ {
+			buf[gatePtr+i] = 0 // a clean scan starts from an all-zero gate array
+		}
+		from := int32(0)
 		for {
 			wd.Arm(store)
-			result, callErr := findAllFn.Call(store, inBase, int32(len(text)), outBase, int32(setOutCap), startPos)
+			result, callErr := findFn.Call(store, inBase, int32(len(text)), from, gatePtr, outBase, outCap)
 			wd.Disarm()
 			if callErr != nil {
 				if isTimeout(callErr) {
@@ -1035,41 +1049,42 @@ nextString:
 					// timeouts are aggregated into stats.nTimeout and surfaced
 					// by the caller as skipTimeout entries.
 					if stats.nTimeout == 1 {
-						fmt.Printf("SKIP  set find_all TIMEOUT input=%q startPos=%d (%d eligible patterns; further timeouts in this block suppressed)\n",
-							text, startPos, len(eligible))
+						fmt.Printf("SKIP  set find TIMEOUT input=%q from=%d (%d eligible patterns; further timeouts in this block suppressed)\n",
+							text, from, len(eligible))
 					}
 					continue nextString
 				}
-				err = fmt.Errorf("set block find_all call (input=%q startPos=%d): %w", text, startPos, callErr)
+				err = fmt.Errorf("set block find call (input=%q from=%d): %w", text, from, callErr)
 				return
 			}
 			count := result.(int32)
-			if count == 0 {
+			if count <= 0 {
 				break
 			}
-			var lastStart int32
+			if count > outCap {
+				nfail += len(eligible)
+				fmt.Printf("FAIL  set find reported %d tuples at one position, but the set has %d patterns (input=%q from=%d)\n",
+					count, outCap, text, from)
+				continue nextString
+			}
+			var start int32
 			for i := int32(0); i < count; i++ {
 				base := int(outBase) + int(i)*setOutTupleBytes
 				pid := int32(buf[base]) | int32(buf[base+1])<<8 | int32(buf[base+2])<<16 | int32(buf[base+3])<<24
-				start := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
-				length := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
-				gotMatches[pid] = append(gotMatches[pid], [2]int{int(start), int(start + length)})
-				lastStart = start
+				st := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
+				en := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
+				if i == 0 {
+					start = st
+				} else if st != start {
+					nfail += len(eligible)
+					fmt.Printf("FAIL  set find tuples in one call disagree on start (%d vs %d) input=%q from=%d\n",
+						start, st, text, from)
+					continue nextString
+				}
+				gotMatches[pid] = append(gotMatches[pid], [2]int{int(st), int(en)})
 			}
-			// find_all returns when EITHER the buffer is full (count == out_cap)
-			// OR the input has been fully scanned (count < out_cap). Only the
-			// buffer-full case needs a resume; otherwise we're done with this
-			// input. Without this guard we would re-scan [lastStart+1, inLen]
-			// after every successful scan, re-emitting the same matches and
-			// looping forever.
-			if int(count) < setOutCap {
-				break
-			}
-			// Resume one position past last.start: the WASM scan is
-			// position-by-position, so only positions <= lastStart have been
-			// visited. Advancing by last_len would skip positions inside the
-			// last match's span and miss overlapping matches.
-			startPos = lastStart + 1
+			// Every tuple in one call shares a start; resume one past it.
+			from = start + 1
 		}
 
 		// Compare against each eligible pattern's expected results.
@@ -1104,6 +1119,10 @@ nextString:
 			}
 
 			got := gotMatches[int32(pi)]
+			// Within one call the tuple order is unspecified (§3.10), so the
+			// comparison is by multiset. Across calls the starts strictly
+			// increase, so sorting by (start, end) recovers col4's order.
+			sortSpanPairs(got)
 			var matchOk bool
 			if len(cols) >= 5 && strings.TrimSpace(cols[4]) != "" {
 				// col4 available: exact match required.
@@ -1449,6 +1468,18 @@ func col4Equal(goAll [][]int, exp [][2]int) bool {
 }
 
 // col4WasmEqual compares WASM iteration results against parsed col4 pairs.
+// sortSpanPairs orders spans by (start, end) so a multiset comparison can be
+// done element-wise. plans/SETS.md §3.10 leaves the order of the tuples within
+// one `find` call unspecified.
+func sortSpanPairs(v [][2]int) {
+	sort.Slice(v, func(i, j int) bool {
+		if v[i][0] != v[j][0] {
+			return v[i][0] < v[j][0]
+		}
+		return v[i][1] < v[j][1]
+	})
+}
+
 func col4WasmEqual(got [][2]int, exp [][2]int) bool {
 	if len(got) != len(exp) {
 		return false

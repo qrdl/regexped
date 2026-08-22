@@ -1,0 +1,4 @@
+# find_func alone: the find body with no anchored sibling.
+regexps:
+  - pattern: '\d{4}-\d{2}-\d{2}'
+    find_func: only_find

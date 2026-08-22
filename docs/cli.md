@@ -30,13 +30,24 @@ regexps:
 
 sets:
   - name: "my_set"             # unique set name
-    find_all: "scan_all"       # non-anchored: all matches, streamed in batches
-    find_any: "scan_first"     # non-anchored: first match only (optional)
-    match: "validate"          # anchored at position 0 (optional)
+    # Seven capabilities; declare the ones you need (at least one).
+    match:      "validate"     # anchored (whole input): yes/no
+    match_any:  "which"        # anchored: one pattern id
+    match_all:  "which_all"    # anchored: every matching pattern id
+    scan:       "has_any"      # non-anchored: yes/no
+    scan_any:   "first_hit"    # non-anchored: one pattern id + its start
+    scan_all:   "all_kinds"    # non-anchored: every pattern matching somewhere
+    find:       "scan_all"     # non-anchored: the matches at the next matching position
+    overlapping: false         # optional; default false = per-pattern non-overlapping
     emit_name_map: true        # emit patternName(id) lookup helper in stubs
     patterns: all              # "all" or list of name: values from regexps:
     hints: [prefer-no-match]   # optional; per-set default; "batch-find" is not valid here, see below
 ```
+
+> **Config parsing is strict.** Any unknown key anywhere in the file is a
+> line-numbered load error. That catches typos (`mach_func:`) and the retired
+> set keys `find_any`, `find_all` and `batch_size`. It cannot catch the
+> `match:` meaning change — see [sets.md](sets.md#the-seven-capabilities).
 
 All paths in the config file are resolved relative to the config file's directory.
 A leading `~/` in `output`, `wasm_file`, `stub_file` or `wasm_merge` is expanded to
@@ -46,7 +57,8 @@ a shell can resolve another user's home).
 ### Export-name rules
 
 Every `match_func`, `find_func`, `groups_func` and `named_groups_func` value, and every
-set's `find_any`, `find_all` and `match` value, becomes both a WASM export name and a
+set capability value (`match`, `match_any`, `match_all`, `scan`, `scan_any`, `scan_all`,
+`find`), becomes both a WASM export name and a
 function name in the generated stub. Because they are written verbatim into generated
 source, they are validated when the config is loaded, before any compile or generate work
 runs. A violation is a hard error: nothing is written and the exit status is non-zero.
@@ -110,8 +122,10 @@ ever applies between `prefer-match` and `prefer-no-match`:
   `prefer-match`.
 - **`batch-find`** — requests a `<func>_batch` WASM export for this pattern's
   `find_func` and/or `groups_func` (see below). **Valid only on `regexps:`
-  entries** — it is a load-time error on a `sets:` entry (sets have their own
-  `find_all` batching via `batch_size`, a separate mechanism).
+  entries** — it is a load-time error on a `sets:` entry, because there is no
+  set-level batching for it to request: a set's `find` returns one complete
+  position per call and the worst case for one position is the set's pattern
+  count, so there is nothing left for a batch knob to size.
 
 An absent or empty `hints:` list keeps the default (`LikelyNeutral`, no batch
 export). The `prefer-match`/`prefer-no-match` choice never affects match
@@ -353,10 +367,9 @@ regexps:
 
 sets:
   - name: secret_scanner
-    find_all: scan_secrets   # non-anchored: returns all matches with positions
-    find_any: scan_first     # non-anchored: returns first match only (optional)
-    match: validate_secret   # anchored at position 0 (optional)
-    batch_size: 256          # output buffer size (stub-gen knob; default 256)
+    find: scan_secrets       # non-anchored: matches at the next matching position
+    scan: has_secret         # non-anchored: yes/no (optional)
+    match_any: which_secret  # anchored (whole input): one pattern id (optional)
     emit_name_map: true      # emit pattern_name(id) helper in stubs
     patterns:
       - aws_key              # list of regexps.name values
@@ -367,11 +380,15 @@ sets:
 | `sets:` field | Required | Description |
 |---|---|---|
 | `name` | Yes | Unique set name |
-| `find_all` | At least one | Export name for non-anchored all-matches function |
-| `find_any` | At least one | Export name for non-anchored first-match function |
-| `match` | At least one | Export name for anchored match function (position 0) |
+| `match` | At least one | Anchored (whole input): 0/1 |
+| `match_any` | At least one | Anchored: one matching pattern id, or -1 |
+| `match_all` | At least one | Anchored: every matching pattern id |
+| `scan` | At least one | Non-anchored, takes `from`: 0/1 |
+| `scan_any` | At least one | Non-anchored: one pattern id plus its match start |
+| `scan_all` | At least one | Non-anchored: every pattern matching somewhere |
+| `find` | At least one | Non-anchored: every match at the next matching position |
+| `overlapping` | No | `false` (default) = per-pattern non-overlapping `find`; `true` = every start position. Only affects `find`; a load error without it |
 | `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
-| `batch_size` | No | Output buffer hint for stub iterators (default 256) |
 | `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
 | `hints` | No | `[prefer-match]` or `[prefer-no-match]`; per-set LikelyMode default. `batch-find` is rejected here — see [`hints:`](#hints--likelymode-and-batch-find-compile-hints) above |
 

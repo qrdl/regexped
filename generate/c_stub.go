@@ -112,76 +112,148 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 	hb.WriteString(hContent)
 	cb.WriteString(cContent)
 	for _, s := range cfg.Sets {
-		if s.FindAll != "" || s.FindAny != "" {
-			bs := batchSize(s, cfg)
-			wasmExport := s.FindAll
-			if wasmExport == "" {
-				wasmExport = s.FindAny
-			}
-			fmt.Fprintf(&hb, `__attribute__((import_module("%s"), import_name("%s")))
-int ffi_%s(const char *ptr, int len, int *out, int cap, int start);
-`, cfg.ImportModule, wasmExport, wasmExport)
-			if s.FindAll != "" {
-				fmt.Fprintf(&hb, "int %s_next(const char *input, int len, rx_set_match_t *out);\nvoid %s_reset(void);\n\n", s.FindAll, s.FindAll)
-				fmt.Fprintf(&cb, `static int _start_%[1]s = 0; static int _buf_%[1]s[%[2]d*3]; static int _buf_n_%[1]s = 0; static int _buf_i_%[1]s = 0;
-int %[1]s_next(const char *input, int len, rx_set_match_t *out) {
-    if (_buf_i_%[1]s >= _buf_n_%[1]s) {
-        /* _start_<fn> < 0 is a sentinel meaning "input exhausted on the previous
-           call" — when ffi returned n < cap. Do not call ffi again. */
-        if (_start_%[1]s < 0) { _buf_n_%[1]s = 0; _buf_i_%[1]s = 0; return 0; }
-        int n = ffi_%[3]s(input, len, _buf_%[1]s, %[2]d, _start_%[1]s);
-        if (n <= 0) { _buf_n_%[1]s = 0; _buf_i_%[1]s = 0; return 0; }
-        _buf_n_%[1]s = n; _buf_i_%[1]s = 0;
-        /* find_all returns when EITHER the buffer is full (n == cap) OR the
-           input has been fully scanned (n < cap). Only the buffer-full case
-           needs a resume; otherwise mark this iterator exhausted. */
-        if (n < %[2]d) {
-            _start_%[1]s = -1;
-        } else {
-            int last = (n-1)*3;
-            /* Advance by exactly one position past the last reported start:
-               the WASM scan is position-by-position and only positions
-               <= last.start have been visited when the buffer fills,
-               regardless of last.length. */
-            _start_%[1]s = _buf_%[1]s[last+1] + 1;
-        }
-    }
-    int i = _buf_i_%[1]s++ * 3;
-    out->pattern_id = _buf_%[1]s[i]; out->start = _buf_%[1]s[i+1]; out->end = _buf_%[1]s[i+1]+_buf_%[1]s[i+2];
-    return 1;
-}
-void %[1]s_reset(void) { _start_%[1]s = 0; _buf_n_%[1]s = 0; _buf_i_%[1]s = 0; }
-`,
-					s.FindAll, bs, wasmExport)
-			}
-			if s.FindAny != "" {
-				anyFFI := "ffi_" + s.FindAny
-				if s.FindAll != "" {
-					anyFFI = "ffi_" + s.FindAll
-				}
-				fmt.Fprintf(&hb, "int %s(const char *input, int len, rx_set_match_t *out);\n\n", s.FindAny)
-				fmt.Fprintf(&cb, `int %s(const char *input, int len, rx_set_match_t *out) {
-    int buf[3];
-    if (%s(input, len, buf, 1, 0) <= 0) return 0;
-    out->pattern_id = buf[0]; out->start = buf[1]; out->end = buf[1]+buf[2];
-    return 1;
-}
-`, s.FindAny, anyFFI)
-			}
+		n := patternsInSet(s, cfg)
+		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
+		idN := idSpaceSize(s, cfg)
+		idKonst := screamingCase(s.Name) + "_ID_SPACE"
+		wide := wideAllForm(s, cfg)
+
+		fmt.Fprintf(&hb, "/* Number of patterns in set %q. Sizes the match buffer: the scanner can\n   receive at most this many matches at one position. */\n#define %s %d\n\n", s.Name, konst, n)
+		fmt.Fprintf(&hb, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id \u2014 the gate\n   array, the _all bitmap, and the out_ids array you pass to the _all calls \u2014\n   is sized from this. */\n#define %s %d\n\n", s.Name, idKonst, idN)
+
+		imp := func(name, sig string) {
+			fmt.Fprintf(&hb, "__attribute__((import_module(%q), import_name(%q)))\n%s\n", cfg.ImportModule, name, sig)
 		}
 		if s.Match != "" {
-			fmt.Fprintf(&hb, `__attribute__((import_module("%s"), import_name("%s")))
-int ffi_%s(const char *ptr, int len, int *out, int cap);
-int %s(const char *input, int len, rx_set_anchor_t *out);
-
-`, cfg.ImportModule, s.Match, s.Match, s.Match)
-			fmt.Fprintf(&cb, `int %s(const char *input, int len, rx_set_anchor_t *out) {
-    int buf[3];
-    if (ffi_%s(input, len, buf, 1) <= 0) return 0;
-    out->pattern_id = buf[0]; out->end = buf[1] + buf[2];
-    return 1;
-}
+			imp(s.Match, fmt.Sprintf("int ffi_%s(const char *ptr, int len);", s.Match))
+			fmt.Fprintf(&hb, "/* 1 when some pattern matches the WHOLE input, else 0. */\nint %s(const char *input, int len);\n\n", s.Match)
+			fmt.Fprintf(&cb, `int %s(const char *input, int len) { return ffi_%s(input, len) != 0; }
 `, s.Match, s.Match)
+		}
+		if s.MatchAny != "" {
+			imp(s.MatchAny, fmt.Sprintf("int ffi_%s(const char *ptr, int len);", s.MatchAny))
+			fmt.Fprintf(&hb, "/* Id of SOME pattern matching the whole input, or -1. */\nint %s(const char *input, int len);\n\n", s.MatchAny)
+			fmt.Fprintf(&cb, `int %s(const char *input, int len) { return ffi_%s(input, len); }
+`, s.MatchAny, s.MatchAny)
+		}
+		if s.MatchAll != "" {
+			if wide {
+				imp(s.MatchAll, fmt.Sprintf("int ffi_%s(const char *ptr, int len, unsigned char *bits);", s.MatchAll))
+			} else {
+				imp(s.MatchAll, fmt.Sprintf("long long ffi_%s(const char *ptr, int len);", s.MatchAll))
+			}
+			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into out_ids (caller array of\n   %s ints) and returns how many. */\nint %s(const char *input, int len, int *out_ids);\n\n", idKonst, s.MatchAll)
+			if wide {
+				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int *out_ids) {
+    unsigned char bits[(%[2]s + 7) / 8] = {0};
+    ffi_%[1]s(input, len, bits);
+    int c = 0;
+    for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) out_ids[c++] = k;
+    return c;
+}
+`, s.MatchAll, idKonst)
+			} else {
+				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int *out_ids) {
+    unsigned long long mask = (unsigned long long)ffi_%[1]s(input, len);
+    int c = 0;
+    for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) out_ids[c++] = k;
+    return c;
+}
+`, s.MatchAll, konst)
+			}
+		}
+		if s.Scan != "" {
+			imp(s.Scan, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from);", s.Scan))
+			fmt.Fprintf(&hb, "/* 1 when some pattern matches at a position at or after `from`, else 0. */\nint %s(const char *input, int len, int from);\n\n", s.Scan)
+			fmt.Fprintf(&cb, `int %s(const char *input, int len, int from) { return ffi_%s(input, len, from) != 0; }
+`, s.Scan, s.Scan)
+		}
+		if s.ScanAny != "" {
+			imp(s.ScanAny, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, int from);", s.ScanAny))
+			fmt.Fprintf(&hb, "/* Returns a pattern id and writes its match start to *start, or returns -1.\n   Which id you get is unspecified when several patterns match there. */\nint %s(const char *input, int len, int from, int *start);\n\n", s.ScanAny)
+			fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int from, int *start) {
+    long long packed = ffi_%[1]s(input, len, from);
+    if (packed < 0) return -1;
+    *start = (int)(packed >> 32);
+    return (int)(packed & 0xFFFFFFFF);
+}
+`, s.ScanAny)
+		}
+		if s.ScanAll != "" {
+			if wide {
+				imp(s.ScanAll, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, unsigned char *bits);", s.ScanAll))
+			} else {
+				imp(s.ScanAll, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, int from);", s.ScanAll))
+			}
+			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into out_ids (caller array of\n   %s ints) and returns how many. */\nint %s(const char *input, int len, int from, int *out_ids);\n\n", idKonst, s.ScanAll)
+			if wide {
+				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int from, int *out_ids) {
+    unsigned char bits[(%[2]s + 7) / 8] = {0};
+    ffi_%[1]s(input, len, from, bits);
+    int c = 0;
+    for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) out_ids[c++] = k;
+    return c;
+}
+`, s.ScanAll, idKonst)
+			} else {
+				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int from, int *out_ids) {
+    unsigned long long mask = (unsigned long long)ffi_%[1]s(input, len, from);
+    int c = 0;
+    for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) out_ids[c++] = k;
+    return c;
+}
+`, s.ScanAll, konst)
+			}
+		}
+		if s.Find != "" {
+			scannerType := "rx_" + setConstBase(s.Name) + "_scanner_t"
+			gateField, gateInit, gateArg := "", "", ""
+			if gatedFind(s) {
+				imp(s.Find, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, unsigned *gates, int *out, int cap);", s.Find))
+				gateField = fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
+				gateInit = fmt.Sprintf("    for (int k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
+				gateArg = "s->gates, "
+			} else {
+				imp(s.Find, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, int *out, int cap);", s.Find))
+			}
+			// D17: the scanner is CALLER-owned, so two scans can be in flight
+			// and re-initialising the struct restarts one. The static
+			// _next/_reset pair this replaces could do neither.
+			fmt.Fprintf(&hb, `/* Caller-owned scanner for %s. Two scans may be in flight at once, and
+   re-initialising the struct restarts a scan. */
+typedef struct {
+    int from;
+    int done;
+%s    int buf[%s * 3];
+    int n, i;
+} %s;
+
+void %s_init(%s *s, int from);
+/* Writes the next match to *out; returns 1, or 0 when the scan is done. */
+int %s_next(%s *s, const char *input, int len, rx_set_match_t *out);
+
+`, s.Find, gateField, konst, scannerType, s.Find, scannerType, s.Find, scannerType)
+			fmt.Fprintf(&cb, `void %[1]s_init(%[2]s *s, int from) {
+    s->from = from; s->done = 0; s->n = 0; s->i = 0;
+%[3]s}
+
+int %[1]s_next(%[2]s *s, const char *input, int len, rx_set_match_t *out) {
+    for (;;) {
+        if (s->i < s->n) {
+            int o = s->i * 3;
+            s->i++;
+            out->pattern_id = s->buf[o]; out->start = s->buf[o + 1]; out->end = s->buf[o + 2];
+            return 1;
+        }
+        if (s->done) return 0;
+        int got = ffi_%[1]s(input, len, s->from, %[4]ss->buf, %[5]s);
+        if (got <= 0) { s->done = 1; return 0; }
+        s->n = got; s->i = 0;
+        /* Every tuple in one call shares a start; resume one past it. */
+        s->from = s->buf[1] + 1;
+    }
+}
+`, s.Find, scannerType, gateInit, gateArg, konst)
 		}
 	}
 	if hasEmitNameMap(cfg) {

@@ -1,0 +1,5 @@
+# CompiledDFA: <= 256 states, so maybeCompiledDFA promotes the plain DFA to
+# direct-index dispatch.
+regexps:
+  - pattern: 'abc[0-9]{2}'
+    find_func: cdfa_find

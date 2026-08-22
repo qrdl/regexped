@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
@@ -193,8 +194,8 @@ func TestValidateSets_Valid(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}, {Name: "p2", Pattern: "bar"}},
 		Sets: []SetConfig{
-			{Name: "s1", FindAny: "s1_any", Patterns: PatternSelector{All: true}},
-			{Name: "s2", FindAll: "s2_all", Patterns: PatternSelector{Names: []string{"p1"}}},
+			{Name: "s1", ScanAny: "s1_any", Patterns: PatternSelector{All: true}},
+			{Name: "s2", ScanAll: "s2_all", Patterns: PatternSelector{Names: []string{"p1"}}},
 		},
 	}
 	if err := ValidateSets(cfg); err != nil {
@@ -205,7 +206,7 @@ func TestValidateSets_Valid(t *testing.T) {
 func TestValidateSets_DuplicateRegexName(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "dup", Pattern: "foo"}, {Name: "dup", Pattern: "bar"}},
-		Sets:    []SetConfig{{Name: "s", FindAny: "ma", Patterns: PatternSelector{All: true}}},
+		Sets:    []SetConfig{{Name: "s", ScanAny: "ma", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for duplicate regexp name, got nil")
@@ -216,8 +217,8 @@ func TestValidateSets_DuplicateSetName(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
 		Sets: []SetConfig{
-			{Name: "same", FindAny: "a", Patterns: PatternSelector{All: true}},
-			{Name: "same", FindAll: "b", Patterns: PatternSelector{All: true}},
+			{Name: "same", ScanAny: "a", Patterns: PatternSelector{All: true}},
+			{Name: "same", ScanAll: "b", Patterns: PatternSelector{All: true}},
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -228,7 +229,7 @@ func TestValidateSets_DuplicateSetName(t *testing.T) {
 func TestValidateSets_UnknownPatternRef(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "known", Pattern: "foo"}},
-		Sets:    []SetConfig{{Name: "s", FindAny: "ma", Patterns: PatternSelector{Names: []string{"unknown"}}}},
+		Sets:    []SetConfig{{Name: "s", ScanAny: "ma", Patterns: PatternSelector{Names: []string{"unknown"}}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for unknown pattern reference, got nil")
@@ -248,7 +249,7 @@ func TestValidateSets_NoExportField(t *testing.T) {
 func TestValidateSets_MissingSetName(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
-		Sets:    []SetConfig{{FindAny: "ma", Patterns: PatternSelector{All: true}}},
+		Sets:    []SetConfig{{ScanAny: "ma", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for set with missing name, got nil")
@@ -346,7 +347,7 @@ func TestValidateSets_RegexSetExportCollision(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo", MatchFunc: "shared"}},
 		Sets: []SetConfig{
-			{Name: "s1", FindAll: "shared", Patterns: PatternSelector{All: true}},
+			{Name: "s1", ScanAll: "shared", Patterns: PatternSelector{All: true}},
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -358,7 +359,7 @@ func TestValidateSets_MissingPatternsField(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}},
 		Sets: []SetConfig{
-			{Name: "s1", FindAny: "s1_any"}, // patterns omitted entirely
+			{Name: "s1", ScanAny: "s1_any"}, // patterns omitted entirely
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -370,7 +371,7 @@ func TestValidateSets_DuplicatePatternInSet(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}},
 		Sets: []SetConfig{
-			{Name: "s1", FindAny: "s1_any", Patterns: PatternSelector{Names: []string{"p1", "p1"}}},
+			{Name: "s1", ScanAny: "s1_any", Patterns: PatternSelector{Names: []string{"p1", "p1"}}},
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -520,5 +521,123 @@ func TestLoadConfig_ValidateSetsError(t *testing.T) {
 	}
 	if _, err := LoadConfig(path); err == nil {
 		t.Error("expected ValidateSets error to surface through LoadConfig, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// plans/SETS.md S0: the seven-capability schema and strict parsing (§3.12,
+// §3.19 / D5, D10/D11).
+
+// writeCfg writes yaml to a temp regexped.yaml and returns its path.
+func writeCfg(t *testing.T, yaml string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "regexped.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
+	// The retired keys are caught loudly by strict parsing rather than by a
+	// targeted "renamed to" message (§3.19). The `match:` meaning change is
+	// deliberately NOT catchable here — that lives in the migration notes.
+	cases := []struct {
+		name, key, yaml string
+	}{
+		{"find_all", "find_all", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_all: sf\n    patterns: all\n"},
+		{"find_any", "find_any", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_any: sf\n    patterns: all\n"},
+		{"batch_size", "batch_size", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find: sf\n    batch_size: 128\n    patterns: all\n"},
+		{"typo", "mach_func", "regexps:\n  - pattern: 'foo'\n    mach_func: m\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := LoadConfig(writeCfg(t, c.yaml))
+			if err == nil {
+				t.Fatalf("expected an unknown-field error naming %q", c.key)
+			}
+			if !strings.Contains(err.Error(), c.key) {
+				t.Fatalf("error should name the offending key %q, got: %v", c.key, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_OverlappingRoundTrips(t *testing.T) {
+	base := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find: sf\n    patterns: all\n"
+	cfg, err := LoadConfig(writeCfg(t, base))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Sets[0].Overlapping {
+		t.Error("overlapping must default to false (the gated body is the default, D11)")
+	}
+	if !cfg.Sets[0].Gated() {
+		t.Error("a set without overlapping: true is gated")
+	}
+
+	cfg, err = LoadConfig(writeCfg(t, base+"    overlapping: true\n"))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Sets[0].Overlapping {
+		t.Error("overlapping: true did not round-trip")
+	}
+	if cfg.Sets[0].Gated() {
+		t.Error("overlapping: true selects the ungated body")
+	}
+}
+
+func TestLoadConfig_OverlappingWithoutFindIsError(t *testing.T) {
+	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan: sc\n    overlapping: true\n    patterns: all\n"
+	_, err := LoadConfig(writeCfg(t, yaml))
+	if err == nil {
+		t.Fatal("overlapping on a set without find: must be a load error (§3.15)")
+	}
+	if !strings.Contains(err.Error(), "overlapping") {
+		t.Fatalf("error should mention overlapping, got: %v", err)
+	}
+}
+
+func TestSetCapabilities(t *testing.T) {
+	s := SetConfig{
+		Name: "s", Match: "m", MatchAny: "ma", MatchAll: "mall",
+		Scan: "sc", ScanAny: "sa", ScanAll: "sall", Find: "f",
+	}
+	got := s.Capabilities()
+	want := []string{"match", "match_any", "match_all", "scan", "scan_any", "scan_all", "find"}
+	if len(got) != len(want) {
+		t.Fatalf("Capabilities() returned %d entries, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].Field != want[i] {
+			t.Errorf("Capabilities()[%d].Field = %q, want %q", i, got[i].Field, want[i])
+		}
+	}
+	if (SetConfig{}).HasExports() {
+		t.Error("a set with no capability keys has no exports")
+	}
+}
+
+func TestValidateSets_AllSevenCapabilityNamesValidated(t *testing.T) {
+	// Every capability value goes through the identifier/reserved-word check,
+	// exactly like the per-pattern _func fields.
+	for _, key := range []string{"match", "match_any", "match_all", "scan", "scan_any", "scan_all", "find"} {
+		t.Run(key, func(t *testing.T) {
+			yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    " + key + ": struct\n    patterns: all\n"
+			_, err := LoadConfig(writeCfg(t, yaml))
+			if err == nil {
+				t.Fatalf("%s: a reserved word must be rejected as an export name", key)
+			}
+		})
+	}
+}
+
+func TestValidateSets_NoCapabilityIsError(t *testing.T) {
+	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    patterns: all\n"
+	_, err := LoadConfig(writeCfg(t, yaml))
+	if err == nil {
+		t.Fatal("a set declaring no capability must be rejected")
 	}
 }
