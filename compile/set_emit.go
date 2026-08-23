@@ -1207,6 +1207,13 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 			// Set-level LikelyMode precedence: set hints > neutral.
 			// Used by H.3 (frontend density gate).
 			LikelyMode: resolveHints(sc.Hints),
+			// The knob that decides whether a pattern survives into the set at
+			// all: a fallback bucket over this limit is DROPPED, not demoted to
+			// another engine. It was unreachable before — CompileSetOptions was
+			// built without it, so the default 1024 always won and the drop
+			// warning's own "raise max_dfa_states" hint pointed at a field that
+			// does not feed this budget.
+			MaxFallbackStates: cfg.MaxFallbackStates,
 		}
 		if !standalone {
 			setOpts.TableMemIdx = 1

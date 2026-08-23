@@ -129,6 +129,16 @@ Two invariants make this easy to consume:
 Iterating is therefore "call, use, resume at `start + 1`". The generated stubs
 do exactly that and hand you one match at a time.
 
+The buffer that holds one position's matches is `<SET>_PATTERN_COUNT` tuples,
+the exact worst case for a single start, and every stub sizes it that way. In
+**C** you supply it — `<find>_init(&sc, from, buf, cap)`, mirroring
+`find_batch` — because a header with no allocator cannot own a buffer whose
+size the set decides. Unlike `find_batch`, this one has a MINIMUM of
+`<SET>_PATTERN_COUNT`: `find` is transactional, so a position whose matches do
+not all fit delivers nothing and asks you to grow, and a scanner given less
+yields nothing rather than a partial scan. Everywhere else the buffer stays
+stub-owned and invisible.
+
 The order of the matches *within* one call is unspecified — not by pattern id,
 not by extent, not stable across compiler versions. Sort what you collect if
 you need a specific order.
@@ -388,7 +398,7 @@ suffix DFAs within each group:
 | Max merged DFA table bytes | 64 KB | `budget_bytes` (internal) |
 | Max merged DFA states | 512 | `budget_states` (internal) |
 | Pre-filter (states × combined classes) | 65536 | `budget_states_prefilter` (internal) |
-| Max fallback-bucket DFA states | 1024 | `max_fallback_states` (internal) |
+| Max fallback-bucket DFA states | 1024 | `max_fallback_states` (top-level config key) |
 
 Patterns that cannot be merged (no mandatory literal, literal inside quantifier,
 budget exceeded) route to fallback buckets that scan every input position.
@@ -403,7 +413,15 @@ fallback bucket's own merged DFA is still subject to the `max_fallback_states`
 budget above; a pattern that would push it over that limit is skipped
 entirely rather than merged — it does not appear in the set's compiled
 output at all. Check `state_limit_dropped` in diagnostics (see below) to
-find any patterns this happened to.
+find any patterns this happened to, and raise `max_fallback_states` in the
+config to admit them.
+
+This is the one budget in the table whose effect is not a slower path but a
+MISSING pattern: a single pattern over `max_dfa_states` falls back to another
+engine and still matches, while a set member over `max_fallback_states` is
+absent from the set and can never match. The build still succeeds, so a
+pipeline that only checks the exit code will ship a set that under-reports —
+read the warning, or `state_limit_dropped`.
 
 ## Diagnostics
 

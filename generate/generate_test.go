@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -1325,5 +1326,136 @@ func TestSetFindBatchAbsentWhenUndeclared(t *testing.T) {
 				t.Errorf("%s set stub: emitted %q for a set without find_batch", lang, forbidden)
 			}
 		}
+	}
+}
+
+// bigSetCfg builds a config whose set is large enough to cross the by-value
+// budget: 300 patterns is 300*12 + 300*4 = 4,800 bytes of inline arrays.
+func bigSetCfg(t *testing.T, n int) config.BuildConfig {
+	t.Helper()
+	regexps := make([]config.RegexEntry, n)
+	for i := range regexps {
+		regexps[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: fmt.Sprintf(`kw%d\d+`, i)}
+	}
+	return config.BuildConfig{
+		ImportModule: "mymod",
+		Regexps:      regexps,
+		Sets: []config.SetConfig{{
+			Name:      "scanner",
+			Find:      "set_find",
+			FindBatch: "set_find_batch",
+			Patterns:  config.PatternSelector{All: true},
+		}},
+	}
+}
+
+// TestRustSetIterBoxedAboveBudget pins SETS_PLAN item 5.
+//
+// The Rust iterator is a VALUE: it is returned from the constructor, moved into
+// a `for`, moved again by `.take()` or `.map()`. Holding PATTERN_COUNT tuples
+// and ID_SPACE gates inline makes that value grow with the set — measured at
+// 32,032 bytes for 2,000 patterns, which rustc turned into a memset, a memcpy
+// and a 60 KB stack frame on a three-line adapter chain.
+//
+// Above the budget both arrays are boxed; below it nothing changes, which is
+// the half worth pinning hardest — `find` allocating NOTHING is a property
+// SETS §19.6 bought deliberately, and it must survive for the sets that can
+// afford it.
+func TestRustSetIterBoxedAboveBudget(t *testing.T) {
+	small := genRustSetInner(setTestCfg())
+	for _, want := range []string{
+		"buf: [[i32; 3]; SCANNER_PATTERN_COUNT]",
+		"gates: [u32; SCANNER_ID_SPACE]",
+	} {
+		if !strings.Contains(small, want) {
+			t.Errorf("2-pattern set: expected inline %q, got a boxed form", want)
+		}
+	}
+	if strings.Contains(small, "Box<") {
+		t.Error("2-pattern set: boxed an array that fits the by-value budget")
+	}
+
+	big := genRustSetInner(bigSetCfg(t, 300))
+	for _, want := range []string{
+		"buf: Box<[[i32; 3]]>",
+		"gates: Box<[u32]>",
+		"vec![[0; 3]; SCANNER_PATTERN_COUNT].into_boxed_slice()",
+		"vec![0u32; SCANNER_ID_SPACE].into_boxed_slice()",
+	} {
+		if !strings.Contains(big, want) {
+			t.Errorf("300-pattern set: missing %q", want)
+		}
+	}
+	if strings.Contains(big, "buf: [[i32; 3]; SCANNER_PATTERN_COUNT]") {
+		t.Error("300-pattern set: still holds the tuple buffer by value")
+	}
+	// The find_batch iterator borrows its buffer, so its only inline array is
+	// the gate array — 300*4 = 1,200 bytes, well inside the budget. It is
+	// judged on its OWN size, not on find's, and correctly stays inline here.
+	if !strings.Contains(big, "gates: [u32; SCANNER_ID_SPACE]") {
+		t.Error("300-pattern set: boxed find_batch's gates, which fit by themselves")
+	}
+	huge := genRustSetInner(bigSetCfg(t, 2000))
+	if strings.Count(huge, "gates: Box<[u32]>") != 2 {
+		t.Error("2000-pattern set: both iterators' gate arrays should be boxed")
+	}
+}
+
+// TestSetInlineBudgetCrossover pins where the two shapes meet. The tuple buffer
+// is 12 bytes an entry and the gate array 4, so a gated set of P patterns with
+// P ids costs 16P: 256 patterns is exactly the 4 KB budget and stays inline,
+// 257 is over it.
+func TestSetInlineBudgetCrossover(t *testing.T) {
+	for _, tc := range []struct {
+		n     int
+		boxed bool
+	}{{255, false}, {256, false}, {257, true}} {
+		out := genRustSetInner(bigSetCfg(t, tc.n))
+		got := strings.Contains(out, "buf: Box<[[i32; 3]]>")
+		if got != tc.boxed {
+			t.Errorf("%d patterns (%d bytes inline): boxed=%v, want %v",
+				tc.n, tc.n*16, got, tc.boxed)
+		}
+	}
+}
+
+// TestSetFindCStubTakesBuffer pins the C half of item 5. C cannot box — the
+// header has no allocator by design — so the tuple buffer becomes the caller's,
+// exactly as find_batch's already is (§19.6).
+//
+// The difference from find_batch is the MINIMUM. `find` is transactional: a
+// position whose matches do not all fit records no gate and delivers nothing,
+// so a scan through a buffer below one position's worst case could never step
+// past such a position. The generated _init refuses it up front instead.
+func TestSetFindCStubTakesBuffer(t *testing.T) {
+	h, c, err := genCStubFilesWithSets(setTestCfg(), "stub.h")
+	if err != nil {
+		t.Fatalf("genCStubFilesWithSets: %v", err)
+	}
+	if !strings.Contains(h, "void set_find_init(rx_scanner_scanner_t *s, int from, int *buf, int cap);") {
+		t.Error("C set find scanner: _init does not take the caller's buffer")
+	}
+	if !strings.Contains(h, "    int *buf;") || !strings.Contains(h, "    int cap;") {
+		t.Error("C set find scanner: struct does not hold a buffer pointer and capacity")
+	}
+	// Only inside the struct: the doc comment above it shows the caller
+	// declaring exactly this array, which is the point.
+	structAt := strings.Index(h, "} rx_scanner_scanner_t;")
+	if structAt < 0 {
+		t.Fatal("C set find scanner: scanner struct not emitted")
+	}
+	declStart := strings.LastIndex(h[:structAt], "typedef struct {")
+	if strings.Contains(h[declStart:structAt], "int buf[") {
+		t.Error("C set find scanner: still embeds the tuple buffer by value")
+	}
+	// The gate array stays inside: its length is a size the compiler knows.
+	if !strings.Contains(h, "unsigned gates[SCANNER_ID_SPACE];") {
+		t.Error("C set find scanner: gate array should stay stub-owned")
+	}
+	if !strings.Contains(c, "if (cap < SCANNER_PATTERN_COUNT) s->done = 1;") {
+		t.Error("C set find scanner: no guard against a buffer below one position's worst case")
+	}
+	if !strings.Contains(c, "s->cap)") {
+		t.Error("C set find scanner: _next does not pass the caller's capacity to the module")
 	}
 }

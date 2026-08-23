@@ -277,3 +277,106 @@ func FuzzFindBatch(f *testing.F) {
 		checkBatch(t, pats, input)
 	})
 }
+
+// TestFindBatchZeroCap pins the raw-ABI contract for a buffer with no room.
+//
+// A caller that loops "call, consume count, hand the cursor back, stop on the
+// sentinel" is the shape every generated stub has, and it is the only shape the
+// cursor supports. With out_cap = 0 the body can deliver nothing, so if it
+// returned the caller's own resume position the loop would never advance and
+// never stop. It reports the scan finished instead — the buffer, the gate array
+// and the count all stay at "nothing happened", and the loop terminates.
+//
+// This is a deliberate asymmetry with `find`, where out_cap = 0 is a size probe:
+// `find` returns a COUNT, which a probe can use, while find_batch returns a
+// resumable cursor, which a probe cannot.
+func TestFindBatchZeroCap(t *testing.T) {
+	for _, overlapping := range []bool{false, true} {
+		name := "gated"
+		if overlapping {
+			name = "overlapping"
+		}
+		t.Run(name, func(t *testing.T) {
+			pats := []string{`a`, `ab`, `b`}
+			const input = "abab"
+
+			w, err := compileBatchSet(pats, overlapping)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			store, inst, mem, release, err := instantiate(w)
+			defer release()
+			if err != nil {
+				t.Fatalf("instantiate: %v", err)
+			}
+			fn := inst.GetFunc(store, "set_find_batch")
+			if fn == nil {
+				t.Fatal("module missing set_find_batch export")
+			}
+			const pageSize = 65536
+			dataTop, err := utils.ParseDataSectionBytes(w)
+			if err != nil {
+				t.Fatalf("parse data section: %v", err)
+			}
+			inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+			gatePtr := inBase + pageSize
+			outPtr := gatePtr + pageSize
+			needed := uint64((int64(outPtr) + 2*pageSize + pageSize - 1) / pageSize)
+			if cur := mem.Size(store); needed > cur {
+				if _, err := mem.Grow(store, needed-cur); err != nil {
+					t.Fatalf("grow: %v", err)
+				}
+			}
+			buf := mem.UnsafeData(store)
+			copy(buf[inBase:], input)
+			for i := int32(0); i < 4*int32(len(pats)); i++ {
+				buf[gatePtr+i] = 0
+			}
+			// Poison the tuple buffer: a body that wrote through a zero-length
+			// buffer would clear these.
+			for i := int32(0); i < 12*int32(len(pats)); i++ {
+				buf[outPtr+i] = 0xAA
+			}
+
+			countBits := uint(config.SetCursorCountBits(len(pats)))
+			countMask := int64(1)<<countBits - 1
+
+			// The `from` of the very first call is 0, which is also a legal
+			// resume position — the value the pre-fix body handed back.
+			var args []interface{}
+			if overlapping {
+				args = []interface{}{inBase, int32(len(input)), int64(0), outPtr, int32(0)}
+			} else {
+				args = []interface{}{inBase, int32(len(input)), int64(0), gatePtr, outPtr, int32(0)}
+			}
+			res, err := fn.Call(store, args...)
+			if err != nil {
+				t.Fatalf("set_find_batch: %v", err)
+			}
+			packed := res.(int64)
+			if got := uint32(packed >> 32); got != 0xFFFFFFFF {
+				t.Fatalf("out_cap=0: expected the done sentinel, got resume position %d "+
+					"(a caller looping on this cursor spins)", got)
+			}
+			if n := packed & countMask; n != 0 {
+				t.Fatalf("out_cap=0: count %d, want 0", n)
+			}
+			buf = mem.UnsafeData(store)
+			for i := int32(0); i < 12*int32(len(pats)); i++ {
+				if buf[outPtr+i] != 0xAA {
+					t.Fatalf("out_cap=0: wrote byte %d of the tuple buffer", i)
+				}
+			}
+			for i := int32(0); i < 4*int32(len(pats)); i++ {
+				if buf[gatePtr+i] != 0 {
+					t.Fatalf("out_cap=0: wrote byte %d of the gate array", i)
+				}
+			}
+
+			// And the loop a stub writes terminates on the first call.
+			if got := runBatchFind(t, pats, input, 0, overlapping); len(got) != 0 {
+				t.Fatalf("out_cap=0: yielded %d matches, want none", got)
+			}
+		})
+	}
+}

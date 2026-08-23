@@ -181,6 +181,15 @@ one at a time before advancing, so steady-state iteration allocates nothing.
 Dropping and re-creating it restarts the scan; the gate array never appears in
 the public surface.
 
+**Where those arrays live depends on the size of the set.** Both are sized by
+the set — 12 bytes per pattern for the buffer, 4 per id for the gates — and the
+iterator is a value Rust MOVES: out of the constructor, into a `for`, into
+`.take()` or `.map()`. Up to about 250 patterns they are inline arrays and the
+whole scan allocates nothing. Past 4 KB of them the generator emits `Box<[..]>`
+instead, so the iterator stays small enough to move freely and the arrays are
+heap-allocated once when it is created. Nothing about the API changes either
+way — only whether creating an iterator allocates.
+
 ### `find_batch` — the same matches, a bufferful per call
 
 `find` crosses the host boundary once per matching position. `find_batch`
@@ -199,7 +208,9 @@ You own the buffer; the iterator borrows it, so batched iteration allocates
 nothing in the steady state — allocate one `Vec<SetTuple>` and reuse it for
 every scan. Its length is the batch size. The gate array and the cursor stay
 internal: the gate array's length is `<SET>_ID_SPACE`, a compile-time constant,
-so it is a fixed inline array and costs no allocation either.
+so it is not a size you choose. It is a fixed inline array — costing no
+allocation — unless the id space pushes it past the same 4 KB budget the `find`
+iterator uses, in which case it is boxed and allocated once per iterator.
 
 `pattern_name(id)` is emitted once per config when any set sets
 `emit_name_map: true`.

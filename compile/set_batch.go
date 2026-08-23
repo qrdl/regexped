@@ -138,7 +138,12 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx int) []byte {
 		b = append(b, 0x71, 0x21, lK)
 	}
 	b = append(b, 0x41, 0x00, 0x21, lCount)
-	b = append(b, 0x41, 0x00, 0x21, lDone)
+	// lDone = cap < 1. A buffer with no room can deliver nothing and would
+	// otherwise return the caller's own resume position unchanged, so a raw-ABI
+	// caller looping on the cursor spins. Reporting the scan finished makes that
+	// loop terminate; `find` keeps treating out_cap = 0 as a size probe, which
+	// it can, because it returns a count rather than a resumable cursor.
+	b = append(b, 0x20, lCap, 0x41, 0x01, 0x48, 0x21, lDone)
 
 	b = append(b, 0x02, 0x40) // block $exit
 	b = append(b, 0x03, 0x40) // loop  $L

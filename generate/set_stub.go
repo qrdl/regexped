@@ -152,3 +152,31 @@ func hasFindBatch(cfg config.BuildConfig) bool {
 	}
 	return false
 }
+
+// setInlineByteLimit is the byte budget for arrays a generated iterator holds
+// BY VALUE. Above it the generator boxes them instead.
+//
+// The arrays are sized by the set — 12 bytes per pattern for the tuple buffer,
+// 4 per id for the gate array — so a large set turns an iterator into a large
+// value, and a value is what Rust MOVES: returning it from the constructor,
+// handing it to `for`, wrapping it in `.take()` or `.map()`. Measured on a
+// 2,000-pattern set, `find(input, 0).take(3).map(..)` compiled to a memset, a
+// memcpy and a 60 KB stack frame for a struct of 32,032 bytes.
+//
+// 4 KB is a threshold, not a measurement: it is roughly a page, it keeps the
+// iterator comfortably inside any stack a wasm host provides, and it leaves
+// every set small enough to be typed out by hand on the zero-allocation path
+// unchanged. A set crosses it at about 250 patterns.
+//
+// Below the limit nothing changes, which is the point: `find` allocating
+// NOTHING is a property worth keeping where it costs nothing (SETS §19.6), and
+// only sets that cannot honour it pay an allocation.
+const setInlineByteLimit = 4096
+
+// boxSetBuffers reports whether a set's iterator arrays exceed the by-value
+// budget and must be boxed. tupleSlots is the number of 12-byte tuples held
+// inline (0 when the buffer is the caller's), gateSlots the number of 4-byte
+// gate entries (0 when the set's find is not gated).
+func boxSetBuffers(tupleSlots, gateSlots int) bool {
+	return tupleSlots*12+gateSlots*4 > setInlineByteLimit
+}

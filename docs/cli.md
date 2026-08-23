@@ -13,6 +13,7 @@ stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .
 stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c, as
 max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
+max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
 
 regexps:
   - pattern: 'https?://...' # RE2 regexp pattern

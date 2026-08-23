@@ -2271,7 +2271,12 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 
 			DeclaredPatternCount: sc.PatternCount(cfg),
 		}
-		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
+		// Same budget the real compile uses (set_emit.go's setOpts). Without
+		// it --diag-json reports drops under the default 1024 while the build
+		// it is describing kept those patterns.
+		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{
+			MaxFallbackStates: cfg.MaxFallbackStates,
+		})
 		if cs.diag != nil {
 			cs.diag.CaptureBearingDropped = droppedRefs
 			diag.Sets = append(diag.Sets, *cs.diag)

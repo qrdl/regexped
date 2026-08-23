@@ -1611,7 +1611,7 @@ func warnPatternDropped(p *PatternInfo, where string, states, limit int) {
 		"where", where,
 		"states", states,
 		"limit", limit,
-		"hint", "raise max_dfa_states, simplify the pattern, or move it out of the set")
+		"hint", "raise max_fallback_states, simplify the pattern, or move it out of the set")
 }
 
 // patternRefFor builds a PatternRef from a PatternInfo.

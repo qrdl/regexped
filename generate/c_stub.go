@@ -226,22 +226,51 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// D17: the scanner is CALLER-owned, so two scans can be in flight
 			// and re-initialising the struct restarts one. The static
 			// _next/_reset pair this replaces could do neither.
-			fmt.Fprintf(&hb, `/* Caller-owned scanner for %s. Two scans may be in flight at once, and
-   re-initialising the struct restarts a scan. */
+			//
+			// The TUPLE BUFFER is the caller's too, for the reason §19.6 gives
+			// for find_batch: a header with no allocator can only own storage
+			// whose size is known at compile time, and PATTERN_COUNT tuples of
+			// a several-thousand-pattern set is tens of kilobytes to bury in a
+			// struct the caller is invited to put on the stack. The GATE array
+			// stays inside — its length is a size the compiler knows, not one
+			// the caller picks.
+			//
+			// Unlike find_batch, the buffer has a MINIMUM: `find` is
+			// transactional (SETS §3.11), so a position reporting more matches
+			// than fit records no gate and writes no complete answer, and the
+			// scan cannot step past it. PATTERN_COUNT is that worst case
+			// exactly — one match per pattern at one start.
+			fmt.Fprintf(&hb, `/* Caller-owned scanner for %[1]s. Two scans may be in flight at once, and
+   re-initialising the struct restarts a scan.
+
+   The buffer is yours: 3 ints per match. It must hold at least %[2]s
+   matches — one position's worst case, since every pattern can report once at
+   one start — and a smaller buffer yields NOTHING rather than a partial scan.
+   Declare it once and reuse it for every scan.
+
+       int buf[%[2]s * 3];
+       %[4]s sc;
+       %[1]s_init(&sc, 0, buf, %[2]s);
+       while (%[1]s_next(&sc, input, len, &m)) { ... }  */
 typedef struct {
     int from;
     int done;
-%s    int buf[%s * 3];
+%[3]s    int *buf;
+    int cap;
     int n, i;
-} %s;
+} %[4]s;
 
-void %s_init(%s *s, int from);
+void %[1]s_init(%[4]s *s, int from, int *buf, int cap);
 /* Writes the next match to *out; returns 1, or 0 when the scan is done. */
-int %s_next(%s *s, const char *input, int len, rx_set_match_t *out);
+int %[1]s_next(%[4]s *s, const char *input, int len, rx_set_match_t *out);
 
-`, s.Find, gateField, konst, scannerType, s.Find, scannerType, s.Find, scannerType)
-			fmt.Fprintf(&cb, `void %[1]s_init(%[2]s *s, int from) {
+`, s.Find, konst, gateField, scannerType)
+			fmt.Fprintf(&cb, `void %[1]s_init(%[2]s *s, int from, int *buf, int cap) {
     s->from = from; s->done = 0; s->n = 0; s->i = 0;
+    s->buf = buf; s->cap = cap;
+    /* Below one position's worst case the scan could stall on a position it
+       cannot deliver whole, so refuse it outright instead. */
+    if (cap < %[5]s) s->done = 1;
 %[3]s}
 
 int %[1]s_next(%[2]s *s, const char *input, int len, rx_set_match_t *out) {
@@ -253,7 +282,7 @@ int %[1]s_next(%[2]s *s, const char *input, int len, rx_set_match_t *out) {
             return 1;
         }
         if (s->done) return 0;
-        int got = ffi_%[1]s(input, len, s->from, %[4]ss->buf, %[5]s);
+        int got = ffi_%[1]s(input, len, s->from, %[4]ss->buf, s->cap);
         if (got <= 0) { s->done = 1; return 0; }
         s->n = got; s->i = 0;
         /* Every tuple in one call shares a start; resume one past it. */

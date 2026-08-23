@@ -162,16 +162,19 @@ int <scan>    (const char *in, int len, int from);               /* 0 | 1    */
 int <scan_any>(const char *in, int len, int from, int *start);   /* id or -1 */
 int <scan_all>(const char *in, int len, int from, int *out_ids); /* count    */
 
-/* find: a caller-owned scanner struct — reentrant, header-only */
+/* find: a caller-owned scanner struct — reentrant, header-only. You own the
+   buffer too: 3 ints per match, and it must hold at least
+   <SET>_PATTERN_COUNT matches. */
 typedef struct {
     int from;
     int done;
     unsigned gates[<SET>_ID_SPACE];        /* non-overlapping sets only */
-    int buf[<SET>_PATTERN_COUNT * 3];
+    int *buf;
+    int cap;
     int n, i;
 } rx_<set>_scanner_t;
 
-void <find>_init(rx_<set>_scanner_t *s, int from);
+void <find>_init(rx_<set>_scanner_t *s, int from, int *buf, int cap);
 int  <find>_next(rx_<set>_scanner_t *s, const char *in, int len, rx_set_match_t *out);
 
 /* find_batch: the same matches, a bufferful per call. You own the buffer —
@@ -185,8 +188,9 @@ const char *pattern_name(int id);
 ```
 
 ```c
+int buf[<SET>_PATTERN_COUNT * 3];
 rx_<set>_scanner_t s;
-<find>_init(&s, 0);
+<find>_init(&s, 0, buf, <SET>_PATTERN_COUNT);
 rx_set_match_t m;
 while (<find>_next(&s, input, len, &m))
     printf("%d %d..%d\n", m.pattern_id, m.start, m.end);
@@ -195,6 +199,18 @@ while (<find>_next(&s, input, len, &m))
 Scanner state is **caller-owned**, so two scans can be in flight at once and
 re-initialising the struct restarts one. The `out_ids` arrays for
 `<match_all>`/`<scan_all>` must hold `<SET>_ID_SPACE` ints.
+
+The tuple buffer is caller-owned for the same reason `find_batch`'s is: a header
+with no allocator can only own storage whose size is fixed at compile time, and
+`<SET>_PATTERN_COUNT` tuples of a several-thousand-pattern set is tens of
+kilobytes buried in a struct you are invited to put on the stack. Declare it
+once and reuse it. **Unlike `find_batch`, this buffer has a minimum**:
+`<SET>_PATTERN_COUNT` matches, which is one position's worst case, since every
+pattern can report once at a single start. `find` is transactional — a position
+whose matches do not all fit records no gate and delivers nothing — so a
+scanner initialised with a smaller `cap` yields nothing at all rather than a
+partial scan. The `gates` array stays inside the struct: its length is a size
+the compiler knows, not one you pick.
 
 The two constants differ for a named subset: `<SET>_PATTERN_COUNT` counts the
 set's patterns and sizes the tuple buffer, while `<SET>_ID_SPACE` is one past

@@ -14,16 +14,27 @@ import (
 
 // BuildConfig is the top-level structure of the YAML config file.
 type BuildConfig struct {
-	WasmMerge    string       `yaml:"wasm_merge"`     // optional; defaults to "wasm-merge" in $PATH
-	Output       string       `yaml:"output"`         // output path for merge command; overridable with -o
-	WasmFile     string       `yaml:"wasm_file"`      // output WASM file for compile command; overridable with -o
-	ImportModule string       `yaml:"import_module"`  // WASM import module name used by wasm-merge and Rust FFI
-	StubFile     string       `yaml:"stub_file"`      // stub output file (Rust, Go, JS, TS, AS, or C)
-	StubType     string       `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
-	MaxDFAStates int          `yaml:"max_dfa_states"` // 0 = default (1024)
-	MaxTDFARegs  int          `yaml:"max_tdfa_regs"`  // 0 = default (32)
-	Regexps      []RegexEntry `yaml:"regexps"`
-	Sets         []SetConfig  `yaml:"sets"` // optional set composition entries
+	WasmMerge    string `yaml:"wasm_merge"`     // optional; defaults to "wasm-merge" in $PATH
+	Output       string `yaml:"output"`         // output path for merge command; overridable with -o
+	WasmFile     string `yaml:"wasm_file"`      // output WASM file for compile command; overridable with -o
+	ImportModule string `yaml:"import_module"`  // WASM import module name used by wasm-merge and Rust FFI
+	StubFile     string `yaml:"stub_file"`      // stub output file (Rust, Go, JS, TS, AS, or C)
+	StubType     string `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
+	MaxDFAStates int    `yaml:"max_dfa_states"` // 0 = default (1024)
+	MaxTDFARegs  int    `yaml:"max_tdfa_regs"`  // 0 = default (32)
+	// MaxFallbackStates caps the suffix DFA of a single-pattern fallback
+	// bucket in a SET. It is a different budget from MaxDFAStates: that one
+	// bounds a whole single-pattern automaton, this one bounds one bucket of
+	// many inside a set, which is why they are separate keys despite sharing
+	// a default.
+	//
+	// It is load-bearing in a way the other two are not. A single pattern over
+	// MaxDFAStates falls back to another engine and still matches; a set
+	// member over this limit is DROPPED from the set and can never match. So
+	// this is the knob that decides whether a set contains what you put in it.
+	MaxFallbackStates int          `yaml:"max_fallback_states"` // 0 = default (1024)
+	Regexps           []RegexEntry `yaml:"regexps"`
+	Sets              []SetConfig  `yaml:"sets"` // optional set composition entries
 }
 
 // SetConfig describes one `sets:` entry in the YAML config.

@@ -101,3 +101,63 @@ func TestCompileFallback_WarnsWithNilDiag(t *testing.T) {
 		t.Errorf("warning must fire with a nil diag; got %q", out)
 	}
 }
+
+// TestMaxFallbackStatesReachesCompiler pins the wiring, not the branch.
+//
+// The tests above drive the drop through CompileSetOptions directly, which
+// proves the branch works but says nothing about whether a user can reach it.
+// They could not: CompileSetOptions was constructed in two places and NEITHER
+// set MaxFallbackStates, so the hardcoded default of 1024 always won — and the
+// drop warning's own hint said "raise max_dfa_states", a field that feeds a
+// different budget entirely. A pattern dropped from a set was therefore
+// unfixable through the remedy it was told to use.
+//
+// This drives the real entry point, CompileFile, so a future refactor that
+// rebuilds CompileSetOptions without the field fails here rather than silently
+// restoring the unreachable knob.
+func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
+	cfg := func(limit int) config.BuildConfig {
+		return config.BuildConfig{
+			MaxFallbackStates: limit,
+			Regexps: []config.RegexEntry{
+				// No usable literal, so it lands in a fallback bucket, and
+				// enough states to clear a small limit and not a large one.
+				{Name: "big", Pattern: `[a-z0-9]{200}`},
+			},
+			Sets: []config.SetConfig{{
+				Name:     "s",
+				Find:     "s_find",
+				Patterns: config.PatternSelector{All: true},
+			}},
+		}
+	}
+
+	for _, tc := range []struct {
+		limit       int
+		wantDropped bool
+	}{
+		{8, true},        // below the pattern's state count: dropped
+		{1 << 20, false}, // far above it: admitted
+	} {
+		buf, restore := captureWarnings(t)
+		if _, _, err := CompileFile(cfg(tc.limit), ""); err != nil {
+			restore()
+			t.Fatalf("max_fallback_states=%d: CompileFile: %v", tc.limit, err)
+		}
+		out := buf.String()
+		restore()
+
+		got := strings.Contains(out, "Pattern dropped from set")
+		if got != tc.wantDropped {
+			t.Errorf("max_fallback_states=%d: dropped=%v, want %v (slog output %q)",
+				tc.limit, got, tc.wantDropped, out)
+		}
+		if tc.wantDropped && !strings.Contains(out, "limit=8") {
+			t.Errorf("max_fallback_states=8: warning reported a different limit: %q", out)
+		}
+		// The hint must name a key that actually feeds this budget.
+		if tc.wantDropped && !strings.Contains(out, "raise max_fallback_states") {
+			t.Errorf("drop hint should name max_fallback_states; got %q", out)
+		}
+	}
+}

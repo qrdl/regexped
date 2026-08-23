@@ -208,22 +208,42 @@ pub fn %s(input: &[u8]) -> Option<usize> {
 		}
 		if s.Find != "" {
 			iterName := iterTypeName(s.Find)
+			gateSlots := 0
+			if gatedFind(s) {
+				gateSlots = idN
+			}
+			// A set big enough to make the iterator a heavy VALUE holds its
+			// arrays behind a Box instead; small sets keep the inline arrays
+			// and the zero-allocation scan. Both shapes deref to a slice, so
+			// only the declarations and the initialisers differ.
+			boxed := boxSetBuffers(n, gateSlots)
+			bufField := "    buf: [[i32; 3]; " + konst + "],\n"
+			bufInit := " buf: [[0; 3]; " + konst + "],"
+			allocDoc := ""
+			if boxed {
+				bufField = "    buf: Box<[[i32; 3]]>,\n"
+				bufInit = " buf: vec![[0; 3]; " + konst + "].into_boxed_slice(),"
+				allocDoc = "///\n/// This set is large enough that the buffer would be a heavy value to\n/// move, so it is heap-allocated once when the iterator is created. Small\n/// sets keep it inline and allocate nothing.\n"
+			}
 			gateField, gateInit, gateArg, gateDoc := "", "", "", ""
 			if gatedFind(s) {
 				gateField = "    gates: [u32; " + idKonst + "],\n"
 				gateInit = " gates: [0u32; " + idKonst + "],"
+				if boxed {
+					gateField = "    gates: Box<[u32]>,\n"
+					gateInit = " gates: vec![0u32; " + idKonst + "].into_boxed_slice(),"
+				}
 				gateArg = "self.gates.as_mut_ptr(), "
 				gateDoc = " and a zeroed gate array"
 			}
 			fmt.Fprintf(&out, `/// Iterator over the set's matches. It owns a reusable tuple buffer%s,
 /// refills at each matching position and yields that position's matches one
 /// at a time before advancing. Dropping and re-creating it restarts the scan.
-pub struct %s<'a> {
+%spub struct %s<'a> {
     input: &'a [u8],
     from: i32,
     done: bool,
-%s    buf: [[i32; 3]; %s],
-    count: i32,
+%s%s    count: i32,
     idx: i32,
 }
 
@@ -252,26 +272,35 @@ impl<'a> Iterator for %s<'a> {
     }
 }
 
-`, gateDoc, iterName, gateField, konst, iterName, s.Find, gateArg, konst)
+`, gateDoc, allocDoc, iterName, gateField, bufField, iterName, s.Find, gateArg, konst)
 			fmt.Fprintf(&out, "/// Starts a scan at `from`. Each step yields one match.\n"+
 				`pub fn %s(input: &[u8], from: usize) -> %s<'_> {
-    %s { input, from: from as i32, done: false,%s buf: [[0; 3]; %s], count: 0, idx: 0 }
+    %s { input, from: from as i32, done: false,%s%s count: 0, idx: 0 }
 }
 
-`, s.Find, iterName, iterName, gateInit, konst)
+`, s.Find, iterName, iterName, gateInit, bufInit)
 		}
 		if s.FindBatch != "" {
 			iterName := iterTypeName(s.FindBatch)
 			maxKonst := screamingCase(s.Name) + "_BATCH_MAX_COUNT"
-			gateField, gateInit, gateArg, gateDoc := "", "", "", ""
+			gateField, gateInit, gateArg, gateDoc, allocDoc := "", "", "", "", ""
 			if gatedFind(s) {
 				// The gate array stays stub-owned and out of the public
-				// surface (docs/sets.md "The gate array"), and it is a FIXED
-				// array rather than a Vec: its length is the emitted id-space
-				// constant, so it costs no allocation and needs no parameter.
-				// Only the tuple buffer's size is the caller's choice.
+				// surface (docs/sets.md "The gate array"): its length is the
+				// emitted id-space constant, so it is not a size the caller
+				// chooses, and it needs no parameter. Only the tuple buffer's
+				// size is the caller's choice.
+				//
+				// It is a FIXED array — no allocation — unless the set is big
+				// enough that carrying it by value would make the iterator a
+				// heavy thing to move, which is the same threshold `find` uses.
 				gateField = "    gates: [u32; " + idKonst + "],\n"
 				gateInit = " gates: [0u32; " + idKonst + "],"
+				if boxSetBuffers(0, idN) {
+					gateField = "    gates: Box<[u32]>,\n"
+					gateInit = " gates: vec![0u32; " + idKonst + "].into_boxed_slice(),"
+					allocDoc = "///\n/// This set's id space is large enough that the gate array would be a\n/// heavy value to move, so it is heap-allocated once when the iterator is\n/// created. Smaller sets keep it inline and allocate nothing at all.\n"
+				}
 				gateArg = "self.gates.as_mut_ptr(), "
 				gateDoc = " and owns a zeroed gate array"
 			}
@@ -284,7 +313,7 @@ impl<'a> Iterator for %s<'a> {
 ///
 /// It borrows the caller's buffer%s, so a scan allocates NOTHING: size the
 /// buffer once and reuse it for every scan.
-pub struct %s<'a, 'b> {
+%spub struct %s<'a, 'b> {
     input: &'a [u8],
     buf: &'b mut [SetTuple],
     cursor: i64,
@@ -321,7 +350,7 @@ impl<'a, 'b> Iterator for %s<'a, 'b> {
     }
 }
 
-`, gateDoc, iterName, gateField, iterName, maxKonst, s.FindBatch, gateArg, cursorCountMask(s, cfg))
+`, gateDoc, allocDoc, iterName, gateField, iterName, maxKonst, s.FindBatch, gateArg, cursorCountMask(s, cfg))
 			fmt.Fprintf(&out, "/// Starts a batched scan at `from` over the caller's buffer. Its length is\n"+
 				"/// the batch size, capped at %s; an empty buffer yields nothing.\n"+
 				`pub fn %s<'a, 'b>(input: &'a [u8], from: usize, buf: &'b mut [SetTuple]) -> %s<'a, 'b> {

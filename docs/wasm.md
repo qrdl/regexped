@@ -278,8 +278,11 @@ in-buffer terminator could be unambiguous.
 Unlike `find`, `find_batch` is **not transactional**: a position whose tuples do
 not all fit is delivered in part and resumed inside, so any `out_cap >= 1` makes
 progress and tuples of one position may span two calls. `out_cap` is clamped to
-`<SET>_BATCH_MAX_COUNT`; `out_cap = 0` returns count 0 with a non-nil cursor and
-must not be looped on.
+`<SET>_BATCH_MAX_COUNT`; `out_cap = 0` delivers nothing and returns the **done
+sentinel** with count 0, so the ordinary loop terminates rather than spinning on
+a cursor that can never advance. This is a deliberate asymmetry with `find`,
+where the same input is a legal size probe: `find` returns a count, which a probe
+can use, while `find_batch` returns a resumable cursor, which a probe cannot.
 
 ### find return value and overflow
 
