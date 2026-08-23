@@ -5,7 +5,7 @@ import (
 )
 
 // hasSetExports reports whether cfg has any sets with at least one declared
-// capability (plans/SETS.md §3.12).
+// capability.
 func hasSetExports(cfg config.BuildConfig) bool {
 	for _, s := range cfg.Sets {
 		if s.HasExports() {
@@ -33,7 +33,7 @@ func hasEmitNameMap(cfg config.BuildConfig) bool {
 // It is NOT a bound on pattern id VALUES: ids are global indices into
 // `regexps:`, so a set holding two patterns can report id 69. Anything indexed
 // by a pattern id — gate arrays, `_all` bitmasks and bitmaps — must be sized
-// with idSpaceSize instead (plans/SETS.md §11 R1).
+// with idSpaceSize instead.
 func patternsInSet(s config.SetConfig, cfg config.BuildConfig) int {
 	return s.PatternCount(cfg)
 }
@@ -48,7 +48,7 @@ func idSpaceSize(s config.SetConfig, cfg config.BuildConfig) int {
 }
 
 // setConstBase sanitises a set name into an identifier stem for the emitted
-// pattern-count and id-space constants (plans/SETS.md D16, §11 R1).
+// pattern-count and id-space constants.
 //
 // Delegates to config.SanitizeSetName so that ValidateSets — which rejects two
 // set names that collapse to one stem — and the generators cannot disagree
@@ -79,12 +79,12 @@ func camelSet(name string) string {
 }
 
 // wideAllForm reports whether a set's `_all` capabilities use the >64-pattern
-// out_ptr bitmap form rather than an i64 bitmask return (plans/SETS.md §3.13).
+// out_ptr bitmap form rather than an i64 bitmask return.
 //
 // Keyed on the ID SPACE, matching compiledSet.wideAll(): the form exists to
 // carry bit positions, and a bit position is a pattern id. Keying it on the
 // pattern count let the stub declare one signature while the module exported
-// the other (plans/SETS.md §11 R1).
+// the other.
 func wideAllForm(s config.SetConfig, cfg config.BuildConfig) bool {
 	return idSpaceSize(s, cfg) > 64
 }
@@ -99,7 +99,7 @@ func bitmapBytes(s config.SetConfig, cfg config.BuildConfig) int {
 func gatedFind(s config.SetConfig) bool { return s.Gated() }
 
 // cursorCountBits is the width of the find_batch cursor's count field for this
-// set (plans/SETS.md §19).
+// set.
 //
 // It calls the SAME config function the compiler encodes with, for the reason
 // idSpaceSize gives: a layout each side derives independently is a layout that

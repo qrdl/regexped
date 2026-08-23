@@ -1,21 +1,21 @@
 package main
 
-// Task G15 (plans/SETS.md §22): drive EVERY set capability over the corpus.
+// Task G15: drive EVERY set capability over the corpus.
 //
 // Before this file, --sets declared one set with `find` OR `find_batch`,
 // `patterns: all` and no `overlapping`, so six of the eight capabilities plus a
 // whole `find` body had no corpus coverage at all — which is how five
-// wrong-answer/crash bugs (plans/FUZZER_BUGS.md 43, 44, 46, 50, 51) survived
+// wrong-answer/crash bugs survived
 // 4.94M passing cases.
 //
 // Everything here computes its expectation from Go `regexp` live, via §9.6's
-// whole-input technique, so no oracle restates an emitter rule back at it
-// (§22.4 / plans/FABLE.md B42). Where the corpus carries a col4 column the two
+// whole-input technique, so no oracle restates an emitter rule back at it.
+// Where the corpus carries a col4 column the two
 // are CROSS-CHECKED against each other rather than one replacing the other.
 //
 // It found two more on its first runs, in configurations that had never been
-// driven at all: FUZZER_BUGS.md 52 (overlapping `find_batch` above capacity 1
-// dropped a tuple per call) and 53 (`scan`/`scan_all` ignored `from > len`).
+// driven at all: overlapping `find_batch` above capacity 1 dropped a tuple
+// per call, and `scan`/`scan_all` ignored `from > len`.
 //
 // Four axes decide what a run covers, and each exists because the corpus alone
 // cannot supply it — see the options below: --set-chunk (set SIZE, since the
@@ -75,8 +75,8 @@ var (
 	// than a wrong answer: pattern_id is the GLOBAL index into `regexps:`, so
 	// the gate array and the `_all` bitmap are sized from the id space while
 	// the tuple buffer is sized from the pattern count. Sizing the gate array
-	// from the count let the module write past the caller's array — plans/SETS.md
-	// §11 R1 — and `patterns: all` makes the two equal, so no run that used it
+	// from the count let the module write past the caller's array, and
+	// `patterns: all` makes the two equal, so no run that used it
 	// could ever have caught that.
 	//
 	// Starting at index 1 is deliberate: it leaves id 0 unselected, so the ids
@@ -237,7 +237,7 @@ func (s *setCapStats) bad(label string, n int) {
 // report prints the per-capability table. setMaxPrint caps the number of
 // individual FAIL lines, never the counts.
 func (s *setCapStats) report() {
-	fmt.Printf("\n=== Set capability coverage (plans/SETS.md §22) ===\n")
+	fmt.Printf("\n=== Set capability coverage ===\n")
 	fmt.Printf("chunks compiled: %d", s.chunks)
 	if s.skipped > 0 {
 		fmt.Printf("  (skipped by --sample: %d)", s.skipped)
@@ -307,7 +307,7 @@ func setFailf(format string, args ...interface{}) {
 }
 
 // ---------------------------------------------------------------------------
-// Oracles (plans/SETS.md §9.6).
+// Oracles.
 
 // setOracle holds every expectation a profile can need, indexed [pattern][string].
 type setOracle struct {
@@ -390,8 +390,7 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 		if needSPM {
 			// One probe per position, built once and reused for every string
 			// long enough to have that position. Without the reuse the map is
-			// rebuilt per string and the cost is quadratic for no reason
-			// (plans/FUZZER_BUGS.md bug 49).
+			// rebuilt per string and the cost is quadratic for no reason.
 			probes := make([]*regexp.Regexp, maxLen+1)
 			row := make([][][2]int, len(strs))
 			for si, s := range strs {
@@ -599,7 +598,7 @@ func (r *setRunner) buf() []byte { return r.mem.UnsafeData(r.store) }
 func (r *setRunner) zeroGates() {
 	b := r.buf()
 	// Sized from the ID SPACE, not the pattern count: the array is indexed by
-	// global pattern id (plans/SETS.md §11 R1).
+	// global pattern id.
 	for i := int32(0); i < int32(r.idSpace)*4; i++ {
 		b[r.gatePtr+i] = 0
 	}
@@ -640,7 +639,7 @@ func (r *setRunner) readBitmap() []int {
 // A set can legitimately EXCLUDE a pattern whose suffix DFA exceeds the
 // fallback bucket's state budget: the compiler warns, records it in
 // --diag-json's `state_limit_dropped`, and compiles the rest (docs/sets.md
-// "Fallback buckets can drop patterns", plans/OPUS.md §N3). A dropped pattern
+// "Fallback buckets can drop patterns"). A dropped pattern
 // reports nothing, so comparing it against an oracle that still expects its
 // matches would manufacture failures out of documented behaviour.
 //
@@ -863,8 +862,8 @@ func newSetRunner(
 //
 // Every position for short inputs; for longer ones a spread that keeps the
 // boundaries the SIMD frontends turn on: 16 and 32 are block edges and 33 is
-// where `simdGuard = MinLen + span - 1` first admits a two-column probe —
-// plans/FUZZER_BUGS.md bug 51 was invisible below 33 bytes (§22.3).
+// where `simdGuard = MinLen + span - 1` first admits a two-column probe:
+// the shared-probe-column defect was invisible below 33 bytes.
 func setFromValues(n int) []int {
 	if n <= 16 {
 		out := make([]int, 0, n+1)
@@ -1310,7 +1309,7 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 
 // driveFindOverflow drives a `find` export at a buffer DELIBERATELY too small,
 // checking the two contracts a full-capacity drive can never reach
-// (docs/sets.md "The gate array", plans/SETS.md §4.2 / §3.11 / D2):
+// (docs/sets.md "The gate array"):
 //
 //   - `out_cap = 0` returns the position's total and delivers no tuples;
 //   - an overflowing call (`total > out_cap`) is TRANSACTIONAL: growing the

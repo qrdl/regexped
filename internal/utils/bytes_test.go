@@ -444,7 +444,7 @@ func TestWasmTableBaseType2Segment(t *testing.T) {
 }
 
 // TestDecodeLEB128Malformed covers the two rejection classes added for
-// plans/FABLE.md B39: truncated input (runs out of bytes with the continuation
+// Truncated input (runs out of bytes with the continuation
 // bit still set) and over-long input (more than ten bytes, whose payload would
 // be shifted past bit 63 and silently disappear).
 func TestDecodeLEB128Malformed(t *testing.T) {

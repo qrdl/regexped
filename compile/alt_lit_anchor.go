@@ -61,10 +61,10 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		}
 		table := dfaTableFrom(fwdMatcher)
 		// Same gates as the single-pattern lit-anchor path in compile.go:
-		// `\b`/`\B` (Task 10) and, per FUZZER_BUGS.md #22, `(?m:^)`/`(?m:$)`
+		// `\b`/`\B` (Task 10) and, per a past defect, `(?m:^)`/`(?m:$)`
 		// in the prefix.
 		//
-		// DELIBERATE DIVERGENCE (plans/TODO.md task 51, 2026-08-17): compile.go's
+		// DELIBERATE DIVERGENCE: compile.go's
 		// copy of this gate is now narrower — it admits a prefix led by
 		// `^`/`(?m:^)` with nothing after the anchor able to consume a '\n'
 		// (lineAnchoredPrefixSafe, lit_anchor.go), a shape §22's defect never
@@ -75,7 +75,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		// no perftest/likelytest case exercises a line-anchored alternation, so
 		// the widening would be unmeasured — the stricter gate is always safe,
 		// making this a missed optimisation, not an unfixed sibling of §22.
-		// plans/TODO.md task 53 tracks lifting it behind a shared predicate.
+		// Lifting it behind a shared predicate is still open.
 		if table.hasWordBoundary || table.hasNewlineBoundary ||
 			prefixContainsWordBoundary(br.lap.prefixRe) || prefixContainsLineAnchor(br.lap.prefixRe) {
 			return nil, false
@@ -261,7 +261,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 	// Derived from the segments actually appended rather than re-deduced from
 	// whichever Teddy offsets happen to be assigned — the three-way branch this
 	// replaces had to stay in lockstep with the emission above by hand. See
-	// plans/OPUS.md §N10.
+	// emitted in a fixed, documented order.
 	result.tableEnd = teddySegs.end
 
 	return result, true

@@ -171,7 +171,7 @@ const (
 	beginAnchorText
 	// beginAnchorLine is (?m:^): the match can start at position 0 or at any
 	// position whose preceding byte is a newline. Collapsing this to
-	// "position 0 only" is plans/FABLE.md B43.
+	// "position 0 only" was a real defect.
 	beginAnchorLine
 )
 
@@ -260,8 +260,7 @@ func isOnlyBeginAnchors(re *syntax.Regexp) bool {
 // pattern's leading anchor. The fallback bucket's DFA models the whole pattern
 // including the assertion, so this is a pre-filter that saves a DFA run rather
 // than the sole implementation of the anchor — but it must not be STRICTER
-// than the assertion, which is what collapsing (?m:^) to "position 0" did
-// (plans/FABLE.md B43).
+// than the assertion, which is what collapsing (?m:^) to "position 0" did.
 func (info *PatternInfo) setTopLevelAnchor(parsed *syntax.Regexp) {
 	switch topLevelBeginAnchorKind(parsed) {
 	case beginAnchorText:
@@ -306,7 +305,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 			// the anywhere-in-the-tree scan — it fires for anchors nested in
 			// *, ?, or an alternation (which restrict nothing) and collapses
 			// (?m:^) to "position 0 only", which is B43. This site was missed
-			// when the others were converted (plans/SETS.md §11 R3).
+			// when the others were converted.
 			info.setTopLevelAnchor(parsed)
 			// suffixDFA is built later by compileFallback via mergeSuffixDFA.
 			return info, nil
@@ -356,7 +355,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 			}
 			// Keep the split ONLY if it survived every rejection above.
 			// Retaining prefixAST after a rejection is one of the two
-			// mechanisms behind plans/FABLE.md B40: a `\b` prefix is
+			// mechanisms behind the \b-in-a-set defect: a `\b` prefix is
 			// zero-length and not an only-begin-anchor, so the split is
 			// rejected — but the retained prefixAST still made the pattern
 			// look split, so it got a backward "prefix DFA" for a bare
@@ -375,7 +374,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		}
 	}
 
-	// Variable-length prefixes route to fallback (plans/SETS.md §9.4).
+	// Variable-length prefixes route to fallback.
 	//
 	// The split representation prefix.literal.suffix answers "where does a
 	// match starting at s end?" by finding a literal occurrence and walking
@@ -393,7 +392,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	//     the empty-prefix candidate, 0-2 from the one-char-prefix
 	//     candidate), where RE2 has exactly one answer, 0-2.
 	//
-	// This is the root cause behind plans/FABLE.md B41's back-dated tuples.
+	// This is the root cause behind the back-dated-tuple defect.
 	// Routing to fallback runs the whole pattern's DFA anchored at each
 	// position, which is the only construction that gets the extent right —
 	// and it is also what §9.4's class B says such a set must do, since a
@@ -418,8 +417,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	// because a backward scan cannot see the byte at input[start-1] that a
 	// boundary sitting at the prefix's LEFT EDGE depends on. Emitting it
 	// anyway silently loses matches — `\B.0` over "000" splits into prefix
-	// `\B.` + literal "0" and returned NOTHING, where [1,3) is a real match
-	// (plans/SETS.md §18.10).
+	// `\B.` + literal "0" and returned NOTHING, where [1,3) is a real match.
 	//
 	// The forward suffix walk is unaffected and needs no guard: it threads
 	// exactly that context through midAcceptNW/midAcceptW, which is what
@@ -433,7 +431,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	}
 
 	// A prefix containing `$`, `\z` or `(?m:$)` routes to fallback, for the
-	// third instance of the same blindness (plans/FUZZER_BUGS.md bug 46).
+	// third instance of the same blindness.
 	//
 	// The backward prefix DFA is a plain byte automaton over the reversed
 	// prefix. End-of-text is not a byte, so reverseRegexp/newDFA simply drop
@@ -574,7 +572,7 @@ func (o CompileSetOptions) maxFallbackStates() int {
 //
 // It is deliberately much larger than budgetBytes(): that budget sizes ONE of
 // many per-bucket DFA tables, while this sizes the single table the whole set
-// shares. 512 KB covers every literal shape measured in plans/SETS.md §14.2 at
+// shares. 512 KB covers every literal shape measured at
 // 128 literals with headroom — ~75 KB for a shared-prefix set, ~250 KB for the
 // expensive shape where every literal starts with a different byte — and keeps
 // the worst case well under the 1.5 MB a regex-automata module costs (§12.7),
@@ -612,7 +610,7 @@ func combinedClassCount(a, b [256]byte) int {
 // Returns error if len(asts) > BitmaskWidth (default 32).
 //
 // The AcceptKind return is always AcceptBitmask today; no caller uses it yet.
-// It exists so Phase 6 (plans/COMPOSING_PATTERNS_PLAN.md) can add
+// It exists so Phase 6 can add
 // AcceptSparseSet for WAF-scale buckets (>BitmaskWidth patterns) without
 // changing this signature or any call site.
 //
@@ -752,8 +750,7 @@ func buildUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uin
 // a single left-to-right pass. Without it a set with no mandatory literal has
 // to restart every bucket's automaton at every position, which is quadratic on
 // unbounded patterns: `[^\n]*ERROR` re-scans to end of line from each of
-// 100,000 positions, and that is the 151M-fuel greedy-3 row (plans/SETS.md
-// §14.12).
+// 100,000 positions, which measured 151M fuel on a 3-pattern set.
 //
 // Two instructions are appended:
 //
@@ -803,8 +800,8 @@ const (
 	// Requires zero fallback buckets — fallback runs at every position
 	// so a first-byte SIMD skip can't safely advance past it.
 	frontendShufti
-	// frontendPackedPair: two-column byte-equality SIMD prefilter
-	// (plans/SETS.md §16 Task G1). Two v128 loads, one i8x16.eq per probe
+	// frontendPackedPair: two-column byte-equality SIMD prefilter.
+	// Two v128 loads, one i8x16.eq per probe
 	// byte, one v128.and and one bitmask per 16-byte chunk — flat in literal
 	// count and far cheaper per byte than Teddy's four nibble-table lookups.
 	// Chosen for small literal sets whose probe window has a rare, narrow
@@ -888,7 +885,7 @@ const teddyMinLenForBucketing = 2
 // teddyFirstByteCrossover is the number of DISTINCT FIRST BYTES at which
 // bucketed Teddy overtakes Aho-Corasick above 16 literals.
 //
-// Measured, not assumed (plans/SETS.md §14.11): at 32 literals over a 100KB
+// Measured, not assumed: at 32 literals over a 100KB
 // no-match corpus, AC leads 419K to 669K fuel at one distinct first byte, is
 // level at two and three, and falls behind from four onward — 1.19x at four,
 // 2.56x at eight, 6.32x at thirty-two — while Teddy stays flat at ~1.04M
@@ -1157,9 +1154,8 @@ func chooseLiteralFrontend(literals [][]byte) frontendKind {
 		// Teddy's four chunk loads and four nibble-table swizzle pairs. Both
 		// verify candidates the same way, so the pair's only cost is a higher
 		// false-positive rate, which choosePackedPair minimises by picking the
-		// rarest columns. Measured for plans/SETS.md §16 Task G1 on the
-		// keywords-2/8 shapes at 100KB: Teddy 6.5 fuel/byte, AC 4.1,
-		// packed-pair ~1.8 — see §16.4.
+		// rarest columns. Measured on the keywords-2/8 shapes at 100KB:
+		// Teddy 6.5 fuel/byte, AC 4.1, packed-pair ~1.8.
 		if _, ok := choosePackedPair(literals); ok {
 			return frontendPackedPair
 		}
@@ -1467,7 +1463,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 				}
 			}
 			// isolatedDFA can still be nil here, and dereferencing it was a
-			// crash (plans/FUZZER_BUGS.md bug 50). analyzePattern returns
+			// crash. analyzePattern returns
 			// EARLY for a non-greedy pattern, leaving p.suffixDFA nil with the
 			// note that compileFallback will build it — so this is the only
 			// place it exists, and the assignment above happens only when the
@@ -1602,7 +1598,7 @@ func patternSuffixAST(p *PatternInfo) *syntax.Regexp {
 // discarded unless the caller asked for --diag-json — its only consumer is
 // CmdWriteDiagJSON. Before this warning existed, a normal build dropped the
 // pattern with exit code 0 and no output at all, and the set silently never
-// matched it. See plans/OPUS.md §N3.
+// matched it.
 //
 // Warn rather than error: erroring would be a behaviour change for configs that
 // build today, and the drop is a resource ceiling rather than a malformed
@@ -1628,7 +1624,7 @@ func patternRefFor(p *PatternInfo) PatternRef {
 }
 
 // --------------------------------------------------------------------------
-// Anchored-capability automata (plans/SETS.md §3.3, §9.5 S3).
+// Anchored-capability automata.
 //
 // `match`, `match_any` and `match_all` ask whether a pattern matches the WHOLE
 // input, which is `\A(?:p)\z` — and that is NOT a question a leftmost-first
@@ -1695,7 +1691,7 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 			// Defensive — analyzePattern parsed this once already — but a bare
 			// `continue` would drop the pattern from the anchored trio while
 			// `find` kept it, with nothing in --diag-json to explain the
-			// disagreement (plans/SETS.md §11 R9).
+			// disagreement.
 			warnPatternDropped(p, "anchored bucket (unparseable)", 0, 0)
 			if diag != nil {
 				diag.UnparseableDropped = append(diag.UnparseableDropped, patternRefFor(p))

@@ -8,7 +8,7 @@ import (
 )
 
 // --------------------------------------------------------------------------
-// Start-anywhere union DFA for the scan trio (plans/SETS.md §14 P5)
+// Start-anywhere union DFA for the scan trio
 //
 // A set with no mandatory literal has no way to skip input, so the scan bodies
 // visit every position and run every bucket's probe from it. That is
@@ -151,7 +151,7 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 }
 
 // unionUnroll is how many input bytes one iteration of the union scan's bulk
-// loop steps (plans/SETS.md §21.5). Four is what the task specifies: it takes
+// loop steps. Four is what the task specifies: it takes
 // the per-byte scaffolding from ~14 fuel to ~3.5 while adding three copies of
 // a ~22-instruction step to two bodies per set.
 const unionUnroll = 4
@@ -173,7 +173,7 @@ const unionUnroll = 4
 // there is nothing to gain past the first match. `scan_all` accumulates to the
 // end, but stops as soon as every id in the set is present.
 //
-// # The unroll (plans/SETS.md §21.5 / G14)
+// # The unroll
 //
 // The loop above runs at ~36 fuel/byte, of which only ~22 is the automaton:
 // the rest is the bounds test, the position increment, the mode's exit test
@@ -210,7 +210,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	b = append(b, 0x42, 0x00, 0x21, lAcc)
 	// Entry state depends on `from`, and getting this wrong is silent.
 	//
-	// plans/SETS.md §3.2: ptr/len describe the WHOLE input and `from` bounds
+	// ptr/len describe the WHOLE input and `from` bounds
 	// only the search, so zero-width assertions must see real context. At
 	// from==0 the scan really is at the start of text and `^`/\A may fire, so
 	// the begin-context start state is correct; at from>0 it is not the start
@@ -232,8 +232,8 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	b = append(b, 0x0B) // end if
 	b = append(b, 0x20, pFrom, 0x21, lPos)
 
-	// `from > len` yields the capability's "nothing" result (plans/SETS.md
-	// §4.2). The loop guard alone does NOT deliver that: the entry-state
+	// `from > len` yields the capability's "nothing" result. The loop guard
+	// alone does NOT deliver that: the entry-state
 	// accept below and the end-of-input accept after the loop both run
 	// regardless of how the loop exited, so a `from` past the end still
 	// reported every nullable and every `\z`-anchored pattern. `from == len`
@@ -253,7 +253,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// below only ORs after a transition, so without this `\A` (and `a*`, and
 	// any other nullable pattern) is silently dropped — found by
 	// tools/fuzz FuzzSetCaps on {`$`, `\A`} over "0", which reported only
-	// `$` (plans/SETS.md §18.7).
+	// `$`.
 	b = append(b, 0x20, lAcc)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, u.acceptOff)
@@ -367,7 +367,7 @@ func (cs *compiledSet) unionScanDataSegs() int {
 
 // dataTop returns one past the highest address this set's tables occupy,
 // derived from the segments actually emitted rather than from a running offset
-// or a length sum (plans/FUZZER_BUGS.md bug 44).
+// or a length sum.
 //
 // The blob list MUST stay in step with the one assembleModuleWithSets
 // concatenates into rawData: a table missing here is a table the module writes
@@ -429,7 +429,7 @@ func (cs *compiledSet) fullIDMask() uint64 {
 }
 
 // --------------------------------------------------------------------------
-// G8: union preflight for `scan_any` (plans/SETS.md §18.4)
+// G8: union preflight for `scan_any`
 
 // usesScanAnyPreflight reports whether this set's `scan_any` body should run
 // the union automaton once up front and narrow every bucket's validMask with
@@ -469,7 +469,7 @@ func (cs *compiledSet) needsLivenessTable() bool {
 // that range.
 //
 // This is emitUnionScanBody's loop without the capability epilogue, and it
-// keeps that body's entry-state rule (plans/SETS.md §14.12): at from == 0 the
+// keeps that body's entry-state rule: at from == 0 the
 // scan really is at start of text and `^`/\A may fire, so the begin-context
 // state is correct; at from > 0 it is not, and midStart is. Getting that wrong
 // is silent, which is why it is restated here rather than assumed.
@@ -538,7 +538,7 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal byte
 
 // usesGatedFindPreflight reports whether this set's gated `find` should run
 // B′: one union preflight per drive, whose result is written back into the
-// caller's gate array as a never-again sentinel (plans/SETS.md §18.5 / G9).
+// caller's gate array as a never-again sentinel.
 func (cs *compiledSet) usesGatedFindPreflight() bool {
 	if cs.find == "" || cs.overlapping || cs.unionScan == nil {
 		return false
@@ -562,7 +562,7 @@ func (cs *compiledSet) usesGatedFindPreflight() bool {
 	return false
 }
 
-// emitGatedFindPreflight emits B′ (plans/SETS.md §18.5 / G9).
+// emitGatedFindPreflight emits B′.
 //
 // Only while some gate is still 0 — i.e. the first call of a drive — run the
 // union automaton over [from,len) and, for every pattern it proves matches

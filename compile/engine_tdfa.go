@@ -167,8 +167,8 @@ func sequentializeCopies(copyOps []tdfaTagOp) []tdfaTagOp {
 // Uses strconv.AppendInt rather than fmt.Appendf: this function was measured at
 // 42% of total newTDFA wall time (pprof, 8-group CSV pattern — 88 ms to build a
 // 16-state automaton), essentially all of it inside fmt's reflection-based
-// integer formatting, called once per register per thread per state. See
-// plans/OPUS.md §N8. The emitted bytes are identical to what "%d" produced —
+// integer formatting, called once per register per thread per state.
+// The emitted bytes are identical to what "%d" produced —
 // including negative register values, which regMap uses for "unset" (-1) and
 // scratchRegSentinel (-2) — so DFA state ordering and every downstream
 // fuel/size baseline are unaffected.
@@ -342,7 +342,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		// Rune-consuming thread's transition once it has seen a higher-or-
 		// equal-priority InstMatch earlier in the list it's given (standard
 		// leftmost-first "kill lower-priority threads once a match is found"
-		// semantics — see plans/FUZZER_BUGS.md §12). Passing it key.threads'
+		// semantics). Passing it key.threads'
 		// pc-sorted order instead would silently defeat that pruning whenever
 		// numeric pc order disagrees with true priority — which happens for
 		// backward loop edges, e.g. an outer repeat wrapping a range-quantified
@@ -490,8 +490,8 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		//   orig >= sentinelBase → was a freshly-captured tag → reg[can] = pos
 		//   orig <  sentinelBase, orig != can → inherited but renumbered → reg[can] = reg[orig]
 		// Copies are ordered by sequentializeCopies (dependency-safe — a fixed
-		// sort direction is NOT sufficient here, see its doc comment and
-		// plans/TODO.md task 13's investigation). Set-ops are sorted by
+		// sort direction is NOT sufficient here, see its doc comment).
+		// Set-ops are sorted by
 		// ascending dst to ensure deterministic WASM emission independent of
 		// Go's non-deterministic map iteration order over `rename`.
 		var copyOps, setOps []tdfaTagOp
@@ -949,8 +949,7 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 // narrowing `len` first), where a byte consumer can have higher priority
 // than an already-reachable Match (e.g. `^(a)?` vs "b", or `^(?:(a){2})?`
 // vs a string with fewer than 2 'a's) and the correct leftmost-first answer
-// is the earlier, lower-priority accept, not "no match". See
-// plans/FUZZER_BUGS.md §10.2/§10.2-followup.
+// is the earlier, lower-priority accept, not "no match".
 //
 // The write must happen EAGERLY (not deferred to whenever the fallback is
 // actually needed) because capture registers are live, mutable WASM locals:
@@ -1144,7 +1143,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	// state = table[<the encoding buildDFALayout actually chose>].
 	//
 	// This MUST go through the same three shared emitters buildMatchBody
-	// dispatches to (plans/FABLE.md B15). The load used to be hand-rolled here
+	// dispatches to. The load used to be hand-rolled here
 	// as a plain `tableOff + prevState<<8 + byte` u8 index with a u16 sibling,
 	// which silently disagreed with the layout on both of the other encodings
 	// dfaDataSegments can emit: byte-class compression (chosen once
@@ -1181,7 +1180,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	// rather than only checking prevState. (This only matters for the
 	// native/anchored capture-body call convention — compile.go:1568 —
 	// where `len` is the caller's full input, not a find-pass-narrowed match
-	// end; see plans/FUZZER_BUGS.md §10.2.)
+	// end.)
 	b = append(b, 0x20, byte(localState))
 	b = append(b, 0x45)       // i32.eqz
 	b = append(b, 0x04, 0x40) // if state==0 (void)
@@ -1328,7 +1327,7 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 		}
 		var groups []opsGroup
 		// strconv.AppendInt, not fmt.Appendf — same reasoning as keyString's doc
-		// comment (plans/OPUS.md §N8), and this runs once per transition entry,
+		// comment, and this runs once per transition entry,
 		// i.e. up to 256 times per state. Byte-identical to "%d:%d," including
 		// negative dst/src (-1 = assign-from-pos, -2 = scratchRegSentinel).
 		keyFor := func(ops []tdfaTagOp) string {
@@ -1737,7 +1736,7 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	//   distinct. Coalescing one op's dst onto another op's src invents a
 	//   read-after-write dependency that did not exist when that order was
 	//   chosen, and remapOps never re-sequentializes — so op i's write silently
-	//   destroys the value op j was supposed to read. plans/FABLE.md B14:
+	//   destroys the value op j was supposed to read. A real defect:
 	//   `(b+){2}c` on "bbbc" had the correctly-sequentialized batch
 	//   [{0 3} {1 2}] coalesced to [{1 2} {0 1}], reporting group 1 as [2 2]
 	//   instead of [2 3]. Forbidding the coalesce is the cheap half of the fix

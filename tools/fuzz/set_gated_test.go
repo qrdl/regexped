@@ -13,7 +13,8 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// The gated (default) `find` body — plans/SETS.md §3.14-3.16, stage S5.
+// The gated (default) `find` body: per-pattern non-overlapping output,
+// filtered through a caller-owned gate array.
 //
 // The oracle is deliberately NOT a Go reimplementation of §3.16's biased gate
 // encoding. §9.6.1 explains why at length: a reference derived from the same
@@ -345,7 +346,7 @@ func TestGatedOverflowStoresNoState(t *testing.T) {
 	}
 }
 
-// TestGatedLadder is plans/SETS.md §9.8's first measurement obligation: the
+// TestGatedLadder is the linearity obligation: the
 // `a+`-in-a-set n-ladder that made the case for gating in the first place.
 // §3.14 measured the ungated scan at a textbook O(n^2) (x4 per doubling);
 // gating must make it linear. Run with -v to see the table.
@@ -376,8 +377,7 @@ func TestGatedLadder(t *testing.T) {
 // it read as "linear, as predicted" (§10.5) while the gated body was in fact
 // still quadratic in WORK: §3.14's mask skip and jump were never emitted, so
 // the terminating call ran each suffix DFA to its full extent at every gated
-// position — 7.8M fuel at n=500 rising x4 per doubling to 1.98B at n=8000
-// (plans/SETS.md §11 R5).
+// position — 7.8M fuel at n=500 rising x4 per doubling to 1.98B at n=8000.
 //
 // The lesson generalised in R-TESTS(3): when the CLAIM is a complexity bound,
 // the test has to measure work, not iterations. Fuel is deterministic, so this
@@ -462,7 +462,7 @@ func TestGatedLadderFuel(t *testing.T) {
 			if ratio > 3.0 {
 				t.Errorf("fuel grew %.2fx from n=%d to n=%d — that is the quadratic "+
 					"behaviour §3.14's mask skip and jump exist to remove "+
-					"(plans/SETS.md §11 R5)", ratio, prevN, n)
+					"(gated find must stay linear in input length)", ratio, prevN, n)
 			}
 		} else {
 			t.Logf("n=%-5d fuel=%d", n, f)

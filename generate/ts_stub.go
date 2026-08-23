@@ -51,7 +51,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	// picks the latter overload for the type-checker, so the instanceof probe
 	// (and the assertion on the result) is what keeps the Module path — the
 	// Cloudflare Workers flow promised in the comment above — working at
-	// runtime. Mirrors genJSStubFile; see plans/FABLE.md B30.
+	// runtime. Mirrors genJSStubFile.
 	sb.WriteString("    const r = await WebAssembly.instantiate(wasm as BufferSource);\n")
 	sb.WriteString("    const instance = (r instanceof WebAssembly.Instance ? r : r.instance) as WebAssembly.Instance;\n")
 	sb.WriteString("    _exp = instance.exports;\n")
@@ -69,7 +69,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("    // the second copy _mem.set would then make. The reservation is the\n")
 	sb.WriteString("    // worst-case UTF-8 expansion of a JS string: 3 bytes per UTF-16 code unit\n")
 	sb.WriteString("    // (an astral char is 2 units and encodes to 4 bytes, so 3x still bounds\n")
-	sb.WriteString("    // it), so encodeInto cannot truncate. See plans/OPUS.md \u00a7N6b.\n")
+	sb.WriteString("    // it), so encodeInto cannot truncate.\n")
 	sb.WriteString("    if (typeof input === 'string') {\n")
 	sb.WriteString("        _resize(input.length * 3, outBytes);\n")
 	// lib.dom.d.ts declares TextEncoderEncodeIntoResult.written as optional, so
@@ -124,7 +124,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		return ""
 	}
 	var out strings.Builder
-	out.WriteString("\n// ---- set composition wrappers (plans/SETS.md §4.5) ----\n")
+	out.WriteString("\n// ---- set composition wrappers ----\n")
 	out.WriteString("//\n")
 	out.WriteString("// Do not call other stub functions while an iterator is suspended: the\n")
 	out.WriteString("// staged input and the shared output region belong to whichever call ran\n")
@@ -139,7 +139,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		wide := wideAllForm(s, cfg)
 		// §4.9 standalone layout: tuples (12 x pattern count), gate array
 		// (4 x ID SPACE), >64-pattern bitmap (ceil(idSpace/8)). The two counts
-		// differ for a named-subset set (plans/SETS.md §11 R1).
+		// differ for a named-subset set.
 		reserve := 12*n + 4*idN + bitmapBytes(s, cfg)
 		gateBase := fmt.Sprintf("_outBase + 12*%s", konst)
 		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
@@ -334,8 +334,8 @@ export function %s(input: string | Uint8Array): [number, boolean] {
 // Yields [start, end] absolute byte positions for each non-overlapping match.
 //
 // Prefers the batch export (funcName+"_batch", requested via the
-// "batch-find" hint — plans/TODO.md task 44) when the loaded WASM provides
-// one — draining lm2BatchCap matches per host call instead of one — and
+// "batch-find" hint) when the loaded WASM provides one — draining
+// lm2BatchCap matches per host call instead of one — and
 // falls back to the standard one-call-per-match loop otherwise. Ported from
 // genJSFindFunc (generate/js_stub.go) — see its doc comment for the full
 // rationale; TS uses the same `_exp['<name>']` dynamic lookup, so the
@@ -380,8 +380,8 @@ export function* %[1]s(input: string | Uint8Array): Generator<[number, number]> 
 // Yields an array per match, index 0 = full match, null for unmatched groups.
 //
 // Prefers the batch export (funcName+"_batch", requested via the
-// "batch-find" hint — plans/TODO.md task 44) when the loaded WASM provides
-// one, same as genTSFindFunc. Ported from genJSGroupsFunc
+// "batch-find" hint) when the loaded WASM provides one, same as
+// genTSFindFunc. Ported from genJSGroupsFunc
 // (generate/js_stub.go) — see compile/compile.go's buildBatchGroupsWrapperBody
 // for the record layout: [start, end, group0_start, group0_end, ...].
 func genTSGroupsFunc(funcName string, numGroups int) string {
@@ -419,7 +419,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<Array<[number, num
     const len = _w(input);
     // Hoisted out of the loop: _mem.buffer and _outBase are both loop-invariant
     // (_resize already ran, and nothing inside the loop grows the memory), so
-    // constructing the view per match was pure overhead. See plans/OPUS.md §N6a.
+    // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
     let off = 0;
     while (off <= len) {
@@ -449,8 +449,8 @@ export function* %[1]s(input: string | Uint8Array): Generator<Array<[number, num
 // Yields a plain object per match with name → [start, end] entries.
 //
 // Prefers the batch export (exportName+"_batch", requested via the
-// "batch-find" hint — plans/TODO.md task 44) when the loaded WASM provides
-// one, same as genTSGroupsFunc. Ported from genJSNamedGroupsFunc
+// "batch-find" hint) when the loaded WASM provides one, same as
+// genTSGroupsFunc. Ported from genJSNamedGroupsFunc
 // (generate/js_stub.go) — see its doc comment for why feature-detection is
 // keyed on exportName rather than funcName.
 func genTSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroups map[string]int) string {
@@ -508,7 +508,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<Record<string, [nu
     const len = _w(input);
     // Hoisted out of the loop: _mem.buffer and _outBase are both loop-invariant
     // (_resize already ran, and nothing inside the loop grows the memory), so
-    // constructing the view per match was pure overhead. See plans/OPUS.md §N6a.
+    // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
     let off = 0;
     while (off <= len) {

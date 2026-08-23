@@ -442,7 +442,7 @@ func TestSelectEngine_UnicodeWithOpt(t *testing.T) {
 	}
 }
 
-// TestSelectBestEngineWithTDFA_TableReuse pins plans/OPUS.md §N8b's contract:
+// TestSelectBestEngineWithTDFA_TableReuse pins the table-reuse contract:
 // the selector hands back the TDFA table it had to build to answer the
 // eligibility question, and it does so exactly when it answers EngineTDFA.
 // compilePattern reuses that table instead of rebuilding it; a nil return on a

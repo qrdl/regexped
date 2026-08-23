@@ -15,8 +15,8 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// End-to-end checks of the seven set capabilities against the plans/SETS.md
-// §9.6 oracle formulas. Every expectation is computed live from Go `regexp`
+// End-to-end checks of the seven set capabilities against oracle formulas
+// built from Go `regexp`. Every expectation is computed live
 // via the whole-input technique, so nothing here restates the emitter's own
 // rules back at it.
 
@@ -55,7 +55,7 @@ type capRunner struct {
 	npat   int
 	// release frees the wasmtime Store and Module. The runner OUTLIVES
 	// newCapRunner, so this cannot be deferred there — every caller must
-	// `defer r.Close()` instead (plans/FUZZER_BUGS.md bug 48).
+	// `defer r.Close()` instead.
 	release func()
 }
 
@@ -117,15 +117,14 @@ func (r *capRunner) call(t *testing.T, name string, args ...interface{}) interfa
 }
 
 // ---------------------------------------------------------------------------
-// Oracles (plans/SETS.md §9.6).
+// Oracles.
 
 // oracleAnchored returns the ids of the patterns matching the WHOLE input.
 //
 // `dropped` names the patterns the compiler EXCLUDED from the set (nil when
 // there are none). They are skipped by all three oracles for the same reason:
 // a set that does not contain a pattern reports none of its matches, so
-// expecting any is expecting the engine to break its own contract
-// (plans/FUZZER_BUGS.md 57).
+// expecting any is expecting the engine to break its own contract.
 func oracleAnchored(pats []string, input string, dropped map[int]bool) []int {
 	var out []int
 	for k, p := range pats {
@@ -199,8 +198,8 @@ func normalizeForOracle(pat string) string {
 //
 // That is what made a single fuzz call exceed the 10s deadline Go's worker
 // arms per call (internal/fuzz.RunFuzzWorker → `panic("deadlocked!")`, whose
-// own comment notes the message is never printed) — see plans/FUZZER_BUGS.md
-// bug 49. Memoising is exact: the probe for a given (pat, p) is a pure
+// own comment notes the message is never printed). Memoising is exact:
+// the probe for a given (pat, p) is a pure
 // function of those two values.
 //
 // Bounded by clearing wholesale: patterns change every fuzz iteration, so an
@@ -385,7 +384,7 @@ func anchoredExtent(pat, input string, p int) int {
 	// character the one probeFor caches, and this is called once per position
 	// per pattern per capability, so an uncached compile made the harness's
 	// cost scale with PATTERN LENGTH x positions — the term that pushed large
-	// patterns past the fuzz worker's 10s deadline (plans/FUZZER_BUGS.md 56).
+	// patterns past the fuzz worker's 10s deadline.
 	m := probeFor(pat, p).FindStringIndex(input)
 	if m == nil {
 		return -1
@@ -589,8 +588,8 @@ func FuzzSetCaps(f *testing.F) {
 }
 
 // TestSetWideAllBitmap exercises the >64-pattern form of match_all/scan_all,
-// which switches from an i64 bitmask return to a caller-provided bitmap
-// (plans/SETS.md §3.13). The bit-per-pattern packing is easy to get wrong at
+// which switches from an i64 bitmask return to a caller-provided bitmap.
+// The bit-per-pattern packing is easy to get wrong at
 // exactly one place — bit 7 of a byte is 0x80, which is not a valid bare
 // i32.const operand — so this checks ids on both sides of every byte boundary.
 func TestSetWideAllBitmap(t *testing.T) {

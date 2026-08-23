@@ -29,8 +29,8 @@ func rustStub(cfg config.BuildConfig, out string) error {
 	return writeStub(out, []byte(combined))
 }
 
-// genRustSetInner generates Rust wrappers for all sets in cfg
-// (plans/SETS.md §4.3). Returns unindented content for placement INSIDE
+// genRustSetInner generates Rust wrappers for all sets in cfg.
+// Returns unindented content for placement INSIDE
 // pub mod <importModule>.
 //
 // D15: `find` is iterator-only and yields individual SetMatch values; the

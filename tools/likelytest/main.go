@@ -1,6 +1,6 @@
 // likelytest is a focused benchmark harness that compares regexped's WASM output
 // across the three LikelyMode compile modes (neutral, likely-match, likely-nomatch)
-// for a hand-picked set of patterns where the LIKELY.md structural optimisations
+// for a hand-picked set of patterns where the the LikelyMode design structural optimisations
 // (SIMD counted-chain verify, SIMD dominant-self-loop skip) are expected to
 // move the needle.
 //
@@ -19,7 +19,7 @@
 // a mismatch prints CORRECTNESS FAIL to stderr and the run exits non-zero.
 //
 // Note: LikelyMode is a stub today — all three modes produce identical WASM. The
-// columns will only diverge once the LIKELY.md optimisations land in compile/.
+// columns will only diverge once the the LikelyMode design optimisations land in compile/.
 // Run via `make run` from this directory.
 package main
 
@@ -87,8 +87,8 @@ type testCase struct {
 	// (advance past each match, repeat until EOF or no match — see
 	// runFindExhaust/runGroupsExhaust) instead of measuring one call. A
 	// single find()/groups() call only scans to the FIRST match — bytes
-	// after it are never touched — so "match-dense" inputs (LM_TODO.md
-	// LM-0) are meaningless under single-call measurement; this flag is
+	// after it are never touched — so "match-dense" inputs are meaningless
+	// under single-call measurement; this flag is
 	// what makes them actually exercise the whole buffer. modeSet cases
 	// always exhaust via the set `find` regardless of this flag.
 	exhaustive bool
@@ -148,7 +148,7 @@ var tests = []testCase{
 		nomatchInput: impossibleRunInput(false),
 	},
 	{
-		// Suggestion 3 target (RESOLVED — see plans/TODO.md task 23,
+		// Suggestion 3 target (RESOLVED —
 		// retracted 2026-07-08): lit-anchored find with a dominant
 		// self-loop body. Lit-anchor (`findLitAnchorPoint`) requires a 2+
 		// byte literal CHILD with a non-empty prefix whose reverse DFA's
@@ -162,7 +162,7 @@ var tests = []testCase{
 		// not because the optimisation is missing. The genuinely open gap
 		// on this pattern is the no-match side: verifying the `[0-9]{4}`
 		// prefix after an `INFO:` literal hit still walks backward one byte
-		// at a time with no SIMD (plans/TODO.md task 22).
+		// at a time with no SIMD.
 		name:         "lit-anchor-dominant-body",
 		pattern:      `[0-9]{4}INFO:[^\n]+`,
 		mode:         modeFind,
@@ -343,7 +343,7 @@ var tests = []testCase{
 		nomatchInput: "," + strings.Repeat("aB3_", 2560),
 	},
 
-	// ── LM-0: match-dense cases (plans/LM_TODO.md) ──────────────────────
+	// ── LM-0: match-dense cases ──────────────────────
 	// All prior cases above bury a single match in 10-50 KB — scan-to-first-
 	// match dominates total fuel, so any per-hit/per-run optimisation is
 	// diluted to ~0% in the matrix. These cases exhaust the whole buffer
@@ -1189,7 +1189,7 @@ type cell struct {
 	// identical is true when this mode's compiled wasm is byte-identical to
 	// neutral's — the compiler emitted the same code regardless of the
 	// LikelyMode hint, so any wall-time difference between them can only be
-	// measurement noise (see TODO.md task 25 investigation: identical wasm
+	// measurement noise (see an earlier task investigation: identical wasm
 	// still showed swings up to +137% run to run on sub-microsecond cases).
 	// Benchmarking is skipped entirely for these; printMatrix shows a single
 	// "identical WASM" message instead of numbers.
@@ -1401,7 +1401,7 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 }
 
 // findExhaustIterTime is the timing-sample count for exhaustive find/groups
-// measurement (LM_TODO.md LM-0). Lower than setIterTime (1000): a dense
+// measurement. Lower than setIterTime (1000): a dense
 // find/groups pass can visit far more matches per pass than the set cases
 // do (e.g. dense-words-grouped's ~8k words), so fewer reps keeps wall-clock
 // reasonable while still giving a stable p50.
@@ -1612,7 +1612,7 @@ func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string
 // correctness bug can hide in exactly this corpus's blind spot: a "good"
 // fuel/time number looks identical whether the compiled WASM took a
 // legitimately cheaper path or is silently returning the wrong answer
-// (FUZZER_BUGS.md #25's gap-e-groups case is exactly this — a false
+// (a past defect’s gap-e-groups case is exactly this — a false
 // negative that went unnoticed here because nothing checked the return
 // value, only its cost). So every (pattern, mode, input) combination that
 // gets a fuel/time number here also gets checked against Go's regexp
@@ -1836,7 +1836,7 @@ func checkFindExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, r
 // composition documented at compile.go's "Capture path" comment performs an
 // internal find (not a strict anchored-at-ptr check) for any shape that
 // doesn't hit the native lit-chain fast path — confirmed empirically for
-// FUZZER_BUGS.md #25's gap-e-groups repro, where a ptr=0 call over a 10KB
+// a past defect’s gap-e-groups repro, where a ptr=0 call over a 10KB
 // buffer found a match starting mid-buffer. Mirrors tools/re2test's col5
 // check: plain FindStringSubmatchIndex, no anchoring requirement.
 func expectedGroups(re *regexp.Regexp, input string) []int {
@@ -2121,7 +2121,7 @@ func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan,
 }
 
 // runSetExhaust drives the set `find` export to exhaustion, the way a
-// generated iterator does (plans/SETS.md §4.8): zero the gate array, then call
+// generated iterator does: zero the gate array, then call
 //
 //	find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> total at that position
 //
@@ -2217,7 +2217,7 @@ func printMatrix(tc testCase, rows [3]cell, rowsNo [3]cell) {
 
 	for i := 0; i < 3; i++ {
 		if rows[i].identical {
-			// TODO.md task 25 investigation: identical wasm still showed
+			// an earlier task investigation: identical wasm still showed
 			// wall-time swings up to +137% run to run on sub-microsecond
 			// cases — comparing timings across byte-identical code is pure
 			// noise, so skip the run entirely rather than report it.
@@ -2308,7 +2308,7 @@ func main() {
 			if i == 0 {
 				neutralWasm = wasm
 			}
-			// Identical-WASM gate (TODO.md task 25 investigation): if this
+			// Identical-WASM gate: if this
 			// mode compiled to byte-identical wasm to neutral, the compiler
 			// ignored the LikelyMode hint for this pattern entirely — any
 			// wall-time delta we'd measure is guaranteed noise, not signal.

@@ -10,7 +10,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// Merged-mode (embedded) execution coverage — plans/SETS.md §11 R2 and
+// Merged-mode (embedded) execution coverage —
 // R-TESTS(2).
 //
 // Every other harness in this repo runs STANDALONE modules, where the module
@@ -155,7 +155,7 @@ func TestSetMergedModeAssertions(t *testing.T) {
 			if gotEmb != want {
 				t.Errorf("embedded scan = %v, Go says %v "+
 					"(embedded reads input from memory 0 and tables from memory 1; "+
-					"see plans/SETS.md §11 R2)", gotEmb, want)
+					"the input memory is memory 0, the tables memory 1)", gotEmb, want)
 			}
 			if gotSA != gotEmb {
 				t.Errorf("standalone and embedded disagree: %v vs %v", gotSA, gotEmb)
@@ -227,7 +227,7 @@ func le32(b []byte) int32 {
 // TestSetMergedModeFind covers the tuple-writing suffix body in embedded mode.
 // TestSetMergedModeAssertions drives `scan`, which goes through the cheap
 // bitmask probes — a different emitter with its own copy of the zero-width
-// machinery, so both need a merged-mode row (plans/SETS.md §11 R2/R12).
+// machinery, so both need a merged-mode row.
 func TestSetMergedModeFind(t *testing.T) {
 	cases := []struct{ pat, input string }{
 		{`\bfoo\b`, "foo xfoo foo"},
@@ -249,7 +249,7 @@ func TestSetMergedModeFind(t *testing.T) {
 			got := runFindEmbedded(t, emb, c.input)
 			if fmt.Sprint(got) != fmt.Sprint(want) {
 				t.Errorf("embedded find = %v, Go FindAllIndex = %v "+
-					"(see plans/SETS.md §11 R2)", got, want)
+					"(the input memory is memory 0, the tables memory 1)", got, want)
 			}
 		})
 	}

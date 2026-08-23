@@ -28,7 +28,7 @@ type dfa struct {
 	midAcceptingW  map[int]uint64
 	// midAcceptingNL[s]: state s accepts BEFORE consuming the next byte when prev was '\n' (for (?m:^)).
 	midAcceptingNL map[int]uint64
-	// midAcceptingNWDominant/W/NL[s] (FUZZER_BUGS.md #2): subset of
+	// midAcceptingNWDominant/W/NL[s]: subset of
 	// midAcceptingNW/W/NL where Match additionally dominates every other live
 	// thread in the closure (the isImmediateAccepting condition, evaluated
 	// once the boundary's ctx is known) — i.e. it's safe to stop scanning
@@ -38,7 +38,7 @@ type dfa struct {
 	midAcceptingNWDominant map[int]uint64
 	midAcceptingWDominant  map[int]uint64
 	midAcceptingNLDominant map[int]uint64
-	// midAcceptingNWOutranked/W/NL[s] (FUZZER_BUGS.md #15): subset of
+	// midAcceptingNWOutranked/W/NL[s]: subset of
 	// midAcceptingNW/W/NL where the boundary assertion resolves to a Match at
 	// STRICTLY HIGHER priority than whatever the state's own ctx=0 midAccept
 	// would resolve to (see boundaryOutranksCtx0), while NOT being dominant.
@@ -63,7 +63,7 @@ type dfa struct {
 	midAcceptingWOutranked  map[int]uint64
 	midAcceptingNLOutranked map[int]uint64
 	startBeginAccept        bool // true if start state accepts with ecBegin only (e.g. a*^)
-	// hasAmbiguousBoundaryTarget (FUZZER_BUGS.md #21): true if resolving some
+	// hasAmbiguousBoundaryTarget: true if resolving some
 	// \b/\B/(?m:$) assertion during ordinary transition construction would
 	// need to promote an already-present, lower-priority element of that
 	// work item's NFA set to a higher-priority position — see
@@ -109,7 +109,7 @@ func (d *dfa) Type() EngineType {
 // definitively dead — indistinguishable here from a branch that really
 // cannot ever succeed. Reporting immediate-accept in that case would let a
 // lower-priority empty branch win by default before the \b/\B branch gets a
-// chance to be resolved against the real byte (FUZZER_BUGS.md #24, e.g.
+// chance to be resolved against the real byte (e.g.
 // `\b0|` vs "0": \b0 is still alive, but the pruned closure only shows the
 // empty branch's Match). So an unresolved \b/\B assertion found ahead of
 // Match must block immediate-accept, the same as a live byte-consumer would.
@@ -130,7 +130,7 @@ func isImmediateAccepting(states []uint32, prog *syntax.Prog) bool {
 	return false
 }
 
-// isDominantAccept (FUZZER_BUGS.md #2) reports whether Match dominates every
+// isDominantAccept reports whether Match dominates every
 // other live thread in the epsilon closure of `states` under `ctx` — i.e.
 // whether, once ctx resolves the specific \b/\B/(?m:$) assertion being
 // tested, this is the leftmost-first winner and it's safe to stop scanning.
@@ -210,7 +210,7 @@ func isDominantAccept(prog *syntax.Prog, states []uint32, ctx int) bool {
 	return false
 }
 
-// boundaryOutranksCtx0 (FUZZER_BUGS.md #15, #18) reports whether, in the
+// boundaryOutranksCtx0 reports whether, in the
 // priority-ordered epsilon closure of `states`, some \b/\B/(?m:$) assertion
 // that resolves under `boundaryCtx` but would NOT resolve under the state's
 // own baseline `baseCtx` is reached before the Match that baseCtx's own
@@ -231,7 +231,7 @@ func isDominantAccept(prog *syntax.Prog, states []uint32, ctx int) bool {
 // whatever context that state's own plain midAccept bit (dfa.midAccepting)
 // is computed under, and it must be included in `boundaryCtx` too (callers
 // already do this — see e.g. state 0's `ecBegin|ecNoWordBoundary`). Passing
-// a bare 0 here regardless of the state's true baseline was FUZZER_BUGS.md
+// a bare 0 here regardless of the state's true baseline was a real defect
 // #18's cause (1): for `(?:a*)+^`, walking state 0's closure hits the `^`
 // node itself (not any \b/\B) — under boundaryCtx=ecBegin|ecNoWordBoundary
 // it resolves (ecBegin present), under a bare ctx=0 comparison it doesn't
@@ -479,7 +479,7 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 	return out
 }
 
-// nfaBoundaryTargetIsAmbiguous (FUZZER_BUGS.md #21) reports whether, for some
+// nfaBoundaryTargetIsAmbiguous reports whether, for some
 // assertion in closedSet that is NEWLY resolved by wbCtx (i.e. it does NOT
 // already fire under baseCtx, the context closedSet was itself originally
 // closed under — see boundaryOutranksCtx0's doc comment for why this
@@ -498,7 +498,7 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 // `(?m:^(\d{4}...) .*(ERROR|WARNING|FATAL): (.+)$)` (perftest's
 // log-capture) — state 0's BeginLine assertion resolves via baseCtx=ecBegin
 // alone, same as boundaryOutranksCtx0's own `^` false-positive history
-// (FUZZER_BUGS.md #18) — and rerouted it to Backtracking, regressing its
+// — and rerouted it to Backtracking, regressing its
 // "no matches" case by ~48x, the exact number and pattern
 // markOutranked's own doc comment already warns about for this reason.
 //
@@ -510,7 +510,7 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 // priority — silently discarding the boundary assertion's higher-priority
 // claim on it. That's harmless when the target is InstMatch and the state's
 // dedicated mid-accept "Dominant"/"Outranked" bits (isDominantAccept,
-// boundaryOutranksCtx0 — FUZZER_BUGS.md #2, #15) already capture the
+// boundaryOutranksCtx0) already capture the
 // priority via their own from-scratch traversal. It is NOT harmless when the
 // target instead needs one more mandatory byte before Match (e.g.
 // ` (\b|0*)0`, where \b's resolution and 0*'s own zero-repetition exit both
@@ -527,7 +527,7 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 // detector instead identifies the narrow set of patterns where the defect is
 // live, so dfaHasAmbiguousBoundaryTarget can route them to Backtracking,
 // which resolves priority via genuine backtracking and has no equivalent
-// defect — the same precedent FUZZER_BUGS.md #15's dfaHasOutrankedState
+// defect — the same precedent dfaHasOutrankedState
 // already established for a sibling blind spot.
 func nfaBoundaryTargetIsAmbiguous(prog *syntax.Prog, closedSet []uint32, baseCtx, wbCtx int, leftmostFirst bool) bool {
 	origIndex := make(map[uint32]int, len(closedSet))
@@ -907,7 +907,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		// `midStartNewline`; 0 for every other item, which has no such context to
 		// inherit). It must be OR'd into every expandWithWB call made against
 		// this item's nfaSet below, mirroring what the mid-accept computations
-		// above already do for these same two bootstrap items (FUZZER_BUGS.md
+		// above already do for these same two bootstrap items
 		// #12) — otherwise a pending \b/\B node resolved by expandWithWB can gate
 		// a nested ^/(?m:^) node whose begin-context was only ever recorded on
 		// the item's initial closure, not carried into its transition expansion.
@@ -940,11 +940,11 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		return nfaExpandWithWB(prog, closedSet, wbCtx, leftmostFirst)
 	}
 
-	// beginContextMatters (FUZZER_BUGS.md #16) reports whether further
+	// beginContextMatters reports whether further
 	// epsilon/word-boundary expansion of this raw NFA set would resolve
 	// differently depending on whether ecBegin is present in the context.
 	// A pending \b/\B node can block a following ^/\A from resolving during
-	// the initial epsilonClosure call (same mechanism as FUZZER_BUGS.md #1),
+	// the initial epsilonClosure call (the same mechanism as the bootstrap defect),
 	// so startSet (closed under ecBegin) and midStartSet (closed under 0)
 	// can end up byte-identical — both stuck at the same pending node — even
 	// though the two states are entitled to different beginCtx values at
@@ -990,7 +990,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		return bits
 	}
 
-	// isDominantMidAccept (FUZZER_BUGS.md #2): see isDominantAccept's doc for
+	// isDominantMidAccept: see isDominantAccept's doc for
 	// why this can't reuse isImmediateAccepting(epsilonClosure(states, ctx)) —
 	// that would misclassify the very \b/\B node ctx resolves as a blocker.
 	isDominantMidAccept := func(states []uint32, ctx int) bool {
@@ -1010,7 +1010,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// markOutranked records, alongside an existing markDominant call with the
 	// SAME (states, ctx) pair, whether this channel's mid-accept hit resolves
 	// to a strictly higher-priority Match than the state's own ctx=0
-	// midAccept bit could ever produce (FUZZER_BUGS.md #15, boundaryOutranksCtx0).
+	// midAccept bit could ever produce.
 	//
 	// Gated on dfa.midAccepting[state] != 0 (already populated for this exact
 	// state by the orAccept(dfa.midAccepting, state, ...) call every one of
@@ -1119,8 +1119,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// Pre-transition accept for start state (prevWasWord=false):
 	// ecBegin is unconditionally true at state 0 (true start of text), so it must be
 	// OR'd into every context below — a pending \b/\B node from the initial closure
-	// (line 517) can gate a nested ^/\A check that would otherwise never resolve
-	// (FUZZER_BUGS.md #1: \B^, \B\A).
+	// (line 517) can gate a nested ^/\A check that would otherwise never resolve.
 	// midAcceptNW: before non-word byte → \B fires (prev=non-word, next=non-word)
 	orAccept(dfa.midAcceptingNW, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary))
 	markDominant(dfa.midAcceptingNWDominant, 0, startSet, ecBegin|ecNoWordBoundary)
@@ -1158,12 +1157,12 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// already-registered id (e.g. the bootstrap start state) is only safe to
 	// reuse when that id's recorded accept value already agrees — otherwise
 	// the closure blocked at the same anchor node under both contexts (see
-	// FUZZER_BUGS.md §6/§7) and reusing the id would silently inherit the
+	// and reusing the id would silently inherit the
 	// wrong (begin-inclusive) accept value. Recompute and compare rather
 	// than trusting the key alone.
 	// The accept-bits check alone is blind to the case where the pending
 	// anchor gates a live byte-consuming transition instead of Match/EOF —
-	// beginContextMatters closes that gap (FUZZER_BUGS.md #16).
+	// beginContextMatters closes that gap.
 	midStartRightfulAccept := acceptBitsFor(midStartSet, ecEnd|ecNoWordBoundary)
 	if id, exists := stateMap[midStartKey]; exists && dfa.accepting[id] == midStartRightfulAccept && !beginContextMatters(midStartSet) {
 		dfa.midStart = id
@@ -1208,7 +1207,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	// Mid-string start state (prev=word): used when attempt_start > 0 and prev byte was a word char.
 	// Same NFA set as midStart but different prevWasWord context → different DFA state.
 	midStartWordKey := setToKey(midStartSet, true, nfaAcceptBits(midStartSet))
-	// Same collision guard as midStart above (FUZZER_BUGS.md §6/§7): don't
+	// Same collision guard as midStart above: don't
 	// trust a raw key match unless the found id's recorded accept value
 	// already agrees with what midStartWord is rightfully entitled to.
 	midStartWordRightfulAccept := acceptBitsFor(midStartSet, ecEnd|ecWordBoundary)
@@ -1257,12 +1256,11 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	if dfa.hasNewlineBoundary {
 		midStartNewlineSet := epsilonClosure([]uint32{uint32(prog.Start)}, ecBeginLine)
 		midStartNewlineKey := setToKey(midStartNewlineSet, false, nfaAcceptBits(midStartNewlineSet), true) // prevWasWord=false, prevWasNewline=true
-		// Same collision guard as midStart above (FUZZER_BUGS.md §6/§7).
+		// Same collision guard as midStart above.
 		// ecBeginLine is unconditionally true for this bootstrap state (it's the
 		// "restart after a \n" context), so it must be OR'd into every context
 		// below — a pending ^-flavored node from the initial closure (line 963)
-		// can gate a nested $ check that would otherwise never resolve
-		// (FUZZER_BUGS.md #17: mirrors bug 1's ecBegin fix for state 0).
+		// can gate a nested $ check that would otherwise never resolve.
 		midStartNewlineRightfulAccept := acceptBitsFor(midStartNewlineSet, ecBeginLine|ecEnd|ecNoWordBoundary)
 		if id, exists := stateMap[midStartNewlineKey]; exists && dfa.accepting[id] == midStartNewlineRightfulAccept {
 			dfa.midStartNewline = id
@@ -1306,7 +1304,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		// zero-value default. Without this, downstream state-remap passes
 		// (bfsRelabelDFA/applyStateRemap/minimizeDFA) have no valid raw id to
 		// remap, and buildLitAnchorFindBody's unconditional read of
-		// wasmMidStartNewline picks up a stale, colliding id (FUZZER_BUGS.md #25).
+		// wasmMidStartNewline picks up a stale, colliding id.
 		dfa.midStartNewline = dfa.midStart
 	}
 
@@ -1354,11 +1352,11 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		// them is a compile-time saving only: emitted WASM is unchanged.
 		// dfa.hasWordBoundary is the right predicate — it is set by a scan over
 		// every prog.Inst above, reachable or not, so `false` means the
-		// instruction is absent from the whole program. See plans/OPUS.md §N9.
+		// instruction is absent from the whole program.
 		expandedForNonWordChar := expandedForWordChar
 		if dfa.hasWordBoundary {
 			expandedForNonWordChar = expandWithWB(item.nfaSet, nonWordCharWBCtx)
-			// FUZZER_BUGS.md #21: see nfaBoundaryTargetIsAmbiguous's doc comment.
+			// See nfaBoundaryTargetIsAmbiguous's doc comment.
 			// Checked once per work item (cheap relative to the closures just
 			// computed above) and short-circuited once found, since only the
 			// pattern-wide yes/no answer is needed to route to Backtracking.
@@ -1421,7 +1419,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				// so ecBeginLine holds permanently for it — fold it into every
 				// accept-bitmask context below so a (?m:^) left unresolved at
 				// transition time (e.g. deferred behind a not-yet-resolvable
-				// (?m:$) in "$^" order) still fires. See FUZZER_BUGS.md #27.
+				// (?m:$) in "$^" order) still fires..
 				nlCtx = ecBeginLine
 			}
 			var eofWBCtx int
@@ -1438,7 +1436,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 			// have been computed under a different, begin-anchor-sensitive
 			// context — see the analogous, confirmed collision in the
 			// midStart/midStartWord/midStartNewline guards above and
-			// FUZZER_BUGS.md §6/§7). Don't trust the key match unless the
+			// Don't trust the key match unless the
 			// found id's recorded accept value already agrees.
 			if exists && dfa.accepting[nextDFAState] != rightfulAccept {
 				exists = false
@@ -1509,8 +1507,8 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 					dfaState:    nextDFAState,
 					nfaSet:      nextSet,
 					prevWasWord: nextPrevWasWord,
-					// Carry the '\n'-reached context into the queued item
-					// (FABLE.md B4). Bug #27's fix folds nlCtx into this
+					// Carry the '\n'-reached context into the queued item.
+					// Bug #27's fix folds nlCtx into this
 					// state's ACCEPT bitmasks above, but the item drives the
 					// state's TRANSITION build on the next queue iteration,
 					// where expandWithWB runs under item.beginCtx. Without
@@ -1647,13 +1645,13 @@ type dfaTable struct {
 	midAcceptWStates      map[int]uint64 // midAcceptW: accepts before word byte (WB triggered)
 	midAcceptNLStates     map[int]uint64 // midAcceptNL: accepts before '\n' byte ((?m:$) triggered)
 	immediateAcceptStates map[int]uint64 // leftmost-first: accept without scanning further
-	// midAcceptNWStatesDominant/W/NL (FUZZER_BUGS.md #2): subset of
+	// midAcceptNWStatesDominant/W/NL: subset of
 	// midAcceptNW/W/NLStates where Match dominates every other live thread —
 	// see dfa.midAcceptingNWDominant/W/NL for the full explanation.
 	midAcceptNWStatesDominant map[int]uint64
 	midAcceptWStatesDominant  map[int]uint64
 	midAcceptNLStatesDominant map[int]uint64
-	// midAcceptNWStatesOutranked/W/NL (FUZZER_BUGS.md #15): see
+	// midAcceptNWStatesOutranked/W/NL: see
 	// dfa.midAcceptingNWOutranked/W/NL for the full explanation.
 	midAcceptNWStatesOutranked map[int]uint64
 	midAcceptWStatesOutranked  map[int]uint64
@@ -1662,7 +1660,7 @@ type dfaTable struct {
 	startBeginAccept           bool  // true if startState accepts with ecBegin only (e.g. a*^)
 	hasWordBoundary            bool  // true if pattern contains \b or \B
 	hasNewlineBoundary         bool  // true if pattern contains (?m:^) or (?m:$)
-	// hasAmbiguousBoundaryTarget (FUZZER_BUGS.md #21): see dfa.hasAmbiguousBoundaryTarget.
+	// hasAmbiguousBoundaryTarget: see dfa.hasAmbiguousBoundaryTarget.
 	hasAmbiguousBoundaryTarget bool
 }
 
@@ -1862,7 +1860,7 @@ func applyStateRemap(t *dfaTable, oldToNew []int) {
 }
 
 // maxMinimizeDFAPasses bounds minimizeDFA's iterative partition-refinement
-// loop (FUZZER_BUGS.md #11). The loop is Moore-style, not Hopcroft's
+// loop. The loop is Moore-style, not Hopcroft's
 // algorithm despite this function's doc comment: it needs one full pass per
 // unit of "distinguishing depth", and a long near-linear-chain DFA (e.g. a
 // long literal or case-fold run — realistic secrets/URL-scanning patterns
@@ -1897,8 +1895,8 @@ func minimizeDFA(t *dfaTable) {
 	// Two states must be in different classes if they differ in any accept flag.
 	type sigKey struct {
 		a, ma, maw, manw, manl, imm uint64
-		mawDom, manwDom, manlDom    uint64 // FUZZER_BUGS.md #2: dominance is part of the signature too
-		mawOut, manwOut, manlOut    uint64 // FUZZER_BUGS.md #15: outranked is part of the signature too
+		mawDom, manwDom, manlDom    uint64 // dominance is part of the signature too
+		mawOut, manwOut, manlOut    uint64 // outranked is part of the signature too
 	}
 	sigToClass := make(map[sigKey]int, 8)
 	classOf := make([]int, n)
@@ -2217,7 +2215,7 @@ type dfaLayout struct {
 	midAcceptWBytes    []byte
 	midAcceptNLBytes   []byte
 
-	// lmBareShufti (LM_TODO.md LM-4) lifts detectShuftiSelfLoop's
+	// lmBareShufti lifts detectShuftiSelfLoop's
 	// len(l.prefix)==0 bail for bare (no literal-anchor) moderately-wide
 	// self-loop bodies, e.g. `[A-Z]{8,}`. Set from
 	// buildOpts.LikelyMode == LikelyMatch at the find/groups DFA layout
@@ -2225,7 +2223,7 @@ type dfaLayout struct {
 	// gate exists and why LikelyMatch is the right scope for lifting it.
 	lmBareShufti bool
 
-	// lmNonMidShufti (LM_TODO.md LM-3) enables detectShuftiSelfLoop's
+	// lmNonMidShufti enables detectShuftiSelfLoop's
 	// non-mid-accept detection branch — moderately-wide (9..64 byte)
 	// self-loop bodies that are NOT accept states themselves (a mandatory
 	// trailing literal/class follows, e.g. `KEY=[a-z0-9/+]+;`). Set from
@@ -2236,7 +2234,7 @@ type dfaLayout struct {
 	// detectShuftiSelfLoop's doc comment.
 	lmNonMidShufti bool
 
-	// lmWideShufti (LM_TODO.md LM-5) widens detectShuftiSelfLoop's self-loop
+	// lmWideShufti widens detectShuftiSelfLoop's self-loop
 	// class-width cap from 64 to 239 bytes. Set from
 	// buildOpts.LikelyMode == LikelyMatch at the match and find/groups DFA
 	// layout call sites — same scope as lmNonMidShufti. Sized with pattest
@@ -2282,13 +2280,11 @@ type dfaLayout struct {
 	//                     attempt_start==0). For begin-anchored patterns startState and
 	//                     midStartState are genuinely different automata, so walking the
 	//                     same prefix bytes can land in a different state (or die, giving
-	//                     WASM state 0). Equals wasmPrefixEnd when they don't diverge.
-	//                     See FUZZER_BUGS.md §23.
+	//                     WASM state 0). Equals wasmPrefixEnd when they don't diverge..
 	wasmPrefixEndNewline uint32 // state after walking the prefix from midStartNewlineState
 	//                     (prev byte == '\n'). Only populated when hasNewlineBoundary;
 	//                     otherwise == wasmPrefixEnd. Mirrors wasmPrefixEndWord's
-	//                     construction but for the (?m:^)/(?m:$) restart context —
-	//                     see FUZZER_BUGS.md §22.
+	//                     construction but for the (?m:^)/(?m:$) restart context —.
 	startBeginAccept bool
 
 	// tableEnd is the highest memory address used by any table in this layout.
@@ -2337,7 +2333,7 @@ type dfaLayout struct {
 	// intermediate attempts from k+1..p-1 would either die at or before p
 	// — so we can safely set attempt_start = p+1 instead of advancing by
 	// one. Collapses O(N²) find-mode worst case on near-miss greedy
-	// patterns to O(N). See plans/TODO.md task 8.
+	// patterns to O(N).
 	skipSafeOnDead bool
 
 	// eofSkipSafe (Task 8 follow-up #2 — min-length quantifier skip): true
@@ -2347,7 +2343,7 @@ type dfaLayout struct {
 	// instead of advancing attempt_start by one and retrying. Collapses the
 	// O(N²) worst case for counted-quantifier patterns like
 	// `[a-z]{50,}[0-9]` whose body class runs to EOF without ever
-	// containing the suffix. See plans/TODO.md task 8 follow-up #2.
+	// containing the suffix.
 	eofSkipSafe bool
 }
 
@@ -2358,8 +2354,8 @@ type dfaLayout struct {
 // len(exitBytes) == 1 the emitter uses the Phase 2 splat+eq fast path;
 // when 2..8 it uses a Shufti-style nibble-table lookup.
 //
-// The non-mid-accept extension (LNM.md Action 2, archived in
-// plans/non_mid_extension.go.archive) added an `isMidAccept bool` field
+// An earlier non-mid-accept extension, since removed, added an
+// `isMidAccept bool` field
 // to differentiate mid- from non-mid-accept dominants. With non-mid
 // emission archived, all entries are mid-accept and the flag is
 // unnecessary. Reinstatement must restore the field (Section 3 of the
@@ -2368,7 +2364,7 @@ type dfaLayout struct {
 type dominantInfo struct {
 	state     int32  // WASM state ID (> 0)
 	exitBytes []byte // 1..8 exit bytes (Shufti cap); mutually exclusive with selfLoopSet
-	// selfLoopSet (task 26, plans/TODO.md): 9..64 bytes — the self-loop
+	// selfLoopSet: 9..64 bytes — the self-loop
 	// membership set itself, for states recorded by detectShuftiSelfLoop
 	// rather than detectDominantSelfLoop. Used instead of exitBytes when
 	// the SELF-LOOP side is the small (≤64, Shufti-cap) side rather than
@@ -2377,7 +2373,7 @@ type dominantInfo struct {
 	// can never reach. emitDominantBulkSkip tests membership in this set
 	// directly and inverts the mask (stop at the first byte NOT a member)
 	// instead of testing membership in exitBytes directly. Mid-accept by
-	// default; LM_TODO.md LM-3 adds a LikelyMatch-gated non-mid-accept
+	// default; a LikelyMatch-gated extension adds a non-mid-accept
 	// channel (see detectShuftiSelfLoop).
 	selfLoopSet []byte
 	encodedByte byte // the value stored in midAcceptBytes[state] (mid) or nonMidDominantBytes[state] (non-mid)
@@ -2407,7 +2403,6 @@ func dfaTableBytes(t *dfaTable) int {
 // dfaLayoutParams are the inputs to buildDFALayout. Grouped into a struct so
 // call sites are keyed rather than a run of bare positional booleans, where
 // transposing two would compile cleanly and emit a subtly wrong module.
-// See plans/OPUS.md §N11.
 type dfaLayoutParams struct {
 	t                    *dfaTable
 	tableBase            int64
@@ -2646,7 +2641,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		// higher-priority live thread may still win, e.g. `0*` in `0*|\b`);
 		// 2 = dominant accept (record AND stop scanning immediately — this
 		// IS the leftmost-first winner, e.g. `\b` in `\b|0*`). See
-		// dfa.midAcceptingNWDominant/W and FUZZER_BUGS.md #2.
+		// dfa.midAcceptingNWDominant/W.
 		for gs, bits := range t.midAcceptNWStates {
 			if bits != 0 {
 				v := byte(1)
@@ -2715,7 +2710,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 				// e.g. `\b[-0]` wants '0' from midStartState but '-' only
 				// from midStartWordState. Miss this and the fast-skip never
 				// even looks at candidate bytes valid only under the word
-				// context (FUZZER_BUGS.md #26).
+				// context.
 				if t.hasWordBoundary && t.transitions[t.midStartWordState*256+b] >= 0 {
 					l.firstByteFlags[b] = 1
 				}
@@ -2743,7 +2738,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		// without consuming further bytes (any-position accept, or an
 		// EOF/anchor accept — either way, requiring a further live
 		// transition out of gs is unsound: the true match may be shorter
-		// than the tier being built). See FUZZER_BUGS.md #3.
+		// than the tier being built)..
 		stateCanAcceptHere := func(gs int) bool {
 			return t.midAcceptStates[gs] != 0 || t.acceptStates[gs] != 0
 		}
@@ -2776,7 +2771,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 				// second byte OK in one context, only '0' in the other", so
 				// both possibilities must be unioned into the filter, and an
 				// immediate accept from either context makes any second-byte
-				// requirement unsound (FUZZER_BUGS.md #36, sibling of #3/#26).
+				// requirement unsound.
 				stateAfterFBWord := -1
 				if t.hasWordBoundary {
 					stateAfterFBWord = t.transitions[t.midStartWordState*256+int(fb)]
@@ -2810,7 +2805,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 
 				// Try T2 tables (third byte). Same midStartState/
 				// midStartWordState union as T1 above, threaded one byte
-				// further (FUZZER_BUGS.md #36).
+				// further.
 				t2Lo := make([]byte, 16)
 				t2Hi := make([]byte, 16)
 				useThreeByte := true
@@ -2871,7 +2866,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 					l.teddyT2HiOff = l.teddyT2LoOff + 16
 
 					// Try T3 tables (fourth byte). Same union, threaded two
-					// bytes further (FUZZER_BUGS.md #36).
+					// bytes further.
 					t3Lo := make([]byte, 16)
 					t3Hi := make([]byte, 16)
 					useFourByte := true
@@ -2988,8 +2983,8 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		// Compute the equivalent end state when walking the prefix from the true
 		// start (attempt_start==0) rather than from midStartState. For patterns
 		// like `0*^0` (begin-anchor with a dead-end mid-string automaton), the two
-		// walks diverge even though both consume the same prefix bytes — see
-		// FUZZER_BUGS.md §23. Dies (→ WASM state 0) if startState has no live path
+		// walks diverge even though both consume the same prefix bytes.
+		// Dies (→ WASM state 0) if startState has no live path
 		// through the prefix.
 		prefixEndStart := t.startState
 		for _, ch := range l.prefix {
@@ -3001,7 +2996,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		l.wasmPrefixEndStart = uint32(prefixEndStart + 1)
 		// Compute the equivalent end state when prev byte was '\n' (the
 		// (?m:^)/(?m:$) restart context). Mirrors the wasmPrefixEndWord
-		// computation above — see FUZZER_BUGS.md §22: this was previously
+		// computation above: this was previously
 		// missing entirely, so a mandatory-literal prefix walked from
 		// midStartState was used even when the true restart context was
 		// midStartNewlineState, silently losing matches whose `(?m:^)`
@@ -3123,7 +3118,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 // The check is intentionally conservative: it's easier to add more patterns
 // to the skip-safe set later than to debug a wrong-answer regression.
 //
-// FUZZER_BUGS.md #41 — two things the original formulation got wrong for
+// Two things the original formulation got wrong for
 // word-boundary and multiline-anchor patterns, both fixed below:
 //
 //   - (d) asked "is this state mid-accept?" but could only answer via
@@ -3149,8 +3144,8 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 //     the attempt dies on its first byte having recorded nothing) or
 //     replicate midStart's own trajectory exactly.
 //
-// wasmStart IS in the entry set, for a reason distinct from the other two
-// (FABLE.md B1). The other entry states matter because a SKIPPED attempt
+// wasmStart IS in the entry set, for a reason distinct from the other two.
+// The other entry states matter because a SKIPPED attempt
 // could begin there. wasmStart matters because the ORIGINAL attempt can
 // begin there: when attempt_start == 0 the prologue selects it, and for a
 // `^`/`\A`-anchored alternation branch it carries transitions midStart does
@@ -3267,7 +3262,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 
 	// (d) Neither midStart nor succ is mid-accept on the path before any
 	// match has been recorded. The two are checked against DIFFERENT sets of
-	// channels, and the asymmetry is load-bearing (FUZZER_BUGS.md #41):
+	// channels, and the asymmetry is load-bearing:
 	//
 	//   - midStart is an ENTRY state. An intermediate attempt begins there at
 	//     position k, where the original attempt was sitting in succ instead.
@@ -3329,7 +3324,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		}
 	}
 
-	// (f) Alternative entry states (FUZZER_BUGS.md #41). For attempt_start
+	// (f) Alternative entry states. For attempt_start
 	// > 0 the outer-loop prologue picks midStartWord when the previous byte
 	// is a word char and midStartNewline when it is '\n', so an
 	// intermediate attempt need not begin at midStart at all. Each such
@@ -3381,7 +3376,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		//
 		// Off-class bytes must lead to DEAD here, not merely to
 		// "dead or mid-accept" as conditions (d)/(e) allow for
-		// midStart and succ (FABLE.md B3). That weaker test is sound
+		// midStart and succ. That weaker test is sound
 		// for those two only because of arguments that do not carry
 		// over: from midStart an off-class byte is dead by
 		// construction of C, and for succ a mid-accept exit is
@@ -3534,7 +3529,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 	// ORIGINAL attempt, though, need not walk that chain at all: when
 	// attempt_start == 0 the prologue starts in startState, which for a
 	// `^`/`\A`-anchored alternation branch carries transitions midStart does
-	// not have (FABLE.md B2). Such an attempt can ride the anchored branch
+	// not have. Such an attempt can ride the anchored branch
 	// to EOF without accepting, at which point this optimization branches
 	// straight to $no_match on the strength of a trajectory it never
 	// analysed. `^a[cd]*y|c+d` on "acccd" loses the 1-5 match entirely.
@@ -3734,7 +3729,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 
 		// The mid/non-mid split above reads ONLY the ctx=0 channel, but a
 		// state can also record a match through the newline channel — that
-		// is exactly what `(?m:$)` compiles to (FABLE.md B5). Such a state
+		// is exactly what `(?m:$)` compiles to. Such a state
 		// looks non-mid here, so it is classified as a NON-mid dominant
 		// whose self-loop set includes '\n', and emitDominantBulkSkip then
 		// advances past every '\n' in one SIMD stride without ever running
@@ -3745,7 +3740,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		// Fixing it at detection time keeps every emitter untouched: force
 		// '\n' to be an EXIT byte, so the skip always stops there and the
 		// resumed per-byte loop runs the newline pre-accept check at that
-		// position. This is FUZZER_BUGS.md #41's channel blind spot in a
+		// position. This is the channel blind spot in a
 		// different skipper (#41 is the inter-attempt advance; this is the
 		// intra-attempt SIMD skip).
 		//
@@ -3821,7 +3816,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 	l.dominantStates = out
 }
 
-// detectShuftiSelfLoop (task 26, plans/TODO.md) scans the WASM-space
+// detectShuftiSelfLoop scans the WASM-space
 // transition table for mid-accept states whose self-loop set is 9..64
 // bytes — below detectDominantSelfLoop's 240-byte/≤8-exit-byte gate (which
 // requires the EXIT set to be the small side), but within
@@ -3840,7 +3835,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 // audit identified as a motivating case — e.g. `ID:[a-zA-Z0-9]{10,}`'s
 // self-loop state — is mid-accept).
 //
-// LM_TODO.md LM-3 adds a non-mid-accept channel (delimited bodies whose
+// A LikelyMatch-gated extension adds a non-mid-accept channel (delimited bodies whose
 // loop state cannot accept until a mandatory trailing literal/class arrives,
 // e.g. `KEY=[a-z0-9/+]+;`), gated on l.lmNonMidShufti (set from
 // buildOpts.LikelyMode == LikelyMatch at the match/find DFA layout call
@@ -3859,7 +3854,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 // existing per-kind cap; non-mid channel capped at 2 (shared with
 // detectDominantSelfLoop, task 38's encoding constraint).
 //
-// Task 34 (plans/TODO.md): gated on len(l.prefix) > 0 — the same
+// Task 34: gated on len(l.prefix) > 0 — the same
 // computePrefix-derived signal buildFindBody already uses to decide between
 // the literal-chain Teddy scan and the broader firstByteFlags scan. A
 // non-empty l.prefix means this DFA is only entered (in the byte-by-byte
@@ -3873,7 +3868,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 // it replaces (measured: `shufti-upper-find-100kb`, bare `[A-Z]{8,}`, -49%
 // wall time vs main before this gate).
 //
-// LM_TODO.md LM-4: task 34's own investigation found the regression that
+// An earlier investigation found the regression that
 // motivated this gate was actually caused by patternMinLen (removed in
 // task 37), not by this detector — the gate itself "did not recover the
 // case at all". Under LikelyMatch (l.lmBareShufti), the bail is lifted:
@@ -3892,7 +3887,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 func detectShuftiSelfLoop(l *dfaLayout) {
 	const minWidth = 9
 	const maxWidth = 64
-	const maxWidthLM = 239 // LM_TODO.md LM-5, gated on l.lmWideShufti
+	const maxWidthLM = 239 // gated on l.lmWideShufti
 	const maxStates = 126
 	const maxNonMid = 2 // shared 254/255 encoding space with detectDominantSelfLoop
 
@@ -3969,7 +3964,7 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 			}
 		}
 		// Same boundary-channel blind spot as detectDominantSelfLoop, seen
-		// from the complement side (FABLE.md B5). `isMid` above reads only
+		// from the complement side. `isMid` above reads only
 		// the ctx=0 channel, so a state that records matches through the
 		// newline channel — what `(?m:$)` compiles to — reaches the non-mid
 		// branch with '\n' still inside its self-loop set, and the emitted
@@ -4025,7 +4020,7 @@ const minLMBareShuftiLen = 8
 
 // lmBareShuftiEligible reports whether pattern has a compile-time-guaranteed
 // minimum match length of at least minLMBareShuftiLen bytes — the
-// additional per-pattern check gating l.lmBareShufti (LM_TODO.md LM-4)
+// additional per-pattern check gating l.lmBareShufti
 // beyond LikelyMode alone. An unparseable pattern is conservatively
 // ineligible (this recomputes syntax.Parse; compilePattern's caller has
 // already validated the pattern earlier in the pipeline, so failure here
@@ -4076,7 +4071,7 @@ func applyDominantStateEncoding(l *dfaLayout, encodeNonMid bool) {
 // anchored-verify DFA, consumed by emitInlineAnchoredDFAVerify) read
 // l.midAcceptOff unconditionally regardless of dominant states, and need the
 // backing data segment emitted even though nothing else on this layout would
-// otherwise require it (FUZZER_BUGS.md #9).
+// otherwise require it.
 func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 	// DFA paths (useAcceptSideTable=false): no accept side table; acceptLimit
 	// partitions state IDs so the runtime check is `(state-1) u< acceptLimit`.
@@ -4177,7 +4172,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			// useAcceptSideTable (TDFA-built tables only) also needs midAccept
 			// unconditionally: buildTDFAMatchBody's dead-transition handler
 			// reads it to fall back to a shorter, already-valid match instead
-			// of failing outright (plans/FUZZER_BUGS.md §10.2).
+			// of failing outright.
 			emitMidAccept := len(l.dominantStates) > 0 || l.useAcceptSideTable || forceMidAccept
 			count := byte(2) // classMap + transitions
 			if emitMidAccept {
@@ -4256,7 +4251,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			// useAcceptSideTable (TDFA-built tables only) also needs midAccept
 			// unconditionally: buildTDFAMatchBody's dead-transition handler
 			// reads it to fall back to a shorter, already-valid match instead
-			// of failing outright (plans/FUZZER_BUGS.md §10.2).
+			// of failing outright.
 			emitMidAccept := len(l.dominantStates) > 0 || l.useAcceptSideTable || forceMidAccept
 			count := byte(1) // transitions
 			if emitMidAccept {
@@ -4320,7 +4315,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 // tableBase is the memory address at which this DFA's data will be placed.
 // tableMemIdx is 0 for standalone modules (single memory).
 // needFirstHitProbe asks genSuffixWASM for the second scan-probe variant that
-// stops at the first matching bit — see probeExit / plans/SETS.md §18.2.
+// stops at the first matching bit — see probeExit.
 // Threaded alongside needProbes rather than derived, because only CompileSet
 // knows which capabilities the set declares.
 func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, needProbes, gated bool, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
@@ -4359,7 +4354,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		return
 	}
 
-	// Task 5 (LIKELY.md opt 2 / Hyperscan "SoME"): a pure counted linear
+	// Task 5: a pure counted linear
 	// class chain doesn't need a DFA table walk at all — verify the whole
 	// suffix via SIMD in one shot. Scoped to single-pattern buckets for now
 	// (see isCountedClassChain's doc comment).
@@ -4396,7 +4391,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		forceWordChar:        t.hasWordBoundary,
 	})
 
-	// LIKELY.md Gap H.2: both mid-accept and non-mid-accept dominants are
+	// Both mid-accept and non-mid-accept dominants are
 	// always kept for the buildSetSuffixBody bulk-skip dispatch (default-on
 	// for every LikelyMode — task 7 step 1 precedent for mid-accept; task 27
 	// promoted non-mid-accept to the same default-on treatment, 2026-07-19,
@@ -4483,7 +4478,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		// Use wasmStart for lPos==0 (allows ^ anchors to fire), wasmMidStart
 		// otherwise — or wasmMidStartNewline when the byte before lPos is a
 		// '\n', so a (?m:^) in a set fires at every line start rather than
-		// only at position 0 (plans/FABLE.md B40/B43, plans/SETS.md §9.5 S2).
+		// only at position 0.
 		futureOff:           futureOff,
 		future:              futureWASM,
 		memberSkip:          memberWalkStates(t),
@@ -4516,33 +4511,32 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 
 // suffixArtifacts holds the bodies one bucket contributes. fnBody is the
 // tuple-writing suffix function `find` calls; scanProbe is the cheap
-// bitmask-only variant the scan trio uses (plans/SETS.md §5: nothing but
-// `find` needs per-pattern extents).
+// bitmask-only variant the scan trio uses: nothing but `find` needs
+// per-pattern extents.
 //
 // There is deliberately no anchored probe here. The anchored trio runs over a
 // SEPARATE packing built without leftmost-first pruning (§10.4(c)), so its
 // probes come from genAnchoredWASM over those buckets. This struct used to
-// carry one built from the find-path DFAs that nothing ever read
-// (plans/SETS.md §11 R11).
+// carry one built from the find-path DFAs that nothing ever read.
 type suffixArtifacts struct {
 	fnBody    []byte
 	scanProbe []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
 	// scanProbeAny is the same probe with a first-hit exit, for `scan` and
-	// `scan_any` (plans/SETS.md §18.2). Nil unless the set declares one of
+	// `scan_any`. Nil unless the set declares one of
 	// them; `scan_all` must keep using scanProbe.
 	scanProbeAny []byte
 }
 
 // setSuffixParams describes one bucket's suffix DFA for buildSetSuffixBody.
 type setSuffixParams struct {
-	// dominantSkip lists the states the ANCHORED probe may bulk-skip through
-	// (plans/SETS.md §18.3 / G7). Nil disables the skip entirely; it is purely
+	// dominantSkip lists the states the ANCHORED probe may bulk-skip through.
+	// Nil disables the skip entirely; it is purely
 	// a performance router and the emitted skip re-derives its own soundness
 	// from the self-loop property.
 	dominantSkip []dominantWalkState
 
 	// futureOff is the offset of the per-state "patterns that can still
-	// accept from here" table (plans/SETS.md §18.4 / G8). Zero disables the
+	// accept from here" table. Zero disables the
 	// liveness exit; it is only emitted for sets a union preflight has
 	// narrowed, since otherwise it costs per byte and never fires (§16.5.2).
 	futureOff int32
@@ -4554,7 +4548,7 @@ type setSuffixParams struct {
 	future []uint64
 
 	// memberSkip lists small-self-loop states for the suffix body's INVERTED
-	// bulk skip (plans/SETS.md §21.2 / G11). Deliberately separate from
+	// bulk skip. Deliberately separate from
 	// l.dominantStates, which is shared with the single-pattern emitters:
 	// threading the member flavour through that slice would change
 	// single-pattern output and break byteident (D6).
@@ -4577,7 +4571,7 @@ type setSuffixParams struct {
 	// empty-match filter. Set for the default (non-overlapping) `find` body.
 	gated bool
 
-	// hasSkip adds a trailing `skip` parameter (plans/SETS.md §19): tuples
+	// hasSkip adds a trailing `skip` parameter: tuples
 	// whose position-relative index is below it are COUNTED but not written.
 	// It is how the overlapping batch body resumes a position whose tuples did
 	// not all fit in the caller's buffer; the gated body resumes through the
@@ -4596,7 +4590,7 @@ type setSuffixParams struct {
 //
 // Do not reach for appendTableLoad8u here. That one targets tableMemIdx, which
 // is 1 in every embedded build, so using it for an input byte reads the DFA
-// tables instead of the caller's text. That was plans/SETS.md §11 R2: every
+// tables instead of the caller's text. That was a real defect: every
 // \b/\B/(?m:^)/(?m:$) set pattern silently gave wrong answers in exactly the
 // mode the Rust/Go/C/AS examples use, and the whole test surface missed it
 // because it runs standalone modules, where the two memories coincide.
@@ -4610,7 +4604,7 @@ func appendInputLoad8u(b []byte) []byte {
 // fallback bucket.
 //
 // Keying on the match start instead is wrong for split buckets, and is the
-// second mechanism behind plans/FABLE.md B40: a pattern like `foo\b` has its
+// second mechanism behind the \b-in-a-set defect: a pattern like `foo\b` has its
 // `\b` in the suffix, so the entry context has to be the byte before the
 // SUFFIX (`input[paramStart-1]`, the literal's last byte) rather than the byte
 // before the match. Begin anchors cannot appear in a split suffix —
@@ -4620,7 +4614,7 @@ func appendInputLoad8u(b []byte) []byte {
 //
 // The three prev-byte classes are checked in one nested chain rather than as
 // mutually exclusive cases. A first-match `switch` on hasWordChar /
-// hasNewlineBoundary was plans/SETS.md §11 R4: a bucket carrying BOTH kinds —
+// hasNewlineBoundary was a real defect: a bucket carrying BOTH kinds —
 // any bucket merging a \b pattern with a (?m:^) one — took the word-char arm
 // and could never reach midStartNewline, so `(?m:^)` failed at every mid-input
 // line start. '\n' is never a word character, so the classes really are
@@ -4684,7 +4678,7 @@ func emitSetEntryState(b []byte, p setSuffixParams, paramPtr, paramStart byte) [
 
 // emitSetTransition emits one DFA transition step for a set body, dispatching
 // on the table layout. Shared with buildSetProbeBody, which carried a second
-// copy of this dispatch (plans/SETS.md §11 R12).
+// copy of this dispatch.
 func emitSetTransition(b []byte, l *dfaLayout, lState, lByteClass, paramPtr, lScanPos byte, tableMemIdx int) []byte {
 	switch {
 	case l.useU8 && l.useCompression:
@@ -4704,8 +4698,8 @@ func emitSetTransition(b []byte, l *dfaLayout, lState, lByteClass, paramPtr, lSc
 // Signature: (ptr i32, start i32, len i32, lPos i32, out_ptr i32, out_cap i32, validMask i32) → i32
 //
 // validMask: bitmask of patterns whose prefix check passed. Only bits set here can produce output.
-// Writes (patternID, matchStart, matchEnd) tuples directly to the output buffer
-// (plans/SETS.md §3.18). out_ptr/out_cap describe the *remaining* buffer at
+// Writes (patternID, matchStart, matchEnd) tuples directly to the output buffer.
+// out_ptr/out_cap describe the *remaining* buffer at
 // this call — the caller offsets the pointer by the running total and passes
 // the signed remaining capacity, which may be negative once the buffer has
 // overflowed.
@@ -4834,7 +4828,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	// prefixMaxLen: max prefix length (0 = trivial, >0 = fixed, -1 = variable/unknown).
 	// matchStart = paramLPos - prefixMaxLen (for fixed-len prefix), else paramLPos.
 	//
-	// Tuple layout (plans/SETS.md §3.18 / D4): (pattern_id, start, end) — the
+	// Tuple layout: (pattern_id, start, end) — the
 	// third field is the absolute end, not a length. endPos_k already *is* the
 	// absolute end, so this deletes the subtract (and, on the fixed-prefix
 	// path, the prefixMaxLen re-add) the length convention needed.
@@ -4984,7 +4978,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 
 	b = append(b, 0x20, lScanPos, 0x20, paramLen, 0x4F, 0x0D, 0x01) // pos>=len: br $done
 
-	// G9 liveness exit (plans/SETS.md §18.5): stop when no pattern this call
+	// G9 liveness exit: stop when no pattern this call
 	// still WANTS can accept from here.
 	//
 	// `find` records extents rather than a bitmask, so unlike the probe there
@@ -5033,7 +5027,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		b = append(b, 0x0B)
 	}
 
-	// LIKELY.md Gap H.2: dominant-state SIMD bulk-skip dispatch.
+	// Dominant-state SIMD bulk-skip dispatch.
 	// Mirrors emitPhase4Dispatch's mid-accept channel but operates on
 	// per-pattern endPos. The encoded byte in midAcceptBytes[state] is
 	// 2+idx for dominant states (0/1 for non-dominant); we dispatch via
@@ -5045,7 +5039,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	// matching the per-byte update the elided iterations would have done.
 	// lBitsScratch is preserved across emitDominantBulkSkip (it only
 	// clobbers lByteClass/lBulkChunk), so we re-read it for the update.
-	// G10 (plans/SETS.md §21.1): liveness guard on the bulk-skip.
+	// G10: liveness guard on the bulk-skip.
 	//
 	// The G9 exit at the loop top is DEFEATED by the skip below it: on a
 	// corpus with no exception byte the skip runs to end of input inside the
@@ -5142,7 +5136,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		}
 	}
 
-	// G11 (plans/SETS.md §21.2): the INVERTED bulk skip, for states whose
+	// G11: the INVERTED bulk skip, for states whose
 	// SELF-LOOP is the small side. Dispatched by state-ID compare, like the
 	// non-mid arm above, because these states are not in midAcceptBytes'
 	// encoded value space at all — they come from memberWalkStates, which is
@@ -5275,7 +5269,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	//
 	// This used to be guarded by `endPos_k == 0`, reading 0 as "no end
 	// recorded yet" so an earlier accept would not be clobbered. Both halves
-	// were wrong (FUZZER_BUGS.md bug 43):
+	// were wrong:
 	//
 	//   - 0 is a legitimate endPos, not a free sentinel — it is what the
 	//     start-state empty-accept writes at paramStart == 0. That collision
@@ -5374,8 +5368,7 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 //
 // The non-mid-accept-dispatch variant (which also returned the list of
 // call-site offsets for assembleModule-time patching of the helper
-// function index) was extracted to plans/non_mid_extension.go.archive
-// (Section 9). To reinstate, change the signature to
+// function index) was removed. To reinstate, change the signature to
 // `([]byte, []int)`, restore the `callSites` plumbing, and update both
 // callers.
 func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
@@ -5504,9 +5497,8 @@ func emitCompressedU8Transition(b []byte,
 	return b
 }
 
-// buildNonMidBulkSkipHelperBody was extracted to
-// plans/non_mid_extension.go.archive (Section 6) along with the rest of
-// the LNM non-mid-accept dispatch infrastructure.
+// buildNonMidBulkSkipHelperBody was removed along with the rest of the
+// LNM non-mid-accept dispatch infrastructure.
 
 // emitSimpleU8Transition emits the simple u8 DFA transition:
 //
@@ -6226,7 +6218,7 @@ func emitDeadHandler(b []byte,
 // and update last_accept from midAcceptW or midAcceptNW accordingly.
 // No-op when hasWordBoundary is false.
 //
-// FUZZER_BUGS.md #2: once last_accept is set here, the byte's word-class is
+// Once last_accept is set here, the byte's word-class is
 // already known. midAcceptW[state]/midAcceptNW[state] is 1 when Match is merely
 // reachable (record last_accept, but a higher-priority live thread — e.g. `0*`
 // in `0*|\b` — may still legitimately keep running past this position) or 2
@@ -6307,7 +6299,7 @@ func emitWBPreAcceptCheck(b []byte, wordCharTableOff, midAcceptWOff, midAcceptNW
 // emitNLPreAcceptCheck emits: if current byte == '\n', check midAcceptNL[state]
 // and update last_accept = pos. No-op when hasNewlineBoundary is false.
 //
-// FUZZER_BUGS.md #2: same defect and same dominance-gated fix as
+// Same defect and same dominance-gated fix as
 // emitWBPreAcceptCheck (see its comment) — midAcceptNL[state] is 1 for a
 // merely-reachable accept (record last_accept, keep scanning) or 2 for a
 // dominant accept (record AND br out to the enclosing block $found/$fwd_done,
@@ -6575,7 +6567,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 // require a completely different byte — or no byte at all — at the very
 // position where the literal prefix derived from midStartState alone would
 // wrongly be treated as mandatory, silently dropping matches that take that
-// branch (task 48, sibling of FUZZER_BUGS.md §23 — same "midStartState's
+// branch (sibling of the start-state defect — same "midStartState's
 // automaton isn't representative of attempt_start==0" family of bug, this
 // time in the prefix-existence check itself rather than in a post-prefix
 // resume state).
@@ -6592,7 +6584,7 @@ func computePrefix(t *dfaTable) []byte {
 	// word char, and vice versa). A single literal-byte fast-skip can't
 	// represent "look for '0' OR '-' depending on context", so deriving
 	// the prefix from midStartState alone silently drops every match
-	// reached via the other context (FUZZER_BUGS.md #26). Divergence can
+	// reached via the other context. Divergence can
 	// only appear at this first byte — once a byte is consumed, later
 	// transitions no longer depend on the external prevWasWord context,
 	// only on which (already-doubled) state it landed in — so checking
@@ -6607,7 +6599,7 @@ func computePrefix(t *dfaTable) []byte {
 	// all in that case — a retry landing on midStartWordState can complete
 	// the match with zero further bytes — so the same "already accepting"
 	// guard computePrefixWalk applies to its own start state must also be
-	// applied to midStartWordState here (FUZZER_BUGS.md #10).
+	// applied to midStartWordState here.
 	if t.hasWordBoundary {
 		if stateAcceptsAny(t, t.midStartWordState) {
 			return nil
@@ -6619,7 +6611,7 @@ func computePrefix(t *dfaTable) []byte {
 		// a different live byte at any position (checked before consuming
 		// each byte, generalizing the old first-byte-only check), or landing
 		// on an accepting state after fewer bytes than prefixMid requires
-		// (FUZZER_BUGS.md #24) — both mean midStartWordState's own shorter or
+		// — both mean midStartWordState's own shorter or
 		// differently-shaped requirement isn't representable by the single
 		// midStartState-derived literal the SIMD scan searches for.
 		state := t.midStartWordState
@@ -6706,7 +6698,7 @@ func computePrefixWalk(t *dfaTable, start int) (prefix []byte, ok bool) {
 	return prefix, true
 }
 
-// dfaHasOutrankedState (FUZZER_BUGS.md #15) reports whether t has any state
+// dfaHasOutrankedState reports whether t has any state
 // whose W/NW/NL mid-accept channel resolves to a genuinely higher-priority
 // Match than the state's own ctx=0 midAccept bit (boundaryOutranksCtx0),
 // while not being dominant. dominant[s]==0 is checked defensively — by
@@ -6735,7 +6727,7 @@ func dfaHasOutrankedState(t *dfaTable) bool {
 	return false
 }
 
-// dfaHasAmbiguousBoundaryTarget (FUZZER_BUGS.md #21) reports whether t was
+// dfaHasAmbiguousBoundaryTarget reports whether t was
 // built from a pattern where nfaBoundaryTargetIsAmbiguous fired during
 // construction — see dfa.hasAmbiguousBoundaryTarget and
 // nfaBoundaryTargetIsAmbiguous's doc comments for the full mechanism.
@@ -7520,7 +7512,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	//   otherwise                    → wasmMidStart
 	// For patterns without newline boundaries wasmMidStart == wasmMidStartNewline
 	// (dfa.midStartNewline aliases dfa.midStart at construction in that case,
-	// FUZZER_BUGS.md #25); the byte check is still emitted for correctness and
+	// the byte check is still emitted for correctness and
 	// future-proofing.
 	b = append(b, 0x20, locRevResult) // local.get rev_result
 	b = append(b, 0x45)               // i32.eqz
@@ -7963,7 +7955,7 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 // so the scan order (the order the shared frontend discovers candidate
 // positions in) and match-start order coincide. See findAltLitAnchorPoints'
 // doc comment for the counterexample this restriction avoids. A future
-// generalisation to unequal prefix lengths (TODO.md task 6 follow-up) would
+// generalisation to unequal prefix lengths would
 // need a bounded-lookahead/best-of-window loop here instead.
 //
 // Signature: (ptr i32, len i32) → i64. Returns -1 on no match.
@@ -8256,7 +8248,7 @@ func buildFindBody(p findBodyParams) []byte {
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
 	// `nonMidDominantOff` parameter and the `[]int` return slot) was
-	// extracted to plans/non_mid_extension.go.archive (Sections 7-9).
+	// removed along with that infrastructure.
 	var b []byte
 
 	// useMandatoryLit is true when we have a mandatory literal and no existing prefix scan.
@@ -8329,7 +8321,7 @@ func buildFindBody(p findBodyParams) []byte {
 	if len(dominantStates) > 0 && numV128ForScan == 0 {
 		numV128ForScan = 1 // Opt 1 bulk-skip needs its own `chunk` register
 	}
-	// needsDenseSwitch (TODO.md task 25): this pattern hits the exact
+	// needsDenseSwitch: this pattern hits the exact
 	// LikelyNoMatch-forced override task 25 targets (17..64-byte
 	// first-byte set, static heuristic would otherwise pick scalar) —
 	// always implies numV128ForScan==1 (the Shufti branch above fires
@@ -8337,7 +8329,7 @@ func buildFindBody(p findBodyParams) []byte {
 	needsDenseSwitch := lnmAction5 && len(firstBytes) > 16 && len(firstBytes) <= 64 && !shuftiBeatsScalar(firstBytes)
 	var denseCounterLocal, denseSkipFlagLocal byte
 
-	// needsBulkHyst (TODO.md task 38): any non-mid-accept dominant present
+	// needsBulkHyst: any non-mid-accept dominant present
 	// → the dispatch below wraps its bulk-skip in the runtime hysteresis,
 	// which needs 2 extra i32 locals (streak counter + pos scratch). The
 	// non-mid dispatch is skipped entirely under useMandatoryLit, so no
@@ -8503,7 +8495,7 @@ func buildFindBody(p findBodyParams) []byte {
 					// and the find loop to advance to the next candidate.
 					//
 					// Independently, for begin-anchored patterns (e.g. `0*^0`,
-					// FUZZER_BUGS.md §23) startState and midStartState can be
+					// startState and midStartState can be
 					// genuinely different automata, so walking the same prefix
 					// bytes from each can land in different states even though
 					// midStartState's dead-end chain has live transitions (i.e.
@@ -8518,7 +8510,7 @@ func buildFindBody(p findBodyParams) []byte {
 					// walk from midStartState assumes the preceding byte
 					// wasn't '\n'; select prefixEndStateNewline (computed from
 					// midStartNewlineState) when it was — this is the
-					// FUZZER_BUGS.md §22 fix: this branch previously had no
+					// A past fix: this branch previously had no
 					// newline-divergence check at all, so any pattern with a
 					// mandatory literal prefix of 2+ bytes silently lost every
 					// match whose `(?m:^)` depended on the byte immediately
@@ -9270,7 +9262,7 @@ func buildFindBody(p findBodyParams) []byte {
 }
 
 // ============================================================================
-// Lit-chain optimisation (LIKELY.md Opt 2 — counted linear chain)
+// Lit-chain optimisation
 //
 // Detects patterns of shape  <literal_prefix><charclass>{N,N}  and emits a
 // specialised match/find body that:
@@ -9345,7 +9337,7 @@ const (
 //   - N >= 1 (counted, not range)
 //   - K + N >= 16 (so the SIMD overlap-load tail covers all class bytes)
 //   - N >= minCount (LM-1: callers pass 24 under neutral/LikelyNoMatch, 1
-//     under LikelyMatch — see plans/LM_TODO.md LM-1)
+//     under LikelyMatch)
 func analyseLitChain(pattern string, minCount int) (*litChainPattern, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -9371,8 +9363,8 @@ func analyseLitChainRe(re *syntax.Regexp, minCount int) (*litChainPattern, bool)
 	// flips clearly positive by N=36 and grows with N. 24 is the empirical
 	// threshold. (Per-branch gate inside alternations applies separately in
 	// analyseLitChainAlt.) LM-1: under LikelyMatch, the wall-time-only
-	// regression that justified 24 is suspected to be placement noise (see
-	// plans/LM_TODO.md LM-1) rather than a fuel cost, so callers pass a lower
+	// regression that justified 24 is suspected to be placement noise
+	// rather than a fuel cost, so callers pass a lower
 	// minCount to trade a possible sparse-input wall-time cost for a large
 	// dense-input fuel win.
 	if info.count < minCount {
@@ -9421,8 +9413,7 @@ type litChainAltPattern struct {
 // same; callers requesting the anchored path use this analyser for both.
 //
 // Gate: N ≥ minCount (same scan-loop register-pressure concern as {N,N};
-// callers pass 24 under neutral/LikelyNoMatch, 1 under LikelyMatch — LM-1,
-// see plans/LM_TODO.md).
+// callers pass 24 under neutral/LikelyNoMatch, 1 under LikelyMatch).
 func analyseLitChainRange(pattern string, minCount int) (*litChainPattern, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -11916,9 +11907,9 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 		locAttemptZero byte = 10
 		// locScalarByte is a same-iteration byte-value scratch for
 		// emitScalarBitmapVerify. It must NOT alias locScalarIdx, which
-		// must survive as the live loop counter across iterations — see
-		// plans/FUZZER_BUGS.md bug 38 (recurrence of bug 30's aliasing
-		// defect in this sibling anchored-match body).
+		// must survive as the live loop counter across iterations.
+		// Aliasing it onto the byte scratch was a real defect here, and
+		// again in the sibling anchored-match body.
 		locScalarByte byte = 11
 	)
 
@@ -12976,7 +12967,7 @@ func appendLitChainFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx in
 }
 
 // ============================================================================
-// Lit-chain alternation (Phase 2 of LIKELY.md Opt 2).
+// Lit-chain alternation.
 //
 // Recognises OpAlternate of strict <literal><class>{N,N} branches; each branch
 // independently uses SIMD class verify (when N≥24) or scalar bitmap verify
@@ -13605,7 +13596,7 @@ type lenAltPattern struct {
 // instead: a full-string match may require retrying a lower-priority
 // alternative when the higher-priority one doesn't reach end-of-string, and
 // leftmostFirst's immediate-accept pruning would kill that thread before it
-// gets the chance. See plans/FUZZER_BUGS.md bug 35 — this was previously
+// gets the chance. This was previously
 // hard-coded false (leftmost-longest) for every caller, which silently
 // mismatched RE2/Perl semantics for find-mode callers whenever a branch had
 // its own internal ambiguity.
@@ -13727,7 +13718,7 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 			continue
 		}
 		// DFA branch: build its layout starting at cur. forceWordChar:
-		// emitInlineAnchoredDFAVerify now consults midAcceptW/NW (FUZZER_BUGS.md
+		// emitInlineAnchoredDFAVerify now consults midAcceptW/NW
 		// #14) for branches with \b/\B, so those tables must actually be built
 		// here — needFind is false for this layout, which would otherwise skip
 		// them (wantWordChar = needFind || forceWordChar[0]).
@@ -13745,7 +13736,7 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 		})
 		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
 		// forceMidAccept=true: emitInlineAnchoredDFAVerify reads dl.midAcceptOff
-		// unconditionally (FUZZER_BUGS.md #4/#9) regardless of dominant states,
+		// unconditionally regardless of dominant states,
 		// so the backing data segment must always be emitted here.
 		raw, segCount := stripSegCount(dfaDataSegments(br.dfaLayout, false, true))
 		br.dfaDataBytes = raw
@@ -13840,8 +13831,7 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	// of position" — sound to consult on every iteration. A branch ending in
 	// an end-anchor ($/\z) has states that are acceptStates-true but
 	// midAccept-false; checking acceptStates unconditionally (as before)
-	// wrongly accepted such branches before reaching true end-of-input. See
-	// FUZZER_BUGS.md #4.
+	// wrongly accepted such branches before reaching true end-of-input.
 	//
 	// Structure: block $dfa_done { loop $dfa { ... } }
 	b = append(b, 0x02, 0x40) // block $dfa_done
@@ -13867,8 +13857,7 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	// DFA has \b/\B AND its layout was built with forceWordChar (see the
 	// buildDFALayout call in planLenAltLayout) — a no-op otherwise. This
 	// loop is directly [loop $dfa, block $dfa_done], the same shape
-	// emitWBPreAcceptCheck's hardcoded br depth 4 assumes. See
-	// FUZZER_BUGS.md #14.
+	// emitWBPreAcceptCheck's hardcoded br depth 4 assumes.
 	b = emitWBPreAcceptCheck(b, dl.wordCharTableOff, dl.midAcceptWOff, dl.midAcceptNWOff,
 		dl.needWordCharTable, locPtr, locPos, locState, locOutEnd, tableMemIdx)
 
@@ -13933,8 +13922,6 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 // dominated: measured at ~45 fuel/candidate, accounting for most of the
 // task-24 promotion regression on `secrets-combined` even after fixing the
 // separate per-branch DFA-verify cost (see that fix a few lines below).
-// See plans/TODO.md task 24's promotion-regression writeup for the full
-// investigation.
 func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) []byte {
 	const (
 		locPtr          byte = 0
@@ -13957,8 +13944,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 		// mask from scratch, this lenient path persists locMask across
 		// $lit_outer iterations (the whole point of the window-scan
 		// optimisation above) — a branch verify that fails must leave
-		// locMask untouched so the next iteration can resume from it. See
-		// plans/FUZZER_BUGS.md bug 30.
+		// locMask untouched so the next iteration can resume from it.
 		locScalarByte byte = 15
 	)
 
@@ -14108,8 +14094,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 			// expensive) per-byte inline DFA verify below. Without this, a
 			// false hit on just literal[0] (e.g. 'e' for "eyJ...", one of the
 			// most common bytes in ordinary text) pays for a full DFA
-			// simulation every time instead of a couple of byte compares —
-			// see plans/TODO.md task 24's promotion-regression writeup.
+			// simulation every time instead of a couple of byte compares.
 			if len(br.literal) > 1 {
 				b = append(b, 0x20, locAttemptStart)
 				b = append(b, 0x41)
@@ -14149,7 +14134,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	// fix #2 (mask persistence) address the cost of a false-positive
 	// candidate; this addresses the cost of a TRUE-positive one still
 	// having to walk past every other branch's first-byte compare before
-	// reaching the right one. See plans/TODO.md task 24.
+	// reaching the right one.
 	type group struct {
 		firstByte byte
 		branches  []int

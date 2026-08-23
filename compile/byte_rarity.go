@@ -2,7 +2,7 @@ package compile
 
 // Byte-rarity classifier — used by `EmitPrefixScan` to decide whether
 // to route a 17..64-byte first-byte set through Shufti SIMD lookup or
-// fall back to scalar firstByteFlags (LNM.md Action 3 deferred portion).
+// fall back to scalar firstByteFlags.
 //
 // Each byte gets a discrete rarity class on a 0–3 scale based on its
 // expected frequency in "typical" workload input (prose-leaning corpus
@@ -27,7 +27,7 @@ package compile
 // chunk, so scalar wins. A lower sum implies the scalar must scan most
 // bytes per chunk (no early exit), letting Shufti's fixed-cost
 // 16-bytes/chunk SIMD pay back. Crossover threshold is set by
-// measurement — see LNM.md.
+// measurement.
 
 var byteRarity = func() [256]int8 {
 	var t [256]int8

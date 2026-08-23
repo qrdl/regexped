@@ -67,7 +67,7 @@ func AppendSLEB128_64(out []byte, v int64) []byte {
 // of seven bits, so an eleventh continuation byte means the encoding is
 // over-long: its payload would be shifted past bit 63 and silently vanish (Go
 // defines x << 64 as 0 rather than leaving x unchanged), turning malformed
-// input into a plausible-looking wrong number. See plans/FABLE.md B39.
+// input into a plausible-looking wrong number.
 const maxLEB128Bytes = 10
 
 // ErrMalformedLEB128 is returned for an encoding that is over-long (more than

@@ -1,4 +1,4 @@
-// Package fuzz is Layer 1 of plans/FUZZER.md: a byte-level correctness
+// Package fuzz is a byte-level correctness
 // fuzzer comparing regexped's compiled WASM find body against Go stdlib
 // regexp on the same (pattern, input) pair. Run with:
 //
@@ -37,8 +37,7 @@ const inputCap = int(tableBase)
 // a regexped one (see CLAUDE.md's "runtime over compile time" design
 // principle) — it exists because a single go test -fuzz worker call covers
 // both compileFind and the WASM run, and Go's internal/fuzz worker treats
-// any call exceeding 10s as a hang and reports it as a crasher
-// (plans/FUZZER_BUGS.md #23).
+// any call exceeding 10s as a hang and reports it as a crasher.
 //
 // # Calibration
 //
@@ -47,7 +46,7 @@ const inputCap = int(tableBase)
 // go test -fuzz build, -parallel=4, real worker processes — not from solo
 // uninstrumented compiles. That distinction is the entire point: the
 // previous value of 5000 was calibrated solo and admitted calls of 9.2s
-// against the 10s deadline, which is plans/FUZZER_BUGS.md #42.
+// against the 10s deadline.
 //
 // Worst observed per-call wall clock among patterns each cap admits, on the
 // reference box (4 CPUs, Linux, Go 1.25.9):
@@ -119,7 +118,7 @@ func envMaxNFAInsts() int {
 
 // maxSetOracleInput bounds the INPUT length FuzzSet admits, for the same 10s
 // worker deadline maxNFAInsts guards — but against a cost term that cap cannot
-// see (plans/FUZZER_BUGS.md bug 45). FuzzSetCaps needs no such variable: it
+// see. FuzzSetCaps needs no such variable: it
 // already caps input at 64 bytes for an unrelated reason, which is why only
 // FuzzSet ever reached the deadline.
 //
@@ -149,8 +148,8 @@ func envMaxNFAInsts() int {
 // ~4.6x. pathsInputCap (128 KB) is no bound at all here — it admits inputs
 // whose oracle alone would run for hours.
 //
-// This narrows coverage, and the loss is real: plans/SETS.md §18.7 records a
-// genuine oracle bug found on a 3,282-byte input, which this cap excludes.
+// This narrows coverage, and the loss is real: a genuine oracle bug was once
+// found on a 3,282-byte input, which this cap excludes.
 // Raise it deliberately (and re-measure) when hunting long-input behaviour:
 //
 //	REGEXPED_FUZZ_MAX_SET_INPUT=4096 go test -run='FuzzSet$' -fuzz='FuzzSet$'
@@ -174,7 +173,7 @@ func envMaxSetOracleInput() int {
 // deadline actually sees is a whole call — but FuzzSetCaps compiles TWO
 // patterns into a set that emits all eight capability bodies plus the anchored
 // automata, where FuzzSet compiles one find body. Same instruction budget,
-// several times the work (plans/FUZZER_BUGS.md 56).
+// several times the work.
 //
 // # Calibration
 //
@@ -191,7 +190,7 @@ func envMaxSetOracleInput() int {
 //
 // The last row is the shared cap of 2000, i.e. what FuzzSetCaps ran under
 // until now: already past the deadline solo, which is why it tripped the
-// moment anything else shared the CPU (plans/SETS.md §21.14). Cost is ~linear
+// moment anything else shared the CPU. Cost is ~linear
 // in instructions and dominated by compilation — instantiate is 2-8ms and the
 // oracle sweep 4-26ms across the whole range, so neither is worth capping.
 //

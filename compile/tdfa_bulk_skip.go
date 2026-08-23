@@ -129,7 +129,7 @@ func detectTDFABulkSkip(tt *tdfaTable) *tdfaBulkSkipInfo {
 //
 // midAcceptTail, when non-nil, is emitted just after info.ops in the K > 0
 // branch. It carries the per-byte mid-accept bookkeeping the scalar loop
-// does and this routine otherwise skips wholesale (plans/FABLE.md B16):
+// does and this routine otherwise skips wholesale:
 // state is unchanged across the whole run, so if it is mid-accepting then
 // every skipped position was an accept of the same state and a single
 // check at the final position reproduces the scalar invariant exactly.

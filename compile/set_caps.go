@@ -6,7 +6,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// The six non-`find` set capabilities (plans/SETS.md §3.12, §3.13, §3.17).
+// The six non-`find` set capabilities.
 //
 //	match    (ptr, len)                -> i32   0 | 1
 //	match_any(ptr, len)                -> i32   pattern id, or -1
@@ -36,7 +36,7 @@ const (
 	capScan
 	capScanAny
 	capScanAll
-	// capFindBatch is the exported multi-position loop (plans/SETS.md §19).
+	// capFindBatch is the exported multi-position loop.
 	// Its per-position worker is emitted separately, as a hidden function,
 	// with mode capFind and compiledSet.batchPos set — see emitSetBatchFn.
 	capFindBatch
@@ -52,7 +52,7 @@ const wideBitmapThreshold = 64
 //
 // It comes from config.SetConfig.IDSpaceSize (via SetSpec), which is the same
 // function the stub generators call — that shared definition is what keeps the
-// two sides from disagreeing (plans/SETS.md §11 R1).
+// two sides from disagreeing.
 //
 // The fallback, for a SetSpec built directly by a harness rather than from a
 // config, derives the bound from the ids actually packed. It must consider
@@ -96,7 +96,7 @@ func (cs *compiledSet) numPatterns() int {
 // Every gate offset (gate + id*4) and every `_all` bit position IS a pattern
 // id, and the caller's array is sized by config.SetConfig.IDSpaceSize. If the
 // two ever diverge the symptom is an out-of-bounds write into the host's
-// memory — silent, data-dependent, and exactly what plans/SETS.md §11 R1 was.
+// memory — silent, data-dependent, and a defect this project has already had.
 // A panic here turns that class of bug into a build failure instead.
 func (cs *compiledSet) checkIDSpace() {
 	size := cs.idSpaceSize()
@@ -106,8 +106,8 @@ func (cs *compiledSet) checkIDSpace() {
 				if id < 0 || id >= size {
 					panic(fmt.Sprintf(
 						"compile: set %q emits pattern id %d but its id space is %d — "+
-							"gate arrays and _all bitmaps are sized by that bound "+
-							"(plans/SETS.md §11 R1)", cs.name, id, size))
+							"gate arrays and _all bitmaps are sized by that bound",
+						cs.name, id, size))
 				}
 			}
 		}
@@ -130,7 +130,7 @@ func (cs *compiledSet) wideAll() bool { return cs.idSpaceSize() > wideBitmapThre
 // start.
 //
 // Shared by emitRecordBits and setFindCtx.emitRecordProbe, which each carried
-// a copy (plans/SETS.md §11 R12).
+// a copy.
 func emitSetAnyID(b []byte, ids []int, bitsLocal, dst byte, escapeDepth int) []byte {
 	for k, gid := range ids {
 		if k >= 32 {
@@ -158,7 +158,7 @@ func emitSetAnyID(b []byte, ids []int, bitsLocal, dst byte, escapeDepth int) []b
 // Wide: set bit gid in the caller's little-endian bitmap and count only the
 // 0->1 transitions, so the returned count is distinct patterns rather than
 // hits. That read-modify-write is why the export REQUIRES an all-zero bitmap
-// on entry (docs/wasm.md, plans/SETS.md §11 R10).
+// on entry (docs/wasm.md).
 //
 // Shared by emitRecordBits (match_all) and setFindCtx.emitRecordProbe
 // (scan_all), which were byte-for-byte copies — including the SLEB128 hazard
@@ -338,8 +338,7 @@ func allPatternsMask(cs *compiledSet) uint64 {
 // Anchored only. The scan trio returns through setFindCtx.emitEpilogue, which
 // is where §3.17's packed-i64 encoding lives; this function used to carry dead
 // capScan/capScanAny/capScanAll arms and an lMinStart parameter its only
-// caller always passed as 0, so the encoding was specified twice
-// (plans/SETS.md §11 R12).
+// caller always passed as 0, so the encoding was specified twice.
 func finishAnchoredCapBody(b []byte, kind setCapKind, wide bool, lAcc, lCount, lAnyID byte) []byte {
 	switch kind {
 	case capMatch:

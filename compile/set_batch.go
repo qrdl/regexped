@@ -5,7 +5,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// Set `find_batch` (plans/SETS.md §19).
+// Set `find_batch`.
 //
 // `find` answers one position per call and is the right shape for a caller who
 // may stop early. `find_batch` answers as many CONSECUTIVE positions as fit in

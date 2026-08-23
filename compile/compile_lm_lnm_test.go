@@ -450,7 +450,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 		// shouldTryLitChainAlt short-circuits to false before
 		// analyseLitChainAltLenient is ever tried (confirmed live) — this
 		// case only exercises the general LikelyMatch compile sweep for this
-		// pattern shape. See TestCompileLenientAltFindBody (TEST.md T33) for
+		// pattern shape. See TestCompileLenientAltFindBody for
 		// a pattern that actually reaches that code.
 		{
 			"lenient_alt_find_only",
@@ -1237,7 +1237,7 @@ func TestCompileGroupsForceBacktrack(t *testing.T) {
 	}})
 }
 
-// TestCompileLikelyNoMatch exercises the LNM Action 5 / lnmAction5 flag path
+// TestCompileLikelyNoMatch exercises the lnmAction5 flag path
 // (impossible-byte SIMD skip with a 17..64-byte first-byte set).
 func TestCompileLikelyNoMatch(t *testing.T) {
 	lnm := CompileOptions{LikelyMode: LikelyNoMatch}
@@ -1307,13 +1307,13 @@ func TestCompileLikelyNoMatch(t *testing.T) {
 	}
 }
 
-// TestLM2BatchExportGating exercises the LM-2 batch find/groups export gate
-// (plans/LM_TODO.md LM-2): the "_batch" export must appear exactly when
+// TestLM2BatchExportGating exercises the LM-2 batch find/groups export gate:
+// the "_batch" export must appear exactly when
 // LikelyMode == LikelyMatch and the pattern's own find_func/groups_func was
 // requested, and must NOT appear for anchored (native lit-chain) groups
 // bodies — that shape is out of v1 scope (see the compiledPattern field doc
 // next to batchGroupsExport).
-// TestBatchExportGating covers the "batch-find" hint (plans/TODO.md task 44)
+// TestBatchExportGating covers the "batch-find" hint
 // as the sole trigger for the _batch export — independent of LikelyMode, and
 // covering both the composed (!anchored) and native lit-chain ("Path B",
 // anchored) groups shapes, plus named_groups_func-only naming.

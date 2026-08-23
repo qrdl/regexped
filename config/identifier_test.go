@@ -23,7 +23,7 @@ func TestValidateIdentifier_Shape(t *testing.T) {
 		"has-dash",   // dash
 		"has.dot",    // dot
 		"has(paren",  // paren
-		"has\"quote", // quote — the injection vector in plans/OPUS.md §N4
+		"has\"quote", // quote — the injection vector
 		"has\nnewl",  // newline
 		"héllo",      // non-ASCII letter
 		"日本語",        // non-ASCII
@@ -39,7 +39,7 @@ func TestValidateIdentifier_Shape(t *testing.T) {
 
 func TestValidateIdentifier_ReservedWords(t *testing.T) {
 	// One representative per language, plus `match`, which is the name the
-	// project used to special-case (see plans/OPUS.md §N4 and CLAUDE.md).
+	// project used to special-case.
 	reserved := []string{
 		"match",     // Rust
 		"fn",        // Rust
@@ -92,7 +92,7 @@ func TestValidateIdentifier_ReservedWords(t *testing.T) {
 }
 
 // TestValidateConfig_RejectsInjection replays the exact payload demonstrated in
-// plans/OPUS.md §N4, which produced a syntactically valid extra Rust function
+// The injection defect, which produced a syntactically valid extra Rust function
 // in the caller's crate.
 func TestValidateConfig_RejectsInjection(t *testing.T) {
 	payload := `m1 } pub fn pwned() { std::process::Command::new("id").status().unwrap(); `
@@ -241,7 +241,7 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-stub-type validation (plans/FABLE.md B32, B33, B34)
+// Per-stub-type validation
 
 func TestValidateIdentifier_StrictModeRestrictedNames(t *testing.T) {
 	// B33: not reserved words, but unbindable in strict-mode code, which every

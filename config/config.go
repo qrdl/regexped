@@ -28,8 +28,8 @@ type BuildConfig struct {
 
 // SetConfig describes one `sets:` entry in the YAML config.
 //
-// The eight capability fields form a 2x3 grid plus `find` and `find_batch`
-// (plans/SETS.md §3.12, §19).  The KEY names the capability; the VALUE is the WASM export /
+// The eight capability fields form a 2x3 grid plus `find` and `find_batch`.
+// The KEY names the capability; the VALUE is the WASM export /
 // generated-function name the user picks.
 //
 //	match_*  — anchored: the match must span the whole input (0..len).
@@ -54,14 +54,14 @@ type SetConfig struct {
 
 	// FindBatch is `find`'s amortised sibling: one call fills the caller's
 	// buffer with the matches of SEVERAL consecutive positions and returns an
-	// opaque cursor to resume from (plans/SETS.md §19). It is an independent
+	// opaque cursor to resume from. It is an independent
 	// capability — declaring it does not imply `find`, and vice versa — and it
 	// is emitted as a separate body, because a `find` caller may stop early
 	// and must not pay for lookahead it never consumes.
 	FindBatch string `yaml:"find_batch"`
 
-	// Overlapping selects which `find` body is emitted (plans/SETS.md
-	// §3.15, D10/D11). Absent or false (the DEFAULT) emits the gated body:
+	// Overlapping selects which `find` body is emitted. Absent or false
+	// (the DEFAULT) emits the gated body:
 	// per-pattern non-overlapping output matching Go FindAllIndex's rule.
 	// True emits the ungated body, which reports every start position and
 	// carries no gate-array parameter. It is a load error on a set without
@@ -74,8 +74,8 @@ type SetConfig struct {
 	// Also serves as the per-set default for unhinted patterns in this set
 	// when they reach the set's suffix DFA body. Accepted values: nil/empty
 	// (no hint), ["prefer-match"], or ["prefer-no-match"] — mutually
-	// exclusive with each other. See plans/LIKELY.md gap H.
-	// "batch-find" (plans/TODO.md task 44) is NOT accepted here — it is a
+	// exclusive with each other.
+	// "batch-find" is NOT accepted here — it is a
 	// per-pattern, JS/TS-only hint and is a load-time error on a sets: entry.
 	Hints []string `yaml:"hints"`
 }
@@ -114,7 +114,7 @@ func (s SetConfig) HasExports() bool { return len(s.Capabilities()) > 0 }
 
 // Gated reports whether this set emits the default gated (per-pattern
 // non-overlapping) `find` body, which threads a caller-owned gate array
-// through the suffix functions (plans/SETS.md §3.14-3.16). A set without
+// through the suffix functions. A set without
 // `find:` gates nothing.
 func (s SetConfig) Gated() bool {
 	return (s.Find != "" || s.FindBatch != "") && !s.Overlapping
@@ -133,7 +133,7 @@ func (s SetConfig) HasFind() bool { return s.Find != "" || s.FindBatch != "" }
 //
 // It lives here, rather than in generate/, so ValidateSets can reject two set
 // names that sanitize to the SAME stem before they become duplicate
-// declarations in generated code (plans/SETS.md §11 R14).
+// declarations in generated code.
 func SanitizeSetName(name string) string {
 	var b []rune
 	for _, c := range name {
@@ -173,7 +173,7 @@ func (s SetConfig) PatternCount(cfg BuildConfig) int {
 // id — the gate array, the `_all` bitmask/bitmap, and hence the narrow-vs-wide
 // `_all` ABI choice — must be sized from this, not from PatternCount.
 //
-// Sizing them from PatternCount was plans/SETS.md §11 R1: the emitted WASM
+// Sizing them from PatternCount was a memory-safety defect: the emitted WASM
 // wrote gate[68] into a stub-allocated two-slot array, `_all` decode loops
 // stopped before the bits the module had set, and the two sides could even
 // disagree about which `_all` signature the module exported.
@@ -211,8 +211,8 @@ func (s SetConfig) IDSpaceSize(cfg BuildConfig) int {
 // its intra-position resume index, for a set of patternCount patterns: the
 // smallest width holding every value in [0, patternCount].
 //
-// It lives here, next to IDSpaceSize and for the same reason (plans/SETS.md §11
-// R1): the compiler encodes the cursor and all six stub generators decode it,
+// It lives here, next to IDSpaceSize and for the same reason: the compiler
+// encodes the cursor and all six stub generators decode it,
 // so the layout must have ONE definition both sides call rather than two that
 // can drift.
 //
@@ -285,8 +285,7 @@ func ValidHints(hints []string) bool {
 // "batch-find" is rejected outright rather than being merely unrecognised:
 // there is no set-level batching for it to request. A set's `find` returns
 // one complete position per call and the worst case for one position is
-// patterns_in_set, so there is nothing left for a batch knob to size
-// (plans/SETS.md §7.7 / D12 — a multi-position `find_batch` is deferred).
+// patterns_in_set, so there is nothing left for a batch knob to size.
 func validateHintList(hints []string, isSet bool) error {
 	var hasMatch, hasNoMatch bool
 	for _, h := range hints {
@@ -389,8 +388,7 @@ func ValidateSets(cfg *BuildConfig) error {
 		// Two DISTINCT set names can sanitize to one identifier stem
 		// ("url-guard" and "url_guard" both give URL_GUARD), which emits the
 		// same <SET>_PATTERN_COUNT / <SET>_ID_SPACE constant twice and breaks
-		// the generated Rust/Go/C at compile time with no diagnostic from us
-		// (plans/SETS.md §11 R14).
+		// the generated Rust/Go/C at compile time with no diagnostic from us.
 		stem := SanitizeSetName(s.Name)
 		if prior, dup := setStems[stem]; dup {
 			return fmt.Errorf("set names %q and %q both produce the identifier %q "+
@@ -449,8 +447,8 @@ type RegexEntry struct {
 	// specific pattern, and/or requests extra WASM exports. Accepted values:
 	// nil/empty (no hint, falls back to the enclosing set's hints for the
 	// suffix-DFA choice), "prefer-match", "prefer-no-match" — mutually
-	// exclusive with each other, see plans/LIKELY.md — and "batch-find"
-	// (plans/TODO.md task 44), which is independent of the other two and may
+	// exclusive with each other — and "batch-find", which is independent
+	// of the other two and may
 	// be combined with either (or neither): it requests a `<func>_batch` WASM
 	// export for this pattern's find_func/groups_func, consumed only by the
 	// JS and TS generators (a no-op for Rust/Go/C/AS stubs).
@@ -487,7 +485,7 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	if err != nil {
 		return BuildConfig{}, fmt.Errorf("read config %s: %w", configPath, err)
 	}
-	// Strict decoding (plans/SETS.md §3.19 / D5): every unknown YAML key
+	// Strict decoding: every unknown YAML key
 	// anywhere in the file is a line-numbered load error. That catches the
 	// set keys retired by this redesign — find_any, find_all, batch_size —
 	// and all future typos (`mach_func:` …), with no tombstone fields and
@@ -527,7 +525,7 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 // absolute. A leading "~/" is expanded to the user's home directory rather
 // than being passed through: every caller of this function feeds the result
 // to os.MkdirAll/os.WriteFile/exec, none of which do shell expansion, so a
-// pass-through creates a literal "~" directory in cwd. See plans/FABLE.md B37.
+// pass-through creates a literal "~" directory in cwd.
 func resolveFilePath(base, path string) string {
 	if path == "" || filepath.IsAbs(path) {
 		return path

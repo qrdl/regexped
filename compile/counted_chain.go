@@ -11,7 +11,7 @@ import "github.com/qrdl/regexped/internal/utils"
 // would mean more than one valid length). Requires a single-pattern
 // suffix DFA (no bucket merging) and no word/newline-boundary tracking.
 //
-// TODO.md task 5 (LIKELY.md opt 2 / Hyperscan "SoME"): AKIA[A-Z0-9]{16},
+// an earlier task: AKIA[A-Z0-9]{16},
 // ghp_[A-Za-z0-9]{36}, etc. compile to exactly this shape after their
 // literal prefix is split off.
 func isCountedClassChain(t *dfaTable) (class []byte, n int, ok bool) {
@@ -71,7 +71,7 @@ func isCountedClassChain(t *dfaTable) (class []byte, n int, ok bool) {
 	// here", and as a set member it reported a match at every position rather
 	// than only at the last one (`.$` over "00" yielded [0-1] and [1-2] where
 	// Go yields [1-2] alone). Found by tools/fuzz FuzzSet; see
-	// tools/re2test/custom-sets.txt Category S10 and plans/SETS.md §14.14.
+	// tools/re2test/custom-sets.txt Category S10.
 	//
 	// The intermediate-state test below deliberately stays broader
 	// (isAccepting): a mid-chain state accepting at EOF means a SHORTER input
@@ -182,7 +182,7 @@ func sameByteSet(a, b []byte) bool {
 // prefixMaxLen mirrors buildSetSuffixBody's emitWriteMatchK convention:
 // 0/-1 (trivial/variable) ⇒ matchStart = lPos; >0 (fixed) ⇒
 // matchStart = lPos - prefixMaxLen. The tuple's third field is the absolute
-// end (plans/SETS.md §3.18), matching emitWriteMatchK.
+// end, matching emitWriteMatchK.
 func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLen int, gated, hasSkip bool) []byte {
 	const (
 		paramPtr       = byte(0)
@@ -302,8 +302,8 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 	// Verified: write the tuple at out_ptr (this emitter never writes more
 	// than one tuple per call, so out_base == out_ptr) — but only if the
 	// caller still has room. The return value is the count FOUND, so an
-	// overflowing call still reports its match towards the total
-	// (plans/SETS.md §3.11 / D2). paramOutCap is the signed remaining
+	// overflowing call still reports its match towards the total.
+	// paramOutCap is the signed remaining
 	// capacity and can be negative.
 	if hasSkip {
 		// §19: this emitter's only tuple has position-relative index 0, so it

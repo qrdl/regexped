@@ -147,7 +147,7 @@ type acLayout struct {
 	gotoBytes   []byte
 	outputBytes []byte // concatenation of nodeOut offsets and flat litID array
 
-	// Byte-class compression (plans/SETS.md §14 P3). When compressed, a goto
+	// Byte-class compression. When compressed, a goto
 	// row is indexed by the byte's EQUIVALENCE CLASS rather than by the byte,
 	// which shrinks the row from 512 bytes to stride*2 at the cost of one
 	// extra table load per input byte to map byte→class.
@@ -297,7 +297,7 @@ func buildACLayoutMode(ac *acAutomaton, tableBase int32, compress bool) *acLayou
 	// the whole concatenation to it counted nodeOut twice and left a
 	// (numNodes+1)*2-byte hole before whatever sits at tableEnd. That is what
 	// acBudgetBytes was measuring, so the budget held fewer literals than it
-	// was sized for (plans/SETS.md §14.14, TestACLayoutNoGap).
+	// was sized for.
 	nodeOutLen := int32(len(nodeOutBytes))
 	nodeOutBytes = append(nodeOutBytes, outputBytes...)
 	l.outputBytes = nodeOutBytes

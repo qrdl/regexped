@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// Context-sensitive assertions inside sets (plans/SETS.md §3.2, §3.21;
-// plans/FABLE.md B40 and B43).
+// Context-sensitive assertions inside sets: `from` never narrows the input,
+// so \b and (?m:^) must judge real neighbouring bytes.
 //
 // The whole-input oracle here is the §9.6 "context-sensitive" technique:
 // `\A(?s:.{p})(?:pat)` hands `pat` position p with its REAL left context, so
@@ -74,7 +74,7 @@ func checkSetContext(t *testing.T, pat, input string) {
 	}
 }
 
-// TestSetLineAnchors closes plans/FABLE.md B43: (?m:^) in a set used to
+// TestSetLineAnchors covers a fixed defect: (?m:^) in a set used to
 // collapse to "position 0 only", so every match after the first line was lost.
 func TestSetLineAnchors(t *testing.T) {
 	cases := []struct{ pat, input string }{
@@ -102,7 +102,7 @@ func TestSetTextAnchorIgnoresFrom(t *testing.T) {
 	}
 }
 
-// TestSetWordBoundaries closes plans/FABLE.md B40: \b patterns in a set used
+// TestSetWordBoundaries covers a fixed defect: \b patterns in a set used
 // to match nothing at all.
 func TestSetWordBoundaries(t *testing.T) {
 	cases := []struct{ pat, input string }{

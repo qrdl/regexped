@@ -39,7 +39,7 @@ func appendDataSegment(out []byte, offset int32, data []byte) []byte {
 // it. Getting it wrong does not fail the build — it yields a tableEnd far below
 // the real end of the tables, and since the next pattern is laid out from
 // PageAlign(tableEnd), that pattern's tables would be written on top of this
-// one's. See plans/OPUS.md §N10.
+// one's.
 type segAccum struct {
 	bytes []byte
 	count int
@@ -67,7 +67,7 @@ type dataSegment struct {
 //
 // Like stripSegCount, rawData is always appendDataSegment's own output, so a
 // LEB128 decode failure here is an internal invariant violation, not malformed
-// user input — see the note on stripSegCount in compile.go and plans/FABLE.md
+// user input — see the note on stripSegCount in compile.go
 // B39.
 func parseDataSegments(rawData []byte) []dataSegment {
 	var segs []dataSegment
@@ -109,7 +109,7 @@ func parseDataSegments(rawData []byte) []dataSegment {
 // segments (memory index, offset, LEB128 size, payload), and the payloads are
 // placed at explicit — not necessarily contiguous — offsets. A length sum both
 // counts the encoding overhead and ignores the gaps, and can land either side
-// of the truth. See plans/FUZZER_BUGS.md bug 44.
+// of the truth.
 func dataSegmentsTop(rawData []byte) int64 {
 	var top int64
 	for _, seg := range parseDataSegments(rawData) {

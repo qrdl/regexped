@@ -405,7 +405,7 @@ var tests = []testCase{
 
 	// ── Phase 0 new patterns — compatibility baseline coverage ────────────────
 	// These four patterns extend the baseline corpus to cover engine paths that
-	// the Phase 1–4 grouping work touches.  See plans/COMBINING_PATTERNS_PLAN.md
+	// the pattern-grouping work touches.
 	// "Phase 0 — Perftest expansion and baseline capture".
 
 	{
@@ -467,7 +467,7 @@ var tests = []testCase{
 		},
 	},
 	{
-		// TODO.md task 13 population: quantifier-loop class whose terminator
+		// an earlier task population: quantifier-loop class whose terminator
 		// overlaps the class itself. hasAmbiguousCaptures flags the loop's
 		// InstAlt as ambiguous (continue-vs-exit can't be resolved by
 		// first-byte lookahead alone) and routes this to Backtracking today,
@@ -486,8 +486,7 @@ var tests = []testCase{
 
 	// ── LNM / Opt 1 coverage on 100 KB workloads ─────────────────────────────
 	// These three patterns surface the wins (or absence thereof) of recent
-	// shipping work on a realistic-scale perftest. See plans/LIKELY.md (Opt 1)
-	// and plans/LNM.md (Shufti prefix scan) for the implementation history.
+	// shipping work on a realistic-scale perftest.
 	{
 		// Phase 5 amplifier: mid-accept dominant body with a multi-byte exit
 		// set. Pattern matches URLs delimited by whitespace, comma, or
@@ -2326,8 +2325,8 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	buf := mem.UnsafeData(store)
 	copy(buf[inBase:], []byte(input))
 
-	// out_cap is patterns_in_set: the exact worst case for a single position
-	// (plans/SETS.md §3.11), so the exhaustion loop never overflows.
+	// out_cap is patterns_in_set: the exact worst case for a single position,
+	// so the exhaustion loop never overflows.
 	outCap := int32(len(sc.patterns))
 	gatePtr := outBase + outCap*12
 
@@ -2358,7 +2357,7 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 }
 
 // exhaustSetFind drives a set `find` export to exhaustion, the way a generated
-// iterator does (plans/SETS.md §4.8): zero the gate array, then call
+// iterator does: zero the gate array, then call
 //
 //	find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> total at that position
 //

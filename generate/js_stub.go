@@ -30,7 +30,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		return ""
 	}
 	var out strings.Builder
-	out.WriteString("\n// ---- set composition wrappers (plans/SETS.md §4.5) ----\n")
+	out.WriteString("\n// ---- set composition wrappers ----\n")
 	out.WriteString("//\n")
 	out.WriteString("// Return types are called out on every function because JavaScript cannot\n")
 	out.WriteString("// catch the predicate-versus-list misreading `_any`/`_all` invite: an empty\n")
@@ -49,7 +49,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		// (12 bytes x pattern count), then the gate array (4 bytes x ID
 		// SPACE), then the >64-pattern bitmap (ceil(idSpace/8)). The two
 		// counts differ for a set that selects a named subset — see
-		// idSpaceSize and plans/SETS.md §11 R1.
+		// idSpaceSize.
 		reserve := 12*n + 4*idN + bitmapBytes(s, cfg)
 		gateBase := fmt.Sprintf("_outBase + 12*%s", konst)
 		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
@@ -288,7 +288,7 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("    // the second copy _mem.set would then make. The reservation is the\n")
 	sb.WriteString("    // worst-case UTF-8 expansion of a JS string: 3 bytes per UTF-16 code unit\n")
 	sb.WriteString("    // (an astral char is 2 units and encodes to 4 bytes, so 3x still bounds\n")
-	sb.WriteString("    // it), so encodeInto cannot truncate. See plans/OPUS.md \u00a7N6b.\n")
+	sb.WriteString("    // it), so encodeInto cannot truncate.\n")
 	sb.WriteString("    if (typeof input === 'string') {\n")
 	sb.WriteString("        _resize(input.length * 3, outBytes);\n")
 	sb.WriteString("        return _enc.encodeInto(input, _mem.subarray(_inBase)).written;\n")
@@ -350,8 +350,8 @@ export function %s(input) {
 }
 
 // lm2BatchCap is the per-refill match capacity used by the JS/TS find/groups
-// generators' batch path (originally LM-2, plans/LM_TODO.md LM-2; the trigger
-// is now the "batch-find" hint, plans/TODO.md task 44). Not user-configurable
+// generators' batch path, whose trigger is the "batch-find" hint. Not
+// user-configurable
 // in v1 — see set stubs' batchSize for the analogous, config-driven sizing
 // used by sets.
 const lm2BatchCap = 256
@@ -360,7 +360,7 @@ const lm2BatchCap = 256
 // Yields [start, end] absolute byte positions for each non-overlapping match.
 //
 // Prefers the batch export (funcName+"_batch", requested via the "batch-find"
-// hint — plans/TODO.md task 44) when the loaded WASM provides one — draining
+// hint) when the loaded WASM provides one — draining
 // lm2BatchCap matches per host call instead of one — and falls back to the
 // standard one-call-per-match loop otherwise. The feature-detect (typeof
 // check, once per generator invocation) makes this stub work unmodified
@@ -446,7 +446,7 @@ export function* %[1]s(input) {
     const len = _w(input);
     // Hoisted out of the loop: _mem.buffer and _outBase are both loop-invariant
     // (_resize already ran, and nothing inside the loop grows the memory), so
-    // constructing the view per match was pure overhead. See plans/OPUS.md §N6a.
+    // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
     let off = 0;
     while (off <= len) {
@@ -477,8 +477,8 @@ export function* %[1]s(input) {
 // Only groups that participated in the match are included.
 //
 // Prefers the batch export (exportName+"_batch", requested via the
-// "batch-find" hint — plans/TODO.md task 44) when the loaded WASM provides
-// one, same as genJSGroupsFunc. Feature-detection and the record layout are
+// "batch-find" hint) when the loaded WASM provides one, same as
+// genJSGroupsFunc. Feature-detection and the record layout are
 // keyed on exportName — the WASM export this pattern's groups_func and
 // named_groups_func share (config.RegexEntry.GroupsExportName) — not on
 // funcName, so a named_groups_func-only pattern (no groups_func) still finds
@@ -539,7 +539,7 @@ export function* %[1]s(input) {
     const len = _w(input);
     // Hoisted out of the loop: _mem.buffer and _outBase are both loop-invariant
     // (_resize already ran, and nothing inside the loop grows the memory), so
-    // constructing the view per match was pure overhead. See plans/OPUS.md §N6a.
+    // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
     let off = 0;
     while (off <= len) {

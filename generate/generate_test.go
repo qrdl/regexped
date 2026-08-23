@@ -524,7 +524,7 @@ func TestGenTSStubFileWithNamedPattern(t *testing.T) {
 // generator, JS and TS, including named_groups_func — this is a structural
 // (source-text) check; the actual batch-vs-non-batch behavioural
 // equivalence was verified via a scratch wasmtime/Node differential harness
-// (not committed — see plans/TODO.md task 44's verification discipline).
+// (not committed).
 func TestGenJSFindFuncHasBatchPath(t *testing.T) {
 	out := genJSFindFunc("f")
 	for _, sub := range []string{`_exp['f_batch']`, `f_batch'](_inBase`} {
@@ -1055,7 +1055,7 @@ func TestWriteStub_MkdirError(t *testing.T) {
 }
 
 // TestConfigPascalCaseMatchesGenerators guards the one duplicated transform in
-// the per-stub-type validation added for plans/FABLE.md B34. config cannot
+// the per-stub-type validation. config cannot
 // import generate, so config.pascalCase is a hand copy of goPublicName (and of
 // iterTypeName minus its "Iter" suffix). If either generator's transform
 // changes, the collision check silently stops matching what is emitted — this
@@ -1208,7 +1208,7 @@ func setBatchTestCfg() config.BuildConfig {
 // two cursor constants, and — in the four languages where the caller can hold
 // storage — a BORROWED buffer rather than one the stub allocates. The last is
 // the point: find_batch exists to cut per-call overhead, so it must not add a
-// per-scan allocation (plans/SETS.md §19.6).
+// per-scan allocation.
 func TestSetFindBatchStubs(t *testing.T) {
 	cfg := setBatchTestCfg()
 	cases := []struct {
@@ -1293,7 +1293,7 @@ func TestSetFindBatchStubs(t *testing.T) {
 
 // TestSetFindBatchCStubTakesBuffer: C has no allocator, so a stub-owned buffer
 // forced an invented capacity macro into the header. With the buffer passed in,
-// that constant is gone entirely (plans/SETS.md §19.6).
+// that constant is gone entirely.
 func TestSetFindBatchCStubTakesBuffer(t *testing.T) {
 	h, c, err := genCStubFilesWithSets(setBatchTestCfg(), "stub.h")
 	if err != nil {

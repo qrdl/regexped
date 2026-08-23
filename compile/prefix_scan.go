@@ -118,7 +118,7 @@ type prefixScanLocals struct {
 	Chunk3       byte // v128 local: 16-byte chunk at attempt_start+3 (4-byte Teddy)
 	T3Lo, T3Hi   byte // v128 locals: T3_lo, T3_hi (4-byte Teddy, pre-loaded)
 
-	// DenseCounter / DenseSkipFlag (TODO.md task 25 v1 — adaptive dense-data
+	// DenseCounter / DenseSkipFlag (an earlier task v1 — adaptive dense-data
 	// switch, combined with the v128 dead-local trim): only read/written
 	// when emitPrefixScan's `adaptive` gate is active (LikelyNoMatch forcing
 	// Shufti past what shuftiBeatsScalar would otherwise pick for a
@@ -138,7 +138,7 @@ type prefixScanLocals struct {
 }
 
 // denseSwitchThreshold is the number of consecutive no-skip Shufti attempts
-// (TODO.md task 25) that trip the adaptive switch to scalar. Chosen by
+// that trip the adaptive switch to scalar. Chosen by
 // initial measurement; see likelytest's alpha-run/word-run/deadskip-near-miss
 // cases for the workloads this tunes against.
 const denseSwitchThreshold int32 = 8
@@ -180,7 +180,7 @@ type prefixScanParams struct {
 	// LikelyNoMatch.
 	LikelyNoMatch bool
 
-	// AllowDenseSwitch (TODO.md task 25): opts into the adaptive
+	// AllowDenseSwitch: opts into the adaptive
 	// dense-data switch for the LikelyNoMatch-forced-Shufti case (17..64
 	// byte first-byte set, static heuristic says scalar would win).
 	// Requires the caller to have allocated real, non-colliding WASM
@@ -228,7 +228,7 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		// loaded for Phase A (16 bytes). For len(prefix) > 16 this can't work:
 		// `i32.shr_u k` for k >= 16 zero-shifts the bitmask, silently
 		// collapsing the accumulator to 0 and reporting "no candidate" even
-		// where one exists (TODO.md Task 11). Gate Phase A/B to prefixes that
+		// where one exists. Gate Phase A/B to prefixes that
 		// fit in one chunk; longer prefixes fall straight through to the
 		// scalar tail below, which verifies the full prefix byte-by-byte and
 		// has no such length limit.
@@ -366,9 +366,9 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		// ── firstByteFlags / SIMD fast-skip ──────────────────────────────────
 		// Strategy based on len(p.FirstByteSet):
 		//   <= 8:    2-byte Teddy (when TeddyTwoByte) or 1-byte Teddy
-		//   9..16:   Shufti — 2-half nibble lookup (LNM Action 3, shipped)
+		// 9..16: Shufti — 2-half nibble lookup (LNM Action 3, shipped)
 		//   17..64:  Shufti when `shuftiBeatsScalar(set)`, else scalar
-		//            (LNM Action 3 deferred portion — density heuristic)
+		// (LNM Action 3 deferred portion — density heuristic)
 		//   > 64:    scalar 256-byte flag table
 		//
 		// Shufti for 9..16 strictly beats the prior multi-eq emission
@@ -380,7 +380,7 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		// scan ~all bytes per chunk before exiting. Sets whose bytes are
 		// dense ⇒ scalar — early-exit wins.
 		//
-		// TODO.md task 25: `p.LikelyNoMatch` can override the static
+		// an earlier task: `p.LikelyNoMatch` can override the static
 		// heuristic and force Shufti even when it predicts scalar wins —
 		// by design, since the caller's runtime-only knowledge is exactly
 		// what the hint is for. But the static heuristic can't distinguish
@@ -607,7 +607,7 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 				// Shufti: multi-half nibble lookup for FirstByteSet of 9..64 bytes.
 				// Each half of ≤ 8 bytes gets its own (T_lo, T_hi) 16-byte
 				// bitmap pair; the SIMD test ORs all halves and reduces to a
-				// per-lane non-zero check. See LNM Action 3 / LIKELY.md Phase 5
+				// per-lane non-zero check. See the LikelyMode work
 				// for the broader history of Shufti adoption in regexped.
 				b = emitShuftiPrefixCheck(b, p.FirstByteSet, l.Chunk)
 			}

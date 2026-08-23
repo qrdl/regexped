@@ -4,7 +4,7 @@ import (
 	"regexp/syntax"
 )
 
-// First-byte eligibility mask (plans/SETS.md §21.6).
+// First-byte eligibility mask.
 //
 // A fallback bucket has no literal to skip with, so the scalar find body
 // evaluates it at EVERY position: gate pre-mask, then a suffix-DFA call. The

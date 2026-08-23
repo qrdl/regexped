@@ -12,7 +12,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// The byte-identical regression net (plans/SETS.md §9.0).
+// The byte-identical regression net.
 //
 // Every fixture under testdata/byteident/ is one SINGLE-PATTERN code path,
 // compiled and compared against a checked-in `expected.wasm` byte for byte.
@@ -22,7 +22,7 @@ import (
 // # Why byte identity rather than a behaviour test
 //
 // The set redesign shares emitters with the single-pattern path. D6 of
-// plans/SETS.md says single-pattern behaviour is out of scope and must not
+// Single-pattern behaviour is out of scope for set work and must not
 // change, and the only evidence strong enough for "must not change" is that
 // the emitted bytes are the same — a behavioural test proves the cases it
 // tries, and a shared-emitter regression is exactly the kind that hides in the
@@ -99,7 +99,7 @@ func TestByteIdentical(t *testing.T) {
 			}
 			if !bytes.Equal(got, want) {
 				t.Fatalf("emitted WASM differs from the checked-in fixture: got %d bytes, want %d.\n"+
-					"Single-pattern output is supposed to be byte-identical (plans/SETS.md D6). If the\n"+
+					"Single-pattern output is supposed to be byte-identical. If the\n"+
 					"change is intended, rerun with -update-byteident and review the diff.",
 					len(got), len(want))
 			}

@@ -1,6 +1,6 @@
 package compile
 
-// Per-state liveness for set probes (plans/SETS.md §18.4 / G8).
+// Per-state liveness for set probes.
 //
 // futureAccepts[s] answers "which patterns can still accept at or after state
 // s?". A walk may stop as soon as every pattern the caller still WANTS is
@@ -70,7 +70,7 @@ func futureAccepts(t *dfaTable) []uint64 {
 // accept from dead), slot s+1 holds raw state s. It is the compile-time twin
 // of the table futureAcceptsBytes serialises, for emitters that know a state
 // at compile time and can therefore fold its future into a constant instead
-// of loading it (plans/SETS.md §21.1 / G10).
+// of loading it.
 func futureAcceptsWASM(t *dfaTable, numWASM int) []uint64 {
 	fa := futureAccepts(t)
 	out := make([]uint64, numWASM)

@@ -7,7 +7,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// abi.BTStackOverflow handling in generated stubs (plans/OPUS.md §N1).
+// abi.BTStackOverflow handling in generated stubs.
 //
 // Every exported matcher can return abi.BTStackOverflow (-2) when the pattern
 // compiled to the Backtracking engine and the input exhausted its frame budget.

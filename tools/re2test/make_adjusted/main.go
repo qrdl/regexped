@@ -202,7 +202,7 @@ func main() {
 			// capture group but its body is provably unreachable, so the
 			// compiler still picks a non-capturing DFA engine and main.go
 			// tests it via matchFn instead). Mirror that decision exactly,
-			// not the syntactic capture count. See plans/FUZZER_BUGS.md §8.
+			// not the syntactic capture count.
 			engineType, selErr := compile.SelectEngine(rp.pattern, compile.CompileOptions{MaxDFAStates: maxDFAStates})
 			testedViaGroups := selErr == nil && (engineType == compile.EngineBacktrack || engineType == compile.EngineTDFA)
 
@@ -213,7 +213,7 @@ func main() {
 			// search to consider every full-consuming derivation, matching
 			// that contract; a plain unanchored FindStringIndex would miss
 			// full-consuming derivations that leftmost-first priority alone
-			// wouldn't reach (e.g. lazy quantifiers). See plans/FUZZER_BUGS.md §8.
+			// wouldn't reach (e.g. lazy quantifiers).
 			var goReFull *regexp.Regexp
 			if !testedViaGroups {
 				var fullErr error
@@ -243,7 +243,7 @@ func main() {
 					// col0 here is tested against regexped's groupsFn, a
 					// non-anchored find-with-captures filtered only by
 					// start==0 (NOT also end==len(s) — groupsFn has no
-					// full-consumption requirement). See plans/FUZZER_BUGS.md §8.
+					// full-consumption requirement).
 					m := goRe.FindStringSubmatchIndex(s)
 					if m == nil || m[0] != 0 {
 						col0 = "-"

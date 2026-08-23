@@ -54,7 +54,7 @@ func genASSetSection(cfg config.BuildConfig) string {
 		return ""
 	}
 	var out strings.Builder
-	out.WriteString("\n// ---- set composition wrappers (plans/SETS.md §4.6) ----\n\n")
+	out.WriteString("\n// ---- set composition wrappers ----\n\n")
 	out.WriteString("class SetMatch { constructor(public patternId: i32, public start: i32, public end: i32) {} }\n")
 	out.WriteString("class SetAnchor { constructor(public patternId: i32, public start: i32) {} }\n\n")
 	for _, s := range cfg.Sets {

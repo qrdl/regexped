@@ -56,18 +56,18 @@ func main() {
 	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors, skips WASM testing)")
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
 	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find/groups (sets MaxDFAStates=-1 so DFA/TDFA always overflow to BT)")
-	setsMode := flag.Bool("sets", false, "test the set capabilities: compile each regexps block's patterns as sets and verify every declared capability against a live Go oracle (plans/SETS.md §22)")
+	setsMode := flag.Bool("sets", false, "test the set capabilities: compile each regexps block's patterns as sets and verify every declared capability against a live Go oracle")
 	setBatch := flag.Bool("set-batch", false, "with --sets, drive `find_batch` ONLY at a buffer capacity of one, so every multi-match position splits and every §19 resume path is taken (default drives capacity 1 and capacity=pattern-count)")
 	setChunk := flag.Int("set-chunk", 32, "with --sets, patterns per compiled set (0 = one set per corpus block, which is what --sets did before §22). The RE2 corpus has 27 blocks of 132..7020 patterns, so without chunking the frontend and id-space thresholds (packed-pair <=16, Teddy <=64, AC >16, wide `_all` >64) are never crossed from below")
 	setShuffle := flag.Bool("set-shuffle", false, "with --sets, deterministically permute a block's patterns before chunking, so a set holds unrelated patterns instead of variations of one generator family")
 	setSampleN := flag.Int("sample", 1, "with --sets, test only every Nth chunk (1 = all). This is what separates the sampled gate from the exhaustive run")
-	setSubsetF := flag.Bool("set-subset", false, "with --sets, make each set select a NAMED SUBSET of the chunk's patterns (every second one, from index 1) instead of `patterns: all`; this is the only configuration in which PATTERN_COUNT and ID_SPACE differ, which is what sizes the gate array and the `_all` bitmap (plans/SETS.md §11 R1)")
+	setSubsetF := flag.Bool("set-subset", false, "with --sets, make each set select a NAMED SUBSET of the chunk's patterns (every second one, from index 1) instead of `patterns: all`; this is the only configuration in which PATTERN_COUNT and ID_SPACE differ, which is what sizes the gate array and the `_all` bitmap")
 	setProfiles := flag.String("set-profiles", "all", "with --sets, comma-separated capability profiles to compile per chunk: all, anchored, scan, scan-any, find, find-ov, batch, batch-ov — or all-profiles")
 	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
 	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
 	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
-	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's Gap B lenient path) that match+find-together dispatch never exercises — see plans/TODO.md task 52")
-	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the Gap E alt-prefixed find body, the Gap C alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises (see plans/FABLE.md B6/B9/B11)")
+	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's Gap B lenient path) that match+find-together dispatch never exercises")
+	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the Gap E alt-prefixed find body, the Gap C alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -517,7 +517,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				// correct find oracle either way. Previously gated behind
 				// `col0 == "-"`, which left find() completely unchecked for any
 				// row whose anchored match also succeeds, hiding real find-mode
-				// bugs (e.g. `a$00|^0` and `\b0|` vs "0" — see plans/FUZZER_BUGS.md).
+				// bugs (e.g. `a$00|^0` and `\b0|` vs "0").
 				if findFn == nil {
 					skipCount[skipNonAnchored]++
 				} else {
@@ -619,8 +619,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					// col0: anchored match (no captures). Skipped for capturing
 					// patterns (groupsFn != nil) even when --validate-groups is
 					// off: col0 is written for groupsFn's non-full-consumption
-					// contract, not matchFn's full-consumption one — see
-					// plans/TODO.md task 46.
+					// contract, not matchFn's full-consumption one.
 					got, callErr := callMatch(wd, store, matchFn, memory, text)
 					if callErr != nil {
 						if isTimeout(callErr) {
@@ -941,7 +940,7 @@ type testSetBlockStats struct {
 // The block's eligible patterns are split into chunks (--set-chunk), each
 // chunk is compiled once per selected capability profile (--set-profiles), and
 // every capability that profile declares is checked against a Go oracle built
-// once per chunk. See plans/SETS.md §22 and the header of setcaps.go.
+// once per chunk. See the header of setcaps.go.
 //
 // The returned counts are this block's contribution to the run total, taken as
 // a delta of setStats so they cover every capability the profiles drove. The
@@ -1187,7 +1186,7 @@ func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *was
 // iterator, etc.) calls groups() at successive nonzero ptr values into the
 // SAME underlying buffer — it never re-writes a substring back to address 0
 // between calls. callGroups' per-call re-copy makes every call start from a
-// pristine buffer, which is exactly what hides TODO.md task 50's bug class
+// pristine buffer, which is exactly what hides an earlier task's bug class
 // (a wrapper-composition bug that corrupts memory at address 0 as a side
 // effect of one call, only visible on the NEXT call into the same,
 // un-rewritten buffer).
@@ -1389,8 +1388,8 @@ func col4Equal(goAll [][]int, exp [][2]int) bool {
 
 // col4WasmEqual compares WASM iteration results against parsed col4 pairs.
 // sortSpanPairs orders spans by (start, end) so a multiset comparison can be
-// done element-wise. plans/SETS.md §3.10 leaves the order of the tuples within
-// one `find` call unspecified.
+// done element-wise: the order of the tuples within one `find` call is
+// unspecified by the set ABI.
 func sortSpanPairs(v [][2]int) {
 	sort.Slice(v, func(i, j int) bool {
 		if v[i][0] != v[j][0] {

@@ -12,7 +12,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// plans/OPUS.md §N1 regression: the Backtracking engine's frame stack is sized
+// Regression: the Backtracking engine's frame stack is sized
 // from a compile-time constant (btAllocSizes: numAlts*4096 frames) while the
 // real requirement scales with input length. Exhausting it used to return
 // abi.NoMatch, i.e. a false negative that switches on somewhere past

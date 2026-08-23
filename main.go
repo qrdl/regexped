@@ -25,7 +25,7 @@ import (
 	"github.com/qrdl/regexped/merge"
 )
 
-// Exit codes. See plans/IMPROVEMENT_PLAN.md #24.
+// Exit codes.
 //
 // Every failure path goes through failf, so these are the only non-zero codes
 // the tool produces. Note that this requires the flag sets to use
@@ -222,7 +222,7 @@ func runMergeCmd(args []string) {
 	var out string
 	// No "- writes to stdout" here, unlike the generate and compile commands:
 	// merge shells out to wasm-merge, which is handed -o verbatim and would
-	// create a file literally named "-". See plans/FABLE.md B36.
+	// create a file literally named "-".
 	fset.StringVar(&out, "output", "", "override output from config (must be a file path)")
 	fset.StringVar(&out, "o", "", "output file (alias for --output)")
 	parseFlags(fset, args)

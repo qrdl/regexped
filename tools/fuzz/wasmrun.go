@@ -15,7 +15,7 @@ import (
 
 // errBTOverflow reports that an export returned abi.BTStackOverflow: the
 // Backtracking engine exhausted its compile-time frame budget, so it does not
-// know whether the input matches (plans/OPUS.md §N1).
+// know whether the input matches.
 //
 // Targets must SKIP on this, not fail. It is a documented runtime ceiling that
 // the engine reports honestly — comparing it against the oracle would flag a
@@ -40,7 +40,7 @@ const (
 
 // compileFind compiles pat into a standalone WASM module exporting a single
 // non-anchored find function, with no captures — the DFA/Compiled DFA find
-// body (Layer 1's target per plans/FUZZER.md).
+// body (Layer 1's target).
 func compileFind(pat string) ([]byte, error) {
 	entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
 	wasmBytes, _, err := compile.Compile([]config.RegexEntry{entry}, tableBase, true)
@@ -68,7 +68,7 @@ func sharedEngine() (*wasmtime.Engine, *watchdog) {
 // runWasmFind instantiates wasmBytes and calls its find export on input.
 // Returns the matched [start,end) span and ok=true on a match; ok=false with
 // a nil err means "no match". hang=true means the watchdog killed a runaway
-// call (the O(n^2) hang detector from plans/FUZZER.md item 6); err covers
+// call (the O(n^2) hang detector); err covers
 // any other WASM-level failure (bad module, trap, missing exports).
 func runWasmFind(wasmBytes []byte, input string) (span [2]int, ok bool, hang bool, err error) {
 	engine, wd := sharedEngine()
@@ -149,7 +149,7 @@ func newWatchdog(eng *wasmtime.Engine) *watchdog {
 // the timer.
 //
 // The deadline used to be set inside the watchdog goroutine, which is a data
-// race on the Store (plans/FUZZER_BUGS.md bug 47). `w.arm <- store` returns as
+// race on the Store. `w.arm <- store` returns as
 // soon as the goroutine RECEIVES, not after it finishes with the store, so the
 // caller went straight into fn.Call while the goroutine was still inside
 // SetEpochDeadline on that same store. wasmtime.Store is not thread-safe, so

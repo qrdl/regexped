@@ -6,7 +6,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// Literal-existence absence prefilter (plans/SETS.md §21.3 / G12).
+// Literal-existence absence prefilter.
 //
 // The G8/G9 preflights only need to know which patterns are PROVEN matchless
 // in [from, len); over-approximating "alive" is documented-safe (§18.4). A

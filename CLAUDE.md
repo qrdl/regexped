@@ -452,17 +452,21 @@ implementation to check against.
 WASM instructions, and Rust→WASM codegen differs structurally from our
 hand-emitted WASM. Track the ratio, never a single absolute number.
 
-The rows where we still LOSE are documented in `plans/SETS.md` §21.15: the
-dense `find` rows (structural — `find` is the lazy API and pays one host
-crossing per matching position; `find_batch` covers most of them at 12x-40x),
-plus `greedy-3`'s no-match `find_batch`, which is a dense drive over a set with
-no literal frontend and is engine work rather than crossings.
+The rows where we still LOSE are documented in `plans/SETS.md` §21.18 (board
+re-measured 2026-08-23): **three, all dense `find`, all structural** —
+keywords-2 0.15x, keywords-8 0.27x, keywords-64 0.59x. `find` is the lazy API
+and pays one host crossing per matching position; each of those rows is covered
+by its own `find_batch` at 8.3x-14.9x. Two further `find` rows now report
+`boundary` rather than a ratio, because the per-call crossing correction has
+grown to the whole sample — that is the instrument declining to divide, not a
+loss.
 
-§20.2's three literal-less rows — once the evidence for "every win comes from
-the literal frontends" — were closed by §21's G10-G14 and are now 64.27x /
-32.78x / 11.17x. The scalar path is no longer at parity: greedy-3's `scan_any`
-runs at 2.93 fuel/byte and its anchored trio at 1.70, against 32.06 and 18.75
-before.
+Everything else wins. §20.2's three literal-less rows — once the evidence for
+"every win comes from the literal frontends" — were closed by §21's G10-G14,
+and G16's first-byte eligibility mask then took greedy-3's no-match `find`
+from 251 to 94 fuel/byte, which flipped its `find_batch` from 0.43x to 1.19x:
+the last non-structural loss on the board. The forward backlog for sets is
+`plans/SETS_PLAN.md`.
 
 ### LikelyMode benchmark matrix (`tools/likelytest/`)
 

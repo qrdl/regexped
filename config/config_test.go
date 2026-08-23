@@ -525,7 +525,7 @@ func TestLoadConfig_ValidateSetsError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// plans/SETS.md S0: the seven-capability schema and strict parsing (§3.12,
+// The seven-capability schema and strict parsing (
 // §3.19 / D5, D10/D11).
 
 // writeCfg writes yaml to a temp regexped.yaml and returns its path.

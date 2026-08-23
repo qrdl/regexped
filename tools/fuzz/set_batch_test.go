@@ -11,7 +11,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// find_batch — plans/SETS.md §19.
+// find_batch: several consecutive positions per call, resumed by cursor.
 //
 // The oracle is the same one the gated `find` target uses (§9.6.1): Go's
 // FindAllIndex per pattern, tagged with the pattern id. Deriving a reference

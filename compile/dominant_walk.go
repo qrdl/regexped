@@ -1,6 +1,6 @@
 package compile
 
-// Dominant-walk-state detection for the anchored probe (plans/SETS.md §18.1).
+// Dominant-walk-state detection for the anchored probe.
 //
 // A merged anchored DFA frequently spends an entire input in ONE state whose
 // self-loop covers almost every byte, waiting for a handful of bytes that may
@@ -32,7 +32,7 @@ const (
 // dominantWalkState is one state worth special-casing, in WASM id space.
 //
 // Two flavours, distinguished by which side of the self-loop is small enough
-// to test with a short SIMD compare chain (plans/SETS.md §21.2 / G11):
+// to test with a short SIMD compare chain:
 //
 //	Exceptions != nil — the EXIT set is small ("no chunk byte LEAVES").
 //	Members    != nil — the SELF-LOOP set is small ("every chunk byte STAYS").

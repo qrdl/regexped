@@ -13,7 +13,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Layer 2 (plans/OPUS.md §N7): the compiled paths the original find-only
+// Layer 2: the compiled paths the original find-only
 // fuzzer never reaches — anchored match, captures via TDFA, captures via
 // Backtracking, and set match/find_all.
 //
@@ -83,7 +83,7 @@ func compileSet(pats []string) ([]byte, map[int]bool, error) {
 		Name: "s",
 		Find: "set_find",
 		// Ungated body: every start position is enumerated, which is what
-		// allStartPositionMatches models (plans/SETS.md §3.15).
+		// allStartPositionMatches models.
 		Overlapping: true,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
@@ -105,7 +105,7 @@ func compileSet(pats []string) ([]byte, map[int]bool, error) {
 // and compile/set.go's warnPatternDropped). Such a pattern is not in the set,
 // so the set reports none of its matches — and a differential test that keeps
 // it in the oracle reports the engine as wrong for obeying its own contract.
-// That is plans/FUZZER_BUGS.md 57, whose threshold was exactly one DFA state
+// That was a real harness defect, whose threshold was exactly one DFA state
 // wide: 1024 states passed, 1025 was dropped and "failed".
 //
 // The ids here are the set's global pattern ids, which compileSet assigns as
@@ -128,8 +128,8 @@ func droppedFromSet(diags []compile.SetDiag) map[int]bool {
 // `defer release()` at the call site, so it runs after every use of the store,
 // instance and memory.
 //
-// Releasing explicitly is not optional housekeeping (plans/FUZZER_BUGS.md bug
-// 48). A Module owns JIT-compiled code and a Store owns the linear memory,
+// Releasing explicitly is not optional housekeeping. A Module owns
+// JIT-compiled code and a Store owns the linear memory,
 // both allocated on the C side. Without Close they are freed only when a
 // runtime.SetFinalizer callback runs, and a fuzz iteration allocates almost no
 // GO memory — so the GC pacer, which sees only the Go heap, can idle while
@@ -266,7 +266,7 @@ type setMatch struct {
 //
 // Each call returns the TOTAL number of matches at the first matching position
 // at or after `from`, writing min(total, out_cap) (patternID, start, end)
-// tuples (plans/SETS.md §3.11, §3.18). Every tuple in one call shares a start,
+// tuples. Every tuple in one call shares a start,
 // so the resume rule is `from = start + 1` and no dedup guesswork is needed —
 // the ambiguity the old find_all harness had to skip on is gone by
 // construction.

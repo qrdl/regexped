@@ -19,7 +19,7 @@ func captureWarnings(t *testing.T) (*bytes.Buffer, func()) {
 	return &buf, func() { slog.SetDefault(prev) }
 }
 
-// TestCompileFallback_WarnsOnStateLimitDrop covers plans/OPUS.md §N3: a pattern
+// TestCompileFallback_WarnsOnStateLimitDrop covers the drop warning: a pattern
 // excluded from a set because its suffix DFA exceeds maxFallbackStates must be
 // reported at warning level, not dropped silently.
 //

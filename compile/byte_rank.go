@@ -1,7 +1,7 @@
 package compile
 
 // Background byte-frequency ranks, used only to pick which byte columns a
-// packed-pair prefilter should probe (plans/SETS.md §16 Task G1).
+// packed-pair prefilter should probe.
 //
 // PROVENANCE AND WEIGHT. This is a heuristic, not a contract. The ranks
 // approximate how often a byte occurs in typical scanned input (text, logs,
@@ -94,14 +94,14 @@ func (p *packedPairPlan) splatCount() int { return len(p.Bytes1) + len(p.Bytes2)
 //
 // Each byte in a column costs one i8x16.eq plus (beyond the first) one v128.or
 // per 16-byte chunk, so the per-chunk cost grows linearly with the budget while
-// Teddy's nibble tables stay flat. The crossover measured for plans/SETS.md §16
+// Teddy's nibble tables stay flat. The crossover measured
 // Task G1 put packed-pair ahead through 4 and behind Teddy beyond it, which is
 // also the point at which two columns stop being selective enough to be worth
 // the verification they imply.
 const packedPairByteBudget = 4
 
 // packedPairChunks is how many 16-byte blocks the emitted scan loop handles
-// per iteration (plans/SETS.md §16 Task G2).
+// per iteration.
 //
 // Probe work scales linearly with this — two v128 loads and one i8x16.eq per
 // probe byte per block — but the per-iteration scaffolding does not: one

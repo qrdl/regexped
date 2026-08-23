@@ -923,7 +923,7 @@ func TestMultiPatternTeddy_LaneToID(t *testing.T) {
 
 func TestMultiPatternTeddy_TooManyLiterals(t *testing.T) {
 	// 17 two-byte literals are now BUCKETED into the 16 lanes rather than
-	// rejected (plans/SETS.md §14 P4); the cap is teddyMaxLiterals.
+	// rejected; the cap is teddyMaxLiterals.
 	lits := make([][]byte, 17)
 	for i := range lits {
 		lits[i] = []byte{byte('a' + i%26), byte('0' + i%10)}
@@ -987,8 +987,8 @@ func TestChooseLiteralFrontend(t *testing.T) {
 		lits [][]byte
 		want frontendKind
 	}{
-		// At or below 16 literals, a qualifying two-column packed pair wins
-		// (plans/SETS.md §16 Task G1): two eq-splat columns cost far less per
+		// At or below 16 literals, a qualifying two-column packed pair wins:
+		// two eq-splat columns cost far less per
 		// chunk than Teddy's four nibble-table probes, and both verify
 		// candidates identically.
 		{[][]byte{[]byte("ab"), []byte("cd")}, frontendPackedPair}, // cols {a,c} × {b,d} = 4, fits
@@ -1034,8 +1034,7 @@ func TestChooseLiteralFrontend(t *testing.T) {
 		want frontendKind
 	}{keywordShape, frontendPackedPair})
 	// 17 literals with 17 DISTINCT first bytes → bucketed Teddy: above the
-	// first-byte crossover, Teddy's fixed-cost probe beats AC's prefilter
-	// (plans/SETS.md §14.11).
+	// first-byte crossover, Teddy's fixed-cost probe beats AC's prefilter.
 	seventeenLits := make([][]byte, 17)
 	for i := range seventeenLits {
 		seventeenLits[i] = []byte{byte('a' + i%26), byte('0' + i%10)}
@@ -1436,8 +1435,8 @@ func TestCompileFile_ACFrontend(t *testing.T) {
 	assertDataSectionConsistent(t, wasm)
 }
 
-// TestACBudget covers the frontend budget introduced by plans/SETS.md §14 P1,
-// which replaced a 32-NODE cap that silently demoted any set past ~17-26
+// TestACBudget covers the Aho-Corasick table budget, which replaced a
+// 32-NODE cap that silently demoted any set past ~17-26
 // literals (the exact count varied with prefix sharing) to the scalar path, at
 // 86-414x the scan fuel (§13 F1, §14.2).
 //
@@ -1619,8 +1618,8 @@ func TestACLayoutBytes(t *testing.T) {
 	}
 }
 
-// TestACByteClassCompression covers the compressed layout (plans/SETS.md §14
-// P3). Compression is a RE-INDEXING of the goto table, so the invariant that
+// TestACByteClassCompression covers the compressed layout.
+// Compression is a RE-INDEXING of the goto table, so the invariant that
 // matters is that every byte still reaches the same target from every node —
 // checked directly here, since a wrong class map would corrupt matching in a
 // way only some inputs reveal.
@@ -1682,7 +1681,7 @@ func TestACByteClassCompression(t *testing.T) {
 
 // TestCompileFile_ShuftiFrontend exercises emitSetMatchFnFinalShufti and
 // litUnionFirstBytes (both 0% covered without this). Reaching the Shufti
-// frontend (LIKELY.md Gap H.3) requires, in order:
+// frontend requires, in order:
 //  1. chooseLiteralFrontend initially picks AC (17+ unique literals);
 //  2. the AC automaton itself exceeds the 32-node cap, so CompileSet
 //     downgrades fe back to frontendScalar (see the "Cap: fall back to
@@ -2790,7 +2789,7 @@ func lowRarityFirstBytes() []byte {
 // TestCompileFile_ShuftiNonAdaptive exercises the non-adaptive locals layout
 // in emitSetMatchFnFinalShufti (shuftiAdaptive = lnm && !rare — false here
 // because rare=true, i.e. shuftiBeatsScalar already selects Shufti
-// statically, so the LikelyNoMatch hint changes nothing) — TEST.md T12.
+// statically, so the LikelyNoMatch hint changes nothing) — the test plan T12.
 // TestCompileFile_ShuftiFrontend's digit/uppercase alphabet always has
 // rare=false, so it can only ever reach adaptive=true; this uses a
 // low-rarity (control-byte/punctuation) first-byte alphabet instead.
@@ -2821,7 +2820,7 @@ func TestCompileFile_ShuftiNonAdaptive(t *testing.T) {
 // TestCompileFile_ShuftiVarLenAndAnchor exercises the startAnchorMasks
 // (sam != 0) branch, the prefixFnIdx fixed-prefix loop, and the emitVarLen
 // closure (both varLenEmptySuffix and varLenNonEmptySuffix) inside
-// emitSetMatchFnFinalShufti — TEST.md T13. TestCompileFile_ShuftiFrontend's
+// emitSetMatchFnFinalShufti — the test plan T13. TestCompileFile_ShuftiFrontend's
 // 33 trivial-prefix patterns never exercise any of these; this reuses the
 // same low-rarity first-byte alphabet (forcing the Shufti frontend
 // unconditionally) but rotates each pattern through 4 prefix shapes:
@@ -2864,7 +2863,7 @@ func TestCompileFile_ShuftiVarLenAndAnchor(t *testing.T) {
 }
 
 // TestCompileFile_ACStartAnchor exercises the start-anchor branch (sam != 0,
-// prefixFnIdx loop) in the AC frontend (emitSetMatchFnFinalAC) — TEST.md
+// prefixFnIdx loop) in the AC frontend (emitSetMatchFnFinalAC) — the test plan
 // T14. Extends TestSetFind_AC_VarLenPrefix's 20-pattern shape (which forces
 // the AC frontend, 17-32 unique literals) with one ^-anchored pattern.
 // Confirmed live via CompileSet probing: fe=ac, startAnchorMasks[0]=1.
@@ -2900,7 +2899,7 @@ func TestCompileFile_ACStartAnchor(t *testing.T) {
 
 // TestCompileFile_TeddyTwoGroupsFourByte exercises the "Group B four-byte
 // lo/hi table load + nibble check" combination in emitSetMatchFnFinalTeddy
-// — TEST.md T15. TwoGroups requires > 8 literals; FourByte requires every
+// — the test plan T15. TwoGroups requires > 8 literals; FourByte requires every
 // literal >= 4 bytes; existing tests only ever hit one condition at a time.
 // 9 patterns, each with a distinct 6-byte mandatory literal, stays under the
 // 16-literal Teddy cap while satisfying both. Confirmed live via CompileSet
@@ -2931,7 +2930,7 @@ func TestCompileFile_TeddyTwoGroupsFourByte(t *testing.T) {
 // litAnchorBackScanBody != nil branch and the anchored groupsExport branch
 // inside assembleModuleWithSets (the cfg.Sets-non-empty per-pattern
 // assembler), which are otherwise only exercised via assembleModule's
-// sets-less path — TEST.md T16. "secret_[A-Za-z0-9]+" qualifies for
+// sets-less path — the test plan T16. "secret_[A-Za-z0-9]+" qualifies for
 // lit-anchor find (confirmed live: findLitAnchorPoint returns non-nil, and
 // the pattern's small forward DFA has useU8=true); "^(a)(b)$" is an anchored
 // groups_func pattern. A trivial, unrelated Sets entry is present so
@@ -2960,7 +2959,7 @@ func TestAssembleModuleWithSets_LitAnchorAndAnchoredGroups(t *testing.T) {
 
 // TestCompileFile_ErrorPropagation exercises the two distinct error paths
 // through CompileFile's full config entry point (previously only unit-
-// tested at the analyzePattern level directly) — TEST.md T17.
+// tested at the analyzePattern level directly) — the test plan T17.
 func TestCompileFile_ErrorPropagation(t *testing.T) {
 	t.Run("compilePattern_failure", func(t *testing.T) {
 		// Broken pattern WITH a func field set, alongside a non-empty Sets
@@ -3008,7 +3007,7 @@ func TestCompileFile_ErrorPropagation(t *testing.T) {
 // emitSetMatchFnAnchored — a pattern whose prefixAST is non-nil, not a
 // trivial prefix, and not variable-length, but whose fixed length is 0 (a
 // zero-width assertion, here \b, immediately before the mandatory literal)
-// — TEST.md T18. Confirmed live via analyzePattern/CompileSet probing:
+// — the test plan T18. Confirmed live via analyzePattern/CompileSet probing:
 // prefixFnIdx=[0] (a real, non-trivial prefix function), prefixFixedLens=[0]
 // (zero-width), trivialPrefixMasks=[0] (not trivial) — exactly the L<=0,
 // fnIdx>=0 combination the doc flagged as needing verification.
@@ -3029,7 +3028,7 @@ func TestSetMatch_ZeroWidthNonNilPrefix(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// plans/SETS.md §9.6: the per-export-combination matrix.
+// The per-export-combination matrix.
 //
 // FABLE wave 3 found bugs visible only under --find-only, and the same is true
 // here: each capability emits a different body shape, and a set that declares
@@ -3237,7 +3236,7 @@ func TestSetDiagRecordsRouting(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// plans/SETS.md §11 R1 / R-TESTS(1): subset selection.
+// Subset selection: PATTERN_COUNT vs ID_SPACE.
 //
 // Every harness in this project builds sets that select ALL of the config's
 // patterns, which keeps global pattern ids dense and equal to set-local
@@ -3456,9 +3455,8 @@ func exportTypeIndex(t *testing.T, wasm []byte, name string) int {
 	return int(ti)
 }
 
-// TestJumpIsProfitable pins the compile-time gate of plans/SETS.md §12.3, as
-// relaxed by §21.4 (G13): the §3.14 jump is emitted only where it can actually
-// fire and pay for itself — one pattern, or a scalar frontend (whose Θ(n)
+// TestJumpIsProfitable pins the compile-time gate on the gate-array jump:
+// it is emitted only where it can actually fire and pay for itself — one pattern, or a scalar frontend (whose Θ(n)
 // stepping the O(patterns) prologue is noise against), and in either case only
 // when some pattern can match more than one byte.
 //
@@ -3524,8 +3522,7 @@ func TestJumpIsProfitable(t *testing.T) {
 	}
 }
 
-// TestTeddyTwoGroupLaneExtraction pins the two-group lane-extraction hazard
-// fixed in plans/SETS.md §14.11.
+// TestTeddyTwoGroupLaneExtraction pins a two-group lane-extraction hazard.
 //
 // emitSetMatchFnFinalTeddy extracts a candidate byte using lLaneOff (the
 // position within the 16-byte chunk), but emitLitDispatch reuses lLaneOff as
@@ -3591,7 +3588,7 @@ func TestTeddyTwoGroupLaneExtraction(t *testing.T) {
 // (firstByteFlags, or the class map when compressed). Harmless but real: it
 // inflates every AC set's table footprint, and acBudgetBytes is measured
 // against that footprint, so the gap made the budget hold fewer literals than
-// it should (plans/SETS.md §14.14).
+// it should.
 func TestACLayoutNoGap(t *testing.T) {
 	cases := [][][]byte{
 		{[]byte("ab"), []byte("cd")},
@@ -3623,7 +3620,7 @@ func TestACLayoutNoGap(t *testing.T) {
 	}
 }
 
-// TestSetFindBatch_Emission covers the structural half of plans/SETS.md §19:
+// TestSetFindBatch_Emission covers the structural half of find_batch:
 // the export exists, is independent of `find`, and declaring it does not
 // disturb the module for a set that doesn't ask for it. The BEHAVIOUR — the
 // cursor, the split-position resume — needs a WASM runtime and lives in
@@ -3692,7 +3689,7 @@ func TestSetFindBatch_Emission(t *testing.T) {
 	})
 }
 
-// TestSetCursorLayout pins the cursor field widths (plans/SETS.md §19.1). They
+// TestSetCursorLayout pins the cursor field widths. They
 // are computed in config so the compiler and all six generators share ONE
 // definition; this asserts the definition itself, not either caller.
 func TestSetCursorLayout(t *testing.T) {

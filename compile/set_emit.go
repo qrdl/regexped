@@ -17,7 +17,7 @@ import (
 type compiledSet struct {
 	name string
 
-	// Capability export names (plans/SETS.md §3.12); "" = not declared.
+	// Capability export names; "" = not declared.
 	match    string // anchored, 0|1
 	matchAny string // anchored, pattern id or -1
 	matchAll string // anchored, bitmask / bitmap of ids
@@ -45,7 +45,7 @@ type compiledSet struct {
 	overlapping bool
 
 	// declaredIDSpace is SetSpec.IDSpaceSize — the id-space bound agreed with
-	// the stub generators (plans/SETS.md §11 R1). Zero means "derive it";
+	// the stub generators. Zero means "derive it";
 	// read it through idSpaceSize(), never directly.
 	declaredIDSpace int
 
@@ -67,7 +67,7 @@ type compiledSet struct {
 	scanProbeBodies [][]byte
 
 	// scanProbeAnyBodies[i] is bucket i's first-hit-exit probe, used by `scan`
-	// and `scan_any` only (plans/SETS.md §18.2 / G6). Empty when the set
+	// and `scan_any` only. Empty when the set
 	// declares neither; `scan_all` always uses scanProbeBodies.
 	scanProbeAnyBodies [][]byte
 
@@ -96,8 +96,8 @@ type compiledSet struct {
 	prefixDataSegCount int
 
 	// unionScan is the start-anywhere union automaton serving `scan` and the
-	// narrow `scan_all` when the set has no literal frontend to skip with
-	// (plans/SETS.md §14 P5). Nil when the set is ineligible or kept its
+	// narrow `scan_all` when the set has no literal frontend to skip with.
+	// Nil when the set is ineligible or kept its
 	// per-position path.
 	unionScan *unionScanDFA
 
@@ -113,8 +113,7 @@ type compiledSet struct {
 	startAnchorMasks []uint32
 
 	// lineAnchorMasks[bi]: bitmask of patterns anchored with (?m:^) — eligible
-	// at position 0 and at any position whose preceding byte is a newline
-	// (plans/FABLE.md B43).
+	// at position 0 and at any position whose preceding byte is a newline.
 	lineAnchorMasks []uint32
 
 	// prefixFixedLens[bi][k]: fixed prefix length for pattern k (minLen==maxLen>0); else 0.
@@ -135,7 +134,7 @@ type compiledSet struct {
 	// Frontend strategy chosen for this set's literal scan.
 	fe frontendKind
 
-	// First-byte eligibility masks (plans/SETS.md §21.6), one 256 x u32 table
+	// First-byte eligibility masks, one 256 x u32 table
 	// per FALLBACK bucket that has something to clear. startableOff[bi] is the
 	// table's address, or -1 when bucket bi has none — which is every bucket
 	// on a set that does not qualify, so those sets stay byte-identical.
@@ -143,7 +142,7 @@ type compiledSet struct {
 	startableDataBytes []byte
 	startableDataSegs  int
 
-	// Literal-existence absence prefilter (plans/SETS.md §21.3 / G12).
+	// Literal-existence absence prefilter.
 	// absenceLits carries one literal per pattern that has one; absenceAlive
 	// is the mask of patterns that have none and are therefore always reported
 	// alive. absenceOK is false when the prefilter cannot serve this set.
@@ -177,7 +176,7 @@ type compiledSet struct {
 	// shuftiAdaptive (task 28): true when Shufti was selected ONLY because
 	// set-level LikelyNoMatch overrode a static verdict that scalar would
 	// win (shuftiBeatsScalar(union) == false). Mirrors EmitPrefixScan's
-	// `adaptive` gate (TODO.md task 25) for the single-pattern path: the
+	// `adaptive` gate for the single-pattern path: the
 	// static heuristic can't tell "sparse runtime data" (override
 	// genuinely wins) from "dense runtime data" (override regresses), so
 	// emitSetMatchFnFinalShufti adds a runtime DenseCounter/DenseSkipFlag
@@ -313,7 +312,7 @@ func (cs *compiledSet) hiddenFnCount() int {
 
 // gatedFind reports whether this set emits the default (per-pattern
 // non-overlapping) `find` body, which threads a gate array through the suffix
-// functions (plans/SETS.md §3.14-3.16).
+// functions.
 func (cs *compiledSet) gatedFind() bool { return cs.hasFind() && !cs.overlapping }
 
 // hasFind reports whether either position-reporting capability is declared.
@@ -327,7 +326,7 @@ const setMatchTypeMatch = setTypeI32x5ToI32
 type SetSpec struct {
 	Name string
 
-	// Capability export names (plans/SETS.md §3.12); "" = not declared.
+	// Capability export names; "" = not declared.
 	Match    string
 	MatchAny string
 	MatchAll string
@@ -335,7 +334,7 @@ type SetSpec struct {
 	ScanAny  string
 	ScanAll  string
 	Find     string
-	// FindBatch is the multi-position sibling of Find (plans/SETS.md §19).
+	// FindBatch is the multi-position sibling of Find.
 	// Independent of it: either, both or neither may be declared.
 	FindBatch string
 
@@ -345,7 +344,7 @@ type SetSpec struct {
 	// config.SetConfig.IDSpaceSize, the SAME function every stub generator
 	// calls, so the two sides provably agree on the size of everything
 	// indexed by pattern id (gate array, `_all` bitmap, and the narrow-vs-wide
-	// `_all` ABI). See plans/SETS.md §11 R1. Zero means "derive it from the
+	// `_all` ABI). Zero means "derive it from the
 	// pattern ids", which is what the internal harnesses that build a SetSpec
 	// directly (rather than from a config) get.
 	IDSpaceSize int
@@ -354,8 +353,9 @@ type SetSpec struct {
 	// patterns the set SELECTS, before any are dropped for carrying captures
 	// or exceeding the state limit. It sizes the stubs' tuple buffer, and with
 	// it the §19 cursor's k field, so it must be the DECLARED count both sides
-	// can compute rather than the surviving one only the compiler sees
-	// (the plans/SETS.md §11 R1 hazard). Zero means "use the resolved count",
+	// can compute rather than the surviving one only the compiler sees —
+	// a mismatch there is a memory-safety hazard, not a wrong answer.
+	// Zero means "use the resolved count",
 	// which is what the internal harnesses building a SetSpec directly get.
 	DeclaredPatternCount int
 
@@ -394,13 +394,13 @@ func (s SetSpec) suffixNeedsSkip() bool { return s.FindBatch != "" && s.Overlapp
 // needsScanProbes reports whether the set declares one of the non-anchored
 // capabilities other than `find`. Those answer "which patterns match here?"
 // and use the cheap bitmask probe over the find-path buckets rather than the
-// tuple-writing suffix function (plans/SETS.md §5).
+// tuple-writing suffix function.
 func (s SetSpec) needsScanProbes() bool {
 	return s.Scan != "" || s.ScanAny != "" || s.ScanAll != ""
 }
 
 // needsFirstHitProbes reports whether the set declares a capability that may
-// stop at the first matching bit (plans/SETS.md §18.2 / G6). `scan_all` is
+// stop at the first matching bit. `scan_all` is
 // deliberately absent: its answer is the full bitmask at a position.
 func (s SetSpec) needsFirstHitProbes() bool {
 	return s.Scan != "" || s.ScanAny != ""
@@ -513,7 +513,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// Two probe variants are only needed when the set wants BOTH exit rules.
 	// With no `scan_all` declared, nothing needs the mask-complete walk, so
 	// the single probe simply IS the first-hit one and no second body — and
-	// no module bytes — are spent (plans/SETS.md §18.2).
+	// no module bytes — are spent.
 	// G8's liveness table is only worth its per-byte cost where a preflight
 	// will narrow the wanted mask (§18.4); elsewhere it is §16.5.2's reverted
 	// Candidate A all over again — a check that costs every byte and can
@@ -568,13 +568,13 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	var totalDataSegs int
 	tableOffset := opts.TableBase // data segment base for this set's tables
 
-	// The tuple-writing suffix function is `find`'s alone (plans/SETS.md §5):
+	// The tuple-writing suffix function is `find`'s alone:
 	// it is the per-pattern extent machinery, and the other six capabilities
 	// answer their question from the bitmask probe instead. A set that does
 	// not declare `find` therefore emits no suffix FUNCTIONS at all — only
 	// their DFA tables, which the probes share.
 	needSuffixFns := spec.HasFind()
-	// Suffix-table dedup (plans/SETS.md §14 P7). Buckets very often share a
+	// Suffix-table dedup. Buckets very often share a
 	// suffix: `kw%03d[0-9a-z]{3}` gives every pattern its own literal and its
 	// own bucket, but one identical `[0-9a-z]{3}` table, re-emitted once per
 	// bucket. The tables are the bulk of such a module.
@@ -699,13 +699,13 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// timeouts during re2test instantiation" — a test-harness constraint
 		// shaping production codegen, and one that no longer reproduces:
 		// instantiating a 128-literal AC module measures ~8 us, flat in AC
-		// size (plans/SETS.md §14.1 F2, §14.2). What it cost was 86-414x the
+		// size. What it cost was 86-414x the
 		// scan fuel, because past the cap the set silently lost its literal
 		// frontend entirely and visited every input position against every
 		// bucket (§13 F1). See acBudgetBytes for why this is denominated in
 		// bytes and why the default is what it is.
-		// Uncompressed first, byte-class compression only as a RESCUE
-		// (plans/SETS.md §14 P3). Compression costs one table load per input
+		// Uncompressed first, byte-class compression only as a RESCUE.
+		// Compression costs one table load per input
 		// byte to map byte→class, so spending it on a set that already fits
 		// would trade fuel — this project's first-priority metric — for
 		// module bytes, its second. It earns that cost only against the
@@ -823,7 +823,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		packedPair, _ = choosePackedPair(lits)
 	}
 
-	// LIKELY.md Gap H.3: density-heuristic / Action 5 Shufti for the
+	// the LikelyMode dispatch design: density-heuristic / Action 5 Shufti for the
 	// scalar fallback case. Requires zero fallback buckets (Shufti can't
 	// skip positions that fallback patterns must visit) and a first-byte
 	// union in the 17..64 band. The selection trigger is either the
@@ -868,8 +868,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// replaces got it wrong in the unsafe direction: for a set declaring all
 	// seven capabilities it placed the union-scan table 8 bytes INSIDE the
 	// anchored eofBitmask, silently overwriting the last state's accept mask.
-	// That is plans/SETS.md §18.10 — an anchored false positive that appeared
-	// only when unrelated capabilities were also declared.
+	// That was an anchored false positive which appeared only when
+	// unrelated capabilities were also declared.
 	setTablesEnd := prefixTableOffset
 	if acL != nil {
 		setTablesEnd = acFirstByteFlagsOff + 256 // firstByteFlags is last
@@ -962,7 +962,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 	}
 
-	// Start-anywhere union DFA for the scan trio (plans/SETS.md §14 P5).
+	// Start-anywhere union DFA for the scan trio.
 	//
 	// Built here, last, so its tables sit past every other region this set
 	// emits — the anchored automata are laid out immediately above AC/Teddy
@@ -1073,8 +1073,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 // in SetDiag.StateLimitDropped, and a set that does not contain a pattern does
 // not report its matches. Any differential test therefore has to know which
 // patterns actually made it in, or it compares the engine against an oracle
-// for a set the engine was never asked to build — which is exactly
-// plans/FUZZER_BUGS.md 57.
+// for a set the engine was never asked to build.
 //
 // CmdWriteDiagJSON answers the same question by RE-RUNNING the whole set
 // compilation. That is fine for a CLI flag and wrong for a caller in a hot
@@ -1115,12 +1114,12 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		// Batch find/groups export trigger (plans/TODO.md task 44) — same
+		// Batch find/groups export trigger — same
 		// trigger compileAll applies; see compileAll's comment for the
 		// eligibility rules. Only the per-pattern exports get a batch
 		// wrapper here: a set's `find` already returns every match at one
-		// position per call and needs no batch knob (plans/SETS.md §7.7 /
-		// D12), so assembleModuleWithSets does not add batch wrappers for
+		// position per call and needs no batch knob, so
+		// assembleModuleWithSets does not add batch wrappers for
 		// compiledSet functions.
 		if hasBatchHint(re.Hints) {
 			if p.findExport != "" {
@@ -1215,8 +1214,8 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 		setOpts.TableBase = int32(setTableBase)
 		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
 		compiledSets = append(compiledSets, cs)
-		// Advance to where this set's tables ACTUALLY end (plans/FUZZER_BUGS.md
-		// bug 44). This used to add up the encoded blob lengths, which is not
+		// Advance to where this set's tables ACTUALLY end. This used to
+		// add up the encoded blob lengths, which is not
 		// the extent of anything: the blobs carry per-segment headers, and
 		// CompileSet places tables at explicit offsets with alignment gaps.
 		// The sum ran short, which under-sized the module's memory whenever the
@@ -1603,7 +1602,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				var body []byte
 				if cs.usesUnionScan(c.kind) {
 					// One pass over the start-anywhere automaton instead of
-					// the per-position bucket walk (plans/SETS.md §14 P5).
+					// the per-position bucket walk.
 					body = emitUnionScanBody(cs.unionScan, c.kind, cs.fullIDMask(), tableMemIdx)
 				} else {
 					// `scan` / `scan_any` may stop at the first bit and get
@@ -1703,11 +1702,11 @@ func hasSetFallbackBuckets(cs *compiledSet) bool {
 
 // emitSetMatchFnFinalScalar emits the scalar (byte-by-byte) set `find` body.
 //
-// Signature (plans/SETS.md §4.1): (ptr, len, from, out_ptr, out_cap) -> i32,
+// Signature: (ptr, len, from, out_ptr, out_cap) -> i32,
 // returning the TOTAL number of matches at the first matching position at or
 // after `from`. See compile/set_find.go for the first-position machinery.
 func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemIdx int, mode setCapKind, probeFnBase int) []byte {
-	// G8 (plans/SETS.md §18.4): when this set qualifies, `scan_any` runs the
+	// G8: when this set qualifies, `scan_any` runs the
 	// start-anywhere union automaton ONCE over [from,len) and uses the result
 	// to drop patterns that match nowhere from every bucket's validMask. The
 	// per-bucket walks then terminate through the G8 liveness exit instead of
@@ -1804,7 +1803,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 }
 
 // emitSetMatchFnFinalShufti emits the set match function body using a SIMD
-// Shufti first-byte pre-filter (LIKELY.md Gap H.3). The per-position bucket
+// Shufti first-byte pre-filter. The per-position bucket
 // check is identical to the scalar path — the only addition is a 16-bytes-
 // per-chunk SIMD skip loop at the top of each iteration that advances lPos
 // to the next position where any literal's first byte appears.
@@ -2125,7 +2124,7 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		// per chunk, so it scales linearly in the size of the first-byte set:
 		// 36 distinct first bytes means ~144 ops to probe 16 input bytes,
 		// which is what made AC 7-10M fuel on the "diverse" shape against
-		// 0.4M on a shared-prefix one (plans/SETS.md §14.2). Shufti answers
+		// 0.4M on a shared-prefix one. Shufti answers
 		// the same membership question in ~7 ops per 8 bytes of the SET —
 		// ~35 ops for those same 36 first bytes — because the set lives in
 		// nibble tables rather than in the instruction stream.
@@ -2338,7 +2337,7 @@ func emitExtractLane(b []byte, lCands, lLaneOff, lLaneBit byte) []byte {
 }
 
 // emitSetMatchFnFinalPackedPair emits the set match body using a two-column
-// byte-equality SIMD prefilter (plans/SETS.md §16 Task G1).
+// byte-equality SIMD prefilter.
 //
 // Per 16-byte chunk it loads the two probe columns, tests each against the
 // distinct bytes that column can hold, ANDs the two results and extracts a
@@ -2507,7 +2506,7 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
 		for li, lb := range lit {
 			// A probe column may be skipped ONLY when its candidate set holds
-			// a single byte (plans/FUZZER_BUGS.md bug 51).
+			// a single byte.
 			//
 			// The lane mask is an OR over every literal's probe bytes, so a
 			// set lane means "SOME literal's probe bytes matched here", not
@@ -2925,7 +2924,7 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	// candidate meant a true fingerprint match on all probed bytes, so the
 	// two groups rarely had candidates at the same position. Bucketed lanes
 	// OR several literals into one bit, group A candidates become common, and
-	// the clobber fires routinely (plans/SETS.md §14.11).
+	// the clobber fires routinely.
 	b = emitExtractLane(b, lCands, lLaneOff, lLaneBit)
 	if tt.TwoGroups {
 		b = emitExtractLane(b, lCandsB, lLaneOff, lLaneBitB)

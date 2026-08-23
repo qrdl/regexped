@@ -9,7 +9,7 @@ import (
 // isWholePatternSingleCapture reports whether re's only capture group spans
 // the entire match — group 0 and group 1 are therefore always identical in
 // wrapper context, so a TDFA/Backtracking capture-body re-walk of [start,end)
-// is pure waste (see plans/TODO.md task 41). Accepts a single OpCapture at
+// is pure waste. Accepts a single OpCapture at
 // top level, optionally inside an OpConcat alongside zero-width assertions
 // (^, $, \b, \B). Anything else — nested captures, additional captures,
 // non-zero-width siblings, or multiline anchors (OpBeginLine/OpEndLine, which

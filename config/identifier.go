@@ -15,7 +15,7 @@ import (
 // `scan_any`, `scan_all`, `find`), is interpolated
 // verbatim into generated source in all six stub languages (see generate/).
 // Without a check, a config file can plant arbitrary code in the caller's
-// crate/module — see plans/OPUS.md §N4, where this is demonstrated end to end.
+// crate/module.
 //
 // The rules, agreed 2026-08-17:
 //
@@ -39,7 +39,7 @@ import (
 // Also deliberately out of scope: duplicate named capture groups within a
 // pattern (IMPROVEMENT_PLAN #14). That is a different defect with a different
 // symptom — duplicate map keys in the named-groups stub — and shares no code
-// with this check. See plans/OPUS.md §N4.
+// with this check.
 
 // reservedWords is the union of reserved words across the six stub languages
 // regexped can emit: Rust, Go, C, JavaScript, TypeScript and AssemblyScript.
@@ -117,7 +117,7 @@ var jsKeywords = []string{
 	// Not reserved words, but restricted binding names: strict-mode code may
 	// not bind either, and a generated ES module is always strict. So
 	// `export function eval(...)` is a SyntaxError even though `eval` passes
-	// every reserved-word list. See plans/FABLE.md B33.
+	// every reserved-word list.
 	"eval", "arguments",
 }
 
@@ -262,7 +262,7 @@ func duplicateCaptureNames(pattern string) []string {
 }
 
 // ---------------------------------------------------------------------------
-// Per-stub-type validation (plans/FABLE.md B32, B34)
+// Per-stub-type validation
 //
 // The `_func` / set-export rule above is deliberately language-agnostic: a name
 // legal today must not become a compile error the moment stub_type changes.
@@ -299,7 +299,7 @@ var tsHelperNames = append(append([]string(nil), jsHelperNames...), "SetMatch", 
 
 // asHelperNames are the module-scope names the AssemblyScript generator emits
 // itself. It declares both classes unconditionally whenever a set exists, and
-// nothing checked them before (plans/SETS.md §11 R14): a user export named
+// nothing checked them before: a user export named
 // SetMatch produced a file with both `class SetMatch` and
 // `export function SetMatch`, which asc rejects with no diagnostic from us.
 var asHelperNames = []string{"SetMatch", "SetAnchor"}
@@ -428,7 +428,7 @@ func init() {
 }
 
 // validateImportModule checks cfg.ImportModule against the requirements of the
-// one generator stubType selects. See plans/FABLE.md B32.
+// one generator stubType selects.
 //
 //   - rust: emitted as `pub mod <name>` — needs a real Rust identifier.
 //   - go:   emitted as `package <name>` when the stub lands in a directory of
@@ -465,7 +465,7 @@ func validateImportModule(cfg *BuildConfig, stubType string) []string {
 }
 
 // validateExportsForStubType applies the collision checks that are specific to
-// one generator. See plans/FABLE.md B34.
+// one generator.
 func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 	var problems []string
 	refs := allExportRefs(cfg)
@@ -603,7 +603,7 @@ func CamelSetName(name string) string {
 
 // setDerivedNames returns the module-scope names stubType's generator
 // synthesizes from one set's NAME — the pattern-count, id-space and
-// find_batch cursor constants (plans/SETS.md D16, §11 R1, §19).
+// find_batch cursor constants.
 //
 // All four are returned whether or not the set declares find_batch today. The
 // batch constants are emitted only when it does, but conditioning the check on

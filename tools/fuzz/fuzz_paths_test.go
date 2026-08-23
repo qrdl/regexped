@@ -1,4 +1,4 @@
-// Layer 2 of the fuzzer (plans/OPUS.md §N7): the four compiled paths
+// Layer 2 of the fuzzer: the four compiled paths
 // FuzzCorrectness never reaches.
 //
 // FuzzCorrectness only ever sets FindFunc, so it exercises exactly one of the
@@ -68,8 +68,7 @@ func isResourceCeiling(err error) bool {
 		// the four above it has no fallback — the set compile fails — but it is
 		// the same KIND of event: a construction refused as effectively
 		// unbounded, not an answer that disagrees with Go. Omitting it is what
-		// made FuzzSet/40f883ef54d47f63 look like a defect
-		// (plans/FUZZER_BUGS.md 55).
+		// made FuzzSet/40f883ef54d47f63 look like a defect.
 		errors.Is(err, compile.ErrDFAStateLimit)
 }
 
@@ -307,8 +306,8 @@ func FuzzGroupsBothEngines(f *testing.F) {
 // FuzzSet checks a two-pattern `overlapping: true` set's find against
 // per-start-position anchored matching.
 //
-// Comparison is per pattern and by MULTISET, not by sequence: plans/SETS.md
-// §3.10 leaves the order of the tuples within one call unspecified. Patterns
+// Comparison is per pattern and by MULTISET, not by sequence: the set ABI
+// leaves the order of the tuples within one call unspecified. Patterns
 // carrying capture groups are skipped: the set pipeline drops capture-bearing
 // patterns (SetDiag.CaptureBearingDropped), so including one would produce an
 // oracle mismatch that is expected behaviour rather than a bug.
@@ -321,7 +320,7 @@ func FuzzSet(f *testing.F) {
 	}
 	f.Add(`abc`, `abd`, "xxabcabd")
 	f.Add(`a+`, `b+`, "aabbaa")
-	// plans/SETS.md §9.4 first-position inversions: literal-candidate order is
+	// First-position inversions: literal-candidate order is
 	// not match-start order once prefixes vary in length.
 	f.Add(`bX`, `.+Y`, "abXY")         // unbounded prefix recovers an earlier start
 	f.Add(`(?:ab)+Y`, `cX`, "abcXabY") // variable-length prefix, state-dependent
@@ -339,7 +338,7 @@ func FuzzSet(f *testing.F) {
 			t.Skip("input longer than the per-start-position oracle can price under the worker deadline")
 		}
 		// The whole-input oracle below counts RUNES in its `.{p}` prefix, so
-		// it is only exact on single-byte-rune input (plans/SETS.md §9.6).
+		// it is only exact on single-byte-rune input.
 		for i := 0; i < len(input); i++ {
 			if input[i] >= 0x80 {
 				t.Skip("non-ASCII input: the rune-counted whole-input oracle would misalign")
@@ -388,8 +387,7 @@ func FuzzSet(f *testing.F) {
 		for i, re := range refs {
 			if dropped[i] {
 				// Not in the set the engine built, so the set reports none of
-				// its matches and the oracle must not expect any
-				// (plans/FUZZER_BUGS.md 57).
+				// its matches and the oracle must not expect any.
 				if n := len(byID[i]); n != 0 {
 					t.Fatalf("set pattern[%d]=%q was DROPPED from the set but reported %d matches",
 						i, pats[i], n)
@@ -415,7 +413,7 @@ func FuzzSet(f *testing.F) {
 }
 
 // sortSpans orders spans by (start, end) so two multisets can be compared
-// element-wise. plans/SETS.md §3.10 leaves within-call tuple order
+// element-wise. The set ABI leaves within-call tuple order
 // unspecified, so the comparison must be multiset-based.
 func sortSpans(v [][2]int) {
 	sort.Slice(v, func(i, j int) bool {
@@ -447,7 +445,7 @@ func sortSpans(v [][2]int) {
 // `\B` and `(?m:^)` judge actual neighbours. The slice technique it replaces
 // (`\A(?:pat)` over input[p:]) judged them against a slice boundary instead
 // and forced every context-sensitive pattern to be skipped — which is exactly
-// how plans/FABLE.md B40 and B43 stayed invisible to this target.
+// how the \b and (?m:^) set defects stayed invisible to this target.
 //
 // `.{p}` counts runes, so callers must restrict the corpus to ASCII.
 //
@@ -488,7 +486,7 @@ func allStartPositionMatches(re *regexp.Regexp, input string) [][2]int {
 // to what this comment claimed until 2026-08-21: Go rejects on the PRODUCT of
 // nested counts, so `(?:.{1000}){2}` is an error just as `.{2000}` is, and the
 // oracle panicked on every input of 2000 bytes or more while `pathsInputCap`
-// admits 128 KB. Found by FuzzSet on a 3,282-byte input (plans/SETS.md §18.7).
+// admits 128 KB. Found by FuzzSet on a 3,282-byte input.
 //
 // CONCATENATION has no such limit — each term is independently under the
 // ceiling — so p/1000 copies of `.{1000}` plus a remainder term is correct for

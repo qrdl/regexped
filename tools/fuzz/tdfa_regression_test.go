@@ -10,7 +10,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// plans/FABLE.md B14/B15/B16 regressions — the TDFA capture path.
+// Regressions on the TDFA capture path.
 //
 // All three are silent wrong-answer bugs on patterns the selector itself routes
 // to TDFA, so every case here asserts the selector's own choice first: forcing

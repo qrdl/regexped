@@ -8,7 +8,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// plans/FABLE.md B12 regression.
+// Range-overread regression.
 //
 // emitRangeClassVerify runs the class verify over `countMax` bytes via
 // planRangeChunks, which covers [K, K+countMax) rounded up to a 16-byte

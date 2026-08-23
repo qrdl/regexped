@@ -2,7 +2,7 @@ package compile
 
 import "github.com/qrdl/regexped/internal/utils"
 
-// Bitmask-only bucket probes (plans/SETS.md §5).
+// Bitmask-only bucket probes.
 //
 // `find` is the only capability that reports positions and extents. The other
 // six ask a strictly cheaper question — "which patterns match?" — and §5's
@@ -80,7 +80,7 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 		lBits          = byte(7) // i32 accumulator
 	)
 
-	// Dominant-state bulk skip (plans/SETS.md §18.3 / G7), anchored only.
+	// Dominant-state bulk skip, anchored only.
 	//
 	// Restricted to the uncompressed u8 layout for the same reason G5's unroll
 	// is: the compressed and u16 paths route the input byte through a class
@@ -105,8 +105,8 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 
 	// Entry state, keyed on paramStart — shared with buildSetSuffixBody, which
 	// is where the rule (and the reason it keys on paramStart rather than the
-	// match start) is documented. This was a second copy until plans/SETS.md
-	// §11 R12; §11 R4 was present in BOTH copies, which is the argument for
+	// match start) is documented. This was a second copy until the two were
+	// consolidated; the same defect was present in BOTH copies, which is the argument for
 	// the extraction.
 	b = emitSetEntryState(b, p, paramPtr, paramStart)
 	b = append(b, 0x21, lState)
@@ -135,8 +135,7 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 	// --- scan loop ---
 	b = append(b, 0x02, 0x40) // block $done
 
-	// Anchored fast path: unroll four transitions per iteration
-	// (plans/SETS.md §16 Task G5).
+	// Anchored fast path: unroll four transitions per iteration.
 	//
 	// The per-byte loop below is already minimal — 24 WASM instructions, with
 	// no accept-table load at all, because every orTableBits call in this
@@ -164,7 +163,7 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 		b = append(b, 0x02, 0x40) // block $tail
 		b = append(b, 0x03, 0x40) // loop $main4
 
-		// Dominant-state bulk skip (plans/SETS.md §18.3 / G7).
+		// Dominant-state bulk skip.
 		//
 		// Placed at the TOP OF THE WALK, not at function entry: lState only
 		// becomes a dominant state after some bytes have been consumed, so an
@@ -198,8 +197,7 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
 			b = append(b, 0x21, lChunk)
 			// Both flavours build ONE mask with the same compare chain; only
-			// what the mask means, and therefore the test against it, differs
-			// (plans/SETS.md §21.2 / G11).
+			// what the mask means, and therefore the test against it, differs.
 			probe := d.Exceptions
 			if d.Members != nil {
 				probe = d.Members
@@ -302,7 +300,7 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 			b = append(b, 0x45, 0x0D, 0x01)                    // eqz -> $done
 		}
 		if exit == probeExitFirstHit {
-			// Any bit settles the question (plans/SETS.md §18.2 / G6).
+			// Any bit settles the question.
 			b = append(b, 0x20, lBits, 0x0D, 0x01)
 		} else {
 			// Every eligible pattern already seen: nothing further can change
@@ -464,7 +462,7 @@ func buildCountedChainProbeBody(class []byte, n int, anchored bool) []byte {
 // segments it needs: the DFA transition table and a per-state EOF accept
 // bitmask. Nothing else — the anchored probe reads no mid-accept, immediate-
 // accept or zero-width side table, because "did the run reach `len` in an
-// accepting state" is answered entirely at the end (plans/SETS.md §3.3).
+// accepting state" is answered entirely at the end.
 func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx, numPatterns int) (body []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
 	nextTableOffset = int32(tableBase)
 	if t == nil || t.numStates == 0 {

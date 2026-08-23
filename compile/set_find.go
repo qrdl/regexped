@@ -6,7 +6,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// Set `find` body support (plans/SETS.md §3.6, §3.11, §3.18, §9.4).
+// Set `find` body support.
 //
 // All four frontend bodies (Scalar, Shufti, AC, Teddy) share the same
 // per-candidate work: compute the bucket's validMask and run its suffix DFA.
@@ -128,7 +128,7 @@ type setFindCtx struct {
 	// harmless because the features that use it are gated off for them.
 	tableMemIdx int
 	// anyProbeBase / useAnyProbe route `scan` and `scan_any` to a bucket's
-	// first-hit-exit probe where one was emitted (plans/SETS.md §18.2).
+	// first-hit-exit probe where one was emitted.
 	anyProbeBase int
 	useAnyProbe  bool
 	wideBitmap   bool // scan_all with > 64 patterns: write a bitmap, count hits
@@ -158,13 +158,13 @@ type setFindCtx struct {
 	localBase byte
 	lPos      byte
 
-	// gated selects the default, per-pattern non-overlapping body
-	// (plans/SETS.md §3.14-3.16). pGate then names the gate-array parameter.
+	// gated selects the default, per-pattern non-overlapping body.
+	// pGate then names the gate-array parameter.
 	gated bool
 	pGate byte
 
 	// batch marks this body as the hidden per-position WORKER of a
-	// find_batch export rather than the exported `find` (plans/SETS.md §19).
+	// find_batch export rather than the exported `find`.
 	// Two things change:
 	//
 	//   - gated: gates are written for every tuple actually DELIVERED, not
@@ -272,7 +272,7 @@ func (c *setFindCtx) emitAliveNarrow(b []byte, bi int) []byte {
 //   - L > 0: every pattern is a CANDIDATE, and emitPrefixChecks clears the
 //     ones whose backward prefix DFA rejects. Starting from all-set is what
 //     lets the gate pre-mask and the empty-mask skip run BEFORE those DFA
-//     calls (plans/SETS.md §11 R6) rather than after them.
+//     calls rather than after them.
 func (c *setFindCtx) emitGroupMask(b []byte, bi int, g prefixLenGroup, posLocal byte) []byte {
 	cs := c.cs
 	if g.L != 0 {
@@ -324,7 +324,7 @@ func (c *setFindCtx) emitGroupMask(b []byte, bi int, g prefixLenGroup, posLocal 
 // tests that can discard the whole group: `lStart < from`, the §9.4 drain
 // guard `lStart > lMinStart`, and the §3.16 gate pre-mask. A candidate past
 // the committed minimum start paid a full backward scan per pattern and then
-// branched out without reading a single result bit (plans/SETS.md §11 R6).
+// branched out without reading a single result bit.
 //
 // The per-pattern liveness guard is only emitted when a gate could have
 // cleared some but not all of the group's bits; otherwise the group-level
@@ -439,7 +439,7 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 		if first {
 			// 2*lStart + 1 is loop-invariant across the group's patterns, so
 			// compute it once into lTmp instead of re-emitting the shift-and-add
-			// for each of up to 32 patterns per candidate (plans/SETS.md §11 R13).
+			// for each of up to 32 patterns per candidate.
 			// lTmp is free here: emitCommit and emitSuffixCall only write it
 			// later.
 			b = append(b, 0x20, c.lStart, 0x41, 0x01, 0x74, 0x41, 0x01, 0x6A)
@@ -519,7 +519,7 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 // on §3.14's own ladder (`a+` over n x "a", gated, driven to exhaustion) the
 // terminating call cost 7.8M fuel at n=500 and 1.98B at n=8000 — x4 per
 // doubling, textbook O(n^2). §10.5 read that as linear because TestGatedLadder
-// counted calls rather than work (plans/SETS.md §11 R5).
+// counted calls rather than work.
 //
 // It is emitted for every mode, not just the gated one: emitValidMask starts
 // from the trivial-prefix mask and ORs in only the patterns whose anchor and
@@ -650,7 +650,7 @@ func setPatternIDs(cs *compiledSet) []int {
 }
 
 // jumpIsProfitable decides AT COMPILE TIME whether emitting the §3.14 jump can
-// pay for itself (plans/SETS.md §12.3).
+// pay for itself.
 //
 // The jump advances to the MINIMUM next-eligible position over all patterns,
 // so it can only fire when EVERY pattern is gated past the cursor. With
@@ -715,7 +715,7 @@ func (cs *compiledSet) jumpIsProfitable() bool {
 
 // emitGateJump advances lPos past every position at which no pattern can
 // possibly match — §3.14's second optimisation ("jump, don't step"), which was
-// never built (plans/SETS.md §11 R5).
+// never built.
 //
 // Pattern k's earliest eligible position is the smallest p with
 // 2p + 1 >= gate[k], i.e. ceil((gate[k]-1)/2), which for the §3.16 encoding is
@@ -861,8 +861,8 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 	return b
 }
 
-// emitStartableMask applies bucket bi's first-byte eligibility table
-// (plans/SETS.md §21.6): a pattern that cannot CONSUME input[posLocal] as its
+// emitStartableMask applies bucket bi's first-byte eligibility table:
+// a pattern that cannot CONSUME input[posLocal] as its
 // first byte cannot match starting there, so its bit is cleared before the
 // suffix DFA is called — and when the whole mask goes empty, the call is
 // skipped.
@@ -1017,7 +1017,7 @@ func (c *setFindCtx) emitDrainCheck(b []byte, lPos byte, depth byte) []byte {
 			// lTotal counts DISTINCT patterns seen, so the bound is how many
 			// patterns the set has — not the id space. Comparing against the
 			// id bound made this exit unreachable for any set whose ids are
-			// sparse (plans/SETS.md §11 R1).
+			// sparse.
 			b = append(b, 0x20, c.lTotal, 0x41)
 			b = utils.AppendSLEB128(b, int32(c.cs.numPatterns()))
 			b = append(b, 0x4E, 0x0D, depth)
@@ -1044,7 +1044,7 @@ func (c *setFindCtx) emitDrainCheck(b []byte, lPos byte, depth byte) []byte {
 //
 // Shared by the Scalar and Shufti bodies, which held identical copies — the
 // same bound check, the same per-byte compare chain, the same emitBucketAt
-// call (plans/SETS.md §11 R12). The Teddy and AC bodies do not use it: their
+// call. The Teddy and AC bodies do not use it: their
 // frontends already identify WHICH literal fired, so they dispatch straight to
 // that literal's buckets instead of re-testing all of them.
 func (c *setFindCtx) emitLiteralBuckets(b []byte, lPos byte) []byte {

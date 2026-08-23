@@ -56,7 +56,7 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 		return "", false
 	}
 	var out strings.Builder
-	fmt.Fprintf(&out, "// ---- set composition wrappers (plans/SETS.md §4.4) ----\n\n")
+	fmt.Fprintf(&out, "// ---- set composition wrappers ----\n\n")
 	fmt.Fprintf(&out, "// SetMatch is one match reported by a set Find iterator.\ntype SetMatch struct { PatternID, Start, End int }\n\n")
 	if hasFindBatch(cfg) {
 		fmt.Fprintf(&out, "// SetTuple is one slot of a batched scan's buffer, in the raw form the\n// module writes. Allocate a []SetTuple once and reuse it for every scan: the\n// batched iterator borrows it and never allocates.\ntype SetTuple [3]int32\n\n")

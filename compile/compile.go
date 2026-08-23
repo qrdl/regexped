@@ -30,8 +30,7 @@ import (
 // legitimate resource ceiling, and it is EXPORTED for the same reason
 // ErrBTProgramTooLarge is: so external callers, notably tools/fuzz, can tell
 // a refused construction from a disagreement with Go via errors.Is. A fuzz
-// target that reports it as a defect is reporting the ceiling, not a bug
-// (plans/FUZZER_BUGS.md 55).
+// target that reports it as a defect is reporting the ceiling, not a bug.
 var ErrDFAStateLimit = errors.New("compile: DFA state limit exceeded during construction")
 
 // ErrBTProgramTooLarge is returned whenever compile() would route a pattern
@@ -68,7 +67,7 @@ const maxBTFallbackInstructions = 20000
 
 // maxBTFallbackPrefixLen caps the length of the mandatory-literal prefix
 // (computePrefix's result) used to build the Backtracking find fallback's
-// SIMD/scalar prefix-scan optimisation (FUZZER_BUGS.md #31). The prefix is
+// SIMD/scalar prefix-scan optimisation. The prefix is
 // purely a candidate pre-filter — the BT matcher re-verifies every
 // candidate position independently, so truncating it changes nothing about
 // correctness, only how many candidate positions the scan lets through.
@@ -95,7 +94,7 @@ const maxBTFallbackPrefixLen = 64
 // WASM module whose memory section is already invalid: it fails at
 // wasmtime.NewModule/instantiation time with a generic "memory size must be
 // at most 0x10000 pages" error instead of failing compilation with a clear,
-// attributable error (FUZZER_BUGS.md #32).
+// attributable error.
 var ErrBTStackTooLarge = errors.New("compile: backtracking stack reservation exceeds WASM's 4GiB memory limit")
 
 // maxWasmMemoryBytes is WASM32's hard linear-memory ceiling: a memory
@@ -116,7 +115,7 @@ func checkBTMemoryBudget(base int64, extra int64) error {
 // ErrBTLoopCountTooLarge is returned when a Backtracking construction's
 // loop-frame-local count (btNumLoopFrameLocals) is large enough that
 // wasmtime's JIT compilation of the resulting module becomes too slow for
-// tools/fuzz's `-fuzz` worker to tolerate (FUZZER_BUGS.md #33 — discovered
+// tools/fuzz's `-fuzz` worker to tolerate (a past defect — discovered
 // via FuzzCorrectness/092700-8c386fe83b176a61, a bug-31 regression-corpus
 // entry that still crashed under real `-fuzz` fuzzing, though not under
 // plain seed replay).
@@ -180,7 +179,7 @@ func checkBTLoopCount(bt *backtrack, withCaptureSnapshots bool) error {
 // construction's count of bt.emptyBodyGreedyLoop heads is large enough that
 // a single find/match/groups call risks costing multiple seconds at
 // *runtime* — a distinct failure mode from ErrBTLoopCountTooLarge, which
-// only bounds one-time JIT compile cost (FUZZER_BUGS.md #34, discovered via
+// only bounds one-time JIT compile cost (a past defect, discovered via
 // tools/fuzz/found repros of `(?m:$*$*...$*0$)`-shaped patterns, e.g. 16
 // chained `$*`).
 //
@@ -219,7 +218,7 @@ func checkBTLoopCount(bt *backtrack, withCaptureSnapshots bool) error {
 // live past a given push instead of all of them) was not attempted here:
 // this exact loop-head logic has a documented history of subtle correctness
 // regressions from well-intentioned changes (see bt.memoInnerLoop's doc,
-// FUZZER_BUGS.md #18's two reverted fix attempts, and this bug's own
+// a past defect’s two reverted fix attempts, and this bug's own
 // reverted twin-skip attempt above) and deserves its own carefully-measured
 // change, not a fix folded into an unrelated bug report. A compile-time cap
 // is the safe, narrowly-scoped mitigation for now.
@@ -280,8 +279,8 @@ type matcher interface {
 }
 
 // LikelyMode hints which suffix-DFA optimisation path the compiler should
-// favour for a pattern. See plans/LIKELY.md for the underlying structural
-// optimisations (SIMD counted-chain verifier, SIMD dominant-self-loop skip).
+// favour for a pattern. The optimisations it steers are the SIMD
+// counted-chain verifier and the SIMD dominant-self-loop skip.
 //
 // The field is presently a stub: it is plumbed through CompileOptions but does
 // not yet alter WASM emission, so all three modes produce identical output. It
@@ -335,8 +334,8 @@ func resolveHints(chain ...[]string) LikelyMode {
 	return LikelyNeutral
 }
 
-// hasBatchHint reports whether hints contains "batch-find" (plans/TODO.md
-// task 44) — the sole trigger for emitting a pattern's `_batch` WASM export.
+// hasBatchHint reports whether hints contains "batch-find" — the sole
+// trigger for emitting a pattern's `_batch` WASM export.
 // Unlike LikelyMode, this is not a chain/precedence value: it's a per-pattern
 // opt-in with no set-level fallback (config.validateHintList rejects
 // "batch-find" on a sets: entry, so there is nothing to resolve down from).
@@ -368,7 +367,7 @@ type CompileOptions struct {
 	ForceEngine   EngineType // If non-zero, skip engine selection and use this engine type
 	LeftmostFirst bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 	// LikelyMode hints which suffix-DFA structural optimisation to favour.
-	// Currently no-op; reserved for the LIKELY.md fast-accept / fast-reject paths.
+	// Currently no-op; reserved for the the LikelyMode design fast-accept / fast-reject paths.
 	LikelyMode LikelyMode
 	// CompiledDFAThreshold is the maximum minimised WASM state count for which the
 	// compiled dispatch path (EngineCompiledDFA) is used instead of the table-driven
@@ -405,7 +404,7 @@ type compiledPattern struct {
 	// captureBody and read by captureBody's word-boundary (\b/\B) checks at the
 	// two edges of the DFA-narrowed match slice. Only meaningful when
 	// !anchored && !isTDFA (Backtracking captureBody composed behind a find
-	// wrapper — see FUZZER_BUGS.md #26). Backtracking's own pos==0/pos==len
+	// wrapper. Backtracking's own pos==0/pos==len
 	// checks otherwise wrongly treat the narrowed slice's edges as the true
 	// start/end of the original input, losing real \b context beyond the
 	// match. Zero value (0) is never read unless isTDFA==false && anchored==false,
@@ -438,8 +437,7 @@ type compiledPattern struct {
 	litAnchorTeddyT1HiBytes []byte
 	litAnchorLitSet         [][]byte // raw literals for post-Teddy scalar verification
 	// Non-mid-accept bulk-skip helper fields (nonMidHelperBody,
-	// findBodyCallSites) were extracted to
-	// plans/non_mid_extension.go.archive (Section 10).
+	// findBodyCallSites) were removed with the rest of that infrastructure.
 
 	// Alternation literal-anchored matching fields (Task 6 v1, 2026-07-05).
 	// altLitAnchorBranches != nil means this pattern's top-level op is
@@ -638,9 +636,8 @@ func (p *compiledPattern) altLitAnchorBranchFuncIdx(i int) (backOff, fwdOff int)
 	return base + 2*i, base + 2*i + 1
 }
 
-// patchPaddedLEB128CallSites and nonMidHelperOff were extracted to
-// plans/non_mid_extension.go.archive (Sections 12-13) along with the
-// rest of the non-mid bulk-skip helper infrastructure.
+// patchPaddedLEB128CallSites and nonMidHelperOff were removed along with
+// the rest of the non-mid bulk-skip helper infrastructure.
 
 // stripSegCount strips the LEB128 count prefix from a data section payload,
 // returning the raw segment bytes and the count.
@@ -652,7 +649,6 @@ func (p *compiledPattern) altLitAnchorBranchFuncIdx(i int) (backOff, fwdOff int)
 // Threading an error out instead would have to pass through six callers that
 // have no error return (assembleModule, CompileSet, genSuffixWASM,
 // planLenAltLayout, …), converting a compiler bug into a silent nil result.
-// The bound that makes this reachable at all is plans/FABLE.md B39.
 func stripSegCount(data []byte) ([]byte, int) {
 	if len(data) == 0 {
 		return nil, 0
@@ -695,14 +691,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 	// Per-pattern hints (from YAML `hints:`) override whatever the caller
 	// passed in buildOpts.LikelyMode, so the precedence resolves to
-	// pattern > caller's default. See plans/LIKELY.md gap H.1.
+	// pattern > caller's default.
 	if mode, set := parseHints(re.Hints); set {
 		buildOpts.LikelyMode = mode
 	}
 
-	// Counted-chain SIMD verifier (LIKELY.md Opt 2), default-on for every
-	// LikelyMode (task 24 — promoted 2026-07-10 after a clean broad sweep;
-	// see plans/TODO.md task 24). Replaces the DFA match/find bodies
+	// Counted-chain SIMD verifier, default-on for every
+	// LikelyMode (promoted 2026-07-10 after a clean broad sweep).
+	// Replaces the DFA match/find bodies
 	// entirely when the pattern matches the strict <literal><charclass>{N,N}
 	// shape or a strict alternation of such branches.
 
@@ -824,8 +820,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						// both limits and hands back the very table it built, so
 						// an ineligible pattern falls through to the standard
 						// pipeline (which routes it to Backtracking) instead of
-						// silently getting a wrong TDFA capture body here. See
-						// plans/FUZZER_BUGS.md #40: `(0$|a0??)` reached this
+						// silently getting a wrong TDFA capture body here.
+						// A past regression: `(0$|a0??)` reached this
 						// path with hasLineAnchors(prog) == true and returned
 						// no match from groups() where find() was correct.
 						selEng, tt := selectBestEngineWithTDFA(prog, &buildOpts)
@@ -899,8 +895,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			}
 			return p, nil
 		}
-		// LM-1: relax the N≥24 single-pattern gate to N≥1 under LikelyMatch.
-		// See plans/LM_TODO.md LM-1.
+		// Relax the N≥24 single-pattern gate to N≥1 under LikelyMatch.
 		litChainMinCount := 24
 		if buildOpts.LikelyMode == LikelyMatch {
 			litChainMinCount = 1
@@ -1200,14 +1195,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	// Check if the LF DFA exceeds the state limit — if so, use BT find body.
-	// dfaHasOutrankedState (FUZZER_BUGS.md #15): a state whose boundary-gated
+	// dfaHasOutrankedState: a state whose boundary-gated
 	// mid-accept channel outranks the state's own unconditional (ctx=0)
 	// mid-accept, e.g. `0*\b|0*` — the find-mode scan loop's ctx=0 check has
 	// no priority concept and can let a later, lower-priority hit silently
 	// overwrite an already-correct higher-priority one. Routed to
 	// Backtracking (correct by construction) rather than patched in the DFA
 	// scan-loop codegen — see dfaHasOutrankedState's doc comment.
-	// dfaHasAmbiguousBoundaryTarget (FUZZER_BUGS.md #21): a sibling blind
+	// dfaHasAmbiguousBoundaryTarget: a sibling blind
 	// spot where resolving a \b/\B/(?m:$) assertion needs one more mandatory
 	// byte before Match, and that byte's own Rune is ALSO reachable via some
 	// other, already-live, lower-priority path in the same NFA set (e.g.
@@ -1334,7 +1329,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// DFA accepts at its start), but that gate is fragile against
 			// future DFA-construction changes.
 			//
-			// FUZZER_BUGS.md #22: the same class of gap exists for
+			// a past defect: the same class of gap exists for
 			// `(?m:^)`/`(?m:$)` in the prefix — reject those too. The forward
 			// continuation resumes suffixRe's own freshly-compiled DFA at the
 			// backward-verified match-start position with no independent way
@@ -1342,7 +1337,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// context was correctly resolved, so a prefix containing a line
 			// anchor is rejected the same way one containing `\b`/`\B` is.
 			//
-			// ...unless the prefix is provably line-scoped (TODO.md task 51):
+			// ...unless the prefix is provably line-scoped:
 			// a leading `^`/`(?m:^)` followed by nothing that can consume a
 			// '\n' makes the backward scan's stop-at-'\n' exact rather than
 			// premature, and the forward continuation is already newline-aware
@@ -1486,7 +1481,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// when the single-pattern check above didn't fire (their
 			// top-level Op gates, OpConcat vs OpAlternate, are mutually
 			// exclusive, so this check is defensive) and only for find-only
-			// patterns (captures are out of scope for v1, matching TODO.md's
+			// patterns (captures are out of scope for v1, matching the roadmap’s
 			// own non-conflict note). See findAltLitAnchorPoints for the
 			// equal-fixed-prefix-length restriction and why it's required
 			// for v1's simple "return on first success" dispatch to be
@@ -1514,8 +1509,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			}
 
 			// Opt 1 — dominant-self-loop SIMD bulk-skip. Default-on for all
-			// modes, mid-accept and non-mid-accept alike (Task 7 Step 2,
-			// 2026-07-05 — see plans/TODO.md task 7). Non-mid was
+			// modes, mid-accept and non-mid-accept alike (2026-07-05).
+			// Non-mid was
 			// previously LM-gated because the original side-table dispatch
 			// caused a 48-57% no-match regression; replaced with a
 			// state-ID-compare emission (commit dbb4dfa9) that shrinks the
@@ -1532,8 +1527,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// dropped the MID channel at this site to fix a fuel-flat
 			// wall-time regression on url-find-100kb — that delta was later
 			// proven to be instruction-placement noise on the Kaby Lake dev
-			// machine (2026-07-18 padding-scan experiment, see plans/TODO.md
-			// task 36), and the drop cost a real 20x fuel / ~40x time
+			// machine (2026-07-18 padding-scan experiment), and the drop
+			// cost a real 20x fuel / ~40x time
 			// regression on lit-anchor patterns whose post-literal body IS
 			// the mid-accept dominant state (likelytest
 			// lit-anchor-dominant-body, `[0-9]{4}INFO:[^\n]+`: match fuel
@@ -1642,7 +1637,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// own base — so this corrupted the caller's input text in place; in
 		// an embedded module (tableMemIdx 1) it corrupts the DFA table's own
 		// base instead. Either way, the next find()/groups() call in the
-		// same instance reads back garbage. See plans/TODO.md task 50.
+		// same instance reads back garbage.
 		p.winScratchOff = -1
 		return p, nil
 	}
@@ -1719,7 +1714,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// Memo table (BitState memoization) — only when the pattern has loops
 		// whose body can match zero bytes, which can cause infinite revisiting.
 		// Sized before the budget check below: the check has to cover
-		// everything this path reserves, not just the stack (FABLE.md B25).
+		// everything this path reserves, not just the stack.
 		useMemo := needsBitState(prog)
 		var memoMaxLen int32
 		var memoMaxSize int64
@@ -1740,7 +1735,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get an 8-byte
 		// (startOff,endOff) scratch slot, and the groups/batch-groups
 		// wrappers stop narrowing (ptr,len) for them entirely — see
-		// buildBacktrackBody, FUZZER_BUGS.md #26 and FABLE.md B13.
+		// buildBacktrackBody, a past defect.
 		// Only needed when this captureBody is composed behind a find
 		// wrapper (!anchored); the native/anchored export already gets the
 		// caller's real ptr/len and has no such gap.
@@ -1765,7 +1760,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// pattern is the right WASM address even past 2GiB, but
 		// sign-extending it back here would make the reservation's own end
 		// address negative and hide an over-ceiling reservation from the
-		// tableEnd bookkeeping (FABLE.md B25). Identical below 2GiB.
+		// tableEnd bookkeeping. Identical below 2GiB.
 		afterBT := btBase + int64(stackSize)
 		if useMemo {
 			afterBT += memoMaxSize
@@ -1818,8 +1813,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	// batch shape is out of v1 scope) don't pay its few bytes. Nothing else
 	// ever references type index 4, so omitting it is always safe.
 	// (A different 4th type — for the LNM non-mid bulk-skip helper — was
-	// extracted to plans/non_mid_extension.go.archive Section 14; this is
-	// an unrelated, newly-added type reusing the same slot number.)
+	// removed; this is an unrelated, newly-added type reusing the same
+	// slot number.)
 	anyBatch := false
 	for _, p := range patterns {
 		if p.batchFindExport != "" || p.batchGroupsExport != "" {
@@ -2135,7 +2130,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 		if err != nil {
 			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
 		}
-		// Batch find/groups export trigger (plans/TODO.md task 44). Sole
+		// Batch find/groups export trigger. Sole
 		// trigger for batchFindExport/batchGroupsExport — independent of
 		// LikelyMode. find_func is always eligible; groups_func is eligible
 		// for both the composed (!anchored) and native lit-chain (anchored,
@@ -2432,7 +2427,7 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 // (ptr,len) and writes the extent as an (startOff,endOff) pair to that
 // table-memory offset. The capture body then sees true input edges for
 // \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already
-// relative to ptr — see FUZZER_BUGS.md #26, FABLE.md B13, and
+// relative to ptr.md B13, and
 // buildBacktrackBody in engine_backtrack.go.
 func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
 	var b []byte
@@ -2572,7 +2567,7 @@ func emitBTOverflowGuardI32(b []byte, localIdx byte) []byte {
 }
 
 // buildBatchFindWrapperBody emits the WASM body for the LM-2 batch find
-// export (plans/LM_TODO.md LM-2). Signature (type 4):
+// export. Signature (type 4):
 //
 //	(ptr i32, len i32, out_ptr i32, out_cap i32, start_pos i32) → i32 (count)
 //
@@ -2665,7 +2660,7 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int) []byte {
 }
 
 // buildBatchGroupsWrapperBody emits the WASM body for the LM-2 batch groups
-// export (plans/LM_TODO.md LM-2). Signature (type 4), same as the batch
+// export. Signature (type 4), same as the batch
 // find wrapper:
 //
 //	(ptr i32, len i32, out_ptr i32, out_cap i32, start_pos i32) → i32 (count)
@@ -2689,8 +2684,8 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int) []byte {
 // winScratchOff (-1 = not applicable) turns on window mode, exactly as in
 // buildGroupsWrapperBody: the capture body is called with this wrapper's
 // own (ptr,len) and the per-match extent is written to the (startOff,endOff)
-// scratch inside the loop, once per match — see FUZZER_BUGS.md #26 and
-// FABLE.md B13.
+// scratch inside the loop, once per match — see a past defect and
+// a past defect.
 //
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
@@ -2839,8 +2834,8 @@ func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, n
 }
 
 // buildBatchLitChainGroupsWrapperBody emits the WASM body for the batch
-// groups export over a Path B native lit-chain groups body (plans/TODO.md
-// task 44, goal 4). Signature (type 4), same ABI as buildBatchGroupsWrapperBody:
+// groups export over a Path B native lit-chain groups body. Signature
+// (type 4), same ABI as buildBatchGroupsWrapperBody:
 //
 //	(ptr i32, len i32, out_ptr i32, out_cap i32, start_pos i32) → i32 (count)
 //

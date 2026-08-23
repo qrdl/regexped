@@ -1,8 +1,8 @@
 // Command make_sets regenerates the expectation columns of custom-sets.txt.
 //
 // The set `find` capability's DEFAULT body is gated: per-pattern
-// non-overlapping output, which is exactly Go FindAllIndex's rule
-// (plans/SETS.md §3.16). So col4 — the "all matches" column --sets compares
+// non-overlapping output, which is exactly Go FindAllIndex's rule.
+// So col4 — the "all matches" column --sets compares
 // against — is regenerated straight from Go's FindAllStringIndex, and col1
 // from FindStringIndex. That is §9.6.1's union oracle applied ahead of time
 // rather than at run time, and it is why the file needed regenerating when
@@ -105,7 +105,7 @@ func main() {
 	// false, which is indistinguishable from a clean EOF at the loop — so
 	// without this the write below would truncate custom-sets.txt to whatever
 	// had been read and exit 0, silently gutting the oracle the whole set
-	// regression net depends on (plans/SETS.md §11 R8).
+	// regression net depends on.
 	if err := sc.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "read %s: %v (corpus NOT rewritten)\n", path, err)
 		f.Close()

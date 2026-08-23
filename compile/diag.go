@@ -27,7 +27,7 @@ type SetDiag struct {
 	Name     string `json:"name"`
 	Frontend string `json:"frontend"` // "packed-pair", "teddy", "ac", "shufti", "scalar"
 	// Capabilities lists the set's declared capability keys, in the
-	// plans/SETS.md §3.12 grid order.
+	// canonical grid order.
 	Capabilities []string `json:"capabilities,omitempty"`
 	// Overlapping mirrors the YAML flag: true = the ungated `find` body.
 	Overlapping bool `json:"overlapping"`
@@ -43,8 +43,8 @@ type SetDiag struct {
 	// letting them widen M (§10.4(a)). An earlier draft of this comment
 	// promised -1 for that case; setMaxLookback cannot return it.
 	MaxLookback int `json:"max_lookback"`
-	// IDSpaceSize is one past the largest pattern id this set can report
-	// (plans/SETS.md §11 R1). For `patterns: all` it equals the pattern count;
+	// IDSpaceSize is one past the largest pattern id this set can report.
+	// For `patterns: all` it equals the pattern count;
 	// for a named subset it is the largest selected pattern's global index
 	// plus one, and it — not the pattern count — is the size of the gate array
 	// and the `_all` bitmap, and what decides the narrow-vs-wide `_all` ABI.
@@ -63,7 +63,7 @@ type SetDiag struct {
 	// and therefore excluded from match/match_any/match_all while `find` kept
 	// them. Defensive — analyzePattern already parsed these once — but a
 	// silent `continue` there would leave the capabilities disagreeing with no
-	// diagnostic trail at all (plans/SETS.md §11 R9).
+	// diagnostic trail at all.
 	UnparseableDropped []PatternRef `json:"unparseable_dropped,omitempty"`
 	// FrontendDemotion records that the frontend chooseLiteralFrontend picked
 	// was NOT the one emitted, and why. Nil when the chosen frontend shipped.
@@ -71,7 +71,7 @@ type SetDiag struct {
 	// This exists because the demotion it reports used to be silent: an
 	// AC automaton over the old 32-node cap fell back to the scalar path with
 	// no trace anywhere, and the resulting 86-414x scan-fuel cliff went
-	// unnoticed for three months (plans/SETS.md §13 F1, §14 P1). Whatever the
+	// unnoticed for three months. Whatever the
 	// budget is set to, the next person to hit it should find out from
 	// --diag-json rather than from a fuel number.
 	FrontendDemotion *FrontendDemotionDiag `json:"frontend_demotion,omitempty"`

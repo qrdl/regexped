@@ -62,8 +62,8 @@ func TestResolveHints(t *testing.T) {
 
 // TestPatternHintsOverridesCallerLikelyMode verifies the actual wiring in
 // compilePattern (compile.go): a pattern's own `hints:` YAML field takes
-// precedence over whatever LikelyMode the caller passed in CompileOptions
-// (plans/LIKELY.md Gap H.1). Observed via the same LikelyNoMatch-gated
+// precedence over whatever LikelyMode the caller passed in CompileOptions.
+// Observed via the same LikelyNoMatch-gated
 // buildSimplePrefixCheckBody shortcut TestCompileLikelyNoMatchSimpleClassPrefix
 // uses, but this time the mode comes from re.Hints, not CompileOptions,
 // which is what's actually under test here.
@@ -121,7 +121,7 @@ func TestPatternHintsOverridesCallerLikelyMode(t *testing.T) {
 // Shufti is only ever reachable through the SCALAR branch, so this test has
 // to keep both literal frontends off the table to exercise the hint at all.
 // It originally reached Shufti by accident: 33 literals blew the old 32-NODE
-// AC cap and were silently demoted to scalar (plans/SETS.md §13 F1). Two
+// AC cap and were silently demoted to scalar. Two
 // measured changes have since taken that route away — the budget now holds a
 // real automaton (§14 P1), and above the first-byte crossover bucketed Teddy
 // beats AC outright (§14.11) — so the set is built with more literals than
@@ -171,7 +171,7 @@ func TestSetHintsSelectsShuftiFrontend(t *testing.T) {
 	// The default build takes AC for this set (it is past teddyMaxLiterals),
 	// and the hint does not change that. Asserted explicitly so a future
 	// change to the budget or to chooseLiteralFrontend surfaces here rather
-	// than as a silent frontend downgrade (plans/SETS.md §14.5, §14.11).
+	// than as a silent frontend downgrade.
 	specDefault, prefixPool3, suffixPool3 := buildSpec(t)
 	csDefault := CompileSet(specDefault, prefixPool3, suffixPool3, CompileSetOptions{LikelyMode: LikelyNoMatch})
 	if csDefault.fe != frontendAC {

@@ -1,6 +1,5 @@
 // Command setperf compares every regexped set capability against
-// `regex-automata`, the layer underneath the `regex` crate's facade
-// (plans/SETS.md §9.9).
+// `regex-automata`, the layer underneath the `regex` crate's facade.
 //
 // # Why a separate tool from perftest
 //
@@ -28,9 +27,8 @@
 // means nothing. The two kinds of fuel are labelled differently for that
 // reason.
 //
-// Wall-clock on this machine is instruction-placement noise (see
-// plans/TODO.md's placement-roulette entry); compare the ratio, averaged over
-// several runs, or don't compare it at all.
+// Wall-clock on this machine is instruction-placement noise; compare the
+// ratio, averaged over several runs, or don't compare it at all.
 //
 // Usage:
 //
@@ -66,7 +64,7 @@ const (
 
 	// callBoundFuel is the fuel below which a wall-clock ratio describes the
 	// two HARNESSES rather than the two engines, so the ratio column is
-	// suppressed (plans/SETS.md §13 F3).
+	// suppressed.
 	//
 	// Our side times one Go→wasmtime Func.Call per sample; theirs loops
 	// `iters` times INSIDE WASM and reports per-iteration nanoseconds. That
@@ -83,7 +81,7 @@ const (
 	callBoundFuel = 10_000
 
 	// overlappingTimedCap bounds the INPUT for the timed find(overlapping)
-	// row only (plans/SETS.md §13 F4).
+	// row only.
 	//
 	// That body is the deliberate every-start-position enumeration of §7.10,
 	// so on a set with no mandatory literal it is O(n^2): greedy-3 over 50,000
@@ -175,8 +173,8 @@ func raPairing(c capability) string {
 	case capMatchAll:
 		return "ra_bench_match_all"
 	case capFind:
-		// Per-pattern find_iter merged — the same construction as the
-		// plans/SETS.md §9.6.1 oracle. regex-automata's own multi-pattern
+		// Per-pattern find_iter merged — the same construction the
+		// gated-find oracle uses. regex-automata's own multi-pattern
 		// find_iter is SET-WIDE non-overlapping while our gated find is
 		// PER-PATTERN; pairing those directly would be confidently wrong.
 		return "ra_bench_find_gated"
@@ -254,9 +252,9 @@ func buildMatrix() []setCase {
 	)
 	// A set whose literals share NO first byte. Every keywords-* literal
 	// starts 'k', so before this the matrix could not see the AC frontend's
-	// first-byte prefilter at all: plans/SETS.md §14 P2 changed that prefilter
-	// from a per-byte compare chain to Shufti, cut this shape's scan fuel by
-	// 28%, and moved not one of the 146 committed rows (§14.6). Prefix sharing
+	// first-byte prefilter at all: moving that prefilter from a per-byte
+	// compare chain to Shufti cut this shape's scan fuel by 28% and moved
+	// not one of the 146 committed rows. Prefix sharing
 	// is also what decides AC's node count, so this is the shape that governs
 	// the table budget too (§14.1, sharpening 1).
 	diverse := make([]string, 32)
@@ -270,9 +268,9 @@ func buildMatrix() []setCase {
 	// A set whose patterns share one SUFFIX behind distinct literals. Every
 	// other set here has a counted-class-chain suffix ([0-9a-z]{3} and
 	// friends), which genSuffixWASM answers with SIMD and no table at all —
-	// so nothing in the matrix built a suffix table to begin with, and the
-	// dedup of plans/SETS.md §14 P7 moved zero rows despite cutting these
-	// shapes' modules by ~70% (§14.10). An alternation suffix does build a
+	// so nothing in the matrix built a suffix table to begin with, and
+	// suffix-table dedup moved zero rows despite cutting these shapes'
+	// modules by ~70%. An alternation suffix does build a
 	// table, which is what makes this case load-bearing.
 	shared := make([]string, 32)
 	for i := range shared {
@@ -411,7 +409,7 @@ type rxInstance struct {
 	// fnCache holds resolved exports. Resolving inside the timed loop meant
 	// every measured operation paid a string-keyed export lookup that is
 	// neither engine work nor the wasmtime crossing — pure harness cost, and
-	// it inflated every one of our rows (plans/SETS.md §17.5).
+	// it inflated every one of our rows.
 	fnCache map[capability]*wasmtime.Func
 }
 
@@ -489,8 +487,7 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 // (Rust [0u8; N], JS .fill(0), Go a fresh slice, C = {0}). Measuring without
 // zeroing meant the warm-up call set every bit and each measured call then
 // skipped the store-and-count branch for every already-set pattern, so the
-// recorded fuel described a code path no real caller executes
-// (plans/SETS.md §11 R7).
+// recorded fuel described a code path no real caller executes.
 func (r *rxInstance) zeroBitmap() {
 	buf := r.mem.UnsafeData(r.store)
 	n := (r.npat + 7) / 8
@@ -505,7 +502,7 @@ func (r *rxInstance) zeroBitmap() {
 // call runs one whole-input operation and returns how many Go→wasmtime
 // crossings it took. The count is what lets measureTime subtract the harness
 // boundary cost: every crossing carries a fixed ~4 us that has nothing to do
-// with the engine, and `find` pays one per match (plans/SETS.md §17.5).
+// with the engine, and `find` pays one per match.
 func (r *rxInstance) call(c capability, wide bool) (int, error) {
 	fn := r.fnFor(c)
 	if fn == nil {
@@ -653,8 +650,8 @@ func measureFuelRow(c setCase) []row {
 			// SENTINEL rather than dropping the row: a bare `continue` here
 			// is why greedy-3's scan_all/find/find(overlapping) had no fuel
 			// number anywhere — the map lookup then yielded 0, and the matrix
-			// printed "0 fuel" for the three most expensive rows it has
-			// (plans/SETS.md §14.7). printRows filters sentinels back out so
+			// printed "0 fuel" for the three most expensive rows it has.
+			// printRows filters sentinels back out so
 			// the baseline files keep their exact-equality format.
 			out = append(out, row{rowKey(c, cap), fuelExhausted})
 			continue
@@ -700,8 +697,8 @@ func timedCase(c setCase, cap capability, ourFuel uint64) (setCase, bool) {
 // with the number of Go→wasmtime crossings one operation costs.
 //
 // The crossing count is not incidental: it is the correction term that makes
-// this side comparable with the regex-automata side at all (plans/SETS.md
-// §17.5). Our sample brackets a host call; theirs is taken by the Rust
+// this side comparable with the regex-automata side at all. Our sample
+// brackets a host call; theirs is taken by the Rust
 // harness INSIDE wasm, around the engine work alone. Subtracting
 // crossings × callFloor from our p50 puts both on the same footing.
 func measureTime(engine *wasmtime.Engine, c setCase, cap capability, ourFuel uint64) (time.Duration, int, time.Duration, error) {
@@ -737,7 +734,7 @@ func measureTime(engine *wasmtime.Engine, c setCase, cap capability, ourFuel uin
 }
 
 // --------------------------------------------------------------------------
-// The harness-boundary correction (plans/SETS.md §17.5).
+// The harness-boundary correction.
 
 // measureInstanceFloor times a call into THIS module that does essentially no
 // work: `cap_match` on a zero-length input, which enters the anchored probe
@@ -1216,8 +1213,8 @@ func runVerify(cases []setCase) int {
 		}
 
 		// find (gated, the default body): ra_find_gated is the per-pattern
-		// merged find_iter — the same construction as the plans/SETS.md §9.6.1
-		// oracle, and the one raPairing already trusts for the fuel rows. This
+		// merged find_iter — the same construction the gated-find oracle
+		// uses, and the one raPairing already trusts for the fuel rows. This
 		// is the only capability here whose EXTENTS are checked, not just its
 		// ids, which is why leaving it out mattered.
 		ourFind := rxCollectFind(r)
@@ -1340,7 +1337,7 @@ func rxCollectFindBatch(r *rxInstance) []setTuple {
 }
 
 // sameMatches compares two tuple lists as multisets. Within-call tuple order
-// is unspecified (plans/SETS.md §3.10), so order must not be part of the test.
+// is unspecified, so order must not be part of the test.
 func sameMatches(a, b []setTuple) bool {
 	if len(a) != len(b) {
 		return false

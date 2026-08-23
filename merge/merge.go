@@ -79,7 +79,7 @@ func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []stri
 // Verified empirically against Binaryen 132: two distinct regex modules merged
 // under the same name produce a module whose exports each bind to their own DFA
 // tables and memory, confirmed by executing both under wasmtime including
-// negative cases. See plans/OPUS.md §N12.
+// negative cases.
 //
 // This rests on the import invariant above. If regex modules ever gain
 // inter-module imports, revisit: they would then need unique names, while still
@@ -114,7 +114,7 @@ func checkTool(path string) error {
 // implementation lives in config so the config-file paths (output, wasm_file,
 // stub_file, wasm_merge) and this one — the wasm-merge binary, which can also
 // come from $WASM_MERGE and so never passes through config — expand
-// identically. See plans/FABLE.md B37.
+// identically.
 func expandHome(path string) string {
 	return config.ExpandHome(path)
 }
