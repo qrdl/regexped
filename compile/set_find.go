@@ -122,6 +122,11 @@ type setFindCtx struct {
 	// skipped with Teddy.
 	mode        setCapKind
 	probeFnBase int
+	// tableMemIdx is the memory holding this set's tables. Only the bodies
+	// that read a table through setFindCtx set it — today the scalar body, for
+	// §21.6's first-byte masks. Bodies that never do leave it 0, which is
+	// harmless because the features that use it are gated off for them.
+	tableMemIdx int
 	// anyProbeBase / useAnyProbe route `scan` and `scan_any` to a bucket's
 	// first-hit-exit probe where one was emitted (plans/SETS.md §18.2).
 	anyProbeBase int
@@ -836,6 +841,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 				b = c.emitEmptyMaskSkip(b, g.mask)
 			}
 		}
+		b = c.emitStartableMask(b, bi, g, posLocal)
 		b = c.emitPrefixChecks(b, bi, g, posLocal)
 		if g.L != 0 {
 			// Only a fixed-prefix group runs prefix DFAs, so only there can
@@ -852,6 +858,51 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		}
 		b = append(b, 0x0B) // end block $skip_group
 	}
+	return b
+}
+
+// emitStartableMask applies bucket bi's first-byte eligibility table
+// (plans/SETS.md §21.6): a pattern that cannot CONSUME input[posLocal] as its
+// first byte cannot match starting there, so its bit is cleared before the
+// suffix DFA is called — and when the whole mask goes empty, the call is
+// skipped.
+//
+// Emitted only where the table exists, which is fallback buckets of a scalar
+// frontend that had something to clear; every other bucket and every other set
+// gets nothing, and stays byte-identical.
+//
+// Two conditions are load-bearing:
+//
+//   - L must be 0. The table is indexed by the byte at the MATCH START, and
+//     only a trivial-prefix group starts at posLocal; a fixed-prefix group
+//     starts L bytes earlier. Fallback buckets have no literal and therefore
+//     only L == 0 groups, so this is an assertion rather than a restriction.
+//   - posLocal < len must be TESTED. The scan loop processes position len once
+//     (for `$`-anchored patterns), where there is no byte to read: loading one
+//     anyway would index whatever follows the input and could clear a pattern
+//     that genuinely matches empty there.
+func (c *setFindCtx) emitStartableMask(b []byte, bi int, g prefixLenGroup, posLocal byte) []byte {
+	if c.mode != capFind || g.L != 0 {
+		return b
+	}
+	if bi >= len(c.cs.startableOff) || c.cs.startableOff[bi] < 0 {
+		return b
+	}
+	// if posLocal < pInLen { lValidMask &= startable[input[posLocal]] }
+	b = append(b, 0x20, posLocal, 0x20, c.pInLen, 0x49) // i32.lt_u
+	b = append(b, 0x04, 0x40)                           // if
+	b = append(b, 0x20, c.lValidMask)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, c.cs.startableOff[bi])
+	b = append(b, 0x20, c.pInPtr, 0x20, posLocal, 0x6A)
+	b = appendInputLoad8u(b)              // the candidate's first byte
+	b = append(b, 0x41, 0x02, 0x74, 0x6A) // *4; + table base
+	b = appendTableLoad32(b, c.tableMemIdx, 0)
+	b = append(b, 0x71, 0x21, c.lValidMask) // i32.and; set
+	b = append(b, 0x0B)                     // end if
+
+	// Nothing left to look for at this position.
+	b = append(b, 0x20, c.lValidMask, 0x45, 0x0D, 0x00) // eqz; br_if $skip_group
 	return b
 }
 

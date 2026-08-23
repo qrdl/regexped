@@ -40,7 +40,7 @@ func itoa(n int) string {
 // to exhaustion.
 func runSetOne(t *testing.T, pat, input string) [][2]int {
 	t.Helper()
-	w, err := compileSet([]string{pat})
+	w, _, err := compileSet([]string{pat})
 	if err != nil {
 		t.Fatalf("compile %q: %v", pat, err)
 	}

@@ -63,7 +63,14 @@ func isResourceCeiling(err error) bool {
 	return errors.Is(err, compile.ErrBTProgramTooLarge) ||
 		errors.Is(err, compile.ErrBTStackTooLarge) ||
 		errors.Is(err, compile.ErrBTLoopCountTooLarge) ||
-		errors.Is(err, compile.ErrBTEmptyBodyLoopChainTooLarge)
+		errors.Is(err, compile.ErrBTEmptyBodyLoopChainTooLarge) ||
+		// The SET path's helper-DFA ceiling (maxHelperDFAStates, 2048). Unlike
+		// the four above it has no fallback — the set compile fails — but it is
+		// the same KIND of event: a construction refused as effectively
+		// unbounded, not an answer that disagrees with Go. Omitting it is what
+		// made FuzzSet/40f883ef54d47f63 look like a defect
+		// (plans/FUZZER_BUGS.md 55).
+		errors.Is(err, compile.ErrDFAStateLimit)
 }
 
 // hasCaptures reports whether pat contains at least one capture group.
@@ -351,7 +358,7 @@ func FuzzSet(f *testing.F) {
 			refs[i] = re
 		}
 
-		wasmBytes, compErr := compileSet(pats)
+		wasmBytes, dropped, compErr := compileSet(pats)
 		if compErr != nil {
 			if isResourceCeiling(compErr) {
 				t.Skip("resource ceiling")
@@ -379,6 +386,16 @@ func FuzzSet(f *testing.F) {
 			byID[m.PatternID] = append(byID[m.PatternID], [2]int{m.Start, m.End})
 		}
 		for i, re := range refs {
+			if dropped[i] {
+				// Not in the set the engine built, so the set reports none of
+				// its matches and the oracle must not expect any
+				// (plans/FUZZER_BUGS.md 57).
+				if n := len(byID[i]); n != 0 {
+					t.Fatalf("set pattern[%d]=%q was DROPPED from the set but reported %d matches",
+						i, pats[i], n)
+				}
+				continue
+			}
 			want := allStartPositionMatches(re, input)
 			gotI := byID[i]
 			sortSpans(want)

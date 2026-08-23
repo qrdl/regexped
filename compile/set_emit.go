@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/qrdl/regexped/config"
@@ -133,6 +134,14 @@ type compiledSet struct {
 
 	// Frontend strategy chosen for this set's literal scan.
 	fe frontendKind
+
+	// First-byte eligibility masks (plans/SETS.md §21.6), one 256 x u32 table
+	// per FALLBACK bucket that has something to clear. startableOff[bi] is the
+	// table's address, or -1 when bucket bi has none — which is every bucket
+	// on a set that does not qualify, so those sets stay byte-identical.
+	startableOff       []int32
+	startableDataBytes []byte
+	startableDataSegs  int
 
 	// Literal-existence absence prefilter (plans/SETS.md §21.3 / G12).
 	// absenceLits carries one literal per pattern that has one; absenceAlive
@@ -966,6 +975,41 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	if fe == frontendScalar && (spec.Scan != "" || spec.ScanAll != "" || spec.ScanAny != "") {
 		unionBase := setTablesEnd
 		cs.unionScan = buildUnionScanDFA(spec, opts, unionBase)
+		if cs.unionScan != nil && cs.unionScan.tableEnd > setTablesEnd {
+			setTablesEnd = cs.unionScan.tableEnd
+		}
+	}
+
+	// First-byte eligibility tables (§21.6 / G16), laid out after every other
+	// region for the same reason the union DFA is: whatever is built last must
+	// start above what is already placed, or two tables share an address.
+	//
+	// Only the scalar frontend, and only its FALLBACK buckets: a literal
+	// frontend has already proved a literal sits at the candidate position, so
+	// the first byte tells it nothing it does not know.
+	cs.startableOff = make([]int32, len(buckets))
+	for bi := range cs.startableOff {
+		cs.startableOff[bi] = -1
+	}
+	if fe == frontendScalar && spec.Find != "" {
+		for bi, bkt := range buckets {
+			if !bkt.isFallback {
+				continue
+			}
+			tab := buildStartableTable(bkt)
+			if tab == nil {
+				continue
+			}
+			raw := make([]byte, 256*4)
+			for b, m := range tab {
+				binary.LittleEndian.PutUint32(raw[b*4:], m)
+			}
+			cs.startableOff[bi] = setTablesEnd
+			cs.startableDataBytes = append(cs.startableDataBytes,
+				appendDataSegment(nil, setTablesEnd, raw)...)
+			cs.startableDataSegs++
+			setTablesEnd += int32(len(raw))
+		}
 	}
 
 	// §9.4 first-position routing data, derived from the finished bucket list.
@@ -1017,8 +1061,27 @@ func appendTableLoad64(b []byte, tableMemIdx int) []byte {
 // CompileFile compiles all regexp patterns and sets from cfg into a single WASM module.
 // When cfg.Sets is empty, it is byte-identical to the existing Compile() path.
 func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
+	w, top, _, err := CompileFileDiag(cfg, output)
+	return w, top, err
+}
+
+// CompileFileDiag is CompileFile plus the per-set diagnostics the same compile
+// already produced — one SetDiag per entry of cfg.Sets, in that order.
+//
+// It exists because a set can legitimately EXCLUDE a pattern the caller asked
+// for: a suffix DFA over max_dfa_states is dropped with a warning and recorded
+// in SetDiag.StateLimitDropped, and a set that does not contain a pattern does
+// not report its matches. Any differential test therefore has to know which
+// patterns actually made it in, or it compares the engine against an oracle
+// for a set the engine was never asked to build — which is exactly
+// plans/FUZZER_BUGS.md 57.
+//
+// CmdWriteDiagJSON answers the same question by RE-RUNNING the whole set
+// compilation. That is fine for a CLI flag and wrong for a caller in a hot
+// loop, which is why this returns what the first compile already knew.
+func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []SetDiag, error) {
 	if err := config.ValidateSets(&cfg); err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 
 	standalone := cfg.Output == ""
@@ -1028,10 +1091,11 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	// that logic here is bug-prone — earlier versions produced under-sized
 	// memory for standalone modules whose DFA tables exceeded 64 KiB.
 	if len(cfg.Sets) == 0 {
-		return Compile(cfg.Regexps, 0, standalone, CompileOptions{
+		w, top, err := Compile(cfg.Regexps, 0, standalone, CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,
 			MaxTDFARegs:  cfg.MaxTDFARegs,
 		})
+		return w, top, nil, err
 	}
 
 	tableBase := int64(0)
@@ -1049,7 +1113,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	for _, re := range cfg.Regexps {
 		p, err := compilePattern(re, tableBase, 0, opts)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		// Batch find/groups export trigger (plans/TODO.md task 44) — same
 		// trigger compileAll applies; see compileAll's comment for the
@@ -1116,7 +1180,7 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 				if patLabel == "" {
 					patLabel = re.Pattern
 				}
-				return nil, 0, fmt.Errorf("set %q: pattern %q: %w", sc.Name, patLabel, err)
+				return nil, 0, nil, fmt.Errorf("set %q: pattern %q: %w", sc.Name, patLabel, err)
 			}
 			info.globalID = idx
 			info.name = re.Name
@@ -1181,7 +1245,13 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	} else if !standalone && lastTableEnd == 0 && setTableBase == 0 {
 		memPages = 1
 	}
-	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone), lastTableEnd, nil
+	diags := make([]SetDiag, 0, len(compiledSets))
+	for _, cs := range compiledSets {
+		if cs.diag != nil {
+			diags = append(diags, *cs.diag)
+		}
+	}
+	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone), lastTableEnd, diags, nil
 }
 
 // assembleModuleWithSets builds a WASM module from per-pattern compilations
@@ -1204,12 +1274,14 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	}
 	for _, cs := range sets {
 		totalSegs += cs.dataSegCount + cs.prefixDataSegCount + cs.acDataSegCount +
-			cs.teddyDataSegCount + cs.anchoredDataSegs + cs.unionScanDataSegs()
+			cs.teddyDataSegCount + cs.anchoredDataSegs + cs.unionScanDataSegs() +
+			cs.startableDataSegs
 		rawData = append(rawData, cs.dataBytes...)
 		rawData = append(rawData, cs.prefixDataBytes...)
 		rawData = append(rawData, cs.acDataBytes...)
 		rawData = append(rawData, cs.teddyDataBytes...)
 		rawData = append(rawData, cs.anchoredDataBytes...)
+		rawData = append(rawData, cs.startableDataBytes...)
 		if cs.unionScan != nil {
 			rawData = append(rawData, cs.unionScan.dataBytes...)
 		}
@@ -1662,6 +1734,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	}
 
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
+	c.tableMemIdx = tableMemIdx
 	c.perPositionDrain = true
 	c.lAcc = c.localBase + 8
 	lPos := c.lPos

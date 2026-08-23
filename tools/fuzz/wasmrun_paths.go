@@ -72,7 +72,7 @@ func compileGroupsForced(pat string, eng compile.EngineType) ([]byte, error) {
 // compileSet compiles pats as one set exporting find_all. Patterns are named
 // p0..pN-1 so the set selector can reference them; the pattern ID reported by
 // the WASM is the index into pats.
-func compileSet(pats []string) ([]byte, error) {
+func compileSet(pats []string) ([]byte, map[int]bool, error) {
 	entries := make([]config.RegexEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
@@ -93,8 +93,34 @@ func compileSet(pats []string) ([]byte, error) {
 	// standalone. runWasmSetFindAll therefore derives its layout from the
 	// emitted data section rather than using pathsInputBase.
 	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
-	w, _, err := compile.CompileFile(cfg, "")
-	return w, err
+	w, _, diags, err := compile.CompileFileDiag(cfg, "")
+	return w, droppedFromSet(diags), err
+}
+
+// droppedFromSet returns the indices of the patterns the compiler EXCLUDED
+// from the set it just built.
+//
+// A set is allowed to drop a pattern: a suffix DFA over max_dfa_states is
+// warned about and recorded rather than failing the compile (see CLAUDE.md,
+// and compile/set.go's warnPatternDropped). Such a pattern is not in the set,
+// so the set reports none of its matches — and a differential test that keeps
+// it in the oracle reports the engine as wrong for obeying its own contract.
+// That is plans/FUZZER_BUGS.md 57, whose threshold was exactly one DFA state
+// wide: 1024 states passed, 1025 was dropped and "failed".
+//
+// The ids here are the set's global pattern ids, which compileSet assigns as
+// the index into pats — so they index the caller's slice directly.
+func droppedFromSet(diags []compile.SetDiag) map[int]bool {
+	dropped := map[int]bool{}
+	for _, d := range diags {
+		for _, ref := range d.StateLimitDropped {
+			dropped[ref.ID] = true
+		}
+		for _, ref := range d.CaptureBearingDropped {
+			dropped[ref.ID] = true
+		}
+	}
+	return dropped
 }
 
 // instantiate builds and instantiates a module, returning the store, instance,

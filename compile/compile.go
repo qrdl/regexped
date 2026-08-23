@@ -13,7 +13,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// errDFAStateLimitExceeded is returned by compile() when EngineDFA subset
+// ErrDFAStateLimit is returned by compile() when EngineDFA subset
 // construction (newDFA) hits its internal state cap. Callers with a BT
 // fallback (compile.go's match/find DFA construction) must treat this the
 // same as the existing "table.numStates > maxStates" post-construction
@@ -22,7 +22,17 @@ import (
 // cheaply. Callers with an all-or-nothing "fall through cleanly on
 // rejection" contract (e.g. compileAltLitAnchorBranches) already handle any
 // non-nil error from compile() correctly with no changes needed.
-var errDFAStateLimitExceeded = errors.New("compile: DFA state limit exceeded during construction")
+//
+// On the SET path there is no fallback: analyzePattern, mergeSuffixDFA and
+// mergeAnchoredDFA all wrap or return this, and the set compile fails. That
+// is deliberate — maxHelperDFAStates is not a tunable but a "this
+// construction never finishes" guard (see selector.go) — so it is a
+// legitimate resource ceiling, and it is EXPORTED for the same reason
+// ErrBTProgramTooLarge is: so external callers, notably tools/fuzz, can tell
+// a refused construction from a disagreement with Go via errors.Is. A fuzz
+// target that reports it as a defect is reporting the ceiling, not a bug
+// (plans/FUZZER_BUGS.md 55).
+var ErrDFAStateLimit = errors.New("compile: DFA state limit exceeded during construction")
 
 // ErrBTProgramTooLarge is returned whenever compile() would route a pattern
 // to the Backtracking engine — whether because the primary DFA was rejected
@@ -36,7 +46,7 @@ var errDFAStateLimitExceeded = errors.New("compile: DFA state limit exceeded dur
 // ~7,654,321-byte function-body-size limit) instead of failing compilation
 // with a clear error.
 //
-// Exported (unlike errDFAStateLimitExceeded) so external callers — e.g.
+// Exported (like ErrDFAStateLimit) so external callers — e.g.
 // tools/fuzz's FuzzCorrectness — can distinguish this legitimate,
 // no-further-fallback-possible resource ceiling from any other compile
 // error via errors.Is.
@@ -1086,7 +1096,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// This matches Go stdlib semantics: regexp.MustCompile("^(a|aa)$").MatchString("aa") = true.
 		llOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: false}
 		llMatch, llErr := compile(re.Pattern, llOpts)
-		if llErr != nil && !errors.Is(llErr, errDFAStateLimitExceeded) {
+		if llErr != nil && !errors.Is(llErr, ErrDFAStateLimit) {
 			return nil, fmt.Errorf("compile match DFA: %w", llErr)
 		}
 		var llTable *dfaTable
@@ -1166,14 +1176,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// LF DFA for find and/or groups.
 	lfOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: true}
 	matcher, err := compile(re.Pattern, lfOpts)
-	if err != nil && !errors.Is(err, errDFAStateLimitExceeded) {
+	if err != nil && !errors.Is(err, ErrDFAStateLimit) {
 		return nil, fmt.Errorf("compile DFA: %w", err)
 	}
 	// dfaStateLimitExceeded: newDFA's own internal cap already fired, so
 	// there is no table to inspect — treat it the same as the ordinary
 	// "table.numStates > maxStates" post-construction check below (both
 	// mean "DFA too large, fall back to BT"), rather than as a hard error.
-	dfaStateLimitExceeded := errors.Is(err, errDFAStateLimitExceeded)
+	dfaStateLimitExceeded := errors.Is(err, ErrDFAStateLimit)
 	var table *dfaTable
 	var anchored, needFindBody bool
 	if !dfaStateLimitExceeded {
@@ -2369,7 +2379,7 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 		ceiling := max(maxHelperDFAStates, resolveMaxDFAStates(&options))
 		d, ok := newDFA(prog, options.Unicode, options.LeftmostFirst, ceiling)
 		if !ok {
-			return nil, errDFAStateLimitExceeded
+			return nil, ErrDFAStateLimit
 		}
 		return d, nil
 	case EngineBacktrack:

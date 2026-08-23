@@ -251,7 +251,7 @@ func TestGatedSubsetOfUngated(t *testing.T) {
 	input := "abXbX"
 	gated := runGatedFind(t, pats, input).matches
 
-	w, err := compileSet(pats)
+	w, _, err := compileSet(pats)
 	if err != nil {
 		t.Fatal(err)
 	}

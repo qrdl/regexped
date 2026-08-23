@@ -22,7 +22,7 @@ import (
 
 // compileCaps compiles pats into a standalone module exporting all seven
 // capabilities under their canonical names.
-func compileCaps(pats []string, overlapping bool) ([]byte, error) {
+func compileCaps(pats []string, overlapping bool) ([]byte, map[int]bool, error) {
 	entries := make([]config.RegexEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
@@ -41,8 +41,8 @@ func compileCaps(pats []string, overlapping bool) ([]byte, error) {
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
-	return w, err
+	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	return w, droppedFromSet(diags), err
 }
 
 // capRunner holds an instantiated capability module plus its memory layout.
@@ -70,7 +70,7 @@ func (r *capRunner) Close() {
 
 func newCapRunner(t *testing.T, pats []string, input string, overlapping bool) *capRunner {
 	t.Helper()
-	w, err := compileCaps(pats, overlapping)
+	w, _, err := compileCaps(pats, overlapping)
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}
@@ -120,9 +120,18 @@ func (r *capRunner) call(t *testing.T, name string, args ...interface{}) interfa
 // Oracles (plans/SETS.md §9.6).
 
 // oracleAnchored returns the ids of the patterns matching the WHOLE input.
-func oracleAnchored(pats []string, input string) []int {
+//
+// `dropped` names the patterns the compiler EXCLUDED from the set (nil when
+// there are none). They are skipped by all three oracles for the same reason:
+// a set that does not contain a pattern reports none of its matches, so
+// expecting any is expecting the engine to break its own contract
+// (plans/FUZZER_BUGS.md 57).
+func oracleAnchored(pats []string, input string, dropped map[int]bool) []int {
 	var out []int
 	for k, p := range pats {
+		if dropped[k] {
+			continue
+		}
 		if regexp.MustCompile(`\A(?:` + normalizeForOracle(p) + `)\z`).MatchString(input) {
 			out = append(out, k)
 		}
@@ -131,9 +140,12 @@ func oracleAnchored(pats []string, input string) []int {
 }
 
 // oracleScanAll returns the ids of the patterns matching at some position >= from.
-func oracleScanAll(pats []string, input string, from int) []int {
+func oracleScanAll(pats []string, input string, from int, dropped map[int]bool) []int {
 	var out []int
 	for k, p := range pats {
+		if dropped[k] {
+			continue
+		}
 		if len(startsMatching(p, input, from)) > 0 {
 			out = append(out, k)
 		}
@@ -143,10 +155,13 @@ func oracleScanAll(pats []string, input string, from int) []int {
 
 // oracleFirstPosition returns the smallest start >= from at which any pattern
 // matches, together with the ids matching there. Returns -1 when there is none.
-func oracleFirstPosition(pats []string, input string, from int) (int, []int) {
+func oracleFirstPosition(pats []string, input string, from int, dropped map[int]bool) (int, []int) {
 	for p := from; p <= len(input); p++ {
 		var ids []int
 		for k, pat := range pats {
+			if dropped[k] {
+				continue
+			}
 			if matchesAt(pat, input, p) {
 				ids = append(ids, k)
 			}
@@ -273,7 +288,7 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 				n := int32(len(input))
 
 				// match: anchored, whole input.
-				wantAnchored := oracleAnchored(tc.pats, input)
+				wantAnchored := oracleAnchored(tc.pats, input, nil)
 				gotMatch := r.call(t, "cap_match", r.inBase, n).(int32)
 				if (gotMatch != 0) != (len(wantAnchored) > 0) {
 					t.Fatalf("match = %d, want %v (ids %v)", gotMatch, len(wantAnchored) > 0, wantAnchored)
@@ -298,7 +313,7 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 				for from := 0; from <= len(input); from++ {
 					f := int32(from)
 
-					wantPos, wantIDs := oracleFirstPosition(tc.pats, input, from)
+					wantPos, wantIDs := oracleFirstPosition(tc.pats, input, from, nil)
 
 					gotScan := r.call(t, "cap_scan", r.inBase, n, f).(int32)
 					if (gotScan != 0) != (wantPos >= 0) {
@@ -321,7 +336,7 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 						}
 					}
 
-					wantScanAll := oracleScanAll(tc.pats, input, from)
+					wantScanAll := oracleScanAll(tc.pats, input, from, nil)
 					gotScanAll := idsFromMask(uint64(r.call(t, "cap_scan_all", r.inBase, n, f).(int64)), len(tc.pats))
 					if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
 						t.Fatalf("scan_all(from=%d) = %v, want %v", from, gotScanAll, wantScanAll)
@@ -366,8 +381,12 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 // anchoredExtent returns the RE2 leftmost-first extent of pat anchored exactly
 // at position p, or -1 when it does not match there.
 func anchoredExtent(pat, input string, p int) int {
-	re := regexp.MustCompile(`\A` + dotPrefix(p) + `(?:` + normalizeForOracle(pat) + `)`)
-	m := re.FindStringIndex(input)
+	// Through probeFor, not a fresh Compile: the expression is character-for-
+	// character the one probeFor caches, and this is called once per position
+	// per pattern per capability, so an uncached compile made the harness's
+	// cost scale with PATTERN LENGTH x positions — the term that pushed large
+	// patterns past the fuzz worker's 10s deadline (plans/FUZZER_BUGS.md 56).
+	m := probeFor(pat, p).FindStringIndex(input)
 	if m == nil {
 		return -1
 	}
@@ -460,12 +479,21 @@ func FuzzSetCaps(f *testing.F) {
 			if reason := skipPattern(p, input); reason != "" {
 				t.Skip(reason)
 			}
+			// Tighter than skipPattern's shared maxNFAInsts, because this
+			// target compiles two patterns into eight capability bodies —
+			// see maxSetCapsNFAInsts for the measured reason.
+			if parsed, err := syntax.Parse(p, syntax.Perl); err == nil {
+				if prog, err := syntax.Compile(parsed.Simplify()); err == nil &&
+					len(prog.Inst) > maxSetCapsNFAInsts() {
+					t.Skip("NFA too large for FuzzSetCaps' eight-body compile (see maxSetCapsNFAInsts)")
+				}
+			}
 			if regexp.MustCompile(p).NumSubexp() > 0 {
 				t.Skip("capture-bearing patterns are dropped from sets by design")
 			}
 		}
 
-		w, err := compileCaps(pats, true)
+		w, dropped, err := compileCaps(pats, true)
 		if err != nil {
 			if isResourceCeiling(err) {
 				t.Skip("resource ceiling")
@@ -496,7 +524,7 @@ func FuzzSetCaps(f *testing.F) {
 		r := &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats)}
 		n := int32(len(input))
 
-		wantAnchored := oracleAnchored(pats, input)
+		wantAnchored := oracleAnchored(pats, input, dropped)
 		if got := r.call(t, "cap_match", inBase, n).(int32); (got != 0) != (len(wantAnchored) > 0) {
 			t.Fatalf("match = %d, want %v: pats=%q,%q input=%q", got, len(wantAnchored) > 0, pat1, pat2, input)
 		}
@@ -515,7 +543,7 @@ func FuzzSetCaps(f *testing.F) {
 
 		for from := 0; from <= len(input); from++ {
 			f32 := int32(from)
-			wantPos, wantIDs := oracleFirstPosition(pats, input, from)
+			wantPos, wantIDs := oracleFirstPosition(pats, input, from, dropped)
 
 			if got := r.call(t, "cap_scan", inBase, n, f32).(int32); (got != 0) != (wantPos >= 0) {
 				t.Fatalf("scan(from=%d) = %d, want %v: pats=%q,%q input=%q", from, got, wantPos >= 0, pat1, pat2, input)
@@ -533,7 +561,7 @@ func FuzzSetCaps(f *testing.F) {
 					t.Fatalf("scan_any(from=%d) id = %d, not among %v: pats=%q,%q input=%q", from, id, wantIDs, pat1, pat2, input)
 				}
 			}
-			wantScanAll := oracleScanAll(pats, input, from)
+			wantScanAll := oracleScanAll(pats, input, from, dropped)
 			gotScanAll := idsFromMask(uint64(r.call(t, "cap_scan_all", inBase, n, f32).(int64)), len(pats))
 			if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
 				t.Fatalf("scan_all(from=%d) = %v, want %v: pats=%q,%q input=%q", from, gotScanAll, wantScanAll, pat1, pat2, input)

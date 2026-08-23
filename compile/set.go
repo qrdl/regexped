@@ -473,7 +473,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		}
 		revD, revOk := newDFA(revProg, false, false, maxHelperDFAStates)
 		if !revOk {
-			return nil, fmt.Errorf("analyzePattern: prefix %q exceeds DFA state limit", re.Pattern)
+			return nil, fmt.Errorf("analyzePattern: prefix %q: %w", re.Pattern, ErrDFAStateLimit)
 		}
 		prefixTable := dfaTableFromCanonical(revD)
 		info.prefixDFA = prefixTable
@@ -495,7 +495,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	}
 	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
 	if !ok {
-		return nil, fmt.Errorf("analyzePattern: suffix %q exceeds DFA state limit", re.Pattern)
+		return nil, fmt.Errorf("analyzePattern: suffix %q: %w", re.Pattern, ErrDFAStateLimit)
 	}
 	suffixTable := dfaTableFromCanonical(d)
 	info.suffixDFA = suffixTable
@@ -648,10 +648,10 @@ func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, A
 	// the common case of a legitimately-large-but-finite merge — the same
 	// contract compile.go's primary DFA construction has with
 	// resolveMaxDFAStates. Only pathological, effectively-unbounded
-	// constructions (beyond maxHelperDFAStates) hit errDFAStateLimitExceeded.
+	// constructions (beyond maxHelperDFAStates) hit ErrDFAStateLimit.
 	d, ok := newDFA(unionProg, false, true, maxHelperDFAStates, patternBits)
 	if !ok {
-		return nil, 0, errDFAStateLimitExceeded
+		return nil, 0, ErrDFAStateLimit
 	}
 	t := dfaTableFromCanonical(d)
 	return t, AcceptBitmask, nil
@@ -1673,7 +1673,7 @@ func mergeAnchoredDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable,
 	unionProg, patternBits := buildUnionProg(progs, bw)
 	d, ok := newDFA(unionProg, false, false, maxHelperDFAStates, patternBits)
 	if !ok {
-		return nil, errDFAStateLimitExceeded
+		return nil, ErrDFAStateLimit
 	}
 	return dfaTableFromCanonical(d), nil
 }

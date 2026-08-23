@@ -44,6 +44,8 @@ regexped/
 │   ├── set_find.go            # Shared per-candidate machinery for every non-anchored capability: setFindCtx,
 │   │                          #   first-position drain (§9.4), gate mask/jump/write-back (§3.14-3.16),
 │   │                          #   eligibility masks, probe recording
+│   ├── startable.go           # First-byte eligibility tables (§21.6/G16): per-pattern bits of which bytes
+│   │                          #   can BEGIN a match, so a fallback bucket's suffix call is skipped outright
 │   ├── set_batch.go           # find_batch: the exported multi-position loop, the cursor layout,
 │   │                          #   and the hidden per-position worker (a find body with §19's gate
 │   │                          #   rule / skip parameter). Cursor field widths live in config/.

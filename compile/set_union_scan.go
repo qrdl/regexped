@@ -376,7 +376,7 @@ func (cs *compiledSet) unionScanDataSegs() int {
 func (cs *compiledSet) dataTop() int64 {
 	blobs := [][]byte{
 		cs.dataBytes, cs.prefixDataBytes, cs.acDataBytes,
-		cs.teddyDataBytes, cs.anchoredDataBytes,
+		cs.teddyDataBytes, cs.anchoredDataBytes, cs.startableDataBytes,
 	}
 	if cs.unionScan != nil {
 		blobs = append(blobs, cs.unionScan.dataBytes)
