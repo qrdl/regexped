@@ -3456,8 +3456,14 @@ func exportTypeIndex(t *testing.T, wasm []byte, name string) int {
 	return int(ti)
 }
 
-// TestJumpIsProfitable pins the compile-time gate of plans/SETS.md §12.3: the
-// §3.14 jump is emitted only where it can actually fire.
+// TestJumpIsProfitable pins the compile-time gate of plans/SETS.md §12.3, as
+// relaxed by §21.4 (G13): the §3.14 jump is emitted only where it can actually
+// fire and pay for itself — one pattern, or a scalar frontend (whose Θ(n)
+// stepping the O(patterns) prologue is noise against), and in either case only
+// when some pattern can match more than one byte.
+//
+// The multi-pattern rejection that remains is specifically the LITERAL-frontend
+// one measured in §12.3; the eight log-level patterns below are that set.
 func TestJumpIsProfitable(t *testing.T) {
 	cases := []struct {
 		name string
@@ -3471,7 +3477,13 @@ func TestJumpIsProfitable(t *testing.T) {
 		{"single 1-byte class", []string{`[a-z]`}, false},
 		{"single 1-byte literal", []string{`a`}, false},
 		{"single any-char", []string{`.`}, false},
-		{"two patterns", []string{`a+`, `b+`}, false},
+		// Multi-pattern, scalar frontend (no usable literal): G13 admits these.
+		{"two patterns scalar", []string{`a+`, `b+`}, true},
+		{"multi scalar one exceeds", []string{`[a-z]`, `x+`}, true},
+		// Multi-pattern, scalar, but nothing can exceed one byte → dead code.
+		{"multi scalar all one byte", []string{`[a-z]`, `[0-9]`}, false},
+		// Multi-pattern with a literal frontend: still rejected (§12.3).
+		{"two patterns teddy", []string{`a`, `b`}, false},
 		{"eight patterns", []string{`ERR\b[^\n]*`, `WRN\b[^\n]*`, `INF\b[^\n]*`, `DBG\b[^\n]*`,
 			`CRT\b[^\n]*`, `FAT\b[^\n]*`, `TRC\b[^\n]*`, `NOT\b[^\n]*`}, false},
 	}

@@ -450,12 +450,17 @@ implementation to check against.
 WASM instructions, and Rust→WASM codegen differs structurally from our
 hand-emitted WASM. Track the ratio, never a single absolute number.
 
-The rows where we still LOSE are documented in `plans/SETS.md` §20: the five
-`find`/dense rows (structural — `find` is the lazy API and pays one host
-crossing per position; `find_batch` covers the same rows at 8x-24x), and three
-`greedy-3` rows where the set has no usable mandatory literal so no literal
-frontend runs. Every win in the matrix comes from the literal frontends; on the
-scalar path we are at parity or slightly behind.
+The rows where we still LOSE are documented in `plans/SETS.md` §21.15: the
+dense `find` rows (structural — `find` is the lazy API and pays one host
+crossing per matching position; `find_batch` covers most of them at 12x-40x),
+plus `greedy-3`'s no-match `find_batch`, which is a dense drive over a set with
+no literal frontend and is engine work rather than crossings.
+
+§20.2's three literal-less rows — once the evidence for "every win comes from
+the literal frontends" — were closed by §21's G10-G14 and are now 64.27x /
+32.78x / 11.17x. The scalar path is no longer at parity: greedy-3's `scan_any`
+runs at 2.93 fuel/byte and its anchored trio at 1.70, against 32.06 and 18.75
+before.
 
 ### LikelyMode benchmark matrix (`tools/likelytest/`)
 

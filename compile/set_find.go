@@ -667,27 +667,45 @@ func setPatternIDs(cs *compiledSet) []int {
 // pattern that cannot never satisfies e > s+1, so the prologue would be dead
 // code. regexpMinMaxLen answers that (maxLen == -1 means unbounded).
 //
-// Multi-pattern sets are NOT undecidable-so-assume-yes here; they are
-// measured-negative. Recovering them would need a runtime test rather than a
-// static one — see §12.3.
+// Multi-pattern sets were NOT undecidable-so-assume-yes here; they were
+// measured-negative — but only on a LITERAL-frontend set (see §12.3). That
+// measurement is what task G13 (§21.4) narrows: log-levels-dense costs ~1K
+// fuel per call because Teddy skips the whole line, so an O(patterns)
+// prologue is +6.8% of a small number. A SCALAR-frontend set has no such
+// skip: its calls cost Θ(n) at ~55 fuel per stepped position, against which
+// the same prologue is noise — and the terminal call of a gated drive (every
+// pattern gated past the cursor, nothing left to find) is exactly the shape
+// the jump was designed for. So the static test is: ONE pattern, or a scalar
+// frontend.
+//
+// The maxLen test is unchanged in intent but now quantifies over the whole
+// set: if NO pattern can match more than one byte, then after reporting (s,
+// s+1) every gate gives p_min = s+1 = from (§4.8) and the jump can never
+// fire, so the prologue would be dead code. regexpMinMaxLen answers that
+// (maxLen == -1 means unbounded).
+// The frontend test comes FIRST because patternFullAST re-parses the pattern:
+// a literal-frontend set must reach the same verdict as before G13 without
+// paying for a walk it will discard.
 func (cs *compiledSet) jumpIsProfitable() bool {
-	var only *PatternInfo
 	n := 0
 	for _, bkt := range cs.buckets {
+		n += len(bkt.patterns)
+	}
+	if n == 0 || (n > 1 && cs.fe != frontendScalar) {
+		return false
+	}
+	for _, bkt := range cs.buckets {
 		for _, p := range bkt.patterns {
-			n++
-			only = p
+			ast := patternFullAST(p)
+			if ast == nil {
+				continue
+			}
+			if _, maxLen := regexpMinMaxLen(ast); maxLen < 0 || maxLen >= 2 {
+				return true
+			}
 		}
 	}
-	if n != 1 || only == nil {
-		return false
-	}
-	ast := patternFullAST(only)
-	if ast == nil {
-		return false
-	}
-	_, maxLen := regexpMinMaxLen(ast)
-	return maxLen < 0 || maxLen >= 2
+	return false
 }
 
 // emitGateJump advances lPos past every position at which no pattern can

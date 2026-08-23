@@ -150,6 +150,12 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 	return u
 }
 
+// unionUnroll is how many input bytes one iteration of the union scan's bulk
+// loop steps (plans/SETS.md §21.5). Four is what the task specifies: it takes
+// the per-byte scaffolding from ~14 fuel to ~3.5 while adding three copies of
+// a ~22-instruction step to two bodies per set.
+const unionUnroll = 4
+
 // emitUnionScanBody emits the one-pass scan body.
 //
 // Signature matches the capability it replaces: (ptr, len, from) -> i32 for
@@ -166,6 +172,30 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 // `scan` exits at the first accepting state — it answers a yes/no question, so
 // there is nothing to gain past the first match. `scan_all` accumulates to the
 // end, but stops as soon as every id in the set is present.
+//
+// # The unroll (plans/SETS.md §21.5 / G14)
+//
+// The loop above runs at ~36 fuel/byte, of which only ~22 is the automaton:
+// the rest is the bounds test, the position increment, the mode's exit test
+// and the backward branch. unionUnroll bytes are therefore stepped per
+// iteration, with that scaffolding paid once, and a tail loop handles the
+// last len%unionUnroll bytes byte-at-a-time.
+//
+// What can and cannot be amortised:
+//
+//   - `acc |= accept[state]` CANNOT be: every transition has its own accept
+//     set, and skipping one loses the ids that match ending there.
+//   - `input[pos+k]` costs nothing extra: k folds into the load's memarg
+//     offset, so an unrolled step is byte-for-byte the rolled step.
+//   - the exit tests CAN move to once per block. Both are monotone — `scan`
+//     exits on acc != 0, `scan_all` on acc == fullMask, and acc only ever
+//     gains bits — so delaying either by up to unionUnroll-1 bytes changes
+//     how much work is done, never the answer.
+//
+// The end-of-input OR must still see the TRUE final state, which it does: a
+// block only runs when all its bytes are in range, so an early exit leaves
+// lPos <= len, and the `pos >= len` guard admits the EOF accepts exactly when
+// the whole input was consumed.
 func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableMemIdx int) []byte {
 	const (
 		pInPtr = 0
@@ -231,42 +261,68 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	b = appendTableLoad64(b, tableMemIdx)
 	b = append(b, 0x84, 0x21, lAcc)
 
-	b = append(b, 0x02, 0x40)                                 // block $done
-	b = append(b, 0x03, 0x40)                                 // loop $scan
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01) // pos >= len → br $done
+	// One step over input[pos+k]: state = trans[state*512 + byte*2], then
+	// acc |= accept[state]. k rides in the load's memarg offset.
+	emitStep := func(b []byte, k byte) []byte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, u.transOff)
+		b = append(b, 0x20, lState, 0x41, 0x09, 0x74, 0x6A) // + state*512
+		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
+		b = append(b, 0x2D, 0x00, k)          // i32.load8_u offset=k (input, memory 0)
+		b = append(b, 0x41, 0x01, 0x74, 0x6A) // *2; add
+		b = appendTableLoad16u(b, tableMemIdx)
+		b = append(b, 0x21, lState)
 
-	// state = trans[state*512 + input[pos]*2]
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, u.transOff)
-	b = append(b, 0x20, lState, 0x41, 0x09, 0x74, 0x6A) // + state*512
-	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
-	b = append(b, 0x2D, 0x00, 0x00)       // i32.load8_u (input byte, memory 0)
-	b = append(b, 0x41, 0x01, 0x74, 0x6A) // *2; add
-	b = appendTableLoad16u(b, tableMemIdx)
-	b = append(b, 0x21, lState)
-
-	// acc |= accept[state]
-	b = append(b, 0x20, lAcc)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, u.acceptOff)
-	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A) // + state*8
-	b = appendTableLoad64(b, tableMemIdx)
-	b = append(b, 0x84, 0x21, lAcc) // i64.or; set
-
-	switch mode {
-	case capScan:
-		// Any bit set answers the question.
-		b = append(b, 0x20, lAcc, 0x42, 0x00, 0x52, 0x0D, 0x01) // acc != 0 → br $done
-	case capScanAll:
-		// Every id present: nothing further can change the answer.
-		b = append(b, 0x20, lAcc, 0x42)
-		b = utils.AppendSLEB128_64(b, int64(fullMask))
-		b = append(b, 0x51, 0x0D, 0x01) // acc == fullMask → br $done
+		// acc |= accept[state]
+		b = append(b, 0x20, lAcc)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, u.acceptOff)
+		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A) // + state*8
+		b = appendTableLoad64(b, tableMemIdx)
+		return append(b, 0x84, 0x21, lAcc) // i64.or; set
 	}
 
+	// The mode's early exit, branching to $done at br depth `depth`.
+	emitExit := func(b []byte, depth byte) []byte {
+		switch mode {
+		case capScan:
+			// Any bit set answers the question.
+			b = append(b, 0x20, lAcc, 0x42, 0x00, 0x52, 0x0D, depth) // acc != 0
+		case capScanAll:
+			// Every id present: nothing further can change the answer.
+			b = append(b, 0x20, lAcc, 0x42)
+			b = utils.AppendSLEB128_64(b, int64(fullMask))
+			b = append(b, 0x51, 0x0D, depth) // acc == fullMask
+		}
+		return b
+	}
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x02, 0x40) // block $bulk_exit
+	b = append(b, 0x03, 0x40) // loop $bulk
+
+	// pos + unionUnroll > len → the block would read past the end: leave the
+	// bulk loop and finish in the tail. Unsigned, and no overflow to worry
+	// about: pos <= len < 2^31 on entry (the from > len case already returned).
+	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
+	b = append(b, 0x20, pInLen, 0x4B, 0x0D, 0x01) // gt_u → br $bulk_exit
+
+	for k := byte(0); k < unionUnroll; k++ {
+		b = emitStep(b, k)
+	}
+	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A, 0x21, lPos)
+	b = emitExit(b, 0x02) // → $done, past $bulk and $bulk_exit
+	b = append(b, 0x0C, 0x00)
+	b = append(b, 0x0B) // end loop $bulk
+	b = append(b, 0x0B) // end block $bulk_exit
+
+	b = append(b, 0x03, 0x40)                                 // loop $tail
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01) // pos >= len → br $done
+	b = emitStep(b, 0)
+	b = emitExit(b, 0x01) // → $done
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
-	b = append(b, 0x0C, 0x00) // br $scan
-	b = append(b, 0x0B)       // end loop
+	b = append(b, 0x0C, 0x00) // br $tail
+	b = append(b, 0x0B)       // end loop $tail
 	b = append(b, 0x0B)       // end block $done
 
 	// End-of-input accepts. Reached whether the loop ran out of input or
