@@ -220,7 +220,9 @@ func TestGenGoFindStub(t *testing.T) {
 		"//go:wasmimport url url_find",
 		"ffi_url_find",
 		"func UrlFind(input []byte, offset uint) iter.Seq2[uint, uint]",
-		"uint64(r)>>32",
+		"uint64(r) >> 32",
+		// The whole buffer and a start position, not a narrowed slice.
+		"uint32(len(input)), uint32(pos)",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genGoFindStub: output missing %q", sub)
@@ -1273,7 +1275,6 @@ func TestSetBatchSizeAbsentWithoutHint(t *testing.T) {
 		}
 	}
 }
-
 
 // bigSetCfg builds a config whose set is large enough to cross the by-value
 // budget: 300 patterns is 300*12 + 300*4 = 4,800 bytes of inline arrays.

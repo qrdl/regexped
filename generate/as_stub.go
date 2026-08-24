@@ -66,7 +66,6 @@ func genASSetSection(cfg config.BuildConfig) string {
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the iterator can\n// receive at most this many matches at one position.\nexport const %s: i32 = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: i32 = %d;\n\n", s.Name, idKonst, idN)
 
-
 		decl := func(name, sig string) {
 			fmt.Fprintf(&out, "@external(%q, %q)\ndeclare function ffi_%s%s;\n\n", cfg.ImportModule, name, name, sig)
 		}
@@ -258,22 +257,27 @@ func genASFindStub(importModule, funcName string) string {
 	ffi := "_ffi_" + funcName
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "@external(\"%s\", \"%s\")\n", importModule, funcName)
-	fmt.Fprintf(&sb, "declare function %s(ptr: usize, len: usize): i64;\n\n", ffi)
+	fmt.Fprintf(&sb, "declare function %s(ptr: usize, len: usize, from: usize): i64;\n\n", ffi)
 	fmt.Fprintf(&sb, "/** Finds match starting from offset.\n")
 	fmt.Fprintf(&sb, " *  Returns packed (absStart << 32 | absEnd) as i64, or -1 if not found.\n")
 	fmt.Fprintf(&sb, " *  To iterate non-overlapping matches, advance past each match; a pattern\n")
 	fmt.Fprintf(&sb, " *  that can match empty needs the guard, or offset never moves:\n")
 	fmt.Fprintf(&sb, " *    const s = i32(<u64>r >> 32), e = i32(<u32>r);\n")
-	fmt.Fprintf(&sb, " *    offset = e > s ? e : s + 1; */\n")
+	fmt.Fprintf(&sb, " *    offset = e > s ? e : s + 1;\n")
+	fmt.Fprintf(&sb, " *  To match Go's FindAllIndex exactly, also SKIP an empty match that\n")
+	fmt.Fprintf(&sb, " *  begins where the previous reported match ended:\n")
+	fmt.Fprintf(&sb, " *    if (s == e && s == prevEnd) continue;\n")
+	fmt.Fprintf(&sb, " *    prevEnd = e; */\n")
 	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer, offset: u32): i64 {\n", funcName)
 	sb.WriteString("  const len = input.byteLength;\n")
 	sb.WriteString("  if (offset > u32(len)) return -1;\n")
-	fmt.Fprintf(&sb, "  const r = %s(changetype<usize>(input) + <usize>offset, <usize>(len - offset));\n", ffi)
+	// Whole buffer plus a start position: offset bounds where the search
+	// begins, it does not truncate what the engine sees behind it, so the
+	// returned positions are already absolute.
+	fmt.Fprintf(&sb, "  const r = %s(changetype<usize>(input), <usize>len, <usize>offset);\n", ffi)
 	fmt.Fprintf(&sb, "  if (r == %d) throw new Error(\"%s\");\n", btOverflow, btOverflowMsg(funcName))
 	sb.WriteString("  if (r < 0) return -1;\n")
-	sb.WriteString("  const relStart = i32(<u64>r >> 32);\n")
-	sb.WriteString("  const relEnd   = i32(<u32>r);\n")
-	sb.WriteString("  return (i64(i32(offset) + relStart) << 32) | i64(i32(offset) + relEnd);\n")
+	sb.WriteString("  return r;\n")
 	sb.WriteString("}\n\n")
 	return sb.String()
 }
@@ -288,7 +292,7 @@ func genASGroupsStub(importModule, funcName, exportName string, numGroups int) s
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "@external(\"%s\", \"%s\")\n", importModule, exportName)
-	fmt.Fprintf(&sb, "declare function %s(ptr: usize, len: usize, out_ptr: usize): i32;\n\n", ffi)
+	fmt.Fprintf(&sb, "declare function %s(ptr: usize, len: usize, out_ptr: usize, from: usize): i32;\n\n", ffi)
 	fmt.Fprintf(&sb, "const %s = new Int32Array(%d);\n\n", slotsVar, slotCount)
 	fmt.Fprintf(&sb, "/** Finds capture match starting from offset.\n")
 	fmt.Fprintf(&sb, " *  Returns dataStart pointer to slots buffer (pairs: start,end per group), or 0 on no match.\n")
@@ -296,21 +300,24 @@ func genASGroupsStub(importModule, funcName, exportName string, numGroups int) s
 	fmt.Fprintf(&sb, " *  Slot layout: [g0_start, g0_end, g1_start, g1_end, ...] as i32 values.\n")
 	fmt.Fprintf(&sb, " *  To iterate non-overlapping matches, advance past each match; a pattern\n")
 	fmt.Fprintf(&sb, " *  that can match empty needs the guard, or offset never moves:\n")
-	fmt.Fprintf(&sb, " *    offset = slots[1] > slots[0] ? slots[1] : slots[0] + 1; */\n")
+	fmt.Fprintf(&sb, " *    offset = slots[1] > slots[0] ? slots[1] : slots[0] + 1;\n")
+	fmt.Fprintf(&sb, " *  To match Go's FindAllSubmatchIndex exactly, also SKIP an empty match\n")
+	fmt.Fprintf(&sb, " *  that begins where the previous reported match ended:\n")
+	fmt.Fprintf(&sb, " *    if (slots[0] == slots[1] && slots[0] == prevEnd) continue;\n")
+	fmt.Fprintf(&sb, " *    prevEnd = slots[1]; */\n")
 	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer, offset: u32): u32 {\n", funcName)
 	sb.WriteString("  const len = input.byteLength;\n")
 	sb.WriteString("  if (offset > u32(len)) return 0;\n")
 	fmt.Fprintf(&sb, "  %s.fill(-1);\n", slotsVar)
 	fmt.Fprintf(&sb, "  const r = %s(\n", ffi)
-	sb.WriteString("    changetype<usize>(input) + <usize>offset,\n")
-	sb.WriteString("    <usize>(len - offset),\n")
+	// Whole buffer plus a start position; slots come back absolute.
+	sb.WriteString("    changetype<usize>(input),\n")
+	sb.WriteString("    <usize>len,\n")
 	fmt.Fprintf(&sb, "    %s.dataStart,\n", slotsVar)
+	sb.WriteString("    <usize>offset,\n")
 	sb.WriteString("  );\n")
 	fmt.Fprintf(&sb, "  if (r == %d) throw new Error(\"%s\");\n", btOverflow, btOverflowMsg(funcName))
 	sb.WriteString("  if (r < 0) return 0;\n")
-	fmt.Fprintf(&sb, "  for (let i = 0; i < %d; i++) {\n", slotCount)
-	fmt.Fprintf(&sb, "    if (%s[i] >= 0) %s[i] += i32(offset);\n", slotsVar, slotsVar)
-	sb.WriteString("  }\n")
 	fmt.Fprintf(&sb, "  return u32(%s.dataStart);\n", slotsVar)
 	sb.WriteString("}\n\n")
 

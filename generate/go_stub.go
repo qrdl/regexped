@@ -74,7 +74,6 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 		fmt.Fprintf(&out, "// %s is the number of patterns in set %q. It sizes the match buffer:\n// Find can report at most this many matches at one position.\nconst %s = %d\n\n", konst, s.Name, konst, n)
 		fmt.Fprintf(&out, "// %s is one past the largest pattern id set %q can report. Pattern ids\n// are global indices into regexps:, so a set holding a few late-declared\n// patterns has a small count and a large id space. Everything indexed BY an\n// id \u2014 the gate array, the _all bitmask \u2014 is sized from this.\nconst %s = %d\n\n", idKonst, s.Name, idKonst, idN)
 
-
 		imp := func(name, sig string) {
 			fmt.Fprintf(&out, "//go:wasmimport %s %s\n//go:noescape\nfunc ffi_%s%s\n\n", cfg.ImportModule, name, name, sig)
 		}
@@ -303,38 +302,48 @@ func genGoFindStub(importModule, funcName string) string {
 	pub := goPublicName(funcName)
 	return fmt.Sprintf(`//go:wasmimport %s %s
 //go:noescape
-func %s(ptr unsafe.Pointer, length uint32) int64
+func %s(ptr unsafe.Pointer, length uint32, from uint32) int64
 
 // %s returns an iterator over all non-overlapping matches at or after offset.
 // Each iteration yields (start, end) absolute byte positions.
 //
-// LIMITATION: offset currently NARROWS the input rather than bounding only the
-// search, so at offset > 0 a leading \b, \B, ^ or (?m:^) judges a truncated
-// left context. The single-pattern WASM exports take no offset; TODO 54 gives
-// them one, after which this stub stops narrowing and the signature is
-// unchanged.
+// The whole input is passed on every call and offset only bounds where the
+// search STARTS, so a leading \b, \B, ^ or (?m:^) is judged against the real
+// preceding byte rather than a slice edge.
 func %s(input []byte, offset uint) iter.Seq2[uint, uint] {
 	return func(yield func(uint, uint) bool) {
 		pos := int(offset)
 		if pos > len(input) {
 			return
 		}
+		var base unsafe.Pointer
+		if len(input) > 0 {
+			base = unsafe.Pointer(&input[0])
+		}
+		prevEnd := -1
 		for pos <= len(input) {
-			var ptr unsafe.Pointer
-			if pos < len(input) {
-				ptr = unsafe.Pointer(&input[pos])
-			}
-			r := %s(ptr, uint32(len(input)-pos))
+			r := %s(base, uint32(len(input)), uint32(pos))
 			if r == %d {
 				panic("%s")
 			}
 			if r < 0 {
 				break
 			}
-			start := pos + int(uint64(r)>>32)
-			end := pos + int(uint32(r))
-			if !yield(uint(start), uint(end)) {
-				break
+			start := int(uint64(r) >> 32)
+			end := int(uint32(r))
+			// Go's FindAllIndex rule: an EMPTY match beginning exactly where
+			// the previous match ended is suppressed. Without this the
+			// iterator reports a strict superset of Go's answer — e.g. a* on
+			// "a" gives 0-1 AND 1-1, where Go gives only 0-1.
+			//
+			// The advance itself is unchanged and still steps one byte past a
+			// zero-length match, which is what stops the loop spinning; only
+			// whether that match is REPORTED changes.
+			if !(start == end && prevEnd >= 0 && start == prevEnd) {
+				if !yield(uint(start), uint(end)) {
+					break
+				}
+				prevEnd = end
 			}
 			if end > start {
 				pos = end
@@ -361,7 +370,7 @@ func genGoGroupsStub(importModule, funcName, exportName string, declareFFI bool,
 	if declareFFI {
 		ffiDecl = fmt.Sprintf(`//go:wasmimport %s %s
 //go:noescape
-func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer) int32
+func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer, from uint32) int32
 
 `, importModule, exportName, ffi)
 	}
@@ -382,13 +391,14 @@ func %s(input []byte, offset uint) iter.Seq[[][]uint] {
 		if pos > len(input) {
 			return
 		}
+		var base unsafe.Pointer
+		if len(input) > 0 {
+			base = unsafe.Pointer(&input[0])
+		}
+		prevEnd := -1
 		for pos <= len(input) {
-			var ptr unsafe.Pointer
-			if pos < len(input) {
-				ptr = unsafe.Pointer(&input[pos])
-			}
 			buf := make([]int32, %d)
-			r := %s(ptr, uint32(len(input)-pos), unsafe.Pointer(&buf[0]))
+			r := %s(base, uint32(len(input)), unsafe.Pointer(&buf[0]), uint32(pos))
 			if r == %d {
 				panic("%s")
 			}
@@ -405,18 +415,27 @@ func %s(input []byte, offset uint) iter.Seq[[][]uint] {
 				if s < 0 {
 					groups[i] = nil
 				} else {
-					groups[i] = []uint{uint(s) + uint(pos), uint(e) + uint(pos)}
+					// Absolute already: the whole input is passed on every
+					// call, so slots are positions in it.
+					groups[i] = []uint{uint(s), uint(e)}
 				}
 			}
-			matchEnd := 0
+			absStart, absEnd := int(buf[0]), int(buf[0])
 			if buf[1] >= 0 {
-				matchEnd = int(buf[1])
+				absEnd = int(buf[1])
 			}
-			if matchEnd > 0 {
-				pos += matchEnd
+			if absEnd > absStart {
+				pos = absEnd
 			} else {
-				pos++
+				pos = absStart + 1
 			}
+			// Go's FindAllSubmatchIndex rule: suppress an EMPTY match
+			// beginning exactly where the previous reported match ended. The
+			// advance above is unchanged.
+			if absStart == absEnd && prevEnd == absStart {
+				continue
+			}
+			prevEnd = absEnd
 			if !yield(groups) {
 				break
 			}
@@ -439,7 +458,7 @@ func genGoNamedGroupsStub(importModule, funcName, exportName string, declareFFI 
 	if declareFFI {
 		ffiDecl = fmt.Sprintf(`//go:wasmimport %s %s
 //go:noescape
-func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer) int32
+func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer, from uint32) int32
 
 `, importModule, exportName, ffi)
 	}
@@ -457,7 +476,7 @@ func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer) int32
 	var assigns strings.Builder
 	for _, e := range entries {
 		fmt.Fprintf(&assigns,
-			"\t\t\tif buf[%d] >= 0 { named[\"%s\"] = []uint{uint(buf[%d]) + uint(pos), uint(buf[%d]) + uint(pos)} }\n",
+			"\t\t\tif buf[%d] >= 0 { named[\"%s\"] = []uint{uint(buf[%d]), uint(buf[%d])} }\n",
 			e.index*2, e.name, e.index*2, e.index*2+1)
 	}
 
@@ -469,13 +488,14 @@ func %s(input []byte, offset uint) iter.Seq[map[string][]uint] {
 		if pos > len(input) {
 			return
 		}
+		var base unsafe.Pointer
+		if len(input) > 0 {
+			base = unsafe.Pointer(&input[0])
+		}
+		prevEnd := -1
 		for pos <= len(input) {
-			var ptr unsafe.Pointer
-			if pos < len(input) {
-				ptr = unsafe.Pointer(&input[pos])
-			}
 			buf := make([]int32, %d)
-			r := %s(ptr, uint32(len(input)-pos), unsafe.Pointer(&buf[0]))
+			r := %s(base, uint32(len(input)), unsafe.Pointer(&buf[0]), uint32(pos))
 			if r == %d {
 				panic("%s")
 			}
@@ -487,15 +507,21 @@ func %s(input []byte, offset uint) iter.Seq[map[string][]uint] {
 				continue
 			}
 			named := make(map[string][]uint, %d)
-%s			matchEnd := 0
+%s			absStart, absEnd := int(buf[0]), int(buf[0])
 			if buf[1] >= 0 {
-				matchEnd = int(buf[1])
+				absEnd = int(buf[1])
 			}
-			if matchEnd > 0 {
-				pos += matchEnd
+			if absEnd > absStart {
+				pos = absEnd
 			} else {
-				pos++
+				pos = absStart + 1
 			}
+			// See the groups iterator: Go suppresses an empty match adjacent
+			// to the previous one.
+			if absStart == absEnd && prevEnd == absStart {
+				continue
+			}
+			prevEnd = absEnd
 			if !yield(named) {
 				break
 			}

@@ -2540,10 +2540,10 @@ func emitBTMemoZeroInitTrimmed(body []byte, memoTableBase int32, N int,
 // Signature: (ptr i32, len i32) → i64
 // Returns (start << 32 | end) on match, -1 on no match.
 func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams,
-	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, mandLit *mandatoryLit, tableMemIdx int) []byte {
-	body := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx)
+	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, mandLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode) {
+	body, mode := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+	return append(cs, body...), mode
 }
 
 // buildBTFindBody emits the full WASM function body for a no-capture BT find.
@@ -2560,7 +2560,8 @@ func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams
 // mandatory literal, inner loop runs BT attempts in the resulting window.
 // scanParams is ignored when mandLit != nil (the mandatory-lit prefix scan replaces it).
 func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandatoryLit,
-	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
+	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) ([]byte, findFromMode) {
+	findFrom := ffLegacyNarrow
 	prog := bt.prog
 	N := len(prog.Inst)
 
@@ -2660,6 +2661,13 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 
 	const locAttemptStart = byte(0x07)
 
+	// The find-from seed (task 54). Placed here because everything above is
+	// the locals declaration and everything below reads attempt_start. This
+	// body already handles a nonzero start — its memo-skip computes
+	// `attempt_start >> 3` precisely so earlier bytes are not revisited — it
+	// was simply never told where to start.
+	body, findFrom = emitFindFromSeed(body, locAttemptStart)
+
 	// ── Mandatory-literal two-level outer loop ────────────────────────────────
 	// When mandLit != nil: outer loop $lit_outer scans for the mandatory literal
 	// using an SIMD prefix scan, inner loop $outer runs BT from each candidate
@@ -2668,13 +2676,21 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		// block $no_match
 		body = append(body, 0x02, 0x40)
 
-		// Initialise scan_start = minOff (skip positions where lit can't appear).
+		// scan_start = attempt_start + minOff.
+		//
+		// This cursor is an ABSOLUTE position into the whole buffer, so it has
+		// to begin at the find-from position rather than at 0; minOff is the
+		// earliest the literal can sit relative to a match start. When from is
+		// 0 this is exactly the old value. Same correction the DFA
+		// mandatory-literal path needed.
+		body = append(body, 0x20, locAttemptStart)
 		if mandLit.minOff > 0 {
 			body = append(body, 0x41)
 			body = utils.AppendSLEB128(body, mandLit.minOff)
-			body = append(body, 0x21)
-			body = utils.AppendULEB128(body, scanStartLocal) // local.set scan_start
+			body = append(body, 0x6A) // i32.add
 		}
+		body = append(body, 0x21)
+		body = utils.AppendULEB128(body, scanStartLocal) // local.set scan_start
 
 		// loop $lit_outer
 		body = append(body, 0x03, 0x40)
@@ -2821,7 +2837,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = append(body, 0x42, 0x7F) // i64.const -1
 		body = append(body, 0x0F)       // return
 		body = append(body, 0x0B)       // end function
-		return body
+		return body, findFrom
 	}
 
 	// ── Standard first-byte / prefix scan path ────────────────────────────────
@@ -2903,5 +2919,5 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	body = append(body, 0x42, 0x7F) // i64.const -1
 	body = append(body, 0x0F)       // return
 	body = append(body, 0x0B)       // end function
-	return body
+	return body, findFrom
 }

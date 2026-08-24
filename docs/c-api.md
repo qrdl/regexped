@@ -82,18 +82,27 @@ if (end >= 0) {
 rx_match_t <func>(const char *input, size_t len, size_t offset);
 ```
 
-Scans `input[offset..len]` for the next match. Returns absolute byte positions
+Scans for the next match at or after `offset`. The whole input stays visible to
+the engine — `offset` bounds where the search starts, it does not truncate the
+left context a leading `\b`, `\B` or `(?m:^)` is judged against. Returns
+absolute byte positions
 `{start, end}`, or `{-1, -1}` if not found.
 
 To iterate all non-overlapping matches:
 
 ```c
 unsigned int off = 0;
+ptrdiff_t prev_end = -1;
 while (off <= len) {
     rx_match_t m = find_token(input, len, off);
     if (m.start < 0) break;
-    /* use m.start, m.end */
     off = (unsigned int)(m.end > m.start ? m.end : m.start + 1);
+    /* Go's FindAllIndex rule: an empty match beginning exactly where the
+       previous reported match ended is not reported. Skip it AFTER
+       advancing, or the loop stalls. */
+    if (m.start == m.end && m.start == prev_end) continue;
+    prev_end = m.end;
+    /* use m.start, m.end */
 }
 ```
 
@@ -131,12 +140,18 @@ To iterate non-overlapping matches:
 
 ```c
 unsigned int off = 0;
+ptrdiff_t prev_end = -1;
 while (off <= len) {
     const rx_group_t *groups = parse_url(input, len, off);
     if (groups[0].start < 0) break;
-    /* process groups[] */
     off = (unsigned int)(groups[0].end > groups[0].start
                          ? groups[0].end : groups[0].start + 1);
+    /* Go's FindAllSubmatchIndex rule: an empty match beginning exactly where
+       the previous reported match ended is not reported. Skip it AFTER
+       advancing, or the loop stalls. */
+    if (groups[0].start == groups[0].end && groups[0].start == prev_end) continue;
+    prev_end = groups[0].end;
+    /* process groups[] */
 }
 ```
 

@@ -333,12 +333,18 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
         const len = _w(input, %[2]d * 8);
         const outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
         let startPos = offset;
+        let prevEnd = -1;
         while (true) {
             const n = (_exp['%[1]s_batch'] as CallableFunction)(_inBase, len, _outBase, %[2]d, startPos) as number;
             if (n === %[3]d) throw new Error("%[4]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
-                yield [outBuf[i * 2], outBuf[i * 2 + 1]];
+                const s = outBuf[i * 2], e = outBuf[i * 2 + 1];
+                // Go's FindAllIndex rule: suppress an EMPTY match beginning
+                // exactly where the previous reported match ended.
+                if (s === e && s === prevEnd) continue;
+                prevEnd = e;
+                yield [s, e];
             }
             if (n < %[2]d) break;
             const lastStart = outBuf[(n - 1) * 2], lastEnd = outBuf[(n - 1) * 2 + 1];
@@ -348,13 +354,22 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
     }
     const len = _w(input);
     let off = offset;
+    let prevEnd2 = -1;
     while (off <= len) {
-        const r = (_exp['%[1]s'] as CallableFunction)(_inBase + off, len - off) as bigint;
+        // Whole input plus a start position: offset bounds where the search
+        // begins, it does not truncate what the engine sees behind it.
+        const r = (_exp['%[1]s'] as CallableFunction)(_inBase, len, off) as bigint;
         if (r === %[3]dn) throw new Error("%[4]s");
         if (r < 0n) break;
-        const relStart = Number(r >> 32n);
-        const relEnd   = Number(r & 0xFFFFFFFFn);
-        yield [off + relStart, off + relEnd];
+        const absStart = Number(r >> 32n);
+        const absEnd   = Number(r & 0xFFFFFFFFn);
+        const relStart = absStart - off, relEnd = absEnd - off;
+        // See the batch path: Go suppresses an empty match adjacent to the
+        // previous one. The advance below is unchanged.
+        if (!(absStart === absEnd && absStart === prevEnd2)) {
+            prevEnd2 = absEnd;
+            yield [absStart, absEnd];
+        }
         off += relEnd > relStart ? relEnd : relStart + 1;
     }
 }
@@ -408,22 +423,29 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
     // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
     let off = offset;
+    let prevEnd = -1;
     while (off <= len) {
         slots.fill(-1);
-        const r = (_exp['%[1]s'] as CallableFunction)(_inBase + off, len - off, _outBase) as number;
+        const r = (_exp['%[1]s'] as CallableFunction)(_inBase, len, _outBase, off) as number;
         if (r === %[7]d) throw new Error("%[8]s");
         if (r < 0) {
             if (off === len) break;
             off++;
             continue;
         }
-        const matchEnd = slots[1] >= 0 ? slots[1] : 0;
+        const matchEnd = slots[1] >= 0 ? slots[1] : slots[0];
         const result: Array<[number, number] | null> = [];
         for (let i = 0; i < %[5]d; i++) {
             const s = slots[i * 2], e = slots[i * 2 + 1];
-            result.push(s < 0 ? null : [off + s, off + e]);
+            result.push(s < 0 ? null : [s, e]); // absolute already
         }
-        off += matchEnd > 0 ? matchEnd : 1;
+        const absStart = slots[0], absEnd = matchEnd;
+        off = absEnd > absStart ? absEnd : absStart + 1;
+        // Go's FindAllSubmatchIndex rule: suppress an EMPTY match beginning
+        // exactly where the previous reported match ended. The advance above
+        // is unchanged.
+        if (absStart === absEnd && absStart === prevEnd) continue;
+        prevEnd = absEnd;
         yield result;
     }
 }
@@ -457,7 +479,7 @@ func genTSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 	var inserts strings.Builder
 	for _, e := range entries {
 		fmt.Fprintf(&inserts,
-			"        if (slots[%d] >= 0) result['%s'] = [off + slots[%d], off + slots[%d]];\n",
+			"        if (slots[%d] >= 0) result['%s'] = [slots[%d], slots[%d]];\n",
 			e.index*2, e.name, e.index*2, e.index*2+1)
 	}
 
@@ -497,18 +519,25 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
     // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
     let off = offset;
+    let prevEnd = -1;
     while (off <= len) {
         slots.fill(-1);
-        const r = (_exp['%[2]s'] as CallableFunction)(_inBase + off, len - off, _outBase) as number;
+        const r = (_exp['%[2]s'] as CallableFunction)(_inBase, len, _outBase, off) as number;
         if (r === %[9]d) throw new Error("%[10]s");
         if (r < 0) {
             if (off === len) break;
             off++;
             continue;
         }
-        const matchEnd = slots[1] >= 0 ? slots[1] : 0;
+        const matchEnd = slots[1] >= 0 ? slots[1] : slots[0];
         const result: Record<string, [number, number]> = {};
-%[8]s        off += matchEnd > 0 ? matchEnd : 1;
+%[8]s        const absStart = slots[0], absEnd = matchEnd;
+        off = absEnd > absStart ? absEnd : absStart + 1;
+        // Go's FindAllSubmatchIndex rule: suppress an EMPTY match beginning
+        // exactly where the previous reported match ended. The advance above
+        // is unchanged.
+        if (absStart === absEnd && absStart === prevEnd) continue;
+        prevEnd = absEnd;
         yield result;
     }
 }

@@ -9,15 +9,18 @@ Each regexp WASM module exports one or more functions depending on which `_func`
 (func $match (param $ptr i32) (param $len i32) (result i32))
 
 ;; Non-anchored find: returns packed (start << 32 | end) on match, or -1 on no match.
-(func $find (param $ptr i32) (param $len i32) (result i64))
+;; $from is where the SEARCH starts; $ptr/$len always describe the WHOLE input,
+;; so zero-width assertions at the search start see their real neighbouring
+;; bytes. Positions in the result are absolute. from > len returns -1.
+(func $find (param $ptr i32) (param $len i32) (param $from i32) (result i64))
 
 ;; Anchored groups: writes numGroups*2 i32 slots to out_ptr, returns end position or -1.
 ;; Slots layout: [start0, end0, start1, end1, ...]  (group 0 = full match)
-(func $groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (result i32))
+(func $groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (param $from i32) (result i32))
 
 ;; Named groups: same ABI and slot layout as $groups above.
 ;; The name→slot-index mapping is resolved in the generated host stub, not in WASM.
-(func $named_groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (result i32))
+(func $named_groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (param $from i32) (result i32))
 ```
 
 ### Negative return values
@@ -34,6 +37,29 @@ The same two values apply to the `i64` find exports, sign-extended (`i64.const -
 For the `_batch` exports, which return a match **count**, `-2` appears as a negative count; a successful call always returns a count ≥ 0. Returning the count collected so far would be a silent truncation the host could not distinguish from a completed scan.
 
 `-2` originates only in Backtracking bodies (the DFA, Compiled DFA and TDFA engines have no such ceiling) and only for a subset of pattern shapes — see [engines.md](engines.md) "Frame budget and the `-2` sentinel" for when it is reachable and how each generated stub surfaces it. The constants are defined once, in `internal/abi`, and shared by the compiler and the stub generators.
+
+`$from` on the capture exports means what it means on `$find`: where the
+SEARCH starts, with `$ptr`/`$len` still describing the whole input. Slot
+positions come back absolute. For a pattern anchored at 0 the export answers
+"no match" for any `$from != 0` — such a pattern has nothing to find later in
+the input.
+
+### The find-from channel
+
+A module that exports any `find` also declares one **mutable `i32` global**,
+index 0 within the module, holding the position an in-progress find should
+start from. The exported `find` is a thin wrapper that sets it and calls the
+two-argument body; the body's own signature is unchanged, which is why its
+several hundred hardcoded local indices did not have to move.
+
+The capture exports use the same channel: their wrapper sets it and the find
+body inside the composed groups path reads it. An anchored capture body reads
+nothing — it cannot match past 0, so its wrapper answers -1 instead of calling
+it.
+
+Hosts never touch this global — it is not exported, and `wasm-merge` renumbers
+it (and every reference to it) when merging into a host that has globals of its
+own. Several regexp modules merged into one host each keep their own.
 
 **Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regexp WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regexp module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
 

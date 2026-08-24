@@ -78,7 +78,10 @@ if (end >= 0) {
 export function <func>(input: ArrayBuffer, offset: u32): i64
 ```
 
-Scans `input[offset..]` for the next match. Returns a **packed** `i64`:
+Scans for the next match at or after `offset`. The whole of `input` stays
+visible to the engine — `offset` bounds where the search starts, it does not
+truncate the left context a leading `\b`, `\B` or `(?m:^)` is judged against.
+Returns a **packed** `i64`:
 
 ```
 (absStart << 32) | absEnd
@@ -94,13 +97,19 @@ import { find_token } from "./stub";
 
 const buf = String.UTF8.encode(text);
 let off: i32 = 0;
+let prevEnd: i32 = -1;
 while (true) {
   const r = find_token(buf, off);
   if (r < 0) break;
   const start = i32(<u64>r >> 32);
   const end   = i32(<u32>r);
-  // use start, end ...
   off = end > start ? end : start + 1;  // advance past zero-length matches
+  // Go's FindAllIndex rule: an empty match beginning exactly where the
+  // previous reported match ended is not reported. Skip it AFTER advancing,
+  // or the loop stalls.
+  if (start == end && start == prevEnd) continue;
+  prevEnd = end;
+  // use start, end ...
 }
 ```
 
@@ -112,7 +121,10 @@ while (true) {
 export function <func>(input: ArrayBuffer, offset: u32): u32
 ```
 
-Scans `input[offset..]` for the next match and fills a **static `Int32Array`** slot
+Scans for the next match at or after `offset`. The whole of `input` stays
+visible to the engine — `offset` bounds where the search starts, it does not
+truncate the left context a leading `\b`, `\B` or `(?m:^)` is judged against.
+Fills a **static `Int32Array`** slot
 buffer with absolute byte positions for each capture group.
 
 Returns the **`dataStart`** pointer of the slot buffer (a non-zero `i32`) on match,

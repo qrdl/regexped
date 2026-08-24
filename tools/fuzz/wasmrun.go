@@ -96,7 +96,8 @@ func runWasmFind(wasmBytes []byte, input string) (span [2]int, ok bool, hang boo
 	}
 
 	wd.Arm(store)
-	result, callErr := findFn.Call(store, int32(0), int32(len(input)))
+	// find is (ptr, len, from); a one-shot find starts at 0.
+	result, callErr := findFn.Call(store, int32(0), int32(len(input)), int32(0))
 	wd.Disarm()
 	if callErr != nil {
 		if isTimeout(callErr) {

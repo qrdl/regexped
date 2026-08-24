@@ -691,7 +691,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 					lmNonMidShufti:       false,
 					lmWideShufti:         false,
 				})
-				body := buildLitAnchorBackScanBody(revL, p.prefixDFA, opts.TableMemIdx)
+				body := buildLitAnchorBackScanBody(revL, p.prefixDFA, opts.TableMemIdx, false)
 				fnIdx = len(prefixFnBodies)
 				prefixFnBodies = append(prefixFnBodies, body)
 				prefixPoolToFnIdx[prefixID] = fnIdx
@@ -1448,6 +1448,20 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		if p.batchGroupsExport != "" {
 			fs = append(fs, byte(setMatchTypeMatch))
 		}
+		if p.hasFindFunc() {
+			// (i32,i32,i32)→i64. NOTE the type index differs from the
+			// single-pattern assembler's 3: this module has its own type
+			// table, where that shape is 7.
+			fs = append(fs, byte(setTypeI32x3ToI64))
+		}
+		// (i32×4)→i32 groups/named-groups wrappers. This table already has
+		// that shape at 6, so no new type is needed here.
+		if p.hasGroupsFromWrapper() {
+			fs = append(fs, byte(setTypeI32x4ToI32))
+		}
+		if p.hasNamedGroupsFromWrapper() {
+			fs = append(fs, byte(setTypeI32x4ToI32))
+		}
 	}
 	for _, cs := range sets {
 		for _, c := range cs.capFns() {
@@ -1501,6 +1515,13 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		out = appendSection(out, 5, mem)
 	}
 
+	// Global section: the find-from channel (see find_from.go), on the same
+	// terms as the single-pattern assembler. Set capabilities take their own
+	// `from` as a real parameter and do not use it.
+	if anyFindFunc(patterns) {
+		out = appendSection(out, 6, findFromGlobalSection())
+	}
+
 	// Export section.
 	numExports := 0
 	if standalone {
@@ -1513,10 +1534,10 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		if p.findExport != "" {
 			numExports++
 		}
-		if p.groupsExport != "" {
+		if p.hasGroupsFromWrapper() {
 			numExports++
 		}
-		if p.namedGroupsExport != "" {
+		if p.hasNamedGroupsFromWrapper() {
 			numExports++
 		}
 		if p.batchFindExport != "" {
@@ -1538,32 +1559,29 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	}
 	for i, p := range patterns {
 		base := baseIdx[i]
-		matchOff, _, findOff, captureOff, wrapperOff, namedWrapperOff := p.offsets()
+		matchOff, _, findOff, _, _, namedWrapperOff := p.offsets()
 		if p.matchExport != "" && matchOff >= 0 {
 			es = appendString(es, p.matchExport)
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+matchOff))
 		}
 		if p.findExport != "" && findOff >= 0 {
+			// The (ptr, len, from) wrapper, not the body — see find_from.go.
 			es = appendString(es, p.findExport)
 			es = append(es, 0x00)
-			es = utils.AppendULEB128(es, uint32(base+findOff))
+			es = utils.AppendULEB128(es, uint32(base+p.findWrapperOffset()))
 		}
-		if p.groupsExport != "" {
-			var groupsFuncIdx int
-			if p.anchored {
-				groupsFuncIdx = base + captureOff
-			} else {
-				groupsFuncIdx = base + wrapperOff
-			}
+		gFromOff, nFromOff := p.groupsFromWrapperOffsets()
+		if p.hasGroupsFromWrapper() {
+			// The (ptr, len, out_ptr, from) wrapper — see find_from.go.
 			es = appendString(es, p.groupsExport)
 			es = append(es, 0x00)
-			es = utils.AppendULEB128(es, uint32(groupsFuncIdx))
+			es = utils.AppendULEB128(es, uint32(base+gFromOff))
 		}
-		if p.namedGroupsExport != "" && namedWrapperOff >= 0 {
+		if p.hasNamedGroupsFromWrapper() && namedWrapperOff >= 0 {
 			es = appendString(es, p.namedGroupsExport)
 			es = append(es, 0x00)
-			es = utils.AppendULEB128(es, uint32(base+namedWrapperOff))
+			es = utils.AppendULEB128(es, uint32(base+nFromOff))
 		}
 		batchFindOff, batchGroupsOff := p.batchOffsets()
 		if p.batchFindExport != "" && batchFindOff >= 0 {
@@ -1592,7 +1610,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total))
 	for i, p := range patterns {
 		base := baseIdx[i]
-		_, backwardScanOff, findOff, captureOff, wrapperOff, _ := p.offsets()
+		_, backwardScanOff, findOff, captureOff, wrapperOff, namedWrapperOff := p.offsets()
 		if p.matchBody != nil {
 			cs_bytes = append(cs_bytes, p.matchBody...)
 		}
@@ -1602,7 +1620,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			if !standalone {
 				tableMemIdx = 1
 			}
-			litAnchorFindBody := buildLitAnchorFindBody(p.litAnchorFindTable, p.litAnchorFindLayout, p, base+backwardScanOff, tableMemIdx)
+			litAnchorFindBody, litAnchorMode := buildLitAnchorFindBody(p.litAnchorFindTable, p.litAnchorFindLayout, p, base+backwardScanOff, tableMemIdx)
+			p.findFromMode = litAnchorMode
 			cs_bytes = utils.AppendULEB128(cs_bytes, uint32(len(litAnchorFindBody)))
 			cs_bytes = append(cs_bytes, litAnchorFindBody...)
 		} else if p.findBody != nil {
@@ -1619,7 +1638,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winScratchOff
 				}
-				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff)
+				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.findFromMode)
 				if p.namedGroupsExport != "" {
 					cs_bytes = appendNamedGroupsWrapperCodeEntry(cs_bytes, base+wrapperOff)
 				}
@@ -1628,7 +1647,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			}
 		}
 		if p.batchFindExport != "" {
-			cs_bytes = appendBatchFindWrapperCodeEntry(cs_bytes, base+findOff)
+			cs_bytes = appendBatchFindWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode)
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
@@ -1642,8 +1661,25 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winScratchOff
 				}
-				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff)
+				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode)
 			}
+		}
+		if p.hasFindFunc() {
+			if p.findFromMode == ffUnset {
+				panic("compile: pattern contributes a find function but no findFromMode was recorded — " +
+					"a find emitter bypassed setFind (see find_from.go)")
+			}
+			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode)
+		}
+		if p.hasGroupsFromWrapper() {
+			inner, anchoredOnly := base+wrapperOff, false
+			if p.anchored {
+				inner, anchoredOnly = base+captureOff, true
+			}
+			cs_bytes = appendGroupsFromWrapperCodeEntry(cs_bytes, inner, anchoredOnly)
+		}
+		if p.hasNamedGroupsFromWrapper() {
+			cs_bytes = appendGroupsFromWrapperCodeEntry(cs_bytes, base+namedWrapperOff, p.anchored)
 		}
 	}
 	// Set function bodies: find fn (if any), anchored match fn (if any), suffix DFA fns, prefix DFA fns.

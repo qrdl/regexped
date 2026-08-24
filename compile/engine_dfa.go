@@ -5371,15 +5371,25 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 // function index) was removed. To reinstate, change the signature to
 // `([]byte, []int)`, restore the `callSites` plumbing, and update both
 // callers.
-func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
+func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode) {
 	var body []byte
+	// mode is decided by WHICH body this dispatch picks.
+	//
+	// The two anchored arms are ffAnchoredZeroOnly and their bodies are used
+	// UNCHANGED. isAnchoredFind(t) is exactly "no state reachable from any
+	// mid-start state accepts in any flavour", i.e. no match can begin past
+	// position 0 — so a search starting anywhere else has nothing to find, and
+	// the wrapper answers -1 without calling the body at all. The claim is
+	// made here, where the predicate is actually evaluated.
+	var mode findFromMode
 	if l.useHybridDispatch {
 		if isAnchoredFind(t) {
-			body = buildHybridAnchoredFindBody(t, l, tableMemIdx)
+			body, mode = buildHybridAnchoredFindBody(t, l, tableMemIdx), ffAnchoredZeroOnly
 		} else {
-			body = buildHybridFindBody(t, l, mandatoryLit, tableMemIdx)
+			body, mode = buildHybridFindBody(t, l, mandatoryLit, tableMemIdx)
 		}
 	} else if isAnchoredFind(t) {
+		mode = ffAnchoredZeroOnly
 		body = buildAnchoredFindBody(anchoredFindBodyParams{
 			startState:         l.wasmStart,
 			tableOff:           l.tableOff,
@@ -5401,7 +5411,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			tableMemIdx:        tableMemIdx,
 		})
 	} else {
-		body = buildFindBody(findBodyParams{
+		body, mode = buildFindBody(findBodyParams{
 			startState:            l.wasmStart,
 			midStartState:         l.wasmMidStart,
 			midStartWordState:     l.wasmMidStartWord,
@@ -5452,7 +5462,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 		})
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+	return append(cs, body...), mode
 }
 
 // emitCompressedU8Transition emits the compressed u8 DFA transition:
@@ -7096,12 +7106,34 @@ func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
 // newline boundary is hit, it records last_accept and terminates.
 //
 // Locals: ptr(0), scan_end(1), state(2), pos(3), last_accept(4), byte_or_class(5)
-func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx int) []byte {
+// floorFromGlobal makes the backward scan stop at the find-from position
+// instead of at 0 (task 54). It MUST be false for the set prefix DFA, which
+// shares this builder but has its own `from` parameter and never writes the
+// find-from global — reading it there would let a single-pattern find's
+// leftover position bound an unrelated set scan.
+func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx int, floorFromGlobal bool) []byte {
 	var b []byte
 
 	// ── local declarations ────────────────────────────────────────────────────
 	// 4 extra i32 locals beyond the 2 params: state(2), pos(3), last_accept(4), byte/class(5)
+	// plus, under floorFromGlobal, floor(6) — appended so 2..5 do not move.
 	b = append(b, 0x01, 0x04, 0x7F)
+
+	// emitFloor pushes the lowest position this scan may report a match start
+	// at: the find-from position, or 0 when the caller did not ask for one.
+	//
+	// The global is read INLINE at each use rather than cached in a local.
+	// Caching cost two instructions in the prologue, and this function runs
+	// once per LITERAL CANDIDATE — on a 100KB input with a common first byte
+	// that was +2273 fuel, measured. Read inline it is free: global.get
+	// replaces the i32.const it stands in for, one instruction for one.
+	emitFloor := func(b []byte) []byte {
+		if !floorFromGlobal {
+			return append(b, 0x41, 0x00) // i32.const 0
+		}
+		b = append(b, 0x23) // global.get
+		return utils.AppendULEB128(b, findFromGlobalIdx)
+	}
 
 	// state = revL.wasmStart
 	b = append(b, 0x41)
@@ -7140,15 +7172,17 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $rev
 
-	// if pos < 0 (signed): check EOF accept, then exit.
+	// if pos < floor (signed): check EOF accept, then exit. floor is 0 unless
+	// the caller asked to start later, so this is the old test in that case.
 	b = append(b, 0x20, 0x03) // local.get pos
-	b = append(b, 0x41, 0x00)
+	b = emitFloor(b)
 	b = append(b, 0x48)       // i32.lt_s
 	b = append(b, 0x04, 0x40) // if (void) — depth 0
-	// if accept[state] != 0: last_accept = 0 (match starts at text start)
+	// if accept[state] != 0: last_accept = floor (match starts at the earliest
+	// position the caller allows, which is text start when floor is 0)
 	b = emitAcceptBitOnStack(b, 0x02, revL.acceptLimit)
 	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x41, 0x00) // i32.const 0
+	b = emitFloor(b)
 	b = append(b, 0x21, 0x04) // local.set last_accept
 	b = append(b, 0x0B)       // end if
 	b = append(b, 0x0C, 0x02) // br 2 → $done (0=outer_if, 1=$rev, 2=$done)
@@ -7327,8 +7361,9 @@ func buildSimplePrefixCheckBody(tlo [16]byte, count int) []byte {
 //	chunk(8)                                        — v128
 //	tLo(9), tHi(10)                                 — v128 (T0 Teddy, if applicable)
 //	chunk1(11), t1Lo(12), t1Hi(13)                  — v128 (T1 Teddy, if applicable)
-func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncIdx int, tableMemIdx int) []byte {
+func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncIdx int, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
+	findFrom := ffLegacyNarrow
 
 	// ── local declarations ────────────────────────────────────────────────────
 	// When there is a single literal use the hybrid prefix scan (one v128.load
@@ -7376,6 +7411,12 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		locT1Lo         = 12
 		locT1Hi         = 13
 	)
+
+	// The find-from seed (task 54). The literal scan, the backward scan and
+	// the forward verify all key off attempt_start, and the backward scan
+	// additionally reads the same global as its floor so it cannot walk left
+	// past the caller's start position.
+	b, findFrom = emitFindFromSeed(b, locAttemptStart)
 
 	// ── outer control flow ────────────────────────────────────────────────────
 	// block $no_match (depth 1 from inside $lit_outer)
@@ -7708,7 +7749,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x42, 0x7F) // i64.const -1
 	b = append(b, 0x0B)       // end function
 
-	return b
+	return b, findFrom
 }
 
 // altLitAnchorFuncIdx holds one alternation branch's function indices
@@ -7959,8 +8000,9 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 // need a bounded-lookahead/best-of-window loop here instead.
 //
 // Signature: (ptr i32, len i32) → i64. Returns -1 on no match.
-func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchorFuncIdx, tableMemIdx int) []byte {
+func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchorFuncIdx, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
+	findFrom := ffLegacyNarrow
 
 	hasT0 := len(p.altLitAnchorTeddyLoBytes) > 0
 	hasT1 := len(p.altLitAnchorTeddyT1LoBytes) > 0
@@ -8005,6 +8047,16 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	}
 
 	// ── outer control flow ────────────────────────────────────────────────
+	// The find-from seed (task 54), AFTER the locals declaration above — this
+	// function declares its local-index constants BEFORE emitting the locals
+	// section, so seeding next to the constants puts instructions where the
+	// locals belong and the module fails validation.
+	//
+	// The dispatcher scans for any branch's literal starting at attempt_start,
+	// and each branch's backward scan reads the same global as its floor, so
+	// neither can look left of the caller's start position.
+	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $outer
 
@@ -8111,7 +8163,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	b = append(b, 0x42, 0x7F) // i64.const -1
 	b = append(b, 0x0B)       // end function
 
-	return b
+	return b, findFrom
 }
 
 // buildFindBody returns the WASM function body for find mode.
@@ -8195,7 +8247,13 @@ type findBodyParams struct {
 	eofSkipSafe           bool
 }
 
-func buildFindBody(p findBodyParams) []byte {
+// findBodyAttemptStartLocal is buildFindBody's scan-start local: the position
+// the next match attempt begins at. It is the local the find-from seed writes
+// and the one prefixScanLocals.AttemptStart names, so the two come from one
+// place and cannot drift apart.
+const findBodyAttemptStartLocal = 4
+
+func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// Destructured once so the body below reads exactly as it did when these
 	// were positional parameters; the struct exists to make call sites keyed.
 	startState := p.startState
@@ -8405,6 +8463,22 @@ func buildFindBody(p findBodyParams) []byte {
 	// counter/scratch — matching the existing "skip the group entirely
 	// when count is 0" convention used elsewhere in this codebase (e.g.
 	// buildBTFindBody in engine_backtrack.go).
+	// findFrom is produced by the seed emitter inside appendLocalGroups below,
+	// never asserted here. If that closure were somehow not reached it stays
+	// ffLegacyNarrow and the wrapper keeps narrowing — wrong-but-safe, rather
+	// than a body and a wrapper that both apply the offset.
+	findFrom := ffLegacyNarrow
+	// seedFindFrom writes the find-from position into attempt_start. BOTH of
+	// this function's locals paths must call it exactly once, immediately
+	// after declaring locals: appendLocalGroups just below, and the
+	// mandatory-literal branches, which declare their locals inline instead of
+	// going through it. Missing the second of those left three of this task's
+	// acceptance patterns still diverging after the first conversion — all
+	// three have a mandatory literal.
+	seedFindFrom := func(b []byte) []byte {
+		b, findFrom = emitFindFromSeed(b, findBodyAttemptStartLocal)
+		return b
+	}
 	appendLocalGroups := func(b []byte, i32Count byte) []byte {
 		trailingI32 := byte(0)
 		if needsDenseSwitch {
@@ -8427,6 +8501,20 @@ func buildFindBody(p findBodyParams) []byte {
 		if trailingI32 > 0 {
 			b = append(b, trailingI32, 0x7F)
 		}
+		// The find-from seed goes here and only here. This closure is the one
+		// point at which every branch of this function declares its locals, so
+		// seeding inside it gives each body exactly one seed, in the only
+		// correct place: after the locals, before the prologue that first
+		// reads attempt_start.
+		//
+		// Nothing downstream resets attempt_start — the sole other write to it
+		// is a max() against a literal-scan position, which only ever raises
+		// it — so this one write is the whole mechanism. The engine already
+		// selects midStart / midStartWord / midStartNewline for
+		// attempt_start > 0 and reads the byte before it, which is why handing
+		// it the whole buffer makes every left-context decision correct
+		// without changing any automaton.
+		b = seedFindFrom(b)
 		return b
 	}
 
@@ -8462,7 +8550,7 @@ func buildFindBody(p findBodyParams) []byte {
 			Locals: prefixScanLocals{
 				Ptr:           0,
 				Len:           lenForScan,
-				AttemptStart:  4,
+				AttemptStart:  findBodyAttemptStartLocal,
 				SimdMask:      simdMaskLocal,
 				Chunk:         chunkLocal,
 				TLo:           tLoLocal,
@@ -8933,11 +9021,19 @@ func buildFindBody(p findBodyParams) []byte {
 	// emitMLOuterSetup emits: [init scan_start if MinOff>0]; loop $lit_outer; emitPrefixScan(lit);
 	// OnMatch: set lit_pos, adjust attempt_start; loop $outer; range check; DFA prologue.
 	emitMLOuterSetup := func(b []byte) []byte {
+		// scan_start = attempt_start + minOff.
+		//
+		// This cursor is an ABSOLUTE position into the whole buffer, so it has
+		// to begin at the find-from position rather than at 0. minOff is the
+		// earliest the literal can sit relative to a match start. When from is
+		// 0 this computes exactly the old value.
+		b = append(b, 0x20, findBodyAttemptStartLocal)
 		if mandatoryLit.minOff > 0 {
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, mandatoryLit.minOff)
-			b = append(b, 0x21, scanStartLocal)
+			b = append(b, 0x6A) // i32.add
 		}
+		b = append(b, 0x21, scanStartLocal)
 		b = append(b, 0x03, 0x40) // loop $lit_outer
 		b = emitPrefixScan(b, prefixScanParams{
 			Prefix:      mandatoryLit.bytes,
@@ -9014,6 +9110,7 @@ func buildFindBody(p findBodyParams) []byte {
 			simdMaskLocal = 10
 			chunkScanLocal = 11
 			b = append(b, 0x02, 0x09, 0x7F, 0x01, 0x7B)
+			b = seedFindFrom(b) // inline locals bypass appendLocalGroups
 		} else {
 			// 6 i32 + N v128 (N sized to what's actually used — see
 			// numV128ForScan)
@@ -9082,7 +9179,7 @@ func buildFindBody(p findBodyParams) []byte {
 		b = append(b, 0x0B)       // end loop $scan
 		b = append(b, 0x0B)       // end block $found
 		b = emitReturn(b)
-		return b
+		return b, findFrom
 	}
 
 	if useU8 {
@@ -9098,6 +9195,7 @@ func buildFindBody(p findBodyParams) []byte {
 			simdMaskLocal = 9
 			chunkScanLocal = 10
 			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
+			b = seedFindFrom(b) // inline locals bypass appendLocalGroups
 		} else {
 			// 5 i32 + N v128 (N sized to what's actually used — see
 			// numV128ForScan)
@@ -9159,7 +9257,7 @@ func buildFindBody(p findBodyParams) []byte {
 		b = append(b, 0x0B)       // end loop $scan
 		b = append(b, 0x0B)       // end block $found
 		b = emitReturn(b)
-		return b
+		return b, findFrom
 	}
 
 	// ── u16 find path ─────────────────────────────────────────────────────────
@@ -9170,6 +9268,7 @@ func buildFindBody(p findBodyParams) []byte {
 		simdMaskScanLocal = 9
 		chunkScanLocal = 10
 		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
+		b = seedFindFrom(b) // inline locals bypass appendLocalGroups
 	} else {
 		// 6 i32 + N v128 (N sized to what's actually used — see
 		// numV128ForScan)
@@ -9258,7 +9357,7 @@ func buildFindBody(p findBodyParams) []byte {
 	b = append(b, 0x0B)       // end loop $scan
 	b = append(b, 0x0B)       // end block $found
 	b = emitReturn(b)
-	return b
+	return b, findFrom
 }
 
 // ============================================================================
@@ -10845,8 +10944,9 @@ func emitPrefixClassVerify(b []byte, m int,
 // literal's position. The full match starts at (attempt_start - M). Verify
 // pulls the M prefix bytes (single SIMD chunk) AND the N suffix bytes
 // (existing multi-chunk verify), ORs the bad-masks, advances on mismatch.
-func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
+func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
+	findFrom := ffLegacyNarrow
 
 	const (
 		locPtr          byte = 0
@@ -10863,6 +10963,11 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) []byte
 	b = append(b, 0x02)
 	b = append(b, 0x02, 0x7F)
 	b = append(b, 0x04, 0x7B)
+	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	// The body already handles a nonzero scan start: emitStartAnchorCheck
+	// fails a begin-text anchor when attempt_start != 0 and reads
+	// input[attempt_start-1] for a word boundary. It was never told where
+	// to start.
 
 	// Hoist all three v128 tables.
 	b = emitV128Const(b, lcp.tlo)
@@ -10956,15 +11061,15 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) []byte
 
 	b = append(b, 0x42, 0x7F) // i64.const -1
 	b = append(b, 0x0B)
-	return b
+	return b, findFrom
 }
 
 // appendLitChainPrefixedFindCodeEntry appends a size-prefixed mixed-prefix
 // find body (Gap E single-pattern, find mode).
-func appendLitChainPrefixedFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) []byte {
-	body := buildLitChainPrefixedFindBody(lcp, tableMemIdx)
+func appendLitChainPrefixedFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
+	body, mode := buildLitChainPrefixedFindBody(lcp, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+	return append(cs, body...), mode
 }
 
 // buildLitChainPrefixedMatchBody emits the anchored full-input match body
@@ -12108,8 +12213,9 @@ func appendLenAltMatchCodeEntry(cs []byte, altp *lenAltPattern, l lenAltLayout, 
 //	  end loop
 //	end block $no_match
 //	return -1
-func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
+func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
+	findFrom := ffLegacyNarrow
 
 	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
 
@@ -12130,6 +12236,11 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F) // 3 × i32
 	b = append(b, 0x03, 0x7B) // 3 × v128
+	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	// The body already handles a nonzero scan start correctly:
+	// emitStartAnchorCheck fails a \A anchor when attempt_start != 0 and
+	// reads input[attempt_start-1] for \b / \B. It was simply never told
+	// where to start.
 
 	k := int32(len(lcp.literal))
 	total := k + int32(lcp.count)
@@ -12221,7 +12332,7 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 	// No match.
 	b = append(b, 0x42, 0x7F) // i64.const -1
 	b = append(b, 0x0B)       // end function
-	return b
+	return b, findFrom
 }
 
 // buildLitChainFindGroupsBody emits the WASM body for non-anchored
@@ -12674,8 +12785,9 @@ func emitRangeClassVerify(b []byte, lcp *litChainPattern,
 //	  match_len = min(match_len, len - attempt_start - K)   // runtime cap
 //	  if match_len < N: advance attempt_start; restart
 //	  return packed (attempt_start, attempt_start + K + match_len)
-func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
+func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
+	findFrom := ffLegacyNarrow
 
 	const (
 		locPtr          byte = 0
@@ -12692,6 +12804,11 @@ func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F)
 	b = append(b, 0x03, 0x7B)
+	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	// The body already handles a nonzero scan start: emitStartAnchorCheck
+	// fails a begin-text anchor when attempt_start != 0 and reads
+	// input[attempt_start-1] for a word boundary. It was never told where
+	// to start.
 
 	k := int32(len(lcp.literal))
 	countMin := int32(lcp.count)
@@ -12783,14 +12900,14 @@ func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) []byte {
 
 	b = append(b, 0x42, 0x7F) // i64.const -1
 	b = append(b, 0x0B)
-	return b
+	return b, findFrom
 }
 
 // appendLitChainRangeFindCodeEntry appends a size-prefixed range find body.
-func appendLitChainRangeFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) []byte {
-	body := buildLitChainRangeFindBody(lcp, tableMemIdx)
+func appendLitChainRangeFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
+	body, mode := buildLitChainRangeFindBody(lcp, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+	return append(cs, body...), mode
 }
 
 // buildLitChainRangeMatchBody emits the anchored full-input match body for a
@@ -12960,10 +13077,10 @@ func appendLitChainRangeMatchCodeEntry(cs []byte, lcp *litChainPattern) []byte {
 }
 
 // appendLitChainFindCodeEntry appends a size-prefixed lit-chain find body.
-func appendLitChainFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) []byte {
-	body := buildLitChainFindBody(lcp, tableMemIdx)
+func appendLitChainFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
+	body, mode := buildLitChainFindBody(lcp, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+	return append(cs, body...), mode
 }
 
 // ============================================================================
@@ -13110,7 +13227,7 @@ func buildLitChainAltDataSegments(altp *litChainAltPattern, l litChainAltLayout)
 //	7  teddyHi        (v128) — scan
 //	8  verifyTlo      (v128) — SIMD verify (loaded per branch)
 //	9  verifyPow2     (v128) — SIMD verify (loaded once)
-func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
+func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
 		locPtr          byte = 0
 		locLen          byte = 1
@@ -13129,11 +13246,17 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 	)
 
 	var b []byte
+	findFrom := ffLegacyNarrow
 
 	// Local declarations: 3 i32 + 7 v128 (T0/T1 Teddy + chunk + chunk1/verifyTlo + verifyPow2).
 	b = append(b, 0x02)       // 2 local groups
 	b = append(b, 0x03, 0x7F) // 3 × i32
 	b = append(b, 0x07, 0x7B) // 7 × v128
+	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	// The body already handles a nonzero scan start: emitStartAnchorCheck
+	// fails a begin-text anchor when attempt_start != 0 and reads
+	// input[attempt_start-1] for a word boundary. It was never told where
+	// to start.
 
 	// Hoist pow2 outside the scan loop (Cranelift JIT workaround). Per-branch
 	// tlo stays inline.
@@ -13208,7 +13331,7 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 	// No match.
 	b = append(b, 0x42, 0x7F)
 	b = append(b, 0x0B) // end function
-	return b
+	return b, findFrom
 }
 
 // buildLitChainAltFindGroupsBody emits the WASM body for non-anchored
@@ -13327,7 +13450,7 @@ func appendLitChainAltFindGroupsCodeEntry(cs []byte, altp *litChainAltPattern,
 // buildLitChainAltPrefixedFindBody emits the find body for a strict
 // alternation where every branch is mixed-prefix shape (Gap E). Signature:
 // (ptr,len) → i64. Per-branch dispatch uses emitLitChainAltLitBranchBodyPrefixed.
-func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
+func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
 		locPtr          byte = 0
 		locLen          byte = 1
@@ -13345,9 +13468,15 @@ func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLay
 	)
 
 	var b []byte
+	findFrom := ffLegacyNarrow
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F)
 	b = append(b, 0x07, 0x7B)
+	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	// The body already handles a nonzero scan start: emitStartAnchorCheck
+	// fails a begin-text anchor when attempt_start != 0 and reads
+	// input[attempt_start-1] for a word boundary. It was never told where
+	// to start.
 
 	b = emitV128Const(b, pow2VecConst)
 	b = append(b, 0x21, locVerifyPow2)
@@ -13415,21 +13544,21 @@ func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLay
 
 	b = append(b, 0x42, 0x7F)
 	b = append(b, 0x0B)
-	return b
+	return b, findFrom
 }
 
 // appendLitChainAltPrefixedFindCodeEntry appends a size-prefixed body.
-func appendLitChainAltPrefixedFindCodeEntry(cs []byte, altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
-	body := buildLitChainAltPrefixedFindBody(altp, l, tableMemIdx)
+func appendLitChainAltPrefixedFindCodeEntry(cs []byte, altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
+	body, mode := buildLitChainAltPrefixedFindBody(altp, l, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+	return append(cs, body...), mode
 }
 
 // buildLitChainAltRangeFindBody emits the find body for a strict alternation
 // where at least one branch is a range `{N,M}`. Per-branch dispatch uses the
 // branch-free range verify when the branch is range, the {N,N} verify
 // otherwise. Signature: (ptr,len) → i64.
-func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
+func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
 		locPtr          byte = 0
 		locLen          byte = 1
@@ -13449,9 +13578,15 @@ func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout
 	)
 
 	var b []byte
+	findFrom := ffLegacyNarrow
 	b = append(b, 0x02)
 	b = append(b, 0x05, 0x7F)
 	b = append(b, 0x07, 0x7B)
+	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	// The body already handles a nonzero scan start: emitStartAnchorCheck
+	// fails a begin-text anchor when attempt_start != 0 and reads
+	// input[attempt_start-1] for a word boundary. It was never told where
+	// to start.
 
 	b = emitV128Const(b, pow2VecConst)
 	b = append(b, 0x21, locVerifyPow2)
@@ -13528,14 +13663,14 @@ func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout
 
 	b = append(b, 0x42, 0x7F)
 	b = append(b, 0x0B)
-	return b
+	return b, findFrom
 }
 
 // appendLitChainAltRangeFindCodeEntry appends a size-prefixed alt-range find body.
-func appendLitChainAltRangeFindCodeEntry(cs []byte, altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) []byte {
-	body := buildLitChainAltRangeFindBody(altp, l, tableMemIdx)
+func appendLitChainAltRangeFindCodeEntry(cs []byte, altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
+	body, mode := buildLitChainAltRangeFindBody(altp, l, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+	return append(cs, body...), mode
 }
 
 // ============================================================================
@@ -13922,7 +14057,7 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 // dominated: measured at ~45 fuel/candidate, accounting for most of the
 // task-24 promotion regression on `secrets-combined` even after fixing the
 // separate per-branch DFA-verify cost (see that fix a few lines below).
-func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) []byte {
+func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
 		locPtr          byte = 0
 		locLen          byte = 1
@@ -13949,6 +14084,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	)
 
 	var b []byte
+	findFrom := ffLegacyNarrow
 	// Local declarations: 7 i32 + 5 v128 + 2 i32 (locWindowBase, locScalarByte
 	// — added on top to avoid renumbering the existing i32/v128 groups above).
 	b = append(b, 0x03)       // 3 local groups
@@ -13958,6 +14094,11 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	// nibble tables as v128.const, so no pre-loaded per-call Teddy table is
 	// needed. Left declared to avoid renumbering locVerifyTlo/locVerifyPow2.)
 	b = append(b, 0x02, 0x7F) // 2 × i32 (locWindowBase, locScalarByte)
+	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	// The body already handles a nonzero scan start: emitStartAnchorCheck
+	// fails a begin-text anchor when attempt_start != 0 and reads
+	// input[attempt_start-1] for a word boundary. It was never told where
+	// to start.
 
 	// Hoist the power-of-two lookup vector once, shared by every lit-chain
 	// branch's class verify (emitLitChainAltLitBranchBody requires the
@@ -14247,5 +14388,5 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 
 	b = append(b, 0x42, 0x7F)
 	b = append(b, 0x0B)
-	return b
+	return b, findFrom
 }

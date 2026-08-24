@@ -1388,9 +1388,13 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 
 	before, _ := store.GetFuel()
 	var callErr error
-	if tc.mode == modeGroups {
-		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase)
-	} else {
+	switch tc.mode {
+	case modeGroups:
+		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase, int32(0))
+	case modeFind:
+		// find is (ptr, len, from); a one-shot find starts at 0.
+		_, callErr = fn.Call(store, inputBase, inputLen, int32(0))
+	default:
 		_, callErr = fn.Call(store, inputBase, inputLen)
 	}
 	if callErr != nil {
@@ -1409,13 +1413,13 @@ const findExhaustIterTime = 200
 
 // runFindExhaust drives a single-pattern find() export to exhaustion over
 // inputLen bytes at inputBase, mirroring the host stubs' iteration loop
-// (generate/js_stub.go genJSFindFunc): re-call with a shrinking window
-// (inputBase+off, inputLen-off), advance off past each match (or by 1 for
-// a zero-length match) until no match or EOF.
+// (generate/js_stub.go genJSFindFunc): re-call with the whole buffer and a
+// rising start position, advancing past each match (or by 1 for a zero-length
+// match) until no match or EOF.
 func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 	off := int32(0)
 	for off <= inputLen {
-		r, err := fn.Call(store, inputBase+off, inputLen-off)
+		r, err := fn.Call(store, inputBase, inputLen, off)
 		if err != nil {
 			return
 		}
@@ -1444,7 +1448,7 @@ func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, slotsPtr, inputLen int32) {
 	off := int32(0)
 	for off <= inputLen {
-		r, err := fn.Call(store, inputBase+off, inputLen-off, slotsPtr)
+		r, err := fn.Call(store, inputBase, inputLen, slotsPtr, off)
 		if err != nil {
 			return
 		}
@@ -1452,12 +1456,15 @@ func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Me
 			return
 		}
 		buf := mem.UnsafeData(store)
-		matchEnd := int32(buf[slotsPtr+4]) | int32(buf[slotsPtr+5])<<8 | int32(buf[slotsPtr+6])<<16 | int32(buf[slotsPtr+7])<<24
+		// Slots are ABSOLUTE now: the whole buffer is passed and `off` only
+		// bounds where the search starts.
+		absStart := int32(buf[slotsPtr]) | int32(buf[slotsPtr+1])<<8 | int32(buf[slotsPtr+2])<<16 | int32(buf[slotsPtr+3])<<24
+		absEnd := int32(buf[slotsPtr+4]) | int32(buf[slotsPtr+5])<<8 | int32(buf[slotsPtr+6])<<16 | int32(buf[slotsPtr+7])<<24
 		runtime.KeepAlive(store)
-		if matchEnd > 0 {
-			off += matchEnd
+		if absEnd > absStart {
+			off = absEnd
 		} else {
-			off++
+			off = absStart + 1
 		}
 	}
 }
@@ -1758,7 +1765,7 @@ func checkFind(engine *wasmtime.Engine, wasmBytes []byte, input string, re *rege
 	}
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
-	r, err := fn.Call(store, inputBase, int32(len(input)))
+	r, err := fn.Call(store, inputBase, int32(len(input)), int32(0))
 	if err != nil {
 		return fmt.Errorf("call: %w", err)
 	}
@@ -1773,16 +1780,26 @@ func checkFind(engine *wasmtime.Engine, wasmBytes []byte, input string, re *rege
 // expectedFindAll mirrors runFindExhaust's exact advance rule (advance past
 // a non-empty match's end, or past a zero-length match's start+1) so a
 // mismatch here reflects a real product bug, not a harness assumption gap.
+//
+// It also applies Go's FindAllIndex suppression rule — an EMPTY match
+// beginning exactly where the previous reported match ended is not reported —
+// because the emitters do (TODO task 54 half B). This harness re-implements
+// the iteration rather than driving a stub, so the rule has to be here too, or
+// it disagrees with the product and blames the engine.
 func expectedFindAll(re *regexp.Regexp, input string) [][2]int {
 	var all [][2]int
 	off := 0
+	prevEnd := -1
 	for off <= len(input) {
 		m := re.FindStringIndex(input[off:])
 		if m == nil {
 			break
 		}
 		s, e := m[0]+off, m[1]+off
-		all = append(all, [2]int{s, e})
+		if !(s == e && s == prevEnd) {
+			all = append(all, [2]int{s, e})
+			prevEnd = e
+		}
 		if e > s {
 			off = e
 		} else {
@@ -1808,7 +1825,8 @@ func checkFindExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, r
 	var got [][2]int
 	off := int32(0)
 	for off <= inputLen {
-		r, err := fn.Call(store, inputBase+off, inputLen-off)
+		// Whole buffer plus a start position; positions come back absolute.
+		r, err := fn.Call(store, inputBase, inputLen, off)
 		if err != nil {
 			return fmt.Errorf("call at off=%d: %w", off, err)
 		}
@@ -1816,9 +1834,10 @@ func checkFindExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, r
 		if packed < 0 {
 			break
 		}
-		relStart := int32(packed >> 32)
-		relEnd := int32(packed & 0xFFFFFFFF)
-		got = append(got, [2]int{int(off + relStart), int(off + relEnd)})
+		absStart := int32(packed >> 32)
+		absEnd := int32(packed & 0xFFFFFFFF)
+		relStart, relEnd := absStart-off, absEnd-off
+		got = append(got, [2]int{int(absStart), int(absEnd)})
 		if relEnd > relStart {
 			off += relEnd
 		} else {
@@ -1858,7 +1877,7 @@ func checkGroups(engine *wasmtime.Engine, wasmBytes []byte, input string, re *re
 	for i := 0; i < totalGroups*2*4; i++ {
 		buf[int(slotsBase)+i] = 0xFF // pre-init to -1, matching re2test's callGroups
 	}
-	r, err := fn.Call(store, inputBase, int32(len(input)), slotsBase)
+	r, err := fn.Call(store, inputBase, int32(len(input)), slotsBase, int32(0))
 	if err != nil {
 		return fmt.Errorf("call: %w", err)
 	}

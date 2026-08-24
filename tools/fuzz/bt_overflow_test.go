@@ -127,7 +127,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			name:    "groups",
 			entry:   config.RegexEntry{Pattern: btCapturePattern, GroupsFunc: "groups"},
 			export:  "groups",
-			extra:   []int32{pathsOutBase},
+			extra:   []int32{pathsOutBase, 0}, // out_ptr, from
 			ok:      capIn(8191),
 			wantOK:  8192, // match end position
 			blown:   capIn(8192),
@@ -156,6 +156,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			entry:  config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find"},
 			opts:   []compile.CompileOptions{squeezed},
 			export: "find",
+			extra:  []int32{0}, // `from` — find is (ptr, len, from)
 			ok:     noCapIn(4000),
 			wantOK: 8006, // packed 0<<32|8006
 			blown:  noCapIn(8192),
@@ -219,10 +220,10 @@ func TestBTStackOverflowThreshold(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 	const wantLast = 8191 // numAlts(2) * 4096 == 8192 frames, one per input byte
-	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast)+"c", pathsOutBase); got < 0 {
+	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast)+"c", pathsOutBase, 0); got < 0 {
 		t.Errorf("%d-byte input already overflows (= %d); ceiling moved down", wantLast+1, got)
 	}
-	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast+1)+"c", pathsOutBase); got != abi.BTStackOverflow {
+	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast+1)+"c", pathsOutBase, 0); got != abi.BTStackOverflow {
 		t.Errorf("%d-byte input = %d, want BTStackOverflow; ceiling moved up", wantLast+2, got)
 	}
 }

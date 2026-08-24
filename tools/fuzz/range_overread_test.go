@@ -66,7 +66,11 @@ func TestRangeVerifyNoOverreadAtMemoryEnd(t *testing.T) {
 			data := mem.UnsafeData(store)
 			ptr := len(data) - len(c.input)
 			copy(data[ptr:], c.input)
-			if _, err := fn.Call(store, int32(ptr), int32(len(c.input))); err != nil {
+			args := []any{int32(ptr), int32(len(c.input))}
+			if export == "find" {
+				args = append(args, int32(0)) // find takes `from`
+			}
+			if _, err := fn.Call(store, args...); err != nil {
 				t.Errorf("pattern=%q %s at ptr=%d (memory size %d): %v",
 					c.pattern, export, ptr, len(data), err)
 			}

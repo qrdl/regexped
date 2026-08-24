@@ -131,7 +131,6 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		fmt.Fprintf(&hb, "/* Number of patterns in set %q. Sizes the match buffer: the scanner can\n   receive at most this many matches at one position. */\n#define %s %d\n\n", s.Name, konst, n)
 		fmt.Fprintf(&hb, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id \u2014 the gate\n   array, the _all bitmap, and the out_ids array you pass to the _all calls \u2014\n   is sized from this. */\n#define %s %d\n\n", s.Name, idKonst, idN)
 
-
 		imp := func(name, sig string) {
 			fmt.Fprintf(&hb, "__attribute__((import_module(%q), import_name(%q)))\n%s\n", cfg.ImportModule, name, sig)
 		}
@@ -389,7 +388,11 @@ func genCFindHPart(funcName string) string {
 			"   {RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW} if the result is unknown.\n"+
 			"   To iterate non-overlapping matches, advance past each match; a pattern\n"+
 			"   that can match empty needs the guard, or offset never moves:\n"+
-			"     off = m.end > m.start ? m.end : m.start + 1; */\n"+
+			"     off = m.end > m.start ? m.end : m.start + 1;\n"+
+			"   To match Go's FindAllIndex exactly, also SKIP an empty match that\n"+
+			"   begins where the previous reported match ended:\n"+
+			"     if (m.start == m.end && m.start == prev_end) continue;\n"+
+			"     prev_end = m.end; */\n"+
 			"rx_match_t %s(const char *input, size_t len, size_t offset);\n\n",
 		funcName, funcName)
 }
@@ -399,15 +402,16 @@ func genCFindCPart(importModule, funcName string) string {
 	ffi := "_ffi_" + funcName
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "__attribute__((import_module(\"%s\"), import_name(\"%s\")))\n", importModule, funcName)
-	fmt.Fprintf(&sb, "extern long long %s(const unsigned char *ptr, unsigned int len);\n\n", ffi)
+	fmt.Fprintf(&sb, "extern long long %s(const unsigned char *ptr, unsigned int len, unsigned int from);\n\n", ffi)
 	fmt.Fprintf(&sb, "rx_match_t %s(const char *input, size_t len, size_t offset) {\n", funcName)
 	sb.WriteString("    if (offset > len) return (rx_match_t){-1, -1};\n")
-	fmt.Fprintf(&sb, "    long long r = %s((const unsigned char *)input + offset, (unsigned int)(len - offset));\n", ffi)
+	fmt.Fprintf(&sb, "    long long r = %s((const unsigned char *)input, (unsigned int)len, (unsigned int)offset);\n", ffi)
 	sb.WriteString("    if (r == RX_ERR_BT_OVERFLOW) return (rx_match_t){RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW};\n")
 	sb.WriteString("    if (r < 0) return (rx_match_t){-1, -1};\n")
-	sb.WriteString("    unsigned int rel_s = (unsigned int)((unsigned long long)r >> 32);\n")
-	sb.WriteString("    unsigned int rel_e = (unsigned int)(r & 0xFFFFFFFFU);\n")
-	sb.WriteString("    return (rx_match_t){(ptrdiff_t)(offset + rel_s), (ptrdiff_t)(offset + rel_e)};\n")
+	// Whole buffer plus a start position, so these are already absolute.
+	sb.WriteString("    unsigned int abs_s = (unsigned int)((unsigned long long)r >> 32);\n")
+	sb.WriteString("    unsigned int abs_e = (unsigned int)(r & 0xFFFFFFFFU);\n")
+	sb.WriteString("    return (rx_match_t){(ptrdiff_t)abs_s, (ptrdiff_t)abs_e};\n")
 	sb.WriteString("}\n\n")
 	return sb.String()
 }
@@ -478,7 +482,12 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 			"   To iterate non-overlapping matches, advance past each match; a pattern\n"+
 			"   that can match empty needs the guard, or offset never moves:\n"+
 			"     off = groups[0].end > groups[0].start ? groups[0].end\n"+
-			"                                          : groups[0].start + 1; */\n"+
+			"                                          : groups[0].start + 1;\n"+
+			"   To match Go's FindAllSubmatchIndex exactly, also SKIP an empty match\n"+
+			"   that begins where the previous reported match ended:\n"+
+			"     if (groups[0].start == groups[0].end &&\n"+
+			"         groups[0].start == prev_end) continue;\n"+
+			"     prev_end = groups[0].end; */\n"+
 			"const rx_group_t *%s(const char *input, size_t len, size_t offset, rx_group_t *out);\n\n",
 		funcName, funcUpper, funcUpper, funcName)
 
@@ -509,7 +518,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 
 	// .c: FFI declaration
 	fmt.Fprintf(&cb, "__attribute__((import_module(\"%s\"), import_name(\"%s\")))\n", importModule, exportName)
-	fmt.Fprintf(&cb, "extern int %s(const unsigned char *ptr, unsigned int len, int *out);\n\n", ffi)
+	fmt.Fprintf(&cb, "extern int %s(const unsigned char *ptr, unsigned int len, int *out, unsigned int from);\n\n", ffi)
 
 	// .c: wrapper function
 	// Decision (8): the caller supplies the array. The `static rx_group_t`
@@ -527,14 +536,15 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	cb.WriteString("    size_t pos = offset;\n")
 	cb.WriteString("    while (pos <= len) {\n")
 	fmt.Fprintf(&cb, "        for (int i = 0; i < %d; i++) slots[i] = -1;\n", slotCount)
-	fmt.Fprintf(&cb, "        int r = %s((const unsigned char *)input + pos, (unsigned int)(len - pos), slots);\n", ffi)
+	// Whole buffer plus a start position; slots come back absolute.
+	fmt.Fprintf(&cb, "        int r = %s((const unsigned char *)input, (unsigned int)len, slots, (unsigned int)pos);\n", ffi)
 	cb.WriteString("        if (r == RX_ERR_BT_OVERFLOW) return (const rx_group_t *)0;\n")
 	cb.WriteString("        if (r >= 0) {\n")
 	fmt.Fprintf(&cb, "            for (int i = 0; i < %d; i++) {\n", numGroups)
 	fmt.Fprintf(&cb, "                out[i].name = %s[i];\n", namesVar)
 	cb.WriteString("                if (slots[i*2] >= 0) {\n")
-	cb.WriteString("                    out[i].start = (ptrdiff_t)(pos + (size_t)slots[i*2]);\n")
-	cb.WriteString("                    out[i].end   = (ptrdiff_t)(pos + (size_t)slots[i*2+1]);\n")
+	cb.WriteString("                    out[i].start = (ptrdiff_t)slots[i*2];\n")
+	cb.WriteString("                    out[i].end   = (ptrdiff_t)slots[i*2+1];\n")
 	cb.WriteString("                } else {\n")
 	cb.WriteString("                    out[i].start = -1;\n")
 	cb.WriteString("                    out[i].end   = -1;\n")

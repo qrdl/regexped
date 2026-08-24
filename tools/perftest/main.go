@@ -1542,9 +1542,13 @@ func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (u
 
 	before, _ := store.GetFuel()
 	var callErr error
-	if tc.mode == anchoredGroups {
-		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase)
-	} else {
+	switch tc.mode {
+	case anchoredGroups:
+		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase, int32(0))
+	case find:
+		// find is (ptr, len, from); a one-shot find starts at 0.
+		_, callErr = fn.Call(store, inputBase, inputLen, int32(0))
+	default:
 		_, callErr = fn.Call(store, inputBase, inputLen)
 	}
 	after, _ := store.GetFuel()

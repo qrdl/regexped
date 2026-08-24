@@ -47,7 +47,7 @@ pub fn <find_func>(input: &[u8], offset: usize) -> <FindFuncPascalCase>Iter<'_>
 
 The iterator type name is derived from the function name (PascalCase + `Iter`), not a fixed `FindIter` — e.g. `find_func: "find_github_token"` generates `FindGithubTokenIter`. This keeps multiple `find_func` entries in the same file from colliding on the type name.
 
-Returns an iterator that yields all non-overlapping matches as absolute `(start, end)` byte pairs. After a zero-length match the iterator advances by one byte to avoid infinite loops.
+Returns an iterator that yields all non-overlapping matches as absolute `(start, end)` byte pairs. After a zero-length match the iterator advances by one byte to avoid infinite loops, and — following Go's `FindAllIndex` — an empty match beginning exactly where the previous reported match ended is not reported.
 
 ```rust
 // All matches:
@@ -132,10 +132,14 @@ The iterator type name is always derived from the config field's own function na
 
 All positions are byte offsets (not character indices). Input is `&[u8]`.
 
-**`offset` currently NARROWS the input** rather than bounding only the search,
-so at `offset > 0` a leading `\b`, `\B`, `^` or `(?m:^)` judges a truncated left
-context. The single-pattern WASM exports take no offset yet; when they do, the
-stubs stop narrowing and these signatures do not change.
+**`offset` bounds where the search starts, not what the engine can see.** The
+stub passes the whole input on every call and the WASM export takes the
+position as an argument, so a leading `\b`, `\B`, `^` or `(?m:^)` at
+`offset > 0` is judged against the real preceding byte.
+
+This holds for `find`, `groups` and `named_groups` alike, and for every engine
+— the conversion is complete, so there is no longer a shape whose left context
+is judged against a slice edge.
 
 ---
 

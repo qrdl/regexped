@@ -33,6 +33,11 @@ regexped/
 │   ├── engine_tdfa.go         # TDFA (Laurikari tagged DFA): subset construction, register ops, WASM emission
 │   ├── engine_backtrack.go    # Backtracking engine: hybrid DFA+NFA, br_table dispatch, explicit stack, WASM emission
 │   ├── mandatory_lit.go       # Mandatory literal extraction (FindMandatoryLit)
+│   ├── find_from.go           # The find-from channel: a module-level mutable i32 GLOBAL
+│   │                          #   carrying an exported find's `from` position to the body,
+│   │                          #   the (ptr,len,from) wrapper that fronts every find, and
+│   │                          #   findFromMode — whose zero value is invalid, so a find
+│   │                          #   emitter that never claimed one is a BUILD failure
 │   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
@@ -211,7 +216,10 @@ TDFA eligibility checked by `selectBestEngine`: `hasNonGreedyQuantifiers`, `hasL
 
 **WASM emission (`genWASM`):**
 - Embedded mode: imports `"main"` memory as `memory[0]` (input), declares own memory for DFA tables (`memory[1]` after merge); standalone mode: declares and exports own memory as `memory[0]`
-- Exports the configured `match_func` name `(ptr i32, len i32) → i32` or `find_func` name `(ptr i32, len i32) → i64`
+- Exports the configured `match_func` name `(ptr i32, len i32) → i32` or `find_func` name `(ptr i32, len i32, from i32) → i64`. The find export is a
+  thin WRAPPER (`compile/find_from.go`): the body keeps its `(ptr, len)` signature — hundreds of hardcoded local indices depend on it — and receives
+  `from` through a module-level mutable global. `ptr`/`len` always describe the WHOLE input, so `\b`, `\B` and `(?m:^)` at the search start are judged
+  against the real preceding byte instead of a slice edge (TODO task 54)
 - DFA execution loop in WASM structured control flow (`block`/`loop`/`br_table`)
 - Calls `EmitPrefixScan` for fast-skip prologue in find mode
 

@@ -129,7 +129,12 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 			lmNonMidShufti:       false,
 			lmWideShufti:         false,
 		})
-		bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx)
+		// floorFromGlobal is true now that the dispatcher seeds the channel: this
+		// scan walks LEFT from a branch literal, so without the floor it would
+		// report matches starting before the caller's position. It must stay in
+		// step with the dispatcher's mode — the two were briefly out of step and
+		// the floor was then reading a stale value.
+		bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true)
 
 		// Opt 1 (Task 7) — default-on for every mode, same as the
 		// single-pattern and whole-alternation find/match bodies.

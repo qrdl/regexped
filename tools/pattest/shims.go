@@ -244,8 +244,8 @@ func buildFindBenchShim() []byte {
 	// if i >= iters: break
 	b = append(b, 0x20, 0x03, 0x20, 0x02, 0x4E, 0x0D, 0x01)
 
-	// find(ptr, len); drop i64 result
-	b = append(b, 0x20, 0x00, 0x20, 0x01, 0x10, 0x01, 0x1A)
+	// find(ptr, len, 0); drop i64 result
+	b = append(b, 0x20, 0x00, 0x20, 0x01, 0x41, 0x00, 0x10, 0x01, 0x1A)
 
 	// t_cur = clock_time_get(); timings[i] = t_cur − t_prev
 	b = emitClockGet(b)
@@ -261,7 +261,7 @@ func buildFindBenchShim() []byte {
 	b = append(b, 0x0C, 0x00, 0x0B, 0x0B, 0x0B) // br 0, end loop, end block, end fn
 
 	return assembleShim(
-		shimTypeSection([]byte{0x7F, 0x7F}, []byte{0x7E}, []byte{0x7F, 0x7F, 0x7F}),
+		shimTypeSection([]byte{0x7F, 0x7F, 0x7F}, []byte{0x7E}, []byte{0x7F, 0x7F, 0x7F}),
 		shimImportSection("regexped", "find"),
 		shimFunctionSection(),
 		shimMemorySection(),

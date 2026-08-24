@@ -432,13 +432,43 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					continue
 				}
 				// col0 (anchored groups): only when --validate-groups is on.
+				//
+				// The oracle must be FULL-CONSUMPTION — \A(?:pat)\z — not a
+				// leftmost-first find that is then checked for having spanned
+				// the input. Those differ whenever an earlier alternative
+				// matches a prefix while a later one would consume everything:
+				// `a|ab` on "ab" finds `a`, spans 0-1, and the span check calls
+				// it "no match", when the anchored answer is a match at 0-2.
+				// That mistake reported 167 false disagreements here, and is
+				// the same trap plans/TODO.md task 54 records costing a
+				// 2026-08-19 sweep 96 false positives.
+				//
+				// Wrapping in (?: ) leaves capture-group numbering untouched,
+				// so the submatch slots line up with col0's slots as before.
 				if validateGroups && col0 != "-" {
-					goSub0 := re.FindStringSubmatchIndex(text)
-					expSlots0 := parseCaptures(col0, re.NumSubexp()+1)
-					goAnchored := len(goSub0) >= 2 && goSub0[0] == 0 && goSub0[1] == len(text)
-					if !goAnchored {
-						goSub0 = nil
+					// col0 is produced by TWO different exports, with two
+					// different contracts, and the oracle has to match whichever
+					// one this row exercises (see the col0 test sites below):
+					//
+					//   captures  → the groups export: anchored at 0, and NOT
+					//               full-consumption; it reports wherever the
+					//               match ends.
+					//   no captures → the match export: full-consumption.
+					//
+					// Using one oracle for both is what produced most of the
+					// noise here. `(.*?)([0-9]+)` on "x123y" is col0 = 0-4,
+					// which a \z oracle calls "no match"; `a|ab` on "ab" is
+					// col0 = 0-2, which an un-anchored-end oracle calls 0-1.
+					anchor := `\A(?:` + pattern + `)`
+					if re.NumSubexp() == 0 {
+						anchor += `\z`
 					}
+					reAnchored, anchErr := regexp.Compile(anchor)
+					if anchErr != nil {
+						continue
+					}
+					goSub0 := reAnchored.FindStringSubmatchIndex(text)
+					expSlots0 := parseCaptures(col0, re.NumSubexp()+1)
 					if !slotsEqualGo(goSub0, expSlots0) {
 						nDataErrors++
 						fmt.Printf("DATA  pattern: %q\n      input:   %q\n      col0 expected: %s\n      col0 go:       %s\n",
@@ -457,28 +487,26 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						pattern, text, fmtFindResult(exp1), fmtFindResult(goFind))
 				}
 				// col4 (all matches): validate if present.
-				// We simulate our own iteration loop (call FindStringIndex repeatedly with
-				// advancing offset) rather than using FindAllStringIndex. This matches the
-				// behavior of the WASM iteration loop: after a zero-length match at position p
-				// we advance to p+1 and DO include the empty match, whereas Go's
-				// FindAllStringIndex skips empty matches adjacent to the previous match.
+				//
+				// TODO task 54 step 1: this is a plain whole-input
+				// FindAllStringIndex — Go's own answer, and the project's
+				// stated oracle.
+				//
+				// It USED to re-implement the WASM iteration loop instead:
+				// FindStringIndex repeatedly over text[off:], advancing by one
+				// after an empty match. That oracle carried the two defects the
+				// expectations were supposed to catch, so WASM and oracle
+				// agreed by being wrong the same way (FABLE T7):
+				//
+				//   (A) the narrowed slice hides the byte before `off`, so \b,
+				//       \B, (?m:^) and (?m:$) are judged against the slice edge;
+				//   (B) Go SUPPRESSES an empty match beginning where the
+				//       previous match ended, and the hand-rolled loop did not.
+				//
+				// Every DATA line this now reports names a row whose
+				// expectation encodes (A) or (B).
 				if col4 != "" && col4 != "-" {
-					var goAll [][]int
-					off := 0
-					for off <= len(text) {
-						m := re.FindStringIndex(text[off:])
-						if m == nil {
-							break
-						}
-						s := m[0] + off
-						e := m[1] + off
-						goAll = append(goAll, []int{s, e})
-						if e > s {
-							off = e
-						} else {
-							off = s + 1
-						}
-					}
+					goAll := re.FindAllStringIndex(text, -1)
 					expAll := parseCol4(col4)
 					if !col4Equal(goAll, expAll) {
 						nDataErrors++
@@ -521,7 +549,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				if findFn == nil {
 					skipCount[skipNonAnchored]++
 				} else {
-					got, callErr := callFind(wd, store, findFn, findMemory, text)
+					got, callErr := callFind(wd, store, findFn, findMemory, text, 0)
 					if callErr != nil {
 						if isTimeout(callErr) {
 							if forceBacktrack {
@@ -664,8 +692,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					expAll := parseCol4(col4)
 					var gotAll [][2]int
 					offset := 0
+					prevEnd := -1
 					for offset <= len(text) {
-						r, callErr := callFind(wd, store, findFn, findMemory, text[offset:])
+						r, callErr := callFind(wd, store, findFn, findMemory, text, offset)
 						if callErr != nil {
 							if isTimeout(callErr) {
 								if forceBacktrack {
@@ -682,9 +711,19 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						if r == -1 {
 							break
 						}
-						s := int(r>>32) + offset
-						e := int(uint32(r)) + offset
-						gotAll = append(gotAll, [2]int{s, e})
+						s := int(r >> 32)
+						e := int(uint32(r))
+						// Go's FindAllIndex rule: suppress an EMPTY match
+						// beginning exactly where the previous reported match
+						// ended. This harness re-implements the stub iterator
+						// loop rather than driving a stub, so the rule has to
+						// live here too — moving the emitters alone would make
+						// this loop disagree with them and misattribute the
+						// difference to the engine.
+						if !(s == e && s == prevEnd) {
+							gotAll = append(gotAll, [2]int{s, e})
+							prevEnd = e
+						}
 						if e > s {
 							offset = e
 						} else {
@@ -785,9 +824,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					copy(buf[inputBase:], text)
 					var gotAll [][]int32
 					offset := int32(0)
+					prevEnd := int32(-1)
 					textLen := int32(len(text))
 					for offset <= textLen {
-						endPos, slots, callErr := callGroupsAt(wd, groupsStore, groupsFn, groupsMemory, inputBase+offset, textLen-offset, numGroups)
+						endPos, slots, callErr := callGroupsAt(wd, groupsStore, groupsFn, groupsMemory, inputBase, textLen, offset, numGroups)
 						if callErr != nil {
 							if isTimeout(callErr) {
 								if forceBacktrack {
@@ -803,19 +843,21 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						if endPos < 0 {
 							break
 						}
+						// Slots are absolute already.
 						shifted := make([]int32, len(slots))
-						for i, v := range slots {
-							if v < 0 {
-								shifted[i] = -1
-							} else {
-								shifted[i] = offset + v
-							}
+						copy(shifted, slots)
+						// Go's FindAllSubmatchIndex rule, as in the col4 loop
+						// above: suppress an EMPTY match beginning exactly
+						// where the previous reported match ended.
+						absStart, absEnd := shifted[0], shifted[1]
+						if !(absStart == absEnd && absStart == prevEnd) {
+							gotAll = append(gotAll, shifted)
+							prevEnd = absEnd
 						}
-						gotAll = append(gotAll, shifted)
-						if relEnd := slots[1]; relEnd > 0 {
-							offset += relEnd
+						if absEnd > absStart {
+							offset = absEnd
 						} else {
-							offset++
+							offset = absStart + 1
 						}
 					}
 					if !col6Equal(gotAll, expAll) {
@@ -1128,14 +1170,18 @@ func callMatch(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasm
 
 // callFind writes text into WASM linear memory and invokes the find function.
 // Returns packed (start<<32)|end as int64, or -1 on no match.
-func callFind(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string) (int64, error) {
+//
+// from is where the SEARCH starts; the whole of text is always visible to the
+// engine, so a leading \b, \B or (?m:^) at from > 0 is judged against the
+// real preceding byte. Positions come back absolute.
+func callFind(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string, from int) (int64, error) {
 	wd.Arm(store)
 	defer wd.Disarm()
 	if len(text) > 0 {
 		buf := mem.UnsafeData(store)
 		copy(buf[inputBase:], text)
 	}
-	result, err := fn.Call(store, inputBase, int32(len(text)))
+	result, err := fn.Call(store, inputBase, int32(len(text)), int32(from))
 	if err != nil {
 		return 0, err
 	}
@@ -1162,7 +1208,7 @@ func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *was
 	}
 	wd.Arm(store)
 	defer wd.Disarm()
-	result, err := fn.Call(store, inputBase, int32(len(text)), slotsBase)
+	result, err := fn.Call(store, inputBase, int32(len(text)), slotsBase, int32(0))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1190,7 +1236,10 @@ func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *was
 // (a wrapper-composition bug that corrupts memory at address 0 as a side
 // effect of one call, only visible on the NEXT call into the same,
 // un-rewritten buffer).
-func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, ptr, length int32, numGroups int) (int32, []int32, error) {
+// from bounds where the SEARCH starts; ptr/length always describe the whole
+// input, so a leading \b, \B or (?m:^) is judged against the real preceding
+// byte. Returned slots are absolute.
+func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, ptr, length, from int32, numGroups int) (int32, []int32, error) {
 	buf := mem.UnsafeData(store)
 	for i := 0; i < numGroups*2; i++ {
 		off := slotsBase + int32(i*4)
@@ -1201,7 +1250,7 @@ func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *w
 	}
 	wd.Arm(store)
 	defer wd.Disarm()
-	result, err := fn.Call(store, ptr, length, slotsBase)
+	result, err := fn.Call(store, ptr, length, slotsBase, from)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1486,28 +1535,25 @@ func fmtCol6(all [][]int32) string {
 // match's own relative end, or off++ if that's zero) rather than Go's
 // FindAllStringSubmatchIndex, which skips empty matches adjacent to the
 // previous one. Matches tools/likelytest's expectedGroupsAll.
+// expectedGroupsAllGo is col6's oracle: Go's own FindAllStringSubmatchIndex
+// over the WHOLE input.
+//
+// TODO task 54 step 1. It used to re-implement the stub iterators' loop over
+// text[off:], which made it carry the same two defects as the code it was
+// meant to check — see the col4 oracle above for what (A) and (B) are.
 func expectedGroupsAllGo(re *regexp.Regexp, text string) [][]int32 {
-	var all [][]int32
-	off := 0
-	for off <= len(text) {
-		sub := re.FindStringSubmatchIndex(text[off:])
-		if sub == nil {
-			break
-		}
-		shifted := make([]int32, len(sub))
+	subs := re.FindAllStringSubmatchIndex(text, -1)
+	all := make([][]int32, 0, len(subs))
+	for _, sub := range subs {
+		row := make([]int32, len(sub))
 		for i, v := range sub {
 			if v < 0 {
-				shifted[i] = -1
+				row[i] = -1
 			} else {
-				shifted[i] = int32(v + off)
+				row[i] = int32(v)
 			}
 		}
-		all = append(all, shifted)
-		if relEnd := sub[1]; relEnd > 0 {
-			off += relEnd
-		} else {
-			off++
-		}
+		all = append(all, row)
 	}
 	return all
 }

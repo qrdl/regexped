@@ -232,7 +232,8 @@ func runWasmGroupsPath(wasmBytes []byte, input string, numGroups int) (slots []i
 
 	_, wd := sharedEngine()
 	wd.Arm(store)
-	res, callErr := fn.Call(store, pathsInputBase, int32(len(input)), pathsOutBase)
+	// groups is (ptr, len, out_ptr, from); a one-shot call starts at 0.
+	res, callErr := fn.Call(store, pathsInputBase, int32(len(input)), pathsOutBase, int32(0))
 	wd.Disarm()
 	if callErr != nil {
 		if isTimeout(callErr) {

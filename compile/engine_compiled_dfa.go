@@ -340,7 +340,7 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 // The SIMD prefix scan (emitPrefixScan) is already table/SIMD-only with no br_table
 // dispatch, so no restructuring is required for the find hot path.
 // Row deduplication is guaranteed disabled for the hybrid path.
-func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
+func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode) {
 	return buildFindBody(findBodyParams{
 		startState:            l.wasmStart,
 		midStartState:         l.wasmMidStart,

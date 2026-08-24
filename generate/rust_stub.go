@@ -69,7 +69,6 @@ impl SetMatch {
 		fmt.Fprintf(&out, "/// Number of patterns in set %q. Sizes the match buffer: `find` can\n/// report at most this many matches at one position.\npub const %s: usize = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "/// One past the largest pattern id set %q can report. Pattern ids are\n/// global indices into `regexps:`, so a set holding a few late-declared\n/// patterns has a small count and a large id space. Everything indexed BY an\n/// id — the gate array, the `_all` bitmask — is sized from this.\npub const %s: usize = %d;\n\n", s.Name, idKonst, idN)
 
-
 		fmt.Fprintf(&out, "#[link(wasm_import_module = %q)]\nunsafe extern \"C\" {\n", cfg.ImportModule)
 		decl := func(name, sig string) {
 			fmt.Fprintf(&out, "    #[link_name = %q]\n    fn ffi_%s%s;\n", name, name, sig)
@@ -391,12 +390,14 @@ func genRustFindIterStub(importModule, funcName string) string {
 	return fmt.Sprintf(`#[link(wasm_import_module = "%s")]
 unsafe extern "C" {
     #[link_name = "%s"]
-    fn %s(ptr: *const u8, len: usize) -> i64;
+    fn %s(ptr: *const u8, len: usize, from: usize) -> i64;
 }
 
 pub struct %s<'a> {
     input: &'a [u8],
     offset: usize,
+    /// End of the last REPORTED match, for Go's adjacent-empty rule.
+    prev_end: Option<usize>,
 }
 
 impl<'a> Iterator for %s<'a> {
@@ -406,16 +407,26 @@ impl<'a> Iterator for %s<'a> {
         if self.offset > self.input.len() {
             return None;
         }
-        let remaining = &self.input[self.offset..];
-        match unsafe { %s(remaining.as_ptr(), remaining.len()) } {
+        // The WHOLE input plus a start position: offset bounds where the
+        // search begins, it does not truncate what the engine can see behind
+        // it. Positions come back absolute.
+        match unsafe { %s(self.input.as_ptr(), self.input.len(), self.offset) } {
             %d => panic!("%s"),
             -1 => None,
             n  => {
-                let start = (n as u64 >> 32) as usize;
-                let end   = (n as u32) as usize;
-                let abs_start = self.offset + start;
-                let abs_end   = self.offset + end;
+                let abs_start = (n as u64 >> 32) as usize;
+                let abs_end   = (n as u32) as usize;
+                let (start, end) = (abs_start - self.offset, abs_end - self.offset);
                 self.offset += if end > start { end } else { start + 1 };
+                // Go's FindAllIndex rule: an EMPTY match beginning exactly
+                // where the previous match ended is suppressed. The advance
+                // above is unchanged — it still steps past a zero-length
+                // match, which is what stops the loop spinning; only whether
+                // the match is REPORTED changes.
+                if abs_start == abs_end && self.prev_end == Some(abs_start) {
+                    return self.next();
+                }
+                self.prev_end = Some(abs_end);
                 Some((abs_start, abs_end))
             }
         }
@@ -426,18 +437,16 @@ impl<'a> Iterator for %s<'a> {
 /// Each item is an absolute (start, end) byte range.
 /// Use .next() to get only the first match.
 ///
-/// LIMITATION: offset currently NARROWS the input rather than bounding only
-/// the search, so at offset > 0 a leading \b, \B, ^ or (?m:^) judges a
-/// truncated left context. The single-pattern WASM exports take no offset;
-/// TODO 54 gives them one, after which this stub stops narrowing and the
-/// signature is unchanged.
+/// The whole input is passed on every call and offset only bounds where the
+/// search STARTS, so a leading \b, \B, ^ or (?m:^) is judged against the
+/// real preceding byte rather than a slice edge.
 ///
 /// # Panics
 /// next() panics if the pattern compiled to the Backtracking engine and the
 /// input exhausted its frame budget: the engine cannot tell whether the input
 /// matches, so ending iteration would be a lie.
 pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
-    %s { input, offset }
+    %s { input, offset, prev_end: None }
 }
 
 `, importModule, funcName, ffiName, iterName, iterName, ffiName, btOverflow, btOverflowMsg(funcName), funcName, iterName, iterName)
@@ -467,6 +476,8 @@ unsafe extern "C" {
 	return ffiDecl + fmt.Sprintf(`pub struct %s<'a> {
     input: &'a [u8],
     offset: usize,
+    /// End of the last REPORTED match, for Go's adjacent-empty rule.
+    prev_end: Option<usize>,
 }
 
 impl<'a> Iterator for %s<'a> {
@@ -477,9 +488,8 @@ impl<'a> Iterator for %s<'a> {
             if self.offset > self.input.len() {
                 return None;
             }
-            let remaining = &self.input[self.offset..];
             let mut slots = [-1i32; %d];
-            let r = unsafe { %s(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) };
+            let r = unsafe { %s(self.input.as_ptr(), self.input.len(), slots.as_mut_ptr(), self.offset) };
             if r == %d {
                 panic!("%s");
             }
@@ -490,14 +500,15 @@ impl<'a> Iterator for %s<'a> {
                 self.offset += 1;
                 continue;
             }
-            let off = self.offset;
-            let match_end = if slots[1] >= 0 { slots[1] as usize } else { 0 };
-            self.offset += if match_end > 0 { match_end } else { 1 };
+            // Slots are ABSOLUTE: the whole input is passed on every call.
+            let abs_start = slots[0] as usize;
+            let abs_end = if slots[1] >= 0 { slots[1] as usize } else { abs_start };
+            self.offset = if abs_end > abs_start { abs_end } else { abs_start + 1 };
             let mut result = Vec::with_capacity(%d);
             for i in 0..%d {
                 let start = slots[i * 2];
                 let end   = slots[i * 2 + 1];
-                result.push(if start < 0 { None } else { Some((start as usize + off, end as usize + off)) });
+                result.push(if start < 0 { None } else { Some((start as usize, end as usize)) });
             }
             return Some(result);
         }
@@ -508,7 +519,7 @@ impl<'a> Iterator for %s<'a> {
 /// Group positions are absolute byte offsets. Index 0 is the full match.
 /// Use .next() to get only the first match.
 pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
-    %s { input, offset }
+    %s { input, offset, prev_end: None }
 }
 
 `, iterName, iterName, slotCount, ffiName, btOverflow, btOverflowMsg(funcName), numGroups, numGroups, funcName, iterName, iterName)
@@ -535,7 +546,7 @@ func genRustNamedGroupsIterStub(importModule, funcName, exportName string, decla
 	var inserts strings.Builder
 	for _, e := range entries {
 		fmt.Fprintf(&inserts,
-			"            if slots[%d] >= 0 { map.insert(\"%s\", (slots[%d] as usize + off, slots[%d] as usize + off)); }\n",
+			"            if slots[%d] >= 0 { map.insert(\"%s\", (slots[%d] as usize, slots[%d] as usize)); }\n",
 			e.index*2, e.name, e.index*2, e.index*2+1)
 	}
 
@@ -554,6 +565,8 @@ unsafe extern "C" {
 	return ffiDecl + fmt.Sprintf(`pub struct %s<'a> {
     input: &'a [u8],
     offset: usize,
+    /// End of the last REPORTED match, for Go's adjacent-empty rule.
+    prev_end: Option<usize>,
 }
 
 impl<'a> Iterator for %s<'a> {
@@ -564,9 +577,8 @@ impl<'a> Iterator for %s<'a> {
             if self.offset > self.input.len() {
                 return None;
             }
-            let remaining = &self.input[self.offset..];
             let mut slots = [-1i32; %d];
-            let r = unsafe { %s(remaining.as_ptr(), remaining.len(), slots.as_mut_ptr()) };
+            let r = unsafe { %s(self.input.as_ptr(), self.input.len(), slots.as_mut_ptr(), self.offset) };
             if r == %d {
                 panic!("%s");
             }
@@ -577,9 +589,10 @@ impl<'a> Iterator for %s<'a> {
                 self.offset += 1;
                 continue;
             }
-            let off = self.offset;
-            let match_end = if slots[1] >= 0 { slots[1] as usize } else { 0 };
-            self.offset += if match_end > 0 { match_end } else { 1 };
+            // Slots are ABSOLUTE: the whole input is passed on every call.
+            let abs_start = slots[0] as usize;
+            let abs_end = if slots[1] >= 0 { slots[1] as usize } else { abs_start };
+            self.offset = if abs_end > abs_start { abs_end } else { abs_start + 1 };
             let mut map = std::collections::HashMap::new();
 %s            return Some(map);
         }
@@ -590,7 +603,7 @@ impl<'a> Iterator for %s<'a> {
 /// Group positions are absolute byte offsets.
 /// Use .next() to get only the first match.
 pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
-    %s { input, offset }
+    %s { input, offset, prev_end: None }
 }
 
 `, iterName, iterName, slotCount, ffiName, btOverflow, btOverflowMsg(funcName), inserts.String(), funcName, iterName, iterName)

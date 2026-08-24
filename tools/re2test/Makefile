@@ -13,7 +13,13 @@ exhaustive: $(TESTDATA)
 	go run . $(TESTDATA)
 
 custom:
-	#go run . --validate-go --validate-groups $(CUSTOM)
+	# Expectation file vs Go, no WASM involved. Was commented out while its
+	# col0 oracle was wrong (it used a leftmost-first find plus a span check
+	# instead of matching the export's actual contract, and reported 167 false
+	# disagreements). Fixed and clean as of task 54, so it runs again: it is
+	# the only thing that keeps the file honest, since every other check
+	# compares WASM against the file rather than against Go.
+	go run . --validate-go --validate-groups $(CUSTOM)
 	go run . --validate-groups $(CUSTOM)
 
 $(ADJUSTED): $(TESTDATA)

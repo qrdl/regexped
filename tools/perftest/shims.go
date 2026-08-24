@@ -242,7 +242,7 @@ func buildMatchBenchShim() []byte {
 // bench(ptr i32, len i32, iters i32) → void
 //
 // Params:  ptr(0), len(1), iters(2)
-// Locals:  i(3 i32), cur_ptr(4 i32), cur_len(5 i32), end(6 i32),
+// Locals:  i(3 i32), off(4 i32), rel_end(5 i32), unused(6 i32),
 //
 //	result(7 i64), t_prev(8 i64)
 //
@@ -265,40 +265,37 @@ func buildFindBenchShim() []byte {
 	// if i >= iters: br_if 1 (exit outer loop)
 	b = append(b, 0x20, 0x03, 0x20, 0x02, 0x4E, 0x0D, 0x01)
 
-	// cur_ptr = ptr; cur_len = len
-	b = append(b, 0x20, 0x00, 0x21, 0x04) // local.get 0, local.set 4
-	b = append(b, 0x20, 0x01, 0x21, 0x05) // local.get 1, local.set 5
+	// off = 0
+	b = append(b, 0x41, 0x00, 0x21, 0x04) // i32.const 0, local.set 4 (off)
 
 	// inner block + loop: exhaust all matches
 	b = append(b, 0x02, 0x40) // block void  (inner)
 	b = append(b, 0x03, 0x40) // loop void   (inner_loop)
 
-	// if cur_len <= 0: br_if 1 (exit inner loop)
-	b = append(b, 0x20, 0x05, 0x41, 0x00, 0x4C, 0x0D, 0x01)
+	// if off >= len: br_if 1 (exit inner loop). Same exit point the
+	// cur_len <= 0 test used to give, so the call COUNT per iteration is
+	// unchanged and the timing stays comparable across the ABI change.
+	b = append(b, 0x20, 0x04, 0x20, 0x01, 0x4E, 0x0D, 0x01)
 
-	// result = find(cur_ptr, cur_len); local.set 7
-	b = append(b, 0x20, 0x04, 0x20, 0x05, 0x10, 0x01, 0x21, 0x07)
+	// result = find(ptr, len, off); local.set 7 — the whole buffer every
+	// call, with off bounding only where the search starts.
+	b = append(b, 0x20, 0x00, 0x20, 0x01, 0x20, 0x04, 0x10, 0x01, 0x21, 0x07)
 
 	// if result == -1i64: br_if 1 (exit inner loop)
 	b = append(b, 0x20, 0x07)       // local.get 7 (result)
 	b = append(b, 0x42, 0x7F)       // i64.const -1
 	b = append(b, 0x51, 0x0D, 0x01) // i64.eq, br_if 1
 
-	// end = i32.wrap_i64(result); local.set 6
-	b = append(b, 0x20, 0x07, 0xA7, 0x21, 0x06)
+	// rel_end = i32.wrap_i64(result) - off; local.set 5. The returned end
+	// is absolute now, so the advance below — unchanged in form — needs it
+	// back in window-relative terms.
+	b = append(b, 0x20, 0x07, 0xA7, 0x20, 0x04, 0x6B, 0x21, 0x05)
 
-	// advance = end + i32.eqz(end)
-	// cur_ptr = cur_ptr + advance
-	b = append(b, 0x20, 0x04)             // local.get 4 (cur_ptr)
-	b = append(b, 0x20, 0x06, 0x20, 0x06) // local.get 6, local.get 6
+	// off += rel_end + i32.eqz(rel_end)
+	b = append(b, 0x20, 0x04)             // local.get 4 (off)
+	b = append(b, 0x20, 0x05, 0x20, 0x05) // local.get 5, local.get 5
 	b = append(b, 0x45, 0x6A)             // i32.eqz, i32.add  → advance
-	b = append(b, 0x6A, 0x21, 0x04)       // i32.add cur_ptr+advance, local.set 4
-
-	// cur_len = cur_len - advance
-	b = append(b, 0x20, 0x05)             // local.get 5 (cur_len)
-	b = append(b, 0x20, 0x06, 0x20, 0x06) // local.get 6, local.get 6
-	b = append(b, 0x45, 0x6A)             // i32.eqz, i32.add  → advance
-	b = append(b, 0x6B, 0x21, 0x05)       // i32.sub cur_len-advance, local.set 5
+	b = append(b, 0x6A, 0x21, 0x04)       // i32.add off+advance, local.set 4
 
 	b = append(b, 0x0C, 0x00) // br 0 (inner_loop)
 	b = append(b, 0x0B, 0x0B) // end inner_loop, end inner block
@@ -317,7 +314,7 @@ func buildFindBenchShim() []byte {
 	b = append(b, 0x0C, 0x00, 0x0B, 0x0B, 0x0B) // br 0, end outer_loop, end outer block, end fn
 
 	return assembleShim(
-		shimTypeSection([]byte{0x7F, 0x7F}, []byte{0x7E}, []byte{0x7F, 0x7F, 0x7F}),
+		shimTypeSection([]byte{0x7F, 0x7F, 0x7F}, []byte{0x7E}, []byte{0x7F, 0x7F, 0x7F}),
 		shimImportSection("regexped", "find"),
 		shimFunctionSection(),
 		shimMemorySection(),
@@ -340,7 +337,7 @@ func buildFindBenchShim() []byte {
 // Single clock call per iteration boundary.
 func buildGroupsBenchShim() []byte {
 	var b []byte
-	// locals: 4×i32 (i, cur_ptr, cur_len, result), 1×i64 (t_prev)
+	// locals: 4×i32 (i, off, rel, result), 1×i64 (t_prev)
 	b = append(b, 0x02, 0x04, 0x7F, 0x01, 0x7E)
 
 	// t_prev = clock_time_get()  — initial timestamp before the loop
@@ -354,35 +351,31 @@ func buildGroupsBenchShim() []byte {
 	// if i >= iters: br_if 1
 	b = append(b, 0x20, 0x04, 0x20, 0x03, 0x4E, 0x0D, 0x01)
 
-	// cur_ptr = ptr; cur_len = len
-	b = append(b, 0x20, 0x00, 0x21, 0x05)
-	b = append(b, 0x20, 0x01, 0x21, 0x06)
+	// off = 0
+	b = append(b, 0x41, 0x00, 0x21, 0x05)
 
 	// inner block + loop: exhaust all matches
 	b = append(b, 0x02, 0x40)
 	b = append(b, 0x03, 0x40)
 
-	// if cur_len <= 0: br_if 1
-	b = append(b, 0x20, 0x06, 0x41, 0x00, 0x4C, 0x0D, 0x01)
+	// if off >= len: br_if 1. Same exit point cur_len <= 0 used to give, so
+	// the call COUNT per iteration is unchanged across the ABI change.
+	b = append(b, 0x20, 0x05, 0x20, 0x01, 0x4E, 0x0D, 0x01)
 
-	// result = groups(cur_ptr, cur_len, out_ptr); local.set 7
-	b = append(b, 0x20, 0x05, 0x20, 0x06, 0x20, 0x02, 0x10, 0x01, 0x21, 0x07)
+	// result = groups(ptr, len, out_ptr, off); local.set 7 — the whole buffer
+	// every call, with off bounding only where the search starts.
+	b = append(b, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x20, 0x05, 0x10, 0x01, 0x21, 0x07)
 
 	// if result == -1: br_if 1
 	b = append(b, 0x20, 0x07, 0x41, 0x7F, 0x46, 0x0D, 0x01)
 
-	// advance = result + i32.eqz(result)
-	// cur_ptr = cur_ptr + advance
+	// result is the ABSOLUTE match end. rel = result - off, then advance by
+	// rel + eqz(rel) exactly as before.
+	b = append(b, 0x20, 0x07, 0x20, 0x05, 0x6B, 0x21, 0x06) // rel = result - off
 	b = append(b, 0x20, 0x05)
-	b = append(b, 0x20, 0x07, 0x20, 0x07)
+	b = append(b, 0x20, 0x06, 0x20, 0x06)
 	b = append(b, 0x45, 0x6A)       // i32.eqz, i32.add → advance
-	b = append(b, 0x6A, 0x21, 0x05) // cur_ptr + advance, local.set 5
-
-	// cur_len = cur_len - advance
-	b = append(b, 0x20, 0x06)
-	b = append(b, 0x20, 0x07, 0x20, 0x07)
-	b = append(b, 0x45, 0x6A)       // advance
-	b = append(b, 0x6B, 0x21, 0x06) // cur_len - advance, local.set 6
+	b = append(b, 0x6A, 0x21, 0x05) // off + advance, local.set 5
 
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B, 0x0B) // end inner_loop, end inner block
@@ -401,7 +394,7 @@ func buildGroupsBenchShim() []byte {
 	b = append(b, 0x0C, 0x00, 0x0B, 0x0B, 0x0B)
 
 	return assembleShim(
-		shimTypeSection([]byte{0x7F, 0x7F, 0x7F}, []byte{0x7F}, []byte{0x7F, 0x7F, 0x7F, 0x7F}),
+		shimTypeSection([]byte{0x7F, 0x7F, 0x7F, 0x7F}, []byte{0x7F}, []byte{0x7F, 0x7F, 0x7F, 0x7F}),
 		shimImportSection("regexped", "groups"),
 		shimFunctionSection(),
 		shimMemorySection(),

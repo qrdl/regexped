@@ -47,7 +47,7 @@ if end, ok := UrlMatch(input); ok {
 func <FindFunc>(input []byte, offset uint) iter.Seq2[uint, uint]
 ```
 
-Returns an iterator over all non-overlapping matches. Each iteration yields `(start, end)` absolute byte positions. After a zero-length match the iterator advances by one byte to avoid infinite loops.
+Returns an iterator over all non-overlapping matches. Each iteration yields `(start, end)` absolute byte positions. After a zero-length match the iterator advances by one byte to avoid infinite loops, and — following Go's `FindAllIndex` — an empty match beginning exactly where the previous reported match ended is not reported.
 
 ```go
 // All matches:
@@ -135,10 +135,14 @@ has no user anywhere in this surface. The cost is at call sites: `Find(input,
 len(prefix))` becomes `Find(input, uint(len(prefix)))`. Pattern ids and counts
 stay `int`, because an id is not an offset.
 
-**`offset` currently NARROWS the input** rather than bounding only the search,
-so at `offset > 0` a leading `\b`, `\B`, `^` or `(?m:^)` judges a truncated left
-context. The single-pattern WASM exports take no offset yet; when they do, the
-stubs stop narrowing and these signatures do not change.
+**`offset` bounds where the search starts, not what the engine can see.** The
+stub passes the whole input on every call and the WASM export takes the
+position as an argument, so a leading `\b`, `\B`, `^` or `(?m:^)` at
+`offset > 0` is judged against the real preceding byte.
+
+This holds for `find`, `groups` and `named_groups` alike, and for every engine
+— the conversion is complete, so there is no longer a shape whose left context
+is judged against a slice edge.
 
 Function names are the `snake_case` config values converted to `PascalCase`: `url_match` → `UrlMatch`, `find_github_token` → `FindGithubToken`. All positions are byte offsets (not character indices). Input is `[]byte`.
 
