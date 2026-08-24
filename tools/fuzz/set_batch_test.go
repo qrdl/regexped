@@ -38,7 +38,7 @@ func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
 	sets := []config.SetConfig{{
 		Name:        "s",
 		Find:        "set_find",
-		FindBatch:   "set_find_batch",
+		Hints:       []string{"batch-find"},
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}

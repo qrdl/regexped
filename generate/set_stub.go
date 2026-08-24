@@ -141,18 +141,6 @@ func defaultBatchCap(s config.SetConfig, cfg config.BuildConfig) int {
 	return n
 }
 
-// hasFindBatch reports whether any set in cfg declares find_batch. It gates the
-// SetTuple buffer type, which only a batched scan's caller needs — emitting it
-// unconditionally would put an unused public type into every set-bearing stub.
-func hasFindBatch(cfg config.BuildConfig) bool {
-	for _, s := range cfg.Sets {
-		if s.FindBatch != "" {
-			return true
-		}
-	}
-	return false
-}
-
 // setInlineByteLimit is the byte budget for arrays a generated iterator holds
 // BY VALUE. Above it the generator boxes them instead.
 //

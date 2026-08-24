@@ -42,7 +42,7 @@ await init(wasm);
 ### `match_func` — anchored match
 
 ```js
-export function <func>(input: string | Uint8Array): [number, boolean]
+export function <func>(input: string | Uint8Array): number | null
 ```
 
 Returns `[endPos, true]` if the pattern matches starting at position 0, or `[0, false]` if no match. `endPos` is the exclusive end position of the match in bytes.
@@ -52,8 +52,8 @@ To test whether the full input matches (anchored at both ends):
 ```js
 const enc = new TextEncoder();
 const bytes = enc.encode('https://example.com/path');
-const [end, ok] = url_match(bytes);
-if (ok && end === bytes.length) {
+const end = url_match(bytes);
+if (end === bytes.length) {
     console.log('valid URL');
 }
 ```
@@ -61,8 +61,8 @@ if (ok && end === bytes.length) {
 For start-anchored use cases where the end position matters:
 
 ```js
-const [end, ok] = url_match(input);
-if (ok) {
+const end = url_match(input);
+if (end !== null) {
     console.log('matched first', end, 'bytes');
 }
 ```
@@ -157,19 +157,19 @@ wire format):
 export const <set>PatternCount = 12;
 
 // anchored: the pattern must match the WHOLE input
-export function <match>(input)              // -> boolean
-export function <match_any>(input)          // -> number | null   (a pattern id)
-export function <match_all>(input)          // -> number[]        NOT a boolean
+export function <match_any>(input)            // -> number | null   (a pattern id)
+export function <match_all>(input)            // -> number[]        NOT a boolean
 
-// non-anchored: each takes a `from` position
-export function <scan>(input, from = 0)     // -> boolean
-export function <scan_any>(input, from = 0) // -> {patternId, start} | null
-export function <scan_all>(input, from = 0) // -> number[]        NOT a boolean
+// non-anchored: each takes an offset bounding the search
+export function <scan_any>(input, offset = 0) // -> number | null   (an id; NO position)
+export function <scan_all>(input, offset = 0) // -> number[]        NOT a boolean
 
-export function* <find>(input, from = 0)    // yields {patternId, start, end}
-export function* <find_batch>(input, from = 0, capacity = 256)  // same, batched
-// JS is the exception: its buffer lives in WASM memory, so it takes a capacity
-// rather than a buffer. Every other language takes the buffer itself.
+export function* <find>(input, offset = 0)    // yields {patternId, start, end}
+
+// with hints: [batch-find] the find generator gains a third parameter, and the
+// set exports its ceiling. Without the hint the parameter does not exist.
+export const <set>BatchMaxSize
+export function* <find>(input, offset = 0, batchSize = 256)
 
 export function patternName(id)             // only if any set sets emit_name_map: true
 ```
@@ -205,34 +205,35 @@ requested `emit_name_map: true`.
 
 | Config field | Generated export | Returns |
 |---|---|---|
-| `match_func` | `function <func>(input)` | `[number, boolean]` — `[endPos, matched]` |
-| `find_func` | `function* <func>(input)` | generator of `[start, end]` |
-| `groups_func` | `function* <func>(input)` | generator of `Array<[start,end]\|null>` |
-| `named_groups_func` | `function* <func>(input)` | generator of `Object` (name → `[start,end]`) |
+| `match_func` | `function <func>(input)` | `number \| null` — the end position, or null |
+| `find_func` | `function* <func>(input, offset = 0)` | generator of `[start, end]` |
+| `groups_func` | `function* <func>(input, offset = 0)` | generator of `Array<[start,end]\|null>` |
+| `named_groups_func` | `function* <func>(input, offset = 0)` | generator of `Object` (name → `[start,end]`) |
 
 Generated export names match the config field values exactly (no case conversion). All positions are byte offsets in the UTF-8 encoded form of the input. Input can be a `string` (UTF-8 encoded automatically) or a `Uint8Array`.
 
 ---
 
-### `find_batch` — the same matches, a bufferful per call
+### `batchSize` — the same matches, a bufferful per call
 
-`find` crosses the host boundary once per matching position. `find_batch`
-reports the same matches in the same order but fills **your** buffer with as
-many consecutive positions as fit, so a caller who will consume the whole scan
-crosses once per bufferful instead. Use `find` when you may stop early — a
-batch call does the work for matches you never look at.
+`find` crosses the host boundary once per matching position. With
+`hints: [batch-find]` on the set, `find` gains an optional `batchSize` and
+fills a buffer with as many consecutive positions as fit, so a caller who will
+consume the whole scan crosses once per bufferful instead. Leave it out when
+you may stop early — a batched call does the work for matches you never look
+at, which is exactly why batching is opt-in rather than the default.
 
-The two are independent capabilities; declare either, both, or neither.
+It is the SAME function either way: same matches, same order, same overlap
+policy. Only how much work one crossing does changes. `batchSize` is clamped
+into `[1, <set>BatchMaxSize]`; any value of 1 or more makes progress, since a
+position whose matches do not all fit is delivered in part and resumed inside.
+Group by the match's `start` field rather than by call boundary if you need
+per-position grouping.
 
-You own the buffer: allocate one and reuse it for every scan, so batched
-iteration allocates nothing in the steady state. Its length is the batch size,
-capped at `<SET>_BATCH_MAX_COUNT`; a zero-length buffer yields nothing. Any
-length of 1 or more makes progress — a position whose matches do not all fit is
-delivered in part and resumed inside. Because of that, group by the match's
-`start` field rather than by call boundary if you need per-position grouping.
-
-The gate array and the resume cursor stay stub-owned and never appear in the
-public surface; only the buffer is yours, because only its size is your choice.
+**JS and TS are the only languages with this parameter.** Batching amortises
+host-boundary crossings, and C, Go, Rust and AssemblyScript are compiled to
+wasm and merged — their call into the module is a direct call inside one module
+with no boundary to amortise. The hint is a no-op there.
 
 ## Notes
 

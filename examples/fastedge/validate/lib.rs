@@ -87,7 +87,7 @@ impl HttpContext for HttpReqBody {
         }
 
         // check for XSS in the description
-        if regexps::find_xss(p.descr.as_bytes()).next().is_some() {
+        if regexps::find_xss(p.descr.as_bytes(), 0).next().is_some() {
             println!("Description contains potential XSS: {}", p.descr);
             self.send_http_response(INVALID_REQUEST, vec![], Some("Description contains potential XSS".as_bytes()));
             return Action::Pause;

@@ -45,7 +45,10 @@ func genRustSetInner(cfg config.BuildConfig) string {
 	out.WriteString("/// A match reported by a set `find` iterator.\n" +
 		`#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetMatch {
-    pub pattern_id: usize,
+    /// Pattern ids are i32: the FFI import already returns one, so this
+    /// removes a cast rather than adding one. start/end stay usize because
+    /// they index a slice.
+    pub pattern_id: i32,
     pub start: usize,
     pub end: usize,
 }
@@ -56,12 +59,6 @@ impl SetMatch {
 }
 
 `)
-	if hasFindBatch(cfg) {
-		out.WriteString("/// One slot of a batched scan's buffer, in the raw form the module writes.\n" +
-			"/// Allocate a Vec<SetTuple> (or a stack array) once and reuse it for every\n" +
-			"/// scan: the batched iterator borrows it and never allocates.\n" +
-			"pub type SetTuple = [i32; 3];\n\n")
-	}
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
@@ -72,19 +69,10 @@ impl SetMatch {
 		fmt.Fprintf(&out, "/// Number of patterns in set %q. Sizes the match buffer: `find` can\n/// report at most this many matches at one position.\npub const %s: usize = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "/// One past the largest pattern id set %q can report. Pattern ids are\n/// global indices into `regexps:`, so a set holding a few late-declared\n/// patterns has a small count and a large id space. Everything indexed BY an\n/// id — the gate array, the `_all` bitmask — is sized from this.\npub const %s: usize = %d;\n\n", s.Name, idKonst, idN)
 
-		if s.FindBatch != "" {
-			fmt.Fprintf(&out, "/// Width of the count field in set %[1]q's `find_batch` cursor. The count is\n/// `packed & ((1 << %[2]s) - 1)`; the scan is finished when the top 32 bits of\n/// the cursor are all ones. Only a direct WASM caller needs this — the\n/// generated iterator decodes the cursor for you.\npub const %[2]s: u32 = %[3]d;\n\n",
-				s.Name, screamingCase(s.Name)+"_BATCH_COUNT_BITS", cursorCountBits(s, cfg))
-			fmt.Fprintf(&out, "/// Largest tuple count one `find_batch` call can report for set %[1]q. The\n/// module clamps `out_cap` to it.\npub const %[2]s: usize = %[3]d;\n\n",
-				s.Name, screamingCase(s.Name)+"_BATCH_MAX_COUNT", cursorMaxCount(s, cfg))
-		}
 
 		fmt.Fprintf(&out, "#[link(wasm_import_module = %q)]\nunsafe extern \"C\" {\n", cfg.ImportModule)
 		decl := func(name, sig string) {
 			fmt.Fprintf(&out, "    #[link_name = %q]\n    fn ffi_%s%s;\n", name, name, sig)
-		}
-		if s.Match != "" {
-			decl(s.Match, "(ptr: *const u8, len: i32) -> i32")
 		}
 		if s.MatchAny != "" {
 			decl(s.MatchAny, "(ptr: *const u8, len: i32) -> i32")
@@ -96,11 +84,8 @@ impl SetMatch {
 				decl(s.MatchAll, "(ptr: *const u8, len: i32) -> i64")
 			}
 		}
-		if s.Scan != "" {
-			decl(s.Scan, "(ptr: *const u8, len: i32, from: i32) -> i32")
-		}
 		if s.ScanAny != "" {
-			decl(s.ScanAny, "(ptr: *const u8, len: i32, from: i32) -> i64")
+			decl(s.ScanAny, "(ptr: *const u8, len: i32, from: i32) -> i32")
 		}
 		if s.ScanAll != "" {
 			if wide {
@@ -116,91 +101,66 @@ impl SetMatch {
 				decl(s.Find, "(ptr: *const u8, len: i32, from: i32, out: *mut i32, cap: i32) -> i32")
 			}
 		}
-		if s.FindBatch != "" {
-			if gatedFind(s) {
-				decl(s.FindBatch, "(ptr: *const u8, len: i32, cursor: i64, gates: *mut u32, out: *mut i32, cap: i32) -> i64")
-			} else {
-				decl(s.FindBatch, "(ptr: *const u8, len: i32, cursor: i64, out: *mut i32, cap: i32) -> i64")
-			}
-		}
 		out.WriteString("}\n\n")
 
-		if s.Match != "" {
-			fmt.Fprintf(&out, `/// Returns true when some pattern in the set matches the WHOLE input.
-pub fn %s(input: &[u8]) -> bool {
-    unsafe { ffi_%s(input.as_ptr(), input.len() as i32) != 0 }
-}
-
-`, s.Match, s.Match)
-		}
 		if s.MatchAny != "" {
 			fmt.Fprintf(&out, `/// Returns the id of SOME pattern matching the whole input, or None.
 /// A set is unordered, so which id you get is unspecified when several match.
-pub fn %s(input: &[u8]) -> Option<usize> {
+pub fn %s(input: &[u8]) -> Option<i32> {
     let r = unsafe { ffi_%s(input.as_ptr(), input.len() as i32) };
-    if r < 0 { None } else { Some(r as usize) }
+    if r < 0 { None } else { Some(r) }
 }
 
 `, s.MatchAny, s.MatchAny)
 		}
 		if s.MatchAll != "" {
-			fmt.Fprintf(&out, "/// Returns the ids of every pattern matching the whole input.\npub fn %s(input: &[u8]) -> Vec<usize> {\n", s.MatchAll)
+			fmt.Fprintf(&out, "/// Yields the id of every pattern matching the whole input.\n"+
+				"///\n"+
+				"/// An iterator rather than a `Vec`: the ABI hands back a bitmap whose set\n"+
+				"/// bits can be yielded lazily with nothing materialised, so a caller who\n"+
+				"/// stops early allocates nothing. `.collect()` gives you a Vec.\n"+
+				"pub fn %s(input: &[u8]) -> impl Iterator<Item = i32> + '_ {\n", s.MatchAll)
 			if wide {
 				fmt.Fprintf(&out, `    let mut bits = [0u8; (%s + 7) / 8];
-    let n = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, bits.as_mut_ptr()) };
-    let mut out = Vec::with_capacity(n as usize);
-    for k in 0..%s {
-        if bits[k / 8] & (1u8 << (k %% 8)) != 0 { out.push(k); }
-    }
-    out
+    unsafe { ffi_%s(input.as_ptr(), input.len() as i32, bits.as_mut_ptr()) };
+    (0..%s as i32).filter(move |k| bits[(*k / 8) as usize] & (1u8 << (*k %% 8)) != 0)
 }
 
 `, idKonst, s.MatchAll, idKonst)
 			} else {
 				fmt.Fprintf(&out, `    let mask = unsafe { ffi_%s(input.as_ptr(), input.len() as i32) } as u64;
-    (0..%s).filter(|k| mask & (1u64 << k) != 0).collect()
+    (0..%s as i32).filter(move |k| mask & (1u64 << k) != 0)
 }
 
 `, s.MatchAll, idKonst)
 			}
 		}
-		if s.Scan != "" {
-			fmt.Fprintf(&out, "/// Returns true when some pattern matches at a position at or after `from`.\n"+
-				`pub fn %s(input: &[u8], from: usize) -> bool {
-    unsafe { ffi_%s(input.as_ptr(), input.len() as i32, from as i32) != 0 }
-}
-
-`, s.Scan, s.Scan)
-		}
 		if s.ScanAny != "" {
-			fmt.Fprintf(&out, "/// Returns (pattern id, start) for the FIRST position at or after `from`\n"+
-				"/// where anything matches, or None. Which id you get is unspecified when\n"+
-				"/// several patterns match at that position.\n"+
-				`pub fn %s(input: &[u8], from: usize) -> Option<(usize, usize)> {
-    let packed = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, from as i32) };
-    if packed < 0 { return None; }
-    Some(((packed & 0xFFFF_FFFF) as usize, (packed >> 32) as usize))
+			fmt.Fprintf(&out, "/// Returns one pattern id that matches somewhere at or after `from`, or\n"+
+				"/// None. Which id you get is unspecified when several patterns match; it\n"+
+				"/// names a genuinely matching pattern, and no position is reported.\n"+
+				`pub fn %s(input: &[u8], offset: usize) -> Option<i32> {
+    let r = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, offset as i32) };
+    if r < 0 { return None; }
+    Some(r)
 }
 
 `, s.ScanAny, s.ScanAny)
 		}
 		if s.ScanAll != "" {
-			fmt.Fprintf(&out, "/// Returns the ids of every pattern matching somewhere at or after `from`.\n"+
-				"pub fn %s(input: &[u8], from: usize) -> Vec<usize> {\n", s.ScanAll)
+			fmt.Fprintf(&out, "/// Yields the id of every pattern matching somewhere at or after `offset`.\n"+
+				"/// See match_all for why this is an iterator.\n"+
+				"pub fn %s(input: &[u8], offset: usize) -> impl Iterator<Item = i32> + '_ {\n", s.ScanAll)
 			if wide {
 				fmt.Fprintf(&out, `    let mut bits = [0u8; (%s + 7) / 8];
-    let n = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, from as i32, bits.as_mut_ptr()) };
-    let mut out = Vec::with_capacity(n as usize);
-    for k in 0..%s {
-        if bits[k / 8] & (1u8 << (k %% 8)) != 0 { out.push(k); }
-    }
-    out
+    unsafe { ffi_%s(input.as_ptr(), input.len() as i32, offset as i32, bits.as_mut_ptr()) };
+    (0..%s as i32).filter(move |k| bits[(*k / 8) as usize] & (1u8 << (*k %% 8)) != 0)
 }
 
 `, idKonst, s.ScanAll, idKonst)
 			} else {
-				fmt.Fprintf(&out, `    let mask = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, from as i32) } as u64;
-    (0..%s).filter(|k| mask & (1u64 << k) != 0).collect()
+				fmt.Fprintf(&out, `    let mask = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, offset as i32) } as u64;
+    (0..%s as i32).filter(move |k| mask & (1u64 << k) != 0)
 }
 
 `, s.ScanAll, idKonst)
@@ -254,7 +214,7 @@ impl<'a> Iterator for %s<'a> {
             if self.idx < self.count {
                 let e = self.buf[self.idx as usize];
                 self.idx += 1;
-                return Some(SetMatch { pattern_id: e[0] as usize, start: e[1] as usize, end: e[2] as usize });
+                return Some(SetMatch { pattern_id: e[0], start: e[1] as usize, end: e[2] as usize });
             }
             if self.done { return None; }
             let n = unsafe {
@@ -273,96 +233,16 @@ impl<'a> Iterator for %s<'a> {
 }
 
 `, gateDoc, allocDoc, iterName, gateField, bufField, iterName, s.Find, gateArg, konst)
-			fmt.Fprintf(&out, "/// Starts a scan at `from`. Each step yields one match.\n"+
-				`pub fn %s(input: &[u8], from: usize) -> %s<'_> {
-    %s { input, from: from as i32, done: false,%s%s count: 0, idx: 0 }
+			fmt.Fprintf(&out, "/// Starts a scan at `offset`. Each step yields one match.\n"+
+				`pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
+    %s { input, from: offset as i32, done: false,%s%s count: 0, idx: 0 }
 }
 
 `, s.Find, iterName, iterName, gateInit, bufInit)
 		}
-		if s.FindBatch != "" {
-			iterName := iterTypeName(s.FindBatch)
-			maxKonst := screamingCase(s.Name) + "_BATCH_MAX_COUNT"
-			gateField, gateInit, gateArg, gateDoc, allocDoc := "", "", "", "", ""
-			if gatedFind(s) {
-				// The gate array stays stub-owned and out of the public
-				// surface (docs/sets.md "The gate array"): its length is the
-				// emitted id-space constant, so it is not a size the caller
-				// chooses, and it needs no parameter. Only the tuple buffer's
-				// size is the caller's choice.
-				//
-				// It is a FIXED array — no allocation — unless the set is big
-				// enough that carrying it by value would make the iterator a
-				// heavy thing to move, which is the same threshold `find` uses.
-				gateField = "    gates: [u32; " + idKonst + "],\n"
-				gateInit = " gates: [0u32; " + idKonst + "],"
-				if boxSetBuffers(0, idN) {
-					gateField = "    gates: Box<[u32]>,\n"
-					gateInit = " gates: vec![0u32; " + idKonst + "].into_boxed_slice(),"
-					allocDoc = "///\n/// This set's id space is large enough that the gate array would be a\n/// heavy value to move, so it is heap-allocated once when the iterator is\n/// created. Smaller sets keep it inline and allocate nothing at all.\n"
-				}
-				gateArg = "self.gates.as_mut_ptr(), "
-				gateDoc = " and owns a zeroed gate array"
-			}
-			fmt.Fprintf(&out, `/// Iterator over the set's matches, refilled a BUFFERFUL at a time.
-///
-/// Same matches, in the same order, as the `+"`find`"+` iterator — the difference is
-/// one host call per bufferful instead of one per position. Use it when the
-/// whole scan will be consumed; use `+"`find`"+` when you may stop early, since a
-/// batch call does the work for matches you never look at.
-///
-/// It borrows the caller's buffer%s, so a scan allocates NOTHING: size the
-/// buffer once and reuse it for every scan.
-%spub struct %s<'a, 'b> {
-    input: &'a [u8],
-    buf: &'b mut [SetTuple],
-    cursor: i64,
-    done: bool,
-%s    count: i32,
-    idx: i32,
-}
-
-impl<'a, 'b> Iterator for %s<'a, 'b> {
-    type Item = SetMatch;
-    fn next(&mut self) -> Option<SetMatch> {
-        loop {
-            if self.idx < self.count {
-                let e = self.buf[self.idx as usize];
-                self.idx += 1;
-                return Some(SetMatch { pattern_id: e[0] as usize, start: e[1] as usize, end: e[2] as usize });
-            }
-            if self.done { return None; }
-            let cap = self.buf.len().min(%s) as i32;
-            let packed = unsafe {
-                ffi_%s(self.input.as_ptr(), self.input.len() as i32, self.cursor,
-                    %sself.buf.as_mut_ptr() as *mut i32, cap)
-            };
-            // The cursor is opaque: hand it back unchanged. Its top 32 bits are
-            // the only public part — all ones means the scan is finished, and
-            // that arrives on the same call as the last matches.
-            self.count = (packed & %d) as i32;
-            self.idx = 0;
-            if (packed as u64) >> 32 == 0xFFFF_FFFF { self.done = true; }
-            self.cursor = packed;
-            // A call reports at least one match unless the scan is over.
-            if self.count == 0 { self.done = true; return None; }
-        }
-    }
-}
-
-`, gateDoc, allocDoc, iterName, gateField, iterName, maxKonst, s.FindBatch, gateArg, cursorCountMask(s, cfg))
-			fmt.Fprintf(&out, "/// Starts a batched scan at `from` over the caller's buffer. Its length is\n"+
-				"/// the batch size, capped at %s; an empty buffer yields nothing.\n"+
-				`pub fn %s<'a, 'b>(input: &'a [u8], from: usize, buf: &'b mut [SetTuple]) -> %s<'a, 'b> {
-    let done = buf.is_empty();
-    %s { input, buf, cursor: (from as i64) << 32, done,%s count: 0, idx: 0 }
-}
-
-`, maxKonst, s.FindBatch, iterName, iterName, gateInit)
-		}
 	}
 	if hasEmitNameMap(cfg) {
-		out.WriteString("pub fn pattern_name(id: usize) -> &'static str {\n    match id {\n")
+		out.WriteString("pub fn pattern_name(id: i32) -> &'static str {\n    match id {\n")
 		for i, re := range cfg.Regexps {
 			fmt.Fprintf(&out, "        %d => %q,\n", i, re.Name)
 		}
@@ -542,16 +422,22 @@ impl<'a> Iterator for %s<'a> {
     }
 }
 
-/// Returns an iterator over all non-overlapping matches in input.
+/// Returns an iterator over all non-overlapping matches at or after offset.
 /// Each item is an absolute (start, end) byte range.
 /// Use .next() to get only the first match.
+///
+/// LIMITATION: offset currently NARROWS the input rather than bounding only
+/// the search, so at offset > 0 a leading \b, \B, ^ or (?m:^) judges a
+/// truncated left context. The single-pattern WASM exports take no offset;
+/// TODO 54 gives them one, after which this stub stops narrowing and the
+/// signature is unchanged.
 ///
 /// # Panics
 /// next() panics if the pattern compiled to the Backtracking engine and the
 /// input exhausted its frame budget: the engine cannot tell whether the input
 /// matches, so ending iteration would be a lie.
-pub fn %s(input: &[u8]) -> %s<'_> {
-    %s { input, offset: 0 }
+pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
+    %s { input, offset }
 }
 
 `, importModule, funcName, ffiName, iterName, iterName, ffiName, btOverflow, btOverflowMsg(funcName), funcName, iterName, iterName)
@@ -621,8 +507,8 @@ impl<'a> Iterator for %s<'a> {
 /// Returns an iterator over all non-overlapping capture matches in input.
 /// Group positions are absolute byte offsets. Index 0 is the full match.
 /// Use .next() to get only the first match.
-pub fn %s(input: &[u8]) -> %s<'_> {
-    %s { input, offset: 0 }
+pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
+    %s { input, offset }
 }
 
 `, iterName, iterName, slotCount, ffiName, btOverflow, btOverflowMsg(funcName), numGroups, numGroups, funcName, iterName, iterName)
@@ -703,8 +589,8 @@ impl<'a> Iterator for %s<'a> {
 /// Returns an iterator over all non-overlapping named-capture matches in input.
 /// Group positions are absolute byte offsets.
 /// Use .next() to get only the first match.
-pub fn %s(input: &[u8]) -> %s<'_> {
-    %s { input, offset: 0 }
+pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
+    %s { input, offset }
 }
 
 `, iterName, iterName, slotCount, ffiName, btOverflow, btOverflowMsg(funcName), inserts.String(), funcName, iterName, iterName)

@@ -17,13 +17,13 @@ func main() {
 
 	// Count all rows that have 3 columns (including those with invalid emails).
 	total := 0
-	for range FindCsvRow(input) {
+	for range FindCsvRow(input, 0) {
 		total++
 	}
 
 	// Parse rows that also have a valid email; extract id, name, email.
 	valid := 0
-	for fields := range ParseCsvRow(input) {
+	for fields := range ParseCsvRow(input, 0) {
 		id := string(input[fields["id"][0]:fields["id"][1]])
 		name := string(input[fields["name"][0]:fields["name"][1]])
 		email := string(input[fields["email"][0]:fields["email"][1]])

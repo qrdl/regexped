@@ -151,7 +151,7 @@ func TestValidateConfig_IgnoresNameFields(t *testing.T) {
 			{Name: "delete", Pattern: "b", MatchFunc: "match_delete"},
 		},
 		Sets: []SetConfig{
-			{Name: "class", Match: "validate_sql"},
+			{Name: "class", MatchAny: "validate_sql"},
 		},
 	}
 	if err := ValidateConfig(&cfg); err != nil {
@@ -348,10 +348,10 @@ func TestValidateExports_SetDerivedConstantCollisions(t *testing.T) {
 	}{
 		{"ts", "scannerPatternCount", true},
 		{"js", "scannerIdSpace", true},
-		{"ts", "scannerBatchMaxCount", true}, // reserved even with no find_batch
+		{"ts", "scannerBatchMaxSize", true}, // reserved even with no batch-find hint
 		{"rust", "SCANNER_PATTERN_COUNT", true},
 		{"c", "SCANNER_ID_SPACE", true},
-		{"as", "SCANNER_BATCH_COUNT_BITS", true},
+		{"as", "SCANNER_BATCH_MAX_SIZE", true},
 		{"go", "scanner_pattern_count", true}, // Go compares the Pascal-cased form
 		{"go", "ScannerIDSpace", true},
 
@@ -370,7 +370,7 @@ func TestValidateExports_SetDerivedConstantCollisions(t *testing.T) {
 				Regexps: []RegexEntry{{Name: "p", Pattern: "a"}},
 				Sets: []SetConfig{{
 					Name:     "scanner",
-					Scan:     c.funcName,
+					ScanAny:  c.funcName,
 					Patterns: PatternSelector{All: true},
 				}},
 			}
@@ -386,7 +386,7 @@ func TestValidateExports_SetDerivedConstantCollisions(t *testing.T) {
 	cfg := &BuildConfig{
 		StubType: "ts", ImportModule: "m",
 		Regexps: []RegexEntry{{Name: "p", Pattern: "a", MatchFunc: "scannerPatternCount"}},
-		Sets:    []SetConfig{{Name: "scanner", Scan: "sc", Patterns: PatternSelector{All: true}}},
+		Sets:    []SetConfig{{Name: "scanner", ScanAny: "sc", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateConfig(cfg); err == nil {
 		t.Error("regexp match_func colliding with a set constant was accepted, want error")

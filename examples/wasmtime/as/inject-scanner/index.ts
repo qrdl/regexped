@@ -7,19 +7,21 @@ function check(label: string, payload: string): void {
   const buf = String.UTF8.encode(payload);
   console.log("[" + label + "] payload: " + payload);
 
-  // scan_any reports the FIRST position at or after `from` where anything in
-  // the set matches, plus one of the pattern ids matching there. It carries no
-  // extent — that is what makes it the cheap capability.
+  // scan_any reports ONE pattern id that matches somewhere at or after
+  // `offset`, or -1. It reports no position and no extent — which is what
+  // makes it the cheap capability: with a start to report it would need an
+  // anchored probe at every position, and without one it compiles to a single
+  // union-automaton pass.
   const sqli = scan_sqli(buf, 0);
-  if (sqli) {
-    console.log("  [SQLI] " + patternName(sqli.patternId) + " at " + sqli.start.toString());
+  if (sqli >= 0) {
+    console.log("  [SQLI] " + patternName(sqli));
   } else {
     console.log("  [SQLI] clean");
   }
 
   const xss = scan_xss(buf, 0);
-  if (xss) {
-    console.log("  [XSS]  detected at " + xss.start.toString());
+  if (xss >= 0) {
+    console.log("  [XSS]  detected: " + patternName(xss));
   } else {
     console.log("  [XSS]  clean");
   }

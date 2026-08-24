@@ -191,18 +191,16 @@ not stored in the table.
 When the config contains a `sets:` block, `regexped compile` emits additional
 WASM functions for multi-pattern matching.
 
-### The eight capability exports
+### The capability exports
 
 ```wasm
 ;; Anchored — the match must span the WHOLE input (0..len).
-(func $match     (param $in_ptr i32) (param $in_len i32) (result i32))            ;; 0 | 1
 (func $match_any (param $in_ptr i32) (param $in_len i32) (result i32))            ;; id, or -1
 (func $match_all (param $in_ptr i32) (param $in_len i32) (result i64))            ;; bitmask  (<= 64 patterns)
 (func $match_all (param $in_ptr i32) (param $in_len i32) (param $out_ptr i32) (result i32))  ;; count + bitmap (> 64)
 
-;; Non-anchored — all take a `from` position.
-(func $scan     (param $in_ptr i32) (param $in_len i32) (param $from i32) (result i32))  ;; 0 | 1
-(func $scan_any (param $in_ptr i32) (param $in_len i32) (param $from i32) (result i64))  ;; (start<<32)|id, or -1
+;; Non-anchored — all take a `from` position bounding the search.
+(func $scan_any (param $in_ptr i32) (param $in_len i32) (param $from i32) (result i32))  ;; id, or -1
 (func $scan_all (param $in_ptr i32) (param $in_len i32) (param $from i32) (result i64))  ;; bitmask (<= 64)
 (func $scan_all (param $in_ptr i32) (param $in_len i32) (param $from i32) (param $out_ptr i32) (result i32))
 
@@ -218,15 +216,19 @@ WASM functions for multi-pattern matching.
     (param $out_ptr i32) (param $out_cap i32)
     (result i32))
 
-;; find_batch — the same matches, several consecutive positions per call.
-;; The cursor is an i64 in and an i64 out: pass the previous return value back
-;; unchanged. A first call passes `from << 32`.
-(func $find_batch                                    ;; gated (default)
+;; <find>_batch — emitted ONLY under `hints: [batch-find]` on the set, alongside
+;; $find rather than instead of it. The same matches, several consecutive
+;; positions per call. The cursor is an i64 in and an i64 out: pass the previous
+;; return value back unchanged. A first call passes `from << 32`.
+;;
+;; Both entries are driven by ONE shared per-position worker, so a batching set
+;; carries one set of bucket code rather than two.
+(func $<find>_batch                                  ;; gated (default)
     (param $in_ptr i32) (param $in_len i32) (param $cursor i64)
     (param $gate_ptr i32) (param $out_ptr i32) (param $out_cap i32)
     (result i64))
 
-(func $find_batch                                    ;; overlapping: true
+(func $<find>_batch                                  ;; overlapping: true
     (param $in_ptr i32) (param $in_len i32) (param $cursor i64)
     (param $out_ptr i32) (param $out_cap i32)
     (result i64))
@@ -250,20 +252,25 @@ Each tuple written to `out_ptr` is 12 bytes (3 × i32), 4-byte aligned:
 The order of tuples *within* one call is unspecified: not by pattern id, not by
 extent, not stable across compiler versions.
 
-### find_batch cursor layout
+### batch cursor layout
 
 The returned `i64` is both the answer and the resume token:
 
 | Bits | Field | Public? |
 |---|---|---|
 | 63..32 | resume position, or `0xFFFFFFFF` when the scan is finished | only the sentinel |
-| 31..`<SET>_BATCH_COUNT_BITS` | `k`, the intra-position resume index | no — opaque |
-| `<SET>_BATCH_COUNT_BITS`-1..0 | `count` — valid tuples in the buffer | yes |
+| 31..`countBits` | `k`, the intra-position resume index | no — opaque |
+| `countBits`-1..0 | `count` — valid tuples in the buffer | yes |
 
-`<SET>_BATCH_COUNT_BITS` is `32 - kBits`, where `kBits` is the smallest width
-holding `[0, patterns_in_set]`; both it and `<SET>_BATCH_MAX_COUNT` are emitted
-as constants. Treat everything but the sentinel and `count` as opaque and hand
-the value straight back.
+`countBits` is `32 - kBits`, where `kBits` is the smallest width holding
+`[0, patterns_in_set]`. Treat everything but the sentinel and `count` as opaque
+and hand the value straight back.
+
+**These widths are ABI facts, not emitted constants.** No generator exports
+them: the stubs decode the cursor for you, and only a direct WASM caller ever
+sees it. The one constant that IS emitted is `<set>BatchMaxSize`, the largest
+`out_cap` one call can report — JS/TS only, since they are the only stubs with
+a batch parameter to bound.
 
 The sentinel is `0xFFFFFFFF` rather than 0 because **0 is a legal resume
 position** — a first call whose buffer fills on the matches at position 0
@@ -275,14 +282,14 @@ partial fill and the buffer is reused: slots past `count` still hold tuples from
 the previous call, and `(id=0, start=0, end=0)` is a legal tuple, so no
 in-buffer terminator could be unambiguous.
 
-Unlike `find`, `find_batch` is **not transactional**: a position whose tuples do
+Unlike `find`, the batch entry is **not transactional**: a position whose tuples do
 not all fit is delivered in part and resumed inside, so any `out_cap >= 1` makes
-progress and tuples of one position may span two calls. `out_cap` is clamped to
-`<SET>_BATCH_MAX_COUNT`; `out_cap = 0` delivers nothing and returns the **done
+progress and tuples of one position may span two calls. `out_cap` is clamped to the count field's
+maximum (`<set>BatchMaxSize` in the JS/TS stubs); `out_cap = 0` delivers nothing and returns the **done
 sentinel** with count 0, so the ordinary loop terminates rather than spinning on
 a cursor that can never advance. This is a deliberate asymmetry with `find`,
 where the same input is a legal size probe: `find` returns a count, which a probe
-can use, while `find_batch` returns a resumable cursor, which a probe cannot.
+can use, while the batch entry returns a resumable cursor, which a probe cannot.
 
 ### find return value and overflow
 
@@ -344,7 +351,7 @@ restores a clean scan from anywhere.
 
 - `0 ≤ from ≤ len` (unsigned). `from == len` is a real position and IS
   evaluated — end-anchored and empty-matchable patterns can match there.
-- `from > len` yields the capability's "nothing": `scan` 0, `scan_any` −1,
+- `from > len` yields the capability's "nothing": `scan_any` −1,
   `scan_all` 0, `find` 0.
 - `len == 0`: position 0 is evaluated.
 - Zero-length matches are ordinary matches; `find` reports them as `(id, p, p)`.

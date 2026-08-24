@@ -31,9 +31,10 @@ impl HttpContext for Guard {
             None => return Action::Continue,
         };
 
-        // scan_any stops at the first matching position and carries no
-        // extent — minimal overhead to block.
-        if let Some((pattern_id, _start)) = patterns::scan_url(&url, 0) {
+        // scan_any answers "does anything in the set match, and which" with a
+        // single pass over a union automaton — no position, no extent, which
+        // is exactly what a block decision needs.
+        if let Some(pattern_id) = patterns::scan_url(&url, 0) {
             let attack = patterns::pattern_name(pattern_id);
             self.send_http_response(
                 403,

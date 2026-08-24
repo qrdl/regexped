@@ -10,7 +10,7 @@ Each stub file is a plain Rust source file intended to be pulled in with `includ
 include!("stubs.rs");
 
 // import_module: "regexps" in the config → module path "regexps::<func_name>"
-regexps::find_github_token(input);
+regexps::find_github_token(input, 0);
 ```
 
 WASM export names (and the generated function names) are whatever you set in `match_func`/`find_func`/`groups_func`/`named_groups_func` — not fixed names like `match`/`find`/`groups` — so two entries only collide if they reuse the same `_func` name within one config, or if two separate configs share the same `import_module`.
@@ -41,7 +41,7 @@ match url_match(input) {
 ### `find_func` — non-anchored find iterator
 
 ```rust
-pub fn <find_func>(input: &[u8]) -> <FindFuncPascalCase>Iter<'_>
+pub fn <find_func>(input: &[u8], offset: usize) -> <FindFuncPascalCase>Iter<'_>
 // <FindFuncPascalCase>Iter implements Iterator<Item = (usize, usize)>
 ```
 
@@ -51,12 +51,12 @@ Returns an iterator that yields all non-overlapping matches as absolute `(start,
 
 ```rust
 // All matches:
-for (start, end) in find_token(input) {
+for (start, end) in find_token(input, 0) {
     println!("match at {}..{}: {:?}", start, end, &input[start..end]);
 }
 
 // First match only:
-if let Some((start, end)) = find_token(input).next() {
+if let Some((start, end)) = find_token(input, 0).next() {
     println!("first match: {:?}", &input[start..end]);
 }
 ```
@@ -66,7 +66,7 @@ if let Some((start, end)) = find_token(input).next() {
 ### `groups_func` — anchored capture groups iterator
 
 ```rust
-pub fn <groups_func>(input: &[u8]) -> <GroupsFuncPascalCase>Iter<'_>
+pub fn <groups_func>(input: &[u8], offset: usize) -> <GroupsFuncPascalCase>Iter<'_>
 // <GroupsFuncPascalCase>Iter implements Iterator<Item = Vec<Option<(usize, usize)>>>
 ```
 
@@ -76,14 +76,14 @@ Returns an iterator that yields all non-overlapping matches. Each item is a `Vec
 
 ```rust
 // All matches:
-for groups in parse_groups(input) {
+for groups in parse_groups(input, 0) {
     if let Some(Some((s, e))) = groups.get(1) {
         println!("group 1: {:?}", &input[*s..*e]);
     }
 }
 
 // First match only:
-if let Some(groups) = parse_groups(input).next() {
+if let Some(groups) = parse_groups(input, 0).next() {
     if let Some(Some((s, e))) = groups.get(1) {
         println!("group 1: {:?}", &input[s..e]);
     }
@@ -95,7 +95,7 @@ if let Some(groups) = parse_groups(input).next() {
 ### `named_groups_func` — named capture groups iterator
 
 ```rust
-pub fn <named_groups_func>(input: &[u8]) -> NamedGroupsIter<'_>
+pub fn <named_groups_func>(input: &[u8], offset: usize) -> NamedGroupsIter<'_>
 // NamedGroupsIter implements Iterator<Item = HashMap<&'static str, (usize, usize)>>
 ```
 
@@ -103,14 +103,14 @@ Returns an iterator that yields all non-overlapping matches. Each item is a `Has
 
 ```rust
 // All matches:
-for parts in parse_url(text) {
+for parts in parse_url(text, 0) {
     if let Some((s, e)) = parts.get("host") {
         println!("host: {}", std::str::from_utf8(&text[*s..*e]).unwrap());
     }
 }
 
 // First match only:
-if let Some(parts) = parse_url(text).next() {
+if let Some(parts) = parse_url(text, 0).next() {
     if let Some((s, e)) = parts.get("host") {
         println!("host: {}", std::str::from_utf8(&text[*s..*e]).unwrap());
     }
@@ -124,13 +124,18 @@ if let Some(parts) = parse_url(text).next() {
 | Config field | Generated function | Return type |
 |---|---|---|
 | `match_func` | `<func>(input)` | `Option<usize>` |
-| `find_func` | `<func>(input)` | `<FuncPascalCase>Iter` — yields `(usize, usize)` per match |
-| `groups_func` | `<func>(input)` | `<FuncPascalCase>Iter` — yields `Vec<Option<(usize, usize)>>` per match |
-| `named_groups_func` | `<func>(input)` | `<FuncPascalCase>Iter` — yields `HashMap<&'static str, (usize, usize)>` per match |
+| `find_func` | `<func>(input, offset)` | `<FuncPascalCase>Iter` — yields `(usize, usize)` per match |
+| `groups_func` | `<func>(input, offset)` | `<FuncPascalCase>Iter` — yields `Vec<Option<(usize, usize)>>` per match |
+| `named_groups_func` | `<func>(input, offset)` | `<FuncPascalCase>Iter` — yields `HashMap<&'static str, (usize, usize)>` per match |
 
 The iterator type name is always derived from the config field's own function name (PascalCase + `Iter`) — it is never a shared fixed name, so multiple `find_func`/`groups_func`/`named_groups_func` entries in one file never collide on the type name.
 
 All positions are byte offsets (not character indices). Input is `&[u8]`.
+
+**`offset` currently NARROWS the input** rather than bounding only the search,
+so at `offset > 0` a leading `\b`, `\B`, `^` or `(?m:^)` judges a truncated left
+context. The single-pattern WASM exports take no offset yet; when they do, the
+stubs stop narrowing and these signatures do not change.
 
 ---
 
@@ -146,24 +151,19 @@ schema and wire format):
 pub const <SET>_PATTERN_COUNT: usize = 12;   // patterns in the set
 pub const <SET>_ID_SPACE: usize = 12;        // largest reportable pattern id + 1
 
-pub struct SetMatch { pub pattern_id: usize, pub start: usize, pub end: usize }
+pub struct SetMatch { pub pattern_id: i32, pub start: usize, pub end: usize }
 
 // anchored: the pattern must match the WHOLE input
-pub fn <match>    (input: &[u8]) -> bool;
-pub fn <match_any>(input: &[u8]) -> Option<usize>;                      // pattern id
-pub fn <match_all>(input: &[u8]) -> Vec<usize>;
+pub fn <match_any>(input: &[u8]) -> Option<i32>;                        // pattern id
+pub fn <match_all>(input: &[u8]) -> impl Iterator<Item = i32> + '_;
 
 // non-anchored: each takes a `from` position
-pub fn <scan>    (input: &[u8], from: usize) -> bool;
-pub fn <scan_any>(input: &[u8], from: usize) -> Option<(usize, usize)>; // (id, start)
-pub fn <scan_all>(input: &[u8], from: usize) -> Vec<usize>;
+pub fn <scan_any>(input: &[u8], offset: usize) -> Option<i32>;          // pattern id, no position
+pub fn <scan_all>(input: &[u8], offset: usize) -> impl Iterator<Item = i32> + '_;
 
-pub fn <find>(input: &[u8], from: usize) -> <Find>Iter<'_>;
+pub fn <find>(input: &[u8], offset: usize) -> <Find>Iter<'_>;
 impl Iterator for <Find>Iter<'_> { type Item = SetMatch; }
 
-pub type SetTuple = [i32; 3];   // one slot of a batched scan's buffer
-pub fn <find_batch><'a, 'b>(input: &'a [u8], from: usize, buf: &'b mut [SetTuple]) -> <FindBatch>Iter<'a, 'b>;
-impl Iterator for <FindBatch>Iter<'_, '_> { type Item = SetMatch; }
 ```
 
 ```rust
@@ -190,27 +190,14 @@ instead, so the iterator stays small enough to move freely and the arrays are
 heap-allocated once when it is created. Nothing about the API changes either
 way — only whether creating an iterator allocates.
 
-### `find_batch` — the same matches, a bufferful per call
+### Batching is a JS/TS-only hint
 
-`find` crosses the host boundary once per matching position. `find_batch`
-reports the same matches in the same order but fills its buffer with as many
-consecutive positions as fit, so a caller who will consume the whole scan
-crosses once per bufferful instead. Use `find` when you may stop early — a
-batch call does the work for matches you never look at.
-
-The two are independent capabilities; declare either, both, or neither. The
-buffer's length is the batch size, capped at `<SET>_BATCH_MAX_COUNT`, and any
-length of 1 or more makes progress: a position whose matches do not all fit is
-delivered in part and resumed inside. Because of that, group by the match's
-`start` field rather than by call boundary if you need per-position grouping.
-
-You own the buffer; the iterator borrows it, so batched iteration allocates
-nothing in the steady state — allocate one `Vec<SetTuple>` and reuse it for
-every scan. Its length is the batch size. The gate array and the cursor stay
-internal: the gate array's length is `<SET>_ID_SPACE`, a compile-time constant,
-so it is not a size you choose. It is a fixed inline array — costing no
-allocation — unless the id space pushes it past the same 4 KB budget the `find`
-iterator uses, in which case it is boxed and allocated once per iterator.
+`hints: [batch-find]` on a set is a **no-op for Rust**, as it is for C, Go and
+AssemblyScript. Batching amortises host-boundary crossings and nothing else,
+and a Rust stub is compiled to wasm and merged, so its call into the module is
+a direct call inside one module with no boundary to amortise. There is no
+`find_batch` function and no `SetTuple` type; `find` is the whole positional
+surface. See [sets.md](sets.md) for the measurements behind that.
 
 `pattern_name(id)` is emitted once per config when any set sets
 `emit_name_map: true`.

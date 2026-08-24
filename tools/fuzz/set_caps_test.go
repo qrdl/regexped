@@ -31,10 +31,8 @@ func compileCaps(pats []string, overlapping bool) ([]byte, map[int]bool, error) 
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
-		Match:       "cap_match",
 		MatchAny:    "cap_match_any",
 		MatchAll:    "cap_match_all",
-		Scan:        "cap_scan",
 		ScanAny:     "cap_scan_any",
 		ScanAll:     "cap_scan_all",
 		Find:        "cap_find",
@@ -288,10 +286,6 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 
 				// match: anchored, whole input.
 				wantAnchored := oracleAnchored(tc.pats, input, nil)
-				gotMatch := r.call(t, "cap_match", r.inBase, n).(int32)
-				if (gotMatch != 0) != (len(wantAnchored) > 0) {
-					t.Fatalf("match = %d, want %v (ids %v)", gotMatch, len(wantAnchored) > 0, wantAnchored)
-				}
 
 				// match_any: membership, never value equality (§3.5).
 				gotAny := r.call(t, "cap_match_any", r.inBase, n).(int32)
@@ -314,28 +308,22 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 
 					wantPos, wantIDs := oracleFirstPosition(tc.pats, input, from, nil)
 
-					gotScan := r.call(t, "cap_scan", r.inBase, n, f).(int32)
-					if (gotScan != 0) != (wantPos >= 0) {
-						t.Fatalf("scan(from=%d) = %d, want %v", from, gotScan, wantPos >= 0)
-					}
-
-					packed := r.call(t, "cap_scan_any", r.inBase, n, f).(int64)
-					if wantPos < 0 {
-						if packed != -1 {
-							t.Fatalf("scan_any(from=%d) = %#x, want -1", from, packed)
-						}
-					} else {
-						start := int(packed >> 32)
-						id := int(packed & 0xFFFFFFFF)
-						if start != wantPos {
-							t.Fatalf("scan_any(from=%d) start = %d, want %d", from, start, wantPos)
-						}
-						if !containsInt(wantIDs, id) {
-							t.Fatalf("scan_any(from=%d) id = %d, not among %v", from, id, wantIDs)
-						}
-					}
-
 					wantScanAll := oracleScanAll(tc.pats, input, from, nil)
+
+					// scan_any reports a bare id and NO start (TODO task 59
+					// decision (10)), so the id may name any pattern matching
+					// anywhere at or after `from` — oracleScanAll's set, not
+					// oracleFirstPosition's. wantPos still decides -1: a set
+					// with a first position is a set with a match.
+					gotAny2 := r.call(t, "cap_scan_any", r.inBase, n, f).(int32)
+					if wantPos < 0 {
+						if gotAny2 != -1 {
+							t.Fatalf("scan_any(from=%d) = %d, want -1", from, gotAny2)
+						}
+					} else if !containsInt(wantScanAll, int(gotAny2)) {
+						t.Fatalf("scan_any(from=%d) id = %d, not among %v", from, gotAny2, wantScanAll)
+					}
+
 					gotScanAll := idsFromMask(uint64(r.call(t, "cap_scan_all", r.inBase, n, f).(int64)), len(tc.pats))
 					if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
 						t.Fatalf("scan_all(from=%d) = %v, want %v", from, gotScanAll, wantScanAll)
@@ -434,10 +422,7 @@ func TestSetFromOutOfRange(t *testing.T) {
 	r := newCapRunner(t, []string{"a", "b"}, "ab", true)
 	defer r.Close()
 	n := int32(2)
-	if got := r.call(t, "cap_scan", r.inBase, n, int32(99)).(int32); got != 0 {
-		t.Errorf("scan(from>len) = %d, want 0", got)
-	}
-	if got := r.call(t, "cap_scan_any", r.inBase, n, int32(99)).(int64); got != -1 {
+	if got := r.call(t, "cap_scan_any", r.inBase, n, int32(99)).(int32); got != -1 {
 		t.Errorf("scan_any(from>len) = %d, want -1", got)
 	}
 	if got := r.call(t, "cap_scan_all", r.inBase, n, int32(99)).(int64); got != 0 {
@@ -524,9 +509,6 @@ func FuzzSetCaps(f *testing.F) {
 		n := int32(len(input))
 
 		wantAnchored := oracleAnchored(pats, input, dropped)
-		if got := r.call(t, "cap_match", inBase, n).(int32); (got != 0) != (len(wantAnchored) > 0) {
-			t.Fatalf("match = %d, want %v: pats=%q,%q input=%q", got, len(wantAnchored) > 0, pat1, pat2, input)
-		}
 		gotAny := int(r.call(t, "cap_match_any", inBase, n).(int32))
 		if len(wantAnchored) == 0 {
 			if gotAny != -1 {
@@ -542,25 +524,19 @@ func FuzzSetCaps(f *testing.F) {
 
 		for from := 0; from <= len(input); from++ {
 			f32 := int32(from)
-			wantPos, wantIDs := oracleFirstPosition(pats, input, from, dropped)
+			wantPos, _ := oracleFirstPosition(pats, input, from, dropped)
 
-			if got := r.call(t, "cap_scan", inBase, n, f32).(int32); (got != 0) != (wantPos >= 0) {
-				t.Fatalf("scan(from=%d) = %d, want %v: pats=%q,%q input=%q", from, got, wantPos >= 0, pat1, pat2, input)
-			}
-			packed := r.call(t, "cap_scan_any", inBase, n, f32).(int64)
-			if wantPos < 0 {
-				if packed != -1 {
-					t.Fatalf("scan_any(from=%d) = %#x, want -1: pats=%q,%q input=%q", from, packed, pat1, pat2, input)
-				}
-			} else {
-				if start := int(packed >> 32); start != wantPos {
-					t.Fatalf("scan_any(from=%d) start = %d, want %d: pats=%q,%q input=%q", from, start, wantPos, pat1, pat2, input)
-				}
-				if id := int(packed & 0xFFFFFFFF); !containsInt(wantIDs, id) {
-					t.Fatalf("scan_any(from=%d) id = %d, not among %v: pats=%q,%q input=%q", from, id, wantIDs, pat1, pat2, input)
-				}
-			}
 			wantScanAll := oracleScanAll(pats, input, from, dropped)
+
+			// See site 1: a bare id, checked against the anywhere-set.
+			gotScanAny := r.call(t, "cap_scan_any", inBase, n, f32).(int32)
+			if wantPos < 0 {
+				if gotScanAny != -1 {
+					t.Fatalf("scan_any(from=%d) = %d, want -1: pats=%q,%q input=%q", from, gotScanAny, pat1, pat2, input)
+				}
+			} else if !containsInt(wantScanAll, int(gotScanAny)) {
+				t.Fatalf("scan_any(from=%d) id = %d, not among %v: pats=%q,%q input=%q", from, gotScanAny, wantScanAll, pat1, pat2, input)
+			}
 			gotScanAll := idsFromMask(uint64(r.call(t, "cap_scan_all", inBase, n, f32).(int64)), len(pats))
 			if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
 				t.Fatalf("scan_all(from=%d) = %v, want %v: pats=%q,%q input=%q", from, gotScanAll, wantScanAll, pat1, pat2, input)

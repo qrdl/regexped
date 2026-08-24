@@ -116,18 +116,21 @@ const (
 	fuelExhausted = ^uint64(0)
 )
 
-// capability names the seven exports, in a fixed order.
+// capability names the exports, in a fixed order.
+//
+// `match` and `scan` are gone: TODO task 59 decision (2) retired them, since
+// `match_any(...) >= 0` and `scan_any(...) >= 0` are exactly what they
+// returned.
 type capability string
 
 const (
-	capMatch    capability = "match"
 	capMatchAny capability = "match_any"
 	capMatchAll capability = "match_all"
-	capScan     capability = "scan"
 	capScanAny  capability = "scan_any"
 	capScanAll  capability = "scan_all"
 	capFind     capability = "find"
-	// capFindBatch is §19's multi-position find. It is the row that makes the
+	// capFindBatch is §19's multi-position find, now requested with
+	// `hints: [batch-find]` rather than declared (decision (11)). It is the row that makes the
 	// `find` comparison an honest one: ra_bench_find_gated runs its WHOLE
 	// enumeration inside ONE wasm call, while our `find` crosses the host
 	// boundary once per position. find_batch crosses once per BUFFERFUL, so
@@ -140,8 +143,8 @@ const (
 )
 
 var allCaps = []capability{
-	capMatch, capMatchAny, capMatchAll,
-	capScan, capScanAny, capScanAll,
+	capMatchAny, capMatchAll,
+	capScanAny, capScanAll,
 	capFind, capFindBatch, capFindOverlapping,
 }
 
@@ -152,8 +155,14 @@ const batchCap = 256
 
 // exportName is the WASM export each capability is compiled under.
 func exportName(c capability) string {
-	if c == capFindOverlapping {
+	switch c {
+	case capFindOverlapping:
 		return "cap_find"
+	case capFindBatch:
+		// Synthesized from `find`'s name under the hint, not declared, so it
+		// is derived through the same function the compiler and the six
+		// generators use.
+		return config.SetBatchExportName("cap_find")
 	}
 	return "cap_" + string(c)
 }
@@ -162,13 +171,11 @@ func exportName(c capability) string {
 // or "" when the pairing would be dishonest (§9.9's table).
 func raPairing(c capability) string {
 	switch c {
-	case capScan:
-		return "ra_bench_scan"
 	case capScanAny:
 		return "ra_bench_scan_any"
 	case capScanAll:
 		return "ra_bench_scan_all"
-	case capMatch, capMatchAny:
+	case capMatchAny:
 		return "ra_bench_match"
 	case capMatchAll:
 		return "ra_bench_match_all"
@@ -379,14 +386,12 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
-		Match:       "cap_match",
 		MatchAny:    "cap_match_any",
 		MatchAll:    "cap_match_all",
-		Scan:        "cap_scan",
 		ScanAny:     "cap_scan_any",
 		ScanAll:     "cap_scan_all",
 		Find:        "cap_find",
-		FindBatch:   "cap_find_batch",
+		Hints:       []string{"batch-find"},
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
@@ -509,7 +514,7 @@ func (r *rxInstance) call(c capability, wide bool) (int, error) {
 		return 0, fmt.Errorf("missing export %s", exportName(c))
 	}
 	switch c {
-	case capMatch, capMatchAny:
+	case capMatchAny:
 		_, err := fn.Call(r.store, r.inBase, r.inLen)
 		return 1, err
 	case capMatchAll:
@@ -520,7 +525,7 @@ func (r *rxInstance) call(c capability, wide bool) (int, error) {
 		}
 		_, err := fn.Call(r.store, r.inBase, r.inLen)
 		return 1, err
-	case capScan, capScanAny:
+	case capScanAny:
 		_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0))
 		return 1, err
 	case capScanAll:
@@ -755,7 +760,7 @@ func measureTime(engine *wasmtime.Engine, c setCase, cap capability, ourFuel uin
 // Calibration check: with matched estimators the anchored rows, which do
 // 54-60 fuel of work, correct to approximately zero.
 func measureInstanceFloor(r *rxInstance) time.Duration {
-	fn := r.fnFor(capMatch)
+	fn := r.fnFor(capMatchAny)
 	if fn == nil {
 		return 0
 	}
@@ -1149,12 +1154,9 @@ func runVerify(cases []setCase) int {
 		// automaton's real answers, and length 0 covers the empty input.
 		anchoredMatches := 0
 		for _, n := range anchoredLens(len(c.input)) {
+			// `match` is retired (decision (2)); regex-automata's boolean is
+			// still the oracle, now compared against match_any's sign.
 			theirMatch := raCallI32(ra, "ra_match", int32(n))
-			ourMatch := rxCallI32(r, "cap_match", r.inBase, int32(n))
-			if (theirMatch != 0) != (ourMatch != 0) {
-				fmt.Printf("MISMATCH %s/%s match@%d: ours=%d theirs=%d\n", c.name, c.inputLbl, n, ourMatch, theirMatch)
-				bad++
-			}
 			if theirMatch != 0 {
 				anchoredMatches++
 			}
@@ -1181,26 +1183,15 @@ func runVerify(cases []setCase) int {
 			}
 		}
 
-		// scan: a boolean, directly comparable.
-		theirScan := raCallI32(ra, "ra_scan", int32(len(c.input)), 0)
-		ourScan := rxCallI32(r, "cap_scan", r.inBase, r.inLen, 0)
-		if (theirScan != 0) != (ourScan != 0) {
-			fmt.Printf("MISMATCH %s/%s scan: ours=%d theirs=%d\n", c.name, c.inputLbl, ourScan, theirScan)
-			bad++
-		}
-
-		// scan_any: the START must agree exactly; the id is unspecified when
-		// several patterns match there, so only membership can be checked and
-		// this tool does not have the oracle for that — the start is the part
-		// that is a hard contract.
+		// scan_any: PRESENCE only. TODO task 59 decision (10) removed the
+		// start it used to report, and the id is unspecified when several
+		// patterns match, so agreement on "did anything match" is the whole
+		// contract this tool can check. regex-automata still returns a span,
+		// so only the sign of its answer is comparable.
 		theirAny := raCallI64(ra, "ra_scan_any", int32(len(c.input)), 0)
-		ourAny := rxCallI64(r, "cap_scan_any", r.inBase, r.inLen, 0)
+		ourAny := int64(rxCallI32(r, "cap_scan_any", r.inBase, r.inLen, 0))
 		if (theirAny < 0) != (ourAny < 0) {
 			fmt.Printf("MISMATCH %s/%s scan_any presence: ours=%d theirs=%d\n", c.name, c.inputLbl, ourAny, theirAny)
-			bad++
-		} else if theirAny >= 0 && (theirAny>>32) != (ourAny>>32) {
-			fmt.Printf("MISMATCH %s/%s scan_any start: ours=%d theirs=%d\n",
-				c.name, c.inputLbl, ourAny>>32, theirAny>>32)
 			bad++
 		}
 

@@ -33,14 +33,25 @@ Defined once (guarded by `REGEXPED_TYPES_DEFINED`) so multiple stub headers can 
 included without conflicts:
 
 ```c
-typedef struct { int start; int end; } rx_match_t;
-typedef struct { int start; int end; const char *name; } rx_group_t;
-typedef struct { int pattern_id; int start; int end; } rx_set_match_t;
-typedef struct { int pattern_id; int end; } rx_set_anchor_t;
+#include <stddef.h>   /* size_t, ptrdiff_t -- freestanding-required, no libc */
+
+typedef struct { ptrdiff_t start, end; } rx_match_t;
+typedef struct { ptrdiff_t start, end; const char *name; } rx_group_t;
+typedef struct { int pattern_id; ptrdiff_t start, end; } rx_set_match_t;
 ```
 
-The last two are always emitted alongside the first two, even when the
+`rx_set_match_t` is always emitted alongside the other two, even when the
 config has no `sets:` block — see [Sets](#sets) below.
+
+**The type choices.** `size_t` for lengths, offsets and capacities and ONLY
+those: it means "can hold the size of any object", which a pattern id is not.
+`ptrdiff_t` for positions coming back, because `-1` is the sentinel for "no
+match" / "group absent" and an unsigned type has no room for it — the same
+pairing `read()` uses. `int` for pattern ids and counts, which keeps a negative
+slot free for a future failure and avoids the signed/unsigned warning in
+`for (int i = 0; i < n; i++)`. And `const char *` for input, not
+`const unsigned char *`: callers hold `char *` (argv, literals, read buffers),
+and the old signatures forced a cast at every call site.
 
 ---
 
@@ -49,7 +60,7 @@ config has no `sets:` block — see [Sets](#sets) below.
 ### `match_func` — anchored match
 
 ```c
-int <func>(const unsigned char *input, unsigned int len);
+ptrdiff_t <func>(const char *input, size_t len);
 ```
 
 Returns the end position of the match (`>= 0`) if the pattern matches at the start
@@ -68,7 +79,7 @@ if (end >= 0) {
 ### `find_func` — non-anchored find
 
 ```c
-rx_match_t <func>(const unsigned char *input, unsigned int len, unsigned int offset);
+rx_match_t <func>(const char *input, size_t len, size_t offset);
 ```
 
 Scans `input[offset..len]` for the next match. Returns absolute byte positions
@@ -91,7 +102,7 @@ while (off <= len) {
 ### `groups_func` — capture groups
 
 ```c
-const rx_group_t *<func>(const unsigned char *input, unsigned int len, unsigned int offset);
+const rx_group_t *<func>(const char *input, size_t len, size_t offset, rx_group_t *out);
 ```
 
 Returns a pointer to a **static array** of `<FUNC_UPPER>_GROUPS` entries. The array is
@@ -150,72 +161,87 @@ When the config has a `sets:` block, the generator also emits, per set (see
 ```c
 #define <SET>_PATTERN_COUNT 12   /* patterns in the set */
 #define <SET>_ID_SPACE      12   /* largest reportable pattern id + 1 */
-typedef struct { int pattern_id; int start; int end; } rx_set_match_t;
 
 /* anchored: the pattern must match the WHOLE input */
-int <match>    (const char *in, int len);                        /* 0 | 1    */
-int <match_any>(const char *in, int len);                        /* id or -1 */
-int <match_all>(const char *in, int len, int *out_ids);          /* count    */
+int <match_any>(const char *in, size_t len);                         /* id or -1 */
+int <match_all>(const char *in, size_t len,
+                int patterns[static <SET>_PATTERN_COUNT]);           /* count    */
 
-/* non-anchored: each takes a `from` position */
-int <scan>    (const char *in, int len, int from);               /* 0 | 1    */
-int <scan_any>(const char *in, int len, int from, int *start);   /* id or -1 */
-int <scan_all>(const char *in, int len, int from, int *out_ids); /* count    */
+/* non-anchored: each takes an offset bounding the search */
+int <scan_any>(const char *in, size_t len, size_t offset);           /* id or -1 */
+int <scan_all>(const char *in, size_t len, size_t offset,
+               int patterns[static <SET>_PATTERN_COUNT]);            /* count    */
 
-/* find: a caller-owned scanner struct — reentrant, header-only. You own the
-   buffer too: 3 ints per match, and it must hold at least
-   <SET>_PATTERN_COUNT matches. */
+/* find: a caller-owned scanner struct — reentrant, header-only. It holds the
+   INPUT as well as the position; you pass the buffer per call. */
 typedef struct {
-    int from;
+    const char *input;
+    size_t len, offset;
     int done;
     unsigned gates[<SET>_ID_SPACE];        /* non-overlapping sets only */
-    int *buf;
-    int cap;
-    int n, i;
 } rx_<set>_scanner_t;
 
-void <find>_init(rx_<set>_scanner_t *s, int from, int *buf, int cap);
-int  <find>_next(rx_<set>_scanner_t *s, const char *in, int len, rx_set_match_t *out);
-
-/* find_batch: the same matches, a bufferful per call. You own the buffer —
-   3 ints per match, cap matches — so declare it once and reuse it. There is no
-   capacity constant in the header. */
-void <find_batch>_init(rx_<set>_batch_scanner_t *s, int from, int *buf, int cap);
-int  <find_batch>_next(rx_<set>_batch_scanner_t *s, const char *in, int len, rx_set_match_t *out);
+int <find>_init(rx_<set>_scanner_t *s, const char *input, size_t len, size_t offset);
+int <find>(rx_<set>_scanner_t *s, rx_set_match_t *buf, size_t cap);
 
 /* only if any set in the config sets emit_name_map: true */
 const char *pattern_name(int id);
 ```
 
 ```c
-int buf[<SET>_PATTERN_COUNT * 3];
+rx_set_match_t buf[<SET>_PATTERN_COUNT];
 rx_<set>_scanner_t s;
-<find>_init(&s, 0, buf, <SET>_PATTERN_COUNT);
-rx_set_match_t m;
-while (<find>_next(&s, input, len, &m))
-    printf("%d %d..%d\n", m.pattern_id, m.start, m.end);
+if (<find>_init(&s, input, len, 0) != 0) { /* RX_ERR_* */ }
+for (int n; (n = <find>(&s, buf, <SET>_PATTERN_COUNT)) > 0; )
+    for (int i = 0; i < n; i++)
+        printf("%d %td..%td\n", buf[i].pattern_id, buf[i].start, buf[i].end);
 ```
 
-Scanner state is **caller-owned**, so two scans can be in flight at once and
-re-initialising the struct restarts one. The `out_ids` arrays for
-`<match_all>`/`<scan_all>` must hold `<SET>_ID_SPACE` ints.
+**`find` is fill-and-count, not an iterator.** C has no iterator protocol, and
+the raw ABI already fills a buffer and returns a count — which is also the C
+idiom (`read`, `getdents`, `recv`). One call reports every match at the FIRST
+position at or after the scanner's offset (they all share that start) and
+returns how many. `0` means the scan is finished.
 
-The tuple buffer is caller-owned for the same reason `find_batch`'s is: a header
-with no allocator can only own storage whose size is fixed at compile time, and
-`<SET>_PATTERN_COUNT` tuples of a several-thousand-pattern set is tens of
-kilobytes buried in a struct you are invited to put on the stack. Declare it
-once and reuse it. **Unlike `find_batch`, this buffer has a minimum**:
-`<SET>_PATTERN_COUNT` matches, which is one position's worst case, since every
-pattern can report once at a single start. `find` is transactional — a position
-whose matches do not all fit records no gate and delivers nothing — so a
-scanner initialised with a smaller `cap` yields nothing at all rather than a
-partial scan. The `gates` array stays inside the struct: its length is a size
-the compiler knows, not one you pick.
+The return is the position's TOTAL, which may exceed `cap`: the underlying call
+is transactional, so it writes `min(total, cap)`, records no gate and does not
+advance, and `n > cap` means "grow and call again, same position". Sizing `cap`
+at `<SET>_PATTERN_COUNT` — one position's worst case, since every pattern can
+report once at a single start — makes overflow impossible.
+
+**The scanner holds the input** (not just the position). The input never
+changes during a scan while the position changes every step, so the old split
+was backwards, and it let a caller pass a DIFFERENT buffer on a later step with
+the stored position silently indexing into it.
+
+**`_init` returns `int`**: `0` on success, a negative `RX_ERR_*` otherwise —
+the dominant C convention for operation status (`pthread_*`, `close`,
+`fclose`). It validates the pointers and that `len`, `offset` and `cap` fit
+INT32_MAX, since the FFI imports are i32. It does NOT reject `len == 0` (an
+empty input is a legitimate scan — `a*`, `(?:)`, `x?`, `\A\z` all match it) and
+it does NOT reject `offset > len`, which the ABI defines as "nothing found".
+
+Scanner state is **caller-owned**, so two scans can be in flight at once and
+re-initialising the struct restarts one. The `gates` array stays inside the
+struct: its length is a size the compiler knows, not one you pick.
+
+**The `_all` arrays carry their size in the type.** `int patterns[static
+<SET>_PATTERN_COUNT]` is C99 for "the caller must pass at least this many
+elements": GCC and Clang diagnose a smaller array at the call site, it rules
+out `NULL`, and it self-documents. The size is `<SET>_PATTERN_COUNT` and not
+`<SET>_ID_SPACE` because the body appends one entry per set bit and only
+patterns IN the set have bits — `ID_SPACE` remains correct for everything
+indexed BY an id, and this is a list of ids rather than an id-indexed array.
+
+**Re-entrancy is not thread-safety.** Removing the last mutable static makes
+these calls re-entrant, but the Backtracking engine keeps its stack and its
+BitState memo at fixed addresses inside the module, so BT-compiled patterns
+stay non-reentrant at the WASM level.
 
 The two constants differ for a named subset: `<SET>_PATTERN_COUNT` counts the
 set's patterns and sizes the tuple buffer, while `<SET>_ID_SPACE` is one past
 the largest id the set can report and sizes everything indexed *by* an id — the
-`gates` array and the `out_ids` arrays above. A set holding two late-declared
+`gates` array and the `_all` bitmap. A set holding two late-declared
 patterns has a count of 2 and a much larger id space.
 
 `pattern_name` is a single shared lookup across every set in the config
@@ -223,25 +249,14 @@ that requested `emit_name_map: true`, not one per set.
 
 ---
 
-### `find_batch` — the same matches, a bufferful per call
+### Batching is a JS/TS-only hint
 
-`find` crosses the host boundary once per matching position. `find_batch`
-reports the same matches in the same order but fills **your** buffer with as
-many consecutive positions as fit, so a caller who will consume the whole scan
-crosses once per bufferful instead. Use `find` when you may stop early — a
-batch call does the work for matches you never look at.
-
-The two are independent capabilities; declare either, both, or neither.
-
-You own the buffer: allocate one and reuse it for every scan, so batched
-iteration allocates nothing in the steady state. Its length is the batch size,
-capped at `<SET>_BATCH_MAX_COUNT`; a zero-length buffer yields nothing. Any
-length of 1 or more makes progress — a position whose matches do not all fit is
-delivered in part and resumed inside. Because of that, group by the match's
-`start` field rather than by call boundary if you need per-position grouping.
-
-The gate array and the resume cursor stay stub-owned and never appear in the
-public surface; only the buffer is yours, because only its size is your choice.
+`hints: [batch-find]` is a **no-op for C**, as it is for Go, Rust and
+AssemblyScript. Batching amortises host-boundary crossings and nothing else,
+and a C stub is compiled to wasm and merged, so its call into the module is a
+direct call inside one module with no boundary to amortise. There is no
+`find_batch` function and no batch scanner type; `find` is the whole positional
+surface.
 
 ## Notes
 

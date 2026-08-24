@@ -55,8 +55,7 @@ func genASSetSection(cfg config.BuildConfig) string {
 	}
 	var out strings.Builder
 	out.WriteString("\n// ---- set composition wrappers ----\n\n")
-	out.WriteString("class SetMatch { constructor(public patternId: i32, public start: i32, public end: i32) {} }\n")
-	out.WriteString("class SetAnchor { constructor(public patternId: i32, public start: i32) {} }\n\n")
+	out.WriteString("class SetMatch { constructor(public patternId: i32, public start: u32, public end: u32) {} }\n")
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
@@ -67,23 +66,9 @@ func genASSetSection(cfg config.BuildConfig) string {
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the iterator can\n// receive at most this many matches at one position.\nexport const %s: i32 = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: i32 = %d;\n\n", s.Name, idKonst, idN)
 
-		if s.FindBatch != "" {
-			fmt.Fprintf(&out, "// Width of the count field in set %q's find_batch cursor. The count is\n// packed & ((1 << bits) - 1); the scan is finished when the top 32 bits of\n// the cursor are all ones. Only a direct WASM caller needs this — the\n// generated iterator decodes the cursor for you.\nexport const %s: i32 = %d;\n\n",
-				s.Name, screamingCase(s.Name)+"_BATCH_COUNT_BITS", cursorCountBits(s, cfg))
-			fmt.Fprintf(&out, "// Largest tuple count one find_batch call can report for set %q. The module\n// clamps out_cap to it.\nexport const %s: i32 = %d;\n\n",
-				s.Name, screamingCase(s.Name)+"_BATCH_MAX_COUNT", cursorMaxCount(s, cfg))
-		}
 
 		decl := func(name, sig string) {
 			fmt.Fprintf(&out, "@external(%q, %q)\ndeclare function ffi_%s%s;\n\n", cfg.ImportModule, name, name, sig)
-		}
-		if s.Match != "" {
-			decl(s.Match, "(ptr: usize, len: i32): i32")
-			fmt.Fprintf(&out, `/** True when some pattern in the set matches the WHOLE input. */
-export function %s(input: ArrayBuffer): bool {
-    return ffi_%s(changetype<usize>(input), input.byteLength) != 0;
-}
-`, s.Match, s.Match)
 		}
 		if s.MatchAny != "" {
 			decl(s.MatchAny, "(ptr: usize, len: i32): i32")
@@ -117,31 +102,23 @@ export function %s(input: ArrayBuffer): Array<i32> {
 `, s.MatchAll, s.MatchAll, idKonst)
 			}
 		}
-		if s.Scan != "" {
-			decl(s.Scan, "(ptr: usize, len: i32, from: i32): i32")
-			fmt.Fprintf(&out, `/** True when some pattern matches at a position at or after `+"`from`"+`. */
-export function %s(input: ArrayBuffer, from: i32): bool {
-    return ffi_%s(changetype<usize>(input), input.byteLength, from) != 0;
-}
-`, s.Scan, s.Scan)
-		}
 		if s.ScanAny != "" {
-			decl(s.ScanAny, "(ptr: usize, len: i32, from: i32): i64")
-			fmt.Fprintf(&out, `/** Pattern id and start of the FIRST matching position at or after `+"`from`"+`. */
-export function %s(input: ArrayBuffer, from: i32): SetAnchor | null {
-    const packed = ffi_%s(changetype<usize>(input), input.byteLength, from);
-    if (packed < 0) return null;
-    return new SetAnchor(i32(packed & 0xFFFFFFFF), i32(packed >> 32));
+			decl(s.ScanAny, "(ptr: usize, len: i32, from: i32): i32")
+			fmt.Fprintf(&out, `/** One pattern id matching somewhere at or after `+"`offset`"+`, or -1.
+ *  Which id you get is unspecified when several patterns match; no position
+ *  is reported. */
+export function %s(input: ArrayBuffer, offset: u32): i32 {
+    return ffi_%s(changetype<usize>(input), input.byteLength, i32(offset));
 }
 `, s.ScanAny, s.ScanAny)
 		}
 		if s.ScanAll != "" {
 			if wide {
 				decl(s.ScanAll, "(ptr: usize, len: i32, from: i32, out: usize): i32")
-				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`from`"+`. */
-export function %s(input: ArrayBuffer, from: i32): Array<i32> {
+				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`offset`"+`. */
+export function %s(input: ArrayBuffer, offset: u32): Array<i32> {
     const bits = new StaticArray<u8>((%s + 7) >> 3);
-    ffi_%s(changetype<usize>(input), input.byteLength, from, changetype<usize>(bits));
+    ffi_%s(changetype<usize>(input), input.byteLength, i32(offset), changetype<usize>(bits));
     const out = new Array<i32>();
     for (let k = 0; k < %s; k++) if (bits[k >> 3] & (1 << (k & 7))) out.push(k);
     return out;
@@ -149,9 +126,9 @@ export function %s(input: ArrayBuffer, from: i32): Array<i32> {
 `, s.ScanAll, idKonst, s.ScanAll, idKonst)
 			} else {
 				decl(s.ScanAll, "(ptr: usize, len: i32, from: i32): i64")
-				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`from`"+`. */
-export function %s(input: ArrayBuffer, from: i32): Array<i32> {
-    const mask = ffi_%s(changetype<usize>(input), input.byteLength, from);
+				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`offset`"+`. */
+export function %s(input: ArrayBuffer, offset: u32): Array<i32> {
+    const mask = ffi_%s(changetype<usize>(input), input.byteLength, i32(offset));
     const out = new Array<i32>();
     for (let k = 0; k < %s; k++) if ((mask >> i64(k)) & 1) out.push(k);
     return out;
@@ -181,9 +158,9 @@ export class %[1]s {
     private n: i32 = 0;
     private i: i32 = 0;
     private buf: StaticArray<i32>;
-%[2]s    constructor(input: ArrayBuffer, from: i32) {
+%[2]s    constructor(input: ArrayBuffer, offset: u32) {
         this.input = input;
-        this.from = from;
+        this.from = i32(offset);
         this.buf = new StaticArray<i32>(%[3]s * 3);
 %[4]s    }
     next(): SetMatch | null {
@@ -191,7 +168,7 @@ export class %[1]s {
             if (this.i < this.n) {
                 const o = this.i * 3;
                 this.i++;
-                return new SetMatch(this.buf[o], this.buf[o + 1], this.buf[o + 2]);
+                return new SetMatch(this.buf[o], u32(this.buf[o + 1]), u32(this.buf[o + 2]));
             }
             if (this.done) return null;
             const got = ffi_%[5]s(changetype<usize>(this.input), this.input.byteLength, this.from,
@@ -205,84 +182,11 @@ export class %[1]s {
     }
 }
 
-/** Starts a scan at `+"`from`"+`. Each next() call returns one match. */
-export function %[5]s(input: ArrayBuffer, from: i32): %[1]s {
-    return new %[1]s(input, from);
+/** Starts a scan at `+"`offset`"+`. Each next() call returns one match. */
+export function %[5]s(input: ArrayBuffer, offset: u32): %[1]s {
+    return new %[1]s(input, offset);
 }
 `, iterName, gateField, konst, gateInit, s.Find, gateArg)
-		}
-		if s.FindBatch != "" {
-			iterName := config.PascalCaseForValidation(s.FindBatch) + "Iter"
-			gateField, gateInit, gateArg := "", "", ""
-			if gatedFind(s) {
-				// Gate array stays stub-owned: its length is the emitted
-				// id-space constant, not a size the caller chooses.
-				decl(s.FindBatch, "(ptr: usize, len: i32, cursor: i64, gates: usize, out: usize, cap: i32): i64")
-				gateField = "    gates: StaticArray<u32>;\n"
-				gateInit = "        this.gates = new StaticArray<u32>(" + idKonst + ");\n"
-				gateArg = "changetype<usize>(this.gates), "
-			} else {
-				decl(s.FindBatch, "(ptr: usize, len: i32, cursor: i64, out: usize, cap: i32): i64")
-			}
-			fmt.Fprintf(&out, `/**
- * Iterator over the set's matches, refilling the CALLER'S buffer a bufferful at
- * a time: one WASM call per bufferful instead of one per position. Same matches
- * in the same order as the unbatched find. Prefer it when the whole scan will be
- * consumed; prefer find when you may stop early, since a batch call does the
- * work for matches you never look at.
- *
- * buf holds 3 i32 per match, so its capacity is buf.length / 3, capped at
- * %[6]d. The buffer is borrowed: allocate one and reuse it for every scan.
- * next() returns null when exhausted.
- */
-export class %[1]s {
-    private input: ArrayBuffer;
-    private buf: StaticArray<i32>;
-    private cursor: i64;
-    private cap: i32;
-    private done: bool = false;
-    private n: i32 = 0;
-    private i: i32 = 0;
-%[2]s    constructor(input: ArrayBuffer, from: i32, buf: StaticArray<i32>) {
-        // The clamp lands in a LOCAL first: AssemblyScript's definite-assignment
-        // check rejects reading this.buf before every field is initialised.
-        let c: i32 = buf.length / 3;
-        if (c > %[6]d) c = %[6]d;
-        this.input = input;
-        this.buf = buf;
-        this.cursor = (<i64>from) << 32;
-        this.cap = c;
-        if (c < 1) this.done = true;
-%[3]s    }
-    next(): SetMatch | null {
-        while (true) {
-            if (this.i < this.n) {
-                const o = this.i * 3;
-                this.i++;
-                return new SetMatch(this.buf[o], this.buf[o + 1], this.buf[o + 2]);
-            }
-            if (this.done) return null;
-            const packed = ffi_%[4]s(changetype<usize>(this.input), this.input.byteLength, this.cursor,
-                %[5]schangetype<usize>(this.buf), this.cap);
-            // The cursor is opaque: hand it back unchanged. Only its top 32
-            // bits are public — all ones means the scan is finished, and that
-            // arrives on the same call as the last matches.
-            this.n = <i32>(packed & %[7]d);
-            this.i = 0;
-            if ((packed >>> 32) == 0xFFFFFFFF) this.done = true;
-            this.cursor = packed;
-            // A call reports at least one match unless the scan is over.
-            if (this.n == 0) { this.done = true; return null; }
-        }
-    }
-}
-
-/** Starts a batched scan at `+"`from`"+` over the caller's buffer. */
-export function %[4]s(input: ArrayBuffer, from: i32, buf: StaticArray<i32>): %[1]s {
-    return new %[1]s(input, from, buf);
-}
-`, iterName, gateField, gateInit, s.FindBatch, gateArg,
-				cursorMaxCount(s, cfg), cursorCountMask(s, cfg))
 		}
 		out.WriteString("\n")
 	}
@@ -361,15 +265,15 @@ func genASFindStub(importModule, funcName string) string {
 	fmt.Fprintf(&sb, " *  that can match empty needs the guard, or offset never moves:\n")
 	fmt.Fprintf(&sb, " *    const s = i32(<u64>r >> 32), e = i32(<u32>r);\n")
 	fmt.Fprintf(&sb, " *    offset = e > s ? e : s + 1; */\n")
-	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer, offset: i32): i64 {\n", funcName)
+	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer, offset: u32): i64 {\n", funcName)
 	sb.WriteString("  const len = input.byteLength;\n")
-	sb.WriteString("  if (offset > len) return -1;\n")
+	sb.WriteString("  if (offset > u32(len)) return -1;\n")
 	fmt.Fprintf(&sb, "  const r = %s(changetype<usize>(input) + <usize>offset, <usize>(len - offset));\n", ffi)
 	fmt.Fprintf(&sb, "  if (r == %d) throw new Error(\"%s\");\n", btOverflow, btOverflowMsg(funcName))
 	sb.WriteString("  if (r < 0) return -1;\n")
 	sb.WriteString("  const relStart = i32(<u64>r >> 32);\n")
 	sb.WriteString("  const relEnd   = i32(<u32>r);\n")
-	sb.WriteString("  return (i64(offset + relStart) << 32) | i64(offset + relEnd);\n")
+	sb.WriteString("  return (i64(i32(offset) + relStart) << 32) | i64(i32(offset) + relEnd);\n")
 	sb.WriteString("}\n\n")
 	return sb.String()
 }
@@ -393,9 +297,9 @@ func genASGroupsStub(importModule, funcName, exportName string, numGroups int) s
 	fmt.Fprintf(&sb, " *  To iterate non-overlapping matches, advance past each match; a pattern\n")
 	fmt.Fprintf(&sb, " *  that can match empty needs the guard, or offset never moves:\n")
 	fmt.Fprintf(&sb, " *    offset = slots[1] > slots[0] ? slots[1] : slots[0] + 1; */\n")
-	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer, offset: i32): i32 {\n", funcName)
+	fmt.Fprintf(&sb, "export function %s(input: ArrayBuffer, offset: u32): u32 {\n", funcName)
 	sb.WriteString("  const len = input.byteLength;\n")
-	sb.WriteString("  if (offset > len) return 0;\n")
+	sb.WriteString("  if (offset > u32(len)) return 0;\n")
 	fmt.Fprintf(&sb, "  %s.fill(-1);\n", slotsVar)
 	fmt.Fprintf(&sb, "  const r = %s(\n", ffi)
 	sb.WriteString("    changetype<usize>(input) + <usize>offset,\n")
@@ -405,9 +309,34 @@ func genASGroupsStub(importModule, funcName, exportName string, numGroups int) s
 	fmt.Fprintf(&sb, "  if (r == %d) throw new Error(\"%s\");\n", btOverflow, btOverflowMsg(funcName))
 	sb.WriteString("  if (r < 0) return 0;\n")
 	fmt.Fprintf(&sb, "  for (let i = 0; i < %d; i++) {\n", slotCount)
-	fmt.Fprintf(&sb, "    if (%s[i] >= 0) %s[i] += offset;\n", slotsVar, slotsVar)
+	fmt.Fprintf(&sb, "    if (%s[i] >= 0) %s[i] += i32(offset);\n", slotsVar, slotsVar)
 	sb.WriteString("  }\n")
-	fmt.Fprintf(&sb, "  return i32(%s.dataStart);\n", slotsVar)
+	fmt.Fprintf(&sb, "  return u32(%s.dataStart);\n", slotsVar)
+	sb.WriteString("}\n\n")
+
+	// <FUNC>_GROUPS and <func>_capture: AS has no named groups (the generator
+	// errors if named_groups_func is set), so captures are addressed purely by
+	// arithmetic — load<i32>(slots + 8*g) twice and hand-roll a UTF-8 decode.
+	// These make bounds-checking and looping over all groups possible at all.
+	//
+	// _capture takes `input` again ON PURPOSE: the slots are offsets, so
+	// decoding needs the buffer. A stub that remembered the last input would
+	// be exactly the mutable-static pattern C decision (8) removes, and would
+	// break the moment two scans interleave. The raw offsets stay reachable,
+	// so this is additive.
+	fmt.Fprintf(&sb, "export const %s_GROUPS: i32 = %d;\n\n", toUpperIdent(funcName), numGroups)
+	fmt.Fprintf(&sb, "/** Decoded text of capture group g (0 = whole match) from a slots pointer\n"+
+		" *  returned by %s, or null when the group did not participate OR g is out\n"+
+		" *  of range. Those are different errors and this return does not\n"+
+		" *  distinguish them: an empty capture is legal, so the empty string cannot\n"+
+		" *  separate them either, and %s_GROUPS lets a caller bound-check without\n"+
+		" *  calling. */\n", funcName, toUpperIdent(funcName))
+	fmt.Fprintf(&sb, "export function %s_capture(input: ArrayBuffer, slots: u32, g: i32): string | null {\n", funcName)
+	fmt.Fprintf(&sb, "  if (slots == 0 || g < 0 || g >= %s_GROUPS) return null;\n", toUpperIdent(funcName))
+	sb.WriteString("  const s = load<i32>(usize(slots) + usize(8 * g));\n")
+	sb.WriteString("  const e = load<i32>(usize(slots) + usize(8 * g + 4));\n")
+	sb.WriteString("  if (s < 0 || e < s) return null;\n")
+	sb.WriteString("  return String.UTF8.decode(input.slice(s, e));\n")
 	sb.WriteString("}\n\n")
 	return sb.String()
 }

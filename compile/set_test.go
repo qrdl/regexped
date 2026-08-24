@@ -1471,7 +1471,7 @@ func TestACBudget(t *testing.T) {
 			patterns = append(patterns, info)
 			ids = append(ids, i)
 		}
-		return SetSpec{Name: "s", Scan: "scan", Patterns: patterns, PatternIDs: ids}, &prefixPool, &suffixPool
+		return SetSpec{Name: "s", ScanAny: "scan", Patterns: patterns, PatternIDs: ids}, &prefixPool, &suffixPool
 	}
 
 	// (1) The default budget holds the AC-selecting shape at every count that
@@ -1553,7 +1553,7 @@ func TestACOutputOverflow(t *testing.T) {
 			patterns = append(patterns, info)
 			ids = append(ids, i)
 		}
-		return SetSpec{Name: "s", Scan: "scan", Patterns: patterns, PatternIDs: ids}, &prefixPool, &suffixPool
+		return SetSpec{Name: "s", ScanAny: "scan", Patterns: patterns, PatternIDs: ids}, &prefixPool, &suffixPool
 	}
 
 	// The arithmetic the constant rests on, asserted directly so a change to
@@ -2138,7 +2138,7 @@ func TestSetMatch_Anchored_ValidWASM(t *testing.T) {
 			{Name: "ins", Pattern: `(?i)^\s*INSERT\s+INTO\b`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "sql", Match: "validate_sql", Patterns: config.PatternSelector{All: true}},
+			{Name: "sql", MatchAny: "validate_sql", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2167,7 +2167,7 @@ func TestSetMatch_Anchored_BothExports(t *testing.T) {
 			{Name: "p2", Pattern: `bar\w+`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "both", Find: "find_all_fn", Match: "match_fn", Patterns: config.PatternSelector{All: true}},
+			{Name: "both", Find: "find_all_fn", MatchAny: "match_fn", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2184,7 +2184,7 @@ func TestSetMatch_Anchored_SQLValidator_Fixture(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: make([]config.RegexEntry, len(fix.Patterns)),
 		Sets: []config.SetConfig{
-			{Name: "sql", Match: "validate_sql", Patterns: config.PatternSelector{All: true}},
+			{Name: "sql", MatchAny: "validate_sql", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	for i, p := range fix.Patterns {
@@ -2209,7 +2209,7 @@ func TestSetMatch_Anchored_FixedLenPrefix(t *testing.T) {
 			{Name: "p2", Pattern: `[a-z]{2}bar`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2230,7 +2230,7 @@ func TestSetMatch_Anchored_VarLenEmptySuffix(t *testing.T) {
 			{Name: "p1", Pattern: `\d+foo`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2251,7 +2251,7 @@ func TestSetMatch_Anchored_VarLenNonEmptySuffix(t *testing.T) {
 			{Name: "p1", Pattern: `\d+foo\d+`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2272,7 +2272,7 @@ func TestSetMatch_Anchored_LargeFallback(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: make([]config.RegexEntry, n),
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", MatchAny: "m", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	for i := 0; i < n; i++ {
@@ -2298,7 +2298,7 @@ func TestSetMatch_Anchored_NoLiteralFallback_Large(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: make([]config.RegexEntry, n),
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", MatchAny: "m", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	// Patterns with no mandatory literal: character classes / quantified.
@@ -2327,7 +2327,7 @@ func TestSetMatch_Anchored_TrivialPrefixMultiByte(t *testing.T) {
 			{Name: "p2", Pattern: `quux.+`},   // literal "quux" at offset 0
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", MatchAny: "m", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2351,7 +2351,7 @@ func TestSetMatch_Anchored_VarLenEmpty(t *testing.T) {
 			{Name: "p2", Pattern: `[xy]{0,3}bar`}, // bounded varlen prefix, empty suffix
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2374,7 +2374,7 @@ func TestSetMatch_Anchored_VarLenNonEmpty(t *testing.T) {
 			{Name: "p2", Pattern: `[cd]{0,2}bar[zz]`}, // bounded varlen prefix, non-empty suffix
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -2513,7 +2513,7 @@ func TestCompileFile_Embedded(t *testing.T) {
 func TestValidateSets_MatchOnly(t *testing.T) {
 	cfg := &config.BuildConfig{
 		Regexps: []config.RegexEntry{{Name: "p", Pattern: "foo"}},
-		Sets:    []config.SetConfig{{Name: "s", Match: "validate", Patterns: config.PatternSelector{All: true}}},
+		Sets:    []config.SetConfig{{Name: "s", MatchAny: "validate", Patterns: config.PatternSelector{All: true}}},
 	}
 	if err := config.ValidateSets(cfg); err != nil {
 		t.Errorf("ValidateSets match-only set: %v", err)
@@ -3015,7 +3015,7 @@ func TestSetMatch_ZeroWidthNonNilPrefix(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: []config.RegexEntry{{Name: "p", Pattern: `\bfoo`}},
 		Sets: []config.SetConfig{
-			{Name: "s", Match: "s_match", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", MatchAny: "s_match", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -3040,8 +3040,8 @@ func TestSetMatch_ZeroWidthNonNilPrefix(t *testing.T) {
 // another, so a plain bytes.Contains check cannot confuse "cap_scan" with
 // "cap_scan_any".
 var setCapNames = map[string]string{
-	"match": "zmatchz", "match_any": "zmatchanyz", "match_all": "zmatchallz",
-	"scan": "zscanz", "scan_any": "zscananyz", "scan_all": "zscanallz",
+	"match_any": "zmatchanyz", "match_all": "zmatchallz",
+	"scan_any": "zscananyz", "scan_all": "zscanallz",
 	"find": "zfindz",
 }
 
@@ -3060,14 +3060,10 @@ func setConfigWith(patterns []string, overlapping bool, caps ...string) config.B
 	}
 	for _, c := range caps {
 		switch c {
-		case "match":
-			sc.Match = setCapNames[c]
 		case "match_any":
 			sc.MatchAny = setCapNames[c]
 		case "match_all":
 			sc.MatchAll = setCapNames[c]
-		case "scan":
-			sc.Scan = setCapNames[c]
 		case "scan_any":
 			sc.ScanAny = setCapNames[c]
 		case "scan_all":
@@ -3083,25 +3079,23 @@ func setConfigWith(patterns []string, overlapping bool, caps ...string) config.B
 
 func TestSetCapabilityMatrix(t *testing.T) {
 	pats := []string{`AKIA[A-Z0-9]{4}`, `ghp_[a-z]+`, `a*`, `\bcat\b`, `(?m:^)log`}
-	all := []string{"match", "match_any", "match_all", "scan", "scan_any", "scan_all", "find"}
+	all := []string{"match_any", "match_all", "scan_any", "scan_all", "find"}
 
 	rows := []struct {
 		name        string
 		caps        []string
 		overlapping bool
 	}{
-		{"match-only", []string{"match"}, false},
 		{"match_any-only", []string{"match_any"}, false},
 		{"match_all-only", []string{"match_all"}, false},
-		{"scan-only", []string{"scan"}, false},
 		{"scan_any-only", []string{"scan_any"}, false},
 		{"scan_all-only", []string{"scan_all"}, false},
 		{"find-only-gated", []string{"find"}, false},
 		{"find-only-overlapping", []string{"find"}, true},
-		{"scan_any-without-find", []string{"scan_any", "scan"}, false},
+		{"scan_any-without-find", []string{"scan_any", "scan_all"}, false},
 		{"scan_any-with-find", []string{"scan_any", "find"}, false},
-		{"all-seven-gated", all, false},
-		{"all-seven-overlapping", all, true},
+		{"all-gated", all, false},
+		{"all-overlapping", all, true},
 	}
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
@@ -3640,51 +3634,54 @@ func TestSetFindBatch_Emission(t *testing.T) {
 	}
 	all := config.PatternSelector{All: true}
 
-	t.Run("batch_only", func(t *testing.T) {
-		// find_batch does not imply find: the batch export must be there and
-		// the find export must not.
-		w := build(config.SetConfig{Name: "s", FindBatch: "fb", Patterns: all})
-		if !bytes.Contains(w, []byte("fb")) {
-			t.Error("find_batch export missing from a find_batch-only set")
-		}
-		if bytes.Contains(w, []byte("plain_find")) {
-			t.Error("a find_batch-only set exported a find")
-		}
-	})
+	batchHint := []string{"batch-find"}
 
-	t.Run("both", func(t *testing.T) {
-		w := build(config.SetConfig{Name: "s", Find: "plain_find", FindBatch: "fb", Patterns: all})
-		for _, name := range []string{"plain_find", "fb"} {
+	t.Run("hint_adds_the_batch_export_alongside_find", func(t *testing.T) {
+		// Decision (11): batching is a property of `find`, not a capability.
+		// The hint adds the synthesized export; `find` itself stays exported.
+		w := build(config.SetConfig{Name: "s", Find: "plain_find", Hints: batchHint, Patterns: all})
+		for _, name := range []string{"plain_find", "plain_find_batch"} {
 			if !bytes.Contains(w, []byte(name)) {
-				t.Errorf("export %q missing when both capabilities are declared", name)
+				t.Errorf("export %q missing from a batching set", name)
 			}
 		}
 		assertDataSectionConsistent(t, w)
 	})
 
+	t.Run("no_hint_emits_no_batch_export", func(t *testing.T) {
+		w := build(config.SetConfig{Name: "s", Find: "plain_find", Patterns: all})
+		if bytes.Contains(w, []byte("plain_find_batch")) {
+			t.Error("a set without the hint must not carry the batch export")
+		}
+	})
+
 	t.Run("overlapping", func(t *testing.T) {
 		// The ungated body takes §19's skip parameter on its suffix functions;
 		// this is the path with no gate array to resume a split position with.
-		w := build(config.SetConfig{Name: "s", Find: "plain_find", FindBatch: "fb", Overlapping: true, Patterns: all})
-		if !bytes.Contains(w, []byte("fb")) {
-			t.Error("find_batch export missing from an overlapping set")
+		w := build(config.SetConfig{Name: "s", Find: "plain_find", Hints: batchHint, Overlapping: true, Patterns: all})
+		if !bytes.Contains(w, []byte("plain_find_batch")) {
+			t.Error("batch export missing from an overlapping set")
 		}
 		assertDataSectionConsistent(t, w)
 	})
 
-	t.Run("undeclared_is_unchanged", func(t *testing.T) {
-		// D6's rule one level up: a set that does not declare find_batch must
-		// compile to exactly what it compiled to before find_batch existed.
-		// Byte identity against the same set built through the same path is the
-		// strongest available statement of that here.
+	t.Run("unhinted_is_unchanged", func(t *testing.T) {
+		// D6's rule one level up: a set that does not ask for batching must
+		// compile to exactly what it compiled to before batching existed.
 		a := build(config.SetConfig{Name: "s", Find: "plain_find", Patterns: all})
 		b := build(config.SetConfig{Name: "s", Find: "plain_find", Patterns: all})
 		if !bytes.Equal(a, b) {
 			t.Fatal("compilation is not deterministic; the comparison below is meaningless")
 		}
-		c := build(config.SetConfig{Name: "s", Find: "plain_find", FindBatch: "fb", Patterns: all})
+		c := build(config.SetConfig{Name: "s", Find: "plain_find", Hints: batchHint, Patterns: all})
 		if len(c) <= len(a) {
-			t.Errorf("declaring find_batch did not add code: %d bytes vs %d", len(c), len(a))
+			t.Errorf("the hint did not add code: %d bytes vs %d", len(c), len(a))
+		}
+		// Decision (11a): the batch entry WRAPS the ordinary find rather than
+		// re-emitting the bucket code, so the cost is the resume loop and a
+		// wrapper, not a second copy of the body.
+		if grew := len(c) - len(a); grew > len(a) {
+			t.Errorf("batching more than doubled the module (%d -> %d); the worker is not being shared", len(a), len(c))
 		}
 	})
 }

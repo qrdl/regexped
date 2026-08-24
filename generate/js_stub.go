@@ -57,21 +57,11 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the find generator\n// can receive at most this many matches at one position.\nexport const %s = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s = %d;\n\n", s.Name, idKonst, idN)
 
-		if s.FindBatch != "" {
-			fmt.Fprintf(&out, "// Width of the count field in set %q's find_batch cursor. The count is\n// packed & ((1n << BigInt(bits)) - 1n); the scan is finished when the top 32\n// bits of the cursor are all ones. Only a direct WASM caller needs this — the\n// generated iterator decodes the cursor for you.\nexport const %s = %d;\n\n",
-				s.Name, camelSet(s.Name)+"BatchCountBits", cursorCountBits(s, cfg))
-			fmt.Fprintf(&out, "// Largest tuple count one find_batch call can report for set %q. The module\n// clamps out_cap to it.\nexport const %s = %d;\n\n",
-				s.Name, camelSet(s.Name)+"BatchMaxCount", cursorMaxCount(s, cfg))
+		if s.BatchFind() {
+			fmt.Fprintf(&out, "// Largest batchSize %s accepts for set %q. It is the cursor layout's\n// limit, not a policy: one i64 carries the resume position in its top 32\n// bits and splits the low 32 between the intra-position index and the count.\n// It never binds in practice — this many tuples is a multi-megabyte buffer.\nexport const %s = %d;\n\n",
+				s.Find, s.Name, camelSet(s.Name)+"BatchMaxSize", cursorMaxCount(s, cfg))
 		}
 
-		if s.Match != "" {
-			fmt.Fprintf(&out, `// -> boolean
-export function %s(input) {
-    const len = _w(input);
-    return _exp['%s'](_inBase, len) !== 0;
-}
-`, s.Match, s.Match)
-		}
 		if s.MatchAny != "" {
 			fmt.Fprintf(&out, `// -> number | null   (a pattern id, NOT a boolean)
 export function %s(input) {
@@ -109,21 +99,12 @@ export function %s(input) {
 `, s.MatchAll, s.MatchAll, idKonst)
 			}
 		}
-		if s.Scan != "" {
-			fmt.Fprintf(&out, `// -> boolean
-export function %s(input, from = 0) {
-    const len = _w(input);
-    return _exp['%s'](_inBase, len, from) !== 0;
-}
-`, s.Scan, s.Scan)
-		}
 		if s.ScanAny != "" {
-			fmt.Fprintf(&out, `// -> { patternId, start } | null   (NOT a boolean)
+			fmt.Fprintf(&out, `// -> pattern id | null   (NOT a boolean, and NO position)
 export function %s(input, from = 0) {
     const len = _w(input);
-    const packed = _exp['%s'](_inBase, len, from);
-    if (packed < 0n) return null;
-    return { patternId: Number(packed & 0xFFFFFFFFn), start: Number(packed >> 32n) };
+    const id = _exp['%s'](_inBase, len, from);
+    return id < 0 ? null : id;
 }
 `, s.ScanAny, s.ScanAny)
 		}
@@ -163,10 +144,15 @@ export function %s(input, from = 0) {
 				gateDoc = "// The generator owns the gate array for its lifetime: dropping it and\n" +
 					"// creating a new one restarts the scan with clean gates.\n"
 			}
-			fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }
-%sexport function* %s(input, from = 0) {
+			if !s.BatchFind() {
+				// No `batch-find` hint: no batchSize parameter at all, so TS
+				// rejects find(input, 0, 64) at build time and JS ignores it
+				// the way it ignores any extra argument. One WASM call per
+				// matching position.
+				fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }
+%sexport function* %s(input, offset = 0) {
     const len = _w(input, %d);
-%s    let pos = from;
+%s    let pos = offset;
     // Hoisted: _mem.buffer and _outBase are loop-invariant, and the input is
     // staged once above, so nothing can detach this view mid-scan. Building it
     // per call allocated one typed array per matching position.
@@ -185,37 +171,32 @@ export function %s(input, from = 0) {
     }
 }
 `, gateDoc, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst)
-		}
-		if s.FindBatch != "" {
-			// The batch buffer is sized at RUNTIME from the caller's capacity,
-			// so the reserve, the gate base and the bitmap base above it are
-			// all computed inside the generator rather than baked in.
-			gateSetup, gateArg, gateDoc := "", "", ""
-			if gatedFind(s) {
-				gateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*capacity;
+			} else {
+				// `hints: [batch-find]`: the same matches in the same order,
+				// but batchSize positions of work per host crossing. That is
+				// the ONLY difference, which is why it is a parameter rather
+				// than a second function — and why it is opt-in, since a
+				// caller who stops early has paid for matches never looked at.
+				batchGateSetup := ""
+				if gatedFind(s) {
+					batchGateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, idKonst)
-				gateArg = "gateBase, "
-				gateDoc = "// The generator owns the gate array for its lifetime: dropping it and\n" +
-					"// creating a new one restarts the scan with clean gates.\n"
-			}
-			fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }, refilled a BUFFERFUL at a
-// time: one WASM call per capacity matches instead of one per position.
+				}
+				fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }
 //
-// Same matches in the same order as the unbatched find. Prefer this when the
-// whole scan will be consumed; prefer find when you may stop early, since a
-// batch call does the work for matches you never look at.
-//
-// capacity is clamped into [1, %d].
-%sexport function* %s(input, from = 0, capacity = %d) {
-    capacity = Math.min(Math.max(capacity | 0, 1), %d);
-    const len = _w(input, 12*capacity + %d);
-%s    let cursor = BigInt(from) << 32n;
-    // Hoisted for the same reason as the unbatched find's view: _mem.buffer
-    // and _outBase are loop-invariant once the input is staged.
-    const buf = new Int32Array(_mem.buffer, _outBase, 3*capacity);
+// batchSize is how many tuples one WASM call may fill: 1 is a call per
+// matching position, larger values amortise the host crossing over a
+// bufferful. Clamped into [1, %s].
+%sexport function* %s(input, offset = 0, batchSize = %d) {
+    batchSize = Math.min(Math.max(batchSize | 0, 1), %s);
+    const len = _w(input, 12*batchSize + %d);
+%s    let cursor = BigInt(offset) << 32n;
+    // Hoisted for the same reason the per-position shape hoists its view:
+    // _mem.buffer and _outBase are loop-invariant once the input is staged.
+    const buf = new Int32Array(_mem.buffer, _outBase, 3*batchSize);
     while (true) {
-        const packed = _exp['%s'](_inBase, len, cursor, %s_outBase, capacity);
+        const packed = _exp['%s'](_inBase, len, cursor, %s_outBase, batchSize);
         // The cursor is opaque: hand it back unchanged. Only its top 32 bits
         // are public — all ones means the scan is finished, and that arrives
         // on the same call as the last matches.
@@ -229,9 +210,10 @@ export function %s(input, from = 0) {
         cursor = packed;
     }
 }
-`, cursorMaxCount(s, cfg), gateDoc, s.FindBatch, defaultBatchCap(s, cfg),
-				cursorMaxCount(s, cfg), 4*idN+bitmapBytes(s, cfg), gateSetup,
-				s.FindBatch, gateArg, cursorCountMask(s, cfg))
+`, camelSet(s.Name)+"BatchMaxSize", gateDoc, s.Find, defaultBatchCap(s, cfg),
+					camelSet(s.Name)+"BatchMaxSize", 4*idN+bitmapBytes(s, cfg), batchGateSetup,
+					config.SetBatchExportName(s.Find), gateArg, cursorCountMask(s, cfg))
+			}
 		}
 		out.WriteString("\n")
 	}
@@ -337,13 +319,12 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 // genJSMatchFunc generates a JS export for an anchored match.
 // Returns [endPos, true] on match, or [0, false] if no match.
 func genJSMatchFunc(funcName string) string {
-	return fmt.Sprintf(`// %s — anchored match; returns [endPos, true] on match or [0, false] if no match.
+	return fmt.Sprintf(`// %s — anchored match; returns the end position, or null if no match.
 export function %s(input) {
     const len = _w(input);
     const r = _exp['%s'](_inBase, len);
     if (r === %d) throw new Error("%s");
-    if (r < 0) return [0, false];
-    return [r, true];
+    return r < 0 ? null : r;
 }
 
 `, funcName, funcName, funcName, btOverflow, btOverflowMsg(funcName))
@@ -368,11 +349,11 @@ const lm2BatchCap = 256
 // need to replicate the compiler's hint-resolution logic.
 func genJSFindFunc(funcName string) string {
 	return fmt.Sprintf(`// %[1]s — yields [start, end] for each non-overlapping match.
-export function* %[1]s(input) {
+export function* %[1]s(input, offset = 0) {
     if (typeof _exp['%[1]s_batch'] === 'function') {
         const len = _w(input, %[2]d * 8);
         const outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
-        let startPos = 0;
+        let startPos = offset;
         while (true) {
             const n = _exp['%[1]s_batch'](_inBase, len, _outBase, %[2]d, startPos);
             if (n === %[3]d) throw new Error("%[4]s");
@@ -387,7 +368,7 @@ export function* %[1]s(input) {
         return;
     }
     const len = _w(input);
-    let off = 0;
+    let off = offset;
     while (off <= len) {
         const r = _exp['%[1]s'](_inBase + off, len - off);
         if (r === %[3]dn) throw new Error("%[4]s");
@@ -418,11 +399,11 @@ func genJSGroupsFunc(funcName string, numGroups int) string {
 	return fmt.Sprintf(`// %[1]s — yields capture group arrays per match.
 // Each element is [start, end] (absolute) or null for unmatched groups.
 // Index 0 is the full match.
-export function* %[1]s(input) {
+export function* %[1]s(input, offset = 0) {
     if (typeof _exp['%[1]s_batch'] === 'function') {
         const len = _w(input, %[2]d * %[4]d);
         const outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
-        let startPos = 0;
+        let startPos = offset;
         while (true) {
             const n = _exp['%[1]s_batch'](_inBase, len, _outBase, %[2]d, startPos);
             if (n === %[7]d) throw new Error("%[8]s");
@@ -448,7 +429,7 @@ export function* %[1]s(input) {
     // (_resize already ran, and nothing inside the loop grows the memory), so
     // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
-    let off = 0;
+    let off = offset;
     while (off <= len) {
         slots.fill(-1);
         const r = _exp['%[1]s'](_inBase + off, len - off, _outBase);
@@ -515,11 +496,11 @@ func genJSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 
 	return fmt.Sprintf(`// %[1]s — yields named capture group objects per match.
 // Each object maps name → [start, end] (absolute) for participating groups.
-export function* %[1]s(input) {
+export function* %[1]s(input, offset = 0) {
     if (typeof _exp['%[2]s_batch'] === 'function') {
         const len = _w(input, %[3]d * %[4]d);
         const outBuf = new Int32Array(_mem.buffer, _outBase, %[3]d * %[5]d);
-        let startPos = 0;
+        let startPos = offset;
         while (true) {
             const n = _exp['%[2]s_batch'](_inBase, len, _outBase, %[3]d, startPos);
             if (n === %[9]d) throw new Error("%[10]s");
@@ -541,7 +522,7 @@ export function* %[1]s(input) {
     // (_resize already ran, and nothing inside the loop grows the memory), so
     // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
-    let off = 0;
+    let off = offset;
     while (off <= len) {
         slots.fill(-1);
         const r = _exp['%[2]s'](_inBase + off, len - off, _outBase);

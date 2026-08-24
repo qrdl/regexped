@@ -8,11 +8,15 @@ JS_STUB     := regexp.js
 all: build
 
 # Step 1 – compile regexp patterns to WASM
-$(REGEX_WASMS): regexped.yaml
+# $(REGEXPED) is a prerequisite of every rule below that runs it: the generated
+# stubs and the compiled .wasm depend on the COMPILER as much as on the config.
+# Without it a rebuild after a compiler change keeps the stale .wasm and the
+# merge fails with an import/export type mismatch.
+$(REGEX_WASMS): regexped.yaml $(REGEXPED)
 	$(REGEXPED) compile --config=regexped.yaml
 
 # Step 2 – generate JS ES module stub
-$(JS_STUB): regexped.yaml $(REGEX_WASMS)
+$(JS_STUB): regexped.yaml $(REGEX_WASMS) $(REGEXPED)
 	$(REGEXPED) generate --config=regexped.yaml
 
 build: $(JS_STUB)

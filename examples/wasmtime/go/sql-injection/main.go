@@ -41,7 +41,7 @@ func main() {
 	}
 
 	fmt.Println("\n=== find_sqli: find injection byte ranges in application log ===")
-	for start, end := range FindSqli([]byte(appLog)) {
+	for start, end := range FindSqli([]byte(appLog), 0) {
 		snippet := appLog[start:end]
 		if len(snippet) > 60 {
 			snippet = snippet[:60] + "..."
@@ -50,7 +50,7 @@ func main() {
 	}
 
 	fmt.Println("\n=== parse_sqli: extract injection type and payload ===")
-	for fields := range ParseSqli([]byte(appLog)) {
+	for fields := range ParseSqli([]byte(appLog), 0) {
 		typeName := appLog[fields["type"][0]:fields["type"][1]]
 		payload := strings.TrimSpace(appLog[fields["payload"][0]:fields["payload"][1]])
 		fmt.Printf("  type=%-35s  payload=%s\n", typeName, payload)

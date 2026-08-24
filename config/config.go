@@ -39,37 +39,42 @@ type BuildConfig struct {
 
 // SetConfig describes one `sets:` entry in the YAML config.
 //
-// The eight capability fields form a 2x3 grid plus `find` and `find_batch`.
-// The KEY names the capability; the VALUE is the WASM export /
-// generated-function name the user picks.
+// The five capability fields are a 2x2 grid plus `find`. The KEY names the
+// capability; the VALUE is the WASM export / generated-function name the user
+// picks.
 //
 //	match_*  — anchored: the match must span the whole input (0..len).
-//	scan_*   — non-anchored: takes a `from` position.
-//	bare     — boolean answer.
+//	scan_*   — non-anchored: takes an `offset`.
 //	_any     — one arbitrary matching pattern id (a set is unordered, §3.5).
 //	_all     — every matching pattern id.
-//	find      — reports positions and extents, one position per call.
-//	find_batch — the same information, several positions per call, resumed
-//	           through an opaque cursor.  `overlapping` affects these two and
-//	           nothing else.
+//	find     — reports positions and extents.
+//
+// TWO KEYS WERE RETIRED by TODO task 59, and both are load errors rather than
+// silently-accepted no-ops (strict YAML decoding does that for free):
+//
+//   - `match:` and `scan:` — decision (2). `match_any(...) >= 0` is exactly
+//     what `match` returned and `scan_any(...) >= 0` what `scan` returned, and
+//     the redundancy measured at 1-3% of module size. They are DROPPED rather
+//     than repurposed: a surviving `match:` with match_any semantics would
+//     leave every existing config compiling while its callers silently
+//     switched from reading 0/1 to reading an id — and id 0 would read as "no
+//     match". A removed key fails at build; a redefined one fails in
+//     production.
+//   - `find_batch:` — decision (11). Batching is no longer a second
+//     capability but a property of `find`, requested with
+//     `hints: [batch-find]` on the set. At the API level the two were never
+//     distinguishable — both iterate the same matches in the same order, and
+//     the cursor and gate array are stub-owned and invisible. The only
+//     caller-visible difference is how much work one host crossing does,
+//     which is a parameter, not a name.
 type SetConfig struct {
 	Name string `yaml:"name"` // set name; must be unique within the file
 
-	Match    string `yaml:"match"`     // anchored, 0|1
 	MatchAny string `yaml:"match_any"` // anchored, pattern id or -1
 	MatchAll string `yaml:"match_all"` // anchored, bitmask / bitmap of ids
-	Scan     string `yaml:"scan"`      // non-anchored, 0|1
-	ScanAny  string `yaml:"scan_any"`  // non-anchored, (start<<32)|id, or -1
+	ScanAny  string `yaml:"scan_any"`  // non-anchored, pattern id or -1
 	ScanAll  string `yaml:"scan_all"`  // non-anchored, bitmask / bitmap of ids
-	Find     string `yaml:"find"`      // non-anchored, tuples at the next matching position
-
-	// FindBatch is `find`'s amortised sibling: one call fills the caller's
-	// buffer with the matches of SEVERAL consecutive positions and returns an
-	// opaque cursor to resume from. It is an independent
-	// capability — declaring it does not imply `find`, and vice versa — and it
-	// is emitted as a separate body, because a `find` caller may stop early
-	// and must not pay for lookahead it never consumes.
-	FindBatch string `yaml:"find_batch"`
+	Find     string `yaml:"find"`      // non-anchored, positions and extents
 
 	// Overlapping selects which `find` body is emitted. Absent or false
 	// (the DEFAULT) emits the gated body:
@@ -98,18 +103,15 @@ type SetCapability struct {
 }
 
 // Capabilities returns the set's declared capabilities in a stable order
-// (the §3.12 grid order: match, match_any, match_all, scan, scan_any,
-// scan_all, find). Undeclared capabilities are omitted.
+// (the §3.12 grid order: match_any, match_all, scan_any, scan_all, find).
+// Undeclared capabilities are omitted.
 func (s SetConfig) Capabilities() []SetCapability {
 	all := []SetCapability{
-		{"match", s.Match},
 		{"match_any", s.MatchAny},
 		{"match_all", s.MatchAll},
-		{"scan", s.Scan},
 		{"scan_any", s.ScanAny},
 		{"scan_all", s.ScanAll},
 		{"find", s.Find},
-		{"find_batch", s.FindBatch},
 	}
 	out := all[:0:0]
 	for _, c := range all {
@@ -128,13 +130,35 @@ func (s SetConfig) HasExports() bool { return len(s.Capabilities()) > 0 }
 // through the suffix functions. A set without
 // `find:` gates nothing.
 func (s SetConfig) Gated() bool {
-	return (s.Find != "" || s.FindBatch != "") && !s.Overlapping
+	return s.Find != "" && !s.Overlapping
 }
 
-// HasFind reports whether the set declares either position-reporting
-// capability. `overlapping` is meaningful only for these two, and only they
-// emit the tuple-writing suffix functions.
-func (s SetConfig) HasFind() bool { return s.Find != "" || s.FindBatch != "" }
+// HasFind reports whether the set declares the position-reporting capability.
+// `overlapping` is meaningful only for it, and only it emits the
+// tuple-writing suffix functions.
+func (s SetConfig) HasFind() bool { return s.Find != "" }
+
+// BatchFind reports whether this set asked for `find` to work several
+// positions ahead per host crossing, via `hints: [batch-find]` (TODO task 59
+// decision (11)).
+//
+// The hint is meaningless without something to batch, so it implies `find`.
+// Emission is keyed on the HINT and never on stub_type: docs/cli.md states
+// that the language-agnostic rules exist "so that changing stub_type never
+// breaks a working config", and keying a module's export surface on it would
+// break exactly that — a merged module loaded from more than one host would
+// silently lack the export.
+func (s SetConfig) BatchFind() bool {
+	if s.Find == "" {
+		return false
+	}
+	for _, h := range s.Hints {
+		if h == "batch-find" {
+			return true
+		}
+	}
+	return false
+}
 
 // SanitizeSetName turns a set name into an identifier stem for the constants
 // and types the stubs emit for it (<SET>_PATTERN_COUNT, <SET>_ID_SPACE, C's
@@ -218,6 +242,17 @@ func (s SetConfig) IDSpaceSize(cfg BuildConfig) int {
 	return max + 1
 }
 
+// SetBatchExportName is the WASM export a `hints: [batch-find]` set emits
+// alongside its `find`.
+//
+// It lives here, next to the cursor layout, for the same reason: the compiler
+// and all six stub generators must agree on it exactly, and a second
+// definition anywhere is a module whose stub calls an export that does not
+// exist. It is derived rather than configured because decision (11) hides
+// batching behind `find`'s optional batchSize parameter — the user never
+// writes this name.
+func SetBatchExportName(find string) string { return find + "_batch" }
+
 // SetCursorKBits returns how many bits the §19 find_batch cursor reserves for
 // its intra-position resume index, for a set of patternCount patterns: the
 // smallest width holding every value in [0, patternCount].
@@ -285,19 +320,24 @@ func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error
 // entry: every entry must be "prefer-match", "prefer-no-match", or
 // "batch-find"; "prefer-match" and "prefer-no-match" are mutually exclusive
 // (both cannot appear in the same list) but "batch-find" may combine with
-// either. An empty or nil list is valid (means "no hint"). Sets have a
-// narrower valid list — see validateHintList's isSet parameter.
+// either. An empty or nil list is valid (means "no hint"). The same list is
+// valid on a sets: entry, where "batch-find" additionally requires `find` —
+// checked in validateHints, which can see the whole entry.
 func ValidHints(hints []string) bool {
-	return validateHintList(hints, false) == nil
+	return validateHintList(hints) == nil
 }
 
 // validateHintList returns a descriptive error for the first problem found in
-// hints, or nil if the list is valid. isSet selects the sets: context, where
-// "batch-find" is rejected outright rather than being merely unrecognised:
-// there is no set-level batching for it to request. A set's `find` returns
-// one complete position per call and the worst case for one position is
-// patterns_in_set, so there is nothing left for a batch knob to size.
-func validateHintList(hints []string, isSet bool) error {
+// hints, or nil if the list is valid.
+//
+// "batch-find" USED TO BE rejected on a sets: entry, on the reasoning that a
+// set's `find` returns one complete position per call and there was nothing
+// left for a batch knob to size. TODO task 59 decision (11) reverses that: it
+// is now how a set asks for batching at all, replacing the retired
+// `find_batch:` key. It still requires `find` on the same set — see
+// SetConfig.BatchFind — which is checked where the set is validated rather
+// than here, since this function sees only the list.
+func validateHintList(hints []string) error {
 	var hasMatch, hasNoMatch bool
 	for _, h := range hints {
 		switch h {
@@ -306,9 +346,7 @@ func validateHintList(hints []string, isSet bool) error {
 		case "prefer-no-match":
 			hasNoMatch = true
 		case "batch-find":
-			if isSet {
-				return fmt.Errorf("\"batch-find\" is not valid for sets")
-			}
+			// valid in both contexts now
 		default:
 			return fmt.Errorf("unknown value %q (want \"prefer-match\", \"prefer-no-match\", or \"batch-find\")", h)
 		}
@@ -323,7 +361,7 @@ func validateHintList(hints []string, isSet bool) error {
 // cfg. Returns an error naming the first offending entry and problem found.
 func validateHints(cfg *BuildConfig) error {
 	for _, re := range cfg.Regexps {
-		if err := validateHintList(re.Hints, false); err != nil {
+		if err := validateHintList(re.Hints); err != nil {
 			label := re.Name
 			if label == "" {
 				label = re.Pattern
@@ -332,8 +370,17 @@ func validateHints(cfg *BuildConfig) error {
 		}
 	}
 	for _, sc := range cfg.Sets {
-		if err := validateHintList(sc.Hints, true); err != nil {
+		if err := validateHintList(sc.Hints); err != nil {
 			return fmt.Errorf("set %q: hints: %w", sc.Name, err)
+		}
+		// "batch-find" asks for `find` to work several positions ahead per
+		// host crossing. On a set with no `find:` there is nothing to batch,
+		// and silently ignoring it would leave the caller believing they had
+		// asked for something.
+		for _, h := range sc.Hints {
+			if h == "batch-find" && sc.Find == "" {
+				return fmt.Errorf("set %q: hints: \"batch-find\" requires \"find\" on the same set", sc.Name)
+			}
 		}
 	}
 	return nil
@@ -341,10 +388,9 @@ func validateHints(cfg *BuildConfig) error {
 
 // ValidateSets validates the `sets:` block against the `regexps:` list.
 // Returns an error if any set name is not unique, any pattern reference is
-// unknown, a set entry declares none of the eight capabilities, or patterns is
-// empty. `overlapping` on a set with neither `find` nor `find_batch` is
-// ignored, not rejected — it selects between two find bodies, and with no find
-// body it simply has no effect.
+// unknown, a set entry declares none of the five capabilities, or patterns is
+// empty. `overlapping` on a set with no `find` is ignored, not rejected — it
+// selects between two find bodies, and with no find body it has no effect.
 func ValidateSets(cfg *BuildConfig) error {
 	// Build name → index map.
 	nameIdx := make(map[string]int, len(cfg.Regexps))
@@ -408,19 +454,32 @@ func ValidateSets(cfg *BuildConfig) error {
 		setStems[stem] = s.Name
 		caps := s.Capabilities()
 		if len(caps) == 0 {
-			return fmt.Errorf("set %q: at least one of match, match_any, match_all, scan, scan_any, scan_all, find, or find_batch must be set", s.Name)
+			return fmt.Errorf("set %q: at least one of match_any, match_all, scan_any, scan_all, or find must be set", s.Name)
 		}
-		// `overlapping` on a set declaring neither find nor find_batch is
-		// silently IGNORED rather than rejected: it selects between two find
-		// bodies, and with no find body to select it simply has no effect.
-		// Rejecting it made a harmless key a build failure.
+		// `overlapping` on a set declaring no find is silently IGNORED rather
+		// than rejected: it selects between two find bodies, and with no find
+		// body to select it simply has no effect. Rejecting it made a harmless
+		// key a build failure.
 		owner := fmt.Sprintf("set %q", s.Name)
 		for _, c := range caps {
 			name := c.Name
+			// A set's `find` synthesizes <find>_batch under
+			// `hints: [batch-find]`, exactly as a pattern's find_func does,
+			// so the same rule applies: the user may not name a capability
+			// into that space, and the synthesized name is reserved whether
+			// or not this set asks for it today. Conditioning the check on
+			// the hint would mean ADDING the hint to a working config turns a
+			// valid export into a duplicate.
+			if strings.HasSuffix(name, "_batch") {
+				return fmt.Errorf("%s: export name %q must not end in \"_batch\" (reserved for the compiler-synthesized batch export)", owner, name)
+			}
 			if prior, dup := exportNames[name]; dup {
 				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
 			}
 			exportNames[name] = owner
+			if c.Field == "find" {
+				exportNames[SetBatchExportName(name)] = owner + " (batch export)"
+			}
 		}
 		if !s.Patterns.All && len(s.Patterns.Names) == 0 {
 			return fmt.Errorf("set %q: patterns is required (use \"all\" or a non-empty list of pattern names)", s.Name)

@@ -73,10 +73,10 @@ func runScanStandalone(t *testing.T, w []byte, input string, from int32) bool {
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	return res.(int32) != 0
+	return res.(int32) >= 0
 }
 
-// runScanEmbedded calls `scan` on an embedded module, supplying the host
+// runScanEmbedded calls `scan_any` on an embedded module, supplying the host
 // memory the module imports as "main"."memory" — the wasm-merge arrangement,
 // modelled directly.
 func runScanEmbedded(t *testing.T, w []byte, input string, from int32) bool {
@@ -109,7 +109,7 @@ func runScanEmbedded(t *testing.T, w []byte, input string, from int32) bool {
 	if err != nil {
 		t.Fatalf("scan (embedded): %v", err)
 	}
-	return res.(int32) != 0
+	return res.(int32) >= 0
 }
 
 // TestSetMergedModeAssertions runs the context-assertion classes through both
@@ -142,7 +142,9 @@ func TestSetMergedModeAssertions(t *testing.T) {
 		{`foo`, "xfooy"},
 		{`foo`, "xbary"},
 	}
-	setScan := func(sc *config.SetConfig) { sc.Scan = "s_scan" }
+	// `scan` was retired by TODO task 59 decision (2): `scan_any(...) >= 0` is
+	// exactly what it returned, which is what runScan* compare against.
+	setScan := func(sc *config.SetConfig) { sc.ScanAny = "s_scan" }
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%s on %q", c.pat, c.input), func(t *testing.T) {
 			want := regexp.MustCompile(c.pat).MatchString(c.input)
@@ -269,7 +271,9 @@ func TestSetMergedModeFromResume(t *testing.T) {
 		{`(?m:^)b`, "ab\nb", 1},   // resume just after a non-newline
 		{`a\Bb`, "abab", 1},       // \B mid-input at a resume point
 	}
-	setScan := func(sc *config.SetConfig) { sc.Scan = "s_scan" }
+	// `scan` was retired by TODO task 59 decision (2): `scan_any(...) >= 0` is
+	// exactly what it returned, which is what runScan* compare against.
+	setScan := func(sc *config.SetConfig) { sc.ScanAny = "s_scan" }
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%s on %q from %d", c.pat, c.input, c.from), func(t *testing.T) {
 			// Oracle: does the pattern match at any position >= from, judged on

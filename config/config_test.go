@@ -405,19 +405,30 @@ func TestValidHints(t *testing.T) {
 	}
 }
 
-// TestValidateHintList_BatchFindRejectedForSets verifies validateHintList's
-// isSet parameter: "batch-find" is a load-time error on a sets: entry (sets
-// have their own find_all batching), distinct from being merely unrecognised.
-func TestValidateHintList_BatchFindRejectedForSets(t *testing.T) {
-	if err := validateHintList([]string{"batch-find"}, false); err != nil {
-		t.Errorf("validateHintList(batch-find, isSet=false) = %v, want nil", err)
+// TestBatchFindOnSets covers TODO task 59 decision (11): "batch-find" USED TO
+// BE a load-time error on a sets: entry and is now how a set asks for batching
+// at all, replacing the retired `find_batch:` key. It still requires `find` on
+// the same set — with nothing to batch, silently ignoring it would leave the
+// caller believing they had asked for something.
+func TestBatchFindOnSets(t *testing.T) {
+	if err := validateHintList([]string{"batch-find"}); err != nil {
+		t.Errorf("validateHintList(batch-find) = %v, want nil", err)
 	}
-	err := validateHintList([]string{"batch-find"}, true)
-	if err == nil {
-		t.Fatal("validateHintList(batch-find, isSet=true) = nil, want error")
+	withFind := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+		"  - name: s\n    find: sf\n    hints: [batch-find]\n    patterns: all\n"
+	cfg, err := LoadConfig(writeCfg(t, withFind))
+	if err != nil {
+		t.Fatalf("batch-find with find: %v", err)
 	}
-	if got := err.Error(); got != `"batch-find" is not valid for sets` {
-		t.Errorf("validateHintList(batch-find, isSet=true) error = %q, want the sets-specific message", got)
+	if !cfg.Sets[0].BatchFind() {
+		t.Error("BatchFind() = false on a set with find: and hints: [batch-find]")
+	}
+	noFind := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+		"  - name: s\n    scan_any: sa\n    hints: [batch-find]\n    patterns: all\n"
+	if _, err := LoadConfig(writeCfg(t, noFind)); err == nil {
+		t.Error("batch-find without find: expected an error")
+	} else if !strings.Contains(err.Error(), "batch-find") {
+		t.Errorf("error should name the hint, got: %v", err)
 	}
 }
 
@@ -549,6 +560,14 @@ func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
 		{"find_all", "find_all", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_all: sf\n    patterns: all\n"},
 		{"find_any", "find_any", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_any: sf\n    patterns: all\n"},
 		{"batch_size", "batch_size", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find: sf\n    batch_size: 128\n    patterns: all\n"},
+		// Retired by TODO task 59: `match:` and `scan:` (decision (2)) and
+		// `find_batch:` (decision (11)). Dropping the KEYS rather than
+		// repurposing them is the point — a surviving `match:` with match_any
+		// semantics would leave every existing config compiling while its
+		// callers silently switched from reading 0/1 to reading an id.
+		{"match", "match", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    match: sm\n    patterns: all\n"},
+		{"scan", "scan", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan: ss\n    patterns: all\n"},
+		{"find_batch", "find_batch", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n"},
 		{"typo", "mach_func", "regexps:\n  - pattern: 'foo'\n    mach_func: m\n"},
 	}
 	for _, c := range cases {
@@ -594,7 +613,7 @@ func TestLoadConfig_OverlappingRoundTrips(t *testing.T) {
 // there is no body to select, so the key has no effect and is accepted rather
 // than rejected — a harmless key should not be a build failure.
 func TestLoadConfig_OverlappingWithoutFindIsIgnored(t *testing.T) {
-	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan: sc\n    overlapping: true\n    patterns: all\n"
+	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan_any: sc\n    overlapping: true\n    patterns: all\n"
 	cfg, err := LoadConfig(writeCfg(t, yaml))
 	if err != nil {
 		t.Fatalf("overlapping without find must be ignored, got error: %v", err)
@@ -607,45 +626,57 @@ func TestLoadConfig_OverlappingWithoutFindIsIgnored(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_FindBatchEnablesOverlapping: find_batch is a find capability
-// for every purpose overlapping cares about.
-func TestLoadConfig_FindBatchEnablesOverlapping(t *testing.T) {
-	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n"
+// TestLoadConfig_BatchFindIsNotACapability: under TODO task 59 decision (11)
+// batching is a property of `find`, not a capability of its own. A batch-only
+// set — legal until then — no longer exists, and asking for batching adds
+// nothing to Capabilities().
+func TestLoadConfig_BatchFindIsNotACapability(t *testing.T) {
+	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+		"  - name: s\n    find: fb\n    hints: [batch-find]\n    patterns: all\n"
 	cfg, err := LoadConfig(writeCfg(t, yaml))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 	if !cfg.Sets[0].HasFind() || !cfg.Sets[0].Gated() {
-		t.Error("a find_batch-only set has a find capability and is gated by default")
+		t.Error("a find set is gated by default")
 	}
 	caps := cfg.Sets[0].Capabilities()
-	if len(caps) != 1 || caps[0].Field != "find_batch" || caps[0].Name != "fb" {
-		t.Errorf("find_batch missing from Capabilities: %+v", caps)
+	if len(caps) != 1 || caps[0].Field != "find" || caps[0].Name != "fb" {
+		t.Errorf("batching must not appear as a capability: %+v", caps)
 	}
 }
 
-// TestLoadConfig_BatchNameCollision: the name the "batch-find" hint would
-// synthesize for a pattern is reserved, so a set capability cannot silently
-// claim it — but every OTHER name ending in _batch is now available, which is
-// what makes `find_batch: x_find_batch` legal.
+// TestLoadConfig_BatchNameCollision: a set's `find` synthesizes <find>_batch
+// under `hints: [batch-find]`, exactly as a pattern's find_func does, so no
+// capability may be NAMED into that space and no two owners may claim the same
+// synthesized name. Reserved whether or not the hint is present today —
+// otherwise adding the hint to a working config would turn a valid export into
+// a duplicate.
 func TestLoadConfig_BatchNameCollision(t *testing.T) {
-	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n  - name: s\n    find_batch: ff_batch\n    patterns: all\n"
-	if _, err := LoadConfig(writeCfg(t, yaml)); err == nil {
+	ending := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+		"  - name: s\n    find: my_batch\n    patterns: all\n"
+	if _, err := LoadConfig(writeCfg(t, ending)); err == nil {
+		t.Fatal("a set capability ending in _batch must be rejected")
+	}
+	collide := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n" +
+		"  - name: s\n    scan_any: ff_batch\n    patterns: all\n"
+	if _, err := LoadConfig(writeCfg(t, collide)); err == nil {
 		t.Fatal("a set capability claiming a pattern's synthesized batch name must be rejected")
 	}
-	ok := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n  - name: s\n    find_batch: set_find_batch\n    patterns: all\n"
+	ok := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n" +
+		"  - name: s\n    find: set_find\n    hints: [batch-find]\n    patterns: all\n"
 	if _, err := LoadConfig(writeCfg(t, ok)); err != nil {
-		t.Fatalf("a non-colliding _batch name must be accepted, got: %v", err)
+		t.Fatalf("a non-colliding batching set must be accepted, got: %v", err)
 	}
 }
 
 func TestSetCapabilities(t *testing.T) {
 	s := SetConfig{
-		Name: "s", Match: "m", MatchAny: "ma", MatchAll: "mall",
-		Scan: "sc", ScanAny: "sa", ScanAll: "sall", Find: "f",
+		Name: "s", MatchAny: "ma", MatchAll: "mall",
+		ScanAny: "sa", ScanAll: "sall", Find: "f",
 	}
 	got := s.Capabilities()
-	want := []string{"match", "match_any", "match_all", "scan", "scan_any", "scan_all", "find"}
+	want := []string{"match_any", "match_all", "scan_any", "scan_all", "find"}
 	if len(got) != len(want) {
 		t.Fatalf("Capabilities() returned %d entries, want %d", len(got), len(want))
 	}
@@ -659,10 +690,10 @@ func TestSetCapabilities(t *testing.T) {
 	}
 }
 
-func TestValidateSets_AllSevenCapabilityNamesValidated(t *testing.T) {
+func TestValidateSets_AllCapabilityNamesValidated(t *testing.T) {
 	// Every capability value goes through the identifier/reserved-word check,
 	// exactly like the per-pattern _func fields.
-	for _, key := range []string{"match", "match_any", "match_all", "scan", "scan_any", "scan_all", "find"} {
+	for _, key := range []string{"match_any", "match_all", "scan_any", "scan_all", "find"} {
 		t.Run(key, func(t *testing.T) {
 			yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    " + key + ": struct\n    patterns: all\n"
 			_, err := LoadConfig(writeCfg(t, yaml))

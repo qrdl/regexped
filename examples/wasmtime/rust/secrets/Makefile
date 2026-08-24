@@ -11,7 +11,11 @@ FINAL_WASM  := final.wasm
 all: run
 
 # Step 1 – generate Rust stubs (all patterns into one file)
-stubs.rs: regexped.yaml
+# $(REGEXPED) is a prerequisite of every rule below that runs it: the generated
+# stubs and the compiled .wasm depend on the COMPILER as much as on the config.
+# Without it a rebuild after a compiler change keeps the stale .wasm and the
+# merge fails with an import/export type mismatch.
+stubs.rs: regexped.yaml $(REGEXPED)
 	$(REGEXPED) generate --config=regexped.yaml
 
 generate: stubs.rs
@@ -23,13 +27,13 @@ $(MAIN_WASM): main.rs stubs.rs Cargo.toml
 build: $(MAIN_WASM)
 
 # Step 3 – compile all regexp patterns to WASM
-$(REGEX_WASMS): regexped.yaml
+$(REGEX_WASMS): regexped.yaml $(REGEXPED)
 	$(REGEXPED) compile --config=regexped.yaml
 
 compile: $(REGEX_WASMS)
 
 # Step 4 – merge main WASM and all regexp WASMs into a single module
-$(FINAL_WASM): $(MAIN_WASM) $(REGEX_WASMS) regexped.yaml
+$(FINAL_WASM): $(MAIN_WASM) $(REGEX_WASMS) regexped.yaml $(REGEXPED)
 	$(REGEXPED) merge --config=regexped.yaml --main=$(MAIN_WASM) $(REGEX_WASMS)
 
 merge: $(FINAL_WASM)

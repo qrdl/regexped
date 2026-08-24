@@ -26,7 +26,7 @@ Unlike the Rust stubs, no `mod` wrapping is needed. Each stub file is a standalo
 ### `match_func` — anchored match
 
 ```go
-func <MatchFunc>(input []byte) (int, bool)
+func <MatchFunc>(input []byte) (uint, bool)
 ```
 
 Tries to match the pattern at position 0 of `input`. Returns the **end position** (exclusive) of the match and `true`, or `(0, false)` if no match. The match is anchored: it always starts at the beginning of `input`.
@@ -44,19 +44,19 @@ if end, ok := UrlMatch(input); ok {
 ### `find_func` — non-anchored find iterator
 
 ```go
-func <FindFunc>(input []byte) iter.Seq2[int, int]
+func <FindFunc>(input []byte, offset uint) iter.Seq2[uint, uint]
 ```
 
 Returns an iterator over all non-overlapping matches. Each iteration yields `(start, end)` absolute byte positions. After a zero-length match the iterator advances by one byte to avoid infinite loops.
 
 ```go
 // All matches:
-for start, end := range FindToken(input) {
+for start, end := range FindToken(input, 0) {
     fmt.Printf("match at %d..%d: %q\n", start, end, input[start:end])
 }
 
 // First match only:
-for start, end := range FindToken(input) {
+for start, end := range FindToken(input, 0) {
     fmt.Printf("first match: %q\n", input[start:end])
     break
 }
@@ -67,21 +67,21 @@ for start, end := range FindToken(input) {
 ### `groups_func` — capture groups iterator
 
 ```go
-func <GroupsFunc>(input []byte) iter.Seq[[][]int]
+func <GroupsFunc>(input []byte, offset uint) iter.Seq[[][]uint]
 ```
 
 Returns an iterator over all non-overlapping matches. Each item is a `[][]int` slice of capture group positions (absolute byte offsets). Index 0 is the full match; subsequent indices are capture groups in order. A group that did not participate is `nil`.
 
 ```go
 // All matches:
-for groups := range ParseGroups(input) {
+for groups := range ParseGroups(input, 0) {
     if g := groups[1]; g != nil {
         fmt.Printf("group 1: %q\n", input[g[0]:g[1]])
     }
 }
 
 // First match only:
-for groups := range ParseGroups(input) {
+for groups := range ParseGroups(input, 0) {
     if g := groups[1]; g != nil {
         fmt.Printf("group 1: %q\n", input[g[0]:g[1]])
     }
@@ -94,21 +94,21 @@ for groups := range ParseGroups(input) {
 ### `named_groups_func` — named capture groups iterator
 
 ```go
-func <NamedGroupsFunc>(input []byte) iter.Seq[map[string][]int]
+func <NamedGroupsFunc>(input []byte, offset uint) iter.Seq[map[string][]uint]
 ```
 
-Returns an iterator over all non-overlapping matches. Each item is a `map[string][]int` of name → `[start, end]` absolute byte offsets. Only groups that participated in the match are present in the map. Group names are hardcoded at stub-generation time.
+Returns an iterator over all non-overlapping matches. Each item is a `map[string][]uint` of name → `[start, end]` absolute byte offsets. Only groups that participated in the match are present in the map. Group names are hardcoded at stub-generation time.
 
 ```go
 // All matches:
-for parts := range ParseUrl(text) {
+for parts := range ParseUrl(text, 0) {
     if g, ok := parts["host"]; ok {
         fmt.Printf("host: %q\n", text[g[0]:g[1]])
     }
 }
 
 // First match only:
-for parts := range ParseUrl(text) {
+for parts := range ParseUrl(text, 0) {
     if g, ok := parts["host"]; ok {
         fmt.Printf("host: %q\n", text[g[0]:g[1]])
     }
@@ -122,10 +122,23 @@ for parts := range ParseUrl(text) {
 
 | Config field | Generated function | Return type |
 |---|---|---|
-| `match_func` | `<PascalCase>(input []byte)` | `(int, bool)` — end pos and match flag |
-| `find_func` | `<PascalCase>(input []byte)` | `iter.Seq2[int, int]` — yields `(start, end)` per match |
-| `groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[[][]int]` — yields `[][start,end]` per match |
-| `named_groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[map[string][]int]` — yields name→`[start,end]` per match |
+| `match_func` | `<PascalCase>(input []byte)` | `(uint, bool)` — end pos and match flag |
+| `find_func` | `<PascalCase>(input []byte, offset uint)` | `iter.Seq2[uint, uint]` — yields `(start, end)` per match |
+| `groups_func` | `<PascalCase>(input []byte, offset uint)` | `iter.Seq[[][]uint]` — yields `[][start,end]` per match |
+| `named_groups_func` | `<PascalCase>(input []byte, offset uint)` | `iter.Seq[map[string][]uint]` — yields name→`[start,end]` per match |
+
+**Positions are `uint`, on both sides.** An offset into an input cannot be
+negative, and Go signals absence structurally rather than with a sentinel —
+`match` has the comma-ok `bool`, the iterators simply end, an absent capture
+group is a `nil` slice, and an absent named group is not in the map — so `-1`
+has no user anywhere in this surface. The cost is at call sites: `Find(input,
+len(prefix))` becomes `Find(input, uint(len(prefix)))`. Pattern ids and counts
+stay `int`, because an id is not an offset.
+
+**`offset` currently NARROWS the input** rather than bounding only the search,
+so at `offset > 0` a leading `\b`, `\B`, `^` or `(?m:^)` judges a truncated left
+context. The single-pattern WASM exports take no offset yet; when they do, the
+stubs stop narrowing and these signatures do not change.
 
 Function names are the `snake_case` config values converted to `PascalCase`: `url_match` → `UrlMatch`, `find_github_token` → `FindGithubToken`. All positions are byte offsets (not character indices). Input is `[]byte`.
 
@@ -143,22 +156,29 @@ schema and wire format):
 const <Set>PatternCount = 12   // patterns in the set
 const <Set>IDSpace = 12        // largest reportable pattern id + 1
 
-type SetMatch struct{ PatternID, Start, End int }
+type SetMatch struct {
+    PatternID  int
+    Start, End uint
+}
 
 // anchored: the pattern must match the WHOLE input
-func <Match>   (input []byte) bool
 func <MatchAny>(input []byte) (int, bool)
-func <MatchAll>(input []byte) []int
+func <MatchAll>(input []byte) iter.Seq[int]
 
-// non-anchored: each takes a `from` position
-func <Scan>   (input []byte, from int) bool
-func <ScanAny>(input []byte, from int) (id, start int, ok bool)
-func <ScanAll>(input []byte, from int) []int
+// non-anchored: each takes an offset bounding the search
+func <ScanAny>(input []byte, offset uint) (int, bool)
+func <ScanAll>(input []byte, offset uint) iter.Seq[int]
 
-func <Find>(input []byte, from int) iter.Seq[SetMatch]
-type SetTuple [3]int32   // one slot of a batched scan's buffer
-func <FindBatch>(input []byte, from int, buf []SetTuple) iter.Seq[SetMatch]
+func <Find>(input []byte, offset uint) iter.Seq[SetMatch]
 ```
+
+`<MatchAll>` and `<ScanAll>` are iterators rather than slices: the ABI hands
+back a bitmask whose set bits can be yielded lazily with nothing materialised,
+so a caller who stops early allocates nothing. `slices.Collect` gives you a
+slice when you want one.
+
+`<ScanAny>` reports **no position** — see [sets.md](sets.md) for why that is
+what makes it cheap.
 
 ```go
 for m := range ScanSecrets(input, 0) {
@@ -175,32 +195,12 @@ the scan advances, so a step is not a call. Requires Go 1.23+ for `iter`.
 `PatternName(id)` is emitted once per config when any set sets
 `emit_name_map: true`.
 
-### `find_batch` — the same matches, a bufferful per call
-
-`find` crosses the host boundary once per matching position. `find_batch`
-reports the same matches in the same order but fills **your** buffer with as
-many consecutive positions as fit, so a caller who will consume the whole scan
-crosses once per bufferful instead. Use `find` when you may stop early — a
-batch call does the work for matches you never look at.
-
-The two are independent capabilities; declare either, both, or neither.
-
-You own the buffer: allocate one and reuse it for every scan, so batched
-iteration allocates nothing in the steady state. Its length is the batch size,
-capped at `<SET>_BATCH_MAX_COUNT`; a zero-length buffer yields nothing. Any
-length of 1 or more makes progress — a position whose matches do not all fit is
-delivered in part and resumed inside. Because of that, group by the match's
-`start` field rather than by call boundary if you need per-position grouping.
-
-The gate array and the resume cursor stay stub-owned and never appear in the
-public surface; only the buffer is yours, because only its size is your choice.
-
 ## Notes
 
 - The `unsafe` FFI call is hidden inside the generated stub; your application code only sees safe Go functions.
 - The WASM module must be loaded before calling any stub function. In `wasip1` targets, all imports are resolved at link time by the runtime (e.g. wasmtime).
 - The stub file imports `"iter"` and `"unsafe"` automatically; do not add them manually.
-- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for Go: it's effective for the JS and TS generators only. Setting it does not change the generated Go stub or its performance.
+- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for Go, on a `regexps:` entry and on a `sets:` entry alike: batching amortises host-boundary crossings, and a Go stub is compiled to wasm and merged, so its call into the module is a direct call inside one module with no boundary to amortise. Setting it does not change the generated Go stub or its performance.
 
 ---
 

@@ -60,10 +60,17 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 	hb.WriteString("#pragma once\n\n")
 	hb.WriteString("#ifndef REGEXPED_TYPES_DEFINED\n")
 	hb.WriteString("#define REGEXPED_TYPES_DEFINED\n")
-	hb.WriteString("typedef struct { int start; int end; } rx_match_t;\n")
-	hb.WriteString("typedef struct { int start; int end; const char *name; } rx_group_t;\n")
-	hb.WriteString("typedef struct { int pattern_id; int start; int end; } rx_set_match_t;\n")
-	hb.WriteString("typedef struct { int pattern_id; int end; } rx_set_anchor_t;\n")
+	// Types per TODO task 59 decision (1). size_t for lengths, offsets and
+	// capacities and ONLY those — it means "can hold the size of any object",
+	// which a pattern id is not. ptrdiff_t for positions coming back, because
+	// -1 is the sentinel for "no match" / "group absent" and an unsigned type
+	// has no room for it; this is the read() pairing. int for pattern ids and
+	// counts, which keeps a negative slot free for a future failure and avoids
+	// the signed/unsigned warning in for (int i = 0; i < n; i++).
+	hb.WriteString("#include <stddef.h>   /* size_t, ptrdiff_t -- freestanding-required, no libc */\n\n")
+	hb.WriteString("typedef struct { ptrdiff_t start, end; } rx_match_t;\n")
+	hb.WriteString("typedef struct { ptrdiff_t start, end; const char *name; } rx_group_t;\n")
+	hb.WriteString("typedef struct { int pattern_id; ptrdiff_t start, end; } rx_set_match_t;\n")
 	hb.WriteString("\n")
 	hb.WriteString("/* Returned when the Backtracking engine exhausted its backtrack-frame\n")
 	hb.WriteString("   budget on this input. The engine abandoned part of the search space, so\n")
@@ -75,6 +82,9 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 	hb.WriteString("   {RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW}, and a groups function returns\n")
 	hb.WriteString("   NULL (which it never does otherwise). See docs/engines.md. */\n")
 	fmt.Fprintf(&hb, "#define RX_ERR_BT_OVERFLOW (%d)\n", btOverflow)
+	hb.WriteString("/* Argument errors from the scanner initialisers. */\n")
+	hb.WriteString("#define RX_ERR_NULL_ARG    (-3)\n")
+	hb.WriteString("#define RX_ERR_RANGE       (-5)\n")
 	hb.WriteString("#endif\n\n")
 
 	// .c file
@@ -121,26 +131,14 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		fmt.Fprintf(&hb, "/* Number of patterns in set %q. Sizes the match buffer: the scanner can\n   receive at most this many matches at one position. */\n#define %s %d\n\n", s.Name, konst, n)
 		fmt.Fprintf(&hb, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id \u2014 the gate\n   array, the _all bitmap, and the out_ids array you pass to the _all calls \u2014\n   is sized from this. */\n#define %s %d\n\n", s.Name, idKonst, idN)
 
-		if s.FindBatch != "" {
-			fmt.Fprintf(&hb, "/* Width of the count field in set %q's find_batch cursor. The count is\n   packed & ((1LL << bits) - 1); the scan is finished when the top 32 bits of\n   the cursor are all ones. Only a direct WASM caller needs these: the\n   generated scanner decodes the cursor for you. */\n#define %s %d\n\n",
-				s.Name, screamingCase(s.Name)+"_BATCH_COUNT_BITS", cursorCountBits(s, cfg))
-			fmt.Fprintf(&hb, "/* Largest tuple count one find_batch call can report for set %q. The module\n   clamps out_cap to it. */\n#define %s %d\n\n",
-				s.Name, screamingCase(s.Name)+"_BATCH_MAX_COUNT", cursorMaxCount(s, cfg))
-		}
 
 		imp := func(name, sig string) {
 			fmt.Fprintf(&hb, "__attribute__((import_module(%q), import_name(%q)))\n%s\n", cfg.ImportModule, name, sig)
 		}
-		if s.Match != "" {
-			imp(s.Match, fmt.Sprintf("int ffi_%s(const char *ptr, int len);", s.Match))
-			fmt.Fprintf(&hb, "/* 1 when some pattern matches the WHOLE input, else 0. */\nint %s(const char *input, int len);\n\n", s.Match)
-			fmt.Fprintf(&cb, `int %s(const char *input, int len) { return ffi_%s(input, len) != 0; }
-`, s.Match, s.Match)
-		}
 		if s.MatchAny != "" {
 			imp(s.MatchAny, fmt.Sprintf("int ffi_%s(const char *ptr, int len);", s.MatchAny))
-			fmt.Fprintf(&hb, "/* Id of SOME pattern matching the whole input, or -1. */\nint %s(const char *input, int len);\n\n", s.MatchAny)
-			fmt.Fprintf(&cb, `int %s(const char *input, int len) { return ffi_%s(input, len); }
+			fmt.Fprintf(&hb, "/* Id of SOME pattern matching the whole input, or -1. */\nint %s(const char *input, size_t len);\n\n", s.MatchAny)
+			fmt.Fprintf(&cb, `int %s(const char *input, size_t len) { return ffi_%s(input, (int)len); }
 `, s.MatchAny, s.MatchAny)
 		}
 		if s.MatchAll != "" {
@@ -149,40 +147,43 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			} else {
 				imp(s.MatchAll, fmt.Sprintf("long long ffi_%s(const char *ptr, int len);", s.MatchAll))
 			}
-			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into out_ids (caller array of\n   %s ints) and returns how many. */\nint %s(const char *input, int len, int *out_ids);\n\n", idKonst, s.MatchAll)
+			// Decision (12): C99's `static N` in an array parameter declarator
+			// means "the caller must pass at least N elements" — GCC and Clang
+			// diagnose a smaller array at the CALL SITE, it rules out NULL,
+			// and it self-documents. A plain int patterns[N] would decay to
+			// int * and be documentation only.
+			//
+			// The size is PATTERN_COUNT, not ID_SPACE: the body loops k over
+			// the id space and appends one entry per set bit, and only
+			// patterns IN the set have bits, so at most PATTERN_COUNT entries
+			// are ever written. ID_SPACE stays correct for things indexed BY
+			// an id — the gate array, the _all bitmap — and this is a LIST of
+			// ids, not an id-indexed array.
+			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into patterns and returns how many. */\nint %s(const char *input, size_t len, int patterns[static %s]);\n\n", s.MatchAll, konst)
 			if wide {
-				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int *out_ids) {
+				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, int patterns[static %[3]s]) {
     unsigned char bits[(%[2]s + 7) / 8] = {0};
-    ffi_%[1]s(input, len, bits);
+    ffi_%[1]s(input, (int)len, bits);
     int c = 0;
-    for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) out_ids[c++] = k;
+    for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) patterns[c++] = k;
     return c;
 }
-`, s.MatchAll, idKonst)
+`, s.MatchAll, idKonst, konst)
 			} else {
-				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int *out_ids) {
-    unsigned long long mask = (unsigned long long)ffi_%[1]s(input, len);
+				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, int patterns[static %[3]s]) {
+    unsigned long long mask = (unsigned long long)ffi_%[1]s(input, (int)len);
     int c = 0;
-    for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) out_ids[c++] = k;
+    for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) patterns[c++] = k;
     return c;
 }
-`, s.MatchAll, idKonst)
+`, s.MatchAll, idKonst, konst)
 			}
 		}
-		if s.Scan != "" {
-			imp(s.Scan, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from);", s.Scan))
-			fmt.Fprintf(&hb, "/* 1 when some pattern matches at a position at or after `from`, else 0. */\nint %s(const char *input, int len, int from);\n\n", s.Scan)
-			fmt.Fprintf(&cb, `int %s(const char *input, int len, int from) { return ffi_%s(input, len, from) != 0; }
-`, s.Scan, s.Scan)
-		}
 		if s.ScanAny != "" {
-			imp(s.ScanAny, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, int from);", s.ScanAny))
-			fmt.Fprintf(&hb, "/* Returns a pattern id and writes its match start to *start, or returns -1.\n   Which id you get is unspecified when several patterns match there. */\nint %s(const char *input, int len, int from, int *start);\n\n", s.ScanAny)
-			fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int from, int *start) {
-    long long packed = ffi_%[1]s(input, len, from);
-    if (packed < 0) return -1;
-    *start = (int)(packed >> 32);
-    return (int)(packed & 0xFFFFFFFF);
+			imp(s.ScanAny, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from);", s.ScanAny))
+			fmt.Fprintf(&hb, "/* Returns one pattern id matching somewhere at or after offset, or -1.\n   Which id you get is unspecified when several patterns match, and no\n   position is reported. */\nint %s(const char *input, size_t len, size_t offset);\n\n", s.ScanAny)
+			fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset) {
+    return ffi_%[1]s(input, (int)len, (int)offset);
 }
 `, s.ScanAny)
 		}
@@ -192,24 +193,24 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			} else {
 				imp(s.ScanAll, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, int from);", s.ScanAll))
 			}
-			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into out_ids (caller array of\n   %s ints) and returns how many. */\nint %s(const char *input, int len, int from, int *out_ids);\n\n", idKonst, s.ScanAll)
+			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into patterns and returns how many.\n   See match_all for why the size is in the type. */\nint %s(const char *input, size_t len, size_t offset, int patterns[static %s]);\n\n", s.ScanAll, konst)
 			if wide {
-				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int from, int *out_ids) {
+				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset, int patterns[static %[3]s]) {
     unsigned char bits[(%[2]s + 7) / 8] = {0};
-    ffi_%[1]s(input, len, from, bits);
+    ffi_%[1]s(input, (int)len, (int)offset, bits);
     int c = 0;
-    for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) out_ids[c++] = k;
+    for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) patterns[c++] = k;
     return c;
 }
-`, s.ScanAll, idKonst)
+`, s.ScanAll, idKonst, konst)
 			} else {
-				fmt.Fprintf(&cb, `int %[1]s(const char *input, int len, int from, int *out_ids) {
-    unsigned long long mask = (unsigned long long)ffi_%[1]s(input, len, from);
+				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset, int patterns[static %[3]s]) {
+    unsigned long long mask = (unsigned long long)ffi_%[1]s(input, (int)len, (int)offset);
     int c = 0;
-    for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) out_ids[c++] = k;
+    for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) patterns[c++] = k;
     return c;
 }
-`, s.ScanAll, idKonst)
+`, s.ScanAll, idKonst, konst)
 			}
 		}
 		if s.Find != "" {
@@ -218,7 +219,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			if gatedFind(s) {
 				imp(s.Find, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, unsigned *gates, int *out, int cap);", s.Find))
 				gateField = fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
-				gateInit = fmt.Sprintf("    for (int k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
+				gateInit = fmt.Sprintf("    for (size_t k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
 				gateArg = "s->gates, "
 			} else {
 				imp(s.Find, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, int *out, int cap);", s.Find))
@@ -243,125 +244,75 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			fmt.Fprintf(&hb, `/* Caller-owned scanner for %[1]s. Two scans may be in flight at once, and
    re-initialising the struct restarts a scan.
 
-   The buffer is yours: 3 ints per match. It must hold at least %[2]s
-   matches — one position's worst case, since every pattern can report once at
-   one start — and a smaller buffer yields NOTHING rather than a partial scan.
-   Declare it once and reuse it for every scan.
+   The scanner holds the INPUT as well as the position (decision (5)): the
+   input never changes during a scan while the position changes every step, so
+   the old split — remembering the position and taking the input on every
+   step — was backwards, and let a caller pass a DIFFERENT buffer on a later
+   step with the stored position silently indexing into it.
 
-       int buf[%[2]s * 3];
+   %[1]s fills your array with every match at the FIRST position at or after
+   the scanner's offset — they all share that start — and returns HOW MANY.
+   0 means the scan is finished. The return is the position's TOTAL, which may
+   exceed cap: the underlying call is transactional, so it writes min(total,
+   cap), records nothing and does not advance, and n > cap means "grow and call
+   again, same position". Sizing cap at %[2]s makes overflow impossible.
+
+       rx_set_match_t buf[%[2]s];
        %[4]s sc;
-       %[1]s_init(&sc, 0, buf, %[2]s);
-       while (%[1]s_next(&sc, input, len, &m)) { ... }  */
+       if (%[1]s_init(&sc, input, len, 0) != 0) { ... }
+       for (int n; (n = %[1]s(&sc, buf, %[2]s)) > 0; )
+           for (int i = 0; i < n; i++) { ... buf[i] ... }  */
 typedef struct {
-    int from;
+    const char *input;
+    size_t len, offset;
     int done;
-%[3]s    int *buf;
-    int cap;
-    int n, i;
-} %[4]s;
+%[3]s} %[4]s;
 
-void %[1]s_init(%[4]s *s, int from, int *buf, int cap);
-/* Writes the next match to *out; returns 1, or 0 when the scan is done. */
-int %[1]s_next(%[4]s *s, const char *input, int len, rx_set_match_t *out);
+/* 0 on success, a negative RX_ERR_* otherwise. An EMPTY input is legitimate
+   (a*, (?:), x?, \\A\\z all match it) and offset > len is not an error either
+   — the ABI defines it as "nothing found". */
+int %[1]s_init(%[4]s *s, const char *input, size_t len, size_t offset);
+int %[1]s(%[4]s *s, rx_set_match_t *buf, size_t cap);
 
 `, s.Find, konst, gateField, scannerType)
-			fmt.Fprintf(&cb, `void %[1]s_init(%[2]s *s, int from, int *buf, int cap) {
-    s->from = from; s->done = 0; s->n = 0; s->i = 0;
-    s->buf = buf; s->cap = cap;
-    /* Below one position's worst case the scan could stall on a position it
-       cannot deliver whole, so refuse it outright instead. */
-    if (cap < %[5]s) s->done = 1;
-%[3]s}
-
-int %[1]s_next(%[2]s *s, const char *input, int len, rx_set_match_t *out) {
-    for (;;) {
-        if (s->i < s->n) {
-            int o = s->i * 3;
-            s->i++;
-            out->pattern_id = s->buf[o]; out->start = s->buf[o + 1]; out->end = s->buf[o + 2];
-            return 1;
-        }
-        if (s->done) return 0;
-        int got = ffi_%[1]s(input, len, s->from, %[4]ss->buf, s->cap);
-        if (got <= 0) { s->done = 1; return 0; }
-        s->n = got; s->i = 0;
-        /* Every tuple in one call shares a start; resume one past it. */
-        s->from = s->buf[1] + 1;
-    }
+			fmt.Fprintf(&cb, `int %[1]s_init(%[2]s *s, const char *input, size_t len, size_t offset) {
+    if (!s || !input) return RX_ERR_NULL_ARG;
+    /* The FFI imports are i32. */
+    if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
+    s->input = input; s->len = len; s->offset = offset; s->done = 0;
+%[3]s    return 0;
 }
-`, s.Find, scannerType, gateInit, gateArg, konst)
-		}
-		if s.FindBatch != "" {
-			scannerType := "rx_" + setConstBase(s.Name) + "_batch_scanner_t"
-			gateField, gateInit, gateArg := "", "", ""
-			if gatedFind(s) {
-				// The gate array stays inside the struct: its length is the
-				// emitted id-space constant, not a size the caller chooses.
-				// Only the tuple buffer is the caller's, which is what lets
-				// the header carry no invented capacity at all.
-				imp(s.FindBatch, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, long long cursor, unsigned *gates, int *out, int cap);", s.FindBatch))
-				gateField = fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
-				gateInit = fmt.Sprintf("    for (int k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
-				gateArg = "s->gates, "
-			} else {
-				imp(s.FindBatch, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, long long cursor, int *out, int cap);", s.FindBatch))
-			}
-			fmt.Fprintf(&hb, `/* Caller-owned batched scanner for %[1]s. It reports the same matches in the
-   same order as the unbatched scanner, but refills the CALLER'S buffer a
-   bufferful at a time — one WASM call per bufferful instead of one per
-   position. Prefer it when the whole scan will be consumed; prefer the
-   unbatched scanner when you may stop early, since a batch call does the work
-   for matches you never look at.
 
-   The buffer is yours: 3 ints per match, cap matches. Declare it once and
-   reuse it for every scan. cap is capped at %[2]d; cap < 1 yields nothing.
-
-       int buf[512 * 3];
-       %[3]s sc;
-       %[1]s_init(&sc, 0, buf, 512);
-       while (%[1]s_next(&sc, input, len, &m)) { ... }  */
-typedef struct {
-    long long cursor;
-    int done;
-%[4]s    int *buf;
-    int cap;
-    int n, i;
-} %[3]s;
-
-void %[1]s_init(%[3]s *s, int from, int *buf, int cap);
-/* Writes the next match to *out; returns 1, or 0 when the scan is done. */
-int %[1]s_next(%[3]s *s, const char *input, int len, rx_set_match_t *out);
-
-`, s.FindBatch, cursorMaxCount(s, cfg), scannerType, gateField)
-			fmt.Fprintf(&cb, `void %[1]s_init(%[2]s *s, int from, int *buf, int cap) {
-    s->cursor = (long long)from << 32; s->done = 0; s->n = 0; s->i = 0;
-    s->buf = buf;
-    s->cap = cap > %[5]d ? %[5]d : cap;
-    if (s->cap < 1) s->done = 1;
-%[3]s}
-
-int %[1]s_next(%[2]s *s, const char *input, int len, rx_set_match_t *out) {
-    for (;;) {
-        if (s->i < s->n) {
-            int o = s->i * 3;
-            s->i++;
-            out->pattern_id = s->buf[o]; out->start = s->buf[o + 1]; out->end = s->buf[o + 2];
-            return 1;
+int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
+    if (!s || !buf) return RX_ERR_NULL_ARG;
+    if (cap > 0x7FFFFFFF) return RX_ERR_RANGE;
+    if (s->done) return 0;
+    int got = ffi_%[1]s(s->input, (int)s->len, (int)s->offset, %[4]s(int *)buf, (int)cap);
+    if (got <= 0) { s->done = 1; return 0; }
+    /* Over capacity: nothing was recorded and the scan did not advance, so the
+       caller can grow and repeat at this same position. */
+    if ((size_t)got > cap) return got;
+    /* The module writes 12-byte {id, start, end} tuples. On wasm32 ptrdiff_t
+       is 4 bytes, rx_set_match_t IS that layout, and the answer is already in
+       place — the branch below folds away. Anywhere else (a host build for an
+       editor or a static check) the structs are wider, so expand in place from
+       the LAST element backwards: entry i occupies bytes [i*S, (i+1)*S) with
+       S >= 12 while its ints sit at [i*12, i*12+12), so writing downward never
+       clobbers a triple not yet read. */
+    if (sizeof(rx_set_match_t) != 12) {
+        const int *raw = (const int *)buf;
+        for (int i = got - 1; i >= 0; i--) {
+            int id = raw[i * 3], st = raw[i * 3 + 1], en = raw[i * 3 + 2];
+            buf[i].pattern_id = id;
+            buf[i].start = (ptrdiff_t)st;
+            buf[i].end = (ptrdiff_t)en;
         }
-        if (s->done) return 0;
-        long long packed = ffi_%[1]s(input, len, s->cursor, %[4]ss->buf, s->cap);
-        /* The cursor is opaque: hand it back unchanged. Only its top 32 bits
-           are public — all ones means the scan is finished, and that arrives
-           on the same call as the last matches. */
-        s->n = (int)(packed & %[6]dLL);
-        s->i = 0;
-        if ((unsigned)((unsigned long long)packed >> 32) == 0xFFFFFFFFu) s->done = 1;
-        s->cursor = packed;
-        /* A call reports at least one match unless the scan is over. */
-        if (s->n == 0) { s->done = 1; return 0; }
     }
+    /* Every tuple in one call shares a start; resume one past it. */
+    s->offset = (size_t)buf[0].start + 1;
+    return got;
 }
-`, s.FindBatch, scannerType, gateInit, gateArg, cursorMaxCount(s, cfg), cursorCountMask(s, cfg))
+`, s.Find, scannerType, gateInit, gateArg)
 		}
 	}
 	if hasEmitNameMap(cfg) {
@@ -414,7 +365,7 @@ func genCMatchHPart(funcName string) string {
 	return fmt.Sprintf(
 		"/* %s: anchored match. Returns end position (>=0), -1 if no match, or\n"+
 			"   RX_ERR_BT_OVERFLOW (see above) if the match result is unknown. */\n"+
-			"int %s(const unsigned char *input, unsigned int len);\n\n",
+			"ptrdiff_t %s(const char *input, size_t len);\n\n",
 		funcName, funcName)
 }
 
@@ -424,8 +375,8 @@ func genCMatchCPart(importModule, funcName string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "__attribute__((import_module(\"%s\"), import_name(\"%s\")))\n", importModule, funcName)
 	fmt.Fprintf(&sb, "extern int %s(const unsigned char *ptr, unsigned int len);\n\n", ffi)
-	fmt.Fprintf(&sb, "int %s(const unsigned char *input, unsigned int len) {\n", funcName)
-	fmt.Fprintf(&sb, "    return %s(input, len);\n", ffi)
+	fmt.Fprintf(&sb, "ptrdiff_t %s(const char *input, size_t len) {\n", funcName)
+	fmt.Fprintf(&sb, "    return %s((const unsigned char *)input, (unsigned int)len);\n", ffi)
 	sb.WriteString("}\n\n")
 	return sb.String()
 }
@@ -439,7 +390,7 @@ func genCFindHPart(funcName string) string {
 			"   To iterate non-overlapping matches, advance past each match; a pattern\n"+
 			"   that can match empty needs the guard, or offset never moves:\n"+
 			"     off = m.end > m.start ? m.end : m.start + 1; */\n"+
-			"rx_match_t %s(const unsigned char *input, unsigned int len, unsigned int offset);\n\n",
+			"rx_match_t %s(const char *input, size_t len, size_t offset);\n\n",
 		funcName, funcName)
 }
 
@@ -449,14 +400,14 @@ func genCFindCPart(importModule, funcName string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "__attribute__((import_module(\"%s\"), import_name(\"%s\")))\n", importModule, funcName)
 	fmt.Fprintf(&sb, "extern long long %s(const unsigned char *ptr, unsigned int len);\n\n", ffi)
-	fmt.Fprintf(&sb, "rx_match_t %s(const unsigned char *input, unsigned int len, unsigned int offset) {\n", funcName)
+	fmt.Fprintf(&sb, "rx_match_t %s(const char *input, size_t len, size_t offset) {\n", funcName)
 	sb.WriteString("    if (offset > len) return (rx_match_t){-1, -1};\n")
-	fmt.Fprintf(&sb, "    long long r = %s(input + offset, len - offset);\n", ffi)
+	fmt.Fprintf(&sb, "    long long r = %s((const unsigned char *)input + offset, (unsigned int)(len - offset));\n", ffi)
 	sb.WriteString("    if (r == RX_ERR_BT_OVERFLOW) return (rx_match_t){RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW};\n")
 	sb.WriteString("    if (r < 0) return (rx_match_t){-1, -1};\n")
 	sb.WriteString("    unsigned int rel_s = (unsigned int)((unsigned long long)r >> 32);\n")
 	sb.WriteString("    unsigned int rel_e = (unsigned int)(r & 0xFFFFFFFFU);\n")
-	sb.WriteString("    return (rx_match_t){(int)(offset + rel_s), (int)(offset + rel_e)};\n")
+	sb.WriteString("    return (rx_match_t){(ptrdiff_t)(offset + rel_s), (ptrdiff_t)(offset + rel_e)};\n")
 	sb.WriteString("}\n\n")
 	return sb.String()
 }
@@ -498,7 +449,6 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	funcUpper := toUpperIdent(funcName)
 	slotCount := numGroups * 2
 	ffi := "_ffi_" + exportName
-	resultVar := "_" + funcName + "_result"
 	namesVar := "_" + funcName + "_names"
 
 	var hb, cb strings.Builder
@@ -529,7 +479,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 			"   that can match empty needs the guard, or offset never moves:\n"+
 			"     off = groups[0].end > groups[0].start ? groups[0].end\n"+
 			"                                          : groups[0].start + 1; */\n"+
-			"const rx_group_t *%s(const unsigned char *input, unsigned int len, unsigned int offset);\n\n",
+			"const rx_group_t *%s(const char *input, size_t len, size_t offset, rx_group_t *out);\n\n",
 		funcName, funcUpper, funcUpper, funcName)
 
 	// .c: group name constant definitions
@@ -562,37 +512,46 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	fmt.Fprintf(&cb, "extern int %s(const unsigned char *ptr, unsigned int len, int *out);\n\n", ffi)
 
 	// .c: wrapper function
-	fmt.Fprintf(&cb, "const rx_group_t *%s(const unsigned char *input, unsigned int len, unsigned int offset) {\n", funcName)
-	fmt.Fprintf(&cb, "    static rx_group_t %s[%d];\n", resultVar, numGroups)
+	// Decision (8): the caller supplies the array. The `static rx_group_t`
+	// this replaces was the last mutable static in generated C — two threads
+	// corrupted each other and a second call invalidated the first result.
+	//
+	// NOTE this does NOT make the C stubs thread-safe: the Backtracking engine
+	// keeps its stack at a fixed stackBase and its BitState memo at a fixed
+	// memoTableBase (compile/engine_backtrack.go), so BT-compiled patterns
+	// stay non-reentrant at the WASM level. Claim re-entrancy, not
+	// thread-safety.
+	fmt.Fprintf(&cb, "const rx_group_t *%s(const char *input, size_t len, size_t offset, rx_group_t *out) {\n", funcName)
+	cb.WriteString("    if (!input || !out) return (const rx_group_t *)0;\n")
 	fmt.Fprintf(&cb, "    int slots[%d];\n", slotCount)
-	cb.WriteString("    unsigned int pos = offset;\n")
+	cb.WriteString("    size_t pos = offset;\n")
 	cb.WriteString("    while (pos <= len) {\n")
 	fmt.Fprintf(&cb, "        for (int i = 0; i < %d; i++) slots[i] = -1;\n", slotCount)
-	fmt.Fprintf(&cb, "        int r = %s(input + pos, len - pos, slots);\n", ffi)
+	fmt.Fprintf(&cb, "        int r = %s((const unsigned char *)input + pos, (unsigned int)(len - pos), slots);\n", ffi)
 	cb.WriteString("        if (r == RX_ERR_BT_OVERFLOW) return (const rx_group_t *)0;\n")
 	cb.WriteString("        if (r >= 0) {\n")
 	fmt.Fprintf(&cb, "            for (int i = 0; i < %d; i++) {\n", numGroups)
-	fmt.Fprintf(&cb, "                %s[i].name = %s[i];\n", resultVar, namesVar)
+	fmt.Fprintf(&cb, "                out[i].name = %s[i];\n", namesVar)
 	cb.WriteString("                if (slots[i*2] >= 0) {\n")
-	fmt.Fprintf(&cb, "                    %s[i].start = (int)(pos + (unsigned int)slots[i*2]);\n", resultVar)
-	fmt.Fprintf(&cb, "                    %s[i].end   = (int)(pos + (unsigned int)slots[i*2+1]);\n", resultVar)
+	cb.WriteString("                    out[i].start = (ptrdiff_t)(pos + (size_t)slots[i*2]);\n")
+	cb.WriteString("                    out[i].end   = (ptrdiff_t)(pos + (size_t)slots[i*2+1]);\n")
 	cb.WriteString("                } else {\n")
-	fmt.Fprintf(&cb, "                    %s[i].start = -1;\n", resultVar)
-	fmt.Fprintf(&cb, "                    %s[i].end   = -1;\n", resultVar)
+	cb.WriteString("                    out[i].start = -1;\n")
+	cb.WriteString("                    out[i].end   = -1;\n")
 	cb.WriteString("                }\n")
 	cb.WriteString("            }\n")
-	fmt.Fprintf(&cb, "            return %s;\n", resultVar)
+	cb.WriteString("            return out;\n")
 	cb.WriteString("        }\n")
 	cb.WriteString("        if (pos == len) break;\n")
 	cb.WriteString("        pos++;\n")
 	cb.WriteString("    }\n")
 	// No match: set all entries to -1/-1 with names
 	fmt.Fprintf(&cb, "    for (int i = 0; i < %d; i++) {\n", numGroups)
-	fmt.Fprintf(&cb, "        %s[i].start = -1;\n", resultVar)
-	fmt.Fprintf(&cb, "        %s[i].end   = -1;\n", resultVar)
-	fmt.Fprintf(&cb, "        %s[i].name  = %s[i];\n", resultVar, namesVar)
+	cb.WriteString("        out[i].start = -1;\n")
+	cb.WriteString("        out[i].end   = -1;\n")
+	fmt.Fprintf(&cb, "        out[i].name  = %s[i];\n", namesVar)
 	cb.WriteString("    }\n")
-	fmt.Fprintf(&cb, "    return %s;\n", resultVar)
+	cb.WriteString("    return out;\n")
 	cb.WriteString("}\n\n")
 
 	return hb.String(), cb.String()

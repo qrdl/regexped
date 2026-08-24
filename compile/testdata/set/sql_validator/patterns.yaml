@@ -46,4 +46,4 @@ patterns:
   - name: with
     pattern: '(?i)^\s*WITH\s+\w'
 expect:
-  match: validate_sql
+  match_any: validate_sql

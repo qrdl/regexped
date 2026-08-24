@@ -62,13 +62,60 @@ func setCursorCountBits(patternCount int) int { return config.SetCursorCountBits
 // rather than a count that overflows into k.
 func setCursorMaxCount(patternCount int) int32 { return config.SetCursorMaxCount(patternCount) }
 
-// emitSetBatchPosBody emits the hidden per-position worker for a find_batch
-// export: the ordinary `find` body, built with compiledSet.batchPos set, which
-// swaps in §19's gate rule (gated) or its `skip` parameter (overlapping).
-func emitSetBatchPosBody(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemIdx int) []byte {
+// emitSetWorkerBody emits the SHARED per-position worker of a batching set:
+// the ordinary `find` body, built with compiledSet.batchPos set.
+//
+// Decision (11a) is what makes it shared. Previously this was the batch
+// export's private copy, and the module carried the bucket code twice — the
+// exported `find` body plus this one — which is where the measured 10-59%
+// module-size cost of declaring `find_batch` came from. Now the exported
+// `find` is a thin wrapper over this function too, so a batching set has ONE
+// set of bucket code and `find` pays one extra call per position.
+//
+// The two callers differ in exactly two ways, and both are runtime arguments
+// rather than compile-time variants:
+//
+//   - gated: the gate write-back rule. `find` is transactional at position
+//     granularity (§3.11 — an overflowing position records nothing and does
+//     not advance); the batch loop gates what it DELIVERED so it can resume
+//     inside a split position. That is one parameter, `batch_mode`, tested
+//     once per position.
+//   - overlapping: `skip`, which already existed. `find` passes 0.
+func emitSetWorkerBody(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemIdx int) []byte {
 	cs.batchPos = true
 	defer func() { cs.batchPos = false }()
 	return emitSetMatchFnFinal(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, capFind, 0)
+}
+
+// workerTypeIdx is the WASM type of the shared worker: `find`'s own signature
+// plus one trailing i32 — `batch_mode` when gated, §19's `skip` when not.
+func (cs *compiledSet) workerTypeIdx() int {
+	if cs.gatedFind() {
+		return setMatchTypeSuffix // (i32 x 7) -> i32
+	}
+	return setTypeI32x6ToI32 // (i32 x 6) -> i32
+}
+
+// emitSetFindWrapperBody emits the exported `find` of a batching set: a
+// forwarding call into the shared worker with the batch-only argument zeroed.
+//
+// Gated:      find(ptr,len,from,gate,out,cap) -> worker(..., batch_mode = 0)
+// Overlapping: find(ptr,len,from,out,cap)     -> worker(..., skip = 0)
+func emitSetFindWrapperBody(cs *compiledSet, workerIdx int) []byte {
+	nparams := 5
+	if cs.gatedFind() {
+		nparams = 6
+	}
+	b := []byte{0x00} // no locals
+	for i := 0; i < nparams; i++ {
+		b = append(b, 0x20, byte(i))
+	}
+	b = append(b, 0x41, 0x00) // the trailing argument: batch_mode / skip = 0
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(workerIdx))
+	b = append(b, 0x0B)
+	body := utils.AppendULEB128(nil, uint32(len(b)))
+	return append(body, b...)
 }
 
 // emitSetFindBatchBody emits the exported find_batch loop.
@@ -175,7 +222,12 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx int) []byte {
 	if !gated {
 		b = append(b, 0x20, lK, 0x6A)
 	}
-	if !gated {
+	if gated {
+		// batch_mode = 1: gate what is DELIVERED rather than only a position
+		// that fitted whole (decision (11a) made this a runtime argument, so
+		// the exported `find` can share this worker by passing 0).
+		b = append(b, 0x41, 0x01)
+	} else {
 		b = append(b, 0x20, lK)
 	}
 	b = append(b, 0x10)

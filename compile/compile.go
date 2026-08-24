@@ -2257,14 +2257,12 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		}
 		spec := SetSpec{
 			Name:        sc.Name,
-			Match:       sc.Match,
 			MatchAny:    sc.MatchAny,
 			MatchAll:    sc.MatchAll,
-			Scan:        sc.Scan,
 			ScanAny:     sc.ScanAny,
 			ScanAll:     sc.ScanAll,
 			Find:        sc.Find,
-			FindBatch:   sc.FindBatch,
+			BatchFind:   sc.BatchFind(),
 			Overlapping: sc.Overlapping,
 			Patterns:    infos,
 			PatternIDs:  globalIDs,

@@ -75,7 +75,7 @@ if (end >= 0) {
 ### `find_func` — non-anchored find
 
 ```ts
-export function <func>(input: ArrayBuffer, offset: i32): i64
+export function <func>(input: ArrayBuffer, offset: u32): i64
 ```
 
 Scans `input[offset..]` for the next match. Returns a **packed** `i64`:
@@ -109,7 +109,7 @@ while (true) {
 ### `groups_func` — capture groups
 
 ```ts
-export function <func>(input: ArrayBuffer, offset: i32): i32
+export function <func>(input: ArrayBuffer, offset: u32): u32
 ```
 
 Scans `input[offset..]` for the next match and fills a **static `Int32Array`** slot
@@ -188,25 +188,20 @@ When the config has a `sets:` block, the generator also emits, per set (see
 
 ```ts
 export const <SET>_PATTERN_COUNT: i32 = 12;
+export const <SET>_ID_SPACE: i32 = 12;
 
-class SetMatch  { constructor(public patternId: i32, public start: i32, public end: i32) {} }
-class SetAnchor { constructor(public patternId: i32, public start: i32) {} }
+class SetMatch { constructor(public patternId: i32, public start: u32, public end: u32) {} }
 
 // anchored: the pattern must match the WHOLE input
-export function <match>(input: ArrayBuffer): bool
 export function <match_any>(input: ArrayBuffer): i32              // id, or -1
 export function <match_all>(input: ArrayBuffer): Array<i32>
 
-// non-anchored: each takes a `from` position
-export function <scan>(input: ArrayBuffer, from: i32): bool
-export function <scan_any>(input: ArrayBuffer, from: i32): SetAnchor | null
-export function <scan_all>(input: ArrayBuffer, from: i32): Array<i32>
+// non-anchored: each takes an offset bounding the search
+export function <scan_any>(input: ArrayBuffer, offset: u32): i32  // id, or -1; NO position
+export function <scan_all>(input: ArrayBuffer, offset: u32): Array<i32>
 
 // AssemblyScript has no generators, so `find` is an explicit iterator object.
-export function <find>(input: ArrayBuffer, from: i32): <Find>Iter
-// find_batch: the same matches, a bufferful per call (see below).
-// buf holds 3 i32 per match, so its capacity is buf.length / 3.
-export function <find_batch>(input: ArrayBuffer, from: i32, buf: StaticArray<i32>): <FindBatch>Iter
+export function <find>(input: ArrayBuffer, offset: u32): <Find>Iter
 class <Find>Iter { next(): SetMatch | null }
 
 // only if any set in the config sets emit_name_map: true
@@ -230,29 +225,37 @@ requested `emit_name_map: true`.
 | Config field | Generated function | Returns |
 |---|---|---|
 | `match_func` | `<func>(input: ArrayBuffer): i32` | end position `≥ 0`, or `-1` |
-| `find_func` | `<func>(input: ArrayBuffer, offset: i32): i64` | packed `(absStart << 32 \| absEnd)`, or `-1` |
-| `groups_func` | `<func>(input: ArrayBuffer, offset: i32): i32` | `dataStart` pointer to slot buffer, or `0` |
+| `find_func` | `<func>(input: ArrayBuffer, offset: u32): i64` | packed `(absStart << 32 \| absEnd)`, or `-1` |
+| `groups_func` | `<func>(input: ArrayBuffer, offset: u32): u32` | `dataStart` pointer to slot buffer, or `0` |
+| `groups_func` | `<FUNC>_GROUPS: i32` | how many groups the slot buffer holds, group 0 included |
+| `groups_func` | `<func>_capture(input, slots: u32, g: i32): string \| null` | the decoded text of group `g` |
+
+**Offsets are `u32`.** An offset into an input cannot be negative, and the type
+says so. This CHANGES an existing parameter rather than adding one, so an AS
+caller passing a signed expression needs a cast.
+
+`<func>_capture` exists because AssemblyScript is the one language where
+captures are addressed purely by arithmetic — `named_groups_func` is rejected
+here (see below), so without it reading capture `g` means computing
+`load<i32>(slots + 8*g)` twice and hand-rolling a UTF-8 decode.
+`<FUNC>_GROUPS` is what makes bounds-checking and looping over all groups
+possible at all.
+
+It takes `input` again ON PURPOSE: the slots are offsets, so decoding needs the
+buffer, and a stub that remembered the last input would break the moment two
+scans interleave. It returns `null` both when the group did not participate and
+when `g` is out of range — those are different errors and this return does not
+separate them; an empty capture is legal, so `""` could not separate them
+either. The raw offsets stay reachable, so this is additive.
 | `named_groups_func` | **not supported** — generator returns an error | — |
 
-### `find_batch` — the same matches, a bufferful per call
+### Batching is a JS/TS-only hint
 
-`find` crosses the host boundary once per matching position. `find_batch`
-reports the same matches in the same order but fills **your** buffer with as
-many consecutive positions as fit, so a caller who will consume the whole scan
-crosses once per bufferful instead. Use `find` when you may stop early — a
-batch call does the work for matches you never look at.
-
-The two are independent capabilities; declare either, both, or neither.
-
-You own the buffer: allocate one and reuse it for every scan, so batched
-iteration allocates nothing in the steady state. Its length is the batch size,
-capped at `<SET>_BATCH_MAX_COUNT`; a zero-length buffer yields nothing. Any
-length of 1 or more makes progress — a position whose matches do not all fit is
-delivered in part and resumed inside. Because of that, group by the match's
-`start` field rather than by call boundary if you need per-position grouping.
-
-The gate array and the resume cursor stay stub-owned and never appear in the
-public surface; only the buffer is yours, because only its size is your choice.
+`hints: [batch-find]` is a **no-op for AssemblyScript**, as it is for C, Go and
+Rust. Batching amortises host-boundary crossings and nothing else, and an AS
+stub is compiled to wasm and merged, so its call into the module is a direct
+call inside one module with no boundary to amortise. There is no `find_batch`
+function; `find` is the whole positional surface.
 
 ## Notes
 

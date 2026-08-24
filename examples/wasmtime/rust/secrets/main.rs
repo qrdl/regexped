@@ -12,17 +12,17 @@ fn main() {
 
     let mut found = false;
 
-    for (start, end) in regexps::find_github_token(input) {
+    for (start, end) in regexps::find_github_token(input, 0) {
         let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
         println!("GitHub token at {}..{}: {}", start, end, s);
         found = true;
     }
-    for (start, end) in regexps::find_jwt_token(input) {
+    for (start, end) in regexps::find_jwt_token(input, 0) {
         let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
         println!("JWT at {}..{}: {}", start, end, s);
         found = true;
     }
-    for (start, end) in regexps::find_aws_key(input) {
+    for (start, end) in regexps::find_aws_key(input, 0) {
         let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
         println!("AWS key at {}..{}: {}", start, end, s);
         found = true;

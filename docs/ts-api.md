@@ -42,7 +42,7 @@ await init(wasm);
 ### `match_func` — anchored match
 
 ```ts
-export function <func>(input: string | Uint8Array): [number, boolean]
+export function <func>(input: string | Uint8Array): number | null
 ```
 
 Returns `[endPos, true]` if the pattern matches starting at position 0, or `[0, false]` if no match. `endPos` is the exclusive end position of the match in bytes.
@@ -52,8 +52,8 @@ To test whether the full input matches (anchored at both ends):
 ```ts
 const enc = new TextEncoder();
 const bytes = enc.encode('https://example.com/path');
-const [end, ok] = url_match(bytes);
-if (ok && end === bytes.length) {
+const end = url_match(bytes);
+if (end === bytes.length) {
     console.log('valid URL');
 }
 ```
@@ -61,8 +61,8 @@ if (ok && end === bytes.length) {
 For start-anchored use cases where the end position matters:
 
 ```ts
-const [end, ok]: [number, boolean] = url_match(input);
-if (ok) {
+const end: number | null = url_match(input);
+if (end !== null) {
     console.log('matched first', end, 'bytes');
 }
 ```
@@ -149,7 +149,7 @@ if (first?.host) {
 
 | Config field | Generated export | Return type |
 |---|---|---|
-| `match_func` | `function <func>(input)` | `[number, boolean]` — `[endPos, matched]` |
+| `match_func` | `function <func>(input)` | `number \| null` — the end position, or null |
 | `find_func` | `function* <func>(input)` | `Generator<[number, number]>` |
 | `groups_func` | `function* <func>(input)` | `Generator<Array<[number, number] \| null>>` |
 | `named_groups_func` | `function* <func>(input)` | `Generator<Record<string, [number, number]>>` |
@@ -168,29 +168,38 @@ format):
 
 ```ts
 export const <set>PatternCount: number;
+export const <set>IdSpace: number;
 
-export interface SetMatch  { patternId: number; start: number; end: number; }
-export interface SetAnchor { patternId: number; start: number; }
+export interface SetMatch { patternId: number; start: number; end: number; }
 
 // anchored: the pattern must match the WHOLE input
-export function <match>(input: string | Uint8Array): boolean
 export function <match_any>(input: string | Uint8Array): number | null
 export function <match_all>(input: string | Uint8Array): number[]
 
-// non-anchored: each takes a `from` position
-export function <scan>(input: string | Uint8Array, from?: number): boolean
-export function <scan_any>(input: string | Uint8Array, from?: number): SetAnchor | null
-export function <scan_all>(input: string | Uint8Array, from?: number): number[]
+// non-anchored: each takes an offset bounding the search
+export function <scan_any>(input: string | Uint8Array, offset?: number): number | null
+export function <scan_all>(input: string | Uint8Array, offset?: number): number[]
 
-export function* <find>(input: string | Uint8Array, from?: number): Generator<SetMatch>
-// TS is the exception: its buffer lives in WASM memory, so it takes a capacity
-// rather than a buffer. Every other language takes the buffer itself.
-export function* <find_batch>(input: string | Uint8Array, from?: number, capacity?: number): Generator<SetMatch>
+// find: without the `batch-find` hint there is no batchSize parameter at all,
+// so TypeScript rejects find(input, 0, 64) at build time.
+export function* <find>(input: string | Uint8Array, offset?: number): Generator<SetMatch>
+
+// with hints: [batch-find]
+export const <set>BatchMaxSize: number;
+export function* <find>(input: string | Uint8Array, offset?: number, batchSize?: number): Generator<SetMatch>
 ```
+
+`<match_all>` and `<scan_all>` stay **arrays, not generators**. That is
+deliberate and is where TS does not follow Go's `iter.Seq[int]` or Rust's
+`impl Iterator`: a generator would be another surface for the suspended-generator
+hazard below, while an array materialises before returning and cannot be
+suspended. The allocation argument that carried Go and Rust does not transfer —
+JS allocates the array either way, and the host crossing dominates it.
 
 The types make the `_any`/`_all` shapes explicit, which is the difference from
 the JavaScript stub — there, `if (scanAll(x))` is always true because an empty
-array is truthy. The `find` generator owns the gate array for the default
+array is truthy. `<scan_any>` reports **no position**, only an id: see
+[sets.md](sets.md) for why that is what makes it cheap. The `find` generator owns the gate array for the default
 non-overlapping configuration; creating a new one restarts the scan.
 
 **Do not call other stub functions while a generator is suspended** — the
@@ -199,25 +208,26 @@ staged input and the shared output region belong to whichever call ran last.
 `patternName(id)` is emitted once per config when any set sets
 `emit_name_map: true`.
 
-### `find_batch` — the same matches, a bufferful per call
+### `batchSize` — the same matches, a bufferful per call
 
-`find` crosses the host boundary once per matching position. `find_batch`
-reports the same matches in the same order but fills **your** buffer with as
-many consecutive positions as fit, so a caller who will consume the whole scan
-crosses once per bufferful instead. Use `find` when you may stop early — a
-batch call does the work for matches you never look at.
+`find` crosses the host boundary once per matching position. With
+`hints: [batch-find]` on the set, `find` gains an optional `batchSize` and
+fills a buffer with as many consecutive positions as fit, so a caller who will
+consume the whole scan crosses once per bufferful instead. Leave it out when
+you may stop early — a batched call does the work for matches you never look
+at, which is exactly why batching is opt-in rather than the default.
 
-The two are independent capabilities; declare either, both, or neither.
+It is the SAME function either way: same matches, same order, same overlap
+policy. Only how much work one crossing does changes. `batchSize` is clamped
+into `[1, <set>BatchMaxSize]`; any value of 1 or more makes progress, since a
+position whose matches do not all fit is delivered in part and resumed inside.
+Group by the match's `start` field rather than by call boundary if you need
+per-position grouping.
 
-You own the buffer: allocate one and reuse it for every scan, so batched
-iteration allocates nothing in the steady state. Its length is the batch size,
-capped at `<SET>_BATCH_MAX_COUNT`; a zero-length buffer yields nothing. Any
-length of 1 or more makes progress — a position whose matches do not all fit is
-delivered in part and resumed inside. Because of that, group by the match's
-`start` field rather than by call boundary if you need per-position grouping.
-
-The gate array and the resume cursor stay stub-owned and never appear in the
-public surface; only the buffer is yours, because only its size is your choice.
+**JS and TS are the only languages with this parameter.** Batching amortises
+host-boundary crossings, and C, Go, Rust and AssemblyScript are compiled to
+wasm and merged — their call into the module is a direct call inside one module
+with no boundary to amortise. The hint is a no-op there.
 
 ## Notes
 

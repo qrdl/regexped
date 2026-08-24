@@ -178,6 +178,10 @@ type setFindCtx struct {
 	batch   bool
 	hasSkip bool
 	pSkip   byte
+	// pBatchMode names the gated worker's trailing parameter: 0 selects
+	// `find`'s transactional gate rule, non-zero the batch loop's
+	// deliver-and-gate rule (decision (11a)). Valid only when batch && gated.
+	pBatchMode byte
 
 	// Locals.
 	lTmp       byte // scratch (prefix-DFA result, suffix-call result)
@@ -189,11 +193,15 @@ type setFindCtx struct {
 	lStart     byte // the match start of the group currently being evaluated
 	lAcc       byte // i64 bitmask accumulator, scan_all only
 	// aliveMask is an i64 local holding the ids that match SOMEWHERE in
-	// [from,len), filled once by the G8 union preflight; aliveReady says it
-	// exists. When set, emitGroupMask intersects every bucket's validMask
-	// with it, which is what lets the liveness exit fire (§18.4).
-	aliveMask  byte
-	aliveReady bool
+	// [from,len). G9's gated-`find` preflight fills it and writes it back as
+	// §3.16 gate sentinels.
+	//
+	// G8's `scan_any` preflight also used it, to intersect every bucket's
+	// validMask and make the liveness exit fire (§18.4). That is gone with
+	// decision (10): `scan_any` is the union walk now, so there is no
+	// per-position walk left to narrow. `aliveReady` and `emitAliveNarrow`
+	// went with it.
+	aliveMask byte
 }
 
 // minStartSentinel is lMinStart's "nothing found yet" value. It is larger than
@@ -209,50 +217,14 @@ const minStartSentinel = int32(0x7FFFFFFF)
 // is provably redundant. Bodies that batch several candidates between drain
 // checks still need it.
 func (c *setFindCtx) needMinStartCompare() bool {
-	// scan and scan_all track no minimum start at all — the first is a
-	// boolean and the second accumulates over the whole input — so lMinStart
-	// stays at its sentinel and the compare can never fire.
-	if c.mode == capScan || c.mode == capScanAll {
+	// The scan trio tracks no minimum start at all — `scan` is a boolean,
+	// `scan_all` accumulates over the whole input, and `scan_any` stopped
+	// reporting a start under TODO task 59 decision (10) — so lMinStart stays
+	// at its sentinel and the compare can never fire.
+	if c.mode == capScan || c.mode == capScanAll || c.mode == capScanAny {
 		return false
 	}
 	return c.maxLookback != 0 || !c.perPositionDrain
-}
-
-// emitAliveNarrow intersects lValidMask with the patterns the G8 preflight
-// proved can match somewhere in [from,len).
-//
-// Correctness: removing a pattern with NO match in the search range cannot
-// change `scan_any`'s answer (§3.5) — it alters neither the earliest matching
-// start nor the set of ids available at that start. It is a no-op when the
-// preflight was not emitted.
-//
-// The alive mask is in GLOBAL id space; bucket bi's validMask is bucket-local,
-// so each bit is tested against its own global id. That is up to 32 tests, but
-// they run once per candidate position rather than per byte, and only for the
-// literal-less sets this path serves.
-func (c *setFindCtx) emitAliveNarrow(b []byte, bi int) []byte {
-	if !c.aliveReady || bi >= len(c.cs.patternIDs) {
-		return b
-	}
-	ids := c.cs.patternIDs[bi]
-	for k, gid := range ids {
-		if k >= 32 || gid >= 64 {
-			continue
-		}
-		// if (alive >> gid) & 1 == 0 { validMask &^= 1<<k }
-		b = append(b, 0x20, c.aliveMask)
-		b = append(b, 0x42)
-		b = utils.AppendSLEB128_64(b, int64(gid))
-		b = append(b, 0x88)             // i64.shr_u
-		b = append(b, 0x42, 0x01, 0x83) // i64.and 1
-		b = append(b, 0x50)             // i64.eqz -> not alive
-		b = append(b, 0x04, 0x40)       // if
-		b = append(b, 0x20, c.lValidMask, 0x41)
-		b = utils.AppendSLEB128(b, int32(^(uint32(1) << uint(k))))
-		b = append(b, 0x71, 0x21, c.lValidMask)
-		b = append(b, 0x0B)
-	}
-	return b
 }
 
 // emitGroupMask computes lValidMask for ONE prefix-length group of bucket bi
@@ -279,7 +251,7 @@ func (c *setFindCtx) emitGroupMask(b []byte, bi int, g prefixLenGroup, posLocal 
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(g.mask))
 		b = append(b, 0x21, c.lValidMask)
-		return c.emitAliveNarrow(b, bi)
+		return b
 	}
 	sam := cs.startAnchorMasks[bi] & g.mask
 	lam := cs.lineAnchorMasks[bi] & g.mask
@@ -287,7 +259,6 @@ func (c *setFindCtx) emitGroupMask(b []byte, bi int, g prefixLenGroup, posLocal 
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(base))
 	b = append(b, 0x21, c.lValidMask)
-	b = c.emitAliveNarrow(b, bi)
 	if sam != 0 {
 		b = append(b, 0x20, posLocal, 0x45, 0x04, 0x40) // if posLocal == 0
 		b = append(b, 0x20, c.lValidMask, 0x41)
@@ -471,11 +442,22 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 	if !c.gated {
 		return b
 	}
-	// if lTotal > 0 [&& lTotal <= out_cap]
-	b = append(b, 0x20, c.lTotal, 0x04, 0x40)
-	if !c.batch {
-		b = append(b, 0x20, c.lTotal, 0x20, c.pOutCap, 0x4C, 0x04, 0x40) // <= (signed)
+	// if lTotal > 0 && (batch_mode != 0 || lTotal <= out_cap)
+	//
+	// The second half is `find`'s transactional rule and the batch loop's
+	// absence of one, selected at RUNTIME because both callers share this
+	// body (decision (11a)). A non-batching set has no batch_mode parameter
+	// and keeps the compile-time form, so its `find` is unchanged.
+	b = append(b, 0x20, c.lTotal, 0x41, 0x00, 0x4A) // total > 0 (signed)
+	if c.batch && c.gated {
+		b = append(b, 0x20, c.pBatchMode)
+		b = append(b, 0x20, c.lTotal, 0x20, c.pOutCap, 0x4C) // total <= cap
+		b = append(b, 0x72)                                  // i32.or
+		b = append(b, 0x71)                                  // i32.and
+	} else if !c.batch {
+		b = append(b, 0x20, c.lTotal, 0x20, c.pOutCap, 0x4C, 0x71) // && total <= cap
 	}
+	b = append(b, 0x04, 0x40) // if
 	b = append(b, 0x41, 0x00, 0x21, lPos)
 	b = append(b, 0x02, 0x40)                                   // block $wb_done
 	b = append(b, 0x03, 0x40)                                   // loop $wb
@@ -485,6 +467,11 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 		// stops at the buffer. An overflowing position leaves the patterns it
 		// could not report ungated, and the §3.16 pre-mask lets exactly those
 		// match again when the caller resumes at this same position.
+		//
+		// Unconditional even in `find` mode, where it cannot fire: the guard
+		// above has already established total <= cap there, so bounding the
+		// loop at cap as well changes nothing and saves a second branch on
+		// batch_mode.
 		b = append(b, 0x20, lPos, 0x20, c.pOutCap, 0x4E, 0x0D, 0x01) // idx >= cap → done
 	}
 	b = append(b, 0x20, c.pOutPtr, 0x20, lPos, 0x41, 12, 0x6C, 0x6A, 0x21, c.lOutBase)
@@ -503,10 +490,7 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B) // end loop $wb
 	b = append(b, 0x0B) // end block $wb_done
-	if !c.batch {
-		b = append(b, 0x0B) // end if total <= cap
-	}
-	b = append(b, 0x0B) // end if total > 0
+	b = append(b, 0x0B) // end if
 	return b
 }
 
@@ -941,14 +925,15 @@ func (c *setFindCtx) emitRecordProbe(b []byte, bi int) []byte {
 		b = append(b, 0x0B)
 		return b
 	case capScanAny:
-		// Keep the earliest start, and one arbitrary id matching there (§3.5).
-		// No escape depth: a later candidate can still recover an earlier
-		// start, so the scan must keep looking.
+		// One arbitrary id matching anywhere at or after `from`. `scan_any`
+		// reports no start (TODO task 59 decision (10)), so there is nothing
+		// to improve on once an id is recorded and no reason to keep looking
+		// for an earlier candidate — the drain check exits at the first hit,
+		// exactly as `scan`'s does. No escape depth: leaving the loop is that
+		// check's job, which keeps this emitter free of each frontend's
+		// br-depth bookkeeping.
 		b = append(b, 0x20, c.lTmp, 0x04, 0x40)
-		b = append(b, 0x20, c.lStart, 0x20, c.lMinStart, 0x48, 0x04, 0x40) // start < best
-		b = append(b, 0x20, c.lStart, 0x21, c.lMinStart)
 		b = emitSetAnyID(b, c.cs.patternIDs[bi], c.lTmp, c.lOutBase, -1)
-		b = append(b, 0x0B)
 		b = append(b, 0x0B)
 		return b
 	default: // capScanAll
@@ -980,15 +965,10 @@ func (c *setFindCtx) emitEpilogue(b []byte) []byte {
 	case capScan:
 		return append(b, 0x20, c.lTotal) // 1 iff some probe reported a hit
 	case capScanAny:
-		// (start << 32) | id, or -1 (§3.17). The id stays -1 when nothing
-		// matched, and -1 is unambiguous because both fields are < 2^31.
-		b = append(b, 0x20, c.lOutBase, 0x41, 0x00, 0x48, 0x04, 0x7E)
-		b = append(b, 0x42, 0x7F)
-		b = append(b, 0x05)
-		b = append(b, 0x20, c.lMinStart, 0xAD, 0x42, 0x20, 0x86)
-		b = append(b, 0x20, c.lOutBase, 0xAD, 0x84)
-		b = append(b, 0x0B)
-		return b
+		// A bare pattern id, or -1 (TODO task 59 decision (10)). lOutBase is
+		// initialised to -1 and only ever written with a real id, so it IS
+		// the answer.
+		return append(b, 0x20, c.lOutBase)
 	case capScanAll:
 		if c.wideBitmap {
 			return append(b, 0x20, c.lTotal)
@@ -1009,6 +989,11 @@ func (c *setFindCtx) emitDrainCheck(b []byte, lPos byte, depth byte) []byte {
 		// position or chunk costs nothing measurable and keeps this check
 		// independent of each frontend's block nesting.
 		return append(b, 0x20, c.lTotal, 0x0D, depth)
+	case capScanAny:
+		// Settled by the first hit for the same reason, now that no start is
+		// reported: any recorded id is a final answer. lOutBase is -1 until
+		// one is recorded, so "id >= 0" is the test.
+		return append(b, 0x20, c.lOutBase, 0x41, 0x00, 0x4E, 0x0D, depth)
 	case capScanAll:
 		// No first-position notion at all: scan_all asks which patterns match
 		// ANYWHERE at or after `from`, so the only early exit is "every
@@ -1154,6 +1139,12 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 	case gated:
 		c.pGate, c.pOutPtr, c.pOutCap = 3, 4, 5
 		c.localBase = 6
+		if batch {
+			// The shared worker's trailing argument: 0 = `find`'s
+			// transactional gate rule, non-zero = §19's deliver-and-gate.
+			c.pBatchMode = 6
+			c.localBase = 7
+		}
 	default:
 		c.pOutPtr, c.pOutCap = 3, 4
 		c.localBase = 5

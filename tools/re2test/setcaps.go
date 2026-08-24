@@ -103,11 +103,15 @@ var (
 //     tuple-writing suffix function.
 
 type setCapMask struct {
-	setName                   string
-	match, matchAny, matchAll bool
-	scan, scanAny, scanAll    bool
-	find, findBatch           bool
-	overlapping               bool
+	setName            string
+	matchAny, matchAll bool
+	scanAny, scanAll   bool
+	find               bool
+	// batchFind is `hints: [batch-find]` on the set. Since TODO task 59
+	// decision (11) batching is a property of `find` rather than a capability
+	// of its own, so it cannot be requested without it.
+	batchFind   bool
+	overlapping bool
 }
 
 type setProfile struct {
@@ -116,26 +120,26 @@ type setProfile struct {
 }
 
 var setProfileTable = []setProfile{
-	// Everything, in one module: a gated set declaring all eight capabilities
-	// plus an overlapping set for the other `find`/`find_batch` bodies. This
-	// is the default, and its gated-find leg is the run §22.5 requires to keep
-	// passing unchanged.
+	// Everything, in one module: a gated set declaring all five capabilities
+	// and asking for batching, plus an overlapping set for the other `find`
+	// bodies. This is the default, and its gated-find leg is the run §22.5
+	// requires to keep passing unchanged.
 	{"all", []setCapMask{
-		{setName: "g", match: true, matchAny: true, matchAll: true,
-			scan: true, scanAny: true, scanAll: true, find: true, findBatch: true},
-		{setName: "o", find: true, findBatch: true, overlapping: true},
+		{setName: "g", matchAny: true, matchAll: true,
+			scanAny: true, scanAll: true, find: true, batchFind: true},
+		{setName: "o", find: true, batchFind: true, overlapping: true},
 	}},
 	// The specialisations. Each drops everything but one family, so the
 	// emitter takes the path it only takes when the rest is absent.
-	{"anchored", []setCapMask{{setName: "g", match: true, matchAny: true, matchAll: true}}},
-	{"scan", []setCapMask{{setName: "g", scan: true, scanAny: true, scanAll: true}}},
+	{"anchored", []setCapMask{{setName: "g", matchAny: true, matchAll: true}}},
+	{"scan", []setCapMask{{setName: "g", scanAny: true, scanAll: true}}},
 	// §3.9: `scan_any` without `find` is its own structural specialisation —
 	// it keeps the first-hit-exit probes but none of the extent machinery.
 	{"scan-any", []setCapMask{{setName: "g", scanAny: true}}},
 	{"find", []setCapMask{{setName: "g", find: true}}},
 	{"find-ov", []setCapMask{{setName: "o", find: true, overlapping: true}}},
-	{"batch", []setCapMask{{setName: "g", findBatch: true}}},
-	{"batch-ov", []setCapMask{{setName: "o", findBatch: true, overlapping: true}}},
+	{"batch", []setCapMask{{setName: "g", find: true, batchFind: true}}},
+	{"batch-ov", []setCapMask{{setName: "o", find: true, batchFind: true, overlapping: true}}},
 }
 
 func lookupSetProfile(name string) (setProfile, bool) {
@@ -184,13 +188,13 @@ func resolveSetProfiles(spec string) ([]setProfile, error) {
 // expensive one — it is O(len) Go probe evaluations per (pattern, string).
 func (p setProfile) needs() (anchored, spm, findAll bool) {
 	for _, s := range p.specs {
-		anchored = anchored || s.match || s.matchAny || s.matchAll
+		anchored = anchored || s.matchAny || s.matchAll
 		if s.overlapping {
-			spm = spm || s.find || s.findBatch
+			spm = spm || s.find
 		} else {
-			findAll = findAll || s.find || s.findBatch
+			findAll = findAll || s.find
 		}
-		spm = spm || s.scan || s.scanAny || s.scanAll
+		spm = spm || s.scanAny || s.scanAll
 	}
 	return
 }
@@ -719,17 +723,11 @@ func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selec
 			Overlapping: s.overlapping,
 			Hints:       hints,
 		}
-		if s.match {
-			sc.Match = s.setName + "_match"
-		}
 		if s.matchAny {
 			sc.MatchAny = s.setName + "_match_any"
 		}
 		if s.matchAll {
 			sc.MatchAll = s.setName + "_match_all"
-		}
-		if s.scan {
-			sc.Scan = s.setName + "_scan"
 		}
 		if s.scanAny {
 			sc.ScanAny = s.setName + "_scan_any"
@@ -740,8 +738,8 @@ func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selec
 		if s.find {
 			sc.Find = s.setName + "_find"
 		}
-		if s.findBatch {
-			sc.FindBatch = s.setName + "_find_batch"
+		if s.batchFind {
+			sc.Hints = append(append([]string(nil), sc.Hints...), "batch-find")
 		}
 		sets = append(sets, sc)
 	}
@@ -910,10 +908,10 @@ func runSetProfile(
 	// Resolve every export once. A missing export is a compiler bug, not a
 	// per-input failure, so it stops the run rather than being counted.
 	type capFns struct {
-		spec                      setCapMask
-		match, matchAny, matchAll *wasmtime.Func
-		scan, scanAny, scanAll    *wasmtime.Func
-		find, findBatch           *wasmtime.Func
+		spec               setCapMask
+		matchAny, matchAll *wasmtime.Func
+		scanAny, scanAll   *wasmtime.Func
+		find, findBatch    *wasmtime.Func
 	}
 	var fns []capFns
 	for _, s := range prof.specs {
@@ -929,16 +927,10 @@ func runSetProfile(
 			return f, nil
 		}
 		var e error
-		if c.match, e = get(s.match, s.setName+"_match"); e != nil {
-			return e
-		}
 		if c.matchAny, e = get(s.matchAny, s.setName+"_match_any"); e != nil {
 			return e
 		}
 		if c.matchAll, e = get(s.matchAll, s.setName+"_match_all"); e != nil {
-			return e
-		}
-		if c.scan, e = get(s.scan, s.setName+"_scan"); e != nil {
 			return e
 		}
 		if c.scanAny, e = get(s.scanAny, s.setName+"_scan_any"); e != nil {
@@ -950,7 +942,10 @@ func runSetProfile(
 		if c.find, e = get(s.find, s.setName+"_find"); e != nil {
 			return e
 		}
-		if c.findBatch, e = get(s.findBatch, s.setName+"_find_batch"); e != nil {
+		// Decision (11): the batch entry is synthesized from `find`'s name
+		// under the hint, not declared, so its export name is derived the
+		// same way the compiler and the six generators derive it.
+		if c.findBatch, e = get(s.batchFind, config.SetBatchExportName(s.setName+"_find")); e != nil {
 			return e
 		}
 		fns = append(fns, c)
@@ -972,26 +967,8 @@ func runSetProfile(
 			}
 
 			// ---- anchored trio -------------------------------------------
-			if c.match != nil || c.matchAny != nil || c.matchAll != nil {
+			if c.matchAny != nil || c.matchAll != nil {
 				want := keepIDs(orc.anchoredIDs(si), r.anchoredEligible)
-				if c.match != nil {
-					res, hang, e := r.call(c.match, r.inBase, tlen)
-					if e != nil {
-						return e
-					}
-					if hang {
-						setStats.timeouts++
-					} else {
-						got := res.(int32)
-						if (got != 0) == (len(want) > 0) {
-							setStats.ok("match", 1)
-						} else {
-							setStats.bad("match", 1)
-							setFailf("FAIL  set match: got %d, want %v (ids %v)\n      input: %q\n      patterns: %s\n",
-								got, len(want) > 0, want, text, fmtSetPatterns(chunk.pats))
-						}
-					}
-				}
 				if c.matchAny != nil {
 					res, hang, e := r.call(c.matchAny, r.inBase, tlen)
 					if e != nil {
@@ -1031,27 +1008,8 @@ func runSetProfile(
 			}
 
 			// ---- scan trio -----------------------------------------------
-			if c.scan != nil || c.scanAny != nil || c.scanAll != nil {
+			if c.scanAny != nil || c.scanAll != nil {
 				for _, from := range setFromValues(len(text)) {
-					if c.scan != nil {
-						res, hang, e := r.call(c.scan, r.inBase, tlen, int32(from))
-						if e != nil {
-							return e
-						}
-						if hang {
-							setStats.timeouts++
-						} else {
-							pos, _ := orc.firstPosition(si, from, r.findEligible)
-							got := res.(int32)
-							if (got != 0) == (pos >= 0) {
-								setStats.ok("scan", 1)
-							} else {
-								setStats.bad("scan", 1)
-								setFailf("FAIL  set scan(from=%d): got %d, want %v\n      input: %q\n      patterns: %s\n",
-									from, got, pos >= 0, text, fmtSetPatterns(chunk.pats))
-							}
-						}
-					}
 					if c.scanAny != nil {
 						res, hang, e := r.call(c.scanAny, r.inBase, tlen, int32(from))
 						if e != nil {
@@ -1060,25 +1018,26 @@ func runSetProfile(
 						if hang {
 							setStats.timeouts++
 						} else {
-							packed := res.(int64)
-							wantPos, wantIDs := orc.firstPosition(si, from, r.findEligible)
+							gotID := int(res.(int32))
+							// TODO task 59 decision (10): a BARE id, no start.
+							// The id may name any pattern matching anywhere at
+							// or after `from`, so the membership set is
+							// scanAllIDs' — firstPosition's would be wrong for
+							// a hit found by the fallback phase past the first
+							// literal position.
+							wantIDs := orc.scanAllIDs(si, from, r.findEligible)
 							okAny := false
-							var gotPos, gotID int
-							if packed == -1 {
-								gotPos, gotID = -1, -1
-								okAny = wantPos == -1
+							if gotID == -1 {
+								okAny = len(wantIDs) == 0
 							} else {
-								gotPos = int(packed >> 32)
-								gotID = int(int32(uint32(packed)))
-								// §9.6: exact on the start, membership on the id.
-								okAny = gotPos == wantPos && containsSetID(wantIDs, gotID)
+								okAny = containsSetID(wantIDs, gotID)
 							}
 							if okAny {
 								setStats.ok("scan_any", 1)
 							} else {
 								setStats.bad("scan_any", 1)
-								setFailf("FAIL  set scan_any(from=%d): got start=%d id=%d, want start=%d id in %v\n      input: %q\n      patterns: %s\n",
-									from, gotPos, gotID, wantPos, wantIDs, text, fmtSetPatterns(chunk.pats))
+								setFailf("FAIL  set scan_any(from=%d): got id=%d, want id in %v\n      input: %q\n      patterns: %s\n",
+									from, gotID, wantIDs, text, fmtSetPatterns(chunk.pats))
 							}
 						}
 					}
@@ -1156,7 +1115,7 @@ func runSetProfile(
 			}
 
 			// ---- §4.2 out-of-range `from` --------------------------------
-			if e := r.checkFromOutOfRange(c.scan, c.scanAny, c.scanAll, c.find, c.findBatch,
+			if e := r.checkFromOutOfRange(c.scanAny, c.scanAll, c.find, c.findBatch,
 				c.spec.overlapping, tlen, chunk.pats); e != nil {
 				return e
 			}
@@ -1403,33 +1362,19 @@ func (r *setRunner) driveFindOverflow(fn *wasmtime.Func, text string, overlappin
 // (an iterator that resumed one past the end) and nothing in the corpus reaches
 // it, because every ordinary drive stops at len.
 func (r *setRunner) checkFromOutOfRange(
-	scan, scanAny, scanAll, find, findBatch *wasmtime.Func, overlapping bool, tlen int32,
+	scanAny, scanAll, find, findBatch *wasmtime.Func, overlapping bool, tlen int32,
 	pats []string,
 ) error {
 	for _, from := range []int32{tlen + 1, tlen + 7} {
-		if scan != nil {
-			res, hang, err := r.call(scan, r.inBase, tlen, from)
-			if err != nil {
-				return err
-			}
-			if !hang {
-				if got := res.(int32); got != 0 {
-					setStats.bad("from>len/scan", 1)
-					setFailf("FAIL  set scan(from=%d > len=%d): got %d, want 0 (§4.2)\n      set: %s\n", from, tlen, got, fmtSetPatterns(pats))
-				} else {
-					setStats.ok("from>len/scan", 1)
-				}
-			}
-		}
 		if scanAny != nil {
 			res, hang, err := r.call(scanAny, r.inBase, tlen, from)
 			if err != nil {
 				return err
 			}
 			if !hang {
-				if got := res.(int64); got != -1 {
+				if got := res.(int32); got != -1 {
 					setStats.bad("from>len/scan_any", 1)
-					setFailf("FAIL  set scan_any(from=%d > len=%d): got %#x, want -1 (§4.2)\n      set: %s\n", from, tlen, got, fmtSetPatterns(pats))
+					setFailf("FAIL  set scan_any(from=%d > len=%d): got %d, want -1 (§4.2)\n      set: %s\n", from, tlen, got, fmtSetPatterns(pats))
 				} else {
 					setStats.ok("from>len/scan_any", 1)
 				}

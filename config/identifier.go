@@ -602,14 +602,18 @@ func CamelSetName(name string) string {
 }
 
 // setDerivedNames returns the module-scope names stubType's generator
-// synthesizes from one set's NAME — the pattern-count, id-space and
-// find_batch cursor constants.
+// synthesizes from one set's NAME — the pattern-count and id-space constants,
+// plus JS/TS's batch-size limit.
 //
-// All four are returned whether or not the set declares find_batch today. The
-// batch constants are emitted only when it does, but conditioning the check on
-// that would mean adding `find_batch:` to a working config turns a valid export
-// name into a collision — the same churn jsHelperNames refuses to create, and
-// the reason that list is denied unconditionally.
+// The batch constant is reserved whether or not the set carries
+// `hints: [batch-find]` today, for the reason jsHelperNames denies its list
+// unconditionally: conditioning the check on the hint would mean ADDING the
+// hint to a working config turns a valid export name into a collision.
+//
+// It is reserved in every language even though only JS/TS emits it. Decision
+// (11) keys batching on the hint and never on stub_type, precisely so that
+// changing stub_type cannot break a working config — reserving the name in
+// only two of the six would reintroduce exactly that.
 //
 // This check cannot be name-independent the way the others are: what a set is
 // called decides what its constants are called, so unlike the helper lists this
@@ -620,13 +624,13 @@ func setDerivedNames(s SetConfig, stubType string) []string {
 	switch stubType {
 	case "rust", "c", "as":
 		stem, suffixes = ScreamingSetName(s.Name), []string{
-			"_PATTERN_COUNT", "_ID_SPACE", "_BATCH_COUNT_BITS", "_BATCH_MAX_COUNT"}
+			"_PATTERN_COUNT", "_ID_SPACE", "_BATCH_MAX_SIZE"}
 	case "go":
 		stem, suffixes = PascalSetName(s.Name), []string{
-			"PatternCount", "IDSpace", "BatchCountBits", "BatchMaxCount"}
+			"PatternCount", "IDSpace", "BatchMaxSize"}
 	case "js", "ts":
 		stem, suffixes = CamelSetName(s.Name), []string{
-			"PatternCount", "IdSpace", "BatchCountBits", "BatchMaxCount"}
+			"PatternCount", "IdSpace", "BatchMaxSize"}
 	default:
 		return nil
 	}

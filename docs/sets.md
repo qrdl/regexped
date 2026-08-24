@@ -45,7 +45,7 @@ their own packing over the full patterns — see
 [below](#the-anchored-capabilities-use-their-own-automata) for why they have
 to.
 
-## The eight capabilities
+## The five capabilities
 
 A set declares which questions it needs answered, and the compiler emits only
 the machinery those questions require. The **key** names the capability; the
@@ -61,54 +61,60 @@ regexps:
 sets:
   - name: secret_scanner
     # ---- anchored: the match must span the WHOLE input (0..len) ----
-    match:      is_secret        # -> yes/no
     match_any:  which_secret     # -> one pattern id, or none
     match_all:  all_secret_kinds # -> every matching pattern id
-    # ---- non-anchored: each takes a `from` position ----
-    scan:       has_secret       # -> yes/no
-    scan_any:   first_secret     # -> one pattern id + where it starts
+    # ---- non-anchored: each takes an `offset` ----
+    scan_any:   first_secret     # -> one pattern id, or none
     scan_all:   secret_kinds     # -> every pattern matching somewhere
     find:       scan_secrets     # -> the matches at the next matching position
-    find_batch: scan_secrets_batch # -> the same, several positions per call
     overlapping: false           # optional; see "Overlap policy" below
+    hints:      [batch-find]     # optional; work several positions ahead per call
     patterns:   all
     emit_name_map: true
 ```
 
-The grid: `match_*` is anchored, `scan_*` is not; bare is a boolean, `_any` is
-one arbitrary matching pattern, `_all` is every matching pattern. `find` and
-`find_batch` are the only capabilities that report positions and extents; they
-report the same matches and differ only in how many positions one call covers.
+The grid: `match_*` is anchored, `scan_*` is not; `_any` is one arbitrary
+matching pattern, `_all` is every matching pattern. `find` is the only
+capability that reports positions and extents.
 
 At least one capability must be declared. Every capability value must be a
 valid identifier in all six stub languages (see
 [cli.md](cli.md#export-name-rules)).
 
-> **Migration trap.** `match:` used to mean "anchored, returns the matching
-> pattern id". It now means "anchored, yes/no". An existing config keeps
-> parsing and silently changes capability — no parsing policy can catch that,
-> because the key stays valid. If you want the old meaning, use `match_any:`.
-> The retired keys `find_any`, `find_all` and `batch_size` are caught loudly:
-> config parsing is strict, so they fail as unknown-field errors. `batch_size`
-> is retired for good: batching is now `find_batch`, and its buffer is sized by
-> the CALLER at run time rather than by a compile-time knob.
+> **Retired keys — all load errors, none silent.** Config parsing is strict, so
+> a retired key fails as a line-numbered unknown-field error.
+>
+> - **`match:` and `scan:`** are gone. `match_any(...) >= 0` is exactly what
+>   `match` returned and `scan_any(...) >= 0` what `scan` returned, and the
+>   redundancy measured at 1-3% of module size. Dropping the KEYS was the
+>   point: keeping `match:` with `match_any` semantics would leave every
+>   existing config compiling while its callers silently switched from reading
+>   0/1 to reading an id — and id 0 would read as "no match". A removed key
+>   fails at build; a redefined one fails in production.
+> - **`find_batch:`** is gone. Batching is a property of `find` now, requested
+>   with `hints: [batch-find]`. The two were never distinguishable at the API
+>   level — same matches, same order, cursor and gate array stub-owned — and
+>   the only caller-visible difference is how much work one host crossing does.
+>   That is a parameter, not a name.
+> - **`find_any`, `find_all`, `batch_size`** were retired earlier and stay so.
 
 ### What "anchored" means here
 
-`match`, `match_any` and `match_all` require **full consumption**: the pattern
+`match_any` and `match_all` require **full consumption**: the pattern
 must match from position 0 to `len`, i.e. `\A(?:p)\z`. A pattern matching a
 proper prefix does not count. This is the same rule the single-pattern
 `match_func` has always used.
 
-### The range of `from`
+### The range of `offset`
 
-Valid values are `0 <= from <= len`. `from == len` is a **real position and is
-evaluated**: end-anchored patterns (`…$`, `…\z`) and empty-matchable ones can
-match there. `from > len` yields the capability's "nothing" result — `scan` 0,
-`scan_any` −1, `scan_all` no ids, `find` 0, `find_batch` a finished cursor with
-count 0 — rather than being an error or wrapping around.
+Valid values are `0 <= offset <= len`. `offset == len` is a **real position and
+is evaluated**: end-anchored patterns (`…$`, `…\z`) and empty-matchable ones can
+match there. `offset > len` yields the capability's "nothing" result —
+`scan_any` −1, `scan_all` no ids, `find` 0, a batching `find` a finished cursor
+with count 0 — rather than being an error or wrapping around.
 
-`ptr`/`len` always describe the **whole** input; `from` bounds only the search.
+`ptr`/`len` always describe the **whole** input; `offset` bounds only the
+search.
 That is what lets `^`, `\A`, `\b` and `(?m:^)` judge their real neighbours when
 you resume a scan mid-input, instead of treating `from` as a new start of text.
 
@@ -130,24 +136,43 @@ Iterating is therefore "call, use, resume at `start + 1`". The generated stubs
 do exactly that and hand you one match at a time.
 
 The buffer that holds one position's matches is `<SET>_PATTERN_COUNT` tuples,
-the exact worst case for a single start, and every stub sizes it that way. In
-**C** you supply it — `<find>_init(&sc, from, buf, cap)`, mirroring
-`find_batch` — because a header with no allocator cannot own a buffer whose
-size the set decides. Unlike `find_batch`, this one has a MINIMUM of
-`<SET>_PATTERN_COUNT`: `find` is transactional, so a position whose matches do
-not all fit delivers nothing and asks you to grow, and a scanner given less
-yields nothing rather than a partial scan. Everywhere else the buffer stays
-stub-owned and invisible.
+the exact worst case for a single start, and every stub sizes it that way.
+
+**C is fill-and-count rather than an iterator**, because C has no iterator
+protocol and the raw ABI already fills a buffer and returns a count — which is
+also the C idiom (`read`, `getdents`, `recv`):
+
+```c
+rx_set_match_t buf[SECRET_SCANNER_PATTERN_COUNT];
+rx_secret_scanner_scanner_t sc;
+if (scan_secrets_init(&sc, input, len, 0) != 0) { /* RX_ERR_* */ }
+for (int n; (n = scan_secrets(&sc, buf, SECRET_SCANNER_PATTERN_COUNT)) > 0; )
+    for (int i = 0; i < n; i++) { /* buf[i] */ }
+```
+
+The scanner holds the INPUT as well as the position: the input never changes
+during a scan while the position changes every step, so remembering the
+position and taking the input on every step was backwards — and it let a caller
+pass a DIFFERENT buffer on a later step with the stored position silently
+indexing into it.
+
+The return is the position's TOTAL, which may exceed `cap`: the call is
+transactional, so it writes `min(total, cap)`, records no gate and does not
+advance, and `n > cap` means "grow and call again, same position". Sizing `cap`
+at `<SET>_PATTERN_COUNT` makes overflow impossible. Everywhere else the buffer
+stays stub-owned and invisible.
 
 The order of the matches *within* one call is unspecified — not by pattern id,
 not by extent, not stable across compiler versions. Sort what you collect if
 you need a specific order.
 
-### `find_batch` — the same matches, several positions per call
+### Batching — the same matches, several positions per call
 
-```
-find_batch(input, cursor, buffer) -> as many matches as the buffer holds,
-                                     plus a cursor to resume from
+```yaml
+sets:
+  - name: secret_scanner
+    find:  scan_secrets
+    hints: [batch-find]
 ```
 
 `find` returns one position per call, which is the right shape for a caller who
@@ -155,29 +180,56 @@ may stop early: nothing is computed for matches you never ask for. That costs
 one host-boundary crossing per position, and on a dense input the crossings
 dominate.
 
-`find_batch` makes the opposite trade. One call fills the caller's buffer with
-the matches of as many CONSECUTIVE positions as fit, so a caller who intends to
-consume everything crosses the boundary once per bufferful. It reports exactly
-the same matches, in the same order, under the same overlap policy.
+`batch-find` makes the opposite trade. One call fills a buffer with the matches
+of as many CONSECUTIVE positions as fit, so a caller who intends to consume
+everything crosses the boundary once per bufferful. It reports exactly the same
+matches, in the same order, under the same overlap policy.
 
-They are independent capabilities: declare either, both, or neither. Declaring
-both emits two separate bodies over shared machinery — batching speculates, and
-a `find` caller must not be charged for speculation it discards.
+**It is a hint, not a capability, and that is the point.** The two shapes were
+never distinguishable at the API level — same matches, same order, and the
+cursor and gate array are stub-owned and invisible. The only caller-visible
+difference is how much work one host crossing does, and therefore what you have
+paid for if you stop early. That is a parameter, not a name: a second function
+called `find_batch` reads as "same thing, fewer calls", which invites it as the
+default, and it is the wrong default for any scan that stops early.
 
-**Which to use.** `find` when you may stop early (first hit, a bounded number
-of results, a user-cancellable scan). `find_batch` when the whole scan will be
-consumed.
+**It costs module size, which is why it is opt-in.** A batching set emits a
+second entry point alongside `find`, plus the cursor and resume loop. Both are
+driven by ONE shared per-position worker, so the bucket code is not duplicated.
+
+**Only JavaScript and TypeScript expose it.** Batching amortises host-boundary
+crossings and nothing else — SETS §20.1 measures `find` and a batched find
+within 12.3% of each other in fuel, with `find` the CHEAPER one in-wasm, while
+they differ 45x-76x in wall clock. C, Go, Rust and AssemblyScript are compiled
+to wasm and merged, so their call into the module is a direct call inside one
+module and there is no boundary to amortise. In those four the hint changes
+nothing about the generated API; in JS/TS it adds an optional `batchSize`
+parameter to `find` and a `<set>BatchMaxSize` constant:
+
+```ts
+// without the hint — no batchSize parameter at all, so TypeScript rejects
+// find(input, 0, 64) at build time and no runtime check is needed
+export function* scan_secrets(input, offset?): Generator<SetMatch>
+
+// with hints: [batch-find]
+export const secretScannerBatchMaxSize: number;
+export function* scan_secrets(input, offset?, batchSize?): Generator<SetMatch>
+```
+
+`batchSize` sizes a batch of POSITIONS to work ahead, clamped into
+`[1, <set>BatchMaxSize]`. The limit is the cursor layout rather than a policy,
+and never binds in practice — 524,287 tuples is a 6 MB buffer.
 
 #### The cursor
 
-The cursor is one `i64`, and it is **opaque**: pass back the value the previous
-call returned, unchanged. A first call passes `from << 32`. Only two things
-about it are public:
+The cursor is one `i64`, and it is **opaque**: the stub passes back the value
+the previous call returned, unchanged. A first call passes `offset << 32`. Only
+two things about it are public, and only a direct WASM caller ever sees them:
 
 | field | meaning |
 |---|---|
 | bits 63..32 | `0xFFFFFFFF` means the scan is finished — otherwise this is internal |
-| low `<SET>_BATCH_COUNT_BITS` | `count` — how many tuples of the buffer are valid |
+| low count bits | `count` — how many tuples of the buffer are valid |
 
 The done flag arrives on the **same call that delivers the final matches**, so
 a finished scan costs no extra call. `count` is needed alongside it because the
@@ -187,54 +239,6 @@ last call is normally a partial fill and the buffer is reused: the slots past
 `0xFFFFFFFF` rather than `0` is the sentinel because **0 is a legal resume
 position** — a first call whose buffer fills on the matches at position 0 must
 resume at 0.
-
-#### The buffer is the caller's
-
-There is no `batch_size` config key. **You allocate the buffer and hand it to
-each scan**, because only you know whether you will consume everything, and how
-many scans you are about to do. Its length is the batch size:
-
-```rust
-let mut buf = vec![[0i32; 3]; 4096];       // once
-for doc in docs {
-    for m in rx::scan_secrets_batch(doc, 0, &mut buf) { ... }   // allocates nothing
-}
-```
-
-```go
-buf := make([]rx.SetTuple, 4096)           // once
-for _, doc := range docs {
-    for m := range rx.ScanSecretsBatch(doc, 0, buf) { ... }     // allocates nothing
-}
-```
-
-```c
-int buf[4096 * 3];                         /* once */
-rx_secrets_batch_scanner_t sc;
-scan_secrets_batch_init(&sc, 0, buf, 4096);
-while (scan_secrets_batch_next(&sc, input, len, &m)) { ... }
-```
-
-That is the whole reason the buffer is not stub-owned: `find_batch` exists to
-cut per-call overhead, and allocating one per scan would put overhead back at a
-different level. Rust, Go, AssemblyScript and C all reach zero allocations in
-the steady state. **JavaScript and TypeScript take a capacity number instead**
-(default 256) — their buffer lives inside WASM memory, so there is nothing for
-a JS caller to hand over.
-
-The gate array is *not* the caller's. Its length is `<SET>_ID_SPACE`, a
-compile-time constant, so it is not a size anyone chooses; the stubs keep
-owning it and it stays out of their public surface.
-
-**Any capacity of 1 or more makes progress.** A position whose matches do not
-all fit is delivered in part and resumed inside — an undersized buffer costs
-more calls, never a stall and never a lost match. (`find` is different: it is
-transactional, and an overflowing call writes nothing and asks you to grow the
-buffer.) The upper bound is `<SET>_BATCH_MAX_COUNT`; the module clamps to it,
-and a zero-length buffer yields nothing.
-
-Because tuples of one position can span two calls, group by the `start` field
-rather than by call boundary if you need per-position grouping.
 
 ### Overlap policy
 
@@ -256,9 +260,9 @@ it is measurably faster to *emit* (no gating code at all) — but on greedy or
 unbounded-tail patterns it is quadratic in the input, because every start runs
 a DFA to its own extent. The default exists to avoid that.
 
-`overlapping` affects `find` and `find_batch` and nothing else. On a set
-declaring neither it is silently ignored — there is no find body for it to
-select, so it has no effect.
+`overlapping` affects `find` and nothing else. On a set without it the key is
+silently ignored — there is no find body for it to select, so it has no
+effect.
 
 The empty-match rule follows Go's: after a match ending at `e` the next match
 may start at `e`, except an empty match exactly at `e` is skipped; after an
@@ -302,9 +306,9 @@ into a caller that meant to start fresh.
 
 With `overlapping: true` there is no gate array and no gate parameter at all.
 
-`find_batch` carries the same gate array as `find` when gated, and none when
-overlapping. It differs in one respect, and only internally: it records gates
-for the matches it DELIVERED rather than only for a position that fitted whole.
+A batching `find` carries the same gate array, and none when overlapping. It
+differs in one respect, and only internally: it records gates for the matches
+it DELIVERED rather than only for a position that fitted whole.
 That is what lets it resume inside a split position — the patterns already
 handed to you are gated out, so re-entering the position yields exactly the
 remainder. Callers see no difference; `find`'s transactional rule above is
@@ -317,18 +321,17 @@ Declaring less emits less:
 
 | capability | literal frontend | backward prefix DFA | per-pattern extents | output |
 |---|---|---|---|---|
-| `match`, `match_any`, `match_all` | ✗ | ✗ | ✗ | bool / id / bitmask |
-| `scan`, `scan_any`, `scan_all` | ✓ | ✓ | ✗ | bool / packed id+start / bitmask |
+| `match_any`, `match_all` | ✗ | ✗ | ✗ | id / bitmask |
+| `scan_any`, `scan_all` | ✓ | ✓ | ✗ | id / bitmask |
 | `find` | ✓ | ✓ | ✓ | tuples (+ gates by default) |
 
 A set that does not declare `find` emits no tuple-writing suffix functions at
-all — just the DFA tables, which the cheap bitmask probes share. A
-`match`-only set additionally emits no literal frontend: the
+all — just the DFA tables, which the cheap bitmask probes share. An
+anchored-only set additionally emits no literal frontend: the
 packed-pair/Teddy/AC/Shufti tables and skip loop could never execute for it.
 
 Measured on a 100KB no-match corpus with eight literal-prefixed patterns:
-`match` 54 fuel, `match_any`/`match_all` 84, `scan` 212K, `scan_any`/`scan_all`
-219K, `find` 219K. The anchored trio dies within a byte or two of position 0;
+`match_any`/`match_all` 84 fuel, `scan_all` 219K, `find` 219K. The anchored trio dies within a byte or two of position 0;
 the scan trio is frontend-bound, like `find`, because it shares `find`'s
 frontend. (An earlier draft gave the scan trio a scalar position-by-position
 scan instead, and measured 17x worse — the literal frontend is what makes
@@ -371,7 +374,7 @@ and they are not interchangeable:
 
 | constant | value | sizes |
 |---|---|---|
-| `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`), and the width of the `find_batch` cursor's `k` field |
+| `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`), and the width of the batch cursor's `k` field |
 | `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array, the `_all` bitmask/bitmap, and which `_all` ABI is exported |
 
 For `patterns: all` — the common case — the two are equal. They diverge only
@@ -381,8 +384,13 @@ module write past the caller's array. Both constants are emitted in all six
 stub languages, and every generated declaration is written in terms of the
 right one.
 
-`scan_any` returns a packed `(start << 32) | pattern_id` as an `i64`, or `-1`.
-Both fields are below 2³¹, so `-1` is unambiguous. Stubs decompose it.
+`scan_any` returns a bare pattern id as an `i32`, or `-1`. It reports **no
+position**, and that is deliberate rather than an omission: a non-anchored DFA
+knows where a match ENDS, not where it began, so reporting the leftmost start
+forced an anchored probe at every position — 78 fuel/byte against 27 for the
+single union-automaton pass it compiles to now. The id is free either way,
+because that pass accumulates an id bitmask. Do not use `scan_any` to locate
+something for `find`; use `find`.
 
 `emit_name_map: true` additionally emits a `pattern_name(id)` helper mapping a
 pattern id back to its `name:` string.

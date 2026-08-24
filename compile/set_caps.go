@@ -13,7 +13,7 @@ import (
 //	match_all(ptr, len)                -> i64   bitmask            (<= 64 patterns)
 //	match_all(ptr, len, out_ptr)       -> i32   count + bitmap     (>  64)
 //	scan     (ptr, len, from)          -> i32   0 | 1
-//	scan_any (ptr, len, from)          -> i64   (start<<32)|id, or -1
+//	scan_any (ptr, len, from)          -> i32   pattern id, or -1
 //	scan_all (ptr, len, from)          -> i64   bitmask            (<= 64)
 //	scan_all (ptr, len, from, out_ptr) -> i32   count + bitmap     (>  64)
 //
@@ -84,7 +84,10 @@ func (cs *compiledSet) idSpaceSize() int {
 // which is a count comparison and would never fire against an id bound.
 func (cs *compiledSet) numPatterns() int {
 	n := 0
-	for _, ids := range cs.patternIDs {
+	for bi, ids := range cs.patternIDs {
+		if cs.phase1Only && cs.buckets[bi].isFallback {
+			continue // see allPatternsMask
+		}
 		n += len(ids)
 	}
 	return n
@@ -124,10 +127,12 @@ func (cs *compiledSet) wideAll() bool { return cs.idSpaceSize() > wideBitmapThre
 //
 // Which id is unspecified (§3.5), so the lowest set bit is as good as any, and
 // the test is one compare per pattern unrolled at compile time. escapeDepth >=
-// 0 additionally leaves that block once an id is found (the anchored form,
-// where nothing further can change the answer); the non-anchored form passes
-// -1 and keeps looking, because a later candidate can still have an earlier
-// start.
+// 0 additionally leaves that block once an id is found; the non-anchored form
+// passes -1 and lets the mode's drain check do the leaving instead, which
+// keeps this emitter free of each frontend's br-depth bookkeeping. Both forms
+// stop at the first id now that `scan_any` reports no start (TODO task 59
+// decision (10)) — before that, a later candidate could still improve the
+// answer by starting earlier.
 //
 // Shared by emitRecordBits and setFindCtx.emitRecordProbe, which each carried
 // a copy.
@@ -322,7 +327,15 @@ func emitSetAnchoredCapBody(cs *compiledSet, kind setCapKind, probeFnBase int) [
 // Only meaningful for the narrow (<= 64 patterns) `_all` forms.
 func allPatternsMask(cs *compiledSet) uint64 {
 	var m uint64
-	for _, ids := range cs.patternIDs {
+	for bi, ids := range cs.patternIDs {
+		// Under phase1Only the fallback buckets belong to phase 2, so their
+		// ids can never appear in this body's accumulator. Including them
+		// would make `scan_all`'s "every pattern seen" exit unreachable and
+		// run phase 1 to end of input on every call — correct, but it throws
+		// away the exit for exactly the sets the split exists to speed up.
+		if cs.phase1Only && cs.buckets[bi].isFallback {
+			continue
+		}
 		for _, id := range ids {
 			if id < 64 {
 				m |= uint64(1) << uint(id)

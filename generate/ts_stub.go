@@ -130,7 +130,6 @@ func genTSSetSection(cfg config.BuildConfig) string {
 	out.WriteString("// staged input and the shared output region belong to whichever call ran\n")
 	out.WriteString("// last (see docs/ts-api.md).\n\n")
 	out.WriteString("export interface SetMatch { patternId: number; start: number; end: number; }\n")
-	out.WriteString("export interface SetAnchor { patternId: number; start: number; }\n\n")
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := camelSet(s.Name) + "PatternCount"
@@ -147,20 +146,11 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the find generator\n// can receive at most this many matches at one position.\nexport const %s: number = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: number = %d;\n\n", s.Name, idKonst, idN)
 
-		if s.FindBatch != "" {
-			fmt.Fprintf(&out, "// Width of the count field in set %q's find_batch cursor. The count is\n// packed & ((1n << BigInt(bits)) - 1n); the scan is finished when the top 32\n// bits of the cursor are all ones. Only a direct WASM caller needs this — the\n// generated iterator decodes the cursor for you.\nexport const %s: number = %d;\n\n",
-				s.Name, camelSet(s.Name)+"BatchCountBits", cursorCountBits(s, cfg))
-			fmt.Fprintf(&out, "// Largest tuple count one find_batch call can report for set %q. The module\n// clamps out_cap to it.\nexport const %s: number = %d;\n\n",
-				s.Name, camelSet(s.Name)+"BatchMaxCount", cursorMaxCount(s, cfg))
+		if s.BatchFind() {
+			fmt.Fprintf(&out, "// Largest batchSize %s accepts for set %q. It is the cursor layout's\n// limit, not a policy: one i64 carries the resume position in its top 32\n// bits and splits the low 32 between the intra-position index and the count.\n// It never binds in practice — this many tuples is a multi-megabyte buffer.\nexport const %s: number = %d;\n\n",
+				s.Find, s.Name, camelSet(s.Name)+"BatchMaxSize", cursorMaxCount(s, cfg))
 		}
 
-		if s.Match != "" {
-			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): boolean {
-    const len = _w(input);
-    return ((_exp['%s'] as Function)(_inBase, len) as number) !== 0;
-}
-`, s.Match, s.Match)
-		}
 		if s.MatchAny != "" {
 			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): number | null {
     const len = _w(input);
@@ -195,19 +185,11 @@ func genTSSetSection(cfg config.BuildConfig) string {
 `, s.MatchAll, s.MatchAll, idKonst)
 			}
 		}
-		if s.Scan != "" {
-			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): boolean {
-    const len = _w(input);
-    return ((_exp['%s'] as Function)(_inBase, len, from) as number) !== 0;
-}
-`, s.Scan, s.Scan)
-		}
 		if s.ScanAny != "" {
-			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): SetAnchor | null {
+			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): number | null {
     const len = _w(input);
-    const packed = (_exp['%s'] as Function)(_inBase, len, from) as bigint;
-    if (packed < 0n) return null;
-    return { patternId: Number(packed & 0xFFFFFFFFn), start: Number(packed >> 32n) };
+    const id = (_exp['%s'] as Function)(_inBase, len, from) as number;
+    return id < 0 ? null : id;
 }
 `, s.ScanAny, s.ScanAny)
 		}
@@ -243,9 +225,13 @@ func genTSSetSection(cfg config.BuildConfig) string {
 `, gateBase, idKonst)
 				gateArg = "gateBase, "
 			}
-			fmt.Fprintf(&out, `export function* %s(input: string | Uint8Array, from: number = 0): Generator<SetMatch> {
+			if !s.BatchFind() {
+				// Without the hint there is no batchSize parameter at all, so
+				// TypeScript rejects find(input, 0, 64) at build time and no
+				// runtime check is needed.
+				fmt.Fprintf(&out, `export function* %s(input: string | Uint8Array, offset: number = 0): Generator<SetMatch> {
     const len = _w(input, %d);
-%s    let pos = from;
+%s    let pos = offset;
     // Hoisted: _mem.buffer and _outBase are loop-invariant and the input is
     // staged once above, so nothing detaches this view mid-scan. Building it
     // per call allocated one typed array per matching position.
@@ -262,29 +248,25 @@ func genTSSetSection(cfg config.BuildConfig) string {
     }
 }
 `, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst)
-		}
-		if s.FindBatch != "" {
-			// Sized at RUNTIME from the caller's capacity, so the reserve and
-			// the gate base above the buffer are computed in the generator.
-			gateSetup, gateArg := "", ""
-			if gatedFind(s) {
-				gateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*capacity;
+			} else {
+				batchGateSetup := ""
+				if gatedFind(s) {
+					batchGateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, idKonst)
-				gateArg = "gateBase, "
-			}
-			fmt.Fprintf(&out, `// Yields the set's matches a BUFFERFUL at a time: one WASM call per capacity
-// matches instead of one per position. Same matches in the same order as the
-// unbatched find. Prefer this when the whole scan will be consumed; prefer
-// find when you may stop early, since a batch call does the work for matches
-// you never look at. capacity is clamped into [1, %d].
-export function* %s(input: string | Uint8Array, from: number = 0, capacity: number = %d): Generator<SetMatch> {
-    capacity = Math.min(Math.max(capacity | 0, 1), %d);
-    const len = _w(input, 12*capacity + %d);
-%s    let cursor = BigInt(from) << 32n;
-    const buf = new Int32Array(_mem.buffer, _outBase, 3*capacity);
+				}
+				fmt.Fprintf(&out, `// batchSize is how many tuples one WASM call may fill: 1 is a call per
+// matching position, larger values amortise the host crossing over a
+// bufferful. The matches and their order are identical either way — the only
+// difference is how much work you have paid for if you stop early. Clamped
+// into [1, %s].
+export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: number = %d): Generator<SetMatch> {
+    batchSize = Math.min(Math.max(batchSize | 0, 1), %s);
+    const len = _w(input, 12*batchSize + %d);
+%s    let cursor = BigInt(offset) << 32n;
+    const buf = new Int32Array(_mem.buffer, _outBase, 3*batchSize);
     while (true) {
-        const packed = (_exp['%s'] as Function)(_inBase, len, cursor, %s_outBase, capacity) as bigint;
+        const packed = (_exp['%s'] as Function)(_inBase, len, cursor, %s_outBase, batchSize) as bigint;
         // The cursor is opaque: hand it back unchanged. Only its top 32 bits
         // are public — all ones means the scan is finished, and that arrives
         // on the same call as the last matches.
@@ -298,9 +280,10 @@ export function* %s(input: string | Uint8Array, from: number = 0, capacity: numb
         cursor = packed;
     }
 }
-`, cursorMaxCount(s, cfg), s.FindBatch, defaultBatchCap(s, cfg),
-				cursorMaxCount(s, cfg), 4*idN+bitmapBytes(s, cfg), gateSetup,
-				s.FindBatch, gateArg, cursorCountMask(s, cfg))
+`, camelSet(s.Name)+"BatchMaxSize", s.Find, defaultBatchCap(s, cfg),
+					camelSet(s.Name)+"BatchMaxSize", 4*idN+bitmapBytes(s, cfg), batchGateSetup,
+					config.SetBatchExportName(s.Find), gateArg, cursorCountMask(s, cfg))
+			}
 		}
 		out.WriteString("\n")
 	}
@@ -318,13 +301,16 @@ export function* %s(input: string | Uint8Array, from: number = 0, capacity: numb
 }
 
 func genTSMatchFunc(funcName string) string {
-	return fmt.Sprintf(`// %s — anchored match; returns [endPos, true] on match or [0, false] if no match.
-export function %s(input: string | Uint8Array): [number, boolean] {
+	return fmt.Sprintf(`// %s — anchored match; returns the end position, or null if no match.
+//
+// null rather than a [pos, ok] tuple: that shape is Go's comma-ok written in
+// TypeScript, and "a value or nothing" is null here — which is also what
+// match_any in this same file returns.
+export function %s(input: string | Uint8Array): number | null {
     const len = _w(input);
     const r = (_exp['%s'] as CallableFunction)(_inBase, len) as number;
     if (r === %d) throw new Error("%s");
-    if (r < 0) return [0, false];
-    return [r, true];
+    return r < 0 ? null : r;
 }
 
 `, funcName, funcName, funcName, btOverflow, btOverflowMsg(funcName))
@@ -342,11 +328,11 @@ export function %s(input: string | Uint8Array): [number, boolean] {
 // feature-detect carries over unchanged.
 func genTSFindFunc(funcName string) string {
 	return fmt.Sprintf(`// %[1]s — yields [start, end] for each non-overlapping match.
-export function* %[1]s(input: string | Uint8Array): Generator<[number, number]> {
+export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generator<[number, number]> {
     if (typeof _exp['%[1]s_batch'] === 'function') {
         const len = _w(input, %[2]d * 8);
         const outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
-        let startPos = 0;
+        let startPos = offset;
         while (true) {
             const n = (_exp['%[1]s_batch'] as CallableFunction)(_inBase, len, _outBase, %[2]d, startPos) as number;
             if (n === %[3]d) throw new Error("%[4]s");
@@ -361,7 +347,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<[number, number]> 
         return;
     }
     const len = _w(input);
-    let off = 0;
+    let off = offset;
     while (off <= len) {
         const r = (_exp['%[1]s'] as CallableFunction)(_inBase + off, len - off) as bigint;
         if (r === %[3]dn) throw new Error("%[4]s");
@@ -391,11 +377,11 @@ func genTSGroupsFunc(funcName string, numGroups int) string {
 	return fmt.Sprintf(`// %[1]s — yields capture group arrays per match.
 // Each element is [start, end] (absolute) or null for unmatched groups.
 // Index 0 is the full match.
-export function* %[1]s(input: string | Uint8Array): Generator<Array<[number, number] | null>> {
+export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generator<Array<[number, number] | null>> {
     if (typeof _exp['%[1]s_batch'] === 'function') {
         const len = _w(input, %[2]d * %[4]d);
         const outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
-        let startPos = 0;
+        let startPos = offset;
         while (true) {
             const n = (_exp['%[1]s_batch'] as CallableFunction)(_inBase, len, _outBase, %[2]d, startPos) as number;
             if (n === %[7]d) throw new Error("%[8]s");
@@ -421,7 +407,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<Array<[number, num
     // (_resize already ran, and nothing inside the loop grows the memory), so
     // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
-    let off = 0;
+    let off = offset;
     while (off <= len) {
         slots.fill(-1);
         const r = (_exp['%[1]s'] as CallableFunction)(_inBase + off, len - off, _outBase) as number;
@@ -484,11 +470,11 @@ func genTSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 
 	return fmt.Sprintf(`// %[1]s — yields named capture group objects per match.
 // Each object maps name → [start, end] (absolute) for participating groups.
-export function* %[1]s(input: string | Uint8Array): Generator<Record<string, [number, number]>> {
+export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generator<Record<string, [number, number]>> {
     if (typeof _exp['%[2]s_batch'] === 'function') {
         const len = _w(input, %[3]d * %[4]d);
         const outBuf = new Int32Array(_mem.buffer, _outBase, %[3]d * %[5]d);
-        let startPos = 0;
+        let startPos = offset;
         while (true) {
             const n = (_exp['%[2]s_batch'] as CallableFunction)(_inBase, len, _outBase, %[3]d, startPos) as number;
             if (n === %[9]d) throw new Error("%[10]s");
@@ -510,7 +496,7 @@ export function* %[1]s(input: string | Uint8Array): Generator<Record<string, [nu
     // (_resize already ran, and nothing inside the loop grows the memory), so
     // constructing the view per match was pure overhead.
     const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
-    let off = 0;
+    let off = offset;
     while (off <= len) {
         slots.fill(-1);
         const r = (_exp['%[2]s'] as CallableFunction)(_inBase + off, len - off, _outBase) as number;

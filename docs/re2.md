@@ -127,10 +127,10 @@ Set composition is validated by replaying multi-pattern blocks from the RE2
 exhaustive suite and a curated `custom-sets.txt` file through the set pipeline
 described in [sets.md](sets.md).
 
-**All eight capabilities are driven, not just `find`.** Until task G15
+**Every capability is driven, not just `find`.** Until task G15
 ([plans/SETS.md](../plans/SETS.md) §22) this target declared one set with
-`find` OR `find_batch`, `patterns: all` and no `overlapping` — so
-`match`/`match_any`/`match_all`, `scan`/`scan_any`/`scan_all` and the
+`find` OR a batching `find`, `patterns: all` and no `overlapping` — so
+`match_any`/`match_all`, `scan_any`/`scan_all` and the
 overlapping `find` body had no corpus coverage at all, which is how five
 wrong-answer/crash bugs survived 4.94M passing cases. Each chunk is now driven
 through:
@@ -138,9 +138,9 @@ through:
 | driven | oracle |
 |---|---|
 | `match`, `match_any`, `match_all` | `\A(?:p)\z` over the whole input; membership (never value equality) for `_any` |
-| `scan`, `scan_any`, `scan_all` | "matches at some position ≥ `from`", at every `from` for short inputs and at the 16/32/33-byte edges for long ones |
-| `find` gated, `find_batch` gated at capacity 1 and P | Go `FindAllIndex` — cross-checked against the corpus's own col4 |
-| `find` overlapping, `find_batch` overlapping at capacity 1 and P | every start position's leftmost-first match |
+| `scan_any`, `scan_all` | "matches at some position ≥ `from`", at every `from` for short inputs and at the 16/32/33-byte edges for long ones |
+| `find` gated, batching `find` gated at capacity 1 and P | Go `FindAllIndex` — cross-checked against the corpus's own col4 |
+| `find` overlapping, batching `find` overlapping at capacity 1 and P | every start position's leftmost-first match |
 | `find` through an under-sized buffer | `out_cap = 0` and the transactional-overflow rule |
 | every capability at `from > len` | §4.2's "nothing" result |
 
@@ -188,9 +188,9 @@ as either a pass or a failure.
 
 The pre-G15 shape, kept because it is the only configuration that compiles sets
 of several thousand patterns: one set per corpus block, the same col4 oracle,
-driving `find` and then `find_batch` at a buffer capacity of **one**. That
+driving `find` and then its batch entry at a buffer capacity of **one**. That
 capacity is the point: it makes every position with more than one match split,
-so the corpus exercises `find_batch`'s resume path — and with it the
+so the corpus exercises the batch resume path — and with it the
 delivered-tuple gate rule of [plans/SETS.md](../plans/SETS.md) §19 — at every
 empty-match shape, anchor and extent it contains, rather than at the handful a
 hand-written test can think of. Also runs clean with **0 failures**.

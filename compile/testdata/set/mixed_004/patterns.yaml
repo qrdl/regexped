@@ -95,7 +95,7 @@ sets:
       - xss_onload
 
   - name: url_validator
-    match: validate_url
+    match_any: validate_url
     patterns:
       - http_url
       - http_url_path

@@ -17,24 +17,31 @@ import (
 type compiledSet struct {
 	name string
 
-	// Capability export names; "" = not declared.
-	match    string // anchored, 0|1
+	// Capability export names; "" = not declared. `match` and `scan` were
+	// retired by TODO task 59 decision (2) — `match_any(...) >= 0` and
+	// `scan_any(...) >= 0` are exactly what they returned.
 	matchAny string // anchored, pattern id or -1
 	matchAll string // anchored, bitmask / bitmap of ids
-	scan     string // non-anchored, 0|1
-	scanAny  string // non-anchored, (start<<32)|id, or -1
+	scanAny  string // non-anchored, pattern id or -1
 	scanAll  string // non-anchored, bitmask / bitmap of ids
 	find     string // non-anchored, tuples at the next matching position
-	// findBatch is the §19 multi-position export. Independent of find.
-	findBatch string
+	// batchFind is `hints: [batch-find]` on the set (decision (11)). It adds
+	// the §19 multi-position export ALONGSIDE `find` — it is no longer a
+	// capability of its own, so it cannot be declared without `find`.
+	batchFind bool
 	// patternCount is the worst-case number of tuples at ONE position, and
 	// therefore how many bits the §19 cursor reserves for its intra-position
 	// index. It is the same quantity the stubs know as <SET>_PATTERN_COUNT.
 	patternCount int
 	// batchPos is a transient emission flag: while it is set, the shared find
-	// emitters build the batch per-position WORKER rather than the exported
+	// emitters build the shared per-position WORKER rather than an exported
 	// `find` body. Set and cleared around one emitSetMatchFnFinal call by
-	// emitSetBatchPosBody; never read outside emission.
+	// emitSetWorkerBody; never read outside emission.
+	//
+	// Under decision (11a) the worker is what BOTH the exported `find` and the
+	// batch loop call, so a batching set carries ONE set of bucket code rather
+	// than two. The gate rule that used to be chosen here at compile time is
+	// now a runtime parameter — see setFindCtx.pBatchMode.
 	batchPos bool
 	// suffixHasSkip mirrors SetSpec.suffixNeedsSkip: the tuple-writing suffix
 	// functions carry a trailing `skip` parameter.
@@ -100,6 +107,29 @@ type compiledSet struct {
 	// Nil when the set is ineligible or kept its
 	// per-position path.
 	unionScan *unionScanDFA
+
+	// phase2Union is the start-anywhere automaton over this set's FALLBACK
+	// patterns ONLY, and it exists exactly for the sets unionScan cannot
+	// serve: a MIXED set, with a literal frontend AND at least one fallback
+	// bucket (SETS_PLAN item 19).
+	//
+	// Such a set is the expensive shape. One fallback pattern must be tried at
+	// every position, which switches the frontend's SIMD skip off for the
+	// WHOLE scan, so `error` and `warning` crawl because `[0-9]{16}` is in the
+	// same set. Measured ~102 fuel/byte against 27 for a union walk.
+	//
+	// The split refuses to interleave them: phase 1 runs the literal frontend
+	// with its skip intact over the literal buckets alone, phase 2 walks the
+	// fallback patterns in one pass. Nil when the set is not mixed, when the
+	// fallback subset cannot be determinised (word boundaries, (?m) anchors,
+	// ids >= 64, state budget), or when no capability wants it.
+	phase2Union *unionScanDFA
+
+	// phase1Only switches the frontend emitters to the phase-1 VIEW of this
+	// set: the fallback buckets are not emitted, and the guards that disable a
+	// prefilter because fallback buckets exist are lifted. Set only around the
+	// phase-1 body emission, the same way set_batch.go drives batchPos.
+	phase1Only bool
 
 	// prefixFnIdx[bi][k]: index into prefixFnBodies for pattern at bitPos k in bucket bi.
 	// -1 means trivial prefix (always passes; bit is always set in validMask).
@@ -219,13 +249,15 @@ func (cs *compiledSet) capFns() []setCapFn {
 		findType = setTypeI32x5ToI32
 		batchType = setTypeBatchUngated
 	}
+	batchName := ""
+	if cs.batchFind {
+		batchName = config.SetBatchExportName(cs.find)
+	}
 	all := []setCapFn{
 		{cs.find, capFind, findType},
-		{cs.findBatch, capFindBatch, batchType},
-		{cs.scan, capScan, setTypeI32x3ToI32},
-		{cs.scanAny, capScanAny, setTypeI32x3ToI64},
+		{batchName, capFindBatch, batchType},
+		{cs.scanAny, capScanAny, setTypeI32x3ToI32},
 		{cs.scanAll, capScanAll, scanAllType},
-		{cs.match, capMatch, setTypeI32I32ToI32},
 		{cs.matchAny, capMatchAny, setTypeI32I32ToI32},
 		{cs.matchAll, capMatchAll, allType},
 	}
@@ -277,11 +309,11 @@ func (cs *compiledSet) anchoredProbeBaseOffset() int {
 const (
 	setTypeI32I32ToI32 = 0 // (i32,i32)→i32      match / match_any / backward prefix
 	setTypeI32I32ToI64 = 1 // (i32,i32)→i64      match_all, <= 64 patterns
-	setTypeI32x3ToI32  = 2 // (i32,i32,i32)→i32  scan; match_all bitmap form
+	setTypeI32x3ToI32  = 2 // (i32,i32,i32)→i32  scan; scan_any; match_all bitmap form
 	setMatchTypeSuffix = 3 // (i32×7)→i32        suffix DFA (tuple-writing)
 	setTypeI32x5ToI32  = 5 // (i32×5)→i32        find, overlapping: true
 	setTypeI32x4ToI32  = 6 // (i32×4)→i32        bucket probes; scan_all bitmap form
-	setTypeI32x3ToI64  = 7 // (i32,i32,i32)→i64  scan_any; scan_all <= 64 patterns
+	setTypeI32x3ToI64  = 7 // (i32,i32,i32)→i64  scan_all <= 64 patterns
 	setTypeI32x6ToI32  = 8 // (i32×6)→i32        find, gated (default)
 	setTypeSuffixGated = 9 // (i32×8)→i32        suffix DFA with a gate pointer
 
@@ -291,11 +323,11 @@ const (
 	setTypeBatchUngated = 11 // (i32,i32,i64,i32,i32)→i64      find_batch, overlapping
 )
 
-// batchPosFnOffset returns the index of the set's hidden per-position batch
-// worker, or -1 when the set declares no find_batch. It sits immediately after
-// the exported capability functions.
+// batchPosFnOffset returns the index of the set's shared per-position worker,
+// or -1 when the set does not batch. It sits immediately after the exported
+// capability functions.
 func (cs *compiledSet) batchPosFnOffset() int {
-	if cs.findBatch == "" {
+	if !cs.batchFind {
 		return -1
 	}
 	return len(cs.capFns())
@@ -304,10 +336,14 @@ func (cs *compiledSet) batchPosFnOffset() int {
 // hiddenFnCount is how many non-exported functions the set contributes between
 // its capability functions and its suffix functions.
 func (cs *compiledSet) hiddenFnCount() int {
-	if cs.findBatch == "" {
-		return 0
+	n := 0
+	if cs.batchFind {
+		n++
 	}
-	return 1
+	// Two per split capability: phase 1 (the frontend over the literal
+	// buckets) and phase 2 (the union walk over the fallback patterns).
+	n += 2 * len(cs.twoPhaseCaps())
+	return n
 }
 
 // gatedFind reports whether this set emits the default (per-pattern
@@ -316,7 +352,7 @@ func (cs *compiledSet) hiddenFnCount() int {
 func (cs *compiledSet) gatedFind() bool { return cs.hasFind() && !cs.overlapping }
 
 // hasFind reports whether either position-reporting capability is declared.
-func (cs *compiledSet) hasFind() bool { return cs.find != "" || cs.findBatch != "" }
+func (cs *compiledSet) hasFind() bool { return cs.find != "" }
 
 // setMatchTypeMatch is kept as the historical alias for the ungated find
 // signature, which the per-pattern batch wrappers also reuse.
@@ -326,17 +362,18 @@ const setMatchTypeMatch = setTypeI32x5ToI32
 type SetSpec struct {
 	Name string
 
-	// Capability export names; "" = not declared.
-	Match    string
+	// Capability export names; "" = not declared. `Match` and `Scan` were
+	// retired by TODO task 59 decision (2).
 	MatchAny string
 	MatchAll string
-	Scan     string
 	ScanAny  string
 	ScanAll  string
 	Find     string
-	// FindBatch is the multi-position sibling of Find.
-	// Independent of it: either, both or neither may be declared.
-	FindBatch string
+	// BatchFind is `hints: [batch-find]` on the set (decision (11)): emit the
+	// §19 multi-position entry alongside Find, both driven by one shared
+	// per-position worker. Meaningless without Find, and rejected at config
+	// load in that case.
+	BatchFind bool
 
 	Overlapping bool // §3.15 / D10: true = ungated `find` body
 
@@ -372,10 +409,10 @@ func (s SetSpec) patternCount() int {
 	return len(s.Patterns)
 }
 
-// HasFind reports whether the set declares either position-reporting
-// capability. Both need the tuple-writing suffix functions and both are
-// affected by Overlapping; nothing else is.
-func (s SetSpec) HasFind() bool { return s.Find != "" || s.FindBatch != "" }
+// HasFind reports whether the set declares the position-reporting capability.
+// It needs the tuple-writing suffix functions and is what Overlapping selects
+// between; nothing else is affected.
+func (s SetSpec) HasFind() bool { return s.Find != "" }
 
 // gated reports whether the set's find bodies carry a gate array.
 func (s SetSpec) gated() bool { return s.HasFind() && !s.Overlapping }
@@ -389,27 +426,27 @@ func (s SetSpec) gated() bool { return s.HasFind() && !s.Overlapping }
 // The parameter is added for every caller of the suffix function once it
 // exists, not just the batch body — `find` passes a constant 0. One extra
 // argument and one signed compare, on the tuple-write path only.
-func (s SetSpec) suffixNeedsSkip() bool { return s.FindBatch != "" && s.Overlapping }
+func (s SetSpec) suffixNeedsSkip() bool { return s.BatchFind && s.Overlapping }
 
 // needsScanProbes reports whether the set declares one of the non-anchored
 // capabilities other than `find`. Those answer "which patterns match here?"
 // and use the cheap bitmask probe over the find-path buckets rather than the
 // tuple-writing suffix function.
 func (s SetSpec) needsScanProbes() bool {
-	return s.Scan != "" || s.ScanAny != "" || s.ScanAll != ""
+	return s.ScanAny != "" || s.ScanAll != ""
 }
 
 // needsFirstHitProbes reports whether the set declares a capability that may
 // stop at the first matching bit. `scan_all` is
 // deliberately absent: its answer is the full bitmask at a position.
 func (s SetSpec) needsFirstHitProbes() bool {
-	return s.Scan != "" || s.ScanAny != ""
+	return s.ScanAny != ""
 }
 
 // needsAnchoredBuckets reports whether the set declares one of the anchored
 // capabilities, which require their own non-leftmost-first automata.
 func (s SetSpec) needsAnchoredBuckets() bool {
-	return s.Match != "" || s.MatchAny != "" || s.MatchAll != ""
+	return s.MatchAny != "" || s.MatchAll != ""
 }
 
 // CompileSet compiles one set specification into a compiledSet.
@@ -525,7 +562,11 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// The last is what §18.4 asks to be asserted here rather than inherited:
 	// buildUnionScanDFA refuses such sets, so they would get the table and the
 	// per-byte check with no preflight to make it fire.
-	needLiveness := (spec.ScanAny != "" || spec.gated()) && fe == frontendScalar
+	// `spec.ScanAny != ""` was the other half of this condition until TODO
+	// task 59 decision (10): a scalar-frontend `scan_any` now compiles to the
+	// union walk itself, so no per-bucket liveness table can ever be consulted
+	// on its behalf. Only G9's gated-`find` preflight still reads one.
+	needLiveness := spec.gated() && fe == frontendScalar
 	if needLiveness {
 		anyNeverDying, anyBoundary := false, false
 		for _, bkt := range buckets {
@@ -883,14 +924,12 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		absenceAlive:        absAlive,
 		absenceOK:           absOK,
 		name:                spec.Name,
-		match:               spec.Match,
 		matchAny:            spec.MatchAny,
 		matchAll:            spec.MatchAll,
-		scan:                spec.Scan,
 		scanAny:             spec.ScanAny,
 		scanAll:             spec.ScanAll,
 		find:                spec.Find,
-		findBatch:           spec.FindBatch,
+		batchFind:           spec.BatchFind,
 		patternCount:        spec.patternCount(),
 		suffixHasSkip:       spec.suffixNeedsSkip(),
 		overlapping:         spec.Overlapping,
@@ -972,11 +1011,27 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// frontend already skips input and beats a table lookup per byte; this
 	// path is for the sets that have nothing to skip with, where the
 	// alternative is visiting every position with every bucket.
-	if fe == frontendScalar && (spec.Scan != "" || spec.ScanAll != "" || spec.ScanAny != "") {
+	if fe == frontendScalar && (spec.ScanAll != "" || spec.ScanAny != "") {
 		unionBase := setTablesEnd
 		cs.unionScan = buildUnionScanDFA(spec, opts, unionBase)
 		if cs.unionScan != nil && cs.unionScan.tableEnd > setTablesEnd {
 			setTablesEnd = cs.unionScan.tableEnd
+		}
+	}
+
+	// Phase 2 of the two-phase scan (SETS_PLAN item 19), for the MIXED sets
+	// the block above cannot serve: a literal frontend plus at least one
+	// fallback bucket, where today the fallback's every-position obligation
+	// costs the whole set its skip. The automaton covers the FALLBACK
+	// patterns only; phase 1 is the frontend over the literal buckets.
+	//
+	// `scan` is not consulted: TODO task 59 decision (2) retires it.
+	if fe != frontendScalar && (spec.ScanAny != "" || spec.ScanAll != "") &&
+		hasSetFallbackBucketsIn(buckets) && hasLiteralBuckets(buckets) {
+		p2Base := setTablesEnd
+		cs.phase2Union = buildUnionScanDFA(fallbackSubSpec(spec, buckets), opts, p2Base)
+		if cs.phase2Union != nil && cs.phase2Union.tableEnd > setTablesEnd {
+			setTablesEnd = cs.phase2Union.tableEnd
 		}
 	}
 
@@ -1023,25 +1078,18 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	diag.IDSpaceSize = cs.idSpaceSize()
 	diag.Overlapping = spec.Overlapping
 	for _, c := range []struct{ field, name string }{
-		{"match", spec.Match}, {"match_any", spec.MatchAny}, {"match_all", spec.MatchAll},
-		{"scan", spec.Scan}, {"scan_any", spec.ScanAny}, {"scan_all", spec.ScanAll},
+		{"match_any", spec.MatchAny}, {"match_all", spec.MatchAll},
+		{"scan_any", spec.ScanAny}, {"scan_all", spec.ScanAll},
 		{"find", spec.Find},
-		{"find_batch", spec.FindBatch},
 	} {
 		if c.name != "" {
 			diag.Capabilities = append(diag.Capabilities, c.field)
 		}
 	}
-	// The bare capabilities always get the bucketed shape: §3.20's union
-	// collapse is not built (§10.2(1)). Recording it rather than leaving the
-	// field absent is what makes that visible in --diag-json.
-	for _, c := range []struct{ field, name string }{{"match", spec.Match}, {"scan", spec.Scan}} {
-		if c.name != "" {
-			if diag.BareBodyShape == nil {
-				diag.BareBodyShape = map[string]string{}
-			}
-			diag.BareBodyShape[c.field] = "bucketed"
-		}
+	if spec.BatchFind {
+		// Not a capability any more (decision (11)), but the module does emit
+		// an extra entry for it, so --diag-json must still say so.
+		diag.Capabilities = append(diag.Capabilities, "find+batch-find")
 	}
 	return cs
 }
@@ -1189,14 +1237,12 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 
 		spec := SetSpec{
 			Name:                 sc.Name,
-			Match:                sc.Match,
 			MatchAny:             sc.MatchAny,
 			MatchAll:             sc.MatchAll,
-			Scan:                 sc.Scan,
 			ScanAny:              sc.ScanAny,
 			ScanAll:              sc.ScanAll,
 			Find:                 sc.Find,
-			FindBatch:            sc.FindBatch,
+			BatchFind:            sc.BatchFind(),
 			DeclaredPatternCount: sc.PatternCount(cfg),
 			Overlapping:          sc.Overlapping,
 			IDSpaceSize:          sc.IDSpaceSize(cfg),
@@ -1290,6 +1336,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		rawData = append(rawData, cs.startableDataBytes...)
 		if cs.unionScan != nil {
 			rawData = append(rawData, cs.unionScan.dataBytes...)
+		}
+		if cs.phase2Union != nil {
+			rawData = append(rawData, cs.phase2Union.dataBytes...)
 		}
 	}
 
@@ -1407,8 +1456,17 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// The hidden per-position batch worker. Gated it is `find`'s own
 		// signature; ungated it is that signature plus §19's `skip` — which
 		// is the same arity, so both are type 8.
-		if cs.findBatch != "" {
-			fs = append(fs, byte(setTypeI32x6ToI32))
+		if cs.batchFind {
+			fs = append(fs, byte(cs.workerTypeIdx()))
+		}
+		// The split's hidden phase bodies take and return exactly what the
+		// capability they serve does, so they reuse its type.
+		for _, kind := range cs.twoPhaseCaps() {
+			t := byte(setTypeI32x3ToI32)
+			if kind == capScanAll {
+				t = setTypeI32x3ToI64
+			}
+			fs = append(fs, t, t)
 		}
 		suffixType := byte(setMatchTypeSuffix)
 		if cs.gatedFind() || cs.suffixHasSkip {
@@ -1600,14 +1658,25 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, c := range cs.capFns() {
 			switch c.kind {
 			case capFind:
-				cs_bytes = append(cs_bytes, rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+				if cs.batchFind {
+					// Decision (11a): the export forwards into the shared
+					// worker instead of carrying its own copy of the bucket
+					// code.
+					cs_bytes = append(cs_bytes, emitSetFindWrapperBody(cs, base+cs.batchPosFnOffset())...)
+				} else {
+					cs_bytes = append(cs_bytes, rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+				}
 			case capFindBatch:
 				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.batchPosFnOffset())...)
 			case capMatch, capMatchAny, capMatchAll:
 				cs_bytes = append(cs_bytes, emitSetAnchoredCapBody(cs, c.kind, anchoredProbeBase)...)
 			default:
 				var body []byte
-				if cs.usesUnionScan(c.kind) {
+				if cs.usesTwoPhaseScan(c.kind) {
+					// The exported body is a wrapper; the work is in the two
+					// hidden phase bodies emitted below.
+					body = emitTwoPhaseScanBody(cs, c.kind, base+cs.twoPhaseFnOffset(c.kind))
+				} else if cs.usesUnionScan(c.kind) {
 					// One pass over the start-anywhere automaton instead of
 					// the per-position bucket walk.
 					body = emitUnionScanBody(cs.unionScan, c.kind, cs.fullIDMask(), tableMemIdx)
@@ -1620,8 +1689,19 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				cs_bytes = append(cs_bytes, body...)
 			}
 		}
-		if cs.findBatch != "" {
-			cs_bytes = append(cs_bytes, emitSetBatchPosBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+		if cs.batchFind {
+			cs_bytes = append(cs_bytes, emitSetWorkerBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+		}
+		// The split's hidden bodies, in twoPhaseCaps order so they line up
+		// with twoPhaseFnOffset. Phase 1 is the ordinary frontend emitter
+		// run against the phase-1 VIEW of the set; phase 2 is the union walk
+		// over the fallback patterns.
+		for _, kind := range cs.twoPhaseCaps() {
+			cs.phase1Only = true
+			p1 := emitSetMatchFnFinal(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx, kind, scanProbeBase)
+			cs.phase1Only = false
+			cs_bytes = append(cs_bytes, p1...)
+			cs_bytes = append(cs_bytes, emitUnionScanBody(cs.phase2Union, kind, cs.phase2Mask(), tableMemIdx)...)
 		}
 		for _, sfn := range cs.suffixFnBodies {
 			cs_bytes = append(cs_bytes, sfn...)
@@ -1697,9 +1777,25 @@ func emitSetMatchFnFinal(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMe
 	return emitSetMatchFnFinalScalar(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
 }
 
-// hasSetFallbackBuckets reports whether any bucket in the set is a fallback (no literal gate).
+// hasSetFallbackBuckets reports whether the body being emitted must visit
+// every position for a fallback bucket.
+//
+// It answers for the VIEW being emitted, not for the set: under phase1Only the
+// fallback buckets belong to phase 2 and are not this body's problem, so the
+// prefilters that a fallback bucket would otherwise disable stay on. That is
+// the entire mechanism of SETS_PLAN item 19 — the skip is not made safe, the
+// work that made it unsafe is moved to a pass of its own.
 func hasSetFallbackBuckets(cs *compiledSet) bool {
-	for _, bkt := range cs.buckets {
+	if cs.phase1Only {
+		return false
+	}
+	return hasSetFallbackBucketsIn(cs.buckets)
+}
+
+// hasSetFallbackBucketsIn is the same question about a raw bucket list, for
+// use during compilation before a compiledSet exists.
+func hasSetFallbackBucketsIn(buckets []*bucket) bool {
+	for _, bkt := range buckets {
 		if bkt.isFallback {
 			return true
 		}
@@ -1713,25 +1809,28 @@ func hasSetFallbackBuckets(cs *compiledSet) bool {
 // returning the TOTAL number of matches at the first matching position at or
 // after `from`. See compile/set_find.go for the first-position machinery.
 func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemIdx int, mode setCapKind, probeFnBase int) []byte {
-	// G8: when this set qualifies, `scan_any` runs the
-	// start-anywhere union automaton ONCE over [from,len) and uses the result
-	// to drop patterns that match nowhere from every bucket's validMask. The
-	// per-bucket walks then terminate through the G8 liveness exit instead of
-	// running to end of input behind a never-dying pattern.
-	preflight := cs.usesScanAnyPreflight(mode)
+	// G8's `scan_any` preflight is GONE (TODO task 59 decision (10)). It ran
+	// the start-anywhere union automaton once over [from,len) and used the
+	// result to drop never-matching patterns from every bucket's validMask —
+	// a way to make the per-position walk cheaper for a capability that could
+	// not use the union walk directly, because it had to report a START.
+	// With the start dropped, `scan_any` IS the union walk (usesUnionScan),
+	// so this body is never reached with mode == capScanAny on a set that
+	// qualified, and the narrowing has nothing left to narrow.
 	// G9 (§18.5): the gated `find` body runs the same union pass once per
-	// drive and writes its result back as §3.16 gate sentinels.
+	// drive and writes its result back as §3.16 gate sentinels. Still live —
+	// `find` reports positions and cannot become a union walk.
 	findPreflight := mode == capFind && cs.usesGatedFindPreflight()
 
 	// G12: the absence prefilter needs one more i32 (its SIMD mask) and a
 	// v128 chunk; the union walk needs neither.
-	absence := (preflight || findPreflight) && cs.usesAbsencePrefilter()
+	absence := findPreflight && cs.usesAbsencePrefilter()
 
 	var b []byte
 	if absence {
 		// 11 i32 (pos, search mask, simd mask), 2 i64 (acc, alive), 1 v128.
 		b = append(b, 0x03, 0x0B, 0x7F, 0x02, 0x7E, 0x01, 0x7B)
-	} else if preflight || findPreflight {
+	} else if findPreflight {
 		// 8 i32 + the union walk's state/pos, then i64 acc + i64 alive mask.
 		b = append(b, 0x02, 0x0A, 0x7F, 0x02, 0x7E)
 	} else {
@@ -1748,11 +1847,9 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	if absence {
 		c.lAcc = c.localBase + 11
 		c.aliveMask = c.localBase + 12
-		c.aliveReady = preflight
-	} else if preflight || findPreflight {
+	} else if findPreflight {
 		c.lAcc = c.localBase + 10
 		c.aliveMask = c.localBase + 11
-		c.aliveReady = preflight
 	}
 
 	if findPreflight {
@@ -1762,14 +1859,6 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 			c.pGate, c.pInLen, tableMemIdx, absence, c.localBase+10, c.localBase+13)
 	}
 	b = c.emitFindPrologue(b, lPos)
-	if preflight {
-		if absence {
-			b = emitLiteralAbsenceMask(b, cs, c.localBase+8, c.localBase+9,
-				c.localBase+10, c.localBase+13, c.aliveMask)
-		} else {
-			b = emitUnionAliveMask(b, cs.unionScan, c.localBase+8, c.localBase+9, c.aliveMask, tableMemIdx)
-		}
-	}
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $scan
@@ -1785,12 +1874,15 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	b = c.emitDrainCheck(b, lPos, 0x01)
 
 	// Fallback buckets first: they have no literal gate, so they must be
-	// evaluated at every position.
-	for bi, bkt := range cs.buckets {
-		if !bkt.isFallback {
-			continue
+	// evaluated at every position. Skipped entirely under phase1Only, where
+	// they are phase 2's pass instead (SETS_PLAN item 19).
+	if !cs.phase1Only {
+		for bi, bkt := range cs.buckets {
+			if !bkt.isFallback {
+				continue
+			}
+			b = c.emitBucketAt(b, bi, 0, lPos)
 		}
-		b = c.emitBucketAt(b, bi, 0, lPos)
 	}
 
 	b = c.emitLiteralBuckets(b, lPos)
@@ -2090,12 +2182,14 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01) // lPos > pInLen → br $batch_done
 	b = c.emitDrainCheck(b, lPos, 0x01)
 
-	// Fallback buckets at every position
-	for bi, bkt := range cs.buckets {
-		if !bkt.isFallback {
-			continue
+	// Fallback buckets at every position — phase 2's job under phase1Only.
+	if !cs.phase1Only {
+		for bi, bkt := range cs.buckets {
+			if !bkt.isFallback {
+				continue
+			}
+			b = c.emitBucketAt(b, bi, 0, lPos)
 		}
-		b = c.emitBucketAt(b, bi, 0, lPos)
 	}
 
 	// AC transition: only when lPos < pInLen (there is a byte to consume)
