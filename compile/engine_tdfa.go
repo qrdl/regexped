@@ -689,7 +689,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		}
 
 		buildInputMap := func(expanded []uint32) map[rune][]uint32 {
-			return nfaBuildInputMap(prog, expanded, leftmostFirst, nil)
+			return nfaBuildInputMap(prog, expanded, leftmostFirst, nil, nil)
 		}
 
 		inputMapWord := buildInputMap(expandedWord)

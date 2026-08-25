@@ -82,6 +82,19 @@ type dfa struct {
 	hasNewlineBoundary bool // true when pattern contains (?m:^) or (?m:$)
 	needsUnicode       bool
 	immediateAccepting map[int]uint64 // leftmost-first: accept without scanning further (bitmask)
+
+	// acceptWide/midAcceptWide/immAcceptWide are the >64-pattern accept form
+	// (SETS §23, G17): per state, the SORTED list of pattern indices accepting
+	// there, on the same three channels the set suffix body reads. Nil unless
+	// the dfa was built by newDFAWide.
+	//
+	// They sit BESIDE the u64 maps rather than replacing them: the bitmask is
+	// what every other consumer reads, and a 65-pattern bucket still has 64
+	// that fit it. Only the emitter that knows it is on the sparse path reads
+	// these.
+	acceptWide    map[int][]uint16
+	midAcceptWide map[int][]uint16
+	immAcceptWide map[int][]uint16
 }
 
 func (d *dfa) Type() EngineType {
@@ -632,7 +645,8 @@ func boundaryTargetReachesLaterState(prog *syntax.Prog, pc uint32, assertionIdx 
 // byte-consumer at PC p is skipped only when pBits[p] != 0 and all of its
 // pattern bits have already seen their InstMatch.  This prevents one
 // pattern's early match from suppressing transitions for other patterns.
-func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool, pBits []uint64) map[rune][]uint32 {
+func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
+	pBits []uint64, pIdx []int32) map[rune][]uint32 {
 	// Pass 1: find which bytes need a private (non-shared) transition list —
 	// any byte named by a live InstRune/InstRune1 instruction (plus its
 	// case-folded siblings), and '\n' whenever an InstRuneAnyNotNL instruction
@@ -713,11 +727,28 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool, 
 	var defaultOut []uint32
 	seenMatch := false       // single-pattern mode
 	var seenMatchBits uint64 // multi-pattern mode
+	// wideSeen is the >64-pattern form of seenMatchBits: suppression keyed on
+	// pattern INDEX rather than on a bit, because a bucket past 64 patterns has
+	// no bit left to key on (SETS §23, G17). Losing this would not fail loudly
+	// — it would make suppression GLOBAL, so one pattern matching would stop
+	// every lower-priority pattern's byte-consumers and silently drop matches.
+	var wideSeen map[int32]bool
+	widePattern := leftmostFirst && pIdx != nil
+	if widePattern {
+		wideSeen = make(map[int32]bool)
+	}
 	multiPattern := leftmostFirst && pBits != nil
 	for _, pc := range expanded {
 		inst := &prog.Inst[pc]
 		if leftmostFirst {
-			if multiPattern {
+			if widePattern {
+				if id := pIdx[pc]; id >= 0 && wideSeen[id] {
+					switch inst.Op {
+					case syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+						continue
+					}
+				}
+			} else if multiPattern {
 				// Per-pattern suppression: skip this byte-consumer only if ALL
 				// of its pattern bits have already matched.
 				if bits := pBits[pc]; bits != 0 && seenMatchBits&bits == bits {
@@ -734,9 +765,14 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool, 
 			}
 		}
 		if inst.Op == syntax.InstMatch {
-			if multiPattern {
+			switch {
+			case widePattern:
+				if id := pIdx[pc]; id >= 0 {
+					wideSeen[id] = true
+				}
+			case multiPattern:
 				seenMatchBits |= pBits[pc]
-			} else {
+			default:
 				seenMatch = true
 			}
 		}
@@ -855,6 +891,33 @@ func nfaStatesKey(states []uint32) string {
 // only checked on newDFA's *output*, after the unbounded construction had
 // already run to completion (or exhausted memory/CPU trying to).
 func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates int, patternBitsArg ...[]uint64) (*dfa, bool) {
+	var pBits []uint64
+	if len(patternBitsArg) > 0 {
+		pBits = patternBitsArg[0]
+	}
+	return newDFAImpl(prog, needsUnicode, leftmostFirst, maxStates, pBits, nil)
+}
+
+// newDFAWide is newDFA for a merged set bucket holding MORE than 64 patterns,
+// where the u64 accept bitmask every other path uses has run out of bits
+// (SETS §23, task G17).
+//
+// patternIdx is per-PC: patternIdx[pc] is the 0-based index of the pattern
+// whose InstMatch sits at pc, or -1 for any other instruction. The resulting
+// dfa carries acceptWide/midAcceptWide/immAcceptWide — per-state SORTED lists
+// of pattern indices — alongside the u64 maps, which stay populated for the
+// first 64 patterns so nothing downstream has to special-case them.
+//
+// It exists as a separate entry point rather than another variadic on newDFA
+// so that every existing caller keeps the exact construction it has today:
+// with patternIdx nil the shared implementation is bit-identical, which is
+// what keeps `make byteident` honest.
+func newDFAWide(prog *syntax.Prog, leftmostFirst bool, maxStates int, patternIdx []int32) (*dfa, bool) {
+	return newDFAImpl(prog, false, leftmostFirst, maxStates, nil, patternIdx)
+}
+
+func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates int,
+	pBits []uint64, pIdx []int32) (*dfa, bool) {
 	dfa := &dfa{
 		accepting:               make(map[int]uint64),
 		midAccepting:            make(map[int]uint64),
@@ -872,9 +935,10 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		immediateAccepting:      make(map[int]uint64),
 	}
 
-	var pBits []uint64
-	if len(patternBitsArg) > 0 {
-		pBits = patternBitsArg[0]
+	if pIdx != nil {
+		dfa.acceptWide = make(map[int][]uint16)
+		dfa.midAcceptWide = make(map[int][]uint16)
+		dfa.immAcceptWide = make(map[int][]uint16)
 	}
 
 	// Detect if pattern has begin/end anchors, word boundary, or multiline assertions
@@ -990,6 +1054,42 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 		return bits
 	}
 
+	// acceptWideFor is acceptBitsFor's >64-pattern twin: the SORTED, deduped
+	// list of pattern indices accepting in this closure. Only built on the
+	// sparse path; nil otherwise, so the ordinary path allocates nothing.
+	//
+	// Sorted because it is part of the state identity below — two states with
+	// the same accepting patterns in a different order are the same state, and
+	// letting order leak in would split them and inflate the DFA.
+	acceptWideFor := func(states []uint32, ctx int) []uint16 {
+		if pIdx == nil {
+			return nil
+		}
+		expanded := epsilonClosure(states, ctx)
+		var out []uint16
+		for _, pc := range expanded {
+			if prog.Inst[pc].Op != syntax.InstMatch {
+				continue
+			}
+			if int(pc) >= len(pIdx) || pIdx[pc] < 0 {
+				continue
+			}
+			out = append(out, uint16(pIdx[pc]))
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+		k := 0
+		for i := 1; i < len(out); i++ {
+			if out[i] != out[k] {
+				k++
+				out[k] = out[i]
+			}
+		}
+		return out[:k+1]
+	}
+
 	// isDominantMidAccept: see isDominantAccept's doc for
 	// why this can't reuse isImmediateAccepting(epsilonClosure(states, ctx)) —
 	// that would misclassify the very \b/\B node ctx resolves as a blocker.
@@ -1042,6 +1142,32 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 	orAccept := func(m map[int]uint64, state int, bits uint64) {
 		if bits != 0 {
 			m[state] |= bits
+		}
+	}
+
+	// recordWideSet fills the >64-pattern accept lists for a newly created
+	// state (SETS §23, G17). It is a no-op off the sparse path.
+	//
+	// Computed from the state's own NFA set rather than threaded through the
+	// ~20 orAccept call sites, because the accept list is FULLY DETERMINED by
+	// that set: each pattern's InstMatch occupies a distinct PC in the union
+	// program, so which patterns accept is a property of which PCs are present.
+	// That is also why setToKey needs no widening — the set is already the
+	// state's identity.
+	recordWideSet := func(state int, set []uint32, midCtx, eofCtx int) {
+		if pIdx == nil {
+			return
+		}
+		if l := acceptWideFor(set, eofCtx); l != nil {
+			dfa.acceptWide[state] = l
+		}
+		if l := acceptWideFor(set, midCtx); l != nil {
+			dfa.midAcceptWide[state] = l
+		}
+		if isImmediateAccepting(set, prog) {
+			if l := acceptWideFor(set, midCtx); l != nil {
+				dfa.immAcceptWide[state] = l
+			}
 		}
 	}
 
@@ -1369,7 +1495,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 
 		// buildInputMap builds the rune→nextNFAStates map from an expanded NFA set.
 		buildInputMap := func(expanded []uint32) map[rune][]uint32 {
-			return nfaBuildInputMap(prog, expanded, leftmostFirst, pBits)
+			return nfaBuildInputMap(prog, expanded, leftmostFirst, pBits, pIdx)
 		}
 
 		// expandedForNewline: expansion for '\n' bytes.
@@ -1445,6 +1571,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 				nextDFAState = nextStateID
 				stateMap[nextKey] = nextStateID
 				nextStateID++
+				recordWideSet(nextDFAState, nextSet, nlCtx, ecEnd|eofWBCtx|nlCtx)
 				orAccept(dfa.accepting, nextDFAState, rightfulAccept)
 				orAccept(dfa.midAccepting, nextDFAState, acceptBitsFor(nextSet, nlCtx))
 				var nwCtx int
@@ -1645,6 +1772,12 @@ type dfaTable struct {
 	midAcceptWStates      map[int]uint64 // midAcceptW: accepts before word byte (WB triggered)
 	midAcceptNLStates     map[int]uint64 // midAcceptNL: accepts before '\n' byte ((?m:$) triggered)
 	immediateAcceptStates map[int]uint64 // leftmost-first: accept without scanning further
+	// acceptWide/midAcceptWide/immAcceptWide: the >64-pattern accept form
+	// (SETS §23, G17), carried from the dfa so it survives minimisation and
+	// both relabels. Nil off the sparse path.
+	acceptWide    map[int][]uint16
+	midAcceptWide map[int][]uint16
+	immAcceptWide map[int][]uint16
 	// midAcceptNWStatesDominant/W/NL: subset of
 	// midAcceptNW/W/NLStates where Match dominates every other live thread —
 	// see dfa.midAcceptingNWDominant/W/NL for the full explanation.
@@ -1685,6 +1818,9 @@ func dfaTableFrom(d *dfa) *dfaTable {
 		midAcceptWStatesOutranked:  d.midAcceptingWOutranked,
 		midAcceptNLStatesOutranked: d.midAcceptingNLOutranked,
 		immediateAcceptStates:      d.immediateAccepting,
+		acceptWide:                 d.acceptWide,
+		midAcceptWide:              d.midAcceptWide,
+		immAcceptWide:              d.immAcceptWide,
 		transitions:                d.transitions,
 		startBeginAccept:           d.startBeginAccept,
 		hasWordBoundary:            d.hasWordBoundary,
@@ -1857,6 +1993,19 @@ func applyStateRemap(t *dfaTable, oldToNew []int) {
 	t.midAcceptWStatesOutranked = remapMap(t.midAcceptWStatesOutranked)
 	t.midAcceptNLStatesOutranked = remapMap(t.midAcceptNLStatesOutranked)
 	t.immediateAcceptStates = remapMap(t.immediateAcceptStates)
+	remapWide := func(m map[int][]uint16) map[int][]uint16 {
+		if m == nil {
+			return nil
+		}
+		out := make(map[int][]uint16, len(m))
+		for st, l := range m {
+			out[oldToNew[st]] = l
+		}
+		return out
+	}
+	t.acceptWide = remapWide(t.acceptWide)
+	t.midAcceptWide = remapWide(t.midAcceptWide)
+	t.immAcceptWide = remapWide(t.immAcceptWide)
 }
 
 // maxMinimizeDFAPasses bounds minimizeDFA's iterative partition-refinement
@@ -1897,6 +2046,25 @@ func minimizeDFA(t *dfaTable) {
 		a, ma, maw, manw, manl, imm uint64
 		mawDom, manwDom, manlDom    uint64 // dominance is part of the signature too
 		mawOut, manwOut, manlOut    uint64 // outranked is part of the signature too
+		// wide is the >64-pattern accept form, serialised (SETS §23, G17).
+		// Load-bearing rather than belt-and-braces: on the sparse path the u64
+		// fields above are bit 0 for EVERY accepting state, so they separate
+		// nothing, and two states accepting different patterns would merge.
+		wide string
+	}
+	wideSig := func(st int) string {
+		if t.acceptWide == nil && t.midAcceptWide == nil && t.immAcceptWide == nil {
+			return ""
+		}
+		var b strings.Builder
+		for _, m := range []map[int][]uint16{t.acceptWide, t.midAcceptWide, t.immAcceptWide} {
+			b.WriteByte('|')
+			for _, id := range m[st] {
+				b.WriteByte(byte(id))
+				b.WriteByte(byte(id >> 8))
+			}
+		}
+		return b.String()
 	}
 	sigToClass := make(map[sigKey]int, 8)
 	classOf := make([]int, n)
@@ -1915,6 +2083,7 @@ func minimizeDFA(t *dfaTable) {
 			t.midAcceptWStatesOutranked[s],
 			t.midAcceptNWStatesOutranked[s],
 			t.midAcceptNLStatesOutranked[s],
+			wideSig(s),
 		}
 		c, ok := sigToClass[sk]
 		if !ok {
@@ -2036,8 +2205,36 @@ func minimizeDFA(t *dfaTable) {
 	newMidAcceptWOutranked := make(map[int]uint64)
 	newMidAcceptNLOutranked := make(map[int]uint64)
 	newImmAccept := make(map[int]uint64)
+	// The wide lists follow their class. Taking the first list seen per class
+	// is exact BECAUSE the partition above keys on it: every state in a class
+	// carries the same list.
+	var newAcceptWide, newMidAcceptWide, newImmAcceptWide map[int][]uint16
+	if t.acceptWide != nil {
+		newAcceptWide = make(map[int][]uint16)
+	}
+	if t.midAcceptWide != nil {
+		newMidAcceptWide = make(map[int][]uint16)
+	}
+	if t.immAcceptWide != nil {
+		newImmAcceptWide = make(map[int][]uint16)
+	}
 	for s := 0; s < n; s++ {
 		c := classOf[s]
+		if newAcceptWide != nil {
+			if l := t.acceptWide[s]; l != nil {
+				newAcceptWide[c] = l
+			}
+		}
+		if newMidAcceptWide != nil {
+			if l := t.midAcceptWide[s]; l != nil {
+				newMidAcceptWide[c] = l
+			}
+		}
+		if newImmAcceptWide != nil {
+			if l := t.immAcceptWide[s]; l != nil {
+				newImmAcceptWide[c] = l
+			}
+		}
 		if v := t.acceptStates[s]; v != 0 {
 			newAccept[c] |= v
 		}
@@ -2084,6 +2281,9 @@ func minimizeDFA(t *dfaTable) {
 	t.numStates = numClasses
 	t.transitions = newTrans
 	t.acceptStates = newAccept
+	t.acceptWide = newAcceptWide
+	t.midAcceptWide = newMidAcceptWide
+	t.immAcceptWide = newImmAcceptWide
 	t.midAcceptStates = newMidAccept
 	t.midAcceptNWStates = newMidAcceptNW
 	t.midAcceptWStates = newMidAcceptW
@@ -4499,6 +4699,51 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		p.wbNWBitmaskOff = wbNWBitmaskOff
 		p.wbWBitmaskOff = wbWBitmaskOff
 	}
+	// G17: a bucket whose accept is a per-state LIST takes the sparse body,
+	// which walks that list instead of unrolling one compare per pattern —
+	// the only shape that can serve more patterns than the mask has bits.
+	// Its tables and scratch go after everything the layout already placed.
+	if t.midAcceptWide != nil {
+		tabs := buildSparseAcceptTables(t, nextTableOffset, l.numWASM)
+		idMapOff := tabs.end
+		idMap := make([]byte, len(patternIDs)*4)
+		for i, gid := range patternIDs {
+			putU32(idMap, i*4, uint32(gid))
+		}
+		scratch := planSparseScratch(idMapOff+int32(len(idMap)), len(patternIDs))
+		dataBytes = append(dataBytes, appendDataSegment(nil, tabs.midOff, tabs.data)...)
+		dataBytes = append(dataBytes, appendDataSegment(nil, idMapOff, idMap)...)
+		// One zero byte at the top of the scratch so utils.WasmMemTop and the
+		// harnesses see the reservation: they derive "where free memory starts"
+		// from the DATA SEGMENTS, and a region nothing declares gets the
+		// caller's input written straight on top of it.
+		dataBytes = append(dataBytes, appendDataSegment(nil, scratch.end-1, []byte{0})...)
+		dataSegCount += 3
+		nextTableOffset = scratch.end
+		prefixLen := 0
+		if len(prefixFixedLens) > 0 && prefixFixedLens[0] > 0 {
+			prefixLen = prefixFixedLens[0]
+		}
+		art.sparseScratch = scratch
+		art.sparseIDMapOff = idMapOff
+		art.sparseProbeReady = true
+		sp := sparseSuffixParams{
+			l: l, tabs: tabs, scratch: scratch, globalIDs: patternIDs,
+			idMapOff: idMapOff, prefixLen: prefixLen,
+			wasmStart:    uint32(t.startState + 1),
+			wasmMidStart: uint32(t.midStartState + 1),
+			tableMemIdx:  tableMemIdx, gated: gated, hasSkip: needSkip,
+		}
+		art.fnBody = sizePrefixed(buildSparseSuffixBody(sp))
+		if needProbes {
+			probe := sizePrefixed(buildSparseProbeBody(sp))
+			art.scanProbe = probe
+			if firstHit {
+				art.scanProbeAny = probe
+			}
+		}
+		return art, dataBytes, dataSegCount, nextTableOffset
+	}
 	art.fnBody = sizePrefixed(buildSetSuffixBody(p))
 	if needProbes {
 		art.scanProbe = sizePrefixed(buildSetProbeBodyExit(p, false, scanExit))
@@ -4519,8 +4764,13 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 // probes come from genAnchoredWASM over those buckets. This struct used to
 // carry one built from the find-path DFAs that nothing ever read.
 type suffixArtifacts struct {
-	fnBody    []byte
-	scanProbe []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
+	// sparseScratch is where a G17 sparse body keeps its working arrays;
+	// the driver needs the same address to read back probe results.
+	sparseScratch    sparseScratch
+	sparseIDMapOff   int32
+	sparseProbeReady bool
+	fnBody           []byte
+	scanProbe        []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
 	// scanProbeAny is the same probe with a first-hit exit, for `scan` and
 	// `scan_any`. Nil unless the set declares one of
 	// them; `scan_all` must keep using scanProbe.

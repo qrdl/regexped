@@ -287,6 +287,39 @@ func buildMatrix() []setCase {
 		setCase{"sharedsuffix-32", shared, corpusNoMatch(), "no-match 100KB"},
 		setCase{"sharedsuffix-32", shared, corpusSparse(shared), "sparse 100KB"},
 	)
+	// Sets whose patterns all share ONE mandatory literal — the WAF shape, and
+	// the only one here that exercises multi-bucket dispatch behind a single
+	// literal (SETS §23.5). Every other set has distinct literals, so it gets
+	// one bucket per literal and the bucket-count factor G17 attacks never
+	// appears at all.
+	//
+	// TWO sizes on purpose. 32 patterns is ONE bucket and 128 is FOUR (the
+	// 32-pattern bitmask width), so the pair measures the factor directly
+	// rather than asserting it: the cost of the 128 row should track four
+	// suffix-DFA calls per candidate against the 32 row's one.
+	//
+	// The distinct part must be NON-LITERAL or the shape silently stops
+	// sharing: mandatory-literal extraction takes the LONGEST literal, so
+	// `unionkw000` would give each pattern its own literal AND its own bucket.
+	// Verified: 128 distinct patterns, one literal `union`, four buckets of 32.
+	//
+	// The DENSE corpus is the load-bearing one (§23.1): per-candidate cost only
+	// exists where the literal actually hits, and the no-match row is expected
+	// to stay flat between the two sizes for exactly that reason.
+	sharedLitPatterns := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf(`union[ \t]+[a-z]{%d}[0-9]{%d}`, 1+i/16, 1+i%16)
+		}
+		return out
+	}
+	for _, n := range []int{32, 128} {
+		pats := sharedLitPatterns(n)
+		out = append(out,
+			setCase{fmt.Sprintf("sharedlit-%d", n), pats, corpusNoMatch(), "no-match 100KB"},
+			setCase{fmt.Sprintf("sharedlit-%d", n), pats, corpusDense(pats), "dense 100KB"},
+		)
+	}
 	// A set with no mandatory literal at all: every position is visited, so
 	// this is where gating has the most to recover.
 	greedy := []string{`a+`, `[^\n]*ERROR`, `x?y`}
@@ -361,6 +394,12 @@ func sampleNeedles(pats []string, k int) []string {
 			out = append(out, "sk_live_"+strings.Repeat("B", 24))
 		case strings.HasPrefix(p, "eyJ"):
 			out = append(out, "eyJ"+strings.Repeat("C", 24))
+		case strings.HasPrefix(p, "union"):
+			// `union[ \t]+[a-z]{A}[0-9]{B}` — rebuild a matching needle from
+			// the pattern's own two counts so the sparse corpus really hits.
+			var a, b int
+			fmt.Sscanf(p, `union[ \t]+[a-z]{%d}[0-9]{%d}`, &a, &b)
+			out = append(out, "union "+strings.Repeat("q", a)+strings.Repeat("7", b))
 		case p == `a+`:
 			out = append(out, "aaaa")
 		case strings.Contains(p, "ERROR"):

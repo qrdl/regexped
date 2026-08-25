@@ -168,6 +168,60 @@ For TDFA paths (`useAcceptSideTable=true`) only:
 
 DFA paths use `immAcceptLimit` (state-ID partition, `state u<= immAcceptLimit`) instead of a separate `immediateAccept` array.
 
+### Set bucket accept: bitmask, and the sparse form above 32 patterns
+
+A set's merged suffix DFA answers "which patterns accept in this state", so its
+accept arrays are wider than a single pattern's flags. Two encodings exist.
+
+**Bitmask** — the default. Three tables of 8 bytes per state, one bit per
+pattern within the bucket:
+
+```
+[midBitmask: u64[numStates]]   // accepts at any position
+[eofBitmask: u64[numStates]]   // accepts at end of input
+[immBitmask: u64[numStates]]   // leftmost-first immediate accept
+```
+
+Cheap, but it caps a bucket at 32 patterns in practice — not 64. Every mask on
+the per-candidate path (`validMask`, the gate pre-mask, the first-byte
+eligibility mask) is an **i32**, so the bucket width follows the narrower of the
+two.
+
+**Sparse set** — emitted when a bucket holds more patterns than that, which
+happens when many patterns share one mandatory literal. Instead of a bitmask per
+state, each state names a *list* of bucket-local pattern indices:
+
+```
+[midOff:  {u32 offset, u32 count}[numStates]]   // into midList
+[midList: u16[]]                                // pattern indices, sorted
+[eofOff:  {u32 offset, u32 count}[numStates]]
+[eofList: u16[]]
+[immOff:  {u32 offset, u32 count}[numStates]]
+[immList: u16[]]
+[idMap:   u32[numPatterns]]                     // bucket-local index → global pattern id
+[scratch: u32[numPatterns] endPos, u8[numPatterns] seen, u16[numPatterns] fired]
+```
+
+Offset-plus-count rather than a list inline after each transition row, because
+the row stride has to stay constant for the transition arithmetic; a variable
+tail would cost a multiply per input byte to save one load here.
+
+The scratch is working memory, not a table: `endPos` records where each pattern
+last accepted, `seen`/`fired` make the per-position pattern set a list rather
+than a scan over all patterns. It is never cleared wholesale — the body clears
+exactly the entries it set, walking `fired`, so the cost is proportional to
+matches rather than to bucket size. Untouched WASM memory starts zeroed, so the
+first call sees a clean slate.
+
+Why it matters: a shared-literal group otherwise splits into `ceil(N/32)`
+buckets, each costing its own suffix-DFA call at *every* position the literal
+hits. Measured on 128 patterns behind one literal, dense input: 7.3x less fuel
+for `find` and a 59% smaller module against the split form.
+
+A sparse bucket's probe returns a **count**, with the matching global ids left in
+`endPos`, rather than the bitmask a normal probe returns — a bitmask would
+reimpose the same 32-pattern ceiling on the scan capabilities.
+
 ---
 
 ## Find-mode fast-skip

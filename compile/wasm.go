@@ -193,6 +193,19 @@ func appendTableStore32(b []byte, tableMemIdx int, offset uint32) []byte {
 // appendTableStore8 emits i32.store8 align=0 offset=0 for a memo table byte write.
 // tableMemIdx 0: 0x3A 0x00 0x00. tableMemIdx 1: 0x3A 0x40 0x01 0x00
 // (memidx emitted as LEB128 — see appendTableLoad8u).
+// appendTableStore16 emits i32.store16 against the table memory. Alignment 1,
+// matching appendTableLoad16u: the sparse accept lists (SETS §23, G17) are
+// packed u16 arrays with no padding, so a 2-byte-aligned encoding would be a
+// lie the validator does not check but a host may.
+func appendTableStore16(b []byte, tableMemIdx int) []byte {
+	if tableMemIdx == 0 {
+		return append(b, 0x3B, 0x00, 0x00)
+	}
+	b = append(b, 0x3B, 0x40)
+	b = utils.AppendULEB128(b, uint32(tableMemIdx))
+	return append(b, 0x00)
+}
+
 func appendTableStore8(b []byte, tableMemIdx int) []byte {
 	if tableMemIdx == 0 {
 		return append(b, 0x3A, 0x00, 0x00)

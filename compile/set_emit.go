@@ -105,9 +105,12 @@ type compiledSet struct {
 	// question — funcCount, the function section, btFnBaseOffset — must use
 	// this, never len(btFnBodies), or the declared function count comes up
 	// short of the code section and the module fails to parse.
-	numBTFns   int
-	btFnBodies [][]byte
-	btRegions  *btSharedRegions
+	numBTFns int
+	// tableMemIdx is the memory this set's tables live in, kept so emitters
+	// reached through setFindCtx can address them.
+	tableMemIdx int
+	btFnBodies  [][]byte
+	btRegions   *btSharedRegions
 
 	// prefixFnBodies[i] is the body for the i-th unique prefix DFA (backward scan).
 	// Signature: (ptr i32, scan_end i32) → i32  (type 0)
@@ -475,6 +478,11 @@ func (s SetSpec) needsAnchoredBuckets() bool {
 // prefixPool and suffixPool are shared dedup pools across all sets in the file.
 func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions) *compiledSet {
 	diag := &SetDiag{Name: spec.Name}
+	// G17's sparse accept. Probes are served too: a sparse probe cannot return
+	// a bucket-local bitmask — that is the 32-pattern ceiling it exists to
+	// escape — so it returns a COUNT and leaves the matching GLOBAL ids in the
+	// bucket's scratch, which emitRecordSparseProbe reads back.
+	opts.AllowSparseAccept = true
 	buckets := binPack(spec.Patterns, opts, diag)
 
 	// G12: per-pattern absence literals, used by the preflights in place of
@@ -679,6 +687,13 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			}
 		}
 		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], needScanProbes, gatedFind, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
+		if art.sparseProbeReady {
+			// The scratch address is decided by the emitter; the driver reads
+			// probe results from it, so it is written back here rather than
+			// recomputed.
+			bkt.sparseScratch = art.sparseScratch
+			bkt.sparseIDMapOff = art.sparseIDMapOff
+		}
 		if needSuffixFns {
 			suffixFnBodies[bi] = art.fnBody
 		}
@@ -1018,6 +1033,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		anyProbeIdx:         anyProbeIdx,
 		numSuffixFns:        len(suffixFnBodies),
 		numBTFns:            numBTFns,
+		tableMemIdx:         opts.TableMemIdx,
 		btRegions:           btRegions,
 		dataBytes:           allDataBytes,
 		dataSegCount:        totalDataSegs,

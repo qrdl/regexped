@@ -513,6 +513,14 @@ type AcceptKind int
 
 const (
 	AcceptBitmask AcceptKind = iota + 1 // one bit per pattern in a u64 per DFA state
+	// AcceptSparseSet: per accepting DFA state, a SORTED list of pattern
+	// indices instead of a bitmask (SETS §23, G17). It exists because the
+	// bitmask caps a bucket at 64 patterns — 32 in practice, since every mask
+	// on the per-candidate path is an i32 — and a set whose patterns share one
+	// mandatory literal then splits into ceil(N/32) buckets, each costing its
+	// own suffix-DFA call at every candidate position. Measured: 128 patterns
+	// sharing a literal cost 3.33x one bucket's work on a literal-dense input.
+	AcceptSparseSet
 )
 
 // CompileSetOptions holds tunable parameters for set composition.
@@ -527,6 +535,10 @@ type CompileSetOptions struct {
 	ACBudgetBytes         int   // max Aho-Corasick table bytes for the whole set; default 524288
 	TableBase             int32 // byte offset where this set's DFA tables start in memory; default 0
 	TableMemIdx           int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
+	// AllowSparseAccept permits G17's >32-pattern buckets. Off by default so a
+	// caller that has not thought about probes cannot get one: see CompileSet.
+	AllowSparseAccept bool
+
 	// LikelyMode is the resolved set-level LikelyMode hint: consumed by the
 	// set-frontend density gate (H.3, shipped — forces Shufti for a 17..64-byte
 	// first-byte union under LikelyNoMatch).
@@ -538,6 +550,17 @@ func (o CompileSetOptions) bitmaskWidth() int {
 		return o.BitmaskWidth
 	}
 	return 32 // 32 patterns per bucket: fits in the i32 extracted by emitSetMatchFnFinal
+}
+
+// maxPatternsPerBucket caps a sparse-set bucket. Pattern indices are u16 in the
+// accept lists, so the format's own ceiling is 65,535; the default is far below
+// that because a bucket this large is a WAF rule group, not a mistake, and the
+// merged DFA still has to fit budgetStates/budgetBytes.
+func (o CompileSetOptions) maxPatternsPerBucket() int {
+	if o.MaxPatternsPerBucket > 0 {
+		return o.MaxPatternsPerBucket
+	}
+	return 4096
 }
 
 func (o CompileSetOptions) budgetBytes() int {
@@ -662,6 +685,75 @@ func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, A
 // Instruction 0 in each individual prog is always InstFail by convention.
 // In the combined prog we reserve position 0 as a shared InstFail; instructions
 // from prog k (skipping its own inst 0) start at offsets[k].
+// mergeSuffixDFASparseSet is mergeSuffixDFA for a bucket that exceeds the
+// bitmask width: one merged DFA over ALL the patterns, with per-state accept
+// LISTS rather than a u64 mask (SETS §23, task G17).
+//
+// The point is call count, not table size. A candidate position today runs one
+// suffix-DFA call per bucket; merging 128 patterns behind their shared literal
+// into one bucket makes that one call. §23.2's prerequisite — that the merge
+// still fits the state and byte budgets — was measured before this was written
+// and passes with room: 128 patterns of three WAF-ish shapes come to 15-85
+// states and 4-22 KB against 512 states / 64 KB.
+//
+// Returns the table plus the dfa, because the accept lists live on the latter;
+// the caller needs both to emit.
+func mergeSuffixDFASparseSet(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, *dfa, error) {
+	if len(asts) == 0 {
+		return nil, nil, fmt.Errorf("mergeSuffixDFASparseSet: empty pattern list")
+	}
+	if max := opts.maxPatternsPerBucket(); len(asts) > max {
+		return nil, nil, fmt.Errorf("mergeSuffixDFASparseSet: %d patterns exceed maxPatternsPerBucket %d",
+			len(asts), max)
+	}
+	progs := make([]*syntax.Prog, len(asts))
+	for k, a := range asts {
+		p, err := syntax.Compile(a.Simplify())
+		if err != nil {
+			return nil, nil, fmt.Errorf("mergeSuffixDFASparseSet: compile suffix %d: %w", k, err)
+		}
+		progs[k] = p
+	}
+	unionProg, patternIdx := buildUnionProgIndexed(progs)
+	d, ok := newDFAWide(unionProg, true, maxHelperDFAStates, patternIdx)
+	if !ok {
+		return nil, nil, ErrDFAStateLimit
+	}
+	return dfaTableFromCanonical(d), d, nil
+}
+
+// buildUnionProgIndexed is buildUnionProg's >64-pattern twin: instead of a
+// per-PC bitmask it returns a per-PC pattern INDEX (-1 for instructions that
+// belong to no pattern), which is what lifts the 64-pattern ceiling.
+//
+// The index is set for EVERY instruction of pattern k, not only its InstMatch,
+// mirroring buildUnionProg's bits exactly — nfaBuildInputMap's leftmost-first
+// suppression reads it to decide whether a byte-consumer still has a live
+// owner, and narrowing it to InstMatch would make that suppression global.
+//
+// Offsets are recomputed here rather than shared with buildUnionProg because
+// that function does not expose them; they must stay in step, which is why
+// both derivations sit next to each other and the test asserts every pattern's
+// InstMatch is found.
+func buildUnionProgIndexed(progs []*syntax.Prog) (*syntax.Prog, []int32) {
+	unionProg, _ := buildUnionProg(progs, len(progs))
+	idx := make([]int32, len(unionProg.Inst))
+	for i := range idx {
+		idx[i] = -1
+	}
+	off := 1 // position 0 is the shared InstFail
+	for k, p := range progs {
+		for i := 1; i < len(p.Inst); i++ {
+			pos := off + i - 1
+			if pos < len(idx) {
+				idx[pos] = int32(k)
+			}
+		}
+		off += len(p.Inst) - 1
+	}
+	return unionProg, idx
+}
+
 func buildUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uint64) {
 	// Compute placement offsets — skip instruction 0 (InstFail) from each prog.
 	offsets := make([]int, len(progs))
@@ -1212,6 +1304,19 @@ type bucket struct {
 	// Always exactly one pattern: BT has no merged form, so there is nothing
 	// to share a bucket with.
 	btFallback *btBucketInfo
+
+	// sparse marks a bucket whose accept is a per-state LIST rather than a
+	// 32-bit mask (SETS §23, G17), which is what lets it hold more patterns
+	// than the mask has bits. suffixDFA then carries the wide accept maps and
+	// the emitter takes buildSparseSuffixBody instead of buildSetSuffixBody.
+	sparse bool
+	// sparseScratch is where this bucket's sparse body keeps its working
+	// arrays. Decided at EMIT time (genSuffixWASM lays it out after the
+	// tables), so it is written back onto the bucket rather than computed
+	// twice — two derivations of one address is how they drift apart.
+	sparseScratch sparseScratch
+	// sparseIDMapOff maps bucket-local index -> global pattern id at runtime.
+	sparseIDMapOff int32
 }
 
 // btBucketInfo carries everything the emitter needs for a Backtracking
@@ -1256,6 +1361,77 @@ func bucketByLiteral(patterns []*PatternInfo) (map[string][]*PatternInfo, []*Pat
 //
 // Each rejection is recorded in diag. Non-literal and non-splittable patterns
 // are routed to compileFallback instead.
+// promoteSharedLiteralBuckets merges buckets that share one literal into a
+// single SPARSE bucket (SETS §23, task G17).
+//
+// A shared-literal group splits into ceil(N/32) buckets purely because the
+// accept bitmask is an i32 on the per-candidate path — never because the merged
+// DFA was too big. Each split costs a suffix-DFA call at EVERY position the
+// literal hits, measured at 3.33x for 128 patterns against 32 (setperf's
+// sharedlit rows). One walk over one merged DFA replaces them.
+//
+// Conservative by construction, because a wrong promotion is worse than no
+// promotion (§23.4): it runs only with more than one bucket to merge, refuses
+// if the merged DFA misses §23.2's state or byte budgets — in which case
+// binPack would have split it again anyway and nothing is gained — and refuses
+// word-boundary or (?m) patterns, whose extra accept channels the sparse body
+// does not serialise.
+func promoteSharedLiteralBuckets(litBuckets []*bucket, opts CompileSetOptions) []*bucket {
+	if !opts.AllowSparseAccept || len(litBuckets) < 2 {
+		return litBuckets
+	}
+	lit := litBuckets[0].literal
+	if lit == "" {
+		return litBuckets
+	}
+	total := 0
+	for _, b := range litBuckets {
+		if b.literal != lit || b.btFallback != nil {
+			return litBuckets
+		}
+		total += len(b.patterns)
+	}
+	if total > opts.maxPatternsPerBucket() {
+		return litBuckets
+	}
+	merged := make([]*PatternInfo, 0, total)
+	asts := make([]*syntax.Regexp, 0, total)
+	for _, b := range litBuckets {
+		for _, p := range b.patterns {
+			ast := patternSuffixAST(p)
+			if ast == nil {
+				return litBuckets
+			}
+			if regexpHasWordBoundary(ast) {
+				return litBuckets
+			}
+			merged = append(merged, p)
+			asts = append(asts, ast)
+		}
+	}
+	tab, _, err := mergeSuffixDFASparseSet(asts, opts)
+	if err != nil {
+		return litBuckets
+	}
+	if tab.hasWordBoundary || tab.hasNewlineBoundary {
+		return litBuckets
+	}
+	if tab.numStates > opts.budgetStates() || dfaTableBytes(tab) > opts.budgetBytes() {
+		return litBuckets
+	}
+	cm, _, nc := computeByteClasses(tab)
+	return []*bucket{{
+		literal:      lit,
+		patterns:     merged,
+		suffixDFA:    tab,
+		suffixStates: tab.numStates,
+		tableBytes:   dfaTableBytes(tab),
+		classMap:     cm,
+		numClasses:   nc,
+		sparse:       true,
+	}}
+}
+
 func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*bucket {
 	bw := opts.bitmaskWidth()
 	prefilterBudget := opts.budgetStatesPreFilter()
@@ -1419,6 +1595,11 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 				litBuckets = append(litBuckets, nb)
 			}
 		}
+		// G17: buckets that split ONLY because the accept mask ran out of bits
+		// are re-merged into one sparse bucket, so a candidate position costs
+		// one suffix-DFA walk instead of ceil(N/32). Only for a shared literal:
+		// distinct literals already get a bucket each and gain nothing.
+		litBuckets = promoteSharedLiteralBuckets(litBuckets, opts)
 		buckets = append(buckets, litBuckets...)
 	}
 
@@ -1445,6 +1626,9 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 			// Its suffix_states / table_bytes are honestly 0: it has no table.
 			if b.btFallback != nil {
 				btype = "bt-fallback"
+			}
+			if b.sparse {
+				btype = "sparse-set"
 			}
 			refs := make([]PatternRef, len(b.patterns))
 			for j, p := range b.patterns {

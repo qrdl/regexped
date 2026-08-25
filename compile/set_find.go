@@ -971,6 +971,9 @@ func (c *setFindCtx) emitProbeOverflowEscape(b []byte, bi int) []byte {
 // this emitter free of the br-depth bookkeeping the four frontends would
 // otherwise each need their own version of.
 func (c *setFindCtx) emitRecordProbe(b []byte, bi int) []byte {
+	if bi < len(c.cs.buckets) && c.cs.buckets[bi].sparse {
+		return c.emitRecordSparseProbe(b, bi)
+	}
 	switch c.mode {
 	case capScan:
 		// Any bit settles a boolean answer.
@@ -993,6 +996,82 @@ func (c *setFindCtx) emitRecordProbe(b []byte, bi int) []byte {
 	default: // capScanAll
 		return emitSetAllBits(b, c.cs.patternIDs[bi], c.lTmp, c.wideBitmap,
 			c.pOutPtr, c.lTotal, c.lAcc)
+	}
+}
+
+// emitRecordSparseProbe folds a SPARSE bucket's probe result into the mode's
+// answer (SETS §23, G17).
+//
+// A sparse probe cannot return a bucket-local bitmask — that is the 32-pattern
+// ceiling it exists to escape — so it returns a COUNT and leaves the matching
+// GLOBAL ids in the bucket's scratch. The ids are already global, which makes
+// this simpler than the bitmask path: there is no bucket-local-to-global
+// mapping to unroll, just a loop.
+func (c *setFindCtx) emitRecordSparseProbe(b []byte, bi int) []byte {
+	sc := c.cs.buckets[bi].sparseScratch
+	switch c.mode {
+	case capScan:
+		// Any hit settles a boolean answer; the count is enough.
+		b = append(b, 0x20, c.lTmp, 0x04, 0x40)
+		b = append(b, 0x41, 0x01, 0x21, c.lTotal)
+		b = append(b, 0x0B)
+		return b
+	case capScanAny:
+		// Which id is unspecified (§3.5), so the first collected one will do.
+		b = append(b, 0x20, c.lTmp, 0x04, 0x40)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, c.cs.buckets[bi].sparseIDMapOff)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, sc.endPos)
+		b = appendTableLoad32(b, c.cs.tableMemIdx, 0)
+		b = append(b, 0x41, 0x02, 0x74, 0x6A)
+		b = appendTableLoad32(b, c.cs.tableMemIdx, 0)
+		b = append(b, 0x21, c.lOutBase)
+		b = append(b, 0x0B)
+		return b
+	default: // capScanAll
+		// Walk the collected ids, setting each one's bit. lTmp is the count.
+		//
+		// Only two locals are borrowed — lStart as the index and lBase as the
+		// id — both dead in scan mode once the probe has been recorded, and
+		// both recomputed by the next group. The bitmap update itself is
+		// stack-only, recomputing the byte address rather than holding it, so
+		// this needs no local of its own.
+		b = append(b, 0x41, 0x00, 0x21, c.lStart)
+		b = append(b, 0x02, 0x40)
+		b = append(b, 0x20, c.lTmp, 0x45, 0x0D, 0x00)
+		b = append(b, 0x03, 0x40)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, c.cs.buckets[bi].sparseIDMapOff)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, sc.endPos)
+		b = append(b, 0x20, c.lStart, 0x41, 0x02, 0x74, 0x6A)
+		b = appendTableLoad32(b, c.cs.tableMemIdx, 0)
+		b = append(b, 0x41, 0x02, 0x74, 0x6A)
+		b = appendTableLoad32(b, c.cs.tableMemIdx, 0)
+		b = append(b, 0x21, c.lBase) // the global id
+		if c.wideBitmap {
+			// Count only 0->1 transitions so lTotal stays DISTINCT patterns.
+			b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41, 0x03, 0x76, 0x6A)
+			b = appendTableLoad8u(b, 0)
+			b = append(b, 0x41, 0x01, 0x20, c.lBase, 0x41, 0x07, 0x71, 0x74)
+			b = append(b, 0x71, 0x45, 0x04, 0x40) // (old & mask) == 0
+			b = append(b, 0x20, c.lTotal, 0x41, 0x01, 0x6A, 0x21, c.lTotal)
+			b = append(b, 0x0B)
+			b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41, 0x03, 0x76, 0x6A)
+			b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41, 0x03, 0x76, 0x6A)
+			b = appendTableLoad8u(b, 0)
+			b = append(b, 0x41, 0x01, 0x20, c.lBase, 0x41, 0x07, 0x71, 0x74, 0x72)
+			b = appendTableStore8(b, 0)
+		} else {
+			b = append(b, 0x20, c.lAcc, 0x42, 0x01)
+			b = append(b, 0x20, c.lBase, 0xAD, 0x86, 0x84, 0x21, c.lAcc)
+		}
+		b = append(b, 0x20, c.lStart, 0x41, 0x01, 0x6A, 0x21, c.lStart)
+		b = append(b, 0x20, c.lStart, 0x20, c.lTmp, 0x49, 0x0D, 0x00)
+		b = append(b, 0x0B)
+		b = append(b, 0x0B)
+		return b
 	}
 }
 

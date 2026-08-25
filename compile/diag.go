@@ -105,11 +105,15 @@ type FrontendDemotionDiag struct {
 // BucketDiag describes one merged bucket.
 type BucketDiag struct {
 	ID int `json:"id"`
-	// Type is "merged" | "singleton" | "fallback" | "bt-fallback".
+	// Type is "merged" | "singleton" | "fallback" | "bt-fallback" |
+	// "sparse-set".
 	// "bt-fallback" is a pattern admitted on the Backtracking engine after its
 	// suffix DFA exceeded max_fallback_states (SETS_PLAN item 20); it holds
 	// exactly one pattern and has NO table, so SuffixStates and TableBytes are
-	// 0 for it rather than unknown.
+	// 0 for it rather than unknown. "sparse-set" is G17's >32-pattern bucket
+	// (SETS §23): its accept is a per-state LIST rather than a bitmask, which
+	// is what lets it hold a whole shared-literal group in one bucket instead
+	// of ceil(N/32) of them.
 	Type         string       `json:"type"`
 	AcceptKind   string       `json:"accept_kind"` // "bitmask" (Phases 2–5)
 	Literal      string       `json:"literal"`
