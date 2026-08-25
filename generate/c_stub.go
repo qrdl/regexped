@@ -162,7 +162,8 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			if wide {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, int patterns[static %[3]s]) {
     unsigned char bits[(%[2]s + 7) / 8] = {0};
-    ffi_%[1]s(input, (int)len, bits);
+    int n = ffi_%[1]s(input, (int)len, bits);
+    if (n < 0) return n; /* RX_ERR_BT_OVERFLOW: result unknown, not empty */
     int c = 0;
     for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) patterns[c++] = k;
     return c;
@@ -180,7 +181,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		}
 		if s.ScanAny != "" {
 			imp(s.ScanAny, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from);", s.ScanAny))
-			fmt.Fprintf(&hb, "/* Returns one pattern id matching somewhere at or after offset, or -1.\n   Which id you get is unspecified when several patterns match, and no\n   position is reported. */\nint %s(const char *input, size_t len, size_t offset);\n\n", s.ScanAny)
+			fmt.Fprintf(&hb, "/* Returns one pattern id matching somewhere at or after offset, or -1.\n   Which id you get is unspecified when several patterns match, and no\n   position is reported.\n\n   May also return RX_ERR_BT_OVERFLOW: a Backtracking member of this set\n   exhausted its frame budget, so the answer is UNKNOWN rather than -1.\n   Test for it before treating a negative result as \"no match\". */\nint %s(const char *input, size_t len, size_t offset);\n\n", s.ScanAny)
 			fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset) {
     return ffi_%[1]s(input, (int)len, (int)offset);
 }
@@ -196,7 +197,8 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			if wide {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset, int patterns[static %[3]s]) {
     unsigned char bits[(%[2]s + 7) / 8] = {0};
-    ffi_%[1]s(input, (int)len, (int)offset, bits);
+    int n = ffi_%[1]s(input, (int)len, (int)offset, bits);
+    if (n < 0) return n; /* RX_ERR_BT_OVERFLOW: result unknown, not empty */
     int c = 0;
     for (int k = 0; k < %[2]s; k++) if (bits[k / 8] & (1u << (k %% 8))) patterns[c++] = k;
     return c;
@@ -287,7 +289,12 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     if (cap > 0x7FFFFFFF) return RX_ERR_RANGE;
     if (s->done) return 0;
     int got = ffi_%[1]s(s->input, (int)s->len, (int)s->offset, %[4]s(int *)buf, (int)cap);
-    if (got <= 0) { s->done = 1; return 0; }
+    /* Negative is RX_ERR_BT_OVERFLOW, not a count: a Backtracking member of
+       this set exhausted its frame budget, so what remains is UNKNOWN rather
+       than nothing. Folding it into the "0 means finished" test below would
+       end the scan silently and report success. */
+    if (got < 0) { s->done = 1; return got; }
+    if (got == 0) { s->done = 1; return 0; }
     /* Over capacity: nothing was recorded and the scan did not advance, so the
        caller can grow and repeat at this same position. */
     if ((size_t)got > cap) return got;

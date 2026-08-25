@@ -60,6 +60,7 @@ func main() {
 	setBatch := flag.Bool("set-batch", false, "with --sets, drive `find_batch` ONLY at a buffer capacity of one, so every multi-match position splits and every §19 resume path is taken (default drives capacity 1 and capacity=pattern-count)")
 	setChunk := flag.Int("set-chunk", 32, "with --sets, patterns per compiled set (0 = one set per corpus block, which is what --sets did before §22). The RE2 corpus has 27 blocks of 132..7020 patterns, so without chunking the frontend and id-space thresholds (packed-pair <=16, Teddy <=64, AC >16, wide `_all` >64) are never crossed from below")
 	setShuffle := flag.Bool("set-shuffle", false, "with --sets, deterministically permute a block's patterns before chunking, so a set holds unrelated patterns instead of variations of one generator family")
+	setBT := flag.Int("set-bt", 0, "with --sets, force set members onto the Backtracking fallback engine by capping max_fallback_states at this many DFA states (0 = off, 1 = force everything BT can take). SETS_PLAN item 20: patterns over the limit used to be DROPPED from the set entirely, so this is the only way to exercise BT-backed buckets at corpus scale")
 	setSampleN := flag.Int("sample", 1, "with --sets, test only every Nth chunk (1 = all). This is what separates the sampled gate from the exhaustive run")
 	setSubsetF := flag.Bool("set-subset", false, "with --sets, make each set select a NAMED SUBSET of the chunk's patterns (every second one, from index 1) instead of `patterns: all`; this is the only configuration in which PATTERN_COUNT and ID_SPACE differ, which is what sizes the gate array and the `_all` bitmap")
 	setProfiles := flag.String("set-profiles", "all", "with --sets, comma-separated capability profiles to compile per chunk: all, anchored, scan, scan-any, find, find-ov, batch, batch-ov — or all-profiles")
@@ -85,6 +86,7 @@ func main() {
 	setShufflePats = *setShuffle
 	setSample = *setSampleN
 	setMaxPrint = *maxErrors
+	setBTFallback = *setBT
 	if *setSampleN < 1 {
 		fmt.Fprintln(os.Stderr, "--sample must be >= 1")
 		os.Exit(1)

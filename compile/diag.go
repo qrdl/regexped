@@ -104,8 +104,13 @@ type FrontendDemotionDiag struct {
 
 // BucketDiag describes one merged bucket.
 type BucketDiag struct {
-	ID           int          `json:"id"`
-	Type         string       `json:"type"`        // "merged" | "singleton" | "fallback"
+	ID int `json:"id"`
+	// Type is "merged" | "singleton" | "fallback" | "bt-fallback".
+	// "bt-fallback" is a pattern admitted on the Backtracking engine after its
+	// suffix DFA exceeded max_fallback_states (SETS_PLAN item 20); it holds
+	// exactly one pattern and has NO table, so SuffixStates and TableBytes are
+	// 0 for it rather than unknown.
+	Type         string       `json:"type"`
 	AcceptKind   string       `json:"accept_kind"` // "bitmask" (Phases 2–5)
 	Literal      string       `json:"literal"`
 	Patterns     []PatternRef `json:"patterns"`

@@ -117,10 +117,34 @@ func (cs *compiledSet) checkIDSpace() {
 	}
 }
 
-// wideAll reports whether this set's `_all` capabilities use the >64-pattern
-// out_ptr bitmap form. Keyed on the ID SPACE, because the form exists to carry
-// bit positions and a bit position is a pattern id (§3.13).
-func (cs *compiledSet) wideAll() bool { return cs.idSpaceSize() > wideBitmapThreshold }
+// hasBTMember reports whether any bucket in this set was admitted on the
+// Backtracking engine (SETS_PLAN item 20). It is the one condition that can
+// make a capability answer "I don't know" instead of yes or no.
+func (cs *compiledSet) hasBTMember() bool { return cs.numBTFns > 0 }
+
+// wideAll reports whether this set's `_all` capabilities use the out_ptr bitmap
+// form rather than the i64 bitmask return.
+//
+// Two independent reasons select it:
+//
+//   - ID SPACE > 64 — the original one: the form exists to carry bit positions
+//     and a bit position is a pattern id (§3.13), so more than 64 ids simply do
+//     not fit in an i64.
+//
+//   - A BACKTRACKING MEMBER — SETS_PLAN item 20 decision 3. BT is the first
+//     engine here that can return "unknown" (abi.BTStackOverflow) rather than a
+//     definite yes/no, and that third outcome needs somewhere to live. The
+//     narrow form is the only capability shape with no room for it: its i64
+//     return IS the bitmask, so every one of the 2^64 values is already a legal
+//     answer and -2 reads as "everything matched except pattern 0". Moving the
+//     bitmap into memory frees the return value to carry a count, which can go
+//     negative.
+//
+// CONDITIONAL, deliberately: a set with no BT member keeps the cheap i64 form
+// untouched, so nothing that exists today changes shape.
+func (cs *compiledSet) wideAll() bool {
+	return cs.idSpaceSize() > wideBitmapThreshold || cs.hasBTMember()
+}
 
 // emitSetAnyID records ONE arbitrary matching pattern id from a bucket-local
 // bitmask into dst — the `_any` capabilities' whole answer.

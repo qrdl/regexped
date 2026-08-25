@@ -78,13 +78,17 @@ export function %s(input) {
     const len = _w(input, %d);
     const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
-    _exp['%s'](_inBase, len, bitmapBase);
+    const n = _exp['%s'](_inBase, len, bitmapBase);
+    // -2 is UNKNOWN, not "nothing matched". The anchored path never probes a
+    // Backtracking member today, so this cannot fire; it is here so that a
+    // future one cannot fail silently.
+    if (n === %d) throw new Error("%s");
     const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
     const out = [];
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, idKonst, idKonst)
+`, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, btOverflow, btOverflowMsg(s.MatchAll), idKonst, idKonst)
 			} else {
 				fmt.Fprintf(&out, `// -> number[]   (pattern ids, NOT a boolean)
 export function %s(input) {
@@ -104,9 +108,12 @@ export function %s(input) {
 export function %s(input, from = 0) {
     const len = _w(input);
     const id = _exp['%s'](_inBase, len, from);
+    // -2 is the Backtracking engine giving up: the result is UNKNOWN, not "no
+    // match". Compared exactly, since -1 — a real no-match — is next door.
+    if (id === %d) throw new Error("%s");
     return id < 0 ? null : id;
 }
-`, s.ScanAny, s.ScanAny)
+`, s.ScanAny, s.ScanAny, btOverflow, btOverflowMsg(s.ScanAny))
 		}
 		if s.ScanAll != "" {
 			if wide {
@@ -115,13 +122,17 @@ export function %s(input, from = 0) {
     const len = _w(input, %d);
     const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
-    _exp['%s'](_inBase, len, from, bitmapBase);
+    const n = _exp['%s'](_inBase, len, from, bitmapBase);
+    // -2 is UNKNOWN, not an empty result: a Backtracking member gave up. The
+    // narrow form has no room to say this — its i64 return IS the bitmask — so
+    // a BT member is exactly what forces this wide form.
+    if (n === %d) throw new Error("%s");
     const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
     const out = [];
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, idKonst, idKonst)
+`, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, btOverflow, btOverflowMsg(s.ScanAll), idKonst, idKonst)
 			} else {
 				fmt.Fprintf(&out, `// -> number[]   (pattern ids, NOT a boolean)
 export function %s(input, from = 0) {
@@ -161,6 +172,10 @@ export function %s(input, from = 0) {
         // The buffer is sized at the set's pattern count, the exact worst case
         // for a single position, so n can never exceed it.
         const n = _exp['%s'](_inBase, len, pos, %s_outBase, %s);
+        // -2 is UNKNOWN, not a count: a Backtracking member gave up here. It
+        // has to be tested before the break below, which reads every
+        // non-positive n as a clean end of scan.
+        if (n === %d) throw new Error("%s");
         if (n <= 0) break;
         // Every tuple in one call shares a start; resume one past it.
         const next = buf[1] + 1;
@@ -170,7 +185,8 @@ export function %s(input, from = 0) {
         pos = next;
     }
 }
-`, gateDoc, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst)
+`, gateDoc, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst,
+					btOverflow, btOverflowMsg(s.Find))
 			} else {
 				// `hints: [batch-find]`: the same matches in the same order,
 				// but batchSize positions of work per host crossing. That is
@@ -201,6 +217,10 @@ export function %s(input, from = 0) {
         // are public — all ones means the scan is finished, and that arrives
         // on the same call as the last matches.
         const n = Number(packed & %dn);
+        // The position word can also carry 0x%X: not a resume point but
+        // UNKNOWN — a Backtracking member gave up, and this call reported
+        // nothing. Tested beside the done word so it cannot pass for a finish.
+        if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
         const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;
         for (let i = 0; i < n; i++) {
             yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
@@ -212,7 +232,8 @@ export function %s(input, from = 0) {
 }
 `, camelSet(s.Name)+"BatchMaxSize", gateDoc, s.Find, defaultBatchCap(s, cfg),
 					camelSet(s.Name)+"BatchMaxSize", 4*idN+bitmapBytes(s, cfg), batchGateSetup,
-					config.SetBatchExportName(s.Find), gateArg, cursorCountMask(s, cfg))
+					config.SetBatchExportName(s.Find), gateArg, cursorCountMask(s, cfg),
+					config.SetCursorOverflowPos, config.SetCursorOverflowPos, btOverflowMsg(s.Find))
 			}
 		}
 		out.WriteString("\n")

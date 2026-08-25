@@ -106,7 +106,9 @@ func %s(input []byte) (int, bool) {
 func %s(input []byte) iter.Seq[int] {
 	return func(yield func(int) bool) {
 		bits := make([]byte, (%s+7)/8)
-		ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), unsafe.Pointer(&bits[0]))
+		// The wide form returns a count, so the sentinel is distinguishable:
+		// overflow means the bitmap was never answered, not that it is empty.
+		if ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), unsafe.Pointer(&bits[0])) == %d { panic("%s") }
 		for k := 0; k < %s; k++ {
 			if bits[k/8]&(1<<uint(k%%8)) != 0 {
 				if !yield(k) { return }
@@ -115,7 +117,7 @@ func %s(input []byte) iter.Seq[int] {
 	}
 }
 
-`, pub, pub, idKonst, s.MatchAll, idKonst)
+`, pub, pub, idKonst, s.MatchAll, btOverflow, btOverflowMsg(pub), idKonst)
 			} else {
 				imp(s.MatchAll, "("+inArgs+") int64")
 				fmt.Fprintf(&out, `// %s yields the id of every pattern matching the whole input.
@@ -142,11 +144,14 @@ func %s(input []byte) iter.Seq[int] {
 // genuinely matching pattern, and no position is reported.
 func %s(input []byte, offset uint) (id int, ok bool) {
 	r := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset))
+	// Tested exactly, not as "negative": -1 is a real answer (no pattern
+	// matched), the sentinel means the engine gave up and the answer is unknown.
+	if r == %d { panic("%s") }
 	if r < 0 { return 0, false }
 	return int(r), true
 }
 
-`, pub, pub, s.ScanAny)
+`, pub, pub, s.ScanAny, btOverflow, btOverflowMsg(pub))
 		}
 		if s.ScanAll != "" {
 			needsIter = true
@@ -157,7 +162,9 @@ func %s(input []byte, offset uint) (id int, ok bool) {
 func %s(input []byte, offset uint) iter.Seq[int] {
 	return func(yield func(int) bool) {
 		bits := make([]byte, (%s+7)/8)
-		ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset), unsafe.Pointer(&bits[0]))
+		// The wide form returns a count, so the sentinel is distinguishable:
+		// overflow means the bitmap was never answered, not that it is empty.
+		if ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset), unsafe.Pointer(&bits[0])) == %d { panic("%s") }
 		for k := 0; k < %s; k++ {
 			if bits[k/8]&(1<<uint(k%%8)) != 0 {
 				if !yield(k) { return }
@@ -166,7 +173,7 @@ func %s(input []byte, offset uint) iter.Seq[int] {
 	}
 }
 
-`, pub, pub, idKonst, s.ScanAll, idKonst)
+`, pub, pub, idKonst, s.ScanAll, btOverflow, btOverflowMsg(pub), idKonst)
 			} else {
 				imp(s.ScanAll, "("+inArgs+", from int32) int64")
 				fmt.Fprintf(&out, `// %s yields the id of every pattern matching somewhere at or after offset.
@@ -205,6 +212,10 @@ func %s(input []byte, offset uint) iter.Seq[SetMatch] {
 %s		pos := int32(offset)
 		for {
 			n := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), pos, %sunsafe.Pointer(&buf[0]), %s)
+			// Before the n <= 0 test: overflow is "unknown", not "scan
+			// finished", and ending the iteration here would report a partial
+			// answer as a complete one.
+			if n == %d { panic("%s") }
 			if n <= 0 { return }
 			// Every tuple in one call shares a start; resume one past it.
 			next := buf[0][1] + 1
@@ -216,7 +227,7 @@ func %s(input []byte, offset uint) iter.Seq[SetMatch] {
 	}
 }
 
-`, pub, gateDoc, pub, konst, gateDecl, s.Find, gateArg, konst)
+`, pub, gateDoc, pub, konst, gateDecl, s.Find, gateArg, konst, btOverflow, btOverflowMsg(pub))
 		}
 	}
 	if hasEmitNameMap(cfg) {

@@ -2,6 +2,7 @@ package compile
 
 import (
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -233,6 +234,28 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx int) []byte {
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(workerIdx))
 	b = append(b, 0x21, lTotal)
+
+	// The worker can return abi.BTStackOverflow instead of a count when a
+	// Backtracking bucket exhausted its frame budget. Both exits below treat a
+	// small total as "nothing more to find", so without this guard "I don't
+	// know" would be delivered to the caller as "the scan finished" — the exact
+	// silent-wrong-answer this sentinel exists to prevent.
+	//
+	// The reply is the reserved position word with an all-zero low half, so a
+	// caller that decodes before testing still reads a count of zero rather
+	// than tuples that were never written.
+	if cs.hasBTMember() {
+		b = append(b, 0x20, lTotal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.BTStackOverflow))
+		b = append(b, 0x46)       // i32.eq
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(config.SetCursorOverflowPos))
+		b = append(b, 0x42, 0x20, 0x86) // << 32
+		b = append(b, 0x0F)             // return
+		b = append(b, 0x0B)
+	}
 
 	// if total <= k: nothing left at or after pos → done. Gated, k is 0 and
 	// this is the ordinary "no match" exit.

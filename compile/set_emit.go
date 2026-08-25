@@ -94,6 +94,21 @@ type compiledSet struct {
 	anchoredDataBytes   []byte
 	anchoredDataSegs    int
 
+	// btFnBodies[i] is the Backtracking driver for the i-th BT fallback bucket
+	// (SETS_PLAN item 20): (ptr, len, out_ptr) -> i32, the same shape a
+	// single-pattern capture body has. Laid out LAST among a set's functions so
+	// adding them moves no existing offset. btRegions is the one shared
+	// stack/memo/scratch allocation they all use.
+	// numBTFns is the count of Backtracking drivers this set will emit. It is
+	// known in CompileSet, whereas btFnBodies is only FILLED at assembleModule
+	// time (a driver's suffix body needs function indices). Every layout
+	// question — funcCount, the function section, btFnBaseOffset — must use
+	// this, never len(btFnBodies), or the declared function count comes up
+	// short of the code section and the module fails to parse.
+	numBTFns   int
+	btFnBodies [][]byte
+	btRegions  *btSharedRegions
+
 	// prefixFnBodies[i] is the body for the i-th unique prefix DFA (backward scan).
 	// Signature: (ptr i32, scan_end i32) → i32  (type 0)
 	prefixFnBodies [][]byte
@@ -274,7 +289,14 @@ func (cs *compiledSet) capFns() []setCapFn {
 // one per declared capability, plus the per-bucket suffix, prefix and probe helpers.
 func (cs *compiledSet) funcCount() int {
 	return len(cs.capFns()) + cs.hiddenFnCount() + cs.numSuffixFns + len(cs.prefixFnBodies) +
-		len(cs.scanProbeBodies) + len(cs.scanProbeAnyBodies) + len(cs.anchoredProbeBodies)
+		len(cs.scanProbeBodies) + len(cs.scanProbeAnyBodies) + len(cs.anchoredProbeBodies) +
+		cs.numBTFns
+}
+
+// btFnBaseOffset returns the index of the first Backtracking driver, which sit
+// last so that adding them moved no existing sub-index.
+func (cs *compiledSet) btFnBaseOffset() int {
+	return cs.anchoredProbeBaseOffset() + len(cs.anchoredProbeBodies)
 }
 
 // suffixFnBaseOffset returns the index of the first suffix function within this
@@ -571,6 +593,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		anyNeverDying, anyBoundary := false, false
 		for _, bkt := range buckets {
 			if bkt.suffixDFA == nil {
+				// Includes BT fallback buckets, which have no table to
+				// inspect. A liveness table is a per-DFA artefact; a BT bucket
+				// simply never contributes one.
 				continue
 			}
 			if hasNeverDyingState(bkt.suffixDFA) {
@@ -635,6 +660,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	}
 	suffixDedup := map[uint64][]suffixSlot{}
 	for bi, bkt := range buckets {
+		// A Backtracking fallback bucket has no table at all — that is the
+		// point of it (SETS_PLAN item 20). Its suffix body is emitted later,
+		// once the shared BT regions and the BT body's function index are
+		// known, so this pass simply leaves its slot empty and advances
+		// nothing.
+		if bkt.btFallback != nil {
+			continue
+		}
 		base, reused, fp := tableOffset, false, uint64(0)
 		if bkt.suffixDFA != nil {
 			fp = dfaFingerprint(bkt.suffixDFA)
@@ -919,6 +952,51 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		setTablesEnd = teddyTableEnd
 	}
 
+	// ── Backtracking fallback buckets (SETS_PLAN item 20) ────────────────────
+	// Laid out above every other table this set owns, so the regions cannot
+	// collide with a suffix, prefix, AC or Teddy table. ONE shared allocation
+	// sized to the largest BT bucket: only one BT call is ever live, because
+	// the per-candidate driver calls one suffix function at a time and the
+	// memo re-zeroes itself at the head of every call.
+	btRegions := planBTRegions(buckets, int64(setTablesEnd))
+	numBTFns := 0
+	for bi, bkt := range buckets {
+		if bkt.btFallback == nil {
+			continue
+		}
+		// A BT bucket holds exactly ONE pattern: BT has no merged form, and
+		// buildSetBTSuffixBody answers for patternIDs[bi][0] / validMask bit 0
+		// alone. This invariant was violated silently once — compileFallback's
+		// bin-packer merged later fallback patterns INTO a BT bucket, and every
+		// merged-in pattern vanished from every bucketed capability with no
+		// error anywhere (SETS_PLAN item 20, the 396/84 corpus failure). Panic
+		// rather than emit: there is no correct module to produce from this
+		// state, and the alternative is another silent under-report.
+		if n := len(bkt.patterns); n != 1 {
+			panic(fmt.Sprintf("compile: set %q bucket %d is a Backtracking "+
+				"fallback holding %d patterns — a BT bucket must hold exactly "+
+				"one; the bin-packer merged into it (SETS_PLAN item 20)",
+				spec.Name, bi, n))
+		}
+		numBTFns++
+	}
+	if btRegions != nil {
+		setTablesEnd = btRegions.end
+		// DECLARE the reservation in the data section. The regions hold no
+		// initial data — BT zeroes its own memo and its stack starts empty —
+		// but a caller has no other way to learn they exist: both
+		// utils.WasmMemTop and the harnesses derive "where free memory
+		// starts" from the emitted data segments. Without this the input
+		// buffer is placed straight on top of the BT stack, which is silent
+		// corruption rather than a trap: a mixed set lost matches from the
+		// LITERAL bucket too, which is how it was found.
+		//
+		// One zero byte at the top is enough to move that boundary; carrying
+		// the whole region as zeros would add tens of KB to every module.
+		allDataBytes = append(allDataBytes, appendDataSegment(nil, btRegions.end-1, []byte{0})...)
+		totalDataSegs++
+	}
+
 	cs := &compiledSet{
 		absenceLits:         absLits,
 		absenceAlive:        absAlive,
@@ -939,6 +1017,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		scanProbeAnyBodies:  scanProbeAnyBodies,
 		anyProbeIdx:         anyProbeIdx,
 		numSuffixFns:        len(suffixFnBodies),
+		numBTFns:            numBTFns,
+		btRegions:           btRegions,
 		dataBytes:           allDataBytes,
 		dataSegCount:        totalDataSegs,
 		prefixFnBodies:      prefixFnBodies,
@@ -1026,8 +1106,18 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// patterns only; phase 1 is the frontend over the literal buckets.
 	//
 	// `scan` is not consulted: TODO task 59 decision (2) retires it.
+	//
+	// NOT taken when the set has a Backtracking member (SETS_PLAN item 20
+	// decision 3). Phase 2's union walk answers with an i64 accumulator and
+	// has no out_ptr parameter at all — it implements the NARROW `_all` ABI
+	// only — while a BT member forces every `_all` capability into the memory
+	// form, so emitTwoPhaseScanBody would be composing two phases of different
+	// shapes. Skipping the split costs those sets phase 1's skip and nothing
+	// else: the ordinary bucketed path serves every pattern, BT buckets
+	// included. A set that pays for Backtracking is already the slow case.
 	if fe != frontendScalar && (spec.ScanAny != "" || spec.ScanAll != "") &&
-		hasSetFallbackBucketsIn(buckets) && hasLiteralBuckets(buckets) {
+		hasSetFallbackBucketsIn(buckets) && hasLiteralBuckets(buckets) &&
+		!hasBTBucketIn(buckets) {
 		p2Base := setTablesEnd
 		cs.phase2Union = buildUnionScanDFA(fallbackSubSpec(spec, buckets), opts, p2Base)
 		if cs.phase2Union != nil && cs.phase2Union.tableEnd > setTablesEnd {
@@ -1214,25 +1304,9 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 		}
 
 		// Drop capture-bearing patterns; build PatternInfos.
-		var infos []*PatternInfo
-		var globalIDs []int
-		for _, idx := range selectedIdx {
-			re := cfg.Regexps[idx]
-			if re.CaptureStubsRequested() {
-				continue // drop capture-bearing
-			}
-			info, err := analyzePattern(re, &prefixPool, &suffixPool)
-			if err != nil {
-				patLabel := re.Name
-				if patLabel == "" {
-					patLabel = re.Pattern
-				}
-				return nil, 0, nil, fmt.Errorf("set %q: pattern %q: %w", sc.Name, patLabel, err)
-			}
-			info.globalID = idx
-			info.name = re.Name
-			infos = append(infos, info)
-			globalIDs = append(globalIDs, idx)
+		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+		if err != nil {
+			return nil, 0, nil, err
 		}
 
 		spec := SetSpec{
@@ -1501,6 +1575,10 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for range cs.anchoredProbeBodies {
 			fs = append(fs, byte(setTypeI32x4ToI32))
 		}
+		for i := 0; i < cs.numBTFns; i++ {
+			// (ptr, len, out_ptr) -> i32, the capture-body shape.
+			fs = append(fs, byte(setTypeI32x3ToI32))
+		}
 	}
 	out = appendSection(out, 3, fs)
 
@@ -1739,7 +1817,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = append(cs_bytes, p1...)
 			cs_bytes = append(cs_bytes, emitUnionScanBody(cs.phase2Union, kind, cs.phase2Mask(), tableMemIdx)...)
 		}
-		for _, sfn := range cs.suffixFnBodies {
+		// A Backtracking fallback bucket's suffix body CALLS its driver, so it
+		// can only be built here, where function indices exist. Everything
+		// else about it is decided in CompileSet; this fills the slot the
+		// suffix pass deliberately left empty.
+		btBodies := cs.buildBTBodies(base+cs.btFnBaseOffset(), tableMemIdx)
+		for bi, sfn := range cs.suffixFnBodies {
+			if repl, ok := btBodies[bi]; ok {
+				sfn = repl
+			}
 			cs_bytes = append(cs_bytes, sfn...)
 		}
 		for _, pfn := range cs.prefixFnBodies {
@@ -1753,6 +1839,10 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 		for _, pb := range cs.anchoredProbeBodies {
 			cs_bytes = append(cs_bytes, pb...)
+		}
+		// Backtracking drivers last, matching btFnBaseOffset.
+		for _, bb := range cs.btFnBodies {
+			cs_bytes = append(cs_bytes, bb...)
 		}
 	}
 	out = appendSection(out, 10, cs_bytes)

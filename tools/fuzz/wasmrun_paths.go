@@ -328,9 +328,12 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 			return nil, false, callErr
 		}
 		n := int(res.(int32))
-		// Set frontends are DFA-only today, so BTStackOverflow is not
-		// currently reachable here. Checked anyway, and BEFORE the n <= 0 test
-		// that would otherwise read it as "no matches".
+		// A set CAN reach this now: a member whose fallback DFA exceeded
+		// max_fallback_states is admitted on the Backtracking engine
+		// (SETS_PLAN item 20), and an exhausted frame budget answers "unknown"
+		// rather than "no match". Tested BEFORE the n <= 0 check below, which
+		// would otherwise read the sentinel as "no matches" and end the scan
+		// reporting success.
 		if n == abi.BTStackOverflow {
 			return nil, false, errBTOverflow
 		}

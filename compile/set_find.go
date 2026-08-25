@@ -3,6 +3,7 @@ package compile
 import (
 	"sort"
 
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -374,7 +375,25 @@ func (c *setFindCtx) emitSelectBase(b []byte) []byte {
 // starting at lStart. Nothing is committed when the count is zero, so a
 // candidate whose literal matched but whose DFA found nothing cannot move
 // lMinStart.
-func (c *setFindCtx) emitCommit(b []byte) []byte {
+//
+// btBucket selects the overflow guard: a Backtracking suffix body can return
+// abi.BTStackOverflow instead of a count, and the commit below tests `count !=
+// 0` — which -2 passes. Without the guard the total becomes `lBase - 2`, a
+// silently corrupted count that the caller reads as a tuple quantity. The
+// guard returns it instead, unchanged, so "unknown" reaches the caller as
+// "unknown" (SETS_PLAN item 20 task 20.D).
+func (c *setFindCtx) emitCommit(b []byte, btBucket bool) []byte {
+	if btBucket {
+		b = append(b, 0x21, c.lTmp) // set (not tee): the guard re-pushes it
+		b = append(b, 0x20, c.lTmp)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x48)       // i32.lt_s
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, c.lTmp)
+		b = append(b, 0x0F) // return the sentinel unchanged
+		b = append(b, 0x0B)
+		b = append(b, 0x20, c.lTmp) // restore for the tee below
+	}
 	b = append(b, 0x22, c.lTmp, 0x04, 0x40) // tee count; if count != 0
 	b = append(b, 0x20, c.lStart, 0x21, c.lMinStart)
 	b = append(b, 0x20, c.lBase, 0x20, c.lTmp, 0x6A, 0x21, c.lTotal)
@@ -835,7 +854,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		if c.mode == capFind {
 			b = c.emitSelectBase(b)
 			b = c.emitSuffixCall(b, bi, litLen, posLocal, g.mask)
-			b = c.emitCommit(b)
+			b = c.emitCommit(b, bi < len(c.cs.buckets) && c.cs.buckets[bi].btFallback != nil)
 		} else {
 			b = c.emitProbeCall(b, bi, litLen, posLocal, g.mask)
 			b = c.emitRecordProbe(b, bi)
@@ -907,6 +926,41 @@ func (c *setFindCtx) emitProbeCall(b []byte, bi, litLen int, posLocal byte, mask
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(c.probeIndex(bi)))
 	b = append(b, 0x21, c.lTmp)
+	b = c.emitProbeOverflowEscape(b, bi)
+	return b
+}
+
+// emitProbeOverflowEscape returns abi.BTStackOverflow out of the whole
+// capability the moment a Backtracking probe reports it (SETS_PLAN item 20
+// task 20.D).
+//
+// Returning IMMEDIATELY is the point. A probe that gave up has not proved a
+// non-match, so folding its answer into the accumulator — an id, a boolean, a
+// bitmap bit — would publish "no" for a question the engine never answered.
+// There is nothing to salvage from the rest of the scan either: any later
+// position could have been the one this pattern matched at.
+//
+// Emitted ONLY for BT buckets. Every other probe is table-driven and always
+// terminates with a definite answer, so for them this would be dead code on
+// the hot path.
+//
+// The return type is i32 for every mode that can reach here: `scan` and
+// `scan_any` are i32 already, and `scan_all` is in its out_ptr form because
+// wideAll() is forced true by hasBTMember() — which is exactly why decision 3
+// requires that form. A narrow scan_all would need an i64 here and have no
+// value free to carry.
+func (c *setFindCtx) emitProbeOverflowEscape(b []byte, bi int) []byte {
+	if bi >= len(c.cs.buckets) || c.cs.buckets[bi].btFallback == nil {
+		return b
+	}
+	b = append(b, 0x20, c.lTmp)
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x48)       // i32.lt_s
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.BTStackOverflow))
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B)
 	return b
 }
 

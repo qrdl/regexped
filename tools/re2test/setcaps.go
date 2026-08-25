@@ -299,6 +299,10 @@ func (s *setCapStats) totalPass() int {
 // the first, most informative report under megabytes of output.
 var setMaxPrint int
 
+// setBTFallback caps max_fallback_states for set compilation, forcing members
+// onto the Backtracking fallback engine (SETS_PLAN item 20). 0 = off.
+var setBTFallback int
+
 func setFailf(format string, args ...interface{}) {
 	if setMaxPrint > 0 && setStats.printed >= setMaxPrint {
 		return
@@ -743,7 +747,17 @@ func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selec
 		}
 		sets = append(sets, sc)
 	}
-	return config.BuildConfig{Regexps: entries, Sets: sets}
+	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
+	// --set-bt drives SETS_PLAN item 20: a low max_fallback_states pushes
+	// ordinary corpus patterns onto the Backtracking fallback engine in bulk,
+	// the same way --force-backtrack does for single patterns by setting
+	// MaxDFAStates = -1. The naturally-dropped population is tiny (2 patterns
+	// in custom-sets, none in a 40-chunk corpus sample), so forcing the path
+	// is the only way to exercise it at corpus scale.
+	if setBTFallback > 0 {
+		cfg.MaxFallbackStates = setBTFallback
+	}
+	return cfg
 }
 
 // setSelection returns the global ids a set selects from a chunk of n
@@ -767,9 +781,10 @@ func newSetRunner(
 	selected := setSelection(len(pats))
 	cfg := buildSetProfileConfig(pats, prof, hints, selected)
 	var wasmBytes []byte
+	var diags []compile.SetDiag
 	var err error
 	droppedFind, droppedAnchored := captureDrops(func() {
-		wasmBytes, _, err = compile.CompileFile(cfg, "")
+		wasmBytes, _, diags, err = compile.CompileFileDiag(cfg, "")
 	})
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
@@ -834,6 +849,29 @@ func newSetRunner(
 			inSet[id] = true
 		}
 	}
+	// Which `_all` ABI the module exported. The id space is one reason for the
+	// memory form; a Backtracking member is the other, because BT can answer
+	// "unknown" and the narrow i64 return has no value free to say so
+	// (SETS_PLAN item 20 decision 3). Under --set-bt that second reason is the
+	// COMMON one, and getting it wrong here is not a wrong answer but a wrong
+	// ARITY — the harness would call a 3-parameter export with 2 arguments.
+	//
+	// Read from the DIAGNOSTICS of the compile just performed, not re-derived:
+	// this is what the emitter actually did, and it costs nothing. Calling
+	// compile.SetAdmitsBacktracking here instead — the predicate the stub
+	// generators use, which has to re-run the analysis because `generate` never
+	// compiles — repeated the whole set analysis for every chunk and every
+	// profile, and made a corpus run several times slower for an answer already
+	// in hand.
+	wideAll := idSpace > 64
+	for _, d := range diags {
+		for _, b := range d.Buckets {
+			if b.Type == "bt-fallback" {
+				wideAll = true
+			}
+		}
+	}
+
 	outBase := inBase + span
 	gatePtr := outBase + int32(patternCount)*int32(setOutTupleBytes)
 	bmpLen := int32((idSpace + 7) / 8)
@@ -851,7 +889,7 @@ func newSetRunner(
 		inBase: inBase, outBase: outBase, gatePtr: gatePtr, bmpPtr: bmpPtr,
 		npat: patternCount, idSpace: idSpace, inSet: inSet,
 		outCap: int32(patternCount), bmpLen: bmpLen,
-		wide:        idSpace > 64,
+		wide:        wideAll,
 		droppedFind: droppedFind, droppedAnchored: droppedAnchored,
 	}, nil
 }

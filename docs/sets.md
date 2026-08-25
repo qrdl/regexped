@@ -359,11 +359,18 @@ undersizes.
 
 `match_all` and `scan_all` return a **bitmask** — bit *k* set means pattern *k*
 matched — as an `i64` return value when the set's id space is 64 or fewer.
-Above that they take an `out_ptr` and write a `ceil(P/8)`-byte little-endian
+Otherwise they take an `out_ptr` and write a `ceil(P/8)`-byte little-endian
 bitmap, returning the count instead. The generated stubs expand either form
 into the language's natural list of ids; the bitmask never reaches a stub user.
 A direct caller must pass an **all-zero** bitmap: the module only ORs bits in
 and counts 0→1 transitions, so a reused dirty buffer reports stale patterns.
+
+Two things select the `out_ptr` form, not one. The second is a set containing a
+pattern that fell back to the **Backtracking engine** — see "When a set member
+falls back to Backtracking" below — and it applies at any id space, including a
+two-pattern set. A direct WASM caller cannot assume the form from the pattern
+count alone; the generated stubs work it out for you, and `--diag-json` names
+the responsible buckets as `"bt-fallback"`.
 
 ### Pattern ids and the two emitted constants
 
@@ -567,6 +574,42 @@ and `(?m:^)KEY` keep both their split and their literal frontend. An
 end-assertion *after* the literal is equally fine — `KEY$` is expressed by the
 forward suffix DFA's end-of-text channel — so only a prefix assertion
 disqualifies.
+
+## When a set member falls back to Backtracking
+
+A set member whose fallback-bucket DFA exceeds `max_fallback_states` is not
+dropped: it is compiled on the **Backtracking engine** instead, so the member
+behaves like the same pattern compiled on its own. Backtracking is the only
+engine here not bound by a compiled table size — it walks the NFA with an
+explicit stack — which is what lets it take a pattern no table budget will fit.
+
+It narrows the drop set rather than emptying it. A pattern whose NFA is larger
+than the engine's own instruction cap, or that trips its loop checks, is still
+excluded, still warned about, and still recorded in `--diag-json`'s
+`state_limit_dropped`. Buckets that were admitted appear there as
+`"bt-fallback"`, with `suffix_states` and `table_bytes` of 0 — they have no
+table.
+
+**One consequence reaches the ABI.** Every other set engine is table-driven and
+always finishes with a definite answer: pattern *k* matched, or it did not.
+Backtracking has a third outcome — an exhausted frame budget means it abandoned
+part of the search space and does **not know**. Reporting that as "no match"
+would turn giving up into a confident wrong answer, so it gets its own channel:
+
+| capability | how "unknown" arrives |
+|---|---|
+| `scan_any` | the return is `-2`, distinct from `-1` for "no match" |
+| `match_all`, `scan_all` | these use the `out_ptr` form for this set at any id space, so the return is a count — and `-2` there is the sentinel |
+| `find` | the return is `-2` instead of a match count |
+| `find`'s batch entry | the cursor's resume-position word is `0xFFFFFFFE`, beside `0xFFFFFFFF` for "done", with a zero count |
+
+The generated stubs surface it the way that language reports an unanswerable
+call — Rust and Go **panic**, JS, TS and AssemblyScript **throw**, C returns
+`RX_ERR_BT_OVERFLOW` — matching what they already do for a single pattern that
+overflows. What none of them do is quietly report "nothing matched".
+
+A set with no Backtracking member is completely unaffected: it keeps the `i64`
+bitmask form and none of these checks are emitted.
 
 ## Examples
 

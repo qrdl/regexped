@@ -282,6 +282,24 @@ func SetCursorMaxCount(patternCount int) int32 {
 	return int32(uint32(1)<<uint(SetCursorCountBits(patternCount))) - 1
 }
 
+// SetCursorOverflowPos is the resume-position word reserved to mean "the
+// Backtracking engine exhausted its frame budget, and this scan's result is
+// UNKNOWN" (SETS_PLAN item 20 decision 3). A find_batch call returning it has
+// answered nothing: its count field is zero and no tuples were written.
+//
+// It lives in the POSITION word, beside 0xFFFFFFFF for "done", rather than in
+// the return value as a whole. That is forced: every done return already has
+// bit 63 set, so "negative means unknown" — the convention every other
+// capability uses — cannot work here, and the count and k fields together can
+// span all 32 low bits, so no value of the packed word as a whole is reserved
+// either. The position word is the only field with room, and it already
+// reserves a value for exactly this kind of out-of-band answer.
+//
+// A real resume position can never collide: it is bounded by the input length,
+// and an input long enough to reach 0xFFFFFFFE cannot coexist with the set's
+// tables inside a 4 GiB wasm32 memory.
+const SetCursorOverflowPos = 0xFFFFFFFE
+
 // PatternSelector selects patterns for a set. It can be the scalar string "all"
 // or a list of pattern names.
 type PatternSelector struct {

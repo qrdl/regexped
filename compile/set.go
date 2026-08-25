@@ -1202,6 +1202,31 @@ type bucket struct {
 	classMap     [256]byte      // combined byte-class map of all suffix DFAs
 	numClasses   int            // number of distinct classes in classMap
 	isFallback   bool           // true = no literal, full-pattern DFA
+
+	// btFallback is set when this bucket's single pattern could not be given a
+	// suffix DFA within max_fallback_states and was admitted on the
+	// Backtracking engine instead (SETS_PLAN item 20). Mutually exclusive with
+	// suffixDFA: a BT bucket has no table, which is the entire point — BT is
+	// the only engine here that is not bound by a compiled table size.
+	//
+	// Always exactly one pattern: BT has no merged form, so there is nothing
+	// to share a bucket with.
+	btFallback *btBucketInfo
+}
+
+// btBucketInfo carries everything the emitter needs for a Backtracking
+// fallback bucket. Built by admitBTFallback at the point the pattern would
+// otherwise have been dropped.
+type btBucketInfo struct {
+	bt      *backtrack // the compiled NFA program driver
+	useMemo bool       // BitState memoisation required (needsBitState)
+	// stackSize and memoSize are this pattern's own requirements. The set
+	// allocates ONE shared region sized to the max over its BT buckets — see
+	// SETS_PLAN item 20 decision 4: only one BT call is ever live, because the
+	// per-candidate driver calls one suffix function at a time, and the memo
+	// re-zeroes itself at the head of every call.
+	stackSize int
+	memoSize  int
 }
 
 // bucketKey is used in the literal grouping map. "~fallback~" is the sentinel
@@ -1413,6 +1438,14 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 			if b.isFallback {
 				btype = "fallback"
 			}
+			// A Backtracking bucket reports as its own type. Without this the
+			// diag for a BT-backed set is byte-identical to the DFA one — which
+			// is exactly why item 20's under-report took a day to localise: the
+			// one artefact that should have shown the difference showed none.
+			// Its suffix_states / table_bytes are honestly 0: it has no table.
+			if b.btFallback != nil {
+				btype = "bt-fallback"
+			}
 			refs := make([]PatternRef, len(b.patterns))
 			for j, p := range b.patterns {
 				refs[j] = patternRefFor(p)
@@ -1474,6 +1507,10 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 			// DFA cannot be built is exactly the case the state-limit branch
 			// below covers, and is reported the same way.
 			if isolatedDFA == nil {
+				if nb := newBTBucket(p, opts); nb != nil {
+					buckets = append(buckets, nb)
+					continue
+				}
 				warnPatternDropped(p, "isolated fallback bucket (suffix DFA could not be built)",
 					0, opts.maxFallbackStates())
 				if diag != nil {
@@ -1482,6 +1519,10 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 				continue
 			}
 			if isolatedDFA.numStates > opts.maxFallbackStates() {
+				if nb := newBTBucket(p, opts); nb != nil {
+					buckets = append(buckets, nb)
+					continue
+				}
 				warnPatternDropped(p, "isolated fallback bucket", isolatedDFA.numStates, opts.maxFallbackStates())
 				if diag != nil {
 					diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
@@ -1504,6 +1545,19 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 		}
 		placed := false
 		for _, b := range buckets {
+			// A Backtracking bucket is closed to packing: it has no suffix DFA
+			// to merge into, and its emitted body answers for exactly one
+			// pattern — buildSetBTSuffixBody hardcodes patternIDs[bi][0] and
+			// validMask bit 0. Packing a second pattern into it leaves that
+			// pattern with NO emitted code in any bucketed capability
+			// (set_emit.go skips the whole DFA suffix pass when
+			// btFallback != nil): a silent under-report, not an error. The
+			// budgets checked below (budgetStates 512 / budgetBytes 64 KB) are
+			// unrelated to maxFallbackStates and do NOT protect this — a merged
+			// table small enough to pass them is exactly the case that failed.
+			if b.btFallback != nil {
+				continue
+			}
 			if len(b.patterns) >= bw {
 				continue
 			}
@@ -1539,7 +1593,32 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 					nbDFA = t
 				}
 			}
+			// nbDFA can still be nil, and dereferencing it below was a CRASH.
+			// analyzePattern returns early for some patterns leaving
+			// p.suffixDFA nil, and the merge above can then fail too — e.g.
+			// 3000 chained `(?:[a-z]*[0-9]*)`, where the merge exceeds its
+			// state limit. The ISOLATED branch above has carried exactly this
+			// guard, and its comment, for some time; it was simply never added
+			// to this sibling. Treated identically: a pattern whose own DFA
+			// cannot be built is the case the state-limit branch covers, so it
+			// gets the same BT admission and the same warn-and-drop.
+			if nbDFA == nil {
+				if nb := newBTBucket(p, opts); nb != nil {
+					buckets = append(buckets, nb)
+					continue
+				}
+				warnPatternDropped(p, "new fallback bucket (suffix DFA could not be built)",
+					0, opts.maxFallbackStates())
+				if diag != nil {
+					diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
+				}
+				continue
+			}
 			if nbDFA.numStates > opts.maxFallbackStates() {
+				if nb := newBTBucket(p, opts); nb != nil {
+					buckets = append(buckets, nb)
+					continue
+				}
 				warnPatternDropped(p, "new fallback bucket", nbDFA.numStates, opts.maxFallbackStates())
 				if diag != nil {
 					diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
@@ -1579,6 +1658,26 @@ func patternSuffixAST(p *PatternInfo) *syntax.Regexp {
 		if err != nil {
 			return nil
 		}
+		// Captures must go, and this branch was the ONLY place in the set
+		// pipeline that kept them. Everything else is already capture-free:
+		// analyzePattern strips the tree it parses, and p.suffixAST below is a
+		// SUBTREE of that stripped tree — so this branch alone returned a
+		// different representation of the same pattern than the rest of the
+		// pipeline uses, which is a bug in its own right.
+		//
+		// It was invisible to the DFA emitters, which treat InstCapture as a
+		// pass-through epsilon, and fatal to the Backtracking one: a
+		// capture-bearing program makes buildBacktrackBody emit capture-slot
+		// writes at locals `7 + slot`, while admitBTFallback has set
+		// numGroups = 0 so no capture locals are declared at all. The result is
+		// a module that does not VALIDATE — "unknown local 9: local index out
+		// of bounds" for a single `(a)` group (SETS_PLAN item 20 bug 1). The
+		// single-pattern BT path never hit it because compileBTProg strips
+		// captures before compiling; this is the same contract, applied here.
+		//
+		// Mutating in place is safe precisely because this tree is freshly
+		// parsed on every call and shared with nobody.
+		stripCaptures(re)
 		return re
 	}
 	if p.suffixAST != nil {

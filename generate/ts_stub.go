@@ -165,14 +165,21 @@ func genTSSetSection(cfg config.BuildConfig) string {
     const len = _w(input, %d);
     const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
-    (_exp['%s'] as Function)(_inBase, len, bitmapBase);
+    // The wide form returns a count; the bitmap carries the answer. The count
+    // is read only for the sentinel, which means unknown, not "matched none".
+    const n = (_exp['%s'] as Function)(_inBase, len, bitmapBase) as number;
+    if (n === %d) throw new Error("%s");
     const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
     const out: number[] = [];
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, idKonst, idKonst)
+`, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, btOverflow, btOverflowMsg(s.MatchAll), idKonst, idKonst)
 			} else {
+				// No overflow check in the narrow form, and none is possible: the
+				// i64 return IS the bitmask, so every value is a legal answer —
+				// a -2 test here would misfire whenever pattern 63 matches. The
+				// narrow form is only chosen when no member can overflow.
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): number[] {
     const len = _w(input);
     // The export returns an i64, which surfaces as a BigInt; it is decomposed
@@ -189,9 +196,12 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): number | null {
     const len = _w(input);
     const id = (_exp['%s'] as Function)(_inBase, len, from) as number;
+    // Tested against the sentinel exactly, not "< 0": -1 is a legitimate
+    // no-match, while -2 means the result is unknown.
+    if (id === %d) throw new Error("%s");
     return id < 0 ? null : id;
 }
-`, s.ScanAny, s.ScanAny)
+`, s.ScanAny, s.ScanAny, btOverflow, btOverflowMsg(s.ScanAny))
 		}
 		if s.ScanAll != "" {
 			if wide {
@@ -199,14 +209,19 @@ func genTSSetSection(cfg config.BuildConfig) string {
     const len = _w(input, %d);
     const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
-    (_exp['%s'] as Function)(_inBase, len, from, bitmapBase);
+    // The wide form returns a count; the bitmap carries the answer. The count
+    // is read only for the sentinel, which means unknown, not "matched none".
+    const n = (_exp['%s'] as Function)(_inBase, len, from, bitmapBase) as number;
+    if (n === %d) throw new Error("%s");
     const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
     const out: number[] = [];
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, idKonst, idKonst)
+`, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, btOverflow, btOverflowMsg(s.ScanAll), idKonst, idKonst)
 			} else {
+				// Narrow form: see match_all above — the i64 return IS the
+				// bitmask, so there is no value left to spend on a sentinel.
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): number[] {
     const len = _w(input);
     const mask = (_exp['%s'] as Function)(_inBase, len, from) as bigint;
@@ -238,6 +253,9 @@ func genTSSetSection(cfg config.BuildConfig) string {
     const buf = new Int32Array(_mem.buffer, _outBase, 3*%s);
     while (true) {
         const n = (_exp['%s'] as Function)(_inBase, len, pos, %s_outBase, %s) as number;
+        // Before the "scan finished" test: -2 is the engine abandoning the
+        // search, so ending the generator here would report success.
+        if (n === %d) throw new Error("%s");
         if (n <= 0) break;
         // Every tuple in one call shares a start; resume one past it.
         const next = buf[1] + 1;
@@ -247,7 +265,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
         pos = next;
     }
 }
-`, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst)
+`, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst, btOverflow, btOverflowMsg(s.Find))
 			} else {
 				batchGateSetup := ""
 				if gatedFind(s) {
@@ -271,6 +289,11 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
         // are public — all ones means the scan is finished, and that arrives
         // on the same call as the last matches.
         const n = Number(packed & %dn);
+        // Overflow travels in the resume-position word, beside "done": the
+        // packed cursor has no spare value of its own, and a done cursor
+        // already has bit 63 set. It must be read before the done test —
+        // it means the scan's result is unknown, not that it finished.
+        if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
         const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;
         for (let i = 0; i < n; i++) {
             yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
@@ -282,7 +305,8 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
 }
 `, camelSet(s.Name)+"BatchMaxSize", s.Find, defaultBatchCap(s, cfg),
 					camelSet(s.Name)+"BatchMaxSize", 4*idN+bitmapBytes(s, cfg), batchGateSetup,
-					config.SetBatchExportName(s.Find), gateArg, cursorCountMask(s, cfg))
+					config.SetBatchExportName(s.Find), gateArg, cursorCountMask(s, cfg),
+					config.SetCursorOverflowPos, btOverflowMsg(s.Find))
 			}
 		}
 		out.WriteString("\n")

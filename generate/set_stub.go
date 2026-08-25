@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 )
 
@@ -78,15 +79,31 @@ func camelSet(name string) string {
 	return config.CamelSetName(name)
 }
 
-// wideAllForm reports whether a set's `_all` capabilities use the >64-pattern
-// out_ptr bitmap form rather than an i64 bitmask return.
+// wideAllForm reports whether a set's `_all` capabilities use the out_ptr
+// bitmap form rather than an i64 bitmask return.
 //
-// Keyed on the ID SPACE, matching compiledSet.wideAll(): the form exists to
-// carry bit positions, and a bit position is a pattern id. Keying it on the
-// pattern count let the stub declare one signature while the module exported
-// the other.
+// This MUST track compiledSet.wideAll() exactly. A disagreement is not a build
+// error — both sides are just integers to WASM — it is a stub that reads a
+// count as a bitmask, so both conditions live here in the same order the
+// emitter tests them:
+//
+//   - ID SPACE > 64: the form exists to carry bit positions, and a bit position
+//     is a pattern id. Keying this on the pattern count instead let the stub
+//     declare one signature while the module exported the other.
+//
+//   - A BACKTRACKING MEMBER: BT can answer "unknown" (abi.BTStackOverflow), and
+//     the narrow form has nowhere to put it — its i64 return IS the bitmask, so
+//     every value is already a legal answer. Moving the bitmap into memory frees
+//     the return to carry a count that can go negative (SETS_PLAN item 20
+//     decision 3).
+//
+// The second condition is a COMPILE-time fact, which is why it comes from
+// compile.SetAdmitsBacktracking rather than from arithmetic on the config: the
+// admission depends on which patterns exceeded max_fallback_states and whether
+// BT accepted them. Asking the compiler keeps one source of truth; `generate`
+// still needs nothing but the config to run.
 func wideAllForm(s config.SetConfig, cfg config.BuildConfig) bool {
-	return idSpaceSize(s, cfg) > 64
+	return idSpaceSize(s, cfg) > 64 || compile.SetAdmitsBacktracking(s, cfg)
 }
 
 // bitmapBytes is the size of the >64-pattern bitmap: ceil(idSpace/8).

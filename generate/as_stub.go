@@ -83,12 +83,15 @@ export function %s(input: ArrayBuffer): i32 {
 				fmt.Fprintf(&out, `/** Ids of every pattern matching the whole input. */
 export function %s(input: ArrayBuffer): Array<i32> {
     const bits = new StaticArray<u8>((%s + 7) >> 3);
-    ffi_%s(changetype<usize>(input), input.byteLength, changetype<usize>(bits));
+    const n = ffi_%s(changetype<usize>(input), input.byteLength, changetype<usize>(bits));
+    // The wide form returns a count, so the sentinel is distinguishable:
+    // overflow means the bitmap was never answered, not that it is empty.
+    if (n == %d) throw new Error("%s");
     const out = new Array<i32>();
     for (let k = 0; k < %s; k++) if (bits[k >> 3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.MatchAll, idKonst, s.MatchAll, idKonst)
+`, s.MatchAll, idKonst, s.MatchAll, btOverflow, btOverflowMsg(s.MatchAll), idKonst)
 			} else {
 				decl(s.MatchAll, "(ptr: usize, len: i32): i64")
 				fmt.Fprintf(&out, `/** Ids of every pattern matching the whole input. */
@@ -107,9 +110,13 @@ export function %s(input: ArrayBuffer): Array<i32> {
  *  Which id you get is unspecified when several patterns match; no position
  *  is reported. */
 export function %s(input: ArrayBuffer, offset: u32): i32 {
-    return ffi_%s(changetype<usize>(input), input.byteLength, i32(offset));
+    const r = ffi_%s(changetype<usize>(input), input.byteLength, i32(offset));
+    // Tested exactly, not as "negative": -1 is a real answer (no pattern
+    // matched), the sentinel means the engine gave up and the answer is unknown.
+    if (r == %d) throw new Error("%s");
+    return r;
 }
-`, s.ScanAny, s.ScanAny)
+`, s.ScanAny, s.ScanAny, btOverflow, btOverflowMsg(s.ScanAny))
 		}
 		if s.ScanAll != "" {
 			if wide {
@@ -117,12 +124,15 @@ export function %s(input: ArrayBuffer, offset: u32): i32 {
 				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`offset`"+`. */
 export function %s(input: ArrayBuffer, offset: u32): Array<i32> {
     const bits = new StaticArray<u8>((%s + 7) >> 3);
-    ffi_%s(changetype<usize>(input), input.byteLength, i32(offset), changetype<usize>(bits));
+    const n = ffi_%s(changetype<usize>(input), input.byteLength, i32(offset), changetype<usize>(bits));
+    // The wide form returns a count, so the sentinel is distinguishable:
+    // overflow means the bitmap was never answered, not that it is empty.
+    if (n == %d) throw new Error("%s");
     const out = new Array<i32>();
     for (let k = 0; k < %s; k++) if (bits[k >> 3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.ScanAll, idKonst, s.ScanAll, idKonst)
+`, s.ScanAll, idKonst, s.ScanAll, btOverflow, btOverflowMsg(s.ScanAll), idKonst)
 			} else {
 				decl(s.ScanAll, "(ptr: usize, len: i32, from: i32): i64")
 				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`offset`"+`. */
@@ -172,6 +182,10 @@ export class %[1]s {
             if (this.done) return null;
             const got = ffi_%[5]s(changetype<usize>(this.input), this.input.byteLength, this.from,
                 %[6]schangetype<usize>(this.buf), %[3]s);
+            // Before the "no more matches" test: the sentinel means the engine
+            // gave up, so ending the iteration here would report a finished
+            // scan when the rest of the input was never answered.
+            if (got == %[7]d) throw new Error("%[8]s");
             if (got <= 0) { this.done = true; return null; }
             this.n = got;
             this.i = 0;
@@ -185,7 +199,7 @@ export class %[1]s {
 export function %[5]s(input: ArrayBuffer, offset: u32): %[1]s {
     return new %[1]s(input, offset);
 }
-`, iterName, gateField, konst, gateInit, s.Find, gateArg)
+`, iterName, gateField, konst, gateInit, s.Find, gateArg, btOverflow, btOverflowMsg(s.Find))
 		}
 		out.WriteString("\n")
 	}

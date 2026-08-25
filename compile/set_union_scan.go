@@ -488,7 +488,15 @@ func (cs *compiledSet) usesUnionScan(kind setCapKind) bool {
 	case capScan, capScanAny:
 		return true
 	case capScanAll:
-		return cs.idSpaceSize() <= 64
+		// The walk answers with an i64 accumulator and takes no out_ptr, so it
+		// implements the NARROW `_all` ABI and can only serve a capability
+		// using it. Keyed on wideAll() rather than on the id space alone
+		// because the id space is no longer the only thing that selects the
+		// wide form: a Backtracking member forces it at any size (SETS_PLAN
+		// item 20 decision 3). Testing the size here left the walk serving a
+		// capability that had already moved to the memory form — an i64 pushed
+		// where an i32 was expected, i.e. a module that does not validate.
+		return !cs.wideAll()
 	}
 	return false
 }
@@ -724,8 +732,10 @@ func (cs *compiledSet) usesTwoPhaseScan(kind setCapKind) bool {
 		return true
 	case capScanAll:
 		// Same reason as usesUnionScan: the wide ABI writes a caller bitmap,
-		// which an accumulator-returning walk does not do.
-		return cs.idSpaceSize() <= 64
+		// which an accumulator-returning walk does not do. Keyed on wideAll()
+		// for the same reason too — a Backtracking member selects the wide
+		// form at any id space.
+		return !cs.wideAll()
 	}
 	return false
 }

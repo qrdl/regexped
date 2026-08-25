@@ -1235,3 +1235,58 @@ regexps
 -;0-34;-;-;0-34
 -;-;-;-;-
 -;0-16;-;-;0-16,16-32,32-34
+# ============================================================
+# SETS_PLAN item 20 (Backtracking as a set fallback engine): a MULTI-pattern
+# all-fallback set. compileFallback's bin-packer used to merge later fallback
+# patterns INTO a BT bucket, and since a BT body answers for one pattern only
+# (patternIDs[bi][0], validMask bit 0), every merged-in pattern vanished from
+# each bucketed capability with no error anywhere.
+#
+# These four are the corpus block that exposed it (orig 3624). They matter
+# together rather than singly: the defect needs a SECOND fallback pattern to
+# exist at all, so a one-pattern regression could not have caught it. Under
+# --set-bt they all become BT-admitted; without it they are ordinary fallback
+# buckets, so the block is a useful shape either way.
+# ============================================================
+SetG15Item20MergedFallbackBuckets
+strings
+""
+"a"
+"c"
+"ac"
+"ca"
+"abc"
+"aacc"
+regexps
+"(?:.(?:c?))"
+-;-;-;-;-
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;0-2;-;-;0-2
+-;0-1;-;-;0-1,1-2
+-;0-1;-;-;0-1,1-3
+-;0-1;-;-;0-1,1-3,3-4
+"^(?:(?:.(?:c?)))$"
+-;-;-;-;-
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"^(?:(?:.(?:c?)))"
+-;-;-;-;-
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;0-2;-;-;0-2
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+"(?:(?:.(?:c?)))$"
+-;-;-;-;-
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;0-2;-;-;0-2
+-;1-2;-;-;1-2
+-;1-3;-;-;1-3
+-;2-4;-;-;2-4

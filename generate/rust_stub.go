@@ -121,11 +121,15 @@ pub fn %s(input: &[u8]) -> Option<i32> {
 				"pub fn %s(input: &[u8]) -> impl Iterator<Item = i32> + '_ {\n", s.MatchAll)
 			if wide {
 				fmt.Fprintf(&out, `    let mut bits = [0u8; (%s + 7) / 8];
-    unsafe { ffi_%s(input.as_ptr(), input.len() as i32, bits.as_mut_ptr()) };
+    let n = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, bits.as_mut_ptr()) };
+    // The wide form returns a COUNT, so -2 can only be the sentinel: the
+    // bitmap is then unknown, not empty. The anchored path never calls a
+    // Backtracking probe today, so this cannot fire yet.
+    if n == %d { panic!("%s"); }
     (0..%s as i32).filter(move |k| bits[(*k / 8) as usize] & (1u8 << (*k %% 8)) != 0)
 }
 
-`, idKonst, s.MatchAll, idKonst)
+`, idKonst, s.MatchAll, btOverflow, btOverflowMsg(s.MatchAll), idKonst)
 			} else {
 				fmt.Fprintf(&out, `    let mask = unsafe { ffi_%s(input.as_ptr(), input.len() as i32) } as u64;
     (0..%s as i32).filter(move |k| mask & (1u64 << k) != 0)
@@ -138,13 +142,21 @@ pub fn %s(input: &[u8]) -> Option<i32> {
 			fmt.Fprintf(&out, "/// Returns one pattern id that matches somewhere at or after `from`, or\n"+
 				"/// None. Which id you get is unspecified when several patterns match; it\n"+
 				"/// names a genuinely matching pattern, and no position is reported.\n"+
+				"///\n"+
+				"/// # Panics\n"+
+				"/// Panics if a member pattern compiled to the Backtracking engine and the\n"+
+				"/// input exhausted its frame budget: the engine cannot tell whether the\n"+
+				"/// input matches, so None (a definite \"no\") would be a lie.\n"+
 				`pub fn %s(input: &[u8], offset: usize) -> Option<i32> {
     let r = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, offset as i32) };
+    // -1 is a legitimate "no match", so the sentinel has to be tested for
+    // exactly rather than folded into the r < 0 test below.
+    if r == %d { panic!("%s"); }
     if r < 0 { return None; }
     Some(r)
 }
 
-`, s.ScanAny, s.ScanAny)
+`, s.ScanAny, s.ScanAny, btOverflow, btOverflowMsg(s.ScanAny))
 		}
 		if s.ScanAll != "" {
 			fmt.Fprintf(&out, "/// Yields the id of every pattern matching somewhere at or after `offset`.\n"+
@@ -152,11 +164,14 @@ pub fn %s(input: &[u8]) -> Option<i32> {
 				"pub fn %s(input: &[u8], offset: usize) -> impl Iterator<Item = i32> + '_ {\n", s.ScanAll)
 			if wide {
 				fmt.Fprintf(&out, `    let mut bits = [0u8; (%s + 7) / 8];
-    unsafe { ffi_%s(input.as_ptr(), input.len() as i32, offset as i32, bits.as_mut_ptr()) };
+    let n = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, offset as i32, bits.as_mut_ptr()) };
+    // The wide form returns a COUNT, so -2 can only be the sentinel: the
+    // bitmap is then unknown, not empty.
+    if n == %d { panic!("%s"); }
     (0..%s as i32).filter(move |k| bits[(*k / 8) as usize] & (1u8 << (*k %% 8)) != 0)
 }
 
-`, idKonst, s.ScanAll, idKonst)
+`, idKonst, s.ScanAll, btOverflow, btOverflowMsg(s.ScanAll), idKonst)
 			} else {
 				fmt.Fprintf(&out, `    let mask = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, offset as i32) } as u64;
     (0..%s as i32).filter(move |k| mask & (1u64 << k) != 0)
@@ -220,6 +235,9 @@ impl<'a> Iterator for %s<'a> {
                 ffi_%s(self.input.as_ptr(), self.input.len() as i32, self.from,
                     %sself.buf.as_mut_ptr() as *mut i32, %s as i32)
             };
+            // Before the scan-finished test: -2 means the engine gave up and
+            // does not know, so ending iteration here would report success.
+            if n == %d { panic!("%s"); }
             if n <= 0 { self.done = true; return None; }
             // The buffer is sized at the set's pattern count, the exact worst
             // case for a single position, so n can never exceed it.
@@ -231,8 +249,13 @@ impl<'a> Iterator for %s<'a> {
     }
 }
 
-`, gateDoc, allocDoc, iterName, gateField, bufField, iterName, s.Find, gateArg, konst)
+`, gateDoc, allocDoc, iterName, gateField, bufField, iterName, s.Find, gateArg, konst, btOverflow, btOverflowMsg(s.Find))
 			fmt.Fprintf(&out, "/// Starts a scan at `offset`. Each step yields one match.\n"+
+				"///\n"+
+				"/// # Panics\n"+
+				"/// next() panics if a member pattern compiled to the Backtracking engine\n"+
+				"/// and the input exhausted its frame budget: the engine cannot tell\n"+
+				"/// whether the input matches, so ending iteration would be a lie.\n"+
 				`pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
     %s { input, from: offset as i32, done: false,%s%s count: 0, idx: 0 }
 }
