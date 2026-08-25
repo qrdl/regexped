@@ -192,11 +192,27 @@ find surface, matching every other language.
 `scan_any` and the `_all` pair are backed by `i64` WASM returns, which surface
 as BigInt. The stub decomposes them; a BigInt never reaches you.
 
-**Do not call other stub functions while a generator is suspended.** The staged
-input and the shared output region belong to whichever call ran last, so an
-interleaved call makes the suspended generator scan the wrong bytes and report
-offsets against them, silently. The same constraint already applies to the
-single-pattern `find_func`/`groups_func`/`named_groups_func` generators.
+**Calling other stub functions while a generator is suspended is safe.** So is
+running two generators over two different inputs at once, or nesting one inside
+the other:
+
+```js
+for (const m of findSecrets(document)) {
+    if (matchAllUrls(someOtherString).length) { … }   // fine
+}
+```
+
+Each live generator owns its input and scratch region for its whole lifetime,
+which is the same guarantee the Rust and Go stubs get from passing a host
+pointer. A generator that exits early — `break`, `return`, or a thrown error —
+releases its region on the way out, so nothing leaks.
+
+*This was not always true.* Until 2026-08-25 every call staged its input at one
+shared address, so an interleaved call left a suspended generator scanning
+another string's bytes and reporting offsets against it — silently, with no
+exception and plausible-looking output (TODO 58). If you are on an older
+generated stub, that hazard is real and the old rule ("do not call other stub
+functions while a generator is suspended") still applies to it.
 
 `patternName` is a single shared lookup across every set in the config that
 requested `emit_name_map: true`.

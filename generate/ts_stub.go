@@ -33,8 +33,12 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 
 	sb.WriteString("let _exp: WebAssembly.Exports;\n")
 	sb.WriteString("let _mem: Uint8Array;\n")
-	sb.WriteString("let _inBase = 0;  // byte offset where input is written (after DFA table pages)\n")
-	sb.WriteString("let _outBase = 0; // byte offset for output buffers and capture slots\n")
+	sb.WriteString("let _staticTop = 0; // first byte after the module's own table pages\n")
+	sb.WriteString("let _bump = 0;      // next free byte; regions are carved from here up\n")
+	// Only generators keep a refcount; a stub with none would declare it unused.
+	if hasSuspendableExports(cfg) {
+		sb.WriteString("let _live = 0;      // live iterator regions\n")
+	}
 	sb.WriteString("const _enc = new TextEncoder();\n")
 	sb.WriteString("\n")
 
@@ -56,41 +60,99 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("    const instance = (r instanceof WebAssembly.Instance ? r : r.instance) as WebAssembly.Instance;\n")
 	sb.WriteString("    _exp = instance.exports;\n")
 	sb.WriteString("    const _m = _exp.memory as WebAssembly.Memory;\n")
-	sb.WriteString("    _inBase = _m.buffer.byteLength; // first byte after DFA table pages\n")
-	sb.WriteString("    _m.grow(2);                     // 1 page for input, 1 page for output/slots\n")
-	sb.WriteString("    _outBase = _inBase + 65536;\n")
+	sb.WriteString("    _staticTop = _m.buffer.byteLength; // first byte after DFA table pages\n")
+	sb.WriteString("    _bump = _staticTop;\n")
+	sb.WriteString("    _m.grow(2);                       // 1 page for input, 1 page for output/slots\n")
 	sb.WriteString("    _mem = new Uint8Array(_m.buffer); // re-acquire after grow\n")
 	sb.WriteString("}\n\n")
 
-	sb.WriteString("function _w(input: string | Uint8Array, outBytes: number = 65536): number {\n")
-	sb.WriteString("    // Writes input into WASM memory at _inBase; returns its byte length.\n")
-	sb.WriteString("    // Strings are encoded straight into WASM memory with encodeInto, which\n")
-	sb.WriteString("    // avoids both the intermediate Uint8Array TextEncoder.encode allocates and\n")
-	sb.WriteString("    // the second copy _mem.set would then make. The reservation is the\n")
-	sb.WriteString("    // worst-case UTF-8 expansion of a JS string: 3 bytes per UTF-16 code unit\n")
-	sb.WriteString("    // (an astral char is 2 units and encodes to 4 bytes, so 3x still bounds\n")
-	sb.WriteString("    // it), so encodeInto cannot truncate.\n")
-	sb.WriteString("    if (typeof input === 'string') {\n")
-	sb.WriteString("        _resize(input.length * 3, outBytes);\n")
+	// ── Regions ─────────────────────────────────────────────────────────────
+	//
+	// Standalone WASM cannot read the JS heap, so an input must be COPIED into
+	// linear memory. Copying is not the hazard; SHARING one staging address is.
+	// A generator stages its input, yields, and resumes — and anything the
+	// caller ran in between had written its own input over the top, so the scan
+	// continued across another string's bytes and reported offsets against it.
+	// Silently: no exception, plausible output (TODO 58 / SETS_PLAN item 4).
+	//
+	// The merged-mode targets never had this. Rust passes `input.as_ptr()` and
+	// Go `unsafe.SliceData(input)`, so each live input already sits at its own
+	// address and nothing relocates it. That — distinct, stable addresses — is
+	// what makes them safe, not the absence of a copy. So this reproduces it:
+	// every call carves its OWN region and keeps it, which gives TS the same
+	// contract with a copy still in the middle.
+	//
+	// A bump allocator with a live-iterator refcount is enough. There is no
+	// free list because there is nothing to reclaim piecemeal: when the last
+	// iterator finishes the whole arena resets, which for ordinary code is
+	// between every loop.
+	sb.WriteString("function _align(x: number): number { return (x + 7) & ~7; }\n\n")
+	sb.WriteString("function _grow(top: number): void {\n")
+	sb.WriteString("    if (top > _mem.buffer.byteLength) {\n")
+	sb.WriteString("        (_exp.memory as WebAssembly.Memory).grow(Math.ceil((top - _mem.buffer.byteLength) / 65536));\n")
+	sb.WriteString("        _mem = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer); // grow DETACHES the old one\n")
+	sb.WriteString("    }\n")
+	sb.WriteString("}\n\n")
+	sb.WriteString("function _inCap(input: string | Uint8Array): number {\n")
+	sb.WriteString("    // Worst-case UTF-8 expansion of a JS string is 3 bytes per UTF-16 code\n")
+	sb.WriteString("    // unit (an astral char is 2 units and encodes to 4, so 3x still bounds\n")
+	sb.WriteString("    // it), so encodeInto cannot truncate inside the reservation.\n")
+	sb.WriteString("    return typeof input === 'string' ? input.length * 3 : input.length;\n")
+	sb.WriteString("}\n\n")
+	sb.WriteString("function _write(input: string | Uint8Array, at: number): number {\n")
+	sb.WriteString("    // encodeInto writes straight into WASM memory, avoiding both the\n")
+	sb.WriteString("    // intermediate array TextEncoder.encode allocates and the second copy\n")
+	sb.WriteString("    // _mem.set would then make.\n")
 	// lib.dom.d.ts declares TextEncoderEncodeIntoResult.written as optional, so
 	// strict-mode consumers need the non-null assertion; it is always present at
 	// runtime per the Encoding spec.
-	sb.WriteString("        return _enc.encodeInto(input, _mem.subarray(_inBase)).written!;\n")
-	sb.WriteString("    }\n")
-	sb.WriteString("    _resize(input.length, outBytes);\n")
-	sb.WriteString("    _mem.set(input, _inBase);\n")
+	sb.WriteString("    if (typeof input === 'string') return _enc.encodeInto(input, _mem.subarray(at)).written!;\n")
+	sb.WriteString("    _mem.set(input, at);\n")
 	sb.WriteString("    return input.length;\n")
 	sb.WriteString("}\n\n")
-	sb.WriteString("function _resize(inputLen: number, outBytes: number = 65536): void {\n")
-	sb.WriteString("    const ob = outBytes > 65536 ? outBytes : 65536;\n")
-	sb.WriteString("    _outBase = _inBase + Math.max(1, Math.ceil(inputLen / 65536)) * 65536;\n")
-	sb.WriteString("    const needed = _outBase + ob;\n")
-	sb.WriteString("    if (needed > _mem.buffer.byteLength) {\n")
-	sb.WriteString("        (_exp.memory as WebAssembly.Memory).grow(Math.ceil((needed - _mem.buffer.byteLength) / 65536));\n")
-	sb.WriteString("        _mem = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer);\n")
-	sb.WriteString("    }\n")
-	sb.WriteString("}\n\n")
+	// Emitted only when something uses them: a stub is a file the caller
+	// compiles, and TypeScript under --noUnusedLocals rejects a declared
+	// helper nothing calls. A match-only config has no generator, and a
+	// generator-only config has no one-shot call.
+	if hasOneShotExports(cfg) {
+		sb.WriteString("function _stage(input: string | Uint8Array, outBytes: number): [number, number, number] {\n")
+		sb.WriteString("    // For calls that CANNOT suspend. They run to completion before anything\n")
+		sb.WriteString("    // else can allocate, so they may reuse the space above the bump without\n")
+		sb.WriteString("    // reserving it — which is what stops a one-shot call inside a loop over a\n")
+		sb.WriteString("    // live iterator from allocating a region per iteration.\n")
+		sb.WriteString("    const at = _bump, out = _align(at + _inCap(input));\n")
+		sb.WriteString("    _grow(out + (outBytes > 0 ? outBytes : 65536));\n")
+		sb.WriteString("    return [at, out, _write(input, at)];\n")
+		sb.WriteString("}\n\n")
+	}
+	if hasSuspendableExports(cfg) {
+		sb.WriteString("function _open(input: string | Uint8Array, outBytes: number): [number, number, number] {\n")
+		sb.WriteString("    // For generators, which DO suspend. The region is reserved for the\n")
+		sb.WriteString("    // iterator's whole lifetime, so no other call can land on its input or\n")
+		sb.WriteString("    // its scratch. Release with _close() from a finally.\n")
+		sb.WriteString("    const at = _bump, out = _align(at + _inCap(input));\n")
+		sb.WriteString("    _bump = out + (outBytes > 0 ? outBytes : 65536);\n")
+		sb.WriteString("    _grow(_bump);\n")
+		sb.WriteString("    _live++;\n")
+		sb.WriteString("    return [at, out, _write(input, at)];\n")
+		sb.WriteString("}\n\n")
+		sb.WriteString("function _close(): void { if (--_live === 0) _bump = _staticTop; }\n\n")
+		// Generic over the view type rather than typed as a union: _att must hand
+		// back the SAME kind of array it was given, or every indexed read after a
+		// re-attach would widen to Int32Array | Uint32Array.
+		sb.WriteString("function _att<T extends Int32Array | Uint32Array>(\n")
+		sb.WriteString("        view: T, Ctor: new (buf: ArrayBufferLike, at: number, len: number) => T,\n")
+		sb.WriteString("        at: number, len: number): T {\n")
+		sb.WriteString("    // A view survives its own iterator's lifetime EXCEPT across a grow, which\n")
+		sb.WriteString("    // detaches every view in the module no matter whose region it points at —\n")
+		sb.WriteString("    // the one hazard the merged-mode targets have no analogue for, since they\n")
+		sb.WriteString("    // hold native pointers rather than views. A detached view reports\n")
+		sb.WriteString("    // length 0 and reads as undefined SILENTLY, so re-attach on that. The\n")
+		sb.WriteString("    // offset is still ours, so rebuilding at the same place is correct.\n")
+		sb.WriteString("    return view.length === 0 ? new Ctor(_mem.buffer, at, len) : view;\n")
+		sb.WriteString("}\n\n")
 
+	}
 	for _, re := range cfg.Regexps {
 		if re.MatchFunc != "" {
 			sb.WriteString(genTSMatchFunc(re.MatchFunc))
@@ -126,9 +188,10 @@ func genTSSetSection(cfg config.BuildConfig) string {
 	var out strings.Builder
 	out.WriteString("\n// ---- set composition wrappers ----\n")
 	out.WriteString("//\n")
-	out.WriteString("// Do not call other stub functions while an iterator is suspended: the\n")
-	out.WriteString("// staged input and the shared output region belong to whichever call ran\n")
-	out.WriteString("// last (see docs/ts-api.md).\n\n")
+	out.WriteString("// Calling other stub functions while an iterator is suspended is SAFE: each\n")
+	out.WriteString("// live iterator owns its input and scratch region for its whole lifetime,\n")
+	out.WriteString("// the same guarantee the Rust and Go stubs get from passing a host pointer\n")
+	out.WriteString("// (TODO 58 / SETS_PLAN item 4).\n\n")
 	out.WriteString("export interface SetMatch { patternId: number; start: number; end: number; }\n")
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
@@ -153,7 +216,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 
 		if s.MatchAny != "" {
 			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): number | null {
-    const len = _w(input);
+    const [_inBase, _outBase, len] = _stage(input, 0);
     const id = (_exp['%s'] as Function)(_inBase, len) as number;
     return id < 0 ? null : id;
 }
@@ -162,7 +225,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		if s.MatchAll != "" {
 			if wide {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): number[] {
-    const len = _w(input, %d);
+    const [_inBase, _outBase, len] = _stage(input, %d);
     const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
     // The wide form returns a count; the bitmap carries the answer. The count
@@ -181,7 +244,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				// a -2 test here would misfire whenever pattern 63 matches. The
 				// narrow form is only chosen when no member can overflow.
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): number[] {
-    const len = _w(input);
+    const [_inBase, _outBase, len] = _stage(input, 0);
     // The export returns an i64, which surfaces as a BigInt; it is decomposed
     // here and never reaches the caller.
     const mask = (_exp['%s'] as Function)(_inBase, len) as bigint;
@@ -194,7 +257,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		}
 		if s.ScanAny != "" {
 			fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): number | null {
-    const len = _w(input);
+    const [_inBase, _outBase, len] = _stage(input, 0);
     const id = (_exp['%s'] as Function)(_inBase, len, from) as number;
     // Tested against the sentinel exactly, not "< 0": -1 is a legitimate
     // no-match, while -2 means the result is unknown.
@@ -206,7 +269,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		if s.ScanAll != "" {
 			if wide {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): number[] {
-    const len = _w(input, %d);
+    const [_inBase, _outBase, len] = _stage(input, %d);
     const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
     // The wide form returns a count; the bitmap carries the answer. The count
@@ -223,7 +286,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				// Narrow form: see match_all above — the i64 return IS the
 				// bitmask, so there is no value left to spend on a sentinel.
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): number[] {
-    const len = _w(input);
+    const [_inBase, _outBase, len] = _stage(input, 0);
     const mask = (_exp['%s'] as Function)(_inBase, len, from) as bigint;
     const out: number[] = [];
     for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
@@ -245,27 +308,36 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				// TypeScript rejects find(input, 0, 64) at build time and no
 				// runtime check is needed.
 				fmt.Fprintf(&out, `export function* %s(input: string | Uint8Array, offset: number = 0): Generator<SetMatch> {
-    const len = _w(input, %d);
+    // The region is this iterator's own for its whole lifetime, so another
+    // stub call cannot land on its input, its tuple buffer or its gates.
+    const [_inBase, _outBase, len] = _open(input, %d);
+    try {
 %s    let pos = offset;
-    // Hoisted: _mem.buffer and _outBase are loop-invariant and the input is
-    // staged once above, so nothing detaches this view mid-scan. Building it
-    // per call allocated one typed array per matching position.
-    const buf = new Int32Array(_mem.buffer, _outBase, 3*%s);
+    // Hoisted rather than rebuilt per position, which allocated one typed
+    // array per matching position. _att re-attaches it if an interleaved
+    // call grew memory while this generator was suspended.
+    let buf = new Int32Array(_mem.buffer, _outBase, 3*%s);
     while (true) {
         const n = (_exp['%s'] as Function)(_inBase, len, pos, %s_outBase, %s) as number;
         // Before the "scan finished" test: -2 is the engine abandoning the
         // search, so ending the generator here would report success.
         if (n === %d) throw new Error("%s");
         if (n <= 0) break;
+        buf = _att(buf, Int32Array, _outBase, 3*%s);
         // Every tuple in one call shares a start; resume one past it.
         const next = buf[1] + 1;
         for (let i = 0; i < n; i++) {
+            // Re-checked each step: the yield below hands control back, and
+            // whatever runs there may grow memory and detach this view.
+            buf = _att(buf, Int32Array, _outBase, 3*%s);
             yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
         }
         pos = next;
     }
+    } finally { _close(); }
 }
-`, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst, btOverflow, btOverflowMsg(s.Find))
+`, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst,
+					btOverflow, btOverflowMsg(s.Find), konst, konst)
 			} else {
 				batchGateSetup := ""
 				if gatedFind(s) {
@@ -280,9 +352,13 @@ func genTSSetSection(cfg config.BuildConfig) string {
 // into [1, %s].
 export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: number = %d): Generator<SetMatch> {
     batchSize = Math.min(Math.max(batchSize | 0, 1), %s);
-    const len = _w(input, 12*batchSize + %d);
+    // This iterator's own region, held until it finishes — see _open.
+    const [_inBase, _outBase, len] = _open(input, 12*batchSize + %d);
+    try {
 %s    let cursor = BigInt(offset) << 32n;
-    const buf = new Int32Array(_mem.buffer, _outBase, 3*batchSize);
+    // Hoisted for the same reason the per-position shape hoists its view, and
+    // re-attached by _att when an interleaved call grows memory.
+    let buf = new Int32Array(_mem.buffer, _outBase, 3*batchSize);
     while (true) {
         const packed = (_exp['%s'] as Function)(_inBase, len, cursor, %s_outBase, batchSize) as bigint;
         // The cursor is opaque: hand it back unchanged. Only its top 32 bits
@@ -296,12 +372,16 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
         if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
         const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;
         for (let i = 0; i < n; i++) {
+            // Re-checked each step: the yield hands control back, and whatever
+            // runs there may grow memory and detach this view.
+            buf = _att(buf, Int32Array, _outBase, 3*batchSize);
             yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
         }
         // A call reports at least one match unless the scan is over.
         if (done || n === 0) break;
         cursor = packed;
     }
+    } finally { _close(); }
 }
 `, camelSet(s.Name)+"BatchMaxSize", s.Find, defaultBatchCap(s, cfg),
 					camelSet(s.Name)+"BatchMaxSize", 4*idN+bitmapBytes(s, cfg), batchGateSetup,
@@ -331,7 +411,7 @@ func genTSMatchFunc(funcName string) string {
 // TypeScript, and "a value or nothing" is null here — which is also what
 // match_any in this same file returns.
 export function %s(input: string | Uint8Array): number | null {
-    const len = _w(input);
+    const [_inBase, _outBase, len] = _stage(input, 0);
     const r = (_exp['%s'] as CallableFunction)(_inBase, len) as number;
     if (r === %d) throw new Error("%s");
     return r < 0 ? null : r;
@@ -353,9 +433,13 @@ export function %s(input: string | Uint8Array): number | null {
 func genTSFindFunc(funcName string) string {
 	return fmt.Sprintf(`// %[1]s — yields [start, end] for each non-overlapping match.
 export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generator<[number, number]> {
-    if (typeof _exp['%[1]s_batch'] === 'function') {
-        const len = _w(input, %[2]d * 8);
-        const outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
+    const _batched = typeof _exp['%[1]s_batch'] === 'function';
+    // One region for whichever path runs, held for this iterator's lifetime so
+    // an interleaved stub call cannot overwrite the staged input mid-scan.
+    const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * 8 : 0);
+    try {
+    if (_batched) {
+        let outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
         let startPos = offset;
         let prevEnd = -1;
         while (true) {
@@ -363,6 +447,9 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
             if (n === %[3]d) throw new Error("%[4]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
+                // Re-attached each step: the yield below hands control back,
+                // and a grow there detaches every view in the module.
+                outBuf = _att(outBuf, Uint32Array, _outBase, %[2]d * 2);
                 const s = outBuf[i * 2], e = outBuf[i * 2 + 1];
                 // Go's FindAllIndex rule: suppress an EMPTY match beginning
                 // exactly where the previous reported match ended.
@@ -371,12 +458,12 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
                 yield [s, e];
             }
             if (n < %[2]d) break;
+            outBuf = _att(outBuf, Uint32Array, _outBase, %[2]d * 2);
             const lastStart = outBuf[(n - 1) * 2], lastEnd = outBuf[(n - 1) * 2 + 1];
             startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
         }
         return;
     }
-    const len = _w(input);
     let off = offset;
     let prevEnd2 = -1;
     while (off <= len) {
@@ -396,6 +483,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
         }
         off += relEnd > relStart ? relEnd : relStart + 1;
     }
+    } finally { _close(); }
 }
 
 `, funcName, lm2BatchCap, btOverflow, btOverflowMsg(funcName))
@@ -417,15 +505,22 @@ func genTSGroupsFunc(funcName string, numGroups int) string {
 // Each element is [start, end] (absolute) or null for unmatched groups.
 // Index 0 is the full match.
 export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generator<Array<[number, number] | null>> {
-    if (typeof _exp['%[1]s_batch'] === 'function') {
-        const len = _w(input, %[2]d * %[4]d);
-        const outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
+    const _batched = typeof _exp['%[1]s_batch'] === 'function';
+    // One region for whichever path runs, held for this iterator's lifetime so
+    // an interleaved stub call cannot overwrite the staged input mid-scan.
+    const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * %[4]d : 0);
+    try {
+    if (_batched) {
+        let outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
         let startPos = offset;
         while (true) {
             const n = (_exp['%[1]s_batch'] as CallableFunction)(_inBase, len, _outBase, %[2]d, startPos) as number;
             if (n === %[7]d) throw new Error("%[8]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
+                // Re-attached each step: the yield below hands control back,
+                // and a grow there detaches every view in the module.
+                outBuf = _att(outBuf, Int32Array, _outBase, %[2]d * %[3]d);
                 const base = i * %[3]d;
                 const result: Array<[number, number] | null> = [];
                 for (let g = 0; g < %[5]d; g++) {
@@ -435,20 +530,20 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
                 yield result;
             }
             if (n < %[2]d) break;
+            outBuf = _att(outBuf, Int32Array, _outBase, %[2]d * %[3]d);
             const lastBase = (n - 1) * %[3]d;
             const lastStart = outBuf[lastBase], lastEnd = outBuf[lastBase + 1];
             startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
         }
         return;
     }
-    const len = _w(input);
-    // Hoisted out of the loop: _mem.buffer and _outBase are both loop-invariant
-    // (_resize already ran, and nothing inside the loop grows the memory), so
-    // constructing the view per match was pure overhead.
-    const slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
+    // Hoisted out of the loop rather than rebuilt per match, and re-attached
+    // by _att when an interleaved call grew memory while suspended.
+    let slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
     let off = offset;
     let prevEnd = -1;
     while (off <= len) {
+        slots = _att(slots, Int32Array, _outBase, %[6]d);
         slots.fill(-1);
         const r = (_exp['%[1]s'] as CallableFunction)(_inBase, len, _outBase, off) as number;
         if (r === %[7]d) throw new Error("%[8]s");
@@ -472,6 +567,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
         prevEnd = absEnd;
         yield result;
     }
+    } finally { _close(); }
 }
 
 `, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName))
@@ -517,34 +613,41 @@ func genTSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroup
 	return fmt.Sprintf(`// %[1]s — yields named capture group objects per match.
 // Each object maps name → [start, end] (absolute) for participating groups.
 export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generator<Record<string, [number, number]>> {
-    if (typeof _exp['%[2]s_batch'] === 'function') {
-        const len = _w(input, %[3]d * %[4]d);
-        const outBuf = new Int32Array(_mem.buffer, _outBase, %[3]d * %[5]d);
+    const _batched = typeof _exp['%[2]s_batch'] === 'function';
+    // One region for whichever path runs, held for this iterator's lifetime so
+    // an interleaved stub call cannot overwrite the staged input mid-scan.
+    const [_inBase, _outBase, len] = _open(input, _batched ? %[3]d * %[4]d : 0);
+    try {
+    if (_batched) {
+        let outBuf = new Int32Array(_mem.buffer, _outBase, %[3]d * %[5]d);
         let startPos = offset;
         while (true) {
             const n = (_exp['%[2]s_batch'] as CallableFunction)(_inBase, len, _outBase, %[3]d, startPos) as number;
             if (n === %[9]d) throw new Error("%[10]s");
             if (n <= 0) break;
             for (let i = 0; i < n; i++) {
+                // Re-attached each step: the yield below hands control back,
+                // and a grow there detaches every view in the module.
+                outBuf = _att(outBuf, Int32Array, _outBase, %[3]d * %[5]d);
                 const base = i * %[5]d;
                 const result: Record<string, [number, number]> = {};
 %[6]s                yield result;
             }
             if (n < %[3]d) break;
+            outBuf = _att(outBuf, Int32Array, _outBase, %[3]d * %[5]d);
             const lastBase = (n - 1) * %[5]d;
             const lastStart = outBuf[lastBase], lastEnd = outBuf[lastBase + 1];
             startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
         }
         return;
     }
-    const len = _w(input);
-    // Hoisted out of the loop: _mem.buffer and _outBase are both loop-invariant
-    // (_resize already ran, and nothing inside the loop grows the memory), so
-    // constructing the view per match was pure overhead.
-    const slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
+    // Hoisted out of the loop rather than rebuilt per match, and re-attached
+    // by _att when an interleaved call grew memory while suspended.
+    let slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
     let off = offset;
     let prevEnd = -1;
     while (off <= len) {
+        slots = _att(slots, Int32Array, _outBase, %[7]d);
         slots.fill(-1);
         const r = (_exp['%[2]s'] as CallableFunction)(_inBase, len, _outBase, off) as number;
         if (r === %[9]d) throw new Error("%[10]s");
@@ -564,6 +667,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
         prevEnd = absEnd;
         yield result;
     }
+    } finally { _close(); }
 }
 
 `, funcName, exportName, lm2BatchCap, recBytes, recSize, batchInserts.String(), slotCount, inserts.String(), btOverflow, btOverflowMsg(funcName))

@@ -193,10 +193,11 @@ export function* <find>(input: string | Uint8Array, offset?: number, batchSize?:
 
 `<match_all>` and `<scan_all>` stay **arrays, not generators**. That is
 deliberate and is where TS does not follow Go's `iter.Seq[int]` or Rust's
-`impl Iterator`: a generator would be another surface for the suspended-generator
-hazard below, while an array materialises before returning and cannot be
-suspended. The allocation argument that carried Go and Rust does not transfer —
-JS allocates the array either way, and the host crossing dominates it.
+`impl Iterator`: an array materialises before returning and cannot be suspended,
+so it needs no region of its own. The allocation argument that carried Go and
+Rust does not transfer — JS allocates the array either way, and the host
+crossing dominates it. (This once also avoided the suspended-generator hazard;
+that hazard is fixed, so it is no longer part of the reason.)
 
 The types make the `_any`/`_all` shapes explicit, which is the difference from
 the JavaScript stub — there, `if (scanAll(x))` is always true because an empty
@@ -204,8 +205,13 @@ array is truthy. `<scan_any>` reports **no position**, only an id: see
 [sets.md](sets.md) for why that is what makes it cheap. The `find` generator owns the gate array for the default
 non-overlapping configuration; creating a new one restarts the scan.
 
-**Do not call other stub functions while a generator is suspended** — the
-staged input and the shared output region belong to whichever call ran last.
+**Calling other stub functions while a generator is suspended is safe**, as is
+running or nesting two generators over different inputs. Each live generator
+owns its input and scratch region for its whole lifetime — the guarantee Rust
+and Go get from passing a host pointer — and releases it on any exit, including
+an early `break`. Until 2026-08-25 this was not true: one shared staging address
+meant an interleaved call left a suspended generator scanning another string's
+bytes, silently (TODO 58).
 
 `patternName(id)` is emitted once per config when any set sets
 `emit_name_map: true`.

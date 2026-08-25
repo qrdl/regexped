@@ -16,6 +16,45 @@ func hasSetExports(cfg config.BuildConfig) bool {
 	return false
 }
 
+// hasSuspendableExports reports whether cfg generates any GENERATOR — the only
+// exports that suspend, and therefore the only ones that reserve a region of
+// their own (_open / _close / _att).
+//
+// This gates their EMISSION rather than just their use: a stub is a file the
+// caller compiles, and TypeScript under --noUnusedLocals rejects a declared
+// helper nothing calls. Before regions existed the question could not arise,
+// because _w and _resize were used by every shape.
+func hasSuspendableExports(cfg config.BuildConfig) bool {
+	for _, re := range cfg.Regexps {
+		if re.FindFunc != "" || re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
+			return true
+		}
+	}
+	for _, s := range cfg.Sets {
+		if s.Find != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasOneShotExports reports whether cfg generates any export that CANNOT
+// suspend, and so stages into the transient area above the bump (_stage)
+// instead of reserving. Same emission-gating reason as hasSuspendableExports.
+func hasOneShotExports(cfg config.BuildConfig) bool {
+	for _, re := range cfg.Regexps {
+		if re.MatchFunc != "" {
+			return true
+		}
+	}
+	for _, s := range cfg.Sets {
+		if s.MatchAny != "" || s.MatchAll != "" || s.ScanAny != "" || s.ScanAll != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // hasEmitNameMap reports whether any set has emit_name_map: true.
 func hasEmitNameMap(cfg config.BuildConfig) bool {
 	for _, s := range cfg.Sets {
