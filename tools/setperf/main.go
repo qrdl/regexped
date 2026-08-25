@@ -320,6 +320,36 @@ func buildMatrix() []setCase {
 			setCase{fmt.Sprintf("sharedlit-%d", n), pats, corpusDense(pats), "dense 100KB"},
 		)
 	}
+	// Sets with NO mandatory literal that are also large enough to split on the
+	// 32-bit accept mask — the fallback packer's version of the sharedlit pair
+	// above, and the shape G17's promotion was extended to cover.
+	//
+	// A fallback bucket has no literal gating it, so each of the ceil(N/32)
+	// suffix walks runs at EVERY input position rather than only where a
+	// literal hit. That makes the no-match corpus load-bearing here, where the
+	// sharedlit pair needed a dense one: with nothing to skip, the whole input
+	// pays the bucket-count factor.
+	//
+	// These rows also cover the ANCHORED packer, since setperf drives match_any
+	// and match_all: 128 of these merge to one anchored bucket where they used
+	// to make four. The sharedlit patterns do NOT — their full-pattern merge
+	// crosses 256 states into u16 cells and misses the 64 KB byte budget, so
+	// promoteSparseBuckets refuses it. That asymmetry is the reason this family
+	// is here rather than a bigger sharedlit row.
+	classChainPatterns := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf(`[a-z]{%d}[0-9]{%d}`, 1+i/16, 1+i%16)
+		}
+		return out
+	}
+	for _, n := range []int{32, 128} {
+		pats := classChainPatterns(n)
+		out = append(out,
+			setCase{fmt.Sprintf("classchain-%d", n), pats, corpusNoMatch(), "no-match 100KB"},
+			setCase{fmt.Sprintf("classchain-%d", n), pats, corpusDense(pats), "dense 100KB"},
+		)
+	}
 	// A set with no mandatory literal at all: every position is visited, so
 	// this is where gating has the most to recover.
 	greedy := []string{`a+`, `[^\n]*ERROR`, `x?y`}

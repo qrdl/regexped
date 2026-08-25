@@ -116,6 +116,15 @@ func putU32(b []byte, at int, v uint32) {
 	b[at+3] = byte(v >> 24)
 }
 
+// sparseAnchoredInfo is what an anchored bucket's sparse probe hands back to
+// the capability body: where it leaves the indices it collected, and the map
+// that turns them into global pattern ids. Nil when the bucket took the
+// ordinary bitmask probe.
+type sparseAnchoredInfo struct {
+	scratch  sparseScratch
+	idMapOff int32
+}
+
 // sparseSuffixParams is everything buildSparseSuffixBody needs that is not
 // derivable from the layout.
 type sparseSuffixParams struct {
@@ -320,11 +329,20 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		b = append(b, 0x6A)
 		b = append(b, 0x20, lOff, 0x49, 0x0D, 0x00) // bound < gate -> skip
 	}
+	// §19's skip belongs in the WRITE condition, not in a branch past it: the
+	// tuple is counted either way, because the count is what tells the caller
+	// how much of this position is still owed. Branching to $skipTuple would
+	// jump over the increment below, pinning lOut under `skip` forever — every
+	// resumed call then returned 0 tuples and the position's later matches were
+	// lost. Only the GATE may branch out, since a gated tuple is not part of
+	// this position's sequence at all. buildSetSuffixBody has the same split.
 	if p.hasSkip {
-		b = append(b, 0x20, lOut, 0x20, pSkip, 0x48, 0x0D, 0x00) // out < skip -> skip write
+		b = append(b, 0x20, lOut, 0x20, pOutCap, 0x48) // out < cap
+		b = append(b, 0x20, lOut, 0x20, pSkip, 0x4E)   // out >= skip
+		b = append(b, 0x71, 0x04, 0x40)                // and; if
+	} else {
+		b = append(b, 0x20, lOut, 0x20, pOutCap, 0x48, 0x04, 0x40)
 	}
-	// if outCount < cap: write (globalID, start, end)
-	b = append(b, 0x20, lOut, 0x20, pOutCap, 0x48, 0x04, 0x40)
 	b = append(b, 0x20, pOutPtr, 0x20, lOut, 0x41, 12, 0x6C, 0x6A, 0x21, lCnt)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, p.idMapOff)
@@ -479,5 +497,108 @@ func buildSparseProbeBody(p sparseSuffixParams) []byte {
 
 	b = append(b, 0x20, lFound)
 	b = append(b, 0x0B)
+	return b
+}
+
+// buildSparseAnchoredProbeBody is the sparse bucket's answer to the ANCHORED
+// trio, and the twin of buildSetProbeBody(anchored=true):
+//
+//	(ptr, start, len, validMask) -> i32
+//
+// Same signature as the bitmask anchored probe so emitSetAnchoredCapBody's call
+// shape is unchanged, but — like the scan probe above — it returns a COUNT and
+// leaves the matching BUCKET-LOCAL indices in the scratch `endPos` array rather
+// than a bitmask, because a bitmask is the 32-pattern ceiling this exists to
+// escape.
+//
+// Much smaller than the scan probe, for two reasons that are both consequences
+// of "the match must span the whole input" (§3.3):
+//
+//   - Only the EOF channel is read. A mid-walk accept says nothing about
+//     reaching `len`, so there is no per-byte collect and no mid-accept table
+//     load in the loop at all.
+//   - The scratch `seen` array is never touched. Collection happens ONCE, from
+//     a single state's accept list, and a state's list holds distinct indices —
+//     so no duplicate can arise and there is nothing to de-duplicate or clear.
+//     The scan probe needs `seen` only because it collects at every position.
+func buildSparseAnchoredProbeBody(p sparseSuffixParams) []byte {
+	const (
+		pPtr   = byte(0)
+		pStart = byte(1)
+		pLen   = byte(2)
+		_      = byte(3) // validMask: see this file's header
+	)
+	const (
+		lState = byte(4)
+		lPos   = byte(5)
+		lFound = byte(6)
+		lOff   = byte(7)
+		lCnt   = byte(8)
+		lIdx   = byte(9)
+		lPat   = byte(10)
+		lTmp   = byte(11)
+	)
+	var b []byte
+	b = append(b, 0x01, 0x08, 0x7F) // 8 i32 locals
+
+	b = append(b, 0x41, 0x00, 0x21, lFound)
+	b = append(b, 0x20, pStart, 0x21, lPos)
+	// Unconditionally the start state: emitSetAnchoredCapBody always passes
+	// start = 0, so the mid-start branch the scan probe carries would be dead
+	// code here — and wasmMidStart is the DEAD state on some tables, which is a
+	// trap worth not leaving armed.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(p.wasmStart))
+	b = append(b, 0x21, lState)
+
+	// --- walk to end of input ---
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $walk
+	b = append(b, 0x20, lPos, 0x20, pLen, 0x4F, 0x0D, 0x01)
+	b = emitSetTransition(b, p.l, lState, lTmp, pPtr, lPos, p.tableMemIdx)
+	b = append(b, 0x20, lState, 0x45, 0x0D, 0x01) // dead state: br $done
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, 0x00)
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block
+
+	// EOF accepts count only when the whole input was consumed: a run that died
+	// early left lPos < len and did not match anchored at all.
+	b = append(b, 0x20, lPos, 0x20, pLen, 0x46, 0x04, 0x40)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, p.tabs.eofOff)
+	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+	b = appendTableLoad32(b, p.tableMemIdx, 0)
+	b = append(b, 0x21, lOff)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, p.tabs.eofOff)
+	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+	b = appendTableLoad32(b, p.tableMemIdx, 4)
+	b = append(b, 0x21, lCnt)
+	b = append(b, 0x41, 0x00, 0x21, lIdx)
+	b = append(b, 0x02, 0x40)
+	b = append(b, 0x20, lCnt, 0x45, 0x0D, 0x00)
+	b = append(b, 0x03, 0x40)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, p.tabs.eofList)
+	b = append(b, 0x20, lOff, 0x20, lIdx, 0x6A, 0x41, 0x01, 0x74, 0x6A)
+	b = appendTableLoad16u(b, p.tableMemIdx)
+	b = append(b, 0x21, lPat)
+	// endPos doubles as the index list, exactly as in the scan probe, and holds
+	// BUCKET-LOCAL indices: the driver maps them through idMapOff itself.
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, p.scratch.endPos)
+	b = append(b, 0x20, lFound, 0x41, 0x02, 0x74, 0x6A)
+	b = append(b, 0x20, lPat)
+	b = appendTableStore32(b, p.tableMemIdx, 0)
+	b = append(b, 0x20, lFound, 0x41, 0x01, 0x6A, 0x21, lFound)
+	b = append(b, 0x20, lIdx, 0x41, 0x01, 0x6A, 0x21, lIdx)
+	b = append(b, 0x20, lIdx, 0x20, lCnt, 0x49, 0x0D, 0x00)
+	b = append(b, 0x0B)
+	b = append(b, 0x0B)
+	b = append(b, 0x0B) // end if lPos == len
+
+	b = append(b, 0x20, lFound)
+	b = append(b, 0x0B) // end function
 	return b
 }

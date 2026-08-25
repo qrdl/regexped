@@ -1086,7 +1086,11 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				}
 			}
 			cs.anchoredIDs[bi] = ids
-			body, data, segs, next := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, len(ab.patterns))
+			body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids)
+			if sp != nil {
+				ab.sparseScratch = sp.scratch
+				ab.sparseIDMapOff = sp.idMapOff
+			}
 			cs.anchoredProbeBodies = append(cs.anchoredProbeBodies, body)
 			cs.anchoredDataBytes = append(cs.anchoredDataBytes, data...)
 			cs.anchoredDataSegs += segs

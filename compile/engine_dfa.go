@@ -1242,6 +1242,14 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	// EOF from start = end-of-input after consuming nothing: use ecNoWordBoundary for WB check.
 	orAccept(dfa.accepting, 0, acceptBitsFor(startSet, ecBegin|ecEnd|ecNoWordBoundary))
 	orAccept(dfa.midAccepting, 0, acceptBitsFor(startSet, 0))
+	// The BOOTSTRAP states are built here, before the exploration loop, so the
+	// recordWideSet call inside that loop never sees them (SETS §23, G17).
+	// Missing them costs exactly the ZERO-LENGTH matches: a nullable pattern
+	// accepts in the start state itself and nowhere else, so a sparse bucket
+	// silently reported nothing for `a*`, `a?` and friends while every
+	// non-empty match was correct. Each call mirrors the two orAccept lines
+	// above it, contexts included.
+	recordWideSet(0, startSet, 0, ecBegin|ecEnd|ecNoWordBoundary)
 	// Pre-transition accept for start state (prevWasWord=false):
 	// ecBegin is unconditionally true at state 0 (true start of text), so it must be
 	// OR'd into every context below — a pending \b/\B node from the initial closure
@@ -1306,6 +1314,7 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		// midStart is prevWasWord=false: end-of-input → \B fires
 		orAccept(dfa.accepting, dfa.midStart, midStartRightfulAccept)
 		orAccept(dfa.midAccepting, dfa.midStart, acceptBitsFor(midStartSet, 0))
+		recordWideSet(dfa.midStart, midStartSet, 0, ecEnd|ecNoWordBoundary)
 		// midAcceptNW for midStart (prevWasWord=false): before non-word → \B fires
 		orAccept(dfa.midAcceptingNW, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary))
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStart, midStartSet, ecNoWordBoundary)
@@ -1353,6 +1362,7 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		// midStartWord is prevWasWord=true: end-of-input → \b fires
 		orAccept(dfa.accepting, dfa.midStartWord, midStartWordRightfulAccept)
 		orAccept(dfa.midAccepting, dfa.midStartWord, acceptBitsFor(midStartSet, 0))
+		recordWideSet(dfa.midStartWord, midStartSet, 0, ecEnd|ecWordBoundary)
 		// midAcceptNW for midStartWord (prevWasWord=true): before non-word → \b fires
 		orAccept(dfa.midAcceptingNW, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary))
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStartWord, midStartSet, ecWordBoundary)
@@ -1404,6 +1414,11 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 			// midStartNewline is prevWasNewline=true: ecBeginLine fires, ecNoWordBoundary fires (newline is non-word).
 			orAccept(dfa.accepting, dfa.midStartNewline, midStartNewlineRightfulAccept)
 			orAccept(dfa.midAccepting, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, 0))
+			// Unreachable on today's sparse path — promoteSparseBuckets refuses
+			// (?m) patterns — but a bootstrap state without its wide lists is
+			// precisely the defect above, so it is not left for the next person
+			// who relaxes that refusal.
+			recordWideSet(dfa.midStartNewline, midStartNewlineSet, 0, ecBeginLine|ecEnd|ecNoWordBoundary)
 			orAccept(dfa.midAcceptingNW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary))
 			markDominant(dfa.midAcceptingNWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary)
 			markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary)
@@ -4720,6 +4735,17 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		dataBytes = append(dataBytes, appendDataSegment(nil, scratch.end-1, []byte{0})...)
 		dataSegCount += 3
 		nextTableOffset = scratch.end
+		// ONE prefix length for the whole bucket, which is sound only because
+		// promoteSparseBuckets refuses any bucket whose patterns do not all
+		// have a TRIVIAL prefix — so this is always 0 today.
+		//
+		// It was not always refused, and the consequence was silent: a bucket
+		// of 288 patterns with prefix lengths {0, 1, 2} had pattern 0's length
+		// applied to all 288, so 285 of them reported a match start off by 1 or
+		// 2 — and at lPos 0 the start came out NEGATIVE. Relaxing that refusal
+		// means giving the body a per-pattern prefix table and moving the start
+		// computation into the tuple loop; it is not a matter of picking a
+		// better single value here.
 		prefixLen := 0
 		if len(prefixFixedLens) > 0 && prefixFixedLens[0] > 0 {
 			prefixLen = prefixFixedLens[0]

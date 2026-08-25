@@ -1361,75 +1361,182 @@ func bucketByLiteral(patterns []*PatternInfo) (map[string][]*PatternInfo, []*Pat
 //
 // Each rejection is recorded in diag. Non-literal and non-splittable patterns
 // are routed to compileFallback instead.
-// promoteSharedLiteralBuckets merges buckets that share one literal into a
-// single SPARSE bucket (SETS §23, task G17).
+// promoteSharedLiteralBuckets is G17 promotion for ONE shared-literal group:
+// buckets that split at 32 patterns behind the same literal become one sparse
+// bucket, so a position where that literal hits costs one suffix-DFA walk
+// instead of ceil(N/32). Measured at 3.33x for 128 patterns against 32
+// (setperf's sharedlit rows). The policy itself lives in promoteSparseBuckets.
+func promoteSharedLiteralBuckets(litBuckets []*bucket, opts CompileSetOptions) []*bucket {
+	if len(litBuckets) == 0 || litBuckets[0].literal == "" {
+		// Distinct literals already get a bucket each and gain nothing, and an
+		// empty literal here would mean the caller handed us the fallback
+		// group, which has its own call site below.
+		return litBuckets
+	}
+	return promoteSparseBuckets(litBuckets, opts, sparsePromotion{
+		literal: litBuckets[0].literal,
+		astFor:  patternSuffixAST,
+		merge:   mergeSuffixDFASparseSet,
+	})
+}
+
+// sparsePromotion is the part of G17 promotion that differs between the three
+// packers. Everything else — the budgets, the refusals, the bucket that comes
+// out — is shared, which is the point: the promotion POLICY existing once is
+// what keeps the three packers from drifting apart the way §12.5 (item 8)
+// warned they would.
 //
-// A shared-literal group splits into ceil(N/32) buckets purely because the
-// accept bitmask is an i32 on the per-candidate path — never because the merged
-// DFA was too big. Each split costs a suffix-DFA call at EVERY position the
-// literal hits, measured at 3.33x for 128 patterns against 32 (setperf's
-// sharedlit rows). One walk over one merged DFA replaces them.
+// The fields are exactly the differences, and each is semantic rather than
+// accidental, which is why this is a strategy struct and not a merged function:
+// the anchored packer's DFA is built with leftmost-first pruning DISABLED and
+// over full patterns, while both find packers use suffix ASTs and keep pruning.
+type sparsePromotion struct {
+	// literal every input bucket must agree on; "" for the two literal-less
+	// packers, where there is nothing to agree on.
+	literal string
+	// astFor extracts the AST the merge should see: the suffix for the find
+	// packers, the full pattern for the anchored one.
+	astFor func(*PatternInfo) *syntax.Regexp
+	// merge builds the wide-accept DFA with the right leftmost-first setting.
+	merge func([]*syntax.Regexp, CompileSetOptions) (*dfaTable, *dfa, error)
+	// isFallback marks the produced bucket as one that runs at every position.
+	isFallback bool
+}
+
+// promoteSparseBuckets merges buckets that split ONLY because the accept
+// bitmask ran out of bits into a single SPARSE bucket (SETS §23, task G17).
+//
+// A group of N patterns splits into ceil(N/32) buckets because the accept
+// bitmask is an i32 on the per-candidate path — never because the merged DFA
+// was too big. Each split costs its own DFA walk: at every candidate position
+// for the find packers, and over the whole input for the anchored one. One walk
+// over one merged DFA replaces them.
 //
 // Conservative by construction, because a wrong promotion is worse than no
-// promotion (§23.4): it runs only with more than one bucket to merge, refuses
-// if the merged DFA misses §23.2's state or byte budgets — in which case
-// binPack would have split it again anyway and nothing is gained — and refuses
-// word-boundary or (?m) patterns, whose extra accept channels the sparse body
-// does not serialise.
-func promoteSharedLiteralBuckets(litBuckets []*bucket, opts CompileSetOptions) []*bucket {
-	if !opts.AllowSparseAccept || len(litBuckets) < 2 {
-		return litBuckets
+// promotion (§23.4). It refuses unless at least two buckets can merge, refuses
+// if the merged DFA misses §23.2's state or byte budgets — in which case the
+// packer would have split it again anyway and nothing is gained — and refuses
+// word-boundary or (?m) patterns, whose extra accept channels the sparse bodies
+// do not serialise.
+//
+// Buckets it cannot take are KEPT rather than made to block the promotion, and
+// the merged bucket inherits the first candidate's slot so relative order is
+// unchanged. That matters most for the fallback packer, where a single
+// Backtracking bucket (item 20) or one isolated non-greedy pattern would
+// otherwise cost the whole group its promotion.
+func promoteSparseBuckets(in []*bucket, opts CompileSetOptions, pr sparsePromotion) []*bucket {
+	if !opts.AllowSparseAccept || len(in) < 2 {
+		return in
 	}
-	lit := litBuckets[0].literal
-	if lit == "" {
-		return litBuckets
+	// A BT bucket has no suffix DFA to merge, and an isolated fallback pattern
+	// was given its own bucket precisely so its DFA would not be merged with
+	// anyone else's — merging either here would undo the reason it exists.
+	eligible := func(b *bucket) bool {
+		if b.btFallback != nil || b.literal != pr.literal || b.sparse {
+			return false
+		}
+		for _, p := range b.patterns {
+			if p.isolatedFallback {
+				return false
+			}
+			// EVERY pattern must have a trivial prefix. Two separate things
+			// break otherwise, both of them silent:
+			//
+			//   - the sparse body carries ONE prefix length for the bucket and
+			//     subtracts it from every tuple's start, so a bucket holding
+			//     several lengths reports most of its matches at the wrong
+			//     start — negative when the candidate is near position 0.
+			//   - a non-trivial prefix has a prefix DFA that must RUN to
+			//     confirm it, and the machinery that runs them is indexed by a
+			//     32-bit mask, so patterns past the 32nd would never have their
+			//     prefix checked at all.
+			//
+			// Both need per-pattern handling inside the body to lift; refusing
+			// costs only the mixed-offset shared-literal sets, and §23.4 is
+			// explicit that a wrong promotion is worse than no promotion.
+			if !p.trivialPrefix && p.prefixDFA != nil {
+				return false
+			}
+			// A \A- or (?m:^)-anchored pattern is eligible only at position 0
+			// (or just after a newline), and emitGroupMask enforces that by
+			// OR-ing its bit into validMask ONLY where the position allows —
+			// the constraint lives in the mask, not in the bucket's DFA. A
+			// sparse body ignores validMask, so such a pattern would be
+			// eligible at EVERY position and report matches it must not: the
+			// corpus showed `^(?:^(?:(?:a|(?:aa)))$)` matching "b" at 0-1.
+			//
+			// HEAD never hit this because analyzePattern routes anchored
+			// patterns to FALLBACK buckets, and until this change fallback
+			// buckets were never promoted. Lifting it means teaching the body
+			// the position rule per pattern, not just widening a mask.
+			if p.startAnchor || p.lineAnchor {
+				return false
+			}
+		}
+		return true
 	}
 	total := 0
-	for _, b := range litBuckets {
-		if b.literal != lit || b.btFallback != nil {
-			return litBuckets
+	cands := 0
+	for _, b := range in {
+		if !eligible(b) {
+			continue
 		}
+		cands++
 		total += len(b.patterns)
 	}
-	if total > opts.maxPatternsPerBucket() {
-		return litBuckets
+	if cands < 2 || total > opts.maxPatternsPerBucket() {
+		return in
 	}
 	merged := make([]*PatternInfo, 0, total)
 	asts := make([]*syntax.Regexp, 0, total)
-	for _, b := range litBuckets {
+	for _, b := range in {
+		if !eligible(b) {
+			continue
+		}
 		for _, p := range b.patterns {
-			ast := patternSuffixAST(p)
-			if ast == nil {
-				return litBuckets
-			}
-			if regexpHasWordBoundary(ast) {
-				return litBuckets
+			ast := pr.astFor(p)
+			if ast == nil || regexpHasWordBoundary(ast) {
+				return in
 			}
 			merged = append(merged, p)
 			asts = append(asts, ast)
 		}
 	}
-	tab, _, err := mergeSuffixDFASparseSet(asts, opts)
+	tab, _, err := pr.merge(asts, opts)
 	if err != nil {
-		return litBuckets
+		return in
 	}
 	if tab.hasWordBoundary || tab.hasNewlineBoundary {
-		return litBuckets
+		return in
 	}
 	if tab.numStates > opts.budgetStates() || dfaTableBytes(tab) > opts.budgetBytes() {
-		return litBuckets
+		return in
 	}
 	cm, _, nc := computeByteClasses(tab)
-	return []*bucket{{
-		literal:      lit,
+	promoted := &bucket{
+		literal:      pr.literal,
 		patterns:     merged,
 		suffixDFA:    tab,
 		suffixStates: tab.numStates,
 		tableBytes:   dfaTableBytes(tab),
 		classMap:     cm,
 		numClasses:   nc,
+		isFallback:   pr.isFallback,
 		sparse:       true,
-	}}
+	}
+	out := make([]*bucket, 0, len(in)-cands+1)
+	placed := false
+	for _, b := range in {
+		if eligible(b) {
+			if !placed {
+				out = append(out, promoted)
+				placed = true
+			}
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
 }
 
 func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*bucket {
@@ -1606,6 +1713,15 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 	// Fallback: compile non-literal / non-splittable patterns.
 	if len(fallbackPatterns) > 0 {
 		fb := compileFallback(fallbackPatterns, opts, diag)
+		// G17 again, and this is the group that pays most for a split: a
+		// fallback bucket has no literal gating it, so every one of the
+		// ceil(N/32) walks runs at EVERY input position rather than only where
+		// a literal hit.
+		fb = promoteSparseBuckets(fb, opts, sparsePromotion{
+			astFor:     patternSuffixAST,
+			merge:      mergeSuffixDFASparseSet,
+			isFallback: true,
+		})
 		buckets = append(buckets, fb...)
 	}
 
@@ -1957,6 +2073,42 @@ func mergeAnchoredDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable,
 	return dfaTableFromCanonical(d), nil
 }
 
+// mergeAnchoredDFASparseSet is mergeAnchoredDFA's wide twin: per-state accept
+// LISTS instead of a u64 mask, so an anchored bucket can hold more than 32
+// patterns (SETS §23, task G17).
+//
+// The anchored trio pays for a split differently from `find`. There is no
+// literal frontend and no candidate enumeration — emitSetAnchoredCapBody simply
+// calls every anchored bucket's probe in turn — so ceil(N/32) buckets means
+// ceil(N/32) full passes over the input for one match_any call, regardless of
+// what the input looks like.
+func mergeAnchoredDFASparseSet(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, *dfa, error) {
+	if len(asts) == 0 {
+		return nil, nil, fmt.Errorf("mergeAnchoredDFASparseSet: empty pattern list")
+	}
+	if max := opts.maxPatternsPerBucket(); len(asts) > max {
+		return nil, nil, fmt.Errorf("mergeAnchoredDFASparseSet: %d patterns exceed maxPatternsPerBucket %d",
+			len(asts), max)
+	}
+	progs := make([]*syntax.Prog, len(asts))
+	for k, a := range asts {
+		p, err := syntax.Compile(a.Simplify())
+		if err != nil {
+			return nil, nil, fmt.Errorf("mergeAnchoredDFASparseSet: compile pattern %d: %w", k, err)
+		}
+		progs[k] = p
+	}
+	unionProg, patternIdx := buildUnionProgIndexed(progs)
+	// leftmostFirst=false, matching mergeAnchoredDFA: an anchored answer is
+	// "which patterns match the whole input", and pruning lower-priority
+	// alternatives would drop patterns that do.
+	d, ok := newDFAWide(unionProg, false, maxHelperDFAStates, patternIdx)
+	if !ok {
+		return nil, nil, ErrDFAStateLimit
+	}
+	return dfaTableFromCanonical(d), d, nil
+}
+
 // compileAnchoredBuckets packs every pattern of the set into buckets whose
 // merged, non-leftmost-first DFA fits the state and byte budgets. Patterns are
 // taken in declaration order so a bucket's bit k maps to a stable global id.
@@ -2027,6 +2179,18 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 			isFallback:   true,
 		})
 		members = append(members, []*PatternInfo{p})
+	}
+	// G17: re-merge buckets that split only on the 32-bit accept mask. Done
+	// here rather than by packing differently above so declaration order — and
+	// with it the bucket-bit-to-global-id mapping the non-promoted path relies
+	// on — is untouched when the promotion is refused.
+	buckets = promoteSparseBuckets(buckets, opts, sparsePromotion{
+		astFor: patternFullAST,
+		merge:  mergeAnchoredDFASparseSet,
+	})
+	members = members[:0]
+	for _, b := range buckets {
+		members = append(members, b.patterns)
 	}
 	return buckets, members
 }

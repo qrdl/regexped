@@ -463,7 +463,8 @@ func buildCountedChainProbeBody(class []byte, n int, anchored bool) []byte {
 // bitmask. Nothing else — the anchored probe reads no mid-accept, immediate-
 // accept or zero-width side table, because "did the run reach `len` in an
 // accepting state" is answered entirely at the end.
-func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx, numPatterns int) (body []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs []int) (body []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32, sparse *sparseAnchoredInfo) {
+	numPatterns := len(patternIDs)
 	nextTableOffset = int32(tableBase)
 	if t == nil || t.numStates == 0 {
 		zero := []byte{0x00, 0x41, 0x00, 0x0B}
@@ -477,6 +478,40 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx, numPatterns int)
 		needFind:      false,
 		leftmostFirst: false,
 	})
+
+	// G17: an anchored bucket whose accept is a per-state LIST takes the sparse
+	// probe. Same trigger as genSuffixWASM's, and the same reason: it is the
+	// only shape that can answer for more patterns than a mask has bits.
+	if t.acceptWide != nil {
+		tabs := buildSparseAcceptTables(t, int32(l.tableEnd), l.numWASM)
+		idMapOff := tabs.end
+		idMap := make([]byte, numPatterns*4)
+		for i, gid := range patternIDs {
+			putU32(idMap, i*4, uint32(gid))
+		}
+		scratch := planSparseScratch(idMapOff+int32(len(idMap)), numPatterns)
+		layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false, false))
+		dataBytes = append(dataBytes, layoutRaw...)
+		dataBytes = append(dataBytes, appendDataSegment(nil, tabs.midOff, tabs.data)...)
+		dataBytes = append(dataBytes, appendDataSegment(nil, idMapOff, idMap)...)
+		// One zero byte at the top of the scratch so utils.WasmMemTop and the
+		// harnesses see the reservation — see genSuffixWASM for why a region
+		// nothing declares gets the caller's input written over it.
+		dataBytes = append(dataBytes, appendDataSegment(nil, scratch.end-1, []byte{0})...)
+		dataSegCount = layoutCount + 3
+		nextTableOffset = scratch.end
+		raw := buildSparseAnchoredProbeBody(sparseSuffixParams{
+			l: l, tabs: tabs, scratch: scratch, globalIDs: patternIDs,
+			idMapOff:    idMapOff,
+			wasmStart:   uint32(t.startState + 1),
+			tableMemIdx: tableMemIdx,
+		})
+		body = utils.AppendULEB128(nil, uint32(len(raw)))
+		body = append(body, raw...)
+		sparse = &sparseAnchoredInfo{scratch: scratch, idMapOff: idMapOff}
+		return
+	}
+
 	eofBitmaskOff := int32(l.tableEnd)
 
 	bs := make([]byte, l.numWASM*8)

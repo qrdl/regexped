@@ -42,7 +42,14 @@ regexped/
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
 │   ├── byte_rank.go           # Packed-pair set frontend: byte-rarity ranks, two-column probe selection (<=16 literals)
-│   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets
+│   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets.
+│   │                          #   Holds the THREE packers (binPack / compileFallback /
+│   │                          #   compileAnchoredBuckets) and the ONE G17 promotion policy they
+│   │                          #   share, promoteSparseBuckets + sparsePromotion. Placement and
+│   │                          #   ordering stay per-packer on purpose: the anchored one packs in
+│   │                          #   DECLARATION order (a bucket's bit k must map to a stable global
+│   │                          #   id) and merges with leftmost-first OFF, which is why the two
+│   │                          #   packers were never merged (SETS_PLAN item 8)
 │   ├── set_emit.go            # Set WASM emission (CompileFile, the four frontend bodies: AC/Teddy/Shufti/scalar).
 │   │                          #   These bodies serve `find` AND the scan pair — setFindCtx.mode picks what
 │   │                          #   each records at a matching position. Scan work belongs HERE + set_find.go.
@@ -61,6 +68,13 @@ regexped/
 │   ├── set_probe.go           # Bitmask-only bucket probes (scan + anchored flavours), genAnchoredWASM
 │   ├── set_caps.go            # ANCHORED bodies only (match_any/match_all) + the shared bit-recording
 │   │                          #   emitters and id-space helpers. The scan pair is NOT here — see set_emit.go.
+│   ├── set_sparse.go          # G17 sparse accept: per-state LISTS of pattern indices instead of a
+│   │                          #   u64 mask, which is what lets ONE bucket hold more than 32
+│   │                          #   patterns. Serves all three packers — shared-literal, fallback and
+│   │                          #   anchored. NOTHING on the candidate path may read an i32 mask as
+│   │                          #   authoritative for such a bucket (validMask, the gate pre-mask and
+│   │                          #   the empty-mask group skip are all suppressed for it); the bodies
+│   │                          #   apply the per-pattern gate rule themselves
 │   ├── diag.go                # Diagnostics structures (set composition diagnostics JSON)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/

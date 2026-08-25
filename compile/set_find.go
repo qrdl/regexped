@@ -414,7 +414,7 @@ func (c *setFindCtx) emitCommit(b []byte, btBucket bool) []byte {
 // gate[k] is indexed by GLOBAL pattern id, so the byte offset is a
 // compile-time constant per pattern and the load needs no arithmetic.
 func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
-	if !c.gated {
+	if !c.gated || c.sparseBucket(bi) {
 		return b
 	}
 	first := true
@@ -448,6 +448,15 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 		b = append(b, 0x0B)
 	}
 	return b
+}
+
+// sparseBucket reports whether bucket bi carries G17's per-state accept LISTS
+// rather than a 32-bit accept mask. Every mask-based shortcut on the candidate
+// path has to consult this: the masks are i32s and cannot describe such a
+// bucket's patterns, so a shortcut that reads one as authoritative silently
+// drops everything past the 32nd pattern.
+func (c *setFindCtx) sparseBucket(bi int) bool {
+	return bi >= 0 && bi < len(c.cs.buckets) && c.cs.buckets[bi].sparse
 }
 
 // emitGateWriteback records the reported matches in the gate array, using
@@ -529,7 +538,17 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 // backward-prefix checks pass, so an empty mask is reachable without any gate
 // being involved. A suffix call with mask 0 can only return 0 (every accept is
 // ANDed with validMask), so skipping it changes nothing but the work done.
-func (c *setFindCtx) emitEmptyMaskSkip(b []byte, mask uint32) []byte {
+func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
+	// A SPARSE bucket's pre-mask describes at most its first 32 patterns, so an
+	// empty mask does NOT mean the group has nothing left to report — patterns
+	// 32.. are simply invisible to it. Skipping the group on that lost every
+	// pattern past the 32nd once the first 32 had been gated off, which showed
+	// up as a gated batch delivering exactly 32 tuples of 40 (SETS §23; the
+	// body applies the real per-pattern rule itself, see set_sparse.go's
+	// header).
+	if c.sparseBucket(bi) {
+		return b
+	}
 	b = append(b, 0x20, c.lValidMask, 0x41)
 	b = utils.AppendSLEB128(b, int32(mask))
 	b = append(b, 0x71)       // i32.and
@@ -841,7 +860,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 				b = c.emitGateMask(b, bi, g.mask)
 			}
 			if c.maskCanBeEmpty(bi, g) {
-				b = c.emitEmptyMaskSkip(b, g.mask)
+				b = c.emitEmptyMaskSkip(b, bi, g.mask)
 			}
 		}
 		b = c.emitStartableMask(b, bi, g, posLocal)
@@ -849,7 +868,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		if g.L != 0 {
 			// Only a fixed-prefix group runs prefix DFAs, so only there can
 			// the mask have changed since the check above.
-			b = c.emitEmptyMaskSkip(b, g.mask)
+			b = c.emitEmptyMaskSkip(b, bi, g.mask)
 		}
 		if c.mode == capFind {
 			b = c.emitSelectBase(b)

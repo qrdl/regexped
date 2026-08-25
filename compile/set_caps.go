@@ -270,6 +270,87 @@ func (a capAccumulator) emitRecordBits(b []byte, bitsLocal byte, ids []int, esca
 	}
 }
 
+// emitRecordSparseCount is emitRecordBits for a G17 SPARSE anchored bucket.
+//
+// The probe could not hand back bucket-local bits — 32 of them is the ceiling
+// the sparse form exists to escape — so it returned a COUNT and left the
+// matching bucket-local indices in its scratch. Recording therefore becomes a
+// runtime loop over that scratch, mapping each index to a global id through the
+// bucket's id map, where the bitmask path could unroll one compare per pattern
+// at compile time.
+//
+// lIdx and lID are scratch i32 locals owned by the caller; both are dead
+// between buckets.
+func (a capAccumulator) emitRecordSparseCount(b []byte, countLocal byte, bkt *bucket, tableMemIdx int, lIdx, lID, escapeDepth byte) []byte {
+	sc := bkt.sparseScratch
+	// pushID emits the global id of the collected entry whose index is on top
+	// of the stack as a byte offset into the scratch index list.
+	pushID := func(b []byte, idxOff func([]byte) []byte) []byte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, bkt.sparseIDMapOff)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, sc.endPos)
+		b = idxOff(b)
+		b = appendTableLoad32(b, tableMemIdx, 0) // bucket-local index
+		b = append(b, 0x41, 0x02, 0x74, 0x6A)    // idMapOff + idx*4
+		return appendTableLoad32(b, tableMemIdx, 0)
+	}
+	switch a.kind {
+	case capMatch:
+		// Any hit at all settles a boolean answer; the count is enough and the
+		// ids never need reading.
+		b = append(b, 0x20, countLocal, 0x04, 0x40)
+		b = append(b, 0x41, 0x01, 0x21, a.lCount)
+		b = append(b, 0x0C, escapeDepth+1)
+		b = append(b, 0x0B)
+		return b
+	case capMatchAny:
+		// Which id is unspecified (§3.5), so the first collected one will do.
+		b = append(b, 0x20, countLocal, 0x04, 0x40)
+		b = pushID(b, func(b []byte) []byte { return b }) // entry 0: offset 0
+		b = append(b, 0x21, a.lAnyID)
+		b = append(b, 0x0C, escapeDepth+1)
+		b = append(b, 0x0B)
+		return b
+	default: // capMatchAll
+		b = append(b, 0x41, 0x00, 0x21, lIdx)
+		b = append(b, 0x02, 0x40)
+		b = append(b, 0x20, countLocal, 0x45, 0x0D, 0x00)
+		b = append(b, 0x03, 0x40)
+		b = pushID(b, func(b []byte) []byte {
+			return append(b, 0x20, lIdx, 0x41, 0x02, 0x74, 0x6A)
+		})
+		b = append(b, 0x21, lID)
+		if a.wide {
+			// Count only 0->1 transitions so the returned count stays DISTINCT
+			// patterns, matching emitSetAllBits' contract.
+			b = append(b, 0x20, a.pOutPtr, 0x20, lID, 0x41, 0x03, 0x76, 0x6A)
+			b = appendTableLoad8u(b, 0)
+			b = append(b, 0x41, 0x01, 0x20, lID, 0x41, 0x07, 0x71, 0x74)
+			b = append(b, 0x71, 0x45, 0x04, 0x40)
+			b = append(b, 0x20, a.lCount, 0x41, 0x01, 0x6A, 0x21, a.lCount)
+			b = append(b, 0x0B)
+			b = append(b, 0x20, a.pOutPtr, 0x20, lID, 0x41, 0x03, 0x76, 0x6A)
+			b = append(b, 0x20, a.pOutPtr, 0x20, lID, 0x41, 0x03, 0x76, 0x6A)
+			b = appendTableLoad8u(b, 0)
+			b = append(b, 0x41, 0x01, 0x20, lID, 0x41, 0x07, 0x71, 0x74, 0x72)
+			b = appendTableStore8(b, 0)
+		} else {
+			b = append(b, 0x20, a.lAcc, 0x42, 0x01)
+			b = append(b, 0x20, lID, 0xAD, 0x86, 0x84, 0x21, a.lAcc)
+			// The bare `match` form reads lCount as its flag, and match_all's
+			// narrow epilogue returns lAcc, so bumping it here is harmless and
+			// keeps a hit visible to both.
+			b = append(b, 0x20, a.lCount, 0x41, 0x01, 0x6A, 0x21, a.lCount)
+		}
+		b = append(b, 0x20, lIdx, 0x41, 0x01, 0x6A, 0x21, lIdx)
+		b = append(b, 0x20, lIdx, 0x20, countLocal, 0x49, 0x0D, 0x00)
+		b = append(b, 0x0B)
+		b = append(b, 0x0B)
+		return b
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Anchored trio: match / match_any / match_all.
 
@@ -293,13 +374,30 @@ func emitSetAnchoredCapBody(cs *compiledSet, kind setCapKind, probeFnBase int) [
 	if wide {
 		nParams = 3
 	}
+	// The two scratch locals a G17 sparse bucket's recording loop needs are
+	// declared ONLY when one is present. Declaring them unconditionally would
+	// change the emitted bytes of every anchored body in the project for no
+	// reason, and module size is an exact gate (tools/setperf `make check`).
+	anySparse := false
+	for _, ab := range cs.anchoredBuckets {
+		if ab.sparse {
+			anySparse = true
+			break
+		}
+	}
+	nI32 := byte(3)
+	if anySparse {
+		nI32 = 5
+	}
 	lBits := nParams
 	lCount := nParams + 1
 	lAnyID := nParams + 2
-	lAcc := nParams + 3 // i64
+	lTmpA := nParams + 3
+	lTmpB := nParams + 4
+	lAcc := nParams + nI32 // i64, last
 
 	var b []byte
-	b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7E) // 3 x i32, 1 x i64
+	b = append(b, 0x02, nI32, 0x7F, 0x01, 0x7E) // n x i32, 1 x i64
 
 	acc := capAccumulator{kind: kind, wide: wide, lAcc: lAcc, lCount: lCount, lAnyID: lAnyID, pOutPtr: pOutPtr}
 
@@ -326,6 +424,12 @@ func emitSetAnchoredCapBody(cs *compiledSet, kind setCapKind, probeFnBase int) [
 		b = append(b, 0x10)
 		b = utils.AppendULEB128(b, uint32(probeFnBase+bi))
 		b = append(b, 0x21, lBits)
+		// A G17 sparse bucket returned a COUNT, not bits — the mask passed
+		// above is ignored by its probe, exactly as on the find path.
+		if cs.anchoredBuckets[bi].sparse {
+			b = acc.emitRecordSparseCount(b, lBits, cs.anchoredBuckets[bi], cs.tableMemIdx, lTmpA, lTmpB, 0)
+			continue
+		}
 		b = acc.emitRecordBits(b, lBits, cs.anchoredIDs[bi], 0)
 	}
 

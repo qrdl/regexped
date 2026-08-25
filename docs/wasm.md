@@ -187,9 +187,11 @@ the per-candidate path (`validMask`, the gate pre-mask, the first-byte
 eligibility mask) is an **i32**, so the bucket width follows the narrower of the
 two.
 
-**Sparse set** — emitted when a bucket holds more patterns than that, which
-happens when many patterns share one mandatory literal. Instead of a bitmask per
-state, each state names a *list* of bucket-local pattern indices:
+**Sparse set** — emitted when a bucket holds more patterns than that. All three
+packers can produce one: patterns sharing a mandatory literal, literal-less
+patterns in a fallback bucket, and the anchored automata behind `match_any` /
+`match_all`. Instead of a bitmask per state, each state names a *list* of
+bucket-local pattern indices:
 
 ```
 [midOff:  {u32 offset, u32 count}[numStates]]   // into midList
@@ -213,14 +215,33 @@ exactly the entries it set, walking `fired`, so the cost is proportional to
 matches rather than to bucket size. Untouched WASM memory starts zeroed, so the
 first call sees a clean slate.
 
-Why it matters: a shared-literal group otherwise splits into `ceil(N/32)`
-buckets, each costing its own suffix-DFA call at *every* position the literal
-hits. Measured on 128 patterns behind one literal, dense input: 7.3x less fuel
-for `find` and a 59% smaller module against the split form.
+Why it matters: a group otherwise splits into `ceil(N/32)` buckets, each costing
+its own DFA walk. What that walk costs depends on the packer:
+
+| Packer | A split costs one extra walk... | Measured at 128 patterns |
+|---|---|---|
+| shared literal | at every position the literal hits | 7.3x `find`, −59% module |
+| fallback (no literal) | at **every input position** | 25.3x `find`, 6.3x `scan_all` |
+| anchored | per `match_any` / `match_all` call, over the whole input | 6.0x |
+
+The fallback figure is the largest because nothing gates those buckets: with no
+literal to skip to, every one of the `ceil(N/32)` walks runs at every position.
 
 A sparse bucket's probe returns a **count**, with the matching global ids left in
 `endPos`, rather than the bitmask a normal probe returns — a bitmask would
 reimpose the same 32-pattern ceiling on the scan capabilities.
+
+The same ceiling is why nothing on the candidate path may read a mask as
+authoritative for a sparse bucket. `validMask` is ignored by the sparse bodies,
+which apply the per-pattern gate rule themselves; the gate pre-mask and the
+empty-mask group skip are not emitted for such a bucket at all, because an
+"empty" i32 mask means only that its first 32 patterns are spent.
+
+Promotion is refused when the merged DFA misses the state or byte budget, in
+which case the packer would have split it again anyway. In practice the byte
+budget binds first: past 256 states a table switches to u16 cells, and 64 KB of
+those is 128 states — so a merge over ~255 states is declined and the group
+keeps its split packing.
 
 ---
 
