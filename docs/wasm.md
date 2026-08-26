@@ -322,17 +322,14 @@ WASM functions for multi-pattern matching.
 (func $scan_all (param $in_ptr i32) (param $in_len i32) (param $from i32) (result i64))  ;; bitmask (<= 64)
 (func $scan_all (param $in_ptr i32) (param $in_len i32) (param $from i32) (param $out_ptr i32) (result i32))
 
-;; find — DEFAULT (overlapping absent/false): per-pattern non-overlapping.
+;; find — ONE signature for both overlap policies. The default body records
+;; per-pattern non-overlapping gates in $gate_ptr; the overlapping body
+;; records none and uses the array to carry its once-per-drive "matches
+;; nowhere" verdict instead. See "The gate array" below.
 (func $find
     (param $in_ptr i32) (param $in_len i32) (param $from i32)
     (param $gate_ptr i32) (param $out_ptr i32) (param $out_cap i32)
     (result i32))   ;; TOTAL matches at the reported position
-
-;; find — overlapping: true. No gate parameter at all.
-(func $find
-    (param $in_ptr i32) (param $in_len i32) (param $from i32)
-    (param $out_ptr i32) (param $out_cap i32)
-    (result i32))
 
 ;; <find>_batch — emitted ONLY under `hints: [batch-find]` on the set, alongside
 ;; $find rather than instead of it. The same matches, several consecutive
@@ -341,14 +338,9 @@ WASM functions for multi-pattern matching.
 ;;
 ;; Both entries are driven by ONE shared per-position worker, so a batching set
 ;; carries one set of bucket code rather than two.
-(func $<find>_batch                                  ;; gated (default)
+(func $<find>_batch                                  ;; both overlap policies
     (param $in_ptr i32) (param $in_len i32) (param $cursor i64)
     (param $gate_ptr i32) (param $out_ptr i32) (param $out_cap i32)
-    (result i64))
-
-(func $<find>_batch                                  ;; overlapping: true
-    (param $in_ptr i32) (param $in_len i32) (param $cursor i64)
-    (param $out_ptr i32) (param $out_cap i32)
     (result i64))
 ```
 
@@ -443,8 +435,11 @@ position, never a truncated one.
 
 ### The gate array
 
-The default `find` body takes `gate_ptr`, pointing at `id_space_size` u32s in
+Every `find` body takes `gate_ptr`, pointing at `id_space_size` u32s in
 the **caller's** memory (`memory[0]` — the same memory the input lives in).
+The parameter does not depend on `overlapping:` — see "Under `overlapping:
+true`" below for what changes, which is what the array holds and nothing a
+caller does.
 
 It is indexed by **global pattern id**, not by position within the set, so it is
 sized from `id_space_size` and not from `patterns_in_set`. Those two differ for
@@ -464,6 +459,27 @@ module write past its end.
 Keeping this state in caller memory rather than inside the module is what makes
 `find` resumable at any index: nothing is hidden, and zeroing the array
 restores a clean scan from anywhere.
+
+#### Under `overlapping: true`
+
+Nothing in the array is a gate: that body reports every match at every start
+position and retires nothing on the strength of an earlier one. It uses the
+array for the only other thing a caller-owned per-drive allocation is good
+for — carrying, across the calls of one drive, the set of patterns proven to
+match NOWHERE at or after the drive's first `from`.
+
+That verdict costs one pass over the input and is what retires a pattern whose
+automaton never dies (`[^\n]*ERROR` on newline-free text, say) from every
+position at once; without somewhere to keep it, the pass would have to run on
+every call and would cost more than it saves. The caller's obligations are
+identical either way: allocate, zero to begin a drive, pass the pointer, never
+read it.
+
+One consequence worth stating, because it is the same one the default body
+has: the verdict is written at CALL ENTRY, before any position is evaluated,
+so an overflowing call or an `out_cap = 0` probe on a fresh array may still
+leave bytes in it. Nothing an eliminated pattern could have matched is lost,
+so no answer changes — but the array is not byte-for-byte untouched.
 
 ### Edge contracts
 

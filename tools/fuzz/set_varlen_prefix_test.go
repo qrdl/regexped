@@ -53,7 +53,7 @@ func TestVarLenPrefixMustRouteToFallback(t *testing.T) {
 				r := newCapRunner(t, tc.pats, input, true) // overlapping: every start
 				defer r.Close()
 				total := int(r.call(t, "cap_find",
-					r.inBase, int32(len(input)), 0, r.outPtr, int32(r.npat)).(int32))
+					r.inBase, int32(len(input)), 0, r.gatePtr, r.outPtr, int32(r.npat)).(int32))
 				buf := r.mem.UnsafeData(r.store)
 				var got [][3]int
 				for i := 0; i < total && i < int(r.npat); i++ {

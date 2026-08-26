@@ -190,10 +190,11 @@ for m := range ScanSecrets(input, 0) {
 }
 ```
 
-The sequence owns one reusable tuple buffer sized from `<Set>PatternCount` and,
-for the default non-overlapping configuration, a zeroed gate array sized from
-`<Set>IDSpace` — the gate array is indexed by global pattern id, so the two
-lengths differ for a named subset. Each WASM call returns every match at one position before
+The sequence owns one reusable tuple buffer sized from `<Set>PatternCount` and
+a zeroed gate array sized from `<Set>IDSpace` — the gate array is indexed by
+global pattern id, so the two lengths differ for a named subset. Both overlap
+policies take the array; see [sets.md](sets.md) for what the overlapping body
+keeps in it. Each WASM call returns every match at one position before
 the scan advances, so a step is not a call. Requires Go 1.23+ for `iter`.
 
 `PatternName(id)` is emitted once per config when any set sets

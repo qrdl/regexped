@@ -140,12 +140,20 @@ const (
 	// equivalent — per-start-position enumeration is not a search it can
 	// express — so it is measured but never compared.
 	capFindOverlapping capability = "find(overlapping)"
+	// capFindBatchOverlapping is the batching entry of an overlapping set.
+	// Added while investigating SETS_PLAN item 11 stage B and KEPT after that
+	// stage was reverted: before this row, overlapping sets were measured
+	// through the lazy `find` alone, so the batching entry — the one a stub
+	// user actually gets under `hints: [batch-find]` — had no number at all.
+	// That blind spot is why stage B's 19.6x regression was invisible until
+	// the row existed. Do not remove it with the feature it was added for.
+	capFindBatchOverlapping capability = "find_batch(overlapping)"
 )
 
 var allCaps = []capability{
 	capMatchAny, capMatchAll,
 	capScanAny, capScanAll,
-	capFind, capFindBatch, capFindOverlapping,
+	capFind, capFindBatch, capFindOverlapping, capFindBatchOverlapping,
 }
 
 // batchCap is the tuple buffer the find_batch row is driven with, in matches.
@@ -158,6 +166,8 @@ func exportName(c capability) string {
 	switch c {
 	case capFindOverlapping:
 		return "cap_find"
+	case capFindBatchOverlapping:
+		return config.SetBatchExportName("cap_find")
 	case capFindBatch:
 		// Synthesized from `find`'s name under the hint, not declared, so it
 		// is derived through the same function the compiler and the six
@@ -354,6 +364,14 @@ func buildMatrix() []setCase {
 	// this is where gating has the most to recover.
 	greedy := []string{`a+`, `[^\n]*ERROR`, `x?y`}
 	out = append(out,
+		// The shape stage A's preflight cannot touch: the never-dying pattern
+		// IS present, so it can never be retired, and every start position
+		// walks to it. One ERROR at the far end of newline-free filler makes
+		// that walk as long as it gets. This is the one row that isolates
+		// "never-dying and PRESENT" from "never-dying and absent", and it is
+		// over the 4e9 budget today — the open half of SETS_PLAN item 11,
+		// which stage B was built for and failed to close.
+		setCase{"greedy-3", greedy, corpusNoMatch()[:100*1024-5] + "ERROR", "late ERROR 100KB"},
 		setCase{"greedy-3", greedy, strings.Repeat("a", 50000), "50K a's"},
 		setCase{"greedy-3", greedy, corpusNoMatch(), "no-match 100KB"},
 	)
@@ -611,30 +629,31 @@ func (r *rxInstance) call(c capability, wide bool) (int, error) {
 		return r.exhaustFindBatch(fn, true)
 	case capFindOverlapping:
 		return r.exhaustFind(fn, false)
+	case capFindBatchOverlapping:
+		return r.exhaustFindBatch(fn, false)
 	}
 	return 0, fmt.Errorf("unknown capability %q", c)
 }
 
 // exhaustFind drives `find` to exhaustion the way a generated iterator does.
 func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
-	if gated {
-		buf := r.mem.UnsafeData(r.store)
-		for i := int32(0); i < r.npat*4; i++ {
-			buf[r.gatePtr+i] = 0
-		}
-		runtime.KeepAlive(r.store)
+	// Zeroed for BOTH flavours: since SETS_PLAN item 11 the overlapping body
+	// takes the array too, not for match gates but as the per-drive home of
+	// its preflight verdict, and zeroing it is what declares a fresh drive.
+	// Doing it once here rather than per call is the point of the change —
+	// the per-call form is what the attempt log measured and rejected.
+	buf := r.mem.UnsafeData(r.store)
+	for i := int32(0); i < r.npat*4; i++ {
+		buf[r.gatePtr+i] = 0
 	}
+	runtime.KeepAlive(r.store)
 	from := int32(0)
 	calls := 0
 	for {
 		var res interface{}
 		var err error
 		calls++
-		if gated {
-			res, err = fn.Call(r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
-		} else {
-			res, err = fn.Call(r.store, r.inBase, r.inLen, from, r.outPtr, r.npat)
-		}
+		res, err = fn.Call(r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
 		if err != nil {
 			return calls, err
 		}
@@ -656,24 +675,18 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 // stop, and reading the tuples would add harness work to a timed loop that is
 // meant to measure the engine.
 func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error) {
-	if gated {
-		buf := r.mem.UnsafeData(r.store)
-		for i := int32(0); i < r.npat*4; i++ {
-			buf[r.gatePtr+i] = 0
-		}
-		runtime.KeepAlive(r.store)
+	buf := r.mem.UnsafeData(r.store)
+	for i := int32(0); i < r.npat*4; i++ {
+		buf[r.gatePtr+i] = 0
 	}
+	runtime.KeepAlive(r.store)
 	cursor := int64(0)
 	calls := 0
 	for {
 		var res interface{}
 		var err error
 		calls++
-		if gated {
-			res, err = fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap))
-		} else {
-			res, err = fn.Call(r.store, r.inBase, r.inLen, cursor, r.batchPtr, int32(batchCap))
-		}
+		res, err = fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap))
 		if err != nil {
 			return calls, err
 		}
@@ -703,7 +716,7 @@ func measureFuelRow(c setCase) []row {
 	engine := wasmtime.NewEngineWithConfig(cfg)
 	var out []row
 	for _, cap := range allCaps {
-		overlapping := cap == capFindOverlapping
+		overlapping := cap == capFindOverlapping || cap == capFindBatchOverlapping
 		wasm, err := compileCase(c, overlapping)
 		if err != nil {
 			continue
@@ -777,7 +790,7 @@ func timedCase(c setCase, cap capability, ourFuel uint64) (setCase, bool) {
 // crossings × callFloor from our p50 puts both on the same footing.
 func measureTime(engine *wasmtime.Engine, c setCase, cap capability, ourFuel uint64) (time.Duration, int, time.Duration, error) {
 	c, _ = timedCase(c, cap, ourFuel)
-	wasm, err := compileCase(c, cap == capFindOverlapping)
+	wasm, err := compileCase(c, cap == capFindOverlapping || cap == capFindBatchOverlapping)
 	if err != nil {
 		return 0, 0, 0, err
 	}

@@ -1221,19 +1221,18 @@ func (r *setRunner) callAll(fn *wasmtime.Func, tlen, from int32) ([]int, bool, e
 // start+1. Returns the matches keyed by pattern id.
 func (r *setRunner) driveFind(fn *wasmtime.Func, text string, overlapping bool) (map[int32][][2]int, bool, error) {
 	got := make(map[int32][][2]int)
-	if !overlapping {
-		r.zeroGates()
-	}
+	// Zeroed for BOTH flavours. An overlapping `find` records no match gates,
+	// but since SETS_PLAN item 11 it reads the array as the per-drive home of
+	// its preflight verdict, and an all-zero array is what declares a fresh
+	// drive. A driver that skipped this would carry one corpus line's verdict
+	// into the next.
+	r.zeroGates()
 	from := int32(0)
 	for {
 		var res interface{}
 		var hang bool
 		var err error
-		if overlapping {
-			res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.outBase, r.outCap)
-		} else {
-			res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.gatePtr, r.outBase, r.outCap)
-		}
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.gatePtr, r.outBase, r.outCap)
 		if err != nil || hang {
 			return nil, hang, err
 		}
@@ -1267,9 +1266,7 @@ func (r *setRunner) driveFind(fn *wasmtime.Func, text string, overlapping bool) 
 // `skip` parameter when overlapping) reachable at corpus scale.
 func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping bool, outCap int32) (map[int32][][2]int, bool, error) {
 	got := make(map[int32][][2]int)
-	if !overlapping {
-		r.zeroGates()
-	}
+	r.zeroGates()
 	countMask := int64(1)<<uint(config.SetCursorCountBits(r.npat)) - 1
 	cursor := int64(0)
 	maxCalls := 8*(len(text)+1)*(r.npat+1) + 16
@@ -1280,11 +1277,7 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 		var res interface{}
 		var hang bool
 		var err error
-		if overlapping {
-			res, hang, err = r.call(fn, r.inBase, int32(len(text)), cursor, r.outBase, outCap)
-		} else {
-			res, hang, err = r.call(fn, r.inBase, int32(len(text)), cursor, r.gatePtr, r.outBase, outCap)
-		}
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), cursor, r.gatePtr, r.outBase, outCap)
 		if err != nil || hang {
 			return nil, hang, err
 		}
@@ -1330,18 +1323,12 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 // at every position of the corpus rather than at a handful of hand-picked ones.
 func (r *setRunner) driveFindOverflow(fn *wasmtime.Func, text string, overlapping bool) (_ map[int32][][2]int, hangOut bool, violation string, _ error) {
 	got := make(map[int32][][2]int)
-	if !overlapping {
-		r.zeroGates()
-	}
+	r.zeroGates()
 	call := func(from, outCap int32) (int32, bool, error) {
 		var res interface{}
 		var hang bool
 		var err error
-		if overlapping {
-			res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.outBase, outCap)
-		} else {
-			res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.gatePtr, r.outBase, outCap)
-		}
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.gatePtr, r.outBase, outCap)
 		if err != nil || hang {
 			return 0, hang, err
 		}
@@ -1433,17 +1420,11 @@ func (r *setRunner) checkFromOutOfRange(
 			}
 		}
 		if find != nil {
-			if !overlapping {
-				r.zeroGates()
-			}
+			r.zeroGates()
 			var res interface{}
 			var hang bool
 			var err error
-			if overlapping {
-				res, hang, err = r.call(find, r.inBase, tlen, from, r.outBase, r.outCap)
-			} else {
-				res, hang, err = r.call(find, r.inBase, tlen, from, r.gatePtr, r.outBase, r.outCap)
-			}
+			res, hang, err = r.call(find, r.inBase, tlen, from, r.gatePtr, r.outBase, r.outCap)
 			if err != nil {
 				return err
 			}
@@ -1457,18 +1438,12 @@ func (r *setRunner) checkFromOutOfRange(
 			}
 		}
 		if findBatch != nil {
-			if !overlapping {
-				r.zeroGates()
-			}
+			r.zeroGates()
 			cursor := int64(from) << 32
 			var res interface{}
 			var hang bool
 			var err error
-			if overlapping {
-				res, hang, err = r.call(findBatch, r.inBase, tlen, cursor, r.outBase, r.outCap)
-			} else {
-				res, hang, err = r.call(findBatch, r.inBase, tlen, cursor, r.gatePtr, r.outBase, r.outCap)
-			}
+			res, hang, err = r.call(findBatch, r.inBase, tlen, cursor, r.gatePtr, r.outBase, r.outCap)
 			if err != nil {
 				return err
 			}

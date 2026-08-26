@@ -217,7 +217,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		if s.Find != "" {
 			scannerType := "rx_" + setConstBase(s.Name) + "_scanner_t"
 			gateField, gateInit, gateArg := "", "", ""
-			if gatedFind(s) {
+			if findGateArray(s) {
 				imp(s.Find, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, unsigned *gates, int *out, int cap);", s.Find))
 				gateField = fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
 				gateInit = fmt.Sprintf("    for (size_t k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)

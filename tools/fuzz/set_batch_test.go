@@ -104,12 +104,10 @@ func runBatchFind(t *testing.T, pats []string, input string, outCap int32, overl
 			t.Fatalf("%v on %q cap=%d: find_batch did not terminate after %d calls",
 				pats, input, outCap, calls)
 		}
-		var args []interface{}
-		if overlapping {
-			args = []interface{}{inBase, int32(len(input)), cursor, outPtr, outCap}
-		} else {
-			args = []interface{}{inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap}
-		}
+		// One signature for both flavours since SETS_PLAN item 11: the
+		// overlapping entry records no match gates but takes the array as the
+		// per-drive home of its preflight verdict.
+		args := []interface{}{inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap}
 		res, err := fn.Call(store, args...)
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
@@ -343,13 +341,7 @@ func TestFindBatchZeroCap(t *testing.T) {
 
 			// The `from` of the very first call is 0, which is also a legal
 			// resume position — the value the pre-fix body handed back.
-			var args []interface{}
-			if overlapping {
-				args = []interface{}{inBase, int32(len(input)), int64(0), outPtr, int32(0)}
-			} else {
-				args = []interface{}{inBase, int32(len(input)), int64(0), gatePtr, outPtr, int32(0)}
-			}
-			res, err := fn.Call(store, args...)
+			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), gatePtr, outPtr, int32(0))
 			if err != nil {
 				t.Fatalf("set_find_batch: %v", err)
 			}

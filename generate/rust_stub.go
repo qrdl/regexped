@@ -94,7 +94,7 @@ impl SetMatch {
 			}
 		}
 		if s.Find != "" {
-			if gatedFind(s) {
+			if findGateArray(s) {
 				decl(s.Find, "(ptr: *const u8, len: i32, from: i32, gates: *mut u32, out: *mut i32, cap: i32) -> i32")
 			} else {
 				decl(s.Find, "(ptr: *const u8, len: i32, from: i32, out: *mut i32, cap: i32) -> i32")
@@ -183,7 +183,7 @@ pub fn %s(input: &[u8]) -> Option<i32> {
 		if s.Find != "" {
 			iterName := iterTypeName(s.Find)
 			gateSlots := 0
-			if gatedFind(s) {
+			if findGateArray(s) {
 				gateSlots = idN
 			}
 			// A set big enough to make the iterator a heavy VALUE holds its
@@ -200,7 +200,7 @@ pub fn %s(input: &[u8]) -> Option<i32> {
 				allocDoc = "///\n/// This set is large enough that the buffer would be a heavy value to\n/// move, so it is heap-allocated once when the iterator is created. Small\n/// sets keep it inline and allocate nothing.\n"
 			}
 			gateField, gateInit, gateArg, gateDoc := "", "", "", ""
-			if gatedFind(s) {
+			if findGateArray(s) {
 				gateField = "    gates: [u32; " + idKonst + "],\n"
 				gateInit = " gates: [0u32; " + idKonst + "],"
 				if boxed {

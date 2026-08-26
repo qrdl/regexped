@@ -611,6 +611,144 @@ func (cs *compiledSet) usesGatedFindPreflight() bool {
 	return false
 }
 
+// usesOverlappingFindPreflight reports whether this set's OVERLAPPING `find`
+// should run the same preflight, keeping its verdict in the caller's gate
+// array (SETS_PLAN item 11).
+//
+// The row this exists for is greedy-3's `[^\n]*ERROR` on newline-free input:
+// a fallback pattern whose suffix DFA never dies, walked from every start
+// position, which makes one overlapping call O(n^2). The verdict "this
+// pattern matches nowhere at or after `from`" retires it from validMask, and
+// the G9 liveness exit inside the suffix body then truncates the walk as soon
+// as only retired patterns could still accept.
+//
+// It shares gatedFind's eligibility except for the two differences that
+// matter:
+//
+//   - SPARSE buckets are excluded outright. The verdict is applied through
+//     the i32 validMask, which is not authoritative for such a bucket (see
+//     set_sparse.go's header), and the liveness exit reads the same mask.
+//   - the id space must fit the i64 alive mask, as it must for the union walk
+//     itself.
+//
+// The never-dying requirement is what keeps this off every other overlapping
+// set: without it the preflight is §16.5.2's Candidate A — a pass that costs
+// the whole input and retires nothing.
+func (cs *compiledSet) usesOverlappingFindPreflight() bool {
+	return cs.overlapPreflightShape() &&
+		(cs.unionScan != nil || cs.usesAbsencePrefilter())
+}
+
+// overlapPreflightShape is usesOverlappingFindPreflight minus the question of
+// whether anything exists yet to COMPUTE the verdict with.
+//
+// Split out because the union automaton is built from this answer: a find-only
+// overlapping set has no scan capability to build it for, so the table has to
+// be requested by the preflight that will read it. Everything here is settled
+// by bucket construction, which finishes first.
+func (cs *compiledSet) overlapPreflightShape() bool {
+	if cs.find == "" || !cs.overlapping {
+		return false
+	}
+	if cs.fe != frontendScalar {
+		return false
+	}
+	if cs.idSpaceSize() > 64 {
+		return false
+	}
+	for _, b := range cs.buckets {
+		if b.sparse {
+			return false
+		}
+		if b.suffixDFA == nil {
+			continue
+		}
+		if b.suffixDFA.hasWordBoundary || b.suffixDFA.hasNewlineBoundary {
+			return false
+		}
+	}
+	for _, b := range cs.buckets {
+		if b.suffixDFA != nil && hasNeverDyingState(b.suffixDFA) {
+			return true
+		}
+	}
+	return false
+}
+
+// emitOverlappingFindPreflight is B′ for the overlapping body.
+//
+// Same pass, same sentinel, one addition — and the addition is the whole
+// reason the per-call version measured in item 11's attempt log failed. The
+// gated body's "run only while some gate is still zero" guard works because
+// its write-back eventually makes every gate non-zero. An overlapping body
+// writes NO gates, so a pattern that is alive would keep its zero for the
+// whole drive and the guard would re-arm on every single call — which on
+// greedy-3 / 50K a's meant 3,724 union passes instead of one.
+//
+// So an alive pattern is marked too, with 1. The §3.16 pre-mask reads that as
+// `2s + 1 >= 1`, true at every position, so the pattern stays eligible
+// everywhere; the value's only job is to be non-zero. A dead one gets
+// `2*len + 2`, exactly as in the gated body, which the same pre-mask reads as
+// false everywhere.
+//
+// One further gift: with every pattern dead, emitGateJump's minimum over
+// `gate[id] >> 1` is len + 1, so the scan cursor jumps past the end and the
+// call returns 0 without entering the loop.
+func emitOverlappingFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
+	ids := setPatternIDs(cs)
+	if len(ids) == 0 {
+		return b
+	}
+	// Run only on a fresh drive, which the caller declares by zeroing the
+	// array (§3.14's existing contract).
+	//
+	// ONE slot is tested, not all of them, and that is a real difference from
+	// the gated body rather than a shortcut. There the guard has to ask "is
+	// ANY gate still zero", because gates arrive one at a time as patterns
+	// match. Here the pass writes every id in one go — alive or dead, all of
+	// them non-zero — so any single slot answers for the whole array. The
+	// difference is O(patterns) per call against O(1), on a capability whose
+	// drive makes one call per matching position; on greedy-3 / 50K a's that
+	// is 50,000 calls paying for it.
+	b = append(b, 0x20, pGate, 0x28, 0x02)
+	b = utils.AppendULEB128(b, uint32(ids[0]*4))
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x04, 0x40) // if the drive is fresh
+
+	if absence {
+		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal)
+	} else {
+		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, tableMemIdx)
+	}
+
+	for _, gid := range ids {
+		if gid >= 64 {
+			// Outside the i64 mask: leave the gate at 0 so the pattern is
+			// never retired. It also leaves this drive's "some gate is zero"
+			// guard armed, which is why usesOverlappingFindPreflight refuses
+			// an id space this wide rather than relying on the loop.
+			continue
+		}
+		b = append(b, 0x20, aliveLocal)
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(gid))
+		b = append(b, 0x88)
+		b = append(b, 0x42, 0x01, 0x83)
+		b = append(b, 0x50)                                             // i64.eqz -> not alive
+		b = append(b, 0x04, 0x7F)                                       // if (result i32)
+		b = append(b, 0x20, pInLen, 0x41, 0x01, 0x74, 0x41, 0x02, 0x6A) // 2*len + 2
+		b = append(b, 0x05)                                             // else
+		b = append(b, 0x41, 0x01)                                       // 1: eligible everywhere, and non-zero
+		b = append(b, 0x0B)
+		b = append(b, 0x21, lState) // stash, then store through pGate
+		b = append(b, 0x20, pGate, 0x20, lState)
+		b = append(b, 0x36, 0x02)
+		b = utils.AppendULEB128(b, uint32(gid*4)) // i32.store offset=gid*4
+	}
+	b = append(b, 0x0B) // end if some gate zero
+	return b
+}
+
 // emitGatedFindPreflight emits B′.
 //
 // Only while some gate is still 0 — i.e. the first call of a drive — run the

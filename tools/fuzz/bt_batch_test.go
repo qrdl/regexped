@@ -83,12 +83,20 @@ func runBTBatch(t *testing.T, w []byte, pats []string, input string, outCap int3
 		t.Fatalf("parse data section: %v", err)
 	}
 	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	outPtr := inBase + pageSize
+	// The overlapping batch entry takes the gate array too since SETS_PLAN
+	// item 11 — not for match gates, which it records none of, but as the
+	// per-drive home of the preflight verdict. Zeroed here: that is what
+	// declares a fresh drive.
+	gatePtr := inBase + pageSize
+	outPtr := gatePtr + pageSize
 	needed := uint64((int64(outPtr) + pageSize + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
 			t.Fatalf("grow: %v", err)
 		}
+	}
+	for i := int32(0); i < pageSize; i++ {
+		mem.UnsafeData(store)[gatePtr+i] = 0
 	}
 	if len(input) > 0 {
 		copy(mem.UnsafeData(store)[inBase:], input)
@@ -105,7 +113,7 @@ func runBTBatch(t *testing.T, w []byte, pats []string, input string, outCap int3
 			t.Fatalf("%v on %q cap=%d: batch did not terminate after %d calls",
 				pats, input, outCap, calls)
 		}
-		res, err := fn.Call(store, inBase, int32(len(input)), cursor, outPtr, outCap)
+		res, err := fn.Call(store, inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap)
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
 		}

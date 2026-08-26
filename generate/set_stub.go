@@ -150,9 +150,17 @@ func bitmapBytes(s config.SetConfig, cfg config.BuildConfig) int {
 	return (idSpaceSize(s, cfg) + 7) / 8
 }
 
-// gatedFind reports whether a set's `find` is the default gated body, which
-// carries a gate-array parameter the stub must own and zero (§3.14).
-func gatedFind(s config.SetConfig) bool { return s.Gated() }
+// findGateArray reports whether a set's `find` carries a gate-array parameter
+// the stub must own and zero.
+//
+// EVERY set with `find` does, including an overlapping one. The default body
+// records per-pattern non-overlapping gates in it (§3.14); the overlapping
+// body records no gates at all and uses the array as the only caller-owned
+// place to keep the once-per-drive preflight verdict (SETS_PLAN item 11).
+// From the stub's side the two are indistinguishable — allocate it, zero it
+// when the drive starts, pass it, never read it — which is why one predicate
+// serves both.
+func findGateArray(s config.SetConfig) bool { return s.HasFind() }
 
 // cursorCountBits is the width of the find_batch cursor's count field for this
 // set.

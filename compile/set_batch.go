@@ -91,20 +91,24 @@ func emitSetWorkerBody(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemI
 // workerTypeIdx is the WASM type of the shared worker: `find`'s own signature
 // plus one trailing i32 — `batch_mode` when gated, §19's `skip` when not.
 func (cs *compiledSet) workerTypeIdx() int {
-	if cs.gatedFind() {
-		return setMatchTypeSuffix // (i32 x 7) -> i32
-	}
-	return setTypeI32x6ToI32 // (i32 x 6) -> i32
+	// Both flavours carry the gate slot now (findGateSlot), so both workers
+	// are (ptr, len, from, gate, out, cap, trailing) -> i32. The trailing
+	// argument is `batch_mode` when gated and §19's `skip` when not.
+	return setMatchTypeSuffix // (i32 x 7) -> i32
 }
 
 // emitSetFindWrapperBody emits the exported `find` of a batching set: a
 // forwarding call into the shared worker with the batch-only argument zeroed.
 //
-// Gated:      find(ptr,len,from,gate,out,cap) -> worker(..., batch_mode = 0)
-// Overlapping: find(ptr,len,from,out,cap)     -> worker(..., skip = 0)
+// Gated:       find(ptr,len,from,gate,out,cap) -> worker(..., batch_mode = 0)
+// Overlapping: find(ptr,len,from,gate,out,cap) -> worker(..., skip = 0)
+//
+// The two signatures are identical since item 11 gave the overlapping body the
+// gate slot for its preflight verdict; only the trailing argument's meaning
+// differs, and `find` zeroes it either way.
 func emitSetFindWrapperBody(cs *compiledSet, workerIdx int) []byte {
 	nparams := 5
-	if cs.gatedFind() {
+	if cs.findGateSlot() {
 		nparams = 6
 	}
 	b := []byte{0x00} // no locals
@@ -121,8 +125,10 @@ func emitSetFindWrapperBody(cs *compiledSet, workerIdx int) []byte {
 
 // emitSetFindBatchBody emits the exported find_batch loop.
 //
-// Signature, gated:      (ptr, len, cursor i64, gate_ptr, out_ptr, out_cap) -> i64
-// Signature, overlapping: (ptr, len, cursor i64, out_ptr, out_cap)          -> i64
+// Signature, both flavours: (ptr, len, cursor i64, gate_ptr, out_ptr, out_cap) -> i64
+//
+// The overlapping form records no match gates; its array carries the
+// once-per-drive preflight verdict (SETS_PLAN item 11).
 //
 // workerIdx is the function index of the per-position worker emitted by
 // emitSetBatchPosBody.
@@ -135,15 +141,8 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx int) []byte {
 	// Parameters.
 	var pInPtr, pInLen, pCursor, pGate, pOutPtr, pOutCap byte
 	pInPtr, pInLen, pCursor = 0, 1, 2
-	if gated {
-		pGate, pOutPtr, pOutCap = 3, 4, 5
-	} else {
-		pOutPtr, pOutCap = 3, 4
-	}
-	localBase := byte(5)
-	if gated {
-		localBase = 6
-	}
+	pGate, pOutPtr, pOutCap = 3, 4, 5
+	localBase := byte(6)
 	var (
 		lPos     = localBase
 		lK       = localBase + 1
@@ -208,12 +207,10 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx int) []byte {
 	// avail = cap - count
 	b = append(b, 0x20, lCap, 0x20, lCount, 0x6B, 0x21, lAvail)
 
-	// total = worker(ptr, len, pos, [gate,] out_ptr + (count-k)*12,
+	// total = worker(ptr, len, pos, gate, out_ptr + (count-k)*12,
 	//                avail + k [, k])
 	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, lPos)
-	if gated {
-		b = append(b, 0x20, pGate)
-	}
+	b = append(b, 0x20, pGate)
 	b = append(b, 0x20, pOutPtr, 0x20, lCount)
 	if !gated {
 		b = append(b, 0x20, lK, 0x6B)

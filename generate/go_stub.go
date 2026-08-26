@@ -195,7 +195,7 @@ func %s(input []byte, offset uint) iter.Seq[int] {
 			needsIter = true
 			pub := goPublicName(s.Find)
 			gateDecl, gateArg, gateDoc := "", "", ""
-			if gatedFind(s) {
+			if findGateArray(s) {
 				imp(s.Find, "("+inArgs+", from int32, gatePtr unsafe.Pointer, outPtr unsafe.Pointer, outCap int32) int32")
 				gateDecl = "\t\tgates := make([]uint32, " + idKonst + ")\n"
 				gateArg = "unsafe.Pointer(&gates[0]), "

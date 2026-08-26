@@ -261,12 +261,15 @@ func (cs *compiledSet) capFns() []setCapFn {
 	if wide {
 		scanAllType = setTypeI32x4ToI32
 	}
+	// The gate-array slot is present on BOTH `find` bodies. Under
+	// `overlapping: true` the array carries no match gates — it carries the
+	// once-per-drive preflight's verdict instead (§16.5.3 / SETS_PLAN item
+	// 11), which is what lets that verdict be computed once rather than on
+	// every call. It is declared unconditionally rather than only when a
+	// preflight is emitted, because the alternative makes an exported
+	// signature depend on pattern analysis the caller cannot predict.
 	findType := byte(setTypeI32x6ToI32)
 	batchType := byte(setTypeBatchGated)
-	if cs.overlapping {
-		findType = setTypeI32x5ToI32
-		batchType = setTypeBatchUngated
-	}
 	batchName := ""
 	if cs.batchFind {
 		batchName = config.SetBatchExportName(cs.find)
@@ -375,6 +378,22 @@ func (cs *compiledSet) hiddenFnCount() int {
 // non-overlapping) `find` body, which threads a gate array through the suffix
 // functions.
 func (cs *compiledSet) gatedFind() bool { return cs.hasFind() && !cs.overlapping }
+
+// findGateSlot reports whether the exported `find`, its batch entry and their
+// shared worker carry a gate-array POINTER.
+//
+// Distinct from gatedFind on purpose, and the distinction is the whole of
+// SETS_PLAN item 11's ABI change. gatedFind asks "does this body apply the
+// §3.16 per-pattern non-overlapping rule"; this asks "is there an array in
+// the argument list". An overlapping `find` answers no to the first and yes
+// to the second: it applies no match gates, but it needs somewhere
+// caller-owned to keep the preflight's verdict across the calls of one drive,
+// and the gate array already has exactly the contract that needs — caller
+// zeroes it to start a drive, one drive per unchanging input.
+//
+// The suffix functions are NOT affected: only the top-level body reads the
+// array, and only through emitGateMask.
+func (cs *compiledSet) findGateSlot() bool { return cs.hasFind() }
 
 // hasFind reports whether either position-reporting capability is declared.
 func (cs *compiledSet) hasFind() bool { return cs.find != "" }
@@ -596,7 +615,23 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// task 59 decision (10): a scalar-frontend `scan_any` now compiles to the
 	// union walk itself, so no per-bucket liveness table can ever be consulted
 	// on its behalf. Only G9's gated-`find` preflight still reads one.
-	needLiveness := spec.gated() && fe == frontendScalar
+	//
+	// Item 11 extends it to the OVERLAPPING body, which now has a preflight of
+	// its own and therefore something to make the exit fire.
+	//
+	// The structural half is overlapCanPreflight; the other half is whether
+	// anything can actually COMPUTE the verdict, and that is settled by a
+	// trial construction of the union automaton. Deciding it by construction
+	// rather than by a predicate is the point: buildUnionScanDFA refuses for
+	// reasons no cheap test can predict — a union state count over
+	// maxUnionScanStates, most of all — and every one of those refusals would
+	// otherwise leave a set carrying the table and the per-byte check with no
+	// preflight to fire them, which is §16.5.2's reverted Candidate A.
+	// Building it twice costs compile time only, and CLAUDE.md's second
+	// design principle spends compile time freely to avoid runtime cost.
+	overlapPreflight := overlapCanPreflight(spec, buckets) &&
+		((absOK && len(absLits) > 0) || buildUnionScanDFA(spec, opts, 0) != nil)
+	needLiveness := (spec.gated() || overlapPreflight) && fe == frontendScalar
 	if needLiveness {
 		anyNeverDying, anyBoundary := false, false
 		for _, bkt := range buckets {
@@ -1111,7 +1146,16 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// frontend already skips input and beats a table lookup per byte; this
 	// path is for the sets that have nothing to skip with, where the
 	// alternative is visiting every position with every bucket.
-	if fe == frontendScalar && (spec.ScanAll != "" || spec.ScanAny != "") {
+	//
+	// A find-only OVERLAPPING set needs it too, for item 11's preflight: the
+	// alive verdict is what retires a never-dying pattern from validMask, and
+	// without the automaton there is nothing to compute it with. Gated
+	// `find`'s own preflight has always been silently dormant on a find-only
+	// set for this reason; extending the condition to it as well is NOT done
+	// here, because that would change the module of every gated set and this
+	// change is supposed to leave them byte-identical.
+	needUnionForOverlap := cs.overlapPreflightShape() && !cs.usesAbsencePrefilter()
+	if fe == frontendScalar && (spec.ScanAll != "" || spec.ScanAny != "" || needUnionForOverlap) {
 		unionBase := setTablesEnd
 		cs.unionScan = buildUnionScanDFA(spec, opts, unionBase)
 		if cs.unionScan != nil && cs.unionScan.tableEnd > setTablesEnd {
@@ -1938,6 +1982,36 @@ func hasSetFallbackBuckets(cs *compiledSet) bool {
 	return hasSetFallbackBucketsIn(cs.buckets)
 }
 
+// overlapCanPreflight is usesOverlappingFindPreflight's structural half,
+// answered from the raw spec and bucket list — early enough to decide whether
+// the per-bucket liveness table is worth emitting.
+//
+// It must refuse everything the real predicate refuses, or a set gets the
+// table and the per-byte check with no preflight to make either fire, which
+// is §16.5.2's reverted Candidate A: cost on every byte, no exit ever taken.
+// The never-dying and boundary tests are applied by the caller, which is
+// already walking the buckets for them.
+func overlapCanPreflight(spec SetSpec, buckets []*bucket) bool {
+	if spec.Find == "" || !spec.Overlapping {
+		return false
+	}
+	maxID := -1
+	for _, bkt := range buckets {
+		if bkt.sparse {
+			return false
+		}
+		for _, p := range bkt.patterns {
+			if p.globalID > maxID {
+				maxID = p.globalID
+			}
+		}
+	}
+	if spec.IDSpaceSize > maxID+1 {
+		maxID = spec.IDSpaceSize - 1
+	}
+	return maxID+1 <= 64
+}
+
 // hasSetFallbackBucketsIn is the same question about a raw bucket list, for
 // use during compilation before a compiledSet exists.
 func hasSetFallbackBucketsIn(buckets []*bucket) bool {
@@ -1966,7 +2040,12 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// G9 (§18.5): the gated `find` body runs the same union pass once per
 	// drive and writes its result back as §3.16 gate sentinels. Still live —
 	// `find` reports positions and cannot become a union walk.
-	findPreflight := mode == capFind && cs.usesGatedFindPreflight()
+	// Item 11: the OVERLAPPING body runs the same pass, keeping its verdict
+	// in the gate array the caller now supplies for exactly this purpose.
+	// Without it that body walks a never-dying suffix DFA from every start
+	// position and one call is O(n^2).
+	overlapPreflight := mode == capFind && cs.usesOverlappingFindPreflight()
+	findPreflight := mode == capFind && cs.usesGatedFindPreflight() || overlapPreflight
 
 	// G12: the absence prefilter needs one more i32 (its SIMD mask) and a
 	// v128 chunk; the union walk needs neither.
@@ -2001,7 +2080,11 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	if findPreflight {
 		// Before the prologue: emitGateJump reads the gate array, so the
 		// sentinels must already be in place for it to skip ahead correctly.
-		b = emitGatedFindPreflight(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
+		emit := emitGatedFindPreflight
+		if overlapPreflight {
+			emit = emitOverlappingFindPreflight
+		}
+		b = emit(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
 			c.pGate, c.pInLen, tableMemIdx, absence, c.localBase+10, c.localBase+13)
 	}
 	b = c.emitFindPrologue(b, lPos)

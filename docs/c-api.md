@@ -193,7 +193,7 @@ typedef struct {
     const char *input;
     size_t len, offset;
     int done;
-    unsigned gates[<SET>_ID_SPACE];        /* non-overlapping sets only */
+    unsigned gates[<SET>_ID_SPACE];        /* every set with find, either policy */
 } rx_<set>_scanner_t;
 
 int <find>_init(rx_<set>_scanner_t *s, const char *input, size_t len, size_t offset);

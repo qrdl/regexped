@@ -176,10 +176,11 @@ for m in scan_secrets(input, 0) {
 }
 ```
 
-The iterator owns one reusable buffer of `<SET>_PATTERN_COUNT` tuples and, for
-the default non-overlapping configuration, a zeroed gate array of
-`<SET>_ID_SPACE` entries — the gate array is indexed by global pattern id, so
-the two lengths differ for a named subset. It refills at each matching position
+The iterator owns one reusable buffer of `<SET>_PATTERN_COUNT` tuples and a
+zeroed gate array of `<SET>_ID_SPACE` entries — the gate array is indexed by
+global pattern id, so the two lengths differ for a named subset. Both overlap
+policies take the array; see [sets.md](sets.md) for what the overlapping body
+keeps in it. It refills at each matching position
 and yields that position's matches
 one at a time before advancing, so steady-state iteration allocates nothing.
 Dropping and re-creating it restarts the scan; the gate array never appears in

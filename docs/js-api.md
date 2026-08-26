@@ -184,9 +184,9 @@ if (scan_all(input)) { ... }   // ALWAYS true, even with zero matches
 if (scan_all(input).length) { ... }   // what you meant
 ```
 
-The `find` generator owns the gate array for the default (non-overlapping)
-configuration: dropping it and creating a new one restarts the scan with clean
-gates. There is no stateless single-position probe — the generator is the only
+The `find` generator owns the gate array, whichever overlap policy the set
+declares: dropping it and creating a new one restarts the scan with a clean
+array. There is no stateless single-position probe — the generator is the only
 find surface, matching every other language.
 
 `scan_any` and the `_all` pair are backed by `i64` WASM returns, which surface

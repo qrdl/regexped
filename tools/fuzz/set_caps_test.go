@@ -49,8 +49,14 @@ type capRunner struct {
 	inst   *wasmtime.Instance
 	mem    *wasmtime.Memory
 	inBase int32
-	outPtr int32
-	npat   int
+	// gatePtr is the caller-owned array every `find` takes, overlapping
+	// included: the default body records §3.16 match gates in it, the
+	// overlapping one keeps SETS_PLAN item 11's once-per-drive preflight
+	// verdict there. Zeroed by newCapRunner; a test that starts a SECOND
+	// drive on the same runner must zero it again with resetGates.
+	gatePtr int32
+	outPtr  int32
+	npat    int
 	// release frees the wasmtime Store and Module. The runner OUTLIVES
 	// newCapRunner, so this cannot be deferred there — every caller must
 	// `defer r.Close()` instead.
@@ -88,7 +94,8 @@ func newCapRunner(t *testing.T, pats []string, input string, overlapping bool) *
 	if span < pageSize {
 		span = pageSize
 	}
-	outPtr := inBase + span
+	gatePtr := inBase + span
+	outPtr := gatePtr + pageSize
 	needed := uint64((int64(outPtr) + pageSize + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -98,7 +105,19 @@ func newCapRunner(t *testing.T, pats []string, input string, overlapping bool) *
 	if len(input) > 0 {
 		copy(mem.UnsafeData(store)[inBase:], input)
 	}
-	return &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats), release: release}
+	r := &capRunner{store: store, inst: inst, mem: mem, inBase: inBase,
+		gatePtr: gatePtr, outPtr: outPtr, npat: len(pats), release: release}
+	r.resetGates()
+	return r
+}
+
+// resetGates zeroes the gate array, which is how a caller declares the start
+// of a drive. One page covers any id space these tests build.
+func (r *capRunner) resetGates() {
+	buf := r.mem.UnsafeData(r.store)
+	for i := int32(0); i < 65536; i++ {
+		buf[r.gatePtr+i] = 0
+	}
 }
 
 func (r *capRunner) call(t *testing.T, name string, args ...interface{}) interface{} {
@@ -330,7 +349,7 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 					}
 
 					// find: every tuple at the first matching position.
-					total := int(r.call(t, "cap_find", r.inBase, n, f, r.outPtr, int32(r.npat)).(int32))
+					total := int(r.call(t, "cap_find", r.inBase, n, f, r.gatePtr, r.outPtr, int32(r.npat)).(int32))
 					if wantPos < 0 {
 						if total != 0 {
 							t.Fatalf("find(from=%d) = %d, want 0", from, total)
@@ -399,19 +418,19 @@ func TestSetFindOverflowContract(t *testing.T) {
 	defer r.Close()
 	n := int32(len(input))
 
-	full := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.outPtr, int32(len(pats))).(int32))
+	full := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.gatePtr, r.outPtr, int32(len(pats))).(int32))
 	if full != 3 {
 		t.Fatalf("expected all three patterns at position 0, got %d", full)
 	}
 	for _, cap := range []int32{0, 1, 2} {
-		got := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.outPtr, cap).(int32))
+		got := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.gatePtr, r.outPtr, cap).(int32))
 		if got != full {
 			t.Fatalf("find with out_cap=%d returned %d, want the total %d", cap, got, full)
 		}
 	}
 	// Idempotence: after the undersized probes, the full-size call must be
 	// identical to calling it first.
-	again := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.outPtr, int32(len(pats))).(int32))
+	again := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.gatePtr, r.outPtr, int32(len(pats))).(int32))
 	if again != full {
 		t.Fatalf("full-size call after undersized probes returned %d, want %d", again, full)
 	}
@@ -428,7 +447,7 @@ func TestSetFromOutOfRange(t *testing.T) {
 	if got := r.call(t, "cap_scan_all", r.inBase, n, int32(99)).(int64); got != 0 {
 		t.Errorf("scan_all(from>len) = %d, want 0", got)
 	}
-	if got := r.call(t, "cap_find", r.inBase, n, int32(99), r.outPtr, int32(2)).(int32); got != 0 {
+	if got := r.call(t, "cap_find", r.inBase, n, int32(99), r.gatePtr, r.outPtr, int32(2)).(int32); got != 0 {
 		t.Errorf("find(from>len) = %d, want 0", got)
 	}
 }

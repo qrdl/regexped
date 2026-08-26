@@ -221,8 +221,8 @@ export function patternName(id: i32): string
 ```
 
 The iterator is caller-owned: two scans can be in flight at once, and creating
-a new one restarts the scan. It owns its tuple buffer and — for the default
-non-overlapping `find` — its gate array, so gates never appear here.
+a new one restarts the scan. It owns its tuple buffer and its gate array —
+both overlap policies take one — so neither ever appears here.
 
 `<match_all>`/`<scan_all>` return an `Array<i32>` of pattern ids, **not** a
 boolean. `<scan_any>` decomposes the engine's packed `i64` for you.

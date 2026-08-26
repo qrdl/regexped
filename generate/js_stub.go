@@ -148,7 +148,7 @@ export function %s(input, from = 0) {
 		}
 		if s.Find != "" {
 			gateSetup, gateArg, gateDoc := "", "", ""
-			if gatedFind(s) {
+			if findGateArray(s) {
 				gateSetup = fmt.Sprintf(`    const gateBase = %s;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, gateBase, idKonst)
@@ -203,7 +203,7 @@ export function %s(input, from = 0) {
 				// than a second function — and why it is opt-in, since a
 				// caller who stops early has paid for matches never looked at.
 				batchGateSetup := ""
-				if gatedFind(s) {
+				if findGateArray(s) {
 					batchGateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, idKonst)

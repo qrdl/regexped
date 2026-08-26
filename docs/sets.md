@@ -280,6 +280,10 @@ inside the module:
 find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> i32
 ```
 
+The parameter is present for **every** `find`, `overlapping: true` included —
+see the end of this section for what the overlapping body keeps there instead
+of gates. One signature, whatever the patterns turn out to compile to.
+
 - `gate_ptr` points at `id_space_size` u32s in the caller's memory — the array
   is indexed by global pattern id, so it is sized from the id space and not
   from the pattern count (see the constants table below).
@@ -304,9 +308,20 @@ Keeping the state visible is what makes `find` resumable at *any* index: an
 array held inside the module would silently carry gates from an earlier scan
 into a caller that meant to start fresh.
 
-With `overlapping: true` there is no gate array and no gate parameter at all.
+With `overlapping: true` the array is still there and still zeroed the same
+way, but nothing in it is a gate. That body reports every match at every start
+position, so it retires nothing. It uses the array for the one other thing a
+caller-owned, per-drive allocation is good for: remembering, across the calls
+of one drive, which patterns were shown to match **nowhere** at or after the
+drive's first `from`. Computing that once retires a pattern whose automaton
+never dies — the shape that otherwise makes a single overlapping call
+quadratic in the input — from every position at once.
 
-A batching `find` carries the same gate array, and none when overlapping. It
+So the rule is the same in both modes and needs no `overlapping`-dependent
+code: allocate `id_space_size` u32s, zero them to begin a drive, pass the
+pointer, never read them.
+
+A batching `find` carries the same gate array in both modes. It
 differs in one respect, and only internally: it records gates for the matches
 it DELIVERED rather than only for a position that fitted whole.
 That is what lets it resume inside a split position — the patterns already

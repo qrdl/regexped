@@ -202,8 +202,8 @@ that hazard is fixed, so it is no longer part of the reason.)
 The types make the `_any`/`_all` shapes explicit, which is the difference from
 the JavaScript stub — there, `if (scanAll(x))` is always true because an empty
 array is truthy. `<scan_any>` reports **no position**, only an id: see
-[sets.md](sets.md) for why that is what makes it cheap. The `find` generator owns the gate array for the default
-non-overlapping configuration; creating a new one restarts the scan.
+[sets.md](sets.md) for why that is what makes it cheap. The `find` generator owns the gate array under either overlap policy;
+creating a new one restarts the scan.
 
 **Calling other stub functions while a generator is suspended is safe**, as is
 running or nesting two generators over different inputs. Each live generator

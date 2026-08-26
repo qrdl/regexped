@@ -148,7 +148,7 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> {
 		if s.Find != "" {
 			iterName := config.PascalCaseForValidation(s.Find) + "Iter"
 			gateField, gateInit, gateArg := "", "", ""
-			if gatedFind(s) {
+			if findGateArray(s) {
 				decl(s.Find, "(ptr: usize, len: i32, from: i32, gates: usize, out: usize, cap: i32): i32")
 				gateField = "    gates: StaticArray<u32>;\n"
 				gateInit = "        this.gates = new StaticArray<u32>(" + idKonst + ");\n"

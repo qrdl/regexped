@@ -143,7 +143,7 @@ func TestSparsePromotionCapabilities(t *testing.T) {
 						t.Fatalf("scan_all(from=%d) = %v, want %v", from, gotScanAll, wantScanAll)
 					}
 
-					total := int(r.call(t, "cap_find", r.inBase, in, f, r.outPtr, int32(r.npat)).(int32))
+					total := int(r.call(t, "cap_find", r.inBase, in, f, r.gatePtr, r.outPtr, int32(r.npat)).(int32))
 					if wantPos < 0 {
 						if total != 0 {
 							t.Fatalf("find(from=%d) = %d, want 0", from, total)

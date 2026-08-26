@@ -300,7 +300,11 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 	if inputSpan < pageSize {
 		inputSpan = pageSize
 	}
-	outBase := inBase + inputSpan
+	// The gate array, which every `find` takes since SETS_PLAN item 11 —
+	// overlapping sets record no gates in it and keep the once-per-drive
+	// preflight verdict there instead. Zeroing it starts the drive.
+	gateBase := inBase + inputSpan
+	outBase := gateBase + pageSize
 	outCap := int32(numPatterns)
 	outBytes := int64(outCap) * 12
 
@@ -309,6 +313,9 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 		if _, growErr := mem.Grow(store, neededPages-cur); growErr != nil {
 			return nil, false, fmt.Errorf("memory.Grow to %d pages: %w", neededPages, growErr)
 		}
+	}
+	for i := int32(0); i < pageSize; i++ {
+		mem.UnsafeData(store)[gateBase+i] = 0
 	}
 	if len(input) > 0 {
 		copy(mem.UnsafeData(store)[inBase:], input)
@@ -319,7 +326,7 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 	prevStart := -1
 	for {
 		wd.Arm(store)
-		res, callErr := fn.Call(store, inBase, int32(len(input)), from, outBase, outCap)
+		res, callErr := fn.Call(store, inBase, int32(len(input)), from, gateBase, outBase, outCap)
 		wd.Disarm()
 		if callErr != nil {
 			if isTimeout(callErr) {

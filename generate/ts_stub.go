@@ -297,7 +297,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		}
 		if s.Find != "" {
 			gateSetup, gateArg := "", ""
-			if gatedFind(s) {
+			if findGateArray(s) {
 				gateSetup = fmt.Sprintf(`    const gateBase = %s;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, gateBase, idKonst)
@@ -340,7 +340,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 					btOverflow, btOverflowMsg(s.Find), konst, konst)
 			} else {
 				batchGateSetup := ""
-				if gatedFind(s) {
+				if findGateArray(s) {
 					batchGateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, idKonst)

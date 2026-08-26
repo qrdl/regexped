@@ -159,10 +159,21 @@ type setFindCtx struct {
 	localBase byte
 	lPos      byte
 
-	// gated selects the default, per-pattern non-overlapping body.
-	// pGate then names the gate-array parameter.
+	// gated selects the default, per-pattern non-overlapping body: the
+	// §3.16 pre-mask, the write-time empty-extent rule and the write-back.
 	gated bool
+	// pGate names the gate-array parameter, which EVERY `find` body has
+	// since SETS_PLAN item 11 — the overlapping one included, where the
+	// array holds no match gates at all. So the presence of the parameter
+	// and the applicability of the gate RULE are two different questions:
+	// this field answers neither on its own. Ask `gated` for the rule and
+	// readsGate() for whether anything is loaded from the array.
 	pGate byte
+	// preflight is true when this body emits the overlapping preflight and
+	// therefore has something to read out of the array. Without it an
+	// overlapping body still carries the pointer but never loads from it, so
+	// every set that gains no preflight stays byte-identical.
+	preflight bool
 
 	// batch marks this body as the hidden per-position WORKER of a
 	// find_batch export rather than the exported `find`.
@@ -305,7 +316,7 @@ func (c *setFindCtx) emitPrefixChecks(b []byte, bi int, g prefixLenGroup, posLoc
 	if g.L == 0 {
 		return b
 	}
-	perBitGuard := c.gated && bitsInMask(g.mask) > 1
+	perBitGuard := c.readsGate() && bitsInMask(g.mask) > 1
 	for k, fnIdx := range c.cs.prefixFnIdx[bi] {
 		if k >= 32 || fnIdx < 0 {
 			continue
@@ -414,7 +425,7 @@ func (c *setFindCtx) emitCommit(b []byte, btBucket bool) []byte {
 // gate[k] is indexed by GLOBAL pattern id, so the byte offset is a
 // compile-time constant per pattern and the load needs no arithmetic.
 func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
-	if !c.gated || c.sparseBucket(bi) {
+	if !c.readsGate() || c.sparseBucket(bi) {
 		return b
 	}
 	first := true
@@ -598,8 +609,19 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 // the dead case for EVERY group at EVERY candidate. On setperf's keywords-128
 // row that was ten wasted instructions per group per candidate.
 func (c *setFindCtx) maskCanBeEmpty(bi int, g prefixLenGroup) bool {
-	return c.gated || c.maskEmptyFromAnchors(bi, g)
+	return c.readsGate() || c.maskEmptyFromAnchors(bi, g)
 }
+
+// readsGate reports whether this body loads from the gate array at all, and
+// is the condition on every per-position gate test.
+//
+// It is deliberately NOT "does pGate exist": an overlapping body that emits
+// no preflight carries the pointer for signature uniformity and must still
+// emit no loads, so that every set which gains nothing from SETS_PLAN item 11
+// stays byte-identical to before it. That is what the setperf run confirms —
+// the 29 overlapping rows without a preflight moved by the one instruction
+// that pushes the extra argument, and by nothing else.
+func (c *setFindCtx) readsGate() bool { return c.gated || c.preflight }
 
 // maskEmptyFromAnchors reports whether emitGroupMask alone can leave the group
 // with no eligible pattern — true only for a trivial-prefix group whose every
@@ -753,6 +775,12 @@ func (cs *compiledSet) jumpIsProfitable() bool {
 // `from` — one never-matched pattern pins the minimum at 0 — which is why the
 // mask skip above, not this, is the load-bearing half.
 func (c *setFindCtx) emitGateJump(b []byte, lPos byte) []byte {
+	// Gated bodies only, and MEASURED so rather than assumed. An overlapping
+	// body's gates hold 1 for an alive pattern, so the minimum over
+	// `gate[id] >> 1` is 0 the moment anything is alive and the jump can only
+	// pay in the all-dead case — where emitEmptyMaskSkip already makes each
+	// position nearly free. Emitting it there cost 1.6M fuel on
+	// greedy-3 / 50K a's and 119K on the no-match row, and saved nothing.
 	if !c.gated {
 		return b
 	}
@@ -853,7 +881,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		// emitted only where it can actually fire — unconditional emission is
 		// dead code in the common literal-set shape (see maskCanBeEmpty), and
 		// for a single-pattern gated group the two collapse into one branch.
-		if c.gated && bitsInMask(g.mask) == 1 && !c.maskEmptyFromAnchors(bi, g) {
+		if c.readsGate() && bitsInMask(g.mask) == 1 && !c.maskEmptyFromAnchors(bi, g) {
 			b = c.emitGateSkipSingle(b, bi, g)
 		} else {
 			if c.mode == capFind {
@@ -1288,22 +1316,21 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 			c.pOutPtr = 3
 			c.localBase = 4
 		}
-	case gated:
+	default:
+		// Both `find` flavours: (ptr, len, from, gate, out, cap).
 		c.pGate, c.pOutPtr, c.pOutCap = 3, 4, 5
 		c.localBase = 6
-		if batch {
+		switch {
+		case batch && gated:
 			// The shared worker's trailing argument: 0 = `find`'s
 			// transactional gate rule, non-zero = §19's deliver-and-gate.
 			c.pBatchMode = 6
 			c.localBase = 7
+		case hasSkip:
+			c.pSkip = 6
+			c.localBase = 7
 		}
-	default:
-		c.pOutPtr, c.pOutCap = 3, 4
-		c.localBase = 5
-		if hasSkip {
-			c.pSkip = 5
-			c.localBase = 6
-		}
+		c.preflight = !gated && cs.usesOverlappingFindPreflight()
 	}
 	c.lPos = c.localBase
 	c.lTotal = c.localBase + 1
