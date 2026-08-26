@@ -243,6 +243,23 @@ budget binds first: past 256 states a table switches to u16 cells, and 64 KB of
 those is 128 states — so a merge over ~255 states is declined and the group
 keeps its split packing.
 
+Three further refusals are about what a sparse body CANNOT see, and each exists
+because ignoring it produced wrong answers rather than slow ones:
+
+- any pattern with a **non-trivial prefix** — the body carries one prefix length
+  for the whole bucket and subtracts it from every tuple's start, so a bucket
+  holding several lengths reports most of its matches at the wrong start
+  (negative, near position 0); and the prefix DFAs that confirm such a prefix
+  are driven by a 32-bit mask, so patterns past the 32nd would never be checked;
+- any pattern anchored with **`\A` or `(?m:^)`** — that eligibility is enforced
+  by OR-ing the pattern's bit into `validMask` only where the position allows,
+  so the rule lives in the mask rather than the DFA and the body cannot see it;
+- any pattern already in a **Backtracking bucket**, which has no table to merge.
+
+The general rule behind all three: for a sparse bucket, any constraint carried
+by the driver's i32 mask is invisible to the body. Either refuse the bucket or
+move the constraint into the body — never assume the mask still speaks for it.
+
 ---
 
 ## Find-mode fast-skip

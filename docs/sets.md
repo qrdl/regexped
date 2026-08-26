@@ -410,13 +410,33 @@ suffix DFAs within each group:
 | Constraint | Default | Config field |
 |---|---|---|
 | Max patterns per bitmask bucket | 32 | `bitmask_width` (internal) |
+| Max patterns per sparse-set bucket | 4096 | `max_patterns_per_bucket` (internal) |
 | Max merged DFA table bytes | 64 KB | `budget_bytes` (internal) |
 | Max merged DFA states | 512 | `budget_states` (internal) |
 | Pre-filter (states × combined classes) | 65536 | `budget_states_prefilter` (internal) |
 | Max fallback-bucket DFA states | 1024 | `max_fallback_states` (top-level config key) |
 
-Patterns that cannot be merged (no mandatory literal, literal inside quantifier,
-budget exceeded) route to fallback buckets that scan every input position.
+A bucket holding more than 32 patterns switches its accept representation from
+a bitmask to a per-state LIST of pattern indices, which is what lets a group of
+patterns stay in ONE bucket instead of splitting into `ceil(N/32)` of them —
+each split otherwise costs its own DFA walk. This applies to all three
+packings: patterns sharing a mandatory literal, literal-less patterns in a
+fallback bucket, and the anchored automata behind `match_any` / `match_all`.
+The promotion is conservative and is declined when the merged DFA misses the
+state or byte budget above, when any pattern carries a non-trivial prefix, or
+when any pattern is `\A`- or `(?m:^)`-anchored. `--diag-json` reports such a
+bucket with `"type": "sparse-set"`, so whether it happened is never a guess.
+
+Patterns that cannot be merged route to fallback buckets that scan every input
+position. The causes are: no mandatory literal; the literal sitting inside a
+quantifier; a merge that exceeds the budgets above; and a **variable-length
+prefix** — where the bytes before the mandatory literal can have more than one
+length, as in `a{0,2}XYZ` or `a?a`. That last one is a correctness requirement
+rather than a budget: the split representation recovers a match start from a
+literal occurrence by subtracting one fixed prefix length, so a prefix with
+several possible lengths would silently lose the matches that use any length
+but the longest.
+
 Under the set's own `hints: [prefer-match]`, two patterns that are each
 individually eligible for the single-pattern counted-class-chain
 optimisation (e.g. `[0-9]{8}`-style bounded class runs) are never merged
