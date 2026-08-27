@@ -220,6 +220,17 @@ export function* scan_secrets(input, offset?, batchSize?): Generator<SetMatch>
 `[1, <set>BatchMaxSize]`. The limit is the cursor layout rather than a policy,
 and never binds in practice — 524,287 tuples is a 6 MB buffer.
 
+**On an `overlapping: true` set the JS/TS iterator also reserves an answer
+cache** for the duration of one iteration, and that reservation is large: 12
+bytes per pattern per input byte, so 3 patterns over a 100 KB input is about
+3.6 MB. It is a reservation, not a cost: the sweep described under "Overlap
+policy" runs only when the drive proves expensive, and on the scans where the
+walk is already fast the memory is never touched. What it buys, when it does
+run, is the difference between a linear drive and a quadratic one on
+unbounded-tail patterns. Past 64 MiB the stub reserves nothing and the drive
+walks instead, so the memory is bounded even on very large inputs. Sets without
+`overlapping: true` reserve none of this.
+
 #### The cursor
 
 The cursor is one `i64`, and it is **opaque**: the stub passes back the value
@@ -259,6 +270,20 @@ want to see every possible match rather than a non-overlapping selection, and
 it is measurably faster to *emit* (no gating code at all) — but on greedy or
 unbounded-tail patterns it is quadratic in the input, because every start runs
 a DFA to its own extent. The default exists to avoid that.
+
+Adding `hints: [batch-find]` to an overlapping set removes most of that
+quadratic cost. The batching entry can be handed a scratch region, and it will
+use it if — and only if — the drive turns out to be expensive: it walks,
+counting the bytes it has matched, and once that exceeds what a single backward
+sweep would cost it sweeps the rest of the input in one pass and answers the
+remaining calls out of the result. A scan the walk handles cheaply never
+sweeps and costs exactly what it did before.
+
+The generated JS and TypeScript stubs reserve that region for you and size it
+from the input; the other stubs do not expose the batching entry, and a direct
+WASM caller opts in by passing a region (see "The overlapping answer cache" in
+[wasm.md](wasm.md)). It is optional everywhere, and declining it — or offering
+too little — changes the speed and never the answer.
 
 `overlapping` affects `find` and nothing else. On a set without it the key is
 silently ignored — there is no find body for it to select, so it has no

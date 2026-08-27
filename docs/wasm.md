@@ -338,9 +338,13 @@ WASM functions for multi-pattern matching.
 ;;
 ;; Both entries are driven by ONE shared per-position worker, so a batching set
 ;; carries one set of bucket code rather than two.
+;;
+;; $cache_ptr/$cache_len are OPTIONAL scratch — pass 0, 0 to decline. See "The
+;; overlapping answer cache" below.
 (func $<find>_batch                                  ;; both overlap policies
     (param $in_ptr i32) (param $in_len i32) (param $cursor i64)
     (param $gate_ptr i32) (param $out_ptr i32) (param $out_cap i32)
+    (param $cache_ptr i32) (param $cache_len i32)
     (result i64))
 ```
 
@@ -400,6 +404,75 @@ sentinel** with count 0, so the ordinary loop terminates rather than spinning on
 a cursor that can never advance. This is a deliberate asymmetry with `find`,
 where the same input is a legal size probe: `find` returns a count, which a probe
 can use, while the batch entry returns a resumable cursor, which a probe cannot.
+
+### The overlapping answer cache
+
+`overlapping: true` reports every start position, so a pattern whose automaton
+never dies — `[^\n]*ERROR` on newline-free input — walks to the end of the
+input from every one of them, and the drive is quadratic in the input length.
+
+The last two parameters of the batch entry let the caller break that. Given a
+region it can fill, the engine may sweep the input **once**, right to left,
+computing every `(start, pattern, extent)` tuple in one pass, and then serve
+the rest of the drive by copying out of it. The sweep reads the same forward
+transition and accept tables the ordinary body reads and emits no tables of its
+own.
+
+**Engagement is adaptive, and that is the point.** The sweep costs a flat
+`states x patterns` per input byte, while the walk's cost depends on the data —
+on most inputs the walk is far cheaper, and sweeping regardless loses badly.
+Nor can the choice be made at compile time: `a+` never dies on 50,000 `a`s and
+dies on the first byte of ordinary text, so one set wants opposite answers on
+different inputs.
+
+So the drive decides for itself. It walks, counting the bytes it has matched,
+and switches only once that count exceeds what the sweep would have cost — at
+which point the sweep is at worst a second helping of work already spent, and
+it removes a quadratic tail. The switch happens at a position boundary and the
+sweep covers only the positions not yet delivered, so the handover is invisible
+to the caller: matches keep arriving in the same order with none repeated or
+dropped. A drive that never crosses the line never sweeps, and costs what it
+cost before the cache existed.
+
+| Parameter | Meaning |
+|---|---|
+| `cache_ptr` | Caller-owned region, or **0 to decline** |
+| `cache_len` | Its size in bytes |
+
+The rules:
+
+- **It is optional.** `cache_ptr = 0` is legal and is what a caller who does
+  not want to pay for it passes. The drive then walks position by position.
+- **Zero the first 16 bytes** before the first call of a drive, exactly as you
+  zero the gate array. The header holds the "ready" flag and the drive's
+  accumulated work, and zero is the honest starting value for both — so no
+  magic value is needed. The rest of the region needs no zeroing: it is written
+  before it is read.
+- **Too small is not an error.** The sweep refuses a region it cannot fill and
+  the drive falls back to walking. The answer is identical, only slower. This
+  is the same rule `out_cap` underflow has.
+- **Size it at `16 + (in_len + 1) * PATTERN_COUNT * 12`.** Twelve bytes per
+  tuple, and the worst case really is one tuple per pattern per start position:
+  a pattern that never dies matches from nearly every start, which is the case
+  the cache exists for.
+- **Offer all of it or none of it.** A short region makes the sweep run and
+  *then* discover it cannot finish — the one outcome strictly worse than never
+  sweeping. The generated JS/TS stubs cap what they will reserve at 64 MiB and
+  pass `0, 0` beyond that rather than pass a truncated region.
+- **The cache belongs to one drive.** It holds the answer for one `(input,
+  pattern set)` pair; re-zero the header to start a new drive.
+
+The engine may decline even when offered a large enough region: the sweep is
+emitted only where it reproduces the per-position semantics exactly (one
+bucket, no anchors, no word-boundary or newline channel, a dense accept mask,
+no Backtracking member). Declining is invisible from the caller's side and
+costs nothing but speed.
+
+While the cache is live the cursor's high half carries a **tuple index** rather
+than a text position. Both are opaque, which is what lets a drive change from
+one to the other when it switches: the call that switches returns the first
+index-form cursor, and every later call reads it as an index. Pass the value
+back unchanged and the change is invisible.
 
 ### find return value and overflow
 

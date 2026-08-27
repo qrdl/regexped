@@ -529,14 +529,15 @@ func (cs *compiledSet) fullIDMask() uint64 {
 // scan really is at start of text and `^`/\A may fire, so the begin-context
 // state is correct; at from > 0 it is not, and midStart is. Getting that wrong
 // is silent, which is why it is restated here rather than assumed.
-func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal byte, tableMemIdx int) []byte {
+// fromIdx is the index of an i32 holding the position the walk starts at —
+// see emitLiteralAbsenceMask for why it is not the hardcoded 2 it once was.
+func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fromIdx byte, tableMemIdx int) []byte {
 	const (
 		pInPtr = 0
 		pInLen = 1
-		pFrom  = 2
 	)
 	b = append(b, 0x42, 0x00, 0x21, aliveLocal)
-	b = append(b, 0x20, pFrom, 0x45)
+	b = append(b, 0x20, fromIdx, 0x45)
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(u.startState))
@@ -546,7 +547,7 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal byte
 	b = utils.AppendSLEB128(b, int32(u.midStartState))
 	b = append(b, 0x21, lState)
 	b = append(b, 0x0B)
-	b = append(b, 0x20, pFrom, 0x21, lPos)
+	b = append(b, 0x20, fromIdx, 0x21, lPos)
 
 	// Entry-state accepts: a pattern matching EMPTY at `from` accepts here and
 	// nowhere else (the §18.7 fix, for the same reason as in the scan body).
@@ -694,7 +695,7 @@ func (cs *compiledSet) overlapPreflightShape() bool {
 // One further gift: with every pattern dead, emitGateJump's minimum over
 // `gate[id] >> 1` is len + 1, so the scan cursor jumps past the end and the
 // call returns 0 without entering the loop.
-func emitOverlappingFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
+func emitOverlappingFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen, fromIdx byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
 	ids := setPatternIDs(cs)
 	if len(ids) == 0 {
 		return b
@@ -716,9 +717,9 @@ func emitOverlappingFindPreflight(b []byte, cs *compiledSet, lPos, lState, alive
 	b = append(b, 0x04, 0x40) // if the drive is fresh
 
 	if absence {
-		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal)
+		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal, fromIdx)
 	} else {
-		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, tableMemIdx)
+		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, fromIdx, tableMemIdx)
 	}
 
 	for _, gid := range ids {
@@ -768,7 +769,7 @@ func emitOverlappingFindPreflight(b []byte, cs *compiledSet, lPos, lState, alive
 //     which §3.14 already requires.
 //
 // Both are documented in docs/sets.md.
-func emitGatedFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
+func emitGatedFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen, fromIdx byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
 	ids := setPatternIDs(cs)
 	if len(ids) == 0 {
 		return b
@@ -789,9 +790,9 @@ func emitGatedFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal,
 	if absence {
 		// G12: prove absence by literal search instead of walking the union
 		// automaton — same over-approximating contract, ~15x cheaper.
-		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal)
+		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal, fromIdx)
 	} else {
-		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, tableMemIdx)
+		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, fromIdx, tableMemIdx)
 	}
 
 	// gate[id] = 2*len + 2 for every id the pass proved dead.

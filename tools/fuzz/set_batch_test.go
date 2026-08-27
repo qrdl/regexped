@@ -107,7 +107,10 @@ func runBatchFind(t *testing.T, pats []string, input string, outCap int32, overl
 		// One signature for both flavours since SETS_PLAN item 11: the
 		// overlapping entry records no match gates but takes the array as the
 		// per-drive home of its preflight verdict.
-		args := []interface{}{inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap}
+		// The scratch pair is zero here: SETS_PLAN item 11 stage C's tuple
+		// cache is OFF, so this drives the ordinary walk. That is deliberate —
+		// this test is the walk's contract, and the cache has its own.
+		args := []interface{}{inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap, int32(0), int32(0)}
 		res, err := fn.Call(store, args...)
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
@@ -341,7 +344,7 @@ func TestFindBatchZeroCap(t *testing.T) {
 
 			// The `from` of the very first call is 0, which is also a legal
 			// resume position — the value the pre-fix body handed back.
-			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), gatePtr, outPtr, int32(0))
+			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), gatePtr, outPtr, int32(0), int32(0), int32(0))
 			if err != nil {
 				t.Fatalf("set_find_batch: %v", err)
 			}

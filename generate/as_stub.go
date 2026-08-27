@@ -494,6 +494,10 @@ func asABIParam(p abiParam) string {
 		return "cap: i32"
 	case abiCursor:
 		return "cursor: i64"
+	case abiScratchPtr:
+		return "scratchPtr: usize"
+	case abiScratchLen:
+		return "scratchLen: i32"
 	}
 	panic("generate: unknown abiParam")
 }

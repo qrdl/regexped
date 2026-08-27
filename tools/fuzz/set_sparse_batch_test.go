@@ -105,7 +105,7 @@ func TestSparseGatedBatchDeliversEveryPattern(t *testing.T) {
 					if calls > maxCalls {
 						t.Fatalf("cap=%d: batch did not terminate after %d calls", outCap, calls)
 					}
-					res, err := fn.Call(store, inBase, int32(0), cursor, gatePtr, outPtr, outCap)
+					res, err := fn.Call(store, inBase, int32(0), cursor, gatePtr, outPtr, outCap, int32(0), int32(0))
 					if err != nil {
 						t.Fatalf("cap=%d: %v", outCap, err)
 					}

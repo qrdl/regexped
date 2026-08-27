@@ -547,12 +547,18 @@ type setRunner struct {
 	outBase int32
 	gatePtr int32
 	bmpPtr  int32
-	npat    int    // patterns IN THE SET — sizes the tuple buffer and the cursor's k
-	idSpace int    // largest reportable global id + 1 — sizes gates and bitmaps
-	inSet   []bool // by chunk index: is this pattern a member of the set?
-	outCap  int32  // = npat: the exact worst case for one position (§3.11)
-	bmpLen  int32
-	wide    bool // idSpace > 64: the `_all` capabilities take an out_ptr
+	// cachePtr/cacheLen are the OVERLAPPING answer cache (SETS_PLAN item 11
+	// stage C). Sized for the LONGEST input in the chunk so one region serves
+	// every drive, and zero when that would exceed the ceiling the generated
+	// stubs use — declining is legal and costs speed, not correctness.
+	cachePtr int32
+	cacheLen int32
+	npat     int    // patterns IN THE SET — sizes the tuple buffer and the cursor's k
+	idSpace  int    // largest reportable global id + 1 — sizes gates and bitmaps
+	inSet    []bool // by chunk index: is this pattern a member of the set?
+	outCap   int32  // = npat: the exact worst case for one position (§3.11)
+	bmpLen   int32
+	wide     bool // idSpace > 64: the `_all` capabilities take an out_ptr
 
 	// Patterns this compile excluded; see the dropHandler comment.
 	droppedFind     map[int]bool
@@ -876,7 +882,14 @@ func newSetRunner(
 	gatePtr := outBase + int32(patternCount)*int32(setOutTupleBytes)
 	bmpLen := int32((idSpace + 7) / 8)
 	bmpPtr := gatePtr + int32(idSpace)*4
-	top := int64(bmpPtr) + int64(bmpLen) + 16
+	cachePtr := (bmpPtr + bmpLen + 15) &^ 7
+	cacheLen := int32(0)
+	if want := config.SetOverlapCacheBytes(maxLen, patternCount); want <= config.SetOverlapCacheMaxBytes {
+		cacheLen = int32(want)
+	} else {
+		cachePtr = 0
+	}
+	top := int64(cachePtr) + int64(cacheLen) + 16
 	needed := uint64((top + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -887,6 +900,7 @@ func newSetRunner(
 	return &setRunner{
 		store: store, inst: inst, mem: mem, wd: wd, release: release,
 		inBase: inBase, outBase: outBase, gatePtr: gatePtr, bmpPtr: bmpPtr,
+		cachePtr: cachePtr, cacheLen: cacheLen,
 		npat: patternCount, idSpace: idSpace, inSet: inSet,
 		outCap: int32(patternCount), bmpLen: bmpLen,
 		wide:        wideAll,
@@ -1139,16 +1153,25 @@ func runSetProfile(
 					caps = caps[:1]
 				}
 				for _, cap := range caps {
-					gotM, hang, e := r.driveFindBatch(c.findBatch, text, c.spec.overlapping, cap)
-					if e != nil {
-						return e
+					// Both engines behind the one export: without the cache
+					// (the ordinary walk) and with it.
+					for _, withCache := range []bool{false, true} {
+						gotM, hang, e := r.driveFindBatch(c.findBatch, text, c.spec.overlapping, cap, withCache)
+						if e != nil {
+							return e
+						}
+						if hang {
+							setStats.timeouts++
+							continue
+						}
+						cacheLbl := "nocache"
+						if withCache {
+							cacheLbl = "cache"
+						}
+						label := fmt.Sprintf("find_batch/%s/cap=%s/%s", mode,
+							batchCapLabel(cap, r.outCap), cacheLbl)
+						compareSetMatches(chunk, strs, si, orc, gotM, c.spec.overlapping, label, verbose, r.findEligible)
 					}
-					if hang {
-						setStats.timeouts++
-						continue
-					}
-					label := fmt.Sprintf("find_batch/%s/cap=%s", mode, batchCapLabel(cap, r.outCap))
-					compareSetMatches(chunk, strs, si, orc, gotM, c.spec.overlapping, label, verbose, r.findEligible)
 				}
 			}
 
@@ -1264,9 +1287,28 @@ func (r *setRunner) driveFind(fn *wasmtime.Func, text string, overlapping bool) 
 // buffer capacity. A capacity of ONE splits every multi-match position, which
 // is what makes §19's resume path (delivered-tuple gating when gated, the
 // `skip` parameter when overlapping) reachable at corpus scale.
-func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping bool, outCap int32) (map[int32][][2]int, bool, error) {
+//
+// withCache offers the SETS_PLAN item 11 stage C answer cache. Both settings
+// are driven over the corpus because they are two different engines behind
+// one export: declined, the drive walks position by position; offered, an
+// eligible overlapping set may sweep the input once and serve from the
+// result. Driving only one of them leaves the other unchecked at corpus
+// scale, and "the answer was right" says nothing about which ran.
+func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping bool, outCap int32, withCache bool) (map[int32][][2]int, bool, error) {
 	got := make(map[int32][][2]int)
 	r.zeroGates()
+	cachePtr, cacheLen := int32(0), int32(0)
+	if withCache {
+		cachePtr, cacheLen = r.cachePtr, r.cacheLen
+		if cachePtr != 0 {
+			// The caller zeroes the header to start a drive, exactly as it
+			// zeroes the gate array.
+			buf := r.buf()
+			for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
+				buf[cachePtr+i] = 0
+			}
+		}
+	}
 	countMask := int64(1)<<uint(config.SetCursorCountBits(r.npat)) - 1
 	cursor := int64(0)
 	maxCalls := 8*(len(text)+1)*(r.npat+1) + 16
@@ -1277,7 +1319,7 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 		var res interface{}
 		var hang bool
 		var err error
-		res, hang, err = r.call(fn, r.inBase, int32(len(text)), cursor, r.gatePtr, r.outBase, outCap)
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), cursor, r.gatePtr, r.outBase, outCap, cachePtr, cacheLen)
 		if err != nil || hang {
 			return nil, hang, err
 		}
@@ -1443,7 +1485,7 @@ func (r *setRunner) checkFromOutOfRange(
 			var res interface{}
 			var hang bool
 			var err error
-			res, hang, err = r.call(findBatch, r.inBase, tlen, cursor, r.gatePtr, r.outBase, r.outCap)
+			res, hang, err = r.call(findBatch, r.inBase, tlen, cursor, r.gatePtr, r.outBase, r.outCap, int32(0), int32(0))
 			if err != nil {
 				return err
 			}

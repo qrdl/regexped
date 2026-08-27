@@ -344,6 +344,41 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				batchGateSetup := fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, idKonst)
+				// SETS_PLAN item 11 stage C. An OVERLAPPING drive reports
+				// every start position, so a pattern whose automaton never
+				// dies is quadratic: each position walks to the end of the
+				// input. Handing the engine a cache lets it sweep once,
+				// backwards, and serve every later call by copying out of it.
+				//
+				// Offered only for `overlapping: true`, because that is the
+				// only policy whose drive the sweep can answer. The engine
+				// may still decline — the sweep refuses shapes it cannot
+				// reproduce exactly — and declining costs nothing but speed.
+				//
+				// The gate array and the >64-pattern bitmap sit between the
+				// tuple buffer and the cache, and the bitmap's width is
+				// ceil(ID_SPACE/8) — not a multiple of 4. The cache header is
+				// read through a Uint32Array, and a typed-array view whose
+				// byte offset is not a multiple of its element size THROWS, so
+				// the gap is rounded up to the same 8 _align uses.
+				batchGateRegion := 4*idN + bitmapBytes(s, cfg)
+				cachePre, cacheReserve, cachePost, cacheArgs := "", "", "", "0, 0"
+				if s.Overlapping {
+					batchGateRegion = (batchGateRegion + 7) &^ 7
+					cachePre = fmt.Sprintf(`    // Twelve bytes per tuple, and the worst case really is one tuple per
+    // pattern per start: a pattern that never dies matches from nearly
+    // every position, which is the case this exists for. Past the ceiling
+    // the engine is offered nothing and walks position by position, which
+    // is what it did before this existed.
+    const cacheNeeded = %d + (_inCap(input) + 1) * %s * 12;
+    const cacheBytes = cacheNeeded <= %d ? cacheNeeded : 0;
+`, config.SetOverlapCacheHeaderBytes, konst, config.SetOverlapCacheMaxBytes)
+					cacheReserve = " + cacheBytes"
+					cachePost = fmt.Sprintf(`    const cacheBase = cacheBytes > 0 ? gateBase + %d : 0;
+    if (cacheBase !== 0) new Uint32Array(_mem.buffer, cacheBase, %d).fill(0);
+`, batchGateRegion, config.SetOverlapCacheHeaderBytes/4)
+					cacheArgs = "cacheBase, cacheBytes"
+				}
 				fmt.Fprintf(&out, `// batchSize is how many tuples one WASM call may fill: 1 is a call per
 // matching position, larger values amortise the host crossing over a
 // bufferful. The matches and their order are identical either way — the only
@@ -351,15 +386,15 @@ func genTSSetSection(cfg config.BuildConfig) string {
 // into [1, %s].
 export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: number = %d): Generator<SetMatch> {
     batchSize = Math.min(Math.max(batchSize | 0, 1), %s);
-    // This iterator's own region, held until it finishes — see _open.
-    const [_inBase, _outBase, len] = _open(input, 12*batchSize + %d);
+%s    // This iterator's own region, held until it finishes — see _open.
+    const [_inBase, _outBase, len] = _open(input, 12*batchSize + %d%s);
     try {
-%s    let cursor = BigInt(offset) << 32n;
+%s%s    let cursor = BigInt(offset) << 32n;
     // Hoisted for the same reason the per-position shape hoists its view, and
     // re-attached by _att when an interleaved call grows memory.
     let buf = new Int32Array(_mem.buffer, _outBase, 3*batchSize);
     while (true) {
-        const packed = (_exp['%s'] as Function)(_inBase, len, cursor, %s_outBase, batchSize) as bigint;
+        const packed = (_exp['%s'] as Function)(_inBase, len, cursor, %s_outBase, batchSize, %s) as bigint;
         // The cursor is opaque: hand it back unchanged. Only its top 32 bits
         // are public — all ones means the scan is finished, and that arrives
         // on the same call as the last matches.
@@ -383,8 +418,9 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
     } finally { _close(); }
 }
 `, camelSet(s.Name)+"BatchMaxSize", s.Find, defaultBatchCap(s, cfg),
-					camelSet(s.Name)+"BatchMaxSize", 4*idN+bitmapBytes(s, cfg), batchGateSetup,
-					config.SetBatchExportName(s.Find), gateArg, cursorCountMask(s, cfg),
+					camelSet(s.Name)+"BatchMaxSize", cachePre, batchGateRegion, cacheReserve,
+					batchGateSetup, cachePost,
+					config.SetBatchExportName(s.Find), gateArg, cacheArgs, cursorCountMask(s, cfg),
 					config.SetCursorOverflowPos, btOverflowMsg(s.Find))
 			}
 		}

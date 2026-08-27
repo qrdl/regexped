@@ -681,6 +681,10 @@ func goABIParam(p abiParam) string {
 		return "outCap int32"
 	case abiCursor:
 		return "cursor int64"
+	case abiScratchPtr:
+		return "scratchPtr unsafe.Pointer"
+	case abiScratchLen:
+		return "scratchLen int32"
 	}
 	panic("generate: unknown abiParam")
 }

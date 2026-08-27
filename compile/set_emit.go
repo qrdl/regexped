@@ -232,6 +232,11 @@ type compiledSet struct {
 	// instead of trusting the static override for the whole scan.
 	shuftiAdaptive bool
 
+	// overlapDPColOff is the module address of the backward sweep's two
+	// working columns (SETS_PLAN item 11 stage C). Zero when the set emits no
+	// sweep.
+	overlapDPColOff int32
+
 	// litToBuckets[litID] = list of bucket indices sharing this literal.
 	// Multiple buckets can share a literal when bin-packing splits large groups.
 	litToBuckets [][]int
@@ -347,7 +352,8 @@ const (
 
 	// §19 find_batch. The cursor is an i64 in and an i64 out: the value the
 	// export returns is passed back verbatim as the next call's cursor.
-	setTypeBatchGated   = 10 // (i32,i32,i64,i32,i32,i32)→i64  find_batch, gated
+	setTypeBatchGated = 10 // (i32,i32,i64,i32,i32,i32,i32,i32)→i64  find_batch
+	//                          ptr, len, cursor, gate, out, cap, scratch, scratch_len
 	setTypeBatchUngated = 11 // (i32,i32,i64,i32,i32)→i64      find_batch, overlapping
 )
 
@@ -371,7 +377,24 @@ func (cs *compiledSet) hiddenFnCount() int {
 	// Two per split capability: phase 1 (the frontend over the literal
 	// buckets) and phase 2 (the union walk over the fallback patterns).
 	n += 2 * len(cs.twoPhaseCaps())
+	if cs.usesOverlapDP() {
+		n++
+	}
 	return n
+}
+
+// overlapDPFnOffset is the index of the backward sweep within this set's
+// functions, or -1. It sits after the two-phase bodies, so adding it moves no
+// existing sub-index.
+func (cs *compiledSet) overlapDPFnOffset() int {
+	if !cs.usesOverlapDP() {
+		return -1
+	}
+	n := len(cs.capFns())
+	if cs.batchFind {
+		n++
+	}
+	return n + 2*len(cs.twoPhaseCaps())
 }
 
 // gatedFind reports whether this set emits the default (per-pattern
@@ -722,6 +745,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			}
 		}
 		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], needScanProbes, gatedFind, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
+		bkt.dp = art.dp
 		if art.sparseProbeReady {
 			// The scratch address is decided by the emitter; the driver reads
 			// probe results from it, so it is written back here rather than
@@ -1221,6 +1245,26 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 	}
 
+	// The sweep's two working columns. Module memory, and that is allowed:
+	// they live only for the duration of one call, which is what §3.15
+	// permits. The tuples — the part that must survive BETWEEN calls — go in
+	// the caller's scratch.
+	//
+	// Reserved as a zero-filled DATA SEGMENT even though every byte is written
+	// before it is read. That is not waste, it is the contract: a caller
+	// decides where its own input may go by asking where the module's data
+	// ends, and every harness in this repo does it by walking the data
+	// section. A region that exists only in an internal offset is invisible to
+	// that question, and the first call lays the column straight over the
+	// caller's input — which is exactly what happened when stage B tried it.
+	if n := cs.overlapDPColumnBytes(); n > 0 {
+		cs.overlapDPColOff = setTablesEnd
+		cs.startableDataBytes = append(cs.startableDataBytes,
+			appendDataSegment(nil, setTablesEnd, make([]byte, n))...)
+		cs.startableDataSegs++
+		setTablesEnd += n
+	}
+
 	// §9.4 first-position routing data, derived from the finished bucket list.
 	cs.prefixLenGroups = make([][]prefixLenGroup, len(buckets))
 	for bi := range buckets {
@@ -1540,7 +1584,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 7
 		0x60, 0x06, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 8
 		0x60, 0x08, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 9
-		0x60, 0x06, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 10
+		0x60, 0x08, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 10
 		0x60, 0x05, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x01, 0x7E, // type 11
 	}
 	out = appendSection(out, 1, typeSection)
@@ -1619,6 +1663,10 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				t = setTypeI32x3ToI64
 			}
 			fs = append(fs, t, t)
+		}
+		// The backward sweep: (ptr, len, from, scratch_ptr, scratch_len) -> i32.
+		if cs.usesOverlapDP() {
+			fs = append(fs, byte(setTypeI32x5ToI32))
 		}
 		suffixType := byte(setMatchTypeSuffix)
 		if cs.gatedFind() || cs.suffixHasSkip {
@@ -1845,7 +1893,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					cs_bytes = append(cs_bytes, rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
 				}
 			case capFindBatch:
-				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.batchPosFnOffset())...)
+				dpIdx := -1
+				if off := cs.overlapDPFnOffset(); off >= 0 {
+					dpIdx = base + off
+				}
+				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.batchPosFnOffset(), dpIdx)...)
 			case capMatch, capMatchAny, capMatchAll:
 				cs_bytes = append(cs_bytes, emitSetAnchoredCapBody(cs, c.kind, anchoredProbeBase)...)
 			default:
@@ -1880,6 +1932,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs.phase1Only = false
 			cs_bytes = append(cs_bytes, p1...)
 			cs_bytes = append(cs_bytes, emitUnionScanBody(cs.phase2Union, kind, cs.phase2Mask(), tableMemIdx)...)
+		}
+		if cs.usesOverlapDP() {
+			cs_bytes = append(cs_bytes, emitOverlapDPBody(cs, tableMemIdx, cs.overlapDPColOff)...)
 		}
 		// A Backtracking fallback bucket's suffix body CALLS its driver, so it
 		// can only be built here, where function indices exist. Everything
@@ -2085,7 +2140,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 			emit = emitOverlappingFindPreflight
 		}
 		b = emit(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
-			c.pGate, c.pInLen, tableMemIdx, absence, c.localBase+10, c.localBase+13)
+			c.pGate, c.pInLen, c.pFrom, tableMemIdx, absence, c.localBase+10, c.localBase+13)
 	}
 	b = c.emitFindPrologue(b, lPos)
 

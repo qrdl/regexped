@@ -113,7 +113,7 @@ func runBTBatch(t *testing.T, w []byte, pats []string, input string, outCap int3
 			t.Fatalf("%v on %q cap=%d: batch did not terminate after %d calls",
 				pats, input, outCap, calls)
 		}
-		res, err := fn.Call(store, inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap)
+		res, err := fn.Call(store, inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap, int32(0), int32(0))
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
 		}

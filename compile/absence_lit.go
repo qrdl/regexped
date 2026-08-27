@@ -205,11 +205,15 @@ func emitAbsenceVerify(b []byte, cs *compiledSet, lPos, lSearch, aliveLocal, pIn
 // is built only from literals still in the search set, so a set that finds its
 // common literal early stops paying for it — which is what keeps the scan near
 // 1 fuel/byte on inputs full of that byte.
-func emitLiteralAbsenceMask(b []byte, cs *compiledSet, lPos, lSearch, lMask, lChunk, aliveLocal byte) []byte {
+// fromIdx is the index of an i32 holding the position the scan starts at. It
+// is a PARAMETER rather than the hardcoded 2 it once was, because the batching
+// `find` reaches this emitter too and its slot 2 is the i64 cursor. Passing
+// the wrong index there is a validation error rather than a wrong answer, but
+// only because the types happen to differ — treat it as load-bearing.
+func emitLiteralAbsenceMask(b []byte, cs *compiledSet, lPos, lSearch, lMask, lChunk, aliveLocal, fromIdx byte) []byte {
 	const (
 		pInPtr = 0
 		pInLen = 1
-		pFrom  = 2
 	)
 	// alive starts as the patterns nothing can rule out.
 	b = append(b, 0x42)
@@ -223,7 +227,7 @@ func emitLiteralAbsenceMask(b []byte, cs *compiledSet, lPos, lSearch, lMask, lCh
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(searchInit))
 	b = append(b, 0x21, lSearch)
-	b = append(b, 0x20, pFrom, 0x21, lPos)
+	b = append(b, 0x20, fromIdx, 0x21, lPos)
 
 	b = append(b, 0x02, 0x40) // block $done   (br 2 from the loop body)
 	b = append(b, 0x02, 0x40) // block $tail   (br 1)

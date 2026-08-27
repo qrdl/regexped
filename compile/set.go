@@ -1317,6 +1317,10 @@ type bucket struct {
 	sparseScratch sparseScratch
 	// sparseIDMapOff maps bucket-local index -> global pattern id at runtime.
 	sparseIDMapOff int32
+	// dp is the table geometry SETS_PLAN item 11 stage C's backward sweep
+	// reads, copied from the very params buildSetSuffixBody was given so the
+	// forward and backward readers cannot disagree about where a table is.
+	dp overlapDPTables
 }
 
 // btBucketInfo carries everything the emitter needs for a Backtracking

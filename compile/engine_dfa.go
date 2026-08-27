@@ -4770,6 +4770,21 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		}
 		return art, dataBytes, dataSegCount, nextTableOffset
 	}
+	// Hand the sweep the same geometry this body walks forward (SETS_PLAN item
+	// 11 stage C). Populated unconditionally: usesOverlapDP decides, and
+	// deriving the offsets a second time is exactly how the two would drift.
+	art.dp = overlapDPTables{
+		ok:                 true,
+		l:                  l,
+		midBitmaskOff:      midBitmaskOff,
+		eofBitmaskOff:      eofBitmaskOff,
+		numWASM:            l.numWASM,
+		wasmStart:          p.wasmStart,
+		wasmMidStart:       p.wasmMidStart,
+		hasWordChar:        p.hasWordChar,
+		hasNewlineBoundary: p.hasNewlineBoundary,
+		dominant:           len(l.dominantStates) > 0 || len(p.memberSkip) > 0,
+	}
 	art.fnBody = sizePrefixed(buildSetSuffixBody(p))
 	if needProbes {
 		art.scanProbe = sizePrefixed(buildSetProbeBodyExit(p, false, scanExit))
@@ -4795,8 +4810,15 @@ type suffixArtifacts struct {
 	sparseScratch    sparseScratch
 	sparseIDMapOff   int32
 	sparseProbeReady bool
-	fnBody           []byte
-	scanProbe        []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
+	// dp carries the table geometry SETS_PLAN item 11 stage C's backward sweep
+	// reads. It is the SAME layout and the SAME bitmask tables this body walks
+	// FORWARD — the sweep reads them in the other direction and emits nothing
+	// of its own — which is the only reason a second implementation of the
+	// per-position semantics is defensible at all. Populated always; the sweep
+	// decides for itself whether to use it.
+	dp        overlapDPTables
+	fnBody    []byte
+	scanProbe []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
 	// scanProbeAny is the same probe with a first-hit exit, for `scan` and
 	// `scan_any`. Nil unless the set declares one of
 	// them; `scan_all` must keep using scanProbe.

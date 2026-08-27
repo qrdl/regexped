@@ -313,6 +313,51 @@ func SetCursorMaxCount(patternCount int) int32 {
 // tables inside a 4 GiB wasm32 memory.
 const SetCursorOverflowPos = 0xFFFFFFFE
 
+// SetOverlapCacheHeaderBytes is the size of the header at the front of the
+// answer cache an `overlapping: true` batching `find` may be handed
+// (SETS_PLAN item 11 stage C).
+//
+// It lives here, beside the cursor layout, for the same reason that does: it
+// is an ABI fact the compiler and every stub generator must agree on
+// independently, and two spellings of it would drift. The compiler's own
+// field offsets are checked against it.
+//
+// The caller zeroes the header to start a drive, exactly as it zeroes the gate
+// array, so a zero "ready" slot IS "this drive has not swept yet" and no magic
+// value is needed. The TUPLE AREA needs no zeroing: it is written before it is
+// read, and it is read only once "ready" says so.
+const SetOverlapCacheHeaderBytes = 16
+
+// SetOverlapCacheBytes is the cache size a drive over an input of inputLen
+// bytes wants, for a set of patternCount patterns.
+//
+// Twelve bytes per tuple, and the worst case is one tuple per pattern per
+// START POSITION. That is not pessimism: a pattern whose automaton never dies
+// matches from nearly every start, which is the very shape the cache exists
+// for.
+//
+// Offering LESS is legal and is not an error. The sweep refuses a region it
+// cannot fill and the drive falls back to walking position by position — the
+// same answer, only slower — which is what lets a stub cap what it will
+// allocate.
+func SetOverlapCacheBytes(inputLen, patternCount int) int {
+	return SetOverlapCacheHeaderBytes + (inputLen+1)*patternCount*12
+}
+
+// SetOverlapCacheMaxBytes is the ceiling a GENERATED STUB puts on that
+// allocation before it declines to offer a cache at all.
+//
+// The requirement grows with input length TIMES pattern count, so an
+// uncapped stub would try to reserve gigabytes for a large input and fail at
+// the grow rather than at the regexp. Past the ceiling the stub offers
+// nothing and the drive walks, which is exactly what it did before the cache
+// existed.
+//
+// The stub passes either the FULL requirement or nothing — never a truncated
+// region. A short region makes the sweep run and then discover it cannot
+// finish, which is the one outcome strictly worse than not sweeping.
+const SetOverlapCacheMaxBytes = 64 << 20
+
 // PatternSelector selects patterns for a set. It can be the scalar string "all"
 // or a list of pattern names.
 type PatternSelector struct {

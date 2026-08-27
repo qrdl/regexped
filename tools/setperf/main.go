@@ -41,6 +41,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -496,6 +497,12 @@ type rxInstance struct {
 	gatePtr  int32
 	bitmapPt int32
 	batchPtr int32
+	// cachePtr/cacheLen are the OVERLAPPING answer cache (SETS_PLAN item 11
+	// stage C). Offered only to the overlapping batch entry, which is what a
+	// generated JS/TS iterator does: every other capability is handed 0, 0
+	// and takes the ordinary per-position walk.
+	cachePtr int32
+	cacheLen int32
 	npat     int32
 	inLen    int32
 	// fnCache holds resolved exports. Resolving inside the timed loop meant
@@ -555,7 +562,9 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	bitmapPt := gatePtr + npat*4
 	// The batch buffer sits above the bitmap, 4 KB clear of it.
 	batchPtr := bitmapPt + int32(npat)/8 + 4096
-	top := int64(batchPtr) + int64(batchCap)*12 + 4096
+	cachePtr := (batchPtr + int32(batchCap)*12 + 4096 + 7) &^ 7
+	cacheLen := int32(config.SetOverlapCacheBytes(len(c.input), int(npat)))
+	top := int64(cachePtr) + int64(cacheLen) + 4096
 	needed := uint64((top + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -568,7 +577,8 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 		store: store, inst: inst, mem: mem,
 		inBase: inBase, outPtr: outPtr, gatePtr: gatePtr, bitmapPt: bitmapPt,
 		batchPtr: batchPtr,
-		npat:     npat, inLen: int32(len(c.input)),
+		cachePtr: cachePtr, cacheLen: cacheLen,
+		npat: npat, inLen: int32(len(c.input)),
 	}, nil
 }
 
@@ -635,6 +645,20 @@ func (r *rxInstance) call(c capability, wide bool) (int, error) {
 	return 0, fmt.Errorf("unknown capability %q", c)
 }
 
+// isFuelExhausted reports whether err is the fuel budget running out rather
+// than a defect in the harness.
+//
+// wasmtime surfaces budget exhaustion as a TRAP, and everything the harness
+// can get wrong itself — a wrong argument count, a missing export, an
+// out-of-bounds region — as an ordinary Go error. So the distinction is
+// exactly the one that matters, and it is worth making: without it a harness
+// that had fallen behind an export's signature reported as an engine too slow
+// to finish.
+func isFuelExhausted(err error) bool {
+	var trap *wasmtime.Trap
+	return errors.As(err, &trap)
+}
+
 // exhaustFind drives `find` to exhaustion the way a generated iterator does.
 func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 	// Zeroed for BOTH flavours: since SETS_PLAN item 11 the overlapping body
@@ -679,6 +703,17 @@ func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error
 	for i := int32(0); i < r.npat*4; i++ {
 		buf[r.gatePtr+i] = 0
 	}
+	// The answer cache goes to the OVERLAPPING drive only, which is what a
+	// generated JS/TS iterator does: it is the one policy whose drive the
+	// backward sweep can answer. A gated drive is handed 0, 0 and walks, so
+	// this row keeps measuring what it measured before the cache existed.
+	cachePtr, cacheLen := int32(0), int32(0)
+	if !gated {
+		cachePtr, cacheLen = r.cachePtr, r.cacheLen
+		for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
+			buf[cachePtr+i] = 0
+		}
+	}
 	runtime.KeepAlive(r.store)
 	cursor := int64(0)
 	calls := 0
@@ -686,7 +721,7 @@ func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error
 		var res interface{}
 		var err error
 		calls++
-		res, err = fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap))
+		res, err = fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
 		if err != nil {
 			return calls, err
 		}
@@ -733,13 +768,24 @@ func measureFuelRow(c setCase) []row {
 		}
 		before, _ := r.store.GetFuel()
 		if _, err := r.call(cap, wide); err != nil {
-			// Almost always the fuel budget running out. Record that as a
-			// SENTINEL rather than dropping the row: a bare `continue` here
-			// is why greedy-3's scan_all/find/find(overlapping) had no fuel
-			// number anywhere — the map lookup then yielded 0, and the matrix
-			// printed "0 fuel" for the three most expensive rows it has.
-			// printRows filters sentinels back out so
-			// the baseline files keep their exact-equality format.
+			// Record budget exhaustion as a SENTINEL rather than dropping the
+			// row: a bare `continue` here is why greedy-3's
+			// scan_all/find/find(overlapping) had no fuel number anywhere —
+			// the map lookup then yielded 0, and the matrix printed "0 fuel"
+			// for the three most expensive rows it has. printRows filters
+			// sentinels back out so the baseline files keep their
+			// exact-equality format.
+			//
+			// But ONLY budget exhaustion. This arm used to absorb every error
+			// on the grounds that it was "almost always" the budget, and it
+			// duly reported an ARITY MISMATCH — the harness calling an export
+			// whose signature had grown — as eight rows of "exceeded the fuel
+			// budget". A broken harness must not be readable as a slow
+			// engine.
+			if !isFuelExhausted(err) {
+				fmt.Fprintf(os.Stderr, "HARNESS ERROR %s: %v\n", rowKey(c, cap), err)
+				os.Exit(1)
+			}
 			out = append(out, row{rowKey(c, cap), fuelExhausted})
 			continue
 		}
@@ -1381,12 +1427,20 @@ func rxCollectFindBatch(r *rxInstance) []setTuple {
 	for i := int32(0); i < r.npat*4; i++ {
 		buf[r.gatePtr+i] = 0
 	}
+	// Offered unconditionally here, unlike the fuel drive: --verify's job is
+	// to check the ANSWER against regex-automata, and offering the cache is
+	// what puts the backward sweep under that check. A build that cannot use
+	// it emits no cache path at all and ignores what it is passed.
+	cachePtr, cacheLen := r.cachePtr, r.cacheLen
+	for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
+		buf[cachePtr+i] = 0
+	}
 	runtime.KeepAlive(r.store)
 	countMask := int64(1)<<uint(config.SetCursorCountBits(int(r.npat))) - 1
 	var out []setTuple
 	cursor := int64(0)
 	for {
-		res, err := fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap))
+		res, err := fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
 		if err != nil {
 			return out
 		}

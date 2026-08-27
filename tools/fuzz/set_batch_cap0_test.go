@@ -74,7 +74,7 @@ func TestBatchZeroCapTerminates(t *testing.T) {
 			copy(mem.UnsafeData(store)[inBase:], input)
 
 			// Both flavours take the gate array since SETS_PLAN item 11.
-			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), gate, out, int32(0))
+			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), gate, out, int32(0), int32(0), int32(0))
 			if err != nil {
 				t.Fatalf("set_find_batch: %v", err)
 			}
