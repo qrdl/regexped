@@ -2429,7 +2429,7 @@ func TestSetWithIndividualFuncs(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: []config.RegexEntry{
 			{Name: "p1", Pattern: `foo\d+`, MatchFunc: "p1_match", FindFunc: "p1_find"},
-			{Name: "p2", Pattern: `(?P<n>bar)(?P<m>\d+)`, GroupsFunc: "p2_groups", NamedGroupsFunc: "p2_named"},
+			{Name: "p2", Pattern: `(?P<n>bar)(?P<m>\d+)`, GroupsFunc: "p2_groups"},
 			{Name: "p3", Pattern: `baz\w+`},
 		},
 		Sets: []config.SetConfig{

@@ -114,7 +114,7 @@ func TestValidateConfig_ReportsAllProblems(t *testing.T) {
 			{Name: "p1", Pattern: "a", MatchFunc: "bad name"},
 			{Name: "p2", Pattern: "b", FindFunc: "9lives"},
 			{Name: "p3", Pattern: "c", GroupsFunc: "match"},
-			{Name: "p4", Pattern: "d", NamedGroupsFunc: "fine_name"},
+			{Name: "p4", Pattern: "d", GroupsFunc: "fine_name"},
 		},
 		Sets: []SetConfig{
 			{Name: "s1", ScanAll: "delete"},
@@ -179,9 +179,9 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 	// regexp/syntax accepts a repeated capture-group name, and
 	// generate.collectNamedGroups then maps the name to whichever group it
 	// visits last — so named_groups_func would silently expose only one of them.
-	t.Run("rejected_for_named_groups_func", func(t *testing.T) {
+	t.Run("rejected_for_groups_func", func(t *testing.T) {
 		cfg := BuildConfig{Regexps: []RegexEntry{
-			{Pattern: `(?P<a>x)(?P<a>y)`, NamedGroupsFunc: "ng"},
+			{Pattern: `(?P<a>x)(?P<a>y)`, GroupsFunc: "ng"},
 		}}
 		err := ValidateConfig(&cfg)
 		if err == nil {
@@ -192,22 +192,23 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 		}
 	})
 
-	// The other three func kinds never resolve captures by name, so a repeated
-	// name is unambiguous for them and must stay legal.
-	t.Run("allowed_without_named_groups_func", func(t *testing.T) {
+	// match_func and find_func report no captures at all, so a repeated group
+	// name is unambiguous for them and stays legal. groups_func is now the one
+	// that turns names into symbols (TODO task 62 retired named_groups_func),
+	// so it is the one that rejects.
+	t.Run("allowed_without_groups_func", func(t *testing.T) {
 		cfg := BuildConfig{Regexps: []RegexEntry{
 			{Pattern: `(?P<a>x)(?P<a>y)`, MatchFunc: "m"},
 			{Pattern: `(?P<a>x)(?P<a>y)`, FindFunc: "f"},
-			{Pattern: `(?P<a>x)(?P<a>y)`, GroupsFunc: "g"},
 		}}
 		if err := ValidateConfig(&cfg); err != nil {
-			t.Fatalf("ValidateConfig = %v, want nil (only named_groups_func resolves by name)", err)
+			t.Fatalf("ValidateConfig = %v, want nil (only groups_func resolves by name)", err)
 		}
 	})
 
 	t.Run("distinct_names_accepted", func(t *testing.T) {
 		cfg := BuildConfig{Regexps: []RegexEntry{
-			{Pattern: `(?P<a>x)(?P<b>y)`, NamedGroupsFunc: "ng"},
+			{Pattern: `(?P<a>x)(?P<b>y)`, GroupsFunc: "ng"},
 		}}
 		if err := ValidateConfig(&cfg); err != nil {
 			t.Fatalf("ValidateConfig = %v, want nil", err)
@@ -217,7 +218,7 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 	// A syntax error is compile's to report; ValidateConfig must not duplicate it.
 	t.Run("unparseable_pattern_ignored", func(t *testing.T) {
 		cfg := BuildConfig{Regexps: []RegexEntry{
-			{Pattern: `(?P<a>x`, NamedGroupsFunc: "ng"},
+			{Pattern: `(?P<a>x`, GroupsFunc: "ng"},
 		}}
 		if err := ValidateConfig(&cfg); err != nil {
 			t.Fatalf("ValidateConfig = %v, want nil (parse errors are reported by compile)", err)
@@ -226,7 +227,7 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 
 	t.Run("multiple_duplicates_sorted", func(t *testing.T) {
 		cfg := BuildConfig{Regexps: []RegexEntry{
-			{Pattern: `(?P<z>1)(?P<z>2)(?P<a>3)(?P<a>4)`, NamedGroupsFunc: "ng"},
+			{Pattern: `(?P<z>1)(?P<z>2)(?P<a>3)(?P<a>4)`, GroupsFunc: "ng"},
 		}}
 		err := ValidateConfig(&cfg)
 		if err == nil {
@@ -498,5 +499,37 @@ func TestPascalCaseMatchesGenerators(t *testing.T) {
 		if got := pascalCase(in); got != want {
 			t.Errorf("pascalCase(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestCaptureGroupNameMayBeAReservedWord pins the correction to task 62's
+// group-name validation: a group name is never a standalone identifier, so
+// reserved words are fine.
+//
+// Every language prefixes it with the function's name (`parse_sqli_type`) or
+// uses it as a JS/TS object KEY, where reserved words are legal. An earlier
+// version of the check rejected `(?P<type>…)` and broke
+// examples/wasmtime/go/sql-injection, which had used that name for years.
+func TestCaptureGroupNameMayBeAReservedWord(t *testing.T) {
+	cfg := BuildConfig{Regexps: []RegexEntry{
+		{Pattern: `(?P<type>a)(?P<match>b)(?P<class>c)`, GroupsFunc: "parse"},
+	}}
+	if err := ValidateConfig(&cfg); err != nil {
+		t.Fatalf("ValidateConfig = %v, want nil: group names are always prefixed or used as object keys", err)
+	}
+}
+
+// TestCaptureGroupNamesCollidingOnCase is the check that DOES apply: two names
+// that differ only in case reach one generated constant stem.
+func TestCaptureGroupNamesCollidingOnCase(t *testing.T) {
+	cfg := BuildConfig{Regexps: []RegexEntry{
+		{Pattern: `(?P<host>x)(?P<Host>y)`, GroupsFunc: "parse"},
+	}}
+	err := ValidateConfig(&cfg)
+	if err == nil {
+		t.Fatal("ValidateConfig = nil, want an error: host and Host collapse to one constant stem")
+	}
+	if !strings.Contains(err.Error(), "differ only in case") {
+		t.Errorf("error should explain the collision, got: %v", err)
 	}
 }

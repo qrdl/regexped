@@ -864,9 +864,6 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				anchored:  true,
 			}
 			p.groupsExport = re.GroupsFunc
-			if re.NamedGroupsFunc != "" {
-				p.namedGroupsExport = re.NamedGroupsFunc
-			}
 			if needFind {
 				p.findExport = re.FindFunc
 				p.setFind(appendLitChainRangeFindCodeEntry(nil, lcp, buildOpts.tableMemIdx))
@@ -889,9 +886,6 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				anchored:  true, // captureBody IS the exported groups function (native A.3 path)
 			}
 			p.groupsExport = re.GroupsFunc
-			if re.NamedGroupsFunc != "" {
-				p.namedGroupsExport = re.NamedGroupsFunc
-			}
 			if needMatch {
 				p.matchExport = re.MatchFunc
 				p.matchBody = appendLitChainMatchCodeEntry(nil, lcp)
@@ -920,9 +914,6 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 					anchored:  true, // captureBody IS the exported groups function (native A.3 path)
 				}
 				p.groupsExport = re.GroupsFunc
-				if re.NamedGroupsFunc != "" {
-					p.namedGroupsExport = re.NamedGroupsFunc
-				}
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				if needFind {
@@ -979,9 +970,6 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 								isTDFA:    true,
 							}
 							p.groupsExport = re.GroupsFunc
-							if re.NamedGroupsFunc != "" {
-								p.namedGroupsExport = re.NamedGroupsFunc
-							}
 							p.groupNames = extractGroupNames(parsed)
 
 							// Lenient-alt data + find body.
@@ -1754,9 +1742,6 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	p.groupsExport = re.GroupsFunc // only set when groups_func explicitly requested
-	if re.NamedGroupsFunc != "" {
-		p.namedGroupsExport = re.NamedGroupsFunc
-	}
 
 	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
 	if err != nil {

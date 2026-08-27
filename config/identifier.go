@@ -180,7 +180,6 @@ func ValidateConfig(cfg *BuildConfig) error {
 			{"match_func", re.MatchFunc},
 			{"find_func", re.FindFunc},
 			{"groups_func", re.GroupsFunc},
-			{"named_groups_func", re.NamedGroupsFunc},
 		} {
 			if f.name == "" {
 				continue
@@ -189,10 +188,9 @@ func ValidateConfig(cfg *BuildConfig) error {
 				problems = append(problems, fmt.Sprintf("%s: %s %q %v", owner, f.field, f.name, err))
 			}
 		}
-		if re.NamedGroupsFunc != "" {
-			for _, dup := range duplicateCaptureNames(re.Pattern) {
-				problems = append(problems, fmt.Sprintf("%s: capture group name %q is used more than once; "+
-					"named_groups_func maps names to slots, so only the last group of that name would be reachable", owner, dup))
+		if re.GroupsFunc != "" {
+			for _, problem := range captureNameProblems(re.Pattern) {
+				problems = append(problems, fmt.Sprintf("%s: %s", owner, problem))
 			}
 		}
 	}
@@ -234,16 +232,20 @@ func ValidateConfig(cfg *BuildConfig) error {
 //
 // A pattern that fails to parse yields no duplicates: reporting the syntax
 // error is compile's job, and doing it here too would double up the message.
-func duplicateCaptureNames(pattern string) []string {
+func captureNameProblems(pattern string) []string {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
 	}
-	counts := make(map[string]int)
+	var names []string
+	seen := make(map[string]int)
 	var walk func(*syntax.Regexp)
 	walk = func(r *syntax.Regexp) {
 		if r.Op == syntax.OpCapture && r.Name != "" {
-			counts[r.Name]++
+			if seen[r.Name] == 0 {
+				names = append(names, r.Name)
+			}
+			seen[r.Name]++
 		}
 		for _, sub := range r.Sub {
 			walk(sub)
@@ -251,14 +253,64 @@ func duplicateCaptureNames(pattern string) []string {
 	}
 	walk(re)
 
-	var dups []string
-	for name, n := range counts {
+	var problems []string
+
+	// 1. Exact duplicates. regexp/syntax ACCEPTS these — verified: it parses
+	//    `(?P<a>x)(?P<a>y)` with a nil error — so nothing upstream catches it.
+	var duplicates []string
+	for name, n := range seen {
 		if n > 1 {
-			dups = append(dups, name)
+			duplicates = append(duplicates, name)
 		}
 	}
-	sort.Strings(dups)
-	return dups
+	sort.Strings(duplicates)
+	for _, name := range duplicates {
+		problems = append(problems, fmt.Sprintf("capture group name %q is used more than once; "+
+			"group names become generated constants and a name→index lookup, so only one group of that name would be reachable", name))
+	}
+
+	// NOT checked: reserved words. A group name never stands alone as an
+	// identifier — every language prefixes it with the function's name
+	// (`url_groups_type`) or uses it as a JS/TS object KEY, where a reserved
+	// word is legal. An earlier version of this check rejected `(?P<type>…)`,
+	// which is a perfectly good group name and is used by one of this repo's
+	// own examples.
+	//
+	// Nor the character set: regexp/syntax already refuses anything that is
+	// not a word character — verified, `(?P<a b>x)` and `(?P<a-b>x)` are parse
+	// errors — and a leading digit is fine once prefixed.
+
+	// 3. Names that COLLIDE after sanitising. `host` and `Host` are two
+	//    distinct groups to regexp/syntax — verified, both parse — but one
+	//    constant stem, so a generated stub would define the same symbol twice.
+	stems := make(map[string][]string)
+	for _, name := range names {
+		stem := strings.ToUpper(name)
+		stems[stem] = append(stems[stem], name)
+	}
+	var collided []string
+	for stem := range stems {
+		if len(stems[stem]) > 1 {
+			collided = append(collided, stem)
+		}
+	}
+	sort.Strings(collided)
+	for _, stem := range collided {
+		group := append([]string(nil), stems[stem]...)
+		sort.Strings(group)
+		problems = append(problems, fmt.Sprintf("capture group names %s differ only in case and collapse to one generated constant stem %q",
+			strings.Join(quoteAll(group), " and "), stem))
+	}
+	return problems
+}
+
+// quoteAll quotes each name for an error message.
+func quoteAll(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = fmt.Sprintf("%q", n)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +419,6 @@ func allExportRefs(cfg *BuildConfig) []exportRef {
 			{"match_func", re.MatchFunc},
 			{"find_func", re.FindFunc},
 			{"groups_func", re.GroupsFunc},
-			{"named_groups_func", re.NamedGroupsFunc},
 		} {
 			if f.name != "" {
 				refs = append(refs, exportRef{owner, f.field, f.name})

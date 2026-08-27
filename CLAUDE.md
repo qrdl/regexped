@@ -175,13 +175,16 @@ regexps:
 
     # All func fields are optional; an entry with only 'pattern' is silently skipped.
     # Each func name becomes the WASM export name AND the generated function name.
-    match_func:        "url_match"         # anchored match → Option<usize> / boolean (JS)
+    match_func:        "url_match"         # anchored match → Result<Option<usize>> / number|null (JS)
     find_func:         "url_find"          # non-anchored find → FindIter / generator (JS)
     groups_func:       "url_groups"        # anchored + captures → GroupsIter / generator (JS)
-    named_groups_func: "url_named_groups"  # anchored + named captures → NamedGroupsIter / generator (JS)
+    # `named_groups_func:` is RETIRED (TODO task 62) and is a load error. It was
+    # never a separate capability — both stubs called the SAME WASM export — so
+    # `groups_func` carries names too, through generated index constants plus
+    # `<func>_index` / `<func>_names` (an `<func>_indices` object in JS/TS).
 ```
 
-Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation (TDFA or Backtracking engine).
+Setting `groups_func` triggers capture-tracking compilation (TDFA or Backtracking engine).
 Setting only `match_func` and/or `find_func` strips captures from the pattern before compilation.
 An entry with no `_func` fields is valid — no WASM file is compiled and no stub is generated for it.
 
@@ -196,7 +199,7 @@ An entry with no `_func` fields is valid — no WASM file is compiled and no stu
 - `CmdCompile(cfg, output)` — CLI entry point; auto-selects standalone vs embedded based on `cfg.Output`: no `output` field → standalone (single memory, for JS/TS direct load); `output` field present → embedded (imports memory from `"main"`, for merge with Rust/Go/C host)
 
 `compilePattern` dispatches based on which `_func` fields are set:
-- `groups_func`/`named_groups_func` → TDFA (with fallback to Backtracking if not TDFA-eligible)
+- `groups_func` → TDFA (with fallback to Backtracking if not TDFA-eligible)
 - `find_func` only → DFA find mode
 - `match_func` only → DFA anchored mode
 - no `_func` fields → returns nil (skipped silently)
@@ -283,7 +286,9 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 
 ### 3. Code Generation (`generate/`)
 
-**WASM export names = func names.** The value of `match_func`, `find_func`, `groups_func`, or `named_groups_func` is used directly as the WASM export name. This ensures unique export names in merged WASMs.
+**WASM export names = func names.** The value of `match_func`, `find_func` or `groups_func` is used directly as the WASM export name. This ensures unique export names in merged WASMs.
+
+**Every generated symbol keeps the config's own casing** (TODO task 62). Go's PascalCase transform is gone — `match_func: url_match` yields `func url_match`, and if that leaves it unexported in a library package the generator warns once rather than renaming it. Symbols DERIVED from a func name follow its style too (`url_groups` → `url_groups_index`, `urlGroups` → `urlGroupsIndex`); symbols with no user name to inherit — `Span`, `SetMatch`, the error type, C's `rx_*_t` — keep their language's convention and can be prefixed with the optional `namespace:` key so two stubs can share one package.
 
 Because those values are also interpolated verbatim into generated source, `config.ValidateConfig` (`config/identifier.go`, called from `LoadConfig`) rejects any that is not `^[A-Za-z_][A-Za-z0-9_]*$` or is a reserved word in **any** of the six stub languages — `match` included, since the Rust generator emits `pub fn <func>` for the public wrapper. The check runs on the config-file path only, not inside `Compile`/`CompileFile`, so the internal harnesses (`tools/re2test`, `perftest`, `likelytest`, `pattest`, `tools/fuzz`) keep their bare `match`/`find`/`groups` names. See `docs/cli.md` "Export-name rules".
 
@@ -291,10 +296,10 @@ Because those values are also interpolated verbatim into generated source, `conf
 
 | Field | WASM export | Generated function | Rust type |
 |---|---|---|---|
-| `match_func` | `<func>` | `<func>(input)` | `Option<usize>` |
-| `find_func` | `<func>` | `<func>(input)` | `FindIter` — yields `(usize, usize)` |
-| `groups_func` | `<func>` | `<func>(input)` | `GroupsIter` — yields `Vec<Option<(usize,usize)>>` |
-| `named_groups_func` | `<func>` | `<func>(input)` | `NamedGroupsIter` — yields `HashMap<&str,(usize,usize)>` |
+| `match_func` | `<func>` | `<func>(input)` | `Result<Option<usize>>` |
+| `find_func` | `<func>` | `<func>(input, offset)` | `<Func>Iter` — yields `Result<(usize, usize)>` |
+| `groups_func` | `<func>` | `<func>(input, offset)` | `<Func>Iter` — yields `Result<Vec<Option<Span>>>` |
+
 
 All FFI declarations use `ffi_<func>` internally with `#[link_name = "<func>"]` to avoid collision with the public Rust wrapper of the same name. Iterators advance past zero-length matches by one byte.
 
@@ -303,14 +308,14 @@ All entries are wrapped in a single `pub mod <import_module> { }` block.
 **Go stubs** (`generate/go_stub.go`):
 
 Generated as a `//go:build wasip1` file using `//go:wasmimport` declarations. Requires Go 1.23+.
-Function names are converted to `PascalCase` for the public API; FFI shims use `ffi_` prefix.
+Function names are the config values VERBATIM; FFI shims use the `ffi_` prefix.
 
 | Field | Generated function | Go type |
 |---|---|---|
-| `match_func` | `<PascalCase>(input []byte)` | `(int, bool)` |
-| `find_func` | `<PascalCase>(input []byte)` | `iter.Seq2[int, int]` |
-| `groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[[][]int]` |
-| `named_groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[map[string][]int]` |
+| `match_func` | `<func>(input []byte)` | `(end uint, ok bool, err error)` |
+| `find_func` | `<func>(input []byte, offset uint)` | `*<func>Iter` — `Matches() iter.Seq2[uint, uint]`, `Err() error` |
+| `groups_func` | `<func>(input []byte, offset uint)` | `*<func>Iter` — `Matches() iter.Seq[[]Span]`, `Err() error` |
+
 
 **JS stubs** (`generate/js_stub.go`):
 
@@ -321,20 +326,20 @@ Generated as a single ES module using top-level `await`. Loads the merged WASM (
 | `match_func` | `function <func>(input)` | `boolean` |
 | `find_func` | `function* <func>(input)` | generator of `[start, end]` |
 | `groups_func` | `function* <func>(input)` | generator of `Array<[start,end]\|null>` |
-| `named_groups_func` | `function* <func>(input)` | generator of `Object` (name→`[start,end]`) |
+
 
 Input `string` or `Uint8Array`. Capture slot buffer placed at memory offset 1024.
 
 **C stubs** (`generate/c_stub.go`):
 
-Generated as a single `#pragma once` header. No libc or sysroot required; uses `__attribute__((import_module(...), import_name(...)))`. Iterators use static offset state.
+Generated as a single `#pragma once` header plus a `.c`. No libc or sysroot required; uses `__attribute__((import_module(...), import_name(...)))`. Iterators and output arrays are CALLER-owned — no static state — so two scans can be in flight.
 
 | Field | Generated API |
 |---|---|
-| `match_func` | `<func>(input, len)` → `int` (end pos or -1) |
-| `find_func` | `<func>_next(input, len, *start, *end)` + `<func>_reset()` |
-| `groups_func` | `<func>_next(input, len, slots[])` + `<func>_reset()` |
-| `named_groups_func` | same as groups + `<func>_get(slots, name, *start, *end)` |
+| `match_func` | `<func>(input, len)` → `ptrdiff_t` (end pos, `-1`, or `RX_ERR_BT_OVERFLOW`) |
+| `find_func` | `<func>_init(iter, …)` + `<func>_next(iter, &match)` — caller-owned iterator |
+| `groups_func` | `<func>_init(iter, …)` + `<func>_next(iter, groups)` — fills the caller's `rx_group_t[]` |
+
 
 ### 4. WASM Merging (`merge/`)
 

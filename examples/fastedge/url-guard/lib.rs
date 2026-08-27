@@ -34,14 +34,31 @@ impl HttpContext for Guard {
         // scan_any answers "does anything in the set match, and which" with a
         // single pass over a union automaton — no position, no extent, which
         // is exactly what a block decision needs.
-        if let Some(pattern_id) = patterns::scan_url(&url, 0) {
-            let attack = patterns::pattern_name(pattern_id);
-            self.send_http_response(
-                403,
-                vec![("Content-Type", "text/plain")],
-                Some(format!("Forbidden: {} detected", attack).as_bytes()),
-            );
-            return Action::Pause;
+        //
+        // Err means the engine could not ANSWER, which is neither "clean" nor
+        // "attack". Failing OPEN would let an attack through on an input
+        // crafted to exhaust the budget, so this fails closed with a 500 —
+        // and says so, rather than reporting "unknown" as either verdict.
+        match patterns::scan_url(&url, 0) {
+            Ok(Some(pattern_id)) => {
+                let attack = patterns::pattern_name(pattern_id);
+                self.send_http_response(
+                    403,
+                    vec![("Content-Type", "text/plain")],
+                    Some(format!("Forbidden: {} detected", attack).as_bytes()),
+                );
+                return Action::Pause;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                println!("Cannot scan URL: {err}");
+                self.send_http_response(
+                    500,
+                    vec![("Content-Type", "text/plain")],
+                    Some("Cannot scan request".as_bytes()),
+                );
+                return Action::Pause;
+            }
         }
 
         Action::Continue

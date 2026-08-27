@@ -2,8 +2,8 @@ package generate
 
 import (
 	"fmt"
+	"log/slog"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/qrdl/regexped/config"
@@ -17,6 +17,13 @@ func goStub(cfg config.BuildConfig, out string) error {
 	pkgName := cfg.ImportModule
 	if filepath.Base(filepath.Dir(out)) != cfg.ImportModule {
 		pkgName = "main"
+	}
+	needsSpan := false
+	for _, re := range cfg.Regexps {
+		if re.GroupsFunc != "" {
+			needsSpan = true
+			break
+		}
 	}
 	singleBody, needsIter, err := genGoStubsBody(cfg.Regexps, cfg.ImportModule)
 	if err != nil {
@@ -33,13 +40,15 @@ func goStub(cfg config.BuildConfig, out string) error {
 	sb.WriteString("//go:build wasip1\n\n")
 	fmt.Fprintf(&sb, "package %s\n\n", pkgName)
 	if needsIter {
-		sb.WriteString("import (\n\t\"iter\"\n\t\"unsafe\"\n)\n\n")
+		sb.WriteString("import (\n\t\"errors\"\n\t\"iter\"\n\t\"unsafe\"\n)\n\n")
 	} else {
-		sb.WriteString("import \"unsafe\"\n\n")
+		sb.WriteString("import (\n\t\"errors\"\n\t\"unsafe\"\n)\n\n")
 	}
+	sb.WriteString(goErrorPreamble(cfg, needsSpan))
 	sb.WriteString(singleBody)
 	sb.WriteString(setBody)
-	combined := sb.String()
+	warnUnexportedGoNames(cfg, pkgName)
+	combined := applyNamespace(cfg, "go", sb.String())
 
 	if out == "-" {
 		_, err := fmt.Print(combined)
@@ -77,157 +86,229 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 		imp := func(name, sig string) {
 			fmt.Fprintf(&out, "//go:wasmimport %s %s\n//go:noescape\nfunc ffi_%s%s\n\n", cfg.ImportModule, name, name, sig)
 		}
-		const inArgs = "ptr unsafe.Pointer, length int32"
+		// Parameter lists come from the ONE descriptor in set_stub.go; only
+		// the Go spelling of each is decided here (R12).
+		setCaps := setCapabilities(s, cfg)
+		sig := func(kind string) string {
+			capability := capByKind(setCaps, kind)
+			if capability == nil {
+				panic("generate: Go stub asked for the signature of an undeclared capability " + kind)
+			}
+			return "(" + capability.render(goABIParam, ", ") + ") " + goABIRet(capability.Ret)
+		}
 
 		if s.MatchAny != "" {
-			imp(s.MatchAny, "("+inArgs+") int32")
-			pub := goPublicName(s.MatchAny)
+			imp(s.MatchAny, sig("match_any"))
+			pub := s.MatchAny
 			fmt.Fprintf(&out, `// %s returns the id of SOME pattern matching the whole input.
 // A set is unordered, so which id you get is unspecified when several match.
-func %s(input []byte) (int, bool) {
-	r := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)))
-	if r < 0 { return 0, false }
-	return int(r), true
+//
+// err is ErrBacktrackOverflow when a member pattern compiled to the
+// Backtracking engine and the input exhausted its frame budget: the engine
+// cannot tell whether the input matches, so ok=false — a definite "no" —
+// would be a lie.
+func %s(input []byte) (id int, ok bool, err error) {
+	result := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)))
+	// Tested EXACTLY, not as "negative": -1 is a real answer (nothing matched)
+	// and the sentinel means the engine gave up. Folding the two — which this
+	// did — turns "unknown" into a confident "no".
+	if result == %d { return 0, false, ErrBacktrackOverflow }
+	if result < 0 { return 0, false, nil }
+	return int(result), true, nil
 }
 
-`, pub, pub, s.MatchAny)
+`, pub, pub, s.MatchAny, btOverflow)
 		}
 		if s.MatchAll != "" {
 			needsIter = true
-			pub := goPublicName(s.MatchAll)
+			pub := s.MatchAll
 			if wide {
-				imp(s.MatchAll, "("+inArgs+", outPtr unsafe.Pointer) int32")
+				imp(s.MatchAll, sig("match_all"))
 				fmt.Fprintf(&out, `// %s yields the id of every pattern matching the whole input.
 //
 // An iterator rather than a slice: the ABI hands back a bitmap whose set bits
 // can be yielded lazily with nothing materialised, so a caller who only wants
 // to know "any?" or to stop early allocates nothing. slices.Collect gives you
 // a slice when you want one.
-func %s(input []byte) iter.Seq[int] {
+//
+// The FFI call happens HERE, not per step, so the error is returned beside the
+// iterator — the shape database/sql's Query has. Nothing after the call can
+// fail, so the iterator itself is infallible.
+func %s(input []byte) (iter.Seq[int], error) {
+	bits := make([]byte, (%s+7)/8)
+	// The wide form returns a count, so the sentinel is distinguishable:
+	// overflow means the bitmap was never answered, not that it is empty.
+	if ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), unsafe.Pointer(&bits[0])) == %d {
+		return nil, ErrBacktrackOverflow
+	}
 	return func(yield func(int) bool) {
-		bits := make([]byte, (%s+7)/8)
-		// The wide form returns a count, so the sentinel is distinguishable:
-		// overflow means the bitmap was never answered, not that it is empty.
-		if ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), unsafe.Pointer(&bits[0])) == %d { panic("%s") }
-		for k := 0; k < %s; k++ {
-			if bits[k/8]&(1<<uint(k%%8)) != 0 {
-				if !yield(k) { return }
+		for patternID := 0; patternID < %s; patternID++ {
+			if bits[patternID/8]&(1<<uint(patternID%%8)) != 0 {
+				if !yield(patternID) { return }
 			}
 		}
-	}
+	}, nil
 }
 
-`, pub, pub, idKonst, s.MatchAll, btOverflow, btOverflowMsg(pub), idKonst)
+`, pub, pub, idKonst, s.MatchAll, btOverflow, idKonst)
 			} else {
-				imp(s.MatchAll, "("+inArgs+") int64")
+				imp(s.MatchAll, sig("match_all"))
 				fmt.Fprintf(&out, `// %s yields the id of every pattern matching the whole input.
 // See the wide form's comment for why this is an iterator.
-func %s(input []byte) iter.Seq[int] {
+func %s(input []byte) (iter.Seq[int], error) {
+	raw := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)))
+	// The narrow form's return IS the bitmask, so the sentinel is tested on
+	// the RAW value before the unsigned conversion: -2 as uint64 is
+	// 0xFFFFFFFFFFFFFFFE, which reads as "every id except 0 matched".
+	if raw == %d { return nil, ErrBacktrackOverflow }
+	mask := uint64(raw)
 	return func(yield func(int) bool) {
-		mask := uint64(ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input))))
-		for k := 0; k < %s; k++ {
-			if mask&(1<<uint(k)) != 0 {
-				if !yield(k) { return }
+		for patternID := 0; patternID < %s; patternID++ {
+			if mask&(1<<uint(patternID)) != 0 {
+				if !yield(patternID) { return }
 			}
 		}
-	}
+	}, nil
 }
 
-`, pub, pub, s.MatchAll, idKonst)
+`, pub, pub, s.MatchAll, btOverflow, idKonst)
 			}
 		}
 		if s.ScanAny != "" {
-			imp(s.ScanAny, "("+inArgs+", from int32) int32")
-			pub := goPublicName(s.ScanAny)
+			imp(s.ScanAny, sig("scan_any"))
+			pub := s.ScanAny
 			fmt.Fprintf(&out, `// %s reports one pattern that matches somewhere at or after offset.
 // Which id you get is unspecified when several patterns match; it names a
 // genuinely matching pattern, and no position is reported.
-func %s(input []byte, offset uint) (id int, ok bool) {
-	r := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset))
+func %s(input []byte, offset uint) (id int, ok bool, err error) {
+	result := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset))
 	// Tested exactly, not as "negative": -1 is a real answer (no pattern
 	// matched), the sentinel means the engine gave up and the answer is unknown.
-	if r == %d { panic("%s") }
-	if r < 0 { return 0, false }
-	return int(r), true
+	if result == %d { return 0, false, ErrBacktrackOverflow }
+	if result < 0 { return 0, false, nil }
+	return int(result), true, nil
 }
 
-`, pub, pub, s.ScanAny, btOverflow, btOverflowMsg(pub))
+`, pub, pub, s.ScanAny, btOverflow)
 		}
 		if s.ScanAll != "" {
 			needsIter = true
-			pub := goPublicName(s.ScanAll)
+			pub := s.ScanAll
 			if wide {
-				imp(s.ScanAll, "("+inArgs+", from int32, outPtr unsafe.Pointer) int32")
+				imp(s.ScanAll, sig("scan_all"))
 				fmt.Fprintf(&out, `// %s yields the id of every pattern matching somewhere at or after offset.
-func %s(input []byte, offset uint) iter.Seq[int] {
+func %s(input []byte, offset uint) (iter.Seq[int], error) {
+	bits := make([]byte, (%s+7)/8)
+	// The wide form returns a count, so the sentinel is distinguishable:
+	// overflow means the bitmap was never answered, not that it is empty.
+	if ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset), unsafe.Pointer(&bits[0])) == %d {
+		return nil, ErrBacktrackOverflow
+	}
 	return func(yield func(int) bool) {
-		bits := make([]byte, (%s+7)/8)
-		// The wide form returns a count, so the sentinel is distinguishable:
-		// overflow means the bitmap was never answered, not that it is empty.
-		if ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset), unsafe.Pointer(&bits[0])) == %d { panic("%s") }
-		for k := 0; k < %s; k++ {
-			if bits[k/8]&(1<<uint(k%%8)) != 0 {
-				if !yield(k) { return }
+		for patternID := 0; patternID < %s; patternID++ {
+			if bits[patternID/8]&(1<<uint(patternID%%8)) != 0 {
+				if !yield(patternID) { return }
 			}
 		}
-	}
+	}, nil
 }
 
-`, pub, pub, idKonst, s.ScanAll, btOverflow, btOverflowMsg(pub), idKonst)
+`, pub, pub, idKonst, s.ScanAll, btOverflow, idKonst)
 			} else {
-				imp(s.ScanAll, "("+inArgs+", from int32) int64")
+				imp(s.ScanAll, sig("scan_all"))
 				fmt.Fprintf(&out, `// %s yields the id of every pattern matching somewhere at or after offset.
-func %s(input []byte, offset uint) iter.Seq[int] {
+func %s(input []byte, offset uint) (iter.Seq[int], error) {
+	raw := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset))
+	// The narrow form's return IS the bitmask, so the sentinel is tested on
+	// the RAW value before the unsigned conversion: -2 as uint64 is
+	// 0xFFFFFFFFFFFFFFFE, which reads as "every id except 0 matched".
+	if raw == %d { return nil, ErrBacktrackOverflow }
+	mask := uint64(raw)
 	return func(yield func(int) bool) {
-		mask := uint64(ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset)))
-		for k := 0; k < %s; k++ {
-			if mask&(1<<uint(k)) != 0 {
-				if !yield(k) { return }
+		for patternID := 0; patternID < %s; patternID++ {
+			if mask&(1<<uint(patternID)) != 0 {
+				if !yield(patternID) { return }
 			}
 		}
-	}
+	}, nil
 }
 
-`, pub, pub, s.ScanAll, idKonst)
+`, pub, pub, s.ScanAll, btOverflow, idKonst)
 			}
 		}
 		if s.Find != "" {
 			needsIter = true
-			pub := goPublicName(s.Find)
-			gateDecl, gateArg, gateDoc := "", "", ""
-			if findGateArray(s) {
-				imp(s.Find, "("+inArgs+", from int32, gatePtr unsafe.Pointer, outPtr unsafe.Pointer, outCap int32) int32")
-				gateDecl = "\t\tgates := make([]uint32, " + idKonst + ")\n"
-				gateArg = "unsafe.Pointer(&gates[0]), "
-				gateDoc = " and a zeroed gate array"
-			} else {
-				imp(s.Find, "("+inArgs+", from int32, outPtr unsafe.Pointer, outCap int32) int32")
-			}
-			fmt.Fprintf(&out, `// %s iterates the set's matches from position offset. The sequence owns a
-// reusable tuple buffer%s; each step yields one match, and each WASM call
+			pub := s.Find
+			// EVERY set with `find` takes the gate array, overlapping included
+			// (SETS_PLAN item 11) — the branch that omitted it was unreachable
+			// and is gone.
+			imp(s.Find, sig("find"))
+			gateDecl := "\t\tgates := make([]uint32, " + idKonst + ")\n"
+			gateArg := "unsafe.Pointer(&gates[0]), "
+			gateDoc := " and a zeroed gate array"
+			fmt.Fprintf(&out, `// %[1]sIter iterates the set's matches from position offset. It owns a
+// reusable tuple buffer%[2]s; each step yields one match, and each WASM call
 // returns every match at one position before the scan advances.
-func %s(input []byte, offset uint) iter.Seq[SetMatch] {
+//
+// Errors are reported by Err() AFTER the loop, the shape sql.Rows has. Check
+// it: an unchecked Err() means a silently truncated match list.
+type %[1]sIter struct {
+	input  []byte
+	offset uint
+	err    error
+	done   bool
+}
+
+// %[1]s starts a scan at offset.
+func %[1]s(input []byte, offset uint) *%[1]sIter {
+	return &%[1]sIter{input: input, offset: offset}
+}
+
+// Err returns the error that stopped iteration, or nil if it ran to
+// completion or the caller broke out early.
+func (iter *%[1]sIter) Err() error { return iter.err }
+
+// Matches yields each match in turn.
+func (iter *%[1]sIter) Matches() iter.Seq[SetMatch] {
 	return func(yield func(SetMatch) bool) {
-		buf := make([][3]int32, %s)
-%s		pos := int32(offset)
+		if iter.done {
+			return
+		}
+		input := iter.input
+		buf := make([][3]int32, %[4]s)
+%[5]s		pos := int32(iter.offset)
 		for {
-			n := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), pos, %sunsafe.Pointer(&buf[0]), %s)
-			// Before the n <= 0 test: overflow is "unknown", not "scan
+			tupleCount := ffi_%[6]s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), pos, %[7]sunsafe.Pointer(&buf[0]), %[8]s)
+			// Before the <= 0 test: overflow is "unknown", not "scan
 			// finished", and ending the iteration here would report a partial
 			// answer as a complete one.
-			if n == %d { panic("%s") }
-			if n <= 0 { return }
+			if tupleCount == %[9]d {
+				iter.err = ErrBacktrackOverflow
+				iter.done = true
+				return
+			}
+			if tupleCount <= 0 {
+				iter.done = true
+				return
+			}
 			// Every tuple in one call shares a start; resume one past it.
 			next := buf[0][1] + 1
-			for i := int32(0); i < n; i++ {
-				if !yield(SetMatch{PatternID: int(buf[i][0]), Start: uint(buf[i][1]), End: uint(buf[i][2])}) { return }
+			for tupleNum := int32(0); tupleNum < tupleCount; tupleNum++ {
+				if !yield(SetMatch{
+					PatternID: int(buf[tupleNum][0]),
+					Start:     uint(buf[tupleNum][1]),
+					End:       uint(buf[tupleNum][2]),
+				}) {
+					return
+				}
 			}
 			pos = next
+			iter.offset = uint(pos)
 		}
 	}
 }
 
-`, pub, gateDoc, pub, konst, gateDecl, s.Find, gateArg, konst, btOverflow, btOverflowMsg(pub))
+`, pub, gateDoc, "", konst, gateDecl, s.Find, gateArg, konst, btOverflow)
 		}
 	}
 	if hasEmitNameMap(cfg) {
@@ -256,74 +337,89 @@ func genGoSetSection(cfg config.BuildConfig, _ string) string {
 }
 
 // goPublicName converts a snake_case function name to a PascalCase Go identifier.
-// "url_match" → "UrlMatch", "find_github_token" → "FindGithubToken"
-func goPublicName(s string) string {
-	var b strings.Builder
-	upper := true
-	for _, c := range s {
-		if c == '_' {
-			upper = true
-			continue
-		}
-		if upper {
-			if c >= 'a' && c <= 'z' {
-				c -= 'a' - 'A'
-			}
-			upper = false
-		}
-		b.WriteRune(c)
-	}
-	return b.String()
-}
 
 // genGoMatchStub generates an anchored-match stub.
 func genGoMatchStub(importModule, funcName string) string {
 	ffi := "ffi_" + funcName
-	pub := goPublicName(funcName)
+	pub := funcName
 	return fmt.Sprintf(`//go:wasmimport %s %s
 //go:noescape
 func %s(ptr unsafe.Pointer, length uint32) int32
 
-// %s returns the end position of the match (exclusive), or (0, false) if no
-// match. The match is anchored: it starts at the beginning of input.
+// %s returns the end position of the match (exclusive), or ok=false if the
+// input does not match. The match is anchored: it starts at the beginning of
+// input.
 //
 // The position is unsigned: it cannot be negative, and the comma-ok bool
 // already carries "no match", so nothing here needs a -1.
-func %s(input []byte) (uint, bool) {
+//
+// err is ErrBacktrackOverflow when the pattern compiled to the Backtracking
+// engine and the input exhausted its frame budget: the engine cannot tell
+// whether the input matches, so ok=false — a definite "no" — would be a lie.
+func %s(input []byte) (end uint, ok bool, err error) {
 	var ptr unsafe.Pointer
 	if len(input) > 0 {
 		ptr = unsafe.Pointer(&input[0])
 	}
-	r := %s(ptr, uint32(len(input)))
-	if r == %d {
-		panic("%s")
+	result := %s(ptr, uint32(len(input)))
+	if result == %d {
+		return 0, false, ErrBacktrackOverflow
 	}
-	if r < 0 {
-		return 0, false
+	if result < 0 {
+		return 0, false, nil
 	}
-	return uint(r), true
+	return uint(result), true, nil
 }
 
-`, importModule, funcName, ffi, pub, pub, ffi, btOverflow, btOverflowMsg(pub))
+`, importModule, funcName, ffi, pub, pub, ffi, btOverflow)
 }
 
 // genGoFindStub generates a find iterator returning iter.Seq2[int,int].
 func genGoFindStub(importModule, funcName string) string {
 	ffi := "ffi_" + funcName
-	pub := goPublicName(funcName)
-	return fmt.Sprintf(`//go:wasmimport %s %s
+	pub := funcName
+	return fmt.Sprintf(`//go:wasmimport %[2]s %[5]s
 //go:noescape
-func %s(ptr unsafe.Pointer, length uint32, from uint32) int64
+func %[3]s(ptr unsafe.Pointer, length uint32, from uint32) int64
 
-// %s returns an iterator over all non-overlapping matches at or after offset.
-// Each iteration yields (start, end) absolute byte positions.
+// %[1]sIter iterates the non-overlapping matches at or after offset.
+//
+// Errors are reported by Err() AFTER the loop, the way database/sql and
+// bufio.Scanner do it, because iter.Seq2's two slots are already spent on
+// (start, end). Check it: an unchecked Err() means a silently truncated match
+// list.
+type %[1]sIter struct {
+	input   []byte
+	offset  uint
+	err     error
+	// Set once iteration has finished, whether by exhausting the input or by
+	// recording an error. Without it a caller who ignores Err() and ranges
+	// again re-runs the identical failing call forever — the overflow is
+	// deterministic and the offset never advanced.
+	done bool
+}
+
+// %[1]s starts a scan at offset.
 //
 // The whole input is passed on every call and offset only bounds where the
 // search STARTS, so a leading \b, \B, ^ or (?m:^) is judged against the real
 // preceding byte rather than a slice edge.
-func %s(input []byte, offset uint) iter.Seq2[uint, uint] {
+func %[1]s(input []byte, offset uint) *%[1]sIter {
+	return &%[1]sIter{input: input, offset: offset}
+}
+
+// Err returns the error that stopped iteration, or nil if it ran to
+// completion or the caller broke out early.
+func (iter *%[1]sIter) Err() error { return iter.err }
+
+// Matches yields each match as (start, end) absolute byte positions.
+func (iter *%[1]sIter) Matches() iter.Seq2[uint, uint] {
 	return func(yield func(uint, uint) bool) {
-		pos := int(offset)
+		if iter.done {
+			return
+		}
+		input := iter.input
+		pos := int(iter.offset)
 		if pos > len(input) {
 			return
 		}
@@ -333,15 +429,18 @@ func %s(input []byte, offset uint) iter.Seq2[uint, uint] {
 		}
 		prevEnd := -1
 		for pos <= len(input) {
-			r := %s(base, uint32(len(input)), uint32(pos))
-			if r == %d {
-				panic("%s")
+			packed := %[3]s(base, uint32(len(input)), uint32(pos))
+			if packed == %[4]d {
+				iter.err = ErrBacktrackOverflow
+				iter.done = true
+				return
 			}
-			if r < 0 {
+			if packed < 0 {
+				iter.done = true
 				break
 			}
-			start := int(uint64(r) >> 32)
-			end := int(uint32(r))
+			start := int(uint64(packed) >> 32)
+			end := int(uint32(packed))
 			// Go's FindAllIndex rule: an EMPTY match beginning exactly where
 			// the previous match ended is suppressed. Without this the
 			// iterator reports a strict superset of Go's answer — e.g. a* on
@@ -361,11 +460,12 @@ func %s(input []byte, offset uint) iter.Seq2[uint, uint] {
 			} else {
 				pos = start + 1
 			}
+			iter.offset = uint(pos)
 		}
 	}
 }
 
-`, importModule, funcName, ffi, pub, pub, ffi, btOverflow, btOverflowMsg(pub))
+`, pub, importModule, ffi, btOverflow, funcName)
 }
 
 // genGoGroupsStub generates a groups iterator returning iter.Seq2[[][]int, bool].
@@ -374,7 +474,7 @@ func %s(input []byte, offset uint) iter.Seq2[uint, uint] {
 // a sibling named-groups stub in the same file already declared it.
 func genGoGroupsStub(importModule, funcName, exportName string, declareFFI bool, numGroups int) string {
 	ffi := "ffi_" + exportName
-	pub := goPublicName(funcName)
+	pub := funcName
 	slotCount := numGroups * 2
 
 	var ffiDecl string
@@ -386,19 +486,46 @@ func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer, from uint32) i
 `, importModule, exportName, ffi)
 	}
 
-	return ffiDecl + fmt.Sprintf(`// %s iterates the non-overlapping matches at or after offset: each iteration is
-// one MATCH, represented by its capture groups.
-// A match is a slice of numGroups [start,end] pairs; nil means the group didn't participate.
-// Index 0 is the full match. Positions are absolute byte offsets.
+	return ffiDecl + fmt.Sprintf(`// %[1]sIter iterates the non-overlapping matches at or after offset: each
+// step is one MATCH, represented by its capture groups.
 //
 // LIMITATION: offset currently NARROWS the input rather than bounding only the
 // search, so at offset > 0 a leading \b, \B, ^ or (?m:^) judges a truncated
 // left context. The single-pattern WASM exports take no offset; TODO 54 gives
 // them one, after which this stub stops narrowing and the signature is
 // unchanged.
-func %s(input []byte, offset uint) iter.Seq[[][]uint] {
-	return func(yield func([][]uint) bool) {
-		pos := int(offset)
+type %[1]sIter struct {
+	input  []byte
+	offset uint
+	err    error
+	done   bool
+	// slotBuffer is a FIELD, not a make() inside the search loop. It used to be
+	// the latter, which allocated on every position TRIED rather than every
+	// match found — on a long input with sparse matches that dominated. It
+	// rides inside the one allocation the iterator already is.
+	slotBuffer [%[3]d]int32
+}
+
+// %[1]s starts a scan at offset.
+func %[1]s(input []byte, offset uint) *%[1]sIter {
+	return &%[1]sIter{input: input, offset: offset}
+}
+
+// Err returns the error that stopped iteration, or nil if it ran to
+// completion or the caller broke out early. An unchecked Err() means a
+// silently truncated match list.
+func (iter *%[1]sIter) Err() error { return iter.err }
+
+// Matches yields one MATCH per step, represented by its capture groups: one
+// Span per group, index 0 the whole match, Ok=false where the group did not
+// participate. The length never depends on which groups participated.
+func (iter *%[1]sIter) Matches() iter.Seq[[]Span] {
+	return func(yield func([]Span) bool) {
+		if iter.done {
+			return
+		}
+		input := iter.input
+		pos := int(iter.offset)
 		if pos > len(input) {
 			return
 		}
@@ -408,38 +535,47 @@ func %s(input []byte, offset uint) iter.Seq[[][]uint] {
 		}
 		prevEnd := -1
 		for pos <= len(input) {
-			buf := make([]int32, %d)
-			r := %s(base, uint32(len(input)), unsafe.Pointer(&buf[0]), uint32(pos))
-			if r == %d {
-				panic("%s")
+			slots := &iter.slotBuffer
+			for i := range slots {
+				slots[i] = -1
 			}
-			if r < 0 {
+			result := %[4]s(base, uint32(len(input)), unsafe.Pointer(&slots[0]), uint32(pos))
+			if result == %[5]d {
+				iter.err = ErrBacktrackOverflow
+				iter.done = true
+				return
+			}
+			if result < 0 {
+				// No match at THIS position — a different thing from the
+				// sentinel above. Advance and retry.
 				if pos == len(input) {
+					iter.done = true
 					break
 				}
 				pos++
 				continue
 			}
-			groups := make([][]uint, %d)
-			for i := range groups {
-				s, e := buf[i*2], buf[i*2+1]
-				if s < 0 {
-					groups[i] = nil
+			groups := make([]Span, %[6]d)
+			for groupNum := range groups {
+				start, end := slots[groupNum*2], slots[groupNum*2+1]
+				if start < 0 {
+					groups[groupNum] = Span{}
 				} else {
 					// Absolute already: the whole input is passed on every
 					// call, so slots are positions in it.
-					groups[i] = []uint{uint(s), uint(e)}
+					groups[groupNum] = Span{Start: uint(start), End: uint(end), Ok: true}
 				}
 			}
-			absStart, absEnd := int(buf[0]), int(buf[0])
-			if buf[1] >= 0 {
-				absEnd = int(buf[1])
+			absStart, absEnd := int(slots[0]), int(slots[0])
+			if slots[1] >= 0 {
+				absEnd = int(slots[1])
 			}
 			if absEnd > absStart {
 				pos = absEnd
 			} else {
 				pos = absStart + 1
 			}
+			iter.offset = uint(pos)
 			// Go's FindAllSubmatchIndex rule: suppress an EMPTY match
 			// beginning exactly where the previous reported match ended. The
 			// advance above is unchanged.
@@ -454,94 +590,7 @@ func %s(input []byte, offset uint) iter.Seq[[][]uint] {
 	}
 }
 
-`, pub, pub, slotCount, ffi, btOverflow, btOverflowMsg(pub), numGroups)
-}
-
-// genGoNamedGroupsStub generates a named-groups iterator that calls the FFI export directly.
-// declareFFI controls whether the //go:wasmimport block is emitted; pass false when a
-// sibling groups stub in the same file already declared it.
-func genGoNamedGroupsStub(importModule, funcName, exportName string, declareFFI bool, numGroups int, namedGroups map[string]int) string {
-	ffi := "ffi_" + exportName
-	pub := goPublicName(funcName)
-	slotCount := numGroups * 2
-
-	var ffiDecl string
-	if declareFFI {
-		ffiDecl = fmt.Sprintf(`//go:wasmimport %s %s
-//go:noescape
-func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer, from uint32) int32
-
-`, importModule, exportName, ffi)
-	}
-
-	type entry struct {
-		name  string
-		index int
-	}
-	var entries []entry
-	for name, idx := range namedGroups {
-		entries = append(entries, entry{name, idx})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].index < entries[j].index })
-
-	var assigns strings.Builder
-	for _, e := range entries {
-		fmt.Fprintf(&assigns,
-			"\t\t\tif buf[%d] >= 0 { named[\"%s\"] = []uint{uint(buf[%d]), uint(buf[%d])} }\n",
-			e.index*2, e.name, e.index*2, e.index*2+1)
-	}
-
-	return ffiDecl + fmt.Sprintf(`// %s iterates the non-overlapping matches at or after offset: each iteration is
-// one MATCH, represented by its named capture groups — a map of group name →
-// [start,end] absolute byte offsets.
-func %s(input []byte, offset uint) iter.Seq[map[string][]uint] {
-	return func(yield func(map[string][]uint) bool) {
-		pos := int(offset)
-		if pos > len(input) {
-			return
-		}
-		var base unsafe.Pointer
-		if len(input) > 0 {
-			base = unsafe.Pointer(&input[0])
-		}
-		prevEnd := -1
-		for pos <= len(input) {
-			buf := make([]int32, %d)
-			r := %s(base, uint32(len(input)), unsafe.Pointer(&buf[0]), uint32(pos))
-			if r == %d {
-				panic("%s")
-			}
-			if r < 0 {
-				if pos == len(input) {
-					break
-				}
-				pos++
-				continue
-			}
-			named := make(map[string][]uint, %d)
-%s			absStart, absEnd := int(buf[0]), int(buf[0])
-			if buf[1] >= 0 {
-				absEnd = int(buf[1])
-			}
-			if absEnd > absStart {
-				pos = absEnd
-			} else {
-				pos = absStart + 1
-			}
-			// See the groups iterator: Go suppresses an empty match adjacent
-			// to the previous one.
-			if absStart == absEnd && prevEnd == absStart {
-				continue
-			}
-			prevEnd = absEnd
-			if !yield(named) {
-				break
-			}
-		}
-	}
-}
-
-`, pub, pub, slotCount, ffi, btOverflow, btOverflowMsg(pub), len(entries), assigns.String())
+`, pub, "", slotCount, ffi, btOverflow, numGroups)
 }
 
 // genGoStubsBody returns the body (no header, no imports) for single-pattern stubs.
@@ -556,7 +605,7 @@ func genGoStubsBody(entries []config.RegexEntry, importModule string) (string, b
 		}
 		if part != "" {
 			parts = append(parts, part)
-			if re.FindFunc != "" || re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
+			if re.FindFunc != "" || re.GroupsFunc != "" {
 				needsIter = true
 			}
 		}
@@ -597,25 +646,197 @@ func genGoStubsForEntry(re config.RegexEntry, importModule string) (string, erro
 		out += genGoFindStub(importModule, re.FindFunc)
 		written = true
 	}
-	if re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
+	if re.GroupsFunc != "" {
 		numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
 		if err != nil {
 			return "", err
 		}
-		exportName := re.GroupsExportName()
-		if re.GroupsFunc != "" {
-			out += genGoGroupsStub(importModule, re.GroupsFunc, exportName, true, numGroups)
-			written = true
-		}
-		if re.NamedGroupsFunc != "" {
-			declareFFI := re.GroupsFunc == ""
-			out += genGoNamedGroupsStub(importModule, re.NamedGroupsFunc, exportName, declareFFI, numGroups, namedGroups)
-			written = true
-		}
+		out += genGoGroupsStub(importModule, re.GroupsFunc, re.GroupsExportName(), true, numGroups)
+		out += genGoGroupIndexConsts(re.GroupsFunc, numGroups, namedGroups)
+		written = true
 	}
 
 	if !written {
 		return "", nil
 	}
 	return out, nil
+}
+
+// goABIParam spells one set-ABI parameter in Go. set_stub.go's descriptor
+// decides WHICH parameters a capability takes and in what order; this decides
+// only how each is written.
+func goABIParam(p abiParam) string {
+	switch p {
+	case abiInputPtr:
+		return "ptr unsafe.Pointer"
+	case abiInputLen:
+		return "length int32"
+	case abiFrom:
+		return "from int32"
+	case abiGatePtr:
+		return "gatePtr unsafe.Pointer"
+	case abiBitmapPtr, abiTuplePtr:
+		return "outPtr unsafe.Pointer"
+	case abiOutCap:
+		return "outCap int32"
+	case abiCursor:
+		return "cursor int64"
+	}
+	panic("generate: unknown abiParam")
+}
+
+func goABIRet(r abiRet) string {
+	if r == abiRetI64 {
+		return "int64"
+	}
+	return "int32"
+}
+
+// genGoGroupIndexConsts emits name→index addressing for a groups function.
+// Replaces the retired `named_groups_func` (TODO task 62); see
+// genRustGroupIndexConsts for why that key was never a separate capability.
+//
+// Names follow the config's own casing, so a `groups_func: url_groups` yields
+// url_groups_host and url_groups_index — unexported, which is the user's
+// choice to make and is warned about once per stub rather than corrected.
+func genGoGroupIndexConsts(funcName string, numGroups int, namedGroups map[string]int) string {
+	if len(namedGroups) == 0 {
+		return ""
+	}
+	names := groupNameSlots(numGroups, namedGroups)
+
+	var out strings.Builder
+	fmt.Fprintf(&out, `// %s is how many capture-group slots %s reports, index 0 (the whole
+// match) included. Every slot is present whether or not the group
+// participated, so this is also the length of each yielded match.
+const %s = %d
+
+`, derivedConstName(funcName, "count"), funcName, derivedConstName(funcName, "count"), numGroups)
+
+	out.WriteString("// Index of each NAMED capture group. Index 0 is the whole match; unnamed\n" +
+		"// groups have no constant and are addressed by number.\n")
+	out.WriteString("const (\n")
+	for idx, name := range names {
+		if name == "" {
+			continue
+		}
+		fmt.Fprintf(&out, "\t%s = %d\n", derivedConstName(funcName, name), idx)
+	}
+	out.WriteString(")\n\n")
+
+	indexFn := derivedFuncName(funcName, "index")
+	fmt.Fprintf(&out, `// %s returns the index of the capture group called name, and whether
+// this pattern has a group of that name.
+//
+// The constants above cover a name known at compile time at no cost; this is
+// for a name chosen at runtime. An EMPTY name is never found: a pattern may
+// hold several unnamed groups, so "" identifies nothing.
+func %s(name string) (int, bool) {
+	switch name {
+`, indexFn, indexFn)
+	for idx, name := range names {
+		if name == "" {
+			continue
+		}
+		fmt.Fprintf(&out, "\tcase %q:\n\t\treturn %d, true\n", name, idx)
+	}
+	out.WriteString("\t}\n\treturn 0, false\n}\n\n")
+
+	namesFn := derivedFuncName(funcName, "names")
+	fmt.Fprintf(&out, `// %s returns the capture-group names ALIGNED WITH INDICES: entry i
+// names the group at index i, and is "" where the group has no name — index 0,
+// the whole match, always included. Same shape as regexp.SubexpNames.
+func %s() []string {
+	return []string{`, namesFn, namesFn)
+	for i, name := range names {
+		if i > 0 {
+			out.WriteString(", ")
+		}
+		fmt.Fprintf(&out, "%q", name)
+	}
+	out.WriteString("}\n}\n\n")
+	return out.String()
+}
+
+// goErrorPreamble emits the shared vocabulary every generated Go export
+// speaks: the sentinel error, and Span when any pattern reports capture groups
+// (TODO task 62).
+//
+// Go reports a failure by RETURNING it, so that is what the stubs do — the
+// panics are gone. Scalars return it last; the two eager set calls return it
+// beside the data, the shape database/sql's Query has; the lazy iterators
+// expose Err() after the loop, the shape sql.Rows has.
+func goErrorPreamble(cfg config.BuildConfig, needsSpan bool) string {
+	var sb strings.Builder
+	errName := namespaced(cfg, "ErrBacktrackOverflow")
+	fmt.Fprintf(&sb, `// %s means the Backtracking engine exhausted its frame
+// budget mid-search. The result is UNKNOWN — NOT "no match". Reporting it as
+// "no" would be a false negative that scales with input length and carries no
+// diagnostic, which is the failure this sentinel exists to prevent.
+//
+// Test for it with errors.Is.
+var %s = errors.New("regexped: backtracking stack overflow — " +
+	"input too large for this pattern's frame budget; the match result is unknown, " +
+	"not negative (see docs/engines.md)")
+
+`, errName, errName)
+	if needsSpan {
+		fmt.Fprintf(&sb, `// %s is one capture group's extent, in absolute byte offsets.
+//
+// Ok distinguishes a group that did not participate from one that matched
+// empty — both have Start == End. Go has no Option, so the flag carries what
+// nil used to: a [][]uint cost one allocation for the outer slice plus one per
+// group, where a []Span costs one for the lot.
+type %s struct {
+	Start, End uint
+	Ok         bool
+}
+
+`, namespaced(cfg, "Span"), namespaced(cfg, "Span"))
+	}
+	return sb.String()
+}
+
+// warnUnexportedGoNames emits ONE warning per stub when the file lands in a
+// library package and something the user named will not be visible outside it.
+//
+// Names are emitted verbatim (TODO task 62), so a snake_case config yields
+// snake_case Go functions — which Go's export rule makes package-private. That
+// is the USER'S CHOICE and is accepted, not corrected: the name they wrote is
+// the name they call. But it is worth saying once, because Go is the only
+// target where casing decides visibility, and a caller in another package
+// would otherwise just see the symbol missing.
+//
+// Silent when the package is main, which is where a stub lands unless its file
+// sits in a directory named after the import module.
+func warnUnexportedGoNames(cfg config.BuildConfig, pkgName string) {
+	if pkgName == "main" {
+		return
+	}
+	var hidden []string
+	note := func(name string) {
+		if name == "" || (name[0] >= 'A' && name[0] <= 'Z') {
+			return
+		}
+		hidden = append(hidden, name)
+	}
+	for _, re := range cfg.Regexps {
+		note(re.MatchFunc)
+		note(re.FindFunc)
+		note(re.GroupsFunc)
+	}
+	for _, set := range cfg.Sets {
+		note(set.MatchAny)
+		note(set.MatchAll)
+		note(set.ScanAny)
+		note(set.ScanAll)
+		note(set.Find)
+	}
+	if len(hidden) == 0 {
+		return
+	}
+	slog.Warn("Generated Go names are not exported and are unusable outside this package",
+		"package", pkgName,
+		"names", strings.Join(hidden, ", "),
+		"hint", "names are emitted exactly as written in the config; capitalise them there to export, or place the stub in package main")
 }

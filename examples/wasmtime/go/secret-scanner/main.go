@@ -18,10 +18,17 @@ func main() {
 	}
 
 	count := 0
-	for m := range ScanSecrets(input, 0) {
-		matched := string(input[m.Start:m.End])
-		fmt.Printf("[%s] at %d..%d: %s\n", PatternName(m.PatternID), m.Start, m.End, matched)
+	scanIter := scan_secrets(input, 0)
+	for match := range scanIter.Matches() {
+		matched := string(input[match.Start:match.End])
+		fmt.Printf("[%s] at %d..%d: %s\n", PatternName(match.PatternID), match.Start, match.End, matched)
 		count++
+	}
+	// Check Err() after the loop: an engine that gave up ends iteration the
+	// same way exhausting the input does.
+	if err := scanIter.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "scan_secrets:", err)
+		os.Exit(2)
 	}
 
 	if count == 0 {

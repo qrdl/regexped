@@ -83,7 +83,7 @@ compile-time literal-chain prefix optimisation.
 
 ### TDFA (~41K passing, via `--validate-groups`)
 
-The TDFA engine handles `groups_func` / `named_groups_func` for patterns
+The TDFA engine handles `groups_func` for patterns
 where Laurikari's tagged DFA construction is feasible (no non-greedy quantifiers,
 no line anchors, no word boundaries, no ambiguous alternations). Each test case
 verifies both the match end position and all capture slot positions.
@@ -97,7 +97,7 @@ Examples of patterns handled by TDFA:
 
 ### Backtracking (~267K passing, via `--validate-groups`)
 
-The Backtracking engine handles `groups_func` / `named_groups_func` for patterns
+The Backtracking engine handles `groups_func` for patterns
 that are not TDFA-eligible — those with ambiguous alternations or overlapping
 quantifiers. Each test case verifies both match position and capture slots.
 

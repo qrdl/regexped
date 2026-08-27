@@ -20,6 +20,19 @@ type BuildConfig struct {
 	ImportModule string `yaml:"import_module"`  // WASM import module name used by wasm-merge and Rust FFI
 	StubFile     string `yaml:"stub_file"`      // stub output file (Rust, Go, JS, TS, AS, or C)
 	StubType     string `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
+
+	// Namespace prefixes the symbols a stub generates that are NOT named by
+	// the user — Span, SetMatch, the error type, the pattern-name helper, C's
+	// rx_*_t typedefs. Optional; empty means the names as they have always
+	// been.
+	//
+	// It exists because two stubs generated from two configs into ONE package
+	// collide on exactly those shared names. Today only C guards against that,
+	// with its REGEXPED_TYPES_DEFINED include guard; Go and TS have no
+	// equivalent, and the shared Span and error type of TODO task 62 widen the
+	// exposure. A NO-OP for Rust, whose `pub mod <import_module>` wrapper
+	// already isolates every stub.
+	Namespace string `yaml:"namespace"`
 	MaxDFAStates int    `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int    `yaml:"max_tdfa_regs"`  // 0 = default (32)
 	// MaxFallbackStates caps the suffix DFA of a single-pattern fallback
@@ -432,7 +445,7 @@ func ValidateSets(cfg *BuildConfig) error {
 		} else if re.Pattern != "" {
 			owner = fmt.Sprintf("regexp %q", re.Pattern)
 		}
-		for _, name := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc, re.NamedGroupsFunc} {
+		for _, name := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc} {
 			if name == "" {
 				continue
 			}
@@ -526,10 +539,18 @@ type RegexEntry struct {
 	Pattern string `yaml:"pattern"`
 
 	// Optional function names — only those set are compiled and stubbed.
-	MatchFunc       string `yaml:"match_func"`        // anchored match → Option<usize>
-	FindFunc        string `yaml:"find_func"`         // non-anchored find → Option<(usize,usize)>
-	GroupsFunc      string `yaml:"groups_func"`       // anchored + captures → Option<Vec<Option<(usize,usize)>>>
-	NamedGroupsFunc string `yaml:"named_groups_func"` // anchored + named captures → Option<HashMap<&'static str,(usize,usize)>>
+	MatchFunc  string `yaml:"match_func"`  // anchored match → the end position, or none
+	FindFunc   string `yaml:"find_func"`   // non-anchored find → an iterator of (start, end)
+	GroupsFunc string `yaml:"groups_func"` // captures → an iterator of matches, each carrying its groups
+
+	// `named_groups_func:` was RETIRED by TODO task 62 and is a load error,
+	// which strict YAML decoding gives for free. It was never a separate
+	// capability: both stubs called the SAME WASM export, and the two differed
+	// only in how the item was assembled — a map keyed by name instead of a
+	// slice indexed by number, minus the whole match and minus the groups that
+	// did not participate. `groups_func` now carries both, with generated
+	// name→index constants and a `<func>_index` lookup, which also gives C and
+	// AssemblyScript named access they never had.
 
 	// Hints biases which suffix-DFA optimisation path to favour for this
 	// specific pattern, and/or requests extra WASM exports. Accepted values:
@@ -545,16 +566,12 @@ type RegexEntry struct {
 
 // CaptureStubsRequested reports whether any capture-returning stub is requested.
 func (r RegexEntry) CaptureStubsRequested() bool {
-	return r.GroupsFunc != "" || r.NamedGroupsFunc != ""
+	return r.GroupsFunc != ""
 }
 
 // GroupsExportName returns the WASM export name for the groups function.
-// GroupsFunc takes priority; falls back to NamedGroupsFunc.
 func (r RegexEntry) GroupsExportName() string {
-	if r.GroupsFunc != "" {
-		return r.GroupsFunc
-	}
-	return r.NamedGroupsFunc
+	return r.GroupsFunc
 }
 
 // LoadConfig reads and parses the YAML config at configPath.

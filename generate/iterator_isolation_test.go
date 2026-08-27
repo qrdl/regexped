@@ -32,8 +32,7 @@ func genStubsForIsolation(t *testing.T, ext string, batch bool) string {
 		Regexps: []config.RegexEntry{
 			{Name: "w", Pattern: `[a-z]+`, FindFunc: "findWords"},
 			{Name: "n", Pattern: `[0-9]+`, MatchFunc: "matchNums"},
-			{Name: "g", Pattern: `(?P<a>[a-z])(?P<b>[0-9])`,
-				GroupsFunc: "grp", NamedGroupsFunc: "ngrp"},
+			{Name: "g", Pattern: `(?P<a>[a-z])(?P<b>[0-9])`, GroupsFunc: "grp"},
 		},
 		Sets:     []config.SetConfig{sc},
 		StubFile: "out." + ext,

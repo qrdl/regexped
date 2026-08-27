@@ -3,7 +3,6 @@ package generate
 import (
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 
 	"github.com/qrdl/regexped/config"
@@ -20,7 +19,7 @@ func jsStub(cfg config.BuildConfig, out string) error {
 		_, err := os.Stdout.WriteString(content)
 		return err
 	}
-	return writeStub(out, []byte(content))
+	return writeStub(out, []byte(applyNamespace(cfg, "js", content)))
 }
 
 // genJSSetSection returns JS set wrappers appended to the module body.
@@ -68,9 +67,13 @@ func genJSSetSection(cfg config.BuildConfig) string {
 export function %s(input) {
     const [_inBase, _outBase, len] = _stage(input, 0);
     const id = _exp['%s'](_inBase, len);
+    // Tested EXACTLY, not as "negative": -1 is a real answer (nothing matched)
+    // and the sentinel means the engine gave up. Folding the two — which this
+    // did — turns "unknown" into a confident null.
+    if (id === %d) throw new Error("%s");
     return id < 0 ? null : id;
 }
-`, s.MatchAny, s.MatchAny)
+`, s.MatchAny, s.MatchAny, btOverflow, btOverflowMsg(s.MatchAny))
 		}
 		if s.MatchAll != "" {
 			if wide {
@@ -97,11 +100,14 @@ export function %s(input) {
     // The export returns an i64, which surfaces as a BigInt; it is decomposed
     // here and never reaches the caller.
     let mask = _exp['%s'](_inBase, len);
+    // The narrow form's return IS the bitmask, so the sentinel is tested
+    // before it is treated as one: -2n reads as "every id except 0 matched".
+    if (mask === %dn) throw new Error("%s");
     const out = [];
     for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
     return out;
 }
-`, s.MatchAll, s.MatchAll, idKonst)
+`, s.MatchAll, s.MatchAll, btOverflow, btOverflowMsg(s.MatchAll), idKonst)
 			}
 		}
 		if s.ScanAny != "" {
@@ -139,23 +145,25 @@ export function %s(input, from = 0) {
 export function %s(input, from = 0) {
     const [_inBase, _outBase, len] = _stage(input, 0);
     let mask = _exp['%s'](_inBase, len, from);
+    // The narrow form's return IS the bitmask, so the sentinel is tested
+    // before it is treated as one: -2n reads as "every id except 0 matched".
+    if (mask === %dn) throw new Error("%s");
     const out = [];
     for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
     return out;
 }
-`, s.ScanAll, s.ScanAll, idKonst)
+`, s.ScanAll, s.ScanAll, btOverflow, btOverflowMsg(s.ScanAll), idKonst)
 			}
 		}
 		if s.Find != "" {
-			gateSetup, gateArg, gateDoc := "", "", ""
-			if findGateArray(s) {
-				gateSetup = fmt.Sprintf(`    const gateBase = %s;
+			// Every set with `find` owns a gate array, overlapping included
+			// (SETS_PLAN item 11), so this is unconditional.
+			gateSetup := fmt.Sprintf(`    const gateBase = %s;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, gateBase, idKonst)
-				gateArg = "gateBase, "
-				gateDoc = "// The generator owns the gate array for its lifetime: dropping it and\n" +
-					"// creating a new one restarts the scan with clean gates.\n"
-			}
+			gateArg := "gateBase, "
+			gateDoc := "// The generator owns the gate array for its lifetime: dropping it and\n" +
+				"// creating a new one restarts the scan with clean gates.\n"
 			if !s.BatchFind() {
 				// No `batch-find` hint: no batchSize parameter at all, so TS
 				// rejects find(input, 0, 64) at build time and JS ignores it
@@ -202,12 +210,9 @@ export function %s(input, from = 0) {
 				// the ONLY difference, which is why it is a parameter rather
 				// than a second function — and why it is opt-in, since a
 				// caller who stops early has paid for matches never looked at.
-				batchGateSetup := ""
-				if findGateArray(s) {
-					batchGateSetup = fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
+				batchGateSetup := fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, idKonst)
-				}
 				fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }
 //
 // batchSize is how many tuples one WASM call may fill: 1 is a call per
@@ -390,18 +395,12 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 			sb.WriteString(genJSFindFunc(re.FindFunc))
 		}
 		if re.GroupsFunc != "" {
-			numGroups, _, err := extractGroupInfo(re.Pattern)
-			if err != nil {
-				return "", fmt.Errorf("pattern %q: %w", re.Pattern, err)
-			}
-			sb.WriteString(genJSGroupsFunc(re.GroupsFunc, numGroups))
-		}
-		if re.NamedGroupsFunc != "" {
 			numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
 			if err != nil {
 				return "", fmt.Errorf("pattern %q: %w", re.Pattern, err)
 			}
-			sb.WriteString(genJSNamedGroupsFunc(re.NamedGroupsFunc, re.GroupsExportName(), numGroups, namedGroups))
+			sb.WriteString(genJSGroupsFunc(re.GroupsFunc, numGroups))
+			sb.WriteString(genJSGroupIndices(re.GroupsFunc, numGroups, namedGroups))
 		}
 	}
 
@@ -584,106 +583,33 @@ export function* %[1]s(input, offset = 0) {
 `, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName))
 }
 
-// genJSNamedGroupsFunc generates a JS generator for named capture groups.
-// Yields a plain object per match with name → [start, end] entries.
-// Only groups that participated in the match are included.
+// genJSGroupIndices emits the name→index object for a groups function.
+// Replaces the retired `named_groups_func` (TODO task 62).
 //
-// Prefers the batch export (exportName+"_batch", requested via the
-// "batch-find" hint) when the loaded WASM provides one, same as
-// genJSGroupsFunc. Feature-detection and the record layout are
-// keyed on exportName — the WASM export this pattern's groups_func and
-// named_groups_func share (config.RegexEntry.GroupsExportName) — not on
-// funcName, so a named_groups_func-only pattern (no groups_func) still finds
-// its batch export, and a pattern requesting both gets one batch export
-// consumed by two independent generators.
-func genJSNamedGroupsFunc(funcName, exportName string, numGroups int, namedGroups map[string]int) string {
-	slotCount := numGroups * 2
-	recSize := 2 + slotCount // ints per batch record
-	recBytes := recSize * 4  // bytes per batch record
-
-	type entry struct {
-		name  string
-		index int
+// One frozen object rather than loose constants: that is how modern JS groups
+// related values, `Object.keys` then covers name enumeration, and it needs no
+// second lookup helper. The name carries an `indices` suffix because the
+// object is the only derived symbol with no suffix of its own — without one
+// its name would be the generator function's and the two would collide.
+func genJSGroupIndices(funcName string, numGroups int, namedGroups map[string]int) string {
+	if len(namedGroups) == 0 {
+		return ""
 	}
-	var entries []entry
-	for name, idx := range namedGroups {
-		entries = append(entries, entry{name, idx})
+	names := groupNameSlots(numGroups, namedGroups)
+
+	var out strings.Builder
+	fmt.Fprintf(&out, `// Index of each NAMED capture group of %s. Index 0 is the whole match;
+// unnamed groups are absent and are addressed by number. Object.keys() gives
+// you the names, and the yielded array's length is always %d whether or not a
+// group participated.
+export const %s = Object.freeze({
+`, funcName, numGroups, derivedConstName(funcName, "indices"))
+	for idx, name := range names {
+		if name == "" {
+			continue
+		}
+		fmt.Fprintf(&out, "    %s: %d,\n", name, idx)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].index < entries[j].index })
-
-	var inserts strings.Builder
-	for _, e := range entries {
-		fmt.Fprintf(&inserts,
-			"        if (slots[%d] >= 0) result['%s'] = [slots[%d], slots[%d]];\n",
-			e.index*2, e.name, e.index*2, e.index*2+1)
-	}
-
-	var batchInserts strings.Builder
-	for _, e := range entries {
-		fmt.Fprintf(&batchInserts,
-			"                if (outBuf[base + 2 + %d] >= 0) result['%s'] = [outBuf[base + 2 + %d], outBuf[base + 2 + %d]];\n",
-			e.index*2, e.name, e.index*2, e.index*2+1)
-	}
-
-	return fmt.Sprintf(`// %[1]s — yields named capture group objects per match.
-// Each object maps name → [start, end] (absolute) for participating groups.
-export function* %[1]s(input, offset = 0) {
-    const _batched = typeof _exp['%[2]s_batch'] === 'function';
-    // One region for whichever path runs, held for this iterator's lifetime so
-    // an interleaved stub call cannot overwrite the staged input mid-scan.
-    const [_inBase, _outBase, len] = _open(input, _batched ? %[3]d * %[4]d : 0);
-    try {
-    if (_batched) {
-        let outBuf = new Int32Array(_mem.buffer, _outBase, %[3]d * %[5]d);
-        let startPos = offset;
-        while (true) {
-            const n = _exp['%[2]s_batch'](_inBase, len, _outBase, %[3]d, startPos);
-            if (n === %[9]d) throw new Error("%[10]s");
-            if (n <= 0) break;
-            for (let i = 0; i < n; i++) {
-                // Re-attached each step: the yield below hands control back,
-                // and a grow there detaches every view in the module.
-                outBuf = _att(outBuf, Int32Array, _outBase, %[3]d * %[5]d);
-                const base = i * %[5]d;
-                const result = {};
-%[6]s                yield result;
-            }
-            if (n < %[3]d) break;
-            outBuf = _att(outBuf, Int32Array, _outBase, %[3]d * %[5]d);
-            const lastBase = (n - 1) * %[5]d;
-            const lastStart = outBuf[lastBase], lastEnd = outBuf[lastBase + 1];
-            startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
-        }
-        return;
-    }
-    // Hoisted out of the loop rather than rebuilt per match, and re-attached
-    // by _att when an interleaved call grew memory while suspended.
-    let slots = new Int32Array(_mem.buffer, _outBase, %[7]d);
-    let off = offset;
-    let prevEnd = -1;
-    while (off <= len) {
-        slots = _att(slots, Int32Array, _outBase, %[7]d);
-        slots.fill(-1);
-        const r = _exp['%[2]s'](_inBase, len, _outBase, off);
-        if (r === %[9]d) throw new Error("%[10]s");
-        if (r < 0) {
-            if (off === len) break;
-            off++;
-            continue;
-        }
-        const matchEnd = slots[1] >= 0 ? slots[1] : slots[0];
-        const result = {};
-%[8]s        const absStart = slots[0], absEnd = matchEnd;
-        off = absEnd > absStart ? absEnd : absStart + 1;
-        // Go's FindAllSubmatchIndex rule: suppress an EMPTY match beginning
-        // exactly where the previous reported match ended. The advance above
-        // is unchanged.
-        if (absStart === absEnd && absStart === prevEnd) continue;
-        prevEnd = absEnd;
-        yield result;
-    }
-    } finally { _close(); }
-}
-
-`, funcName, exportName, lm2BatchCap, recBytes, recSize, batchInserts.String(), slotCount, inserts.String(), btOverflow, btOverflowMsg(funcName))
+	out.WriteString("});\n\n")
+	return out.String()
 }

@@ -490,7 +490,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 			"capture_named_ghp",
 			[]config.RegexEntry{{
 				Pattern:         `(?P<key>ghp_[A-Za-z0-9]{36})`,
-				NamedGroupsFunc: "ghp_named_groups",
+				GroupsFunc:      "ghp_named_groups",
 			}},
 		},
 		{
@@ -504,14 +504,14 @@ func TestCompileLikelyMatch(t *testing.T) {
 			"capture_prefixed_named",
 			[]config.RegexEntry{{
 				Pattern:         `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
-				NamedGroupsFunc: "prefixed_named_groups",
+				GroupsFunc:      "prefixed_named_groups",
 			}},
 		},
 		{
 			"capture_strict_alt_named_only",
 			[]config.RegexEntry{{
 				Pattern:         `(?P<aws>AKIA[A-Z0-9]{16})|(?P<gh>ghp_[A-Za-z0-9]{36})`,
-				NamedGroupsFunc: "strict_alt_named_only",
+				GroupsFunc:      "strict_alt_named_only",
 			}},
 		},
 		// Lit-chain range with captures (single branch).
@@ -526,7 +526,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 			"capture_range_named_groups",
 			[]config.RegexEntry{{
 				Pattern:         `(?P<key>secret_[A-Za-z0-9]{24,40})`,
-				NamedGroupsFunc: "secret_range_named",
+				GroupsFunc:      "secret_range_named",
 			}},
 		},
 
@@ -544,7 +544,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 			[]config.RegexEntry{{
 				Pattern:         `(?P<key>ghp_[A-Za-z0-9]{36})`,
 				FindFunc:        "ghp_find_cap",
-				NamedGroupsFunc: "ghp_named_groups_cap",
+				GroupsFunc:      "ghp_named_groups_cap",
 			}},
 		},
 		{
@@ -560,7 +560,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 			[]config.RegexEntry{{
 				Pattern:         `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
 				FindFunc:        "prefixed_find_cap",
-				NamedGroupsFunc: "prefixed_named_groups_cap",
+				GroupsFunc:      "prefixed_named_groups_cap",
 			}},
 		},
 		{
@@ -607,7 +607,6 @@ func TestCompileLikelyMatch(t *testing.T) {
 				Pattern:         `(?P<gh>ghp_[A-Za-z0-9]{36})|(?P<aws>aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40})`,
 				FindFunc:        "lenient_alt_find_named_cap",
 				GroupsFunc:      "lenient_alt_groups_named_cap",
-				NamedGroupsFunc: "lenient_alt_named_groups_cap",
 			}},
 		},
 	}
@@ -1346,7 +1345,7 @@ func TestBatchExportGating(t *testing.T) {
 	// p.groupsExport is empty here.
 	namedOnlyEntries := []config.RegexEntry{{
 		Pattern:         `(a)(b)?`,
-		NamedGroupsFunc: "named_ab",
+		GroupsFunc:      "named_ab",
 		Hints:           []string{"batch-find"},
 	}}
 
@@ -1421,20 +1420,19 @@ func TestBatchExportGating(t *testing.T) {
 			t.Error("akia_groups_batch export present without batch-find hint, should be absent")
 		}
 	})
-	t.Run("named_only_batch_export_named_after_namedGroupsFunc", func(t *testing.T) {
+	t.Run("batch_export_named_after_groupsFunc", func(t *testing.T) {
 		wasm, _, err := Compile(namedOnlyEntries, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
 		if !bytes.Contains(wasm, []byte("named_ab_batch")) {
-			t.Error("expected named_ab_batch export (GroupsExportName falls back to NamedGroupsFunc), not found")
+			t.Error("expected named_ab_batch export, not found")
 		}
 	})
 	t.Run("groups_and_named_share_one_batch_export", func(t *testing.T) {
 		both := []config.RegexEntry{{
 			Pattern:         `(a)(b)?`,
 			GroupsFunc:      "g1",
-			NamedGroupsFunc: "g2",
 			Hints:           []string{"batch-find"},
 		}}
 		wasm, _, err := Compile(both, 0, true)

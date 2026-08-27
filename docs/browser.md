@@ -90,18 +90,20 @@ for (const groups of parse_record(text)) {
 
 Returns a generator yielding `Array<[start, end] | null>` per match. Index 0 is the full match.
 
-### `named_groups_func` — named capture groups
+### Named groups — index constants
+
+`named_groups_func` is retired. `groups_func` carries names too: when a pattern
+has at least one named group, the stub also exports a frozen `<func>_indices`
+object mapping each name to its group index.
 
 ```js
-import { parse_url } from './regexp.js';
+import { parse_url, parse_url_indices } from './regexp.js';
 
-for (const parts of parse_url(text)) {
-    const [s, e] = parts['host'] ?? [0, 0];
-    console.log('host:', text.slice(s, e));
+for (const match of parse_url(text)) {
+    const host = match[parse_url_indices.host];
+    if (host) console.log('host:', text.slice(host[0], host[1]));
 }
 ```
-
-Returns a generator yielding a plain object mapping group name → `[start, end]` for groups that participated in the match.
 
 ## Embedding in HTML
 

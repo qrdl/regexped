@@ -36,7 +36,7 @@ included without conflicts:
 #include <stddef.h>   /* size_t, ptrdiff_t -- freestanding-required, no libc */
 
 typedef struct { ptrdiff_t start, end; } rx_match_t;
-typedef struct { ptrdiff_t start, end; const char *name; } rx_group_t;
+typedef struct { ptrdiff_t start, end; } rx_group_t;
 typedef struct { int pattern_id; ptrdiff_t start, end; } rx_set_match_t;
 ```
 
@@ -76,84 +76,104 @@ if (end >= 0) {
 
 ---
 
-### `find_func` — non-anchored find
+### `find_func` — non-anchored find iterator
 
 ```c
-rx_match_t <func>(const char *input, size_t len, size_t offset);
+typedef struct {
+    const char *input;
+    size_t len, offset, prev_end;
+    int done;
+} rx_<func>_iter_t;
+
+int <func>_init(rx_<func>_iter_t *iter, const char *input, size_t len, size_t offset);
+int <func>_next(rx_<func>_iter_t *iter, rx_match_t *out_match);
 ```
 
-Scans for the next match at or after `offset`. The whole input stays visible to
-the engine — `offset` bounds where the search starts, it does not truncate the
-left context a leading `\b`, `\B` or `(?m:^)` is judged against. Returns
-absolute byte positions
-`{start, end}`, or `{-1, -1}` if not found.
+Scans for non-overlapping matches at or after `offset`. The whole input stays visible to the engine — `offset` bounds where the search starts, it does not truncate the left context a leading `\b`, `\B` or `(?m:^)` is judged against. Positions are absolute.
 
-To iterate all non-overlapping matches:
+`_next` returns `1` when it wrote a match, `0` when the scan is finished, and `RX_ERR_BT_OVERFLOW` when the engine gave up and what remains is unknown.
 
 ```c
-unsigned int off = 0;
-ptrdiff_t prev_end = -1;
-while (off <= len) {
-    rx_match_t m = find_token(input, len, off);
-    if (m.start < 0) break;
-    off = (unsigned int)(m.end > m.start ? m.end : m.start + 1);
-    /* Go's FindAllIndex rule: an empty match beginning exactly where the
-       previous reported match ended is not reported. Skip it AFTER
-       advancing, or the loop stalls. */
-    if (m.start == m.end && m.start == prev_end) continue;
-    prev_end = m.end;
-    /* use m.start, m.end */
+rx_find_token_iter_t iter;
+find_token_init(&iter, input, len, 0);
+
+rx_match_t match;
+int status;
+while ((status = find_token_next(&iter, &match)) == 1) {
+    /* use match.start, match.end */
+}
+if (status == RX_ERR_BT_OVERFLOW) {
+    /* the result is unknown, not "no more matches" */
+}
+```
+
+The iterator owns the advance past a zero-length match and Go's `FindAllIndex` rule — an empty match beginning exactly where the previous reported match ended is not reported. Both used to be your job, copied from this document.
+
+---
+
+### `groups_func` — capture-match iterator
+
+```c
+typedef struct {
+    const char *input;
+    size_t len, offset, prev_end;
+    int done;
+} rx_<func>_iter_t;
+
+int <func>_init(rx_<func>_iter_t *iter, const char *input, size_t len, size_t offset);
+int <func>_next(rx_<func>_iter_t *iter, rx_group_t out_groups[static <FUNC_UPPER>_GROUPS]);
+```
+
+`_next` writes this match's groups into **your** array and returns:
+
+| return | meaning |
+|---|---|
+| `1` | a match was written |
+| `0` | the scan is finished |
+| `RX_ERR_BT_OVERFLOW` | the engine gave up; what remains is **unknown** |
+
+The status is the return value rather than something written into `out_groups`, so `0` stays unambiguously "finished".
+
+`out_groups[0]` is the whole match; subsequent entries are capture groups in source order. A group that did not participate is `{-1, -1}`, so the array length never depends on which groups matched.
+
+The iterator is **caller-owned**, so two scans can be in flight and re-initialising the struct restarts one. It owns the advance and the empty-match rule — the logic this document used to ask you to copy into your own loop, which is the part that got subtly and silently wrong.
+
+```c
+rx_parse_url_iter_t iter;
+parse_url_init(&iter, input, len, 0);
+
+rx_group_t groups[PARSE_URL_GROUPS];
+int status;
+while ((status = parse_url_next(&iter, groups)) == 1) {
+    rx_group_t host = groups[parse_url_host];
+    if (host.start >= 0) {
+        /* host matched: input[host.start .. host.end] */
+    }
+}
+if (status == RX_ERR_BT_OVERFLOW) {
+    /* the result is unknown, not "no more matches" */
 }
 ```
 
 ---
 
-### `groups_func` — capture groups
+### Named groups — index constants
+
+`named_groups_func` used to be **rejected** for C. It is now retired for every language, and C gains the named access it never had: when a pattern has at least one named group, `groups_func` additionally emits
 
 ```c
-const rx_group_t *<func>(const char *input, size_t len, size_t offset, rx_group_t *out);
+#define <func>_scheme 1     /* one per NAMED group; index 0 is the whole match */
+#define <func>_host   2
+
+int <func>_index(const char *name);          /* -1 if unknown */
+const char *const *<func>_names(void);       /* <FUNC_UPPER>_GROUPS entries */
 ```
 
-Returns a pointer to a **static array** of `<FUNC_UPPER>_GROUPS` entries. The array is
-valid until the next call to the same function. `groups[0]` is the full match;
-subsequent entries are capture groups in order.
+The constants cover a name known at compile time; `_index` is for one chosen at runtime. An **empty** name is never found — a pattern may hold several unnamed groups, so `""` identifies nothing. `_names` is aligned with indices: entry *i* names the group at index *i* and is `""` where it has none, index 0 included.
 
-All entries have `start == -1` and `end == -1` when no match is found starting from
-`offset`.
+`rx_group_t` no longer carries a `name` pointer. Identity is the index now, so the pointer duplicated the name table and cost a pointer per group.
 
-> **Note:** `named_groups_func` is **not supported** for C stubs — the generator will
-> return an error. Use `groups_func` and identify groups by their index constants
-> (`<FUNC_UPPER>_GROUP_<NAME>`) instead.
-
-**Group name constants** are declared as `extern const char * const <FUNC_UPPER>_GROUP_<NAME>`
-(a pointer variable, not an array) and defined in `stub.c`. Use `==` (pointer identity) for fast group name comparison:
-
-```c
-for (int i = 0; i < PARSE_URL_GROUPS; i++) {
-    if (groups[i].name == PARSE_URL_GROUP_HOST && groups[i].start >= 0) {
-        /* host matched */
-    }
-}
-```
-
-To iterate non-overlapping matches:
-
-```c
-unsigned int off = 0;
-ptrdiff_t prev_end = -1;
-while (off <= len) {
-    const rx_group_t *groups = parse_url(input, len, off);
-    if (groups[0].start < 0) break;
-    off = (unsigned int)(groups[0].end > groups[0].start
-                         ? groups[0].end : groups[0].start + 1);
-    /* Go's FindAllSubmatchIndex rule: an empty match beginning exactly where
-       the previous reported match ended is not reported. Skip it AFTER
-       advancing, or the loop stalls. */
-    if (groups[0].start == groups[0].end && groups[0].start == prev_end) continue;
-    prev_end = groups[0].end;
-    /* process groups[] */
-}
-```
+These names follow **your** config's casing, not C's SCREAMING convention, because they derive from a name you chose.
 
 ---
 
@@ -161,10 +181,13 @@ while (off <= len) {
 
 | Config field | Generated function | Returns |
 |---|---|---|
-| `match_func` | `int <func>(input, len)` | end position `>=0`, or `-1` |
-| `find_func` | `rx_match_t <func>(input, len, offset)` | `{start, end}` absolute, or `{-1,-1}` |
-| `groups_func` | `const rx_group_t *<func>(input, len, offset)` | static array of `rx_group_t` |
-| `named_groups_func` | **not supported** — generator returns an error | — |
+| `match_func` | `ptrdiff_t <func>(input, len)` | end position `>=0`, `-1`, or `RX_ERR_BT_OVERFLOW` |
+| `find_func` | `<func>_init` + `<func>_next(iter, &match)` | `1` wrote a match, `0` finished, `RX_ERR_BT_OVERFLOW` unknown |
+| `groups_func` | `<func>_init` + `<func>_next(iter, groups)` | same three-way status |
+
+`named_groups_func` is **retired** for every language; C reaches named groups through the index constants above.
+
+C is the one target that never panicked or threw — it has no unwinding, and its return types were already integer error codes with a documented negative case.
 
 ---
 
@@ -275,10 +298,14 @@ surface.
 
 ## Notes
 
-- The static array returned by a groups function is **not thread-safe** and is
-  **overwritten on each call**. Copy results before calling again.
-- Group name pointer comparison (`==`) is valid because all calls return pointers into
-  the same static name table defined in `stub.c`. Do not compare by string value.
+- Every iterator and every output array is **caller-owned**, so two scans can be
+  in flight and nothing is overwritten behind your back. That is re-entrancy,
+  not thread-safety: the Backtracking engine keeps its stack and BitState memo
+  at fixed addresses in the module's memory, so a BT-compiled pattern is not
+  safe to drive from two threads sharing one instance.
+- Groups are addressed by **index**, with a constant per named group. The
+  `name` pointer `rx_group_t` used to carry is gone — the index carries identity
+  now, and the pointer duplicated the name table at a pointer per group.
 - The `#define <FUNC_UPPER>_GROUPS` constant gives the total number of groups
   including group 0 (full match). Use it to size loops or slot arrays.
 - No heap allocation or libc is required. The stubs are self-contained and suitable
@@ -299,10 +326,10 @@ C has no unwinding, so the sentinel is returned to the caller instead. The heade
 
 | Function shape | Value on overflow |
 |---|---|
-| anchored match (`int`) | `RX_ERR_BT_OVERFLOW` |
-| find (`rx_match_t`) | `{RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW}` |
-| groups (`const rx_group_t *`) | `NULL` — never returned otherwise |
+| anchored match (`ptrdiff_t`) | `RX_ERR_BT_OVERFLOW` |
+| `<func>_next` (find and groups) | `RX_ERR_BT_OVERFLOW` as the return status |
+| set `_any` / `_all` (`int`) | `RX_ERR_BT_OVERFLOW` |
 
-Check for it wherever you currently check for `-1` / `{-1, -1}`: a plain `< 0` or `.start < 0` test silently treats overflow as "no match", which is the exact failure the sentinel exists to prevent.
+Check for it wherever you currently check for `-1`: a plain `< 0` test silently treats overflow as "no match", which is the exact failure the sentinel exists to prevent. The iterators make that harder to get wrong — a `while (… == 1)` loop leaves the failing status in the variable for you to test afterwards.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

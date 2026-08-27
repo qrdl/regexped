@@ -2,4 +2,4 @@
 # word boundaries, no ambiguous alternations.
 regexps:
   - pattern: '(?P<scheme>https?)://(?P<host>[a-z.]+)/(?P<path>[a-z/]*)'
-    named_groups_func: tdfa_groups
+    groups_func: tdfa_groups

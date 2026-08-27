@@ -122,30 +122,33 @@ if (first && first[1] !== null) {
 
 ---
 
-### `named_groups_func` — named capture groups generator
+### Named groups — one frozen index object
+
+`named_groups_func` is **retired** (a config key using it is a load error). It was never a separate capability: both stubs called the *same* WASM export, and the two differed only in how the item was assembled — an object keyed by name instead of an array indexed by number, minus the whole match and minus the groups that did not participate.
+
+When a pattern has at least one named group, `groups_func` additionally emits one object:
 
 ```js
-export function* <func>(input: string | Uint8Array): Generator<Object>
+export const <groups_func>_indices = Object.freeze({
+    scheme: 1,   // one per NAMED group; index 0 is the whole match
+    host:   2,
+});
 ```
-
-Generator that yields one plain object per non-overlapping match. Each key is a capture group name; the value is `[start, end]` (absolute byte positions). Only groups that participated in the match are present.
 
 ```js
-// All matches:
-for (const parts of parse_url(text)) {
-    if ('host' in parts) {
-        const [s, e] = parts['host'];
-        console.log('host:', text.slice(s, e));
-    }
+for (const match of parse_url(text)) {
+    const host = match[parse_url_indices.host];
+    if (host) console.log('host:', text.slice(host[0], host[1]));
 }
 
-// First match only:
-const first = parse_url(text).next().value;
-if (first?.host) {
-    const [s, e] = first['host'];
-    console.log('host:', text.slice(s, e));
-}
+Object.keys(parse_url_indices);   // the group names
 ```
+
+The `_indices` suffix is required, not decorative: the object is the only derived symbol with no suffix of its own, so without one its name would be the generator function's and the two would collide.
+
+The name follows **your** config's casing — `groups_func: parse_url` yields `parse_url_indices`, `groups_func: parseUrl` yields `parseUrlIndices`.
+
+Duplicate or colliding group names are rejected at **config load**: `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`, but both would collapse to one generated key.
 
 ---
 
@@ -226,7 +229,7 @@ requested `emit_name_map: true`.
 | `match_func` | `function <func>(input)` | `number \| null` — the end position, or null |
 | `find_func` | `function* <func>(input, offset = 0)` | generator of `[start, end]` |
 | `groups_func` | `function* <func>(input, offset = 0)` | generator of `Array<[start,end]\|null>` |
-| `named_groups_func` | `function* <func>(input, offset = 0)` | generator of `Object` (name → `[start,end]`) |
+| `<groups_func>_indices` | frozen object | name → group index, emitted when the pattern has named groups |
 
 Generated export names match the config field values exactly (no case conversion). All positions are byte offsets in the UTF-8 encoded form of the input. Input can be a `string` (UTF-8 encoded automatically) or a `Uint8Array`.
 
@@ -258,7 +261,9 @@ with no boundary to amortise. The hint is a no-op there.
 - `init()` must be awaited before calling any matcher. Calling a matcher before `init()` will throw.
 - The stub uses top-level `await` internally — it is designed for ES module environments (browser, Node.js with `"type": "module"`, Cloudflare Workers).
 - `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. The stub is not re-entrant: do not call two generators concurrently on the same stub module instance.
-- `find_func`, `groups_func`, and `named_groups_func` generators automatically detect and use an internal `<func>_batch` WASM export when present, draining several matches per host↔WASM call instead of one. This export only exists when the pattern was compiled with `hints: [batch-find]` (see [`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)); it's purely an internal performance path and doesn't change the generator's external `[start,end]` / capture-array / named-object output. Covers every `groups_func`/`named_groups_func` shape, including the native lit-chain ("Path B") groups bodies. When both `groups_func` and `named_groups_func` are set on the same entry they share one batch export (named after `groups_func`); a `named_groups_func`-only entry gets its own, named after itself.
+- `find_func` and `groups_func` generators automatically detect and use an internal `<func>_batch` WASM export when present, draining several matches per host↔WASM call instead of one. This export only exists when the pattern was compiled with `hints: [batch-find]` (see [`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)); it's purely an internal performance path and doesn't change the generator's external `[start,end]` / capture-array output. Covers every `groups_func` shape, including the native lit-chain ("Path B") groups bodies.
+
+  The rule about `groups_func` and `named_groups_func` *sharing* a batch export is gone with the key: one capability, one export, one name.
 
 ---
 
@@ -267,5 +272,7 @@ with no boundary to amortise. The hint is a no-op there.
 Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
 
 The generated function **throws** an `Error` whose message names the function. Since the find/groups functions are generators, the throw surfaces from the `next()` call (i.e. from the `for...of` loop), not from the call that creates the generator.
+
+**Three set exports used to swallow it.** `match_any` folded `-2` into `null`, and the narrow `match_all`/`scan_all` treated it as a bitmask — `-2` reads as *every id except 0 matched*. All three now throw. Neither could fire in practice, but the invariants that kept them safe lived in the compiler rather than beside the code that depended on them.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

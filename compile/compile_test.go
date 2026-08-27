@@ -199,10 +199,7 @@ func TestCompileIntegrationTDFA(t *testing.T) {
 		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}})
 	})
 	t.Run("named_groups", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", NamedGroupsFunc: "ng"}})
-	})
-	t.Run("groups_and_named", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", GroupsFunc: "g", NamedGroupsFunc: "ng"}})
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}})
 	})
 	t.Run("find_and_groups", func(t *testing.T) {
 		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a+)(b+)", FindFunc: "f", GroupsFunc: "g"}})
@@ -227,7 +224,7 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	})
 	t.Run("named_groups_forced", func(t *testing.T) {
 		_, _, err := CompileForced(
-			[]config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", NamedGroupsFunc: "ng"}},
+			[]config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {

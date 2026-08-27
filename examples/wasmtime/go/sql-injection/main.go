@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -31,28 +32,45 @@ var appLog = strings.Join([]string{
 
 func main() {
 	fmt.Println("=== is_sqli: anchored match (is this value a SQL injection?) ===")
-	for _, v := range values {
-		_, matched := IsSqli([]byte(v))
+	for _, value := range values {
+		_, matched, err := is_sqli([]byte(value))
+		if err != nil {
+			// The engine could not decide — NOT the same as "clean".
+			fmt.Fprintln(os.Stderr, "is_sqli:", err)
+			os.Exit(2)
+		}
 		label := "clean    "
 		if matched {
 			label = "INJECTION"
 		}
-		fmt.Printf("  [%s] %s\n", label, v)
+		fmt.Printf("  [%s] %s\n", label, value)
 	}
 
 	fmt.Println("\n=== find_sqli: find injection byte ranges in application log ===")
-	for start, end := range FindSqli([]byte(appLog), 0) {
+	findIter := find_sqli([]byte(appLog), 0)
+	for start, end := range findIter.Matches() {
 		snippet := appLog[start:end]
 		if len(snippet) > 60 {
 			snippet = snippet[:60] + "..."
 		}
 		fmt.Printf("  [%d:%d] %s\n", start, end, snippet)
 	}
+	if err := findIter.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "find_sqli:", err)
+		os.Exit(2)
+	}
 
 	fmt.Println("\n=== parse_sqli: extract injection type and payload ===")
-	for fields := range ParseSqli([]byte(appLog), 0) {
-		typeName := appLog[fields["type"][0]:fields["type"][1]]
-		payload := strings.TrimSpace(appLog[fields["payload"][0]:fields["payload"][1]])
-		fmt.Printf("  type=%-35s  payload=%s\n", typeName, payload)
+	// Named groups are generated index constants now, not a per-match map.
+	parseIter := parse_sqli([]byte(appLog), 0)
+	for match := range parseIter.Matches() {
+		injectionType := match[parse_sqli_type]
+		payloadSpan := match[parse_sqli_payload]
+		payload := strings.TrimSpace(appLog[payloadSpan.Start:payloadSpan.End])
+		fmt.Printf("  type=%-35s  payload=%s\n", appLog[injectionType.Start:injectionType.End], payload)
+	}
+	if err := parseIter.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "parse_sqli:", err)
+		os.Exit(2)
 	}
 }

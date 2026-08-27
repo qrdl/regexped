@@ -1,0 +1,166 @@
+package generate
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+
+	"github.com/qrdl/regexped/config"
+)
+
+// TestGeneratedStubsCompile hands each generated stub to that language's own
+// compiler.
+//
+// WHY THIS EXISTS. Every other test in this package checks the generated
+// SOURCE TEXT — `strings.Contains(out, "pub fn url_match")` and the like. That
+// cannot see a type error, and one lived here undetected: the Rust groups stub
+// declared its FFI import with THREE parameters and called it with four (the
+// `offset` TODO task 59 added — the call site was updated, the declaration was
+// not). Generated Rust for any `groups_func` had not compiled since, and no
+// test noticed, because none of them ever compiled anything.
+//
+// A source-text assertion can only check what someone thought to assert. A
+// compiler checks everything at once, including the next mistake nobody
+// predicted.
+//
+// TOOLCHAINS. Only Go is guaranteed — these tests are written in it. Every
+// other language is SKIPPED when its compiler is not on PATH, so this is a
+// stronger check on a developer machine than in a bare CI container and never
+// a false failure. Skipped in -short.
+func TestGeneratedStubsCompile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("compiling generated stubs is slow; skipped in -short")
+	}
+
+	// One config exercising every export shape: the three single-pattern
+	// funcs, named groups (so the index constants are emitted), and all five
+	// set capabilities.
+	cfg := config.BuildConfig{
+		Output:       "merged.wasm",
+		ImportModule: "demo",
+		Regexps: []config.RegexEntry{
+			{
+				Name:       "url",
+				Pattern:    `(?P<scheme>https?)://(?P<host>[a-z.]+)/([a-z/]*)`,
+				MatchFunc:  "url_match",
+				FindFunc:   "url_find",
+				GroupsFunc: "url_groups",
+			},
+			{Name: "aws", Pattern: `AKIA[A-Z0-9]{16}`},
+			{Name: "gh", Pattern: `ghp_[0-9a-zA-Z]{36}`},
+		},
+		Sets: []config.SetConfig{{
+			Name:        "sec",
+			MatchAny:    "which_secret",
+			MatchAll:    "all_kinds",
+			ScanAny:     "first_secret",
+			ScanAll:     "kinds",
+			Find:        "scan_secrets",
+			Patterns:    config.PatternSelector{All: true},
+			EmitNameMap: true,
+		}},
+	}
+
+	for _, lang := range []struct {
+		name     string
+		file     string
+		write    func(config.BuildConfig, string) error
+		compiler string // "" means the language needs no external tool beyond Go
+		compile  func(t *testing.T, dir, path string)
+	}{
+		{"rust", "stubs.rs", rustStub, "rustc", compileRust},
+		{"go", "stubs.go", goStub, "", compileGo},
+		{"c", "stubs.h", cStub, "cc", compileC},
+		{"js", "stubs.js", jsStub, "node", checkJS},
+		{"as", "stubs.ts", asStub, "asc", compileAS},
+		// TypeScript has no check here: `tsc` is not a toolchain this repo
+		// otherwise needs, and the TS generator is a near-copy of the JS one
+		// whose output IS checked. Add it if tsc ever becomes a dependency.
+	} {
+		t.Run(lang.name, func(t *testing.T) {
+			if lang.compiler != "" {
+				if _, err := exec.LookPath(lang.compiler); err != nil {
+					t.Skipf("%s not on PATH; this check is a no-op here", lang.compiler)
+				}
+			}
+			dir := t.TempDir()
+			path := filepath.Join(dir, lang.file)
+			cfg := cfg
+			cfg.StubFile = lang.file
+			if err := lang.write(cfg, path); err != nil {
+				t.Fatalf("generate %s stub: %v", lang.name, err)
+			}
+			lang.compile(t, dir, path)
+		})
+	}
+}
+
+// run executes a command and fails the test with its combined output. The
+// output is the whole point: a compiler diagnostic names the line, which a
+// bare exit code does not.
+func run(t *testing.T, dir string, env []string, name string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", name, err, out)
+	}
+}
+
+// compileRust type-checks the stub for the HOST target rather than
+// wasm32-wasip1, so the check does not depend on that target being installed.
+// An FFI arity or type error — the class this test exists for — is caught
+// either way.
+func compileRust(t *testing.T, dir, path string) {
+	t.Helper()
+	run(t, dir, nil, "rustc",
+		"--crate-type=lib", "--edition=2021",
+		"-A", "dead_code", "-A", "non_upper_case_globals",
+		"--out-dir", dir, path)
+}
+
+// compileGo builds for wasip1, the only target the stub's build tag admits.
+// It needs a module and a main function: the stub is `package main` and would
+// otherwise fail to link rather than to compile.
+func compileGo(t *testing.T, dir, _ string) {
+	t.Helper()
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	write("go.mod", "module generatedstub\n\ngo 1.23\n")
+	write("main.go", "//go:build wasip1\n\npackage main\n\nfunc main() {}\n")
+	run(t, dir, []string{"GOOS=wasip1", "GOARCH=wasm", "GOFLAGS=-mod=mod"}, "go", "build", "./...")
+}
+
+// compileC syntax-checks the .c, which includes the .h the generator wrote
+// beside it. The import_module/import_name attributes are wasm-only and draw
+// an ignored-attribute warning on a host compiler; that is not an error and
+// -fsyntax-only still type-checks every declaration and call.
+func compileC(t *testing.T, dir, path string) {
+	t.Helper()
+	cPath := path[:len(path)-len(filepath.Ext(path))] + ".c"
+	if _, err := os.Stat(cPath); err != nil {
+		t.Fatalf("C generator wrote no .c beside %s: %v", path, err)
+	}
+	run(t, dir, nil, "cc", "-fsyntax-only", "-Wno-attributes", cPath)
+}
+
+// checkJS parses the module. Node has no type checker, so this catches syntax
+// errors only — which is still more than a source-text assertion does.
+func checkJS(t *testing.T, dir, path string) {
+	t.Helper()
+	run(t, dir, nil, "node", "--check", path)
+}
+
+// compileAS type-checks with the AssemblyScript compiler.
+func compileAS(t *testing.T, dir, path string) {
+	t.Helper()
+	run(t, dir, nil, "asc", path, "--noEmit")
+}

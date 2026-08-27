@@ -32,6 +32,8 @@ func cStub(cfg config.BuildConfig, out string) error {
 		return err
 	}
 	base := strings.TrimSuffix(out, filepath.Ext(out))
+	hContent = applyNamespace(cfg, "c", hContent)
+	cContent = applyNamespace(cfg, "c", cContent)
 	if err := writeStub(base+".h", []byte(hContent)); err != nil {
 		return err
 	}
@@ -69,18 +71,20 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 	// the signed/unsigned warning in for (int i = 0; i < n; i++).
 	hb.WriteString("#include <stddef.h>   /* size_t, ptrdiff_t -- freestanding-required, no libc */\n\n")
 	hb.WriteString("typedef struct { ptrdiff_t start, end; } rx_match_t;\n")
-	hb.WriteString("typedef struct { ptrdiff_t start, end; const char *name; } rx_group_t;\n")
+	// The `name` field is gone (TODO task 62): identity is the INDEX now, so
+	// the name pointer duplicated the index-aligned table and cost a pointer per group.
+	hb.WriteString("typedef struct { ptrdiff_t start, end; } rx_group_t;\n")
 	hb.WriteString("typedef struct { int pattern_id; ptrdiff_t start, end; } rx_set_match_t;\n")
 	hb.WriteString("\n")
 	hb.WriteString("/* Returned when the Backtracking engine exhausted its backtrack-frame\n")
 	hb.WriteString("   budget on this input. The engine abandoned part of the search space, so\n")
 	hb.WriteString("   whether the input matches is UNKNOWN -- this is NOT \"no match\". Treat it\n")
 	hb.WriteString("   as an error: shorten the input, or raise the pattern's frame budget.\n")
-	hb.WriteString("   Unlike the other language stubs (which throw or panic), C has no\n")
-	hb.WriteString("   unwinding, so the sentinel is returned to the caller: an int-returning\n")
-	hb.WriteString("   match function returns it directly, a find function returns\n")
-	hb.WriteString("   {RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW}, and a groups function returns\n")
-	hb.WriteString("   NULL (which it never does otherwise). See docs/engines.md. */\n")
+	hb.WriteString("   C has no unwinding, so the sentinel is RETURNED: a match function\n")
+	hb.WriteString("   returns it directly, and an iterator's _next returns it as its status\n")
+	hb.WriteString("   instead of 1 (wrote a match) or 0 (finished). Test it EXACTLY -- a\n")
+	hb.WriteString("   plain < 0 check reports \"unknown\" as a confident \"no\".\n")
+	hb.WriteString("   See docs/engines.md. */\n")
 	fmt.Fprintf(&hb, "#define RX_ERR_BT_OVERFLOW (%d)\n", btOverflow)
 	hb.WriteString("/* Argument errors from the scanner initialisers. */\n")
 	hb.WriteString("#define RX_ERR_NULL_ARG    (-3)\n")
@@ -103,7 +107,7 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, cContent string, err error) {
 	hasIndividual := false
 	for _, re := range cfg.Regexps {
-		if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" || re.NamedGroupsFunc != "" {
+		if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" {
 			hasIndividual = true
 			break
 		}
@@ -134,17 +138,34 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		imp := func(name, sig string) {
 			fmt.Fprintf(&hb, "__attribute__((import_module(%q), import_name(%q)))\n%s\n", cfg.ImportModule, name, sig)
 		}
+		// Parameter lists come from the ONE descriptor in set_stub.go; only
+		// the C spelling of each is decided here (R12). C puts the return type
+		// FIRST, which is why this builds the whole declaration rather than
+		// just a parameter list.
+		setCaps := setCapabilities(s, cfg)
+		decl := func(kind string) string {
+			capability := capByKind(setCaps, kind)
+			if capability == nil {
+				panic("generate: C stub asked for the signature of an undeclared capability " + kind)
+			}
+			return fmt.Sprintf("%s ffi_%s(%s);", cABIRet(capability.Ret), capability.Export,
+				capability.render(cABIParam, ", "))
+		}
 		if s.MatchAny != "" {
-			imp(s.MatchAny, fmt.Sprintf("int ffi_%s(const char *ptr, int len);", s.MatchAny))
-			fmt.Fprintf(&hb, "/* Id of SOME pattern matching the whole input, or -1. */\nint %s(const char *input, size_t len);\n\n", s.MatchAny)
+			imp(s.MatchAny, decl("match_any"))
+			fmt.Fprintf(&hb, "/* Id of SOME pattern matching the whole input, -1 if none, or\n"+
+				"   RX_ERR_BT_OVERFLOW if a Backtracking member exhausted its frame budget\n"+
+				"   and the answer is UNKNOWN. Test the sentinel EXACTLY: -1 is a real\n"+
+				"   answer and folding the two reports \"unknown\" as a confident \"no\". */\n"+
+				"int %s(const char *input, size_t len);\n\n", s.MatchAny)
 			fmt.Fprintf(&cb, `int %s(const char *input, size_t len) { return ffi_%s(input, (int)len); }
 `, s.MatchAny, s.MatchAny)
 		}
 		if s.MatchAll != "" {
 			if wide {
-				imp(s.MatchAll, fmt.Sprintf("int ffi_%s(const char *ptr, int len, unsigned char *bits);", s.MatchAll))
+				imp(s.MatchAll, decl("match_all"))
 			} else {
-				imp(s.MatchAll, fmt.Sprintf("long long ffi_%s(const char *ptr, int len);", s.MatchAll))
+				imp(s.MatchAll, decl("match_all"))
 			}
 			// Decision (12): C99's `static N` in an array parameter declarator
 			// means "the caller must pass at least N elements" — GCC and Clang
@@ -171,7 +192,12 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 `, s.MatchAll, idKonst, konst)
 			} else {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, int patterns[static %[3]s]) {
-    unsigned long long mask = (unsigned long long)ffi_%[1]s(input, (int)len);
+    long long raw = ffi_%[1]s(input, (int)len);
+    /* The narrow form's return IS the bitmask, so the sentinel is tested on the
+       RAW value before the unsigned cast: -2 as unsigned long long reads as
+       "every id except 0 matched". */
+    if (raw == RX_ERR_BT_OVERFLOW) return RX_ERR_BT_OVERFLOW;
+    unsigned long long mask = (unsigned long long)raw;
     int c = 0;
     for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) patterns[c++] = k;
     return c;
@@ -180,7 +206,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			}
 		}
 		if s.ScanAny != "" {
-			imp(s.ScanAny, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from);", s.ScanAny))
+			imp(s.ScanAny, decl("scan_any"))
 			fmt.Fprintf(&hb, "/* Returns one pattern id matching somewhere at or after offset, or -1.\n   Which id you get is unspecified when several patterns match, and no\n   position is reported.\n\n   May also return RX_ERR_BT_OVERFLOW: a Backtracking member of this set\n   exhausted its frame budget, so the answer is UNKNOWN rather than -1.\n   Test for it before treating a negative result as \"no match\". */\nint %s(const char *input, size_t len, size_t offset);\n\n", s.ScanAny)
 			fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset) {
     return ffi_%[1]s(input, (int)len, (int)offset);
@@ -189,9 +215,9 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		}
 		if s.ScanAll != "" {
 			if wide {
-				imp(s.ScanAll, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, unsigned char *bits);", s.ScanAll))
+				imp(s.ScanAll, decl("scan_all"))
 			} else {
-				imp(s.ScanAll, fmt.Sprintf("long long ffi_%s(const char *ptr, int len, int from);", s.ScanAll))
+				imp(s.ScanAll, decl("scan_all"))
 			}
 			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into patterns and returns how many.\n   See match_all for why the size is in the type. */\nint %s(const char *input, size_t len, size_t offset, int patterns[static %s]);\n\n", s.ScanAll, konst)
 			if wide {
@@ -206,7 +232,12 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 `, s.ScanAll, idKonst, konst)
 			} else {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset, int patterns[static %[3]s]) {
-    unsigned long long mask = (unsigned long long)ffi_%[1]s(input, (int)len, (int)offset);
+    long long raw = ffi_%[1]s(input, (int)len, (int)offset);
+    /* The narrow form's return IS the bitmask, so the sentinel is tested on the
+       RAW value before the unsigned cast: -2 as unsigned long long reads as
+       "every id except 0 matched". */
+    if (raw == RX_ERR_BT_OVERFLOW) return RX_ERR_BT_OVERFLOW;
+    unsigned long long mask = (unsigned long long)raw;
     int c = 0;
     for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) patterns[c++] = k;
     return c;
@@ -216,15 +247,13 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		}
 		if s.Find != "" {
 			scannerType := "rx_" + setConstBase(s.Name) + "_scanner_t"
-			gateField, gateInit, gateArg := "", "", ""
-			if findGateArray(s) {
-				imp(s.Find, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, unsigned *gates, int *out, int cap);", s.Find))
-				gateField = fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
-				gateInit = fmt.Sprintf("    for (size_t k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
-				gateArg = "s->gates, "
-			} else {
-				imp(s.Find, fmt.Sprintf("int ffi_%s(const char *ptr, int len, int from, int *out, int cap);", s.Find))
-			}
+			// EVERY set with `find` takes the gate array, overlapping included
+			// (SETS_PLAN item 11) — the branch that omitted it was unreachable
+			// and is gone.
+			imp(s.Find, decl("find"))
+			gateField := fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
+			gateInit := fmt.Sprintf("    for (size_t k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
+			gateArg := "s->gates, "
 			// D17: the scanner is CALLER-owned, so two scans can be in flight
 			// and re-initialising the struct restarts one. The static
 			// _next/_reset pair this replaces could do neither.
@@ -339,10 +368,6 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
 
 // genCPartsForEntry generates the .h and .c fragments for one regexp entry.
 func genCPartsForEntry(re config.RegexEntry, importModule string) (hPart, cPart string, err error) {
-	if re.NamedGroupsFunc != "" {
-		return "", "", fmt.Errorf("named_groups_func is not supported for C stubs; use groups_func instead")
-	}
-
 	var hb, cb strings.Builder
 
 	if re.MatchFunc != "" {
@@ -389,37 +414,81 @@ func genCMatchCPart(importModule, funcName string) string {
 
 // genCFindHPart generates the .h prototype for a non-anchored find function.
 func genCFindHPart(funcName string) string {
+	iterType := cIterTypeName(funcName)
 	return fmt.Sprintf(
-		"/* %s: non-anchored find from offset.\n"+
-			"   Returns absolute {start, end}, {-1, -1} if not found, or\n"+
-			"   {RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW} if the result is unknown.\n"+
-			"   To iterate non-overlapping matches, advance past each match; a pattern\n"+
-			"   that can match empty needs the guard, or offset never moves:\n"+
-			"     off = m.end > m.start ? m.end : m.start + 1;\n"+
-			"   To match Go's FindAllIndex exactly, also SKIP an empty match that\n"+
-			"   begins where the previous reported match ended:\n"+
-			"     if (m.start == m.end && m.start == prev_end) continue;\n"+
-			"     prev_end = m.end; */\n"+
-			"rx_match_t %s(const char *input, size_t len, size_t offset);\n\n",
-		funcName, funcName)
+		"/* Iterator over %[1]s's non-overlapping matches. CALLER-owned, so two\n"+
+			"   scans can be in flight and re-initialising the struct restarts one.\n"+
+			"   It owns the advance AND the empty-match rule, which the caller used to\n"+
+			"   copy out of this comment — the place they got subtly wrong. */\n"+
+			"typedef struct {\n"+
+			"    const char *input;\n"+
+			"    size_t len, offset, prev_end;\n"+
+			"    int done;\n"+
+			"} %[2]s;\n\n"+
+			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG. */\n"+
+			"int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset);\n\n"+
+			"/* Writes the next match to *out_match.\n"+
+			"     1  a match was written\n"+
+			"     0  the scan is finished\n"+
+			"     RX_ERR_BT_OVERFLOW  the engine gave up; what remains is UNKNOWN\n"+
+			"   The status is the RETURN value, not something written into out_match,\n"+
+			"   so 0 stays unambiguously \"finished\". */\n"+
+			"int %[1]s_next(%[2]s *iter, rx_match_t *out_match);\n\n",
+		funcName, iterType)
+}
+
+// cIterTypeName is the struct type an iterator uses. It follows the config's
+// casing like every other derived symbol; the rx_ prefix and _t suffix are C's
+// own convention for a type and inherit from nothing the user chose.
+func cIterTypeName(funcName string) string {
+	return "rx_" + funcName + "_iter_t"
 }
 
 // genCFindCPart generates the .c FFI declaration and wrapper for a non-anchored find function.
 func genCFindCPart(importModule, funcName string) string {
 	ffi := "_ffi_" + funcName
+	iterType := cIterTypeName(funcName)
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "__attribute__((import_module(\"%s\"), import_name(\"%s\")))\n", importModule, funcName)
 	fmt.Fprintf(&sb, "extern long long %s(const unsigned char *ptr, unsigned int len, unsigned int from);\n\n", ffi)
-	fmt.Fprintf(&sb, "rx_match_t %s(const char *input, size_t len, size_t offset) {\n", funcName)
-	sb.WriteString("    if (offset > len) return (rx_match_t){-1, -1};\n")
-	fmt.Fprintf(&sb, "    long long r = %s((const unsigned char *)input, (unsigned int)len, (unsigned int)offset);\n", ffi)
-	sb.WriteString("    if (r == RX_ERR_BT_OVERFLOW) return (rx_match_t){RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW};\n")
-	sb.WriteString("    if (r < 0) return (rx_match_t){-1, -1};\n")
-	// Whole buffer plus a start position, so these are already absolute.
-	sb.WriteString("    unsigned int abs_s = (unsigned int)((unsigned long long)r >> 32);\n")
-	sb.WriteString("    unsigned int abs_e = (unsigned int)(r & 0xFFFFFFFFU);\n")
-	sb.WriteString("    return (rx_match_t){(ptrdiff_t)abs_s, (ptrdiff_t)abs_e};\n")
-	sb.WriteString("}\n\n")
+
+	fmt.Fprintf(&sb, `int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
+    if (!iter || !input) return RX_ERR_NULL_ARG;
+    iter->input = input;
+    iter->len = len;
+    iter->offset = offset;
+    iter->prev_end = (size_t)-1;
+    iter->done = (offset > len);
+    return 0;
+}
+
+int %[1]s_next(%[2]s *iter, rx_match_t *out_match) {
+    if (!iter || !out_match) return RX_ERR_NULL_ARG;
+    while (!iter->done && iter->offset <= iter->len) {
+        /* The WHOLE input plus a start position: offset bounds where the search
+           begins, it does not truncate what the engine can see behind it. */
+        long long packed = %[3]s((const unsigned char *)iter->input,
+                                 (unsigned int)iter->len, (unsigned int)iter->offset);
+        if (packed == RX_ERR_BT_OVERFLOW) { iter->done = 1; return RX_ERR_BT_OVERFLOW; }
+        if (packed < 0) { iter->done = 1; return 0; }
+        size_t start = (size_t)((unsigned long long)packed >> 32);
+        size_t end   = (size_t)(packed & 0xFFFFFFFFU);
+        /* Advance first, so an empty match cannot spin the scan. */
+        iter->offset = (end > start) ? end : start + 1;
+        /* Go's FindAllIndex rule: an EMPTY match beginning exactly where the
+           previous REPORTED match ended is suppressed. Only whether it is
+           reported changes; the advance above is unchanged. */
+        if (start == end && iter->prev_end == start) continue;
+        iter->prev_end = end;
+        out_match->start = (ptrdiff_t)start;
+        out_match->end   = (ptrdiff_t)end;
+        return 1;
+    }
+    iter->done = 1;
+    return 0;
+}
+
+`, funcName, iterType, ffi)
 	return sb.String()
 }
 
@@ -436,10 +505,18 @@ func toUpperIdent(s string) string {
 	return b.String()
 }
 
-// cGroupConst returns the C constant name for a named capture group.
-// e.g. funcName="parse_url", groupName="host" → "PARSE_URL_GROUP_HOST"
+// cGroupConst returns the C constant naming a capture group's INDEX.
+// e.g. funcName="url_groups", groupName="host" → "url_groups_host".
+//
+// It used to be a `const char *` holding the NAME, compared by pointer
+// identity, with the name also carried in every rx_group_t. TODO task 62
+// replaced that with the index, which is what the caller actually needs to
+// address the array, and dropped the per-group name pointer entirely.
+//
+// The name follows the config's casing rather than C's SCREAMING convention,
+// because it derives from a name the user chose (see derivedConstName).
 func cGroupConst(funcName, groupName string) string {
-	return toUpperIdent(funcName) + "_GROUP_" + toUpperIdent(groupName)
+	return derivedConstName(funcName, groupName)
 }
 
 // genCGroupsStubParts generates the .h and .c fragments for a capture-groups function.
@@ -464,11 +541,14 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 
 	var hb, cb strings.Builder
 
-	// .h: group name constants
+	// .h: group INDEX constants, plus the runtime lookup and the name table.
+	// This is what replaced `named_groups_func` (TODO task 62) — and it gives
+	// C named access it never had, since that key was rejected here outright.
 	if len(named) > 0 {
-		fmt.Fprintf(&hb, "/* Group name constants for %s */\n", funcName)
+		fmt.Fprintf(&hb, "/* Index of each NAMED capture group of %s. Index 0 is the whole\n"+
+			"   match; unnamed groups have no constant and are addressed by number. */\n", funcName)
 		for _, g := range named {
-			fmt.Fprintf(&hb, "extern const char * const %s;\n", cGroupConst(funcName, g.name))
+			fmt.Fprintf(&hb, "#define %s %d\n", cGroupConst(funcName, g.name), g.index)
 		}
 		hb.WriteString("\n")
 	}
@@ -476,100 +556,167 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	// .h: groups count macro
 	fmt.Fprintf(&hb, "#define %s_GROUPS %d\n\n", funcUpper, numGroups)
 
-	// .h: function prototype and doc comment
-	fmt.Fprintf(&hb,
-		"/* %s: find next capture match from offset.\n"+
-			"   Returns pointer to a static array of %s_GROUPS rx_group_t entries.\n"+
-			"   groups[0] is the full match; subsequent entries are capture groups in order.\n"+
-			"   Named groups have their name field pointing to the corresponding %s_GROUP_* constant;\n"+
-			"   use == for identity comparison. Unnamed groups have name == NULL.\n"+
-			"   All entries are {-1, -1, ...} when no match is found starting from offset.\n"+
-			"   Returns NULL (never returned otherwise) if the Backtracking engine\n"+
-			"   exhausted its frame budget -- see RX_ERR_BT_OVERFLOW above.\n"+
-			"   To iterate non-overlapping matches, advance past each match; a pattern\n"+
-			"   that can match empty needs the guard, or offset never moves:\n"+
-			"     off = groups[0].end > groups[0].start ? groups[0].end\n"+
-			"                                          : groups[0].start + 1;\n"+
-			"   To match Go's FindAllSubmatchIndex exactly, also SKIP an empty match\n"+
-			"   that begins where the previous reported match ended:\n"+
-			"     if (groups[0].start == groups[0].end &&\n"+
-			"         groups[0].start == prev_end) continue;\n"+
-			"     prev_end = groups[0].end; */\n"+
-			"const rx_group_t *%s(const char *input, size_t len, size_t offset, rx_group_t *out);\n\n",
-		funcName, funcUpper, funcUpper, funcName)
-
-	// .c: group name constant definitions
 	if len(named) > 0 {
-		fmt.Fprintf(&cb, "/* Group name constants for %s */\n", funcName)
-		for _, g := range named {
-			fmt.Fprintf(&cb, "const char * const %s = \"%s\";\n", cGroupConst(funcName, g.name), g.name)
-		}
-		cb.WriteString("\n")
+		fmt.Fprintf(&hb,
+			"/* Index of the capture group called `name`, or -1 if this pattern has no\n"+
+				"   group of that name. The constants above cover a name known at compile\n"+
+				"   time; this is for one chosen at runtime. An EMPTY name is never found:\n"+
+				"   a pattern may hold several unnamed groups, so \"\" identifies nothing. */\n"+
+				"int %s(const char *name);\n\n", derivedFuncName(funcName, "index"))
+		fmt.Fprintf(&hb,
+			"/* Capture-group names, ALIGNED WITH INDICES: entry i names the group at\n"+
+				"   index i and is \"\" where it has no name, index 0 included. %s_GROUPS\n"+
+				"   entries. Same shape as Go's regexp.SubexpNames. */\n"+
+				"const char *const *%s(void);\n\n", funcUpper, derivedFuncName(funcName, "names"))
 	}
 
-	// .c: internal name table (index → name pointer; NULL for group 0 and unnamed groups)
-	// Using char array addresses (not pointer variables) ensures stable identity comparison.
-	groupConstByIdx := make(map[int]string, len(named))
-	for _, g := range named {
-		groupConstByIdx[g.index] = cGroupConst(funcName, g.name)
-	}
-	fmt.Fprintf(&cb, "static const char * const %s[%d] = {\n", namesVar, numGroups)
-	for i := 0; i < numGroups; i++ {
-		if constName, ok := groupConstByIdx[i]; ok {
-			fmt.Fprintf(&cb, "    %s,\n", constName)
-		} else {
-			cb.WriteString("    (const char *)0,\n")
+	// .h: the iterator. Single-shot before TODO task 62, which left the caller
+	// hand-rolling the advance and the empty-match guard from a COMMENT — the
+	// place they got subtly wrong, and silently. C already had this shape for
+	// its set scanner, so this applies a local idiom rather than importing one.
+	fmt.Fprintf(&hb,
+		"/* Iterator over %[1]s's non-overlapping capture matches. CALLER-owned,\n"+
+			"   so two scans can be in flight and re-initialising the struct restarts\n"+
+			"   one. */\n"+
+			"typedef struct {\n"+
+			"    const char *input;\n"+
+			"    size_t len, offset, prev_end;\n"+
+			"    int done;\n"+
+			"} %[2]s;\n\n"+
+			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG. */\n"+
+			"int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset);\n\n"+
+			"/* Writes this match's groups into the CALLER'S out_groups[], which must\n"+
+			"   hold %[3]s_GROUPS entries. Index 0 is the whole match; a group that\n"+
+			"   did not participate is {-1, -1}, so the array length never depends on\n"+
+			"   which groups matched. Address a named group with its index constant.\n"+
+			"     1  a match was written\n"+
+			"     0  the scan is finished\n"+
+			"     RX_ERR_BT_OVERFLOW  the engine gave up; what remains is UNKNOWN */\n"+
+			"int %[1]s_next(%[2]s *iter, rx_group_t out_groups[static %[3]s_GROUPS]);\n\n",
+		funcName, cIterTypeName(funcName), funcUpper)
+
+	// .c: the index-aligned name table, plus the lookup. Entry i names the
+	// group at index i and is "" where it has no name — index 0 included, the
+	// shape regexp.SubexpNames uses.
+	if len(named) > 0 {
+		groupNameByIdx := make(map[int]string, len(named))
+		for _, g := range named {
+			groupNameByIdx[g.index] = g.name
 		}
+		fmt.Fprintf(&cb, "static const char *const %s[%d] = {", namesVar, numGroups)
+		for i := 0; i < numGroups; i++ {
+			if i > 0 {
+				cb.WriteString(", ")
+			}
+			fmt.Fprintf(&cb, "%q", groupNameByIdx[i])
+		}
+		cb.WriteString("};\n")
+		fmt.Fprintf(&cb, "const char *const *%s(void) { return %s; }\n\n",
+			derivedFuncName(funcName, "names"), namesVar)
+
+		fmt.Fprintf(&cb, "int %s(const char *name) {\n", derivedFuncName(funcName, "index"))
+		cb.WriteString("    if (!name || !name[0]) return -1;\n")
+		fmt.Fprintf(&cb, "    for (int i = 0; i < %d; i++) {\n", numGroups)
+		fmt.Fprintf(&cb, "        const char *candidate = %s[i];\n", namesVar)
+		cb.WriteString("        if (!candidate[0]) continue;\n")
+		cb.WriteString("        const char *a = candidate, *b = name;\n")
+		cb.WriteString("        while (*a && *a == *b) { a++; b++; }\n")
+		cb.WriteString("        if (!*a && !*b) return i;\n")
+		cb.WriteString("    }\n    return -1;\n}\n\n")
 	}
-	cb.WriteString("};\n\n")
 
 	// .c: FFI declaration
 	fmt.Fprintf(&cb, "__attribute__((import_module(\"%s\"), import_name(\"%s\")))\n", importModule, exportName)
 	fmt.Fprintf(&cb, "extern int %s(const unsigned char *ptr, unsigned int len, int *out, unsigned int from);\n\n", ffi)
 
-	// .c: wrapper function
-	// Decision (8): the caller supplies the array. The `static rx_group_t`
-	// this replaces was the last mutable static in generated C — two threads
-	// corrupted each other and a second call invalidated the first result.
+	// .c: the iterator. Decision (8)'s caller-owned array, now driven by a
+	// caller-owned iterator too, so nothing here is static and a second scan
+	// cannot invalidate the first.
 	//
 	// NOTE this does NOT make the C stubs thread-safe: the Backtracking engine
 	// keeps its stack at a fixed stackBase and its BitState memo at a fixed
-	// memoTableBase (compile/engine_backtrack.go), so BT-compiled patterns
-	// stay non-reentrant at the WASM level. Claim re-entrancy, not
+	// memoTableBase (compile/engine_backtrack.go). Claim re-entrancy, not
 	// thread-safety.
-	fmt.Fprintf(&cb, "const rx_group_t *%s(const char *input, size_t len, size_t offset, rx_group_t *out) {\n", funcName)
-	cb.WriteString("    if (!input || !out) return (const rx_group_t *)0;\n")
-	fmt.Fprintf(&cb, "    int slots[%d];\n", slotCount)
-	cb.WriteString("    size_t pos = offset;\n")
-	cb.WriteString("    while (pos <= len) {\n")
-	fmt.Fprintf(&cb, "        for (int i = 0; i < %d; i++) slots[i] = -1;\n", slotCount)
-	// Whole buffer plus a start position; slots come back absolute.
-	fmt.Fprintf(&cb, "        int r = %s((const unsigned char *)input, (unsigned int)len, slots, (unsigned int)pos);\n", ffi)
-	cb.WriteString("        if (r == RX_ERR_BT_OVERFLOW) return (const rx_group_t *)0;\n")
-	cb.WriteString("        if (r >= 0) {\n")
-	fmt.Fprintf(&cb, "            for (int i = 0; i < %d; i++) {\n", numGroups)
-	fmt.Fprintf(&cb, "                out[i].name = %s[i];\n", namesVar)
-	cb.WriteString("                if (slots[i*2] >= 0) {\n")
-	cb.WriteString("                    out[i].start = (ptrdiff_t)slots[i*2];\n")
-	cb.WriteString("                    out[i].end   = (ptrdiff_t)slots[i*2+1];\n")
-	cb.WriteString("                } else {\n")
-	cb.WriteString("                    out[i].start = -1;\n")
-	cb.WriteString("                    out[i].end   = -1;\n")
-	cb.WriteString("                }\n")
-	cb.WriteString("            }\n")
-	cb.WriteString("            return out;\n")
-	cb.WriteString("        }\n")
-	cb.WriteString("        if (pos == len) break;\n")
-	cb.WriteString("        pos++;\n")
-	cb.WriteString("    }\n")
-	// No match: set all entries to -1/-1 with names
-	fmt.Fprintf(&cb, "    for (int i = 0; i < %d; i++) {\n", numGroups)
-	cb.WriteString("        out[i].start = -1;\n")
-	cb.WriteString("        out[i].end   = -1;\n")
-	fmt.Fprintf(&cb, "        out[i].name  = %s[i];\n", namesVar)
-	cb.WriteString("    }\n")
-	cb.WriteString("    return out;\n")
-	cb.WriteString("}\n\n")
+	fmt.Fprintf(&cb, `int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
+    if (!iter || !input) return RX_ERR_NULL_ARG;
+    iter->input = input;
+    iter->len = len;
+    iter->offset = offset;
+    iter->prev_end = (size_t)-1;
+    iter->done = (offset > len);
+    return 0;
+}
+
+int %[1]s_next(%[2]s *iter, rx_group_t out_groups[static %[5]d]) {
+    if (!iter || !out_groups) return RX_ERR_NULL_ARG;
+    int slots[%[4]d];
+    while (!iter->done && iter->offset <= iter->len) {
+        for (int slot_num = 0; slot_num < %[4]d; slot_num++) slots[slot_num] = -1;
+        int status = %[3]s((const unsigned char *)iter->input,
+                           (unsigned int)iter->len, slots, (unsigned int)iter->offset);
+        if (status == RX_ERR_BT_OVERFLOW) { iter->done = 1; return RX_ERR_BT_OVERFLOW; }
+        if (status < 0) {
+            /* No match at THIS position — a different thing from the sentinel
+               above. Advance and retry. */
+            if (iter->offset == iter->len) { iter->done = 1; return 0; }
+            iter->offset++;
+            continue;
+        }
+        size_t start = (size_t)slots[0];
+        size_t end   = (slots[1] >= 0) ? (size_t)slots[1] : start;
+        iter->offset = (end > start) ? end : start + 1;
+        /* Go's FindAllSubmatchIndex rule: suppress an EMPTY match beginning
+           exactly where the previous reported match ended. */
+        if (start == end && iter->prev_end == start) continue;
+        iter->prev_end = end;
+        for (int group_num = 0; group_num < %[5]d; group_num++) {
+            if (slots[group_num * 2] >= 0) {
+                out_groups[group_num].start = (ptrdiff_t)slots[group_num * 2];
+                out_groups[group_num].end   = (ptrdiff_t)slots[group_num * 2 + 1];
+            } else {
+                out_groups[group_num].start = -1;
+                out_groups[group_num].end   = -1;
+            }
+        }
+        return 1;
+    }
+    iter->done = 1;
+    return 0;
+}
+
+`, funcName, cIterTypeName(funcName), ffi, slotCount, numGroups)
 
 	return hb.String(), cb.String()
+}
+
+// cABIParam spells one set-ABI parameter in C. set_stub.go's descriptor
+// decides WHICH parameters a capability takes and in what order; this decides
+// only how each is written.
+func cABIParam(p abiParam) string {
+	switch p {
+	case abiInputPtr:
+		return "const char *ptr"
+	case abiInputLen:
+		return "int len"
+	case abiFrom:
+		return "int from"
+	case abiGatePtr:
+		return "unsigned *gates"
+	case abiBitmapPtr:
+		return "unsigned char *bits"
+	case abiTuplePtr:
+		return "int *out"
+	case abiOutCap:
+		return "int cap"
+	case abiCursor:
+		return "long long cursor"
+	}
+	panic("generate: unknown abiParam")
+}
+
+func cABIRet(r abiRet) string {
+	if r == abiRetI64 {
+		return "long long"
+	}
+	return "int"
 }

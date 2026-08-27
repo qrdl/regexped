@@ -72,124 +72,86 @@ if (end >= 0) {
 
 ---
 
-### `find_func` — non-anchored find
+### `find_func` — non-anchored find iterator
 
 ```ts
-export function <func>(input: ArrayBuffer, offset: u32): i64
+export class <func>_iter {
+  next(): i64;   // packed (start << 32 | end); -1 finished; RX_ERR_BT_OVERFLOW unknown
+}
+export function <func>(input: ArrayBuffer, offset: u32): <func>_iter
 ```
 
-Scans for the next match at or after `offset`. The whole of `input` stays
-visible to the engine — `offset` bounds where the search starts, it does not
-truncate the left context a leading `\b`, `\B` or `(?m:^)` is judged against.
-Returns a **packed** `i64`:
-
-```
-(absStart << 32) | absEnd
-```
-
-Both positions are absolute byte offsets into the original `input`. Returns `-1` if
-no match is found from `offset` onward.
-
-To iterate all non-overlapping matches:
+Scans for non-overlapping matches at or after `offset`. The whole input stays visible to the engine — `offset` bounds where the search starts, it does not truncate the left context a leading `\b`, `\B` or `(?m:^)` is judged against. Positions are absolute.
 
 ```ts
-import { find_token } from "./stub";
-
-const buf = String.UTF8.encode(text);
-let off: i32 = 0;
-let prevEnd: i32 = -1;
-while (true) {
-  const r = find_token(buf, off);
-  if (r < 0) break;
-  const start = i32(<u64>r >> 32);
-  const end   = i32(<u32>r);
-  off = end > start ? end : start + 1;  // advance past zero-length matches
-  // Go's FindAllIndex rule: an empty match beginning exactly where the
-  // previous reported match ended is not reported. Skip it AFTER advancing,
-  // or the loop stalls.
-  if (start == end && start == prevEnd) continue;
-  prevEnd = end;
-  // use start, end ...
+const iter = find_token(input, 0);
+let packed = iter.next();
+while (packed >= 0) {
+  const start = i32(<u64>packed >> 32);
+  const end   = i32(<u32>packed);
+  // use input[start .. end]
+  packed = iter.next();
+}
+if (packed == i64(RX_ERR_BT_OVERFLOW)) {
+  // the result is unknown, not "no more matches"
 }
 ```
+
+The iterator owns the advance past a zero-length match and Go's `FindAllIndex` rule — an empty match beginning exactly where the previous reported match ended is not reported. Both used to be your job, copied from this document.
+
+Nothing is allocated per match: `next()` returns a number, not an object. AssemblyScript nullability is reference-types only, so an object-returning `next()` would allocate on every step.
 
 ---
 
-### `groups_func` — capture groups
+### `groups_func` — capture-match iterator
 
 ```ts
-export function <func>(input: ArrayBuffer, offset: u32): u32
-```
-
-Scans for the next match at or after `offset`. The whole of `input` stays
-visible to the engine — `offset` bounds where the search starts, it does not
-truncate the left context a leading `\b`, `\B` or `(?m:^)` is judged against.
-Fills a **static `Int32Array`** slot
-buffer with absolute byte positions for each capture group.
-
-Returns the **`dataStart`** pointer of the slot buffer (a non-zero `i32`) on match,
-or `0` if no match is found from `offset` onward.
-
-#### Slot layout
-
-The buffer contains `numGroups * 2` entries:
-
-```
-index 0, 1  →  group 0 start, end  (full match)
-index 2, 3  →  group 1 start, end  (first capture group)
-index 4, 5  →  group 2 start, end
-…
-```
-
-Values are absolute byte offsets into `input`. An optional group that did not
-participate has both its `start` and `end` set to `-1`.
-
-#### Reading slots with `load<i32>`
-
-```ts
-import { find_email } from "./stub";
-
-function slice(buf: ArrayBuffer, start: i32, end: i32): string {
-  return String.UTF8.decodeUnsafe(
-    changetype<usize>(buf) + <usize>start,
-    <usize>(end - start),
-    false,
-  );
+export class <func>_iter {
+  next(): u32;   // slot pointer; 0 finished; RX_ITER_ERROR unknown
 }
+export function <func>(input: ArrayBuffer, offset: u32): <func>_iter
+export function <func>_capture(input: ArrayBuffer, slots: u32, groupNum: i32): string | null
+export const <FUNC_UPPER>_GROUPS: i32
+```
 
-const buf = String.UTF8.encode(text);
-let off: i32 = 0;
-while (true) {
-  const slots = find_email(buf, off);
-  if (!slots) break;
-  const matchStart = load<i32>(slots);          // group 0 start
-  const matchEnd   = load<i32>(slots + 4);      // group 0 end
-  const userStart  = load<i32>(slots + 8);      // group 1 start
-  const userEnd    = load<i32>(slots + 12);      // group 1 end
-  const domStart   = load<i32>(slots + 16);     // group 2 start
-  const domEnd     = load<i32>(slots + 20);     // group 2 end
-  // … use the slices
-  off = matchEnd > matchStart ? matchEnd : matchStart + 1;
+`next()` returns a pointer to **this iterator's** slot buffer. Slot layout is `[g0_start, g0_end, g1_start, g1_end, …]` as `i32`, absolute offsets; group 0 is the whole match, and a group that did not participate has `start == -1`.
+
+The pointer is valid only until the next `next()` call — the buffer is reused.
+
+```ts
+const iter = parse_url(input, 0);
+let slots = iter.next();
+while (slots != 0 && slots != RX_ITER_ERROR) {
+  const host = parse_url_capture(input, slots, parse_url_host);
+  if (host != null) { /* decoded text */ }
+  slots = iter.next();
+}
+if (slots == RX_ITER_ERROR) {
+  // the result is unknown, not "no more matches"
 }
 ```
 
-Each slot entry is a 4-byte `i32`, so consecutive groups are at `slots + 0`,
-`slots + 4`, `slots + 8`, etc.
-
-> **Warning:** the slot buffer is **static and overwritten on each call**, and is
-> **not thread-safe** — concurrent calls on the same module instance will race
-> on the buffer. Read all slot values before calling the same function again.
+The buffer lives **inside the iterator**. It used to be module-level, which was not re-entrant: two interleaved scans clobbered each other, and the returned pointer was silently invalidated by the next call.
 
 ---
 
-### `named_groups_func` — not supported
+### Named groups — index constants
 
-`named_groups_func` is **not supported** for AssemblyScript stubs. The generator
-returns an error if this field is set.
+`named_groups_func` used to be **rejected** for AssemblyScript. It is now retired for every language, and AS gains the named access it never had: when a pattern has at least one named group, `groups_func` additionally emits
 
-Use `groups_func` instead and access groups by their numeric index. Named groups keep
-their original order in the pattern, so the mapping from name to index is stable and
-known at compile time.
+```ts
+export const <func>_scheme: i32 = 1;   // one per NAMED group; index 0 is the whole match
+export const <func>_host:   i32 = 2;
+
+export function <func>_index(name: string): i32;   // -1 if unknown
+export function <func>_names(): string[];          // aligned with indices
+```
+
+Flat constants rather than JS/TS's single object: AS has no `as const`, and its object support is heavier than a handful of `i32`s.
+
+The constants cover a name known at compile time; `_index` is for one chosen at runtime. An **empty** name is never found — a pattern may hold several unnamed groups, so `""` identifies nothing.
+
+These names follow **your** config's casing, not AssemblyScript's.
 
 ---
 
@@ -205,12 +167,12 @@ export const <SET>_ID_SPACE: i32 = 12;
 class SetMatch { constructor(public patternId: i32, public start: u32, public end: u32) {} }
 
 // anchored: the pattern must match the WHOLE input
-export function <match_any>(input: ArrayBuffer): i32              // id, or -1
-export function <match_all>(input: ArrayBuffer): Array<i32>
+export function <match_any>(input: ArrayBuffer): i32              // id, -1, or RX_ERR_BT_OVERFLOW
+export function <match_all>(input: ArrayBuffer): Array<i32> | null   // null = unknown
 
 // non-anchored: each takes an offset bounding the search
-export function <scan_any>(input: ArrayBuffer, offset: u32): i32  // id, or -1; NO position
-export function <scan_all>(input: ArrayBuffer, offset: u32): Array<i32>
+export function <scan_any>(input: ArrayBuffer, offset: u32): i32  // id, -1, or RX_ERR_BT_OVERFLOW; NO position
+export function <scan_all>(input: ArrayBuffer, offset: u32): Array<i32> | null
 
 // AssemblyScript has no generators, so `find` is an explicit iterator object.
 export function <find>(input: ArrayBuffer, offset: u32): <Find>Iter
@@ -247,11 +209,11 @@ says so. This CHANGES an existing parameter rather than adding one, so an AS
 caller passing a signed expression needs a cast.
 
 `<func>_capture` exists because AssemblyScript is the one language where
-captures are addressed purely by arithmetic — `named_groups_func` is rejected
-here (see below), so without it reading capture `g` means computing
-`load<i32>(slots + 8*g)` twice and hand-rolling a UTF-8 decode.
-`<FUNC>_GROUPS` is what makes bounds-checking and looping over all groups
-possible at all.
+captures are addressed purely by arithmetic: without it, reading capture
+`groupNum` means computing `load<i32>(slots + 8*groupNum)` twice and
+hand-rolling a UTF-8 decode. `<FUNC>_GROUPS` is what makes bounds-checking and
+looping over all groups possible at all, and the generated index constants give
+the named ones a name.
 
 It takes `input` again ON PURPOSE: the slots are offsets, so decoding needs the
 buffer, and a stub that remembered the last input would break the moment two
@@ -259,7 +221,7 @@ scans interleave. It returns `null` both when the group did not participate and
 when `g` is out of range — those are different errors and this return does not
 separate them; an empty capture is legal, so `""` could not separate them
 either. The raw offsets stay reachable, so this is additive.
-| `named_groups_func` | **not supported** — generator returns an error | — |
+| `<func>_index` / `<func>_names` | name → index, and the index-aligned name table | emitted when the pattern has named groups |
 
 ### Batching is a JS/TS-only hint
 
@@ -279,6 +241,27 @@ function; `find` is the whole positional surface.
 
 Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
 
-The generated function **throws** an `Error` whose message names the function. Note that in AssemblyScript an uncaught `throw` compiles to an abort, so the host sees a WASM trap.
+The generated function **returns a sentinel**. It used to throw, and that was wrong: verified against this repo's own `asc` (0.28.13), `try { } catch { }` is rejected outright —
+
+```
+ERROR AS100: Not implemented: Exceptions
+```
+
+— and a `throw` compiles to a call to the imported `abort`, a one-way trap the AS caller cannot handle. A throw here was strictly *worse* than a sentinel, not equivalent to one. So AssemblyScript follows C:
+
+```ts
+export const RX_ERR_BT_OVERFLOW: i32 = -2;      // scalar and i64 returns
+export const RX_ITER_ERROR: u32 = 0xFFFFFFFF;   // pointer returns, where 0 already means "finished"
+```
+
+| Function shape | Value on overflow |
+|---|---|
+| `match_func`, `match_any`, `scan_any` (`i32`) | `RX_ERR_BT_OVERFLOW` |
+| `find_func` iterator (`i64`) | `RX_ERR_BT_OVERFLOW` |
+| `groups_func` iterator (`u32`) | `RX_ITER_ERROR` |
+| `match_all`, `scan_all` | `null` — `Array` is a reference type, so it can be nullable |
+| set `find` iterator | `next()` returns `null`; `err()` after the loop distinguishes it from exhaustion |
+
+**Three set exports used to swallow it.** `match_any` returned the raw `-2` under a doc comment promising only `-1`, and the narrow `match_all`/`scan_all` treated it as a bitmask — `-2` reads as *every id except 0 matched*. All three report it now.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

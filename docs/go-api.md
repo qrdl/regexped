@@ -26,16 +26,18 @@ Unlike the Rust stubs, no `mod` wrapping is needed. Each stub file is a standalo
 ### `match_func` — anchored match
 
 ```go
-func <MatchFunc>(input []byte) (uint, bool)
+func <match_func>(input []byte) (end uint, ok bool, err error)
 ```
 
-Tries to match the pattern at position 0 of `input`. Returns the **end position** (exclusive) of the match and `true`, or `(0, false)` if no match. The match is anchored: it always starts at the beginning of `input`.
+Tries to match the pattern at position 0 of `input`. Returns the **end position** (exclusive), `ok=false` if the input does not match, or a non-nil `err` if the engine could not answer — see [Backtracking stack overflow](#backtracking-stack-overflow).
+
+The position is unsigned: it cannot be negative, and the comma-ok bool already carries "no match", so nothing here needs a `-1`.
 
 ```go
-if end, ok := UrlMatch(input); ok {
+if end, ok, err := url_match(input); err != nil {
+    return err
+} else if ok {
     fmt.Printf("matched %d bytes\n", end)
-} else {
-    fmt.Println("no match")
 }
 ```
 
@@ -44,21 +46,22 @@ if end, ok := UrlMatch(input); ok {
 ### `find_func` — non-anchored find iterator
 
 ```go
-func <FindFunc>(input []byte, offset uint) iter.Seq2[uint, uint]
+func <find_func>(input []byte, offset uint) *<find_func>Iter
+func (iter *<find_func>Iter) Matches() iter.Seq2[uint, uint]
+func (iter *<find_func>Iter) Err() error
 ```
 
-Returns an iterator over all non-overlapping matches. Each iteration yields `(start, end)` absolute byte positions. After a zero-length match the iterator advances by one byte to avoid infinite loops, and — following Go's `FindAllIndex` — an empty match beginning exactly where the previous reported match ended is not reported.
+Yields all non-overlapping matches as absolute `(start, end)` byte positions. After a zero-length match the iterator advances by one byte to avoid infinite loops, and — following Go's `FindAllIndex` — an empty match beginning exactly where the previous reported match ended is not reported.
+
+**Check `Err()` after the loop.** `iter.Seq2`'s two slots are already spent on `(start, end)`, so the error cannot ride on the item the way Rust's does. This is `database/sql`'s shape, and it carries `sql.Rows`' hazard: an unchecked `Err()` means a silently truncated match list.
 
 ```go
-// All matches:
-for start, end := range FindToken(input, 0) {
+findIter := find_token(input, 0)
+for start, end := range findIter.Matches() {
     fmt.Printf("match at %d..%d: %q\n", start, end, input[start:end])
 }
-
-// First match only:
-for start, end := range FindToken(input, 0) {
-    fmt.Printf("first match: %q\n", input[start:end])
-    break
+if err := findIter.Err(); err != nil {
+    return err
 }
 ```
 
@@ -67,54 +70,62 @@ for start, end := range FindToken(input, 0) {
 ### `groups_func` — match iterator, each item a match's capture groups
 
 ```go
-func <GroupsFunc>(input []byte, offset uint) iter.Seq[[][]uint]
+func <groups_func>(input []byte, offset uint) *<groups_func>Iter
+func (iter *<groups_func>Iter) Matches() iter.Seq[[]Span]
+func (iter *<groups_func>Iter) Err() error
+
+type Span struct {
+    Start, End uint
+    Ok         bool   // false = this group did not participate
+}
 ```
 
-Iterates the non-overlapping **matches** at or after `offset` — one iteration per match, not per group. Each item is a match, represented as `[][]uint`: one `[start, end]` pair per capture group, at absolute byte offsets. Index 0 is the full match; subsequent indices are capture groups in order. A group that did not participate is `nil`, so the outer length is always `numGroups + 1` regardless of how many participated.
+Iterates the non-overlapping **matches** at or after `offset` — one step per match, not per group. Each item is a match, represented as a `[]Span` with one entry per capture group. Index 0 is the whole match; subsequent indices are groups in source order. The length never depends on which groups participated — a group that did not has `Ok == false`.
+
+`Span` replaces the old `[][]uint`, where `nil` meant "did not participate". Go has no `Option`, so the flag carries what `nil` used to — and it collapses the allocations: `[][]uint` cost one for the outer slice plus one per group, a `[]Span` costs one for the lot.
 
 ```go
-// Every match:
-for match := range ParseGroups(input, 0) {
-    if g := match[1]; g != nil {
-        fmt.Printf("group 1: %q\n", input[g[0]:g[1]])
+groupsIter := parse_groups(input, 0)
+for match := range groupsIter.Matches() {
+    if host := match[parse_groups_host]; host.Ok {
+        fmt.Printf("host: %q\n", input[host.Start:host.End])
+    }
+    for groupNum, span := range match {
+        if !span.Ok {
+            fmt.Printf("group %d: (unset)\n", groupNum)
+            continue
+        }
+        fmt.Printf("group %d: %q\n", groupNum, input[span.Start:span.End])
     }
 }
-
-// First match only:
-for match := range ParseGroups(input, 0) {
-    if g := match[1]; g != nil {
-        fmt.Printf("group 1: %q\n", input[g[0]:g[1]])
-    }
-    break
+if err := groupsIter.Err(); err != nil {
+    return err
 }
 ```
 
 ---
 
-### `named_groups_func` — match iterator, each item a match's named groups
+### Named groups — index constants, not a separate export
+
+`named_groups_func` is **retired** (a config key using it is a load error). It was never a separate capability: both stubs called the *same* WASM export, and the two differed only in how the item was assembled.
+
+When a pattern has at least one named group, `groups_func` additionally emits:
 
 ```go
-func <NamedGroupsFunc>(input []byte, offset uint) iter.Seq[map[string][]uint]
+const <groups_func>_count = 4    // slots, index 0 included
+
+const (
+    <groups_func>_scheme = 1     // one per NAMED group
+    <groups_func>_host   = 2
+)
+
+func <groups_func>_index(name string) (int, bool)   // runtime lookup
+func <groups_func>_names() []string                 // aligned with indices
 ```
 
-Iterates the non-overlapping **matches** at or after `offset` — one iteration per match. Each item is a match, represented as `map[string][]uint`: group name → `[start, end]` absolute byte offsets. Only groups that participated are present, and the whole match is **not** in the map — use `groups_func` for that. Group names are hardcoded at stub-generation time.
+The constants cover a name known at compile time at no cost; `_index` is for one chosen at runtime. An **empty** name is never found: a pattern may hold several unnamed groups, so `""` identifies nothing. `_names` follows `regexp.SubexpNames` — entry *i* names the group at index *i* and is `""` where it has none, index 0 included.
 
-```go
-// All matches:
-for parts := range ParseUrl(text, 0) {
-    if g, ok := parts["host"]; ok {
-        fmt.Printf("host: %q\n", text[g[0]:g[1]])
-    }
-}
-
-// First match only:
-for parts := range ParseUrl(text, 0) {
-    if g, ok := parts["host"]; ok {
-        fmt.Printf("host: %q\n", text[g[0]:g[1]])
-    }
-    break
-}
-```
+Duplicate or colliding group names are rejected at **config load**: `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`, but both would collapse to one generated constant.
 
 ---
 
@@ -122,16 +133,19 @@ for parts := range ParseUrl(text, 0) {
 
 | Config field | Generated function | Return type |
 |---|---|---|
-| `match_func` | `<PascalCase>(input []byte)` | `(uint, bool)` — end pos and match flag |
-| `find_func` | `<PascalCase>(input []byte, offset uint)` | `iter.Seq2[uint, uint]` — yields `(start, end)` per match |
-| `groups_func` | `<PascalCase>(input []byte, offset uint)` | `iter.Seq[[][]uint]` — yields `[][start,end]` per match |
-| `named_groups_func` | `<PascalCase>(input []byte, offset uint)` | `iter.Seq[map[string][]uint]` — yields name→`[start,end]` per match |
+| `match_func` | `<func>(input []byte)` | `(end uint, ok bool, err error)` |
+| `find_func` | `<func>(input []byte, offset uint)` | `*<func>Iter` — `Matches() iter.Seq2[uint, uint]`, `Err() error` |
+| `groups_func` | `<func>(input []byte, offset uint)` | `*<func>Iter` — `Matches() iter.Seq[[]Span]`, `Err() error` |
+
+`named_groups_func` is **retired**; `groups_func` carries names through generated index constants plus `<func>_index` and `<func>_names`.
+
+**The generated name is your config name, verbatim.** The PascalCase transform is gone: `match_func: url_match` yields `func url_match`, not `func UrlMatch`. If the stub lands in a library package rather than `package main` that leaves the symbol unexported — that is your choice to make, and the generator warns once per stub rather than renaming it.
 
 **Positions are `uint`, on both sides.** An offset into an input cannot be
 negative, and Go signals absence structurally rather than with a sentinel —
-`match` has the comma-ok `bool`, the iterators simply end, an absent capture
-group is a `nil` slice, and an absent named group is not in the map — so `-1`
-has no user anywhere in this surface. The cost is at call sites: `Find(input,
+`match` has the comma-ok `bool`, the iterators simply end, and an absent
+capture group has `Span.Ok == false` — so `-1` has no user anywhere in this
+surface. The cost is at call sites: `Find(input,
 len(prefix))` becomes `Find(input, uint(len(prefix)))`. Pattern ids and counts
 stay `int`, because an id is not an offset.
 
@@ -144,7 +158,7 @@ This holds for `find`, `groups` and `named_groups` alike, and for every engine
 — the conversion is complete, so there is no longer a shape whose left context
 is judged against a slice edge.
 
-Function names are the `snake_case` config values converted to `PascalCase`: `url_match` → `UrlMatch`, `find_github_token` → `FindGithubToken`. All positions are byte offsets (not character indices). Input is `[]byte`.
+Function names are the config values **verbatim** — `url_match` stays `url_match`. All positions are byte offsets (not character indices). Input is `[]byte`.
 
 ---
 
@@ -166,14 +180,16 @@ type SetMatch struct {
 }
 
 // anchored: the pattern must match the WHOLE input
-func <MatchAny>(input []byte) (int, bool)
-func <MatchAll>(input []byte) iter.Seq[int]
+func <match_any>(input []byte) (id int, ok bool, err error)
+func <match_all>(input []byte) (iter.Seq[int], error)
 
 // non-anchored: each takes an offset bounding the search
-func <ScanAny>(input []byte, offset uint) (int, bool)
-func <ScanAll>(input []byte, offset uint) iter.Seq[int]
+func <scan_any>(input []byte, offset uint) (id int, ok bool, err error)
+func <scan_all>(input []byte, offset uint) (iter.Seq[int], error)
 
-func <Find>(input []byte, offset uint) iter.Seq[SetMatch]
+func <find>(input []byte, offset uint) *<find>Iter
+func (iter *<find>Iter) Matches() iter.Seq[SetMatch]
+func (iter *<find>Iter) Err() error
 ```
 
 `<MatchAll>` and `<ScanAll>` are iterators rather than slices: the ABI hands
@@ -181,17 +197,31 @@ back a bitmask whose set bits can be yielded lazily with nothing materialised,
 so a caller who stops early allocates nothing. `slices.Collect` gives you a
 slice when you want one.
 
-`<ScanAny>` reports **no position** — see [sets.md](sets.md) for why that is
+`<scan_any>` reports **no position** — see [sets.md](sets.md) for why that is
 what makes it cheap.
 
 ```go
-for m := range ScanSecrets(input, 0) {
-    fmt.Println(m.PatternID, m.Start, m.End)
+scanIter := scan_secrets(input, 0)
+for match := range scanIter.Matches() {
+    fmt.Println(match.PatternID, match.Start, match.End)
+}
+if err := scanIter.Err(); err != nil {
+    return err
+}
+
+// The two _all calls resolve in ONE FFI call, so their error comes back
+// beside the data — the shape database/sql's Query has:
+kindSeq, err := all_secret_kinds(input)
+if err != nil {
+    return err
+}
+for patternID := range kindSeq {
+    fmt.Println(patternID)
 }
 ```
 
-The sequence owns one reusable tuple buffer sized from `<Set>PatternCount` and
-a zeroed gate array sized from `<Set>IDSpace` — the gate array is indexed by
+The iterator owns one reusable tuple buffer sized from `<set>_pattern_count`
+and a zeroed gate array sized from `<set>_id_space` — the gate array is indexed by
 global pattern id, so the two lengths differ for a named subset. Both overlap
 policies take the array; see [sets.md](sets.md) for what the overlapping body
 keeps in it. Each WASM call returns every match at one position before
@@ -213,6 +243,22 @@ the scan advances, so a step is not a call. Requires Go 1.23+ for `iter`.
 
 Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
 
-The generated wrapper **panics** with a message naming the function. Go's `(int, bool)` return and the `iter.Seq`/`iter.Seq2` protocols have no third state to report this in, so a panic is the only way to keep it distinguishable from `false` / end-of-iteration without changing every signature.
+The generated wrapper **returns it**. It used to panic; a panic unwinding out of an FFI wrapper is a poor fit for a library, and Go reports failure by returning it.
+
+```go
+var ErrBacktrackOverflow = errors.New("regexped: backtracking stack overflow — ...")
+```
+
+Test for it with `errors.Is`. Where it appears depends on when the failure can occur:
+
+| kind | where the error goes | exports |
+|---|---|---|
+| scalar | last return value | `match_func`, `match_any`, `scan_any` |
+| eager — one FFI call up front | second return, `db.Query`'s shape | `match_all`, `scan_all` |
+| lazy — one FFI call per step | `Err()` after the loop, `sql.Rows`' shape | `find_func`, `groups_func`, set `find` |
+
+**`Err()` can be skipped, and skipping it truncates silently.** That is the same hazard `sql.Rows` and `bufio.Scanner` carry — `golangci-lint` ships `rowserrcheck` for the `sql.Rows` case specifically, and there is no equivalent for these types. Go offers no un-skippable option: `for match := range seq2` legally drops the error variable too, so the choice was between two ignorable designs and this is the one Go programmers already know.
+
+The iterators also stop for good once they record an error. That is required rather than tidy: the overflow is deterministic and the failing call does not advance the offset, so an iterator that kept going would re-run the identical call forever.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

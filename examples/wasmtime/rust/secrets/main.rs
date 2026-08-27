@@ -3,6 +3,15 @@
 include!("stubs.rs");
 
 fn main() {
+    if let Err(err) = run() {
+        // The engine could not answer — NOT the same as "no secrets". See
+        // docs/engines.md, "Backtracking stack overflow".
+        eprintln!("cannot decide: {err}");
+        std::process::exit(2);
+    }
+}
+
+fn run() -> regexps::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: secrets <input>");
@@ -10,25 +19,30 @@ fn main() {
     }
     let input = args[1].as_bytes();
 
-    let mut found = false;
+    // Each find_func gets its OWN iterator type, so this is generic rather
+    // than an array: the three types never unify.
+    fn report<I>(label: &str, input: &[u8], matches: I, found: &mut bool) -> regexps::Result<()>
+    where
+        I: Iterator<Item = regexps::Result<(usize, usize)>>,
+    {
+        for match_result in matches {
+            // `?` here is the whole difference from the panicking API: an
+            // engine that gave up propagates instead of unwinding.
+            let (start, end) = match_result?;
+            let text = std::str::from_utf8(&input[start..end]).unwrap_or("?");
+            println!("{label} at {start}..{end}: {text}");
+            *found = true;
+        }
+        Ok(())
+    }
 
-    for (start, end) in regexps::find_github_token(input, 0) {
-        let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
-        println!("GitHub token at {}..{}: {}", start, end, s);
-        found = true;
-    }
-    for (start, end) in regexps::find_jwt_token(input, 0) {
-        let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
-        println!("JWT at {}..{}: {}", start, end, s);
-        found = true;
-    }
-    for (start, end) in regexps::find_aws_key(input, 0) {
-        let s = std::str::from_utf8(&input[start..end]).unwrap_or("?");
-        println!("AWS key at {}..{}: {}", start, end, s);
-        found = true;
-    }
+    let mut found = false;
+    report("GitHub token", input, regexps::find_github_token(input, 0), &mut found)?;
+    report("JWT", input, regexps::find_jwt_token(input, 0), &mut found)?;
+    report("AWS key", input, regexps::find_aws_key(input, 0), &mut found)?;
 
     if !found {
         println!("No secrets found");
     }
+    Ok(())
 }

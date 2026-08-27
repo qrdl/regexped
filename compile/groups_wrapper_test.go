@@ -23,7 +23,7 @@ func TestGroupsWrapperValidWithoutCaptureBody(t *testing.T) {
 	for _, pat := range []string{`(?:(a){0})`, `(a){0}`, `(a)`, `\A(a)(b)`, `\b(?P<x>a)`} {
 		for _, entry := range []config.RegexEntry{
 			{Pattern: pat, GroupsFunc: "groups"},
-			{Pattern: pat, GroupsFunc: "groups", NamedGroupsFunc: "ngroups"},
+			{Pattern: pat, GroupsFunc: "groups"},
 		} {
 			w, _, err := Compile([]config.RegexEntry{entry}, 65536, true)
 			if err != nil {
@@ -36,7 +36,7 @@ func TestGroupsWrapperValidWithoutCaptureBody(t *testing.T) {
 			}
 			out, vErr := exec.Command("wasm-tools", "validate", "--features", "all", f).CombinedOutput()
 			if vErr != nil {
-				t.Errorf("%-12q named=%v INVALID: %s", pat, entry.NamedGroupsFunc != "", out)
+				t.Errorf("%-12q INVALID: %s", pat, out)
 			}
 		}
 	}

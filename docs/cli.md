@@ -11,6 +11,10 @@ wasm_file: "regexps.wasm"  # output path for the compile command; overridable wi
 import_module: "mymod"     # WASM module name used by wasm-merge and Rust/Go FFI
 stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .js, .ts, .go, .h
 stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c, as
+namespace:      "acme"     # optional; prefixes the symbols a stub declares that YOU did not name
+                           #   (Span, SetMatch, the error type, the pattern-name helper, C's rx_*_t)
+                           #   so two stubs can share one package. No-op for Rust, whose
+                           #   `pub mod <import_module>` already isolates each stub.
 max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
 max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
@@ -24,8 +28,7 @@ regexps:
     # An entry with only 'pattern' is valid; no code is generated for it.
     match_func:        "url_match"         # anchored match
     find_func:         "url_find"          # non-anchored find
-    groups_func:       "url_groups"        # anchored match with all capture groups
-    named_groups_func: "url_named_groups"  # anchored match with named capture groups
+    groups_func:       "url_groups"        # match iterator; each item is that match's capture groups
 
     hints: [prefer-match, batch-find]   # optional; see "hints:" below
 
@@ -70,7 +73,7 @@ a shell can resolve another user's home).
 
 ### Export-name rules
 
-Every `match_func`, `find_func`, `groups_func` and `named_groups_func` value, and every
+Every `match_func`, `find_func` and `groups_func` value, and every
 set capability value (`match`, `match_any`, `match_all`, `scan`, `scan_any`, `scan_all`,
 `find`), becomes both a WASM export name and a
 function name in the generated stub. Because they are written verbatim into generated
@@ -112,11 +115,12 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 | `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. |
 | Export names must not collide with a generator helper (`init`, `_w`, `_resize`, `_exp`, `_mem`, `_inBase`, `_outBase`, `_enc`, `_patternNames`, `patternName`, and `SetMatch` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
 | Export names must not start with `ffi_` | `rust`, `go` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
-| Export names must not collide after the snake_case → PascalCase transform | `rust`, `go` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Go function / Rust iterator type. This also rejects a name that transforms to `SetMatch`, the struct the set stubs declare. |
+| Export names must not collide after the snake_case → PascalCase transform | `rust` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Rust iterator TYPE. Go dropped out of this rule: its names are now emitted verbatim, so nothing there transforms. |
+| Capture group names must be usable as identifiers, unique, and not collide after sanitising | all, when `groups_func` is set | Group names become generated constants and a name→index lookup. `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`; both would collapse to one generated symbol, so this check is ours. |
 
 ### Engine selection
 
-Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation:
+Setting `groups_func` triggers capture-tracking compilation:
 - **TDFA engine** — used when the pattern has no non-greedy quantifiers, no line anchors, no word boundaries, and no ambiguous alternations (Laurikari's tagged DFA, O(n))
 - **Backtracking engine** — used automatically as a fallback for patterns that are not TDFA-eligible (e.g. `(a|ab)`, `(a*)(a*)`)
 
@@ -162,12 +166,11 @@ measure the effect on your own patterns with `tools/pattest`.
 Setting `hints: [batch-find]` on a `regexps:` entry adds a `<func>_batch` WASM
 export — `(ptr, len, out_ptr, out_cap, start_pos) → count` — that drains
 multiple matches per host call instead of one, for `find_func` and
-`groups_func` (`named_groups_func` shares `groups_func`'s batch export when
-both are set on the same entry, or gets its own — named after itself — when
-`named_groups_func` is the only capture export requested).
+`groups_func`. One capability means one batch export and one name; the rule
+about two capture keys sharing an export went with `named_groups_func`.
 
 **⚠ This hint is effective for the JS and TS generators only.** The generated
-JS/TS `find_func`/`groups_func`/`named_groups_func` consumer feature-detects
+JS/TS `find_func`/`groups_func` consumer feature-detects
 the `_batch` export at runtime and prefers it automatically — no stub-side
 configuration needed, and the same generated stub works unmodified whether or
 not `batch-find` was set. **Setting `batch-find` has no effect on stubs
@@ -268,75 +271,82 @@ Generates a stub file (Rust, JS, TypeScript, Go, or C) from the config. The stub
 
 #### Rust stubs
 
-All entries are wrapped in a single `pub mod <import_module> { }` block.
+Wraps every entry in one `pub mod <import_module> { … }` block.
 
 | Config field | Generated function | Return type |
 |---|---|---|
-| `match_func` | `<func>(input)` | `Option<usize>` |
-| `find_func` | `<func>(input)` | `FindIter` — yields `(usize, usize)` per match |
-| `groups_func` | `<func>(input)` | `GroupsIter` — yields `Vec<Option<(usize, usize)>>` per match |
-| `named_groups_func` | `<func>(input)` | `NamedGroupsIter` — yields `HashMap<&'static str, (usize, usize)>` per match |
+| `match_func` | `<func>(input)` | `Result<Option<usize>>` |
+| `find_func` | `<func>(input, offset)` | `<Func>Iter` — yields `Result<(usize, usize)>` |
+| `groups_func` | `<func>(input, offset)` | `<Func>Iter` — yields `Result<Vec<Option<Span>>>` |
 
-See [rust-api.md](rust-api.md) for full usage examples.
+Every export reports a Backtracking overflow as `Err(Error::BacktrackOverflow)`;
+the iterators are fused. See [rust-api.md](rust-api.md).
 
 #### Go stubs (`GOOS=wasip1`)
 
-Generates a `//go:build wasip1` file using `//go:wasmimport` declarations plus a `//go:build !wasip1` host stub for IDE compatibility.
-Requires `import_module` in config (used as the Go package name).
-Requires Go 1.23+ (iterators use `iter.Seq2` / `iter.Seq`).
+Generates a `//go:build wasip1` file using `//go:wasmimport` declarations.
+Requires `import_module` in config (used as the Go package name) and Go 1.23+
+(iterators use `iter.Seq2` / `iter.Seq`).
 
 | Config field | Generated function | Return type |
 |---|---|---|
-| `match_func` | `<PascalCase>(input []byte)` | `(int, bool)` — end pos and match flag |
-| `find_func` | `<PascalCase>(input []byte)` | `iter.Seq2[int, int]` — (start, end) per match |
-| `groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[[][]int]` — slice of [start,end] per match |
-| `named_groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[map[string][]int]` — name→[start,end] per match |
+| `match_func` | `<func>(input []byte)` | `(end uint, ok bool, err error)` |
+| `find_func` | `<func>(input []byte, offset uint)` | `*<func>Iter` — `Matches() iter.Seq2[uint, uint]`, `Err() error` |
+| `groups_func` | `<func>(input []byte, offset uint)` | `*<func>Iter` — `Matches() iter.Seq[[]Span]`, `Err() error` |
 
-Function names are derived by converting `snake_case` config names to `PascalCase`
-(e.g. `url_match` → `UrlMatch`).
+**Function names are your config names, verbatim** — `url_match` stays
+`url_match`. The PascalCase transform is gone. In a library package that leaves
+the symbol unexported; the generator warns once rather than renaming it. See
+[go-api.md](go-api.md).
 
-#### JS stubs
+#### JS and TS stubs
 
-Generates a single ES module. Exports an `init(wasm)` function that must be called with the WASM bytes or a pre-compiled `WebAssembly.Module` before any matcher is used.
+A single ES module. `init(wasm)` must be awaited before any matcher is used.
 
-| Config field | Generated JS export | Returns |
+| Config field | Generated export | Yields |
 |---|---|---|
-| `match_func` | `function <func>(input)` | `[number, boolean]` — `[endPos, matched]` |
-| `find_func` | `function* <func>(input)` | generator yielding `[start, end]` per match |
-| `groups_func` | `function* <func>(input)` | generator yielding `Array<[start,end]\|null>` per match |
-| `named_groups_func` | `function* <func>(input)` | generator yielding `Object` (name→`[start,end]`) per match |
+| `match_func` | `function <func>(input)` | `number \| null` |
+| `find_func` | `function* <func>(input, offset)` | `[start, end]` per match |
+| `groups_func` | `function* <func>(input, offset)` | `Array<[start, end] \| null>` per match |
 
-#### TS stubs
-
-Same as JS stubs but with TypeScript type annotations.
+Overflow **throws**, which is JS's own error channel. TS is the same surface
+with type annotations. See [js-api.md](js-api.md) and [ts-api.md](ts-api.md).
 
 #### C stubs
 
-Generates a single `#pragma once` header file. Requires `import_module` in config.
-No libc or sysroot required — uses `__attribute__((import_module(...), import_name(...)))` for WASM imports.
+A `#pragma once` header plus a `.c`. No libc or sysroot required.
 
 | Config field | Generated functions | Notes |
 |---|---|---|
-| `match_func` | `<func>(input, len)` | Returns end position (≥0) or -1 |
-| `find_func` | `<func>_next(input, len, *start, *end)` + `<func>_reset()` | Static offset state; call reset before iterating |
-| `groups_func` | `<func>_next(input, len, slots[])` + `<func>_reset()` | `slots[i*2]`/`[i*2+1]` = start/end for group i; -1 if absent |
-| `named_groups_func` | same as groups + `<func>_get(slots, name, *start, *end)` | Hardcoded name→index mapping |
+| `match_func` | `ptrdiff_t <func>(input, len)` | end position, `-1`, or `RX_ERR_BT_OVERFLOW` |
+| `find_func` | `<func>_init` + `<func>_next(iter, &match)` | caller-owned iterator; `1` / `0` / `RX_ERR_BT_OVERFLOW` |
+| `groups_func` | `<func>_init` + `<func>_next(iter, groups)` | fills the caller's `rx_group_t[]` |
+
+C returns sentinels — it has no unwinding, and its return types were already
+error codes. See [c-api.md](c-api.md).
 
 #### AS stubs (AssemblyScript)
 
-Generates a single AssemblyScript `.ts` file using `@external` declarations. Requires `import_module` in config. Must set `stub_type: "as"` — `.ts` extension alone infers TypeScript.
-
-**`named_groups_func` is not supported for AS stubs.** Use `groups_func` and access slots by index instead.
-
-Input is `ArrayBuffer` (use `String.UTF8.encode(str)` to convert from string). All functions are stateless — the caller passes an `offset` argument and no module-level state is mutated.
+An AssemblyScript `.ts` using `@external` declarations. Requires
+`import_module`, and `stub_type: "as"` — a `.ts` extension alone infers
+TypeScript. Input is `ArrayBuffer`.
 
 | Config field | Generated function | Returns |
 |---|---|---|
-| `match_func` | `<func>(input: ArrayBuffer): i32` | End position (≥0) or -1 if no match |
-| `find_func` | `<func>(input: ArrayBuffer, offset: i32): i64` | Packed `(absStart << 32 \| absEnd)` or -1 if not found |
-| `groups_func` | `<func>(input: ArrayBuffer, offset: i32): i32` | `dataStart` pointer to static `Int32Array` slots, or 0 on no match |
+| `match_func` | `<func>(input): i32` | end position, `-1`, or `RX_ERR_BT_OVERFLOW` |
+| `find_func` | `<func>(input, offset): <func>_iter` | `next(): i64` — packed pair, `-1`, or `RX_ERR_BT_OVERFLOW` |
+| `groups_func` | `<func>(input, offset): <func>_iter` | `next(): u32` — slot pointer, `0`, or `RX_ITER_ERROR` |
 
-See [as-api.md](as-api.md) for full usage examples and slot layout.
+AssemblyScript returns sentinels, not exceptions: `asc` cannot `catch`, and a
+`throw` there compiles to an uncatchable `abort`. See [as-api.md](as-api.md).
+
+#### Named capture groups
+
+There is no `named_groups_func` — it was retired, because it was never a
+separate capability: both stubs called the same WASM export. When a pattern has
+at least one named group, `groups_func` additionally emits a constant per named
+group plus `<func>_index` and `<func>_names` (an index object in JS/TS). This
+also gives C and AssemblyScript named access, which they never had.
 
 ---
 

@@ -18,8 +18,6 @@ func TestCaptureStubsRequested(t *testing.T) {
 		{RegexEntry{MatchFunc: "m"}, false},
 		{RegexEntry{FindFunc: "f"}, false},
 		{RegexEntry{GroupsFunc: "g"}, true},
-		{RegexEntry{NamedGroupsFunc: "ng"}, true},
-		{RegexEntry{GroupsFunc: "g", NamedGroupsFunc: "ng"}, true},
 	}
 	for _, c := range cases {
 		if got := c.entry.CaptureStubsRequested(); got != c.want {
@@ -34,8 +32,6 @@ func TestGroupsExportName(t *testing.T) {
 		want  string
 	}{
 		{RegexEntry{GroupsFunc: "grp"}, "grp"},
-		{RegexEntry{NamedGroupsFunc: "ng"}, "ng"},
-		{RegexEntry{GroupsFunc: "grp", NamedGroupsFunc: "ng"}, "grp"},
 		{RegexEntry{}, ""},
 	}
 	for _, c := range cases {
@@ -568,6 +564,11 @@ func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
 		{"match", "match", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    match: sm\n    patterns: all\n"},
 		{"scan", "scan", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan: ss\n    patterns: all\n"},
 		{"find_batch", "find_batch", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n"},
+		// Retired by TODO task 62. It was never a separate capability — both
+		// stubs called the SAME WASM export — so `groups_func` plus the
+		// generated name→index constants replaces it, and C and AS gain named
+		// access they never had.
+		{"named_groups_func", "named_groups_func", "regexps:\n  - pattern: '(?P<a>x)'\n    named_groups_func: ng\n"},
 		{"typo", "mach_func", "regexps:\n  - pattern: 'foo'\n    mach_func: m\n"},
 	}
 	for _, c := range cases {
