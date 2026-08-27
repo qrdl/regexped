@@ -63,7 +63,7 @@ if let Some((start, end)) = find_token(input, 0).next() {
 
 ---
 
-### `groups_func` — anchored capture groups iterator
+### `groups_func` — match iterator, each item a match's capture groups
 
 ```rust
 pub fn <groups_func>(input: &[u8], offset: usize) -> <GroupsFuncPascalCase>Iter<'_>
@@ -72,19 +72,19 @@ pub fn <groups_func>(input: &[u8], offset: usize) -> <GroupsFuncPascalCase>Iter<
 
 As with `find_func`, the iterator type name is derived from the function name (PascalCase + `Iter`), e.g. `groups_func: "parse_groups"` generates `ParseGroupsIter`.
 
-Returns an iterator that yields all non-overlapping matches. Each item is a `Vec` of capture group positions (absolute offsets). Index 0 is the full match; subsequent indices are capture groups in order. A group that did not participate is `None`.
+Iterates the non-overlapping **matches** at or after `offset` — one item per match, not per group. Each item is a match, represented as a `Vec` of positions at absolute byte offsets. Index 0 is the full match; subsequent indices are capture groups in order. A group that did not participate is `None`, so the `Vec` length is always `groups + 1` regardless of how many participated.
 
 ```rust
-// All matches:
-for groups in parse_groups(input, 0) {
-    if let Some(Some((s, e))) = groups.get(1) {
+// Every match:
+for m in parse_groups(input, 0) {
+    if let Some(Some((s, e))) = m.get(1) {
         println!("group 1: {:?}", &input[*s..*e]);
     }
 }
 
 // First match only:
-if let Some(groups) = parse_groups(input, 0).next() {
-    if let Some(Some((s, e))) = groups.get(1) {
+if let Some(m) = parse_groups(input, 0).next() {
+    if let Some(Some((s, e))) = m.get(1) {
         println!("group 1: {:?}", &input[s..e]);
     }
 }
@@ -92,14 +92,14 @@ if let Some(groups) = parse_groups(input, 0).next() {
 
 ---
 
-### `named_groups_func` — named capture groups iterator
+### `named_groups_func` — match iterator, each item a match's named groups
 
 ```rust
 pub fn <named_groups_func>(input: &[u8], offset: usize) -> NamedGroupsIter<'_>
 // NamedGroupsIter implements Iterator<Item = HashMap<&'static str, (usize, usize)>>
 ```
 
-Returns an iterator that yields all non-overlapping matches. Each item is a `HashMap` of name → `(start, end)` for groups that participated in the match. Keys are `&'static str` — group names are hardcoded at stub-generation time.
+Iterates the non-overlapping **matches** at or after `offset` — one item per match. Each item is a match, represented as a `HashMap` of name → `(start, end)` for the groups that participated. The whole match is **not** in the map — use `groups_func` for that. Keys are `&'static str`; group names are hardcoded at stub-generation time.
 
 ```rust
 // All matches:

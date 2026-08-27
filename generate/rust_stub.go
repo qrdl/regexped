@@ -538,7 +538,8 @@ impl<'a> Iterator for %s<'a> {
     }
 }
 
-/// Returns an iterator over all non-overlapping capture matches in input.
+/// Iterates the non-overlapping matches at or after offset: each item is one
+/// MATCH, represented by its capture groups.
 /// Group positions are absolute byte offsets. Index 0 is the full match.
 /// Use .next() to get only the first match.
 pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
@@ -622,7 +623,8 @@ impl<'a> Iterator for %s<'a> {
     }
 }
 
-/// Returns an iterator over all non-overlapping named-capture matches in input.
+/// Iterates the non-overlapping matches at or after offset: each item is one
+/// MATCH, represented by its named capture groups.
 /// Group positions are absolute byte offsets.
 /// Use .next() to get only the first match.
 pub fn %s(input: &[u8], offset: usize) -> %s<'_> {

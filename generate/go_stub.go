@@ -386,9 +386,9 @@ func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer, from uint32) i
 `, importModule, exportName, ffi)
 	}
 
-	return ffiDecl + fmt.Sprintf(`// %s returns an iterator over capture groups of all non-overlapping matches
-// starting at or after offset.
-// Each iteration yields a slice of numGroups [start,end] pairs; nil means the group didn't participate.
+	return ffiDecl + fmt.Sprintf(`// %s iterates the non-overlapping matches at or after offset: each iteration is
+// one MATCH, represented by its capture groups.
+// A match is a slice of numGroups [start,end] pairs; nil means the group didn't participate.
 // Index 0 is the full match. Positions are absolute byte offsets.
 //
 // LIMITATION: offset currently NARROWS the input rather than bounding only the
@@ -491,8 +491,9 @@ func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer, from uint32) i
 			e.index*2, e.name, e.index*2, e.index*2+1)
 	}
 
-	return ffiDecl + fmt.Sprintf(`// %s returns an iterator over named capture groups of all non-overlapping matches.
-// Each iteration yields a map of group name → [start,end] absolute byte offsets.
+	return ffiDecl + fmt.Sprintf(`// %s iterates the non-overlapping matches at or after offset: each iteration is
+// one MATCH, represented by its named capture groups — a map of group name →
+// [start,end] absolute byte offsets.
 func %s(input []byte, offset uint) iter.Seq[map[string][]uint] {
 	return func(yield func(map[string][]uint) bool) {
 		pos := int(offset)

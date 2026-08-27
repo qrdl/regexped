@@ -64,25 +64,25 @@ for start, end := range FindToken(input, 0) {
 
 ---
 
-### `groups_func` — capture groups iterator
+### `groups_func` — match iterator, each item a match's capture groups
 
 ```go
 func <GroupsFunc>(input []byte, offset uint) iter.Seq[[][]uint]
 ```
 
-Returns an iterator over all non-overlapping matches. Each item is a `[][]int` slice of capture group positions (absolute byte offsets). Index 0 is the full match; subsequent indices are capture groups in order. A group that did not participate is `nil`.
+Iterates the non-overlapping **matches** at or after `offset` — one iteration per match, not per group. Each item is a match, represented as `[][]uint`: one `[start, end]` pair per capture group, at absolute byte offsets. Index 0 is the full match; subsequent indices are capture groups in order. A group that did not participate is `nil`, so the outer length is always `numGroups + 1` regardless of how many participated.
 
 ```go
-// All matches:
-for groups := range ParseGroups(input, 0) {
-    if g := groups[1]; g != nil {
+// Every match:
+for match := range ParseGroups(input, 0) {
+    if g := match[1]; g != nil {
         fmt.Printf("group 1: %q\n", input[g[0]:g[1]])
     }
 }
 
 // First match only:
-for groups := range ParseGroups(input, 0) {
-    if g := groups[1]; g != nil {
+for match := range ParseGroups(input, 0) {
+    if g := match[1]; g != nil {
         fmt.Printf("group 1: %q\n", input[g[0]:g[1]])
     }
     break
@@ -91,13 +91,13 @@ for groups := range ParseGroups(input, 0) {
 
 ---
 
-### `named_groups_func` — named capture groups iterator
+### `named_groups_func` — match iterator, each item a match's named groups
 
 ```go
 func <NamedGroupsFunc>(input []byte, offset uint) iter.Seq[map[string][]uint]
 ```
 
-Returns an iterator over all non-overlapping matches. Each item is a `map[string][]uint` of name → `[start, end]` absolute byte offsets. Only groups that participated in the match are present in the map. Group names are hardcoded at stub-generation time.
+Iterates the non-overlapping **matches** at or after `offset` — one iteration per match. Each item is a match, represented as `map[string][]uint`: group name → `[start, end]` absolute byte offsets. Only groups that participated are present, and the whole match is **not** in the map — use `groups_func` for that. Group names are hardcoded at stub-generation time.
 
 ```go
 // All matches:
