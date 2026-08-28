@@ -1,6 +1,6 @@
 GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/*/*.go merge/*.go))
 
-.PHONY: re2test setcaps setcaps-exhaustive perftest perftest-check setperf setperf-check byteident examples clean unittest lint fmt
+.PHONY: re2test setcaps setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross byteident examples clean unittest lint fmt
 
 build: regexped
 
@@ -30,6 +30,12 @@ setperf:
 
 setperf-check:
 	$(MAKE) -C tools/setperf check
+
+# Cross-engine FUEL: ours vs regex-automata's, both metered over one
+# whole-input operation. Deterministic and machine-independent — the number to
+# quote when wall-clock would only report this machine's placement noise.
+setperf-fuel-cross:
+	$(MAKE) -C tools/setperf fuel-cross
 
 # Byte-identical regression net for the single-pattern paths
 # (plans/SETS.md §9.0). One fixture per code path, compared byte for byte —

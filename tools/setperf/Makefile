@@ -3,13 +3,20 @@
 # The Rust harness is shared with tools/perftest: one crate, one toolchain,
 # one build artefact. Build it there first (or via the `harnesses` target).
 
-.PHONY: run fuel size verify harnesses baseline check clean
+.PHONY: run fuel fuel-cross size verify harnesses baseline check clean
 
 run: harnesses
 	go run .
 
 fuel:
 	go run . -fuel
+
+# Cross-engine fuel: ours vs regex-automata's, both metered by wasmtime over
+# one whole-input operation. Deterministic and machine-independent, so it is
+# the number to quote in a plan — unlike the full matrix's wall-clock, which is
+# placement noise here. Needs the Rust harness.
+fuel-cross: harnesses
+	go run . -fuel-cross
 
 size:
 	go run . -size

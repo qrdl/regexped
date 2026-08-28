@@ -494,20 +494,33 @@ implementation to check against.
 WASM instructions, and Rust→WASM codegen differs structurally from our
 hand-emitted WASM. Track the ratio, never a single absolute number.
 
-The rows where we still LOSE are documented in `plans/SETS.md` §21.18 (board
-re-measured 2026-08-23): **three, all dense `find`, all structural** —
-keywords-2 0.15x, keywords-8 0.27x, keywords-64 0.59x. `find` is the lazy API
-and pays one host crossing per matching position; each of those rows is covered
-by its own batched find at 8.3x-14.9x. Two further `find` rows now report
-`boundary` rather than a ratio, because the per-call crossing correction has
-grown to the whole sample — that is the instrument declining to divide, not a
-loss.
+**The classchain corpus fix of 2026-08-28 rebaselined this tool.**
+`sampleNeedles` had no arm for `[a-z]{A}[0-9]{B}`, so classchain's "dense"
+corpus planted needles with no digit and matched nothing — its dense rows were
+a second no-match corpus. `baseline_fuel.txt` / `baseline_size.txt` were
+recaptured against the fixed corpus, so **comparing a classchain row against
+any figure recorded before that date compares two different corpora.**
+
+The rows where we still LOSE are documented in `plans/SETS.md` §21.19 (board
+re-measured 2026-08-28, superseding §21.18): **eight of 114, six of them dense
+`find`** — keywords-2 0.14x, keywords-8 0.21x, keywords-32 0.47x, greedy-3
+late-ERROR 0.19x and no-match 0.10x, plus its `find_batch` at 0.98x (a boundary
+row, not a loss). `find` is the lazy API and pays one host crossing per matching
+position; each of those rows is covered by its own batched find at 7x-11x.
+
+The two that are NOT `find` are the honest residual: **classchain `scan_any` on
+no-match input, 0.97x at 32 patterns and 0.80x at 128.** Our `scan_any` and
+`scan_all` do identical per-byte work, while regex-automata's `scan_any` is much
+cheaper than its `scan_all` — so the same engine work wins comfortably against
+one of their capabilities and just misses the other.
 
 Everything else wins. §20.2's three literal-less rows — once the evidence for
-"every win comes from the literal frontends" — were closed by §21's G10-G14,
-and G16's first-byte eligibility mask then took greedy-3's no-match `find`
-from 251 to 94 fuel/byte, which flipped its batched find from 0.43x to 1.19x:
-the last non-structural loss on the board. The forward backlog for sets is
+"every win comes from the literal frontends" — were closed by §21's G10-G14;
+G16's first-byte eligibility mask took greedy-3's no-match `find` from 251 to 94
+fuel/byte; and SETS_PLAN item 21 then removed a 64-id ELIGIBILITY ceiling that
+had been dropping wide literal-less sets onto the per-position walk, taking
+classchain-128's scan rows 17,171,467 → 2,227,464 fuel (7.7x) and making the
+scan pair nearly flat in pattern count. The forward backlog for sets is
 `plans/SETS_PLAN.md`.
 
 ### LikelyMode benchmark matrix (`tools/likelytest/`)

@@ -205,6 +205,46 @@ func raPairing(c capability) string {
 	return ""
 }
 
+// raFuelPairing is raPairing for the FUEL comparison: the same task, but the
+// harness's ONE-SHOT export rather than its `ra_bench_*` timing wrapper.
+//
+// The bench exports loop `iters` times inside wasm and take timestamps, so
+// metering them would count the loop, the clock calls and the timings writes
+// along with the engine work. The one-shot exports do exactly one whole-input
+// operation — they are what `--verify` already calls — and their bodies are
+// the same code the bench wrappers loop over. That makes them the honest fuel
+// target, and it is why no new Rust entry point was needed for any of this.
+func raFuelPairing(c capability) string {
+	switch c {
+	case capScanAny:
+		return "ra_scan_any"
+	case capScanAll:
+		return "ra_scan_all"
+	case capMatchAny:
+		return "ra_match"
+	case capMatchAll:
+		return "ra_match_all"
+	case capFind, capFindBatch:
+		// Same pairing rule as raPairing: the per-pattern merged enumeration.
+		// One call walks the whole input for every pattern, which is what one
+		// exhausted drive is on our side.
+		return "ra_find_gated"
+	}
+	return ""
+}
+
+// raFuelArgs returns the argument list for the one-shot export, whose arity
+// differs by capability: the anchored pair takes only a length, everything
+// else also takes `from`.
+func raFuelArgs(c capability, inputLen int32) []interface{} {
+	switch c {
+	case capMatchAny, capMatchAll:
+		return []interface{}{inputLen}
+	default:
+		return []interface{}{inputLen, int32(0)}
+	}
+}
+
 // setCase is one (set, input) row of the matrix.
 type setCase struct {
 	name     string
@@ -215,6 +255,7 @@ type setCase struct {
 
 func main() {
 	fuelOnly := flag.Bool("fuel", false, "print our fuel only (deterministic)")
+	fuelCross := flag.Bool("fuel-cross", false, "our fuel vs regex-automata's, both metered (deterministic; no timing)")
 	sizeOnly := flag.Bool("size", false, "print module sizes only")
 	verify := flag.Bool("verify", false, "cross-engine correctness on the honest pairings")
 	compareFuel := flag.String("compare-fuel", "", "compare our fuel against a baseline file; exit 1 on any change")
@@ -230,6 +271,9 @@ func main() {
 		os.Exit(runCompare(*compareSize, cases, measureSizeRow, "size"))
 	case *fuelOnly:
 		printRows(cases, measureFuelRow, "fuel")
+		return
+	case *fuelCross:
+		runFuelCross(cases)
 		return
 	case *sizeOnly:
 		printRows(cases, measureSizeRow, "bytes")
@@ -449,6 +493,17 @@ func sampleNeedles(pats []string, k int) []string {
 			var a, b int
 			fmt.Sscanf(p, `union[ \t]+[a-z]{%d}[0-9]{%d}`, &a, &b)
 			out = append(out, "union "+strings.Repeat("q", a)+strings.Repeat("7", b))
+		case strings.HasPrefix(p, "[a-z]{"):
+			// classchain: `[a-z]{A}[0-9]{B}`, same rebuild as the union arm.
+			// Before this arm existed the patterns fell through to the default
+			// needle "xy" — which contains no digit, so classchain's "dense"
+			// corpus matched NOTHING and its dense rows were a second no-match
+			// corpus with different byte statistics (SETS_PLAN item 21,
+			// instrument fix; the tell was dense fuel == no-match fuel to the
+			// digit).
+			var a, b int
+			fmt.Sscanf(p, `[a-z]{%d}[0-9]{%d}`, &a, &b)
+			out = append(out, strings.Repeat("q", a)+strings.Repeat("7", b))
 		case p == `a+`:
 			out = append(out, "aaaa")
 		case strings.Contains(p, "ERROR"):
@@ -933,11 +988,26 @@ type raHarness struct {
 }
 
 func newRaHarness(engine *wasmtime.Engine, wasm []byte, c setCase) (*raHarness, error) {
+	return newRaHarnessFuel(engine, wasm, c, false)
+}
+
+// newRaHarnessFuel is newRaHarness with a switch for a fuel-metering engine.
+//
+// A metered store traps on the FIRST call if it has no fuel, and this
+// constructor makes several (the pointer getters, ra_set_init) before anything
+// is measured — so the budget has to be in place before setup, not just before
+// the measured call. Every measurement re-arms it anyway.
+func newRaHarnessFuel(engine *wasmtime.Engine, wasm []byte, c setCase, metered bool) (*raHarness, error) {
 	mod, err := wasmtime.NewModule(engine, wasm)
 	if err != nil {
 		return nil, err
 	}
 	store := wasmtime.NewStore(engine)
+	if metered {
+		if err := store.SetFuel(fuelBudget); err != nil {
+			return nil, err
+		}
+	}
 	store.SetWasi(wasmtime.NewWasiConfig())
 	linker := wasmtime.NewLinker(engine)
 	if err := linker.DefineWasi(); err != nil {
@@ -997,6 +1067,57 @@ func newRaHarness(engine *wasmtime.Engine, wasm []byte, c setCase) (*raHarness, 
 	return &raHarness{store: store, inst: inst, mem: mem, inputPtr: inputPtr, timings: timings, outPtr: outPtr}, nil
 }
 
+// fuelOf meters ONE whole-input operation of the regex-automata harness, the
+// same way measureFuelRow meters one of ours: a warm-up call first (the first
+// call through a function pays lazy compilation and one-time lazy-DFA cache
+// fills, neither of which is per-operation work), then re-arm the budget and
+// bracket a single call.
+//
+// Returns fuelExhausted when the budget runs out, for the same reason our side
+// does: dropping the row would make a too-expensive engine read as a missing
+// number, and 0 fuel would read as a free one.
+//
+// truncated reports that `ra_find_gated` filled RA_OUT_BUF and stopped early,
+// which would make their fuel describe LESS work than ours. It has never
+// fired on this matrix — the buffer holds 65,536 tuples and the densest row
+// produces a few thousand — but an unnoticed truncation would read as a large
+// unearned win for them, so it is checked rather than assumed.
+func (h *raHarness) fuelOf(cap capability, inputLen int32) (fuel uint64, truncated bool, err error) {
+	name := raFuelPairing(cap)
+	if name == "" {
+		return 0, false, fmt.Errorf("no fuel pairing for %s", cap)
+	}
+	fn := h.inst.GetFunc(h.store, name)
+	if fn == nil {
+		return 0, false, fmt.Errorf("harness missing %s", name)
+	}
+	args := raFuelArgs(cap, inputLen)
+	if _, err := fn.Call(h.store, args...); err != nil {
+		if isFuelExhausted(err) {
+			return fuelExhausted, false, nil
+		}
+		return 0, false, err
+	}
+	if err := h.store.SetFuel(fuelBudget); err != nil {
+		return 0, false, err
+	}
+	before, _ := h.store.GetFuel()
+	res, err := fn.Call(h.store, args...)
+	if err != nil {
+		if isFuelExhausted(err) {
+			return fuelExhausted, false, nil
+		}
+		return 0, false, err
+	}
+	after, _ := h.store.GetFuel()
+	if cap == capFind || cap == capFindBatch {
+		if n, ok := res.(int32); ok && int(n) >= raOutTuples {
+			truncated = true
+		}
+	}
+	return before - after, truncated, nil
+}
+
 // bench runs the named regex-automata bench export and returns its p50.
 func (h *raHarness) bench(name string, inputLen int) (time.Duration, error) {
 	fn := h.inst.GetFunc(h.store, name)
@@ -1042,8 +1163,24 @@ func runFullMatrix(cases []setCase) {
 
 	fmt.Println("setperf — regexped set capabilities vs regex-automata")
 	fmt.Println(strings.Repeat("─", 96))
-	fmt.Println("Fuel is EXACT within an engine and indicative ACROSS engines; wall-clock is")
-	fmt.Println("placement noise on this machine — compare the ratio, not the absolute.")
+	fmt.Println("TWO ratios per row, and they answer different questions.")
+	fmt.Println()
+	fmt.Println("`fuel x` is theirs/ours in WASM instructions EXECUTED, both sides metered by")
+	fmt.Println("wasmtime over one whole-input operation. It is deterministic — same number")
+	fmt.Println("every run, on any machine — and it has no host-crossing term, because a")
+	fmt.Println("Go->wasmtime call executes no wasm instructions. So it is the only column")
+	fmt.Println("that answers the small rows the timed one has to withhold as call-bound.")
+	fmt.Println("Its bias: our WASM is hand-emitted, theirs is rustc/LLVM output, so their")
+	fmt.Println("count carries bounds checks, spills and panic paths ours never emits. That")
+	fmt.Println("is real work their engine does, not an artefact — but it means `fuel x` is")
+	fmt.Println("a measure of instructions, not of nanoseconds. Read a 1.1x as parity.")
+	fmt.Println()
+	fmt.Println("`time x` is theirs/ours in wall-clock, crossing-corrected. It is what a")
+	fmt.Println("caller feels, and on this machine it is also instruction-placement noise —")
+	fmt.Println("compare it over several runs or not at all.")
+	fmt.Println()
+	fmt.Println("When the two disagree, they are usually both right and measuring different")
+	fmt.Println("things: fuel says who does less work, time says whose work the CPU likes.")
 	fmt.Println()
 	fmt.Println("BOTH SIDES ARE WASM: regex-automata is built for wasm32-wasip1 and runs in the")
 	fmt.Println("same wasmtime engine. What differs is where the clock sits (§17.5). Our sample")
@@ -1069,23 +1206,54 @@ func runFullMatrix(cases []setCase) {
 			len(gated), len(over), len(raBytes))
 
 		ra, raErr := newRaHarness(engine, raBytes, c)
+		// A SECOND harness on the fuel-metered engine. Separate because
+		// metering is an engine-level setting and the timed harness must not
+		// carry it: fuel accounting is per-instruction overhead, and a timed
+		// row measured under it would report the meter, not the engine.
+		raFuel, raFuelErr := newRaHarnessFuel(fuelEngine, raBytes, c, true)
 		fuel := map[string]uint64{}
 		for _, r := range measureFuelRow(c) {
 			fuel[r.key] = r.value
 		}
 
-		fmt.Printf("  %-18s %12s %11s %7s %11s %11s %9s  %s\n",
-			"capability", "our fuel", "our p50", "calls", "our engine", "theirs p50", "ratio", "note")
-		fmt.Println("  " + strings.Repeat("─", 100))
+		fmt.Printf("  %-18s %12s %12s %7s %11s %7s %11s %11s %7s  %s\n",
+			"capability", "our fuel", "theirs fuel", "fuel x", "our p50", "calls", "our engine", "theirs p50", "time x", "note")
+		fmt.Println("  " + strings.Repeat("─", 118))
 		for _, cap := range allCaps {
 			ourFuel := fuel[rowKey(c, cap)]
+			// The FUEL comparison, computed first because it is deterministic
+			// and does not depend on any timing. It is also the only
+			// cross-engine number on this row that does not need the host
+			// crossing corrected away: fuel counts instructions executed
+			// INSIDE wasm, and a Go->wasmtime call contributes none of them.
+			// That is why a row can be "call-bound" for time and still carry a
+			// real fuel ratio.
+			theirFuel, fuelTrunc, tfErr := uint64(0), false, error(nil)
+			if raFuelErr != nil {
+				tfErr = raFuelErr
+			} else if raFuelPairing(cap) == "" {
+				tfErr = errNoPairing
+			} else {
+				theirFuel, fuelTrunc, tfErr = raFuel.fuelOf(cap, int32(len(c.input)))
+			}
+			tf, fx := fmtTheirFuel(theirFuel, tfErr)
+			if tfErr == nil {
+				fx = fmtFuelRatio(ourFuel, theirFuel)
+			}
+
 			ours, calls, floor, err := measureTime(engine, c, cap, ourFuel)
 			if err != nil {
-				fmt.Printf("  %-18s %12s %11s %7s %11s %11s %9s\n", cap, "-", "error", "-", "-", "-", "-")
+				fmt.Printf("  %-18s %12s %12s %7s %11s %7s %11s %11s %7s  %s\n",
+					cap, "-", tf, fx, "error", "-", "-", "-", "-", "")
 				continue
 			}
 			ourEng := engineTime(ours, calls, floor)
 			f := fmtFuel(ourFuel)
+			if fuelTrunc {
+				// Their side stopped filling its output buffer, so its fuel
+				// describes less work than ours. Withhold rather than divide.
+				fx = "truncated"
+			}
 			// F4: say so when the timed input was shortened, because then this
 			// row's fuel and time describe different input lengths.
 			var note string
@@ -1102,14 +1270,14 @@ func runFullMatrix(cases []setCase) {
 				if raErr != nil {
 					reason = "harness error"
 				}
-				fmt.Printf("  %-18s %12s %11s %7d %11s %11s %9s  %s\n",
-					cap, f, fmtDur(ours), calls, fmtDur(ourEng), reason, "-", note)
+				fmt.Printf("  %-18s %12s %12s %7s %11s %7d %11s %11s %7s  %s\n",
+					cap, f, tf, fx, fmtDur(ours), calls, fmtDur(ourEng), reason, "-", note)
 				continue
 			}
 			theirs, err := ra.bench(pairing, len(c.input))
 			if err != nil {
-				fmt.Printf("  %-18s %12s %11s %7d %11s %11s %9s  %s\n",
-					cap, f, fmtDur(ours), calls, fmtDur(ourEng), "error", "-", note)
+				fmt.Printf("  %-18s %12s %12s %7s %11s %7d %11s %11s %7s  %s\n",
+					cap, f, tf, fx, fmtDur(ours), calls, fmtDur(ourEng), "error", "-", note)
 				continue
 			}
 			// A ratio is printed only when both sides did comparable work.
@@ -1139,11 +1307,131 @@ func runFullMatrix(cases []setCase) {
 						calls, fmtDur(floor), fmtDur(ours))
 				}
 			}
-			fmt.Printf("  %-18s %12s %11s %7d %11s %11s %9s  %s\n",
-				cap, f, fmtDur(ours), calls, fmtDur(ourEng), fmtDur(theirs), ratio, note)
+			fmt.Printf("  %-18s %12s %12s %7s %11s %7d %11s %11s %7s  %s\n",
+				cap, f, tf, fx, fmtDur(ours), calls, fmtDur(ourEng), fmtDur(theirs), ratio, note)
 		}
-		_ = fuelEngine
 	}
+}
+
+// errNoPairing marks a capability regex-automata has no equivalent for — the
+// overlapping find pair. Distinct from a harness failure, and printed
+// differently, because "they cannot do this" and "we could not measure it" are
+// not the same statement.
+var errNoPairing = errors.New("no regex-automata pairing")
+
+// fmtTheirFuel renders the harness's fuel cell and the placeholder for the
+// ratio beside it.
+func fmtTheirFuel(f uint64, err error) (cell, ratio string) {
+	switch {
+	case errors.Is(err, errNoPairing):
+		return "-", "-"
+	case err != nil:
+		return "error", "-"
+	case f == fuelExhausted:
+		return "exhausted", "-"
+	}
+	return fmtFuel(f), "-"
+}
+
+// fmtFuelRatio is theirs/ours, so >1 means we execute fewer WASM instructions
+// — the same orientation as the time ratio beside it.
+//
+// It is withheld when either side is missing or exhausted. It is NOT withheld
+// for small work: unlike the timed ratio, a fuel ratio has no host-crossing
+// term to swamp it, so a 60-fuel row divides just as honestly as a 2M-fuel one.
+// That is the whole reason this column exists — it answers the 73 rows the
+// timed column has to report as "call-bound".
+func fmtFuelRatio(ours, theirs uint64) string {
+	if ours == 0 || theirs == 0 || ours == fuelExhausted || theirs == fuelExhausted {
+		return "-"
+	}
+	return fmt.Sprintf("%.2fx", float64(theirs)/float64(ours))
+}
+
+// runFuelCross prints the cross-engine FUEL table and nothing else.
+//
+// Separate from the full matrix because it is a different kind of measurement:
+// deterministic, machine-independent, and fast (no 50 ms warm-up and no 2,000
+// timed iterations per row). It is the mode to use when the question is "who
+// does less work", and the one to quote in a plan, because two runs of it on
+// two machines produce identical numbers.
+//
+// It deliberately does NOT feed a baseline file. `-fuel`'s output is the
+// committed regression gate and its format is compared for exact equality;
+// adding a second engine's numbers to that contract would make our gate fail
+// whenever the Rust toolchain changed under it.
+func runFuelCross(cases []setCase) {
+	raBytes, err := os.ReadFile(harnessPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot read the regex-automata harness (run 'make harnesses' in ../perftest): %v\n", err)
+		os.Exit(1)
+	}
+	cfg := wasmtime.NewConfig()
+	cfg.SetConsumeFuel(true)
+	engine := wasmtime.NewEngineWithConfig(cfg)
+
+	fmt.Println("setperf — cross-engine FUEL (WASM instructions executed, one whole-input operation)")
+	fmt.Println(strings.Repeat("─", 96))
+	fmt.Println("Both sides metered by wasmtime. Deterministic: same numbers on any machine.")
+	fmt.Println("ratio is theirs/ours, so >1 means we execute fewer instructions.")
+	fmt.Println("BIAS: their WASM is rustc/LLVM output and carries bounds checks, spills and")
+	fmt.Println("panic paths our hand-emitted WASM does not. That is work their engine really")
+	fmt.Println("does, but it means this measures INSTRUCTIONS, not nanoseconds — read ~1.1x")
+	fmt.Println("as parity and use the full matrix's `time x` for what a caller feels.")
+	fmt.Println()
+
+	var wins, losses, drawn int
+	for _, c := range cases {
+		fmt.Printf("\n=== %s / %s (%d patterns, %d bytes) ===\n", c.name, c.inputLbl, len(c.patterns), len(c.input))
+		h, err := newRaHarnessFuel(engine, raBytes, c, true)
+		if err != nil {
+			fmt.Printf("  harness error: %v\n", err)
+			continue
+		}
+		fuel := map[string]uint64{}
+		for _, r := range measureFuelRow(c) {
+			fuel[r.key] = r.value
+		}
+		fmt.Printf("  %-18s %14s %14s %9s  %s\n", "capability", "our fuel", "theirs fuel", "ratio", "note")
+		fmt.Println("  " + strings.Repeat("─", 76))
+		for _, cap := range allCaps {
+			ourFuel := fuel[rowKey(c, cap)]
+			if raFuelPairing(cap) == "" {
+				fmt.Printf("  %-18s %14s %14s %9s  %s\n",
+					cap, fmtFuel(ourFuel), "-", "-", "regex-automata has no equivalent")
+				continue
+			}
+			theirFuel, trunc, err := h.fuelOf(cap, int32(len(c.input)))
+			if err != nil {
+				fmt.Printf("  %-18s %14s %14s %9s  %s\n", cap, fmtFuel(ourFuel), "error", "-", err)
+				continue
+			}
+			note := ""
+			ratio := fmtFuelRatio(ourFuel, theirFuel)
+			if trunc {
+				ratio, note = "truncated", "their output buffer filled; their fuel covers less work than ours"
+			}
+			if ourFuel == fuelExhausted || theirFuel == fuelExhausted {
+				note = fmt.Sprintf("one side exceeded the %s budget", fmtFuel(fuelBudget))
+			}
+			if r := ratio; strings.HasSuffix(r, "x") {
+				v := 0.0
+				fmt.Sscanf(r, "%fx", &v)
+				switch {
+				case v >= 1.1:
+					wins++
+				case v <= 0.9:
+					losses++
+				default:
+					drawn++
+				}
+			}
+			fmt.Printf("  %-18s %14s %14s %9s  %s\n",
+				cap, fmtFuel(ourFuel), fmtFuel(theirFuel), ratio, note)
+		}
+	}
+	fmt.Printf("\n%d comparable rows: %d ours by >1.1x, %d theirs by >1.1x, %d within 0.9-1.1x.\n",
+		wins+losses+drawn, wins, losses, drawn)
 }
 
 func printRows(cases []setCase, measure func(setCase) []row, unit string) {
