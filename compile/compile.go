@@ -389,10 +389,9 @@ type compiledPattern struct {
 	findBody    []byte // (i32,i32)→i64; nil if not needed. Set via setFind, never directly.
 	captureBody []byte // (i32,i32,i32)→i32; nil if no groups; always internal
 
-	matchExport       string // empty = not exported
-	findExport        string // empty = internal-only (for wrapper use)
-	groupsExport      string
-	namedGroupsExport string
+	matchExport  string // empty = not exported
+	findExport   string // empty = internal-only (for wrapper use)
+	groupsExport string
 
 	anchored   bool     // true = pattern anchored at 0; no wrapper needed
 	numGroups  int      // capture group count (for wrapper slot adjustment)
@@ -576,9 +575,6 @@ func (p *compiledPattern) findWrapperOffset() int {
 		if !p.anchored {
 			idx++
 		}
-		if p.namedGroupsExport != "" {
-			idx++
-		}
 	}
 	if p.batchFindExport != "" {
 		idx++
@@ -602,11 +598,6 @@ func (p *compiledPattern) hasGroupsFromWrapper() bool {
 	return p.groupsExport != "" && p.captureBody != nil
 }
 
-// hasNamedGroupsFromWrapper is the same test for the named-groups export.
-func (p *compiledPattern) hasNamedGroupsFromWrapper() bool {
-	return p.namedGroupsExport != "" && p.captureBody != nil
-}
-
 // groupsFromWrapperOffsets returns the sub-indices of the exported
 // (ptr, len, out_ptr, from) wrappers for groups and named groups, or -1 when
 // the corresponding export is absent. They are laid out last, after the find
@@ -625,9 +616,6 @@ func (p *compiledPattern) groupsFromWrapperOffsets() (groupsOff, namedOff int) {
 			if !p.anchored {
 				idx++
 			}
-			if p.namedGroupsExport != "" {
-				idx++
-			}
 		}
 		if p.batchFindExport != "" {
 			idx++
@@ -640,10 +628,6 @@ func (p *compiledPattern) groupsFromWrapperOffsets() (groupsOff, namedOff int) {
 	}
 	if p.hasGroupsFromWrapper() {
 		groupsOff = idx
-		idx++
-	}
-	if p.hasNamedGroupsFromWrapper() {
-		namedOff = idx
 	}
 	return
 }
@@ -666,9 +650,6 @@ func (p *compiledPattern) funcCount() int {
 		if !p.anchored {
 			n++
 		} // groups_wrapper
-		if p.namedGroupsExport != "" {
-			n++
-		} // named_groups_wrapper
 	}
 	// LNM non-mid bulk-skip helper count was here — see archive Section 11.
 	if p.batchFindExport != "" {
@@ -682,9 +663,6 @@ func (p *compiledPattern) funcCount() int {
 	}
 	if p.hasGroupsFromWrapper() {
 		n++ // groups wrapper (ptr, len, out_ptr, from) → i32
-	}
-	if p.hasNamedGroupsFromWrapper() {
-		n++ // named-groups wrapper, same signature
 	}
 	return n
 }
@@ -711,9 +689,6 @@ func (p *compiledPattern) batchOffsets() (batchFindOff, batchGroupsOff int) {
 		if !p.anchored {
 			idx++
 		}
-		if p.namedGroupsExport != "" {
-			idx++
-		}
 	}
 	batchFindOff, batchGroupsOff = -1, -1
 	if p.batchFindExport != "" {
@@ -735,8 +710,8 @@ func (p *compiledPattern) batchOffsets() (batchFindOff, batchGroupsOff int) {
 // no single backward-scan slot for the multi-branch case (N of them);
 // altLitAnchorBranchFuncIdx addresses those individually. findOff is the
 // dispatcher, laid out after all branch functions.
-func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, captureOff, wrapperOff, namedWrapperOff int) {
-	matchOff, backwardScanOff, findOff, captureOff, wrapperOff, namedWrapperOff = -1, -1, -1, -1, -1, -1
+func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, captureOff, wrapperOff int) {
+	matchOff, backwardScanOff, findOff, captureOff, wrapperOff = -1, -1, -1, -1, -1
 	idx := 0
 	if p.matchBody != nil {
 		matchOff = idx
@@ -760,10 +735,6 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 		idx++
 		if !p.anchored {
 			wrapperOff = idx
-			idx++
-		}
-		if p.namedGroupsExport != "" {
-			namedWrapperOff = idx
 		}
 	}
 	return
@@ -2031,9 +2002,6 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			if !p.anchored {
 				fs = append(fs, 0x02)
 			}
-			if p.namedGroupsExport != "" {
-				fs = append(fs, 0x02)
-			}
 		}
 		// LNM non-mid bulk-skip helper function-section entry was here —
 		// see archive Section 15.
@@ -2048,9 +2016,6 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		}
 		if p.hasGroupsFromWrapper() {
 			fs = append(fs, byte(groupsFromTypeIdx)) // (i32×4)→i32
-		}
-		if p.hasNamedGroupsFromWrapper() {
-			fs = append(fs, byte(groupsFromTypeIdx))
 		}
 	}
 	out = appendSection(out, 3, fs)
@@ -2079,7 +2044,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		numExports++
 	}
 	for _, p := range patterns {
-		matchOff, _, findOff, _, _, namedWrapperOff := p.offsets()
+		matchOff, _, findOff, _, _ := p.offsets()
 		if p.matchExport != "" && matchOff >= 0 {
 			numExports++
 		}
@@ -2087,9 +2052,6 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			numExports++
 		}
 		if p.hasGroupsFromWrapper() {
-			numExports++
-		}
-		if p.namedGroupsExport != "" && namedWrapperOff >= 0 {
 			numExports++
 		}
 		if p.batchFindExport != "" {
@@ -2107,7 +2069,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	}
 	for i, p := range patterns {
 		base := baseIdx[i]
-		matchOff, _, findOff, _, _, namedWrapperOff := p.offsets()
+		matchOff, _, findOff, _, _ := p.offsets()
 		if p.matchExport != "" && matchOff >= 0 {
 			es = appendString(es, p.matchExport)
 			es = append(es, 0x00)
@@ -2120,17 +2082,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+p.findWrapperOffset()))
 		}
-		gFromOff, nFromOff := p.groupsFromWrapperOffsets()
+		gFromOff, _ := p.groupsFromWrapperOffsets()
 		if p.hasGroupsFromWrapper() {
 			// The (ptr, len, out_ptr, from) wrapper, not the body it fronts.
 			es = appendString(es, p.groupsExport)
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+gFromOff))
-		}
-		if p.namedGroupsExport != "" && namedWrapperOff >= 0 {
-			es = appendString(es, p.namedGroupsExport)
-			es = append(es, 0x00)
-			es = utils.AppendULEB128(es, uint32(base+nFromOff))
 		}
 		batchFindOff, batchGroupsOff := p.batchOffsets()
 		if p.batchFindExport != "" && batchFindOff >= 0 {
@@ -2151,7 +2108,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	cs = utils.AppendULEB128(cs, uint32(total))
 	for i, p := range patterns {
 		base := baseIdx[i]
-		_, backwardScanOff, findOff, captureOff, wrapperOff, namedWrapperOff := p.offsets()
+		_, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
 		if p.matchBody != nil {
 			cs = append(cs, p.matchBody...)
 		}
@@ -2202,11 +2159,6 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 					winOff = p.winScratchOff
 				}
 				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.findFromMode)
-				if p.namedGroupsExport != "" {
-					cs = appendNamedGroupsWrapperCodeEntry(cs, base+wrapperOff)
-				}
-			} else if p.namedGroupsExport != "" {
-				cs = appendNamedGroupsWrapperCodeEntry(cs, base+captureOff)
 			}
 		}
 		// LNM non-mid bulk-skip helper body append was here —
@@ -2245,9 +2197,6 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				inner, anchoredOnly = base+captureOff, true
 			}
 			cs = appendGroupsFromWrapperCodeEntry(cs, inner, anchoredOnly)
-		}
-		if p.hasNamedGroupsFromWrapper() {
-			cs = appendGroupsFromWrapperCodeEntry(cs, base+namedWrapperOff, p.anchored)
 		}
 	}
 	out = appendSection(out, 10, cs)
@@ -2332,12 +2281,8 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 			if p.findExport != "" {
 				p.batchFindExport = p.findExport + "_batch"
 			}
-			groupsBatchName := p.groupsExport
-			if groupsBatchName == "" {
-				groupsBatchName = p.namedGroupsExport
-			}
-			if groupsBatchName != "" {
-				p.batchGroupsExport = groupsBatchName + "_batch"
+			if p.groupsExport != "" {
+				p.batchGroupsExport = p.groupsExport + "_batch"
 			}
 		}
 		compiled = append(compiled, p)
@@ -3197,29 +3142,4 @@ func appendBatchLitChainGroupsWrapperCodeEntry(cs []byte, captureFuncIdx, numGro
 	body := buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
-}
-
-// appendNamedGroupsWrapperCodeEntry appends a size-prefixed named-groups wrapper body to cs.
-// The wrapper calls groupsFuncIdx (the groups wrapper) and maps numbered slot pairs
-// to named output slots using compile-time constants from groupNames.
-// groupNames[i] is the name for capture group i+1 (empty = unnamed, skip).
-//
-// Signature: (ptr i32, len i32, out_ptr i32) → i32
-//
-// The named-groups out_ptr layout is identical to groups out_ptr — the stub
-// uses the name→index mapping to present results by name to callers.
-// This function is a thin pass-through: it calls the groups wrapper and returns
-// its result unchanged; named group mapping is handled entirely in the stub.
-func appendNamedGroupsWrapperCodeEntry(cs []byte, groupsFuncIdx int) []byte {
-	// Body: call groupsFuncIdx(ptr, len, out_ptr), return result.
-	var b []byte
-	b = append(b, 0x00)       // 0 local declarations
-	b = append(b, 0x20, 0x00) // local.get ptr
-	b = append(b, 0x20, 0x01) // local.get len
-	b = append(b, 0x20, 0x02) // local.get out_ptr
-	b = append(b, 0x10)       // call
-	b = utils.AppendULEB128(b, uint32(groupsFuncIdx))
-	b = append(b, 0x0B) // end
-	cs = utils.AppendULEB128(cs, uint32(len(b)))
-	return append(cs, b...)
 }

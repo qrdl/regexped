@@ -64,7 +64,6 @@ type sparseAcceptTables struct {
 	immOff, immList int32
 	end             int32
 	data            []byte
-	segs            int
 }
 
 // buildSparseAcceptTables serialises the three channels. Pattern indices are

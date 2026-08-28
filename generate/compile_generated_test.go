@@ -167,7 +167,27 @@ func compileC(t *testing.T, dir, path string) {
 // errors only — which is still more than a source-text assertion does.
 func checkJS(t *testing.T, dir, path string) {
 	t.Helper()
+	writeESMPackageJSON(t, dir)
 	run(t, dir, nil, "node", "--check", path)
+}
+
+// writeESMPackageJSON marks the directory as containing ES modules.
+//
+// Without it node decides how to parse a `.js` file from its own defaults, and
+// those CHANGED: Node 20.10+ sniffs the source and detects ESM, while Node 18
+// treats any `.js` outside an ESM package as CommonJS and rejects `export` as a
+// syntax error. So the same generated stub passed on one machine and failed on
+// another with `SyntaxError: Unexpected token 'export'` — a version difference
+// wearing a generator bug's clothes.
+//
+// Stating the type removes node's guess from the test, and it is also what a
+// real consumer has: docs/js-api.md documents the stub as an ES module.
+func writeESMPackageJSON(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "package.json"),
+		[]byte(`{"type":"module"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // compileAS type-checks with the AssemblyScript compiler.

@@ -489,8 +489,8 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"capture_named_ghp",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<key>ghp_[A-Za-z0-9]{36})`,
-				GroupsFunc:      "ghp_named_groups",
+				Pattern:    `(?P<key>ghp_[A-Za-z0-9]{36})`,
+				GroupsFunc: "ghp_named_groups",
 			}},
 		},
 		{
@@ -503,15 +503,15 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"capture_prefixed_named",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
-				GroupsFunc:      "prefixed_named_groups",
+				Pattern:    `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
+				GroupsFunc: "prefixed_named_groups",
 			}},
 		},
 		{
 			"capture_strict_alt_named_only",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<aws>AKIA[A-Z0-9]{16})|(?P<gh>ghp_[A-Za-z0-9]{36})`,
-				GroupsFunc:      "strict_alt_named_only",
+				Pattern:    `(?P<aws>AKIA[A-Z0-9]{16})|(?P<gh>ghp_[A-Za-z0-9]{36})`,
+				GroupsFunc: "strict_alt_named_only",
 			}},
 		},
 		// Lit-chain range with captures (single branch).
@@ -525,8 +525,8 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"capture_range_named_groups",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<key>secret_[A-Za-z0-9]{24,40})`,
-				GroupsFunc:      "secret_range_named",
+				Pattern:    `(?P<key>secret_[A-Za-z0-9]{24,40})`,
+				GroupsFunc: "secret_range_named",
 			}},
 		},
 
@@ -542,9 +542,9 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"find_with_named_groups_ghp",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<key>ghp_[A-Za-z0-9]{36})`,
-				FindFunc:        "ghp_find_cap",
-				GroupsFunc:      "ghp_named_groups_cap",
+				Pattern:    `(?P<key>ghp_[A-Za-z0-9]{36})`,
+				FindFunc:   "ghp_find_cap",
+				GroupsFunc: "ghp_named_groups_cap",
 			}},
 		},
 		{
@@ -558,9 +558,9 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"find_with_prefixed_named_groups",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
-				FindFunc:        "prefixed_find_cap",
-				GroupsFunc:      "prefixed_named_groups_cap",
+				Pattern:    `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
+				FindFunc:   "prefixed_find_cap",
+				GroupsFunc: "prefixed_named_groups_cap",
 			}},
 		},
 		{
@@ -604,9 +604,9 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"find_with_named_groups_lenient_alt",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<gh>ghp_[A-Za-z0-9]{36})|(?P<aws>aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40})`,
-				FindFunc:        "lenient_alt_find_named_cap",
-				GroupsFunc:      "lenient_alt_groups_named_cap",
+				Pattern:    `(?P<gh>ghp_[A-Za-z0-9]{36})|(?P<aws>aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40})`,
+				FindFunc:   "lenient_alt_find_named_cap",
+				GroupsFunc: "lenient_alt_groups_named_cap",
 			}},
 		},
 	}
@@ -1344,9 +1344,9 @@ func TestBatchExportGating(t *testing.T) {
 	// fall back to namedGroupsExport (GroupsExportName priority), since
 	// p.groupsExport is empty here.
 	namedOnlyEntries := []config.RegexEntry{{
-		Pattern:         `(a)(b)?`,
-		GroupsFunc:      "named_ab",
-		Hints:           []string{"batch-find"},
+		Pattern:    `(a)(b)?`,
+		GroupsFunc: "named_ab",
+		Hints:      []string{"batch-find"},
 	}}
 
 	t.Run("find_batch_present_with_hint", func(t *testing.T) {
@@ -1431,9 +1431,9 @@ func TestBatchExportGating(t *testing.T) {
 	})
 	t.Run("groups_and_named_share_one_batch_export", func(t *testing.T) {
 		both := []config.RegexEntry{{
-			Pattern:         `(a)(b)?`,
-			GroupsFunc:      "g1",
-			Hints:           []string{"batch-find"},
+			Pattern:    `(a)(b)?`,
+			GroupsFunc: "g1",
+			Hints:      []string{"batch-find"},
 		}}
 		wasm, _, err := Compile(both, 0, true)
 		if err != nil {

@@ -348,6 +348,13 @@ func findMagicInDataSection(data []byte) (int64, error) {
 			}
 			off += n
 			off++ // end (0x0b)
+			// A segment whose offset expression runs to the end of the payload
+			// leaves nothing to read the size from, and `data[off:]` past the
+			// end PANICS rather than returning an empty slice. Untrusted bytes
+			// reach here, so this has to be an error.
+			if off > len(data) {
+				return 0, fmt.Errorf("data segment %d ends mid-offset-expression", i)
+			}
 			size, n, err := DecodeULEB128(data[off:])
 			if err != nil {
 				return 0, err
@@ -389,6 +396,13 @@ func findMagicInDataSection(data []byte) (int64, error) {
 			}
 			off += n
 			off++ // end
+			// A segment whose offset expression runs to the end of the payload
+			// leaves nothing to read the size from, and `data[off:]` past the
+			// end PANICS rather than returning an empty slice. Untrusted bytes
+			// reach here, so this has to be an error.
+			if off > len(data) {
+				return 0, fmt.Errorf("data segment %d ends mid-offset-expression", i)
+			}
 			size, n, err := DecodeULEB128(data[off:])
 			if err != nil {
 				return 0, err
@@ -443,6 +457,13 @@ func ParseDataSection(data []byte) (int64, error) {
 			}
 			off += n
 			off++ // end (0x0b)
+			// A segment whose offset expression runs to the end of the payload
+			// leaves nothing to read the size from, and `data[off:]` past the
+			// end PANICS rather than returning an empty slice. Untrusted bytes
+			// reach here, so this has to be an error.
+			if off > len(data) {
+				return max, fmt.Errorf("data segment %d ends mid-offset-expression", i)
+			}
 			size, n, err := DecodeULEB128(data[off:])
 			if err != nil {
 				return max, err
@@ -478,6 +499,13 @@ func ParseDataSection(data []byte) (int64, error) {
 			}
 			off += n
 			off++ // end
+			// A segment whose offset expression runs to the end of the payload
+			// leaves nothing to read the size from, and `data[off:]` past the
+			// end PANICS rather than returning an empty slice. Untrusted bytes
+			// reach here, so this has to be an error.
+			if off > len(data) {
+				return max, fmt.Errorf("data segment %d ends mid-offset-expression", i)
+			}
 			size, n, err := DecodeULEB128(data[off:])
 			if err != nil {
 				return max, err

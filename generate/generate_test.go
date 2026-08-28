@@ -325,7 +325,7 @@ func TestGenGoStubFileFull(t *testing.T) {
 	entries := []config.RegexEntry{
 		{MatchFunc: "url_match", FindFunc: "url_find",
 			GroupsFunc: "url_groups",
-			Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
+			Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)"},
 	}
 	out, err := genGoStubFile(entries, "url", "url")
 	if err != nil {

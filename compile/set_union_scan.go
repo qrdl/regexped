@@ -421,19 +421,12 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	return append(body, b...)
 }
 
-// unionScanDataLen / unionScanDataSegs report the union automaton's
-// contribution to the module's data section, or zero when the set has none.
-func (cs *compiledSet) unionScanDataLen() int {
-	n := 0
-	if cs.unionScan != nil {
-		n += len(cs.unionScan.dataBytes)
-	}
-	if cs.phase2Union != nil {
-		n += len(cs.phase2Union.dataBytes)
-	}
-	return n
-}
-
+// unionScanDataSegs reports how many data SEGMENTS the union automaton
+// contributes to the module, or zero when the set has none.
+//
+// A companion unionScanDataLen, reporting the same contribution in BYTES, was
+// removed as dead: the segment count is what assembleModuleWithSets needs, and
+// the byte length had no caller.
 func (cs *compiledSet) unionScanDataSegs() int {
 	n := 0
 	if cs.unionScan != nil {

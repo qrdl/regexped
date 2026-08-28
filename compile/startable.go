@@ -38,9 +38,6 @@ import (
 // to it: `\bfoo` still starts with `f`, because an assertion restricts WHERE
 // a byte may be consumed, never WHICH.
 
-// startableAll is the sentinel for "this pattern can start with any byte".
-const startableAll = -1
-
 // firstByteSet returns the set of bytes that can begin a match of pat as a
 // 256-element boolean slice, or nil when every byte must be assumed possible.
 //

@@ -106,6 +106,9 @@ func TestJSIteratorIsolationAtRuntime(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(isolationDriver), 0o644); err != nil {
 				t.Fatal(err)
 			}
+			// The stub is an ES module; say so rather than letting node's
+			// version-dependent default decide. See writeESMPackageJSON.
+			writeESMPackageJSON(t, dir)
 
 			cmd := exec.Command("node", "drive.mjs")
 			cmd.Dir = dir

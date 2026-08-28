@@ -710,10 +710,6 @@ func cABIParam(p abiParam) string {
 		return "int cap"
 	case abiCursor:
 		return "long long cursor"
-	case abiScratchPtr:
-		return "unsigned char *scratch"
-	case abiScratchLen:
-		return "int scratch_len"
 	}
 	panic("generate: unknown abiParam")
 }

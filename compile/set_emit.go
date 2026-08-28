@@ -354,7 +354,10 @@ const (
 	// export returns is passed back verbatim as the next call's cursor.
 	setTypeBatchGated = 10 // (i32,i32,i64,i32,i32,i32,i32,i32)→i64  find_batch
 	//                          ptr, len, cursor, gate, out, cap, scratch, scratch_len
-	setTypeBatchUngated = 11 // (i32,i32,i64,i32,i32)→i64      find_batch, overlapping
+	//
+	// There is no separate type for the OVERLAPPING batch entry. Both overlap
+	// policies have shared ONE signature since SETS_PLAN item 11, so the
+	// second type was declared in every set module and referenced by none.
 )
 
 // batchPosFnOffset returns the index of the set's shared per-position worker,
@@ -1371,12 +1374,8 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 			if p.findExport != "" {
 				p.batchFindExport = p.findExport + "_batch"
 			}
-			groupsBatchName := p.groupsExport
-			if groupsBatchName == "" {
-				groupsBatchName = p.namedGroupsExport
-			}
-			if groupsBatchName != "" {
-				p.batchGroupsExport = groupsBatchName + "_batch"
+			if p.groupsExport != "" {
+				p.batchGroupsExport = p.groupsExport + "_batch"
 			}
 		}
 		tableBase = p.tableEnd
@@ -1570,10 +1569,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// 8: (i32×6)→i32            set find body, gated (default)
 	// 9: (i32×8)→i32            suffix DFA with a gate pointer; also the
 	//                            ungated suffix DFA carrying §19's `skip`
-	// 10: (i32,i32,i64,i32,i32,i32)→i64  find_batch, gated
-	// 11: (i32,i32,i64,i32,i32)→i64      find_batch, overlapping
+	// 10: (i32,i32,i64,i32,i32,i32,i32,i32)→i64  find_batch, BOTH overlap
+	//                                             policies (one signature
+	//                                             since SETS_PLAN item 11)
 	typeSection := []byte{
-		0x0C,
+		0x0B,
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E, // type 1
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 2
@@ -1585,7 +1585,6 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		0x60, 0x06, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 8
 		0x60, 0x08, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 9
 		0x60, 0x08, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 10
-		0x60, 0x05, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x01, 0x7E, // type 11
 	}
 	out = appendSection(out, 1, typeSection)
 
@@ -1617,9 +1616,6 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			if !p.anchored {
 				fs = append(fs, 0x02)
 			}
-			if p.namedGroupsExport != "" {
-				fs = append(fs, 0x02)
-			}
 		}
 		// Batch find/groups wrapper (task 44): same signature as the set
 		// match body — (i32,i32,i32,i32,i32)→i32 — so it reuses type 5
@@ -1639,9 +1635,6 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// (i32×4)→i32 groups/named-groups wrappers. This table already has
 		// that shape at 6, so no new type is needed here.
 		if p.hasGroupsFromWrapper() {
-			fs = append(fs, byte(setTypeI32x4ToI32))
-		}
-		if p.hasNamedGroupsFromWrapper() {
 			fs = append(fs, byte(setTypeI32x4ToI32))
 		}
 	}
@@ -1727,9 +1720,6 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		if p.hasGroupsFromWrapper() {
 			numExports++
 		}
-		if p.hasNamedGroupsFromWrapper() {
-			numExports++
-		}
 		if p.batchFindExport != "" {
 			numExports++
 		}
@@ -1749,7 +1739,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	}
 	for i, p := range patterns {
 		base := baseIdx[i]
-		matchOff, _, findOff, _, _, namedWrapperOff := p.offsets()
+		matchOff, _, findOff, _, _ := p.offsets()
 		if p.matchExport != "" && matchOff >= 0 {
 			es = appendString(es, p.matchExport)
 			es = append(es, 0x00)
@@ -1761,17 +1751,12 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+p.findWrapperOffset()))
 		}
-		gFromOff, nFromOff := p.groupsFromWrapperOffsets()
+		gFromOff, _ := p.groupsFromWrapperOffsets()
 		if p.hasGroupsFromWrapper() {
 			// The (ptr, len, out_ptr, from) wrapper — see find_from.go.
 			es = appendString(es, p.groupsExport)
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+gFromOff))
-		}
-		if p.hasNamedGroupsFromWrapper() && namedWrapperOff >= 0 {
-			es = appendString(es, p.namedGroupsExport)
-			es = append(es, 0x00)
-			es = utils.AppendULEB128(es, uint32(base+nFromOff))
 		}
 		batchFindOff, batchGroupsOff := p.batchOffsets()
 		if p.batchFindExport != "" && batchFindOff >= 0 {
@@ -1800,7 +1785,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total))
 	for i, p := range patterns {
 		base := baseIdx[i]
-		_, backwardScanOff, findOff, captureOff, wrapperOff, namedWrapperOff := p.offsets()
+		_, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
 		if p.matchBody != nil {
 			cs_bytes = append(cs_bytes, p.matchBody...)
 		}
@@ -1829,11 +1814,6 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					winOff = p.winScratchOff
 				}
 				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.findFromMode)
-				if p.namedGroupsExport != "" {
-					cs_bytes = appendNamedGroupsWrapperCodeEntry(cs_bytes, base+wrapperOff)
-				}
-			} else if p.namedGroupsExport != "" {
-				cs_bytes = appendNamedGroupsWrapperCodeEntry(cs_bytes, base+captureOff)
 			}
 		}
 		if p.batchFindExport != "" {
@@ -1867,9 +1847,6 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				inner, anchoredOnly = base+captureOff, true
 			}
 			cs_bytes = appendGroupsFromWrapperCodeEntry(cs_bytes, inner, anchoredOnly)
-		}
-		if p.hasNamedGroupsFromWrapper() {
-			cs_bytes = appendGroupsFromWrapperCodeEntry(cs_bytes, base+namedWrapperOff, p.anchored)
 		}
 	}
 	// Set function bodies: find fn (if any), anchored match fn (if any), suffix DFA fns, prefix DFA fns.

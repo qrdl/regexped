@@ -268,15 +268,11 @@ const (
 	abiOutCap
 	// abiCursor is the batch entry's opaque i64 resume cursor.
 	abiCursor
-	// abiScratchPtr is the batch entry's caller-owned answer cache, zeroed to
-	// start a drive exactly like the gate array. It is OPTIONAL: passing a
-	// null pointer and a zero length is legal and simply costs speed on the
-	// one shape that benefits (SETS_PLAN item 11 stage C).
-	abiScratchPtr
-	// abiScratchLen is that region's size in BYTES. Too small is not an
-	// error — the engine falls back to the ordinary per-position walk and the
-	// answer is identical, only slower.
-	abiScratchLen
+	// The batching entry's caller-owned answer cache (SETS_PLAN item 11 stage
+	// C) has NO abiParam of its own. Only JS and TS expose that entry, and
+	// they build its call directly rather than through this descriptor, so a
+	// pair of scratch params here would be spelled by four generators and
+	// produced by none.
 )
 
 // abiRet is a capability's WASM return type.
@@ -335,32 +331,6 @@ func setCapabilities(s config.SetConfig, cfg config.BuildConfig) []setCapability
 	}
 	add("find", s.Find, []abiParam{abiInputPtr, abiInputLen, abiFrom, abiGatePtr, abiTuplePtr, abiOutCap}, abiRetI32)
 	return caps
-}
-
-// setBatchCapability returns the descriptor for the hidden multi-position
-// entry a `hints: [batch-find]` set carries beside `find`, or nil.
-//
-// Its export name is DERIVED rather than declared, through the same function
-// the compiler uses, so the two cannot drift. The cursor replaces `from`: it
-// carries the resume position in its high half and the intra-position index in
-// its low half.
-//
-// The scratch pair is present on EVERY batching set, not only on the ones that
-// can use it. The compiler widens the batch entry's WASM type unconditionally
-// for the same reason: one signature per entry point is what makes the stub a
-// table lookup instead of a case analysis, and a set that cannot sweep simply
-// ignores what it is passed. This is the same call SETS_PLAN item 11 made for
-// `find` and its gate array.
-func setBatchCapability(s config.SetConfig) *setCapability {
-	if !s.HasFind() || !s.BatchFind() {
-		return nil
-	}
-	return &setCapability{
-		Kind:   "find_batch",
-		Export: config.SetBatchExportName(s.Find),
-		Params: []abiParam{abiInputPtr, abiInputLen, abiCursor, abiGatePtr, abiTuplePtr, abiOutCap, abiScratchPtr, abiScratchLen},
-		Ret:    abiRetI64,
-	}
 }
 
 // render spells this capability's parameter list with a per-language speller

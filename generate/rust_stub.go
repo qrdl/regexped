@@ -603,10 +603,6 @@ func rustABIParam(p abiParam) string {
 		return "cap: i32"
 	case abiCursor:
 		return "cursor: i64"
-	case abiScratchPtr:
-		return "scratch_ptr: *mut u8"
-	case abiScratchLen:
-		return "scratch_len: i32"
 	}
 	panic("generate: unknown abiParam")
 }

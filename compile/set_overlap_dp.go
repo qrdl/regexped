@@ -280,13 +280,6 @@ const (
 	overlapDPHdrBytes = config.SetOverlapCacheHeaderBytes
 )
 
-// overlapDPScratchBytes is the caller-owned scratch one drive needs. The
-// sizing rule is config's, for the same reason the header width is: the stub
-// generators compute it too, and two spellings would drift.
-func overlapDPScratchBytes(inputLen, patternCount int) int {
-	return config.SetOverlapCacheBytes(inputLen, patternCount)
-}
-
 // emitOverlapDPBody emits the sweep.
 //
 //	(ptr, len, from, scratchPtr, scratchLen) -> i32

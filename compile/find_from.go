@@ -105,20 +105,6 @@ func emitFindFromSeed(b []byte, attemptStartLocal byte) ([]byte, findFromMode) {
 	return b, ffNative
 }
 
-// emitFindFromReset appends `global.set find_from, 0`, for internal callers
-// that invoke a find body directly and must not inherit a previous caller's
-// position. Emitted unconditionally, including while every body is still
-// ffLegacyNarrow and nothing reads the global: the discipline "every caller
-// of a find body sets the channel" is cheap to establish now and easy to
-// forget later, when forgetting it means a stale scan start rather than a
-// build failure.
-func emitFindFromReset(b []byte) []byte {
-	b = append(b, 0x41, 0x00) // i32.const 0
-	b = append(b, 0x24)       // global.set
-	b = utils.AppendULEB128(b, findFromGlobalIdx)
-	return b
-}
-
 // emitFindFromSet appends `global.set find_from, <local>`.
 func emitFindFromSet(b []byte, srcLocal byte) []byte {
 	b = append(b, 0x20, srcLocal) // local.get src
@@ -317,7 +303,7 @@ func emitUnpackRelative(b []byte, mode findFromMode, rLocal, posLocal, relStartL
 // and therefore whether the module needs the 4-argument groups type.
 func anyGroupsExport(patterns []*compiledPattern) bool {
 	for _, p := range patterns {
-		if p.groupsExport != "" || p.namedGroupsExport != "" {
+		if p.groupsExport != "" {
 			return true
 		}
 	}
