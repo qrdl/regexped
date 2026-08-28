@@ -61,10 +61,17 @@ regexped/
 │   ├── set_batch.go           # batching: the exported multi-position loop, the cursor layout,
 │   │                          #   and the hidden per-position worker (a find body with §19's gate
 │   │                          #   rule / skip parameter). Cursor field widths live in config/.
-│   ├── set_union_scan.go      # Start-anywhere union automaton: one pass, i64 id-bitmask accumulator.
+│   ├── set_union_scan.go      # Start-anywhere union automaton: one pass over the whole input.
 │   │                          #   Serves scan_any/scan_all on literal-less sets, and PHASE 2 of the
 │   │                          #   two-phase split on MIXED sets (SETS_PLAN item 19). Table layout is
 │   │                          #   u8 state ids <=256 states, byte-class compressed over 32 KB.
+│   │                          #   TWO accept representations, one body each: <=64 ids accumulate an
+│   │                          #   i64 id bitmask; up to maxUnionScanIDs (256) each state instead
+│   │                          #   carries a representative id (scan_any's whole answer) plus a
+│   │                          #   bitmap row OR'd into the caller's `_all` bitmap (SETS_PLAN item
+│   │                          #   21). Past 256 ids the set keeps the per-position walk, ~7x dearer.
+│   │                          #   Both preflight predicates REQUIRE the narrow form — the preflight
+│   │                          #   emitters read u64 accept tables a wide automaton does not emit.
 │   ├── set_probe.go           # Bitmask-only bucket probes (scan + anchored flavours), genAnchoredWASM
 │   ├── set_caps.go            # ANCHORED bodies only (match_any/match_all) + the shared bit-recording
 │   │                          #   emitters and id-space helpers. The scan pair is NOT here — see set_emit.go.
@@ -684,7 +691,7 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 **Last Updated:** 2026-08-24
 **CLI commands:** `generate` (stubs), `compile`, `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand.
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition)
-**Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
+**Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 
 **Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body), scalar.
 

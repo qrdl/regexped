@@ -435,9 +435,18 @@ right one.
 position**, and that is deliberate rather than an omission: a non-anchored DFA
 knows where a match ENDS, not where it began, so reporting the leftmost start
 forced an anchored probe at every position — 78 fuel/byte against 27 for the
-single union-automaton pass it compiles to now. The id is free either way,
-because that pass accumulates an id bitmask. Do not use `scan_any` to locate
+single union-automaton pass it compiles to now. Do not use `scan_any` to locate
 something for `find`; use `find`.
+
+That one-pass form serves the scan pair on any literal-less set of up to **256
+ids**. Up to 64 it accumulates an `i64` id bitmask; above that the automaton
+carries a per-state representative id and a bitmap row instead, which is a
+different body but the same exports, the same signatures and the same answers.
+Past 256 ids the set keeps the per-position bucket walk, which costs roughly
+seven times as much per byte — so a very wide literal-less set is worth
+splitting into several sets if its scan capabilities are hot. `--diag-json`
+reports which body a set got under `union_scan`; there is no other way to see
+it.
 
 `emit_name_map: true` additionally emits a `pattern_name(id)` helper mapping a
 pattern id back to its `name:` string.
@@ -528,6 +537,21 @@ cost that grows with it, and a downgrade is otherwise invisible at runtime.
   "detail": {"literals": 400, "ac_nodes": 1600,
              "table_bytes": 823296, "budget_bytes": 524288}
 }
+```
+
+A set declaring `scan_any` or `scan_all` also carries `union_scan`, which says
+whether the scan pair got the one-pass start-anywhere automaton or the
+per-position bucket walk — a difference of roughly seven times in per-byte cost
+that is invisible at runtime, since both produce the same answers through the
+same exports. `used: false` names the reason in `refused`: `id_space` (over 256
+ids), `frontend` (the set has literals, so the two-phase split applies instead)
+or `construction` (a word boundary, a `(?m)` line anchor, or a determinisation
+over the state budget — none of which a single forward pass can answer).
+`wide` is the >64-id accept form, and `phase2` marks an automaton serving only
+the fallback half of a mixed set.
+
+```json
+"union_scan": {"used": true, "wide": true, "states": 74, "mask_words": 2}
 ```
 
 ## Literal scan frontend

@@ -873,6 +873,28 @@ func buildStartAnywhereUnionProg(progs []*syntax.Prog, bitmaskWidth int) (*synta
 	return union, patternBits
 }
 
+// buildStartAnywhereUnionProgIndexed is buildStartAnywhereUnionProg for a set
+// whose ids do not fit the u64 accept mask (SETS_PLAN item 21 phase 1): it
+// returns per-PC pattern INDICES for newDFAWide instead of per-PC bitmasks.
+//
+// The two functions must stay in step — same two appended instructions, same
+// new Start — because they are two spellings of one automaton and a divergence
+// would make the wide form answer a different question from the narrow one.
+// The appended pair belongs to no pattern, so its index entries are -1, which
+// is exactly what acceptWideFor skips.
+func buildStartAnywhereUnionProgIndexed(progs []*syntax.Prog) (*syntax.Prog, []int32) {
+	union, patternIdx := buildUnionProgIndexed(progs)
+	n := len(union.Inst)
+	dotAlt, dotAny := n, n+1
+	union.Inst = append(union.Inst,
+		syntax.Inst{Op: syntax.InstAlt, Out: uint32(union.Start), Arg: uint32(dotAny)},
+		syntax.Inst{Op: syntax.InstRuneAny, Out: uint32(dotAlt)},
+	)
+	patternIdx = append(patternIdx, -1, -1)
+	union.Start = dotAlt
+	return union, patternIdx
+}
+
 // --------------------------------------------------------------------------
 // Phase 4a: multi-pattern Teddy + frontend strategy selection
 

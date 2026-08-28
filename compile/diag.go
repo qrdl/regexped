@@ -78,6 +78,37 @@ type SetDiag struct {
 	// ACTable describes the Aho-Corasick tables when the AC frontend shipped.
 	// Nil for every other frontend.
 	ACTable *ACTableDiag `json:"ac_table,omitempty"`
+	// UnionScan reports what served the scan pair: the start-anywhere
+	// one-pass automaton, or the per-position bucket walk, and in the first
+	// case which accept representation. Nil for a set with no scan capability.
+	//
+	// It exists because the difference is a factor of seven in fuel and NOTHING
+	// else makes it visible: the same set, same patterns, same answers, one
+	// eligibility test apart. That is exactly the shape of the AC demotion
+	// FrontendDemotion was added for, and of SETS_PLAN item 21 itself — six
+	// sub-1x rows whose cause was a body selection nobody could see.
+	UnionScan *UnionScanDiag `json:"union_scan,omitempty"`
+}
+
+// UnionScanDiag reports the scan pair's body selection.
+type UnionScanDiag struct {
+	// Used is false when the automaton was refused and the scan pair fell back
+	// to the per-position bucket walk. Refused is then the reason.
+	Used bool `json:"used"`
+	// Refused names the eligibility test that failed: "construction" covers
+	// everything buildUnionScanDFA decides internally (state cap, word
+	// boundaries, line anchors, an unparseable pattern), "id_space" is an id
+	// beyond maxUnionScanIDs, "frontend" a set with a literal frontend (which
+	// uses the two-phase split instead, reported as phase2 below).
+	Refused string `json:"refused,omitempty"`
+	// Wide is the >64-id accept form (SETS_PLAN item 21 phase 1): per-state
+	// representative id plus a bitmap row, in place of a u64 mask.
+	Wide      bool `json:"wide,omitempty"`
+	States    int  `json:"states,omitempty"`
+	MaskWords int  `json:"mask_words,omitempty"`
+	// Phase2 is set when this automaton serves only the FALLBACK half of a
+	// mixed set (SETS_PLAN item 19's two-phase split).
+	Phase2 bool `json:"phase2,omitempty"`
 }
 
 // ACTableDiag reports the shape of the emitted Aho-Corasick tables. Its point

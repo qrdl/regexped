@@ -51,10 +51,40 @@ type unionScanDFA struct {
 	acceptOff int32 // [numStates] u64: patterns accepting at any position
 	eofOff    int32 // [numStates] u64: patterns accepting at end of input
 
+	// --- the WIDE form (SETS_PLAN item 21 phase 1) ---
+	//
+	// maskWords is 1 for every set that fits the u64 accumulator, and
+	// ceil(idSpace/64) above it. When it is > 1 the u64 tables above are NOT
+	// emitted at all (acceptOff/eofOff are -1) and these take their place:
+	//
+	//   midReprOff/eofReprOff  [numStates] i32 — 0 when the state accepts
+	//     nothing, else SOME accepting global id, plus one. `scan_any` needs
+	//     no more than this: §3.5 leaves which id it reports unspecified, so
+	//     one i32 load replaces a mask load, an OR and an accumulator.
+	//   midWordsOff/eofWordsOff [numStates][rowBytes] — the accept set as a
+	//     bitmap ROW shaped exactly like the caller's `_all` bitmap, so
+	//     recording is a straight OR of a table row into caller memory. Built
+	//     only when the set exports `scan_all`; -1 otherwise.
+	//
+	// bitmapBytes is ceil((maxID+1)/8) — derived from the ids this automaton
+	// can actually set, never from the declared id space, so a row can never
+	// be wider than the caller's allocation even when the two disagree.
+	maskWords   int
+	rowBytes    int
+	bitmapBytes int
+	distinctIDs int // the `scan_all` early-exit target: ids this union can set
+	midReprOff  int32
+	eofReprOff  int32
+	midWordsOff int32
+	eofWordsOff int32
+
 	dataBytes []byte
 	dataSegs  int
 	tableEnd  int32
 }
+
+// isWide reports whether this automaton carries the >64-id accept form.
+func (u *unionScanDFA) isWide() bool { return u != nil && u.maskWords > 1 }
 
 // maxUnionScanStates bounds the subset construction. The construction is a
 // `.*`-prefixed union, so it is larger than the plain union it replaces —
@@ -62,6 +92,19 @@ type unionScanDFA struct {
 // still a determinisation and can blow up. Over budget, the set keeps the
 // per-position path it has today.
 const maxUnionScanStates = 4096
+
+// maxUnionScanIDs bounds the ID SPACE the one-pass automaton will serve, which
+// is a different budget from maxUnionScanStates: that one bounds the
+// determinisation, this one bounds the per-state accept ROW (rowBytes =
+// 8*ceil(idSpace/64)) and the straight-line WASM that ORs it into the caller's
+// bitmap — one unrolled word per 64 ids, in the body, per accepting state.
+//
+// 256 keeps that at four words. It was 64 before SETS_PLAN item 21, not as a
+// budget but because the accumulator was a single u64; the six classchain scan
+// rows were the cost of treating that representation limit as an eligibility
+// limit — a 128-pattern set fell all the way back to the per-position bucket
+// walk at ~168 fuel/byte against the union pass's 24.7.
+const maxUnionScanIDs = 256
 
 // unionTableBudget is the size above which the transition matrix is byte-class
 // compressed, mirroring the DFA engine's own "compress once the table exceeds
@@ -97,18 +140,38 @@ const unionTableBudget = 32 * 1024
 //     (prevWasWord / prevWasNewline) that the per-position path threads
 //     through midAcceptNW/W/NL. A context-free one-pass loop would silently
 //     get those patterns wrong, so such sets are excluded outright.
-//   - Ids above 63 do not fit the u64 accept mask this emits.
+//   - Ids at or above maxUnionScanIDs, which bounds the per-state accept row.
 //   - A pattern that cannot be re-parsed is skipped everywhere else too, and
 //     a union missing a pattern would under-report.
 func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *unionScanDFA {
 	if len(spec.Patterns) == 0 {
 		return nil
 	}
-	progs := make([]*syntax.Prog, 0, len(spec.Patterns))
-	for k, p := range spec.Patterns {
-		if k >= 64 || spec.PatternIDs[k] >= 64 {
-			return nil // accept masks are u64
+
+	// The id space this automaton must represent, taken from the ids it can
+	// actually set and NOT from spec.IDSpaceSize. Two reasons, and they pull
+	// the same way: a named subset can declare an id space of 128 while every
+	// id it holds is below 64, and reading the declared bound would push such
+	// a set into the wide form and change a module that has no need to move;
+	// and a row sized by the ids present can never be wider than the caller's
+	// bitmap, which is sized by the declared bound and therefore at least as
+	// large (§11 R1's hazard, in the direction that is safe).
+	maxID := -1
+	for _, id := range spec.PatternIDs {
+		if id > maxID {
+			maxID = id
 		}
+	}
+	idSpace := maxID + 1
+	if idSpace > maxUnionScanIDs || len(spec.Patterns) > maxUnionScanIDs {
+		return nil
+	}
+	// Exactly the old refusal, restated as a representation choice: below the
+	// threshold everything is emitted as it always was, byte for byte.
+	wide := idSpace > 64 || len(spec.Patterns) > 64
+
+	progs := make([]*syntax.Prog, 0, len(spec.Patterns))
+	for _, p := range spec.Patterns {
 		ast := patternFullAST(p)
 		if ast == nil {
 			return nil
@@ -120,12 +183,26 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 		progs = append(progs, pr)
 	}
 
-	prog, patternBits := buildStartAnywhereUnionProg(progs, 64)
-	// leftmostFirst=false: the question is which patterns match ANYWHERE, so
-	// every live thread must be kept. Pruning to the highest-priority thread
-	// is what a leftmost-first search wants and would lose lower-priority
-	// patterns' accepts here.
-	d, ok := newDFA(prog, false, false, maxUnionScanStates, patternBits)
+	// leftmostFirst=false in both arms: the question is which patterns match
+	// ANYWHERE, so every live thread must be kept. Pruning to the
+	// highest-priority thread is what a leftmost-first search wants and would
+	// lose lower-priority patterns' accepts here.
+	var d *dfa
+	var ok bool
+	if wide {
+		// newDFAWide records per-state SORTED lists of pattern INDICES
+		// (acceptWide/midAcceptWide) instead of a u64 mask — G17 built it for
+		// the >64-pattern buckets and it answers exactly this question. Its
+		// u64 maps degrade to "bit 1 = something accepts here" on this path
+		// (pBits is nil), which is why nothing below reads them: the lists are
+		// the authority, and the state identity that keeps two differently
+		// accepting states apart is the NFA set itself, not the mask.
+		prog, patternIdx := buildStartAnywhereUnionProgIndexed(progs)
+		d, ok = newDFAWide(prog, false, maxUnionScanStates, patternIdx)
+	} else {
+		prog, patternBits := buildStartAnywhereUnionProg(progs, 64)
+		d, ok = newDFA(prog, false, false, maxUnionScanStates, patternBits)
+	}
 	if !ok {
 		return nil
 	}
@@ -136,7 +213,20 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 		return nil
 	}
 
-	u := &unionScanDFA{numStates: d.numStates, startState: d.start, midStartState: d.midStart}
+	u := &unionScanDFA{
+		numStates: d.numStates, startState: d.start, midStartState: d.midStart,
+		maskWords: 1, midReprOff: -1, eofReprOff: -1, midWordsOff: -1, eofWordsOff: -1,
+	}
+	if wide {
+		u.maskWords = (idSpace + 63) / 64
+		u.rowBytes = u.maskWords * 8
+		u.bitmapBytes = (idSpace + 7) / 8
+		seen := make(map[int]bool, len(spec.PatternIDs))
+		for _, id := range spec.PatternIDs {
+			seen[id] = true
+		}
+		u.distinctIDs = len(seen)
+	}
 	if d.midStart < 0 || d.midStart >= d.numStates {
 		return nil
 	}
@@ -191,13 +281,6 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 		}
 		return out
 	}
-	accept := make([]byte, d.numStates*8)
-	eof := make([]byte, d.numStates*8)
-	for s := 0; s < d.numStates; s++ {
-		binary.LittleEndian.PutUint64(accept[s*8:], remap(d.midAccepting[s]))
-		binary.LittleEndian.PutUint64(eof[s*8:], remap(d.accepting[s]))
-	}
-
 	off := tableBase
 	if u.numClasses < 256 {
 		u.classMapOff = off
@@ -206,13 +289,87 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 		off += 256
 	}
 	u.transOff = off
-	u.acceptOff = u.transOff + int32(len(trans))
-	u.eofOff = u.acceptOff + int32(len(accept))
-	u.tableEnd = u.eofOff + int32(len(eof))
 	u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.transOff, trans)...)
-	u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.acceptOff, accept)...)
-	u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.eofOff, eof)...)
-	u.dataSegs += 3
+	u.dataSegs++
+	off = u.transOff + int32(len(trans))
+
+	if !wide {
+		accept := make([]byte, d.numStates*8)
+		eof := make([]byte, d.numStates*8)
+		for s := 0; s < d.numStates; s++ {
+			binary.LittleEndian.PutUint64(accept[s*8:], remap(d.midAccepting[s]))
+			binary.LittleEndian.PutUint64(eof[s*8:], remap(d.accepting[s]))
+		}
+		u.acceptOff = off
+		u.eofOff = u.acceptOff + int32(len(accept))
+		u.tableEnd = u.eofOff + int32(len(eof))
+		u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.acceptOff, accept)...)
+		u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.eofOff, eof)...)
+		u.dataSegs += 2
+		return u
+	}
+
+	// Wide: the u64 pair above is not emitted at all, so acceptOff/eofOff stay
+	// at their zero value and emitUnionScanBody refuses to read them.
+	u.acceptOff, u.eofOff = -1, -1
+
+	// wideRow turns one state's SORTED list of pattern indices into the two
+	// forms the wide bodies read: a representative global id (plus one, so 0
+	// can mean "accepts nothing") and a bitmap row shaped like the caller's.
+	wideRow := func(list []uint16) (int32, []byte) {
+		if len(list) == 0 {
+			return 0, make([]byte, u.rowBytes)
+		}
+		row := make([]byte, u.rowBytes)
+		repr := int32(0)
+		for _, k := range list {
+			if int(k) >= len(spec.PatternIDs) {
+				continue
+			}
+			gid := spec.PatternIDs[k]
+			row[gid/8] |= 1 << uint(gid%8)
+			if repr == 0 {
+				repr = int32(gid) + 1
+			}
+		}
+		return repr, row
+	}
+
+	midRepr := make([]byte, d.numStates*4)
+	eofRepr := make([]byte, d.numStates*4)
+	midWords := make([]byte, d.numStates*u.rowBytes)
+	eofWords := make([]byte, d.numStates*u.rowBytes)
+	for s := 0; s < d.numStates; s++ {
+		mr, mrow := wideRow(d.midAcceptWide[s])
+		er, erow := wideRow(d.acceptWide[s])
+		binary.LittleEndian.PutUint32(midRepr[s*4:], uint32(mr))
+		binary.LittleEndian.PutUint32(eofRepr[s*4:], uint32(er))
+		copy(midWords[s*u.rowBytes:], mrow)
+		copy(eofWords[s*u.rowBytes:], erow)
+	}
+
+	u.midReprOff = off
+	u.eofReprOff = u.midReprOff + int32(len(midRepr))
+	u.tableEnd = u.eofReprOff + int32(len(eofRepr))
+	u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.midReprOff, midRepr)...)
+	u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.eofReprOff, eofRepr)...)
+	u.dataSegs += 2
+
+	// The bitmap rows are `scan_all`'s alone — `scan_any` answers from the
+	// representative — so a set that does not export it pays no table for it.
+	if spec.ScanAll != "" {
+		// 8-aligned: the rows are read with i64 loads, and rowBytes is a
+		// multiple of 8, so aligning the base aligns every row. Misalignment
+		// would be legal (WASM treats the align field as a hint) and slow,
+		// which is the combination that never shows up as a failure.
+		u.tableEnd = (u.tableEnd + 7) &^ 7
+		u.midWordsOff = u.tableEnd
+		u.eofWordsOff = u.midWordsOff + int32(len(midWords))
+		u.tableEnd = u.eofWordsOff + int32(len(eofWords))
+		u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.midWordsOff, midWords)...)
+		u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.eofWordsOff, eofWords)...)
+		u.dataSegs += 2
+	}
 	return u
 }
 
@@ -263,6 +420,13 @@ const unionUnroll = 4
 // lPos <= len, and the `pos >= len` guard admits the EOF accepts exactly when
 // the whole input was consumed.
 func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableMemIdx int) []byte {
+	if u.isWide() {
+		// A wide automaton emits no u64 accept tables at all, so every load
+		// below would read the transition table as accept masks — wrong
+		// answers, not a trap. The dispatch in set_emit.go is what keeps the
+		// two apart; this turns a mistake there into a build failure.
+		panic("compile: narrow union scan body emitted for a wide union automaton")
+	}
 	const (
 		pInPtr = 0
 		pInLen = 1
@@ -421,6 +585,289 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	return append(body, b...)
 }
 
+// emitUnionScanWideBody is emitUnionScanBody for an automaton whose ids do not
+// fit a u64 (SETS_PLAN item 21 phase 1). Same pass, same entry-state rule, same
+// unroll; what changes is how an accepting state is RECOGNISED and RECORDED.
+//
+// Signatures are the ones the capability already declares, unchanged:
+//
+//	scan_any (ptr, len, from)          -> i32   a global id, or -1
+//	scan_all (ptr, len, from, out_ptr) -> i32   count of distinct patterns
+//
+// # Recognition
+//
+// The narrow body ORs an i64 accept mask into an accumulator on every byte,
+// because the mask IS its answer. Here the answer lives elsewhere, so each byte
+// only asks "does this state accept anything" — one i32 load of midRepr and a
+// branch, taken only where a match ends. On input that matches nothing, which
+// is where a scan spends its time, that is strictly less work than the narrow
+// body does.
+//
+// # Recording
+//
+//   - scan_any returns midRepr[state]-1 on the spot. §3.5 leaves which id it
+//     reports unspecified, so the representative baked into the table is a
+//     complete answer and no accumulator is needed at all.
+//   - scan_all ORs the state's bitmap row into the caller's bitmap, counting
+//     the 0->1 transitions with popcnt so the returned count stays DISTINCT
+//     PATTERNS — emitSetAllBits' contract, which is also why the export
+//     requires an all-zero bitmap on entry. Idempotence comes free: OR-ing the
+//     same row twice adds nothing and counts nothing, so no visited-state
+//     bookkeeping is needed to keep the count honest.
+//
+// # The write must stay inside the caller's allocation
+//
+// The bitmap is ceil(idSpace/8) BYTES (generate/set_stub.go's bitmapBytes; all
+// six stub generators allocate exactly that). An id space that is not a
+// multiple of 64 therefore has a final PARTIAL word, and an i64 store there
+// would write up to seven bytes past the caller's array — §11 R1's class of
+// defect: silent, data-dependent memory corruption rather than a wrong answer.
+// So whole words are emitted only while the whole word fits, and the remainder
+// is done byte at a time.
+func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []byte {
+	if !u.isWide() {
+		panic("compile: wide union scan body emitted for a narrow union automaton")
+	}
+	if mode != capScanAny && mode != capScanAll {
+		panic("compile: wide union scan body emitted for an unsupported capability")
+	}
+	if mode == capScanAll && u.midWordsOff < 0 {
+		panic("compile: wide scan_all body emitted without accept bitmap rows")
+	}
+	const (
+		pInPtr  = 0
+		pInLen  = 1
+		pFrom   = 2
+		pOutPtr = 3 // scan_all only
+	)
+	var b []byte
+	// lPos/lState are shared; the rest are scan_all's recording scratch.
+	localBase := byte(3)
+	if mode == capScanAll {
+		localBase = 4
+	}
+	lPos, lState := localBase, localBase+1
+	// scan_all's recording scratch; scan_any declares neither, since it keeps
+	// nothing between bytes at all.
+	lCount, lAddr := localBase+2, localBase+3
+	lOld32, lNew32 := localBase+4, localBase+5
+	lOld64, lNew64 := localBase+6, localBase+7
+	if mode == capScanAll {
+		b = append(b, 0x02, 0x06, 0x7F, 0x02, 0x7E) // 6 x i32, 2 x i64
+	} else {
+		b = append(b, 0x01, 0x02, 0x7F) // 2 x i32
+	}
+
+	// repr[state], left on the stack.
+	loadRepr := func(b []byte, off int32) []byte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, off)
+		b = append(b, 0x20, lState, 0x41, 0x02, 0x74, 0x6A) // + state*4
+		return appendTableLoad32(b, tableMemIdx, 0)
+	}
+
+	// OR one state's accept row into the caller's bitmap, adding the number of
+	// bits that flipped 0->1 to lCount.
+	orRow := func(b []byte, off int32) []byte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, off)
+		b = append(b, 0x20, lState, 0x41)
+		if sh := shiftForRow(u.rowBytes); sh >= 0 {
+			b = utils.AppendSLEB128(b, int32(sh))
+			b = append(b, 0x74, 0x6A) // shl; add
+		} else {
+			b = utils.AppendSLEB128(b, int32(u.rowBytes))
+			b = append(b, 0x6C, 0x6A) // mul; add
+		}
+		b = append(b, 0x21, lAddr)
+
+		full := (u.bitmapBytes / 8) * 8
+		for o := 0; o < full; o += 8 {
+			// old = bitmap[o]
+			b = append(b, 0x20, pOutPtr, 0x41)
+			b = utils.AppendSLEB128(b, int32(o))
+			b = append(b, 0x6A, 0x29, 0x00, 0x00) // i64.load align=0, memory 0
+			b = append(b, 0x21, lOld64)
+			// new = old | row[o]
+			b = append(b, 0x20, lOld64)
+			b = append(b, 0x20, lAddr, 0x41)
+			b = utils.AppendSLEB128(b, int32(o))
+			b = append(b, 0x6A)
+			b = appendTableLoad64(b, tableMemIdx)
+			b = append(b, 0x84, 0x21, lNew64) // i64.or
+			// bitmap[o] = new
+			b = append(b, 0x20, pOutPtr, 0x41)
+			b = utils.AppendSLEB128(b, int32(o))
+			b = append(b, 0x6A, 0x20, lNew64)
+			b = append(b, 0x37, 0x00, 0x00) // i64.store align=0, memory 0
+			// count += popcnt(new ^ old)
+			b = append(b, 0x20, lCount)
+			b = append(b, 0x20, lNew64, 0x20, lOld64, 0x85) // i64.xor
+			b = append(b, 0x7B, 0xA7)                       // i64.popcnt; i32.wrap_i64
+			b = append(b, 0x6A, 0x21, lCount)
+		}
+		for o := full; o < u.bitmapBytes; o++ {
+			b = append(b, 0x20, pOutPtr, 0x41)
+			b = utils.AppendSLEB128(b, int32(o))
+			b = append(b, 0x6A, 0x2D, 0x00, 0x00) // i32.load8_u, memory 0
+			b = append(b, 0x21, lOld32)
+			b = append(b, 0x20, lOld32)
+			b = append(b, 0x20, lAddr, 0x41)
+			b = utils.AppendSLEB128(b, int32(o))
+			b = append(b, 0x6A)
+			b = appendTableLoad8u(b, tableMemIdx)
+			b = append(b, 0x72, 0x21, lNew32) // i32.or
+			b = append(b, 0x20, pOutPtr, 0x41)
+			b = utils.AppendSLEB128(b, int32(o))
+			b = append(b, 0x6A, 0x20, lNew32)
+			b = append(b, 0x3A, 0x00, 0x00) // i32.store8, memory 0
+			b = append(b, 0x20, lCount)
+			b = append(b, 0x20, lNew32, 0x20, lOld32, 0x73) // i32.xor
+			b = append(b, 0x69)                             // i32.popcnt
+			b = append(b, 0x6A, 0x21, lCount)
+		}
+		return b
+	}
+
+	// The whole "this state accepts" arm: record, and for scan_all leave early
+	// once every id the set can report has been seen. That target is the count
+	// of DISTINCT IDS, never the id space — a named subset leaves gaps it can
+	// never fill, and comparing against the bound would make the exit dead.
+	emitAcceptArm := func(b []byte, reprOff, wordsOff int32, exit bool) []byte {
+		switch mode {
+		case capScanAny:
+			// RELOADED inside the branch rather than kept with a local.tee.
+			// The tee costs one instruction on EVERY byte; the reload costs
+			// one load on the single byte that ends the scan. Measured: 1
+			// fuel/byte, which on a 100 KB no-match corpus was the whole
+			// difference between this body and `scan_all`'s (2,637,109 against
+			// 2,534,697 — 102,412 apart on a 102,410-byte input).
+			b = loadRepr(b, reprOff)
+			b = append(b, 0x04, 0x40) // if it is non-zero
+			b = loadRepr(b, reprOff)
+			b = append(b, 0x41, 0x01, 0x6B, 0x0F) // return repr-1
+			b = append(b, 0x0B)
+		default: // capScanAll
+			b = loadRepr(b, reprOff)
+			b = append(b, 0x04, 0x40) // if
+			b = orRow(b, wordsOff)
+			if exit {
+				b = append(b, 0x20, lCount, 0x41)
+				b = utils.AppendSLEB128(b, int32(u.distinctIDs))
+				b = append(b, 0x4E, 0x04, 0x40)   // i32.ge_s; if
+				b = append(b, 0x20, lCount, 0x0F) // return count
+				b = append(b, 0x0B)
+			}
+			b = append(b, 0x0B)
+		}
+		return b
+	}
+
+	// Entry state: at from == 0 the scan really is at the start of text and
+	// `^`/\A may fire; at from > 0 it is not, and midStart is the same closure
+	// without that context. Identical to the narrow body, and getting it wrong
+	// is silent.
+	b = append(b, 0x20, pFrom, 0x45) // from == 0
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(u.startState))
+	b = append(b, 0x21, lState)
+	b = append(b, 0x05)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(u.midStartState))
+	b = append(b, 0x21, lState)
+	b = append(b, 0x0B)
+	b = append(b, 0x20, pFrom, 0x21, lPos)
+
+	// `from > len` yields the capability's "nothing" answer (§4.2). gt_u, not
+	// ge_u: `from == len` is a real position, and a pattern matching empty
+	// there must still be reported.
+	b = append(b, 0x20, pFrom, 0x20, pInLen, 0x4B, 0x04, 0x40)
+	if mode == capScanAny {
+		b = append(b, 0x41, 0x7F) // -1
+	} else {
+		b = append(b, 0x41, 0x00) // count 0
+	}
+	b = append(b, 0x0F, 0x0B)
+
+	// The ENTRY state's own accepts, before consuming anything: a pattern that
+	// matches EMPTY at `from` accepts here and nowhere else, and the loop below
+	// only tests after a transition (§18.7).
+	b = emitAcceptArm(b, u.midReprOff, u.midWordsOff, true)
+
+	step := func(b []byte, k byte) []byte {
+		b = emitUnionTransition(b, u, lPos, lState, pInPtr, k, tableMemIdx)
+		return emitAcceptArm(b, u.midReprOff, u.midWordsOff, true)
+	}
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x02, 0x40) // block $bulk_exit
+	b = append(b, 0x03, 0x40) // loop $bulk
+	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
+	b = append(b, 0x20, pInLen, 0x4B, 0x0D, 0x01) // pos+4 > len (u) -> $bulk_exit
+	for k := byte(0); k < unionUnroll; k++ {
+		b = step(b, k)
+	}
+	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, 0x00) // br $bulk
+	b = append(b, 0x0B)       // end loop $bulk
+	b = append(b, 0x0B)       // end block $bulk_exit
+
+	b = append(b, 0x03, 0x40)                                 // loop $tail
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01) // pos >= len -> $done
+	b = step(b, 0)
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, 0x00) // br $tail
+	b = append(b, 0x0B)       // end loop $tail
+	b = append(b, 0x0B)       // end block $done
+
+	// End-of-input accepts. No `pos >= len` guard, unlike the narrow body: this
+	// body's only exit from the loops is the tail's own `pos >= len` test —
+	// every accept leaves through `return`, not through a break — so the guard
+	// would be a branch that can never be false. The narrow body needs it
+	// because its monotone early exits do leave with pos < len.
+	b = emitAcceptArm(b, u.eofReprOff, u.eofWordsOff, false)
+
+	if mode == capScanAny {
+		b = append(b, 0x41, 0x7F) // nothing matched
+	} else {
+		b = append(b, 0x20, lCount)
+	}
+	b = append(b, 0x0B) // end function
+
+	body := utils.AppendULEB128(nil, uint32(len(b)))
+	return append(body, b...)
+}
+
+// unionScanDiagOf describes a union-automaton build for --diag-json.
+//
+// The refusal reason is reconstructed rather than threaded out of
+// buildUnionScanDFA: everything it decides internally is reported as
+// "construction", and only the id-space bound — the one an author can act on
+// by splitting a set — is distinguished, because it is the bound SETS_PLAN item
+// 21 raised and the one most likely to be hit next.
+func unionScanDiagOf(u *unionScanDFA, spec SetSpec, phase2 bool) *UnionScanDiag {
+	d := &UnionScanDiag{Phase2: phase2}
+	if u == nil {
+		maxID := -1
+		for _, id := range spec.PatternIDs {
+			if id > maxID {
+				maxID = id
+			}
+		}
+		d.Refused = "construction"
+		if maxID+1 > maxUnionScanIDs || len(spec.Patterns) > maxUnionScanIDs {
+			d.Refused = "id_space"
+		}
+		return d
+	}
+	d.Used = true
+	d.Wide = u.isWide()
+	d.States = u.numStates
+	d.MaskWords = u.maskWords
+	return d
+}
+
 // unionScanDataSegs reports how many data SEGMENTS the union automaton
 // contributes to the module, or zero when the set has none.
 //
@@ -481,14 +928,26 @@ func (cs *compiledSet) usesUnionScan(kind setCapKind) bool {
 	case capScan, capScanAny:
 		return true
 	case capScanAll:
-		// The walk answers with an i64 accumulator and takes no out_ptr, so it
-		// implements the NARROW `_all` ABI and can only serve a capability
-		// using it. Keyed on wideAll() rather than on the id space alone
-		// because the id space is no longer the only thing that selects the
-		// wide form: a Backtracking member forces it at any size (SETS_PLAN
-		// item 20 decision 3). Testing the size here left the walk serving a
-		// capability that had already moved to the memory form — an i64 pushed
-		// where an i32 was expected, i.e. a module that does not validate.
+		// Two bodies, two ABIs, and the automaton's own representation picks
+		// between them.
+		//
+		// The NARROW walk answers with an i64 accumulator and takes no
+		// out_ptr, so it can only serve a capability using that ABI. Keyed on
+		// wideAll() rather than on the id space alone because the id space is
+		// no longer the only thing that selects the wide form: a Backtracking
+		// member forces it at any size (SETS_PLAN item 20 decision 3). Testing
+		// the size here left the walk serving a capability that had already
+		// moved to the memory form — an i64 pushed where an i32 was expected,
+		// i.e. a module that does not validate.
+		//
+		// The WIDE union body writes the caller's bitmap itself, so it serves
+		// the memory ABI directly (item 21 phase 1). Its rows are emitted only
+		// for a set that exports `scan_all`, so that is checked and not
+		// assumed. A set made wide by a BT member alone keeps a narrow
+		// automaton and stays on the walk.
+		if cs.unionScan.isWide() {
+			return cs.wideAll() && cs.unionScan.midWordsOff >= 0
+		}
 		return !cs.wideAll()
 	}
 	return false
@@ -586,6 +1045,17 @@ func (cs *compiledSet) usesGatedFindPreflight() bool {
 	if cs.find == "" || cs.overlapping || cs.unionScan == nil {
 		return false
 	}
+	// The preflight emitters read acceptOff/eofOff as [numStates] u64, which a
+	// WIDE automaton does not emit (item 21 phase 1). This predicate is the
+	// only thing standing between a >64-id scalar set with a never-dying
+	// suffix and a preflight reading the transition table as accept masks —
+	// and the failure would be silent in the worst direction: a pattern
+	// wrongly declared dead stops reporting matches. The overlapping twin is
+	// additionally capped at 64 ids by overlapPreflightShape, but this one has
+	// never had an id-space test of its own.
+	if cs.unionScan.isWide() {
+		return false
+	}
 	if cs.fe != frontendScalar {
 		return false
 	}
@@ -629,6 +1099,9 @@ func (cs *compiledSet) usesGatedFindPreflight() bool {
 // set: without it the preflight is §16.5.2's Candidate A — a pass that costs
 // the whole input and retires nothing.
 func (cs *compiledSet) usesOverlappingFindPreflight() bool {
+	if cs.unionScan.isWide() {
+		return false // same reason as usesGatedFindPreflight; see there
+	}
 	return cs.overlapPreflightShape() &&
 		(cs.unionScan != nil || cs.usesAbsencePrefilter())
 }
@@ -863,10 +1336,14 @@ func (cs *compiledSet) usesTwoPhaseScan(kind setCapKind) bool {
 	case capScanAny:
 		return true
 	case capScanAll:
-		// Same reason as usesUnionScan: the wide ABI writes a caller bitmap,
-		// which an accumulator-returning walk does not do. Keyed on wideAll()
-		// for the same reason too — a Backtracking member selects the wide
-		// form at any id space.
+		// Same reason as usesUnionScan, and the same two bodies: phase 2's
+		// automaton serves the memory ABI when it is wide and the accumulator
+		// ABI when it is not. Keyed on wideAll() for the same reason too — a
+		// Backtracking member selects the wide form at any id space, and such
+		// a set never reaches here (phase 2 is not built for it at all).
+		if cs.phase2Union.isWide() {
+			return cs.wideAll() && cs.phase2Union.midWordsOff >= 0
+		}
 		return !cs.wideAll()
 	}
 	return false
@@ -935,17 +1412,36 @@ func (cs *compiledSet) phase2Mask() uint64 {
 // whether phase 2 had an earlier one, and both phases would always run.
 func emitTwoPhaseScanBody(cs *compiledSet, kind setCapKind, phase1Idx int) []byte {
 	const (
-		pInPtr = 0
-		pInLen = 1
-		pFrom  = 2
+		pInPtr  = 0
+		pInLen  = 1
+		pFrom   = 2
+		pOutPtr = 3 // wide scan_all only
 	)
 	phase2Idx := phase1Idx + 1
+	wide := kind == capScanAll && cs.wideAll()
 	var b []byte
 
 	call := func(b []byte, idx int) []byte {
 		b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, pFrom)
+		if wide {
+			b = append(b, 0x20, pOutPtr)
+		}
 		b = append(b, 0x10)
 		return utils.AppendULEB128(b, uint32(idx))
+	}
+
+	if wide {
+		// Both phases write the SAME caller bitmap and each returns how many
+		// bits it set, so the answer is their sum. They cannot double-count: a
+		// pattern lives in exactly one bucket, so phase 1's ids and phase 2's
+		// are disjoint — the same argument phase2Mask rests on.
+		b = append(b, 0x00) // no locals
+		b = call(b, phase1Idx)
+		b = call(b, phase2Idx)
+		b = append(b, 0x6A) // i32.add
+		b = append(b, 0x0B)
+		body := utils.AppendULEB128(nil, uint32(len(b)))
+		return append(body, b...)
 	}
 
 	switch kind {

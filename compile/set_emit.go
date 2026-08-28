@@ -1188,6 +1188,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		if cs.unionScan != nil && cs.unionScan.tableEnd > setTablesEnd {
 			setTablesEnd = cs.unionScan.tableEnd
 		}
+		diag.UnionScan = unionScanDiagOf(cs.unionScan, spec, false)
+	} else if spec.ScanAll != "" || spec.ScanAny != "" {
+		diag.UnionScan = &UnionScanDiag{Refused: "frontend"}
 	}
 
 	// Phase 2 of the two-phase scan (SETS_PLAN item 19), for the MIXED sets
@@ -1210,10 +1213,12 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		hasSetFallbackBucketsIn(buckets) && hasLiteralBuckets(buckets) &&
 		!hasBTBucketIn(buckets) {
 		p2Base := setTablesEnd
-		cs.phase2Union = buildUnionScanDFA(fallbackSubSpec(spec, buckets), opts, p2Base)
+		sub := fallbackSubSpec(spec, buckets)
+		cs.phase2Union = buildUnionScanDFA(sub, opts, p2Base)
 		if cs.phase2Union != nil && cs.phase2Union.tableEnd > setTablesEnd {
 			setTablesEnd = cs.phase2Union.tableEnd
 		}
+		diag.UnionScan = unionScanDiagOf(cs.phase2Union, sub, true)
 	}
 
 	// First-byte eligibility tables (§21.6 / G16), laid out after every other
@@ -1653,7 +1658,12 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, kind := range cs.twoPhaseCaps() {
 			t := byte(setTypeI32x3ToI32)
 			if kind == capScanAll {
+				// The wide form takes the caller's bitmap and returns a count,
+				// so both phases carry the out_ptr the wrapper threads through.
 				t = setTypeI32x3ToI64
+				if cs.wideAll() {
+					t = setTypeI32x4ToI32
+				}
 			}
 			fs = append(fs, t, t)
 		}
@@ -1885,8 +1895,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					body = emitTwoPhaseScanBody(cs, c.kind, base+cs.twoPhaseFnOffset(c.kind))
 				} else if cs.usesUnionScan(c.kind) {
 					// One pass over the start-anywhere automaton instead of
-					// the per-position bucket walk.
-					body = emitUnionScanBody(cs.unionScan, c.kind, cs.fullIDMask(), tableMemIdx)
+					// the per-position bucket walk. Which body depends on the
+					// automaton's accept representation, not on the
+					// capability: above 64 ids there is no u64 accumulator to
+					// answer with (SETS_PLAN item 21 phase 1).
+					if cs.unionScan.isWide() {
+						body = emitUnionScanWideBody(cs.unionScan, c.kind, tableMemIdx)
+					} else {
+						body = emitUnionScanBody(cs.unionScan, c.kind, cs.fullIDMask(), tableMemIdx)
+					}
 				} else {
 					// `scan` / `scan_any` may stop at the first bit and get
 					// the first-hit probes; `scan_all` needs every bit at the
@@ -1908,7 +1925,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			p1 := emitSetMatchFnFinal(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx, kind, scanProbeBase)
 			cs.phase1Only = false
 			cs_bytes = append(cs_bytes, p1...)
-			cs_bytes = append(cs_bytes, emitUnionScanBody(cs.phase2Union, kind, cs.phase2Mask(), tableMemIdx)...)
+			if cs.phase2Union.isWide() {
+				cs_bytes = append(cs_bytes, emitUnionScanWideBody(cs.phase2Union, kind, tableMemIdx)...)
+			} else {
+				cs_bytes = append(cs_bytes, emitUnionScanBody(cs.phase2Union, kind, cs.phase2Mask(), tableMemIdx)...)
+			}
 		}
 		if cs.usesOverlapDP() {
 			cs_bytes = append(cs_bytes, emitOverlapDPBody(cs, tableMemIdx, cs.overlapDPColOff)...)

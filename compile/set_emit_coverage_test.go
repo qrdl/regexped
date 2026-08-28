@@ -506,15 +506,33 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 			"the budget no longer refuses it", maxUnionScanStates, got.numStates)
 	}
 
-	// The accept masks are u64, so pattern 64 has no bit to set. Refusing is
-	// the only safe answer: a union missing a pattern under-reports, which is
-	// the direction that turns a match into a miss.
+	// The id-space ceiling. It was 64 — one u64 accept mask — until SETS_PLAN
+	// item 21 phase 1 gave the automaton a wide accept form; the refusal now
+	// sits at maxUnionScanIDs, which bounds the per-state accept ROW and the
+	// straight-line WASM that ORs it into the caller's bitmap.
+	//
+	// Both sides are asserted, because a ceiling is only a ceiling if
+	// something below it is admitted: a 66-pattern set must now BUILD, and
+	// build wide.
 	wide := make([]string, 66)
 	for i := range wide {
 		wide[i] = fmt.Sprintf("[0-9]{%d}", i+1)
 	}
-	if got := buildFor(t, wide); got != nil {
-		t.Errorf("a %d-pattern set was accepted; ids past 63 do not fit the u64 accept mask", len(wide))
+	got := buildFor(t, wide)
+	if got == nil {
+		t.Error("a 66-pattern set was refused; the wide accept form should serve it")
+	} else if !got.isWide() || got.maskWords != 2 {
+		t.Errorf("66 ids: wide=%v maskWords=%d, want a 2-word wide form",
+			got.isWide(), got.maskWords)
+	}
+
+	over := make([]string, maxUnionScanIDs+1)
+	for i := range over {
+		over[i] = fmt.Sprintf("[0-9]{%d}", i+1)
+	}
+	if got := buildFor(t, over); got != nil {
+		t.Errorf("a %d-pattern set was accepted; the id space exceeds maxUnionScanIDs (%d)",
+			len(over), maxUnionScanIDs)
 	}
 
 	// A pattern whose AST cannot be recovered is skipped everywhere else in
@@ -533,12 +551,16 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 	}
 }
 
-// TestSetEmitUnionScanWideSetSkipsWalk is the same u64 ceiling reached the way
-// a config reaches it: a literal-less set of 66 patterns declaring scan_any.
+// TestSetEmitUnionScanWideSetCompiles is the id ceiling reached the way a
+// config reaches it: a literal-less set of 66 patterns declaring the scan pair.
 //
-// It compiles — the set falls back to the per-position bucket walk — and that
-// is the point: the ceiling is a routing decision, not a build error.
-func TestSetEmitUnionScanWideSetSkipsWalk(t *testing.T) {
+// Before SETS_PLAN item 21 phase 1 this set fell back to the per-position
+// bucket walk, and the test's point was that the ceiling is a routing decision
+// rather than a build error. It now takes the WIDE union body instead, and the
+// point is the same one from the other side — the routing changed and the
+// module still assembles, with the `_all` pair on its out_ptr/count ABI (66 ids
+// is over wideBitmapThreshold) served by a body that writes the bitmap itself.
+func TestSetEmitUnionScanWideSetCompiles(t *testing.T) {
 	patterns := make([]string, 66)
 	for i := range patterns {
 		patterns[i] = fmt.Sprintf(`[0-9]{%d}[a-c]`, i+1)
@@ -551,6 +573,14 @@ func TestSetEmitUnionScanWideSetSkipsWalk(t *testing.T) {
 		}},
 	}
 	setEmitCovMustCompile(t, cfg)
+
+	_, _, diags, err := CompileFileDiag(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if len(diags) != 1 || diags[0].UnionScan == nil || !diags[0].UnionScan.Wide {
+		t.Errorf("want a wide union automaton in --diag-json, got %+v", diags)
+	}
 }
 
 // TestSetEmitCapabilityPredicatesRefuseFind covers the "no" answers of three
