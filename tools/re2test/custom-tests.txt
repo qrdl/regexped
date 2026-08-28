@@ -5385,3 +5385,144 @@ regexps
 -;1-2;-;-;1-2;1-2 -
 -;2-3;-;-;2-3;2-3 2-3
 0-1 0-1;0-1;-;-;0-1;0-1 0-1
+# ============================================================
+# Category (DFA find-mode prefix-resume DIVERGENCE arms, plans/TODO.md task
+# 63) — after the SIMD prefix scan matches, buildFindBody must resume the DFA
+# in the state the prefix walk ends in, and there are up to FOUR such states,
+# one per context the scan can land in: the ordinary mid-string walk, the walk
+# from the true start (attempt_start==0), the walk taken when the preceding
+# byte was a word char, and the walk taken when it was '\n'. Three of its arms
+# exist only for the cases where those walks DISAGREE.
+#
+# The shape that makes them disagree is an alternation where only ONE branch
+# carries the anchor while BOTH branches share the mandatory literal prefix.
+# computePrefix truncates to the common BYTE prefix of the start and mid-start
+# walks, but consuming the same bytes can still land in DIFFERENT STATES: from
+# startState the anchored branch is still alive, from midStartState it is dead.
+#
+# A broken arm — one resuming from the plain mid-string prefixEndState in every
+# context — silently LOSES matches rather than reporting wrong ones, which is
+# why the discriminating rows below are the ones whose match lives only in the
+# anchored/after-newline/after-non-word context:
+#   "A" and "AxAB"      under ^A|AB              (0-1 needs the start walk)
+#   "AB5" and "AB5xABc" under ^AB\d|AB[a-z]      (0-3 needs the start walk)
+#   "x\nAB5"            under (?m:^)AB\d|...     (2-5 needs the newline walk)
+#   "x ABc"             under (?m:^AB\d)|\bAB... (2-5 needs the \b walk)
+# The remaining rows are controls: they match identically in every context, so
+# a failure confined to them means the prefix machinery broke, not the arms.
+#
+# "xABc" under the last pattern is the opposite guard: \b must FAIL after a
+# word byte, so an arm resuming in a live state where it should be dead reports
+# a match that must not exist.
+#
+# Expectations generated from Go stdlib and refereed by --validate-go:
+# col0 = \A(?:pat)\z full consumption, col1 = FindStringIndex,
+# col4 = whole-input FindAllStringIndex (the task 54 step 1 oracle).
+# ============================================================
+PrefixResumeDivergence
+strings
+""
+"A"
+"AB5"
+"ABc"
+"xAB5"
+"AB5xABc"
+"AxAB"
+"x\nAB5"
+"x\nAB5 ABc"
+"x ABc"
+"xABc"
+".AB5"
+"\nAB5"
+"AB5\nAB5"
+regexps
+"^A|AB"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;1-3;-;-;1-3
+-;0-1;-;-;0-1,4-6
+-;0-1;-;-;0-1,2-4
+-;2-4;-;-;2-4
+-;2-4;-;-;2-4,6-8
+-;2-4;-;-;2-4
+-;1-3;-;-;1-3
+-;1-3;-;-;1-3
+-;1-3;-;-;1-3
+-;0-1;-;-;0-1,4-6
+"^AB\\d|AB[a-z]"
+-;-;-;-;-
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;0-3;-;-;0-3,4-7
+-;-;-;-;-
+-;-;-;-;-
+-;6-9;-;-;6-9
+-;2-5;-;-;2-5
+-;1-4;-;-;1-4
+-;-;-;-;-
+-;-;-;-;-
+-;0-3;-;-;0-3
+"\\AAB\\d|AB[a-z]"
+-;-;-;-;-
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;0-3;-;-;0-3,4-7
+-;-;-;-;-
+-;-;-;-;-
+-;6-9;-;-;6-9
+-;2-5;-;-;2-5
+-;1-4;-;-;1-4
+-;-;-;-;-
+-;-;-;-;-
+-;0-3;-;-;0-3
+"(?m:^)AB\\d|AB[a-z]"
+-;-;-;-;-
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;0-3;-;-;0-3,4-7
+-;-;-;-;-
+-;2-5;-;-;2-5
+-;2-5;-;-;2-5,6-9
+-;2-5;-;-;2-5
+-;1-4;-;-;1-4
+-;-;-;-;-
+-;1-4;-;-;1-4
+-;0-3;-;-;0-3,4-7
+"\\bAB"
+-;-;-;-;-
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;2-4;-;-;2-4
+-;2-4;-;-;2-4,6-8
+-;2-4;-;-;2-4
+-;-;-;-;-
+-;1-3;-;-;1-3
+-;1-3;-;-;1-3
+-;0-2;-;-;0-2,4-6
+"(?m:^AB\\d)|\\bAB[a-z]"
+-;-;-;-;-
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;0-3;-;-;0-3
+-;-;-;-;-
+-;2-5;-;-;2-5
+-;2-5;-;-;2-5,6-9
+-;2-5;-;-;2-5
+-;-;-;-;-
+-;-;-;-;-
+-;1-4;-;-;1-4
+-;0-3;-;-;0-3,4-7

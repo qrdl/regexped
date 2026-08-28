@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"fmt"
 	"regexp/syntax"
 	"strings"
@@ -442,12 +443,23 @@ func TestSetMatrixCompiles(t *testing.T) {
 			// rather than declares, and renumbers every memory index after it.
 			// A set shape that assembles one way and not the other would
 			// otherwise surface only at merge time.
+			//
+			// The arm is selected by cfg.Output, NOT by CompileFile's `output`
+			// argument — `standalone := cfg.Output == ""` in CompileFileDiag.
+			// This loop used to vary only the argument, so cfg.Output stayed
+			// empty and BOTH passes compiled standalone: the embedded arm was
+			// never reached, while the failure messages still said "embedded".
+			// Set it on the config, and keep passing it as the argument too,
+			// which is what the CLI does.
+			byMode := map[string][]byte{}
 			for _, output := range []string{"", "merged.wasm"} {
 				mode := "standalone"
+				modeCfg := cfg
 				if output != "" {
 					mode = "embedded"
+					modeCfg.Output = output
 				}
-				wasm, _, err := CompileFile(cfg, output)
+				wasm, _, err := CompileFile(modeCfg, output)
 				if err != nil {
 					t.Fatalf("%s/%s (selects %s): %v", c.name, mode, c.selects, err)
 				}
@@ -463,6 +475,19 @@ func TestSetMatrixCompiles(t *testing.T) {
 						t.Errorf("%s/%s: module does not export %q", c.name, mode, want)
 					}
 				}
+				byMode[mode] = wasm
+			}
+			// The two arms must actually produce DIFFERENT modules — one
+			// declares and exports its memory, the other imports it from
+			// "main" and renumbers every memory index after it. Identical
+			// bytes mean the loop compiled the same arm twice, which is what
+			// it silently did while it varied only CompileFile's argument:
+			// the embedded path went untested for as long as that lasted,
+			// with the failure messages above still naming it. Comparing the
+			// output is the only assertion that notices.
+			if bytes.Equal(byMode["standalone"], byMode["embedded"]) {
+				t.Errorf("%s: standalone and embedded compiled to identical bytes; "+
+					"the embedded arm is not being exercised", c.name)
 			}
 		})
 	}
