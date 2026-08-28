@@ -639,6 +639,97 @@ func TestWideUnionTwoPhaseScan(t *testing.T) {
 	}
 }
 
+// TestUnionScanDegenerateLimits drives the two DEGENERATE forms of the
+// mid-accept partition (SETS_PLAN item 21 phase 2), which are not variations of
+// the general case but different emitted code:
+//
+//   - midAcceptLimit == 0 — no state can accept mid-string, so the bodies emit
+//     NO mid-accept arm at all and every answer has to come from the
+//     end-of-input arm. `{[a-z]+\z, [0-9]{2}\z}` is that set.
+//   - midAcceptLimit == numStates — every state can, so the arm is emitted with
+//     NO guard, because the compare could never be false. For `scan_any` that
+//     means an unconditional return on the first byte. `{[0-9]*, [a-c]{2}}` is
+//     that set: the nullable member matches empty in every state, so every state
+//     accepts, while the second member matches MID-string and not at end of
+//     input — which is what makes the arm load-bearing rather than something
+//     the end-of-input arm could answer instead.
+//
+// compile/set_union_partition_test.go proves the two limits are REACHED (and
+// fails if a fixture stops reaching them); this proves the code emitted for
+// them answers correctly. Both halves are needed: the construction being right
+// says nothing about the branch that consumes it.
+func TestUnionScanDegenerateLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pats []string
+	}{
+		{"limit-zero", []string{`[a-z]+\z`, `[0-9]{2}\z`}},
+		{"limit-full", []string{`[0-9]*`, `[a-c]{2}`}},
+	} {
+		w, diags := wideUnionSet(t, tc.pats, nil, false)
+		assertUnionScan(t, diags, false) // narrow: two patterns
+		dropped := droppedFromSet(diags)
+
+		// "xabz" is load-bearing for limit-full: `[a-c]{2}` matches MID-string
+		// there and does NOT match at end of input, so only the mid-accept arm
+		// can report it. Without such an input the end-of-input arm answers the
+		// whole case on its own and a lost mid arm is invisible — which is
+		// exactly what mutation testing showed with the first fixture.
+		for _, input := range []string{"", "a", "12", "abc", "ab12", "12ab", "x9", "xabz", "zzabzz"} {
+			t.Run(tc.name+"/"+fmt.Sprintf("%q", input), func(t *testing.T) {
+				store, inst, mem, release, err := instantiate(w)
+				defer release()
+				if err != nil {
+					t.Fatalf("instantiate: %v", err)
+				}
+				const pageSize = 65536
+				dataTop, err := utils.ParseDataSectionBytes(w)
+				if err != nil {
+					t.Fatalf("parse data section: %v", err)
+				}
+				inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+				if cur := mem.Size(store); uint64(inBase/pageSize)+2 > cur {
+					if _, err := mem.Grow(store, uint64(inBase/pageSize)+2-cur); err != nil {
+						t.Fatalf("grow: %v", err)
+					}
+				}
+				if len(input) > 0 {
+					copy(mem.UnsafeData(store)[inBase:], input)
+				}
+				in := int32(len(input))
+				for from := 0; from <= len(input); from++ {
+					want := oracleScanAll(tc.pats, input, from, dropped)
+
+					// Narrow ABI: scan_all returns an i64 mask, scan_any an id.
+					res, err := inst.GetFunc(store, "cap_scan_all").
+						Call(store, inBase, in, int32(from))
+					if err != nil {
+						t.Fatalf("scan_all: %v", err)
+					}
+					got := idsFromMask(uint64(res.(int64)), len(tc.pats))
+					if !eqIDs(append([]int(nil), want...), got) {
+						t.Fatalf("scan_all(from=%d) = %v, want %v", from, got, want)
+					}
+
+					res, err = inst.GetFunc(store, "cap_scan_any").
+						Call(store, inBase, in, int32(from))
+					if err != nil {
+						t.Fatalf("scan_any: %v", err)
+					}
+					gotAny := res.(int32)
+					if len(want) == 0 {
+						if gotAny != -1 {
+							t.Fatalf("scan_any(from=%d) = %d, want -1", from, gotAny)
+						}
+					} else if !containsInt(want, int(gotAny)) {
+						t.Fatalf("scan_any(from=%d) = %d, not among %v", from, gotAny, want)
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestWideUnionScanSingleCapability covers the two configurations where the
 // declared capabilities decide which TABLES exist, not just which bodies do.
 //

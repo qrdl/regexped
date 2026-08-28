@@ -51,6 +51,16 @@ type unionScanDFA struct {
 	acceptOff int32 // [numStates] u64: patterns accepting at any position
 	eofOff    int32 // [numStates] u64: patterns accepting at end of input
 
+	// midAcceptLimit partitions the state space: states [0, midAcceptLimit) can
+	// accept mid-string, the rest cannot (SETS_PLAN item 21 phase 2). It is what
+	// turns the per-byte "does a match end here" question from a table load into
+	// a compare against a constant.
+	//
+	// 0 means NO state can accept mid-string — the set matches nothing except
+	// possibly at end of input — and the bodies then emit no mid-accept arm at
+	// all rather than a branch that is never taken.
+	midAcceptLimit int
+
 	// --- the WIDE form (SETS_PLAN item 21 phase 1) ---
 	//
 	// maskWords is 1 for every set that fits the u64 accumulator, and
@@ -242,12 +252,59 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 		}
 	}
 
+	// Mid-accept-first renumbering (SETS_PLAN item 21 phase 2).
+	//
+	// Every byte of every scan asks the same question — "can a match END here?"
+	// — and it used to be answered by LOADING the state's accept entry: a u64
+	// mask in the narrow form, a representative id in the wide one. Partitioned
+	// this way the question becomes `state < midAcceptLimit`, a compare against
+	// a constant, and the load happens only where the answer is yes. On input
+	// that matches nothing, which is where a scan spends its time, that is
+	// never.
+	//
+	// This is the DFA engine's own reorderAcceptFirst trick (engine_dfa.go)
+	// applied to the union's own table build. It is done here rather than
+	// through dfaTable because the union emits its tables directly from the
+	// dfa, and because the partition it needs is MID-accept, not the
+	// end-of-input accept dfaTable partitions by: the two are different sets of
+	// states, and the end-of-input one is read once per call, where a load
+	// costs nothing worth reordering for.
+	midAccepts := func(s int) bool {
+		if wide {
+			return len(d.midAcceptWide[s]) > 0
+		}
+		return d.midAccepting[s] != 0
+	}
+	oldToNew := make([]int, d.numStates)
+	newToOld := make([]int, d.numStates)
+	next := 0
+	for pass := 0; pass < 2; pass++ {
+		want := pass == 0
+		for s := 0; s < d.numStates; s++ {
+			if midAccepts(s) == want {
+				oldToNew[s] = next
+				newToOld[next] = s
+				next++
+			}
+		}
+	}
+	for s := 0; s < d.numStates; s++ {
+		if midAccepts(s) {
+			u.midAcceptLimit++
+		}
+	}
+	u.startState = oldToNew[d.start]
+	u.midStartState = oldToNew[d.midStart]
+
 	u.stateWidth, u.numClasses = 2, 256
 	var classMap [256]byte
 	if d.numStates <= 256 {
 		u.stateWidth = 1
 	}
 	if d.numStates*256*u.stateWidth > unionTableBudget {
+		// Byte classes group BYTES that every state treats alike, which is
+		// invariant under renumbering the states — so this may be computed
+		// from the pre-permutation table.
 		cm, _, nc := computeByteClasses(dfaTableFrom(d))
 		if nc < 256 {
 			classMap, u.numClasses = cm, nc
@@ -255,17 +312,18 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 	}
 	rowLen := u.numClasses * u.stateWidth
 	trans := make([]byte, d.numStates*rowLen)
-	for st := 0; st < d.numStates; st++ {
+	for newSt := 0; newSt < d.numStates; newSt++ {
+		oldSt := newToOld[newSt]
 		for b := 0; b < 256; b++ {
 			col := b
 			if u.numClasses < 256 {
 				col = int(classMap[b])
 			}
-			next := uint16(d.transitions[st*256+b])
+			next := uint16(oldToNew[d.transitions[oldSt*256+b]])
 			if u.stateWidth == 1 {
-				trans[st*rowLen+col] = byte(next)
+				trans[newSt*rowLen+col] = byte(next)
 			} else {
-				binary.LittleEndian.PutUint16(trans[st*rowLen+col*2:], next)
+				binary.LittleEndian.PutUint16(trans[newSt*rowLen+col*2:], next)
 			}
 		}
 	}
@@ -296,9 +354,10 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 	if !wide {
 		accept := make([]byte, d.numStates*8)
 		eof := make([]byte, d.numStates*8)
-		for s := 0; s < d.numStates; s++ {
-			binary.LittleEndian.PutUint64(accept[s*8:], remap(d.midAccepting[s]))
-			binary.LittleEndian.PutUint64(eof[s*8:], remap(d.accepting[s]))
+		for newSt := 0; newSt < d.numStates; newSt++ {
+			oldSt := newToOld[newSt]
+			binary.LittleEndian.PutUint64(accept[newSt*8:], remap(d.midAccepting[oldSt]))
+			binary.LittleEndian.PutUint64(eof[newSt*8:], remap(d.accepting[oldSt]))
 		}
 		u.acceptOff = off
 		u.eofOff = u.acceptOff + int32(len(accept))
@@ -339,13 +398,14 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 	eofRepr := make([]byte, d.numStates*4)
 	midWords := make([]byte, d.numStates*u.rowBytes)
 	eofWords := make([]byte, d.numStates*u.rowBytes)
-	for s := 0; s < d.numStates; s++ {
-		mr, mrow := wideRow(d.midAcceptWide[s])
-		er, erow := wideRow(d.acceptWide[s])
-		binary.LittleEndian.PutUint32(midRepr[s*4:], uint32(mr))
-		binary.LittleEndian.PutUint32(eofRepr[s*4:], uint32(er))
-		copy(midWords[s*u.rowBytes:], mrow)
-		copy(eofWords[s*u.rowBytes:], erow)
+	for newSt := 0; newSt < d.numStates; newSt++ {
+		oldSt := newToOld[newSt]
+		mr, mrow := wideRow(d.midAcceptWide[oldSt])
+		er, erow := wideRow(d.acceptWide[oldSt])
+		binary.LittleEndian.PutUint32(midRepr[newSt*4:], uint32(mr))
+		binary.LittleEndian.PutUint32(eofRepr[newSt*4:], uint32(er))
+		copy(midWords[newSt*u.rowBytes:], mrow)
+		copy(eofWords[newSt*u.rowBytes:], erow)
 	}
 
 	u.midReprOff = off
@@ -378,6 +438,20 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 // the per-byte scaffolding from ~14 fuel to ~3.5 while adding three copies of
 // a ~22-instruction step to two bodies per set.
 const unionUnroll = 4
+
+// A prev-state skip — `if state != lastOr` inside the mid-accept arm, so a
+// repeat visit to the same accepting state records nothing — was BUILT here
+// and REVERTED the same day (SETS_PLAN item 21, Issue 1 option B, 2026-08-28).
+// Its premise was that a run of identical bytes sits in ONE accepting state.
+// It does not: the `.*`-prefixed subset construction allocates PARITY COPIES
+// of states (the same NFA set arriving in two orders on alternate bytes), so
+// a saturated run alternates between two accepting states, the skip never
+// fires, and its test is pure per-byte cost — measured +20.9% on the very row
+// it targeted (greedy-3 / 50K a's / scan_all). Do not rebuild it while the
+// copies exist; the refutation record and the minimisation proposal that
+// would change the premise are in SETS_PLAN item 21 (Issues 1 and 2).
+// tools/fuzz/set_union_prevstate_test.go keeps the coverage that episode
+// added, including the fuel pin on the saturated-run shape.
 
 // emitUnionScanBody emits the one-pass scan body.
 //
@@ -486,25 +560,42 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// any other nullable pattern) is silently dropped — found by
 	// tools/fuzz FuzzSetCaps on {`$`, `\A`} over "0", which reported only
 	// `$`.
-	b = append(b, 0x20, lAcc)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, u.acceptOff)
-	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
-	b = appendTableLoad64(b, tableMemIdx)
-	b = append(b, 0x84, 0x21, lAcc)
-
-	// One step over input[pos+k]: state = trans[state*512 + byte*2], then
-	// acc |= accept[state]. k rides in the load's memarg offset.
-	emitStep := func(b []byte, k byte) []byte {
-		b = emitUnionTransition(b, u, lPos, lState, pInPtr, k, tableMemIdx)
-
-		// acc |= accept[state]
+	//
+	// The mid-accept OR, guarded by the phase-2 partition: states below
+	// midAcceptLimit are exactly the ones that can accept mid-string, so the
+	// load happens only where it can contribute. A limit of 0 means no state
+	// ever accepts mid-string and the arm is not emitted at all; a limit equal
+	// to the state count means every state does, and the compare would be a
+	// branch that is never false, so the OR is emitted bare.
+	emitMidAccept := func(b []byte) []byte {
+		if u.midAcceptLimit == 0 {
+			return b
+		}
+		guarded := u.midAcceptLimit < u.numStates
+		if guarded {
+			b = append(b, 0x20, lState, 0x41)
+			b = utils.AppendSLEB128(b, int32(u.midAcceptLimit))
+			b = append(b, 0x49)       // i32.lt_u
+			b = append(b, 0x04, 0x40) // if
+		}
 		b = append(b, 0x20, lAcc)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, u.acceptOff)
 		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A) // + state*8
 		b = appendTableLoad64(b, tableMemIdx)
-		return append(b, 0x84, 0x21, lAcc) // i64.or; set
+		b = append(b, 0x84, 0x21, lAcc) // i64.or; set
+		if guarded {
+			b = append(b, 0x0B) // end if
+		}
+		return b
+	}
+	b = emitMidAccept(b)
+
+	// One step over input[pos+k]: state = trans[state*rowLen + col], then the
+	// guarded mid-accept OR. k rides in the load's memarg offset.
+	emitStep := func(b []byte, k byte) []byte {
+		b = emitUnionTransition(b, u, lPos, lState, pInPtr, k, tableMemIdx)
+		return emitMidAccept(b)
 	}
 
 	// The mode's early exit, branching to $done at br depth `depth`.
@@ -733,23 +824,40 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	// once every id the set can report has been seen. That target is the count
 	// of DISTINCT IDS, never the id space — a named subset leaves gaps it can
 	// never fill, and comparing against the bound would make the exit dead.
-	emitAcceptArm := func(b []byte, reprOff, wordsOff int32, exit bool) []byte {
-		switch mode {
-		case capScanAny:
-			// RELOADED inside the branch rather than kept with a local.tee.
-			// The tee costs one instruction on EVERY byte; the reload costs
-			// one load on the single byte that ends the scan. Measured: 1
-			// fuel/byte, which on a 100 KB no-match corpus was the whole
-			// difference between this body and `scan_all`'s (2,637,109 against
-			// 2,534,697 — 102,412 apart on a 102,410-byte input).
+	//
+	// `mid` selects how the arm is OPENED, and the two are genuinely different
+	// questions. Mid-string, the phase-2 partition answers it with a compare
+	// against a constant — states below midAcceptLimit are exactly those that
+	// can accept — so the representative is loaded only inside the branch, and
+	// is known non-zero there by construction. At end of input there is no
+	// partition (a different set of states accepts there, and the arm runs once
+	// per call), so it keeps the load-and-test it always had.
+	emitAcceptArm := func(b []byte, reprOff, wordsOff int32, exit, mid bool) []byte {
+		guarded := true
+		if mid {
+			switch {
+			case u.midAcceptLimit == 0:
+				return b // no state can accept mid-string: no arm at all
+			case u.midAcceptLimit >= u.numStates:
+				guarded = false // every state can: the compare is never false
+			default:
+				b = append(b, 0x20, lState, 0x41)
+				b = utils.AppendSLEB128(b, int32(u.midAcceptLimit))
+				b = append(b, 0x49)       // i32.lt_u
+				b = append(b, 0x04, 0x40) // if
+			}
+		} else {
 			b = loadRepr(b, reprOff)
 			b = append(b, 0x04, 0x40) // if it is non-zero
+		}
+		switch mode {
+		case capScanAny:
+			// Loaded INSIDE the branch rather than kept in a local across the
+			// loop: what the hot path needs is the yes/no, and the id itself
+			// is needed only on the byte that ends the scan.
 			b = loadRepr(b, reprOff)
 			b = append(b, 0x41, 0x01, 0x6B, 0x0F) // return repr-1
-			b = append(b, 0x0B)
 		default: // capScanAll
-			b = loadRepr(b, reprOff)
-			b = append(b, 0x04, 0x40) // if
 			b = orRow(b, wordsOff)
 			if exit {
 				b = append(b, 0x20, lCount, 0x41)
@@ -758,7 +866,9 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 				b = append(b, 0x20, lCount, 0x0F) // return count
 				b = append(b, 0x0B)
 			}
-			b = append(b, 0x0B)
+		}
+		if guarded {
+			b = append(b, 0x0B) // end if
 		}
 		return b
 	}
@@ -793,11 +903,11 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	// The ENTRY state's own accepts, before consuming anything: a pattern that
 	// matches EMPTY at `from` accepts here and nowhere else, and the loop below
 	// only tests after a transition (§18.7).
-	b = emitAcceptArm(b, u.midReprOff, u.midWordsOff, true)
+	b = emitAcceptArm(b, u.midReprOff, u.midWordsOff, true, true)
 
 	step := func(b []byte, k byte) []byte {
 		b = emitUnionTransition(b, u, lPos, lState, pInPtr, k, tableMemIdx)
-		return emitAcceptArm(b, u.midReprOff, u.midWordsOff, true)
+		return emitAcceptArm(b, u.midReprOff, u.midWordsOff, true, true)
 	}
 
 	b = append(b, 0x02, 0x40) // block $done
@@ -826,7 +936,7 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	// every accept leaves through `return`, not through a break — so the guard
 	// would be a branch that can never be false. The narrow body needs it
 	// because its monotone early exits do leave with pos < len.
-	b = emitAcceptArm(b, u.eofReprOff, u.eofWordsOff, false)
+	b = emitAcceptArm(b, u.eofReprOff, u.eofWordsOff, false, false)
 
 	if mode == capScanAny {
 		b = append(b, 0x41, 0x7F) // nothing matched
@@ -1001,27 +1111,41 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 	b = append(b, 0x0B)
 	b = append(b, 0x20, fromIdx, 0x21, lPos)
 
+	// The mid-accept OR, under the phase-2 partition — the same guard the scan
+	// body uses, and for the same reason: this walk visits every byte of the
+	// input once per drive, so a load it can skip is a load worth skipping.
+	emitAlive := func(b []byte) []byte {
+		if u.midAcceptLimit == 0 {
+			return b
+		}
+		guarded := u.midAcceptLimit < u.numStates
+		if guarded {
+			b = append(b, 0x20, lState, 0x41)
+			b = utils.AppendSLEB128(b, int32(u.midAcceptLimit))
+			b = append(b, 0x49, 0x04, 0x40) // i32.lt_u; if
+		}
+		b = append(b, 0x20, aliveLocal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, u.acceptOff)
+		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+		b = appendTableLoad64(b, tableMemIdx)
+		b = append(b, 0x84, 0x21, aliveLocal)
+		if guarded {
+			b = append(b, 0x0B)
+		}
+		return b
+	}
+
 	// Entry-state accepts: a pattern matching EMPTY at `from` accepts here and
 	// nowhere else (the §18.7 fix, for the same reason as in the scan body).
-	b = append(b, 0x20, aliveLocal)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, u.acceptOff)
-	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
-	b = appendTableLoad64(b, tableMemIdx)
-	b = append(b, 0x84, 0x21, aliveLocal)
+	b = emitAlive(b)
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $scan
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
 
 	b = emitUnionTransition(b, u, lPos, lState, pInPtr, 0, tableMemIdx)
-
-	b = append(b, 0x20, aliveLocal)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, u.acceptOff)
-	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
-	b = appendTableLoad64(b, tableMemIdx)
-	b = append(b, 0x84, 0x21, aliveLocal)
+	b = emitAlive(b)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
 	b = append(b, 0x0C, 0x00)

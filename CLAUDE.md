@@ -72,6 +72,10 @@ regexped/
 │   │                          #   21). Past 256 ids the set keeps the per-position walk, ~7x dearer.
 │   │                          #   Both preflight predicates REQUIRE the narrow form — the preflight
 │   │                          #   emitters read u64 accept tables a wide automaton does not emit.
+│   │                          #   States are renumbered MID-ACCEPT-FIRST, so the per-byte "can a
+│   │                          #   match end here" test is `state < midAcceptLimit` — a compare
+│   │                          #   against a constant — and the accept entry is loaded only inside
+│   │                          #   the branch. Shared by both scan bodies AND emitUnionAliveMask.
 │   ├── set_probe.go           # Bitmask-only bucket probes (scan + anchored flavours), genAnchoredWASM
 │   ├── set_caps.go            # ANCHORED bodies only (match_any/match_all) + the shared bit-recording
 │   │                          #   emitters and id-space helpers. The scan pair is NOT here — see set_emit.go.
