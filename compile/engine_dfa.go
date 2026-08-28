@@ -4645,11 +4645,24 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// Only present when t.hasWordBoundary; placed after the standard 3 bitmask tables.
 	wbNWBitmaskOff := immBitmaskOff + int32(l.numWASM)*8
 	wbWBitmaskOff := wbNWBitmaskOff + int32(l.numWASM)*8
+	// ...and their DOMINANT subsets: the states where, once the boundary
+	// resolves, the accept is the leftmost-first WINNER and scanning further
+	// can only find a worse answer.
+	//
+	// The set body needs these for the same reason the single-pattern one
+	// does. A word-boundary accept is recorded as a candidate end and then
+	// OVERWRITTEN by any later accept, which is right for `\b0*` and wrong for
+	// `\b|0*`: there the leading `\b` already won, so the empty match at the
+	// boundary IS the answer and `0*`'s longer one must never replace it.
+	// Without these tables the set body cannot tell the two apart, and it
+	// reported 0-1 on "0" where Go reports 0-0 (FUZZER_BUGS 63).
+	wbNWDomBitmaskOff := wbWBitmaskOff + int32(l.numWASM)*8
+	wbWDomBitmaskOff := wbNWDomBitmaskOff + int32(l.numWASM)*8
 	// Newline-boundary pre-transition accept bitmask ((?m:$) fires just before
 	// a '\n'). Placed after whichever of the above are present.
 	nlBitmaskOff := immBitmaskOff + int32(l.numWASM)*8
 	if t.hasWordBoundary {
-		nlBitmaskOff = wbWBitmaskOff + int32(l.numWASM)*8
+		nlBitmaskOff = wbWDomBitmaskOff + int32(l.numWASM)*8
 	}
 
 	// G8 liveness table, placed after every other per-state table.
@@ -4668,8 +4681,10 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	if t.hasWordBoundary {
 		dataBytes = append(dataBytes, appendDataSegment(nil, wbNWBitmaskOff, writeBitmask(t.midAcceptNWStates))...)
 		dataBytes = append(dataBytes, appendDataSegment(nil, wbWBitmaskOff, writeBitmask(t.midAcceptWStates))...)
-		dataSegCount += 2
-		nextTableOffset = wbWBitmaskOff + int32(l.numWASM)*8
+		dataBytes = append(dataBytes, appendDataSegment(nil, wbNWDomBitmaskOff, writeBitmask(t.midAcceptNWStatesDominant))...)
+		dataBytes = append(dataBytes, appendDataSegment(nil, wbWDomBitmaskOff, writeBitmask(t.midAcceptWStatesDominant))...)
+		dataSegCount += 4
+		nextTableOffset = wbWDomBitmaskOff + int32(l.numWASM)*8
 	}
 	if t.hasNewlineBoundary {
 		dataBytes = append(dataBytes, appendDataSegment(nil, nlBitmaskOff, writeBitmask(t.midAcceptNLStates))...)
@@ -4713,6 +4728,8 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		p.wordCharTableOff = l.wordCharTableOff
 		p.wbNWBitmaskOff = wbNWBitmaskOff
 		p.wbWBitmaskOff = wbWBitmaskOff
+		p.wbNWDomBitmaskOff = wbNWDomBitmaskOff
+		p.wbWDomBitmaskOff = wbWDomBitmaskOff
 	}
 	// G17: a bucket whose accept is a per-state LIST takes the sparse body,
 	// which walks that list instead of unrolling one compare per pattern —
@@ -4852,19 +4869,20 @@ type setSuffixParams struct {
 	// single-pattern output and break byteident (D6).
 	memberSkip []dominantWalkState
 
-	l                             *dfaLayout
-	midBitmaskOff                 int32
-	eofBitmaskOff                 int32
-	immBitmaskOff                 int32
-	wasmStart, wasmMidStart       uint32
-	wasmMidStartNewline           uint32
-	hasNewlineBoundary            bool
-	nlBitmaskOff                  int32
-	hasWordChar                   bool
-	wordCharTableOff              int32
-	wbNWBitmaskOff, wbWBitmaskOff int32
-	patternIDs, prefixFixedLens   []int
-	tableMemIdx                   int
+	l                                   *dfaLayout
+	midBitmaskOff                       int32
+	eofBitmaskOff                       int32
+	immBitmaskOff                       int32
+	wasmStart, wasmMidStart             uint32
+	wasmMidStartNewline                 uint32
+	hasNewlineBoundary                  bool
+	nlBitmaskOff                        int32
+	hasWordChar                         bool
+	wordCharTableOff                    int32
+	wbNWBitmaskOff, wbWBitmaskOff       int32
+	wbNWDomBitmaskOff, wbWDomBitmaskOff int32
+	patternIDs, prefixFixedLens         []int
+	tableMemIdx                         int
 	// gated adds a trailing gate-array parameter and the §3.16 write-time
 	// empty-match filter. Set for the default (non-overlapping) `find` body.
 	gated bool
@@ -5048,8 +5066,15 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	lBits := endPosBase + byte(n)
 	lResult := lBits + 1
 	lStartResult := lBits + 2
+	// lDomBits holds the DOMINANT word-boundary accept mask. Declared only for
+	// a set that has a word boundary at all, so nothing else pays for it.
+	lDomBits := lBits + 3
+	nI64 := 3
+	if hasWordChar {
+		nI64 = 4
+	}
 	// Bulk-skip chunk local (v128); only declared when dominants exist.
-	lBulkChunk := lBits + 3
+	lBulkChunk := lBits + byte(nI64)
 	// The v128 chunk local is shared by both skip flavours, so either one
 	// alone must still declare it.
 	haveDominants := len(l.dominantStates) > 0 || len(p.memberSkip) > 0
@@ -5062,8 +5087,8 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		b = append(b, 0x02) // 2 groups
 	}
 	b = utils.AppendULEB128(b, uint32(7+n))
-	b = append(b, 0x7F)       // i32
-	b = append(b, 0x03, 0x7E) // 3 × i64
+	b = append(b, 0x7F) // i32
+	b = append(b, byte(nI64), 0x7E)
 	if haveDominants {
 		b = append(b, 0x01, 0x7B) // 1 × v128
 	}
@@ -5074,12 +5099,30 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 
 	// emitWBPreAcceptCheck emits the word-boundary pre-transition bitmask check.
 	// Reads current byte, selects wbWBitmask or wbNWBitmask, ORs into lResult, updates endPos_k.
+	// A pattern's fixed prefix length, or 0. Hoisted above emitWBCheck, which
+	// now writes tuples of its own and needs the same start adjustment every
+	// other writer uses.
+	pmlFor := func(k int) int {
+		if k < len(prefixFixedLens) && prefixFixedLens[k] > 0 {
+			return prefixFixedLens[k]
+		}
+		return 0
+	}
+
+	// Forward-declared: emitWBCheck needs it, and it needs emitWriteMatchK,
+	// which is defined further down. Every one of these is a closure invoked
+	// at EMIT time, and emitWBCheck's own call site is below the assignment,
+	// so the ordering is sound.
+	var emitCheckAndWriteK func(b []byte, bitsLocal byte, bit uint32, globalID, k, prefixMaxLen int) []byte
+
 	emitWBCheck := func(b []byte) []byte {
 		if !hasWordChar {
 			return b
 		}
 		wbNW := p.wbNWBitmaskOff
 		wbW := p.wbWBitmaskOff
+		wbNWDom := p.wbNWDomBitmaskOff
+		wbWDom := p.wbWDomBitmaskOff
 		// Read wordChar[input[paramPtr + lScanPos]]
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, p.wordCharTableOff)
@@ -5094,6 +5137,11 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
 		b = appendTableLoad64(b, tableMemIdx)
 		b = append(b, 0x21, lBits)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, wbWDom)
+		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+		b = appendTableLoad64(b, tableMemIdx)
+		b = append(b, 0x21, lDomBits)
 		b = append(b, 0x05) // else: !isWord
 		// !isWord: wbBits = wbNWBitmask[lState]
 		b = append(b, 0x41)
@@ -5101,6 +5149,11 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
 		b = appendTableLoad64(b, tableMemIdx)
 		b = append(b, 0x21, lBits)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, wbNWDom)
+		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+		b = appendTableLoad64(b, tableMemIdx)
+		b = append(b, 0x21, lDomBits)
 		b = append(b, 0x0B) // end if isWord
 		// lResult |= lBits
 		b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult)
@@ -5118,6 +5171,33 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 			b = append(b, 0x71, 0x04, 0x40)
 			b = append(b, 0x20, lScanPos, 0x21, endPosK(k))
 			b = append(b, 0x0B)
+		}
+
+		// A DOMINANT boundary accept is FINAL: once the boundary resolves, the
+		// leftmost-first winner is already decided and no later accept may
+		// replace it. Write the tuple here, which also marks the pattern done,
+		// so the ordinary end-of-walk write cannot overwrite endPos_k with a
+		// longer match from a lower-priority alternative.
+		//
+		// This is the whole of the `\b|0*` fix: without it the empty match the
+		// leading `\b` won at position 0 was recorded and then replaced by
+		// `0*`'s 0-1 (FUZZER_BUGS 63).
+		//
+		// SINGLE-PATTERN BUCKETS ONLY, and that restriction is load-bearing.
+		// markDominant records `m[state] = 1` — a BOOLEAN from the
+		// single-pattern era, not a per-pattern mask — because
+		// isDominantAccept returns at the first InstMatch of ANY pattern in
+		// the merged program. With one pattern in the bucket, bit 0 IS that
+		// pattern and the read is exact. With several it is not: reading the
+		// boolean as "pattern 0 is dominant" wrote tuples for patterns that
+		// had not accepted at all, and the corpus caught it immediately as
+		// an INVERTED span (start 1, end 0 — endPos_k never set). Lifting
+		// this needs per-pattern dominance, which is engine work of its own;
+		// see FUZZER_BUGS 63.
+		if len(patternIDs) == 1 {
+			b = append(b, 0x20, lDomBits, 0xA7, 0x21, lBitsScratch)
+			b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch)
+			b = emitCheckAndWriteK(b, lBitsScratch, 1, patternIDs[0], 0, pmlFor(0))
 		}
 		return b
 	}
@@ -5197,7 +5277,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	}
 
 	// emitCheckAndWriteK: if (bitsLocal & bit) && !(doneMask & bit): write using endPos_k.
-	emitCheckAndWriteK := func(b []byte, bitsLocal byte, bit uint32, globalID, k, prefixMaxLen int) []byte {
+	emitCheckAndWriteK = func(b []byte, bitsLocal byte, bit uint32, globalID, k, prefixMaxLen int) []byte {
 		b = append(b, 0x20, bitsLocal, 0x41)
 		b = utils.AppendSLEB128(b, int32(bit))
 		b = append(b, 0x71, 0x04, 0x40) // i32.and; if
@@ -5527,12 +5607,6 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	b = appendTableLoad64(b, tableMemIdx)
 	b = append(b, 0xA7, 0x21, lBitsScratch)
 	b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch) // mask with validMask
-	pmlFor := func(k int) int {
-		if k < len(prefixFixedLens) && prefixFixedLens[k] > 0 {
-			return prefixFixedLens[k]
-		}
-		return 0
-	}
 	for k, gid := range patternIDs {
 		if k >= 32 {
 			break

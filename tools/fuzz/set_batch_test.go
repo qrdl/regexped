@@ -4,8 +4,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"regexp"
+	"runtime"
 	"testing"
 
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -49,15 +51,64 @@ func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
 // runBatchFind drives find_batch to exhaustion with the given buffer capacity,
 // exactly as a generated iterator would: allocate the buffer and the gate
 // array, start from cursor 0, hand the previous return value back unchanged.
-func runBatchFind(t *testing.T, pats []string, input string, outCap int32, overlapping bool) []setMatch {
+//
+// Compiles and instantiates per call. checkBatch drives ONE set through ten
+// combinations of capacity and cache, so it uses batchRunner below instead and
+// compiles once — see the comment there for why that is not just a speed-up.
+func runBatchFind(t *testing.T, pats []string, input string, outCap int32, overlapping, withCache bool) []setMatch {
+	t.Helper()
+	r := newBatchRunner(t, pats, input, overlapping)
+	defer r.release()
+	return r.drive(t, outCap, withCache)
+}
+
+// batchRunner holds one compiled, instantiated set so a caller can drive it
+// many times.
+//
+// The module owns NO state across calls — SETS.md §3.15 — so every drive is
+// independent as long as it re-zeroes the caller-owned arrays, which drive()
+// does. That is the contract, so exercising it this way is a check on the
+// contract as well as a way to compile once instead of ten times.
+//
+// It matters for more than speed. A fuzz worker kills a call that takes longer
+// than ten seconds, and recompiling per combination put the heaviest seeds
+// (`A{1000}` and friends, ~0.9s each even before the cache dimension doubled
+// them) close enough to that limit to be killed under load — reported as
+// "fuzzing process hung or terminated unexpectedly", which reads like an
+// engine hang and is not one.
+type batchRunner struct {
+	store    *wasmtime.Store
+	inst     *wasmtime.Instance
+	mem      *wasmtime.Memory
+	release  func()
+	fn       *wasmtime.Func
+	pats     []string
+	input    string
+	inBase   int32
+	gatePtr  int32
+	outPtr   int32
+	cachePtr int32
+	cacheLen int32
+}
+
+func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool) *batchRunner {
 	t.Helper()
 	w, err := compileBatchSet(pats, overlapping)
 	if err != nil {
+		// A documented construction ceiling is not a defect. FuzzSet already
+		// learned this the hard way — see isResourceCeiling's own comment
+		// about FuzzSet/40f883ef54d47f63 — and the batch target simply never
+		// inherited the skip, so `\baa00\b` beside a pattern whose suffix
+		// blows the DFA state limit reported as a fuzz failure
+		// (FUZZER_BUGS 64).
+		if isResourceCeiling(err) {
+			t.Skip("resource ceiling")
+		}
 		t.Fatalf("compile %v: %v", pats, err)
 	}
 	store, inst, mem, release, err := instantiate(w)
-	defer release()
 	if err != nil {
+		release()
 		t.Fatalf("instantiate: %v", err)
 	}
 	fn := inst.GetFunc(store, "set_find_batch")
@@ -76,7 +127,12 @@ func runBatchFind(t *testing.T, pats []string, input string, outCap int32, overl
 	}
 	gatePtr := inBase + span
 	outPtr := gatePtr + pageSize
-	needed := uint64((int64(outPtr) + pageSize + pageSize - 1) / pageSize)
+	// SETS_PLAN item 11 stage C's answer cache, offered only when the caller
+	// asks. Sized at the sweep's own worst case so "too small" is never the
+	// reason a drive declines — that path has its own test.
+	cachePtr := outPtr + pageSize
+	cacheLen := int32(config.SetOverlapCacheBytes(len(input), len(pats)))
+	needed := uint64((int64(cachePtr) + int64(cacheLen) + 2*pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
 			t.Fatalf("grow: %v", err)
@@ -86,9 +142,37 @@ func runBatchFind(t *testing.T, pats []string, input string, outCap int32, overl
 	if len(input) > 0 {
 		copy(buf[inBase:], input)
 	}
+	runtime.KeepAlive(store)
+	return &batchRunner{
+		store: store, inst: inst, mem: mem, release: release, fn: fn,
+		pats: pats, input: input,
+		inBase: inBase, gatePtr: gatePtr, outPtr: outPtr,
+		cachePtr: cachePtr, cacheLen: cacheLen,
+	}
+}
+
+// drive runs one complete find_batch drive at the given capacity, offering the
+// answer cache or not.
+func (r *batchRunner) drive(t *testing.T, outCap int32, withCache bool) []setMatch {
+	t.Helper()
+	store, mem, fn := r.store, r.mem, r.fn
+	pats, input := r.pats, r.input
+	inBase, gatePtr, outPtr := r.inBase, r.gatePtr, r.outPtr
+
+	// Every drive starts from a zeroed gate array — §3.14's contract — and,
+	// when one is offered, a zeroed cache header.
+	buf := mem.UnsafeData(store)
 	for i := int32(0); i < int32(4*len(pats)); i++ {
 		buf[gatePtr+i] = 0
 	}
+	passCache, passCacheLen := int32(0), int32(0)
+	if withCache {
+		passCache, passCacheLen = r.cachePtr, r.cacheLen
+		for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
+			buf[passCache+i] = 0
+		}
+	}
+	runtime.KeepAlive(store)
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))
 	countMask := int64(1)<<countBits - 1
@@ -107,11 +191,8 @@ func runBatchFind(t *testing.T, pats []string, input string, outCap int32, overl
 		// One signature for both flavours since SETS_PLAN item 11: the
 		// overlapping entry records no match gates but takes the array as the
 		// per-drive home of its preflight verdict.
-		// The scratch pair is zero here: SETS_PLAN item 11 stage C's tuple
-		// cache is OFF, so this drives the ordinary walk. That is deliberate —
-		// this test is the walk's contract, and the cache has its own.
-		args := []interface{}{inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap, int32(0), int32(0)}
-		res, err := fn.Call(store, args...)
+		res, err := fn.Call(store, inBase, int32(len(input)), cursor,
+			gatePtr, outPtr, outCap, passCache, passCacheLen)
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
 		}
@@ -144,20 +225,33 @@ func checkBatch(t *testing.T, pats []string, input string) {
 	t.Helper()
 	want := gatedOracle(pats, input)
 	sortMatches(want)
+	// One compile for all ten drives below. This is the difference between
+	// ~0.9s and ~9s on the heaviest seeds, which is the difference between a
+	// fuzz worker finishing the call and killing it.
+	runner := newBatchRunner(t, pats, input, false)
+	defer runner.release()
 	for _, outCap := range []int32{1, 2, int32(len(pats)), int32(len(pats)) + 3, 64} {
 		if outCap < 1 {
 			continue
 		}
-		got := runBatchFind(t, pats, input, outCap, false)
-		sortMatches(got)
-		if len(want) != len(got) {
-			t.Fatalf("%v on %q cap=%d: expected %d matches %v, got %d %v",
-				pats, input, outCap, len(want), want, len(got), got)
-		}
-		for i := range want {
-			if want[i] != got[i] {
-				t.Fatalf("%v on %q cap=%d: match %d expected %+v, got %+v",
-					pats, input, outCap, i, want[i], got[i])
+		// BOTH engines behind the one export. Declining the cache drives the
+		// ordinary per-position walk; offering it lets the drive switch to
+		// SETS_PLAN item 11 stage C's backward sweep once its own work says
+		// the walk is expensive. They are two implementations of one
+		// contract, and only running both can tell them apart — an answer
+		// that matches the oracle says nothing about which produced it.
+		for _, withCache := range []bool{false, true} {
+			got := runner.drive(t, outCap, withCache)
+			sortMatches(got)
+			if len(want) != len(got) {
+				t.Fatalf("%v on %q cap=%d cache=%v: expected %d matches %v, got %d %v",
+					pats, input, outCap, withCache, len(want), want, len(got), got)
+			}
+			for i := range want {
+				if want[i] != got[i] {
+					t.Fatalf("%v on %q cap=%d cache=%v: match %d expected %+v, got %+v",
+						pats, input, outCap, withCache, i, want[i], got[i])
+				}
 			}
 		}
 	}
@@ -225,17 +319,23 @@ func TestFindBatchOverlapping(t *testing.T) {
 				}
 			}
 			sortMatches(want)
+			runner := newBatchRunner(t, c.pats, c.input, true)
+			defer runner.release()
 			for _, outCap := range []int32{1, 2, int32(len(c.pats)), 64} {
-				got := runBatchFind(t, c.pats, c.input, outCap, true)
-				sortMatches(got)
-				if len(want) != len(got) {
-					t.Fatalf("%v on %q cap=%d: expected %d %v, got %d %v",
-						c.pats, c.input, outCap, len(want), want, len(got), got)
-				}
-				for i := range want {
-					if want[i] != got[i] {
-						t.Fatalf("%v on %q cap=%d: match %d expected %+v, got %+v",
-							c.pats, c.input, outCap, i, want[i], got[i])
+				// Overlapping is the ONLY policy the answer cache serves, so
+				// this is where offering it matters most.
+				for _, withCache := range []bool{false, true} {
+					got := runner.drive(t, outCap, withCache)
+					sortMatches(got)
+					if len(want) != len(got) {
+						t.Fatalf("%v on %q cap=%d cache=%v: expected %d %v, got %d %v",
+							c.pats, c.input, outCap, withCache, len(want), want, len(got), got)
+					}
+					for i := range want {
+						if want[i] != got[i] {
+							t.Fatalf("%v on %q cap=%d cache=%v: match %d expected %+v, got %+v",
+								c.pats, c.input, outCap, withCache, i, want[i], got[i])
+						}
 					}
 				}
 			}
@@ -369,7 +469,7 @@ func TestFindBatchZeroCap(t *testing.T) {
 			}
 
 			// And the loop a stub writes terminates on the first call.
-			if got := runBatchFind(t, pats, input, 0, overlapping); len(got) != 0 {
+			if got := runBatchFind(t, pats, input, 0, overlapping, false); len(got) != 0 {
 				t.Fatalf("out_cap=0: yielded %d matches, want none", got)
 			}
 		})
