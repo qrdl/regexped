@@ -93,6 +93,12 @@ type compiledSet struct {
 	anchoredProbeBodies [][]byte
 	anchoredDataBytes   []byte
 	anchoredDataSegs    int
+	// anchoredUnion replaces that packing with ONE automaton when it can be
+	// built (SETS_PLAN item 22 fix 1b). Non-nil means anchoredBuckets and
+	// anchoredProbeBodies are EMPTY: the two are alternatives, never both, and
+	// anchoredIDs then holds the whole set's ids as a single group because the
+	// automaton reports for every pattern.
+	anchoredUnion *anchoredUnion
 
 	// btFnBodies[i] is the Backtracking driver for the i-th BT fallback bucket
 	// (SETS_PLAN item 20): (ptr, len, out_ptr) -> i32, the same shape a
@@ -1128,38 +1134,74 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	}
 	// Anchored-capability automata (§3.3): a separate packing over the full
 	// patterns with leftmost-first pruning disabled.
+	//
+	// ONE automaton when it can be built (SETS_PLAN item 22 fix 1b), buckets
+	// otherwise. The union serves match_any and match_all together — there is
+	// no way to give one of them the automaton and the other the buckets, since
+	// both read the same packing — so the staging the item describes collapses
+	// into a single step, which is recorded there.
 	if spec.needsAnchoredBuckets() {
 		// Anchored tables go after every other table this set emits; the data
 		// segment bytes include their own headers, so this over-estimates the
 		// end of the preceding regions, which is harmless.
 		anchoredTableBase := setTablesEnd
+		// The packer runs FIRST, because whether it produces one automaton is
+		// itself part of the union's eligibility — see anchoredUnionBeatsBuckets.
+		// Its result is discarded when the union wins, which costs compile time
+		// only (CLAUDE.md: runtime over compile time).
 		abuckets, _ := compileAnchoredBuckets(spec.Patterns, opts, diag)
-		cs.anchoredBuckets = abuckets
-		cs.anchoredIDs = make([][]int, len(abuckets))
-		anchoredOffset := anchoredTableBase
-		for bi, ab := range abuckets {
-			ids := make([]int, len(ab.patterns))
-			for j, ap := range ab.patterns {
-				for k, sp := range spec.Patterns {
-					if sp == ap {
-						ids[j] = spec.PatternIDs[k]
-						break
+		var au *anchoredUnion
+		if anchoredUnionBeatsBuckets(abuckets) {
+			au = buildAnchoredUnionDFA(spec, opts, anchoredTableBase, spec.MatchAll != "")
+		}
+		if au != nil {
+			cs.anchoredUnion = au
+			// The union covers every pattern of the set, so the ids it can
+			// report are exactly the set's — no packing to read them from.
+			// idSpaceSize and checkIDSpace consult this, and an anchored-only
+			// set has no other packing at all.
+			cs.anchoredIDs = [][]int{append([]int(nil), spec.PatternIDs...)}
+			cs.anchoredDataBytes = append(cs.anchoredDataBytes, au.dataBytes...)
+			cs.anchoredDataSegs += au.dataSegs
+			if au.tableEnd > setTablesEnd {
+				setTablesEnd = au.tableEnd
+			}
+			diag.AnchoredUnion = &AnchoredUnionDiag{
+				Used: true, States: au.numStates, Wide: au.isWide(),
+				StateWidth: au.stateWidth, NumClasses: au.numClasses,
+			}
+		} else {
+			diag.AnchoredUnion = &AnchoredUnionDiag{Refused: "construction"}
+			if !anchoredUnionBeatsBuckets(abuckets) {
+				diag.AnchoredUnion.Refused = "single_sparse_bucket"
+			}
+			cs.anchoredBuckets = abuckets
+			cs.anchoredIDs = make([][]int, len(abuckets))
+			anchoredOffset := anchoredTableBase
+			for bi, ab := range abuckets {
+				ids := make([]int, len(ab.patterns))
+				for j, ap := range ab.patterns {
+					for k, sp := range spec.Patterns {
+						if sp == ap {
+							ids[j] = spec.PatternIDs[k]
+							break
+						}
 					}
 				}
+				cs.anchoredIDs[bi] = ids
+				body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids)
+				if sp != nil {
+					ab.sparseScratch = sp.scratch
+					ab.sparseIDMapOff = sp.idMapOff
+				}
+				cs.anchoredProbeBodies = append(cs.anchoredProbeBodies, body)
+				cs.anchoredDataBytes = append(cs.anchoredDataBytes, data...)
+				cs.anchoredDataSegs += segs
+				anchoredOffset = next
 			}
-			cs.anchoredIDs[bi] = ids
-			body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids)
-			if sp != nil {
-				ab.sparseScratch = sp.scratch
-				ab.sparseIDMapOff = sp.idMapOff
+			if anchoredOffset > setTablesEnd {
+				setTablesEnd = anchoredOffset
 			}
-			cs.anchoredProbeBodies = append(cs.anchoredProbeBodies, body)
-			cs.anchoredDataBytes = append(cs.anchoredDataBytes, data...)
-			cs.anchoredDataSegs += segs
-			anchoredOffset = next
-		}
-		if anchoredOffset > setTablesEnd {
-			setTablesEnd = anchoredOffset
 		}
 	}
 
@@ -1176,13 +1218,17 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	//
 	// A find-only OVERLAPPING set needs it too, for item 11's preflight: the
 	// alive verdict is what retires a never-dying pattern from validMask, and
-	// without the automaton there is nothing to compute it with. Gated
-	// `find`'s own preflight has always been silently dormant on a find-only
-	// set for this reason; extending the condition to it as well is NOT done
-	// here, because that would change the module of every gated set and this
-	// change is supposed to leave them byte-identical.
+	// without the automaton there is nothing to compute it with.
+	//
+	// So does a find-only GATED set, as of SETS_PLAN item 22 fix 2a. Its
+	// preflight had always been silently dormant on such a set — the automaton
+	// it reads was only ever built for the scan capabilities — which is why
+	// the losing classchain row got one at all (setperf declares the scan pair
+	// beside `find`) while a `find`-only module got nothing. Building it here
+	// is what makes the extended eligibility mean anything.
 	needUnionForOverlap := cs.overlapPreflightShape() && !cs.usesAbsencePrefilter()
-	if fe == frontendScalar && (spec.ScanAll != "" || spec.ScanAny != "" || needUnionForOverlap) {
+	needUnionForGated := cs.gatedPreflightShape() && !cs.usesAbsencePrefilter()
+	if fe == frontendScalar && (spec.ScanAll != "" || spec.ScanAny != "" || needUnionForOverlap || needUnionForGated) {
 		unionBase := setTablesEnd
 		cs.unionScan = buildUnionScanDFA(spec, opts, unionBase)
 		if cs.unionScan != nil && cs.unionScan.tableEnd > setTablesEnd {
@@ -1886,6 +1932,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				}
 				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.batchPosFnOffset(), dpIdx)...)
 			case capMatch, capMatchAny, capMatchAll:
+				if cs.anchoredUnion != nil {
+					cs_bytes = append(cs_bytes,
+						emitAnchoredUnionBody(cs.anchoredUnion, c.kind, cs.wideAll(), tableMemIdx)...)
+					break
+				}
 				cs_bytes = append(cs_bytes, emitSetAnchoredCapBody(cs, c.kind, anchoredProbeBase)...)
 			default:
 				var body []byte
@@ -2104,41 +2155,58 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// v128 chunk; the union walk needs neither.
 	absence := findPreflight && cs.usesAbsencePrefilter()
 
+	// One further i32 in every arm, LAST in the i32 block: lAllElig, the
+	// per-call "every pattern is eligible from here on" bound (item 22 fix
+	// 2b). Declared only in this body — see setFindCtx.lAllElig for why the
+	// literal-frontend bodies do not get it.
+	// A preflight arm carries ONE more i32 still: lEnd, the union walk's
+	// `pInPtr + len` bound. It exists because that walk's cursor is an
+	// absolute input pointer rather than an offset (see emitUnionTransition),
+	// which is what takes three instructions per byte down to one.
 	var b []byte
 	if absence {
-		// 11 i32 (pos, search mask, simd mask), 2 i64 (acc, alive), 1 v128.
-		b = append(b, 0x03, 0x0B, 0x7F, 0x02, 0x7E, 0x01, 0x7B)
+		// 13 i32 (pos, search mask, simd mask, allElig, end), 2 i64 (acc, alive), 1 v128.
+		b = append(b, 0x03, 0x0D, 0x7F, 0x02, 0x7E, 0x01, 0x7B)
 	} else if findPreflight {
-		// 8 i32 + the union walk's state/pos, then i64 acc + i64 alive mask.
-		b = append(b, 0x02, 0x0A, 0x7F, 0x02, 0x7E)
+		// 8 i32 + the union walk's state/pos + allElig + end, then i64 acc + i64 alive.
+		b = append(b, 0x02, 0x0C, 0x7F, 0x02, 0x7E)
 	} else {
-		// locals: 8 x i32, then the scan_all i64 accumulator.
-		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7E)
+		// locals: 9 x i32, then the scan_all i64 accumulator.
+		b = append(b, 0x02, 0x09, 0x7F, 0x01, 0x7E)
 	}
 
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	c.tableMemIdx = tableMemIdx
 	c.perPositionDrain = true
-	c.lAcc = c.localBase + 8
+	// lAllElig is the last i32 of each arm; the i64s follow it, so both move
+	// up by one against the pre-2b layout.
+	c.lAllElig = c.localBase + 8
+	c.lAcc = c.localBase + 9
 	lPos := c.lPos
 	pInLen := c.pInLen
+	lEnd := byte(0)
 	if absence {
-		c.lAcc = c.localBase + 11
-		c.aliveMask = c.localBase + 12
+		c.lAllElig = c.localBase + 11
+		lEnd = c.localBase + 12
+		c.lAcc = c.localBase + 13
+		c.aliveMask = c.localBase + 14
 	} else if findPreflight {
-		c.lAcc = c.localBase + 10
-		c.aliveMask = c.localBase + 11
+		c.lAllElig = c.localBase + 10
+		lEnd = c.localBase + 11
+		c.lAcc = c.localBase + 12
+		c.aliveMask = c.localBase + 13
 	}
 
 	if findPreflight {
 		// Before the prologue: emitGateJump reads the gate array, so the
 		// sentinels must already be in place for it to skip ahead correctly.
-		emit := emitGatedFindPreflight
-		if overlapPreflight {
-			emit = emitOverlappingFindPreflight
-		}
-		b = emit(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
-			c.pGate, c.pInLen, c.pFrom, tableMemIdx, absence, c.localBase+10, c.localBase+13)
+		// One emitter serves both bodies — see emitFindPreflight's header for
+		// why the gated and overlapping forms converged (item 22 fix 2a).
+		// The v128 chunk is the last local of the absence arm, so it moves up
+		// with the i64s when lAllElig is inserted ahead of them.
+		lChunk := byte(c.localBase + 15)
+		b = emitFindPreflight(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
+			c.pGate, c.pInLen, c.pFrom, lEnd, tableMemIdx, absence, c.localBase+10, lChunk)
 	}
 	b = c.emitFindPrologue(b, lPos)
 

@@ -5021,6 +5021,30 @@ func emitSetTransition(b []byte, l *dfaLayout, lState, lByteClass, paramPtr, lSc
 // overflowed.
 // Returns the number of matches FOUND (which may exceed what fitted).
 //
+// emitIfBitsSet wraps a per-pattern chain in `if bitsLocal != 0`.
+//
+// Every chain in the suffix body unrolls one test per pattern over the SAME
+// local, so when that local is zero — which at a non-matching position is
+// every time — the whole chain is ~5 fuel per pattern of provably dead work.
+// At 32 patterns that is ~150 fuel replaced by three instructions, and the
+// body runs it at up to five sites, two of them per BYTE walked (SETS_PLAN
+// item 22 fix 2c).
+//
+// This is the guard the EOF chain has always had; the others simply never got
+// it. The ctz-loop alternative — iterate only the set bits — is not available
+// here: endPos_k is a WASM LOCAL per pattern and locals cannot be indexed, so
+// the unrolled chain is the only shape, and guarding it is the whole
+// available saving.
+//
+// Wrapping is safe for chains that contain emitCheckAndWriteK: its branches
+// target blocks it opens itself, so an extra enclosing `if` does not change
+// any relative depth.
+func emitIfBitsSet(b []byte, bitsLocal byte, chain func([]byte) []byte) []byte {
+	b = append(b, 0x20, bitsLocal, 0x04, 0x40) // if bitsLocal != 0
+	b = chain(b)
+	return append(b, 0x0B) // end if
+}
+
 // Uses per-pattern endPos tracking to eliminate shared-endPos contamination.
 func buildSetSuffixBody(p setSuffixParams) []byte {
 	l := p.l
@@ -5302,17 +5326,20 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch) // mask with validMask
 	// For each bit k in start-state midAccept: set endPos_k = paramStart
 	// (matchStart_k already initialized to paramLPos above)
-	for k := range patternIDs {
-		if k >= 32 {
-			break
+	b = emitIfBitsSet(b, lBitsScratch, func(b []byte) []byte {
+		for k := range patternIDs {
+			if k >= 32 {
+				break
+			}
+			bit := uint32(1) << uint(k)
+			b = append(b, 0x20, lBitsScratch, 0x41)
+			b = utils.AppendSLEB128(b, int32(bit))
+			b = append(b, 0x71, 0x04, 0x40) // if (lBitsScratch & bit) != 0
+			b = append(b, 0x20, paramStart, 0x21, endPosK(k))
+			b = append(b, 0x0B)
 		}
-		bit := uint32(1) << uint(k)
-		b = append(b, 0x20, lBitsScratch, 0x41)
-		b = utils.AppendSLEB128(b, int32(bit))
-		b = append(b, 0x71, 0x04, 0x40) // if (lBitsScratch & bit) != 0
-		b = append(b, 0x20, paramStart, 0x21, endPosK(k))
-		b = append(b, 0x0B)
-	}
+		return b
+	})
 
 	// emitNLCheck emits the newline-boundary pre-transition accept check: a
 	// `(?m:$)` accepts at the position just BEFORE a '\n', which the
@@ -5393,17 +5420,20 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch) // mask with validMask
 	b = append(b, 0x20, lResult, 0x20, lBits, 0x84, 0x21, lResult)
 	// Per-pattern: if bit k in midAccept, update endPos_k = scanPos+1
-	for k := range patternIDs {
-		if k >= 32 {
-			break
+	b = emitIfBitsSet(b, lBitsScratch, func(b []byte) []byte {
+		for k := range patternIDs {
+			if k >= 32 {
+				break
+			}
+			bit := uint32(1) << uint(k)
+			b = append(b, 0x20, lBitsScratch, 0x41)
+			b = utils.AppendSLEB128(b, int32(bit))
+			b = append(b, 0x71, 0x04, 0x40)                                   // if bit k fired
+			b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, endPosK(k)) // endPos_k = scanPos+1
+			b = append(b, 0x0B)
 		}
-		bit := uint32(1) << uint(k)
-		b = append(b, 0x20, lBitsScratch, 0x41)
-		b = utils.AppendSLEB128(b, int32(bit))
-		b = append(b, 0x71, 0x04, 0x40)                                   // if bit k fired
-		b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, endPosK(k)) // endPos_k = scanPos+1
-		b = append(b, 0x0B)
-	}
+		return b
+	})
 
 	// Dominant-state SIMD bulk-skip dispatch.
 	// Mirrors emitPhase4Dispatch's mid-accept channel but operates on
@@ -5607,13 +5637,16 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	b = appendTableLoad64(b, tableMemIdx)
 	b = append(b, 0xA7, 0x21, lBitsScratch)
 	b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch) // mask with validMask
-	for k, gid := range patternIDs {
-		if k >= 32 {
-			break
+	b = emitIfBitsSet(b, lBitsScratch, func(b []byte) []byte {
+		for k, gid := range patternIDs {
+			if k >= 32 {
+				break
+			}
+			bit := uint32(1) << uint(k)
+			b = emitCheckAndWriteK(b, lBitsScratch, bit, gid, k, pmlFor(k))
 		}
-		bit := uint32(1) << uint(k)
-		b = emitCheckAndWriteK(b, lBitsScratch, bit, gid, k, pmlFor(k))
-	}
+		return b
+	})
 
 	b = append(b, 0x20, lState, 0x45, 0x0D, 0x01)                   // dead: br $done
 	b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, lScanPos) // scanPos++
@@ -5679,24 +5712,30 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	// --- Post-loop: write scan+eof bits with per-pattern endPos ---
 	b = append(b, 0x20, lResult, 0xA7, 0x21, lBitsScratch)
 	b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch) // mask with validMask
-	for k, gid := range patternIDs {
-		if k >= 32 {
-			break
+	b = emitIfBitsSet(b, lBitsScratch, func(b []byte) []byte {
+		for k, gid := range patternIDs {
+			if k >= 32 {
+				break
+			}
+			bit := uint32(1) << uint(k)
+			b = emitCheckAndWriteK(b, lBitsScratch, bit, gid, k, pmlFor(k))
 		}
-		bit := uint32(1) << uint(k)
-		b = emitCheckAndWriteK(b, lBitsScratch, bit, gid, k, pmlFor(k))
-	}
+		return b
+	})
 
 	// --- Post-loop: write start-only bits (used paramStart as endPos_k) ---
 	b = append(b, 0x20, lStartResult, 0xA7, 0x21, lBitsScratch)
 	b = append(b, 0x20, lBitsScratch, 0x20, paramValidMask, 0x71, 0x21, lBitsScratch) // mask with validMask
-	for k, gid := range patternIDs {
-		if k >= 32 {
-			break
+	b = emitIfBitsSet(b, lBitsScratch, func(b []byte) []byte {
+		for k, gid := range patternIDs {
+			if k >= 32 {
+				break
+			}
+			bit := uint32(1) << uint(k)
+			b = emitCheckAndWriteK(b, lBitsScratch, bit, gid, k, pmlFor(k))
 		}
-		bit := uint32(1) << uint(k)
-		b = emitCheckAndWriteK(b, lBitsScratch, bit, gid, k, pmlFor(k))
-	}
+		return b
+	})
 
 	b = append(b, 0x20, lOutCount, 0x0B) // return lOutCount
 	return b

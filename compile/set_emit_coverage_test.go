@@ -1335,22 +1335,22 @@ func TestSetEmitPlanBTRegionsWithMemo(t *testing.T) {
 	}
 }
 
-// TestSetEmitPreflightWithNoPatterns covers the empty-set guard in both
-// preflight emitters.
+// TestSetEmitPreflightWithNoPatterns covers the empty-set guard in the
+// preflight emitter.
 //
 // The pass writes one gate slot per pattern id, and with no ids there is
-// nothing to write — but the OVERLAPPING form also READS slot ids[0] to decide
-// whether the drive is fresh, so without this guard an empty set indexes
-// gate[-1]. A set with no surviving members is not something a config produces
-// today (the shape predicates refuse it earlier), so the emitters are called
-// on an empty compiledSet directly.
+// nothing to write — but it also READS slot ids[0] to decide whether the drive
+// is fresh, so without this guard an empty set indexes gate[-1]. A set with no
+// surviving members is not something a config produces today (the shape
+// predicates refuse it earlier), so the emitter is called on an empty
+// compiledSet directly.
+//
+// One emitter, not two: item 22 fix 2a gave the gated body the overlapping
+// body's alive-marking write-back, at which point the two were the same code.
 func TestSetEmitPreflightWithNoPatterns(t *testing.T) {
 	empty := &compiledSet{}
-	if got := emitGatedFindPreflight(nil, empty, 8, 9, 10, 3, 1, 2, 0, false, 11, 12); len(got) != 0 {
-		t.Errorf("the gated preflight emitted %d bytes for a set with no patterns", len(got))
-	}
-	if got := emitOverlappingFindPreflight(nil, empty, 8, 9, 10, 3, 1, 2, 0, false, 11, 12); len(got) != 0 {
-		t.Errorf("the overlapping preflight emitted %d bytes for a set with no patterns", len(got))
+	if got := emitFindPreflight(nil, empty, 8, 9, 10, 3, 1, 2, 13, 0, false, 11, 12); len(got) != 0 {
+		t.Errorf("the preflight emitted %d bytes for a set with no patterns", len(got))
 	}
 }
 

@@ -167,6 +167,19 @@ func TestUnionAliveMaskPreflightMatchesGo(t *testing.T) {
 		// empty nothing here would notice.
 		{`[^\n]*[0-2]`, `[0-9]*`},
 		{`[^\n]*[0-2]`, `\A`},
+		// NO never-dying member — shapes the preflight only reaches since
+		// SETS_PLAN item 22 fix 2a dropped hasNeverDyingState from its
+		// eligibility. Every one of them is nullable, which is the axis that
+		// broke: fix 2a's first draft marked ALIVE patterns with gate 1, and
+		// while 1 is invisible to the pre-mask and to emitGateJump, the
+		// write-time empty-extent rule in emitWriteMatchK is the stricter
+		// `2s >= gate[k]` — so an empty match at s == 0 was dropped by every
+		// one of these and by 24 corpus cases. The marker is gone; these pin
+		// its absence.
+		{`(?:.|(?:c?))`},
+		{`(?:.|(?:c?))`, `^(?:(?:.|(?:c?)))$`},
+		{`[a-c]*`, `[0-9]*`},
+		{`(?:x|)`, `[p-r]{2}`},
 	}
 	inputs := []string{
 		"",

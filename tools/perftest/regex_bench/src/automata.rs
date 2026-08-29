@@ -233,6 +233,38 @@ pub extern "C" fn ra_find_gated(len: i32, from: i32) -> i32 {
     n as i32
 }
 
+/// find, LAZILY: the single leftmost match at or after `from`, packed as
+/// `(start << 32) | end`, or -1 when there is none.
+///
+/// SETS_PLAN item 22 task 2. Every other `find` pairing here enumerates the
+/// whole input in one call, which is a fair comparison against our BATCHED
+/// find and an unfair one against our bare `find` — that returns to the host
+/// once per matching position, so the timed row compares two API shapes rather
+/// than two engines (the matrix now labels it `api-shape`). This entry point
+/// is the missing half: driven one match per call from Go, both sides pay the
+/// same N host crossings, and the ratio is a real "our lazy API vs their lazy
+/// API" number for the first time.
+///
+/// It answers the same question our `find` does — the FIRST POSITION at or
+/// after `from` where anything in the set matches — so it uses the multi-
+/// pattern automaton (`set`) rather than the per-pattern `each` loop the bulk
+/// pairing uses. Per-pattern iteration would make one call O(P) searches and
+/// measure a different algorithm; the leftmost match over the set is one
+/// search, which is what our single pass computes.
+#[no_mangle]
+pub extern "C" fn ra_find_next(len: i32, from: i32) -> i64 {
+    let st = state();
+    let h = haystack(len);
+    if from < 0 || from as usize > h.len() {
+        return -1;
+    }
+    let input = Input::new(h).span(from as usize..h.len());
+    match st.set.find(input) {
+        Some(m) => ((m.start() as i64) << 32) | (m.end() as i64),
+        None => -1,
+    }
+}
+
 // --------------------------------------------------------------------------
 // Benchmark entry points. Each times `iters` iterations of one whole-input
 // operation and writes the per-iteration nanosecond duration to TIMINGS_BUF,

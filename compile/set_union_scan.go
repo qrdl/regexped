@@ -506,10 +506,15 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 		pInLen = 1
 		pFrom  = 2
 	)
-	// locals: lPos, lState (i32), lAcc (i64)
-	lPos, lState, lAcc := byte(3), byte(4), byte(5)
+	// locals: lPos, lState, lEnd (i32), lAcc (i64).
+	//
+	// lPos is an absolute INPUT POINTER (pInPtr + position) and lEnd is
+	// pInPtr + len, so the per-byte load needs no address arithmetic at all —
+	// see emitUnionTransition. Nothing here reports a position, which is what
+	// makes the offset expendable.
+	lPos, lState, lEnd, lAcc := byte(3), byte(4), byte(5), byte(6)
 	var b []byte
-	b = append(b, 0x02, 0x02, 0x7F, 0x01, 0x7E) // 2 x i32, 1 x i64
+	b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7E) // 3 x i32, 1 x i64
 
 	b = append(b, 0x42, 0x00, 0x21, lAcc)
 	// Entry state depends on `from`, and getting this wrong is silent.
@@ -534,7 +539,8 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	b = utils.AppendSLEB128(b, int32(u.midStartState))
 	b = append(b, 0x21, lState)
 	b = append(b, 0x0B) // end if
-	b = append(b, 0x20, pFrom, 0x21, lPos)
+	b = append(b, 0x20, pInPtr, 0x20, pFrom, 0x6A, 0x21, lPos)
+	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x6A, 0x21, lEnd)
 
 	// `from > len` yields the capability's "nothing" result. The loop guard
 	// alone does NOT deliver that: the entry-state
@@ -594,7 +600,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// One step over input[pos+k]: state = trans[state*rowLen + col], then the
 	// guarded mid-accept OR. k rides in the load's memarg offset.
 	emitStep := func(b []byte, k byte) []byte {
-		b = emitUnionTransition(b, u, lPos, lState, pInPtr, k, tableMemIdx)
+		b = emitUnionTransition(b, u, lPos, lState, k, tableMemIdx)
 		return emitMidAccept(b)
 	}
 
@@ -623,7 +629,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// bulk loop and finish in the tail. Unsigned, and no overflow to worry
 	// about: pos <= len < 2^31 on entry (the from > len case already returned).
 	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
-	b = append(b, 0x20, pInLen, 0x4B, 0x0D, 0x01) // gt_u → br $bulk_exit
+	b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01) // gt_u → br $bulk_exit
 
 	for k := byte(0); k < unionUnroll; k++ {
 		b = emitStep(b, k)
@@ -634,8 +640,8 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	b = append(b, 0x0B) // end loop $bulk
 	b = append(b, 0x0B) // end block $bulk_exit
 
-	b = append(b, 0x03, 0x40)                                 // loop $tail
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01) // pos >= len → br $done
+	b = append(b, 0x03, 0x40)                               // loop $tail
+	b = append(b, 0x20, lPos, 0x20, lEnd, 0x4F, 0x0D, 0x01) // cur >= end → br $done
 	b = emitStep(b, 0)
 	b = emitExit(b, 0x01) // → $done
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
@@ -646,7 +652,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// End-of-input accepts. Reached whether the loop ran out of input or
 	// broke early; in the early-exit cases the extra OR cannot change a
 	// non-zero acc for `scan`, and for `scan_all` a full mask stays full.
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x04, 0x40) // if pos >= len
+	b = append(b, 0x20, lPos, 0x20, lEnd, 0x4F, 0x04, 0x40) // if cur >= end
 	b = append(b, 0x20, lAcc)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, u.eofOff)
@@ -737,16 +743,22 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	if mode == capScanAll {
 		localBase = 4
 	}
+	// lPos is an absolute INPUT POINTER and lEnd is pInPtr + len, so the
+	// per-byte load needs no address arithmetic (see emitUnionTransition).
 	lPos, lState := localBase, localBase+1
-	// scan_all's recording scratch; scan_any declares neither, since it keeps
-	// nothing between bytes at all.
+	// scan_all's recording scratch; scan_any declares only the cursor pair and
+	// the end bound, since it keeps nothing between bytes at all.
+	// lEnd is the LAST i32 of each shape, so the i64 pair that follows it
+	// shifts up by one against the pre-pointer layout.
 	lCount, lAddr := localBase+2, localBase+3
 	lOld32, lNew32 := localBase+4, localBase+5
-	lOld64, lNew64 := localBase+6, localBase+7
+	lEnd := localBase + 2
+	lOld64, lNew64 := localBase+7, localBase+8
 	if mode == capScanAll {
-		b = append(b, 0x02, 0x06, 0x7F, 0x02, 0x7E) // 6 x i32, 2 x i64
+		lEnd = localBase + 6
+		b = append(b, 0x02, 0x07, 0x7F, 0x02, 0x7E) // 7 x i32, 2 x i64
 	} else {
-		b = append(b, 0x01, 0x02, 0x7F) // 2 x i32
+		b = append(b, 0x01, 0x03, 0x7F) // 3 x i32
 	}
 
 	// repr[state], left on the stack.
@@ -887,7 +899,8 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	b = utils.AppendSLEB128(b, int32(u.midStartState))
 	b = append(b, 0x21, lState)
 	b = append(b, 0x0B)
-	b = append(b, 0x20, pFrom, 0x21, lPos)
+	b = append(b, 0x20, pInPtr, 0x20, pFrom, 0x6A, 0x21, lPos)
+	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x6A, 0x21, lEnd)
 
 	// `from > len` yields the capability's "nothing" answer (§4.2). gt_u, not
 	// ge_u: `from == len` is a real position, and a pattern matching empty
@@ -906,7 +919,7 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	b = emitAcceptArm(b, u.midReprOff, u.midWordsOff, true, true)
 
 	step := func(b []byte, k byte) []byte {
-		b = emitUnionTransition(b, u, lPos, lState, pInPtr, k, tableMemIdx)
+		b = emitUnionTransition(b, u, lPos, lState, k, tableMemIdx)
 		return emitAcceptArm(b, u.midReprOff, u.midWordsOff, true, true)
 	}
 
@@ -914,7 +927,7 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	b = append(b, 0x02, 0x40) // block $bulk_exit
 	b = append(b, 0x03, 0x40) // loop $bulk
 	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
-	b = append(b, 0x20, pInLen, 0x4B, 0x0D, 0x01) // pos+4 > len (u) -> $bulk_exit
+	b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01) // cur+4 > end (u) -> $bulk_exit
 	for k := byte(0); k < unionUnroll; k++ {
 		b = step(b, k)
 	}
@@ -923,8 +936,8 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	b = append(b, 0x0B)       // end loop $bulk
 	b = append(b, 0x0B)       // end block $bulk_exit
 
-	b = append(b, 0x03, 0x40)                                 // loop $tail
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01) // pos >= len -> $done
+	b = append(b, 0x03, 0x40)                               // loop $tail
+	b = append(b, 0x20, lPos, 0x20, lEnd, 0x4F, 0x0D, 0x01) // cur >= end -> $done
 	b = step(b, 0)
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
 	b = append(b, 0x0C, 0x00) // br $tail
@@ -1093,7 +1106,20 @@ func (cs *compiledSet) fullIDMask() uint64 {
 // is silent, which is why it is restated here rather than assumed.
 // fromIdx is the index of an i32 holding the position the walk starts at —
 // see emitLiteralAbsenceMask for why it is not the hardcoded 2 it once was.
-func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fromIdx byte, tableMemIdx int) []byte {
+//
+// fullMask is the caller's fullIDMask: once every id it names is alive the
+// walk can stop, because the only consumer of this mask is "which patterns are
+// DEAD" and the answer is already "none". This is what bounds the pass on
+// matching input — the walk costs at most the bytes up to the first position
+// where the last pattern shows alive, which a per-position drive has to cover
+// anyway — and it is why SETS_PLAN item 22's fix 2a can offer the preflight to
+// every eligible set instead of only to never-dying ones (§16.5.2's Candidate
+// A was a pass that cost the whole input and retired nothing). The test is
+// ANDed rather than compared outright because the union is built from the SPEC
+// while fullMask comes from the BUCKETS: a pattern the packer dropped has a
+// bit here and not there, and a bare == would then never fire. Pass 0 to
+// suppress the exit.
+func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fromIdx, lEnd byte, tableMemIdx int, fullMask uint64) []byte {
 	const (
 		pInPtr = 0
 		pInLen = 1
@@ -1109,12 +1135,18 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 	b = utils.AppendSLEB128(b, int32(u.midStartState))
 	b = append(b, 0x21, lState)
 	b = append(b, 0x0B)
-	b = append(b, 0x20, fromIdx, 0x21, lPos)
+	// lPos is an absolute INPUT POINTER here too, and lEnd is pInPtr + len.
+	b = append(b, 0x20, pInPtr, 0x20, fromIdx, 0x6A, 0x21, lPos)
+	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x6A, 0x21, lEnd)
 
 	// The mid-accept OR, under the phase-2 partition — the same guard the scan
 	// body uses, and for the same reason: this walk visits every byte of the
 	// input once per drive, so a load it can skip is a load worth skipping.
-	emitAlive := func(b []byte) []byte {
+	//
+	// exitDepth >= 0 additionally leaves the walk once every id in fullMask is
+	// alive. It sits INSIDE the mid-accept guard because that is the only place
+	// aliveLocal can change, so a byte that ends no match pays nothing for it.
+	emitAlive := func(b []byte, exitDepth int) []byte {
 		if u.midAcceptLimit == 0 {
 			return b
 		}
@@ -1130,6 +1162,17 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
 		b = appendTableLoad64(b, tableMemIdx)
 		b = append(b, 0x84, 0x21, aliveLocal)
+		if exitDepth >= 0 && fullMask != 0 {
+			d := exitDepth
+			if guarded {
+				d++ // the `if` above is one more level of nesting
+			}
+			b = append(b, 0x20, aliveLocal, 0x42)
+			b = utils.AppendSLEB128_64(b, int64(fullMask))
+			b = append(b, 0x83, 0x42) // i64.and
+			b = utils.AppendSLEB128_64(b, int64(fullMask))
+			b = append(b, 0x51, 0x0D, byte(d)) // i64.eq; br_if
+		}
 		if guarded {
 			b = append(b, 0x0B)
 		}
@@ -1138,27 +1181,36 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 
 	// Entry-state accepts: a pattern matching EMPTY at `from` accepts here and
 	// nowhere else (the §18.7 fix, for the same reason as in the scan body).
-	b = emitAlive(b)
+	// No early exit here: this runs before $done exists to branch to, and a set
+	// whose every pattern matches empty is not the shape the exit is for.
+	b = emitAlive(b, -1)
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $scan
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+	b = append(b, 0x20, lPos, 0x20, lEnd, 0x4F, 0x0D, 0x01)
 
-	b = emitUnionTransition(b, u, lPos, lState, pInPtr, 0, tableMemIdx)
-	b = emitAlive(b)
+	b = emitUnionTransition(b, u, lPos, lState, 0, tableMemIdx)
+	b = emitAlive(b, 1) // 1 = $done, past $scan
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B) // end loop
 	b = append(b, 0x0B) // end block
 
-	// End-of-input accepts.
+	// End-of-input accepts, guarded by pos >= len exactly as emitUnionScanBody
+	// guards its own — the early exit above can leave the loop mid-input, where
+	// this state's EOF accepts say nothing about what matches in the rest of
+	// the input. Reading them anyway would only ever ADD alive bits, which is
+	// the safe direction (fewer patterns retired), but the guard keeps the mask
+	// meaning what its name says rather than relying on the consumer.
+	b = append(b, 0x20, lPos, 0x20, lEnd, 0x4F, 0x04, 0x40) // if cur >= end
 	b = append(b, 0x20, aliveLocal)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, u.eofOff)
 	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
 	b = appendTableLoad64(b, tableMemIdx)
 	b = append(b, 0x84, 0x21, aliveLocal)
+	b = append(b, 0x0B) // end if
 	return b
 }
 
@@ -1166,23 +1218,57 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 // B′: one union preflight per drive, whose result is written back into the
 // caller's gate array as a never-again sentinel.
 func (cs *compiledSet) usesGatedFindPreflight() bool {
-	if cs.find == "" || cs.overlapping || cs.unionScan == nil {
+	if cs.unionScan == nil && !cs.usesAbsencePrefilter() {
 		return false
 	}
 	// The preflight emitters read acceptOff/eofOff as [numStates] u64, which a
-	// WIDE automaton does not emit (item 21 phase 1). This predicate is the
-	// only thing standing between a >64-id scalar set with a never-dying
-	// suffix and a preflight reading the transition table as accept masks —
-	// and the failure would be silent in the worst direction: a pattern
-	// wrongly declared dead stops reporting matches. The overlapping twin is
-	// additionally capped at 64 ids by overlapPreflightShape, but this one has
-	// never had an id-space test of its own.
+	// WIDE automaton does not emit (item 21 phase 1). This is the only thing
+	// standing between a >64-id scalar set and a preflight reading the
+	// transition table as accept masks — and the failure would be silent in
+	// the worst direction: a pattern wrongly declared dead stops reporting
+	// matches. gatedPreflightShape's id-space test is the structural twin of
+	// this, applied before the automaton exists.
 	if cs.unionScan.isWide() {
+		return false
+	}
+	return cs.gatedPreflightShape()
+}
+
+// gatedPreflightShape is usesGatedFindPreflight's structural half, answerable
+// from the set alone — before the union automaton is built, which is what
+// decides whether to build one at all (the same split overlapPreflightShape
+// exists for).
+//
+// SETS_PLAN item 22 fix 2a, decided: there is NO hasNeverDyingState test here.
+// It used to be the engagement rule — offer the preflight only where a suffix
+// DFA can walk forever, because §16.5.2's Candidate A was a pass that cost the
+// whole input and retired nothing. What retires that objection is
+// emitUnionAliveMask's fullMask early exit (fix 2a prerequisite 2): the pass
+// now stops at the first position where the last pattern shows alive, so on
+// input the walk was going to cover anyway it costs a fraction of a pass, and
+// on input where patterns really do match nowhere it retires them and the
+// drive ends in emitGateJump's prologue. The OVERLAPPING twin keeps its
+// never-dying test — item 11's refutations are about that body's economics,
+// not this one's.
+func (cs *compiledSet) gatedPreflightShape() bool {
+	if cs.find == "" || cs.overlapping {
 		return false
 	}
 	if cs.fe != frontendScalar {
 		return false
 	}
+	// Ids past 63 have no bit in the i64 alive mask, so they can never be
+	// retired — and if ids[0] is one of them the one-slot freshness guard
+	// never disarms. Both are the wide-automaton case, refused here in the
+	// form that is answerable without the automaton.
+	if cs.idSpaceSize() > 64 || cs.numPatterns() > 64 {
+		return false
+	}
+	// Sparse buckets are NOT excluded, unlike the overlapping twin: that one
+	// applies its verdict through the i32 validMask, which set_sparse.go's
+	// header forbids reading as authoritative for such a bucket, while this
+	// one writes the caller's GATE ARRAY — which a sparse bucket's body reads
+	// per pattern for itself.
 	for _, b := range cs.buckets {
 		if b.suffixDFA == nil {
 			continue
@@ -1191,12 +1277,7 @@ func (cs *compiledSet) usesGatedFindPreflight() bool {
 			return false
 		}
 	}
-	for _, b := range cs.buckets {
-		if b.suffixDFA != nil && hasNeverDyingState(b.suffixDFA) {
-			return true
-		}
-	}
-	return false
+	return true
 }
 
 // usesOverlappingFindPreflight reports whether this set's OVERLAPPING `find`
@@ -1266,128 +1347,94 @@ func (cs *compiledSet) overlapPreflightShape() bool {
 	return false
 }
 
-// emitOverlappingFindPreflight is B′ for the overlapping body.
+// emitFindPreflight emits B′ for BOTH `find` bodies, gated and overlapping.
 //
-// Same pass, same sentinel, one addition — and the addition is the whole
-// reason the per-call version measured in item 11's attempt log failed. The
-// gated body's "run only while some gate is still zero" guard works because
-// its write-back eventually makes every gate non-zero. An overlapping body
-// writes NO gates, so a pattern that is alive would keep its zero for the
-// whole drive and the guard would re-arm on every single call — which on
-// greedy-3 / 50K a's meant 3,724 union passes instead of one.
+// Run the union automaton over [from,len) once per drive and write the verdict
+// into the caller's gate array: `2*len + 2` for every pattern it proves
+// matches NOWHERE, `1` for every pattern still alive.
 //
-// So an alive pattern is marked too, with 1. The §3.16 pre-mask reads that as
-// `2s + 1 >= 1`, true at every position, so the pattern stays eligible
-// everywhere; the value's only job is to be non-zero. A dead one gets
-// `2*len + 2`, exactly as in the gated body, which the same pre-mask reads as
-// false everywhere.
+// The dead value is already legal in the §3.16 encoding — it is what an empty
+// match at `len` writes, and the pre-mask `2p + 1 >= gate[k]` is false for
+// every p <= len, so the pattern is excluded for the rest of the drive. No new
+// kind of value is introduced; that is the whole reason B′ is preferable to B.
+// The alive value's only job is to be NON-ZERO: the same pre-mask reads
+// `2s + 1 >= 1` as true at every position, and emitGateJump's `gate[id] >> 1`
+// reads it as 0, exactly as a fresh 0 does.
 //
-// One further gift: with every pattern dead, emitGateJump's minimum over
-// `gate[id] >> 1` is len + 1, so the scan cursor jumps past the end and the
-// call returns 0 without entering the loop.
-func emitOverlappingFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen, fromIdx byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
-	ids := setPatternIDs(cs)
-	if len(ids) == 0 {
-		return b
-	}
-	// Run only on a fresh drive, which the caller declares by zeroing the
-	// array (§3.14's existing contract).
-	//
-	// ONE slot is tested, not all of them, and that is a real difference from
-	// the gated body rather than a shortcut. There the guard has to ask "is
-	// ANY gate still zero", because gates arrive one at a time as patterns
-	// match. Here the pass writes every id in one go — alive or dead, all of
-	// them non-zero — so any single slot answers for the whole array. The
-	// difference is O(patterns) per call against O(1), on a capability whose
-	// drive makes one call per matching position; on greedy-3 / 50K a's that
-	// is 50,000 calls paying for it.
-	b = append(b, 0x20, pGate, 0x28, 0x02)
-	b = utils.AppendULEB128(b, uint32(ids[0]*4))
-	b = append(b, 0x45)       // i32.eqz
-	b = append(b, 0x04, 0x40) // if the drive is fresh
-
-	if absence {
-		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal, fromIdx)
-	} else {
-		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, fromIdx, tableMemIdx)
-	}
-
-	for _, gid := range ids {
-		if gid >= 64 {
-			// Outside the i64 mask: leave the gate at 0 so the pattern is
-			// never retired. It also leaves this drive's "some gate is zero"
-			// guard armed, which is why usesOverlappingFindPreflight refuses
-			// an id space this wide rather than relying on the loop.
-			continue
-		}
-		b = append(b, 0x20, aliveLocal)
-		b = append(b, 0x42)
-		b = utils.AppendSLEB128_64(b, int64(gid))
-		b = append(b, 0x88)
-		b = append(b, 0x42, 0x01, 0x83)
-		b = append(b, 0x50)                                             // i64.eqz -> not alive
-		b = append(b, 0x04, 0x7F)                                       // if (result i32)
-		b = append(b, 0x20, pInLen, 0x41, 0x01, 0x74, 0x41, 0x02, 0x6A) // 2*len + 2
-		b = append(b, 0x05)                                             // else
-		b = append(b, 0x41, 0x01)                                       // 1: eligible everywhere, and non-zero
-		b = append(b, 0x0B)
-		b = append(b, 0x21, lState) // stash, then store through pGate
-		b = append(b, 0x20, pGate, 0x20, lState)
-		b = append(b, 0x36, 0x02)
-		b = utils.AppendULEB128(b, uint32(gid*4)) // i32.store offset=gid*4
-	}
-	b = append(b, 0x0B) // end if some gate zero
-	return b
-}
-
-// emitGatedFindPreflight emits B′.
+// TWO FRESHNESS GUARDS, one per body, and the difference is forced.
 //
-// Only while some gate is still 0 — i.e. the first call of a drive — run the
-// union automaton over [from,len) and, for every pattern it proves matches
-// NOWHERE, write `gate[id] = 2*len + 2`.
+// OVERLAPPING uses the gate array itself: it writes no gates of its own, so
+// before item 11 an alive pattern kept its zero for the whole drive and a "is
+// ANY gate zero" guard re-armed on every call — 3,724 union passes instead of
+// one on greedy-3 / 50K a's. Marking alive patterns with 1 makes the array
+// all-non-zero after the first call, so ONE slot answers for the whole array.
 //
-// That value is already legal in the §3.16 encoding: it is what an empty match
-// at `len` writes, and the pre-mask `2p + 1 >= gate[k]` is false for every
-// p <= len, so the pattern is excluded for the rest of the drive. No new kind
-// of value is introduced — that is the whole reason B′ is preferable to B.
+// GATED cannot use that marker, and SETS_PLAN item 22 fix 2a's own
+// prescription for prerequisite 1 was wrong to assume it could. `1` IS
+// invisible to the pre-mask (`2s + 1 >= 1` holds everywhere) and to
+// emitGateJump (`1 >> 1 == 0`), which is as far as that prescription checked.
+// It is NOT invisible to the third reader: emitWriteMatchK's write-time rule
+// for an EMPTY extent is the stricter `2s >= gate[k]`, and at s == 0 that
+// rejects 1 while accepting 0. The whole gated corpus agrees — marking alive
+// patterns dropped every empty match at position 0 (24 setcaps failures, all
+// nullable patterns on empty input). No value can serve: the marker must be
+// non-zero for the guard and <= 0 for that rule.
+//
+// So the gated guard asks `from == 0` instead. A gated drive advances `from`
+// strictly (§4.8 resumes at start + 1), so this is true on its first call and
+// false on every later one — once per drive, in O(1), with nothing written to
+// a slot the match path reads. Its verdict stays valid as `from` grows: a
+// pattern that matches nowhere in [0, len) matches nowhere in any subrange.
+// A drive that legitimately STARTS at from > 0 simply gets no preflight, which
+// costs it the optimisation and nothing else. Re-running on a later call that
+// is again at from == 0 is harmless: the pass is idempotent and writes nothing
+// for alive patterns.
+//
+// One further gift, shared by both: with every pattern dead, emitGateJump's
+// minimum over `gate[id] >> 1` is len + 1, so the scan cursor jumps past the
+// end and the call returns 0 without entering the loop.
 //
 // TWO CONTRACT NOTES, per §18.5:
-//   - the sentinel is written at CALL ENTRY, independent of whether a position
+//   - the verdict is written at CALL ENTRY, independent of whether a position
 //     is fully delivered, so it sits outside D2's "only after a fully
 //     delivered position" rule;
 //   - a caller resuming at a smaller `from` must zero the gate array first,
 //     which §3.14 already requires.
 //
 // Both are documented in docs/sets.md.
-func emitGatedFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen, fromIdx byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
+func emitFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen, fromIdx, lEnd byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
 	ids := setPatternIDs(cs)
 	if len(ids) == 0 {
 		return b
 	}
-	// Run only when some gate is still zero: a fresh drive.
-	b = append(b, 0x41, 0x00, 0x21, lState) // lState doubles as "any gate zero"
-	for _, gid := range ids {
+	// Run only on a fresh drive. See the header for why the two bodies answer
+	// that question differently — the gated one MUST NOT use the gate array,
+	// because the marker that would make one slot answer for all of them is
+	// exactly the value emitWriteMatchK reads as "no empty match here".
+	if cs.overlapping {
 		b = append(b, 0x20, pGate, 0x28, 0x02)
-		b = utils.AppendULEB128(b, uint32(gid*4))
+		b = utils.AppendULEB128(b, uint32(ids[0]*4))
 		b = append(b, 0x45) // i32.eqz
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x41, 0x01, 0x21, lState)
-		b = append(b, 0x0B)
+	} else {
+		b = append(b, 0x20, fromIdx, 0x45) // from == 0
 	}
-	b = append(b, 0x20, lState)
-	b = append(b, 0x04, 0x40) // if some gate is zero
+	b = append(b, 0x04, 0x40) // if the drive is fresh
 
 	if absence {
 		// G12: prove absence by literal search instead of walking the union
 		// automaton — same over-approximating contract, ~15x cheaper.
 		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal, fromIdx)
 	} else {
-		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, fromIdx, tableMemIdx)
+		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, fromIdx, lEnd, tableMemIdx, cs.fullIDMask())
 	}
 
-	// gate[id] = 2*len + 2 for every id the pass proved dead.
 	for _, gid := range ids {
 		if gid >= 64 {
+			// Outside the i64 mask: leave the gate at 0 so the pattern is
+			// never retired. It also leaves an overlapping drive's one-slot
+			// guard armed if ids[0] is itself that wide, which is why both
+			// eligibility predicates refuse an id space over 64 rather than
+			// relying on this loop.
 			continue
 		}
 		b = append(b, 0x20, aliveLocal)
@@ -1395,15 +1442,33 @@ func emitGatedFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal,
 		b = utils.AppendSLEB128_64(b, int64(gid))
 		b = append(b, 0x88)
 		b = append(b, 0x42, 0x01, 0x83)
-		b = append(b, 0x50)       // not alive
-		b = append(b, 0x04, 0x40) // if
+		b = append(b, 0x50) // i64.eqz -> not alive
+		if cs.overlapping {
+			// Alive patterns are marked too, so one slot answers "has this
+			// drive run the pass". Sound only here: this body's gates are the
+			// preflight's own storage and no match path reads them.
+			b = append(b, 0x04, 0x7F)                                       // if (result i32)
+			b = append(b, 0x20, pInLen, 0x41, 0x01, 0x74, 0x41, 0x02, 0x6A) // 2*len + 2
+			b = append(b, 0x05)                                             // else
+			b = append(b, 0x41, 0x01)                                       // 1: eligible everywhere, and non-zero
+			b = append(b, 0x0B)
+			b = append(b, 0x21, lState) // stash, then store through pGate
+			b = append(b, 0x20, pGate, 0x20, lState)
+			b = append(b, 0x36, 0x02)
+			b = utils.AppendULEB128(b, uint32(gid*4)) // i32.store offset=gid*4
+			continue
+		}
+		// Gated: write the DEAD sentinel only. An alive pattern keeps its 0,
+		// which is the only value the empty-extent rule reads as "no
+		// constraint" (see the header).
+		b = append(b, 0x04, 0x40) // if not alive
 		b = append(b, 0x20, pGate)
 		b = append(b, 0x20, pInLen, 0x41, 0x01, 0x74, 0x41, 0x02, 0x6A) // 2*len + 2
 		b = append(b, 0x36, 0x02)
 		b = utils.AppendULEB128(b, uint32(gid*4)) // i32.store offset=gid*4
 		b = append(b, 0x0B)
 	}
-	b = append(b, 0x0B) // end if some gate zero
+	b = append(b, 0x0B) // end if the drive is fresh
 	return b
 }
 
@@ -1599,7 +1664,43 @@ func emitTwoPhaseScanBody(cs *compiledSet, kind setCapKind, phase1Idx int) []byt
 // emitUnionScanBody and emitUnionAliveMask because those two carried
 // byte-for-byte copies of it against a HARDCODED layout — the exact place a
 // layout change silently produces a module that reads its own tables wrong.
-func emitUnionTransition(b []byte, u *unionScanDFA, lPos, lState, pInPtr, k byte, tableMemIdx int) []byte {
+// lCur is an ABSOLUTE INPUT POINTER, not an offset — `pInPtr + position`,
+// maintained by the caller.
+//
+// It was `pInPtr + lPos` computed here, which cost three instructions on every
+// byte of every union walk (two local.gets and an add) where a pointer costs
+// one. The callers all pay for it once instead: they seed the cursor with
+// `pInPtr + from` and carry a second local holding `pInPtr + len` to compare
+// against. Nothing in any of those bodies needs the numeric POSITION — the
+// scan pair reports ids and masks, the alive mask reports a mask, the anchored
+// walk reports accepts — so the offset had no other reader to keep it for.
+// Measured saving: ~2 fuel per byte against a per-byte cost of ~19.75.
+func emitUnionTransition(b []byte, u *unionScanDFA, lCur, lState, k byte, tableMemIdx int) []byte {
+	return emitUnionTransitionAddr(b, u, lState, k, tableMemIdx, func(b []byte) []byte {
+		return append(b, 0x20, lCur)
+	})
+}
+
+// emitUnionTransitionOffset is emitUnionTransition for a walk that keeps an
+// OFFSET rather than a pointer: it pays the `base + offset` add on every byte
+// and saves the two instructions of setup a pointer cursor needs.
+//
+// That trade is only worth taking one way round, and which way depends on how
+// far the walk goes. A pointer costs +4 instructions once (seed the cursor,
+// compute the end bound) and saves 2 per byte, so it repays itself after two
+// bytes — which every scan walk clears by five orders of magnitude, and which
+// the ANCHORED walk does not clear at all: it dies within a byte or two by
+// design, so in pointer form it measured +2 fuel on every one of the 48
+// anchored rows. Hence two forms, chosen by how long the walk lives.
+func emitUnionTransitionOffset(b []byte, u *unionScanDFA, lBase, lOff, lState, k byte, tableMemIdx int) []byte {
+	return emitUnionTransitionAddr(b, u, lState, k, tableMemIdx, func(b []byte) []byte {
+		return append(b, 0x20, lBase, 0x20, lOff, 0x6A)
+	})
+}
+
+// emitUnionTransitionAddr is the body both forms share; pushAddr leaves the
+// address of the input byte on the stack.
+func emitUnionTransitionAddr(b []byte, u *unionScanDFA, lState, k byte, tableMemIdx int, pushAddr func([]byte) []byte) []byte {
 	rowLen := u.numClasses * u.stateWidth
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, u.transOff)
@@ -1618,12 +1719,12 @@ func emitUnionTransition(b []byte, u *unionScanDFA, lPos, lState, pInPtr, k byte
 	if u.numClasses < 256 {
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, u.classMapOff)
-		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
+		b = pushAddr(b)
 		b = append(b, 0x2D, 0x00, k) // i32.load8_u offset=k (input, memory 0)
 		b = append(b, 0x6A)
 		b = appendTableLoad8u(b, tableMemIdx)
 	} else {
-		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
+		b = pushAddr(b)
 		b = append(b, 0x2D, 0x00, k) // i32.load8_u offset=k (input, memory 0)
 	}
 	if u.stateWidth == 2 {

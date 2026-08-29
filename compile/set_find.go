@@ -203,7 +203,18 @@ type setFindCtx struct {
 	lMinStart  byte // best match start seen so far; minStartSentinel when none
 	lBase      byte // tuple index this call's writes start at
 	lStart     byte // the match start of the group currently being evaluated
-	lAcc       byte // i64 bitmask accumulator, scan_all only
+	// lAllElig is the smallest match start at which EVERY pattern passes the
+	// §3.16 pre-mask — `max_k(gate[k]) >> 1`, computed once per call beside
+	// emitGateJump's minimum (SETS_PLAN item 22 fix 2b). At starts from there
+	// on, emitGateMask's per-pattern chain provably clears nothing, so ONE
+	// compare replaces up to 32 load-and-compare pairs.
+	//
+	// 0 means "not allocated": only the scalar `find` body declares the local,
+	// because it is the only one whose per-position cost the chain dominates —
+	// a literal frontend has already skipped most positions before reaching a
+	// bucket, and giving it the local would move bytes it is supposed to keep.
+	lAllElig byte
+	lAcc     byte // i64 bitmask accumulator, scan_all only
 	// aliveMask is an i64 local holding the ids that match SOMEWHERE in
 	// [from,len). G9's gated-`find` preflight fills it and writes it back as
 	// §3.16 gate sentinels.
@@ -428,6 +439,15 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 	if !c.readsGate() || c.sparseBucket(bi) {
 		return b
 	}
+	// Skip the whole chain where it provably clears nothing (item 22 fix 2b).
+	// Wrapping is safe because the chain below contains no branch out of this
+	// block — only one `if` per pattern — so nothing inside it depends on the
+	// nesting depth.
+	shortcut := c.gateMaskCanShortcut(bi, mask)
+	if shortcut {
+		b = append(b, 0x20, c.lStart, 0x20, c.lAllElig, 0x49) // lStart < lAllElig
+		b = append(b, 0x04, 0x40)                             // if: some pattern may be gated off
+	}
 	first := true
 	for k, gid := range c.cs.patternIDs[bi] {
 		if k >= 32 {
@@ -457,6 +477,9 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 		b = utils.AppendSLEB128(b, int32(^bit))
 		b = append(b, 0x71, 0x21, c.lValidMask)
 		b = append(b, 0x0B)
+	}
+	if shortcut {
+		b = append(b, 0x0B) // end if
 	}
 	return b
 }
@@ -774,6 +797,87 @@ func (cs *compiledSet) jumpIsProfitable() bool {
 // position. As §3.14 notes, it only fires when EVERY pattern is gated past
 // `from` — one never-matched pattern pins the minimum at 0 — which is why the
 // mask skip above, not this, is the load-bearing half.
+// emitAllEligibleFrom computes lAllElig = max_k(gate[k]) >> 1 once per call —
+// the smallest match start at which the §3.16 pre-mask clears NOTHING.
+//
+// Pattern k survives the pre-mask at start s while `2s + 1 >= gate[k]`, so
+// every pattern survives while `2s + 1 >= max_k gate[k]`, and the smallest
+// such s is that maximum shifted right by one — the same algebra emitGateJump
+// applies to the MINIMUM, for the opposite purpose. Where the jump asks "can I
+// skip this position entirely", this asks "can I skip asking".
+//
+// It is the mirror of the jump in profitability too. The jump fires only when
+// EVERY pattern is gated past the cursor, which one never-matched pattern
+// pins at 0 forever; this fires once the cursor passes the FURTHEST gate,
+// which a never-matched pattern (gate 0) cannot prevent at all — it only
+// lowers the maximum. On a dense drive the gates trail the cursor by at most
+// one match extent, so the shortcut is taken at nearly every position after
+// the first few of each call.
+//
+// O(patterns) once per call, replacing O(patterns) at every position it
+// covers. Sound to hoist for exactly emitGateJump's reason: the gate array
+// cannot change during a call, since write-back runs after the scan loop.
+func (c *setFindCtx) emitAllEligibleFrom(b []byte) []byte {
+	if !c.anyGroupCanShortcut() {
+		// Nothing will read it. Emitting it anyway is not free: the loop is
+		// O(patterns) on EVERY call, and a set whose buckets are all G17-sparse
+		// suppresses the chain entirely, so the prologue would be pure cost
+		// against no saving at all. Measured before this test existed:
+		// classchain-128 (four sparse buckets) paid +19.4% on its dense `find`
+		// for a shortcut none of its buckets could take.
+		return b
+	}
+	ids := setPatternIDs(c.cs)
+	b = append(b, 0x41, 0x00, 0x21, c.lAllElig) // max = 0
+	for _, gid := range ids {
+		b = append(b, 0x20, c.pGate, 0x28, 0x02)
+		b = utils.AppendULEB128(b, uint32(gid*4)) // i32.load offset=gid*4
+		b = append(b, 0x22, c.lTmp)               // tee candidate
+		b = append(b, 0x20, c.lAllElig, 0x4B)     // candidate > max (unsigned)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, c.lTmp, 0x21, c.lAllElig)
+		b = append(b, 0x0B)
+	}
+	b = append(b, 0x20, c.lAllElig, 0x41, 0x01, 0x76, 0x21, c.lAllElig) // >>= 1
+	return b
+}
+
+// gateShortcutMinPatterns is how long a gate chain has to be before guarding
+// it with the lAllElig compare pays.
+//
+// The trade is measured, not derived, because the deciding quantity is how
+// OFTEN the shortcut fires and that is a property of the input. When it fires
+// it saves ~6 fuel per pattern; when it misses it costs ~4, plus the
+// prologue's O(patterns) on every call. Both ends were measured on the setperf
+// corpus with no threshold at all: 32 patterns in one bucket won 4.5% on
+// classchain-32's dense `find`, while THREE patterns lost 5.5% on every
+// greedy-3 gated row — the same shape item 11's refutations warn about, a
+// per-position test that does not fire often enough to repay itself. 8 sits
+// between the measured points, on the winning side of both.
+const gateShortcutMinPatterns = 8
+
+// gateMaskCanShortcut reports whether emitGateMask should guard its chain with
+// the lAllElig compare for this group: the local must exist, the group must
+// actually read gates, and the chain has to be long enough to be worth
+// skipping.
+func (c *setFindCtx) gateMaskCanShortcut(bi int, mask uint32) bool {
+	return c.lAllElig != 0 && c.readsGate() && !c.sparseBucket(bi) &&
+		bitsInMask(mask) >= gateShortcutMinPatterns
+}
+
+// anyGroupCanShortcut reports whether any group of any bucket will emit the
+// shortcut, which is what decides whether lAllElig is worth computing.
+func (c *setFindCtx) anyGroupCanShortcut() bool {
+	for bi := range c.cs.prefixLenGroups {
+		for _, g := range c.cs.prefixLenGroups[bi] {
+			if c.gateMaskCanShortcut(bi, g.mask) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (c *setFindCtx) emitGateJump(b []byte, lPos byte) []byte {
 	// Gated bodies only, and MEASURED so rather than assumed. An overlapping
 	// body's gates hold 1 for an alive pattern, so the minimum over
@@ -875,6 +979,14 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		b = append(b, 0x21, c.lStart)
 		b = c.emitStartGuards(b, g.L != 0)
 		b = c.emitGroupMask(b, bi, g, posLocal)
+		// First-byte eligibility comes FIRST (SETS_PLAN item 22 fix 2b). Both
+		// it and the gate chain only refine lValidMask, so their order is
+		// semantics-free — but the costs are not remotely equal. The gate
+		// chain unrolls a load and a compare PER PATTERN (~190 fuel at 32
+		// patterns), while this is one table lookup that carries its own
+		// empty-mask skip, so on the positions it rejects the chain is never
+		// reached at all. On classchain-32's dense corpus that is 75% of them.
+		b = c.emitStartableMask(b, bi, g, posLocal)
 		// Gate test plus the first empty-mask skip. The skip guards the prefix
 		// DFAs (the expensive part); the second one below guards the
 		// suffix/probe call once those DFAs have had their say. Each is
@@ -891,7 +1003,6 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 				b = c.emitEmptyMaskSkip(b, bi, g.mask)
 			}
 		}
-		b = c.emitStartableMask(b, bi, g, posLocal)
 		b = c.emitPrefixChecks(b, bi, g, posLocal)
 		if g.L != 0 {
 			// Only a fixed-prefix group runs prefix DFAs, so only there can
@@ -1130,6 +1241,7 @@ func (c *setFindCtx) emitFindPrologue(b []byte, lPos byte) []byte {
 	b = append(b, 0x21, c.lMinStart)
 	b = append(b, 0x20, c.pFrom, 0x21, lPos)
 	b = c.emitGateJump(b, lPos)
+	b = c.emitAllEligibleFrom(b)
 	switch c.mode {
 	case capScanAny:
 		b = append(b, 0x41, 0x7F, 0x21, c.lOutBase) // id = -1

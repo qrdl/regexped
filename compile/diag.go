@@ -88,6 +88,35 @@ type SetDiag struct {
 	// FrontendDemotion was added for, and of SETS_PLAN item 21 itself — six
 	// sub-1x rows whose cause was a body selection nobody could see.
 	UnionScan *UnionScanDiag `json:"union_scan,omitempty"`
+	// AnchoredUnion reports how the ANCHORED capabilities were served
+	// (SETS_PLAN item 22 fix 1b): one union automaton, or the bucket packing.
+	// Before this field the anchored packer had no diagnostic at all, so the
+	// difference between "one automaton" and "four buckets and a probe call
+	// each" — which is the whole cost difference between 154 fuel and 700 —
+	// was invisible to everything but a disassembler.
+	AnchoredUnion *AnchoredUnionDiag `json:"anchored_union,omitempty"`
+}
+
+// AnchoredUnionDiag reports the anchored trio's body selection.
+type AnchoredUnionDiag struct {
+	// Used is false when the automaton was refused and match_any/match_all
+	// fell back to the per-bucket probes. Refused is then the reason.
+	Used bool `json:"used"`
+	// Refused names what failed. "construction" covers everything
+	// buildAnchoredUnionDFA decides internally: the state cap, a word or
+	// newline boundary, an id space past maxUnionScanIDs, an unparseable
+	// pattern.
+	Refused string `json:"refused,omitempty"`
+	// Wide is the >64-id accept form: a per-state representative id plus a
+	// bitmap row, in place of a u64 mask.
+	Wide   bool `json:"wide,omitempty"`
+	States int  `json:"states,omitempty"`
+	// StateWidth and NumClasses describe the emitted table. They are the
+	// reason this path exists: unlike the bucket packing's layout, the two are
+	// chosen independently, so a 530-state automaton still compresses by byte
+	// class instead of costing 512 bytes a row.
+	StateWidth int `json:"state_width,omitempty"`
+	NumClasses int `json:"num_classes,omitempty"`
 }
 
 // UnionScanDiag reports the scan pair's body selection.

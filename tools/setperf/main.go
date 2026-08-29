@@ -205,6 +205,27 @@ func raPairing(c capability) string {
 	return ""
 }
 
+// timedRatioIsAPIShape reports whether a capability's TIMED ratio would
+// measure the shape of the two APIs rather than the two engines.
+//
+// Only bare `find` qualifies, and the tool half-knew it already: raPairing's
+// comment on capFindBatch calls that pairing "the fair one", because there
+// both sides make O(matches/buffer) host crossings. Bare `find` is the same
+// pairing with our side making one crossing PER MATCH and theirs making one in
+// total, so its ratio was never an engine comparison (SETS_PLAN item 22 task
+// 1). The FUEL ratio is unaffected and stays printed: a Go->wasmtime call
+// executes no wasm instructions, so that column has no crossing term to
+// distort.
+//
+// Scope note, so the label is not over-read: the crossings are not a defect.
+// Batching is built (item 19) and closes the gap on the same rows, and for
+// C/Go/Rust/AS there are no crossings at all — wasm-merge makes a stub call
+// intra-module, which is why TestSetBatchFindIsJSTSOnly pins batching as
+// JS/TS-only. This row models un-hinted JS/TS and nothing else.
+func timedRatioIsAPIShape(c capability) bool {
+	return c == capFind
+}
+
 // raFuelPairing is raPairing for the FUEL comparison: the same task, but the
 // harness's ONE-SHOT export rather than its `ra_bench_*` timing wrapper.
 //
@@ -1119,6 +1140,67 @@ func (h *raHarness) fuelOf(cap capability, inputLen int32) (fuel uint64, truncat
 }
 
 // bench runs the named regex-automata bench export and returns its p50.
+// benchLazyFind drives ra_find_next ONE MATCH PER CALL from Go and times the
+// whole drive here, in the host — the mirror image of measureTime on our side.
+//
+// SETS_PLAN item 22 task 2. Every other pairing in this file times the Rust
+// side INSIDE wasm, which is right for a bulk entry point and wrong for a lazy
+// one: our bare `find` returns to the host at every matching position, so the
+// only fair comparison is one where their driver crosses the boundary just as
+// often. Here it does, and neither side's number is crossing-corrected —
+// BOTH carry N crossings, which is the point, so subtracting them would
+// remove the very term being compared.
+//
+// The resume rule is our §4.8 rule, so the two drives visit the same
+// positions: continue at start+1, and stop when the scan reports nothing.
+// Returns the p50 of the whole drive plus the call count that produced it.
+func (h *raHarness) benchLazyFind(inputLen int) (time.Duration, int, error) {
+	fn := h.inst.GetFunc(h.store, "ra_find_next")
+	if fn == nil {
+		return 0, 0, fmt.Errorf("harness missing ra_find_next")
+	}
+	drive := func() (int, error) {
+		calls, from := 0, int32(0)
+		for {
+			v, err := fn.Call(h.store, int32(inputLen), from)
+			calls++
+			if err != nil {
+				return calls, err
+			}
+			packed := v.(int64)
+			if packed < 0 {
+				return calls, nil
+			}
+			start := int32(packed >> 32)
+			from = start + 1
+			if int(from) > inputLen {
+				return calls, nil
+			}
+		}
+	}
+	for end := time.Now().Add(50 * time.Millisecond); time.Now().Before(end); {
+		if _, err := drive(); err != nil {
+			return 0, 0, err
+		}
+	}
+	// Far fewer iterations than bench()'s 2000: one sample is a whole drive,
+	// which on a dense corpus is thousands of host crossings.
+	const iters = 15
+	samples := make([]time.Duration, iters)
+	calls := 0
+	for i := range samples {
+		t0 := time.Now()
+		n, err := drive()
+		if err != nil {
+			return 0, 0, err
+		}
+		samples[i] = time.Since(t0)
+		calls = n
+	}
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	return samples[len(samples)/2], calls, nil
+}
+
 func (h *raHarness) bench(name string, inputLen int) (time.Duration, error) {
 	fn := h.inst.GetFunc(h.store, name)
 	if fn == nil {
@@ -1190,6 +1272,16 @@ func runFullMatrix(cases []setCase) {
 	fmt.Println("the ratio is computed from it, so both columns describe engine work alone.")
 	fmt.Printf("Ratios are still withheld below %d fuel (\"call-bound\"): once the correction\n", callBoundFuel)
 	fmt.Println("is the bulk of the sample, what remains is measurement noise, not a result.")
+	fmt.Println()
+	fmt.Println("`find` shows \"api-shape\" instead of a time ratio, and that is not a missing")
+	fmt.Println("measurement. It compares OUR LAZY API against THEIR BULK ENUMERATION: we")
+	fmt.Println("return to the host at every matching position while ra_bench_find_gated loops")
+	fmt.Println("inside wasm and returns once, so the crossing correction is an estimate that")
+	fmt.Println("grows until it swallows the sample. Read that row from `fuel x`, which has no")
+	fmt.Println("crossing term at all, or from the find_batch row below it, where both sides")
+	fmt.Println("make O(matches/buffer) crossings. The \"↳ lazy pairing\" line under it is the")
+	fmt.Println("third view: ra_find_next driven one match per call, both sides paying N")
+	fmt.Println("crossings, uncorrected — lazy API against lazy API.")
 	fmt.Printf("find(overlapping) is timed on at most %d bytes: it is the every-start-position\n", overlappingTimedCap)
 	fmt.Println("enumeration, quadratic on literal-less sets, and blocks the matrix otherwise (F4).")
 	fmt.Println()
@@ -1290,6 +1382,29 @@ func runFullMatrix(cases []setCase) {
 			switch {
 			case capped:
 				ratio = "input differs"
+			case timedRatioIsAPIShape(cap):
+				// SETS_PLAN item 22 task 1. This row compares OUR LAZY API
+				// against THEIR BULK ENUMERATION and cannot be made fair by
+				// correcting for the crossing: we return to the host once per
+				// matching position (3,659 calls on a dense 100 KB corpus)
+				// while ra_bench_find_gated loops every pattern's find_iter
+				// INSIDE wasm and returns once. The correction is an estimate
+				// that grows until it swallows the sample, which is what the
+				// "boundary" label below was already admitting on the worst of
+				// these rows.
+				//
+				// The number it produced was not an engine result and was read
+				// as one: on the 2026-08-28 board these rows were five of the
+				// eight reported losses, including a headline 0.10x, while the
+				// SAME rows are 1.15x-18.70x in our favour on fuel.
+				//
+				// The verdicts for this row come from `fuel x` beside it, which
+				// has no crossing term at all, and from the find_batch row
+				// below it, where both sides make O(matches/buffer) crossings.
+				ratio = "api-shape"
+				if note == "" {
+					note = fmt.Sprintf("lazy API vs bulk enumeration over %d call(s); read `fuel x`, or the find_batch row", calls)
+				}
 			case ourFuel > 0 && ourFuel < callBoundFuel:
 				ratio = "call-bound"
 				if note == "" {
@@ -1309,6 +1424,27 @@ func runFullMatrix(cases []setCase) {
 			}
 			fmt.Printf("  %-18s %12s %12s %7s %11s %7d %11s %11s %7s  %s\n",
 				cap, f, tf, fx, fmtDur(ours), calls, fmtDur(ourEng), fmtDur(theirs), ratio, note)
+
+			// The LAZY pairing, printed beside the bulk one because the two
+			// answer different questions (item 22 task 2). Here both sides
+			// resume per match and pay N host crossings, so neither number is
+			// crossing-corrected and the ratio is over the RAW p50s — the
+			// crossings are the term under comparison, not an artefact to
+			// subtract. This is the only row on the board where our bare
+			// `find` is compared against a like-shaped API.
+			if timedRatioIsAPIShape(cap) && !capped && ourFuel != fuelExhausted {
+				theirsLazy, theirCalls, lerr := ra.benchLazyFind(len(c.input))
+				switch {
+				case lerr != nil:
+					fmt.Printf("  %-18s %12s %12s %7s %11s %7s %11s %11s %7s  %s\n",
+						"  ↳ lazy pairing", "-", "-", "-", "-", "-", "-", "error", "-", lerr)
+				case ours > 0 && theirsLazy > 0:
+					fmt.Printf("  %-18s %12s %12s %7s %11s %7d %11s %11s %6.2fx  %s\n",
+						"  ↳ lazy pairing", "-", "-", "-", fmtDur(ours), calls, "uncorrected",
+						fmtDur(theirsLazy), float64(theirsLazy)/float64(ours),
+						fmt.Sprintf("ra_find_next, %d their call(s): both sides resume per match", theirCalls))
+				}
+			}
 		}
 	}
 }
@@ -1414,6 +1550,11 @@ func runFuelCross(cases []setCase) {
 			if ourFuel == fuelExhausted || theirFuel == fuelExhausted {
 				note = fmt.Sprintf("one side exceeded the %s budget", fmtFuel(fuelBudget))
 			}
+			// `find` COUNTS here, unlike in the timed matrix where item 22
+			// task 1 withholds its ratio as "api-shape". The distinction is
+			// the whole reason this column exists: a Go->wasmtime call
+			// executes no wasm instructions, so the crossings that make the
+			// timed row a comparison of API shapes leave this one untouched.
 			if r := ratio; strings.HasSuffix(r, "x") {
 				v := 0.0
 				fmt.Sscanf(r, "%fx", &v)
