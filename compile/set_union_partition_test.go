@@ -67,7 +67,7 @@ func TestUnionScanMidAcceptPartition(t *testing.T) {
 				Patterns: infos, PatternIDs: ids,
 				DeclaredPatternCount: len(infos), IDSpaceSize: len(infos),
 			}
-			u := buildUnionScanDFA(spec, CompileSetOptions{}, 0)
+			u := buildUnionScanDFA(spec, CompileSetOptions{}, 0, false)
 			if u == nil {
 				t.Skip("union automaton refused for this shape")
 			}

@@ -153,7 +153,12 @@ const unionTableBudget = 32 * 1024
 //   - Ids at or above maxUnionScanIDs, which bounds the per-state accept row.
 //   - A pattern that cannot be re-parsed is skipped everywhere else too, and
 //     a union missing a pattern would under-report.
-func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *unionScanDFA {
+//
+// wantAcceptRows asks for the per-state accept BITMAP ROWS even when the set
+// exports no `scan_all` — the gated find preflight reads them in its wide form
+// (SETS_PLAN item 22 fix 2a-wide). It has no effect on a narrow build, where
+// the u64 accept pair is emitted instead and the rows do not exist at all.
+func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32, wantAcceptRows bool) *unionScanDFA {
 	if len(spec.Patterns) == 0 {
 		return nil
 	}
@@ -415,9 +420,11 @@ func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32) *u
 	u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.eofReprOff, eofRepr)...)
 	u.dataSegs += 2
 
-	// The bitmap rows are `scan_all`'s alone — `scan_any` answers from the
-	// representative — so a set that does not export it pays no table for it.
-	if spec.ScanAll != "" {
+	// The bitmap rows serve `scan_all` — `scan_any` answers from the
+	// representative — and, since item 22 fix 2a-wide, the gated find
+	// preflight's wide alive walk, which ORs the same rows into its word
+	// accumulators. A set that needs neither pays no table for them.
+	if spec.ScanAll != "" || wantAcceptRows {
 		// 8-aligned: the rows are read with i64 loads, and rowBytes is a
 		// multiple of 8, so aligning the base aligns every row. Misalignment
 		// would be legal (WASM treats the align field as a hint) and slow,
@@ -1084,15 +1091,42 @@ func (cs *compiledSet) usesUnionScan(kind setCapKind) bool {
 // bits between them, and comparing against a dense mask would mean the early
 // exit never fires.
 func (cs *compiledSet) fullIDMask() uint64 {
-	var m uint64
+	return cs.fullIDMaskWords(1)[0]
+}
+
+// fullIDMaskWords is fullIDMask over an id space wider than one u64: word w
+// holds ids [64w, 64w+64), matching the bit order of the union automaton's
+// accept ROWS (buildUnionScanDFA's wideRow sets bit gid%8 of byte gid/8, which
+// an i64 load at word w reads as bit gid%64).
+//
+// Ids at or above 64*words are dropped rather than folded, exactly as
+// fullIDMask drops ids past 63: the mask's only consumer is an early exit whose
+// safe direction is to fire LATE, and an id with no bit simply keeps the walk
+// going.
+func (cs *compiledSet) fullIDMaskWords(words int) []uint64 {
+	m := make([]uint64, words)
 	for _, ids := range cs.patternIDs {
 		for _, id := range ids {
-			if id < 64 {
-				m |= 1 << uint(id)
+			if w := id / 64; id >= 0 && w < words {
+				m[w] |= 1 << uint(id%64)
 			}
 		}
 	}
 	return m
+}
+
+// preflightAliveWords is how many i64 locals the find preflight's alive mask
+// occupies — 1 for every narrow set, ceil(idSpace/64) for a wide one.
+//
+// It mirrors emitSetMatchFnFinalScalar's own choice of preflight arm: the
+// absence prefilter is capped at absenceMaxPatterns (64) ids and always answers
+// in a single word, so a set taking that path is narrow whatever its automaton
+// would have been.
+func (cs *compiledSet) preflightAliveWords() int {
+	if cs.usesAbsencePrefilter() || cs.unionScan == nil {
+		return 1
+	}
+	return cs.unionScan.maskWords
 }
 
 // emitUnionAliveMask runs the start-anywhere union automaton over [from, len)
@@ -1107,7 +1141,7 @@ func (cs *compiledSet) fullIDMask() uint64 {
 // fromIdx is the index of an i32 holding the position the walk starts at —
 // see emitLiteralAbsenceMask for why it is not the hardcoded 2 it once was.
 //
-// fullMask is the caller's fullIDMask: once every id it names is alive the
+// fullMask is the caller's fullIDMaskWords: once every id it names is alive the
 // walk can stop, because the only consumer of this mask is "which patterns are
 // DEAD" and the answer is already "none". This is what bounds the pass on
 // matching input — the walk costs at most the bytes up to the first position
@@ -1117,14 +1151,73 @@ func (cs *compiledSet) fullIDMask() uint64 {
 // A was a pass that cost the whole input and retired nothing). The test is
 // ANDed rather than compared outright because the union is built from the SPEC
 // while fullMask comes from the BUCKETS: a pattern the packer dropped has a
-// bit here and not there, and a bare == would then never fire. Pass 0 to
-// suppress the exit.
-func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fromIdx, lEnd byte, tableMemIdx int, fullMask uint64) []byte {
+// bit here and not there, and a bare == would then never fire. Pass nil, or an
+// all-zero mask, to suppress the exit.
+//
+// WIDTH (SETS_PLAN item 22 fix 2a-wide). aliveLocal is the FIRST of
+// u.maskWords consecutive i64 locals, and fullMask must be that long. The two
+// forms differ only in how the accept entry is addressed and how many
+// accumulators it lands in:
+//
+//   - narrow (maskWords == 1) reads the u64 accept tables at acceptOff/eofOff,
+//     stride 8, into one accumulator;
+//   - wide reads the accept ROWS at midWordsOff/eofWordsOff, stride rowBytes,
+//     one i64 load per word — the same rows emitUnionScanWideBody ORs into the
+//     caller's `_all` bitmap, read here into locals instead.
+//
+// Word w of the row holds ids [64w, 64w+64) because wideRow lays bits out by
+// global id, so no remapping is needed on either path: the narrow tables are
+// already remapped to global ids and the wide rows are built from them.
+//
+// The narrow arm emits byte for byte what it emitted before the width existed.
+func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fromIdx, lEnd byte, tableMemIdx int, fullMask []uint64) []byte {
 	const (
 		pInPtr = 0
 		pInLen = 1
 	)
-	b = append(b, 0x42, 0x00, 0x21, aliveLocal)
+	words := 1
+	midOff, eofOff, stride := u.acceptOff, u.eofOff, 8
+	if u.isWide() {
+		if u.midWordsOff < 0 || u.eofWordsOff < 0 {
+			panic("compile: wide union alive mask emitted without accept bitmap rows")
+		}
+		words, midOff, eofOff, stride = u.maskWords, u.midWordsOff, u.eofWordsOff, u.rowBytes
+	}
+	if len(fullMask) < words {
+		fullMask = append(append([]uint64(nil), fullMask...), make([]uint64, words-len(fullMask))...)
+	}
+	anyFull := false
+	for _, m := range fullMask[:words] {
+		if m != 0 {
+			anyFull = true
+		}
+	}
+
+	// One state's accept entry ORed into the accumulators: `alive[w] |=
+	// table[off + state*stride + 8w]`. The address constant folds the word
+	// offset in, so a wide read costs exactly what the narrow one does per word.
+	orAccepts := func(b []byte, off int32) []byte {
+		for w := 0; w < words; w++ {
+			b = append(b, 0x20, aliveLocal+byte(w))
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, off+int32(w*8))
+			b = append(b, 0x20, lState, 0x41)
+			if sh := shiftForRow(stride); sh >= 0 {
+				b = utils.AppendSLEB128(b, int32(sh))
+				b = append(b, 0x74, 0x6A) // shl; add
+			} else {
+				b = utils.AppendSLEB128(b, int32(stride))
+				b = append(b, 0x6C, 0x6A) // mul; add
+			}
+			b = appendTableLoad64(b, tableMemIdx)
+			b = append(b, 0x84, 0x21, aliveLocal+byte(w)) // i64.or
+		}
+		return b
+	}
+
+	for w := 0; w < words; w++ {
+		b = append(b, 0x42, 0x00, 0x21, aliveLocal+byte(w))
+	}
 	b = append(b, 0x20, fromIdx, 0x45)
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x41)
@@ -1156,22 +1249,33 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 			b = utils.AppendSLEB128(b, int32(u.midAcceptLimit))
 			b = append(b, 0x49, 0x04, 0x40) // i32.lt_u; if
 		}
-		b = append(b, 0x20, aliveLocal)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, u.acceptOff)
-		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
-		b = appendTableLoad64(b, tableMemIdx)
-		b = append(b, 0x84, 0x21, aliveLocal)
-		if exitDepth >= 0 && fullMask != 0 {
+		b = orAccepts(b, midOff)
+		if exitDepth >= 0 && anyFull {
 			d := exitDepth
 			if guarded {
 				d++ // the `if` above is one more level of nesting
 			}
-			b = append(b, 0x20, aliveLocal, 0x42)
-			b = utils.AppendSLEB128_64(b, int64(fullMask))
-			b = append(b, 0x83, 0x42) // i64.and
-			b = utils.AppendSLEB128_64(b, int64(fullMask))
-			b = append(b, 0x51, 0x0D, byte(d)) // i64.eq; br_if
+			// (alive[w] & full[w]) == full[w], ANDed across the words that have
+			// anything to wait for. A word whose full mask is zero is satisfied
+			// by every value, so testing it would be a compare that is always
+			// true — dropped rather than emitted, which is what keeps the narrow
+			// arm byte-identical to the single-word test it replaces.
+			first := true
+			for w := 0; w < words; w++ {
+				if fullMask[w] == 0 {
+					continue
+				}
+				b = append(b, 0x20, aliveLocal+byte(w), 0x42)
+				b = utils.AppendSLEB128_64(b, int64(fullMask[w]))
+				b = append(b, 0x83, 0x42) // i64.and
+				b = utils.AppendSLEB128_64(b, int64(fullMask[w]))
+				b = append(b, 0x51) // i64.eq
+				if !first {
+					b = append(b, 0x71) // i32.and
+				}
+				first = false
+			}
+			b = append(b, 0x0D, byte(d)) // br_if
 		}
 		if guarded {
 			b = append(b, 0x0B)
@@ -1204,12 +1308,7 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 	// the safe direction (fewer patterns retired), but the guard keeps the mask
 	// meaning what its name says rather than relying on the consumer.
 	b = append(b, 0x20, lPos, 0x20, lEnd, 0x4F, 0x04, 0x40) // if cur >= end
-	b = append(b, 0x20, aliveLocal)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, u.eofOff)
-	b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
-	b = appendTableLoad64(b, tableMemIdx)
-	b = append(b, 0x84, 0x21, aliveLocal)
+	b = orAccepts(b, eofOff)
 	b = append(b, 0x0B) // end if
 	return b
 }
@@ -1221,14 +1320,16 @@ func (cs *compiledSet) usesGatedFindPreflight() bool {
 	if cs.unionScan == nil && !cs.usesAbsencePrefilter() {
 		return false
 	}
-	// The preflight emitters read acceptOff/eofOff as [numStates] u64, which a
-	// WIDE automaton does not emit (item 21 phase 1). This is the only thing
-	// standing between a >64-id scalar set and a preflight reading the
-	// transition table as accept masks — and the failure would be silent in
-	// the worst direction: a pattern wrongly declared dead stops reporting
-	// matches. gatedPreflightShape's id-space test is the structural twin of
-	// this, applied before the automaton exists.
-	if cs.unionScan.isWide() {
+	// A WIDE automaton emits no acceptOff/eofOff u64 pair (item 21 phase 1), so
+	// what it must have instead is the per-state accept ROWS the wide alive walk
+	// reads (item 22 fix 2a-wide). Requiring them by their offsets rather than
+	// by re-deriving who asked for them is the point: the rows are emitted for
+	// `scan_all` OR at the gated preflight's own request, and if that request
+	// never reached buildUnionScanDFA — a refusal it makes for reasons no
+	// predicate here can reproduce — this must come back false. Reading a table
+	// that was not emitted would be silent in the worst direction: a pattern
+	// wrongly declared dead stops reporting matches.
+	if cs.unionScan.isWide() && (cs.unionScan.midWordsOff < 0 || cs.unionScan.eofWordsOff < 0) {
 		return false
 	}
 	return cs.gatedPreflightShape()
@@ -1257,11 +1358,17 @@ func (cs *compiledSet) gatedPreflightShape() bool {
 	if cs.fe != frontendScalar {
 		return false
 	}
-	// Ids past 63 have no bit in the i64 alive mask, so they can never be
-	// retired — and if ids[0] is one of them the one-slot freshness guard
-	// never disarms. Both are the wide-automaton case, refused here in the
-	// form that is answerable without the automaton.
-	if cs.idSpaceSize() > 64 || cs.numPatterns() > 64 {
+	// The alive mask is ceil(idSpace/64) i64 locals (item 22 fix 2a-wide), so
+	// what bounds it here is the automaton's own id ceiling rather than one
+	// word. Above maxUnionScanIDs no union is built at all, and an id with no
+	// bit in the mask could never be retired.
+	//
+	// This used to be a flat `> 64` refusal, and it is what kept classchain-128
+	// on the per-position walk for a whole no-match drive: the same verdict the
+	// preflight computes in one pass was simply unrepresentable. The OVERLAPPING
+	// twin below still refuses at 64 — its one-slot freshness guard reads
+	// ids[0]'s gate, so every id must fit the word that guard is written for.
+	if cs.idSpaceSize() > maxUnionScanIDs || cs.numPatterns() > maxUnionScanIDs {
 		return false
 	}
 	// Sparse buckets are NOT excluded, unlike the overlapping twin: that one
@@ -1407,6 +1514,16 @@ func emitFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGat
 	if len(ids) == 0 {
 		return b
 	}
+	// aliveLocal is the first of this many consecutive i64 locals; word w holds
+	// ids [64w, 64w+64). The overlapping body is narrow by its own eligibility
+	// (overlapPreflightShape refuses an id space over 64), and the absence
+	// prefilter is narrow by absenceMaxPatterns — asserted rather than assumed,
+	// because a silent width mismatch here reads a local that belongs to
+	// something else.
+	words := cs.preflightAliveWords()
+	if words > 1 && (cs.overlapping || absence) {
+		panic("compile: wide find preflight emitted for a narrow-only path")
+	}
 	// Run only on a fresh drive. See the header for why the two bodies answer
 	// that question differently — the gated one MUST NOT use the gate array,
 	// because the marker that would make one slot answer for all of them is
@@ -1425,21 +1542,23 @@ func emitFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGat
 		// automaton — same over-approximating contract, ~15x cheaper.
 		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal, fromIdx)
 	} else {
-		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, fromIdx, lEnd, tableMemIdx, cs.fullIDMask())
+		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, fromIdx, lEnd, tableMemIdx, cs.fullIDMaskWords(words))
 	}
 
 	for _, gid := range ids {
-		if gid >= 64 {
-			// Outside the i64 mask: leave the gate at 0 so the pattern is
+		if gid >= 64*words {
+			// Outside the alive mask: leave the gate at 0 so the pattern is
 			// never retired. It also leaves an overlapping drive's one-slot
-			// guard armed if ids[0] is itself that wide, which is why both
-			// eligibility predicates refuse an id space over 64 rather than
-			// relying on this loop.
+			// guard armed if ids[0] is itself that wide, which is why that
+			// eligibility predicate refuses an id space over 64 rather than
+			// relying on this loop. Unreachable for the gated body, whose mask
+			// is sized from the same id space this loop walks, and kept as the
+			// fail-safe direction if the two ever disagree.
 			continue
 		}
-		b = append(b, 0x20, aliveLocal)
+		b = append(b, 0x20, aliveLocal+byte(gid/64))
 		b = append(b, 0x42)
-		b = utils.AppendSLEB128_64(b, int64(gid))
+		b = utils.AppendSLEB128_64(b, int64(gid%64))
 		b = append(b, 0x88)
 		b = append(b, 0x42, 0x01, 0x83)
 		b = append(b, 0x50) // i64.eqz -> not alive

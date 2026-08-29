@@ -105,17 +105,17 @@ func TestUnionAliveMaskEmits(t *testing.T) {
 		DeclaredPatternCount: len(patterns), IDSpaceSize: len(patterns),
 		Patterns: patterns, PatternIDs: ids,
 	}
-	u := buildUnionScanDFA(spec, CompileSetOptions{}, 0)
+	u := buildUnionScanDFA(spec, CompileSetOptions{}, 0, false)
 	if u == nil {
 		t.Skip("no union automaton for this set: nothing to emit")
 	}
-	body := emitUnionAliveMask(nil, u, 8, 9, 10, 2, 11, 0, 0)
+	body := emitUnionAliveMask(nil, u, 8, 9, 10, 2, 11, 0, nil)
 	if len(body) == 0 {
 		t.Fatal("emitted an empty alive-mask sequence")
 	}
 	// fullMask != 0 arms the early exit (item 22 fix 2a prerequisite 2), which
 	// is a different emitted shape and the one every real caller gets.
-	withExit := emitUnionAliveMask(nil, u, 8, 9, 10, 2, 11, 0, 0x7)
+	withExit := emitUnionAliveMask(nil, u, 8, 9, 10, 2, 11, 0, []uint64{0x7})
 	if len(withExit) <= len(body) {
 		t.Fatalf("the fullMask early exit emitted no extra bytes: %d vs %d", len(withExit), len(body))
 	}

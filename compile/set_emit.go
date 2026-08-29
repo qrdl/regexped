@@ -662,7 +662,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// Building it twice costs compile time only, and CLAUDE.md's second
 	// design principle spends compile time freely to avoid runtime cost.
 	overlapPreflight := overlapCanPreflight(spec, buckets) &&
-		((absOK && len(absLits) > 0) || buildUnionScanDFA(spec, opts, 0) != nil)
+		((absOK && len(absLits) > 0) || buildUnionScanDFA(spec, opts, 0, false) != nil)
 	needLiveness := (spec.gated() || overlapPreflight) && fe == frontendScalar
 	if needLiveness {
 		anyNeverDying, anyBoundary := false, false
@@ -1230,7 +1230,12 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	needUnionForGated := cs.gatedPreflightShape() && !cs.usesAbsencePrefilter()
 	if fe == frontendScalar && (spec.ScanAll != "" || spec.ScanAny != "" || needUnionForOverlap || needUnionForGated) {
 		unionBase := setTablesEnd
-		cs.unionScan = buildUnionScanDFA(spec, opts, unionBase)
+		// needUnionForGated also asks for the per-state accept ROWS, which a
+		// WIDE automaton emits only on request and the wide alive walk reads in
+		// place of the u64 pair it has no room for (item 22 fix 2a-wide). On a
+		// narrow build the flag changes nothing: that arm emits the u64 pair and
+		// returns before the rows exist at all.
+		cs.unionScan = buildUnionScanDFA(spec, opts, unionBase, needUnionForGated)
 		if cs.unionScan != nil && cs.unionScan.tableEnd > setTablesEnd {
 			setTablesEnd = cs.unionScan.tableEnd
 		}
@@ -1260,7 +1265,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		!hasBTBucketIn(buckets) {
 		p2Base := setTablesEnd
 		sub := fallbackSubSpec(spec, buckets)
-		cs.phase2Union = buildUnionScanDFA(sub, opts, p2Base)
+		// No accept rows on request: phase 2 serves the scan pair only, and
+		// `find` — the preflight's capability — is excluded from the split.
+		cs.phase2Union = buildUnionScanDFA(sub, opts, p2Base, false)
 		if cs.phase2Union != nil && cs.phase2Union.tableEnd > setTablesEnd {
 			setTablesEnd = cs.phase2Union.tableEnd
 		}
@@ -2163,13 +2170,26 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// `pInPtr + len` bound. It exists because that walk's cursor is an
 	// absolute input pointer rather than an offset (see emitUnionTransition),
 	// which is what takes three instructions per byte down to one.
+
+	// The alive mask is one i64 per 64 ids (item 22 fix 2a-wide), so the i64
+	// group grows with the set's id space. Every other local keeps its index:
+	// the extra words are appended AFTER the mask's first word, which is the
+	// last local of the narrow preflight arm.
+	aliveWords := 1
+	if findPreflight {
+		aliveWords = cs.preflightAliveWords()
+	}
 	var b []byte
 	if absence {
 		// 13 i32 (pos, search mask, simd mask, allElig, end), 2 i64 (acc, alive), 1 v128.
+		// Always one alive word: the absence prefilter is capped at 64 ids.
 		b = append(b, 0x03, 0x0D, 0x7F, 0x02, 0x7E, 0x01, 0x7B)
 	} else if findPreflight {
-		// 8 i32 + the union walk's state/pos + allElig + end, then i64 acc + i64 alive.
-		b = append(b, 0x02, 0x0C, 0x7F, 0x02, 0x7E)
+		// 8 i32 + the union walk's state/pos + allElig + end, then i64 acc + the
+		// alive mask's words.
+		b = append(b, 0x02, 0x0C, 0x7F)
+		b = utils.AppendULEB128(b, uint32(1+aliveWords))
+		b = append(b, 0x7E)
 	} else {
 		// locals: 9 x i32, then the scan_all i64 accumulator.
 		b = append(b, 0x02, 0x09, 0x7F, 0x01, 0x7E)

@@ -489,7 +489,7 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 			Patterns: infos, PatternIDs: globalIDs,
 			DeclaredPatternCount: len(infos), IDSpaceSize: len(infos),
 		}
-		return buildUnionScanDFA(spec, CompileSetOptions{}, 0)
+		return buildUnionScanDFA(spec, CompileSetOptions{}, 0, false)
 	}
 
 	// A start-anywhere determinisation is `.*`-prefixed, so it is bigger than
@@ -546,7 +546,7 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 		Patterns: []*PatternInfo{broken}, PatternIDs: []int{0},
 		DeclaredPatternCount: 1, IDSpaceSize: 1,
 	}
-	if got := buildUnionScanDFA(unparseable, CompileSetOptions{}, 0); got != nil {
+	if got := buildUnionScanDFA(unparseable, CompileSetOptions{}, 0, false); got != nil {
 		t.Error("a pattern whose AST could not be recovered was admitted to the union automaton")
 	}
 }

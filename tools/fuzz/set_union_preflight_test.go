@@ -3,6 +3,7 @@ package fuzz
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/qrdl/regexped/compile"
@@ -44,7 +45,17 @@ import (
 // compileUnionPreflightSet compiles pats with the gated `find` AND the scan
 // pair, which is the combination that makes the union automaton exist for the
 // preflight to walk.
+//
+// wide selects which representation the automaton must have come out in, and it
+// is an assertion rather than a request: the two are entirely different readers
+// of the accept tables (a u64 pair against per-state bitmap rows), so a test
+// that silently got the other one would be exercising code it is not named
+// after. Which one a set lands in is decided by its id space alone.
 func compileUnionPreflightSet(t *testing.T, pats []string) []byte {
+	return compileUnionPreflightSetWidth(t, pats, false)
+}
+
+func compileUnionPreflightSetWidth(t *testing.T, pats []string, wide bool) []byte {
 	t.Helper()
 	entries := make([]config.RegexEntry, len(pats))
 	names := make([]string, len(pats))
@@ -64,15 +75,18 @@ func compileUnionPreflightSet(t *testing.T, pats []string) []byte {
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}
-	// The union automaton must have been BUILT and must be the narrow form —
-	// the preflight emitters read u64 accept tables, and a wide automaton
-	// emits none. Without this the test could pass by never reaching the code
-	// it is named after.
+	// The union automaton must have been BUILT and must be in the form this
+	// test set out to drive. Without this the test could pass by never reaching
+	// the code it is named after.
 	if len(diags) != 1 || diags[0].UnionScan == nil || !diags[0].UnionScan.Used {
 		t.Fatalf("no union automaton for %v: %+v", pats, diags)
 	}
-	if diags[0].UnionScan.Wide {
-		t.Fatalf("union automaton is WIDE for %v; the preflight cannot use it", pats)
+	if got := diags[0].UnionScan.Wide; got != wide {
+		t.Fatalf("union automaton wide=%v for %d patterns, want wide=%v", got, len(pats), wide)
+	}
+	if wide && diags[0].UnionScan.MaskWords < 2 {
+		t.Fatalf("wide union reports %d mask words; the walk would use one accumulator",
+			diags[0].UnionScan.MaskWords)
 	}
 	return w
 }
@@ -258,6 +272,197 @@ func TestUnionAliveMaskPreflightResumes(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
+// The WIDE alive walk (SETS_PLAN item 22 fix 2a-wide).
+//
+// Above 64 ids the union automaton emits no u64 accept pair at all, so the
+// preflight was refused outright and the set kept the per-position walk for the
+// whole drive — the closing board's 0.20x row. The walk now reads the same
+// per-state accept ROWS `scan_all` does, one i64 load per 64 ids, into that many
+// accumulator locals.
+//
+// Three things can go wrong that the narrow suite cannot see, and all are
+// silent in the direction that loses matches. All three were confirmed CAUGHT
+// by mutating the emitter, which is the only evidence worth having here:
+//
+//   - the WORD index in the write-back. `alive[gid/64]` read as `alive[0]`
+//     cross-links two patterns 64 apart, so one is retired on the other's
+//     evidence.
+//   - the ROW word offset in the walk. Every accumulator ORing the SAME word of
+//     the accept row leaves word 1 holding word 0's bits.
+//   - the early exit's coverage. Testing only word 0 lets the walk stop while
+//     patterns in word 1 have not yet shown alive, and they are then retired.
+//
+// The BIT index is NOT on that list, and the reason is worth recording so it is
+// not "fixed" back into a hazard: shifting by the global id rather than by
+// `gid % 64` is the same instruction, because WASM takes an `i64.shr_u` count
+// modulo 64. That mutation survives the whole suite. `gid % 64` is written out
+// anyway, since a reader should not have to know that rule to see the code is
+// right.
+//
+// `[0-9]{k}` for k = 1..N is the shape that catches the three: under a run of m
+// digits, patterns 1..m match and m+1..N match nowhere, so sweeping m across the
+// 63/64 boundary puts the alive/dead frontier on either side of the word edge
+// and on it.
+
+// digitRunWideSet is N patterns whose aliveness a single digit run decides,
+// plus a nullable member at a wide id. Literal-less throughout, so G12's
+// absence prefilter declines and the union walk is what computes the verdict —
+// which it must, since that prefilter is capped at 64 ids and could not serve
+// this set anyway.
+func digitRunWideSet(n int) []string {
+	pats := make([]string, n)
+	for i := range pats {
+		pats[i] = fmt.Sprintf(`[0-9]{%d}`, i+1)
+	}
+	// A nullable pattern above the word edge. Fix 2a's refused first draft
+	// marked ALIVE patterns with gate 1, which emitWriteMatchK's empty-extent
+	// rule reads as "no empty match at 0"; this is that trap at a wide id.
+	pats[n-1] = `[a-c]*`
+	return pats
+}
+
+func TestWideUnionAliveMaskPreflightMatchesGo(t *testing.T) {
+	const n = 70
+	pats := digitRunWideSet(n)
+	w := compileUnionPreflightSetWidth(t, pats, true)
+
+	inputs := []string{
+		"",
+		"5",
+		"abc",
+		// Runs that put the alive/dead frontier just below, on, and just above
+		// the 63/64 word edge. Pattern k is alive iff the run is at least k+1
+		// long, so these decide ids 61..66 one at a time.
+		strings.Repeat("7", 62),
+		strings.Repeat("7", 63),
+		strings.Repeat("7", 64),
+		strings.Repeat("7", 65),
+		strings.Repeat("7", 66),
+		// Every pattern alive: the fullMask early exit must fire on the LAST
+		// word too, not on the first one alone.
+		strings.Repeat("7", n+4),
+		// Digits present but never enough for the wide ids — the case the
+		// preflight exists to retire, with survivors in word 0 only.
+		"12 34 56 78",
+		"a1b22c333d",
+		strings.Repeat("9", 40) + "x" + strings.Repeat("9", 30),
+	}
+	for _, input := range inputs {
+		t.Run(fmt.Sprintf("len=%d", len(input)), func(t *testing.T) {
+			var want []setMatch
+			for k, p := range pats {
+				for _, x := range regexp.MustCompile(p).FindAllStringIndex(input, -1) {
+					want = append(want, setMatch{PatternID: k, Start: x[0], End: x[1]})
+				}
+			}
+			got := runUnionPreflightFind(t, w, pats, input, 0)
+			sortMatches(want)
+			sortMatches(got)
+			if len(want) != len(got) {
+				t.Fatalf("%q: want %d matches, got %d", input, len(want), len(got))
+			}
+			for i := range want {
+				if want[i] != got[i] {
+					t.Fatalf("%q: match %d = %+v, want %+v", input, i, got[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestWideUnionAliveMaskPreflightResumes is the wide twin of the narrow resume
+// test: the verdict is computed once, over [from, len) of the first call, and
+// stays sound only because it over-approximates as `from` advances.
+func TestWideUnionAliveMaskPreflightResumes(t *testing.T) {
+	const n = 66
+	pats := digitRunWideSet(n)
+	w := compileUnionPreflightSetWidth(t, pats, true)
+	for _, input := range []string{
+		"ab" + strings.Repeat("3", 64) + "cd",
+		strings.Repeat("1", 65),
+		"12a345b",
+	} {
+		for from := 0; from <= len(input); from += 7 {
+			t.Run(fmt.Sprintf("len=%d/from=%d", len(input), from), func(t *testing.T) {
+				var want []setMatch
+				for k, p := range pats {
+					for _, x := range regexp.MustCompile(p).FindAllStringIndex(input[from:], -1) {
+						want = append(want, setMatch{
+							PatternID: k, Start: x[0] + from, End: x[1] + from})
+					}
+				}
+				got := runUnionPreflightFind(t, w, pats, input, int32(from))
+				sortMatches(want)
+				sortMatches(got)
+				if len(want) != len(got) {
+					t.Fatalf("%q from %d: want %d, got %d", input, from, len(want), len(got))
+				}
+				for i := range want {
+					if want[i] != got[i] {
+						t.Fatalf("%q from %d: match %d = %+v, want %+v",
+							input, from, i, got[i], want[i])
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestWideUnionPreflightFindOnly pins the OTHER half of the fix: a wide set
+// exporting `find` and nothing else.
+//
+// Such a set asks for no scan capability, so before this change no union
+// automaton was built for it at all and the accept rows — emitted only for
+// `scan_all` — did not exist either. Both are now requested by the preflight
+// itself. A regression that restores either condition leaves this set silently
+// on the per-position walk, which is slower but still CORRECT, so the assertion
+// that the automaton was built is the load-bearing half of this test and the
+// answer check is the guard on it.
+func TestWideUnionPreflightFindOnly(t *testing.T) {
+	const n = 70
+	pats := digitRunWideSet(n)
+	entries := make([]config.RegexEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+	}
+	sets := []config.SetConfig{{
+		Name: "s", Find: "gated_find", Patterns: config.PatternSelector{Names: names},
+	}}
+	w, _, diags, err := compile.CompileFileDiag(
+		config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if len(diags) != 1 || diags[0].UnionScan == nil || !diags[0].UnionScan.Used {
+		t.Fatalf("a find-only wide set got no union automaton, so its preflight is dormant: %+v", diags)
+	}
+	if !diags[0].UnionScan.Wide {
+		t.Fatalf("union automaton is narrow for %d patterns", len(pats))
+	}
+	for _, input := range []string{"", "abc", strings.Repeat("4", 65), "12 345"} {
+		var want []setMatch
+		for k, p := range pats {
+			for _, x := range regexp.MustCompile(p).FindAllStringIndex(input, -1) {
+				want = append(want, setMatch{PatternID: k, Start: x[0], End: x[1]})
+			}
+		}
+		got := runUnionPreflightFind(t, w, pats, input, 0)
+		sortMatches(want)
+		sortMatches(got)
+		if len(want) != len(got) {
+			t.Fatalf("%q: want %d matches, got %d", input, len(want), len(got))
+		}
+		for i := range want {
+			if want[i] != got[i] {
+				t.Fatalf("%q: match %d = %+v, want %+v", input, i, got[i], want[i])
+			}
 		}
 	}
 }
