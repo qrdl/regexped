@@ -2052,7 +2052,7 @@ func TestBinPacking_FirstFitDecreasing(t *testing.T) {
 	}
 }
 
-func runConflictTest(t *testing.T, fixtureName string) ([]*bucket, *SetDiag) {
+func runConflictTest(t *testing.T, fixtureName string) *SetDiag {
 	t.Helper()
 	fix := testdataFixture(t, fixtureName)
 	patterns := fix.patternInfos(t)
@@ -2073,7 +2073,7 @@ func runConflictTest(t *testing.T, fixtureName string) ([]*bucket, *SetDiag) {
 			t.Errorf("fixture %s: got %d fallback buckets, want %d", fixtureName, fb, fix.Expect.FallbackCount)
 		}
 	}
-	return buckets, diag
+	return diag
 }
 
 func TestEquivalence_Conflict001(t *testing.T) { runConflictTest(t, "conflict_001") }
@@ -2087,7 +2087,7 @@ func TestEquivalence_Conflict008(t *testing.T) { runConflictTest(t, "conflict_00
 
 func TestFallback_NoLiteral(t *testing.T) {
 	// conflict_005 patterns have no mandatory literal → all in fallback buckets.
-	_, diag := runConflictTest(t, "conflict_005")
+	diag := runConflictTest(t, "conflict_005")
 	if len(diag.Buckets) == 0 {
 		t.Fatal("no BucketDiag entries")
 	}

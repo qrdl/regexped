@@ -489,7 +489,7 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 			Patterns: infos, PatternIDs: globalIDs,
 			DeclaredPatternCount: len(infos), IDSpaceSize: len(infos),
 		}
-		return buildUnionScanDFA(spec, CompileSetOptions{}, 0, false)
+		return buildUnionScanDFA(spec, 0, false)
 	}
 
 	// A start-anywhere determinisation is `.*`-prefixed, so it is bigger than
@@ -546,7 +546,7 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 		Patterns: []*PatternInfo{broken}, PatternIDs: []int{0},
 		DeclaredPatternCount: 1, IDSpaceSize: 1,
 	}
-	if got := buildUnionScanDFA(unparseable, CompileSetOptions{}, 0, false); got != nil {
+	if got := buildUnionScanDFA(unparseable, 0, false); got != nil {
 		t.Error("a pattern whose AST could not be recovered was admitted to the union automaton")
 	}
 }
@@ -923,7 +923,7 @@ func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
 			t.Errorf("panic message %q does not say what was wrong", message)
 		}
 	}()
-	buildSetBTSuffixBody(info, regions, 0, 0, 0, true, true, 0)
+	buildSetBTSuffixBody(regions, 0, 0, 0, true, true, 0)
 }
 
 // TestSetEmitBTProbeBodyAnchored emits a Backtracking bucket's probe in its

@@ -360,7 +360,12 @@ func findMagicInDataSection(data []byte) (int64, error) {
 				return 0, err
 			}
 			off += n
-			if int(size) >= len(ReservationMagic) {
+			// The DECLARED size is not evidence the bytes are there: a
+			// truncated file can promise a payload it does not carry, and
+			// indexing data[off+j] on that promise panics. Both bounds are
+			// needed — the declared size decides whether the magic COULD be
+			// present, the real remainder decides whether it can be read.
+			if int(size) >= len(ReservationMagic) && off+len(ReservationMagic) <= len(data) {
 				match := true
 				for j, b := range ReservationMagic {
 					if data[off+j] != b {
@@ -408,7 +413,12 @@ func findMagicInDataSection(data []byte) (int64, error) {
 				return 0, err
 			}
 			off += n
-			if int(size) >= len(ReservationMagic) {
+			// The DECLARED size is not evidence the bytes are there: a
+			// truncated file can promise a payload it does not carry, and
+			// indexing data[off+j] on that promise panics. Both bounds are
+			// needed — the declared size decides whether the magic COULD be
+			// present, the real remainder decides whether it can be read.
+			if int(size) >= len(ReservationMagic) && off+len(ReservationMagic) <= len(data) {
 				match := true
 				for j, b := range ReservationMagic {
 					if data[off+j] != b {

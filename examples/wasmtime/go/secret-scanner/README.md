@@ -1,7 +1,7 @@
 # wasmtime/go/secret-scanner — multi-pattern secret detection
 
 A Go (wasip1) program that scans text for 10 known secret patterns using
-**set composition**. One `ScanSecrets()` call checks all patterns simultaneously
+**set composition**. One `scan_secrets()` call checks all patterns simultaneously
 and returns all matches with their pattern name and position.
 
 ## Patterns detected
@@ -44,15 +44,23 @@ regexped merge      →  merge app + patterns into final.wasm
 
 ## How it works
 
-`stub.go` is auto-generated and exposes `ScanSecrets([]byte) iter.Seq[SetMatch]`
-and `PatternName(int) string`. `main.go` is ~20 lines:
+`stub.go` is auto-generated. The scan function keeps the config's name
+VERBATIM — `find: scan_secrets` in `regexped.yaml` yields `func scan_secrets`,
+not `ScanSecrets`; the PascalCase transform was retired (TODO task 62). Symbols
+with no user-supplied name, like `PatternName`, keep Go's convention.
+
+`main.go` is ~20 lines:
 
 ```go
-for m := range ScanSecrets(input) {
+scanIter := scan_secrets(input, 0)
+for m := range scanIter.Matches() {
     fmt.Printf("[%s] at %d..%d: %s\n",
         PatternName(m.PatternID), m.Start, m.End,
         string(input[m.Start:m.End]))
 }
+// Err() after the loop: an engine that gave up ends iteration the same way
+// exhausting the input does, so the two are only distinguishable here.
+if err := scanIter.Err(); err != nil { /* handle */ }
 ```
 
 No WASM memory management, no manual tuple decoding, no batch loop.

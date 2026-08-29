@@ -662,7 +662,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// Building it twice costs compile time only, and CLAUDE.md's second
 	// design principle spends compile time freely to avoid runtime cost.
 	overlapPreflight := overlapCanPreflight(spec, buckets) &&
-		((absOK && len(absLits) > 0) || buildUnionScanDFA(spec, opts, 0, false) != nil)
+		((absOK && len(absLits) > 0) || buildUnionScanDFA(spec, 0, false) != nil)
 	needLiveness := (spec.gated() || overlapPreflight) && fe == frontendScalar
 	if needLiveness {
 		anyNeverDying, anyBoundary := false, false
@@ -1152,7 +1152,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		abuckets, _ := compileAnchoredBuckets(spec.Patterns, opts, diag)
 		var au *anchoredUnion
 		if anchoredUnionBeatsBuckets(abuckets) {
-			au = buildAnchoredUnionDFA(spec, opts, anchoredTableBase, spec.MatchAll != "")
+			au = buildAnchoredUnionDFA(spec, anchoredTableBase, spec.MatchAll != "")
 		}
 		if au != nil {
 			cs.anchoredUnion = au
@@ -1235,7 +1235,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// place of the u64 pair it has no room for (item 22 fix 2a-wide). On a
 		// narrow build the flag changes nothing: that arm emits the u64 pair and
 		// returns before the rows exist at all.
-		cs.unionScan = buildUnionScanDFA(spec, opts, unionBase, needUnionForGated)
+		cs.unionScan = buildUnionScanDFA(spec, unionBase, needUnionForGated)
 		if cs.unionScan != nil && cs.unionScan.tableEnd > setTablesEnd {
 			setTablesEnd = cs.unionScan.tableEnd
 		}
@@ -1267,7 +1267,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		sub := fallbackSubSpec(spec, buckets)
 		// No accept rows on request: phase 2 serves the scan pair only, and
 		// `find` — the preflight's capability — is excluded from the split.
-		cs.phase2Union = buildUnionScanDFA(sub, opts, p2Base, false)
+		cs.phase2Union = buildUnionScanDFA(sub, p2Base, false)
 		if cs.phase2Union != nil && cs.phase2Union.tableEnd > setTablesEnd {
 			setTablesEnd = cs.phase2Union.tableEnd
 		}
@@ -1323,7 +1323,6 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		cs.startableDataBytes = append(cs.startableDataBytes,
 			appendDataSegment(nil, setTablesEnd, make([]byte, n))...)
 		cs.startableDataSegs++
-		setTablesEnd += n
 	}
 
 	// §9.4 first-position routing data, derived from the finished bucket list.
@@ -1814,7 +1813,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+p.findWrapperOffset()))
 		}
-		gFromOff, _ := p.groupsFromWrapperOffsets()
+		gFromOff := p.groupsFromWrapperOffsets()
 		if p.hasGroupsFromWrapper() {
 			// The (ptr, len, out_ptr, from) wrapper — see find_from.go.
 			es = appendString(es, p.groupsExport)
@@ -1876,7 +1875,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winScratchOff
 				}
-				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.findFromMode)
+				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff)
 			}
 		}
 		if p.batchFindExport != "" {

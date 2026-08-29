@@ -19,7 +19,18 @@ import (
 // because the guard it checks is easy to drop again: three places (funcCount,
 // the layout, the export/code sections) all have to agree that the wrapper is
 // absent, and disagreeing produces a module that only fails at load.
+// The guard is not optional politeness. Without it, `exec.Command` fails with
+// "executable file not found in $PATH", CombinedOutput returns EMPTY, and every
+// case reports `INVALID: ` with nothing after the colon — a module the compiler
+// never got wrong, condemned by a missing validator. That is exactly how this
+// read in GitHub Actions, where wasm-tools is not preinstalled: ten identical
+// failures including plain `(a)`. The same guard is in compile_test.go and
+// tools/fuzz/set_sparse_caps_test.go, and this was the one place in compile/
+// that shelled out without it.
 func TestGroupsWrapperValidWithoutCaptureBody(t *testing.T) {
+	if _, err := exec.LookPath("wasm-tools"); err != nil {
+		t.Skip("wasm-tools not in PATH: cannot validate the emitted modules")
+	}
 	for _, pat := range []string{`(?:(a){0})`, `(a){0}`, `(a)`, `\A(a)(b)`, `\b(?P<x>a)`} {
 		for _, entry := range []config.RegexEntry{
 			{Pattern: pat, GroupsFunc: "groups"},
@@ -36,7 +47,11 @@ func TestGroupsWrapperValidWithoutCaptureBody(t *testing.T) {
 			}
 			out, vErr := exec.Command("wasm-tools", "validate", "--features", "all", f).CombinedOutput()
 			if vErr != nil {
-				t.Errorf("%-12q INVALID: %s", pat, out)
+				// vErr as well as out: a validation failure puts its
+				// diagnostic in out, but a failure to RUN the validator
+				// leaves out empty and says everything in vErr. Reporting
+				// only out is what made the CI failure unreadable.
+				t.Errorf("%-12q INVALID: %v\n%s", pat, vErr, out)
 			}
 		}
 	}

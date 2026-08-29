@@ -105,7 +105,7 @@ func TestUnionAliveMaskEmits(t *testing.T) {
 		DeclaredPatternCount: len(patterns), IDSpaceSize: len(patterns),
 		Patterns: patterns, PatternIDs: ids,
 	}
-	u := buildUnionScanDFA(spec, CompileSetOptions{}, 0, false)
+	u := buildUnionScanDFA(spec, 0, false)
 	if u == nil {
 		t.Skip("no union automaton for this set: nothing to emit")
 	}

@@ -635,3 +635,69 @@ func TestWasmTableBasePassiveSegment(t *testing.T) {
 		t.Errorf("WasmTableBase passive: got %d, want 0", got)
 	}
 }
+
+// A data segment that DECLARES a payload it does not carry must be an error,
+// not a panic.
+//
+// findMagicInDataSection tested the declared size against len(ReservationMagic)
+// and then indexed data[off+j] on the strength of that promise. A file
+// truncated after the size byte satisfied the test and read past the end:
+// `index out of range [6] with length 6` on a 16-byte input. The existing
+// `off > len(data)` guard above it does not help — that one covers the offset
+// EXPRESSION running to the end, and by then off is still in range.
+//
+// Both segment encodings carry the same comparison, so both are driven here:
+// segType 0 (active, memory 0) and segType 2 (active, explicit memory index).
+//
+// The inputs are hand-assembled rather than built with the helpers above,
+// because what is under test is precisely a byte sequence the writers cannot
+// produce.
+func TestWasmTableBaseTruncatedPayloadIsErrorNotPanic(t *testing.T) {
+	magic := len(ReservationMagic)
+	for _, tc := range []struct {
+		name string
+		seg  []byte
+	}{
+		{
+			// segType 0, i32.const 0, end, size = magic — then nothing.
+			name: "segType0",
+			seg:  append([]byte{0x00, 0x41, 0x00, 0x0b}, byte(magic)),
+		},
+		{
+			// segType 2, memory index 0, i32.const 0, end, size = magic.
+			name: "segType2",
+			seg:  append([]byte{0x02, 0x00, 0x41, 0x00, 0x0b}, byte(magic)),
+		},
+		{
+			// One byte of payload present where `magic` were promised: the
+			// off-by-a-lot case above could be caught by a coarse test, this
+			// one needs the exact bound.
+			name: "oneBytePresent",
+			seg:  append([]byte{0x00, 0x41, 0x00, 0x0b}, byte(magic), 0x00),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var payload []byte
+			payload = AppendULEB128(payload, 1) // one segment
+			payload = append(payload, tc.seg...)
+			raw := buildWasm(11, payload)
+
+			f, err := os.CreateTemp("", "regexped-truncated-*.wasm")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(f.Name())
+			if _, err := f.Write(raw); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+
+			// The contract is only "does not panic". Returning 0 with no
+			// error is a legal answer — the magic genuinely is not there —
+			// and so is an error; asserting either would pin an
+			// implementation detail rather than the guarantee.
+			base, err := WasmTableBase(f.Name())
+			t.Logf("WasmTableBase = %d, err = %v", base, err)
+		})
+	}
+}

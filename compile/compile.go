@@ -598,12 +598,16 @@ func (p *compiledPattern) hasGroupsFromWrapper() bool {
 	return p.groupsExport != "" && p.captureBody != nil
 }
 
-// groupsFromWrapperOffsets returns the sub-indices of the exported
-// (ptr, len, out_ptr, from) wrappers for groups and named groups, or -1 when
-// the corresponding export is absent. They are laid out last, after the find
-// wrapper, so adding them moved no existing sub-index.
-func (p *compiledPattern) groupsFromWrapperOffsets() (groupsOff, namedOff int) {
-	groupsOff, namedOff = -1, -1
+// groupsFromWrapperOffsets returns the sub-index of the exported
+// (ptr, len, out_ptr, from) groups wrapper, or -1 when that export is absent.
+// It is laid out last, after the find wrapper, so adding it moved no existing
+// sub-index.
+//
+// It once returned a second offset for a separate named-groups wrapper. TODO
+// task 62 retired named_groups_func — both stubs always called the SAME
+// export — so there is one wrapper and one offset.
+func (p *compiledPattern) groupsFromWrapperOffsets() (groupsOff int) {
+	groupsOff = -1
 	idx := p.findWrapperOffset()
 	if idx < 0 {
 		// No find function: start from the end of everything else.
@@ -1039,7 +1043,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// full input consumption, which also makes greedy and non-greedy
 		// equivalent), so a match-only compile keeps the fast path.
 		if lcp, ok := analyseLitChainRange(re.Pattern, litChainMinCount); ok &&
-			!(needFind && (lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone)) {
+			(!needFind || !lcp.hasAnchor()) {
 			// Greedy and non-greedy paths split by function:
 			//   anchored match: greedy/non-greedy same → range match body
 			//   find/groups greedy: range find/groups body
@@ -2082,7 +2086,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+p.findWrapperOffset()))
 		}
-		gFromOff, _ := p.groupsFromWrapperOffsets()
+		gFromOff := p.groupsFromWrapperOffsets()
 		if p.hasGroupsFromWrapper() {
 			// The (ptr, len, out_ptr, from) wrapper, not the body it fronts.
 			es = appendString(es, p.groupsExport)
@@ -2158,7 +2162,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !p.isTDFA {
 					winOff = p.winScratchOff
 				}
-				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.findFromMode)
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff)
 			}
 		}
 		// LNM non-mid bulk-skip helper body append was here —
@@ -2570,7 +2574,7 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 // \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already
 // relative to ptr.md B13, and
 // buildBacktrackBody in engine_backtrack.go.
-func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32, mode findFromMode) []byte {
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
 	var b []byte
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F) // 3 × i32
@@ -2671,8 +2675,8 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 }
 
 // appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
-func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32, mode findFromMode) []byte {
-	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winScratchOff, mode)
+func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
+	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winScratchOff)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

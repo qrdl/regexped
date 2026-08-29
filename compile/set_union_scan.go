@@ -158,7 +158,7 @@ const unionTableBudget = 32 * 1024
 // exports no `scan_all` — the gated find preflight reads them in its wide form
 // (SETS_PLAN item 22 fix 2a-wide). It has no effect on a narrow build, where
 // the u64 accept pair is emitted instead and the rows do not exist at all.
-func buildUnionScanDFA(spec SetSpec, opts CompileSetOptions, tableBase int32, wantAcceptRows bool) *unionScanDFA {
+func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unionScanDFA {
 	if len(spec.Patterns) == 0 {
 		return nil
 	}

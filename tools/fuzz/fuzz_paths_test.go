@@ -503,35 +503,6 @@ func dotPrefix(p int) string {
 	return out + ")"
 }
 
-// hasContextAssertion reports whether pat contains an assertion whose meaning
-// depends on text outside the matched span: ^ $ \A \z \b \B, including the
-// multiline forms. allStartPositionMatches evaluates each start position against
-// a SLICE of the input, so such an assertion would be judged against the slice
-// boundary instead of the real one and the oracle would be wrong — a harness bug
-// masquerading as an engine bug.
-func hasContextAssertion(pat string) bool {
-	parsed, err := syntax.Parse(pat, syntax.Perl)
-	if err != nil {
-		return true // unparseable: treat as unsafe
-	}
-	var walk func(*syntax.Regexp) bool
-	walk = func(re *syntax.Regexp) bool {
-		switch re.Op {
-		case syntax.OpBeginLine, syntax.OpEndLine,
-			syntax.OpBeginText, syntax.OpEndText,
-			syntax.OpWordBoundary, syntax.OpNoWordBoundary:
-			return true
-		}
-		for _, sub := range re.Sub {
-			if walk(sub) {
-				return true
-			}
-		}
-		return false
-	}
-	return walk(parsed)
-}
-
 // ---------------------------------------------------------------------------
 // Slot comparison helpers.
 

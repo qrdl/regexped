@@ -246,8 +246,7 @@ func computeDominators(prog *syntax.Prog) []int {
 		rpo[len(order)-1-i] = pc
 	}
 
-	var preds [][]int
-	preds = make([][]int, n)
+	preds := make([][]int, n)
 	for pc := 0; pc < n; pc++ {
 		if !visited[pc] {
 			continue
@@ -2561,7 +2560,7 @@ func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams
 // scanParams is ignored when mandLit != nil (the mandatory-lit prefix scan replaces it).
 func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandatoryLit,
 	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) ([]byte, findFromMode) {
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 	prog := bt.prog
 	N := len(prog.Inst)
 

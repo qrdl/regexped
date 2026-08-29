@@ -689,32 +689,6 @@ func litAnchorFalsePositiveInput() string {
 	return string(b[:targetSize])
 }
 
-// secretsFalsePositiveInput builds ~50 KB of no-match input for
-// `ghp_[A-Za-z0-9]{36}` (task 24: promoting the Opt 2 counted-chain SIMD
-// verifier from LikelyMatch-gated to unconditional). Scatters "ghp_"
-// occurrences through filler text, each followed by exactly 35 valid
-// [A-Za-z0-9] bytes — one short of the 36 required — so the pattern never
-// actually matches, but both the plain DFA's counted-chain walk and Opt 2's
-// SIMD chain-verify must consume all 35 valid bytes before the 36th
-// (non-alnum) byte proves failure. This is the worst case for Opt 2: unlike
-// a false positive that dies within the first byte or two, this one forces
-// the full chain-length comparison every time, which is exactly the
-// scenario where a regression from unconditional promotion would show up
-// if one exists. Filler is alnum-free so a 35-byte near-miss run can never
-// accidentally extend past 36 bytes at a concatenation boundary.
-func secretsFalsePositiveInput() string {
-	const targetSize = 50 * 1024
-	filler := []byte(", the quick brown fox jumps over the lazy dog - filler text goes here forever; ")
-	nearMissSuffix := []byte("AbCdEfGhIjKlMnOpQrStUvWxYz012345678") // 35 chars, one short of 36
-	var b []byte
-	for len(b) < targetSize {
-		b = append(b, filler...)
-		b = append(b, []byte("ghp_")...)
-		b = append(b, nearMissSuffix...)
-	}
-	return string(b[:targetSize])
-}
-
 // deadSkipNearMissInput builds ~10 KB of letter runs separated by spaces.
 // Pattern `[a-zA-Z]+\d` is the find target.
 //
@@ -762,36 +736,6 @@ func minLenQuantifierSkipInput(withMatches bool) string {
 		b = append(b, 'a')
 	}
 	return string(b)
-}
-
-// postLiteralWideSelfLoopInput builds ~50 KB for `ID:[a-zA-Z0-9]{10,}`
-// (task 26). `find` returns on the FIRST match, so repeating "ID:<value> "
-// many times would only exercise the self-loop walk once (the first hit) —
-// no good as a cumulative stress test. Instead, when withMatches is true:
-// a single "ID:" followed by one alnum run spanning almost the entire
-// buffer, forcing the greedy `{10,}` self-loop to scalar-walk the full
-// ~50 KB to find where the run ends (no trailing non-alnum byte, so it
-// walks to EOF) — directly measuring the per-byte cost this task targets.
-// When false: plain "ID:"-free prose of the same size — the literal never
-// fires, so the post-hit self-loop scan never runs at all (the floor; see
-// the case's own comment for why the no-match side can't otherwise stress
-// this gap for an open-ended `{10,}` quantifier).
-func postLiteralWideSelfLoopInput(withMatches bool) string {
-	const targetSize = 50 * 1024
-	prose := []byte("the quick brown fox jumps over the lazy dog and other filler text goes here. ")
-	if !withMatches {
-		var b []byte
-		for len(b) < targetSize {
-			b = append(b, prose...)
-		}
-		return string(b[:targetSize])
-	}
-	alnum := []byte("aB3xR9mLq2ZpW7cD5nE8fH1jK4sT6vU0")
-	b := []byte("ID:")
-	for len(b) < targetSize {
-		b = append(b, alnum...)
-	}
-	return string(b[:targetSize])
 }
 
 // setShuftiLNMInput builds ~50 KB for the H.3 set-shufti-lnm case.

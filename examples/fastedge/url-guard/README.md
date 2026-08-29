@@ -61,19 +61,33 @@ regexped merge      →  merge app + patterns into final.wasm
 `lib.rs` intercepts every HTTP request at the `on_http_request_headers` phase,
 extracts the `:path` header, and passes it to the generated `patterns::scan_url()`
 function. `scan_url` is declared as `scan_any` in `regexped.yaml`, so the
-generated Rust wrapper returns `Option<i32>` — the id of some pattern matching
-somewhere in the URL, if anything matched. `scan_any` deliberately reports
-neither a position nor an extent: that is what lets it compile to a single
-pass over a union automaton rather than an anchored probe at every position,
-measured at 27 fuel/byte against 78 (plans/SETS.md §3.9, SETS_PLAN item 19). If a match is found, the request is blocked immediately
-with a 403 and the matched attack category is logged. If no pattern matches,
-the request continues to the origin.
+generated Rust wrapper returns `Result<Option<i32>>` — the id of some pattern
+matching somewhere in the URL, if anything matched. `scan_any` deliberately
+reports neither a position nor an extent: that is what lets it compile to a
+single pass over a union automaton rather than an anchored probe at every
+position, measured at 27 fuel/byte against 78 (plans/SETS.md §3.9, SETS_PLAN
+item 19). If a match is found, the request is blocked immediately with a 403
+and the matched attack category is logged. If no pattern matches, the request
+continues to the origin.
+
+**There are three outcomes, not two, and the third is why the return type is a
+`Result`.** `Err` means the engine could not ANSWER — a Backtracking member of
+the set exhausted its frame budget — which is neither "clean" nor "attack".
+Treating it as clean fails OPEN, letting an attack through on an input crafted
+to exhaust the budget, so a guard must fail closed. `lib.rs` matches all three
+arms and answers 500 on the third.
 
 The calling code is minimal — the generated `stubs.rs` hides all WASM FFI details:
 
 ```rust
-if let Some((pattern_id, _start)) = patterns::scan_url(url.as_bytes(), 0) {
-    let attack = patterns::pattern_name(pattern_id);
-    // block with 403
+match patterns::scan_url(url.as_bytes(), 0) {
+    Ok(Some(pattern_id)) => {
+        let attack = patterns::pattern_name(pattern_id);
+        // block with 403
+    }
+    Ok(None) => {}          // nothing matched: continue to the origin
+    Err(_) => {
+        // the engine could not answer — fail CLOSED with a 500
+    }
 }
 ```

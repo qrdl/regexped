@@ -20,6 +20,13 @@ jobs:
           go-version-file: go.mod
       - name: Build regexped
         run: go build -o regexped .
+      # Several tests validate the emitted module by shelling out to
+      # `wasm-tools validate`. They SKIP when it is absent, so without this
+      # step the suite still passes — while quietly checking nothing. The
+      # modules it rejects are ones that only fail at load, which no Go
+      # assertion catches.
+      - name: Install wasm-tools
+        run: ./get_wasm_tools.sh /usr/local/bin
       - name: Run unit tests
         run: go test -coverprofile=coverage.out ./compile/... ./config/... ./generate/... ./merge/... ./internal/...
       - name: Upload coverage reports to Codecov

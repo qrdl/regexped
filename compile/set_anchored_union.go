@@ -71,7 +71,10 @@ type anchoredUnion = unionScanDFA
 // is one bucket of 32 patterns and its 32-way recording chain is what makes it
 // 181 fuel against the union's 38.
 func anchoredUnionBeatsBuckets(buckets []*bucket) bool {
-	return !(len(buckets) == 1 && buckets[0].sparse)
+	// Named rather than inlined so the return reads as the doc above states
+	// the rule: the union wins everywhere EXCEPT this one packing.
+	singleSparseBucket := len(buckets) == 1 && buckets[0].sparse
+	return !singleSparseBucket
 }
 
 // buildAnchoredUnionDFA builds the automaton described above, or returns nil to
@@ -80,7 +83,7 @@ func anchoredUnionBeatsBuckets(buckets []*bucket) bool {
 // wantAll controls only whether the `_all` bitmap rows are emitted, exactly as
 // spec.ScanAll does for the scan automaton: a set that exports no `match_all`
 // pays no table for it.
-func buildAnchoredUnionDFA(spec SetSpec, opts CompileSetOptions, tableBase int32, wantAll bool) *anchoredUnion {
+func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll bool) *anchoredUnion {
 	if len(spec.Patterns) == 0 {
 		return nil
 	}

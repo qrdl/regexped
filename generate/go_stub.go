@@ -336,8 +336,6 @@ func genGoSetSection(cfg config.BuildConfig, _ string) string {
 	return body
 }
 
-// goPublicName converts a snake_case function name to a PascalCase Go identifier.
-
 // genGoMatchStub generates an anchored-match stub.
 func genGoMatchStub(importModule, funcName string) string {
 	ffi := "ffi_" + funcName

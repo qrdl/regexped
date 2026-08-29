@@ -251,7 +251,7 @@ func planBTRegions(buckets []*bucket, base int64) *btSharedRegions {
 // Called at each of set.go's three drop sites. A BT bucket always holds
 // exactly one pattern: BT has no merged form, so there is nothing to share
 // with.
-func newBTBucket(p *PatternInfo, opts CompileSetOptions) *bucket {
+func newBTBucket(p *PatternInfo) *bucket {
 	info := admitBTFallback(patternSuffixAST(p), resolveMemoBudget(nil))
 	if info == nil {
 		return nil
@@ -307,7 +307,7 @@ func btSufEndLocal(hasTrailingParam bool) byte {
 	return 7
 }
 
-func buildSetBTSuffixBody(info *btBucketInfo, regions *btSharedRegions,
+func buildSetBTSuffixBody(regions *btSharedRegions,
 	btFuncIdx int, patternID int, patternBit int, gated, hasSkip bool, tableMemIdx int) []byte {
 
 	if gated && hasSkip {
@@ -495,7 +495,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		// gated and skip-carrying are mutually exclusive and mean DIFFERENT
 		// things for parameter 7; passing them as one flag made the body read
 		// §19's skip count as a gate pointer (task 20.B).
-		body := buildSetBTSuffixBody(info, cs.btRegions, btFnBase+k,
+		body := buildSetBTSuffixBody(cs.btRegions, btFnBase+k,
 			cs.patternIDs[bi][0], 0, cs.gatedFind(), cs.suffixHasSkip,
 			tableMemIdx)
 		out[bi] = sizePrefixed(body)

@@ -486,39 +486,6 @@ func (o *setOracle) scanAllIDs(si, from int, eligible func(int) bool) []int {
 	return out
 }
 
-// firstPosition returns the smallest start >= from at which anything matches,
-// with the ids matching exactly there. Returns -1 when nothing matches.
-func (o *setOracle) firstPosition(si, from int, eligible func(int) bool) (int, []int) {
-	best := -1
-	for pi := range o.spm {
-		if !eligible(pi) {
-			continue
-		}
-		for _, sp := range o.spm[pi][si] {
-			if sp[0] >= from && (best == -1 || sp[0] < best) {
-				best = sp[0]
-				break
-			}
-		}
-	}
-	if best == -1 {
-		return -1, nil
-	}
-	var ids []int
-	for pi := range o.spm {
-		if !eligible(pi) {
-			continue
-		}
-		for _, sp := range o.spm[pi][si] {
-			if sp[0] == best {
-				ids = append(ids, pi)
-				break
-			}
-		}
-	}
-	return best, ids
-}
-
 // overlappingSpans returns every (start, end) pattern pi reports under
 // `overlapping: true` — one per start position at which it matches.
 func (o *setOracle) overlappingSpans(pi, si int) [][2]int {

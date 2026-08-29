@@ -1833,7 +1833,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 			// DFA cannot be built is exactly the case the state-limit branch
 			// below covers, and is reported the same way.
 			if isolatedDFA == nil {
-				if nb := newBTBucket(p, opts); nb != nil {
+				if nb := newBTBucket(p); nb != nil {
 					buckets = append(buckets, nb)
 					continue
 				}
@@ -1845,7 +1845,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 				continue
 			}
 			if isolatedDFA.numStates > opts.maxFallbackStates() {
-				if nb := newBTBucket(p, opts); nb != nil {
+				if nb := newBTBucket(p); nb != nil {
 					buckets = append(buckets, nb)
 					continue
 				}
@@ -1929,7 +1929,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 			// cannot be built is the case the state-limit branch covers, so it
 			// gets the same BT admission and the same warn-and-drop.
 			if nbDFA == nil {
-				if nb := newBTBucket(p, opts); nb != nil {
+				if nb := newBTBucket(p); nb != nil {
 					buckets = append(buckets, nb)
 					continue
 				}
@@ -1941,7 +1941,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 				continue
 			}
 			if nbDFA.numStates > opts.maxFallbackStates() {
-				if nb := newBTBucket(p, opts); nb != nil {
+				if nb := newBTBucket(p); nb != nil {
 					buckets = append(buckets, nb)
 					continue
 				}

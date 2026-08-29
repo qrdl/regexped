@@ -14,12 +14,12 @@ import (
 
 // BuildConfig is the top-level structure of the YAML config file.
 type BuildConfig struct {
-	WasmMerge    string `yaml:"wasm_merge"`     // optional; defaults to "wasm-merge" in $PATH
-	Output       string `yaml:"output"`         // output path for merge command; overridable with -o
-	WasmFile     string `yaml:"wasm_file"`      // output WASM file for compile command; overridable with -o
-	ImportModule string `yaml:"import_module"`  // WASM import module name used by wasm-merge and Rust FFI
-	StubFile     string `yaml:"stub_file"`      // stub output file (Rust, Go, JS, TS, AS, or C)
-	StubType     string `yaml:"stub_type"`      // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
+	WasmMerge    string `yaml:"wasm_merge"`    // optional; defaults to "wasm-merge" in $PATH
+	Output       string `yaml:"output"`        // output path for merge command; overridable with -o
+	WasmFile     string `yaml:"wasm_file"`     // output WASM file for compile command; overridable with -o
+	ImportModule string `yaml:"import_module"` // WASM import module name used by wasm-merge and Rust FFI
+	StubFile     string `yaml:"stub_file"`     // stub output file (Rust, Go, JS, TS, AS, or C)
+	StubType     string `yaml:"stub_type"`     // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
 
 	// Namespace prefixes the symbols a stub generates that are NOT named by
 	// the user — Span, SetMatch, the error type, the pattern-name helper, C's
@@ -32,7 +32,7 @@ type BuildConfig struct {
 	// equivalent, and the shared Span and error type of TODO task 62 widen the
 	// exposure. A NO-OP for Rust, whose `pub mod <import_module>` wrapper
 	// already isolates every stub.
-	Namespace string `yaml:"namespace"`
+	Namespace    string `yaml:"namespace"`
 	MaxDFAStates int    `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int    `yaml:"max_tdfa_regs"`  // 0 = default (32)
 	// MaxFallbackStates caps the suffix DFA of a single-pattern fallback

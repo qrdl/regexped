@@ -7774,7 +7774,7 @@ func buildSimplePrefixCheckBody(tlo [16]byte, count int) []byte {
 //	chunk1(11), t1Lo(12), t1Hi(13)                  — v128 (T1 Teddy, if applicable)
 func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFuncIdx int, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 
 	// ── local declarations ────────────────────────────────────────────────────
 	// When there is a single literal use the hybrid prefix scan (one v128.load
@@ -8413,7 +8413,7 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 // Signature: (ptr i32, len i32) → i64. Returns -1 on no match.
 func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchorFuncIdx, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 
 	hasT0 := len(p.altLitAnchorTeddyLoBytes) > 0
 	hasT1 := len(p.altLitAnchorTeddyT1LoBytes) > 0
@@ -9799,6 +9799,15 @@ type litChainPattern struct {
 	prefixTlo    [16]byte // SIMD prefix verify
 	startAnchor  anchorType
 	endAnchor    anchorType
+}
+
+// hasAnchor reports whether this shape carries `^`/`\A` or `$`/`\z`.
+//
+// litChainBranchInfo holds the same field pair and repeats this test at its own
+// call sites; the two are separate types, so sharing one helper would mean an
+// interface for a two-field comparison.
+func (p *litChainPattern) hasAnchor() bool {
+	return p.startAnchor != anchorNone || p.endAnchor != anchorNone
 }
 
 // litChainBranchInfo is the analysis result for a single lit-chain branch.
@@ -11357,7 +11366,7 @@ func emitPrefixClassVerify(b []byte, m int,
 // (existing multi-chunk verify), ORs the bad-masks, advances on mismatch.
 func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 
 	const (
 		locPtr          byte = 0
@@ -12626,7 +12635,7 @@ func appendLenAltMatchCodeEntry(cs []byte, altp *lenAltPattern, l lenAltLayout, 
 //	return -1
 func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 
 	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
 
@@ -13198,7 +13207,7 @@ func emitRangeClassVerify(b []byte, lcp *litChainPattern,
 //	  return packed (attempt_start, attempt_start + K + match_len)
 func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
 	var b []byte
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 
 	const (
 		locPtr          byte = 0
@@ -13657,7 +13666,7 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 	)
 
 	var b []byte
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 
 	// Local declarations: 3 i32 + 7 v128 (T0/T1 Teddy + chunk + chunk1/verifyTlo + verifyPow2).
 	b = append(b, 0x02)       // 2 local groups
@@ -13879,7 +13888,7 @@ func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLay
 	)
 
 	var b []byte
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F)
 	b = append(b, 0x07, 0x7B)
@@ -13989,7 +13998,7 @@ func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout
 	)
 
 	var b []byte
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 	b = append(b, 0x02)
 	b = append(b, 0x05, 0x7F)
 	b = append(b, 0x07, 0x7B)
@@ -14495,7 +14504,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	)
 
 	var b []byte
-	findFrom := ffLegacyNarrow
+	var findFrom findFromMode
 	// Local declarations: 7 i32 + 5 v128 + 2 i32 (locWindowBase, locScalarByte
 	// — added on top to avoid renumbering the existing i32/v128 groups above).
 	b = append(b, 0x03)       // 3 local groups
