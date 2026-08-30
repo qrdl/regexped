@@ -41,7 +41,7 @@ type backtrack struct {
 	// That's harmless in isolation (each entry still corresponds to a
 	// distinct, legitimate backtracking choice), but becomes unbounded
 	// when this PC is *also* the sole, unconditional body of an enclosing
-	// emptyBodyGreedyLoop (FUZZER_BUGS.md #18, e.g. the inner `a*` inside
+	// emptyBodyGreedyLoop (a past defect, e.g. the inner `a*` inside
 	// the outer `+` in `(?:a*)+^`): the outer loop's own zero-progress
 	// scalar can be clobbered by an intervening re-entry at a different
 	// position before the outer loop is revisited at the position that
@@ -56,7 +56,7 @@ type backtrack struct {
 	// directions: (a) `(?:a*|b*)*` on "b" started returning a wrong
 	// non-empty match, because the outer loop's own re-entry at the same
 	// position is *also* how the "still-pending sibling branch" mechanism
-	// (task 20) works, and blocking it suppressed that sibling; (b) even
+	//  works, and blocking it suppressed that sibling; (b) even
 	// where it produced the right answer (`(?:a*)+^`), it did so by
 	// accident — the trace showed it only worked because it happened not
 	// to disturb the specific revisit the zero-progress guard needed.
@@ -74,8 +74,8 @@ type backtrack struct {
 	// that actually targets the loop's bodyStart. Go's compiler emits a
 	// separate, non-cyclic InstAlt for a captured star's very first entry
 	// (identical Out/Arg to the genuine, back-edged loop head, but not
-	// itself reached via a back edge, hence bt.loops[pc]==false for it) —
-	// see FUZZER_BUGS.md #20. The entry twin is the only place that knows
+	// itself reached via a back edge, hence bt.loops[pc]==false for it) —.
+	// The entry twin is the only place that knows
 	// the position at which THIS SPECIFIC loop instance began; the loop
 	// head's own zero-progress guard needs that value (not the global
 	// attempt start, and not "unconditionally exit") to decide whether an
@@ -90,7 +90,7 @@ type backtrack struct {
 	// popped retry frame. A single unsplit map (the original design) always
 	// instrumented the Out site regardless of which edge actually matched,
 	// silently corrupting loopEntryLocalIdx whenever the qualifying edge was
-	// Arg — see FUZZER_BUGS.md #37.
+	// Arg.
 	loopEntryOutOf map[int]int
 	loopEntryArgOf map[int]int
 
@@ -105,7 +105,7 @@ type backtrack struct {
 	// bodies, the find engine's attempt_start local otherwise) — so their
 	// loopEntryLocalIdx local must be seeded with that value at
 	// declaration time instead of the usual -1 sentinel. See
-	// emitBTInstHandler's InstAlt case and FUZZER_BUGS.md #20.
+	// emitBTInstHandler's InstAlt case and a past defect.
 	loopEntryAtStart map[int]bool
 }
 
@@ -246,8 +246,7 @@ func computeDominators(prog *syntax.Prog) []int {
 		rpo[len(order)-1-i] = pc
 	}
 
-	var preds [][]int
-	preds = make([][]int, n)
+	preds := make([][]int, n)
 	for pc := 0; pc < n; pc++ {
 		if !visited[pc] {
 			continue
@@ -358,13 +357,13 @@ func altLoopBody(prog *syntax.Prog, idom []int, pc int) (bodyPC, exitPC int, isL
 	case outIsBack && argIsBack:
 		// Both branches test as back edges: pc is simultaneously an inner
 		// loop's own back edge and, via the other branch, an enclosing
-		// loop's continuation point (FUZZER_BUGS.md #26 — first found when
+		// loop's continuation point (a past defect — first found when
 		// the enclosing loop's continuation happened to be prog.Start
 		// itself, which trivially dominates everything). Discriminate by
 		// dominance between the two targets directly: whichever target
 		// dominates the OTHER target closes the more enclosing loop
 		// relative to this Alt, so the other, dominated target is the
-		// true, more-local inner-loop body (FUZZER_BUGS.md #29 — the
+		// true, more-local inner-loop body (a past defect — the
 		// original prog.Start-equality check was only a special case of
 		// this and misfires once a prefix construct pushes prog.Start
 		// outside the affected group).
@@ -385,7 +384,7 @@ func altLoopBody(prog *syntax.Prog, idom []int, pc int) (bodyPC, exitPC int, isL
 			// within the program (e.g. bare `x*` at the very start of a
 			// pattern: the back edge is body's last instruction -> pc, and
 			// pc IS the entry, so nothing "dominates" it despite the cycle
-			// being real). FUZZER_BUGS.md #37.
+			// being real). a past defect.
 			//
 			// Fall back to direct forward reachability from each branch back
 			// to pc. This is the same reachability test rejected above for
@@ -474,7 +473,7 @@ func loopBodyCanMatchEmpty(prog *syntax.Prog, idom []int, loopPC int) bool {
 }
 
 // nestedLoopPC looks for a single, unconditional nested loop directly inside
-// loopPC's body — the specific shape FUZZER_BUGS.md #18 needs memoised. It
+// loopPC's body — the specific shape a past defect needs memoised. It
 // walks the body linearly from bodyStart, following only non-branching
 // instructions (Capture/Nop), and stops at the FIRST Alt/AltMatch it finds:
 // if that instruction cycles back to itself, its PC is returned as the
@@ -564,7 +563,7 @@ func pcReachesBounded(prog *syntax.Prog, from, target, boundary int) bool {
 
 // btHasWordBoundary reports whether prog contains a \b/\B assertion —
 // used to decide whether a non-anchored captureBody needs the edge-scratch
-// mechanism (FUZZER_BUGS.md #26): patterns without any \b/\B never emit
+// mechanism: patterns without any \b/\B never emit
 // btWordBoundary at all, so there's nothing for the scratch slot to fix and
 // reserving/writing it would be pure overhead.
 func btHasWordBoundary(prog *syntax.Prog) bool {
@@ -584,7 +583,7 @@ func btHasWordBoundary(prog *syntax.Prog) bool {
 // (?m:$) assertion. Like btHasWordBoundary, these four assertions are
 // defined against the true input edges, which a captureBody handed a
 // narrowed match slice cannot see. Their presence is what switches the
-// groups wrappers into window mode (FABLE.md B13) — see
+// groups wrappers into window mode — see
 // buildBacktrackBody's winScratchOff.
 func btHasTextLineAnchors(prog *syntax.Prog) bool {
 	const mask = syntax.EmptyBeginText | syntax.EmptyEndText |
@@ -617,8 +616,8 @@ func btLocalGet(b []byte, idx uint32) []byte {
 //     incorrectly takes the body branch again (instead of exiting), causing
 //     an infinite loop.
 //   - A PC that nestedLoopPC finds nested, unconditionally and alone, inside
-//     an emptyBodyGreedyLoop's body (bt.memoInnerLoop — FUZZER_BUGS.md #18,
-//     e.g. the inner `a*` inside the outer `+` in `(?:a*)+^`). Such a PC is
+//     an emptyBodyGreedyLoop's body (bt.memoInnerLoop — e.g. the inner `a*`
+//     inside the outer `+` in `(?:a*)+^`). Such a PC is
 //     never itself a registered loop head (altLoopBody's dominance-based
 //     back-edge test can't recognize it — see nestedLoopPC's doc), so it's
 //     compiled as an ordinary non-loop alternation with no zero-progress
@@ -703,7 +702,7 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // identically-named parameter for the TDFA-side counterpart of this fix).
 //
 // winScratchOff (-1 = off) switches this body into WINDOW MODE, the fix for
-// FUZZER_BUGS.md #26 and FABLE.md B13. In window mode the wrapper stops
+// a past defect. In window mode the wrapper stops
 // narrowing: it passes the caller's real (ptr,len) and stashes the match
 // window as an (startOff,endOff) pair at this table-memory offset. This
 // body then starts at pos=startOff, accepts at pos==endOff, and records
@@ -749,7 +748,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 
 	// loopEntryLocalIdx[headPC] = local variable index holding the position
 	// at which that loop instance was entered — see loopEntryOutOf's doc and
-	// FUZZER_BUGS.md #20. Placed after the snapshot locals.
+	// a past defect. Placed after the snapshot locals.
 	entryPCsSorted := entryLoopPCsSorted(bt)
 	entryBase := baseExtra + uint32(snapTotal)
 	loopEntryLocalIdx := make(map[int]uint32, len(entryPCsSorted))
@@ -761,7 +760,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	// per-loop capture snapshot slot (loopSnapBase/loopSnapLocals), saved
 	// into and restored from every backtrack frame like captures already
 	// are — see btPushFrame's and btNumLoopFrameLocals's docs and
-	// FUZZER_BUGS.md #28. The snapshot slots are included here (and not for
+	// a past defect. The snapshot slots are included here (and not for
 	// the no-capture bodies, which have none) because they're per-loop-
 	// instance state read by the very same zero-progress guard
 	// (restoreLoopSnap) as the trackers, and go stale the same way.
@@ -769,7 +768,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	// Narrowing this to only bt.emptyBodyGreedyLoop heads was tried and
 	// reverted: it broke non-greedy loops (e.g. `^(?:(?:(?:a*?){0,}))$`)
 	// and other loop shapes outside bug 28's specific repro class — see
-	// FUZZER_BUGS.md #28's "Confidence"/investigation notes. All bt.loops
+	// a past defect’s "Confidence"/investigation notes. All bt.loops
 	// heads need this, not just the empty-body-greedy subset.
 	extraFrameLocals := make([]uint32, 0, len(loopPCsSorted)+len(entryPCsSorted)+snapTotal)
 	for _, pc := range loopPCsSorted {
@@ -1000,7 +999,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 
 	// Restore extraFrameLocals (loop_pos/loop_entry trackers) from
 	// mem[sp+4+numCapLocals*4 ..] — see btPushFrame's doc and
-	// FUZZER_BUGS.md #28.
+	// a past defect.
 	extraOff := uint32(4 + numCapLocals*4)
 	for i, localIdx := range extraFrameLocals {
 		body = append(body, 0x20, localSP)
@@ -1064,8 +1063,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 
 // emitBitStateGuard emits the shared BitState "already visited (p, pos)?
 // fail : mark visited" check — used both for non-greedy empty-body loop
-// heads (bt.nonGreedyLoop) and for bt.memoInnerLoop PCs (FUZZER_BUGS.md
-// #18). brDepth is the br depth to restart $run from inside this one
+// heads (bt.nonGreedyLoop) and for bt.memoInnerLoop PCs. brDepth is the br depth to restart $run from inside this one
 // WASM-level if-block (callers pass brRunNested; the enclosing Go-level
 // `if useMemo && ...` around the call site is compile-time only and adds no
 // WASM nesting).
@@ -1173,7 +1171,7 @@ func emitBTInstHandler(
 	// `*`/`?`-shaped loop, or the mandatory predecessor for a `+`-shaped
 	// loop) via its Out or Arg edge respectively — record the position at
 	// which this loop instance began, for that loop's own zero-progress
-	// guard to consult (FUZZER_BUGS.md #20). See loopEntryOutOf's doc.
+	// guard to consult. See loopEntryOutOf's doc.
 	//
 	// The write must happen at the point control actually transfers via the
 	// qualifying edge, not unconditionally at handler entry: p may fail its
@@ -1193,7 +1191,7 @@ func emitBTInstHandler(
 	// before the push is exactly equivalent to writing it at the later pop).
 	// Conflating the two edges into one write keyed only on p — the original
 	// design — silently corrupted loopEntryLocalIdx whenever the qualifying
-	// edge was Arg instead of Out (FUZZER_BUGS.md #37).
+	// edge was Arg instead of Out.
 	writeLoopEntryOut := func(b []byte) []byte {
 		if headPC, ok := bt.loopEntryOutOf[p]; ok {
 			b = append(b, 0x20, localPos) // local.get pos (already past any consumed byte)
@@ -1254,7 +1252,7 @@ func emitBTInstHandler(
 			// Non-loop alternation: push retry=inst.Arg, continue with inst.Out.
 			//
 			// bt.memoInnerLoop[p]: this PC nonetheless cycles back to itself
-			// (FUZZER_BUGS.md #18) but isn't a registered loop head, so it has
+			// but isn't a registered loop head, so it has
 			// no zero-progress guard at all — memoise it the same way a
 			// non-greedy empty-body loop head is memoised below, to bound the
 			// otherwise-unlimited retry growth. See bt.memoInnerLoop's doc.
@@ -1308,7 +1306,7 @@ func emitBTInstHandler(
 			} else if bt.emptyBodyGreedyLoop[p] {
 				// Greedy loop whose body can match empty (e.g. the outer `*`
 				// in (?:a*|b*)*, or ` (\B|0)*`/` (\b|0*)*` —
-				// FUZZER_BUGS.md #19/#20). Go stdlib's actual leftmost-first
+				// past defects). Go stdlib's actual leftmost-first
 				// answer here depends on whether THIS SPECIFIC LOOP has made
 				// any real forward progress since it was entered — not since
 				// the whole match attempt began (a mandatory prefix before
@@ -1408,7 +1406,7 @@ func emitBTInstHandler(
 			// (?m:^): fires at pos==0 or when prev byte is '\n'
 			// Fail if: pos != 0 AND mem[ptr + pos - 1] != '\n'
 			// pos is a true input offset under window mode, so this needs no
-			// edge fix-up (FABLE.md B13).
+			// edge fix-up.
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x45)       // i32.eqz
 			body = append(body, 0x04, 0x40) // if void (pos == 0): ok
@@ -1429,7 +1427,7 @@ func emitBTInstHandler(
 
 		case emptyOp&syntax.EmptyBeginText != 0:
 			// \A: fires only at pos==0, which under window mode is the true
-			// start of the input (FABLE.md B13).
+			// start of the input.
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x45)       // i32.eqz
 			body = append(body, 0x45)       // i32.eqz (NOT: nonzero = fail)
@@ -1441,7 +1439,7 @@ func emitBTInstHandler(
 		case emptyOp&syntax.EmptyEndLine != 0:
 			// (?m:$): fires at pos==len or when next byte is '\n'
 			// Fail if: pos != len AND mem[ptr + pos] != '\n'
-			// len is the true input length under window mode (FABLE.md B13).
+			// len is the true input length under window mode.
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x20, localLen)
 			body = append(body, 0x46)       // i32.eq
@@ -1461,7 +1459,7 @@ func emitBTInstHandler(
 
 		case emptyOp&syntax.EmptyEndText != 0:
 			// \z: fires only at pos==len, which under window mode is the true
-			// end of the input (FABLE.md B13).
+			// end of the input.
 			body = append(body, 0x20, localPos)
 			body = append(body, 0x20, localLen)
 			body = append(body, 0x47)       // i32.ne
@@ -1492,7 +1490,7 @@ func emitBTInstHandler(
 			// RE2 semantics: only accept if the whole match window is
 			// consumed. limitLocal is localLen when the caller narrowed the
 			// slice, and the window end loaded from scratch under window
-			// mode (FABLE.md B13 option D).
+			// mode.
 			body = append(body, 0x20, localPos)
 			body = btLocalGet(body, limitLocal)
 			body = append(body, 0x47)       // i32.ne
@@ -1759,7 +1757,7 @@ func btOverflowFindReturn(bb []byte, _ uint32) []byte {
 // The default bail-out (overflowFn == nil) returns abi.BTStackOverflow (-2),
 // NOT abi.NoMatch (-1). Overflow means the engine abandoned part of the search
 // space, so it does not know whether a match exists; returning -1 would report
-// a definite "no" it has not established. That was §N1 in plans/OPUS.md: a
+// a definite "no" it has not established. That was a real defect: a
 // false negative that appears once the input crosses numAlts*4096 bytes and is
 // indistinguishable from a real no-match at every layer above. Callers that
 // compose this body (the groups wrapper, the batch wrappers) must propagate -2
@@ -1768,7 +1766,7 @@ func btOverflowFindReturn(bb []byte, _ uint32) []byte {
 // extraLocals: local indices of every loop_pos/loop_entry tracker in the
 // program (in the same fixed order the caller uses everywhere else), saved
 // into and restored from every frame exactly like captures already are.
-// These are per-loop-instance state (FUZZER_BUGS.md #28): once a loop head
+// These are per-loop-instance state: once a loop head
 // has updated its tracker, popping back to a frame pushed *before* that
 // update must undo it too, or the loop head's zero-progress guard compares
 // the restored `pos` against a stale tracker value left over from an
@@ -1841,7 +1839,7 @@ func btPushFrame(b []byte, numCapLocals int, extraLocals []uint32, retryPC uint3
 // The captureBody's (ptr,len) are always the caller's true input under
 // window mode (see buildBacktrackBody's winScratchOff), so pos==0 / pos==len
 // are true input edges here and no side-channel edge context is needed —
-// this is what FUZZER_BUGS.md #26's (origPtr,origEnd) scratch used to
+// this is what a past defect’s (origPtr,origEnd) scratch used to
 // reconstruct for a narrowed slice.
 func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32) []byte {
 	// Compute prevIsWord (0 or 1) using block (result i32):
@@ -2009,7 +2007,7 @@ func compileBTProg(pattern string) *syntax.Prog {
 
 // btAllocSizes returns (stackSize, memoSize) in bytes for a no-capture BT engine.
 // frameSize is 8 (pos + retryPC, no cap slots) plus 4 bytes per loop_pos/
-// loop_entry tracker (FUZZER_BUGS.md #28) — see btNumLoopFrameLocals.
+// loop_entry tracker — see btNumLoopFrameLocals.
 // memoBudget is the maximum bytes to allocate for the BitState bitset.
 func btAllocSizes(bt *backtrack, useMemo bool, _ int, memoBudget int) (stackSize, memoSize int) {
 	frameSize := 8 + btNumLoopFrameLocals(bt, false)*4 // pos(4) + extraLocals + retryPC(4)
@@ -2210,7 +2208,7 @@ func buildBTInnerDisp(
 
 	// extraFrameLocals: every loop_pos/loop_entry tracker, saved into and
 	// restored from every backtrack frame like captures already are — see
-	// btPushFrame's doc and FUZZER_BUGS.md #28. Order must match the caller's
+	// btPushFrame's doc and a past defect. Order must match the caller's
 	// loopLocalIdx/loopEntryLocalIdx local assignment: loopPCsSorted first
 	// (bt.loops keys, sorted), then entryLoopPCsSorted(bt).
 	//
@@ -2438,7 +2436,7 @@ func entryLoopPCsSorted(bt *backtrack) []int {
 // loop_entry trackers, plus per-loop capture snapshot slots when
 // withCaptureSnapshots is true) that every backtrack stack frame must
 // reserve space for, alongside pos/captures/retryPC — see btPushFrame's doc
-// and FUZZER_BUGS.md #28. Callers computing frameSize/stackSize before the
+// and a past defect. Callers computing frameSize/stackSize before the
 // WASM body itself is built (compile.go, btAllocSizes) use this to stay in
 // sync with the per-loop-head local count each body builder actually emits.
 //
@@ -2541,10 +2539,10 @@ func emitBTMemoZeroInitTrimmed(body []byte, memoTableBase int32, N int,
 // Signature: (ptr i32, len i32) → i64
 // Returns (start << 32 | end) on match, -1 on no match.
 func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams,
-	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, mandLit *mandatoryLit, tableMemIdx int) []byte {
-	body := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx)
+	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, mandLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode) {
+	body, mode := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+	return append(cs, body...), mode
 }
 
 // buildBTFindBody emits the full WASM function body for a no-capture BT find.
@@ -2561,7 +2559,8 @@ func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams
 // mandatory literal, inner loop runs BT attempts in the resulting window.
 // scanParams is ignored when mandLit != nil (the mandatory-lit prefix scan replaces it).
 func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandatoryLit,
-	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) []byte {
+	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) ([]byte, findFromMode) {
+	var findFrom findFromMode
 	prog := bt.prog
 	N := len(prog.Inst)
 
@@ -2602,7 +2601,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	}
 
 	// Entry-pos locals follow the loop_pos locals — see loopEntryOutOf's doc
-	// and FUZZER_BUGS.md #20.
+	// and a past defect.
 	entryPCsSorted := entryLoopPCsSorted(bt)
 	entryBase := loopLocalsBase + uint32(len(loopPCsSorted))
 	loopEntryLocalIdx := make(map[int]uint32, len(entryPCsSorted))
@@ -2661,6 +2660,13 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 
 	const locAttemptStart = byte(0x07)
 
+	// The find-from seed. Placed here because everything above is
+	// the locals declaration and everything below reads attempt_start. This
+	// body already handles a nonzero start — its memo-skip computes
+	// `attempt_start >> 3` precisely so earlier bytes are not revisited — it
+	// was simply never told where to start.
+	body, findFrom = emitFindFromSeed(body, locAttemptStart)
+
 	// ── Mandatory-literal two-level outer loop ────────────────────────────────
 	// When mandLit != nil: outer loop $lit_outer scans for the mandatory literal
 	// using an SIMD prefix scan, inner loop $outer runs BT from each candidate
@@ -2669,13 +2675,21 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		// block $no_match
 		body = append(body, 0x02, 0x40)
 
-		// Initialise scan_start = minOff (skip positions where lit can't appear).
+		// scan_start = attempt_start + minOff.
+		//
+		// This cursor is an ABSOLUTE position into the whole buffer, so it has
+		// to begin at the find-from position rather than at 0; minOff is the
+		// earliest the literal can sit relative to a match start. When from is
+		// 0 this is exactly the old value. Same correction the DFA
+		// mandatory-literal path needed.
+		body = append(body, 0x20, locAttemptStart)
 		if mandLit.minOff > 0 {
 			body = append(body, 0x41)
 			body = utils.AppendSLEB128(body, mandLit.minOff)
-			body = append(body, 0x21)
-			body = utils.AppendULEB128(body, scanStartLocal) // local.set scan_start
+			body = append(body, 0x6A) // i32.add
 		}
+		body = append(body, 0x21)
+		body = utils.AppendULEB128(body, scanStartLocal) // local.set scan_start
 
 		// loop $lit_outer
 		body = append(body, 0x03, 0x40)
@@ -2822,7 +2836,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = append(body, 0x42, 0x7F) // i64.const -1
 		body = append(body, 0x0F)       // return
 		body = append(body, 0x0B)       // end function
-		return body
+		return body, findFrom
 	}
 
 	// ── Standard first-byte / prefix scan path ────────────────────────────────
@@ -2904,5 +2918,5 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	body = append(body, 0x42, 0x7F) // i64.const -1
 	body = append(body, 0x0F)       // return
 	body = append(body, 0x0B)       // end function
-	return body
+	return body, findFrom
 }

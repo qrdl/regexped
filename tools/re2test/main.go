@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"regexp/syntax"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +15,6 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/internal/utils"
 )
 
 const (
@@ -56,12 +56,19 @@ func main() {
 	validateGo := flag.Bool("validate-go", false, "validate test expectations against Go stdlib regexp (reports data errors, skips WASM testing)")
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
 	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find/groups (sets MaxDFAStates=-1 so DFA/TDFA always overflow to BT)")
-	setsMode := flag.Bool("sets", false, "test set find_all: compile each regexps block as a set and verify all matches against col4/col1 expected results")
+	setsMode := flag.Bool("sets", false, "test the set capabilities: compile each regexps block's patterns as sets and verify every declared capability against a live Go oracle")
+	setBatch := flag.Bool("set-batch", false, "with --sets, drive `find_batch` ONLY at a buffer capacity of one, so every multi-match position splits and every batch resume path is taken (default drives capacity 1 and capacity=pattern-count)")
+	setChunk := flag.Int("set-chunk", 32, "with --sets, patterns per compiled set (0 = one set per corpus block, which is what --sets did originally). The RE2 corpus has 27 blocks of 132..7020 patterns, so without chunking the frontend and id-space thresholds (packed-pair <=16, Teddy <=64, AC >16, wide `_all` >64) are never crossed from below")
+	setShuffle := flag.Bool("set-shuffle", false, "with --sets, deterministically permute a block's patterns before chunking, so a set holds unrelated patterns instead of variations of one generator family")
+	setBT := flag.Int("set-bt", 0, "with --sets, force set members onto the Backtracking fallback engine by capping max_fallback_states at this many DFA states (0 = off, 1 = force everything BT can take). Patterns over the limit used to be DROPPED from the set entirely, so this is the only way to exercise BT-backed buckets at corpus scale")
+	setSampleN := flag.Int("sample", 1, "with --sets, test only every Nth chunk (1 = all). This is what separates the sampled gate from the exhaustive run")
+	setSubsetF := flag.Bool("set-subset", false, "with --sets, make each set select a NAMED SUBSET of the chunk's patterns (every second one, from index 1) instead of `patterns: all`; this is the only configuration in which PATTERN_COUNT and ID_SPACE differ, which is what sizes the gate array and the `_all` bitmap")
+	setProfiles := flag.String("set-profiles", "all", "with --sets, comma-separated capability profiles to compile per chunk: all, anchored, scan, scan-any, find, find-ov, batch, batch-ov — or all-profiles")
 	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
 	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
 	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
-	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's Gap B lenient path) that match+find-together dispatch never exercises — see plans/TODO.md task 52")
-	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the Gap E alt-prefixed find body, the Gap C alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises (see plans/FABLE.md B6/B9/B11)")
+	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's Gap B lenient path) that match+find-together dispatch never exercises")
+	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the Gap E alt-prefixed find body, the Gap C alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -69,6 +76,40 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The set-mode switches are package-level rather than further parameters on
+	// run()/testSetBlock(): they change only what the set path COMPILES and
+	// DRIVES, and threading eight more through would double the width of two
+	// already-overlong signatures.
+	setBatchCap1Only = *setBatch
+	setSubset = *setSubsetF
+	setChunkSize = *setChunk
+	setShufflePats = *setShuffle
+	setSample = *setSampleN
+	setMaxPrint = *maxErrors
+	setBTFallback = *setBT
+	if *setSampleN < 1 {
+		fmt.Fprintln(os.Stderr, "--sample must be >= 1")
+		os.Exit(1)
+	}
+	for _, f := range []struct {
+		set  bool
+		name string
+	}{{*setBatch, "--set-batch"}, {*setChunk != 32, "--set-chunk"}, {*setShuffle, "--set-shuffle"},
+		{*setSampleN != 1, "--sample"}, {*setProfiles != "all", "--set-profiles"},
+		{*setSubsetF, "--set-subset"}} {
+		if f.set && !*setsMode {
+			fmt.Fprintf(os.Stderr, "%s requires --sets\n", f.name)
+			os.Exit(1)
+		}
+	}
+	if *setsMode {
+		profs, err := resolveSetProfiles(*setProfiles)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		activeSetProfiles = profs
+	}
 	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly, *matchOnly, *findOnly); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -393,13 +434,43 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					continue
 				}
 				// col0 (anchored groups): only when --validate-groups is on.
+				//
+				// The oracle must be FULL-CONSUMPTION — \A(?:pat)\z — not a
+				// leftmost-first find that is then checked for having spanned
+				// the input. Those differ whenever an earlier alternative
+				// matches a prefix while a later one would consume everything:
+				// `a|ab` on "ab" finds `a`, spans 0-1, and the span check calls
+				// it "no match", when the anchored answer is a match at 0-2.
+				// That mistake reported 167 false disagreements here, and is
+				// the same trap that once cost a
+				// 2026-08-19 sweep 96 false positives.
+				//
+				// Wrapping in (?: ) leaves capture-group numbering untouched,
+				// so the submatch slots line up with col0's slots as before.
 				if validateGroups && col0 != "-" {
-					goSub0 := re.FindStringSubmatchIndex(text)
-					expSlots0 := parseCaptures(col0, re.NumSubexp()+1)
-					goAnchored := len(goSub0) >= 2 && goSub0[0] == 0 && goSub0[1] == len(text)
-					if !goAnchored {
-						goSub0 = nil
+					// col0 is produced by TWO different exports, with two
+					// different contracts, and the oracle has to match whichever
+					// one this row exercises (see the col0 test sites below):
+					//
+					//   captures  → the groups export: anchored at 0, and NOT
+					//               full-consumption; it reports wherever the
+					//               match ends.
+					//   no captures → the match export: full-consumption.
+					//
+					// Using one oracle for both is what produced most of the
+					// noise here. `(.*?)([0-9]+)` on "x123y" is col0 = 0-4,
+					// which a \z oracle calls "no match"; `a|ab` on "ab" is
+					// col0 = 0-2, which an un-anchored-end oracle calls 0-1.
+					anchor := `\A(?:` + pattern + `)`
+					if re.NumSubexp() == 0 {
+						anchor += `\z`
 					}
+					reAnchored, anchErr := regexp.Compile(anchor)
+					if anchErr != nil {
+						continue
+					}
+					goSub0 := reAnchored.FindStringSubmatchIndex(text)
+					expSlots0 := parseCaptures(col0, re.NumSubexp()+1)
 					if !slotsEqualGo(goSub0, expSlots0) {
 						nDataErrors++
 						fmt.Printf("DATA  pattern: %q\n      input:   %q\n      col0 expected: %s\n      col0 go:       %s\n",
@@ -418,28 +489,26 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						pattern, text, fmtFindResult(exp1), fmtFindResult(goFind))
 				}
 				// col4 (all matches): validate if present.
-				// We simulate our own iteration loop (call FindStringIndex repeatedly with
-				// advancing offset) rather than using FindAllStringIndex. This matches the
-				// behavior of the WASM iteration loop: after a zero-length match at position p
-				// we advance to p+1 and DO include the empty match, whereas Go's
-				// FindAllStringIndex skips empty matches adjacent to the previous match.
+				//
+				// This is a plain whole-input
+				// FindAllStringIndex — Go's own answer, and the project's
+				// stated oracle.
+				//
+				// It USED to re-implement the WASM iteration loop instead:
+				// FindStringIndex repeatedly over text[off:], advancing by one
+				// after an empty match. That oracle carried the two defects the
+				// expectations were supposed to catch, so WASM and oracle
+				// agreed by being wrong the same way (FABLE T7):
+				//
+				//   (A) the narrowed slice hides the byte before `off`, so \b,
+				//       \B, (?m:^) and (?m:$) are judged against the slice edge;
+				//   (B) Go SUPPRESSES an empty match beginning where the
+				//       previous match ended, and the hand-rolled loop did not.
+				//
+				// Every DATA line this now reports names a row whose
+				// expectation encodes (A) or (B).
 				if col4 != "" && col4 != "-" {
-					var goAll [][]int
-					off := 0
-					for off <= len(text) {
-						m := re.FindStringIndex(text[off:])
-						if m == nil {
-							break
-						}
-						s := m[0] + off
-						e := m[1] + off
-						goAll = append(goAll, []int{s, e})
-						if e > s {
-							off = e
-						} else {
-							off = s + 1
-						}
-					}
+					goAll := re.FindAllStringIndex(text, -1)
 					expAll := parseCol4(col4)
 					if !col4Equal(goAll, expAll) {
 						nDataErrors++
@@ -478,11 +547,11 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				// correct find oracle either way. Previously gated behind
 				// `col0 == "-"`, which left find() completely unchecked for any
 				// row whose anchored match also succeeds, hiding real find-mode
-				// bugs (e.g. `a$00|^0` and `\b0|` vs "0" — see plans/FUZZER_BUGS.md).
+				// bugs (e.g. `a$00|^0` and `\b0|` vs "0").
 				if findFn == nil {
 					skipCount[skipNonAnchored]++
 				} else {
-					got, callErr := callFind(wd, store, findFn, findMemory, text)
+					got, callErr := callFind(wd, store, findFn, findMemory, text, 0)
 					if callErr != nil {
 						if isTimeout(callErr) {
 							if forceBacktrack {
@@ -580,8 +649,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					// col0: anchored match (no captures). Skipped for capturing
 					// patterns (groupsFn != nil) even when --validate-groups is
 					// off: col0 is written for groupsFn's non-full-consumption
-					// contract, not matchFn's full-consumption one — see
-					// plans/TODO.md task 46.
+					// contract, not matchFn's full-consumption one.
 					got, callErr := callMatch(wd, store, matchFn, memory, text)
 					if callErr != nil {
 						if isTimeout(callErr) {
@@ -626,8 +694,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					expAll := parseCol4(col4)
 					var gotAll [][2]int
 					offset := 0
+					prevEnd := -1
 					for offset <= len(text) {
-						r, callErr := callFind(wd, store, findFn, findMemory, text[offset:])
+						r, callErr := callFind(wd, store, findFn, findMemory, text, offset)
 						if callErr != nil {
 							if isTimeout(callErr) {
 								if forceBacktrack {
@@ -644,9 +713,19 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						if r == -1 {
 							break
 						}
-						s := int(r>>32) + offset
-						e := int(uint32(r)) + offset
-						gotAll = append(gotAll, [2]int{s, e})
+						s := int(r >> 32)
+						e := int(uint32(r))
+						// Go's FindAllIndex rule: suppress an EMPTY match
+						// beginning exactly where the previous reported match
+						// ended. This harness re-implements the stub iterator
+						// loop rather than driving a stub, so the rule has to
+						// live here too — moving the emitters alone would make
+						// this loop disagree with them and misattribute the
+						// difference to the engine.
+						if !(s == e && s == prevEnd) {
+							gotAll = append(gotAll, [2]int{s, e})
+							prevEnd = e
+						}
 						if e > s {
 							offset = e
 						} else {
@@ -730,7 +809,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				// the shape col5 never exercises (col5 always calls groups()
 				// at ptr=0): every generated stub's GroupsIter/generator
 				// re-enters at a nonzero ptr after the first match, and a bug
-				// in that composition (task 50: the whole-pattern
+				// in that composition (the whole-pattern
 				// single-capture shortcut left edgeScratchOff at its zero
 				// value instead of -1, so the groups wrapper scribbled an
 				// (origPtr,origEnd) scratch pair over table-memory offset 0
@@ -747,9 +826,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					copy(buf[inputBase:], text)
 					var gotAll [][]int32
 					offset := int32(0)
+					prevEnd := int32(-1)
 					textLen := int32(len(text))
 					for offset <= textLen {
-						endPos, slots, callErr := callGroupsAt(wd, groupsStore, groupsFn, groupsMemory, inputBase+offset, textLen-offset, numGroups)
+						endPos, slots, callErr := callGroupsAt(wd, groupsStore, groupsFn, groupsMemory, inputBase, textLen, offset, numGroups)
 						if callErr != nil {
 							if isTimeout(callErr) {
 								if forceBacktrack {
@@ -765,19 +845,21 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						if endPos < 0 {
 							break
 						}
+						// Slots are absolute already.
 						shifted := make([]int32, len(slots))
-						for i, v := range slots {
-							if v < 0 {
-								shifted[i] = -1
-							} else {
-								shifted[i] = offset + v
-							}
+						copy(shifted, slots)
+						// Go's FindAllSubmatchIndex rule, as in the col4 loop
+						// above: suppress an EMPTY match beginning exactly
+						// where the previous reported match ended.
+						absStart, absEnd := shifted[0], shifted[1]
+						if !(absStart == absEnd && absStart == prevEnd) {
+							gotAll = append(gotAll, shifted)
+							prevEnd = absEnd
 						}
-						gotAll = append(gotAll, shifted)
-						if relEnd := slots[1]; relEnd > 0 {
-							offset += relEnd
+						if absEnd > absStart {
+							offset = absEnd
 						} else {
-							offset++
+							offset = absStart + 1
 						}
 					}
 					if !col6Equal(gotAll, expAll) {
@@ -860,9 +942,23 @@ done:
 	}
 
 	if setsMode {
-		fmt.Printf("\n=== Set Mode Results ===\n")
+		fmt.Printf("\n=== Set Mode Results (all driven capabilities) ===\n")
 		fmt.Printf("passed:  %d\n", npassSet)
 		fmt.Printf("failed:  %d\n", nfailSet)
+		setStats.report()
+		// nfailSet is already the same total, taken as a delta per block; this
+		// makes the exit status independent of that bookkeeping.
+		nfailSet = setStats.totalFail()
+		nDataErrors += setStats.dataErrs
+		// Run-level gates: mass drops and systematic timeouts SHRINK what was
+		// checked instead of reporting a wrong answer, so neither moves
+		// setStats.fail and neither used to affect the exit status.
+		// --set-bt deliberately drives BT past its budget, so
+		// the timeout gate is lifted there as well as under --force-backtrack.
+		for _, p := range setStats.gateProblems(forceBacktrack || setBTFallback > 0) {
+			fmt.Printf("  GATE FAILURE: %s\n", p)
+			setGateFailures++
+		}
 	}
 
 	if nDataErrors > 0 {
@@ -874,8 +970,14 @@ done:
 	if nfailSet > 0 {
 		return fmt.Errorf("%d set test(s) failed", nfailSet)
 	}
+	if setGateFailures > 0 {
+		return fmt.Errorf("%d set run-level gate(s) failed", setGateFailures)
+	}
 	return nil
 }
+
+// setGateFailures counts the run-level gates gateProblems reported.
+var setGateFailures int
 
 // setBlockEntry holds one eligible pattern from a regexps block plus its result lines.
 type setBlockEntry struct {
@@ -883,14 +985,8 @@ type setBlockEntry struct {
 	results []string // one result line per testString
 }
 
-const (
-	setOutCap        = 65536 // max tuples per find_all batch
-	setOutTupleBytes = 12    // (pattern_id i32, start i32, length i32)
-)
+const setOutTupleBytes = 12 // (pattern_id i32, start i32, end i32)
 
-// testSetBlock compiles all patterns in entries as a set and runs find_all against
-// each string, comparing results against the per-pattern col4 (all matches) or col1
-// (first match) expected values from the re2 test data.
 // testSetBlockStats carries diagnostic counters from testSetBlock.
 type testSetBlockStats struct {
 	hasNonGreedy bool // at least one eligible pattern has a non-greedy quantifier
@@ -898,6 +994,16 @@ type testSetBlockStats struct {
 	nTimeout     int  // number of test strings where find_all timed out
 }
 
+// testSetBlock drives every declared set capability over one corpus block.
+//
+// The block's eligible patterns are split into chunks (--set-chunk), each
+// chunk is compiled once per selected capability profile (--set-profiles), and
+// every capability that profile declares is checked against a Go oracle built
+// once per chunk. See the header of setcaps.go.
+//
+// The returned counts are this block's contribution to the run total, taken as
+// a delta of setStats so they cover every capability the profiles drove. The
+// per-capability breakdown is setStats' own summary table.
 func testSetBlock(
 	entries []setBlockEntry,
 	testStrings []string,
@@ -907,232 +1013,185 @@ func testSetBlock(
 	likelyMatch bool,
 	likelyNoMatch bool,
 ) (npass, nfail int, stats testSetBlockStats, err error) {
-	type eligibleEntry struct {
-		orig  int // index into entries
-		entry setBlockEntry
-	}
-	var eligible []eligibleEntry
+	var (
+		pats []string
+		orig []int
+		cols [][]string
+	)
 	for i, e := range entries {
 		if preCheck(e.pattern) != "" {
 			continue // skip unicode etc.
 		}
-		if _, err := syntax.Parse(e.pattern, syntax.Perl); err != nil {
+		if _, perr := syntax.Parse(e.pattern, syntax.Perl); perr != nil {
 			continue // skip unsupported syntax (\C etc.)
 		}
-		eligible = append(eligible, eligibleEntry{orig: i, entry: e})
+		// The oracle is Go's own regexp, so a pattern Go will not compile
+		// cannot be given an expectation. syntax.Parse accepting it makes this
+		// unreachable in practice; it is here so a future divergence skips the
+		// pattern instead of panicking inside the oracle.
+		if _, cerr := regexp.Compile(e.pattern); cerr != nil {
+			continue
+		}
+		pats = append(pats, e.pattern)
+		orig = append(orig, i)
+		cols = append(cols, e.results)
 		if strings.Contains(e.pattern, "+?") || strings.Contains(e.pattern, "*?") || strings.Contains(e.pattern, "??") {
 			stats.hasNonGreedy = true
 		}
 	}
-	if len(eligible) < 2 {
+	if len(pats) < 2 {
 		return // not enough patterns to form a set
 	}
 
-	regexps := make([]config.RegexEntry, len(eligible))
-	for i, e := range eligible {
-		regexps[i] = config.RegexEntry{Pattern: e.entry.pattern}
-	}
 	var hints []string
 	if likelyMatch {
 		hints = []string{"prefer-match"}
 	} else if likelyNoMatch {
 		hints = []string{"prefer-no-match"}
 	}
-	cfg := config.BuildConfig{
-		Regexps: regexps,
-		Sets: []config.SetConfig{
-			{Name: "test", FindAll: "find_all", Patterns: config.PatternSelector{All: true}, Hints: hints},
-		},
-	}
 
-	wasmBytes, _, compErr := compile.CompileFile(cfg, "")
-	if compErr != nil {
-		nfail += len(eligible) * len(testStrings)
-		fmt.Printf("FAIL  set block compile error: %v\n      %d eligible pattern(s) in block:\n",
-			compErr, len(eligible))
-		for _, e := range eligible {
-			fmt.Printf("        [%d] %q\n", e.orig, e.entry.pattern)
-		}
-		return
+	profiles := activeSetProfiles
+	if len(profiles) == 0 {
+		p, _ := lookupSetProfile("all")
+		profiles = []setProfile{p}
 	}
-	stats.ran = true
+	var needAnchored, needSPM, needFindAll bool
+	for _, p := range profiles {
+		a, s, f := p.needs()
+		needAnchored = needAnchored || a
+		needSPM = needSPM || s
+		needFindAll = needFindAll || f
+	}
+	// The col4 cross-check below needs Go's FindAll even when no selected
+	// profile drives a gated find, and it is cheap next to the start-position
+	// map. Keeping it on means every run re-validates the corpus column that
+	// --sets originally compared against, rather than quietly dropping it.
+	needFindAll = true
 
-	mod, modErr := wasmtime.NewModule(engine, wasmBytes)
-	if modErr != nil {
-		err = fmt.Errorf("set block NewModule: %w", modErr)
-		return
-	}
-	store := wasmtime.NewStore(engine)
-	store.SetEpochDeadline(1)
-	inst, instErr := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
-	if instErr != nil {
-		err = fmt.Errorf("set block NewInstance: %w", instErr)
-		return
-	}
-	var mem *wasmtime.Memory
-	if exp := inst.GetExport(store, "memory"); exp != nil {
-		mem = exp.Memory()
-	}
-	findAllFn := inst.GetFunc(store, "find_all")
-	if mem == nil || findAllFn == nil {
-		err = fmt.Errorf("set block missing exports: memory=%v find_all=%v", mem != nil, findAllFn != nil)
-		return
-	}
-
-	// Place input after DFA tables (page-aligned), output after the longest
-	// input (page-aligned). Sizing outBase from the max input length avoids
-	// the input buffer overlapping the find_all tuple buffer when a single
-	// test string is larger than one page.
-	const pageSize = 65536
-	dataTop, _ := utils.ParseDataSectionBytes(wasmBytes)
-	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	maxInLen := 0
-	for _, s := range testStrings {
-		if len(s) > maxInLen {
-			maxInLen = len(s)
-		}
-	}
-	inputSpan := int32((maxInLen + pageSize - 1) / pageSize * pageSize)
-	if inputSpan < int32(pageSize) {
-		inputSpan = int32(pageSize)
-	}
-	outBase := inBase + inputSpan
-	outBytes := int64(setOutCap * setOutTupleBytes)
-
-	neededPages := uint64((int64(outBase) + outBytes + pageSize - 1) / pageSize)
-	if cur := mem.Size(store); neededPages > cur {
-		if _, growErr := mem.Grow(store, neededPages-cur); growErr != nil {
-			nfail += len(eligible) * len(testStrings)
-			err = fmt.Errorf("set block memory.Grow to %d pages: %w", neededPages, growErr)
-			return
-		}
-	}
-
-	buf := mem.UnsafeData(store)
-
-nextString:
-	for si, text := range testStrings {
-		if hasUnicode(text) {
+	timeoutsBefore := setStats.timeouts
+	passBefore, failBefore := setStats.totalPass(), setStats.totalFail()
+	for ci, chunk := range setChunksOf(pats, orig, cols) {
+		if ci%setSample != 0 {
+			setStats.skipped++
 			continue
 		}
-		if len(text) > 0 {
-			copy(buf[inBase:], []byte(text))
+		setStats.chunks++
+		orc, oerr := buildSetOracle(chunk.pats, testStrings, needAnchored, needSPM, needFindAll)
+		if oerr != nil {
+			return npass, nfail, stats, oerr
 		}
-
-		// Collect all find_all matches: gotMatches[patternID] = [][2]int{start,end}
-		gotMatches := make(map[int32][][2]int, len(entries))
-		startPos := int32(0)
-		for {
-			wd.Arm(store)
-			result, callErr := findAllFn.Call(store, inBase, int32(len(text)), outBase, int32(setOutCap), startPos)
-			wd.Disarm()
-			if callErr != nil {
-				if isTimeout(callErr) {
-					stats.nTimeout++
-					// Report only the first timeout per block to avoid flooding
-					// output when a giant set (e.g. re2-exhaustive's full pattern
-					// list) trips the 2s watchdog on every input. Subsequent
-					// timeouts are aggregated into stats.nTimeout and surfaced
-					// by the caller as skipTimeout entries.
-					if stats.nTimeout == 1 {
-						fmt.Printf("SKIP  set find_all TIMEOUT input=%q startPos=%d (%d eligible patterns; further timeouts in this block suppressed)\n",
-							text, startPos, len(eligible))
-					}
-					continue nextString
-				}
-				err = fmt.Errorf("set block find_all call (input=%q startPos=%d): %w", text, startPos, callErr)
-				return
+		crossCheckCol4(chunk, testStrings, orc)
+		for _, prof := range profiles {
+			if perr := runSetProfile(engine, wd, chunk, testStrings, orc, prof, hints, verbose); perr != nil {
+				// The PROFILE and the PATTERNS, not a bare wasmtime backtrace:
+				// a trap names a wasm function index and nothing else, and
+				// finding which of thousands of chunks produced it was a
+				// bisect. The --set-bt gate hit exactly that on
+				// its first run.
+				return npass, nfail, stats, fmt.Errorf("profile %s over %s: %w",
+					prof.name, fmtSetPatterns(chunk.pats), perr)
 			}
-			count := result.(int32)
-			if count == 0 {
-				break
-			}
-			var lastStart int32
-			for i := int32(0); i < count; i++ {
-				base := int(outBase) + int(i)*setOutTupleBytes
-				pid := int32(buf[base]) | int32(buf[base+1])<<8 | int32(buf[base+2])<<16 | int32(buf[base+3])<<24
-				start := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
-				length := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
-				gotMatches[pid] = append(gotMatches[pid], [2]int{int(start), int(start + length)})
-				lastStart = start
-			}
-			// find_all returns when EITHER the buffer is full (count == out_cap)
-			// OR the input has been fully scanned (count < out_cap). Only the
-			// buffer-full case needs a resume; otherwise we're done with this
-			// input. Without this guard we would re-scan [lastStart+1, inLen]
-			// after every successful scan, re-emitting the same matches and
-			// looping forever.
-			if int(count) < setOutCap {
-				break
-			}
-			// Resume one position past last.start: the WASM scan is
-			// position-by-position, so only positions <= lastStart have been
-			// visited. Advancing by last_len would skip positions inside the
-			// last match's span and miss overlapping matches.
-			startPos = lastStart + 1
+			stats.ran = true
 		}
+	}
+	stats.nTimeout = setStats.timeouts - timeoutsBefore
+	npass = setStats.totalPass() - passBefore
+	nfail = setStats.totalFail() - failBefore
+	return
+}
 
-		// Compare against each eligible pattern's expected results.
-		// pattern_id in the set output = index into eligible[].
-		for pi, el := range eligible {
-			if si >= len(el.entry.results) {
+// crossCheckCol4 compares the live Go oracle against the corpus's own col4
+// column wherever the corpus has one.
+//
+// This is the two-oracle discipline made mechanical. The original --sets run compared
+// the engine against col4; this file computes expectations from Go instead. If
+// the two ever disagree, one of them is wrong and the run must say so — a
+// silent switch of oracle would be exactly the FABLE B42 mistake, where the
+// comparison and its oracle were narrowed the same way and agreed while both
+// were wrong.
+func crossCheckCol4(chunk setChunk, strs []string, orc *setOracle) {
+	if orc.findAllByStr == nil {
+		return
+	}
+	for pi := range chunk.pats {
+		lines := chunk.cols[pi]
+		for si, text := range strs {
+			if si >= len(lines) || hasUnicode(text) {
 				continue
 			}
-			cols := strings.Split(el.entry.results[si], ";")
-
-			// Prefer col4 (all matches); fall back to col1 (first match).
-			var expected [][2]int
-			hasExpected := false
-			if len(cols) >= 5 {
-				col4 := strings.TrimSpace(cols[4])
-				if col4 != "" {
-					expected = parseCol4(col4)
-					hasExpected = true
-				}
+			c := strings.Split(lines[si], ";")
+			if len(c) < 5 {
+				continue
 			}
-			if !hasExpected && len(cols) >= 2 {
-				col1 := strings.TrimSpace(cols[1])
-				if col1 != "" && col1 != "-" {
-					if r := parseCol1(col1); r != -1 {
-						expected = [][2]int{{int(r >> 32), int(uint32(r))}}
-					}
-				}
-				hasExpected = true
+			col4 := strings.TrimSpace(c[4])
+			if col4 == "" {
+				continue
 			}
-			if !hasExpected {
-				continue // no expected data for this column
-			}
-
-			got := gotMatches[int32(pi)]
-			var matchOk bool
-			if len(cols) >= 5 && strings.TrimSpace(cols[4]) != "" {
-				// col4 available: exact match required.
-				matchOk = col4WasmEqual(got, expected)
-			} else if expected == nil {
-				// col1 = "-": no match expected.
-				matchOk = len(got) == 0
-			} else {
-				// col1 only: the expected first match must appear in got.
-				for _, g := range got {
-					if g == expected[0] {
-						matchOk = true
-						break
-					}
-				}
-			}
-			if matchOk {
-				npass++
-				if verbose {
-					fmt.Printf("PASS set pattern[%d] (orig %d): %q input=%q\n", pi, el.orig, el.entry.pattern, text)
-				}
-			} else {
-				nfail++
-				fmt.Printf("FAIL  set pattern[%d] (orig %d): %q\n      input:    %q\n      expected: %s\n      got:      %s\n",
-					pi, el.orig, el.entry.pattern, text, fmtCol4(expected), fmtCol4Wasm(got))
+			want := parseCol4(col4)
+			got := orc.findAllByStr[pi][si]
+			if !col4WasmEqual(got, want) {
+				setStats.dataErrs++
+				setFailf("DATA  set oracle disagrees with col4: pattern %q input %q\n      col4: %s\n      Go:   %s\n",
+					chunk.pats[pi], text, fmtCol4(want), fmtCol4(got))
 			}
 		}
 	}
-	return
+	crossCheckSPM(chunk, strs, orc)
+}
+
+// crossCheckSPM holds the oracle's two halves against each other.
+//
+// findAllByStr comes from Go's FindAllIndex on the RAW pattern; spm comes from
+// the per-position probe `\A(?s:.{p})(?:re-serialised pattern)`. The probe path
+// re-serialises through regexp/syntax (see normalizeSetOraclePattern) while
+// findAll does not, so a round-trip that changed the pattern's meaning would
+// leave the two halves quietly measuring different regexps — and each drive
+// consults only one of them.
+//
+// The invariant: the FIRST span FindAllIndex reports is the span the
+// lowest-position probe finds, because leftmost-first picks the earliest start
+// and then the same extent. Recorded as a DATA error, exactly as the col4
+// disagreement above is.
+func crossCheckSPM(chunk setChunk, strs []string, orc *setOracle) {
+	if orc.findAllByStr == nil || orc.spm == nil {
+		return
+	}
+	for pi := range chunk.pats {
+		if orc.spm[pi] == nil {
+			continue
+		}
+		for si, text := range strs {
+			if si >= len(orc.spm[pi]) || si >= len(orc.findAllByStr[pi]) || hasUnicode(text) {
+				continue
+			}
+			all, spm := orc.findAllByStr[pi][si], orc.spm[pi][si]
+			if len(all) == 0 != (len(spm) == 0) {
+				setStats.dataErrs++
+				setFailf("DATA  set oracle halves disagree on whether %q matches %q: FindAll %d spans, per-position probe %d\n",
+					chunk.pats[pi], text, len(all), len(spm))
+				continue
+			}
+			if len(all) == 0 {
+				continue
+			}
+			if all[0] != spm[0] {
+				setStats.dataErrs++
+				setFailf("DATA  set oracle halves disagree on the first match of %q in %q: FindAll %v, per-position probe %v\n",
+					chunk.pats[pi], text, all[0], spm[0])
+				continue
+			}
+			// The stronger form: replaying the gated selection from 0 over the
+			// per-position map must reproduce FindAllIndex exactly. That is
+			// what licenses spansFrom as the expectation for a drive starting
+			// at a nonzero `from`, where FindAllIndex cannot
+			// be asked directly.
+			if replay := orc.spansFrom(pi, si, 0, false); !col4WasmEqual(replay, all) {
+				setStats.dataErrs++
+				setFailf("DATA  gated replay from 0 disagrees with FindAll for %q in %q: replay %s, FindAll %s\n",
+					chunk.pats[pi], text, fmtCol4(replay), fmtCol4(all))
+			}
+		}
+	}
 }
 
 const wasmCallTimeout = 2 * time.Second
@@ -1151,8 +1210,8 @@ func newWatchdog(eng *wasmtime.Engine) *watchdog {
 		disarm: make(chan struct{}),
 	}
 	go func() {
-		for store := range w.arm {
-			store.SetEpochDeadline(1)
+		// The store itself is not touched here — see Arm.
+		for range w.arm {
 			select {
 			case <-time.After(wasmCallTimeout):
 				eng.IncrementEpoch()
@@ -1165,8 +1224,24 @@ func newWatchdog(eng *wasmtime.Engine) *watchdog {
 	return w
 }
 
-func (w *watchdog) Arm(store *wasmtime.Store) { w.arm <- store }
-func (w *watchdog) Disarm()                   { w.disarm <- struct{}{} }
+// Arm sets the store's epoch deadline ON THE CALLING GOROUTINE, then starts
+// the timer.
+//
+// The deadline used to be set inside the watchdog goroutine, which is a data
+// race on the Store: `w.arm <- store` returns as soon as the goroutine
+// RECEIVES, not after it finishes with the store, so the caller went straight
+// into fn.Call while the goroutine was still inside SetEpochDeadline on that
+// same store. wasmtime.Store is not thread-safe, so that is a race into cgo.
+// tools/fuzz/wasmrun.go fixed this; every set drive here ran through the racy
+// copy.
+//
+// Only eng.IncrementEpoch stays on the goroutine, which is the one operation
+// wasmtime documents as safe to call from another thread.
+func (w *watchdog) Arm(store *wasmtime.Store) {
+	store.SetEpochDeadline(1)
+	w.arm <- store
+}
+func (w *watchdog) Disarm() { w.disarm <- struct{}{} }
 
 // isTimeout reports whether a wasmtime error is an epoch interruption.
 func isTimeout(err error) bool {
@@ -1190,14 +1265,18 @@ func callMatch(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasm
 
 // callFind writes text into WASM linear memory and invokes the find function.
 // Returns packed (start<<32)|end as int64, or -1 on no match.
-func callFind(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string) (int64, error) {
+//
+// from is where the SEARCH starts; the whole of text is always visible to the
+// engine, so a leading \b, \B or (?m:^) at from > 0 is judged against the
+// real preceding byte. Positions come back absolute.
+func callFind(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, text string, from int) (int64, error) {
 	wd.Arm(store)
 	defer wd.Disarm()
 	if len(text) > 0 {
 		buf := mem.UnsafeData(store)
 		copy(buf[inputBase:], text)
 	}
-	result, err := fn.Call(store, inputBase, int32(len(text)))
+	result, err := fn.Call(store, inputBase, int32(len(text)), int32(from))
 	if err != nil {
 		return 0, err
 	}
@@ -1224,7 +1303,7 @@ func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *was
 	}
 	wd.Arm(store)
 	defer wd.Disarm()
-	result, err := fn.Call(store, inputBase, int32(len(text)), slotsBase)
+	result, err := fn.Call(store, inputBase, int32(len(text)), slotsBase, int32(0))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1248,11 +1327,14 @@ func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *was
 // iterator, etc.) calls groups() at successive nonzero ptr values into the
 // SAME underlying buffer — it never re-writes a substring back to address 0
 // between calls. callGroups' per-call re-copy makes every call start from a
-// pristine buffer, which is exactly what hides TODO.md task 50's bug class
+// pristine buffer, which is exactly what hides an earlier task's bug class
 // (a wrapper-composition bug that corrupts memory at address 0 as a side
 // effect of one call, only visible on the NEXT call into the same,
 // un-rewritten buffer).
-func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, ptr, length int32, numGroups int) (int32, []int32, error) {
+// from bounds where the SEARCH starts; ptr/length always describe the whole
+// input, so a leading \b, \B or (?m:^) is judged against the real preceding
+// byte. Returned slots are absolute.
+func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, ptr, length, from int32, numGroups int) (int32, []int32, error) {
 	buf := mem.UnsafeData(store)
 	for i := 0; i < numGroups*2; i++ {
 		off := slotsBase + int32(i*4)
@@ -1263,7 +1345,7 @@ func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *w
 	}
 	wd.Arm(store)
 	defer wd.Disarm()
-	result, err := fn.Call(store, ptr, length, slotsBase)
+	result, err := fn.Call(store, ptr, length, slotsBase, from)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1449,6 +1531,18 @@ func col4Equal(goAll [][]int, exp [][2]int) bool {
 }
 
 // col4WasmEqual compares WASM iteration results against parsed col4 pairs.
+// sortSpanPairs orders spans by (start, end) so a multiset comparison can be
+// done element-wise: the order of the tuples within one `find` call is
+// unspecified by the set ABI.
+func sortSpanPairs(v [][2]int) {
+	sort.Slice(v, func(i, j int) bool {
+		if v[i][0] != v[j][0] {
+			return v[i][0] < v[j][0]
+		}
+		return v[i][1] < v[j][1]
+	})
+}
+
 func col4WasmEqual(got [][2]int, exp [][2]int) bool {
 	if len(got) != len(exp) {
 		return false
@@ -1536,28 +1630,25 @@ func fmtCol6(all [][]int32) string {
 // match's own relative end, or off++ if that's zero) rather than Go's
 // FindAllStringSubmatchIndex, which skips empty matches adjacent to the
 // previous one. Matches tools/likelytest's expectedGroupsAll.
+// expectedGroupsAllGo is col6's oracle: Go's own FindAllStringSubmatchIndex
+// over the WHOLE input.
+//
+// It used to re-implement the stub iterators' loop over
+// text[off:], which made it carry the same two defects as the code it was
+// meant to check — see the col4 oracle above for what (A) and (B) are.
 func expectedGroupsAllGo(re *regexp.Regexp, text string) [][]int32 {
-	var all [][]int32
-	off := 0
-	for off <= len(text) {
-		sub := re.FindStringSubmatchIndex(text[off:])
-		if sub == nil {
-			break
-		}
-		shifted := make([]int32, len(sub))
+	subs := re.FindAllStringSubmatchIndex(text, -1)
+	all := make([][]int32, 0, len(subs))
+	for _, sub := range subs {
+		row := make([]int32, len(sub))
 		for i, v := range sub {
 			if v < 0 {
-				shifted[i] = -1
+				row[i] = -1
 			} else {
-				shifted[i] = int32(v + off)
+				row[i] = int32(v)
 			}
 		}
-		all = append(all, shifted)
-		if relEnd := sub[1]; relEnd > 0 {
-			off += relEnd
-		} else {
-			off++
-		}
+		all = append(all, row)
 	}
 	return all
 }

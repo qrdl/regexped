@@ -11,8 +11,13 @@ wasm_file: "regexps.wasm"  # output path for the compile command; overridable wi
 import_module: "mymod"     # WASM module name used by wasm-merge and Rust/Go FFI
 stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .js, .ts, .go, .h
 stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c, as
+namespace:      "acme"     # optional; prefixes the symbols a stub declares that YOU did not name
+                           #   (Span, SetMatch, the error type, the pattern-name helper, C's rx_*_t)
+                           #   so two stubs can share one package. No-op for Rust, whose
+                           #   `pub mod <import_module>` already isolates each stub.
 max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
+max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
 
 regexps:
   - pattern: 'https?://...' # RE2 regexp pattern
@@ -23,20 +28,43 @@ regexps:
     # An entry with only 'pattern' is valid; no code is generated for it.
     match_func:        "url_match"         # anchored match
     find_func:         "url_find"          # non-anchored find
-    groups_func:       "url_groups"        # anchored match with all capture groups
-    named_groups_func: "url_named_groups"  # anchored match with named capture groups
+    groups_func:       "url_groups"        # match iterator; each item is that match's capture groups
 
     hints: [prefer-match, batch-find]   # optional; see "hints:" below
 
 sets:
   - name: "my_set"             # unique set name
-    find_all: "scan_all"       # non-anchored: all matches, streamed in batches
-    find_any: "scan_first"     # non-anchored: first match only (optional)
-    match: "validate"          # anchored at position 0 (optional)
+    # Five capabilities; declare the ones you need (at least one).
+    match_any:  "which"        # anchored (whole input): one pattern id, or -1
+    match_all:  "which_all"    # anchored: every matching pattern id
+    scan_any:   "first_hit"    # non-anchored: one pattern id, or -1
+    scan_all:   "all_kinds"    # non-anchored: every pattern matching somewhere
+    find:       "locate"       # non-anchored: positions and extents
+    overlapping: false         # optional; default false = per-pattern non-overlapping
     emit_name_map: true        # emit patternName(id) lookup helper in stubs
     patterns: all              # "all" or list of name: values from regexps:
-    hints: [prefer-no-match]   # optional; per-set default; "batch-find" is not valid here, see below
+    hints: [batch-find]        # optional; see "hints:" below
 ```
+
+> **Three set keys were retired and are now load errors.**
+>
+> - **`match:` and `scan:`** — `match_any(...) >= 0` is exactly what `match`
+>   returned and `scan_any(...) >= 0` what `scan` returned, and the redundancy
+>   measured at 1-3% of module size. They were DROPPED rather than repurposed:
+>   a surviving `match:` with `match_any` semantics would leave every existing
+>   config compiling while its callers silently switched from reading 0/1 to
+>   reading an id — and id 0 would read as "no match".
+> - **`find_batch:`** — batching is no longer a second capability but a
+>   property of `find`, requested with `hints: [batch-find]` on the set. At the
+>   API level the two were never distinguishable: both iterate the same matches
+>   in the same order, and the cursor and gate array are stub-owned and
+>   invisible. The only caller-visible difference is how much work one host
+>   crossing does, which is a parameter, not a name.
+
+> **Config parsing is strict.** Any unknown key anywhere in the file is a
+> line-numbered load error. That catches typos (`mach_func:`) and the retired
+> set keys `match`, `scan`, `find_batch`, `find_any`, `find_all` and
+> `batch_size` — see [sets.md](sets.md#the-five-capabilities).
 
 All paths in the config file are resolved relative to the config file's directory.
 A leading `~/` in `output`, `wasm_file`, `stub_file` or `wasm_merge` is expanded to
@@ -45,8 +73,9 @@ a shell can resolve another user's home).
 
 ### Export-name rules
 
-Every `match_func`, `find_func`, `groups_func` and `named_groups_func` value, and every
-set's `find_any`, `find_all` and `match` value, becomes both a WASM export name and a
+Every `match_func`, `find_func` and `groups_func` value, and every
+set capability value (`match_any`, `match_all`, `scan_any`, `scan_all`,
+`find`), becomes both a WASM export name and a
 function name in the generated stub. Because they are written verbatim into generated
 source, they are validated when the config is loaded, before any compile or generate work
 runs. A violation is a hard error: nothing is written and the exit status is non-zero.
@@ -84,13 +113,22 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 |---|---|---|
 | `import_module` must be a valid identifier and not a keyword of that language | `rust`, `go` | Emitted as `pub mod <name>` / `package <name>`. A hyphenated `import_module: "my-mod"` stays legal for `js`/`ts`, which never emit it. |
 | `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. |
-| Export names must not collide with a generator helper (`init`, `_w`, `_resize`, `_exp`, `_mem`, `_inBase`, `_outBase`, `_enc`, `_patternNames`, `patternName`, and `SetMatch` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_live`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, `_patternNames`, `patternName`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `SetMatch`, `PatternName`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
+| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `pattern_name`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`) | `c` | Same reason. |
+| Export names must not collide with a generator helper (`SetMatch`, `patternName`, `RX_ERR_BT_OVERFLOW`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
 | Export names must not start with `ffi_` | `rust`, `go` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
-| Export names must not collide after the snake_case → PascalCase transform | `rust`, `go` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Go function / Rust iterator type. This also rejects a name that transforms to `SetMatch`, the struct the set stubs declare. |
+| Export names must not collide after the snake_case → PascalCase transform | `rust` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Rust iterator TYPE. Go dropped out of this rule: its names are now emitted verbatim, so nothing there transforms. |
+| An export must not be named `<X>Iter` for another find/groups export `X` | `go`, `as` | Every find or groups export declares an iterator type of that name. This is Go's real collision surface, where the PascalCase rule above is not. |
+| An export must not collide with a symbol DERIVED from another export (`<func>_index`, `<func>_names`, `<func>_count`, `<func>_indices`, `<func>_iter`, in the base name's own casing style) | all | `groups_func: parse` emits `parse_index` and friends; a second export literally named `parse_index` duplicates the symbol. |
+| `namespace:` must be a valid identifier and not a reserved word | all | It is interpolated verbatim into generated identifiers in Go/JS/TS/AS/C. |
+| An export must not be the blank identifier `_` | all | Shape-legal, but `pub fn _` is invalid Rust and `func _()` is invalid Go. |
+| Capture group names must be usable as identifiers, unique, and not collide after sanitising | all, when `groups_func` is set | Group names become generated constants and a name→index lookup. `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`; both would collapse to one generated symbol, so this check is ours. |
+| Capture group names must not be `index`, `names`, `count` or `indices` | all, when `groups_func` is set | Those are the suffixes the generators derive from the `groups_func` name, so a group of that name produces the same symbol twice in one file. |
 
 ### Engine selection
 
-Setting `groups_func` or `named_groups_func` triggers capture-tracking compilation:
+Setting `groups_func` triggers capture-tracking compilation:
 - **TDFA engine** — used when the pattern has no non-greedy quantifiers, no line anchors, no word boundaries, and no ambiguous alternations (Laurikari's tagged DFA, O(n))
 - **Backtracking engine** — used automatically as a fallback for patterns that are not TDFA-eligible (e.g. `(a|ab)`, `(a*)(a*)`)
 
@@ -108,10 +146,14 @@ ever applies between `prefer-match` and `prefer-no-match`:
 - **`prefer-match`** — biases the compiler's code-shape choice for fast-accept.
 - **`prefer-no-match`** — biases for fast-reject. Mutually exclusive with
   `prefer-match`.
-- **`batch-find`** — requests a `<func>_batch` WASM export for this pattern's
-  `find_func` and/or `groups_func` (see below). **Valid only on `regexps:`
-  entries** — it is a load-time error on a `sets:` entry (sets have their own
-  `find_all` batching via `batch_size`, a separate mechanism).
+- **`batch-find`** — requests batching. On a `regexps:` entry it emits a
+  `<func>_batch` WASM export for that pattern's `find_func` and/or
+  `groups_func` (see below). On a `sets:` entry it emits one alongside the
+  set's `find` and gives the generated `find` an optional `batchSize`
+  parameter; it requires `find` on the same set, since there is otherwise
+  nothing to batch. Emission is keyed on the HINT and never on `stub_type` —
+  keying a module's export surface on the stub language would break the rule
+  below that changing `stub_type` never breaks a working config.
 
 An absent or empty `hints:` list keeps the default (`LikelyNeutral`, no batch
 export). The `prefer-match`/`prefer-no-match` choice never affects match
@@ -120,8 +162,11 @@ correctness — only which optimisation path is emitted.
 A pattern's own `prefer-match`/`prefer-no-match` takes precedence over its
 enclosing set's `hints:` (and a set's own suffix-body compilation falls back
 to its `hints:` when a member pattern doesn't set its own). `batch-find` has
-no set-level fallback to resolve, since it's rejected on `sets:` entries
-outright.
+no fallback to resolve: it is read on the entry (or set) that carries it, and
+each one decides for itself. On a `regexps:` entry it requires `find_func` or
+`groups_func`, and on a `sets:` entry it requires `find` — there is otherwise
+nothing to batch, and accepting the hint anyway would leave the caller
+believing they had asked for something.
 
 See [prefer-hints.md](prefer-hints.md) for the full `prefer-match`/
 `prefer-no-match` mechanism, which pattern shapes benefit, and how to
@@ -132,12 +177,11 @@ measure the effect on your own patterns with `tools/pattest`.
 Setting `hints: [batch-find]` on a `regexps:` entry adds a `<func>_batch` WASM
 export — `(ptr, len, out_ptr, out_cap, start_pos) → count` — that drains
 multiple matches per host call instead of one, for `find_func` and
-`groups_func` (`named_groups_func` shares `groups_func`'s batch export when
-both are set on the same entry, or gets its own — named after itself — when
-`named_groups_func` is the only capture export requested).
+`groups_func`. One capability means one batch export and one name; the rule
+about two capture keys sharing an export went with `named_groups_func`.
 
 **⚠ This hint is effective for the JS and TS generators only.** The generated
-JS/TS `find_func`/`groups_func`/`named_groups_func` consumer feature-detects
+JS/TS `find_func`/`groups_func` consumer feature-detects
 the `_batch` export at runtime and prefers it automatically — no stub-side
 configuration needed, and the same generated stub works unmodified whether or
 not `batch-find` was set. **Setting `batch-find` has no effect on stubs
@@ -238,75 +282,82 @@ Generates a stub file (Rust, JS, TypeScript, Go, or C) from the config. The stub
 
 #### Rust stubs
 
-All entries are wrapped in a single `pub mod <import_module> { }` block.
+Wraps every entry in one `pub mod <import_module> { … }` block.
 
 | Config field | Generated function | Return type |
 |---|---|---|
-| `match_func` | `<func>(input)` | `Option<usize>` |
-| `find_func` | `<func>(input)` | `FindIter` — yields `(usize, usize)` per match |
-| `groups_func` | `<func>(input)` | `GroupsIter` — yields `Vec<Option<(usize, usize)>>` per match |
-| `named_groups_func` | `<func>(input)` | `NamedGroupsIter` — yields `HashMap<&'static str, (usize, usize)>` per match |
+| `match_func` | `<func>(input)` | `Result<Option<usize>>` |
+| `find_func` | `<func>(input, offset)` | `<Func>Iter` — yields `Result<(usize, usize)>` |
+| `groups_func` | `<func>(input, offset)` | `<Func>Iter` — yields `Result<Vec<Option<Span>>>` |
 
-See [rust-api.md](rust-api.md) for full usage examples.
+Every export reports a Backtracking overflow as `Err(Error::BacktrackOverflow)`;
+the iterators are fused. See [rust-api.md](rust-api.md).
 
 #### Go stubs (`GOOS=wasip1`)
 
-Generates a `//go:build wasip1` file using `//go:wasmimport` declarations plus a `//go:build !wasip1` host stub for IDE compatibility.
-Requires `import_module` in config (used as the Go package name).
-Requires Go 1.23+ (iterators use `iter.Seq2` / `iter.Seq`).
+Generates a `//go:build wasip1` file using `//go:wasmimport` declarations.
+Requires `import_module` in config (used as the Go package name) and Go 1.23+
+(iterators use `iter.Seq2` / `iter.Seq`).
 
 | Config field | Generated function | Return type |
 |---|---|---|
-| `match_func` | `<PascalCase>(input []byte)` | `(int, bool)` — end pos and match flag |
-| `find_func` | `<PascalCase>(input []byte)` | `iter.Seq2[int, int]` — (start, end) per match |
-| `groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[[][]int]` — slice of [start,end] per match |
-| `named_groups_func` | `<PascalCase>(input []byte)` | `iter.Seq[map[string][]int]` — name→[start,end] per match |
+| `match_func` | `<func>(input []byte)` | `(end uint, ok bool, err error)` |
+| `find_func` | `<func>(input []byte, offset uint)` | `*<func>Iter` — `Matches() iter.Seq2[uint, uint]`, `Err() error` |
+| `groups_func` | `<func>(input []byte, offset uint)` | `*<func>Iter` — `Matches() iter.Seq[[]Span]`, `Err() error` |
 
-Function names are derived by converting `snake_case` config names to `PascalCase`
-(e.g. `url_match` → `UrlMatch`).
+**Function names are your config names, verbatim** — `url_match` stays
+`url_match`. The PascalCase transform is gone. In a library package that leaves
+the symbol unexported; the generator warns once rather than renaming it. See
+[go-api.md](go-api.md).
 
-#### JS stubs
+#### JS and TS stubs
 
-Generates a single ES module. Exports an `init(wasm)` function that must be called with the WASM bytes or a pre-compiled `WebAssembly.Module` before any matcher is used.
+A single ES module. `init(wasm)` must be awaited before any matcher is used.
 
-| Config field | Generated JS export | Returns |
+| Config field | Generated export | Yields |
 |---|---|---|
-| `match_func` | `function <func>(input)` | `[number, boolean]` — `[endPos, matched]` |
-| `find_func` | `function* <func>(input)` | generator yielding `[start, end]` per match |
-| `groups_func` | `function* <func>(input)` | generator yielding `Array<[start,end]\|null>` per match |
-| `named_groups_func` | `function* <func>(input)` | generator yielding `Object` (name→`[start,end]`) per match |
+| `match_func` | `function <func>(input)` | `number \| null` |
+| `find_func` | `function* <func>(input, offset)` | `[start, end]` per match |
+| `groups_func` | `function* <func>(input, offset)` | `Array<[start, end] \| null>` per match |
 
-#### TS stubs
-
-Same as JS stubs but with TypeScript type annotations.
+Overflow **throws**, which is JS's own error channel. TS is the same surface
+with type annotations. See [js-api.md](js-api.md) and [ts-api.md](ts-api.md).
 
 #### C stubs
 
-Generates a single `#pragma once` header file. Requires `import_module` in config.
-No libc or sysroot required — uses `__attribute__((import_module(...), import_name(...)))` for WASM imports.
+A `#pragma once` header plus a `.c`. No libc or sysroot required.
 
 | Config field | Generated functions | Notes |
 |---|---|---|
-| `match_func` | `<func>(input, len)` | Returns end position (≥0) or -1 |
-| `find_func` | `<func>_next(input, len, *start, *end)` + `<func>_reset()` | Static offset state; call reset before iterating |
-| `groups_func` | `<func>_next(input, len, slots[])` + `<func>_reset()` | `slots[i*2]`/`[i*2+1]` = start/end for group i; -1 if absent |
-| `named_groups_func` | same as groups + `<func>_get(slots, name, *start, *end)` | Hardcoded name→index mapping |
+| `match_func` | `ptrdiff_t <func>(input, len)` | end position, `-1`, or `RX_ERR_BT_OVERFLOW` |
+| `find_func` | `<func>_init` + `<func>_next(iter, &match)` | caller-owned iterator; `1` / `0` / `RX_ERR_BT_OVERFLOW` |
+| `groups_func` | `<func>_init` + `<func>_next(iter, groups)` | fills the caller's `rx_group_t[]` |
+
+C returns sentinels — it has no unwinding, and its return types were already
+error codes. See [c-api.md](c-api.md).
 
 #### AS stubs (AssemblyScript)
 
-Generates a single AssemblyScript `.ts` file using `@external` declarations. Requires `import_module` in config. Must set `stub_type: "as"` — `.ts` extension alone infers TypeScript.
-
-**`named_groups_func` is not supported for AS stubs.** Use `groups_func` and access slots by index instead.
-
-Input is `ArrayBuffer` (use `String.UTF8.encode(str)` to convert from string). All functions are stateless — the caller passes an `offset` argument and no module-level state is mutated.
+An AssemblyScript `.ts` using `@external` declarations. Requires
+`import_module`, and `stub_type: "as"` — a `.ts` extension alone infers
+TypeScript. Input is `ArrayBuffer`.
 
 | Config field | Generated function | Returns |
 |---|---|---|
-| `match_func` | `<func>(input: ArrayBuffer): i32` | End position (≥0) or -1 if no match |
-| `find_func` | `<func>(input: ArrayBuffer, offset: i32): i64` | Packed `(absStart << 32 \| absEnd)` or -1 if not found |
-| `groups_func` | `<func>(input: ArrayBuffer, offset: i32): i32` | `dataStart` pointer to static `Int32Array` slots, or 0 on no match |
+| `match_func` | `<func>(input): i32` | end position, `-1`, or `RX_ERR_BT_OVERFLOW` |
+| `find_func` | `<func>(input, offset): <func>_iter` | `next(): i64` — packed pair, `-1`, or `RX_ERR_BT_OVERFLOW` |
+| `groups_func` | `<func>(input, offset): <func>_iter` | `next(): u32` — slot pointer, `0`, or `RX_ITER_ERROR` |
 
-See [as-api.md](as-api.md) for full usage examples and slot layout.
+AssemblyScript returns sentinels, not exceptions: `asc` cannot `catch`, and a
+`throw` there compiles to an uncatchable `abort`. See [as-api.md](as-api.md).
+
+#### Named capture groups
+
+There is no `named_groups_func` — it was retired, because it was never a
+separate capability: both stubs called the same WASM export. When a pattern has
+at least one named group, `groups_func` additionally emits a constant per named
+group plus `<func>_index` and `<func>_names` (an index object in JS/TS). This
+also gives C and AssemblyScript named access, which they never had.
 
 ---
 
@@ -342,7 +393,7 @@ otherwise it participates only as a member of the set(s) that select it.
 
 #### `sets:` block — multi-pattern set composition
 
-When the config contains a `sets:` block, `compile` also emits multi-pattern set-match functions. Each set entry produces up to three exported WASM functions.
+When the config contains a `sets:` block, `compile` also emits multi-pattern set-match functions. Each set entry produces one exported WASM function per declared capability, plus a batch entry when it asks for one.
 
 ```yaml
 regexps:
@@ -353,10 +404,10 @@ regexps:
 
 sets:
   - name: secret_scanner
-    find_all: scan_secrets   # non-anchored: returns all matches with positions
-    find_any: scan_first     # non-anchored: returns first match only (optional)
-    match: validate_secret   # anchored at position 0 (optional)
-    batch_size: 256          # output buffer size (stub-gen knob; default 256)
+    find: scan_secrets       # non-anchored: matches at the next matching position
+    scan_any: which_secret   # non-anchored: one pattern id, or -1 (optional)
+    match_any: validate      # anchored (whole input): one pattern id (optional)
+    hints: [batch-find]      # optional: work several positions ahead per call
     emit_name_map: true      # emit pattern_name(id) helper in stubs
     patterns:
       - aws_key              # list of regexps.name values
@@ -367,13 +418,18 @@ sets:
 | `sets:` field | Required | Description |
 |---|---|---|
 | `name` | Yes | Unique set name |
-| `find_all` | At least one | Export name for non-anchored all-matches function |
-| `find_any` | At least one | Export name for non-anchored first-match function |
-| `match` | At least one | Export name for anchored match function (position 0) |
+| `match_any` | At least one | Anchored (whole input): one matching pattern id, or -1 |
+| `match_all` | At least one | Anchored: every matching pattern id |
+| `scan_any` | At least one | Non-anchored, takes `offset`: one pattern id, or -1. Reports NO position |
+| `scan_all` | At least one | Non-anchored: every pattern matching somewhere |
+| `find` | At least one | Non-anchored: every match at the next matching position — the only capability reporting positions and extents |
+| `overlapping` | No | `false` (default) = per-pattern non-overlapping; `true` = every start position. Affects `find` only, and is silently ignored on a set without it |
 | `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
-| `batch_size` | No | Output buffer hint for stub iterators (default 256) |
 | `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
-| `hints` | No | `[prefer-match]` or `[prefer-no-match]`; per-set LikelyMode default. `batch-find` is rejected here — see [`hints:`](#hints--likelymode-and-batch-find-compile-hints) above |
+| `hints` | No | `[prefer-match]` or `[prefer-no-match]` (per-set LikelyMode default), and/or `[batch-find]`, which requires `find` — see [`hints:`](#hints--likelymode-and-batch-find-compile-hints) above |
+
+`match:`, `scan:` and `find_batch:` are **retired keys** and are load errors;
+see the note under the schema above.
 
 The `name:` field on `regexps:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
 

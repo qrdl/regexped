@@ -38,9 +38,9 @@ regexped generate   →  generate TypeScript ES module stub
 ## How it works
 
 Four patterns (`select`, `insert`, `update`, `delete`) are compiled into a set
-with `match: validate_sql` and `emit_name_map: true`. The generated stub exports
-`validate_sql(input)` which returns `{ patternId, start, end }` or `null`, and
-`patternName(id)` which maps the pattern ID to its name. One WASM call per
+with `match_any: validate_sql` and `emit_name_map: true`. The generated stub
+exports `validate_sql(input)`, which returns the id of a pattern matching the
+whole input or `null`, and `patternName(id)`, which maps that id to its name. One WASM call per
 statement validates syntax and identifies the statement type.
 
 Patterns check required structural keywords (FROM for SELECT, INTO+VALUES for

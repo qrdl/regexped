@@ -234,7 +234,7 @@ func TestIsAlternationDeterministicPaths(t *testing.T) {
 }
 
 // TestIsAlternationDeterministicQuantifierLoop exercises the quantifierLoop=true
-// branch added by task 13 (commit c9436b8): a quantifier-loop InstAlt whose
+// branch added in commit c9436b8: a quantifier-loop InstAlt whose
 // continuation and exit first-byte sets overlap is now TDFA-eligible (the
 // overlap alone no longer forces Backtracking, since TDFA's LeftmostFirst
 // priority always prefers the loop body over the exit regardless of overlap).
@@ -442,7 +442,7 @@ func TestSelectEngine_UnicodeWithOpt(t *testing.T) {
 	}
 }
 
-// TestSelectBestEngineWithTDFA_TableReuse pins plans/OPUS.md §N8b's contract:
+// TestSelectBestEngineWithTDFA_TableReuse pins the table-reuse contract:
 // the selector hands back the TDFA table it had to build to answer the
 // eligibility question, and it does so exactly when it answers EngineTDFA.
 // compilePattern reuses that table instead of rebuilding it; a nil return on a

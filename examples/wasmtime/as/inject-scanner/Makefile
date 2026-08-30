@@ -13,7 +13,11 @@ STUB       := stub.ts
 all: run
 
 # Step 1 – generate AssemblyScript stub from config
-$(STUB): regexped.yaml
+# $(REGEXPED) is a prerequisite of every rule below that runs it: the generated
+# stubs and the compiled .wasm depend on the COMPILER as much as on the config.
+# Without it a rebuild after a compiler change keeps the stale .wasm and the
+# merge fails with an import/export type mismatch.
+$(STUB): regexped.yaml $(REGEXPED)
 	$(REGEXPED) generate --config=regexped.yaml
 
 generate: $(STUB)
@@ -28,13 +32,13 @@ $(MAIN_WASM): index.ts $(STUB) node_modules/.package-lock.json
 build: $(MAIN_WASM)
 
 # Step 3 – compile threat patterns to WASM (two sets in one module)
-$(THREAT_WASM): regexped.yaml
+$(THREAT_WASM): regexped.yaml $(REGEXPED)
 	$(REGEXPED) compile --config=regexped.yaml
 
 compile: $(THREAT_WASM)
 
 # Step 4 – merge main WASM and threat patterns WASM into a single module
-$(FINAL_WASM): $(MAIN_WASM) $(THREAT_WASM) regexped.yaml
+$(FINAL_WASM): $(MAIN_WASM) $(THREAT_WASM) regexped.yaml $(REGEXPED)
 	$(REGEXPED) merge --config=regexped.yaml --main=$(MAIN_WASM) $(THREAT_WASM)
 
 merge: $(FINAL_WASM)

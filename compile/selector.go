@@ -35,7 +35,7 @@ func selectBestEngine(prog *syntax.Prog, opts *CompileOptions) EngineType {
 // from the same prog and the same CompileOptions. Callers that override the
 // engine choice (CompileForced) must therefore still handle a nil table.
 //
-// See plans/OPUS.md §N8b and IMPROVEMENT_PLAN §8.
+
 func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineType, *tdfaTable) {
 	// Analyse pattern complexity and DFA viability
 	analysis := analysePattern(prog)
@@ -311,8 +311,8 @@ func hasLineAnchors(prog *syntax.Prog) bool {
 // computable, since TDFA's LeftmostFirst priority always prefers the loop
 // body over the exit — "does this byte continue the loop or start the exit"
 // resolves correctly even when the exit's first-byte set overlaps the loop's
-// own class (e.g. X([a-zA-Z]+)Y, where Y is itself a class member) — see
-// plans/TODO.md task 13. This used to also require no further quantifier loop
+// own class (e.g. X([a-zA-Z]+)Y, where Y is itself a class member).
+// This used to also require no further quantifier loop
 // reachable past the exit branch, working around a bug where a second loop
 // over an overlapping alphabet corrupted TDFA's tag-op register-copy
 // ordering (e.g. ([a-z]+)(er)([a-z]+)); that bug is now fixed at its root in
@@ -547,7 +547,7 @@ func isEpsilonAccept(prog *syntax.Prog, pc int) bool {
 // (empty first-rune set — Gap I's inverted-class signal, CLAUDE.md
 // "Load-bearing engine-selection gates") is still treated as ambiguous; only
 // the disjoint-ness requirement between two otherwise-computable branches is
-// skipped (task 13), since TDFA's LeftmostFirst priority resolves that case
+// skipped, since TDFA's LeftmostFirst priority resolves that case
 // correctly regardless of overlap.
 func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop bool) bool {
 	if altPC >= len(prog.Inst) {
@@ -579,7 +579,7 @@ func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop boo
 	}
 
 	if quantifierLoop {
-		return true // both sides computable; overlap alone doesn't matter for a greedy loop (task 13)
+		return true // both sides computable; overlap alone doesn't matter for a greedy loop
 	}
 
 	for r := range leftRunes {

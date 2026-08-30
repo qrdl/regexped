@@ -434,7 +434,7 @@ func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
 
 // TestTDFAAllZeroTagOpsSkip exercises the "if !anyHasOps { return b }" early
 // skip in emitTDFATagOps, reached when the whole TDFA transition table has
-// zero register-set/copy ops — TEST.md T28. ()a has one zero-width capture
+// zero register-set/copy ops — the test plan T28. a has one zero-width capture
 // group, resolved entirely via entry ops before the first byte-consuming
 // transition (anyHasOps=false).
 func TestTDFAAllZeroTagOpsSkip(t *testing.T) {
@@ -444,7 +444,7 @@ func TestTDFAAllZeroTagOpsSkip(t *testing.T) {
 // TestTDFAMinimizeRegistersApplyColoring exercises the block in
 // minimizeTDFARegisters that rewrites tagOps/acceptOps/acceptRegMap after
 // graph coloring finds a real register-count reduction (guarded by
-// newNumRegs < numRegs) — TEST.md T29. Two alternated, order-swapped
+// newNumRegs < numRegs) — the test plan T29. Two alternated, order-swapped
 // capture groups inside a `+` loop give the construction-time canonical
 // register numbering more registers than liveness analysis actually needs.
 // Confirmed live: numRegs is minimised to 19 (well below the raw tag count),
@@ -461,7 +461,7 @@ func TestTDFAMinimizeRegistersApplyColoring(t *testing.T) {
 }
 
 // TestTDFAU16TableAddressing exercises the useU8=false (2-byte state ID)
-// branch of buildTDFAMatchBody/emitTDFATagOps — TEST.md T30. Bounded
+// branch of buildTDFAMatchBody/emitTDFATagOps — the test plan T30. Bounded
 // repetition unrolls into many states without necessarily blowing up
 // register count: confirmed live via newTDFA, this pattern has 511 states
 // (> 256, forcing u16) and 24 registers (within the default 32-register
@@ -480,10 +480,10 @@ func TestTDFAU16TableAddressing(t *testing.T) {
 
 // TestTDFAEpsWalkAltFallthrough exercises the "try inst.Arg after inst.Out
 // fails" fallback in tdfaEpsCapOps/tdfaEpsCapOpsTo's InstAlt handling —
-// TEST.md T31. (?:(a)|(b)): the nested alternation's Out branch doesn't
+// the test plan T31. (?:(a)|(b)): the nested alternation's Out branch doesn't
 // reach the target/capture being searched for, so the epsilon walk must
 // fall through to Arg. Top-level Op is OpAlternate (not OpCapture/OpConcat),
-// so task 41's whole-pattern-single-capture shortcut never applies
+// so the whole-pattern-single-capture shortcut never applies
 // regardless of MaxCap — confirmed live.
 func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:(a)|(b))`, GroupsFunc: "g"}})
@@ -491,9 +491,9 @@ func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
 
 // TestTDFAStartThreadOffMainEntry exercises startThreads[i]'s capture-op
 // discovery via tdfaEpsCapOpsTo for a start PC that isn't the main entry
-// target (newTDFA's comment: "e.g. (a*) reaching InstMatch") — TEST.md T32.
+// target (newTDFA's comment: "e.g. (a*) reaching InstMatch") — the test plan T32.
 // (a*) alone reaches InstMatch via a pure-epsilon path from Start, exactly
-// the mechanism this targets — but it also trips task 41's whole-pattern-
+// the mechanism this targets — but it also trips the whole-pattern-
 // single-capture shortcut (MaxCap()==1, confirmed live), which would bypass
 // TDFA construction entirely. (a*)(b*) keeps both groups nullable (so
 // InstMatch is still reachable via pure epsilon from Start, preserving the

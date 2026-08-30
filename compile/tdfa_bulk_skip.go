@@ -13,7 +13,7 @@ import "github.com/qrdl/regexped/internal/utils"
 // during such a run is dead except the last — the whole run can be skipped
 // with a SIMD scan and a single register write for the final position.
 //
-// This is a different optimization from Task 7's plain-DFA dominant
+// This is a different optimization from the plain-DFA dominant
 // self-loop bulk-skip (detectDominantSelfLoop/emitDominantBulkSkip): that
 // machinery is tuned for large self-loop / tiny exit-set states (e.g. `.`
 // inside a comment body) and is the wrong polarity for Gap F's population,
@@ -129,7 +129,7 @@ func detectTDFABulkSkip(tt *tdfaTable) *tdfaBulkSkipInfo {
 //
 // midAcceptTail, when non-nil, is emitted just after info.ops in the K > 0
 // branch. It carries the per-byte mid-accept bookkeeping the scalar loop
-// does and this routine otherwise skips wholesale (plans/FABLE.md B16):
+// does and this routine otherwise skips wholesale:
 // state is unchanged across the whole run, so if it is mid-accepting then
 // every skipped position was an accept of the same state and a single
 // check at the final position reproduces the scalar invariant exactly.

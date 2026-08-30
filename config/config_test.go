@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
@@ -17,8 +18,6 @@ func TestCaptureStubsRequested(t *testing.T) {
 		{RegexEntry{MatchFunc: "m"}, false},
 		{RegexEntry{FindFunc: "f"}, false},
 		{RegexEntry{GroupsFunc: "g"}, true},
-		{RegexEntry{NamedGroupsFunc: "ng"}, true},
-		{RegexEntry{GroupsFunc: "g", NamedGroupsFunc: "ng"}, true},
 	}
 	for _, c := range cases {
 		if got := c.entry.CaptureStubsRequested(); got != c.want {
@@ -33,8 +32,6 @@ func TestGroupsExportName(t *testing.T) {
 		want  string
 	}{
 		{RegexEntry{GroupsFunc: "grp"}, "grp"},
-		{RegexEntry{NamedGroupsFunc: "ng"}, "ng"},
-		{RegexEntry{GroupsFunc: "grp", NamedGroupsFunc: "ng"}, "grp"},
 		{RegexEntry{}, ""},
 	}
 	for _, c := range cases {
@@ -193,8 +190,8 @@ func TestValidateSets_Valid(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}, {Name: "p2", Pattern: "bar"}},
 		Sets: []SetConfig{
-			{Name: "s1", FindAny: "s1_any", Patterns: PatternSelector{All: true}},
-			{Name: "s2", FindAll: "s2_all", Patterns: PatternSelector{Names: []string{"p1"}}},
+			{Name: "s1", ScanAny: "s1_any", Patterns: PatternSelector{All: true}},
+			{Name: "s2", ScanAll: "s2_all", Patterns: PatternSelector{Names: []string{"p1"}}},
 		},
 	}
 	if err := ValidateSets(cfg); err != nil {
@@ -205,7 +202,7 @@ func TestValidateSets_Valid(t *testing.T) {
 func TestValidateSets_DuplicateRegexName(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "dup", Pattern: "foo"}, {Name: "dup", Pattern: "bar"}},
-		Sets:    []SetConfig{{Name: "s", FindAny: "ma", Patterns: PatternSelector{All: true}}},
+		Sets:    []SetConfig{{Name: "s", ScanAny: "ma", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for duplicate regexp name, got nil")
@@ -216,8 +213,8 @@ func TestValidateSets_DuplicateSetName(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
 		Sets: []SetConfig{
-			{Name: "same", FindAny: "a", Patterns: PatternSelector{All: true}},
-			{Name: "same", FindAll: "b", Patterns: PatternSelector{All: true}},
+			{Name: "same", ScanAny: "a", Patterns: PatternSelector{All: true}},
+			{Name: "same", ScanAll: "b", Patterns: PatternSelector{All: true}},
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -228,7 +225,7 @@ func TestValidateSets_DuplicateSetName(t *testing.T) {
 func TestValidateSets_UnknownPatternRef(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "known", Pattern: "foo"}},
-		Sets:    []SetConfig{{Name: "s", FindAny: "ma", Patterns: PatternSelector{Names: []string{"unknown"}}}},
+		Sets:    []SetConfig{{Name: "s", ScanAny: "ma", Patterns: PatternSelector{Names: []string{"unknown"}}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for unknown pattern reference, got nil")
@@ -248,7 +245,7 @@ func TestValidateSets_NoExportField(t *testing.T) {
 func TestValidateSets_MissingSetName(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
-		Sets:    []SetConfig{{FindAny: "ma", Patterns: PatternSelector{All: true}}},
+		Sets:    []SetConfig{{ScanAny: "ma", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for set with missing name, got nil")
@@ -346,7 +343,7 @@ func TestValidateSets_RegexSetExportCollision(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo", MatchFunc: "shared"}},
 		Sets: []SetConfig{
-			{Name: "s1", FindAll: "shared", Patterns: PatternSelector{All: true}},
+			{Name: "s1", ScanAll: "shared", Patterns: PatternSelector{All: true}},
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -358,7 +355,7 @@ func TestValidateSets_MissingPatternsField(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}},
 		Sets: []SetConfig{
-			{Name: "s1", FindAny: "s1_any"}, // patterns omitted entirely
+			{Name: "s1", ScanAny: "s1_any"}, // patterns omitted entirely
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -370,7 +367,7 @@ func TestValidateSets_DuplicatePatternInSet(t *testing.T) {
 	cfg := &BuildConfig{
 		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}},
 		Sets: []SetConfig{
-			{Name: "s1", FindAny: "s1_any", Patterns: PatternSelector{Names: []string{"p1", "p1"}}},
+			{Name: "s1", ScanAny: "s1_any", Patterns: PatternSelector{Names: []string{"p1", "p1"}}},
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
@@ -389,7 +386,7 @@ func TestValidHints(t *testing.T) {
 		{[]string{"prefer-no-match"}, true},
 		{[]string{"prefer-match", "prefer-no-match"}, false},
 		{[]string{"bogus"}, false},
-		// batch-find (task 44): valid alone and combined with either of the
+		// batch-find: valid alone and combined with either of the
 		// other two, since it's orthogonal to the prefer-match/prefer-no-match
 		// exclusion.
 		{[]string{"batch-find"}, true},
@@ -404,19 +401,30 @@ func TestValidHints(t *testing.T) {
 	}
 }
 
-// TestValidateHintList_BatchFindRejectedForSets verifies validateHintList's
-// isSet parameter: "batch-find" is a load-time error on a sets: entry (sets
-// have their own find_all batching), distinct from being merely unrecognised.
-func TestValidateHintList_BatchFindRejectedForSets(t *testing.T) {
-	if err := validateHintList([]string{"batch-find"}, false); err != nil {
-		t.Errorf("validateHintList(batch-find, isSet=false) = %v, want nil", err)
+// TestBatchFindOnSets covers the hint's history: "batch-find" USED TO
+// BE a load-time error on a sets: entry and is now how a set asks for batching
+// at all, replacing the retired `find_batch:` key. It still requires `find` on
+// the same set — with nothing to batch, silently ignoring it would leave the
+// caller believing they had asked for something.
+func TestBatchFindOnSets(t *testing.T) {
+	if err := validateHintList([]string{"batch-find"}); err != nil {
+		t.Errorf("validateHintList(batch-find) = %v, want nil", err)
 	}
-	err := validateHintList([]string{"batch-find"}, true)
-	if err == nil {
-		t.Fatal("validateHintList(batch-find, isSet=true) = nil, want error")
+	withFind := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+		"  - name: s\n    find: sf\n    hints: [batch-find]\n    patterns: all\n"
+	cfg, err := LoadConfig(writeCfg(t, withFind))
+	if err != nil {
+		t.Fatalf("batch-find with find: %v", err)
 	}
-	if got := err.Error(); got != `"batch-find" is not valid for sets` {
-		t.Errorf("validateHintList(batch-find, isSet=true) error = %q, want the sets-specific message", got)
+	if !cfg.Sets[0].BatchFind() {
+		t.Error("BatchFind() = false on a set with find: and hints: [batch-find]")
+	}
+	noFind := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+		"  - name: s\n    scan_any: sa\n    hints: [batch-find]\n    patterns: all\n"
+	if _, err := LoadConfig(writeCfg(t, noFind)); err == nil {
+		t.Error("batch-find without find: expected an error")
+	} else if !strings.Contains(err.Error(), "batch-find") {
+		t.Errorf("error should name the hint, got: %v", err)
 	}
 }
 
@@ -468,7 +476,7 @@ func TestLoadConfig_SetHintsMutuallyExclusive(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_BatchFindInvalidForSets verifies "batch-find" (task 44) is a
+// TestLoadConfig_BatchFindInvalidForSets verifies "batch-find" is a
 // load-time error on a sets: entry — sets have their own find_all batching
 // (batch_size) and don't wire up the per-pattern _batch export mechanism.
 func TestLoadConfig_BatchFindInvalidForSets(t *testing.T) {
@@ -520,5 +528,187 @@ func TestLoadConfig_ValidateSetsError(t *testing.T) {
 	}
 	if _, err := LoadConfig(path); err == nil {
 		t.Error("expected ValidateSets error to surface through LoadConfig, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The seven-capability schema and strict parsing (
+// the capability grid).
+
+// writeCfg writes yaml to a temp regexped.yaml and returns its path.
+func writeCfg(t *testing.T, yaml string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "regexped.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
+	// The retired keys are caught loudly by strict parsing rather than by a
+	// targeted "renamed to" message. The `match:` meaning change is
+	// deliberately NOT catchable here — that lives in the migration notes.
+	cases := []struct {
+		name, key, yaml string
+	}{
+		{"find_all", "find_all", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_all: sf\n    patterns: all\n"},
+		{"find_any", "find_any", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_any: sf\n    patterns: all\n"},
+		{"batch_size", "batch_size", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find: sf\n    batch_size: 128\n    patterns: all\n"},
+		// Retired keys: `match:` and `scan:` and
+		// `find_batch:` (decision (11)). Dropping the KEYS rather than
+		// repurposing them is the point — a surviving `match:` with match_any
+		// semantics would leave every existing config compiling while its
+		// callers silently switched from reading 0/1 to reading an id.
+		{"match", "match", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    match: sm\n    patterns: all\n"},
+		{"scan", "scan", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan: ss\n    patterns: all\n"},
+		{"find_batch", "find_batch", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n"},
+		// Retired. It was never a separate capability — both
+		// stubs called the SAME WASM export — so `groups_func` plus the
+		// generated name→index constants replaces it, and C and AS gain named
+		// access they never had.
+		{"named_groups_func", "named_groups_func", "regexps:\n  - pattern: '(?P<a>x)'\n    named_groups_func: ng\n"},
+		{"typo", "mach_func", "regexps:\n  - pattern: 'foo'\n    mach_func: m\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := LoadConfig(writeCfg(t, c.yaml))
+			if err == nil {
+				t.Fatalf("expected an unknown-field error naming %q", c.key)
+			}
+			if !strings.Contains(err.Error(), c.key) {
+				t.Fatalf("error should name the offending key %q, got: %v", c.key, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_OverlappingRoundTrips(t *testing.T) {
+	base := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find: sf\n    patterns: all\n"
+	cfg, err := LoadConfig(writeCfg(t, base))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Sets[0].Overlapping {
+		t.Error("overlapping must default to false (the gated body is the default, D11)")
+	}
+	if !cfg.Sets[0].Gated() {
+		t.Error("a set without overlapping: true is gated")
+	}
+
+	cfg, err = LoadConfig(writeCfg(t, base+"    overlapping: true\n"))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Sets[0].Overlapping {
+		t.Error("overlapping: true did not round-trip")
+	}
+	if cfg.Sets[0].Gated() {
+		t.Error("overlapping: true selects the ungated body")
+	}
+}
+
+// TestLoadConfig_OverlappingWithoutFindIsIgnored: `overlapping` selects
+// between two find bodies. On a set declaring neither `find` nor `find_batch`
+// there is no body to select, so the key has no effect and is accepted rather
+// than rejected — a harmless key should not be a build failure.
+func TestLoadConfig_OverlappingWithoutFindIsIgnored(t *testing.T) {
+	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan_any: sc\n    overlapping: true\n    patterns: all\n"
+	cfg, err := LoadConfig(writeCfg(t, yaml))
+	if err != nil {
+		t.Fatalf("overlapping without find must be ignored, got error: %v", err)
+	}
+	if cfg.Sets[0].Gated() {
+		t.Error("a set with no find capability gates nothing")
+	}
+	if cfg.Sets[0].HasFind() {
+		t.Error("HasFind must be false for a scan-only set")
+	}
+}
+
+// TestLoadConfig_BatchFindIsNotACapability: batching
+// batching is a property of `find`, not a capability of its own. A batch-only
+// set — legal until then — no longer exists, and asking for batching adds
+// nothing to Capabilities().
+func TestLoadConfig_BatchFindIsNotACapability(t *testing.T) {
+	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+		"  - name: s\n    find: fb\n    hints: [batch-find]\n    patterns: all\n"
+	cfg, err := LoadConfig(writeCfg(t, yaml))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Sets[0].HasFind() || !cfg.Sets[0].Gated() {
+		t.Error("a find set is gated by default")
+	}
+	caps := cfg.Sets[0].Capabilities()
+	if len(caps) != 1 || caps[0].Field != "find" || caps[0].Name != "fb" {
+		t.Errorf("batching must not appear as a capability: %+v", caps)
+	}
+}
+
+// TestLoadConfig_BatchNameCollision: a set's `find` synthesizes <find>_batch
+// under `hints: [batch-find]`, exactly as a pattern's find_func does, so no
+// capability may be NAMED into that space and no two owners may claim the same
+// synthesized name. Reserved whether or not the hint is present today —
+// otherwise adding the hint to a working config would turn a valid export into
+// a duplicate.
+func TestLoadConfig_BatchNameCollision(t *testing.T) {
+	ending := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+		"  - name: s\n    find: my_batch\n    patterns: all\n"
+	if _, err := LoadConfig(writeCfg(t, ending)); err == nil {
+		t.Fatal("a set capability ending in _batch must be rejected")
+	}
+	collide := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n" +
+		"  - name: s\n    scan_any: ff_batch\n    patterns: all\n"
+	if _, err := LoadConfig(writeCfg(t, collide)); err == nil {
+		t.Fatal("a set capability claiming a pattern's synthesized batch name must be rejected")
+	}
+	ok := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n" +
+		"  - name: s\n    find: set_find\n    hints: [batch-find]\n    patterns: all\n"
+	if _, err := LoadConfig(writeCfg(t, ok)); err != nil {
+		t.Fatalf("a non-colliding batching set must be accepted, got: %v", err)
+	}
+}
+
+func TestSetCapabilities(t *testing.T) {
+	s := SetConfig{
+		Name: "s", MatchAny: "ma", MatchAll: "mall",
+		ScanAny: "sa", ScanAll: "sall", Find: "f",
+	}
+	got := s.Capabilities()
+	want := []string{"match_any", "match_all", "scan_any", "scan_all", "find"}
+	if len(got) != len(want) {
+		t.Fatalf("Capabilities() returned %d entries, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].Field != want[i] {
+			t.Errorf("Capabilities()[%d].Field = %q, want %q", i, got[i].Field, want[i])
+		}
+	}
+	if (SetConfig{}).HasExports() {
+		t.Error("a set with no capability keys has no exports")
+	}
+}
+
+func TestValidateSets_AllCapabilityNamesValidated(t *testing.T) {
+	// Every capability value goes through the identifier/reserved-word check,
+	// exactly like the per-pattern _func fields.
+	for _, key := range []string{"match_any", "match_all", "scan_any", "scan_all", "find"} {
+		t.Run(key, func(t *testing.T) {
+			yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    " + key + ": struct\n    patterns: all\n"
+			_, err := LoadConfig(writeCfg(t, yaml))
+			if err == nil {
+				t.Fatalf("%s: a reserved word must be rejected as an export name", key)
+			}
+		})
+	}
+}
+
+func TestValidateSets_NoCapabilityIsError(t *testing.T) {
+	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    patterns: all\n"
+	_, err := LoadConfig(writeCfg(t, yaml))
+	if err == nil {
+		t.Fatal("a set declaring no capability must be rejected")
 	}
 }

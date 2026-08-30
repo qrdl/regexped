@@ -11,7 +11,13 @@ fn main() {
     let input = args[1].as_bytes();
 
     match url_ipv6::match_ipv6_url(input) {
-        Some(end) => println!("Valid IPv6 URL (matched {} bytes)", end),
-        None      => println!("Not a valid IPv6 URL"),
+        Ok(Some(end)) => println!("Valid IPv6 URL (matched {} bytes)", end),
+        Ok(None)      => println!("Not a valid IPv6 URL"),
+        // The engine could not answer — NOT the same as "no match". See
+        // docs/engines.md, "Backtracking stack overflow".
+        Err(err)      => {
+            eprintln!("cannot decide: {err}");
+            std::process::exit(2);
+        }
     }
 }

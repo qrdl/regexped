@@ -14,7 +14,6 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-
 func parseTestRe(t *testing.T, pattern string) *syntax.Regexp {
 	t.Helper()
 	re, err := syntax.Parse(pattern, syntax.Perl)
@@ -107,7 +106,7 @@ var wasmMagic = []byte{0x00, 0x61, 0x73, 0x6d}
 
 // wasmValidator locates a WASM validator once per test binary.
 //
-// plans/FABLE.md T4: this whole file used to accept any byte string starting
+// This whole file used to accept any byte string starting
 // with the magic header as "a valid WASM module", which is how B15's u16 TDFA
 // table addressing — an operand order that never once produced a well-typed
 // function — sat behind a green TestTDFAU16TableAddressing. Compiling a module
@@ -137,7 +136,7 @@ func validateWASM(t *testing.T, wasm []byte) {
 	t.Helper()
 	argv := wasmValidator()
 	if argv == nil {
-		t.Log("neither wasm-tools nor wasmtime found in PATH: skipping WASM validation (see plans/FABLE.md T4)")
+		t.Log("neither wasm-tools nor wasmtime found in PATH: skipping WASM validation")
 		return
 	}
 	path := filepath.Join(t.TempDir(), "m.wasm")
@@ -200,10 +199,7 @@ func TestCompileIntegrationTDFA(t *testing.T) {
 		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}})
 	})
 	t.Run("named_groups", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", NamedGroupsFunc: "ng"}})
-	})
-	t.Run("groups_and_named", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", GroupsFunc: "g", NamedGroupsFunc: "ng"}})
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}})
 	})
 	t.Run("find_and_groups", func(t *testing.T) {
 		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a+)(b+)", FindFunc: "f", GroupsFunc: "g"}})
@@ -228,7 +224,7 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	})
 	t.Run("named_groups_forced", func(t *testing.T) {
 		_, _, err := CompileForced(
-			[]config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", NamedGroupsFunc: "ng"}},
+			[]config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
@@ -649,7 +645,7 @@ func TestCompileMatchBodyCompressed(t *testing.T) {
 // is compiled LL, and buildDFALayout raises hasImmAccept only under LF, so the
 // match body has never emitted one. (The original comment here claimed the
 // opposite; coverage showed the branch at 0.) The dead plumbing was removed in
-// 2026-08-18 — see plans/IMPROVEMENT_PLAN.md #7. Kept as a compile smoke test
+// 2026-08-18. Kept as a compile smoke test
 // for the empty-match-at-start shape.
 func TestCompileMatchBodyImmediateAccept(t *testing.T) {
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a*", MatchFunc: "m"}},
@@ -1101,7 +1097,7 @@ func TestCmdCompile_WithSets(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: []config.RegexEntry{{Name: "p", Pattern: `foo\w+`}},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "s_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "s_all", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	if err := CmdCompile(cfg, out); err != nil {
@@ -1125,15 +1121,22 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 			{Name: "p3", Pattern: `(quux)`, GroupsFunc: "qg"},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s1", FindAll: "s1_all", Patterns: config.PatternSelector{All: true}},
-			{Name: "s2", FindAny: "s2_any", Patterns: config.PatternSelector{Names: []string{"p1", "p2"}}},
+			{Name: "s1", Find: "s1_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s2", Find: "s2_any", Patterns: config.PatternSelector{Names: []string{"p1", "p2"}}},
 		},
 	}
 
-	t.Run("no_sets_returns_nil", func(t *testing.T) {
+	t.Run("no_sets_is_an_error", func(t *testing.T) {
+		// It used to return nil: `--diag-json=out.json` on a set-less config
+		// wrote no file and said nothing, leaving the user with a missing
+		// file and no explanation.
 		empty := config.BuildConfig{Regexps: cfg.Regexps}
-		if err := CmdWriteDiagJSON(empty, "", ""); err != nil {
-			t.Errorf("expected nil, got %v", err)
+		err := CmdWriteDiagJSON(empty, "", "")
+		if err == nil {
+			t.Fatal("expected an error for a config with no sets")
+		}
+		if !strings.Contains(err.Error(), "no sets") {
+			t.Errorf("the error does not say why: %v", err)
 		}
 	})
 
@@ -1181,7 +1184,7 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 // TestCompileLenientAltFindBody exercises the Phase 2a lenient-alternation
 // find body in compilePattern, reached when analyseLitChainAltLenient
 // succeeds after the strict analysers fail, gated by
-// shouldTryLitChainAlt(pattern) — TEST.md T33. The real sql-inject perftest
+// shouldTryLitChainAlt(pattern) — the test plan T33. The real sql-inject perftest
 // pattern's first branch contains a nested (?:OR|AND) alternation
 // (OpAlternate), which makes shouldTryLitChainAlt bail out early and keep
 // the pattern lit-chain-alt-eligible; confirmed live that
@@ -1191,14 +1194,14 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 func TestCompileLenientAltFindBody(t *testing.T) {
 	const pattern = `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`
 	if !shouldTryLitChainAlt(pattern) {
-		t.Fatalf("shouldTryLitChainAlt(%q) = false, want true (test pattern no longer trips the T33 gate)", pattern)
+		t.Fatalf("shouldTryLitChainAlt(%q) = false, want true (test pattern no longer trips the lit-chain-alt gate)", pattern)
 	}
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "sql_inject_find"}})
 }
 
 // TestCompileTDFARegLimitExceededForced exercises the
 // "ok && tt.numRegs > resolveMaxTDFARegs(&buildOpts)" fallback-to-Backtrack
-// re-check in compilePattern — TEST.md T34. Only reachable when
+// re-check in compilePattern — the test plan T34. Only reachable when
 // forceGroupsEngine bypasses the selector's own register estimate (unlike
 // TestCompileTDFARegLimit, which goes through the normal, unforced
 // selectBestEngine path and so never reaches TDFA construction at all for a
@@ -1213,7 +1216,7 @@ func TestCompileTDFARegLimitExceededForced(t *testing.T) {
 	}
 }
 
-// TestCompileBTStackTooLarge — FUZZER_BUGS.md #32. A no-capture find
+// TestCompileBTStackTooLarge — a past defect. A no-capture find
 // pattern shaped like N sequential `(?:$*<literal>)` groups drives the
 // Backtracking find-fallback's DFA past MaxDFAStates (the DFA-too-large
 // gate that routes it to Backtracking), and btAllocSizes' stackSize formula
@@ -1222,7 +1225,7 @@ func TestCompileTDFARegLimitExceededForced(t *testing.T) {
 // whose memory section was already invalid (fails at
 // wasmtime.NewModule/instantiation time); Compile must now reject it.
 //
-// Superseded by FUZZER_BUGS.md #33 (checkBTLoopCount): this exact pattern
+// Superseded by a past defect (checkBTLoopCount): this exact pattern
 // shape's stackSize growth is driven by the same per-loop frameSize term
 // that also drives its Backtracking-JIT cost, so N=256's 256 loop-frame
 // locals now trip the earlier, more specific ErrBTLoopCountTooLarge before
@@ -1240,7 +1243,7 @@ func TestCompileBTStackTooLarge(t *testing.T) {
 
 // TestCompileBTStackWithinBudget — originally confirmed the same pattern
 // shape at a size just under the 4GiB ceiling (N=255) still compiled
-// successfully. FUZZER_BUGS.md #33 supersedes that expectation: N=255 has
+// successfully. a past defect supersedes that expectation: N=255 has
 // 255 loop-frame locals, an isolated live measurement of which cost ~12s of
 // wasmtime JIT time (see checkBTLoopCount's doc) — legitimately fitting
 // under WASM32's memory ceiling does not mean it is safe to compile, and
@@ -1254,7 +1257,7 @@ func TestCompileBTStackWithinBudget(t *testing.T) {
 	}
 }
 
-// TestCompileBTLoopCountTooLarge — FUZZER_BUGS.md #33
+// TestCompileBTLoopCountTooLarge — a past defect
 // (tools/fuzz/testdata/fuzz/FuzzCorrectness/092700-8c386fe83b176a61, itself
 // a bug-31 regression-corpus entry that still crashed real `-fuzz` fuzzing
 // via an unbounded wasmtime JIT-time cost). N=114 sequential
@@ -1284,7 +1287,7 @@ func TestCompileBTLoopCountWithinBudget(t *testing.T) {
 	}
 }
 
-// TestCompileBTEmptyBodyLoopChainTooLarge — FUZZER_BUGS.md #34
+// TestCompileBTEmptyBodyLoopChainTooLarge — a past defect
 // (tools/fuzz/found/20260815-142901, five repros of
 // `(?m:$*$*...$*0$)`-shaped patterns). 16 chained `$*` compiles fine (well
 // under checkBTLoopCount's JIT-time cap) but takes over a second of
@@ -1309,7 +1312,7 @@ func TestCompileBTEmptyBodyLoopChainWithinBudget(t *testing.T) {
 }
 
 // TestCompileFuzzRepro143548 directly regression-tests the fuzz-discovered
-// hang (FUZZER_BUGS.md #34):
+// hang:
 // tools/fuzz/found/20260815-142901/143548-4c06db1f6419e310 and four
 // byte-identical-root-cause siblings all hung `go test -fuzz` on
 // `(?m:$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*0$)` (16 chained `$*`) against a
@@ -1328,7 +1331,7 @@ func TestCompileFuzzRepro143548(t *testing.T) {
 }
 
 // TestCompileFuzzRepro092700 directly regression-tests the fuzz-discovered
-// crash (FUZZER_BUGS.md #33): tools/fuzz/testdata/fuzz/FuzzCorrectness/
+// crash: tools/fuzz/testdata/fuzz/FuzzCorrectness/
 // 092700-8c386fe83b176a61 crashed `go test -fuzz` because compiling
 // `(?:$*llllllll0){200}` succeeded but took ~6s of wasmtime JIT time with
 // no bound, exceeding the fuzz worker's hang-classification threshold under
@@ -1345,9 +1348,9 @@ func TestCompileFuzzRepro092700(t *testing.T) {
 
 // TestCompileBTCaptureWithMemoTwoGroups exercises the useMemo=true
 // initialization block in buildBacktrackBody for the capture path —
-// TEST.md T35. TestCompileBTCaptureWithMemo's pattern ((?:a?)+?) has a
+// the test plan T35. TestCompileBTCaptureWithMemo's pattern ((?:a?)+?) has a
 // single capture spanning the whole pattern (MaxCap()==1) and is not
-// itself ^-anchored, so task 41's whole-pattern-single-capture shortcut
+// itself ^-anchored, so the whole-pattern-single-capture shortcut
 // (compile.go, isWholePatternSingleCapture) now intercepts it before it
 // ever reaches TDFA/BT selection — confirmed live via isAnchoredFind/
 // isWholePatternSingleCapture probing. ((?:a?)+?)(b) has two capture
@@ -1361,7 +1364,7 @@ func TestCompileBTCaptureWithMemoTwoGroups(t *testing.T) {
 // TestCompileEmbeddedLitAnchorTableMemIdx exercises the tableMemIdx = 1
 // branch (!standalone) inside both the single-pattern lit-anchor and the
 // alt-lit-anchor dispatch-body-generation paths in assembleModule —
-// TEST.md T36. All existing lit-anchor/alt-lit-anchor tests use
+// the test plan T36. All existing lit-anchor/alt-lit-anchor tests use
 // standalone=true; this compiles the same pattern shapes with
 // standalone=false.
 func TestCompileEmbeddedLitAnchorTableMemIdx(t *testing.T) {
@@ -1378,13 +1381,13 @@ func TestCompileEmbeddedLitAnchorTableMemIdx(t *testing.T) {
 }
 
 // TestCmdCompile_ErrorPaths exercises the four distinct error/IO branches in
-// CmdCompile — TEST.md T37.
+// CmdCompile — the test plan T37.
 func TestCmdCompile_ErrorPaths(t *testing.T) {
 	t.Run("compile_file_error_with_sets", func(t *testing.T) {
 		cfg := config.BuildConfig{
 			Regexps: []config.RegexEntry{{Name: "bad", Pattern: `[`}},
 			Sets: []config.SetConfig{
-				{Name: "s", FindAny: "f", Patterns: config.PatternSelector{All: true}},
+				{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 			},
 		}
 		if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "out.wasm")); err == nil {
@@ -1426,7 +1429,7 @@ func TestCmdCompile_ErrorPaths(t *testing.T) {
 
 // TestCmdWriteDiagJSON_DroppedPatternError exercises the analyzePattern
 // error path in CmdWriteDiagJSON, propagated as `continue` (silently
-// dropping the pattern from the set's diagnostics) — TEST.md T38.
+// dropping the pattern from the set's diagnostics) — the test plan T38.
 func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: []config.RegexEntry{
@@ -1434,7 +1437,7 @@ func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 			{Name: "good", Pattern: `foo`},
 		},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	dir := t.TempDir()
@@ -1454,7 +1457,7 @@ func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 // TestCompileAutoSelectEngine exercises the `else { engineType =
 // selectBestEngine(prog, &options) }` branch in compile() — calling the
 // private compile() helper WITHOUT an explicit ForceEngine, unlike every
-// production caller (which always sets ForceEngine: EngineDFA) — TEST.md
+// production caller (which always sets ForceEngine: EngineDFA) — the test plan
 // T39.
 func TestCompileAutoSelectEngine(t *testing.T) {
 	t.Run("backtrack_via_gap_i", func(t *testing.T) {
@@ -1471,12 +1474,12 @@ func TestCompileAutoSelectEngine(t *testing.T) {
 	})
 }
 
-// TestCompileBTCaptureBudgetIncludesMemoTable — FABLE.md B25. The BT
+// TestCompileBTCaptureBudgetIncludesMemoTable — a past defect. The BT
 // capture path checked only the stack against WASM32's 4GiB ceiling, then
 // went on to reserve the BitState memo table (up to MemoBudget) and, for
 // patterns needing true-input edge context, an 8-byte (origPtr,origEnd)
 // scratch. A reservation whose stack ended just below the ceiling therefore
-// passed the check yet declared memory past it — FUZZER_BUGS.md #32's
+// passed the check yet declared memory past it — a past defect’s
 // failure mode again (a generic wasmtime instantiation error instead of a
 // clear compile error).
 //

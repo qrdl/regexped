@@ -1,0 +1,5 @@
+# TDFA capture path: greedy, no non-greedy quantifiers, no line anchors, no
+# word boundaries, no ambiguous alternations.
+regexps:
+  - pattern: '(?P<scheme>https?)://(?P<host>[a-z.]+)/(?P<path>[a-z/]*)'
+    groups_func: tdfa_groups

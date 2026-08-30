@@ -6,7 +6,11 @@ all: run
 
 # Compile the 10-pattern set to a standalone WASM module.
 # No merge step: the set WASM is self-contained (exports its own memory).
-compile: regexped.yaml
+# $(REGEXPED) is a prerequisite of every rule below that runs it: the generated
+# stubs and the compiled .wasm depend on the COMPILER as much as on the config.
+# Without it a rebuild after a compiler change keeps the stale .wasm and the
+# merge fails with an import/export type mismatch.
+compile: regexped.yaml $(REGEXPED)
 	$(REGEXPED) compile --config=regexped.yaml
 
 # Build the Rust host binary (native, not WASM).

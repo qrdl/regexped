@@ -12,7 +12,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// plans/OPUS.md §N1 regression: the Backtracking engine's frame stack is sized
+// Regression: the Backtracking engine's frame stack is sized
 // from a compile-time constant (btAllocSizes: numAlts*4096 frames) while the
 // real requirement scales with input length. Exhausting it used to return
 // abi.NoMatch, i.e. a false negative that switches on somewhere past
@@ -55,7 +55,8 @@ const (
 // result widened to int64, so an i32 -2 and an i64 -2 compare the same way.
 func btRawCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs ...int32) int64 {
 	t.Helper()
-	store, inst, mem, err := instantiate(wasmBytes)
+	store, inst, mem, release, err := instantiate(wasmBytes)
+	defer release()
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}
@@ -95,7 +96,7 @@ func btRawCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs .
 	}
 }
 
-// TestBTStackOverflowIsDistinguishable is the core §N1 assertion: on an input
+// TestBTStackOverflowIsDistinguishable is the core assertion: on an input
 // past the frame ceiling every BT-hosting export reports BTStackOverflow, and
 // critically NOT NoMatch — while the same pattern on a shorter input still
 // answers correctly, so the sentinel has not simply replaced all results.
@@ -126,7 +127,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			name:    "groups",
 			entry:   config.RegexEntry{Pattern: btCapturePattern, GroupsFunc: "groups"},
 			export:  "groups",
-			extra:   []int32{pathsOutBase},
+			extra:   []int32{pathsOutBase, 0}, // out_ptr, from
 			ok:      capIn(8191),
 			wantOK:  8192, // match end position
 			blown:   capIn(8192),
@@ -155,6 +156,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			entry:  config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find"},
 			opts:   []compile.CompileOptions{squeezed},
 			export: "find",
+			extra:  []int32{0}, // `from` — find is (ptr, len, from)
 			ok:     noCapIn(4000),
 			wantOK: 8006, // packed 0<<32|8006
 			blown:  noCapIn(8192),
@@ -195,7 +197,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			}
 			got := btRawCall(t, w, tc.export, tc.blown, tc.extra...)
 			if got == abi.NoMatch {
-				t.Errorf("%s on %d-byte input = %d (NoMatch) — §N1 regression: "+
+				t.Errorf("%s on %d-byte input = %d (NoMatch) — regression: "+
 					"stack overflow reported as a definite no-match",
 					tc.export, len(tc.blown), got)
 			}
@@ -218,10 +220,10 @@ func TestBTStackOverflowThreshold(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 	const wantLast = 8191 // numAlts(2) * 4096 == 8192 frames, one per input byte
-	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast)+"c", pathsOutBase); got < 0 {
+	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast)+"c", pathsOutBase, 0); got < 0 {
 		t.Errorf("%d-byte input already overflows (= %d); ceiling moved down", wantLast+1, got)
 	}
-	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast+1)+"c", pathsOutBase); got != abi.BTStackOverflow {
+	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast+1)+"c", pathsOutBase, 0); got != abi.BTStackOverflow {
 		t.Errorf("%d-byte input = %d, want BTStackOverflow; ceiling moved up", wantLast+2, got)
 	}
 }

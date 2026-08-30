@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -53,12 +54,47 @@ func TestGenRustGroupsIterStub(t *testing.T) {
 	}
 }
 
-func TestGenRustNamedGroupsIterStub(t *testing.T) {
-	named := map[string]int{"x": 1, "y": 2}
-	out := genRustNamedGroupsIterStub("mymod", "ng", "ng", true, 3, named)
-	for _, sub := range []string{"\"mymod\"", "NgIter", "pub fn ng", "HashMap"} {
+// TestGenRustGroupIndexConsts covers what replaced `named_groups_func` in Rust:
+// one constant per named group, a runtime lookup and an
+// index-aligned name table.
+func TestGenRustGroupIndexConsts(t *testing.T) {
+	named := map[string]int{"scheme": 1, "host": 2}
+	out := genRustGroupIndexConsts("url_groups", 4, named)
+	for _, sub := range []string{
+		"pub const url_groups_count: usize = 4;",
+		"pub const url_groups_scheme: usize = 1;",
+		"pub const url_groups_host: usize = 2;",
+		"pub fn url_groups_index(name: &str) -> Option<usize>",
+		`"scheme" => Some(1)`,
+		"pub fn url_groups_names() -> &'static [&'static str]",
+		// Index-aligned, "" where unnamed — index 0 and index 3 here.
+		`&["", "scheme", "host", ""]`,
+		// A lowercase const is deliberate (names follow the config's casing),
+		// so the lint has to be suppressed rather than the name changed.
+		"#[allow(non_upper_case_globals)]",
+	} {
 		if !strings.Contains(out, sub) {
-			t.Errorf("genRustNamedGroupsIterStub: output missing %q", sub)
+			t.Errorf("genRustGroupIndexConsts: output missing %q\ngot:\n%s", sub, out)
+		}
+	}
+	// A pattern with no named group gets none of it.
+	if got := genRustGroupIndexConsts("plain", 2, nil); got != "" {
+		t.Errorf("genRustGroupIndexConsts with no named groups: want empty, got %q", got)
+	}
+}
+
+// TestDerivedNamesFollowConfigCasing pins the rule that a symbol derived from a
+// user-chosen name copies that name's STYLE rather than the language's.
+func TestDerivedNamesFollowConfigCasing(t *testing.T) {
+	cases := []struct{ base, suffix, want string }{
+		{"url_groups", "index", "url_groups_index"},
+		{"urlGroups", "index", "urlGroupsIndex"},
+		{"find", "names", "find_names"},
+		{"URLGroups", "index", "URLGroupsIndex"},
+	}
+	for _, c := range cases {
+		if got := derivedFuncName(c.base, c.suffix); got != c.want {
+			t.Errorf("derivedFuncName(%q, %q) = %q, want %q", c.base, c.suffix, got, c.want)
 		}
 	}
 }
@@ -135,7 +171,7 @@ func TestGenJSStubFile(t *testing.T) {
 		StubFile: "regexp.js",
 		Regexps: []config.RegexEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
-			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
+			{GroupsFunc: "tok_groups", Pattern: "(?P<first>a)(b)"},
 		},
 	}
 	out, err := genJSStubFile(cfg)
@@ -144,7 +180,7 @@ func TestGenJSStubFile(t *testing.T) {
 	}
 	for _, sub := range []string{
 		"url_match", "url_find",
-		"tok_groups", "tok_named",
+		"tok_groups", "tok_groups_indices",
 		"export async function init", "WebAssembly.instantiate", "_inBase", "_outBase",
 	} {
 		if !strings.Contains(out, sub) {
@@ -159,7 +195,7 @@ func TestGenTSStubFile(t *testing.T) {
 		StubFile: "regexp.ts",
 		Regexps: []config.RegexEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
-			{GroupsFunc: "tok_groups", NamedGroupsFunc: "tok_named", Pattern: "(a)(b)"},
+			{GroupsFunc: "tok_groups", Pattern: "(?P<first>a)(b)"},
 		},
 	}
 	out, err := genTSStubFile(cfg)
@@ -168,11 +204,11 @@ func TestGenTSStubFile(t *testing.T) {
 	}
 	for _, sub := range []string{
 		"url_match", "url_find",
-		"tok_groups", "tok_named",
+		"tok_groups", "tok_groups_indices",
 		"export async function init", "Promise<void>",
 		"WebAssembly.Module", "WebAssembly.instantiate",
 		"Generator<[number, number]>",
-		"Generator<Record<string, [number, number]>>",
+		"as const",
 		"_inBase", "_outBase",
 	} {
 		if !strings.Contains(out, sub) {
@@ -181,21 +217,17 @@ func TestGenTSStubFile(t *testing.T) {
 	}
 }
 
-func TestGoPublicName(t *testing.T) {
-	cases := []struct {
-		input string
-		want  string
-	}{
-		{"url_match", "UrlMatch"},
-		{"find_github_token", "FindGithubToken"},
-		{"m", "M"},
-		{"foo", "Foo"},
+// The Go generator's PascalCase transform is GONE: a name the
+// user wrote in the config is the name a caller writes, in every language. If
+// that leaves a symbol unexported, that is the user's choice and is warned
+// about once per stub rather than corrected.
+func TestGoStubKeepsConfigNameVerbatim(t *testing.T) {
+	out := genGoMatchStub("url", "url_match")
+	if !strings.Contains(out, "func url_match(input []byte)") {
+		t.Errorf("genGoMatchStub should emit the config name verbatim, got:\n%s", out)
 	}
-	for _, c := range cases {
-		got := goPublicName(c.input)
-		if got != c.want {
-			t.Errorf("goPublicName(%q) = %q, want %q", c.input, got, c.want)
-		}
+	if strings.Contains(out, "func UrlMatch") {
+		t.Error("genGoMatchStub still Pascal-cases the config name")
 	}
 }
 
@@ -204,7 +236,7 @@ func TestGenGoMatchStub(t *testing.T) {
 	for _, sub := range []string{
 		"//go:wasmimport url url_match",
 		"ffi_url_match",
-		"func UrlMatch(input []byte) (int, bool)",
+		"func url_match(input []byte) (end uint, ok bool, err error)",
 		"unsafe.Pointer",
 	} {
 		if !strings.Contains(out, sub) {
@@ -218,8 +250,10 @@ func TestGenGoFindStub(t *testing.T) {
 	for _, sub := range []string{
 		"//go:wasmimport url url_find",
 		"ffi_url_find",
-		"func UrlFind(input []byte) iter.Seq2[int, int]",
-		"uint64(r)>>32",
+		"func (iter *url_findIter) Matches() iter.Seq2[uint, uint]",
+		"uint64(packed) >> 32",
+		// The whole buffer and a start position, not a narrowed slice.
+		"uint32(len(input)), uint32(pos)",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genGoFindStub: output missing %q", sub)
@@ -232,8 +266,8 @@ func TestGenGoGroupsStub(t *testing.T) {
 	for _, sub := range []string{
 		"//go:wasmimport url url_groups",
 		"ffi_url_groups",
-		"func UrlGroups(input []byte) iter.Seq[[][]int]",
-		"make([]int32, 6)",
+		"func (iter *url_groupsIter) Matches() iter.Seq[[]Span]",
+		"slotBuffer [6]int32",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genGoGroupsStub: output missing %q", sub)
@@ -241,23 +275,25 @@ func TestGenGoGroupsStub(t *testing.T) {
 	}
 }
 
-func TestGenGoNamedGroupsStub(t *testing.T) {
+// TestGenGoGroupIndexConsts covers what replaced `named_groups_func` in Go.
+func TestGenGoGroupIndexConsts(t *testing.T) {
 	named := map[string]int{"scheme": 1, "host": 2}
-	out := genGoNamedGroupsStub("url", "url_named_groups", "url_groups", false, 3, named)
+	out := genGoGroupIndexConsts("url_groups", 4, named)
 	for _, sub := range []string{
-		"func UrlNamedGroups(input []byte) iter.Seq[map[string][]int]",
-		`named["scheme"]`,
-		`named["host"]`,
-		"ffi_url_groups",
-		"make([]int32, 6)",
+		"const url_groups_count = 4",
+		"url_groups_scheme = 1",
+		"url_groups_host = 2",
+		"func url_groups_index(name string) (int, bool)",
+		`case "scheme":`,
+		"func url_groups_names() []string",
+		`[]string{"", "scheme", "host", ""}`,
 	} {
 		if !strings.Contains(out, sub) {
-			t.Errorf("genGoNamedGroupsStub: output missing %q", sub)
+			t.Errorf("genGoGroupIndexConsts: output missing %q\ngot:\n%s", sub, out)
 		}
 	}
-	// declareFFI=false: no wasmimport block expected
-	if strings.Contains(out, "//go:wasmimport") {
-		t.Error("genGoNamedGroupsStub: unexpected //go:wasmimport when declareFFI=false")
+	if got := genGoGroupIndexConsts("plain", 2, nil); got != "" {
+		t.Errorf("genGoGroupIndexConsts with no named groups: want empty, got %q", got)
 	}
 }
 
@@ -287,8 +323,8 @@ func TestGenGoStubFileMatchOnly(t *testing.T) {
 func TestGenGoStubFileFull(t *testing.T) {
 	entries := []config.RegexEntry{
 		{MatchFunc: "url_match", FindFunc: "url_find",
-			GroupsFunc: "url_groups", NamedGroupsFunc: "url_named",
-			Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
+			GroupsFunc: "url_groups",
+			Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)"},
 	}
 	out, err := genGoStubFile(entries, "url", "url")
 	if err != nil {
@@ -299,10 +335,10 @@ func TestGenGoStubFileFull(t *testing.T) {
 		"package url",
 		`"iter"`,
 		`"unsafe"`,
-		"url_match", "url_find", "url_groups", "UrlNamed",
-		"iter.Seq2[int, int]",
-		"iter.Seq[[][]int]",
-		"iter.Seq[map[string][]int]",
+		"url_match", "url_find", "url_groups", "url_groups_index",
+		"iter.Seq2[uint, uint]",
+		"iter.Seq[[]Span]",
+		"url_groups_names",
 	} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genGoStubFile full: missing %q", sub)
@@ -312,9 +348,8 @@ func TestGenGoStubFileFull(t *testing.T) {
 
 func TestGenRustStubFileGroupsAndNamed(t *testing.T) {
 	entries := []config.RegexEntry{{
-		GroupsFunc:      "url_groups",
-		NamedGroupsFunc: "url_named",
-		Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
+		GroupsFunc: "url_groups",
+		Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)",
 	}}
 	out, err := genRustStubFile(entries, "url")
 	if err != nil {
@@ -327,15 +362,15 @@ func TestGenRustStubFileGroupsAndNamed(t *testing.T) {
 	if !strings.Contains(out, "UrlGroupsIter") {
 		t.Error("missing UrlGroupsIter")
 	}
-	if !strings.Contains(out, "UrlNamedIter") {
-		t.Error("missing UrlNamedIter")
+	if !strings.Contains(out, "url_groups_index") {
+		t.Error("missing url_groups_index")
 	}
 }
 
 func TestGenRustStubFileNamedOnly(t *testing.T) {
 	entries := []config.RegexEntry{{
-		NamedGroupsFunc: "url_named",
-		Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
+		GroupsFunc: "url_groups",
+		Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)",
 	}}
 	out, err := genRustStubFile(entries, "url")
 	if err != nil {
@@ -344,8 +379,8 @@ func TestGenRustStubFileNamedOnly(t *testing.T) {
 	if !strings.Contains(out, `#[link(wasm_import_module = "url")]`) {
 		t.Error("genRustStubFile named-only: missing FFI block")
 	}
-	if !strings.Contains(out, "UrlNamedIter") {
-		t.Error("missing UrlNamedIter")
+	if !strings.Contains(out, "url_groups_index") {
+		t.Error("missing url_groups_index")
 	}
 }
 
@@ -363,14 +398,14 @@ func TestGenRustStubFileNoFuncs(t *testing.T) {
 func TestGenCMatchParts(t *testing.T) {
 	h := genCMatchHPart("my_match")
 	c := genCMatchCPart("mymod", "my_match")
-	for _, sub := range []string{"int my_match", "anchored match"} {
+	for _, sub := range []string{"ptrdiff_t my_match", "anchored match"} {
 		if !strings.Contains(h, sub) {
 			t.Errorf("genCMatchHPart: output missing %q", sub)
 		}
 	}
 	for _, sub := range []string{
 		`import_module("mymod")`, `import_name("my_match")`,
-		"_ffi_my_match", "int my_match",
+		"_ffi_my_match", "ptrdiff_t my_match",
 	} {
 		if !strings.Contains(c, sub) {
 			t.Errorf("genCMatchCPart: output missing %q", sub)
@@ -381,14 +416,14 @@ func TestGenCMatchParts(t *testing.T) {
 func TestGenCFindParts(t *testing.T) {
 	h := genCFindHPart("tok_find")
 	c := genCFindCPart("mymod", "tok_find")
-	for _, sub := range []string{"rx_match_t tok_find", "offset"} {
+	for _, sub := range []string{"int tok_find_next(rx_tok_find_iter_t *iter, rx_match_t *out_match)", "offset"} {
 		if !strings.Contains(h, sub) {
 			t.Errorf("genCFindHPart: output missing %q", sub)
 		}
 	}
 	for _, sub := range []string{
 		`import_module("mymod")`, `import_name("tok_find")`,
-		"_ffi_tok_find", "rx_match_t tok_find",
+		"_ffi_tok_find", "int tok_find_next(rx_tok_find_iter_t *iter, rx_match_t *out_match)",
 		"unsigned long long", "0xFFFFFFFFU",
 	} {
 		if !strings.Contains(c, sub) {
@@ -401,8 +436,8 @@ func TestGenCGroupsStubParts(t *testing.T) {
 	named := map[string]int{"scheme": 1, "host": 2}
 	h, c := genCGroupsStubParts("mymod", "parse_url", "parse_url", 3, named)
 	for _, sub := range []string{
-		"PARSE_URL_GROUP_SCHEME", "PARSE_URL_GROUP_HOST",
-		"PARSE_URL_GROUPS", "const rx_group_t *parse_url",
+		"parse_url_scheme", "parse_url_host",
+		"PARSE_URL_GROUPS", "int parse_url_next(rx_parse_url_iter_t *iter, rx_group_t out_groups[static PARSE_URL_GROUPS])",
 	} {
 		if !strings.Contains(h, sub) {
 			t.Errorf("genCGroupsStubParts h: missing %q", sub)
@@ -410,8 +445,11 @@ func TestGenCGroupsStubParts(t *testing.T) {
 	}
 	for _, sub := range []string{
 		`import_module("mymod")`, `import_name("parse_url")`,
-		"_ffi_parse_url", "PARSE_URL_GROUP_SCHEME",
-		"const rx_group_t *parse_url",
+		"_ffi_parse_url", "parse_url_index", "_parse_url_names",
+		// The .h prototype uses the macro; the .c definition uses the literal
+		// count, so this asserts the definition rather than repeating the .h.
+		"int parse_url_next(rx_parse_url_iter_t *iter, rx_group_t out_groups[static 3])",
+		"int parse_url_init(rx_parse_url_iter_t *iter,",
 	} {
 		if !strings.Contains(c, sub) {
 			t.Errorf("genCGroupsStubParts c: missing %q", sub)
@@ -430,23 +468,10 @@ func TestGenCStubFilesFind(t *testing.T) {
 			t.Errorf("genCStubFiles find h: missing %q", sub)
 		}
 	}
-	for _, sub := range []string{`#include "stub.h"`, "_ffi_tok_find", "rx_match_t tok_find"} {
+	for _, sub := range []string{`#include "stub.h"`, "_ffi_tok_find", "int tok_find_next(rx_tok_find_iter_t *iter, rx_match_t *out_match)"} {
 		if !strings.Contains(c, sub) {
 			t.Errorf("genCStubFiles find c: missing %q", sub)
 		}
-	}
-}
-
-func TestGenCStubFilesGroupsAndNamed(t *testing.T) {
-	// named_groups_func is not supported for C stubs — must return an error.
-	entries := []config.RegexEntry{{
-		GroupsFunc:      "url_groups",
-		NamedGroupsFunc: "url_named",
-		Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
-	}}
-	_, _, err := genCStubFiles(entries, "mymod", "stub.h")
-	if err == nil {
-		t.Fatal("genCStubFiles groups+named: expected error for named_groups_func, got nil")
 	}
 }
 
@@ -468,14 +493,21 @@ func TestGenCStubFilesSingle(t *testing.T) {
 	}
 }
 
-func TestGenCStubFilesWithNamedGroups(t *testing.T) {
-	// named_groups_func is not supported for C stubs — must return an error.
+// TestGenCStubFilesNamedGroupIndices covers what replaced `named_groups_func`
+// in C: C used to REJECT the key outright, and now gets the
+// named access it never had, through index constants.
+func TestGenCStubFilesNamedGroupIndices(t *testing.T) {
 	entries := []config.RegexEntry{
-		{NamedGroupsFunc: "url_named", Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
+		{GroupsFunc: "url_groups", Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
 	}
-	_, _, err := genCStubFiles(entries, "mymod", "stub.h")
-	if err == nil {
-		t.Fatal("genCStubFiles named groups: expected error for named_groups_func, got nil")
+	h, _, err := genCStubFiles(entries, "mymod", "stub.h")
+	if err != nil {
+		t.Fatalf("genCStubFiles: %v", err)
+	}
+	for _, sub := range []string{"url_groups_scheme", "url_groups_host", "url_groups_index"} {
+		if !strings.Contains(h, sub) {
+			t.Errorf("genCStubFiles h: missing %q", sub)
+		}
 	}
 }
 
@@ -484,15 +516,15 @@ func TestGenJSStubFileWithNamedPattern(t *testing.T) {
 		Output:   "merged.wasm",
 		StubFile: "regexp.js",
 		Regexps: []config.RegexEntry{{
-			NamedGroupsFunc: "url_named",
-			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
+			GroupsFunc: "url_groups",
+			Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)",
 		}},
 	}
 	out, err := genJSStubFile(cfg)
 	if err != nil {
 		t.Fatalf("genJSStubFile named pattern: %v", err)
 	}
-	for _, sub := range []string{"url_named", `result['scheme']`, `result['host']`} {
+	for _, sub := range []string{"url_groups_indices", `"scheme": 1`, `"host": 2`} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genJSStubFile named pattern: missing %q", sub)
 		}
@@ -504,15 +536,15 @@ func TestGenTSStubFileWithNamedPattern(t *testing.T) {
 		Output:   "merged.wasm",
 		StubFile: "regexp.ts",
 		Regexps: []config.RegexEntry{{
-			NamedGroupsFunc: "url_named",
-			Pattern:         "(?P<scheme>https?)://(?P<host>[^/]+)",
+			GroupsFunc: "url_groups",
+			Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)",
 		}},
 	}
 	out, err := genTSStubFile(cfg)
 	if err != nil {
 		t.Fatalf("genTSStubFile named pattern: %v", err)
 	}
-	for _, sub := range []string{"url_named", `result['scheme']`, `result['host']`} {
+	for _, sub := range []string{"url_groups_indices", `"scheme": 1`, `"host": 2`} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genTSStubFile named pattern: missing %q", sub)
 		}
@@ -520,11 +552,11 @@ func TestGenTSStubFileWithNamedPattern(t *testing.T) {
 }
 
 // TestGenJSGroupsFuncHasBatchPath and its TS/named-groups siblings verify the
-// batch-detect-and-drain block (task 44) is emitted by every groups/find
+// batch-detect-and-drain block is emitted by every groups/find
 // generator, JS and TS, including named_groups_func — this is a structural
 // (source-text) check; the actual batch-vs-non-batch behavioural
 // equivalence was verified via a scratch wasmtime/Node differential harness
-// (not committed — see plans/TODO.md task 44's verification discipline).
+// (not committed).
 func TestGenJSFindFuncHasBatchPath(t *testing.T) {
 	out := genJSFindFunc("f")
 	for _, sub := range []string{`_exp['f_batch']`, `f_batch'](_inBase`} {
@@ -561,40 +593,51 @@ func TestGenTSGroupsFuncHasBatchPath(t *testing.T) {
 	}
 }
 
-// TestGenJSNamedGroupsFuncBatchUsesExportName verifies the named-groups
-// generator's batch feature-detect is keyed on exportName (the WASM export
-// this pattern's groups_func/named_groups_func share), not funcName — so a
-// named_groups_func-only pattern (funcName != exportName) still finds its
-// batch export, which is named after exportName.
-func TestGenJSNamedGroupsFuncBatchUsesExportName(t *testing.T) {
-	out := genJSNamedGroupsFunc("named_ab", "plain_ab", 2, map[string]int{"g1": 1})
+// The batch feature-detect is keyed on the WASM export name. That used to be
+// worth its own test because `named_groups_func` could name an export
+// different from `groups_func`'s; with the key retired there is
+// only ever one name, so the checks below cover it.
+// TestGenJSGroupIndices covers what replaced `named_groups_func` in JS (TODO
+// one frozen name→index object, suffixed `indices` because without a
+// suffix its derived name would collide with the generator function's.
+func TestGenJSGroupIndices(t *testing.T) {
+	out := genJSGroupIndices("url_groups", 4, map[string]int{"scheme": 1, "host": 2})
 	for _, sub := range []string{
-		`_exp['plain_ab_batch']`,
-		`plain_ab_batch'](_inBase`,
-		`result['g1']`,
+		"export const url_groups_indices = Object.freeze({",
+		`"scheme": 1,`,
+		`"host": 2,`,
 	} {
 		if !strings.Contains(out, sub) {
-			t.Errorf("genJSNamedGroupsFunc: missing %q", sub)
+			t.Errorf("genJSGroupIndices: missing %q\ngot:\n%s", sub, out)
 		}
 	}
-	if strings.Contains(out, `named_ab_batch`) {
-		t.Error("genJSNamedGroupsFunc: batch export must be named after exportName, not funcName")
+	if got := genJSGroupIndices("plain", 2, nil); got != "" {
+		t.Errorf("genJSGroupIndices with no named groups: want empty, got %q", got)
+	}
+	// Go's regexp/syntax accepts a digit-leading group name; a BARE key of
+	// that shape is a SyntaxError that takes the whole module down.
+	if got := genJSGroupIndices("g", 2, map[string]int{"1a": 1}); !strings.Contains(got, `"1a": 1,`) {
+		t.Errorf("genJSGroupIndices: digit-leading name not quoted\ngot:\n%s", got)
 	}
 }
 
-func TestGenTSNamedGroupsFuncBatchUsesExportName(t *testing.T) {
-	out := genTSNamedGroupsFunc("named_ab", "plain_ab", 2, map[string]int{"g1": 1})
+func TestGenTSGroupIndices(t *testing.T) {
+	out := genTSGroupIndices("url_groups", 4, map[string]int{"scheme": 1, "host": 2})
 	for _, sub := range []string{
-		`_exp['plain_ab_batch']`,
-		`plain_ab_batch'] as CallableFunction)(_inBase`,
-		`result['g1']`,
+		"export const url_groups_indices = {",
+		`"scheme": 1,`,
+		`"host": 2,`,
+		"} as const;",
 	} {
 		if !strings.Contains(out, sub) {
-			t.Errorf("genTSNamedGroupsFunc: missing %q", sub)
+			t.Errorf("genTSGroupIndices: missing %q\ngot:\n%s", sub, out)
 		}
 	}
-	if strings.Contains(out, `named_ab_batch`) {
-		t.Error("genTSNamedGroupsFunc: batch export must be named after exportName, not funcName")
+	if got := genTSGroupIndices("plain", 2, nil); got != "" {
+		t.Errorf("genTSGroupIndices with no named groups: want empty, got %q", got)
+	}
+	if got := genTSGroupIndices("g", 2, map[string]int{"1a": 1}); !strings.Contains(got, `"1a": 1,`) {
+		t.Errorf("genTSGroupIndices: digit-leading name not quoted\ngot:\n%s", got)
 	}
 }
 
@@ -648,7 +691,7 @@ func TestGenASMatchStub(t *testing.T) {
 
 func TestGenASFindStub(t *testing.T) {
 	out := genASFindStub("mymod", "url_find")
-	for _, sub := range []string{`@external("mymod", "url_find")`, "_ffi_url_find", "export function url_find", "offset: i32", "i64"} {
+	for _, sub := range []string{`@external("mymod", "url_find")`, "_ffi_url_find", "export function url_find", "offset: u32", "i64"} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genASFindStub: missing %q", sub)
 		}
@@ -660,23 +703,13 @@ func TestGenASFindStub(t *testing.T) {
 
 func TestGenASGroupsStub(t *testing.T) {
 	out := genASGroupsStub("mymod", "parse_url", "parse_url", 3)
-	for _, sub := range []string{`@external("mymod", "parse_url")`, "_ffi_parse_url", "export function parse_url", "offset: i32", "Int32Array(6)", "dataStart"} {
+	for _, sub := range []string{`@external("mymod", "parse_url")`, "_ffi_parse_url", "export function parse_url", "offset: u32", "Int32Array(6)", "dataStart"} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genASGroupsStub: missing %q", sub)
 		}
 	}
 	if strings.Contains(out, "_parse_url_off") {
 		t.Error("genASGroupsStub: must not have module-level offset state")
-	}
-}
-
-func TestGenASStubNamedGroupsFuncError(t *testing.T) {
-	entries := []config.RegexEntry{
-		{NamedGroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
-	}
-	_, err := genASStubFile(config.BuildConfig{Regexps: entries, ImportModule: "mymod"})
-	if err == nil {
-		t.Fatal("genASStubFile: expected error for named_groups_func, got nil")
 	}
 }
 
@@ -688,7 +721,7 @@ func TestGenASStubFileGroupsFunc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("genASStubFile: %v", err)
 	}
-	for _, sub := range []string{"Auto-generated", "find_email", "offset: i32", "Int32Array", "dataStart"} {
+	for _, sub := range []string{"Auto-generated", "find_email", "offset: u32", "Int32Array", "dataStart"} {
 		if !strings.Contains(out, sub) {
 			t.Errorf("genASStubFile groups_func: missing %q", sub)
 		}
@@ -801,9 +834,11 @@ func setTestCfg() config.BuildConfig {
 		Sets: []config.SetConfig{
 			{
 				Name:        "scanner",
-				FindAll:     "scan_all",
-				FindAny:     "scan_any",
-				Match:       "validate",
+				MatchAny:    "validate_any",
+				MatchAll:    "validate_all",
+				ScanAny:     "probe_any",
+				ScanAll:     "probe_all",
+				Find:        "set_find",
 				EmitNameMap: true,
 				Patterns:    config.PatternSelector{All: true},
 			},
@@ -817,13 +852,16 @@ func TestGenRustSetInner(t *testing.T) {
 	required := []string{
 		"SetMatch",
 		"range(self)",
-		"scan_all",
-		"scan_any",
-		"validate",
+		"SCANNER_PATTERN_COUNT",                  // D16: the emitted constant
+		"SCANNER_ID_SPACE",                       // the id-space constant
+		"buf: [[i32; 3]; SCANNER_PATTERN_COUNT]", // tuples: at most one per pattern per position
+		"gates: [u32; SCANNER_ID_SPACE]",         // indexed by pattern id
+		"set_find", "probe_any", "probe_all", "probe",
+		"validate", "validate_any", "validate_all",
 		"pattern_name",
 		"\"pat_a\"",
 		"\"pat_b\"",
-		"ffi_scan_all",
+		"ffi_set_find",
 		"ffi_validate",
 	}
 	for _, s := range required {
@@ -834,6 +872,10 @@ func TestGenRustSetInner(t *testing.T) {
 	if strings.Contains(out, "SetAnchorMatch") {
 		t.Error("genRustSetInner: should not contain SetAnchorMatch (removed in 5.4.1)")
 	}
+	// D24/D15: `find` is iterator-only; no stateless probe variant exists.
+	if strings.Contains(out, "set_findAt") {
+		t.Error("genRustSetInner: emitted a stateless find probe, which D24 removed")
+	}
 }
 
 func TestGenGoSetSection(t *testing.T) {
@@ -841,12 +883,13 @@ func TestGenGoSetSection(t *testing.T) {
 	out := genGoSetSection(cfg, "mymod")
 	required := []string{
 		"SetMatch",
-		"ScanAll",
-		"ScanAny",
-		"Validate",
+		"ScannerPatternCount",
+		"set_find", "probe_any", "probe_all", "probe",
+		"validate", "validate_any", "validate_all",
 		"PatternName",
-		"scan_all", // wasmimport directive
+		"set_find", // wasmimport directive
 		"validate", // wasmimport directive
+		"iter.Seq[SetMatch]",
 	}
 	for _, s := range required {
 		if !strings.Contains(out, s) {
@@ -859,9 +902,10 @@ func TestGenJSSetSection(t *testing.T) {
 	cfg := setTestCfg()
 	out := genJSSetSection(cfg)
 	required := []string{
-		"scan_all",
-		"scan_any",
+		"set_find",
+		"probe_any",
 		"validate",
+		"scannerPatternCount",
 		"patternName",
 		"patternId",
 		"_exp",
@@ -882,9 +926,10 @@ func TestGenTSSetSection(t *testing.T) {
 	out := genTSSetSection(cfg)
 	required := []string{
 		"SetMatch",
-		"scan_all",
-		"scan_any",
+		"set_find",
+		"probe_any",
 		"validate",
+		"scannerPatternCount",
 		"patternName",
 		"_exp",
 		"_mem",
@@ -908,7 +953,10 @@ func TestGenCStubFilesWithSets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("genCStubFilesWithSets: %v", err)
 	}
-	for _, s := range []string{"rx_set_match_t", "rx_set_anchor_t", "scan_all", "validate", "pattern_name"} {
+	for _, s := range []string{
+		"rx_set_match_t", "set_find_init", "rx_scanner_scanner_t",
+		"SCANNER_PATTERN_COUNT", "validate", "probe_all", "pattern_name",
+	} {
 		if !strings.Contains(h, s) && !strings.Contains(c, s) {
 			t.Errorf("genCStubFilesWithSets: missing %q in output", s)
 		}
@@ -920,9 +968,9 @@ func TestGenASSetSection(t *testing.T) {
 	out := genASSetSection(cfg)
 	required := []string{
 		"SetMatch",
-		"scan_all_next",
-		"scan_all_reset",
-		"scan_any",
+		"SCANNER_PATTERN_COUNT",
+		"class SetFindIter",
+		"probe_any",
 		"validate",
 		"patternName",
 	}
@@ -974,20 +1022,23 @@ func TestSetSection_NoSets_Empty(t *testing.T) {
 	}
 }
 
-func TestSetSection_FindAllOnly(t *testing.T) {
+func TestSetSection_FindOnly(t *testing.T) {
 	cfg := config.BuildConfig{
 		ImportModule: "m",
 		Regexps:      []config.RegexEntry{{Pattern: `foo`}},
 		Sets: []config.SetConfig{
-			{Name: "s", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	rust := genRustSetInner(cfg)
-	if !strings.Contains(rust, "find_all") {
-		t.Error("find_all not in Rust set stub")
+	if !strings.Contains(rust, "fn set_find") {
+		t.Error("set_find not in Rust set stub")
 	}
-	if strings.Contains(rust, "fn validate") || strings.Contains(rust, "ffi_find_any") {
-		t.Error("unexpected exports in find_all-only Rust stub")
+	// A find-only set must not drag in any of the other six capabilities.
+	for _, unexpected := range []string{"fn validate", "ffi_probe", "ffi_validate"} {
+		if strings.Contains(rust, unexpected) {
+			t.Errorf("unexpected %q in a find-only Rust stub", unexpected)
+		}
 	}
 }
 
@@ -1004,37 +1055,6 @@ func TestPatternsInSet_Names(t *testing.T) {
 	}
 	if got := patternsInSet(s, cfg); got != 2 {
 		t.Errorf("patternsInSet(Names): got %d, want 2", got)
-	}
-}
-
-func TestBatchSize_Bounds(t *testing.T) {
-	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "a", Pattern: "a"}},
-	}
-	// BatchSize below the 64 floor must be raised.
-	s1 := config.SetConfig{
-		BatchSize: 10,
-		Patterns:  config.PatternSelector{All: true},
-	}
-	if got := batchSize(s1, cfg); got != 64 {
-		t.Errorf("batchSize(10): got %d, want 64", got)
-	}
-	// BatchSize below patternsInSet must be raised to n.
-	bigCfg := config.BuildConfig{Regexps: make([]config.RegexEntry, 300)}
-	for i := range bigCfg.Regexps {
-		bigCfg.Regexps[i] = config.RegexEntry{Name: "p", Pattern: "x"}
-	}
-	s2 := config.SetConfig{
-		BatchSize: 100,
-		Patterns:  config.PatternSelector{All: true},
-	}
-	if got := batchSize(s2, bigCfg); got != 300 {
-		t.Errorf("batchSize(n>bs): got %d, want 300", got)
-	}
-	// Default (BatchSize=0) stays at 256 when patternsInSet is small.
-	s3 := config.SetConfig{Patterns: config.PatternSelector{All: true}}
-	if got := batchSize(s3, cfg); got != 256 {
-		t.Errorf("batchSize(default): got %d, want 256", got)
 	}
 }
 
@@ -1064,23 +1084,455 @@ func TestWriteStub_MkdirError(t *testing.T) {
 }
 
 // TestConfigPascalCaseMatchesGenerators guards the one duplicated transform in
-// the per-stub-type validation added for plans/FABLE.md B34. config cannot
-// import generate, so config.pascalCase is a hand copy of goPublicName (and of
-// iterTypeName minus its "Iter" suffix). If either generator's transform
-// changes, the collision check silently stops matching what is emitted — this
-// test fails instead.
+// the per-stub-type validation. config cannot
+// import generate, so config.pascalCase is a hand copy of iterTypeName minus
+// its "Iter" suffix. If that transform changes, the collision check silently
+// stops matching what is emitted — this test fails instead.
+//
+// Go dropped out of this: its names are now verbatim, so
+// nothing there Pascal-cases. Rust's iterator TYPE name still does.
 func TestConfigPascalCaseMatchesGenerators(t *testing.T) {
 	names := []string{
 		"url_match", "urlMatch", "UrlMatch", "set_match", "a_b_c",
 		"_leading", "x9", "find", "named_groups_func", "aB_cD",
 	}
 	for _, n := range names {
-		want := goPublicName(n)
-		if got := config.PascalCaseForValidation(n); got != want {
-			t.Errorf("config.PascalCaseForValidation(%q) = %q, but goPublicName = %q", n, got, want)
-		}
 		if got, wantIter := config.PascalCaseForValidation(n)+"Iter", iterTypeName(n); got != wantIter {
 			t.Errorf("config.PascalCaseForValidation(%q)+\"Iter\" = %q, but iterTypeName = %q", n, got, wantIter)
+		}
+	}
+}
+
+// TestSetAllDecodesOverIDSpace covers the narrow (<=64 id) `_all` decode in
+// every generator. The i64 bitmask carries bit positions, and a bit position is
+// a GLOBAL pattern id — so the decode loop is bounded by the id space, not by
+// the set's pattern count. The two are equal for a whole-config set, which is
+// why the C generator's loop over PATTERN_COUNT went unnoticed; for a named
+// subset of two late-declared patterns it dropped every match.
+func TestSetAllDecodesOverIDSpace(t *testing.T) {
+	// Six patterns, of which the set selects only the last two: count 2,
+	// id space 6, ids 4 and 5. A loop bounded by the count never inspects
+	// either bit.
+	cfg := config.BuildConfig{
+		ImportModule: "mymod",
+		Regexps: []config.RegexEntry{
+			{Name: "p0", Pattern: "a"}, {Name: "p1", Pattern: "b"},
+			{Name: "p2", Pattern: "c"}, {Name: "p3", Pattern: "d"},
+			{Name: "p4", Pattern: "e"}, {Name: "p5", Pattern: "f"},
+		},
+		Sets: []config.SetConfig{{
+			Name:     "scanner",
+			MatchAll: "validate_all",
+			ScanAll:  "probe_all",
+			Patterns: config.PatternSelector{Names: []string{"p4", "p5"}},
+		}},
+	}
+	set := cfg.Sets[0]
+	if n, id := patternsInSet(set, cfg), idSpaceSize(set, cfg); n != 2 || id != 6 {
+		t.Fatalf("test set is not the sparse shape: count=%d idSpace=%d, want 2 and 6", n, id)
+	}
+	if wideAllForm(set, cfg) {
+		t.Fatal("test set took the wide _all form; this test must exercise the narrow bitmask decode")
+	}
+
+	hStub, cStub, err := genCStubFilesWithSets(cfg, "stubs.h")
+	if err != nil {
+		t.Fatalf("genCStubFilesWithSets: %v", err)
+	}
+	for _, lang := range []struct{ name, out, count, idSpace string }{
+		{"rust", genRustSetInner(cfg), "SCANNER_PATTERN_COUNT", "SCANNER_ID_SPACE"},
+		{"go", genGoSetSection(cfg, "mymod"), "ScannerPatternCount", "ScannerIDSpace"},
+		{"js", genJSSetSection(cfg), "scannerPatternCount", "scannerIdSpace"},
+		{"ts", genTSSetSection(cfg), "scannerPatternCount", "scannerIdSpace"},
+		{"as", genASSetSection(cfg), "SCANNER_PATTERN_COUNT", "SCANNER_ID_SPACE"},
+		{"c", hStub + cStub, "SCANNER_PATTERN_COUNT", "SCANNER_ID_SPACE"},
+	} {
+		for _, fn := range []string{"validate_all", "probe_all"} {
+			body, ok := allDecodeBody(lang.out, fn)
+			if !ok {
+				t.Errorf("%s: no %s body found", lang.name, fn)
+				continue
+			}
+			if !strings.Contains(body, lang.idSpace) {
+				t.Errorf("%s: %s decodes without %s; a loop that stops at the pattern count "+
+					"never inspects the bits of a sparse subset's ids\n%s", lang.name, fn, lang.idSpace, body)
+			}
+			// The check is about the LOOP BOUND, not about every mention of
+			// the count: C's _all parameter is declared
+			// `int patterns[static <SET>_PATTERN_COUNT]`, which names the count legitimately — that is the
+			// most entries the loop can ever APPEND, while the bit positions
+			// it walks are ids. So the signature line is excluded.
+			decode := body
+			if i := strings.Index(decode, "\n"); i >= 0 {
+				decode = decode[i+1:]
+			}
+			if strings.Contains(decode, lang.count) {
+				t.Errorf("%s: %s decode is bounded by %s, but bit positions are global pattern ids\n%s",
+					lang.name, fn, lang.count, body)
+			}
+		}
+	}
+}
+
+// allDecodeBody extracts the emitted `_all` wrapper for fn — everything from
+// the line that names it up to the closing brace at that indentation — so the
+// bound can be asserted against the DECODE loop rather than against the whole
+// file, where the other constant is always present somewhere.
+func allDecodeBody(out, fn string) (string, bool) {
+	lines := strings.Split(out, "\n")
+	for i, ln := range lines {
+		// The definition line: names fn and opens a block. Import/extern
+		// declarations name it too, so require the brace.
+		if !strings.Contains(ln, fn) || !strings.Contains(ln, "{") || strings.Contains(ln, "ffi_"+fn) {
+			continue
+		}
+		for j := i + 1; j < len(lines) && j < i+30; j++ {
+			if strings.HasPrefix(strings.TrimSpace(lines[j]), "}") &&
+				len(lines[j])-len(strings.TrimLeft(lines[j], " \t")) == len(ln)-len(strings.TrimLeft(ln, " \t")) {
+				return strings.Join(lines[i:j+1], "\n"), true
+			}
+		}
+	}
+	return "", false
+}
+
+// TestConfigSetDerivedNamesMatchGenerators is the same guard for the per-set
+// constants. config.setDerivedNames reserves those names so a capability export
+// cannot collide with one, and a reservation that does not match what is
+// actually emitted protects nothing: too narrow and the collision still ships,
+// too wide and it rejects names no generator uses. The batch config is used
+// because it emits all four.
+func TestConfigSetDerivedNamesMatchGenerators(t *testing.T) {
+	cfg := setBatchTestCfg()
+	set := cfg.Sets[0]
+	hStub, cStub, err := genCStubFilesWithSets(cfg, "stubs.h")
+	if err != nil {
+		t.Fatalf("genCStubFilesWithSets: %v", err)
+	}
+	for _, lang := range []struct{ name, out string }{
+		{"rust", genRustSetInner(cfg)},
+		{"go", genGoSetSection(cfg, "mymod")},
+		{"js", genJSSetSection(cfg)},
+		{"ts", genTSSetSection(cfg)},
+		{"as", genASSetSection(cfg)},
+		{"c", hStub + cStub},
+	} {
+		names := config.SetDerivedNamesForValidation(set, lang.name)
+		if len(names) != 3 {
+			t.Errorf("%s: reserved %d names, want 3 (pattern count, id space, batch size limit)", lang.name, len(names))
+		}
+		for _, n := range names {
+			// The batch-size limit is reserved in every language but EMITTED
+			// only by JS/TS, which is the only configuration with a host
+			// boundary to amortise (decision (3)/(11)). Reserving it
+			// everywhere is what keeps `stub_type` from changing which configs
+			// are valid.
+			if strings.HasSuffix(n, "BatchMaxSize") || strings.HasSuffix(n, "_BATCH_MAX_SIZE") {
+				if lang.name != "js" && lang.name != "ts" {
+					continue
+				}
+			}
+			if !strings.Contains(lang.out, n) {
+				t.Errorf("%s: reserves %q, but the generator emits no such name", lang.name, n)
+			}
+		}
+	}
+}
+
+// setBatchTestCfg is setTestCfg with batching requested the way decision (11)
+// requires: a hint on the set, not a second capability.
+func setBatchTestCfg() config.BuildConfig {
+	cfg := setTestCfg()
+	cfg.Sets[0].Hints = []string{"batch-find"}
+	return cfg
+}
+
+// TestSetBatchFindIsJSTSOnly covers decision (11) and the (3) reasoning it
+// generalised: batching amortises HOST-BOUNDARY crossings and nothing else, so
+// only JS/TS — the one configuration with a real boundary — carries any of it.
+// The four merged languages (C, Go, Rust, AS) call into the same module and
+// have no crossing to amortise, so the hint is a no-op for them.
+func TestSetBatchFindIsJSTSOnly(t *testing.T) {
+	cfg := setBatchTestCfg()
+	merged := map[string]string{
+		"rust": genRustSetInner(cfg),
+		"go":   genGoSetSection(cfg, "mymod"),
+		"as":   genASSetSection(cfg),
+	}
+	for lang, out := range merged {
+		for _, forbidden := range []string{"batchSize", "SetTuple", "BatchMaxSize", "_batch"} {
+			if strings.Contains(out, forbidden) {
+				t.Errorf("%s set stub: %q must not appear — batching is JS/TS-only", lang, forbidden)
+			}
+		}
+	}
+	for lang, out := range map[string]string{"js": genJSSetSection(cfg), "ts": genTSSetSection(cfg)} {
+		for _, want := range []string{"batchSize", "scannerBatchMaxSize", "set_find_batch"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s set stub: missing %q", lang, want)
+			}
+		}
+		// One public function, not two: batching is a parameter.
+		if n := strings.Count(out, "function* set_find"); n != 1 {
+			t.Errorf("%s set stub: %d find generators, want exactly 1", lang, n)
+		}
+	}
+}
+
+// TestSetBatchSizeAbsentWithoutHint: without `hints: [batch-find]` the
+// parameter is not in the signature at all, so TypeScript rejects
+// find(input, 0, 64) at build time and no runtime check is needed.
+func TestSetBatchSizeAbsentWithoutHint(t *testing.T) {
+	cfg := setTestCfg() // no hint
+	outs := map[string]string{
+		"rust": genRustSetInner(cfg),
+		"go":   genGoSetSection(cfg, "mymod"),
+		"js":   genJSSetSection(cfg),
+		"ts":   genTSSetSection(cfg),
+		"as":   genASSetSection(cfg),
+	}
+	for lang, out := range outs {
+		for _, forbidden := range []string{"batchSize", "BatchMaxSize", "BatchCountBits", "batchCountBits", "_batch"} {
+			if strings.Contains(out, forbidden) {
+				t.Errorf("%s set stub: %q leaked into an unhinted set", lang, forbidden)
+			}
+		}
+	}
+}
+
+// bigSetCfg builds a config whose set is large enough to cross the by-value
+// budget: 300 patterns is 300*12 + 300*4 = 4,800 bytes of inline arrays.
+func bigSetCfg(t *testing.T, n int) config.BuildConfig {
+	t.Helper()
+	regexps := make([]config.RegexEntry, n)
+	for i := range regexps {
+		regexps[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: fmt.Sprintf(`kw%d\d+`, i)}
+	}
+	return config.BuildConfig{
+		ImportModule: "mymod",
+		Regexps:      regexps,
+		Sets: []config.SetConfig{{
+			Name:     "scanner",
+			Find:     "set_find",
+			Hints:    []string{"batch-find"},
+			Patterns: config.PatternSelector{All: true},
+		}},
+	}
+}
+
+// TestRustSetIterBoxedAboveBudget pins the Rust set-iterator boxing budget.
+//
+// The Rust iterator is a VALUE: it is returned from the constructor, moved into
+// a `for`, moved again by `.take()` or `.map()`. Holding PATTERN_COUNT tuples
+// and ID_SPACE gates inline makes that value grow with the set — measured at
+// 32,032 bytes for 2,000 patterns, which rustc turned into a memset, a memcpy
+// and a 60 KB stack frame on a three-line adapter chain.
+//
+// Above the budget both arrays are boxed; below it nothing changes, which is
+// the half worth pinning hardest — `find` allocating NOTHING is a property
+// the caller-owned buffer design bought deliberately, and it must survive for the sets that can
+// afford it.
+func TestRustSetIterBoxedAboveBudget(t *testing.T) {
+	small := genRustSetInner(setTestCfg())
+	for _, want := range []string{
+		"buf: [[i32; 3]; SCANNER_PATTERN_COUNT]",
+		"gates: [u32; SCANNER_ID_SPACE]",
+	} {
+		if !strings.Contains(small, want) {
+			t.Errorf("2-pattern set: expected inline %q, got a boxed form", want)
+		}
+	}
+	if strings.Contains(small, "Box<") {
+		t.Error("2-pattern set: boxed an array that fits the by-value budget")
+	}
+
+	big := genRustSetInner(bigSetCfg(t, 300))
+	for _, want := range []string{
+		"buf: Box<[[i32; 3]]>",
+		"gates: Box<[u32]>",
+		"vec![[0; 3]; SCANNER_PATTERN_COUNT].into_boxed_slice()",
+		"vec![0u32; SCANNER_ID_SPACE].into_boxed_slice()",
+	} {
+		if !strings.Contains(big, want) {
+			t.Errorf("300-pattern set: missing %q", want)
+		}
+	}
+	if strings.Contains(big, "buf: [[i32; 3]; SCANNER_PATTERN_COUNT]") {
+		t.Error("300-pattern set: still holds the tuple buffer by value")
+	}
+	// Rust has ONE set iterator since decision (11) removed find_batch from
+	// the merged languages, so there is one gate array to judge rather than
+	// two. At 300 patterns the tuple buffer (300*12 = 3,600 B) plus the gates
+	// (300*4 = 1,200 B) crosses the 4 KB budget, so both are boxed together —
+	// the pair is one struct and it is the struct that gets moved.
+	huge := genRustSetInner(bigSetCfg(t, 2000))
+	if strings.Count(huge, "gates: Box<[u32]>") != 1 {
+		t.Error("2000-pattern set: the iterator's gate array should be boxed")
+	}
+}
+
+// TestSetInlineBudgetCrossover pins where the two shapes meet. The tuple buffer
+// is 12 bytes an entry and the gate array 4, so a gated set of P patterns with
+// P ids costs 16P: 256 patterns is exactly the 4 KB budget and stays inline,
+// 257 is over it.
+func TestSetInlineBudgetCrossover(t *testing.T) {
+	for _, tc := range []struct {
+		n     int
+		boxed bool
+	}{{255, false}, {256, false}, {257, true}} {
+		out := genRustSetInner(bigSetCfg(t, tc.n))
+		got := strings.Contains(out, "buf: Box<[[i32; 3]]>")
+		if got != tc.boxed {
+			t.Errorf("%d patterns (%d bytes inline): boxed=%v, want %v",
+				tc.n, tc.n*16, got, tc.boxed)
+		}
+	}
+}
+
+// TestSetFindCScannerShape pins the caller-owned scanner shape for
+// the C set scanner:
+//
+//	(4) fill-and-count, not one-at-a-time — C has no iterator protocol, and
+//	    the raw ABI already fills a buffer and returns a count, which is also
+//	    the C idiom (read, getdents, recv).
+//	(5) the scanner holds the INPUT. Every other language takes it once when
+//	    the scan is created; C was the only one passing it on every step, and
+//	    the split was backwards — it remembered the position, which changes
+//	    every step, and forgot the input, which never does.
+//	(6) _init returns int: 0 or a negative RX_ERR_*, the dominant C
+//	    convention for operation status.
+func TestSetFindCScannerShape(t *testing.T) {
+	h, c, err := genCStubFilesWithSets(setTestCfg(), "stub.h")
+	if err != nil {
+		t.Fatalf("genCStubFilesWithSets: %v", err)
+	}
+	for _, want := range []string{
+		"int set_find_init(rx_scanner_scanner_t *s, const char *input, size_t len, size_t offset);",
+		"int set_find(rx_scanner_scanner_t *s, rx_set_match_t *buf, size_t cap);",
+		"    const char *input;",
+		"    size_t len, offset;",
+	} {
+		if !strings.Contains(h, want) {
+			t.Errorf("C set scanner: header missing %q", want)
+		}
+	}
+	// The buffer is the CALLER's and is passed per call, not stored.
+	structAt := strings.Index(h, "} rx_scanner_scanner_t;")
+	if structAt < 0 {
+		t.Fatal("C set scanner: struct not emitted")
+	}
+	declStart := strings.LastIndex(h[:structAt], "typedef struct {")
+	for _, forbidden := range []string{"int buf[", "int *buf;", "int cap;"} {
+		if strings.Contains(h[declStart:structAt], forbidden) {
+			t.Errorf("C set scanner: struct still carries %q", forbidden)
+		}
+	}
+	// The gate array stays inside: its length is a size the compiler knows,
+	// not one the caller picks.
+	if !strings.Contains(h, "unsigned gates[SCANNER_ID_SPACE];") {
+		t.Error("C set scanner: gate array should stay stub-owned")
+	}
+	// (6): argument validation, and NOT rejecting the two things the contract makes
+	// legitimate — an empty input and offset > len.
+	for _, want := range []string{"return RX_ERR_NULL_ARG;", "return RX_ERR_RANGE;"} {
+		if !strings.Contains(c, want) {
+			t.Errorf("C set scanner: _init missing %q", want)
+		}
+	}
+	if strings.Contains(c, "len == 0") {
+		t.Error("C set scanner: an empty input is a legitimate scan and must not be refused")
+	}
+	// (4): the transactional overflow rule is reported, not hidden.
+	if !strings.Contains(c, "if ((size_t)got > cap) return got;") {
+		t.Error("C set scanner: over-capacity must return the position's total without advancing")
+	}
+}
+
+// TestNamespacePrefixesOnlySharedSymbols covers the `namespace:` key (TODO
+// It renames the symbols a stub declares that the USER did not name,
+// which is exactly what two stubs in one package collide on, and leaves every
+// user-chosen export name alone.
+func TestNamespacePrefixesOnlySharedSymbols(t *testing.T) {
+	cfg := config.BuildConfig{
+		ImportModule: "demo",
+		Namespace:    "acme",
+		StubFile:     "stubs.go",
+		Regexps: []config.RegexEntry{
+			{Name: "u", Pattern: `(?P<host>[a-z.]+)`, GroupsFunc: "url_groups"},
+		},
+		Sets: []config.SetConfig{
+			{Name: "sec", Find: "scan_secrets", Patterns: config.PatternSelector{All: true}, EmitNameMap: true},
+		},
+	}
+	body, needsIter := genGoSetBody(cfg)
+	single, _, err := genGoStubsBody(cfg.Regexps, cfg.ImportModule)
+	if err != nil {
+		t.Fatalf("genGoStubsBody: %v", err)
+	}
+	_ = needsIter
+	out := applyNamespace(cfg, "go", goErrorPreamble(cfg, true)+single+body)
+
+	for _, want := range []string{"acme_Span", "acme_ErrBacktrackOverflow", "acme_SetMatch", "acme_PatternName"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("namespace: missing %q", want)
+		}
+	}
+	// The user's own names, and anything derived from them, are untouched.
+	for _, keep := range []string{"url_groups", "scan_secrets", "url_groups_host", "url_groups_index"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("namespace: user-chosen name %q should survive verbatim", keep)
+		}
+		if strings.Contains(out, "acme_"+keep) {
+			t.Errorf("namespace: %q must not be prefixed — the key exists to let two stubs share a package, not to rename the API", keep)
+		}
+	}
+	// Empty namespace changes nothing.
+	cfg.Namespace = ""
+	if got := applyNamespace(cfg, "go", "type Span struct{}"); got != "type Span struct{}" {
+		t.Errorf("empty namespace should be a no-op, got %q", got)
+	}
+	// Rust is deliberately absent from the table: pub mod already isolates it.
+	cfg.Namespace = "acme"
+	if got := applyNamespace(cfg, "rust", "pub struct Span;"); got != "pub struct Span;" {
+		t.Errorf("namespace should be a no-op for Rust, got %q", got)
+	}
+}
+
+// TestSharedSymbolsMirrorIsInStep pins config's copy of sharedSymbols against
+// the list applyNamespace actually rewrites.
+//
+// The copy exists because generate imports config and not the reverse, so the
+// config-side collision checks cannot read this list directly. A copy nothing
+// compares is a copy that drifts — which is how an export named `Span` came to
+// pass validation and then duplicate the Go type.
+func TestSharedSymbolsMirrorIsInStep(t *testing.T) {
+	for _, stubType := range []string{"go", "js", "ts", "as", "c", "rust"} {
+		want := sharedSymbols[stubType]
+		got := config.StubSharedSymbolsForValidation(stubType)
+		if len(want) != len(got) {
+			t.Errorf("%s: generate has %v, config mirrors %v", stubType, want, got)
+			continue
+		}
+		for i := range want {
+			if want[i] != got[i] {
+				t.Errorf("%s: generate has %v, config mirrors %v", stubType, want, got)
+				break
+			}
+		}
+	}
+}
+
+// TestDerivedNameMatchesGenerator pins config's copy of derivedFuncName —
+// which the derived-symbol collision check is built on —
+// against the transform the generators actually apply. A check computing a
+// different name than the generator emits is a check that reserves the wrong
+// symbol and misses the real one.
+func TestDerivedNameMatchesGenerator(t *testing.T) {
+	for _, base := range []string{"url_groups", "urlGroups", "find", "a_b", "aB", "X"} {
+		for _, suf := range []string{"index", "names", "count", "indices", "iter"} {
+			if got, want := config.DerivedNameForValidation(base, suf), derivedFuncName(base, suf); got != want {
+				t.Errorf("derivedName(%q, %q) = %q, generator emits %q", base, suf, got, want)
+			}
 		}
 	}
 }

@@ -24,10 +24,10 @@ regexps:
 
 sets:
   - name: "sqli"
-    find_any: "scan_sqli"
+    scan_any: "scan_sqli"
     emit_name_map: true
     patterns: ["union_select", "drop_table", "or_tautology", "sleep_inject"]
 
   - name: "xss"
-    find_any: "scan_xss"
+    scan_any: "scan_xss"
     patterns: ["script_tag", "js_protocol", "event_handler", "alert_call"]

@@ -9,7 +9,7 @@ import (
 // isWholePatternSingleCapture reports whether re's only capture group spans
 // the entire match — group 0 and group 1 are therefore always identical in
 // wrapper context, so a TDFA/Backtracking capture-body re-walk of [start,end)
-// is pure waste (see plans/TODO.md task 41). Accepts a single OpCapture at
+// is pure waste. Accepts a single OpCapture at
 // top level, optionally inside an OpConcat alongside zero-width assertions
 // (^, $, \b, \B). Anything else — nested captures, additional captures,
 // non-zero-width siblings, or multiline anchors (OpBeginLine/OpEndLine, which
@@ -43,7 +43,7 @@ func isWholePatternSingleCapture(re *syntax.Regexp) bool {
 }
 
 // buildTrivialSingleCaptureBody emits the WASM body for the trivial
-// captureBody used by the task 41 shortcut. Signature (type 2):
+// captureBody used by the whole-pattern single-capture shortcut. Signature (type 2):
 //
 //	(ptr i32, len i32, out_ptr i32) → i32
 //

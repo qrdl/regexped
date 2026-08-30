@@ -1,0 +1,2036 @@
+package main
+
+// Task G15: drive EVERY set capability over the corpus.
+//
+// Before this file, --sets declared one set with `find` OR `find_batch`,
+// `patterns: all` and no `overlapping`, so six of the eight capabilities plus a
+// whole `find` body had no corpus coverage at all — which is how five
+// wrong-answer/crash bugs survived
+// 4.94M passing cases.
+//
+// Everything here computes its expectation from Go `regexp` live, via the
+// whole-input technique, so no oracle restates an emitter rule back at it.
+// Where the corpus carries a col4 column the two
+// are CROSS-CHECKED against each other rather than one replacing the other.
+//
+// It found two more on its first runs, in configurations that had never been
+// driven at all: overlapping `find_batch` above capacity 1 dropped a tuple
+// per call, and `scan`/`scan_all` ignored `from > len`.
+//
+// Four axes decide what a run covers, and each exists because the corpus alone
+// cannot supply it — see the options below: --set-chunk (set SIZE, since the
+// corpus has 27 blocks of 132..7020 patterns), --set-shuffle (set MEMBERSHIP),
+// --set-subset (a NAMED subset, the only way PATTERN_COUNT and ID_SPACE
+// differ), and --set-profiles (which capabilities the module DECLARES, since
+// the compiler emits only what the declared ones need).
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"regexp"
+	"regexp/syntax"
+	"sort"
+	"strconv"
+	"strings"
+
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
+	"github.com/qrdl/regexped/compile"
+	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/utils"
+)
+
+// errBTUnknown is returned by a drive whose engine answered
+// abi.BTStackOverflow: the Backtracking member exhausted its frame budget, so
+// the result is UNKNOWN. The caller skips the comparison for that input rather
+// than scoring it — see setStats.btUnknown.
+var errBTUnknown = errors.New("backtracking member gave up (abi.BTStackOverflow)")
+
+// checkTuple validates one tuple the engine wrote before it is compared
+// against anything. An id outside the id space, or an extent outside the
+// input, is a MEMORY-SAFETY class of defect against the caller's arrays — and
+// exactly what --set-subset exists to hunt — but the comparison only ever
+// looked at ids the oracle already knew about, so a fabricated one sat
+// unexamined.
+func (r *setRunner) checkTuple(pid, st, en, tlen int32) error {
+	if pid < 0 || int(pid) >= r.idSpace {
+		return fmt.Errorf("tuple reports pattern id %d, outside the set's id space of %d", pid, r.idSpace)
+	}
+	if st < 0 || en < st || en > tlen {
+		return fmt.Errorf("tuple for pattern %d reports the extent [%d,%d) on a %d-byte input", pid, st, en, tlen)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Options (package-level, assigned once from main; see setBatchDrive's comment
+// for why the set-mode switches are not threaded through run()'s signature).
+
+var (
+	// setChunkSize splits a corpus block's patterns into consecutive sets of
+	// this many patterns. 0 = one set per block, which is what --sets always
+	// did: the RE2 corpus has 27 blocks of 132..7020 patterns each, so without
+	// chunking every set is enormous and the frontend/id-space thresholds the
+	// compiler specialises on (packed-pair <=16, Teddy <=64, AC >16, wide
+	// `_all` >64) are never crossed from below.
+	setChunkSize int
+
+	// setShufflePats permutes a block's patterns before chunking. Adjacent
+	// corpus patterns are near-duplicates from the same generator family, so
+	// unshuffled chunks hold variations of one shape; shuffling manufactures
+	// the pattern INTERACTION the corpus cannot otherwise produce.
+	// Deterministic: a fixed-seed LCG, so a failure is reproducible.
+	setShufflePats bool
+
+	// setSample tests every Nth chunk (1 = every chunk). This is the knob that
+	// separates the sampled `make sets` gate from `make sets-exhaustive`.
+	setSample = 1
+
+	// setBatchCap1Only restricts find_batch drives to a capacity of ONE.
+	setBatchCap1Only bool
+
+	// setSubset makes each set select a NAMED SUBSET of the chunk's patterns
+	// (every second one, starting at index 1) instead of `patterns: all`.
+	//
+	// This is the only configuration in which <SET>_PATTERN_COUNT and
+	// <SET>_ID_SPACE differ, and confusing them is a memory-safety bug rather
+	// than a wrong answer: pattern_id is the GLOBAL index into `regexps:`, so
+	// the gate array and the `_all` bitmap are sized from the id space while
+	// the tuple buffer is sized from the pattern count. Sizing the gate array
+	// from the count let the module write past the caller's array, and
+	// `patterns: all` makes the two equal, so no run that used it
+	// could ever have caught that.
+	//
+	// Starting at index 1 is deliberate: it leaves id 0 unselected, so the ids
+	// are sparse from the very first slot and an off-by-one that happens to
+	// work for a dense prefix does not survive.
+	setSubset bool
+
+	// activeSetProfiles is the resolved --set-profiles selection.
+	activeSetProfiles []setProfile
+)
+
+// ---------------------------------------------------------------------------
+// Capability profiles.
+//
+// A profile is a whole MODULE: one or more sets, each declaring a subset of
+// the eight capabilities. Two things make more than one profile necessary:
+//
+//   - `overlapping` is a per-set property, so the gated and ungated `find`
+//     bodies can only be driven together by declaring two sets; and
+//   - the compiler emits only the machinery a set's declared capabilities need
+//     (docs/sets.md "What each capability costs"), so a set declaring
+//     everything never exercises the specialised emissions — a `match`-only
+//     set emits no literal frontend at all, and a `scan`-only set emits no
+//     tuple-writing suffix function.
+
+type setCapMask struct {
+	setName            string
+	matchAny, matchAll bool
+	scanAny, scanAll   bool
+	find               bool
+	// batchFind is `hints: [batch-find]` on the set. Batching is a property
+	// of `find` rather than a capability
+	// of its own, so it cannot be requested without it.
+	batchFind   bool
+	overlapping bool
+}
+
+type setProfile struct {
+	name  string
+	specs []setCapMask
+}
+
+var setProfileTable = []setProfile{
+	// Everything, in one module: a gated set declaring all five capabilities
+	// and asking for batching, plus an overlapping set for the other `find`
+	// bodies. This is the default, and its gated-find leg is the run whose
+	// requires to keep passing unchanged.
+	{"all", []setCapMask{
+		{setName: "g", matchAny: true, matchAll: true,
+			scanAny: true, scanAll: true, find: true, batchFind: true},
+		{setName: "o", find: true, batchFind: true, overlapping: true},
+	}},
+	// The specialisations. Each drops everything but one family, so the
+	// emitter takes the path it only takes when the rest is absent.
+	{"anchored", []setCapMask{{setName: "g", matchAny: true, matchAll: true}}},
+	{"scan", []setCapMask{{setName: "g", scanAny: true, scanAll: true}}},
+	// `scan_any` without `find` is its own structural specialisation —
+	// it keeps the first-hit-exit probes but none of the extent machinery.
+	{"scan-any", []setCapMask{{setName: "g", scanAny: true}}},
+	{"find", []setCapMask{{setName: "g", find: true}}},
+	{"find-ov", []setCapMask{{setName: "o", find: true, overlapping: true}}},
+	{"batch", []setCapMask{{setName: "g", find: true, batchFind: true}}},
+	{"batch-ov", []setCapMask{{setName: "o", find: true, batchFind: true, overlapping: true}}},
+}
+
+func lookupSetProfile(name string) (setProfile, bool) {
+	for _, p := range setProfileTable {
+		if p.name == name {
+			return p, true
+		}
+	}
+	return setProfile{}, false
+}
+
+func setProfileNamesAll() []string {
+	out := make([]string, 0, len(setProfileTable))
+	for _, p := range setProfileTable {
+		out = append(out, p.name)
+	}
+	return out
+}
+
+// resolveSetProfiles turns the --set-profiles value into profiles.
+func resolveSetProfiles(spec string) ([]setProfile, error) {
+	if spec == "all-profiles" {
+		spec = strings.Join(setProfileNamesAll(), ",")
+	}
+	var out []setProfile
+	for _, name := range strings.Split(spec, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		p, ok := lookupSetProfile(name)
+		if !ok {
+			return nil, fmt.Errorf("unknown set profile %q (known: %s, all-profiles)",
+				name, strings.Join(setProfileNamesAll(), ", "))
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("--set-profiles selected nothing")
+	}
+	return out, nil
+}
+
+// needs reports what the profile asks of the oracle, so a chunk never pays for
+// an expectation nothing compares against. The start-position map is the
+// expensive one — it is O(len) Go probe evaluations per (pattern, string).
+func (p setProfile) needs() (anchored, spm, findAll bool) {
+	for _, s := range p.specs {
+		anchored = anchored || s.matchAny || s.matchAll
+		if s.overlapping {
+			spm = spm || s.find
+		} else {
+			findAll = findAll || s.find
+		}
+		spm = spm || s.scanAny || s.scanAll
+	}
+	return
+}
+
+// ---------------------------------------------------------------------------
+// Statistics.
+
+// setCapStats accumulates per-capability results across the whole run. The
+// capability label is the key, so the summary names exactly what was driven
+// and a capability that silently never ran shows up as an absent row rather
+// than as a green tick.
+type setCapStats struct {
+	pass     map[string]int
+	fail     map[string]int
+	order    []string
+	timeouts int
+	dataErrs int
+	chunks   int
+	skipped  int // chunks skipped by --sample
+	dropped  int // pattern/capability pairs the compiler legitimately excluded
+	printed  int // failure reports emitted so far
+	// btUnknown counts calls that answered with abi.BTStackOverflow — the
+	// Backtracking engine giving up. Counted rather than folded into "no
+	// match": an engine that wrongly gives up when nothing further matches
+	// would otherwise be scored as a PASS.
+	btUnknown int
+	// skippedCache counts find_batch legs that asked for the answer cache and
+	// got no region, so the leg was identical to the nocache one and would
+	// have been recorded under the wrong label.
+	skippedCache int
+	// eligible is the denominator for the drop ceiling: every pattern offered
+	// to a chunk's compile, counted once per compile so it lines up with
+	// `dropped`.
+	eligible int
+}
+
+// setMaxDropFraction is the share of eligible patterns the compiler may
+// legitimately exclude before the run FAILS.
+//
+// Drops are documented behaviour — a fallback bucket's suffix DFA over
+// max_fallback_states — and are excluded from the comparison, so a regression
+// that made the compiler drop EVERYTHING would empty every expectation and
+// exit 0 with a green table. That is the masking direction, so it needs a
+// ceiling rather than a printed number.
+const setMaxDropFraction = 0.01
+
+// setMaxTimeoutFraction is the same idea for the watchdog: a timed-out call is
+// skipped, so an engine regression that made every set call exceed the
+// watchdog scored zero failures.
+//
+// Under --force-backtrack and --set-bt a timeout is an expected outcome (the BT
+// engine is deliberately being driven past its budget), so both gates are
+// lifted there — see gateProblems.
+const setMaxTimeoutFraction = 0.001
+
+var setStats = setCapStats{pass: map[string]int{}, fail: map[string]int{}}
+
+func (s *setCapStats) note(label string) {
+	if _, seen := s.pass[label]; !seen {
+		if _, seen2 := s.fail[label]; !seen2 {
+			s.order = append(s.order, label)
+		}
+	}
+}
+
+func (s *setCapStats) ok(label string, n int) {
+	s.note(label)
+	s.pass[label] += n
+}
+
+func (s *setCapStats) bad(label string, n int) {
+	s.note(label)
+	s.fail[label] += n
+}
+
+// report prints the per-capability table. setMaxPrint caps the number of
+// individual FAIL lines, never the counts.
+func (s *setCapStats) report() {
+	fmt.Printf("\n=== Set capability coverage ===\n")
+	fmt.Printf("chunks compiled: %d", s.chunks)
+	if s.skipped > 0 {
+		fmt.Printf("  (skipped by --sample: %d)", s.skipped)
+	}
+	fmt.Println()
+	total, totalFail := 0, 0
+	for _, label := range s.order {
+		p, f := s.pass[label], s.fail[label]
+		total += p
+		totalFail += f
+		flag := ""
+		if f > 0 {
+			flag = "   <-- FAILURES"
+		}
+		fmt.Printf("  %-28s pass %10d  fail %6d%s\n", label+":", p, f, flag)
+	}
+	fmt.Printf("  %-28s pass %10d  fail %6d\n", "TOTAL:", total, totalFail)
+	if s.timeouts > 0 {
+		fmt.Printf("  timeouts (input skipped):    %d\n", s.timeouts)
+	}
+	if s.dataErrs > 0 {
+		fmt.Printf("  col4/Go disagreements:       %d\n", s.dataErrs)
+	}
+	if s.btUnknown > 0 {
+		fmt.Printf("  backtracking gave up (input skipped): %d\n", s.btUnknown)
+	}
+	if s.skippedCache > 0 {
+		fmt.Printf("  find_batch cache legs skipped (no region offered): %d\n", s.skippedCache)
+	}
+	if s.dropped > 0 {
+		// Documented behaviour, not a failure — but it means those patterns
+		// were NOT checked, so it must be visible rather than inferred from a
+		// count that quietly does not move.
+		fmt.Printf("  patterns dropped by compiler (state limit, excluded from comparison): %d of %d eligible\n",
+			s.dropped, s.eligible)
+	}
+}
+
+// gateProblems returns the run-level failures that are not individual
+// capability mismatches: mass compiler drops and systematic timeouts. Both
+// SHRINK what was checked rather than reporting a wrong answer, so neither
+// moves setStats.fail and neither used to affect the exit status at all.
+func (s *setCapStats) gateProblems(forceBacktrack bool) []string {
+	var out []string
+	// BOTH gates are lifted under --set-bt / --force-backtrack, which cap
+	// max_fallback_states on purpose: mass drops and timeouts are the point of
+	// those runs, not a regression in them.
+	if forceBacktrack {
+		return nil
+	}
+	if s.eligible > 0 {
+		if frac := float64(s.dropped) / float64(s.eligible); frac > setMaxDropFraction {
+			out = append(out, fmt.Sprintf("compiler dropped %d of %d eligible patterns (%.2f%%, ceiling %.2f%%) — those patterns were not checked",
+				s.dropped, s.eligible, frac*100, setMaxDropFraction*100))
+		}
+	}
+	{
+		if total := s.totalPass() + s.totalFail(); total > 0 {
+			if frac := float64(s.timeouts) / float64(total+s.timeouts); frac > setMaxTimeoutFraction {
+				out = append(out, fmt.Sprintf("%d calls timed out (%.3f%% of %d, ceiling %.3f%%) — a timed-out call is skipped, not scored",
+					s.timeouts, frac*100, total+s.timeouts, setMaxTimeoutFraction*100))
+			}
+		}
+	}
+	return out
+}
+
+// totalFail is every capability failure, so the process exit status reflects
+// all eight capabilities and not only the gated-find leg.
+func (s *setCapStats) totalFail() int {
+	n := 0
+	for _, v := range s.fail {
+		n += v
+	}
+	return n
+}
+
+// totalPass mirrors totalFail. run()'s own counter is derived from these two
+// rather than kept in parallel: a second counter that only some profiles
+// incremented reported 0 for a run whose table showed 4.9M passing checks.
+func (s *setCapStats) totalPass() int {
+	n := 0
+	for _, v := range s.pass {
+		n += v
+	}
+	return n
+}
+
+// setMaxPrint bounds the FAIL lines printed; 0 = unlimited. Assigned from
+// --max-errors so a chunk that fails on every one of 7020 patterns cannot bury
+// the first, most informative report under megabytes of output.
+var setMaxPrint int
+
+// setBTFallback caps max_fallback_states for set compilation, forcing members
+// onto the Backtracking fallback engine. 0 = off.
+var setBTFallback int
+
+func setFailf(format string, args ...interface{}) {
+	if setMaxPrint > 0 && setStats.printed >= setMaxPrint {
+		return
+	}
+	setStats.printed++
+	fmt.Printf(format, args...)
+	if setMaxPrint > 0 && setStats.printed == setMaxPrint {
+		fmt.Printf("... further set failure reports suppressed (--max-errors=%d); counts continue\n", setMaxPrint)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Oracles.
+
+// setOracle holds every expectation a profile can need, indexed [pattern][string].
+type setOracle struct {
+	anchored [][]bool     // \A(?:p)\z over the whole input
+	spm      [][][][2]int // every start position at which p matches, with its extent
+	// findAllByStr is Go FindAllStringIndex per [pattern][string] — the gated
+	// `find` oracle, and the column the corpus's col4 is checked
+	// against rather than replaced by.
+	findAllByStr [][][][2]int
+}
+
+// buildSetOracle computes the expectations for one chunk.
+//
+// The start-position map uses the whole-input technique: `\A(?s:.{p})(?:pat)`
+// over the WHOLE input hands `pat` position p with its real left context, so
+// `\b`, `\B` and `(?m:^)` judge actual neighbours. The slice technique it
+// replaces (`\A(?:pat)` over input[p:]) judges them against a slice boundary —
+// which is the mistake the two-oracle discipline exists to prevent.
+//
+// `.{p}` counts RUNES, so the caller must have excluded non-ASCII inputs.
+func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFindAll bool) (*setOracle, error) {
+	o := &setOracle{}
+	if needAnchored {
+		o.anchored = make([][]bool, len(pats))
+	}
+	if needSPM {
+		o.spm = make([][][][2]int, len(pats))
+	}
+	if needFindAll {
+		o.findAllByStr = make([][][][2]int, len(pats))
+	}
+	// Non-ASCII inputs are left with EMPTY expectations, deliberately.
+	//
+	// The whole-input probe counts RUNES in its `.{p}` prefix, so on a
+	// multi-byte input position p would not be the byte offset the module was
+	// given and every expectation would be quietly wrong. The drive loop skips
+	// these inputs (as the rest of re2test does), so nothing reads these rows —
+	// but computing a wrong answer and relying on nobody looking at it is how a
+	// harness bug becomes an engine bug report.
+	usable := make([]bool, len(strs))
+	maxLen := 0
+	for si, s := range strs {
+		usable[si] = !hasUnicode(s)
+		if usable[si] && len(s) > maxLen {
+			maxLen = len(s)
+		}
+	}
+	for pi, pat := range pats {
+		body, err := normalizeSetOraclePattern(pat)
+		if err != nil {
+			return nil, fmt.Errorf("oracle: pattern %q: %w", pat, err)
+		}
+		if needAnchored {
+			anch, err := regexp.Compile(`\A(?:` + body + `)\z`)
+			if err != nil {
+				return nil, fmt.Errorf("oracle: anchored probe for %q: %w", pat, err)
+			}
+			row := make([]bool, len(strs))
+			for si, s := range strs {
+				row[si] = usable[si] && anch.MatchString(s)
+			}
+			o.anchored[pi] = row
+		}
+		if needFindAll {
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				return nil, fmt.Errorf("oracle: %q: %w", pat, err)
+			}
+			row := make([][][2]int, len(strs))
+			for si, s := range strs {
+				if !usable[si] {
+					continue
+				}
+				for _, m := range re.FindAllStringIndex(s, -1) {
+					row[si] = append(row[si], [2]int{m[0], m[1]})
+				}
+			}
+			o.findAllByStr[pi] = row
+		}
+		if needSPM {
+			// One probe per position, built once and reused for every string
+			// long enough to have that position. Without the reuse the map is
+			// rebuilt per string and the cost is quadratic for no reason.
+			probes := make([]*regexp.Regexp, maxLen+1)
+			row := make([][][2]int, len(strs))
+			for si, s := range strs {
+				if !usable[si] {
+					continue
+				}
+				for p := 0; p <= len(s); p++ {
+					if probes[p] == nil {
+						pr, err := regexp.Compile(`\A` + setDotPrefix(p) + `(?:` + body + `)`)
+						if err != nil {
+							// Never fall through to "no matches": a broken
+							// probe would read as the engine over-reporting.
+							return nil, fmt.Errorf("oracle: position-%d probe for %q: %w", p, pat, err)
+						}
+						probes[p] = pr
+					}
+					if m := probes[p].FindStringIndex(s); m != nil {
+						row[si] = append(row[si], [2]int{p, m[1]})
+					}
+				}
+			}
+			o.spm[pi] = row
+		}
+	}
+	return o, nil
+}
+
+// normalizeSetOraclePattern re-serialises a pattern through regexp/syntax
+// before it is embedded in a wrapper like `\A(?:pat)\z`.
+//
+// The raw source may contain `\Q`, which quotes everything after it —
+// including the wrapper's own closing paren — and would silently build a
+// DIFFERENT regexp, then blame the engine for the difference.
+func normalizeSetOraclePattern(pat string) (string, error) {
+	parsed, err := syntax.Parse(pat, syntax.Perl)
+	if err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
+}
+
+// setDotPrefix builds a regexp matching exactly p runes of anything.
+//
+// `(?s:.{p})` hits regexp/syntax's maxRepeat ceiling of 1000, and NESTING
+// repeats does not lift it (Go rejects on the product). Concatenation has no
+// such limit — each term is independently under the ceiling.
+func setDotPrefix(p int) string {
+	q, r := p/1000, p%1000
+	out := "(?s:"
+	for i := 0; i < q; i++ {
+		out += ".{1000}"
+	}
+	if r > 0 {
+		out += ".{" + strconv.Itoa(r) + "}"
+	}
+	return out + ")"
+}
+
+// anchoredIDs returns the ids matching the whole of strs[si].
+func (o *setOracle) anchoredIDs(si int) []int {
+	var out []int
+	for pi := range o.anchored {
+		if o.anchored[pi][si] {
+			out = append(out, pi)
+		}
+	}
+	return out
+}
+
+// scanAllIDs returns the ids matching at some position >= from. `eligible`
+// excludes patterns the compiler dropped, which report nothing by design.
+func (o *setOracle) scanAllIDs(si, from int, eligible func(int) bool) []int {
+	var out []int
+	for pi := range o.spm {
+		if !eligible(pi) {
+			continue
+		}
+		for _, sp := range o.spm[pi][si] {
+			if sp[0] >= from {
+				out = append(out, pi)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// overlappingSpans returns every (start, end) pattern pi reports under
+// `overlapping: true` — one per start position at which it matches.
+func (o *setOracle) overlappingSpans(pi, si int) [][2]int {
+	return o.spm[pi][si]
+}
+
+// spansFrom returns what pattern pi should report from a FRESH gate array
+// starting at `from`, under either overlap policy.
+//
+// Overlapping is a filter; gated replays Go's FindAllIndex non-overlapping
+// selection with the cursor seeded at `from` instead of 0 — take the first
+// span at or after the cursor, then move the cursor to its end (one past its
+// start when empty). spm is built in ascending position order, which is what
+// makes one pass enough.
+//
+// Needed because every find drive started at from=0 and reached interior
+// positions only MID-DRIVE, with gates already carrying state — so a
+// first-call defect specific to a nonzero `from` (the union-elimination
+// prologue mis-anchored on a fresh array, say) had no coverage at all.
+func (o *setOracle) spansFrom(pi, si, from int, overlapping bool) [][2]int {
+	var out [][2]int
+	cursor, prevEnd := from, -1
+	for _, sp := range o.spm[pi][si] {
+		if sp[0] < from {
+			continue
+		}
+		if overlapping {
+			out = append(out, sp)
+			continue
+		}
+		if sp[0] < cursor {
+			continue
+		}
+		// The half of the rule that is not just an advance: an EMPTY match
+		// sitting exactly at the previous reported match's end is skipped.
+		if sp[0] == sp[1] && sp[0] == prevEnd {
+			cursor = sp[0] + 1
+			continue
+		}
+		out = append(out, sp)
+		prevEnd = sp[1]
+		if sp[1] > sp[0] {
+			cursor = sp[1]
+		} else {
+			cursor = sp[0] + 1
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// The chunk runner.
+
+// setChunk is one compiled set: a slice of a block's eligible patterns.
+type setChunk struct {
+	pats []string // the patterns, in set order (= pattern id order)
+	orig []int    // index into the block's entries, for failure messages
+	cols [][]string
+}
+
+// capFns is one capability profile's resolved exports. Package-scope so the
+// drives below can take it as a parameter.
+type capFns struct {
+	spec               setCapMask
+	matchAny, matchAll *wasmtime.Func
+	scanAny, scanAll   *wasmtime.Func
+	find, findBatch    *wasmtime.Func
+}
+
+// setRunner is an instantiated profile module plus its memory layout.
+type setRunner struct {
+	store   *wasmtime.Store
+	inst    *wasmtime.Instance
+	mem     *wasmtime.Memory
+	wd      *watchdog
+	release func()
+
+	inBase  int32
+	outBase int32
+	gatePtr int32
+	bmpPtr  int32
+	// cachePtr/cacheLen are the OVERLAPPING answer cache (see the
+	// stage C). Sized for the LONGEST input in the chunk so one region serves
+	// every drive, and zero when that would exceed the ceiling the generated
+	// stubs use — declining is legal and costs speed, not correctness.
+	cachePtr int32
+	cacheLen int32
+	npat     int    // patterns IN THE SET — sizes the tuple buffer and the cursor's k
+	idSpace  int    // largest reportable global id + 1 — sizes gates and bitmaps
+	inSet    []bool // by chunk index: is this pattern a member of the set?
+	outCap   int32  // = npat: the exact worst case for one position
+	bmpLen   int32
+	wide     bool // idSpace > 64: the `_all` capabilities take an out_ptr
+
+	// Patterns this compile excluded; see the dropHandler comment.
+	droppedFind     map[int]bool
+	droppedAnchored map[int]bool
+}
+
+// findEligible reports whether pattern pi can appear in a non-anchored answer:
+// it must be a member of the set and not have been dropped by the compiler.
+// A pattern that is a member and IS expected to match still counts against the
+// engine if it goes missing, and one that is NOT a member must never appear —
+// compareSetMatches checks that direction too.
+func (r *setRunner) findEligible(pi int) bool { return r.inSet[pi] && !r.droppedFind[pi] }
+
+// anchoredEligible reports whether pattern pi can appear in an anchored answer.
+//
+// A FALLBACK-bucket drop does NOT remove it: the anchored capabilities are
+// packed from the unfiltered spec (compile/set_emit.go passes spec.Patterns
+// straight to compileAnchoredBuckets), so a pattern whose non-anchored suffix
+// DFA blew the state budget is still answered for by match_any/match_all.
+// Excluding it here manufactured a FAILURE out of a correct engine — the
+// dropHandler comment below has always said "removes it from everything
+// non-anchored", and this function contradicted it. See also the converse
+// (patterns BT-rescued for find that the
+// anchored packer really does drop, which droppedAnchored covers).
+func (r *setRunner) anchoredEligible(pi int) bool {
+	return r.inSet[pi] && !r.droppedAnchored[pi]
+}
+
+// keepIDs filters an oracle id list down to the patterns the module kept.
+func keepIDs(ids []int, eligible func(int) bool) []int {
+	out := ids[:0:0]
+	for _, id := range ids {
+		if eligible(id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func (r *setRunner) fn(name string) *wasmtime.Func { return r.inst.GetFunc(r.store, name) }
+
+// call invokes an export under the watchdog. hang=true means the 2s epoch
+// deadline fired; the caller abandons the current input.
+func (r *setRunner) call(fn *wasmtime.Func, args ...interface{}) (interface{}, bool, error) {
+	r.wd.Arm(r.store)
+	res, err := fn.Call(r.store, args...)
+	r.wd.Disarm()
+	if err != nil {
+		if isTimeout(err) {
+			return nil, true, nil
+		}
+		return nil, false, err
+	}
+	return res, false, nil
+}
+
+func (r *setRunner) buf() []byte { return r.mem.UnsafeData(r.store) }
+
+// zeroGates restores the all-zero gate array that means "a clean scan".
+func (r *setRunner) zeroGates() {
+	b := r.buf()
+	// Sized from the ID SPACE, not the pattern count: the array is indexed by
+	// global pattern id.
+	for i := int32(0); i < int32(r.idSpace)*4; i++ {
+		b[r.gatePtr+i] = 0
+	}
+}
+
+// zeroBitmap clears the wide `_all` output. The module only ORs bits in and
+// counts 0->1 transitions, so a dirty buffer reports stale patterns.
+func (r *setRunner) zeroBitmap() {
+	b := r.buf()
+	for i := int32(0); i < r.bmpLen; i++ {
+		b[r.bmpPtr+i] = 0
+	}
+}
+
+func (r *setRunner) readTuple(i int32) (pid, st, en int32) {
+	b := r.buf()
+	base := int(r.outBase) + int(i)*setOutTupleBytes
+	rd := func(off int) int32 {
+		return int32(b[base+off]) | int32(b[base+off+1])<<8 | int32(b[base+off+2])<<16 | int32(b[base+off+3])<<24
+	}
+	return rd(0), rd(4), rd(8)
+}
+
+// readBitmap decodes the wide `_all` bitmap, and refuses one with bits set
+// past the id space.
+//
+// The trailing bits of the last byte are PADDING the caller allocated but no
+// id names; a set one is a write outside the id space, which is the
+// memory-safety class --set-subset exists to hunt. They were never inspected.
+func (r *setRunner) readBitmap() ([]int, error) {
+	b := r.buf()
+	var out []int
+	for k := 0; k < r.idSpace; k++ {
+		if b[int(r.bmpPtr)+k/8]&(1<<uint(k%8)) != 0 {
+			out = append(out, k)
+		}
+	}
+	for k := r.idSpace; k < int(r.bmpLen)*8; k++ {
+		if b[int(r.bmpPtr)+k/8]&(1<<uint(k%8)) != 0 {
+			return nil, fmt.Errorf("_all set bitmap bit %d, past the id space of %d", k, r.idSpace)
+		}
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Dropped patterns.
+//
+// A set can legitimately EXCLUDE a pattern whose suffix DFA exceeds the
+// fallback bucket's state budget: the compiler warns, records it in
+// --diag-json's `state_limit_dropped`, and compiles the rest (docs/sets.md
+// "Fallback buckets can drop patterns"). A dropped pattern
+// reports nothing, so comparing it against an oracle that still expects its
+// matches would manufacture failures out of documented behaviour.
+//
+// The drop is captured from the warning itself rather than by re-deriving it:
+// re-running the analysis through CmdWriteDiagJSON would double the compile
+// cost of every chunk, and the warning is emitted by the very compile whose
+// module is about to be driven — there is no way for the two to disagree.
+//
+// `where` decides the scope: an "anchored bucket" drop removes the pattern
+// from match/match_any/match_all only, while a fallback-bucket drop removes it
+// from everything non-anchored.
+
+type dropHandler struct {
+	find     map[int]bool
+	anchored map[int]bool
+}
+
+func (h *dropHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *dropHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *dropHandler) WithGroup(string) slog.Handler            { return h }
+
+func (h *dropHandler) Handle(_ context.Context, r slog.Record) error {
+	if !strings.HasPrefix(r.Message, "Pattern dropped from set") {
+		return nil
+	}
+	id, where := -1, ""
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "id":
+			id = int(a.Value.Int64())
+		case "where":
+			where = a.Value.String()
+		}
+		return true
+	})
+	if id < 0 {
+		return nil
+	}
+	if strings.HasPrefix(where, "anchored bucket") {
+		h.anchored[id] = true
+	} else {
+		h.find[id] = true
+	}
+	return nil
+}
+
+// captureDrops runs fn with the compiler's warnings redirected into a
+// recorder, and returns what it dropped.
+func captureDrops(fn func()) (find, anchored map[int]bool) {
+	h := &dropHandler{find: map[int]bool{}, anchored: map[int]bool{}}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	defer slog.SetDefault(prev)
+	fn()
+	return h.find, h.anchored
+}
+
+// buildSetProfileConfig turns a profile into a BuildConfig over pats.
+func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selected []int) config.BuildConfig {
+	entries := make([]config.RegexEntry, len(pats))
+	for i, p := range pats {
+		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+	}
+	sel := config.PatternSelector{All: true}
+	if selected != nil {
+		names := make([]string, len(selected))
+		for i, id := range selected {
+			names[i] = fmt.Sprintf("p%d", id)
+		}
+		sel = config.PatternSelector{Names: names}
+	}
+	sets := make([]config.SetConfig, 0, len(prof.specs))
+	for _, s := range prof.specs {
+		sc := config.SetConfig{
+			Name:        s.setName,
+			Patterns:    sel,
+			Overlapping: s.overlapping,
+			Hints:       hints,
+		}
+		if s.matchAny {
+			sc.MatchAny = s.setName + "_match_any"
+		}
+		if s.matchAll {
+			sc.MatchAll = s.setName + "_match_all"
+		}
+		if s.scanAny {
+			sc.ScanAny = s.setName + "_scan_any"
+		}
+		if s.scanAll {
+			sc.ScanAll = s.setName + "_scan_all"
+		}
+		if s.find {
+			sc.Find = s.setName + "_find"
+		}
+		if s.batchFind {
+			sc.Hints = append(append([]string(nil), sc.Hints...), "batch-find")
+		}
+		sets = append(sets, sc)
+	}
+	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
+	// --set-bt drives Backtracking set members: a low max_fallback_states pushes
+	// ordinary corpus patterns onto the Backtracking fallback engine in bulk,
+	// the same way --force-backtrack does for single patterns by setting
+	// MaxDFAStates = -1. The naturally-dropped population is tiny (2 patterns
+	// in custom-sets, none in a 40-chunk corpus sample), so forcing the path
+	// is the only way to exercise it at corpus scale.
+	if setBTFallback > 0 {
+		cfg.MaxFallbackStates = setBTFallback
+	}
+	return cfg
+}
+
+// setSelection returns the global ids a set selects from a chunk of n
+// patterns, or nil for `patterns: all`. See setSubset for why it skips id 0.
+func setSelection(n int) []int {
+	if !setSubset || n < 4 {
+		return nil // fewer than 4 leaves under two members: not a set any more
+	}
+	var out []int
+	for i := 1; i < n; i += 2 {
+		out = append(out, i)
+	}
+	return out
+}
+
+// newSetRunner compiles and instantiates one profile module for one chunk.
+func newSetRunner(
+	engine *wasmtime.Engine, wd *watchdog,
+	pats []string, strs []string, prof setProfile, hints []string,
+) (*setRunner, error) {
+	selected := setSelection(len(pats))
+	cfg := buildSetProfileConfig(pats, prof, hints, selected)
+	var wasmBytes []byte
+	var diags []compile.SetDiag
+	var err error
+	droppedFind, droppedAnchored := captureDrops(func() {
+		wasmBytes, _, diags, err = compile.CompileFileDiag(cfg, "")
+	})
+	if err != nil {
+		return nil, fmt.Errorf("compile: %w", err)
+	}
+	// UNIQUE ids, not the sum of the two maps: a pattern dropped from both the
+	// find and the anchored packing is ONE pattern the comparison excludes,
+	// and summing counted it twice. `eligible` is the denominator the ceiling
+	// below is measured against.
+	uniqueDropped := make(map[int]bool, len(droppedFind)+len(droppedAnchored))
+	for id := range droppedFind {
+		uniqueDropped[id] = true
+	}
+	for id := range droppedAnchored {
+		uniqueDropped[id] = true
+	}
+	setStats.dropped += len(uniqueDropped)
+	setStats.eligible += len(pats)
+	mod, err := wasmtime.NewModule(engine, wasmBytes)
+	if err != nil {
+		return nil, fmt.Errorf("NewModule: %w", err)
+	}
+	store := wasmtime.NewStore(engine)
+	store.SetEpochDeadline(1)
+	release := func() {
+		store.Close()
+		mod.Close()
+	}
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("NewInstance: %w", err)
+	}
+	memExp := inst.GetExport(store, "memory")
+	if memExp == nil || memExp.Memory() == nil {
+		release()
+		return nil, fmt.Errorf("module has no exported memory")
+	}
+	mem := memExp.Memory()
+
+	const pageSize = 65536
+	dataTop, err := utils.ParseDataSectionBytes(wasmBytes)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("parse data section: %w", err)
+	}
+	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+	maxLen := 0
+	for _, s := range strs {
+		if len(s) > maxLen {
+			maxLen = len(s)
+		}
+	}
+	span := int32((maxLen + pageSize - 1) / pageSize * pageSize)
+	if span < pageSize {
+		span = pageSize
+	}
+	// The two sizes are DIFFERENT things and must be derived from different
+	// places (docs/sets.md "Pattern ids and the two emitted constants"):
+	//   patternCount sizes the tuple buffer and the batch cursor's k field;
+	//   idSpace (largest reportable global id + 1) sizes the gate array, the
+	//   `_all` bitmap, and decides which `_all` ABI the module exported.
+	// They are equal only for `patterns: all`.
+	patternCount := len(pats)
+	idSpace := len(pats)
+	inSet := make([]bool, len(pats))
+	if selected == nil {
+		for i := range inSet {
+			inSet[i] = true
+		}
+	} else {
+		patternCount = len(selected)
+		idSpace = selected[len(selected)-1] + 1
+		for _, id := range selected {
+			inSet[id] = true
+		}
+	}
+	// Which `_all` ABI the module exported. The id space is one reason for the
+	// memory form; a Backtracking member is the other, because BT can answer
+	// "unknown" and the narrow i64 return has no value free to say so
+	//. Under --set-bt that second reason is the
+	// COMMON one, and getting it wrong here is not a wrong answer but a wrong
+	// ARITY — the harness would call a 3-parameter export with 2 arguments.
+	//
+	// Read from the DIAGNOSTICS of the compile just performed, not re-derived:
+	// this is what the emitter actually did, and it costs nothing. Calling
+	// compile.SetAdmitsBacktracking here instead — the predicate the stub
+	// generators use, which has to re-run the analysis because `generate` never
+	// compiles — repeated the whole set analysis for every chunk and every
+	// profile, and made a corpus run several times slower for an answer already
+	// in hand.
+	wideAll := idSpace > 64
+	for _, d := range diags {
+		for _, b := range d.Buckets {
+			if b.Type == "bt-fallback" {
+				wideAll = true
+			}
+		}
+	}
+
+	outBase := inBase + span
+	gatePtr := outBase + int32(patternCount)*int32(setOutTupleBytes)
+	bmpLen := int32((idSpace + 7) / 8)
+	bmpPtr := gatePtr + int32(idSpace)*4
+	cachePtr := (bmpPtr + bmpLen + 15) &^ 7
+	cacheLen := int32(0)
+	if want := config.SetOverlapCacheBytes(maxLen, patternCount); want <= config.SetOverlapCacheMaxBytes {
+		cacheLen = int32(want)
+	} else {
+		cachePtr = 0
+	}
+	// The top is the LAYOUT's true end, not the cache's. Deriving it from
+	// cachePtr meant that declining the cache (cachePtr = 0) computed a top of
+	// 16, skipped the grow entirely, and left the input region, tuple buffer,
+	// gate array and bitmap beyond initial memory — an index-out-of-range
+	// panic on the first write. Reachable in whole-block mode
+	// (--set-chunk=0, npat up to 7020) with inputs of a few hundred bytes.
+	// cachePtr = 0 stays the "declined" signal.
+	end := int64(bmpPtr) + int64(bmpLen)
+	if cacheLen > 0 {
+		end = int64(cachePtr) + int64(cacheLen)
+	}
+	top := end + 16
+	needed := uint64((top + pageSize - 1) / pageSize)
+	if cur := mem.Size(store); needed > cur {
+		if _, err := mem.Grow(store, needed-cur); err != nil {
+			release()
+			return nil, fmt.Errorf("memory.Grow to %d pages: %w", needed, err)
+		}
+	}
+	return &setRunner{
+		store: store, inst: inst, mem: mem, wd: wd, release: release,
+		inBase: inBase, outBase: outBase, gatePtr: gatePtr, bmpPtr: bmpPtr,
+		cachePtr: cachePtr, cacheLen: cacheLen,
+		npat: patternCount, idSpace: idSpace, inSet: inSet,
+		outCap: int32(patternCount), bmpLen: bmpLen,
+		wide:        wideAll,
+		droppedFind: droppedFind, droppedAnchored: droppedAnchored,
+	}, nil
+}
+
+// setFromValues picks the `from` positions the scan trio is driven at.
+//
+// Every position for short inputs; for longer ones a spread that keeps the
+// boundaries the SIMD frontends turn on: 16 and 32 are block edges and 33 is
+// where `simdGuard = MinLen + span - 1` first admits a two-column probe:
+// the shared-probe-column defect was invisible below 33 bytes.
+func setFromValues(n int) []int {
+	if n <= 16 {
+		out := make([]int, 0, n+1)
+		for i := 0; i <= n; i++ {
+			out = append(out, i)
+		}
+		return out
+	}
+	cand := []int{0, 1, 2, 15, 16, 17, 31, 32, 33, n / 2, n - 2, n - 1, n}
+	seen := map[int]bool{}
+	out := make([]int, 0, len(cand))
+	for _, v := range cand {
+		if v < 0 || v > n || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Driving one chunk under one profile.
+
+// runSetProfile compiles the chunk under prof and checks every capability the
+// profile declares against the oracle. All accounting goes through setStats;
+// the caller derives its own totals from that, so there is no second counter
+// to keep in step.
+func runSetProfile(
+	engine *wasmtime.Engine, wd *watchdog,
+	chunk setChunk, strs []string, orc *setOracle, prof setProfile, hints []string,
+	verbose bool,
+) error {
+	r, err := newSetRunner(engine, wd, chunk.pats, strs, prof, hints)
+	if err != nil {
+		setStats.bad("compile["+prof.name+"]", len(chunk.pats)*len(strs))
+		setFailf("FAIL  set chunk compile error (profile %s, %d patterns): %v\n      first pattern: %q\n",
+			prof.name, len(chunk.pats), err, chunk.pats[0])
+		return nil
+	}
+	defer r.release()
+
+	// Resolve every export once. A missing export is a compiler bug, not a
+	// per-input failure, so it stops the run rather than being counted.
+	var fns []capFns
+	for _, s := range prof.specs {
+		c := capFns{spec: s}
+		get := func(want bool, name string) (*wasmtime.Func, error) {
+			if !want {
+				return nil, nil
+			}
+			f := r.fn(name)
+			if f == nil {
+				return nil, fmt.Errorf("profile %s: missing export %q", prof.name, name)
+			}
+			return f, nil
+		}
+		var e error
+		if c.matchAny, e = get(s.matchAny, s.setName+"_match_any"); e != nil {
+			return e
+		}
+		if c.matchAll, e = get(s.matchAll, s.setName+"_match_all"); e != nil {
+			return e
+		}
+		if c.scanAny, e = get(s.scanAny, s.setName+"_scan_any"); e != nil {
+			return e
+		}
+		if c.scanAll, e = get(s.scanAll, s.setName+"_scan_all"); e != nil {
+			return e
+		}
+		if c.find, e = get(s.find, s.setName+"_find"); e != nil {
+			return e
+		}
+		// Decision (11): the batch entry is synthesized from `find`'s name
+		// under the hint, not declared, so its export name is derived the
+		// same way the compiler and the six generators derive it.
+		if c.findBatch, e = get(s.batchFind, config.SetBatchExportName(s.setName+"_find")); e != nil {
+			return e
+		}
+		fns = append(fns, c)
+	}
+
+	for si, text := range strs {
+		if hasUnicode(text) {
+			// The live oracle has no expectation for a non-ASCII input:
+			// The probe counts RUNES, so position p would not be the byte
+			// offset the module was given. Such inputs are instead driven
+			// against the corpus's own PINNED col4 column, which is the only
+			// coverage the documented byte- vs rune-advance divergence has.
+			if e := r.driveUnicodePinned(fns, chunk, strs, si, text, verbose); e != nil {
+				return e
+			}
+			continue
+		}
+		if len(text) > 0 {
+			copy(r.buf()[r.inBase:], text)
+		}
+		tlen := int32(len(text))
+
+		for _, c := range fns {
+			mode := "gated"
+			if c.spec.overlapping {
+				mode = "overlap"
+			}
+
+			// ---- anchored trio -------------------------------------------
+			if c.matchAny != nil || c.matchAll != nil {
+				want := keepIDs(orc.anchoredIDs(si), r.anchoredEligible)
+				if c.matchAny != nil {
+					res, hang, e := r.call(c.matchAny, r.inBase, tlen)
+					if e != nil {
+						return e
+					}
+					if hang {
+						setStats.timeouts++
+					} else {
+						got := int(res.(int32))
+						// Membership, never value equality — any of the
+						// matching ids is a correct answer.
+						okAny := (got == -1 && len(want) == 0) || (got != -1 && containsSetID(want, got))
+						if okAny {
+							setStats.ok("match_any", 1)
+						} else {
+							setStats.bad("match_any", 1)
+							setFailf("FAIL  set match_any: got %d, want one of %v\n      input: %q\n      patterns: %s\n",
+								got, want, text, fmtSetPatterns(chunk.pats))
+						}
+					}
+				}
+				if c.matchAll != nil {
+					got, hang, e := r.callAll(c.matchAll, tlen, -1)
+					if e != nil {
+						return e
+					}
+					if hang {
+						setStats.timeouts++
+					} else if eqSetIDs(got, want) {
+						setStats.ok("match_all", 1)
+					} else {
+						setStats.bad("match_all", 1)
+						setFailf("FAIL  set match_all: got %v, want %v\n      input: %q\n      patterns: %s\n",
+							got, want, text, fmtSetPatterns(chunk.pats))
+					}
+				}
+			}
+
+			// ---- scan trio -----------------------------------------------
+			if c.scanAny != nil || c.scanAll != nil {
+				for _, from := range setFromValues(len(text)) {
+					if c.scanAny != nil {
+						res, hang, e := r.call(c.scanAny, r.inBase, tlen, int32(from))
+						if e != nil {
+							return e
+						}
+						if hang {
+							setStats.timeouts++
+						} else {
+							gotID := int(res.(int32))
+							// A BARE id, no start.
+							// The id may name any pattern matching anywhere at
+							// or after `from`, so the membership set is
+							// scanAllIDs' — firstPosition's would be wrong for
+							// a hit found by the fallback phase past the first
+							// literal position.
+							wantIDs := orc.scanAllIDs(si, from, r.findEligible)
+							okAny := false
+							if gotID == -1 {
+								okAny = len(wantIDs) == 0
+							} else {
+								okAny = containsSetID(wantIDs, gotID)
+							}
+							if okAny {
+								setStats.ok("scan_any", 1)
+							} else {
+								setStats.bad("scan_any", 1)
+								setFailf("FAIL  set scan_any(from=%d): got id=%d, want id in %v\n      input: %q\n      patterns: %s\n",
+									from, gotID, wantIDs, text, fmtSetPatterns(chunk.pats))
+							}
+						}
+					}
+					if c.scanAll != nil {
+						got, hang, e := r.callAll(c.scanAll, tlen, int32(from))
+						if e != nil {
+							return e
+						}
+						if hang {
+							setStats.timeouts++
+						} else {
+							want := orc.scanAllIDs(si, from, r.findEligible)
+							if eqSetIDs(got, want) {
+								setStats.ok("scan_all", 1)
+							} else {
+								setStats.bad("scan_all", 1)
+								setFailf("FAIL  set scan_all(from=%d): got %v, want %v\n      input: %q\n      patterns: %s\n",
+									from, got, want, text, fmtSetPatterns(chunk.pats))
+							}
+						}
+					}
+				}
+			}
+
+			// ---- find ----------------------------------------------------
+			if c.find != nil {
+				gotM, hang, e := r.driveFind(c.find, text, c.spec.overlapping)
+				if errors.Is(e, errBTUnknown) {
+					// The engine said "unknown"; there is nothing to compare
+					// against. Counted, not scored.
+					e = nil
+					hang = true
+				} else if e != nil {
+					return e
+				}
+				if hang {
+					setStats.timeouts++
+				} else {
+					compareSetMatches(chunk, strs, si, orc, gotM, c.spec.overlapping,
+						"find/"+mode, verbose, r.findEligible)
+				}
+				// The same scan through an under-sized buffer, checking
+				// out_cap=0 and the transactional-overflow rule at every
+				// position.
+				ovM, hang, viol, e := r.driveFindOverflow(c.find, text, c.spec.overlapping)
+				if errors.Is(e, errBTUnknown) {
+					e, hang = nil, true
+				} else if e != nil {
+					return e
+				}
+				switch {
+				case hang:
+					setStats.timeouts++
+				case viol != "":
+					setStats.bad("find/"+mode+"/overflow", 1)
+					setFailf("FAIL  set find/%s/overflow: %s\n      input: %q\n      set:   %s\n",
+						mode, viol, text, fmtSetPatterns(chunk.pats))
+				default:
+					compareSetMatches(chunk, strs, si, orc, ovM, c.spec.overlapping,
+						"find/"+mode+"/overflow", verbose, r.findEligible)
+				}
+				// The same scan from a FRESH gate array at interior `from`
+				// values — the one shape the drives above cannot produce.
+				for _, from := range setFromValues(len(text)) {
+					if from == 0 {
+						continue // already covered, against the col4-checked oracle
+					}
+					fm, hang, e := r.driveFindFrom(c.find, text, int32(from))
+					if errors.Is(e, errBTUnknown) {
+						e, hang = nil, true
+					} else if e != nil {
+						return e
+					}
+					if hang {
+						setStats.timeouts++
+						continue
+					}
+					compareSetMatchesFrom(chunk, strs, si, orc, fm, c.spec.overlapping,
+						"find/"+mode+"/from", verbose, r.findEligible, from)
+				}
+			}
+
+			// ---- find_batch ----------------------------------------------
+			if c.findBatch != nil {
+				caps := []int32{1, r.outCap}
+				if setBatchCap1Only || r.outCap <= 1 {
+					caps = caps[:1]
+				}
+				for _, cap := range caps {
+					// Both engines behind the one export: without the cache
+					// (the ordinary walk) and with it.
+					for _, withCache := range []bool{false, true} {
+						// A declined cache makes the two legs the same drive,
+						// and recording the second under the `cache` label
+						// claims coverage that did not happen.
+						if withCache && r.cachePtr == 0 {
+							setStats.skippedCache++
+							continue
+						}
+						gotM, hang, e := r.driveFindBatch(c.findBatch, text, c.spec.overlapping, cap, withCache)
+						if errors.Is(e, errBTUnknown) {
+							e, hang = nil, true
+						} else if e != nil {
+							return e
+						}
+						if hang {
+							setStats.timeouts++
+							continue
+						}
+						cacheLbl := "nocache"
+						if withCache {
+							cacheLbl = "cache"
+						}
+						label := fmt.Sprintf("find_batch/%s/cap=%s/%s", mode,
+							batchCapLabel(cap, r.outCap), cacheLbl)
+						compareSetMatches(chunk, strs, si, orc, gotM, c.spec.overlapping, label, verbose, r.findEligible)
+					}
+				}
+			}
+
+			// ---- out-of-range `from` -------------------------------------
+			if e := r.checkFromOutOfRange(c.scanAny, c.scanAll, c.find, c.findBatch,
+				c.spec.overlapping, tlen, chunk.pats); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
+// driveUnicodePinned drives the GATED `find` over a non-ASCII input and
+// compares against the corpus's col4 column.
+//
+// Gated only, and col4 only. The overlapping policy has no column in the file,
+// and the anchored and scan capabilities are answered by the live oracle
+// everywhere else — this exists for exactly one contract: the byte advance
+// after an empty match, which no Go-derived oracle can express (docs/sets.md
+// "Byte- vs rune-advance on empty matches"). A block with no col4 for
+// these rows contributes nothing rather than a false pass.
+func (r *setRunner) driveUnicodePinned(
+	fns []capFns, chunk setChunk, strs []string, si int, text string, verbose bool,
+) error {
+	if len(text) > 0 {
+		copy(r.buf()[r.inBase:], text)
+	}
+	for _, c := range fns {
+		if c.find == nil || c.spec.overlapping {
+			continue
+		}
+		got, hang, e := r.driveFind(c.find, text, false)
+		if errors.Is(e, errBTUnknown) {
+			continue
+		}
+		if e != nil {
+			return e
+		}
+		if hang {
+			setStats.timeouts++
+			continue
+		}
+		for pi := range chunk.pats {
+			if !r.findEligible(pi) {
+				if extra := got[int32(pi)]; len(extra) > 0 {
+					setStats.bad("find/gated/unicode", 1)
+					setFailf("FAIL  set find/gated/unicode reported %d match(es) for pattern[%d] %q, which is not in the set\n      input: %q\n",
+						len(extra), pi, chunk.pats[pi], text)
+				}
+				continue
+			}
+			if pi >= len(chunk.cols) || si >= len(chunk.cols[pi]) {
+				continue
+			}
+			cols := strings.Split(chunk.cols[pi][si], ";")
+			if len(cols) < 5 || strings.TrimSpace(cols[4]) == "" {
+				continue
+			}
+			want := parseCol4(strings.TrimSpace(cols[4]))
+			g := append([][2]int(nil), got[int32(pi)]...)
+			sortSpanPairs(g)
+			sortSpanPairs(want)
+			if col4WasmEqual(g, want) {
+				setStats.ok("find/gated/unicode", 1)
+				if verbose {
+					fmt.Printf("PASS set find/gated/unicode pattern[%d] %q input=%q\n", pi, chunk.pats[pi], text)
+				}
+			} else {
+				setStats.bad("find/gated/unicode", 1)
+				setFailf("FAIL  set find/gated/unicode pattern[%d] %q\n      input:    %q\n      expected: %s\n      got:      %s\n",
+					pi, chunk.pats[pi], text, fmtCol4(want), fmtCol4Wasm(g))
+			}
+		}
+	}
+	return nil
+}
+
+func batchCapLabel(cap, full int32) string {
+	if cap == 1 {
+		return "1"
+	}
+	if cap == full {
+		return "P"
+	}
+	return strconv.Itoa(int(cap))
+}
+
+// callAll drives a `match_all` / `scan_all` export in whichever ABI its id
+// space selected: a bitmask i64 return at <=64, a caller-supplied bitmap plus
+// a count above it (docs/sets.md "Output formats"). from < 0 means the
+// anchored form, which takes no `from`.
+func (r *setRunner) callAll(fn *wasmtime.Func, tlen, from int32) ([]int, bool, error) {
+	if r.wide {
+		r.zeroBitmap()
+		var res interface{}
+		var hang bool
+		var err error
+		if from < 0 {
+			res, hang, err = r.call(fn, r.inBase, tlen, r.bmpPtr)
+		} else {
+			res, hang, err = r.call(fn, r.inBase, tlen, from, r.bmpPtr)
+		}
+		if err != nil || hang {
+			return nil, hang, err
+		}
+		ids, berr := r.readBitmap()
+		if berr != nil {
+			return nil, false, berr
+		}
+		if got := int(res.(int32)); got != len(ids) {
+			return nil, false, fmt.Errorf("_all returned count %d but its bitmap holds %d ids", got, len(ids))
+		}
+		return ids, false, nil
+	}
+	var res interface{}
+	var hang bool
+	var err error
+	if from < 0 {
+		res, hang, err = r.call(fn, r.inBase, tlen)
+	} else {
+		res, hang, err = r.call(fn, r.inBase, tlen, from)
+	}
+	if err != nil || hang {
+		return nil, hang, err
+	}
+	mask := uint64(res.(int64))
+	// Bits at or above the id space are not "extra information": they are ids
+	// the caller has no array slot for. Only the in-range bits were ever
+	// inspected, so a fabricated one sat unexamined.
+	if r.idSpace < 64 && mask>>uint(r.idSpace) != 0 {
+		return nil, false, fmt.Errorf("_all returned mask %#016x with bits set at or above the id space of %d", mask, r.idSpace)
+	}
+	var ids []int
+	for k := 0; k < r.idSpace; k++ {
+		if mask&(uint64(1)<<uint(k)) != 0 {
+			ids = append(ids, k)
+		}
+	}
+	return ids, false, nil
+}
+
+// driveFind iterates a `find` export to exhaustion: call, record, resume at
+// start+1. Returns the matches keyed by pattern id.
+func (r *setRunner) driveFind(fn *wasmtime.Func, text string, overlapping bool) (map[int32][][2]int, bool, error) {
+	got := make(map[int32][][2]int)
+	// Zeroed for BOTH flavours. An overlapping `find` records no match gates,
+	// but it now reads the array as the per-drive home of
+	// its preflight verdict, and an all-zero array is what declares a fresh
+	// drive. A driver that skipped this would carry one corpus line's verdict
+	// into the next.
+	r.zeroGates()
+	from := int32(0)
+	for {
+		var res interface{}
+		var hang bool
+		var err error
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.gatePtr, r.outBase, r.outCap)
+		if err != nil || hang {
+			return nil, hang, err
+		}
+		count := res.(int32)
+		// BEFORE the <= 0 test. abi.BTStackOverflow is "I don't know", not
+		// "the scan finished": folding it in scores an engine that gives up
+		// as a PASS, which is the masking direction. tools/fuzz already
+		// handles it; this loop was re-created without the check.
+		if count == abi.BTStackOverflow {
+			setStats.btUnknown++
+			return nil, false, errBTUnknown
+		}
+		if count <= 0 {
+			return got, false, nil
+		}
+		if count > r.outCap {
+			return nil, false, fmt.Errorf("find reported %d tuples at one position for a %d-pattern set", count, r.outCap)
+		}
+		var start int32
+		for i := int32(0); i < count; i++ {
+			pid, st, en := r.readTuple(i)
+			if err := r.checkTuple(pid, st, en, int32(len(text))); err != nil {
+				return nil, false, err
+			}
+			if i == 0 {
+				start = st
+			} else if st != start {
+				return nil, false, fmt.Errorf("find tuples in one call disagree on start (%d vs %d)", start, st)
+			}
+			got[pid] = append(got[pid], [2]int{int(st), int(en)})
+		}
+		// Progress invariants the fuzz twin already has: a reported start
+		// BEFORE the position asked for, or one that does not strictly
+		// advance, stalls this loop forever — and the watchdog only bounds
+		// individual CALLS.
+		if start < from {
+			return nil, false, fmt.Errorf("find at from=%d reported a match starting at %d", from, start)
+		}
+		from = start + 1
+		if int(from) > len(text)+1 {
+			return nil, false, fmt.Errorf("find failed to terminate: from=%d past len=%d", from, len(text))
+		}
+	}
+}
+
+// driveFindFrom is driveFind starting at an arbitrary `from` on a FRESH gate
+// array, which is the one shape driveFind cannot produce: it always begins at
+// 0, so every interior position it visits has gates carrying the drive's own
+// history.
+func (r *setRunner) driveFindFrom(fn *wasmtime.Func, text string, from int32) (map[int32][][2]int, bool, error) {
+	got := make(map[int32][][2]int)
+	r.zeroGates()
+	pos := from
+	for {
+		res, hang, err := r.call(fn, r.inBase, int32(len(text)), pos, r.gatePtr, r.outBase, r.outCap)
+		if err != nil || hang {
+			return nil, hang, err
+		}
+		count := res.(int32)
+		if count == abi.BTStackOverflow {
+			setStats.btUnknown++
+			return nil, false, errBTUnknown
+		}
+		if count <= 0 {
+			return got, false, nil
+		}
+		if count > r.outCap {
+			return nil, false, fmt.Errorf("find reported %d tuples at one position for a %d-pattern set", count, r.outCap)
+		}
+		var start int32
+		for i := int32(0); i < count; i++ {
+			pid, st, en := r.readTuple(i)
+			if err := r.checkTuple(pid, st, en, int32(len(text))); err != nil {
+				return nil, false, err
+			}
+			if i == 0 {
+				start = st
+			} else if st != start {
+				return nil, false, fmt.Errorf("find tuples in one call disagree on start (%d vs %d)", start, st)
+			}
+			got[pid] = append(got[pid], [2]int{int(st), int(en)})
+		}
+		if start < pos {
+			return nil, false, fmt.Errorf("find at from=%d reported a match starting at %d", pos, start)
+		}
+		pos = start + 1
+		if int(pos) > len(text)+1 {
+			return nil, false, fmt.Errorf("find failed to terminate: from=%d past len=%d", pos, len(text))
+		}
+	}
+}
+
+// driveFindBatch iterates a `find_batch` export to exhaustion at the given
+// buffer capacity. A capacity of ONE splits every multi-match position, which
+// is what makes the batch resume path (delivered-tuple gating when gated, the
+// `skip` parameter when overlapping) reachable at corpus scale.
+//
+// withCache offers the overlapping answer cache. Both settings
+// are driven over the corpus because they are two different engines behind
+// one export: declined, the drive walks position by position; offered, an
+// eligible overlapping set may sweep the input once and serve from the
+// result. Driving only one of them leaves the other unchecked at corpus
+// scale, and "the answer was right" says nothing about which ran.
+func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping bool, outCap int32, withCache bool) (map[int32][][2]int, bool, error) {
+	got := make(map[int32][][2]int)
+	r.zeroGates()
+	cachePtr, cacheLen := int32(0), int32(0)
+	if withCache {
+		cachePtr, cacheLen = r.cachePtr, r.cacheLen
+		if cachePtr != 0 {
+			// The caller zeroes the header to start a drive, exactly as it
+			// zeroes the gate array.
+			buf := r.buf()
+			for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
+				buf[cachePtr+i] = 0
+			}
+		}
+	}
+	countMask := int64(1)<<uint(config.SetCursorCountBits(r.npat)) - 1
+	cursor := int64(0)
+	maxCalls := 8*(len(text)+1)*(r.npat+1) + 16
+	for calls := 0; ; calls++ {
+		if calls > maxCalls {
+			return nil, false, fmt.Errorf("find_batch did not terminate after %d calls", calls)
+		}
+		var res interface{}
+		var hang bool
+		var err error
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), cursor, r.gatePtr, r.outBase, outCap, cachePtr, cacheLen)
+		if err != nil || hang {
+			return nil, hang, err
+		}
+		packed := res.(int64)
+		// The reserved position word means the Backtracking engine gave up;
+		// the count is zero and nothing was written. Read as "done" it scores
+		// a give-up as a completed scan.
+		if uint32(packed>>32) == config.SetCursorOverflowPos {
+			setStats.btUnknown++
+			return nil, false, errBTUnknown
+		}
+		count := int32(packed & countMask)
+		if count < 0 || count > outCap {
+			return nil, false, fmt.Errorf("find_batch reported count %d for a buffer of %d", count, outCap)
+		}
+		for i := int32(0); i < count; i++ {
+			pid, st, en := r.readTuple(i)
+			if err := r.checkTuple(pid, st, en, int32(len(text))); err != nil {
+				return nil, false, err
+			}
+			got[pid] = append(got[pid], [2]int{int(st), int(en)})
+		}
+		if uint32(packed>>32) == 0xFFFFFFFF || count == 0 {
+			return got, false, nil
+		}
+		cursor = packed
+	}
+}
+
+// driveFindOverflow drives a `find` export at a buffer DELIBERATELY too small,
+// checking the two contracts a full-capacity drive can never reach
+// (docs/sets.md "The gate array"):
+//
+//   - `out_cap = 0` returns the position's total and delivers no tuples;
+//   - an overflowing call (`total > out_cap`) is TRANSACTIONAL: growing the
+//     buffer and calling again with the same `from` returns the same total and
+//     the same tuples — the retry sees the identical world.
+//
+// The check is on the ANSWER, not on the bytes of the gate array. A gated find
+// on a fresh array may legitimately write eliminations into it before
+// delivering anything: the union-scan prologue runs once, and permanently
+// gates out every pattern that matches nowhere at or after `from`. That is
+// sound (a pattern it eliminates cannot match, so no answer changes) and it is
+// where G10's −99.74% comes from — but it does mean docs/sets.md's literal
+// "the gate array is left exactly as it was found" is not true byte-for-byte.
+// Asserting the bytes would therefore fail on a correct compiler; asserting the
+// answer is both what a caller can observe and what the rule exists to protect.
+//
+// The scan therefore proceeds one position at a time: probe at capacity 0,
+// probe at capacity 1, and whenever that overflows, retry at full capacity —
+// which is what a real caller who under-sized its buffer must do. The
+// collected matches still have to equal the oracle, so the contract is checked
+// at every position of the corpus rather than at a handful of hand-picked ones.
+func (r *setRunner) driveFindOverflow(fn *wasmtime.Func, text string, overlapping bool) (_ map[int32][][2]int, hangOut bool, violation string, _ error) {
+	got := make(map[int32][][2]int)
+	r.zeroGates()
+	call := func(from, outCap int32) (int32, bool, error) {
+		var res interface{}
+		var hang bool
+		var err error
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.gatePtr, r.outBase, outCap)
+		if err != nil || hang {
+			return 0, hang, err
+		}
+		return res.(int32), false, nil
+	}
+	from := int32(0)
+	for {
+		zeroTotal, hang, err := call(from, 0)
+		if err != nil || hang {
+			return nil, hang, "", err
+		}
+		if zeroTotal == abi.BTStackOverflow {
+			setStats.btUnknown++
+			return nil, false, "", errBTUnknown
+		}
+		total, hang, err := call(from, 1)
+		if err != nil || hang {
+			return nil, hang, "", err
+		}
+		if total == abi.BTStackOverflow {
+			setStats.btUnknown++
+			return nil, false, "", errBTUnknown
+		}
+		if total != zeroTotal {
+			return nil, false, fmt.Sprintf("find at from=%d returned %d with out_cap=0 but %d with out_cap=1", from, zeroTotal, total), nil
+		}
+		if total <= 0 {
+			return got, false, "", nil
+		}
+		n := total
+		if total > 1 {
+			// Overflowed. The retry must see the identical world: same total,
+			// and the tuples it then delivers must still satisfy the oracle,
+			// which the caller checks on the collected result.
+			retry, hang, err := call(from, r.outCap)
+			if err != nil || hang {
+				return nil, hang, "", err
+			}
+			if retry == abi.BTStackOverflow {
+				setStats.btUnknown++
+				return nil, false, "", errBTUnknown
+			}
+			if retry != total {
+				return nil, false, fmt.Sprintf("find at from=%d returned %d when overflowing but %d on retry at full capacity", from, total, retry), nil
+			}
+			n = retry
+		}
+		if n > r.outCap {
+			return nil, false, fmt.Sprintf("find reported %d tuples at one position for a %d-pattern set", n, r.outCap), nil
+		}
+		var start int32
+		for i := int32(0); i < n; i++ {
+			pid, st, en := r.readTuple(i)
+			if err := r.checkTuple(pid, st, en, int32(len(text))); err != nil {
+				return nil, false, "", err
+			}
+			if i == 0 {
+				start = st
+			} else if st != start {
+				// driveFind asserts this; the overflow drive must too, since
+				// its retry path is the one place a re-entered position could
+				// enumerate differently.
+				return nil, false, fmt.Sprintf("find tuples in one call disagree on start (%d vs %d)", start, st), nil
+			}
+			got[pid] = append(got[pid], [2]int{int(st), int(en)})
+		}
+		if start < from {
+			return nil, false, fmt.Sprintf("find at from=%d reported a match starting at %d", from, start), nil
+		}
+		from = start + 1
+		if int(from) > len(text)+1 {
+			return nil, false, fmt.Sprintf("find failed to terminate: from=%d past len=%d", from, len(text)), nil
+		}
+	}
+}
+
+// checkFromOutOfRange drives every declared capability at `from > len`, which
+// The contract fixes this as the capability's "nothing" result. It is a real caller mistake
+// (an iterator that resumed one past the end) and nothing in the corpus reaches
+// it, because every ordinary drive stops at len.
+func (r *setRunner) checkFromOutOfRange(
+	scanAny, scanAll, find, findBatch *wasmtime.Func, overlapping bool, tlen int32,
+	pats []string,
+) error {
+	for _, from := range []int32{tlen + 1, tlen + 7} {
+		if scanAny != nil {
+			res, hang, err := r.call(scanAny, r.inBase, tlen, from)
+			if err != nil {
+				return err
+			}
+			if !hang {
+				if got := res.(int32); got != -1 {
+					setStats.bad("from>len/scan_any", 1)
+					setFailf("FAIL  set scan_any(from=%d > len=%d): got %d, want -1\n      set: %s\n", from, tlen, got, fmtSetPatterns(pats))
+				} else {
+					setStats.ok("from>len/scan_any", 1)
+				}
+			}
+		}
+		if scanAll != nil {
+			ids, hang, err := r.callAll(scanAll, tlen, from)
+			if err != nil {
+				return err
+			}
+			if !hang {
+				if len(ids) != 0 {
+					setStats.bad("from>len/scan_all", 1)
+					setFailf("FAIL  set scan_all(from=%d > len=%d): got %v, want none\n      set: %s\n", from, tlen, ids, fmtSetPatterns(pats))
+				} else {
+					setStats.ok("from>len/scan_all", 1)
+				}
+			}
+		}
+		if find != nil {
+			r.zeroGates()
+			var res interface{}
+			var hang bool
+			var err error
+			res, hang, err = r.call(find, r.inBase, tlen, from, r.gatePtr, r.outBase, r.outCap)
+			if err != nil {
+				return err
+			}
+			if !hang {
+				if got := res.(int32); got != 0 {
+					setStats.bad("from>len/find", 1)
+					setFailf("FAIL  set find(from=%d > len=%d): got %d, want 0\n      set: %s\n", from, tlen, got, fmtSetPatterns(pats))
+				} else {
+					setStats.ok("from>len/find", 1)
+				}
+			}
+		}
+		if findBatch != nil {
+			r.zeroGates()
+			cursor := int64(from) << 32
+			var res interface{}
+			var hang bool
+			var err error
+			res, hang, err = r.call(findBatch, r.inBase, tlen, cursor, r.gatePtr, r.outBase, r.outCap, int32(0), int32(0))
+			if err != nil {
+				return err
+			}
+			if !hang {
+				packed := res.(int64)
+				countMask := int64(1)<<uint(config.SetCursorCountBits(r.npat)) - 1
+				count := int32(packed & countMask)
+				if count != 0 || uint32(packed>>32) != 0xFFFFFFFF {
+					setStats.bad("from>len/find_batch", 1)
+					setFailf("FAIL  set find_batch(from=%d > len=%d): count=%d done=%v, want count 0 and done\n      set: %s\n",
+						from, tlen, count, uint32(packed>>32) == 0xFFFFFFFF, fmtSetPatterns(pats))
+				} else {
+					setStats.ok("from>len/find_batch", 1)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// compareSetMatches checks one drive's output against the oracle, per pattern.
+func compareSetMatches(
+	chunk setChunk, strs []string, si int, orc *setOracle,
+	got map[int32][][2]int, overlapping bool, label string, verbose bool,
+	eligible func(int) bool,
+) (npass, nfail int) {
+	return compareSetMatchesFrom(chunk, strs, si, orc, got, overlapping, label, verbose, eligible, 0)
+}
+
+// compareSetMatchesFrom is compareSetMatches for a drive that began at a
+// nonzero `from`. fromPos = 0 is the ordinary whole-input
+// case and keeps the col4-cross-checked findAllByStr expectation.
+func compareSetMatchesFrom(
+	chunk setChunk, strs []string, si int, orc *setOracle,
+	got map[int32][][2]int, overlapping bool, label string, verbose bool,
+	eligible func(int) bool, fromPos int,
+) (npass, nfail int) {
+	// A pattern the set does NOT select, or that the compiler dropped, must
+	// report nothing at all. Skipping those ids without checking would let a
+	// set that ignores its own `patterns:` selection pass silently — and the
+	// selection is exactly what makes the id space sparse.
+	for pi := range chunk.pats {
+		if eligible(pi) {
+			continue
+		}
+		if extra := got[int32(pi)]; len(extra) > 0 {
+			nfail++
+			setStats.bad(label, 1)
+			setFailf("FAIL  set %s reported %d match(es) for pattern[%d] %q, which is not in the set\n      input: %q\n      got:   %s\n",
+				label, len(extra), pi, chunk.pats[pi], strs[si], fmtCol4Wasm(extra))
+		}
+	}
+	for pi := range chunk.pats {
+		if !eligible(pi) {
+			continue // not a member, or compiler-excluded; checked above
+		}
+		var want [][2]int
+		switch {
+		case fromPos > 0:
+			want = append(want, orc.spansFrom(pi, si, fromPos, overlapping)...)
+		case overlapping:
+			want = append(want, orc.overlappingSpans(pi, si)...)
+		default:
+			want = append(want, orc.findAllByStr[pi][si]...)
+		}
+		g := append([][2]int(nil), got[int32(pi)]...)
+		// Within-call tuple order is unspecified, so compare as a
+		// multiset; across calls the starts strictly increase anyway.
+		sortSpanPairs(g)
+		sortSpanPairs(want)
+		if col4WasmEqual(g, want) {
+			npass++
+			setStats.ok(label, 1)
+			if verbose {
+				fmt.Printf("PASS set %s pattern[%d] %q input=%q\n", label, pi, chunk.pats[pi], strs[si])
+			}
+		} else {
+			nfail++
+			setStats.bad(label, 1)
+			setFailf("FAIL  set %s pattern[%d] (orig %d): %q\n      input:    %q\n      expected: %s\n      got:      %s\n      set:      %s\n",
+				label, pi, chunk.orig[pi], chunk.pats[pi], strs[si], fmtCol4(want), fmtCol4Wasm(g),
+				fmtSetPatterns(chunk.pats))
+		}
+	}
+	return
+}
+
+func containsSetID(v []int, x int) bool {
+	for _, e := range v {
+		if e == x {
+			return true
+		}
+	}
+	return false
+}
+
+func eqSetIDs(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a = append([]int(nil), a...)
+	b = append([]int(nil), b...)
+	sort.Ints(a)
+	sort.Ints(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// fmtSetPatterns renders a chunk's patterns for a failure message, truncated:
+// a 7020-pattern chunk's full list helps nobody.
+func fmtSetPatterns(pats []string) string {
+	const max = 6
+	var b strings.Builder
+	for i, p := range pats {
+		if i == max {
+			fmt.Fprintf(&b, " ... (+%d more)", len(pats)-max)
+			break
+		}
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		fmt.Fprintf(&b, "%q", p)
+	}
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Chunking.
+
+// setChunksOf splits a block's eligible patterns into the sets to compile.
+func setChunksOf(pats []string, orig []int, cols [][]string) []setChunk {
+	order := make([]int, len(pats))
+	for i := range order {
+		order[i] = i
+	}
+	if setShufflePats {
+		// A fixed-seed LCG rather than math/rand: reproducible across Go
+		// versions, so a chunk that fails is the same chunk on a rerun.
+		state := uint64(0x2545F4914F6CDD1D)
+		for i := len(order) - 1; i > 0; i-- {
+			state = state*6364136223846793005 + 1442695040888963407
+			j := int((state >> 33) % uint64(i+1))
+			order[i], order[j] = order[j], order[i]
+		}
+	}
+	size := setChunkSize
+	if size <= 0 || size > len(order) {
+		size = len(order)
+	}
+	var out []setChunk
+	for start := 0; start < len(order); start += size {
+		end := start + size
+		if end > len(order) {
+			end = len(order)
+		}
+		if end-start < 2 {
+			// A one-pattern set is a single-pattern engine in disguise and
+			// tests none of the interaction this task exists to reach. Fold it
+			// into the previous chunk instead of dropping the patterns.
+			if len(out) > 0 {
+				c := &out[len(out)-1]
+				for _, idx := range order[start:end] {
+					c.pats = append(c.pats, pats[idx])
+					c.orig = append(c.orig, orig[idx])
+					c.cols = append(c.cols, cols[idx])
+				}
+				break
+			}
+			break
+		}
+		var c setChunk
+		for _, idx := range order[start:end] {
+			c.pats = append(c.pats, pats[idx])
+			c.orig = append(c.orig, orig[idx])
+			c.cols = append(c.cols, cols[idx])
+		}
+		out = append(out, c)
+	}
+	return out
+}

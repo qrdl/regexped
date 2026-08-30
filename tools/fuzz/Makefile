@@ -15,19 +15,19 @@ seed:
 fuzz:
 	go test -fuzz=FuzzCorrectness -fuzztime=1m .
 
-# Overnight run (see plans/FUZZER.md "Practical concerns").
+# Overnight run.
 fuzz-long:
 	go test -fuzz=FuzzCorrectness -fuzztime=8h .
 
 # ---------------------------------------------------------------------------
-# Layer 2 (plans/OPUS.md §N7): the paths Layer 1 never reaches.
+# Layer 2: the paths Layer 1 never reaches.
 #
 # Only ONE -fuzz target can run per `go test` invocation, hence one goal each.
 # The seed-* goals have no such restriction and are what CI should run.
 
 # Replay every Layer-2 target's seed corpus. NOTE: seed-groups and seed-engines
-# currently FAIL on `(0$|a0??)` — that is real bug 40 (plans/FUZZER_BUGS.md),
-# not harness flake. Do not "fix" it by weakening the oracle.
+# currently FAIL on `(0$|a0??)` — that is a real engine bug, not harness
+# flake. Do not "fix" it by weakening the oracle.
 seed-all: seed seed-match seed-groups seed-engines seed-set
 
 seed-match:                     ## anchored match (full-consumption oracle)

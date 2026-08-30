@@ -8,7 +8,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// plans/FABLE.md B12 regression.
+// Range-overread regression.
 //
 // emitRangeClassVerify runs the class verify over `countMax` bytes via
 // planRangeChunks, which covers [K, K+countMax) rounded up to a 16-byte
@@ -54,7 +54,8 @@ func TestRangeVerifyNoOverreadAtMemoryEnd(t *testing.T) {
 			t.Fatalf("pattern=%q compile: %v", c.pattern, err)
 		}
 		for _, export := range []string{"match", "find"} {
-			store, inst, mem, err := instantiate(wasmBytes)
+			store, inst, mem, release, err := instantiate(wasmBytes)
+			defer release()
 			if err != nil {
 				t.Fatalf("pattern=%q instantiate: %v", c.pattern, err)
 			}
@@ -65,7 +66,11 @@ func TestRangeVerifyNoOverreadAtMemoryEnd(t *testing.T) {
 			data := mem.UnsafeData(store)
 			ptr := len(data) - len(c.input)
 			copy(data[ptr:], c.input)
-			if _, err := fn.Call(store, int32(ptr), int32(len(c.input))); err != nil {
+			args := []any{int32(ptr), int32(len(c.input))}
+			if export == "find" {
+				args = append(args, int32(0)) // find takes `from`
+			}
+			if _, err := fn.Call(store, args...); err != nil {
 				t.Errorf("pattern=%q %s at ptr=%d (memory size %d): %v",
 					c.pattern, export, ptr, len(data), err)
 			}

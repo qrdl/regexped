@@ -1,0 +1,5 @@
+# Backtracking capture path: a non-greedy quantifier makes the pattern
+# TDFA-ineligible, so selectBestEngine falls back to BT.
+regexps:
+  - pattern: '(a.*?b)(c+)'
+    groups_func: bt_groups

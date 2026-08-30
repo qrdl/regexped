@@ -216,7 +216,7 @@ The SIMD scan in Phase 1 typically eliminates ≥ 99% of input positions before 
 
 ## TDFA Engine (Tagged DFA)
 
-**Used for:** `groups_func`, `named_groups_func` — O(n) capture tracking for patterns that qualify.
+**Used for:** `groups_func` — O(n) capture tracking for patterns that qualify.
 
 **State limit:** the TDFA state count is bounded at compile time (default 1024; adjustable via `CompileOptions.MaxDFAStates`). The register count is also bounded (default 32; adjustable via `CompileOptions.MaxTDFARegs`). Patterns exceeding either limit fall back to Backtracking.
 
@@ -250,7 +250,7 @@ Capture slot values are reconstructed from registers at match acceptance time. T
 
 ## Backtracking Engine (BitState)
 
-**Used for:** `groups_func`, `named_groups_func` when the pattern has captures but is not TDFA-eligible; and `match_func`, `find_func` when the DFA exceeds `MaxDFAStates` states (default 1024).
+**Used for:** `groups_func` when the pattern has captures but is not TDFA-eligible; and `match_func`, `find_func` when the DFA exceeds `MaxDFAStates` states (default 1024).
 
 **Complexity:** O(n × inputLen) time and space — guaranteed by BitState memoization when enabled (see below).
 
@@ -281,7 +281,7 @@ When the budget runs out the engine has abandoned part of the search space and *
 | `-1` | the input does not match — an ordinary, reliable answer |
 | `-2` | the frame budget was exhausted; the result is **unknown**, not "no match" |
 
-`-2` is returned by every export shape that can host a Backtracking body: `match_func`, `find_func` (as `i64 -2`), `groups_func`, `named_groups_func`, and the `_batch` variants — for the batch exports as a negative count, since a successful call always returns a count ≥ 0. Wrapper functions propagate it instead of folding it into their own "negative means no match" test.
+`-2` is returned by every export shape that can host a Backtracking body: `match_func`, `find_func` (as `i64 -2`), `groups_func`, and the `_batch` variants — for the batch exports as a negative count, since a successful call always returns a count ≥ 0. Wrapper functions propagate it instead of folding it into their own "negative means no match" test.
 
 **Which patterns can reach it.** The frame has to survive input being consumed, which means an untried *alternation* branch, not merely a quantifier: after `ab` matches in `(?:ab|cd)*?x`, the frame holding "try `cd` here instead" stays live. A non-greedy loop on its own does not accumulate, because its preferred branch fails against the next byte and the frame is popped straight back. The alternation must also survive `regexp/syntax` simplification — `a|b` becomes the char class `[ab]` and `aa|ab` is factored to `a[ab]`, and neither leaves an `InstAlt` to push a frame for. This combination is why the ceiling is rarely hit in practice, and why it went unnoticed: before this sentinel existed, crossing it returned `-1`, an input-length-dependent false negative with no diagnostic.
 
@@ -289,11 +289,28 @@ When the budget runs out the engine has abandoned part of the search space and *
 
 | stub | behaviour |
 |---|---|
-| Rust, Go | panic |
-| JS, TS, AssemblyScript | throw |
-| C | returns the sentinel: `RX_ERR_BT_OVERFLOW` from a match function, `{RX_ERR_BT_OVERFLOW, RX_ERR_BT_OVERFLOW}` from a find function, `NULL` from a groups function |
+| Rust | `Err(Error::BacktrackOverflow)` — the iterators put it on the item and are fused |
+| Go | an `error` return; `Err()` after the loop for the lazy iterators |
+| JS, TS | `throw` |
+| C, AssemblyScript | return the sentinel: `RX_ERR_BT_OVERFLOW`, or `RX_ITER_ERROR` where a pointer return has no negative value to spend |
 
-C differs because it has no unwinding, and its return types already carry integer error codes. The other languages' public types (`Option<usize>`, `(int, bool)`, generators) have no room for a third outcome, so an unwind is the only way to keep the distinction without redesigning every signature.
+Each is that **language's own** way of saying "this call cannot be answered". Two shapes that look inconsistent across languages are correct if each is right at home.
+
+Rust and Go used to panic. A panic unwinding out of an FFI wrapper is a poor fit for the contexts this library targets — under `panic = "abort"` it is a hard process abort — and both languages report failure by returning it.
+
+AssemblyScript used to be grouped with JS/TS as "throw", and that was **wrong**. Verified against this repo's own `asc` (0.28.13): `try`/`catch` is rejected outright ("ERROR AS100: Not implemented: Exceptions"), and a `throw` compiles to a call to the imported `abort` — a one-way trap the AS caller cannot handle. A throw there was strictly worse than a sentinel, not equivalent to one. JS and TS are unaffected: exceptions are real, catchable, and the normal error channel.
+
+C is unchanged. It has no unwinding, and its return types were already integer error codes with a documented negative case.
+
+**`match_any` used to swallow it** in every language, folding `-2` into "no match". It reports it now.
+
+The NARROW `match_all` / `scan_all` do **not** test for it, and must not: their
+`i64` return IS the bitmask, so every 64-bit value is a legal answer. `-2` is
+`0xFFFF_FFFF_FFFF_FFFE` — ids 1..63 matched and id 0 did not — which a
+sentinel test would report as an engine failure on a perfectly good result.
+The real sentinel cannot reach that form at all: a set with a Backtracking
+member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
+`-2` is unambiguous.
 
 **Raising the ceiling.** There is no runtime knob today. The options are to shorten the input, restructure the pattern so fewer alternation frames stay live, or make the engine grow its stack at runtime — the last being the only fix that makes such a pattern work on arbitrarily long input, and it is not implemented.
 
@@ -333,7 +350,7 @@ All regions are page-aligned and strictly non-overlapping. The input buffer is p
 
 ## Hybrid Modules
 
-When a config entry sets both `match_func`/`find_func` AND `groups_func`/`named_groups_func`, a single WASM module is generated containing both a DFA function (match and/or find) and a groups function (TDFA or Backtracking depending on the pattern), sharing the same memory region.
+When a config entry sets both `match_func`/`find_func` AND `groups_func`, a single WASM module is generated containing both a DFA function (match and/or find) and a groups function (TDFA or Backtracking depending on the pattern), sharing the same memory region.
 
 ---
 

@@ -1,11 +1,12 @@
-// Layer 2 of the fuzzer (plans/OPUS.md §N7): the four compiled paths
+// Layer 2 of the fuzzer: the four compiled paths
 // FuzzCorrectness never reaches.
 //
 // FuzzCorrectness only ever sets FindFunc, so it exercises exactly one of the
 // five compiled paths — the no-capture DFA/CompiledDFA find body. Thirty-nine
 // fuzzer bugs came out of that single path; anchored match, the two capture
-// backends, and the whole set pipeline had no coverage at all. §N1 (Backtracking
-// silently returning "no match" once the input passes numAlts*4096 bytes) was
+// backends, and the whole set pipeline had no coverage at all. The BT
+// stack-overflow bug (Backtracking silently returning "no match" once the
+// input passes numAlts*4096 bytes) was
 // found by hand-pointing a harness at the BT capture path, which is the direct
 // argument for this file existing.
 //
@@ -20,6 +21,8 @@ import (
 	"errors"
 	"regexp"
 	"regexp/syntax"
+	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/qrdl/regexped/compile"
@@ -56,12 +59,19 @@ func skipPattern(pat, input string) string {
 
 // isResourceCeiling reports whether a compile error is a legitimate, documented
 // resource ceiling rather than a bug. These are surfaced as typed errors on
-// purpose (contrast §N1, whose *runtime* ceiling is silent).
+// purpose (contrast the Backtracking frame budget, whose *runtime* ceiling was
+// silent until it got its own sentinel).
 func isResourceCeiling(err error) bool {
 	return errors.Is(err, compile.ErrBTProgramTooLarge) ||
 		errors.Is(err, compile.ErrBTStackTooLarge) ||
 		errors.Is(err, compile.ErrBTLoopCountTooLarge) ||
-		errors.Is(err, compile.ErrBTEmptyBodyLoopChainTooLarge)
+		errors.Is(err, compile.ErrBTEmptyBodyLoopChainTooLarge) ||
+		// The SET path's helper-DFA ceiling (maxHelperDFAStates, 2048). Unlike
+		// the four above it has no fallback — the set compile fails — but it is
+		// the same KIND of event: a construction refused as effectively
+		// unbounded, not an answer that disagrees with Go. Omitting it is what
+		// made FuzzSet/40f883ef54d47f63 look like a defect.
+		errors.Is(err, compile.ErrDFAStateLimit)
 }
 
 // hasCaptures reports whether pat contains at least one capture group.
@@ -295,14 +305,14 @@ func FuzzGroupsBothEngines(f *testing.F) {
 // ---------------------------------------------------------------------------
 // Path 4: sets (find_all).
 
-// FuzzSet checks a two-pattern set's find_all against per-pattern
-// FindAllStringIndex.
+// FuzzSet checks a two-pattern `overlapping: true` set's find against
+// per-start-position anchored matching.
 //
-// The oracle is exact ordered equality per pattern, matching what re2test
-// asserts (col4WasmEqual). Patterns carrying capture groups are skipped: the set
-// pipeline drops capture-bearing patterns (SetDiag.CaptureBearingDropped), so
-// including one would produce an oracle mismatch that is expected behaviour
-// rather than a bug.
+// Comparison is per pattern and by MULTISET, not by sequence: the set ABI
+// leaves the order of the tuples within one call unspecified. Patterns
+// carrying capture groups are skipped: the set pipeline drops capture-bearing
+// patterns (SetDiag.CaptureBearingDropped), so including one would produce an
+// oracle mismatch that is expected behaviour rather than a bug.
 func FuzzSet(f *testing.F) {
 	// Seed with pattern pairs drawn from consecutive corpus entries, so the
 	// seeds contain patterns that actually share literals and inputs.
@@ -312,10 +322,29 @@ func FuzzSet(f *testing.F) {
 	}
 	f.Add(`abc`, `abd`, "xxabcabd")
 	f.Add(`a+`, `b+`, "aabbaa")
+	// First-position inversions: literal-candidate order is
+	// not match-start order once prefixes vary in length.
+	f.Add(`bX`, `.+Y`, "abXY")         // unbounded prefix recovers an earlier start
+	f.Add(`(?:ab)+Y`, `cX`, "abcXabY") // variable-length prefix, state-dependent
+	f.Add(`xxxFOO`, `FOO`, "yxxxFOOy") // fixed-vs-fixed prefix skew (non-zero drain)
+	f.Add(`a.{3}Z`, `Z`, "qaqqqZ")     // fixed prefix 4 vs trivial
 
 	f.Fuzz(func(t *testing.T, pat1, pat2, input string) {
 		if len(input) >= pathsInputCap {
 			t.Skip()
+		}
+		// The oracle below costs ~n^2.2 in input length and dominates the
+		// call, so pathsInputCap is no protection against the fuzz worker's
+		// 10s hang deadline — see maxSetOracleInput for the measurements.
+		if len(input) > maxSetOracleInput() {
+			t.Skip("input longer than the per-start-position oracle can price under the worker deadline")
+		}
+		// The whole-input oracle below counts RUNES in its `.{p}` prefix, so
+		// it is only exact on single-byte-rune input.
+		for i := 0; i < len(input); i++ {
+			if input[i] >= 0x80 {
+				t.Skip("non-ASCII input: the rune-counted whole-input oracle would misalign")
+			}
 		}
 		pats := []string{pat1, pat2}
 		refs := make([]*regexp.Regexp, len(pats))
@@ -327,13 +356,10 @@ func FuzzSet(f *testing.F) {
 			if re.NumSubexp() > 0 {
 				t.Skip("capture-bearing patterns are dropped from sets by design")
 			}
-			if hasContextAssertion(p) {
-				t.Skip("context-sensitive assertion: the per-start-position oracle cannot preserve left context")
-			}
 			refs[i] = re
 		}
 
-		wasmBytes, compErr := compileSet(pats)
+		wasmBytes, dropped, compErr := compileSet(pats)
 		if compErr != nil {
 			if isResourceCeiling(compErr) {
 				t.Skip("resource ceiling")
@@ -341,9 +367,10 @@ func FuzzSet(f *testing.F) {
 			t.Fatalf("set compile error on patterns Go stdlib accepts: %q + %q: %v", pat1, pat2, compErr)
 		}
 
-		got, hang, runErr := runWasmSetFindAll(wasmBytes, input)
+		got, hang, runErr := runWasmSetFind(wasmBytes, input, len(pats))
 		if errors.Is(runErr, errSetOutputTruncated) {
-			t.Skip("set output truncated — not comparable")
+			t.Fatalf("set find overflowed a patterns_in_set-sized buffer: pats=%q,%q input=%q: %v",
+				pat1, pat2, input, runErr)
 		}
 		if errors.Is(runErr, errBTOverflow) {
 			t.Skip("backtracking frame budget exhausted")
@@ -360,8 +387,19 @@ func FuzzSet(f *testing.F) {
 			byID[m.PatternID] = append(byID[m.PatternID], [2]int{m.Start, m.End})
 		}
 		for i, re := range refs {
+			if dropped[i] {
+				// Not in the set the engine built, so the set reports none of
+				// its matches and the oracle must not expect any.
+				if n := len(byID[i]); n != 0 {
+					t.Fatalf("set pattern[%d]=%q was DROPPED from the set but reported %d matches",
+						i, pats[i], n)
+				}
+				continue
+			}
 			want := allStartPositionMatches(re, input)
 			gotI := byID[i]
+			sortSpans(want)
+			sortSpans(gotI)
 			if len(want) != len(gotI) {
 				t.Fatalf("set pattern[%d]=%q match count: input=%q expected %d %v, got %d %v",
 					i, pats[i], input, len(want), want, len(gotI), gotI)
@@ -376,67 +414,95 @@ func FuzzSet(f *testing.F) {
 	})
 }
 
-// allStartPositionMatches is the oracle for set find_all.
+// sortSpans orders spans by (start, end) so two multisets can be compared
+// element-wise. The set ABI leaves within-call tuple order
+// unspecified, so the comparison must be multiset-based.
+func sortSpans(v [][2]int) {
+	sort.Slice(v, func(i, j int) bool {
+		if v[i][0] != v[j][0] {
+			return v[i][0] < v[j][0]
+		}
+		return v[i][1] < v[j][1]
+	})
+}
+
+// allStartPositionMatches is the oracle for an `overlapping: true` set find.
 //
-// find_all does NOT return Go's FindAllStringIndex. It reports, for every start
-// position, the match beginning exactly at that position — so its results
-// OVERLAP, where Go's FindAll skips forward past each match. Measured
-// difference, which is how this was caught:
+// It reports, for every start position, the match beginning exactly at that
+// position — so its results OVERLAP, where Go's FindAll skips forward past each
+// match. Measured difference, which is how this was caught:
 //
 //	a{2,5}? vs "aaaaaa"  Go FindAll: [0-2] [2-4] [4-6]
-//	                     find_all:   [0-2] [1-3] [2-4] [3-5] [4-6]
+//	                     find:       [0-2] [1-3] [2-4] [3-5] [4-6]
 //	.*?end  vs "xyzend"  Go FindAll: [0-6]
-//	                     find_all:   [0-6] [1-6] [2-6] [3-6]
+//	                     find:       [0-6] [1-6] [2-6] [3-6]
 //	a*      vs "a"       Go FindAll: [0-1]
-//	                     find_all:   [0-1] [1-1]
+//	                     find:       [0-1] [1-1]
 //
 // tools/re2test compares against the corpus's col4 column rather than computing
 // this, so it never had to state the rule explicitly.
 //
-// Implemented by anchoring at each offset over input[p:]. That loses left
-// context, which is why FuzzSet skips patterns containing context-sensitive
-// assertions — see hasContextAssertion.
+// Implemented with the whole-input technique: `\A(?s:.{p})(?:pat)` over
+// the WHOLE input hands `pat` position p with its real left context, so `\b`,
+// `\B` and `(?m:^)` judge actual neighbours. The slice technique it replaces
+// (`\A(?:pat)` over input[p:]) judged them against a slice boundary instead
+// and forced every context-sensitive pattern to be skipped — which is exactly
+// how the \b and (?m:^) set defects stayed invisible to this target.
+//
+// `.{p}` counts runes, so callers must restrict the corpus to ASCII.
+//
+// The pattern is re-serialised through regexp/syntax before being embedded:
+// the raw source may contain `\Q`, which quotes everything after it and would
+// swallow the closing paren of the `(?:...)` wrapper, silently building a
+// DIFFERENT regexp and blaming the engine for the difference.
 func allStartPositionMatches(re *regexp.Regexp, input string) [][2]int {
-	anchored, err := regexp.Compile(`\A(?:` + re.String() + `)`)
+	parsed, err := syntax.Parse(re.String(), syntax.Perl)
 	if err != nil {
-		return nil
+		panic("oracle: pattern Go already accepted failed to re-parse: " + err.Error())
 	}
+	body := parsed.String()
 	var out [][2]int
 	for p := 0; p <= len(input); p++ {
-		if m := anchored.FindStringIndex(input[p:]); m != nil {
-			out = append(out, [2]int{p + m[0], p + m[1]})
+		anchored, err := regexp.Compile(`\A` + dotPrefix(p) + `(?:` + body + `)`)
+		if err != nil {
+			// Never return "no matches" here: a broken oracle expression
+			// would read as "the engine over-reported" and blame the
+			// compiler for a harness bug. This is exactly how the
+			// maxRepeat ceiling below first showed up.
+			panic("oracle: could not build the position-" + strconv.Itoa(p) + " probe: " + err.Error())
+		}
+		if m := anchored.FindStringIndex(input); m != nil {
+			out = append(out, [2]int{p, m[1]})
 		}
 	}
 	return out
 }
 
-// hasContextAssertion reports whether pat contains an assertion whose meaning
-// depends on text outside the matched span: ^ $ \A \z \b \B, including the
-// multiline forms. allStartPositionMatches evaluates each start position against
-// a SLICE of the input, so such an assertion would be judged against the slice
-// boundary instead of the real one and the oracle would be wrong — a harness bug
-// masquerading as an engine bug.
-func hasContextAssertion(pat string) bool {
-	parsed, err := syntax.Parse(pat, syntax.Perl)
-	if err != nil {
-		return true // unparseable: treat as unsafe
+// dotPrefix builds a regexp matching exactly p bytes of anything.
+//
+// The obvious `(?s:.{p})` hits regexp/syntax's maxRepeat ceiling of 1000 and
+// fails to compile for any longer input — silently, if the caller treats a
+// compile error as "no matches".
+//
+// NESTING a repeat inside another repeat does NOT lift that ceiling, contrary
+// to what this comment claimed until 2026-08-21: Go rejects on the PRODUCT of
+// nested counts, so `(?:.{1000}){2}` is an error just as `.{2000}` is, and the
+// oracle panicked on every input of 2000 bytes or more while `pathsInputCap`
+// admits 128 KB. Found by FuzzSet on a 3,282-byte input.
+//
+// CONCATENATION has no such limit — each term is independently under the
+// ceiling — so p/1000 copies of `.{1000}` plus a remainder term is correct for
+// any length the fuzzer can produce, at the cost of a longer pattern string.
+func dotPrefix(p int) string {
+	q, r := p/1000, p%1000
+	out := "(?s:"
+	for i := 0; i < q; i++ {
+		out += ".{1000}"
 	}
-	var walk func(*syntax.Regexp) bool
-	walk = func(re *syntax.Regexp) bool {
-		switch re.Op {
-		case syntax.OpBeginLine, syntax.OpEndLine,
-			syntax.OpBeginText, syntax.OpEndText,
-			syntax.OpWordBoundary, syntax.OpNoWordBoundary:
-			return true
-		}
-		for _, sub := range re.Sub {
-			if walk(sub) {
-				return true
-			}
-		}
-		return false
+	if r > 0 {
+		out += ".{" + strconv.Itoa(r) + "}"
 	}
-	return walk(parsed)
+	return out + ")"
 }
 
 // ---------------------------------------------------------------------------

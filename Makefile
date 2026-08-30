@@ -1,6 +1,6 @@
 GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/*/*.go merge/*.go))
 
-.PHONY: re2test perftest perftest-check examples clean unittest lint fmt
+.PHONY: re2test setcaps setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross byteident examples clean unittest lint fmt
 
 build: regexped
 
@@ -10,11 +10,39 @@ regexped: $(GO_SRCS) go.mod go.sum
 re2test: build
 	$(MAKE) -C tools/re2test test
 
+# Set-capability coverage. `setcaps` is the sampled gate
+# that `re2test` already includes; `setcaps-exhaustive` is the whole-corpus
+# run, measured in hours — before a release, or after touching a set emitter.
+setcaps:
+	$(MAKE) -C tools/re2test sets
+
+setcaps-exhaustive:
+	$(MAKE) -C tools/re2test sets-exhaustive
+
 perftest: build
 	$(MAKE) -C tools/perftest
 
 perftest-check: build
 	$(MAKE) -C tools/perftest perftest-check
+
+setperf:
+	$(MAKE) -C tools/setperf run
+
+setperf-check:
+	$(MAKE) -C tools/setperf check
+
+# Cross-engine FUEL: ours vs regex-automata's, both metered over one
+# whole-input operation. Deterministic and machine-independent — the number to
+# quote when wall-clock would only report this machine's placement noise.
+setperf-fuel-cross:
+	$(MAKE) -C tools/setperf fuel-cross
+
+# Byte-identical regression net for the single-pattern paths: one fixture
+# per code path, compared byte for byte —
+# the evidence that a change to a shared emitter did not move single-pattern
+# output. See compile/testdata/byteident/README.md.
+byteident:
+	go test ./compile -run TestByteIdentical -v
 
 examples: build
 	$(MAKE) -C examples

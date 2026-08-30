@@ -26,7 +26,9 @@ The `test` target chains ten single-pattern sub-targets — `exhaustive`, `custo
 `LikelyMode` to verify the mode never changes match correctness, only emitted
 code shape — see [prefer-hints.md](prefer-hints.md)), and `matchonly`,
 `findonly`, `groupsonly` — plus `sets`, which exercises the multi-pattern
-composition pipeline described in [sets.md](sets.md).
+composition pipeline described in [sets.md](sets.md) across all five
+capabilities (plus `find`'s batch entry and both overlap policies). `sets-exhaustive` and `set-batch` are the whole-corpus set runs;
+they are not part of `test` (see "Sets" below for why).
 
 The last three compile each pattern with only one of `match_func`,
 `find_func`, `groups_func` set. That is not redundant with the default
@@ -81,7 +83,7 @@ compile-time literal-chain prefix optimisation.
 
 ### TDFA (~41K passing, via `--validate-groups`)
 
-The TDFA engine handles `groups_func` / `named_groups_func` for patterns
+The TDFA engine handles `groups_func` for patterns
 where Laurikari's tagged DFA construction is feasible (no non-greedy quantifiers,
 no line anchors, no word boundaries, no ambiguous alternations). Each test case
 verifies both the match end position and all capture slot positions.
@@ -95,7 +97,7 @@ Examples of patterns handled by TDFA:
 
 ### Backtracking (~267K passing, via `--validate-groups`)
 
-The Backtracking engine handles `groups_func` / `named_groups_func` for patterns
+The Backtracking engine handles `groups_func` for patterns
 that are not TDFA-eligible — those with ambiguous alternations or overlapping
 quantifiers. Each test case verifies both match position and capture slots.
 
@@ -119,25 +121,81 @@ Examples of patterns handled by Backtracking:
 - `(.*)(foo)(.*)` — greedy capture consuming into next group (same
   indeterminate-branch reason: `.` can't be resolved to a finite first-byte set)
 
-### Sets (`make sets`)
+### Sets (`make sets`, `make sets-exhaustive`)
 
 Set composition is validated by replaying multi-pattern blocks from the RE2
 exhaustive suite and a curated `custom-sets.txt` file through the set pipeline
-described in [sets.md](sets.md). For every block with at least two patterns the
-runner:
+described in [sets.md](sets.md).
 
-1. Compiles all patterns as a single set via `CompileFile` with `find_all`.
-2. Runs the resulting WASM against every test input in the block.
-3. Verifies that the returned `(pattern_id, start, length)` tuples cover all
-   per-pattern matches expected by columns 4 / 1 of the RE2 test format.
+**Every capability is driven, not just `find`.** Until task G15
+ this target declared one set with
+`find` OR a batching `find`, `patterns: all` and no `overlapping` — so
+`match_any`/`match_all`, `scan_any`/`scan_all` and the
+overlapping `find` body had no corpus coverage at all, which is how five
+wrong-answer/crash bugs survived 4.94M passing cases. Each chunk is now driven
+through:
 
-This exercises all set frontends — SIMD Teddy (≤ 16 literals), Aho-Corasick
-(17+ literals, capped by automaton node count rather than literal count),
-SIMD Shufti (density/hint-selected first-byte prefilter), and the scalar DFA
-fallback — together with bucket dispatch and the isolated-fallback path for
-non-greedy patterns. See [sets.md](sets.md) for the exact frontend-selection
-rules. Set tests currently run
-clean with **0 failures**.
+| driven | oracle |
+|---|---|
+| `match_any`, `match_all` | `\A(?:p)\z` over the whole input; membership (never value equality) for `_any` |
+| `scan_any`, `scan_all` | "matches at some position ≥ `from`", at every `from` for short inputs and at the 16/32/33-byte edges for long ones |
+| `find` gated, batching `find` gated at capacity 1 and P | Go `FindAllIndex` — cross-checked against the corpus's own col4 |
+| `find` overlapping, batching `find` overlapping at capacity 1 and P | every start position's leftmost-first match |
+| `find` through an under-sized buffer | `out_cap = 0` and the transactional-overflow rule |
+| every capability at `from > len` | the "nothing" result |
+
+Every expectation is computed **live from Go `regexp`** via a whole-input
+technique (`\A(?s:.{p})(?:pat)`, which hands the pattern position `p` with its
+real left context), so no oracle restates an emitter's own rule back at it.
+
+Further dimensions matter, because the corpus alone supplies none of them. The
+RE2 suite has only **27 blocks, of 132 to 7020 patterns each**, so one set per
+block never crosses the thresholds the compiler specialises on from below
+(packed-pair ≤ 16, Teddy ≤ 64, Aho-Corasick > 16, wide `_all` > 64):
+`--set-chunk` fixes the set size, and `--set-shuffle` deterministically
+permutes a block's patterns first, so a set holds unrelated patterns rather
+than variations of one generator family. `--set-subset` makes the set select a
+**named subset** rather than `patterns: all` — the only configuration in which
+`<SET>_PATTERN_COUNT` and `<SET>_ID_SPACE` differ, and confusing those two is a
+memory-safety bug rather than a wrong answer, since the gate array and the
+`_all` bitmap are sized from the id space while the tuple buffer is sized from
+the count. Separately, `--set-profiles` compiles each chunk under several
+capability configurations, because the compiler emits only the machinery a
+set's declared capabilities need — a `match`-only set emits no literal frontend
+at all, and those specialised emissions are invisible to a set that declares
+everything.
+
+This exercises all set frontends — packed-pair (≤ 16 literals with a selective
+two-byte probe window), SIMD Teddy (≤ 64 literals, 16 when the shortest is one
+byte), Aho-Corasick (> 16 literals, capped by table bytes rather than literal
+count), SIMD Shufti (density/hint-selected first-byte prefilter), and the
+scalar DFA fallback —
+together with bucket dispatch and the isolated-fallback path for non-greedy
+patterns. Per-shape *scaling* is measured separately by `tools/setperf` and the
+fuel ladder.
+
+`make sets` samples the corpus — measured at **2m58s for 6,525,501 checks** —
+which is why it is part of `make test`; `make sets-exhaustive` is the same
+coverage over every chunk and takes hours. Both run clean with **0 failures**,
+and the whole-block gated-`find` leg still reports its historical
+**4,935,736**.
+
+A pattern the compiler legitimately drops from a set — a fallback bucket's
+suffix DFA over the `max_fallback_states` budget, reported as a warning and in
+`--diag-json`'s `state_limit_dropped` — is excluded from the comparison and
+counted separately in the summary, so a documented exclusion cannot masquerade
+as either a pass or a failure.
+
+### Batched sets (`make set-batch`)
+
+The pre-G15 shape, kept because it is the only configuration that compiles sets
+of several thousand patterns: one set per corpus block, the same col4 oracle,
+driving `find` and then its batch entry at a buffer capacity of **one**. That
+capacity is the point: it makes every position with more than one match split,
+so the corpus exercises the batch resume path — and with it the
+delivered-tuple gate rule of — at every
+empty-match shape, anchor and extent it contains, rather than at the handful a
+hand-written test can think of. Also runs clean with **0 failures**.
 
 ---
 

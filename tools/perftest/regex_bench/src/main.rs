@@ -17,17 +17,19 @@
 // The Go host writes data directly into WASM linear memory at the addresses
 // returned by get_input_ptr() / get_output_ptr().
 
+mod automata;
+
 use std::sync::OnceLock;
 use regex::{Regex, RegexSet};
 
 // 512KB input buffer — large enough for the biggest test inputs (~100KB).
-static mut INPUT_BUF: [u8; 512 * 1024] = [0u8; 512 * 1024];
+pub(crate) static mut INPUT_BUF: [u8; 512 * 1024] = [0u8; 512 * 1024];
 
 // Output buffer for capture group slots: [start0, end0, start1, end1, ...]
 static mut OUTPUT_BUF: [i32; 256] = [0i32; 256];
 
 // Timings buffer: one u32 nanosecond value per iteration.
-static mut TIMINGS_BUF: [u32; 10_000] = [0u32; 10_000];
+pub(crate) static mut TIMINGS_BUF: [u32; 10_000] = [0u32; 10_000];
 
 static REGEX: OnceLock<Regex> = OnceLock::new();
 
@@ -35,7 +37,7 @@ static REGEX: OnceLock<Regex> = OnceLock::new();
 // Multi-pattern set benchmarking (RegexSet + per-pattern re-scan for positions)
 
 // Separate 64KB buffer for receiving newline-delimited patterns.
-static mut SET_PATTERNS_BUF: [u8; 64 * 1024] = [0u8; 64 * 1024];
+pub(crate) static mut SET_PATTERNS_BUF: [u8; 64 * 1024] = [0u8; 64 * 1024];
 
 struct SetState {
     set: RegexSet,

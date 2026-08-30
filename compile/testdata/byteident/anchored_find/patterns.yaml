@@ -1,0 +1,4 @@
+# Anchored find (\z): isAnchoredFind selects buildAnchoredFindBody.
+regexps:
+  - pattern: '[0-9]{3}\z'
+    find_func: anchored_find

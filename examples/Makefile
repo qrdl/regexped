@@ -6,7 +6,10 @@ WASMTIME      := $(WASMTIME_RUST) $(WASMTIME_GO) $(WASMTIME_C) $(WASMTIME_AS)
 FASTEDGE      := fastedge/validate fastedge/url-guard
 OTHER         := browser node workers
 
-.PHONY: all clean $(WASMTIME) $(OTHER)
+# $(FASTEDGE) must be here too: those targets are named after directories that
+# EXIST, so without .PHONY make considers them up to date and silently skips
+# the recipe — `make all` then reported success having never built them.
+.PHONY: all clean $(WASMTIME) $(FASTEDGE) $(OTHER)
 
 all: $(WASMTIME) $(FASTEDGE) $(OTHER)
 

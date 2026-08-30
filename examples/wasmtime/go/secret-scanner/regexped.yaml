@@ -36,6 +36,6 @@ regexps:
 
 sets:
   - name: scanner
-    find_all: scan_secrets
+    find: scan_secrets
     emit_name_map: true
     patterns: all

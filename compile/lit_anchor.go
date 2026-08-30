@@ -25,7 +25,7 @@ type litAnchorPoint struct {
 // fixed number of times) with M in [1,16]. This is the shape
 // buildSimplePrefixCheckBody can verify with a single SIMD chunk load
 // instead of buildLitAnchorBackScanBody's generic scalar per-byte reverse
-// walk (plans/TODO.md task 22). Returns the class's SIMD nibble-lookup
+// walk. Returns the class's SIMD nibble-lookup
 // table (same encoding as litChainBranchInfo.tlo — see analyseLitChainBranch
 // in engine_dfa.go) and M on success.
 //
@@ -288,7 +288,7 @@ func findLitAnchorPointInRegexp(re *syntax.Regexp) *litAnchorPoint {
 // lit-anchor optimisation: the reversed-prefix DFA construction does not
 // evaluate word boundaries in the backward direction and the backward-scan
 // body does not verify them at candidate positions, so lit-anchor is unsafe
-// for any prefix that mentions `\b`/`\B`. Task 10 (2026-06-30) — makes the
+// for any prefix that mentions `\b`/`\B`. Added 2026-06-30 — makes the
 // gate at compile.go's lit-anchor activation explicit; previously the
 // rejection relied on the incidental behaviour that a reversed-`\b`-only DFA
 // happens to have an accepting start state, which was fragile against future
@@ -313,18 +313,18 @@ func prefixContainsWordBoundary(re *syntax.Regexp) bool {
 // OpBeginLine (`(?m:^)`) or OpEndLine (`(?m:$)`) node.
 //
 // Gates the lit-anchor optimisation, roughly the way
-// prefixContainsWordBoundary gates `\b`/`\B` (Task 10), but for a different
+// prefixContainsWordBoundary gates `\b`/`\B`, but for a different
 // underlying reason: what a line anchor in the prefix endangers is the
 // BACKWARD scan, not the forward continuation.
 // buildLitAnchorBackScanBody's `revTable.hasNewlineBoundary` branch
 // (engine_dfa.go) stops the reverse walk **unconditionally** at the first
 // '\n' it reads. When the prefix can itself consume a '\n' that stop is
-// premature and the real match start is never reached — FUZZER_BUGS.md §22's
+// premature and the real match start is never reached — a past defect’s
 // repro `\D(?m:^)ab` on "\nab", where `\D` legitimately matches the very '\n'
 // the scan halts at.
 //
 // NOT a forward-continuation problem, contrary to what this comment claimed
-// before TODO.md task 51 (2026-08-17). The forward scan runs the WHOLE
+// before an earlier task (2026-08-17). The forward scan runs the WHOLE
 // pattern's DFA, not a freshly-compiled `suffixRe` DFA
 // (`p.litAnchorFindTable`/`p.litAnchorFindLayout` are the whole-pattern
 // table/layout), and it does establish the preceding byte's newline context:
@@ -335,7 +335,7 @@ func prefixContainsWordBoundary(re *syntax.Regexp) bool {
 //
 // Consequently this predicate is NOT the whole gate: a true answer only
 // forces a fallback when lineAnchoredPrefixSafe also says no. That helper
-// admits the one shape the §22 defect cannot touch — a prefix led by
+// admits the one shape the back-scan defect cannot touch — a prefix led by
 // `^`/`(?m:^)` with nothing after the anchor able to consume a '\n', which
 // makes the stop-at-'\n' exact rather than premature. This function is also
 // reused inside lineAnchoredPrefixSafe to reject any FURTHER line anchor in
@@ -440,12 +440,12 @@ func canConsumeNewline(re *syntax.Regexp) bool {
 
 // lineAnchoredPrefixSafe reports whether a lit-anchor prefix that DOES contain
 // a line anchor is nevertheless safe for the backward scan, so it need not be
-// rejected outright by FUZZER_BUGS.md §22's gate.
+// rejected outright by a past defect’s gate.
 //
-// The §22 defect is in buildLitAnchorBackScanBody's `revTable.hasNewlineBoundary`
+// The defect is in buildLitAnchorBackScanBody's `revTable.hasNewlineBoundary`
 // branch, which stops the backward scan unconditionally at the first '\n' it
 // meets. That is only sound when no match's prefix portion can contain a '\n'
-// — otherwise the scan halts before reaching the real match start (§22's repro
+// — otherwise the scan halts before reaching the real match start (the repro
 // `\D(?m:^)ab` on "\nab": `\D` legitimately consumes the '\n' the scan stops
 // at). It is exactly sound when:
 //
@@ -492,7 +492,7 @@ const maxAltLitAnchorBranches = 8
 // finite length.
 //
 // The equal-fixed-prefix-length requirement is a v1 restriction, not a
-// fundamental one (see plans/TODO.md task 6 for the general
+// fundamental one (see the general
 // bounded-lookahead version that lifts it). With every branch's prefix at
 // the same fixed length P, match_start = literal_pos - P for every branch,
 // so scan order (the order the shared Teddy frontend discovers branch

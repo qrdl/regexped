@@ -10,11 +10,15 @@ import (
 
 // Identifier validation for user-supplied export names.
 //
-// Every `match_func` / `find_func` / `groups_func` / `named_groups_func` value,
-// and every set's `find_any` / `find_all` / `match` value, is interpolated
-// verbatim into generated source in all six stub languages (see generate/).
-// Without a check, a config file can plant arbitrary code in the caller's
-// crate/module — see plans/OPUS.md §N4, where this is demonstrated end to end.
+// Every `match_func` / `find_func` / `groups_func` value, every set capability
+// value (`match_any`, `match_all`, `scan_any`, `scan_all`, `find`), and
+// `namespace:`, is interpolated verbatim into generated source in all six stub
+// languages (see generate/). Without a check, a config file can plant
+// arbitrary code in the caller's crate/module.
+//
+// `named_groups_func` is RETIRED and `match` / `scan` /
+// `find_batch` are retired set keys; all four
+// are load errors, so none reaches this file.
 //
 // The rules, agreed 2026-08-17:
 //
@@ -36,9 +40,9 @@ import (
 // "select" (a Go keyword) and "delete" (a JS keyword), for no benefit.
 //
 // Also deliberately out of scope: duplicate named capture groups within a
-// pattern (IMPROVEMENT_PLAN #14). That is a different defect with a different
+// pattern. That is a different defect with a different
 // symptom — duplicate map keys in the named-groups stub — and shares no code
-// with this check. See plans/OPUS.md §N4.
+// with this check.
 
 // reservedWords is the union of reserved words across the six stub languages
 // regexped can emit: Rust, Go, C, JavaScript, TypeScript and AssemblyScript.
@@ -65,15 +69,21 @@ func init() {
 	}
 }
 
-// rustKeywords covers the 2015/2018/2021 editions' strict keywords plus the
-// reserved-for-future-use set (rejecting those keeps a name from breaking on a
-// future edition bump in the caller's crate).
+// rustKeywords covers the 2015/2018/2021/2024 editions' strict keywords plus
+// the reserved-for-future-use set (rejecting those keeps a name from breaking
+// on a future edition bump in the caller's crate).
+//
+// `gen` is 2024's addition and was missing: a stub with
+// `pub fn gen` compiles on 2021 and fails the moment the caller's crate moves
+// to 2024, which is exactly the breakage the future-use list exists to prevent.
 var rustKeywords = []string{
 	"as", "async", "await", "break", "const", "continue", "crate", "dyn", "else",
 	"enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop",
 	"match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
 	"static", "struct", "super", "trait", "true", "type", "unsafe", "use",
 	"where", "while",
+	// 2024 edition.
+	"gen",
 	// Reserved for future use.
 	"abstract", "become", "box", "do", "final", "macro", "override", "priv",
 	"try", "typeof", "unsized", "virtual", "yield",
@@ -116,7 +126,7 @@ var jsKeywords = []string{
 	// Not reserved words, but restricted binding names: strict-mode code may
 	// not bind either, and a generated ES module is always strict. So
 	// `export function eval(...)` is a SyntaxError even though `eval` passes
-	// every reserved-word list. See plans/FABLE.md B33.
+	// every reserved-word list.
 	"eval", "arguments",
 }
 
@@ -148,6 +158,12 @@ func ValidateIdentifier(name string) error {
 			return fmt.Errorf("contains invalid character %q at offset %d (allowed: ASCII letters, digits and underscore, not starting with a digit)", string(name[i]), i)
 		}
 	}
+	if name == "_" {
+		// Shape-legal but not a NAME: `pub fn _` is invalid Rust, `func _()`
+		// is invalid Go, and in JS it would silently become an ordinary
+		// (shadowable) global.
+		return fmt.Errorf("is the blank identifier, which is not a usable function name in Rust or Go")
+	}
 	if reservedWords[name] {
 		return fmt.Errorf("is a reserved word in at least one stub language (Rust/Go/C/JS/TS/AS) and cannot be used as a generated function name")
 	}
@@ -155,7 +171,7 @@ func ValidateIdentifier(name string) error {
 }
 
 // ValidateConfig checks every user-supplied export name in cfg, and the
-// capture-group names of every entry that declares a named_groups_func. It
+// capture-group names of every entry that declares a groups_func. It
 // reports all violations found rather than stopping at the first, so a config
 // with several bad names is fixable in one pass.
 //
@@ -179,7 +195,6 @@ func ValidateConfig(cfg *BuildConfig) error {
 			{"match_func", re.MatchFunc},
 			{"find_func", re.FindFunc},
 			{"groups_func", re.GroupsFunc},
-			{"named_groups_func", re.NamedGroupsFunc},
 		} {
 			if f.name == "" {
 				continue
@@ -188,27 +203,57 @@ func ValidateConfig(cfg *BuildConfig) error {
 				problems = append(problems, fmt.Sprintf("%s: %s %q %v", owner, f.field, f.name, err))
 			}
 		}
-		if re.NamedGroupsFunc != "" {
-			for _, dup := range duplicateCaptureNames(re.Pattern) {
-				problems = append(problems, fmt.Sprintf("%s: capture group name %q is used more than once; "+
-					"named_groups_func maps names to slots, so only the last group of that name would be reachable", owner, dup))
+		if re.GroupsFunc != "" {
+			for _, problem := range captureNameProblems(re.Pattern) {
+				problems = append(problems, fmt.Sprintf("%s: %s", owner, problem))
 			}
 		}
 	}
 
 	for _, s := range cfg.Sets {
 		owner := fmt.Sprintf("set %q", s.Name)
-		for _, f := range []struct{ field, name string }{
-			{"find_any", s.FindAny},
-			{"find_all", s.FindAll},
-			{"match", s.Match},
-		} {
-			if f.name == "" {
-				continue
+		for _, c := range s.Capabilities() {
+			if err := ValidateIdentifier(c.Name); err != nil {
+				problems = append(problems, fmt.Sprintf("%s: %s %q %v", owner, c.Field, c.Name, err))
 			}
-			if err := ValidateIdentifier(f.name); err != nil {
-				problems = append(problems, fmt.Sprintf("%s: %s %q %v", owner, f.field, f.name, err))
+		}
+	}
+
+	// `name:` reaches generated source as a STRING LITERAL when
+	// `emit_name_map` is on, quoted with Go's %q — whose escapes (\x00,
+	// \u00e9) are not valid in every one of the six languages, and whose
+	// output for a control character is a sequence C and AssemblyScript read
+	// differently from Go. Restricting the value to printable ASCII without a
+	// quote or backslash makes %q's output identical in all six.
+	emitsNames := false
+	for _, sc := range cfg.Sets {
+		if sc.EmitNameMap {
+			emitsNames = true
+			break
+		}
+	}
+	if emitsNames {
+		for _, re := range cfg.Regexps {
+			for i := 0; i < len(re.Name); i++ {
+				if c := re.Name[i]; c < 0x20 || c > 0x7E || c == '"' || c == '\\' {
+					problems = append(problems, fmt.Sprintf(
+						"regexp name %q contains %q at offset %d, which cannot be emitted as a string literal in all six stub languages (emit_name_map is on)",
+						re.Name, string(rune(c)), i))
+					break
+				}
 			}
+		}
+	}
+
+	// `namespace:` is interpolated VERBATIM into generated identifiers in
+	// Go/JS/TS/AS/C — `derivedFuncName(cfg.Namespace, name)` at every shared
+	// symbol — so it is exactly the injection vector every _func value is
+	// shape-checked for. It was not checked at all: `namespace: "x; } func
+	// pwn() {"` planted code in the caller's package, and the merely-wrong
+	// `my-ns` or `9x` produced a file that does not parse.
+	if cfg.Namespace != "" {
+		if err := ValidateIdentifier(cfg.Namespace); err != nil {
+			problems = append(problems, fmt.Sprintf("namespace %q %v", cfg.Namespace, err))
 		}
 	}
 
@@ -233,23 +278,28 @@ func ValidateConfig(cfg *BuildConfig) error {
 // regexp/syntax accepts duplicate names — `(?P<a>x)(?P<a>y)` parses without
 // error — but generate.collectNamedGroups builds a name→slot map, so a repeated
 // name silently resolves to whichever group is visited last. That only changes
-// observable output for named_groups_func (groups_func is positional and
-// match_func / find_func ignore captures), so ValidateConfig applies this check
-// to named_groups_func entries only, rather than rejecting a pattern that is
-// legal and unambiguous everywhere else.
+// observable output where the NAMES are used — the generated index constants
+// and the name->index lookup, which `groups_func` carries
+// retired `named_groups_func` — so ValidateConfig applies this check to
+// groups_func entries only, rather than rejecting a pattern that is legal and
+// unambiguous everywhere else.
 //
 // A pattern that fails to parse yields no duplicates: reporting the syntax
 // error is compile's job, and doing it here too would double up the message.
-func duplicateCaptureNames(pattern string) []string {
+func captureNameProblems(pattern string) []string {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
 	}
-	counts := make(map[string]int)
+	var names []string
+	seen := make(map[string]int)
 	var walk func(*syntax.Regexp)
 	walk = func(r *syntax.Regexp) {
 		if r.Op == syntax.OpCapture && r.Name != "" {
-			counts[r.Name]++
+			if seen[r.Name] == 0 {
+				names = append(names, r.Name)
+			}
+			seen[r.Name]++
 		}
 		for _, sub := range r.Sub {
 			walk(sub)
@@ -257,18 +307,90 @@ func duplicateCaptureNames(pattern string) []string {
 	}
 	walk(re)
 
-	var dups []string
-	for name, n := range counts {
+	var problems []string
+
+	// 1. Exact duplicates. regexp/syntax ACCEPTS these — verified: it parses
+	//    `(?P<a>x)(?P<a>y)` with a nil error — so nothing upstream catches it.
+	var duplicates []string
+	for name, n := range seen {
 		if n > 1 {
-			dups = append(dups, name)
+			duplicates = append(duplicates, name)
 		}
 	}
-	sort.Strings(dups)
-	return dups
+	sort.Strings(duplicates)
+	for _, name := range duplicates {
+		problems = append(problems, fmt.Sprintf("capture group name %q is used more than once; "+
+			"group names become generated constants and a name→index lookup, so only one group of that name would be reachable", name))
+	}
+
+	// NOT checked: reserved words. A group name never stands alone as an
+	// identifier — every language prefixes it with the function's name
+	// (`url_groups_type`) or uses it as a JS/TS object KEY, where a reserved
+	// word is legal. An earlier version of this check rejected `(?P<type>…)`,
+	// which is a perfectly good group name and is used by one of this repo's
+	// own examples.
+	//
+	// Nor the character set: regexp/syntax already refuses anything that is
+	// not a word character — verified, `(?P<a b>x)` and `(?P<a-b>x)` are parse
+	// errors — and a leading digit is fine once prefixed. A DIGIT-LEADING name
+	// used to be a JS/TS hazard for the second reason above (`{ 1a: 3 }` is a
+	// SyntaxError, not a legal key); the generators now quote every key, so
+	// the waiver holds for that too.
+
+	// 2. Names that collide with the SUFFIXES a generator derives from the
+	//    same function's name. `groups_func: url` emits `url_count`,
+	//    `url_index`, `url_names` (and `url_indices` in JS/TS) alongside one
+	//    constant per named group — so a group called `index` makes
+	//    derivedConstName("url","index") and derivedFuncName("url","index")
+	//    the same symbol, declared twice in one file.
+	var reservedSuffix []string
+	for _, name := range names {
+		switch name {
+		case "index", "names", "count", "indices", "iter":
+			reservedSuffix = append(reservedSuffix, name)
+		}
+	}
+	sort.Strings(reservedSuffix)
+	for _, name := range reservedSuffix {
+		problems = append(problems, fmt.Sprintf("capture group name %q is one of the suffixes the stub generators derive from the groups_func name "+
+			"(<func>_index, <func>_names, <func>_count, <func>_indices, <func>_iter), so its constant would collide with the generated helper of the same name", name))
+	}
+
+	// 3. Names that COLLIDE after sanitising. `host` and `Host` are two
+	//    distinct groups to regexp/syntax — verified, both parse — but one
+	//    constant stem, so a generated stub would define the same symbol twice.
+	stems := make(map[string][]string)
+	for _, name := range names {
+		stem := strings.ToUpper(name)
+		stems[stem] = append(stems[stem], name)
+	}
+	var collided []string
+	for stem := range stems {
+		if len(stems[stem]) > 1 {
+			collided = append(collided, stem)
+		}
+	}
+	sort.Strings(collided)
+	for _, stem := range collided {
+		group := append([]string(nil), stems[stem]...)
+		sort.Strings(group)
+		problems = append(problems, fmt.Sprintf("capture group names %s differ only in case and collapse to one generated constant stem %q",
+			strings.Join(quoteAll(group), " and "), stem))
+	}
+	return problems
+}
+
+// quoteAll quotes each name for an error message.
+func quoteAll(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = fmt.Sprintf("%q", n)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
-// Per-stub-type validation (plans/FABLE.md B32, B34)
+// Per-stub-type validation
 //
 // The `_func` / set-export rule above is deliberately language-agnostic: a name
 // legal today must not become a compile error the moment stub_type changes.
@@ -286,32 +408,74 @@ func duplicateCaptureNames(pattern string) []string {
 // Everything here is keyed off ResolveStubType(cfg). A config with neither
 // stub_type nor a stub_file extension generates nothing, so none of it applies.
 
-// jsHelperNames are the module-scope names genJSStubFile emits itself. A user
-// export name equal to any of them produces a duplicate declaration (for the
-// exported ones, a duplicate *export*) in the generated ES module.
+// stubSharedSymbols MIRRORS generate.sharedSymbols — the identifiers a
+// generated file declares that the user did not name, and therefore the ones
+// two stubs in one package collide on and `namespace:` rewrites.
 //
-// _patternNames and patternName are emitted only when at least one set has
-// named patterns, and SetMatch (TS only) only when a set exists at all. They
-// are denied unconditionally anyway: conditioning on the current set list
-// would mean a config that generates fine today starts failing when a set is
-// added later, which is exactly the churn this whole file exists to prevent.
-var jsHelperNames = []string{
-	"init", "_w", "_resize", "_exp", "_mem", "_inBase", "_outBase", "_enc",
-	"_patternNames", "patternName",
+// It is a mirror rather than the original because generate imports config and
+// not the reverse. generate pins the two against each other
+// (TestSharedSymbolsMirrorIsInStep), which is the only thing that keeps a copy
+// honest.
+var stubSharedSymbols = map[string][]string{
+	"go": {"Span", "ErrBacktrackOverflow", "SetMatch", "PatternName"},
+	"js": {"patternName"},
+	"ts": {"SetMatch", "patternName"},
+	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ITER_ERROR"},
+	"c": {
+		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
+		"RX_ERR_BT_OVERFLOW", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
+		"REGEXPED_TYPES_DEFINED",
+	},
+	// Rust is deliberately absent from the SHARED list for the same reason it
+	// is in generate: `pub mod <import_module>` isolates every stub. Its own
+	// declarations are still denied below.
 }
 
-// tsHelperNames is jsHelperNames plus the TS-only exported interface.
-var tsHelperNames = append(append([]string(nil), jsHelperNames...), "SetMatch")
+// stubPrivateHelpers are the other module-scope names a generator emits that a
+// user export can duplicate: file-private helpers, and declarations the
+// namespace key does not rewrite.
+//
+// The JS/TS list is the real set of top-level names genJSStubFile emits, not a
+// sample. It was three renames out of date — `_w`, `_resize`, `_inBase` and
+// `_outBase` are gone and eleven helpers were missing — which is exactly the
+// drift this check exists to prevent.
+//
+// Names are denied unconditionally rather than conditioned on the current set
+// list: otherwise a config that generates fine today starts failing when a set
+// is added later, the churn this whole file exists to prevent.
+var stubPrivateHelpers = map[string][]string{
+	"js": {
+		"init", "_exp", "_mem", "_staticTop", "_bump", "_live", "_enc",
+		"_align", "_grow", "_inCap", "_write", "_stage", "_open", "_close",
+		"_att", "_patternNames",
+	},
+	// Go declares no private helpers of its own, but `init` is reserved by the
+	// LANGUAGE: `func init(input []byte) (uint, bool, error)` is a compile
+	// error, since Go's init takes no arguments and returns nothing.
+	"go":   {"init"},
+	"rust": {"Span", "Error", "Result", "SetMatch"},
+	"as":   {"Span"},
+}
 
-// goTransformedReserved are Pascal-case names the Go generator emits itself,
-// compared against goPublicName(exportName). "SetMatch" is the struct
-// genGoSetBody declares, so an export named `set_match` (or `setMatch`, or
-// `SetMatch`) collides with the type rather than with another function.
-var goTransformedReserved = []string{"SetMatch"}
+func init() { stubPrivateHelpers["ts"] = stubPrivateHelpers["js"] }
 
-// rustTransformedReserved is the same idea for the Rust generator's SetMatch
-// struct. Rust's iterator types get an "Iter" suffix, so only the verbatim
-// struct name can collide.
+// stubHelperNames is every module-scope name stubType's generator declares for
+// itself: the shared symbols plus the private helpers.
+func stubHelperNames(stubType string) []string {
+	out := append([]string(nil), stubSharedSymbols[stubType]...)
+	return append(out, stubPrivateHelpers[stubType]...)
+}
+
+// StubSharedSymbolsForValidation exposes the mirror above so the generate
+// package can pin it against the list the generators really use. Not part of
+// the config API otherwise.
+func StubSharedSymbolsForValidation(stubType string) []string {
+	return append([]string(nil), stubSharedSymbols[stubType]...)
+}
+
+// rustTransformedReserved are names the Rust generator's PascalCase transform
+// can produce a collision with. Rust's iterator types get an "Iter" suffix, so
+// only the verbatim struct name can collide.
 var rustTransformedReserved = []string{"SetMatch"}
 
 // ResolveStubType determines the stub type from cfg.StubType or the extension
@@ -366,7 +530,6 @@ func allExportRefs(cfg *BuildConfig) []exportRef {
 			{"match_func", re.MatchFunc},
 			{"find_func", re.FindFunc},
 			{"groups_func", re.GroupsFunc},
-			{"named_groups_func", re.NamedGroupsFunc},
 		} {
 			if f.name != "" {
 				refs = append(refs, exportRef{owner, f.field, f.name})
@@ -375,14 +538,8 @@ func allExportRefs(cfg *BuildConfig) []exportRef {
 	}
 	for _, s := range cfg.Sets {
 		owner := fmt.Sprintf("set %q", s.Name)
-		for _, f := range []struct{ field, name string }{
-			{"find_any", s.FindAny},
-			{"find_all", s.FindAll},
-			{"match", s.Match},
-		} {
-			if f.name != "" {
-				refs = append(refs, exportRef{owner, f.field, f.name})
-			}
+		for _, c := range s.Capabilities() {
+			refs = append(refs, exportRef{owner, c.Field, c.Name})
 		}
 	}
 	return refs
@@ -433,7 +590,7 @@ func init() {
 }
 
 // validateImportModule checks cfg.ImportModule against the requirements of the
-// one generator stubType selects. See plans/FABLE.md B32.
+// one generator stubType selects.
 //
 //   - rust: emitted as `pub mod <name>` — needs a real Rust identifier.
 //   - go:   emitted as `package <name>` when the stub lands in a directory of
@@ -470,15 +627,18 @@ func validateImportModule(cfg *BuildConfig, stubType string) []string {
 }
 
 // validateExportsForStubType applies the collision checks that are specific to
-// one generator. See plans/FABLE.md B34.
+// one generator.
 func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 	var problems []string
 	refs := allExportRefs(cfg)
 
-	// (1) Collisions with names the JS/TS generator emits for itself.
-	if helpers := map[string][]string{"js": jsHelperNames, "ts": tsHelperNames}[stubType]; helpers != nil {
+	// (1) Collisions with names the generator emits for itself. Every language
+	// including C and Go, which had no such check at all: `rx_match_t` and
+	// `pattern_name` are valid C identifiers, and an export named `Span` was a
+	// duplicate Go type declaration nothing diagnosed.
+	{
 		deny := map[string]bool{}
-		for _, h := range helpers {
+		for _, h := range stubHelperNames(stubType) {
 			deny[h] = true
 		}
 		for _, r := range refs {
@@ -502,22 +662,28 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 		}
 	}
 
-	// (3) Collisions created by the generator's name transform. Both Rust and
-	// Go turn snake_case into PascalCase, so `url_match` and `urlMatch` are
-	// distinct WASM exports (and so pass the verbatim dedup in ValidateSets)
-	// that generate the same Go function / Rust iterator type.
-	if stubType == "rust" || stubType == "go" {
-		reserved := map[string][]string{"rust": rustTransformedReserved, "go": goTransformedReserved}[stubType]
+	// (3) Collisions created by the RUST generator's name transform: two
+	// exports differing only in shape (`a_b` and `aB`) collapse to one
+	// PascalCase iterator TYPE (`ABIter`), so both cannot exist in one module.
+	//
+	// GO IS NOT HERE. Its names have been verbatim so
+	// Pascal-folding them rejected valid configs (`url_match` + `urlMatch` are
+	// two perfectly good Go functions) while MISSING the collision Go really
+	// has — an export literally named `fooIter` against the `type fooIter`
+	// that `find_func: foo` declares. That is check (3b) below.
+	if stubType == "rust" {
 		seen := map[string]exportRef{}
 		for _, r := range refs {
+			// The iterator type, not the function: two exports may share a
+			// PascalCase form without colliding unless both declare one.
 			pub := pascalCase(r.name)
 			if prior, dup := seen[pub]; dup {
 				problems = append(problems, fmt.Sprintf("%s: %s %q and %s %s %q are distinct WASM exports but both generate %s %q; rename one",
-					r.owner, r.field, r.name, prior.owner, prior.field, prior.name, stubType, pub))
+					r.owner, r.field, r.name, prior.owner, prior.field, prior.name, stubType, pub+"Iter"))
 				continue
 			}
 			seen[pub] = r
-			for _, res := range reserved {
+			for _, res := range rustTransformedReserved {
 				if pub == res {
 					problems = append(problems, fmt.Sprintf("%s: %s %q generates %s %q, which is the name of a type the %s stub generator declares for sets",
 						r.owner, r.field, r.name, stubType, pub, stubType))
@@ -526,7 +692,238 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 		}
 	}
 
+	// (3b) Go's real collision surface, compared VERBATIM. Every find or
+	// groups export X also declares `type XIter`; an export literally named
+	// XIter duplicates it. AssemblyScript has the same shape with a
+	// PascalCase iterator name.
+	if stubType == "go" || stubType == "as" {
+		iterOf := func(name string) string {
+			if stubType == "as" {
+				return pascalCase(name) + "Iter"
+			}
+			return name + "Iter"
+		}
+		deny := map[string]exportRef{}
+		for _, r := range refs {
+			if r.field == "find_func" || r.field == "groups_func" || r.field == "find" {
+				deny[iterOf(r.name)] = r
+			}
+		}
+		for _, r := range refs {
+			emitted := r.name
+			if stubType == "as" {
+				emitted = pascalCase(r.name)
+			}
+			if owner, clash := deny[emitted]; clash && owner.name != r.name {
+				problems = append(problems, fmt.Sprintf("%s: %s %q collides with the iterator type the %s generator declares for %s %s %q; rename one",
+					r.owner, r.field, r.name, stubType, owner.owner, owner.field, owner.name))
+			}
+		}
+	}
+
+	// (4) Collisions with the constants a generator derives from a SET NAME.
+	// Unlike (1), these are not a fixed list: `<SET>_PATTERN_COUNT` and its
+	// three siblings are built from the set's own name, so what is reserved
+	// depends on the config. Without this check a TS config with a set named
+	// `scanner` and a capability exported as `scannerPatternCount` passes
+	// validation and then emits both `export const scannerPatternCount` and
+	// `export function scannerPatternCount`, which tsc rejects with no
+	// diagnostic from us. See setDerivedNames for why all four are reserved
+	// even when the set declares no find_batch.
+	//
+	// Compared against the same form the generator emits the export under,
+	// which is the export name VERBATIM in every language.
+	{
+		deny := map[string]SetConfig{}
+		for _, s := range cfg.Sets {
+			for _, n := range setDerivedNames(s, stubType) {
+				deny[n] = s
+			}
+		}
+		for _, r := range refs {
+			// Every generator emits the export name VERBATIM, Go included
+			// verbatim — the Pascal-cased comparison that used to
+			// live here flagged names verbatim emission cannot collide.
+			emitted := r.name
+			if s, clash := deny[emitted]; clash {
+				problems = append(problems, fmt.Sprintf("%s: %s %q generates %s %q, which is also the name of a constant the %s stub generator derives from set %q; rename one",
+					r.owner, r.field, r.name, stubType, emitted, stubType, s.Name))
+			}
+		}
+	}
+
+	// (5) Collisions with symbols a generator DERIVES from another export's
+	// name. `groups_func: parse` emits parse_count / parse_index / parse_names
+	// (+ parse_indices in JS/TS, parse_iter in AS); a second entry with
+	// `match_func: parse_index` passes every check above and then duplicates
+	// the symbol, with no diagnostic from us.
+	//
+	// Derived from find/groups exports only — a match_func contributes no
+	// derived symbols — and skipped for Rust, whose per-stub `pub mod` does
+	// NOT isolate these (they are inside the same module) but whose derived
+	// names follow the same rule, so the same list serves.
+	{
+		deny := map[string]exportRef{}
+		for _, r := range refs {
+			for _, suf := range derivedExportSuffixes(r.field, stubType) {
+				deny[derivedName(r.name, suf)] = r
+			}
+		}
+		for _, r := range refs {
+			if owner, clash := deny[r.name]; clash && owner.name != r.name {
+				problems = append(problems, fmt.Sprintf("%s: %s %q collides with a symbol the %s generator derives from %s %s %q; rename one",
+					r.owner, r.field, r.name, stubType, owner.owner, owner.field, owner.name))
+			}
+		}
+	}
+
 	return problems
+}
+
+// derivedExportSuffixes lists the suffixes stubType's generator appends to one
+// export's name. Mirrors the derivedConstName/derivedFuncName call sites in
+// generate/{rust,go,c,as,js,ts}_stub.go.
+func derivedExportSuffixes(field, stubType string) []string {
+	switch field {
+	case "groups_func":
+		switch stubType {
+		case "js", "ts":
+			return []string{"indices"}
+		case "as":
+			return []string{"count", "index", "names", "iter"}
+		default:
+			return []string{"count", "index", "names"}
+		}
+	case "find_func", "find":
+		if stubType == "as" {
+			return []string{"iter"}
+		}
+		return nil
+	}
+	return nil
+}
+
+// derivedName reproduces generate.derivedFuncName: a name in the base's own
+// style, snake_case appending `_suffix` and camelCase appending `Suffix`.
+// Pinned against the generator by TestDerivedNameMatchesGenerator.
+func derivedName(base, suffix string) string {
+	if suffix == "" {
+		return base
+	}
+	if isCamelStyleName(base) {
+		return base + strings.ToUpper(suffix[:1]) + suffix[1:]
+	}
+	return base + "_" + suffix
+}
+
+// isCamelStyleName mirrors generate.isCamelStyle: an underscore anywhere
+// settles a name as snake, otherwise an uppercase letter after the first
+// character settles it as camel.
+func isCamelStyleName(name string) bool {
+	if strings.Contains(name, "_") {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if name[i] >= 'A' && name[i] <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+// The three set-name stem transforms. Each generator names its per-set
+// constants by applying one of these to SanitizeSetName(set.Name); they live
+// here, and generate/set_stub.go delegates to them, for the reason
+// SanitizeSetName gives — a transform each side derives independently is a
+// transform that can drift, and setDerivedNames below has to reproduce the
+// generators' output EXACTLY or the check it feeds is theatre.
+
+// ScreamingSetName returns the SCREAMING_SNAKE_CASE stem the Rust, C and
+// AssemblyScript generators build their per-set constants from, inserting an
+// underscore at lower→upper transitions so "sqlValidator" becomes
+// "SQL_VALIDATOR" rather than "SQLVALIDATOR".
+func ScreamingSetName(name string) string {
+	base := SanitizeSetName(name)
+	var out []rune
+	for i, c := range base {
+		if i > 0 && c >= 'A' && c <= 'Z' {
+			prev := rune(base[i-1])
+			if prev >= 'a' && prev <= 'z' || prev >= '0' && prev <= '9' {
+				out = append(out, '_')
+			}
+		}
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		out = append(out, c)
+	}
+	return string(out)
+}
+
+// PascalSetName returns the PascalCase stem the Go generator uses.
+func PascalSetName(name string) string { return pascalCase(SanitizeSetName(name)) }
+
+// CamelSetName returns the camelCase stem the JS and TS generators use.
+func CamelSetName(name string) string {
+	p := PascalSetName(name)
+	if p == "" {
+		return p
+	}
+	r := []rune(p)
+	if r[0] >= 'A' && r[0] <= 'Z' {
+		r[0] += 'a' - 'A'
+	}
+	return string(r)
+}
+
+// setDerivedNames returns the module-scope names stubType's generator
+// synthesizes from one set's NAME — the pattern-count and id-space constants,
+// plus JS/TS's batch-size limit.
+//
+// The batch constant is reserved whether or not the set carries
+// `hints: [batch-find]` today, for the reason jsHelperNames denies its list
+// unconditionally: conditioning the check on the hint would mean ADDING the
+// hint to a working config turns a valid export name into a collision.
+//
+// It is reserved in every language even though only JS/TS emits it. Decision
+// (11) keys batching on the hint and never on stub_type, precisely so that
+// changing stub_type cannot break a working config — reserving the name in
+// only two of the six would reintroduce exactly that.
+//
+// This check cannot be name-independent the way the others are: what a set is
+// called decides what its constants are called, so unlike the helper lists this
+// one has to be computed from cfg.Sets.
+func setDerivedNames(s SetConfig, stubType string) []string {
+	var stem string
+	var suffixes []string
+	switch stubType {
+	case "rust", "c", "as":
+		stem, suffixes = ScreamingSetName(s.Name), []string{
+			"_PATTERN_COUNT", "_ID_SPACE", "_BATCH_MAX_SIZE"}
+	case "go":
+		stem, suffixes = PascalSetName(s.Name), []string{
+			"PatternCount", "IDSpace", "BatchMaxSize"}
+	case "js", "ts":
+		stem, suffixes = CamelSetName(s.Name), []string{
+			"PatternCount", "IdSpace", "BatchMaxSize"}
+	default:
+		return nil
+	}
+	out := make([]string, len(suffixes))
+	for i, suf := range suffixes {
+		out[i] = stem + suf
+	}
+	return out
+}
+
+// SetDerivedNamesForValidation exposes setDerivedNames so the generate package
+// — which can import config, but not the reverse — can pin this list against
+// the constants the generators really emit. The stems cannot drift (the
+// generators call the transforms above), but the four SUFFIXES are written out
+// on both sides, and a reserved name that no generator emits is as broken as an
+// emitted one that is not reserved. Not part of the config API otherwise.
+func SetDerivedNamesForValidation(s SetConfig, stubType string) []string {
+	return setDerivedNames(s, stubType)
 }
 
 // PascalCaseForValidation exposes pascalCase so the generate package — which
@@ -557,3 +954,8 @@ func pascalCase(s string) string {
 	}
 	return b.String()
 }
+
+// DerivedNameForValidation exposes derivedName so the generate package can pin
+// it against generate.derivedFuncName. See StubSharedSymbolsForValidation for
+// why the copy exists at all. Not part of the config API otherwise.
+func DerivedNameForValidation(base, suffix string) string { return derivedName(base, suffix) }

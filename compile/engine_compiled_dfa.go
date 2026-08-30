@@ -148,7 +148,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 
 	// Phase 4: when mid-accept dominants exist, add v128 chunk local
 	// (and tmp i32 for the non-compressed path, which lacks a class local).
-	// Task 38: non-mid dominants additionally need 2 i32 hysteresis locals
+	// Non-mid dominants additionally need 2 i32 hysteresis locals
 	// (counter at 6, scratch at 7).
 	emitMidDom := len(l.dominantStates) > 0
 	hystDom := false
@@ -340,7 +340,7 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 // The SIMD prefix scan (emitPrefixScan) is already table/SIMD-only with no br_table
 // dispatch, so no restructuring is required for the find hot path.
 // Row deduplication is guaranteed disabled for the hybrid path.
-func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) []byte {
+func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode) {
 	return buildFindBody(findBodyParams{
 		startState:            l.wasmStart,
 		midStartState:         l.wasmMidStart,

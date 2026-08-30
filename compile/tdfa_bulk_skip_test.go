@@ -37,7 +37,7 @@ func TestDetectTDFABulkSkipAccept(t *testing.T) {
 		// Constructed via newTDFA directly, bypassing selectBestEngine — note
 		// this exact pattern is routed to Backtracking in production because
 		// the trailing Y overlaps the [a-zA-Z] self-loop class, triggering
-		// hasAmbiguousCaptures (see plans/TODO.md task 13). This test is only
+		// hasAmbiguousCaptures. This test is only
 		// exercising the detector in isolation, not real engine selection.
 		{"letter-class", `X([a-zA-Z]+)Y`, 50},
 	}
@@ -314,8 +314,8 @@ func TestEmitTDFABulkSkipShapeNoTagOps(t *testing.T) {
 }
 
 // TestTDFABulkSkipMidAcceptModuleValid compiles whole modules for the
-// bulk-skip shapes end to end, so the B16 mid-accept tail is type-checked by
-// mustCompileEntries' validator (plans/FABLE.md T4) rather than only by the
+// bulk-skip shapes end to end, so the mid-accept tail is type-checked by
+// mustCompileEntries' validator rather than only by the
 // control-flow shape decoder above.
 //
 // The tail is emitted INSIDE emitTDFABulkSkip's "if pos != skipStart" body and

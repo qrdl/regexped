@@ -8,11 +8,15 @@ TS_STUB      := stubs.ts
 all: build
 
 # Step 1 – compile SQL patterns to WASM
-$(PATTERN_WASM): regexped.yaml
+# $(REGEXPED) is a prerequisite of every rule below that runs it: the generated
+# stubs and the compiled .wasm depend on the COMPILER as much as on the config.
+# Without it a rebuild after a compiler change keeps the stale .wasm and the
+# merge fails with an import/export type mismatch.
+$(PATTERN_WASM): regexped.yaml $(REGEXPED)
 	$(REGEXPED) compile --config=regexped.yaml
 
 # Step 2 – generate TypeScript stub
-$(TS_STUB): regexped.yaml $(PATTERN_WASM)
+$(TS_STUB): regexped.yaml $(PATTERN_WASM) $(REGEXPED)
 	$(REGEXPED) generate --config=regexped.yaml
 
 build: $(TS_STUB)

@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Regression tests for plans/FABLE.md wave 3 (B6, B7, B9, B10, B11, B12).
+// Regression tests for the lit-chain anchored/find body defects.
 //
 // Every fix in that wave is a *gate*: the emitter it protects cannot express
 // the shape, so the analyser must refuse it and let the pattern fall through

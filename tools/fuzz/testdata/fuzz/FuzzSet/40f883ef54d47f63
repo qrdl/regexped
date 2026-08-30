@@ -1,0 +1,4 @@
+go test fuzz v1
+string("a[-z]+-.........[.[0-9]+")
+string("[a-z]+-[-09]+")
+string("nohyphen")

@@ -227,7 +227,11 @@ func benchFuel(wasmBytes []byte, mode, input string, fuelEngine *wasmtime.Engine
 	inputLen := int32(len(input))
 
 	before, _ := store.GetFuel()
-	if _, err := fn.Call(store, inputBase, inputLen); err != nil {
+	args := []any{inputBase, inputLen}
+	if mode == "find" {
+		args = append(args, int32(0)) // find is (ptr, len, from)
+	}
+	if _, err := fn.Call(store, args...); err != nil {
 		return 0, err
 	}
 	after, _ := store.GetFuel()

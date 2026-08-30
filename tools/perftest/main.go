@@ -405,7 +405,7 @@ var tests = []testCase{
 
 	// ── Phase 0 new patterns — compatibility baseline coverage ────────────────
 	// These four patterns extend the baseline corpus to cover engine paths that
-	// the Phase 1–4 grouping work touches.  See plans/COMBINING_PATTERNS_PLAN.md
+	// the pattern-grouping work touches.
 	// "Phase 0 — Perftest expansion and baseline capture".
 
 	{
@@ -467,11 +467,11 @@ var tests = []testCase{
 		},
 	},
 	{
-		// TODO.md task 13 population: quantifier-loop class whose terminator
+		// an earlier task population: quantifier-loop class whose terminator
 		// overlaps the class itself. hasAmbiguousCaptures flags the loop's
 		// InstAlt as ambiguous (continue-vs-exit can't be resolved by
 		// first-byte lookahead alone) and routes this to Backtracking today,
-		// even though Task 12 measured forced-TDFA as faster on this exact
+		// even though an earlier measurement made forced-TDFA faster on this exact
 		// shape (68.07 vs 114.12 fuel/byte, -40%). This case exists to
 		// measure that population at scale if/when the gate is narrowed —
 		// not to demonstrate a win yet.
@@ -486,8 +486,7 @@ var tests = []testCase{
 
 	// ── LNM / Opt 1 coverage on 100 KB workloads ─────────────────────────────
 	// These three patterns surface the wins (or absence thereof) of recent
-	// shipping work on a realistic-scale perftest. See plans/LIKELY.md (Opt 1)
-	// and plans/LNM.md (Shufti prefix scan) for the implementation history.
+	// shipping work on a realistic-scale perftest.
 	{
 		// Phase 5 amplifier: mid-accept dominant body with a multi-byte exit
 		// set. Pattern matches URLs delimited by whitespace, comma, or
@@ -1117,9 +1116,6 @@ const (
 	tableBase = int64(131072) // page 2; pages 0-1 are reserved for input
 	// slotsBase is where capture output slots are written for groups calls.
 	slotsBase = int32(512)
-	// benchIters is the number of iterations run inside WASM per benchmark call.
-	// The loop executes entirely within WASM so CGo overhead is paid only once.
-	benchIters = 10_000
 )
 
 type benchResult struct {
@@ -1543,9 +1539,13 @@ func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (u
 
 	before, _ := store.GetFuel()
 	var callErr error
-	if tc.mode == anchoredGroups {
-		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase)
-	} else {
+	switch tc.mode {
+	case anchoredGroups:
+		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase, int32(0))
+	case find:
+		// find is (ptr, len, from); a one-shot find starts at 0.
+		_, callErr = fn.Call(store, inputBase, inputLen, int32(0))
+	default:
 		_, callErr = fn.Call(store, inputBase, inputLen)
 	}
 	after, _ := store.GetFuel()
@@ -2113,10 +2113,10 @@ func runCompareSize(baselinePath string) bool {
 }
 
 // --------------------------------------------------------------------------
-// Set composition benchmarks (task 5.4)
+// Set composition benchmarks
 //
 // Compares:
-//   (a) regexped find_all via CompileFile — one WASM call returns all
+//   (a) regexped `find` via CompileFile — one WASM call returns all
 //       (pattern_id, start, length) tuples for all patterns simultaneously.
 //   (b) regex crate RegexSet::matches + per-pattern Regex::find_iter — the
 //       idiomatic two-pass approach needed because RegexSet returns only which
@@ -2276,7 +2276,7 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	cfg := config.BuildConfig{
 		Regexps: entries,
 		Sets: []config.SetConfig{
-			{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasmBytes, tableEnd, err := compile.CompileFile(cfg, "")
@@ -2299,7 +2299,7 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	if exp := inst.GetExport(store, "memory"); exp != nil {
 		mem = exp.Memory()
 	}
-	findFn := inst.GetFunc(store, "find_all")
+	findFn := inst.GetFunc(store, "set_find")
 	if mem == nil || findFn == nil {
 		return benchResult{}
 	}
@@ -2315,8 +2315,8 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	}
 	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
 	outBase := inBase + int32(len(input)) + 4096
-	// Ensure enough memory pages.
-	neededPages := uint64((int64(outBase) + 4096*3 + pageSize - 1) / pageSize)
+	// Ensure enough memory pages (tuples + gate array both live above outBase).
+	neededPages := uint64((int64(outBase) + 4096*4 + pageSize - 1) / pageSize)
 	curPages := mem.Size(store)
 	if neededPages > curPages {
 		mem.Grow(store, neededPages-curPages) //nolint:errcheck
@@ -2326,27 +2326,14 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	buf := mem.UnsafeData(store)
 	copy(buf[inBase:], []byte(input))
 
-	const outCap = int32(256)
+	// out_cap is patterns_in_set: the exact worst case for a single position,
+	// so the exhaustion loop never overflows.
+	outCap := int32(len(sc.patterns))
+	gatePtr := outBase + outCap*12
 
 	// Warmup: exhaust all matches a few times.
 	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
-		startPos := int32(0)
-		for {
-			n, err := findFn.Call(store, inBase, int32(len(input)), outBase, outCap, startPos)
-			if err != nil || n.(int32) <= 0 {
-				break
-			}
-			b := mem.UnsafeData(store)
-			last := n.(int32) - 1
-			start := b[int(outBase)+int(last)*12+4 : int(outBase)+int(last)*12+8]
-			length := b[int(outBase)+int(last)*12+8 : int(outBase)+int(last)*12+12]
-			s := int32(start[0]) | int32(start[1])<<8 | int32(start[2])<<16 | int32(start[3])<<24
-			l := int32(length[0]) | int32(length[1])<<8 | int32(length[2])<<16 | int32(length[3])<<24
-			if l <= 0 {
-				l = 1
-			}
-			startPos = s + l
-		}
+		exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)
 	}
 
 	// Benchmark: time each full exhaustion pass.
@@ -2354,23 +2341,7 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	timings := make([]time.Duration, setIters)
 	for i := range timings {
 		t0 := time.Now()
-		startPos := int32(0)
-		for {
-			n, err := findFn.Call(store, inBase, int32(len(input)), outBase, outCap, startPos)
-			if err != nil || n.(int32) <= 0 {
-				break
-			}
-			b := mem.UnsafeData(store)
-			last := n.(int32) - 1
-			start := b[int(outBase)+int(last)*12+4 : int(outBase)+int(last)*12+8]
-			length := b[int(outBase)+int(last)*12+8 : int(outBase)+int(last)*12+12]
-			s := int32(start[0]) | int32(start[1])<<8 | int32(start[2])<<16 | int32(start[3])<<24
-			l := int32(length[0]) | int32(length[1])<<8 | int32(length[2])<<16 | int32(length[3])<<24
-			if l <= 0 {
-				l = 1
-			}
-			startPos = s + l
-		}
+		exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)
 		timings[i] = time.Since(t0)
 	}
 
@@ -2386,7 +2357,39 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	return benchResult{avgExec: computeStat(ns, pct), wasmSize: len(wasmBytes)}
 }
 
-// benchRegexpedSetFuel measures WASM fuel consumed by one complete find_all exhaustion
+// exhaustSetFind drives a set `find` export to exhaustion, the way a generated
+// iterator does: zero the gate array, then call
+//
+//	find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> total at that position
+//
+// advancing `from` to start+1 each time. Every tuple in one call shares a
+// start, so reading the first tuple is enough to resume.
+func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtime.Func,
+	inBase, inLen, gatePtr, outBase, outCap int32) int {
+	buf := mem.UnsafeData(store)
+	for i := int32(0); i < outCap*4; i++ {
+		buf[gatePtr+i] = 0
+	}
+	total := 0
+	from := int32(0)
+	for {
+		res, err := findFn.Call(store, inBase, inLen, from, gatePtr, outBase, outCap)
+		if err != nil {
+			return total
+		}
+		n := res.(int32)
+		if n <= 0 {
+			return total
+		}
+		total += int(n)
+		b := mem.UnsafeData(store)
+		start := int32(b[int(outBase)+4]) | int32(b[int(outBase)+5])<<8 |
+			int32(b[int(outBase)+6])<<16 | int32(b[int(outBase)+7])<<24
+		from = start + 1
+	}
+}
+
+// benchRegexpedSetFuel measures WASM fuel consumed by one complete `find` exhaustion
 // pass over the input using a fuel-enabled wasmtime engine.
 func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Engine) uint64 {
 	entries := make([]config.RegexEntry, len(sc.patterns))
@@ -2396,7 +2399,7 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 	cfg := config.BuildConfig{
 		Regexps: entries,
 		Sets: []config.SetConfig{
-			{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+			{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	wasmBytes, tableEnd, err := compile.CompileFile(cfg, "")
@@ -2420,7 +2423,7 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 	if exp := inst.GetExport(store, "memory"); exp != nil {
 		mem = exp.Memory()
 	}
-	findFn := inst.GetFunc(store, "find_all")
+	findFn := inst.GetFunc(store, "set_find")
 	if mem == nil || findFn == nil {
 		return 0
 	}
@@ -2431,49 +2434,36 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 	}
 	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
 	outBase := inBase + int32(len(input)) + 4096
-	neededPages := uint64((int64(outBase) + 4096*3 + pageSize - 1) / pageSize)
+	neededPages := uint64((int64(outBase) + 4096*4 + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); neededPages > cur {
 		mem.Grow(store, neededPages-cur) //nolint:errcheck
 	}
 	buf := mem.UnsafeData(store)
 	copy(buf[inBase:], []byte(input))
 
+	outCap := int32(len(sc.patterns))
+	gatePtr := outBase + outCap*12
+
 	// Warmup call (uncounted).
-	findFn.Call(store, inBase, int32(len(input)), outBase, int32(256), int32(0)) //nolint:errcheck
-	store.SetFuel(fuelBudget)                                                    //nolint:errcheck
+	exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)
+	store.SetFuel(fuelBudget) //nolint:errcheck
 
 	before, _ := store.GetFuel()
-	startPos := int32(0)
-	for {
-		n, err := findFn.Call(store, inBase, int32(len(input)), outBase, int32(256), startPos)
-		if err != nil || n.(int32) <= 0 {
-			break
-		}
-		b := mem.UnsafeData(store)
-		last := n.(int32) - 1
-		s := int32(b[int(outBase)+int(last)*12+4]) | int32(b[int(outBase)+int(last)*12+5])<<8 |
-			int32(b[int(outBase)+int(last)*12+6])<<16 | int32(b[int(outBase)+int(last)*12+7])<<24
-		l := int32(b[int(outBase)+int(last)*12+8]) | int32(b[int(outBase)+int(last)*12+9])<<8 |
-			int32(b[int(outBase)+int(last)*12+10])<<16 | int32(b[int(outBase)+int(last)*12+11])<<24
-		if l <= 0 {
-			l = 1
-		}
-		startPos = s + l
-	}
+	exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)
 	after, _ := store.GetFuel()
 	return before - after
 }
 
 // runSetBenchmarks runs all set composition benchmarks and prints the results.
 func runSetBenchmarks(regexWasmBytes []byte, engine *wasmtime.Engine, fuelEngine *wasmtime.Engine, pct int) {
-	const setFindLabel = "set find_all (regexped) vs RegexSet+rescan (regex crate)"
+	const setFindLabel = "set find (regexped) vs RegexSet+rescan (regex crate)"
 	fmt.Printf("\n%s\n%s\n\n", setFindLabel, strings.Repeat("─", len(setFindLabel)))
 	if fuelEngine != nil {
 		fmt.Printf("%-32s  %14s\n", "", "regexped-set fuel")
 		fmt.Println(strings.Repeat("─", 50))
 	} else {
 		fmt.Printf("%-32s  %14s  %14s  %8s\n", "", "regex-crate", "regexped-set", "speedup")
-		fmt.Printf("%-32s  %14s  %14s  %8s\n", "", "(RegexSet+rescan)", "(find_all)", "")
+		fmt.Printf("%-32s  %14s  %14s  %8s\n", "", "(RegexSet+rescan)", "(find)", "")
 		fmt.Println(strings.Repeat("─", 75))
 	}
 
@@ -2647,7 +2637,7 @@ func runSizeOnlySets() {
 		cfg := config.BuildConfig{
 			Regexps: entries,
 			Sets: []config.SetConfig{
-				{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+				{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 			},
 		}
 		wasmBytes, _, err := compile.CompileFile(cfg, "")
@@ -2752,7 +2742,7 @@ func runCompareSetSize(baselinePath string) bool {
 		cfg := config.BuildConfig{
 			Regexps: entries,
 			Sets: []config.SetConfig{
-				{Name: "bench_set", FindAll: "find_all", Patterns: config.PatternSelector{All: true}},
+				{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 			},
 		}
 		wasmBytes, _, err2 := compile.CompileFile(cfg, "")
@@ -2785,7 +2775,7 @@ func main() {
 	fuel := flag.Bool("fuel", false, "measure fuel (WASM instruction count) for a single call instead of timing")
 	pct := flag.Int("p", 0, "report this percentile (1-99) instead of average (e.g. -p 95)")
 	sizeOnly := flag.Bool("size-only", false, "print WASM module sizes per test case and exit (no harness required)")
-	sets := flag.Bool("sets", false, "run set composition benchmarks (regexped find_all vs regex crate RegexSet+rescan)")
+	sets := flag.Bool("sets", false, "run set composition benchmarks (regexped find vs regex crate RegexSet+rescan)")
 	sizeOnlySets := flag.Bool("size-only-sets", false, "print WASM sizes for set test cases and exit")
 	compareSetsTime := flag.String("compare-sets-time", "", "compare set p50 times against baseline file; exit 1 if outside ±10%")
 	compareSetsFuel := flag.String("compare-sets-fuel", "", "compare set fuel counts against baseline file; exit 1 if outside ±5%")

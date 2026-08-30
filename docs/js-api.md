@@ -42,7 +42,7 @@ await init(wasm);
 ### `match_func` — anchored match
 
 ```js
-export function <func>(input: string | Uint8Array): [number, boolean]
+export function <func>(input: string | Uint8Array): number | null
 ```
 
 Returns `[endPos, true]` if the pattern matches starting at position 0, or `[0, false]` if no match. `endPos` is the exclusive end position of the match in bytes.
@@ -52,8 +52,8 @@ To test whether the full input matches (anchored at both ends):
 ```js
 const enc = new TextEncoder();
 const bytes = enc.encode('https://example.com/path');
-const [end, ok] = url_match(bytes);
-if (ok && end === bytes.length) {
+const end = url_match(bytes);
+if (end === bytes.length) {
     console.log('valid URL');
 }
 ```
@@ -61,8 +61,8 @@ if (ok && end === bytes.length) {
 For start-anchored use cases where the end position matters:
 
 ```js
-const [end, ok] = url_match(input);
-if (ok) {
+const end = url_match(input);
+if (end !== null) {
     console.log('matched first', end, 'bytes');
 }
 ```
@@ -75,7 +75,9 @@ if (ok) {
 export function* <func>(input: string | Uint8Array): Generator<[number, number]>
 ```
 
-Generator that yields `[start, end]` absolute byte positions for each non-overlapping match. After a zero-length match the iterator advances by one byte to avoid infinite loops.
+Generator that yields `[start, end]` absolute byte positions for each non-overlapping match. After a zero-length match the iterator advances by one byte to avoid infinite loops, and — following Go's `FindAllIndex` — an empty match beginning exactly where the previous reported match ended is not reported.
+
+The whole input is passed on every call and `offset` only bounds where the search STARTS, so a leading `\b`, `\B`, `^` or `(?m:^)` is judged against the real preceding byte rather than a slice edge.
 
 ```js
 // All matches:
@@ -120,50 +122,103 @@ if (first && first[1] !== null) {
 
 ---
 
-### `named_groups_func` — named capture groups generator
+### Named groups — one frozen index object
+
+`named_groups_func` is **retired** (a config key using it is a load error). It was never a separate capability: both stubs called the *same* WASM export, and the two differed only in how the item was assembled — an object keyed by name instead of an array indexed by number, minus the whole match and minus the groups that did not participate.
+
+When a pattern has at least one named group, `groups_func` additionally emits one object:
 
 ```js
-export function* <func>(input: string | Uint8Array): Generator<Object>
+export const <groups_func>_indices = Object.freeze({
+    scheme: 1,   // one per NAMED group; index 0 is the whole match
+    host:   2,
+});
 ```
-
-Generator that yields one plain object per non-overlapping match. Each key is a capture group name; the value is `[start, end]` (absolute byte positions). Only groups that participated in the match are present.
 
 ```js
-// All matches:
-for (const parts of parse_url(text)) {
-    if ('host' in parts) {
-        const [s, e] = parts['host'];
-        console.log('host:', text.slice(s, e));
-    }
+for (const match of parse_url(text)) {
+    const host = match[parse_url_indices.host];
+    if (host) console.log('host:', text.slice(host[0], host[1]));
 }
 
-// First match only:
-const first = parse_url(text).next().value;
-if (first?.host) {
-    const [s, e] = first['host'];
-    console.log('host:', text.slice(s, e));
-}
+Object.keys(parse_url_indices);   // the group names
 ```
+
+The `_indices` suffix is required, not decorative: the object is the only derived symbol with no suffix of its own, so without one its name would be the generator function's and the two would collide.
+
+The name follows **your** config's casing — `groups_func: parse_url` yields `parse_url_indices`, `groups_func: parseUrl` yields `parseUrlIndices`.
+
+Duplicate or colliding group names are rejected at **config load**: `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`, but both would collapse to one generated key.
 
 ---
 
 ## Set composition exports
 
-When the config has a `sets:` block, the stub also exports up to three
-functions per set (see [sets.md](sets.md) for the full config schema and
+When the config has a `sets:` block, the stub also exports one function per
+declared capability (see [sets.md](sets.md) for the full config schema and
 wire format):
 
 ```js
-export function* <find_all>(input): Generator<{patternId: number, start: number, end: number}>
-export function <find_any>(input): {patternId: number, start: number, end: number} | null
-export function <match>(input): {patternId: number, start: number, end: number} | null
-export function patternName(id): string   // only if any set sets emit_name_map: true
+export const <set>PatternCount = 12;
+
+// anchored: the pattern must match the WHOLE input
+export function <match_any>(input)            // -> number | null   (a pattern id)
+export function <match_all>(input)            // -> number[]        NOT a boolean
+
+// non-anchored: each takes an offset bounding the search
+export function <scan_any>(input, offset = 0) // -> number | null   (an id; NO position)
+export function <scan_all>(input, offset = 0) // -> number[]        NOT a boolean
+
+export function* <find>(input, offset = 0)    // yields {patternId, start, end}
+
+// with hints: [batch-find] the find generator gains a third parameter, and the
+// set exports its ceiling. Without the hint the parameter does not exist.
+export const <set>BatchMaxSize
+export function* <find>(input, offset = 0, batchSize = 256)
+
+export function patternName(id)             // only if any set sets emit_name_map: true
 ```
 
-`find_all` yields every non-overlapping match across all patterns in the
-set, batched internally for efficiency; `find_any` and `match` return a
-single result object or `null`. `patternName` is a single shared lookup
-across every set in the config that requested `emit_name_map: true`.
+**`_all` and `_any` return data, not predicates.** JavaScript cannot catch the
+misreading, and an empty array is truthy:
+
+```js
+if (scan_all(input)) { ... }   // ALWAYS true, even with zero matches
+if (scan_all(input).length) { ... }   // what you meant
+```
+
+The `find` generator owns the gate array, whichever overlap policy the set
+declares: dropping it and creating a new one restarts the scan with a clean
+array. There is no stateless single-position probe — the generator is the only
+find surface, matching every other language.
+
+`scan_any` and the `_all` pair are backed by `i64` WASM returns, which surface
+as BigInt. The stub decomposes them; a BigInt never reaches you.
+
+**Calling other stub functions while a generator is suspended is safe.** So is
+running two generators over two different inputs at once, or nesting one inside
+the other:
+
+```js
+for (const m of findSecrets(document)) {
+    if (matchAllUrls(someOtherString).length) { … }   // fine
+}
+```
+
+Each live generator owns its input and scratch region for its whole lifetime,
+which is the same guarantee the Rust and Go stubs get from passing a host
+pointer. A generator that exits early — `break`, `return`, or a thrown error —
+releases its region on the way out, so nothing leaks.
+
+*This was not always true.* Until 2026-08-25 every call staged its input at one
+shared address, so an interleaved call left a suspended generator scanning
+another string's bytes and reporting offsets against it — silently, with no
+exception and plausible-looking output (TODO 58). If you are on an older
+generated stub, that hazard is real and the old rule ("do not call other stub
+functions while a generator is suspended") still applies to it.
+
+`patternName` is a single shared lookup across every set in the config that
+requested `emit_name_map: true`.
 
 ---
 
@@ -171,21 +226,44 @@ across every set in the config that requested `emit_name_map: true`.
 
 | Config field | Generated export | Returns |
 |---|---|---|
-| `match_func` | `function <func>(input)` | `[number, boolean]` — `[endPos, matched]` |
-| `find_func` | `function* <func>(input)` | generator of `[start, end]` |
-| `groups_func` | `function* <func>(input)` | generator of `Array<[start,end]\|null>` |
-| `named_groups_func` | `function* <func>(input)` | generator of `Object` (name → `[start,end]`) |
+| `match_func` | `function <func>(input)` | `number \| null` — the end position, or null |
+| `find_func` | `function* <func>(input, offset = 0)` | generator of `[start, end]` |
+| `groups_func` | `function* <func>(input, offset = 0)` | generator of `Array<[start,end]\|null>` |
+| `<groups_func>_indices` | frozen object | name → group index, emitted when the pattern has named groups |
 
 Generated export names match the config field values exactly (no case conversion). All positions are byte offsets in the UTF-8 encoded form of the input. Input can be a `string` (UTF-8 encoded automatically) or a `Uint8Array`.
 
 ---
+
+### `batchSize` — the same matches, a bufferful per call
+
+`find` crosses the host boundary once per matching position. With
+`hints: [batch-find]` on the set, `find` gains an optional `batchSize` and
+fills a buffer with as many consecutive positions as fit, so a caller who will
+consume the whole scan crosses once per bufferful instead. Leave it out when
+you may stop early — a batched call does the work for matches you never look
+at, which is exactly why batching is opt-in rather than the default.
+
+It is the SAME function either way: same matches, same order, same overlap
+policy. Only how much work one crossing does changes. `batchSize` is clamped
+into `[1, <set>BatchMaxSize]`; any value of 1 or more makes progress, since a
+position whose matches do not all fit is delivered in part and resumed inside.
+Group by the match's `start` field rather than by call boundary if you need
+per-position grouping.
+
+**JS and TS are the only languages with this parameter.** Batching amortises
+host-boundary crossings, and C, Go, Rust and AssemblyScript are compiled to
+wasm and merged — their call into the module is a direct call inside one module
+with no boundary to amortise. The hint is a no-op there.
 
 ## Notes
 
 - `init()` must be awaited before calling any matcher. Calling a matcher before `init()` will throw.
 - The stub uses top-level `await` internally — it is designed for ES module environments (browser, Node.js with `"type": "module"`, Cloudflare Workers).
 - `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. The stub is not re-entrant: do not call two generators concurrently on the same stub module instance.
-- `find_func`, `groups_func`, and `named_groups_func` generators automatically detect and use an internal `<func>_batch` WASM export when present, draining several matches per host↔WASM call instead of one. This export only exists when the pattern was compiled with `hints: [batch-find]` (see [`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)); it's purely an internal performance path and doesn't change the generator's external `[start,end]` / capture-array / named-object output. Covers every `groups_func`/`named_groups_func` shape, including the native lit-chain ("Path B") groups bodies. When both `groups_func` and `named_groups_func` are set on the same entry they share one batch export (named after `groups_func`); a `named_groups_func`-only entry gets its own, named after itself.
+- `find_func` and `groups_func` generators automatically detect and use an internal `<func>_batch` WASM export when present, draining several matches per host↔WASM call instead of one. This export only exists when the pattern was compiled with `hints: [batch-find]` (see [`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)); it's purely an internal performance path and doesn't change the generator's external `[start,end]` / capture-array output. Covers every `groups_func` shape, including the native lit-chain ("Path B") groups bodies.
+
+  The rule about `groups_func` and `named_groups_func` *sharing* a batch export is gone with the key: one capability, one export, one name.
 
 ---
 
@@ -194,5 +272,15 @@ Generated export names match the config field values exactly (no case conversion
 Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
 
 The generated function **throws** an `Error` whose message names the function. Since the find/groups functions are generators, the throw surfaces from the `next()` call (i.e. from the `for...of` loop), not from the call that creates the generator.
+
+**`match_any` used to swallow it.** It folded `-2` into `null`; it now throws.
+
+The NARROW `match_all` / `scan_all` do **not** test for it, and must not: their
+`i64` return IS the bitmask, so every 64-bit value is a legal answer. `-2` is
+`0xFFFF_FFFF_FFFF_FFFE` — ids 1..63 matched and id 0 did not — which a
+sentinel test would report as an engine failure on a perfectly good result.
+The real sentinel cannot reach that form at all: a set with a Backtracking
+member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
+`-2` is unambiguous.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

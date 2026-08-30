@@ -1,0 +1,4 @@
+go test fuzz v1
+string("0{310}")
+string("0{0,100}")
+string("")

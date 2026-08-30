@@ -32,13 +32,13 @@ regexps:
 
 sets:
   - name: creds
-    find_all: creds_find_all
+    find: creds_find
     patterns: "all"
     hints: [prefer-no-match]
 ```
 
 A `regexps:` entry's hint governs that pattern's own compiled body
-(`match_func`/`find_func`/`groups_func`/`named_groups_func`). A `sets:`
+(`match_func`/`find_func`/`groups_func`). A `sets:`
 entry's hint governs that set's own frontend and suffix-body choices — it is
 not inherited by member patterns' own directly-exported bodies. There's no
 enclosing-set or global fallback: each entry that wants a hint sets its own.
@@ -62,8 +62,8 @@ set a hint or not.
 
 **`prefer-no-match` targets:**
 - A first-byte set of roughly 17–64 distinct bytes in `find_func` mode (or
-  the equivalent shared step inside a non-anchored `groups_func`/
-  `named_groups_func`) — e.g. `[a-zA-Z]{8,}`, `[a-zA-Z0-9_]{n,}`. Forces a
+  the equivalent shared step inside a non-anchored `groups_func`) — e.g.
+  `[a-zA-Z]{8,}`, `[a-zA-Z0-9_]{n,}`. Forces a
   SIMD-driven scan that pays off when most of the input isn't in that byte
   class, with a runtime fallback if the input turns out to be dense in it
   anyway (so it doesn't cost much even when your intuition is wrong).

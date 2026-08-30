@@ -6,8 +6,8 @@ run:
 	go run . $(ARGS)
 
 # Clear LikelyMatch win on the matching-inputs table (LM-1: relaxes the
-# lit-chain SIMD-verify gate from N>=24 to N>=1; see plans/LM_TODO.md
-# LM-1, and tools/likelytest's "dense-akia" case). AKIA[A-Z0-9]{16} has
+# lit-chain SIMD-verify gate from N>=24 to N>=1; see tools/likelytest's
+# "dense-akia" case). AKIA[A-Z0-9]{16} has
 # count N=16, below the neutral/LikelyNoMatch gate of 24 but above
 # LikelyMatch's gate of 1 — under neutral this pattern falls back to a
 # plain scalar DFA scan/verify; under LikelyMatch it takes the SIMD
@@ -19,7 +19,7 @@ example-lm:
 	go run . -pattern 'AKIA[A-Z0-9]{16}' -mode find -inputs examples/lm_akia_inputs.txt $(ARGS)
 
 # Clear LikelyNoMatch win on the non-matching-inputs table (no literal
-# anchor, wide first-byte class; see plans/TODO.md LNM Action 5).
+# anchor, wide first-byte class).
 example-lnm:
 	go run . -pattern '[a-zA-Z]{8,}' -mode find -inputs examples/lnm_inputs.txt $(ARGS)
 

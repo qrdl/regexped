@@ -72,27 +72,54 @@ impl HttpContext for HttpReqBody {
 
         println!("Received request: email={}, url={}, descr={}", p.email, p.url, p.descr);
 
+        // Every matcher returns a Result. Err means the engine could not
+        // ANSWER — not that the input failed validation — so it is a 500, not
+        // a 400: rejecting the request would report "unknown" as "invalid".
+        let validation_failed = |reason: &str| println!("{reason}");
+
         // validate the e-mail address
-        if regexps::match_email(p.email.as_bytes()).is_none() {
-            println!("Invalid email address: {}", p.email);
-            self.send_http_response(INVALID_REQUEST, vec![], Some("Invalid email address".as_bytes()));
-            return Action::Pause;
+        match regexps::match_email(p.email.as_bytes()) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                validation_failed(&format!("Invalid email address: {}", p.email));
+                self.send_http_response(INVALID_REQUEST, vec![], Some("Invalid email address".as_bytes()));
+                return Action::Pause;
+            }
+            Err(err) => return self.cannot_validate(err),
         }
 
         // validate the URL
-        if regexps::url_match(p.url.as_bytes()).is_none() {
-            println!("Invalid URL: {}", p.url);
-            self.send_http_response(INVALID_REQUEST, vec![], Some("Invalid URL".as_bytes()));
-            return Action::Pause;
+        match regexps::url_match(p.url.as_bytes()) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                validation_failed(&format!("Invalid URL: {}", p.url));
+                self.send_http_response(INVALID_REQUEST, vec![], Some("Invalid URL".as_bytes()));
+                return Action::Pause;
+            }
+            Err(err) => return self.cannot_validate(err),
         }
 
         // check for XSS in the description
-        if regexps::find_xss(p.descr.as_bytes()).next().is_some() {
-            println!("Description contains potential XSS: {}", p.descr);
-            self.send_http_response(INVALID_REQUEST, vec![], Some("Description contains potential XSS".as_bytes()));
-            return Action::Pause;
+        match regexps::find_xss(p.descr.as_bytes(), 0).next() {
+            Some(Ok(_)) => {
+                validation_failed(&format!("Description contains potential XSS: {}", p.descr));
+                self.send_http_response(INVALID_REQUEST, vec![], Some("Description contains potential XSS".as_bytes()));
+                return Action::Pause;
+            }
+            None => {}
+            Some(Err(err)) => return self.cannot_validate(err),
         }
 
         Action::Continue // checks passed
+    }
+}
+
+impl HttpReqBody {
+    /// The engine could not decide. That is a SERVER failure, not a rejected
+    /// request: answering 400 here would report "unknown" as "invalid".
+    fn cannot_validate(&mut self, err: regexps::Error) -> Action {
+        println!("Cannot validate request: {err}");
+        self.send_http_response(500, vec![], Some("Cannot validate request".as_bytes()));
+        Action::Pause
     }
 }

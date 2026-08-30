@@ -2,7 +2,7 @@ package compile
 
 // Byte-rarity classifier — used by `EmitPrefixScan` to decide whether
 // to route a 17..64-byte first-byte set through Shufti SIMD lookup or
-// fall back to scalar firstByteFlags (LNM.md Action 3 deferred portion).
+// fall back to scalar firstByteFlags.
 //
 // Each byte gets a discrete rarity class on a 0–3 scale based on its
 // expected frequency in "typical" workload input (prose-leaning corpus
@@ -27,8 +27,15 @@ package compile
 // chunk, so scalar wins. A lower sum implies the scalar must scan most
 // bytes per chunk (no early exit), letting Shufti's fixed-cost
 // 16-bytes/chunk SIMD pay back. Crossover threshold is set by
-// measurement — see LNM.md.
+// measurement.
 
+// SIBLING TABLE: byte_rank.go's byteRank is the other hand-maintained
+// background byte-frequency model in this package. They answer different
+// questions — this one grades a byte 0..3 for the Shufti density gate, that
+// one ranks bytes 0..255 to pick the packed-pair probe COLUMNS — and they are
+// tuned independently, so they are not duplicates to merge. Merging them (or
+// deriving one from the other) is a performance experiment and needs fuel
+// measurement, not a refactor.
 var byteRarity = func() [256]int8 {
 	var t [256]int8
 	// Default 0 (rare) for unspecified bytes — control / high-bit / NUL.

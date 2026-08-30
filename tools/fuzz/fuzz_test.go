@@ -1,4 +1,4 @@
-// Package fuzz is Layer 1 of plans/FUZZER.md: a byte-level correctness
+// Package fuzz is a byte-level correctness
 // fuzzer comparing regexped's compiled WASM find body against Go stdlib
 // regexp on the same (pattern, input) pair. Run with:
 //
@@ -37,8 +37,7 @@ const inputCap = int(tableBase)
 // a regexped one (see CLAUDE.md's "runtime over compile time" design
 // principle) — it exists because a single go test -fuzz worker call covers
 // both compileFind and the WASM run, and Go's internal/fuzz worker treats
-// any call exceeding 10s as a hang and reports it as a crasher
-// (plans/FUZZER_BUGS.md #23).
+// any call exceeding 10s as a hang and reports it as a crasher.
 //
 // # Calibration
 //
@@ -47,7 +46,7 @@ const inputCap = int(tableBase)
 // go test -fuzz build, -parallel=4, real worker processes — not from solo
 // uninstrumented compiles. That distinction is the entire point: the
 // previous value of 5000 was calibrated solo and admitted calls of 9.2s
-// against the 10s deadline, which is plans/FUZZER_BUGS.md #42.
+// against the 10s deadline.
 //
 // Worst observed per-call wall clock among patterns each cap admits, on the
 // reference box (4 CPUs, Linux, Go 1.25.9):
@@ -113,6 +112,104 @@ func envMaxNFAInsts() int {
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
 		panic(fmt.Sprintf("REGEXPED_FUZZ_MAX_NFA_INSTS must be a positive integer, got %q", raw))
+	}
+	return n
+}
+
+// maxSetOracleInput bounds the INPUT length FuzzSet admits, for the same 10s
+// worker deadline maxNFAInsts guards — but against a cost term that cap cannot
+// see. FuzzSetCaps needs no such variable: it
+// already caps input at 64 bytes for an unrelated reason, which is why only
+// FuzzSet ever reached the deadline.
+//
+// maxNFAInsts bounds the PATTERN's NFA. FuzzSet's dominant cost is neither the
+// pattern nor the engine: it is the harness oracle. allStartPositionMatches
+// calls regexp.Compile once per start position, on a pattern carrying a
+// `.{p}` prefix, so its cost grows superlinearly in INPUT length while the
+// pattern stays trivial. On the crasher that exposed this — patterns
+// `a(?:b|bc)` + `a\x00\x00b\)`, 1,903 bytes — compile was 0.33ms and the WASM
+// run 3.19ms against 405ms of oracle: 99% of the call.
+//
+// # Calibration
+//
+// Oracle wall clock for that pattern pair, measured 2026-08-22 on the
+// reference box (4 CPUs, Linux, Go 1.25.9), against the same 3.5x
+// solo→fuzz-worker factor maxNFAInsts documents:
+//
+//	input   oracle solo   x3.5      headroom vs 10s
+//	512     53ms          187ms     53x
+//	1024    216ms         756ms     13x
+//	2048    744ms         2.6s      3.8x   <- default
+//	4096    3.70s         12.9s     0.8x   (already over)
+//	8192    17.1s         60s       0.17x
+//	16384   80.2s         281s      0.04x
+//
+// Growth is ~n^2.2, so the cliff is sharp: every doubling past 2048 costs
+// ~4.6x. pathsInputCap (128 KB) is no bound at all here — it admits inputs
+// whose oracle alone would run for hours.
+//
+// This narrows coverage, and the loss is real: a genuine oracle bug was once
+// found on a 3,282-byte input, which this cap excludes.
+// Raise it deliberately (and re-measure) when hunting long-input behaviour:
+//
+//	REGEXPED_FUZZ_MAX_SET_INPUT=4096 go test -run='FuzzSet$' -fuzz='FuzzSet$'
+var maxSetOracleInput = sync.OnceValue(envMaxSetOracleInput)
+
+func envMaxSetOracleInput() int {
+	const def = 2048
+	raw, ok := os.LookupEnv("REGEXPED_FUZZ_MAX_SET_INPUT")
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		panic(fmt.Sprintf("REGEXPED_FUZZ_MAX_SET_INPUT must be a positive integer, got %q", raw))
+	}
+	return n
+}
+
+// maxSetCapsNFAInsts is maxNFAInsts for FuzzSetCaps, which needs a tighter one
+// for a structural reason: maxNFAInsts bounds ONE pattern, and what the 10s
+// deadline actually sees is a whole call — but FuzzSetCaps compiles TWO
+// patterns into a set that emits all eight capability bodies plus the anchored
+// automata, where FuzzSet compiles one find body. Same instruction budget,
+// several times the work.
+//
+// # Calibration
+//
+// Measured 2026-08-23 on the reference box, `compileCaps` of two patterns of
+// EQUAL size (the worst case a per-pattern cap admits), against the same 3.5x
+// solo→fuzz-worker factor maxNFAInsts documents:
+//
+//	insts/pattern   compileCaps solo   x3.5      headroom vs 10s
+//	504             756ms              2.65s     3.8x   <- default
+//	704             1.235s             4.32s     2.3x
+//	804             1.456s             5.10s     2.0x
+//	1004            1.906s             6.67s     1.5x
+//	1994            3.289s             11.5s     0.87x  (over before contention)
+//
+// The last row is the shared cap of 2000, i.e. what FuzzSetCaps ran under
+// until now: already past the deadline solo, which is why it tripped the
+// moment anything else shared the CPU. Cost is ~linear
+// in instructions and dominated by compilation — instantiate is 2-8ms and the
+// oracle sweep 4-26ms across the whole range, so neither is worth capping.
+//
+// This narrows FuzzSetCaps' pattern coverage, and only FuzzSetCaps': every
+// other target keeps maxNFAInsts. Raise it deliberately (and re-measure) when
+// hunting large-pattern set behaviour:
+//
+//	REGEXPED_FUZZ_MAX_CAPS_NFA_INSTS=1000 go test -run=FuzzSetCaps -fuzz=FuzzSetCaps
+var maxSetCapsNFAInsts = sync.OnceValue(envMaxSetCapsNFAInsts)
+
+func envMaxSetCapsNFAInsts() int {
+	const def = 512
+	raw, ok := os.LookupEnv("REGEXPED_FUZZ_MAX_CAPS_NFA_INSTS")
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		panic(fmt.Sprintf("REGEXPED_FUZZ_MAX_CAPS_NFA_INSTS must be a positive integer, got %q", raw))
 	}
 	return n
 }

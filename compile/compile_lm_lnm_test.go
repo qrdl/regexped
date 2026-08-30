@@ -450,7 +450,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 		// shouldTryLitChainAlt short-circuits to false before
 		// analyseLitChainAltLenient is ever tried (confirmed live) — this
 		// case only exercises the general LikelyMatch compile sweep for this
-		// pattern shape. See TestCompileLenientAltFindBody (TEST.md T33) for
+		// pattern shape. See TestCompileLenientAltFindBody for
 		// a pattern that actually reaches that code.
 		{
 			"lenient_alt_find_only",
@@ -489,8 +489,8 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"capture_named_ghp",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<key>ghp_[A-Za-z0-9]{36})`,
-				NamedGroupsFunc: "ghp_named_groups",
+				Pattern:    `(?P<key>ghp_[A-Za-z0-9]{36})`,
+				GroupsFunc: "ghp_named_groups",
 			}},
 		},
 		{
@@ -503,15 +503,15 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"capture_prefixed_named",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
-				NamedGroupsFunc: "prefixed_named_groups",
+				Pattern:    `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
+				GroupsFunc: "prefixed_named_groups",
 			}},
 		},
 		{
 			"capture_strict_alt_named_only",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<aws>AKIA[A-Z0-9]{16})|(?P<gh>ghp_[A-Za-z0-9]{36})`,
-				NamedGroupsFunc: "strict_alt_named_only",
+				Pattern:    `(?P<aws>AKIA[A-Z0-9]{16})|(?P<gh>ghp_[A-Za-z0-9]{36})`,
+				GroupsFunc: "strict_alt_named_only",
 			}},
 		},
 		// Lit-chain range with captures (single branch).
@@ -525,8 +525,8 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"capture_range_named_groups",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<key>secret_[A-Za-z0-9]{24,40})`,
-				NamedGroupsFunc: "secret_range_named",
+				Pattern:    `(?P<key>secret_[A-Za-z0-9]{24,40})`,
+				GroupsFunc: "secret_range_named",
 			}},
 		},
 
@@ -542,9 +542,9 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"find_with_named_groups_ghp",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<key>ghp_[A-Za-z0-9]{36})`,
-				FindFunc:        "ghp_find_cap",
-				NamedGroupsFunc: "ghp_named_groups_cap",
+				Pattern:    `(?P<key>ghp_[A-Za-z0-9]{36})`,
+				FindFunc:   "ghp_find_cap",
+				GroupsFunc: "ghp_named_groups_cap",
 			}},
 		},
 		{
@@ -558,9 +558,9 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"find_with_prefixed_named_groups",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
-				FindFunc:        "prefixed_find_cap",
-				NamedGroupsFunc: "prefixed_named_groups_cap",
+				Pattern:    `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
+				FindFunc:   "prefixed_find_cap",
+				GroupsFunc: "prefixed_named_groups_cap",
 			}},
 		},
 		{
@@ -604,10 +604,9 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"find_with_named_groups_lenient_alt",
 			[]config.RegexEntry{{
-				Pattern:         `(?P<gh>ghp_[A-Za-z0-9]{36})|(?P<aws>aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40})`,
-				FindFunc:        "lenient_alt_find_named_cap",
-				GroupsFunc:      "lenient_alt_groups_named_cap",
-				NamedGroupsFunc: "lenient_alt_named_groups_cap",
+				Pattern:    `(?P<gh>ghp_[A-Za-z0-9]{36})|(?P<aws>aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40})`,
+				FindFunc:   "lenient_alt_find_named_cap",
+				GroupsFunc: "lenient_alt_groups_named_cap",
 			}},
 		},
 	}
@@ -1237,7 +1236,7 @@ func TestCompileGroupsForceBacktrack(t *testing.T) {
 	}})
 }
 
-// TestCompileLikelyNoMatch exercises the LNM Action 5 / lnmAction5 flag path
+// TestCompileLikelyNoMatch exercises the lnmAction5 flag path
 // (impossible-byte SIMD skip with a 17..64-byte first-byte set).
 func TestCompileLikelyNoMatch(t *testing.T) {
 	lnm := CompileOptions{LikelyMode: LikelyNoMatch}
@@ -1307,13 +1306,13 @@ func TestCompileLikelyNoMatch(t *testing.T) {
 	}
 }
 
-// TestLM2BatchExportGating exercises the LM-2 batch find/groups export gate
-// (plans/LM_TODO.md LM-2): the "_batch" export must appear exactly when
+// TestLM2BatchExportGating exercises the LM-2 batch find/groups export gate:
+// the "_batch" export must appear exactly when
 // LikelyMode == LikelyMatch and the pattern's own find_func/groups_func was
 // requested, and must NOT appear for anchored (native lit-chain) groups
 // bodies — that shape is out of v1 scope (see the compiledPattern field doc
 // next to batchGroupsExport).
-// TestBatchExportGating covers the "batch-find" hint (plans/TODO.md task 44)
+// TestBatchExportGating covers the "batch-find" hint
 // as the sole trigger for the _batch export — independent of LikelyMode, and
 // covering both the composed (!anchored) and native lit-chain ("Path B",
 // anchored) groups shapes, plus named_groups_func-only naming.
@@ -1345,9 +1344,9 @@ func TestBatchExportGating(t *testing.T) {
 	// fall back to namedGroupsExport (GroupsExportName priority), since
 	// p.groupsExport is empty here.
 	namedOnlyEntries := []config.RegexEntry{{
-		Pattern:         `(a)(b)?`,
-		NamedGroupsFunc: "named_ab",
-		Hints:           []string{"batch-find"},
+		Pattern:    `(a)(b)?`,
+		GroupsFunc: "named_ab",
+		Hints:      []string{"batch-find"},
 	}}
 
 	t.Run("find_batch_present_with_hint", func(t *testing.T) {
@@ -1405,7 +1404,7 @@ func TestBatchExportGating(t *testing.T) {
 			t.Fatalf("Compile: %v", err)
 		}
 		if !bytes.Contains(wasm, []byte("akia_groups_batch")) {
-			t.Error("expected akia_groups_batch export for anchored (Path B) lit-chain groups body — task 44 goal 4")
+			t.Error("expected akia_groups_batch export for anchored (Path B) lit-chain groups body")
 		}
 		if !bytes.Contains(wasm, []byte("akia_groups")) {
 			t.Error("expected akia_groups (non-batch) export to still be present")
@@ -1421,21 +1420,20 @@ func TestBatchExportGating(t *testing.T) {
 			t.Error("akia_groups_batch export present without batch-find hint, should be absent")
 		}
 	})
-	t.Run("named_only_batch_export_named_after_namedGroupsFunc", func(t *testing.T) {
+	t.Run("batch_export_named_after_groupsFunc", func(t *testing.T) {
 		wasm, _, err := Compile(namedOnlyEntries, 0, true)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
 		if !bytes.Contains(wasm, []byte("named_ab_batch")) {
-			t.Error("expected named_ab_batch export (GroupsExportName falls back to NamedGroupsFunc), not found")
+			t.Error("expected named_ab_batch export, not found")
 		}
 	})
 	t.Run("groups_and_named_share_one_batch_export", func(t *testing.T) {
 		both := []config.RegexEntry{{
-			Pattern:         `(a)(b)?`,
-			GroupsFunc:      "g1",
-			NamedGroupsFunc: "g2",
-			Hints:           []string{"batch-find"},
+			Pattern:    `(a)(b)?`,
+			GroupsFunc: "g1",
+			Hints:      []string{"batch-find"},
 		}}
 		wasm, _, err := Compile(both, 0, true)
 		if err != nil {

@@ -12,7 +12,7 @@ stub_file:     "regexp.ts"    # .ts → TypeScript stub; use .js for plain JS
 
 regexps:
   - pattern:           'https?://(?P<host>[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?'
-    named_groups_func: "extract_domain"
+    groups_func:       "extract_domain"
 ```
 
 No `output` field → standalone WASM, no merge step needed.
@@ -31,15 +31,15 @@ See [`examples/node/domain-extract/Makefile`](../examples/node/domain-extract/Ma
 ```ts
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { init, extract_domain } from './regexp.ts';
+import { init, extract_domain, extract_domain_indices } from './regexp.ts';
 
 const wasmPath = fileURLToPath(new URL('./urls.wasm', import.meta.url));
 await init(readFileSync(wasmPath));
 
 const text = readFileSync('/dev/stdin');
 for (const match of extract_domain(text)) {
-    const [start, end] = match['host'];
-    console.log(text.subarray(start, end).toString('utf8'));
+    const host = match[extract_domain_indices.host];
+    if (host) console.log(text.subarray(host[0], host[1]).toString('utf8'));
 }
 ```
 
@@ -53,7 +53,7 @@ node --experimental-strip-types main.ts
 npx tsx main.ts
 ```
 
-See [`examples/node/domain-extract/`](../examples/node/domain-extract/) for the complete example above (a single pattern with `named_groups_func`).
+See [`examples/node/domain-extract/`](../examples/node/domain-extract/) for the complete example above (a single pattern with `groups_func` and a named group).
 
 ## Set composition example
 

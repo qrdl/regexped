@@ -39,7 +39,7 @@ func appendDataSegment(out []byte, offset int32, data []byte) []byte {
 // it. Getting it wrong does not fail the build — it yields a tableEnd far below
 // the real end of the tables, and since the next pattern is laid out from
 // PageAlign(tableEnd), that pattern's tables would be written on top of this
-// one's. See plans/OPUS.md §N10.
+// one's.
 type segAccum struct {
 	bytes []byte
 	count int
@@ -67,7 +67,7 @@ type dataSegment struct {
 //
 // Like stripSegCount, rawData is always appendDataSegment's own output, so a
 // LEB128 decode failure here is an internal invariant violation, not malformed
-// user input — see the note on stripSegCount in compile.go and plans/FABLE.md
+// user input — see the note on stripSegCount in compile.go
 // B39.
 func parseDataSegments(rawData []byte) []dataSegment {
 	var segs []dataSegment
@@ -98,6 +98,26 @@ func parseDataSegments(rawData []byte) []dataSegment {
 		segs = append(segs, dataSegment{int32(offset64), data})
 	}
 	return segs
+}
+
+// dataSegmentsTop returns one past the highest address any segment in rawData
+// writes, or 0 when there are none. It is segAccum's `end` recovered after the
+// fact, for blobs that were already encoded by the time the caller needs their
+// extent.
+//
+// Summing len(rawData) is NOT a substitute and never was: rawData holds ENCODED
+// segments (memory index, offset, LEB128 size, payload), and the payloads are
+// placed at explicit — not necessarily contiguous — offsets. A length sum both
+// counts the encoding overhead and ignores the gaps, and can land either side
+// of the truth.
+func dataSegmentsTop(rawData []byte) int64 {
+	var top int64
+	for _, seg := range parseDataSegments(rawData) {
+		if e := int64(seg.offset) + int64(len(seg.data)); e > top {
+			top = e
+		}
+	}
+	return top
 }
 
 func appendString(out []byte, s string) []byte {
@@ -157,6 +177,15 @@ func appendTableVLoad(b []byte, tableMemIdx int) []byte {
 	return append(b, 0x00)
 }
 
+// appendTableLoad64 emits i64.load align=3 offset=0.
+// tableMemIdx 0: 0x29 0x03 0x00. tableMemIdx 1: 0x29 0x43 0x01 0x00.
+func appendTableLoad64(b []byte, tableMemIdx int) []byte {
+	if tableMemIdx == 0 {
+		return append(b, 0x29, 0x03, 0x00)
+	}
+	return append(b, 0x29, 0x43, byte(tableMemIdx), 0x00)
+}
+
 // appendTableStore32 emits i32.store align=2 for a stack/table write at the given offset.
 // tableMemIdx 0: 0x36 0x02 {offset}. tableMemIdx 1: 0x36 0x42 0x01 {offset}
 // (memidx emitted as LEB128 — see appendTableLoad8u).
@@ -170,8 +199,26 @@ func appendTableStore32(b []byte, tableMemIdx int, offset uint32) []byte {
 	return utils.AppendULEB128(b, offset)
 }
 
-// appendTableStore8 emits i32.store8 align=0 offset=0 for a memo table byte write.
-// tableMemIdx 0: 0x3A 0x00 0x00. tableMemIdx 1: 0x3A 0x40 0x01 0x00
+// appendTableStore16 emits i32.store16 against the table memory, matching
+// appendTableLoad16u's alignment: the memarg align field is the LOG2 of the
+// alignment in bytes, so the 0x00 below declares 1-byte (2^0) alignment, NOT
+// 2-byte. That is deliberate — the sparse accept lists are packed u16 arrays
+// with no padding, so declaring 2-byte alignment would be a lie the validator
+// does not check but a host may. Do not "fix" the 0x00 to 0x01.
+//
+// tableMemIdx 0: 0x3B 0x00 0x00. tableMemIdx 1: 0x3B 0x40 <memidx LEB128> 0x00
+// (the 0x40 bit flags an explicit memory index — see appendTableLoad8u).
+func appendTableStore16(b []byte, tableMemIdx int) []byte {
+	if tableMemIdx == 0 {
+		return append(b, 0x3B, 0x00, 0x00)
+	}
+	b = append(b, 0x3B, 0x40)
+	b = utils.AppendULEB128(b, uint32(tableMemIdx))
+	return append(b, 0x00)
+}
+
+// appendTableStore8 emits i32.store8 align=0 offset=0 for a memo table byte
+// write. tableMemIdx 0: 0x3A 0x00 0x00. tableMemIdx 1: 0x3A 0x40 0x01 0x00
 // (memidx emitted as LEB128 — see appendTableLoad8u).
 func appendTableStore8(b []byte, tableMemIdx int) []byte {
 	if tableMemIdx == 0 {

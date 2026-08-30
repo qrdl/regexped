@@ -1,6 +1,6 @@
 // likelytest is a focused benchmark harness that compares regexped's WASM output
 // across the three LikelyMode compile modes (neutral, likely-match, likely-nomatch)
-// for a hand-picked set of patterns where the LIKELY.md structural optimisations
+// for a hand-picked set of patterns where the LikelyMode design's structural optimisations
 // (SIMD counted-chain verify, SIMD dominant-self-loop skip) are expected to
 // move the needle.
 //
@@ -19,7 +19,7 @@
 // a mismatch prints CORRECTNESS FAIL to stderr and the run exits non-zero.
 //
 // Note: LikelyMode is a stub today — all three modes produce identical WASM. The
-// columns will only diverge once the LIKELY.md optimisations land in compile/.
+// columns will only diverge once the LikelyMode design's optimisations land in compile/.
 // Run via `make run` from this directory.
 package main
 
@@ -47,7 +47,6 @@ const (
 	inputBase  = int32(0)
 	slotsBase  = int32(65536)  // page 1: keep clear of input (up to 64 KiB at offset 0)
 	tableBase  = int64(131072) // page 2; pages 0-1 reserved for input + slots
-	benchIters = 10_000
 	fuelBudget = uint64(10_000_000_000)
 )
 
@@ -60,7 +59,7 @@ const (
 	modeFind matchMode = iota
 	modeAnchored
 	modeGroups
-	modeSet // CompileFile with cfg.Sets; driven via find_all exhaustion loop
+	modeSet // CompileFile with cfg.Sets; driven via the `find` exhaustion loop
 )
 
 func (m matchMode) String() string {
@@ -87,10 +86,10 @@ type testCase struct {
 	// (advance past each match, repeat until EOF or no match — see
 	// runFindExhaust/runGroupsExhaust) instead of measuring one call. A
 	// single find()/groups() call only scans to the FIRST match — bytes
-	// after it are never touched — so "match-dense" inputs (LM_TODO.md
-	// LM-0) are meaningless under single-call measurement; this flag is
+	// after it are never touched — so "match-dense" inputs are meaningless
+	// under single-call measurement; this flag is
 	// what makes them actually exercise the whole buffer. modeSet cases
-	// always exhaust via find_all regardless of this flag.
+	// always exhaust via the set `find` regardless of this flag.
 	exhaustive bool
 }
 
@@ -148,7 +147,7 @@ var tests = []testCase{
 		nomatchInput: impossibleRunInput(false),
 	},
 	{
-		// Suggestion 3 target (RESOLVED — see plans/TODO.md task 23,
+		// Suggestion 3 target (RESOLVED —
 		// retracted 2026-07-08): lit-anchored find with a dominant
 		// self-loop body. Lit-anchor (`findLitAnchorPoint`) requires a 2+
 		// byte literal CHILD with a non-empty prefix whose reverse DFA's
@@ -162,16 +161,16 @@ var tests = []testCase{
 		// not because the optimisation is missing. The genuinely open gap
 		// on this pattern is the no-match side: verifying the `[0-9]{4}`
 		// prefix after an `INFO:` literal hit still walks backward one byte
-		// at a time with no SIMD (plans/TODO.md task 22).
+		// at a time with no SIMD.
 		name:         "lit-anchor-dominant-body",
 		pattern:      `[0-9]{4}INFO:[^\n]+`,
 		mode:         modeFind,
-		notes:        "lit-anchor + mid-accept dominant body — task 22 (backward prefix-scan) target",
+		notes:        "lit-anchor + mid-accept dominant body — backward prefix-scan target",
 		matchInput:   litAnchorDominantBodyInput(true),
 		nomatchInput: litAnchorDominantBodyInput(false),
 	},
 	{
-		// Task 22 target: a bounded-but-larger class-count prefix
+		// a bounded-but-larger class-count prefix
 		// (`{16}`, a trace-ID-style sequence number) before the same
 		// `INFO:` literal + dominant-body suffix shape. A SHORT bounded
 		// count like lit-anchor-dominant-body's `{4}` doesn't actually
@@ -184,7 +183,7 @@ var tests = []testCase{
 		name:         "lit-anchor-false-positive-literal",
 		pattern:      `[0-9]{16}INFO:[^\n]+`,
 		mode:         modeFind,
-		notes:        "lit-anchor backward prefix-scan, 15-digit near-miss false-positives — task 22 target",
+		notes:        "lit-anchor backward prefix-scan, 15-digit near-miss false-positives — backward prefix-scan target",
 		matchInput:   litAnchorLongPrefixMatchInput(),
 		nomatchInput: litAnchorFalsePositiveInput(),
 	},
@@ -212,7 +211,7 @@ var tests = []testCase{
 		nomatchInput: btAction5Input(false),
 	},
 	{
-		// Task 8 target: pattern with greedy class quantifier followed by a
+		// pattern with greedy class quantifier followed by a
 		// required suffix that doesn't appear anywhere. From every starting
 		// position the DFA self-loops through the same letter run and dies
 		// at the same delimiter — O(N²) work without dead-state skip.
@@ -224,12 +223,12 @@ var tests = []testCase{
 		name:         "deadskip-near-miss",
 		pattern:      `[a-zA-Z]+\d`,
 		mode:         modeFind,
-		notes:        "near-miss greedy quantifier — Task 8 (dead-state skip) target",
+		notes:        "near-miss greedy quantifier — dead-state skip target",
 		matchInput:   deadSkipNearMissInput(true),
 		nomatchInput: deadSkipNearMissInput(false),
 	},
 	{
-		// Task 8 follow-up #2 target: min-length quantifier skip. Pattern
+		// Min-length quantifier skip. Pattern
 		// requires >=50 lowercase letters followed by a digit. Suffix is a
 		// character CLASS, not a literal, so no mandatory-literal frontend
 		// applies (confirmed by probe: fuel scales linearly for an
@@ -239,7 +238,7 @@ var tests = []testCase{
 		//
 		// No-match input is 2000 lowercase letters with no digit anywhere:
 		// the DFA never dies (stays in-class the whole way) and never runs
-		// short of input (Task 8's dead-state skip and follow-up #1's
+		// short of input (the dead-state skip and follow-up #1's
 		// EOF-without-match check both stay silent), so every attempt from
 		// position k scans forward to EOF before failing — the pattern is
 		// entirely captured by neither prior fix. Confirmed via direct fuel
@@ -257,7 +256,7 @@ var tests = []testCase{
 		name:         "minlen-quantifier-skip",
 		pattern:      `[a-z]{50,}[0-9]`,
 		mode:         modeFind,
-		notes:        "no mandatory literal, never dies, never runs short — Task 8 follow-up #2 target",
+		notes:        "no mandatory literal, never dies, never runs short — min-length quantifier skip target",
 		matchInput:   minLenQuantifierSkipInput(true),
 		nomatchInput: minLenQuantifierSkipInput(false),
 	},
@@ -286,11 +285,11 @@ var tests = []testCase{
 		nomatchInput: setShuftiLNMInput(false),
 	},
 	{
-		// Task 28 target: same 21-pattern [A-U] set as set-shufti-lnm, but
+		// same 21-pattern [A-U] set as set-shufti-lnm, but
 		// the no-match input is DENSE in the tracked first-byte set instead
 		// of sparse — the "rarely matches" assumption LikelyNoMatch bakes
 		// into forcing Shufti doesn't hold here. Mirrors alpha-run/word-run
-		// (task 25's single-pattern version of this same footgun), which
+		// (the single-pattern version of this same footgun), which
 		// EmitPrefixScan's DenseCounter/DenseSkipFlag adaptive switch
 		// already protects against — buildSetSuffixBody's Shufti frontend
 		// (emitSetMatchFnFinalShufti) has no equivalent protection yet.
@@ -310,7 +309,7 @@ var tests = []testCase{
 			`U1:[^\n]+`,
 		},
 		mode:         modeSet,
-		notes:        "set with 21 [A-U]-prefixed literals, DENSE no-match data — task 28 (Shufti dense-data harm) target",
+		notes:        "set with 21 [A-U]-prefixed literals, DENSE no-match data — Shufti dense-data harm target",
 		matchInput:   setShuftiDenseHarmInput(true),
 		nomatchInput: setShuftiDenseHarmInput(false),
 	},
@@ -328,22 +327,22 @@ var tests = []testCase{
 		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
 	},
 	{
-		// Task 41 BT-routed sibling of tdfa-bulk-skip-word-class above:
+		// BT-routed sibling of tdfa-bulk-skip-word-class above:
 		// `([^,]+)` is also a whole-pattern single capture, but the
-		// inverted class trips hasAmbiguousCaptures (task 13) and routes
+		// inverted class trips hasAmbiguousCaptures and routes
 		// to Backtracking instead of TDFA. Same shape (10 KB self-loop
 		// run + one-byte offset between match/nomatch inputs) confirms
-		// the task 41 shortcut's fuel win isn't TDFA-specific — it should
+		// the shortcut's fuel win isn't TDFA-specific — it should
 		// eliminate BT's ~40 fuel/byte captureBody re-walk here too.
 		name:         "bt-groups-whole-capture-inverted-class",
 		pattern:      `([^,]+)`,
 		mode:         modeGroups,
-		notes:        "BT-routed whole-pattern single capture (inverted class) — task 41 BT sibling",
+		notes:        "BT-routed whole-pattern single capture (inverted class) — BT sibling",
 		matchInput:   strings.Repeat("aB3_", 2560) + ",",
 		nomatchInput: "," + strings.Repeat("aB3_", 2560),
 	},
 
-	// ── LM-0: match-dense cases (plans/LM_TODO.md) ──────────────────────
+	// ── LM-0: match-dense cases ──────────────────────
 	// All prior cases above bury a single match in 10-50 KB — scan-to-first-
 	// match dominates total fuel, so any per-hit/per-run optimisation is
 	// diluted to ~0% in the matrix. These cases exhaust the whole buffer
@@ -391,7 +390,7 @@ var tests = []testCase{
 	{
 		// LM-3 target: non-mid-accept 9-64-byte self-loop body
 		// (`[^>]+` after a 1-byte literal `<`), dense tags every ~20 bytes.
-		// Today's Shufti self-loop bulk-skip (task 26) is mid-accept only;
+		// Today's Shufti self-loop bulk-skip is mid-accept only;
 		// this shape's accept state sits at `>`, one byte AFTER the
 		// self-loop, i.e. non-mid — uncovered until LM-3.
 		name:         "dense-tags",
@@ -433,7 +432,7 @@ var tests = []testCase{
 	},
 	{
 		// LM-4 target: bare (no literal prefix) 9-64-byte-class self-loop —
-		// detectShuftiSelfLoop bails on len(l.prefix)==0 today (task 34's
+		// detectShuftiSelfLoop bails on len(l.prefix)==0 today (the
 		// gate). Runs vary 10-30 bytes so the self-loop is exercised
 		// repeatedly rather than as one giant run.
 		name:         "dense-bare-upper",
@@ -482,7 +481,7 @@ var tests = []testCase{
 		// regardless of LikelyMode, so that shape produces byte-identical
 		// WASM across all three modes and exercises nothing. This pair, by
 		// contrast, lands in the same bucketByLiteral group and binPack's
-		// constraint checks merge them under neutral, losing task 5's
+		// constraint checks merge them under neutral, losing the
 		// single-pattern SIMD suffix body for both. LM-6 gates a refusal on
 		// this exact shape.
 		name: "dense-set-shared-prefix",
@@ -644,7 +643,7 @@ func litAnchorDominantBodyInput(withMatches bool) string {
 }
 
 // litAnchorLongPrefixMatchInput builds ~50 KB of match input for
-// `[0-9]{16}INFO:[^\n]+` (task 22): 2 long matches, each with a full
+// `[0-9]{16}INFO:[^\n]+`: 2 long matches, each with a full
 // 16-digit prefix immediately before "INFO:".
 func litAnchorLongPrefixMatchInput() string {
 	const targetSize = 50 * 1024
@@ -667,7 +666,7 @@ func litAnchorLongPrefixMatchInput() string {
 }
 
 // litAnchorFalsePositiveInput builds ~50 KB of no-match input for
-// `[0-9]{16}INFO:[^\n]+` (task 22). Scatters "INFO:" occurrences through
+// `[0-9]{16}INFO:[^\n]+`. Scatters "INFO:" occurrences through
 // digit-free filler, each preceded by exactly 15 consecutive digits — one
 // short of the 16 required, so [0-9]{16}INFO: never actually matches, but
 // buildLitAnchorBackScanBody's scalar reverse walk must still consume all 15
@@ -685,32 +684,6 @@ func litAnchorFalsePositiveInput() string {
 		b = append(b, filler...)
 		b = append(b, nearMissPrefix...)
 		b = append(b, []byte("INFO:")...)
-	}
-	return string(b[:targetSize])
-}
-
-// secretsFalsePositiveInput builds ~50 KB of no-match input for
-// `ghp_[A-Za-z0-9]{36}` (task 24: promoting the Opt 2 counted-chain SIMD
-// verifier from LikelyMatch-gated to unconditional). Scatters "ghp_"
-// occurrences through filler text, each followed by exactly 35 valid
-// [A-Za-z0-9] bytes — one short of the 36 required — so the pattern never
-// actually matches, but both the plain DFA's counted-chain walk and Opt 2's
-// SIMD chain-verify must consume all 35 valid bytes before the 36th
-// (non-alnum) byte proves failure. This is the worst case for Opt 2: unlike
-// a false positive that dies within the first byte or two, this one forces
-// the full chain-length comparison every time, which is exactly the
-// scenario where a regression from unconditional promotion would show up
-// if one exists. Filler is alnum-free so a 35-byte near-miss run can never
-// accidentally extend past 36 bytes at a concatenation boundary.
-func secretsFalsePositiveInput() string {
-	const targetSize = 50 * 1024
-	filler := []byte(", the quick brown fox jumps over the lazy dog - filler text goes here forever; ")
-	nearMissSuffix := []byte("AbCdEfGhIjKlMnOpQrStUvWxYz012345678") // 35 chars, one short of 36
-	var b []byte
-	for len(b) < targetSize {
-		b = append(b, filler...)
-		b = append(b, []byte("ghp_")...)
-		b = append(b, nearMissSuffix...)
 	}
 	return string(b[:targetSize])
 }
@@ -742,7 +715,7 @@ func deadSkipNearMissInput(withMatches bool) string {
 	return string(b)
 }
 
-// minLenQuantifierSkipInput builds inputs for the Task 8 follow-up #2
+// minLenQuantifierSkipInput builds inputs for the min-length quantifier-skip
 // target (pattern `[a-z]{50,}[0-9]`, no-match input never dies and never
 // runs short of input — see likelytest case "minlen-quantifier-skip").
 func minLenQuantifierSkipInput(withMatches bool) string {
@@ -762,36 +735,6 @@ func minLenQuantifierSkipInput(withMatches bool) string {
 		b = append(b, 'a')
 	}
 	return string(b)
-}
-
-// postLiteralWideSelfLoopInput builds ~50 KB for `ID:[a-zA-Z0-9]{10,}`
-// (task 26). `find` returns on the FIRST match, so repeating "ID:<value> "
-// many times would only exercise the self-loop walk once (the first hit) —
-// no good as a cumulative stress test. Instead, when withMatches is true:
-// a single "ID:" followed by one alnum run spanning almost the entire
-// buffer, forcing the greedy `{10,}` self-loop to scalar-walk the full
-// ~50 KB to find where the run ends (no trailing non-alnum byte, so it
-// walks to EOF) — directly measuring the per-byte cost this task targets.
-// When false: plain "ID:"-free prose of the same size — the literal never
-// fires, so the post-hit self-loop scan never runs at all (the floor; see
-// the case's own comment for why the no-match side can't otherwise stress
-// this gap for an open-ended `{10,}` quantifier).
-func postLiteralWideSelfLoopInput(withMatches bool) string {
-	const targetSize = 50 * 1024
-	prose := []byte("the quick brown fox jumps over the lazy dog and other filler text goes here. ")
-	if !withMatches {
-		var b []byte
-		for len(b) < targetSize {
-			b = append(b, prose...)
-		}
-		return string(b[:targetSize])
-	}
-	alnum := []byte("aB3xR9mLq2ZpW7cD5nE8fH1jK4sT6vU0")
-	b := []byte("ID:")
-	for len(b) < targetSize {
-		b = append(b, alnum...)
-	}
-	return string(b[:targetSize])
 }
 
 // setShuftiLNMInput builds ~50 KB for the H.3 set-shufti-lnm case.
@@ -833,7 +776,7 @@ func setShuftiLNMInput(withMatches bool) string {
 	return string(b[:targetSize])
 }
 
-// setShuftiDenseHarmInput builds ~50 KB for the task 28 set-shufti-dense-harm
+// setShuftiDenseHarmInput builds ~50 KB for the set-shufti-dense-harm
 // case — the harm-side counterpart to setShuftiLNMInput's win-side prose.
 //
 // When withMatches is false: solid A-U letters with no gaps at all (no
@@ -1189,7 +1132,7 @@ type cell struct {
 	// identical is true when this mode's compiled wasm is byte-identical to
 	// neutral's — the compiler emitted the same code regardless of the
 	// LikelyMode hint, so any wall-time difference between them can only be
-	// measurement noise (see TODO.md task 25 investigation: identical wasm
+	// measurement noise (see an earlier task investigation: identical wasm
 	// still showed swings up to +137% run to run on sub-microsecond cases).
 	// Benchmarking is skipped entirely for these; printMatrix shows a single
 	// "identical WASM" message instead of numbers.
@@ -1216,7 +1159,7 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 }
 
 // compileSetMode compiles tc.setPatterns as a regexped set under the given
-// LikelyMode and returns standalone WASM exporting find_all. The mode is
+// LikelyMode and returns standalone WASM exporting the set `find`. The mode is
 // applied via the set's own `hints:` field — the set's resolveHints(sc.Hints)
 // call is what actually consumes it (H.3 frontend density gate); none of
 // these entries carry their own _func fields, so there is no per-pattern
@@ -1231,7 +1174,7 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		Sets: []config.SetConfig{
 			{
 				Name:     "bench_set",
-				FindAll:  "find_all",
+				Find:     "set_find",
 				Patterns: config.PatternSelector{All: true},
 				Hints:    hintsYAML(mode),
 			},
@@ -1388,9 +1331,13 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 
 	before, _ := store.GetFuel()
 	var callErr error
-	if tc.mode == modeGroups {
-		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase)
-	} else {
+	switch tc.mode {
+	case modeGroups:
+		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase, int32(0))
+	case modeFind:
+		// find is (ptr, len, from); a one-shot find starts at 0.
+		_, callErr = fn.Call(store, inputBase, inputLen, int32(0))
+	default:
 		_, callErr = fn.Call(store, inputBase, inputLen)
 	}
 	if callErr != nil {
@@ -1401,7 +1348,7 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 }
 
 // findExhaustIterTime is the timing-sample count for exhaustive find/groups
-// measurement (LM_TODO.md LM-0). Lower than setIterTime (1000): a dense
+// measurement. Lower than setIterTime (1000): a dense
 // find/groups pass can visit far more matches per pass than the set cases
 // do (e.g. dense-words-grouped's ~8k words), so fewer reps keeps wall-clock
 // reasonable while still giving a stable p50.
@@ -1409,13 +1356,13 @@ const findExhaustIterTime = 200
 
 // runFindExhaust drives a single-pattern find() export to exhaustion over
 // inputLen bytes at inputBase, mirroring the host stubs' iteration loop
-// (generate/js_stub.go genJSFindFunc): re-call with a shrinking window
-// (inputBase+off, inputLen-off), advance off past each match (or by 1 for
-// a zero-length match) until no match or EOF.
+// (generate/js_stub.go genJSFindFunc): re-call with the whole buffer and a
+// rising start position, advancing past each match (or by 1 for a zero-length
+// match) until no match or EOF.
 func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 	off := int32(0)
 	for off <= inputLen {
-		r, err := fn.Call(store, inputBase+off, inputLen-off)
+		r, err := fn.Call(store, inputBase, inputLen, off)
 		if err != nil {
 			return
 		}
@@ -1423,12 +1370,20 @@ func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 		if packed < 0 {
 			return
 		}
-		relStart := int32(packed >> 32)
-		relEnd := int32(packed & 0xFFFFFFFF)
-		if relEnd > relStart {
-			off += relEnd
+		// ABSOLUTE, not relative. the export takes the whole
+		// buffer plus a start position, and the packed halves are positions in
+		// that buffer — so the advance is an ASSIGNMENT, not an increment.
+		// `off += absEnd` roughly DOUBLED off every iteration, so a
+		// match-dense 50 KB input "exhausted" in ~17 calls instead of ~8000
+		// and every exhaustive find row measured a logarithmic sliver of the
+		// drive. checkFindExhaust has always converted correctly, which is why
+		// the correctness gate could not see it.
+		absStart := int32(packed >> 32)
+		absEnd := int32(packed & 0xFFFFFFFF)
+		if absEnd > absStart {
+			off = absEnd
 		} else {
-			off += relStart + 1
+			off = absStart + 1
 		}
 	}
 }
@@ -1444,7 +1399,7 @@ func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, slotsPtr, inputLen int32) {
 	off := int32(0)
 	for off <= inputLen {
-		r, err := fn.Call(store, inputBase+off, inputLen-off, slotsPtr)
+		r, err := fn.Call(store, inputBase, inputLen, slotsPtr, off)
 		if err != nil {
 			return
 		}
@@ -1452,12 +1407,15 @@ func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Me
 			return
 		}
 		buf := mem.UnsafeData(store)
-		matchEnd := int32(buf[slotsPtr+4]) | int32(buf[slotsPtr+5])<<8 | int32(buf[slotsPtr+6])<<16 | int32(buf[slotsPtr+7])<<24
+		// Slots are ABSOLUTE now: the whole buffer is passed and `off` only
+		// bounds where the search starts.
+		absStart := int32(buf[slotsPtr]) | int32(buf[slotsPtr+1])<<8 | int32(buf[slotsPtr+2])<<16 | int32(buf[slotsPtr+3])<<24
+		absEnd := int32(buf[slotsPtr+4]) | int32(buf[slotsPtr+5])<<8 | int32(buf[slotsPtr+6])<<16 | int32(buf[slotsPtr+7])<<24
 		runtime.KeepAlive(store)
-		if matchEnd > 0 {
-			off += matchEnd
+		if absEnd > absStart {
+			off = absEnd
 		} else {
-			off++
+			off = absStart + 1
 		}
 	}
 }
@@ -1612,7 +1570,7 @@ func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string
 // correctness bug can hide in exactly this corpus's blind spot: a "good"
 // fuel/time number looks identical whether the compiled WASM took a
 // legitimately cheaper path or is silently returning the wrong answer
-// (FUZZER_BUGS.md #25's gap-e-groups case is exactly this — a false
+// (a past defect’s gap-e-groups case is exactly this — a false
 // negative that went unnoticed here because nothing checked the return
 // value, only its cost). So every (pattern, mode, input) combination that
 // gets a fuel/time number here also gets checked against Go's regexp
@@ -1622,8 +1580,8 @@ func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string
 //
 // modeSet is intentionally not checked here: tools/re2test's own --sets
 // mode already exhaustively validates set-composition correctness, and
-// decoding find_all's per-pattern tuple output against the right member of
-// a multi-pattern set is a different, more involved job than the
+// decoding the set `find`'s per-pattern tuple output against the right member
+// of a multi-pattern set is a different, more involved job than the
 // single-pattern checks below. Only 3 of this suite's cases use modeSet.
 
 // newPlainInstance instantiates wasmBytes on a fuel-free store and returns
@@ -1758,7 +1716,7 @@ func checkFind(engine *wasmtime.Engine, wasmBytes []byte, input string, re *rege
 	}
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
-	r, err := fn.Call(store, inputBase, int32(len(input)))
+	r, err := fn.Call(store, inputBase, int32(len(input)), int32(0))
 	if err != nil {
 		return fmt.Errorf("call: %w", err)
 	}
@@ -1773,16 +1731,26 @@ func checkFind(engine *wasmtime.Engine, wasmBytes []byte, input string, re *rege
 // expectedFindAll mirrors runFindExhaust's exact advance rule (advance past
 // a non-empty match's end, or past a zero-length match's start+1) so a
 // mismatch here reflects a real product bug, not a harness assumption gap.
+//
+// It also applies Go's FindAllIndex suppression rule — an EMPTY match
+// beginning exactly where the previous reported match ended is not reported —
+// because the emitters do. This harness re-implements
+// the iteration rather than driving a stub, so the rule has to be here too, or
+// it disagrees with the product and blames the engine.
 func expectedFindAll(re *regexp.Regexp, input string) [][2]int {
 	var all [][2]int
 	off := 0
+	prevEnd := -1
 	for off <= len(input) {
 		m := re.FindStringIndex(input[off:])
 		if m == nil {
 			break
 		}
 		s, e := m[0]+off, m[1]+off
-		all = append(all, [2]int{s, e})
+		if !(s == e && s == prevEnd) {
+			all = append(all, [2]int{s, e})
+			prevEnd = e
+		}
 		if e > s {
 			off = e
 		} else {
@@ -1808,7 +1776,8 @@ func checkFindExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, r
 	var got [][2]int
 	off := int32(0)
 	for off <= inputLen {
-		r, err := fn.Call(store, inputBase+off, inputLen-off)
+		// Whole buffer plus a start position; positions come back absolute.
+		r, err := fn.Call(store, inputBase, inputLen, off)
 		if err != nil {
 			return fmt.Errorf("call at off=%d: %w", off, err)
 		}
@@ -1816,9 +1785,10 @@ func checkFindExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, r
 		if packed < 0 {
 			break
 		}
-		relStart := int32(packed >> 32)
-		relEnd := int32(packed & 0xFFFFFFFF)
-		got = append(got, [2]int{int(off + relStart), int(off + relEnd)})
+		absStart := int32(packed >> 32)
+		absEnd := int32(packed & 0xFFFFFFFF)
+		relStart, relEnd := absStart-off, absEnd-off
+		got = append(got, [2]int{int(absStart), int(absEnd)})
 		if relEnd > relStart {
 			off += relEnd
 		} else {
@@ -1836,7 +1806,7 @@ func checkFindExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, r
 // composition documented at compile.go's "Capture path" comment performs an
 // internal find (not a strict anchored-at-ptr check) for any shape that
 // doesn't hit the native lit-chain fast path — confirmed empirically for
-// FUZZER_BUGS.md #25's gap-e-groups repro, where a ptr=0 call over a 10KB
+// a past defect’s gap-e-groups repro, where a ptr=0 call over a 10KB
 // buffer found a match starting mid-buffer. Mirrors tools/re2test's col5
 // check: plain FindStringSubmatchIndex, no anchoring requirement.
 func expectedGroups(re *regexp.Regexp, input string) []int {
@@ -1858,7 +1828,7 @@ func checkGroups(engine *wasmtime.Engine, wasmBytes []byte, input string, re *re
 	for i := 0; i < totalGroups*2*4; i++ {
 		buf[int(slotsBase)+i] = 0xFF // pre-init to -1, matching re2test's callGroups
 	}
-	r, err := fn.Call(store, inputBase, int32(len(input)), slotsBase)
+	r, err := fn.Call(store, inputBase, int32(len(input)), slotsBase, int32(0))
 	if err != nil {
 		return fmt.Errorf("call: %w", err)
 	}
@@ -1883,11 +1853,14 @@ func checkGroups(engine *wasmtime.Engine, wasmBytes []byte, input string, re *re
 	return nil
 }
 
-// expectedGroupsAll mirrors runGroupsExhaust's exact advance rule: advance
-// by the match's own relative end (slots[1] before shifting), or off++ if
-// that's zero. This deliberately differs from expectedFindAll's "end>start"
-// rule — see runGroupsExhaust's doc comment for why groups' generated-stub
-// advance logic isn't the same as find's.
+// expectedGroupsAll mirrors runGroupsExhaust's exact advance rule, on the
+// the ABSOLUTE positions the export reports: advance to the match end,
+// or one past the start when the match is empty.
+//
+// It used to model the pre-task-54 relative rule (advance by slots[1], off++
+// when that is zero) and shift the oracle's own spans by `off` — both of which
+// are now wrong twice over, since the export is handed the whole buffer and
+// returns positions in it.
 func expectedGroupsAll(re *regexp.Regexp, input string) [][]int {
 	var all [][]int
 	off := 0
@@ -1905,10 +1878,10 @@ func expectedGroupsAll(re *regexp.Regexp, input string) [][]int {
 			}
 		}
 		all = append(all, shifted)
-		if relEnd := sub[1]; relEnd > 0 {
-			off += relEnd
+		if absStart, absEnd := shifted[0], shifted[1]; absEnd > absStart {
+			off = absEnd
 		} else {
-			off++
+			off = absStart + 1
 		}
 	}
 	return all
@@ -1935,7 +1908,12 @@ func checkGroupsExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string,
 		for i := 0; i < totalGroups*2*4; i++ {
 			buf[int(slotsBase)+i] = 0xFF
 		}
-		r, err := fn.Call(store, inputBase+off, inputLen-off, slotsBase)
+		// FOUR arguments, and the WHOLE buffer: the groups export has taken
+		// (ptr, len, out_ptr, from) The three-argument
+		// shrinking-window call this replaced was an ARITY error wasmtime
+		// rejected outright, so the exhaustive modeGroups case failed and the
+		// run exited non-zero.
+		r, err := fn.Call(store, inputBase, inputLen, slotsBase, off)
 		if err != nil {
 			return fmt.Errorf("call at off=%d: %w", off, err)
 		}
@@ -1944,19 +1922,21 @@ func checkGroupsExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string,
 		}
 		buf = mem.UnsafeData(store)
 		slots := readSlots(buf, slotsBase, totalGroups)
-		shifted := make([]int, len(slots))
+		// Slots are ABSOLUTE: no +off shift, only the -1 mapping for a group
+		// that did not participate.
+		abs := make([]int, len(slots))
 		for i, v := range slots {
 			if v < 0 {
-				shifted[i] = -1
+				abs[i] = -1
 			} else {
-				shifted[i] = int(off) + v
+				abs[i] = v
 			}
 		}
-		got = append(got, shifted)
-		if relEnd := slots[1]; relEnd > 0 {
-			off += int32(relEnd)
+		got = append(got, abs)
+		if absStart, absEnd := abs[0], abs[1]; absEnd > absStart {
+			off = int32(absEnd)
 		} else {
-			off++
+			off = int32(absStart) + 1
 		}
 	}
 	runtime.KeepAlive(store)
@@ -2019,7 +1999,7 @@ func planSetMem(wasmBytes []byte, inputLen int) (setMemPlan, error) {
 	return setMemPlan{inputBase: inBase, outputBase: outBase}, nil
 }
 
-// benchTimeSet times the cost of one full find_all exhaustion pass over
+// benchTimeSet times the cost of one full set-`find` exhaustion pass over
 // `input` and returns the p50 over setIterTime samples.
 func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time.Duration, error) {
 	plan, err := planSetMem(wasmBytes, len(input))
@@ -2037,7 +2017,7 @@ func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time
 		return 0, fmt.Errorf("instance: %w", err)
 	}
 	mem := inst.GetExport(store, "memory").Memory()
-	findFn := inst.GetFunc(store, "find_all")
+	findFn := inst.GetFunc(store, "set_find")
 	if mem == nil || findFn == nil {
 		return 0, fmt.Errorf("missing exports")
 	}
@@ -2068,7 +2048,7 @@ func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time
 	return computeStat(ns, 50), nil
 }
 
-// benchFuelSet measures fuel for one full find_all exhaustion pass.
+// benchFuelSet measures fuel for one full set-`find` exhaustion pass.
 func benchFuelSet(wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (uint64, error) {
 	plan, err := planSetMem(wasmBytes, len(input))
 	if err != nil {
@@ -2087,7 +2067,7 @@ func benchFuelSet(wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (
 		return 0, err
 	}
 	mem := inst.GetExport(store, "memory").Memory()
-	findFn := inst.GetFunc(store, "find_all")
+	findFn := inst.GetFunc(store, "set_find")
 	if mem == nil || findFn == nil {
 		return 0, fmt.Errorf("missing exports")
 	}
@@ -2102,7 +2082,8 @@ func benchFuelSet(wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (
 
 func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan, input string) error {
 	const pageSize = 65536
-	needTop := uint64(plan.outputBase) + uint64(setOutCap)*12 + 4096
+	// Tuples, then the gate array, both above outputBase.
+	needTop := uint64(plan.outputBase) + uint64(setOutCap)*16 + 4096
 	neededPages := (needTop + pageSize - 1) / pageSize
 	curPages := mem.Size(store)
 	if neededPages > curPages {
@@ -2119,12 +2100,23 @@ func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan,
 	return nil
 }
 
-// runSetExhaust drives find_all in a loop until it returns 0 (no more matches),
-// advancing startPos past the last match each iteration.
+// runSetExhaust drives the set `find` export to exhaustion, the way a
+// generated iterator does: zero the gate array, then call
+//
+//	find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> total at that position
+//
+// advancing `from` to start+1 each time. Every tuple in one call shares a
+// start, so reading the first tuple is enough to resume.
 func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) {
-	startPos := int32(0)
+	gatePtr := plan.outputBase + setOutCap*12
+	buf := mem.UnsafeData(store)
+	for i := int32(0); i < setOutCap*4; i++ {
+		buf[gatePtr+i] = 0
+	}
+	runtime.KeepAlive(store)
+	from := int32(0)
 	for {
-		n, err := findFn.Call(store, plan.inputBase, inputLen, plan.outputBase, setOutCap, startPos)
+		n, err := findFn.Call(store, plan.inputBase, inputLen, from, gatePtr, plan.outputBase, setOutCap)
 		if err != nil {
 			return
 		}
@@ -2133,17 +2125,12 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 			return
 		}
 		buf := mem.UnsafeData(store)
-		last := int(count - 1)
-		base := int(plan.outputBase) + last*12
+		base := int(plan.outputBase)
 		s := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
-		l := int32(buf[base+8]) | int32(buf[base+9])<<8 | int32(buf[base+10])<<16 | int32(buf[base+11])<<24
-		if l <= 0 {
-			l = 1
-		}
 		// See benchTime's comment on the same pattern: buf is a raw pointer
 		// into wasmtime's native memory, not a Go reference to store.
 		runtime.KeepAlive(store)
-		startPos = s + l
+		from = s + 1
 	}
 }
 
@@ -2210,7 +2197,7 @@ func printMatrix(tc testCase, rows [3]cell, rowsNo [3]cell) {
 
 	for i := 0; i < 3; i++ {
 		if rows[i].identical {
-			// TODO.md task 25 investigation: identical wasm still showed
+			// an earlier task investigation: identical wasm still showed
 			// wall-time swings up to +137% run to run on sub-microsecond
 			// cases — comparing timings across byte-identical code is pure
 			// noise, so skip the run entirely rather than report it.
@@ -2301,7 +2288,7 @@ func main() {
 			if i == 0 {
 				neutralWasm = wasm
 			}
-			// Identical-WASM gate (TODO.md task 25 investigation): if this
+			// Identical-WASM gate: if this
 			// mode compiled to byte-identical wasm to neutral, the compiler
 			// ignored the LikelyMode hint for this pattern entirely — any
 			// wall-time delta we'd measure is guaranteed noise, not signal.
