@@ -17,12 +17,12 @@ go run . [options] <test-file>
 | `--validate-go` | false | Validate test expectations against Go stdlib; skips WASM testing |
 | `--validate-groups` | false | Enable col0 capture-groups validation (see below) |
 
-### Set-mode options (plans/SETS.md §22)
+### Set-mode options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--sets` | false | Compile each block's patterns as SETS and drive every declared capability against a live Go oracle |
-| `--set-chunk N` | 32 | Patterns per compiled set; `0` = one set per corpus block (the pre-§22 shape) |
+| `--set-chunk N` | 32 | Patterns per compiled set; `0` = one set per corpus block (the original shape) |
 | `--set-shuffle` | false | Deterministically permute a block's patterns before chunking |
 | `--sample N` | 1 | Test only every Nth chunk — the sampled gate vs the exhaustive run |
 | `--set-profiles` | `all` | Capability configurations per chunk: `all`, `anchored`, `scan`, `scan-any`, `find`, `find-ov`, `batch`, `batch-ov`, or `all-profiles` |

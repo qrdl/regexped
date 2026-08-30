@@ -1,4 +1,4 @@
-// regex-automata pairings for tools/setperf (plans/SETS.md §9.9 / D21).
+// regex-automata pairings for tools/setperf.
 //
 // `perftest --sets` compares regexped's set find against the `regex` crate's
 // RegexSet plus a per-pattern rescan — a fair model of what a `regex` user
@@ -6,11 +6,11 @@
 // deliberately never reports *where*. `regex-automata` is the layer
 // underneath and maps onto the new set API almost one-to-one:
 //
-//   Input::span(from..)        <-> the `from` parameter (§3.2)
-//   PatternSet / PatternID     <-> our bitmask + pattern ids (§3.13)
+//   Input::span(from..)        <-> the `from` parameter
+//   PatternSet / PatternID     <-> our bitmask + pattern ids
 //   MatchKind::LeftmostFirst   <-> our RE2/Perl semantics (default here)
 //
-// Capability pairings implemented below (the "honest" rows of §9.9's table):
+// Capability pairings implemented below (the "honest" rows):
 //
 //   scan       -> re.is_match(Input::new(h).span(from..))
 //   scan_any   -> re.find(Input::new(h).span(from..)) -> (pattern, start)
@@ -24,7 +24,7 @@
 //                 anchored `match` asks "is 0..len an accepting run", which
 //                 is exactly `\A(?:p)\z`.
 //   find(gated)-> per-pattern find_iter, merged — the same construction as
-//                 the §9.6.1 Go oracle.  regex-automata's own multi-pattern
+//                 the Go union oracle.  regex-automata's own multi-pattern
 //                 find_iter is *set-wide* non-overlapping while our gated
 //                 find is *per-pattern*; pairing those directly would produce
 //                 a confidently wrong number.
@@ -61,7 +61,7 @@ struct RaState {
     /// Pattern count. Also the capacity of the reusable PatternSet below —
     /// which used to be described HERE as "Reusable PatternSet", a reuse that
     /// did not exist: every scan_all call built a fresh one, allocation
-    /// included, inside the metered/timed body. FABLE_REVIEW P10.
+ /// included, inside the metered/timed body..
     npat: usize,
 }
 
@@ -251,7 +251,7 @@ pub extern "C" fn ra_find_gated(len: i32, from: i32) -> i32 {
 /// find, LAZILY: the single leftmost match at or after `from`, packed as
 /// `(start << 32) | end`, or -1 when there is none.
 ///
-/// SETS_PLAN item 22 task 2. Every other `find` pairing here enumerates the
+/// Every other `find` pairing here enumerates the
 /// whole input in one call, which is a fair comparison against our BATCHED
 /// find and an unfair one against our bare `find` — that returns to the host
 /// once per matching position, so the timed row compares two API shapes rather

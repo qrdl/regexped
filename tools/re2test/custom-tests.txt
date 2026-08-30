@@ -9,7 +9,7 @@
 # are separated by "|"; each match's per-group spans are space-separated like
 # col5. This is the only column that exercises groups() at a nonzero ptr —
 # col0/col5 always call groups() at ptr=0 — so it's the only column that can
-# catch bugs specific to re-entry (see plans/TODO.md task 50).
+# catch bugs specific to re-entry.
 #
 # col0: standard DFA, must match from pos 0 consuming ALL input (leftmost-longest).
 #       Returns end=len(input) on success, or "-" for no match.
@@ -1470,7 +1470,7 @@ regexps
 -;-;-;-;-;-
 # ============================================================
 # Category 24: dot (.) and nfaFirstBytes allBytes behaviour
-# Anomaly #4: TEST_ANOMALIES.md claims bare (.) produces a 255-byte first-byte
+# Anomaly #4: claims bare (.) produces a 255-byte first-byte
 # set (allBytes=false, '\n' excluded). The actual code places both
 # InstRuneAnyNotNL and InstRuneAny in the allBytes=true branch, so the BT find
 # scan correctly tries all positions including '\n'-starting ones.
@@ -2058,12 +2058,12 @@ regexps
 # groups at different chunk alignments (S7, via localSkipStart re-snapshot).
 # Note: X([a-zA-Z]+)Y (trailing literal inside the self-loop class) would
 # route to Backtracking via hasAmbiguousCaptures, not TDFA — see task 13 in
-# plans/TODO.md — so the trailing delimiter here is '#', not a letter.
+# — so the trailing delimiter here is '#', not a letter.
 #
 # Expected values cross-checked against Go's regexp package (--validate-go)
 # before being committed to this fixture.
 #
-# col0 caveat (see plans/TODO.md task 14, retracted-bug postmortem): under
+# col0 caveat (retracted-bug postmortem): under
 # `--force-backtrack` (without `--groups-only`), col0 validates against
 # match_func (full-string match by design, compile.go:700-706) instead of
 # groups_func (prefix-anchored). The (\w+) rows on S5/S6/S7 have trailing
@@ -2193,7 +2193,7 @@ regexps
 -;24-132;-;-
 # ============================================================
 # Category 32: fold-case (?i) find no-match past a length threshold
-# (task 43 in plans/TODO.md).
+# (task 43.
 #
 # buildDFALayout's Teddy chain construction (compile/engine_dfa.go, the
 # useTwoByte/useThreeByte/useFourByte tier loops) walked DFA transitions
@@ -2336,7 +2336,7 @@ regexps
 # ============================================================
 # Category 34: literal NUL byte in pattern — find body OOB read
 #
-# Bug found 2026-08-06 by tools/fuzz's Layer-1 fuzzer (plans/FUZZER.md):
+# Bug found 2026-08-06 by tools/fuzz's Layer-1 fuzzer:
 # pattern "a\x00" against 1-byte input "a" returned WASM match [0,2) — the
 # find body read one byte past the declared input length, and happened to
 # treat whatever it found there (uninitialized/zero WASM memory in the
@@ -2364,7 +2364,7 @@ regexps
 # ============================================================
 # Category 35: DFA find — end-anchor immediately followed by begin-anchor
 #
-# Bug found 2026-08-06 (plans/FUZZER_BUGS.md §6/§7): patterns shaped like
+# Bug found 2026-08-06: patterns shaped like
 # an end-anchor ($/\z) directly followed by a begin-anchor (^/\A), e.g.
 # "(?:(?:$)(?:^))", incorrectly reported an empty match at pos==len(input)
 # in find mode on non-empty input. Root cause: newDFA's midStart bootstrap
@@ -2400,7 +2400,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (Backtracking native/anchored captures) — task 10.3/§9 fix.
+# Category (Backtracking native/anchored captures).
 # A leading ^ makes the pattern p.anchored (isAnchoredFind): the compiled
 # groups function IS the Backtracking captureBody, exported directly with
 # the caller's full, un-narrowed input length (no independent find pass
@@ -2444,8 +2444,8 @@ regexps
 0-0 0-0;0-0;-;-
 0-6 0-6;0-6;-;-
 # ============================================================
-# Category (TDFA native/anchored range-quantifier priority) — FUZZER_BUGS.md
-# §12. A leading ^ makes the pattern p.anchored (isAnchoredFind): the
+# Category (TDFA native/anchored range-quantifier priority)
+# A leading ^ makes the pattern p.anchored (isAnchoredFind): the
 # compiled groups function IS the TDFA captureBody, exported directly with
 # the caller's full, un-narrowed input length. An outer repeat (`*`/`+`)
 # wrapping a range-quantified (`{m,n}`, m<n) capture group creates a state
@@ -2488,7 +2488,7 @@ regexps
 0-8 7-8;0-8;-;-
 0-8 7-8;0-8;-;-
 # ============================================================
-# Category (no-capture Backtracking find, FUZZER_BUGS.md §17) —
+# Category (no-capture Backtracking find)
 # these patterns naturally select Compiled DFA (unaffected); the two bugs
 # below only ever fire under --force-backtrack, which overflows the DFA
 # and routes match/find through buildBTMatchBody/buildBTFindBody's
@@ -2563,8 +2563,8 @@ regexps
 0-3;0-3;-;-
 -;4-4;-;-
 # ============================================================
-# Category (Backtracking EmptyBeginLine/EmptyEndLine br-depth escape,
-# FUZZER_BUGS.md §19) — emitBTInstHandler's (?m:^)/(?m:$) cases nest
+# Category (Backtracking EmptyBeginLine/EmptyEndLine br-depth escape)
+# — emitBTInstHandler's (?m:^)/(?m:$) cases nest
 # btFail's br two if-blocks deep (outer if/else, then a nested if for the
 # actual prev/next-byte check) but only escaped one level's worth of depth
 # (brRunNested = one-if-deep, not two). Under-escaping by exactly one level
@@ -2603,8 +2603,8 @@ regexps
 -;-;-;-;-;-
 0-5 2-5;0-5;-;-;-;0-5 2-5
 # ============================================================
-# Category (Backtracking greedy-loop zero-progress guard, FUZZER_BUGS.md
-# §20) — (?:a*|b*)*'s outer greedy loop has a body that can match empty via
+# Category (Backtracking greedy-loop zero-progress guard
+# — (?:a*|b*)*'s outer greedy loop has a body that can match empty via
 # EITHER alternative branch. When the higher-priority branch (a*) completes
 # a repeat attempt with zero width after at least one earlier iteration made
 # real progress, the old zero-progress guard branched straight to the
@@ -2645,7 +2645,7 @@ regexps
 0-4;0-4;-;-
 # ============================================================
 # Category (DFA find-mode computePrefix word/newline-boundary pre-accept
-# gap, FUZZER_BUGS.md §22) — computePrefix's bail-out check (used to derive
+# gap) — computePrefix's bail-out check (used to derive
 # a mandatory-literal-prefix fast-skip for non-anchored find) only tested
 # plain accept/mid-accept state flags, not midAcceptWStates/midAcceptNWStates
 # (word-boundary pre-accept, checked against the byte about to be consumed
@@ -2708,7 +2708,7 @@ regexps
 -;1-1;-;-
 # ============================================================
 # Category (DFA find-mode fast-skip prefixEndState derived unconditionally
-# from midStartState, FUZZER_BUGS.md §23) — buildDFALayout's prefix-scan
+# from midStartState) — buildDFALayout's prefix-scan
 # shortcut walked the mandatory-literal prefix from midStartState to
 # compute the post-prefix jump state (wasmPrefixEnd/prefixEndState) and
 # used it for every attempt position, including attempt_start==0. For
@@ -2748,7 +2748,7 @@ regexps
 -;-;-;-
 # ============================================================
 # WordBoundaryAltPriority: a \b/\B-gated branch loses leftmost-first
-# priority to a later empty alternation branch (FUZZER_BUGS.md #24).
+# priority to a later empty alternation branch.
 # \b0|  vs "0": \b0 (higher priority, byte-consuming) should win over the
 #   empty branch -- expect find=[0,1), not the empty match [0,0).
 # \bx|  vs "x": same shape, different literal/boundary byte.
@@ -2822,7 +2822,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category 27 (FUZZER_BUGS.md #26): \b inside a capturing group loses the
+# Category 27: \b inside a capturing group loses the
 # match entirely. Two distinct, unrelated root causes, both keyed on
 # whether the two \b contexts (prev=word vs prev=non-word) require a
 # DIFFERENT first byte — e.g. `\b[-0]` wants '0' after a non-word byte but
@@ -2885,7 +2885,7 @@ regexps
 -;-;-;-;-;-
 -;2-4;-;-;-;2-4 2-3
 # ============================================================
-# Category (FUZZER_BUGS.md #1): \B immediately before ^/\A loses the
+# Category: \B immediately before ^/\A loses the
 # begin-of-text context. state 0's mid-accept computation resolved \B
 # (ecNoWordBoundary/ecWordBoundary) without also carrying ecBegin, so the
 # chained ^/\A check behind it could never fire. \B^ / \B\A must match
@@ -2925,7 +2925,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #2): a \b/\B branch's resolved empty-accept can
+# Category: a \b/\B branch's resolved empty-accept can
 # be silently overwritten by a lower-priority live branch. emitWBPreAcceptCheck
 # recorded last_accept on a mid-accept hit but fell through into the regular
 # byte-transition code instead of branching out of the scan loop, so a
@@ -2961,7 +2961,7 @@ regexps
 0-2;0-1;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #3): Teddy lookahead-tier construction extends
+# Category: Teddy lookahead-tier construction extends
 # past an already-accepting state. The 2-/3-/4-byte Teddy lookahead tiers
 # (find-mode, no fixed prefix, <=8 first-byte candidates) only checked
 # whether some byte continues from the lookahead state, never whether that
@@ -2992,7 +2992,7 @@ regexps
 -;-;-;-
 -;12-15;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #4): lenient-alt $-terminated branches accept
+# Category: lenient-alt $-terminated branches accept
 # before reaching true end-of-text. emitInlineAnchoredDFAVerify's per-branch
 # DFA verify checked only the EOF-only acceptStates bitmap on every
 # iteration instead of splitting it from the mid-scan-safe midAccept table
@@ -3044,7 +3044,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #5): dominant-self-loop bulk-skip leaves
+# Category: dominant-self-loop bulk-skip leaves
 # last_accept stale across a 16-byte chunk boundary. emitDominantBulkSkip's
 # "no exit found in this chunk" branch advanced pos by 16 without also
 # advancing last_accept, even though every byte just confirmed exit-free is
@@ -3082,7 +3082,7 @@ regexps
 -;-;-;-
 -;0-18;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #6): multiline ^$ fails at true end-of-text
+# Category: multiline ^$ fails at true end-of-text
 # reached via the midStartNewline restart context. emitOuterPrologue's
 # no-mandatory-literal bootstrap-state selection never checked
 # hasNewlineBoundary / whether the preceding byte was '\n', so a restart
@@ -3123,7 +3123,7 @@ regexps
 -;-;-;-
 -;1-2;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #9): lenient-alt DFA-branch verify never emits
+# Category: lenient-alt DFA-branch verify never emits
 # its midAccept data segment. planLenAltLayout's per-branch DFA layout
 # computed midAcceptOff/midAcceptBytes unconditionally but dfaDataSegments'
 # non-find branch only emitted the backing data segment when a dominant
@@ -3236,7 +3236,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #13): computePrefixWalk treats a byte as
+# Category: computePrefixWalk treats a byte as
 # mandatory even when the state it lands on can already accept via a
 # word/newline-boundary pre-check. Its per-step continuation guard only
 # checked acceptStates/midAcceptStates (ctx=0 unconditional accept) before
@@ -3257,7 +3257,7 @@ regexps
 # because the fast-skip is scanning for a mandatory-but-wrong-length
 # literal derived from the *other*, longer '0000' branch's shape.
 # "-(?:\b|x)" is a control that does NOT reproduce (branch order avoids the
-# defect the same way FUZZER_BUGS.md documents for bug 2's analogous
+# defect the same way it does for bug 2's analogous
 # control) -- included to confirm the fix doesn't change already-correct
 # behavior.
 # All expected values cross-checked against Go stdlib regexp.
@@ -3313,7 +3313,7 @@ regexps
 -;0-1;-;-
 0-2;0-1;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #14): lenient-alternation per-branch inline DFA
+# Category: lenient-alternation per-branch inline DFA
 # verify never consults the word-boundary pre-accept tables.
 # emitInlineAnchoredDFAVerify (the tiny per-branch DFA loop
 # analyseLitChainAltLenient uses for alternation branches with no common
@@ -3327,7 +3327,7 @@ regexps
 # after=' ', both non-word, no boundary crossed) -> [0,1).
 # \0\B alone (no alternation, so it never reaches the buggy per-branch
 # verify machinery -- the general shared scan loop already handles \b/\B
-# correctly per FUZZER_BUGS.md #1/#2) is a control confirming the expected
+# correctly is a control confirming the expected
 # semantics in isolation.
 # Both patterns on bare "\x00" resolve via the EOF-only acceptStates path
 # instead (\B also holds at true end-of-text) -- untouched by this bug,
@@ -3407,7 +3407,7 @@ regexps
 -;0-1;-;-
 0-2;0-2;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #16): midStart aliases start when a leading
+# Category: midStart aliases start when a leading
 # \b/\B blocks both closures identically, wrongly inheriting ecBegin at
 # non-zero scan positions. startSet := epsilonClosure({Start}, ecBegin) and
 # midStartSet := epsilonClosure({Start}, 0) both get stuck at the same
@@ -3468,7 +3468,7 @@ regexps
 0-1;0-1;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #17): (?m:$^) fails at true end-of-text
+# Category: (?m:$^) fails at true end-of-text
 # reached via the midStartNewline restart context. Reverse-order sibling
 # of already-fixed bug 6 ((?m:^$) on "0\n"): midStartNewline's EOF-accept
 # computation (acceptBitsFor(midStartNewlineSet, ecEnd|ecNoWordBoundary))
@@ -3506,7 +3506,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #18): nested greedy-loop backoff to satisfy a
+# Category: nested greedy-loop backoff to satisfy a
 # trailing ^. "(?:a*)+^" must back off through two levels of greedy
 # nesting (a Star inside a Plus) to leave position 0 unconsumed, where ^
 # can fire. Go stdlib finds [0,0) on "a"/"aa"; regexped returned no match.
@@ -3537,7 +3537,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #18, Backtracking-engine regression guard):
+# Category (Backtracking-engine regression guard):
 # nested-loop shape with a NON-GREEDY inner loop instead of a greedy one
 # (contrast with FuzzBug18NestedGreedyLoopBackoffForCaret above, whose inner
 # `a*` is greedy). This pattern was never broken on any committed/shipped
@@ -3554,7 +3554,7 @@ regexps
 # head) resolves both this pattern and the greedy-inner one without needing
 # to touch the outer loop's guard at all. Kept here as a permanent
 # regression guard against re-introducing the outer-loop-memoisation
-# mistake (see FUZZER_BUGS.md #18 "Fix" section for the full trace of why
+# mistake "Fix" section for the full trace of why
 # that approach is unsound in general).
 #
 # col0 here is groupsFn's own contract: anchored at pos 0, NOT required to
@@ -3587,7 +3587,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #19): Backtracking's zero-progress loop guard
+# Category: Backtracking's zero-progress loop guard
 # resurrects a same-iteration, lower-priority alternation sibling that a
 # higher-priority zero-width branch already suppressed. `.(?:\b|0)*` needs
 # a mandatory non-empty prefix (the leading `.`) so pos != attempt_start
@@ -3647,7 +3647,7 @@ regexps
 0-1;0-1;-;-
 -;0-1;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #20): Backtracking's zero-progress guard for an
+# Category: Backtracking's zero-progress guard for an
 # empty-matchable loop compares `pos` against the wrong reference position.
 # ` (\B|0)*` has no nested loop in its body: the guard's no-nested-loop
 # branch unconditionally exits the outer loop the moment ANY iteration
@@ -3728,7 +3728,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #21): DFA's isDominantAccept/nfaExpandWithWB
+# Category: DFA's isDominantAccept/nfaExpandWithWB
 # machinery gives up as soon as a boundary-resolved continuation hits ANY
 # byte-consumer, blind to the case where that byte-consumer is the SAME
 # mandatory-literal Rune already reachable via a separate, lower-priority
@@ -3741,7 +3741,7 @@ regexps
 # priority `0*` branch, exactly as if `\b` had never resolved.
 # Fix: a new compile-time detector (nfaBoundaryTargetIsAmbiguous) recognizes
 # this exact shape and routes the pattern to Backtracking, the same
-# precedent FUZZER_BUGS.md #15's dfaHasOutrankedState established for a
+# precedent dfaHasOutrankedState established for a
 # sibling DFA blind spot — Backtracking resolves priority via genuine
 # backtracking and has no equivalent defect, confirmed here for both the
 # find export and the real capturing group's own span via the "groups"
@@ -3755,7 +3755,7 @@ regexps
 # All expected values cross-checked against Go stdlib regexp
 # (FindStringIndex for col1; FindStringSubmatchIndex, kept only when it
 # starts at 0, for col0 — the "groups" export is a non-anchored find, not a
-# `\A...\z` full-consumption match, same convention as FUZZER_BUGS.md #20's
+# `\A...\z` full-consumption match, same convention
 # entries above).
 # ============================================================
 FuzzBug21DFABoundaryTargetAmbiguity
@@ -3797,7 +3797,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #22): multi-byte mandatory-literal prologue
+# Category: multi-byte mandatory-literal prologue
 # never selects the newline-boundary restart state. `buildFindBody`'s
 # `len(prefix)>=1` branch (used once a 2+-byte mandatory literal engages
 # the SIMD literal-scan machinery) selects its post-prefix-scan restart
@@ -3808,7 +3808,7 @@ regexps
 # match whenever the restart position is reached via the SIMD-scanned
 # prefix rather than the plain byte-by-byte bootstrap. Confirmed length
 # boundary: a 1-byte trailing literal (`\D(?m:^)x`) is unaffected (routed
-# through the already-fixed `len(prefix)==0` branch, FUZZER_BUGS.md #6);
+# through the already-fixed `len(prefix)==0` branch);
 # 2-byte (`\D(?m:^)ab`) and 3-byte (`\D(?m:^)abc`) trailing literals both
 # reproduce. `\D(?m:^ x)` is the original raw fuzzer repro (2-byte
 # literal " x").
@@ -3872,8 +3872,8 @@ regexps
 # Bug 22 side-check: does the same lit-anchor gap corrupt the
 # Backtracking engine's internal DFA-determines-extent phase for
 # capturing patterns shaped like `\D(?m:^)(LIT)`? Backtracking uses a
-# DFA to find the match extent before running the NFA to fill captures
-# (CLAUDE.md), and that internal extent-DFA goes through the same
+# DFA to find the match extent before running the NFA to fill captures,
+# and that internal extent-DFA goes through the same
 # compile.go lit-anchor gate as the standalone find_func path.
 # col5 = non-anchored find with captures, validated against Go stdlib.
 # ============================================================
@@ -3901,7 +3901,7 @@ regexps
 -;-;-;-
 -;-;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #24): computePrefix's hasWordBoundary
+# Category: computePrefix's hasWordBoundary
 # cross-check only catches midStartWordState accepting with ZERO bytes
 # consumed (bug #10) or diverging in byte VALUE on the first byte. It
 # never walks midStartWordState through the derived prefix looking for
@@ -3969,7 +3969,7 @@ regexps
 -;1-3;-;-
 -;1-3;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #25): midStartNewlineState is remapped
+# Category: midStartNewlineState is remapped
 # unconditionally at construction but left at its stale raw (pre-
 # minimization/reordering) value whenever hasNewlineBoundary is false.
 # buildLitAnchorFindBody unconditionally substitutes it in for
@@ -4029,7 +4029,7 @@ regexps
 -;-;-;-
 -;1-4;-;-
 # ============================================================
-# Category (TODO.md task 50): the whole-pattern single-capture shortcut
+# Category: the whole-pattern single-capture shortcut
 # (isWholePatternSingleCapture, compile.go) left p.edgeScratchOff at its
 # zero-value default instead of an explicit -1. The groups-wrapper
 # emission call site only forces edgeOff=-1 when p.isTDFA, so this path
@@ -4053,8 +4053,8 @@ regexps
 "(\\w+)"
 0-3 0-3;0-3;-;-;0-3,4-9;0-3 0-3;0-3 0-3|4-9 4-9
 # ============================================================
-# Category (Backtracking altLoopBody dual-back-edge ambiguity,
-# FUZZER_BUGS.md #26) — the NFA for `(?m:0$*)*` has an InstAlt (the inner
+# Category (Backtracking altLoopBody dual-back-edge ambiguity)
+# — the NFA for `(?m:0$*)*` has an InstAlt (the inner
 # `$*` loop head) whose two branches are SIMULTANEOUSLY a genuine inner-loop
 # back edge (the real `$*` cycle) and a trivial "back edge" to prog.Start
 # (which dominates everything, so it always tests positive). altLoopBody's
@@ -4083,8 +4083,8 @@ regexps
 -;0-1;-;-
 0-3;0-3;-;-
 # ============================================================
-# Category (DFA getOrAddState newline-transition ecBeginLine drop,
-# FUZZER_BUGS.md #27) — newDFA's dedicated '\n'-byte transition branch
+# Category (DFA getOrAddState newline-transition ecBeginLine drop)
+# — newDFA's dedicated '\n'-byte transition branch
 # (compile/engine_dfa.go, ~line 1501) resolves the immediate epsilon
 # closure with ecBeginLine, correctly firing an immediately-following
 # (?m:^). But when a (?m:$) sits between the '\n' transition and the
@@ -4124,7 +4124,7 @@ regexps
 -;2-3;-;-
 -;2-3;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #28): Backtracking's per-loop-head zero-progress
+# Category: Backtracking's per-loop-head zero-progress
 # tracker (loop_pos local) and its zero-width-assertion reference tracker
 # (loop_entry local) are ordinary WASM locals that btPushFrame/btFail never
 # saved or restored across a backtrack-stack pop — unlike captures, which
@@ -4143,7 +4143,7 @@ regexps
 # defect independent of loop position. `+` variants confirm it's independent
 # of `*` vs `+`. All expected values cross-checked against Go stdlib regexp
 # (FindStringSubmatchIndex for col1; col0 kept only when the match starts at
-# 0, same convention as FUZZER_BUGS.md #20's block above).
+# 0, same convention block above).
 # ============================================================
 FuzzBug28StaleLoopTrackerAcrossBacktrackPop
 strings
@@ -4202,7 +4202,7 @@ regexps
 0-2 1-1;0-2 1-1;-;-
 0-2 1-1;0-2 1-1;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #29) — altLoopBody's dual-back-edge
+# Category — altLoopBody's dual-back-edge
 # discriminator (added by bug #26's fix) used `== prog.Start` as a proxy for
 # "this edge closes an enclosing loop, not the inner one" — valid only when
 # the enclosing loop happens to coincide with the whole program's entry
@@ -4345,7 +4345,7 @@ regexps
 -;0-16;-;-
 -;2-18;-;-
 # ============================================================
-# FuzzBug35LenientLitChainAltBranchLeftmostFirst: FUZZER_BUGS.md bug 35.
+# FuzzBug35LenientLitChainAltBranchLeftmostFirst:.
 # analyseLitChainAltLenient's per-branch helper DFA (the "lenient
 # literal-chain alternation" find fast path, engine_dfa.go) compiled each
 # non-lit-chain branch leftmost-*longest* instead of leftmost-*first*. A
@@ -4390,7 +4390,7 @@ regexps
 -;-;-;-
 0-2;0-1;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #36): Teddy 2/3/4-byte lookahead-tier
+# Category: Teddy 2/3/4-byte lookahead-tier
 # construction derives its lookahead filter only from midStartState,
 # ignoring midStartWordState's divergent transitions. "a0|\Ba": from
 # midStartState, consuming 'a' leaves only the "a0" thread alive (needs a
@@ -4420,7 +4420,7 @@ regexps
 -;14-15;-;-
 -;15-16;-;-
 # ============================================================
-# Category (FUZZER_BUGS.md #37): a preceding star/bounded-repeat that
+# Category: a preceding star/bounded-repeat that
 # altLoopBody misclassifies as a non-loop both skips its own zero-progress
 # guard and corrupts the *following* loop's zero-progress reference
 # position. Two compounding defects in compile/engine_backtrack.go:
@@ -4550,7 +4550,7 @@ regexps
 # ============================================================
 # Task 51: line-scoped lit-anchor prefixes.
 #
-# FUZZER_BUGS.md §22 gated the lit-anchor optimisation off for ANY
+# gated the lit-anchor optimisation off for ANY
 # prefix containing `(?m:^)`/`(?m:$)`. That gate is wider than the
 # defect: buildLitAnchorBackScanBody's stop-at-'\n' rule is exactly
 # sound when the prefix starts with `^`/`(?m:^)` and nothing after that
@@ -4563,7 +4563,7 @@ regexps
 #   still rejected (fallback path):
 #     (?m:^)[\s\S]*ab   — prefix can consume '\n', so the backward scan
 #                         would stop short of the true leftmost start
-#     \D(?m:^)ab        — §22's own repro; anchor is not leading
+#     \D(?m:^)ab        — the original repro; anchor is not leading
 #
 # All expected values generated from and cross-checked against Go
 # stdlib regexp (--validate-go clean).
@@ -4731,7 +4731,7 @@ regexps
 -;-;-;-;-;-
 0-29 0-19 22-26 28-29;0-29;-;-;-;0-29 0-19 22-26 28-29
 # ============================================================
-# FuzzBug40GapA4TDFAEligibilityBypass: FUZZER_BUGS.md bug 40.
+# FuzzBug40GapA4TDFAEligibilityBypass:.
 # ============================================================
 # The Gap A.4 capture path (compile.go, "lenient alternation with captures")
 # called newTDFA directly instead of going through the selector, so a pattern
@@ -4769,7 +4769,7 @@ regexps
 0-1 - 0-1;0-1;-;-;0-1,1-2;0-1 - 0-1
 -;1-2;-;-;1-2;1-2 - 1-2
 # ============================================================
-# FUZZER_BUGS.md #41: detectSkipSafeOnDead's mid-accept test (conditions (d)
+# detectSkipSafeOnDead's mid-accept test (conditions (d)
 # and (e)) reads only the unconditional l.midAcceptBytes channel and never the
 # context-dependent midAcceptNW/midAcceptW/midAcceptNL side tables. A
 # zero-width `\B`/`(?m:$)` alternative that accepts empty at an intermediate
@@ -4848,7 +4848,7 @@ regexps
 -;3-3;-;-;3-3
 -;0-0;-;-;0-0,1-1
 # ============================================================
-# Category: FABLE.md deep-review bugs B1-B5 (DFA find-path detectors and
+# Category: deep-review bugs B1-B5 (DFA find-path detectors and
 # newline-context transition construction). All five were live-reproduced
 # against Go stdlib regexp before any fix was written.
 # ============================================================
@@ -4985,7 +4985,7 @@ regexps
 # therefore classified NON-mid dominant with '\n' inside its self-loop set,
 # so emitDominantBulkSkip advances past every '\n' without running the
 # newline pre-accept check and last_accept is never set. Sibling of
-# FUZZER_BUGS.md #41 (same channel blind spot, different skipper: #41 is the
+# (same channel blind spot, different skipper: #41 is the
 # inter-attempt advance, this is the intra-attempt SIMD skip).
 # The third input ("axx\nyyb", 7 bytes) is a CONTROL: below the bulk-skip's
 # pos+17>len bounds check it never engages, so it passed before the fix too.
@@ -5018,7 +5018,7 @@ regexps
 -;0-23;-;-;0-23
 -;0-23;-;-;0-23
 # ============================================================
-# Category 36: FABLE.md wave 3 — lit-chain anchor / range gates
+# Category 36: — lit-chain anchor / range gates
 # ============================================================
 # B6: the three Gap E mixed-prefix emitters
 # (buildLitChainPrefixedMatchBody, buildLitChainPrefixedFindBody,
@@ -5320,7 +5320,7 @@ regexps
 -;-;-;-
 0-26;0-26;-;-
 # ============================================================
-# Category 37: FABLE.md wave 4 — BT narrowed-slice text/line anchors
+# Category 37: — BT narrowed-slice text/line anchors
 # ============================================================
 # B13: the BT composed captureBody's InstEmptyWidth handlers for \A, \z,
 # (?m:^) and (?m:$) tested the narrowed (ptr,len) slice the groups wrapper
@@ -5386,7 +5386,7 @@ regexps
 -;2-3;-;-;2-3;2-3 2-3
 0-1 0-1;0-1;-;-;0-1;0-1 0-1
 # ============================================================
-# Category (DFA find-mode prefix-resume DIVERGENCE arms, plans/TODO.md task
+# Category (DFA find-mode prefix-resume DIVERGENCE arms
 # 63) — after the SIMD prefix scan matches, buildFindBody must resume the DFA
 # in the state the prefix walk ends in, and there are up to FOUR such states,
 # one per context the scan can land in: the ordinary mid-string walk, the walk

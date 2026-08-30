@@ -1,4 +1,4 @@
-# tools/setperf — cross-engine comparison against regex-automata (plans/SETS.md §9.9).
+# tools/setperf — cross-engine comparison against regex-automata.
 #
 # The Rust harness is shared with tools/perftest: one crate, one toolchain,
 # one build artefact. Build it there first (or via the `harnesses` target).
@@ -30,8 +30,8 @@ harnesses:
 # Capture the deterministic baselines. Fuel and module size are exact, so
 # these are compared for EQUALITY, not within a tolerance — a change is a
 # change and must be attributed. Wall-clock is deliberately not baselined:
-# it is placement noise on this machine (see plans/TODO.md's
-# placement-roulette entry), so a committed number would only ever produce
+# it is instruction-placement noise on this machine, so a committed number
+# would only ever produce
 # false alarms.
 #
 # Written through a TEMPORARY file and moved into place only on success. The
@@ -41,7 +41,7 @@ harnesses:
 #
 # stderr is NOT discarded: the fuel path routes "row exceeded the budget" notes
 # and every HARNESS ERROR there precisely so this target shows them, and
-# `2>/dev/null` hid exactly the messages written for it. FABLE_REVIEW P8.
+# `2>/dev/null` hid exactly the messages written for it.
 baseline:
 	go run . -fuel > baseline_fuel.txt.tmp && mv baseline_fuel.txt.tmp baseline_fuel.txt
 	go run . -size > baseline_size.txt.tmp && mv baseline_size.txt.tmp baseline_size.txt

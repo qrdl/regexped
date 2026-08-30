@@ -198,7 +198,7 @@ second entry point alongside `find`, plus the cursor and resume loop. Both are
 driven by ONE shared per-position worker, so the bucket code is not duplicated.
 
 **Only JavaScript and TypeScript expose it.** Batching amortises host-boundary
-crossings and nothing else — SETS §20.1 measures `find` and a batched find
+crossings and nothing else — measurement compares `find` and a batched find
 within 12.3% of each other in fuel, with `find` the CHEAPER one in-wasm, while
 they differ 45x-76x in wall clock. C, Go, Rust and AssemblyScript are compiled
 to wasm and merged, so their call into the module is a direct call inside one

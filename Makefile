@@ -10,7 +10,7 @@ regexped: $(GO_SRCS) go.mod go.sum
 re2test: build
 	$(MAKE) -C tools/re2test test
 
-# Set-capability coverage (plans/SETS.md §22). `setcaps` is the sampled gate
+# Set-capability coverage. `setcaps` is the sampled gate
 # that `re2test` already includes; `setcaps-exhaustive` is the whole-corpus
 # run, measured in hours — before a release, or after touching a set emitter.
 setcaps:
@@ -37,8 +37,8 @@ setperf-check:
 setperf-fuel-cross:
 	$(MAKE) -C tools/setperf fuel-cross
 
-# Byte-identical regression net for the single-pattern paths
-# (plans/SETS.md §9.0). One fixture per code path, compared byte for byte —
+# Byte-identical regression net for the single-pattern paths: one fixture
+# per code path, compared byte for byte —
 # the evidence that a change to a shared emitter did not move single-pattern
 # output. See compile/testdata/byteident/README.md.
 byteident:

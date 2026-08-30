@@ -3,7 +3,7 @@
 # exhausted or a target number of distinct crashers has been found,
 # whichever comes first.
 #
-# go test -fuzz stops at the very first failure by design (see README.md)
+# go test -fuzz stops at the very first failure by design
 # and re-fails immediately replaying it on every later invocation, since a
 # crasher gets written under testdata/fuzz/FuzzCorrectness/ and is always
 # replayed as seed corpus. This script loops around that: each time a run
@@ -23,8 +23,8 @@
 #   cp found/.../HHMMSS-<hash> testdata/fuzz/FuzzCorrectness/<hash>
 #   go test -run=FuzzCorrectness .
 # Once understood, shrink it and add the minimal repro to
-# tools/re2test/custom-tests.txt as a permanent regression test — per
-# FUZZER.md, don't rely on the testdata/fuzz entry alone for that.
+# tools/re2test/custom-tests.txt as a permanent regression test — don't rely
+# on the testdata/fuzz entry alone for that.
 
 set -euo pipefail
 cd "$(dirname "$0")"

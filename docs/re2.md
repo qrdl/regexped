@@ -128,7 +128,7 @@ exhaustive suite and a curated `custom-sets.txt` file through the set pipeline
 described in [sets.md](sets.md).
 
 **Every capability is driven, not just `find`.** Until task G15
-([plans/SETS.md](../plans/SETS.md) §22) this target declared one set with
+ this target declared one set with
 `find` OR a batching `find`, `patterns: all` and no `overlapping` — so
 `match_any`/`match_all`, `scan_any`/`scan_all` and the
 overlapping `find` body had no corpus coverage at all, which is how five
@@ -142,9 +142,9 @@ through:
 | `find` gated, batching `find` gated at capacity 1 and P | Go `FindAllIndex` — cross-checked against the corpus's own col4 |
 | `find` overlapping, batching `find` overlapping at capacity 1 and P | every start position's leftmost-first match |
 | `find` through an under-sized buffer | `out_cap = 0` and the transactional-overflow rule |
-| every capability at `from > len` | §4.2's "nothing" result |
+| every capability at `from > len` | the "nothing" result |
 
-Every expectation is computed **live from Go `regexp`** via §9.6's whole-input
+Every expectation is computed **live from Go `regexp`** via a whole-input
 technique (`\A(?s:.{p})(?:pat)`, which hands the pattern position `p` with its
 real left context), so no oracle restates an emitter's own rule back at it.
 
@@ -172,7 +172,7 @@ count), SIMD Shufti (density/hint-selected first-byte prefilter), and the
 scalar DFA fallback —
 together with bucket dispatch and the isolated-fallback path for non-greedy
 patterns. Per-shape *scaling* is measured separately by `tools/setperf` and the
-fuel ladder in [plans/SETS.md](../plans/SETS.md) §14.
+fuel ladder.
 
 `make sets` samples the corpus — measured at **2m58s for 6,525,501 checks** —
 which is why it is part of `make test`; `make sets-exhaustive` is the same
@@ -193,7 +193,7 @@ of several thousand patterns: one set per corpus block, the same col4 oracle,
 driving `find` and then its batch entry at a buffer capacity of **one**. That
 capacity is the point: it makes every position with more than one match split,
 so the corpus exercises the batch resume path — and with it the
-delivered-tuple gate rule of [plans/SETS.md](../plans/SETS.md) §19 — at every
+delivered-tuple gate rule of — at every
 empty-match shape, anchor and extent it contains, rather than at the handful a
 hand-written test can think of. Also runs clean with **0 failures**.
 

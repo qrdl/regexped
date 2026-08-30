@@ -446,14 +446,12 @@ func buildMatrix() []setCase {
 		// which stage B was built for and failed to close.
 		setCase{"greedy-3", greedy, corpusNoMatch()[:100*1024-5] + "ERROR", "late ERROR 100KB"},
 		setCase{"greedy-3", greedy, strings.Repeat("a", 50000), "50K a's"},
-		// MISLABELLED, deliberately left as-is: corpusNoMatch's filler
-		// contains "a" and "y", which `a+` and `x?y` match ~1,830 times each
-		// per 100 KB, so this row is match-dense. Renaming it (or stripping
-		// those letters from the filler) changes the baseline KEY, and
-		// baseline_fuel.txt / baseline_size.txt are gitignored and therefore
-		// unrecoverable — so the correction is the owner's to make, together
-		// with the rebaseline it forces. See corpusNoMatch's doc comment.
-		setCase{"greedy-3", greedy, corpusNoMatch(), "no-match 100KB"},
+		// The complement of the row above: the never-dying pattern's literal
+		// is ABSENT, so the preflight can retire it. NOT a no-match row —
+		// corpusNoMatch's filler contains "a" and "y", which `a+` and `x?y`
+		// match ~1,830 times each per 100 KB — which is why it is labelled
+		// for the letter it lacks rather than for matching nothing.
+		setCase{"greedy-3", greedy, corpusNoMatch(), "no-ERROR 100KB"},
 	)
 	return out
 }
@@ -471,11 +469,11 @@ func keywordPatterns(n int) []string {
 //
 // The name is a promise it can only keep for a set whose patterns carry a
 // mandatory literal. greedy-3 is the exception: its `a+` matches the "a" in
-// "lazy", its `x?y` matches every "y", and there are ~1,830 of each per 100 KB
-// — so the rows labelled "no-match 100KB" for that family are MATCH-DENSE.
-// Their measurements are self-consistent and the board's numbers stand; the
-// LABEL is what was wrong, and it is what makes the "gating has the most to
-// recover" rows read as a bigger claim than they are.
+// "lazy", its `x?y` matches every "y", and there are ~1,830 of each per 100 KB.
+// Those rows are therefore labelled "no-ERROR 100KB" rather than "no-match":
+// what they isolate is the ABSENCE of the never-dying pattern's literal, not
+// an absence of matches. Any new caller on a literal-less set owes itself the
+// same check before using the word "no-match".
 func corpusNoMatch() string {
 	var b strings.Builder
 	line := "the quick brown fox jumps over the lazy dog 0123456789 "

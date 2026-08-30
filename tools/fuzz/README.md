@@ -3,8 +3,8 @@
 Mutates `(pattern, input)` string pairs and compares regexped's compiled WASM
 against Go stdlib `regexp` on the same pair.
 
-**Layer 1** ([plans/FUZZER.md](../../plans/FUZZER.md)) covers the no-capture
-`find` body. **Layer 2** ([plans/OPUS.md](../../plans/OPUS.md) §N7) covers the
+**Layer 1** covers the no-capture
+`find` body. **Layer 2** ( §N7) covers the
 four paths Layer 1 never reaches — see "Layers" below. Rejects (skips) any pair Go
 stdlib itself can't compile, or that regexped can't compile (unsupported
 syntax, engine state-limit overflow) — those aren't regexped bugs.
@@ -25,7 +25,7 @@ make seed-set     make fuzz-set       # set find_all
 
 > `make seed-groups` and `make seed-engines` currently **fail** on
 > `(0$|a0??)`. That is real bug 40
-> ([plans/FUZZER_BUGS.md](../../plans/FUZZER_BUGS.md)), not harness flake.
+>, not harness flake.
 > Don't make it green by weakening the oracle.
 
 Each `fuzz-*` goal pairs `-fuzz` with a matching `-run`. Without the `-run`
@@ -42,7 +42,7 @@ go test -fuzz=FuzzCorrectness -fuzztime=10m .
 
 A failing case is written under `testdata/fuzz/FuzzCorrectness/` and
 replayed on every subsequent `go test` (with or without `-fuzz`) until
-fixed or removed — see `go help testflag` ("Fuzzing"). Per FUZZER.md's
+fixed or removed — see `go help testflag` ("Fuzzing"). Per
 "Practical concerns", once a failure is understood, shrink it and add the
 minimal repro to `tools/re2test/custom-tests.txt` as a permanent regression
 test; don't rely on the `testdata/fuzz` entry alone for that.
@@ -63,7 +63,7 @@ empirically, and two contradict the docs:
 - **`match_func` is full-consumption.** It matches only if the pattern consumes
   the *entire* input (`a` vs `"ab"` is NO match). The oracle is `\A(?:pat)\z`,
   not `FindStringIndex`.
-- **`groups_func` is NON-anchored**, despite CLAUDE.md calling it "anchored +
+- **`groups_func` is NON-anchored**, despite calling it "anchored +
   captures". `(a)(b)` vs `"xxab"` returns `[2 4 2 3 3 4]`.
 - **set `find_all` reports overlapping matches** — one per start position — not
   Go's `FindAllStringIndex`, which skips forward past each match. `a*` vs `"a"`
@@ -77,7 +77,7 @@ preserve left context for those assertions. Widening that is open work.
 
 Every target skips a case when an export returns `abi.BTStackOverflow` (-2):
 the Backtracking engine exhausted its compile-time frame budget and is telling
-you it does not know the answer (plans/OPUS.md §N1, docs/engines.md). Comparing
+you it does not know the answer ( §N1, docs/engines.md). Comparing
 that against the oracle would report a "wrong answer" for an answer the engine
 explicitly declined to give — the same harness mistake as treating a
 compile-time ceiling error as a bug (see `isResourceCeiling`).
@@ -117,7 +117,7 @@ recomputed live).
 
 ## Scope
 
-Deliberately out of scope for this pass (see FUZZER.md's own
+Deliberately out of scope for this pass own
 recommendation — start minimal, expand only if it earns its keep):
 
 - **Layer 2** (structure-aware AST-grammar pattern generation) — skipped;

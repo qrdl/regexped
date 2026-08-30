@@ -65,7 +65,7 @@ generated Rust wrapper returns `Result<Option<i32>>` — the id of some pattern
 matching somewhere in the URL, if anything matched. `scan_any` deliberately
 reports neither a position nor an extent: that is what lets it compile to a
 single pass over a union automaton rather than an anchored probe at every
-position, measured at 27 fuel/byte against 78 (plans/SETS.md §3.9, SETS_PLAN
+position, measured at 27 fuel/byte against 78
 item 19). If a match is found, the request is blocked immediately with a 403
 and the matched attack category is logged. If no pattern matches, the request
 continues to the origin.

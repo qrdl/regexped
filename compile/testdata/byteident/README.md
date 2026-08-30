@@ -4,7 +4,7 @@ Each directory here is **one single-pattern code path**, checked in with the
 exact bytes its `patterns.yaml` compiles to. `compile/byteident_test.go`
 recompiles them and compares byte for byte — no tolerance.
 
-They exist because the set redesign (`plans/SETS.md`) shares emitters with the
+They exist because the set redesign shares emitters with the
 single-pattern path, and D6 of that plan says single-pattern behaviour must not
 change. Byte identity is the only evidence strong enough for "must not change":
 a behavioural test proves the cases it tries, and a shared-emitter regression
