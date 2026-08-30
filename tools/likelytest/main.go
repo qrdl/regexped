@@ -34,7 +34,7 @@ import (
 	"strings"
 	"time"
 
-	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -1261,17 +1261,17 @@ func benchTime(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Eng
 	warmupEnd := time.Now().Add(50 * time.Millisecond)
 	for time.Now().Before(warmupEnd) {
 		if tc.mode == modeGroups {
-			benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters)) //nolint:errcheck
+			wcall(benchFn, store, inputBase, inputLen, slotsBase, int32(benchIters)) //nolint:errcheck
 		} else {
-			benchFn.Call(store, inputBase, inputLen, int32(benchIters)) //nolint:errcheck
+			wcall(benchFn, store, inputBase, inputLen, int32(benchIters)) //nolint:errcheck
 		}
 	}
 
 	var benchErr error
 	if tc.mode == modeGroups {
-		_, benchErr = benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters))
+		_, benchErr = wcall(benchFn, store, inputBase, inputLen, slotsBase, int32(benchIters))
 	} else {
-		_, benchErr = benchFn.Call(store, inputBase, inputLen, int32(benchIters))
+		_, benchErr = wcall(benchFn, store, inputBase, inputLen, int32(benchIters))
 	}
 	if benchErr != nil {
 		return 0, fmt.Errorf("bench call: %w", benchErr)
@@ -1333,12 +1333,12 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 	var callErr error
 	switch tc.mode {
 	case modeGroups:
-		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase, int32(0))
+		_, callErr = wcall(fn, store, inputBase, inputLen, slotsBase, int32(0))
 	case modeFind:
 		// find is (ptr, len, from); a one-shot find starts at 0.
-		_, callErr = fn.Call(store, inputBase, inputLen, int32(0))
+		_, callErr = wcall(fn, store, inputBase, inputLen, int32(0))
 	default:
-		_, callErr = fn.Call(store, inputBase, inputLen)
+		_, callErr = wcall(fn, store, inputBase, inputLen)
 	}
 	if callErr != nil {
 		return 0, callErr
@@ -1362,7 +1362,7 @@ const findExhaustIterTime = 200
 func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 	off := int32(0)
 	for off <= inputLen {
-		r, err := fn.Call(store, inputBase, inputLen, off)
+		r, err := wcall(fn, store, inputBase, inputLen, off)
 		if err != nil {
 			return
 		}
@@ -1399,7 +1399,7 @@ func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, slotsPtr, inputLen int32) {
 	off := int32(0)
 	for off <= inputLen {
-		r, err := fn.Call(store, inputBase, inputLen, slotsPtr, off)
+		r, err := wcall(fn, store, inputBase, inputLen, slotsPtr, off)
 		if err != nil {
 			return
 		}
@@ -1681,7 +1681,7 @@ func checkMatch(engine *wasmtime.Engine, wasmBytes []byte, input string, re *reg
 	}
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
-	r, err := fn.Call(store, inputBase, int32(len(input)))
+	r, err := wcall(fn, store, inputBase, int32(len(input)))
 	if err != nil {
 		return fmt.Errorf("call: %w", err)
 	}
@@ -1716,7 +1716,7 @@ func checkFind(engine *wasmtime.Engine, wasmBytes []byte, input string, re *rege
 	}
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
-	r, err := fn.Call(store, inputBase, int32(len(input)), int32(0))
+	r, err := wcall(fn, store, inputBase, int32(len(input)), int32(0))
 	if err != nil {
 		return fmt.Errorf("call: %w", err)
 	}
@@ -1777,7 +1777,7 @@ func checkFindExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, r
 	off := int32(0)
 	for off <= inputLen {
 		// Whole buffer plus a start position; positions come back absolute.
-		r, err := fn.Call(store, inputBase, inputLen, off)
+		r, err := wcall(fn, store, inputBase, inputLen, off)
 		if err != nil {
 			return fmt.Errorf("call at off=%d: %w", off, err)
 		}
@@ -1828,7 +1828,7 @@ func checkGroups(engine *wasmtime.Engine, wasmBytes []byte, input string, re *re
 	for i := 0; i < totalGroups*2*4; i++ {
 		buf[int(slotsBase)+i] = 0xFF // pre-init to -1, matching re2test's callGroups
 	}
-	r, err := fn.Call(store, inputBase, int32(len(input)), slotsBase, int32(0))
+	r, err := wcall(fn, store, inputBase, int32(len(input)), slotsBase, int32(0))
 	if err != nil {
 		return fmt.Errorf("call: %w", err)
 	}
@@ -1913,7 +1913,7 @@ func checkGroupsExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string,
 		// shrinking-window call this replaced was an ARITY error wasmtime
 		// rejected outright, so the exhaustive modeGroups case failed and the
 		// run exited non-zero.
-		r, err := fn.Call(store, inputBase, inputLen, slotsBase, off)
+		r, err := wcall(fn, store, inputBase, inputLen, slotsBase, off)
 		if err != nil {
 			return fmt.Errorf("call at off=%d: %w", off, err)
 		}
@@ -2116,7 +2116,7 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 	runtime.KeepAlive(store)
 	from := int32(0)
 	for {
-		n, err := findFn.Call(store, plan.inputBase, inputLen, from, gatePtr, plan.outputBase, setOutCap)
+		n, err := wcall(findFn, store, plan.inputBase, inputLen, from, gatePtr, plan.outputBase, setOutCap)
 		if err != nil {
 			return
 		}
@@ -2243,12 +2243,12 @@ func main() {
 	// Silence regexped's slog output.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	engine := wasmtime.NewEngine()
+	engine := newWatchedEngine(nil)
 	warmup(engine)
 
 	fuelCfg := wasmtime.NewConfig()
 	fuelCfg.SetConsumeFuel(true)
-	fuelEngine := wasmtime.NewEngineWithConfig(fuelCfg)
+	fuelEngine := newWatchedEngine(fuelCfg)
 
 	modes := [3]compile.LikelyMode{compile.LikelyNeutral, compile.LikelyMatch, compile.LikelyNoMatch}
 
@@ -2260,6 +2260,7 @@ func main() {
 		if filter != "" && !strings.Contains(tc.name, filter) {
 			continue
 		}
+		wcallCase = tc.name
 		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
 
 		// Ground truth for the correctness checks below. modeSet isn't

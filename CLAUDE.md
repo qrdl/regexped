@@ -489,7 +489,7 @@ so it never reports `[15,28)` for `[a-z]+@example\.com` over
 make byteident   # from repo root
 ```
 
-Seventeen configs, one per single-pattern code path, each checked in with the
+Nineteen configs, one per single-pattern code path, each checked in with the
 exact bytes it compiles to and compared byte for byte. This is the regression
 net for any change that touches a shared emitter: single-pattern output is
 supposed to be unaffected by set work ( D6), and byte identity is

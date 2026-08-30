@@ -11137,10 +11137,21 @@ func emitLitChainAltLitBranchBodyPrefixed(b []byte, br litChainAltBranch,
 	b = append(b, 0x47)
 	b = append(b, 0x0D, failDepth)
 
-	// Bounds: attempt_start < M → fail (no prefix room).
+	// Bounds AND the find-from floor: attempt_start < find_from + M → fail.
+	//
+	// The floor is not optional. This branch reports `attempt_start - M` as the
+	// match start, so a literal at attempt_start in [from, from+M) yields a
+	// start BEFORE `from` — the prefix verify genuinely matches there and
+	// passes, and the export answers with a match the caller already consumed.
+	// That is the same defect the generic backward scan grew a floor for
+	// (see buildSimplePrefixCheckBody), and a host iterating the export walks
+	// BACKWARDS on it: the advance `off += end - off` goes negative.
 	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x23) // global.get find_from
+	b = utils.AppendULEB128(b, findFromGlobalIdx)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, m)
+	b = append(b, 0x6A) // i32.add → find_from + M
 	b = append(b, 0x49)
 	b = append(b, 0x0D, failDepth)
 
@@ -11478,10 +11489,20 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) ([]byt
 	}
 	b = emitPrefixScan(b, scan)
 
-	// Bounds A: attempt_start < M → no prefix room, advance & retry.
+	// Bounds A AND the find-from floor: attempt_start < find_from + M →
+	// advance & retry.
+	//
+	// The floor is not optional: this body reports `attempt_start - M` as the
+	// match start, so without it a literal at attempt_start in [from, from+M)
+	// yields a start BEFORE `from`. See emitLitChainAltLitBranchBodyPrefixed
+	// for the full note; advancing rather than failing is right here because
+	// $lit_outer rescans from the new position.
 	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x23) // global.get find_from
+	b = utils.AppendULEB128(b, findFromGlobalIdx)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, m)
+	b = append(b, 0x6A) // i32.add → find_from + M
 	b = append(b, 0x49) // i32.lt_u
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, locAttemptStart)

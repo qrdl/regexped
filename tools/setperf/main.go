@@ -52,7 +52,7 @@ import (
 	"strings"
 	"time"
 
-	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -730,26 +730,26 @@ func (r *rxInstance) call(c capability, wide bool) (int, error) {
 	}
 	switch c {
 	case capMatchAny:
-		_, err := fn.Call(r.store, r.inBase, r.inLen)
+		_, err := wcall(fn, r.store, r.inBase, r.inLen)
 		return 1, err
 	case capMatchAll:
 		if wide {
 			r.zeroBitmap()
-			_, err := fn.Call(r.store, r.inBase, r.inLen, r.bitmapPt)
+			_, err := wcall(fn, r.store, r.inBase, r.inLen, r.bitmapPt)
 			return 1, err
 		}
-		_, err := fn.Call(r.store, r.inBase, r.inLen)
+		_, err := wcall(fn, r.store, r.inBase, r.inLen)
 		return 1, err
 	case capScanAny:
-		_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0))
+		_, err := wcall(fn, r.store, r.inBase, r.inLen, int32(0))
 		return 1, err
 	case capScanAll:
 		if wide {
 			r.zeroBitmap()
-			_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0), r.bitmapPt)
+			_, err := wcall(fn, r.store, r.inBase, r.inLen, int32(0), r.bitmapPt)
 			return 1, err
 		}
-		_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0))
+		_, err := wcall(fn, r.store, r.inBase, r.inLen, int32(0))
 		return 1, err
 	case capFind:
 		return r.exhaustFind(fn, true)
@@ -795,7 +795,7 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 		var res interface{}
 		var err error
 		calls++
-		res, err = fn.Call(r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
+		res, err = wcall(fn, r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
 		if err != nil {
 			return calls, err
 		}
@@ -839,7 +839,7 @@ func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error
 		var res interface{}
 		var err error
 		calls++
-		res, err = fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
+		res, err = wcall(fn, r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
 		if err != nil {
 			return calls, err
 		}
@@ -871,7 +871,7 @@ func rowKey(c setCase, cap capability) string {
 func measureFuelRow(c setCase) []row {
 	cfg := wasmtime.NewConfig()
 	cfg.SetConsumeFuel(true)
-	engine := wasmtime.NewEngineWithConfig(cfg)
+	engine := newWatchedEngine(cfg)
 	var out []row
 	for _, cap := range allCaps {
 		overlapping := cap == capFindOverlapping || cap == capFindBatchOverlapping
@@ -1030,14 +1030,14 @@ func measureInstanceFloor(r *rxInstance) time.Duration {
 		return 0
 	}
 	for end := time.Now().Add(50 * time.Millisecond); time.Now().Before(end); {
-		if _, err := fn.Call(r.store, r.inBase, int32(0)); err != nil {
+		if _, err := wcall(fn, r.store, r.inBase, int32(0)); err != nil {
 			return 0
 		}
 	}
 	samples := make([]time.Duration, benchIters)
 	for i := range samples {
 		t0 := time.Now()
-		if _, err := fn.Call(r.store, r.inBase, int32(0)); err != nil {
+		if _, err := wcall(fn, r.store, r.inBase, int32(0)); err != nil {
 			return 0
 		}
 		samples[i] = time.Since(t0)
@@ -1106,7 +1106,7 @@ func newRaHarnessFuel(engine *wasmtime.Engine, wasm []byte, c setCase, metered b
 		if fn == nil {
 			return 0, fmt.Errorf("harness missing %s", name)
 		}
-		v, err := fn.Call(store)
+		v, err := wcall(fn, store)
 		if err != nil {
 			return 0, err
 		}
@@ -1139,7 +1139,7 @@ func newRaHarnessFuel(engine *wasmtime.Engine, wasm []byte, c setCase, metered b
 	if initFn == nil {
 		return nil, fmt.Errorf("harness missing ra_set_init")
 	}
-	res, err := initFn.Call(store, int32(len(joined)))
+	res, err := wcall(initFn, store, int32(len(joined)))
 	if err != nil {
 		return nil, err
 	}
@@ -1180,7 +1180,7 @@ func (h *raHarness) fuelOf(cap capability, inputLen int32) (fuel uint64, truncat
 	if err := h.store.SetFuel(fuelBudget); err != nil {
 		return 0, false, err
 	}
-	if _, err := fn.Call(h.store, args...); err != nil {
+	if _, err := wcall(fn, h.store, args...); err != nil {
 		if isFuelExhausted(err) {
 			return fuelExhausted, false, nil
 		}
@@ -1190,7 +1190,7 @@ func (h *raHarness) fuelOf(cap capability, inputLen int32) (fuel uint64, truncat
 		return 0, false, err
 	}
 	before, _ := h.store.GetFuel()
-	res, err := fn.Call(h.store, args...)
+	res, err := wcall(fn, h.store, args...)
 	if err != nil {
 		if isFuelExhausted(err) {
 			return fuelExhausted, false, nil
@@ -1229,7 +1229,7 @@ func (h *raHarness) benchLazyFind(inputLen int) (time.Duration, int, error) {
 	drive := func() (int, error) {
 		calls, from := 0, int32(0)
 		for {
-			v, err := fn.Call(h.store, int32(inputLen), from)
+			v, err := wcall(fn, h.store, int32(inputLen), from)
 			calls++
 			if err != nil {
 				return calls, err
@@ -1275,10 +1275,10 @@ func (h *raHarness) bench(name string, inputLen int) (time.Duration, error) {
 	}
 	// The harness times each iteration internally and writes ns to TIMINGS_BUF.
 	const iters = 2000
-	if _, err := fn.Call(h.store, int32(inputLen), int32(200)); err != nil {
+	if _, err := wcall(fn, h.store, int32(inputLen), int32(200)); err != nil {
 		return 0, err // warm-up
 	}
-	if _, err := fn.Call(h.store, int32(inputLen), int32(iters)); err != nil {
+	if _, err := wcall(fn, h.store, int32(inputLen), int32(iters)); err != nil {
 		return 0, err
 	}
 	buf := h.mem.UnsafeData(h.store)
@@ -1311,10 +1311,10 @@ func runFullMatrix(cases []setCase) {
 		fmt.Fprintf(os.Stderr, "cannot read the regex-automata harness (run 'make harnesses' in ../perftest): %v\n", err)
 		os.Exit(1)
 	}
-	engine := wasmtime.NewEngine()
+	engine := newWatchedEngine(nil)
 	fuelCfg := wasmtime.NewConfig()
 	fuelCfg.SetConsumeFuel(true)
-	fuelEngine := wasmtime.NewEngineWithConfig(fuelCfg)
+	fuelEngine := newWatchedEngine(fuelCfg)
 
 	fmt.Println("setperf — regexped set capabilities vs regex-automata")
 	fmt.Println(strings.Repeat("─", 96))
@@ -1360,6 +1360,7 @@ func runFullMatrix(cases []setCase) {
 	fmt.Println()
 
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		fmt.Printf("\n=== %s / %s (%d patterns, %d bytes) ===\n", c.name, c.inputLbl, len(c.patterns), len(c.input))
 		gated, err := compileCase(c, false)
 		if err != nil {
@@ -1577,7 +1578,7 @@ func runFuelCross(cases []setCase) {
 	}
 	cfg := wasmtime.NewConfig()
 	cfg.SetConsumeFuel(true)
-	engine := wasmtime.NewEngineWithConfig(cfg)
+	engine := newWatchedEngine(cfg)
 
 	fmt.Println("setperf — cross-engine FUEL (WASM instructions executed, one whole-input operation)")
 	fmt.Println(strings.Repeat("─", 96))
@@ -1591,6 +1592,7 @@ func runFuelCross(cases []setCase) {
 
 	var wins, losses, drawn int
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		fmt.Printf("\n=== %s / %s (%d patterns, %d bytes) ===\n", c.name, c.inputLbl, len(c.patterns), len(c.input))
 		h, err := newRaHarnessFuel(engine, raBytes, c, true)
 		if err != nil {
@@ -1650,6 +1652,7 @@ func runFuelCross(cases []setCase) {
 
 func printRows(cases []setCase, measure func(setCase) []row, unit string) {
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		for _, r := range measure(c) {
 			if r.value == fuelExhausted {
 				// Not a number, so it cannot join an exact-equality baseline.
@@ -1696,6 +1699,7 @@ func runCompare(path string, cases []setCase, measure func(setCase) []row, unit 
 	// exactly." over a board that had lost them.
 	visited := map[string]bool{}
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		for _, r := range measure(c) {
 			visited[r.key] = true
 			want, ok := base[r.key]
@@ -1766,9 +1770,10 @@ func runVerify(cases []setCase) int {
 		fmt.Fprintf(os.Stderr, "cannot read the regex-automata harness (run 'make harnesses' in ../perftest): %v\n", err)
 		return 1
 	}
-	engine := wasmtime.NewEngine()
+	engine := newWatchedEngine(nil)
 	bad := 0
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		ra, err := newRaHarness(engine, raBytes, c)
 		if err != nil {
 			fmt.Printf("SKIP %s/%s: %v\n", c.name, c.inputLbl, err)
@@ -1987,7 +1992,7 @@ func rxCollectFind(r *rxInstance) []setTuple {
 	var out []setTuple
 	from := int32(0)
 	for {
-		res, err := fn.Call(r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
+		res, err := wcall(fn, r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
 		if err != nil {
 			return out
 		}
@@ -2038,7 +2043,7 @@ func rxCollectFindBatch(r *rxInstance) []setTuple {
 	var out []setTuple
 	cursor := int64(0)
 	for {
-		res, err := fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
+		res, err := wcall(fn, r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
 		if err != nil {
 			return out
 		}
@@ -2098,7 +2103,7 @@ func raCallI32(h *raHarness, name string, args ...interface{}) int32 {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: the regex-automata harness has no export %q (run 'make harnesses' in ../perftest)\n", name)
 		os.Exit(1)
 	}
-	v, err := fn.Call(h.store, args...)
+	v, err := wcall(fn, h.store, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling regex-automata %q: %v\n", name, err)
 		os.Exit(1)
@@ -2112,7 +2117,7 @@ func raCallI64(h *raHarness, name string, args ...interface{}) int64 {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: the regex-automata harness has no export %q (run 'make harnesses' in ../perftest)\n", name)
 		os.Exit(1)
 	}
-	v, err := fn.Call(h.store, args...)
+	v, err := wcall(fn, h.store, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling regex-automata %q: %v\n", name, err)
 		os.Exit(1)
@@ -2132,7 +2137,7 @@ func rxCallI32(r *rxInstance, name string, args ...interface{}) int32 {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: our module has no export %q\n", name)
 		os.Exit(1)
 	}
-	v, err := fn.Call(r.store, args...)
+	v, err := wcall(fn, r.store, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling our %q: %v\n", name, err)
 		os.Exit(1)
@@ -2146,7 +2151,7 @@ func rxCallI64(r *rxInstance, name string, args ...interface{}) int64 {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: our module has no export %q\n", name)
 		os.Exit(1)
 	}
-	v, err := fn.Call(r.store, args...)
+	v, err := wcall(fn, r.store, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling our %q: %v\n", name, err)
 		os.Exit(1)

@@ -26,7 +26,7 @@ import (
 	"regexp"
 	"time"
 
-	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -55,6 +55,7 @@ type cell struct {
 }
 
 func main() {
+	wcallCase = "pattest"
 	// Silence regexped's slog output.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
@@ -108,11 +109,11 @@ func main() {
 		tableBase = aligned
 	}
 
-	engine := wasmtime.NewEngine()
+	engine := newWatchedEngine(nil)
 	warmup(engine)
 	fuelCfg := wasmtime.NewConfig()
 	fuelCfg.SetConsumeFuel(true)
-	fuelEngine := wasmtime.NewEngineWithConfig(fuelCfg)
+	fuelEngine := newWatchedEngine(fuelCfg)
 
 	wasmByMode := make(map[compile.LikelyMode][]byte, 3)
 	for _, m := range likelyModes {
@@ -231,7 +232,7 @@ func benchFuel(wasmBytes []byte, mode, input string, fuelEngine *wasmtime.Engine
 	if mode == "find" {
 		args = append(args, int32(0)) // find is (ptr, len, from)
 	}
-	if _, err := fn.Call(store, args...); err != nil {
+	if _, err := wcall(fn, store, args...); err != nil {
 		return 0, err
 	}
 	after, _ := store.GetFuel()
@@ -288,10 +289,10 @@ func benchTime(wasmBytes []byte, mode, input string, engine *wasmtime.Engine) (t
 	// 50 ms warmup.
 	warmupEnd := time.Now().Add(50 * time.Millisecond)
 	for time.Now().Before(warmupEnd) {
-		benchFn.Call(store, inputBase, inputLen, int32(benchIters)) //nolint:errcheck
+		wcall(benchFn, store, inputBase, inputLen, int32(benchIters)) //nolint:errcheck
 	}
 
-	if _, err := benchFn.Call(store, inputBase, inputLen, int32(benchIters)); err != nil {
+	if _, err := wcall(benchFn, store, inputBase, inputLen, int32(benchIters)); err != nil {
 		return 0, fmt.Errorf("bench call: %w", err)
 	}
 	shimBuf := shimMem.UnsafeData(store)

@@ -35,6 +35,8 @@ add a fixture for it.
 | `counted_chain` | `x[a-f]{3,10}y` | bounded counted repeat `{N,M}` | Compiled DFA |
 | `strict_alt` | `AKIA[A-Z0-9]{16}\|ghp_[A-Za-z0-9]{20}` | strict alternation of lit-chain branches — `buildLitChainAltFindBody` | Compiled DFA |
 | `lenient_alt` | `ERROR[0-9]{3}\|WARNING[0-9]{3}` | lenient alternation find — `buildLitChainAltLenientFindBody`, the one find body whose scan cursor is NOT `locAttemptStart` | Compiled DFA |
+| `lit_chain_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}` | lit chain with a fixed-length prefix — `buildLitChainPrefixedFindBody`; reports `attempt_start - M`, so it needs a find-from floor | Compiled DFA |
+| `alt_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}\|[0-9]{3}ghp_[A-Za-z0-9]{24}` | Gap E: strict alternation of prefixed branches — `buildLitChainAltPrefixedFindBody` | Compiled DFA |
 
 The engine column was taken from `SelectEngine`, and
 `TestByteIdenticalPathsAreDistinct` re-checks it on every run — a fixture set
@@ -59,7 +61,10 @@ checks that the local named is the one the scan actually starts from — WASM
 locals are zero-initialised, so a wrong name yields a module that validates,
 answers `from == 0` correctly, and ignores `from` forever after.
 
-That defect shipped twice. `strict_alt` and `lenient_alt` pin the two
-alternation find bodies, which had no fixture at all; `tools/fuzz`'s
+That defect shipped twice. `strict_alt`, `lenient_alt`, `lit_chain_prefixed` and `alt_prefixed`
+pin four find bodies that had no fixture at all — the last two were found by
+`compile`'s `TestEveryFindEmitterIsCovered`, which reported that six of the
+fourteen find emitters were reached by nothing, and both turned out to be
+missing the find-from floor; `tools/fuzz`'s
 `TestFindFromStartsAtOrAfterFrom` is the behavioural half of the same net and
 asserts the invariant the bytes here only freeze.

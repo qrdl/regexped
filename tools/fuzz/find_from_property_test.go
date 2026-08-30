@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
+	"github.com/qrdl/regexped/compile"
+	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
 )
 
@@ -110,7 +112,28 @@ var findFromShapes = []struct{ name, pat, input string }{
 	{"lnm_simple_prefix", `[0-9]{4}MARKER`, "1234MARKER5678MARKERyy"},
 	{"lnm_lit_anchor", `[a-f]{6}TAIL`, "abcdefTAILabcdefTAIL"},
 	{"lnm_lit_chain", `AKIA[A-Z0-9]{16}`, "AKIA0123456789ABCDEF AKIAFEDCBA9876543210"},
+
+	// Six shapes added after compile's TestEveryFindEmitterIsCovered reported
+	// that the emitters below were reached by NOTHING — not by this corpus and
+	// not by any byteident fixture. The locals fingerprint had hidden it: two
+	// of them share a fingerprint with a shape already here, so the count this
+	// file checks looked healthy while the bodies went undriven.
+	{"lit_chain_range_body", `foo[0-9]{26,30}`,
+		"foo0123456789012345678901234567 q foo9876543210987654321098765432"},
+	{"lit_chain_prefixed_body", `[a-z]{3}AKIA[A-Z0-9]{24}`,
+		"abcAKIA0123456789ABCDEF01234567 q xyzAKIAFEDCBA9876543210FEDCBA98"},
+	{"alt_lit_anchor_dispatch", `[a-z]{5}@aaa\.com|[0-9]{5}#bbb\.net`,
+		"q abcde@aaa.com w 12345#bbb.net e fghij@aaa.com"},
+	{"alt_prefixed_body", `[a-z]{3}AKIA[A-Z0-9]{24}|[0-9]{3}ghp_[A-Za-z0-9]{24}`,
+		"abcAKIA0123456789ABCDEF01234567 q 123ghp_abcdefghij0123456789abcd"},
+	{"bt_find_fallback", `(?:alpha|beta|gamma)[0-9a-f]{8}`,
+		"xx alpha0123abcd yy beta4567ef01 zz gamma89abcdef"},
 }
+
+// findFromMaxStates forces a DFA state ceiling for shapes that need one.
+// buildBTFindBody is the fallback taken when a find pattern's DFA is too large,
+// so no pattern small enough to sweep reaches it at the default limit.
+var findFromMaxStates = map[string]int{"bt_find_fallback": 8}
 
 // findFromLNM names the shapes compiled under LikelyNoMatch. Some emitters
 // exist ONLY under that mode — buildSimplePrefixCheckBody, whose missing
@@ -127,6 +150,12 @@ var findFromLNM = map[string]bool{
 func compileFindShape(name, pat string) ([]byte, error) {
 	if findFromLNM[name] {
 		return compileFindLNM(pat)
+	}
+	if n, ok := findFromMaxStates[name]; ok {
+		entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
+		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true,
+			compile.CompileOptions{MaxDFAStates: n})
+		return w, err
 	}
 	return compileFind(pat)
 }
@@ -295,14 +324,20 @@ func TestFindFromIterationTerminates(t *testing.T) {
 	}
 }
 
-// TestFindFromShapesReachDistinctBodies keeps the corpus above honest.
+// TestFindFromShapesReachDistinctBodies is a cheap corpus-collapse detector,
+// and NOT the coverage authority.
 //
-// The same reasoning as TestByteIdenticalPathsAreDistinct: a shape list that
-// silently collapsed onto one emitter would still pass both tests above while
-// defending nothing. Bodies are fingerprinted by their locals declarations,
-// which is what distinguishes the emitters — the lenient-alt body is
-// `7 i32, 5 v128, 2 i32` and the strict-alt one `3 i32, 7 v128`, and it was
-// exactly that difference that identified the second bug's owner.
+// It fingerprints bodies by their locals declarations, which is a proxy: two
+// emitters can declare identical locals, so a healthy-looking count can hide an
+// emitter that nothing reaches. That is not hypothetical — when this file was
+// written the count looked fine while SIX of the fourteen find emitters were
+// driven by nothing at all.
+//
+// compile's TestEveryFindEmitterIsCovered is the authority: it parses the
+// package for emitFindFromSeed call sites and traces which ones a corpus
+// actually reaches, so it can name the emitter that is missing. Keep this test
+// for what it does cheaply — noticing the corpus shrinking — and fix coverage
+// gaps there.
 func TestFindFromShapesReachDistinctBodies(t *testing.T) {
 	byFingerprint := map[string][]string{}
 	for _, c := range findFromShapes {
@@ -326,13 +361,14 @@ func TestFindFromShapesReachDistinctBodies(t *testing.T) {
 		t.Logf("%-40s %s", k, strings.Join(byFingerprint[k], ", "))
 	}
 
-	// The floor is empirical: the shape list reached this many distinct
-	// bodies when it was written. Raising it is welcome; a DROP means an
-	// emitter stopped being covered, which is how both shipped bugs got in.
-	const minBodies = 10
+	// Empirical, and a floor rather than a target: a DROP means the corpus
+	// shrank. It is NOT evidence that every emitter is covered — see the doc
+	// comment, and compile's TestEveryFindEmitterIsCovered for that claim.
+	const minBodies = 12
 	if len(byFingerprint) < minBodies {
 		t.Errorf("find-from shapes reach only %d distinct find bodies, want >= %d — "+
-			"an emitter has stopped being covered", len(byFingerprint), minBodies)
+			"the corpus has shrunk; compile's TestEveryFindEmitterIsCovered says "+
+			"which emitter is now unreached", len(byFingerprint), minBodies)
 	}
 }
 
