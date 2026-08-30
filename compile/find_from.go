@@ -86,19 +86,33 @@ func (m findFromMode) String() string {
 }
 
 // emitFindFromSeed appends the two instructions that load the find-from
-// global into a find body's attempt-start local, and returns ffNative.
+// global into a find body's SCAN CURSOR, and returns ffNative.
 //
 // This is the ONLY producer of ffNative, and it returns the mode rather than
 // letting the caller assert it: a body is native exactly when it carries this
-// seed. attemptStartLocal is that body's own scan-start local index — the one
-// fact per emitter that this mechanism cannot check for itself, which is why
-// each emitter conversion lands with its own seed pattern in
-// tools/fuzz/iter_test.go.
+// seed.
+//
+// # Why the parameter is a scanCursor and not a local index
+//
+// It used to take a byte, and "which local is this body's scan start" was then
+// one fact per emitter that nothing could check — stated in a const block,
+// consumed here, never reconciled. WASM locals are zero-initialised, so naming
+// the wrong one yields a module that validates, answers `from == 0` correctly,
+// and ignores `from` for ever after; ffNative is returned either way, so the
+// mode is no evidence. That defect shipped twice, most recently in
+// buildLitChainAltLenientFindBody, whose attempt-start local is DERIVED from
+// its window base rather than being the cursor — every exported find returned
+// the first match in the buffer, and hosts iterating it never terminated.
+//
+// A scanCursor comes only from localAlloc.scanCursor(), so the body must
+// decide which of its locals is the cursor at the point it allocates them, and
+// can then hand that same value to both its scan and this seed. Passing some
+// other local is no longer expressible: ordinary locals are bytes, and a byte
+// is not a scanCursor.
 //
 // Placement: immediately after the locals declaration, before the prologue
-// that reads attempt_start. WASM locals are zero-initialised, which is
-// precisely why "start at 0" used to be the only behaviour available.
-func emitFindFromSeed(b []byte, attemptStartLocal byte) ([]byte, findFromMode) {
+// that reads the cursor.
+func emitFindFromSeed(b []byte, cur scanCursor) ([]byte, findFromMode) {
 	b = append(b, 0x23) // global.get
 	b = utils.AppendULEB128(b, findFromGlobalIdx)
 	b = append(b, 0x21)
@@ -106,7 +120,7 @@ func emitFindFromSeed(b []byte, attemptStartLocal byte) ([]byte, findFromMode) {
 	// byte, and writing one raw produced a truncated index the validator
 	// accepts as a DIFFERENT local. No emitter is near 128 locals today, which
 	// is exactly why this would be found late.
-	b = utils.AppendULEB128(b, uint32(attemptStartLocal))
+	b = utils.AppendULEB128(b, uint32(cur.Local()))
 	return b, ffNative
 }
 

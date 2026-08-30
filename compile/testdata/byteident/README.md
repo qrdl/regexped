@@ -33,6 +33,8 @@ add a fixture for it.
 | `case_folded` | `(?i)select\s+.*\s+from` | `(?i)`: literals carry FoldCase and are excluded from literal extraction | Compiled DFA |
 | `line_anchored` | `(?m:^)ERROR:.*(?m:$)` | newline-boundary machinery: `midStartNewline`, the `midAcceptNL` side table | Compiled DFA |
 | `counted_chain` | `x[a-f]{3,10}y` | bounded counted repeat `{N,M}` | Compiled DFA |
+| `strict_alt` | `AKIA[A-Z0-9]{16}\|ghp_[A-Za-z0-9]{20}` | strict alternation of lit-chain branches — `buildLitChainAltFindBody` | Compiled DFA |
+| `lenient_alt` | `ERROR[0-9]{3}\|WARNING[0-9]{3}` | lenient alternation find — `buildLitChainAltLenientFindBody`, the one find body whose scan cursor is NOT `locAttemptStart` | Compiled DFA |
 
 The engine column was taken from `SelectEngine`, and
 `TestByteIdenticalPathsAreDistinct` re-checks it on every run — a fixture set
@@ -47,3 +49,17 @@ go test ./compile -run TestByteIdentical -update-byteident
 
 Do this **only** when a change to the single-pattern path is intended, and
 review the resulting diff. That review is the point of the fixtures.
+
+## The find-from cursor
+
+Two of these fixtures exist for a reason worth stating separately. Every
+exported `find` receives its start offset through the find-from global, and
+each emitter names, by hand, the local that offset is seeded into. Nothing
+checks that the local named is the one the scan actually starts from — WASM
+locals are zero-initialised, so a wrong name yields a module that validates,
+answers `from == 0` correctly, and ignores `from` forever after.
+
+That defect shipped twice. `strict_alt` and `lenient_alt` pin the two
+alternation find bodies, which had no fixture at all; `tools/fuzz`'s
+`TestFindFromStartsAtOrAfterFrom` is the behavioural half of the same net and
+asserts the invariant the bytes here only freeze.

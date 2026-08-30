@@ -2638,34 +2638,27 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		numLoopAndMemoLocals += 2
 	}
 	var body []byte
-	if numV128Locals > 0 {
-		numGroups := byte(2)
-		if numLoopAndMemoLocals > 0 {
-			numGroups = 3
-		}
-		body = append(body, numGroups)
-		body = utils.AppendULEB128(body, 7)
-		body = append(body, 0x7F) // 7 fixed i32s
-		body = utils.AppendULEB128(body, uint32(numV128Locals))
-		body = append(body, 0x7B) // numV128 v128s
-		if numLoopAndMemoLocals > 0 {
-			body = utils.AppendULEB128(body, uint32(numLoopAndMemoLocals))
-			body = append(body, 0x7F) // loop+memo (+ lit_pos+scan_start) i32s
-		}
-	} else {
-		body = append(body, 0x01)
-		body = utils.AppendULEB128(body, uint32(7+numLoopAndMemoLocals))
-		body = append(body, 0x7F)
-	}
+	// 7 fixed i32s, then the v128 scan locals, then the loop/memo i32s. The
+	// allocator coalesces adjacent runs of one type, which reproduces both of
+	// the shapes this used to emit by hand: with v128 locals the trailing i32s
+	// form a third group, and without them they merge into the leading run —
+	// the same "skip the group entirely when the count is 0" convention.
+	a := newLocalAlloc(2)
+	a.Reserve(valI32, 5)            // 2..6
+	attemptCursor := a.ScanCursor() // 7 — the scan start
+	a.Reserve(valI32, 1)            // 8, completing the 7 fixed i32s
+	a.Reserve(valV128, numV128Locals)
+	a.Reserve(valI32, numLoopAndMemoLocals)
+	body = a.EmitDecls(body)
 
-	const locAttemptStart = byte(0x07)
+	locAttemptStart := attemptCursor.Local()
 
 	// The find-from seed. Placed here because everything above is
 	// the locals declaration and everything below reads attempt_start. This
 	// body already handles a nonzero start — its memo-skip computes
 	// `attempt_start >> 3` precisely so earlier bytes are not revisited — it
 	// was simply never told where to start.
-	body, findFrom = emitFindFromSeed(body, locAttemptStart)
+	body, findFrom = emitFindFromSeed(body, attemptCursor)
 
 	// ── Mandatory-literal two-level outer loop ────────────────────────────────
 	// When mandLit != nil: outer loop $lit_outer scans for the mandatory literal

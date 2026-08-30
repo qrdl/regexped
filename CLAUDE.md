@@ -37,7 +37,16 @@ regexped/
 │   │                          #   carrying an exported find's `from` position to the body,
 │   │                          #   the (ptr,len,from) wrapper that fronts every find, and
 │   │                          #   findFromMode — whose zero value is invalid, so a find
-│   │                          #   emitter that never claimed one is a BUILD failure
+│   │                          #   emitter that never claimed one is a BUILD failure.
+│   │                          #   emitFindFromSeed takes a scanCursor, NOT a local index —
+│   │                          #   see locals.go for why that distinction is load-bearing
+│   ├── locals.go              # Binding for internal/wlocals: the WASM local allocator and
+│   │                          #   the SEALED scan cursor. Emitters no longer write local
+│   │                          #   indices by hand; the declaration vector is generated from
+│   │                          #   the same allocation that hands out the indices, so the two
+│   │                          #   cannot disagree. Allocation order is declaration order and
+│   │                          #   same-type runs coalesce, which is what let the conversion
+│   │                          #   be proved byte-identical
 │   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
@@ -100,8 +109,16 @@ regexped/
 ├── merge/
 │   └── merge.go               # WASM module merging with wasm-merge
 ├── internal/
-│   └── utils/
-│       └── bytes.go           # LEB128, page alignment, WasmMemTop
+│   ├── utils/
+│   │   └── bytes.go           # LEB128, page alignment, WasmMemTop
+│   └── wlocals/
+│       └── wlocals.go         # WASM local allocation + Cursor, the scan-start local a find
+│                              #   body seeds the find-from offset into. Cursor's fields are
+│                              #   unexported and the package exports no constructor, so
+│                              #   `compile` can only obtain one by ALLOCATING it — naming
+│                              #   some other local is not expressible. That defect (seed the
+│                              #   wrong local, module validates, from == 0 answers correctly,
+│                              #   `from` ignored for ever after) shipped twice before this
 ├── tools/
 │   ├── setperf/
 │   │   ├── main.go            # Cross-engine set comparison vs regex-automata (see Testing);
@@ -445,13 +462,34 @@ A pattern the compiler legitimately drops from a set (fallback suffix DFA over
 `state_limit_dropped`) is excluded from the comparison and counted separately,
 so a documented exclusion cannot pass for either a pass or a failure.
 
+### The find-from invariant (`tools/fuzz/find_from_property_test.go`)
+
+```bash
+go test ./tools/fuzz -run TestFindFrom
+```
+
+Drives `find` at EVERY start position over a shape corpus, against an oracle
+built from whole-input anchored probes (`\A(?s:.{s})(?:pat)` — the same
+technique re2test's set mode uses, so left-context assertions see the real
+preceding byte). Three tests: the invariant itself (`find(I, f)` is the
+leftmost match starting at or after `f`, never before it), the host-iteration
+property (the stub advance rule `off += (end - off) or 1` must terminate — a
+returned start before `from` sends it backwards, which is a hang rather than a
+wrong answer), and a coverage check that the corpus still reaches at least ten
+distinct find bodies, fingerprinted by their locals declarations.
+
+The naive oracle is WRONG and wrongly failed two shapes when this was written:
+`FindAllStringIndex` reports non-overlapping matches from a left-to-right scan,
+so it never reports `[15,28)` for `[a-z]+@example\.com` over
+`"...bb@example.com..."` — but a find starting at 15 must.
+
 ### Byte-identical fixtures (`compile/testdata/byteident/`)
 
 ```bash
 make byteident   # from repo root
 ```
 
-Fifteen configs, one per single-pattern code path, each checked in with the
+Seventeen configs, one per single-pattern code path, each checked in with the
 exact bytes it compiles to and compared byte for byte. This is the regression
 net for any change that touches a shared emitter: single-pattern output is
 supposed to be unaffected by set work ( D6), and byte identity is

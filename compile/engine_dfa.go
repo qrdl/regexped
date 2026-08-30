@@ -7843,39 +7843,40 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		numV128Locals = 0
 	}
 
-	// Local group count  (groups share the same type).
-	if numV128Locals > 0 {
-		b = append(b, 0x02)                      // 2 local groups
-		b = append(b, byte(numI32Locals), 0x7F)  // 6 × i32
-		b = append(b, byte(numV128Locals), 0x7B) // N × v128
-	} else {
-		b = append(b, 0x01)                     // 1 local group
-		b = append(b, byte(numI32Locals), 0x7F) // 6 × i32
-	}
-
-	// Local indices for the DFA locals (also used by emitPrefixScan).
+	// Local indices for the DFA locals (also used by emitPrefixScan). The
+	// v128 group is variable-width, so the allocator reserves the tail rather
+	// than the declaration and the constants being kept in step by hand.
 	const (
-		locPtr          = 0
-		locLen          = 1
-		locState        = 2
-		locPos          = 3
-		locAttemptStart = 4
-		locLastAccept   = 5
-		locRevResult    = 6
-		locSimdOrClass  = 7
-		locChunk        = 8
-		locTLo          = 9
-		locTHi          = 10
-		locChunk1       = 11
-		locT1Lo         = 12
-		locT1Hi         = 13
+		locPtr = 0
+		locLen = 1
 	)
+	a := newLocalAlloc(2)
+	locState := a.I32()
+	locPos := a.I32()
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locLastAccept := a.I32()
+	locRevResult := a.I32()
+	locSimdOrClass := a.I32()
+	if int(a.Next()) != numI32Locals+2 {
+		panic("compile: litAnchor i32 allocation drifted from numI32Locals")
+	}
+	a.Reserve(valV128, numV128Locals)
+	const (
+		locChunk  = 8
+		locTLo    = 9
+		locTHi    = 10
+		locChunk1 = 11
+		locT1Lo   = 12
+		locT1Hi   = 13
+	)
+	b = a.EmitDecls(b)
 
 	// The find-from seed. The literal scan, the backward scan and
 	// the forward verify all key off attempt_start, and the backward scan
 	// additionally reads the same global as its floor so it cannot walk left
 	// past the caller's start position.
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 
 	// ── outer control flow ────────────────────────────────────────────────────
 	// block $no_match (depth 1 from inside $lit_outer)
@@ -8479,31 +8480,30 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	}
 
 	const (
-		locPtr          = 0
-		locLen          = 1
-		locAttemptStart = 2
-		locSimdOrClass  = 3
-		locRevResult    = 4
-		locPacked       = 5 // i64
-		locChunk        = 6
-		locTLo          = 7
-		locTHi          = 8
-		locChunk1       = 9
-		locT1Lo         = 10
-		locT1Hi         = 11
+		locPtr = 0
+		locLen = 1
+	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdOrClass := a.I32()
+	locRevResult := a.I32()
+	locPacked := a.I64()
+	if int(a.Next()) != numI32Locals+3 {
+		panic("compile: altLitAnchor i32 allocation drifted from numI32Locals")
+	}
+	a.Reserve(valV128, numV128Locals)
+	const (
+		locChunk  = 6
+		locTLo    = 7
+		locTHi    = 8
+		locChunk1 = 9
+		locT1Lo   = 10
+		locT1Hi   = 11
 	)
 
 	// ── local declarations ────────────────────────────────────────────────
-	if numV128Locals > 0 {
-		b = append(b, 0x03)                      // 3 local groups
-		b = append(b, byte(numI32Locals), 0x7F)  // i32 × numI32Locals
-		b = append(b, 0x01, 0x7E)                // i64 × 1 (packed)
-		b = append(b, byte(numV128Locals), 0x7B) // v128 × numV128Locals
-	} else {
-		b = append(b, 0x02)                     // 2 local groups
-		b = append(b, byte(numI32Locals), 0x7F) // i32 × numI32Locals
-		b = append(b, 0x01, 0x7E)               // i64 × 1 (packed)
-	}
+	b = a.EmitDecls(b)
 
 	// ── outer control flow ────────────────────────────────────────────────
 	// The find-from seed, AFTER the locals declaration above — this
@@ -8514,7 +8514,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	// The dispatcher scans for any branch's literal starting at attempt_start,
 	// and each branch's backward scan reads the same global as its floor, so
 	// neither can look left of the caller's start position.
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $outer
@@ -8705,12 +8705,6 @@ type findBodyParams struct {
 	skipSafeOnDead        bool
 	eofSkipSafe           bool
 }
-
-// findBodyAttemptStartLocal is buildFindBody's scan-start local: the position
-// the next match attempt begins at. It is the local the find-from seed writes
-// and the one prefixScanLocals.AttemptStart names, so the two come from one
-// place and cannot drift apart.
-const findBodyAttemptStartLocal = 4
 
 func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// Destructured once so the body below reads exactly as it did when these
@@ -8926,6 +8920,19 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// never asserted here. If that closure were somehow not reached it stays
 	// ffLegacyNarrow and the wrapper keeps narrowing — wrong-but-safe, rather
 	// than a body and a wrapper that both apply the offset.
+	// buildFindBody's locals are laid out by hand below (i32Count varies with
+	// the pattern, and the v128 and trailing-i32 groups are conditional), so
+	// the allocator is used here only to MINT the scan cursor from the leading
+	// i32 run rather than to emit the declarations. That still removes the
+	// hand-written index: the cursor's position follows from allocating the
+	// two i32s that precede it, and appendLocalGroups asserts i32Count covers
+	// them. attempt_start is the local the seed writes AND the one
+	// prefixScanLocals.AttemptStart names, so the two cannot drift apart.
+	cursorAlloc := newLocalAlloc(2)
+	cursorAlloc.Reserve(valI32, 2)
+	attemptCursor := cursorAlloc.ScanCursor()
+	findBodyAttemptStartLocal := attemptCursor.Local()
+
 	findFrom := ffLegacyNarrow
 	// seedFindFrom writes the find-from position into attempt_start. BOTH of
 	// this function's locals paths must call it exactly once, immediately
@@ -8935,7 +8942,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// acceptance patterns still diverging after the first conversion — all
 	// three have a mandatory literal.
 	seedFindFrom := func(b []byte) []byte {
-		b, findFrom = emitFindFromSeed(b, findBodyAttemptStartLocal)
+		b, findFrom = emitFindFromSeed(b, attemptCursor)
 		return b
 	}
 	appendLocalGroups := func(b []byte, i32Count byte) []byte {
@@ -8952,6 +8959,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		}
 		if trailingI32 > 0 {
 			numGroups++
+		}
+		if i32Count <= findBodyAttemptStartLocal-2 {
+			panic("compile: buildFindBody i32 group does not cover attempt_start")
 		}
 		b = append(b, numGroups, i32Count, 0x7F)
 		if numV128ForScan > 0 {
@@ -11417,21 +11427,21 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) ([]byt
 	var findFrom findFromMode
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locChunk        byte = 4
-		locTLo          byte = 5 // suffix class table
-		locPow2         byte = 6
-		locPrefixTlo    byte = 7
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locChunk := a.V128()
+	locTLo := a.V128() // suffix class table
+	locPow2 := a.V128()
+	locPrefixTlo := a.V128()
 
 	// 2 × i32 + 4 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x02, 0x7F)
-	b = append(b, 0x04, 0x7B)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -12688,23 +12698,23 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findF
 	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locTmp          byte = 4 // word-byte check scratch (only used when anchors present)
-		locChunk        byte = 5 // shared between prefix scan and class verify
-		locTLo          byte = 6
-		locPow2         byte = 7
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locTmp := a.I32()    // word-byte check scratch (only used when anchors present)
+	locChunk := a.V128() // shared between prefix scan and class verify
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// Local declarations: 3 i32 + 3 v128.
 	// locTmp is declared regardless (cheap) so the local indices stay stable
 	// across hasAnchors variants.
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F) // 3 × i32
-	b = append(b, 0x03, 0x7B) // 3 × v128
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start correctly:
 	// emitStartAnchorCheck fails a \A anchor when attempt_start != 0 and
 	// reads input[attempt_start-1] for \b / \B. It was simply never told
@@ -12818,21 +12828,21 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 
 	// out_ptr is param 2, so all locals from the find-body shift by +1.
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locOutPtr       byte = 2
-		locAttemptStart byte = 3
-		locSimdMask     byte = 4
-		locTmp          byte = 5 // word-byte scratch (only used when anchors present)
-		locChunk        byte = 6
-		locTLo          byte = 7
-		locPow2         byte = 8
+		locPtr    byte = 0
+		locLen    byte = 1
+		locOutPtr byte = 2
 	)
+	a := newLocalAlloc(3)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locTmp := a.I32() // word-byte scratch (only used when anchors present)
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// 3 × i32 + 3 × v128 (locTmp declared regardless for stable indices).
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F) // 3 × i32
-	b = append(b, 0x03, 0x7B) // 3 × v128
+	b = a.EmitDecls(b)
 
 	// This body IS the exported groups function
 	// (compiledPattern.anchored), but it SCANS — it is a non-anchored
@@ -12840,7 +12850,7 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 	// groups(from > 0) find the second and later matches instead of the
 	// export's wrapper refusing every nonzero `from`. Slots stay absolute and
 	// left context is real, so \b and ^ judge the actual preceding byte.
-	b, _ = emitFindFromSeed(b, locAttemptStart)
+	b, _ = emitFindFromSeed(b, attemptCursor)
 
 	k := int32(len(lcp.literal))
 	total := k + int32(lcp.count)
@@ -12944,22 +12954,22 @@ func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCapture
 	var b []byte
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locOutPtr       byte = 2
-		locAttemptStart byte = 3
-		locSimdMask     byte = 4
-		locMatchLen     byte = 5
-		locTmp          byte = 6
-		locChunk        byte = 7
-		locTLo          byte = 8
-		locPow2         byte = 9
+		locPtr    byte = 0
+		locLen    byte = 1
+		locOutPtr byte = 2
 	)
+	a := newLocalAlloc(3)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locMatchLen := a.I32()
+	locTmp := a.I32()
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// 4 × i32 + 3 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x04, 0x7F)
-	b = append(b, 0x03, 0x7B)
+	b = a.EmitDecls(b)
 
 	// This body IS the exported groups function
 	// (compiledPattern.anchored), but it SCANS — it is a non-anchored
@@ -12967,7 +12977,7 @@ func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCapture
 	// groups(from > 0) find the second and later matches instead of the
 	// export's wrapper refusing every nonzero `from`. Slots stay absolute and
 	// left context is real, so \b and ^ judge the actual preceding byte.
-	b, _ = emitFindFromSeed(b, locAttemptStart)
+	b, _ = emitFindFromSeed(b, attemptCursor)
 
 	k := int32(len(lcp.literal))
 	countMin := int32(lcp.count)
@@ -13274,21 +13284,21 @@ func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, 
 	var findFrom findFromMode
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locMatchLen     byte = 4
-		locChunk        byte = 5
-		locTLo          byte = 6
-		locPow2         byte = 7
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locMatchLen := a.I32()
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// 3 × i32 + 3 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F)
-	b = append(b, 0x03, 0x7B)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -13713,30 +13723,29 @@ func buildLitChainAltDataSegments(altp *litChainAltPattern, l litChainAltLayout)
 //	9  verifyPow2     (v128) — SIMD verify (loaded once)
 func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locScalarIdx    byte = 4
-		locChunk        byte = 5
-		locTeddyLo      byte = 6
-		locTeddyHi      byte = 7
-		locTeddyT1Lo    byte = 8
-		locTeddyT1Hi    byte = 9
-		// locVerifyTlo doubles as locTeddyChunk1 during scan (different phases).
-		locVerifyTlo   byte = 10
-		locTeddyChunk1 byte = 10
-		locVerifyPow2  byte = 11
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locScalarIdx := a.I32()
+	locChunk := a.V128()
+	locTeddyLo := a.V128()
+	locTeddyHi := a.V128()
+	locTeddyT1Lo := a.V128()
+	locTeddyT1Hi := a.V128()
+	// locVerifyTlo doubles as locTeddyChunk1 during scan (different phases).
+	locVerifyTlo := a.V128()
+	locTeddyChunk1 := locVerifyTlo
+	locVerifyPow2 := a.V128()
 
 	var b []byte
 	var findFrom findFromMode
 
-	// Local declarations: 3 i32 + 7 v128 (T0/T1 Teddy + chunk + chunk1/verifyTlo + verifyPow2).
-	b = append(b, 0x02)       // 2 local groups
-	b = append(b, 0x03, 0x7F) // 3 × i32
-	b = append(b, 0x07, 0x7B) // 7 × v128
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -13826,28 +13835,28 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 	l litChainAltLayout, tableMemIdx int) []byte {
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locOutPtr       byte = 2
-		locAttemptStart byte = 3
-		locSimdMask     byte = 4
-		locScalarIdx    byte = 5
-		locChunk        byte = 6
-		locTeddyLo      byte = 7
-		locTeddyHi      byte = 8
-		locTeddyT1Lo    byte = 9
-		locTeddyT1Hi    byte = 10
-		locVerifyTlo    byte = 11
-		locTeddyChunk1  byte = 11 // alias: doubles as Chunk1 during scan
-		locVerifyPow2   byte = 12
+		locPtr    byte = 0
+		locLen    byte = 1
+		locOutPtr byte = 2
 	)
+	a := newLocalAlloc(3)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locScalarIdx := a.I32()
+	locChunk := a.V128()
+	locTeddyLo := a.V128()
+	locTeddyHi := a.V128()
+	locTeddyT1Lo := a.V128()
+	locTeddyT1Hi := a.V128()
+	locVerifyTlo := a.V128()
+	locTeddyChunk1 := locVerifyTlo // alias: doubles as Chunk1 during scan
+	locVerifyPow2 := a.V128()
 
 	var b []byte
 
 	// 3 i32 + 7 v128.
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F)
-	b = append(b, 0x07, 0x7B)
+	b = a.EmitDecls(b)
 
 	// This body IS the exported groups function
 	// (compiledPattern.anchored), but it SCANS — it is a non-anchored
@@ -13855,7 +13864,7 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 	// groups(from > 0) find the second and later matches instead of the
 	// export's wrapper refusing every nonzero `from`. Slots stay absolute and
 	// left context is real, so \b and ^ judge the actual preceding byte.
-	b, _ = emitFindFromSeed(b, locAttemptStart)
+	b, _ = emitFindFromSeed(b, attemptCursor)
 
 	// Hoist pow2 outside the scan loop (Cranelift JIT workaround).
 	b = emitV128Const(b, pow2VecConst)
@@ -13944,27 +13953,27 @@ func appendLitChainAltFindGroupsCodeEntry(cs []byte, altp *litChainAltPattern,
 // (ptr,len) → i64. Per-branch dispatch uses emitLitChainAltLitBranchBodyPrefixed.
 func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locScalarIdx    byte = 4
-		locChunk        byte = 5
-		locTeddyLo      byte = 6
-		locTeddyHi      byte = 7
-		locTeddyT1Lo    byte = 8
-		locTeddyT1Hi    byte = 9
-		locVerifyTlo    byte = 10
-		locTeddyChunk1  byte = 10
-		locVerifyPow2   byte = 11
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locScalarIdx := a.I32()
+	locChunk := a.V128()
+	locTeddyLo := a.V128()
+	locTeddyHi := a.V128()
+	locTeddyT1Lo := a.V128()
+	locTeddyT1Hi := a.V128()
+	locVerifyTlo := a.V128()
+	locTeddyChunk1 := locVerifyTlo
+	locVerifyPow2 := a.V128()
 
 	var b []byte
 	var findFrom findFromMode
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F)
-	b = append(b, 0x07, 0x7B)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -14052,29 +14061,29 @@ func appendLitChainAltPrefixedFindCodeEntry(cs []byte, altp *litChainAltPattern,
 // otherwise. Signature: (ptr,len) → i64.
 func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locScalarIdx    byte = 4
-		locMatchLen     byte = 5
-		locTmp          byte = 6
-		locChunk        byte = 7
-		locTeddyLo      byte = 8
-		locTeddyHi      byte = 9
-		locTeddyT1Lo    byte = 10
-		locTeddyT1Hi    byte = 11
-		locVerifyTlo    byte = 12
-		locTeddyChunk1  byte = 12 // alias: doubles as Chunk1 during scan
-		locVerifyPow2   byte = 13
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locScalarIdx := a.I32()
+	locMatchLen := a.I32()
+	locTmp := a.I32()
+	locChunk := a.V128()
+	locTeddyLo := a.V128()
+	locTeddyHi := a.V128()
+	locTeddyT1Lo := a.V128()
+	locTeddyT1Hi := a.V128()
+	locVerifyTlo := a.V128()
+	locTeddyChunk1 := locVerifyTlo // alias: doubles as Chunk1 during scan
+	locVerifyPow2 := a.V128()
 
 	var b []byte
 	var findFrom findFromMode
-	b = append(b, 0x02)
-	b = append(b, 0x05, 0x7F)
-	b = append(b, 0x07, 0x7B)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -14551,42 +14560,46 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 // separate per-branch DFA-verify cost (see that fix a few lines below).
 func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locMask         byte = 3 // persistent SIMD candidate bitmask for the current 16-byte window
-		locScalarIdx    byte = 4
-		locDFAState     byte = 5
-		locDFAPos       byte = 6
-		locDFAClass     byte = 7
-		locDFAOutEnd    byte = 8
-		locChunk        byte = 9
-		locVerifyTlo    byte = 12
-		locVerifyPow2   byte = 13
-		locWindowBase   byte = 14 // base of the currently-loaded 16-byte SIMD window
-		// locScalarByte is a same-iteration byte-value scratch for
-		// emitScalarBitmapVerify. It must NOT alias locMask: unlike the
-		// strict path (buildLitChainAltFindBody), where a failed branch
-		// verify loops back to a fresh emitPrefixScan that recomputes the
-		// mask from scratch, this lenient path persists locMask across
-		// $lit_outer iterations (the whole point of the window-scan
-		// optimisation above) — a branch verify that fails must leave
-		// locMask untouched so the next iteration can resume from it.
-		locScalarByte byte = 15
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	// attempt_start is DERIVED here — the window loop computes it as
+	// windowBase + ctz(mask) and the scalar tail assigns it from windowBase —
+	// so it is an ordinary local. The cursor is the window base below.
+	locAttemptStart := a.I32()
+	locMask := a.I32() // persistent SIMD candidate bitmask for the current 16-byte window
+	locScalarIdx := a.I32()
+	locDFAState := a.I32()
+	locDFAPos := a.I32()
+	locDFAClass := a.I32()
+	locDFAOutEnd := a.I32()
+	locChunk := a.V128()
+	// Two v128 slots that used to hold pre-loaded Teddy tables. Reserved, not
+	// removed: emitShuftiPrefixCheck now inlines its nibble tables as
+	// v128.const, but dropping the slots would renumber every local after them.
+	a.Reserve(valV128, 2)
+	locVerifyTlo := a.V128()
+	locVerifyPow2 := a.V128()
+	// The cursor: base of the currently-loaded 16-byte SIMD window, and the
+	// scalar tail's scan position. Both entry paths start here, which is why
+	// this — not locAttemptStart — is what the find-from offset is seeded into.
+	windowCursor := a.ScanCursor()
+	locWindowBase := windowCursor.Local()
+	// locScalarByte is a same-iteration byte-value scratch for
+	// emitScalarBitmapVerify. It must NOT alias locMask: unlike the
+	// strict path (buildLitChainAltFindBody), where a failed branch
+	// verify loops back to a fresh emitPrefixScan that recomputes the
+	// mask from scratch, this lenient path persists locMask across
+	// $lit_outer iterations (the whole point of the window-scan
+	// optimisation above) — a branch verify that fails must leave
+	// locMask untouched so the next iteration can resume from it.
+	locScalarByte := a.I32()
 
 	var b []byte
 	var findFrom findFromMode
-	// Local declarations: 7 i32 + 5 v128 + 2 i32 (locWindowBase, locScalarByte
-	// — added on top to avoid renumbering the existing i32/v128 groups above).
-	b = append(b, 0x03)       // 3 local groups
-	b = append(b, 0x07, 0x7F) // 7 × i32
-	b = append(b, 0x05, 0x7B) // 5 × v128 (indices 10,11 — formerly Teddy table
-	// locals — are now unused: emitShuftiPrefixCheck below inlines its
-	// nibble tables as v128.const, so no pre-loaded per-call Teddy table is
-	// needed. Left declared to avoid renumbering locVerifyTlo/locVerifyPow2.)
-	b = append(b, 0x02, 0x7F) // 2 × i32 (locWindowBase, locScalarByte)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, windowCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where

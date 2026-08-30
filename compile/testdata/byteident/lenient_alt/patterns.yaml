@@ -1,0 +1,11 @@
+# Lenient alternation find: buildLitChainAltLenientFindBody, the window-scan
+# body that PERSISTS its candidate mask and 16-byte window across $lit_outer
+# iterations (locals: 7 i32 + 5 v128 + 2 i32).
+#
+# That second cursor is why this path needs its own fixture: it is the one find
+# emitter whose scan start is NOT locAttemptStart — attempt_start is derived
+# from the window base — and seeding the wrong one of the two made the exported
+# find ignore its `from` argument entirely while still passing at from == 0.
+regexps:
+  - pattern: 'ERROR[0-9]{3}|WARNING[0-9]{3}'
+    find_func: lenientalt_find
