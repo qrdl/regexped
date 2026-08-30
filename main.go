@@ -118,7 +118,7 @@ Global flags:
   --debug   Enable debug logging (default: warnings only)
 
 Commands:
-  generate  Generate language stubs (Rust/Go/JS/TS/AS) from a config file
+  generate  Generate language stubs (Rust/Go/JS/TS/C/AS) from a config file
   compile   Compile regexp patterns to a standalone WASM module
   merge     Merge WASM modules into a single binary (thin wrapper around wasm-merge)
 

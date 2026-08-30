@@ -9,7 +9,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// TestBatchZeroCapTerminates pins the raw-ABI contract behind SETS_PLAN item 6.
+// TestBatchZeroCapTerminates pins the raw-ABI zero-capacity contract.
 //
 // find_batch returns a packed i64: bits 63..32 are the resume position, or
 // 0xFFFFFFFF when the scan is finished. A caller driving the export directly,
@@ -73,7 +73,7 @@ func TestBatchZeroCapTerminates(t *testing.T) {
 			// there is nowhere to put it.
 			copy(mem.UnsafeData(store)[inBase:], input)
 
-			// Both flavours take the gate array since SETS_PLAN item 11.
+			// Both flavours take the gate array.
 			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), gate, out, int32(0), int32(0), int32(0))
 			if err != nil {
 				t.Fatalf("set_find_batch: %v", err)

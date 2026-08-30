@@ -177,6 +177,15 @@ func appendTableVLoad(b []byte, tableMemIdx int) []byte {
 	return append(b, 0x00)
 }
 
+// appendTableLoad64 emits i64.load align=3 offset=0.
+// tableMemIdx 0: 0x29 0x03 0x00. tableMemIdx 1: 0x29 0x43 0x01 0x00.
+func appendTableLoad64(b []byte, tableMemIdx int) []byte {
+	if tableMemIdx == 0 {
+		return append(b, 0x29, 0x03, 0x00)
+	}
+	return append(b, 0x29, 0x43, byte(tableMemIdx), 0x00)
+}
+
 // appendTableStore32 emits i32.store align=2 for a stack/table write at the given offset.
 // tableMemIdx 0: 0x36 0x02 {offset}. tableMemIdx 1: 0x36 0x42 0x01 {offset}
 // (memidx emitted as LEB128 — see appendTableLoad8u).
@@ -194,7 +203,7 @@ func appendTableStore32(b []byte, tableMemIdx int, offset uint32) []byte {
 // tableMemIdx 0: 0x3A 0x00 0x00. tableMemIdx 1: 0x3A 0x40 0x01 0x00
 // (memidx emitted as LEB128 — see appendTableLoad8u).
 // appendTableStore16 emits i32.store16 against the table memory. Alignment 1,
-// matching appendTableLoad16u: the sparse accept lists (SETS §23, G17) are
+// matching appendTableLoad16u: the sparse accept lists are
 // packed u16 arrays with no padding, so a 2-byte-aligned encoding would be a
 // lie the validator does not check but a host may.
 func appendTableStore16(b []byte, tableMemIdx int) []byte {

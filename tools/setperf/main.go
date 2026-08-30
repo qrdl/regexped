@@ -69,7 +69,7 @@ const (
 	//
 	// Our side times one Go→wasmtime Func.Call per sample; theirs loops
 	// `iters` times INSIDE WASM and reports per-iteration nanoseconds. That
-	// call costs ~4-7 us (measured independently in §10.5), which is fixed
+	// call costs ~4-7 us (measured independently), which is fixed
 	// per row. Every anchored row spends 52-58 WASM instructions — work that
 	// cannot take 4 us — and duly printed "~0.02x", reading as a 50x loss on
 	// capabilities where we are in fact spending almost nothing.
@@ -84,12 +84,12 @@ const (
 	// overlappingTimedCap bounds the INPUT for the timed find(overlapping)
 	// row only.
 	//
-	// That body is the deliberate every-start-position enumeration of §7.10,
+	// That body is the deliberate every-start-position enumeration,
 	// so on a set with no mandatory literal it is O(n^2): greedy-3 over 50,000
 	// 'a's is ~1.25 BILLION DFA steps for ONE exhaustion, and measureTime
 	// wants benchIters of them. The default matrix therefore could not be run
-	// to completion — which is the mechanical reason §9.9's cross-engine
-	// numbers went unrecorded for the whole project (§13 F4/F5).
+	// to completion — which is the mechanical reason the cross-engine
+	// numbers went unrecorded for the whole project.
 	//
 	// Only the timed path is bounded. Fuel rows keep the full input: they do
 	// one exhaustion, which completes, and bounding them would silently
@@ -103,7 +103,7 @@ const (
 	// shortened input (see overlappingTimedCap). benchIters samples of a row
 	// this expensive is minutes to hours of wall time.
 	//
-	// §13 F4 blamed the unrunnable matrix on find(overlapping) alone. That was
+	// An earlier note blamed the unrunnable matrix on find(overlapping) alone. That was
 	// the row it happened to be killed in; measuring showed the property is
 	// not specific to that capability but to "must visit every start position
 	// on a set with no mandatory literal", which on greedy-3 over 50,000 'a's
@@ -119,7 +119,7 @@ const (
 
 // capability names the exports, in a fixed order.
 //
-// `match` and `scan` are gone: TODO task 59 decision (2) retired them, since
+// `match` and `scan` are gone: retired them, since
 // `match_any(...) >= 0` and `scan_any(...) >= 0` are exactly what they
 // returned.
 type capability string
@@ -130,7 +130,7 @@ const (
 	capScanAny  capability = "scan_any"
 	capScanAll  capability = "scan_all"
 	capFind     capability = "find"
-	// capFindBatch is §19's multi-position find, now requested with
+	// capFindBatch is the multi-position find, now requested with
 	// `hints: [batch-find]` rather than declared (decision (11)). It is the row that makes the
 	// `find` comparison an honest one: ra_bench_find_gated runs its WHOLE
 	// enumeration inside ONE wasm call, while our `find` crosses the host
@@ -142,7 +142,7 @@ const (
 	// express — so it is measured but never compared.
 	capFindOverlapping capability = "find(overlapping)"
 	// capFindBatchOverlapping is the batching entry of an overlapping set.
-	// Added while investigating SETS_PLAN item 11 stage B and KEPT after that
+	// Added while investigating a batching sweep and KEPT after that
 	// stage was reverted: before this row, overlapping sets were measured
 	// through the lazy `find` alone, so the batching entry — the one a stub
 	// user actually gets under `hints: [batch-find]` — had no number at all.
@@ -179,7 +179,7 @@ func exportName(c capability) string {
 }
 
 // raPairing names the regex-automata export a capability is compared against,
-// or "" when the pairing would be dishonest (§9.9's table).
+// or "" when the pairing would be dishonest.
 func raPairing(c capability) string {
 	switch c {
 	case capScanAny:
@@ -212,8 +212,7 @@ func raPairing(c capability) string {
 // comment on capFindBatch calls that pairing "the fair one", because there
 // both sides make O(matches/buffer) host crossings. Bare `find` is the same
 // pairing with our side making one crossing PER MATCH and theirs making one in
-// total, so its ratio was never an engine comparison (SETS_PLAN item 22 task
-// 1). The FUEL ratio is unaffected and stays printed: a Go->wasmtime call
+// total, so its ratio was never an engine comparison. The FUEL ratio is unaffected and stays printed: a Go->wasmtime call
 // executes no wasm instructions, so that column has no crossing term to
 // distort.
 //
@@ -221,7 +220,15 @@ func raPairing(c capability) string {
 // Batching is built (item 19) and closes the gap on the same rows, and for
 // C/Go/Rust/AS there are no crossings at all — wasm-merge makes a stub call
 // intra-module, which is why TestSetBatchFindIsJSTSOnly pins batching as
-// JS/TS-only. This row models un-hinted JS/TS and nothing else.
+// JS/TS-only.
+//
+// One caveat on the row itself: compileCase always sets `hints: [batch-find]`,
+// so what this measures is the BATCHING set's `find` — the forwarding wrapper
+// over the shared per-position worker (decision (11a)) — not a hint-less
+// module's own bucket code. The two differ by one call per position. Measuring
+// a hint-less module instead would be the truer model of un-hinted JS/TS, but
+// it changes every `find` fuel and size value and so forces a rebaseline of
+// files that are gitignored and unrecoverable; that is the owner's call.
 func timedRatioIsAPIShape(c capability) bool {
 	return c == capFind
 }
@@ -321,7 +328,7 @@ func buildMatrix() []setCase {
 			setCase{fmt.Sprintf("keywords-%d", n), pats, corpusDense(pats), "dense 100KB"},
 		)
 	}
-	// A literal-anchored set, the shape §9.8 wants the "~1x from gating"
+	// A literal-anchored set, the shape that wants the "~1x from gating"
 	// claim measured on.
 	secrets := []string{
 		`AKIA[A-Z0-9]{16}`,
@@ -339,7 +346,7 @@ func buildMatrix() []setCase {
 	// compare chain to Shufti cut this shape's scan fuel by 28% and moved
 	// not one of the 146 committed rows. Prefix sharing
 	// is also what decides AC's node count, so this is the shape that governs
-	// the table budget too (§14.1, sharpening 1).
+	// the table budget too.
 	diverse := make([]string, 32)
 	for i := range diverse {
 		diverse[i] = fmt.Sprintf("%cQ%03d[0-9a-z]{3}", "abcdefghijklmnopqrstuvwxyz0123456789"[i%36], i)
@@ -365,7 +372,7 @@ func buildMatrix() []setCase {
 	)
 	// Sets whose patterns all share ONE mandatory literal — the WAF shape, and
 	// the only one here that exercises multi-bucket dispatch behind a single
-	// literal (SETS §23.5). Every other set has distinct literals, so it gets
+	// literal. Every other set has distinct literals, so it gets
 	// one bucket per literal and the bucket-count factor G17 attacks never
 	// appears at all.
 	//
@@ -379,7 +386,7 @@ func buildMatrix() []setCase {
 	// `unionkw000` would give each pattern its own literal AND its own bucket.
 	// Verified: 128 distinct patterns, one literal `union`, four buckets of 32.
 	//
-	// The DENSE corpus is the load-bearing one (§23.1): per-candidate cost only
+	// The DENSE corpus is the load-bearing one: per-candidate cost only
 	// exists where the literal actually hits, and the no-match row is expected
 	// to stay flat between the two sizes for exactly that reason.
 	sharedLitPatterns := func(n int) []string {
@@ -435,10 +442,17 @@ func buildMatrix() []setCase {
 		// walks to it. One ERROR at the far end of newline-free filler makes
 		// that walk as long as it gets. This is the one row that isolates
 		// "never-dying and PRESENT" from "never-dying and absent", and it is
-		// over the 4e9 budget today — the open half of SETS_PLAN item 11,
+		// over the 4e9 budget today — still open,
 		// which stage B was built for and failed to close.
 		setCase{"greedy-3", greedy, corpusNoMatch()[:100*1024-5] + "ERROR", "late ERROR 100KB"},
 		setCase{"greedy-3", greedy, strings.Repeat("a", 50000), "50K a's"},
+		// MISLABELLED, deliberately left as-is: corpusNoMatch's filler
+		// contains "a" and "y", which `a+` and `x?y` match ~1,830 times each
+		// per 100 KB, so this row is match-dense. Renaming it (or stripping
+		// those letters from the filler) changes the baseline KEY, and
+		// baseline_fuel.txt / baseline_size.txt are gitignored and therefore
+		// unrecoverable — so the correction is the owner's to make, together
+		// with the rebaseline it forces. See corpusNoMatch's doc comment.
 		setCase{"greedy-3", greedy, corpusNoMatch(), "no-match 100KB"},
 	)
 	return out
@@ -452,7 +466,16 @@ func keywordPatterns(n int) []string {
 	return pats
 }
 
-// corpusNoMatch is 100KB of filler none of the patterns can match.
+// corpusNoMatch is 100KB of filler none of the LITERAL-BEARING patterns can
+// match.
+//
+// The name is a promise it can only keep for a set whose patterns carry a
+// mandatory literal. greedy-3 is the exception: its `a+` matches the "a" in
+// "lazy", its `x?y` matches every "y", and there are ~1,830 of each per 100 KB
+// — so the rows labelled "no-match 100KB" for that family are MATCH-DENSE.
+// Their measurements are self-consistent and the board's numbers stand; the
+// LABEL is what was wrong, and it is what makes the "gating has the most to
+// recover" rows read as a bigger claim than they are.
 func corpusNoMatch() string {
 	var b strings.Builder
 	line := "the quick brown fox jumps over the lazy dog 0123456789 "
@@ -498,7 +521,20 @@ func sampleNeedles(pats []string, k int) []string {
 	out := make([]string, 0, k)
 	for i := 0; i < k; i++ {
 		switch p := pats[i]; {
+		case strings.HasPrefix(p, "kw") && strings.Contains(p, "(?:alpha|beta|gamma)"):
+			// sharedsuffix: `kw%03d(?:alpha|beta|gamma)`. It shares the "kw"
+			// prefix with the keywords-* family, so it used to take the arm
+			// below and get the needle `kw000abc` — which does not match, so
+			// its "sparse" corpus was a second no-match corpus and the ONLY
+			// shape in the matrix that builds a suffix TABLE never had its
+			// successful-match path measured at all.
+			out = append(out, p[:5]+"alpha")
 		case strings.HasPrefix(p, "kw"):
+			out = append(out, p[:5]+"abc")
+		case len(p) > 2 && p[1] == 'Q' && strings.Contains(p, "[0-9a-z]{3}"):
+			// diverse: `%cQ%03d[0-9a-z]{3}` — no arm matched it at all, so it
+			// fell through to the default "xy" and its "sparse" corpus matched
+			// nothing either.
 			out = append(out, p[:5]+"abc")
 		case strings.HasPrefix(p, "AKIA"):
 			out = append(out, "AKIAIOSFODNN7EXAMPLE")
@@ -519,7 +555,7 @@ func sampleNeedles(pats []string, k int) []string {
 			// Before this arm existed the patterns fell through to the default
 			// needle "xy" — which contains no digit, so classchain's "dense"
 			// corpus matched NOTHING and its dense rows were a second no-match
-			// corpus with different byte statistics (SETS_PLAN item 21,
+			// corpus with different byte statistics (see the notes above,
 			// instrument fix; the tell was dense fuel == no-match fuel to the
 			// digit).
 			var a, b int
@@ -530,7 +566,15 @@ func sampleNeedles(pats []string, k int) []string {
 		case strings.Contains(p, "ERROR"):
 			out = append(out, "ERROR")
 		default:
-			out = append(out, "xy")
+			// A HARD ERROR, not a fallback. Three separate incidents —
+			// classchain, sharedsuffix and diverse
+			// — were all the same cause: a pattern shape
+			// with no arm silently got a needle that does not match, turning
+			// its "dense"/"sparse" corpus into a second no-match corpus under
+			// a wrong label. A benchmark measuring the wrong thing quietly is
+			// worse than one that refuses to run.
+			fmt.Fprintf(os.Stderr, "sampleNeedles: no needle arm for pattern %q — add one\n", p)
+			os.Exit(1)
 		}
 	}
 	return out
@@ -573,7 +617,7 @@ type rxInstance struct {
 	gatePtr  int32
 	bitmapPt int32
 	batchPtr int32
-	// cachePtr/cacheLen are the OVERLAPPING answer cache (SETS_PLAN item 11
+	// cachePtr/cacheLen are the OVERLAPPING answer cache (see the
 	// stage C). Offered only to the overlapping batch entry, which is what a
 	// generated JS/TS iterator does: every other capability is handed 0, 0
 	// and takes the ordinary per-position walk.
@@ -675,12 +719,12 @@ func (r *rxInstance) zeroBitmap() {
 }
 
 // call runs one whole-input operation for the given capability, exactly as a
-// caller would: the `_all` pair once, the boolean and `_any` pair once, and
-// `find` driven to exhaustion.
-// call runs one whole-input operation and returns how many Go→wasmtime
-// crossings it took. The count is what lets measureTime subtract the harness
-// boundary cost: every crossing carries a fixed ~4 us that has nothing to do
-// with the engine, and `find` pays one per match.
+// caller would — the `_all` pair once, the `_any` pair once, `find` driven to
+// exhaustion — and returns how many Go→wasmtime crossings that took.
+//
+// The count is what lets measureTime subtract the harness boundary cost: every
+// crossing carries a fixed ~4 us that has nothing to do with the engine, and
+// `find` pays one per match.
 func (r *rxInstance) call(c capability, wide bool) (int, error) {
 	fn := r.fnFor(c)
 	if fn == nil {
@@ -737,7 +781,7 @@ func isFuelExhausted(err error) bool {
 
 // exhaustFind drives `find` to exhaustion the way a generated iterator does.
 func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
-	// Zeroed for BOTH flavours: since SETS_PLAN item 11 the overlapping body
+	// Zeroed for BOTH flavours: the overlapping body
 	// takes the array too, not for match gates but as the per-drive home of
 	// its preflight verdict, and zeroing it is what declares a fresh drive.
 	// Doing it once here rather than per call is the point of the change —
@@ -805,6 +849,11 @@ func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error
 		if uint32(packed>>32) == 0xFFFFFFFF {
 			return calls, nil
 		}
+		// A cursor that does not advance is a hang, not a slow row, and this
+		// loop has no other bound.
+		if packed == cursor {
+			return calls, fmt.Errorf("find_batch returned its own cursor %#016x unchanged after %d calls", uint64(cursor), calls)
+		}
 		cursor = packed
 	}
 }
@@ -830,17 +879,31 @@ func measureFuelRow(c setCase) []row {
 		overlapping := cap == capFindOverlapping || cap == capFindBatchOverlapping
 		wasm, err := compileCase(c, overlapping)
 		if err != nil {
-			continue
+			// A HARD error, matching the call-error policy below: silently
+			// dropping the row removed it from the board AND from the
+			// baseline gate, so a regression that made a set fail to compile
+			// printed "All fuel baselines match exactly."
+			fmt.Fprintf(os.Stderr, "HARNESS ERROR %s: compile: %v\n", rowKey(c, cap), err)
+			os.Exit(1)
 		}
 		r, err := newRxInstance(engine, wasm, c, true)
 		if err != nil {
-			continue
+			fmt.Fprintf(os.Stderr, "HARNESS ERROR %s: instantiate: %v\n", rowKey(c, cap), err)
+			os.Exit(1)
 		}
 		wide := r.npat > 64
-		// Warm-up call, uncounted: the first call pays lazy compilation.
+		// Warm-up call, uncounted: the first call pays lazy compilation — and
+		// it runs on a RE-ARMED budget, so a case whose warm-up is itself
+		// expensive cannot leave the measured call starting from a partly
+		// spent one.
+		if err := r.store.SetFuel(fuelBudget); err != nil {
+			fmt.Fprintf(os.Stderr, "HARNESS ERROR %s: SetFuel: %v\n", rowKey(c, cap), err)
+			os.Exit(1)
+		}
 		_, _ = r.call(cap, wide)
 		if err := r.store.SetFuel(fuelBudget); err != nil {
-			continue
+			fmt.Fprintf(os.Stderr, "HARNESS ERROR %s: SetFuel: %v\n", rowKey(c, cap), err)
+			os.Exit(1)
 		}
 		before, _ := r.store.GetFuel()
 		if _, err := r.call(cap, wide); err != nil {
@@ -1113,6 +1176,12 @@ func (h *raHarness) fuelOf(cap capability, inputLen int32) (fuel uint64, truncat
 		return 0, false, fmt.Errorf("harness missing %s", name)
 	}
 	args := raFuelArgs(cap, inputLen)
+	// The WARM-UP gets its own budget. It used to run on whatever the previous
+	// capability had left, so an expensive earlier row could make this one
+	// report fuelExhausted for a call that fits the budget comfortably.
+	if err := h.store.SetFuel(fuelBudget); err != nil {
+		return 0, false, err
+	}
 	if _, err := fn.Call(h.store, args...); err != nil {
 		if isFuelExhausted(err) {
 			return fuelExhausted, false, nil
@@ -1143,7 +1212,7 @@ func (h *raHarness) fuelOf(cap capability, inputLen int32) (fuel uint64, truncat
 // benchLazyFind drives ra_find_next ONE MATCH PER CALL from Go and times the
 // whole drive here, in the host — the mirror image of measureTime on our side.
 //
-// SETS_PLAN item 22 task 2. Every other pairing in this file times the Rust
+// Every other pairing in this file times the Rust
 // side INSIDE wasm, which is right for a bulk entry point and wrong for a lazy
 // one: our bare `find` returns to the host at every matching position, so the
 // only fair comparison is one where their driver crosses the boundary just as
@@ -1151,7 +1220,7 @@ func (h *raHarness) fuelOf(cap capability, inputLen int32) (fuel uint64, truncat
 // BOTH carry N crossings, which is the point, so subtracting them would
 // remove the very term being compared.
 //
-// The resume rule is our §4.8 rule, so the two drives visit the same
+// The resume rule is the same one our engine uses, so the two drives visit the same
 // positions: continue at start+1, and stop when the scan reports nothing.
 // Returns the p50 of the whole drive plus the call count that produced it.
 func (h *raHarness) benchLazyFind(inputLen int) (time.Duration, int, error) {
@@ -1228,7 +1297,13 @@ func (h *raHarness) bench(name string, inputLen int) (time.Duration, error) {
 // Output.
 
 func harnessPath() string {
-	dir, _ := os.Getwd()
+	dir, err := os.Getwd()
+	if err != nil {
+		// Swallowed, this produced a path relative to nothing and a
+		// "cannot read the harness" message blaming the build.
+		fmt.Fprintf(os.Stderr, "cannot determine the working directory: %v\n", err)
+		os.Exit(1)
+	}
 	return filepath.Join(dir, "..", "perftest", "regex_bench", "target", "wasm32-wasip1", "release", "regex_bench.wasm")
 }
 
@@ -1265,7 +1340,7 @@ func runFullMatrix(cases []setCase) {
 	fmt.Println("things: fuel says who does less work, time says whose work the CPU likes.")
 	fmt.Println()
 	fmt.Println("BOTH SIDES ARE WASM: regex-automata is built for wasm32-wasip1 and runs in the")
-	fmt.Println("same wasmtime engine. What differs is where the clock sits (§17.5). Our sample")
+	fmt.Println("same wasmtime engine. What differs is where the clock sits. Our sample")
 	fmt.Println("brackets a Go→wasmtime call; the Rust harness times itself INSIDE wasm. So our")
 	fmt.Println("raw p50 carries one crossing per call — and `find` makes one call per match.")
 	fmt.Println("`our engine` subtracts calls × the measured crossing cost for that arity, and")
@@ -1383,7 +1458,7 @@ func runFullMatrix(cases []setCase) {
 			case capped:
 				ratio = "input differs"
 			case timedRatioIsAPIShape(cap):
-				// SETS_PLAN item 22 task 1. This row compares OUR LAZY API
+				// This row compares OUR LAZY API
 				// against THEIR BULK ENUMERATION and cannot be made fair by
 				// correcting for the crossing: we return to the host once per
 				// matching position (3,659 calls on a dense 100 KB corpus)
@@ -1426,7 +1501,7 @@ func runFullMatrix(cases []setCase) {
 				cap, f, tf, fx, fmtDur(ours), calls, fmtDur(ourEng), fmtDur(theirs), ratio, note)
 
 			// The LAZY pairing, printed beside the bulk one because the two
-			// answer different questions (item 22 task 2). Here both sides
+			// answer different questions. Here both sides
 			// resume per match and pay N host crossings, so neither number is
 			// crossing-corrected and the ratio is over the RAW p50s — the
 			// crossings are the term under comparison, not an artefact to
@@ -1551,7 +1626,7 @@ func runFuelCross(cases []setCase) {
 				note = fmt.Sprintf("one side exceeded the %s budget", fmtFuel(fuelBudget))
 			}
 			// `find` COUNTS here, unlike in the timed matrix where item 22
-			// task 1 withholds its ratio as "api-shape". The distinction is
+			// the bare-find row withholds its ratio as "api-shape". The distinction is
 			// the whole reason this column exists: a Go->wasmtime call
 			// executes no wasm instructions, so the crossings that make the
 			// timed row a comparison of API shapes leave this one untouched.
@@ -1617,8 +1692,14 @@ func runCompare(path string, cases []setCase, measure func(setCase) []row, unit 
 		base[key] = v
 	}
 	bad := 0
+	// Rows that VANISH are the other half of the gate. runCompare iterates the
+	// rows it measured, so a regression that made a set fail to compile
+	// removed its rows entirely and the run printed "All fuel baselines match
+	// exactly." over a board that had lost them.
+	visited := map[string]bool{}
 	for _, c := range cases {
 		for _, r := range measure(c) {
+			visited[r.key] = true
 			want, ok := base[r.key]
 			if !ok {
 				if r.value == fuelExhausted {
@@ -1652,6 +1733,18 @@ func runCompare(path string, cases []setCase, measure func(setCase) []row, unit 
 			}
 		}
 	}
+	var missing []string
+	for key := range base {
+		if !visited[key] {
+			missing = append(missing, key)
+		}
+	}
+	sort.Strings(missing)
+	for _, key := range missing {
+		fmt.Fprintf(os.Stderr, "MISSING %s: the baseline has this row and this run produced none (baseline=%d %s)\n",
+			key, base[key], unit)
+		bad++
+	}
 	if bad > 0 {
 		return 1
 	}
@@ -1660,11 +1753,11 @@ func runCompare(path string, cases []setCase, measure func(setCase) []row, unit 
 }
 
 // --------------------------------------------------------------------------
-// Cross-engine correctness (§9.9's secondary mode).
+// Cross-engine correctness (the secondary mode).
 //
 // On the pairings marked honest, running both engines over the same inputs
 // yields a THIRD independent implementation to check against — strengthening
-// the §9.6.1 story for multi-pattern interleaving, which Go's FindAllIndex
+// the union-oracle story for multi-pattern interleaving, which Go's FindAllIndex
 // union covers by construction rather than by an independent engine. It is a
 // separate mode from the perf path so a semantic mismatch can never quietly
 // corrupt the numbers.
@@ -1685,13 +1778,13 @@ func runVerify(cases []setCase) int {
 		}
 		wasm, err := compileCase(c, false)
 		if err != nil {
-			fmt.Printf("SKIP %s/%s: compile: %v\n", c.name, c.inputLbl, err)
-			continue
+			fmt.Fprintf(os.Stderr, "HARNESS ERROR %s/%s: compile: %v\n", c.name, c.inputLbl, err)
+			os.Exit(1)
 		}
 		r, err := newRxInstance(engine, wasm, c, false)
 		if err != nil {
-			fmt.Printf("SKIP %s/%s: instantiate: %v\n", c.name, c.inputLbl, err)
-			continue
+			fmt.Fprintf(os.Stderr, "HARNESS ERROR %s/%s: instantiate: %v\n", c.name, c.inputLbl, err)
+			os.Exit(1)
 		}
 		wide := r.npat > 64
 
@@ -1740,7 +1833,7 @@ func runVerify(cases []setCase) int {
 			}
 		}
 
-		// scan_any: PRESENCE only. TODO task 59 decision (10) removed the
+		// scan_any: PRESENCE only. removed the
 		// start it used to report, and the id is unspecified when several
 		// patterns match, so agreement on "did anything match" is the whole
 		// contract this tool can check. regex-automata still returns a span,
@@ -1752,12 +1845,32 @@ func runVerify(cases []setCase) int {
 			bad++
 		}
 
-		// scan_all: exact set equality.
-		theirIDs := raAllIDs(ra, "ra_scan_all", int32(len(c.input)), int32(0))
-		ourIDs := rxAllIDs(r, wide, "cap_scan_all", r.inLen, int32(0))
-		if !sameIDs(theirIDs, ourIDs) {
-			fmt.Printf("MISMATCH %s/%s scan_all: ours=%v theirs=%v\n", c.name, c.inputLbl, ourIDs, theirIDs)
-			bad++
+		// scan_all: exact set equality. Driven at several `from` values, not
+		// only 0 — `from` is the one parameter the scan pair takes, and
+		// checking it at 0 alone leaves the entry-state rule (which start
+		// state a nonzero `from` enters) unchecked.
+		for _, from := range scanFromValues(len(c.input)) {
+			theirIDs := raAllIDs(ra, "ra_scan_all", int32(len(c.input)), int32(from))
+			ourIDs := rxAllIDs(r, wide, "cap_scan_all", r.inLen, int32(from))
+			if !sameIDs(theirIDs, ourIDs) {
+				fmt.Printf("MISMATCH %s/%s scan_all@from=%d: ours=%v theirs=%v\n", c.name, c.inputLbl, from, ourIDs, theirIDs)
+				bad++
+			}
+			// The id scan_any reports is unspecified, but it must NAME A
+			// PATTERN THAT MATCHES — and scan_all's set at the same `from` is
+			// exactly the set of legal answers. Presence alone let an emitter
+			// return an id belonging to no matching pattern.
+			ourScanAny := rxCallI32(r, "cap_scan_any", r.inBase, r.inLen, int32(from))
+			switch {
+			case ourScanAny < 0 && len(ourIDs) != 0:
+				fmt.Printf("MISMATCH %s/%s scan_any@from=%d: reported no match, but scan_all found %v\n",
+					c.name, c.inputLbl, from, ourIDs)
+				bad++
+			case ourScanAny >= 0 && !containsID(ourIDs, int(ourScanAny)):
+				fmt.Printf("MISMATCH %s/%s scan_any@from=%d: reported id %d, which is not in scan_all's %v\n",
+					c.name, c.inputLbl, from, ourScanAny, ourIDs)
+				bad++
+			}
 		}
 
 		// find (gated, the default body): ra_find_gated is the per-pattern
@@ -1782,13 +1895,21 @@ func runVerify(cases []setCase) int {
 		// suffix functions and must report the identical multiset. The
 		// regex-automata pairing above bounds `find` itself; this one is
 		// internal because there is no pairing for the BATCHED shape, and it
-		// is what exercises §19's split-position resume, since batchCap is
+		// is what exercises the split-position resume, since batchCap is
 		// deliberately not "big enough for one call".
 		ourBatch := rxCollectFindBatch(r)
 		if !sameMatches(ourFind, ourBatch) {
 			fmt.Printf("MISMATCH %s/%s find vs find_batch: find=%d matches, batch=%d\n",
 				c.name, c.inputLbl, len(ourFind), len(ourBatch))
 			bad++
+		}
+
+		// The OVERLAPPING module, which nothing else in --verify builds. It
+		// is the only one whose find_batch reads the answer cache, so the
+		// backward sweep had no correctness check at all — the engine-
+		// independent find-vs-find_batch cross-check is applied to it here.
+		if n := verifyOverlapping(engine, c); n > 0 {
+			bad += n
 		}
 
 		// The anchored hit count is printed, not just tallied: a row where no
@@ -1805,6 +1926,48 @@ func runVerify(cases []setCase) int {
 	return 0
 }
 
+// verifyOverlapping compiles the OVERLAPPING module for one case and holds its
+// `find` against its own `find_batch`.
+//
+// regex-automata has no every-start-position enumeration to compare against,
+// so this is an internal cross-check rather than a cross-engine one — but the
+// two bodies are independent implementations of the same answer, and the batch
+// one is the only consumer of the backward sweep. Without it nothing in
+// --verify ever built an overlapping module.
+func verifyOverlapping(engine *wasmtime.Engine, c setCase) int {
+	wasm, err := compileCase(c, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: compiling the overlapping module for %s/%s: %v\n", c.name, c.inputLbl, err)
+		os.Exit(1)
+	}
+	r, err := newRxInstance(engine, wasm, c, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: instantiating the overlapping module for %s/%s: %v\n", c.name, c.inputLbl, err)
+		os.Exit(1)
+	}
+	ourFind := rxCollectFind(r)
+	ourBatch := rxCollectFindBatch(r)
+	if !sameMatches(ourFind, ourBatch) {
+		fmt.Printf("MISMATCH %s/%s overlapping find vs find_batch: find=%d matches, batch=%d\n",
+			c.name, c.inputLbl, len(ourFind), len(ourBatch))
+		return 1
+	}
+	return 0
+}
+
+// scanFromValues picks the `from` positions the scan pair is verified at: the
+// ends, the middle, and a couple of small offsets that land inside a SIMD
+// block rather than on one.
+func scanFromValues(n int) []int {
+	out := []int{0}
+	for _, v := range []int{1, 17, n / 2, n - 1, n} {
+		if v > 0 && v <= n {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // setTuple is one (pattern id, start, end) triple read back from a find or
 // find_batch buffer.
 type setTuple struct{ id, start, end int32 }
@@ -1813,7 +1976,10 @@ type setTuple struct{ id, start, end int32 }
 func rxCollectFind(r *rxInstance) []setTuple {
 	fn := r.inst.GetFunc(r.store, "cap_find")
 	if fn == nil {
-		return nil
+		// Not `return nil`: two nils compare equal, so a missing export used
+		// to VERIFY CLEAN.
+		fmt.Fprintln(os.Stderr, "HARNESS ERROR: our module has no export \"cap_find\"")
+		os.Exit(1)
 	}
 	buf := r.mem.UnsafeData(r.store)
 	for i := int32(0); i < r.npat*4; i++ {
@@ -1850,16 +2016,21 @@ func rxCollectFind(r *rxInstance) []setTuple {
 func rxCollectFindBatch(r *rxInstance) []setTuple {
 	fn := r.inst.GetFunc(r.store, "cap_find_batch")
 	if fn == nil {
-		return nil
+		fmt.Fprintln(os.Stderr, "HARNESS ERROR: our module has no export \"cap_find_batch\"")
+		os.Exit(1)
 	}
 	buf := r.mem.UnsafeData(r.store)
 	for i := int32(0); i < r.npat*4; i++ {
 		buf[r.gatePtr+i] = 0
 	}
-	// Offered unconditionally here, unlike the fuel drive: --verify's job is
-	// to check the ANSWER against regex-automata, and offering the cache is
-	// what puts the backward sweep under that check. A build that cannot use
-	// it emits no cache path at all and ignores what it is passed.
+	// Offered unconditionally here, unlike the fuel drive.
+	//
+	// NOTE what this does and does not cover. Offering the cache to a GATED
+	// module puts nothing under check: the backward sweep is read only by the
+	// overlapping body, and the gated one ignores the pointer entirely
+	// (compile/set_batch.go). The sweep is exercised by the overlapping
+	// module verifyOverlapping builds below, which is what this comment used
+	// to claim for itself.
 	cachePtr, cacheLen := r.cachePtr, r.cacheLen
 	for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
 		buf[cachePtr+i] = 0
@@ -1920,14 +2091,19 @@ func sameMatches(a, b []setTuple) bool {
 	return true
 }
 
+// raCallI32/raCallI64 abort for the same reason rxCallI32 does: -1 is a legal
+// answer, so folding a broken call into it makes an unusable comparison look
+// like agreement.
 func raCallI32(h *raHarness, name string, args ...interface{}) int32 {
 	fn := h.inst.GetFunc(h.store, name)
 	if fn == nil {
-		return -1
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: the regex-automata harness has no export %q (run 'make harnesses' in ../perftest)\n", name)
+		os.Exit(1)
 	}
 	v, err := fn.Call(h.store, args...)
 	if err != nil {
-		return -1
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling regex-automata %q: %v\n", name, err)
+		os.Exit(1)
 	}
 	return v.(int32)
 }
@@ -1935,23 +2111,33 @@ func raCallI32(h *raHarness, name string, args ...interface{}) int32 {
 func raCallI64(h *raHarness, name string, args ...interface{}) int64 {
 	fn := h.inst.GetFunc(h.store, name)
 	if fn == nil {
-		return -1
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: the regex-automata harness has no export %q (run 'make harnesses' in ../perftest)\n", name)
+		os.Exit(1)
 	}
 	v, err := fn.Call(h.store, args...)
 	if err != nil {
-		return -1
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling regex-automata %q: %v\n", name, err)
+		os.Exit(1)
 	}
 	return v.(int64)
 }
 
+// rxCallI32/rxCallI64 abort the run on a missing export or a failed call.
+//
+// They used to return -1, which is a LEGAL "no match" answer for every `_any`
+// capability — so an ABI drift (an export renamed, a signature grown) verified
+// clean on every no-match row instead of failing. A harness that cannot make
+// the call has not checked anything.
 func rxCallI32(r *rxInstance, name string, args ...interface{}) int32 {
 	fn := r.inst.GetFunc(r.store, name)
 	if fn == nil {
-		return -1
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: our module has no export %q\n", name)
+		os.Exit(1)
 	}
 	v, err := fn.Call(r.store, args...)
 	if err != nil {
-		return -1
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling our %q: %v\n", name, err)
+		os.Exit(1)
 	}
 	return v.(int32)
 }
@@ -1959,11 +2145,13 @@ func rxCallI32(r *rxInstance, name string, args ...interface{}) int32 {
 func rxCallI64(r *rxInstance, name string, args ...interface{}) int64 {
 	fn := r.inst.GetFunc(r.store, name)
 	if fn == nil {
-		return -1
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: our module has no export %q\n", name)
+		os.Exit(1)
 	}
 	v, err := fn.Call(r.store, args...)
 	if err != nil {
-		return -1
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling our %q: %v\n", name, err)
+		os.Exit(1)
 	}
 	return v.(int64)
 }
@@ -1973,6 +2161,13 @@ func rxCallI64(r *rxInstance, name string, args ...interface{}) int64 {
 // (which takes a `from`, passed in extra) or "ra_match_all" (which does not).
 func raAllIDs(h *raHarness, export string, args ...interface{}) []int {
 	n := raCallI32(h, export, args...)
+	if n < 0 {
+		// `make([]int, 0, n)` with a negative capacity PANICS. Cannot happen
+		// now that raCallI32 aborts on a failed call, but the panic was one
+		// arity change away.
+		fmt.Fprintf(os.Stderr, "HARNESS ERROR: regex-automata %q returned a negative count %d\n", export, n)
+		os.Exit(1)
+	}
 	buf := h.mem.UnsafeData(h.store)
 	out := make([]int, 0, n)
 	for i := int32(0); i < n; i++ {

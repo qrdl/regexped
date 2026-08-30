@@ -43,7 +43,7 @@ func isWholePatternSingleCapture(re *syntax.Regexp) bool {
 }
 
 // buildTrivialSingleCaptureBody emits the WASM body for the trivial
-// captureBody used by the task 41 shortcut. Signature (type 2):
+// captureBody used by the whole-pattern single-capture shortcut. Signature (type 2):
 //
 //	(ptr i32, len i32, out_ptr i32) → i32
 //

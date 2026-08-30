@@ -247,6 +247,14 @@ Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed
 
 The generated function **throws** an `Error` whose message names the function. Since the find/groups functions are generators, the throw surfaces from the `next()` call (i.e. from the `for...of` loop), not from the call that creates the generator.
 
-**Three set exports used to swallow it.** `match_any` folded `-2` into `null`, and the narrow `match_all`/`scan_all` treated it as a bitmask — `-2` reads as *every id except 0 matched*. All three now throw. Neither could fire in practice, but the invariants that kept them safe lived in the compiler rather than beside the code that depended on them.
+**`match_any` used to swallow it.** It folded `-2` into `null`; it now throws.
+
+The NARROW `match_all` / `scan_all` do **not** test for it, and must not: their
+`i64` return IS the bitmask, so every 64-bit value is a legal answer. `-2` is
+`0xFFFF_FFFF_FFFF_FFFE` — ids 1..63 matched and id 0 did not — which a
+sentinel test would report as an engine failure on a perfectly good result.
+The real sentinel cannot reach that form at all: a set with a Backtracking
+member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
+`-2` is unambiguous.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

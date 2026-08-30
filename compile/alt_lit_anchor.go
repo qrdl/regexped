@@ -61,20 +61,20 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		}
 		table := dfaTableFrom(fwdMatcher)
 		// Same gates as the single-pattern lit-anchor path in compile.go:
-		// `\b`/`\B` (Task 10) and, per a past defect, `(?m:^)`/`(?m:$)`
+		// `\b`/`\B` and, per a past defect, `(?m:^)`/`(?m:$)`
 		// in the prefix.
 		//
 		// DELIBERATE DIVERGENCE: compile.go's
 		// copy of this gate is now narrower — it admits a prefix led by
 		// `^`/`(?m:^)` with nothing after the anchor able to consume a '\n'
-		// (lineAnchoredPrefixSafe, lit_anchor.go), a shape §22's defect never
+		// (lineAnchoredPrefixSafe, lit_anchor.go), a shape the back-scan defect never
 		// covered. That relaxation would be equally sound here: this path calls
 		// buildLitAnchorBackScanBody verbatim, and buildAltLitAnchorForwardVerifyBody
 		// duplicates buildLitAnchorFindBody's newline-aware start-state selection
 		// and its emitNLPreAcceptCheck call. It is left un-relaxed only because
 		// no perftest/likelytest case exercises a line-anchored alternation, so
 		// the widening would be unmeasured — the stricter gate is always safe,
-		// making this a missed optimisation, not an unfixed sibling of §22.
+		// making this a missed optimisation, not an unfixed sibling of that defect.
 		// Lifting it behind a shared predicate is still open.
 		if table.hasWordBoundary || table.hasNewlineBoundary ||
 			prefixContainsWordBoundary(br.lap.prefixRe) || prefixContainsLineAnchor(br.lap.prefixRe) {
@@ -136,11 +136,11 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		// the floor was then reading a stale value.
 		bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true)
 
-		// Opt 1 (Task 7) — default-on for every mode, same as the
+		// Opt 1 — default-on for every mode, same as the
 		// single-pattern and whole-alternation find/match bodies.
 		// encodeNonMid=false: the forward-verify body dispatches non-mid
 		// via state-ID compares and reads midAccept with plain `!= 0`
-		// accept semantics (task 38's 254+ value encoding is decoded only
+		// accept semantics (the 254+ value encoding is decoded only
 		// by buildFindBody/emitPhase4Dispatch consumers).
 		applyDominantStateEncoding(l, false)
 		fvBody := buildAltLitAnchorForwardVerifyBody(table, l, buildOpts.tableMemIdx)
@@ -264,9 +264,9 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 	result.teddyT1HiBytes = teddyT1HiBytes
 
 	// Derived from the segments actually appended rather than re-deduced from
-	// whichever Teddy offsets happen to be assigned — the three-way branch this
-	// replaces had to stay in lockstep with the emission above by hand. See
-	// emitted in a fixed, documented order.
+	// whichever Teddy offsets happen to be assigned — the three-way branch
+	// this replaces had to stay in lockstep with the emission above by hand,
+	// and the segments are appended in a fixed order above.
 	result.tableEnd = teddySegs.end
 
 	return result, true

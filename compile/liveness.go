@@ -7,7 +7,7 @@ package compile
 // either already recorded or provably unreachable — a strictly stronger exit
 // than "every wanted pattern has been seen", which is all the probe had.
 //
-// §16.5.2 built this table once before as Candidate A, measured it at +37.5%
+// This table was built once before as Candidate A, measured at +37.5%
 // and reverted it. The mechanism was right and the gate was missing: on
 // greedy-3 the wanted set contains `[^\n]*ERROR`, which on a corpus with no
 // newline is simultaneously never-recorded and never-dead, so the check cost

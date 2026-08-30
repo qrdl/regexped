@@ -20,7 +20,7 @@ import (
 // memory 0 and keep their tables in memory 1.
 //
 // That difference is invisible to a standalone test by construction, which is
-// how §11 R2 shipped: the zero-width machinery read input bytes through the
+// how an earlier bug shipped: the zero-width machinery read input bytes through the
 // table-memory helper, so in embedded builds every \b, \B, (?m:^) and (?m:$)
 // set pattern consulted DFA-table bytes instead of the caller's text — giving
 // both false negatives and false positives. Standalone builds were correct
@@ -134,7 +134,7 @@ func TestSetMergedModeAssertions(t *testing.T) {
 		{`foo(?m:$)`, "foox"},
 		{`(?m:^)foo(?m:$)`, "a\nfoo\nb"},
 		// mixed contexts in one pattern: the entry-state selection has to
-		// handle a bucket carrying BOTH kinds (§11 R4)
+		// handle a bucket carrying BOTH kinds
 		{`(?:\bfoo|(?m:^)bar)`, "x\nbar"},
 		{`(?:\bfoo|(?m:^)bar)`, "x foo"},
 		{`(?:\bfoo|(?m:^)bar)`, "xfooybarz"},
@@ -142,7 +142,7 @@ func TestSetMergedModeAssertions(t *testing.T) {
 		{`foo`, "xfooy"},
 		{`foo`, "xbary"},
 	}
-	// `scan` was retired by TODO task 59 decision (2): `scan_any(...) >= 0` is
+	// `scan` was retired: `scan_any(...) >= 0` is
 	// exactly what it returned, which is what runScan* compare against.
 	setScan := func(sc *config.SetConfig) { sc.ScanAny = "s_scan" }
 	for _, c := range cases {
@@ -242,7 +242,7 @@ func TestSetMergedModeFind(t *testing.T) {
 	setFind := func(sc *config.SetConfig) { sc.Find = "s_find" }
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%s on %q", c.pat, c.input), func(t *testing.T) {
-			// Gated find's contract IS Go's FindAllIndex rule (§9.6.1).
+			// Gated find's contract IS Go's FindAllIndex rule.
 			var want [][2]int
 			for _, m := range regexp.MustCompile(c.pat).FindAllStringIndex(c.input, -1) {
 				want = append(want, [2]int{m[0], m[1]})
@@ -271,13 +271,13 @@ func TestSetMergedModeFromResume(t *testing.T) {
 		{`(?m:^)b`, "ab\nb", 1},   // resume just after a non-newline
 		{`a\Bb`, "abab", 1},       // \B mid-input at a resume point
 	}
-	// `scan` was retired by TODO task 59 decision (2): `scan_any(...) >= 0` is
+	// `scan` was retired: `scan_any(...) >= 0` is
 	// exactly what it returned, which is what runScan* compare against.
 	setScan := func(sc *config.SetConfig) { sc.ScanAny = "s_scan" }
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%s on %q from %d", c.pat, c.input, c.from), func(t *testing.T) {
 			// Oracle: does the pattern match at any position >= from, judged on
-			// the WHOLE input so assertions see real context (§9.6).
+			// the WHOLE input so assertions see real context.
 			want := false
 			for p := int(c.from); p <= len(c.input); p++ {
 				re := regexp.MustCompile(`\A(?s:.{` + itoa(p) + `})(?:` + c.pat + `)`)

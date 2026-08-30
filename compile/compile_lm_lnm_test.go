@@ -1404,7 +1404,7 @@ func TestBatchExportGating(t *testing.T) {
 			t.Fatalf("Compile: %v", err)
 		}
 		if !bytes.Contains(wasm, []byte("akia_groups_batch")) {
-			t.Error("expected akia_groups_batch export for anchored (Path B) lit-chain groups body — task 44 goal 4")
+			t.Error("expected akia_groups_batch export for anchored (Path B) lit-chain groups body")
 		}
 		if !bytes.Contains(wasm, []byte("akia_groups")) {
 			t.Error("expected akia_groups (non-batch) export to still be present")

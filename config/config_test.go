@@ -386,7 +386,7 @@ func TestValidHints(t *testing.T) {
 		{[]string{"prefer-no-match"}, true},
 		{[]string{"prefer-match", "prefer-no-match"}, false},
 		{[]string{"bogus"}, false},
-		// batch-find (task 44): valid alone and combined with either of the
+		// batch-find: valid alone and combined with either of the
 		// other two, since it's orthogonal to the prefer-match/prefer-no-match
 		// exclusion.
 		{[]string{"batch-find"}, true},
@@ -401,7 +401,7 @@ func TestValidHints(t *testing.T) {
 	}
 }
 
-// TestBatchFindOnSets covers TODO task 59 decision (11): "batch-find" USED TO
+// TestBatchFindOnSets covers the hint's history: "batch-find" USED TO
 // BE a load-time error on a sets: entry and is now how a set asks for batching
 // at all, replacing the retired `find_batch:` key. It still requires `find` on
 // the same set — with nothing to batch, silently ignoring it would leave the
@@ -476,7 +476,7 @@ func TestLoadConfig_SetHintsMutuallyExclusive(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_BatchFindInvalidForSets verifies "batch-find" (task 44) is a
+// TestLoadConfig_BatchFindInvalidForSets verifies "batch-find" is a
 // load-time error on a sets: entry — sets have their own find_all batching
 // (batch_size) and don't wire up the per-pattern _batch export mechanism.
 func TestLoadConfig_BatchFindInvalidForSets(t *testing.T) {
@@ -533,7 +533,7 @@ func TestLoadConfig_ValidateSetsError(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // The seven-capability schema and strict parsing (
-// §3.19 / D5, D10/D11).
+// the capability grid).
 
 // writeCfg writes yaml to a temp regexped.yaml and returns its path.
 func writeCfg(t *testing.T, yaml string) string {
@@ -548,7 +548,7 @@ func writeCfg(t *testing.T, yaml string) string {
 
 func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
 	// The retired keys are caught loudly by strict parsing rather than by a
-	// targeted "renamed to" message (§3.19). The `match:` meaning change is
+	// targeted "renamed to" message. The `match:` meaning change is
 	// deliberately NOT catchable here — that lives in the migration notes.
 	cases := []struct {
 		name, key, yaml string
@@ -556,7 +556,7 @@ func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
 		{"find_all", "find_all", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_all: sf\n    patterns: all\n"},
 		{"find_any", "find_any", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_any: sf\n    patterns: all\n"},
 		{"batch_size", "batch_size", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find: sf\n    batch_size: 128\n    patterns: all\n"},
-		// Retired by TODO task 59: `match:` and `scan:` (decision (2)) and
+		// Retired keys: `match:` and `scan:` and
 		// `find_batch:` (decision (11)). Dropping the KEYS rather than
 		// repurposing them is the point — a surviving `match:` with match_any
 		// semantics would leave every existing config compiling while its
@@ -564,7 +564,7 @@ func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
 		{"match", "match", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    match: sm\n    patterns: all\n"},
 		{"scan", "scan", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan: ss\n    patterns: all\n"},
 		{"find_batch", "find_batch", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n"},
-		// Retired by TODO task 62. It was never a separate capability — both
+		// Retired. It was never a separate capability — both
 		// stubs called the SAME WASM export — so `groups_func` plus the
 		// generated name→index constants replaces it, and C and AS gain named
 		// access they never had.
@@ -627,7 +627,7 @@ func TestLoadConfig_OverlappingWithoutFindIsIgnored(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_BatchFindIsNotACapability: under TODO task 59 decision (11)
+// TestLoadConfig_BatchFindIsNotACapability: batching
 // batching is a property of `find`, not a capability of its own. A batch-only
 // set — legal until then — no longer exists, and asking for batching adds
 // nothing to Capabilities().

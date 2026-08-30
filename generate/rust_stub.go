@@ -118,17 +118,16 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 `, idKonst, s.MatchAll, btOverflow, idKonst)
 			} else {
 				fmt.Fprintf(&out, `    let raw = unsafe { ffi_%s(input.as_ptr(), input.len() as i32) };
-    // The narrow form's return IS the bitmask, so the sentinel is tested on the
-    // RAW value before the unsigned cast: -2 as u64 is 0xFFFF_FFFF_FFFF_FFFE,
-    // which reads as "every id except 0 matched". Unreachable while
-    // wideAllForm forces the wide form for any set with a Backtracking member,
-    // but that invariant lives elsewhere and this makes it local.
-    if raw == %d { return Err(Error::BacktrackOverflow); }
+    // NO overflow sentinel here: the narrow form's return IS the bitmask, so
+    // every 64-bit value is a legal answer. -2 is 0xFFFF_FFFF_FFFF_FFFE — ids
+    // 1..63 matched and id 0 did not — which a sentinel test would report as
+    // an engine failure. The real sentinel cannot reach this form at all:
+    // wideAllForm picks the wide form for any set with a Backtracking member.
     let mask = raw as u64;
     Ok((0..%s as i32).filter(move |k| mask & (1u64 << k) != 0))
 }
 
-`, s.MatchAll, btOverflow, idKonst)
+`, s.MatchAll, idKonst)
 			}
 		}
 		if s.ScanAny != "" {
@@ -168,23 +167,22 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 `, idKonst, s.ScanAll, btOverflow, idKonst)
 			} else {
 				fmt.Fprintf(&out, `    let raw = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, offset as i32) };
-    // The narrow form's return IS the bitmask, so the sentinel is tested on the
-    // RAW value before the unsigned cast: -2 as u64 is 0xFFFF_FFFF_FFFF_FFFE,
-    // which reads as "every id except 0 matched". Unreachable while
-    // wideAllForm forces the wide form for any set with a Backtracking member,
-    // but that invariant lives elsewhere and this makes it local.
-    if raw == %d { return Err(Error::BacktrackOverflow); }
+    // NO overflow sentinel here: the narrow form's return IS the bitmask, so
+    // every 64-bit value is a legal answer. -2 is 0xFFFF_FFFF_FFFF_FFFE — ids
+    // 1..63 matched and id 0 did not — which a sentinel test would report as
+    // an engine failure. The real sentinel cannot reach this form at all:
+    // wideAllForm picks the wide form for any set with a Backtracking member.
     let mask = raw as u64;
     Ok((0..%s as i32).filter(move |k| mask & (1u64 << k) != 0))
 }
 
-`, s.ScanAll, btOverflow, idKonst)
+`, s.ScanAll, idKonst)
 			}
 		}
 		if s.Find != "" {
 			iterName := iterTypeName(s.Find)
 			// Every set with `find` owns a gate array, overlapping included
-			// (SETS_PLAN item 11), so this is unconditional.
+			//, so this is unconditional.
 			gateSlots := idN
 			// A set big enough to make the iterator a heavy VALUE holds its
 			// arrays behind a Box instead; small sets keep the inline arrays
@@ -533,19 +531,28 @@ impl<'a> Iterator for %s<'a> {
                 return Some(Err(Error::BacktrackOverflow));
             }
             if r < 0 {
-                // No match at THIS offset — a different thing from the
-                // sentinel above. Advance and retry.
-                if self.offset == self.input.len() {
-                    self.done = true;
-                    return None;
-                }
-                self.offset += 1;
-                continue;
+                // Terminal, not "try the next position". the
+                // groups export has SCAN-FROM semantics in both wrapper arms:
+                // a negative result means there is no match at or after the
+                // offset. The advance-by-one retry this replaced re-scanned
+                // the tail once per remaining byte — O(n^2) work where the
+                // find iterator does O(n).
+                self.done = true;
+                return None;
             }
             // Slots are ABSOLUTE: the whole input is passed on every call.
             let abs_start = slots[0] as usize;
             let abs_end = if slots[1] >= 0 { slots[1] as usize } else { abs_start };
             self.offset = if abs_end > abs_start { abs_end } else { abs_start + 1 };
+            // Go's FindAllSubmatchIndex rule: suppress an EMPTY match
+            // beginning exactly where the previous REPORTED match ended. The
+            // advance above is unchanged. Without this, a pattern like
+            // (a?) over "ab" yields (0,1),(1,1),(2,2) here and (0,1),(2,2)
+            // in the other five languages.
+            if abs_start == abs_end && self.prev_end == Some(abs_start) {
+                continue;
+            }
+            self.prev_end = Some(abs_end);
             let mut groups = Vec::with_capacity(%d);
             for group_num in 0..%d {
                 let start = slots[group_num * 2];
@@ -616,7 +623,7 @@ func rustABIRet(r abiRet) string {
 
 // genRustGroupIndexConsts emits name→index addressing for a groups function:
 // one constant per NAMED group, a runtime lookup, and the index-aligned name
-// table. This replaces the retired `named_groups_func` (TODO task 62) — it was
+// table. This replaces the retired `named_groups_func` — it was
 // never a separate capability, only a second presentation of the same WASM
 // export.
 //
@@ -681,7 +688,7 @@ pub fn %s() -> &'static [&'static str] {
 }
 
 // rustErrorPreamble emits the error type, the Result alias and Span — the
-// shared vocabulary every export in this module speaks (TODO task 62).
+// shared vocabulary every export in this module speaks.
 //
 // Rust reports "this call cannot be answered" with Result, so that is what the
 // stubs do. This replaces panicking: a panic unwinding out of an FFI wrapper is

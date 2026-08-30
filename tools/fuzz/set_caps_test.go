@@ -50,8 +50,8 @@ type capRunner struct {
 	mem    *wasmtime.Memory
 	inBase int32
 	// gatePtr is the caller-owned array every `find` takes, overlapping
-	// included: the default body records §3.16 match gates in it, the
-	// overlapping one keeps SETS_PLAN item 11's once-per-drive preflight
+	// included: the default body records match gates in it, the
+	// overlapping one keeps its once-per-drive preflight
 	// verdict there. Zeroed by newCapRunner; a test that starts a SECOND
 	// drive on the same runner must zero it again with resetGates.
 	gatePtr int32
@@ -306,7 +306,7 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 				// match: anchored, whole input.
 				wantAnchored := oracleAnchored(tc.pats, input, nil)
 
-				// match_any: membership, never value equality (§3.5).
+				// match_any: membership, never value equality.
 				gotAny := r.call(t, "cap_match_any", r.inBase, n).(int32)
 				if len(wantAnchored) == 0 {
 					if gotAny != -1 {
@@ -329,8 +329,8 @@ func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 
 					wantScanAll := oracleScanAll(tc.pats, input, from, nil)
 
-					// scan_any reports a bare id and NO start (TODO task 59
-					// decision (10)), so the id may name any pattern matching
+					// scan_any reports a bare id and NO start, so the id
+					// may name any pattern matching
 					// anywhere at or after `from` — oracleScanAll's set, not
 					// oracleFirstPosition's. wantPos still decides -1: a set
 					// with a first position is a set with a match.
@@ -408,7 +408,7 @@ func containsInt(v []int, x int) bool {
 	return false
 }
 
-// TestSetFindOverflowContract pins §3.11 / D2: the return value is the TOTAL
+// TestSetFindOverflowContract pins the overflow contract: the return value is the TOTAL
 // at the position, the buffer takes what fits, and an overflowing call stores
 // no state — so the grown retry sees exactly the same world.
 func TestSetFindOverflowContract(t *testing.T) {
@@ -436,7 +436,7 @@ func TestSetFindOverflowContract(t *testing.T) {
 	}
 }
 
-// TestSetFromOutOfRange pins the §4.2 edge contract for from > len.
+// TestSetFromOutOfRange pins the edge contract for from > len.
 func TestSetFromOutOfRange(t *testing.T) {
 	r := newCapRunner(t, []string{"a", "b"}, "ab", true)
 	defer r.Close()
@@ -453,7 +453,7 @@ func TestSetFromOutOfRange(t *testing.T) {
 }
 
 // FuzzSetCaps drives all seven capabilities of a two-pattern set against the
-// §9.6 oracle formulas at every `from`. It is the multi-capability counterpart
+// whole-input oracle formulas at every `from`. It is the multi-capability counterpart
 // to FuzzSet, which covers `find` alone.
 func FuzzSetCaps(f *testing.F) {
 	corpus := seedCorpus(seedFile)
@@ -562,7 +562,7 @@ func FuzzSetCaps(f *testing.F) {
 			}
 		}
 
-		// The DEFAULT `find` configuration, against §9.6.1's union oracle.
+		// The DEFAULT `find` configuration, against the union oracle.
 		// The loop above compiled the set with overlapping: true, so this is
 		// the one place the fuzzer reaches the gated body.
 		gotGated := runGatedFind(t, pats, input).matches

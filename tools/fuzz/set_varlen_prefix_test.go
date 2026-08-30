@@ -8,13 +8,12 @@ import (
 
 // TestVarLenPrefixMustRouteToFallback pins the counterexamples behind
 // analyzePattern's variable-length-prefix guard, and with them the reason
-// SETS_PLAN item 13's premise does not hold.
 //
 // The split representation prefix.literal.suffix recovers a match start from a
 // literal candidate at c as `c - L` for ONE compile-time L (prefixMaxLen). That
 // is exact only while the prefix has a single length. Every pattern below has a
 // BOUNDED, ACYCLIC variable-length prefix — `a?`, `a{0,2}`, `(?:xy)?` — so each
-// one satisfies SETS §9.4's "deferred tier" criterion, under which an acyclic
+// one satisfies the "deferred tier" criterion, under which an acyclic
 // backward prefix DFA yields a computable maximum lookback M and the pattern
 // may keep its literal frontend.
 //

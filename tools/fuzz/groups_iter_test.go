@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// The groups half of TODO task 54 (A). The find export now takes a `from`
+// The groups half of the find-from channel. The find export now takes a `from`
 // position; groups and named_groups still NARROW, so a leading \b, \B or
 // (?m:^) is judged against the slice edge on every re-entry.
 //

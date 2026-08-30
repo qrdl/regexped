@@ -3,37 +3,40 @@ package compile
 import (
 	"fmt"
 
+	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// The six non-`find` set capabilities.
+// The four non-`find` set capabilities.
 //
-//	match    (ptr, len)                -> i32   0 | 1
 //	match_any(ptr, len)                -> i32   pattern id, or -1
 //	match_all(ptr, len)                -> i64   bitmask            (<= 64 patterns)
 //	match_all(ptr, len, out_ptr)       -> i32   count + bitmap     (>  64)
-//	scan     (ptr, len, from)          -> i32   0 | 1
 //	scan_any (ptr, len, from)          -> i32   pattern id, or -1
 //	scan_all (ptr, len, from)          -> i64   bitmask            (<= 64)
 //	scan_all (ptr, len, from, out_ptr) -> i32   count + bitmap     (>  64)
 //
-// All six are built on the bitmask probes of set_probe.go rather than on the
-// tuple-writing suffix function: none of them reports a position and extent,
-// so none pays for per-pattern endPos tracking, the immBitmask lookup, or an
-// output buffer (§5).
+// The boolean `match` and `scan` are RETIRED config keys (
+// decisions (2) and (11)) and are load errors. Their enum values and emitter
+// arms outlived them in five files — capFns() is the only production producer
+// of a setCapKind and never yielded either — so a reader had to work out that
+// half the switch cases could not run.
 //
-// The anchored trio walks candidate literal placements inside a match pinned
-// at 0..len; the scan trio walks positions like `find` does.
+// All four are built on the bitmask probes of set_probe.go rather than on the
+// tuple-writing suffix function: neither reports a position and extent, so
+// neither pays for per-pattern endPos tracking, the immBitmask lookup, or an
+// output buffer.
+//
+// The anchored pair walks candidate literal placements inside a match pinned
+// at 0..len; the scan pair walks positions like `find` does.
 
-// setCapKind selects which of the six bodies to emit.
+// setCapKind selects which of the bodies to emit.
 type setCapKind int
 
 const (
 	capFind setCapKind = iota
-	capMatch
 	capMatchAny
 	capMatchAll
-	capScan
 	capScanAny
 	capScanAll
 	// capFindBatch is the exported multi-position loop.
@@ -43,8 +46,10 @@ const (
 )
 
 // wideBitmapThreshold is the pattern count above which the `_all` pair
-// switches from an i64 return value to a caller-provided bitmap (§3.13).
-const wideBitmapThreshold = 64
+// switches from an i64 return value to a caller-provided bitmap.
+//
+// An alias for the ABI constant the generators read, not a second copy of it.
+const wideBitmapThreshold = config.WideBitmapThreshold
 
 // idSpaceSize returns one past the largest pattern id this set can report —
 // the size of everything indexed BY a pattern id: the gate array, the `_all`
@@ -118,7 +123,7 @@ func (cs *compiledSet) checkIDSpace() {
 }
 
 // hasBTMember reports whether any bucket in this set was admitted on the
-// Backtracking engine (SETS_PLAN item 20). It is the one condition that can
+// Backtracking engine. It is the one condition that can
 // make a capability answer "I don't know" instead of yes or no.
 func (cs *compiledSet) hasBTMember() bool { return cs.numBTFns > 0 }
 
@@ -128,10 +133,10 @@ func (cs *compiledSet) hasBTMember() bool { return cs.numBTFns > 0 }
 // Two independent reasons select it:
 //
 //   - ID SPACE > 64 — the original one: the form exists to carry bit positions
-//     and a bit position is a pattern id (§3.13), so more than 64 ids simply do
+//     and a bit position is a pattern id, so more than 64 ids simply do
 //     not fit in an i64.
 //
-//   - A BACKTRACKING MEMBER — SETS_PLAN item 20 decision 3. BT is the first
+//   - A BACKTRACKING MEMBER. BT is the first
 //     engine here that can return "unknown" (abi.BTStackOverflow) rather than a
 //     definite yes/no, and that third outcome needs somewhere to live. The
 //     narrow form is the only capability shape with no room for it: its i64
@@ -146,23 +151,56 @@ func (cs *compiledSet) wideAll() bool {
 	return cs.idSpaceSize() > wideBitmapThreshold || cs.hasBTMember()
 }
 
+// emitWideBitmapSet emits the wide `_all` read-modify-write: set the bit for
+// the id in lID within the caller's bitmap at pOutPtr, and bump lCount only on
+// a 0->1 transition so the returned count stays DISTINCT PATTERNS.
+//
+// One emitter, not three. The identical opcode sequence lived in
+// emitRecordSparseProbe's wide arm and emitRecordSparseCount's wide arm modulo
+// local names, and emitSetAllBits — the CONSTANT-id flavour, unrolled at
+// compile time — was itself created to end this exact duplication.
+// The 0->1 counting rule has to stay synchronised with emitDrainCheck's bound
+// on how many distinct patterns a position can report, which is one more
+// reason for it to have a single site.
+func emitWideBitmapSet(b []byte, pOutPtr, lID, lCount byte) []byte {
+	// if (bitmap[id>>3] & (1 << (id&7))) == 0 { lCount++ }
+	b = append(b, 0x20, pOutPtr, 0x20, lID, 0x41, 0x03, 0x76, 0x6A)
+	b = appendTableLoad8u(b, 0)
+	b = append(b, 0x41, 0x01, 0x20, lID, 0x41, 0x07, 0x71, 0x74)
+	b = append(b, 0x71, 0x45, 0x04, 0x40)
+	b = append(b, 0x20, lCount, 0x41, 0x01, 0x6A, 0x21, lCount)
+	b = append(b, 0x0B)
+	// bitmap[id>>3] |= 1 << (id&7)
+	b = append(b, 0x20, pOutPtr, 0x20, lID, 0x41, 0x03, 0x76, 0x6A)
+	b = append(b, 0x20, pOutPtr, 0x20, lID, 0x41, 0x03, 0x76, 0x6A)
+	b = appendTableLoad8u(b, 0)
+	b = append(b, 0x41, 0x01, 0x20, lID, 0x41, 0x07, 0x71, 0x74, 0x72)
+	return appendTableStore8(b, 0)
+}
+
+// emitAccOrID is emitWideBitmapSet's NARROW twin: OR the id's bit into the i64
+// accumulator that IS the narrow `_all` answer.
+func emitAccOrID(b []byte, lAcc, lID byte) []byte {
+	b = append(b, 0x20, lAcc, 0x42, 0x01)
+	return append(b, 0x20, lID, 0xAD, 0x86, 0x84, 0x21, lAcc)
+}
+
 // emitSetAnyID records ONE arbitrary matching pattern id from a bucket-local
 // bitmask into dst — the `_any` capabilities' whole answer.
 //
-// Which id is unspecified (§3.5), so the lowest set bit is as good as any, and
+// Which id is unspecified, so the lowest set bit is as good as any, and
 // the test is one compare per pattern unrolled at compile time. escapeDepth >=
 // 0 additionally leaves that block once an id is found; the non-anchored form
 // passes -1 and lets the mode's drain check do the leaving instead, which
 // keeps this emitter free of each frontend's br-depth bookkeeping. Both forms
-// stop at the first id now that `scan_any` reports no start (TODO task 59
-// decision (10)) — before that, a later candidate could still improve the
+// stop at the first id now that `scan_any` reports no start — before that, a later candidate could still improve the
 // answer by starting earlier.
 //
 // Shared by emitRecordBits and setFindCtx.emitRecordProbe, which each carried
 // a copy.
 func emitSetAnyID(b []byte, ids []int, bitsLocal, dst byte, escapeDepth int) []byte {
 	for k, gid := range ids {
-		if k >= 32 {
+		if k >= bucketMaskBits {
 			break
 		}
 		b = append(b, 0x20, bitsLocal, 0x41)
@@ -180,7 +218,7 @@ func emitSetAnyID(b []byte, ids []int, bitsLocal, dst byte, escapeDepth int) []b
 }
 
 // emitSetAllBits records EVERY matching pattern of a bucket-local bitmask —
-// the `_all` capabilities' answer, in whichever of the two §3.13 forms this
+// the `_all` capabilities' answer, in whichever of the two forms this
 // set uses.
 //
 // Narrow (id space <= 64): OR the bit into an i64 accumulator.
@@ -191,10 +229,10 @@ func emitSetAnyID(b []byte, ids []int, bitsLocal, dst byte, escapeDepth int) []b
 //
 // Shared by emitRecordBits (match_all) and setFindCtx.emitRecordProbe
 // (scan_all), which were byte-for-byte copies — including the SLEB128 hazard
-// noted below, which was documented in only one of them (§11 R12).
+// noted below, which was once documented in only one of them.
 func emitSetAllBits(b []byte, ids []int, bitsLocal byte, wide bool, pOutPtr, lCount, lAcc byte) []byte {
 	for k, gid := range ids {
-		if k >= 32 {
+		if k >= bucketMaskBits {
 			break
 		}
 		b = append(b, 0x20, bitsLocal, 0x41)
@@ -254,15 +292,6 @@ type capAccumulator struct {
 // delegate the per-bit work to the shared emitters above.
 func (a capAccumulator) emitRecordBits(b []byte, bitsLocal byte, ids []int, escapeDepth byte) []byte {
 	switch a.kind {
-	case capMatch:
-		// Any bit at all settles a boolean answer. lCount doubles as the
-		// result flag so the epilogue has one thing to return whichever way
-		// the block was left.
-		b = append(b, 0x20, bitsLocal, 0x04, 0x40)
-		b = append(b, 0x41, 0x01, 0x21, a.lCount)
-		b = append(b, 0x0C, escapeDepth+1)
-		b = append(b, 0x0B)
-		return b
 	case capMatchAny:
 		return emitSetAnyID(b, ids, bitsLocal, a.lAnyID, int(escapeDepth))
 	default: // capMatchAll
@@ -296,16 +325,8 @@ func (a capAccumulator) emitRecordSparseCount(b []byte, countLocal byte, bkt *bu
 		return appendTableLoad32(b, tableMemIdx, 0)
 	}
 	switch a.kind {
-	case capMatch:
-		// Any hit at all settles a boolean answer; the count is enough and the
-		// ids never need reading.
-		b = append(b, 0x20, countLocal, 0x04, 0x40)
-		b = append(b, 0x41, 0x01, 0x21, a.lCount)
-		b = append(b, 0x0C, escapeDepth+1)
-		b = append(b, 0x0B)
-		return b
 	case capMatchAny:
-		// Which id is unspecified (§3.5), so the first collected one will do.
+		// Which id is unspecified, so the first collected one will do.
 		b = append(b, 0x20, countLocal, 0x04, 0x40)
 		b = pushID(b, func(b []byte) []byte { return b }) // entry 0: offset 0
 		b = append(b, 0x21, a.lAnyID)
@@ -322,22 +343,9 @@ func (a capAccumulator) emitRecordSparseCount(b []byte, countLocal byte, bkt *bu
 		})
 		b = append(b, 0x21, lID)
 		if a.wide {
-			// Count only 0->1 transitions so the returned count stays DISTINCT
-			// patterns, matching emitSetAllBits' contract.
-			b = append(b, 0x20, a.pOutPtr, 0x20, lID, 0x41, 0x03, 0x76, 0x6A)
-			b = appendTableLoad8u(b, 0)
-			b = append(b, 0x41, 0x01, 0x20, lID, 0x41, 0x07, 0x71, 0x74)
-			b = append(b, 0x71, 0x45, 0x04, 0x40)
-			b = append(b, 0x20, a.lCount, 0x41, 0x01, 0x6A, 0x21, a.lCount)
-			b = append(b, 0x0B)
-			b = append(b, 0x20, a.pOutPtr, 0x20, lID, 0x41, 0x03, 0x76, 0x6A)
-			b = append(b, 0x20, a.pOutPtr, 0x20, lID, 0x41, 0x03, 0x76, 0x6A)
-			b = appendTableLoad8u(b, 0)
-			b = append(b, 0x41, 0x01, 0x20, lID, 0x41, 0x07, 0x71, 0x74, 0x72)
-			b = appendTableStore8(b, 0)
+			b = emitWideBitmapSet(b, a.pOutPtr, lID, a.lCount)
 		} else {
-			b = append(b, 0x20, a.lAcc, 0x42, 0x01)
-			b = append(b, 0x20, lID, 0xAD, 0x86, 0x84, 0x21, a.lAcc)
+			b = emitAccOrID(b, a.lAcc, lID)
 			// The bare `match` form reads lCount as its flag, and match_all's
 			// narrow epilogue returns lAcc, so bumping it here is harmless and
 			// keeps a hit visible to both.
@@ -356,11 +364,11 @@ func (a capAccumulator) emitRecordSparseCount(b []byte, countLocal byte, bkt *bu
 
 // emitSetAnchoredCapBody emits one of the three anchored capabilities.
 //
-// The match must span the whole input (§3.3), which is what the anchored probe
+// The match must span the whole input, which is what the anchored probe
 // tests: it reports pattern k only when the run from position 0 reaches `len`
 // in a state accepting for k. These run over the set's ANCHORED buckets — full
 // patterns, merged without leftmost-first pruning — so there is no literal
-// frontend, no prefix DFA and no candidate enumeration here at all. §5's table
+// frontend, no prefix DFA and no candidate enumeration here at all. The table
 // says as much: a `match`-only set needs no literal machinery, because it can
 // never execute.
 func emitSetAnchoredCapBody(cs *compiledSet, kind setCapKind, probeFnBase int) []byte {
@@ -409,11 +417,11 @@ func emitSetAnchoredCapBody(cs *compiledSet, kind setCapKind, probeFnBase int) [
 
 	for bi := range cs.anchoredBuckets {
 		n := len(cs.anchoredBuckets[bi].patterns)
-		if n > 32 {
+		if n > bucketMaskBits {
 			n = 32
 		}
 		mask := uint32(0xFFFFFFFF)
-		if n < 32 {
+		if n < bucketMaskBits {
 			mask = uint32(1)<<uint(n) - 1
 		}
 		b = append(b, 0x20, pInPtr)
@@ -476,14 +484,12 @@ func allPatternsMask(cs *compiledSet) uint64 {
 // finishAnchoredCapBody emits the anchored capability's return value and the
 // function end.
 //
-// Anchored only. The scan trio returns through setFindCtx.emitEpilogue, which
-// is where §3.17's packed-i64 encoding lives; this function used to carry dead
-// capScan/capScanAny/capScanAll arms and an lMinStart parameter its only
-// caller always passed as 0, so the encoding was specified twice.
+// Anchored only. The scan pair returns through setFindCtx.emitEpilogue, which
+// is where the packed-i64 encoding lives; this function used to carry dead
+// capScanAny/capScanAll arms and an lMinStart parameter its only caller always
+// passed as 0, so the encoding was specified twice.
 func finishAnchoredCapBody(b []byte, kind setCapKind, wide bool, lAcc, lCount, lAnyID byte) []byte {
 	switch kind {
-	case capMatch:
-		b = append(b, 0x20, lCount) // 1 iff some probe reported a hit
 	case capMatchAny:
 		b = append(b, 0x20, lAnyID)
 	default: // capMatchAll

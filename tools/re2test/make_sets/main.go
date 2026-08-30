@@ -4,7 +4,7 @@
 // non-overlapping output, which is exactly Go FindAllIndex's rule.
 // So col4 — the "all matches" column --sets compares
 // against — is regenerated straight from Go's FindAllStringIndex, and col1
-// from FindStringIndex. That is §9.6.1's union oracle applied ahead of time
+// from FindStringIndex. That is the union oracle applied ahead of time
 // rather than at run time, and it is why the file needed regenerating when
 // the old every-start-position enumeration was retired.
 //
@@ -23,6 +23,10 @@ import (
 	"strings"
 )
 
+// blockNameRE is the shape of a block-name line: a bare identifier, which is
+// what every block in custom-sets.txt uses (SetNonGreedyDotStar and friends).
+var blockNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 func main() {
 	if len(os.Args) != 2 {
 		fmt.Fprintln(os.Stderr, "usage: make_sets <custom-sets.txt>")
@@ -39,6 +43,13 @@ func main() {
 	var curPattern string
 	strIdx := 0
 	section := ""
+	// A block whose name ends in "Pinned" carries HAND-DERIVED expectations
+	// that Go cannot produce — the byte-advance empty-match rule on non-ASCII
+	// input, where our byte-oriented engine deliberately diverges from Go's
+	// rune advance (docs/sets.md "The empty-match rule").
+	// Regenerating those rows would overwrite the divergence with the very
+	// answer it exists to contradict.
+	pinned := false
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -73,9 +84,24 @@ func main() {
 				continue
 			}
 			if !strings.Contains(trimmed, ";") {
-				// A new block name: expectation rows always carry ';'.
+				// A new BLOCK NAME. "no semicolon" alone is not evidence of
+				// that: an expectation row whose every column is `-` carries
+				// none either, and treating it as a block name silently
+				// switched the section off — after which the whole rest of the
+				// block passed through UNREGENERATED, i.e. frozen. Require the
+				// block-name shape instead, and refuse anything else.
+				if !blockNameRE.MatchString(trimmed) {
+					fmt.Fprintf(os.Stderr, "%s: line %q is neither an expectation row (no ';') nor a block name; corpus NOT rewritten\n", path, trimmed)
+					os.Exit(1)
+				}
 				section = ""
+				pinned = strings.HasSuffix(trimmed, "Pinned")
 				out = append(out, line)
+				continue
+			}
+			if pinned {
+				out = append(out, line)
+				strIdx++
 				continue
 			}
 			// An expectation row for strs[strIdx].
@@ -83,15 +109,20 @@ func main() {
 			for len(cols) < 5 {
 				cols = append(cols, "-")
 			}
-			if strIdx < len(strs) {
-				re, err := regexp.Compile(curPattern)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "pattern %q: %v\n", curPattern, err)
-					os.Exit(1)
-				}
-				cols[1] = fmtFirst(re, strs[strIdx])
-				cols[4] = fmtAll(re, strs[strIdx])
+			if strIdx >= len(strs) {
+				// More expectation rows than test strings: the extra ones
+				// would pass through unchecked and stay whatever they were.
+				fmt.Fprintf(os.Stderr, "%s: pattern %q has more expectation rows than the block's %d strings; corpus NOT rewritten\n",
+					path, curPattern, len(strs))
+				os.Exit(1)
 			}
+			re, err := regexp.Compile(curPattern)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pattern %q: %v\n", curPattern, err)
+				os.Exit(1)
+			}
+			cols[1] = fmtFirst(re, strs[strIdx])
+			cols[4] = fmtAll(re, strs[strIdx])
 			strIdx++
 			out = append(out, strings.Join(cols, ";"))
 			continue
@@ -99,6 +130,7 @@ func main() {
 		// Block name or anything else: pass through.
 		out = append(out, line)
 		section = ""
+		pinned = strings.HasSuffix(trimmed, "Pinned")
 	}
 	// Check the scanner BEFORE rewriting the corpus. Scan() stops on error
 	// (a line over the buffer limit gives bufio.ErrTooLong) by returning

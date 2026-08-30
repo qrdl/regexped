@@ -31,16 +31,16 @@ type SetDiag struct {
 	Capabilities []string `json:"capabilities,omitempty"`
 	// Overlapping mirrors the YAML flag: true = the ungated `find` body.
 	Overlapping bool `json:"overlapping"`
-	// MaxLookback is the set's first-position drain bound M (§9.4): the
+	// MaxLookback is the set's first-position drain bound M: the
 	// largest distance between a mandatory literal and the match start it can
-	// serve. It is what decides whether a set behaves as §9.4 "class A"
+	// serve. It is what decides whether a set behaves as drain "class A"
 	// (bounded drain, literal frontend intact) or "class B" (nothing can be
 	// skipped) — confirm a test set's class from here rather than by
 	// inspection.
 	//
 	// It is always finite: a variable-length prefix has no usable bound, so
 	// analyzePattern routes those patterns to a fallback bucket instead of
-	// letting them widen M (§10.4(a)). An earlier draft of this comment
+	// letting them widen M. An earlier draft of this comment
 	// promised -1 for that case; setMaxLookback cannot return it.
 	MaxLookback int `json:"max_lookback"`
 	// IDSpaceSize is one past the largest pattern id this set can report.
@@ -50,8 +50,8 @@ type SetDiag struct {
 	// and the `_all` bitmap, and what decides the narrow-vs-wide `_all` ABI.
 	IDSpaceSize int `json:"id_space_size"`
 	// BareBodyShape records which body shape each declared bare capability
-	// received (§3.20 / D9), keyed by capability name. Only "bucketed" is
-	// emitted today: the union collapse of §3.20 is not built (§10.2(1)), so
+	// received, keyed by capability name. Only "bucketed" is
+	// emitted today: the union collapse is not built, so
 	// this field exists to make that visible rather than to be guessed at, and
 	// gains a "collapsed" value if the collapse ever lands.
 	BareBodyShape         map[string]string `json:"bare_body_shape,omitempty"`
@@ -85,11 +85,11 @@ type SetDiag struct {
 	// It exists because the difference is a factor of seven in fuel and NOTHING
 	// else makes it visible: the same set, same patterns, same answers, one
 	// eligibility test apart. That is exactly the shape of the AC demotion
-	// FrontendDemotion was added for, and of SETS_PLAN item 21 itself — six
+	// FrontendDemotion was added for, and of the wide-accept work itself — six
 	// sub-1x rows whose cause was a body selection nobody could see.
 	UnionScan *UnionScanDiag `json:"union_scan,omitempty"`
 	// AnchoredUnion reports how the ANCHORED capabilities were served
-	// (SETS_PLAN item 22 fix 1b): one union automaton, or the bucket packing.
+	//: one union automaton, or the bucket packing.
 	// Before this field the anchored packer had no diagnostic at all, so the
 	// difference between "one automaton" and "four buckets and a probe call
 	// each" — which is the whole cost difference between 154 fuel and 700 —
@@ -130,13 +130,13 @@ type UnionScanDiag struct {
 	// beyond maxUnionScanIDs, "frontend" a set with a literal frontend (which
 	// uses the two-phase split instead, reported as phase2 below).
 	Refused string `json:"refused,omitempty"`
-	// Wide is the >64-id accept form (SETS_PLAN item 21 phase 1): per-state
+	// Wide is the >64-id accept form: per-state
 	// representative id plus a bitmap row, in place of a u64 mask.
 	Wide      bool `json:"wide,omitempty"`
 	States    int  `json:"states,omitempty"`
 	MaskWords int  `json:"mask_words,omitempty"`
 	// Phase2 is set when this automaton serves only the FALLBACK half of a
-	// mixed set (SETS_PLAN item 19's two-phase split).
+	// mixed set.
 	Phase2 bool `json:"phase2,omitempty"`
 }
 
@@ -168,10 +168,10 @@ type BucketDiag struct {
 	// Type is "merged" | "singleton" | "fallback" | "bt-fallback" |
 	// "sparse-set".
 	// "bt-fallback" is a pattern admitted on the Backtracking engine after its
-	// suffix DFA exceeded max_fallback_states (SETS_PLAN item 20); it holds
+	// suffix DFA exceeded max_fallback_states; it holds
 	// exactly one pattern and has NO table, so SuffixStates and TableBytes are
 	// 0 for it rather than unknown. "sparse-set" is G17's >32-pattern bucket
-	// (SETS §23): its accept is a per-state LIST rather than a bitmask, which
+	//: its accept is a per-state LIST rather than a bitmask, which
 	// is what lets it hold a whole shared-literal group in one bucket instead
 	// of ceil(N/32) of them.
 	Type         string       `json:"type"`

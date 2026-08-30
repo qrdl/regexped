@@ -12,7 +12,7 @@ import (
 // All four frontend bodies (Scalar, Shufti, AC, Teddy) share the same
 // per-candidate work: compute the bucket's validMask and run its suffix DFA.
 // Before this file that logic was copy-pasted four times; the S1 rework needs
-// it in one place, because the first-position obligation of §9.4 threads
+// it in one place, because the first-position obligation threads
 // through every one of those sites.
 //
 // # What a `find` call returns
@@ -24,7 +24,7 @@ import (
 // TOTAL number of such matches, which may exceed out_cap; the buffer receives
 // min(total, out_cap) tuples.  Every tuple in one call shares the same start.
 //
-// # Why "first position" is not free (§9.4)
+// # Why "first position" is not free
 //
 // Candidate order is not match-start order.  A bucket whose mandatory literal
 // sits L bytes into the pattern reports a match starting at `c - L` for a
@@ -41,7 +41,7 @@ import (
 // something is what keeps a *candidate* that produces no match from poisoning
 // the scan: a bucket can pass its literal check and still match nothing.
 //
-// # The drain (§9.4 class A / class B)
+// # The drain (class A / class B)
 //
 // Scanning must continue past the first productive candidate, because a later
 // candidate can recover an earlier start.  How far is bounded by the set's
@@ -51,8 +51,8 @@ import (
 //
 // With M == 0 — every pattern's mandatory literal at its start, the flagship
 // `AKIA[A-Z0-9]{16}` shape — the drain is empty and the body is exactly
-// stop-at-first-productive-candidate, which is §9.4's class A with an empty
-// drain.  A larger M is class A with a real drain.  §9.4's class B (nothing can
+// stop-at-first-productive-candidate, which is class A with an empty
+// drain.  A larger M is class A with a real drain.  Class B (nothing can
 // be skipped, because a literal arbitrarily far to the right can serve a match
 // starting here) is the variable-length-prefix case, and analyzePattern routes
 // those patterns to a fallback bucket instead — see its comment on why the
@@ -74,7 +74,7 @@ type prefixLenGroup struct {
 func buildPrefixLenGroups(cs *compiledSet, bi int) []prefixLenGroup {
 	byLen := map[int]uint32{}
 	for k := range cs.prefixFixedLens[bi] {
-		if k >= 32 {
+		if k >= bucketMaskBits {
 			break
 		}
 		byLen[cs.prefixFixedLens[bi][k]] |= uint32(1) << uint(k)
@@ -92,11 +92,14 @@ func buildPrefixLenGroups(cs *compiledSet, bi int) []prefixLenGroup {
 
 // setMaxLookback returns the set's maximum lookback M: the largest number of
 // bytes between a mandatory literal and the match start it can serve.
+// Never returns a negative: every prefixFixedLens entry is a FIXED length, and
+// a pattern with a variable-length prefix is fallback-routed before it gets
+// one (see compiledSet.maxLookback).
 func setMaxLookback(cs *compiledSet) int {
 	m := 0
 	for bi := range cs.buckets {
 		for k := range cs.prefixFixedLens[bi] {
-			if k >= 32 {
+			if k >= bucketMaskBits {
 				break
 			}
 			if l := cs.prefixFixedLens[bi][k]; l > m {
@@ -125,7 +128,7 @@ type setFindCtx struct {
 	probeFnBase int
 	// tableMemIdx is the memory holding this set's tables. Only the bodies
 	// that read a table through setFindCtx set it — today the scalar body, for
-	// §21.6's first-byte masks. Bodies that never do leave it 0, which is
+	// the first-byte eligibility masks. Bodies that never do leave it 0, which is
 	// harmless because the features that use it are gated off for them.
 	tableMemIdx int
 	// anyProbeBase / useAnyProbe route `scan` and `scan_any` to a bucket's
@@ -149,9 +152,10 @@ type setFindCtx struct {
 	// redundant, even at M == 0.
 	perPositionDrain bool
 
-	// Parameters, in the §4.1 order:
-	//   ungated: (ptr, len, from, out_ptr, out_cap)
-	//   gated:   (ptr, len, from, gate_ptr, out_ptr, out_cap)
+	// Parameters, in the documented order. BOTH find flavours are 6-param: the
+	// overlapping body takes the gate slot for its preflight verdict; the 5-param ungated form below is retired, and
+	// pGate's own doc two fields down is the accurate one.
+	//   (ptr, len, from, gate_ptr, out_ptr, out_cap)
 	pInPtr, pInLen, pFrom, pOutPtr, pOutCap byte
 
 	// localBase is the first local index (one past the last parameter), and
@@ -160,10 +164,10 @@ type setFindCtx struct {
 	lPos      byte
 
 	// gated selects the default, per-pattern non-overlapping body: the
-	// §3.16 pre-mask, the write-time empty-extent rule and the write-back.
+	// gate pre-mask, the write-time empty-extent rule and the write-back.
 	gated bool
 	// pGate names the gate-array parameter, which EVERY `find` body has
-	// since SETS_PLAN item 11 — the overlapping one included, where the
+	// — the overlapping one included, where the
 	// array holds no match gates at all. So the presence of the parameter
 	// and the applicability of the gate RULE are two different questions:
 	// this field answers neither on its own. Ask `gated` for the rule and
@@ -181,7 +185,7 @@ type setFindCtx struct {
 	//
 	//   - gated: gates are written for every tuple actually DELIVERED, not
 	//     only for a position that fitted whole. That is what lets the batch
-	//     loop resume a split position — the §3.16 pre-mask then excludes
+	//     loop resume a split position — the gate pre-mask then excludes
 	//     exactly the patterns already handed to the caller. `find` keeps D2's
 	//     transactional rule, which is why this is a separate body.
 	//   - ungated: pSkip names a trailing parameter holding how many of this
@@ -203,9 +207,20 @@ type setFindCtx struct {
 	lMinStart  byte // best match start seen so far; minStartSentinel when none
 	lBase      byte // tuple index this call's writes start at
 	lStart     byte // the match start of the group currently being evaluated
+	// gateLocalBase is the first of one i32 local per GLOBAL id in the set's
+	// id space, holding gate[gid] read once in the prologue. 0 means the body
+	// declared none and the readers go to memory.
+	//
+	// The array is immutable for the whole call — the write-back runs once,
+	// after the scan loop — so every read of it during the scan is a reload of
+	// a call-invariant value. Hoisting saves ONE instruction per pattern per
+	// CANDIDATE and costs two per pattern per CALL, so it pays exactly when a
+	// body evaluates several candidates per call. See gateLocalsProfitable.
+	gateLocalBase byte
+
 	// lAllElig is the smallest match start at which EVERY pattern passes the
-	// §3.16 pre-mask — `max_k(gate[k]) >> 1`, computed once per call beside
-	// emitGateJump's minimum (SETS_PLAN item 22 fix 2b). At starts from there
+	// gate pre-mask — `max_k(gate[k]) >> 1`, computed once per call beside
+	// emitGateJump's minimum. At starts from there
 	// on, emitGateMask's per-pattern chain provably clears nothing, so ONE
 	// compare replaces up to 32 load-and-compare pairs.
 	//
@@ -217,10 +232,10 @@ type setFindCtx struct {
 	lAcc     byte // i64 bitmask accumulator, scan_all only
 	// aliveMask is an i64 local holding the ids that match SOMEWHERE in
 	// [from,len). G9's gated-`find` preflight fills it and writes it back as
-	// §3.16 gate sentinels.
+	// gate sentinels.
 	//
 	// G8's `scan_any` preflight also used it, to intersect every bucket's
-	// validMask and make the liveness exit fire (§18.4). That is gone with
+	// validMask and make the liveness exit fire. That is gone with
 	// decision (10): `scan_any` is the union walk now, so there is no
 	// per-position walk left to narrow. `aliveReady` and `emitAliveNarrow`
 	// went with it.
@@ -242,9 +257,9 @@ const minStartSentinel = int32(0x7FFFFFFF)
 func (c *setFindCtx) needMinStartCompare() bool {
 	// The scan trio tracks no minimum start at all — `scan` is a boolean,
 	// `scan_all` accumulates over the whole input, and `scan_any` stopped
-	// reporting a start under TODO task 59 decision (10) — so lMinStart stays
+	// reporting a start at all — so lMinStart stays
 	// at its sentinel and the compare can never fire.
-	if c.mode == capScan || c.mode == capScanAll || c.mode == capScanAny {
+	if c.mode == capScanAll || c.mode == capScanAny {
 		return false
 	}
 	return c.maxLookback != 0 || !c.perPositionDrain
@@ -315,8 +330,8 @@ func (c *setFindCtx) emitGroupMask(b []byte, bi int, g prefixLenGroup, posLocal 
 // "Still a candidate" is the point. These calls are backward DFA scans over
 // the input — by far the most expensive thing per candidate position — and
 // they used to run for every pattern of the bucket before the three cheap
-// tests that can discard the whole group: `lStart < from`, the §9.4 drain
-// guard `lStart > lMinStart`, and the §3.16 gate pre-mask. A candidate past
+// tests that can discard the whole group: `lStart < from`, the drain
+// guard `lStart > lMinStart`, and the gate pre-mask. A candidate past
 // the committed minimum start paid a full backward scan per pattern and then
 // branched out without reading a single result bit.
 //
@@ -329,7 +344,7 @@ func (c *setFindCtx) emitPrefixChecks(b []byte, bi int, g prefixLenGroup, posLoc
 	}
 	perBitGuard := c.readsGate() && bitsInMask(g.mask) > 1
 	for k, fnIdx := range c.cs.prefixFnIdx[bi] {
-		if k >= 32 || fnIdx < 0 {
+		if k >= bucketMaskBits || fnIdx < 0 {
 			continue
 		}
 		bit := uint32(1) << uint(k)
@@ -403,7 +418,7 @@ func (c *setFindCtx) emitSelectBase(b []byte) []byte {
 // 0` — which -2 passes. Without the guard the total becomes `lBase - 2`, a
 // silently corrupted count that the caller reads as a tuple quantity. The
 // guard returns it instead, unchanged, so "unknown" reaches the caller as
-// "unknown" (SETS_PLAN item 20 task 20.D).
+// "unknown".
 func (c *setFindCtx) emitCommit(b []byte, btBucket bool) []byte {
 	if btBucket {
 		b = append(b, 0x21, c.lTmp) // set (not tee): the guard re-pushes it
@@ -423,10 +438,10 @@ func (c *setFindCtx) emitCommit(b []byte, btBucket bool) []byte {
 	return b
 }
 
-// emitGateMask folds the §3.16 pre-mask into lValidMask: pattern k stays
+// emitGateMask folds the gate pre-mask into lValidMask: pattern k stays
 // eligible at match start s only while `2s + 1 >= gate[k]`.
 //
-// This is what collapses the quadratic behaviour of §3.14 — a bucket whose
+// This is what collapses the quadratic gate behaviour — a bucket whose
 // mask ends up empty is skipped entirely, so no literal check, no prefix DFA
 // and no suffix DFA run at that position. The bound used here is the weaker,
 // non-empty one; an empty extent needs the stricter `2s >= gate[k]`, which
@@ -450,7 +465,7 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 	}
 	first := true
 	for k, gid := range c.cs.patternIDs[bi] {
-		if k >= 32 {
+		if k >= bucketMaskBits {
 			break
 		}
 		bit := uint32(1) << uint(k)
@@ -469,9 +484,8 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 		}
 		// if (2*lStart + 1) < gate[gid]: clear bit k
 		b = append(b, 0x20, c.lTmp)
-		b = append(b, 0x20, c.pGate, 0x28, 0x02)
-		b = utils.AppendULEB128(b, uint32(gid*4)) // i32.load offset=gid*4
-		b = append(b, 0x49)                       // i32.lt_u
+		b = c.emitGateValue(b, gid)
+		b = append(b, 0x49) // i32.lt_u
 		b = append(b, 0x04, 0x40)
 		b = append(b, 0x20, c.lValidMask, 0x41)
 		b = utils.AppendSLEB128(b, int32(^bit))
@@ -482,6 +496,84 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 		b = append(b, 0x0B) // end if
 	}
 	return b
+}
+
+// emitGateValue pushes gate[gid] — from the hoisted local when the body has
+// one, otherwise straight from the caller's array.
+func (c *setFindCtx) emitGateValue(b []byte, gid int) []byte {
+	if c.gateLocalBase != 0 && gid >= 0 && gid < c.cs.idSpaceSize() &&
+		int(c.gateLocalBase)+gid < 256 {
+		return append(b, 0x20, byte(int(c.gateLocalBase)+gid))
+	}
+	return append(append(b, 0x20, c.pGate, 0x28, 0x02),
+		utils.AppendULEB128(nil, uint32(gid*4))...)
+}
+
+// emitGateLocalsPrologue fills the hoisted gate locals, once per call.
+func (c *setFindCtx) emitGateLocalsPrologue(b []byte) []byte {
+	if c.gateLocalBase == 0 {
+		return b
+	}
+	for gid := 0; gid < c.cs.idSpaceSize(); gid++ {
+		if int(c.gateLocalBase)+gid >= 256 {
+			break
+		}
+		b = append(b, 0x20, c.pGate, 0x28, 0x02)
+		b = utils.AppendULEB128(b, uint32(gid*4))
+		b = append(b, 0x21, byte(int(c.gateLocalBase)+gid))
+	}
+	return b
+}
+
+// gateLocalsProfitable decides AT COMPILE TIME whether hoisting the gate array
+// into locals can pay for itself.
+//
+// The trade is 2 instructions per id per CALL against 1 per pattern per
+// CANDIDATE, so it needs a body that evaluates several candidates per call.
+// A LITERAL frontend does not: it skips almost every position, so a call
+// typically evaluates one candidate and the prologue is pure loss — which is
+// the shape of the +5.5% regression the gate jump measured on greedy-3.
+// A set with FALLBACK buckets evaluates every position, so one call over a
+// non-matching input amortises the prologue across the whole input.
+//
+// It is ALSO bounded by the id space, and that bound came from measurement
+// rather than from the argument above. Candidates-per-call is the gap between
+// matches, which is data and not something compile time can know: on a
+// match-dense input a call ends at the first position it tries, and the
+// prologue is pure loss. classchain-32 (32 ids) measured +1.40% on its dense
+// `find` row for exactly that reason, while its no-match row — one call over
+// the whole input — was flat. Capping the id space caps the per-call loss in
+// absolute terms, which is the only bound available without knowing the input.
+//
+// Also bounded by the local index space: local indices are emitted as a single
+// byte throughout these emitters, so the whole block must sit below 256.
+func gateLocalsProfitable(cs *compiledSet, gated bool, localCount int) bool {
+	if !gated || !hasSetFallbackBuckets(cs) {
+		return false
+	}
+	n := cs.idSpaceSize()
+	return n > 0 && n <= maxHoistedGateLocals && localCount+n < 256
+}
+
+// maxHoistedGateLocals bounds F2's per-call prologue. See gateLocalsProfitable.
+const maxHoistedGateLocals = 8
+
+// gateGroups is 1 when F2's gate locals are declared, 0 otherwise — the amount
+// to add to a body's local-GROUP count.
+func gateGroups(n int) byte {
+	if n > 0 {
+		return 1
+	}
+	return 0
+}
+
+// appendGateLocalGroup appends the trailing i32 group holding F2's gate locals.
+func appendGateLocalGroup(b []byte, n int) []byte {
+	if n <= 0 {
+		return b
+	}
+	b = utils.AppendULEB128(b, uint32(n))
+	return append(b, 0x7F)
 }
 
 // sparseBucket reports whether bucket bi carries G17's per-state accept LISTS
@@ -496,7 +588,7 @@ func (c *setFindCtx) sparseBucket(bi int) bool {
 // emitGateWriteback records the reported matches in the gate array, using
 // scratch locals the scan loop has finished with.
 //
-// Write-back runs ONLY for a fully delivered position (§3.11 / D2): an
+// Write-back runs ONLY for a fully delivered position: an
 // overflowing call must leave the array byte-for-byte as it found it, so that
 // the caller's grown retry sees the identical world. The same rule covers the
 // out_cap = 0 size probe.
@@ -525,9 +617,9 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 	b = append(b, 0x03, 0x40)                                   // loop $wb
 	b = append(b, 0x20, lPos, 0x20, c.lTotal, 0x4E, 0x0D, 0x01) // idx >= total → done
 	if c.batch {
-		// §19: the batch worker gates what it DELIVERED, so the loop also
+		// The batch worker gates what it DELIVERED, so the loop also
 		// stops at the buffer. An overflowing position leaves the patterns it
-		// could not report ungated, and the §3.16 pre-mask lets exactly those
+		// could not report ungated, and the gate pre-mask lets exactly those
 		// match again when the caller resumes at this same position.
 		//
 		// Unconditional even in `find` mode, where it cannot fire: the guard
@@ -540,7 +632,7 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x00, 0x21, c.lTmp)   // id
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x04, 0x21, c.lStart) // start
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x08, 0x21, c.lBase)  // end
-	// gate[id] = 2*end + (end > start ? 1 : 2)   — §3.16's biased encoding.
+	// gate[id] = 2*end + (end > start ? 1 : 2)   — the biased gate encoding.
 	b = append(b, 0x20, c.pGate, 0x20, c.lTmp, 0x41, 0x02, 0x74, 0x6A) // &gate[id]
 	b = append(b, 0x20, c.lBase, 0x41, 0x01, 0x74)                     // 2*end
 	b = append(b, 0x41, 0x01, 0x41, 0x02)                              // 1, 2
@@ -559,15 +651,15 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 // emitEmptyMaskSkip leaves the enclosing $skip_group block when no pattern of
 // the group is eligible, so the group's DFA never runs.
 //
-// THIS is what collapses §3.14's quadratic, and it was missing: emitGateMask
+// THIS is what collapses the quadratic, and it was missing: emitGateMask
 // computed the pre-mask and the body then called the suffix DFA anyway, which
 // walked to its full extent only to AND every accept bit with zero. Measured
-// on §3.14's own ladder (`a+` over n x "a", gated, driven to exhaustion) the
+// on the gate ladder (`a+` over n x "a", gated, driven to exhaustion) the
 // terminating call cost 7.8M fuel at n=500 and 1.98B at n=8000 — x4 per
-// doubling, textbook O(n^2). §10.5 read that as linear because TestGatedLadder
+// doubling, textbook O(n^2). An earlier measurement read that as linear because TestGatedLadder
 // counted calls rather than work.
 //
-// It is emitted for every mode, not just the gated one: emitValidMask starts
+// It is emitted for every mode, not just the gated one: the valid mask starts
 // from the trivial-prefix mask and ORs in only the patterns whose anchor and
 // backward-prefix checks pass, so an empty mask is reachable without any gate
 // being involved. A suffix call with mask 0 can only return 0 (every accept is
@@ -577,7 +669,7 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 	// empty mask does NOT mean the group has nothing left to report — patterns
 	// 32.. are simply invisible to it. Skipping the group on that lost every
 	// pattern past the 32nd once the first 32 had been gated off, which showed
-	// up as a gated batch delivering exactly 32 tuples of 40 (SETS §23; the
+	// up as a gated batch delivering exactly 32 tuples of 40 (the
 	// body applies the real per-pattern rule itself, see set_sparse.go's
 	// header).
 	if c.sparseBucket(bi) {
@@ -593,7 +685,8 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 
 // scan_all group retirement: MEASURED AND REJECTED.
 //
-// §3.13 wanted "retire each pattern once it hits", and §10.2(2) recorded the
+// The original design wanted "retire each pattern once it hits", and an
+// earlier note recorded the
 // per-bucket-local version as unimplementable (WASM local indices are a single
 // byte here, so a large set runs out of slots). A cheaper form does exist —
 // test the i64 accumulator against the group's compile-time-constant global
@@ -609,7 +702,7 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 // others never hit — a workload no benchmark here has, and inventing one to
 // justify the code would be backwards. CLAUDE.md's Gap I is this lesson.
 //
-// Recorded rather than silently dropped, so anyone revisiting §3.13's
+// Recorded rather than silently dropped, so anyone revisiting that
 // retirement idea knows it has been tried at this level and what it measured.
 
 // maskCanBeEmpty reports whether `lValidMask & g.mask` can be zero at the
@@ -620,7 +713,7 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 // none of them applies the mask is a known non-zero constant and the skip is
 // dead code:
 //
-//   - the §3.16 gate pre-mask, which exists only in the gated `find` body;
+//   - the gate pre-mask, which exists only in the gated `find` body;
 //   - a trivial-prefix (L == 0) group whose patterns are all anchored, whose
 //     base is then 0 until the position test enables them;
 //   - nothing else: a fixed-prefix (L > 0) group starts from the full g.mask
@@ -640,7 +733,7 @@ func (c *setFindCtx) maskCanBeEmpty(bi int, g prefixLenGroup) bool {
 //
 // It is deliberately NOT "does pGate exist": an overlapping body that emits
 // no preflight carries the pointer for signature uniformity and must still
-// emit no loads, so that every set which gains nothing from SETS_PLAN item 11
+// emit no loads, so that every set which gains nothing from the gate slot
 // stays byte-identical to before it. That is what the setperf run confirms —
 // the 29 overlapping rows without a preflight moved by the one instruction
 // that pushes the extra argument, and by nothing else.
@@ -679,7 +772,7 @@ func (c *setFindCtx) maskEmptyFromAnchors(bi int, g prefixLenGroup) bool {
 func (c *setFindCtx) emitGateSkipSingle(b []byte, bi int, g prefixLenGroup) []byte {
 	gid := -1
 	for k, id := range c.cs.patternIDs[bi] {
-		if k >= 32 {
+		if k >= bucketMaskBits {
 			break
 		}
 		if g.mask&(uint32(1)<<uint(k)) != 0 {
@@ -690,10 +783,9 @@ func (c *setFindCtx) emitGateSkipSingle(b []byte, bi int, g prefixLenGroup) []by
 	if gid < 0 {
 		return b
 	}
-	// if (2*lStart + 1) < gate[gid] → br $skip_group   (§3.16 pre-mask bound)
+	// if (2*lStart + 1) < gate[gid] → br $skip_group   (pre-mask bound)
 	b = append(b, 0x20, c.lStart, 0x41, 0x01, 0x74, 0x41, 0x01, 0x6A)
-	b = append(b, 0x20, c.pGate, 0x28, 0x02)
-	b = utils.AppendULEB128(b, uint32(gid*4))
+	b = c.emitGateValue(b, gid)
 	b = append(b, 0x49)       // i32.lt_u
 	b = append(b, 0x0D, 0x00) // br_if $skip_group
 	return b
@@ -716,7 +808,7 @@ func setPatternIDs(cs *compiledSet) []int {
 	return out
 }
 
-// jumpIsProfitable decides AT COMPILE TIME whether emitting the §3.14 jump can
+// jumpIsProfitable decides AT COMPILE TIME whether emitting the gate jump can
 // pay for itself.
 //
 // The jump advances to the MINIMUM next-eligible position over all patterns,
@@ -729,19 +821,19 @@ func setPatternIDs(cs *compiledSet) []int {
 // instructions on each of ~1,460 calls.
 //
 // With ONE pattern there is nobody to pin the minimum. After reporting (s, e)
-// the gate gives p_min = e while the caller resumes at from = s+1 (§4.8), so
+// the gate gives p_min = e while the caller resumes at from = s+1, so
 // the jump fires whenever the match is at least two bytes long, and what it
-// skips is the whole match extent. That is precisely §3.14's motivating case
+// skips is the whole match extent. That is precisely the jump's motivating case
 // (`a+` over a run of `a`s: 7,999 stepped positions become one leap) and the
-// shape re2test's one-pattern-set mode drives over the entire corpus (§10.3).
+// shape re2test's one-pattern-set mode drives over the entire corpus.
 //
 // The remaining static test is whether a match can exceed one byte at all: a
 // pattern that cannot never satisfies e > s+1, so the prologue would be dead
 // code. regexpMinMaxLen answers that (maxLen == -1 means unbounded).
 //
 // Multi-pattern sets were NOT undecidable-so-assume-yes here; they were
-// measured-negative — but only on a LITERAL-frontend set (see §12.3). That
-// measurement is what task G13 (§21.4) narrows: log-levels-dense costs ~1K
+// measured-negative — but only on a LITERAL-frontend set. That
+// measurement is what task G13 narrows: log-levels-dense costs ~1K
 // fuel per call because Teddy skips the whole line, so an O(patterns)
 // prologue is +6.8% of a small number. A SCALAR-frontend set has no such
 // skip: its calls cost Θ(n) at ~55 fuel per stepped position, against which
@@ -752,7 +844,7 @@ func setPatternIDs(cs *compiledSet) []int {
 //
 // The maxLen test is unchanged in intent but now quantifies over the whole
 // set: if NO pattern can match more than one byte, then after reporting (s,
-// s+1) every gate gives p_min = s+1 = from (§4.8) and the jump can never
+// s+1) every gate gives p_min = s+1 = from and the jump can never
 // fire, so the prologue would be dead code. regexpMinMaxLen answers that
 // (maxLen == -1 means unbounded).
 // The frontend test comes FIRST because patternFullAST re-parses the pattern:
@@ -780,25 +872,8 @@ func (cs *compiledSet) jumpIsProfitable() bool {
 	return false
 }
 
-// emitGateJump advances lPos past every position at which no pattern can
-// possibly match — §3.14's second optimisation ("jump, don't step"), which was
-// never built.
-//
-// Pattern k's earliest eligible position is the smallest p with
-// 2p + 1 >= gate[k], i.e. ceil((gate[k]-1)/2), which for the §3.16 encoding is
-// exactly gate[k] >> 1: g = 2e+1 gives e, g = 2e+2 gives e+1, and g <= 1 gives
-// 0. Below min_k of that, the pre-mask clears every pattern, so no position
-// there can produce output and the scan may skip straight to it.
-//
-// The whole computation is hoisted to the prologue rather than repeated per
-// position, which is sound because the gate array cannot change during a call:
-// write-back runs once, after the scan loop has finished (emitGateWriteback).
-// So this is O(patterns) once per call, replacing O(patterns) at every skipped
-// position. As §3.14 notes, it only fires when EVERY pattern is gated past
-// `from` — one never-matched pattern pins the minimum at 0 — which is why the
-// mask skip above, not this, is the load-bearing half.
 // emitAllEligibleFrom computes lAllElig = max_k(gate[k]) >> 1 once per call —
-// the smallest match start at which the §3.16 pre-mask clears NOTHING.
+// the smallest match start at which the gate pre-mask clears NOTHING.
 //
 // Pattern k survives the pre-mask at start s while `2s + 1 >= gate[k]`, so
 // every pattern survives while `2s + 1 >= max_k gate[k]`, and the smallest
@@ -878,6 +953,23 @@ func (c *setFindCtx) anyGroupCanShortcut() bool {
 	return false
 }
 
+// emitGateJump advances lPos past every position at which no pattern can
+// possibly match — the gate's second optimisation ("jump, don't step"), which was
+// never built.
+//
+// Pattern k's earliest eligible position is the smallest p with
+// 2p + 1 >= gate[k], i.e. ceil((gate[k]-1)/2), which for the biased encoding is
+// exactly gate[k] >> 1: g = 2e+1 gives e, g = 2e+2 gives e+1, and g <= 1 gives
+// 0. Below min_k of that, the pre-mask clears every pattern, so no position
+// there can produce output and the scan may skip straight to it.
+//
+// The whole computation is hoisted to the prologue rather than repeated per
+// position, which is sound because the gate array cannot change during a call:
+// write-back runs once, after the scan loop has finished (emitGateWriteback).
+// So this is O(patterns) once per call, replacing O(patterns) at every skipped
+// position. It only fires when EVERY pattern is gated past
+// `from` — one never-matched pattern pins the minimum at 0 — which is why the
+// mask skip above, not this, is the load-bearing half.
 func (c *setFindCtx) emitGateJump(b []byte, lPos byte) []byte {
 	// Gated bodies only, and MEASURED so rather than assumed. An overlapping
 	// body's gates hold 1 for an alive pattern, so the minimum over
@@ -937,7 +1029,7 @@ func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mas
 	if c.gated {
 		b = append(b, 0x20, c.pGate)
 	} else if c.cs.suffixHasSkip {
-		// §19: rebase the position-level skip onto this call's tuple index
+		// Rebase the position-level skip onto this call's tuple index
 		// space. lBase tuples are already committed at this position, so a
 		// tuple with local index i is position-index lBase+i and must be
 		// written when lBase+i >= skip. The suffix compares against `skip -
@@ -959,7 +1051,7 @@ func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mas
 // emitBucketAt emits the complete per-candidate evaluation of bucket bi with
 // its mandatory literal at posLocal (litLen == 0 for a fallback bucket, whose
 // suffix DFA models the whole pattern anchored at posLocal).
-// Order within a group is deliberate and is the §11 R6 fix: cheap static mask,
+// Order within a group is deliberate: cheap static mask,
 // then the two start guards, then the gate pre-mask, then the empty-mask skip
 // — and only after all of those, the backward prefix DFA calls, which are the
 // expensive part. Each stage can retire the group before the next one runs.
@@ -979,7 +1071,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		b = append(b, 0x21, c.lStart)
 		b = c.emitStartGuards(b, g.L != 0)
 		b = c.emitGroupMask(b, bi, g, posLocal)
-		// First-byte eligibility comes FIRST (SETS_PLAN item 22 fix 2b). Both
+		// First-byte eligibility comes FIRST. Both
 		// it and the gate chain only refine lValidMask, so their order is
 		// semantics-free — but the costs are not remotely equal. The gate
 		// chain unrolls a load and a compare PER PATTERN (~190 fuel at 32
@@ -1043,7 +1135,12 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 //     anyway would index whatever follows the input and could clear a pattern
 //     that genuinely matches empty there.
 func (c *setFindCtx) emitStartableMask(b []byte, bi int, g prefixLenGroup, posLocal byte) []byte {
-	if c.mode != capFind || g.L != 0 {
+	// Mode-INDEPENDENT. The table says which patterns can BEGIN at a byte,
+	// which is as true for a scan as for a find; the gate was a leftover from
+	// G16 shipping on the find path first. The remaining
+	// conditions are the real ones: L must be 0, and the emission side decides
+	// which buckets have a table at all.
+	if g.L != 0 {
 		return b
 	}
 	if bi >= len(c.cs.startableOff) || c.cs.startableOff[bi] < 0 {
@@ -1089,8 +1186,7 @@ func (c *setFindCtx) emitProbeCall(b []byte, bi, litLen int, posLocal byte, mask
 }
 
 // emitProbeOverflowEscape returns abi.BTStackOverflow out of the whole
-// capability the moment a Backtracking probe reports it (SETS_PLAN item 20
-// task 20.D).
+// capability the moment a Backtracking probe reports it.
 //
 // Returning IMMEDIATELY is the point. A probe that gave up has not proved a
 // non-match, so folding its answer into the accumulator — an id, a boolean, a
@@ -1133,15 +1229,9 @@ func (c *setFindCtx) emitRecordProbe(b []byte, bi int) []byte {
 		return c.emitRecordSparseProbe(b, bi)
 	}
 	switch c.mode {
-	case capScan:
-		// Any bit settles a boolean answer.
-		b = append(b, 0x20, c.lTmp, 0x04, 0x40)
-		b = append(b, 0x41, 0x01, 0x21, c.lTotal)
-		b = append(b, 0x0B)
-		return b
 	case capScanAny:
 		// One arbitrary id matching anywhere at or after `from`. `scan_any`
-		// reports no start (TODO task 59 decision (10)), so there is nothing
+		// reports no start, so there is nothing
 		// to improve on once an id is recorded and no reason to keep looking
 		// for an earlier candidate — the drain check exits at the first hit,
 		// exactly as `scan`'s does. No escape depth: leaving the loop is that
@@ -1158,24 +1248,23 @@ func (c *setFindCtx) emitRecordProbe(b []byte, bi int) []byte {
 }
 
 // emitRecordSparseProbe folds a SPARSE bucket's probe result into the mode's
-// answer (SETS §23, G17).
+// answer.
 //
 // A sparse probe cannot return a bucket-local bitmask — that is the 32-pattern
 // ceiling it exists to escape — so it returns a COUNT and leaves the matching
-// GLOBAL ids in the bucket's scratch. The ids are already global, which makes
-// this simpler than the bitmask path: there is no bucket-local-to-global
-// mapping to unroll, just a loop.
+// BUCKET-LOCAL indices in the bucket's scratch, which the code below maps to
+// global ids through sparseIDMapOff.
+//
+// What makes this simpler than the bitmask path is that it is a LOOP rather
+// than a compile-time unrolled chain — not that the mapping is absent. The
+// comment here used to say the ids "are already global, no mapping to unroll",
+// which a reader simplifying per the comment would act on by writing ids in
+// the wrong space, straight into the caller's arrays.
 func (c *setFindCtx) emitRecordSparseProbe(b []byte, bi int) []byte {
 	sc := c.cs.buckets[bi].sparseScratch
 	switch c.mode {
-	case capScan:
-		// Any hit settles a boolean answer; the count is enough.
-		b = append(b, 0x20, c.lTmp, 0x04, 0x40)
-		b = append(b, 0x41, 0x01, 0x21, c.lTotal)
-		b = append(b, 0x0B)
-		return b
 	case capScanAny:
-		// Which id is unspecified (§3.5), so the first collected one will do.
+		// Which id is unspecified, so the first collected one will do.
 		b = append(b, 0x20, c.lTmp, 0x04, 0x40)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, c.cs.buckets[bi].sparseIDMapOff)
@@ -1209,21 +1298,9 @@ func (c *setFindCtx) emitRecordSparseProbe(b []byte, bi int) []byte {
 		b = appendTableLoad32(b, c.cs.tableMemIdx, 0)
 		b = append(b, 0x21, c.lBase) // the global id
 		if c.wideBitmap {
-			// Count only 0->1 transitions so lTotal stays DISTINCT patterns.
-			b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41, 0x03, 0x76, 0x6A)
-			b = appendTableLoad8u(b, 0)
-			b = append(b, 0x41, 0x01, 0x20, c.lBase, 0x41, 0x07, 0x71, 0x74)
-			b = append(b, 0x71, 0x45, 0x04, 0x40) // (old & mask) == 0
-			b = append(b, 0x20, c.lTotal, 0x41, 0x01, 0x6A, 0x21, c.lTotal)
-			b = append(b, 0x0B)
-			b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41, 0x03, 0x76, 0x6A)
-			b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41, 0x03, 0x76, 0x6A)
-			b = appendTableLoad8u(b, 0)
-			b = append(b, 0x41, 0x01, 0x20, c.lBase, 0x41, 0x07, 0x71, 0x74, 0x72)
-			b = appendTableStore8(b, 0)
+			b = emitWideBitmapSet(b, c.pOutPtr, c.lBase, c.lTotal)
 		} else {
-			b = append(b, 0x20, c.lAcc, 0x42, 0x01)
-			b = append(b, 0x20, c.lBase, 0xAD, 0x86, 0x84, 0x21, c.lAcc)
+			b = emitAccOrID(b, c.lAcc, c.lBase)
 		}
 		b = append(b, 0x20, c.lStart, 0x41, 0x01, 0x6A, 0x21, c.lStart)
 		b = append(b, 0x20, c.lStart, 0x20, c.lTmp, 0x49, 0x0D, 0x00)
@@ -1254,10 +1331,8 @@ func (c *setFindCtx) emitFindPrologue(b []byte, lPos byte) []byte {
 // emitEpilogue pushes the body's return value.
 func (c *setFindCtx) emitEpilogue(b []byte) []byte {
 	switch c.mode {
-	case capScan:
-		return append(b, 0x20, c.lTotal) // 1 iff some probe reported a hit
 	case capScanAny:
-		// A bare pattern id, or -1 (TODO task 59 decision (10)). lOutBase is
+		// A bare pattern id, or -1. lOutBase is
 		// initialised to -1 and only ever written with a real id, so it IS
 		// the answer.
 		return append(b, 0x20, c.lOutBase)
@@ -1271,16 +1346,11 @@ func (c *setFindCtx) emitEpilogue(b []byte) []byte {
 	}
 }
 
-// emitDrainCheck emits the §9.4 drain test as a br_if to the given depth: once
+// emitDrainCheck emits the drain test as a br_if to the given depth: once
 // no remaining candidate can produce a start at or before lMinStart, the scan
 // is finished.
 func (c *setFindCtx) emitDrainCheck(b []byte, lPos byte, depth byte) []byte {
 	switch c.mode {
-	case capScan:
-		// A boolean answer is settled by the first hit; finishing the current
-		// position or chunk costs nothing measurable and keeps this check
-		// independent of each frontend's block nesting.
-		return append(b, 0x20, c.lTotal, 0x0D, depth)
 	case capScanAny:
 		// Settled by the first hit for the same reason, now that no start is
 		// reported: any recorded id is a final answer. lOutBase is -1 until
@@ -1289,7 +1359,7 @@ func (c *setFindCtx) emitDrainCheck(b []byte, lPos byte, depth byte) []byte {
 	case capScanAll:
 		// No first-position notion at all: scan_all asks which patterns match
 		// ANYWHERE at or after `from`, so the only early exit is "every
-		// pattern has already been seen" (§3.13).
+		// pattern has already been seen".
 		if c.wideBitmap {
 			// lTotal counts DISTINCT patterns seen, so the bound is how many
 			// patterns the set has — not the id space. Comparing against the
@@ -1324,7 +1394,54 @@ func (c *setFindCtx) emitDrainCheck(b []byte, lPos byte, depth byte) []byte {
 // call. The Teddy and AC bodies do not use it: their
 // frontends already identify WHICH literal fired, so they dispatch straight to
 // that literal's buckets instead of re-testing all of them.
+// firstByteLocal is 0 when the caller has no local to hoist input[lPos] into.
+// Local index 0 is always a PARAMETER (pInPtr), so it can never name a real
+// scratch local and doubles as the "not offered" signal.
+const noFirstByteLocal = byte(0)
+
+// minHoistedLiteralBuckets is how many literal buckets must share a position
+// before hoisting its first byte is worth the guarded load and select. Below
+// it the hoist is pure overhead — see emitLiteralBucketsHoisted.
+const minHoistedLiteralBuckets = 4
+
 func (c *setFindCtx) emitLiteralBuckets(b []byte, lPos byte) []byte {
+	return c.emitLiteralBucketsHoisted(b, lPos, noFirstByteLocal)
+}
+
+// emitLiteralBucketsHoisted is emitLiteralBuckets with the option of loading
+// input[lPos] ONCE per position into firstByteLocal instead of once per bucket.
+//
+// Every bucket's first compare reads the same byte. An AC-demoted scalar set
+// carries dozens to hundreds of buckets, so that is N loads of one byte at
+// every position — and the load is the whole cost of the compare for the
+// buckets that do not match, which is nearly all of them. Bytes at li >= 1 are
+// still loaded per bucket: they differ by literal length and are only reached
+// once the first byte has already matched.
+//
+// The hoisted load must be GUARDED by lPos < len: the scan loop visits
+// position len itself (for `$`-anchored patterns), where there is no byte to
+// read. The per-bucket fit test below would have rejected every bucket there
+// anyway, which is why the unhoisted form needs no guard.
+func (c *setFindCtx) emitLiteralBucketsHoisted(b []byte, lPos, firstByteLocal byte) []byte {
+	// PROFITABILITY. The hoist trades N per-bucket loads for one guarded load
+	// plus a select, so it pays only once several buckets share the position.
+	// Measured: applying it unconditionally cost classchain and greedy-3
+	// between +1.6% and +10.5% fuel — those sets have NO literal buckets at
+	// all, so the hoisted load ran at every position for nothing.
+	if len(litOrderFor(c.cs)) < minHoistedLiteralBuckets {
+		firstByteLocal = noFirstByteLocal
+	}
+	if firstByteLocal != noFirstByteLocal {
+		// firstByte = lPos < len ? input[lPos] : -1   (-1 matches no literal)
+		b = append(b, 0x20, lPos, 0x20, c.pInLen, 0x49) // i32.lt_u
+		b = append(b, 0x04, 0x7F)                       // if (result i32)
+		b = append(b, 0x20, c.pInPtr, 0x20, lPos, 0x6A)
+		b = appendInputLoad8u(b)
+		b = append(b, 0x05)       // else
+		b = append(b, 0x41, 0x7F) // i32.const -1
+		b = append(b, 0x0B)       // end if
+		b = append(b, 0x21, firstByteLocal)
+	}
 	for _, bi := range litOrderFor(c.cs) {
 		lit := []byte(c.cs.buckets[bi].literal)
 		litLen := len(lit)
@@ -1336,13 +1453,17 @@ func (c *setFindCtx) emitLiteralBuckets(b []byte, lPos byte) []byte {
 		b = append(b, 0x6A, 0x20, c.pInLen, 0x4B, 0x0D, 0x00)
 
 		for li, lb := range lit {
-			b = append(b, 0x20, c.pInPtr, 0x20, lPos, 0x6A)
-			if li > 0 {
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(li))
-				b = append(b, 0x6A)
+			if li == 0 && firstByteLocal != noFirstByteLocal {
+				b = append(b, 0x20, firstByteLocal)
+			} else {
+				b = append(b, 0x20, c.pInPtr, 0x20, lPos, 0x6A)
+				if li > 0 {
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, int32(li))
+					b = append(b, 0x6A)
+				}
+				b = appendInputLoad8u(b)
 			}
-			b = appendInputLoad8u(b)
 			b = append(b, 0x41)
 			b = utils.AppendSLEB128(b, int32(lb))
 			b = append(b, 0x47, 0x0D, 0x00) // ne → skip this bucket
@@ -1411,7 +1532,7 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 		// probeFnBase is the scan-probe base; the first-hit bodies follow the
 		// ordinary ones, so their base is that plus however many there are.
 		anyProbeBase: probeFnBase + len(cs.scanProbeBodies),
-		useAnyProbe:  mode == capScan || mode == capScanAny,
+		useAnyProbe:  mode == capScanAny,
 		maxLookback:  cs.maxLookback, drainSlack: drainSlack,
 		gated:   gated,
 		batch:   batch,
@@ -1435,7 +1556,7 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 		switch {
 		case batch && gated:
 			// The shared worker's trailing argument: 0 = `find`'s
-			// transactional gate rule, non-zero = §19's deliver-and-gate.
+			// transactional gate rule, non-zero = the batch deliver-and-gate.
 			c.pBatchMode = 6
 			c.localBase = 7
 		case hasSkip:

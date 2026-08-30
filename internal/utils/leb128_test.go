@@ -9,7 +9,7 @@ import (
 // AppendSLEB128_64 was at 0%, which is a poor place for a gap: it exists
 // BECAUSE the 32-bit encoder is wrong for the values it handles, and using the
 // wrong one produces a module that validates and computes the wrong answer.
-// That is not hypothetical — FUZZER_BUGS 63's investigation found an emitter
+// That is not hypothetical — an earlier investigation found an emitter
 // writing an i64.const through AppendULEB128 with a uint32 cast, so `1 << 6`
 // became the single byte 0x40 and decoded as -64. Only an 8-pattern bucket
 // could see it.

@@ -56,7 +56,7 @@ type backtrack struct {
 	// directions: (a) `(?:a*|b*)*` on "b" started returning a wrong
 	// non-empty match, because the outer loop's own re-entry at the same
 	// position is *also* how the "still-pending sibling branch" mechanism
-	// (task 20) works, and blocking it suppressed that sibling; (b) even
+	//  works, and blocking it suppressed that sibling; (b) even
 	// where it produced the right answer (`(?:a*)+^`), it did so by
 	// accident — the trace showed it only worked because it happened not
 	// to disturb the specific revisit the zero-progress guard needed.
@@ -2660,7 +2660,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 
 	const locAttemptStart = byte(0x07)
 
-	// The find-from seed (task 54). Placed here because everything above is
+	// The find-from seed. Placed here because everything above is
 	// the locals declaration and everything below reads attempt_start. This
 	// body already handles a nonzero start — its memo-skip computes
 	// `attempt_start >> 3` precisely so earlier bytes are not revisited — it

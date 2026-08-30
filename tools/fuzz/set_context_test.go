@@ -8,7 +8,7 @@ import (
 // Context-sensitive assertions inside sets: `from` never narrows the input,
 // so \b and (?m:^) must judge real neighbouring bytes.
 //
-// The whole-input oracle here is the §9.6 "context-sensitive" technique:
+// The whole-input oracle here is the "context-sensitive" technique:
 // `\A(?s:.{p})(?:pat)` hands `pat` position p with its REAL left context, so
 // `\b` and `(?m:^)` judge actual neighbours rather than a slice boundary. The
 // `.{p}` prefix counts runes, so every input below is ASCII.
@@ -92,7 +92,7 @@ func TestSetLineAnchors(t *testing.T) {
 	}
 }
 
-// TestSetTextAnchorIgnoresFrom pins §4.2: \A is anchored to real input
+// TestSetTextAnchorIgnoresFrom pins the anchor contract: \A is anchored to real input
 // position 0 whatever `from` the caller passed. Driving find to exhaustion
 // covers every from value in turn.
 func TestSetTextAnchorIgnoresFrom(t *testing.T) {

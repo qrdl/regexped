@@ -494,6 +494,16 @@ implementation to check against.
 WASM instructions, and Rust→WASM codegen differs structurally from our
 hand-emitted WASM. Track the ratio, never a single absolute number.
 
+**Two corpus fixes have invalidated cross-date comparisons.**
+
+The `sharedsuffix-32` and `diverse-32` "sparse" corpora matched NOTHING until
+2026-08-30 (FABLE_REVIEW P3/P4): sharedsuffix's needle was `kw000abc` against
+`kw000(?:alpha|beta|gamma)`, and diverse had no `sampleNeedles` arm at all and
+fell through to the literal `"xy"`. Both rows were second no-match corpora
+under a "sparse" label, and sharedsuffix's suffix-TABLE path — the only one in
+the matrix — was never measured. `sampleNeedles`' `default:` arm is now a hard
+error, since three incidents have now shared that one cause.
+
 **The classchain corpus fix of 2026-08-28 rebaselined this tool.**
 `sampleNeedles` had no arm for `[a-z]{A}[0-9]{B}`, so classchain's "dense"
 corpus planted needles with no digit and matched nothing — its dense rows were

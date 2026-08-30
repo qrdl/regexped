@@ -7,7 +7,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// The ANCHORED union automaton — SETS_PLAN item 22 fix 1b.
+// The ANCHORED union automaton.
 //
 // `match_any` and `match_all` ask one question of the whole input: which
 // patterns match it from 0 to len. The bucket packer answers it with
@@ -52,7 +52,14 @@ import (
 //     make "can a match END here" cheap on EVERY byte; an anchored run asks
 //     only at the end, where set_union_scan.go's own comment already notes a
 //     load costs nothing worth reordering for.
-type anchoredUnion = unionScanDFA
+//
+// A DEFINED type, not an alias. The two share a representation but not an
+// invariant set: an anchored automaton leaves acceptOff/eofOff at -1 in the
+// wide form and emits no mid-accept tables at all, so handing one to
+// emitUnionScanBody would produce an i64 load at a negative address — a wrong
+// answer, not a trap. With a defined type the scan-only emitters cannot
+// receive one, and the shared helpers take the embedded struct explicitly.
+type anchoredUnion struct{ unionScanDFA }
 
 // anchoredUnionBeatsBuckets reports whether replacing this anchored packing
 // with one union automaton can pay.
@@ -83,7 +90,15 @@ func anchoredUnionBeatsBuckets(buckets []*bucket) bool {
 // wantAll controls only whether the `_all` bitmap rows are emitted, exactly as
 // spec.ScanAll does for the scan automaton: a set that exports no `match_all`
 // pays no table for it.
-func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll bool) *anchoredUnion {
+//
+// forceWideAll is the caller's already-decided `_all` ABI (compiledSet.wideAll).
+// The two decisions are independent inputs — the ABI can be wide for a reason
+// this builder cannot see (a Backtracking member, or a DECLARED id space wider
+// than the ids actually present) — and if they disagree the emitted match_all
+// body is a no-op that returns 0 on every input: emitAnchoredOrRow is selected
+// by the ABI but reads rowBytes/bitmapBytes the narrow automaton never filled
+// in. So the automaton follows the ABI.
+func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll, forceWideAll bool) *anchoredUnion {
 	if len(spec.Patterns) == 0 {
 		return nil
 	}
@@ -97,7 +112,7 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll bool) *anchore
 	if idSpace > maxUnionScanIDs || len(spec.Patterns) > maxUnionScanIDs {
 		return nil
 	}
-	wide := idSpace > 64 || len(spec.Patterns) > 64
+	wide := idSpace > wideBitmapThreshold || len(spec.Patterns) > wideBitmapThreshold || forceWideAll
 
 	progs := make([]*syntax.Prog, 0, len(spec.Patterns))
 	for _, p := range spec.Patterns {
@@ -155,10 +170,25 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll bool) *anchore
 	if hasNeverDyingState(tbl) {
 		return nil
 	}
+	// The MEMBER flavour of the same argument, as a LOCAL predicate.
+	//
+	// hasNeverDyingState only sees DOMINANT self-loops (a state most bytes
+	// return to). A state whose self-loop is a small member set — an `a+`-like
+	// pattern — walks saturated runs just as long, and the per-bucket probe
+	// bulk-skips those too (genAnchoredWASM is handed memberWalkStates as well
+	// as dominantSkip). Taking the union for such a set is the same +1100%
+	// trade in a different disguise.
+	//
+	// Deliberately NOT folded into hasNeverDyingState: that predicate gates
+	// G8/G9 elsewhere, and widening it would re-gate those on an argument they
+	// were not measured under.
+	if len(memberWalkStates(tbl)) > 0 {
+		return nil
+	}
 
 	// State 0 is DEAD; real state s becomes s+1.
 	numStates := d.numStates + 1
-	u := &anchoredUnion{
+	au := &anchoredUnion{unionScanDFA{
 		numStates: numStates, startState: d.start + 1, midStartState: d.start + 1,
 		maskWords: 1, acceptOff: -1, eofOff: -1,
 		midReprOff: -1, eofReprOff: -1, midWordsOff: -1, eofWordsOff: -1,
@@ -166,8 +196,10 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll bool) *anchore
 		// concerned: nothing reads midAcceptLimit, and leaving it 0 keeps any
 		// shared helper from emitting a mid-accept arm.
 		midAcceptLimit: 0,
-	}
+	}}
+	u := &au.unionScanDFA
 	if wide {
+		u.wideAccept = true
 		u.maskWords = (idSpace + 63) / 64
 		u.rowBytes = u.maskWords * 8
 		u.bitmapBytes = (idSpace + 7) / 8
@@ -250,11 +282,14 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll bool) *anchore
 		for s := 0; s < d.numStates; s++ {
 			binary.LittleEndian.PutUint64(eof[(s+1)*8:], remap(d.accepting[s]))
 		}
+		// 8-aligned: a u64 table read with an i64 load on every EOF check, and
+		// the transition table above it can end anywhere.
+		off = (off + 7) &^ 7
 		u.eofOff = off
 		u.tableEnd = u.eofOff + int32(len(eof))
 		u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.eofOff, eof)...)
 		u.dataSegs++
-		return u
+		return au
 	}
 
 	wideRow := func(list []uint16) (int32, []byte) {
@@ -262,7 +297,12 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll bool) *anchore
 		repr := int32(0)
 		for _, k := range list {
 			if int(k) >= len(spec.PatternIDs) {
-				continue
+				// A pattern index the spec has no id for cannot be answered
+				// for, and SKIPPING it is a silent "no match" for that pattern
+				// in a wide scan — the one outcome no defensive `continue`
+				// should produce. The lists come from the very progs built
+				// from spec.Patterns, so this is unreachable by construction.
+				panic("compile: union accept list names a pattern index outside the spec")
 			}
 			gid := spec.PatternIDs[k]
 			row[gid/8] |= 1 << uint(gid%8)
@@ -279,6 +319,8 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll bool) *anchore
 		binary.LittleEndian.PutUint32(eofRepr[(s+1)*4:], uint32(er))
 		copy(eofWords[(s+1)*u.rowBytes:], erow)
 	}
+	// 4-aligned: the repr table is read with an i32 load.
+	off = (off + 3) &^ 3
 	u.eofReprOff = off
 	u.tableEnd = u.eofReprOff + int32(len(eofRepr))
 	u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.eofReprOff, eofRepr)...)
@@ -292,7 +334,7 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll bool) *anchore
 		u.dataBytes = append(u.dataBytes, appendDataSegment(nil, u.eofWordsOff, eofWords)...)
 		u.dataSegs++
 	}
-	return u
+	return au
 }
 
 // emitAnchoredUnionBody emits one anchored capability over the union automaton.
@@ -349,7 +391,7 @@ func emitAnchoredUnionBody(u *anchoredUnion, kind setCapKind, wideAll bool, tabl
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $scan
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
-	b = emitUnionTransitionOffset(b, u, pInPtr, lPos, lState, 0, tableMemIdx)
+	b = emitUnionTransitionOffset(b, &u.unionScanDFA, pInPtr, lPos, lState, 0, tableMemIdx)
 	b = append(b, 0x20, lState, 0x45, 0x0D, 0x01) // dead: leave, state 0 answers "nothing"
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
 	b = append(b, 0x0C, 0x00)

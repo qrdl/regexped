@@ -42,7 +42,7 @@ import (
 //   - gated (the default): the worker records gates for the tuples it
 //     DELIVERED rather than for a position that fitted whole, so re-entering
 //     the position finds exactly the undelivered patterns still eligible under
-//     the §3.16 pre-mask. k stays 0.
+//     the gate pre-mask. k stays 0.
 //   - overlapping: there is no gate array, so k is passed to the worker as an
 //     explicit `skip` and the suffix functions count-but-do-not-write below it.
 //
@@ -77,7 +77,7 @@ func setCursorMaxCount(patternCount int) int32 { return config.SetCursorMaxCount
 // rather than compile-time variants:
 //
 //   - gated: the gate write-back rule. `find` is transactional at position
-//     granularity (§3.11 — an overflowing position records nothing and does
+//     granularity — an overflowing position records nothing and does
 //     not advance); the batch loop gates what it DELIVERED so it can resume
 //     inside a split position. That is one parameter, `batch_mode`, tested
 //     once per position.
@@ -89,11 +89,11 @@ func emitSetWorkerBody(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemI
 }
 
 // workerTypeIdx is the WASM type of the shared worker: `find`'s own signature
-// plus one trailing i32 — `batch_mode` when gated, §19's `skip` when not.
+// plus one trailing i32 — `batch_mode` when gated, the batch `skip` when not.
 func (cs *compiledSet) workerTypeIdx() int {
 	// Both flavours carry the gate slot now (findGateSlot), so both workers
 	// are (ptr, len, from, gate, out, cap, trailing) -> i32. The trailing
-	// argument is `batch_mode` when gated and §19's `skip` when not.
+	// argument is `batch_mode` when gated and the batch `skip` when not.
 	return setMatchTypeSuffix // (i32 x 7) -> i32
 }
 
@@ -107,10 +107,13 @@ func (cs *compiledSet) workerTypeIdx() int {
 // gate slot for its preflight verdict; only the trailing argument's meaning
 // differs, and `find` zeroes it either way.
 func emitSetFindWrapperBody(cs *compiledSet, workerIdx int) []byte {
-	nparams := 5
-	if cs.findGateSlot() {
-		nparams = 6
+	// SIX parameters, always. findGateSlot() is hasFind() by another name and
+	// this wrapper is only emitted for a set with `find`, so the 5-parameter
+	// branch that used to stand here could not be taken.
+	if !cs.findGateSlot() {
+		panic("compile: the find wrapper was emitted for a set with no gate slot")
 	}
+	const nparams = 6
 	b := []byte{0x00} // no locals
 	for i := 0; i < nparams; i++ {
 		b = append(b, 0x20, byte(i))
@@ -125,10 +128,13 @@ func emitSetFindWrapperBody(cs *compiledSet, workerIdx int) []byte {
 
 // emitSetFindBatchBody emits the exported find_batch loop.
 //
-// Signature, both flavours: (ptr, len, cursor i64, gate_ptr, out_ptr, out_cap) -> i64
+// Signature, both flavours: (ptr, len, cursor i64, gate_ptr, out_ptr, out_cap,
+// scratch_ptr, scratch_len) -> i64 — EIGHT parameters. The scratch pair is on
+// both flavours (only the overlapping sweep reads it), and listing six here
+// was simply out of date.
 //
 // The overlapping form records no match gates; its array carries the
-// once-per-drive preflight verdict (SETS_PLAN item 11).
+// once-per-drive preflight verdict.
 //
 // workerIdx is the function index of the per-position worker emitted by
 // emitSetBatchPosBody.
@@ -143,7 +149,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	// The scratch pair is on BOTH flavours, and a gated set simply passes
 	// zero. Stage A's lesson was that one signature for both is worth more
 	// than two tight ones: the stubs, the descriptor and the docs each stop
-	// carrying a fork. Only SETS_PLAN item 11 stage C's overlapping sweep
+	// carrying a fork. Only the overlapping backward sweep
 	// reads it, and it treats a null pointer as "not offered".
 	var pInPtr, pInLen, pCursor, pGate, pOutPtr, pOutCap, pScratch, pScratchLen byte
 	pInPtr, pInLen, pCursor = 0, 1, 2
@@ -151,16 +157,15 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	pScratch, pScratchLen = 6, 7
 	localBase := byte(8)
 	var (
-		lPos     = localBase
-		lK       = localBase + 1
-		lCount   = localBase + 2
-		lTotal   = localBase + 3
-		lStart   = localBase + 4
-		lAvail   = localBase + 5
-		lDeliver = localBase + 6
-		lDone    = localBase + 7
-		lCap     = localBase + 8 // out_cap, clamped to the cursor's count field
-		// SETS_PLAN item 11 stage C, cache path only.
+		lPos        = localBase
+		lK          = localBase + 1
+		lCount      = localBase + 2
+		lTotal      = localBase + 3
+		lStart      = localBase + 4
+		lAvail      = localBase + 5
+		lDeliver    = localBase + 6
+		lDone       = localBase + 7
+		lCap        = localBase + 8 // out_cap, clamped to the cursor's count field
 		lReady      = localBase + 9
 		lIdx        = localBase + 10
 		lCacheTotal = localBase + 11
@@ -169,9 +174,11 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 		lWork    = localBase + 13 // matched bytes this drive has delivered
 		lWorkIdx = localBase + 14 // cursor over the tuples just delivered
 		lWorkTmp = localBase + 15
+		// 1 when the ENTRY-TIME sweep just ran, so the cursor's high half is
+		// still a text POSITION and the cache must be served from tuple 0.
+		lEntrySwept = localBase + 16
 	)
 
-	// SETS_PLAN item 11 stage C: WHEN to sweep.
 	//
 	// The sweep costs a flat numStates x patterns per input byte. The walk's
 	// cost is data-dependent, and on most shapes it is far cheaper — measured,
@@ -192,7 +199,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	}
 
 	var b []byte
-	b = append(b, 0x01, 0x10, 0x7F) // 16 x i32
+	b = append(b, 0x01, 0x11, 0x7F) // 17 x i32
 
 	// emitWorkExceedsSweep pushes 1 when the walk has already spent more than
 	// the sweep would cost. Computed in i64 because len * cost overflows i32
@@ -216,8 +223,24 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	b = append(b, 0x1B) // select
 	b = append(b, 0x21, lCap)
 
+	// out_cap < 1: no room for a tuple, on ANY path. Reported as "the scan
+	// finished, zero tuples" so a raw-ABI caller looping on the cursor
+	// terminates instead of spinning on its own resume value.
+	//
+	// It has to be HERE, above the cache block, not only in the walk loop. The
+	// cache path runs first and used to return the caller's own cursor with a
+	// zero count, which a caller whose rule is "count == 0 means finished"
+	// (the TS stub's) reads as the end of the drive — silently dropping every
+	// remaining match. A NEGATIVE out_cap was worse still: it reached
+	// memory.copy with deliver*12 wrapped to a huge u32, i.e. a trap. The
+	// walk path keeps its own lDone form as belt and braces.
+	b = append(b, 0x20, lCap, 0x41, 0x01, 0x48) // cap < 1 (signed)
+	b = append(b, 0x04, 0x40)                   // if
+	b = append(b, 0x42, 0x7F, 0x42, 0x20, 0x86) // (i64)-1 << 32
+	b = append(b, 0x0F)                         // return
+	b = append(b, 0x0B)                         // end if
+
 	// ---------------------------------------------------------------
-	// SETS_PLAN item 11 stage C: serve from the caller's tuple cache.
 	//
 	// The sweep runs ONCE per drive and writes every tuple into the caller's
 	// scratch; each call after that is a bounds check and a memory.copy. That
@@ -234,6 +257,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 		// local rather than each deciding for itself.
 		b = append(b, 0x41, 0x7F, 0x21, lReady)
 		b = append(b, 0x41, 0x00, 0x21, lWork)
+		b = append(b, 0x41, 0x00, 0x21, lEntrySwept)
 		b = append(b, 0x20, pScratch)
 		b = append(b, 0x45)       // i32.eqz -> no scratch offered
 		b = append(b, 0x04, 0x40) // if
@@ -276,6 +300,15 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 		b = append(b, 0x20, pScratch)
 		b = append(b, 0x28, 0x02, overlapDPHdrReady)
 		b = append(b, 0x21, lReady)
+		// Remember that THIS call is the one that swept. The cursor it was
+		// handed still carries a text POSITION in its high half, and the
+		// block below reads that half as a tuple INDEX — so without this the
+		// serve would start from tuple P (or report "done") for a resume
+		// position P. Unreachable today (every walk-path return leaves
+		// work <= threshold or ready != 0, so an entry with work over the
+		// line and ready == 0 cannot happen), which is precisely why it must
+		// not be left armed for the first change that makes it reachable.
+		b = append(b, 0x41, 0x01, 0x21, lEntrySwept)
 		b = append(b, 0x0B) // end if not swept yet
 
 		b = append(b, 0x20, lReady)
@@ -287,7 +320,17 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 		// than a text position. Both are opaque to the caller (docs/wasm.md:
 		// "treat everything but the sentinel and count as opaque"), and a
 		// drive never mixes the two — `ready` is decided on its first call.
-		b = append(b, 0x20, pCursor, 0x42, 0x20, 0x88, 0xA7, 0x21, lIdx)
+		//
+		// EXCEPT on the call that swept at entry: its cursor is still the
+		// position form, and everything below that position was delivered
+		// before, so cache index 0 is the first tuple still owed.
+		b = append(b, 0x20, lEntrySwept)
+		b = append(b, 0x04, 0x7F)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x05)
+		b = append(b, 0x20, pCursor, 0x42, 0x20, 0x88, 0xA7)
+		b = append(b, 0x0B)
+		b = append(b, 0x21, lIdx)
 		b = append(b, 0x20, pScratch)
 		b = append(b, 0x28, 0x02, overlapDPHdrCount)
 		b = append(b, 0x21, lCacheTotal)
@@ -423,12 +466,28 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	// The reply is the reserved position word with an all-zero low half, so a
 	// caller that decodes before testing still reads a count of zero rather
 	// than tuples that were never written.
+	//
+	// But ONLY when this call has delivered nothing yet. config.SetCursorOverflowPos'
+	// contract — "a call returning it has answered nothing, no tuples were
+	// written" — is a promise about the CALL, and tuples already written and
+	// GATED earlier in this same call cannot be unwritten. Reporting count 0
+	// over them loses them for good (the stub throws before yielding, a direct
+	// caller reads zero) while the gate array has advanced for matches nobody
+	// saw. So a call that has tuples in hand returns them under the ordinary
+	// resume cursor, leaving lPos where it is; the next call re-enters at the
+	// same position, the worker overflows again with nothing delivered, and
+	// the sentinel goes out with a genuinely-zero count and untouched gates.
 	if cs.hasBTMember() {
 		b = append(b, 0x20, lTotal)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(abi.BTStackOverflow))
-		b = append(b, 0x46)       // i32.eq
-		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x46)                           // i32.eq
+		b = append(b, 0x04, 0x40)                     // if (void)
+		b = append(b, 0x20, lCount, 0x41, 0x00, 0x4A) // count > 0
+		b = append(b, 0x04, 0x40)                     // if
+		// br 3: 0 = this if, 1 = the overflow if, 2 = loop $L, 3 = block $exit.
+		b = append(b, 0x0C, 0x03)
+		b = append(b, 0x0B) // end if count > 0
 		b = append(b, 0x42)
 		b = utils.AppendSLEB128_64(b, int64(config.SetCursorOverflowPos))
 		b = append(b, 0x42, 0x20, 0x86) // << 32

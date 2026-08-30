@@ -63,8 +63,8 @@ sets:
 
 > **Config parsing is strict.** Any unknown key anywhere in the file is a
 > line-numbered load error. That catches typos (`mach_func:`) and the retired
-> set keys `find_any`, `find_all` and `batch_size`. It cannot catch the
-> `match:` meaning change — see [sets.md](sets.md#the-eight-capabilities).
+> set keys `match`, `scan`, `find_batch`, `find_any`, `find_all` and
+> `batch_size` — see [sets.md](sets.md#the-five-capabilities).
 
 All paths in the config file are resolved relative to the config file's directory.
 A leading `~/` in `output`, `wasm_file`, `stub_file` or `wasm_merge` is expanded to
@@ -74,7 +74,7 @@ a shell can resolve another user's home).
 ### Export-name rules
 
 Every `match_func`, `find_func` and `groups_func` value, and every
-set capability value (`match`, `match_any`, `match_all`, `scan`, `scan_any`, `scan_all`,
+set capability value (`match_any`, `match_all`, `scan_any`, `scan_all`,
 `find`), becomes both a WASM export name and a
 function name in the generated stub. Because they are written verbatim into generated
 source, they are validated when the config is loaded, before any compile or generate work
@@ -113,10 +113,18 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 |---|---|---|
 | `import_module` must be a valid identifier and not a keyword of that language | `rust`, `go` | Emitted as `pub mod <name>` / `package <name>`. A hyphenated `import_module: "my-mod"` stays legal for `js`/`ts`, which never emit it. |
 | `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. |
-| Export names must not collide with a generator helper (`init`, `_w`, `_resize`, `_exp`, `_mem`, `_inBase`, `_outBase`, `_enc`, `_patternNames`, `patternName`, and `SetMatch` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_live`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, `_patternNames`, `patternName`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `SetMatch`, `PatternName`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
+| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `pattern_name`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`) | `c` | Same reason. |
+| Export names must not collide with a generator helper (`SetMatch`, `patternName`, `RX_ERR_BT_OVERFLOW`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
 | Export names must not start with `ffi_` | `rust`, `go` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
 | Export names must not collide after the snake_case → PascalCase transform | `rust` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Rust iterator TYPE. Go dropped out of this rule: its names are now emitted verbatim, so nothing there transforms. |
+| An export must not be named `<X>Iter` for another find/groups export `X` | `go`, `as` | Every find or groups export declares an iterator type of that name. This is Go's real collision surface, where the PascalCase rule above is not. |
+| An export must not collide with a symbol DERIVED from another export (`<func>_index`, `<func>_names`, `<func>_count`, `<func>_indices`, `<func>_iter`, in the base name's own casing style) | all | `groups_func: parse` emits `parse_index` and friends; a second export literally named `parse_index` duplicates the symbol. |
+| `namespace:` must be a valid identifier and not a reserved word | all | It is interpolated verbatim into generated identifiers in Go/JS/TS/AS/C. |
+| An export must not be the blank identifier `_` | all | Shape-legal, but `pub fn _` is invalid Rust and `func _()` is invalid Go. |
 | Capture group names must be usable as identifiers, unique, and not collide after sanitising | all, when `groups_func` is set | Group names become generated constants and a name→index lookup. `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`; both would collapse to one generated symbol, so this check is ours. |
+| Capture group names must not be `index`, `names`, `count` or `indices` | all, when `groups_func` is set | Those are the suffixes the generators derive from the `groups_func` name, so a group of that name produces the same symbol twice in one file. |
 
 ### Engine selection
 
@@ -154,8 +162,11 @@ correctness — only which optimisation path is emitted.
 A pattern's own `prefer-match`/`prefer-no-match` takes precedence over its
 enclosing set's `hints:` (and a set's own suffix-body compilation falls back
 to its `hints:` when a member pattern doesn't set its own). `batch-find` has
-no set-level fallback to resolve, since it's rejected on `sets:` entries
-outright.
+no fallback to resolve: it is read on the entry (or set) that carries it, and
+each one decides for itself. On a `regexps:` entry it requires `find_func` or
+`groups_func`, and on a `sets:` entry it requires `find` — there is otherwise
+nothing to batch, and accepting the hint anyway would leave the caller
+believing they had asked for something.
 
 See [prefer-hints.md](prefer-hints.md) for the full `prefer-match`/
 `prefer-no-match` mechanism, which pattern shapes benefit, and how to

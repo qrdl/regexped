@@ -1023,7 +1023,7 @@ func TestChooseLiteralFrontend(t *testing.T) {
 		lits [][]byte
 		want frontendKind
 	}{wideCols, frontendTeddy})
-	// The keywords-N shape §16 Task G1 exists for: literals sharing a "kw00"
+	// The keywords-N shape the packed-pair frontend exists for: literals sharing a "kw00"
 	// prefix. Columns 0 and 1 are one rare byte each, which is the ideal pair.
 	keywordShape := make([][]byte, 8)
 	for i := range keywordShape {
@@ -1438,7 +1438,7 @@ func TestCompileFile_ACFrontend(t *testing.T) {
 // TestACBudget covers the Aho-Corasick table budget, which replaced a
 // 32-NODE cap that silently demoted any set past ~17-26
 // literals (the exact count varied with prefix sharing) to the scalar path, at
-// 86-414x the scan fuel (§13 F1, §14.2).
+// 86-414x the scan fuel.
 //
 // Three things are asserted, in the order they can break:
 //  1. Large literal sets KEEP an AC frontend under the default budget. This is
@@ -1449,7 +1449,7 @@ func TestCompileFile_ACFrontend(t *testing.T) {
 //     cliff; the diagnostic is the durable fix, independent of the constant.
 func TestACBudget(t *testing.T) {
 	// buildSet returns a spec whose literals share a prefix ("kw") or not,
-	// mirroring the two shapes measured in §14.2: prefix sharing is what
+	// mirroring two measured shapes: prefix sharing is what
 	// decides AC node count, and therefore where any node-based cap bites.
 	buildSet := func(t *testing.T, n int, shared bool) (SetSpec, *dfaPool, *dfaPool) {
 		t.Helper()
@@ -1477,7 +1477,7 @@ func TestACBudget(t *testing.T) {
 	// (1) The default budget holds the AC-selecting shape at every count that
 	// used to fall off the cliff. 17 and 26 are the two measured cliff edges.
 	//
-	// Only the SHARED-prefix shape is checked for AC: since §14.11 the
+	// Only the SHARED-prefix shape is checked for AC: the
 	// diverse shape selects bucketed Teddy instead, which is a different
 	// (and measured-better) path, not a budget failure. It is asserted
 	// separately below so a silent swap in either direction is caught.
@@ -1512,7 +1512,7 @@ func TestACBudget(t *testing.T) {
 		t.Errorf("ACBudgetBytes=1: fe = %v, want frontendScalar", cs.fe)
 	}
 	if cs.diag == nil || cs.diag.FrontendDemotion == nil {
-		t.Fatal("ACBudgetBytes=1: demotion not recorded in SetDiag — a silent frontend downgrade is exactly the §13 F1 failure mode")
+		t.Fatal("ACBudgetBytes=1: demotion not recorded in SetDiag — a silent frontend downgrade is exactly the failure mode")
 	}
 	d := cs.diag.FrontendDemotion
 	if d.From != "ac" || d.To != "scalar" || d.Reason != "ac_table_over_budget" {
@@ -1575,7 +1575,7 @@ func TestACOutputOverflow(t *testing.T) {
 	}
 
 	// 361 fits and must keep its AC frontend; 362 overflows and must demote,
-	// with the reason recorded rather than silently downgraded (§13 F1).
+	// with the reason recorded rather than silently downgraded.
 	spec, pp, sp := nested(t, 361)
 	if cs := CompileSet(spec, pp, sp, CompileSetOptions{}); cs.diag != nil && cs.diag.FrontendDemotion != nil {
 		t.Errorf("n=361: unexpected demotion %+v — 65,341 outputs fit the u16 offsets", cs.diag.FrontendDemotion)
@@ -3126,7 +3126,7 @@ func TestSetCapabilityMatrix(t *testing.T) {
 	}
 }
 
-// TestSetScanAnyWithoutFindIsSmaller pins the structural half of §5's
+// TestSetScanAnyWithoutFindIsSmaller pins the structural half of the
 // specialisation claim: a set that declares scan_any and NOT find never emits
 // the extent machinery, so its module is strictly smaller.
 func TestSetScanAnyWithoutFindIsSmaller(t *testing.T) {
@@ -3147,7 +3147,7 @@ func TestSetScanAnyWithoutFindIsSmaller(t *testing.T) {
 }
 
 // TestSetWideAllForm covers the >64-pattern branch of match_all/scan_all,
-// which switches from an i64 bitmask return to an out_ptr bitmap (§3.13).
+// which switches from an i64 bitmask return to an out_ptr bitmap.
 func TestSetWideAllForm(t *testing.T) {
 	var pats []string
 	for i := 0; i < 70; i++ {
@@ -3160,7 +3160,7 @@ func TestSetWideAllForm(t *testing.T) {
 	validateWASM(t, wasm)
 }
 
-// TestSetOverlappingFlagChangesFindBody pins §3.15: the flag is a
+// TestSetOverlappingFlagChangesFindBody pins the flag's effect: it is a
 // compile-time property, and `overlapping: true` emits no gating code at all
 // — so the two bodies cannot be byte-identical.
 func TestSetOverlappingFlagChangesFindBody(t *testing.T) {
@@ -3182,7 +3182,7 @@ func TestSetOverlappingFlagChangesFindBody(t *testing.T) {
 	}
 }
 
-// TestSetDiagRecordsRouting pins the diagnostics §9.4 asks for: the class of a
+// TestSetDiagRecordsRouting pins the routing diagnostics: the class of a
 // set must be readable from --diag-json rather than inferred by inspection.
 func TestSetDiagRecordsRouting(t *testing.T) {
 	cases := []struct {
@@ -3234,7 +3234,7 @@ func TestSetDiagRecordsRouting(t *testing.T) {
 //
 // Every harness in this project builds sets that select ALL of the config's
 // patterns, which keeps global pattern ids dense and equal to set-local
-// indices — and that is precisely why §11 R1 survived 4.9M corpus cases. A
+// indices — and that is precisely why this hazard survived 4.9M corpus cases. A
 // pattern id is the GLOBAL index into `regexps:`, so a set selecting a
 // non-prefix subset reports ids above its own pattern count, and everything
 // indexed by an id has to be sized for that.
@@ -3317,7 +3317,7 @@ func TestSubsetIDSpace(t *testing.T) {
 	}
 }
 
-// TestSubsetAllABIMatchesIDSpace is the check that makes §11 R1's third
+// TestSubsetAllABIMatchesIDSpace is the check that makes that hazard's third
 // manifestation impossible to reintroduce: the narrow/wide `_all` signature
 // the module EXPORTS must be the one the generators would declare. The two
 // were derived from different counts, so a subset set could export
@@ -3455,7 +3455,7 @@ func exportTypeIndex(t *testing.T, wasm []byte, name string) int {
 // when some pattern can match more than one byte.
 //
 // The multi-pattern rejection that remains is specifically the LITERAL-frontend
-// one measured in §12.3; the eight log-level patterns below are that set.
+// one measured earlier; the eight log-level patterns below are that set.
 func TestJumpIsProfitable(t *testing.T) {
 	cases := []struct {
 		name string
@@ -3474,7 +3474,7 @@ func TestJumpIsProfitable(t *testing.T) {
 		{"multi scalar one exceeds", []string{`[a-z]`, `x+`}, true},
 		// Multi-pattern, scalar, but nothing can exceed one byte → dead code.
 		{"multi scalar all one byte", []string{`[a-z]`, `[0-9]`}, false},
-		// Multi-pattern with a literal frontend: still rejected (§12.3).
+		// Multi-pattern with a literal frontend: still rejected.
 		{"two patterns teddy", []string{`a`, `b`}, false},
 		{"eight patterns", []string{`ERR\b[^\n]*`, `WRN\b[^\n]*`, `INF\b[^\n]*`, `DBG\b[^\n]*`,
 			`CRT\b[^\n]*`, `FAT\b[^\n]*`, `TRC\b[^\n]*`, `NOT\b[^\n]*`}, false},
@@ -3656,7 +3656,7 @@ func TestSetFindBatch_Emission(t *testing.T) {
 	})
 
 	t.Run("overlapping", func(t *testing.T) {
-		// The ungated body takes §19's skip parameter on its suffix functions;
+		// The ungated body takes the batch skip parameter on its suffix functions;
 		// this is the path with no gate array to resume a split position with.
 		w := build(config.SetConfig{Name: "s", Find: "plain_find", Hints: batchHint, Overlapping: true, Patterns: all})
 		if !bytes.Contains(w, []byte("plain_find_batch")) {

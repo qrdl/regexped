@@ -21,6 +21,8 @@ package compile
 // The shape encoded here: ASCII letters and digits are common, with `etaoin
 // shrdlu` most common of all; whitespace and the frequent punctuation of
 // structured text are common; control bytes and high bytes are rare.
+// SIBLING TABLE: see byte_rarity.go's byteRarity, and its note on why the two
+// stay separate.
 var byteRank = func() [256]uint8 {
 	var r [256]uint8
 	// Default: high bytes and control bytes are rare. Spread them over the
@@ -109,7 +111,7 @@ const packedPairByteBudget = 4
 // the whole span. Two blocks is the measured optimum and also the natural
 // ceiling for this shape, because two 16-bit bitmasks fill a 32-bit lane mask
 // exactly; a third block would need a second mask register and a second
-// decode loop, giving back what the widening buys. See §16.4 for the numbers.
+// decode loop, giving back what the widening buys.
 const packedPairChunks = 2
 
 // packedPairMaxLiterals caps how many literals a packed pair will serve.

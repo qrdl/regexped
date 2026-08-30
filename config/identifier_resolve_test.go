@@ -72,7 +72,7 @@ func TestResolveStubTypeRejectsUnknownExtension(t *testing.T) {
 // TestPascalCaseForValidation pins the copy of the PascalCase transform that
 // lives here because `config` cannot import `generate`.
 //
-// Its doc still names `goPublicName` as the thing it mirrors, and TODO task 62
+// Its doc still names `goPublicName` as the thing it mirrors, and the rework
 // DELETED that function — Go stubs now emit the config's name verbatim. So
 // what this transform still serves is the RESERVED-NAME check: config must
 // know every identifier a generator could derive from a user's name, and the

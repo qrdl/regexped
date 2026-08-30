@@ -12,7 +12,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// SETS_PLAN item 11 stage C: the batching overlapping `find` may sweep the
+// The batching overlapping `find` may sweep the
 // input ONCE into a caller-owned tuple cache and then serve each call by
 // copying from it — but only once the drive's own walk has cost more than the
 // sweep would.
@@ -233,7 +233,7 @@ func canonCache(in [][3]int) [][3]int {
 // every start position, every pattern that matches there, with its
 // leftmost-first extent.
 //
-// The probe is §9.6's WHOLE-INPUT one, `\A(?s:.{start})(?:pat)`, not the
+// The probe is the WHOLE-INPUT one, `\A(?s:.{start})(?:pat)`, not the
 // pattern against a slice. `^` is \A and can only match at absolute position
 // 0, so a slice would let an anchored pattern match at every start and the
 // oracle would be wrong in exactly the cases the anchored sets above exist to
@@ -369,7 +369,7 @@ func driveOverlapCacheScratch(t *testing.T, pats []string, input string, offset,
 			case engageNever:
 				if ready == 1 {
 					t.Fatalf("cache engaged (ready=1) on a drive the walk handles cheaply: " +
-						"sweeping here is the regression SETS_PLAN item 11 stage B was reverted for")
+						"sweeping here is the regression an earlier attempt was reverted for")
 				}
 			}
 			return out

@@ -13,7 +13,7 @@ import "github.com/qrdl/regexped/internal/utils"
 // during such a run is dead except the last — the whole run can be skipped
 // with a SIMD scan and a single register write for the final position.
 //
-// This is a different optimization from Task 7's plain-DFA dominant
+// This is a different optimization from the plain-DFA dominant
 // self-loop bulk-skip (detectDominantSelfLoop/emitDominantBulkSkip): that
 // machinery is tuned for large self-loop / tiny exit-set states (e.g. `.`
 // inside a comment body) and is the wrong polarity for Gap F's population,

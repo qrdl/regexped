@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// SETS_PLAN item 11 stage C rests on ONE claim: that the leftmost-first extent
+// The overlapping backward sweep rests on ONE claim: that the leftmost-first extent
 // of a match from start s satisfies a right-to-left recurrence, so a single
 // backward sweep answers every start at once.
 //
@@ -125,7 +125,7 @@ func overlapDPReference(t *dfaTable, input []byte, numPatterns int) [][]int {
 //
 // The oracle is `overlapping: true`'s contract stated directly: at every start
 // position, every pattern that matches THERE, with its leftmost-first extent.
-// That is an anchored probe per start, which is how §22 builds its own
+// That is an anchored probe per start, which is how the corpus harness builds its own
 // expectations — and deliberately NOT FindAllIndex, which is the GATED rule.
 func TestOverlapDPRecurrenceMatchesGo(t *testing.T) {
 	patternSets := [][]string{

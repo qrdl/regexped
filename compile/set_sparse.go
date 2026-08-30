@@ -4,7 +4,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// ── Sparse-set accept: the >32-pattern suffix body (SETS §23, task G17) ──────
+// ── Sparse-set accept: the >32-pattern suffix body (task G17) ───────────────
 //
 // A set whose patterns share ONE mandatory literal packs into ceil(N/32)
 // buckets, because the accept bitmask every other path uses is an i32 on the
@@ -19,9 +19,9 @@ import (
 //
 // WHAT IT DELIBERATELY DOES NOT DO, and why the driver needs no changes:
 // `validMask` is ignored. Every mask on the per-candidate path — the group
-// mask, the gate pre-mask, §21.6's first-byte mask — is an i32 and cannot
+// mask, the gate pre-mask, the first-byte mask — is an i32 and cannot
 // express more than 32 patterns, and widening all of them to i64 was rejected
-// (§23.3) as bigger and riskier than this format, for half the benefit. So the
+// as bigger and riskier than this format, for half the benefit. So the
 // per-pattern filtering the driver would have done up front happens HERE
 // instead, once per pattern that actually accepted, using the gate array the
 // body already receives. The cost is losing the pre-mask's early exits for
@@ -58,10 +58,27 @@ func planSparseScratch(base int32, numPatterns int) sparseScratch {
 // Offset+count rather than an inline list after each transition row because
 // the row stride must stay constant for the transition arithmetic; a variable
 // tail would cost a multiply per byte on the hot path to save one load here.
+//
+// TWO channels, not three. The bitmask suffix body also carries an
+// IMMEDIATE-ACCEPT channel, which freezes a pattern's extent so a later accept
+// cannot overwrite an earlier one; that is what licenses its unconditional
+// "later accept wins" rule. The sparse body has the same unconditional
+// overwrite and NO freeze, so emitting the channel while reading neither was a
+// table it paid for and an invariant it did not enforce.
+//
+// The invariant that makes the omission sound: a sparse-eligible pattern
+// cannot have an immediate accept with a live thread of its own. Non-greedy
+// quantifiers — the only construct that produces one — make a pattern
+// isolatedFallback, which promoteSparseBuckets refuses (see sparsePromotion's
+// eligibility). For greedy patterns, leftmost-first suppression drops the
+// lower-priority byte-consumers once a pattern's match is top of the closure,
+// so the state that accepts immediately has no surviving thread to extend.
+// If a counterexample is ever constructed, the fix is a per-pattern "frozen"
+// byte in the scratch checked before overwriting endPos — not re-adding a
+// table nothing reads.
 type sparseAcceptTables struct {
 	midOff, midList int32
 	eofOff, eofList int32
-	immOff, immList int32
 	end             int32
 	data            []byte
 }
@@ -100,8 +117,6 @@ func buildSparseAcceptTables(t *dfaTable, base int32, numWASM int) sparseAcceptT
 	out.midOff, out.midList, blob = emit(t.midAcceptWide)
 	b = append(b, blob...)
 	out.eofOff, out.eofList, blob = emit(t.acceptWide)
-	b = append(b, blob...)
-	out.immOff, out.immList, blob = emit(t.immAcceptWide)
 	b = append(b, blob...)
 	out.end = cur
 	out.data = b
@@ -212,20 +227,27 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 	// record(channelOffTab, channelListTab) walks the accept list of lState and
 	// stamps lPos into endPos for each pattern, adding first-timers to `fired`.
 	record := func(b []byte, offTab, listTab int32) []byte {
-		// off = offTab[state*8]; cnt = offTab[state*8+4]
+		// COUNT FIRST, and everything else inside the branch.
+		//
+		// This runs at every input byte of every candidate walk, and at almost
+		// every byte the state accepts nothing. Loading the list OFFSET and
+		// zeroing the index before asking whether there is a list at all paid
+		// a second address computation, a second load and two stores per byte
+		// for nothing. The count IS the per-state "does anything accept here"
+		// boolean the bitmask body gets from its liveness table.
+		b = append(b, 0x02, 0x40) // block $done
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, offTab)
+		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
+		b = appendTableLoad32(b, p.tableMemIdx, 4)
+		b = append(b, 0x22, lCnt) // tee: the eqz below consumes the copy
+		b = append(b, 0x45, 0x0D, 0x00)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, offTab)
 		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
 		b = appendTableLoad32(b, p.tableMemIdx, 0)
 		b = append(b, 0x21, lOff)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, offTab)
-		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
-		b = appendTableLoad32(b, p.tableMemIdx, 4)
-		b = append(b, 0x21, lCnt)
 		b = append(b, 0x41, 0x00, 0x21, lIdx)
-		b = append(b, 0x02, 0x40) // block $done
-		b = append(b, 0x20, lCnt, 0x45, 0x0D, 0x00)
 		b = append(b, 0x03, 0x40) // loop
 		// pat = list[(off+idx)*2]
 		b = append(b, 0x41)
@@ -309,7 +331,7 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 
 	b = append(b, 0x02, 0x40) // block $skipTuple
 	if p.gated {
-		// §3.16, applied here rather than by the driver's pre-mask, which
+		// The gate rule, applied here rather than by the driver's pre-mask, which
 		// cannot address more than 32 patterns. gate[id] is the doubled 2s+1
 		// encoding; a non-empty extent needs 2s+1 >= gate, an empty one the
 		// stricter 2s >= gate.
@@ -328,7 +350,7 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		b = append(b, 0x6A)
 		b = append(b, 0x20, lOff, 0x49, 0x0D, 0x00) // bound < gate -> skip
 	}
-	// §19's skip belongs in the WRITE condition, not in a branch past it: the
+	// The batch skip belongs in the WRITE condition, not in a branch past it: the
 	// tuple is counted either way, because the count is what tells the caller
 	// how much of this position is still owed. Branching to $skipTuple would
 	// jump over the increment below, pinning lOut under `skip` forever — every
@@ -511,7 +533,7 @@ func buildSparseProbeBody(p sparseSuffixParams) []byte {
 // escape.
 //
 // Much smaller than the scan probe, for two reasons that are both consequences
-// of "the match must span the whole input" (§3.3):
+// of "the match must span the whole input":
 //
 //   - Only the EOF channel is read. A mid-walk accept says nothing about
 //     reaching `len`, so there is no per-byte collect and no mid-accept table

@@ -49,7 +49,7 @@ type setMatrixCase struct {
 	hints       []string
 	// maxFallbackStates, when non-zero, caps the fallback suffix DFA. Setting
 	// it to 1 is how a member is forced onto the BACKTRACKING engine
-	// (SETS_PLAN item 20): no fallback DFA can be built that small, so the
+	//: no fallback DFA can be built that small, so the
 	// pattern is admitted on BT instead of dropped.
 	maxFallbackStates int
 	// perPattern gives each pattern its OWN exports alongside the set.
@@ -141,7 +141,7 @@ func setMatrixCases() []setMatrixCase {
 			patterns: manyPatterns(70, "pat_%02d_tail"), caps: capsAll,
 		},
 		{
-			name: "named-subset", selects: "ID_SPACE > PATTERN_COUNT, the §11 R1 memory-safety hazard",
+			name: "named-subset", selects: "ID_SPACE > PATTERN_COUNT, the memory-safety hazard",
 			patterns: manyPatterns(12, "sub%02d"), subset: []string{"p00", "p05", "p11"}, caps: capsAll,
 		},
 		{
@@ -181,7 +181,7 @@ func setMatrixCases() []setMatrixCase {
 			patterns: keywords, caps: capsAll, hints: []string{"prefer-no-match"},
 		},
 
-		// ---- Backtracking members (SETS_PLAN item 20) --------------------
+		// ---- Backtracking members --------------------
 		//
 		// maxFallbackStates = 1 admits every fallback member on BT, which is
 		// the whole of set_bt.go plus the ABI switch it forces: a BT member

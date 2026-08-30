@@ -11,7 +11,7 @@ import (
 	"github.com/qrdl/regexped/internal/abi"
 )
 
-// Single-pattern ITERATION coverage — TODO task 54.
+// Single-pattern ITERATION coverage.
 //
 // Everything else in this package checks ONE match: fuzz_test.go compares a
 // single leftmost find, wasmrun_paths.go a single groups call at ptr 0. The
@@ -135,7 +135,7 @@ func wasmFindIter(t *testing.T, wasmBytes []byte, input string) ([][2]int, bool)
 		// our API sees and what Go reports.
 		//
 		// Whether the module then actually USES that left context is the
-		// per-emitter question task 54 phase 2 answers one emitter at a time;
+		// per-emitter question answered one emitter at a time;
 		// until an emitter is converted its wrapper narrows internally and
 		// this call returns exactly what the narrowed call used to.
 		r, callErr := findFn.Call(store, int32(0), int32(len(input)), int32(pos))

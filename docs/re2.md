@@ -26,8 +26,8 @@ The `test` target chains ten single-pattern sub-targets — `exhaustive`, `custo
 `LikelyMode` to verify the mode never changes match correctness, only emitted
 code shape — see [prefer-hints.md](prefer-hints.md)), and `matchonly`,
 `findonly`, `groupsonly` — plus `sets`, which exercises the multi-pattern
-composition pipeline described in [sets.md](sets.md) across all eight
-capabilities. `sets-exhaustive` and `set-batch` are the whole-corpus set runs;
+composition pipeline described in [sets.md](sets.md) across all five
+capabilities (plus `find`'s batch entry and both overlap policies). `sets-exhaustive` and `set-batch` are the whole-corpus set runs;
 they are not part of `test` (see "Sets" below for why).
 
 The last three compile each pattern with only one of `match_func`,
@@ -137,7 +137,7 @@ through:
 
 | driven | oracle |
 |---|---|
-| `match`, `match_any`, `match_all` | `\A(?:p)\z` over the whole input; membership (never value equality) for `_any` |
+| `match_any`, `match_all` | `\A(?:p)\z` over the whole input; membership (never value equality) for `_any` |
 | `scan_any`, `scan_all` | "matches at some position ≥ `from`", at every `from` for short inputs and at the 16/32/33-byte edges for long ones |
 | `find` gated, batching `find` gated at capacity 1 and P | Go `FindAllIndex` — cross-checked against the corpus's own col4 |
 | `find` overlapping, batching `find` overlapping at capacity 1 and P | every start position's leftmost-first match |
@@ -165,9 +165,11 @@ set's declared capabilities need — a `match`-only set emits no literal fronten
 at all, and those specialised emissions are invisible to a set that declares
 everything.
 
-This exercises all set frontends — SIMD Teddy (≤ 16 literals), Aho-Corasick
-(17+ literals, capped by table bytes rather than literal count), SIMD Shufti
-(density/hint-selected first-byte prefilter), and the scalar DFA fallback —
+This exercises all set frontends — packed-pair (≤ 16 literals with a selective
+two-byte probe window), SIMD Teddy (≤ 64 literals, 16 when the shortest is one
+byte), Aho-Corasick (> 16 literals, capped by table bytes rather than literal
+count), SIMD Shufti (density/hint-selected first-byte prefilter), and the
+scalar DFA fallback —
 together with bucket dispatch and the isolated-fallback path for non-greedy
 patterns. Per-shape *scaling* is measured separately by `tools/setperf` and the
 fuel ladder in [plans/SETS.md](../plans/SETS.md) §14.

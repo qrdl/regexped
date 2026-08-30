@@ -16,7 +16,7 @@ import (
 // "negative means no match" test turns an engine giving up into a confident
 // wrong answer, which is exactly the defect §N1 records.
 //
-// How each language surfaces it, AFTER TODO task 62 rewrote this table twice:
+// How each language surfaces it, after this table was rewritten twice:
 //
 //	Rust        Result<T, Error>
 //	Go          an error return; Err() after the loop for the lazy iterators

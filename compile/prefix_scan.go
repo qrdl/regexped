@@ -464,7 +464,7 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 			b = append(b, 0x02, 0x40) // block $found_candidate (void)
 
 			if adaptive {
-				// Task 25: DenseCounter < threshold? Else skip SIMD entirely
+				// DenseCounter < threshold? Else skip SIMD entirely
 				// for this attempt and fall straight through to the scalar
 				// tail below.
 				b = append(b, 0x20, l.DenseCounter)

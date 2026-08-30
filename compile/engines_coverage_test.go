@@ -61,7 +61,7 @@ func enginesCovFindInst(t *testing.T, prog *syntax.Prog, op syntax.InstOp) int {
 // These four predicates gate the lit-anchor find optimisation. They are pure
 // functions over the parsed AST, and every one of them is a SAFETY gate: a
 // false negative only costs speed, but a false positive emits a backward scan
-// that stops at the wrong byte (FUZZER_BUGS.md §22). Testing them directly is
+// that stops at the wrong byte. Testing them directly is
 // the only way to reach the branches that no perftest/re2 corpus pattern
 // happens to have the shape for.
 // ---------------------------------------------------------------------------
@@ -1034,7 +1034,7 @@ func TestEnginesCovBuildBTScanTablesScalarFallback(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestEnginesCovAltLoopBodyBothBranchesBackEdges(t *testing.T) {
-	// FUZZER_BUGS.md #26/#29: an Alt where BOTH targets dominate it is at once
+	// An Alt where BOTH targets dominate it is at once
 	// an inner loop's back edge and an enclosing loop's continuation. The
 	// classifier must pick the more-local (dominated) target as the body; a
 	// naive "ambiguous, give up" answer loses the inner loop's zero-progress
@@ -1070,7 +1070,7 @@ func TestEnginesCovAltLoopBodyBothBranchesBackEdges(t *testing.T) {
 }
 
 func TestEnginesCovAltLoopBodyStartAltArgBackEdge(t *testing.T) {
-	// FUZZER_BUGS.md #37: prog.Start is its own immediate dominator, so a loop
+	// prog.Start is its own immediate dominator, so a loop
 	// whose head IS the entry has no dominance-visible back edge and needs the
 	// forward-reachability fallback. `(?:a)*?` puts a NON-greedy loop there,
 	// which makes Arg (not Out) the back edge — the mirror of the greedy case.
@@ -1147,8 +1147,8 @@ func TestEnginesCovBTLoopEntryAtStart(t *testing.T) {
 
 func TestEnginesCovBTLoopEntryViaArgEdge(t *testing.T) {
 	// The instruction that enters a loop body can reach it through its Arg
-	// branch as easily as through Out (`(?:x|(?:a*)+)`). FUZZER_BUGS.md #37:
-	// recording only the Out edge corrupted loopEntryLocalIdx for exactly
+	// branch as easily as through Out (`(?:x|(?:a*)+)`).
+	// Recording only the Out edge corrupted loopEntryLocalIdx for exactly
 	// this shape, so both maps and both emitters have to exist.
 	pattern := `((?:x|(?:a*)+)y)`
 	backtracker := newBacktrack(enginesCovProg(t, pattern))
@@ -1277,7 +1277,7 @@ func TestEnginesCovBTComposedCaptureBodyWindowAndMemo(t *testing.T) {
 }
 
 func TestEnginesCovBTComposedCaptureBodyArgEntry(t *testing.T) {
-	// The Arg-edge loop entry (FUZZER_BUGS.md #37) reached through the
+	// The Arg-edge loop entry reached through the
 	// composed capture body rather than the whole-pattern shortcut.
 	pattern := `((?:x|(?:a*)+)y)z`
 	if len(newBacktrack(enginesCovProg(t, pattern)).loopEntryArgOf) == 0 {
@@ -1595,7 +1595,7 @@ func TestEnginesCovGroupsOnlyBTLimits(t *testing.T) {
 }
 
 func TestEnginesCovBTStackReservationOverCeiling(t *testing.T) {
-	// FUZZER_BUGS.md #32: a Backtracking stack reserved above WASM32's 4GiB
+	// A Backtracking stack reserved above WASM32's 4GiB
 	// linear-memory ceiling used to produce a module whose memory section was
 	// already invalid — a failure that only surfaced at instantiation time,
 	// with no attribution to the pattern that caused it. A table base close
@@ -1647,7 +1647,7 @@ func TestEnginesCovBatchGroupsWrapperWindowMode(t *testing.T) {
 	// The batch groups wrapper writes each match's extent into the window
 	// scratch slot and then calls the capture body with the caller's REAL
 	// (ptr,len) — the same window-mode contract the single-match wrapper has
-	// (FUZZER_BUGS.md #26, FABLE.md B13). A Backtracking capture body with a
+	//. A Backtracking capture body with a
 	// word boundary is what turns that on; a TDFA one never does.
 	entry := config.RegexEntry{
 		Pattern:    `(\b(?:a*)+b)c`,

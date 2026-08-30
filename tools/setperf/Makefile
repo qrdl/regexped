@@ -33,9 +33,18 @@ harnesses:
 # it is placement noise on this machine (see plans/TODO.md's
 # placement-roulette entry), so a committed number would only ever produce
 # false alarms.
+#
+# Written through a TEMPORARY file and moved into place only on success. The
+# shell truncates a `>` redirect BEFORE the command runs, so a run that failed
+# part-way left a half-written baseline — and these files are gitignored, so
+# there is nothing to restore them from.
+#
+# stderr is NOT discarded: the fuel path routes "row exceeded the budget" notes
+# and every HARNESS ERROR there precisely so this target shows them, and
+# `2>/dev/null` hid exactly the messages written for it. FABLE_REVIEW P8.
 baseline:
-	go run . -fuel 2>/dev/null > baseline_fuel.txt
-	go run . -size 2>/dev/null > baseline_size.txt
+	go run . -fuel > baseline_fuel.txt.tmp && mv baseline_fuel.txt.tmp baseline_fuel.txt
+	go run . -size > baseline_size.txt.tmp && mv baseline_size.txt.tmp baseline_size.txt
 	@echo "setperf baselines captured."
 
 check:
@@ -48,4 +57,4 @@ check:
 	@echo "All setperf baseline checks passed."
 
 clean:
-	rm -f setperf
+	rm -f setperf baseline_fuel.txt.tmp baseline_size.txt.tmp

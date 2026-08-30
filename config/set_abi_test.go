@@ -26,7 +26,7 @@ func cfgWithPatterns(names ...string) BuildConfig {
 	return BuildConfig{Regexps: entries}
 }
 
-// TestPatternCountAndIDSpaceSizeDiffer is the §11 R1 hazard stated as a test.
+// TestPatternCountAndIDSpaceSizeDiffer is the id-space hazard stated as a test.
 //
 // PATTERN_COUNT sizes the tuple buffer — the worst case at ONE position.
 // ID_SPACE sizes anything indexed BY a pattern id: the gate array, the `_all`
@@ -81,7 +81,7 @@ func TestIDSpaceSizeEdgeCases(t *testing.T) {
 	}
 }
 
-// TestSetCursorFieldWidths pins the §19 batch cursor layout.
+// TestSetCursorFieldWidths pins the batch cursor layout.
 //
 // The returned i64 splits its LOW 32 bits between `k` (the intra-position
 // resume index) and `count` (tuples delivered). k must hold [0, patternCount],

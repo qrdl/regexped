@@ -9,7 +9,7 @@ their positions and pattern IDs.
 | Situation | Recommendation |
 |---|---|
 | Scanning text for any of N patterns, with positions (WAF, secret scanning, log analysis) | Declare `find` |
-| "Is anything in here at all?" | Declare `scan` — a boolean, no positions, no extents |
+| "Is anything in here at all?" | Declare `scan_any` — it returns a matching pattern id, or `-1`; test the sign |
 | "Which patterns appear somewhere?" | Declare `scan_all` |
 | Classifying whole inputs by which pattern they match (URL validation, SQL type detection) | Declare `match_any` or `match_all` |
 | 1–3 patterns, simple scan | Individual `find_func` exports are sufficient |
@@ -507,6 +507,20 @@ absent from the set and can never match. The build still succeeds, so a
 pipeline that only checks the exit code will ship a set that under-reports —
 read the warning, or `state_limit_dropped`.
 
+**Which capabilities a drop removes it from.** A pattern the FIND-path packers
+drop is gone from `find` and the scan pair; the anchored pair is packed
+separately, from the unfiltered pattern list, so `match_any` and `match_all`
+still answer for it. The reverse also happens and is worth stating plainly:
+
+**Backtracking members and the anchored pair.** A pattern whose suffix DFA
+exceeds `max_fallback_states` can be rescued onto the Backtracking engine for
+`find` and the scan pair. The ANCHORED packing admits no Backtracking member —
+it has no BT bucket path at all — so such a pattern is silently absent from
+`match_any` and `match_all`. `--diag-json` shows it in both places: in a
+`bt-fallback` bucket, and in `state_limit_dropped` for the anchored packing.
+If your set needs the anchored pair to answer for every member, raise
+`max_fallback_states` until nothing is BT-rescued.
+
 ## Diagnostics
 
 Use `--diag-json <path>` with `regexped compile` to write a JSON file
@@ -558,13 +572,12 @@ the fallback half of a mixed set.
 
 | Condition | Frontend |
 |---|---|
-| 1–16 distinct literals | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch |
-| 17+ distinct literals | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count, with a SIMD first-byte prefilter at the root state |
+| ≤16 distinct literals, with a selective two-byte probe window | **Packed-pair** — two `v128` loads and an `i8x16.eq` chain per 32-byte block, against two columns chosen by byte rarity |
+| ≤64 distinct literals (≤16 when the shortest literal is 1 byte) | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch. For 9+ literals it uses two groups of 8 (`TwoGroups=true`), ORing two independent nibble probes per 16-byte chunk |
+| >16 distinct literals with low first-byte diversity | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count, with a SIMD first-byte prefilter at the root state |
 | (AC tables exceed 512 KB) | **Scalar** — AC is capped by *table bytes*, not literal count. The budget holds ~1,000 trie nodes uncompressed, and no set of 128 literals tested so far comes close to it; literals sharing no common prefix consume nodes fastest, since each distinct first byte forks the trie at the root. A demotion is always reported in `--diag-json` as `frontend_demotion` |
+| High first-byte diversity, or the `prefer-no-match` hint | **Shufti** — a SIMD first-byte prefilter over the scalar body, answering set membership from nibble tables instead of a per-byte compare chain |
 | No mandatory literal at all | **Scalar** |
-
-For 9–16 literals Teddy uses two groups of 8 (`TwoGroups=true`), ORing the
-results of two independent nibble probes per 16-byte chunk.
 
 Aho-Corasick's root-state prefilter skips ahead to the next position whose byte
 could begin some literal. With **1–3 distinct first bytes** it compares against
@@ -599,7 +612,7 @@ shapes it affects.
 
 ## The anchored capabilities use their own automata
 
-`match`, `match_any` and `match_all` do NOT read their answer off the
+`match_any` and `match_all` do NOT read their answer off the
 scan-path DFAs. Those are built leftmost-first, which prunes the search the
 moment the highest-priority alternative accepts — so the automaton for `a|ab`
 has no transition out of the state reached by `"a"`, and `a+?` stops after one
@@ -688,9 +701,10 @@ would turn giving up into a confident wrong answer, so it gets its own channel:
 | `find`'s batch entry | the cursor's resume-position word is `0xFFFFFFFE`, beside `0xFFFFFFFF` for "done", with a zero count |
 
 The generated stubs surface it the way that language reports an unanswerable
-call — Rust and Go **panic**, JS, TS and AssemblyScript **throw**, C returns
-`RX_ERR_BT_OVERFLOW` — matching what they already do for a single pattern that
-overflows. What none of them do is quietly report "nothing matched".
+call — Rust returns `Err(Error::BacktrackOverflow)`, Go returns
+`ErrBacktrackOverflow`, JS and TS **throw**, AssemblyScript returns `null` /
+`RX_ITER_ERROR`, and C returns `RX_ERR_BT_OVERFLOW`. What none of them do is
+quietly report "nothing matched".
 
 A set with no Backtracking member is completely unaffected: it keeps the `i64`
 bitmask form and none of these checks are emitted.

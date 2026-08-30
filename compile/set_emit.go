@@ -18,7 +18,7 @@ type compiledSet struct {
 	name string
 
 	// Capability export names; "" = not declared. `match` and `scan` were
-	// retired by TODO task 59 decision (2) — `match_any(...) >= 0` and
+	// retired — `match_any(...) >= 0` and
 	// `scan_any(...) >= 0` are exactly what they returned.
 	matchAny string // anchored, pattern id or -1
 	matchAll string // anchored, bitmask / bitmap of ids
@@ -26,11 +26,11 @@ type compiledSet struct {
 	scanAll  string // non-anchored, bitmask / bitmap of ids
 	find     string // non-anchored, tuples at the next matching position
 	// batchFind is `hints: [batch-find]` on the set (decision (11)). It adds
-	// the §19 multi-position export ALONGSIDE `find` — it is no longer a
+	// the batching multi-position export ALONGSIDE `find` — it is no longer a
 	// capability of its own, so it cannot be declared without `find`.
 	batchFind bool
 	// patternCount is the worst-case number of tuples at ONE position, and
-	// therefore how many bits the §19 cursor reserves for its intra-position
+	// therefore how many bits the batch cursor reserves for its intra-position
 	// index. It is the same quantity the stubs know as <SET>_PATTERN_COUNT.
 	patternCount int
 	// batchPos is a transient emission flag: while it is set, the shared find
@@ -47,7 +47,7 @@ type compiledSet struct {
 	// functions carry a trailing `skip` parameter.
 	suffixHasSkip bool
 
-	// overlapping selects the ungated `find` body (§3.15 / D10). The default
+	// overlapping selects the ungated `find` body. The default
 	// (false) is the gated, per-pattern non-overlapping body.
 	overlapping bool
 
@@ -57,8 +57,15 @@ type compiledSet struct {
 	declaredIDSpace int
 
 	// maxLookback (M) is the largest distance between a mandatory literal and
-	// the match start it can serve, over every pattern in the set; -1 when any
-	// pattern's prefix is unbounded. It bounds the §9.4 first-position drain.
+	// the match start it can serve, over every pattern in the set. It bounds
+	// the first-position drain.
+	//
+	// Never negative. A "-1 = unbounded" state was documented here and is
+	// unreachable: a pattern whose prefix is variable-length is fallback-routed
+	// by analyzePattern and never contributes a fixed prefix length at all, so
+	// setMaxLookback only ever maximises over non-negative values. Nothing at
+	// the use site handles a negative, which is what made the sentence a
+	// hazard rather than a note.
 	maxLookback int
 
 	// prefixLenGroups[bi] partitions bucket bi's patterns by fixed prefix
@@ -94,14 +101,14 @@ type compiledSet struct {
 	anchoredDataBytes   []byte
 	anchoredDataSegs    int
 	// anchoredUnion replaces that packing with ONE automaton when it can be
-	// built (SETS_PLAN item 22 fix 1b). Non-nil means anchoredBuckets and
+	// built. Non-nil means anchoredBuckets and
 	// anchoredProbeBodies are EMPTY: the two are alternatives, never both, and
 	// anchoredIDs then holds the whole set's ids as a single group because the
 	// automaton reports for every pattern.
 	anchoredUnion *anchoredUnion
 
 	// btFnBodies[i] is the Backtracking driver for the i-th BT fallback bucket
-	// (SETS_PLAN item 20): (ptr, len, out_ptr) -> i32, the same shape a
+	//: (ptr, len, out_ptr) -> i32, the same shape a
 	// single-pattern capture body has. Laid out LAST among a set's functions so
 	// adding them moves no existing offset. btRegions is the one shared
 	// stack/memo/scratch allocation they all use.
@@ -135,7 +142,7 @@ type compiledSet struct {
 	// phase2Union is the start-anywhere automaton over this set's FALLBACK
 	// patterns ONLY, and it exists exactly for the sets unionScan cannot
 	// serve: a MIXED set, with a literal frontend AND at least one fallback
-	// bucket (SETS_PLAN item 19).
+	// bucket.
 	//
 	// Such a set is the expensive shape. One fallback pattern must be tried at
 	// every position, which switches the frontend's SIMD skip off for the
@@ -227,7 +234,7 @@ type compiledSet struct {
 	// emitted as i32.const/i8x16.splat pairs hoisted out of the scan loop.
 	packedPair *packedPairPlan
 
-	// shuftiAdaptive (task 28): true when Shufti was selected ONLY because
+	// shuftiAdaptive: true when Shufti was selected ONLY because
 	// set-level LikelyNoMatch overrode a static verdict that scalar would
 	// win (shuftiBeatsScalar(union) == false). Mirrors EmitPrefixScan's
 	// `adaptive` gate for the single-pattern path: the
@@ -239,7 +246,7 @@ type compiledSet struct {
 	shuftiAdaptive bool
 
 	// overlapDPColOff is the module address of the backward sweep's two
-	// working columns (SETS_PLAN item 11 stage C). Zero when the set emits no
+	// working columns. Zero when the set emits no
 	// sweep.
 	overlapDPColOff int32
 
@@ -274,8 +281,8 @@ func (cs *compiledSet) capFns() []setCapFn {
 	}
 	// The gate-array slot is present on BOTH `find` bodies. Under
 	// `overlapping: true` the array carries no match gates — it carries the
-	// once-per-drive preflight's verdict instead (§16.5.3 / SETS_PLAN item
-	// 11), which is what lets that verdict be computed once rather than on
+	// once-per-drive preflight's verdict instead, which is what lets that
+	// verdict be computed once rather than on
 	// every call. It is declared unconditionally rather than only when a
 	// preflight is emitted, because the alternative makes an exported
 	// signature depend on pattern analysis the caller cannot predict.
@@ -350,20 +357,20 @@ const (
 	setTypeI32I32ToI64 = 1 // (i32,i32)→i64      match_all, <= 64 patterns
 	setTypeI32x3ToI32  = 2 // (i32,i32,i32)→i32  scan; scan_any; match_all bitmap form
 	setMatchTypeSuffix = 3 // (i32×7)→i32        suffix DFA (tuple-writing)
-	setTypeI32x5ToI32  = 5 // (i32×5)→i32        find, overlapping: true
+	setTypeI32x5ToI32  = 5 // (i32×5)→i32        per-pattern batch wrappers; the DP sweep
 	setTypeI32x4ToI32  = 6 // (i32×4)→i32        bucket probes; scan_all bitmap form
 	setTypeI32x3ToI64  = 7 // (i32,i32,i32)→i64  scan_all <= 64 patterns
 	setTypeI32x6ToI32  = 8 // (i32×6)→i32        find, gated (default)
 	setTypeSuffixGated = 9 // (i32×8)→i32        suffix DFA with a gate pointer
 
-	// §19 find_batch. The cursor is an i64 in and an i64 out: the value the
+	// find_batch. The cursor is an i64 in and an i64 out: the value the
 	// export returns is passed back verbatim as the next call's cursor.
 	setTypeBatchGated = 10 // (i32,i32,i64,i32,i32,i32,i32,i32)→i64  find_batch
 	//                          ptr, len, cursor, gate, out, cap, scratch, scratch_len
 	//
 	// There is no separate type for the OVERLAPPING batch entry. Both overlap
-	// policies have shared ONE signature since SETS_PLAN item 11, so the
-	// second type was declared in every set module and referenced by none.
+	// policies share ONE signature, so the second type was declared in every
+	// set module and referenced by none.
 )
 
 // batchPosFnOffset returns the index of the set's shared per-position worker,
@@ -415,8 +422,8 @@ func (cs *compiledSet) gatedFind() bool { return cs.hasFind() && !cs.overlapping
 // shared worker carry a gate-array POINTER.
 //
 // Distinct from gatedFind on purpose, and the distinction is the whole of
-// SETS_PLAN item 11's ABI change. gatedFind asks "does this body apply the
-// §3.16 per-pattern non-overlapping rule"; this asks "is there an array in
+// the one-signature ABI. gatedFind asks "does this body apply the
+// per-pattern non-overlapping rule"; this asks "is there an array in
 // the argument list". An overlapping `find` answers no to the first and yes
 // to the second: it applies no match gates, but it needs somewhere
 // caller-owned to keep the preflight's verdict across the calls of one drive,
@@ -439,19 +446,19 @@ type SetSpec struct {
 	Name string
 
 	// Capability export names; "" = not declared. `Match` and `Scan` were
-	// retired by TODO task 59 decision (2).
+	// retired.
 	MatchAny string
 	MatchAll string
 	ScanAny  string
 	ScanAll  string
 	Find     string
 	// BatchFind is `hints: [batch-find]` on the set (decision (11)): emit the
-	// §19 multi-position entry alongside Find, both driven by one shared
+	// Multi-position batch entry alongside Find, both driven by one shared
 	// per-position worker. Meaningless without Find, and rejected at config
 	// load in that case.
 	BatchFind bool
 
-	Overlapping bool // §3.15 / D10: true = ungated `find` body
+	Overlapping bool // true = ungated `find` body
 
 	// IDSpaceSize is one past the largest pattern id this set can report —
 	// config.SetConfig.IDSpaceSize, the SAME function every stub generator
@@ -465,7 +472,7 @@ type SetSpec struct {
 	// DeclaredPatternCount is config.SetConfig.PatternCount — the number of
 	// patterns the set SELECTS, before any are dropped for carrying captures
 	// or exceeding the state limit. It sizes the stubs' tuple buffer, and with
-	// it the §19 cursor's k field, so it must be the DECLARED count both sides
+	// it the batch cursor's k field, so it must be the DECLARED count both sides
 	// can compute rather than the surviving one only the compiler sees —
 	// a mismatch there is a memory-safety hazard, not a wrong answer.
 	// Zero means "use the resolved count",
@@ -476,7 +483,7 @@ type SetSpec struct {
 	PatternIDs []int          // global indices into the regexps list
 }
 
-// patternCount is the count the §19 cursor and the stubs' buffer are sized
+// patternCount is the count the batch cursor and the stubs' buffer are sized
 // from: the declared one when the caller supplied it.
 func (s SetSpec) patternCount() int {
 	if s.DeclaredPatternCount > 0 {
@@ -494,9 +501,9 @@ func (s SetSpec) HasFind() bool { return s.Find != "" }
 func (s SetSpec) gated() bool { return s.HasFind() && !s.Overlapping }
 
 // suffixNeedsSkip reports whether the tuple-writing suffix functions carry the
-// §19 `skip` parameter. Only the OVERLAPPING batch body needs it: the gated
+// batch `skip` parameter. Only the OVERLAPPING batch body needs it: the gated
 // one resumes a split position through the gate array instead, since the
-// tuples it already delivered have gates recorded for them and the §3.16
+// tuples it already delivered have gates recorded for them and the gate
 // pre-mask therefore excludes exactly those patterns on re-entry.
 //
 // The parameter is added for every caller of the suffix function once it
@@ -541,17 +548,19 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	absLits, absAlive, absOK := buildAbsenceLits(spec)
 
 	// Build per-bucket pattern-ID mapping: patternIDs[bucketIdx][bitPos] = globalID.
+	//
+	// Through a map built once, not a linear search through spec.Patterns per
+	// bucket member — that was O(P^2) in the pattern count, twice over (the
+	// anchored packing below repeated it).
+	globalIDOf := make(map[*PatternInfo]int, len(spec.Patterns))
+	for k, sp := range spec.Patterns {
+		globalIDOf[sp] = spec.PatternIDs[k]
+	}
 	patternIDs := make([][]int, len(buckets))
 	for bi, b := range buckets {
 		ids := make([]int, len(b.patterns))
 		for j, p := range b.patterns {
-			// Find this pattern in spec.Patterns to get its global ID.
-			for k, sp := range spec.Patterns {
-				if sp == p {
-					ids[j] = spec.PatternIDs[k]
-					break
-				}
-			}
+			ids[j] = globalIDOf[p]
 		}
 		patternIDs[bi] = ids
 	}
@@ -588,7 +597,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		pml := make([]int, len(bkt.patterns))
 		var tm, sam, lam uint32
 		for j, p := range bkt.patterns {
-			if j >= 32 {
+			if j >= bucketMaskBits {
 				idxes[j] = -1
 				continue
 			}
@@ -633,18 +642,18 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// the single probe simply IS the first-hit one and no second body — and
 	// no module bytes — are spent.
 	// G8's liveness table is only worth its per-byte cost where a preflight
-	// will narrow the wanted mask (§18.4); elsewhere it is §16.5.2's reverted
+	// will narrow the wanted mask; elsewhere it is the reverted
 	// Candidate A all over again — a check that costs every byte and can
 	// never fire.
 	//
 	// The gate therefore mirrors usesScanAnyPreflight's own eligibility as
 	// closely as it can this early: `scan_any` declared, scalar frontend, some
 	// bucket with a never-dying walk, and NO word-boundary or (?m) pattern.
-	// The last is what §18.4 asks to be asserted here rather than inherited:
+	// The last is asserted here rather than inherited:
 	// buildUnionScanDFA refuses such sets, so they would get the table and the
 	// per-byte check with no preflight to make it fire.
 	// `spec.ScanAny != ""` was the other half of this condition until TODO
-	// task 59 decision (10): a scalar-frontend `scan_any` now compiles to the
+	// A scalar-frontend `scan_any` now compiles to the
 	// union walk itself, so no per-bucket liveness table can ever be consulted
 	// on its behalf. Only G9's gated-`find` preflight still reads one.
 	//
@@ -658,7 +667,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// reasons no cheap test can predict — a union state count over
 	// maxUnionScanStates, most of all — and every one of those refusals would
 	// otherwise leave a set carrying the table and the per-byte check with no
-	// preflight to fire them, which is §16.5.2's reverted Candidate A.
+	// preflight to fire them, which is the reverted Candidate A.
 	// Building it twice costs compile time only, and CLAUDE.md's second
 	// design principle spends compile time freely to avoid runtime cost.
 	overlapPreflight := overlapCanPreflight(spec, buckets) &&
@@ -729,6 +738,16 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// Identity is dfaFingerprint + dfaTableEqual, the same exact test dfaPool
 	// uses. Both are exact rather than heuristic, so a table that is not
 	// canonical simply fails to dedup; it can never alias onto a different one.
+	//
+	// The "DATA is a function of (table, base) alone" argument holds ONLY for
+	// bitmask buckets. A G17-SPARSE bucket's data additionally carries an
+	// idMap of GLOBAL pattern ids plus per-state accept lists sized by its own
+	// pattern count — none of which the table identity sees — so two sparse
+	// buckets with structurally identical suffix DFAs would alias onto one
+	// idMap and report the second bucket's matches under the first bucket's
+	// ids (with different pattern counts, under baked offsets that no longer
+	// match the emitted layout at all). Sparse buckets therefore never enter
+	// the pool and never reuse a base.
 	type suffixSlot struct {
 		t    *dfaTable
 		base int32
@@ -736,7 +755,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	suffixDedup := map[uint64][]suffixSlot{}
 	for bi, bkt := range buckets {
 		// A Backtracking fallback bucket has no table at all — that is the
-		// point of it (SETS_PLAN item 20). Its suffix body is emitted later,
+		// point of it. Its suffix body is emitted later,
 		// once the shared BT regions and the BT body's function index are
 		// known, so this pass simply leaves its slot empty and advances
 		// nothing.
@@ -744,7 +763,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			continue
 		}
 		base, reused, fp := tableOffset, false, uint64(0)
-		if bkt.suffixDFA != nil {
+		if bkt.suffixDFA != nil && !bkt.sparse {
 			fp = dfaFingerprint(bkt.suffixDFA)
 			for _, slot := range suffixDedup[fp] {
 				if dfaTableEqual(slot.t, bkt.suffixDFA) {
@@ -780,7 +799,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		tableOffset = nextOffset // use actual memory end, not encoded size
 		allDataBytes = append(allDataBytes, dataBytes...)
 		totalDataSegs += dataSegs
-		if bkt.suffixDFA != nil {
+		if bkt.suffixDFA != nil && !bkt.sparse {
 			suffixDedup[fp] = append(suffixDedup[fp], suffixSlot{bkt.suffixDFA, base})
 		}
 	}
@@ -790,7 +809,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	for bi, bkt := range buckets {
 		// Resolve prefixID → fnIdx for non-trivial patterns in this bucket.
 		for j, p := range bkt.patterns {
-			if j >= 32 || prefixFnIdx[bi][j] < 0 {
+			if j >= bucketMaskBits || prefixFnIdx[bi][j] < 0 {
 				continue // trivial or out of range
 			}
 			prefixID := p.prefixID
@@ -859,7 +878,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// size. What it cost was 86-414x the
 		// scan fuel, because past the cap the set silently lost its literal
 		// frontend entirely and visited every input position against every
-		// bucket (§13 F1). See acBudgetBytes for why this is denominated in
+		// bucket. See acBudgetBytes for why this is denominated in
 		// bytes and why the default is what it is.
 		// Uncompressed first, byte-class compression only as a RESCUE.
 		// Compression costs one table load per input
@@ -867,7 +886,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// would trade fuel — this project's first-priority metric — for
 		// module bytes, its second. It earns that cost only against the
 		// alternative of losing the literal frontend altogether, which
-		// measures 86-414x worse (§13 F1, §14.5).
+		// measures 86-414x worse.
 		cand := buildACLayoutMode(ac, prefixTableOffset, false)
 		acBytes := cand.bytes()
 		if acBytes > opts.acBudgetBytes() {
@@ -972,7 +991,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		teddyTableEnd = teddyDataOffset + int32(len(rawTeddy))
 	}
 
-	// Packed pair (§16 Task G1): no tables, so nothing is laid out here —
+	// Packed pair: no tables, so nothing is laid out here —
 	// only the plan the emitter reads. chooseLiteralFrontend returns this
 	// kind only when choosePackedPair succeeded on the same literals.
 	var packedPair *packedPairPlan
@@ -1035,7 +1054,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		setTablesEnd = teddyTableEnd
 	}
 
-	// ── Backtracking fallback buckets (SETS_PLAN item 20) ────────────────────
+	// ── Backtracking fallback buckets ────────────────────
 	// Laid out above every other table this set owns, so the regions cannot
 	// collide with a suffix, prefix, AC or Teddy table. ONE shared allocation
 	// sized to the largest BT bucket: only one BT call is ever live, because
@@ -1052,13 +1071,13 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// alone. This invariant was violated silently once — compileFallback's
 		// bin-packer merged later fallback patterns INTO a BT bucket, and every
 		// merged-in pattern vanished from every bucketed capability with no
-		// error anywhere (SETS_PLAN item 20, the 396/84 corpus failure). Panic
+		// error anywhere. Panic
 		// rather than emit: there is no correct module to produce from this
 		// state, and the alternative is another silent under-report.
 		if n := len(bkt.patterns); n != 1 {
 			panic(fmt.Sprintf("compile: set %q bucket %d is a Backtracking "+
 				"fallback holding %d patterns — a BT bucket must hold exactly "+
-				"one; the bin-packer merged into it (SETS_PLAN item 20)",
+				"one; the bin-packer merged into it",
 				spec.Name, bi, n))
 		}
 		numBTFns++
@@ -1132,10 +1151,10 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		litLens:             litLens,
 		diag:                diag,
 	}
-	// Anchored-capability automata (§3.3): a separate packing over the full
+	// Anchored-capability automata: a separate packing over the full
 	// patterns with leftmost-first pruning disabled.
 	//
-	// ONE automaton when it can be built (SETS_PLAN item 22 fix 1b), buckets
+	// ONE automaton when it can be built, buckets
 	// otherwise. The union serves match_any and match_all together — there is
 	// no way to give one of them the automaton and the other the buckets, since
 	// both read the same packing — so the staging the item describes collapses
@@ -1144,15 +1163,62 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// Anchored tables go after every other table this set emits; the data
 		// segment bytes include their own headers, so this over-estimates the
 		// end of the preceding regions, which is harmless.
-		anchoredTableBase := setTablesEnd
+		// 8-aligned. Every union table this base leads to is read with an
+		// i64 or i32 load, and their own internal alignment is relative to
+		// it — so a base at an odd address makes the alignment inside the
+		// builder a promise it cannot keep.
+		anchoredTableBase := (setTablesEnd + 7) &^ 7
 		// The packer runs FIRST, because whether it produces one automaton is
 		// itself part of the union's eligibility — see anchoredUnionBeatsBuckets.
 		// Its result is discarded when the union wins, which costs compile time
 		// only (CLAUDE.md: runtime over compile time).
-		abuckets, _ := compileAnchoredBuckets(spec.Patterns, opts, diag)
+		abuckets, amembers := compileAnchoredBuckets(spec.Patterns, opts, diag)
+		// The union must answer for exactly the patterns the PACKER kept.
+		//
+		// It is built from a spec, and the packer drops a pattern whose solo
+		// anchored DFA exceeds max_fallback_states (and admits no Backtracking
+		// member — see docs/sets.md "Backtracking members and the anchored
+		// pair"). Building the union from the unfiltered spec made the two
+		// halves of one capability disagree: with the union, match_any and
+		// match_all reported patterns that with buckets they do not, and the
+		// --set-bt corpus leg found exactly that.
+		anchoredSpec := spec
+		kept := make(map[*PatternInfo]bool, len(spec.Patterns))
+		for _, members := range amembers {
+			for _, p := range members {
+				kept[p] = true
+			}
+		}
+		if len(kept) != len(spec.Patterns) {
+			anchoredSpec.Patterns = nil
+			anchoredSpec.PatternIDs = nil
+			for i, p := range spec.Patterns {
+				if kept[p] {
+					anchoredSpec.Patterns = append(anchoredSpec.Patterns, p)
+					anchoredSpec.PatternIDs = append(anchoredSpec.PatternIDs, spec.PatternIDs[i])
+				}
+			}
+		}
 		var au *anchoredUnion
-		if anchoredUnionBeatsBuckets(abuckets) {
-			au = buildAnchoredUnionDFA(spec, anchoredTableBase, spec.MatchAll != "")
+		if len(anchoredSpec.Patterns) > 0 && anchoredUnionBeatsBuckets(abuckets) {
+			// The `_all` ABI is cs.wideAll()'s to decide, and the automaton
+			// must be built to match it — see buildAnchoredUnionDFA's
+			// forceWideAll. cs.idSpaceSize() is not usable here yet (an
+			// anchored-only set has no packing to read ids from until this
+			// block fills cs.anchoredIDs), so the same quantity is computed
+			// from the spec.
+			idSpace := spec.IDSpaceSize
+			if idSpace <= 0 {
+				maxID := -1
+				for _, id := range spec.PatternIDs {
+					if id > maxID {
+						maxID = id
+					}
+				}
+				idSpace = maxID + 1
+			}
+			forceWideAll := idSpace > wideBitmapThreshold || cs.hasBTMember()
+			au = buildAnchoredUnionDFA(anchoredSpec, anchoredTableBase, spec.MatchAll != "", forceWideAll)
 		}
 		if au != nil {
 			cs.anchoredUnion = au
@@ -1160,7 +1226,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			// report are exactly the set's — no packing to read them from.
 			// idSpaceSize and checkIDSpace consult this, and an anchored-only
 			// set has no other packing at all.
-			cs.anchoredIDs = [][]int{append([]int(nil), spec.PatternIDs...)}
+			cs.anchoredIDs = [][]int{append([]int(nil), anchoredSpec.PatternIDs...)}
 			cs.anchoredDataBytes = append(cs.anchoredDataBytes, au.dataBytes...)
 			cs.anchoredDataSegs += au.dataSegs
 			if au.tableEnd > setTablesEnd {
@@ -1181,12 +1247,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			for bi, ab := range abuckets {
 				ids := make([]int, len(ab.patterns))
 				for j, ap := range ab.patterns {
-					for k, sp := range spec.Patterns {
-						if sp == ap {
-							ids[j] = spec.PatternIDs[k]
-							break
-						}
-					}
+					ids[j] = globalIDOf[ap]
 				}
 				cs.anchoredIDs[bi] = ids
 				body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids)
@@ -1220,7 +1281,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// alive verdict is what retires a never-dying pattern from validMask, and
 	// without the automaton there is nothing to compute it with.
 	//
-	// So does a find-only GATED set, as of SETS_PLAN item 22 fix 2a. Its
+	// So does a find-only GATED set. Its
 	// preflight had always been silently dormant on such a set — the automaton
 	// it reads was only ever built for the scan capabilities — which is why
 	// the losing classchain row got one at all (setperf declares the scan pair
@@ -1229,7 +1290,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	needUnionForOverlap := cs.overlapPreflightShape() && !cs.usesAbsencePrefilter()
 	needUnionForGated := cs.gatedPreflightShape() && !cs.usesAbsencePrefilter()
 	if fe == frontendScalar && (spec.ScanAll != "" || spec.ScanAny != "" || needUnionForOverlap || needUnionForGated) {
-		unionBase := setTablesEnd
+		unionBase := (setTablesEnd + 7) &^ 7 // 8-aligned, see anchoredTableBase (U4)
 		// needUnionForGated also asks for the per-state accept ROWS, which a
 		// WIDE automaton emits only on request and the wide alive walk reads in
 		// place of the u64 pair it has no room for (item 22 fix 2a-wide). On a
@@ -1244,16 +1305,16 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		diag.UnionScan = &UnionScanDiag{Refused: "frontend"}
 	}
 
-	// Phase 2 of the two-phase scan (SETS_PLAN item 19), for the MIXED sets
+	// Phase 2 of the two-phase scan, for the MIXED sets
 	// the block above cannot serve: a literal frontend plus at least one
 	// fallback bucket, where today the fallback's every-position obligation
 	// costs the whole set its skip. The automaton covers the FALLBACK
 	// patterns only; phase 1 is the frontend over the literal buckets.
 	//
-	// `scan` is not consulted: TODO task 59 decision (2) retires it.
+	// `scan` is not consulted: it is a retired key.
 	//
-	// NOT taken when the set has a Backtracking member (SETS_PLAN item 20
-	// decision 3). Phase 2's union walk answers with an i64 accumulator and
+	// NOT taken when the set has a Backtracking member. Phase 2's union walk
+	// answers with an i64 accumulator and
 	// has no out_ptr parameter at all — it implements the NARROW `_all` ABI
 	// only — while a BT member forces every `_all` capability into the memory
 	// form, so emitTwoPhaseScanBody would be composing two phases of different
@@ -1263,7 +1324,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	if fe != frontendScalar && (spec.ScanAny != "" || spec.ScanAll != "") &&
 		hasSetFallbackBucketsIn(buckets) && hasLiteralBuckets(buckets) &&
 		!hasBTBucketIn(buckets) {
-		p2Base := setTablesEnd
+		p2Base := (setTablesEnd + 7) &^ 7 // 8-aligned, see anchoredTableBase (U4)
 		sub := fallbackSubSpec(spec, buckets)
 		// No accept rows on request: phase 2 serves the scan pair only, and
 		// `find` — the preflight's capability — is excluded from the split.
@@ -1274,7 +1335,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		diag.UnionScan = unionScanDiagOf(cs.phase2Union, sub, true)
 	}
 
-	// First-byte eligibility tables (§21.6 / G16), laid out after every other
+	// First-byte eligibility tables, laid out after every other
 	// region for the same reason the union DFA is: whatever is built last must
 	// start above what is already placed, or two tables share an address.
 	//
@@ -1285,7 +1346,13 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	for bi := range cs.startableOff {
 		cs.startableOff[bi] = -1
 	}
-	if fe == frontendScalar && spec.Find != "" {
+	// Built for the SCAN pair as well as `find`. The scan bodies take exactly
+	// the same per-position probe call on exactly the same fallback buckets —
+	// literal-less past 256 ids, or a mixed set whose fallback cannot
+	// determinise into phase2Union — so withholding the table from them left
+	// every position paying a full probe G16 would have skipped. On `find`
+	// that skip was worth 251 -> 94 fuel/byte on greedy-3's no-match row.
+	if fe == frontendScalar && (spec.Find != "" || spec.ScanAny != "" || spec.ScanAll != "") {
 		for bi, bkt := range buckets {
 			if !bkt.isFallback {
 				continue
@@ -1307,7 +1374,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	}
 
 	// The sweep's two working columns. Module memory, and that is allowed:
-	// they live only for the duration of one call, which is what §3.15
+	// they live only for the duration of one call, which is what the
+	// no-module-state rule
 	// permits. The tuples — the part that must survive BETWEEN calls — go in
 	// the caller's scratch.
 	//
@@ -1323,9 +1391,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		cs.startableDataBytes = append(cs.startableDataBytes,
 			appendDataSegment(nil, setTablesEnd, make([]byte, n))...)
 		cs.startableDataSegs++
+		// ADVANCED, even though the columns are the last region placed today.
+		// Leaving a region out of the running end is the accounting slip X1
+		// exists to end, and "correct because nothing follows it" is a
+		// property of the current order, not of this code.
+		setTablesEnd += int32(n)
 	}
 
-	// §9.4 first-position routing data, derived from the finished bucket list.
+	// First-position routing data, derived from the finished bucket list.
 	cs.prefixLenGroups = make([][]prefixLenGroup, len(buckets))
 	for bi := range buckets {
 		cs.prefixLenGroups[bi] = buildPrefixLenGroups(cs, bi)
@@ -1352,20 +1425,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	return cs
 }
 
-// appendTableLoad64 emits i64.load align=3 offset=0.
-// tableMemIdx 0: 0x29 0x03 0x00. tableMemIdx 1: 0x29 0x43 0x01 0x00.
-func appendTableLoad64(b []byte, tableMemIdx int) []byte {
-	if tableMemIdx == 0 {
-		return append(b, 0x29, 0x03, 0x00)
-	}
-	return append(b, 0x29, 0x43, byte(tableMemIdx), 0x00)
-}
-
 // --------------------------------------------------------------------------
 // CompileFile — orchestrates all patterns and sets into one WASM module.
 
 // CompileFile compiles all regexp patterns and sets from cfg into a single WASM module.
 // When cfg.Sets is empty, it is byte-identical to the existing Compile() path.
+//
+// The second return value is ONE PAST the highest address the module's tables
+// occupy — set tables included — so a caller can place its input above it.
 func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	w, top, _, err := CompileFileDiag(cfg, output)
 	return w, top, err
@@ -1523,17 +1590,15 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 	if setTableBase > dataTop {
 		dataTop = setTableBase
 	}
+	// One page minimum, and the clamp below the division is the only one
+	// needed: memPages starts at 1 and the ceiling division of a positive
+	// dataTop cannot produce less than 1, so the two arms that re-clamped it
+	// afterwards were unreachable.
 	var memPages int32 = 1
 	if dataTop > 0 {
-		memPages = int32((dataTop + 65535) / 65536)
-		if memPages < 1 {
-			memPages = 1
+		if n := int32((dataTop + 65535) / 65536); n > 1 {
+			memPages = n
 		}
-	}
-	if standalone && memPages < 1 {
-		memPages = 1
-	} else if !standalone && lastTableEnd == 0 && setTableBase == 0 {
-		memPages = 1
 	}
 	diags := make([]SetDiag, 0, len(compiledSets))
 	for _, cs := range compiledSets {
@@ -1541,7 +1606,12 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 			diags = append(diags, *cs.diag)
 		}
 	}
-	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone), lastTableEnd, diags, nil
+	// dataTop, not lastTableEnd. The second return value is "where is it safe
+	// to put input", and lastTableEnd covers only the PER-PATTERN tables — a
+	// caller trusting it on a set-bearing module wrote its input over the
+	// first set's tables. tools/perftest already worked around this by
+	// re-parsing the data section; nothing else did.
+	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone), dataTop, diags, nil
 }
 
 // assembleModuleWithSets builds a WASM module from per-pattern compilations
@@ -1563,20 +1633,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		rawData = append(rawData, p.dataBytes...)
 	}
 	for _, cs := range sets {
-		totalSegs += cs.dataSegCount + cs.prefixDataSegCount + cs.acDataSegCount +
-			cs.teddyDataSegCount + cs.anchoredDataSegs + cs.unionScanDataSegs() +
-			cs.startableDataSegs
-		rawData = append(rawData, cs.dataBytes...)
-		rawData = append(rawData, cs.prefixDataBytes...)
-		rawData = append(rawData, cs.acDataBytes...)
-		rawData = append(rawData, cs.teddyDataBytes...)
-		rawData = append(rawData, cs.anchoredDataBytes...)
-		rawData = append(rawData, cs.startableDataBytes...)
-		if cs.unionScan != nil {
-			rawData = append(rawData, cs.unionScan.dataBytes...)
-		}
-		if cs.phase2Union != nil {
-			rawData = append(rawData, cs.phase2Union.dataBytes...)
+		// ONE authority for what a set contributes, shared with dataTop — see
+		// dataBlobs.
+		for _, blob := range cs.dataBlobs() {
+			totalSegs += blob.segs
+			rawData = append(rawData, blob.bytes...)
 		}
 	}
 
@@ -1614,21 +1675,26 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	out = append(out, 0x00, 0x61, 0x73, 0x6D)
 	out = append(out, 0x01, 0x00, 0x00, 0x00)
 
-	// Type section: 7 types.
+	// Type section. Index 4 is emitted but referenced by NOTHING: it is a
+	// duplicate of type 0 kept only so the indices below do not renumber, and
+	// removing it would move every constant in the setType* block. Its comment
+	// used to describe it as the prefix backward DFA, which reads as a live
+	// slot.
+	// Type section: 11 types.
 	// 0: (i32,i32)→i32          match/backward-prefix
 	// 1: (i32,i32)→i64          find
 	// 2: (i32,i32,i32)→i32      capture/groups
 	// 3: (i32×7)→i32            suffix DFA (ptr,start,len,lPos,out_ptr,out_cap,validMask)→count
 	// 4: (i32,i32)→i32          prefix backward DFA (same as 0, kept for clarity)
-	// 5: (i32×5)→i32            set find body, overlapping: true
+	// 5: (i32×5)→i32            per-pattern batch wrappers; the DP sweep
 	// 6: (i32×4)→i32            bucket probe / bitmap-form _all
 	// 7: (i32×3)→i64            scan_any, scan_all (<= 64 patterns)
 	// 8: (i32×6)→i32            set find body, gated (default)
 	// 9: (i32×8)→i32            suffix DFA with a gate pointer; also the
-	//                            ungated suffix DFA carrying §19's `skip`
+	//                            ungated suffix DFA carrying the batch `skip`
 	// 10: (i32,i32,i64,i32,i32,i32,i32,i32)→i64  find_batch, BOTH overlap
 	//                                             policies (one signature
-	//                                             since SETS_PLAN item 11)
+	//                                             policies)
 	typeSection := []byte{
 		0x0B,
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0
@@ -1656,43 +1722,37 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	}
 
 	// Function section: patterns + set functions.
+	// Walks the SAME funcLayout the single-pattern assembler does; only the
+	// TYPE INDICES differ, because this module has its own type table. That
+	// remapping is the hazard this indirection exists for — the alt-lit-anchor
+	// arm was once missing here entirely — and reading the layout from one place
+	// leaves exactly this table to get right.
+	setSlotType := map[funcSlotKind]byte{
+		slotMatch:             setTypeI32I32ToI32, // (i32,i32)→i32
+		slotAltBackScan:       setTypeI32I32ToI32,
+		slotAltForwardVerify:  setTypeI32x3ToI64, // (i32,i32,i32)→i64 — 7 here, 3 there
+		slotAltDispatch:       setTypeI32I32ToI64,
+		slotLitAnchorBackScan: setTypeI32I32ToI32,
+		slotLitAnchorFind:     setTypeI32I32ToI64,
+		slotFind:              setTypeI32I32ToI64,
+		slotCapture:           setTypeI32x3ToI32, // (i32,i32,i32)→i32
+		slotGroupsWrapper:     setTypeI32x3ToI32,
+		// The LM-2 batch wrappers share the set match body's
+		// (i32×5)→i32 shape rather than needing a type of their own.
+		slotBatchFind:         setMatchTypeMatch,
+		slotBatchGroups:       setMatchTypeMatch,
+		slotFindWrapper:       setTypeI32x3ToI64, // 7 here, 3 there
+		slotGroupsFromWrapper: setTypeI32x4ToI32, // (i32×4)→i32
+	}
 	var fs []byte
 	fs = utils.AppendULEB128(fs, uint32(total))
 	for _, p := range patterns {
-		if p.matchBody != nil {
-			fs = append(fs, 0x00)
-		}
-		if p.litAnchorBackScanBody != nil {
-			fs = append(fs, 0x00)
-			fs = append(fs, 0x01)
-		} else if p.findBody != nil {
-			fs = append(fs, 0x01)
-		}
-		if p.captureBody != nil {
-			fs = append(fs, 0x02)
-			if !p.anchored {
-				fs = append(fs, 0x02)
+		for _, slot := range p.funcLayout() {
+			t, ok := setSlotType[slot.kind]
+			if !ok {
+				panic("compile: no set-module type index for function slot kind")
 			}
-		}
-		// Batch find/groups wrapper (task 44): same signature as the set
-		// match body — (i32,i32,i32,i32,i32)→i32 — so it reuses type 5
-		// rather than needing a dedicated type.
-		if p.batchFindExport != "" {
-			fs = append(fs, byte(setMatchTypeMatch))
-		}
-		if p.batchGroupsExport != "" {
-			fs = append(fs, byte(setMatchTypeMatch))
-		}
-		if p.hasFindFunc() {
-			// (i32,i32,i32)→i64. NOTE the type index differs from the
-			// single-pattern assembler's 3: this module has its own type
-			// table, where that shape is 7.
-			fs = append(fs, byte(setTypeI32x3ToI64))
-		}
-		// (i32×4)→i32 groups/named-groups wrappers. This table already has
-		// that shape at 6, so no new type is needed here.
-		if p.hasGroupsFromWrapper() {
-			fs = append(fs, byte(setTypeI32x4ToI32))
+			fs = append(fs, t)
 		}
 	}
 	for _, cs := range sets {
@@ -1700,7 +1760,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			fs = append(fs, c.typeIdx)
 		}
 		// The hidden per-position batch worker. Gated it is `find`'s own
-		// signature; ungated it is that signature plus §19's `skip` — which
+		// signature; ungated it is that signature plus the batch `skip` — which
 		// is the same arity, so both are type 8.
 		if cs.batchFind {
 			fs = append(fs, byte(cs.workerTypeIdx()))
@@ -1763,7 +1823,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// Global section: the find-from channel (see find_from.go), on the same
 	// terms as the single-pattern assembler. Set capabilities take their own
 	// `from` as a real parameter and do not use it.
-	if anyFindFunc(patterns) {
+	if moduleUsesFindFrom(patterns) {
 		out = appendSection(out, 6, findFromGlobalSection())
 	}
 
@@ -1773,19 +1833,25 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		numExports++
 	}
 	for _, p := range patterns {
-		if p.matchExport != "" {
+		// The conditions here MUST be character-for-character the ones the
+		// emission loop below uses: a count larger than the number of entries
+		// written produces a malformed module with no diagnostic, and the two
+		// assemblers have drifted before.
+		matchOff, _, findOff, _, _ := p.offsets()
+		batchFindOff, batchGroupsOff := p.batchOffsets()
+		if p.matchExport != "" && matchOff >= 0 {
 			numExports++
 		}
-		if p.findExport != "" {
+		if p.findExport != "" && findOff >= 0 {
 			numExports++
 		}
 		if p.hasGroupsFromWrapper() {
 			numExports++
 		}
-		if p.batchFindExport != "" {
+		if p.batchFindExport != "" && batchFindOff >= 0 {
 			numExports++
 		}
-		if p.batchGroupsExport != "" {
+		if p.batchGroupsExport != "" && batchGroupsOff >= 0 {
 			numExports++
 		}
 	}
@@ -1851,7 +1917,26 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		if p.matchBody != nil {
 			cs_bytes = append(cs_bytes, p.matchBody...)
 		}
-		if p.litAnchorBackScanBody != nil {
+		if p.altLitAnchorBranches != nil {
+			for _, br := range p.altLitAnchorBranches {
+				cs_bytes = append(cs_bytes, br.backScanBody...)
+				cs_bytes = append(cs_bytes, br.forwardVerifyBody...)
+			}
+			// Generate the dispatcher body now that function indices are known.
+			tableMemIdx := 0
+			if !standalone {
+				tableMemIdx = 1
+			}
+			branchFuncIdxs := make([]altLitAnchorFuncIdx, len(p.altLitAnchorBranches))
+			for j := range p.altLitAnchorBranches {
+				backOff, fwdOff := p.altLitAnchorBranchFuncIdx(j)
+				branchFuncIdxs[j] = altLitAnchorFuncIdx{backScan: base + backOff, forwardVerify: base + fwdOff}
+			}
+			altDispatchBody, altDispatchMode := buildAltLitAnchorFindBody(p, branchFuncIdxs, tableMemIdx)
+			p.findFromMode = altDispatchMode
+			cs_bytes = utils.AppendULEB128(cs_bytes, uint32(len(altDispatchBody)))
+			cs_bytes = append(cs_bytes, altDispatchBody...)
+		} else if p.litAnchorBackScanBody != nil {
 			cs_bytes = append(cs_bytes, p.litAnchorBackScanBody...)
 			tableMemIdx := 0
 			if !standalone {
@@ -1883,7 +1968,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
-				cs_bytes = appendBatchLitChainGroupsWrapperCodeEntry(cs_bytes, base+captureOff, p.numGroups)
+				cs_bytes = appendBatchLitChainGroupsWrapperCodeEntry(cs_bytes, base+captureOff, p.numGroups, p.captureFromMode)
 			} else {
 				batchTableMemIdx := 0
 				if !standalone {
@@ -1906,8 +1991,12 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
 			if p.anchored {
-				inner, anchoredOnly = base+captureOff, true
+				// See assembleModule's twin: anchored means "captureBody is
+				// the export", not "matches only at 0".
+				inner = base + captureOff
+				anchoredOnly = p.captureFromMode == ffAnchoredZeroOnly
 			}
+			assertGroupsFromWrapperMode(p, anchoredOnly)
 			cs_bytes = appendGroupsFromWrapperCodeEntry(cs_bytes, inner, anchoredOnly)
 		}
 	}
@@ -1937,7 +2026,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					dpIdx = base + off
 				}
 				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.batchPosFnOffset(), dpIdx)...)
-			case capMatch, capMatchAny, capMatchAll:
+			case capMatchAny, capMatchAll:
 				if cs.anchoredUnion != nil {
 					cs_bytes = append(cs_bytes,
 						emitAnchoredUnionBody(cs.anchoredUnion, c.kind, cs.wideAll(), tableMemIdx)...)
@@ -1955,7 +2044,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					// the per-position bucket walk. Which body depends on the
 					// automaton's accept representation, not on the
 					// capability: above 64 ids there is no u64 accumulator to
-					// answer with (SETS_PLAN item 21 phase 1).
+					// answer with.
 					if cs.unionScan.isWide() {
 						body = emitUnionScanWideBody(cs.unionScan, c.kind, tableMemIdx)
 					} else {
@@ -1964,7 +2053,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				} else {
 					// `scan` / `scan_any` may stop at the first bit and get
 					// the first-hit probes; `scan_all` needs every bit at the
-					// position and keeps the mask-complete ones (§18.2).
+					// position and keeps the mask-complete ones.
 					body = emitSetMatchFnFinal(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx, c.kind, scanProbeBase)
 				}
 				cs_bytes = append(cs_bytes, body...)
@@ -2083,7 +2172,7 @@ func emitSetMatchFnFinal(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMe
 // It answers for the VIEW being emitted, not for the set: under phase1Only the
 // fallback buckets belong to phase 2 and are not this body's problem, so the
 // prefilters that a fallback bucket would otherwise disable stay on. That is
-// the entire mechanism of SETS_PLAN item 19 — the skip is not made safe, the
+// the entire mechanism of the two-phase split — the skip is not made safe, the
 // work that made it unsafe is moved to a pass of its own.
 func hasSetFallbackBuckets(cs *compiledSet) bool {
 	if cs.phase1Only {
@@ -2098,9 +2187,14 @@ func hasSetFallbackBuckets(cs *compiledSet) bool {
 //
 // It must refuse everything the real predicate refuses, or a set gets the
 // table and the per-byte check with no preflight to make either fire, which
-// is §16.5.2's reverted Candidate A: cost on every byte, no exit ever taken.
+// is the reverted Candidate A: cost on every byte, no exit ever taken.
 // The never-dying and boundary tests are applied by the caller, which is
 // already walking the buckets for them.
+// It must be a SUPERSET of compiledSet.overlapPreflightShape
+// (set_union_scan.go), which asks the same question later, from the finished
+// compiledSet, to decide whether the union TABLES must be built. If this one
+// admits a set the other refuses, the preflight is emitted with no table to
+// read. TestOverlapPreflightPredicatesAgree pins the containment.
 func overlapCanPreflight(spec SetSpec, buckets []*bucket) bool {
 	if spec.Find == "" || !spec.Overlapping {
 		return false
@@ -2139,7 +2233,7 @@ func hasSetFallbackBucketsIn(buckets []*bucket) bool {
 // returning the TOTAL number of matches at the first matching position at or
 // after `from`. See compile/set_find.go for the first-position machinery.
 func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemIdx int, mode setCapKind, probeFnBase int) []byte {
-	// G8's `scan_any` preflight is GONE (TODO task 59 decision (10)). It ran
+	// G8's `scan_any` preflight is GONE. It ran
 	// the start-anywhere union automaton once over [from,len) and used the
 	// result to drop never-matching patterns from every bucket's validMask —
 	// a way to make the per-position walk cheaper for a capability that could
@@ -2147,8 +2241,8 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// With the start dropped, `scan_any` IS the union walk (usesUnionScan),
 	// so this body is never reached with mode == capScanAny on a set that
 	// qualified, and the narrowing has nothing left to narrow.
-	// G9 (§18.5): the gated `find` body runs the same union pass once per
-	// drive and writes its result back as §3.16 gate sentinels. Still live —
+	// G9: the gated `find` body runs the same union pass once per
+	// drive and writes its result back as gate sentinels. Still live —
 	// `find` reports positions and cannot become a union walk.
 	// Item 11: the OVERLAPPING body runs the same pass, keeping its verdict
 	// in the gate array the caller now supplies for exactly this purpose.
@@ -2178,20 +2272,42 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	if findPreflight {
 		aliveWords = cs.preflightAliveWords()
 	}
+	// F2: one i32 per global id, holding the call-invariant gate value. The
+	// count is decided here so the local declaration and the base index below
+	// cannot disagree; 0 means the body keeps reading the caller's array.
+	gateLocals := 0
+	{
+		// The trailing locals already declared, in the widest arm, so the
+		// 256-index bound is checked against the real frame.
+		frame := 17
+		if gateLocalsProfitable(cs, cs.gatedFind() && mode == capFind, frame) {
+			gateLocals = cs.idSpaceSize()
+		}
+	}
+
 	var b []byte
+	// lFirstByte is E5's hoisted input[lPos], declared in a TRAILING group so
+	// every index below it keeps its value — the arms name the i64s and the
+	// v128 explicitly, and inserting into an earlier group would move them.
+	var lFirstByte byte
 	if absence {
-		// 13 i32 (pos, search mask, simd mask, allElig, end), 2 i64 (acc, alive), 1 v128.
+		// 13 i32 (pos, search mask, simd mask, allElig, end), 2 i64 (acc, alive), 1 v128,
+		// then lFirstByte and the absence drain's candidate position (G5).
 		// Always one alive word: the absence prefilter is capped at 64 ids.
-		b = append(b, 0x03, 0x0D, 0x7F, 0x02, 0x7E, 0x01, 0x7B)
+		b = append(b, 0x04+gateGroups(gateLocals), 0x0D, 0x7F, 0x02, 0x7E, 0x01, 0x7B, 0x02, 0x7F)
+		b = appendGateLocalGroup(b, gateLocals)
 	} else if findPreflight {
 		// 8 i32 + the union walk's state/pos + allElig + end, then i64 acc + the
-		// alive mask's words.
-		b = append(b, 0x02, 0x0C, 0x7F)
+		// alive mask's words, then lFirstByte.
+		b = append(b, 0x03+gateGroups(gateLocals), 0x0C, 0x7F)
 		b = utils.AppendULEB128(b, uint32(1+aliveWords))
 		b = append(b, 0x7E)
+		b = append(b, 0x01, 0x7F)
+		b = appendGateLocalGroup(b, gateLocals)
 	} else {
-		// locals: 9 x i32, then the scan_all i64 accumulator.
-		b = append(b, 0x02, 0x09, 0x7F, 0x01, 0x7E)
+		// locals: 9 x i32, then the scan_all i64 accumulator, then lFirstByte.
+		b = append(b, 0x03+gateGroups(gateLocals), 0x09, 0x7F, 0x01, 0x7E, 0x01, 0x7F)
+		b = appendGateLocalGroup(b, gateLocals)
 	}
 
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
@@ -2201,6 +2317,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// up by one against the pre-2b layout.
 	c.lAllElig = c.localBase + 8
 	c.lAcc = c.localBase + 9
+	lFirstByte = c.localBase + 10
 	lPos := c.lPos
 	pInLen := c.pInLen
 	lEnd := byte(0)
@@ -2209,11 +2326,24 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 		lEnd = c.localBase + 12
 		c.lAcc = c.localBase + 13
 		c.aliveMask = c.localBase + 14
+		lFirstByte = c.localBase + 16 // past the v128 chunk at +15
 	} else if findPreflight {
 		c.lAllElig = c.localBase + 10
 		lEnd = c.localBase + 11
 		c.lAcc = c.localBase + 12
 		c.aliveMask = c.localBase + 13
+		lFirstByte = byte(int(c.localBase) + 13 + aliveWords)
+	}
+
+	if gateLocals > 0 {
+		// The gate block is the LAST group of every arm, so its base is one
+		// past that arm's last local. lFirstByte is the last non-gate local in
+		// the plain and preflight arms; lCand is in the absence arm.
+		if absence {
+			c.gateLocalBase = c.localBase + 18
+		} else {
+			c.gateLocalBase = lFirstByte + 1
+		}
 	}
 
 	if findPreflight {
@@ -2224,9 +2354,19 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 		// The v128 chunk is the last local of the absence arm, so it moves up
 		// with the i64s when lAllElig is inserted ahead of them.
 		lChunk := byte(c.localBase + 15)
+		// The absence drain's candidate position is the LAST local of the
+		// absence arm, one past lFirstByte (G5).
+		lCand := byte(c.localBase + 17)
 		b = emitFindPreflight(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
-			c.pGate, c.pInLen, c.pFrom, lEnd, tableMemIdx, absence, c.localBase+10, lChunk)
+			c.pGate, c.pInLen, c.pFrom, lEnd, tableMemIdx, absence, c.localBase+10, lChunk, lCand)
 	}
+	// AFTER the preflight, which WRITES gate sentinels into the caller's
+	// array: locals captured before it hold the pre-preflight values, and the
+	// per-candidate pre-mask then clears nothing the preflight had retired.
+	// Safe (a gate value is a lower bound, so a stale one only
+	// over-approximates eligibility) but measured at +93% fuel on greedy-3's
+	// no-match `find` — which is exactly what G10's preflight exists to avoid.
+	b = c.emitGateLocalsPrologue(b)
 	b = c.emitFindPrologue(b, lPos)
 
 	b = append(b, 0x02, 0x40) // block $done
@@ -2238,13 +2378,13 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// buildSetSuffixBody's eofBitmaskOff table (paired with newDFA's bootstrap-alias
 	// guard giving midStart its own correct accept bits) avoids false positives.
 	// An out-of-range `from` (> len) lands here on the first iteration and returns
-	// 0, which is the §4.2 contract.
+	// 0, which is the documented offset-past-end contract.
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01) // lPos > pInLen (i32.gt_u)
 	b = c.emitDrainCheck(b, lPos, 0x01)
 
 	// Fallback buckets first: they have no literal gate, so they must be
 	// evaluated at every position. Skipped entirely under phase1Only, where
-	// they are phase 2's pass instead (SETS_PLAN item 19).
+	// they are phase 2's pass instead.
 	if !cs.phase1Only {
 		for bi, bkt := range cs.buckets {
 			if !bkt.isFallback {
@@ -2254,7 +2394,10 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 		}
 	}
 
-	b = c.emitLiteralBuckets(b, lPos)
+	// The position's first byte is loaded once for the whole bucket chain: an
+	// AC-demoted scalar set can carry dozens to hundreds of buckets, and every
+	// one of them opened by reading the same byte again (E5).
+	b = c.emitLiteralBucketsHoisted(b, lPos, lFirstByte)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
 	b = append(b, 0x0C, 0x00)
@@ -2281,7 +2424,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 //   - 17 ≤ |shuftiFirstByteSet| ≤ 64 (matches emitShuftiPrefixCheck's bounds),
 //   - rarity-based density supports Shufti OR set-level LikelyNoMatch is set.
 //
-// When cs.shuftiAdaptive (task 28 — ported from EmitPrefixScan's task 25
+// When cs.shuftiAdaptive (ported from EmitPrefixScan's own
 // DenseCounter/DenseSkipFlag switch): adds a runtime density counter that
 // disables the SIMD probe for the rest of the call once `denseSwitchThreshold`
 // consecutive "attempts" (one $scan iteration each) found a candidate in the
@@ -2293,21 +2436,27 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	var b []byte
 	adaptive := cs.shuftiAdaptive
 	// locals: 6 × i32 (lPos, lTotal, lTmp, lValidMask, lOutBase, lSkipMask), 1 × v128 (lChunk),
-	// + task 28: 2 × i32 (lDenseCounter, lDenseSkipFlag) when adaptive,
-	// + 3 × i32 (lMinStart, lBase, lStart) for the §9.4 first-position state.
+	// + 2 × i32 (lDenseCounter, lDenseSkipFlag) when adaptive,
+	// + 3 × i32 (lMinStart, lBase, lStart) for the first-position state.
+	// The per-position first byte (E5) is declared in a TRAILING group so that
+	// every index above it is untouched: WASM assigns local indices in
+	// declaration order, and inserting into an earlier group would move the
+	// v128 and i64 the arms below name explicitly.
 	if adaptive {
-		b = append(b, 0x05)       // 5 local groups
+		b = append(b, 0x06)       // 6 local groups
 		b = append(b, 0x06, 0x7F) // 6 × i32
 		b = append(b, 0x01, 0x7B) // 1 × v128
 		b = append(b, 0x02, 0x7F) // 2 × i32
 		b = append(b, 0x03, 0x7F) // 3 × i32
 		b = append(b, 0x01, 0x7E) // 1 × i64 (scan_all accumulator)
+		b = append(b, 0x01, 0x7F) // 1 × i32 (hoisted first byte)
 	} else {
-		b = append(b, 0x04)       // 4 local groups
+		b = append(b, 0x05)       // 5 local groups
 		b = append(b, 0x06, 0x7F) // 6 × i32
 		b = append(b, 0x01, 0x7B) // 1 × v128
 		b = append(b, 0x03, 0x7F) // 3 × i32
 		b = append(b, 0x01, 0x7E) // 1 × i64 (scan_all accumulator)
+		b = append(b, 0x01, 0x7F) // 1 × i32 (hoisted first byte)
 	}
 
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
@@ -2318,12 +2467,14 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	lChunk := c.localBase + 6
 	lDenseCounter := c.localBase + 7
 	lDenseSkipFlag := c.localBase + 8
-	// The §9.4 first-position locals go last so the v128 index is stable.
+	// The first-position locals go last so the v128 index is stable.
 	c.lMinStart, c.lBase, c.lStart = c.localBase+7, c.localBase+8, c.localBase+9
 	c.lAcc = c.localBase + 10
+	lFirstByte := c.localBase + 11
 	if adaptive {
 		c.lMinStart, c.lBase, c.lStart = c.localBase+9, c.localBase+10, c.localBase+11
 		c.lAcc = c.localBase + 12
+		lFirstByte = c.localBase + 13
 	}
 
 	b = c.emitFindPrologue(b, lPos)
@@ -2361,7 +2512,7 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
 
 	if adaptive {
-		// Task 28: DenseCounter < threshold? If so, try SIMD (+ its scalar
+		// DenseCounter < threshold? If so, try SIMD (+ its scalar
 		// tail below, unmodified). Once tripped, the else branch skips
 		// BOTH the SIMD probe and the scalar tail's own candidate-membership
 		// chain entirely and treats the current lPos as the candidate
@@ -2480,8 +2631,9 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	b = c.emitDrainCheck(b, lPos, 0x01)
 
 	// Literal buckets only (selection requires no fallback). Shortest literal
-	// first for the same ordering reason as the scalar path.
-	b = c.emitLiteralBuckets(b, lPos)
+	// first for the same ordering reason as the scalar path, and with the
+	// position's first byte loaded once for the whole chain (E5).
+	b = c.emitLiteralBucketsHoisted(b, lPos, lFirstByte)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
 	b = append(b, 0x0C, 0x00)                               // br $scan
@@ -2522,7 +2674,7 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	// Prefilter locals (i32 skip mask, then a v128 chunk).
 	lSkipMask := c.localBase + 10
 	lChunk := c.localBase + 11
-	// The §9.4 first-position locals go in their own trailing group so the
+	// The first-position locals go in their own trailing group so the
 	// v128 local's index is unaffected by whether the prefilter is emitted.
 	c.lMinStart, c.lBase, c.lStart = c.localBase+10, c.localBase+11, c.localBase+12
 	c.lAcc = c.localBase + 13
@@ -2677,6 +2829,24 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	b = appendTableLoad16u(b, tableMemIdx)
 	b = append(b, 0x21, lACState)
 
+	// Does this node report anything? ONE unsigned compare against a
+	// constant, and the two u16 loads below happen only when it does.
+	//
+	// buildACLayoutMode renumbers nodes so the root is 0 and every
+	// output-bearing node lands in [1, outLimit] (acLayout.outLimit), which
+	// makes the test `(state - 1) u< outLimit` — the root's 0 underflows to
+	// 0xFFFFFFFF and fails it, as it must. Before this the walk paid two
+	// table loads per INPUT BYTE for a list that is empty at almost every
+	// position.
+	//
+	// Emitted as a br_if out of $end_ac_pos rather than an `if` block so no
+	// branch depth inside the output machinery moves.
+	b = append(b, 0x20, lACState, 0x41, 0x01, 0x6B) // state - 1
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(acL.outLimit))
+	b = append(b, 0x4F)       // i32.ge_u
+	b = append(b, 0x0D, 0x00) // br_if 0 → $end_ac_pos
+
 	// lOutIdx = nodeOut[lACState]
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, acL.nodeOutOff)
@@ -2777,32 +2947,24 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	return funcBody
 }
 
-// emitExtractLane emits a 16-way br_table dispatch that extracts the byte at lane
-// lLaneOff (runtime, 0-15) from v128 local lCands, storing the result in lLaneBit.
+// emitExtractLane extracts the byte at lane lLaneOff (a RUNTIME value, 0-15)
+// from v128 local lCands into lLaneBit.
+//
+// One swizzle, not a 16-way br_table. i8x16.swizzle indexes a vector by
+// another vector's bytes, so splatting the lane number and swizzling puts the
+// wanted byte in every lane — after which lane 0 is a static extract. The
+// br_table form this replaces was 16 nested blocks and 16 handlers, entered
+// once per candidate lane (twice under TwoGroups).
+//
+// Operand order for i8x16.swizzle is DATA then INDICES: the byte at index
+// indices[i] of `data` lands in lane i.
 func emitExtractLane(b []byte, lCands, lLaneOff, lLaneBit byte) []byte {
-	const N = 16
-	b = append(b, 0x02, 0x40) // block $end_extract
-	for i := 0; i < N; i++ {
-		b = append(b, 0x02, 0x40) // block B[i]
-	}
-	// br_table: case k → depth k; default → N-1
-	b = append(b, 0x20, lLaneOff)
-	b = append(b, 0x0E)
-	b = utils.AppendULEB128(b, uint32(N))
-	for i := 0; i < N; i++ {
-		b = utils.AppendULEB128(b, uint32(i))
-	}
-	b = utils.AppendULEB128(b, uint32(N-1)) // default → case 15
-	for k := 0; k < N; k++ {
-		b = append(b, 0x0B) // end B[k] → handler k falls through
-		b = append(b, 0x20, lCands)
-		b = append(b, 0xFD, 0x16, byte(k)) // i8x16.extract_lane_u k
-		b = append(b, 0x21, lLaneBit)
-		if k < N-1 {
-			b = append(b, 0x0C, byte(N-1-k)) // br to $end_extract
-		}
-	}
-	b = append(b, 0x0B) // end block $end_extract
+	b = append(b, 0x20, lCands)     // v128 data
+	b = append(b, 0x20, lLaneOff)   // i32 lane number
+	b = append(b, 0xFD, 0x0F)       // i8x16.splat  -> indices
+	b = append(b, 0xFD, 0x0E)       // i8x16.swizzle
+	b = append(b, 0xFD, 0x16, 0x00) // i8x16.extract_lane_u 0
+	b = append(b, 0x21, lLaneBit)
 	return b
 }
 
@@ -2829,7 +2991,7 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	lLaneOff := c.localBase + 7
 	numI32 := 8
 
-	// Blocks of 16 bytes handled per loop iteration (§16 Task G2). The probe
+	// Blocks of 16 bytes handled per loop iteration. The probe
 	// work scales linearly with this, but the per-iteration scaffolding —
 	// bounds guard, drain check, position bump, loop branch — does not, so
 	// widening amortises it. Two blocks fill a 32-bit lane mask exactly,
@@ -2859,7 +3021,7 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	}
 	numV128 := 2*blocks + pp.splatCount()
 
-	// §9.4 first-position locals sit after the v128 group so the v128 indices
+	// First-position locals sit after the v128 group so the v128 indices
 	// above stay stable.
 	c.lMinStart = v128Base + byte(numV128)
 	c.lBase = c.lMinStart + 1
@@ -3019,28 +3181,11 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	b = append(b, 0x0B)             // end block $not_simd
 
 	// Scalar tail: check each literal at lPos, one position at a time.
-	for _, bi := range litOrderFor(cs) {
-		bkt := cs.buckets[bi]
-		lit := []byte(bkt.literal)
-		litLen := len(lit)
-		b = append(b, 0x02, 0x40)
-		b = append(b, 0x20, lPos, 0x41)
-		b = utils.AppendSLEB128(b, int32(litLen))
-		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
-		for li, lb := range lit {
-			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
-			if li > 0 {
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(li))
-				b = append(b, 0x6A)
-			}
-			b = append(b, 0x2D, 0x00, 0x00, 0x41)
-			b = utils.AppendSLEB128(b, int32(lb))
-			b = append(b, 0x47, 0x0D, 0x00)
-		}
-		b = c.emitBucketAt(b, bi, litLen, lPos)
-		b = append(b, 0x0B)
-	}
+	// The same per-position literal chain the scalar and Shufti bodies run —
+	// verified opcode-identical (same litOrderFor order, same fit test, same
+	// compare chain, same emitBucketAt) before being folded into the one
+	// emitter.
+	b = c.emitLiteralBuckets(b, lPos)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos += 1
 	b = append(b, 0x0C, 0x00)                               // br 0 → restart $scan
@@ -3109,7 +3254,7 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	}
 	numV128 := int(off)
 
-	// The §9.4 first-position locals sit after the v128 group so the v128
+	// The first-position locals sit after the v128 group so the v128
 	// indices above stay unchanged.
 	c.lMinStart = v128Base + byte(numV128)
 	c.lBase = c.lMinStart + 1
@@ -3413,28 +3558,11 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	b = append(b, 0x0B)       // end block $not_simd
 
 	// Scalar tail: check each literal at lPos
-	for _, bi := range litOrderFor(cs) {
-		bkt := cs.buckets[bi]
-		lit := []byte(bkt.literal)
-		litLen := len(lit)
-		b = append(b, 0x02, 0x40)
-		b = append(b, 0x20, lPos, 0x41)
-		b = utils.AppendSLEB128(b, int32(litLen))
-		b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00)
-		for li, lb := range lit {
-			b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
-			if li > 0 {
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(li))
-				b = append(b, 0x6A)
-			}
-			b = append(b, 0x2D, 0x00, 0x00, 0x41)
-			b = utils.AppendSLEB128(b, int32(lb))
-			b = append(b, 0x47, 0x0D, 0x00)
-		}
-		b = c.emitBucketAt(b, bi, litLen, lPos)
-		b = append(b, 0x0B)
-	}
+	// The same per-position literal chain the scalar and Shufti bodies run —
+	// verified opcode-identical (same litOrderFor order, same fit test, same
+	// compare chain, same emitBucketAt) before being folded into the one
+	// emitter.
+	b = c.emitLiteralBuckets(b, lPos)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
 	b = append(b, 0x0C, 0x00)
@@ -3444,13 +3572,6 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	b = c.emitEpilogue(b)
 	b = append(b, 0x0B)
 
-	_ = lChunk1
-	_ = lChunk2
-	_ = lChunk3
-	_ = lT3Lo
-	_ = lT3Hi
-	_ = lBT3Lo
-	_ = lBT3Hi
 	funcBody := utils.AppendULEB128(nil, uint32(len(b)))
 	funcBody = append(funcBody, b...)
 	return funcBody

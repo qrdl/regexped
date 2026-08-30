@@ -156,7 +156,7 @@ type acLayout struct {
 	// acBudgetBytes: for a set that already fits, paying a load per byte to
 	// save bytes would trade the project's first-priority metric for its
 	// second. Compression is what lets a set that would otherwise lose its
-	// literal frontend entirely (and run 86-414x slower — §13 F1) keep it.
+	// literal frontend entirely (and run 86-414x slower) keep it.
 	compressed  bool
 	classMapOff int32 // offset of byte→class table [256]u8; valid iff compressed
 	classMap    [256]byte
@@ -165,6 +165,20 @@ type acLayout struct {
 	strideShift int // log2(stride*2) — the shift that turns a node id into a row offset
 
 	numNodes int
+	// outLimit is the highest node id that carries OUTPUT. Nodes are
+	// renumbered so that the root is 0 (it can never carry output — every
+	// literal is non-empty) and every output-bearing node falls in
+	// [1, outLimit]; the rest follow.
+	//
+	// That turns "does this node report anything" from two u16 table loads
+	// per input byte into one unsigned compare against a constant —
+	// `(state - 1) u< outLimit` — with the loads moved inside the branch. It
+	// is the same MID-ACCEPT-FIRST trick the union automaton uses, applied to
+	// the AC walk, where output is rare and the loads were paid every byte.
+	//
+	// 0 means NO node carries output, and the body then emits no output arm
+	// at all.
+	outLimit int
 	tableEnd int32
 }
 
@@ -228,7 +242,35 @@ func buildACLayout(ac *acAutomaton, tableBase int32) *acLayout {
 // See acLayout.compressed for when compression is worth its per-byte cost.
 func buildACLayoutMode(ac *acAutomaton, tableBase int32, compress bool) *acLayout {
 	n := len(ac.nodes)
-	l := &acLayout{numNodes: n, stride: 256}
+	// OUTPUT-BEARING NODES FIRST (after the root). See acLayout.outLimit.
+	//
+	// oldToNew[i] is node i's emitted id; newToOld is its inverse. The root
+	// keeps id 0 both because the walk starts there (lACState is
+	// zero-initialised) and because it is the one node guaranteed to have no
+	// output.
+	oldToNew := make([]int, n)
+	newToOld := make([]int, n)
+	next := 1
+	if n > 0 {
+		if len(ac.nodes[0].output) != 0 {
+			panic("compile: the Aho-Corasick root carries output — an empty literal reached buildAC")
+		}
+		oldToNew[0], newToOld[0] = 0, 0
+	}
+	for i := 1; i < n; i++ {
+		if len(ac.nodes[i].output) != 0 {
+			oldToNew[i], newToOld[next] = next, i
+			next++
+		}
+	}
+	outLimit := next - 1
+	for i := 1; i < n; i++ {
+		if len(ac.nodes[i].output) == 0 {
+			oldToNew[i], newToOld[next] = next, i
+			next++
+		}
+	}
+	l := &acLayout{numNodes: n, stride: 256, outLimit: outLimit}
 	for b := 0; b < 256; b++ {
 		l.classMap[b] = byte(b) // identity, unused unless compressed
 	}
@@ -250,16 +292,20 @@ func buildACLayoutMode(ac *acAutomaton, tableBase int32, compress bool) *acLayou
 	// has, by construction, the same target from every node, so writing the
 	// row from any representative byte of the class is exact — this is a
 	// re-indexing, not an approximation, and cannot change what matches.
+	// Rows are written at the node's NEW id and their targets are remapped
+	// through oldToNew — a pure renumbering, so nothing about what the
+	// automaton accepts changes.
 	l.gotoOff = tableBase
 	l.gotoBytes = make([]byte, n*l.stride*2)
-	for i, node := range ac.nodes {
+	for newID := 0; newID < n; newID++ {
+		node := ac.nodes[newToOld[newID]]
 		if l.compressed {
 			for b := 0; b < 256; b++ {
-				binary.LittleEndian.PutUint16(l.gotoBytes[(i*l.stride+int(l.classMap[b]))*2:], uint16(node.gotoTable[b]))
+				binary.LittleEndian.PutUint16(l.gotoBytes[(newID*l.stride+int(l.classMap[b]))*2:], uint16(oldToNew[node.gotoTable[b]]))
 			}
 		} else {
-			for b, next := range node.gotoTable {
-				binary.LittleEndian.PutUint16(l.gotoBytes[(i*256+b)*2:], uint16(next))
+			for b, tgt := range node.gotoTable {
+				binary.LittleEndian.PutUint16(l.gotoBytes[(newID*256+b)*2:], uint16(oldToNew[tgt]))
 			}
 		}
 	}
@@ -268,9 +314,9 @@ func buildACLayoutMode(ac *acAutomaton, tableBase int32, compress bool) *acLayou
 	l.nodeOutOff = l.gotoOff + int32(len(l.gotoBytes))
 	startOffsets := make([]int, n+1)
 	total := 0
-	for i, node := range ac.nodes {
-		startOffsets[i] = total
-		total += len(node.output)
+	for newID := 0; newID < n; newID++ {
+		startOffsets[newID] = total
+		total += len(ac.nodes[newToOld[newID]].output)
 	}
 	startOffsets[n] = total
 
@@ -282,9 +328,9 @@ func buildACLayoutMode(ac *acAutomaton, tableBase int32, compress bool) *acLayou
 	// Output array: flat list of litID values in node order.
 	l.outputOff = l.nodeOutOff + int32(len(nodeOutBytes))
 	outputBytes := make([]byte, total*2)
-	for i, node := range ac.nodes {
-		for j, litID := range node.output {
-			idx := startOffsets[i] + j
+	for newID := 0; newID < n; newID++ {
+		for j, litID := range ac.nodes[newToOld[newID]].output {
+			idx := startOffsets[newID] + j
 			binary.LittleEndian.PutUint16(outputBytes[idx*2:], uint16(litID))
 		}
 	}

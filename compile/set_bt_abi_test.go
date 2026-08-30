@@ -49,7 +49,7 @@ func compileBTABISet(t *testing.T, pats []string, maxFallback int) *compiledSet 
 		CompileSetOptions{MaxFallbackStates: maxFallback})
 }
 
-// TestSetBTForcesMemoryAllABI is SETS_PLAN item 20 decision 3: admitting a
+// TestSetBTForcesMemoryAllABI pins the Backtracking `_all` ABI: admitting a
 // Backtracking member moves the `_all` bitmap into MEMORY and frees the return
 // value to carry a count, whatever the id space.
 //

@@ -302,7 +302,15 @@ AssemblyScript used to be grouped with JS/TS as "throw", and that was **wrong**.
 
 C is unchanged. It has no unwinding, and its return types were already integer error codes with a documented negative case.
 
-**Three set exports used to swallow it** in every language: `match_any` folded `-2` into "no match", and the narrow `match_all`/`scan_all` treated it as a bitmask, where `-2` reads as *every id except 0 matched*. All three report it now. Neither could fire in practice, but the invariants that kept them safe lived in the compiler rather than beside the code depending on them.
+**`match_any` used to swallow it** in every language, folding `-2` into "no match". It reports it now.
+
+The NARROW `match_all` / `scan_all` do **not** test for it, and must not: their
+`i64` return IS the bitmask, so every 64-bit value is a legal answer. `-2` is
+`0xFFFF_FFFF_FFFF_FFFE` — ids 1..63 matched and id 0 did not — which a
+sentinel test would report as an engine failure on a perfectly good result.
+The real sentinel cannot reach that form at all: a set with a Backtracking
+member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
+`-2` is unambiguous.
 
 **Raising the ceiling.** There is no runtime knob today. The options are to shorten the input, restructure the pattern so fewer alternation frames stay live, or make the engine grow its stack at runtime — the last being the only fix that makes such a pattern work on arbitrarily long input, and it is not implemented.
 

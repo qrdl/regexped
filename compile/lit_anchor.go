@@ -288,7 +288,7 @@ func findLitAnchorPointInRegexp(re *syntax.Regexp) *litAnchorPoint {
 // lit-anchor optimisation: the reversed-prefix DFA construction does not
 // evaluate word boundaries in the backward direction and the backward-scan
 // body does not verify them at candidate positions, so lit-anchor is unsafe
-// for any prefix that mentions `\b`/`\B`. Task 10 (2026-06-30) — makes the
+// for any prefix that mentions `\b`/`\B`. Added 2026-06-30 — makes the
 // gate at compile.go's lit-anchor activation explicit; previously the
 // rejection relied on the incidental behaviour that a reversed-`\b`-only DFA
 // happens to have an accepting start state, which was fragile against future
@@ -313,7 +313,7 @@ func prefixContainsWordBoundary(re *syntax.Regexp) bool {
 // OpBeginLine (`(?m:^)`) or OpEndLine (`(?m:$)`) node.
 //
 // Gates the lit-anchor optimisation, roughly the way
-// prefixContainsWordBoundary gates `\b`/`\B` (Task 10), but for a different
+// prefixContainsWordBoundary gates `\b`/`\B`, but for a different
 // underlying reason: what a line anchor in the prefix endangers is the
 // BACKWARD scan, not the forward continuation.
 // buildLitAnchorBackScanBody's `revTable.hasNewlineBoundary` branch
@@ -335,7 +335,7 @@ func prefixContainsWordBoundary(re *syntax.Regexp) bool {
 //
 // Consequently this predicate is NOT the whole gate: a true answer only
 // forces a fallback when lineAnchoredPrefixSafe also says no. That helper
-// admits the one shape the §22 defect cannot touch — a prefix led by
+// admits the one shape the back-scan defect cannot touch — a prefix led by
 // `^`/`(?m:^)` with nothing after the anchor able to consume a '\n', which
 // makes the stop-at-'\n' exact rather than premature. This function is also
 // reused inside lineAnchoredPrefixSafe to reject any FURTHER line anchor in
@@ -442,10 +442,10 @@ func canConsumeNewline(re *syntax.Regexp) bool {
 // a line anchor is nevertheless safe for the backward scan, so it need not be
 // rejected outright by a past defect’s gate.
 //
-// The §22 defect is in buildLitAnchorBackScanBody's `revTable.hasNewlineBoundary`
+// The defect is in buildLitAnchorBackScanBody's `revTable.hasNewlineBoundary`
 // branch, which stops the backward scan unconditionally at the first '\n' it
 // meets. That is only sound when no match's prefix portion can contain a '\n'
-// — otherwise the scan halts before reaching the real match start (§22's repro
+// — otherwise the scan halts before reaching the real match start (the repro
 // `\D(?m:^)ab` on "\nab": `\D` legitimately consumes the '\n' the scan stops
 // at). It is exactly sound when:
 //

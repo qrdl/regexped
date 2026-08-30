@@ -107,7 +107,7 @@ func setEmitCovMustCompile(t *testing.T, cfg config.BuildConfig) []byte {
 // is why the family is spelled out once here:
 //
 //   - never-dying is what makes usesGatedFindPreflight / overlapPreflightShape
-//     say yes at all. Without it a preflight is §16.5.2's Candidate A — a pass
+//     say yes at all. Without it a preflight is the reverted Candidate A — a pass
 //     over the whole input that retires nothing.
 //   - literal-LESS is what makes the G12 absence prefilter DECLINE
 //     (buildAbsenceLits needs at least one pattern with a mandatory literal),
@@ -294,7 +294,7 @@ func TestSetEmitOverlapPreflightIDSpaceExceedsMembers(t *testing.T) {
 // emitSetMatchFnFinalAC, and no set with fewer than 17 literals can reach it.
 //
 // Low first-byte diversity is what keeps AC in front of Teddy above 16
-// literals (§14.11), hence the shared "keyword" stem.
+// literals, hence the shared "keyword" stem.
 func TestSetEmitACFrontendWithFallbackBucket(t *testing.T) {
 	patterns := make([]string, 0, 25)
 	for i := 0; i < 24; i++ {
@@ -506,8 +506,8 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 			"the budget no longer refuses it", maxUnionScanStates, got.numStates)
 	}
 
-	// The id-space ceiling. It was 64 — one u64 accept mask — until SETS_PLAN
-	// item 21 phase 1 gave the automaton a wide accept form; the refusal now
+	// The id-space ceiling. It was 64 — one u64 accept mask — until the
+	// automaton gained a wide accept form; the refusal now
 	// sits at maxUnionScanIDs, which bounds the per-state accept ROW and the
 	// straight-line WASM that ORs it into the caller's bitmap.
 	//
@@ -554,7 +554,7 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 // TestSetEmitUnionScanWideSetCompiles is the id ceiling reached the way a
 // config reaches it: a literal-less set of 66 patterns declaring the scan pair.
 //
-// Before SETS_PLAN item 21 phase 1 this set fell back to the per-position
+// Before the wide accept form this set fell back to the per-position
 // bucket walk, and the test's point was that the ceiling is a routing decision
 // rather than a build error. It now takes the WIDE union body instead, and the
 // point is the same one from the other side — the routing changed and the
@@ -734,13 +734,15 @@ func TestSetEmitShuftiNonAdaptiveBody(t *testing.T) {
 			t.Errorf("mode %v: body does not end with `end` (0x0B), got %#x",
 				mode, body[len(body)-1])
 		}
-		// Four local groups, not five: the adaptive form's dense-gate counter
-		// is absent. The count is the second byte — the first is the body's
+		// Five local groups, not six: the adaptive form's dense-gate counter
+		// is absent. (Both frames gained one trailing i32 group for E5's
+		// hoisted first byte, so the non-adaptive frame is 5 and the adaptive
+		// one 6.) The count is the second byte — the first is the body's
 		// LEB128 size prefix, which is single-byte only for tiny bodies, so
 		// the check reads it back through the same size prefix the emitter
 		// wrote.
-		if got := setEmitCovLocalGroups(t, body); got != 4 {
-			t.Errorf("mode %v: %d local groups, want 4 (the non-adaptive frame)", mode, got)
+		if got := setEmitCovLocalGroups(t, body); got != 5 {
+			t.Errorf("mode %v: %d local groups, want 5 (the non-adaptive frame)", mode, got)
 		}
 	}
 }
@@ -926,37 +928,33 @@ func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
 	buildSetBTSuffixBody(regions, 0, 0, 0, true, true, 0)
 }
 
-// TestSetEmitBTProbeBodyAnchored emits a Backtracking bucket's probe in its
-// ANCHORED form.
+// TestSetEmitBTProbeBody emits a Backtracking bucket's probe.
 //
-// The anchored probe adds one check the non-anchored one does not have: a
-// match that ends before `len` is not an anchored match, since `match_*` must
-// span the whole input. No caller passes anchored=true today — the anchored
-// capabilities reach their Backtracking members another way — so this is
-// called directly, and what it establishes is that the arm still builds and
-// still produces a longer body than the non-anchored one.
-func TestSetEmitBTProbeBodyAnchored(t *testing.T) {
+// It used to drive an ANCHORED form as well — a full-consumption check for
+// `match_*`. No caller ever passed it: compileAnchoredBuckets admits no BT
+// bucket at all, so a BT-rescued pattern is simply absent from the anchored
+// pair (docs/sets.md "Backtracking members and the anchored pair"). The
+// parameter and its arm are gone, because dead machinery made a documented
+// exclusion look like an oversight.
+func TestSetEmitBTProbeBody(t *testing.T) {
 	info := admitBTFallback(parseForBTFallback(t, `[0-9]+x`), 0)
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
 	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0)
-	loose := buildSetBTProbeBody(regions, 7, false, 0)
-	anchored := buildSetBTProbeBody(regions, 7, true, 0)
-	if len(anchored) <= len(loose) {
-		t.Errorf("the anchored probe emitted %d bytes and the non-anchored %d: "+
-			"the full-consumption check is missing", len(anchored), len(loose))
+	body := buildSetBTProbeBody(regions, 7, 0)
+	if len(body) == 0 {
+		t.Fatal("the Backtracking probe emitted nothing")
 	}
-	if anchored[len(anchored)-1] != 0x0B {
-		t.Errorf("the anchored probe does not end with `end` (0x0B), got %#x",
-			anchored[len(anchored)-1])
+	if body[len(body)-1] != 0x0B {
+		t.Errorf("the probe does not end with `end` (0x0B), got %#x", body[len(body)-1])
 	}
 }
 
 // TestSetEmitSuffixCallSkipDefault covers the constant-zero `skip` a non-batch
 // caller passes.
 //
-// Once a set's suffix functions carry the §19 skip parameter, EVERY caller
+// Once a set's suffix functions carry the batch skip parameter, EVERY caller
 // passes one — the batch worker passes the real value, and anything else
 // passes 0, which the suffix reads as "no tuple is skipped" because local tuple
 // indices are never negative. Today the shared-worker rewrite (decision (11a))
@@ -1349,47 +1347,42 @@ func TestSetEmitPlanBTRegionsWithMemo(t *testing.T) {
 // body's alive-marking write-back, at which point the two were the same code.
 func TestSetEmitPreflightWithNoPatterns(t *testing.T) {
 	empty := &compiledSet{}
-	if got := emitFindPreflight(nil, empty, 8, 9, 10, 3, 1, 2, 13, 0, false, 11, 12); len(got) != 0 {
+	if got := emitFindPreflight(nil, empty, 8, 9, 10, 3, 1, 2, 13, 0, false, 11, 12, 14); len(got) != 0 {
 		t.Errorf("the preflight emitted %d bytes for a set with no patterns", len(got))
 	}
 }
 
-// TestSetEmitRetiredScanCapabilityArms emits the bodies for capScan.
+// TestSetEmitScanAnyCapabilityArms emits the bodies for capScanAny.
 //
-// `scan:` was RETIRED as a config key (TODO task 59 decision (2)): its answer
-// is `scan_any(...) >= 0`, and the redundancy measured at 1-3% of module size.
-// No YAML config can select it, so nothing below is reachable through
-// CompileFile — but capScan is still a value of the internal setCapKind enum
-// and every one of these switches still carries an arm for it. They are
-// emitted here so that an arm which stops building is a test failure rather
-// than something discovered when the kind is next used.
-//
-// This is a deliberate white-box call on a kind the config layer rejects; it
-// asserts that the arms produce bodies, and nothing about what a `scan`
-// capability would mean.
-func TestSetEmitRetiredScanCapabilityArms(t *testing.T) {
+// It used to drive capScan — the retired boolean `scan:` key's kind (TODO task
+// 59 decision (2)). That kind, and its arms in five files, are gone:
+// capFns() never produced it, so the arms were unreachable code the reader had
+// to disprove. Retargeted at capScanAny, which is the
+// capability those switches really serve, so the coverage of each switch
+// survives the deletion.
+func TestSetEmitScanAnyCapabilityArms(t *testing.T) {
 	spec := SetSpec{Name: "s", Find: "s_find", ScanAny: "s_scan_any", ScanAll: "s_scan_all"}
 	compiled := setEmitCovCompileSet(t, spec, litLessNeverDying, CompileSetOptions{})
 	if compiled.unionScan == nil {
 		t.Fatal("no union automaton was built; the union body cannot be emitted")
 	}
-	body := emitUnionScanBody(compiled.unionScan, capScan, compiled.fullIDMask(), 0)
+	body := emitUnionScanBody(compiled.unionScan, capScanAny, compiled.fullIDMask(), 0)
 	if len(body) == 0 || body[len(body)-1] != 0x0B {
-		t.Errorf("the capScan union body is empty or unterminated (%d bytes)", len(body))
+		t.Errorf("the capScanAny union body is empty or unterminated (%d bytes)", len(body))
 	}
 
-	ctx := newSetFindCtx(compiled, 0, 0, 0, capScan, 0)
+	ctx := newSetFindCtx(compiled, 0, 0, 0, capScanAny, 0)
 	if got := ctx.emitRecordProbe(nil, 0); len(got) == 0 {
-		t.Error("emitRecordProbe emitted nothing for capScan")
+		t.Error("emitRecordProbe emitted nothing for capScanAny")
 	}
 	if got := ctx.emitEpilogue(nil); len(got) == 0 {
-		t.Error("emitEpilogue emitted nothing for capScan")
+		t.Error("emitEpilogue emitted nothing for capScanAny")
 	}
 	if got := ctx.emitDrainCheck(nil, ctx.lPos, 1); len(got) == 0 {
-		t.Error("emitDrainCheck emitted nothing for capScan")
+		t.Error("emitDrainCheck emitted nothing for capScanAny")
 	}
 
-	// The SPARSE probe recorder is a separate switch with its own capScan arm,
+	// The SPARSE probe recorder is a separate switch with its own arm,
 	// and it needs a bucket whose accept is a per-state list rather than a
 	// mask — which needs more than 32 patterns behind one literal.
 	sparsePatterns := make([]string, 40)
@@ -1408,9 +1401,9 @@ func TestSetEmitRetiredScanCapabilityArms(t *testing.T) {
 	if sparseBucket < 0 {
 		t.Fatal("no sparse bucket: the sparse probe recorder is not reached")
 	}
-	sparseCtx := newSetFindCtx(sparseSet, 0, 0, 0, capScan, 0)
+	sparseCtx := newSetFindCtx(sparseSet, 0, 0, 0, capScanAny, 0)
 	if got := sparseCtx.emitRecordProbe(nil, sparseBucket); len(got) == 0 {
-		t.Error("emitRecordProbe emitted nothing for a sparse bucket under capScan")
+		t.Error("emitRecordProbe emitted nothing for a sparse bucket under capScanAny")
 	}
 }
 
@@ -1424,7 +1417,7 @@ func TestSetEmitRetiredScanCapabilityArms(t *testing.T) {
 // error.
 //
 // The demotion to scalar must also be RECORDED. A frontend that silently
-// downgrades is the §13 F1 failure mode — the set still answers correctly, it
+// downgrades is the silent-downgrade failure mode — the set still answers correctly, it
 // just answers many times slower, and nothing says why.
 //
 // This case costs a few seconds because there is no cheaper way to build
@@ -1451,7 +1444,7 @@ func TestSetEmitACNodeIDSpaceDemotion(t *testing.T) {
 	}
 	demotion := compiled.diag.FrontendDemotion
 	if demotion == nil {
-		t.Fatal("the frontend was downgraded with no diagnostic — a silent downgrade is the §13 F1 failure mode")
+		t.Fatal("the frontend was downgraded with no diagnostic — a silent downgrade is the failure mode")
 	}
 	if demotion.Reason != "ac_nodes_exceed_u16" {
 		t.Errorf("demotion reason = %q, want \"ac_nodes_exceed_u16\" (got %v nodes); "+

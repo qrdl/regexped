@@ -79,15 +79,24 @@ func firstByteSet(pat string) []bool {
 // b. A pattern whose first-byte set is undetermined contributes to EVERY
 // entry, which is what makes the table safe on mixed buckets.
 func buildStartableTable(bkt *bucket) []uint32 {
-	if len(bkt.patterns) == 0 || len(bkt.patterns) > 32 {
+	if len(bkt.patterns) == 0 || len(bkt.patterns) > bucketMaskBits {
+		return nil
+	}
+	if bkt.sparse {
+		// A G17-sparse bucket reads its answer out of per-state LISTS and
+		// ignores every i32 mask on the candidate path (validMask included),
+		// so a table indexed into one is dead weight there — and, worse, a
+		// reader who wired it up would be applying a bucket-local mask to a
+		// body that never consults one. The >32 guard above already excludes
+		// today's sparse buckets; this states the rule rather than relying on
+		// the count.
 		return nil
 	}
 	tab := make([]uint32, 256)
 	narrow := false
 	for k, p := range bkt.patterns {
-		if k >= 32 {
-			return nil
-		}
+		// No k >= 32 check: the len(bkt.patterns) > 32 guard above already
+		// returned, so it was unreachable.
 		bit := uint32(1) << uint(k)
 		set := firstByteSet(p.fullPattern)
 		if set == nil {

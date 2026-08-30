@@ -36,7 +36,7 @@ func captureWarnings(t *testing.T) (*bytes.Buffer, func()) {
 var btRefusedPattern = strings.Repeat(`(?:a|)*`, 13) + `[a-z]{20}`
 
 // TestCompileFallback_AdmitsToBTOverStateLimit is the positive half of the
-// contract SETS_PLAN item 20 introduced: a pattern whose suffix DFA exceeds
+// Backtracking-member contract: a pattern whose suffix DFA exceeds
 // maxFallbackStates is no longer dropped, it is admitted on the Backtracking
 // engine, so the set member behaves like the same pattern compiled alone.
 //
@@ -67,7 +67,7 @@ func TestCompileFallback_AdmitsToBTOverStateLimit(t *testing.T) {
 	// patternIDs[bi][0] and validMask bit 0 alone. compileFallback's bin-packer
 	// used to merge later fallback patterns into it, and every merged-in
 	// pattern then vanished from every bucketed capability with no error
-	// anywhere (SETS_PLAN item 20, the 396/84 corpus failure).
+	// anywhere.
 	if n := len(buckets[0].patterns); n != 1 {
 		t.Errorf("BT bucket holds %d patterns, want exactly 1", n)
 	}
@@ -167,7 +167,7 @@ func TestCompileFallback_NoWarnWhenAdmitted(t *testing.T) {
 func TestCompileFallback_WarnsWithNilDiag(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	// Must be a pattern BT also refuses, or there is no drop left to warn
-	// about (SETS_PLAN item 20).
+	// about.
 	info, err := analyzePattern(config.RegexEntry{Pattern: btRefusedPattern}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
@@ -197,7 +197,8 @@ func TestCompileFallback_WarnsWithNilDiag(t *testing.T) {
 // rebuilds CompileSetOptions without the field fails here rather than silently
 // restoring the unreachable knob.
 //
-// Since SETS_PLAN item 20 the observable effect of the budget being reached is
+// Since sets gained Backtracking members the observable effect of the budget
+// being reached is
 // only a DROP for a pattern BT also refuses — an ordinary over-limit pattern is
 // now admitted to BT instead, and warns about nothing. So the pattern here is
 // btRefusedPattern: the budget is still what decides its fate, and the warning
@@ -249,8 +250,8 @@ func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 	}
 }
 
-// TestCompileFallback_NilSuffixDFANoPanic is the regression for SETS_PLAN
-// item 20 bug 3: compileFallback's non-isolated `!placed` branch dereferenced
+// TestCompileFallback_NilSuffixDFANoPanic is a crash regression:
+// compileFallback's non-isolated `!placed` branch dereferenced
 // nbDFA with no nil check and CRASHED.
 //
 // analyzePattern returns early for this shape leaving p.suffixDFA nil, and the

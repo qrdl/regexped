@@ -166,7 +166,7 @@ func sameByteSet(a, b []byte) bool {
 }
 
 // buildCountedChainSuffixBody emits the WASM function body for a
-// counted-class-chain suffix (task 5): instead of walking a DFA table N
+// counted-class-chain suffix: instead of walking a DFA table N
 // times, verify all N bytes at [ptr+start, ptr+start+n) belong to class via
 // SIMD (emitShuftiPrefixCheck, ceil(n/16) chunks of ~1 load + a few ops
 // each), then write the match tuple directly.
@@ -192,10 +192,10 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 		paramOutPtr    = byte(4)
 		paramOutCap    = byte(5)
 		paramValidMask = byte(6)
-		paramSkip      = byte(7) // §19 skip; ungated batch signature only
+		paramSkip      = byte(7) // batch skip; ungated batch signature only
 		// paramGate (7) exists only in the gated signature and is unused here:
 		// a counted chain consumes n >= 1 bytes, so its match can never be
-		// empty and §3.16's write-time empty-match filter is vacuous. The
+		// empty and the write-time empty-match filter is vacuous. The
 		// parameter is still declared so the function matches the gated suffix
 		// type every find body calls.
 	)
@@ -306,7 +306,7 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 	// paramOutCap is the signed remaining
 	// capacity and can be negative.
 	if hasSkip {
-		// §19: this emitter's only tuple has position-relative index 0, so it
+		// This emitter's only tuple has position-relative index 0, so it
 		// is written when 0 < cap AND skip <= 0.
 		//
 		// SIGNED. The caller rebases the position-level skip onto this call's
@@ -334,7 +334,7 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 	} else {
 		b = append(b, 0x20, lOutBase, 0x20, paramLPos, 0x36, 0x02, 0x04) // matchStart = lPos
 	}
-	// matchEnd = start + n (absolute), §3.18.
+	// matchEnd = start + n (absolute).
 	b = append(b, 0x20, lOutBase, 0x20, lEndPos, 0x36, 0x02, 0x08)
 	b = append(b, 0x0B) // end if room
 

@@ -136,8 +136,7 @@ func camelSet(name string) string {
 //   - A BACKTRACKING MEMBER: BT can answer "unknown" (abi.BTStackOverflow), and
 //     the narrow form has nowhere to put it — its i64 return IS the bitmask, so
 //     every value is already a legal answer. Moving the bitmap into memory frees
-//     the return to carry a count that can go negative (SETS_PLAN item 20
-//     decision 3).
+//     the return to carry a count that can go negative.
 //
 // The second condition is a COMPILE-time fact, which is why it comes from
 // compile.SetAdmitsBacktracking rather than from arithmetic on the config: the
@@ -145,7 +144,7 @@ func camelSet(name string) string {
 // BT accepted them. Asking the compiler keeps one source of truth; `generate`
 // still needs nothing but the config to run.
 func wideAllForm(s config.SetConfig, cfg config.BuildConfig) bool {
-	return idSpaceSize(s, cfg) > 64 || compile.SetAdmitsBacktracking(s, cfg)
+	return idSpaceSize(s, cfg) > config.WideBitmapThreshold || compile.SetAdmitsBacktracking(s, cfg)
 }
 
 // bitmapBytes is the size of the >64-pattern bitmap: ceil(idSpace/8).
@@ -212,7 +211,7 @@ func defaultBatchCap(s config.SetConfig, cfg config.BuildConfig) int {
 // unchanged. A set crosses it at about 250 patterns.
 //
 // Below the limit nothing changes, which is the point: `find` allocating
-// NOTHING is a property worth keeping where it costs nothing (SETS §19.6), and
+// NOTHING is a property worth keeping where it costs nothing, and
 // only sets that cannot honour it pay an allocation.
 const setInlineByteLimit = 4096
 
@@ -225,7 +224,7 @@ func boxSetBuffers(tupleSlots, gateSlots int) bool {
 }
 
 // ---------------------------------------------------------------------------
-// The capability descriptor table (SETS_PLAN item 7 / SETS.md R12).
+// The capability descriptor table.
 //
 // A set capability's WASM signature is ONE fact. Before this it was six: each
 // generator in this package hand-rolled the same chain over the five
@@ -268,8 +267,7 @@ const (
 	abiOutCap
 	// abiCursor is the batch entry's opaque i64 resume cursor.
 	abiCursor
-	// The batching entry's caller-owned answer cache (SETS_PLAN item 11 stage
-	// C) has NO abiParam of its own. Only JS and TS expose that entry, and
+	// The batching entry's caller-owned answer cache has NO abiParam of its own. Only JS and TS expose that entry, and
 	// they build its call directly rather than through this descriptor, so a
 	// pair of scratch params here would be spelled by four generators and
 	// produced by none.
@@ -303,8 +301,7 @@ type setCapability struct {
 //     returns an i64 bitmask in the narrow one. wideAllForm decides, and it
 //     must track compiledSet.wideAll() exactly.
 //   - `find` ALWAYS takes the gate array, in both the gated and the
-//     `overlapping: true` flavours — one signature, both bodies (SETS_PLAN
-//     item 11). The overlapping body records no match gates and uses the array
+//     `overlapping: true` flavours — one signature, both bodies. The overlapping body records no match gates and uses the array
 //     as the per-drive home of its "matches nowhere" preflight verdict, which
 //     is indistinguishable from the stub's side.
 func setCapabilities(s config.SetConfig, cfg config.BuildConfig) []setCapability {
@@ -357,7 +354,7 @@ func capByKind(caps []setCapability, kind string) *setCapability {
 }
 
 // ---------------------------------------------------------------------------
-// Deriving symbol names from a user's function name (TODO task 62).
+// Deriving symbol names from a user's function name.
 //
 // Function names are emitted VERBATIM — whatever the user wrote in the config
 // is what a caller writes — so anything DERIVED from one has to follow the
@@ -448,12 +445,17 @@ func namespaced(cfg config.BuildConfig, name string) string {
 //
 // A user-chosen export name never appears here: the `namespace:` key exists to
 // let two stubs coexist, not to rename anyone's API. Nor do symbols DERIVED
-// from a user name (`<func>_index`, `<func>_iter_t`), which are already unique
-// if the export names are.
+// from a user name (`<func>_index`, `<func>_iter_t`), whose uniqueness
+// config.ValidateConfig checks directly.
+// Two entries were removed because no generator emits
+// them: `BacktrackOverflowError` in JS/TS (both throw a plain Error) and
+// `SetMatch` in JS (a TS-only interface — JS yields a plain object literal).
+// A name listed here that is never emitted is not harmless: config-side
+// validation denies it as a user export name for nothing.
 var sharedSymbols = map[string][]string{
 	"go": {"Span", "ErrBacktrackOverflow", "SetMatch", "PatternName"},
-	"js": {"SetMatch", "patternName", "BacktrackOverflowError"},
-	"ts": {"SetMatch", "patternName", "BacktrackOverflowError"},
+	"js": {"patternName"},
+	"ts": {"SetMatch", "patternName"},
 	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ITER_ERROR"},
 	"c": {
 		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
@@ -487,4 +489,62 @@ func applyNamespace(cfg config.BuildConfig, stubType, src string) string {
 		src = re.ReplaceAllString(src, namespaced(cfg, name))
 	}
 	return src
+}
+
+// anyStubExport reports whether cfg asks for any generated symbol at all: a
+// per-pattern export, or a set capability. A config with none produces no
+// stub file, which is what every generator does — JS and TS used to emit a
+// module of helpers with nothing to call them.
+func anyStubExport(cfg config.BuildConfig) bool {
+	if hasSetExports(cfg) {
+		return true
+	}
+	for _, re := range cfg.Regexps {
+		if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// jsArgSpelling maps each ABI parameter to the JS/TS expression the set
+// wrappers use for it. The two languages spell them identically — only the
+// type annotations around them differ — so one table serves both.
+type jsArgSpelling struct {
+	inPtr, inLen, from, gate, bitmap, tuple, outCap, cursor string
+}
+
+// spellJSArgs renders one capability's argument list in ABI order.
+//
+// The JS and TS set templates are ~260 pairwise-duplicated lines that each
+// hand-rolled these lists, while rust/go/c/as had already adopted the R12
+// descriptor. They were in sync; the risk is FORWARD drift, which is exactly
+// how the cross-batch empty-match suppression came to exist in the find path
+// and not the groups path. Deriving the order from
+// setCapabilities gives it one source; the generate goldens pin the output.
+func spellJSArgs(c *setCapability, s jsArgSpelling) string {
+	if c == nil {
+		return ""
+	}
+	return c.render(func(p abiParam) string {
+		switch p {
+		case abiInputPtr:
+			return s.inPtr
+		case abiInputLen:
+			return s.inLen
+		case abiFrom:
+			return s.from
+		case abiGatePtr:
+			return s.gate
+		case abiBitmapPtr:
+			return s.bitmap
+		case abiTuplePtr:
+			return s.tuple
+		case abiOutCap:
+			return s.outCap
+		case abiCursor:
+			return s.cursor
+		}
+		panic("generate: no JS spelling for an ABI parameter")
+	}, ", ")
 }

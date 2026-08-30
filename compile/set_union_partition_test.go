@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// The mid-accept-first partition (SETS_PLAN item 21 phase 2).
+// The mid-accept-first partition.
 //
 // Both scan bodies and the gated/overlapping find preflight replace a per-byte
 // accept LOAD with the compare `state < midAcceptLimit`. That is only sound if

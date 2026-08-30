@@ -5,8 +5,8 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// SETS_PLAN item 11 stage C — the backward sweep, and the caller-owned answer
-// cache that makes it RESUMABLE.
+// The backward sweep, and the caller-owned answer cache that makes it
+// RESUMABLE.
 //
 // THE PROBLEM. `overlapping: true` enumerates every start position, so the
 // natural implementation walks the suffix DFA forward from each one. On a
@@ -61,8 +61,8 @@ import (
 // Stage C removes the fits-entirely restriction by making the sweep RESUMABLE.
 // It sweeps ONCE on the first call of a drive and writes every tuple into
 // caller-owned scratch; every later call copies its window straight out of
-// that cache and re-sweeps nothing. That is the move SETS.md §3.16 already
-// made once: §3.15 says the module may not own state across calls, and gates
+// that cache and re-sweeps nothing. That is the move the empty-match rule
+// already made once: the module may not own state across calls, and gates
 // got past it by making the state the CALLER's. The answer is the same shape
 // of problem and takes the same answer.
 //
@@ -175,7 +175,7 @@ func (cs *compiledSet) overlapDPBucket() int {
 	}
 	// The mask is i64, so more than 64 patterns cannot be expressed in it.
 	// The column bound below is stricter in practice.
-	if len(bkt.patterns) == 0 || len(bkt.patterns) > 64 {
+	if len(bkt.patterns) == 0 || len(bkt.patterns) > wideBitmapThreshold {
 		return -1
 	}
 	// Anchors and the word-boundary / newline channels change which START
@@ -198,7 +198,7 @@ func (cs *compiledSet) overlapDPBucket() int {
 
 // overlapDPColumnBytes is the module memory the sweep needs for its two
 // working columns. This is MODULE scratch and is fine: it lives only for the
-// duration of one call, which is what §3.15 permits. The TUPLES are the part
+// duration of one call, which is what the no-module-state rule permits. The TUPLES are the part
 // that must survive between calls, and those are the caller's.
 func (cs *compiledSet) overlapDPColumnBytes() int32 {
 	bi := cs.overlapDPBucket()
@@ -215,24 +215,31 @@ func (cs *compiledSet) overlapDPColumnBytes() int32 {
 // row dedup — because the sweep reads that table rather than emitting one of
 // its own. That is the single most important property of this file: there is
 // one transition table, and reversing the traversal does not fork it.
-func emitOverlapDPTransition(b []byte, dp overlapDPTables, tableMemIdx int, stateLocal, byteLocal, dstLocal, tmpLocal byte) []byte {
-	l := dp.l
-	cellsPerState := 256
-	if l.useCompression {
-		cellsPerState = l.numClasses
-	}
-
-	// cell = useCompression ? classMap[byte] : byte
-	if l.useCompression {
+// emitOverlapDPCell computes the byte's equivalence class ONCE per position
+// and leaves it in cellLocal, which emitOverlapDPTransition then reads.
+//
+// It used to be inside the transition emitter, i.e. inside the per-STATE loop,
+// where `classMap[input[pos]]` is loop-invariant: a load and an add per state
+// per byte for a value that cannot change until the position does.
+func emitOverlapDPCell(b []byte, dp overlapDPTables, tableMemIdx int, byteLocal, cellLocal byte) []byte {
+	if dp.l.useCompression {
 		b = append(b, 0x20, byteLocal)
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.classMapOff)
+		b = utils.AppendSLEB128(b, dp.l.classMapOff)
 		b = append(b, 0x6A) // i32.add
 		b = appendTableLoad8u(b, tableMemIdx)
 	} else {
 		b = append(b, 0x20, byteLocal)
 	}
-	b = append(b, 0x21, tmpLocal)
+	return append(b, 0x21, cellLocal)
+}
+
+func emitOverlapDPTransition(b []byte, dp overlapDPTables, tableMemIdx int, stateLocal, cellLocal, dstLocal byte) []byte {
+	l := dp.l
+	cellsPerState := 256
+	if l.useCompression {
+		cellsPerState = l.numClasses
+	}
 
 	// row = useRowDedup ? rowMap[state] : state
 	if l.useRowDedup {
@@ -248,7 +255,7 @@ func emitOverlapDPTransition(b []byte, dp overlapDPTables, tableMemIdx int, stat
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(cellsPerState))
 	b = append(b, 0x6C) // i32.mul
-	b = append(b, 0x20, tmpLocal)
+	b = append(b, 0x20, cellLocal)
 	b = append(b, 0x6A) // i32.add
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, l.tableOff)
@@ -269,7 +276,7 @@ const (
 	// sum of (end - start) over every tuple the walk has delivered so far.
 	//
 	// It lives in the caller's scratch for the same reason the gate array
-	// does — §3.15 forbids the module owning state across calls — and it is
+	// does — the module may not own state across calls — and it is
 	// what makes the sweep ADAPTIVE rather than unconditional. The header was
 	// already 16 bytes with this slot as padding, so nothing about the
 	// contract changes: the caller zeroes the header to start a drive, and a
@@ -344,8 +351,11 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 		lSwap
 		lStartRow
 	)
+	// lCell holds the current byte's equivalence class, computed once per
+	// position rather than once per state.
+	const lCell = lStartRow + 1
 	const (
-		lMidMask = lStartRow + 1 + iota
+		lMidMask = lCell + 1 + iota
 		lEofMask
 	)
 
@@ -354,7 +364,7 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 
 	var b []byte
 	b = append(b, 0x02)       // two local groups
-	b = append(b, 0x0E, 0x7F) // 14 i32
+	b = append(b, 0x0F, 0x7F) // 15 i32
 	b = append(b, 0x02, 0x7E) // 2 i64
 
 	konst := func(v int32) { b = append(b, 0x41); b = utils.AppendSLEB128(b, v) }
@@ -382,11 +392,22 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 		add()
 		b = appendTableLoad64(b, tableMemIdx)
 	}
-	// storeCol stores the value on the stack into rowLocal[k].
-	storeCol := func(rowLocal byte, k int) {
-		b = append(b, 0x36, 0x02)
-		b = utils.AppendULEB128(b, uint32(k*4))
-		_ = rowLocal
+	// storeCol stores the value on the stack into the current column row at
+	// slot k.
+	//
+	// The two working columns live at cs.overlapDPColOff — a TABLE-memory
+	// address (their zero-filled data segment is rewritten to memory 1 in
+	// embedded mode), so the access must carry the memory index like every
+	// other table access in this body. Standalone (tableMemIdx == 0, which is
+	// every harness in this repo) is the same bytes either way; embedded with
+	// a raw memory-0 store wrote over the HOST's heap.
+	storeCol := func(k int) {
+		b = appendTableStore32(b, tableMemIdx, uint32(k*4))
+	}
+	// loadCol pushes the column value at slot k of the row whose address is
+	// already on the stack.
+	loadCol := func(k int) {
+		b = appendTableLoad32(b, tableMemIdx, uint32(k*4))
 	}
 
 	// ---- prologue ----
@@ -406,7 +427,8 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	set(lPrev)
 
 	// ---- column at t == len: len when the state accepts at EOF, else -1 ----
-	konst(0)
+	// From state 1: row 0 is the dead state's, and nothing reads it (B6).
+	konst(1)
 	set(lState)
 	b = append(b, 0x02, 0x40) // block $stateDone
 	b = append(b, 0x03, 0x40) // loop $state
@@ -433,7 +455,7 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 		b = append(b, 0x05)
 		get(pLen)
 		b = append(b, 0x0B)
-		storeCol(lCurRow, k)
+		storeCol(k)
 	}
 	get(lState)
 	konst(1)
@@ -460,8 +482,7 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 		set(lStartRow)
 		for k := 0; k < numPat; k++ {
 			get(lStartRow)
-			b = append(b, 0x28, 0x02)
-			b = utils.AppendULEB128(b, uint32(k*4))
+			loadCol(k)
 			tee(lVal)
 			konst(-1)
 			b = append(b, 0x47)       // i32.ne  -> this pattern matched here
@@ -510,7 +531,7 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	get(pLen)
 	set(lPos)
 	// ...but only if position len is at or above the floor. A caller resuming
-	// past the end of the input gets nothing, which is §4.2's contract.
+	// past the end of the input gets nothing, which is the documented contract.
 	get(pLen)
 	get(pFrom)
 	b = append(b, 0x4E)       // i32.ge_s
@@ -549,8 +570,13 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	add()
 	b = appendInputLoad8u(b)
 	set(lByte)
+	b = emitOverlapDPCell(b, dp, tableMemIdx, lByte, lCell)
 
-	konst(0)
+	// State 0 is the DEAD state, and its column is never read: every read goes
+	// through prev[lNext] with lNext != 0, and both start states are >= 1. It
+	// was computed at every position anyway, which at the eligibility floor is
+	// a third to a half of the whole sweep.
+	konst(1)
 	set(lState)
 	b = append(b, 0x02, 0x40) // block $stDone
 	b = append(b, 0x03, 0x40) // loop $st
@@ -559,7 +585,7 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	b = append(b, 0x4E)
 	b = append(b, 0x0D, 0x01)
 
-	b = emitOverlapDPTransition(b, dp, tableMemIdx, lState, lByte, lNext, lVal)
+	b = emitOverlapDPTransition(b, dp, tableMemIdx, lState, lCell, lNext)
 	loadMask64(dp.midBitmaskOff, lState)
 	set(lMidMask)
 
@@ -582,8 +608,7 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 		get(lNext)
 		b = append(b, 0x04, 0x7F)
 		get(lPrevRow)
-		b = append(b, 0x28, 0x02)
-		b = utils.AppendULEB128(b, uint32(k*4))
+		loadCol(k)
 		b = append(b, 0x05)
 		konst(-1)
 		b = append(b, 0x0B)
@@ -604,7 +629,7 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 		get(lPos)
 		b = append(b, 0x0B)
 		b = append(b, 0x0B)
-		storeCol(lCurRow, k)
+		storeCol(k)
 	}
 
 	get(lState)

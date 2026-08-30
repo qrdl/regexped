@@ -47,7 +47,7 @@ func dfaLayoutCovFindParams() dfaLayoutParams {
 // TestDFALayoutTeddyTiers pins how deep the Teddy prefilter is built for
 // shapes the rest of the corpus does not produce: word-boundary patterns
 // (where the filter must union the prev-is-word and prev-is-non-word
-// continuations — FUZZER_BUGS.md #36) and patterns whose continuation set is
+// continuations) and patterns whose continuation set is
 // too wide for a 64-bit filter lane.
 //
 // A regression here is silent: an over-narrow filter drops real matches, an
@@ -103,8 +103,8 @@ func TestDFALayoutTeddyTiers(t *testing.T) {
 // TestDFALayoutFirstByteFlagsWordContext covers the fast-skip first-byte set
 // for a pattern that can match zero-width at the start state under a word
 // context only. Miss the wbAccept*Start0 unions and the prefix scan never
-// looks at bytes that are valid only in that context (FUZZER_BUGS.md #26's
-// sibling at position 0).
+// looks at bytes that are valid only in that context — the position-0
+// sibling of the mid-string case.
 func TestDFALayoutFirstByteFlagsWordContext(t *testing.T) {
 	// `\b` alone accepts zero-width at the start state exactly when the next
 	// byte is a word char, so every word byte must be a candidate first byte
@@ -195,7 +195,7 @@ func TestDFALayoutRowDedup(t *testing.T) {
 // TestDFALayoutSkipSafeOnDead covers the dead-state skip-safety analysis,
 // including condition (f) — the alternative entry states an intermediate
 // attempt can begin in when the previous byte was a word char or a newline
-// (FUZZER_BUGS.md #41, FABLE.md B1/B3). Wrongly returning true here makes the
+// . Wrongly returning true here makes the
 // find loop jump over real matches.
 func TestDFALayoutSkipSafeOnDead(t *testing.T) {
 	cases := []struct {
@@ -238,7 +238,7 @@ func TestDFALayoutSkipSafeOnDead(t *testing.T) {
 }
 
 // TestDFALayoutDominantSelfLoopNewlineExit covers the '\n' carve-out
-// (FABLE.md B5): a state that records matches only through the newline
+// carve-out: a state that records matches only through the newline
 // channel looks non-mid-accepting, so the bulk skip would stride over every
 // '\n' without ever running the newline pre-accept check. '\n' therefore has
 // to leave the self-loop set — and when there is no room left in the 8-byte
@@ -553,8 +553,8 @@ func TestDFALayoutSuffixWASMCompressed(t *testing.T) {
 // TestDFALayoutFindBodyStartContexts covers buildFindBody's per-attempt entry
 // selection. Which state an attempt starts in depends on the byte before it,
 // and each divergence (begin-of-text vs mid-string, prev-is-word,
-// prev-is-newline) gets its own emitted branch. Compare FUZZER_BUGS.md §22
-// and §23: both were missing branches here, and both silently lost matches.
+// prev-is-newline) gets its own emitted branch. Two past bugs were missing
+// branches here, and both silently lost matches.
 func TestDFALayoutFindBodyStartContexts(t *testing.T) {
 	cases := []struct {
 		pattern string

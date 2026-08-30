@@ -14,7 +14,7 @@ import (
 // The UNION-WALK arm of the gated `find` preflight (`emitUnionAliveMask`).
 //
 // This file exists because a mutation survived everything else in the suite.
-// SETS_PLAN item 21 phase 2 put the mid-accept OR of that walk behind the
+// The wide accept form put the mid-accept OR of that walk behind the
 // accept-first partition, and inverting the guard — so the walk reads the
 // accepts of states that cannot accept and skips the ones that can — passed
 // `make setcaps`, the whole gated-find suite, and both overlapping-preflight
@@ -26,7 +26,7 @@ import (
 // things, and the existing fixtures each miss at least one:
 //
 //   - a scalar frontend and a NEVER-DYING suffix DFA, or no preflight is
-//     emitted at all (§16.5.2: a preflight that retires nothing is Candidate A);
+//     emitted at all (a preflight that retires nothing is Candidate A);
 //   - every pattern LITERAL-LESS, so G12's absence prefilter declines
 //     (buildAbsenceLits needs one pattern with a mandatory literal) and the
 //     union walk is what computes the verdict. greedy-3 — the fixture the
@@ -176,13 +176,13 @@ func TestUnionAliveMaskPreflightMatchesGo(t *testing.T) {
 		{`[^\n]*[0-2]`, `[^\n]*[3-5]`, `[p-r]{2}`},
 		// A NULLABLE member, which is alive only through the ENTRY-STATE arm
 		// of the walk — the one that records what accepts at `from` before any
-		// byte is consumed (§18.7). It is a separate arm from the loop's, so
+		// byte is consumed. It is a separate arm from the loop's, so
 		// losing it is a separate bug, and without a pattern that can match
 		// empty nothing here would notice.
 		{`[^\n]*[0-2]`, `[0-9]*`},
 		{`[^\n]*[0-2]`, `\A`},
 		// NO never-dying member — shapes the preflight only reaches since
-		// SETS_PLAN item 22 fix 2a dropped hasNeverDyingState from its
+		// A later fix dropped hasNeverDyingState from its
 		// eligibility. Every one of them is nullable, which is the axis that
 		// broke: fix 2a's first draft marked ALIVE patterns with gate 1, and
 		// while 1 is invisible to the pre-mask and to emitGateJump, the
@@ -211,7 +211,7 @@ func TestUnionAliveMaskPreflightMatchesGo(t *testing.T) {
 		w := compileUnionPreflightSet(t, pats)
 		for _, input := range inputs {
 			t.Run(fmt.Sprintf("set%d/%q", si, input), func(t *testing.T) {
-				// The gated contract IS Go's FindAllIndex per pattern (§9.6.1),
+				// The gated contract IS Go's FindAllIndex per pattern,
 				// computed independently of anything the emitter believes.
 				var want []setMatch
 				for k, p := range pats {
@@ -277,7 +277,7 @@ func TestUnionAliveMaskPreflightResumes(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// The WIDE alive walk (SETS_PLAN item 22 fix 2a-wide).
+// The WIDE alive walk.
 //
 // Above 64 ids the union automaton emits no u64 accept pair at all, so the
 // preflight was refused outright and the set kept the per-position walk for the

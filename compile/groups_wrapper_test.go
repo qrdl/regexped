@@ -31,29 +31,41 @@ func TestGroupsWrapperValidWithoutCaptureBody(t *testing.T) {
 	if _, err := exec.LookPath("wasm-tools"); err != nil {
 		t.Skip("wasm-tools not in PATH: cannot validate the emitted modules")
 	}
-	for _, pat := range []string{`(?:(a){0})`, `(a){0}`, `(a)`, `\A(a)(b)`, `\b(?P<x>a)`} {
-		for _, entry := range []config.RegexEntry{
-			{Pattern: pat, GroupsFunc: "groups"},
-			{Pattern: pat, GroupsFunc: "groups"},
-		} {
-			w, _, err := Compile([]config.RegexEntry{entry}, 65536, true)
-			if err != nil {
-				t.Logf("%-12q compile err=%v", pat, err)
-				continue
-			}
-			f := t.TempDir() + "/m.wasm"
-			if err := writeFile(f, w); err != nil {
-				t.Fatal(err)
-			}
-			out, vErr := exec.Command("wasm-tools", "validate", "--features", "all", f).CombinedOutput()
-			if vErr != nil {
-				// vErr as well as out: a validation failure puts its
-				// diagnostic in out, but a failure to RUN the validator
-				// leaves out empty and says everything in vErr. Reporting
-				// only out is what made the CI failure unreadable.
-				t.Errorf("%-12q INVALID: %v\n%s", pat, vErr, out)
-			}
+	// The two identical entries this loop used to build were a leftover from
+	// `named_groups_func`, now retired — every pattern was
+	// compiled and validated twice with the same config.
+	pats := []string{`(?:(a){0})`, `(a){0}`, `(a)`, `\A(a)(b)`, `\b(?P<x>a)`}
+	validated := 0
+	for _, pat := range pats {
+		w, _, err := Compile([]config.RegexEntry{{Pattern: pat, GroupsFunc: "groups"}}, 65536, true)
+		if err != nil {
+			// A FAILURE, not a logged note. These are fixtures the compiler is
+			// expected to handle; treating a compile error as "skip this one"
+			// let a regression take every fixture out of the run while the
+			// test still passed.
+			t.Errorf("%-12q compile: %v", pat, err)
+			continue
 		}
+		f := t.TempDir() + "/m.wasm"
+		if err := writeFile(f, w); err != nil {
+			t.Fatal(err)
+		}
+		out, vErr := exec.Command("wasm-tools", "validate", "--features", "all", f).CombinedOutput()
+		if vErr != nil {
+			// vErr as well as out: a validation failure puts its
+			// diagnostic in out, but a failure to RUN the validator
+			// leaves out empty and says everything in vErr. Reporting
+			// only out is what made the CI failure unreadable.
+			t.Errorf("%-12q INVALID: %v\n%s", pat, vErr, out)
+			continue
+		}
+		validated++
+	}
+	// The coverage this test claims, asserted rather than assumed: without it
+	// a run that validated NOTHING is indistinguishable from a clean one.
+	if validated != len(pats) {
+		t.Errorf("validated %d of %d fixtures; the wrapper-validity coverage is incomplete",
+			validated, len(pats))
 	}
 }
 

@@ -234,7 +234,7 @@ func TestIsAlternationDeterministicPaths(t *testing.T) {
 }
 
 // TestIsAlternationDeterministicQuantifierLoop exercises the quantifierLoop=true
-// branch added by task 13 (commit c9436b8): a quantifier-loop InstAlt whose
+// branch added in commit c9436b8: a quantifier-loop InstAlt whose
 // continuation and exit first-byte sets overlap is now TDFA-eligible (the
 // overlap alone no longer forces Backtracking, since TDFA's LeftmostFirst
 // priority always prefers the loop body over the exit regardless of overlap).

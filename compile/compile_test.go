@@ -1126,10 +1126,17 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 		},
 	}
 
-	t.Run("no_sets_returns_nil", func(t *testing.T) {
+	t.Run("no_sets_is_an_error", func(t *testing.T) {
+		// It used to return nil: `--diag-json=out.json` on a set-less config
+		// wrote no file and said nothing, leaving the user with a missing
+		// file and no explanation.
 		empty := config.BuildConfig{Regexps: cfg.Regexps}
-		if err := CmdWriteDiagJSON(empty, "", ""); err != nil {
-			t.Errorf("expected nil, got %v", err)
+		err := CmdWriteDiagJSON(empty, "", "")
+		if err == nil {
+			t.Fatal("expected an error for a config with no sets")
+		}
+		if !strings.Contains(err.Error(), "no sets") {
+			t.Errorf("the error does not say why: %v", err)
 		}
 	})
 
@@ -1343,7 +1350,7 @@ func TestCompileFuzzRepro092700(t *testing.T) {
 // initialization block in buildBacktrackBody for the capture path —
 // the test plan T35. TestCompileBTCaptureWithMemo's pattern ((?:a?)+?) has a
 // single capture spanning the whole pattern (MaxCap()==1) and is not
-// itself ^-anchored, so task 41's whole-pattern-single-capture shortcut
+// itself ^-anchored, so the whole-pattern-single-capture shortcut
 // (compile.go, isWholePatternSingleCapture) now intercepts it before it
 // ever reaches TDFA/BT selection — confirmed live via isAnchoredFind/
 // isWholePatternSingleCapture probing. ((?:a?)+?)(b) has two capture

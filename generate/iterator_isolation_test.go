@@ -12,7 +12,7 @@ import (
 // staging address was. A generator staged its input, yielded, and resumed — and
 // anything the caller ran in between had written its own input over the top, so
 // the scan continued across another string's bytes and reported offsets against
-// it. No exception, plausible output (TODO 58 / SETS_PLAN item 4).
+// it. No exception, plausible output.
 //
 // The fix gives every live call its OWN region, which is the property Rust and
 // Go get for free by passing a host pointer. These tests pin the shape of that

@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"fmt"
 	"regexp/syntax"
 	"strings"
 	"testing"
@@ -131,7 +132,7 @@ func TestSetCoreSetTopLevelAnchor(t *testing.T) {
 
 	// The (?m:^) arm must NOT collapse to startAnchor. Doing so made the
 	// eligibility mask STRICTER than the assertion — position 0 only, where
-	// the pattern also matches after any newline — which is FUZZER_BUGS 43.
+	// the pattern also matches after any newline — which is
 	var lineInfo PatternInfo
 	lineInfo.setTopLevelAnchor(mustParse(t, `(?m:^)abc`))
 	if !lineInfo.lineAnchor {
@@ -649,15 +650,18 @@ func TestSetCorePromoteSparseBucketsKeepsIneligibleMembers(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plainOne := setCoreCovAnalyze(t, `alpha[0-9]`)
-			plainTwo := setCoreCovAnalyze(t, `beta[0-9]`)
-			odd := setCoreCovAnalyze(t, tc.pattern)
-
-			in := []*bucket{
-				setCoreCovBucketOf(plainOne),
-				setCoreCovBucketOf(odd),
-				setCoreCovBucketOf(plainTwo),
+			// Enough eligible patterns that the merged bucket is over the
+			// bitmask width. Below it the promotion is refused outright — a
+			// group the bitmask form could have held gains nothing from the
+			// slowest body shape there is — so two plain
+			// patterns no longer reach the refusals this test is about.
+			var in []*bucket
+			eligibleCount := bucketMaskBits + 1
+			for i := 0; i < eligibleCount; i++ {
+				in = append(in, setCoreCovBucketOf(setCoreCovAnalyze(t, fmt.Sprintf(`kw%03d[0-9]`, i))))
 			}
+			odd := setCoreCovAnalyze(t, tc.pattern)
+			in = append(in, setCoreCovBucketOf(odd))
 			out := promoteSparseBuckets(in, CompileSetOptions{AllowSparseAccept: true},
 				setCoreCovFallbackPromotion)
 
@@ -669,8 +673,8 @@ func TestSetCorePromoteSparseBucketsKeepsIneligibleMembers(t *testing.T) {
 			for _, bkt := range out {
 				if bkt.sparse {
 					sparseCount++
-					if len(bkt.patterns) != 2 {
-						t.Errorf("%s: promoted bucket holds %d patterns, want 2", tc.name, len(bkt.patterns))
+					if len(bkt.patterns) != eligibleCount {
+						t.Errorf("%s: promoted bucket holds %d patterns, want %d", tc.name, len(bkt.patterns), eligibleCount)
 					}
 				}
 				if len(bkt.patterns) == 1 && bkt.patterns[0] == odd {
@@ -812,32 +816,29 @@ func TestSetCoreRecordEmittersStopAtBit32(t *testing.T) {
 }
 
 func TestSetCoreCapAccumulatorBooleanArms(t *testing.T) {
-	// capMatch is the boolean anchored arm: any bit at all settles the answer,
-	// so it emits a flag store and a branch out rather than any id handling.
-	// The `match:` CONFIG KEY that used to select it is retired (TODO task 59
-	// decision (2)), so no YAML reaches these arms today — they are driven
-	// directly, and stay because match_any/match_all share the same emitter
-	// dispatch and would break together.
-	accumulator := capAccumulator{kind: capMatch, lCount: 5, lAnyID: 6, lAcc: 7}
+	// Retargeted at capMatchAny. The boolean capMatch kind this used to drive
+	// was deleted with the retired `match:` key it existed for — no YAML could
+	// select it, capFns() never produced it, and its arms were unreachable
+	// code in five files. What the test is really for is the
+	// anchored emitter DISPATCH, which match_any and match_all share.
+	accumulator := capAccumulator{kind: capMatchAny, lCount: 5, lAnyID: 6, lAcc: 7}
 
 	bits := accumulator.emitRecordBits(nil, 8 /* bitsLocal */, setCoreCovIDs(4), 1 /* escapeDepth */)
 	if len(bits) == 0 {
-		t.Fatal("emitRecordBits(capMatch) emitted nothing")
+		t.Fatal("emitRecordBits(capMatchAny) emitted nothing")
 	}
 
 	// The sparse flavour answers from a COUNT rather than bucket-local bits,
-	// because a sparse bucket has more patterns than a mask has bits. For the
-	// boolean arm the count alone is enough and no id map is read, which is
-	// why an id-map-less bucket is a legitimate argument here.
-	sparseBits := accumulator.emitRecordSparseCount(nil, 4 /* countLocal */, &bucket{},
+	// because a sparse bucket has more patterns than a mask has bits.
+	sparseBits := accumulator.emitRecordSparseCount(nil, 4 /* countLocal */, &bucket{sparseIDMapOff: 64},
 		0 /* tableMemIdx */, 9, 10, 1)
 	if len(sparseBits) == 0 {
-		t.Fatal("emitRecordSparseCount(capMatch) emitted nothing")
+		t.Fatal("emitRecordSparseCount(capMatchAny) emitted nothing")
 	}
 
-	body := finishAnchoredCapBody(nil, capMatch, false, 7, 5, 6)
+	body := finishAnchoredCapBody(nil, capMatchAny, false, 7, 5, 6)
 	if len(body) == 0 {
-		t.Fatal("finishAnchoredCapBody(capMatch) emitted nothing")
+		t.Fatal("finishAnchoredCapBody(capMatchAny) emitted nothing")
 	}
 	if body[len(body)-1] != 0x0B {
 		t.Errorf("finishAnchoredCapBody did not terminate the function (last byte %#x)", body[len(body)-1])

@@ -9,7 +9,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// TODO task 62 made generated symbols keep the config's casing VERBATIM. That
+// Generated symbols keep the config's casing VERBATIM. That
 // was a deliberate choice — a user who writes `url_match` gets `url_match` —
 // and it has one consequence worth telling them about: in Go a lower-case name
 // is unexported, so in a LIBRARY package the generated function is invisible
@@ -56,7 +56,7 @@ func writeGoStub(t *testing.T, dirName, importModule, matchFunc, setFind string)
 }
 
 // TestGoStubKeepsNamesVerbatim: the name the user wrote is the name emitted,
-// whatever its case, and the PascalCase transform task 62 removed has not
+// whatever its case, and the removed PascalCase transform has not
 // come back.
 func TestGoStubKeepsNamesVerbatim(t *testing.T) {
 	src := writeGoStub(t, "mylib", "mylib", "url_match", "scan_all_secrets")

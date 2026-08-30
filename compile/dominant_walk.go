@@ -119,7 +119,7 @@ const (
 	// memberMaxStates bounds the member arms, separately from
 	// dominantMaxStates. Each costs a compare per walk iteration on inputs
 	// that never enter the state, and member mode cannot argue from coverage
-	// the way exception mode can (§21.2's "collateral" note).
+	// the way exception mode can.
 	memberMaxStates = 2
 )
 

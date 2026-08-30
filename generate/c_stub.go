@@ -27,13 +27,15 @@ func cStub(cfg config.BuildConfig, out string) error {
 	if hContent == "" {
 		return nil
 	}
+	// See jsStub: the namespace applies on the stdout path too, and to BOTH
+	// halves.
+	hContent = applyNamespace(cfg, "c", hContent)
+	cContent = applyNamespace(cfg, "c", cContent)
 	if out == "-" {
 		_, err := os.Stdout.WriteString(hContent + cContent)
 		return err
 	}
 	base := strings.TrimSuffix(out, filepath.Ext(out))
-	hContent = applyNamespace(cfg, "c", hContent)
-	cContent = applyNamespace(cfg, "c", cContent)
 	if err := writeStub(base+".h", []byte(hContent)); err != nil {
 		return err
 	}
@@ -62,7 +64,7 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 	hb.WriteString("#pragma once\n\n")
 	hb.WriteString("#ifndef REGEXPED_TYPES_DEFINED\n")
 	hb.WriteString("#define REGEXPED_TYPES_DEFINED\n")
-	// Types per TODO task 59 decision (1). size_t for lengths, offsets and
+	// Types: size_t for lengths, offsets and
 	// capacities and ONLY those — it means "can hold the size of any object",
 	// which a pattern id is not. ptrdiff_t for positions coming back, because
 	// -1 is the sentinel for "no match" / "group absent" and an unsigned type
@@ -71,7 +73,7 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string) 
 	// the signed/unsigned warning in for (int i = 0; i < n; i++).
 	hb.WriteString("#include <stddef.h>   /* size_t, ptrdiff_t -- freestanding-required, no libc */\n\n")
 	hb.WriteString("typedef struct { ptrdiff_t start, end; } rx_match_t;\n")
-	// The `name` field is gone (TODO task 62): identity is the INDEX now, so
+	// The `name` field is gone: identity is the INDEX now, so
 	// the name pointer duplicated the index-aligned table and cost a pointer per group.
 	hb.WriteString("typedef struct { ptrdiff_t start, end; } rx_group_t;\n")
 	hb.WriteString("typedef struct { int pattern_id; ptrdiff_t start, end; } rx_set_match_t;\n")
@@ -133,7 +135,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		wide := wideAllForm(s, cfg)
 
 		fmt.Fprintf(&hb, "/* Number of patterns in set %q. Sizes the match buffer: the scanner can\n   receive at most this many matches at one position. */\n#define %s %d\n\n", s.Name, konst, n)
-		fmt.Fprintf(&hb, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id \u2014 the gate\n   array, the _all bitmap, and the out_ids array you pass to the _all calls \u2014\n   is sized from this. */\n#define %s %d\n\n", s.Name, idKonst, idN)
+		fmt.Fprintf(&hb, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id \u2014 the gate\n   array and the _all bitmap \u2014 is sized from this. The out_ids array you\n   pass to the _all calls is NOT: it is a LIST of ids, not an id-indexed array,\n   and at most PATTERN_COUNT ids can ever be written to it \u2014 which is what\n   the prototypes' `static` sizes say. */\n#define %s %d\n\n", s.Name, idKonst, idN)
 
 		imp := func(name, sig string) {
 			fmt.Fprintf(&hb, "__attribute__((import_module(%q), import_name(%q)))\n%s\n", cfg.ImportModule, name, sig)
@@ -193,10 +195,11 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			} else {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, int patterns[static %[3]s]) {
     long long raw = ffi_%[1]s(input, (int)len);
-    /* The narrow form's return IS the bitmask, so the sentinel is tested on the
-       RAW value before the unsigned cast: -2 as unsigned long long reads as
-       "every id except 0 matched". */
-    if (raw == RX_ERR_BT_OVERFLOW) return RX_ERR_BT_OVERFLOW;
+    /* NO overflow sentinel here: the narrow form's return IS the bitmask, so
+       every 64-bit value is a legal answer. -2 means ids 1..63 matched and id 0
+       did not, which a sentinel test would report as an engine failure. The
+       real sentinel cannot reach this form — a Backtracking member forces the
+       wide one. */
     unsigned long long mask = (unsigned long long)raw;
     int c = 0;
     for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) patterns[c++] = k;
@@ -233,10 +236,11 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			} else {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset, int patterns[static %[3]s]) {
     long long raw = ffi_%[1]s(input, (int)len, (int)offset);
-    /* The narrow form's return IS the bitmask, so the sentinel is tested on the
-       RAW value before the unsigned cast: -2 as unsigned long long reads as
-       "every id except 0 matched". */
-    if (raw == RX_ERR_BT_OVERFLOW) return RX_ERR_BT_OVERFLOW;
+    /* NO overflow sentinel here: the narrow form's return IS the bitmask, so
+       every 64-bit value is a legal answer. -2 means ids 1..63 matched and id 0
+       did not, which a sentinel test would report as an engine failure. The
+       real sentinel cannot reach this form — a Backtracking member forces the
+       wide one. */
     unsigned long long mask = (unsigned long long)raw;
     int c = 0;
     for (int k = 0; k < %[2]s; k++) if (mask & (1ULL << k)) patterns[c++] = k;
@@ -248,7 +252,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		if s.Find != "" {
 			scannerType := "rx_" + setConstBase(s.Name) + "_scanner_t"
 			// EVERY set with `find` takes the gate array, overlapping included
-			// (SETS_PLAN item 11) — the branch that omitted it was unreachable
+			// — the branch that omitted it was unreachable
 			// and is gone.
 			imp(s.Find, decl("find"))
 			gateField := fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
@@ -258,7 +262,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// and re-initialising the struct restarts one. The static
 			// _next/_reset pair this replaces could do neither.
 			//
-			// The TUPLE BUFFER is the caller's too, for the reason §19.6 gives
+			// The TUPLE BUFFER is the caller's too, for the reason given
 			// for find_batch: a header with no allocator can only own storage
 			// whose size is known at compile time, and PATTERN_COUNT tuples of
 			// a several-thousand-pattern set is tens of kilobytes to bury in a
@@ -267,7 +271,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// the caller picks.
 			//
 			// Unlike find_batch, the buffer has a MINIMUM: `find` is
-			// transactional (SETS §3.11), so a position reporting more matches
+			// transactional, so a position reporting more matches
 			// than fit records no gate and writes no complete answer, and the
 			// scan cannot step past it. PATTERN_COUNT is that worst case
 			// exactly — one match per pattern at one start.
@@ -509,8 +513,8 @@ func toUpperIdent(s string) string {
 // e.g. funcName="url_groups", groupName="host" → "url_groups_host".
 //
 // It used to be a `const char *` holding the NAME, compared by pointer
-// identity, with the name also carried in every rx_group_t. TODO task 62
-// replaced that with the index, which is what the caller actually needs to
+// identity, with the name also carried in every rx_group_t. That was
+// replaced with the index, which is what the caller actually needs to
 // address the array, and dropped the per-group name pointer entirely.
 //
 // The name follows the config's casing rather than C's SCREAMING convention,
@@ -542,7 +546,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	var hb, cb strings.Builder
 
 	// .h: group INDEX constants, plus the runtime lookup and the name table.
-	// This is what replaced `named_groups_func` (TODO task 62) — and it gives
+	// This is what replaced `named_groups_func` — and it gives
 	// C named access it never had, since that key was rejected here outright.
 	if len(named) > 0 {
 		fmt.Fprintf(&hb, "/* Index of each NAMED capture group of %s. Index 0 is the whole\n"+
@@ -570,7 +574,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 				"const char *const *%s(void);\n\n", funcUpper, derivedFuncName(funcName, "names"))
 	}
 
-	// .h: the iterator. Single-shot before TODO task 62, which left the caller
+	// .h: the iterator. Single-shot originally, which left the caller
 	// hand-rolling the advance and the empty-match guard from a COMMENT — the
 	// place they got subtly wrong, and silently. C already had this shape for
 	// its set scanner, so this applies a local idiom rather than importing one.
@@ -656,11 +660,13 @@ int %[1]s_next(%[2]s *iter, rx_group_t out_groups[static %[5]d]) {
                            (unsigned int)iter->len, slots, (unsigned int)iter->offset);
         if (status == RX_ERR_BT_OVERFLOW) { iter->done = 1; return RX_ERR_BT_OVERFLOW; }
         if (status < 0) {
-            /* No match at THIS position — a different thing from the sentinel
-               above. Advance and retry. */
-            if (iter->offset == iter->len) { iter->done = 1; return 0; }
-            iter->offset++;
-            continue;
+            /* Terminal, not "try the next position": the groups
+               export has SCAN-FROM semantics in both wrapper arms, so a
+               negative result means there is no match at or after offset. The
+               advance-by-one retry this replaced re-scanned the tail once per
+               remaining byte. */
+            iter->done = 1;
+            return 0;
         }
         size_t start = (size_t)slots[0];
         size_t end   = (slots[1] >= 0) ? (size_t)slots[1] : start;

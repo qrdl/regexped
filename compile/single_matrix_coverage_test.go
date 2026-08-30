@@ -204,7 +204,7 @@ func singleCases() []singleCase {
 			match:   true, find: true,
 		},
 		{
-			name: "alt-lit-anchor-unequal", selects: "the same analysis refusing UNEQUAL prefix widths (task 6 option 2)",
+			name: "alt-lit-anchor-unequal", selects: "the same analysis refusing UNEQUAL prefix widths",
 			pattern: `[0-9]{4}aaa_[^\s]+|[a-f]{9}bbb_[^\s]+`, match: true, find: true,
 		},
 		{

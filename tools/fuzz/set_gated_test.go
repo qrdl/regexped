@@ -16,8 +16,8 @@ import (
 // The gated (default) `find` body: per-pattern non-overlapping output,
 // filtered through a caller-owned gate array.
 //
-// The oracle is deliberately NOT a Go reimplementation of §3.16's biased gate
-// encoding. §9.6.1 explains why at length: a reference derived from the same
+// The oracle is deliberately NOT a Go reimplementation of the biased gate
+// encoding: a reference derived from the same
 // spec paragraph as the emitter proves the two agree, not that either is
 // right, and this project has already been bitten by exactly that (FABLE B42,
 // where re2test's comparison AND its oracle narrowed the input the same way).
@@ -49,7 +49,7 @@ func compileGatedSet(pats []string) ([]byte, error) {
 
 // gatedRun drives the gated find to exhaustion with a zeroed gate array, the
 // way a generated iterator does, and returns every reported match plus the
-// per-call batches for the structural invariants of §9.6.1.
+// per-call batches for the structural invariants of the union oracle.
 type gatedRun struct {
 	matches []setMatch
 	batches [][]setMatch
@@ -139,7 +139,7 @@ func runGatedFind(t *testing.T, pats []string, input string) gatedRun {
 	return run
 }
 
-// gatedOracle is §9.6.1's union of Go FindAllIndex, tagged with the pattern id.
+// gatedOracle is the union of Go FindAllIndex, tagged with the pattern id.
 func gatedOracle(pats []string, input string) []setMatch {
 	var out []setMatch
 	for k, p := range pats {
@@ -178,7 +178,7 @@ func checkGated(t *testing.T, pats []string, input string) {
 		}
 	}
 
-	// Encoding-independent invariants (§9.6.1). These hold whatever the gate
+	// Encoding-independent invariants. These hold whatever the gate
 	// formula says, and a wrong bias direction violates them immediately.
 	byID := map[int][]setMatch{}
 	for _, m := range run.matches {
@@ -245,7 +245,7 @@ func TestGatedFindInterleaving(t *testing.T) {
 	}
 }
 
-// TestGatedSubsetOfUngated pins the §9.6.1 invariant that the gated output is
+// TestGatedSubsetOfUngated pins the invariant that the gated output is
 // a subset of the ungated one for the same set and input.
 func TestGatedSubsetOfUngated(t *testing.T) {
 	pats := []string{`[a-z]+X`, `b`}
@@ -271,7 +271,7 @@ func TestGatedSubsetOfUngated(t *testing.T) {
 	}
 }
 
-// TestGatedOverflowStoresNoState pins §3.11 / D2: an overflowing call must
+// TestGatedOverflowStoresNoState pins the overflow contract: an overflowing call must
 // leave the gate array byte-for-byte as it found it, so a grown retry sees the
 // identical world. Probing with out_cap 0 then 1 then the full size must give
 // the same answer as calling at full size first.
@@ -348,7 +348,7 @@ func TestGatedOverflowStoresNoState(t *testing.T) {
 
 // TestGatedLadder is the linearity obligation: the
 // `a+`-in-a-set n-ladder that made the case for gating in the first place.
-// §3.14 measured the ungated scan at a textbook O(n^2) (x4 per doubling);
+// The ungated scan measured a textbook O(n^2) (x4 per doubling);
 // gating must make it linear. Run with -v to see the table.
 func TestGatedLadder(t *testing.T) {
 	if testing.Short() {
@@ -374,8 +374,8 @@ func TestGatedLadder(t *testing.T) {
 // NOT — and the omission mattered.
 //
 // TestGatedLadder counts calls and matches, both of which are 1 at every n, so
-// it read as "linear, as predicted" (§10.5) while the gated body was in fact
-// still quadratic in WORK: §3.14's mask skip and jump were never emitted, so
+// it read as "linear, as predicted" while the gated body was in fact
+// still quadratic in WORK: the mask skip and jump were never emitted, so
 // the terminating call ran each suffix DFA to its full extent at every gated
 // position — 7.8M fuel at n=500 rising x4 per doubling to 1.98B at n=8000.
 //
@@ -461,7 +461,7 @@ func TestGatedLadderFuel(t *testing.T) {
 			t.Logf("n=%-5d fuel=%-12d ratio vs n=%d: %.2fx", n, f, prevN, ratio)
 			if ratio > 3.0 {
 				t.Errorf("fuel grew %.2fx from n=%d to n=%d — that is the quadratic "+
-					"behaviour §3.14's mask skip and jump exist to remove "+
+					"behaviour the mask skip and jump exist to remove "+
 					"(gated find must stay linear in input length)", ratio, prevN, n)
 			}
 		} else {

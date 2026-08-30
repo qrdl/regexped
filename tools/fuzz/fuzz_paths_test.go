@@ -440,7 +440,7 @@ func sortSpans(v [][2]int) {
 // tools/re2test compares against the corpus's col4 column rather than computing
 // this, so it never had to state the rule explicitly.
 //
-// Implemented with the §9.6 whole-input technique: `\A(?s:.{p})(?:pat)` over
+// Implemented with the whole-input technique: `\A(?s:.{p})(?:pat)` over
 // the WHOLE input hands `pat` position p with its real left context, so `\b`,
 // `\B` and `(?m:^)` judge actual neighbours. The slice technique it replaces
 // (`\A(?:pat)` over input[p:]) judged them against a slice boundary instead

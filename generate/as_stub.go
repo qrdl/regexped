@@ -17,11 +17,13 @@ func asStub(cfg config.BuildConfig, out string) error {
 	if content == "" {
 		return nil
 	}
+	// See jsStub: the namespace applies on the stdout path too (S5).
+	content = applyNamespace(cfg, "as", content)
 	if out == "-" {
 		_, err := fmt.Print(content)
 		return err
 	}
-	return writeStub(out, []byte(applyNamespace(cfg, "as", content)))
+	return writeStub(out, []byte(content))
 }
 
 // genASStubFile generates the content of an AssemblyScript stub file.
@@ -50,7 +52,7 @@ func genASStubFile(cfg config.BuildConfig) (string, error) {
 }
 
 // asSentinelPreamble emits the two sentinels every AssemblyScript export
-// reports failure with (TODO task 62).
+// reports failure with.
 //
 // AS uses SENTINELS, not exceptions, and this is measured rather than assumed.
 // asc 0.28.13 rejects `try { } catch { }` outright — "ERROR AS100: Not
@@ -76,7 +78,11 @@ func genASSetSection(cfg config.BuildConfig) string {
 	}
 	var out strings.Builder
 	out.WriteString("\n// ---- set composition wrappers ----\n\n")
-	out.WriteString("class SetMatch { constructor(public patternId: i32, public start: u32, public end: u32) {} }\n")
+	// EXPORTED. A caller iterating a set's find gets SetMatch values back, so a
+	// module-private class left them with no way to name the type
+	//. It is also in the namespace-rewritten shared-symbol
+	// list, which only makes sense for a symbol the caller can see.
+	out.WriteString("export class SetMatch { constructor(public patternId: i32, public start: u32, public end: u32) {} }\n")
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
@@ -102,7 +108,14 @@ func genASSetSection(cfg config.BuildConfig) string {
 		}
 		if s.MatchAny != "" {
 			decl(s.MatchAny, sig("match_any"))
-			fmt.Fprintf(&out, `/** Id of SOME pattern matching the whole input, or -1. */
+			fmt.Fprintf(&out, `/** Id of SOME pattern matching the whole input, or -1.
+ *  Which id you get is unspecified when several patterns match.
+ *
+ *  May also return RX_ERR_BT_OVERFLOW (-2): a Backtracking member of this set
+ *  exhausted its frame budget, so the answer is UNKNOWN rather than -1. Test
+ *  for it before reading a negative result as "no match" — the doc here used
+ *  to promise only -1 while the sentinel came straight through
+ */
 export function %s(input: ArrayBuffer): i32 {
     return ffi_%s(changetype<usize>(input), input.byteLength);
 }
@@ -130,14 +143,16 @@ export function %s(input: ArrayBuffer): Array<i32> | null {
 				fmt.Fprintf(&out, `/** Ids of every pattern matching the whole input. */
 export function %s(input: ArrayBuffer): Array<i32> | null {
     const raw = ffi_%s(changetype<usize>(input), input.byteLength);
-    // The narrow form's return IS the bitmask, so the sentinel is tested
-    // before it is treated as one: -2 reads as "every id except 0 matched".
-    if (raw == %d) return null;
+    // NO overflow sentinel here: the narrow form's return IS the bitmask, so
+    // every 64-bit value is a legal answer. -2 means ids 1..63 matched and id
+    // 0 did not, which a sentinel test would report as an engine failure. The
+    // real sentinel cannot reach this form — a Backtracking member forces the
+    // wide one.
     const out = new Array<i32>();
     for (let k = 0; k < %s; k++) if ((raw >> i64(k)) & 1) out.push(k);
     return out;
 }
-`, s.MatchAll, s.MatchAll, btOverflow, idKonst)
+`, s.MatchAll, s.MatchAll, idKonst)
 			}
 		}
 		if s.ScanAny != "" {
@@ -178,20 +193,22 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 				fmt.Fprintf(&out, `/** Ids of every pattern matching somewhere at or after `+"`offset`"+`. */
 export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
     const raw = ffi_%s(changetype<usize>(input), input.byteLength, i32(offset));
-    // The narrow form's return IS the bitmask, so the sentinel is tested
-    // before it is treated as one: -2 reads as "every id except 0 matched".
-    if (raw == %d) return null;
+    // NO overflow sentinel here: the narrow form's return IS the bitmask, so
+    // every 64-bit value is a legal answer. -2 means ids 1..63 matched and id
+    // 0 did not, which a sentinel test would report as an engine failure. The
+    // real sentinel cannot reach this form — a Backtracking member forces the
+    // wide one.
     const out = new Array<i32>();
     for (let k = 0; k < %s; k++) if ((raw >> i64(k)) & 1) out.push(k);
     return out;
 }
-`, s.ScanAll, s.ScanAll, btOverflow, idKonst)
+`, s.ScanAll, s.ScanAll, idKonst)
 			}
 		}
 		if s.Find != "" {
 			iterName := config.PascalCaseForValidation(s.Find) + "Iter"
 			// EVERY set with `find` takes the gate array, overlapping included
-			// (SETS_PLAN item 11) — the branch that omitted it was unreachable
+			// — the branch that omitted it was unreachable
 			// and is gone.
 			decl(s.Find, sig("find"))
 			gateField := "    gates: StaticArray<u32>;\n"
@@ -419,11 +436,13 @@ export class %[2]s {
       );
       if (status == %[5]d) { this.done = true; return RX_ITER_ERROR; }
       if (status < 0) {
-        // No match at THIS position — a different thing from the sentinel
-        // above. Advance and retry.
-        if (this.offset == u32(len)) { this.done = true; return 0; }
-        this.offset++;
-        continue;
+        // Terminal, not "try the next position": the groups
+        // export has SCAN-FROM semantics in both wrapper arms, so a negative
+        // result means there is no match at or after offset. The
+        // advance-by-one retry this replaced re-scanned the tail once per
+        // remaining byte.
+        this.done = true;
+        return 0;
       }
       const start = this.slots[0];
       const end = this.slots[1] >= 0 ? this.slots[1] : start;
@@ -450,7 +469,7 @@ export function %[1]s(input: ArrayBuffer, offset: u32): %[2]s {
 	// load<i32>(slots + 8*g) twice and hand-roll a UTF-8 decode. These make
 	// bounds-checking and looping over all groups possible at all. Named
 	// groups reach the same slots through the index constants
-	// genASGroupIndexConsts emits (TODO task 62); AS used to have no named
+	// genASGroupIndexConsts emits; AS used to have no named
 	// access at all, because `named_groups_func` was rejected here.
 	//
 	// _capture takes `input` again ON PURPOSE: the slots are offsets, so
@@ -506,7 +525,7 @@ func asABIRet(r abiRet) string {
 }
 
 // genASGroupIndexConsts emits name→index addressing for a groups function.
-// Replaces the retired `named_groups_func` (TODO task 62), which AS rejected
+// Replaces the retired `named_groups_func`, which AS rejected
 // outright — so this is named access AssemblyScript never had.
 //
 // Flat constants rather than JS/TS's single frozen object: AS has no

@@ -471,7 +471,7 @@ var tests = []testCase{
 		// overlaps the class itself. hasAmbiguousCaptures flags the loop's
 		// InstAlt as ambiguous (continue-vs-exit can't be resolved by
 		// first-byte lookahead alone) and routes this to Backtracking today,
-		// even though Task 12 measured forced-TDFA as faster on this exact
+		// even though an earlier measurement made forced-TDFA faster on this exact
 		// shape (68.07 vs 114.12 fuel/byte, -40%). This case exists to
 		// measure that population at scale if/when the gate is narrowed —
 		// not to demonstrate a win yet.
@@ -1116,9 +1116,6 @@ const (
 	tableBase = int64(131072) // page 2; pages 0-1 are reserved for input
 	// slotsBase is where capture output slots are written for groups calls.
 	slotsBase = int32(512)
-	// benchIters is the number of iterations run inside WASM per benchmark call.
-	// The loop executes entirely within WASM so CGo overhead is paid only once.
-	benchIters = 10_000
 )
 
 type benchResult struct {
@@ -2116,7 +2113,7 @@ func runCompareSize(baselinePath string) bool {
 }
 
 // --------------------------------------------------------------------------
-// Set composition benchmarks (task 5.4)
+// Set composition benchmarks
 //
 // Compares:
 //   (a) regexped `find` via CompileFile — one WASM call returns all

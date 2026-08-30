@@ -547,7 +547,7 @@ func isEpsilonAccept(prog *syntax.Prog, pc int) bool {
 // (empty first-rune set — Gap I's inverted-class signal, CLAUDE.md
 // "Load-bearing engine-selection gates") is still treated as ambiguous; only
 // the disjoint-ness requirement between two otherwise-computable branches is
-// skipped (task 13), since TDFA's LeftmostFirst priority resolves that case
+// skipped, since TDFA's LeftmostFirst priority resolves that case
 // correctly regardless of overlap.
 func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop bool) bool {
 	if altPC >= len(prog.Inst) {
@@ -579,7 +579,7 @@ func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop boo
 	}
 
 	if quantifierLoop {
-		return true // both sides computable; overlap alone doesn't matter for a greedy loop (task 13)
+		return true // both sides computable; overlap alone doesn't matter for a greedy loop
 	}
 
 	for r := range leftRunes {

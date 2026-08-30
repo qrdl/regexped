@@ -262,6 +262,14 @@ export const RX_ITER_ERROR: u32 = 0xFFFFFFFF;   // pointer returns, where 0 alre
 | `match_all`, `scan_all` | `null` — `Array` is a reference type, so it can be nullable |
 | set `find` iterator | `next()` returns `null`; `err()` after the loop distinguishes it from exhaustion |
 
-**Three set exports used to swallow it.** `match_any` returned the raw `-2` under a doc comment promising only `-1`, and the narrow `match_all`/`scan_all` treated it as a bitmask — `-2` reads as *every id except 0 matched*. All three report it now.
+**`match_any` used to swallow it**, returning the raw `-2` under a doc comment promising only `-1`. It reports it now.
+
+The NARROW `match_all` / `scan_all` do **not** test for it, and must not: their
+`i64` return IS the bitmask, so every 64-bit value is a legal answer. `-2` is
+`0xFFFF_FFFF_FFFF_FFFE` — ids 1..63 matched and id 0 did not — which a
+sentinel test would report as an engine failure on a perfectly good result.
+The real sentinel cannot reach that form at all: a set with a Backtracking
+member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
+`-2` is unambiguous.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.

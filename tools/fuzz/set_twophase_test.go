@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// TestTwoPhaseMixedSets drives the SETS_PLAN item 19 split: sets holding BOTH
+// TestTwoPhaseMixedSets drives the two-phase split: sets holding BOTH
 // literal-bearing and literal-less patterns, which is the only shape that
 // reaches phase 2.
 func TestTwoPhaseMixedSets(t *testing.T) {

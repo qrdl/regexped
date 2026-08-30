@@ -34,7 +34,7 @@ import (
 // after a '\n', or after a word/non-word byte for this pattern family. The
 // assertions below are therefore two-directional: they fail if a flag stops
 // firing (the arm goes quietly dead again) as well as if the wrong arm is
-// chosen. See plans/TODO.md task 63.
+// chosen.
 //
 // SCOPE, stated plainly so this file is not over-trusted: it pins the LAYOUT
 // (the four resume states really do diverge) and the SELECTION (which arm a

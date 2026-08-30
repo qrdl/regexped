@@ -9,7 +9,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// ── Backtracking as a set fallback engine (SETS_PLAN item 20) ────────────────
+// ── Backtracking as a set fallback engine ────────────────
 //
 // A set member whose fallback-bucket DFA exceeds max_fallback_states used to be
 // DROPPED: warned, recorded in --diag-json's state_limit_dropped, and then
@@ -50,9 +50,15 @@ import (
 // about to be dropped from a set. Returns nil when BT cannot take it either,
 // in which case the caller drops the pattern exactly as before.
 //
-// memoBudget is the set's configured BitState budget; ast is the pattern's
-// full AST (patternSuffixAST), captures already irrelevant because sets never
-// report them.
+// memoBudget is the BitState budget. There is no SET-level knob for it —
+// CompileSetOptions has no MemoBudget field — so every caller passes
+// resolveMemoBudget(nil), i.e. the single-pattern default of 128 KB. The doc
+// here used to name a configured set budget that does not exist
+// ; the parameter stays so adding one later is a change at
+// the three call sites rather than in this function.
+//
+// ast is the pattern's full AST (patternSuffixAST), captures already
+// irrelevant because sets never report them.
 func admitBTFallback(ast *syntax.Regexp, memoBudget int) *btBucketInfo {
 	if ast == nil {
 		return nil
@@ -125,8 +131,7 @@ func setPatternInfos(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []
 // It exists for the STUB GENERATORS. `generate` is a separate command from
 // `compile` and derives every signature from the config alone, but the `_all`
 // ABI depends on a compile-time fact: a set with a BT member returns its bitmap
-// through memory rather than as an i64 (SETS_PLAN item 20 decision 3, and
-// compiledSet.wideAll). A stub that guessed would emit the wrong signature and
+// through memory rather than as an i64 (see compiledSet.wideAll). A stub that guessed would emit the wrong signature and
 // read a count as a bitmask.
 //
 // It re-runs the analysis rather than reading a compile artefact so `generate`
@@ -187,8 +192,7 @@ func hasBTBucketIn(buckets []*bucket) bool {
 // btSharedRegions is the one stack / memo / scratch allocation a set makes for
 // ALL of its BT buckets, sized to the largest of them.
 //
-// Sharing is safe for two reasons, both verified rather than assumed
-// (SETS_PLAN item 20, decision 4):
+// Sharing is safe for two reasons, both verified rather than assumed:
 //
 //  1. The memo re-zeroes itself at the head of every BT call
 //     (emitBTMemoZeroInitTrimmed), so one pattern cannot inherit another's
@@ -291,9 +295,9 @@ const (
 	// forms have the same arity, so conflating them is a silent wrong answer
 	// rather than a validation error. It was: the body read parameter 7 as a
 	// gate pointer in BOTH cases, so an overlapping batch set dereferenced
-	// §19's skip COUNT as an address (SETS_PLAN item 20 task 20.B).
+	// the batch skip COUNT as an address.
 	btSufGatePtr = 7 // gated find only: pointer to the caller's gate array
-	btSufSkip    = 7 // overlapping batch only: §19 skip count, already rebased
+	btSufSkip    = 7 // overlapping batch only: batch skip count, already rebased
 )
 
 // btSufEndLocal is the index of this body's one local — the end position the
@@ -380,7 +384,7 @@ func buildSetBTSuffixBody(regions *btSharedRegions,
 	b = append(b, 0x0B) // end if
 
 	if gated {
-		// §3.16, and ONLY §3.16. The driver has already applied the gate
+		// The write-time gate rule, and ONLY that. The driver has already applied the gate
 		// PRE-MASK before calling — that is what validMask carries — so a
 		// second general gate test here is not a refinement, it is a wrong
 		// answer: the gate is a DOUBLED `2s+1` encoding, not a start
@@ -419,7 +423,7 @@ func buildSetBTSuffixBody(regions *btSharedRegions,
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x4A) // out_cap > 0
 	if hasSkip {
-		// §19 resume: the driver rebased the position-level skip onto this
+		// Batch resume: the driver rebased the position-level skip onto this
 		// call's tuple-index space (emitSuffixCall passes `skip - lBase`,
 		// signed). A BT bucket contributes at most ONE tuple, whose local
 		// index is 0, so it is wanted exactly when 0 >= skip — i.e. skip <= 0.
@@ -494,7 +498,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 
 		// gated and skip-carrying are mutually exclusive and mean DIFFERENT
 		// things for parameter 7; passing them as one flag made the body read
-		// §19's skip count as a gate pointer (task 20.B).
+		// the batch skip count as a gate pointer.
 		body := buildSetBTSuffixBody(cs.btRegions, btFnBase+k,
 			cs.patternIDs[bi][0], 0, cs.gatedFind(), cs.suffixHasSkip,
 			tableMemIdx)
@@ -508,12 +512,12 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 	for bi, idx := range btIdx {
 		if cs.scanProbeBodies != nil {
 			cs.scanProbeBodies[bi] = sizePrefixed(
-				buildSetBTProbeBody(cs.btRegions, idx, false, tableMemIdx))
+				buildSetBTProbeBody(cs.btRegions, idx, tableMemIdx))
 		}
 		if cs.scanProbeAnyBodies != nil && cs.anyProbeIdx != nil &&
 			bi < len(cs.anyProbeIdx) && cs.anyProbeIdx[bi] >= 0 {
 			cs.scanProbeAnyBodies[cs.anyProbeIdx[bi]] = sizePrefixed(
-				buildSetBTProbeBody(cs.btRegions, idx, false, tableMemIdx))
+				buildSetBTProbeBody(cs.btRegions, idx, tableMemIdx))
 		}
 	}
 	return out
@@ -551,7 +555,14 @@ func sizePrefixed(body []byte) []byte {
 // function at all. A BT bucket that emitted only one of the two left the other
 // capability's slot EMPTY, which is a function declared but not emitted — a
 // module that fails to parse, and exactly how this was found.
-func buildSetBTProbeBody(regions *btSharedRegions, btFuncIdx int, anchored bool, tableMemIdx int) []byte {
+// There is no `anchored` flavour, and no parameter for one. A Backtracking
+// bucket is admitted by the FIND-path packers only: compileAnchoredBuckets
+// (set.go) has no newBTBucket call, so a pattern BT-rescued for find/scan is
+// simply absent from match_any/match_all — see docs/sets.md "Backtracking
+// members and the anchored pair". The parameter and its full-consumption arm
+// were once dead code that made the exclusion look like an oversight rather
+// than the contract it is.
+func buildSetBTProbeBody(regions *btSharedRegions, btFuncIdx int, tableMemIdx int) []byte {
 	const (
 		pPtr       = 0
 		pStart     = 1
@@ -598,8 +609,7 @@ func buildSetBTProbeBody(regions *btSharedRegions, btFuncIdx int, anchored bool,
 	// A probe's return is a bucket-local bitmask, and a BT bucket holds exactly
 	// one pattern, so its only legal answers are 0 and 1 — every negative value
 	// is therefore unambiguous at the call site, which is what lets the caller
-	// short-circuit on `< 0` without a second channel (SETS_PLAN item 20
-	// decision 3, task 20.D).
+	// short-circuit on `< 0` without a second channel.
 	b = append(b, 0x20, lEnd)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(abi.BTStackOverflow))
@@ -618,18 +628,6 @@ func buildSetBTProbeBody(regions *btSharedRegions, btFuncIdx int, anchored bool,
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
-
-	if anchored {
-		// Full consumption: a match ending before `len` is not an anchored
-		// match.
-		b = append(b, 0x20, lEnd)
-		b = append(b, 0x20, pLen)
-		b = append(b, 0x47)       // i32.ne
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x41, 0x00)
-		b = append(b, 0x0F)
-		b = append(b, 0x0B)
-	}
 
 	b = append(b, 0x41, 0x01) // bit 0
 	b = append(b, 0x0B)       // end function

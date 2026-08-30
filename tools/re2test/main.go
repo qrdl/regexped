@@ -57,10 +57,10 @@ func main() {
 	validateGroups := flag.Bool("validate-groups", false, "enable col0 capture groups validation against Go stdlib and WASM (off by default for re2-exhaustive.txt compatibility)")
 	forceBacktrack := flag.Bool("force-backtrack", false, "force Backtracking engine for match/find/groups (sets MaxDFAStates=-1 so DFA/TDFA always overflow to BT)")
 	setsMode := flag.Bool("sets", false, "test the set capabilities: compile each regexps block's patterns as sets and verify every declared capability against a live Go oracle")
-	setBatch := flag.Bool("set-batch", false, "with --sets, drive `find_batch` ONLY at a buffer capacity of one, so every multi-match position splits and every §19 resume path is taken (default drives capacity 1 and capacity=pattern-count)")
-	setChunk := flag.Int("set-chunk", 32, "with --sets, patterns per compiled set (0 = one set per corpus block, which is what --sets did before §22). The RE2 corpus has 27 blocks of 132..7020 patterns, so without chunking the frontend and id-space thresholds (packed-pair <=16, Teddy <=64, AC >16, wide `_all` >64) are never crossed from below")
+	setBatch := flag.Bool("set-batch", false, "with --sets, drive `find_batch` ONLY at a buffer capacity of one, so every multi-match position splits and every batch resume path is taken (default drives capacity 1 and capacity=pattern-count)")
+	setChunk := flag.Int("set-chunk", 32, "with --sets, patterns per compiled set (0 = one set per corpus block, which is what --sets did originally). The RE2 corpus has 27 blocks of 132..7020 patterns, so without chunking the frontend and id-space thresholds (packed-pair <=16, Teddy <=64, AC >16, wide `_all` >64) are never crossed from below")
 	setShuffle := flag.Bool("set-shuffle", false, "with --sets, deterministically permute a block's patterns before chunking, so a set holds unrelated patterns instead of variations of one generator family")
-	setBT := flag.Int("set-bt", 0, "with --sets, force set members onto the Backtracking fallback engine by capping max_fallback_states at this many DFA states (0 = off, 1 = force everything BT can take). SETS_PLAN item 20: patterns over the limit used to be DROPPED from the set entirely, so this is the only way to exercise BT-backed buckets at corpus scale")
+	setBT := flag.Int("set-bt", 0, "with --sets, force set members onto the Backtracking fallback engine by capping max_fallback_states at this many DFA states (0 = off, 1 = force everything BT can take). Patterns over the limit used to be DROPPED from the set entirely, so this is the only way to exercise BT-backed buckets at corpus scale")
 	setSampleN := flag.Int("sample", 1, "with --sets, test only every Nth chunk (1 = all). This is what separates the sampled gate from the exhaustive run")
 	setSubsetF := flag.Bool("set-subset", false, "with --sets, make each set select a NAMED SUBSET of the chunk's patterns (every second one, from index 1) instead of `patterns: all`; this is the only configuration in which PATTERN_COUNT and ID_SPACE differ, which is what sizes the gate array and the `_all` bitmap")
 	setProfiles := flag.String("set-profiles", "all", "with --sets, comma-separated capability profiles to compile per chunk: all, anchored, scan, scan-any, find, find-ov, batch, batch-ov — or all-profiles")
@@ -442,7 +442,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				// `a|ab` on "ab" finds `a`, spans 0-1, and the span check calls
 				// it "no match", when the anchored answer is a match at 0-2.
 				// That mistake reported 167 false disagreements here, and is
-				// the same trap plans/TODO.md task 54 records costing a
+				// the same trap that once cost a
 				// 2026-08-19 sweep 96 false positives.
 				//
 				// Wrapping in (?: ) leaves capture-group numbering untouched,
@@ -490,7 +490,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				}
 				// col4 (all matches): validate if present.
 				//
-				// TODO task 54 step 1: this is a plain whole-input
+				// This is a plain whole-input
 				// FindAllStringIndex — Go's own answer, and the project's
 				// stated oracle.
 				//
@@ -809,7 +809,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				// the shape col5 never exercises (col5 always calls groups()
 				// at ptr=0): every generated stub's GroupsIter/generator
 				// re-enters at a nonzero ptr after the first match, and a bug
-				// in that composition (task 50: the whole-pattern
+				// in that composition (the whole-pattern
 				// single-capture shortcut left edgeScratchOff at its zero
 				// value instead of -1, so the groups wrapper scribbled an
 				// (origPtr,origEnd) scratch pair over table-memory offset 0
@@ -950,6 +950,15 @@ done:
 		// makes the exit status independent of that bookkeeping.
 		nfailSet = setStats.totalFail()
 		nDataErrors += setStats.dataErrs
+		// Run-level gates: mass drops and systematic timeouts SHRINK what was
+		// checked instead of reporting a wrong answer, so neither moves
+		// setStats.fail and neither used to affect the exit status.
+		// --set-bt deliberately drives BT past its budget, so
+		// the timeout gate is lifted there as well as under --force-backtrack.
+		for _, p := range setStats.gateProblems(forceBacktrack || setBTFallback > 0) {
+			fmt.Printf("  GATE FAILURE: %s\n", p)
+			setGateFailures++
+		}
 	}
 
 	if nDataErrors > 0 {
@@ -961,8 +970,14 @@ done:
 	if nfailSet > 0 {
 		return fmt.Errorf("%d set test(s) failed", nfailSet)
 	}
+	if setGateFailures > 0 {
+		return fmt.Errorf("%d set run-level gate(s) failed", setGateFailures)
+	}
 	return nil
 }
+
+// setGateFailures counts the run-level gates gateProblems reported.
+var setGateFailures int
 
 // setBlockEntry holds one eligible pattern from a regexps block plus its result lines.
 type setBlockEntry struct {
@@ -1050,7 +1065,7 @@ func testSetBlock(
 	// The col4 cross-check below needs Go's FindAll even when no selected
 	// profile drives a gated find, and it is cheap next to the start-position
 	// map. Keeping it on means every run re-validates the corpus column that
-	// --sets compared against before §22, rather than quietly dropping it.
+	// --sets originally compared against, rather than quietly dropping it.
 	needFindAll = true
 
 	timeoutsBefore := setStats.timeouts
@@ -1068,7 +1083,13 @@ func testSetBlock(
 		crossCheckCol4(chunk, testStrings, orc)
 		for _, prof := range profiles {
 			if perr := runSetProfile(engine, wd, chunk, testStrings, orc, prof, hints, verbose); perr != nil {
-				return npass, nfail, stats, perr
+				// The PROFILE and the PATTERNS, not a bare wasmtime backtrace:
+				// a trap names a wasm function index and nothing else, and
+				// finding which of thousands of chunks produced it was a
+				// bisect. The --set-bt gate hit exactly that on
+				// its first run.
+				return npass, nfail, stats, fmt.Errorf("profile %s over %s: %w",
+					prof.name, fmtSetPatterns(chunk.pats), perr)
 			}
 			stats.ran = true
 		}
@@ -1082,7 +1103,7 @@ func testSetBlock(
 // crossCheckCol4 compares the live Go oracle against the corpus's own col4
 // column wherever the corpus has one.
 //
-// This is §22.4's discipline made mechanical. The pre-§22 --sets run compared
+// This is the two-oracle discipline made mechanical. The original --sets run compared
 // the engine against col4; this file computes expectations from Go instead. If
 // the two ever disagree, one of them is wrong and the run must say so — a
 // silent switch of oracle would be exactly the FABLE B42 mistake, where the
@@ -1115,6 +1136,62 @@ func crossCheckCol4(chunk setChunk, strs []string, orc *setOracle) {
 			}
 		}
 	}
+	crossCheckSPM(chunk, strs, orc)
+}
+
+// crossCheckSPM holds the oracle's two halves against each other.
+//
+// findAllByStr comes from Go's FindAllIndex on the RAW pattern; spm comes from
+// the per-position probe `\A(?s:.{p})(?:re-serialised pattern)`. The probe path
+// re-serialises through regexp/syntax (see normalizeSetOraclePattern) while
+// findAll does not, so a round-trip that changed the pattern's meaning would
+// leave the two halves quietly measuring different regexps — and each drive
+// consults only one of them.
+//
+// The invariant: the FIRST span FindAllIndex reports is the span the
+// lowest-position probe finds, because leftmost-first picks the earliest start
+// and then the same extent. Recorded as a DATA error, exactly as the col4
+// disagreement above is.
+func crossCheckSPM(chunk setChunk, strs []string, orc *setOracle) {
+	if orc.findAllByStr == nil || orc.spm == nil {
+		return
+	}
+	for pi := range chunk.pats {
+		if orc.spm[pi] == nil {
+			continue
+		}
+		for si, text := range strs {
+			if si >= len(orc.spm[pi]) || si >= len(orc.findAllByStr[pi]) || hasUnicode(text) {
+				continue
+			}
+			all, spm := orc.findAllByStr[pi][si], orc.spm[pi][si]
+			if len(all) == 0 != (len(spm) == 0) {
+				setStats.dataErrs++
+				setFailf("DATA  set oracle halves disagree on whether %q matches %q: FindAll %d spans, per-position probe %d\n",
+					chunk.pats[pi], text, len(all), len(spm))
+				continue
+			}
+			if len(all) == 0 {
+				continue
+			}
+			if all[0] != spm[0] {
+				setStats.dataErrs++
+				setFailf("DATA  set oracle halves disagree on the first match of %q in %q: FindAll %v, per-position probe %v\n",
+					chunk.pats[pi], text, all[0], spm[0])
+				continue
+			}
+			// The stronger form: replaying the gated selection from 0 over the
+			// per-position map must reproduce FindAllIndex exactly. That is
+			// what licenses spansFrom as the expectation for a drive starting
+			// at a nonzero `from`, where FindAllIndex cannot
+			// be asked directly.
+			if replay := orc.spansFrom(pi, si, 0, false); !col4WasmEqual(replay, all) {
+				setStats.dataErrs++
+				setFailf("DATA  gated replay from 0 disagrees with FindAll for %q in %q: replay %s, FindAll %s\n",
+					chunk.pats[pi], text, fmtCol4(replay), fmtCol4(all))
+			}
+		}
+	}
 }
 
 const wasmCallTimeout = 2 * time.Second
@@ -1133,8 +1210,8 @@ func newWatchdog(eng *wasmtime.Engine) *watchdog {
 		disarm: make(chan struct{}),
 	}
 	go func() {
-		for store := range w.arm {
-			store.SetEpochDeadline(1)
+		// The store itself is not touched here — see Arm.
+		for range w.arm {
 			select {
 			case <-time.After(wasmCallTimeout):
 				eng.IncrementEpoch()
@@ -1147,8 +1224,24 @@ func newWatchdog(eng *wasmtime.Engine) *watchdog {
 	return w
 }
 
-func (w *watchdog) Arm(store *wasmtime.Store) { w.arm <- store }
-func (w *watchdog) Disarm()                   { w.disarm <- struct{}{} }
+// Arm sets the store's epoch deadline ON THE CALLING GOROUTINE, then starts
+// the timer.
+//
+// The deadline used to be set inside the watchdog goroutine, which is a data
+// race on the Store: `w.arm <- store` returns as soon as the goroutine
+// RECEIVES, not after it finishes with the store, so the caller went straight
+// into fn.Call while the goroutine was still inside SetEpochDeadline on that
+// same store. wasmtime.Store is not thread-safe, so that is a race into cgo.
+// tools/fuzz/wasmrun.go fixed this; every set drive here ran through the racy
+// copy.
+//
+// Only eng.IncrementEpoch stays on the goroutine, which is the one operation
+// wasmtime documents as safe to call from another thread.
+func (w *watchdog) Arm(store *wasmtime.Store) {
+	store.SetEpochDeadline(1)
+	w.arm <- store
+}
+func (w *watchdog) Disarm() { w.disarm <- struct{}{} }
 
 // isTimeout reports whether a wasmtime error is an epoch interruption.
 func isTimeout(err error) bool {
@@ -1540,7 +1633,7 @@ func fmtCol6(all [][]int32) string {
 // expectedGroupsAllGo is col6's oracle: Go's own FindAllStringSubmatchIndex
 // over the WHOLE input.
 //
-// TODO task 54 step 1. It used to re-implement the stub iterators' loop over
+// It used to re-implement the stub iterators' loop over
 // text[off:], which made it carry the same two defects as the code it was
 // meant to check — see the col4 oracle above for what (A) and (B) are.
 func expectedGroupsAllGo(re *regexp.Regexp, text string) [][]int32 {

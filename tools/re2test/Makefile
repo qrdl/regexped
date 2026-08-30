@@ -131,6 +131,12 @@ sets: $(TESTDATA)
 	go run . --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 	go run . --sets --set-chunk=4  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 	go run . --sets --set-chunk=0  --set-subset --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	# --set-bt forces set members onto the Backtracking fallback engine
+	# (SETS_PLAN item 20), which is the only way to reach a BT-backed bucket at
+	# corpus scale. It was wired into no target at all, so the item-20 path had
+	# no standing gate (FABLE_REVIEW T3).
+	go run . --sets --set-chunk=8 --sample=250 --set-bt=1 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=0 --set-bt=1 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 
 sets-exhaustive: $(TESTDATA)
 	go run . --sets --set-chunk=8  --set-profiles=all $(TESTDATA)
@@ -142,6 +148,8 @@ sets-exhaustive: $(TESTDATA)
 	go run . --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 	go run . --sets --set-chunk=4  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 	go run . --sets --set-chunk=0  --set-subset --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . --sets --set-chunk=8  --set-bt=1 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=0  --set-bt=1 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 	$(MAKE) set-batch
 
 # The pre-§22 shape: ONE set per corpus block, `find` and `find_batch` only,

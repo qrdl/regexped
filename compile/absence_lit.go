@@ -9,7 +9,7 @@ import (
 // Literal-existence absence prefilter.
 //
 // The G8/G9 preflights only need to know which patterns are PROVEN matchless
-// in [from, len); over-approximating "alive" is documented-safe (§18.4). A
+// in [from, len); over-approximating "alive" is documented-safe. A
 // pattern whose mandatory literal does not OCCUR in that range cannot match
 // there, and that is an exact absence proof — independent of prefixes, word
 // boundaries or context, which is why it is sound to use where the offset-
@@ -25,6 +25,15 @@ const (
 	// a set with any id at or above 64 keeps the union walk rather than
 	// silently dropping those patterns from the proof.
 	absenceMaxPatterns = 64
+	// absenceMaxLits bounds the SEARCH mask, which is a different quantity
+	// from the alive mask and a narrower one: lSearch is an i32 with one bit
+	// per collected literal, so entry 32 and beyond would get `uint32(1)<<i`
+	// == 0 — never in the initial search set, never verified, and therefore
+	// never marked alive. That is the UNSAFE direction (over-
+	// approximating alive is the only safe error), and it is silent. Patterns
+	// past this bound are folded into alwaysAlive instead, which keeps the
+	// prefilter useful and can only over-approximate.
+	absenceMaxLits = 32
 )
 
 // absenceLit pairs a pattern's global id with a literal every match of it must
@@ -134,7 +143,7 @@ func buildAbsenceLits(spec SetSpec) (lits []absenceLit, alwaysAlive uint64, ok b
 		}
 		stripCaptures(parsed)
 		lit := findAbsenceLit(parsed)
-		if len(lit) == 0 {
+		if len(lit) == 0 || len(lits) >= absenceMaxLits {
 			alwaysAlive |= uint64(1) << uint(gid)
 			continue
 		}
@@ -210,7 +219,11 @@ func emitAbsenceVerify(b []byte, cs *compiledSet, lPos, lSearch, aliveLocal, pIn
 // `find` reaches this emitter too and its slot 2 is the i64 cursor. Passing
 // the wrong index there is a validation error rather than a wrong answer, but
 // only because the types happen to differ — treat it as load-bearing.
-func emitLiteralAbsenceMask(b []byte, cs *compiledSet, lPos, lSearch, lMask, lChunk, aliveLocal, fromIdx byte) []byte {
+// lCand holds the candidate position inside the current 16-byte block, so the
+// block's candidate lanes can be DRAINED from one mask instead of the chunk
+// being reloaded and its whole compare chain re-run per candidate. lPos stays
+// the block base throughout. See the drain loop below.
+func emitLiteralAbsenceMask(b []byte, cs *compiledSet, lPos, lSearch, lMask, lChunk, aliveLocal, fromIdx, lCand byte) []byte {
 	const (
 		pInPtr = 0
 		pInLen = 1
@@ -266,14 +279,34 @@ func emitLiteralAbsenceMask(b []byte, cs *compiledSet, lPos, lSearch, lMask, lCh
 	}
 	b = append(b, 0x21, lMask)
 
-	b = append(b, 0x20, lMask, 0x45) // mask == 0 ?
-	b = append(b, 0x04, 0x40)        // if: whole chunk is free of candidates
+	// DRAIN the chunk's candidate lanes, memchr-style: one v128 load and one
+	// compare chain per 16 bytes, then a ctz per candidate.
+	//
+	// It used to advance lPos to the FIRST candidate lane and restart the
+	// outer loop, which reloaded the chunk (now unaligned and overlapping)
+	// and re-ran the whole per-literal compare chain for every candidate. On
+	// input dense in the literals' first bytes that degenerated to
+	// chain-cost x density per byte. Draining is exact: the mask names every
+	// lane whose byte equals some still-searched literal's first byte, and a
+	// literal leaving the search set mid-drain only makes emitAbsenceVerify's
+	// own gate refuse it — the extra lanes cost a failed test, never a wrong
+	// answer.
+	// lPos stays the CHUNK base for the whole drain — lCand carries the
+	// candidate position — so the block advance below is the same single
+	// `lPos += 16` it always was and the drain costs nothing on a chunk with
+	// no candidates.
+	b = append(b, 0x02, 0x40)                    // block $drain_done
+	b = append(b, 0x03, 0x40)                    // loop  $drain
+	b = append(b, 0x20, lMask, 0x45, 0x0D, 0x01) // mask == 0 → br $drain_done
+	b = append(b, 0x20, lPos, 0x20, lMask, 0x68, 0x6A, 0x21, lCand)
+	b = emitAbsenceVerify(b, cs, lCand, lSearch, aliveLocal, pInPtr, pInLen)
+	// mask &= mask - 1: clear the lane just handled.
+	b = append(b, 0x20, lMask, 0x20, lMask, 0x41, 0x01, 0x6B, 0x71, 0x21, lMask)
+	b = append(b, 0x0C, 0x00) // br $drain
+	b = append(b, 0x0B)       // end loop $drain
+	b = append(b, 0x0B)       // end block $drain_done
+
 	b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos)
-	b = append(b, 0x05) // else: verify at the first candidate lane
-	b = append(b, 0x20, lPos, 0x20, lMask, 0x68, 0x6A, 0x21, lPos)
-	b = emitAbsenceVerify(b, cs, lPos, lSearch, aliveLocal, pInPtr, pInLen)
-	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
-	b = append(b, 0x0B) // end if
 
 	b = append(b, 0x0C, 0x00) // br $simd
 	b = append(b, 0x0B)       // end loop $simd

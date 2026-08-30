@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// SETS §23 / G17 foundation: one merged DFA over MORE than 64 patterns, with
+// G17 foundation: one merged DFA over MORE than 64 patterns, with
 // per-state accept LISTS instead of a u64 bitmask.
 //
 // The bitmask caps a bucket at 64 (32 in practice, since every mask on the
@@ -52,7 +52,7 @@ func TestSparseSetMergeExceeds64(t *testing.T) {
 	if d.midAcceptWide == nil {
 		t.Fatal("sparse merge produced no wide accept lists")
 	}
-	// §23.2's budgets, re-asserted here so a future construction change that
+	// The construction budgets, re-asserted here so a future change that
 	// blows them fails loudly rather than silently splitting the bucket again.
 	if tab.numStates > opts.budgetStates() || dfaTableBytes(tab) > opts.budgetBytes() {
 		t.Errorf("merged 128-pattern DFA is over budget: %d states / %d bytes "+

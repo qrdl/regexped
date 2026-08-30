@@ -16,8 +16,8 @@ import (
 //
 // Every one of those is an *emitter or its gate*: when a gate wrongly accepts a
 // shape, the emitter silently produces a body that cannot express it, and the
-// pattern matches wrongly rather than failing to compile (that is the whole of
-// plans/FABLE.md wave 3 — B7, B8, B10, B11). Each case below therefore pins one
+// pattern matches wrongly rather than failing to compile — several past bugs
+// in this family were exactly that. Each case below therefore pins one
 // specific reason a shape is refused or accepted, so a relaxed gate shows up
 // here instead of in the RE2 corpus.
 //
@@ -765,7 +765,7 @@ func TestLitChainAltLenientRejects(t *testing.T) {
 
 // litChainLenAltBody analyses pattern as a lenient alternation and returns the
 // anchored-match body for it, in the leftmost-longest flavour the anchored
-// caller uses (see the analyser's doc comment and FUZZER_BUGS bug 35).
+// caller uses (see the analyser's doc comment).
 func litChainLenAltBody(t *testing.T, pattern string) []byte {
 	t.Helper()
 	altp, ok := analyseLitChainAltLenient(pattern, false)

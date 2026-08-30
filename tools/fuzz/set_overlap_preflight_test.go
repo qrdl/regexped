@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// SETS_PLAN item 11 stage A: the overlapping `find` body runs a once-per-drive
+// The overlapping `find` body runs a once-per-drive
 // preflight and keeps its verdict in the caller's gate array, retiring every
 // pattern that matches NOWHERE at or after the drive's `from`.
 //
@@ -60,7 +60,7 @@ var overlapPreflightInputs = []string{
 // TestOverlappingPreflightMatchesGo drives overlapping `find` to exhaustion and
 // compares against Go's every-start-position enumeration.
 //
-// The oracle is built the way §22 builds its own: per pattern, an anchored
+// The oracle is built the way the corpus harness builds its own: per pattern, an anchored
 // probe at every start, which is exactly what `overlapping: true` promises.
 // Comparing against `FindAllIndex` would be wrong — that is the GATED rule.
 func TestOverlappingPreflightMatchesGo(t *testing.T) {
@@ -151,7 +151,7 @@ func TestOverlappingPreflightRunsOncePerDrive(t *testing.T) {
 	if len(zero) != 0 {
 		t.Fatalf("after the first call of a drive, gate slots %v are still zero — "+
 			"the preflight guard will re-arm and the pass will run on EVERY call, "+
-			"which is the failure SETS_PLAN item 11's attempt log recorded", zero)
+			"which is the failure an earlier attempt recorded", zero)
 	}
 }
 

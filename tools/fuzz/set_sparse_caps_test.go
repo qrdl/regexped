@@ -10,7 +10,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// G17 promotion for the ANCHORED and FALLBACK packers (SETS_PLAN item 1 /
+// G17 promotion for the ANCHORED and FALLBACK packers (
 // item 8).
 //
 // The shared-literal find packer got sparse accept first; these are the two
@@ -29,7 +29,7 @@ import (
 // wide ABI over the same code is covered by TestSparsePromotionWideAll.
 
 // sparseFamilies generate patterns that share enough structure for the merged
-// DFA to stay inside §23.2's budgets. That constraint is real rather than
+// DFA to stay inside the construction budgets. That constraint is real rather than
 // incidental: 128 mutually unrelated patterns merge to a 416-state u16 table of
 // 213 KB against a 64 KB budget, and promoteSparseBuckets correctly refuses it.
 var sparseFamilies = []struct {
@@ -160,7 +160,7 @@ func TestSparsePromotionCapabilities(t *testing.T) {
 	}
 }
 
-// TestSparsePromotionRefusal pins the other half of §23.4's contract: a merge
+// TestSparsePromotionRefusal pins the other half of that contract: a merge
 // that misses the state or byte budget must be REFUSED, leaving the ordinary
 // split packing in place, because a bucket the emitters cannot serve is worse
 // than a bucket that costs an extra walk.

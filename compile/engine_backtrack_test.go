@@ -228,7 +228,7 @@ func TestBTCompileDeterminism(t *testing.T) {
 // TestBTMemoInitNeedsBitState exercises the BitState memo-init path in
 // buildBacktrackBody (memo locals + bitset zero-init/memory.fill, gated on
 // needsBitState) — the test plan T19. ((a?)*?) has a nested capture group ((a?)
-// inside the outer capture), so MaxCap()==2 — task 41's whole-pattern-
+// inside the outer capture), so MaxCap()==2 — the whole-pattern-
 // single-capture shortcut (which requires MaxCap()==1) does not intercept
 // it, unlike its close cousin ((?:a?)+?) — confirmed live via
 // isWholePatternSingleCapture/isAnchoredFind probing.
@@ -249,7 +249,7 @@ func TestBTNonLoopAltPushContinue(t *testing.T) {
 // wantBoundary=false fail-if-boundary-present logic in btWordBoundary —
 // the test plan T21. A second capture group ((c)) is added to the doc's original
 // (a)\B suggestion: confirmed live that (a)\B alone (MaxCap==1, one capture
-// spanning past a zero-width-only assertion) trips task 41's whole-pattern-
+// spanning past a zero-width-only assertion) trips the whole-pattern-
 // single-capture shortcut and never reaches BT capture compilation at all;
 // the second group makes isWholePatternSingleCapture reject it.
 func TestBTWordBoundaryFalse(t *testing.T) {
@@ -260,7 +260,7 @@ func TestBTWordBoundaryFalse(t *testing.T) {
 // reachable when the NFA program contains an InstNop (emitted by
 // regexp/syntax.Compile for an empty alternation branch) — the test plan T22. As
 // with T21, a second capture group is added: (a|)\B alone (MaxCap==1) trips
-// the task 41 shortcut (confirmed live), so (a|)\B(c) is used instead —
+// the whole-pattern shortcut (confirmed live), so (a|)\B(c) is used instead —
 // confirmed live to still produce an InstNop instruction and route to
 // Backtracking.
 func TestBTInstNop(t *testing.T) {
@@ -356,7 +356,7 @@ func TestBTFindMandatoryLitCluster(t *testing.T) {
 // loopBodyCanMatchEmpty for a loop body with path reconvergence before
 // reaching loopPC (two ?-quantified sub-terms in sequence, where both arms
 // of the first rejoin before the second) — the test plan T27. ((a?b?)*?) has a
-// nested capture, so MaxCap()==2 and task 41's single-capture shortcut
+// nested capture, so MaxCap()==2 and the single-capture shortcut
 // (confirmed live) does not intercept it.
 func TestLoopBodyCanMatchEmptyVisitedGuard(t *testing.T) {
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: "((a?b?)*?)", GroupsFunc: "g"}})

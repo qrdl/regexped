@@ -2,7 +2,7 @@ package compile
 
 import "github.com/qrdl/regexped/internal/utils"
 
-// ── The find-from channel (TODO task 54 half A) ──────────────────────────────
+// ── The find-from channel ──────────────────────────────
 //
 // Every exported single-pattern find takes a `from` position, so that
 // iterating a pattern over an input re-enters with the WHOLE buffer and a
@@ -24,7 +24,7 @@ import "github.com/qrdl/regexped/internal/utils"
 //   - A table-memory SCRATCH SLOT (the shape B13 used for winScratchOff) has
 //     a per-pattern address whose Go zero value — 0 — is a real, writable
 //     table offset. That defect landed twice in one attempt, and is the same
-//     class as task 50's edgeScratchOff.
+//     class as the edgeScratchOff.
 //
 // A global has neither failure mode. The index is a package constant, so
 // there is no per-pattern address to forget to initialise, and a body that
@@ -101,14 +101,20 @@ func (m findFromMode) String() string {
 func emitFindFromSeed(b []byte, attemptStartLocal byte) ([]byte, findFromMode) {
 	b = append(b, 0x23) // global.get
 	b = utils.AppendULEB128(b, findFromGlobalIdx)
-	b = append(b, 0x21, attemptStartLocal) // local.set attempt_start
+	b = append(b, 0x21)
+	// LEB128, not a raw byte. Local indices above 0x7F need a continuation
+	// byte, and writing one raw produced a truncated index the validator
+	// accepts as a DIFFERENT local. No emitter is near 128 locals today, which
+	// is exactly why this would be found late.
+	b = utils.AppendULEB128(b, uint32(attemptStartLocal))
 	return b, ffNative
 }
 
 // emitFindFromSet appends `global.set find_from, <local>`.
 func emitFindFromSet(b []byte, srcLocal byte) []byte {
-	b = append(b, 0x20, srcLocal) // local.get src
-	b = append(b, 0x24)           // global.set
+	b = append(b, 0x20)
+	b = utils.AppendULEB128(b, uint32(srcLocal)) // local.get src — see emitFindFromSeed
+	b = append(b, 0x24)                          // global.set
 	b = utils.AppendULEB128(b, findFromGlobalIdx)
 	return b
 }
@@ -229,12 +235,23 @@ func appendFindFromWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMod
 	return append(cs, body...)
 }
 
-// anyFindFunc reports whether any pattern in the module contributes a find
-// function, and therefore whether the module must declare the find-from
+// moduleUsesFindFrom reports whether any function in the module touches the
+// find-from channel, and therefore whether the assemblers must declare the
 // global.
-func anyFindFunc(patterns []*compiledPattern) bool {
+//
+// It is not simply "does any pattern have a find function". A groups-only
+// pattern on a lit-chain A.3 path has none at all, yet its capture body reads
+// the channel (it SCANS) and its exported wrapper writes it.
+// Declaring the global is what keeps that pairing a load-time WASM validation
+// question rather than a silent read of the wrong thing.
+func moduleUsesFindFrom(patterns []*compiledPattern) bool {
 	for _, p := range patterns {
 		if p.hasFindFunc() {
+			return true
+		}
+		// The anchored-zero-only groups wrapper answers from != 0 itself and
+		// never touches the channel; every other groups wrapper writes it.
+		if p.hasGroupsFromWrapper() && p.captureFromMode != ffAnchoredZeroOnly {
 			return true
 		}
 	}
@@ -358,4 +375,38 @@ func appendGroupsFromWrapperCodeEntry(cs []byte, innerFuncIdx int, anchoredOnly 
 	body := buildGroupsFromWrapperBody(innerFuncIdx, anchoredOnly)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
+}
+
+// assertGroupsFromWrapperMode enforces the one precondition the non-anchored
+// groups-from wrapper has and cannot check for itself.
+//
+// The wrapper writes the find-from channel and then calls the composed
+// (find, capture) wrapper, which calls the find BODY with the whole
+// (ptr, len). That is correct only for an ffNative body — one that reads the
+// channel. An ffLegacyNarrow body ignores it and scans from 0, so
+// groups(from > 0) would report a match BEFORE `from` with no error anywhere:
+// "wrong-but-safe" for the find export (whose wrapper narrows and rebases)
+// is plain wrong for groups.
+//
+// buildFindBody has a documented ffLegacyNarrow fallback. Today every emitter
+// returns ffNative, so this never fires — but the whole point of the mode
+// machinery is that a missed emitter is a BUILD failure (see the findFromMode
+// doc above), and this is exactly the hole where the failure would otherwise
+// be silent wrong answers.
+func assertGroupsFromWrapperMode(p *compiledPattern, anchoredOnly bool) {
+	if anchoredOnly {
+		// The export IS captureBody; the channel is not consulted at all.
+		return
+	}
+	mode, what := p.findFromMode, "find body"
+	if p.anchored {
+		// captureBody IS the export; the channel reaches it directly.
+		mode, what = p.captureFromMode, "capture body"
+	}
+	if mode != ffNative {
+		panic("compile: pattern exports groups over a non-native " + what +
+			" (findFromMode " + mode.String() + ") — the groups-from wrapper " +
+			"seeds the find-from channel, which only an ffNative body reads " +
+			"(see find_from.go)")
+	}
 }

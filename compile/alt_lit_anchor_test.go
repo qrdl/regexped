@@ -79,7 +79,7 @@ func TestFindAltLitAnchorPoints(t *testing.T) {
 	})
 }
 
-// TestCompileAltLitAnchorDispatch exercises the full Task 6 v1 pipeline —
+// TestCompileAltLitAnchorDispatch exercises the full alt-lit-anchor pipeline —
 // compileAltLitAnchorBranches, buildAltLitAnchorFindBody, and
 // compiledPattern.altLitAnchorBranchFuncIdx (all 0% covered without this) —
 // by compiling a find-only alternation whose branches have an UNBOUNDED

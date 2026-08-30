@@ -15,9 +15,9 @@ import (
 
 // find_batch: several consecutive positions per call, resumed by cursor.
 //
-// The oracle is the same one the gated `find` target uses (§9.6.1): Go's
+// The oracle is the same one the gated `find` target uses: Go's
 // FindAllIndex per pattern, tagged with the pattern id. Deriving a reference
-// from §19's own cursor arithmetic would only prove the emitter agrees with
+// from the emitter's own cursor arithmetic would only prove it agrees with
 // itself.
 //
 // What makes this target sharp is the out_cap sweep. Batching is only
@@ -65,7 +65,7 @@ func runBatchFind(t *testing.T, pats []string, input string, outCap int32, overl
 // batchRunner holds one compiled, instantiated set so a caller can drive it
 // many times.
 //
-// The module owns NO state across calls — SETS.md §3.15 — so every drive is
+// The module owns NO state across calls — see docs/sets.md — so every drive is
 // independent as long as it re-zeroes the caller-owned arrays, which drive()
 // does. That is the contract, so exercising it this way is a check on the
 // contract as well as a way to compile once instead of ten times.
@@ -99,8 +99,7 @@ func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool)
 		// learned this the hard way — see isResourceCeiling's own comment
 		// about FuzzSet/40f883ef54d47f63 — and the batch target simply never
 		// inherited the skip, so `\baa00\b` beside a pattern whose suffix
-		// blows the DFA state limit reported as a fuzz failure
-		// (FUZZER_BUGS 64).
+		// blows the DFA state limit reported as a fuzz failure.
 		if isResourceCeiling(err) {
 			t.Skip("resource ceiling")
 		}
@@ -127,7 +126,7 @@ func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool)
 	}
 	gatePtr := inBase + span
 	outPtr := gatePtr + pageSize
-	// SETS_PLAN item 11 stage C's answer cache, offered only when the caller
+	// The overlapping answer cache, offered only when the caller
 	// asks. Sized at the sweep's own worst case so "too small" is never the
 	// reason a drive declines — that path has its own test.
 	cachePtr := outPtr + pageSize
@@ -159,7 +158,7 @@ func (r *batchRunner) drive(t *testing.T, outCap int32, withCache bool) []setMat
 	pats, input := r.pats, r.input
 	inBase, gatePtr, outPtr := r.inBase, r.gatePtr, r.outPtr
 
-	// Every drive starts from a zeroed gate array — §3.14's contract — and,
+	// Every drive starts from a zeroed gate array — the gate contract — and,
 	// when one is offered, a zeroed cache header.
 	buf := mem.UnsafeData(store)
 	for i := int32(0); i < int32(4*len(pats)); i++ {
@@ -188,7 +187,7 @@ func (r *batchRunner) drive(t *testing.T, outCap int32, withCache bool) []setMat
 			t.Fatalf("%v on %q cap=%d: find_batch did not terminate after %d calls",
 				pats, input, outCap, calls)
 		}
-		// One signature for both flavours since SETS_PLAN item 11: the
+		// One signature for both flavours: the
 		// overlapping entry records no match gates but takes the array as the
 		// per-drive home of its preflight verdict.
 		res, err := fn.Call(store, inBase, int32(len(input)), cursor,
@@ -236,7 +235,7 @@ func checkBatch(t *testing.T, pats []string, input string) {
 		}
 		// BOTH engines behind the one export. Declining the cache drives the
 		// ordinary per-position walk; offering it lets the drive switch to
-		// SETS_PLAN item 11 stage C's backward sweep once its own work says
+		// the backward sweep once its own work says
 		// the walk is expensive. They are two implementations of one
 		// contract, and only running both can tell them apart — an answer
 		// that matches the oracle says nothing about which produced it.

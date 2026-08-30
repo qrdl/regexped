@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -484,5 +485,96 @@ func TestSectionParsersSurviveEveryTruncation(t *testing.T) {
 				}()
 			}
 		})
+	}
+}
+
+// hugeULEB is the 10-byte ULEB128 encoding of 1<<63 — a legal LEB128 whose
+// value has bit 63 set. Converted to a Go `int` it is NEGATIVE, which is what
+// made every `off + int(size)` bounds check fail open before
+func hugeULEB() []byte {
+	return []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}
+}
+
+// TestParsersRejectOversizedLengths feeds each reader a module whose SECTION
+// size, and then whose SEGMENT size, is that value.
+//
+// The contract is the truncation sweep's: an answer or an error, never a
+// panic. Before the fix, section ids 5/6/11 sliced raw[off:secEnd] with
+// secEnd < off (an inverted-bounds panic) and every other id set off negative
+// (an out-of-range index).
+func TestParsersRejectOversizedLengths(t *testing.T) {
+	var segs []byte
+	segs = AppendULEB128(segs, 1)
+	segs = append(segs, activeSegment(4096, []byte("payload!"))...)
+
+	cases := map[string][]byte{}
+
+	// A data section whose declared size is 1<<63.
+	m := wasmHeader()
+	m = append(m, 11)
+	m = append(m, hugeULEB()...)
+	m = append(m, segs...)
+	cases["section size 1<<63"] = m
+
+	// A well-sized data section holding a segment whose payload length is 1<<63.
+	var badSeg []byte
+	badSeg = AppendULEB128(badSeg, 1)
+	badSeg = append(badSeg, 0x00, 0x41)
+	badSeg = AppendSLEB128(badSeg, 4096)
+	badSeg = append(badSeg, 0x0B)
+	badSeg = append(badSeg, hugeULEB()...)
+	badSeg = append(badSeg, "payload!"...)
+	cases["segment size 1<<63"] = section(wasmHeader(), 11, badSeg)
+
+	// The same, on the explicit-memory-index segment flavour.
+	var badSeg2 []byte
+	badSeg2 = AppendULEB128(badSeg2, 1)
+	badSeg2 = append(badSeg2, 0x02, 0x01, 0x41)
+	badSeg2 = AppendSLEB128(badSeg2, 4096)
+	badSeg2 = append(badSeg2, 0x0B)
+	badSeg2 = append(badSeg2, hugeULEB()...)
+	badSeg2 = append(badSeg2, "payload!"...)
+	cases["segment size 1<<63, memidx form"] = section(wasmHeader(), 11, badSeg2)
+
+	dir := t.TempDir()
+	for name, mod := range cases {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked: %v", r)
+				}
+			}()
+			_, _ = ParseDataSectionBytes(mod)
+			path := filepath.Join(dir, "t.wasm")
+			if err := os.WriteFile(path, mod, 0o644); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			_, _ = WasmMemTop(path)
+			_, _ = WasmTableBase(path)
+		})
+	}
+}
+
+// TestLEBDecodersRejectOverlongPayloads pins the other half of K1: a tenth
+// LEB128 byte whose payload bits would be shifted out of the 64-bit result is
+// refused rather than silently truncated.
+func TestLEBDecodersRejectOverlongPayloads(t *testing.T) {
+	// 0x02 in the tenth byte carries bit 1, which lands at bit 64.
+	bad := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02}
+	if _, _, err := DecodeULEB128(bad); err == nil {
+		t.Error("DecodeULEB128 accepted a payload bit above 63")
+	}
+	if _, _, err := DecodeSLEB128(bad); err == nil {
+		t.Error("DecodeSLEB128 accepted a payload bit above 63")
+	}
+	// The canonical 10-byte encodings still round-trip.
+	for _, v := range []int64{math.MinInt64, math.MaxInt64, -1, 0, 1} {
+		got, _, err := DecodeSLEB128(AppendSLEB128_64(nil, v))
+		if err != nil || got != v {
+			t.Errorf("DecodeSLEB128 round-trip of %d: got %d, %v", v, got, err)
+		}
+	}
+	if got, _, err := DecodeULEB128(hugeULEB()); err != nil || got != 1<<63 {
+		t.Errorf("DecodeULEB128(1<<63): got %d, %v", got, err)
 	}
 }

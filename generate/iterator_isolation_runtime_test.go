@@ -12,7 +12,7 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// TODO 58 / SETS_PLAN item 4 gave every live JS/TS call its own input and
+// Per-call regions give every live JS/TS call its own input and
 // scratch region. iterator_isolation_test.go pins the SHAPE of that fix in the
 // generated source — `_open`/`_close` pairs, no module-level staging address,
 // `_att` guards, no hoisted views.

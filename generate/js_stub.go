@@ -15,11 +15,15 @@ func jsStub(cfg config.BuildConfig, out string) error {
 	if err != nil {
 		return fmt.Errorf("generate JS stub: %w", err)
 	}
+	// Applied BEFORE the stdout/file branch, not on the file branch alone:
+	// a user piping `-o -` into a build must get the same symbols the file
+	// output has.
+	content = applyNamespace(cfg, "js", content)
 	if out == "-" {
 		_, err := os.Stdout.WriteString(content)
 		return err
 	}
-	return writeStub(out, []byte(applyNamespace(cfg, "js", content)))
+	return writeStub(out, []byte(content))
 }
 
 // genJSSetSection returns JS set wrappers appended to the module body.
@@ -37,15 +41,15 @@ func genJSSetSection(cfg config.BuildConfig) string {
 	out.WriteString("//\n")
 	out.WriteString("// Calling other stub functions while an iterator is suspended is SAFE: each\n")
 	out.WriteString("// live iterator owns its input and scratch region for its whole lifetime,\n")
-	out.WriteString("// the same guarantee the Rust and Go stubs get from passing a host pointer\n")
-	out.WriteString("// (TODO 58 / SETS_PLAN item 4).\n\n")
+	out.WriteString("// the same guarantee the Rust and Go stubs get from passing a host pointer.\n")
+	out.WriteString("\n")
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := camelSet(s.Name) + "PatternCount"
 		idN := idSpaceSize(s, cfg)
 		idKonst := camelSet(s.Name) + "IdSpace"
 		wide := wideAllForm(s, cfg)
-		// §4.9 standalone layout, all above _outBase: the tuple buffer
+		// Standalone layout, all above _outBase: the tuple buffer
 		// (12 bytes x pattern count), then the gate array (4 bytes x ID
 		// SPACE), then the >64-pattern bitmap (ceil(idSpace/8)). The two
 		// counts differ for a set that selects a named subset — see
@@ -53,6 +57,18 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		reserve := 12*n + 4*idN + bitmapBytes(s, cfg)
 		gateBase := fmt.Sprintf("_outBase + 12*%s", konst)
 		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
+
+		// Argument ORDER comes from the R12 descriptor, not from the templates
+		// below — the one place the compiler's ABI is written down
+		//. Only the SPELLING of each parameter is decided
+		// here; `args` names the list for one capability.
+		caps := setCapabilities(s, cfg)
+		spell := jsArgSpelling{
+			inPtr: "_inBase", inLen: "len", from: "from",
+			gate: gateBase, bitmap: "bitmapBase",
+			tuple: "_outBase", outCap: konst, cursor: "cursor",
+		}
+		args := func(kind string) string { return spellJSArgs(capByKind(caps, kind), spell) }
 
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the find generator\n// can receive at most this many matches at one position.\nexport const %s = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s = %d;\n\n", s.Name, idKonst, idN)
@@ -66,14 +82,14 @@ func genJSSetSection(cfg config.BuildConfig) string {
 			fmt.Fprintf(&out, `// -> number | null   (a pattern id, NOT a boolean)
 export function %s(input) {
     const [_inBase, _outBase, len] = _stage(input, 0);
-    const id = _exp['%s'](_inBase, len);
+    const id = _exp['%s'](%s);
     // Tested EXACTLY, not as "negative": -1 is a real answer (nothing matched)
     // and the sentinel means the engine gave up. Folding the two — which this
     // did — turns "unknown" into a confident null.
     if (id === %d) throw new Error("%s");
     return id < 0 ? null : id;
 }
-`, s.MatchAny, s.MatchAny, btOverflow, btOverflowMsg(s.MatchAny))
+`, s.MatchAny, s.MatchAny, args("match_any"), btOverflow, btOverflowMsg(s.MatchAny))
 		}
 		if s.MatchAll != "" {
 			if wide {
@@ -82,7 +98,7 @@ export function %s(input) {
     const [_inBase, _outBase, len] = _stage(input, %d);
     const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
-    const n = _exp['%s'](_inBase, len, bitmapBase);
+    const n = _exp['%s'](%s);
     // -2 is UNKNOWN, not "nothing matched". The anchored path never probes a
     // Backtracking member today, so this cannot fire; it is here so that a
     // future one cannot fail silently.
@@ -92,35 +108,37 @@ export function %s(input) {
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, btOverflow, btOverflowMsg(s.MatchAll), idKonst, idKonst)
+`, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, args("match_all"), btOverflow, btOverflowMsg(s.MatchAll), idKonst, idKonst)
 			} else {
 				fmt.Fprintf(&out, `// -> number[]   (pattern ids, NOT a boolean)
 export function %s(input) {
     const [_inBase, _outBase, len] = _stage(input, 0);
     // The export returns an i64, which surfaces as a BigInt; it is decomposed
     // here and never reaches the caller.
-    let mask = _exp['%s'](_inBase, len);
-    // The narrow form's return IS the bitmask, so the sentinel is tested
-    // before it is treated as one: -2n reads as "every id except 0 matched".
-    if (mask === %dn) throw new Error("%s");
+    let mask = _exp['%s'](%s);
+    // NO overflow sentinel here: the narrow form's return IS the bitmask, so
+    // every 64-bit value is a legal answer. -2n means ids 1..63 matched and id
+    // 0 did not, which a sentinel test would report as an engine failure. The
+    // real sentinel cannot reach this form — a Backtracking member forces the
+    // wide one.
     const out = [];
     for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
     return out;
 }
-`, s.MatchAll, s.MatchAll, btOverflow, btOverflowMsg(s.MatchAll), idKonst)
+`, s.MatchAll, s.MatchAll, args("match_all"), idKonst)
 			}
 		}
 		if s.ScanAny != "" {
 			fmt.Fprintf(&out, `// -> pattern id | null   (NOT a boolean, and NO position)
 export function %s(input, from = 0) {
     const [_inBase, _outBase, len] = _stage(input, 0);
-    const id = _exp['%s'](_inBase, len, from);
+    const id = _exp['%s'](%s);
     // -2 is the Backtracking engine giving up: the result is UNKNOWN, not "no
     // match". Compared exactly, since -1 — a real no-match — is next door.
     if (id === %d) throw new Error("%s");
     return id < 0 ? null : id;
 }
-`, s.ScanAny, s.ScanAny, btOverflow, btOverflowMsg(s.ScanAny))
+`, s.ScanAny, s.ScanAny, args("scan_any"), btOverflow, btOverflowMsg(s.ScanAny))
 		}
 		if s.ScanAll != "" {
 			if wide {
@@ -129,7 +147,7 @@ export function %s(input, from = 0) {
     const [_inBase, _outBase, len] = _stage(input, %d);
     const bitmapBase = %s;
     new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
-    const n = _exp['%s'](_inBase, len, from, bitmapBase);
+    const n = _exp['%s'](%s);
     // -2 is UNKNOWN, not an empty result: a Backtracking member gave up. The
     // narrow form has no room to say this — its i64 return IS the bitmask — so
     // a BT member is exactly what forces this wide form.
@@ -139,25 +157,27 @@ export function %s(input, from = 0) {
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
 }
-`, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, btOverflow, btOverflowMsg(s.ScanAll), idKonst, idKonst)
+`, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, args("scan_all"), btOverflow, btOverflowMsg(s.ScanAll), idKonst, idKonst)
 			} else {
 				fmt.Fprintf(&out, `// -> number[]   (pattern ids, NOT a boolean)
 export function %s(input, from = 0) {
     const [_inBase, _outBase, len] = _stage(input, 0);
-    let mask = _exp['%s'](_inBase, len, from);
-    // The narrow form's return IS the bitmask, so the sentinel is tested
-    // before it is treated as one: -2n reads as "every id except 0 matched".
-    if (mask === %dn) throw new Error("%s");
+    let mask = _exp['%s'](%s);
+    // NO overflow sentinel here: the narrow form's return IS the bitmask, so
+    // every 64-bit value is a legal answer. -2n means ids 1..63 matched and id
+    // 0 did not, which a sentinel test would report as an engine failure. The
+    // real sentinel cannot reach this form — a Backtracking member forces the
+    // wide one.
     const out = [];
     for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
     return out;
 }
-`, s.ScanAll, s.ScanAll, btOverflow, btOverflowMsg(s.ScanAll), idKonst)
+`, s.ScanAll, s.ScanAll, args("scan_all"), idKonst)
 			}
 		}
 		if s.Find != "" {
 			// Every set with `find` owns a gate array, overlapping included
-			// (SETS_PLAN item 11), so this is unconditional.
+			//, so this is unconditional.
 			gateSetup := fmt.Sprintf(`    const gateBase = %s;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, gateBase, idKonst)
@@ -183,7 +203,7 @@ export function %s(input, from = 0) {
     while (true) {
         // The buffer is sized at the set's pattern count, the exact worst case
         // for a single position, so n can never exceed it.
-        const n = _exp['%s'](_inBase, len, pos, %s_outBase, %s);
+        const n = _exp['%s'](%s);
         // -2 is UNKNOWN, not a count: a Backtracking member gave up here. It
         // has to be tested before the break below, which reads every
         // non-positive n as a clean end of scan.
@@ -202,7 +222,11 @@ export function %s(input, from = 0) {
     }
     } finally { _close(); }
 }
-`, gateDoc, s.Find, reserve, gateSetup, konst, s.Find, gateArg, konst,
+`, gateDoc, s.Find, reserve, gateSetup, konst, s.Find,
+					spellJSArgs(capByKind(caps, "find"), jsArgSpelling{
+						inPtr: "_inBase", inLen: "len", from: "pos",
+						gate: gateBase, tuple: "_outBase", outCap: konst,
+					}),
 					btOverflow, btOverflowMsg(s.Find), konst, konst)
 			} else {
 				// `hints: [batch-find]`: the same matches in the same order,
@@ -210,10 +234,16 @@ export function %s(input, from = 0) {
 				// the ONLY difference, which is why it is a parameter rather
 				// than a second function — and why it is opt-in, since a
 				// caller who stops early has paid for matches never looked at.
+				// The BATCH entry's argument order stays spelled out here:
+				// setCapabilities describes the five DECLARED capabilities,
+				// and batching is a hint rather than one, so it has no
+				// descriptor entry to derive from. Its
+				// signature is pinned instead by
+				// compile/set_emit.go's setTypeBatchGated and the goldens.
 				batchGateSetup := fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, idKonst)
-				// SETS_PLAN item 11 stage C. An OVERLAPPING drive reports
+				// The overlapping answer cache. An OVERLAPPING drive reports
 				// every start position, so a pattern whose automaton never
 				// dies is quadratic: each position walks to the end of the
 				// input. Handing the engine a cache lets it sweep once,
@@ -313,6 +343,12 @@ export function %s(input, from = 0) {
 // for loading the WASM file and passing the bytes (or a WebAssembly.Module)
 // to the exported init() function before calling any matcher.
 func genJSStubFile(cfg config.BuildConfig) (string, error) {
+	// A config with no exports gets NO FILE, matching the other four
+	// generators. It used to get a module of dead `_align`/`_grow`/`_stage`
+	// helpers and nothing to call them.
+	if !anyStubExport(cfg) {
+		return "", nil
+	}
 	// Determine whether any entry needs a slots buffer (groups/named_groups).
 	var sb strings.Builder
 	sb.WriteString("// Auto-generated by regexped. Do not edit.\n\n")
@@ -352,7 +388,7 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	// A generator stages its input, yields, and resumes — and anything the
 	// caller ran in between had written its own input over the top, so the scan
 	// continued across another string's bytes and reported offsets against it.
-	// Silently: no exception, plausible output (TODO 58 / SETS_PLAN item 4).
+	// Silently: no exception, plausible output.
 	//
 	// The merged-mode targets never had this. Rust passes `input.as_ptr()` and
 	// Go `unsafe.SliceData(input)`, so each live input already sits at its own
@@ -446,7 +482,9 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 }
 
 // genJSMatchFunc generates a JS export for an anchored match.
-// Returns [endPos, true] on match, or [0, false] if no match.
+// The generated function returns the end position, or null if no match — the
+// doc here used to say `[endPos, true]` / `[0, false]`, a tuple shape the code
+// has never produced.
 func genJSMatchFunc(funcName string) string {
 	return fmt.Sprintf(`// %s — anchored match; returns the end position, or null if no match.
 export function %s(input) {
@@ -560,6 +598,11 @@ export function* %[1]s(input, offset = 0) {
     if (_batched) {
         let outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
         let startPos = offset;
+        // Kept ACROSS calls, exactly as the find batch loop does. The in-WASM
+        // wrapper suppresses empty-adjacent matches only within one call, so a
+        // batch that fills ending on a non-empty match at p resumes at p and
+        // would report an empty match at p that Go suppresses.
+        let prevEnd = -1;
         while (true) {
             const n = _exp['%[1]s_batch'](_inBase, len, _outBase, %[2]d, startPos);
             if (n === %[7]d) throw new Error("%[8]s");
@@ -569,6 +612,9 @@ export function* %[1]s(input, offset = 0) {
                 // and a grow there detaches every view in the module.
                 outBuf = _att(outBuf, Int32Array, _outBase, %[2]d * %[3]d);
                 const base = i * %[3]d;
+                const ms = outBuf[base], me = outBuf[base + 1];
+                if (ms === me && ms === prevEnd) continue;
+                prevEnd = me;
                 const result = [];
                 for (let g = 0; g < %[5]d; g++) {
                     const s = outBuf[base + 2 + g * 2], e = outBuf[base + 2 + g * 2 + 1];
@@ -595,9 +641,12 @@ export function* %[1]s(input, offset = 0) {
         const r = _exp['%[1]s'](_inBase, len, _outBase, off);
         if (r === %[7]d) throw new Error("%[8]s");
         if (r < 0) {
-            if (off === len) break;
-            off++;
-            continue;
+            // Terminal, not "try the next position": the groups
+            // export has SCAN-FROM semantics in both wrapper arms, so a
+            // negative result means there is no match at or after off. The
+            // advance-by-one retry this replaced re-scanned the tail once per
+            // remaining byte.
+            break;
         }
         const matchEnd = slots[1] >= 0 ? slots[1] : slots[0];
         const result = [];
@@ -621,7 +670,7 @@ export function* %[1]s(input, offset = 0) {
 }
 
 // genJSGroupIndices emits the name→index object for a groups function.
-// Replaces the retired `named_groups_func` (TODO task 62).
+// Replaces the retired `named_groups_func`.
 //
 // One frozen object rather than loose constants: that is how modern JS groups
 // related values, `Object.keys` then covers name enumeration, and it needs no
@@ -645,7 +694,12 @@ export const %s = Object.freeze({
 		if name == "" {
 			continue
 		}
-		fmt.Fprintf(&out, "    %s: %d,\n", name, idx)
+		// QUOTED. Go's regexp/syntax accepts digit-leading group names —
+		// `(?P<1a>x)` parses — and a bare `1a:` key is a SyntaxError that
+		// takes the whole generated module down with it. %q is valid for
+		// every key, keeps Object.keys() behaviour, and leaves TS's `as const`
+		// literal types intact.
+		fmt.Fprintf(&out, "    %q: %d,\n", name, idx)
 	}
 	out.WriteString("});\n\n")
 	return out.String()

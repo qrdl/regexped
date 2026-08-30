@@ -367,7 +367,8 @@ type CompileOptions struct {
 	ForceEngine   EngineType // If non-zero, skip engine selection and use this engine type
 	LeftmostFirst bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 	// LikelyMode hints which suffix-DFA structural optimisation to favour.
-	// Currently no-op; reserved for the the LikelyMode design fast-accept / fast-reject paths.
+	// Currently no-op; reserved for the LikelyMode design's fast-accept /
+	// fast-reject paths.
 	LikelyMode LikelyMode
 	// CompiledDFAThreshold is the maximum minimised WASM state count for which the
 	// compiled dispatch path (EngineCompiledDFA) is used instead of the table-driven
@@ -393,7 +394,20 @@ type compiledPattern struct {
 	findExport   string // empty = internal-only (for wrapper use)
 	groupsExport string
 
-	anchored   bool     // true = pattern anchored at 0; no wrapper needed
+	// anchored means "captureBody IS the exported groups function" — no
+	// find+capture wrapper composition. On the DFA/TDFA/BT paths it also
+	// implies the body can only match at position 0. It does NOT on the
+	// lit-chain A.3 paths, whose capture body is a non-anchored
+	// find-with-captures that scans; captureFromMode records which.
+	anchored bool
+	// captureFromMode records how captureBody receives `from` when it is
+	// itself the export (anchored). ffAnchoredZeroOnly means the body can only
+	// report a match at 0 and the wrapper answers from != 0 without calling
+	// it; ffNative means the body reads the find-from channel and the wrapper
+	// seeds it. Meaningless (and left ffUnset) when !anchored, where the
+	// composed wrapper's find half carries the mode instead.
+	captureFromMode findFromMode
+
 	numGroups  int      // capture group count (for wrapper slot adjustment)
 	isTDFA     bool     // true = TDFA capture; false = Backtracking (controls sentinel data segment)
 	groupNames []string // groupNames[i] = name for group i+1; "" = unnamed
@@ -411,7 +425,7 @@ type compiledPattern struct {
 	winScratchOff int32
 
 	// findFromMode records how this pattern's find function receives the
-	// `from` position of an exported find call (TODO task 54 half A). It is
+	// `from` position of an exported find call. It is
 	// REQUIRED whenever the pattern contributes a find function of any shape,
 	// and its zero value (ffUnset) is invalid: both assemblers panic on it
 	// rather than emit a module whose find silently restarts every scan at 0.
@@ -450,7 +464,7 @@ type compiledPattern struct {
 	// Non-mid-accept bulk-skip helper fields (nonMidHelperBody,
 	// findBodyCallSites) were removed with the rest of that infrastructure.
 
-	// Alternation literal-anchored matching fields (Task 6 v1, 2026-07-05).
+	// Alternation literal-anchored matching fields.
 	// altLitAnchorBranches != nil means this pattern's top-level op is
 	// OpAlternate with every branch independently literal-anchored and
 	// sharing the same fixed prefix length (see findAltLitAnchorPoints).
@@ -484,7 +498,7 @@ type compiledPattern struct {
 	// directly, since it calls branch functions by index.
 
 	// Batch find/groups exports (multiple matches per host call, modelled on
-	// the set find ABI; originally LM-2, now task 44). Set by compileAll
+	// the set find ABI). Set by compileAll
 	// (not compilePattern) once findExport/groupsExport/namedGroupsExport are
 	// known, gated on the pattern's "batch-find" hint (see hasBatchHint) —
 	// independent of LikelyMode. Empty = not requested.
@@ -498,7 +512,7 @@ type compiledPattern struct {
 	//
 	// batchGroupsExport covers both shapes: !anchored (composed find+capture,
 	// buildBatchGroupsWrapperBody) and anchored (native lit-chain groups body
-	// IS captureBody, buildBatchLitChainGroupsWrapperBody — task 44 goal 4,
+	// IS captureBody, buildBatchLitChainGroupsWrapperBody,
 	// "Path B"); assembleModule's code-section emission branches on
 	// p.anchored to pick the right wrapper builder.
 	//
@@ -511,7 +525,7 @@ type compiledPattern struct {
 }
 
 // altLitAnchorCompiledBranch holds one alternation branch's precomputed WASM
-// bodies and literal set (Task 6 v1). backScanBody and forwardVerifyBody are
+// bodies and literal set. backScanBody and forwardVerifyBody are
 // both fully built during compilePattern — unlike the dispatcher, neither
 // calls another function in this module by index, so both can be built
 // eagerly instead of deferred to assembleModule time.
@@ -537,6 +551,107 @@ func (p *compiledPattern) setFind(body []byte, mode findFromMode) {
 	p.findFromMode = mode
 }
 
+// setCaptureBody records a capture body together with how it receives `from`,
+// for the A.3 paths where that body IS the exported groups function. Same
+// contract as setFind: the mode comes from the emitter, and ffUnset is a build
+// failure rather than a silent scan-from-0.
+func (p *compiledPattern) setCaptureBody(body []byte, mode findFromMode) {
+	if mode == ffUnset {
+		panic("compile: setCaptureBody with unset findFromMode")
+	}
+	p.captureBody = body
+	p.captureFromMode = mode
+}
+
+// funcSlotKind names one function a pattern contributes to the module, in the
+// order they are laid out.
+type funcSlotKind uint8
+
+const (
+	slotMatch             funcSlotKind = iota
+	slotAltBackScan                    // one per alternation branch
+	slotAltForwardVerify               // one per alternation branch
+	slotAltDispatch                    // the branch dispatcher, laid out last
+	slotLitAnchorBackScan              // the lit-anchor pair's backward half
+	slotLitAnchorFind                  // the lit-anchor pair's forward half
+	slotFind                           // a plain find body
+	slotCapture                        // captureBody
+	slotGroupsWrapper                  // the composed (find, capture) wrapper
+	slotBatchFind
+	slotBatchGroups
+	slotFindWrapper       // the exported (ptr, len, from) find wrapper
+	slotGroupsFromWrapper // the exported (ptr, len, out_ptr, from) groups wrapper
+)
+
+// funcSlot is one entry of a pattern's function layout. branch is the
+// alternation branch index for the two slotAlt* kinds and 0 otherwise.
+type funcSlot struct {
+	kind   funcSlotKind
+	branch int
+}
+
+// funcLayout is THE definition of which functions a pattern contributes and in
+// what order. funcCount, offsets, batchOffsets, findWrapperOffset,
+// groupsFromWrapperOffsets and altLitAnchorBranchFuncIdx are all derived from
+// it, and both assemblers' function sections walk it.
+//
+// It replaces five hand-synchronised ladders and two emission loops that each
+// wrote the same sequence of `if` tests out again. They were verified to agree
+// — and then the sets assembler was found missing the
+// alt-lit-anchor arm entirely, which is exactly what this failure mode
+// produces: a module declaring more functions than it emits, with no
+// diagnostic.
+func (p *compiledPattern) funcLayout() []funcSlot {
+	var out []funcSlot
+	add := func(k funcSlotKind) { out = append(out, funcSlot{kind: k}) }
+	if p.matchBody != nil {
+		add(slotMatch)
+	}
+	switch {
+	case p.altLitAnchorBranches != nil:
+		for j := range p.altLitAnchorBranches {
+			out = append(out,
+				funcSlot{kind: slotAltBackScan, branch: j},
+				funcSlot{kind: slotAltForwardVerify, branch: j})
+		}
+		add(slotAltDispatch)
+	case p.litAnchorBackScanBody != nil:
+		add(slotLitAnchorBackScan)
+		add(slotLitAnchorFind)
+	case p.findBody != nil:
+		add(slotFind)
+	}
+	if p.captureBody != nil {
+		add(slotCapture)
+		if !p.anchored {
+			add(slotGroupsWrapper)
+		}
+	}
+	if p.batchFindExport != "" {
+		add(slotBatchFind)
+	}
+	if p.batchGroupsExport != "" {
+		add(slotBatchGroups)
+	}
+	if p.hasFindFunc() {
+		add(slotFindWrapper)
+	}
+	if p.hasGroupsFromWrapper() {
+		add(slotGroupsFromWrapper)
+	}
+	return out
+}
+
+// slotIndex returns the sub-index of the first slot of kind k, or -1.
+func (p *compiledPattern) slotIndex(k funcSlotKind) int {
+	for i, s := range p.funcLayout() {
+		if s.kind == k {
+			return i
+		}
+	}
+	return -1
+}
+
 // hasFindFunc reports whether this pattern contributes a find function in any
 // of its three shapes: a plain body, the lit-anchor pair (whose find half is
 // generated at assembleModule time), or the alt-lit-anchor branch dispatcher.
@@ -556,33 +671,7 @@ func (p *compiledPattern) hasFindFunc() bool {
 // Laid out last, after the batch wrappers, so adding it moved no existing
 // sub-index.
 func (p *compiledPattern) findWrapperOffset() int {
-	if !p.hasFindFunc() {
-		return -1
-	}
-	idx := 0
-	if p.matchBody != nil {
-		idx++
-	}
-	if p.altLitAnchorBranches != nil {
-		idx += 1 + 2*len(p.altLitAnchorBranches)
-	} else if p.litAnchorBackScanBody != nil {
-		idx += 2
-	} else if p.findBody != nil {
-		idx++
-	}
-	if p.captureBody != nil {
-		idx++
-		if !p.anchored {
-			idx++
-		}
-	}
-	if p.batchFindExport != "" {
-		idx++
-	}
-	if p.batchGroupsExport != "" {
-		idx++
-	}
-	return idx
+	return p.slotIndex(slotFindWrapper)
 }
 
 // hasGroupsFromWrapper reports whether this pattern actually emits the
@@ -604,71 +693,15 @@ func (p *compiledPattern) hasGroupsFromWrapper() bool {
 // sub-index.
 //
 // It once returned a second offset for a separate named-groups wrapper. TODO
-// task 62 retired named_groups_func — both stubs always called the SAME
+// named_groups_func was retired — both stubs always called the SAME
 // export — so there is one wrapper and one offset.
 func (p *compiledPattern) groupsFromWrapperOffsets() (groupsOff int) {
-	groupsOff = -1
-	idx := p.findWrapperOffset()
-	if idx < 0 {
-		// No find function: start from the end of everything else.
-		idx = 0
-		if p.matchBody != nil {
-			idx++
-		}
-		if p.captureBody != nil {
-			idx++
-			if !p.anchored {
-				idx++
-			}
-		}
-		if p.batchFindExport != "" {
-			idx++
-		}
-		if p.batchGroupsExport != "" {
-			idx++
-		}
-	} else {
-		idx++ // past the find wrapper itself
-	}
-	if p.hasGroupsFromWrapper() {
-		groupsOff = idx
-	}
-	return
+	return p.slotIndex(slotGroupsFromWrapper)
 }
 
 // funcCount returns the number of WASM functions this pattern contributes.
 func (p *compiledPattern) funcCount() int {
-	n := 0
-	if p.matchBody != nil {
-		n++
-	}
-	if p.altLitAnchorBranches != nil {
-		n += 1 + 2*len(p.altLitAnchorBranches) // dispatcher + (backward_scan_i, forward_verify_i) per branch
-	} else if p.litAnchorBackScanBody != nil {
-		n += 2 // backward_scan + lit_anchor_find
-	} else if p.findBody != nil {
-		n++
-	}
-	if p.captureBody != nil {
-		n++ // capture_internal
-		if !p.anchored {
-			n++
-		} // groups_wrapper
-	}
-	// LNM non-mid bulk-skip helper count was here — see archive Section 11.
-	if p.batchFindExport != "" {
-		n++
-	}
-	if p.batchGroupsExport != "" {
-		n++
-	}
-	if p.hasFindFunc() {
-		n++ // find wrapper (ptr, len, from) → i64
-	}
-	if p.hasGroupsFromWrapper() {
-		n++ // groups wrapper (ptr, len, out_ptr, from) → i32
-	}
-	return n
+	return len(p.funcLayout())
 }
 
 // batchOffsets returns the sub-indices of the optional LM-2 batch wrapper
@@ -677,32 +710,7 @@ func (p *compiledPattern) funcCount() int {
 // separate from offsets() so its widely-shared 4-return signature (used by
 // both assembleModule and assembleModuleWithSets) does not need to change.
 func (p *compiledPattern) batchOffsets() (batchFindOff, batchGroupsOff int) {
-	idx := 0
-	if p.matchBody != nil {
-		idx++
-	}
-	if p.altLitAnchorBranches != nil {
-		idx += 1 + 2*len(p.altLitAnchorBranches)
-	} else if p.litAnchorBackScanBody != nil {
-		idx += 2
-	} else if p.findBody != nil {
-		idx++
-	}
-	if p.captureBody != nil {
-		idx++
-		if !p.anchored {
-			idx++
-		}
-	}
-	batchFindOff, batchGroupsOff = -1, -1
-	if p.batchFindExport != "" {
-		batchFindOff = idx
-		idx++
-	}
-	if p.batchGroupsExport != "" {
-		batchGroupsOff = idx
-	}
-	return
+	return p.slotIndex(slotBatchFind), p.slotIndex(slotBatchGroups)
 }
 
 // offsets returns the sub-indices of each function within this pattern.
@@ -715,30 +723,17 @@ func (p *compiledPattern) batchOffsets() (batchFindOff, batchGroupsOff int) {
 // altLitAnchorBranchFuncIdx addresses those individually. findOff is the
 // dispatcher, laid out after all branch functions.
 func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, captureOff, wrapperOff int) {
-	matchOff, backwardScanOff, findOff, captureOff, wrapperOff = -1, -1, -1, -1, -1
-	idx := 0
-	if p.matchBody != nil {
-		matchOff = idx
-		idx++
-	}
-	if p.altLitAnchorBranches != nil {
-		idx += 2 * len(p.altLitAnchorBranches) // all branch helpers laid out first
-		findOff = idx
-		idx++
-	} else if p.litAnchorBackScanBody != nil {
-		backwardScanOff = idx
-		idx++
-		findOff = idx
-		idx++
-	} else if p.findBody != nil {
-		findOff = idx
-		idx++
-	}
-	if p.captureBody != nil {
-		captureOff = idx
-		idx++
-		if !p.anchored {
-			wrapperOff = idx
+	matchOff = p.slotIndex(slotMatch)
+	backwardScanOff = p.slotIndex(slotLitAnchorBackScan)
+	captureOff = p.slotIndex(slotCapture)
+	wrapperOff = p.slotIndex(slotGroupsWrapper)
+	// findOff names whichever function fronts the find: the alt dispatcher,
+	// the lit-anchor forward half, or a plain body.
+	findOff = -1
+	for _, k := range []funcSlotKind{slotAltDispatch, slotLitAnchorFind, slotFind} {
+		if i := p.slotIndex(k); i >= 0 {
+			findOff = i
+			break
 		}
 	}
 	return
@@ -751,11 +746,19 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 // [backward_scan_0, forward_verify_0, backward_scan_1, forward_verify_1, ...],
 // dispatcher last (see offsets() above).
 func (p *compiledPattern) altLitAnchorBranchFuncIdx(i int) (backOff, fwdOff int) {
-	base := 0
-	if p.matchBody != nil {
-		base = 1
+	backOff, fwdOff = -1, -1
+	for idx, slot := range p.funcLayout() {
+		if slot.branch != i {
+			continue
+		}
+		switch slot.kind {
+		case slotAltBackScan:
+			backOff = idx
+		case slotAltForwardVerify:
+			fwdOff = idx
+		}
 	}
-	return base + 2*i, base + 2*i + 1
+	return
 }
 
 // patchPaddedLEB128CallSites and nonMidHelperOff were removed along with
@@ -847,7 +850,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				p.matchExport = re.MatchFunc
 				p.matchBody = appendLitChainRangeMatchCodeEntry(nil, lcp)
 			}
-			p.captureBody = appendLitChainRangeFindGroupsCodeEntry(nil, lcp, lcc, buildOpts.tableMemIdx)
+			p.setCaptureBody(appendLitChainRangeFindGroupsCodeEntry(nil, lcp, lcc, buildOpts.tableMemIdx))
 			parsed, perr := syntax.Parse(re.Pattern, syntax.Perl)
 			if perr == nil {
 				p.groupNames = extractGroupNames(parsed)
@@ -871,7 +874,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			}
 			// Native find-with-captures body — replaces the find+capture wrapper
 			// composition. Single SIMD pass with inline slot writes.
-			p.captureBody = appendLitChainFindGroupsCodeEntry(nil, lcp, lcc, buildOpts.tableMemIdx)
+			p.setCaptureBody(appendLitChainFindGroupsCodeEntry(nil, lcp, lcc, buildOpts.tableMemIdx))
 			parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
 			if err == nil {
 				p.groupNames = extractGroupNames(parsed)
@@ -903,7 +906,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				p.dataSegCount = segCount
 				p.tableEnd = layout.tableEnd
 				// Native single-function alt find-with-captures.
-				p.captureBody = appendLitChainAltFindGroupsCodeEntry(nil, altp, branchCaps, layout, buildOpts.tableMemIdx)
+				p.setCaptureBody(appendLitChainAltFindGroupsCodeEntry(nil, altp, branchCaps, layout, buildOpts.tableMemIdx))
 				parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
 				if err == nil {
 					p.groupNames = extractGroupNames(parsed)
@@ -1253,8 +1256,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 				lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
 			})
-			// Task 38 (2026-07-18): non-mid dominants are default-on for
-			// every LikelyMode again, replacing task 36's LikelyMatch-only
+			// Since 2026-07-18: non-mid dominants are default-on for
+			// every LikelyMode again, replacing the LikelyMatch-only
 			// gate, which was lossy in both directions — neutral callers
 			// lost the −90% long-run fuel win, LikelyMatch callers still
 			// paid the short-run penalty. Two runtime mechanisms make this
@@ -1347,6 +1350,15 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		findExport:  re.FindFunc,
 		anchored:    anchored,
 	}
+	if anchored {
+		// On this path `anchored` really does mean "can only match at 0" —
+		// isAnchoredFind proved it of the DFA, and the capture body below is
+		// emitted with anchored=true. The groups export can therefore answer
+		// any from != 0 without calling it. (The lit-chain A.3 paths set
+		// p.anchored for the OTHER reason and are ffNative; see
+		// captureFromMode's doc.)
+		p.captureFromMode = ffAnchoredZeroOnly
+	}
 
 	if needMatch {
 		p.matchBody = matchBody
@@ -1435,7 +1447,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
 			lap := findLitAnchorPoint(re.Pattern)
-			// Task 10: reject prefixes containing `\b`/`\B` explicitly. The
+			// Reject prefixes containing `\b`/`\B` explicitly. The
 			// reversed-prefix DFA doesn't evaluate word boundaries backward,
 			// and the lit-anchor find body doesn't verify them at candidate
 			// positions. Previously this was blocked only incidentally by
@@ -1490,7 +1502,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 							lmWideShufti:         false,
 						})
 						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true)
-						// Task 22: when the prefix is a bare `[class]{M}` (M<=16),
+						// When the prefix is a bare `[class]{M}` (M<=16),
 						// a single SIMD chunk verify replaces the scalar reverse
 						// walk above with no runtime trade-off. LikelyNoMatch-gated
 						// for this initial landing (see buildSimplePrefixCheckBody's
@@ -1597,7 +1609,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				}
 			}
 
-			// Alternation lit-anchor (Task 6 v1, 2026-07-05) — only tried
+			// Alternation lit-anchor — only tried
 			// when the single-pattern check above didn't fire (their
 			// top-level Op gates, OpConcat vs OpAlternate, are mutually
 			// exclusive, so this check is defensive) and only for find-only
@@ -1660,7 +1672,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// genuine -58% fuel win (the `.*` before its alternation), so it
 			// stays too.
 			//
-			// Task 38 (2026-07-18): buildFindBody's own call site (the
+			// Since 2026-07-18: buildFindBody's own call site (the
 			// litAnchorBackScanBody == nil branch below) emits the
 			// non-mid channel for every LikelyMode again, replacing task
 			// 36's LikelyMatch-only gate. The short-run fuel harm that
@@ -1676,7 +1688,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				// this layout's midAcceptBytes — the lit-anchor forward
 				// scan and alt-lit branches read the table with plain
 				// `!= 0` accept semantics and dispatch non-mid via
-				// state-ID compares (unchanged by task 38).
+				// state-ID compares (unchanged).
 				applyDominantStateEncoding(l,
 					p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil)
 			} else {
@@ -1729,7 +1741,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 	p.groupNames = extractGroupNames(parsed)
 
-	// Task 41: whole-pattern single-capture shortcut. Only valid on the
+	// Whole-pattern single-capture shortcut. Only valid on the
 	// find-wrapper composition path (captureBody re-traverses the
 	// wrapper-supplied [start,end) substring, so group 0 there is always
 	// (0,len) — a sole capture spanning the whole match is therefore
@@ -1926,7 +1938,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	out = append(out, 0x01, 0x00, 0x00, 0x00)
 
 	// Type section: 4 fixed types (match, find, capture/groups, and
-	// alt-lit-anchor's forward_verify_i — Task 6 v1, 2026-07-05), plus an
+	// alt-lit-anchor's forward_verify_i), plus an
 	// optional 5th (the LM-2 batch find/groups wrapper signature) — added
 	// only when some pattern actually has a batch export, so modules with
 	// no LM-2 usage (including LikelyMatch modules where every pattern's
@@ -1956,7 +1968,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		numTypes++
 	}
 	// (i32,i32,i32,i32)→i32 — the groups/named-groups export with a `from`
-	// position (task 54). Appended AFTER the batch type so that type's index
+	// position. Appended AFTER the batch type so that type's index
 	// does not move. Emitted only when some pattern exports groups.
 	groupsFromTypeIdx := -1
 	if anyGroupsExport(patterns) {
@@ -1983,43 +1995,34 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	}
 
 	// Function section: pattern functions only.
+	// Walks funcLayout, so the entries here cannot drift from what funcCount
+	// counted or what the code section emits. Only the
+	// TYPE INDEX is decided per assembler, because the two modules have
+	// different type tables.
+	singlePatternSlotType := map[funcSlotKind]byte{
+		slotMatch:             0x00, // (i32,i32)→i32
+		slotAltBackScan:       0x00,
+		slotAltForwardVerify:  0x03, // (i32,i32,i32)→i64
+		slotAltDispatch:       0x01, // (i32,i32)→i64
+		slotLitAnchorBackScan: 0x00,
+		slotLitAnchorFind:     0x01,
+		slotFind:              0x01,
+		slotCapture:           0x02, // (i32,i32,i32)→i32
+		slotGroupsWrapper:     0x02,
+		slotBatchFind:         0x04, // (i32×5)→i32
+		slotBatchGroups:       0x04,
+		slotFindWrapper:       0x03,
+		slotGroupsFromWrapper: byte(groupsFromTypeIdx), // (i32×4)→i32
+	}
 	var fs []byte
 	fs = utils.AppendULEB128(fs, uint32(total))
 	for _, p := range patterns {
-		if p.matchBody != nil {
-			fs = append(fs, 0x00)
-		}
-		if p.altLitAnchorBranches != nil {
-			for range p.altLitAnchorBranches {
-				fs = append(fs, 0x00) // backward_scan_i: (i32,i32)->i32
-				fs = append(fs, 0x03) // forward_verify_i: (i32,i32,i32)->i64
+		for _, slot := range p.funcLayout() {
+			t, ok := singlePatternSlotType[slot.kind]
+			if !ok {
+				panic("compile: no type index for function slot kind")
 			}
-			fs = append(fs, 0x01) // dispatcher: (i32,i32)->i64
-		} else if p.litAnchorBackScanBody != nil {
-			fs = append(fs, 0x00) // backward_scan: (i32,i32)->i32
-			fs = append(fs, 0x01) // lit_anchor_find: (i32,i32)->i64
-		} else if p.findBody != nil {
-			fs = append(fs, 0x01)
-		}
-		if p.captureBody != nil {
-			fs = append(fs, 0x02)
-			if !p.anchored {
-				fs = append(fs, 0x02)
-			}
-		}
-		// LNM non-mid bulk-skip helper function-section entry was here —
-		// see archive Section 15.
-		if p.batchFindExport != "" {
-			fs = append(fs, 0x04)
-		}
-		if p.batchGroupsExport != "" {
-			fs = append(fs, 0x04)
-		}
-		if p.hasFindFunc() {
-			fs = append(fs, 0x03) // find wrapper: (i32,i32,i32)→i64
-		}
-		if p.hasGroupsFromWrapper() {
-			fs = append(fs, byte(groupsFromTypeIdx)) // (i32×4)→i32
+			fs = append(fs, t)
 		}
 	}
 	out = appendSection(out, 3, fs)
@@ -2038,7 +2041,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	// reads the global can never end up in a module that failed to declare
 	// it — that pairing is a WASM VALIDATION error, caught at load by every
 	// harness, rather than a silent read of the wrong thing.
-	if anyFindFunc(patterns) {
+	if moduleUsesFindFrom(patterns) {
 		out = appendSection(out, 6, findFromGlobalSection())
 	}
 
@@ -2172,9 +2175,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
-				// Path B (task 44 goal 4): captureBody IS the exported groups
+				// Path B: captureBody IS the exported groups
 				// function — no separate find function to compose over.
-				cs = appendBatchLitChainGroupsWrapperCodeEntry(cs, base+captureOff, p.numGroups)
+				cs = appendBatchLitChainGroupsWrapperCodeEntry(cs, base+captureOff, p.numGroups, p.captureFromMode)
 			} else {
 				batchTableMemIdx := 0
 				if !standalone {
@@ -2197,9 +2200,14 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
 			if p.anchored {
-				// The export IS captureBody: it can only match at 0.
-				inner, anchoredOnly = base+captureOff, true
+				// The export IS captureBody. Whether it can only match at 0
+				// is captureFromMode's to say — the lit-chain A.3 bodies
+				// SCAN, and answering their every nonzero `from` with -1 lost
+				// every match after the first.
+				inner = base + captureOff
+				anchoredOnly = p.captureFromMode == ffAnchoredZeroOnly
 			}
+			assertGroupsFromWrapperMode(p, anchoredOnly)
 			cs = appendGroupsFromWrapperCodeEntry(cs, inner, anchoredOnly)
 		}
 	}
@@ -2353,7 +2361,10 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 // Independent of slog level — the JSON is always complete.
 func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 	if len(cfg.Sets) == 0 {
-		return nil
+		// SAY SO. Returning nil wrote no file and printed nothing, so
+		// `--diag-json=out.json` on a set-less config left the user staring at
+		// a missing file with no explanation.
+		return fmt.Errorf("--diag-json: the config declares no sets, and set composition is all this reports")
 	}
 	// Gather diagnostics by re-running CompileFile (it already computed them;
 	// for simplicity we re-run rather than threading Diagnostics through CmdCompile).
@@ -2571,9 +2582,9 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 // (ptr,len) to the match extent, this wrapper passes the caller's real
 // (ptr,len) and writes the extent as an (startOff,endOff) pair to that
 // table-memory offset. The capture body then sees true input edges for
-// \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already
-// relative to ptr.md B13, and
-// buildBacktrackBody in engine_backtrack.go.
+// \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already relative
+// to ptr — so this wrapper adds nothing to them. See buildBacktrackBody in
+// engine_backtrack.go for the reading side.
 func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
 	var b []byte
 	b = append(b, 0x02)
@@ -2768,7 +2779,7 @@ func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode) []byte {
 	// relStart, relEnd — relative to pos whichever way the body reported them
 	b = emitUnpackRelative(b, mode, 0x07, 0x05, 0x08, 0x09)
 
-	// Go's FindAllIndex rule (TODO task 54 half B): an EMPTY match beginning
+	// Go's FindAllIndex rule: an EMPTY match beginning
 	// exactly where the previous REPORTED match ended is suppressed. Emitted
 	// here as well as in the stubs so a direct WASM caller of the batch export
 	// gets the same answer.
@@ -2850,19 +2861,17 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMo
 // winScratchOff (-1 = not applicable) turns on window mode, exactly as in
 // buildGroupsWrapperBody: the capture body is called with this wrapper's
 // own (ptr,len) and the per-match extent is written to the (startOff,endOff)
-// scratch inside the loop, once per match — see a past defect and
-// a past defect.
+// scratch inside the loop, once per match.
 //
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
 // 12=recBase i32, 13=capRes i32, 14=adj i32, 15=slotVal i32.
 func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32, mode findFromMode) []byte {
-	// Not yet converted for a find body that reads the find-from global.
-	// When an emitter goes native (task 54 phase 2) this caller must set the
-	// channel before calling the body, and — where it currently rebases a
-	// narrowed result — stop doing so. Panicking is deliberate: the
-	// alternative is a body that scans from whatever position the previous
-	// call happened to leave behind.
+	// The `mode` parameter is what decides how this wrapper hands the find
+	// body its position: emitFindCallFromPos seeds the find-from channel for
+	// an ffNative body and narrows for an ffLegacyNarrow one. A comment here
+	// used to say the conversion had not happened and that "panicking is
+	// deliberate" — on a function that neither panics nor needs to.
 
 	recordSize := 8 + numGroups*8
 
@@ -2974,7 +2983,7 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = append(b, 0x20, 0x0C, 0x20, 0x0C, 0x28, 0x02, 0x08, 0x36, 0x02, 0x00)
 	b = append(b, 0x20, 0x0C, 0x20, 0x0C, 0x28, 0x02, 0x0C, 0x36, 0x02, 0x04)
 
-	// Go's FindAllSubmatchIndex rule (TODO task 54 half B): an EMPTY match
+	// Go's FindAllSubmatchIndex rule: an EMPTY match
 	// beginning exactly where the previous REPORTED match ended is suppressed.
 	// The batch FIND wrapper has carried this since (B) shipped; this one was
 	// missed, so `(a*)` on "bab" reported a 2-2 Go does not.
@@ -3033,33 +3042,49 @@ func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, n
 // groups function for this pattern shape (compiledPattern.anchored's native
 // A.3 meaning — see appendLitChainFindGroupsCodeEntry and siblings).
 //
-// captureFuncIdx returns the match end position relative to the ptr passed
-// to IT, or -1. It writes group 0 (the whole match) at slots [0:8) — start
-// relative to its own ptr, end likewise — exactly like buildGroupsWrapperBody's
-// out_ptr convention, so writing directly into the record's slot area
-// (recBase+8) lines group 0 up with the record's [8:16) group-0 slots for
-// free. This wrapper then adjusts every slot (group 0 included) by the
-// running scan offset (pos) and copies the adjusted group-0 start/end into
-// the record's [0:8) header — same record layout buildBatchGroupsWrapperBody
-// produces, so the JS/TS consumer needs no path-specific branching.
+// How the scan position reaches captureFuncIdx depends on `mode`, which is
+// compiledPattern.captureFromMode:
 //
-// assembleModule also routes here for the general native-anchored TDFA/
-// Backtracking capture body (compiledPattern.anchored set via isAnchoredFind
-// in compilePattern's non-lit-chain path) whenever it has a batch export —
-// that body shares this wrapper's (ptr,len,out_ptr)→i32 ABI but, unlike a
-// genuine lit-chain shape, CAN match zero-length (e.g. `^(a*)?` at the end of
-// the input). So the advance step cannot assume r always strictly advances;
-// it uses the same relEnd>relStart-guarded rule as buildBatchGroupsWrapperBody,
-// read back from the record's just-written, already-adjusted start/end
-// header (recBase+0/recBase+4) instead of pos+r directly.
+//   - ffNative (the three lit-chain A.3 bodies): through the FIND-FROM CHANNEL
+//     (find_from.go), with the WHOLE buffer handed to the body. That is what
+//     makes this export agree with the plain groups export on the same input —
+//     `\b` and `(?m:^)` at the resume position judge the real preceding byte
+//     rather than a slice edge — and it makes every slot the body writes
+//     ABSOLUTE, so this wrapper adjusts nothing.
+//
+//   - ffAnchoredZeroOnly (the general native-anchored TDFA/Backtracking
+//     capture body, compiledPattern.anchored set via isAnchoredFind): the body
+//     does not read the channel, so the buffer is NARROWED to (ptr+pos,
+//     len-pos) and every returned slot is rebased by +pos, unchanged from
+//     before.
+//
+// captureFuncIdx returns the match end position (absolute under ffNative,
+// relative to the ptr it was given under narrowing), or -1. It writes group 0
+// (the whole match) at slots [0:8), so writing directly into the record's slot
+// area (recBase+8) lines group 0 up with the record's [8:16) group-0 slots for
+// free; the group-0 start/end are then copied into the record's [0:8) header —
+// the same record layout buildBatchGroupsWrapperBody produces, so the JS/TS
+// consumer needs no path-specific branching.
+//
+// The advance step cannot assume the body always strictly advances (a capture
+// body that CAN match zero-length, e.g. `^(a*)?` at end of input), so it uses
+// the same end>start-guarded rule as buildBatchGroupsWrapperBody, read back
+// from the record's just-written, absolute start/end header.
 //
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=recBase i32,
-// 8=r i32, 9=slotVal i32.
-func buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups int) []byte {
+// 8=r i32, 9=slotVal i32 (narrowing form only).
+func buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups int, mode findFromMode) []byte {
+	if mode != ffNative && mode != ffAnchoredZeroOnly {
+		panic("compile: batch groups over an anchored capture body with mode " +
+			mode.String() + " — see find_from.go")
+	}
+	native := mode == ffNative
 	recordSize := 8 + numGroups*8
 
 	var b []byte
-	// Locals: 5 × i32 (pos, count, recBase, r, slotVal).
+	// Locals: 5 × i32 (pos, count, recBase, r, slotVal). slotVal is unused by
+	// the native form; declaring it regardless keeps the local indices of the
+	// two forms identical.
 	b = append(b, 0x01)
 	b = append(b, 0x05, 0x7F)
 
@@ -3080,9 +3105,17 @@ func buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups int) []byte {
 	b = utils.AppendSLEB128(b, int32(recordSize))
 	b = append(b, 0x6C, 0x6A, 0x21, 0x07)
 
-	// r = call capture(ptr+pos, len-pos, recBase+8)
-	b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A)
-	b = append(b, 0x20, 0x01, 0x20, 0x05, 0x6B)
+	if native {
+		// Tell the body where to resume, then hand it the WHOLE buffer.
+		b = emitFindFromSet(b, 0x05)
+		// r = call capture(ptr, len, recBase+8)
+		b = append(b, 0x20, 0x00)
+		b = append(b, 0x20, 0x01)
+	} else {
+		// r = call capture(ptr+pos, len-pos, recBase+8)
+		b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A)
+		b = append(b, 0x20, 0x01, 0x20, 0x05, 0x6B)
+	}
 	b = append(b, 0x20, 0x07, 0x41, 0x08, 0x6A)
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
@@ -3091,36 +3124,35 @@ func buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups int) []byte {
 	// if r < 0: br $done
 	b = append(b, 0x20, 0x08, 0x41, 0x00, 0x48, 0x0D, 0x01)
 
-	// Adjust each of numGroups*2 slot ints at recBase+8+g*4 by +pos (skip
-	// unmatched groups, encoded as -1).
-	for g := 0; g < numGroups*2; g++ {
-		off := uint32(8 + g*4)
-		b = append(b, 0x20, 0x07)
-		b = append(b, 0x28, 0x02)
-		b = utils.AppendULEB128(b, off)
-		b = append(b, 0x22, 0x09) // tee slotVal
-		b = append(b, 0x41, 0x00, 0x4E)
-		b = append(b, 0x04, 0x40) // if (void)
-		b = append(b, 0x20, 0x07)
-		b = append(b, 0x20, 0x09, 0x20, 0x05, 0x6A)
-		b = append(b, 0x36, 0x02)
-		b = utils.AppendULEB128(b, off)
-		b = append(b, 0x0B) // end if
+	if !native {
+		// Adjust each of numGroups*2 slot ints at recBase+8+g*4 by +pos (skip
+		// unmatched groups, encoded as -1). The native form's slots are
+		// absolute already.
+		for g := 0; g < numGroups*2; g++ {
+			off := uint32(8 + g*4)
+			b = append(b, 0x20, 0x07)
+			b = append(b, 0x28, 0x02)
+			b = utils.AppendULEB128(b, off)
+			b = append(b, 0x22, 0x09) // tee slotVal
+			b = append(b, 0x41, 0x00, 0x4E)
+			b = append(b, 0x04, 0x40) // if (void)
+			b = append(b, 0x20, 0x07)
+			b = append(b, 0x20, 0x09, 0x20, 0x05, 0x6A)
+			b = append(b, 0x36, 0x02)
+			b = utils.AppendULEB128(b, off)
+			b = append(b, 0x0B) // end if
+		}
 	}
 
-	// Copy the (now-adjusted) whole-match slot0/slot1 into the record's
-	// start/end prefix.
+	// Copy the whole-match slot0/slot1 into the record's start/end prefix.
 	b = append(b, 0x20, 0x07, 0x20, 0x07, 0x28, 0x02, 0x08, 0x36, 0x02, 0x00)
 	b = append(b, 0x20, 0x07, 0x20, 0x07, 0x28, 0x02, 0x0C, 0x36, 0x02, 0x04)
 
 	// count += 1
 	b = append(b, 0x20, 0x06, 0x41, 0x01, 0x6A, 0x21, 0x06)
 
-	// pos = adjEnd > adjStart ? adjEnd : adjStart + 1, reading the
-	// already-adjusted, absolute start/end just written to the record
-	// header at recBase+0/recBase+4 (see doc comment: zero-length matches
-	// are possible on the general native-anchored path, not just the
-	// guaranteed-non-empty lit-chain one).
+	// pos = end > start ? end : start + 1, reading the absolute start/end
+	// just written to the record header at recBase+0/recBase+4.
 	b = append(b, 0x20, 0x07, 0x28, 0x02, 0x04) // adjEnd = mem32[recBase+4]
 	b = append(b, 0x20, 0x07, 0x28, 0x02, 0x00) // adjStart = mem32[recBase+0]
 	b = append(b, 0x4B)                         // i32.gt_u
@@ -3142,8 +3174,8 @@ func buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups int) []byte {
 
 // appendBatchLitChainGroupsWrapperCodeEntry appends a size-prefixed Path B
 // batch groups wrapper body to cs.
-func appendBatchLitChainGroupsWrapperCodeEntry(cs []byte, captureFuncIdx, numGroups int) []byte {
-	body := buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups)
+func appendBatchLitChainGroupsWrapperCodeEntry(cs []byte, captureFuncIdx, numGroups int, mode findFromMode) []byte {
+	body := buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups, mode)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

@@ -2,6 +2,7 @@ package compile
 
 import (
 	"fmt"
+	"regexp/syntax"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
@@ -60,7 +61,7 @@ func TestSparsePromotionMergesSharedLiteralBuckets(t *testing.T) {
 	if on[0].suffixDFA.midAcceptWide == nil {
 		t.Error("sparse bucket's DFA carries no wide accept lists")
 	}
-	// §23.2: a promotion that then misses the budgets is worse than the split
+	// A promotion that then misses the budgets is worse than the split
 	// it replaced, because binPack would have split it again.
 	o := CompileSetOptions{}
 	if on[0].suffixStates > o.budgetStates() || on[0].tableBytes > o.budgetBytes() {
@@ -98,6 +99,101 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 			if b.sparse {
 				t.Error("promoted a word-boundary group; its \\b accept channels are not serialised")
 			}
+		}
+	}
+
+	// A group that fits ONE bitmask bucket never
+	// split on the mask, so the promotion has nothing to undo — and the sparse
+	// body is the slowest shape there is (it ignores validMask, loses the gate
+	// pre-mask and the empty-mask group skip). Constructed as separate
+	// single-pattern buckets, which is what the fallback packer produces when
+	// a merge misses its byte or state budget.
+	{
+		var pp, sp dfaPool
+		var in []*bucket
+		for i := 0; i < bucketMaskBits; i++ {
+			info, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`kw%03d[0-9]`, i)}, &pp, &sp)
+			if err != nil {
+				t.Fatalf("analyzePattern: %v", err)
+			}
+			info.globalID = i
+			in = append(in, &bucket{literal: "", patterns: []*PatternInfo{info}, isFallback: true})
+		}
+		out := promoteSparseBuckets(in, opts, sparsePromotion{
+			astFor: patternSuffixAST, merge: mergeSuffixDFASparseSet, isFallback: true,
+		})
+		if len(out) != len(in) {
+			t.Errorf("promoted %d buckets totalling %d patterns, which fits one bitmask bucket; want no promotion",
+				len(in), bucketMaskBits)
+		}
+	}
+
+	// Under LikelyMatch a counted-class-chain
+	// singleton has the SIMD-verify suffix body, and constraint 0 (LM-6)
+	// kept it out of a shared bucket on purpose; the promotion must not take
+	// it back.
+	{
+		var pp, sp dfaPool
+		var in []*bucket
+		for i := 0; i < bucketMaskBits+1; i++ {
+			// A counted class chain: literal + [0-9a-z]{N}, N large enough for
+			// isCountedClassChain.
+			info, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`kw%03d[0-9a-z]{6}`, i)}, &pp, &sp)
+			if err != nil {
+				t.Fatalf("analyzePattern: %v", err)
+			}
+			info.globalID = i
+			in = append(in, &bucket{literal: "", patterns: []*PatternInfo{info}, isFallback: true})
+		}
+		lm := CompileSetOptions{AllowSparseAccept: true, LikelyMode: LikelyMatch}
+		out := promoteSparseBuckets(in, lm, sparsePromotion{
+			astFor: patternSuffixAST, merge: mergeSuffixDFASparseSet, isFallback: true,
+		})
+		anyChain := false
+		for _, b := range in {
+			if _, _, ok := isCountedClassChain(b.patterns[0].suffixDFA); ok {
+				anyChain = true
+				break
+			}
+		}
+		if anyChain && len(out) != len(in) {
+			t.Errorf("under LikelyMatch, promoted %d counted-chain singletons into %d buckets; want no promotion",
+				len(in), len(out))
+		}
+	}
+
+	// The ANCHORED packer's promotion does not inherit the
+	// find path's refusals: a validator set of `^...$` patterns is exactly
+	// what the promotion exists for, and start-anchored is not a
+	// disqualifier there (an anchored capability matches from position 0).
+	{
+		var pp, sp dfaPool
+		var in []*bucket
+		for i := 0; i < bucketMaskBits+8; i++ {
+			info, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`^kw%03d[0-9]+$`, i)}, &pp, &sp)
+			if err != nil {
+				t.Fatalf("analyzePattern: %v", err)
+			}
+			info.globalID = i
+			solo, err := mergeAnchoredDFA([]*syntax.Regexp{patternFullAST(info)}, opts)
+			if err != nil {
+				t.Fatalf("mergeAnchoredDFA: %v", err)
+			}
+			in = append(in, &bucket{patterns: []*PatternInfo{info}, suffixDFA: solo,
+				suffixStates: solo.numStates, isFallback: true})
+		}
+		out := promoteSparseBuckets(in, opts, sparsePromotion{
+			astFor: patternFullAST, merge: mergeAnchoredDFASparseSet, anchored: true,
+		})
+		sparseCount := 0
+		for _, b := range out {
+			if b.sparse {
+				sparseCount++
+			}
+		}
+		if sparseCount != 1 {
+			t.Errorf("anchored promotion of %d `^...$` patterns produced %d sparse buckets, want 1 (got %d buckets)",
+				len(in), sparseCount, len(out))
 		}
 	}
 }

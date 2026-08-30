@@ -1,12 +1,12 @@
 package fuzz
 
-// SETS_PLAN item 20, task 20.B: parameter 7 of a set suffix function carries
-// EITHER a gate-array pointer (gated find) OR §19's skip count (overlapping
+// Parameter 7 of a set suffix function carries
+// EITHER a gate-array pointer (gated find) OR the batch skip count (overlapping
 // batch) — never both, and the two forms have the same arity, so conflating
 // them is a silent wrong answer rather than a validation error.
 //
 // The BT suffix body read parameter 7 as a gate pointer in both cases. On an
-// overlapping batch set that means (a) the §3.16 empty-extent block
+// overlapping batch set that means (a) the empty-extent block
 // dereferences `skip + id*4` as an address, and (b) skip is never honoured, so
 // a batch resume at a split position re-delivers the BT bucket's tuple.
 //
@@ -83,7 +83,7 @@ func runBTBatch(t *testing.T, w []byte, pats []string, input string, outCap int3
 		t.Fatalf("parse data section: %v", err)
 	}
 	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	// The overlapping batch entry takes the gate array too since SETS_PLAN
+	// The overlapping batch entry takes the gate array too, as the
 	// item 11 — not for match gates, which it records none of, but as the
 	// per-drive home of the preflight verdict. Zeroed here: that is what
 	// declares a fresh drive.
@@ -139,7 +139,7 @@ func runBTBatch(t *testing.T, w []byte, pats []string, input string, outCap int3
 	return out
 }
 
-// TestBTOverlappingBatchHonoursSkip is task 20.B's regression.
+// TestBTOverlappingBatchHonoursSkip is the skip-parameter regression.
 //
 // The set deliberately mixes an empty-extent-capable pattern with one that
 // shares its start positions, so a single input exercises both halves of the
@@ -155,7 +155,7 @@ func TestBTOverlappingBatchHonoursSkip(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 	if nBT == 0 {
-		t.Skip("no BT bucket was created — nothing of task 20.B is exercised")
+		t.Skip("no BT bucket was created — nothing of the skip path is exercised")
 	}
 	t.Logf("%d BT bucket(s)", nBT)
 
@@ -190,7 +190,7 @@ func TestBTOverlappingFindMatchesBatch(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 	if nBT == 0 {
-		t.Skip("no BT bucket was created — nothing of task 20.B is exercised")
+		t.Skip("no BT bucket was created — nothing of the skip path is exercised")
 	}
 
 	got, hang, runErr := runWasmSetFind(w, input, len(pats))

@@ -461,6 +461,12 @@ The rules:
   pass `0, 0` beyond that rather than pass a truncated region.
 - **The cache belongs to one drive.** It holds the answer for one `(input,
   pattern set)` pair; re-zero the header to start a new drive.
+- **Same region on every call of a drive, or none.** The sweep writes its
+  tuples once and later calls serve out of them by index, so passing a
+  different `cache_ptr` (or offering it on some calls and declining on others)
+  mid-drive serves indices into a region that no longer holds what they name.
+  Offer the same `(cache_ptr, cache_len)` on every call, or `0, 0` on every
+  call.
 
 The engine may decline even when offered a large enough region: the sweep is
 emitted only where it reproduces the per-position semantics exactly (one

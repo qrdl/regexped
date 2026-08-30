@@ -1,6 +1,6 @@
 package fuzz
 
-// SETS_PLAN item 20 decision 3 moves a set's `_all` capabilities to the
+// A Backtracking member moves a set's `_all` capabilities to the
 // out_ptr/count form whenever the set has a Backtracking member, at ANY id
 // space. That switch has to reach every emitter that answers an `_all`
 // question, and two of them were missed on the first pass — both of which

@@ -5,7 +5,7 @@ import "github.com/qrdl/regexped/internal/utils"
 // Bitmask-only bucket probes.
 //
 // `find` is the only capability that reports positions and extents. The other
-// six ask a strictly cheaper question — "which patterns match?" — and §5's
+// six ask a strictly cheaper question — "which patterns match?" — and the
 // specialisation table says they must not pay for the machinery `find` needs:
 // no per-pattern endPos locals, no immBitmask lookup, no output buffer, no
 // leftmost-first extent resolution. What they need is one bitmask.
@@ -17,7 +17,7 @@ import "github.com/qrdl/regexped/internal/utils"
 //	                 this position", which is what the scan trio asks per
 //	                 candidate position.
 //	anchored probe — pattern k is reported iff the run reaches `len` in a state
-//	                 accepting for k. That is full consumption (§3.3), the
+//	                 accepting for k. That is full consumption, the
 //	                 anchored trio's contract: a pattern matching a proper
 //	                 prefix does NOT count.
 //
@@ -33,7 +33,7 @@ import "github.com/qrdl/regexped/internal/utils"
 //     Required by `scan_all`, whose answer is the full bitmask at this start.
 //   - probeExitFirstHit: stop at the first bit. Legal for `scan` (boolean) and
 //     for `scan_any`, which owes the earliest matching START plus AN ARBITRARY
-//     id at that start (§3.5) — emitRecordProbe keys on c.lStart, not on walk
+//     id at that start — emitRecordProbe keys on c.lStart, not on walk
 //     progress, so exiting early changes at most WHICH arbitrary id is
 //     reported, which the contract permits. Using it for `scan_all` would
 //     silently drop bits.
@@ -61,11 +61,11 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 	l := p.l
 	tableMemIdx := p.tableMemIdx
 	n := len(p.patternIDs)
-	if n > 32 {
+	if n > bucketMaskBits {
 		n = 32
 	}
 	validBits := uint32(0xFFFFFFFF)
-	if n < 32 {
+	if n < bucketMaskBits {
 		validBits = uint32(1)<<uint(n) - 1
 	}
 
@@ -362,7 +362,7 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 	return b
 }
 
-// buildCountedChainProbeBody is the counted-class-chain (task 5) equivalent of
+// buildCountedChainProbeBody is the counted-class-chain equivalent of
 // buildSetProbeBody: the bucket is a single pattern whose suffix is exactly N
 // bytes of one class, so "does it match" is one SIMD verification and needs no
 // DFA walk at all. Returns bit 0 (the bucket's only pattern) or 0.
@@ -541,8 +541,8 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs [
 		patternIDs:  make([]int, numPatterns),
 		tableMemIdx: tableMemIdx,
 		// G7 + G11: states this anchored walk may bulk-skip through — the
-		// wide-self-loop flavour (§18.3) followed by the small-self-loop one
-		// (§21.2). Exception mode goes first so it keeps the cheaper compare
+		// wide-self-loop flavour followed by the small-self-loop one.
+		// Exception mode goes first so it keeps the cheaper compare
 		// chain's position when both fire.
 		dominantSkip: append(dominantWalkStates(t), memberWalkStates(t)...),
 	}

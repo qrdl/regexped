@@ -125,8 +125,8 @@ func TestSetBTMatchesGo(t *testing.T) {
 	}
 }
 
-// TestSetBTManyFallbackPatterns is the permanent regression for SETS_PLAN
-// item 20 task 20.A, and it is deliberately a MULTI-pattern all-fallback set:
+// TestSetBTManyFallbackPatterns is the permanent regression for the shared-region
+// shared BT region, and it is deliberately a MULTI-pattern all-fallback set:
 // the defect it guards needs a second fallback pattern to exist at all.
 //
 // compileFallback's bin-packer used to merge later fallback patterns INTO a BT
@@ -180,7 +180,7 @@ func TestSetBTManyFallbackPatterns(t *testing.T) {
 	}
 }
 
-// TestSetBTCaptureBearingPatterns is the regression for SETS_PLAN item 20
+// TestSetBTCaptureBearingPatterns is the regression for the capture-bearing
 // bugs 1 and 2, which turned out to be ONE root cause with two very different
 // symptoms.
 //

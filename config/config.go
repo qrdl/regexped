@@ -29,7 +29,7 @@ type BuildConfig struct {
 	// It exists because two stubs generated from two configs into ONE package
 	// collide on exactly those shared names. Today only C guards against that,
 	// with its REGEXPED_TYPES_DEFINED include guard; Go and TS have no
-	// equivalent, and the shared Span and error type of TODO task 62 widen the
+	// equivalent, and the shared Span and error type widen the
 	// exposure. A NO-OP for Rust, whose `pub mod <import_module>` wrapper
 	// already isolates every stub.
 	Namespace    string `yaml:"namespace"`
@@ -58,11 +58,11 @@ type BuildConfig struct {
 //
 //	match_*  — anchored: the match must span the whole input (0..len).
 //	scan_*   — non-anchored: takes an `offset`.
-//	_any     — one arbitrary matching pattern id (a set is unordered, §3.5).
+//	_any     — one arbitrary matching pattern id (a set is unordered).
 //	_all     — every matching pattern id.
 //	find     — reports positions and extents.
 //
-// TWO KEYS WERE RETIRED by TODO task 59, and both are load errors rather than
+// TWO KEYS WERE RETIRED, and both are load errors rather than
 // silently-accepted no-ops (strict YAML decoding does that for free):
 //
 //   - `match:` and `scan:` — decision (2). `match_any(...) >= 0` is exactly
@@ -116,7 +116,7 @@ type SetCapability struct {
 }
 
 // Capabilities returns the set's declared capabilities in a stable order
-// (the §3.12 grid order: match_any, match_all, scan_any, scan_all, find).
+// (the grid order: match_any, match_all, scan_any, scan_all, find).
 // Undeclared capabilities are omitted.
 func (s SetConfig) Capabilities() []SetCapability {
 	all := []SetCapability{
@@ -152,8 +152,7 @@ func (s SetConfig) Gated() bool {
 func (s SetConfig) HasFind() bool { return s.Find != "" }
 
 // BatchFind reports whether this set asked for `find` to work several
-// positions ahead per host crossing, via `hints: [batch-find]` (TODO task 59
-// decision (11)).
+// positions ahead per host crossing, via `hints: [batch-find]`.
 //
 // The hint is meaningless without something to batch, so it implies `find`.
 // Emission is keyed on the HINT and never on stub_type: docs/cli.md states
@@ -266,7 +265,30 @@ func (s SetConfig) IDSpaceSize(cfg BuildConfig) int {
 // writes this name.
 func SetBatchExportName(find string) string { return find + "_batch" }
 
-// SetCursorKBits returns how many bits the §19 find_batch cursor reserves for
+// SetCursorMaxPatterns is the largest number of patterns a BATCHING set may
+// hold: the cursor's k field is capped at SetCursorKBits' 24 bits, so past
+// this the field cannot represent every intra-position resume index and a
+// split position would resume at the wrong tuple.
+const SetCursorMaxPatterns = 1 << 24
+
+// setBatchPatternCount returns a set's member count and whether it is within
+// SetCursorMaxPatterns. A set with no `batch-find` hint has no cursor at all
+// and is always ok.
+//
+// Extracted from ValidateSets so the bound is testable: tripping it in place
+// would mean building a slice of 16,777,217 pattern names.
+func setBatchPatternCount(s SetConfig, cfg *BuildConfig) (n int, ok bool) {
+	if !s.BatchFind() {
+		return 0, true
+	}
+	n = len(s.Patterns.Names)
+	if s.Patterns.All {
+		n = len(cfg.Regexps)
+	}
+	return n, n <= SetCursorMaxPatterns
+}
+
+// SetCursorKBits returns how many bits the find_batch cursor reserves for
 // its intra-position resume index, for a set of patternCount patterns: the
 // smallest width holding every value in [0, patternCount].
 //
@@ -275,9 +297,10 @@ func SetBatchExportName(find string) string { return find + "_batch" }
 // so the layout must have ONE definition both sides call rather than two that
 // can drift.
 //
-// Capped at 24 so count keeps at least 8 bits. A set with more than 16M
-// patterns is pathological, and the cap costs a shorter batch rather than a
-// count that overflows into the k field.
+// Capped at 24 so count keeps at least 8 bits. Past 2^24 patterns the cap is
+// no longer merely "a shorter batch": k can no longer represent every
+// intra-position index, and a set that large is REJECTED at config load
+// (see ValidateSets) rather than compiled to a cursor that silently wraps.
 func SetCursorKBits(patternCount int) int {
 	kb := 0
 	for kb < 24 && (1<<uint(kb)) <= patternCount {
@@ -286,18 +309,33 @@ func SetCursorKBits(patternCount int) int {
 	return kb
 }
 
+// WideBitmapThreshold is the ID SPACE above which the `_all` pair switches from
+// an i64 bitmask return to a caller-provided bitmap (docs/sets.md).
+//
+// It lives in config because BOTH sides of the ABI must agree on it: the
+// compiler picks the emitted signature from it, and the six stub generators
+// pick the declared one — and generate/set_stub.go's comment says its copy
+// "MUST track compiledSet.wideAll() exactly". A threshold spelled as a bare
+// literal in two packages is one that can drift.
+const WideBitmapThreshold = 64
+
 // SetCursorCountBits is the width of the find_batch cursor's count field.
 func SetCursorCountBits(patternCount int) int { return 32 - SetCursorKBits(patternCount) }
 
 // SetCursorMaxCount is the largest tuple count one find_batch call can report.
 // The emitted body clamps out_cap to it.
+//
+// Computed in uint64 and narrowed AFTER the subtraction. The old form built
+// `uint32(1) << countBits` first, which is 0 when countBits is 32 (a set with
+// no patterns) and relies on int32 wraparound to come back to -1 — a clamp of
+// -1 would make every call report "no room".
 func SetCursorMaxCount(patternCount int) int32 {
-	return int32(uint32(1)<<uint(SetCursorCountBits(patternCount))) - 1
+	return int32((uint64(1) << uint(SetCursorCountBits(patternCount))) - 1)
 }
 
 // SetCursorOverflowPos is the resume-position word reserved to mean "the
 // Backtracking engine exhausted its frame budget, and this scan's result is
-// UNKNOWN" (SETS_PLAN item 20 decision 3). A find_batch call returning it has
+// UNKNOWN". A find_batch call returning it has
 // answered nothing: its count field is zero and no tuples were written.
 //
 // It lives in the POSITION word, beside 0xFFFFFFFF for "done", rather than in
@@ -314,8 +352,7 @@ func SetCursorMaxCount(patternCount int) int32 {
 const SetCursorOverflowPos = 0xFFFFFFFE
 
 // SetOverlapCacheHeaderBytes is the size of the header at the front of the
-// answer cache an `overlapping: true` batching `find` may be handed
-// (SETS_PLAN item 11 stage C).
+// answer cache an `overlapping: true` batching `find` may be handed.
 //
 // It lives here, beside the cursor layout, for the same reason that does: it
 // is an ABI fact the compiler and every stub generator must agree on
@@ -408,7 +445,7 @@ func ValidHints(hints []string) bool {
 //
 // "batch-find" USED TO BE rejected on a sets: entry, on the reasoning that a
 // set's `find` returns one complete position per call and there was nothing
-// left for a batch knob to size. TODO task 59 decision (11) reverses that: it
+// left for a batch knob to size. reverses that: it
 // is now how a set asks for batching at all, replacing the retired
 // `find_batch:` key. It still requires `find` on the same set — see
 // SetConfig.BatchFind — which is checked where the set is validated rather
@@ -437,12 +474,21 @@ func validateHintList(hints []string) error {
 // cfg. Returns an error naming the first offending entry and problem found.
 func validateHints(cfg *BuildConfig) error {
 	for _, re := range cfg.Regexps {
+		label := re.Name
+		if label == "" {
+			label = re.Pattern
+		}
 		if err := validateHintList(re.Hints); err != nil {
-			label := re.Name
-			if label == "" {
-				label = re.Pattern
-			}
 			return fmt.Errorf("regexp %q: hints: %w", label, err)
+		}
+		// "batch-find" batches a find or groups DRIVE. On an entry with
+		// neither there is nothing to batch, and accepting the hint silently
+		// left the caller believing they had asked for something — the same
+		// reasoning the set arm below already applied.
+		for _, h := range re.Hints {
+			if h == "batch-find" && re.FindFunc == "" && re.GroupsFunc == "" {
+				return fmt.Errorf("regexp %q: hints: \"batch-find\" requires find_func or groups_func on the same entry", label)
+			}
 		}
 	}
 	for _, sc := range cfg.Sets {
@@ -501,13 +547,14 @@ func ValidateSets(cfg *BuildConfig) error {
 				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
 			}
 			exportNames[name] = owner
-			// Reserve the name the "batch-find" hint would synthesize for this
-			// entry, so a later set capability cannot silently claim it. This
-			// is why set names ending in "_batch" no longer need a blanket ban:
-			// only the names that can actually collide are taken, which leaves
-			// `find_batch: my_find_batch` — the obvious name for the §19
-			// capability — available.
-			exportNames[name+"_batch"] = owner + " (batch export)"
+			// No `name+"_batch"` reservation here. ONE mechanism, and it is
+			// the suffix ban above: nothing may be named `*_batch` at all, so
+			// a reservation of a name that is already unusable can never fire.
+			// The comment that stood here described the opposite design —
+			// "set names ending in _batch no longer need a blanket ban" —
+			// which the ban three lines up contradicts, and it cited
+			// `find_batch:` as the name it kept available, a config key
+			// retired.
 		}
 	}
 	for _, s := range cfg.Sets {
@@ -553,12 +600,20 @@ func ValidateSets(cfg *BuildConfig) error {
 				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
 			}
 			exportNames[name] = owner
-			if c.Field == "find" {
-				exportNames[SetBatchExportName(name)] = owner + " (batch export)"
-			}
+			// See the regexp side above: the `*_batch` suffix ban is the one
+			// mechanism, so there is nothing to reserve.
 		}
 		if !s.Patterns.All && len(s.Patterns.Names) == 0 {
 			return fmt.Errorf("set %q: patterns is required (use \"all\" or a non-empty list of pattern names)", s.Name)
+		}
+		// The find_batch cursor's k field is capped at 24 bits, so past
+		// 2^24 members it cannot hold every intra-position resume index and a
+		// split position would resume at the wrong tuple. Rejected rather than
+		// compiled to a cursor that wraps. Only a batching
+		// set has a cursor at all.
+		if n, ok := setBatchPatternCount(s, cfg); !ok {
+			return fmt.Errorf("set %q: %d patterns exceeds the find_batch cursor's %d-pattern limit; drop the \"batch-find\" hint or split the set",
+				s.Name, n, SetCursorMaxPatterns)
 		}
 		if !s.Patterns.All {
 			seen := make(map[string]bool, len(s.Patterns.Names))
@@ -588,7 +643,7 @@ type RegexEntry struct {
 	FindFunc   string `yaml:"find_func"`   // non-anchored find → an iterator of (start, end)
 	GroupsFunc string `yaml:"groups_func"` // captures → an iterator of matches, each carrying its groups
 
-	// `named_groups_func:` was RETIRED by TODO task 62 and is a load error,
+	// `named_groups_func:` was RETIRED and is a load error,
 	// which strict YAML decoding gives for free. It was never a separate
 	// capability: both stubs called the SAME WASM export, and the two differed
 	// only in how the item was assembled — a map keyed by name instead of a
@@ -648,6 +703,18 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	if len(cfg.Regexps) == 0 {
 		return BuildConfig{}, fmt.Errorf("config %s has no regexps", configPath)
 	}
+	// An EMPTY pattern was accepted and compiled to something that matches the
+	// empty string everywhere — almost certainly a YAML slip (a missing value,
+	// or a quoting mistake that ate the pattern) rather than an intent.
+	for i, re := range cfg.Regexps {
+		if re.Pattern == "" {
+			label := re.Name
+			if label == "" {
+				label = fmt.Sprintf("#%d", i)
+			}
+			return BuildConfig{}, fmt.Errorf("config %s: regexp %s has an empty pattern", configPath, label)
+		}
+	}
 
 	// Resolve all paths relative to the config file's directory.
 	cfg.Output = resolveFilePath(configDir, cfg.Output)
@@ -666,6 +733,14 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	}
 	if err := validateHints(&cfg); err != nil {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
+	// An unrecognised `stub_type` used to pass the `compile` command silently
+	// and only fail at `generate`. It is a typo either way, and the config
+	// that carries it is wrong from the moment it is loaded.
+	if cfg.StubType != "" {
+		if _, err := ResolveStubType(cfg); err != nil {
+			return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+		}
 	}
 
 	return cfg, nil

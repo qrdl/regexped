@@ -483,7 +483,7 @@ func TestTDFAU16TableAddressing(t *testing.T) {
 // the test plan T31. (?:(a)|(b)): the nested alternation's Out branch doesn't
 // reach the target/capture being searched for, so the epsilon walk must
 // fall through to Arg. Top-level Op is OpAlternate (not OpCapture/OpConcat),
-// so task 41's whole-pattern-single-capture shortcut never applies
+// so the whole-pattern-single-capture shortcut never applies
 // regardless of MaxCap — confirmed live.
 func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:(a)|(b))`, GroupsFunc: "g"}})
@@ -493,7 +493,7 @@ func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
 // discovery via tdfaEpsCapOpsTo for a start PC that isn't the main entry
 // target (newTDFA's comment: "e.g. (a*) reaching InstMatch") — the test plan T32.
 // (a*) alone reaches InstMatch via a pure-epsilon path from Start, exactly
-// the mechanism this targets — but it also trips task 41's whole-pattern-
+// the mechanism this targets — but it also trips the whole-pattern-
 // single-capture shortcut (MaxCap()==1, confirmed live), which would bypass
 // TDFA construction entirely. (a*)(b*) keeps both groups nullable (so
 // InstMatch is still reachable via pure epsilon from Start, preserving the

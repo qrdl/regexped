@@ -1,6 +1,6 @@
 // likelytest is a focused benchmark harness that compares regexped's WASM output
 // across the three LikelyMode compile modes (neutral, likely-match, likely-nomatch)
-// for a hand-picked set of patterns where the the LikelyMode design structural optimisations
+// for a hand-picked set of patterns where the LikelyMode design's structural optimisations
 // (SIMD counted-chain verify, SIMD dominant-self-loop skip) are expected to
 // move the needle.
 //
@@ -19,7 +19,7 @@
 // a mismatch prints CORRECTNESS FAIL to stderr and the run exits non-zero.
 //
 // Note: LikelyMode is a stub today — all three modes produce identical WASM. The
-// columns will only diverge once the the LikelyMode design optimisations land in compile/.
+// columns will only diverge once the LikelyMode design's optimisations land in compile/.
 // Run via `make run` from this directory.
 package main
 
@@ -47,7 +47,6 @@ const (
 	inputBase  = int32(0)
 	slotsBase  = int32(65536)  // page 1: keep clear of input (up to 64 KiB at offset 0)
 	tableBase  = int64(131072) // page 2; pages 0-1 reserved for input + slots
-	benchIters = 10_000
 	fuelBudget = uint64(10_000_000_000)
 )
 
@@ -166,12 +165,12 @@ var tests = []testCase{
 		name:         "lit-anchor-dominant-body",
 		pattern:      `[0-9]{4}INFO:[^\n]+`,
 		mode:         modeFind,
-		notes:        "lit-anchor + mid-accept dominant body — task 22 (backward prefix-scan) target",
+		notes:        "lit-anchor + mid-accept dominant body — backward prefix-scan target",
 		matchInput:   litAnchorDominantBodyInput(true),
 		nomatchInput: litAnchorDominantBodyInput(false),
 	},
 	{
-		// Task 22 target: a bounded-but-larger class-count prefix
+		// a bounded-but-larger class-count prefix
 		// (`{16}`, a trace-ID-style sequence number) before the same
 		// `INFO:` literal + dominant-body suffix shape. A SHORT bounded
 		// count like lit-anchor-dominant-body's `{4}` doesn't actually
@@ -184,7 +183,7 @@ var tests = []testCase{
 		name:         "lit-anchor-false-positive-literal",
 		pattern:      `[0-9]{16}INFO:[^\n]+`,
 		mode:         modeFind,
-		notes:        "lit-anchor backward prefix-scan, 15-digit near-miss false-positives — task 22 target",
+		notes:        "lit-anchor backward prefix-scan, 15-digit near-miss false-positives — backward prefix-scan target",
 		matchInput:   litAnchorLongPrefixMatchInput(),
 		nomatchInput: litAnchorFalsePositiveInput(),
 	},
@@ -212,7 +211,7 @@ var tests = []testCase{
 		nomatchInput: btAction5Input(false),
 	},
 	{
-		// Task 8 target: pattern with greedy class quantifier followed by a
+		// pattern with greedy class quantifier followed by a
 		// required suffix that doesn't appear anywhere. From every starting
 		// position the DFA self-loops through the same letter run and dies
 		// at the same delimiter — O(N²) work without dead-state skip.
@@ -224,12 +223,12 @@ var tests = []testCase{
 		name:         "deadskip-near-miss",
 		pattern:      `[a-zA-Z]+\d`,
 		mode:         modeFind,
-		notes:        "near-miss greedy quantifier — Task 8 (dead-state skip) target",
+		notes:        "near-miss greedy quantifier — dead-state skip target",
 		matchInput:   deadSkipNearMissInput(true),
 		nomatchInput: deadSkipNearMissInput(false),
 	},
 	{
-		// Task 8 follow-up #2 target: min-length quantifier skip. Pattern
+		// Min-length quantifier skip. Pattern
 		// requires >=50 lowercase letters followed by a digit. Suffix is a
 		// character CLASS, not a literal, so no mandatory-literal frontend
 		// applies (confirmed by probe: fuel scales linearly for an
@@ -239,7 +238,7 @@ var tests = []testCase{
 		//
 		// No-match input is 2000 lowercase letters with no digit anywhere:
 		// the DFA never dies (stays in-class the whole way) and never runs
-		// short of input (Task 8's dead-state skip and follow-up #1's
+		// short of input (the dead-state skip and follow-up #1's
 		// EOF-without-match check both stay silent), so every attempt from
 		// position k scans forward to EOF before failing — the pattern is
 		// entirely captured by neither prior fix. Confirmed via direct fuel
@@ -257,7 +256,7 @@ var tests = []testCase{
 		name:         "minlen-quantifier-skip",
 		pattern:      `[a-z]{50,}[0-9]`,
 		mode:         modeFind,
-		notes:        "no mandatory literal, never dies, never runs short — Task 8 follow-up #2 target",
+		notes:        "no mandatory literal, never dies, never runs short — min-length quantifier skip target",
 		matchInput:   minLenQuantifierSkipInput(true),
 		nomatchInput: minLenQuantifierSkipInput(false),
 	},
@@ -286,11 +285,11 @@ var tests = []testCase{
 		nomatchInput: setShuftiLNMInput(false),
 	},
 	{
-		// Task 28 target: same 21-pattern [A-U] set as set-shufti-lnm, but
+		// same 21-pattern [A-U] set as set-shufti-lnm, but
 		// the no-match input is DENSE in the tracked first-byte set instead
 		// of sparse — the "rarely matches" assumption LikelyNoMatch bakes
 		// into forcing Shufti doesn't hold here. Mirrors alpha-run/word-run
-		// (task 25's single-pattern version of this same footgun), which
+		// (the single-pattern version of this same footgun), which
 		// EmitPrefixScan's DenseCounter/DenseSkipFlag adaptive switch
 		// already protects against — buildSetSuffixBody's Shufti frontend
 		// (emitSetMatchFnFinalShufti) has no equivalent protection yet.
@@ -310,7 +309,7 @@ var tests = []testCase{
 			`U1:[^\n]+`,
 		},
 		mode:         modeSet,
-		notes:        "set with 21 [A-U]-prefixed literals, DENSE no-match data — task 28 (Shufti dense-data harm) target",
+		notes:        "set with 21 [A-U]-prefixed literals, DENSE no-match data — Shufti dense-data harm target",
 		matchInput:   setShuftiDenseHarmInput(true),
 		nomatchInput: setShuftiDenseHarmInput(false),
 	},
@@ -328,17 +327,17 @@ var tests = []testCase{
 		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
 	},
 	{
-		// Task 41 BT-routed sibling of tdfa-bulk-skip-word-class above:
+		// BT-routed sibling of tdfa-bulk-skip-word-class above:
 		// `([^,]+)` is also a whole-pattern single capture, but the
-		// inverted class trips hasAmbiguousCaptures (task 13) and routes
+		// inverted class trips hasAmbiguousCaptures and routes
 		// to Backtracking instead of TDFA. Same shape (10 KB self-loop
 		// run + one-byte offset between match/nomatch inputs) confirms
-		// the task 41 shortcut's fuel win isn't TDFA-specific — it should
+		// the shortcut's fuel win isn't TDFA-specific — it should
 		// eliminate BT's ~40 fuel/byte captureBody re-walk here too.
 		name:         "bt-groups-whole-capture-inverted-class",
 		pattern:      `([^,]+)`,
 		mode:         modeGroups,
-		notes:        "BT-routed whole-pattern single capture (inverted class) — task 41 BT sibling",
+		notes:        "BT-routed whole-pattern single capture (inverted class) — BT sibling",
 		matchInput:   strings.Repeat("aB3_", 2560) + ",",
 		nomatchInput: "," + strings.Repeat("aB3_", 2560),
 	},
@@ -391,7 +390,7 @@ var tests = []testCase{
 	{
 		// LM-3 target: non-mid-accept 9-64-byte self-loop body
 		// (`[^>]+` after a 1-byte literal `<`), dense tags every ~20 bytes.
-		// Today's Shufti self-loop bulk-skip (task 26) is mid-accept only;
+		// Today's Shufti self-loop bulk-skip is mid-accept only;
 		// this shape's accept state sits at `>`, one byte AFTER the
 		// self-loop, i.e. non-mid — uncovered until LM-3.
 		name:         "dense-tags",
@@ -433,7 +432,7 @@ var tests = []testCase{
 	},
 	{
 		// LM-4 target: bare (no literal prefix) 9-64-byte-class self-loop —
-		// detectShuftiSelfLoop bails on len(l.prefix)==0 today (task 34's
+		// detectShuftiSelfLoop bails on len(l.prefix)==0 today (the
 		// gate). Runs vary 10-30 bytes so the self-loop is exercised
 		// repeatedly rather than as one giant run.
 		name:         "dense-bare-upper",
@@ -482,7 +481,7 @@ var tests = []testCase{
 		// regardless of LikelyMode, so that shape produces byte-identical
 		// WASM across all three modes and exercises nothing. This pair, by
 		// contrast, lands in the same bucketByLiteral group and binPack's
-		// constraint checks merge them under neutral, losing task 5's
+		// constraint checks merge them under neutral, losing the
 		// single-pattern SIMD suffix body for both. LM-6 gates a refusal on
 		// this exact shape.
 		name: "dense-set-shared-prefix",
@@ -644,7 +643,7 @@ func litAnchorDominantBodyInput(withMatches bool) string {
 }
 
 // litAnchorLongPrefixMatchInput builds ~50 KB of match input for
-// `[0-9]{16}INFO:[^\n]+` (task 22): 2 long matches, each with a full
+// `[0-9]{16}INFO:[^\n]+`: 2 long matches, each with a full
 // 16-digit prefix immediately before "INFO:".
 func litAnchorLongPrefixMatchInput() string {
 	const targetSize = 50 * 1024
@@ -667,7 +666,7 @@ func litAnchorLongPrefixMatchInput() string {
 }
 
 // litAnchorFalsePositiveInput builds ~50 KB of no-match input for
-// `[0-9]{16}INFO:[^\n]+` (task 22). Scatters "INFO:" occurrences through
+// `[0-9]{16}INFO:[^\n]+`. Scatters "INFO:" occurrences through
 // digit-free filler, each preceded by exactly 15 consecutive digits — one
 // short of the 16 required, so [0-9]{16}INFO: never actually matches, but
 // buildLitAnchorBackScanBody's scalar reverse walk must still consume all 15
@@ -716,7 +715,7 @@ func deadSkipNearMissInput(withMatches bool) string {
 	return string(b)
 }
 
-// minLenQuantifierSkipInput builds inputs for the Task 8 follow-up #2
+// minLenQuantifierSkipInput builds inputs for the min-length quantifier-skip
 // target (pattern `[a-z]{50,}[0-9]`, no-match input never dies and never
 // runs short of input — see likelytest case "minlen-quantifier-skip").
 func minLenQuantifierSkipInput(withMatches bool) string {
@@ -777,7 +776,7 @@ func setShuftiLNMInput(withMatches bool) string {
 	return string(b[:targetSize])
 }
 
-// setShuftiDenseHarmInput builds ~50 KB for the task 28 set-shufti-dense-harm
+// setShuftiDenseHarmInput builds ~50 KB for the set-shufti-dense-harm
 // case — the harm-side counterpart to setShuftiLNMInput's win-side prose.
 //
 // When withMatches is false: solid A-U letters with no gaps at all (no
@@ -1371,12 +1370,20 @@ func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 		if packed < 0 {
 			return
 		}
-		relStart := int32(packed >> 32)
-		relEnd := int32(packed & 0xFFFFFFFF)
-		if relEnd > relStart {
-			off += relEnd
+		// ABSOLUTE, not relative. the export takes the whole
+		// buffer plus a start position, and the packed halves are positions in
+		// that buffer — so the advance is an ASSIGNMENT, not an increment.
+		// `off += absEnd` roughly DOUBLED off every iteration, so a
+		// match-dense 50 KB input "exhausted" in ~17 calls instead of ~8000
+		// and every exhaustive find row measured a logarithmic sliver of the
+		// drive. checkFindExhaust has always converted correctly, which is why
+		// the correctness gate could not see it.
+		absStart := int32(packed >> 32)
+		absEnd := int32(packed & 0xFFFFFFFF)
+		if absEnd > absStart {
+			off = absEnd
 		} else {
-			off += relStart + 1
+			off = absStart + 1
 		}
 	}
 }
@@ -1727,7 +1734,7 @@ func checkFind(engine *wasmtime.Engine, wasmBytes []byte, input string, re *rege
 //
 // It also applies Go's FindAllIndex suppression rule — an EMPTY match
 // beginning exactly where the previous reported match ended is not reported —
-// because the emitters do (TODO task 54 half B). This harness re-implements
+// because the emitters do. This harness re-implements
 // the iteration rather than driving a stub, so the rule has to be here too, or
 // it disagrees with the product and blames the engine.
 func expectedFindAll(re *regexp.Regexp, input string) [][2]int {
@@ -1846,11 +1853,14 @@ func checkGroups(engine *wasmtime.Engine, wasmBytes []byte, input string, re *re
 	return nil
 }
 
-// expectedGroupsAll mirrors runGroupsExhaust's exact advance rule: advance
-// by the match's own relative end (slots[1] before shifting), or off++ if
-// that's zero. This deliberately differs from expectedFindAll's "end>start"
-// rule — see runGroupsExhaust's doc comment for why groups' generated-stub
-// advance logic isn't the same as find's.
+// expectedGroupsAll mirrors runGroupsExhaust's exact advance rule, on the
+// the ABSOLUTE positions the export reports: advance to the match end,
+// or one past the start when the match is empty.
+//
+// It used to model the pre-task-54 relative rule (advance by slots[1], off++
+// when that is zero) and shift the oracle's own spans by `off` — both of which
+// are now wrong twice over, since the export is handed the whole buffer and
+// returns positions in it.
 func expectedGroupsAll(re *regexp.Regexp, input string) [][]int {
 	var all [][]int
 	off := 0
@@ -1868,10 +1878,10 @@ func expectedGroupsAll(re *regexp.Regexp, input string) [][]int {
 			}
 		}
 		all = append(all, shifted)
-		if relEnd := sub[1]; relEnd > 0 {
-			off += relEnd
+		if absStart, absEnd := shifted[0], shifted[1]; absEnd > absStart {
+			off = absEnd
 		} else {
-			off++
+			off = absStart + 1
 		}
 	}
 	return all
@@ -1898,7 +1908,12 @@ func checkGroupsExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string,
 		for i := 0; i < totalGroups*2*4; i++ {
 			buf[int(slotsBase)+i] = 0xFF
 		}
-		r, err := fn.Call(store, inputBase+off, inputLen-off, slotsBase)
+		// FOUR arguments, and the WHOLE buffer: the groups export has taken
+		// (ptr, len, out_ptr, from) The three-argument
+		// shrinking-window call this replaced was an ARITY error wasmtime
+		// rejected outright, so the exhaustive modeGroups case failed and the
+		// run exited non-zero.
+		r, err := fn.Call(store, inputBase, inputLen, slotsBase, off)
 		if err != nil {
 			return fmt.Errorf("call at off=%d: %w", off, err)
 		}
@@ -1907,19 +1922,21 @@ func checkGroupsExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string,
 		}
 		buf = mem.UnsafeData(store)
 		slots := readSlots(buf, slotsBase, totalGroups)
-		shifted := make([]int, len(slots))
+		// Slots are ABSOLUTE: no +off shift, only the -1 mapping for a group
+		// that did not participate.
+		abs := make([]int, len(slots))
 		for i, v := range slots {
 			if v < 0 {
-				shifted[i] = -1
+				abs[i] = -1
 			} else {
-				shifted[i] = int(off) + v
+				abs[i] = v
 			}
 		}
-		got = append(got, shifted)
-		if relEnd := slots[1]; relEnd > 0 {
-			off += int32(relEnd)
+		got = append(got, abs)
+		if absStart, absEnd := abs[0], abs[1]; absEnd > absStart {
+			off = int32(absEnd)
 		} else {
-			off++
+			off = int32(absStart) + 1
 		}
 	}
 	runtime.KeepAlive(store)

@@ -109,7 +109,7 @@ func TestIsAnchoredFind(t *testing.T) {
 		// Word boundary: \bfoo can match anywhere after a word boundary → not anchored.
 		{`\bfoo`, false},
 
-		// TODO task 47: multi-step dead-end chains. A mid-position ^ / \A gives
+		// Multi-step dead-end chains. A mid-position ^ / \A gives
 		// midStartState live outgoing transitions (so the old one-step check
 		// said "not anchored"), but every state reachable through them needs a
 		// begin-of-text assertion that can never hold after a byte has been
@@ -118,7 +118,7 @@ func TestIsAnchoredFind(t *testing.T) {
 		{`a\Ab`, true},    // same via \A
 		{"^ab|a^b", true}, // real match only via the ^ branch
 		{`0*^0`, true},    // a past defect’s repro
-		{`a$00|^0`, true}, // task 48's fuzzer seed
+		{`a$00|^0`, true}, // a fuzzer seed
 		{`[a-z]^x`, true}, // dead-end reached through a byte class
 		{`(?:\Aa|b\Ac)`, true},
 		{"a^", true},

@@ -157,10 +157,11 @@ func %s(input []byte) (iter.Seq[int], error) {
 // See the wide form's comment for why this is an iterator.
 func %s(input []byte) (iter.Seq[int], error) {
 	raw := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)))
-	// The narrow form's return IS the bitmask, so the sentinel is tested on
-	// the RAW value before the unsigned conversion: -2 as uint64 is
-	// 0xFFFFFFFFFFFFFFFE, which reads as "every id except 0 matched".
-	if raw == %d { return nil, ErrBacktrackOverflow }
+	// NO overflow sentinel here: the narrow form's return IS the bitmask, so
+	// every 64-bit value is a legal answer. -2 is 0xFFFFFFFFFFFFFFFE — ids
+	// 1..63 matched and id 0 did not — which a sentinel test would report as
+	// an engine failure. The real sentinel cannot reach this form: the wide
+	// form is chosen for any set with a Backtracking member.
 	mask := uint64(raw)
 	return func(yield func(int) bool) {
 		for patternID := 0; patternID < %s; patternID++ {
@@ -171,7 +172,7 @@ func %s(input []byte) (iter.Seq[int], error) {
 	}, nil
 }
 
-`, pub, pub, s.MatchAll, btOverflow, idKonst)
+`, pub, pub, s.MatchAll, idKonst)
 			}
 		}
 		if s.ScanAny != "" {
@@ -219,10 +220,11 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 				fmt.Fprintf(&out, `// %s yields the id of every pattern matching somewhere at or after offset.
 func %s(input []byte, offset uint) (iter.Seq[int], error) {
 	raw := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset))
-	// The narrow form's return IS the bitmask, so the sentinel is tested on
-	// the RAW value before the unsigned conversion: -2 as uint64 is
-	// 0xFFFFFFFFFFFFFFFE, which reads as "every id except 0 matched".
-	if raw == %d { return nil, ErrBacktrackOverflow }
+	// NO overflow sentinel here: the narrow form's return IS the bitmask, so
+	// every 64-bit value is a legal answer. -2 is 0xFFFFFFFFFFFFFFFE — ids
+	// 1..63 matched and id 0 did not — which a sentinel test would report as
+	// an engine failure. The real sentinel cannot reach this form: the wide
+	// form is chosen for any set with a Backtracking member.
 	mask := uint64(raw)
 	return func(yield func(int) bool) {
 		for patternID := 0; patternID < %s; patternID++ {
@@ -233,18 +235,28 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 	}, nil
 }
 
-`, pub, pub, s.ScanAll, btOverflow, idKonst)
+`, pub, pub, s.ScanAll, idKonst)
 			}
 		}
 		if s.Find != "" {
 			needsIter = true
 			pub := s.Find
 			// EVERY set with `find` takes the gate array, overlapping included
-			// (SETS_PLAN item 11) — the branch that omitted it was unreachable
+			// — the branch that omitted it was unreachable
 			// and is gone.
 			imp(s.Find, sig("find"))
-			gateDecl := "\t\tgates := make([]uint32, " + idKonst + ")\n"
-			gateArg := "unsafe.Pointer(&gates[0]), "
+			// The gate array and the tuple buffer live in the ITERATOR, not
+			// in the Matches() closure. Breaking out of a range over an
+			// iter.Seq and ranging again is legal, and the generated docs
+			// invite exactly that (break, then check Err()). With the state in
+			// the closure, the second call rebuilt a ZEROED gate array
+			// mid-drive — so a gated set could re-report a pattern inside the
+			// extent of its own earlier match, violating the per-pattern
+			// FindAllIndex contract — and re-drove the last position,
+			// re-yielding tuples the caller had already seen. This is the
+			// shape the Rust and AS iterators already have.
+			gateDecl := "\t\tif iter.gates == nil {\n\t\t\titer.gates = make([]uint32, " + idKonst + ")\n\t\t}\n"
+			gateArg := "unsafe.Pointer(&iter.gates[0]), "
 			gateDoc := " and a zeroed gate array"
 			fmt.Fprintf(&out, `// %[1]sIter iterates the set's matches from position offset. It owns a
 // reusable tuple buffer%[2]s; each step yields one match, and each WASM call
@@ -257,6 +269,13 @@ type %[1]sIter struct {
 	offset uint
 	err    error
 	done   bool
+	// Drive state, held here rather than in the Matches() closure so that
+	// breaking out and ranging again resumes exactly where it stopped.
+	gates []uint32
+	buf   [][3]int32
+	// tuples still owed at iter.offset, and how many of them were consumed.
+	pending  int32
+	consumed int32
 }
 
 // %[1]s starts a scan at offset.
@@ -275,10 +294,31 @@ func (iter *%[1]sIter) Matches() iter.Seq[SetMatch] {
 			return
 		}
 		input := iter.input
-		buf := make([][3]int32, %[4]s)
-%[5]s		pos := int32(iter.offset)
-		for {
-			tupleCount := ffi_%[6]s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), pos, %[7]sunsafe.Pointer(&buf[0]), %[8]s)
+		if iter.buf == nil {
+			iter.buf = make([][3]int32, %[4]s)
+		}
+%[5]s		for {
+			// Tuples left over from a drive that was broken out of mid
+			// position are delivered before any new call is made.
+			for iter.consumed < iter.pending {
+				t := iter.buf[iter.consumed]
+				// Consumed BEFORE the yield: a break must not leave this
+				// tuple owed a second time.
+				iter.consumed++
+				if !yield(SetMatch{
+					PatternID: int(t[0]),
+					Start:     uint(t[1]),
+					End:       uint(t[2]),
+				}) {
+					return
+				}
+			}
+			if iter.pending > 0 {
+				// Every tuple in one call shares a start; resume one past it.
+				iter.offset = uint(iter.buf[0][1] + 1)
+				iter.pending, iter.consumed = 0, 0
+			}
+			tupleCount := ffi_%[6]s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(iter.offset), %[7]sunsafe.Pointer(&iter.buf[0]), %[8]s)
 			// Before the <= 0 test: overflow is "unknown", not "scan
 			// finished", and ending the iteration here would report a partial
 			// answer as a complete one.
@@ -291,19 +331,7 @@ func (iter *%[1]sIter) Matches() iter.Seq[SetMatch] {
 				iter.done = true
 				return
 			}
-			// Every tuple in one call shares a start; resume one past it.
-			next := buf[0][1] + 1
-			for tupleNum := int32(0); tupleNum < tupleCount; tupleNum++ {
-				if !yield(SetMatch{
-					PatternID: int(buf[tupleNum][0]),
-					Start:     uint(buf[tupleNum][1]),
-					End:       uint(buf[tupleNum][2]),
-				}) {
-					return
-				}
-			}
-			pos = next
-			iter.offset = uint(pos)
+			iter.pending, iter.consumed = tupleCount, 0
 		}
 	}
 }
@@ -487,11 +515,10 @@ func %s(ptr unsafe.Pointer, length uint32, outPtr unsafe.Pointer, from uint32) i
 	return ffiDecl + fmt.Sprintf(`// %[1]sIter iterates the non-overlapping matches at or after offset: each
 // step is one MATCH, represented by its capture groups.
 //
-// LIMITATION: offset currently NARROWS the input rather than bounding only the
-// search, so at offset > 0 a leading \b, \B, ^ or (?m:^) judges a truncated
-// left context. The single-pattern WASM exports take no offset; TODO 54 gives
-// them one, after which this stub stops narrowing and the signature is
-// unchanged.
+// offset bounds the SEARCH only: the whole input is passed on every call, so a
+// leading \b, \B, ^ or (?m:^) judges the real preceding byte. A
+// negative result is therefore terminal — there is no match at or after
+// offset — not a reason to try the next position.
 type %[1]sIter struct {
 	input  []byte
 	offset uint
@@ -544,14 +571,14 @@ func (iter *%[1]sIter) Matches() iter.Seq[[]Span] {
 				return
 			}
 			if result < 0 {
-				// No match at THIS position — a different thing from the
-				// sentinel above. Advance and retry.
-				if pos == len(input) {
-					iter.done = true
-					break
-				}
-				pos++
-				continue
+				// Terminal, not "try the next position". the
+				// groups export has SCAN-FROM semantics in both wrapper arms:
+				// a negative result means there is no match at or after pos.
+				// The advance-by-one retry this replaced re-scanned the tail
+				// once per remaining byte — O(n^2) work where the find
+				// iterator does O(n).
+				iter.done = true
+				break
 			}
 			groups := make([]Span, %[6]d)
 			for groupNum := range groups {
@@ -691,7 +718,7 @@ func goABIRet(r abiRet) string {
 }
 
 // genGoGroupIndexConsts emits name→index addressing for a groups function.
-// Replaces the retired `named_groups_func` (TODO task 62); see
+// Replaces the retired `named_groups_func`; see
 // genRustGroupIndexConsts for why that key was never a separate capability.
 //
 // Names follow the config's own casing, so a `groups_func: url_groups` yields
@@ -757,8 +784,7 @@ func %s() []string {
 }
 
 // goErrorPreamble emits the shared vocabulary every generated Go export
-// speaks: the sentinel error, and Span when any pattern reports capture groups
-// (TODO task 62).
+// speaks: the sentinel error, and Span when any pattern reports capture groups.
 //
 // Go reports a failure by RETURNING it, so that is what the stubs do — the
 // panics are gone. Scalars return it last; the two eager set calls return it
@@ -798,7 +824,7 @@ type %s struct {
 // warnUnexportedGoNames emits ONE warning per stub when the file lands in a
 // library package and something the user named will not be visible outside it.
 //
-// Names are emitted verbatim (TODO task 62), so a snake_case config yields
+// Names are emitted verbatim, so a snake_case config yields
 // snake_case Go functions — which Go's export rule makes package-private. That
 // is the USER'S CHOICE and is accepted, not corrected: the name they wrote is
 // the name they call. But it is worth saying once, because Go is the only

@@ -123,8 +123,8 @@ func TestPatternHintsOverridesCallerLikelyMode(t *testing.T) {
 // It originally reached Shufti by accident: 33 literals blew the old 32-NODE
 // AC cap and were silently demoted to scalar. Two
 // measured changes have since taken that route away — the budget now holds a
-// real automaton (§14 P1), and above the first-byte crossover bucketed Teddy
-// beats AC outright (§14.11) — so the set is built with more literals than
+// real automaton, and above the first-byte crossover bucketed Teddy
+// beats AC outright — so the set is built with more literals than
 // teddyMaxLiterals and compiled with ACBudgetBytes pinned to 1. What is
 // asserted is the hint→LikelyMode→Shufti wiring, not a frontend ranking that
 // measurement has overturned twice.

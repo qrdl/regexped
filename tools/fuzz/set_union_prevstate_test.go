@@ -9,7 +9,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// Coverage from the PREV-STATE SKIP episode (SETS_PLAN item 21, Issue 1
+// Coverage from the PREV-STATE SKIP episode (an optimisation refuted on fuel
 // option B — BUILT AND REVERTED 2026-08-28).
 //
 // The skip made the mid-accept recording conditional on `state != lastOr` and
@@ -198,7 +198,7 @@ func TestUnionScanAcceptArmsWide(t *testing.T) {
 
 // TestUnionScanSaturatedRunCost measures the union scan on a long run that
 // keeps the automaton in ACCEPTING states — greedy-3 / 50K a's in miniature,
-// the row SETS_PLAN item 21 Issue 1 is about.
+// the row that episode was about.
 //
 // It exists as a COST guard because that row has now moved twice on emitter
 // changes that no oracle could see, and because measuring it here is what
@@ -282,7 +282,7 @@ func TestUnionScanSaturatedRunCost(t *testing.T) {
 	if perByte > bound {
 		t.Fatalf("saturated scan_all costs %.2f fuel/byte, over the %.1f bound. "+
 			"A run of bytes inside accepting states is the union scan's worst "+
-			"shape and the one SETS_PLAN item 21 Issue 1 tracks; a cost this "+
+			"shape and the one the refuted skip targeted; a cost this "+
 			"far above either recorded figure means the per-byte arm grew.",
 			perByte, bound)
 	}

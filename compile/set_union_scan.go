@@ -15,8 +15,7 @@ import (
 // O(positions x buckets), and on an unbounded pattern it is quadratic in the
 // input: `[^\n]*ERROR` re-scans to the end of the line from each of 100,000
 // positions. It is the 151M-fuel `greedy-3 / no-match / scan` row, and the
-// reason `scan_all` and `find` on that set exhaust even a 4e9 fuel budget
-// (§14.7).
+// reason `scan_all` and `find` on that set exhaust even a 4e9 fuel budget.
 //
 // The fix is the shape regex-automata uses for the same question: ONE
 // left-to-right pass over an automaton that can start a match at any position,
@@ -24,7 +23,7 @@ import (
 // one table lookup and one OR per input byte, independent of pattern count.
 //
 // This serves `scan`, `scan_any` and the narrow `scan_all`:
-//   - `scan_any` joined them under TODO task 59 decision (10). It used to be
+//   - `scan_any` joined them later. It used to be
 //     excluded because it reported WHERE the match started and a forward pass
 //     over a start-anywhere automaton knows only where matches END; with the
 //     start dropped, the accumulator IS its answer — any set bit names a
@@ -52,7 +51,7 @@ type unionScanDFA struct {
 	eofOff    int32 // [numStates] u64: patterns accepting at end of input
 
 	// midAcceptLimit partitions the state space: states [0, midAcceptLimit) can
-	// accept mid-string, the rest cannot (SETS_PLAN item 21 phase 2). It is what
+	// accept mid-string, the rest cannot. It is what
 	// turns the per-byte "does a match end here" question from a table load into
 	// a compare against a constant.
 	//
@@ -61,7 +60,7 @@ type unionScanDFA struct {
 	// all rather than a branch that is never taken.
 	midAcceptLimit int
 
-	// --- the WIDE form (SETS_PLAN item 21 phase 1) ---
+	// --- the WIDE form ---
 	//
 	// maskWords is 1 for every set that fits the u64 accumulator, and
 	// ceil(idSpace/64) above it. When it is > 1 the u64 tables above are NOT
@@ -69,7 +68,7 @@ type unionScanDFA struct {
 	//
 	//   midReprOff/eofReprOff  [numStates] i32 — 0 when the state accepts
 	//     nothing, else SOME accepting global id, plus one. `scan_any` needs
-	//     no more than this: §3.5 leaves which id it reports unspecified, so
+	//     no more than this: which id `scan_any` reports is unspecified, so
 	//     one i32 load replaces a mask load, an OR and an accumulator.
 	//   midWordsOff/eofWordsOff [numStates][rowBytes] — the accept set as a
 	//     bitmap ROW shaped exactly like the caller's `_all` bitmap, so
@@ -79,10 +78,32 @@ type unionScanDFA struct {
 	// bitmapBytes is ceil((maxID+1)/8) — derived from the ids this automaton
 	// can actually set, never from the declared id space, so a row can never
 	// be wider than the caller's allocation even when the two disagree.
-	maskWords   int
+	maskWords int
+	// wideAccept records WHICH ACCEPT FORM was emitted, which is a different
+	// question from how many words a row takes.
+	//
+	// maskWords is (idSpace+63)/64, so it is 1 for a set of 8 ids whichever
+	// form was built — and `isWide()` used to be `maskWords > 1`. Once
+	// buildAnchoredUnionDFA gained forceWideAll, a small set
+	// with a Backtracking member began building WIDE while maskWords stayed 1,
+	// and every reader keyed on isWide() then went to the narrow tables that
+	// the wide path never emits: match_any read acceptOff == -1 and trapped on
+	// a load at 0xFFFFFFFF. The two questions now have two fields.
+	wideAccept  bool
 	rowBytes    int
 	bitmapBytes int
 	distinctIDs int // the `scan_all` early-exit target: ids this union can set
+	// idMask is the set of GLOBAL ids this automaton can report, as a bitmask.
+	// Narrow form only (an i64 cannot hold more than 64 ids); 0 on the wide
+	// path, where nothing consults it.
+	//
+	// It exists so the bodies can tell whether the answer needs restricting to
+	// the BUCKET universe at all: the automaton is built from the spec, which
+	// still names patterns the packer dropped at the state limit, so
+	// idMask &^ fullIDMask() is exactly "ids this walk can set that no bucket
+	// answers for". When that is empty — the ordinary case — the masking is a
+	// no-op and is not emitted.
+	idMask      uint64
 	midReprOff  int32
 	eofReprOff  int32
 	midWordsOff int32
@@ -94,11 +115,14 @@ type unionScanDFA struct {
 }
 
 // isWide reports whether this automaton carries the >64-id accept form.
-func (u *unionScanDFA) isWide() bool { return u != nil && u.maskWords > 1 }
+// isWide reports whether the WIDE accept form was emitted — per-state
+// representative ids plus bitmap rows — rather than the u64 accept/eof tables.
+// See wideAccept for why this is not `maskWords > 1`.
+func (u *unionScanDFA) isWide() bool { return u != nil && u.wideAccept }
 
 // maxUnionScanStates bounds the subset construction. The construction is a
 // `.*`-prefixed union, so it is larger than the plain union it replaces —
-// measured at 1.6x to 4.2x on the shapes that reach it (§14.12) — but it is
+// measured at 1.6x to 4.2x on the shapes that reach it — but it is
 // still a determinisation and can blow up. Over budget, the set keeps the
 // per-position path it has today.
 const maxUnionScanStates = 4096
@@ -109,7 +133,7 @@ const maxUnionScanStates = 4096
 // 8*ceil(idSpace/64)) and the straight-line WASM that ORs it into the caller's
 // bitmap — one unrolled word per 64 ids, in the body, per accepting state.
 //
-// 256 keeps that at four words. It was 64 before SETS_PLAN item 21, not as a
+// 256 keeps that at four words. It was 64 before the wide accept form, not as a
 // budget but because the accumulator was a single u64; the six classchain scan
 // rows were the cost of treating that representation limit as an eligibility
 // limit — a 128-pattern set fell all the way back to the per-position bucket
@@ -120,8 +144,8 @@ const maxUnionScanIDs = 256
 // compressed, mirroring the DFA engine's own "compress once the table exceeds
 // 32 KB" rule (docs/wasm.md).
 //
-// Measured 2026-08-24, four layouts against each other on the SETS_PLAN item
-// 19 shapes, 100 KB no-match, fuel per byte and module bytes:
+// Measured 2026-08-24, four layouts against each other on the two-phase
+// split's shapes, 100 KB no-match, fuel per byte and module bytes:
 //
 //   - u8 state ids are FASTER, not merely free: -2.0 fuel/byte, because the
 //     entry index loses its `*2` shift. Applied unconditionally at <= 256
@@ -156,7 +180,7 @@ const unionTableBudget = 32 * 1024
 //
 // wantAcceptRows asks for the per-state accept BITMAP ROWS even when the set
 // exports no `scan_all` — the gated find preflight reads them in its wide form
-// (SETS_PLAN item 22 fix 2a-wide). It has no effect on a narrow build, where
+// . It has no effect on a narrow build, where
 // the u64 accept pair is emitted instead and the rows do not exist at all.
 func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unionScanDFA {
 	if len(spec.Patterns) == 0 {
@@ -170,7 +194,7 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 	// a set into the wide form and change a module that has no need to move;
 	// and a row sized by the ids present can never be wider than the caller's
 	// bitmap, which is sized by the declared bound and therefore at least as
-	// large (§11 R1's hazard, in the direction that is safe).
+	// large (the id-space hazard, in the direction that is safe).
 	maxID := -1
 	for _, id := range spec.PatternIDs {
 		if id > maxID {
@@ -183,7 +207,7 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 	}
 	// Exactly the old refusal, restated as a representation choice: below the
 	// threshold everything is emitted as it always was, byte for byte.
-	wide := idSpace > 64 || len(spec.Patterns) > 64
+	wide := idSpace > wideBitmapThreshold || len(spec.Patterns) > wideBitmapThreshold
 
 	progs := make([]*syntax.Prog, 0, len(spec.Patterns))
 	for _, p := range spec.Patterns {
@@ -232,7 +256,15 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 		numStates: d.numStates, startState: d.start, midStartState: d.midStart,
 		maskWords: 1, midReprOff: -1, eofReprOff: -1, midWordsOff: -1, eofWordsOff: -1,
 	}
+	if !wide {
+		for _, id := range spec.PatternIDs {
+			if id >= 0 && id < 64 {
+				u.idMask |= uint64(1) << uint(id)
+			}
+		}
+	}
 	if wide {
+		u.wideAccept = true
 		u.maskWords = (idSpace + 63) / 64
 		u.rowBytes = u.maskWords * 8
 		u.bitmapBytes = (idSpace + 7) / 8
@@ -257,7 +289,7 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 		}
 	}
 
-	// Mid-accept-first renumbering (SETS_PLAN item 21 phase 2).
+	// Mid-accept-first renumbering.
 	//
 	// Every byte of every scan asks the same question — "can a match END here?"
 	// — and it used to be answered by LOADING the state's accept entry: a u64
@@ -364,6 +396,12 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 			binary.LittleEndian.PutUint64(accept[newSt*8:], remap(d.midAccepting[oldSt]))
 			binary.LittleEndian.PutUint64(eof[newSt*8:], remap(d.accepting[oldSt]))
 		}
+		// 8-ALIGNED. These are u64 tables read with an i64 load on every
+		// mid-accepting byte, and the transition table above them can end
+		// anywhere — an odd numClasses on a compressed u8 table makes `off`
+		// odd. The wide rows below were already aligned; the narrow pair,
+		// which is the hotter of the two, was not.
+		off = (off + 7) &^ 7
 		u.acceptOff = off
 		u.eofOff = u.acceptOff + int32(len(accept))
 		u.tableEnd = u.eofOff + int32(len(eof))
@@ -376,6 +414,9 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 	// Wide: the u64 pair above is not emitted at all, so acceptOff/eofOff stay
 	// at their zero value and emitUnionScanBody refuses to read them.
 	u.acceptOff, u.eofOff = -1, -1
+	// The repr tables are i32 loads; the rows below are i64. Both get their
+	// natural alignment rather than inheriting the transition table's end.
+	off = (off + 3) &^ 3
 
 	// wideRow turns one state's SORTED list of pattern indices into the two
 	// forms the wide bodies read: a representative global id (plus one, so 0
@@ -388,7 +429,12 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 		repr := int32(0)
 		for _, k := range list {
 			if int(k) >= len(spec.PatternIDs) {
-				continue
+				// A pattern index the spec has no id for cannot be answered
+				// for, and SKIPPING it is a silent "no match" for that pattern
+				// in a wide scan — the one outcome no defensive `continue`
+				// should produce. The lists come from the very progs built
+				// from spec.Patterns, so this is unreachable by construction.
+				panic("compile: union accept list names a pattern index outside the spec")
 			}
 			gid := spec.PatternIDs[k]
 			row[gid/8] |= 1 << uint(gid%8)
@@ -448,17 +494,52 @@ const unionUnroll = 4
 
 // A prev-state skip — `if state != lastOr` inside the mid-accept arm, so a
 // repeat visit to the same accepting state records nothing — was BUILT here
-// and REVERTED the same day (SETS_PLAN item 21, Issue 1 option B, 2026-08-28).
+// and REVERTED the same day.
 // Its premise was that a run of identical bytes sits in ONE accepting state.
 // It does not: the `.*`-prefixed subset construction allocates PARITY COPIES
 // of states (the same NFA set arriving in two orders on alternate bytes), so
 // a saturated run alternates between two accepting states, the skip never
 // fires, and its test is pure per-byte cost — measured +20.9% on the very row
 // it targeted (greedy-3 / 50K a's / scan_all). Do not rebuild it while the
-// copies exist; the refutation record and the minimisation proposal that
-// would change the premise are in SETS_PLAN item 21 (Issues 1 and 2).
+// copies exist.
 // tools/fuzz/set_union_prevstate_test.go keeps the coverage that episode
 // added, including the fuel pin on the saturated-run shape.
+
+// emitUnionEntryState selects the walk's start state from `from` and seeds the
+// cursor pair.
+//
+// The entry state depends on `from`, and getting it wrong is SILENT. ptr/len
+// describe the WHOLE input and `from` bounds only the search, so zero-width
+// assertions must see real context: at from == 0 the scan really is at the
+// start of text and `^`/\A may fire, so the begin-context start state is
+// correct; at from > 0 it is not, and midStart is the same closure without
+// that context. Entering startState at from > 0 makes `^[0-9]` match at
+// position 1.
+//
+// Only two states are needed because buildUnionScanDFA refuses sets with word
+// boundaries or (?m) line anchors — those would additionally need the
+// prev-byte context states.
+//
+// lPos and lEnd are absolute INPUT POINTERS (pInPtr + offset), not offsets:
+// that is what takes the per-byte address arithmetic down to one instruction
+// (see emitUnionTransition).
+//
+// Written out three times before this — in both scan bodies and the alive-mask
+// walk — with the reasoning in one of them.
+func emitUnionEntryState(b []byte, u *unionScanDFA, pInPtr, pInLen, fromIdx, lState, lPos, lEnd byte) []byte {
+	b = append(b, 0x20, fromIdx, 0x45) // from == 0
+	b = append(b, 0x04, 0x40)          // if
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(u.startState))
+	b = append(b, 0x21, lState)
+	b = append(b, 0x05) // else
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(u.midStartState))
+	b = append(b, 0x21, lState)
+	b = append(b, 0x0B) // end if
+	b = append(b, 0x20, pInPtr, 0x20, fromIdx, 0x6A, 0x21, lPos)
+	return append(b, 0x20, pInPtr, 0x20, pInLen, 0x6A, 0x21, lEnd)
+}
 
 // emitUnionScanBody emits the one-pass scan body.
 //
@@ -520,6 +601,10 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// see emitUnionTransition. Nothing here reports a position, which is what
 	// makes the offset expendable.
 	lPos, lState, lEnd, lAcc := byte(3), byte(4), byte(5), byte(6)
+	// Does this walk need its answer restricted to fullMask's universe? Only
+	// if it can set a bit fullMask does not name — i.e. only if the packer
+	// dropped a pattern the automaton still carries.
+	needMask := fullMask != 0 && u.idMask&^fullMask != 0
 	var b []byte
 	b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7E) // 3 x i32, 1 x i64
 
@@ -536,18 +621,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// Only these two are needed because sets with word boundaries or (?m)
 	// line anchors are refused in buildUnionScanDFA — those would additionally
 	// need the prev-byte context states.
-	b = append(b, 0x20, pFrom, 0x45) // from == 0
-	b = append(b, 0x04, 0x40)        // if
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(u.startState))
-	b = append(b, 0x21, lState)
-	b = append(b, 0x05) // else
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(u.midStartState))
-	b = append(b, 0x21, lState)
-	b = append(b, 0x0B) // end if
-	b = append(b, 0x20, pInPtr, 0x20, pFrom, 0x6A, 0x21, lPos)
-	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x6A, 0x21, lEnd)
+	b = emitUnionEntryState(b, u, pInPtr, pInLen, pFrom, lState, lPos, lEnd)
 
 	// `from > len` yields the capability's "nothing" result. The loop guard
 	// alone does NOT deliver that: the entry-state
@@ -557,8 +631,6 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// is a REAL position and must still be evaluated, hence gt_u and not ge_u.
 	b = append(b, 0x20, pFrom, 0x20, pInLen, 0x4B, 0x04, 0x40) // if from > len (u)
 	switch mode {
-	case capScan:
-		b = append(b, 0x41, 0x00) // i32.const 0
 	case capScanAny:
 		b = append(b, 0x41, 0x7F) // i32.const -1
 	default:
@@ -614,16 +686,40 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// The mode's early exit, branching to $done at br depth `depth`.
 	emitExit := func(b []byte, depth byte) []byte {
 		switch mode {
-		case capScan, capScanAny:
-			// Any bit set answers the question: `scan` needs only that one
-			// exists, and `scan_any` reports no start, so the first id found
-			// is as good as any other (§3.5 leaves the id unspecified).
+		case capScanAny:
+			// Any bit set answers the question: `scan_any` reports no start,
+			// so the first id found is as good as any other (the contract leaves the
+			// id unspecified).
 			b = append(b, 0x20, lAcc, 0x42, 0x00, 0x52, 0x0D, depth) // acc != 0
 		case capScanAll:
 			// Every id present: nothing further can change the answer.
+			//
+			// ANDed rather than compared outright, for the reason
+			// emitUnionAliveMask states at length: the automaton is built from
+			// the SPEC while fullMask comes from the BUCKETS, so a pattern the
+			// packer dropped at the state limit has a bit in acc and none in
+			// fullMask. A bare == would then never fire (every call walks the
+			// whole input), and when it did fire first the dropped pattern's
+			// bit would be truncated out of the answer — making whether
+			// scan_all reports it depend on input order.
+			if fullMask == 0 {
+				// Nothing to wait for and nothing to report: exiting here
+				// would answer "all present" with acc == 0. Same suppression
+				// emitUnionAliveMask makes.
+				break
+			}
 			b = append(b, 0x20, lAcc, 0x42)
+			if needMask {
+				// Only when the walk can set a bit no bucket answers for. In
+				// the ordinary case acc is already a subset of fullMask and
+				// the AND is a no-op — worth avoiding, since this runs once
+				// per 4-byte block.
+				b = utils.AppendSLEB128_64(b, int64(fullMask))
+				b = append(b, 0x83) // i64.and
+				b = append(b, 0x42)
+			}
 			b = utils.AppendSLEB128_64(b, int64(fullMask))
-			b = append(b, 0x51, 0x0D, depth) // acc == fullMask
+			b = append(b, 0x51, 0x0D, depth) // (acc & fullMask) == fullMask
 		}
 		return b
 	}
@@ -668,9 +764,23 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	b = append(b, 0x84, 0x21, lAcc)
 	b = append(b, 0x0B) // end if
 
+	// Restrict the answer to the BUCKET universe. The automaton is built from
+	// the spec, which still names patterns the packer dropped at the state
+	// limit, and reporting one of those from scan_any/scan_all while `find`
+	// answers nothing for it is an inconsistency this masking prevents.
+	// Masking here is also what makes the early exits above sound: they
+	// already reason in fullMask's universe.
+	//
+	// Emitted only when the walk can actually set such a bit — see
+	// unionScanDFA.idMask. With nothing dropped this is a no-op and the body
+	// is byte-identical to the one before U3.
+	if needMask {
+		b = append(b, 0x20, lAcc, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(fullMask))
+		b = append(b, 0x83, 0x21, lAcc) // acc &= fullMask
+	}
+
 	switch mode {
-	case capScan:
-		b = append(b, 0x20, lAcc, 0x42, 0x00, 0x52) // i64.ne → i32 0/1
 	case capScanAny:
 		// Lowest set bit's index IS a global pattern id: buildUnionScanDFA
 		// remaps every accept mask through spec.PatternIDs, so no translation
@@ -690,7 +800,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 }
 
 // emitUnionScanWideBody is emitUnionScanBody for an automaton whose ids do not
-// fit a u64 (SETS_PLAN item 21 phase 1). Same pass, same entry-state rule, same
+// fit a u64. Same pass, same entry-state rule, same
 // unroll; what changes is how an accepting state is RECOGNISED and RECORDED.
 //
 // Signatures are the ones the capability already declares, unchanged:
@@ -709,7 +819,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 //
 // # Recording
 //
-//   - scan_any returns midRepr[state]-1 on the spot. §3.5 leaves which id it
+//   - scan_any returns midRepr[state]-1 on the spot. The contract leaves which id it
 //     reports unspecified, so the representative baked into the table is a
 //     complete answer and no accumulator is needed at all.
 //   - scan_all ORs the state's bitmap row into the caller's bitmap, counting
@@ -724,7 +834,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 // The bitmap is ceil(idSpace/8) BYTES (generate/set_stub.go's bitmapBytes; all
 // six stub generators allocate exactly that). An id space that is not a
 // multiple of 64 therefore has a final PARTIAL word, and an i64 store there
-// would write up to seven bytes past the caller's array — §11 R1's class of
+// would write up to seven bytes past the caller's array — the id-space class of
 // defect: silent, data-dependent memory corruption rather than a wrong answer.
 // So whole words are emitted only while the whole word fits, and the remainder
 // is done byte at a time.
@@ -896,20 +1006,9 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	// `^`/\A may fire; at from > 0 it is not, and midStart is the same closure
 	// without that context. Identical to the narrow body, and getting it wrong
 	// is silent.
-	b = append(b, 0x20, pFrom, 0x45) // from == 0
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(u.startState))
-	b = append(b, 0x21, lState)
-	b = append(b, 0x05)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(u.midStartState))
-	b = append(b, 0x21, lState)
-	b = append(b, 0x0B)
-	b = append(b, 0x20, pInPtr, 0x20, pFrom, 0x6A, 0x21, lPos)
-	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x6A, 0x21, lEnd)
+	b = emitUnionEntryState(b, u, pInPtr, pInLen, pFrom, lState, lPos, lEnd)
 
-	// `from > len` yields the capability's "nothing" answer (§4.2). gt_u, not
+	// `from > len` yields the capability's "nothing" answer. gt_u, not
 	// ge_u: `from == len` is a real position, and a pattern matching empty
 	// there must still be reported.
 	b = append(b, 0x20, pFrom, 0x20, pInLen, 0x4B, 0x04, 0x40)
@@ -922,7 +1021,7 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 
 	// The ENTRY state's own accepts, before consuming anything: a pattern that
 	// matches EMPTY at `from` accepts here and nowhere else, and the loop below
-	// only tests after a transition (§18.7).
+	// only tests after a transition.
 	b = emitAcceptArm(b, u.midReprOff, u.midWordsOff, true, true)
 
 	step := func(b []byte, k byte) []byte {
@@ -974,8 +1073,8 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 // The refusal reason is reconstructed rather than threaded out of
 // buildUnionScanDFA: everything it decides internally is reported as
 // "construction", and only the id-space bound — the one an author can act on
-// by splitting a set — is distinguished, because it is the bound SETS_PLAN item
-// 21 raised and the one most likely to be hit next.
+// by splitting a set — is distinguished, because it is the bound the wide
+// accept form raised and the one most likely to be hit next.
 func unionScanDiagOf(u *unionScanDFA, spec SetSpec, phase2 bool) *UnionScanDiag {
 	d := &UnionScanDiag{Phase2: phase2}
 	if u == nil {
@@ -998,45 +1097,47 @@ func unionScanDiagOf(u *unionScanDFA, spec SetSpec, phase2 bool) *UnionScanDiag 
 	return d
 }
 
-// unionScanDataSegs reports how many data SEGMENTS the union automaton
-// contributes to the module, or zero when the set has none.
+// dataBlob is one region of a set's emitted data: its bytes and how many
+// active segments they encode.
+type dataBlob struct {
+	bytes []byte
+	segs  int
+}
+
+// dataBlobs is the ONE authority on what data a set contributes, in the order
+// assembleModuleWithSets concatenates it.
 //
-// A companion unionScanDataLen, reporting the same contribution in BYTES, was
-// removed as dead: the segment count is what assembleModuleWithSets needs, and
-// the byte length had no caller.
-func (cs *compiledSet) unionScanDataSegs() int {
-	n := 0
+// It replaces three hand-maintained parallel lists — the rawData appends and
+// the totalSegs sum in the assembler, and dataTop's own blob list — whose
+// comments each said they "MUST stay in step". They did not: the class was
+// fixed twice on this branch (the BT regions, then the anchored eofBitmask),
+// and a table missing from the accounting is a table the module writes but
+// does not size for, which relocates the NEXT set on top of this one.
+func (cs *compiledSet) dataBlobs() []dataBlob {
+	out := []dataBlob{
+		{cs.dataBytes, cs.dataSegCount},
+		{cs.prefixDataBytes, cs.prefixDataSegCount},
+		{cs.acDataBytes, cs.acDataSegCount},
+		{cs.teddyDataBytes, cs.teddyDataSegCount},
+		{cs.anchoredDataBytes, cs.anchoredDataSegs},
+		{cs.startableDataBytes, cs.startableDataSegs},
+	}
 	if cs.unionScan != nil {
-		n += cs.unionScan.dataSegs
+		out = append(out, dataBlob{cs.unionScan.dataBytes, cs.unionScan.dataSegs})
 	}
 	if cs.phase2Union != nil {
-		n += cs.phase2Union.dataSegs
+		out = append(out, dataBlob{cs.phase2Union.dataBytes, cs.phase2Union.dataSegs})
 	}
-	return n
+	return out
 }
 
 // dataTop returns one past the highest address this set's tables occupy,
 // derived from the segments actually emitted rather than from a running offset
 // or a length sum.
-//
-// The blob list MUST stay in step with the one assembleModuleWithSets
-// concatenates into rawData: a table missing here is a table the module writes
-// but does not account for, which under-sizes the memory and relocates the
-// NEXT set on top of this one.
 func (cs *compiledSet) dataTop() int64 {
-	blobs := [][]byte{
-		cs.dataBytes, cs.prefixDataBytes, cs.acDataBytes,
-		cs.teddyDataBytes, cs.anchoredDataBytes, cs.startableDataBytes,
-	}
-	if cs.unionScan != nil {
-		blobs = append(blobs, cs.unionScan.dataBytes)
-	}
-	if cs.phase2Union != nil {
-		blobs = append(blobs, cs.phase2Union.dataBytes)
-	}
 	var top int64
-	for _, raw := range blobs {
-		if e := dataSegmentsTop(raw); e > top {
+	for _, blob := range cs.dataBlobs() {
+		if e := dataSegmentsTop(blob.bytes); e > top {
 			top = e
 		}
 	}
@@ -1055,7 +1156,7 @@ func (cs *compiledSet) usesUnionScan(kind setCapKind) bool {
 		return false
 	}
 	switch kind {
-	case capScan, capScanAny:
+	case capScanAny:
 		return true
 	case capScanAll:
 		// Two bodies, two ABIs, and the automaton's own representation picks
@@ -1065,7 +1166,7 @@ func (cs *compiledSet) usesUnionScan(kind setCapKind) bool {
 		// out_ptr, so it can only serve a capability using that ABI. Keyed on
 		// wideAll() rather than on the id space alone because the id space is
 		// no longer the only thing that selects the wide form: a Backtracking
-		// member forces it at any size (SETS_PLAN item 20 decision 3). Testing
+		// member forces it at any size. Testing
 		// the size here left the walk serving a capability that had already
 		// moved to the memory form — an i64 pushed where an i32 was expected,
 		// i.e. a module that does not validate.
@@ -1146,15 +1247,15 @@ func (cs *compiledSet) preflightAliveWords() int {
 // DEAD" and the answer is already "none". This is what bounds the pass on
 // matching input — the walk costs at most the bytes up to the first position
 // where the last pattern shows alive, which a per-position drive has to cover
-// anyway — and it is why SETS_PLAN item 22's fix 2a can offer the preflight to
-// every eligible set instead of only to never-dying ones (§16.5.2's Candidate
-// A was a pass that cost the whole input and retired nothing). The test is
+// anyway — and it is why the preflight can be offered to every eligible set
+// instead of only to never-dying ones. An earlier candidate was a pass that
+// cost the whole input and retired nothing. The test is
 // ANDed rather than compared outright because the union is built from the SPEC
 // while fullMask comes from the BUCKETS: a pattern the packer dropped has a
 // bit here and not there, and a bare == would then never fire. Pass nil, or an
 // all-zero mask, to suppress the exit.
 //
-// WIDTH (SETS_PLAN item 22 fix 2a-wide). aliveLocal is the FIRST of
+// WIDTH. aliveLocal is the FIRST of
 // u.maskWords consecutive i64 locals, and fullMask must be that long. The two
 // forms differ only in how the accept entry is addressed and how many
 // accumulators it lands in:
@@ -1218,19 +1319,7 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 	for w := 0; w < words; w++ {
 		b = append(b, 0x42, 0x00, 0x21, aliveLocal+byte(w))
 	}
-	b = append(b, 0x20, fromIdx, 0x45)
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(u.startState))
-	b = append(b, 0x21, lState)
-	b = append(b, 0x05)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(u.midStartState))
-	b = append(b, 0x21, lState)
-	b = append(b, 0x0B)
-	// lPos is an absolute INPUT POINTER here too, and lEnd is pInPtr + len.
-	b = append(b, 0x20, pInPtr, 0x20, fromIdx, 0x6A, 0x21, lPos)
-	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x6A, 0x21, lEnd)
+	b = emitUnionEntryState(b, u, pInPtr, pInLen, fromIdx, lState, lPos, lEnd)
 
 	// The mid-accept OR, under the phase-2 partition — the same guard the scan
 	// body uses, and for the same reason: this walk visits every byte of the
@@ -1284,22 +1373,39 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 	}
 
 	// Entry-state accepts: a pattern matching EMPTY at `from` accepts here and
-	// nowhere else (the §18.7 fix, for the same reason as in the scan body).
+	// nowhere else (for the same reason as in the scan body).
 	// No early exit here: this runs before $done exists to branch to, and a set
 	// whose every pattern matches empty is not the shape the exit is for.
 	b = emitAlive(b, -1)
 
+	// UNROLLED by unionUnroll, exactly as both scan bodies are. This walk runs
+	// over the whole input once per drive, so paying the loop's bounds test
+	// per byte where the scan bodies pay it per four was a difference with no
+	// argument behind it — no comment claimed it was deliberate.
 	b = append(b, 0x02, 0x40) // block $done
-	b = append(b, 0x03, 0x40) // loop $scan
+	b = append(b, 0x02, 0x40) // block $bulk_exit
+	b = append(b, 0x03, 0x40) // loop $bulk
+
+	// pos + unionUnroll > end → finish in the tail.
+	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
+	b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01) // gt_u → br $bulk_exit
+	for k := byte(0); k < unionUnroll; k++ {
+		b = emitUnionTransition(b, u, lPos, lState, k, tableMemIdx)
+		b = emitAlive(b, 2) // 2 = $done, past $bulk and $bulk_exit
+	}
+	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, 0x00)
+	b = append(b, 0x0B) // end loop $bulk
+	b = append(b, 0x0B) // end block $bulk_exit
+
+	b = append(b, 0x03, 0x40) // loop $tail
 	b = append(b, 0x20, lPos, 0x20, lEnd, 0x4F, 0x0D, 0x01)
-
 	b = emitUnionTransition(b, u, lPos, lState, 0, tableMemIdx)
-	b = emitAlive(b, 1) // 1 = $done, past $scan
-
+	b = emitAlive(b, 1) // 1 = $done, past $tail
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
 	b = append(b, 0x0C, 0x00)
-	b = append(b, 0x0B) // end loop
-	b = append(b, 0x0B) // end block
+	b = append(b, 0x0B) // end loop $tail
+	b = append(b, 0x0B) // end block $done
 
 	// End-of-input accepts, guarded by pos >= len exactly as emitUnionScanBody
 	// guards its own — the early exit above can leave the loop mid-input, where
@@ -1340,9 +1446,8 @@ func (cs *compiledSet) usesGatedFindPreflight() bool {
 // decides whether to build one at all (the same split overlapPreflightShape
 // exists for).
 //
-// SETS_PLAN item 22 fix 2a, decided: there is NO hasNeverDyingState test here.
 // It used to be the engagement rule — offer the preflight only where a suffix
-// DFA can walk forever, because §16.5.2's Candidate A was a pass that cost the
+// DFA can walk forever, because the reverted Candidate A was a pass that cost the
 // whole input and retired nothing. What retires that objection is
 // emitUnionAliveMask's fullMask early exit (fix 2a prerequisite 2): the pass
 // now stops at the first position where the last pattern shows alive, so on
@@ -1389,7 +1494,7 @@ func (cs *compiledSet) gatedPreflightShape() bool {
 
 // usesOverlappingFindPreflight reports whether this set's OVERLAPPING `find`
 // should run the same preflight, keeping its verdict in the caller's gate
-// array (SETS_PLAN item 11).
+// array.
 //
 // The row this exists for is greedy-3's `[^\n]*ERROR` on newline-free input:
 // a fallback pattern whose suffix DFA never dies, walked from every start
@@ -1408,7 +1513,7 @@ func (cs *compiledSet) gatedPreflightShape() bool {
 //     itself.
 //
 // The never-dying requirement is what keeps this off every other overlapping
-// set: without it the preflight is §16.5.2's Candidate A — a pass that costs
+// set: without it the preflight is that reverted Candidate A — a pass that costs
 // the whole input and retires nothing.
 func (cs *compiledSet) usesOverlappingFindPreflight() bool {
 	if cs.unionScan.isWide() {
@@ -1425,6 +1530,10 @@ func (cs *compiledSet) usesOverlappingFindPreflight() bool {
 // overlapping set has no scan capability to build it for, so the table has to
 // be requested by the preflight that will read it. Everything here is settled
 // by bucket construction, which finishes first.
+// It is the NARROWER of the two: overlapCanPreflight (set_emit.go) asks the
+// same question earlier, from the spec and the raw bucket list, and admitting
+// a set here that it refuses would leave a preflight with no table to read.
+// TestOverlapPreflightPredicatesAgree pins the containment.
 func (cs *compiledSet) overlapPreflightShape() bool {
 	if cs.find == "" || !cs.overlapping {
 		return false
@@ -1432,7 +1541,7 @@ func (cs *compiledSet) overlapPreflightShape() bool {
 	if cs.fe != frontendScalar {
 		return false
 	}
-	if cs.idSpaceSize() > 64 {
+	if cs.idSpaceSize() > wideBitmapThreshold {
 		return false
 	}
 	for _, b := range cs.buckets {
@@ -1460,7 +1569,7 @@ func (cs *compiledSet) overlapPreflightShape() bool {
 // into the caller's gate array: `2*len + 2` for every pattern it proves
 // matches NOWHERE, `1` for every pattern still alive.
 //
-// The dead value is already legal in the §3.16 encoding — it is what an empty
+// The dead value is already legal in the gate encoding — it is what an empty
 // match at `len` writes, and the pre-mask `2p + 1 >= gate[k]` is false for
 // every p <= len, so the pattern is excluded for the rest of the drive. No new
 // kind of value is introduced; that is the whole reason B′ is preferable to B.
@@ -1476,9 +1585,8 @@ func (cs *compiledSet) overlapPreflightShape() bool {
 // one on greedy-3 / 50K a's. Marking alive patterns with 1 makes the array
 // all-non-zero after the first call, so ONE slot answers for the whole array.
 //
-// GATED cannot use that marker, and SETS_PLAN item 22 fix 2a's own
-// prescription for prerequisite 1 was wrong to assume it could. `1` IS
-// invisible to the pre-mask (`2s + 1 >= 1` holds everywhere) and to
+// GATED cannot use that marker, though an early prescription assumed it
+// could. `1` IS invisible to the pre-mask (`2s + 1 >= 1` holds everywhere) and to
 // emitGateJump (`1 >> 1 == 0`), which is as far as that prescription checked.
 // It is NOT invisible to the third reader: emitWriteMatchK's write-time rule
 // for an EMPTY extent is the stricter `2s >= gate[k]`, and at s == 0 that
@@ -1488,7 +1596,7 @@ func (cs *compiledSet) overlapPreflightShape() bool {
 // non-zero for the guard and <= 0 for that rule.
 //
 // So the gated guard asks `from == 0` instead. A gated drive advances `from`
-// strictly (§4.8 resumes at start + 1), so this is true on its first call and
+// strictly (an overlapping drive resumes at start + 1), so this is true on its first call and
 // false on every later one — once per drive, in O(1), with nothing written to
 // a slot the match path reads. Its verdict stays valid as `from` grows: a
 // pattern that matches nowhere in [0, len) matches nowhere in any subrange.
@@ -1501,15 +1609,15 @@ func (cs *compiledSet) overlapPreflightShape() bool {
 // minimum over `gate[id] >> 1` is len + 1, so the scan cursor jumps past the
 // end and the call returns 0 without entering the loop.
 //
-// TWO CONTRACT NOTES, per §18.5:
+// TWO CONTRACT NOTES:
 //   - the verdict is written at CALL ENTRY, independent of whether a position
 //     is fully delivered, so it sits outside D2's "only after a fully
 //     delivered position" rule;
 //   - a caller resuming at a smaller `from` must zero the gate array first,
-//     which §3.14 already requires.
+//     which the gate mask already requires.
 //
 // Both are documented in docs/sets.md.
-func emitFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen, fromIdx, lEnd byte, tableMemIdx int, absence bool, lMask, lChunk byte) []byte {
+func emitFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGate, pInLen, fromIdx, lEnd byte, tableMemIdx int, absence bool, lMask, lChunk, lCand byte) []byte {
 	ids := setPatternIDs(cs)
 	if len(ids) == 0 {
 		return b
@@ -1540,7 +1648,7 @@ func emitFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGat
 	if absence {
 		// G12: prove absence by literal search instead of walking the union
 		// automaton — same over-approximating contract, ~15x cheaper.
-		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal, fromIdx)
+		b = emitLiteralAbsenceMask(b, cs, lPos, lState, lMask, lChunk, aliveLocal, fromIdx, lCand)
 	} else {
 		b = emitUnionAliveMask(b, cs.unionScan, lPos, lState, aliveLocal, fromIdx, lEnd, tableMemIdx, cs.fullIDMaskWords(words))
 	}
@@ -1592,7 +1700,7 @@ func emitFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGat
 }
 
 // --------------------------------------------------------------------------
-// Phase 2 of the two-phase scan (SETS_PLAN item 19)
+// Phase 2 of the two-phase scan
 
 // fallbackSubSpec returns spec restricted to the patterns that landed in
 // FALLBACK buckets, preserving their global ids.
@@ -1634,8 +1742,7 @@ func hasLiteralBuckets(buckets []*bucket) bool {
 //
 // `find` is excluded: it reports positions and extents, which phase 2's
 // automaton does not carry — it knows only WHICH patterns match, which is
-// exactly what the scan trio asks. `scan` is not listed because TODO task 59
-// decision (2) retires it.
+// exactly what the scan trio asks. `scan` is not listed because it is retired.
 func (cs *compiledSet) usesTwoPhaseScan(kind setCapKind) bool {
 	if cs.phase2Union == nil {
 		return false

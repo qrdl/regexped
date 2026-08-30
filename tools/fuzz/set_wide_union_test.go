@@ -10,7 +10,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// SETS_PLAN item 21 phase 1: the scan pair served by the START-ANYWHERE union
+// The scan pair served by the START-ANYWHERE union
 // automaton above 64 ids, where the u64 accumulator every other union set uses
 // has run out of bits.
 //
@@ -32,10 +32,10 @@ import (
 //     seven bytes past the caller's array — silent corruption, not a wrong
 //     answer, so a canary sits immediately after every bitmap here;
 //   - a NAMED SUBSET, the only configuration where the pattern count and the
-//     id space differ (§11 R1), which is also the only way to make the
+//     id space differ, which is also the only way to make the
 //     `scan_all` early exit's count target wrong-but-plausible: comparing
 //     against the id space instead of the distinct ids would make it dead;
-//   - empty input, `from == len` and `from > len` (§4.2), and nullable /
+//   - empty input, `from == len` and `from > len`, and nullable /
 //     `\A` / `$` members, because the entry-state and end-of-input accepts are
 //     separate arms of the body from the loop and each has been a bug before.
 
@@ -260,7 +260,7 @@ func TestWideUnionScanMatchesGo(t *testing.T) {
 					}
 				}
 
-				// §4.2: past the end is "nothing", and it is a REAL case
+				// Past the end is "nothing", and it is a REAL case
 				// rather than a defensive one — the loop guard alone does not
 				// deliver it, because the entry-state and end-of-input accept
 				// arms both run regardless of how the loop exited.
@@ -411,7 +411,7 @@ func TestWideUnionScanBitmapEdge(t *testing.T) {
 	}
 }
 
-// TestWideUnionScanNamedSubset is the §11 R1 configuration: PATTERN_COUNT and
+// TestWideUnionScanNamedSubset is the id-space configuration: PATTERN_COUNT and
 // ID_SPACE differ, so every structure indexed by an id is larger than the
 // number of patterns.
 //
@@ -530,7 +530,7 @@ func TestWideUnionScanEarlyExitCompleteness(t *testing.T) {
 // NOT the loop: the entry-state accepts, which are the only place a pattern
 // matching EMPTY at `from` is ever reported, and the end-of-input accepts,
 // which are the only place `$`/\z is. Both were separate bug fixes in the
-// narrow body (§18.7); the wide body re-implements them and so can lose them
+// narrow body; the wide body re-implements them and so can lose them
 // independently.
 func TestWideUnionScanZeroWidthMembers(t *testing.T) {
 	pats := classChain(70)
@@ -568,7 +568,7 @@ func TestWideUnionScanZeroWidthMembers(t *testing.T) {
 }
 
 // TestWideUnionTwoPhaseScan covers the MIXED set: a literal frontend over some
-// buckets plus fallback buckets the frontend cannot skip, which SETS_PLAN item
+// buckets plus fallback buckets the frontend cannot skip, which the two-phase
 // 19 splits into phase 1 (the frontend) and phase 2 (a union automaton over the
 // fallback patterns only).
 //
@@ -640,7 +640,7 @@ func TestWideUnionTwoPhaseScan(t *testing.T) {
 }
 
 // TestUnionScanDegenerateLimits drives the two DEGENERATE forms of the
-// mid-accept partition (SETS_PLAN item 21 phase 2), which are not variations of
+// mid-accept partition, which are not variations of
 // the general case but different emitted code:
 //
 //   - midAcceptLimit == 0 — no state can accept mid-string, so the bodies emit
@@ -792,7 +792,7 @@ func TestWideUnionScanSingleCapability(t *testing.T) {
 // and it is a `find` test rather than a scan one.
 //
 // The gated `find` preflight runs the union automaton once per drive and writes
-// its verdict into the caller's gate array as §3.16 sentinels. Its emitters
+// its verdict into the caller's gate array as gate sentinels. Its emitters
 // read acceptOff/eofOff as [numStates] u64 — tables a WIDE automaton does not
 // emit at all. Before item 21 the predicate needed no id-space test, because
 // `cs.unionScan != nil` implied 64 ids or fewer; afterwards it does, and

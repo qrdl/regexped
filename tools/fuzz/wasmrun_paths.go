@@ -300,7 +300,7 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 	if inputSpan < pageSize {
 		inputSpan = pageSize
 	}
-	// The gate array, which every `find` takes since SETS_PLAN item 11 —
+	// The gate array, which every `find` takes —
 	// overlapping sets record no gates in it and keep the once-per-drive
 	// preflight verdict there instead. Zeroing it starts the drive.
 	gateBase := inBase + inputSpan
@@ -337,7 +337,7 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 		n := int(res.(int32))
 		// A set CAN reach this now: a member whose fallback DFA exceeded
 		// max_fallback_states is admitted on the Backtracking engine
-		// (SETS_PLAN item 20), and an exhausted frame budget answers "unknown"
+		//, and an exhausted frame budget answers "unknown"
 		// rather than "no match". Tested BEFORE the n <= 0 check below, which
 		// would otherwise read the sentinel as "no matches" and end the scan
 		// reporting success.
@@ -377,6 +377,6 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 }
 
 // errSetOutputTruncated signals that one `find` call reported more matches at a
-// single position than patterns_in_set, which the §3.11 contract says is
+// single position than patterns_in_set, which the overflow contract says is
 // impossible.
 var errSetOutputTruncated = errors.New("set find reported more tuples at one position than the set has patterns")

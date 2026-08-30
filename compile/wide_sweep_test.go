@@ -151,7 +151,20 @@ func TestWideSweepSets(t *testing.T) {
 							if !caps.find && (overlapping || batch) {
 								continue
 							}
-							CompileFile(c.build(), out)
+							// ASSERTED, not discarded. This sweep compiles
+							// every capability shape the emitters have, and
+							// throwing away both returns meant a shape that
+							// failed to compile — or produced nothing —
+							// passed. It is why U1's always-empty match_all
+							// body compiled green here.
+							w, _, err := CompileFile(c.build(), out)
+							if err != nil {
+								t.Errorf("%s (overlapping=%v batch=%v mfs=%d out=%q): %v",
+									c.name, overlapping, batch, mfs, out, err)
+								continue
+							}
+							assertWasm(t, w, fmt.Sprintf("%s (overlapping=%v batch=%v mfs=%d out=%q)",
+								c.name, overlapping, batch, mfs, out))
 						}
 					}
 				}

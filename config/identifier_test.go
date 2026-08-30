@@ -194,7 +194,7 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 
 	// match_func and find_func report no captures at all, so a repeated group
 	// name is unambiguous for them and stays legal. groups_func is now the one
-	// that turns names into symbols (TODO task 62 retired named_groups_func),
+	// that turns names into symbols (named_groups_func was retired),
 	// so it is the one that rejects.
 	t.Run("allowed_without_groups_func", func(t *testing.T) {
 		cfg := BuildConfig{Regexps: []RegexEntry{
@@ -315,12 +315,22 @@ func TestValidateExports_HelperCollisions(t *testing.T) {
 	}{
 		{"js", "init", true},
 		{"ts", "init", true},
-		{"js", "_resize", true},
+		{"js", "_stage", true},
 		{"js", "patternName", true},
 		{"ts", "SetMatch", true},
 		{"js", "SetMatch", false}, // the interface is TS-only
 		{"rust", "init", false},   // not a Rust helper name
-		{"go", "init", false},
+		// `func init(input []byte) (uint, bool, error)` is a Go COMPILE error:
+		// init takes no arguments and returns nothing.
+		{"go", "init", true},
+		// C had no helper check at all until K5; these are real declarations
+		// in every generated header.
+		{"c", "rx_match_t", true},
+		{"c", "pattern_name", true},
+		{"c", "url_match", false},
+		// Go declares Span and the error value for every stub.
+		{"go", "Span", true},
+		{"go", "ErrBacktrackOverflow", true},
 		{"js", "url_match", false},
 	}
 	for _, c := range cases {
@@ -353,7 +363,10 @@ func TestValidateExports_SetDerivedConstantCollisions(t *testing.T) {
 		{"rust", "SCANNER_PATTERN_COUNT", true},
 		{"c", "SCANNER_ID_SPACE", true},
 		{"as", "SCANNER_BATCH_MAX_SIZE", true},
-		{"go", "scanner_pattern_count", true}, // Go compares the Pascal-cased form
+		// Go's names are VERBATIM so the Pascal-cased constant
+		// is the colliding one and the snake_case export is not (K2).
+		{"go", "scanner_pattern_count", false},
+		{"go", "ScannerPatternCount", true},
 		{"go", "ScannerIDSpace", true},
 
 		// The stems are per language: the TS constant is camelCase, so the
@@ -430,8 +443,27 @@ func TestValidateExports_FFIPrefix(t *testing.T) {
 
 func TestValidateExports_CaseFoldCollision(t *testing.T) {
 	// B34 class 2: distinct WASM exports (so ValidateSets' verbatim dedup is
-	// happy) that collapse to one generated Go function / Rust iterator type.
-	for _, st := range []string{"rust", "go"} {
+	// happy) that collapse to one generated Rust iterator type.
+	//
+	// RUST ONLY. Go dropped out of this — its names are
+	// verbatim, so `url_find` and `urlFind` are two perfectly good Go
+	// functions declaring two distinct `url_findIter`/`urlFindIter` types.
+	cfg := &BuildConfig{
+		StubType: "rust", ImportModule: "m",
+		Regexps: []RegexEntry{
+			{Name: "a", Pattern: "a", FindFunc: "url_find"},
+			{Name: "b", Pattern: "b", FindFunc: "urlFind"},
+		},
+	}
+	err := ValidateConfig(cfg)
+	if err == nil {
+		t.Fatal("stub_type rust: accepted url_find + urlFind, want error")
+	}
+	if !strings.Contains(err.Error(), "UrlFindIter") {
+		t.Errorf("stub_type rust: error does not name the collision: %v", err)
+	}
+	// The two names stay distinct wherever they are emitted verbatim.
+	for _, st := range []string{"js", "go"} {
 		cfg := &BuildConfig{
 			StubType: st, ImportModule: "m",
 			Regexps: []RegexEntry{
@@ -439,34 +471,39 @@ func TestValidateExports_CaseFoldCollision(t *testing.T) {
 				{Name: "b", Pattern: "b", FindFunc: "urlFind"},
 			},
 		}
-		err := ValidateConfig(cfg)
-		if err == nil {
-			t.Fatalf("stub_type %q: accepted url_find + urlFind, want error", st)
-		}
-		if !strings.Contains(err.Error(), "UrlFind") {
-			t.Errorf("stub_type %q: error does not name the collision: %v", st, err)
+		if err := ValidateConfig(cfg); err != nil {
+			t.Errorf("stub_type %s: rejected url_find + urlFind: %v", st, err)
 		}
 	}
-	// The two names stay distinct in JS/TS, which emit them verbatim.
-	cfg := &BuildConfig{
-		StubType: "js",
+	// Go's REAL collision: `find_func: foo` declares `type fooIter`, so a
+	// second export literally named fooIter duplicates it (K2).
+	dup := &BuildConfig{
+		StubType: "go", ImportModule: "m",
 		Regexps: []RegexEntry{
-			{Name: "a", Pattern: "a", FindFunc: "url_find"},
-			{Name: "b", Pattern: "b", FindFunc: "urlFind"},
+			{Name: "a", Pattern: "a", FindFunc: "foo"},
+			{Name: "b", Pattern: "b", MatchFunc: "fooIter"},
 		},
 	}
-	if err := ValidateConfig(cfg); err != nil {
-		t.Errorf("stub_type js: rejected url_find + urlFind: %v", err)
+	if err := ValidateConfig(dup); err == nil {
+		t.Error("stub_type go: accepted foo + fooIter, want error")
 	}
-	// And `set_match` collides with the SetMatch struct the set stubs declare.
-	for _, st := range []string{"rust", "go"} {
-		cfg := &BuildConfig{
-			StubType: st, ImportModule: "m",
-			Regexps: []RegexEntry{{Name: "a", Pattern: "a", MatchFunc: "set_match"}},
-		}
-		if err := ValidateConfig(cfg); err == nil {
-			t.Errorf("stub_type %q: accepted set_match, want error", st)
-		}
+	// `set_match` Pascal-folds onto the SetMatch struct the RUST set stubs
+	// declare. Go emits verbatim, so `set_match` is unremarkable there and
+	// `SetMatch` is the colliding spelling (checked by the helper-collision
+	// test above).
+	cfg = &BuildConfig{
+		StubType: "rust", ImportModule: "m",
+		Regexps: []RegexEntry{{Name: "a", Pattern: "a", MatchFunc: "set_match"}},
+	}
+	if err := ValidateConfig(cfg); err == nil {
+		t.Error("stub_type rust: accepted set_match, want error")
+	}
+	cfg = &BuildConfig{
+		StubType: "go", ImportModule: "m",
+		Regexps: []RegexEntry{{Name: "a", Pattern: "a", MatchFunc: "set_match"}},
+	}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Errorf("stub_type go: rejected set_match, which it emits verbatim: %v", err)
 	}
 }
 
@@ -502,7 +539,7 @@ func TestPascalCaseMatchesGenerators(t *testing.T) {
 	}
 }
 
-// TestCaptureGroupNameMayBeAReservedWord pins the correction to task 62's
+// TestCaptureGroupNameMayBeAReservedWord pins the correction to the
 // group-name validation: a group name is never a standalone identifier, so
 // reserved words are fine.
 //
@@ -531,5 +568,78 @@ func TestCaptureGroupNamesCollidingOnCase(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "differ only in case") {
 		t.Errorf("error should explain the collision, got: %v", err)
+	}
+}
+
+// TestValidateNamespace covers the namespace rule: `namespace:` is interpolated
+// verbatim into generated identifiers in five languages and was never checked.
+func TestValidateNamespace(t *testing.T) {
+	for _, c := range []struct {
+		ns        string
+		wantError bool
+	}{
+		{"", false},
+		{"myns", false},
+		{"my_ns", false},
+		{"my-ns", true},
+		{"9x", true},
+		{"x; } func pwn() {", true},
+		{"struct", true}, // reserved in at least one stub language
+	} {
+		cfg := &BuildConfig{
+			StubType: "go", ImportModule: "m", Namespace: c.ns,
+			Regexps: []RegexEntry{{Name: "p", Pattern: "a", MatchFunc: "m1"}},
+		}
+		err := ValidateConfig(cfg)
+		if c.wantError != (err != nil) {
+			t.Errorf("namespace %q: err = %v, wantError = %v", c.ns, err, c.wantError)
+		}
+	}
+}
+
+// TestValidateExports_DerivedSymbolCollisions covers derived symbols: ones a
+// generator derives from ONE export's name colliding with ANOTHER export.
+func TestValidateExports_DerivedSymbolCollisions(t *testing.T) {
+	// groups_func: parse emits parse_index / parse_names / parse_count.
+	cfg := &BuildConfig{
+		StubType: "go", ImportModule: "m",
+		Regexps: []RegexEntry{
+			{Name: "a", Pattern: "(?P<x>a)", GroupsFunc: "parse"},
+			{Name: "b", Pattern: "b", MatchFunc: "parse_index"},
+		},
+	}
+	if err := ValidateConfig(cfg); err == nil {
+		t.Error("accepted match_func parse_index against groups_func parse, want error")
+	}
+	// camelCase names derive camelCase symbols.
+	cfg = &BuildConfig{
+		StubType: "ts", ImportModule: "m",
+		Regexps: []RegexEntry{
+			{Name: "a", Pattern: "(?P<x>a)", GroupsFunc: "parseIt"},
+			{Name: "b", Pattern: "b", MatchFunc: "parseItIndices"},
+		},
+	}
+	if err := ValidateConfig(cfg); err == nil {
+		t.Error("accepted match_func parseItIndices against groups_func parseIt, want error")
+	}
+	// An unrelated name is fine.
+	cfg = &BuildConfig{
+		StubType: "go", ImportModule: "m",
+		Regexps: []RegexEntry{
+			{Name: "a", Pattern: "(?P<x>a)", GroupsFunc: "parse"},
+			{Name: "b", Pattern: "b", MatchFunc: "other"},
+		},
+	}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Errorf("rejected an unrelated name: %v", err)
+	}
+	// A capture group named after one of the derived suffixes collides with
+	// the helper of the same name within ONE entry.
+	cfg = &BuildConfig{
+		StubType: "go", ImportModule: "m",
+		Regexps: []RegexEntry{{Name: "a", Pattern: "(?P<index>a)", GroupsFunc: "parse"}},
+	}
+	if err := ValidateConfig(cfg); err == nil {
+		t.Error("accepted a capture group named \"index\", want error")
 	}
 }
