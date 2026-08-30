@@ -15,7 +15,7 @@ func tsStub(cfg config.BuildConfig, out string) error {
 	if err != nil {
 		return fmt.Errorf("generate TS stub: %w", err)
 	}
-	// See jsStub: the namespace applies on the stdout path too (S5).
+	// See jsStub: the namespace applies on the stdout path too.
 	content = applyNamespace(cfg, "ts", content)
 	if out == "-" {
 		_, err := os.Stdout.WriteString(content)

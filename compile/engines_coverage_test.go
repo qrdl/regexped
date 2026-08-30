@@ -330,7 +330,7 @@ func TestEnginesCovIsCountedClassChain(t *testing.T) {
 	})
 
 	// The accept channels are NOT interchangeable, and the split below is the
-	// whole point of the S10 fix (tools/fuzz FuzzSet; custom-sets.txt Category
+	// whole point of the split (tools/fuzz FuzzSet; custom-sets.txt Category
 	// S10). The emitted body verifies N class bytes with SIMD and reports a
 	// match with no end-of-input test and no knowledge of the preceding byte —
 	// so it is sound only for a terminal that accepts at an ARBITRARY

@@ -56,7 +56,7 @@ func TestSparseSetMergeExceeds64(t *testing.T) {
 	// blows them fails loudly rather than silently splitting the bucket again.
 	if tab.numStates > opts.budgetStates() || dfaTableBytes(tab) > opts.budgetBytes() {
 		t.Errorf("merged 128-pattern DFA is over budget: %d states / %d bytes "+
-			"(budgets %d / %d) — the bucket would split anyway and G17 buys nothing",
+			"(budgets %d / %d) — the bucket would split anyway and sparse accept buys nothing",
 			tab.numStates, dfaTableBytes(tab), opts.budgetStates(), opts.budgetBytes())
 	}
 	t.Logf("128 patterns merged: %d states, %d bytes, %d states carry accept lists",

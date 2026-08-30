@@ -11,7 +11,7 @@ import (
 //
 // All four frontend bodies (Scalar, Shufti, AC, Teddy) share the same
 // per-candidate work: compute the bucket's validMask and run its suffix DFA.
-// Before this file that logic was copy-pasted four times; the S1 rework needs
+// Before this file that logic was copy-pasted four times; sharing it needs
 // it in one place, because the first-position obligation threads
 // through every one of those sites.
 //

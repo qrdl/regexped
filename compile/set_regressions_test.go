@@ -350,7 +350,8 @@ func countMem0Access(body []byte) int {
 // `maskWords > 1` — still said narrow for a small id space. Every reader keyed
 // on isWide() therefore went to the u64 accept tables the wide path does not
 // emit: `match_any` loaded from acceptOff == -1 and TRAPPED at 0xFFFFFFFF.
-// Caught by the --set-bt corpus leg the same review asked for (T3).
+// Caught by the --set-bt corpus leg, which forces set members onto the
+// Backtracking fallback engine.
 //
 // The invariant, stated once: the accept FORM and the row WIDTH are two
 // questions, and isWide() answers the first.

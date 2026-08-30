@@ -1194,7 +1194,7 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 func TestCompileLenientAltFindBody(t *testing.T) {
 	const pattern = `'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`
 	if !shouldTryLitChainAlt(pattern) {
-		t.Fatalf("shouldTryLitChainAlt(%q) = false, want true (test pattern no longer trips the T33 gate)", pattern)
+		t.Fatalf("shouldTryLitChainAlt(%q) = false, want true (test pattern no longer trips the lit-chain-alt gate)", pattern)
 	}
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "sql_inject_find"}})
 }

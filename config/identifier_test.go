@@ -364,7 +364,7 @@ func TestValidateExports_SetDerivedConstantCollisions(t *testing.T) {
 		{"c", "SCANNER_ID_SPACE", true},
 		{"as", "SCANNER_BATCH_MAX_SIZE", true},
 		// Go's names are VERBATIM so the Pascal-cased constant
-		// is the colliding one and the snake_case export is not (K2).
+		// is the colliding one and the snake_case export is not.
 		{"go", "scanner_pattern_count", false},
 		{"go", "ScannerPatternCount", true},
 		{"go", "ScannerIDSpace", true},
@@ -476,7 +476,7 @@ func TestValidateExports_CaseFoldCollision(t *testing.T) {
 		}
 	}
 	// Go's REAL collision: `find_func: foo` declares `type fooIter`, so a
-	// second export literally named fooIter duplicates it (K2).
+	// second export literally named fooIter duplicates it.
 	dup := &BuildConfig{
 		StubType: "go", ImportModule: "m",
 		Regexps: []RegexEntry{

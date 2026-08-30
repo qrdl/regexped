@@ -99,7 +99,8 @@ func dominantWalkStates(t *dfaTable) []dominantWalkState {
 }
 
 // hasNeverDyingState reports whether t contains a state that can hold a walk
-// to end of input. Used by G8/G9 as an emission gate: those tasks only pay for
+// to end of input. Used as an emission gate by the liveness table and its
+// exit, which only pay for
 // their machinery on sets where a walk actually fails to terminate early.
 //
 // Deliberately asks dominantWalkStates ONLY, never memberWalkStates. A 1-byte

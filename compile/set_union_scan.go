@@ -1500,7 +1500,7 @@ func (cs *compiledSet) gatedPreflightShape() bool {
 // a fallback pattern whose suffix DFA never dies, walked from every start
 // position, which makes one overlapping call O(n^2). The verdict "this
 // pattern matches nowhere at or after `from`" retires it from validMask, and
-// the G9 liveness exit inside the suffix body then truncates the walk as soon
+// the liveness exit inside the suffix body then truncates the walk as soon
 // as only retired patterns could still accept.
 //
 // It shares gatedFind's eligibility except for the two differences that

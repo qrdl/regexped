@@ -4562,7 +4562,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// scanProbe itself gets the cheap exit and no second body is emitted.
 	firstHit := len(probeFlags) > 0 && probeFlags[0] && needProbes
 	soleFirstHit := len(probeFlags) > 1 && probeFlags[1] && needProbes
-	// probeFlags[2]: emit the G8 liveness table and exit.
+	// probeFlags[2]: emit the liveness table and exit.
 	needFuture := len(probeFlags) > 2 && probeFlags[2] && needProbes
 	// probeFlags[3]: the tuple-writing body carries the batch `skip` parameter.
 	// Independent of needProbes — it is about the WRITE path, not the probes.
@@ -4889,7 +4889,7 @@ type setSuffixParams struct {
 	// bulk skip. Deliberately separate from
 	// l.dominantStates, which is shared with the single-pattern emitters:
 	// threading the member flavour through that slice would change
-	// single-pattern output and break byteident (D6).
+	// single-pattern output and break byteident.
 	memberSkip []dominantWalkState
 
 	l                                   *dfaLayout

@@ -1290,7 +1290,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	needUnionForOverlap := cs.overlapPreflightShape() && !cs.usesAbsencePrefilter()
 	needUnionForGated := cs.gatedPreflightShape() && !cs.usesAbsencePrefilter()
 	if fe == frontendScalar && (spec.ScanAll != "" || spec.ScanAny != "" || needUnionForOverlap || needUnionForGated) {
-		unionBase := (setTablesEnd + 7) &^ 7 // 8-aligned, see anchoredTableBase (U4)
+		unionBase := (setTablesEnd + 7) &^ 7 // 8-aligned, see anchoredTableBase
 		// needUnionForGated also asks for the per-state accept ROWS, which a
 		// WIDE automaton emits only on request and the wide alive walk reads in
 		// place of the u64 pair it has no room for (item 22 fix 2a-wide). On a
@@ -1324,7 +1324,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	if fe != frontendScalar && (spec.ScanAny != "" || spec.ScanAll != "") &&
 		hasSetFallbackBucketsIn(buckets) && hasLiteralBuckets(buckets) &&
 		!hasBTBucketIn(buckets) {
-		p2Base := (setTablesEnd + 7) &^ 7 // 8-aligned, see anchoredTableBase (U4)
+		p2Base := (setTablesEnd + 7) &^ 7 // 8-aligned, see anchoredTableBase
 		sub := fallbackSubSpec(spec, buckets)
 		// No accept rows on request: phase 2 serves the scan pair only, and
 		// `find` — the preflight's capability — is excluded from the split.
@@ -2292,7 +2292,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	var lFirstByte byte
 	if absence {
 		// 13 i32 (pos, search mask, simd mask, allElig, end), 2 i64 (acc, alive), 1 v128,
-		// then lFirstByte and the absence drain's candidate position (G5).
+		// then lFirstByte and the absence drain's candidate position.
 		// Always one alive word: the absence prefilter is capped at 64 ids.
 		b = append(b, 0x04+gateGroups(gateLocals), 0x0D, 0x7F, 0x02, 0x7E, 0x01, 0x7B, 0x02, 0x7F)
 		b = appendGateLocalGroup(b, gateLocals)
@@ -2355,7 +2355,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 		// with the i64s when lAllElig is inserted ahead of them.
 		lChunk := byte(c.localBase + 15)
 		// The absence drain's candidate position is the LAST local of the
-		// absence arm, one past lFirstByte (G5).
+		// absence arm, one past lFirstByte.
 		lCand := byte(c.localBase + 17)
 		b = emitFindPreflight(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
 			c.pGate, c.pInLen, c.pFrom, lEnd, tableMemIdx, absence, c.localBase+10, lChunk, lCand)
@@ -2396,7 +2396,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 
 	// The position's first byte is loaded once for the whole bucket chain: an
 	// AC-demoted scalar set can carry dozens to hundreds of buckets, and every
-	// one of them opened by reading the same byte again (E5).
+	// one of them opened by reading the same byte again.
 	b = c.emitLiteralBucketsHoisted(b, lPos, lFirstByte)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
@@ -2438,7 +2438,7 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	// locals: 6 × i32 (lPos, lTotal, lTmp, lValidMask, lOutBase, lSkipMask), 1 × v128 (lChunk),
 	// + 2 × i32 (lDenseCounter, lDenseSkipFlag) when adaptive,
 	// + 3 × i32 (lMinStart, lBase, lStart) for the first-position state.
-	// The per-position first byte (E5) is declared in a TRAILING group so that
+	// The per-position first byte is declared in a TRAILING group so that
 	// every index above it is untouched: WASM assigns local indices in
 	// declaration order, and inserting into an earlier group would move the
 	// v128 and i64 the arms below name explicitly.
@@ -2632,7 +2632,7 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 
 	// Literal buckets only (selection requires no fallback). Shortest literal
 	// first for the same ordering reason as the scalar path, and with the
-	// position's first byte loaded once for the whole chain (E5).
+	// position's first byte loaded once for the whole chain.
 	b = c.emitLiteralBucketsHoisted(b, lPos, lFirstByte)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++

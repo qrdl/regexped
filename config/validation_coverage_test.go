@@ -38,7 +38,7 @@ func TestLoadConfigRejectsEmptyPattern(t *testing.T) {
 }
 
 // TestLoadConfigRejectsUnknownStubType covers surfacing ResolveStubType's error
-// at load rather than only at `generate` (D9).
+// at load rather than only at `generate`.
 func TestLoadConfigRejectsUnknownStubType(t *testing.T) {
 	err := loadYAML(t, "stub_type: pascal\nregexps:\n  - pattern: 'a'\n    match_func: m\n")
 	if err == nil || !strings.Contains(err.Error(), "pascal") {
@@ -77,7 +77,7 @@ func TestLoadConfigReadErrors(t *testing.T) {
 }
 
 // TestValidateHintsRejectsPointlessBatchFind covers both arms of the
-// "batch-find needs something to batch" rule (D9): the per-regexp one is new,
+// "batch-find needs something to batch" rule: the per-regexp one is new,
 // the per-set one already existed.
 func TestValidateHintsRejectsPointlessBatchFind(t *testing.T) {
 	t.Run("regexp with neither find_func nor groups_func", func(t *testing.T) {
@@ -161,7 +161,7 @@ func TestSetBatchPatternCount(t *testing.T) {
 }
 
 // TestSetBatchExportName pins the synthesized batch export name. It lost its
-// only in-package caller when the dead `_batch` reservation was removed (D9).
+// only in-package caller when the dead `_batch` reservation was removed.
 func TestSetBatchExportName(t *testing.T) {
 	if got := SetBatchExportName("scan_urls"); got != "scan_urls_batch" {
 		t.Errorf("SetBatchExportName = %q, want %q", got, "scan_urls_batch")
@@ -209,7 +209,7 @@ func TestValidateIdentifierRejectsBlank(t *testing.T) {
 }
 
 // TestValidateConfigChecksPatternNamesForNameMap covers the emit_name_map
-// charset rule (D9): `name:` reaches generated source as a %q string literal,
+// charset rule: `name:` reaches generated source as a %q string literal,
 // whose escapes are not valid in all six languages.
 func TestValidateConfigChecksPatternNamesForNameMap(t *testing.T) {
 	withNameMap := func(name string) *BuildConfig {
@@ -239,7 +239,7 @@ func TestValidateConfigChecksPatternNamesForNameMap(t *testing.T) {
 }
 
 // TestASIteratorTypeCollision covers the AssemblyScript arm of the
-// iterator-type check (K2): AS Pascal-cases its iterator name, so the
+// iterator-type check: AS Pascal-cases its iterator name, so the
 // colliding spelling differs from Go's.
 func TestASIteratorTypeCollision(t *testing.T) {
 	cfg := &BuildConfig{

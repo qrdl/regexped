@@ -202,7 +202,7 @@ func SanitizeSetName(name string) string {
 
 // PatternCount returns the number of patterns the set selects.
 //
-// This is the D16 <SET>_PATTERN_COUNT: the worst-case number of matches at a
+// This is <SET>_PATTERN_COUNT: the worst-case number of matches at a
 // single `find` position, and therefore the size of the tuple buffer. It is
 // NOT a bound on pattern id values — see IDSpaceSize.
 func (s SetConfig) PatternCount(cfg BuildConfig) int {

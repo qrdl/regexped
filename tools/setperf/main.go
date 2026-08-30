@@ -1358,7 +1358,7 @@ func runFullMatrix(cases []setCase) {
 	fmt.Println("third view: ra_find_next driven one match per call, both sides paying N")
 	fmt.Println("crossings, uncorrected — lazy API against lazy API.")
 	fmt.Printf("find(overlapping) is timed on at most %d bytes: it is the every-start-position\n", overlappingTimedCap)
-	fmt.Println("enumeration, quadratic on literal-less sets, and blocks the matrix otherwise (F4).")
+	fmt.Println("enumeration, quadratic on literal-less sets, and blocks the matrix otherwise.")
 	fmt.Println()
 
 	for _, c := range cases {

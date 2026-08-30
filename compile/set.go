@@ -1510,7 +1510,7 @@ type sparsePromotion struct {
 }
 
 // promoteSparseBuckets merges buckets that split ONLY because the accept
-// bitmask ran out of bits into a single SPARSE bucket (G17).
+// bitmask ran out of bits into a single SPARSE bucket.
 //
 // A group of N patterns splits into ceil(N/32) buckets because the accept
 // bitmask is an i32 on the per-candidate path — never because the merged DFA

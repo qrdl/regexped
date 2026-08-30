@@ -164,7 +164,7 @@ func (cs *compiledSet) overlapDPBucket() int {
 		return -1
 	}
 	// A sparse bucket keeps per-state accept LISTS rather than an i64 mask,
-	// and G17's rule is that nothing on the candidate path may read an i32
+	// and the sparse rule is that nothing on the candidate path may read an i32
 	// mask as authoritative for one. The sweep reads masks.
 	if bkt.sparse {
 		return -1
@@ -427,7 +427,7 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	set(lPrev)
 
 	// ---- column at t == len: len when the state accepts at EOF, else -1 ----
-	// From state 1: row 0 is the dead state's, and nothing reads it (B6).
+	// From state 1: row 0 is the dead state's, and nothing reads it.
 	konst(1)
 	set(lState)
 	b = append(b, 0x02, 0x40) // block $stateDone

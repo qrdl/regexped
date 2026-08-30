@@ -17,7 +17,7 @@ func asStub(cfg config.BuildConfig, out string) error {
 	if content == "" {
 		return nil
 	}
-	// See jsStub: the namespace applies on the stdout path too (S5).
+	// See jsStub: the namespace applies on the stdout path too.
 	content = applyNamespace(cfg, "as", content)
 	if out == "-" {
 		_, err := fmt.Print(content)

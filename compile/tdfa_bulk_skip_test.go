@@ -314,7 +314,7 @@ func TestEmitTDFABulkSkipShapeNoTagOps(t *testing.T) {
 }
 
 // TestTDFABulkSkipMidAcceptModuleValid compiles whole modules for the
-// bulk-skip shapes end to end, so the B16 mid-accept tail is type-checked by
+// bulk-skip shapes end to end, so the mid-accept tail is type-checked by
 // mustCompileEntries' validator rather than only by the
 // control-flow shape decoder above.
 //

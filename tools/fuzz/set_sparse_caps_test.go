@@ -351,7 +351,7 @@ func TestSparseZeroLengthMatches(t *testing.T) {
 		name string
 		gen  func(i int) string
 	}{
-		// Nullable SUFFIX behind one shared literal: the G17 path.
+		// Nullable SUFFIX behind one shared literal: the sparse-accept path.
 		{"shared-literal", func(i int) string { return fmt.Sprintf(`union[a-z]{0,%d}[0-9]*`, 1+i%8) }},
 		// Nullable and literal-less: the fallback path.
 		{"literal-less", func(i int) string { return fmt.Sprintf(`[a-z]{0,%d}[0-9]*`, 1+i%8) }},

@@ -23,7 +23,7 @@ import (
 //     every merged Rust/Go/C host gets — was never emitted from this package.
 //
 //   - SHAPES THAT NEED A PATTERN FAMILY, not a capability. The union-walk
-//     preflight only runs when the G12 absence prefilter DECLINES, which needs
+//     preflight only runs when the absence prefilter DECLINES, which needs
 //     patterns carrying no mandatory literal at all; the Aho-Corasick body's
 //     no-prefilter arm needs AC to be chosen ALONGSIDE a fallback bucket.
 //     Neither follows from any capability combination.
@@ -109,7 +109,7 @@ func setEmitCovMustCompile(t *testing.T, cfg config.BuildConfig) []byte {
 //   - never-dying is what makes usesGatedFindPreflight / overlapPreflightShape
 //     say yes at all. Without it a preflight is the reverted Candidate A — a pass
 //     over the whole input that retires nothing.
-//   - literal-LESS is what makes the G12 absence prefilter DECLINE
+//   - literal-LESS is what makes the absence prefilter DECLINE
 //     (buildAbsenceLits needs at least one pattern with a mandatory literal),
 //     which is the only way the UNION-walk arm of either preflight runs.
 //
