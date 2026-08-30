@@ -14,7 +14,7 @@ import (
 // It means the engine abandoned part of the search space and does NOT know
 // whether the input matches — so a stub that folds it into its existing
 // "negative means no match" test turns an engine giving up into a confident
-// wrong answer, which is exactly the defect §N1 records.
+// wrong answer, which is exactly the BT stack-overflow defect.
 //
 // How each language surfaces it, after this table was rewritten twice:
 //

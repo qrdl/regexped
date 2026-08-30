@@ -23,7 +23,8 @@ import (
 // the same class of harness mistake as treating a compile-time ceiling error as
 // a bug (see isResourceCeiling).
 //
-// Before the §N1 fix this was indistinguishable from a genuine no-match, so the
+// Before BT stack overflow got its own sentinel this was indistinguishable
+// from a genuine no-match, so the
 // harness could not have skipped it even in principle — a long-input false
 // negative would simply have been reported as an engine bug, or worse, matched
 // the oracle by luck.

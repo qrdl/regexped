@@ -1,6 +1,8 @@
 package generate
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +28,28 @@ import (
 // so these tests write real files rather than calling the string builder.
 
 func writeGoStub(t *testing.T, dirName, importModule, matchFunc, setFind string) string {
+	t.Helper()
+	src, _ := writeGoStubCapturingLog(t, dirName, importModule, matchFunc, setFind)
+	return src
+}
+
+// writeGoStubCapturingLog is writeGoStub plus the slog output goStub produced
+// while running. The warning is the whole point of this file, and it is not
+// observable in the generated source — only in the log — so the tests that
+// assert it need this rather than the string builder.
+//
+// slog.SetDefault is process-global, so these tests must not run in parallel
+// with anything else in the package that logs.
+func writeGoStubCapturingLog(t *testing.T, dirName, importModule, matchFunc, setFind string) (string, string) {
+	t.Helper()
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+	return writeGoStubInner(t, dirName, importModule, matchFunc, setFind), logBuf.String()
+}
+
+func writeGoStubInner(t *testing.T, dirName, importModule, matchFunc, setFind string) string {
 	t.Helper()
 	root := t.TempDir()
 	dir := filepath.Join(root, dirName)
@@ -107,6 +131,72 @@ func TestGoStubPackageNameFromOutputPath(t *testing.T) {
 			}
 			if c.setFind != "" && !strings.Contains(src, c.setFind) {
 				t.Errorf("stub does not mention the set export %q", c.setFind)
+			}
+		})
+	}
+}
+
+// TestGoStubWarnsOnlyForHiddenLibraryNames asserts the WARNING itself, which no
+// other test in this file can see: it is emitted through slog and leaves no
+// trace in the generated source. Without this, the warning could disappear
+// entirely, fire for package main where it is pure noise, or name the wrong
+// symbols, and every other case here would still pass.
+func TestGoStubWarnsOnlyForHiddenLibraryNames(t *testing.T) {
+	cases := []struct {
+		name      string
+		dirName   string
+		module    string
+		matchFunc string
+		setFind   string
+		wantWarn  bool
+		wantNames []string
+	}{
+		{
+			name:    "library package, both names unexported: warns and names both",
+			dirName: "mylib", module: "mylib",
+			matchFunc: "url_match", setFind: "scan_secrets",
+			wantWarn: true, wantNames: []string{"url_match", "scan_secrets"},
+		},
+		{
+			name:    "library package, both names exported: silent",
+			dirName: "mylib", module: "mylib",
+			matchFunc: "URLMatch", setFind: "ScanSecrets",
+			wantWarn: false,
+		},
+		{
+			// The set export is the only hidden one, so it must be the only
+			// one named — a warning that lists every symbol would be useless.
+			name:    "library package, mixed casing: names only the hidden one",
+			dirName: "mylib", module: "mylib",
+			matchFunc: "URLMatch", setFind: "scan_secrets",
+			wantWarn: true, wantNames: []string{"scan_secrets"},
+		},
+		{
+			// package main exports nothing to anyone, so the advice does not
+			// apply and the warning would be noise.
+			name:    "package main, unexported names: silent",
+			dirName: "cmd", module: "mylib",
+			matchFunc: "url_match", setFind: "scan_secrets",
+			wantWarn: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, logs := writeGoStubCapturingLog(t, c.dirName, c.module, c.matchFunc, c.setFind)
+			got := strings.Contains(logs, "not exported")
+			if got != c.wantWarn {
+				t.Fatalf("warning emitted = %v, want %v; log was:\n%s", got, c.wantWarn, logs)
+			}
+			if !c.wantWarn {
+				return
+			}
+			for _, want := range c.wantNames {
+				if !strings.Contains(logs, want) {
+					t.Errorf("warning does not name %q; log was:\n%s", want, logs)
+				}
+			}
+			if c.matchFunc == "URLMatch" && strings.Contains(logs, "URLMatch") {
+				t.Errorf("warning names the EXPORTED symbol URLMatch; log was:\n%s", logs)
 			}
 		})
 	}

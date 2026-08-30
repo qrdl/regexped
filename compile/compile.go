@@ -2601,7 +2601,8 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	b = append(b, 0x22, 0x06)
 	// Any negative find result is forwarded verbatim (wrapped to i32), not
 	// collapsed to -1: a BT find body can return abi.BTStackOverflow (-2), and
-	// rewriting that to abi.NoMatch here would re-create §N1 one layer up. Both
+	// rewriting that to abi.NoMatch here would re-create the silent-overflow
+	// bug one layer up. Both
 	// sentinels are small negatives, so i32.wrap_i64 preserves them exactly.
 	b = append(b, 0x42, 0x00) // i64.const 0
 	b = append(b, 0x53)       // i64.lt_s
@@ -2647,7 +2648,7 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	b = append(b, 0x22, 0x04)
 	// Same rule as the find result above: forward the capture body's own
 	// negative verbatim so a BT captureBody's abi.BTStackOverflow survives to
-	// the export instead of being reported as abi.NoMatch (§N1).
+	// the export instead of being reported as abi.NoMatch.
 	b = append(b, 0x41, 0x00) // i32.const 0
 	b = append(b, 0x48)       // i32.lt_s
 	b = append(b, 0x04, 0x7F) // if (result i32)
@@ -2769,7 +2770,7 @@ func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode) []byte {
 	// if r < -1: return abi.BTStackOverflow. Must be tested BEFORE the
 	// r < 0 exit below, which would otherwise report the batch collected so
 	// far as a complete result — a silent truncation with no way for the host
-	// to tell it from a finished scan (§N1). The count return is non-negative
+	// to tell it from a finished scan. The count return is non-negative
 	// for every successful call, so a negative count is unambiguous.
 	b = emitBTOverflowGuardI64(b, 0x07)
 

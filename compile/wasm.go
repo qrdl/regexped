@@ -199,13 +199,15 @@ func appendTableStore32(b []byte, tableMemIdx int, offset uint32) []byte {
 	return utils.AppendULEB128(b, offset)
 }
 
-// appendTableStore8 emits i32.store8 align=0 offset=0 for a memo table byte write.
-// tableMemIdx 0: 0x3A 0x00 0x00. tableMemIdx 1: 0x3A 0x40 0x01 0x00
-// (memidx emitted as LEB128 — see appendTableLoad8u).
-// appendTableStore16 emits i32.store16 against the table memory. Alignment 1,
-// matching appendTableLoad16u: the sparse accept lists are
-// packed u16 arrays with no padding, so a 2-byte-aligned encoding would be a
-// lie the validator does not check but a host may.
+// appendTableStore16 emits i32.store16 against the table memory, matching
+// appendTableLoad16u's alignment: the memarg align field is the LOG2 of the
+// alignment in bytes, so the 0x00 below declares 1-byte (2^0) alignment, NOT
+// 2-byte. That is deliberate — the sparse accept lists are packed u16 arrays
+// with no padding, so declaring 2-byte alignment would be a lie the validator
+// does not check but a host may. Do not "fix" the 0x00 to 0x01.
+//
+// tableMemIdx 0: 0x3B 0x00 0x00. tableMemIdx 1: 0x3B 0x40 <memidx LEB128> 0x00
+// (the 0x40 bit flags an explicit memory index — see appendTableLoad8u).
 func appendTableStore16(b []byte, tableMemIdx int) []byte {
 	if tableMemIdx == 0 {
 		return append(b, 0x3B, 0x00, 0x00)
@@ -215,6 +217,9 @@ func appendTableStore16(b []byte, tableMemIdx int) []byte {
 	return append(b, 0x00)
 }
 
+// appendTableStore8 emits i32.store8 align=0 offset=0 for a memo table byte
+// write. tableMemIdx 0: 0x3A 0x00 0x00. tableMemIdx 1: 0x3A 0x40 0x01 0x00
+// (memidx emitted as LEB128 — see appendTableLoad8u).
 func appendTableStore8(b []byte, tableMemIdx int) []byte {
 	if tableMemIdx == 0 {
 		return append(b, 0x3A, 0x00, 0x00)

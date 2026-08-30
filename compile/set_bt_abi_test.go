@@ -72,7 +72,11 @@ func TestSetBTForcesMemoryAllABI(t *testing.T) {
 
 	bt := compileBTABISet(t, pats, 1)
 	if !bt.hasBTMember() {
-		t.Skip("max_fallback_states=1 admitted no BT member here")
+		// Failing to build the required fixture is a failure, not a skip:
+		// without a BT member there is no wide-_all arm left to assert, and a
+		// skip would make this ABI regression test silently vacuous.
+		t.Fatal("max_fallback_states=1 admitted no BT member; the forced-BT " +
+			"fixture no longer builds and the wide-_all arm is untested")
 	}
 	if !bt.wideAll() {
 		t.Error("a set with a BT member must use the memory _all form even at a 2-id space")
@@ -91,7 +95,8 @@ func TestSetBTDisablesTwoPhaseSplit(t *testing.T) {
 	pats := []string{`hello[0-9]{3}`, `(?:ab|cd)+`}
 	bt := compileBTABISet(t, pats, 1)
 	if !bt.hasBTMember() {
-		t.Skip("no BT member admitted here")
+		t.Fatal("max_fallback_states=1 admitted no BT member; the forced-BT " +
+			"fixture no longer builds and the split-suppression arm is untested")
 	}
 	if bt.phase2Union != nil {
 		t.Error("a set with a BT member must not take the two-phase scan split: " +

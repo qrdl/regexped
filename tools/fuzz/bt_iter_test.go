@@ -39,11 +39,18 @@ func TestBTFindIterationMatchesGo(t *testing.T) {
 		t.Run(c.pat+"/"+c.input, func(t *testing.T) {
 			re, err := regexp.Compile(c.pat)
 			if err != nil {
-				t.Skipf("Go rejects %q: %v", c.pat, err)
+				// btIterSeeds are hardcoded and valid, so Go cannot reject one.
+				// If it does, something is wrong that a skip would hide behind
+				// a green test.
+				t.Fatalf("Go rejects %q: %v", c.pat, err)
 			}
 			w, err := compileFindBT(c.pat)
 			if err != nil {
-				t.Skipf("compile %q: %v", c.pat, err)
+				// btIterSeeds are fixed shapes chosen to exercise the forced-BT
+				// path, and nothing else in this package reaches it. A skip
+				// here would let an emitter regression pass by deleting the
+				// only coverage of the path under test.
+				t.Fatalf("compile %q: %v", c.pat, err)
 			}
 			got, ok := wasmFindIter(t, w, c.input)
 			if !ok {

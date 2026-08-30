@@ -23,9 +23,10 @@ import (
 // resumable cursor — a different function with a different contract, covered by
 // make setcaps.
 //
-// Both the gated and the overlapping entries are checked: they take different
-// parameter lists (the gated one carries a gate array) and reach the sentinel
-// through different arms.
+// Both the gated and the overlapping entries are checked. They share ONE
+// signature — the gate array included, which the overlapping body uses as the
+// per-drive home of its "matches nowhere" preflight verdict rather than for
+// gating — but they reach the sentinel through different arms.
 func TestBatchZeroCapTerminates(t *testing.T) {
 	pats := []string{`ab`, `b`}
 	entries := make([]config.RegexEntry, len(pats))

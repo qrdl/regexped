@@ -28,7 +28,9 @@ func TestBatchGroupsMatchesGo(t *testing.T) {
 				Pattern: c.pat, GroupsFunc: "groups", Hints: []string{"batch-find"},
 			}}, pathsTableBase, true)
 			if err != nil {
-				t.Skipf("compile: %v", err)
+				// Fixed, valid fixtures: a compile failure is the regression,
+				// not a reason to stop testing.
+				t.Fatalf("compile: %v", err)
 			}
 			store, inst, mem, release, err := instantiate(w)
 			defer release()
@@ -37,7 +39,11 @@ func TestBatchGroupsMatchesGo(t *testing.T) {
 			}
 			fn := inst.GetFunc(store, "groups_batch")
 			if fn == nil {
-				t.Skip("no groups_batch export")
+				// The config above asks for the batch export by name
+				// (Hints: batch-find), so its absence IS the regression this
+				// test exists to catch.
+				t.Fatal("no groups_batch export: the config requested it via " +
+					"hints: [batch-find]")
 			}
 			copy(mem.UnsafeData(store)[pathsInputBase:], c.input)
 			res, callErr := fn.Call(store, pathsInputBase, int32(len(c.input)), outBase, outCap, int32(0))

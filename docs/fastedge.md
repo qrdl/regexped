@@ -109,10 +109,27 @@ sets:
 match patterns::scan_url(&url, 0) {
     Ok(Some(pattern_id)) => {
         let attack = patterns::pattern_name(pattern_id);
-        // block, log `attack`, etc.
+        self.send_http_response(
+            403,
+            vec![("Content-Type", "text/plain")],
+            Some(format!("Forbidden: {} detected", attack).as_bytes()),
+        );
+        return Action::Pause;
     }
-    Ok(None) => {}      // nothing matched
-    Err(_) => {}        // unanswerable — fail CLOSED
+    Ok(None) => {}      // nothing matched — fall through to Action::Continue
+    Err(err) => {
+        // Fail CLOSED: the request was not shown to be clean, so it is not
+        // forwarded. Every arm that is not `Ok(None)` must TERMINATE the
+        // request — an empty arm here reads as "fail closed" and behaves
+        // exactly like `Ok(None)`.
+        println!("Cannot scan URL: {err}");
+        self.send_http_response(
+            500,
+            vec![("Content-Type", "text/plain")],
+            Some("Cannot scan request".as_bytes()),
+        );
+        return Action::Pause;
+    }
 }
 ```
 

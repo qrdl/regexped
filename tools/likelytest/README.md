@@ -8,8 +8,7 @@ both a matching and a non-matching input.
 
 It exists to catch regressions and confirm wins as the `LikelyMode`
 optimisations in `compile/` evolve (see `docs/prefer-hints.md` for the
-user-facing mechanism, or/ for the design
-history). It is **not** a tool for deciding whether *your* pattern should
+user-facing mechanism). It is **not** a tool for deciding whether *your* pattern should
 use `LikelyMatch`/`LikelyNoMatch` — for that, use `tools/pattest` against
 your own pattern and representative inputs (see "Before enabling a
 non-neutral mode on your own pattern" below).
@@ -29,11 +28,10 @@ exits non-zero. `modeSet` cases are not checked here — `tools/re2test`'s own
 This exists because a `LikelyMode`-specific correctness bug can hide in
 exactly this corpus's blind spot: fuel/time numbers look "good" whether the
 compiled WASM took a legitimately cheap path or is silently returning the
-wrong answer cheaper than the correct one would cost. See the case that
-motivated adding this check —
-a false negative in a groups-mode capture composition that had been sitting
-undetected in this benchmark's own `gap-e-groups` case because nothing
-here validated output, only cost.
+wrong answer cheaper than the correct one would cost. The case that motivated
+adding this check was exactly that: a false negative in a groups-mode capture
+composition, sitting undetected in this benchmark's own `gap-e-groups` case
+because nothing here validated output, only cost.
 
 ## Running it
 
@@ -69,8 +67,8 @@ in-WASM timing samples per cell (see `computeStat` in `shims.go`).
 **Trust fuel, not wall-time, for pass/fail decisions.** Fuel is a
 deterministic instruction-count proxy; wall-time on this harness has shown
 swings up to ±85% between runs of byte-identical WASM, traced to
-Cranelift/CPU instruction-placement noise, not a real difference (see
- "placement roulette" finding). A case with 0% fuel Δ and a
+Cranelift/CPU instruction-placement noise, not a real difference — the
+"placement roulette" finding. A case with 0% fuel Δ and a
 large time Δ is noise, not a regression. Compare fuel first; use time only to
 sanity-check that nothing has gone catastrophically slower in absolute terms.
 
@@ -158,15 +156,15 @@ repeatedly for the next match), not just of the byte class:
 | `dense-words-grouped` | LNM (match) | +37% | `exhaustive: true`, `(\w+)` matching almost every ~6 bytes — each `find_all` call returns before the counter can accumulate anywhere near the ~8-attempt threshold, so the switch essentially never trips and the whole scan pays the Shufti tax. |
 
 `dense-bare-upper` and `dense-words-grouped`'s numbers are new findings (not
-previously written up in `docs/prefer-hints.md`, `docs/likely.md`, or
-``) — same mechanism as
+previously written up in `docs/prefer-hints.md` or `docs/likely.md`) — same
+mechanism as
 the `alpha-run`/`word-run` residual, just a larger instance of it because
 of how frequently their matches restart the per-call counter. This is a
 real, understood limitation of the task-25 mechanism (short/frequent
 matches defeat the adaptive switch), not a new class of bug — but the
 mechanism has only ever been tuned/measured against `alpha-run`, `word-run`,
-`alpha-run-impossible-bytes`, and `deadskip-near-miss` (see task 25's
-original measurement plan. A future fix would need to
+`alpha-run-impossible-bytes`, and `deadskip-near-miss`, which is the whole of
+task 25's original measurement plan. A future fix would need to
 either persist the counter across calls (state stored outside the function,
 e.g. a global or memory cell) or accept that exhaustive/frequent-match
 workloads are the worst case for this mechanism.
@@ -230,7 +228,7 @@ counter-case was built and run through the full likelytest matrix plus the
 complete 8-stage re2test sweep — and Opt 1 specifically failed that process
 on its first design (a 48-57% no-match regression from the original
 side-table dispatch) and had to be redesigned before it could go default.
-Task 22 hasn't been through that drill yet "Load-bearing
+Task 22 hasn't been through that drill yet; see `CLAUDE.md`'s "Load-bearing
 engine-selection gates" note for the standing project policy this falls
 under — don't relax a gate (or remove one entirely by defaulting it on)
 without measuring the specific counter-shape first.

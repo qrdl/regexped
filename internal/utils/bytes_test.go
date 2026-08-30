@@ -636,8 +636,11 @@ func TestWasmTableBasePassiveSegment(t *testing.T) {
 	}
 }
 
-// A data segment that DECLARES a payload it does not carry must be an error,
-// not a panic.
+// A data segment that DECLARES a payload it does not carry must not PANIC.
+//
+// That is the whole contract, and the name says so: either answer is legal —
+// an error, or (0, nil) because the magic genuinely is not there. Asserting
+// one of them would pin an implementation detail instead of the guarantee.
 //
 // findMagicInDataSection tested the declared size against len(ReservationMagic)
 // and then indexed data[off+j] on the strength of that promise. A file
@@ -652,7 +655,7 @@ func TestWasmTableBasePassiveSegment(t *testing.T) {
 // The inputs are hand-assembled rather than built with the helpers above,
 // because what is under test is precisely a byte sequence the writers cannot
 // produce.
-func TestWasmTableBaseTruncatedPayloadIsErrorNotPanic(t *testing.T) {
+func TestWasmTableBaseTruncatedPayloadDoesNotPanic(t *testing.T) {
 	magic := len(ReservationMagic)
 	for _, tc := range []struct {
 		name string

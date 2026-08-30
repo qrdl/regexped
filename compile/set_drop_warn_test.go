@@ -158,8 +158,8 @@ func TestCompileFallback_NoWarnWhenAdmitted(t *testing.T) {
 	}
 }
 
-// TestCompileFallback_WarnsWithNilDiag is the specific regression for §N3's
-// corrected mechanism. The warning must not be nested inside the
+// TestCompileFallback_WarnsWithNilDiag is the specific regression for the
+// nil-diag warning mechanism. The warning must not be nested inside the
 // `if diag != nil` bookkeeping guards: CompileSet always allocates a SetDiag so
 // those guards always pass, but the struct is discarded unless --diag-json was
 // requested. Passing an explicitly nil diag here asserts the warning is

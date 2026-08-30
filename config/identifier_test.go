@@ -101,7 +101,7 @@ func TestValidateConfig_RejectsInjection(t *testing.T) {
 	}
 	err := ValidateConfig(&cfg)
 	if err == nil {
-		t.Fatal("ValidateConfig accepted the §N4 injection payload, want error")
+		t.Fatal("ValidateConfig accepted the injection payload, want error")
 	}
 	if !strings.Contains(err.Error(), "match_func") {
 		t.Errorf("error does not name the offending field: %v", err)

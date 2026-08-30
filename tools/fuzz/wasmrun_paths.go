@@ -26,8 +26,9 @@ import (
 //
 // re2test puts its slots buffer at offset 512 with input at 0, which caps
 // usable input at 512 bytes before the two collide. That is fine for
-// exhaustive short strings but useless here: §N1 is an input-length-dependent
-// Backtracking bug that only appears past numAlts*4096 bytes, so the whole
+// exhaustive short strings but useless here: BT stack overflow is an
+// input-length-dependent Backtracking failure that only appears past
+// numAlts*4096 bytes, so the whole
 // point of this layer is to reach long inputs. Hence a 128 KB input window and
 // a separate 128 KB output window, both below the tables.
 const (

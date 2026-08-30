@@ -18,7 +18,10 @@ func TestAltLitAnchorIteration(t *testing.T) {
 		t.Run(c.input, func(t *testing.T) {
 			w, err := compileFind(c.pat)
 			if err != nil {
-				t.Skipf("compile: %v", err)
+				// A fixed, valid fixture whose whole purpose is to keep the
+				// alt-lit-anchor emitter covered. Skipping here would turn the
+				// loss of that entire path into a green test.
+				t.Fatalf("compile: %v", err)
 			}
 			got, ok := wasmFindIter(t, w, c.input)
 			if !ok {

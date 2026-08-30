@@ -4,8 +4,9 @@
 // FuzzCorrectness only ever sets FindFunc, so it exercises exactly one of the
 // five compiled paths — the no-capture DFA/CompiledDFA find body. Thirty-nine
 // fuzzer bugs came out of that single path; anchored match, the two capture
-// backends, and the whole set pipeline had no coverage at all. §N1 (Backtracking
-// silently returning "no match" once the input passes numAlts*4096 bytes) was
+// backends, and the whole set pipeline had no coverage at all. The BT
+// stack-overflow bug (Backtracking silently returning "no match" once the
+// input passes numAlts*4096 bytes) was
 // found by hand-pointing a harness at the BT capture path, which is the direct
 // argument for this file existing.
 //
@@ -58,7 +59,8 @@ func skipPattern(pat, input string) string {
 
 // isResourceCeiling reports whether a compile error is a legitimate, documented
 // resource ceiling rather than a bug. These are surfaced as typed errors on
-// purpose (contrast §N1, whose *runtime* ceiling is silent).
+// purpose (contrast the Backtracking frame budget, whose *runtime* ceiling was
+// silent until it got its own sentinel).
 func isResourceCeiling(err error) bool {
 	return errors.Is(err, compile.ErrBTProgramTooLarge) ||
 		errors.Is(err, compile.ErrBTStackTooLarge) ||

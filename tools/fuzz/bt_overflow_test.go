@@ -96,7 +96,7 @@ func btRawCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs .
 	}
 }
 
-// TestBTStackOverflowIsDistinguishable is the core §N1 assertion: on an input
+// TestBTStackOverflowIsDistinguishable is the core assertion: on an input
 // past the frame ceiling every BT-hosting export reports BTStackOverflow, and
 // critically NOT NoMatch — while the same pattern on a shorter input still
 // answers correctly, so the sentinel has not simply replaced all results.
@@ -197,7 +197,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			}
 			got := btRawCall(t, w, tc.export, tc.blown, tc.extra...)
 			if got == abi.NoMatch {
-				t.Errorf("%s on %d-byte input = %d (NoMatch) — §N1 regression: "+
+				t.Errorf("%s on %d-byte input = %d (NoMatch) — regression: "+
 					"stack overflow reported as a definite no-match",
 					tc.export, len(tc.blown), got)
 			}
