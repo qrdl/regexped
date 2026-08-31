@@ -71,6 +71,17 @@ regexped/
 │   │                          #   and the hidden per-position worker (a find body with the batch gate
 │   │                          #   rule / skip parameter). Cursor field widths live in config/.
 │   ├── set_union_scan.go      # Start-anywhere union automaton: one pass over the whole input.
+│   │                          #   Under set-level prefer-no-match, emitUnionSkip strides 16
+│   │                          #   bytes at a time through a state's self-loop run. Exact, not
+│   │                          #   approximate: only NON-mid-accepting states qualify, so a run
+│   │                          #   has no effect but the position, and these bodies report no
+│   │                          #   position. It probes the EXIT set, never the self-loop set —
+│   │                          #   one nibble-table pair per 8 members makes a 230-byte
+│   │                          #   self-loop 29 pairs against the exit set's 4. The automaton
+│   │                          #   is NOT minimized, so the detector must treat a move to an
+│   │                          #   INDISTINGUISHABLE state as staying put (same rows AND same
+│   │                          #   accepts); without that the exit set is \w rather than [a-z]
+│   │                          #   and the win halves.
 │   │                          #   Serves scan_any/scan_all on literal-less sets, and PHASE 2 of the
 │ │ # two-phase split on MIXED sets. Table layout is
 │   │                          #   u8 state ids <=256 states, byte-class compressed over 32 KB.
@@ -153,7 +164,11 @@ regexped/
 │   ├── workers.md             # Cloudflare Workers integration
 │   ├── re2.md                 # RE2 test coverage
 │   ├── wasm.md                # WASM interface, memory layout, table formats
-│   └── sets.md                # Set composition: five capabilities, YAML schema, gate array, output formats
+│   ├── sets.md                # Set composition: five capabilities, YAML schema, gate array, output formats
+│   └── prefer-hints.md        # THE hints doc: the `hints:` values prefer-match /
+│                              #   prefer-no-match, which pattern and SET shapes each one
+│                              #   actually changes, and how to measure whether it helps
+│                              #   YOUR traffic before shipping it
 └── examples/
  ├──
     ├── Makefile
@@ -443,6 +458,16 @@ Two scales: **`make setcaps`** samples (`--sample`) and measures about three
 minutes for **7,712,525 checks**, which is why it is in `make test`;
 **`make setcaps-exhaustive`** is the same coverage over every chunk and takes
 hours. **Current: 0 failures.**
+
+**`make setcaps-likely`** is the same corpus under a non-neutral set-level
+hint (`--likelymatch` / `--likelynomatch`, which reach the set path as
+`hints:`), and it is in `make test` too. It exists because `setcaps` runs
+entirely NEUTRAL: until it was added, every hint-gated set emitter — the
+Shufti self-loop channels in bucket suffix bodies, the union scan's SIMD
+stride, the widened Shufti band, LM-6's packer split, H.3's forced-Shufti
+frontend — had **no correctness gate at all**. It compiles genuinely
+different bodies from the ones `setcaps` checks, at 9,410,470 checks / 0
+failures.
 
 `custom-sets.txt` adds hand-picked blocks whose expectations are REGENERATED
 from Go (`go run ./make_sets custom-sets.txt`) rather than hand-maintained,
@@ -757,9 +782,11 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 **Last Updated:** 2026-08-24
 **CLI commands:** `generate` (stubs), `compile`, `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand.
-**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition)
+**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 
-**Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body), scalar.
+**Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body; reachable ONLY from the scalar branch, i.e. after AC declines over its 512 KB budget — first-byte union 17..64, or up to 128 under set-level `prefer-no-match`), scalar. The crossovers between them were re-measured on a match-dense corpus in 2026-08-31 (TODO task 71) and did NOT move: the chooser picks the winning frontend in all 20 rows of both corpora, so none of them is hint-conditional. `CompileSetOptions.WithForcedFrontend` + `setperf -force-frontend` are the test-only knobs that ask the question again.
+
+**Set hint-gated emission** (all set-level, `sets:` → `hints:`; gated by `make setcaps-likely`, since plain `make setcaps` runs entirely neutral): `prefer-match` gives bucket SUFFIX bodies the three Shufti self-loop channels via `genSuffixWASM`'s `LikelyMode` parameter (a suffix DFA has an empty `l.prefix` by construction, which used to make `detectShuftiSelfLoop` refuse every set body outright) and keeps counted-chain patterns in singleton buckets (LM-6); `prefer-no-match` turns on the union scan's SIMD stride (`emitUnionSkip`) and the widened Shufti band.
 
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

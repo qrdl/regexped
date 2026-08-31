@@ -1,0 +1,25 @@
+# The bucket SUFFIX body's Shufti self-loop channels (task 68).
+#
+# Each pattern's mandatory literal (`A="`) is split off by the packer, leaving
+# the suffix `[a-z0-9]+"` — a 36-byte NON-mid-accept self-loop, since the body
+# cannot accept until the closing quote arrives. That is the LM-3 shape, which
+# no set could reach before task 68: a suffix DFA has an empty l.prefix by
+# construction, so detectShuftiSelfLoop's bare-prefix bail refused every bucket
+# body regardless of hint.
+#
+# `prefer-match` is what turns the three channels on; without it this fixture
+# would be byte-identical to a neutral one and would pin nothing.
+regexps:
+  - name: p0
+    pattern: 'A="[a-z0-9]+"'
+  - name: p1
+    pattern: 'B="[a-z0-9]+"'
+  - name: p2
+    pattern: 'C="[a-z0-9]+"'
+  - name: p3
+    pattern: 'D="[a-z0-9]+"'
+sets:
+  - name: s
+    find: s_find
+    patterns: all
+    hints: [prefer-match]

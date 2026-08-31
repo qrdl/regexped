@@ -1080,9 +1080,9 @@ func TestSetCoreSparseSuffixBodySubtractsFixedPrefix(t *testing.T) {
 	prefixFixedLens := make([]int, numPatterns)
 	prefixFixedLens[0] = 3 // the bucket-wide fixed prefix length
 
-	withPrefix, _, _, _ := genSuffixWASM(table, 0, 0, setCoreCovIDs(numPatterns), prefixFixedLens,
+	withPrefix, _, _, _ := genSuffixWASM(table, 0, 0, setCoreCovIDs(numPatterns), prefixFixedLens, LikelyNeutral,
 		false /* needProbes */, false /* gated */)
-	withoutPrefix, _, _, _ := genSuffixWASM(table, 0, 0, setCoreCovIDs(numPatterns), make([]int, numPatterns),
+	withoutPrefix, _, _, _ := genSuffixWASM(table, 0, 0, setCoreCovIDs(numPatterns), make([]int, numPatterns), LikelyNeutral,
 		false, false)
 
 	if len(withPrefix.fnBody) == 0 {

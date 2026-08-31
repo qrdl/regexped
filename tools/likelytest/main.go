@@ -91,7 +91,27 @@ type testCase struct {
 	// what makes them actually exercise the whole buffer. modeSet cases
 	// always exhaust via the set `find` regardless of this flag.
 	exhaustive bool
+
+	// setCap selects which capability a modeSet case declares and drives.
+	// Empty (the default) is `find`, driven to exhaustion — the only shape
+	// this harness had before.
+	//
+	// The scan pair exists here because it is the ONLY way to reach the union
+	// automaton (compile/set_union_scan.go): `find` never enters it except
+	// through a preflight. A set-level optimisation to the union scan is
+	// invisible to a `find`-only harness, which is what this field fixes.
+	// Values: setCapFind, setCapScanAny, setCapScanAll.
+	setCap string
 }
+
+// The capabilities a modeSet case can drive. Kept as the export names
+// themselves so the config field, the WASM export and the row label cannot
+// drift apart.
+const (
+	setCapFind    = ""         // `find`, driven to exhaustion
+	setCapScanAny = "scan_any" // one call; returns a bare id or -1
+	setCapScanAll = "scan_all" // one call; returns an i64 id bitmask
+)
 
 var tests = []testCase{
 	// ── Shufti prefix-scan targets (LNM Action 3) ───────────────────────
@@ -271,6 +291,26 @@ var tests = []testCase{
 		// No-match input is pure lowercase prose — Shufti never finds a
 		// candidate, SIMD-skips the entire 50 KB in 16-byte chunks. Match
 		// input has letter density too high for SIMD to help much.
+		//
+		// ⚠ STALE AS OF 2026-08-31: this case and set-shufti-dense-harm below
+		// both compile to **Teddy**, not Shufti, and print "identical WASM —
+		// same as neutral" in all three modes — so neither exercises the H.3
+		// mechanism its name and notes claim. The comment above describes the
+		// selection rules as they were before the Teddy crossover rework: 21
+		// literals of length 3 with 21 distinct first bytes now satisfy
+		// chooseLiteralFrontend's Teddy branch (<=64 literals, minLen >= 2,
+		// distinctFirst >= 4), and Shufti is reachable ONLY from the scalar
+		// branch — i.e. only after Aho-Corasick declines over its 512 KB
+		// budget, which takes hundreds of long literals.
+		//
+		// Left in place rather than silently repointed: choosing the
+		// replacement shape is a judgement call about what these two cases
+		// should measure, not a mechanical fix. Same class as the
+		// sampleNeedles incidents in tools/setperf — a case whose label and
+		// its subject drifted apart. tools/fuzz's
+		// TestSetShuftiFrontendAgainstOracle is the shape that does reach the
+		// Shufti frontend, and it asserts the frontend so it cannot drift the
+		// same way.
 		name: "set-shufti-lnm",
 		setPatterns: []string{
 			`A1:[^\n]+`, `B1:[^\n]+`, `C1:[^\n]+`, `D1:[^\n]+`, `E1:[^\n]+`,
@@ -494,6 +534,158 @@ var tests = []testCase{
 		matchInput:   denseSetSharedPrefixInput(true),
 		nomatchInput: denseSetSharedPrefixInput(false),
 	},
+	{
+		// Task 68 primary target: the LM-3 shape inside a SET. Each pattern's
+		// mandatory literal (`A="`) is split off by the packer, leaving the
+		// suffix `[a-z0-9]+"` — a 36-byte NON-mid-accept self-loop, since the
+		// body cannot accept until the closing quote arrives.
+		//
+		// Before task 68 no set could reach that channel at all: a suffix DFA
+		// has an empty l.prefix by construction, so detectShuftiSelfLoop's
+		// bare-prefix bail refused every bucket body regardless of hint.
+		// Long runs (20-50 bytes) so a 16-byte chunk skip is productive.
+		name: "set-dense-quoted",
+		setPatterns: []string{
+			`A="[a-z0-9]+"`, `B="[a-z0-9]+"`, `C="[a-z0-9]+"`, `D="[a-z0-9]+"`,
+			`E="[a-z0-9]+"`, `F="[a-z0-9]+"`, `G="[a-z0-9]+"`, `H="[a-z0-9]+"`,
+		},
+		mode:         modeSet,
+		notes:        "8-pattern set, quoted alnum bodies 20-50 bytes — task 68 primary target (non-mid Shufti self-loop in a bucket suffix body)",
+		matchInput:   setQuotedInput(true, false),
+		nomatchInput: setQuotedInput(false, false),
+	},
+	{
+		// Task 68 harm/hysteresis guard: same set, 3-6-byte bodies. Every
+		// bulk-skip attempt advances < 16 bytes, so the task-38 hysteresis
+		// should self-disable the channel and hold fuel near neutral. This is
+		// the case that decides whether task 68 needs a minimum-length gate
+		// of its own (the single-pattern LM-4 precedent) or whether the
+		// hysteresis is enough — a suffix DFA has no pattern string to
+		// re-parse for a min-length check, so "enough" is the better answer.
+		name: "set-dense-quoted-short",
+		setPatterns: []string{
+			`A="[a-z0-9]+"`, `B="[a-z0-9]+"`, `C="[a-z0-9]+"`, `D="[a-z0-9]+"`,
+			`E="[a-z0-9]+"`, `F="[a-z0-9]+"`, `G="[a-z0-9]+"`, `H="[a-z0-9]+"`,
+		},
+		mode:         modeSet,
+		notes:        "same 8-pattern set, bodies 3-6 bytes — task 68 harm/hysteresis guard",
+		matchInput:   setQuotedInput(true, true),
+		nomatchInput: setQuotedInput(false, true),
+	},
+	{
+		// Task 69 target: a LITERAL-LESS set driving scan_any, which is the
+		// only way into the union automaton (compile/set_union_scan.go) —
+		// `find` never enters it except through a preflight, so a find-only
+		// harness cannot see a union-scan change at all.
+		//
+		// Every pattern starts with [a-z], so the union automaton's entry
+		// state self-loops on the other 230 bytes. The no-match input is
+		// SPARSE in [a-z] (digits and punctuation), which is the run-skipping
+		// win case; the match input is dense prose, the harm case.
+		name: "set-scan-classchain-sparse",
+		setPatterns: []string{
+			`[a-z]{4}[0-9]{1}`, `[a-z]{4}[0-9]{2}`, `[a-z]{4}[0-9]{3}`,
+			`[a-z]{5}[0-9]{1}`, `[a-z]{5}[0-9]{2}`, `[a-z]{5}[0-9]{3}`,
+			`[a-z]{6}[0-9]{2}`, `[a-z]{6}[0-9]{3}`,
+		},
+		mode:         modeSet,
+		setCap:       setCapScanAny,
+		notes:        "literal-less 8-pattern set, scan_any over the union automaton — task 69 target (entry-state self-loop skip)",
+		matchInput:   setClassChainInput(true),
+		nomatchInput: setClassChainInput(false),
+	},
+	{
+		// The scan_all twin of the case above. Both walk every byte the same
+		// way (our scan_any and scan_all do identical per-byte work — the
+		// documented reason the setperf board loses classchain scan_any to
+		// regex-automata while winning scan_all), so a union-scan change must
+		// move both or neither.
+		name: "set-scan-all-classchain-sparse",
+		setPatterns: []string{
+			`[a-z]{4}[0-9]{1}`, `[a-z]{4}[0-9]{2}`, `[a-z]{4}[0-9]{3}`,
+			`[a-z]{5}[0-9]{1}`, `[a-z]{5}[0-9]{2}`, `[a-z]{5}[0-9]{3}`,
+			`[a-z]{6}[0-9]{2}`, `[a-z]{6}[0-9]{3}`,
+		},
+		mode:         modeSet,
+		setCap:       setCapScanAll,
+		notes:        "same literal-less set driving scan_all — task 69 twin (no early exit until every id is seen)",
+		matchInput:   setClassChainInput(true),
+		nomatchInput: setClassChainInput(false),
+	},
+	{
+		// Task 70 target: a set whose first-byte union is WIDER than the
+		// 17..64 Shufti band, which neutral mode therefore leaves on the
+		// scalar per-position walk.
+		//
+		// Reaching it takes all three of: enough long literals that the
+		// Aho-Corasick table blows its 512 KB budget (the only route from a
+		// literal set to frontendScalar), 65+ distinct first bytes, and no
+		// fallback bucket. 80 patterns over a 79-byte alphabet does it.
+		//
+		// The no-match input is built from bytes OUTSIDE the union — the
+		// "impossible bytes" workload LNM.md's Action 5 was written for, and
+		// the only shape where a 79-byte prefilter can skip anything. The
+		// match input is dense in the union, where it cannot.
+		name:         "set-wide-union-shufti",
+		setPatterns:  wideUnionSetPatterns(80),
+		mode:         modeSet,
+		notes:        "80 long literals, 79 distinct first bytes — task 70 target (Shufti band widened past 64 under LNM)",
+		matchInput:   wideUnionInput(true),
+		nomatchInput: wideUnionInput(false),
+	},
+}
+
+// wideUnionAlphabet is the 79 bytes the task-70 case's literals start with:
+// every alphanumeric plus the punctuation that needs no regexp escaping. Its
+// COMPLEMENT is what the no-match input is built from, so the two must be
+// derived from one place.
+const wideUnionAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" +
+	"_~!@#%&=:;,<>/'\"`"
+
+// wideUnionSetPatterns builds n literals long enough to push the AC table over
+// its budget, each starting with a distinct byte of wideUnionAlphabet.
+func wideUnionSetPatterns(n int) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		body := ""
+		for j := 0; j < 24; j++ {
+			body += string(rune('a' + (i/len(wideUnionAlphabet)+j)%26))
+		}
+		out = append(out, fmt.Sprintf("%s%s%04d[0-9]+", string(wideUnionAlphabet[i%len(wideUnionAlphabet)]), body, i))
+	}
+	return out
+}
+
+// wideUnionInput builds ~50 KB for the task-70 case.
+//
+// The no-match half uses ONLY bytes outside wideUnionAlphabet, which is what
+// makes it the case a wide prefilter can serve at all; anything else and a
+// 79-byte union finds a candidate in nearly every 16-byte chunk. The match
+// half is dense in the alphabet and carries real needles.
+func wideUnionInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	var b []byte
+	if !withMatches {
+		var outside []byte
+		for c := 0; c < 256; c++ {
+			if !strings.ContainsRune(wideUnionAlphabet, rune(c)) && c != 0 {
+				outside = append(outside, byte(c))
+			}
+		}
+		for i := 0; len(b) < targetSize; i++ {
+			b = append(b, outside[i%len(outside)])
+		}
+		return string(b[:targetSize])
+	}
+	pats := wideUnionSetPatterns(80)
+	for i := 0; len(b) < targetSize; i++ {
+		// The literal prefix of pattern i, then a digit run to complete it.
+		lit := pats[i%len(pats)]
+		lit = lit[:len(lit)-len("[0-9]+")]
+		b = append(b, lit...)
+		b = append(b, "123 "...)
+	}
+	return string(b[:targetSize])
 }
 
 // --------------------------------------------------------------------------
@@ -1092,6 +1284,85 @@ func denseSetSharedPrefixInput(withMatches bool) string {
 	return string(b[:targetSize])
 }
 
+// setQuotedInput builds ~50 KB for the set-dense-quoted / -short cases: an
+// 8-pattern set of `<K>="[a-z0-9]+"`. Each token is prefixed with one of the
+// set's literals so the frontend produces a real candidate, and the body
+// length selects the win case (20-50 bytes, several SIMD chunks per run) or
+// the harm case (3-6 bytes, every attempt advancing < 16).
+//
+// The no-match input carries the literals' first bytes but never the `="`
+// that completes them, so the frontend still does its work and the suffix
+// bodies still run — a no-match input with no candidate at all would measure
+// the frontend alone and say nothing about the suffix channel this targets.
+func setQuotedInput(withMatches, short bool) string {
+	const targetSize = 50 * 1024
+	keys := "ABCDEFGH"
+	alnum := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
+	minLen, maxLen := 20, 50
+	if short {
+		minLen, maxLen = 3, 6
+	}
+	var b []byte
+	runLen := minLen
+	for i := 0; len(b) < targetSize; i++ {
+		b = append(b, keys[i%len(keys)])
+		if withMatches {
+			b = append(b, '=', '"')
+		} else {
+			// Same first byte, no `="`: a frontend candidate that dies at the
+			// second byte of the literal.
+			b = append(b, '-', ' ')
+		}
+		for j := 0; j < runLen; j++ {
+			b = append(b, alnum[j%len(alnum)])
+		}
+		if withMatches {
+			b = append(b, '"')
+		}
+		b = append(b, ' ')
+		runLen++
+		if runLen > maxLen {
+			runLen = minLen
+		}
+	}
+	return string(b[:targetSize])
+}
+
+// setClassChainInput builds ~50 KB for the literal-less scan cases.
+//
+// The two inputs differ in the axis task 69 turns on, not just in whether
+// they match: the no-match input is SPARSE in [a-z] (the byte class every
+// pattern starts with), so the union automaton's entry state sits in a long
+// self-loop run that a SIMD skip can stride over. The match input is dense
+// lowercase prose carrying real needles, where the same skip finds an exit in
+// nearly every chunk — the harm side the adaptive switch has to bound.
+func setClassChainInput(withMatches bool) string {
+	const targetSize = 50 * 1024
+	var b []byte
+	if !withMatches {
+		filler := []byte("0123456789 ,.;:!?()[]{}<>/@#$%^&*-_=+|~ 9876543210 ")
+		for len(b) < targetSize {
+			b = append(b, filler...)
+		}
+		return string(b[:targetSize])
+	}
+	words := []string{
+		"the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+	}
+	for i := 0; len(b) < targetSize; i++ {
+		if i%17 == 0 {
+			// A real needle: six lowercase, a digit in 0..7, three digits.
+			b = append(b, "abcdef"...)
+			b = append(b, byte('0'+i%8))
+			b = append(b, "123"...)
+		} else {
+			b = append(b, words[i%len(words)]...)
+		}
+		b = append(b, ' ')
+	}
+	return string(b[:targetSize])
+}
+
 // spread inserts `items` evenly through `base`, separated by `sep`.
 func spread(base string, items []string, sep string) string {
 	if len(items) == 0 {
@@ -1169,16 +1440,26 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	for i, p := range tc.setPatterns {
 		entries[i] = config.RegexEntry{Pattern: p}
 	}
+	sc := config.SetConfig{
+		Name:     "bench_set",
+		Patterns: config.PatternSelector{All: true},
+		Hints:    hintsYAML(mode),
+	}
+	// Exactly ONE capability per case, on purpose: the compiler emits only the
+	// machinery the declared capabilities need, so a set that also declared
+	// `find` would carry a literal frontend the scan measurement is not
+	// driving — and the module-size column would report the union of both.
+	switch tc.setCap {
+	case setCapScanAny:
+		sc.ScanAny = "set_scan_any"
+	case setCapScanAll:
+		sc.ScanAll = "set_scan_all"
+	default:
+		sc.Find = "set_find"
+	}
 	cfg := config.BuildConfig{
 		Regexps: entries,
-		Sets: []config.SetConfig{
-			{
-				Name:     "bench_set",
-				Find:     "set_find",
-				Patterns: config.PatternSelector{All: true},
-				Hints:    hintsYAML(mode),
-			},
-		},
+		Sets:    []config.SetConfig{sc},
 	}
 	// Output empty → standalone.
 	wasm, _, err := compile.CompileFile(cfg, "")
@@ -1529,11 +1810,11 @@ func benchFuelExhaust(wasmBytes []byte, tc testCase, input string, fuelEngine *w
 // measured under a different mode label.
 func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string, engine, fuelEngine *wasmtime.Engine) (cell, error) {
 	if tc.mode == modeSet {
-		t, err := benchTimeSet(wasm, input, engine)
+		t, err := benchTimeSet(tc, wasm, input, engine)
 		if err != nil {
 			return cell{}, fmt.Errorf("bench time %s: %w", mode, err)
 		}
-		f, err := benchFuelSet(wasm, input, fuelEngine)
+		f, err := benchFuelSet(tc, wasm, input, fuelEngine)
 		if err != nil {
 			return cell{}, fmt.Errorf("bench fuel %s: %w", mode, err)
 		}
@@ -1999,9 +2280,47 @@ func planSetMem(wasmBytes []byte, inputLen int) (setMemPlan, error) {
 	return setMemPlan{inputBase: inBase, outputBase: outBase}, nil
 }
 
-// benchTimeSet times the cost of one full set-`find` exhaustion pass over
-// `input` and returns the p50 over setIterTime samples.
-func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time.Duration, error) {
+// setDriver resolves the export a modeSet case drives and returns a closure
+// that performs ONE unit of work — a full `find` exhaustion, or a single scan
+// call over the whole input.
+//
+// Both bench paths (time and fuel) go through this so they can never end up
+// measuring different work for the same case, which is the failure a second
+// hand-written export lookup invites.
+func setDriver(tc testCase, store *wasmtime.Store, inst *wasmtime.Instance, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) (func(), error) {
+	switch tc.setCap {
+	case setCapScanAny, setCapScanAll:
+		name := "set_" + tc.setCap
+		fn := inst.GetFunc(store, name)
+		if fn == nil {
+			return nil, fmt.Errorf("missing export %q", name)
+		}
+		// The scan pair takes (ptr, len, offset) and reports no position:
+		// one call consumes the whole input, so there is nothing to exhaust.
+		//
+		// scan_all's i64-bitmask return is assumed, which holds while a case
+		// stays at or below 64 patterns; past that the ABI changes to an
+		// out_ptr bitmap and this call would be wrong. Enforced in main's
+		// case validation rather than here, where a per-iteration check would
+		// be measured.
+		return func() {
+			_, _ = wcall(fn, store, plan.inputBase, inputLen, int32(0))
+		}, nil
+	default:
+		fn := inst.GetFunc(store, "set_find")
+		if fn == nil {
+			return nil, fmt.Errorf("missing export %q", "set_find")
+		}
+		return func() {
+			runSetExhaust(store, fn, mem, plan, inputLen)
+		}, nil
+	}
+}
+
+// benchTimeSet times the cost of one full set capability pass over `input`
+// (a `find` exhaustion, or one scan call) and returns the p50 over
+// setIterTime samples.
+func benchTimeSet(tc testCase, wasmBytes []byte, input string, engine *wasmtime.Engine) (time.Duration, error) {
 	plan, err := planSetMem(wasmBytes, len(input))
 	if err != nil {
 		return 0, err
@@ -2017,23 +2336,26 @@ func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time
 		return 0, fmt.Errorf("instance: %w", err)
 	}
 	mem := inst.GetExport(store, "memory").Memory()
-	findFn := inst.GetFunc(store, "set_find")
-	if mem == nil || findFn == nil {
+	if mem == nil {
 		return 0, fmt.Errorf("missing exports")
 	}
 	if err := writeSetInput(store, mem, plan, input); err != nil {
 		return 0, err
 	}
+	drive, err := setDriver(tc, store, inst, mem, plan, int32(len(input)))
+	if err != nil {
+		return 0, err
+	}
 
-	// Warmup: a few exhaustion passes.
+	// Warmup: a few passes.
 	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
-		runSetExhaust(store, findFn, mem, plan, int32(len(input)))
+		drive()
 	}
 
 	timings := make([]time.Duration, setIterTime)
 	for i := range timings {
 		t0 := time.Now()
-		runSetExhaust(store, findFn, mem, plan, int32(len(input)))
+		drive()
 		timings[i] = time.Since(t0)
 	}
 	// p50.
@@ -2048,8 +2370,8 @@ func benchTimeSet(wasmBytes []byte, input string, engine *wasmtime.Engine) (time
 	return computeStat(ns, 50), nil
 }
 
-// benchFuelSet measures fuel for one full set-`find` exhaustion pass.
-func benchFuelSet(wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (uint64, error) {
+// benchFuelSet measures fuel for one full set capability pass (see setDriver).
+func benchFuelSet(tc testCase, wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (uint64, error) {
 	plan, err := planSetMem(wasmBytes, len(input))
 	if err != nil {
 		return 0, err
@@ -2067,15 +2389,18 @@ func benchFuelSet(wasmBytes []byte, input string, fuelEngine *wasmtime.Engine) (
 		return 0, err
 	}
 	mem := inst.GetExport(store, "memory").Memory()
-	findFn := inst.GetFunc(store, "set_find")
-	if mem == nil || findFn == nil {
+	if mem == nil {
 		return 0, fmt.Errorf("missing exports")
 	}
 	if err := writeSetInput(store, mem, plan, input); err != nil {
 		return 0, err
 	}
+	drive, err := setDriver(tc, store, inst, mem, plan, int32(len(input)))
+	if err != nil {
+		return 0, err
+	}
 	before, _ := store.GetFuel()
-	runSetExhaust(store, findFn, mem, plan, int32(len(input)))
+	drive()
 	after, _ := store.GetFuel()
 	return before - after, nil
 }
@@ -2253,6 +2578,26 @@ func main() {
 	modes := [3]compile.LikelyMode{compile.LikelyNeutral, compile.LikelyMatch, compile.LikelyNoMatch}
 
 	fmt.Println("likelytest — LikelyMode 3x3 matrix (p50 over 10k inner iterations per cell)")
+
+	// Case-table validation, before any measurement: a case that measures the
+	// wrong thing is worse than one that refuses to run (the same rule
+	// setperf's sampleNeedles default arm now enforces, after three incidents
+	// shared that one cause).
+	for _, tc := range tests {
+		if tc.mode != modeSet && tc.setCap != setCapFind {
+			fmt.Fprintf(os.Stderr, "case %q: setCap is meaningful only for modeSet\n", tc.name)
+			os.Exit(1)
+		}
+		// scan_all returns an i64 bitmask only while the id space fits 64;
+		// above that the ABI takes an out_ptr and writes a bitmap, and
+		// setDriver's three-argument call would be wrong. Refuse rather than
+		// silently measure a trap.
+		if tc.setCap == setCapScanAll && len(tc.setPatterns) > 64 {
+			fmt.Fprintf(os.Stderr, "case %q: scan_all with %d patterns exceeds the i64-bitmask ABI setDriver calls\n",
+				tc.name, len(tc.setPatterns))
+			os.Exit(1)
+		}
+	}
 
 	filter := os.Getenv("LIKELYTEST_FILTER")
 	totalChecks, totalFailures := 0, 0

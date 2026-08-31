@@ -156,7 +156,7 @@ repeatedly for the next match), not just of the byte class:
 | `dense-words-grouped` | LNM (match) | +37% | `exhaustive: true`, `(\w+)` matching almost every ~6 bytes — each `find_all` call returns before the counter can accumulate anywhere near the ~8-attempt threshold, so the switch essentially never trips and the whole scan pays the Shufti tax. |
 
 `dense-bare-upper` and `dense-words-grouped`'s numbers are new findings (not
-previously written up in `docs/prefer-hints.md` or `docs/likely.md`) — same
+previously written up in `docs/prefer-hints.md`) — same
 mechanism as
 the `alpha-run`/`word-run` residual, just a larger instance of it because
 of how frequently their matches restart the per-call counter. This is a

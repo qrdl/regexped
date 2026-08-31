@@ -1,6 +1,6 @@
 GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/*/*.go merge/*.go))
 
-.PHONY: from-coverage set-coverage re2test setcaps setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross byteident examples clean unittest lint fmt
+.PHONY: from-coverage set-coverage re2test setcaps setcaps-likely setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross byteident examples clean unittest lint fmt
 
 build: regexped
 
@@ -15,6 +15,11 @@ re2test: build
 # run, measured in hours — before a release, or after touching a set emitter.
 setcaps:
 	$(MAKE) -C tools/re2test sets
+
+# The same capability coverage under a non-neutral set-level hint, which
+# `setcaps` never applies — see tools/re2test/Makefile's `sets-likely`.
+setcaps-likely:
+	$(MAKE) -C tools/re2test sets-likely
 
 setcaps-exhaustive:
 	$(MAKE) -C tools/re2test sets-exhaustive

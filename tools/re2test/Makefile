@@ -1,4 +1,4 @@
-.PHONY: test exhaustive custom adjusted sets sets-exhaustive set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
+.PHONY: test exhaustive custom adjusted sets sets-likely sets-exhaustive set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -96,7 +96,7 @@ groupsonly: $(ADJUSTED)
 	go run . --groups-only --validate-groups $(ADJUSTED)
 	go run . --groups-only --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets
+test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets sets-likely
 
 # ---------------------------------------------------------------------------
 # Set-capability coverage.
@@ -136,6 +136,27 @@ sets: $(TESTDATA)
 	# wired into no target at all, so that path had no standing gate.
 	go run . --sets --set-chunk=8 --sample=250 --set-bt=1 --set-profiles=$(SET_PROFILES) $(TESTDATA)
 	go run . --sets --set-chunk=0 --set-bt=1 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+
+# The set capabilities under a non-neutral set-level hint.
+#
+# `sets` above runs entirely NEUTRAL, so every hint-gated set emitter had no
+# correctness gate at all: task 68's Shufti self-loop channels in the bucket
+# suffix bodies, LM-6's packer split, and H.3's forced-Shufti frontend are all
+# invisible to it. --likelymatch / --likelynomatch reach the set path as
+# set-level `hints:` (see main.go's setHints resolution), so these runs compile
+# genuinely different bodies from the ones `sets` checks.
+#
+# Deliberately fewer configurations than `sets`: the hint changes the BODY, not
+# which capability or which oracle, so the chunk/subset/profile axes are
+# already covered above. What is new here is the emission, and one chunk size
+# per hint reaches it across the whole corpus.
+sets-likely: $(TESTDATA)
+	go run . --sets --set-chunk=8  --sample=200 --likelymatch   --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=16 --sample=150 --set-shuffle --likelymatch   --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=8  --sample=200 --likelynomatch --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=16 --sample=150 --set-shuffle --likelynomatch --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . --sets --set-chunk=0  --likelymatch   --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . --sets --set-chunk=0  --likelynomatch --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 
 sets-exhaustive: $(TESTDATA)
 	go run . --sets --set-chunk=8  --set-profiles=all $(TESTDATA)

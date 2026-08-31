@@ -432,7 +432,7 @@ func TestDFALayoutSuffixWASMEmptyDFA(t *testing.T) {
 		{"zero-state table", &dfaTable{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bodyArt, data, segCount, nextOff := genSuffixWASM(tc.table, 4096, 0, []int{7}, []int{0}, false, false)
+			bodyArt, data, segCount, nextOff := genSuffixWASM(tc.table, 4096, 0, []int{7}, []int{0}, LikelyNeutral, false, false)
 			body := bodyArt.fnBody
 			if len(body) == 0 {
 				t.Fatal("empty function body")
@@ -465,7 +465,7 @@ func TestDFALayoutSuffixWASMWideBucket(t *testing.T) {
 	for idx := range patternIDs {
 		patternIDs[idx] = 100 + idx
 	}
-	bodyArt, data, segCount, nextOff := genSuffixWASM(table, 0, 0, patternIDs, prefixFixedLens, false, false)
+	bodyArt, data, segCount, nextOff := genSuffixWASM(table, 0, 0, patternIDs, prefixFixedLens, LikelyNeutral, false, false)
 	body := bodyArt.fnBody
 	if len(body) == 0 {
 		t.Fatal("empty function body for a 40-pattern bucket")
@@ -480,7 +480,7 @@ func TestDFALayoutSuffixWASMWideBucket(t *testing.T) {
 	// The same bucket at exactly 32 patterns must emit strictly less code:
 	// bits 32..39 contribute nothing, so the two bodies cannot be equal in
 	// size unless the ceiling silently dropped earlier bits too.
-	narrowBodyArt, _, _, _ := genSuffixWASM(table, 0, 0, patternIDs[:32], prefixFixedLens[:32], false, false)
+	narrowBodyArt, _, _, _ := genSuffixWASM(table, 0, 0, patternIDs[:32], prefixFixedLens[:32], LikelyNeutral, false, false)
 	narrowBody := narrowBodyArt.fnBody
 	if len(narrowBody) != len(body) {
 		t.Errorf("32-pattern body is %d bytes and 40-pattern body is %d; patterns past bit 32 must contribute no code", len(narrowBody), len(body))
@@ -500,7 +500,7 @@ func TestDFALayoutSuffixWASMWideBucket(t *testing.T) {
 	if !midDominant {
 		t.Fatalf(`a[^b]*: expected a mid-accepting dominant state — case is not testing what it claims`)
 	}
-	if dominantBodyArt, _, _, _ := genSuffixWASM(dominantTable, 0, 0, patternIDs, prefixFixedLens, false, false); len(dominantBodyArt.fnBody) == 0 {
+	if dominantBodyArt, _, _, _ := genSuffixWASM(dominantTable, 0, 0, patternIDs, prefixFixedLens, LikelyNeutral, false, false); len(dominantBodyArt.fnBody) == 0 {
 		t.Error(`a[^b]*: empty function body for a 40-pattern bucket`)
 	}
 
@@ -511,7 +511,7 @@ func TestDFALayoutSuffixWASMWideBucket(t *testing.T) {
 	if wideLayout.useU8 {
 		t.Fatalf(`x{127}$|y{128}: expected a u16 suffix table (numWASM=%d)`, wideLayout.numWASM)
 	}
-	if wideBodyArt, _, _, _ := genSuffixWASM(wideTable, 0, 0, []int{1, 2}, []int{0, 0}, false, false); len(wideBodyArt.fnBody) == 0 {
+	if wideBodyArt, _, _, _ := genSuffixWASM(wideTable, 0, 0, []int{1, 2}, []int{0, 0}, LikelyNeutral, false, false); len(wideBodyArt.fnBody) == 0 {
 		t.Error(`x{127}$|y{128}: empty function body for a u16 suffix table`)
 	}
 }
@@ -535,12 +535,12 @@ func TestDFALayoutSuffixWASMCompressed(t *testing.T) {
 	for idx := range patternIDs {
 		patternIDs[idx] = 200 + idx
 	}
-	bodyArt, _, _, _ := genSuffixWASM(table, 0, 0, patternIDs, prefixFixedLens, false, false)
+	bodyArt, _, _, _ := genSuffixWASM(table, 0, 0, patternIDs, prefixFixedLens, LikelyNeutral, false, false)
 	body := bodyArt.fnBody
 	if len(body) == 0 {
 		t.Fatal("empty function body")
 	}
-	singleArt, _, _, _ := genSuffixWASM(table, 0, 0, []int{3}, []int{0}, false, false)
+	singleArt, _, _, _ := genSuffixWASM(table, 0, 0, []int{3}, []int{0}, LikelyNeutral, false, false)
 	single := singleArt.fnBody
 	if len(single) == 0 {
 		t.Fatal("empty function body for a single-pattern bucket")

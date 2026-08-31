@@ -1366,7 +1366,7 @@ func TestSetEmitScanAnyCapabilityArms(t *testing.T) {
 	if compiled.unionScan == nil {
 		t.Fatal("no union automaton was built; the union body cannot be emitted")
 	}
-	body := emitUnionScanBody(compiled.unionScan, capScanAny, compiled.fullIDMask(), 0)
+	body := emitUnionScanBody(compiled.unionScan, capScanAny, compiled.fullIDMask(), 0, false)
 	if len(body) == 0 || body[len(body)-1] != 0x0B {
 		t.Errorf("the capScanAny union body is empty or unterminated (%d bytes)", len(body))
 	}

@@ -113,3 +113,97 @@ func TestSetShuftiFrontendAgainstOracle(t *testing.T) {
 		})
 	}
 }
+
+// wideUnionAlphabet is the 79 bytes the widened-band patterns start with:
+// every alphanumeric plus punctuation that needs no regexp escaping.
+const wideUnionAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" +
+	"_~!@#%&=:;,<>/'\"`"
+
+// wideUnionPatterns builds n literals whose first bytes are n distinct members
+// of wideUnionAlphabet — so the first-byte union lands ABOVE the 64 that
+// bounded Shufti selection before task 70.
+func wideUnionPatterns(n int) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		body := ""
+		for j := 0; j < 6; j++ {
+			body += string(rune('a' + (i/len(wideUnionAlphabet)+j)%26))
+		}
+		out = append(out, fmt.Sprintf("%s%s%02dxx[a-z]+", string(wideUnionAlphabet[i%len(wideUnionAlphabet)]), body, i))
+	}
+	return out
+}
+
+// compileCapsWideUnion is compileCapsShufti for the WIDENED band: the same
+// AC-out-of-budget route to the scalar branch, but a first-byte union of 70 —
+// which reaches emitSetMatchFnFinalShufti only under set-level
+// LikelyNoMatch, and only since task 70 raised the selection ceiling.
+func compileCapsWideUnion(t *testing.T, pats []string, overlapping bool) []byte {
+	t.Helper()
+	entries := make([]config.RegexEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+	}
+	sets := []config.SetConfig{{
+		Name:        "s",
+		MatchAny:    "cap_match_any",
+		MatchAll:    "cap_match_all",
+		ScanAny:     "cap_scan_any",
+		ScanAll:     "cap_scan_all",
+		Find:        "cap_find",
+		Overlapping: overlapping,
+		Hints:       []string{"prefer-no-match"},
+		Patterns:    config.PatternSelector{Names: names},
+	}}
+	w, _, diags, err := compile.CompileFileOpts(
+		config.BuildConfig{Regexps: entries, Sets: sets}, "",
+		compile.CompileSetOptions{ACBudgetBytes: 1})
+	if err != nil {
+		t.Fatalf("compile wide-union set: %v", err)
+	}
+	if len(diags) != 1 {
+		t.Fatalf("got %d set diagnostics, want 1", len(diags))
+	}
+	// Without this the test degrades into a second scalar case the moment the
+	// ceiling moves back — the same trap the sibling test above documents.
+	if diags[0].Frontend != "shufti" {
+		t.Fatalf("frontend = %q, want \"shufti\" — the widened band no longer "+
+			"selects Shufti for a 70-byte first-byte union", diags[0].Frontend)
+	}
+	if n := len(droppedFromSet(diags)); n != 0 {
+		t.Fatalf("%d patterns dropped from the set", n)
+	}
+	return w
+}
+
+// The Shufti frontend at a first-byte union WIDER than 64 (task 70).
+//
+// emitShuftiPrefixCheck builds one nibble-table pair per 8 set members, so a
+// 70-byte union is 9 pairs where the pre-task-70 ceiling allowed 8. Nothing
+// about the emitter is width-specific, but "nothing about it is width-specific"
+// is a claim about code that had never been run past 64 — this runs it, and
+// checks every capability against the Go oracle.
+func TestSetWideUnionShuftiAgainstOracle(t *testing.T) {
+	pats := wideUnionPatterns(70)
+
+	inputs := []string{
+		"",
+		"Aabcdef00xxabc",               // pattern 0 matches
+		"zzBbcdefg01xxdef",             // pattern 1, not at position 0
+		"Aabcdef00xxab Bbcdefg01xxcd",  // two patterns, two positions
+		"Ccdefgh02xx",                  // first bytes present, suffix absent
+		"(((( ))))",                    // nothing in the union at all
+		strings.Repeat("(", 40),        // long, no candidate — the skip's win case
+		"Aabcdef00xxaaaaaaaaaaaaaaaaa", // one long match
+	}
+	for i, input := range inputs {
+		t.Run(fmt.Sprintf("input%d", i), func(t *testing.T) {
+			w := compileCapsWideUnion(t, pats, true)
+			r := newCapRunnerFrom(t, w, pats, input)
+			defer r.Close()
+			checkCapsAgainstOracle(t, r, pats, input)
+		})
+	}
+}

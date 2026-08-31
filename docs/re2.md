@@ -180,6 +180,23 @@ coverage over every chunk and takes hours. Both run clean with **0 failures**,
 and the whole-block gated-`find` leg still reports its historical
 **4,935,736**.
 
+### Sets under a hint (`make sets-likely`)
+
+`make sets` compiles every set **neutral**, so the emitters that only exist
+under a hint were not covered by it at all: the SIMD skip in a bucket's suffix
+body, the union scan's stride, the widened Shufti band, the counted-chain
+packer split, and the forced-Shufti frontend. `make sets-likely` runs the same
+capability sweep with `--likelymatch` and `--likelynomatch`, which reach the
+set path as set-level `hints:` — so it compiles genuinely different bodies
+against the same oracle, at **9,410,470 checks, 0 failures**. It is part of
+`make test`.
+
+Fewer configurations than `make sets` on purpose: a hint changes the emitted
+body, not which capability is exported or which oracle answers for it, so the
+chunk-size, subset and profile axes are already covered by the neutral run.
+What is new here is the emission, and one chunk size per hint reaches it
+across the whole corpus.
+
 A pattern the compiler legitimately drops from a set — a fallback bucket's
 suffix DFA over the `max_fallback_states` budget, reported as a warning and in
 `--diag-json`'s `state_limit_dropped` — is excluded from the comparison and

@@ -159,14 +159,20 @@ An absent or empty `hints:` list keeps the default (`LikelyNeutral`, no batch
 export). The `prefer-match`/`prefer-no-match` choice never affects match
 correctness — only which optimisation path is emitted.
 
-A pattern's own `prefer-match`/`prefer-no-match` takes precedence over its
-enclosing set's `hints:` (and a set's own suffix-body compilation falls back
-to its `hints:` when a member pattern doesn't set its own). `batch-find` has
-no fallback to resolve: it is read on the entry (or set) that carries it, and
-each one decides for itself. On a `regexps:` entry it requires `find_func` or
-`groups_func`, and on a `sets:` entry it requires `find` — there is otherwise
-nothing to batch, and accepting the hint anyway would leave the caller
-believing they had asked for something.
+`prefer-match`/`prefer-no-match` resolve **per entry, with no fallback chain
+between the two levels**. A `regexps:` entry's hint governs only that
+pattern's own exported bodies (`match_func`/`find_func`/`groups_func`); a
+`sets:` entry's hint governs only that set's own frontend and bucket suffix
+bodies. A set's hint is not inherited by a member's own exported bodies, and a
+member's hint does not reach the set's bucket code — a bucket holds one merged
+suffix DFA for several patterns, so there is no per-pattern choice for it to
+honour. An entry with no `hints:` is neutral regardless of what encloses it.
+
+`batch-find` has no fallback to resolve either: it is read on the entry (or
+set) that carries it, and each one decides for itself. On a `regexps:` entry
+it requires `find_func` or `groups_func`, and on a `sets:` entry it requires
+`find` — there is otherwise nothing to batch, and accepting the hint anyway
+would leave the caller believing they had asked for something.
 
 See [prefer-hints.md](prefer-hints.md) for the full `prefer-match`/
 `prefer-no-match` mechanism, which pattern shapes benefit, and how to

@@ -245,6 +245,14 @@ type compiledSet struct {
 	// instead of trusting the static override for the whole scan.
 	shuftiAdaptive bool
 
+	// unionSkipLNM enables emitUnionSkip — the SIMD stride through a union
+	// state's self-loop run — in this set's scan bodies. Set-level
+	// LikelyNoMatch only: the stride wins on input SPARSE in the exit set and
+	// pays a probe for nothing on dense input, and the compiler cannot tell
+	// the two apart. That is a hint's job, and the runtime staleness counter
+	// bounds the cost of a wrong one.
+	unionSkipLNM bool
+
 	// overlapDPColOff is the module address of the backward sweep's two
 	// working columns. Zero when the set emits no
 	// sweep.
@@ -577,6 +585,15 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 	}
 	fe := chooseLiteralFrontend(lits)
+	// TEST-ONLY measurement override (task 71). Placed here, before every
+	// structural refusal below, so a forced frontend is still subject to the
+	// rules that exist for correctness rather than for speed — a fallback
+	// bucket still disables a position-skipping prefilter, AC still demotes
+	// over budget, packed-pair still needs a qualifying probe window. Only the
+	// crossover VERDICT is overridden.
+	if opts.forceFrontend && len(lits) > 0 {
+		fe = opts.ForceFrontend
+	}
 
 	// First pass: compute per-bucket prefix metadata (before building suffix DFAs).
 	prefixFnIdx := make([][]int, len(buckets))
@@ -772,7 +789,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], needScanProbes, gatedFind, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
 		bkt.dp = art.dp
 		if art.sparseProbeReady {
 			// The scratch address is decided by the emitter; the driver reads
@@ -1006,6 +1023,24 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// rarity-based density heuristic or set-level LikelyNoMatch (Action 5).
 	var shuftiFirstByteSet []byte
 	var shuftiAdaptive bool
+	// maxShuftiUnionLNM is the widened upper bound on the first-byte union,
+	// under set-level LikelyNoMatch only (task 70). The SIMD probe itself is
+	// width-agnostic — emitShuftiPrefixCheck just builds one more nibble-table
+	// pair per 8 members — but this body's SCALAR TAIL is not: it tests
+	// membership with an unrolled per-first-byte compare chain, which is
+	// O(|union|) per byte and runs for the rest of the call once the adaptive
+	// density switch disables the probe.
+	//
+	// So this bound is limited by MEASUREMENT, not by the mechanism. 79 is the
+	// widest union measured (−54% fuel on input outside the union, +4% on
+	// input dense in it) and 70 is the widest checked against Go
+	// (tools/fuzz's TestSetWideUnionShuftiAgainstOracle). 128 stays within
+	// interpolation of that; raising it to detectShuftiSelfLoop's 239 is an
+	// extrapolation of the tail's cost, and should not happen without either a
+	// measurement at that width or replacing the compare chain with a 256-byte
+	// membership table — which is what would make the bound mechanism-limited
+	// instead.
+	const maxShuftiUnionLNM = 128
 	if fe == frontendScalar {
 		hasFallback := false
 		for _, b := range buckets {
@@ -1016,9 +1051,26 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 		if !hasFallback {
 			union := litUnionFirstBytes(lits)
-			if len(union) >= 17 && len(union) <= 64 {
-				lnm := opts.LikelyMode == LikelyNoMatch
-				rare := shuftiBeatsScalar(union)
+			lnm := opts.LikelyMode == LikelyNoMatch
+			// The band's upper bound is 64 for a static verdict and
+			// maxShuftiUnionLNM under LikelyNoMatch. Shufti's nibble tables
+			// express any byte set — 64 is a productivity heuristic, not a
+			// structural limit, and the single-pattern side already runs the
+			// same mechanism at 239 (detectShuftiSelfLoop's maxWidthLM).
+			//
+			// Above 64 the static heuristic is NOT consulted, and that is
+			// deliberate rather than an oversight: shuftiBeatsScalar's density
+			// model was calibrated inside the narrow band, so asking it about a
+			// 90-byte union is asking a question it was never fitted for. The
+			// widened band is therefore force-plus-adapt — LNM asserts it, and
+			// shuftiAdaptive's runtime counter is what bounds a wrong
+			// assertion.
+			hi := 64
+			if lnm {
+				hi = maxShuftiUnionLNM
+			}
+			if len(union) >= 17 && len(union) <= hi {
+				rare := len(union) <= 64 && shuftiBeatsScalar(union)
 				if lnm || rare {
 					fe = frontendShufti
 					shuftiFirstByteSet = union
@@ -1156,6 +1208,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		shuftiFirstByteSet:  shuftiFirstByteSet,
 		packedPair:          packedPair,
 		shuftiAdaptive:      shuftiAdaptive,
+		unionSkipLNM:        opts.LikelyMode == LikelyNoMatch,
 		litToBuckets:        litToBuckets,
 		litLens:             litLens,
 		diag:                diag,
@@ -1619,6 +1672,9 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 			MaxFallbackStates: cfg.MaxFallbackStates,
 			// Test-only overrides (CompileFileOpts); zero everywhere else.
 			ACBudgetBytes: over.ACBudgetBytes,
+			// Test-only frontend pin; see CompileSetOptions.ForceFrontend.
+			ForceFrontend: over.ForceFrontend,
+			forceFrontend: over.forceFrontend,
 		}
 		if !standalone {
 			setOpts.TableMemIdx = 1
@@ -2102,7 +2158,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					if cs.unionScan.isWide() {
 						body = emitUnionScanWideBody(cs.unionScan, c.kind, tableMemIdx)
 					} else {
-						body = emitUnionScanBody(cs.unionScan, c.kind, cs.fullIDMask(), tableMemIdx)
+						body = emitUnionScanBody(cs.unionScan, c.kind, cs.fullIDMask(), tableMemIdx, cs.unionSkipLNM)
 					}
 				} else {
 					// `scan` / `scan_any` may stop at the first bit and get
@@ -2128,7 +2184,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			if cs.phase2Union.isWide() {
 				cs_bytes = append(cs_bytes, emitUnionScanWideBody(cs.phase2Union, kind, tableMemIdx)...)
 			} else {
-				cs_bytes = append(cs_bytes, emitUnionScanBody(cs.phase2Union, kind, cs.phase2Mask(), tableMemIdx)...)
+				cs_bytes = append(cs_bytes, emitUnionScanBody(cs.phase2Union, kind, cs.phase2Mask(), tableMemIdx, cs.unionSkipLNM)...)
 			}
 		}
 		if cs.usesOverlapDP() {

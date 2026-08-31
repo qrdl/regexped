@@ -281,6 +281,44 @@ type setCase struct {
 	inputLbl string
 }
 
+// setHints is the set-level `hints:` value every compiled case carries,
+// resolved once from -hints before the matrix runs and never written again.
+//
+// It is a package variable rather than a compileCase parameter because
+// compileCase has seven call sites across the fuel, size, cross-fuel and
+// verify paths, and threading a knob none of them decide would invite exactly
+// the drift this measures: one path compiling under a different mode than the
+// one the header claims. One value, set once, read everywhere.
+//
+// Empty means neutral, which is what every committed baseline was taken
+// under. See setHintsKeySuffix for how a non-empty value is kept out of a
+// neutral baseline comparison.
+var setHints string
+
+// forcedFrontend pins the literal frontend for every compiled case, so a
+// family can be measured through a frontend its literal count would not have
+// chosen (task 71). Empty means "let chooseLiteralFrontend decide".
+//
+// The crossover constants it exists to interrogate were each calibrated on a
+// NO-MATCH corpus; whether they still hold when nearly every probe is a real
+// hit is a different question, and one that cannot be asked without this.
+var forcedFrontend string
+
+var validFrontends = map[string]compile.SetFrontend{
+	"teddy":       compile.SetFrontendTeddy,
+	"ac":          compile.SetFrontendAC,
+	"scalar":      compile.SetFrontendScalar,
+	"packed-pair": compile.SetFrontendPackedPair,
+}
+
+// validSetHints are the LikelyMode spellings config.ValidateConfig accepts on
+// a set. `batch-find` is NOT among them: it is unconditional here (every case
+// compiles its batch entry) and is added by compileCase itself.
+var validSetHints = map[string]bool{
+	"prefer-match":    true,
+	"prefer-no-match": true,
+}
+
 func main() {
 	fuelOnly := flag.Bool("fuel", false, "print our fuel only (deterministic)")
 	fuelCross := flag.Bool("fuel-cross", false, "our fuel vs regex-automata's, both metered (deterministic; no timing)")
@@ -288,7 +326,32 @@ func main() {
 	verify := flag.Bool("verify", false, "cross-engine correctness on the honest pairings")
 	compareFuel := flag.String("compare-fuel", "", "compare our fuel against a baseline file; exit 1 on any change")
 	compareSize := flag.String("compare-size", "", "compare module sizes against a baseline file; exit 1 on any change")
+	hints := flag.String("hints", "", "set-level LikelyMode hint applied to every case: prefer-match, prefer-no-match, or empty for neutral")
+	forceFE := flag.String("force-frontend", "", "TEST-ONLY: pin the literal frontend for every case (teddy, ac, scalar, packed-pair); empty lets the chooser decide")
 	flag.Parse()
+
+	if *forceFE != "" {
+		if _, ok := validFrontends[*forceFE]; !ok {
+			fmt.Fprintf(os.Stderr, "-force-frontend: unknown value %q\n", *forceFE)
+			os.Exit(1)
+		}
+		forcedFrontend = *forceFE
+		fmt.Fprintf(os.Stderr, "note: literal frontend pinned to %q for every case — rows are keyed %q\n",
+			forcedFrontend, setHintsKeySuffix())
+	}
+
+	if *hints != "" && !validSetHints[*hints] {
+		fmt.Fprintf(os.Stderr, "-hints: unknown value %q (want prefer-match, prefer-no-match, or empty)\n", *hints)
+		os.Exit(1)
+	}
+	setHints = *hints
+	if setHints != "" {
+		// Stated once, on stderr, so it survives redirection of the rows
+		// themselves into a file — a hinted board that reads as neutral is
+		// the mistake this whole knob has to avoid.
+		fmt.Fprintf(os.Stderr, "note: every set compiled with hints: [%s] — rows are keyed %q and will NOT match a neutral baseline\n",
+			setHints, setHintsKeySuffix())
+	}
 
 	cases := buildMatrix()
 
@@ -668,6 +731,10 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 		names[i] = fmt.Sprintf("p%d", i)
 		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
 	}
+	hints := []string{"batch-find"}
+	if setHints != "" {
+		hints = append(hints, setHints)
+	}
 	sets := []config.SetConfig{{
 		Name:        "s",
 		MatchAny:    "cap_match_any",
@@ -675,11 +742,17 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 		ScanAny:     "cap_scan_any",
 		ScanAll:     "cap_scan_all",
 		Find:        "cap_find",
-		Hints:       []string{"batch-find"},
+		Hints:       hints,
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
+	if forcedFrontend == "" {
+		w, _, err := compile.CompileFile(cfg, "")
+		return w, err
+	}
+	opts := compile.CompileSetOptions{}.WithForcedFrontend(validFrontends[forcedFrontend])
+	w, _, _, err := compile.CompileFileOpts(cfg, "", opts)
 	return w, err
 }
 
@@ -943,7 +1016,29 @@ type row struct {
 }
 
 func rowKey(c setCase, cap capability) string {
-	return c.name + "|" + c.inputLbl + "|" + string(cap)
+	return c.name + "|" + c.inputLbl + "|" + string(cap) + setHintsKeySuffix()
+}
+
+// setHintsKeySuffix is what keeps a HINTED run's numbers from being read as a
+// neutral run's. It is appended to every row key, so:
+//
+//   - printed rows and `make baseline` output are self-labelling, and
+//   - `-compare-fuel`/`-compare-size` against a baseline taken under a
+//     different mode finds NO row it can match, and every row is reported
+//     UNCHECKED — which is already an exit-1 failure (see runCompare).
+//
+// That reuses the existing missing-row gate rather than adding a second
+// comparison rule, and it fails in the safe direction: a mode mismatch is
+// loud, not a silent apples-to-oranges "all baselines match exactly".
+func setHintsKeySuffix() string {
+	s := ""
+	if setHints != "" {
+		s += "|" + setHints
+	}
+	if forcedFrontend != "" {
+		s += "|fe=" + forcedFrontend
+	}
+	return s
 }
 
 func measureFuelRow(c setCase) []row {

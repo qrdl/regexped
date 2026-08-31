@@ -4563,7 +4563,12 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 // stops at the first matching bit — see probeExit.
 // Threaded alongside needProbes rather than derived, because only CompileSet
 // knows which capabilities the set declares.
-func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, needProbes, gated bool, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+// lm is the SET-LEVEL LikelyMode. It selects the three Shufti self-loop
+// channels below; every other decision here is mode-independent. A bucket
+// holds one suffix DFA for N patterns, so there is deliberately no
+// per-pattern override: the hint that governs this body is the one on the
+// set.
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
 	// probeFlags[0]: also build the first-hit variant (set wants both rules).
 	// probeFlags[1]: the SOLE probe is first-hit (no scan_all declared), so
 	// scanProbe itself gets the cheap exit and no second body is emitted.
@@ -4623,6 +4628,25 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		}
 	}
 
+	// The three Shufti self-loop channels, under set-level LikelyMatch.
+	//
+	// A suffix DFA is the pattern with its mandatory literal SPLIT OFF, so
+	// l.prefix is empty for every bucket body here — which means
+	// detectShuftiSelfLoop's bare-prefix bail refused all three channels for
+	// every set, and the whole 9..64-byte band was unreachable from a set.
+	// The bail exists to keep the fixed SIMD setup off a state reachable
+	// directly from every scan restart; in a set the FRONTEND has already
+	// gated the position (a suffix body runs only at a candidate), so the
+	// frequency argument that motivates it does not transfer. What remains is
+	// the per-candidate setup cost on short runs, which is the LM contract's
+	// to accept and the task-38 hysteresis's to bound.
+	//
+	// lmBareShufti carries no minimum-match-length check here, unlike the
+	// single-pattern LM-4 gate it mirrors: that gate reads a PATTERN STRING
+	// (lmBareShuftiEligible re-parses it) and a suffix DFA has no pattern to
+	// re-parse — a bucket may hold several. The equivalent bound is the
+	// hysteresis, plus the short-run likelytest guard case.
+	lmShufti := lm == LikelyMatch
 	l := buildDFALayout(dfaLayoutParams{
 		t:                    t,
 		tableBase:            tableBase,
@@ -4630,9 +4654,9 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		leftmostFirst:        true,
 		compiledDFAThreshold: 0,
 		useAcceptSideTable:   false,
-		lmBareShufti:         false,
-		lmNonMidShufti:       false,
-		lmWideShufti:         false,
+		lmBareShufti:         lmShufti,
+		lmNonMidShufti:       lmShufti,
+		lmWideShufti:         lmShufti,
 		forceWordChar:        t.hasWordBoundary,
 	})
 

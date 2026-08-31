@@ -584,6 +584,42 @@ type CompileSetOptions struct {
 	// set-frontend density gate (H.3, shipped — forces Shufti for a 17..64-byte
 	// first-byte union under LikelyNoMatch).
 	LikelyMode LikelyMode
+
+	// ForceFrontend overrides chooseLiteralFrontend's verdict. TEST-ONLY, and
+	// specifically a MEASUREMENT knob (task 71): the crossover constants in
+	// chooseLiteralFrontend were each calibrated on a no-match corpus, and the
+	// only way to ask whether they still hold on a match-dense one is to run a
+	// set through the frontend it would not have chosen.
+	//
+	// Empty means "use the chooser". A forced frontend still has to be
+	// BUILDABLE — the structural refusals (a fallback bucket cannot be served
+	// by a position-skipping prefilter; packed-pair needs a qualifying probe
+	// window) are correctness rules, not preferences, and are applied after
+	// this.
+	ForceFrontend frontendKind
+	forceFrontend bool
+}
+
+// SetFrontend is the exported spelling of frontendKind, so an out-of-package
+// measurement harness can name a frontend for WithForcedFrontend. The type
+// itself stays unexported: these four constants are the only values any caller
+// outside this package has a reason to mention.
+type SetFrontend = frontendKind
+
+const (
+	SetFrontendTeddy      = frontendTeddy
+	SetFrontendAC         = frontendAC
+	SetFrontendScalar     = frontendScalar
+	SetFrontendPackedPair = frontendPackedPair
+)
+
+// WithForcedFrontend returns a copy of o with the literal frontend pinned.
+// TEST-ONLY; see ForceFrontend. Named rather than set directly so that the
+// "was it forced" flag cannot be forgotten, which would make frontendTeddy
+// (the zero value) mean "forced to Teddy" for every caller that never asked.
+func (o CompileSetOptions) WithForcedFrontend(fe frontendKind) CompileSetOptions {
+	o.ForceFrontend, o.forceFrontend = fe, true
+	return o
 }
 
 // bucketMaskBits is the width of the per-bucket accept bitmask, and it is not
