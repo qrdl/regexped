@@ -403,6 +403,61 @@ func buildMatrix() []setCase {
 			setCase{fmt.Sprintf("sharedlit-%d", n), pats, corpusDense(pats), "dense 100KB"},
 		)
 	}
+	// A sparse bucket whose merged suffix DFA carries an ACCEPTING 1-byte
+	// self-loop — the shape the bitmask body's member bulk skip exists for, and
+	// the one the matrix had no row of (TODO 64).
+	//
+	// The two existing sparse families, sharedlit-128 and classchain-128, are
+	// bounded class chains: a bounded repeat produces a CHAIN, not a self-loop,
+	// so memberWalkStates finds nothing in either and the accelerator could
+	// never fire on any row able to measure it.
+	//
+	// Getting both properties at once needs the set kept SMALL. 128 patterns
+	// over long class chains grow the merged DFA past promoteSparseBuckets'
+	// budget, which then refuses the merge and leaves four bitmask buckets — so
+	// the tail that supplies the self-loop also destroys the sparseness. Forty
+	// short ones promote cleanly: one sparse bucket, 87 states, two member-walk
+	// states (measured 2026-08-31).
+	sharedLitRunPatterns := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf(`union[ \t]+k%02da+`, i)
+		}
+		return out
+	}
+	{
+		pats := sharedLitRunPatterns(40)
+		out = append(out,
+			setCase{"sharedlit-run-40", pats, corpusNoMatch(), "no-match 100KB"},
+			setCase{"sharedlit-run-40", pats, corpusDense(pats), "dense 100KB"},
+		)
+	}
+	// The CEILING control for the family above, and the only reason it exists.
+	//
+	// Structurally identical — same literal, same bucket shape, same accepting
+	// 1-byte self-loop — but its needle carries a 4-byte run instead of 64,
+	// PADDED back to the same total length so corpusDense plants the same
+	// NUMBER of needles in the same 100 KB. Needle count, literal hits and
+	// corpus size are therefore held constant, and the only difference is 60
+	// bytes of saturated-run walk per needle.
+	//
+	// The dense-row gap between the two families is thus an upper bound on what
+	// any bulk skip over that run could ever save. Measuring it costs half an
+	// hour; discovering the same bound by writing the skip costs a day, and
+	// Candidate A's +37.5% is what happens when the bound is assumed instead.
+	sharedLitRunShortPatterns := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf(`union[ \t]+m%02da+`, i)
+		}
+		return out
+	}
+	{
+		pats := sharedLitRunShortPatterns(40)
+		out = append(out,
+			setCase{"sharedlit-run4-40", pats, corpusDense(pats), "dense 100KB"},
+		)
+	}
 	// Sets with NO mandatory literal that are also large enough to split on the
 	// 32-bit accept mask — the fallback packer's version of the sharedlit pair
 	// above, and the shape G17's promotion was extended to cover.
@@ -542,6 +597,29 @@ func sampleNeedles(pats []string, k int) []string {
 			out = append(out, "sk_live_"+strings.Repeat("B", 24))
 		case strings.HasPrefix(p, "eyJ"):
 			out = append(out, "eyJ"+strings.Repeat("C", 24))
+		case strings.HasPrefix(p, `union[ \t]+m`) && strings.HasSuffix(p, "a+"):
+			// sharedlit-run4: the ceiling control. Four 'a' instead of 64, then
+			// 60 bytes of 'z' padding so the needle is the SAME LENGTH and
+			// corpusDense plants the same number of them. 'z' is not in the
+			// run's member set, so the walk dies at it — the padding is scanned
+			// by the frontend but not walked.
+			var k int
+			fmt.Sscanf(p, `union[ \t]+m%02da+`, &k)
+			out = append(out, fmt.Sprintf("union m%02d%s%s", k,
+				strings.Repeat("a", 4), strings.Repeat("z", 60)))
+		case strings.HasPrefix(p, `union[ \t]+k`) && strings.HasSuffix(p, "a+"):
+			// sharedlit-run: `union[ \t]+kNNa+`. MUST precede the generic union
+			// arm below — that one Sscanfs two class counts out of the pattern,
+			// which does not parse here, leaving a=b=0 and a needle of "union "
+			// that never matches. Silent wrong corpus, the exact failure the
+			// default arm hard-errors for.
+			//
+			// The run is long on purpose: this family exists to measure a bulk
+			// skip over an accepting self-loop, and a 4-byte run amortises
+			// nothing.
+			var k int
+			fmt.Sscanf(p, `union[ \t]+k%02da+`, &k)
+			out = append(out, fmt.Sprintf("union k%02d%s", k, strings.Repeat("a", 64)))
 		case strings.HasPrefix(p, "union"):
 			// `union[ \t]+[a-z]{A}[0-9]{B}` — rebuild a matching needle from
 			// the pattern's own two counts so the sparse corpus really hits.
