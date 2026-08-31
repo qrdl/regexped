@@ -38,6 +38,41 @@ add a fixture for it.
 | `lit_chain_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}` | lit chain with a fixed-length prefix — `buildLitChainPrefixedFindBody`; reports `attempt_start - M`, so it needs a find-from floor | Compiled DFA |
 | `alt_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}\|[0-9]{3}ghp_[A-Za-z0-9]{24}` | Gap E: strict alternation of prefixed branches — `buildLitChainAltPrefixedFindBody` | Compiled DFA |
 
+## Set fixtures
+
+Everything above is SINGLE-PATTERN. Until these existed, set output had no
+byte-identity pin at all — every set change was made without the drift check the
+single-pattern path has had since the beginning, which is the gap TODO 65 names
+as a hard prerequisite for splitting `CompileSet`.
+
+The failure mode is the expensive one. `CompileSet` is a memory allocator whose
+ordering invariant is enforced by prose: reorder two layout blocks and two table
+regions overlap — not a compile error, not a WASM validation error, but a module
+that reads one table through another's bytes.
+
+| fixture | shape it pins | frontend |
+|---|---|---|
+| `set_packed_pair` | <=16 literals, narrow two-column probe (`byte_rank.go`) | packed-pair |
+| `set_teddy` | 17..64 literals with DIVERSE first bytes, nibble tables | teddy |
+| `set_ac` | >16 literals, LOW first-byte diversity (`aho_corasick.go`) | ac |
+| `set_scalar` | no literal to anchor on — no prefilter emitted | scalar |
+| `set_sparse` | G17 sparse accept: 40 patterns in ONE bucket, past the 32 a u64 mask allows | packed-pair |
+| `set_anchored` | the anchored pair alone — an anchored-only set emits NO literal frontend | packed-pair |
+| `set_scan` | the scan pair: non-anchored, offset-taking, no positions | packed-pair |
+| `set_overlap` | `overlapping: true` — every-start enumeration, same signature as gated find | packed-pair |
+| `set_batch` | `hints: [batch-find]` — a second entry point over ONE shared worker | packed-pair |
+
+`TestByteIdenticalSetShapesAreDistinct` re-derives the frontend, accept kind and
+capability list from the diagnostics on every run, for the same reason the
+engine column above is re-checked: a fixture set that silently collapsed onto
+one frontend would still pass the byte comparison while defending nothing.
+
+**Shufti is deliberately absent.** It is selected only when Aho-Corasick
+declines on budget, which no YAML config can arrange — so it cannot have a
+fixture here. It is covered instead by `tools/fuzz/set_shufti_test.go`, which
+reaches it through `CompileFileOpts`.
+
+
 The engine column was taken from `SelectEngine`, and
 `TestByteIdenticalPathsAreDistinct` re-checks it on every run — a fixture set
 that silently collapsed onto one engine would still pass the byte comparison

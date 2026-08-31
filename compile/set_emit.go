@@ -1033,26 +1033,31 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 
 	// The set match function body is built at assemble time (when function table
 	// indices are known). Store nil here; assembleModuleWithSets fills it in.
-	// setTablesEnd is the first free address after every table laid out so
-	// far, and it is a REAL end-of-region, not a sum of serialized data-segment
-	// lengths.
+	// Everything from here down claims its region through `ra`, which tracks a
+	// REAL end-of-region rather than a sum of serialized data-segment lengths.
 	//
 	// Those two differ. A data segment's bytes include its own header, which
 	// over-counts, but a REGION can also contain gaps between segments — the
 	// anchored automaton leaves one between its transition table and its
 	// eofBitmask — and the byte sum under-counts those. The proxy this
-	// replaces got it wrong in the unsafe direction: for a set declaring all
+	// replaced got it wrong in the unsafe direction: for a set declaring all
 	// seven capabilities it placed the union-scan table 8 bytes INSIDE the
 	// anchored eofBitmask, silently overwriting the last state's accept mask.
 	// That was an anchored false positive which appeared only when
 	// unrelated capabilities were also declared.
-	setTablesEnd := prefixTableOffset
+	//
+	// The allocator exists so that class cannot recur by inspection: a base
+	// comes only from Reserve, so no block can lay a table at an address
+	// derived from a stale cursor, and Commit refuses an extent below the
+	// frontier. See compile/region.go.
+	frontier := prefixTableOffset
 	if acL != nil {
-		setTablesEnd = acFirstByteFlagsOff + 256 // firstByteFlags is last
+		frontier = acFirstByteFlagsOff + 256 // firstByteFlags is last
 	}
-	if teddyTableEnd > setTablesEnd {
-		setTablesEnd = teddyTableEnd
+	if teddyTableEnd > frontier {
+		frontier = teddyTableEnd
 	}
+	ra := newRegionAlloc(frontier)
 
 	// ── Backtracking fallback buckets ────────────────────
 	// Laid out above every other table this set owns, so the regions cannot
@@ -1060,7 +1065,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// sized to the largest BT bucket: only one BT call is ever live, because
 	// the per-candidate driver calls one suffix function at a time and the
 	// memo re-zeroes itself at the head of every call.
-	btRegions := planBTRegions(buckets, int64(setTablesEnd))
+	btBase := ra.Reserve("bt-fallback", 1)
+	btRegions := planBTRegions(buckets, int64(btBase))
 	numBTFns := 0
 	for bi, bkt := range buckets {
 		if bkt.btFallback == nil {
@@ -1082,8 +1088,11 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 		numBTFns++
 	}
+	if btRegions == nil {
+		ra.Skip()
+	}
 	if btRegions != nil {
-		setTablesEnd = btRegions.end
+		ra.Commit(btRegions.end)
 		// DECLARE the reservation in the data section. The regions hold no
 		// initial data — BT zeroes its own memo and its stack starts empty —
 		// but a caller has no other way to learn they exist: both
@@ -1167,7 +1176,10 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// i64 or i32 load, and their own internal alignment is relative to
 		// it — so a base at an odd address makes the alignment inside the
 		// builder a promise it cannot keep.
-		anchoredTableBase := (setTablesEnd + 7) &^ 7
+		anchoredTableBase := ra.Reserve("anchored", 8)
+		// Both arms below lay their tables from this base; whichever runs sets
+		// anchoredEnd, and the single Commit after them records the extent.
+		anchoredEnd := anchoredTableBase
 		// The packer runs FIRST, because whether it produces one automaton is
 		// itself part of the union's eligibility — see anchoredUnionBeatsBuckets.
 		// Its result is discarded when the union wins, which costs compile time
@@ -1229,8 +1241,8 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			cs.anchoredIDs = [][]int{append([]int(nil), anchoredSpec.PatternIDs...)}
 			cs.anchoredDataBytes = append(cs.anchoredDataBytes, au.dataBytes...)
 			cs.anchoredDataSegs += au.dataSegs
-			if au.tableEnd > setTablesEnd {
-				setTablesEnd = au.tableEnd
+			if au.tableEnd > anchoredEnd {
+				anchoredEnd = au.tableEnd
 			}
 			diag.AnchoredUnion = &AnchoredUnionDiag{
 				Used: true, States: au.numStates, Wide: au.isWide(),
@@ -1260,10 +1272,11 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				cs.anchoredDataSegs += segs
 				anchoredOffset = next
 			}
-			if anchoredOffset > setTablesEnd {
-				setTablesEnd = anchoredOffset
+			if anchoredOffset > anchoredEnd {
+				anchoredEnd = anchoredOffset
 			}
 		}
+		ra.Commit(anchoredEnd)
 	}
 
 	// Start-anywhere union DFA for the scan trio.
@@ -1290,15 +1303,17 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	needUnionForOverlap := cs.overlapPreflightShape() && !cs.usesAbsencePrefilter()
 	needUnionForGated := cs.gatedPreflightShape() && !cs.usesAbsencePrefilter()
 	if fe == frontendScalar && (spec.ScanAll != "" || spec.ScanAny != "" || needUnionForOverlap || needUnionForGated) {
-		unionBase := (setTablesEnd + 7) &^ 7 // 8-aligned, see anchoredTableBase
+		unionBase := ra.Reserve("union-scan", 8) // 8-aligned, see anchoredTableBase
 		// needUnionForGated also asks for the per-state accept ROWS, which a
 		// WIDE automaton emits only on request and the wide alive walk reads in
 		// place of the u64 pair it has no room for (item 22 fix 2a-wide). On a
 		// narrow build the flag changes nothing: that arm emits the u64 pair and
 		// returns before the rows exist at all.
 		cs.unionScan = buildUnionScanDFA(spec, unionBase, needUnionForGated)
-		if cs.unionScan != nil && cs.unionScan.tableEnd > setTablesEnd {
-			setTablesEnd = cs.unionScan.tableEnd
+		if cs.unionScan != nil && cs.unionScan.tableEnd > unionBase {
+			ra.Commit(cs.unionScan.tableEnd)
+		} else {
+			ra.Skip()
 		}
 		diag.UnionScan = unionScanDiagOf(cs.unionScan, spec, false)
 	} else if spec.ScanAll != "" || spec.ScanAny != "" {
@@ -1324,13 +1339,15 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	if fe != frontendScalar && (spec.ScanAny != "" || spec.ScanAll != "") &&
 		hasSetFallbackBucketsIn(buckets) && hasLiteralBuckets(buckets) &&
 		!hasBTBucketIn(buckets) {
-		p2Base := (setTablesEnd + 7) &^ 7 // 8-aligned, see anchoredTableBase
+		p2Base := ra.Reserve("phase2-union", 8) // 8-aligned, see anchoredTableBase
 		sub := fallbackSubSpec(spec, buckets)
 		// No accept rows on request: phase 2 serves the scan pair only, and
 		// `find` — the preflight's capability — is excluded from the split.
 		cs.phase2Union = buildUnionScanDFA(sub, p2Base, false)
-		if cs.phase2Union != nil && cs.phase2Union.tableEnd > setTablesEnd {
-			setTablesEnd = cs.phase2Union.tableEnd
+		if cs.phase2Union != nil && cs.phase2Union.tableEnd > p2Base {
+			ra.Commit(cs.phase2Union.tableEnd)
+		} else {
+			ra.Skip()
 		}
 		diag.UnionScan = unionScanDiagOf(cs.phase2Union, sub, true)
 	}
@@ -1365,11 +1382,11 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			for b, m := range tab {
 				binary.LittleEndian.PutUint32(raw[b*4:], m)
 			}
-			cs.startableOff[bi] = setTablesEnd
+			off := ra.Bump("startable", int32(len(raw)), 1)
+			cs.startableOff[bi] = off
 			cs.startableDataBytes = append(cs.startableDataBytes,
-				appendDataSegment(nil, setTablesEnd, raw)...)
+				appendDataSegment(nil, off, raw)...)
 			cs.startableDataSegs++
-			setTablesEnd += int32(len(raw))
 		}
 	}
 
@@ -1387,15 +1404,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// that question, and the first call lays the column straight over the
 	// caller's input — which is exactly what happened when stage B tried it.
 	if n := cs.overlapDPColumnBytes(); n > 0 {
-		cs.overlapDPColOff = setTablesEnd
+		// Bump, not a bare offset: the columns are the last region placed
+		// today, and "correct because nothing follows it" is a property of the
+		// current order rather than of this code. Leaving a region out of the
+		// running end is the accounting slip X1 exists to end.
+		cs.overlapDPColOff = ra.Bump("overlap-dp-column", int32(n), 1)
 		cs.startableDataBytes = append(cs.startableDataBytes,
-			appendDataSegment(nil, setTablesEnd, make([]byte, n))...)
+			appendDataSegment(nil, cs.overlapDPColOff, make([]byte, n))...)
 		cs.startableDataSegs++
-		// ADVANCED, even though the columns are the last region placed today.
-		// Leaving a region out of the running end is the accounting slip X1
-		// exists to end, and "correct because nothing follows it" is a
-		// property of the current order, not of this code.
-		setTablesEnd += int32(n)
 	}
 
 	// First-position routing data, derived from the finished bucket list.
@@ -2512,11 +2528,18 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 		b = append(b, 0x41, 0x00, 0x21, lDenseCounter) // DenseCounter = 0
 	}
 
+	// Branch depths come from st, not from counted literals — see
+	// compile/blockstack.go. This body is the reason that matters: the
+	// adaptive $dense_gate adds a level on some paths and not others, so every
+	// depth below used to be written twice, once per arm of `if adaptive`.
+	st := &blockStack{}
 	b = append(b, 0x02, 0x40) // block $batch_done
+	st.Push("batch_done")
 	b = append(b, 0x03, 0x40) // loop $scan
+	st.Push("scan")
 
 	// Exit conditions.
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01) // lPos > pInLen
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, st.Depth("batch_done")) // lPos > pInLen
 	b = c.emitDrainCheck(b, lPos, 0x01)
 
 	if adaptive {
@@ -2536,10 +2559,12 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	// inside $skip_loop) and adds one level to every depth computed from
 	// inside it.
 	b = append(b, 0x02, 0x40) // block $skip_done
+	st.Push("skip_done")
 	b = append(b, 0x03, 0x40) // loop $skip_loop
+	st.Push("skip_loop")
 
 	// If lPos >= pInLen: exit $skip_done.
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, st.Depth("skip_done"))
 
 	if adaptive {
 		// DenseCounter < threshold? If so, try SIMD (+ its scalar
@@ -2559,6 +2584,7 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 		b = utils.AppendSLEB128(b, denseSwitchThreshold)
 		b = append(b, 0x48)       // i32.lt_s
 		b = append(b, 0x04, 0x40) // if $dense_gate (void)
+		st.Push("dense_gate")
 	}
 
 	// SIMD path: lPos + 15 < pInLen → load 16 bytes.
@@ -2566,13 +2592,15 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	//   0=SIMD if, 1=$skip_loop, 2=$skip_done.
 	// Adaptive adds $dense_gate between SIMD-if and $skip_loop/$skip_done.
 	b = append(b, 0x20, lPos, 0x41, 15, 0x6A, 0x20, pInLen, 0x49) // lt_u
-	b = append(b, 0x04, 0x40)                                     // if (void)
-	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)                 // pInPtr + lPos
-	b = append(b, 0xFD, 0x00, 0x00, 0x00)                         // v128.load align=0 offset=0
-	b = append(b, 0x21, lChunk)                                   // local.set lChunk
+	b = append(b, 0x04, 0x40)                                     // if (void) — SIMD path
+	st.Push("simd_if")
+	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A) // pInPtr + lPos
+	b = append(b, 0xFD, 0x00, 0x00, 0x00)         // v128.load align=0 offset=0
+	b = append(b, 0x21, lChunk)                   // local.set lChunk
 	b = emitShuftiPrefixCheck(b, cs.shuftiFirstByteSet, lChunk)
 	b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
-	b = append(b, 0x04, 0x40)      // if mask != 0  (adds one more depth)
+	b = append(b, 0x04, 0x40)      // if mask != 0
+	st.Push("mask_if")
 	if adaptive {
 		// No skip yet this attempt (DenseSkipFlag==0) → this probe bought
 		// nothing, bump the streak. Otherwise a skip already happened this
@@ -2594,24 +2622,18 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	// 2=$dense_gate, 3=$skip_loop, 4=$skip_done.
 	// Candidate found: lPos += ctz(mask); exit $skip_done.
 	b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos)
-	if adaptive {
-		b = append(b, 0x0C, 0x04) // br 4 → $skip_done
-	} else {
-		b = append(b, 0x0C, 0x03) // br 3 → $skip_done
-	}
+	b = append(b, 0x0C, st.Depth("skip_done"))
 	b = append(b, 0x0B) // end if mask != 0
+	st.Pop()
 	// No candidate in chunk: lPos += 16, continue $skip_loop.
 	if adaptive {
 		b = append(b, 0x41, 0x01)
 		b = append(b, 0x21, lDenseSkipFlag) // this attempt did skip ≥16 bytes
 	}
 	b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos)
-	if adaptive {
-		b = append(b, 0x0C, 0x02) // br 2 → $skip_loop (SIMD if, $dense_gate, $skip_loop)
-	} else {
-		b = append(b, 0x0C, 0x01) // br 1 → $skip_loop
-	}
+	b = append(b, 0x0C, st.Depth("skip_loop"))
 	b = append(b, 0x0B) // end if SIMD path
+	st.Pop()
 
 	// Scalar tail: byte-by-byte. For simplicity check membership via the
 	// inline byte set (≤ 64 entries) — emit a chained i32.eq + br.
@@ -2644,17 +2666,20 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 		// frontend (emitSetMatchFnFinalScalar) which never pre-filters at
 		// all. Depths from the else branch: $dense_gate (0, current),
 		// $skip_loop (1), $skip_done (2).
-		b = append(b, 0x05)       // else
-		b = append(b, 0x0C, 0x02) // br 2 → $skip_done
-		b = append(b, 0x0B)       // end if $dense_gate
+		b = append(b, 0x05) // else
+		b = append(b, 0x0C, st.Depth("skip_done"))
+		b = append(b, 0x0B) // end if $dense_gate
+		st.Pop()
 	}
 
 	b = append(b, 0x0B) // end loop $skip_loop
+	st.Pop()
 	b = append(b, 0x0B) // end block $skip_done
+	st.Pop()
 
 	// Re-check bounds: prefilter may have walked to lPos >= pInLen with no hit.
-	// $batch_done is at depth 1 from loop $scan.
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+	// $batch_done, not $skip_done: the prefilter's block has already closed.
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, st.Depth("batch_done"))
 	// The prefilter also moved lPos past the drain bound checked at the top of
 	// $scan, so re-check it here — that is what keeps perPositionDrain true for
 	// this body (the bucket work below sees exactly one candidate position).
@@ -2666,9 +2691,14 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	b = c.emitLiteralBucketsHoisted(b, lPos, lFirstByte)
 
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
-	b = append(b, 0x0C, 0x00)                               // br $scan
-	b = append(b, 0x0B)                                     // end loop $scan
-	b = append(b, 0x0B)                                     // end block $batch_done
+	b = append(b, 0x0C, st.Depth("scan"))
+	b = append(b, 0x0B) // end loop $scan
+	st.Pop()
+	b = append(b, 0x0B) // end block $batch_done
+	st.Pop()
+	if st.Open() != 0 {
+		panic("compile: emitSetMatchFnFinalShufti left blocks open")
+	}
 
 	b = c.emitGateWriteback(b, lPos)
 	b = c.emitEpilogue(b)
@@ -2726,11 +2756,17 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	b = c.emitFindPrologue(b, lPos)
 	b = append(b, 0x41, 0x00, 0x21, lACState)
 
+	// Branch depths come from st, not from counted literals — see
+	// compile/blockstack.go. A wrong depth here is a well-typed module that
+	// branches to the wrong enclosing block, which no validator rejects.
+	st := &blockStack{}
 	b = append(b, 0x02, 0x40) // block $batch_done
+	st.Push("batch_done")
 	b = append(b, 0x03, 0x40) // loop $scan
+	st.Push("scan")
 
 	// Exit conditions
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, 0x01) // lPos > pInLen → br $batch_done
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, st.Depth("batch_done")) // lPos > pInLen
 	b = c.emitDrainCheck(b, lPos, 0x01)
 
 	// Fallback buckets at every position — phase 2's job under phase1Only.
@@ -2744,8 +2780,9 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	}
 
 	// AC transition: only when lPos < pInLen (there is a byte to consume)
-	b = append(b, 0x02, 0x40)                                 // block $end_ac_pos
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x00) // lPos >= pInLen → br 0 (skip)
+	b = append(b, 0x02, 0x40) // block $end_ac_pos
+	st.Push("end_ac_pos")
+	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, st.Depth("end_ac_pos")) // lPos >= pInLen
 
 	// SIMD first-byte prefilter: when at root state, fast-skip to next candidate position.
 	// Only emitted when there are no fallback buckets (those require visiting every position).
@@ -2755,16 +2792,20 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	//   Inside if(mask): depths are 0=if, 1=outer_if, 2=loop, 3=$skip_done
 	if usePrefilter {
 		b = append(b, 0x20, lACState, 0x45, 0x04, 0x40) // if lACState == 0 (eqz; if)
+		st.Push("ac_state_zero")
 
 		b = append(b, 0x02, 0x40) // block $skip_done
+		st.Push("skip_done")
 		b = append(b, 0x03, 0x40) // loop $skip_loop
+		st.Push("skip_loop")
 
 		// Exhaustion check: if lPos >= pInLen → br 1 → exit $skip_done
-		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
+		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, st.Depth("skip_done"))
 
 		// SIMD path: if lPos + 15 < pInLen
 		b = append(b, 0x20, lPos, 0x41, 15, 0x6A, 0x20, pInLen, 0x49) // lt_u
-		b = append(b, 0x04, 0x40)                                     // if (void)
+		b = append(b, 0x04, 0x40)                                     // if (void) — SIMD path
+		st.Push("simd_if")
 
 		// Load 16-byte chunk from memory[0] (input)
 		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
@@ -2807,15 +2848,18 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
 
 		// if mask != 0: candidate found at lPos + ctz(mask)
-		b = append(b, 0x04, 0x40)                                          // if (void)
+		b = append(b, 0x04, 0x40) // if (void) — mask non-zero
+		st.Push("mask_if")
 		b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos) // lPos += ctz(mask)
-		b = append(b, 0x0C, 0x03)                                          // br 3 → $skip_done
-		b = append(b, 0x0B)                                                // end if mask
+		b = append(b, 0x0C, st.Depth("skip_done"))
+		b = append(b, 0x0B) // end if mask
+		st.Pop()
 
 		// No candidate: advance 16 and restart
 		b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos) // lPos += 16
-		b = append(b, 0x0C, 0x01)                               // br 1 → restart $skip_loop
-		b = append(b, 0x0B)                                     // end if (SIMD path)
+		b = append(b, 0x0C, st.Depth("skip_loop"))
+		b = append(b, 0x0B) // end if (SIMD path)
+		st.Pop()
 
 		// Scalar tail: check firstByteFlags[input[lPos]]
 		b = append(b, 0x41)
@@ -2824,18 +2868,23 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		b = append(b, 0x6A)                                             // add → flags address
 		b = appendTableLoad8u(b, tableMemIdx)                           // load flag byte
 		b = append(b, 0x04, 0x40)                                       // if (void) non-zero
-		b = append(b, 0x0C, 0x02)                                       // br 2 → $skip_done (candidate at lPos)
-		b = append(b, 0x0B)                                             // end if
+		st.Push("scalar_if")
+		b = append(b, 0x0C, st.Depth("skip_done")) // candidate at lPos
+		b = append(b, 0x0B)                        // end if
+		st.Pop()
 
 		b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
-		b = append(b, 0x0C, 0x00)                               // br 0 → restart $skip_loop
-		b = append(b, 0x0B)                                     // end loop $skip_loop
-		b = append(b, 0x0B)                                     // end block $skip_done
+		b = append(b, 0x0C, st.Depth("skip_loop"))
+		b = append(b, 0x0B) // end loop $skip_loop
+		st.Pop()
+		b = append(b, 0x0B) // end block $skip_done
+		st.Pop()
 
 		b = append(b, 0x0B) // end if lACState == 0
+		st.Pop()
 
 		// Re-check bounds: prefilter may have exhausted input (lPos = pInLen)
-		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x00) // ge_u → br 0 → exit $end_ac_pos
+		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, st.Depth("end_ac_pos")) // ge_u
 	}
 
 	// lACState = goto_table[lACState * stride*2 + col(input[lPos]) * 2] as u16,
@@ -2874,8 +2923,8 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	b = append(b, 0x20, lACState, 0x41, 0x01, 0x6B) // state - 1
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(acL.outLimit))
-	b = append(b, 0x4F)       // i32.ge_u
-	b = append(b, 0x0D, 0x00) // br_if 0 → $end_ac_pos
+	b = append(b, 0x4F)                         // i32.ge_u
+	b = append(b, 0x0D, st.Depth("end_ac_pos")) // br_if → $end_ac_pos
 
 	// lOutIdx = nodeOut[lACState]
 	b = append(b, 0x41)
@@ -2892,9 +2941,11 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	b = append(b, 0x21, lACOutEnd)
 
 	// Inner output loop: while lOutIdx < lACOutEnd
-	b = append(b, 0x02, 0x40)                                       // block $no_output
-	b = append(b, 0x03, 0x40)                                       // loop $outputs
-	b = append(b, 0x20, lOutIdx, 0x20, lACOutEnd, 0x4F, 0x0D, 0x01) // ge_u → br_if 1 ($no_output)
+	b = append(b, 0x02, 0x40) // block $no_output
+	st.Push("no_output")
+	b = append(b, 0x03, 0x40) // loop $outputs
+	st.Push("outputs")
+	b = append(b, 0x20, lOutIdx, 0x20, lACOutEnd, 0x4F, 0x0D, st.Depth("no_output")) // ge_u
 
 	// lLitID = output[lOutIdx]; lOutIdx++
 	b = append(b, 0x41)
@@ -2922,10 +2973,16 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	//     end $end
 	K := len(cs.litToBuckets)
 	if K > 0 {
+		// Tracked on st even though the br_table below computes its own depths
+		// from K: a stack that is silently short while these are open would
+		// hand a wrong answer to any Depth() added inside them later.
 		b = append(b, 0x02, 0x40) // block $end
+		st.Push("brtable_end")
 		b = append(b, 0x02, 0x40) // block $default
-		for i := 0; i < K; i++ {  // K nested case blocks
+		st.Push("brtable_default")
+		for i := 0; i < K; i++ { // K nested case blocks
 			b = append(b, 0x02, 0x40)
+			st.Push(fmt.Sprintf("brtable_case%d", i))
 		}
 		b = append(b, 0x20, lLitID)           // local.get lLitID
 		b = append(b, 0x0E)                   // br_table
@@ -2936,6 +2993,7 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		b = utils.AppendULEB128(b, uint32(K)) // default depth → $default
 		for i := K - 1; i >= 0; i-- {
 			b = append(b, 0x0B) // end $case_i
+			st.Pop()
 			buckets := cs.litToBuckets[i]
 			if len(buckets) > 0 {
 				litLen := cs.litLens[i]
@@ -2955,19 +3013,29 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 			b = utils.AppendULEB128(b, uint32(i+1))
 		}
 		b = append(b, 0x0B) // end $default
+		st.Pop()
 		b = append(b, 0x0B) // end $end
+		st.Pop()
 	}
 
-	b = append(b, 0x0C, 0x00) // br 0 → restart $outputs
-	b = append(b, 0x0B)       // end loop $outputs
-	b = append(b, 0x0B)       // end block $no_output
-	b = append(b, 0x0B)       // end block $end_ac_pos
+	b = append(b, 0x0C, st.Depth("outputs"))
+	b = append(b, 0x0B) // end loop $outputs
+	st.Pop()
+	b = append(b, 0x0B) // end block $no_output
+	st.Pop()
+	b = append(b, 0x0B) // end block $end_ac_pos
+	st.Pop()
 
 	// lPos++; restart loop
 	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
-	b = append(b, 0x0C, 0x00) // br 0 → restart $scan
-	b = append(b, 0x0B)       // end loop $scan
-	b = append(b, 0x0B)       // end block $batch_done
+	b = append(b, 0x0C, st.Depth("scan"))
+	b = append(b, 0x0B) // end loop $scan
+	st.Pop()
+	b = append(b, 0x0B) // end block $batch_done
+	st.Pop()
+	if st.Open() != 0 {
+		panic("compile: emitSetMatchFnFinalAC left blocks open")
+	}
 	b = c.emitGateWriteback(b, lPos)
 	b = c.emitEpilogue(b)
 	b = append(b, 0x0B)
