@@ -63,7 +63,10 @@ import (
 var findFromShapes = []struct{ name, pat, input string }{
 	{"dfa_find", `(?:alpha|beta|gamma)[0-9a-f]{4}`, "xx alpha00ff yy beta1234 zz gamma00ab"},
 	{"compiled_dfa", `abc[0-9]{2}`, "abc12 q abc34 r abc56"},
-	{"lit_chain", `AKIA[A-Z0-9]{16}`, "AKIA0123456789ABCDEF AKIAFEDCBA9876543210"},
+	// Count >= 24: below the lit-chain gate these fall through to buildFindBody
+	// instead, which is how both of these emitters went unreached.
+	{"lit_chain", `AKIA[A-Z0-9]{24}`,
+		"AKIA0123456789ABCDEF01234567 q AKIAFEDCBA9876543210FEDCBA98"},
 	{"lit_anchor", `[a-z]+@example\.com`, "a@example.com bb@example.com ccc@example.com"},
 	{"teddy_prefix", `ghp_[A-Za-z0-9]{8}`, "ghp_abcd1234 ghp_ZZZZ9999 ghp_0000aaaa"},
 	{"word_boundary", `\bclass\b`, "class a class b subclass class"},
@@ -75,11 +78,29 @@ var findFromShapes = []struct{ name, pat, input string }{
 		"AKIA0123456789ABCDEF ghp_abcdefghij0123456789 AKIAFEDCBA9876543210"},
 	{"lenient_alt", `ERROR[0-9]{3}|WARNING[0-9]{3}`, "ERROR123 x WARNING456 y ERROR789"},
 	{"lenient_alt_wb", `\bERR[0-9]{2}|WRN[0-9]{2}`, "ERR12 q WRN34 r ERR56"},
-	{"alt_range", `foo[0-9]{2,4}|bar[a-f]{2,4}`, "foo12 barab foo3456 barcdef"},
+	{"alt_range", `foo[0-9]{24,30}|bar[a-f]{24,30}`,
+		"foo012345678901234567890123 q barabcdefabcdefabcdefabcdef"},
 	{"no_match", `ZZZ[0-9]{4}`, "nothing here at all, no digits either"},
 	{"adjacent", `[0-9]{2}`, "123456789"},
 	{"single_char", `a`, "aaaa"},
 	{"empty_input", `abc`, ""},
+
+	// Empty-CAPABLE shapes: the only ones that can exercise half (B), Go's
+	// rule that an empty match beginning exactly where the previous reported
+	// match ended is not reported. A lit-chain or alternation body cannot
+	// produce one by construction — it always consumes a literal — so this
+	// rule lives on the bodies that can match zero bytes.
+	{"empty_star", `a*`, "bab"},
+	{"empty_opt", `a?`, "xaay"},
+	{"empty_alt_assert", `\B|a+b`, "1112"},
+	{"empty_alt_digits", `\B|11*0`, "x110"},
+	{"empty_only", `(?:)`, "abc"},
+	{"empty_trailing", `x*`, "axxbx"},
+	// Empty-capable on the BT find fallback and the trivial whole-capture
+	// body — the two non-lit-chain find emitters an empty-capable pattern can
+	// reach that the shapes above do not.
+	{"bt_find_empty", `\B|(?:alpha|beta|gamma)[0-9a-f]{8}`, "xx alpha0123abcd yy"},
+	{"trivial_whole_empty", `([a-z]*)`, "ab cd"},
 
 	// Alternation of variable-length-prefix branches: the alt-lit-anchor
 	// dispatcher, one of the two paths whose findFromMode comes from a
@@ -133,7 +154,7 @@ var findFromShapes = []struct{ name, pat, input string }{
 // findFromMaxStates forces a DFA state ceiling for shapes that need one.
 // buildBTFindBody is the fallback taken when a find pattern's DFA is too large,
 // so no pattern small enough to sweep reaches it at the default limit.
-var findFromMaxStates = map[string]int{"bt_find_fallback": 8}
+var findFromMaxStates = map[string]int{"bt_find_fallback": 8, "bt_find_empty": 8}
 
 // findFromLNM names the shapes compiled under LikelyNoMatch. Some emitters
 // exist ONLY under that mode — buildSimplePrefixCheckBody, whose missing
@@ -287,7 +308,7 @@ func TestFindFromIterationTerminates(t *testing.T) {
 
 			var got [][2]int
 			budget := 4*len(c.input) + 16
-			off := 0
+			off, prevEnd := 0, -1
 			for steps := 0; off <= len(c.input); steps++ {
 				if steps > budget {
 					t.Fatalf("iteration did not terminate within %d steps "+
@@ -304,7 +325,15 @@ func TestFindFromIterationTerminates(t *testing.T) {
 				if state == findNone {
 					break
 				}
-				got = append(got, sp)
+				// Half (B): Go does not report an EMPTY match beginning
+				// exactly where the previous reported match ended. Every
+				// generated stub applies this, and so must the model — without
+				// it an empty-capable pattern reports one match too many and
+				// the comparison below fails for the wrong reason.
+				if !(sp[0] == sp[1] && sp[0] == prevEnd) {
+					got = append(got, sp)
+					prevEnd = sp[1]
+				}
 				adv := sp[1] - off
 				if adv <= 0 {
 					adv = 1

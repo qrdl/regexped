@@ -1,33 +1,6 @@
 package compile
 
-import (
-	"runtime"
-	"strings"
-
-	"github.com/qrdl/regexped/internal/utils"
-)
-
-// callerFuncName returns the unqualified name of the function skip frames up,
-// with any closure suffix trimmed — buildFindBody seeds from inside a closure,
-// and it is the emitter that matters, not the closure.
-func callerFuncName(skip int) string {
-	pc, _, _, ok := runtime.Caller(skip)
-	if !ok {
-		return "?"
-	}
-	// "github.com/qrdl/regexped/compile.buildFindBody.func2" — the package
-	// path contains dots of its own, so drop it by the last slash first, then
-	// take the element after the package name.
-	name := runtime.FuncForPC(pc).Name()
-	if i := strings.LastIndex(name, "/"); i >= 0 {
-		name = name[i+1:]
-	}
-	parts := strings.Split(name, ".")
-	if len(parts) < 2 {
-		return name
-	}
-	return parts[1]
-}
+import "github.com/qrdl/regexped/internal/utils"
 
 // ── The find-from channel ──────────────────────────────
 //
@@ -139,18 +112,7 @@ func (m findFromMode) String() string {
 //
 // Placement: immediately after the locals declaration, before the prologue
 // that reads the cursor.
-// seedTrace, when non-nil, is called with the name of the emitter that
-// produced each seed. Only TestEveryFindEmitterIsCovered sets it, and it exists
-// because the alternative accountings are all proxies: a find body cannot be
-// identified from the module it emits (two emitters can declare identical
-// locals), and a static call-site count cannot tell which of them a corpus
-// actually reached. The cost when unset is one nil check per compiled pattern.
-var seedTrace func(emitter string)
-
 func emitFindFromSeed(b []byte, cur scanCursor) ([]byte, findFromMode) {
-	if seedTrace != nil {
-		seedTrace(callerFuncName(2))
-	}
 	b = append(b, 0x23) // global.get
 	b = utils.AppendULEB128(b, findFromGlobalIdx)
 	b = append(b, 0x21)

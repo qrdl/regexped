@@ -1438,6 +1438,28 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 	return w, top, err
 }
 
+// CompileFileOpts is CompileFileDiag with per-set options the YAML config does
+// not expose, for tests that need to reach a frontend the config cannot select.
+//
+// It exists for exactly one such frontend today. Shufti is chosen only from the
+// SCALAR branch, which needs Aho-Corasick to decline first — and AC declines
+// only when its table would exceed ACBudgetBytes, default 512 KB. A set large
+// enough to do that naturally is reachable in production but far too large to
+// build in a test, so `ACBudgetBytes: 1` simulates the condition cheaply.
+//
+// Without this entry point there was no way for a harness that can RUN a module
+// to produce a Shufti one: `CompileSet` is exported but returns an unexported
+// type, and every module-building path took only a config.BuildConfig. The
+// result was 215 lines of SIMD prefilter emitter — emitSetMatchFnFinalShufti —
+// whose output nothing had ever executed and compared against an oracle, while
+// `make set-coverage` reported every other set emitter reached.
+//
+// The zero value reproduces CompileFileDiag exactly; only fields the caller
+// sets take effect, and none of them is reachable from YAML.
+func CompileFileOpts(cfg config.BuildConfig, output string, over CompileSetOptions) ([]byte, int64, []SetDiag, error) {
+	return compileFileDiag(cfg, output, over)
+}
+
 // CompileFileDiag is CompileFile plus the per-set diagnostics the same compile
 // already produced — one SetDiag per entry of cfg.Sets, in that order.
 //
@@ -1452,6 +1474,12 @@ func CompileFile(cfg config.BuildConfig, output string) ([]byte, int64, error) {
 // compilation. That is fine for a CLI flag and wrong for a caller in a hot
 // loop, which is why this returns what the first compile already knew.
 func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []SetDiag, error) {
+	return compileFileDiag(cfg, output, CompileSetOptions{})
+}
+
+// compileFileDiag carries the optional per-set overrides. `over` is the zero
+// value on every path but CompileFileOpts.
+func compileFileDiag(cfg config.BuildConfig, output string, over CompileSetOptions) ([]byte, int64, []SetDiag, error) {
 	if err := config.ValidateSets(&cfg); err != nil {
 		return nil, 0, nil, err
 	}
@@ -1565,6 +1593,8 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 			// warning's own "raise max_dfa_states" hint pointed at a field that
 			// does not feed this budget.
 			MaxFallbackStates: cfg.MaxFallbackStates,
+			// Test-only overrides (CompileFileOpts); zero everywhere else.
+			ACBudgetBytes: over.ACBudgetBytes,
 		}
 		if !standalone {
 			setOpts.TableMemIdx = 1
