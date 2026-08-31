@@ -1496,6 +1496,12 @@ func CompileFileDiag(cfg config.BuildConfig, output string) ([]byte, int64, []Se
 // compileFileDiag carries the optional per-set overrides. `over` is the zero
 // value on every path but CompileFileOpts.
 func compileFileDiag(cfg config.BuildConfig, output string, over CompileSetOptions) ([]byte, int64, []SetDiag, error) {
+	return compileFileDiagReport(cfg, output, over, nil)
+}
+
+// compileFileDiagReport is compileFileDiag with an optional verbose Reporter.
+// nil on every path but `regexped compile --verbose`.
+func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSetOptions, rep *Reporter) ([]byte, int64, []SetDiag, error) {
 	if err := config.ValidateSets(&cfg); err != nil {
 		return nil, 0, nil, err
 	}
@@ -1510,6 +1516,7 @@ func compileFileDiag(cfg config.BuildConfig, output string, over CompileSetOptio
 		w, top, err := Compile(cfg.Regexps, 0, standalone, CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,
 			MaxTDFARegs:  cfg.MaxTDFARegs,
+			Report:       rep,
 		})
 		return w, top, nil, err
 	}
@@ -1522,6 +1529,7 @@ func compileFileDiag(cfg config.BuildConfig, output string, over CompileSetOptio
 	opts := CompileOptions{
 		MaxDFAStates: cfg.MaxDFAStates,
 		MaxTDFARegs:  cfg.MaxTDFARegs,
+		Report:       rep,
 	}
 	if !standalone {
 		opts.tableMemIdx = 1

@@ -1,6 +1,10 @@
 package compile
 
-import "github.com/qrdl/regexped/internal/utils"
+import (
+	"fmt"
+
+	"github.com/qrdl/regexped/internal/utils"
+)
 
 // emitShuftiPrefixCheck emits a SIMD byte-set-membership test (Shufti)
 // against the 16-byte chunk currently in `chunkLocal`. Leaves an i32
@@ -196,6 +200,10 @@ type prefixScanParams struct {
 	// have closed. attempt_start holds the candidate position.
 	// Emits engine-specific setup code (e.g. DFA state/pos initialisation).
 	OnMatch func(b []byte) []byte
+
+	// Report, when non-nil, receives the strategy this scan actually chose,
+	// for `regexped compile --verbose`. Nil on every path but that flag.
+	Report *Reporter
 }
 
 // emitPrefixScan emits the WASM bytes for the prefix/firstByteFlags scan phase.
@@ -207,6 +215,10 @@ type prefixScanParams struct {
 //
 // The caller is responsible for the surrounding $no_match/$outer blocks.
 func emitPrefixScan(b []byte, p prefixScanParams) []byte {
+	// The strategy is reported HERE, by the code that chooses it. Deriving it
+	// again at the call site would be a second implementation of this
+	// if/else — the mistake --verbose already made once with SelectEngine.
+	defer func() { p.Report.Note(p.strategyNote()) }()
 	l := p.Locals
 	ed := p.EngineDepth
 
@@ -716,4 +728,33 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		b = p.OnMatch(b)
 	}
 	return b
+}
+
+// strategyNote names the scan strategy these params select, in the words the
+// verbose report uses. It repeats the conditions immediately above rather than
+// observing them, which is a duplication worth flagging: if that if/else moves,
+// this must move with it. The alternative — threading a result out of the
+// emitter — costs a return value on a function called from fifteen sites for
+// output that is off by default.
+func (p prefixScanParams) strategyNote() string {
+	if len(p.Prefix) >= 1 {
+		if len(p.Prefix) <= 16 {
+			return fmt.Sprintf("prefix scan: hybrid SIMD, %d-byte prefix", len(p.Prefix))
+		}
+		return fmt.Sprintf("prefix scan: scalar (prefix %d bytes, over one chunk)", len(p.Prefix))
+	}
+	n := len(p.FirstByteSet)
+	switch {
+	case n == 0:
+		return "prefix scan: none"
+	case n <= 8 && p.TeddyTwoByte:
+		return "prefix scan: 2-byte Teddy"
+	case n <= 8:
+		return "prefix scan: 1-byte Teddy"
+	case n <= 16:
+		return "prefix scan: multi-eq SIMD"
+	case n <= 64:
+		return fmt.Sprintf("prefix scan: Shufti or scalar (%d first bytes)", n)
+	}
+	return fmt.Sprintf("prefix scan: scalar flag table (%d first bytes)", n)
 }

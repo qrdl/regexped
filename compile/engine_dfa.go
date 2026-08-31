@@ -2583,6 +2583,11 @@ type dfaLayout struct {
 	// `[a-z]{50,}[0-9]` whose body class runs to EOF without ever
 	// containing the suffix.
 	eofSkipSafe bool
+
+	// report carries the verbose Reporter to the emitters the layout reaches,
+	// so each can name the strategy IT chose rather than have the choice
+	// re-derived at a call site. Nil on every path but `compile --verbose`.
+	report *Reporter
 }
 
 // dominantInfo describes one dominant self-loop state recorded by
@@ -2652,6 +2657,7 @@ type dfaLayoutParams struct {
 	lmNonMidShufti       bool
 	lmWideShufti         bool
 	forceWordChar        bool
+	report               *Reporter
 }
 
 func buildDFALayout(p dfaLayoutParams) *dfaLayout {
@@ -2669,6 +2675,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	forceWordChar := p.forceWordChar
 	wantWordChar := needFind || forceWordChar
 	l := &dfaLayout{}
+	l.report = p.report
 	l.lmBareShufti = lmBareShufti
 	l.lmNonMidShufti = lmNonMidShufti
 	l.lmWideShufti = lmWideShufti
@@ -5844,6 +5851,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 		})
 	} else {
 		body, mode = buildFindBody(findBodyParams{
+			report:                l.report,
 			startState:            l.wasmStart,
 			midStartState:         l.wasmMidStart,
 			midStartWordState:     l.wasmMidStartWord,
@@ -8704,6 +8712,10 @@ type findBodyParams struct {
 	lnmAction5            bool
 	skipSafeOnDead        bool
 	eofSkipSafe           bool
+
+	// report reaches emitPrefixScan so the scan can name the strategy IT
+	// chose. Nil on every path but `compile --verbose`.
+	report *Reporter
 }
 
 func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
@@ -9335,6 +9347,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 				return b
 			},
 		}
+		params.Report = p.report
 		return emitPrefixScan(b, params)
 	}
 
@@ -11578,19 +11591,18 @@ func buildLitChainPrefixedMatchBody(lcp *litChainPattern) []byte {
 	var b []byte
 
 	const (
-		locPtr       byte = 0
-		locLen       byte = 1
-		locBase      byte = 2 // holds M; gives the "attempt_start" frame for shared helpers
-		locChunk     byte = 3
-		locTLo       byte = 4
-		locPow2      byte = 5
-		locPrefixTlo byte = 6
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	locBase := a.I32() // holds M; the "attempt_start" frame for shared helpers
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
+	locPrefixTlo := a.V128()
 
 	// 1 × i32 + 4 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x01, 0x7F)
-	b = append(b, 0x04, 0x7B)
+	b = a.EmitDecls(b)
 
 	k := int32(len(lcp.literal))
 	m := int32(lcp.prefixCount)
@@ -11719,25 +11731,24 @@ func buildLitChainMatchBody(lcp *litChainPattern) []byte {
 	// when end-anchor check needs the helpers, to keep the no-anchor WASM
 	// byte-identical to the pre-anchor emission.
 	const (
-		locPtr   byte = 0
-		locLen   byte = 1
-		locChunk byte = 2
-		locTLo   byte = 3
-		locPow2  byte = 4
-		// When hasAnchors:
-		locAttemptZero byte = 5
-		locTmp         byte = 6
+		locPtr byte = 0
+		locLen byte = 1
 	)
 	// Declare v128 group first so existing local indices (locChunk=2..) stay
 	// stable whether or not the anchor i32 locals are present.
+	// The two i32s exist only for the anchor helpers; without anchors the
+	// allocator emits the v128 group alone, exactly as the hand-written
+	// if/else did.
+	a := newLocalAlloc(2)
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
+	var locAttemptZero, locTmp byte
 	if hasAnchors {
-		b = append(b, 0x02)
-		b = append(b, 0x03, 0x7B) // 3 × v128
-		b = append(b, 0x02, 0x7F) // 2 × i32 (attempt-zero sentinel + tmp)
-	} else {
-		b = append(b, 0x01)
-		b = append(b, 0x03, 0x7B)
+		locAttemptZero = a.I32()
+		locTmp = a.I32()
 	}
+	b = a.EmitDecls(b)
 
 	// Materialise tLo and pow2 from inline v128.const into locals.
 	b = emitV128Const(b, lcp.tlo)
@@ -12344,23 +12355,21 @@ func buildLitChainAltMatchBody(altp *litChainAltPattern) []byte {
 	}
 
 	const (
-		locPtr         byte = 0
-		locLen         byte = 1
-		locChunk       byte = 2
-		locTLo         byte = 3
-		locPow2        byte = 4
-		locAttemptZero byte = 5 // attempt_start sentinel (init 0); used by emitEndAnchorCheck
-		locTmp         byte = 6 // is_word scratch
+		locPtr byte = 0
+		locLen byte = 1
 	)
 
+	a := newLocalAlloc(2)
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
+	// attempt_start sentinel (init 0) and is_word scratch, both anchor-only.
+	var locAttemptZero, locTmp byte
 	if anyAnchor {
-		b = append(b, 0x02)
-		b = append(b, 0x03, 0x7B) // 3 × v128
-		b = append(b, 0x02, 0x7F) // 2 × i32
-	} else {
-		b = append(b, 0x01)
-		b = append(b, 0x03, 0x7B)
+		locAttemptZero = a.I32()
+		locTmp = a.I32()
 	}
+	b = a.EmitDecls(b)
 
 	// Materialise pow2 once.
 	b = emitV128Const(b, pow2VecConst)
@@ -12498,29 +12507,28 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 	var b []byte
 
 	const (
-		locPtr         byte = 0
-		locLen         byte = 1
-		locChunk       byte = 2
-		locTLo         byte = 3
-		locPow2        byte = 4
-		locState       byte = 5 // DFA verify
-		locPos         byte = 6 // DFA verify
-		locClass       byte = 7 // DFA verify
-		locOutEnd      byte = 8 // DFA verify last_accept
-		locScalarIdx   byte = 9 // scalar bitmap verify counter / is_word scratch
-		locAttemptZero byte = 10
-		// locScalarByte is a same-iteration byte-value scratch for
-		// emitScalarBitmapVerify. It must NOT alias locScalarIdx, which
-		// must survive as the live loop counter across iterations.
-		// Aliasing it onto the byte scratch was a real defect here, and
-		// again in the sibling anchored-match body.
-		locScalarByte byte = 11
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
+	locState := a.I32()     // DFA verify
+	locPos := a.I32()       // DFA verify
+	locClass := a.I32()     // DFA verify
+	locOutEnd := a.I32()    // DFA verify last_accept
+	locScalarIdx := a.I32() // scalar bitmap verify counter / is_word scratch
+	locAttemptZero := a.I32()
+	// locScalarByte is a same-iteration byte-value scratch for
+	// emitScalarBitmapVerify. It must NOT alias locScalarIdx, which must
+	// survive as the live loop counter across iterations. Aliasing it onto the
+	// byte scratch was a real defect here, and again in the sibling anchored-
+	// match body — which is the kind of mistake the allocator makes hard to
+	// repeat, since each name now comes from its own allocation.
+	locScalarByte := a.I32()
 
-	// 3 × v128 + 7 × i32 locals.
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7B)
-	b = append(b, 0x07, 0x7F)
+	b = a.EmitDecls(b)
 
 	// Materialise pow2 once.
 	b = emitV128Const(b, pow2VecConst)
@@ -13442,21 +13450,20 @@ func buildLitChainRangeMatchBody(lcp *litChainPattern) []byte {
 	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
 
 	const (
-		locPtr         byte = 0
-		locLen         byte = 1
-		locMatchLen    byte = 2
-		locScratch     byte = 3 // for tmp in verify
-		locAttemptZero byte = 4 // zero-init; used by emitEndAnchorCheck
-		locTmp         byte = 5 // is_word scratch
-		locChunk       byte = 6
-		locTLo         byte = 7
-		locPow2        byte = 8
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	locMatchLen := a.I32()
+	locScratch := a.I32()     // for tmp in verify
+	locAttemptZero := a.I32() // zero-init; used by emitEndAnchorCheck
+	locTmp := a.I32()         // is_word scratch
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// 4 × i32 (locMatchLen, locScratch, locAttemptZero, locTmp) + 3 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x04, 0x7F)
-	b = append(b, 0x03, 0x7B)
+	b = a.EmitDecls(b)
 
 	k := int32(len(lcp.literal))
 	countMin := int32(lcp.count)

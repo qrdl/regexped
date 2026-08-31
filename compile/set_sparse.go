@@ -173,28 +173,27 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		pGate   = byte(7)
 		pSkip   = byte(7)
 	)
-	base := byte(7)
+	// The parameter count varies: a gated or skip-taking body has one more.
+	// The declared locals then follow it, and `nLocals` used to be a separate
+	// hand-kept count that had to match the ten `base + N` names above it.
+	nParams := uint32(7)
 	if p.gated || p.hasSkip {
-		base = 8
+		nParams = 8
 	}
-	var (
-		lState = base
-		lPos   = base + 1
-		lFired = base + 2
-		lOff   = base + 3
-		lCnt   = base + 4
-		lIdx   = base + 5
-		lPat   = base + 6
-		lTmp   = base + 7
-		lOut   = base + 8
-		lStart = base + 9
-	)
-	nLocals := 10
+	a := newLocalAlloc(nParams)
+	lState := a.I32()
+	lPos := a.I32()
+	lFired := a.I32()
+	lOff := a.I32()
+	lCnt := a.I32()
+	lIdx := a.I32()
+	lPat := a.I32()
+	lTmp := a.I32()
+	lOut := a.I32()
+	lStart := a.I32()
 
 	var b []byte
-	b = append(b, 0x01)
-	b = utils.AppendULEB128(b, uint32(nLocals))
-	b = append(b, 0x7F) // all i32
+	b = a.EmitDecls(b)
 
 	// matchStart is lPos minus the bucket's fixed prefix length; computed once.
 	b = append(b, 0x20, pLPos)

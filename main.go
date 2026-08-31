@@ -3,7 +3,7 @@
 // Usage:
 //
 //	regexped [--debug] generate [--config=<file>] [--output=<file>|-]
-//	regexped [--debug] compile  [--config=<file>] [--output=<file>|-]
+//	regexped [--debug] compile  [--config=<file>] [--output=<file>|-] [--verbose]
 //	regexped [--debug] merge    [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
 //
 // The config file defaults to regexped.yaml in the current directory when not specified.
@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -169,6 +170,7 @@ func runCompileCmd(args []string) {
 	fset := flag.NewFlagSet("compile", flag.ContinueOnError)
 	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
 	diagJSON := fset.String("diag-json", "", "write set-composition diagnostics as JSON to this path (- for stdout)")
+	verbose := fset.Bool("verbose", false, "report what the compiler decided per pattern and per set, to stderr")
 	var out string
 	fset.StringVar(&out, "output", "", "override wasm_file from config; - writes to stdout")
 	fset.StringVar(&out, "o", "", "output file (alias for --output)")
@@ -204,7 +206,13 @@ func runCompileCmd(args []string) {
 		}
 	}
 
-	if err := compile.CmdCompile(cfg, outPath); err != nil {
+	// stderr, never stdout: `--output -` writes the WASM module to stdout, and
+	// interleaving a report with it would corrupt the module.
+	var report io.Writer
+	if *verbose {
+		report = os.Stderr
+	}
+	if err := compile.CmdCompileVerbose(cfg, outPath, report); err != nil {
 		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 

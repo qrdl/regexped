@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"regexp/syntax"
@@ -370,6 +371,12 @@ type CompileOptions struct {
 	// Currently no-op; reserved for the LikelyMode design's fast-accept /
 	// fast-reject paths.
 	LikelyMode LikelyMode
+
+	// Report, when non-nil, accumulates the compiler's per-pattern decisions
+	// for `regexped compile --verbose`. Nil on every other path, and every
+	// Reporter method is nil-safe, so the compile path calls them
+	// unconditionally. See compile/verbose.go.
+	Report *Reporter
 	// CompiledDFAThreshold is the maximum minimised WASM state count for which the
 	// compiled dispatch path (EngineCompiledDFA) is used instead of the table-driven
 	// interpreter. 0 means use the default (256). Capped at 256 (u8 state index
@@ -806,6 +813,23 @@ func extractGroupNames(re *syntax.Regexp) []string {
 // It does not build the final WASM module; call assembleModule for that.
 // forceGroupsEngine overrides engine selection for the capture path (0 = auto).
 func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions) (*compiledPattern, error) {
+	// Opens the verbose scope every decision below records into. Nil-safe, and
+	// End is idempotent, so an early return cannot lose the record — the next
+	// Begin flushes it.
+	buildOpts.report().Begin(re.Name, re.Pattern)
+	defer func() {
+		if rep := buildOpts.report(); rep != nil && !rep.HasEngine() {
+			// A specialised body (the literal-chain family and its kin) never
+			// builds a general DFA, so nothing above recorded an engine. Say
+			// which of the two situations this is rather than guess.
+			if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" {
+				rep.Reason("specialised body — no general engine (literal-chain family)")
+			} else {
+				rep.Reason("none — set member only, or declares no *_func")
+			}
+		}
+		buildOpts.report().End()
+	}()
 	needMatch := re.MatchFunc != ""
 	needFind := re.FindFunc != ""
 	needGroups := re.CaptureStubsRequested()
@@ -819,6 +843,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// pattern > caller's default.
 	if mode, set := parseHints(re.Hints); set {
 		buildOpts.LikelyMode = mode
+	}
+	// The RESOLVED mode, after the pattern's own hints have overridden the
+	// caller's default — which is the precedence a user cannot otherwise see.
+	if buildOpts.LikelyMode != LikelyNeutral {
+		buildOpts.report().Note("LikelyMode " + buildOpts.LikelyMode.String())
 	}
 
 	// Counted-chain SIMD verifier, default-on for every
@@ -1329,9 +1358,66 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	dfaTooLarge := dfaStateLimitExceeded || table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit) ||
 		dfaHasOutrankedState(table) || dfaHasAmbiguousBoundaryTarget(table)
 
+	// The real DFA-vs-Backtracking decision for the no-capture paths, recorded
+	// where it is MADE. An earlier version of --verbose asked SelectEngine
+	// instead and reported a DFA the compiler had not built: the selector
+	// answers for the capture path, and does not model dfaHasOutrankedState,
+	// the memory bound, or the ambiguous-boundary refusal below. A verbose mode
+	// that lies is worse than none.
+	if rep := buildOpts.report(); rep != nil {
+		rep.Limit("DFA states", table.numStates, maxStates)
+		switch {
+		case dfaStateLimitExceeded:
+			rep.Engine(EngineBacktrack, "DFA construction hit the state limit — raise max_dfa_states to keep the O(n) engine")
+		case table.numStates > maxStates:
+			rep.Engine(EngineBacktrack, "DFA over max_dfa_states — raise it to keep the O(n) engine")
+		case memLimit > 0 && dfaTableBytes(table) > memLimit:
+			rep.Engine(EngineBacktrack, "DFA table over the memory bound")
+			rep.Limit("DFA table bytes", dfaTableBytes(table), memLimit)
+		case dfaHasOutrankedState(table):
+			rep.Engine(EngineBacktrack, "DFA has an outranked state (leftmost-first cannot be preserved in a plain table)")
+		case dfaHasAmbiguousBoundaryTarget(table):
+			rep.Engine(EngineBacktrack, "DFA has an ambiguous word-boundary target")
+		}
+	}
+
 	var l *dfaLayout
 	if !dfaTooLarge {
+		defer func() {
+			rep := buildOpts.report()
+			if rep == nil || l == nil {
+				return
+			}
+			if !rep.HasEngine() {
+				if l.useHybridDispatch {
+					rep.Engine(EngineCompiledDFA, "no captures; promoted to direct-index dispatch")
+				} else {
+					rep.Engine(EngineDFA, "no captures; table-driven DFA")
+				}
+			}
+			// Read back off the layout rather than re-deriving: these fields
+			// ARE the decisions, so the report cannot drift from what was
+			// emitted the way an independent recomputation would.
+			if l.useU8 {
+				rep.Note("u8 state ids")
+			} else {
+				rep.Note("u16 state ids")
+			}
+			if l.useCompression {
+				rep.Note("byte-class compressed table")
+			}
+			if l.useRowDedup {
+				rep.Note("u16 row dedup")
+			}
+			if len(l.dominantStates) > 0 {
+				rep.Note(fmt.Sprintf("SIMD bulk skip (%d dominant state(s))", len(l.dominantStates)))
+			}
+			if l.skipSafeOnDead {
+				rep.Note("skip-safe-on-dead")
+			}
+		}()
 		l = buildDFALayout(dfaLayoutParams{
+			report:               buildOpts.report(),
 			t:                    table,
 			tableBase:            cur,
 			needFind:             needFindBody,
@@ -1344,6 +1430,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		})
 	}
 	patMandLit := findMandatoryLit(re.Pattern)
+	if patMandLit != nil {
+		buildOpts.report().Note("mandatory literal extracted")
+	}
 
 	p := &compiledPattern{
 		matchExport: re.MatchFunc,
@@ -1410,9 +1499,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
 				btScanParams = prefixScanParams{
 					Prefix: btPrefix,
-					Locals: prefixScanLocals{
-						Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8, Chunk: 9,
-					},
+					// The layout is buildBTFindBody's, and comes from the
+					// allocation that decides it — not from five indices
+					// written out here, in a different file.
+					Locals:        btScanLocalsOnly(),
 					EngineDepth:   2,
 					LikelyNoMatch: buildOpts.LikelyMode == LikelyNoMatch,
 				}
@@ -1570,6 +1660,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 							}
 						}
 
+						buildOpts.report().Note("literal-anchored find (SIMD literal scan + backward DFA)")
 						p.litAnchorBackScanBody = bsBody
 						// findFromMode is deliberately NOT set here. This
 						// pair's find half is built at assembleModule time and
@@ -1621,6 +1712,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			if p.litAnchorBackScanBody == nil && !needGroups {
 				if altBranches, ok := findAltLitAnchorPoints(re.Pattern); ok {
 					if altCompiled, altOK := compileAltLitAnchorBranches(altBranches, l.tableEnd, buildOpts); altOK {
+						buildOpts.report().Note("alternation literal-anchored find")
 						p.altLitAnchorBranches = altCompiled.branches
 						// findFromMode not set here either — the branch
 						// dispatcher records it at assembleModule time. See
@@ -2319,20 +2411,41 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 // output is the output path (absolute, relative to cwd, or "-" for stdout).
 // Mode is auto-selected from cfg.Output: empty → standalone; non-empty → embedded.
 func CmdCompile(cfg config.BuildConfig, output string) error {
+	return CmdCompileVerbose(cfg, output, nil)
+}
+
+// CmdCompileVerbose is CmdCompile that, when report is non-nil, writes a
+// human-readable account of what the compiler decided to it.
+//
+// Separate from --debug on purpose: that flag raises the slog level to diagnose
+// the COMPILER, whereas this reports on the user's PATTERNS. It exists because
+// two outcomes a user must act on are otherwise silent — a pattern demoted to
+// Backtracking by a state limit, and a pattern dropped from a set.
+func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) error {
 	outPath := output
 	slog.Info("Compiling regexps", "count", len(cfg.Regexps), "output", outPath)
+
+	var rep *Reporter
+	if report != nil {
+		rep = &Reporter{}
+	}
 
 	var wasmBytes []byte
 	if len(cfg.Sets) > 0 {
 		var err error
-		wasmBytes, _, err = CompileFile(cfg, output)
+		var diags []SetDiag
+		wasmBytes, _, diags, err = compileFileDiagReport(cfg, output, CompileSetOptions{}, rep)
 		if err != nil {
 			return fmt.Errorf("compile: %w", err)
+		}
+		if rep != nil {
+			rep.Sets = diags
 		}
 	} else {
 		compOpts := CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,
 			MaxTDFARegs:  cfg.MaxTDFARegs,
+			Report:       rep,
 		}
 		standalone := cfg.Output == ""
 		var err error
@@ -2341,6 +2454,7 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 			return fmt.Errorf("compile: %w", err)
 		}
 	}
+	rep.Render(report)
 
 	if outPath == "-" {
 		if _, err := os.Stdout.Write(wasmBytes); err != nil {

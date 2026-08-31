@@ -2122,11 +2122,8 @@ func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes boo
 			FirstByteSet:   firstBytes,
 			FirstByteFlags: firstByteFlags,
 			FirstByteOff:   off,
-			Locals: prefixScanLocals{
-				Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8,
-				Chunk: 9, TLo: 10, THi: 11, Chunk1: 12, T1Lo: 13, T1Hi: 14,
-			},
-			EngineDepth: 2,
+			Locals:         btScanLocalsOnly(),
+			EngineDepth:    2,
 		}
 		return params, segs, 1
 	}
@@ -2159,11 +2156,8 @@ func buildBTScanTables(firstBytes []byte, firstByteFlags [256]byte, allBytes boo
 		TeddyLoOff:     teddyLoOff,
 		TeddyHiOff:     teddyHiOff,
 		TeddyTwoByte:   false,
-		Locals: prefixScanLocals{
-			Ptr: 0, Len: 1, AttemptStart: 7, SimdMask: 8,
-			Chunk: 9, TLo: 10, THi: 11, Chunk1: 12, T1Lo: 13, T1Hi: 14,
-		},
-		EngineDepth: 2,
+		Locals:         btScanLocalsOnly(),
+		EngineDepth:    2,
 	}
 
 	return params, segs, segCnt
@@ -2558,6 +2552,39 @@ func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams
 // When mandLit != nil: uses a two-level outer loop — outer loop scans for the
 // mandatory literal, inner loop runs BT attempts in the resulting window.
 // scanParams is ignored when mandLit != nil (the mandatory-lit prefix scan replaces it).
+// btScanLocals is the prefix-scan local layout of buildBTFindBody's body,
+// derived from the SAME allocation the body emits its declarations from.
+//
+// It exists because these indices used to be written out by hand at four call
+// sites — three here and one in compile.go's Backtracking fallback — none of
+// them the place that decides them. They agreed only by coincidence, and a
+// wrong index is not a validation error: WASM locals are zero-initialised, so
+// naming the wrong one yields a module that runs and scans from somewhere
+// unintended. Same defect class as TODO 67's, which this is the first site of.
+//
+// The v128 group is fixed at six here because that is the widest shape the
+// scan can ask for (two-byte Teddy); a body with fewer simply never names the
+// tail. buildBTFindBody asserts its own allocation agrees with this one.
+func btScanLocals() (prefixScanLocals, scanCursor) {
+	a := newLocalAlloc(2) // ptr, len
+	a.Reserve(valI32, 5)  // 2..6 — state, pos and friends
+	cur := a.ScanCursor() // 7 — the scan start
+	simdMask := a.I32()   // 8 — completes the 7 fixed i32s
+	chunk, tLo, tHi := a.V128(), a.V128(), a.V128()
+	chunk1, t1Lo, t1Hi := a.V128(), a.V128(), a.V128()
+	return prefixScanLocals{
+		Ptr: 0, Len: 1, AttemptStart: cur.Local(), SimdMask: simdMask,
+		Chunk: chunk, TLo: tLo, THi: tHi, Chunk1: chunk1, T1Lo: t1Lo, T1Hi: t1Hi,
+	}, cur
+}
+
+// btScanLocalsOnly is btScanLocals without the cursor, for the call sites that
+// only need the layout.
+func btScanLocalsOnly() prefixScanLocals {
+	l, _ := btScanLocals()
+	return l
+}
+
 func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandatoryLit,
 	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int) ([]byte, findFromMode) {
 	var findFrom findFromMode
@@ -2647,6 +2674,13 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	a.Reserve(valI32, 5)            // 2..6
 	attemptCursor := a.ScanCursor() // 7 — the scan start
 	a.Reserve(valI32, 1)            // 8, completing the 7 fixed i32s
+	// The scan layout is published by btScanLocals for the four call sites
+	// that build prefixScanParams for this body; they must agree with what is
+	// allocated here, and this is where that is checked.
+	if sl, sc := btScanLocals(); sl.AttemptStart != attemptCursor.Local() ||
+		sc.Local() != attemptCursor.Local() {
+		panic("compile: btScanLocals disagrees with buildBTFindBody's allocation")
+	}
 	a.Reserve(valV128, numV128Locals)
 	a.Reserve(valI32, numLoopAndMemoLocals)
 	body = a.EmitDecls(body)
@@ -2698,13 +2732,14 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		mlScan := prefixScanParams{
 			Prefix:      mandLit.bytes,
 			EngineDepth: 2,
-			Locals: prefixScanLocals{
-				Ptr:          0,
-				Len:          1,
-				AttemptStart: byte(scanStartLocal),
-				SimdMask:     8,
-				Chunk:        9,
-			},
+			// AttemptStart is the mandatory-literal scan's OWN cursor, not
+			// the body's: this scan restarts from scanStartLocal per literal
+			// hit. Everything else is the shared layout.
+			Locals: func() prefixScanLocals {
+				l := btScanLocalsOnly()
+				l.AttemptStart = byte(scanStartLocal)
+				return l
+			}(),
 			OnMatch: func(b []byte) []byte {
 				// lit_pos = scan_start
 				b = append(b, 0x20)
