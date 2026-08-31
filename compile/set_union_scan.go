@@ -155,9 +155,15 @@ type unionSkipInfo struct {
 const maxUnionSkipExit = 64
 
 // maxUnionSkipStates caps how many states get a dispatch compare at the top of
-// the bulk loop. Each costs a compare per FOUR input bytes (the unroll), paid
-// whether or not the skip fires, so this stays small on purpose.
-const maxUnionSkipStates = 2
+// the bulk loop.
+//
+// ONE, and the reason is measured. The guard is paid on every bulk iteration
+// whether or not the stride fires, against a body that costs about 20 fuel per
+// byte — so each extra state is a few percent of the whole scan, permanently.
+// A no-match walk spends nearly all of its bytes in the state it restarts
+// into, and start/midStart are usually the same state anyway, so the second
+// slot bought almost nothing and cost every byte.
+const maxUnionSkipStates = 1
 
 // detectUnionSkipStates finds the states worth a SIMD stride, reading the raw
 // per-byte transitions before class compression (`trans` there is already
@@ -167,44 +173,19 @@ const maxUnionSkipStates = 2
 // Entry states first: a no-match walk spends nearly all of its bytes in the
 // state it restarts into, so if only one state can be afforded, that is the
 // one. Ties beyond the entry pair go to the widest self-loop.
-func detectUnionSkipStates(d *dfa, oldToNew []int, midAcceptLimit int) []unionSkipInfo {
-	// A byte that moves the automaton to a state INDISTINGUISHABLE from the
-	// one it is in has not left it, and must not stop the stride.
-	//
-	// This is not a refinement, it is the difference between the optimisation
-	// working and not. The union automaton is a `.*`-prefixed determinisation
-	// and is NOT minimized, so the restart closure appears as several states
-	// with byte-for-byte identical rows. Measured on `[a-z]{4,6}[0-9]{1,3}`:
-	// the raw exit set of the start state is `\w` — 63 bytes — because every
-	// word byte moves it to a DUPLICATE of itself, while the set of bytes that
-	// genuinely begin a match is `[a-z]`, 26. Striding stopped on every digit
-	// for no reason.
-	//
-	// Equivalence is deliberately strict: identical transition rows AND
-	// identical accept behaviour on every channel a scan body can observe.
-	// Transitions alone would be wrong — two states can agree on where every
-	// byte goes and disagree on what accepts there, and the stride would then
-	// swallow the accept.
-	sameAccept := func(x, y int) bool {
-		return d.accepting[x] == d.accepting[y] &&
-			d.midAccepting[x] == d.midAccepting[y] &&
-			d.midAcceptingNW[x] == d.midAcceptingNW[y] &&
-			d.midAcceptingW[x] == d.midAcceptingW[y] &&
-			d.midAcceptingNL[x] == d.midAcceptingNL[y]
-	}
-	sameRow := func(x, y int) bool {
-		for b := 0; b < 256; b++ {
-			if d.transitions[x*256+b] != d.transitions[y*256+b] {
-				return false
-			}
-		}
-		return true
-	}
-	equivalent := func(x, y int) bool { return x == y || (sameAccept(x, y) && sameRow(x, y)) }
-	exitSetOf := func(oldSt int) []byte {
+//
+// The machine handed in is MINIMIZED (task 72), which is what lets "leaves
+// this state" be the plain `!= st` it reads as. Before minimization it could
+// not be: the `.*`-prefixed determinisation carried several byte-for-byte
+// identical copies of the restart closure, so a byte moving to a duplicate
+// looked like an exit and the exit set of a classchain start state came out
+// as `\w` (63 bytes) instead of `[a-z]` (26). This function used to carry a
+// state-equivalence test to compensate; minimizing deleted the need for it.
+func detectUnionSkipStates(t *dfaTable, oldToNew []int, midAcceptLimit int) []unionSkipInfo {
+	exitSetOf := func(st int) []byte {
 		var out []byte
 		for b := 0; b < 256; b++ {
-			if !equivalent(d.transitions[oldSt*256+b], oldSt) {
+			if t.transitions[st*256+b] != st {
 				out = append(out, byte(b))
 			}
 		}
@@ -230,8 +211,8 @@ func detectUnionSkipStates(d *dfa, oldToNew []int, midAcceptLimit int) []unionSk
 		seen[oldSt] = true
 		out = append(out, unionSkipInfo{state: newSt, exitSet: ex})
 	}
-	consider(d.start)
-	consider(d.midStart)
+	consider(t.startState)
+	consider(t.midStartState)
 	return out
 }
 
@@ -373,8 +354,37 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 		return nil
 	}
 
+	// MINIMIZE (task 72). The `.*`-prefixed determinisation is not minimal:
+	// the restart closure comes out as several states with byte-for-byte
+	// identical rows and identical accepts. That cost this file real work
+	// before it was fixed here — the SIMD stride's exit-set analysis had to
+	// carry its own state-equivalence test, and on a classchain shape the raw
+	// exit set of the start state is `\w` where the set of bytes that
+	// genuinely begins a match is `[a-z]`.
+	//
+	// dfaTableFrom runs minimizeDFA and then reorderAcceptFirst. The union
+	// applies its OWN mid-accept-first partition below, which is a permutation
+	// of whatever ordering it receives, so composing the two is harmless — and
+	// the union's is the one that survives, which is what `midAcceptLimit`
+	// counts. minimizeDFA remaps startState/midStartState and rewrites
+	// numStates itself, so nothing below needs to know it happened.
+	//
+	// It is SOUND for both accept representations: minimizeDFA's state
+	// signature includes `wideSig`, which serialises acceptWide/midAcceptWide/
+	// immAcceptWide with length prefixes precisely because the u64 fields
+	// degrade to "bit 1 = something accepts here" on the wide path and would
+	// otherwise merge two states accepting different patterns.
+	//
+	// Measured reduction on real shapes: classchain-128 138 -> 34 states
+	// (-75%, which also drops the table under unionTableBudget so no byte-class
+	// map is emitted at all), greedy-3 24 -> 18, alt-heavy 33 -> 25.
+	mt := dfaTableFrom(d)
+	if mt.numStates == 0 || mt.startState < 0 || mt.midStartState < 0 {
+		return nil
+	}
+
 	u := &unionScanDFA{
-		numStates: d.numStates, startState: d.start, midStartState: d.midStart,
+		numStates: mt.numStates, startState: mt.startState, midStartState: mt.midStartState,
 		maskWords: 1, midReprOff: -1, eofReprOff: -1, midWordsOff: -1, eofWordsOff: -1,
 	}
 	if !wide {
@@ -395,16 +405,16 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 		}
 		u.distinctIDs = len(seen)
 	}
-	if d.midStart < 0 || d.midStart >= d.numStates {
+	if mt.midStartState >= mt.numStates {
 		return nil
 	}
 
 	// The `.*` prefix keeps a live thread at every position, so no byte can
 	// lead to the dead state. Verified rather than assumed: a -1 here would
 	// mean the loop below reads a state id that does not exist.
-	for st := 0; st < d.numStates; st++ {
+	for st := 0; st < mt.numStates; st++ {
 		for b := 0; b < 256; b++ {
-			if next := d.transitions[st*256+b]; next < 0 || next >= d.numStates {
+			if next := mt.transitions[st*256+b]; next < 0 || next >= mt.numStates {
 				return nil
 			}
 		}
@@ -429,16 +439,16 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 	// costs nothing worth reordering for.
 	midAccepts := func(s int) bool {
 		if wide {
-			return len(d.midAcceptWide[s]) > 0
+			return len(mt.midAcceptWide[s]) > 0
 		}
-		return d.midAccepting[s] != 0
+		return mt.midAcceptStates[s] != 0
 	}
-	oldToNew := make([]int, d.numStates)
-	newToOld := make([]int, d.numStates)
+	oldToNew := make([]int, mt.numStates)
+	newToOld := make([]int, mt.numStates)
 	next := 0
 	for pass := 0; pass < 2; pass++ {
 		want := pass == 0
-		for s := 0; s < d.numStates; s++ {
+		for s := 0; s < mt.numStates; s++ {
 			if midAccepts(s) == want {
 				oldToNew[s] = next
 				newToOld[next] = s
@@ -446,58 +456,52 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 			}
 		}
 	}
-	for s := 0; s < d.numStates; s++ {
+	for s := 0; s < mt.numStates; s++ {
 		if midAccepts(s) {
 			u.midAcceptLimit++
 		}
 	}
-	u.startState = oldToNew[d.start]
-	u.midStartState = oldToNew[d.midStart]
+	u.startState = oldToNew[mt.startState]
+	u.midStartState = oldToNew[mt.midStartState]
 	// Before class compression: the exit set is a question about BYTES, and
 	// `trans` below may be a class-column table.
 	//
-	// NOT for the wide form, and the reason is a trap rather than a
-	// preference. On the wide path `newDFAWide` degrades the u64 accept maps
-	// to "bit 1 = something accepts here" (the per-state LISTS are the
-	// authority there), so detectUnionSkipStates' accept comparison would find
-	// two states with genuinely different accept sets indistinguishable, and
-	// the stride would swallow matches. `emitUnionScanWideBody` does not emit
-	// the stride today, so this changes nothing now — it is here so that
-	// wiring it there later fails by producing no skip states rather than by
-	// producing wrong answers.
-	//
-	// Guarded on u.isWide() rather than the local `wide`, so the predicate is
-	// the SAME one emitUnionScanBody panics on — the two questions have been
-	// allowed to drift apart in this file before (see wideAccept's comment on
-	// why it is not `maskWords > 1`).
-	if !u.isWide() {
-		u.skipStates = detectUnionSkipStates(d, oldToNew, u.midAcceptLimit)
-	}
+	// NARROW AND WIDE ALIKE since task 72. This was guarded to the narrow form
+	// while the detector compared u64 accept masks, which `newDFAWide`
+	// degrades to "bit 1 = something accepts here" — it would have called two
+	// states with different accept sets indistinguishable and the stride would
+	// have swallowed matches. Minimization removed that comparison entirely
+	// (the detector is now a plain `!= st` over transitions), so the trap has
+	// no surface left and the wide automaton gets the stride too.
+	u.skipStates = detectUnionSkipStates(mt, oldToNew, u.midAcceptLimit)
 
 	u.stateWidth, u.numClasses = 2, 256
 	var classMap [256]byte
-	if d.numStates <= 256 {
+	if mt.numStates <= 256 {
 		u.stateWidth = 1
 	}
-	if d.numStates*256*u.stateWidth > unionTableBudget {
+	if mt.numStates*256*u.stateWidth > unionTableBudget {
 		// Byte classes group BYTES that every state treats alike, which is
 		// invariant under renumbering the states — so this may be computed
-		// from the pre-permutation table.
-		cm, _, nc := computeByteClasses(dfaTableFrom(d))
+		// from the pre-permutation table. Computed from the MINIMIZED machine,
+		// which is also why this branch is now taken less often: minimization
+		// can drop the table under the budget outright (classchain-128:
+		// 138 states compressed, 34 states not).
+		cm, _, nc := computeByteClasses(mt)
 		if nc < 256 {
 			classMap, u.numClasses = cm, nc
 		}
 	}
 	rowLen := u.numClasses * u.stateWidth
-	trans := make([]byte, d.numStates*rowLen)
-	for newSt := 0; newSt < d.numStates; newSt++ {
+	trans := make([]byte, mt.numStates*rowLen)
+	for newSt := 0; newSt < mt.numStates; newSt++ {
 		oldSt := newToOld[newSt]
 		for b := 0; b < 256; b++ {
 			col := b
 			if u.numClasses < 256 {
 				col = int(classMap[b])
 			}
-			next := uint16(oldToNew[d.transitions[oldSt*256+b]])
+			next := uint16(oldToNew[mt.transitions[oldSt*256+b]])
 			if u.stateWidth == 1 {
 				trans[newSt*rowLen+col] = byte(next)
 			} else {
@@ -530,12 +534,12 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 	off = u.transOff + int32(len(trans))
 
 	if !wide {
-		accept := make([]byte, d.numStates*8)
-		eof := make([]byte, d.numStates*8)
-		for newSt := 0; newSt < d.numStates; newSt++ {
+		accept := make([]byte, mt.numStates*8)
+		eof := make([]byte, mt.numStates*8)
+		for newSt := 0; newSt < mt.numStates; newSt++ {
 			oldSt := newToOld[newSt]
-			binary.LittleEndian.PutUint64(accept[newSt*8:], remap(d.midAccepting[oldSt]))
-			binary.LittleEndian.PutUint64(eof[newSt*8:], remap(d.accepting[oldSt]))
+			binary.LittleEndian.PutUint64(accept[newSt*8:], remap(mt.midAcceptStates[oldSt]))
+			binary.LittleEndian.PutUint64(eof[newSt*8:], remap(mt.acceptStates[oldSt]))
 		}
 		// 8-ALIGNED. These are u64 tables read with an i64 load on every
 		// mid-accepting byte, and the transition table above them can end
@@ -586,14 +590,14 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 		return repr, row
 	}
 
-	midRepr := make([]byte, d.numStates*4)
-	eofRepr := make([]byte, d.numStates*4)
-	midWords := make([]byte, d.numStates*u.rowBytes)
-	eofWords := make([]byte, d.numStates*u.rowBytes)
-	for newSt := 0; newSt < d.numStates; newSt++ {
+	midRepr := make([]byte, mt.numStates*4)
+	eofRepr := make([]byte, mt.numStates*4)
+	midWords := make([]byte, mt.numStates*u.rowBytes)
+	eofWords := make([]byte, mt.numStates*u.rowBytes)
+	for newSt := 0; newSt < mt.numStates; newSt++ {
 		oldSt := newToOld[newSt]
-		mr, mrow := wideRow(d.midAcceptWide[oldSt])
-		er, erow := wideRow(d.acceptWide[oldSt])
+		mr, mrow := wideRow(mt.midAcceptWide[oldSt])
+		er, erow := wideRow(mt.acceptWide[oldSt])
 		binary.LittleEndian.PutUint32(midRepr[newSt*4:], uint32(mr))
 		binary.LittleEndian.PutUint32(eofRepr[newSt*4:], uint32(er))
 		copy(midWords[newSt*u.rowBytes:], mrow)
@@ -755,11 +759,10 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	lAcc := a.I64()
 	// The LNM stride's locals, allocated only when it is emitted — which is
 	// why this body was converted off hand-numbered indices first.
-	var lSkipMask, lStale, lChunk byte
+	var lSkipMask, lArmed, lStale, lChunk byte
 	skip := lnm && len(u.skipStates) > 0
 	if skip {
-		lSkipMask = a.I32()
-		lStale = a.I32()
+		lSkipMask, lArmed, lStale = a.I32(), a.I32(), a.I32()
 		lChunk = a.V128()
 	}
 	// Does this walk need its answer restricted to fullMask's universe? Only
@@ -783,6 +786,9 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	// line anchors are refused in buildUnionScanDFA — those would additionally
 	// need the prev-byte context states.
 	b = emitUnionEntryState(b, u, pInPtr, pInLen, pFrom, lState, lPos, lEnd)
+	if skip {
+		b = emitUnionSkipArm(b, u, lArmed)
+	}
 
 	// `from > len` yields the capability's "nothing" result. The loop guard
 	// alone does NOT deliver that: the entry-state
@@ -896,19 +902,7 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 	b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01) // gt_u → br $bulk_exit
 
 	if skip {
-		b = emitUnionSkip(b, u, lPos, lState, lEnd, lSkipMask, lStale, lChunk)
-		// The stride moved `lPos`, so the guard above no longer holds and the
-		// unrolled steps below would read past the input: the stride stops
-		// once `pos + 16 > end`, which leaves pos as late as end-1, while the
-		// four steps read pos..pos+3. Re-check, and let the byte-at-a-time
-		// tail loop finish what is left.
-		//
-		// The corpus cannot be relied on to catch this: its inputs are short
-		// enough that the stride's own 16-byte bound check refuses on the
-		// first attempt, so the stride never advances and the steps are never
-		// reached with a moved position.
-		b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
-		b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01) // gt_u → br $bulk_exit
+		b = emitUnionSkip(b, u, lPos, lState, lEnd, lSkipMask, lArmed, lChunk, lStale, 2)
 	}
 
 	for k := byte(0); k < unionUnroll; k++ {
@@ -1049,7 +1043,10 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 // rest of the call. Without it, input dense in the exit set (prose, for a
 // state whose exit set is [a-z]) pays the probe on every bulk iteration and
 // never strides — the alpha-run/word-run regression, in the union scan.
-func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lStale, lChunk byte) []byte {
+// bulkExitDepth is the br depth of the enclosing $bulk_exit block counted from
+// INSIDE this function's own `if armed` arm — 2 for both callers (if / loop
+// $bulk / block $bulk_exit).
+func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lArmed, lChunk, lStale, bulkExitDepth byte) []byte {
 	// Depths come from st, not from counting `end`s by eye: this body nests
 	// if / block / loop / if, and the inner branch target is two levels out,
 	// which is exactly the literal a hand count gets wrong (see
@@ -1057,17 +1054,18 @@ func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lStale,
 	// somewhere plausible).
 	for _, info := range u.skipStates {
 		st := &blockStack{}
-		// Enabled while the consecutive-failure counter is under the limit.
-		// The counter IS the disable flag: it only ever reaches the limit by
-		// counting up, a productive stride resets it to zero, and once
-		// disabled no further attempt runs to raise it further.
-		b = append(b, 0x20, lStale, 0x41)
-		b = utils.AppendSLEB128(b, unionSkipStaleLimit)
-		b = append(b, 0x49) // i32.lt_u
-		b = append(b, 0x20, lState, 0x41)
-		b = utils.AppendSLEB128(b, int32(info.state))
+		// The guard is ONE compare, and disabling makes it unsatisfiable.
+		//
+		// This started as `stale < limit && state == S` — two loads, two
+		// compares and an AND on every bulk iteration — and measured an 18-20%
+		// REGRESSION on setperf's prose no-match corpus, where the stride never
+		// skips and the guard is the whole cost. `lArmed` holds the state id
+		// while the stride is worth trying and -1 once it is not, which folds
+		// the enable test and the state test into the same compare and makes a
+		// disabled stride cost one load and one i32.eq per four bytes.
+		b = append(b, 0x20, lState)
+		b = append(b, 0x20, lArmed)
 		b = append(b, 0x46)       // i32.eq
-		b = append(b, 0x71)       // i32.and
 		b = append(b, 0x04, 0x40) // if
 		st.Push("enabled")
 
@@ -1094,24 +1092,49 @@ func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lStale,
 		b = append(b, 0x20, lPos)
 		b = append(b, 0x20, lMask, 0x68) // i32.ctz
 		b = append(b, 0x6A, 0x21, lPos)
-		// This attempt cleared no full chunk, so it bought nothing and paid
-		// the probe: count it toward the disable limit.
-		b = append(b, 0x20, lStale, 0x41, 0x01, 0x6A, 0x21, lStale)
+		// This attempt cleared no full chunk, so it bought nothing and paid the
+		// probe. Count it, and DISARM at the limit by parking an id no state
+		// can equal — after which the guard above is one load and one compare
+		// that is never true again.
+		//
+		// lStale is its OWN local. An earlier cut rode the counter in lMask to
+		// save one, which does not work and was caught by measurement rather
+		// than by a test: the shufti result is tee'd into lMask at the top of
+		// every attempt, so the "counter" was re-seeded from a bitmask each
+		// time and never accumulated — it disarmed on whatever the mask
+		// happened to be, not after a run of failures.
+		b = append(b, 0x20, lStale, 0x41, 0x01, 0x6A, 0x22, lStale)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, unionSkipStaleLimit)
+		b = append(b, 0x4E)                     // i32.ge_s
+		b = append(b, 0x04, 0x40)               // if
+		b = append(b, 0x41, 0x7F, 0x21, lArmed) // armed = -1
+		b = append(b, 0x0B)                     // end if
 		b = append(b, 0x0C, st.Depth("skip_done"))
 		b = append(b, 0x0B) // end if
 		st.Pop()
 
-		// Whole chunk self-loops: stride it, and the streak resets — a dense
-		// patch inside otherwise sparse input must not cost the rest of the
-		// call.
+		// Whole chunk self-loops: stride it. NOTE the streak is NOT reset — the
+		// disable is sticky, matching EmitPrefixScan's own dense switch, which
+		// persists across the caller's outer scan loop for the same reason: a
+		// counter that resets on any success never latches on mixed input, and
+		// mixed input is where the churn is worst.
 		b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos)
-		b = append(b, 0x41, 0x00, 0x21, lStale)
 		b = append(b, 0x0C, st.Depth("skip"))
 		b = append(b, 0x0B) // end loop $skip
 		st.Pop()
 		b = append(b, 0x0B) // end block $skip_done
 		st.Pop()
-		b = append(b, 0x0B) // end if enabled
+		// The stride moved lPos, so the caller's `pos + unionUnroll > end`
+		// guard no longer holds: the stride stops at `pos + 16 > end`, which
+		// leaves pos as late as end-1 while the unrolled steps read pos..pos+3.
+		// Re-check HERE, inside the armed arm, so a disarmed stride pays
+		// nothing for it — emitting it in the loop body instead cost every
+		// iteration either way, which measured as most of an 18-20% regression
+		// on prose. The byte-at-a-time tail finishes what is left.
+		b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
+		b = append(b, 0x20, lEnd, 0x4B, 0x0D, bulkExitDepth) // gt_u -> $bulk_exit
+		b = append(b, 0x0B)                                  // end if enabled
 		st.Pop()
 		if st.Open() != 0 {
 			panic("compile: emitUnionSkip left a block open")
@@ -1120,13 +1143,26 @@ func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lStale,
 	return b
 }
 
+// emitUnionSkipArm seeds the armed-state local. Emitted once, before the scan
+// loops: a WASM local starts at 0, and 0 is a real state id, so without this a
+// stride would fire on whichever state happens to be numbered 0.
+func emitUnionSkipArm(b []byte, u *unionScanDFA, lArmed byte) []byte {
+	if len(u.skipStates) == 0 {
+		return b
+	}
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(u.skipStates[0].state))
+	return append(b, 0x21, lArmed)
+}
+
 // unionSkipStaleLimit is how many CONSECUTIVE stride attempts may fail to
 // clear a full 16-byte chunk before the stride turns itself off for the rest
 // of the call. Mirrors EmitPrefixScan's denseSwitchThreshold, which bounds the
 // same failure on the same kind of input.
 const unionSkipStaleLimit = 8
 
-func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []byte {
+// lnm gates the SIMD stride only; see emitUnionScanBody's twin parameter.
+func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int, lnm bool) []byte {
 	if !u.isWide() {
 		panic("compile: wide union scan body emitted for a narrow union automaton")
 	}
@@ -1143,28 +1179,38 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 		pOutPtr = 3 // scan_all only
 	)
 	var b []byte
-	// lPos/lState are shared; the rest are scan_all's recording scratch.
-	localBase := byte(3)
+	// Allocated rather than hand-numbered (task 67): this body grew a
+	// conditional local group with the LNM stride, which is the shape that
+	// made hand-numbering fail before. The allocation order below reproduces
+	// the previous layout exactly — 3 x i32 for scan_any; 7 x i32 then 2 x i64
+	// for scan_all — which is what makes the conversion byte-identical.
+	nParams := uint32(3)
 	if mode == capScanAll {
-		localBase = 4
+		nParams = 4
 	}
+	a := newLocalAlloc(nParams)
 	// lPos is an absolute INPUT POINTER and lEnd is pInPtr + len, so the
 	// per-byte load needs no address arithmetic (see emitUnionTransition).
-	lPos, lState := localBase, localBase+1
-	// scan_all's recording scratch; scan_any declares only the cursor pair and
-	// the end bound, since it keeps nothing between bytes at all.
-	// lEnd is the LAST i32 of each shape, so the i64 pair that follows it
-	// shifts up by one against the pre-pointer layout.
-	lCount, lAddr := localBase+2, localBase+3
-	lOld32, lNew32 := localBase+4, localBase+5
-	lEnd := localBase + 2
-	lOld64, lNew64 := localBase+7, localBase+8
+	lPos, lState := a.I32(), a.I32()
+	// scan_all's recording scratch; scan_any allocates only the cursor pair
+	// and the end bound, since it keeps nothing between bytes at all.
+	var lCount, lAddr, lOld32, lNew32, lEnd, lOld64, lNew64 byte
 	if mode == capScanAll {
-		lEnd = localBase + 6
-		b = append(b, 0x02, 0x07, 0x7F, 0x02, 0x7E) // 7 x i32, 2 x i64
+		lCount, lAddr = a.I32(), a.I32()
+		lOld32, lNew32 = a.I32(), a.I32()
+		lEnd = a.I32()
+		lOld64, lNew64 = a.I64(), a.I64()
 	} else {
-		b = append(b, 0x01, 0x03, 0x7F) // 3 x i32
+		lEnd = a.I32()
 	}
+	// The LNM stride's locals, allocated only when it is emitted.
+	var lSkipMask, lArmed, lStale, lChunk byte
+	skip := lnm && len(u.skipStates) > 0
+	if skip {
+		lSkipMask, lArmed, lStale = a.I32(), a.I32(), a.I32()
+		lChunk = a.V128()
+	}
+	b = a.EmitDecls(b)
 
 	// repr[state], left on the stack.
 	loadRepr := func(b []byte, off int32) []byte {
@@ -1295,6 +1341,9 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	// without that context. Identical to the narrow body, and getting it wrong
 	// is silent.
 	b = emitUnionEntryState(b, u, pInPtr, pInLen, pFrom, lState, lPos, lEnd)
+	if skip {
+		b = emitUnionSkipArm(b, u, lArmed)
+	}
 
 	// `from > len` yields the capability's "nothing" answer. gt_u, not
 	// ge_u: `from == len` is a real position, and a pattern matching empty
@@ -1322,6 +1371,11 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int) []
 	b = append(b, 0x03, 0x40) // loop $bulk
 	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
 	b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01) // cur+4 > end (u) -> $bulk_exit
+
+	if skip {
+		b = emitUnionSkip(b, u, lPos, lState, lEnd, lSkipMask, lArmed, lChunk, lStale, 2)
+	}
+
 	for k := byte(0); k < unionUnroll; k++ {
 		b = step(b, k)
 	}
@@ -1677,6 +1731,7 @@ func emitUnionAliveMask(b []byte, u *unionScanDFA, lPos, lState, aliveLocal, fro
 	// pos + unionUnroll > end → finish in the tail.
 	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
 	b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01) // gt_u → br $bulk_exit
+
 	for k := byte(0); k < unionUnroll; k++ {
 		b = emitUnionTransition(b, u, lPos, lState, k, tableMemIdx)
 		b = emitAlive(b, 2) // 2 = $done, past $bulk and $bulk_exit

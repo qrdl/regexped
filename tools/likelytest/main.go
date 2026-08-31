@@ -102,6 +102,22 @@ type testCase struct {
 	// invisible to a `find`-only harness, which is what this field fixes.
 	// Values: setCapFind, setCapScanAny, setCapScanAll.
 	setCap string
+
+	// forceScalarFrontend pins the set's literal frontend to scalar, which is
+	// the ONLY way these cases can reach the Shufti frontend: Shufti is
+	// selected out of the scalar branch, and 21 short literals with 21
+	// distinct first bytes now satisfy chooseLiteralFrontend's Teddy branch
+	// instead. Without it the two set-shufti-* cases silently measure Teddy
+	// and print "identical WASM" in every mode — which is what they had been
+	// doing.
+	//
+	// The measured BODY is the real Shufti emission either way; what forcing
+	// misrepresents is bucket count (21, where a set that reaches Shufti
+	// naturally has hundreds), which inflates the prefilter's share of total
+	// cost. That cancels for a 3-mode comparison, since every arm carries the
+	// same buckets — but it makes the Δ% an UPPER BOUND, not a production
+	// figure. See TODO task 73.
+	forceScalarFrontend bool
 }
 
 // The capabilities a modeSet case can drive. Kept as the export names
@@ -292,26 +308,26 @@ var tests = []testCase{
 		// candidate, SIMD-skips the entire 50 KB in 16-byte chunks. Match
 		// input has letter density too high for SIMD to help much.
 		//
-		// ⚠ STALE AS OF 2026-08-31: this case and set-shufti-dense-harm below
-		// both compile to **Teddy**, not Shufti, and print "identical WASM —
-		// same as neutral" in all three modes — so neither exercises the H.3
-		// mechanism its name and notes claim. The comment above describes the
-		// selection rules as they were before the Teddy crossover rework: 21
-		// literals of length 3 with 21 distinct first bytes now satisfy
-		// chooseLiteralFrontend's Teddy branch (<=64 literals, minLen >= 2,
-		// distinctFirst >= 4), and Shufti is reachable ONLY from the scalar
-		// branch — i.e. only after Aho-Corasick declines over its 512 KB
-		// budget, which takes hundreds of long literals.
+		// SELECTION IS FORCED (forceScalarFrontend, task 73). Between this
+		// case being written and 2026-08-31 it drifted onto **Teddy** and
+		// printed "identical WASM" in all three modes, measuring nothing
+		// hint-related: 21 literals of length 3 with 21 distinct first bytes
+		// satisfy chooseLiteralFrontend's Teddy branch (<=64 literals,
+		// minLen >= 2, distinctFirst >= 4), and Shufti is reachable ONLY out
+		// of the scalar branch — in production only after Aho-Corasick
+		// declines over its 512 KB budget, which takes hundreds of long
+		// literals.
 		//
-		// Left in place rather than silently repointed: choosing the
-		// replacement shape is a judgement call about what these two cases
-		// should measure, not a mechanical fix. Same class as the
-		// sampleNeedles incidents in tools/setperf — a case whose label and
-		// its subject drifted apart. tools/fuzz's
-		// TestSetShuftiFrontendAgainstOracle is the shape that does reach the
-		// Shufti frontend, and it asserts the frontend so it cannot drift the
-		// same way.
-		name: "set-shufti-lnm",
+		// Pinning the frontend to scalar restores the intended A/B: neutral
+		// stays scalar (these literals' rarity sum is 42 against the 40
+		// threshold) and only prefer-no-match flips to Shufti. Verified by
+		// direct compile before this was written.
+		//
+		// Read the Δ% as an UPPER BOUND — see forceScalarFrontend's comment
+		// for why 21 buckets inflate the prefilter's share. Absolute fuel
+		// here models no real workload.
+		name:                "set-shufti-lnm",
+		forceScalarFrontend: true,
 		setPatterns: []string{
 			`A1:[^\n]+`, `B1:[^\n]+`, `C1:[^\n]+`, `D1:[^\n]+`, `E1:[^\n]+`,
 			`F1:[^\n]+`, `G1:[^\n]+`, `H1:[^\n]+`, `I1:[^\n]+`, `J1:[^\n]+`,
@@ -340,7 +356,17 @@ var tests = []testCase{
 		// attempt — forcing the scalar membership-check tail on literally
 		// every position, on top of the SIMD overhead itself. None of the
 		// letters are ever followed by "1:" so nothing matches.
-		name: "set-shufti-dense-harm",
+		// Selection forced to scalar for the same reason as its sibling above
+		// (task 73). This case is the more valuable of the two: its no-match
+		// input is solid A-U letters with no gaps, so every SIMD chunk's
+		// bitmask is all-1s, ctz always returns 0, the skip loop can never
+		// advance more than one position, and the scalar membership-check
+		// tail runs on literally EVERY position. That tail is the
+		// per-first-byte compare chain whose cost is the reason task 70's
+		// Shufti band is capped at 128 rather than 239 — so this is the
+		// instrument task 70's step B measures with.
+		name:                "set-shufti-dense-harm",
+		forceScalarFrontend: true,
 		setPatterns: []string{
 			`A1:[^\n]+`, `B1:[^\n]+`, `C1:[^\n]+`, `D1:[^\n]+`, `E1:[^\n]+`,
 			`F1:[^\n]+`, `G1:[^\n]+`, `H1:[^\n]+`, `I1:[^\n]+`, `J1:[^\n]+`,
@@ -1462,6 +1488,13 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		Sets:    []config.SetConfig{sc},
 	}
 	// Output empty → standalone.
+	if tc.forceScalarFrontend {
+		// CompileFileOpts reads only ACBudgetBytes/ForceFrontend off the
+		// override, so an otherwise-zero value is CompileFile plus the pin.
+		opts := compile.CompileSetOptions{}.WithForcedFrontend(compile.SetFrontendScalar)
+		wasm, _, _, err := compile.CompileFileOpts(cfg, "", opts)
+		return wasm, err
+	}
 	wasm, _, err := compile.CompileFile(cfg, "")
 	return wasm, err
 }

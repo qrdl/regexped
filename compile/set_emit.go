@@ -2156,7 +2156,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					// capability: above 64 ids there is no u64 accumulator to
 					// answer with.
 					if cs.unionScan.isWide() {
-						body = emitUnionScanWideBody(cs.unionScan, c.kind, tableMemIdx)
+						body = emitUnionScanWideBody(cs.unionScan, c.kind, tableMemIdx, cs.unionSkipLNM)
 					} else {
 						body = emitUnionScanBody(cs.unionScan, c.kind, cs.fullIDMask(), tableMemIdx, cs.unionSkipLNM)
 					}
@@ -2182,7 +2182,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs.phase1Only = false
 			cs_bytes = append(cs_bytes, p1...)
 			if cs.phase2Union.isWide() {
-				cs_bytes = append(cs_bytes, emitUnionScanWideBody(cs.phase2Union, kind, tableMemIdx)...)
+				cs_bytes = append(cs_bytes, emitUnionScanWideBody(cs.phase2Union, kind, tableMemIdx, cs.unionSkipLNM)...)
 			} else {
 				cs_bytes = append(cs_bytes, emitUnionScanBody(cs.phase2Union, kind, cs.phase2Mask(), tableMemIdx, cs.unionSkipLNM)...)
 			}

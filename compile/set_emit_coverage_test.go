@@ -1067,7 +1067,14 @@ func TestSetEmitUnionScanTableLayouts(t *testing.T) {
 			// Past 256 states, so ids are u16 and every entry is loaded two
 			// bytes wide; five byte classes, so the row length is 10 and the
 			// index needs a multiply.
-			name: "u16-and-non-power-of-two-row", patterns: []string{`[ab].{6}[cd]|[0-9]`},
+			//
+			// The repeat is {7}, not {6}: task 72 made buildUnionScanDFA
+			// MINIMIZE its automaton, and {6} drops from >256 states to 200 —
+			// u8, which is not the layout this case exists to cover. {7}
+			// minimizes to 496 and still exercises it. Any future change that
+			// shrinks the automaton further will trip this same assertion,
+			// which is the assertion working.
+			name: "u16-and-non-power-of-two-row", patterns: []string{`[ab].{7}[cd]|[0-9]`},
 			wantWidth: 2, wantCompressed: true, wantShift: false,
 		},
 	} {

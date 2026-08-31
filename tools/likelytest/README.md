@@ -99,8 +99,26 @@ Cases fall into a few families (see the comment above each entry in
   per-match/per-attempt cost (not just scan-to-first-match cost) shows up in
   the total. These are where most of the `LikelyMatch` wins (and the
   regressions documented below) live.
-- **Set cases** (`set-shufti-*`, `dense-set-*`) — `CompileFile`/set
-  composition frontend (AC/Teddy/Shufti/scalar selection, binPack merging).
+- **Set cases** (`set-shufti-*`, `dense-set-*`, `set-dense-*`, `set-scan-*`,
+  `set-wide-union-*`) — `CompileFile`/set composition: frontend selection
+  (AC/Teddy/Shufti/packed-pair/scalar), binPack merging, bucket suffix
+  bodies, and the start-anywhere union automaton. A `modeSet` case declares
+  exactly ONE capability, because the compiler emits only the machinery the
+  declared capabilities need — a case declaring two would compile a literal
+  frontend it is not driving and report the union of both in the size column.
+  The five added 2026-08-31 for TODO tasks 68-70:
+
+  | Case | Capability | Targets |
+  |---|---|---|
+  | `set-dense-quoted` | `find` | task 68 — the Shufti self-loop skip inside a bucket's SUFFIX body, 20-50-byte quoted bodies (the win case) |
+  | `set-dense-quoted-short` | `find` | task 68 — same set, 3-6-byte bodies: the hysteresis guard that decided no minimum-length gate was needed |
+  | `set-scan-classchain-sparse` | `scan_any` | task 69 — the union automaton's SIMD stride. Literal-less patterns, since `find` never enters the union scan except through a preflight |
+  | `set-scan-all-classchain-sparse` | `scan_all` | task 69 — the twin; both scan capabilities do identical per-byte work, so a union-scan change must move both or neither |
+  | `set-wide-union-shufti` | `find` | task 70 — the Shufti frontend at a first-byte union WIDER than 64. Reaching it needs ~80 long literals so Aho-Corasick exceeds its 512 KB budget, which is the only route from a literal set to the scalar branch |
+
+  The scan pair is reachable at all only because the set mode gained a
+  capability selector in the same change; before that it drove `find`
+  exclusively, so the union automaton could not be measured from here.
 - **Harm/hysteresis guard cases** (anything with `-short` or `-dense-harm`
   in the name) — deliberately adversarial inputs (short runs, dense
   no-match data) that are *expected* to show a small, bounded regression
@@ -127,7 +145,26 @@ finding, not a defect.
 |---|---|---|---|
 | `dense-quoted-short` | LM (match) | +3% | LM-3 non-mid Shufti self-loop, short-run hysteresis guard |
 | `dense-printable-short` | LM (match) | +26% | LM-5 wide-class-band self-loop, at-minimum-length guard |
-| `set-shufti-dense-harm` | LNM (match & no-match) | +5% / +5% | task 28: LNM forcing Shufti on a set frontend when no-match data is dense in the tracked first-byte set |
+| ~~`set-shufti-dense-harm`~~ | LNM (match & no-match) | ~~+5% / +5%~~ → **-67% / -62%** | **NO LONGER A GUARD CASE — re-measured 2026-08-31.** See below. |
+
+**`set-shufti-dense-harm` stopped demonstrating harm.** The case had drifted
+onto the Teddy frontend and was measuring nothing; task 73 restored it by
+pinning selection to scalar, and it now shows `prefer-no-match` **winning**
+by 62-67% on the very input built to make it lose. The documented +5%/+5%
+is not reproducible on this tree.
+
+Two things follow, and neither is settled here:
+
+- The suite currently has **no case demonstrating H.3's dense-data cost**,
+  so task 28's adaptive switch has no standing guard. Whether that is
+  because the switch now works well enough that the cost is gone, or because
+  this input no longer adversarially violates the assumption, is unmeasured.
+- Its neutral arm is a **forced** scalar frontend. 21 short literals would
+  never be scalar in production — they would be Teddy — so the -62% is the
+  honest size of the *H.3 scalar-vs-Shufti decision* for this byte set, and
+  says nothing about how these 21 patterns would actually perform. H.3 only
+  ever fires for sets that are already on scalar, so measuring it this way is
+  legitimate; reading the number as a property of the pattern set is not.
 
 ### Family 2 — the task-25 "dense-switch" residual
 
@@ -182,7 +219,19 @@ no-match-input columns at once:
 | LNM | `bt-action5-target` | -58% | -58% | Same Action-5 mechanism, BT-routed (Gap G). |
 | LM | `minlen-quantifier-skip` | -82% | -82% | LM-4 bare self-loop bulk-skip — `[a-z]{50,}[0-9]` has no literal prefix, so *both* inputs spend nearly their whole scan inside the bulk-skip-eligible self-loop. |
 | LNM | `lit-anchor-false-positive-literal` | -1% | -64% | Task 22 SIMD backward-verify; the match-side gain is real but negligible in magnitude. |
-| LNM | `set-shufti-lnm` | -97% | -98% | H.3 forced Shufti on the whole 21-pattern set frontend. |
+| LNM | `set-shufti-lnm` | -97%* | -98%* | H.3 forced Shufti on the whole 21-pattern set frontend. |
+
+> **RE-MEASURED 2026-08-31 after task 73; the starred figures above are the
+> OLD ones.** Current: `set-shufti-lnm` -97% match / -70% no-match. The two
+> cases had drifted off the Shufti frontend entirely and were measuring
+> Teddy: 21
+> literals of length 3 with 21 distinct first bytes now satisfy
+> `chooseLiteralFrontend`'s Teddy branch, and both cases print "identical
+> WASM — same as neutral" in all three modes. Task 73 pinned selection to
+> scalar, which is the only way a 21-literal set can reach Shufti, so both
+> cases measure the H.3 decision again — but their Δ% is an upper bound
+> against an artificial baseline. See the `set-shufti-dense-harm` note under
+> *Known regression cases*.
 
 ### Should any of these be promoted to default (neutral)?
 
@@ -197,10 +246,15 @@ which is precisely what a default-on promotion cannot safely assume.
   under the same mode (see Family 2 above). `shuftiBeatsScalar`'s density
   heuristic only sees the abstract byte class (`[a-zA-Z]`), never the
   caller's actual data, so neutral mode has no way to pick correctly here.
-- `set-shufti-lnm` (sparse no-match data, -97%/-98%) vs.
-  `set-shufti-dense-harm` — the *same 21 patterns*, dense no-match data —
-  loses +5%/+5% (Family 1 above). This is the cleanest proof in the suite:
-  identical pattern set, opposite result, driven entirely by data density.
+- ~~`set-shufti-lnm` vs. `set-shufti-dense-harm` — the *same 21 patterns*,
+  opposite result, driven entirely by data density.~~ **This argument no
+  longer holds (2026-08-31).** It was the suite's cleanest same-pattern
+  win-versus-loss pair, and after task 73 restored both cases to the Shufti
+  frontend they BOTH win: -97%/-70% on sparse data, -67%/-62% on dense. The
+  data-density reversal this bullet rested on is not currently reproducible
+  for this pattern set. `alpha-run-impossible-bytes` vs `alpha-run` above is
+  now the only same-pattern reversal in the suite, so the conclusion below
+  rests on one pair rather than two.
 - `minlen-quantifier-skip` (-82%/-82%) qualifies for the same LM-4 gate
   (min length ≥ 8) as `alpha-run`/`word-run`, which show a persistent "LM
   contract cost" residual (+22%/+24% match fuel, Family 2 above) under the
