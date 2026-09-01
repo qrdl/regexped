@@ -638,6 +638,23 @@ type RegexEntry struct {
 	Name    string `yaml:"name"` // optional; used by sets: for pattern selection
 	Pattern string `yaml:"pattern"`
 
+	// ByteMode declares this pattern BYTE-oriented, which is what regexped
+	// has always been: `.` consumes one byte, classes are byte classes, `\b`
+	// is ASCII. Setting it makes runes 0x80-0xFF legal and mean exactly that
+	// byte, so `[a\x80]+` and `[\xc0-\xdf]` compile and match raw bytes.
+	//
+	// Without it (the default), a rune above 127 that the pattern actually
+	// WROTE is a compile error rather than a silent wrong answer — the engine
+	// would truncate it to a byte and diverge from Go on any non-ASCII input.
+	// Runes above 0xFF are rejected in both modes: no byte can hold one.
+	//
+	// It is a per-pattern property because it is a statement about the
+	// pattern's own text, not about the build. Rust's regex crate spells the
+	// same distinction `(?-u)` / `regex::bytes`; an inline flag was rejected
+	// here because Go's parser refuses `(?-u)` outright, so it would have to
+	// be stripped from the source before syntax.Parse.
+	ByteMode bool `yaml:"byte_mode"`
+
 	// Optional function names — only those set are compiled and stubbed.
 	MatchFunc  string `yaml:"match_func"`  // anchored match → the end position, or none
 	FindFunc   string `yaml:"find_func"`   // non-anchored find → an iterator of (start, end)

@@ -177,10 +177,13 @@ func TestSelectEngineNonCapturePaths(t *testing.T) {
 		}
 	})
 	// Mixed ASCII+non-ASCII char class → HasUnicode=true in analysePattern → complexity="Unicode".
-	// [a-é] has hasASCII=true so needsUnicodeSupport returns false, but the last rune (0xe9) > 127
-	// sets analysis.HasUnicode=true.
+	// Compiled in BYTE MODE since 2026-09-01: the default mode now rejects a
+	// rune the pattern wrote above 127 (é is 0xE9), which is the FABLE B29
+	// leak this test used to depend on. Byte mode keeps the pattern legal —
+	// é means the single byte 0xE9 — so analysis.HasUnicode is still set and
+	// the selector path under test is unchanged.
 	t.Run("unicode", func(t *testing.T) {
-		got, err := SelectEngine("[a-é]+", CompileOptions{})
+		got, err := SelectEngine("[a-é]+", CompileOptions{ByteMode: true})
 		if err != nil {
 			t.Fatalf("SelectEngine: %v", err)
 		}
@@ -208,21 +211,29 @@ func TestIsAlternationDeterministicPaths(t *testing.T) {
 		pattern string
 		want    EngineType
 		note    string
+		opts    CompileOptions
 	}{
 		// Each branch in its own capture prevents prefix factoring, so both start with 'c'
 		// and getFirstRuneSet returns overlapping sets → not deterministic → BT.
-		{"((cat)|(car))", EngineBacktrack, "overlapping first rune"},
+		{"((cat)|(car))", EngineBacktrack, "overlapping first rune", CompileOptions{}},
 		// Left branch is empty capture (epsilon), right is rune 'a' → disjoint → TDFA-eligible.
-		{"(()|a)", EngineTDFA, "one epsilon branch"},
+		{"(()|a)", EngineTDFA, "one epsilon branch", CompileOptions{}},
 		// Both branches epsilon-accepting: () and (a?) both reach Match without consuming
 		// a byte → ambiguous → BT.
-		{"(()|(?:a?))", EngineBacktrack, "both epsilon branches"},
+		{"(()|(?:a?))", EngineBacktrack, "both epsilon branches", CompileOptions{}},
 		// Large char class >256 chars in left branch → getFirstRuneSet returns empty set
 		// → treated as undetermined → not deterministic → BT.
-		{"(([\x00-Ā])|(b))", EngineBacktrack, "large char class first rune set"},
+		//
+		// Ā is U+0100, so no mode can represent it and byte_mode would not
+		// help — the class has to be >256 codepoints for getFirstRuneSet to
+		// give up, which is the whole point of the case. `Unicode: true` is
+		// the compile-anyway bypass, used here to reach the SELECTOR with a
+		// pattern the gate would otherwise refuse.
+		{"(([\x00-Ā])|(b))", EngineBacktrack, "large char class first rune set",
+			CompileOptions{Unicode: true}},
 	}
 	for _, c := range cases {
-		got, err := SelectEngine(c.pattern, CompileOptions{})
+		got, err := SelectEngine(c.pattern, c.opts)
 		if err != nil {
 			t.Errorf("SelectEngine(%q) [%s]: %v", c.pattern, c.note, err)
 			continue

@@ -34,6 +34,10 @@ type singleCase struct {
 	hints               []string
 	maxDFAStates        int
 	maxTDFARegs         int
+	// byteMode compiles the pattern as byte-oriented (config's `byte_mode`).
+	// Needed by any case whose pattern names a byte above 127 — the default
+	// mode rejects those since 2026-09-01.
+	byteMode bool
 }
 
 func singleCases() []singleCase {
@@ -80,7 +84,10 @@ func singleCases() []singleCase {
 		},
 		{
 			name: "scalar-prologue", selects: "the scalar fallback prologue: too many first bytes to prefilter",
-			pattern: `[\x00-\xff]x`, find: true,
+			// Genuinely byte-oriented: the class IS every byte, which is what
+			// leaves the prologue with nothing to prefilter on. byte_mode is
+			// the declaration that `\xff` means the byte and not U+00FF.
+			pattern: `[\x00-\xff]x`, find: true, byteMode: true,
 		},
 		{
 			name: "lit-anchor", selects: "lit_anchor.go — SIMD literal scan plus a backward DFA for the start",
@@ -447,7 +454,7 @@ func singleCases() []singleCase {
 }
 
 func (c singleCase) build() config.BuildConfig {
-	entry := config.RegexEntry{Name: "p", Pattern: c.pattern, Hints: c.hints}
+	entry := config.RegexEntry{Name: "p", Pattern: c.pattern, Hints: c.hints, ByteMode: c.byteMode}
 	if c.match {
 		entry.MatchFunc = "p_match"
 	}
@@ -526,6 +533,7 @@ func TestSingleMatrixEngineSelection(t *testing.T) {
 			eng, err := SelectEngine(c.pattern, CompileOptions{
 				MaxDFAStates: c.maxDFAStates,
 				MaxTDFARegs:  c.maxTDFARegs,
+				ByteMode:     c.byteMode,
 			})
 			if err != nil {
 				t.Fatalf("SelectEngine(%q): %v", c.pattern, err)

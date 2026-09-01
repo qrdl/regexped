@@ -117,7 +117,10 @@ func TestByteIdenticalPathsAreDistinct(t *testing.T) {
 	for _, name := range byteIdentFixtures(t) {
 		cfg := loadByteIdentConfig(t, name)
 		for _, re := range cfg.Regexps {
-			eng, err := SelectEngine(re.Pattern, CompileOptions{})
+			// The entry's own mode has to be passed: a byte_mode fixture names
+			// runes the default mode rejects, so asking the selector about it
+			// neutrally is asking about a pattern that does not compile.
+			eng, err := SelectEngine(re.Pattern, CompileOptions{ByteMode: re.ByteMode})
 			if err != nil {
 				t.Fatalf("%s: SelectEngine: %v", name, err)
 			}

@@ -358,6 +358,36 @@ When a config entry sets both `match_func`/`find_func` AND `groups_func`, a sing
 
 Regexped implements **RE2 syntax with Perl/RE2 semantics** (leftmost-first match, non-greedy quantifiers prefer shorter matches). POSIX semantics (leftmost-longest) are not supported.
 
+### Bytes, not codepoints
+
+Every engine here operates on **bytes**. `.` consumes one byte, a character
+class is a byte class, `\b` is ASCII, and a table row is indexed by a byte
+value. There is no UTF-8 decoding step anywhere in the pipeline.
+
+This is a deliberate design point rather than a missing feature, and it has two
+visible consequences.
+
+**A pattern naming a rune above U+007F is a compile error** unless the entry
+sets [`byte_mode: true`](cli.md#byte_mode--matching-raw-bytes-above-127), which
+declares runes `0x80`-`0xFF` to mean those bytes. Runes above `U+00FF` are
+rejected in both modes. Before this gate existed, such patterns compiled and
+the automaton silently truncated the rune to a byte — `[a-zé]+` over `"zzé"`
+returned `[0,2)` where Go returns `[0,4)`.
+
+**Two things are still byte-semantic by declaration**, because no gate can
+separate them from ordinary ASCII patterns:
+
+- `.` and negated classes match one byte, so `a.c` does not match `"aéc"`
+  (Go, decoding UTF-8, does).
+- Case folding stays inside the byte range. `(?i)k` does not match a Kelvin
+  sign and `(?i:[a-z]+)` does not match a long s, because Go's parser
+  manufactures those runes from the ASCII the pattern actually wrote, and
+  rejecting them would reject `(?i)` over any letter class.
+
+If your input is UTF-8 and your pattern is ASCII, none of this is visible: an
+ASCII byte never appears inside a multi-byte UTF-8 sequence, so a byte-oriented
+match over UTF-8 text finds exactly what a codepoint-oriented one would.
+
 ---
 
 ## RE2 Test Coverage

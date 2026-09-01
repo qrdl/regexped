@@ -31,6 +31,7 @@ regexps:
     groups_func:       "url_groups"        # match iterator; each item is that match's capture groups
 
     hints: [prefer-match, batch-find]   # optional; see "hints:" below
+    byte_mode: false           # optional; see "byte_mode:" below
 
 sets:
   - name: "my_set"             # unique set name
@@ -135,6 +136,53 @@ Setting `groups_func` triggers capture-tracking compilation:
 Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
+
+### `byte_mode:` — matching raw bytes above 127
+
+Regexped is a **byte** engine. `.` consumes one byte, classes are byte classes,
+and `\b` is ASCII. A rune above U+007F has no byte to be, so a pattern naming
+one is rejected:
+
+```
+pattern contains the non-ASCII rune U+00E9; regexped matches bytes,
+so set byte_mode: true to match it as the single byte 0xE9, or remove it
+```
+
+Setting `byte_mode: true` on a `regexps:` entry declares the pattern
+byte-oriented: runes `0x80`-`0xFF` become legal and mean **exactly that byte**.
+
+```yaml
+regexps:
+  - name: utf8_lead
+    pattern: '[\xc0-\xdf]'        # a UTF-8 two-byte lead — needs byte_mode
+    byte_mode: true
+    find_func: find_lead
+```
+
+Runes above `U+00FF` are rejected in **both** modes — no byte holds one — with
+a different message that does not suggest the flag:
+
+```
+pattern contains the rune U+03B1, above U+00FF; regexped matches bytes
+and has no Unicode support
+```
+
+The flag is per pattern because it is a statement about that pattern's text,
+and it applies to set members as well as to `_func` patterns. Rust's regex
+crate spells the same distinction `(?-u)` / `regex::bytes`; an inline flag was
+not chosen here because Go's parser rejects `(?-u)` outright.
+
+**What is NOT rejected**, in either mode:
+
+- **`.` and negated classes.** `[^,]` names every rune there is, and consumes
+  one byte. This is documented byte semantics, not an oversight.
+- **Case-fold artifacts of ASCII.** Go's parser expands `(?i)` over a class
+  eagerly, so `(?i:[a-z])` arrives carrying U+017F (long s) and U+212A (Kelvin
+  sign) — runes you did not write, manufactured from the `s` and `k` you did.
+  `(?i)` therefore keeps working over letter classes, `\w` and ASCII literals.
+  The consequence is that `(?i)k` does not match a Kelvin sign and
+  `(?i:[a-z]+)` does not match a long s: case folding is ASCII-only in
+  practice, and folding within `0x00`-`0xFF` in byte mode.
 
 ### `hints:` — LikelyMode and batch-find compile hints
 

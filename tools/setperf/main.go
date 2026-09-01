@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -549,6 +550,29 @@ func buildMatrix() []setCase {
 		out = append(out,
 			setCase{fmt.Sprintf("classchain-%d", n), pats, corpusNoMatch(), "no-match 100KB"},
 			setCase{fmt.Sprintf("classchain-%d", n), pats, corpusDense(pats), "dense 100KB"},
+			// The third corpus, added 2026-09-01, and the reason is that the
+			// board could not see `prefer-no-match` at all.
+			//
+			// classchain is the only literal-less family, so it is the only one
+			// reaching the union scan — and `emitUnionSkip`, the SIMD stride
+			// that hint turns on, pays only over a stretch where the automaton
+			// is sitting in a self-loop. For these patterns the exit set is
+			// [a-z], and BOTH corpora above are dense in it: corpusNoMatch is
+			// lowercase prose and corpusDense's filler is the word "filler".
+			// So the stride probed, never skipped, and every hinted row on the
+			// board reported its guard cost (+5-6%) with no row anywhere able
+			// to report the win. Measured against likelytest's own sparse
+			// input the same code is -74%.
+			//
+			// This corpus is that missing shape: no lowercase letter at all,
+			// so the automaton stays in its entry self-loop for the whole
+			// 100 KB. It is a no-match corpus like the first, with deliberately
+			// different byte statistics — which is exactly what the classchain
+			// and sharedsuffix incidents teach has to be VERIFIED rather than
+			// asserted in a comment, hence assertExitSparse below.
+			setCase{fmt.Sprintf("classchain-%d", n), pats,
+				assertExitSparse(pats, corpusExitSparse(), fmt.Sprintf("classchain-%d", n)),
+				"no-match exit-sparse 100KB"},
 		)
 	}
 	// A set with no mandatory literal at all: every position is visited, so
@@ -599,6 +623,68 @@ func corpusNoMatch() string {
 		b.WriteString(line)
 	}
 	return b.String()
+}
+
+// corpusExitSparse is 100KB of filler holding NO lowercase letter at all.
+//
+// For a class-chain set whose patterns all begin with [a-z], that makes it
+// both a no-match corpus AND one where the union automaton never leaves its
+// entry state's self-loop — the input shape `prefer-no-match`'s SIMD stride
+// exists for. corpusNoMatch is a no-match corpus for these patterns too, but
+// it is lowercase prose, so the automaton leaves the self-loop on nearly every
+// byte and the stride has nothing to stride over.
+//
+// Both promises are checked at build time by assertExitSparse; neither is
+// this comment's to keep.
+func corpusExitSparse() string {
+	var b strings.Builder
+	line := "0123456789 ,.;:!?()[]{}<>/@#$%^&*-_=+|~ 9876543210 THE QUICK BROWN FOX 42 "
+	for b.Len() < 100*1024 {
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// assertExitSparse hard-errors unless corpus really is what corpusExitSparse
+// claims: matched by none of pats, and containing almost no byte that can
+// begin one of them.
+//
+// It exists because three separate incidents in this file
+// — classchain, sharedsuffix and diverse — were all one shape: a corpus that
+// silently stopped being what its label said, so a row went on printing
+// numbers for a workload nobody was running. sampleNeedles' default arm is the
+// same guard for the matching corpora; this is it for a no-match one. A
+// benchmark measuring the wrong thing quietly is worse than one that refuses
+// to run.
+func assertExitSparse(pats []string, corpus, family string) string {
+	for _, p := range pats {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "assertExitSparse %s: pattern %q rejected by Go regexp: %v\n", family, p, err)
+			os.Exit(1)
+		}
+		if loc := re.FindStringIndex(corpus); loc != nil {
+			fmt.Fprintf(os.Stderr, "assertExitSparse %s: %q matches the exit-sparse corpus at %d — it is not a no-match corpus\n",
+				family, p, loc[0])
+			os.Exit(1)
+		}
+	}
+	// The exit set for these patterns is [a-z]. Anything above a token
+	// fraction and the automaton leaves its self-loop often enough that the
+	// stride has nothing to measure — which is the state corpusNoMatch is
+	// already in, and would make this row a duplicate under a new label.
+	lower := 0
+	for i := 0; i < len(corpus); i++ {
+		if corpus[i] >= 'a' && corpus[i] <= 'z' {
+			lower++
+		}
+	}
+	if lower*100 > len(corpus) {
+		fmt.Fprintf(os.Stderr, "assertExitSparse %s: corpus is %.1f%% lowercase — not sparse in the exit set\n",
+			family, float64(lower)*100/float64(len(corpus)))
+		os.Exit(1)
+	}
+	return corpus
 }
 
 // corpusSparse plants a handful of matches in otherwise inert filler.

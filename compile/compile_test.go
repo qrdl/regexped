@@ -1077,17 +1077,46 @@ func TestNeedsUnicodeSupport(t *testing.T) {
 		return prog
 	}
 
-	// Non-ASCII only (\p{Greek}) → hasNonASCII && !hasASCII → true.
+	// Non-ASCII only → rejected.
 	if !needsUnicodeSupport(mkProg(t, `\p{Greek}`)) {
 		t.Error("needsUnicodeSupport(\\p{Greek}) = false, want true")
 	}
-	// Pure ASCII → false.
+	// Pure ASCII → accepted.
 	if needsUnicodeSupport(mkProg(t, `[a-z]`)) {
 		t.Error("needsUnicodeSupport([a-z]) = true, want false")
 	}
-	// Mixed ASCII+non-ASCII char class → both flags set → false.
-	if needsUnicodeSupport(mkProg(t, `[a-é]`)) {
-		t.Error("needsUnicodeSupport([a-é]) = true, want false")
+	// MIXED ASCII + non-ASCII → rejected. This case asserted `false` until
+	// 2026-09-01, which is precisely the leak FABLE B29 verified: `[a-zé]+`
+	// on "zzé" returned [0,2) where Go returns [0,4), because the engine
+	// truncated é to a byte and the old `hasNonASCII && !hasASCII` gate let
+	// the pattern through. Such a pattern now needs byte_mode.
+	if !needsUnicodeSupport(mkProg(t, `[a-é]`)) {
+		t.Error("needsUnicodeSupport([a-é]) = false, want true")
+	}
+	// The fold artifact, which must NOT be rejected: Go's parser expands
+	// `(?i)` over a class eagerly, so this arrives carrying U+017F and
+	// U+212A — runes the pattern never wrote, manufactured from its own
+	// ASCII `s` and `k`. Rejecting it would reject `(?i)` over any letter
+	// class.
+	if needsUnicodeSupport(mkProg(t, `(?i:[a-z])`)) {
+		t.Error("needsUnicodeSupport((?i:[a-z])) = true, want false")
+	}
+	// The same phenomenon reached through inst.Arg's FoldCase rather than an
+	// expanded class.
+	if needsUnicodeSupport(mkProg(t, `(?i)k`)) {
+		t.Error("needsUnicodeSupport((?i)k) = true, want false")
+	}
+	// Byte mode moves the limit to 0xFF, not beyond it.
+	if unsupportedRune(mkProg(t, `[a\x80]`), true) >= 0 {
+		t.Error("unsupportedRune([a\\x80], byteMode) rejected, want accepted")
+	}
+	if got := unsupportedRune(mkProg(t, `[α-ω]`), true); got < 0 {
+		t.Error("unsupportedRune([α-ω], byteMode) accepted, want rejected")
+	}
+	// A negated class names every rune up to U+0010FFFF and must stay legal
+	// in both modes — rejecting it would reject `.` too.
+	if needsUnicodeSupport(mkProg(t, `[^,]`)) {
+		t.Error("needsUnicodeSupport([^,]) = true, want false")
 	}
 }
 

@@ -780,10 +780,16 @@ func TestCompileLargeStateDFA(t *testing.T) {
 		},
 		// Unicode pattern to exercise unicodeTrans paths.
 		{
-			"unicode_pattern",
+			// `[\p{L}]+` used to live here, and does not compile in any mode
+			// since 2026-09-01 — it names runes above U+00FF, which no byte
+			// can hold. Its rejection is asserted by
+			// TestUnsupportedRuneRejection; a wide BYTE class keeps the
+			// large-state coverage this list wanted.
+			"wide_byte_class",
 			[]config.RegexEntry{{
-				Pattern:  `[\p{L}]+`,
-				FindFunc: "unicode_find",
+				Pattern:  `[\x00-\xff]{4}END`,
+				FindFunc: "wide_byte_find",
+				ByteMode: true,
 			}},
 		},
 		// Mandatory lit with many states - tries to trigger u8+compressed+mandlit path.

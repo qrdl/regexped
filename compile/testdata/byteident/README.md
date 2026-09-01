@@ -37,6 +37,7 @@ add a fixture for it.
 | `lenient_alt` | `ERROR[0-9]{3}\|WARNING[0-9]{3}` | lenient alternation find — `buildLitChainAltLenientFindBody`, the one find body whose scan cursor is NOT `locAttemptStart` | Compiled DFA |
 | `lit_chain_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}` | lit chain with a fixed-length prefix — `buildLitChainPrefixedFindBody`; reports `attempt_start - M`, so it needs a find-from floor | Compiled DFA |
 | `alt_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}\|[0-9]{3}ghp_[A-Za-z0-9]{24}` | Gap E: strict alternation of prefixed branches — `buildLitChainAltPrefixedFindBody` | Compiled DFA |
+| `byte_mode` | `caf\xe9[0-9]{4}` + `byte_mode: true` | a pattern naming raw bytes above 127, which every other fixture's mode rejects outright | Compiled DFA |
 
 ## Set fixtures
 

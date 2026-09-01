@@ -226,11 +226,16 @@ regexps:
     match_func:        "url_match"         # anchored match → Result<Option<usize>> / number|null (JS)
     find_func:         "url_find"          # non-anchored find → FindIter / generator (JS)
     groups_func:       "url_groups"        # anchored + captures → GroupsIter / generator (JS)
+    byte_mode:         false               # optional; runes 0x80-0xFF mean those BYTES
  # `named_groups_func:` is RETIRED and is a load error. It was
     # never a separate capability — both stubs called the SAME WASM export — so
     # `groups_func` carries names too, through generated index constants plus
     # `<func>_index` / `<func>_names` (an `<func>_indices` object in JS/TS).
 ```
+
+**`byte_mode:` and the unsupported-rune gate.** regexped is a BYTE engine — `.` consumes one byte, classes are byte classes, `\b` is ASCII — so a rune above U+007F has no byte to be. `compile/compile.go`'s `unsupportedRune` rejects a pattern naming one, with a message that names the rune and points at `byte_mode: true`; runes above U+00FF are rejected in BOTH modes with a message that does not suggest a flag which cannot help. `byte_mode: true` moves the limit to 0xFF and declares those runes to mean exactly those bytes, which is a capability that did not exist before 2026-09-01 (`[\x80-\xff]+` was rejected outright). The gate sits at the TOP of `compilePattern`, before any fast path — `compile()` alone missed the lit-chain family, lit-anchor and the alternation shapes, so acceptability would have depended on which emitter a pattern qualified for — and it therefore covers SET members too, since `CompileFile` calls `compilePattern` for every entry.
+
+TWO things stay byte-semantic by declaration, because no rule separates them from ordinary ASCII patterns: `.`/negated classes consume one byte, and case folding stays inside the byte range. The second one is not obvious: Go's parser expands `(?i)` over a class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F and U+212A — runes manufactured from its own ASCII `s` and `k`. A rune above the limit is therefore tolerated when it is a SimpleFold partner of an ASCII rune the same instruction names. Without that tolerance the gate rejects `(?i:[a-z]+)` and `(?i)^\s*SELECT\b`: measured over all four corpora, 8 rows of working, tested patterns. `CompileOptions.Unicode` is NOT Unicode support and never was — it is a compile-anyway bypass for tests, not reachable from YAML.
 
 Setting `groups_func` triggers capture-tracking compilation (TDFA or Backtracking engine).
 Setting only `match_func` and/or `find_func` strips captures from the pattern before compilation.
@@ -563,6 +568,19 @@ implementation to check against.
 **Fuel is exact within an engine and indicative ACROSS engines** — it counts
 WASM instructions, and Rust→WASM codegen differs structurally from our
 hand-emitted WASM. Track the ratio, never a single absolute number.
+
+**A third classchain corpus was ADDED 2026-09-01: `no-match exit-sparse
+100KB`** (`corpusExitSparse`, 100 KB with no lowercase byte). It exists because
+the board could not see `prefer-no-match` at all: classchain is the only
+literal-less family and so the only one reaching the union scan, but its two
+existing corpora are both DENSE in the exit set `[a-z]`, so `emitUnionSkip`
+probed and never skipped and every hinted row reported only the stride's guard
+cost. The new row measures −75% to −77.5% on the scan pair, reproducing
+likelytest's −74% independently; the guard-cost rows remain, so the board now
+shows both sides of the trade. `assertExitSparse` hard-errors unless the corpus
+matches no pattern in the family AND stays under 1% lowercase — the no-match
+counterpart of `sampleNeedles`' default arm. **It adds 16 rows, so the
+committed fuel/size baselines are short until `make baseline` is re-run.**
 
 **Two corpus fixes have invalidated cross-date comparisons.**
 

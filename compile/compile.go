@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp/syntax"
+	"unicode"
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
@@ -362,9 +363,18 @@ type CompileOptions struct {
 	// MaxTDFARegs is the maximum number of WASM capture registers a TDFA may
 	// use before falling back to Backtracking. 0 means use the default (32).
 	// Exposed as max_tdfa_regs in the YAML config.
-	MaxTDFARegs   int
-	MaxDFAMemory  int        // Maximum DFA memory in bytes (default: 102400)
-	Unicode       bool       // Enable Unicode support
+	MaxTDFARegs  int
+	MaxDFAMemory int // Maximum DFA memory in bytes (default: 102400)
+	// ByteMode is config.RegexEntry.ByteMode for the pattern being compiled:
+	// runes 0x80-0xFF are legal and mean that byte. See unsupportedRune.
+	ByteMode bool
+	// Unicode does NOT enable Unicode support — nothing implements it. It
+	// suppresses the unsupported-rune rejection, so the compiler emits its
+	// usual byte automaton for a pattern known to be wrong on non-ASCII
+	// input. It exists for tests that need a Unicode-bearing pattern to reach
+	// the selector, is not reachable from YAML, and is not the byte-oriented
+	// opt-in — that is ByteMode.
+	Unicode       bool
 	ForceEngine   EngineType // If non-zero, skip engine selection and use this engine type
 	LeftmostFirst bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 	// LikelyMode hints which suffix-DFA structural optimisation to favour.
@@ -813,6 +823,24 @@ func extractGroupNames(re *syntax.Regexp) []string {
 // It does not build the final WASM module; call assembleModule for that.
 // forceGroupsEngine overrides engine selection for the capture path (0 = auto).
 func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions) (*compiledPattern, error) {
+	// The mode is a property of the PATTERN, so it is adopted here rather than
+	// being expected in the build-wide options every caller would have to
+	// thread.
+	buildOpts.ByteMode = buildOpts.ByteMode || re.ByteMode
+	// Rejected BEFORE any fast path. compile() carries the same gate, but half
+	// of this function's bodies (the lit-chain family, lit-anchor, the
+	// alternation shapes) never reach it — so gating only there would let a
+	// pattern's acceptability depend on which emitter it happened to qualify
+	// for.
+	if !buildOpts.Unicode {
+		if parsed, perr := syntax.Parse(re.Pattern, syntax.Perl); perr == nil {
+			if prog, cerr := syntax.Compile(parsed.Simplify()); cerr == nil {
+				if bad := unsupportedRune(prog, buildOpts.ByteMode); bad >= 0 {
+					return nil, unsupportedRuneError(bad)
+				}
+			}
+		}
+	}
 	// Opens the verbose scope every decision below records into. Nil-safe, and
 	// End is idempotent, so an early return cannot lose the record — the next
 	// Begin flushes it.
@@ -1235,7 +1263,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// making full-string match fail for patterns like `a|aa` on "aa" (LF picks `a` at
 		// pos 0, loses the `aa` path, then can't reach the end of input).
 		// This matches Go stdlib semantics: regexp.MustCompile("^(a|aa)$").MatchString("aa") = true.
-		llOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: false}
+		llOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: false,
+			ByteMode: buildOpts.ByteMode, Unicode: buildOpts.Unicode}
 		llMatch, llErr := compile(re.Pattern, llOpts)
 		if llErr != nil && !errors.Is(llErr, ErrDFAStateLimit) {
 			return nil, fmt.Errorf("compile match DFA: %w", llErr)
@@ -1315,7 +1344,8 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	// LF DFA for find and/or groups.
-	lfOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: true}
+	lfOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: true,
+		ByteMode: buildOpts.ByteMode, Unicode: buildOpts.Unicode}
 	matcher, err := compile(re.Pattern, lfOpts)
 	if err != nil && !errors.Is(err, ErrDFAStateLimit) {
 		return nil, fmt.Errorf("compile DFA: %w", err)
@@ -1827,8 +1857,13 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
 	prog, _ := syntax.Compile(parsed.Simplify())
-	if needsUnicodeSupport(prog) {
-		return nil, fmt.Errorf("pattern contains Unicode features not yet supported")
+	// Mode-aware, unlike the strict predicate the optimisation guards use: this
+	// one decides whether the PATTERN compiles, and a byte-mode pattern's
+	// 0x80-0xFF runes are legal. Redundant with the check at the top of this
+	// function and kept anyway — it is the guard for the capture path, which
+	// reaches here through several early returns.
+	if bad := unsupportedRune(prog, buildOpts.ByteMode); bad >= 0 && !buildOpts.Unicode {
+		return nil, unsupportedRuneError(bad)
 	}
 
 	p.groupNames = extractGroupNames(parsed)
@@ -2598,8 +2633,8 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 		return 0, fmt.Errorf("parse error: %w", err)
 	}
 	prog, _ := syntax.Compile(re.Simplify())
-	if needsUnicodeSupport(prog) && !opts.Unicode {
-		return 0, fmt.Errorf("pattern contains Unicode features but Unicode option not enabled")
+	if bad := unsupportedRune(prog, opts.ByteMode); bad >= 0 && !opts.Unicode {
+		return 0, unsupportedRuneError(bad)
 	}
 	return selectBestEngine(prog, &opts), nil
 }
@@ -2619,8 +2654,8 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 		options = opts[0]
 	}
 
-	if requiresUnicode := needsUnicodeSupport(prog); requiresUnicode && !options.Unicode {
-		return nil, fmt.Errorf("pattern contains Unicode features but Unicode option not enabled")
+	if bad := unsupportedRune(prog, options.ByteMode); bad >= 0 && !options.Unicode {
+		return nil, unsupportedRuneError(bad)
 	}
 
 	var engineType EngineType
@@ -2657,32 +2692,143 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 	}
 }
 
-// needsUnicodeSupport analyzes whether a compiled program requires Unicode support.
-func needsUnicodeSupport(prog *syntax.Prog) bool {
-	const maxUnicode = 0x10ffff
+// maxUnicodeRune is the upper bound syntax.Compile writes for an open-ended
+// range — the tail of every negated class. It is never a rune the pattern
+// named, so it must not be read as one.
+const maxUnicodeRune = 0x10ffff
 
+// unsupportedRune returns the first rune in prog that this compiler cannot
+// match correctly, or -1 when the whole program is representable.
+//
+// regexped is a BYTE engine. A rune above the mode's limit has no byte to be,
+// so the automaton silently truncates it — which is a wrong answer rather than
+// a missing feature, and was for a long time an entirely silent one (five
+// verified divergences from Go, FABLE B29). This is the gate that turns those
+// into compile errors.
+//
+// The limit is 127 by default and 0xFF in byte mode. Three things are
+// deliberately NOT rejected:
+//
+//   - **The open-ended tail of a negated class.** `[^,]` compiles to
+//     `[\x00-\x2b]` plus `[\x2d-\U0010ffff]`; the second range names every
+//     rune there is, not a non-ASCII intention. Rejecting it would reject `.`
+//     and every negated class, which is a non-starter. That these consume ONE
+//     BYTE is documented byte semantics (B29 row 4).
+//
+//   - **Case-fold artifacts of ASCII.** Go's parser expands `(?i)` over a
+//     class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F (long s) and
+//     U+212A (Kelvin sign) — runes the user never wrote, manufactured from
+//     the ASCII `s` and `k` in the same instruction. A rune above the limit is
+//     therefore tolerated when it is a SimpleFold partner of an ASCII rune the
+//     same instruction also names. Without this the gate rejects `(?i:[a-z]+)`
+//     and `(?i)^\s*SELECT\b` — measured over the four corpora, that is 8 rows
+//     of working, tested patterns, and `(?i)` over a letter class or `\w` is a
+//     common shape rather than an exotic one.
+//
+//   - **`(?i)` on an ASCII literal whose orbit escapes 0xFF.** `(?i)k` keeps
+//     `FoldCase` in inst.Arg rather than expanding, and markFold drops the
+//     Kelvin sign at the 0xFF boundary. It is the same phenomenon as the case
+//     above and cannot be separated from it — no rule rejects `(?i)k` while
+//     keeping `(?i:[a-z]+)`, since both are an ASCII rune whose fold orbit
+//     leaves the byte range. Declared byte semantics, alongside `.`.
+//
+// What IS rejected is a rune the pattern itself wrote: `[a-zé]+`, `\pL+`,
+// `[a\x80]+` outside byte mode, and anything above U+00FF in either mode.
+func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
+	limit := rune(127)
+	if byteMode {
+		limit = 0xFF
+	}
 	for i := range prog.Inst {
 		inst := &prog.Inst[i]
-
-		switch inst.Op {
-		case syntax.InstRune, syntax.InstRune1:
-			hasASCII := false
-			hasNonASCII := false
-
-			for _, r := range inst.Rune {
-				if r <= 127 {
-					hasASCII = true
-				} else if r != maxUnicode {
-					hasNonASCII = true
+		if inst.Op != syntax.InstRune && inst.Op != syntax.InstRune1 {
+			continue
+		}
+		// Built only when a candidate is found: the overwhelming majority of
+		// instructions have no rune above the limit at all, and this runs over
+		// every instruction of every pattern the harnesses compile.
+		var ascii *[128]bool
+		for j := 0; j < len(inst.Rune); j += 2 {
+			lo := inst.Rune[j]
+			hi := lo
+			if j+1 < len(inst.Rune) {
+				hi = inst.Rune[j+1]
+			}
+			if hi <= limit {
+				continue
+			}
+			if hi == maxUnicodeRune && lo <= limit {
+				continue // open-ended tail of a negated class
+			}
+			if lo == hi {
+				if ascii == nil {
+					ascii = asciiRunesOf(inst)
+				}
+				if foldsToASCIIIn(lo, ascii) {
+					continue
 				}
 			}
-
-			if hasNonASCII && !hasASCII {
-				return true
+			if lo > limit {
+				return lo
 			}
+			return limit + 1
+		}
+	}
+	return -1
+}
+
+// asciiRunesOf collects the runes <= 127 one instruction names, ranges
+// expanded. It is the evidence for "this non-ASCII rune is a fold artifact of
+// something ASCII in the same class".
+func asciiRunesOf(inst *syntax.Inst) *[128]bool {
+	var m [128]bool
+	for j := 0; j < len(inst.Rune); j += 2 {
+		lo := inst.Rune[j]
+		hi := lo
+		if j+1 < len(inst.Rune) {
+			hi = inst.Rune[j+1]
+		}
+		if lo > 127 {
+			continue
+		}
+		if hi > 127 {
+			hi = 127
+		}
+		for r := lo; r <= hi; r++ {
+			m[r] = true
+		}
+	}
+	return &m
+}
+
+// foldsToASCIIIn reports whether r is in the simple-case-fold orbit of an
+// ASCII rune present in ascii.
+func foldsToASCIIIn(r rune, ascii *[128]bool) bool {
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f >= 0 && f <= 127 && ascii[f] {
+			return true
 		}
 	}
 	return false
+}
+
+// unsupportedRuneError phrases a rejection so the reader knows which of the
+// two situations they are in: a byte they could opt into, or a codepoint no
+// byte can hold.
+func unsupportedRuneError(r rune) error {
+	if r <= 0xFF {
+		return fmt.Errorf("pattern contains the non-ASCII rune U+%04X; regexped matches bytes, "+
+			"so set byte_mode: true to match it as the single byte 0x%02X, or remove it", r, r)
+	}
+	return fmt.Errorf("pattern contains the rune U+%04X, above U+00FF; regexped matches bytes "+
+		"and has no Unicode support", r)
+}
+
+// needsUnicodeSupport reports whether prog names a rune the DEFAULT (non-byte)
+// mode refuses. Kept as the predicate form for the internal optimisation
+// guards, which ask only "can a byte automaton represent this sub-program".
+func needsUnicodeSupport(prog *syntax.Prog) bool {
+	return unsupportedRune(prog, false) >= 0
 }
 
 // buildGroupsWrapperBody emits the WASM body for the exported groups wrapper function.

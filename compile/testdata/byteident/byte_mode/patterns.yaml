@@ -1,0 +1,7 @@
+# Byte mode: a pattern naming raw bytes above 127, which the default mode
+# rejects outright. Nothing else here compiles with byte_mode set, so without
+# this fixture the flag's effect on emitted output has no drift check at all.
+regexps:
+  - pattern: 'caf\xe9[0-9]{4}'
+    find_func: bytemode_find
+    byte_mode: true
