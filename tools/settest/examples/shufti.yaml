@@ -1,0 +1,38 @@
+# 21 literal-prefixed patterns with distinct uppercase first bytes [A..U].
+#
+# Shufti is reachable ONLY out of the scalar frontend branch, which in
+# production needs Aho-Corasick to decline over its 512 KB table budget first.
+# These 21 short literals would be picked up by Teddy instead, so the example
+# target passes -force-frontend scalar to restore the intended A/B: neutral
+# stays scalar (this literal set's rarity sum is 42 against the threshold of
+# 40) and only prefer-no-match flips to Shufti.
+#
+# Read the deltas as an UPPER BOUND — 21 buckets inflate the prefilter's share
+# of the work, and the absolute fuel here models no real workload.
+regexps:
+  - {name: pA, pattern: 'A1:[^\n]+'}
+  - {name: pB, pattern: 'B1:[^\n]+'}
+  - {name: pC, pattern: 'C1:[^\n]+'}
+  - {name: pD, pattern: 'D1:[^\n]+'}
+  - {name: pE, pattern: 'E1:[^\n]+'}
+  - {name: pF, pattern: 'F1:[^\n]+'}
+  - {name: pG, pattern: 'G1:[^\n]+'}
+  - {name: pH, pattern: 'H1:[^\n]+'}
+  - {name: pI, pattern: 'I1:[^\n]+'}
+  - {name: pJ, pattern: 'J1:[^\n]+'}
+  - {name: pK, pattern: 'K1:[^\n]+'}
+  - {name: pL, pattern: 'L1:[^\n]+'}
+  - {name: pM, pattern: 'M1:[^\n]+'}
+  - {name: pN, pattern: 'N1:[^\n]+'}
+  - {name: pO, pattern: 'O1:[^\n]+'}
+  - {name: pP, pattern: 'P1:[^\n]+'}
+  - {name: pQ, pattern: 'Q1:[^\n]+'}
+  - {name: pR, pattern: 'R1:[^\n]+'}
+  - {name: pS, pattern: 'S1:[^\n]+'}
+  - {name: pT, pattern: 'T1:[^\n]+'}
+  - {name: pU, pattern: 'U1:[^\n]+'}
+
+sets:
+  - name: prefixed
+    find: prefixed_find
+    patterns: all

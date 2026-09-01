@@ -598,6 +598,23 @@ type CompileSetOptions struct {
 	// this.
 	ForceFrontend frontendKind
 	forceFrontend bool
+
+	// ForceShuftiAdaptive overrides the `shuftiAdaptive = lnm && !rare`
+	// verdict that decides whether a forced-Shufti set carries the runtime
+	// density switch. TEST-ONLY, and a MEASUREMENT knob in exactly the sense
+	// ForceFrontend is (task 74).
+	//
+	// The switch was built on evidence (a guard case measuring +23%/+21% fuel
+	// without it) that no longer reproduces, and the only way to ask whether
+	// it still earns its counter, flag and per-attempt branch is to compile
+	// the same set both ways. Selection cannot answer it: `lnm && !rare` is
+	// deterministic, so nothing reachable from YAML compiles the off arm of a
+	// set that qualifies for the on arm.
+	//
+	// Applies only where shuftiAdaptive is decided, i.e. only when the Shufti
+	// frontend actually ships. Zero value means "use the verdict".
+	ForceShuftiAdaptive bool
+	forceShuftiAdaptive bool
 }
 
 // SetFrontend is the exported spelling of frontendKind, so an out-of-package
@@ -619,6 +636,16 @@ const (
 // (the zero value) mean "forced to Teddy" for every caller that never asked.
 func (o CompileSetOptions) WithForcedFrontend(fe frontendKind) CompileSetOptions {
 	o.ForceFrontend, o.forceFrontend = fe, true
+	return o
+}
+
+// WithShuftiAdaptive returns a copy of o with the Shufti density switch pinned
+// on or off. TEST-ONLY; see ForceShuftiAdaptive. Named for the same reason
+// WithForcedFrontend is: `false` is both a meaningful setting and the zero
+// value, so a caller that never asked must not be indistinguishable from one
+// asking to turn the switch off.
+func (o CompileSetOptions) WithShuftiAdaptive(on bool) CompileSetOptions {
+	o.ForceShuftiAdaptive, o.forceShuftiAdaptive = on, true
 	return o
 }
 

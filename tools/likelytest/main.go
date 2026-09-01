@@ -25,6 +25,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -341,30 +342,40 @@ var tests = []testCase{
 		nomatchInput: setShuftiLNMInput(false),
 	},
 	{
-		// same 21-pattern [A-U] set as set-shufti-lnm, but
-		// the no-match input is DENSE in the tracked first-byte set instead
-		// of sparse — the "rarely matches" assumption LikelyNoMatch bakes
-		// into forcing Shufti doesn't hold here. Mirrors alpha-run/word-run
-		// (the single-pattern version of this same footgun), which
-		// EmitPrefixScan's DenseCounter/DenseSkipFlag adaptive switch
-		// already protects against — buildSetSuffixBody's Shufti frontend
-		// (emitSetMatchFnFinalShufti) has no equivalent protection yet.
-		//
-		// No-match input is solid A-U letters with no gaps at all: every
-		// SIMD chunk's bitmask is all-1s, so ctz always returns 0 and the
-		// skip loop can never advance by more than one position per
-		// attempt — forcing the scalar membership-check tail on literally
-		// every position, on top of the SIMD overhead itself. None of the
-		// letters are ever followed by "1:" so nothing matches.
-		// Selection forced to scalar for the same reason as its sibling above
-		// (task 73). This case is the more valuable of the two: its no-match
-		// input is solid A-U letters with no gaps, so every SIMD chunk's
-		// bitmask is all-1s, ctz always returns 0, the skip loop can never
-		// advance more than one position, and the scalar membership-check
-		// tail runs on literally EVERY position. That tail is the
-		// per-first-byte compare chain whose cost is the reason task 70's
+		// same 21-pattern [A-U] set as set-shufti-lnm, but the no-match
+		// input is DENSE in the tracked first-byte set instead of sparse —
+		// the "rarely matches" assumption LikelyNoMatch bakes into forcing
+		// Shufti doesn't hold here. Solid A-U letters with no gaps at all:
+		// every SIMD chunk's bitmask is all-1s, so ctz always returns 0 and
+		// the skip loop can never advance more than one position per
+		// attempt, forcing the scalar membership-check tail on literally
+		// EVERY position, on top of the SIMD overhead itself. None of the
+		// letters is ever followed by "1:" so nothing matches. That tail is
+		// the per-first-byte compare chain whose cost is the reason task 70's
 		// Shufti band is capped at 128 rather than 239 — so this is the
 		// instrument task 70's step B measures with.
+		//
+		// Selection forced to scalar for the same reason as its sibling above
+		// (task 73).
+		//
+		// WHAT IT DOES NOT MEASURE (task 74, settled 2026-09-01). This case
+		// used to be cited as the guard for `shuftiAdaptive`, the runtime
+		// density switch emitSetMatchFnFinalShufti carries — the set port of
+		// EmitPrefixScan's DenseCounter/DenseSkipFlag, which alpha-run and
+		// word-run guard for the single-pattern path. It cannot be: its axis
+		// is the three hint modes, and the switch's verdict
+		// (`prefer-no-match && !rare`) is deterministic per set, so BOTH arms
+		// of the comparison compile the switch identically. What moves here
+		// is Shufti against scalar, and that now reads as a large WIN even on
+		// this adversarial input.
+		//
+		// The switch is nonetheless load-bearing — worth 16-17% of the Shufti
+		// body's fuel on exactly this input, against 3-9% overhead where it
+		// never fires. Measured by compiling both arms directly, which needs
+		// a compiler override rather than a hint:
+		// `tools/settest/examples/dense_harm.yaml` plus
+		// `settest -force-frontend scalar -adaptive on|off`
+		// (`make example-adaptive` there).
 		name:                "set-shufti-dense-harm",
 		forceScalarFrontend: true,
 		setPatterns: []string{
@@ -375,7 +386,7 @@ var tests = []testCase{
 			`U1:[^\n]+`,
 		},
 		mode:         modeSet,
-		notes:        "set with 21 [A-U]-prefixed literals, DENSE no-match data — Shufti dense-data harm target",
+		notes:        "set with 21 [A-U]-prefixed literals, DENSE no-match data — Shufti-vs-scalar on adversarial input (NOT the shuftiAdaptive guard; see settest)",
 		matchInput:   setShuftiDenseHarmInput(true),
 		nomatchInput: setShuftiDenseHarmInput(false),
 	},
@@ -2598,6 +2609,9 @@ func warmup(engine *wasmtime.Engine) {
 // Main
 
 func main() {
+	setsOnly := flag.Bool("sets", false, "run only the set-composition cases (mode == modeSet)")
+	flag.Parse()
+
 	// Silence regexped's slog output.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
@@ -2635,6 +2649,12 @@ func main() {
 	filter := os.Getenv("LIKELYTEST_FILTER")
 	totalChecks, totalFailures := 0, 0
 	for _, tc := range tests {
+		// -sets selects on the case's mode, not on its name: a modeSet case
+		// is free to be named for the shape it measures (dense-set-shared-prefix)
+		// rather than carrying a "set-" prefix for the filter's benefit.
+		if *setsOnly && tc.mode != modeSet {
+			continue
+		}
 		if filter != "" && !strings.Contains(tc.name, filter) {
 			continue
 		}

@@ -1075,6 +1075,13 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 					fe = frontendShufti
 					shuftiFirstByteSet = union
 					shuftiAdaptive = lnm && !rare
+					// TEST-ONLY measurement override (task 74). Inside the
+					// selection branch on purpose: it answers "does the switch
+					// still earn its cost on a set that ships Shufti", not
+					// "emit the switch somewhere it has nothing to guard".
+					if opts.forceShuftiAdaptive {
+						shuftiAdaptive = opts.ForceShuftiAdaptive
+					}
 				}
 			}
 		}
@@ -1675,6 +1682,10 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 			// Test-only frontend pin; see CompileSetOptions.ForceFrontend.
 			ForceFrontend: over.ForceFrontend,
 			forceFrontend: over.forceFrontend,
+			// Test-only Shufti density-switch pin; see
+			// CompileSetOptions.ForceShuftiAdaptive.
+			ForceShuftiAdaptive: over.ForceShuftiAdaptive,
+			forceShuftiAdaptive: over.forceShuftiAdaptive,
 		}
 		if !standalone {
 			setOpts.TableMemIdx = 1

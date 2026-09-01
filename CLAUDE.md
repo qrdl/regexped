@@ -144,10 +144,15 @@ regexped/
 │   │   └── Makefile           # Builds harnesses, runs benchmarks
 │   ├── likelytest/
 │   │   ├── main.go            # LikelyMode 3-way benchmark matrix (see Testing below)
-│   │   └── Makefile           # Runs the matrix, captures baseline
-│   └── pattest/
-│       ├── main.go            # Single-pattern ad-hoc LikelyMode benchmarking CLI (see Testing below)
-│       └── Makefile           # Runs against a pattern/mode/input file; example targets
+│   │   └── Makefile           # Runs the matrix (`run`), the set cases only (`sets`), captures baseline
+│   ├── pattest/
+│   │   ├── main.go            # Single-pattern ad-hoc LikelyMode benchmarking CLI (see Testing below)
+│   │   └── Makefile           # Runs against a pattern/mode/input file; example targets
+│   └── settest/
+│       ├── main.go            # Single-SET ad-hoc hint benchmarking CLI (see Testing below);
+│       │                      #   takes the set from a YAML config, drives any of the five
+│       │                      #   capabilities, varies only the set-level `hints:`
+│       └── Makefile           # Runs against a config/capability/input file; example targets
 ├── docs/
 │   ├── cli.md                 # CLI reference: commands, flags, config schema
 │   ├── rust-api.md            # Generated Rust API: function signatures, iterators
@@ -333,7 +338,7 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 
 **Every generated symbol keeps the config's own casing**. Go's PascalCase transform is gone — `match_func: url_match` yields `func url_match`, and if that leaves it unexported in a library package the generator warns once rather than renaming it. Symbols DERIVED from a func name follow its style too (`url_groups` → `url_groups_index`, `urlGroups` → `urlGroupsIndex`); symbols with no user name to inherit — `Span`, `SetMatch`, the error type, C's `rx_*_t` — keep their language's convention and can be prefixed with the optional `namespace:` key so two stubs can share one package.
 
-Because those values are also interpolated verbatim into generated source, `config.ValidateConfig` (`config/identifier.go`, called from `LoadConfig`) rejects any that is not `^[A-Za-z_][A-Za-z0-9_]*$` or is a reserved word in **any** of the six stub languages — `match` included, since the Rust generator emits `pub fn <func>` for the public wrapper. The check runs on the config-file path only, not inside `Compile`/`CompileFile`, so the internal harnesses (`tools/re2test`, `perftest`, `likelytest`, `pattest`, `tools/fuzz`) keep their bare `match`/`find`/`groups` names. See `docs/cli.md` "Export-name rules".
+Because those values are also interpolated verbatim into generated source, `config.ValidateConfig` (`config/identifier.go`, called from `LoadConfig`) rejects any that is not `^[A-Za-z_][A-Za-z0-9_]*$` or is a reserved word in **any** of the six stub languages — `match` included, since the Rust generator emits `pub fn <func>` for the public wrapper. The check runs on the config-file path only, not inside `Compile`/`CompileFile`, so the internal harnesses (`tools/re2test`, `perftest`, `likelytest`, `pattest`, `settest`, `tools/fuzz`) keep their bare `match`/`find`/`groups` names. See `docs/cli.md` "Export-name rules".
 
 **Rust stubs** (`generate/rust_stub.go`):
 
@@ -618,6 +623,13 @@ swings up to +137% between runs of literally the same bytes on sub-microsecond c
 Debugging env vars: `LIKELYTEST_FILTER=<substring>` runs only matching test cases;
 `DEBUG_STATS=1` prints p50/p90/p99/mean side by side per measurement.
 
+Eight of the cases are SETS (`mode: modeSet`) rather than single patterns, compiled
+through `CompileFile` with `cfg.Sets` and driven over `find`, `scan_any` or `scan_all`.
+`make sets` (the `-sets` flag) runs those alone; it selects on the case's MODE, not on
+its name, so a set case is free to be named for the shape it measures
+(`dense-set-shared-prefix`) rather than carrying a prefix for a filter's benefit. It
+composes with `LIKELYTEST_FILTER`.
+
 ### Single-pattern ad-hoc benchmarking (`tools/pattest/`)
 
 ```bash
@@ -631,6 +643,36 @@ measurement) and average wall-clock time (100,000 iterations) per mode per bucke
 this for quick, targeted investigation of a specific pattern shape rather than
 `likelytest`'s fixed curated set. `make example-lm` / `make example-lnm` /
 `make example-combined` run pre-built demonstration patterns.
+
+### Single-set ad-hoc hint benchmarking (`tools/settest/`)
+
+```bash
+make run ARGS="-config myset.yaml -cap find -inputs myinputs.txt"   # from tools/settest/
+```
+
+`pattest` for SETS, and the tool to reach for when the set is the user's own rather than
+a fixture. `-config` takes the same YAML `regexped compile` reads — patterns, selector,
+declared capabilities, `overlapping:` and all — so the set under test is the set that
+would ship; settest compiles it three times varying ONLY the set-level `hints:`, and
+drives any one of the five capabilities (`-cap`, optional when the set declares one).
+
+It answers "can this set benefit from a hint" in three layers, cheapest first: whether
+the hint changed the module at all (a byte-identical build is a definitive no and is not
+measured), what it changed (a per-mode `SetDiag` row — frontend, scan body, anchored
+body, buckets — since a body selection is invisible everywhere else and is usually the
+whole story), and whether it paid (fuel and p50 per bucket). Inputs are bucketed
+matching/non-matching by a Go stdlib oracle built from the patterns the set ACTUALLY
+contains — a compiler-dropped pattern is excluded and warned about — and the driven
+export is checked against that oracle before anything is measured, since a mis-driven
+ABI measures the wrong work entirely.
+
+The `_all` bitmask-vs-bitmap ABI is read off the function's TYPE, not predicted from the
+pattern count, because a Backtracking member selects the wide form at any width.
+`-force-frontend` mirrors `setperf`'s knob and additionally accepts `shufti`, which is
+not a chooser verdict but a simulated Aho-Corasick decline (`ACBudgetBytes: 1`) — the
+frontend column reports what actually shipped. `make example-lnm` / `make example-shufti`
+run pre-built demonstrations of a real `prefer-no-match` win. See
+`tools/settest/README.md`.
 
 ## Memory Layout
 
@@ -774,7 +816,7 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 - **Go 1.25.9+**
 - **gopkg.in/yaml.v3** — YAML parsing
-- **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (`tools/re2test`, `tools/likelytest`, `tools/pattest`, `tools/perftest`, `tools/setperf`, `tools/fuzz` only — not a dependency of the compiler itself)
+- **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (`tools/re2test`, `tools/likelytest`, `tools/pattest`, `tools/settest`, `tools/perftest`, `tools/setperf`, `tools/fuzz` only — not a dependency of the compiler itself)
 - **regex-automata** (Rust, `tools/perftest/regex_bench`) — the cross-engine comparison and correctness target for `tools/setperf`
 - **wasm-merge** (external, Binaryen) — for `merge` command and `tools/perftest`
 

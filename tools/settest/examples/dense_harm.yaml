@@ -1,0 +1,39 @@
+# The `set-shufti-dense-harm` guard case, as a settest fixture (TODO task 74).
+#
+# The same 21 [A-U]-prefixed patterns as shufti.yaml, pointed at input built to
+# make Shufti LOSE: solid A-U with no gaps, so every SIMD chunk's bitmask is
+# all-ones, ctz always returns 0, the skip loop can never advance more than one
+# position, and every position falls through to the scalar membership tail.
+#
+# This is the input the runtime density switch (`shuftiAdaptive`) exists to
+# rescue: it counts consecutive unproductive probes and disables the SIMD
+# prefilter for the rest of the call. Run with `-force-frontend scalar` and
+# `-adaptive on` against `-adaptive off` to measure whether the switch still
+# earns its counter, flag and per-attempt branch.
+regexps:
+  - {name: pA, pattern: 'A1:[^\n]+'}
+  - {name: pB, pattern: 'B1:[^\n]+'}
+  - {name: pC, pattern: 'C1:[^\n]+'}
+  - {name: pD, pattern: 'D1:[^\n]+'}
+  - {name: pE, pattern: 'E1:[^\n]+'}
+  - {name: pF, pattern: 'F1:[^\n]+'}
+  - {name: pG, pattern: 'G1:[^\n]+'}
+  - {name: pH, pattern: 'H1:[^\n]+'}
+  - {name: pI, pattern: 'I1:[^\n]+'}
+  - {name: pJ, pattern: 'J1:[^\n]+'}
+  - {name: pK, pattern: 'K1:[^\n]+'}
+  - {name: pL, pattern: 'L1:[^\n]+'}
+  - {name: pM, pattern: 'M1:[^\n]+'}
+  - {name: pN, pattern: 'N1:[^\n]+'}
+  - {name: pO, pattern: 'O1:[^\n]+'}
+  - {name: pP, pattern: 'P1:[^\n]+'}
+  - {name: pQ, pattern: 'Q1:[^\n]+'}
+  - {name: pR, pattern: 'R1:[^\n]+'}
+  - {name: pS, pattern: 'S1:[^\n]+'}
+  - {name: pT, pattern: 'T1:[^\n]+'}
+  - {name: pU, pattern: 'U1:[^\n]+'}
+
+sets:
+  - name: dense_harm
+    find: dense_harm_find
+    patterns: all

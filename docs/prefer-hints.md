@@ -134,3 +134,33 @@ each mode against each bucket — so you can see directly whether a hint helps
 *your* traffic before shipping it. `make example-lm` / `make example-lnm` /
 `make example-combined` (from `tools/pattest`) run pre-built demonstrations
 of each case above if you want to see the shape of a real win first.
+
+### Measuring a SET
+
+A set-level hint is a different question — several of the effects listed
+above (the union-scan run skip, the widened Shufti band, the packer split)
+exist only on the set path, and `pattest` cannot reach any of them. Use
+`tools/settest`, which takes the set from a YAML config file — the same
+schema `regexped compile` reads, so it tests the set you would actually
+ship:
+
+```bash
+cd tools/settest
+make run ARGS="-config your_config.yaml -cap find -inputs your_inputs.txt"
+```
+
+It compiles your set three times varying only its `hints:`, drives whichever
+capability you name with `-cap` (any of the five; optional when the set
+declares just one), and reports the same fuel-and-time-per-bucket table.
+
+Two things it adds, because a set has more places for a hint to land. First,
+when a hint compiles to a byte-identical module it says so and skips the
+measurement: that is a definitive "this hint cannot help this set", and it is
+worth knowing before reading any timing. Second, each mode prints what the
+compiler chose — literal frontend, scan-pair body, anchored body, bucket
+count — which is where a set-level hint's effect actually shows up, and is
+otherwise invisible.
+
+`make example-lnm` and `make example-shufti` (from `tools/settest`) run
+pre-built demonstrations of a real `prefer-no-match` win — one with no
+literal frontend at all, one where the hint changes which frontend ships.
