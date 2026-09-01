@@ -33,7 +33,7 @@ because `cat`/`car` are still distinguishable by their second byte, not
 because of the quantifier-loop relaxation described next. A quantifier
 loop's own back-edge (e.g. the `+` in `[a-z]+`) is *also* internally an
 alternation between "continue the loop" and "exit," but overlap between
-those two branches alone no longer disqualifies TDFA (task 13, 2026-08-01) — TDFA's
+those two branches alone no longer disqualifies TDFA (2026-08-01) — TDFA's
 LeftmostFirst priority always prefers continuing the loop over exiting it,
 so `([a-z]+)(er)([a-z]+)` now selects TDFA even though the loop's exit
 (into `er`) starts with a byte the loop's own class also matches. It used
@@ -154,7 +154,7 @@ Every Teddy tier promotion (1-byte → 2-byte → 3-byte → 4-byte) additionall
 requires that **no** first-byte candidate's next byte lead to a
 terminal/dead-end state — a candidate with no further live transitions
 after its first byte disqualifies the whole tier and the builder falls back
-to the tier below (fixed in task 43, 2026-07-26; previously this could
+to the tier below (fixed 2026-07-26; previously this could
 silently build an all-zero nibble table and produce wrong scan results for
 shorter alternates in a mixed-length alternation).
 
@@ -240,7 +240,7 @@ Capture slot values are reconstructed from registers at match acceptance time. T
 
 **Register minimization:** after table construction, a liveness-based graph-coloring pass merges registers whose live ranges do not overlap, reducing WASM local count.
 
-**Copy ordering (`sequentializeCopies`):** when a transition has more than one register-to-register copy tag op, they must take effect as one atomic parallel assignment — every copy reads its source's value from *before* the transition, never a value an earlier copy in the same batch already overwrote. A single fixed emission order (e.g. always descending by destination register) only produces correct results for copy chains that happen to run in that direction; a chain running the other way silently reads an already-clobbered value. `sequentializeCopies` instead walks the actual destination→source dependency graph, emitting each copy only once nothing else still pending needs to read its destination first, and breaks any remaining dependency cycle by spilling one copy through a scratch register. This fixed a real capture-corruption bug (task 13, 2026-08-01) that patterns like `([a-z]+)(er)([a-z]+)` had been triggering.
+**Copy ordering (`sequentializeCopies`):** when a transition has more than one register-to-register copy tag op, they must take effect as one atomic parallel assignment — every copy reads its source's value from *before* the transition, never a value an earlier copy in the same batch already overwrote. A single fixed emission order (e.g. always descending by destination register) only produces correct results for copy chains that happen to run in that direction; a chain running the other way silently reads an already-clobbered value. `sequentializeCopies` instead walks the actual destination→source dependency graph, emitting each copy only once nothing else still pending needs to read its destination first, and breaks any remaining dependency cycle by spilling one copy through a scratch register. This fixed a real capture-corruption bug (2026-08-01) that patterns like `([a-z]+)(er)([a-z]+)` had been triggering.
 
 **Tag-op emission:** each DFA state's per-byte tag operations are emitted as a `br_table` dispatch in the WASM function body. A majority-group optimization encodes only the minority of differing transitions explicitly; the dominant operation is emitted unconditionally, keeping WASM bytecode size small.
 

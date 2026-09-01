@@ -33,8 +33,8 @@ they are not part of `test` (see "Sets" below for why).
 The last three compile each pattern with only one of `match_func`,
 `find_func`, `groups_func` set. That is not redundant with the default
 combined compile: `compile.go` has call sites gated on `needMatch &&
-!needFind` and on `needFind && !needMatch` (the Gap E alt-prefixed find body,
-the Gap C alt-range find body, the strict and lenient alt find bodies) which
+!needFind` and on `needFind && !needMatch` (the alt-prefixed find body,
+the alt-range find body, the strict and lenient alt find bodies) which
 a match+find compile never reaches at all, so several emitters are invisible
 without them.
 
@@ -92,7 +92,7 @@ Examples of patterns handled by TDFA:
 - `(?P<scheme>https?)://(?P<host>[^/:?#]+)...` — disjoint scheme alternatives
 - `(\d{4})-(\d{2})-(\d{2})` — date capture with fixed delimiters
 - `([a-z]+)(er)([a-z]+)` — a quantifier loop whose exit overlaps its own
-  class no longer disqualifies TDFA on its own (task 13, 2026-08-01); see
+  class no longer disqualifies TDFA on its own (2026-08-01); see
   [engines.md](engines.md#engine-selection)
 
 ### Backtracking (~267K passing, via `--validate-groups`)
@@ -117,7 +117,7 @@ inside WASM.
 Examples of patterns handled by Backtracking:
 - `<([^>]+)>` — the loop's exit branch has an indeterminate first-byte set
   (inverted class wider than 256 codepoints), which stays ambiguous
-  regardless of the task 13 quantifier-loop relaxation
+  regardless of the 2026-08-01 quantifier-loop relaxation
 - `(.*)(foo)(.*)` — greedy capture consuming into next group (same
   indeterminate-branch reason: `.` can't be resolved to a finite first-byte set)
 
@@ -127,7 +127,7 @@ Set composition is validated by replaying multi-pattern blocks from the RE2
 exhaustive suite and a curated `custom-sets.txt` file through the set pipeline
 described in [sets.md](sets.md).
 
-**Every capability is driven, not just `find`.** Until task G15
+**Every capability is driven, not just `find`.** Until 2026-08-23
  this target declared one set with
 `find` OR a batching `find`, `patterns: all` and no `overlapping` — so
 `match_any`/`match_all`, `scan_any`/`scan_all` and the
@@ -205,7 +205,7 @@ as either a pass or a failure.
 
 ### Batched sets (`make set-batch`)
 
-The pre-G15 shape, kept because it is the only configuration that compiles sets
+The older single-set-per-block shape, kept because it is the only configuration that compiles sets
 of several thousand patterns: one set per corpus block, the same col4 oracle,
 driving `find` and then its batch entry at a buffer capacity of **one**. That
 capacity is the point: it makes every position with more than one match split,

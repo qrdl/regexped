@@ -8859,21 +8859,25 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		}
 	case len(firstBytes) > 8 && len(firstBytes) <= 16:
 		numV128ForScan = 1 // Shufti, unconditional for 9..16
-	case len(firstBytes) > 16 && len(firstBytes) <= 64:
-		if lnmAction5 || shuftiBeatsScalar(firstBytes) {
-			numV128ForScan = 1 // Shufti: density-gated or LikelyNoMatch-forced
+	case len(firstBytes) > 16:
+		// Asks the SAME predicate the emitter asks, rather than restating its
+		// rule — the two disagreeing is a module that fails WASM validation,
+		// not a wrong answer. canAdapt is true because this path reserves the
+		// dense-switch locals below whenever the plan wants them.
+		if useShufti, _ := shuftiPrefixPlan(firstBytes, lnmAction5, true); useShufti {
+			numV128ForScan = 1
 		}
 		// else: scalar firstByteFlags — no SIMD locals needed
 	}
 	if len(dominantStates) > 0 && numV128ForScan == 0 {
 		numV128ForScan = 1 // Opt 1 bulk-skip needs its own `chunk` register
 	}
-	// needsDenseSwitch: this pattern hits the exact
-	// LikelyNoMatch-forced override target (17..64-byte
-	// first-byte set, static heuristic would otherwise pick scalar) —
-	// always implies numV128ForScan==1 (the Shufti branch above fires
-	// whenever lnmAction5 is true in that byte range).
-	needsDenseSwitch := lnmAction5 && len(firstBytes) > 16 && len(firstBytes) <= 64 && !shuftiBeatsScalar(firstBytes)
+	// needsDenseSwitch: this pattern got Shufti from a LikelyNoMatch
+	// assertion the static rarity model would not have made on its own —
+	// either a 17..64 set the model called dense, or anything in the 65..128
+	// band, where the model is not consulted at all. Always implies
+	// numV128ForScan==1, since the same predicate decided both.
+	_, needsDenseSwitch := shuftiPrefixPlan(firstBytes, lnmAction5, true)
 	var denseCounterLocal, denseSkipFlagLocal byte
 
 	// needsBulkHyst: any non-mid-accept dominant present

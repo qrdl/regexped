@@ -53,7 +53,7 @@ regexped/
 │   ├── byte_rank.go           # Packed-pair set frontend: byte-rarity ranks, two-column probe selection (<=16 literals)
 │   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets.
 │   │                          #   Holds the THREE packers (binPack / compileFallback /
-│   │                          #   compileAnchoredBuckets) and the ONE G17 promotion policy they
+│   │                          #   compileAnchoredBuckets) and the ONE sparse-promotion policy they
 │   │                          #   share, promoteSparseBuckets + sparsePromotion. Placement and
 │   │                          #   ordering stay per-packer on purpose: the anchored one packs in
 │   │                          #   DECLARATION order (a bucket's bit k must map to a stable global
@@ -99,7 +99,7 @@ regexped/
 │   ├── set_probe.go           # Bitmask-only bucket probes (scan + anchored flavours), genAnchoredWASM
 │   ├── set_caps.go            # ANCHORED bodies only (match_any/match_all) + the shared bit-recording
 │   │                          #   emitters and id-space helpers. The scan pair is NOT here — see set_emit.go.
-│   ├── set_sparse.go          # G17 sparse accept: per-state LISTS of pattern indices instead of a
+│   ├── set_sparse.go          # Sparse accept: per-state LISTS of pattern indices instead of a
 │   │                          #   u64 mask, which is what lets ONE bucket hold more than 32
 │   │                          #   patterns. Serves all three packers — shared-literal, fallback and
 │   │                          #   anchored. NOTHING on the candidate path may read an i32 mask as
@@ -442,7 +442,7 @@ Each pattern is compiled and tested for:
 - Col 5: non-anchored find with captures (with --validate-groups)
 
 **Set mode (`make setcaps` / `make sets`)** drives EVERY capability over
-the corpus (task G15), not just gated `find`: the anchored
+the corpus, not just gated `find`: the anchored
 pair, the scan pair at many `offset` values, `find` and its batch entry in both the
 gated and `overlapping: true` configurations at capacities 1 and P, `find`
 through an under-sized buffer (`out_cap = 0` and the transactional-overflow
@@ -474,7 +474,7 @@ hint (`--likelymatch` / `--likelynomatch`, which reach the set path as
 `hints:`), and it is in `make test` too. It exists because `setcaps` runs
 entirely NEUTRAL: until it was added, every hint-gated set emitter — the
 Shufti self-loop channels in bucket suffix bodies, the union scan's SIMD
-stride, the widened Shufti band, LM-6's packer split, H.3's forced-Shufti
+stride, the widened Shufti band, the counted-chain packer split, the forced-Shufti
 frontend — had **no correctness gate at all**. It compiles genuinely
 different bodies from the ones `setcaps` checks, at 9,410,470 checks / 0
 failures.
@@ -485,7 +485,7 @@ which keeps them an independent oracle rather than a transcript of engine
 output. Its `SetG15*` blocks are the permanent regressions for
  plus other hand-picked shapes.
 
-**`make set-batch`** is the pre-G15 shape, kept because it is the only
+**`make set-batch`** is the older single-set-per-block shape, kept because it is the only
 configuration that compiles sets of several thousand patterns: ONE set per
 corpus block, gated `find` and then its batch entry at a buffer capacity of ONE,
 so every multi-match position splits and the corpus becomes a check of the
@@ -529,7 +529,7 @@ spanning four frontends, both accept representations and all five
 capabilities — each checked in with the exact bytes it compiles to and
 compared byte for byte. This is the regression
 net for any change that touches a shared emitter: single-pattern output is
-supposed to be unaffected by set work ( D6), and byte identity is
+supposed to be unaffected by set work, and byte identity is
 the only evidence strong enough for "unaffected". See the README there before
 adding a path.
 
@@ -613,8 +613,8 @@ cheaper than its `scan_all` — so the same engine work wins comfortably against
 one of their capabilities and just misses the other.
 
 Everything else wins. The three literal-less rows — once the evidence for
-"every win comes from the literal frontends" — were closed by G10-G14;
-G16's first-byte eligibility mask took greedy-3's no-match `find` from 251 to 94
+"every win comes from the literal frontends" — were closed over 2026-08;
+the first-byte eligibility mask took greedy-3's no-match `find` from 251 to 94
 fuel/byte; and then removed a 64-id ELIGIBILITY ceiling that
 had been dropping wide literal-less sets onto the per-position walk, taking
 classchain-128's scan rows 17,171,467 → 2,227,464 fuel (7.7x) and making the
@@ -760,10 +760,9 @@ conservative ("the detector is wrong, this pattern is clearly
 deterministic, it should reach TDFA"). They are deliberately kept.
 Relaxing them has been tried and **caused measurable performance
 regressions**. Always measure per-byte fuel on representative patterns
-before removing or weakening any gate. See "Gap I"
-for the full diagnosis.
+before removing or weakening any gate. The full diagnosis is below.
 
-### `hasAmbiguousCaptures` / `getFirstRuneSet` for inverted classes (Gap I)
+### `hasAmbiguousCaptures` / `getFirstRuneSet` for inverted classes
 
 `getFirstRuneSet` in [compile/selector.go](compile/selector.go) returns
 false on InstRune instructions whose Unicode range exceeds 256
@@ -777,7 +776,7 @@ treats them as ambiguous and routes the patterns to Backtracking.
 - **Before:** patterns like `<([^>]+)>`, `([^,]+),`, `KEY=([^&]+)&`
   compile to BT. BT captureBody costs ~40 fuel/byte for these
   patterns (deterministic in practice, no actual backtracking).
-- **After (Gap I fix applied):** patterns reach TDFA cleanly, captures
+- **After the relaxation was applied:** patterns reach TDFA cleanly, captures
   correct under re2 `--validate-groups`. TDFA captureBody costs ~77
   fuel/byte. Measured regressions: `<([^>]+)>` neutral +73%, LM +466%,
   WASM size +69%.
@@ -845,8 +844,8 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 
-**Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body; reachable ONLY from the scalar branch, i.e. after AC declines over its 512 KB budget — first-byte union 17..64, or up to 128 under set-level `prefer-no-match`), scalar. The crossovers between them were re-measured on a match-dense corpus in 2026-08-31 (TODO task 71) and did NOT move: the chooser picks the winning frontend in all 20 rows of both corpora, so none of them is hint-conditional. `CompileSetOptions.WithForcedFrontend` + `setperf -force-frontend` are the test-only knobs that ask the question again.
+**Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body; reachable ONLY from the scalar branch, i.e. after AC declines over its 512 KB budget — first-byte union 17..64, or up to 128 under set-level `prefer-no-match`), scalar. The crossovers between them were re-measured on a match-dense corpus in 2026-08-31 and did NOT move: the chooser picks the winning frontend in all 20 rows of both corpora, so none of them is hint-conditional. `CompileSetOptions.WithForcedFrontend` + `setperf -force-frontend` are the test-only knobs that ask the question again.
 
-**Set hint-gated emission** (all set-level, `sets:` → `hints:`; gated by `make setcaps-likely`, since plain `make setcaps` runs entirely neutral): `prefer-match` gives bucket SUFFIX bodies the three Shufti self-loop channels via `genSuffixWASM`'s `LikelyMode` parameter (a suffix DFA has an empty `l.prefix` by construction, which used to make `detectShuftiSelfLoop` refuse every set body outright) and keeps counted-chain patterns in singleton buckets (LM-6); `prefer-no-match` turns on the union scan's SIMD stride (`emitUnionSkip`) and the widened Shufti band.
+**Set hint-gated emission** (all set-level, `sets:` → `hints:`; gated by `make setcaps-likely`, since plain `make setcaps` runs entirely neutral): `prefer-match` gives bucket SUFFIX bodies the three Shufti self-loop channels via `genSuffixWASM`'s `LikelyMode` parameter (a suffix DFA has an empty `l.prefix` by construction, which used to make `detectShuftiSelfLoop` refuse every set body outright) and keeps counted-chain patterns in singleton buckets; `prefer-no-match` turns on the union scan's SIMD stride (`emitUnionSkip`) and the widened Shufti band.
 
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

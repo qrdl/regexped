@@ -157,6 +157,35 @@ var tests = []testCase{
 		nomatchInput: classRunInput(false, "", 0, 0),
 	},
 	{
+		// The 65..128 first-byte band, which single patterns leave on the
+		// scalar path: prefix_scan.go caps Shufti at 64 while the SET path
+		// goes to 128 under the hint. `[!-~]` is 94 bytes and carries no
+		// literal, so nothing else can prefilter it.
+		//
+		// WIN half: input dominated by whitespace, which is outside the
+		// class, so the prefilter has long runs to stride over. Its twin
+		// below is the harm half; both are needed or the pair measures only
+		// the flattering side.
+		name:         "printable-run",
+		pattern:      `[!-~]{12,}`,
+		mode:         modeFind,
+		notes:        "94-byte first-set, whitespace-sparse input — the 65..128 band win case",
+		matchInput:   printableRunInput(true, false),
+		nomatchInput: printableRunInput(false, false),
+	},
+	{
+		// HARM half of the pair above: printable bytes everywhere, so every
+		// SIMD chunk finds a candidate at once and the prefilter's nibble
+		// tables are pure overhead. Runs are capped one byte short of the
+		// pattern's {12,} so the buffer stays dense without matching.
+		name:         "printable-run-dense-harm",
+		pattern:      `[!-~]{12,}`,
+		mode:         modeFind,
+		notes:        "94-byte first-set, DENSE input — the 65..128 band harm case",
+		matchInput:   printableRunInput(true, true),
+		nomatchInput: printableRunInput(false, true),
+	},
+	{
 		// Gap E groups: captures wrap class-prefix and class-suffix pieces.
 		// Group offsets must account for the prefix (group d at 0..8, group
 		// k at 12..48 after the K=4 ghp_ literal).
@@ -765,6 +794,61 @@ export AWS_S3_BUCKET=example-data-bucket
 // without the run length needed to complete a match. That stresses the
 // prefix-scan throughput end of the engine: scan-rate dominates, DFA
 // verification trips early.
+// printableRunInput builds ~50 KB for the 94-byte-first-set cases.
+//
+// `[!-~]` is every printable ASCII byte EXCEPT space, which is what makes the
+// two halves separable: whitespace is outside the class, so a
+// whitespace-dominated buffer is genuinely SPARSE in the tracked first bytes
+// while still being ordinary-looking input.
+//
+// dense=false is the win case — long whitespace runs the SIMD prefilter can
+// stride over. dense=true is the harm case: printable bytes everywhere, so
+// every chunk finds a candidate immediately and the nibble-table work is pure
+// overhead. Runs are capped at 11 bytes there, one short of the pattern's
+// {12,}, so the buffer stays dense without ever matching.
+func printableRunInput(withMatches, dense bool) string {
+	const targetSize = 50 * 1024
+	// A deterministic, dependency-free byte source: the cases must produce the
+	// same buffer on every run or the baseline means nothing.
+	next := uint32(2463534242)
+	rnd := func(n int) int {
+		next ^= next << 13
+		next ^= next >> 17
+		next ^= next << 5
+		return int(next % uint32(n))
+	}
+	printable := make([]byte, 0, 94)
+	for c := byte('!'); c <= '~'; c++ {
+		printable = append(printable, c)
+	}
+	gap := []byte(" \t \t\t   ")
+
+	var b []byte
+	emitFiller := func() {
+		if dense {
+			// 4..11 printable bytes, then one space. Dense in the class,
+			// never long enough to match.
+			n := 4 + rnd(8)
+			for i := 0; i < n; i++ {
+				b = append(b, printable[rnd(len(printable))])
+			}
+			b = append(b, ' ')
+			return
+		}
+		b = append(b, gap...)
+	}
+	for i := 0; len(b) < targetSize; i++ {
+		emitFiller()
+		if withMatches && i%64 == 0 {
+			for j := 0; j < 16; j++ {
+				b = append(b, printable[rnd(len(printable))])
+			}
+			b = append(b, ' ')
+		}
+	}
+	return string(b[:targetSize])
+}
+
 func classRunInput(withMatches bool, class string, runLen, runs int) string {
 	const targetSize = 50 * 1024
 	prose := []byte("The quick brown fox jumps over the lazy dog. ")

@@ -48,6 +48,56 @@ import (
 //   - i32 bitmask on top of stack.
 //   - `chunkLocal` unchanged.
 //   - No other locals written.
+//
+// Shufti first-byte band. Below the first bound the static rarity model
+// decides; between the two, only a LikelyNoMatch caller that can also supply
+// the dense switch gets it.
+const (
+	maxShuftiFirstBytes    = 64
+	maxShuftiFirstBytesLNM = 128
+)
+
+// shuftiPrefixPlan is the SINGLE authority on whether the prefix scan emits a
+// Shufti membership check for a first-byte set, and whether that emission
+// needs the adaptive dense switch.
+//
+// It exists because this decision used to be stated in four places — the
+// emission site below, plus three independent local-reservation sites
+// (`numV128ForScan` and `needsDenseSwitch` in engine_dfa.go, `numV128Locals`
+// in engine_backtrack.go). When they disagree the module does not merely
+// answer wrongly, it FAILS WASM VALIDATION with "expected i32, found v128",
+// because the emitter uses a v128 local the caller never declared. That has
+// already happened once: engine_backtrack.go's copy sat at 16 after this band
+// was widened to 64, and its comment still records the symptom.
+//
+// Callers pass canAdapt = "I have reserved the two i32 locals the dense
+// switch needs". It is a REQUIREMENT above maxShuftiFirstBytes, not a
+// preference: past 64 the static rarity model is not consulted at all — it
+// was calibrated inside the narrow band and asking it about a 94-byte set is
+// asking a question it was never fitted for — so the wide band is
+// force-plus-adapt, exactly as the set frontend's equivalent widening is, and
+// the runtime counter is the only thing bounding a wrong assertion. A caller
+// that cannot adapt therefore stays at 64 rather than being forced blind.
+//
+// Only meaningful for n > 16; smaller sets take the multi-eq SIMD strategy,
+// which is a different shape and is decided by its own bound.
+func shuftiPrefixPlan(firstByteSet []byte, likelyNoMatch, canAdapt bool) (useShufti, wantDenseSwitch bool) {
+	n := len(firstByteSet)
+	switch {
+	case n <= 16:
+		return false, false
+	case n <= maxShuftiFirstBytes:
+		rare := shuftiBeatsScalar(firstByteSet)
+		if likelyNoMatch {
+			return true, !rare && canAdapt
+		}
+		return rare, false
+	case likelyNoMatch && canAdapt && n <= maxShuftiFirstBytesLNM:
+		return true, true
+	}
+	return false, false
+}
+
 func emitShuftiPrefixCheck(b []byte, firstByteSet []byte, chunkLocal byte) []byte {
 	if len(firstByteSet) == 0 {
 		// No candidates — push 0 onto stack as a trivial bitmask.
@@ -417,16 +467,10 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		if n := len(p.FirstByteSet); n > 0 {
 			if n <= 16 {
 				useSIMD = true
-			} else if n <= 64 {
-				rare := shuftiBeatsScalar(p.FirstByteSet)
-				if p.LikelyNoMatch {
-					useSIMD = true
-					// only adapt when overriding the static heuristic, and
-					// only when the caller has reserved real locals for it
-					adaptive = !rare && p.AllowDenseSwitch
-				} else if rare {
-					useSIMD = true
-				}
+			} else {
+				// One authority, shared with every site that reserves the
+				// locals this emission then uses — see shuftiPrefixPlan.
+				useSIMD, adaptive = shuftiPrefixPlan(p.FirstByteSet, p.LikelyNoMatch, p.AllowDenseSwitch)
 			}
 		}
 

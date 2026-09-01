@@ -2601,16 +2601,23 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		numV128Locals = 6
 	} else if len(scanParams.FirstByteSet) > 0 && len(scanParams.FirstByteSet) <= 8 {
 		numV128Locals = 3
-	} else if len(scanParams.FirstByteSet) > 0 && len(scanParams.FirstByteSet) <= 64 {
-		// 9..64: Shufti (emitPrefixScan's useSIMD gate — either unconditional
-		// for 9..16, or shuftiBeatsScalar/LikelyNoMatch-gated for 17..64).
-		// Only needs the single "chunk" v128 local; emitShuftiPrefixCheck
-		// inlines its nibble tables as v128.const operands. This upper bound
-		// must track emitPrefixScan's own useSIMD ceiling (prefix_scan.go) —
-		// previously capped at 16, a stale bound from before LNM Action 3
-		// extended Shufti coverage to 64 bytes, which left FirstByteSet
-		// 17..64 emitting zero v128 locals while emitShuftiPrefixCheck still
-		// used one, producing invalid WASM ("expected i32, found v128").
+	} else if n := len(scanParams.FirstByteSet); n > 0 && n <= 16 {
+		// 9..16: Shufti unconditionally. Only needs the single "chunk" v128
+		// local; emitShuftiPrefixCheck inlines its nibble tables as v128.const
+		// operands.
+		numV128Locals = 1
+	} else if useShufti, _ := shuftiPrefixPlan(scanParams.FirstByteSet,
+		scanParams.LikelyNoMatch, false); useShufti {
+		// Above 16, ask the SAME predicate the emitter asks instead of
+		// restating its ceiling. This site is why that predicate exists: it
+		// was capped at 16 after the band had already been widened to 64,
+		// which left FirstByteSet 17..64 emitting zero v128 locals while
+		// emitShuftiPrefixCheck still used one — invalid WASM, "expected
+		// i32, found v128". A shared predicate cannot drift that way.
+		//
+		// canAdapt is FALSE here: this body reserves no dense-switch locals,
+		// so BT stays at the 64-byte ceiling rather than being forced into
+		// the wide band with nothing to bound a wrong assertion.
 		numV128Locals = 1
 	}
 
