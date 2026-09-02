@@ -2576,6 +2576,12 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		// it is describing kept those patterns.
 		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{
 			MaxFallbackStates: cfg.MaxFallbackStates,
+			// The set's own hint. Omitting it made this re-run NEUTRAL
+			// whatever the config said, so --diag-json reported the frontend,
+			// union-scan body and member-skip counts of a compilation the user
+			// was not asking about — and those are hint-dependent selections
+			// for which this file is the only window.
+			LikelyMode: resolveHints(sc.Hints),
 		})
 		if cs.diag != nil {
 			cs.diag.CaptureBearingDropped = droppedRefs

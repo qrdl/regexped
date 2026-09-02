@@ -4790,13 +4790,26 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// the only shape that can serve more patterns than the mask has bits.
 	// Its tables and scratch go after everything the layout already placed.
 	if t.midAcceptWide != nil {
-		tabs := buildSparseAcceptTables(t, nextTableOffset, l.numWASM)
+		// Member self-loop skip is hint-gated, following every other trade in
+		// this pipeline with a harm side (the widened Shufti band, the union
+		// stride, the adaptive switch): it saves a great deal on buckets with
+		// long self-loop runs and costs a few percent on buckets that have
+		// none, and only the caller knows which their traffic is.
+		tabs := buildSparseAcceptTables(t, nextTableOffset, l.numWASM, lm == LikelyMatch)
 		idMapOff := tabs.end
 		idMap := make([]byte, len(patternIDs)*4)
 		for i, gid := range patternIDs {
 			putU32(idMap, i*4, uint32(gid))
 		}
-		scratch := planSparseScratch(idMapOff+int32(len(idMap)), len(patternIDs))
+		// The per-state stale flags are allocated ONLY when the skip is
+		// emitted. Sizing them unconditionally would move every sparse
+		// bucket's scratch — and therefore its neutral output — for a region
+		// a neutral build never reads.
+		staleStates := 0
+		if tabs.hasMember {
+			staleStates = l.numWASM
+		}
+		scratch := planSparseScratch(idMapOff+int32(len(idMap)), len(patternIDs), staleStates)
 		dataBytes = append(dataBytes, appendDataSegment(nil, tabs.midOff, tabs.data)...)
 		dataBytes = append(dataBytes, appendDataSegment(nil, idMapOff, idMap)...)
 		// One zero byte at the top of the scratch so utils.WasmMemTop and the
@@ -4821,6 +4834,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		if len(prefixFixedLens) > 0 && prefixFixedLens[0] > 0 {
 			prefixLen = prefixFixedLens[0]
 		}
+		art.memberStates, art.memberSets = tabs.memberStates, tabs.memberSets
 		art.sparseScratch = scratch
 		art.sparseIDMapOff = idMapOff
 		art.sparseProbeReady = true
@@ -4887,9 +4901,14 @@ type suffixArtifacts struct {
 	// of its own — which is the only reason a second implementation of the
 	// per-position semantics is defensible at all. Populated always; the sweep
 	// decides for itself whether to use it.
-	dp        overlapDPTables
-	fnBody    []byte
-	scanProbe []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
+	// memberStates / memberSets record how many states got a member self-loop
+	// skip arm and how many distinct sets back them, for --diag-json. Zero
+	// when the bucket is neutral or has no eligible state.
+	memberStates int
+	memberSets   int
+	dp           overlapDPTables
+	fnBody       []byte
+	scanProbe    []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
 	// scanProbeAny is the same probe with a first-hit exit, for `scan` and
 	// `scan_any`. Nil unless the set declares one of
 	// them; `scan_all` must keep using scanProbe.

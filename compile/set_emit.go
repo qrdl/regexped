@@ -1090,6 +1090,30 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// Record the frontend actually used (after any fallback to scalar).
 	diag.Frontend = fe.String()
 
+	// Member self-loop skip counts, recorded HERE rather than at emission.
+	//
+	// `--diag-json` is produced by CmdWriteDiagJSON, which re-runs CompileSet
+	// and never reaches assembleModuleWithSets — so anything written when the
+	// body is emitted is invisible to it. buildMemberSets is a pure function
+	// of (suffix DFA, state count), so asking it twice is safe: the emitter
+	// and this report cannot disagree about what qualified.
+	if opts.LikelyMode == LikelyMatch {
+		for bi, bkt := range buckets {
+			if bi >= len(diag.Buckets) || bkt.suffixDFA == nil || !bkt.sparse {
+				continue
+			}
+			idTab, setTab := buildMemberSets(bkt.suffixDFA, bkt.suffixDFA.numStates+1)
+			n := 0
+			for _, id := range idTab {
+				if id != 0 {
+					n++
+				}
+			}
+			diag.Buckets[bi].MemberSkipStates = n
+			diag.Buckets[bi].MemberSkipSets = len(setTab) / memberSetBytes
+		}
+	}
+
 	// The set match function body is built at assemble time (when function table
 	// indices are known). Store nil here; assembleModuleWithSets fills it in.
 	// Everything from here down claims its region through `ra`, which tracks a

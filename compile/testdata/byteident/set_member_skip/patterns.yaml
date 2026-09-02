@@ -1,0 +1,54 @@
+# Member self-loop skip: 40 shared-literal patterns packing into ONE sparse
+# bucket whose body states each self-loop on a single byte, compiled with
+# prefer-match so the skip is emitted.
+#
+# The only fixture that pins the skip's bytes. set_sparse pins the same body
+# WITHOUT it (neutral), so the pair is what separates "the sparse body changed"
+# from "the skip changed".
+regexps:
+  - {name: p00, pattern: 'union[ \t]+k00a+'}
+  - {name: p01, pattern: 'union[ \t]+k01a+'}
+  - {name: p02, pattern: 'union[ \t]+k02a+'}
+  - {name: p03, pattern: 'union[ \t]+k03a+'}
+  - {name: p04, pattern: 'union[ \t]+k04a+'}
+  - {name: p05, pattern: 'union[ \t]+k05a+'}
+  - {name: p06, pattern: 'union[ \t]+k06a+'}
+  - {name: p07, pattern: 'union[ \t]+k07a+'}
+  - {name: p08, pattern: 'union[ \t]+k08a+'}
+  - {name: p09, pattern: 'union[ \t]+k09a+'}
+  - {name: p10, pattern: 'union[ \t]+k10a+'}
+  - {name: p11, pattern: 'union[ \t]+k11a+'}
+  - {name: p12, pattern: 'union[ \t]+k12a+'}
+  - {name: p13, pattern: 'union[ \t]+k13a+'}
+  - {name: p14, pattern: 'union[ \t]+k14a+'}
+  - {name: p15, pattern: 'union[ \t]+k15a+'}
+  - {name: p16, pattern: 'union[ \t]+k16a+'}
+  - {name: p17, pattern: 'union[ \t]+k17a+'}
+  - {name: p18, pattern: 'union[ \t]+k18a+'}
+  - {name: p19, pattern: 'union[ \t]+k19a+'}
+  - {name: p20, pattern: 'union[ \t]+k20a+'}
+  - {name: p21, pattern: 'union[ \t]+k21a+'}
+  - {name: p22, pattern: 'union[ \t]+k22a+'}
+  - {name: p23, pattern: 'union[ \t]+k23a+'}
+  - {name: p24, pattern: 'union[ \t]+k24a+'}
+  - {name: p25, pattern: 'union[ \t]+k25a+'}
+  - {name: p26, pattern: 'union[ \t]+k26a+'}
+  - {name: p27, pattern: 'union[ \t]+k27a+'}
+  - {name: p28, pattern: 'union[ \t]+k28a+'}
+  - {name: p29, pattern: 'union[ \t]+k29a+'}
+  - {name: p30, pattern: 'union[ \t]+k30a+'}
+  - {name: p31, pattern: 'union[ \t]+k31a+'}
+  - {name: p32, pattern: 'union[ \t]+k32a+'}
+  - {name: p33, pattern: 'union[ \t]+k33a+'}
+  - {name: p34, pattern: 'union[ \t]+k34a+'}
+  - {name: p35, pattern: 'union[ \t]+k35a+'}
+  - {name: p36, pattern: 'union[ \t]+k36a+'}
+  - {name: p37, pattern: 'union[ \t]+k37a+'}
+  - {name: p38, pattern: 'union[ \t]+k38a+'}
+  - {name: p39, pattern: 'union[ \t]+k39a+'}
+
+sets:
+  - name: member
+    find: member_find
+    patterns: all
+    hints: [prefer-match]

@@ -420,17 +420,87 @@ var tests = []testCase{
 		nomatchInput: setShuftiDenseHarmInput(false),
 	},
 	{
-		// Gap F target: (\w+) TDFA capture body is a single state that
-		// self-loops on 63 of 256 bytes with a uniform set-to-pos tag op.
-		// matchInput anchors a 10 KB run of \w bytes so the SIMD bulk-skip
-		// dominates the scan; nomatchInput starts with a non-word byte so
-		// the anchored capture fails immediately at pos 0.
+		// NOT a Gap F target, despite its name and its original comment.
+		// `(\w+)` is a whole-pattern single capture, so it takes the
+		// capture-stripping shortcut and compiles to a **Compiled DFA** —
+		// `compile --verbose` reports "no captures; promoted to direct-index
+		// dispatch". It never reaches the TDFA capture body, and the DFA it
+		// does reach already has the self-loop bulk skip, so any movement
+		// here is the shortcut's, not Gap F's. Verified 2026-09-01, also by
+		// CompileForced producing byte-identical TDFA and BT modules for it.
+		//
+		// Kept because it still guards the shortcut. The real Gap F targets
+		// are the two cases below.
 		name:         "tdfa-bulk-skip-word-class",
 		pattern:      `(\w+)`,
 		mode:         modeGroups,
-		notes:        "TDFA dominant self-loop on \\w (63 bytes) — Gap F target",
+		notes:        "whole-pattern single-capture shortcut → Compiled DFA (NOT the TDFA body; see comment)",
 		matchInput:   strings.Repeat("aB3_", 2560) + "!",
 		nomatchInput: "!" + strings.Repeat("aB3_", 2560),
+	},
+	{
+		// Member self-loop skip, WIN half. Forty patterns behind one shared
+		// literal pack into a single SPARSE bucket whose forty accepting body
+		// states each self-loop on one byte — the shape the skip exists for,
+		// and the only shape in this file that produces one.
+		//
+		// Without a case here the mechanism is measurable only in setperf,
+		// whose baselines are gitignored and whose check is not in `make
+		// test`, so nothing on demand would notice it silently ceasing to
+		// fire. That is exactly how set-shufti-dense-harm guarded nothing for
+		// a month.
+		name:         "sparse-member-skip",
+		setPatterns:  memberSkipPatterns(40),
+		mode:         modeSet,
+		notes:        "40 shared-literal patterns with one-byte self-loop tails — member skip win case",
+		matchInput:   memberSkipInput(true, true),
+		nomatchInput: memberSkipInput(false, true),
+	},
+	{
+		// HARM half: same set, but the input carries no runs for the skip to
+		// stride over, so every candidate pays the per-byte member load and
+		// gains nothing. A win case alone would show only the flattering side
+		// of a trade whose whole design question is how much the other side
+		// costs.
+		name:         "sparse-member-skip-norun",
+		setPatterns:  memberSkipPatterns(40),
+		mode:         modeSet,
+		notes:        "the same set on run-free input — member skip harm case",
+		matchInput:   memberSkipInput(true, false),
+		nomatchInput: memberSkipInput(false, false),
+	},
+	{
+		// Gap F target, WIN half. `<([a-z]+)>` is a partial capture, so the
+		// shortcut does not apply and it genuinely compiles to TDFA
+		// (verified with `compile --verbose`). Its body state self-loops on
+		// [a-z] with a uniform set-to-pos tag op, which is the shape a
+		// tag-aware bulk skip can collapse.
+		//
+		// Measured before implementation: TDFA costs 37.81 fuel/byte on this
+		// body, of which the plain walk is 33.00 — so tag tracking is only
+		// ~13% and the walk is what a skip attacks. The same body with the
+		// capture removed drops to 4.88 fuel/byte once the DFA's skip
+		// engages, i.e. the skip is worth ~85% of the walk.
+		name:         "tdfa-capture-body-long",
+		pattern:      `<([a-z]+)>`,
+		mode:         modeGroups,
+		notes:        "TDFA capture body, 10 KB uniform [a-z] run — Gap F win case",
+		matchInput:   "<" + strings.Repeat("a", 10240) + ">",
+		nomatchInput: "!" + strings.Repeat("a", 10240),
+	},
+	{
+		// Gap F target, HARM half. Same pattern and engine, but the captured
+		// bodies are 3 bytes, far below the 16-byte SIMD chunk — so the skip
+		// can never amortise its setup and this is where it costs rather
+		// than pays. A win case alone would measure only the flattering
+		// side, which is how two cases in this file drifted into measuring
+		// nothing at all.
+		name:         "tdfa-capture-body-short",
+		pattern:      `<([a-z]+)>`,
+		mode:         modeGroups,
+		notes:        "TDFA capture body, 3-byte run — Gap F harm case (below the SIMD chunk)",
+		matchInput:   "<abc>",
+		nomatchInput: "!abc>",
 	},
 	{
 		// BT-routed sibling of tdfa-bulk-skip-word-class above:
@@ -794,6 +864,50 @@ export AWS_S3_BUCKET=example-data-bucket
 // without the run length needed to complete a match. That stresses the
 // prefix-scan throughput end of the engine: scan-rate dominates, DFA
 // verification trips early.
+// memberSkipPatterns builds the shared-literal family the member self-loop
+// skip serves: one mandatory literal so they pack into a single bucket, a
+// per-pattern discriminator so they stay distinct, and a one-byte `a+` tail
+// that becomes an accepting state self-looping on exactly one byte.
+func memberSkipPatterns(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf(`union[ \t]+k%02da+`, i)
+	}
+	return out
+}
+
+// memberSkipInput builds ~50 KB for the two member-skip cases.
+//
+// withRuns=true gives each needle a 64-byte `a` run — the stride the skip
+// collapses. withRuns=false caps the run at one byte, so the same literal
+// hits happen and the same buckets are entered, but there is nothing to
+// stride over: that isolates the skip's COST from its benefit, which is the
+// half both previous attempts at this optimisation failed to price.
+func memberSkipInput(withMatches, withRuns bool) string {
+	const targetSize = 50 * 1024
+	run := 1
+	if withRuns {
+		run = 64
+	}
+	filler := "..... filler ..... "
+	var b []byte
+	for i := 0; len(b) < targetSize; i++ {
+		b = append(b, filler...)
+		if withMatches {
+			b = append(b, fmt.Sprintf("union k%02d", i%40)...)
+			b = append(b, strings.Repeat("a", run)...)
+			b = append(b, ' ')
+			continue
+		}
+		// No-match: the literal is absent, so the frontend never fires and
+		// the suffix body is never entered.
+		b = append(b, "onion k00"...)
+		b = append(b, strings.Repeat("a", run)...)
+		b = append(b, ' ')
+	}
+	return string(b[:targetSize])
+}
+
 // printableRunInput builds ~50 KB for the 94-byte-first-set cases.
 //
 // `[!-~]` is every printable ASCII byte EXCEPT space, which is what makes the

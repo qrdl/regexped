@@ -58,6 +58,7 @@ that reads one table through another's bytes.
 | `set_ac` | >16 literals, LOW first-byte diversity (`aho_corasick.go`) | ac |
 | `set_scalar` | no literal to anchor on — no prefilter emitted | scalar |
 | `set_sparse` | G17 sparse accept: 40 patterns in ONE bucket, past the 32 a u64 mask allows | packed-pair |
+| `set_member_skip` | the SAME sparse shape under `prefer-match`, which adds the member self-loop skip. Paired with `set_sparse` on purpose: that one pins the body without the skip, so a diff that moves both is the body and a diff that moves only this one is the skip | packed-pair |
 | `set_anchored` | the anchored pair alone — an anchored-only set emits NO literal frontend | packed-pair |
 | `set_scan` | the scan pair: non-anchored, offset-taking, no positions | packed-pair |
 | `set_overlap` | `overlapping: true` — every-start enumeration, same signature as gated find | packed-pair |

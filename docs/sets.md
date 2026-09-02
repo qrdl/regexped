@@ -451,6 +451,19 @@ it.
 `emit_name_map: true` additionally emits a `pattern_name(id)` helper mapping a
 pattern id back to its `name:` string.
 
+### `--diag-json` reports what the compiler chose
+
+Several of a set's decisions are invisible in the output and change its cost by
+large factors: which literal frontend shipped, whether the scan pair got the
+one-pass union automaton or the per-position walk, and whether a sparse
+bucket's states carry the member self-loop skip (`member_skip_states`). If a
+set is slower than you expect, that file is where to look first — there is no
+other window onto any of it.
+
+Note it reports the compilation your `hints:` actually asks for. Before
+2026-09-02 it always reported the unhinted one, which made every hint-dependent
+row above misleading for a hinted set.
+
 ## Bin-packing and merge constraints
 
 The bin-packer groups patterns by their mandatory literal and merges compatible
