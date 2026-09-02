@@ -182,7 +182,8 @@ type BucketDiag struct {
 	// MemberSkipStates is how many of this bucket's states carry a member
 	// self-loop skip arm, and MemberSkipSets how many distinct byte sets back
 	// them. Both zero unless the set is compiled with prefer-match AND the
-	// bucket is sparse AND some state self-loops on at most memberMaxBytes.
+	// bucket is sparse AND some state has a self-loop set at all (any width:
+	// two nibble pairs cover every set — see memberSetPairs).
 	//
 	// Reported because the skip is otherwise invisible: it changes fuel by
 	// ~80% on a bucket with long self-loop runs and by nothing at all on one

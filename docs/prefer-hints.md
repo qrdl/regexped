@@ -110,11 +110,14 @@ won't change anything.
 - **Member self-loop skip** *(prefer-match, sets)* — once a set's suffix walk
   is inside a state that a run of bytes keeps it in, strides over that run
   rather than stepping it. Worth about **80%** of a bucket's cost on patterns
-  with long repeated tails (`kw001aaaa…`), and it **costs about 9%** on the
-  same patterns when the tails are short. It notices per state when it is not
-  paying and stops trying, retrying periodically in case the input changes
-  character, so a wrong guess costs a bounded amount rather than a
-  proportional one. Only applies to sets large enough to pack into a sparse
+  with long repeated tails (`kw001aaaa…`), and it **costs under 2%** on the
+  same patterns when the tails are short. It notices when it is not paying and
+  stops — first per state, so one unhelpful state does not stop the others,
+  and then for the bucket as a whole, at which point the walk it runs is the
+  one it would run without the feature at all. Both retry periodically in case
+  the input changes character, so a wrong guess costs a bounded amount rather
+  than a proportional one. Applies to any repeated run, however wide the
+  character class, and only to sets large enough to pack into a sparse
   bucket.
 
 Each of the SIMD skips above turns itself off for the rest of a call once it

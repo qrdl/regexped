@@ -8898,6 +8898,16 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// numV128ForScan==1, since the same predicate decided both.
 	_, needsDenseSwitch := shuftiPrefixPlan(firstBytes, lnmAction5, true)
 	var denseCounterLocal, denseSkipFlagLocal byte
+	// denseLocalsReady gates the seed below on the locals having actually been
+	// ALLOCATED, not merely wanted. needsDenseSwitch is computed from the
+	// first-byte set alone, but the mandatory-literal paths declare their
+	// locals inline and never call assignV128Locals — so their
+	// denseCounterLocal stays at its zero value, which aliases `ptr`. Seeding
+	// on the wrong condition would store a constant over the input pointer.
+	// Those paths also never reach the adaptive emission (emitPrefixScan takes
+	// its prefix branch when a literal is present), so there is nothing to
+	// seed there either.
+	denseLocalsReady := false
 
 	// needsBulkHyst: any non-mid-accept dominant present
 	// → the dispatch below wraps its bulk-skip in the runtime hysteresis,
@@ -8961,6 +8971,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 			next++
 			denseSkipFlagLocal = next
 			next++
+			denseLocalsReady = true
 		}
 		if needsBulkHyst {
 			bulkHystCounterLocal = next
@@ -9002,6 +9013,19 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// three have a mandatory literal.
 	seedFindFrom := func(b []byte) []byte {
 		b, findFrom = emitFindFromSeed(b, attemptCursor)
+		// The adaptive dense switch's probe budget rides along here for the
+		// same reason the find-from offset does: this is the one point every
+		// locals path passes through, after the declarations and before the
+		// prologue that first reads either. DenseCounter counts DOWN so its
+		// per-attempt gate is two instructions rather than four, which means
+		// zero has to mean "stop" — and a WASM local starts at zero, so
+		// without this store the switch would be tripped before the first
+		// probe and Shufti would never run at all.
+		if denseLocalsReady {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, denseSwitchThreshold)
+			b = append(b, 0x21, denseCounterLocal)
+		}
 		return b
 	}
 	appendLocalGroups := func(b []byte, i32Count byte) []byte {

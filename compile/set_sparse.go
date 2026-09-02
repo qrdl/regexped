@@ -46,15 +46,54 @@ type sparseScratch struct {
 	// eligible states and one failing must not silence the others — a shared
 	// flag took the win from -80% to +5%.
 	memberStale int32
-	end         int32
+	// memberBucketStale: the BUCKET-level counterpart of
+	// memberStale, and the reason a bucket that never skips can stop paying
+	// for the machinery entirely rather than merely stop attempting.
+	//
+	// memberStale bounds the WASTED ATTEMPT. What it cannot bound is the
+	// DISPATCH: a memberTab[state] load, a tee and a branch at every byte of
+	// every candidate walk, plus the stale probe on every eligible state,
+	// whether or not anything is ever skipped. On a set whose tails are one
+	// byte long that dispatch is the entire cost of the feature — ~54 fuel
+	// per call with not one attempt executing.
+	//
+	// So the body emits the walk TWICE, once with the member dispatch and
+	// once without, and picks between them at entry. The second copy is
+	// byte-for-byte the walk a neutral bucket emits, so a bucket whose skip
+	// is not paying costs exactly what not having the feature costs.
+	// memberBucketStale (u8) is that verdict, set at the end of a dispatching
+	// walk that dispatched and advanced nothing; masking the candidate
+	// position makes it a re-probe rather than a latch, as `lPos & 63` does
+	// for the per-state flag: one candidate in memberReprobeCalls takes the
+	// dispatching walk regardless, so a run-free input cannot disable the
+	// skip for a run-heavy one that follows on the same instance.
+	memberBucketStale int32
+	end               int32
 }
+
+// memberReprobeCalls is how often a bucket whose member skip was judged
+// unproductive takes the dispatching walk anyway, to find out whether the
+// input has changed character. One candidate in 32 pays the dispatch, so a
+// wrong verdict costs ~3% of what it used to rather than compounding, and a
+// right one keeps ~97% of the saving. Must be a power of two: the test is a
+// mask over the candidate position.
+const memberReprobeCalls = 32
 
 func planSparseScratch(base int32, numPatterns, numStates int) sparseScratch {
 	s := sparseScratch{endPos: base}
 	s.seen = s.endPos + int32(numPatterns)*4
 	s.fired = s.seen + int32(numPatterns)
 	s.memberStale = s.fired + int32(numPatterns)*2
-	s.end = s.memberStale + int32(numStates)
+	s.memberBucketStale = s.memberStale + int32(numStates)
+	s.end = s.memberBucketStale
+	if numStates > 0 {
+		// Reserved on exactly the same condition as the per-state flags above
+		// it — numStates is zero unless the skip is emitted. Sizing this byte
+		// unconditionally would move every sparse bucket's scratch, and
+		// therefore its neutral output, for a region a neutral build never
+		// reads.
+		s.end++
+	}
 	// 8-align so a following table starts clean.
 	s.end = (s.end + 7) &^ 7
 	return s
@@ -111,30 +150,36 @@ type sparseAcceptTables struct {
 
 // Member self-loop skip sizing.
 //
-// memberMaxBytes is the largest self-loop set the skip will serve, and it is
-// bounded by the EMITTER, not by taste: emitShuftiPrefixCheck's encoding is
-// exact at one bit per member, which fits 8 members per nibble-table pair, and
-// the emitted code shape has to be the same for every state because the set is
-// chosen at RUNTIME from a table. Two pairs is therefore 16 members, fixed.
+// TWO pairs serve ANY self-loop set, of any width, because buildShuftiPairs
+// spends one bit per distinct low-nibble ROW rather than one per member, and
+// there are only 16 rows. That is what removed the former memberMaxBytes = 16
+// ceiling: the old one-bit-per-member encoding fitted 8 members to a pair, so
+// two pairs meant sixteen members and a state whose self-loop was wider had to
+// be REFUSED (truncating it would have strided over non-members and left the
+// state unnoticed — a wrong extent, silently). With the row encoding there is
+// nothing left to refuse, and the widest self-loops — `[^\n]+` and `.+` tails,
+// 255 members — are both eligible and the most profitable to stride.
 //
-// Widening means either more pairs (more work per lap for every state,
-// including the ones with one member) or a loop over a variable pair count
-// (which the runtime-indexed design cannot express cheaply). Neither is worth
-// doing before a corpus family shows a set of 17..64 that pays.
+// The pair count stays FIXED at two because the set is chosen at RUNTIME from
+// a per-state table, so the emitted code shape cannot vary per state. A set
+// needing one pair leaves the second all-zero, contributing nothing for four
+// SIMD ops: the price of one code shape for every state.
 const (
-	memberMaxBytes = 16
 	memberSetPairs = 2
 	memberSetBytes = memberSetPairs * 32 // (tLo,tHi) per pair
 )
 
-// buildMemberSets finds every state whose self-loop set is small enough to
-// serve, and serialises the per-state id table plus the deduplicated sets.
+// buildMemberSets finds every state that has a self-loop set at all, and
+// serialises the per-state id table plus the deduplicated sets.
 //
 // A state qualifies on its SELF-LOOP set — the bytes that transition it back
 // to itself. While the walk sits in such a state the accept list cannot
 // change, so nothing but the position moves, which is what makes skipping the
 // run equivalent to walking it. See buildSparseSuffixBody's emission comment
 // for why that holds even for an ACCEPTING state.
+//
+// There is no width ceiling: see the memberSetPairs comment above for why two
+// pairs cover any set, and why this used to stop at sixteen bytes.
 func buildMemberSets(t *dfaTable, numWASM int) (idTab, setTab []byte) {
 	idTab = make([]byte, numWASM)
 	seen := map[string]int{}
@@ -147,12 +192,9 @@ func buildMemberSets(t *dfaTable, numWASM int) (idTab, setTab []byte) {
 		for by := 0; by < 256; by++ {
 			if t.transitions[gs*256+by] == gs {
 				members = append(members, byte(by))
-				if len(members) > memberMaxBytes {
-					break
-				}
 			}
 		}
-		if len(members) == 0 || len(members) > memberMaxBytes {
+		if len(members) == 0 {
 			continue
 		}
 		key := string(members)
@@ -174,19 +216,32 @@ func buildMemberSets(t *dfaTable, numWASM int) (idTab, setTab []byte) {
 	return idTab, setTab
 }
 
-// encodeMemberSet lays out one set as memberSetPairs (tLo,tHi) nibble tables.
+// encodeMemberSet lays out one set as memberSetPairs (tLo,tHi) nibble tables,
+// in the fixed order emitMemberSetSkip loads them: pair p's tLo at p*32 and
+// its tHi at p*32+16.
 //
-// One bit per member, exactly as emitShuftiPrefixCheck does: member i sets bit
-// i in tLo[member.lo] and in tHi[member.hi], so a byte is a member iff some
-// bit survives the AND. That is exact rather than approximate — the bit
-// survives only if the SAME member contributed both halves.
+// The tables come from buildShuftiPairs, the same rectangle cover
+// emitShuftiPrefixCheck inlines as constants, so membership is EXACT here as
+// it is there. That matters more at this site than at any other in the
+// compiler: elsewhere Shufti is a prefilter where a false positive costs
+// wasted work, but here it decides whether a byte keeps the walk in its
+// state, so a false positive strides past the byte that should have left the
+// state and reports the wrong extent. TestMemberSetEncodingIsExact pins it.
+//
+// A cover needing fewer than memberSetPairs pairs leaves the rest zeroed,
+// which contributes nothing to the OR. More than memberSetPairs is
+// impossible — 16 rows cannot need more than two pairs of eight — and is a
+// panic rather than a silent truncation, since truncating is precisely the
+// wrong-extent bug above.
 func encodeMemberSet(members []byte) []byte {
+	pairs := buildShuftiPairs(members)
+	if len(pairs) > memberSetPairs {
+		panic("compile: member self-loop set needs more than memberSetPairs nibble pairs")
+	}
 	out := make([]byte, memberSetBytes)
-	for i, m := range members {
-		pair := i / 8
-		bit := byte(1) << uint(i%8)
-		out[pair*32+int(m&0x0F)] |= bit
-		out[pair*32+16+int(m>>4)] |= bit
+	for p, pair := range pairs {
+		copy(out[p*32:], pair[0][:])
+		copy(out[p*32+16:], pair[1][:])
 	}
 	return out
 }
@@ -267,8 +322,9 @@ type memberSkipLocals struct {
 // Unlike every other Shufti site in this compiler, the nibble tables are
 // LOADED rather than inlined as v128.const: the set is chosen at runtime from
 // a per-state table, so the code shape must be identical for every state.
-// That is what fixes the pair count at memberSetPairs, and therefore the set
-// size at memberMaxBytes.
+// That is what fixes the pair count at memberSetPairs — which the rectangle
+// cover makes enough for a set of any width, so nothing here caps the set
+// size any more.
 //
 //	lo   = chunk & 0x0F ; hi = chunk >> 4
 //	m    = (T0lo[lo] & T0hi[hi]) | (T1lo[lo] & T1hi[hi])
@@ -430,9 +486,18 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 	// eligible state, so a bucket that never skips declares no v128 —
 	// allocation order is declaration order, and every index above is already
 	// taken, so adding it last moves nothing.
-	lVec, lWas := byte(0), byte(0)
+	// The member skip's own locals, allocated only when the bucket has an
+	// eligible state — allocation order is declaration order, and every index
+	// above is already taken, so adding them last moves nothing.
+	//
+	// lTried / lAdvanced are the call-wide verdict the entry test reads next
+	// time; WASM zero-initialises locals, so each call starts undecided with
+	// no explicit reset.
+	lVec, lWas, lTried, lAdvanced := byte(0), byte(0), byte(0), byte(0)
 	if p.tabs.hasMember {
 		lWas = a.I32() // lPos before an attempt, to tell productive from not
+		lTried = a.I32()
+		lAdvanced = a.I32()
 		lVec = a.V128()
 	}
 
@@ -531,78 +596,121 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 	b = record(b, p.tabs.midOff, p.tabs.midList)
 
 	// ── the walk ────────────────────────────────────────────────────────────
-	b = append(b, 0x02, 0x40)                               // block $exit
-	b = append(b, 0x03, 0x40)                               // loop
-	b = append(b, 0x20, lPos, 0x20, pLen, 0x4F, 0x0D, 0x01) // pos >= len -> exit
-	// emitSetTransition stores the next state into lState itself; it leaves
-	// nothing on the stack.
-	b = emitSetTransition(b, p.l, lState, lTmp, pPtr, lPos, p.tableMemIdx)
-	b = append(b, 0x20, lState, 0x45, 0x0D, 0x01) // dead -> exit
-	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
-	// Member self-loop skip.
 	//
-	// While the walk sits in a state, its accept list cannot change — the
-	// list is indexed by state — so a run of bytes that all self-loop has no
-	// observable effect except on lPos. record() below therefore fires ONCE
-	// at the end of the run instead of once per byte.
-	//
-	// That is equivalent, not approximate, and it rests on two properties of
-	// record() which TestSparseRecordIsSkipSafe pins: it STAMPS lPos into
-	// endPos (so the last write is the one that survives, which is exactly
-	// what walking the run byte by byte would have left), and its first-timer
-	// bookkeeping is idempotent behind `seen` (so the skipped stamps cannot
-	// have been the ones that mattered). Break either and every skipped run
-	// reports the wrong extent, silently.
-	//
-	// Emitted only when the bucket has an eligible state: a bucket that can
-	// never skip must not pay a load per byte to keep asking.
-	if p.tabs.hasMember {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, p.tabs.memberOff)
-		b = append(b, 0x20, lState, 0x6A)
-		b = appendTableLoad8u(b, p.tableMemIdx)
-		b = append(b, 0x22, lTmp)
-		b = append(b, 0x04, 0x40) // if (void): this state has a member set
-		// Attempt gate. A state whose last attempt advanced nothing is
-		// marked stale and stops being tried — that is what turns the
-		// run-free case from +26% into roughly the dispatch floor, since the
-		// wasted attempt, not the dispatch, is what costs.
-		//
-		// It RE-PROBES rather than latching. A latch is a lifetime verdict on
-		// evidence from one moment, and these counters live in scratch, which
-		// survives calls and drives: one run-free input would disable the skip
-		// for every later run-heavy one. Retrying whenever the position is
-		// 64-aligned costs one masked compare and makes the mechanism track
-		// recent behaviour instead. There is no reset to get wrong, and no
-		// caller-visible state.
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, p.scratch.memberStale)
-		b = append(b, 0x20, lState, 0x6A)
-		b = appendTableLoad8u(b, p.tableMemIdx)
-		b = append(b, 0x45) // i32.eqz — not stale
-		b = append(b, 0x20, lPos)
-		b = append(b, 0x41, 0x3F, 0x71) // lPos & 63
-		b = append(b, 0x45)             // == 0 — the re-probe tick
-		b = append(b, 0x72)             // i32.or
-		b = append(b, 0x04, 0x40)       // if (void): attempt
-		b = append(b, 0x20, lPos, 0x21, lWas)
-		b = emitMemberSetSkip(b, memberSkipLocals{
-			pos: lPos, length: pLen, ptr: pPtr, setID: lTmp,
-			mask: lIdx, chunk: lVec,
-		}, p.tabs.memberSetOff, p.tableMemIdx)
-		// stale[state] = advanced ? 0 : 1
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, p.scratch.memberStale)
-		b = append(b, 0x20, lState, 0x6A)
-		b = append(b, 0x20, lPos, 0x20, lWas, 0x46) // i32.eq — did NOT advance
-		b = appendTableStore8(b, p.tableMemIdx)
-		b = append(b, 0x0B) // end if (attempt)
-		b = append(b, 0x0B) // end if (has member set)
+	// Emitted through a closure because a bucket with a member skip emits it
+	// TWICE and chooses at entry — see sparseScratch.memberBucketStale for
+	// why. withMember=false must stay byte-for-byte the walk a bucket without
+	// a member set emits, which is what makes an unproductive skip cost
+	// nothing rather than merely attempt nothing.
+	emitWalk := func(b []byte, withMember bool) []byte {
+		b = append(b, 0x02, 0x40)                               // block $exit
+		b = append(b, 0x03, 0x40)                               // loop
+		b = append(b, 0x20, lPos, 0x20, pLen, 0x4F, 0x0D, 0x01) // pos >= len -> exit
+		// emitSetTransition stores the next state into lState itself; it leaves
+		// nothing on the stack.
+		b = emitSetTransition(b, p.l, lState, lTmp, pPtr, lPos, p.tableMemIdx)
+		b = append(b, 0x20, lState, 0x45, 0x0D, 0x01) // dead -> exit
+		b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+		if withMember {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, p.tabs.memberOff)
+			b = append(b, 0x20, lState, 0x6A)
+			b = appendTableLoad8u(b, p.tableMemIdx)
+			b = append(b, 0x22, lTmp)
+			b = append(b, 0x04, 0x40) // if (void): this state has a member set
+			// The call-wide verdict counts states DISPATCHED to, not attempts
+			// made. Attempts are already suppressed per state by memberStale,
+			// so a walk over states that have all gone stale makes none — and
+			// counting attempts would read that as "nothing to judge" and clear
+			// the verdict, putting the dispatch back on the hot path every
+			// call. Dispatching at all is the cost this verdict exists to
+			// remove, so dispatching at all is what it must observe.
+			b = append(b, 0x41, 0x01, 0x21, lTried)
+			// Attempt gate. A state whose last attempt advanced nothing is
+			// marked stale and stops being tried — that is what turns the
+			// run-free case from +26% into roughly the dispatch floor, since the
+			// wasted attempt, not the dispatch, is what costs.
+			//
+			// It RE-PROBES rather than latching. A latch is a lifetime verdict on
+			// evidence from one moment, and these counters live in scratch, which
+			// survives calls and drives: one run-free input would disable the skip
+			// for every later run-heavy one. Retrying whenever the position is
+			// 64-aligned costs one masked compare and makes the mechanism track
+			// recent behaviour instead. There is no reset to get wrong, and no
+			// caller-visible state.
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, p.scratch.memberStale)
+			b = append(b, 0x20, lState, 0x6A)
+			b = appendTableLoad8u(b, p.tableMemIdx)
+			b = append(b, 0x45) // i32.eqz — not stale
+			b = append(b, 0x20, lPos)
+			b = append(b, 0x41, 0x3F, 0x71) // lPos & 63
+			b = append(b, 0x45)             // == 0 — the re-probe tick
+			b = append(b, 0x72)             // i32.or
+			b = append(b, 0x04, 0x40)       // if (void): attempt
+			b = append(b, 0x20, lPos, 0x21, lWas)
+			b = emitMemberSetSkip(b, memberSkipLocals{
+				pos: lPos, length: pLen, ptr: pPtr, setID: lTmp,
+				mask: lIdx, chunk: lVec,
+			}, p.tabs.memberSetOff, p.tableMemIdx)
+			// stale[state] = advanced ? 0 : 1, and the same verdict OR-ed into
+			// the call-wide one the caller reads to choose next time's walk.
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, p.scratch.memberStale)
+			b = append(b, 0x20, lState, 0x6A)
+			b = append(b, 0x20, lPos, 0x20, lWas, 0x46) // i32.eq — did NOT advance
+			b = append(b, 0x22, lTmp)                   // tee: reused just below
+			b = appendTableStore8(b, p.tableMemIdx)
+			b = append(b, 0x20, lAdvanced, 0x20, lTmp, 0x45, 0x72, 0x21, lAdvanced)
+			b = append(b, 0x0B) // end if (attempt)
+			b = append(b, 0x0B) // end if (has member set)
+		}
+		b = record(b, p.tabs.midOff, p.tabs.midList)
+		b = append(b, 0x0C, 0x00) // continue
+		b = append(b, 0x0B)       // end loop
+		b = append(b, 0x0B)       // end block $exit
+		return b
 	}
-	b = record(b, p.tabs.midOff, p.tabs.midList)
-	b = append(b, 0x0C, 0x00) // continue
-	b = append(b, 0x0B)       // end loop
-	b = append(b, 0x0B)       // end block $exit
+
+	if !p.tabs.hasMember {
+		b = emitWalk(b, false)
+	} else {
+		// Choose the walk: dispatching unless the skip has been judged
+		// unproductive, and then only on every memberReprobeCalls-th candidate.
+		//
+		// The re-probe tick is the CANDIDATE POSITION, not a counter. A
+		// counter has to be loaded, incremented and stored on the very path
+		// this exists to make cheap — eleven instructions per call to maintain
+		// a number nothing else reads, which measured as two thirds of the
+		// remaining overhead. Candidate positions rise through the input and
+		// are already in a parameter, so masking one costs four instructions
+		// and no memory traffic, and it re-probes for exactly the reason
+		// `lPos & 63` does inside the walk: scratch survives calls and drives,
+		// so a run-free input must not be able to disable the skip for a
+		// run-heavy one that follows.
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, p.scratch.memberBucketStale)
+		b = appendTableLoad8u(b, p.tableMemIdx)
+		b = append(b, 0x45)       // i32.eqz — not judged unproductive
+		b = append(b, 0x04, 0x7F) // if (result i32)
+		b = append(b, 0x41, 0x01) //   dispatch unconditionally
+		b = append(b, 0x05)       // else — stale: dispatch only on the tick
+		b = append(b, 0x20, pLPos)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(memberReprobeCalls-1))
+		b = append(b, 0x71, 0x45) // (lPos & (N-1)) == 0
+		b = append(b, 0x0B)       // end if (result i32)
+		b = append(b, 0x04, 0x40) // if (void): the dispatching walk
+		b = emitWalk(b, true)
+		// The verdict: attempted at least once and advanced not once.
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, p.scratch.memberBucketStale)
+		b = append(b, 0x20, lTried, 0x20, lAdvanced, 0x45, 0x71)
+		b = appendTableStore8(b, p.tableMemIdx)
+		b = append(b, 0x05) // else: the walk a bucket without a skip emits
+		b = emitWalk(b, false)
+		b = append(b, 0x0B) // end if
+	}
 
 	// End-of-input accepts, only when the walk really reached the end.
 	b = append(b, 0x20, lPos, 0x20, pLen, 0x46, 0x04, 0x40)
