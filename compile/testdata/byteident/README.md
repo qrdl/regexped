@@ -24,6 +24,7 @@ add a fixture for it.
 | `lit_anchor` | `[a-z]+@example\.com` | literal-anchored find: variable-length prefix recovered by a backward DFA | Compiled DFA |
 | `teddy_prefix` | `ghp_[A-Za-z0-9]{36}` | Teddy nibble-fingerprint prefix scan | Compiled DFA |
 | `shufti` | `[a-p][0-9]{4}END` + `prefer-no-match` | Shufti SIMD first-byte membership prefilter | Compiled DFA |
+| `shufti_neutral` | `[A-Z]{8,}` | the byte-rarity model selecting Shufti with NO hint — the path `byteRarity`'s weights govern, which no other fixture reaches | Compiled DFA |
 | `shufti_dense_switch` | `[a-zA-Z]{20,}` + `prefer-no-match` | the ADAPTIVE dense switch: a first-byte set the rarity model calls dense, forced onto Shufti by the hint, so the runtime probe-budget counter is emitted. `shufti` above does not reach it — 16 first bytes take the unconditional SIMD branch | Compiled DFA |
 | `word_boundary` | `\bclass\b` | `prevWasWord` doubled state space and `wordCharTable` | Compiled DFA |
 | `anchored_find` | `[0-9]{3}\z` | `isAnchoredFind` → `buildAnchoredFindBody` | Compiled DFA |
