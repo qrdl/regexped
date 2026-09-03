@@ -704,3 +704,33 @@ func TestWasmTableBaseTruncatedPayloadDoesNotPanic(t *testing.T) {
 		})
 	}
 }
+
+// TestAppendPaddedULEB128 pins the property the twin-call patch depends on:
+// a fixed-width encoding that DecodeULEB128 reads back exactly, so an emitter
+// can reserve space for a function index before it is known and overwrite the
+// same bytes later without moving anything after them.
+func TestAppendPaddedULEB128(t *testing.T) {
+	for _, v := range []uint32{0, 1, 0x7F, 0x80, 0x3FFF, 0x4000, 0xFFFFF, 0xFFFFFFF, 0xFFFFFFFF} {
+		for n := 1; n <= 5; n++ {
+			// Skip widths the value cannot fit in; those panic by design.
+			if bits := 7 * n; n < 5 && v >= uint32(1)<<uint(bits) {
+				continue
+			}
+			got := AppendPaddedULEB128(nil, v, n)
+			if len(got) != n {
+				t.Fatalf("AppendPaddedULEB128(%d, %d) is %d bytes, want %d", v, n, len(got), n)
+			}
+			back, used, err := DecodeULEB128(got)
+			if err != nil || back != uint64(v) || used != n {
+				t.Fatalf("AppendPaddedULEB128(%d, %d) = % x, decoded (%d, %d, %v)",
+					v, n, got, back, used, err)
+			}
+		}
+	}
+	// Overwriting in place must not change the width.
+	buf := AppendPaddedULEB128(nil, 0, 5)
+	copy(buf, AppendPaddedULEB128(nil, 123456, 5))
+	if back, used, err := DecodeULEB128(buf); err != nil || back != 123456 || used != 5 {
+		t.Errorf("in-place overwrite decoded (%d, %d, %v), want (123456, 5, nil)", back, used, err)
+	}
+}

@@ -1618,6 +1618,10 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 	if !standalone {
 		opts.tableMemIdx = 1
 	}
+	// One allocator for the whole module, shared by the per-pattern entries
+	// below and by every set — the same rule compileAll follows.
+	globals := &moduleGlobals{}
+	opts.globals = globals
 	for _, re := range cfg.Regexps {
 		p, err := compilePattern(re, tableBase, 0, opts)
 		if err != nil {
@@ -1756,15 +1760,18 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 	// caller trusting it on a set-bearing module wrote its input over the
 	// first set's tables. tools/perftest already worked around this by
 	// re-parsing the data section; nothing else did.
-	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone), dataTop, diags, nil
+	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone, globals), dataTop, diags, nil
 }
 
 // assembleModuleWithSets builds a WASM module from per-pattern compilations
 // plus per-set compiled sets. When sets is empty it produces the same bytes
 // as assembleModule.
-func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, memPages int32, standalone bool) []byte {
+func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, memPages int32, standalone bool, globals *moduleGlobals) []byte {
+	if globals == nil {
+		globals = &moduleGlobals{}
+	}
 	if len(sets) == 0 {
-		return assembleModule(patterns, memPages, standalone)
+		return assembleModule(patterns, memPages, standalone, globals)
 	}
 
 	// Reuse assembleModule for the base (patterns only), then we'll handle sets separately.
@@ -1968,8 +1975,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// Global section: the find-from channel (see find_from.go), on the same
 	// terms as the single-pattern assembler. Set capabilities take their own
 	// `from` as a real parameter and do not use it.
-	if moduleUsesFindFrom(patterns) {
-		out = appendSection(out, 6, findFromGlobalSection())
+	if moduleUsesFindFrom(patterns) || globals.Count() > 1 {
+		out = appendSection(out, 6, globals.Section())
 	}
 
 	// Export section.

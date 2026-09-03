@@ -2779,7 +2779,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 				return b
 			},
 		}
-		body = emitPrefixScan(body, mlScan)
+		body, _ = emitPrefixScan(body, mlScan)
 
 		// loop $outer: try BT at each position in [attempt_start, lit_pos−minOff].
 		body = append(body, 0x03, 0x40) // loop $outer
@@ -2942,7 +2942,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		b = append(b, 0x0B) // end block $run_exit
 		return b
 	}
-	body = emitPrefixScan(body, scanParams)
+	body, _ = emitPrefixScan(body, scanParams)
 
 	// attempt_start++; br $outer
 	body = append(body, 0x20, locAttemptStart, 0x41, 0x01, 0x6A, 0x21, locAttemptStart)

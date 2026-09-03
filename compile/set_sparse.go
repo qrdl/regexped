@@ -625,7 +625,14 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 			// the verdict, putting the dispatch back on the hot path every
 			// call. Dispatching at all is the cost this verdict exists to
 			// remove, so dispatching at all is what it must observe.
-			b = append(b, 0x41, 0x01, 0x21, lTried)
+			//
+			// The value is the RE-PROBE MASK itself rather than 1, so the
+			// verdict store below can `select` between it and 0 without any
+			// arithmetic: a multiply there cost two instructions on every
+			// dispatching call, +551 fuel on the win half, for nothing.
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(memberReprobeCalls-1))
+			b = append(b, 0x21, lTried)
 			// Attempt gate. A state whose last attempt advanced nothing is
 			// marked stale and stops being tried — that is what turns the
 			// run-free case from +26% into roughly the dispatch floor, since the
@@ -688,27 +695,44 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		// `lPos & 63` does inside the walk: scratch survives calls and drives,
 		// so a run-free input must not be able to disable the skip for a
 		// run-heavy one that follows.
+		// The verdict byte holds the RE-PROBE MASK rather than a boolean:
+		// memberReprobeCalls-1 when the skip has been judged unproductive, 0
+		// while it is still worth dispatching. That collapses the entry test
+		// from a load, an eqz, a result-typed if and its two arms into a load,
+		// an AND against the candidate position and one branch:
+		//
+		//	stale_mask & lPos == 0  ⇔  dispatch (either not stale, or on the tick)
+		//
+		// A zero mask ANDs to zero at every position, so "not stale" needs no
+		// separate test at all — which is the whole saving, five instructions
+		// per candidate against eight, on every candidate of every sparse
+		// bucket that carries a skip.
+		//
+		// The arms are the opposite way round from the boolean form: a NON-zero
+		// result now means "stale and not on the tick", i.e. take the plain
+		// walk. Getting this backwards emits a bucket that dispatches only on
+		// the tick when it should always dispatch, which costs the skip's whole
+		// win and no correctness — exactly the kind of silent loss the
+		// `sparse-member-skip` win-half row exists to catch.
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, p.scratch.memberBucketStale)
 		b = appendTableLoad8u(b, p.tableMemIdx)
-		b = append(b, 0x45)       // i32.eqz — not judged unproductive
-		b = append(b, 0x04, 0x7F) // if (result i32)
-		b = append(b, 0x41, 0x01) //   dispatch unconditionally
-		b = append(b, 0x05)       // else — stale: dispatch only on the tick
 		b = append(b, 0x20, pLPos)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(memberReprobeCalls-1))
-		b = append(b, 0x71, 0x45) // (lPos & (N-1)) == 0
-		b = append(b, 0x0B)       // end if (result i32)
-		b = append(b, 0x04, 0x40) // if (void): the dispatching walk
+		b = append(b, 0x71)       // i32.and — mask & candidate position
+		b = append(b, 0x04, 0x40) // if (void): stale AND off the tick
+		b = emitWalk(b, false)    //   the walk a bucket without a skip emits
+		b = append(b, 0x05)       // else: the dispatching walk
 		b = emitWalk(b, true)
-		// The verdict: attempted at least once and advanced not once.
+		// The verdict: dispatched at least once and advanced not once. lTried
+		// already holds the mask (or 0 if nothing was dispatched to), so this
+		// is `advanced ? 0 : lTried` — one select, six instructions in all,
+		// exactly what the boolean store cost before the mask existed.
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, p.scratch.memberBucketStale)
-		b = append(b, 0x20, lTried, 0x20, lAdvanced, 0x45, 0x71)
+		b = append(b, 0x41, 0x00) // i32.const 0
+		b = append(b, 0x20, lTried, 0x20, lAdvanced)
+		b = append(b, 0x1B) // select — lAdvanced != 0 ? 0 : lTried
 		b = appendTableStore8(b, p.tableMemIdx)
-		b = append(b, 0x05) // else: the walk a bucket without a skip emits
-		b = emitWalk(b, false)
 		b = append(b, 0x0B) // end if
 	}
 

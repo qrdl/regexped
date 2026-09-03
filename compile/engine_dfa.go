@@ -5890,7 +5890,51 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 // `([]byte, []int)`, restore the `callSites` plumbing, and update both
 // callers.
 func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode) {
-	var body []byte
+	cs, mode, _, _ := appendFindCodeEntryTwinned(cs, l, t, mandatoryLit, tableMemIdx, nil)
+	return cs, mode
+}
+
+// appendFindCodeEntryTwinned is appendFindCodeEntry plus the NEUTRAL TWIN: when
+// this layout's find body carries a runtime escape that can judge its own hint
+// wrong, a second body is emitted exactly as a neutral compile would emit it,
+// and the returned twin is non-nil.
+//
+// Only the adaptive dense switch qualifies today. Its escape costs two
+// instructions per ATTEMPT for the rest of a call once tripped, and a 50 KB
+// no-match scan makes ~40,000 attempts — the whole margin by which
+// `prefer-no-match` cost more than neutral on `[a-zA-Z]{20,}`. A twin removes
+// the residue completely, because the neutral copy IS the neutral body.
+//
+// The twin is built from the SAME layout and the same tables. That is sound
+// here and would NOT be for a LikelyMatch dominant: the hinted table encodes
+// dominants as 128..255 in midAcceptBytes, values a neutral body would read as
+// ordinary accepts. Under LikelyNoMatch no such encoding is written — verified
+// on `[a-zA-Z]{20,}`, whose midAccept segment is `\00\01` under both neutral
+// and prefer-no-match, and `\00\80` only under prefer-match — so the twin can
+// share the tables. Extending this to the mid-accept channel means emitting a
+// second, plain midAccept segment first.
+//
+// globals may be nil, in which case no twin is built and the bytes are exactly
+// what the single-body path produces.
+func appendFindCodeEntryTwinned(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int, globals *moduleGlobals) ([]byte, findFromMode, []byte, int) {
+	var twin []byte
+	var hasTwin bool
+	// The twin is worth building only when the hinted body would actually carry
+	// the escape. shuftiPrefixPlan is the one predicate that decides that, and
+	// it is asked here with the same arguments buildFindBody will ask it with,
+	// so the two cannot disagree about whether a switch exists.
+	if globals != nil && l.lnmAction5 && !isAnchoredFind(t) && mandatoryLit == nil {
+		if _, adaptive := shuftiPrefixPlan(l.firstBytes, true, true); adaptive {
+			hasTwin = true
+		}
+	}
+	cs, mode, twin, patch := appendFindCodeEntryInner(cs, l, t, mandatoryLit, tableMemIdx, hasTwin)
+	return cs, mode, twin, patch
+}
+
+func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int, hasTwin bool) ([]byte, findFromMode, []byte, int) {
+	var body, twinBody []byte
+	twinPatch := -1
 	// mode is decided by WHICH body this dispatch picks.
 	//
 	// The two anchored arms are ffAnchoredZeroOnly and their bodies are used
@@ -5904,7 +5948,15 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 		if isAnchoredFind(t) {
 			body, mode = buildHybridAnchoredFindBody(t, l, tableMemIdx), ffAnchoredZeroOnly
 		} else {
-			body, mode = buildHybridFindBody(t, l, mandatoryLit, tableMemIdx)
+			body, mode, twinPatch = buildHybridFindBodyVerdict(t, l, mandatoryLit, tableMemIdx, hasTwin, l.lnmAction5)
+			if hasTwin {
+				tb, tmode, _ := buildHybridFindBodyVerdict(t, l, mandatoryLit, tableMemIdx, false, false)
+				if tmode != mode {
+					panic("compile: neutral find twin disagrees with its hinted body about findFromMode")
+				}
+				twinBody = utils.AppendULEB128(nil, uint32(len(tb)))
+				twinBody = append(twinBody, tb...)
+			}
 		}
 	} else if isAnchoredFind(t) {
 		mode = ffAnchoredZeroOnly
@@ -5929,7 +5981,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			tableMemIdx:        tableMemIdx,
 		})
 	} else {
-		body, mode = buildFindBody(findBodyParams{
+		fp := findBodyParams{
 			report:                l.report,
 			startState:            l.wasmStart,
 			midStartState:         l.wasmMidStart,
@@ -5979,10 +6031,36 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			lnmAction5:            l.lnmAction5,
 			skipSafeOnDead:        l.skipSafeOnDead,
 			eofSkipSafe:           l.eofSkipSafe,
-		})
+		}
+		fp.hasTwin = hasTwin
+		body, mode, twinPatch = buildFindBody(fp)
+		if hasTwin {
+			// The neutral twin: the SAME layout and tables, emitted the way a
+			// neutral compile would emit them. lnmAction5=false is the whole
+			// difference — it un-forces Shufti, so the scan falls back to the
+			// scalar first-byte loop and shuftiPrefixPlan reports no adaptive
+			// switch, which removes both the gate and the counter. The twin
+			// never writes the verdict; only the hinted body does.
+			np := fp
+			np.lnmAction5 = false
+			np.hasTwin = false
+			np.report = nil // the strategy note belongs to the shipped body
+			tb, tmode, _ := buildFindBody(np)
+			if tmode != mode {
+				panic("compile: neutral find twin disagrees with its hinted body about findFromMode")
+			}
+			twinBody = utils.AppendULEB128(nil, uint32(len(tb)))
+			twinBody = append(twinBody, tb...)
+		}
 	}
-	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...), mode
+	sizePrefix := utils.AppendULEB128(nil, uint32(len(body)))
+	if twinPatch >= 0 {
+		// Report the patch offset relative to the START of the size-prefixed
+		// entry, which is what the assembler holds.
+		twinPatch += len(sizePrefix)
+	}
+	cs = append(cs, sizePrefix...)
+	return append(cs, body...), mode, twinBody, twinPatch
 }
 
 // emitCompressedU8Transition emits the compressed u8 DFA transition:
@@ -8088,7 +8166,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 			OnMatch: nil,
 		}
 	}
-	b = emitPrefixScan(b, simdParams)
+	b, _ = emitPrefixScan(b, simdParams)
 
 	// ── Scalar literal verification (multi-literal / Teddy only) ─────────────
 	// After Teddy places a candidate in attempt_start, verify that one of the
@@ -8696,7 +8774,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, simdParams)
+	b, _ = emitPrefixScan(b, simdParams)
 
 	// ── Per-branch verify chain ─────────────────────────────────────────────
 	// Teddy has false positives, so every candidate is verified byte-for-byte
@@ -8852,9 +8930,14 @@ type findBodyParams struct {
 	midAcceptNLOff        int32
 	tableMemIdx           int
 	dominantStates        []dominantInfo
-	lnmAction5            bool
-	skipSafeOnDead        bool
-	eofSkipSafe           bool
+	// hasTwin says a NEUTRAL twin of this body exists, so the adaptive dense
+	// switch can hand off to it the moment its probe budget runs out, instead
+	// of paying its own gate on every remaining attempt of the call. Set only
+	// on the HINTED body of a twinned pair; the twin itself never hands off.
+	hasTwin        bool
+	lnmAction5     bool
+	skipSafeOnDead bool
+	eofSkipSafe    bool
 
 	// soleMidDominant: a nonzero midAccept load can only be dominantStates[0],
 	// so the dispatch needs neither the cached value nor the compare against
@@ -8866,7 +8949,7 @@ type findBodyParams struct {
 	report *Reporter
 }
 
-func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
+func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	// Destructured once so the body below reads exactly as it did when these
 	// were positional parameters; the struct exists to make call sites keyed.
 	startState := p.startState
@@ -9183,6 +9266,10 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// Emits: if attempt_start >= len: br $no_match
 	//        state=startState, pos=attempt_start, last_accept=-1
 	//        if accept[state]: last_accept=pos  (start-state empty-match check)
+	// twinCallPatch records where the adaptive dense switch's handoff call to
+	// the neutral twin left a five-byte zero-padded immediate. -1 when this
+	// body emits no handoff, which is every body without a twin.
+	twinCallPatch := -1
 	emitOuterPrologue := func(b []byte) []byte {
 		lenForScan := byte(1) // raw len param
 		params := prefixScanParams{
@@ -9204,6 +9291,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 			TableMemIdx:      tableMemIdx,
 			LikelyNoMatch:    lnmAction5,
 			AllowDenseSwitch: needsDenseSwitch,
+			HasTwin:          p.hasTwin,
 			EngineDepth:      2, // loop $outer + block $no_match
 			Locals: prefixScanLocals{
 				Ptr:           0,
@@ -9525,7 +9613,14 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 			},
 		}
 		params.Report = p.report
-		return emitPrefixScan(b, params)
+		b, patch := emitPrefixScan(b, params)
+		if patch >= 0 {
+			if twinCallPatch >= 0 {
+				panic("compile: two twin-call patch sites in one find body")
+			}
+			twinCallPatch = patch
+		}
+		return b
 	}
 
 	// ── helper: emit the packed-i64 return and close loops ──────────────────
@@ -9694,7 +9789,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		}
 		b = append(b, 0x21, scanStartLocal)
 		b = append(b, 0x03, 0x40) // loop $lit_outer
-		b = emitPrefixScan(b, prefixScanParams{
+		b, _ = emitPrefixScan(b, prefixScanParams{
 			Prefix:      mandatoryLit.bytes,
 			EngineDepth: 2, // loop $lit_outer + block $no_match
 			// MinPatternLen NOT set: scanStartLocal is a mandatory-lit scan
@@ -9838,7 +9933,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		b = append(b, 0x0B)       // end loop $scan
 		b = append(b, 0x0B)       // end block $found
 		b = emitReturn(b)
-		return b, findFrom
+		return b, findFrom, twinCallPatch
 	}
 
 	if useU8 {
@@ -9916,7 +10011,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		b = append(b, 0x0B)       // end loop $scan
 		b = append(b, 0x0B)       // end block $found
 		b = emitReturn(b)
-		return b, findFrom
+		return b, findFrom, twinCallPatch
 	}
 
 	// ── u16 find path ─────────────────────────────────────────────────────────
@@ -10016,7 +10111,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	b = append(b, 0x0B)       // end loop $scan
 	b = append(b, 0x0B)       // end block $found
 	b = emitReturn(b)
-	return b, findFrom
+	return b, findFrom, twinCallPatch
 }
 
 // ============================================================================
@@ -11677,7 +11772,7 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) ([]byt
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds A AND the find-from floor: attempt_start < find_from + M →
 	// advance & retry.
@@ -12954,7 +13049,7 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findF
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds check: attempt_start + K + N > len → $no_match.
 	b = append(b, 0x20, locAttemptStart)
@@ -13077,7 +13172,7 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds: attempt_start + K + N > len → $no_match.
 	b = append(b, 0x20, locAttemptStart)
@@ -13210,7 +13305,7 @@ func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCapture
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds: attempt_start + K + countMin > len → $no_match.
 	b = append(b, 0x20, locAttemptStart)
@@ -13538,7 +13633,7 @@ func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, 
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds: attempt_start + K + countMin > len → $no_match.
 	b = append(b, 0x20, locAttemptStart)
@@ -14002,7 +14097,7 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// attempt_start = candidate position. Try each branch in turn.
 	locals := litChainBranchLocals{
@@ -14114,7 +14209,7 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	locals := litChainBranchLocals{
 		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
@@ -14226,7 +14321,7 @@ func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLay
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	locals := litChainBranchLocals{
 		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
@@ -14336,7 +14431,7 @@ func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	locals := litChainBranchLocals{
 		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,

@@ -665,8 +665,8 @@ func TestSetEmitBatchPosFnOffsetWithoutBatching(t *testing.T) {
 // producing different bytes.
 func TestSetEmitAssembleWithNoSetsMatchesAssembleModule(t *testing.T) {
 	for _, standalone := range []bool{true, false} {
-		viaSets := assembleModuleWithSets(nil, nil, 1, standalone)
-		direct := assembleModule(nil, 1, standalone)
+		viaSets := assembleModuleWithSets(nil, nil, 1, standalone, nil)
+		direct := assembleModule(nil, 1, standalone, nil)
 		if string(viaSets) != string(direct) {
 			t.Errorf("standalone=%v: assembleModuleWithSets(sets=nil) produced %d bytes, "+
 				"assembleModule %d — the delegation no longer matches",

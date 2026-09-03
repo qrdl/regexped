@@ -398,6 +398,14 @@ type CompileOptions struct {
 	// Defaults to 128*1024 (128 KB) when zero.
 	MemoBudget  int
 	tableMemIdx int // 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables)
+
+	// globals is the module's WASM global allocator, shared by every pattern
+	// in one module so their indices cannot collide. A POINTER, because
+	// CompileOptions is passed by value: an allocation made inside
+	// compilePattern has to be visible to the assembler afterwards. Nil on the
+	// paths that compile a body without assembling a module (helper DFAs,
+	// SelectEngine); those allocate nothing, so nothing dereferences it.
+	globals *moduleGlobals
 }
 
 // compiledPattern holds the intermediate compilation result for one RegexEntry.
@@ -510,6 +518,29 @@ type compiledPattern struct {
 	altLitAnchorTeddyT1HiOff   int32
 	altLitAnchorTeddyT1LoBytes []byte
 	altLitAnchorTeddyT1HiBytes []byte
+	// findNeutralBody is a SECOND copy of the find body, emitted exactly as a
+	// NEUTRAL compile would emit it, for patterns whose hinted body carries a
+	// runtime escape that can judge its own hint wrong.
+	//
+	// The pair exists because a disabled mechanism still costs something per
+	// attempt: the adaptive dense switch's gate is two instructions on every
+	// attempt for the whole remainder of a call once it has tripped, which on a
+	// 50 KB no-match buffer is ~40,000 attempts and was the entire margin by
+	// which `prefer-no-match` cost more than neutral. A second FUNCTION has no
+	// such residue — the neutral copy is the neutral body, instruction for
+	// instruction — and unlike duplicating the loop inside one body it does not
+	// shift any of the hardcoded branch depths the engine emits.
+	//
+	// Nil when the hinted body has no escape to judge, which is every neutral
+	// compile and most hinted ones.
+	findNeutralBody []byte
+
+	// findTwinCallOff is the byte offset within findBody (INCLUDING its size
+	// prefix) of the five-byte zero-padded LEB128 immediate on the handoff
+	// call to findNeutralBody. -1 when there is no twin. Patched in
+	// assembleModule, where the twin's function index is finally known.
+	findTwinCallOff int
+
 	// altLitAnchorFindBody (the dispatcher) is NOT a field here — like
 	// litAnchorFindBody, it's built at assembleModule time and appended
 	// directly, since it calls branch functions by index.
@@ -592,6 +623,7 @@ const (
 	slotLitAnchorBackScan              // the lit-anchor pair's backward half
 	slotLitAnchorFind                  // the lit-anchor pair's forward half
 	slotFind                           // a plain find body
+	slotFindNeutral                    // the neutral twin of a plain find body
 	slotCapture                        // captureBody
 	slotGroupsWrapper                  // the composed (find, capture) wrapper
 	slotBatchFind
@@ -637,6 +669,9 @@ func (p *compiledPattern) funcLayout() []funcSlot {
 		add(slotLitAnchorFind)
 	case p.findBody != nil:
 		add(slotFind)
+		if p.findNeutralBody != nil {
+			add(slotFindNeutral)
+		}
 	}
 	if p.captureBody != nil {
 		add(slotCapture)
@@ -1818,7 +1853,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			}
 			l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
 			if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
-				p.setFind(appendFindCodeEntry(nil, l, table, patMandLit, buildOpts.tableMemIdx))
+				fb, fmode, twin, twinPatch := appendFindCodeEntryTwinned(nil, l, table, patMandLit,
+					buildOpts.tableMemIdx, buildOpts.globals)
+				p.setFind(fb, fmode)
+				p.findNeutralBody = twin
+				p.findTwinCallOff = twinPatch
+				if (twin != nil) != (twinPatch >= 0) {
+					panic("compile: find twin and its handoff call-site patch must be emitted together")
+				}
 			}
 
 			// Note the asymmetry with the single-pattern lit-anchor case just
@@ -2043,7 +2085,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 // standalone=false: module imports memory from "main" (for wasm-merge).
 // Both modes emit active data segments; in non-standalone mode the host stub's
 // reservation variable ensures the host runtime declares enough initial memory.
-func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool) []byte {
+func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool, globals *moduleGlobals) []byte {
 	// Pre-collect data segments.
 	totalSegs := 0
 	var rawData []byte
@@ -2134,6 +2176,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		slotLitAnchorBackScan: 0x00,
 		slotLitAnchorFind:     0x01,
 		slotFind:              0x01,
+		slotFindNeutral:       0x01, // same (i32,i32)→i64 shape as the body it twins
 		slotCapture:           0x02, // (i32,i32,i32)→i32
 		slotGroupsWrapper:     0x02,
 		slotBatchFind:         0x04, // (i32×5)→i32
@@ -2168,8 +2211,11 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	// reads the global can never end up in a module that failed to declare
 	// it — that pairing is a WASM VALIDATION error, caught at load by every
 	// harness, rather than a silent read of the wrong thing.
-	if moduleUsesFindFrom(patterns) {
-		out = appendSection(out, 6, findFromGlobalSection())
+	if globals == nil {
+		globals = &moduleGlobals{}
+	}
+	if moduleUsesFindFrom(patterns) || globals.Count() > 1 {
+		out = appendSection(out, 6, globals.Section())
 	}
 
 	// Export section.
@@ -2279,7 +2325,27 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		} else if p.findBody != nil {
 			// LNM non-mid bulk-skip helper call-site patching was here —
 			// see archive Section 16.
-			cs = append(cs, p.findBody...)
+			// Patch the handoff call's function index now that it is known.
+			// funcLayout places slotFindNeutral immediately after slotFind, so
+			// the twin is the body's index plus one. The immediate was emitted
+			// as five zero-padded LEB128 bytes, so overwriting it in place
+			// moves nothing.
+			if p.findNeutralBody != nil {
+				body := append([]byte(nil), p.findBody...)
+				off := p.findTwinCallOff
+				if off < 0 || off+twinCallImmWidth > len(body) {
+					panic("compile: find twin handoff patch offset outside the body")
+				}
+				copy(body[off:off+twinCallImmWidth],
+					utils.AppendPaddedULEB128(nil, uint32(base+findOff+1), twinCallImmWidth))
+				cs = append(cs, body...)
+				// The neutral twin follows immediately, matching funcLayout's
+				// slotFind → slotFindNeutral order. Both are already
+				// size-prefixed by their emitter.
+				cs = append(cs, p.findNeutralBody...)
+			} else {
+				cs = append(cs, p.findBody...)
+			}
 		}
 		if p.captureBody != nil {
 			cs = append(cs, p.captureBody...)
@@ -2404,6 +2470,11 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	if !standalone {
 		opts.tableMemIdx = 1
 	}
+	// One allocator per module, created before the loop so every pattern draws
+	// from the same counter and the assembler below declares exactly what they
+	// allocated.
+	globals := &moduleGlobals{}
+	opts.globals = globals
 	var compiled []*compiledPattern
 	cur := tableBase
 	for _, re := range patterns {
@@ -2437,7 +2508,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	if memPages < 1 {
 		memPages = 1
 	}
-	return assembleModule(compiled, memPages, standalone), lastTableEnd, nil
+	return assembleModule(compiled, memPages, standalone, globals), lastTableEnd, nil
 }
 
 // CmdCompile compiles all regexp patterns (and optional sets) from cfg to a

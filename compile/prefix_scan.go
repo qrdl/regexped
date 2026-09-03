@@ -282,6 +282,11 @@ type prefixScanLocals struct {
 	DenseCounter, DenseSkipFlag byte
 }
 
+// twinCallImmWidth is the reserved width of the handoff call's function-index
+// immediate. Five bytes is the maximum a u32 LEB128 can take, so the patch can
+// write any index without moving the bytes after it.
+const twinCallImmWidth = 5
+
 // denseSwitchThreshold is the number of consecutive no-skip Shufti attempts
 // that trip the adaptive switch to scalar, and therefore the value
 // DenseCounter is seeded to and counts down from. Chosen by
@@ -336,6 +341,11 @@ type prefixScanParams struct {
 	// is required for correctness, not just an optimisation choice.
 	AllowDenseSwitch bool
 
+	// HasTwin says a NEUTRAL twin body exists for this pattern, so the adaptive
+	// dense switch can hand off to it the moment its probe budget runs out
+	// instead of paying its own gate for the rest of the call.
+	HasTwin bool
+
 	Locals prefixScanLocals
 
 	// OnMatch is called after the scan finds a candidate and all scan blocks
@@ -356,7 +366,16 @@ type prefixScanParams struct {
 // the prefix path).
 //
 // The caller is responsible for the surrounding $no_match/$outer blocks.
-func emitPrefixScan(b []byte, p prefixScanParams) []byte {
+// emitPrefixScan emits the scan and returns the body bytes plus the offset of
+// a twin-call immediate that still needs patching, or -1 when there is none.
+// See the handoff in the adaptive block for what that call is.
+func emitPrefixScan(b []byte, p prefixScanParams) ([]byte, int) {
+	b, patch := emitPrefixScanInner(b, p)
+	return b, patch
+}
+
+func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
+	twinCallPatch := -1
 	// The strategy is reported HERE, by the code that chooses it. Deriving it
 	// again at the call site would be a second implementation of this
 	// if/else — the mistake --verbose already made once with SelectEngine.
@@ -806,6 +825,41 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 			b = append(b, 0x0B) // end loop $simd_outer
 			b = append(b, 0x0B) // end block $simd_exhausted
 			if adaptive {
+				if p.HasTwin {
+					// The probe budget is spent: this body's prefilter has
+					// proved itself useless on THIS input, and every remaining
+					// attempt would pay `local.get DenseCounter; if` for the
+					// rest of the call — ~40,000 of them on a 50 KB buffer,
+					// which is the whole margin by which prefer-no-match cost
+					// more than neutral.
+					//
+					// Hand the rest of the search to the neutral twin instead.
+					// The else arm is entered at most ONCE per call (the very
+					// first attempt after the trip) and costs nothing on any
+					// path that never trips, because the `if` is already here.
+					//
+					// Exactness: attempt_start has only ever advanced past
+					// positions this body proved cannot begin a match — including
+					// the skip-safe-on-dead jumps, which are proofs over a
+					// range — so a leftmost-first search from it returns the same
+					// answer as one from 0. The twin is ffNative and reads the
+					// WHOLE buffer, so \b and (?m:^) at that position are judged
+					// against the real preceding byte; the two bodies' modes are
+					// asserted equal where the twin is built.
+					b = append(b, 0x05) // else — DenseCounter == 0
+					b = append(b, 0x20, l.AttemptStart)
+					b = append(b, 0x24) // global.set $find_from
+					b = utils.AppendULEB128(b, findFromGlobalIdx)
+					b = append(b, 0x20, l.Ptr)
+					b = append(b, 0x20, l.Len)
+					// The twin's function index is not known until the module is
+					// assembled, so the immediate is five zero-padded LEB128
+					// bytes and its offset is reported to the caller to patch.
+					b = append(b, 0x10)
+					twinCallPatch = len(b)
+					b = utils.AppendPaddedULEB128(b, 0, twinCallImmWidth)
+					b = append(b, 0x0F) // return
+				}
 				b = append(b, 0x0B) // end if $dense_gate
 			}
 		}
@@ -861,7 +915,7 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 	if p.OnMatch != nil {
 		b = p.OnMatch(b)
 	}
-	return b
+	return b, twinCallPatch
 }
 
 // strategyNote names the scan strategy these params select, in the words the

@@ -13,6 +13,34 @@ func PageAlign(n int64) int64 {
 	return (n + WasmPageSize - 1) &^ (WasmPageSize - 1)
 }
 
+// AppendPaddedULEB128 appends v as EXACTLY n bytes of unsigned LEB128, padding
+// with redundant continuation bytes rather than the minimal encoding.
+//
+// It exists so an emitter can reserve space for a value it does not yet know —
+// a function index, in the only current caller — and overwrite those same n
+// bytes later without moving anything after them. WASM accepts non-minimal
+// LEB128 for indices, and DecodeULEB128 reads the padded form back unchanged.
+//
+// Panics if v does not fit in n bytes, which would silently truncate the index
+// and produce a module that calls the wrong function.
+func AppendPaddedULEB128(out []byte, v uint32, n int) []byte {
+	if n < 1 || n > 5 {
+		panic("utils: AppendPaddedULEB128 width must be 1..5")
+	}
+	for i := 0; i < n; i++ {
+		b := byte(v & 0x7F)
+		v >>= 7
+		if i < n-1 {
+			b |= 0x80 // more bytes follow, even when the value is exhausted
+		}
+		out = append(out, b)
+	}
+	if v != 0 {
+		panic("utils: AppendPaddedULEB128 value does not fit in the requested width")
+	}
+	return out
+}
+
 // AppendULEB128 encodes v as an unsigned LEB128.
 func AppendULEB128(out []byte, v uint32) []byte {
 	for {
