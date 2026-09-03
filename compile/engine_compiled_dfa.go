@@ -361,6 +361,7 @@ func buildHybridFindBodyVerdict(t *dfaTable, l *dfaLayout, mandatoryLit *mandato
 		tableOff:              l.tableOff,
 		midAcceptOff:          l.midAcceptOff,
 		soleMidDominant:       soleMidDominant(l),
+		classChain:            classChainFor(l, t),
 		firstByteOff:          l.firstByteOff,
 		prefix:                l.prefix,
 		classMapOff:           l.classMapOff,

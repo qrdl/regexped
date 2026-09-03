@@ -1492,6 +1492,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern),
 			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 			lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
+			lmClassChain:         buildOpts.LikelyMode == LikelyMatch,
 		})
 	}
 	patMandLit := findMandatoryLit(re.Pattern)

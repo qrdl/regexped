@@ -2484,6 +2484,11 @@ type dfaLayout struct {
 	// hysteresis).
 	lmWideShufti bool
 
+	// lmClassChain enables the chain-start SIMD verify (see
+	// detectClassChainPrefix). LikelyMatch only, and set from the same
+	// buildOpts.LikelyMode as its siblings above.
+	lmClassChain bool
+
 	// Fast-skip / SIMD (find mode only)
 	prefix         []byte
 	firstByteOff   int32
@@ -2656,6 +2661,7 @@ type dfaLayoutParams struct {
 	lmBareShufti         bool
 	lmNonMidShufti       bool
 	lmWideShufti         bool
+	lmClassChain         bool
 	forceWordChar        bool
 	report               *Reporter
 }
@@ -2679,6 +2685,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	l.lmBareShufti = lmBareShufti
 	l.lmNonMidShufti = lmNonMidShufti
 	l.lmWideShufti = lmWideShufti
+	l.lmClassChain = p.lmClassChain
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
 	// acceptLimit: WASM-state ID K such that "state in [1, K]" iff the DFA state
@@ -4307,6 +4314,25 @@ func applyDominantStateEncoding(l *dfaLayout, encodeNonMid bool) {
 			l.midAcceptBytes[info.state] = info.encodedByte
 		}
 	}
+}
+
+// classChainFor returns the chain-start probe description for l, or nil.
+//
+// Gated on prefer-match: the probe verifies a WHOLE 16-byte chunk before the
+// walk begins, which is the right bet when the caller has said matches are
+// expected and a wasted one on input made of short runs. Whether NEUTRAL
+// should also carry it is a separate measurement with a different balance —
+// it would move every fixture in this family — and is deliberately not asked
+// here.
+func classChainFor(l *dfaLayout, t *dfaTable) *classChainPrefix {
+	if !l.lmClassChain {
+		return nil
+	}
+	cc, ok := detectClassChainPrefix(l, t)
+	if !ok {
+		return nil
+	}
+	return &cc
 }
 
 // soleMidDominant reports whether a nonzero midAcceptBytes load can only ever
@@ -6028,6 +6054,7 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 			tableMemIdx:           tableMemIdx,
 			dominantStates:        l.dominantStates,
 			soleMidDominant:       soleMidDominant(l),
+			classChain:            classChainFor(l, t),
 			lnmAction5:            l.lnmAction5,
 			skipSafeOnDead:        l.skipSafeOnDead,
 			eofSkipSafe:           l.eofSkipSafe,
@@ -8930,6 +8957,11 @@ type findBodyParams struct {
 	midAcceptNLOff        int32
 	tableMemIdx           int
 	dominantStates        []dominantInfo
+	// classChain, when non-nil, describes a linear class chain at the head of
+	// the pattern, so the candidate prologue can verify it with one SIMD probe
+	// instead of walking it a byte at a time. See detectClassChainPrefix.
+	classChain *classChainPrefix
+
 	// hasTwin says a NEUTRAL twin of this body exists, so the adaptive dense
 	// switch can hand off to it the moment its probe budget runs out, instead
 	// of paying its own gate on every remaining attempt of the call. Set only
@@ -8997,6 +9029,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	tableMemIdx := p.tableMemIdx
 	dominantStates := p.dominantStates
 	soleMid := p.soleMidDominant
+	classChain := p.classChain
 	lnmAction5 := p.lnmAction5
 	skipSafeOnDead := p.skipSafeOnDead
 	eofSkipSafe := p.eofSkipSafe
@@ -9075,6 +9108,13 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		if useShufti, _ := shuftiPrefixPlan(firstBytes, lnmAction5, true); useShufti {
 			numV128ForScan = 1
 		}
+	}
+	// The chain-start probe needs a v128 chunk of its own, and it fires on
+	// patterns whose first-byte set is too dense for Shufti — `[a-zA-Z]{20,}`
+	// scans SCALAR, so without this the scan would reserve no v128 local at
+	// all and the probe would address one that was never declared.
+	if classChain != nil && numV128ForScan == 0 {
+		numV128ForScan = 1
 		// else: scalar firstByteFlags — no SIMD locals needed
 	}
 	if len(dominantStates) > 0 && numV128ForScan == 0 {
@@ -9460,6 +9500,84 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 					b = append(b, 0x6A)       // i32.add
 					b = append(b, 0x21, 0x03) // pos = attempt_start + prefix_len
 				} else {
+					// ── chain-start SIMD verify ─────────────────────────────
+					//
+					// When the pattern's head is a linear chain of one byte
+					// class, one probe replaces the first min(N,16) scalar
+					// steps AND retires a failed range outright: a non-member
+					// at offset r proves no start in [p, p+r] can begin a
+					// match, because each of those has fewer than N class
+					// bytes ahead of it. The scalar scan would retry every one
+					// of them.
+					//
+					// Emitted around the ordinary state/pos init, which stays
+					// as the fallback for the last <16 bytes of the input. The
+					// last_accept initialisation AFTER this block is untouched
+					// and runs on both paths — which is why the probe never
+					// writes last_accept itself: landing in an accepting state
+					// with pos set is enough for that code to do it.
+					chainDone := false
+					if classChain != nil {
+						k := classChain.n
+						if k > 16 {
+							k = 16
+						}
+						var bs blockStack
+						bs.Push("outer")
+						bs.Push("chain_done")
+						b = append(b, 0x02, 0x40) // block $chain_done
+						bs.Push("scalar")
+						b = append(b, 0x02, 0x40) // block $scalar
+						// Need a full 16-byte chunk regardless of k.
+						b = append(b, 0x20, 0x04) // local.get attempt_start
+						b = append(b, 0x41, 0x10) // i32.const 16
+						b = append(b, 0x6A)       // i32.add
+						b = append(b, 0x20, 0x01) // local.get len
+						b = append(b, 0x4B)       // i32.gt_u
+						b = append(b, 0x0D, bs.Depth("scalar"))
+						// chunk = v128.load(ptr + attempt_start)
+						b = append(b, 0x20, 0x00)
+						b = append(b, 0x20, 0x04)
+						b = append(b, 0x6A)
+						b = append(b, 0xFD, 0x00, 0x00, 0x00)
+						b = append(b, 0x21, chunkLocal)
+						// mask: bit j set ⇔ lane j is NOT in the class.
+						b = emitShuftiStopMask(b, classChain.class, chunkLocal)
+						if k < 16 {
+							// Only the first k lanes decide; a non-member past
+							// them does not stop a match starting here.
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32((1<<uint(k))-1))
+							b = append(b, 0x71) // i32.and
+						}
+						b = append(b, 0x22, simdMaskLocal) // local.tee
+						b = append(b, 0x45)                // i32.eqz
+						b = append(b, 0x04, 0x40)          // if: all k are members
+						bs.Push("if")
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, classChain.states[k-1])
+						b = append(b, 0x21, 0x02) // local.set state
+						b = append(b, 0x20, 0x04)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(k))
+						b = append(b, 0x6A)       // attempt_start + k
+						b = append(b, 0x21, 0x03) // local.set pos
+						b = append(b, 0x0C, bs.Depth("chain_done"))
+						bs.Pop()
+						b = append(b, 0x0B) // end if
+						// Short run: skip the whole failed range.
+						b = append(b, 0x20, 0x04)
+						b = append(b, 0x20, simdMaskLocal)
+						b = append(b, 0x68) // i32.ctz
+						b = append(b, 0x6A)
+						b = append(b, 0x41, 0x01)
+						b = append(b, 0x6A)       // + 1
+						b = append(b, 0x21, 0x04) // local.set attempt_start
+						b = append(b, 0x0C, bs.Depth("outer"))
+						bs.Pop()
+						b = append(b, 0x0B) // end block $scalar
+						chainDone = true
+					}
 					// state = startState / midStartState / midStartWordState / midStartNewlineState
 					if startState == midStartState && (!hasWordBoundary || midStartState == midStartWordState) && (!hasNewlineBoundary || midStartState == midStartNewlineState) {
 						b = append(b, 0x41)
@@ -9547,6 +9665,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 					b = append(b, 0x21, 0x02) // local.set state
 					b = append(b, 0x20, 0x04) // local.get attempt_start
 					b = append(b, 0x21, 0x03) // local.set pos
+					if chainDone {
+						b = append(b, 0x0B) // end block $chain_done
+					}
 				}
 				// Initialise last_accept for the start state before entering the scan loop.
 				// Handles empty-input and immediate-accept cases: if midAccept[startState]
