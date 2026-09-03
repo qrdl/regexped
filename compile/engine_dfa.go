@@ -6217,9 +6217,17 @@ func emitHystBulkSkip(b []byte, info dominantInfo,
 	// hystPos = pos
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x21, hystPosLocal)
-	b = emitDominantBulkSkip(b, info, false,
+	// Close the channel outright on the bounds exit. pos is monotone within a
+	// call, so a failed `pos + 17 > len` proves every later attempt would fail
+	// it too; without this the counter merely ticks and the doomed check is
+	// re-run on every dominant-state byte that follows.
+	b = emitDominantBulkSkipHooked(b, info, false,
 		posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
-		chunkLocal, tmpLocal)
+		chunkLocal, tmpLocal, func(b []byte) []byte {
+			b = append(b, 0x41, nonMidHystStreak)
+			b = append(b, 0x21, hystCounterLocal)
+			return b
+		})
 	// hystCounter = (pos - hystPos < 16) ? hystCounter + 1 : 0
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x20, hystPosLocal)
@@ -6502,6 +6510,28 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	posLocal, lenLocal, lastAcceptLocal,
 	ptrLocal, chunkLocal, tmpLocal byte) []byte {
+	return emitDominantBulkSkipHooked(b, info, updateLastAccept,
+		posLocal, lenLocal, lastAcceptLocal, ptrLocal, chunkLocal, tmpLocal, nil)
+}
+
+// emitDominantBulkSkipHooked is emitDominantBulkSkip with an optional hook on
+// the BOUNDS EXIT — the `pos + 17 > len` arm, taken when fewer than 17 bytes
+// remain and no chunk can be loaded.
+//
+// That arm is worth a hook because it is MONOTONE: pos never decreases within a
+// call, so once the check fires, no later attempt in the same call can pass it
+// either. A channel that learns this can close itself for the rest of the call
+// instead of paying the same doomed bounds check on every subsequent
+// dominant-state byte. On a short input that is the whole cost of the channel —
+// `<([a-z]+)>` over "<abc>" made two attempts, both of which did nothing but
+// evaluate the bounds check and update a counter.
+//
+// A nil hook emits the original `br_if $bulk_done` byte for byte, so the seven
+// callers that do not want it keep their exact previous bytes.
+func emitDominantBulkSkipHooked(b []byte, info dominantInfo, updateLastAccept bool,
+	posLocal, lenLocal, lastAcceptLocal,
+	ptrLocal, chunkLocal, tmpLocal byte,
+	onBoundsExit func([]byte) []byte) []byte {
 	exitBytes := info.exitBytes
 
 	// block $bulk_done
@@ -6514,8 +6544,17 @@ func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	b = append(b, 0x41, 0x11) // i32.const 17
 	b = append(b, 0x6A)
 	b = append(b, 0x20, lenLocal)
-	b = append(b, 0x4B)       // i32.gt_u
-	b = append(b, 0x0D, 0x01) // br_if $bulk_done
+	b = append(b, 0x4B) // i32.gt_u
+	if onBoundsExit == nil {
+		b = append(b, 0x0D, 0x01) // br_if $bulk_done
+	} else {
+		// Same branch, wrapped so the hook runs on the way out. Depths shift
+		// by one inside the `if`: $bulk_done is now 2 (if, loop, block).
+		b = append(b, 0x04, 0x40) // if (void)
+		b = onBoundsExit(b)
+		b = append(b, 0x0C, 0x02) // br $bulk_done
+		b = append(b, 0x0B)       // end if
+	}
 
 	// chunk = v128.load(ptr + pos + 1)
 	b = append(b, 0x20, ptrLocal)
