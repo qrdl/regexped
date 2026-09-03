@@ -98,9 +98,37 @@ func shuftiPrefixPlan(firstByteSet []byte, likelyNoMatch, canAdapt bool) (useShu
 }
 
 func emitShuftiPrefixCheck(b []byte, firstByteSet []byte, chunkLocal byte) []byte {
+	return emitShuftiMask(b, firstByteSet, chunkLocal, false)
+}
+
+// emitShuftiStopMask is emitShuftiPrefixCheck with the opposite polarity: bit k
+// is set when lane k is NOT a member of the set.
+//
+// The bulk skips want exactly this — they advance to the first byte that leaves
+// the self-loop class — and used to get it by taking the member mask and
+// following it with `i32.const 0xFFFF; i32.xor`. Comparing the merged lanes
+// against zero with i8x16.eq instead of i8x16.ne produces it directly, and
+// i8x16.bitmask zero-extends the upper 16 bits, so the xor was never doing
+// anything the compare could not. Two instructions per attempt and per
+// productive 16-byte lap, in every bulk skip in the compiler.
+func emitShuftiStopMask(b []byte, set []byte, chunkLocal byte) []byte {
+	return emitShuftiMask(b, set, chunkLocal, true)
+}
+
+// emitShuftiMask is the shared body. stop=false leaves a member mask (bit k set
+// ⇔ lane k IS in the set); stop=true leaves its complement over the 16 relevant
+// lanes. The nibble-table emission is identical either way — only the final
+// comparison against zero differs — so the two polarities cannot drift apart in
+// the table construction, which is the part that has to be exact.
+func emitShuftiMask(b []byte, firstByteSet []byte, chunkLocal byte, stop bool) []byte {
 	if len(firstByteSet) == 0 {
-		// No candidates — push 0 onto stack as a trivial bitmask.
+		// No candidates — push a trivial bitmask. With stop polarity every lane
+		// is a non-member, so the honest constant is 0xFFFF rather than 0.
 		// (Caller's useSIMD gate makes this unreachable in practice.)
+		if stop {
+			b = append(b, 0x41)
+			return utils.AppendSLEB128(b, int32(0xFFFF))
+		}
 		return append(b, 0x41, 0x00)
 	}
 
@@ -133,10 +161,15 @@ func emitShuftiPrefixCheck(b []byte, firstByteSet []byte, chunkLocal byte) []byt
 		}
 	}
 
-	// Reduce to i32 bitmask of non-zero lanes.
+	// Reduce to an i32 bitmask: lanes that matched (member polarity) or lanes
+	// that did not (stop polarity).
 	b = append(b, 0x41, 0x00) // i32.const 0
 	b = append(b, 0xFD, 0x0F) // i8x16.splat
-	b = append(b, 0xFD, 0x24) // i8x16.ne
+	if stop {
+		b = append(b, 0xFD, 0x23) // i8x16.eq → lane == 0, i.e. NOT a member
+	} else {
+		b = append(b, 0xFD, 0x24) // i8x16.ne → lane != 0, i.e. a member
+	}
 	b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
 	return b
 }

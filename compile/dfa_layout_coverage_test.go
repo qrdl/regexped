@@ -990,3 +990,128 @@ func TestDFALayoutNFAInputMapFolding(t *testing.T) {
 		})
 	}
 }
+
+// TestSoleMidDominant pins the predicate that lets the mid-accept dispatch drop
+// its `local.tee` and its `val == encodedByte` compare.
+//
+// The property is about the TABLE, not about len(dominantStates): a layout can
+// carry exactly one dominant and still hold a 1 for some ordinary accept state,
+// and that makes a nonzero load ambiguous again. Getting this wrong emits a
+// dispatch that treats every accepting state as the dominant and bulk-skips
+// from states whose self-loop set it was never given — a wrong answer, not a
+// slow one, which is why the false cases below matter more than the true one.
+func TestSoleMidDominant(t *testing.T) {
+	layoutWith := func(numWASM int, midAccept map[int32]byte, doms []dominantInfo) *dfaLayout {
+		l := &dfaLayout{numWASM: numWASM}
+		l.midAcceptBytes = make([]byte, numWASM)
+		for st, v := range midAccept {
+			l.midAcceptBytes[st] = v
+		}
+		l.dominantStates = doms
+		return l
+	}
+	mid := func(state int32, enc byte) dominantInfo {
+		return dominantInfo{state: state, encodedByte: enc, isMidAccept: true}
+	}
+	nonMid := func(state int32, enc byte) dominantInfo {
+		return dominantInfo{state: state, encodedByte: enc, isMidAccept: false}
+	}
+
+	cases := []struct {
+		name string
+		l    *dfaLayout
+		want bool
+	}{
+		{
+			// The alpha-run shape: one dominant, its encoding the only
+			// nonzero byte in the table.
+			name: "sole mid dominant",
+			l:    layoutWith(4, map[int32]byte{2: 128}, []dominantInfo{mid(2, 128)}),
+			want: true,
+		},
+		{
+			// One dominant, but state 3 also accepts. A nonzero load can be
+			// either, so the compare is load-bearing.
+			name: "dominant plus a plain accept state",
+			l:    layoutWith(4, map[int32]byte{2: 128, 3: 1}, []dominantInfo{mid(2, 128)}),
+			want: false,
+		},
+		{
+			name: "two dominants",
+			l: layoutWith(5, map[int32]byte{2: 128, 3: 129},
+				[]dominantInfo{mid(2, 128), mid(3, 129)}),
+			want: false,
+		},
+		{
+			// A non-mid dominant reaches the dispatch through the 254+
+			// sub-range and its own channel; the shortcut must not claim it.
+			name: "sole non-mid dominant",
+			l:    layoutWith(4, map[int32]byte{2: 254}, []dominantInfo{nonMid(2, 254)}),
+			want: false,
+		},
+		{
+			name: "no dominants",
+			l:    layoutWith(4, map[int32]byte{2: 1}, nil),
+			want: false,
+		},
+		{
+			// applyDominantStateEncoding never ran, so the table does not
+			// carry the encoding this predicate is about to promise.
+			name: "encoding not applied",
+			l:    layoutWith(4, nil, []dominantInfo{mid(2, 128)}),
+			want: false,
+		},
+		{
+			// The state index is past the table — the same out-of-range guard
+			// applyDominantStateEncoding itself carries.
+			name: "dominant state out of range",
+			l:    layoutWith(3, map[int32]byte{2: 128}, []dominantInfo{mid(9, 128)}),
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := soleMidDominant(tc.l); got != tc.want {
+				t.Errorf("soleMidDominant = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSoleMidDominantOnRealPatterns checks the predicate against layouts the
+// compiler actually builds, so a change to the detectors or to the encoding
+// pass cannot leave the unit table above testing a shape that no longer occurs.
+func TestSoleMidDominantOnRealPatterns(t *testing.T) {
+	cases := []struct {
+		pattern string
+		mode    LikelyMode
+		want    bool
+	}{
+		// The alpha-run shape: state 20 is the only accepting state and it is
+		// the dominant. This is the case the optimisation exists for.
+		{`[a-zA-Z]{20,}`, LikelyMatch, true},
+		// Neutral compiles no dominant at all for it.
+		{`[a-zA-Z]{20,}`, LikelyNeutral, false},
+		// A non-mid dominant: the body needs `>` before it accepts.
+		{`<[a-z]+>`, LikelyMatch, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.pattern+"/"+tc.mode.String(), func(t *testing.T) {
+			table := compileTestDFA(t, tc.pattern, true)
+			l := buildDFALayout(dfaLayoutParams{
+				t:              table,
+				tableBase:      0,
+				needFind:       true,
+				leftmostFirst:  true,
+				lmBareShufti:   tc.mode == LikelyMatch,
+				lmNonMidShufti: tc.mode == LikelyMatch,
+				lmWideShufti:   tc.mode == LikelyMatch,
+			})
+			applyDominantStateEncoding(l, true)
+			if got := soleMidDominant(l); got != tc.want {
+				t.Errorf("soleMidDominant = %v, want %v (dominants=%d)",
+					got, tc.want, len(l.dominantStates))
+			}
+		})
+	}
+}

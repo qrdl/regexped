@@ -4309,6 +4309,42 @@ func applyDominantStateEncoding(l *dfaLayout, encodeNonMid bool) {
 	}
 }
 
+// soleMidDominant reports whether a nonzero midAcceptBytes load can only ever
+// be this layout's single mid-accept dominant — i.e. that state's encoding is
+// the ONLY nonzero entry in the table.
+//
+// When it holds, the dispatch in emitFindMidAcceptDispatch / emitPhase4Dispatch
+// can skip both the `local.tee val` that caches the loaded byte and the
+// `val == encodedByte` compare that follows it: `val != 0` has already
+// identified the state. The tee is paid on EVERY byte the engine loop consumes,
+// not just on dominant ones, so it is the larger half — on `[a-zA-Z]{20,}` over
+// a 20-byte run the two together are 25 of the 68 fuel prefer-match cost against
+// neutral.
+//
+// MUST be called after applyDominantStateEncoding has written the encodings,
+// since it reads the table that pass produces. It is deliberately a property of
+// the TABLE rather than of len(l.dominantStates): a layout can carry one
+// dominant and still have ordinary accept states holding 1, and those make a
+// nonzero load ambiguous again.
+//
+// The word- and newline-boundary side tables (midAcceptNW/W/NLBytes) are
+// separate tables read by separate checks, so they do not affect this.
+func soleMidDominant(l *dfaLayout) bool {
+	if len(l.dominantStates) != 1 || !l.dominantStates[0].isMidAccept {
+		return false
+	}
+	st := l.dominantStates[0].state
+	if int(st) >= len(l.midAcceptBytes) || l.midAcceptBytes[st] == 0 {
+		return false
+	}
+	for i, v := range l.midAcceptBytes {
+		if v != 0 && int32(i) != st {
+			return false
+		}
+	}
+	return true
+}
+
 // dfaDataSegments builds the raw data-section payload (count byte + segments)
 // for a DFA layout. needFind controls whether find-mode-only tables are emitted.
 // forceMidAccept overrides the dominant-state/TDFA gating on the non-find
@@ -5822,7 +5858,7 @@ func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, tableMemIdx int)
 		body = buildMatchBody(l.wasmStart, l.tableOff, l.classMapOff,
 			l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
 			l.rowMapOff, l.useRowDedup, tableMemIdx,
-			l.midAcceptOff, l.dominantStates)
+			l.midAcceptOff, l.dominantStates, soleMidDominant(l))
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -5939,6 +5975,7 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			midAcceptNLOff:        l.midAcceptNLOff,
 			tableMemIdx:           tableMemIdx,
 			dominantStates:        l.dominantStates,
+			soleMidDominant:       soleMidDominant(l),
 			lnmAction5:            l.lnmAction5,
 			skipSafeOnDead:        l.skipSafeOnDead,
 			eofSkipSafe:           l.eofSkipSafe,
@@ -6263,7 +6300,8 @@ func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
 func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 	useMandatoryLit bool, midAcceptOff int32, tableMemIdx int,
 	stateLocal, posLocal, lenLocal, lastAcceptLocal, ptrLocal,
-	chunkLocal, valLocal, hystCounterLocal, hystPosLocal byte) []byte {
+	chunkLocal, valLocal, hystCounterLocal, hystPosLocal byte,
+	soleMid bool) []byte {
 
 	var mid, nonMid []dominantInfo
 	for _, info := range dominantStates {
@@ -6299,16 +6337,29 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 		return b
 	}
 
+	// A sole mid-accept dominant that is the only nonzero value in the table
+	// needs neither the cached value nor the compare: `val != 0` has already
+	// identified the state. See soleMidDominant.
+	skipValDispatch := soleMid && emitMidDom && !hasNonMidVals && len(mid) == 1
+
 	// val = midAccept[state]
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, midAcceptOff)
 	b = append(b, 0x20, stateLocal)
 	b = append(b, 0x6A)
 	b = appendTableLoad8u(b, tableMemIdx)
-	if emitMidDom || hasNonMidVals {
+	if (emitMidDom || hasNonMidVals) && !skipValDispatch {
 		b = append(b, 0x22, valLocal) // local.tee — cache val
 	}
 	b = append(b, 0x04, 0x40) // if (val != 0)
+	if skipValDispatch {
+		b = emitAccept(b)
+		b = emitDominantBulkSkip(b, mid[0], true,
+			posLocal, lenLocal, lastAcceptLocal, ptrLocal,
+			chunkLocal, valLocal)
+		b = append(b, 0x0B) // end if (val != 0)
+		return b
+	}
 	if hasNonMidVals {
 		b = append(b, 0x20, valLocal)
 		b = append(b, 0x41)
@@ -6360,7 +6411,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 // locals (hysteresis counter + scratch) and pass their indices; both are
 // ignored when every entry is mid-accept.
 func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
-	midAcceptOff int32, tableMemIdx int) []byte {
+	midAcceptOff int32, tableMemIdx int, soleMid bool) []byte {
 	if len(dominantStates) == 0 {
 		return b
 	}
@@ -6394,14 +6445,28 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 		}
 		return b
 	}
+	// A sole mid-accept dominant that is the only nonzero value in the table
+	// identifies itself by being nonzero — no cached value, no compare. See
+	// soleMidDominant.
+	skipValDispatch := soleMid && len(mid) == 1 && len(nonMid) == 0
+
 	// val = midAccept[state] (tee'd into tmp)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, midAcceptOff)
 	b = append(b, 0x20, stateLocal)
 	b = append(b, 0x6A) // i32.add
 	b = appendTableLoad8u(b, tableMemIdx)
-	b = append(b, 0x22, tmpLocal) // local.tee tmp
-	b = append(b, 0x04, 0x40)     // if (val != 0)
+	if !skipValDispatch {
+		b = append(b, 0x22, tmpLocal) // local.tee tmp
+	}
+	b = append(b, 0x04, 0x40) // if (val != 0)
+	if skipValDispatch {
+		b = emitDominantBulkSkip(b, mid[0], false,
+			posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
+			chunkLocal, tmpLocal)
+		b = append(b, 0x0B) // end if (val != 0)
+		return b
+	}
 	switch {
 	case len(mid) > 0 && len(nonMid) > 0:
 		b = append(b, 0x20, tmpLocal)
@@ -6463,15 +6528,11 @@ func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 
 	if len(info.selfLoopSet) > 0 {
 		// Self-loop set is the small (≤64, Shufti-cap) side, not
-		// the exit side. Test membership in it directly via the shared
-		// Shufti primitive (leaves an i32 bitmask, bit k set ⇔ lane k IS a
-		// member) and invert: a "stop" bit means the byte is NOT a member
-		// — the first byte outside the self-loop class, which is exactly
-		// what the ctz/pos-advance logic below needs.
-		b = emitShuftiPrefixCheck(b, info.selfLoopSet, chunkLocal)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(0xFFFF))
-		b = append(b, 0x73) // i32.xor — invert the 16 relevant bits
+		// the exit side. Ask the shared Shufti primitive for the STOP
+		// polarity directly: bit k set ⇔ lane k is NOT a member, i.e. the
+		// first byte outside the self-loop class, which is exactly what
+		// the ctz/pos-advance logic below needs.
+		b = emitShuftiStopMask(b, info.selfLoopSet, chunkLocal)
 	} else if len(exitBytes) == 1 {
 		// Phase 2 single-byte: m = bitmask(eq(chunk, splat(exit))).
 		b = append(b, 0x20, chunkLocal)
@@ -6863,7 +6924,7 @@ func emitNLPreAcceptCheck(b []byte, midAcceptNLOff int32,
 // and the match DFA is compiled LL by design so that `^(a|aa)$` matches "aa"
 // — see the LL/LF note in compile.go. The two are permanently mutually
 // exclusive, so no immAcceptLimit/hasImmAccept parameters are threaded here.
-func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, rowMapOff int32, useRowDedup bool, tableMemIdx int, midAcceptOff int32, dominantStates []dominantInfo) []byte {
+func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, rowMapOff int32, useRowDedup bool, tableMemIdx int, midAcceptOff int32, dominantStates []dominantInfo, soleMid bool) []byte {
 	var b []byte
 
 	// emitAcceptCheck emits the final post-loop accept check:
@@ -6940,7 +7001,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 		// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse class),
 		// hysteresis counter/scratch = locals 6/7 (only with non-mid).
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -6986,7 +7047,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x0B)
 
 		// Phase 4 dispatch: tmp=local 4, chunk=local 5, hyst=6/7.
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -7034,7 +7095,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 	b = append(b, 0x0B)
 
 	// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse byte), hyst=6/7.
-	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
+	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)
@@ -8756,6 +8817,11 @@ type findBodyParams struct {
 	skipSafeOnDead        bool
 	eofSkipSafe           bool
 
+	// soleMidDominant: a nonzero midAccept load can only be dominantStates[0],
+	// so the dispatch needs neither the cached value nor the compare against
+	// its encoding. See soleMidDominant().
+	soleMidDominant bool
+
 	// report reaches emitPrefixScan so the scan can name the strategy IT
 	// chose. Nil on every path but `compile --verbose`.
 	report *Reporter
@@ -8808,6 +8874,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	midAcceptNLOff := p.midAcceptNLOff
 	tableMemIdx := p.tableMemIdx
 	dominantStates := p.dominantStates
+	soleMid := p.soleMidDominant
 	lnmAction5 := p.lnmAction5
 	skipSafeOnDead := p.skipSafeOnDead
 	eofSkipSafe := p.eofSkipSafe
@@ -9719,7 +9786,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
 			chunkLocal /*val+tmp=*/, 0x06,
-			bulkHystCounterLocal, bulkHystPosLocal)
+			bulkHystCounterLocal, bulkHystPosLocal, soleMid)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
@@ -9797,7 +9864,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
 			chunkLocal /*val+tmp=*/, simdMaskLocal,
-			bulkHystCounterLocal, bulkHystPosLocal)
+			bulkHystCounterLocal, bulkHystPosLocal, soleMid)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 

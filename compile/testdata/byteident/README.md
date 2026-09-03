@@ -40,6 +40,7 @@ add a fixture for it.
 | `lit_chain_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}` | lit chain with a fixed-length prefix — `buildLitChainPrefixedFindBody`; reports `attempt_start - M`, so it needs a find-from floor | Compiled DFA |
 | `alt_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}\|[0-9]{3}ghp_[A-Za-z0-9]{24}` | Gap E: strict alternation of prefixed branches — `buildLitChainAltPrefixedFindBody` | Compiled DFA |
 | `byte_mode` | `caf\xe9[0-9]{4}` + `byte_mode: true` | a pattern naming raw bytes above 127, which every other fixture's mode rejects outright | Compiled DFA |
+| `lm_sole_dominant` | `[a-zA-Z]{20,}` + `prefer-match` | the LikelyMatch mid-accept dominant dispatch and its Shufti self-loop bulk skip. `prefer-match` reached NO single-pattern fixture before this one — only the two set fixtures — so every LM-gated emitter in a find body was unpinned | Compiled DFA |
 
 ## Set fixtures
 

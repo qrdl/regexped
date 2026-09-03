@@ -3,6 +3,8 @@ package compile
 import (
 	"math/rand"
 	"testing"
+
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // decodeShuftiPairs reproduces, in Go, exactly what the emitted SIMD does to
@@ -116,5 +118,72 @@ func TestEmitShuftiPrefixCheckEmpty(t *testing.T) {
 	got := emitShuftiPrefixCheck(nil, nil, 9)
 	if len(got) != 2 || got[0] != 0x41 || got[1] != 0x00 {
 		t.Errorf("emitShuftiPrefixCheck(empty set) = % x, want 41 00 (i32.const 0)", got)
+	}
+}
+
+// TestShuftiMaskPolarities pins the contract between the two emitters: they
+// must differ in the final lane comparison and in NOTHING else.
+//
+// The stop polarity replaced a member mask followed by `i32.const 0xFFFF;
+// i32.xor`. That the xor is redundant rests on i8x16.bitmask zero-extending
+// its result, so the complement over the 16 relevant lanes is exactly what
+// `lane == 0` produces. If someone reintroduces the xor, or flips the compare
+// in the wrong emitter, every bulk skip in the compiler advances to the first
+// byte that IS a member — a walk that stops immediately and never strides,
+// which costs performance silently rather than failing.
+func TestShuftiMaskPolarities(t *testing.T) {
+	const (
+		opEq = 0x23 // i8x16.eq, after the 0xFD prefix
+		opNe = 0x24 // i8x16.ne
+	)
+	for _, set := range [][]byte{
+		[]byte("abcdefghijklmnopqrstuvwxyz"),
+		[]byte("0123456789"),
+		{0x00, 0x7F, 0x80, 0xFF},
+	} {
+		member := emitShuftiPrefixCheck(nil, set, 7)
+		stop := emitShuftiStopMask(nil, set, 7)
+		if len(member) != len(stop) {
+			t.Fatalf("polarities differ in length: member %d, stop %d — the stop "+
+				"mask must be the same emission with one opcode changed",
+				len(member), len(stop))
+		}
+		diffs := 0
+		for i := range member {
+			if member[i] != stop[i] {
+				diffs++
+				if member[i] != opNe || stop[i] != opEq {
+					t.Fatalf("byte %d differs as %#02x/%#02x, want the compare "+
+						"opcode %#02x/%#02x", i, member[i], stop[i], opNe, opEq)
+				}
+			}
+		}
+		if diffs != 1 {
+			t.Fatalf("polarities differ in %d bytes, want exactly 1 (the compare)", diffs)
+		}
+		// No 0xFFFF constant may survive in either emission: its presence is
+		// the signature of the inversion this replaced.
+		for i := 0; i+3 < len(stop); i++ {
+			if stop[i] == 0x41 && stop[i+1] == 0xFF && stop[i+2] == 0xFF && stop[i+3] == 0x03 {
+				t.Fatalf("stop mask still emits i32.const 0xFFFF at byte %d", i)
+			}
+		}
+	}
+}
+
+// TestShuftiStopMaskEmptySet pins the empty-set constant, which is the one
+// place the two polarities legitimately differ by more than an opcode: with no
+// members every lane is a non-member, so the stop mask's honest answer is
+// 0xFFFF and the member mask's is 0.
+func TestShuftiStopMaskEmptySet(t *testing.T) {
+	if got := emitShuftiPrefixCheck(nil, nil, 7); len(got) != 2 || got[0] != 0x41 || got[1] != 0x00 {
+		t.Errorf("member mask on empty set = % x, want i32.const 0", got)
+	}
+	got := emitShuftiStopMask(nil, nil, 7)
+	if len(got) == 0 || got[0] != 0x41 {
+		t.Fatalf("stop mask on empty set = % x, want an i32.const", got)
+	}
+	if v, _, err := utils.DecodeSLEB128(got[1:]); err != nil || v != 0xFFFF {
+		t.Errorf("stop mask on empty set = i32.const %d (err %v), want 65535", v, err)
 	}
 }
