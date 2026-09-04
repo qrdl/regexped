@@ -28,10 +28,14 @@
 // contains matches it — anchored over the whole input for match_any/match_all,
 // unanchored for scan_any/scan_all/find.
 //
-// Only the SET-level `hints:` is varied. Per-pattern `hints:` in the config
-// are left exactly as written, since they override the set default for the
-// patterns that carry them — a config full of per-pattern hints will show
-// small deltas here, and that is the truth about it rather than an artefact.
+// Only the SET-level `hints:` is varied, and set compilation resolves its mode
+// from the set's OWN hints alone — a per-pattern `hints:` never feeds it. Those
+// reach `compilePattern` and so shape the per-pattern exports the same config
+// may also declare; since settest rewrites nothing but the set's hints, they
+// are identical across all three builds and cannot contribute to any delta
+// reported here. What they can move is the baseline: they are part of the
+// module whose size is printed, and part of what the identical-WASM verdict
+// compares.
 //
 // The module is compiled with every capability the config declares, not just
 // the one being driven: that is the module the user would actually ship, so it

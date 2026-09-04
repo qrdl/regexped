@@ -327,16 +327,31 @@ var tests = []testCase{
 		nomatchInput: minLenQuantifierSkipInput(false),
 	},
 	{
-		// H.3 target: 21 literal-prefixed patterns with distinct uppercase
-		// first bytes [A..U]. AC builds ~63 nodes which exceeds the 32-node
+		// H.3 target: 21 literal-prefixed patterns with distinct lowercase
+		// first bytes [a..u]. AC builds ~63 nodes which exceeds the 32-node
 		// cap → frontend falls back to scalar. With H.3, set-level
-		// LikelyNoMatch forces Shufti (rarity sum = 42 > 40 threshold, so
-		// the density heuristic alone would keep scalar — LNM is the
-		// trigger here). Under neutral/LM the set stays on scalar.
+		// LikelyNoMatch forces Shufti: the rarity sum is 21*3 = 63 against
+		// the 40 threshold, so `rare` is false and the density heuristic
+		// alone keeps scalar — LNM is the only trigger. Under neutral/LM the
+		// set stays on scalar.
 		//
-		// No-match input is pure lowercase prose — Shufti never finds a
-		// candidate, SIMD-skips the entire 50 KB in 16-byte chunks. Match
-		// input has letter density too high for SIMD to help much.
+		// THE FIRST BYTES ARE LOWERCASE ON PURPOSE, and the corpora are
+		// uppercase to match. This case was written over [A..U] when
+		// byteRarity graded uppercase 2 — a sum of 42 against a threshold of
+		// 40, correct but with two points of margin. The regrade to 1 (see
+		// byteRarity's own comment, which separates "26 individually rare
+		// bytes" from "17 individually dominant" ones) took that sum to 21,
+		// which put the case on the WRONG side: neutral selected Shufti by
+		// itself and all three modes compiled byte-identical WASM, so the
+		// case measured nothing at all. Lowercase restores the intended A/B
+		// with 23 points of margin instead of 2.
+		//
+		// That inversion is why the corpora had to move too. The premise is
+		// a no-match input SPARSE in the tracked first-byte set — Shufti
+		// never finds a candidate and SIMD-skips the entire 50 KB in 16-byte
+		// chunks — and the prose that delivered that against [A..U] is
+		// lowercase, i.e. maximally DENSE against [a..u]. Both corpora are
+		// therefore uppercase now; see setShuftiLNMInput.
 		//
 		// SELECTION IS FORCED (forceScalarFrontend, task 73). Between this
 		// case being written and 2026-08-31 it drifted onto **Teddy** and
@@ -349,9 +364,14 @@ var tests = []testCase{
 		// literals.
 		//
 		// Pinning the frontend to scalar restores the intended A/B: neutral
-		// stays scalar (these literals' rarity sum is 42 against the 40
-		// threshold) and only prefer-no-match flips to Shufti. Verified by
-		// direct compile before this was written.
+		// stays scalar (rarity sum 63 against the 40 threshold) and only
+		// prefer-no-match flips to Shufti. Verified by direct compile.
+		//
+		// prefer-no-match is also the only arm that ships shuftiAdaptive
+		// (`lnm && !rare`, and !rare is exactly what the lowercase move
+		// buys), so this is the one case here where a HINT reaches the
+		// runtime density switch — everywhere else it takes a compiler
+		// override.
 		//
 		// Read the Δ% as an UPPER BOUND — see forceScalarFrontend's comment
 		// for why 21 buckets inflate the prefilter's share. Absolute fuel
@@ -359,22 +379,22 @@ var tests = []testCase{
 		name:                "set-shufti-lnm",
 		forceScalarFrontend: true,
 		setPatterns: []string{
-			`A1:[^\n]+`, `B1:[^\n]+`, `C1:[^\n]+`, `D1:[^\n]+`, `E1:[^\n]+`,
-			`F1:[^\n]+`, `G1:[^\n]+`, `H1:[^\n]+`, `I1:[^\n]+`, `J1:[^\n]+`,
-			`K1:[^\n]+`, `L1:[^\n]+`, `M1:[^\n]+`, `N1:[^\n]+`, `O1:[^\n]+`,
-			`P1:[^\n]+`, `Q1:[^\n]+`, `R1:[^\n]+`, `S1:[^\n]+`, `T1:[^\n]+`,
-			`U1:[^\n]+`,
+			`a1:[^\n]+`, `b1:[^\n]+`, `c1:[^\n]+`, `d1:[^\n]+`, `e1:[^\n]+`,
+			`f1:[^\n]+`, `g1:[^\n]+`, `h1:[^\n]+`, `i1:[^\n]+`, `j1:[^\n]+`,
+			`k1:[^\n]+`, `l1:[^\n]+`, `m1:[^\n]+`, `n1:[^\n]+`, `o1:[^\n]+`,
+			`p1:[^\n]+`, `q1:[^\n]+`, `r1:[^\n]+`, `s1:[^\n]+`, `t1:[^\n]+`,
+			`u1:[^\n]+`,
 		},
 		mode:         modeSet,
-		notes:        "set with 21 [A-U]-prefixed literals — H.3 (LNM forces Shufti over scalar)",
+		notes:        "set with 21 [a-u]-prefixed literals — H.3 (LNM forces Shufti over scalar)",
 		matchInput:   setShuftiLNMInput(true),
 		nomatchInput: setShuftiLNMInput(false),
 	},
 	{
-		// same 21-pattern [A-U] set as set-shufti-lnm, but the no-match
+		// same 21-pattern [a-u] set as set-shufti-lnm, but the no-match
 		// input is DENSE in the tracked first-byte set instead of sparse —
 		// the "rarely matches" assumption LikelyNoMatch bakes into forcing
-		// Shufti doesn't hold here. Solid A-U letters with no gaps at all:
+		// Shufti doesn't hold here. Solid a-u letters with no gaps at all:
 		// every SIMD chunk's bitmask is all-1s, so ctz always returns 0 and
 		// the skip loop can never advance more than one position per
 		// attempt, forcing the scalar membership-check tail on literally
@@ -408,14 +428,14 @@ var tests = []testCase{
 		name:                "set-shufti-dense-harm",
 		forceScalarFrontend: true,
 		setPatterns: []string{
-			`A1:[^\n]+`, `B1:[^\n]+`, `C1:[^\n]+`, `D1:[^\n]+`, `E1:[^\n]+`,
-			`F1:[^\n]+`, `G1:[^\n]+`, `H1:[^\n]+`, `I1:[^\n]+`, `J1:[^\n]+`,
-			`K1:[^\n]+`, `L1:[^\n]+`, `M1:[^\n]+`, `N1:[^\n]+`, `O1:[^\n]+`,
-			`P1:[^\n]+`, `Q1:[^\n]+`, `R1:[^\n]+`, `S1:[^\n]+`, `T1:[^\n]+`,
-			`U1:[^\n]+`,
+			`a1:[^\n]+`, `b1:[^\n]+`, `c1:[^\n]+`, `d1:[^\n]+`, `e1:[^\n]+`,
+			`f1:[^\n]+`, `g1:[^\n]+`, `h1:[^\n]+`, `i1:[^\n]+`, `j1:[^\n]+`,
+			`k1:[^\n]+`, `l1:[^\n]+`, `m1:[^\n]+`, `n1:[^\n]+`, `o1:[^\n]+`,
+			`p1:[^\n]+`, `q1:[^\n]+`, `r1:[^\n]+`, `s1:[^\n]+`, `t1:[^\n]+`,
+			`u1:[^\n]+`,
 		},
 		mode:         modeSet,
-		notes:        "set with 21 [A-U]-prefixed literals, DENSE no-match data — Shufti-vs-scalar on adversarial input (NOT the shuftiAdaptive guard; see settest)",
+		notes:        "set with 21 [a-u]-prefixed literals, DENSE no-match data — Shufti-vs-scalar on adversarial input (NOT the shuftiAdaptive guard; see settest)",
 		matchInput:   setShuftiDenseHarmInput(true),
 		nomatchInput: setShuftiDenseHarmInput(false),
 	},
@@ -1176,7 +1196,16 @@ func minLenQuantifierSkipInput(withMatches bool) string {
 // per-bucket comparison loop.
 func setShuftiLNMInput(withMatches bool) string {
 	const targetSize = 50 * 1024
-	prose := []byte("the quick brown fox jumps over the lazy dog and they all live happily ever after. ")
+	// UPPERCASE prose, because the tracked first-byte set is [a..u].
+	//
+	// The whole point of this corpus is that Shufti finds no candidate and
+	// skips 16 bytes at a time, which requires the filler to live OUTSIDE the
+	// union. It reads oddly, and that is the price of the first bytes being
+	// lowercase — which is itself what keeps the set on the scalar side of
+	// shuftiBeatsScalar so that prefer-no-match has something to force. In
+	// lowercase this filler would make every position a candidate and turn
+	// this case into a duplicate of set-shufti-dense-harm.
+	prose := []byte("THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG AND THEY ALL LIVE HAPPILY EVER AFTER. ")
 	if !withMatches {
 		var b []byte
 		for len(b) < targetSize {
@@ -1184,12 +1213,14 @@ func setShuftiLNMInput(withMatches bool) string {
 		}
 		return string(b[:targetSize])
 	}
-	bodyFiller := []byte("the operation completed normally with no observable side effects on subsystem state. ")
-	letters := []byte("ABCDEFGHIJKLMNOPQRSTU")
+	// Uppercase for the same reason, and it also keeps the body free of any
+	// byte that could start a second candidate inside a match's own extent.
+	bodyFiller := []byte("THE OPERATION COMPLETED NORMALLY WITH NO OBSERVABLE SIDE EFFECTS ON SUBSYSTEM STATE. ")
+	letters := []byte("abcdefghijklmnopqrstu")
 	var b []byte
 	idx := 0
 	for len(b) < targetSize {
-		// Periodic match: "<Letter>1:<200-byte body>\n"
+		// Periodic match: "<letter>1:<200-byte body>\n"
 		b = append(b, letters[idx%len(letters)])
 		b = append(b, '1', ':')
 		bodyStart := len(b)
@@ -1206,18 +1237,21 @@ func setShuftiLNMInput(withMatches bool) string {
 // setShuftiDenseHarmInput builds ~50 KB for the set-shufti-dense-harm
 // case — the harm-side counterpart to setShuftiLNMInput's win-side prose.
 //
-// When withMatches is false: solid A-U letters with no gaps at all (no
+// When withMatches is false: solid a-u letters with no gaps at all (no
 // spaces, no other bytes) — every byte in the buffer is a Shufti
 // candidate, so the SIMD skip loop's bitmask is always all-1s and ctz
 // always returns 0, forcing the scalar membership-check tail on every
 // single position. None of the letters are followed by "1:" so nothing
 // ever matches.
-// When withMatches is true: the same dense A-U filler with a handful of
-// real "<Letter>1:<body>\n" matches spliced in, so the match path is
+// When withMatches is true: the same dense a-u filler with a handful of
+// real "<letter>1:<body>\n" matches spliced in, so the match path is
 // exercised under the same dense-first-byte-set conditions.
+//
+// This filler tracks the pattern list: it IS the tracked first-byte set, so
+// lowercasing the literals (see set-shufti-lnm's comment) lowercases it too.
 func setShuftiDenseHarmInput(withMatches bool) string {
 	const targetSize = 50 * 1024
-	letters := []byte("ABCDEFGHIJKLMNOPQRSTU")
+	letters := []byte("abcdefghijklmnopqrstu")
 	if !withMatches {
 		var b []byte
 		for len(b) < targetSize {
@@ -1225,6 +1259,8 @@ func setShuftiDenseHarmInput(withMatches bool) string {
 		}
 		return string(b[:targetSize])
 	}
+	// 'V' is uppercase and so outside the tracked [a..u] union, exactly as it
+	// was outside [A..U] before the move.
 	bodyFiller := []byte("VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV")
 	var b []byte
 	idx := 0
@@ -1232,8 +1268,8 @@ func setShuftiDenseHarmInput(withMatches bool) string {
 		for i := 0; i < 400; i++ {
 			b = append(b, letters...)
 		}
-		// Real match: "<Letter>1:<200-byte body>\n" — body uses 'V' (not
-		// in the tracked A-U set) so it can't itself extend a neighbouring
+		// Real match: "<letter>1:<200-byte body>\n" — body uses 'V' (not
+		// in the tracked a-u set) so it can't itself extend a neighbouring
 		// dense run into a spurious match.
 		b = append(b, letters[idx%len(letters)])
 		b = append(b, '1', ':')

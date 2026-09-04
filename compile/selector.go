@@ -139,10 +139,25 @@ func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineTy
 				opts.report().Limit("TDFA registers", tt.numRegs, resolveMaxTDFARegs(opts))
 				return EngineTDFA, tt
 			}
-			if tt != nil {
+			// tt == nil is the STATE limit and nothing else: newTDFA is the
+			// only thing that can fail here, it returns a nil table when its
+			// own ceiling fires, and the register limit above sets ok=false
+			// while leaving the table it measured intact.
+			//
+			// The guard used to read `tt != nil`, which inverted both halves.
+			// A register-limit pattern reached this block with its table in
+			// hand and had its accurate reason OVERWRITTEN — reported as
+			// "raise max_dfa_states" while printing "TDFA states 26 of 1024",
+			// i.e. pointing at the one knob that could not help, when
+			// max_tdfa_regs was the answer. A genuine state-limit pattern took
+			// the opposite fate: tt was nil, so nothing was reported at all
+			// and the demotion the flag exists to explain went unexplained.
+			if tt == nil {
 				slog.Debug("Engine selected", "engine", "Backtrack", "reason", "TDFA state limit exceeded")
+				// No Limit line: construction stopped at the ceiling, so there
+				// is no final state count, and inventing one would be worse
+				// than the number's absence.
 				opts.report().Engine(EngineBacktrack, "TDFA state limit exceeded — raise max_dfa_states to keep O(n) captures")
-				opts.report().Limit("TDFA states", tt.numStates, resolveMaxDFAStates(opts))
 			}
 		} else {
 			slog.Debug("Engine selected", "engine", "Backtrack", "reason", "non-greedy or line-anchor captures")

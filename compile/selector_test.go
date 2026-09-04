@@ -532,3 +532,70 @@ func TestSelectBestEngineWithTDFA_MatchesWrapper(t *testing.T) {
 		}
 	}
 }
+
+// TestSelectorTDFALimitReasons pins which limit --verbose names when a capture
+// pattern is demoted to Backtracking. The two are reported from opposite sides
+// of one `ok` flag and were swapped: a register-limit pattern was told to raise
+// max_dfa_states (while its own report showed the state count comfortably under
+// that limit), and a state-limit pattern was told nothing at all, because the
+// branch was guarded on the non-nil table newTDFA does not return in that case.
+func TestSelectorTDFALimitReasons(t *testing.T) {
+	cases := []struct {
+		label, pattern     string
+		maxStates, maxRegs int
+		wantReason         string
+		wantLimit          string
+		unwantLimit        string
+	}{
+		{
+			label: "register limit", pattern: strings.Repeat("(x)", 25),
+			maxStates: 1024, maxRegs: 8,
+			wantReason: "TDFA register limit exceeded",
+			wantLimit:  "TDFA registers",
+			// The state count is not the reason and must not be quoted as it.
+			unwantLimit: "TDFA states",
+		},
+		{
+			label: "state limit", pattern: `((a|b|c)+(d|e)+(f|g)+)+`,
+			maxStates: 4, maxRegs: 64,
+			wantReason: "TDFA state limit exceeded",
+			// No table was built, so there is no count to report.
+			unwantLimit: "TDFA states",
+		},
+	}
+	for _, c := range cases {
+		re, err := syntax.Parse(c.pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", c.label, err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatalf("%s: compile: %v", c.label, err)
+		}
+		rep := &Reporter{}
+		rep.Begin(c.label, c.pattern)
+		eng, _ := selectBestEngineWithTDFA(prog, &CompileOptions{
+			Report: rep, MaxDFAStates: c.maxStates, MaxTDFARegs: c.maxRegs})
+		rep.End()
+		if eng != EngineBacktrack {
+			t.Fatalf("%s: engine = %v, want Backtracking", c.label, eng)
+		}
+		if len(rep.Patterns) != 1 {
+			t.Fatalf("%s: reported %d patterns, want 1", c.label, len(rep.Patterns))
+		}
+		got := rep.Patterns[0]
+		if got.Engine != EngineBacktrack {
+			t.Errorf("%s: reported engine = %v, want Backtracking", c.label, got.Engine)
+		}
+		if !strings.Contains(got.Reason, c.wantReason) {
+			t.Errorf("%s: reason = %q, want it to contain %q", c.label, got.Reason, c.wantReason)
+		}
+		limits := strings.Join(got.Limits, " | ")
+		if c.wantLimit != "" && !strings.Contains(limits, c.wantLimit) {
+			t.Errorf("%s: limits = %q, want a %q line", c.label, limits, c.wantLimit)
+		}
+		if c.unwantLimit != "" && strings.Contains(limits, c.unwantLimit) {
+			t.Errorf("%s: limits = %q, must not quote %q", c.label, limits, c.unwantLimit)
+		}
+	}
+}

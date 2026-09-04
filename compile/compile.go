@@ -2802,11 +2802,12 @@ const maxUnicodeRune = 0x10ffff
 //     class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F (long s) and
 //     U+212A (Kelvin sign) — runes the user never wrote, manufactured from
 //     the ASCII `s` and `k` in the same instruction. A rune above the limit is
-//     therefore tolerated when it is a SimpleFold partner of an ASCII rune the
-//     same instruction also names. Without this the gate rejects `(?i:[a-z]+)`
-//     and `(?i)^\s*SELECT\b` — measured over the four corpora, that is 8 rows
-//     of working, tested patterns, and `(?i)` over a letter class or `\w` is a
-//     common shape rather than an exotic one.
+//     therefore tolerated when the same instruction names its WHOLE fold
+//     orbit, which is what the expansion produces and what a hand-written
+//     `[sſ]` does not — see foldArtifactOf. Without this the gate rejects
+//     `(?i:[a-z]+)` and `(?i)^\s*SELECT\b` — measured over the four corpora,
+//     that is 8 rows of working, tested patterns, and `(?i)` over a letter
+//     class or `\w` is a common shape rather than an exotic one.
 //
 //   - **`(?i)` on an ASCII literal whose orbit escapes 0xFF.** `(?i)k` keeps
 //     `FoldCase` in inst.Arg rather than expanding, and markFold drops the
@@ -2827,10 +2828,6 @@ func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
 		if inst.Op != syntax.InstRune && inst.Op != syntax.InstRune1 {
 			continue
 		}
-		// Built only when a candidate is found: the overwhelming majority of
-		// instructions have no rune above the limit at all, and this runs over
-		// every instruction of every pattern the harnesses compile.
-		var ascii *[128]bool
 		for j := 0; j < len(inst.Rune); j += 2 {
 			lo := inst.Rune[j]
 			hi := lo
@@ -2843,13 +2840,8 @@ func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
 			if hi == maxUnicodeRune && lo <= limit {
 				continue // open-ended tail of a negated class
 			}
-			if lo == hi {
-				if ascii == nil {
-					ascii = asciiRunesOf(inst)
-				}
-				if foldsToASCIIIn(lo, ascii) {
-					continue
-				}
+			if lo == hi && foldArtifactOf(lo, inst, limit) {
+				continue
 			}
 			if lo > limit {
 				return lo
@@ -2860,35 +2852,54 @@ func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
 	return -1
 }
 
-// asciiRunesOf collects the runes <= 127 one instruction names, ranges
-// expanded. It is the evidence for "this non-ASCII rune is a fold artifact of
-// something ASCII in the same class".
-func asciiRunesOf(inst *syntax.Inst) *[128]bool {
-	var m [128]bool
+// foldArtifactOf reports whether r — a single rune above the byte limit — was
+// MANUFACTURED by the parser's eager `(?i)` expansion from an in-range rune the
+// same instruction names, rather than written by the pattern itself.
+//
+// The discriminator is ORBIT COMPLETENESS, and the weaker test it replaces is
+// the reason: "some in-range rune in this class folds to r" also holds for
+// `[sſ]`, where the user wrote U+017F next to an `s` that happens to be its
+// fold partner. That was accepted and then silently ignored — the class
+// compiled to a matcher for the single byte 0x73, with no diagnostic, while a
+// bare `ſ` was correctly rejected.
+//
+// `(?i)` expansion always emits the WHOLE fold orbit: `(?i:[a-z])` carries
+// `s`, `S` and `ſ` together, because the parser closed the orbit of every rune
+// in the class. A hand-written `[sſ]` carries `s` and `ſ` but NOT `S`, since
+// nothing asked for it. So requiring every other orbit member to be present in
+// the same instruction admits the artifacts and rejects the hand-written ones
+// — checked against `(?i:[a-z])`, `(?i:[a-z]+)`, `(?i:\w+)`, `(?i)k`,
+// `(?i)^\s*SELECT\b` and `(?i)Kelvin` on the tolerate side and `[sſ]`,
+// `[s\x{17F}]` and `[a-zſ]` on the reject side.
+//
+// `(?i)[sſ]` tolerates, and that is the right answer rather than a leak: under
+// `(?i)` the class IS the closed orbit, so the artifact and the written rune
+// are the same bytes, and matching `s`/`S` serves what was asked.
+//
+// At least one orbit member must be in range, or there is nothing this rune
+// could be an artifact OF.
+func foldArtifactOf(r rune, inst *syntax.Inst, limit rune) bool {
+	inRangePartner := false
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if !instNamesRune(inst, f) {
+			return false
+		}
+		if f >= 0 && f <= limit {
+			inRangePartner = true
+		}
+	}
+	return inRangePartner
+}
+
+// instNamesRune reports whether inst's rune ranges cover r.
+func instNamesRune(inst *syntax.Inst, r rune) bool {
 	for j := 0; j < len(inst.Rune); j += 2 {
 		lo := inst.Rune[j]
 		hi := lo
 		if j+1 < len(inst.Rune) {
 			hi = inst.Rune[j+1]
 		}
-		if lo > 127 {
-			continue
-		}
-		if hi > 127 {
-			hi = 127
-		}
-		for r := lo; r <= hi; r++ {
-			m[r] = true
-		}
-	}
-	return &m
-}
-
-// foldsToASCIIIn reports whether r is in the simple-case-fold orbit of an
-// ASCII rune present in ascii.
-func foldsToASCIIIn(r rune, ascii *[128]bool) bool {
-	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-		if f >= 0 && f <= 127 && ascii[f] {
+		if r >= lo && r <= hi {
 			return true
 		}
 	}

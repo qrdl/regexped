@@ -1,3 +1,12 @@
+# Recipes run under bash with pipefail. Two coverage targets below pipe
+# `go test` into `grep` for readability, and a pipeline's status is its LAST
+# command's: `FAIL` is in both filters, so a failing test printed FAIL, grep
+# matched it and exited 0, and the gate reported success on failure. That is
+# the worst way for a coverage gate to break, since it breaks silently and in
+# the passing direction.
+SHELL := /bin/bash
+.SHELLFLAGS := -o pipefail -c
+
 GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/*/*.go merge/*.go))
 
 .PHONY: from-coverage set-coverage re2test setcaps setcaps-likely setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross byteident examples clean unittest lint fmt

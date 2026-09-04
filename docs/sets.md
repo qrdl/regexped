@@ -583,11 +583,11 @@ the fallback half of a mixed set.
 
 Under `hints: [prefer-no-match]` the one-pass automaton additionally **strides
 over stretches of input where no pattern could be starting**, in 16-byte SIMD
-chunks, instead of stepping a byte at a time. It applies to the narrow (≤64
-id) form only, and it is exact rather than approximate: the states it strides
-through are ones where no pattern can accept, and these bodies report no
-position, so a skipped run has no effect at all beyond advancing. Like every
-other SIMD skip here it turns itself off for the rest of a call once several
+chunks, instead of stepping a byte at a time. It applies to both accept forms
+— narrow (≤64 ids) and wide alike — and it is exact rather than approximate:
+the states it strides through are ones where no pattern can accept, and these
+bodies report no position, so a skipped run has no effect at all beyond
+advancing. Like every other SIMD skip here it turns itself off for the rest of a call once several
 attempts in a row have failed to clear a full chunk, so input that is dense in
 the patterns' opening byte classes pays a bounded cost rather than a
 compounding one.
