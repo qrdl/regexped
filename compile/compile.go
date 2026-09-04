@@ -1855,7 +1855,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
 			if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
 				fb, fmode, twin, twinPatch := appendFindCodeEntryTwinned(nil, l, table, patMandLit,
-					buildOpts.tableMemIdx, buildOpts.globals)
+					buildOpts.tableMemIdx)
 				p.setFind(fb, fmode)
 				p.findNeutralBody = twin
 				p.findTwinCallOff = twinPatch

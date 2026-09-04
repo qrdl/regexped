@@ -99,34 +99,12 @@ func detectClassChainPrefix(l *dfaLayout, t *dfaTable) (classChainPrefix, bool) 
 		return none, false
 	}
 
-	cellsPerState := 256
-	if l.useCompression {
-		cellsPerState = l.numClasses
-	}
-	readCell := func(state, idx int) int32 {
-		row := state
-		if l.useRowDedup {
-			row = int(l.rowMapBytes[state])
-		}
-		off := row*cellsPerState + idx
-		if l.useU8 {
-			return int32(l.tableBytes[off])
-		}
-		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
-	}
-	transitionOn := func(state int, b int) int32 {
-		cell := b
-		if l.useCompression {
-			cell = int(l.classMap[b])
-		}
-		return readCell(state, cell)
-	}
 	// liveSet returns the bytes with a live transition out of state, plus the
 	// single destination they all share; ok is false when they disagree.
 	liveSet := func(state int) (set []byte, dest int32, ok bool) {
 		dest = -1
 		for b := 0; b < 256; b++ {
-			t := transitionOn(state, b)
+			t := l.transitionOn(state, b)
 			if t == 0 {
 				continue
 			}
@@ -235,10 +213,10 @@ func detectClassChainPrefix(l *dfaLayout, t *dfaTable) (classChainPrefix, bool) 
 		// destinations, so the single-destination rule below refuses it, and
 		// the chain would be lost even though the pattern demonstrably needs
 		// 50 class bytes. Checked BEFORE liveSet for that reason.
-		if transitionOn(int(cur), int(class[0])) == cur {
+		if l.transitionOn(int(cur), int(class[0])) == cur {
 			selfLoops := true
 			for _, c := range class {
-				if transitionOn(int(cur), int(c)) != cur {
+				if l.transitionOn(int(cur), int(c)) != cur {
 					selfLoops = false
 					break
 				}

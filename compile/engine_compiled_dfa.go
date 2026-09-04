@@ -340,15 +340,11 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 // The SIMD prefix scan (emitPrefixScan) is already table/SIMD-only with no br_table
 // dispatch, so no restructuring is required for the find hot path.
 // Row deduplication is guaranteed disabled for the hybrid path.
-func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode, int) {
-	return buildHybridFindBodyVerdict(t, l, mandatoryLit, tableMemIdx, false, l.lnmAction5)
-}
-
-// buildHybridFindBodyVerdict is buildHybridFindBody with the two knobs a
-// neutral TWIN needs: whether a twin exists to hand off to (false for the twin
-// itself, which never hands off) and an explicit lnmAction5, so the twin can be
-// built from the same layout with the hint un-forced.
-func buildHybridFindBodyVerdict(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int, hasTwin, lnm bool) ([]byte, findFromMode, int) {
+// buildHybridFindBody takes the two knobs a neutral TWIN needs: whether a twin
+// exists to hand off to (false for the twin itself, which never hands off) and
+// an explicit lnmAction5, so the twin can be built from the SAME layout with
+// the hint un-forced. Ordinary callers pass (false, l.lnmAction5).
+func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int, hasTwin, lnm bool) ([]byte, findFromMode, int) {
 	return buildFindBody(findBodyParams{
 		startState:            l.wasmStart,
 		midStartState:         l.wasmMidStart,

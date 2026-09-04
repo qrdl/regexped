@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // Set-emission paths that the compile matrices next door do not select.
@@ -628,6 +629,51 @@ func TestSetEmitCapabilityPredicatesRefuseFind(t *testing.T) {
 	}
 	if off := mixed.twoPhaseFnOffset(capFind); off != -1 {
 		t.Errorf("twoPhaseFnOffset(find) = %d, want -1: find is never split", off)
+	}
+}
+
+// TestSetTwoPhaseScanAllWideBody covers the WIDE arm of emitTwoPhaseScanBody:
+// a mixed set whose `_all` answer is a caller-owned BITMAP rather than an i64
+// mask, which is what more than 64 pattern ids forces.
+//
+// The arm is short and its correctness argument is entirely in a comment — the
+// two phases write the same bitmap and each returns how many bits it set, so
+// the answer is their sum, and they cannot double-count because a pattern
+// lives in exactly one bucket. That is the kind of claim worth having a test
+// behind, and it was reached by nothing: every other two-phase set in the
+// suite is narrow.
+func TestSetTwoPhaseScanAllWideBody(t *testing.T) {
+	// Enough literal patterns to push the id space past 64, plus literal-less
+	// ones so the set is MIXED and actually splits into two phases.
+	var pats []string
+	for i := 0; i < 70; i++ {
+		pats = append(pats, fmt.Sprintf("lit%03dx", i))
+	}
+	pats = append(pats, `[^
+]*[0-2]`, `[^
+]*[3-5]`)
+
+	spec := SetSpec{Name: "s", ScanAll: "s_scan_all"}
+	cs := setEmitCovCompileSet(t, spec, pats, CompileSetOptions{})
+	if !cs.wideAll() {
+		t.Skipf("id space %d did not select the wide _all ABI", cs.idSpaceSize())
+	}
+	if !cs.usesTwoPhaseScan(capScanAll) {
+		t.Skip("this set no longer takes the two-phase split")
+	}
+	body := emitTwoPhaseScanBody(cs, capScanAll, cs.twoPhaseFnOffset(capScanAll))
+	if len(body) == 0 {
+		t.Fatal("wide two-phase scan_all emitted an empty body")
+	}
+	if body[len(body)-1] != 0x0B {
+		t.Errorf("body does not end with `end` (0x0B), got %#x", body[len(body)-1])
+	}
+	// The wide arm declares no locals and sums two calls; the narrow arms all
+	// declare at least one. Byte 1 is the locals-group count, after the
+	// size prefix — a cheap way to confirm which arm ran.
+	if _, n, err := utils.DecodeULEB128(body); err == nil && body[n] != 0x00 {
+		t.Errorf("wide arm declared %d locals groups, want 0 — the narrow arm ran",
+			body[n])
 	}
 }
 

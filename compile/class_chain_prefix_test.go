@@ -91,6 +91,21 @@ func TestDetectClassChainPrefix(t *testing.T) {
 		{"start accepts", `[a-z]*`, false, 0, 0},
 		// Alternation: the start state has two destinations.
 		{"alternation", `[a-z]{3}|[0-9]{5}`, false, 0, 0},
+
+		// A chain longer than maxClassChainPrefix. Also the u16 table form:
+		// 301 states puts the ids past a byte, so readCell takes its two-byte
+		// arm — the only case in this table that does.
+		{"past the chain cap", `[a-z]{300,}`, false, 0, 0},
+
+		// wasmStart != wasmMidStart: position 0 and a mid-input candidate walk
+		// DIFFERENT automata, and the probe consults neither the preceding byte
+		// nor which of the two it is in. Both spellings must be refused.
+		{"begin-anchored", `\A[a-z]{5,}`, false, 0, 0},
+		{"begin-anchored via star", `0*^0[a-z]{5,}`, false, 0, 0},
+
+		// An END anchor leaves both start states equal, so it stays eligible:
+		// the chain is the same, only its continuation differs.
+		{"end-anchored is still a chain", `[a-z]{5,}\z`, true, 5, 26},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

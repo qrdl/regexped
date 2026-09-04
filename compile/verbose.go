@@ -194,9 +194,32 @@ func reportDrops(w io.Writer, label string, refs []PatternRef) {
 	fmt.Fprintf(w, "  %s: %s\n", label, strings.Join(names, ", "))
 }
 
+// truncate caps s at n BYTES, ending with an ellipsis when it has to cut.
+//
+// The cut is made on a rune boundary. Slicing by byte index splits a
+// multi-byte rune and emits its lead byte alone, which is invalid UTF-8 going
+// straight to the user's terminal: truncate("ααααα", 6) used to yield
+// "αα\xce…". Patterns are arbitrary user input and byte_mode ones are not
+// even text, so this is reachable rather than theoretical.
+//
+// n counts bytes because the caller is aligning a column, and the result is
+// therefore at most n bytes — possibly fewer, when the boundary falls short.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	const ellipsis = "…"
+	budget := n - len(ellipsis)
+	if budget < 0 {
+		return ellipsis
+	}
+	// Walk runes and keep the last boundary that still fits.
+	cut := 0
+	for i := range s {
+		if i > budget {
+			break
+		}
+		cut = i
+	}
+	return s[:cut] + ellipsis
 }

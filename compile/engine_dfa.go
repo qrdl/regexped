@@ -3330,6 +3330,56 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	return l
 }
 
+// ── Reading the emitted transition table ───────────────────────────────────
+//
+// The table's layout varies along three independent axes — u8 vs u16 state
+// ids, byte-class compression, and row dedup — and every compile-time detector
+// that inspects it has to honour all three. These three methods are that
+// reading, in one place.
+//
+// They existed as five identical copies of a `readCell` closure (and three of
+// `transitionOn`), one per detector, because each one needs the table before
+// the emitters do. Five copies of an indexing rule with three conditional axes
+// is five chances for one to drift when a fourth axis is added; the copies
+// were verified byte-identical before being replaced by these.
+
+// cellsPerRow is the width of one table row: 256 raw bytes, or the number of
+// equivalence classes when byte-class compression is on.
+func (l *dfaLayout) cellsPerRow() int {
+	if l.useCompression {
+		return l.numClasses
+	}
+	return 256
+}
+
+// readCell returns the transition stored at (state, idx), where idx is a CELL
+// index — a byte value, or a byte class when compression is on. Callers that
+// have a byte rather than a cell want transitionOn.
+func (l *dfaLayout) readCell(state, idx int) int32 {
+	// When row dedup is on, map state → row index first.
+	row := state
+	if l.useRowDedup {
+		row = int(l.rowMapBytes[state])
+	}
+	off := row*l.cellsPerRow() + idx
+	if l.useU8 {
+		return int32(l.tableBytes[off])
+	}
+	// u16, little-endian.
+	return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
+}
+
+// transitionOn returns the state reached from state on byte b, mapping the
+// byte through the class table first when compression is on. 0 is the dead
+// state.
+func (l *dfaLayout) transitionOn(state, b int) int32 {
+	cell := b
+	if l.useCompression {
+		cell = int(l.classMap[b])
+	}
+	return l.readCell(state, cell)
+}
+
 // detectSkipSafeOnDead computes l.skipSafeOnDead via a conservative
 // "single-successor self-loop" condition. The safety argument requires
 // that intermediate attempts (starting between attempt_start and the dead
@@ -3411,28 +3461,6 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 	if l.numWASM <= 1 {
 		return
 	}
-	cellsPerState := 256
-	if l.useCompression {
-		cellsPerState = l.numClasses
-	}
-	readCell := func(state, idx int) int32 {
-		row := state
-		if l.useRowDedup {
-			row = int(l.rowMapBytes[state])
-		}
-		off := row*cellsPerState + idx
-		if l.useU8 {
-			return int32(l.tableBytes[off])
-		}
-		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
-	}
-	transitionOn := func(state int, b int) int32 {
-		cell := b
-		if l.useCompression {
-			cell = int(l.classMap[b])
-		}
-		return readCell(state, cell)
-	}
 
 	// isAnyMidAccept answers "can this state record a zero-width match at an
 	// attempt's start position?" across every channel that can set
@@ -3476,7 +3504,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 	var midStartAccepts [256]bool
 	anyAccept := false
 	for b := 0; b < 256; b++ {
-		if transitionOn(midStartIdx, b) != 0 {
+		if l.transitionOn(midStartIdx, b) != 0 {
 			midStartAccepts[b] = true
 			anyAccept = true
 		}
@@ -3491,7 +3519,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		if !midStartAccepts[b] {
 			continue
 		}
-		t := transitionOn(midStartIdx, b)
+		t := l.transitionOn(midStartIdx, b)
 		if succ < 0 {
 			succ = t
 		} else if t != succ {
@@ -3507,7 +3535,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		if !midStartAccepts[b] {
 			continue
 		}
-		if transitionOn(int(succ), b) != succ {
+		if l.transitionOn(int(succ), b) != succ {
 			return // not self-loop → not stable
 		}
 	}
@@ -3568,10 +3596,10 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		if midStartAccepts[b] {
 			continue
 		}
-		if !isAcceptingExit(transitionOn(midStartIdx, b)) {
+		if !isAcceptingExit(l.transitionOn(midStartIdx, b)) {
 			return
 		}
-		if !isAcceptingExit(transitionOn(int(succ), b)) {
+		if !isAcceptingExit(l.transitionOn(int(succ), b)) {
 			return
 		}
 	}
@@ -3616,7 +3644,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		}
 		entryAccepts := false
 		for b := 0; b < 256; b++ {
-			if transitionOn(es, b) != 0 {
+			if l.transitionOn(es, b) != 0 {
 				entryAccepts = true
 				break
 			}
@@ -3643,7 +3671,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		// an empty accept class, so it exits above via case 1 and is
 		// unaffected by this tightening.)
 		for b := 0; b < 256; b++ {
-			t := transitionOn(es, b)
+			t := l.transitionOn(es, b)
 			if midStartAccepts[b] {
 				if t != succ {
 					return
@@ -3730,28 +3758,6 @@ func detectEOFSkipSafe(l *dfaLayout) {
 	if l.needWordCharTable || l.midAcceptNLBytes != nil {
 		return
 	}
-	cellsPerState := 256
-	if l.useCompression {
-		cellsPerState = l.numClasses
-	}
-	readCell := func(state, idx int) int32 {
-		row := state
-		if l.useRowDedup {
-			row = int(l.rowMapBytes[state])
-		}
-		off := row*cellsPerState + idx
-		if l.useU8 {
-			return int32(l.tableBytes[off])
-		}
-		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
-	}
-	transitionOn := func(state int, b int) int32 {
-		cell := b
-		if l.useCompression {
-			cell = int(l.classMap[b])
-		}
-		return readCell(state, cell)
-	}
 	isMidAccept := func(state int) bool {
 		return state < len(l.midAcceptBytes) && l.midAcceptBytes[state] != 0
 	}
@@ -3799,7 +3805,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 			return // unanalysable
 		}
 		for b := 0; b < 256; b++ {
-			if transitionOn(startIdx, b) != 0 {
+			if l.transitionOn(startIdx, b) != 0 {
 				return // startState can consume: trajectory unproven
 			}
 		}
@@ -3809,7 +3815,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 	var classC [256]bool
 	anyAccept := false
 	for b := 0; b < 256; b++ {
-		if transitionOn(midStartIdx, b) != 0 {
+		if l.transitionOn(midStartIdx, b) != 0 {
 			classC[b] = true
 			anyAccept = true
 		}
@@ -3840,7 +3846,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 			if !classC[b] {
 				continue
 			}
-			t := transitionOn(cur, b)
+			t := l.transitionOn(cur, b)
 			if succ < 0 {
 				succ = t
 			} else if t != succ {
@@ -3856,7 +3862,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 			if classC[b] {
 				continue
 			}
-			if !isAcceptingExit(transitionOn(cur, b)) {
+			if !isAcceptingExit(l.transitionOn(cur, b)) {
 				return
 			}
 		}
@@ -3913,26 +3919,13 @@ func detectDominantSelfLoop(l *dfaLayout) {
 	}
 
 	// Reader for the table cell (u8 or u16) at a given (state, classOrByte).
-	readCell := func(state, idx int) int32 {
-		// When row dedup is on, map state → row index first.
-		row := state
-		if l.useRowDedup {
-			row = int(l.rowMapBytes[state])
-		}
-		off := row*cellsPerState + idx
-		if l.useU8 {
-			return int32(l.tableBytes[off])
-		}
-		// u16, little-endian.
-		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
-	}
 
 	for state := int32(1); state < int32(l.numWASM); state++ {
 		selfBytes := 0
 		var exitBytes []byte
 		hitCap := false
 		for c := 0; c < cellsPerState; c++ {
-			next := readCell(int(state), c)
+			next := l.readCell(int(state), c)
 			bytesInClass := 1
 			if l.useCompression {
 				bytesInClass = classByteCount[c]
@@ -4174,17 +4167,6 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 			classByteCount[l.classMap[b]]++
 		}
 	}
-	readCell := func(state, idx int) int32 {
-		row := state
-		if l.useRowDedup {
-			row = int(l.rowMapBytes[state])
-		}
-		off := row*cellsPerState + idx
-		if l.useU8 {
-			return int32(l.tableBytes[off])
-		}
-		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
-	}
 
 	idx := 0
 	for state := int32(1); state < int32(l.numWASM); state++ {
@@ -4202,7 +4184,7 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 		}
 		var selfSet []byte
 		for c := 0; c < cellsPerState; c++ {
-			if readCell(int(state), c) != state {
+			if l.readCell(int(state), c) != state {
 				continue
 			}
 			if l.useCompression {
@@ -5915,11 +5897,6 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 // function index) was removed. To reinstate, change the signature to
 // `([]byte, []int)`, restore the `callSites` plumbing, and update both
 // callers.
-func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode) {
-	cs, mode, _, _ := appendFindCodeEntryTwinned(cs, l, t, mandatoryLit, tableMemIdx, nil)
-	return cs, mode
-}
-
 // appendFindCodeEntryTwinned is appendFindCodeEntry plus the NEUTRAL TWIN: when
 // this layout's find body carries a runtime escape that can judge its own hint
 // wrong, a second body is emitted exactly as a neutral compile would emit it,
@@ -5940,16 +5917,19 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 // share the tables. Extending this to the mid-accept channel means emitting a
 // second, plain midAccept segment first.
 //
-// globals may be nil, in which case no twin is built and the bytes are exactly
-// what the single-body path produces.
-func appendFindCodeEntryTwinned(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int, globals *moduleGlobals) ([]byte, findFromMode, []byte, int) {
+// The twin costs no GLOBAL: the handoff seeds the find-from channel, which
+// index 0 always is and which every module carrying a find already declares.
+// An earlier design selected between the two bodies in the wrapper on a
+// verdict global, and that is what the moduleGlobals allocator was built for;
+// the handoff replaced it, and the allocator now has no consumer in this file.
+func appendFindCodeEntryTwinned(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode, []byte, int) {
 	var twin []byte
 	var hasTwin bool
 	// The twin is worth building only when the hinted body would actually carry
 	// the escape. shuftiPrefixPlan is the one predicate that decides that, and
 	// it is asked here with the same arguments buildFindBody will ask it with,
 	// so the two cannot disagree about whether a switch exists.
-	if globals != nil && l.lnmAction5 && !isAnchoredFind(t) && mandatoryLit == nil {
+	if l.lnmAction5 && !isAnchoredFind(t) && mandatoryLit == nil {
 		if _, adaptive := shuftiPrefixPlan(l.firstBytes, true, true); adaptive {
 			hasTwin = true
 		}
@@ -5974,9 +5954,9 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 		if isAnchoredFind(t) {
 			body, mode = buildHybridAnchoredFindBody(t, l, tableMemIdx), ffAnchoredZeroOnly
 		} else {
-			body, mode, twinPatch = buildHybridFindBodyVerdict(t, l, mandatoryLit, tableMemIdx, hasTwin, l.lnmAction5)
+			body, mode, twinPatch = buildHybridFindBody(t, l, mandatoryLit, tableMemIdx, hasTwin, l.lnmAction5)
 			if hasTwin {
-				tb, tmode, _ := buildHybridFindBodyVerdict(t, l, mandatoryLit, tableMemIdx, false, false)
+				tb, tmode, _ := buildHybridFindBody(t, l, mandatoryLit, tableMemIdx, false, false)
 				if tmode != mode {
 					panic("compile: neutral find twin disagrees with its hinted body about findFromMode")
 				}
