@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/qrdl/regexped/config"
 )
 
 // ── The --verbose reporter ─────────────────────────────────────────────────
@@ -239,6 +241,38 @@ func TestTruncate(t *testing.T) {
 	for _, c := range cases {
 		if got := truncate(c.in, c.n); got != c.want {
 			t.Errorf("truncate(%q, %d) = %q, want %q", c.in, c.n, got, c.want)
+		}
+	}
+}
+
+// TestVerboseDFAConstructionLimit pins the one --verbose path with no table to
+// report on. When newDFA's own ceiling fires, compilePattern holds a nil
+// *dfaTable and only the demotion is knowable; reading numStates off it to fill
+// the "DFA states N of M" line panicked, so `compile --verbose` crashed on
+// exactly the pattern the flag exists to explain.
+func TestVerboseDFAConstructionLimit(t *testing.T) {
+	// Exponential subset construction: `.*a.{14}b` needs a state per
+	// 15-byte window, far past newDFA's internal ceiling.
+	re := config.RegexEntry{Name: "blowup", Pattern: `(?s).*a.{14}b`, FindFunc: "find"}
+	rep := &Reporter{}
+	if _, err := compilePattern(re, 0, 0, CompileOptions{Report: rep, MaxDFAStates: 64}); err != nil {
+		t.Fatalf("compilePattern: %v", err)
+	}
+	if len(rep.Patterns) != 1 {
+		t.Fatalf("reported %d patterns, want 1", len(rep.Patterns))
+	}
+	got := rep.Patterns[0]
+	if got.Engine != EngineBacktrack {
+		t.Errorf("engine = %v, want Backtracking", got.Engine)
+	}
+	if !strings.Contains(got.Reason, "state limit") {
+		t.Errorf("reason = %q, want it to name the state limit", got.Reason)
+	}
+	// No table means no measurement: the limit line must be omitted rather
+	// than invented.
+	for _, l := range got.Limits {
+		if strings.HasPrefix(l, "DFA states") {
+			t.Errorf("reported %q with no table constructed", l)
 		}
 	}
 }

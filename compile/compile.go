@@ -1430,7 +1430,12 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	// the memory bound, or the ambiguous-boundary refusal below. A verbose mode
 	// that lies is worse than none.
 	if rep := buildOpts.report(); rep != nil {
-		rep.Limit("DFA states", table.numStates, maxStates)
+		// table is nil exactly when construction itself hit the ceiling —
+		// there is no state count to report against the limit, only the
+		// demotion the switch records below.
+		if table != nil {
+			rep.Limit("DFA states", table.numStates, maxStates)
+		}
 		switch {
 		case dfaStateLimitExceeded:
 			rep.Engine(EngineBacktrack, "DFA construction hit the state limit — raise max_dfa_states to keep the O(n) engine")

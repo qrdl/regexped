@@ -615,15 +615,27 @@ func (r *runner) setInput(input string) int32 {
 
 // drive performs ONE unit of work — a full `find` exhaustion, or a single call
 // for every other capability — and reports whether anything matched.
-func (r *runner) drive(inputLen int32) bool {
+//
+// A failed call is an ERROR, never `false`. Collapsing a trap or a watchdog
+// timeout into "did not match" is the worst possible outcome for this tool: on
+// a non-matching input it agrees with the oracle, so the sanity check passes,
+// and the fuel and timing of the aborted call are then published as a
+// measurement of work that never ran.
+func (r *runner) drive(inputLen int32) (bool, error) {
 	p := r.plan
 	switch r.kind {
 	case capMatchAny:
 		v, err := wcall(r.fn, r.store, p.inputBase, inputLen)
-		return err == nil && v.(int32) >= 0
+		if err != nil {
+			return false, err
+		}
+		return v.(int32) >= 0, nil
 	case capScanAny:
 		v, err := wcall(r.fn, r.store, p.inputBase, inputLen, int32(0))
-		return err == nil && v.(int32) >= 0
+		if err != nil {
+			return false, err
+		}
+		return v.(int32) >= 0, nil
 	case capMatchAll, capScanAll:
 		if r.wide {
 			// The module only ORs bits in and counts 0->1 transitions, so a
@@ -636,7 +648,10 @@ func (r *runner) drive(inputLen int32) bool {
 				args = []interface{}{p.inputBase, inputLen, p.bitmapPtr}
 			}
 			v, err := wcall(r.fn, r.store, args...)
-			return err == nil && v.(int32) > 0
+			if err != nil {
+				return false, err
+			}
+			return v.(int32) > 0, nil
 		}
 		var args []interface{}
 		if r.kind == capScanAll {
@@ -645,7 +660,10 @@ func (r *runner) drive(inputLen int32) bool {
 			args = []interface{}{p.inputBase, inputLen}
 		}
 		v, err := wcall(r.fn, r.store, args...)
-		return err == nil && v.(int64) != 0
+		if err != nil {
+			return false, err
+		}
+		return v.(int64) != 0, nil
 	default:
 		return r.exhaustFind(inputLen)
 	}
@@ -659,17 +677,17 @@ func (r *runner) drive(inputLen int32) bool {
 // resuming at start+1. Every tuple of one call shares a start, so reading the
 // first tuple is enough to resume. out_cap is the pattern count, the exact
 // worst case for one position, so the overflow path is never taken.
-func (r *runner) exhaustFind(inputLen int32) bool {
+func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 	p := r.plan
 	r.zero(p.gatePtr, int32(r.idSpace)*4)
 	found := false
 	for from := int32(0); ; {
 		n, err := wcall(r.fn, r.store, p.inputBase, inputLen, from, p.gatePtr, p.outBase, r.outCap)
 		if err != nil {
-			return found
+			return found, err
 		}
 		if n.(int32) <= 0 {
-			return found
+			return found, nil
 		}
 		found = true
 		buf := r.mem.UnsafeData(r.store)
@@ -721,22 +739,42 @@ func measureMode(b build, kind capKind, export string, inputs []string, iters in
 			return nil, fmt.Errorf("set fuel: %w", err)
 		}
 		before, _ := fuelRun.store.GetFuel()
-		fuelRun.drive(n)
+		if _, err := fuelRun.drive(n); err != nil {
+			return nil, fmt.Errorf("fuel pass over %q: %w", truncate(in, 60), err)
+		}
 		after, _ := fuelRun.store.GetFuel()
 
 		n = timeRun.setInput(in)
-		for end := time.Now().Add(warmupTime); time.Now().Before(end); {
-			timeRun.drive(n)
-		}
 		samples := make([]byte, iters*4)
-		for k := 0; k < iters; k++ {
-			t0 := time.Now()
-			timeRun.drive(n)
-			d := uint32(time.Since(t0).Nanoseconds())
-			samples[k*4] = byte(d)
-			samples[k*4+1] = byte(d >> 8)
-			samples[k*4+2] = byte(d >> 16)
-			samples[k*4+3] = byte(d >> 24)
+		// One arm for the whole series, not one per call. Arming costs a
+		// channel handoff and a timer — ~850 ns on the development machine —
+		// which is the same order as a scan call over a short input and would
+		// land inside every sample, diluting exactly the hint deltas this tool
+		// exists to show. The bound therefore covers the warmup and all
+		// `iters` passes together; it stays a liveness check, and a case that
+		// legitimately needs longer raises REGEXPED_WASM_TIMEOUT.
+		err := watchedSeries(timeRun.store, func() error {
+			for end := time.Now().Add(warmupTime); time.Now().Before(end); {
+				if _, err := timeRun.drive(n); err != nil {
+					return err
+				}
+			}
+			for k := 0; k < iters; k++ {
+				t0 := time.Now()
+				_, err := timeRun.drive(n)
+				d := uint32(time.Since(t0).Nanoseconds())
+				if err != nil {
+					return err
+				}
+				samples[k*4] = byte(d)
+				samples[k*4+1] = byte(d >> 8)
+				samples[k*4+2] = byte(d >> 16)
+				samples[k*4+3] = byte(d >> 24)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("timed pass over %q: %w", truncate(in, 60), err)
 		}
 		out[i] = cell{fuel: before - after, t: benchshim.ComputeStat(samples, 50)}
 	}
@@ -767,7 +805,10 @@ func sanityCheck(builds [3]build, kind capKind, export string, patternCount, idS
 		wcallCase = fmt.Sprintf("sanity/%s", modeNames[i])
 		for _, in := range inputs {
 			want := anyMatch(oracle, in)
-			got := r.drive(r.setInput(in))
+			got, err := r.drive(r.setInput(in))
+			if err != nil {
+				return fmt.Errorf("%s/%s: input %q: %w", modeNames[i], kind, truncate(in, 60), err)
+			}
 			if got != want {
 				return fmt.Errorf("%s/%s: input %q — engine says matched=%v, Go says %v",
 					modeNames[i], kind, truncate(in, 60), got, want)

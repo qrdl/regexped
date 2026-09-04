@@ -25,21 +25,58 @@ var wdog *wasmwatch.Watchdog
 // wcallCase names the case being measured, so a timeout says WHICH one hung.
 var wcallCase string
 
+// inSeries is true while a watchedSeries region is open. wcall then makes the
+// call bare, because the region already holds the epoch deadline that would
+// interrupt it — see watchedSeries for why the arming must not be per call.
+// This harness runs one WASM call at a time by construction, so a plain
+// package-level flag is enough.
+var inSeries bool
+
 // wcall is the only way this harness should invoke a WASM function.
 func wcall(fn *wasmtime.Func, store *wasmtime.Store, args ...interface{}) (interface{}, error) {
-	if wdog == nil {
-		return fn.Call(store, args...)
+	if wdog == nil || inSeries {
+		res, err := fn.Call(store, args...)
+		reportTimeout(err)
+		return res, err
 	}
 	wdog.Arm(store)
 	res, err := fn.Call(store, args...)
 	wdog.Disarm()
-	if wasmwatch.IsTimeout(err) {
-		fmt.Fprintf(os.Stderr,
-			"\nWASM call exceeded %s during %q — this is a HANG, not a slow pattern.\n"+
-				"Set REGEXPED_WASM_TIMEOUT to raise the bound if the work is genuinely this slow.\n",
-			wasmwatch.Timeout(), wcallCase)
-	}
+	reportTimeout(err)
 	return res, err
+}
+
+// watchedSeries runs body with the watchdog armed ONCE for its whole duration.
+//
+// Arming is not free — an unbuffered channel handoff to the watchdog goroutine
+// plus a timer, ~850 ns on the development machine — and a timed sample that
+// pays it measures the harness as much as the module. Wrapping the whole series
+// instead keeps the liveness guarantee (a hang in any pass still traps, and
+// still names the case) while leaving nothing host-side inside the measured
+// interval. The trade is that the timeout now bounds the SERIES rather than one
+// call, which is a bound on wall time either way and is what
+// REGEXPED_WASM_TIMEOUT is for.
+func watchedSeries(store *wasmtime.Store, body func() error) error {
+	if wdog == nil {
+		return body()
+	}
+	wdog.Arm(store)
+	inSeries = true
+	err := body()
+	inSeries = false
+	wdog.Disarm()
+	return err
+}
+
+// reportTimeout tells the user a watchdog interrupt is a hang, not slow work.
+func reportTimeout(err error) {
+	if !wasmwatch.IsTimeout(err) {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"\nWASM call exceeded %s during %q — this is a HANG, not a slow pattern.\n"+
+			"Set REGEXPED_WASM_TIMEOUT to raise the bound if the work is genuinely this slow.\n",
+		wasmwatch.Timeout(), wcallCase)
 }
 
 // newWatchedEngine builds an engine whose calls this harness's watchdog can

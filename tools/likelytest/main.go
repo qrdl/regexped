@@ -2529,7 +2529,11 @@ func planSetMem(wasmBytes []byte, inputLen int) (setMemPlan, error) {
 // Both bench paths (time and fuel) go through this so they can never end up
 // measuring different work for the same case, which is the failure a second
 // hand-written export lookup invites.
-func setDriver(tc testCase, store *wasmtime.Store, inst *wasmtime.Instance, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) (func(), error) {
+//
+// The closure reports the call error rather than swallowing it: a trap or a
+// watchdog timeout must abort the case, not be published as a timing and fuel
+// figure for work that never finished.
+func setDriver(tc testCase, store *wasmtime.Store, inst *wasmtime.Instance, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) (func() error, error) {
 	switch tc.setCap {
 	case setCapScanAny, setCapScanAll:
 		name := "set_" + tc.setCap
@@ -2545,16 +2549,17 @@ func setDriver(tc testCase, store *wasmtime.Store, inst *wasmtime.Instance, mem 
 		// out_ptr bitmap and this call would be wrong. Enforced in main's
 		// case validation rather than here, where a per-iteration check would
 		// be measured.
-		return func() {
-			_, _ = wcall(fn, store, plan.inputBase, inputLen, int32(0))
+		return func() error {
+			_, err := wcall(fn, store, plan.inputBase, inputLen, int32(0))
+			return err
 		}, nil
 	default:
 		fn := inst.GetFunc(store, "set_find")
 		if fn == nil {
 			return nil, fmt.Errorf("missing export %q", "set_find")
 		}
-		return func() {
-			runSetExhaust(store, fn, mem, plan, inputLen)
+		return func() error {
+			return runSetExhaust(store, fn, mem, plan, inputLen)
 		}, nil
 	}
 }
@@ -2589,16 +2594,28 @@ func benchTimeSet(tc testCase, wasmBytes []byte, input string, engine *wasmtime.
 		return 0, err
 	}
 
-	// Warmup: a few passes.
-	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
-		drive()
-	}
-
 	timings := make([]time.Duration, setIterTime)
-	for i := range timings {
-		t0 := time.Now()
-		drive()
-		timings[i] = time.Since(t0)
+	// One arm for the whole series, not one per call: unlike every other bench
+	// here, a modeSet pass is driven from the HOST, so wcall's per-call arming
+	// would land inside each sample. See watchedSeries.
+	if err := watchedSeries(store, func() error {
+		// Warmup: a few passes.
+		for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
+			if err := drive(); err != nil {
+				return err
+			}
+		}
+		for i := range timings {
+			t0 := time.Now()
+			err := drive()
+			timings[i] = time.Since(t0)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 	// p50.
 	ns := make([]byte, setIterTime*4)
@@ -2642,7 +2659,9 @@ func benchFuelSet(tc testCase, wasmBytes []byte, input string, fuelEngine *wasmt
 		return 0, err
 	}
 	before, _ := store.GetFuel()
-	drive()
+	if err := drive(); err != nil {
+		return 0, err
+	}
 	after, _ := store.GetFuel()
 	return before - after, nil
 }
@@ -2674,7 +2693,7 @@ func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan,
 //
 // advancing `from` to start+1 each time. Every tuple in one call shares a
 // start, so reading the first tuple is enough to resume.
-func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) {
+func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) error {
 	gatePtr := plan.outputBase + setOutCap*12
 	buf := mem.UnsafeData(store)
 	for i := int32(0); i < setOutCap*4; i++ {
@@ -2685,11 +2704,11 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 	for {
 		n, err := wcall(findFn, store, plan.inputBase, inputLen, from, gatePtr, plan.outputBase, setOutCap)
 		if err != nil {
-			return
+			return err
 		}
 		count := n.(int32)
 		if count <= 0 {
-			return
+			return nil
 		}
 		buf := mem.UnsafeData(store)
 		base := int(plan.outputBase)
