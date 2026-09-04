@@ -1,6 +1,8 @@
 package compile
 
 import (
+	"fmt"
+	"regexp/syntax"
 	"strings"
 	"testing"
 
@@ -14,11 +16,11 @@ import (
 // silently truncated — five verified divergences from Go, of which four were
 // reachable through the old `hasNonASCII && !hasASCII` gate. The rule now is:
 //
-//   - a rune the pattern WROTE above the mode's limit is a compile error;
+//   - a rune NAMED AS A MEMBER above the mode's limit is a compile error;
 //   - the limit is 127 by default and 0xFF under byte_mode;
 //   - runes above 0xFF are rejected in both modes, since no byte holds one;
-//   - case-fold artifacts of ASCII, and the open-ended tail of a negated
-//     class, are not "written" runes and stay legal.
+//   - case-fold artifacts of ASCII, and a range whose top endpoint is
+//     U+10FFFF, name no member above the limit and stay legal.
 func TestUnsupportedRuneRejection(t *testing.T) {
 	cases := []struct {
 		pattern              string
@@ -44,6 +46,12 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		{`(?i)k`, false, false, "B29 row 5 — the Kelvin sign, declared byte semantics"},
 		{`(?i)abc`, false, false, "plain ASCII folding"},
 		{`[^,]+`, false, false, "a negated class names every rune; rejecting it would reject `.`"},
+		// The same class in both spellings. See TestOpenEndedTailSpellings for
+		// why no rule can separate them, and the one below for where the line
+		// actually falls.
+		{`[a-\x{10ffff}]+`, false, false, "an explicit range to U+10FFFF IS the complement of everything below"},
+		{"[^\\x00-`]+", false, false, "the same class, spelled as a complement"},
+		{`[a-\x{ffff}]+`, true, true, "a top endpoint below U+10FFFF names members no byte holds"},
 		{`a.c`, false, false, "B29 row 4 — dot is one byte, declared byte semantics"},
 		{`[a-z]+`, false, false, "plain ASCII"},
 		{`\w+`, false, false, "plain ASCII class"},
@@ -128,4 +136,93 @@ func TestByteModeGateAppliesBeforeFastPaths(t *testing.T) {
 			t.Errorf("byte mode %q: %v", p, err)
 		}
 	}
+}
+
+// TestOpenEndedTailSpellings pins the boundary of the U+10FFFF exemption and
+// the reason it cannot be drawn any tighter.
+//
+// A review asked for explicit range endpoints (`[a-\x{10ffff}]`) to be
+// separated from parser-generated negated-class tails, on the grounds that the
+// first is a rune the user wrote. They cannot be separated: Go applies negation
+// while PARSING, so the complement spelling and the explicit spelling produce
+// one identical AST and one identical rune pair long before this gate runs. A
+// rule rejecting the explicit form would reject every negated class with it.
+//
+// Nor is anything lost by accepting them. The tail SATURATES at 0xFF in both
+// modes rather than truncating at the mode's limit, so the class means "every
+// byte from the low endpoint up" — exactly what the complement means to a byte
+// engine. The accepted byte set is asserted, not just the acceptance: a change
+// that truncated the tail at 0x7F would still compile, and would be a silent
+// wrong answer.
+//
+// Where the line DOES fall is the top endpoint. `[a-\x{ffff}]` names members
+// no byte can hold and is rejected in both modes.
+func TestOpenEndedTailSpellings(t *testing.T) {
+	const explicit = `[a-\x{10ffff}]`
+	const complement = "[^\\x00-`]"
+
+	// Same AST, so nothing downstream can tell them apart.
+	pe, err := syntax.Parse(explicit, syntax.Perl)
+	if err != nil {
+		t.Fatalf("parse %q: %v", explicit, err)
+	}
+	pc, err := syntax.Parse(complement, syntax.Perl)
+	if err != nil {
+		t.Fatalf("parse %q: %v", complement, err)
+	}
+	if pe.String() != pc.String() {
+		t.Errorf("%q and %q parse differently (%q vs %q) — the exemption could be narrowed after all",
+			explicit, complement, pe.String(), pc.String())
+	}
+
+	// Same accepted bytes, saturating at 0xFF, in both modes.
+	for _, byteMode := range []bool{false, true} {
+		gotE := acceptedByteRange(t, explicit, byteMode)
+		gotC := acceptedByteRange(t, complement, byteMode)
+		if gotE != gotC {
+			t.Errorf("byteMode=%v: %q accepts %s but %q accepts %s — one spelling compiles differently",
+				byteMode, explicit, gotE, complement, gotC)
+		}
+		if want := "61..ff"; gotE != want {
+			t.Errorf("byteMode=%v: %q accepts %s, want %s (the tail must saturate, not truncate)",
+				byteMode, explicit, gotE, want)
+		}
+	}
+
+	// And the endpoint below U+10FFFF is still rejected.
+	for _, byteMode := range []bool{false, true} {
+		e := config.RegexEntry{Pattern: `[a-\x{ffff}]+`, FindFunc: "find", ByteMode: byteMode}
+		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err == nil {
+			t.Errorf("byteMode=%v: [a-\\x{ffff}] accepted, want rejected", byteMode)
+		}
+	}
+}
+
+// acceptedByteRange reports the span of single bytes that reach an accepting
+// state from the start state, as "lo..hi".
+func acceptedByteRange(t *testing.T, pattern string, byteMode bool) string {
+	t.Helper()
+	m, err := compile(pattern, CompileOptions{ForceEngine: EngineDFA, LeftmostFirst: true, ByteMode: byteMode})
+	if err != nil {
+		t.Fatalf("compile %q (byteMode=%v): %v", pattern, byteMode, err)
+	}
+	tbl := dfaTableFrom(m.(*dfa))
+	lo, hi := -1, -1
+	for b := 0; b < 256; b++ {
+		ns := tbl.transitions[tbl.startState*256+b]
+		if ns < 0 {
+			continue
+		}
+		if _, ok := tbl.acceptStates[ns]; !ok {
+			continue
+		}
+		if lo < 0 {
+			lo = b
+		}
+		hi = b
+	}
+	if lo < 0 {
+		return "none"
+	}
+	return fmt.Sprintf("%02x..%02x", lo, hi)
 }

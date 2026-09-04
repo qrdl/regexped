@@ -2792,11 +2792,30 @@ const maxUnicodeRune = 0x10ffff
 // The limit is 127 by default and 0xFF in byte mode. Three things are
 // deliberately NOT rejected:
 //
-//   - **The open-ended tail of a negated class.** `[^,]` compiles to
-//     `[\x00-\x2b]` plus `[\x2d-\U0010ffff]`; the second range names every
-//     rune there is, not a non-ASCII intention. Rejecting it would reject `.`
-//     and every negated class, which is a non-starter. That these consume ONE
-//     BYTE is documented byte semantics (B29 row 4).
+//   - **A range whose top is U+10FFFF.** `[^,]` compiles to `[\x00-\x2b]`
+//     plus `[\x2d-\U0010ffff]`; the second range names every rune there is,
+//     not a non-ASCII intention. Rejecting it would reject `.` and every
+//     negated class, which is a non-starter. That these consume ONE BYTE is
+//     documented byte semantics (B29 row 4).
+//
+//     The top endpoint is the whole test, and it does not — cannot — ask how
+//     the class was SPELLED. A complement is not merely like an explicit range
+//     to U+10FFFF, it IS one: Go's parser applies negation while parsing and
+//     leaves no trace, so the complement of everything up to a backtick and
+//     `[a-\x{10ffff}]` produce the same AST, print the same String(), and
+//     compile to the same [97, 1114111] rune pair. No rule can accept the
+//     first and reject the second, and a rule keyed on the source text would
+//     compile two spellings of one class differently.
+//
+//     Nothing is lost by accepting them: the tail SATURATES at 0xFF rather
+//     than truncating, in both modes, so `[a-\x{10ffff}]` matches every byte
+//     >= 0x61 — exactly what the complement means to a byte engine. That is
+//     the opposite of the fold-artifact case below, where the rune is a class
+//     MEMBER with no byte to be and would vanish from the class in silence.
+//
+//     A range topping out anywhere else is rejected in both modes, which is
+//     why `[a-\x{ffff}]` is refused while `[a-\x{10ffff}]` is not. Pinned by
+//     TestOpenEndedTailSpellings.
 //
 //   - **Case-fold artifacts of ASCII.** Go's parser expands `(?i)` over a
 //     class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F (long s) and
@@ -2816,8 +2835,12 @@ const maxUnicodeRune = 0x10ffff
 //     keeping `(?i:[a-z]+)`, since both are an ASCII rune whose fold orbit
 //     leaves the byte range. Declared byte semantics, alongside `.`.
 //
-// What IS rejected is a rune the pattern itself wrote: `[a-zé]+`, `\pL+`,
-// `[a\x80]+` outside byte mode, and anything above U+00FF in either mode.
+// What IS rejected is a rune NAMED AS A MEMBER above the mode's limit —
+// `[a-zé]+`, `\pL+`, `[a\x80]+` outside byte mode, `[sſ]` in either — and
+// anything above U+00FF in either mode. "Named as a member" rather than
+// "written by the pattern" on purpose: a range endpoint of U+10FFFF is a
+// spelling of "the complement of everything below", not a demand to match that
+// codepoint, and the two are indistinguishable by the time this runs.
 func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
 	limit := rune(127)
 	if byteMode {
