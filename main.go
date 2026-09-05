@@ -193,7 +193,7 @@ func runCompileCmd(args []string) {
 	// Validate output conflict before writing any output: refuse to send both
 	// streams to the same destination (stdout/stdout, or the same filesystem
 	// path), which would silently corrupt the WASM with the JSON diagnostics.
-	if *diagJSON != "" && len(cfg.Sets) > 0 {
+	if *diagJSON != "" {
 		if outPath == "-" && *diagJSON == "-" {
 			failf(exitUsage, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
 		}
@@ -216,7 +216,7 @@ func runCompileCmd(args []string) {
 		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 
-	if *diagJSON != "" && len(cfg.Sets) > 0 {
+	if *diagJSON != "" {
 		if err := compile.CmdWriteDiagJSON(cfg, outPath, *diagJSON); err != nil {
 			failf(exitCodeFor(err, exitCompile), "%v", err)
 		}

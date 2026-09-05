@@ -1367,7 +1367,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			if useMemo {
 				btMemoBase = btStackLimit
 			}
-			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx)
+			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx, btMemoMaxLen(len(bt.prog.Inst), matchMemoBudget))
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(dfaLayoutParams{
@@ -1635,7 +1635,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				btMemoBase = btStackLimit
 			}
 			frameSize := int32(8 + btNumLoopFrameLocals(bt, false)*4) // pos + loop trackers + retryPC (no cap slots)
-			p.setFind(appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx))
+			p.setFind(appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx, btMemoMaxLen(len(bt.prog.Inst), memoBudget)))
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
@@ -2060,7 +2060,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		if useMemo {
 			N := len(prog.Inst)
 			memoBudget := resolveMemoBudget(&buildOpts)
-			memoMaxLen = int32(memoBudget*8/N - 1)
+			memoMaxLen = btMemoMaxLen(N, memoBudget)
 			memoMaxSize = int64((N*(int(memoMaxLen)+1) + 7) / 8)
 			if memoMaxSize > int64(memoBudget) {
 				return nil, fmt.Errorf(
@@ -2112,7 +2112,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 		p.numGroups = bt.numGroups
 		p.winScratchOff = winScratchOff
-		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winScratchOff)
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winScratchOff, memoMaxLen)
 	}
 
 	return p, nil

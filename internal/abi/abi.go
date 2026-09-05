@@ -26,15 +26,30 @@ const (
 	// to None / nil / false / end-of-iteration.
 	NoMatch = -1
 
-	// BTStackOverflow is returned when the Backtracking engine runs out of
-	// backtrack frames mid-search (btPushFrame's guard in
-	// compile/engine_backtrack.go). The frame budget is a compile-time constant
-	// sized from the pattern's alternation count (btAllocSizes), while the true
-	// requirement scales with input length, so a long enough input can exhaust
-	// it. When that happens the engine has abandoned part of the search space
-	// and cannot say whether a match exists: reporting NoMatch here would be a
+	// BTStackOverflow is returned when the Backtracking engine cannot complete a
+	// search because one of its compile-time sized regions is too small for the
+	// input. Two independent regions can hit that, and both report this value:
+	//
+	//   - the backtrack FRAME STACK (btPushFrame's guard in
+	//     compile/engine_backtrack.go), sized from the pattern's alternation
+	//     count by btAllocSizes;
+	//   - the BitState MEMO bitset (emitBTMemoLenGuard, same file), sized from
+	//     the pattern's instruction count by btMemoMaxLen.
+	//
+	// Both budgets are compile-time constants while the true requirement scales
+	// with input length, so a long enough input can exhaust either. The two
+	// ceilings move independently — one with numAlts, the other with N — so
+	// neither guard may be left to the other to catch.
+	//
+	// When either fires the engine has abandoned part of the search space and
+	// cannot say whether a match exists: reporting NoMatch here would be a
 	// false negative that scales in with input size and carries no diagnostic,
 	// which is exactly the failure this sentinel exists to prevent.
+	//
+	// They share one value because a host acts identically on both — surface an
+	// error, do not treat it as "no match" — and because a new value would have
+	// to be threaded through all six stub generators to convey a distinction no
+	// caller can act on.
 	//
 	// Hosts must surface it as an error, never as "no match". See
 	// docs/engines.md ("Backtracking frame budget").

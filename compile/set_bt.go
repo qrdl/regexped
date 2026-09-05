@@ -493,7 +493,11 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			cs.btRegions.stackBase, cs.btRegions.stackLimit,
 			int32(btFrameSize(info.bt)), cs.btRegions.memoBase, info.useMemo,
 			true, // nativeAnchored
-			tableMemIdx, cs.btRegions.winScratch)
+			tableMemIdx, cs.btRegions.winScratch,
+			// Per-bucket, not per-set: the shared memo region is sized to the
+			// LARGEST bucket's reservation, but each body's fill is sized from
+			// its OWN N, so each must be bounded by its own ceiling.
+			btMemoMaxLen(len(info.bt.prog.Inst), resolveMemoBudget(nil)))
 		cs.btFnBodies = append(cs.btFnBodies, driver)
 
 		// gated and skip-carrying are mutually exclusive and mean DIFFERENT

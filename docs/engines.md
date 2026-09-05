@@ -336,7 +336,15 @@ bit       = 1 << (bitIndex & 7)
 
 If the bit is already set, the current thread is discarded — it cannot produce a new result. Otherwise the bit is set and execution continues. This guarantees each `(pc, pos)` pair is visited at most once, bounding runtime to O(numInstructions × inputLen).
 
-The bitset is zero-initialised at the start of each call. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, computed at runtime from the actual input length. A compile-time budget of 128 KB is reserved in WASM linear memory for the bitset; the memory region is placed last in the layout so longer inputs consume only unused space.
+The bitset is zero-initialised at the start of each call. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, computed at runtime from the actual input length, while the region reserved for it is a compile-time 128 KB. The two therefore meet at a ceiling:
+
+```
+maxInputLen = 128 KB × 8 / numInstructions − 1
+```
+
+An input longer than that cannot be memoised in the space reserved, so the engine reports `-2` (the same "resource exhausted, answer unknown" sentinel as a backtrack-stack overflow — see *Backtracking frame budget*) instead of running the fill past its region. The ceiling scales inversely with the pattern's instruction count: a 25-instruction pattern accepts inputs up to about 42 KB, a 250-instruction one about 4 KB.
+
+The two ceilings — this one and the frame budget — move independently, with `numInstructions` and with `numAlts` respectively, so either can be the one a given pattern and input hits first.
 
 **Memory layout:**
 ```
