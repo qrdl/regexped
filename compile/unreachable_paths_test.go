@@ -26,20 +26,15 @@ import (
 // well-formed output — which is what would break silently as the emitters
 // around it change.
 
-// shuftiCompiledSet builds a set whose frontend is Shufti, by the same route
-// hints_test.go uses: enough literals that Teddy declines, first bytes inside
-// Shufti's 17..64 band, Aho-Corasick pushed out of budget, and the
+// shuftiCompiledSetOpts builds a set whose frontend is Shufti, by the same
+// route hints_test.go uses: enough literals that Teddy declines, first bytes
+// inside Shufti's 17..64 band, Aho-Corasick pushed out of budget, and the
 // LikelyNoMatch bias that selects it.
-func shuftiCompiledSet(t *testing.T) *compiledSet {
-	t.Helper()
-	return shuftiCompiledSetOpts(t, nil)
-}
-
-// shuftiCompiledSetOpts is shuftiCompiledSet with the options left open, so a
-// caller can force the ADAPTIVE variant. The dense switch is `lnm && !rare`,
-// and this set's byte union is one the rarity model calls rare — so the
-// adaptive arm, roughly a third of the emitter, is unreachable without
-// WithShuftiAdaptive.
+//
+// `over` leaves the options open so a caller can force the ADAPTIVE variant.
+// The dense switch is `lnm && !rare`, and this set's byte union is one the
+// rarity model calls rare — so the adaptive arm, roughly a third of the
+// emitter, is unreachable without WithShuftiAdaptive.
 func shuftiCompiledSetOpts(t *testing.T, over func(*CompileSetOptions)) *compiledSet {
 	t.Helper()
 	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"

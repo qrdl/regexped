@@ -791,6 +791,38 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 	return
 }
 
+// appendFindBodyWithTwin appends the plain-find body, patching its handoff call
+// to the neutral twin and appending that twin, when one exists.
+//
+// findFuncIdx is the module-wide function index of the find body itself;
+// funcLayout places slotFindNeutral immediately after slotFind, so the twin is
+// that index plus one. The immediate was emitted as five zero-padded LEB128
+// bytes (twinCallImmWidth), so overwriting it in place moves nothing.
+//
+// BOTH assemblers call this. The twin was added to funcLayout and to the
+// single-pattern assembler alone, so a module combining any set with a
+// prefer-no-match find that emits an adaptive-Shufti twin panicked in the
+// function section — and, past that, would have declared one more function than
+// it emitted with the handoff still pointing at function 0. Sharing the
+// emission is what keeps the two sides of that layout from drifting again.
+func (p *compiledPattern) appendFindBodyWithTwin(cs []byte, findFuncIdx int) []byte {
+	if p.findNeutralBody == nil {
+		return append(cs, p.findBody...)
+	}
+	body := append([]byte(nil), p.findBody...)
+	off := p.findTwinCallOff
+	if off < 0 || off+twinCallImmWidth > len(body) {
+		panic("compile: find twin handoff patch offset outside the body")
+	}
+	copy(body[off:off+twinCallImmWidth],
+		utils.AppendPaddedULEB128(nil, uint32(findFuncIdx+1), twinCallImmWidth))
+	cs = append(cs, body...)
+	// The neutral twin follows immediately, matching funcLayout's
+	// slotFind → slotFindNeutral order. Both are already size-prefixed by
+	// their emitter.
+	return append(cs, p.findNeutralBody...)
+}
+
 // altLitAnchorBranchFuncIdx returns the (local, pattern-relative) function
 // indices of branch i's backward_scan and forward_verify functions — the
 // offset to add to baseIdx[patternIndex] in assembleModule. Layout: after
@@ -2331,27 +2363,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		} else if p.findBody != nil {
 			// LNM non-mid bulk-skip helper call-site patching was here —
 			// see archive Section 16.
-			// Patch the handoff call's function index now that it is known.
-			// funcLayout places slotFindNeutral immediately after slotFind, so
-			// the twin is the body's index plus one. The immediate was emitted
-			// as five zero-padded LEB128 bytes, so overwriting it in place
-			// moves nothing.
-			if p.findNeutralBody != nil {
-				body := append([]byte(nil), p.findBody...)
-				off := p.findTwinCallOff
-				if off < 0 || off+twinCallImmWidth > len(body) {
-					panic("compile: find twin handoff patch offset outside the body")
-				}
-				copy(body[off:off+twinCallImmWidth],
-					utils.AppendPaddedULEB128(nil, uint32(base+findOff+1), twinCallImmWidth))
-				cs = append(cs, body...)
-				// The neutral twin follows immediately, matching funcLayout's
-				// slotFind → slotFindNeutral order. Both are already
-				// size-prefixed by their emitter.
-				cs = append(cs, p.findNeutralBody...)
-			} else {
-				cs = append(cs, p.findBody...)
-			}
+			cs = p.appendFindBodyWithTwin(cs, base+findOff)
 		}
 		if p.captureBody != nil {
 			cs = append(cs, p.captureBody...)

@@ -1887,7 +1887,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		slotLitAnchorBackScan: setTypeI32I32ToI32,
 		slotLitAnchorFind:     setTypeI32I32ToI64,
 		slotFind:              setTypeI32I32ToI64,
-		slotCapture:           setTypeI32x3ToI32, // (i32,i32,i32)→i32
+		slotFindNeutral:       setTypeI32I32ToI64, // same shape as the body it twins
+		slotCapture:           setTypeI32x3ToI32,  // (i32,i32,i32)→i32
 		slotGroupsWrapper:     setTypeI32x3ToI32,
 		// The LM-2 batch wrappers share the set match body's
 		// (i32×5)→i32 shape rather than needing a type of their own.
@@ -2099,7 +2100,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = utils.AppendULEB128(cs_bytes, uint32(len(litAnchorFindBody)))
 			cs_bytes = append(cs_bytes, litAnchorFindBody...)
 		} else if p.findBody != nil {
-			cs_bytes = append(cs_bytes, p.findBody...)
+			cs_bytes = p.appendFindBodyWithTwin(cs_bytes, base+findOff)
 		}
 		if p.captureBody != nil {
 			cs_bytes = append(cs_bytes, p.captureBody...)

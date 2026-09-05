@@ -1,10 +1,12 @@
 package compile
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // ── Per-pattern emitters inside the SET assembler ──────────────────────────
@@ -98,6 +100,26 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			exports: []string{"m_match", "s_find"},
 		},
 		{
+			// A prefer-no-match find whose adaptive Shufti scan emits a
+			// NEUTRAL TWIN: two functions from one findBody, the first
+			// handing off to the second. funcLayout gained the twin's slot
+			// and both assemblers therefore declared it, while only the
+			// single-pattern one had a type index for it — so this
+			// combination panicked in the set module's function section.
+			//
+			// The pattern needs a first-byte set in the adaptive band and no
+			// mandatory literal, or there is no dense switch to escape and no
+			// twin to emit (TestFindNeutralTwinEmission pins that predicate).
+			name: "prefer-no-match find twin",
+			entries: []config.RegexEntry{{
+				Name:     "tw",
+				Pattern:  `[a-zA-Z]{20,}`,
+				FindFunc: "tw_find",
+				Hints:    []string{"prefer-no-match"},
+			}},
+			exports: []string{"tw_find", "s_find"},
+		},
+		{
 			// Batch wrappers beside a set: a second entry point over the same
 			// body, whose index the assembler also has to resolve.
 			name: "batch find",
@@ -157,5 +179,79 @@ func TestSetAssemblerWithReporter(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("set report missing %q\n--- got ---\n%s", want, got)
 		}
+	}
+}
+
+// TestSetAssemblerFindTwinHandoff pins that the set assembler emits the neutral
+// twin AND patches the handoff call that reaches it.
+//
+// The export check above cannot see either. A missing twin body leaves the
+// module declaring one more function than it emits, which is a section-length
+// error rather than a missing export; an unpatched handoff leaves the call
+// immediate at its placeholder 0 — the find body itself, whose type matches, so
+// the module still validates and merely recurses for ever. Comparing against
+// the bytes the shared emitter produces at the pattern's real function index
+// catches both, without a WASM parser.
+func TestSetAssemblerFindTwinHandoff(t *testing.T) {
+	entry := config.RegexEntry{
+		Name:     "tw",
+		Pattern:  `[a-zA-Z]{20,}`,
+		FindFunc: "tw_find",
+		Hints:    []string{"prefer-no-match"},
+	}
+	cfg := setPlusPatternsConfig([]config.RegexEntry{entry}, nil)
+	w, _, _, err := CompileFileOpts(cfg, "", CompileSetOptions{})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// The same pattern through the same front end, to learn what its find
+	// body and twin should look like and where the twin sits.
+	p, err := compilePattern(entry, 0, 0, CompileOptions{})
+	if err != nil {
+		t.Fatalf("compilePattern: %v", err)
+	}
+	if p.findNeutralBody == nil {
+		t.Fatal("pattern emitted no neutral twin — the case no longer covers " +
+			"the path it was written for")
+	}
+	// The twin pattern is the LAST entry, so its base is every earlier
+	// pattern's function count. The set members declare no _func fields, so
+	// they compile to nothing here and the twin is the module's first — and
+	// only — standalone pattern.
+	base := 0
+	for _, e := range cfg.Regexps[:len(cfg.Regexps)-1] {
+		q, cErr := compilePattern(e, 0, 0, CompileOptions{})
+		if cErr != nil {
+			t.Fatalf("compilePattern(%s): %v", e.Name, cErr)
+		}
+		if q != nil {
+			base += len(q.funcLayout())
+		}
+	}
+	// Being first is also what makes tableBase 0 for it, which is the base the
+	// reference build above used. A table-bearing pattern added ahead of it
+	// would shift the twin's data offsets and the reconstruction below would
+	// no longer be the bytes the assembler emits — so say so here rather than
+	// letting the comparison fail as if the assembler were at fault.
+	if base != 0 {
+		t.Fatalf("twin pattern is no longer the module's first compiled "+
+			"pattern (base=%d): rebuild the reference at its real tableBase", base)
+	}
+	_, _, findOff, _, _ := p.offsets()
+	want := p.appendFindBodyWithTwin(nil, base+findOff)
+	if !bytes.Contains(w, want) {
+		t.Errorf("set module does not contain the find body and its patched "+
+			"twin handoff (find at function %d, twin at %d)",
+			base+findOff, base+findOff+1)
+	}
+	// And the unpatched form must NOT appear: that is the placeholder the
+	// assembler is responsible for overwriting.
+	unpatched := append([]byte(nil), p.findBody...)
+	copy(unpatched[p.findTwinCallOff:p.findTwinCallOff+twinCallImmWidth],
+		utils.AppendPaddedULEB128(nil, 0, twinCallImmWidth))
+	if bytes.Contains(w, unpatched) {
+		t.Error("set module contains the find body with an UNPATCHED twin " +
+			"handoff — the call still targets function 0")
 	}
 }

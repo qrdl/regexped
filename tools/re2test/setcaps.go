@@ -213,9 +213,13 @@ func resolveSetProfiles(spec string) ([]setProfile, error) {
 func (p setProfile) needs() (anchored, spm, findAll bool) {
 	for _, s := range p.specs {
 		anchored = anchored || s.matchAny || s.matchAll
-		if s.overlapping {
-			spm = spm || s.find
-		} else {
+		// `find` needs the start-position map under BOTH overlap policies: it
+		// is the whole expectation for `overlapping`, and it is what
+		// spansFrom replays for the interior-`from` drive, which every find
+		// spec runs. findAll is the extra one the gated whole-input drive
+		// uses, because that is the column col4 cross-checks.
+		spm = spm || s.find
+		if !s.overlapping {
 			findAll = findAll || s.find
 		}
 		spm = spm || s.scanAny || s.scanAll
