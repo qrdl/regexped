@@ -46,13 +46,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -281,6 +282,44 @@ type setCase struct {
 	inputLbl string
 }
 
+// setHints is the set-level `hints:` value every compiled case carries,
+// resolved once from -hints before the matrix runs and never written again.
+//
+// It is a package variable rather than a compileCase parameter because
+// compileCase has seven call sites across the fuel, size, cross-fuel and
+// verify paths, and threading a knob none of them decide would invite exactly
+// the drift this measures: one path compiling under a different mode than the
+// one the header claims. One value, set once, read everywhere.
+//
+// Empty means neutral, which is what every committed baseline was taken
+// under. See setHintsKeySuffix for how a non-empty value is kept out of a
+// neutral baseline comparison.
+var setHints string
+
+// forcedFrontend pins the literal frontend for every compiled case, so a
+// family can be measured through a frontend its literal count would not have
+// chosen (task 71). Empty means "let chooseLiteralFrontend decide".
+//
+// The crossover constants it exists to interrogate were each calibrated on a
+// NO-MATCH corpus; whether they still hold when nearly every probe is a real
+// hit is a different question, and one that cannot be asked without this.
+var forcedFrontend string
+
+var validFrontends = map[string]compile.SetFrontend{
+	"teddy":       compile.SetFrontendTeddy,
+	"ac":          compile.SetFrontendAC,
+	"scalar":      compile.SetFrontendScalar,
+	"packed-pair": compile.SetFrontendPackedPair,
+}
+
+// validSetHints are the LikelyMode spellings config.ValidateConfig accepts on
+// a set. `batch-find` is NOT among them: it is unconditional here (every case
+// compiles its batch entry) and is added by compileCase itself.
+var validSetHints = map[string]bool{
+	"prefer-match":    true,
+	"prefer-no-match": true,
+}
+
 func main() {
 	fuelOnly := flag.Bool("fuel", false, "print our fuel only (deterministic)")
 	fuelCross := flag.Bool("fuel-cross", false, "our fuel vs regex-automata's, both metered (deterministic; no timing)")
@@ -288,7 +327,32 @@ func main() {
 	verify := flag.Bool("verify", false, "cross-engine correctness on the honest pairings")
 	compareFuel := flag.String("compare-fuel", "", "compare our fuel against a baseline file; exit 1 on any change")
 	compareSize := flag.String("compare-size", "", "compare module sizes against a baseline file; exit 1 on any change")
+	hints := flag.String("hints", "", "set-level LikelyMode hint applied to every case: prefer-match, prefer-no-match, or empty for neutral")
+	forceFE := flag.String("force-frontend", "", "TEST-ONLY: pin the literal frontend for every case (teddy, ac, scalar, packed-pair); empty lets the chooser decide")
 	flag.Parse()
+
+	if *forceFE != "" {
+		if _, ok := validFrontends[*forceFE]; !ok {
+			fmt.Fprintf(os.Stderr, "-force-frontend: unknown value %q\n", *forceFE)
+			os.Exit(1)
+		}
+		forcedFrontend = *forceFE
+		fmt.Fprintf(os.Stderr, "note: literal frontend pinned to %q for every case — rows are keyed %q\n",
+			forcedFrontend, setHintsKeySuffix())
+	}
+
+	if *hints != "" && !validSetHints[*hints] {
+		fmt.Fprintf(os.Stderr, "-hints: unknown value %q (want prefer-match, prefer-no-match, or empty)\n", *hints)
+		os.Exit(1)
+	}
+	setHints = *hints
+	if setHints != "" {
+		// Stated once, on stderr, so it survives redirection of the rows
+		// themselves into a file — a hinted board that reads as neutral is
+		// the mistake this whole knob has to avoid.
+		fmt.Fprintf(os.Stderr, "note: every set compiled with hints: [%s] — rows are keyed %q and will NOT match a neutral baseline\n",
+			setHints, setHintsKeySuffix())
+	}
 
 	cases := buildMatrix()
 
@@ -403,6 +467,61 @@ func buildMatrix() []setCase {
 			setCase{fmt.Sprintf("sharedlit-%d", n), pats, corpusDense(pats), "dense 100KB"},
 		)
 	}
+	// A sparse bucket whose merged suffix DFA carries an ACCEPTING 1-byte
+	// self-loop — the shape the bitmask body's member bulk skip exists for, and
+	// the one the matrix had no row of (TODO 64).
+	//
+	// The two existing sparse families, sharedlit-128 and classchain-128, are
+	// bounded class chains: a bounded repeat produces a CHAIN, not a self-loop,
+	// so memberWalkStates finds nothing in either and the accelerator could
+	// never fire on any row able to measure it.
+	//
+	// Getting both properties at once needs the set kept SMALL. 128 patterns
+	// over long class chains grow the merged DFA past promoteSparseBuckets'
+	// budget, which then refuses the merge and leaves four bitmask buckets — so
+	// the tail that supplies the self-loop also destroys the sparseness. Forty
+	// short ones promote cleanly: one sparse bucket, 87 states, two member-walk
+	// states (measured 2026-08-31).
+	sharedLitRunPatterns := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf(`union[ \t]+k%02da+`, i)
+		}
+		return out
+	}
+	{
+		pats := sharedLitRunPatterns(40)
+		out = append(out,
+			setCase{"sharedlit-run-40", pats, corpusNoMatch(), "no-match 100KB"},
+			setCase{"sharedlit-run-40", pats, corpusDense(pats), "dense 100KB"},
+		)
+	}
+	// The CEILING control for the family above, and the only reason it exists.
+	//
+	// Structurally identical — same literal, same bucket shape, same accepting
+	// 1-byte self-loop — but its needle carries a 4-byte run instead of 64,
+	// PADDED back to the same total length so corpusDense plants the same
+	// NUMBER of needles in the same 100 KB. Needle count, literal hits and
+	// corpus size are therefore held constant, and the only difference is 60
+	// bytes of saturated-run walk per needle.
+	//
+	// The dense-row gap between the two families is thus an upper bound on what
+	// any bulk skip over that run could ever save. Measuring it costs half an
+	// hour; discovering the same bound by writing the skip costs a day, and
+	// Candidate A's +37.5% is what happens when the bound is assumed instead.
+	sharedLitRunShortPatterns := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf(`union[ \t]+m%02da+`, i)
+		}
+		return out
+	}
+	{
+		pats := sharedLitRunShortPatterns(40)
+		out = append(out,
+			setCase{"sharedlit-run4-40", pats, corpusDense(pats), "dense 100KB"},
+		)
+	}
 	// Sets with NO mandatory literal that are also large enough to split on the
 	// 32-bit accept mask — the fallback packer's version of the sharedlit pair
 	// above, and the shape G17's promotion was extended to cover.
@@ -431,6 +550,29 @@ func buildMatrix() []setCase {
 		out = append(out,
 			setCase{fmt.Sprintf("classchain-%d", n), pats, corpusNoMatch(), "no-match 100KB"},
 			setCase{fmt.Sprintf("classchain-%d", n), pats, corpusDense(pats), "dense 100KB"},
+			// The third corpus, added 2026-09-01, and the reason is that the
+			// board could not see `prefer-no-match` at all.
+			//
+			// classchain is the only literal-less family, so it is the only one
+			// reaching the union scan — and `emitUnionSkip`, the SIMD stride
+			// that hint turns on, pays only over a stretch where the automaton
+			// is sitting in a self-loop. For these patterns the exit set is
+			// [a-z], and BOTH corpora above are dense in it: corpusNoMatch is
+			// lowercase prose and corpusDense's filler is the word "filler".
+			// So the stride probed, never skipped, and every hinted row on the
+			// board reported its guard cost (+5-6%) with no row anywhere able
+			// to report the win. Measured against likelytest's own sparse
+			// input the same code is -74%.
+			//
+			// This corpus is that missing shape: no lowercase letter at all,
+			// so the automaton stays in its entry self-loop for the whole
+			// 100 KB. It is a no-match corpus like the first, with deliberately
+			// different byte statistics — which is exactly what the classchain
+			// and sharedsuffix incidents teach has to be VERIFIED rather than
+			// asserted in a comment, hence assertExitSparse below.
+			setCase{fmt.Sprintf("classchain-%d", n), pats,
+				assertExitSparse(pats, corpusExitSparse(), fmt.Sprintf("classchain-%d", n)),
+				"no-match exit-sparse 100KB"},
 		)
 	}
 	// A set with no mandatory literal at all: every position is visited, so
@@ -481,6 +623,68 @@ func corpusNoMatch() string {
 		b.WriteString(line)
 	}
 	return b.String()
+}
+
+// corpusExitSparse is 100KB of filler holding NO lowercase letter at all.
+//
+// For a class-chain set whose patterns all begin with [a-z], that makes it
+// both a no-match corpus AND one where the union automaton never leaves its
+// entry state's self-loop — the input shape `prefer-no-match`'s SIMD stride
+// exists for. corpusNoMatch is a no-match corpus for these patterns too, but
+// it is lowercase prose, so the automaton leaves the self-loop on nearly every
+// byte and the stride has nothing to stride over.
+//
+// Both promises are checked at build time by assertExitSparse; neither is
+// this comment's to keep.
+func corpusExitSparse() string {
+	var b strings.Builder
+	line := "0123456789 ,.;:!?()[]{}<>/@#$%^&*-_=+|~ 9876543210 THE QUICK BROWN FOX 42 "
+	for b.Len() < 100*1024 {
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// assertExitSparse hard-errors unless corpus really is what corpusExitSparse
+// claims: matched by none of pats, and containing almost no byte that can
+// begin one of them.
+//
+// It exists because three separate incidents in this file
+// — classchain, sharedsuffix and diverse — were all one shape: a corpus that
+// silently stopped being what its label said, so a row went on printing
+// numbers for a workload nobody was running. sampleNeedles' default arm is the
+// same guard for the matching corpora; this is it for a no-match one. A
+// benchmark measuring the wrong thing quietly is worse than one that refuses
+// to run.
+func assertExitSparse(pats []string, corpus, family string) string {
+	for _, p := range pats {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "assertExitSparse %s: pattern %q rejected by Go regexp: %v\n", family, p, err)
+			os.Exit(1)
+		}
+		if loc := re.FindStringIndex(corpus); loc != nil {
+			fmt.Fprintf(os.Stderr, "assertExitSparse %s: %q matches the exit-sparse corpus at %d — it is not a no-match corpus\n",
+				family, p, loc[0])
+			os.Exit(1)
+		}
+	}
+	// The exit set for these patterns is [a-z]. Anything above a token
+	// fraction and the automaton leaves its self-loop often enough that the
+	// stride has nothing to measure — which is the state corpusNoMatch is
+	// already in, and would make this row a duplicate under a new label.
+	lower := 0
+	for i := 0; i < len(corpus); i++ {
+		if corpus[i] >= 'a' && corpus[i] <= 'z' {
+			lower++
+		}
+	}
+	if lower*100 > len(corpus) {
+		fmt.Fprintf(os.Stderr, "assertExitSparse %s: corpus is %.1f%% lowercase — not sparse in the exit set\n",
+			family, float64(lower)*100/float64(len(corpus)))
+		os.Exit(1)
+	}
+	return corpus
 }
 
 // corpusSparse plants a handful of matches in otherwise inert filler.
@@ -542,6 +746,29 @@ func sampleNeedles(pats []string, k int) []string {
 			out = append(out, "sk_live_"+strings.Repeat("B", 24))
 		case strings.HasPrefix(p, "eyJ"):
 			out = append(out, "eyJ"+strings.Repeat("C", 24))
+		case strings.HasPrefix(p, `union[ \t]+m`) && strings.HasSuffix(p, "a+"):
+			// sharedlit-run4: the ceiling control. Four 'a' instead of 64, then
+			// 60 bytes of 'z' padding so the needle is the SAME LENGTH and
+			// corpusDense plants the same number of them. 'z' is not in the
+			// run's member set, so the walk dies at it — the padding is scanned
+			// by the frontend but not walked.
+			var k int
+			fmt.Sscanf(p, `union[ \t]+m%02da+`, &k)
+			out = append(out, fmt.Sprintf("union m%02d%s%s", k,
+				strings.Repeat("a", 4), strings.Repeat("z", 60)))
+		case strings.HasPrefix(p, `union[ \t]+k`) && strings.HasSuffix(p, "a+"):
+			// sharedlit-run: `union[ \t]+kNNa+`. MUST precede the generic union
+			// arm below — that one Sscanfs two class counts out of the pattern,
+			// which does not parse here, leaving a=b=0 and a needle of "union "
+			// that never matches. Silent wrong corpus, the exact failure the
+			// default arm hard-errors for.
+			//
+			// The run is long on purpose: this family exists to measure a bulk
+			// skip over an accepting self-loop, and a 4-byte run amortises
+			// nothing.
+			var k int
+			fmt.Sscanf(p, `union[ \t]+k%02da+`, &k)
+			out = append(out, fmt.Sprintf("union k%02d%s", k, strings.Repeat("a", 64)))
 		case strings.HasPrefix(p, "union"):
 			// `union[ \t]+[a-z]{A}[0-9]{B}` — rebuild a matching needle from
 			// the pattern's own two counts so the sparse corpus really hits.
@@ -590,6 +817,10 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 		names[i] = fmt.Sprintf("p%d", i)
 		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
 	}
+	hints := []string{"batch-find"}
+	if setHints != "" {
+		hints = append(hints, setHints)
+	}
 	sets := []config.SetConfig{{
 		Name:        "s",
 		MatchAny:    "cap_match_any",
@@ -597,11 +828,17 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 		ScanAny:     "cap_scan_any",
 		ScanAll:     "cap_scan_all",
 		Find:        "cap_find",
-		Hints:       []string{"batch-find"},
+		Hints:       hints,
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
+	if forcedFrontend == "" {
+		w, _, err := compile.CompileFile(cfg, "")
+		return w, err
+	}
+	opts := compile.CompileSetOptions{}.WithForcedFrontend(validFrontends[forcedFrontend])
+	w, _, _, err := compile.CompileFileOpts(cfg, "", opts)
 	return w, err
 }
 
@@ -730,26 +967,26 @@ func (r *rxInstance) call(c capability, wide bool) (int, error) {
 	}
 	switch c {
 	case capMatchAny:
-		_, err := fn.Call(r.store, r.inBase, r.inLen)
+		_, err := wcall(fn, r.store, r.inBase, r.inLen)
 		return 1, err
 	case capMatchAll:
 		if wide {
 			r.zeroBitmap()
-			_, err := fn.Call(r.store, r.inBase, r.inLen, r.bitmapPt)
+			_, err := wcall(fn, r.store, r.inBase, r.inLen, r.bitmapPt)
 			return 1, err
 		}
-		_, err := fn.Call(r.store, r.inBase, r.inLen)
+		_, err := wcall(fn, r.store, r.inBase, r.inLen)
 		return 1, err
 	case capScanAny:
-		_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0))
+		_, err := wcall(fn, r.store, r.inBase, r.inLen, int32(0))
 		return 1, err
 	case capScanAll:
 		if wide {
 			r.zeroBitmap()
-			_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0), r.bitmapPt)
+			_, err := wcall(fn, r.store, r.inBase, r.inLen, int32(0), r.bitmapPt)
 			return 1, err
 		}
-		_, err := fn.Call(r.store, r.inBase, r.inLen, int32(0))
+		_, err := wcall(fn, r.store, r.inBase, r.inLen, int32(0))
 		return 1, err
 	case capFind:
 		return r.exhaustFind(fn, true)
@@ -795,7 +1032,7 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 		var res interface{}
 		var err error
 		calls++
-		res, err = fn.Call(r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
+		res, err = wcall(fn, r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
 		if err != nil {
 			return calls, err
 		}
@@ -839,7 +1076,7 @@ func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error
 		var res interface{}
 		var err error
 		calls++
-		res, err = fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
+		res, err = wcall(fn, r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
 		if err != nil {
 			return calls, err
 		}
@@ -865,13 +1102,35 @@ type row struct {
 }
 
 func rowKey(c setCase, cap capability) string {
-	return c.name + "|" + c.inputLbl + "|" + string(cap)
+	return c.name + "|" + c.inputLbl + "|" + string(cap) + setHintsKeySuffix()
+}
+
+// setHintsKeySuffix is what keeps a HINTED run's numbers from being read as a
+// neutral run's. It is appended to every row key, so:
+//
+//   - printed rows and `make baseline` output are self-labelling, and
+//   - `-compare-fuel`/`-compare-size` against a baseline taken under a
+//     different mode finds NO row it can match, and every row is reported
+//     UNCHECKED — which is already an exit-1 failure (see runCompare).
+//
+// That reuses the existing missing-row gate rather than adding a second
+// comparison rule, and it fails in the safe direction: a mode mismatch is
+// loud, not a silent apples-to-oranges "all baselines match exactly".
+func setHintsKeySuffix() string {
+	s := ""
+	if setHints != "" {
+		s += "|" + setHints
+	}
+	if forcedFrontend != "" {
+		s += "|fe=" + forcedFrontend
+	}
+	return s
 }
 
 func measureFuelRow(c setCase) []row {
 	cfg := wasmtime.NewConfig()
 	cfg.SetConsumeFuel(true)
-	engine := wasmtime.NewEngineWithConfig(cfg)
+	engine := newWatchedEngine(cfg)
 	var out []row
 	for _, cap := range allCaps {
 		overlapping := cap == capFindOverlapping || cap == capFindBatchOverlapping
@@ -1030,14 +1289,14 @@ func measureInstanceFloor(r *rxInstance) time.Duration {
 		return 0
 	}
 	for end := time.Now().Add(50 * time.Millisecond); time.Now().Before(end); {
-		if _, err := fn.Call(r.store, r.inBase, int32(0)); err != nil {
+		if _, err := wcall(fn, r.store, r.inBase, int32(0)); err != nil {
 			return 0
 		}
 	}
 	samples := make([]time.Duration, benchIters)
 	for i := range samples {
 		t0 := time.Now()
-		if _, err := fn.Call(r.store, r.inBase, int32(0)); err != nil {
+		if _, err := wcall(fn, r.store, r.inBase, int32(0)); err != nil {
 			return 0
 		}
 		samples[i] = time.Since(t0)
@@ -1106,7 +1365,7 @@ func newRaHarnessFuel(engine *wasmtime.Engine, wasm []byte, c setCase, metered b
 		if fn == nil {
 			return 0, fmt.Errorf("harness missing %s", name)
 		}
-		v, err := fn.Call(store)
+		v, err := wcall(fn, store)
 		if err != nil {
 			return 0, err
 		}
@@ -1139,7 +1398,7 @@ func newRaHarnessFuel(engine *wasmtime.Engine, wasm []byte, c setCase, metered b
 	if initFn == nil {
 		return nil, fmt.Errorf("harness missing ra_set_init")
 	}
-	res, err := initFn.Call(store, int32(len(joined)))
+	res, err := wcall(initFn, store, int32(len(joined)))
 	if err != nil {
 		return nil, err
 	}
@@ -1180,7 +1439,7 @@ func (h *raHarness) fuelOf(cap capability, inputLen int32) (fuel uint64, truncat
 	if err := h.store.SetFuel(fuelBudget); err != nil {
 		return 0, false, err
 	}
-	if _, err := fn.Call(h.store, args...); err != nil {
+	if _, err := wcall(fn, h.store, args...); err != nil {
 		if isFuelExhausted(err) {
 			return fuelExhausted, false, nil
 		}
@@ -1190,7 +1449,7 @@ func (h *raHarness) fuelOf(cap capability, inputLen int32) (fuel uint64, truncat
 		return 0, false, err
 	}
 	before, _ := h.store.GetFuel()
-	res, err := fn.Call(h.store, args...)
+	res, err := wcall(fn, h.store, args...)
 	if err != nil {
 		if isFuelExhausted(err) {
 			return fuelExhausted, false, nil
@@ -1229,7 +1488,7 @@ func (h *raHarness) benchLazyFind(inputLen int) (time.Duration, int, error) {
 	drive := func() (int, error) {
 		calls, from := 0, int32(0)
 		for {
-			v, err := fn.Call(h.store, int32(inputLen), from)
+			v, err := wcall(fn, h.store, int32(inputLen), from)
 			calls++
 			if err != nil {
 				return calls, err
@@ -1275,10 +1534,10 @@ func (h *raHarness) bench(name string, inputLen int) (time.Duration, error) {
 	}
 	// The harness times each iteration internally and writes ns to TIMINGS_BUF.
 	const iters = 2000
-	if _, err := fn.Call(h.store, int32(inputLen), int32(200)); err != nil {
+	if _, err := wcall(fn, h.store, int32(inputLen), int32(200)); err != nil {
 		return 0, err // warm-up
 	}
-	if _, err := fn.Call(h.store, int32(inputLen), int32(iters)); err != nil {
+	if _, err := wcall(fn, h.store, int32(inputLen), int32(iters)); err != nil {
 		return 0, err
 	}
 	buf := h.mem.UnsafeData(h.store)
@@ -1311,10 +1570,10 @@ func runFullMatrix(cases []setCase) {
 		fmt.Fprintf(os.Stderr, "cannot read the regex-automata harness (run 'make harnesses' in ../perftest): %v\n", err)
 		os.Exit(1)
 	}
-	engine := wasmtime.NewEngine()
+	engine := newWatchedEngine(nil)
 	fuelCfg := wasmtime.NewConfig()
 	fuelCfg.SetConsumeFuel(true)
-	fuelEngine := wasmtime.NewEngineWithConfig(fuelCfg)
+	fuelEngine := newWatchedEngine(fuelCfg)
 
 	fmt.Println("setperf — regexped set capabilities vs regex-automata")
 	fmt.Println(strings.Repeat("─", 96))
@@ -1360,6 +1619,7 @@ func runFullMatrix(cases []setCase) {
 	fmt.Println()
 
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		fmt.Printf("\n=== %s / %s (%d patterns, %d bytes) ===\n", c.name, c.inputLbl, len(c.patterns), len(c.input))
 		gated, err := compileCase(c, false)
 		if err != nil {
@@ -1577,7 +1837,7 @@ func runFuelCross(cases []setCase) {
 	}
 	cfg := wasmtime.NewConfig()
 	cfg.SetConsumeFuel(true)
-	engine := wasmtime.NewEngineWithConfig(cfg)
+	engine := newWatchedEngine(cfg)
 
 	fmt.Println("setperf — cross-engine FUEL (WASM instructions executed, one whole-input operation)")
 	fmt.Println(strings.Repeat("─", 96))
@@ -1591,6 +1851,7 @@ func runFuelCross(cases []setCase) {
 
 	var wins, losses, drawn int
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		fmt.Printf("\n=== %s / %s (%d patterns, %d bytes) ===\n", c.name, c.inputLbl, len(c.patterns), len(c.input))
 		h, err := newRaHarnessFuel(engine, raBytes, c, true)
 		if err != nil {
@@ -1650,6 +1911,7 @@ func runFuelCross(cases []setCase) {
 
 func printRows(cases []setCase, measure func(setCase) []row, unit string) {
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		for _, r := range measure(c) {
 			if r.value == fuelExhausted {
 				// Not a number, so it cannot join an exact-equality baseline.
@@ -1696,6 +1958,7 @@ func runCompare(path string, cases []setCase, measure func(setCase) []row, unit 
 	// exactly." over a board that had lost them.
 	visited := map[string]bool{}
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		for _, r := range measure(c) {
 			visited[r.key] = true
 			want, ok := base[r.key]
@@ -1766,9 +2029,10 @@ func runVerify(cases []setCase) int {
 		fmt.Fprintf(os.Stderr, "cannot read the regex-automata harness (run 'make harnesses' in ../perftest): %v\n", err)
 		return 1
 	}
-	engine := wasmtime.NewEngine()
+	engine := newWatchedEngine(nil)
 	bad := 0
 	for _, c := range cases {
+		wcallCase = c.name + "/" + c.inputLbl
 		ra, err := newRaHarness(engine, raBytes, c)
 		if err != nil {
 			fmt.Printf("SKIP %s/%s: %v\n", c.name, c.inputLbl, err)
@@ -1987,7 +2251,7 @@ func rxCollectFind(r *rxInstance) []setTuple {
 	var out []setTuple
 	from := int32(0)
 	for {
-		res, err := fn.Call(r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
+		res, err := wcall(fn, r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
 		if err != nil {
 			return out
 		}
@@ -2038,7 +2302,7 @@ func rxCollectFindBatch(r *rxInstance) []setTuple {
 	var out []setTuple
 	cursor := int64(0)
 	for {
-		res, err := fn.Call(r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
+		res, err := wcall(fn, r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
 		if err != nil {
 			return out
 		}
@@ -2098,7 +2362,7 @@ func raCallI32(h *raHarness, name string, args ...interface{}) int32 {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: the regex-automata harness has no export %q (run 'make harnesses' in ../perftest)\n", name)
 		os.Exit(1)
 	}
-	v, err := fn.Call(h.store, args...)
+	v, err := wcall(fn, h.store, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling regex-automata %q: %v\n", name, err)
 		os.Exit(1)
@@ -2112,7 +2376,7 @@ func raCallI64(h *raHarness, name string, args ...interface{}) int64 {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: the regex-automata harness has no export %q (run 'make harnesses' in ../perftest)\n", name)
 		os.Exit(1)
 	}
-	v, err := fn.Call(h.store, args...)
+	v, err := wcall(fn, h.store, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling regex-automata %q: %v\n", name, err)
 		os.Exit(1)
@@ -2132,7 +2396,7 @@ func rxCallI32(r *rxInstance, name string, args ...interface{}) int32 {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: our module has no export %q\n", name)
 		os.Exit(1)
 	}
-	v, err := fn.Call(r.store, args...)
+	v, err := wcall(fn, r.store, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling our %q: %v\n", name, err)
 		os.Exit(1)
@@ -2146,7 +2410,7 @@ func rxCallI64(r *rxInstance, name string, args ...interface{}) int64 {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: our module has no export %q\n", name)
 		os.Exit(1)
 	}
-	v, err := fn.Call(r.store, args...)
+	v, err := wcall(fn, r.store, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: calling our %q: %v\n", name, err)
 		os.Exit(1)

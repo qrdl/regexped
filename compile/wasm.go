@@ -140,6 +140,20 @@ func appendTableLoad8u(b []byte, tableMemIdx int) []byte {
 	return append(b, 0x00)
 }
 
+// appendTableLoadV128At emits v128.load align=0 with a static byte offset,
+// for a DFA table access whose base is on the stack. The offset immediate is
+// what lets a runtime-chosen table base address the fixed sub-tables inside
+// one record without a second add per access.
+func appendTableLoadV128At(b []byte, offset int32, tableMemIdx int) []byte {
+	if tableMemIdx == 0 {
+		b = append(b, 0xFD, 0x00, 0x00)
+		return utils.AppendULEB128(b, uint32(offset))
+	}
+	b = append(b, 0xFD, 0x00, 0x40)
+	b = utils.AppendULEB128(b, uint32(tableMemIdx))
+	return utils.AppendULEB128(b, uint32(offset))
+}
+
 // appendTableLoad16u emits i32.load16_u align=1 for a DFA table access.
 // tableMemIdx 0: 0x2F 0x01 0x00. tableMemIdx 1: 0x2F 0x41 0x01 0x00
 // (memidx emitted as LEB128 — see appendTableLoad8u).

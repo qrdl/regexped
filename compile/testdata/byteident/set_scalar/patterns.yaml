@@ -1,0 +1,16 @@
+# Set frontend: SCALAR — no literal to anchor on, so no prefilter is emitted
+# and every pattern lands in a fallback bucket whose DFA runs anchored at each
+# position.
+regexps:
+  - name: p0
+    pattern: '[a-z]+0[0-9]+'
+  - name: p1
+    pattern: '[a-z]+1[0-9]+'
+  - name: p2
+    pattern: '[a-z]+2[0-9]+'
+  - name: p3
+    pattern: '[a-z]+3[0-9]+'
+sets:
+  - name: s
+    find: s_find
+    patterns: all

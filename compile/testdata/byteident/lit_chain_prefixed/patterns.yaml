@@ -1,0 +1,7 @@
+# Lit chain with a fixed-length PREFIX before the literal:
+# buildLitChainPrefixedFindBody. The reported start is `attempt_start - M`, so
+# this body needs a find-from floor — it shipped without one, and answered with
+# a match starting before the caller's `from` for every from in (0, M].
+regexps:
+  - pattern: '[a-z]{3}AKIA[A-Z0-9]{24}'
+    find_func: prefixed_find

@@ -1,0 +1,30 @@
+# A literal-less set: every pattern is a class chain, so there is no literal
+# frontend to prefilter with and the whole answer comes from the start-anywhere
+# union automaton. Every pattern begins with [a-z], so that automaton's entry
+# state self-loops on the other 230 bytes.
+#
+# prefer-no-match turns on emitUnionSkip, which strides 16 bytes at a time
+# through such a self-loop run. It therefore pays on input SPARSE in [a-z] and
+# does nothing on prose. Both are in examples/classchain_inputs.txt.
+regexps:
+  - name: c41
+    pattern: '[a-z]{4}[0-9]{1}'
+  - name: c42
+    pattern: '[a-z]{4}[0-9]{2}'
+  - name: c43
+    pattern: '[a-z]{4}[0-9]{3}'
+  - name: c51
+    pattern: '[a-z]{5}[0-9]{1}'
+  - name: c52
+    pattern: '[a-z]{5}[0-9]{2}'
+  - name: c53
+    pattern: '[a-z]{5}[0-9]{3}'
+  - name: c62
+    pattern: '[a-z]{6}[0-9]{2}'
+  - name: c63
+    pattern: '[a-z]{6}[0-9]{3}'
+
+sets:
+  - name: classchain
+    scan_any: classchain_scan_any
+    patterns: all

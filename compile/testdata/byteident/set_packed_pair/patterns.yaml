@@ -1,0 +1,23 @@
+# Set frontend: PACKED-PAIR — <=16 literals, narrow two-column probe window
+# (two v128 loads + i8x16.eq per 32-byte block). compile/byte_rank.go.
+regexps:
+  - name: p0
+    pattern: 'kw00abc'
+  - name: p1
+    pattern: 'kw01abc'
+  - name: p2
+    pattern: 'kw02abc'
+  - name: p3
+    pattern: 'kw03abc'
+  - name: p4
+    pattern: 'kw04abc'
+  - name: p5
+    pattern: 'kw05abc'
+  - name: p6
+    pattern: 'kw06abc'
+  - name: p7
+    pattern: 'kw07abc'
+sets:
+  - name: s
+    find: s_find
+    patterns: all

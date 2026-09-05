@@ -1,0 +1,26 @@
+# The union automaton's LikelyNoMatch SIMD stride (task 69).
+#
+# Literal-less patterns, so the set has no literal frontend and the scan pair
+# compiles to the one-pass union automaton rather than a per-position bucket
+# walk. `prefer-no-match` is what turns emitUnionSkip on; without it this
+# fixture would be byte-identical to a neutral one and would pin nothing.
+#
+# The shape matters: every pattern begins with [a-z], so the union's restart
+# state has a 26-byte exit set and a 230-byte self-loop — the stride's target.
+# Several patterns with DIFFERENT counts keep them distinct without giving any
+# of them a mandatory literal.
+regexps:
+  - name: p0
+    pattern: '[a-z]{4}[0-9]{1}'
+  - name: p1
+    pattern: '[a-z]{4}[0-9]{2}'
+  - name: p2
+    pattern: '[a-z]{5}[0-9]{1}'
+  - name: p3
+    pattern: '[a-z]{6}[0-9]{3}'
+sets:
+  - name: s
+    scan_any: s_scan_any
+    scan_all: s_scan_all
+    patterns: all
+    hints: [prefer-no-match]

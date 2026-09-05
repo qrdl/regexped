@@ -2484,6 +2484,11 @@ type dfaLayout struct {
 	// hysteresis).
 	lmWideShufti bool
 
+	// lmClassChain enables the chain-start SIMD verify (see
+	// detectClassChainPrefix). LikelyMatch only, and set from the same
+	// buildOpts.LikelyMode as its siblings above.
+	lmClassChain bool
+
 	// Fast-skip / SIMD (find mode only)
 	prefix         []byte
 	firstByteOff   int32
@@ -2583,6 +2588,11 @@ type dfaLayout struct {
 	// `[a-z]{50,}[0-9]` whose body class runs to EOF without ever
 	// containing the suffix.
 	eofSkipSafe bool
+
+	// report carries the verbose Reporter to the emitters the layout reaches,
+	// so each can name the strategy IT chose rather than have the choice
+	// re-derived at a call site. Nil on every path but `compile --verbose`.
+	report *Reporter
 }
 
 // dominantInfo describes one dominant self-loop state recorded by
@@ -2651,7 +2661,9 @@ type dfaLayoutParams struct {
 	lmBareShufti         bool
 	lmNonMidShufti       bool
 	lmWideShufti         bool
+	lmClassChain         bool
 	forceWordChar        bool
+	report               *Reporter
 }
 
 func buildDFALayout(p dfaLayoutParams) *dfaLayout {
@@ -2669,9 +2681,11 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	forceWordChar := p.forceWordChar
 	wantWordChar := needFind || forceWordChar
 	l := &dfaLayout{}
+	l.report = p.report
 	l.lmBareShufti = lmBareShufti
 	l.lmNonMidShufti = lmNonMidShufti
 	l.lmWideShufti = lmWideShufti
+	l.lmClassChain = p.lmClassChain
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
 	// acceptLimit: WASM-state ID K such that "state in [1, K]" iff the DFA state
@@ -3316,6 +3330,56 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	return l
 }
 
+// ── Reading the emitted transition table ───────────────────────────────────
+//
+// The table's layout varies along three independent axes — u8 vs u16 state
+// ids, byte-class compression, and row dedup — and every compile-time detector
+// that inspects it has to honour all three. These three methods are that
+// reading, in one place.
+//
+// They existed as five identical copies of a `readCell` closure (and three of
+// `transitionOn`), one per detector, because each one needs the table before
+// the emitters do. Five copies of an indexing rule with three conditional axes
+// is five chances for one to drift when a fourth axis is added; the copies
+// were verified byte-identical before being replaced by these.
+
+// cellsPerRow is the width of one table row: 256 raw bytes, or the number of
+// equivalence classes when byte-class compression is on.
+func (l *dfaLayout) cellsPerRow() int {
+	if l.useCompression {
+		return l.numClasses
+	}
+	return 256
+}
+
+// readCell returns the transition stored at (state, idx), where idx is a CELL
+// index — a byte value, or a byte class when compression is on. Callers that
+// have a byte rather than a cell want transitionOn.
+func (l *dfaLayout) readCell(state, idx int) int32 {
+	// When row dedup is on, map state → row index first.
+	row := state
+	if l.useRowDedup {
+		row = int(l.rowMapBytes[state])
+	}
+	off := row*l.cellsPerRow() + idx
+	if l.useU8 {
+		return int32(l.tableBytes[off])
+	}
+	// u16, little-endian.
+	return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
+}
+
+// transitionOn returns the state reached from state on byte b, mapping the
+// byte through the class table first when compression is on. 0 is the dead
+// state.
+func (l *dfaLayout) transitionOn(state, b int) int32 {
+	cell := b
+	if l.useCompression {
+		cell = int(l.classMap[b])
+	}
+	return l.readCell(state, cell)
+}
+
 // detectSkipSafeOnDead computes l.skipSafeOnDead via a conservative
 // "single-successor self-loop" condition. The safety argument requires
 // that intermediate attempts (starting between attempt_start and the dead
@@ -3397,28 +3461,6 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 	if l.numWASM <= 1 {
 		return
 	}
-	cellsPerState := 256
-	if l.useCompression {
-		cellsPerState = l.numClasses
-	}
-	readCell := func(state, idx int) int32 {
-		row := state
-		if l.useRowDedup {
-			row = int(l.rowMapBytes[state])
-		}
-		off := row*cellsPerState + idx
-		if l.useU8 {
-			return int32(l.tableBytes[off])
-		}
-		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
-	}
-	transitionOn := func(state int, b int) int32 {
-		cell := b
-		if l.useCompression {
-			cell = int(l.classMap[b])
-		}
-		return readCell(state, cell)
-	}
 
 	// isAnyMidAccept answers "can this state record a zero-width match at an
 	// attempt's start position?" across every channel that can set
@@ -3462,7 +3504,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 	var midStartAccepts [256]bool
 	anyAccept := false
 	for b := 0; b < 256; b++ {
-		if transitionOn(midStartIdx, b) != 0 {
+		if l.transitionOn(midStartIdx, b) != 0 {
 			midStartAccepts[b] = true
 			anyAccept = true
 		}
@@ -3477,7 +3519,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		if !midStartAccepts[b] {
 			continue
 		}
-		t := transitionOn(midStartIdx, b)
+		t := l.transitionOn(midStartIdx, b)
 		if succ < 0 {
 			succ = t
 		} else if t != succ {
@@ -3493,7 +3535,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		if !midStartAccepts[b] {
 			continue
 		}
-		if transitionOn(int(succ), b) != succ {
+		if l.transitionOn(int(succ), b) != succ {
 			return // not self-loop → not stable
 		}
 	}
@@ -3554,10 +3596,10 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		if midStartAccepts[b] {
 			continue
 		}
-		if !isAcceptingExit(transitionOn(midStartIdx, b)) {
+		if !isAcceptingExit(l.transitionOn(midStartIdx, b)) {
 			return
 		}
-		if !isAcceptingExit(transitionOn(int(succ), b)) {
+		if !isAcceptingExit(l.transitionOn(int(succ), b)) {
 			return
 		}
 	}
@@ -3602,7 +3644,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		}
 		entryAccepts := false
 		for b := 0; b < 256; b++ {
-			if transitionOn(es, b) != 0 {
+			if l.transitionOn(es, b) != 0 {
 				entryAccepts = true
 				break
 			}
@@ -3629,7 +3671,7 @@ func detectSkipSafeOnDead(l *dfaLayout) {
 		// an empty accept class, so it exits above via case 1 and is
 		// unaffected by this tightening.)
 		for b := 0; b < 256; b++ {
-			t := transitionOn(es, b)
+			t := l.transitionOn(es, b)
 			if midStartAccepts[b] {
 				if t != succ {
 					return
@@ -3716,28 +3758,6 @@ func detectEOFSkipSafe(l *dfaLayout) {
 	if l.needWordCharTable || l.midAcceptNLBytes != nil {
 		return
 	}
-	cellsPerState := 256
-	if l.useCompression {
-		cellsPerState = l.numClasses
-	}
-	readCell := func(state, idx int) int32 {
-		row := state
-		if l.useRowDedup {
-			row = int(l.rowMapBytes[state])
-		}
-		off := row*cellsPerState + idx
-		if l.useU8 {
-			return int32(l.tableBytes[off])
-		}
-		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
-	}
-	transitionOn := func(state int, b int) int32 {
-		cell := b
-		if l.useCompression {
-			cell = int(l.classMap[b])
-		}
-		return readCell(state, cell)
-	}
 	isMidAccept := func(state int) bool {
 		return state < len(l.midAcceptBytes) && l.midAcceptBytes[state] != 0
 	}
@@ -3785,7 +3805,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 			return // unanalysable
 		}
 		for b := 0; b < 256; b++ {
-			if transitionOn(startIdx, b) != 0 {
+			if l.transitionOn(startIdx, b) != 0 {
 				return // startState can consume: trajectory unproven
 			}
 		}
@@ -3795,7 +3815,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 	var classC [256]bool
 	anyAccept := false
 	for b := 0; b < 256; b++ {
-		if transitionOn(midStartIdx, b) != 0 {
+		if l.transitionOn(midStartIdx, b) != 0 {
 			classC[b] = true
 			anyAccept = true
 		}
@@ -3826,7 +3846,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 			if !classC[b] {
 				continue
 			}
-			t := transitionOn(cur, b)
+			t := l.transitionOn(cur, b)
 			if succ < 0 {
 				succ = t
 			} else if t != succ {
@@ -3842,7 +3862,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 			if classC[b] {
 				continue
 			}
-			if !isAcceptingExit(transitionOn(cur, b)) {
+			if !isAcceptingExit(l.transitionOn(cur, b)) {
 				return
 			}
 		}
@@ -3899,26 +3919,13 @@ func detectDominantSelfLoop(l *dfaLayout) {
 	}
 
 	// Reader for the table cell (u8 or u16) at a given (state, classOrByte).
-	readCell := func(state, idx int) int32 {
-		// When row dedup is on, map state → row index first.
-		row := state
-		if l.useRowDedup {
-			row = int(l.rowMapBytes[state])
-		}
-		off := row*cellsPerState + idx
-		if l.useU8 {
-			return int32(l.tableBytes[off])
-		}
-		// u16, little-endian.
-		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
-	}
 
 	for state := int32(1); state < int32(l.numWASM); state++ {
 		selfBytes := 0
 		var exitBytes []byte
 		hitCap := false
 		for c := 0; c < cellsPerState; c++ {
-			next := readCell(int(state), c)
+			next := l.readCell(int(state), c)
 			bytesInClass := 1
 			if l.useCompression {
 				bytesInClass = classByteCount[c]
@@ -4160,17 +4167,6 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 			classByteCount[l.classMap[b]]++
 		}
 	}
-	readCell := func(state, idx int) int32 {
-		row := state
-		if l.useRowDedup {
-			row = int(l.rowMapBytes[state])
-		}
-		off := row*cellsPerState + idx
-		if l.useU8 {
-			return int32(l.tableBytes[off])
-		}
-		return int32(l.tableBytes[2*off]) | int32(l.tableBytes[2*off+1])<<8
-	}
 
 	idx := 0
 	for state := int32(1); state < int32(l.numWASM); state++ {
@@ -4188,7 +4184,7 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 		}
 		var selfSet []byte
 		for c := 0; c < cellsPerState; c++ {
-			if readCell(int(state), c) != state {
+			if l.readCell(int(state), c) != state {
 				continue
 			}
 			if l.useCompression {
@@ -4300,6 +4296,61 @@ func applyDominantStateEncoding(l *dfaLayout, encodeNonMid bool) {
 			l.midAcceptBytes[info.state] = info.encodedByte
 		}
 	}
+}
+
+// classChainFor returns the chain-start probe description for l, or nil.
+//
+// Gated on prefer-match: the probe verifies a WHOLE 16-byte chunk before the
+// walk begins, which is the right bet when the caller has said matches are
+// expected and a wasted one on input made of short runs. Whether NEUTRAL
+// should also carry it is a separate measurement with a different balance —
+// it would move every fixture in this family — and is deliberately not asked
+// here.
+func classChainFor(l *dfaLayout, t *dfaTable) *classChainPrefix {
+	if !l.lmClassChain {
+		return nil
+	}
+	cc, ok := detectClassChainPrefix(l, t)
+	if !ok {
+		return nil
+	}
+	return &cc
+}
+
+// soleMidDominant reports whether a nonzero midAcceptBytes load can only ever
+// be this layout's single mid-accept dominant — i.e. that state's encoding is
+// the ONLY nonzero entry in the table.
+//
+// When it holds, the dispatch in emitFindMidAcceptDispatch / emitPhase4Dispatch
+// can skip both the `local.tee val` that caches the loaded byte and the
+// `val == encodedByte` compare that follows it: `val != 0` has already
+// identified the state. The tee is paid on EVERY byte the engine loop consumes,
+// not just on dominant ones, so it is the larger half — on `[a-zA-Z]{20,}` over
+// a 20-byte run the two together are 25 of the 68 fuel prefer-match cost against
+// neutral.
+//
+// MUST be called after applyDominantStateEncoding has written the encodings,
+// since it reads the table that pass produces. It is deliberately a property of
+// the TABLE rather than of len(l.dominantStates): a layout can carry one
+// dominant and still have ordinary accept states holding 1, and those make a
+// nonzero load ambiguous again.
+//
+// The word- and newline-boundary side tables (midAcceptNW/W/NLBytes) are
+// separate tables read by separate checks, so they do not affect this.
+func soleMidDominant(l *dfaLayout) bool {
+	if len(l.dominantStates) != 1 || !l.dominantStates[0].isMidAccept {
+		return false
+	}
+	st := l.dominantStates[0].state
+	if int(st) >= len(l.midAcceptBytes) || l.midAcceptBytes[st] == 0 {
+		return false
+	}
+	for i, v := range l.midAcceptBytes {
+		if v != 0 && int32(i) != st {
+			return false
+		}
+	}
+	return true
 }
 
 // dfaDataSegments builds the raw data-section payload (count byte + segments)
@@ -4556,7 +4607,12 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 // stops at the first matching bit — see probeExit.
 // Threaded alongside needProbes rather than derived, because only CompileSet
 // knows which capabilities the set declares.
-func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, needProbes, gated bool, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+// lm is the SET-LEVEL LikelyMode. It selects the three Shufti self-loop
+// channels below; every other decision here is mode-independent. A bucket
+// holds one suffix DFA for N patterns, so there is deliberately no
+// per-pattern override: the hint that governs this body is the one on the
+// set.
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
 	// probeFlags[0]: also build the first-hit variant (set wants both rules).
 	// probeFlags[1]: the SOLE probe is first-hit (no scan_all declared), so
 	// scanProbe itself gets the cheap exit and no second body is emitted.
@@ -4616,6 +4672,25 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		}
 	}
 
+	// The three Shufti self-loop channels, under set-level LikelyMatch.
+	//
+	// A suffix DFA is the pattern with its mandatory literal SPLIT OFF, so
+	// l.prefix is empty for every bucket body here — which means
+	// detectShuftiSelfLoop's bare-prefix bail refused all three channels for
+	// every set, and the whole 9..64-byte band was unreachable from a set.
+	// The bail exists to keep the fixed SIMD setup off a state reachable
+	// directly from every scan restart; in a set the FRONTEND has already
+	// gated the position (a suffix body runs only at a candidate), so the
+	// frequency argument that motivates it does not transfer. What remains is
+	// the per-candidate setup cost on short runs, which is the LM contract's
+	// to accept and the task-38 hysteresis's to bound.
+	//
+	// lmBareShufti carries no minimum-match-length check here, unlike the
+	// single-pattern LM-4 gate it mirrors: that gate reads a PATTERN STRING
+	// (lmBareShuftiEligible re-parses it) and a suffix DFA has no pattern to
+	// re-parse — a bucket may hold several. The equivalent bound is the
+	// hysteresis, plus the short-run likelytest guard case.
+	lmShufti := lm == LikelyMatch
 	l := buildDFALayout(dfaLayoutParams{
 		t:                    t,
 		tableBase:            tableBase,
@@ -4623,9 +4698,9 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		leftmostFirst:        true,
 		compiledDFAThreshold: 0,
 		useAcceptSideTable:   false,
-		lmBareShufti:         false,
-		lmNonMidShufti:       false,
-		lmWideShufti:         false,
+		lmBareShufti:         lmShufti,
+		lmNonMidShufti:       lmShufti,
+		lmWideShufti:         lmShufti,
 		forceWordChar:        t.hasWordBoundary,
 	})
 
@@ -4759,13 +4834,26 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// the only shape that can serve more patterns than the mask has bits.
 	// Its tables and scratch go after everything the layout already placed.
 	if t.midAcceptWide != nil {
-		tabs := buildSparseAcceptTables(t, nextTableOffset, l.numWASM)
+		// Member self-loop skip is hint-gated, following every other trade in
+		// this pipeline with a harm side (the widened Shufti band, the union
+		// stride, the adaptive switch): it saves a great deal on buckets with
+		// long self-loop runs and costs a few percent on buckets that have
+		// none, and only the caller knows which their traffic is.
+		tabs := buildSparseAcceptTables(t, nextTableOffset, l.numWASM, lm == LikelyMatch)
 		idMapOff := tabs.end
 		idMap := make([]byte, len(patternIDs)*4)
 		for i, gid := range patternIDs {
 			putU32(idMap, i*4, uint32(gid))
 		}
-		scratch := planSparseScratch(idMapOff+int32(len(idMap)), len(patternIDs))
+		// The per-state stale flags are allocated ONLY when the skip is
+		// emitted. Sizing them unconditionally would move every sparse
+		// bucket's scratch — and therefore its neutral output — for a region
+		// a neutral build never reads.
+		staleStates := 0
+		if tabs.hasMember {
+			staleStates = l.numWASM
+		}
+		scratch := planSparseScratch(idMapOff+int32(len(idMap)), len(patternIDs), staleStates)
 		dataBytes = append(dataBytes, appendDataSegment(nil, tabs.midOff, tabs.data)...)
 		dataBytes = append(dataBytes, appendDataSegment(nil, idMapOff, idMap)...)
 		// One zero byte at the top of the scratch so utils.WasmMemTop and the
@@ -4790,6 +4878,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		if len(prefixFixedLens) > 0 && prefixFixedLens[0] > 0 {
 			prefixLen = prefixFixedLens[0]
 		}
+		art.memberStates, art.memberSets = tabs.memberStates, tabs.memberSets
 		art.sparseScratch = scratch
 		art.sparseIDMapOff = idMapOff
 		art.sparseProbeReady = true
@@ -4856,9 +4945,14 @@ type suffixArtifacts struct {
 	// of its own — which is the only reason a second implementation of the
 	// per-position semantics is defensible at all. Populated always; the sweep
 	// decides for itself whether to use it.
-	dp        overlapDPTables
-	fnBody    []byte
-	scanProbe []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
+	// memberStates / memberSets record how many states got a member self-loop
+	// skip arm and how many distinct sets back them, for --diag-json. Zero
+	// when the bucket is neutral or has no eligible state.
+	memberStates int
+	memberSets   int
+	dp           overlapDPTables
+	fnBody       []byte
+	scanProbe    []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
 	// scanProbeAny is the same probe with a first-hit exit, for `scan` and
 	// `scan_any`. Nil unless the set declares one of
 	// them; `scan_all` must keep using scanProbe.
@@ -5772,7 +5866,7 @@ func appendMatchCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, tableMemIdx int)
 		body = buildMatchBody(l.wasmStart, l.tableOff, l.classMapOff,
 			l.numClasses, l.useU8, l.useCompression, l.acceptLimit,
 			l.rowMapOff, l.useRowDedup, tableMemIdx,
-			l.midAcceptOff, l.dominantStates)
+			l.midAcceptOff, l.dominantStates, soleMidDominant(l))
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
@@ -5803,8 +5897,50 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 // function index) was removed. To reinstate, change the signature to
 // `([]byte, []int)`, restore the `callSites` plumbing, and update both
 // callers.
-func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode) {
-	var body []byte
+// appendFindCodeEntryTwinned is appendFindCodeEntry plus the NEUTRAL TWIN: when
+// this layout's find body carries a runtime escape that can judge its own hint
+// wrong, a second body is emitted exactly as a neutral compile would emit it,
+// and the returned twin is non-nil.
+//
+// Only the adaptive dense switch qualifies today. Its escape costs two
+// instructions per ATTEMPT for the rest of a call once tripped, and a 50 KB
+// no-match scan makes ~40,000 attempts — the whole margin by which
+// `prefer-no-match` cost more than neutral on `[a-zA-Z]{20,}`. A twin removes
+// the residue completely, because the neutral copy IS the neutral body.
+//
+// The twin is built from the SAME layout and the same tables. That is sound
+// here and would NOT be for a LikelyMatch dominant: the hinted table encodes
+// dominants as 128..255 in midAcceptBytes, values a neutral body would read as
+// ordinary accepts. Under LikelyNoMatch no such encoding is written — verified
+// on `[a-zA-Z]{20,}`, whose midAccept segment is `\00\01` under both neutral
+// and prefer-no-match, and `\00\80` only under prefer-match — so the twin can
+// share the tables. Extending this to the mid-accept channel means emitting a
+// second, plain midAccept segment first.
+//
+// The twin costs no GLOBAL: the handoff seeds the find-from channel, which
+// index 0 always is and which every module carrying a find already declares.
+// An earlier design selected between the two bodies in the wrapper on a
+// verdict global, and that is what the moduleGlobals allocator was built for;
+// the handoff replaced it, and the allocator now has no consumer in this file.
+func appendFindCodeEntryTwinned(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode, []byte, int) {
+	var twin []byte
+	var hasTwin bool
+	// The twin is worth building only when the hinted body would actually carry
+	// the escape. shuftiPrefixPlan is the one predicate that decides that, and
+	// it is asked here with the same arguments buildFindBody will ask it with,
+	// so the two cannot disagree about whether a switch exists.
+	if l.lnmAction5 && !isAnchoredFind(t) && mandatoryLit == nil {
+		if _, adaptive := shuftiPrefixPlan(l.firstBytes, true, true); adaptive {
+			hasTwin = true
+		}
+	}
+	cs, mode, twin, patch := appendFindCodeEntryInner(cs, l, t, mandatoryLit, tableMemIdx, hasTwin)
+	return cs, mode, twin, patch
+}
+
+func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int, hasTwin bool) ([]byte, findFromMode, []byte, int) {
+	var body, twinBody []byte
+	twinPatch := -1
 	// mode is decided by WHICH body this dispatch picks.
 	//
 	// The two anchored arms are ffAnchoredZeroOnly and their bodies are used
@@ -5818,7 +5954,15 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 		if isAnchoredFind(t) {
 			body, mode = buildHybridAnchoredFindBody(t, l, tableMemIdx), ffAnchoredZeroOnly
 		} else {
-			body, mode = buildHybridFindBody(t, l, mandatoryLit, tableMemIdx)
+			body, mode, twinPatch = buildHybridFindBody(t, l, mandatoryLit, tableMemIdx, hasTwin, l.lnmAction5)
+			if hasTwin {
+				tb, tmode, _ := buildHybridFindBody(t, l, mandatoryLit, tableMemIdx, false, false)
+				if tmode != mode {
+					panic("compile: neutral find twin disagrees with its hinted body about findFromMode")
+				}
+				twinBody = utils.AppendULEB128(nil, uint32(len(tb)))
+				twinBody = append(twinBody, tb...)
+			}
 		}
 	} else if isAnchoredFind(t) {
 		mode = ffAnchoredZeroOnly
@@ -5843,7 +5987,8 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			tableMemIdx:        tableMemIdx,
 		})
 	} else {
-		body, mode = buildFindBody(findBodyParams{
+		fp := findBodyParams{
+			report:                l.report,
 			startState:            l.wasmStart,
 			midStartState:         l.wasmMidStart,
 			midStartWordState:     l.wasmMidStartWord,
@@ -5888,13 +6033,41 @@ func appendFindCodeEntry(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *man
 			midAcceptNLOff:        l.midAcceptNLOff,
 			tableMemIdx:           tableMemIdx,
 			dominantStates:        l.dominantStates,
+			soleMidDominant:       soleMidDominant(l),
+			classChain:            classChainFor(l, t),
 			lnmAction5:            l.lnmAction5,
 			skipSafeOnDead:        l.skipSafeOnDead,
 			eofSkipSafe:           l.eofSkipSafe,
-		})
+		}
+		fp.hasTwin = hasTwin
+		body, mode, twinPatch = buildFindBody(fp)
+		if hasTwin {
+			// The neutral twin: the SAME layout and tables, emitted the way a
+			// neutral compile would emit them. lnmAction5=false is the whole
+			// difference — it un-forces Shufti, so the scan falls back to the
+			// scalar first-byte loop and shuftiPrefixPlan reports no adaptive
+			// switch, which removes both the gate and the counter. The twin
+			// never writes the verdict; only the hinted body does.
+			np := fp
+			np.lnmAction5 = false
+			np.hasTwin = false
+			np.report = nil // the strategy note belongs to the shipped body
+			tb, tmode, _ := buildFindBody(np)
+			if tmode != mode {
+				panic("compile: neutral find twin disagrees with its hinted body about findFromMode")
+			}
+			twinBody = utils.AppendULEB128(nil, uint32(len(tb)))
+			twinBody = append(twinBody, tb...)
+		}
 	}
-	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...), mode
+	sizePrefix := utils.AppendULEB128(nil, uint32(len(body)))
+	if twinPatch >= 0 {
+		// Report the patch offset relative to the START of the size-prefixed
+		// entry, which is what the assembler holds.
+		twinPatch += len(sizePrefix)
+	}
+	cs = append(cs, sizePrefix...)
+	return append(cs, body...), mode, twinBody, twinPatch
 }
 
 // emitCompressedU8Transition emits the compressed u8 DFA transition:
@@ -6129,9 +6302,17 @@ func emitHystBulkSkip(b []byte, info dominantInfo,
 	// hystPos = pos
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x21, hystPosLocal)
-	b = emitDominantBulkSkip(b, info, false,
+	// Close the channel outright on the bounds exit. pos is monotone within a
+	// call, so a failed `pos + 17 > len` proves every later attempt would fail
+	// it too; without this the counter merely ticks and the doomed check is
+	// re-run on every dominant-state byte that follows.
+	b = emitDominantBulkSkipHooked(b, info, false,
 		posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
-		chunkLocal, tmpLocal)
+		chunkLocal, tmpLocal, func(b []byte) []byte {
+			b = append(b, 0x41, nonMidHystStreak)
+			b = append(b, 0x21, hystCounterLocal)
+			return b
+		})
 	// hystCounter = (pos - hystPos < 16) ? hystCounter + 1 : 0
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x20, hystPosLocal)
@@ -6212,7 +6393,8 @@ func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
 func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 	useMandatoryLit bool, midAcceptOff int32, tableMemIdx int,
 	stateLocal, posLocal, lenLocal, lastAcceptLocal, ptrLocal,
-	chunkLocal, valLocal, hystCounterLocal, hystPosLocal byte) []byte {
+	chunkLocal, valLocal, hystCounterLocal, hystPosLocal byte,
+	soleMid bool) []byte {
 
 	var mid, nonMid []dominantInfo
 	for _, info := range dominantStates {
@@ -6248,16 +6430,29 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 		return b
 	}
 
+	// A sole mid-accept dominant that is the only nonzero value in the table
+	// needs neither the cached value nor the compare: `val != 0` has already
+	// identified the state. See soleMidDominant.
+	skipValDispatch := soleMid && emitMidDom && !hasNonMidVals && len(mid) == 1
+
 	// val = midAccept[state]
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, midAcceptOff)
 	b = append(b, 0x20, stateLocal)
 	b = append(b, 0x6A)
 	b = appendTableLoad8u(b, tableMemIdx)
-	if emitMidDom || hasNonMidVals {
+	if (emitMidDom || hasNonMidVals) && !skipValDispatch {
 		b = append(b, 0x22, valLocal) // local.tee — cache val
 	}
 	b = append(b, 0x04, 0x40) // if (val != 0)
+	if skipValDispatch {
+		b = emitAccept(b)
+		b = emitDominantBulkSkip(b, mid[0], true,
+			posLocal, lenLocal, lastAcceptLocal, ptrLocal,
+			chunkLocal, valLocal)
+		b = append(b, 0x0B) // end if (val != 0)
+		return b
+	}
 	if hasNonMidVals {
 		b = append(b, 0x20, valLocal)
 		b = append(b, 0x41)
@@ -6309,7 +6504,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 // locals (hysteresis counter + scratch) and pass their indices; both are
 // ignored when every entry is mid-accept.
 func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
-	midAcceptOff int32, tableMemIdx int) []byte {
+	midAcceptOff int32, tableMemIdx int, soleMid bool) []byte {
 	if len(dominantStates) == 0 {
 		return b
 	}
@@ -6343,14 +6538,28 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 		}
 		return b
 	}
+	// A sole mid-accept dominant that is the only nonzero value in the table
+	// identifies itself by being nonzero — no cached value, no compare. See
+	// soleMidDominant.
+	skipValDispatch := soleMid && len(mid) == 1 && len(nonMid) == 0
+
 	// val = midAccept[state] (tee'd into tmp)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, midAcceptOff)
 	b = append(b, 0x20, stateLocal)
 	b = append(b, 0x6A) // i32.add
 	b = appendTableLoad8u(b, tableMemIdx)
-	b = append(b, 0x22, tmpLocal) // local.tee tmp
-	b = append(b, 0x04, 0x40)     // if (val != 0)
+	if !skipValDispatch {
+		b = append(b, 0x22, tmpLocal) // local.tee tmp
+	}
+	b = append(b, 0x04, 0x40) // if (val != 0)
+	if skipValDispatch {
+		b = emitDominantBulkSkip(b, mid[0], false,
+			posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
+			chunkLocal, tmpLocal)
+		b = append(b, 0x0B) // end if (val != 0)
+		return b
+	}
 	switch {
 	case len(mid) > 0 && len(nonMid) > 0:
 		b = append(b, 0x20, tmpLocal)
@@ -6386,6 +6595,28 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	posLocal, lenLocal, lastAcceptLocal,
 	ptrLocal, chunkLocal, tmpLocal byte) []byte {
+	return emitDominantBulkSkipHooked(b, info, updateLastAccept,
+		posLocal, lenLocal, lastAcceptLocal, ptrLocal, chunkLocal, tmpLocal, nil)
+}
+
+// emitDominantBulkSkipHooked is emitDominantBulkSkip with an optional hook on
+// the BOUNDS EXIT — the `pos + 17 > len` arm, taken when fewer than 17 bytes
+// remain and no chunk can be loaded.
+//
+// That arm is worth a hook because it is MONOTONE: pos never decreases within a
+// call, so once the check fires, no later attempt in the same call can pass it
+// either. A channel that learns this can close itself for the rest of the call
+// instead of paying the same doomed bounds check on every subsequent
+// dominant-state byte. On a short input that is the whole cost of the channel —
+// `<([a-z]+)>` over "<abc>" made two attempts, both of which did nothing but
+// evaluate the bounds check and update a counter.
+//
+// A nil hook emits the original `br_if $bulk_done` byte for byte, so the seven
+// callers that do not want it keep their exact previous bytes.
+func emitDominantBulkSkipHooked(b []byte, info dominantInfo, updateLastAccept bool,
+	posLocal, lenLocal, lastAcceptLocal,
+	ptrLocal, chunkLocal, tmpLocal byte,
+	onBoundsExit func([]byte) []byte) []byte {
 	exitBytes := info.exitBytes
 
 	// block $bulk_done
@@ -6398,8 +6629,17 @@ func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	b = append(b, 0x41, 0x11) // i32.const 17
 	b = append(b, 0x6A)
 	b = append(b, 0x20, lenLocal)
-	b = append(b, 0x4B)       // i32.gt_u
-	b = append(b, 0x0D, 0x01) // br_if $bulk_done
+	b = append(b, 0x4B) // i32.gt_u
+	if onBoundsExit == nil {
+		b = append(b, 0x0D, 0x01) // br_if $bulk_done
+	} else {
+		// Same branch, wrapped so the hook runs on the way out. Depths shift
+		// by one inside the `if`: $bulk_done is now 2 (if, loop, block).
+		b = append(b, 0x04, 0x40) // if (void)
+		b = onBoundsExit(b)
+		b = append(b, 0x0C, 0x02) // br $bulk_done
+		b = append(b, 0x0B)       // end if
+	}
 
 	// chunk = v128.load(ptr + pos + 1)
 	b = append(b, 0x20, ptrLocal)
@@ -6412,15 +6652,11 @@ func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 
 	if len(info.selfLoopSet) > 0 {
 		// Self-loop set is the small (≤64, Shufti-cap) side, not
-		// the exit side. Test membership in it directly via the shared
-		// Shufti primitive (leaves an i32 bitmask, bit k set ⇔ lane k IS a
-		// member) and invert: a "stop" bit means the byte is NOT a member
-		// — the first byte outside the self-loop class, which is exactly
-		// what the ctz/pos-advance logic below needs.
-		b = emitShuftiPrefixCheck(b, info.selfLoopSet, chunkLocal)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(0xFFFF))
-		b = append(b, 0x73) // i32.xor — invert the 16 relevant bits
+		// the exit side. Ask the shared Shufti primitive for the STOP
+		// polarity directly: bit k set ⇔ lane k is NOT a member, i.e. the
+		// first byte outside the self-loop class, which is exactly what
+		// the ctz/pos-advance logic below needs.
+		b = emitShuftiStopMask(b, info.selfLoopSet, chunkLocal)
 	} else if len(exitBytes) == 1 {
 		// Phase 2 single-byte: m = bitmask(eq(chunk, splat(exit))).
 		b = append(b, 0x20, chunkLocal)
@@ -6812,7 +7048,7 @@ func emitNLPreAcceptCheck(b []byte, midAcceptNLOff int32,
 // and the match DFA is compiled LL by design so that `^(a|aa)$` matches "aa"
 // — see the LL/LF note in compile.go. The two are permanently mutually
 // exclusive, so no immAcceptLimit/hasImmAccept parameters are threaded here.
-func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, rowMapOff int32, useRowDedup bool, tableMemIdx int, midAcceptOff int32, dominantStates []dominantInfo) []byte {
+func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses int, useU8, useCompression bool, acceptLimit int32, rowMapOff int32, useRowDedup bool, tableMemIdx int, midAcceptOff int32, dominantStates []dominantInfo, soleMid bool) []byte {
 	var b []byte
 
 	// emitAcceptCheck emits the final post-loop accept check:
@@ -6889,7 +7125,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 		// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse class),
 		// hysteresis counter/scratch = locals 6/7 (only with non-mid).
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -6935,7 +7171,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x0B)
 
 		// Phase 4 dispatch: tmp=local 4, chunk=local 5, hyst=6/7.
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
+		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -6983,7 +7219,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 	b = append(b, 0x0B)
 
 	// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse byte), hyst=6/7.
-	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx)
+	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)
@@ -7843,39 +8079,40 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		numV128Locals = 0
 	}
 
-	// Local group count  (groups share the same type).
-	if numV128Locals > 0 {
-		b = append(b, 0x02)                      // 2 local groups
-		b = append(b, byte(numI32Locals), 0x7F)  // 6 × i32
-		b = append(b, byte(numV128Locals), 0x7B) // N × v128
-	} else {
-		b = append(b, 0x01)                     // 1 local group
-		b = append(b, byte(numI32Locals), 0x7F) // 6 × i32
-	}
-
-	// Local indices for the DFA locals (also used by emitPrefixScan).
+	// Local indices for the DFA locals (also used by emitPrefixScan). The
+	// v128 group is variable-width, so the allocator reserves the tail rather
+	// than the declaration and the constants being kept in step by hand.
 	const (
-		locPtr          = 0
-		locLen          = 1
-		locState        = 2
-		locPos          = 3
-		locAttemptStart = 4
-		locLastAccept   = 5
-		locRevResult    = 6
-		locSimdOrClass  = 7
-		locChunk        = 8
-		locTLo          = 9
-		locTHi          = 10
-		locChunk1       = 11
-		locT1Lo         = 12
-		locT1Hi         = 13
+		locPtr = 0
+		locLen = 1
 	)
+	a := newLocalAlloc(2)
+	locState := a.I32()
+	locPos := a.I32()
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locLastAccept := a.I32()
+	locRevResult := a.I32()
+	locSimdOrClass := a.I32()
+	if int(a.Next()) != numI32Locals+2 {
+		panic("compile: litAnchor i32 allocation drifted from numI32Locals")
+	}
+	a.Reserve(valV128, numV128Locals)
+	const (
+		locChunk  = 8
+		locTLo    = 9
+		locTHi    = 10
+		locChunk1 = 11
+		locT1Lo   = 12
+		locT1Hi   = 13
+	)
+	b = a.EmitDecls(b)
 
 	// The find-from seed. The literal scan, the backward scan and
 	// the forward verify all key off attempt_start, and the backward scan
 	// additionally reads the same global as its floor so it cannot walk left
 	// past the caller's start position.
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 
 	// ── outer control flow ────────────────────────────────────────────────────
 	// block $no_match (depth 1 from inside $lit_outer)
@@ -7936,7 +8173,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 			OnMatch: nil,
 		}
 	}
-	b = emitPrefixScan(b, simdParams)
+	b, _ = emitPrefixScan(b, simdParams)
 
 	// ── Scalar literal verification (multi-literal / Teddy only) ─────────────
 	// After Teddy places a candidate in attempt_start, verify that one of the
@@ -8479,31 +8716,30 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	}
 
 	const (
-		locPtr          = 0
-		locLen          = 1
-		locAttemptStart = 2
-		locSimdOrClass  = 3
-		locRevResult    = 4
-		locPacked       = 5 // i64
-		locChunk        = 6
-		locTLo          = 7
-		locTHi          = 8
-		locChunk1       = 9
-		locT1Lo         = 10
-		locT1Hi         = 11
+		locPtr = 0
+		locLen = 1
+	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdOrClass := a.I32()
+	locRevResult := a.I32()
+	locPacked := a.I64()
+	if int(a.Next()) != numI32Locals+3 {
+		panic("compile: altLitAnchor i32 allocation drifted from numI32Locals")
+	}
+	a.Reserve(valV128, numV128Locals)
+	const (
+		locChunk  = 6
+		locTLo    = 7
+		locTHi    = 8
+		locChunk1 = 9
+		locT1Lo   = 10
+		locT1Hi   = 11
 	)
 
 	// ── local declarations ────────────────────────────────────────────────
-	if numV128Locals > 0 {
-		b = append(b, 0x03)                      // 3 local groups
-		b = append(b, byte(numI32Locals), 0x7F)  // i32 × numI32Locals
-		b = append(b, 0x01, 0x7E)                // i64 × 1 (packed)
-		b = append(b, byte(numV128Locals), 0x7B) // v128 × numV128Locals
-	} else {
-		b = append(b, 0x02)                     // 2 local groups
-		b = append(b, byte(numI32Locals), 0x7F) // i32 × numI32Locals
-		b = append(b, 0x01, 0x7E)               // i64 × 1 (packed)
-	}
+	b = a.EmitDecls(b)
 
 	// ── outer control flow ────────────────────────────────────────────────
 	// The find-from seed, AFTER the locals declaration above — this
@@ -8514,7 +8750,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	// The dispatcher scans for any branch's literal starting at attempt_start,
 	// and each branch's backward scan reads the same global as its floor, so
 	// neither can look left of the caller's start position.
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $outer
@@ -8545,7 +8781,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, simdParams)
+	b, _ = emitPrefixScan(b, simdParams)
 
 	// ── Per-branch verify chain ─────────────────────────────────────────────
 	// Teddy has false positives, so every candidate is verified byte-for-byte
@@ -8701,18 +8937,31 @@ type findBodyParams struct {
 	midAcceptNLOff        int32
 	tableMemIdx           int
 	dominantStates        []dominantInfo
-	lnmAction5            bool
-	skipSafeOnDead        bool
-	eofSkipSafe           bool
+	// classChain, when non-nil, describes a linear class chain at the head of
+	// the pattern, so the candidate prologue can verify it with one SIMD probe
+	// instead of walking it a byte at a time. See detectClassChainPrefix.
+	classChain *classChainPrefix
+
+	// hasTwin says a NEUTRAL twin of this body exists, so the adaptive dense
+	// switch can hand off to it the moment its probe budget runs out, instead
+	// of paying its own gate on every remaining attempt of the call. Set only
+	// on the HINTED body of a twinned pair; the twin itself never hands off.
+	hasTwin        bool
+	lnmAction5     bool
+	skipSafeOnDead bool
+	eofSkipSafe    bool
+
+	// soleMidDominant: a nonzero midAccept load can only be dominantStates[0],
+	// so the dispatch needs neither the cached value nor the compare against
+	// its encoding. See soleMidDominant().
+	soleMidDominant bool
+
+	// report reaches emitPrefixScan so the scan can name the strategy IT
+	// chose. Nil on every path but `compile --verbose`.
+	report *Reporter
 }
 
-// findBodyAttemptStartLocal is buildFindBody's scan-start local: the position
-// the next match attempt begins at. It is the local the find-from seed writes
-// and the one prefixScanLocals.AttemptStart names, so the two come from one
-// place and cannot drift apart.
-const findBodyAttemptStartLocal = 4
-
-func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
+func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	// Destructured once so the body below reads exactly as it did when these
 	// were positional parameters; the struct exists to make call sites keyed.
 	startState := p.startState
@@ -8759,6 +9008,8 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	midAcceptNLOff := p.midAcceptNLOff
 	tableMemIdx := p.tableMemIdx
 	dominantStates := p.dominantStates
+	soleMid := p.soleMidDominant
+	classChain := p.classChain
 	lnmAction5 := p.lnmAction5
 	skipSafeOnDead := p.skipSafeOnDead
 	eofSkipSafe := p.eofSkipSafe
@@ -8829,22 +9080,43 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		}
 	case len(firstBytes) > 8 && len(firstBytes) <= 16:
 		numV128ForScan = 1 // Shufti, unconditional for 9..16
-	case len(firstBytes) > 16 && len(firstBytes) <= 64:
-		if lnmAction5 || shuftiBeatsScalar(firstBytes) {
-			numV128ForScan = 1 // Shufti: density-gated or LikelyNoMatch-forced
+	case len(firstBytes) > 16:
+		// Asks the SAME predicate the emitter asks, rather than restating its
+		// rule — the two disagreeing is a module that fails WASM validation,
+		// not a wrong answer. canAdapt is true because this path reserves the
+		// dense-switch locals below whenever the plan wants them.
+		if useShufti, _ := shuftiPrefixPlan(firstBytes, lnmAction5, true); useShufti {
+			numV128ForScan = 1
 		}
+	}
+	// The chain-start probe needs a v128 chunk of its own, and it fires on
+	// patterns whose first-byte set is too dense for Shufti — `[a-zA-Z]{20,}`
+	// scans SCALAR, so without this the scan would reserve no v128 local at
+	// all and the probe would address one that was never declared.
+	if classChain != nil && numV128ForScan == 0 {
+		numV128ForScan = 1
 		// else: scalar firstByteFlags — no SIMD locals needed
 	}
 	if len(dominantStates) > 0 && numV128ForScan == 0 {
 		numV128ForScan = 1 // Opt 1 bulk-skip needs its own `chunk` register
 	}
-	// needsDenseSwitch: this pattern hits the exact
-	// LikelyNoMatch-forced override target (17..64-byte
-	// first-byte set, static heuristic would otherwise pick scalar) —
-	// always implies numV128ForScan==1 (the Shufti branch above fires
-	// whenever lnmAction5 is true in that byte range).
-	needsDenseSwitch := lnmAction5 && len(firstBytes) > 16 && len(firstBytes) <= 64 && !shuftiBeatsScalar(firstBytes)
+	// needsDenseSwitch: this pattern got Shufti from a LikelyNoMatch
+	// assertion the static rarity model would not have made on its own —
+	// either a 17..64 set the model called dense, or anything in the 65..128
+	// band, where the model is not consulted at all. Always implies
+	// numV128ForScan==1, since the same predicate decided both.
+	_, needsDenseSwitch := shuftiPrefixPlan(firstBytes, lnmAction5, true)
 	var denseCounterLocal, denseSkipFlagLocal byte
+	// denseLocalsReady gates the seed below on the locals having actually been
+	// ALLOCATED, not merely wanted. needsDenseSwitch is computed from the
+	// first-byte set alone, but the mandatory-literal paths declare their
+	// locals inline and never call assignV128Locals — so their
+	// denseCounterLocal stays at its zero value, which aliases `ptr`. Seeding
+	// on the wrong condition would store a constant over the input pointer.
+	// Those paths also never reach the adaptive emission (emitPrefixScan takes
+	// its prefix branch when a literal is present), so there is nothing to
+	// seed there either.
+	denseLocalsReady := false
 
 	// needsBulkHyst: any non-mid-accept dominant present
 	// → the dispatch below wraps its bulk-skip in the runtime hysteresis,
@@ -8908,6 +9180,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 			next++
 			denseSkipFlagLocal = next
 			next++
+			denseLocalsReady = true
 		}
 		if needsBulkHyst {
 			bulkHystCounterLocal = next
@@ -8926,6 +9199,19 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// never asserted here. If that closure were somehow not reached it stays
 	// ffLegacyNarrow and the wrapper keeps narrowing — wrong-but-safe, rather
 	// than a body and a wrapper that both apply the offset.
+	// buildFindBody's locals are laid out by hand below (i32Count varies with
+	// the pattern, and the v128 and trailing-i32 groups are conditional), so
+	// the allocator is used here only to MINT the scan cursor from the leading
+	// i32 run rather than to emit the declarations. That still removes the
+	// hand-written index: the cursor's position follows from allocating the
+	// two i32s that precede it, and appendLocalGroups asserts i32Count covers
+	// them. attempt_start is the local the seed writes AND the one
+	// prefixScanLocals.AttemptStart names, so the two cannot drift apart.
+	cursorAlloc := newLocalAlloc(2)
+	cursorAlloc.Reserve(valI32, 2)
+	attemptCursor := cursorAlloc.ScanCursor()
+	findBodyAttemptStartLocal := attemptCursor.Local()
+
 	findFrom := ffLegacyNarrow
 	// seedFindFrom writes the find-from position into attempt_start. BOTH of
 	// this function's locals paths must call it exactly once, immediately
@@ -8935,7 +9221,20 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// acceptance patterns still diverging after the first conversion — all
 	// three have a mandatory literal.
 	seedFindFrom := func(b []byte) []byte {
-		b, findFrom = emitFindFromSeed(b, findBodyAttemptStartLocal)
+		b, findFrom = emitFindFromSeed(b, attemptCursor)
+		// The adaptive dense switch's probe budget rides along here for the
+		// same reason the find-from offset does: this is the one point every
+		// locals path passes through, after the declarations and before the
+		// prologue that first reads either. DenseCounter counts DOWN so its
+		// per-attempt gate is two instructions rather than four, which means
+		// zero has to mean "stop" — and a WASM local starts at zero, so
+		// without this store the switch would be tripped before the first
+		// probe and Shufti would never run at all.
+		if denseLocalsReady {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, denseSwitchThreshold)
+			b = append(b, 0x21, denseCounterLocal)
+		}
 		return b
 	}
 	appendLocalGroups := func(b []byte, i32Count byte) []byte {
@@ -8952,6 +9251,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		}
 		if trailingI32 > 0 {
 			numGroups++
+		}
+		if i32Count <= findBodyAttemptStartLocal-2 {
+			panic("compile: buildFindBody i32 group does not cover attempt_start")
 		}
 		b = append(b, numGroups, i32Count, 0x7F)
 		if numV128ForScan > 0 {
@@ -8984,6 +9286,10 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	// Emits: if attempt_start >= len: br $no_match
 	//        state=startState, pos=attempt_start, last_accept=-1
 	//        if accept[state]: last_accept=pos  (start-state empty-match check)
+	// twinCallPatch records where the adaptive dense switch's handoff call to
+	// the neutral twin left a five-byte zero-padded immediate. -1 when this
+	// body emits no handoff, which is every body without a twin.
+	twinCallPatch := -1
 	emitOuterPrologue := func(b []byte) []byte {
 		lenForScan := byte(1) // raw len param
 		params := prefixScanParams{
@@ -9005,6 +9311,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 			TableMemIdx:      tableMemIdx,
 			LikelyNoMatch:    lnmAction5,
 			AllowDenseSwitch: needsDenseSwitch,
+			HasTwin:          p.hasTwin,
 			EngineDepth:      2, // loop $outer + block $no_match
 			Locals: prefixScanLocals{
 				Ptr:           0,
@@ -9173,6 +9480,84 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 					b = append(b, 0x6A)       // i32.add
 					b = append(b, 0x21, 0x03) // pos = attempt_start + prefix_len
 				} else {
+					// ── chain-start SIMD verify ─────────────────────────────
+					//
+					// When the pattern's head is a linear chain of one byte
+					// class, one probe replaces the first min(N,16) scalar
+					// steps AND retires a failed range outright: a non-member
+					// at offset r proves no start in [p, p+r] can begin a
+					// match, because each of those has fewer than N class
+					// bytes ahead of it. The scalar scan would retry every one
+					// of them.
+					//
+					// Emitted around the ordinary state/pos init, which stays
+					// as the fallback for the last <16 bytes of the input. The
+					// last_accept initialisation AFTER this block is untouched
+					// and runs on both paths — which is why the probe never
+					// writes last_accept itself: landing in an accepting state
+					// with pos set is enough for that code to do it.
+					chainDone := false
+					if classChain != nil {
+						k := classChain.n
+						if k > 16 {
+							k = 16
+						}
+						var bs blockStack
+						bs.Push("outer")
+						bs.Push("chain_done")
+						b = append(b, 0x02, 0x40) // block $chain_done
+						bs.Push("scalar")
+						b = append(b, 0x02, 0x40) // block $scalar
+						// Need a full 16-byte chunk regardless of k.
+						b = append(b, 0x20, 0x04) // local.get attempt_start
+						b = append(b, 0x41, 0x10) // i32.const 16
+						b = append(b, 0x6A)       // i32.add
+						b = append(b, 0x20, 0x01) // local.get len
+						b = append(b, 0x4B)       // i32.gt_u
+						b = append(b, 0x0D, bs.Depth("scalar"))
+						// chunk = v128.load(ptr + attempt_start)
+						b = append(b, 0x20, 0x00)
+						b = append(b, 0x20, 0x04)
+						b = append(b, 0x6A)
+						b = append(b, 0xFD, 0x00, 0x00, 0x00)
+						b = append(b, 0x21, chunkLocal)
+						// mask: bit j set ⇔ lane j is NOT in the class.
+						b = emitShuftiStopMask(b, classChain.class, chunkLocal)
+						if k < 16 {
+							// Only the first k lanes decide; a non-member past
+							// them does not stop a match starting here.
+							b = append(b, 0x41)
+							b = utils.AppendSLEB128(b, int32((1<<uint(k))-1))
+							b = append(b, 0x71) // i32.and
+						}
+						b = append(b, 0x22, simdMaskLocal) // local.tee
+						b = append(b, 0x45)                // i32.eqz
+						b = append(b, 0x04, 0x40)          // if: all k are members
+						bs.Push("if")
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, classChain.states[k-1])
+						b = append(b, 0x21, 0x02) // local.set state
+						b = append(b, 0x20, 0x04)
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(k))
+						b = append(b, 0x6A)       // attempt_start + k
+						b = append(b, 0x21, 0x03) // local.set pos
+						b = append(b, 0x0C, bs.Depth("chain_done"))
+						bs.Pop()
+						b = append(b, 0x0B) // end if
+						// Short run: skip the whole failed range.
+						b = append(b, 0x20, 0x04)
+						b = append(b, 0x20, simdMaskLocal)
+						b = append(b, 0x68) // i32.ctz
+						b = append(b, 0x6A)
+						b = append(b, 0x41, 0x01)
+						b = append(b, 0x6A)       // + 1
+						b = append(b, 0x21, 0x04) // local.set attempt_start
+						b = append(b, 0x0C, bs.Depth("outer"))
+						bs.Pop()
+						b = append(b, 0x0B) // end block $scalar
+						chainDone = true
+					}
 					// state = startState / midStartState / midStartWordState / midStartNewlineState
 					if startState == midStartState && (!hasWordBoundary || midStartState == midStartWordState) && (!hasNewlineBoundary || midStartState == midStartNewlineState) {
 						b = append(b, 0x41)
@@ -9260,6 +9645,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 					b = append(b, 0x21, 0x02) // local.set state
 					b = append(b, 0x20, 0x04) // local.get attempt_start
 					b = append(b, 0x21, 0x03) // local.set pos
+					if chainDone {
+						b = append(b, 0x0B) // end block $chain_done
+					}
 				}
 				// Initialise last_accept for the start state before entering the scan loop.
 				// Handles empty-input and immediate-accept cases: if midAccept[startState]
@@ -9325,7 +9713,15 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 				return b
 			},
 		}
-		return emitPrefixScan(b, params)
+		params.Report = p.report
+		b, patch := emitPrefixScan(b, params)
+		if patch >= 0 {
+			if twinCallPatch >= 0 {
+				panic("compile: two twin-call patch sites in one find body")
+			}
+			twinCallPatch = patch
+		}
+		return b
 	}
 
 	// ── helper: emit the packed-i64 return and close loops ──────────────────
@@ -9494,7 +9890,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		}
 		b = append(b, 0x21, scanStartLocal)
 		b = append(b, 0x03, 0x40) // loop $lit_outer
-		b = emitPrefixScan(b, prefixScanParams{
+		b, _ = emitPrefixScan(b, prefixScanParams{
 			Prefix:      mandatoryLit.bytes,
 			EngineDepth: 2, // loop $lit_outer + block $no_match
 			// MinPatternLen NOT set: scanStartLocal is a mandatory-lit scan
@@ -9625,7 +10021,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
 			chunkLocal /*val+tmp=*/, 0x06,
-			bulkHystCounterLocal, bulkHystPosLocal)
+			bulkHystCounterLocal, bulkHystPosLocal, soleMid)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
@@ -9638,7 +10034,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		b = append(b, 0x0B)       // end loop $scan
 		b = append(b, 0x0B)       // end block $found
 		b = emitReturn(b)
-		return b, findFrom
+		return b, findFrom, twinCallPatch
 	}
 
 	if useU8 {
@@ -9703,7 +10099,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
 			chunkLocal /*val+tmp=*/, simdMaskLocal,
-			bulkHystCounterLocal, bulkHystPosLocal)
+			bulkHystCounterLocal, bulkHystPosLocal, soleMid)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
@@ -9716,7 +10112,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 		b = append(b, 0x0B)       // end loop $scan
 		b = append(b, 0x0B)       // end block $found
 		b = emitReturn(b)
-		return b, findFrom
+		return b, findFrom, twinCallPatch
 	}
 
 	// ── u16 find path ─────────────────────────────────────────────────────────
@@ -9816,7 +10212,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode) {
 	b = append(b, 0x0B)       // end loop $scan
 	b = append(b, 0x0B)       // end block $found
 	b = emitReturn(b)
-	return b, findFrom
+	return b, findFrom, twinCallPatch
 }
 
 // ============================================================================
@@ -11127,10 +11523,21 @@ func emitLitChainAltLitBranchBodyPrefixed(b []byte, br litChainAltBranch,
 	b = append(b, 0x47)
 	b = append(b, 0x0D, failDepth)
 
-	// Bounds: attempt_start < M → fail (no prefix room).
+	// Bounds AND the find-from floor: attempt_start < find_from + M → fail.
+	//
+	// The floor is not optional. This branch reports `attempt_start - M` as the
+	// match start, so a literal at attempt_start in [from, from+M) yields a
+	// start BEFORE `from` — the prefix verify genuinely matches there and
+	// passes, and the export answers with a match the caller already consumed.
+	// That is the same defect the generic backward scan grew a floor for
+	// (see buildSimplePrefixCheckBody), and a host iterating the export walks
+	// BACKWARDS on it: the advance `off += end - off` goes negative.
 	b = append(b, 0x20, locals.AttemptStart)
+	b = append(b, 0x23) // global.get find_from
+	b = utils.AppendULEB128(b, findFromGlobalIdx)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, m)
+	b = append(b, 0x6A) // i32.add → find_from + M
 	b = append(b, 0x49)
 	b = append(b, 0x0D, failDepth)
 
@@ -11417,21 +11824,21 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) ([]byt
 	var findFrom findFromMode
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locChunk        byte = 4
-		locTLo          byte = 5 // suffix class table
-		locPow2         byte = 6
-		locPrefixTlo    byte = 7
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locChunk := a.V128()
+	locTLo := a.V128() // suffix class table
+	locPow2 := a.V128()
+	locPrefixTlo := a.V128()
 
 	// 2 × i32 + 4 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x02, 0x7F)
-	b = append(b, 0x04, 0x7B)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -11466,12 +11873,22 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) ([]byt
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
-	// Bounds A: attempt_start < M → no prefix room, advance & retry.
+	// Bounds A AND the find-from floor: attempt_start < find_from + M →
+	// advance & retry.
+	//
+	// The floor is not optional: this body reports `attempt_start - M` as the
+	// match start, so without it a literal at attempt_start in [from, from+M)
+	// yields a start BEFORE `from`. See emitLitChainAltLitBranchBodyPrefixed
+	// for the full note; advancing rather than failing is right here because
+	// $lit_outer rescans from the new position.
 	b = append(b, 0x20, locAttemptStart)
+	b = append(b, 0x23) // global.get find_from
+	b = utils.AppendULEB128(b, findFromGlobalIdx)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, m)
+	b = append(b, 0x6A) // i32.add → find_from + M
 	b = append(b, 0x49) // i32.lt_u
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, locAttemptStart)
@@ -11547,19 +11964,18 @@ func buildLitChainPrefixedMatchBody(lcp *litChainPattern) []byte {
 	var b []byte
 
 	const (
-		locPtr       byte = 0
-		locLen       byte = 1
-		locBase      byte = 2 // holds M; gives the "attempt_start" frame for shared helpers
-		locChunk     byte = 3
-		locTLo       byte = 4
-		locPow2      byte = 5
-		locPrefixTlo byte = 6
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	locBase := a.I32() // holds M; the "attempt_start" frame for shared helpers
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
+	locPrefixTlo := a.V128()
 
 	// 1 × i32 + 4 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x01, 0x7F)
-	b = append(b, 0x04, 0x7B)
+	b = a.EmitDecls(b)
 
 	k := int32(len(lcp.literal))
 	m := int32(lcp.prefixCount)
@@ -11688,25 +12104,24 @@ func buildLitChainMatchBody(lcp *litChainPattern) []byte {
 	// when end-anchor check needs the helpers, to keep the no-anchor WASM
 	// byte-identical to the pre-anchor emission.
 	const (
-		locPtr   byte = 0
-		locLen   byte = 1
-		locChunk byte = 2
-		locTLo   byte = 3
-		locPow2  byte = 4
-		// When hasAnchors:
-		locAttemptZero byte = 5
-		locTmp         byte = 6
+		locPtr byte = 0
+		locLen byte = 1
 	)
 	// Declare v128 group first so existing local indices (locChunk=2..) stay
 	// stable whether or not the anchor i32 locals are present.
+	// The two i32s exist only for the anchor helpers; without anchors the
+	// allocator emits the v128 group alone, exactly as the hand-written
+	// if/else did.
+	a := newLocalAlloc(2)
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
+	var locAttemptZero, locTmp byte
 	if hasAnchors {
-		b = append(b, 0x02)
-		b = append(b, 0x03, 0x7B) // 3 × v128
-		b = append(b, 0x02, 0x7F) // 2 × i32 (attempt-zero sentinel + tmp)
-	} else {
-		b = append(b, 0x01)
-		b = append(b, 0x03, 0x7B)
+		locAttemptZero = a.I32()
+		locTmp = a.I32()
 	}
+	b = a.EmitDecls(b)
 
 	// Materialise tLo and pow2 from inline v128.const into locals.
 	b = emitV128Const(b, lcp.tlo)
@@ -12313,23 +12728,21 @@ func buildLitChainAltMatchBody(altp *litChainAltPattern) []byte {
 	}
 
 	const (
-		locPtr         byte = 0
-		locLen         byte = 1
-		locChunk       byte = 2
-		locTLo         byte = 3
-		locPow2        byte = 4
-		locAttemptZero byte = 5 // attempt_start sentinel (init 0); used by emitEndAnchorCheck
-		locTmp         byte = 6 // is_word scratch
+		locPtr byte = 0
+		locLen byte = 1
 	)
 
+	a := newLocalAlloc(2)
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
+	// attempt_start sentinel (init 0) and is_word scratch, both anchor-only.
+	var locAttemptZero, locTmp byte
 	if anyAnchor {
-		b = append(b, 0x02)
-		b = append(b, 0x03, 0x7B) // 3 × v128
-		b = append(b, 0x02, 0x7F) // 2 × i32
-	} else {
-		b = append(b, 0x01)
-		b = append(b, 0x03, 0x7B)
+		locAttemptZero = a.I32()
+		locTmp = a.I32()
 	}
+	b = a.EmitDecls(b)
 
 	// Materialise pow2 once.
 	b = emitV128Const(b, pow2VecConst)
@@ -12467,29 +12880,28 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 	var b []byte
 
 	const (
-		locPtr         byte = 0
-		locLen         byte = 1
-		locChunk       byte = 2
-		locTLo         byte = 3
-		locPow2        byte = 4
-		locState       byte = 5 // DFA verify
-		locPos         byte = 6 // DFA verify
-		locClass       byte = 7 // DFA verify
-		locOutEnd      byte = 8 // DFA verify last_accept
-		locScalarIdx   byte = 9 // scalar bitmap verify counter / is_word scratch
-		locAttemptZero byte = 10
-		// locScalarByte is a same-iteration byte-value scratch for
-		// emitScalarBitmapVerify. It must NOT alias locScalarIdx, which
-		// must survive as the live loop counter across iterations.
-		// Aliasing it onto the byte scratch was a real defect here, and
-		// again in the sibling anchored-match body.
-		locScalarByte byte = 11
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
+	locState := a.I32()     // DFA verify
+	locPos := a.I32()       // DFA verify
+	locClass := a.I32()     // DFA verify
+	locOutEnd := a.I32()    // DFA verify last_accept
+	locScalarIdx := a.I32() // scalar bitmap verify counter / is_word scratch
+	locAttemptZero := a.I32()
+	// locScalarByte is a same-iteration byte-value scratch for
+	// emitScalarBitmapVerify. It must NOT alias locScalarIdx, which must
+	// survive as the live loop counter across iterations. Aliasing it onto the
+	// byte scratch was a real defect here, and again in the sibling anchored-
+	// match body — which is the kind of mistake the allocator makes hard to
+	// repeat, since each name now comes from its own allocation.
+	locScalarByte := a.I32()
 
-	// 3 × v128 + 7 × i32 locals.
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7B)
-	b = append(b, 0x07, 0x7F)
+	b = a.EmitDecls(b)
 
 	// Materialise pow2 once.
 	b = emitV128Const(b, pow2VecConst)
@@ -12688,23 +13100,23 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findF
 	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locTmp          byte = 4 // word-byte check scratch (only used when anchors present)
-		locChunk        byte = 5 // shared between prefix scan and class verify
-		locTLo          byte = 6
-		locPow2         byte = 7
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locTmp := a.I32()    // word-byte check scratch (only used when anchors present)
+	locChunk := a.V128() // shared between prefix scan and class verify
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// Local declarations: 3 i32 + 3 v128.
 	// locTmp is declared regardless (cheap) so the local indices stay stable
 	// across hasAnchors variants.
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F) // 3 × i32
-	b = append(b, 0x03, 0x7B) // 3 × v128
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start correctly:
 	// emitStartAnchorCheck fails a \A anchor when attempt_start != 0 and
 	// reads input[attempt_start-1] for \b / \B. It was simply never told
@@ -12738,7 +13150,7 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findF
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds check: attempt_start + K + N > len → $no_match.
 	b = append(b, 0x20, locAttemptStart)
@@ -12818,21 +13230,21 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 
 	// out_ptr is param 2, so all locals from the find-body shift by +1.
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locOutPtr       byte = 2
-		locAttemptStart byte = 3
-		locSimdMask     byte = 4
-		locTmp          byte = 5 // word-byte scratch (only used when anchors present)
-		locChunk        byte = 6
-		locTLo          byte = 7
-		locPow2         byte = 8
+		locPtr    byte = 0
+		locLen    byte = 1
+		locOutPtr byte = 2
 	)
+	a := newLocalAlloc(3)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locTmp := a.I32() // word-byte scratch (only used when anchors present)
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// 3 × i32 + 3 × v128 (locTmp declared regardless for stable indices).
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F) // 3 × i32
-	b = append(b, 0x03, 0x7B) // 3 × v128
+	b = a.EmitDecls(b)
 
 	// This body IS the exported groups function
 	// (compiledPattern.anchored), but it SCANS — it is a non-anchored
@@ -12840,7 +13252,7 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 	// groups(from > 0) find the second and later matches instead of the
 	// export's wrapper refusing every nonzero `from`. Slots stay absolute and
 	// left context is real, so \b and ^ judge the actual preceding byte.
-	b, _ = emitFindFromSeed(b, locAttemptStart)
+	b, _ = emitFindFromSeed(b, attemptCursor)
 
 	k := int32(len(lcp.literal))
 	total := k + int32(lcp.count)
@@ -12861,7 +13273,7 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds: attempt_start + K + N > len → $no_match.
 	b = append(b, 0x20, locAttemptStart)
@@ -12944,22 +13356,22 @@ func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCapture
 	var b []byte
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locOutPtr       byte = 2
-		locAttemptStart byte = 3
-		locSimdMask     byte = 4
-		locMatchLen     byte = 5
-		locTmp          byte = 6
-		locChunk        byte = 7
-		locTLo          byte = 8
-		locPow2         byte = 9
+		locPtr    byte = 0
+		locLen    byte = 1
+		locOutPtr byte = 2
 	)
+	a := newLocalAlloc(3)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locMatchLen := a.I32()
+	locTmp := a.I32()
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// 4 × i32 + 3 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x04, 0x7F)
-	b = append(b, 0x03, 0x7B)
+	b = a.EmitDecls(b)
 
 	// This body IS the exported groups function
 	// (compiledPattern.anchored), but it SCANS — it is a non-anchored
@@ -12967,7 +13379,7 @@ func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCapture
 	// groups(from > 0) find the second and later matches instead of the
 	// export's wrapper refusing every nonzero `from`. Slots stay absolute and
 	// left context is real, so \b and ^ judge the actual preceding byte.
-	b, _ = emitFindFromSeed(b, locAttemptStart)
+	b, _ = emitFindFromSeed(b, attemptCursor)
 
 	k := int32(len(lcp.literal))
 	countMin := int32(lcp.count)
@@ -12994,7 +13406,7 @@ func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCapture
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds: attempt_start + K + countMin > len → $no_match.
 	b = append(b, 0x20, locAttemptStart)
@@ -13274,21 +13686,21 @@ func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, 
 	var findFrom findFromMode
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locMatchLen     byte = 4
-		locChunk        byte = 5
-		locTLo          byte = 6
-		locPow2         byte = 7
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locMatchLen := a.I32()
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// 3 × i32 + 3 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F)
-	b = append(b, 0x03, 0x7B)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -13322,7 +13734,7 @@ func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, 
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds: attempt_start + K + countMin > len → $no_match.
 	b = append(b, 0x20, locAttemptStart)
@@ -13411,21 +13823,20 @@ func buildLitChainRangeMatchBody(lcp *litChainPattern) []byte {
 	hasAnchors := lcp.startAnchor != anchorNone || lcp.endAnchor != anchorNone
 
 	const (
-		locPtr         byte = 0
-		locLen         byte = 1
-		locMatchLen    byte = 2
-		locScratch     byte = 3 // for tmp in verify
-		locAttemptZero byte = 4 // zero-init; used by emitEndAnchorCheck
-		locTmp         byte = 5 // is_word scratch
-		locChunk       byte = 6
-		locTLo         byte = 7
-		locPow2        byte = 8
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	locMatchLen := a.I32()
+	locScratch := a.I32()     // for tmp in verify
+	locAttemptZero := a.I32() // zero-init; used by emitEndAnchorCheck
+	locTmp := a.I32()         // is_word scratch
+	locChunk := a.V128()
+	locTLo := a.V128()
+	locPow2 := a.V128()
 
 	// 4 × i32 (locMatchLen, locScratch, locAttemptZero, locTmp) + 3 × v128.
-	b = append(b, 0x02)
-	b = append(b, 0x04, 0x7F)
-	b = append(b, 0x03, 0x7B)
+	b = a.EmitDecls(b)
 
 	k := int32(len(lcp.literal))
 	countMin := int32(lcp.count)
@@ -13713,30 +14124,29 @@ func buildLitChainAltDataSegments(altp *litChainAltPattern, l litChainAltLayout)
 //	9  verifyPow2     (v128) — SIMD verify (loaded once)
 func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locScalarIdx    byte = 4
-		locChunk        byte = 5
-		locTeddyLo      byte = 6
-		locTeddyHi      byte = 7
-		locTeddyT1Lo    byte = 8
-		locTeddyT1Hi    byte = 9
-		// locVerifyTlo doubles as locTeddyChunk1 during scan (different phases).
-		locVerifyTlo   byte = 10
-		locTeddyChunk1 byte = 10
-		locVerifyPow2  byte = 11
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locScalarIdx := a.I32()
+	locChunk := a.V128()
+	locTeddyLo := a.V128()
+	locTeddyHi := a.V128()
+	locTeddyT1Lo := a.V128()
+	locTeddyT1Hi := a.V128()
+	// locVerifyTlo doubles as locTeddyChunk1 during scan (different phases).
+	locVerifyTlo := a.V128()
+	locTeddyChunk1 := locVerifyTlo
+	locVerifyPow2 := a.V128()
 
 	var b []byte
 	var findFrom findFromMode
 
-	// Local declarations: 3 i32 + 7 v128 (T0/T1 Teddy + chunk + chunk1/verifyTlo + verifyPow2).
-	b = append(b, 0x02)       // 2 local groups
-	b = append(b, 0x03, 0x7F) // 3 × i32
-	b = append(b, 0x07, 0x7B) // 7 × v128
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -13788,7 +14198,7 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	// attempt_start = candidate position. Try each branch in turn.
 	locals := litChainBranchLocals{
@@ -13826,28 +14236,28 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 	l litChainAltLayout, tableMemIdx int) []byte {
 
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locOutPtr       byte = 2
-		locAttemptStart byte = 3
-		locSimdMask     byte = 4
-		locScalarIdx    byte = 5
-		locChunk        byte = 6
-		locTeddyLo      byte = 7
-		locTeddyHi      byte = 8
-		locTeddyT1Lo    byte = 9
-		locTeddyT1Hi    byte = 10
-		locVerifyTlo    byte = 11
-		locTeddyChunk1  byte = 11 // alias: doubles as Chunk1 during scan
-		locVerifyPow2   byte = 12
+		locPtr    byte = 0
+		locLen    byte = 1
+		locOutPtr byte = 2
 	)
+	a := newLocalAlloc(3)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locScalarIdx := a.I32()
+	locChunk := a.V128()
+	locTeddyLo := a.V128()
+	locTeddyHi := a.V128()
+	locTeddyT1Lo := a.V128()
+	locTeddyT1Hi := a.V128()
+	locVerifyTlo := a.V128()
+	locTeddyChunk1 := locVerifyTlo // alias: doubles as Chunk1 during scan
+	locVerifyPow2 := a.V128()
 
 	var b []byte
 
 	// 3 i32 + 7 v128.
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F)
-	b = append(b, 0x07, 0x7B)
+	b = a.EmitDecls(b)
 
 	// This body IS the exported groups function
 	// (compiledPattern.anchored), but it SCANS — it is a non-anchored
@@ -13855,7 +14265,7 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 	// groups(from > 0) find the second and later matches instead of the
 	// export's wrapper refusing every nonzero `from`. Slots stay absolute and
 	// left context is real, so \b and ^ judge the actual preceding byte.
-	b, _ = emitFindFromSeed(b, locAttemptStart)
+	b, _ = emitFindFromSeed(b, attemptCursor)
 
 	// Hoist pow2 outside the scan loop (Cranelift JIT workaround).
 	b = emitV128Const(b, pow2VecConst)
@@ -13900,7 +14310,7 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	locals := litChainBranchLocals{
 		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
@@ -13944,27 +14354,27 @@ func appendLitChainAltFindGroupsCodeEntry(cs []byte, altp *litChainAltPattern,
 // (ptr,len) → i64. Per-branch dispatch uses emitLitChainAltLitBranchBodyPrefixed.
 func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locScalarIdx    byte = 4
-		locChunk        byte = 5
-		locTeddyLo      byte = 6
-		locTeddyHi      byte = 7
-		locTeddyT1Lo    byte = 8
-		locTeddyT1Hi    byte = 9
-		locVerifyTlo    byte = 10
-		locTeddyChunk1  byte = 10
-		locVerifyPow2   byte = 11
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locScalarIdx := a.I32()
+	locChunk := a.V128()
+	locTeddyLo := a.V128()
+	locTeddyHi := a.V128()
+	locTeddyT1Lo := a.V128()
+	locTeddyT1Hi := a.V128()
+	locVerifyTlo := a.V128()
+	locTeddyChunk1 := locVerifyTlo
+	locVerifyPow2 := a.V128()
 
 	var b []byte
 	var findFrom findFromMode
-	b = append(b, 0x02)
-	b = append(b, 0x03, 0x7F)
-	b = append(b, 0x07, 0x7B)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -14012,7 +14422,7 @@ func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLay
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	locals := litChainBranchLocals{
 		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
@@ -14052,29 +14462,29 @@ func appendLitChainAltPrefixedFindCodeEntry(cs []byte, altp *litChainAltPattern,
 // otherwise. Signature: (ptr,len) → i64.
 func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locSimdMask     byte = 3
-		locScalarIdx    byte = 4
-		locMatchLen     byte = 5
-		locTmp          byte = 6
-		locChunk        byte = 7
-		locTeddyLo      byte = 8
-		locTeddyHi      byte = 9
-		locTeddyT1Lo    byte = 10
-		locTeddyT1Hi    byte = 11
-		locVerifyTlo    byte = 12
-		locTeddyChunk1  byte = 12 // alias: doubles as Chunk1 during scan
-		locVerifyPow2   byte = 13
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	attemptCursor := a.ScanCursor()
+	locAttemptStart := attemptCursor.Local()
+	locSimdMask := a.I32()
+	locScalarIdx := a.I32()
+	locMatchLen := a.I32()
+	locTmp := a.I32()
+	locChunk := a.V128()
+	locTeddyLo := a.V128()
+	locTeddyHi := a.V128()
+	locTeddyT1Lo := a.V128()
+	locTeddyT1Hi := a.V128()
+	locVerifyTlo := a.V128()
+	locTeddyChunk1 := locVerifyTlo // alias: doubles as Chunk1 during scan
+	locVerifyPow2 := a.V128()
 
 	var b []byte
 	var findFrom findFromMode
-	b = append(b, 0x02)
-	b = append(b, 0x05, 0x7F)
-	b = append(b, 0x07, 0x7B)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, attemptCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where
@@ -14122,7 +14532,7 @@ func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout
 		},
 		OnMatch: nil,
 	}
-	b = emitPrefixScan(b, scan)
+	b, _ = emitPrefixScan(b, scan)
 
 	locals := litChainBranchLocals{
 		Ptr: locPtr, Len: locLen, AttemptStart: locAttemptStart,
@@ -14551,42 +14961,46 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 // separate per-branch DFA-verify cost (see that fix a few lines below).
 func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
-		locPtr          byte = 0
-		locLen          byte = 1
-		locAttemptStart byte = 2
-		locMask         byte = 3 // persistent SIMD candidate bitmask for the current 16-byte window
-		locScalarIdx    byte = 4
-		locDFAState     byte = 5
-		locDFAPos       byte = 6
-		locDFAClass     byte = 7
-		locDFAOutEnd    byte = 8
-		locChunk        byte = 9
-		locVerifyTlo    byte = 12
-		locVerifyPow2   byte = 13
-		locWindowBase   byte = 14 // base of the currently-loaded 16-byte SIMD window
-		// locScalarByte is a same-iteration byte-value scratch for
-		// emitScalarBitmapVerify. It must NOT alias locMask: unlike the
-		// strict path (buildLitChainAltFindBody), where a failed branch
-		// verify loops back to a fresh emitPrefixScan that recomputes the
-		// mask from scratch, this lenient path persists locMask across
-		// $lit_outer iterations (the whole point of the window-scan
-		// optimisation above) — a branch verify that fails must leave
-		// locMask untouched so the next iteration can resume from it.
-		locScalarByte byte = 15
+		locPtr byte = 0
+		locLen byte = 1
 	)
+	a := newLocalAlloc(2)
+	// attempt_start is DERIVED here — the window loop computes it as
+	// windowBase + ctz(mask) and the scalar tail assigns it from windowBase —
+	// so it is an ordinary local. The cursor is the window base below.
+	locAttemptStart := a.I32()
+	locMask := a.I32() // persistent SIMD candidate bitmask for the current 16-byte window
+	locScalarIdx := a.I32()
+	locDFAState := a.I32()
+	locDFAPos := a.I32()
+	locDFAClass := a.I32()
+	locDFAOutEnd := a.I32()
+	locChunk := a.V128()
+	// Two v128 slots that used to hold pre-loaded Teddy tables. Reserved, not
+	// removed: emitShuftiPrefixCheck now inlines its nibble tables as
+	// v128.const, but dropping the slots would renumber every local after them.
+	a.Reserve(valV128, 2)
+	locVerifyTlo := a.V128()
+	locVerifyPow2 := a.V128()
+	// The cursor: base of the currently-loaded 16-byte SIMD window, and the
+	// scalar tail's scan position. Both entry paths start here, which is why
+	// this — not locAttemptStart — is what the find-from offset is seeded into.
+	windowCursor := a.ScanCursor()
+	locWindowBase := windowCursor.Local()
+	// locScalarByte is a same-iteration byte-value scratch for
+	// emitScalarBitmapVerify. It must NOT alias locMask: unlike the
+	// strict path (buildLitChainAltFindBody), where a failed branch
+	// verify loops back to a fresh emitPrefixScan that recomputes the
+	// mask from scratch, this lenient path persists locMask across
+	// $lit_outer iterations (the whole point of the window-scan
+	// optimisation above) — a branch verify that fails must leave
+	// locMask untouched so the next iteration can resume from it.
+	locScalarByte := a.I32()
 
 	var b []byte
 	var findFrom findFromMode
-	// Local declarations: 7 i32 + 5 v128 + 2 i32 (locWindowBase, locScalarByte
-	// — added on top to avoid renumbering the existing i32/v128 groups above).
-	b = append(b, 0x03)       // 3 local groups
-	b = append(b, 0x07, 0x7F) // 7 × i32
-	b = append(b, 0x05, 0x7B) // 5 × v128 (indices 10,11 — formerly Teddy table
-	// locals — are now unused: emitShuftiPrefixCheck below inlines its
-	// nibble tables as v128.const, so no pre-loaded per-call Teddy table is
-	// needed. Left declared to avoid renumbering locVerifyTlo/locVerifyPow2.)
-	b = append(b, 0x02, 0x7F) // 2 × i32 (locWindowBase, locScalarByte)
-	b, findFrom = emitFindFromSeed(b, locAttemptStart)
+	b = a.EmitDecls(b)
+	b, findFrom = emitFindFromSeed(b, windowCursor)
 	// The body already handles a nonzero scan start: emitStartAnchorCheck
 	// fails a begin-text anchor when attempt_start != 0 and reads
 	// input[attempt_start-1] for a word boundary. It was never told where

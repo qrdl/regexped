@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"fmt"
 	"regexp/syntax"
 	"strings"
@@ -25,11 +26,16 @@ import (
 // well-formed output — which is what would break silently as the emitters
 // around it change.
 
-// shuftiCompiledSet builds a set whose frontend is Shufti, by the same route
-// hints_test.go uses: enough literals that Teddy declines, first bytes inside
-// Shufti's 17..64 band, Aho-Corasick pushed out of budget, and the
+// shuftiCompiledSetOpts builds a set whose frontend is Shufti, by the same
+// route hints_test.go uses: enough literals that Teddy declines, first bytes
+// inside Shufti's 17..64 band, Aho-Corasick pushed out of budget, and the
 // LikelyNoMatch bias that selects it.
-func shuftiCompiledSet(t *testing.T) *compiledSet {
+//
+// `over` leaves the options open so a caller can force the ADAPTIVE variant.
+// The dense switch is `lnm && !rare`, and this set's byte union is one the
+// rarity model calls rare — so the adaptive arm, roughly a third of the
+// emitter, is unreachable without WithShuftiAdaptive.
+func shuftiCompiledSetOpts(t *testing.T, over func(*CompileSetOptions)) *compiledSet {
 	t.Helper()
 	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	var prefixPool, suffixPool dfaPool
@@ -50,8 +56,11 @@ func shuftiCompiledSet(t *testing.T) *compiledSet {
 		DeclaredPatternCount: len(patterns), IDSpaceSize: len(patterns),
 		Patterns: patterns, PatternIDs: ids,
 	}
-	cs := CompileSet(spec, &prefixPool, &suffixPool,
-		CompileSetOptions{LikelyMode: LikelyNoMatch, ACBudgetBytes: 1})
+	opts := CompileSetOptions{LikelyMode: LikelyNoMatch, ACBudgetBytes: 1}
+	if over != nil {
+		over(&opts)
+	}
+	cs := CompileSet(spec, &prefixPool, &suffixPool, opts)
 	if cs.fe != frontendShufti {
 		t.Fatalf("expected the Shufti frontend, got %v — this test no longer reaches what it claims", cs.fe)
 	}
@@ -65,20 +74,72 @@ func shuftiCompiledSet(t *testing.T) *compiledSet {
 // through CompileFile: see the file comment. Emitting it directly at least
 // pins that it produces a body at all, for both anchored kinds.
 func TestShuftiAnchoredBodyEmits(t *testing.T) {
-	cs := shuftiCompiledSet(t)
-	base := cs.funcCount()
-	for _, mode := range []setCapKind{capMatchAny, capMatchAll} {
-		body := emitSetMatchFnFinalShufti(cs, base, base, mode, base)
-		if len(body) == 0 {
-			t.Fatalf("mode %v: emitted an empty body", mode)
-		}
-		// A WASM function body is a size-prefixed byte sequence whose last
-		// byte is `end` (0x0B). Cheap, but it is what catches a body that
-		// stopped being terminated.
-		if body[len(body)-1] != 0x0B {
-			t.Errorf("mode %v: body does not end with `end` (0x0B), got %#x",
-				mode, body[len(body)-1])
-		}
+	// Both switch shapes. The adaptive one carries the runtime dense counter
+	// and its escape to the scalar tail — a separate locals layout and a
+	// separate set of branch depths, so a body that emits only one of them is
+	// only half tested. It is reachable ONLY through the test-only override:
+	// this set's byte union is rare, and `shuftiAdaptive = lnm && !rare`.
+	for _, tc := range []struct {
+		name     string
+		over     func(*CompileSetOptions)
+		adaptive bool
+	}{
+		{"plain", nil, false},
+		{"adaptive", func(o *CompileSetOptions) { *o = o.WithShuftiAdaptive(true) }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := shuftiCompiledSetOpts(t, tc.over)
+			if cs.shuftiAdaptive != tc.adaptive {
+				t.Fatalf("shuftiAdaptive = %v, want %v — this case no longer "+
+					"covers the arm it was written for", cs.shuftiAdaptive, tc.adaptive)
+			}
+			base := cs.funcCount()
+			var prev []byte
+			for _, mode := range []setCapKind{capMatchAny, capMatchAll} {
+				body := emitSetMatchFnFinalShufti(cs, base, base, mode, base)
+				if len(body) == 0 {
+					t.Fatalf("mode %v: emitted an empty body", mode)
+				}
+				// A WASM function body is a size-prefixed byte sequence whose
+				// last byte is `end` (0x0B). Cheap, but it is what catches a
+				// body that stopped being terminated.
+				if body[len(body)-1] != 0x0B {
+					t.Errorf("mode %v: body does not end with `end` (0x0B), got %#x",
+						mode, body[len(body)-1])
+				}
+				// The two anchored modes emit the SAME body here, and that is
+				// correct: newSetFindCtx branches on capFind and capScanAny
+				// only, so match_any and match_all are indistinguishable to
+				// this emitter — their difference lives in the probe and the
+				// accumulation around it. Asserted rather than assumed,
+				// because a future mode-dependent arm added here would want
+				// this test updated deliberately rather than silently.
+				if prev != nil && !bytes.Equal(prev, body) {
+					t.Error("match_any and match_all now emit different bodies; " +
+						"this emitter used to be mode-independent — update the test " +
+						"if that is intended")
+				}
+				prev = body
+			}
+		})
+	}
+}
+
+// TestShuftiAnchoredAdaptiveIsLarger pins that the adaptive arm actually emits
+// the extra machinery rather than silently collapsing to the plain shape —
+// which is what a wrong `adaptive` test inside the emitter would look like.
+func TestShuftiAnchoredAdaptiveIsLarger(t *testing.T) {
+	plain := shuftiCompiledSetOpts(t, nil)
+	adaptive := shuftiCompiledSetOpts(t, func(o *CompileSetOptions) {
+		*o = o.WithShuftiAdaptive(true)
+	})
+	base := plain.funcCount()
+	p := emitSetMatchFnFinalShufti(plain, base, base, capMatchAny, base)
+	a := emitSetMatchFnFinalShufti(adaptive, adaptive.funcCount(), adaptive.funcCount(), capMatchAny, adaptive.funcCount())
+	if len(a) <= len(p) {
+		t.Errorf("adaptive body is %d bytes, plain is %d — the dense counter, "+
+			"its gate and the scalar escape should make it strictly larger",
+			len(a), len(p))
 	}
 }
 

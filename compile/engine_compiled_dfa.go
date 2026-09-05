@@ -275,7 +275,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 
 	// Phase 4 dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
 	// or extra i32 added by the locals declaration above), hyst=6/7.
-	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx)
+	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx, soleMidDominant(l))
 
 	// pos++
 	b = append(b, 0x20, byte(localPos))
@@ -340,7 +340,11 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 // The SIMD prefix scan (emitPrefixScan) is already table/SIMD-only with no br_table
 // dispatch, so no restructuring is required for the find hot path.
 // Row deduplication is guaranteed disabled for the hybrid path.
-func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode) {
+// buildHybridFindBody takes the two knobs a neutral TWIN needs: whether a twin
+// exists to hand off to (false for the twin itself, which never hands off) and
+// an explicit lnmAction5, so the twin can be built from the SAME layout with
+// the hint un-forced. Ordinary callers pass (false, l.lnmAction5).
+func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int, hasTwin, lnm bool) ([]byte, findFromMode, int) {
 	return buildFindBody(findBodyParams{
 		startState:            l.wasmStart,
 		midStartState:         l.wasmMidStart,
@@ -352,6 +356,8 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		prefixEndStateNewline: l.wasmPrefixEndNewline,
 		tableOff:              l.tableOff,
 		midAcceptOff:          l.midAcceptOff,
+		soleMidDominant:       soleMidDominant(l),
+		classChain:            classChainFor(l, t),
 		firstByteOff:          l.firstByteOff,
 		prefix:                l.prefix,
 		classMapOff:           l.classMapOff,
@@ -386,7 +392,8 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		midAcceptNLOff:        l.midAcceptNLOff,
 		tableMemIdx:           tableMemIdx,
 		dominantStates:        l.dominantStates,
-		lnmAction5:            l.lnmAction5,
+		lnmAction5:            lnm,
+		hasTwin:               hasTwin,
 		skipSafeOnDead:        l.skipSafeOnDead,
 		eofSkipSafe:           l.eofSkipSafe,
 	})

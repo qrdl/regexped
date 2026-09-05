@@ -483,13 +483,16 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs [
 	// probe. Same trigger as genSuffixWASM's, and the same reason: it is the
 	// only shape that can answer for more patterns than a mask has bits.
 	if t.acceptWide != nil {
-		tabs := buildSparseAcceptTables(t, int32(l.tableEnd), l.numWASM)
+		// The ANCHORED probe never skips: it walks to prove full consumption,
+		// and a skip would have to preserve the same proof. Not attempted.
+		tabs := buildSparseAcceptTables(t, int32(l.tableEnd), l.numWASM, false)
 		idMapOff := tabs.end
 		idMap := make([]byte, numPatterns*4)
 		for i, gid := range patternIDs {
 			putU32(idMap, i*4, uint32(gid))
 		}
-		scratch := planSparseScratch(idMapOff+int32(len(idMap)), numPatterns)
+		// The anchored probe never skips, so it needs no counter region.
+		scratch := planSparseScratch(idMapOff+int32(len(idMap)), numPatterns, 0)
 		layoutRaw, layoutCount := stripSegCount(dfaDataSegments(l, false, false))
 		dataBytes = append(dataBytes, layoutRaw...)
 		dataBytes = append(dataBytes, appendDataSegment(nil, tabs.midOff, tabs.data)...)

@@ -1,0 +1,92 @@
+# G17 SPARSE ACCEPT — 40 patterns sharing one literal, so they pack into a
+# SINGLE bucket. A u64 accept mask caps a bucket at 32 patterns; the sparse
+# representation carries per-state LISTS of pattern indices instead, which is
+# what lets one bucket hold more. compile/set_sparse.go.
+#
+# Verified by the diagnostics rather than assumed: this fixture's one bucket
+# reports accept_kind "sparse", every other set fixture reports "bitmask".
+regexps:
+  - name: p0
+    pattern: 'SHARED[a-z]{2}00'
+  - name: p1
+    pattern: 'SHARED[a-z]{2}01'
+  - name: p2
+    pattern: 'SHARED[a-z]{2}02'
+  - name: p3
+    pattern: 'SHARED[a-z]{2}03'
+  - name: p4
+    pattern: 'SHARED[a-z]{2}04'
+  - name: p5
+    pattern: 'SHARED[a-z]{2}05'
+  - name: p6
+    pattern: 'SHARED[a-z]{2}06'
+  - name: p7
+    pattern: 'SHARED[a-z]{2}07'
+  - name: p8
+    pattern: 'SHARED[a-z]{2}08'
+  - name: p9
+    pattern: 'SHARED[a-z]{2}09'
+  - name: p10
+    pattern: 'SHARED[a-z]{2}10'
+  - name: p11
+    pattern: 'SHARED[a-z]{2}11'
+  - name: p12
+    pattern: 'SHARED[a-z]{2}12'
+  - name: p13
+    pattern: 'SHARED[a-z]{2}13'
+  - name: p14
+    pattern: 'SHARED[a-z]{2}14'
+  - name: p15
+    pattern: 'SHARED[a-z]{2}15'
+  - name: p16
+    pattern: 'SHARED[a-z]{2}16'
+  - name: p17
+    pattern: 'SHARED[a-z]{2}17'
+  - name: p18
+    pattern: 'SHARED[a-z]{2}18'
+  - name: p19
+    pattern: 'SHARED[a-z]{2}19'
+  - name: p20
+    pattern: 'SHARED[a-z]{2}20'
+  - name: p21
+    pattern: 'SHARED[a-z]{2}21'
+  - name: p22
+    pattern: 'SHARED[a-z]{2}22'
+  - name: p23
+    pattern: 'SHARED[a-z]{2}23'
+  - name: p24
+    pattern: 'SHARED[a-z]{2}24'
+  - name: p25
+    pattern: 'SHARED[a-z]{2}25'
+  - name: p26
+    pattern: 'SHARED[a-z]{2}26'
+  - name: p27
+    pattern: 'SHARED[a-z]{2}27'
+  - name: p28
+    pattern: 'SHARED[a-z]{2}28'
+  - name: p29
+    pattern: 'SHARED[a-z]{2}29'
+  - name: p30
+    pattern: 'SHARED[a-z]{2}30'
+  - name: p31
+    pattern: 'SHARED[a-z]{2}31'
+  - name: p32
+    pattern: 'SHARED[a-z]{2}32'
+  - name: p33
+    pattern: 'SHARED[a-z]{2}33'
+  - name: p34
+    pattern: 'SHARED[a-z]{2}34'
+  - name: p35
+    pattern: 'SHARED[a-z]{2}35'
+  - name: p36
+    pattern: 'SHARED[a-z]{2}36'
+  - name: p37
+    pattern: 'SHARED[a-z]{2}37'
+  - name: p38
+    pattern: 'SHARED[a-z]{2}38'
+  - name: p39
+    pattern: 'SHARED[a-z]{2}39'
+sets:
+  - name: s
+    find: s_find
+    patterns: all

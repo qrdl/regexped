@@ -1,0 +1,26 @@
+# Capability shape: `find` with overlapping: true — the every-start-position
+# enumeration rather than the default per-pattern non-overlapping gate. Same
+# signature as gated find; both take the caller-owned gate array, and the
+# overlapping body uses it as the home of its once-per-drive preflight verdict.
+regexps:
+  - name: p0
+    pattern: 'Aqr00'
+  - name: p1
+    pattern: 'Bqr01'
+  - name: p2
+    pattern: 'Cqr02'
+  - name: p3
+    pattern: 'Dqr03'
+  - name: p4
+    pattern: 'Eqr04'
+  - name: p5
+    pattern: 'Fqr05'
+  - name: p6
+    pattern: 'Gqr06'
+  - name: p7
+    pattern: 'Hqr07'
+sets:
+  - name: s
+    find: s_find
+    overlapping: true
+    patterns: all

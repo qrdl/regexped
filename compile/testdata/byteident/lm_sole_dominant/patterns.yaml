@@ -1,0 +1,21 @@
+# The LikelyMatch mid-accept dominant dispatch, which NO other single-pattern
+# fixture reaches: `prefer-match` appears only on the two SET fixtures
+# (set_member_skip, set_suffix_lm), so every emitter gated on LikelyMatch in a
+# single-pattern find body — detectShuftiSelfLoop's bare-prefix and wide-set
+# lifts, the mid channel in emitFindMidAcceptDispatch, and the Shufti
+# self-loop bulk skip it dispatches to — was pinned by nothing at all.
+#
+# `[a-zA-Z]{20,}` is the shape those emitters were tuned on (likelytest's
+# alpha-run). Under prefer-match its state 20 becomes a mid-accept dominant
+# with a 52-byte self-loop set, and it is the SOLE nonzero entry in
+# midAcceptBytes — the property that lets the dispatch skip caching the loaded
+# value and comparing it against the encoding, since a nonzero load can only be
+# that one state.
+#
+# Neutral compiles this pattern with no dominant at all, so this fixture and a
+# neutral build of the same pattern are deliberately different bodies; nothing
+# here should ever move on a change that claims to be neutral-only.
+regexps:
+  - pattern: '[a-zA-Z]{20,}'
+    find_func: lm_dominant_find
+    hints: [prefer-match]

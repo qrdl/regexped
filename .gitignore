@@ -55,4 +55,6 @@ tools/setperf/setperf
 tools/setperf/*.txt
 tools/fuzz/found
 tools/pattest/pattest
+tools/settest/settest
 tools/re2test/make_sets/make_sets
+tools/likelytest/*.txt

@@ -1,0 +1,48 @@
+# Set frontend: TEDDY — 17..64 literals with DIVERSE first bytes, nibble
+# fingerprint tables. Diversity is what distinguishes this from set_ac: the same
+# literal count with a shared first byte goes to Aho-Corasick instead.
+regexps:
+  - name: p0
+    pattern: 'Aqr00'
+  - name: p1
+    pattern: 'Bqr01'
+  - name: p2
+    pattern: 'Cqr02'
+  - name: p3
+    pattern: 'Dqr03'
+  - name: p4
+    pattern: 'Eqr04'
+  - name: p5
+    pattern: 'Fqr05'
+  - name: p6
+    pattern: 'Gqr06'
+  - name: p7
+    pattern: 'Hqr07'
+  - name: p8
+    pattern: 'Iqr08'
+  - name: p9
+    pattern: 'Jqr09'
+  - name: p10
+    pattern: 'Kqr10'
+  - name: p11
+    pattern: 'Lqr11'
+  - name: p12
+    pattern: 'Mqr12'
+  - name: p13
+    pattern: 'Nqr13'
+  - name: p14
+    pattern: 'Oqr14'
+  - name: p15
+    pattern: 'Pqr15'
+  - name: p16
+    pattern: 'Qqr16'
+  - name: p17
+    pattern: 'Rqr17'
+  - name: p18
+    pattern: 'Sqr18'
+  - name: p19
+    pattern: 'Tqr19'
+sets:
+  - name: s
+    find: s_find
+    patterns: all

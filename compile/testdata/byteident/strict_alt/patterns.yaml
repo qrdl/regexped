@@ -1,0 +1,7 @@
+# Strict alternation of lit-chain branches: every branch is a fixed literal
+# followed by a counted class run, so analyseLitChainAlt accepts it and
+# buildLitChainAltFindBody emits the body (locals: 3 i32 + 7 v128).
+# Distinct first bytes ('A', 'g') put two entries in the Teddy fingerprint.
+regexps:
+  - pattern: 'AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{20}'
+    find_func: strictalt_find

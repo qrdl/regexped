@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"testing"
 
-	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -78,6 +78,15 @@ func newCapRunner(t *testing.T, pats []string, input string, overlapping bool) *
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}
+	return newCapRunnerFrom(t, w, pats, input)
+}
+
+// newCapRunnerFrom instantiates an ALREADY-COMPILED capability module. It is
+// split out so a caller that had to build its module differently — see
+// TestSetShuftiFrontendAgainstOracle, which needs an option the YAML config
+// does not expose — gets the same memory layout and gate handling.
+func newCapRunnerFrom(t *testing.T, w []byte, pats []string, input string) *capRunner {
+	t.Helper()
 	store, inst, mem, release, err := instantiate(w)
 	if err != nil {
 		release()
@@ -295,90 +304,132 @@ var capCases = []struct {
 	{"alternation", []string{`(?:cat|car)+`, `t`}, []string{"catcar", "t", "carcat"}},
 }
 
+// allIDs calls a `_all` capability and returns the matching ids, hiding the
+// ABI split: at most 64 ids the answer is an i64 mask returned directly; past
+// that the callee fills a caller-owned BITMAP and returns a count. Both forms
+// exist in the emitters, and a test that knew only the narrow one could not
+// drive any set wide enough to select the Shufti frontend — which needs more
+// literals than Teddy accepts, so its id space is always past 64.
+func (r *capRunner) allIDs(t *testing.T, fn string, args ...interface{}) []int {
+	t.Helper()
+	if r.npat <= 64 {
+		return idsFromMask(uint64(r.call(t, fn, args...).(int64)), r.npat)
+	}
+	buf := r.mem.UnsafeData(r.store)
+	nbytes := (r.npat + 7) / 8
+	for i := 0; i < nbytes; i++ {
+		buf[int(r.outPtr)+i] = 0
+	}
+	count := int(r.call(t, fn, append(args, r.outPtr)...).(int32))
+	buf = r.mem.UnsafeData(r.store)
+	var got []int
+	for k := 0; k < r.npat; k++ {
+		if buf[int(r.outPtr)+k/8]&(1<<uint(k%8)) != 0 {
+			got = append(got, k)
+		}
+	}
+	if count != len(got) {
+		t.Errorf("%s: count = %d but bitmap holds %d ids (%v)", fn, count, len(got), got)
+	}
+	return got
+}
+
+// checkCapsAgainstOracle drives every capability of an instantiated set module
+// and compares each answer with a formula built from Go regexp.
+//
+// Extracted from TestSetCapabilitiesAgainstOracle so a second caller can reuse
+// it: TestSetShuftiFrontendAgainstOracle needs exactly these checks against a
+// module the YAML config cannot build. Duplicating them would have meant the
+// Shufti frontend was checked by a copy that could drift from the original.
+func checkCapsAgainstOracle(t *testing.T, r *capRunner, pats []string, input string) {
+	t.Helper()
+	n := int32(len(input))
+
+	// match: anchored, whole input.
+	wantAnchored := oracleAnchored(pats, input, nil)
+
+	// match_any: membership, never value equality.
+	gotAny := r.call(t, "cap_match_any", r.inBase, n).(int32)
+	if len(wantAnchored) == 0 {
+		if gotAny != -1 {
+			t.Fatalf("match_any = %d, want -1", gotAny)
+		}
+	} else if !containsInt(wantAnchored, int(gotAny)) {
+		t.Fatalf("match_any = %d, not among %v", gotAny, wantAnchored)
+	}
+
+	// match_all: exact set.
+	gotAll := r.allIDs(t, "cap_match_all", r.inBase, n)
+	if !eqIDs(append([]int(nil), wantAnchored...), gotAll) {
+		t.Fatalf("match_all = %v, want %v", gotAll, wantAnchored)
+	}
+
+	for from := 0; from <= len(input); from++ {
+		f := int32(from)
+
+		wantPos, wantIDs := oracleFirstPosition(pats, input, from, nil)
+
+		wantScanAll := oracleScanAll(pats, input, from, nil)
+
+		// scan_any reports a bare id and NO start, so the id
+		// may name any pattern matching
+		// anywhere at or after `from` — oracleScanAll's set, not
+		// oracleFirstPosition's. wantPos still decides -1: a set
+		// with a first position is a set with a match.
+		gotAny2 := r.call(t, "cap_scan_any", r.inBase, n, f).(int32)
+		if wantPos < 0 {
+			if gotAny2 != -1 {
+				t.Fatalf("scan_any(from=%d) = %d, want -1", from, gotAny2)
+			}
+		} else if !containsInt(wantScanAll, int(gotAny2)) {
+			t.Fatalf("scan_any(from=%d) id = %d, not among %v", from, gotAny2, wantScanAll)
+		}
+
+		gotScanAll := r.allIDs(t, "cap_scan_all", r.inBase, n, f)
+		if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
+			t.Fatalf("scan_all(from=%d) = %v, want %v", from, gotScanAll, wantScanAll)
+		}
+
+		// find: every tuple at the first matching position.
+		total := int(r.call(t, "cap_find", r.inBase, n, f, r.gatePtr, r.outPtr, int32(r.npat)).(int32))
+		if wantPos < 0 {
+			if total != 0 {
+				t.Fatalf("find(from=%d) = %d, want 0", from, total)
+			}
+			continue
+		}
+		if total != len(wantIDs) {
+			t.Fatalf("find(from=%d) total = %d, want %d (ids %v)", from, total, len(wantIDs), wantIDs)
+		}
+		buf := r.mem.UnsafeData(r.store)
+		var gotIDs []int
+		for i := 0; i < total; i++ {
+			base := int(r.outPtr) + i*12
+			id := int(int32(binary.LittleEndian.Uint32(buf[base:])))
+			st := int(int32(binary.LittleEndian.Uint32(buf[base+4:])))
+			en := int(int32(binary.LittleEndian.Uint32(buf[base+8:])))
+			if st != wantPos {
+				t.Fatalf("find(from=%d) tuple %d start = %d, want %d", from, i, st, wantPos)
+			}
+			wantEnd := anchoredExtent(pats[id], input, wantPos)
+			if en != wantEnd {
+				t.Fatalf("find(from=%d) pattern %d end = %d, want %d", from, id, en, wantEnd)
+			}
+			gotIDs = append(gotIDs, id)
+		}
+		if !eqIDs(append([]int(nil), wantIDs...), gotIDs) {
+			t.Fatalf("find(from=%d) ids = %v, want %v", from, gotIDs, wantIDs)
+		}
+	}
+}
+
 func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 	for _, tc := range capCases {
 		for _, input := range tc.inputs {
 			t.Run(tc.name+"/"+input, func(t *testing.T) {
 				r := newCapRunner(t, tc.pats, input, true)
 				defer r.Close()
-				n := int32(len(input))
-
-				// match: anchored, whole input.
-				wantAnchored := oracleAnchored(tc.pats, input, nil)
-
-				// match_any: membership, never value equality.
-				gotAny := r.call(t, "cap_match_any", r.inBase, n).(int32)
-				if len(wantAnchored) == 0 {
-					if gotAny != -1 {
-						t.Fatalf("match_any = %d, want -1", gotAny)
-					}
-				} else if !containsInt(wantAnchored, int(gotAny)) {
-					t.Fatalf("match_any = %d, not among %v", gotAny, wantAnchored)
-				}
-
-				// match_all: exact set.
-				gotAll := idsFromMask(uint64(r.call(t, "cap_match_all", r.inBase, n).(int64)), len(tc.pats))
-				if !eqIDs(append([]int(nil), wantAnchored...), gotAll) {
-					t.Fatalf("match_all = %v, want %v", gotAll, wantAnchored)
-				}
-
-				for from := 0; from <= len(input); from++ {
-					f := int32(from)
-
-					wantPos, wantIDs := oracleFirstPosition(tc.pats, input, from, nil)
-
-					wantScanAll := oracleScanAll(tc.pats, input, from, nil)
-
-					// scan_any reports a bare id and NO start, so the id
-					// may name any pattern matching
-					// anywhere at or after `from` — oracleScanAll's set, not
-					// oracleFirstPosition's. wantPos still decides -1: a set
-					// with a first position is a set with a match.
-					gotAny2 := r.call(t, "cap_scan_any", r.inBase, n, f).(int32)
-					if wantPos < 0 {
-						if gotAny2 != -1 {
-							t.Fatalf("scan_any(from=%d) = %d, want -1", from, gotAny2)
-						}
-					} else if !containsInt(wantScanAll, int(gotAny2)) {
-						t.Fatalf("scan_any(from=%d) id = %d, not among %v", from, gotAny2, wantScanAll)
-					}
-
-					gotScanAll := idsFromMask(uint64(r.call(t, "cap_scan_all", r.inBase, n, f).(int64)), len(tc.pats))
-					if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
-						t.Fatalf("scan_all(from=%d) = %v, want %v", from, gotScanAll, wantScanAll)
-					}
-
-					// find: every tuple at the first matching position.
-					total := int(r.call(t, "cap_find", r.inBase, n, f, r.gatePtr, r.outPtr, int32(r.npat)).(int32))
-					if wantPos < 0 {
-						if total != 0 {
-							t.Fatalf("find(from=%d) = %d, want 0", from, total)
-						}
-						continue
-					}
-					if total != len(wantIDs) {
-						t.Fatalf("find(from=%d) total = %d, want %d (ids %v)", from, total, len(wantIDs), wantIDs)
-					}
-					buf := r.mem.UnsafeData(r.store)
-					var gotIDs []int
-					for i := 0; i < total; i++ {
-						base := int(r.outPtr) + i*12
-						id := int(int32(binary.LittleEndian.Uint32(buf[base:])))
-						st := int(int32(binary.LittleEndian.Uint32(buf[base+4:])))
-						en := int(int32(binary.LittleEndian.Uint32(buf[base+8:])))
-						if st != wantPos {
-							t.Fatalf("find(from=%d) tuple %d start = %d, want %d", from, i, st, wantPos)
-						}
-						wantEnd := anchoredExtent(tc.pats[id], input, wantPos)
-						if en != wantEnd {
-							t.Fatalf("find(from=%d) pattern %d end = %d, want %d", from, id, en, wantEnd)
-						}
-						gotIDs = append(gotIDs, id)
-					}
-					if !eqIDs(append([]int(nil), wantIDs...), gotIDs) {
-						t.Fatalf("find(from=%d) ids = %v, want %v", from, gotIDs, wantIDs)
-					}
-				}
+				checkCapsAgainstOracle(t, r, tc.pats, input)
 			})
 		}
 	}

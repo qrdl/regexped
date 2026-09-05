@@ -3,7 +3,7 @@ package fuzz
 import (
 	"testing"
 
-	"github.com/bytecodealliance/wasmtime-go/v42"
+	"github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 )

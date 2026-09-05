@@ -37,14 +37,23 @@ regexped/
 │   │                          #   carrying an exported find's `from` position to the body,
 │   │                          #   the (ptr,len,from) wrapper that fronts every find, and
 │   │                          #   findFromMode — whose zero value is invalid, so a find
-│   │                          #   emitter that never claimed one is a BUILD failure
+│   │                          #   emitter that never claimed one is a BUILD failure.
+│   │                          #   emitFindFromSeed takes a scanCursor, NOT a local index —
+│   │                          #   see locals.go for why that distinction is load-bearing
+│   ├── locals.go              # Binding for internal/wlocals: the WASM local allocator and
+│   │                          #   the SEALED scan cursor. Emitters no longer write local
+│   │                          #   indices by hand; the declaration vector is generated from
+│   │                          #   the same allocation that hands out the indices, so the two
+│   │                          #   cannot disagree. Allocation order is declaration order and
+│   │                          #   same-type runs coalesce, which is what let the conversion
+│   │                          #   be proved byte-identical
 │   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
 │   ├── byte_rank.go           # Packed-pair set frontend: byte-rarity ranks, two-column probe selection (<=16 literals)
 │   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets.
 │   │                          #   Holds the THREE packers (binPack / compileFallback /
-│   │                          #   compileAnchoredBuckets) and the ONE G17 promotion policy they
+│   │                          #   compileAnchoredBuckets) and the ONE sparse-promotion policy they
 │   │                          #   share, promoteSparseBuckets + sparsePromotion. Placement and
 │   │                          #   ordering stay per-packer on purpose: the anchored one packs in
 │   │                          #   DECLARATION order (a bucket's bit k must map to a stable global
@@ -62,6 +71,17 @@ regexped/
 │   │                          #   and the hidden per-position worker (a find body with the batch gate
 │   │                          #   rule / skip parameter). Cursor field widths live in config/.
 │   ├── set_union_scan.go      # Start-anywhere union automaton: one pass over the whole input.
+│   │                          #   Under set-level prefer-no-match, emitUnionSkip strides 16
+│   │                          #   bytes at a time through a state's self-loop run. Exact, not
+│   │                          #   approximate: only NON-mid-accepting states qualify, so a run
+│   │                          #   has no effect but the position, and these bodies report no
+│   │                          #   position. It probes the EXIT set, never the self-loop set —
+│   │                          #   one nibble-table pair per 8 members makes a 230-byte
+│   │                          #   self-loop 29 pairs against the exit set's 4. The automaton
+│   │                          #   is NOT minimized, so the detector must treat a move to an
+│   │                          #   INDISTINGUISHABLE state as staying put (same rows AND same
+│   │                          #   accepts); without that the exit set is \w rather than [a-z]
+│   │                          #   and the win halves.
 │   │                          #   Serves scan_any/scan_all on literal-less sets, and PHASE 2 of the
 │ │ # two-phase split on MIXED sets. Table layout is
 │   │                          #   u8 state ids <=256 states, byte-class compressed over 32 KB.
@@ -79,7 +99,7 @@ regexped/
 │   ├── set_probe.go           # Bitmask-only bucket probes (scan + anchored flavours), genAnchoredWASM
 │   ├── set_caps.go            # ANCHORED bodies only (match_any/match_all) + the shared bit-recording
 │   │                          #   emitters and id-space helpers. The scan pair is NOT here — see set_emit.go.
-│   ├── set_sparse.go          # G17 sparse accept: per-state LISTS of pattern indices instead of a
+│   ├── set_sparse.go          # Sparse accept: per-state LISTS of pattern indices instead of a
 │   │                          #   u64 mask, which is what lets ONE bucket hold more than 32
 │   │                          #   patterns. Serves all three packers — shared-literal, fallback and
 │   │                          #   anchored. NOTHING on the candidate path may read an i32 mask as
@@ -100,8 +120,16 @@ regexped/
 ├── merge/
 │   └── merge.go               # WASM module merging with wasm-merge
 ├── internal/
-│   └── utils/
-│       └── bytes.go           # LEB128, page alignment, WasmMemTop
+│   ├── utils/
+│   │   └── bytes.go           # LEB128, page alignment, WasmMemTop
+│   └── wlocals/
+│       └── wlocals.go         # WASM local allocation + Cursor, the scan-start local a find
+│                              #   body seeds the find-from offset into. Cursor's fields are
+│                              #   unexported and the package exports no constructor, so
+│                              #   `compile` can only obtain one by ALLOCATING it — naming
+│                              #   some other local is not expressible. That defect (seed the
+│                              #   wrong local, module validates, from == 0 answers correctly,
+│                              #   `from` ignored for ever after) shipped twice before this
 ├── tools/
 │   ├── setperf/
 │   │   ├── main.go            # Cross-engine set comparison vs regex-automata (see Testing);
@@ -116,10 +144,15 @@ regexped/
 │   │   └── Makefile           # Builds harnesses, runs benchmarks
 │   ├── likelytest/
 │   │   ├── main.go            # LikelyMode 3-way benchmark matrix (see Testing below)
-│   │   └── Makefile           # Runs the matrix, captures baseline
-│   └── pattest/
-│       ├── main.go            # Single-pattern ad-hoc LikelyMode benchmarking CLI (see Testing below)
-│       └── Makefile           # Runs against a pattern/mode/input file; example targets
+│   │   └── Makefile           # Runs the matrix (`run`), the set cases only (`sets`), captures baseline
+│   ├── pattest/
+│   │   ├── main.go            # Single-pattern ad-hoc LikelyMode benchmarking CLI (see Testing below)
+│   │   └── Makefile           # Runs against a pattern/mode/input file; example targets
+│   └── settest/
+│       ├── main.go            # Single-SET ad-hoc hint benchmarking CLI (see Testing below);
+│       │                      #   takes the set from a YAML config, drives any of the five
+│       │                      #   capabilities, varies only the set-level `hints:`
+│       └── Makefile           # Runs against a config/capability/input file; example targets
 ├── docs/
 │   ├── cli.md                 # CLI reference: commands, flags, config schema
 │   ├── rust-api.md            # Generated Rust API: function signatures, iterators
@@ -136,7 +169,11 @@ regexped/
 │   ├── workers.md             # Cloudflare Workers integration
 │   ├── re2.md                 # RE2 test coverage
 │   ├── wasm.md                # WASM interface, memory layout, table formats
-│   └── sets.md                # Set composition: five capabilities, YAML schema, gate array, output formats
+│   ├── sets.md                # Set composition: five capabilities, YAML schema, gate array, output formats
+│   └── prefer-hints.md        # THE hints doc: the `hints:` values prefer-match /
+│                              #   prefer-no-match, which pattern and SET shapes each one
+│                              #   actually changes, and how to measure whether it helps
+│                              #   YOUR traffic before shipping it
 └── examples/
  ├──
     ├── Makefile
@@ -189,11 +226,16 @@ regexps:
     match_func:        "url_match"         # anchored match → Result<Option<usize>> / number|null (JS)
     find_func:         "url_find"          # non-anchored find → FindIter / generator (JS)
     groups_func:       "url_groups"        # anchored + captures → GroupsIter / generator (JS)
+    byte_mode:         false               # optional; runes 0x80-0xFF mean those BYTES
  # `named_groups_func:` is RETIRED and is a load error. It was
     # never a separate capability — both stubs called the SAME WASM export — so
     # `groups_func` carries names too, through generated index constants plus
     # `<func>_index` / `<func>_names` (an `<func>_indices` object in JS/TS).
 ```
+
+**`byte_mode:` and the unsupported-rune gate.** regexped is a BYTE engine — `.` consumes one byte, classes are byte classes, `\b` is ASCII — so a rune above U+007F has no byte to be. `compile/compile.go`'s `unsupportedRune` rejects a pattern naming one, with a message that names the rune and points at `byte_mode: true`; runes above U+00FF are rejected in BOTH modes with a message that does not suggest a flag which cannot help. `byte_mode: true` moves the limit to 0xFF and declares those runes to mean exactly those bytes, which is a capability that did not exist before 2026-09-01 (`[\x80-\xff]+` was rejected outright). The gate sits at the TOP of `compilePattern`, before any fast path — `compile()` alone missed the lit-chain family, lit-anchor and the alternation shapes, so acceptability would have depended on which emitter a pattern qualified for — and it therefore covers SET members too, since `CompileFile` calls `compilePattern` for every entry.
+
+TWO things stay byte-semantic by declaration, because no rule separates them from ordinary ASCII patterns: `.`/negated classes consume one byte, and case folding stays inside the byte range. The second one is not obvious: Go's parser expands `(?i)` over a class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F and U+212A — runes manufactured from its own ASCII `s` and `k`. A rune above the limit is therefore tolerated when it is a SimpleFold partner of an ASCII rune the same instruction names. Without that tolerance the gate rejects `(?i:[a-z]+)` and `(?i)^\s*SELECT\b`: measured over all four corpora, 8 rows of working, tested patterns. `CompileOptions.Unicode` is NOT Unicode support and never was — it is a compile-anyway bypass for tests, not reachable from YAML.
 
 Setting `groups_func` triggers capture-tracking compilation (TDFA or Backtracking engine).
 Setting only `match_func` and/or `find_func` strips captures from the pattern before compilation.
@@ -301,7 +343,7 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 
 **Every generated symbol keeps the config's own casing**. Go's PascalCase transform is gone — `match_func: url_match` yields `func url_match`, and if that leaves it unexported in a library package the generator warns once rather than renaming it. Symbols DERIVED from a func name follow its style too (`url_groups` → `url_groups_index`, `urlGroups` → `urlGroupsIndex`); symbols with no user name to inherit — `Span`, `SetMatch`, the error type, C's `rx_*_t` — keep their language's convention and can be prefixed with the optional `namespace:` key so two stubs can share one package.
 
-Because those values are also interpolated verbatim into generated source, `config.ValidateConfig` (`config/identifier.go`, called from `LoadConfig`) rejects any that is not `^[A-Za-z_][A-Za-z0-9_]*$` or is a reserved word in **any** of the six stub languages — `match` included, since the Rust generator emits `pub fn <func>` for the public wrapper. The check runs on the config-file path only, not inside `Compile`/`CompileFile`, so the internal harnesses (`tools/re2test`, `perftest`, `likelytest`, `pattest`, `tools/fuzz`) keep their bare `match`/`find`/`groups` names. See `docs/cli.md` "Export-name rules".
+Because those values are also interpolated verbatim into generated source, `config.ValidateConfig` (`config/identifier.go`, called from `LoadConfig`) rejects any that is not `^[A-Za-z_][A-Za-z0-9_]*$` or is a reserved word in **any** of the six stub languages — `match` included, since the Rust generator emits `pub fn <func>` for the public wrapper. The check runs on the config-file path only, not inside `Compile`/`CompileFile`, so the internal harnesses (`tools/re2test`, `perftest`, `likelytest`, `pattest`, `settest`, `tools/fuzz`) keep their bare `match`/`find`/`groups` names. See `docs/cli.md` "Export-name rules".
 
 **Rust stubs** (`generate/rust_stub.go`):
 
@@ -400,7 +442,7 @@ Each pattern is compiled and tested for:
 - Col 5: non-anchored find with captures (with --validate-groups)
 
 **Set mode (`make setcaps` / `make sets`)** drives EVERY capability over
-the corpus (task G15), not just gated `find`: the anchored
+the corpus, not just gated `find`: the anchored
 pair, the scan pair at many `offset` values, `find` and its batch entry in both the
 gated and `overlapping: true` configurations at capacities 1 and P, `find`
 through an under-sized buffer (`out_cap = 0` and the transactional-overflow
@@ -427,13 +469,23 @@ minutes for **7,712,525 checks**, which is why it is in `make test`;
 **`make setcaps-exhaustive`** is the same coverage over every chunk and takes
 hours. **Current: 0 failures.**
 
+**`make setcaps-likely`** is the same corpus under a non-neutral set-level
+hint (`--likelymatch` / `--likelynomatch`, which reach the set path as
+`hints:`), and it is in `make test` too. It exists because `setcaps` runs
+entirely NEUTRAL: until it was added, every hint-gated set emitter — the
+Shufti self-loop channels in bucket suffix bodies, the union scan's SIMD
+stride, the widened Shufti band, the counted-chain packer split, the forced-Shufti
+frontend — had **no correctness gate at all**. It compiles genuinely
+different bodies from the ones `setcaps` checks, at 9,410,470 checks / 0
+failures.
+
 `custom-sets.txt` adds hand-picked blocks whose expectations are REGENERATED
 from Go (`go run ./make_sets custom-sets.txt`) rather than hand-maintained,
 which keeps them an independent oracle rather than a transcript of engine
 output. Its `SetG15*` blocks are the permanent regressions for
  plus other hand-picked shapes.
 
-**`make set-batch`** is the pre-G15 shape, kept because it is the only
+**`make set-batch`** is the older single-set-per-block shape, kept because it is the only
 configuration that compiles sets of several thousand patterns: ONE set per
 corpus block, gated `find` and then its batch entry at a buffer capacity of ONE,
 so every multi-match position splits and the corpus becomes a check of the
@@ -445,16 +497,39 @@ A pattern the compiler legitimately drops from a set (fallback suffix DFA over
 `state_limit_dropped`) is excluded from the comparison and counted separately,
 so a documented exclusion cannot pass for either a pass or a failure.
 
+### The find-from invariant (`tools/fuzz/find_from_property_test.go`)
+
+```bash
+go test ./tools/fuzz -run TestFindFrom
+```
+
+Drives `find` at EVERY start position over a shape corpus, against an oracle
+built from whole-input anchored probes (`\A(?s:.{s})(?:pat)` — the same
+technique re2test's set mode uses, so left-context assertions see the real
+preceding byte). Three tests: the invariant itself (`find(I, f)` is the
+leftmost match starting at or after `f`, never before it), the host-iteration
+property (the stub advance rule `off += (end - off) or 1` must terminate — a
+returned start before `from` sends it backwards, which is a hang rather than a
+wrong answer), and a coverage check that the corpus still reaches at least ten
+distinct find bodies, fingerprinted by their locals declarations.
+
+The naive oracle is WRONG and wrongly failed two shapes when this was written:
+`FindAllStringIndex` reports non-overlapping matches from a left-to-right scan,
+so it never reports `[15,28)` for `[a-z]+@example\.com` over
+`"...bb@example.com..."` — but a find starting at 15 must.
+
 ### Byte-identical fixtures (`compile/testdata/byteident/`)
 
 ```bash
 make byteident   # from repo root
 ```
 
-Fifteen configs, one per single-pattern code path, each checked in with the
-exact bytes it compiles to and compared byte for byte. This is the regression
+Nineteen single-pattern configs, one per code path, plus nine SET configs
+spanning four frontends, both accept representations and all five
+capabilities — each checked in with the exact bytes it compiles to and
+compared byte for byte. This is the regression
 net for any change that touches a shared emitter: single-pattern output is
-supposed to be unaffected by set work ( D6), and byte identity is
+supposed to be unaffected by set work, and byte identity is
 the only evidence strong enough for "unaffected". See the README there before
 adding a path.
 
@@ -494,6 +569,19 @@ implementation to check against.
 WASM instructions, and Rust→WASM codegen differs structurally from our
 hand-emitted WASM. Track the ratio, never a single absolute number.
 
+**A third classchain corpus was ADDED 2026-09-01: `no-match exit-sparse
+100KB`** (`corpusExitSparse`, 100 KB with no lowercase byte). It exists because
+the board could not see `prefer-no-match` at all: classchain is the only
+literal-less family and so the only one reaching the union scan, but its two
+existing corpora are both DENSE in the exit set `[a-z]`, so `emitUnionSkip`
+probed and never skipped and every hinted row reported only the stride's guard
+cost. The new row measures −75% to −77.5% on the scan pair, reproducing
+likelytest's −74% independently; the guard-cost rows remain, so the board now
+shows both sides of the trade. `assertExitSparse` hard-errors unless the corpus
+matches no pattern in the family AND stays under 1% lowercase — the no-match
+counterpart of `sampleNeedles`' default arm. **It adds 16 rows, so the
+committed fuel/size baselines are short until `make baseline` is re-run.**
+
 **Two corpus fixes have invalidated cross-date comparisons.**
 
 The `sharedsuffix-32` and `diverse-32` "sparse" corpora matched NOTHING until
@@ -525,8 +613,8 @@ cheaper than its `scan_all` — so the same engine work wins comfortably against
 one of their capabilities and just misses the other.
 
 Everything else wins. The three literal-less rows — once the evidence for
-"every win comes from the literal frontends" — were closed by G10-G14;
-G16's first-byte eligibility mask took greedy-3's no-match `find` from 251 to 94
+"every win comes from the literal frontends" — were closed over 2026-08;
+the first-byte eligibility mask took greedy-3's no-match `find` from 251 to 94
 fuel/byte; and then removed a 64-id ELIGIBILITY ceiling that
 had been dropping wide literal-less sets onto the per-position walk, taking
 classchain-128's scan rows 17,171,467 → 2,227,464 fuel (7.7x) and making the
@@ -553,6 +641,13 @@ swings up to +137% between runs of literally the same bytes on sub-microsecond c
 Debugging env vars: `LIKELYTEST_FILTER=<substring>` runs only matching test cases;
 `DEBUG_STATS=1` prints p50/p90/p99/mean side by side per measurement.
 
+Eight of the cases are SETS (`mode: modeSet`) rather than single patterns, compiled
+through `CompileFile` with `cfg.Sets` and driven over `find`, `scan_any` or `scan_all`.
+`make sets` (the `-sets` flag) runs those alone; it selects on the case's MODE, not on
+its name, so a set case is free to be named for the shape it measures
+(`dense-set-shared-prefix`) rather than carrying a prefix for a filter's benefit. It
+composes with `LIKELYTEST_FILTER`.
+
 ### Single-pattern ad-hoc benchmarking (`tools/pattest/`)
 
 ```bash
@@ -566,6 +661,36 @@ measurement) and average wall-clock time (100,000 iterations) per mode per bucke
 this for quick, targeted investigation of a specific pattern shape rather than
 `likelytest`'s fixed curated set. `make example-lm` / `make example-lnm` /
 `make example-combined` run pre-built demonstration patterns.
+
+### Single-set ad-hoc hint benchmarking (`tools/settest/`)
+
+```bash
+make run ARGS="-config myset.yaml -cap find -inputs myinputs.txt"   # from tools/settest/
+```
+
+`pattest` for SETS, and the tool to reach for when the set is the user's own rather than
+a fixture. `-config` takes the same YAML `regexped compile` reads — patterns, selector,
+declared capabilities, `overlapping:` and all — so the set under test is the set that
+would ship; settest compiles it three times varying ONLY the set-level `hints:`, and
+drives any one of the five capabilities (`-cap`, optional when the set declares one).
+
+It answers "can this set benefit from a hint" in three layers, cheapest first: whether
+the hint changed the module at all (a byte-identical build is a definitive no and is not
+measured), what it changed (a per-mode `SetDiag` row — frontend, scan body, anchored
+body, buckets — since a body selection is invisible everywhere else and is usually the
+whole story), and whether it paid (fuel and p50 per bucket). Inputs are bucketed
+matching/non-matching by a Go stdlib oracle built from the patterns the set ACTUALLY
+contains — a compiler-dropped pattern is excluded and warned about — and the driven
+export is checked against that oracle before anything is measured, since a mis-driven
+ABI measures the wrong work entirely.
+
+The `_all` bitmask-vs-bitmap ABI is read off the function's TYPE, not predicted from the
+pattern count, because a Backtracking member selects the wide form at any width.
+`-force-frontend` mirrors `setperf`'s knob and additionally accepts `shufti`, which is
+not a chooser verdict but a simulated Aho-Corasick decline (`ACBudgetBytes: 1`) — the
+frontend column reports what actually shipped. `make example-lnm` / `make example-shufti`
+run pre-built demonstrations of a real `prefer-no-match` win. See
+`tools/settest/README.md`.
 
 ## Memory Layout
 
@@ -635,10 +760,9 @@ conservative ("the detector is wrong, this pattern is clearly
 deterministic, it should reach TDFA"). They are deliberately kept.
 Relaxing them has been tried and **caused measurable performance
 regressions**. Always measure per-byte fuel on representative patterns
-before removing or weakening any gate. See "Gap I"
-for the full diagnosis.
+before removing or weakening any gate. The full diagnosis is below.
 
-### `hasAmbiguousCaptures` / `getFirstRuneSet` for inverted classes (Gap I)
+### `hasAmbiguousCaptures` / `getFirstRuneSet` for inverted classes
 
 `getFirstRuneSet` in [compile/selector.go](compile/selector.go) returns
 false on InstRune instructions whose Unicode range exceeds 256
@@ -652,7 +776,7 @@ treats them as ambiguous and routes the patterns to Backtracking.
 - **Before:** patterns like `<([^>]+)>`, `([^,]+),`, `KEY=([^&]+)&`
   compile to BT. BT captureBody costs ~40 fuel/byte for these
   patterns (deterministic in practice, no actual backtracking).
-- **After (Gap I fix applied):** patterns reach TDFA cleanly, captures
+- **After the relaxation was applied:** patterns reach TDFA cleanly, captures
   correct under re2 `--validate-groups`. TDFA captureBody costs ~77
   fuel/byte. Measured regressions: `<([^>]+)>` neutral +73%, LM +466%,
   WASM size +69%.
@@ -709,17 +833,21 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 - **Go 1.25.9+**
 - **gopkg.in/yaml.v3** — YAML parsing
-- **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (`tools/re2test`, `tools/likelytest`, `tools/pattest`, `tools/perftest`, `tools/setperf`, `tools/fuzz` only — not a dependency of the compiler itself)
+- **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (`tools/re2test`, `tools/likelytest`, `tools/pattest`, `tools/settest`, `tools/perftest`, `tools/setperf`, `tools/fuzz` only — not a dependency of the compiler itself)
 - **regex-automata** (Rust, `tools/perftest/regex_bench`) — the cross-engine comparison and correctness target for `tools/setperf`
 - **wasm-merge** (external, Binaryen) — for `merge` command and `tools/perftest`
 
 ---
 
 **Last Updated:** 2026-08-24
-**CLI commands:** `generate` (stubs), `compile`, `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand.
-**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition)
+**CLI commands:** `generate` (stubs), `compile`, `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
+**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 
-**Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body), scalar.
+**Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body; reachable ONLY from the scalar branch, i.e. after AC declines over its 512 KB budget — first-byte union 17..64, or up to 128 under set-level `prefer-no-match`), scalar. The crossovers between them were re-measured on a match-dense corpus in 2026-08-31 and did NOT move: the chooser picks the winning frontend in all 20 rows of both corpora, so none of them is hint-conditional. `CompileSetOptions.WithForcedFrontend` + `setperf -force-frontend` are the test-only knobs that ask the question again.
+
+**Set hint-gated emission** (all set-level, `sets:` → `hints:`; gated by `make setcaps-likely`, since plain `make setcaps` runs entirely neutral): `prefer-match` gives bucket SUFFIX bodies the three Shufti self-loop channels via `genSuffixWASM`'s `LikelyMode` parameter (a suffix DFA has an empty `l.prefix` by construction, which used to make `detectShuftiSelfLoop` refuse every set body outright), keeps counted-chain patterns in singleton buckets, and turns on the **member self-loop skip** in SPARSE bucket bodies; `prefer-no-match` turns on the union scan's SIMD stride (`emitUnionSkip`) and the widened Shufti band.
+
+**Member self-loop skip** (`compile/set_sparse.go`, sparse bucket bodies, `prefer-match` only). While the walk sits in a state its accept list cannot change, so a run of bytes that all self-loop moves nothing but the position — and `record` may fire ONCE at the end of the run instead of once per byte. Worth **−80%** of the bucket's fuel on a shared-literal family with long self-loop tails, and **+1.6%** on the same family with no runs to stride over, which is why it is hinted rather than default. That +1.6% was +26%, then +9%, and the two reductions attack DIFFERENT costs. The first is a per-state stale flag in the body's scratch, set when an attempt advances nothing and cleared when one advances; it bounds the WASTED ATTEMPT. It has to be per STATE and it has to live in SCRATCH — the body is called once per CANDIDATE, so a local resets before any streak accumulates (a local counter measured +33%, worse than none), and one flag shared across a bucket's dozens of eligible states lets one failing state silence the rest (win collapsed −80% → +5%). The second is that the walk is emitted TWICE, with the member dispatch and without, and chosen between at entry on a per-BUCKET verdict byte: what the stale flags cannot bound is the DISPATCH — a `memberTab[state]` load, a tee and a branch at every byte of every candidate — which on one-byte tails is the entire remaining cost, ~54 fuel per call with not one attempt executing. The no-dispatch copy is byte-for-byte the walk a neutral bucket emits, so a bucket whose skip is not paying costs exactly what not having the feature costs. BOTH escapes RE-PROBE rather than latch, because scratch survives calls and drives: a latch would let one run-free input disable the skip for every later run-heavy one. The per-state flag re-probes on `lPos & 63 == 0`; the per-bucket verdict re-probes on `lPos & 31 == 0`, the CANDIDATE POSITION rather than a call counter, because a counter must be loaded, incremented and stored on the very path the verdict exists to make cheap and measured as two thirds of what was left. The verdict counts states DISPATCHED to, not attempts made — attempts are already suppressed by the stale flags, so counting them reads as "nothing to judge" and clears the verdict every call. Per state, `memberTab[state]` gives a set id and `memberSets[id]` two nibble-table pairs, EXACT — one bit per distinct nibble ROW (see `buildShuftiPairs`), so two pairs cover a set of ANY width and the former 16-byte ceiling is gone; a `[^\n]+` tail is now served, and served exactly. The pair count is fixed because the set is chosen at RUNTIME and the emitted code shape cannot vary per state. The correctness argument rests on `record` stamping the position (last write wins) and its first-timer bookkeeping being idempotent behind `seen`; both are pinned by tests, because breaking either makes every skipped run report the wrong extent silently. A bucket with no eligible state emits no dispatch at all, so it pays nothing. `--diag-json` reports `member_skip_states` / `member_skip_sets` — the skip is otherwise invisible, and an invisible mechanism is one that stops working quietly.
 
 **Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, all logic inside WASM)

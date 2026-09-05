@@ -1,6 +1,10 @@
 package compile
 
-import "github.com/qrdl/regexped/internal/utils"
+import (
+	"fmt"
+
+	"github.com/qrdl/regexped/internal/utils"
+)
 
 // emitShuftiPrefixCheck emits a SIMD byte-set-membership test (Shufti)
 // against the 16-byte chunk currently in `chunkLocal`. Leaves an i32
@@ -9,20 +13,17 @@ import "github.com/qrdl/regexped/internal/utils"
 //
 // Used by `EmitPrefixScan` (LNM Action 3) as the SIMD strategy for
 // first-byte sets of 9..64 bytes, replacing the older multi-eq emission
-// that did 4×N ops/chunk. Shufti does ~8 SIMD ops per half-of-8-bytes,
-// scaling sub-linearly with N.
+// that did 4×N ops/chunk.
 //
-// Encoding (one half, ≤ 8 bytes):
-//
-//	for i, b := range half {
-//	  bit := byte(1) << i              // each set member gets a unique bit position
-//	  T_lo[b & 0x0F] |= bit            // mark low nibble
-//	  T_hi[b >> 4]   |= bit            // mark high nibble
-//	}
+// Encoding: see buildShuftiPairs. Bytes are grouped by HIGH NIBBLE and one
+// bit is spent per distinct low-nibble row, not per set member, so the
+// emission is at most TWO (T_lo, T_hi) pairs — 13 SIMD ops each — for any
+// set whatsoever. The older one-bit-per-member scheme needed ceil(N/8)
+// pairs: 7 for `[a-zA-Z]`, 12 for `[!-~]`, and every wasted probe or
+// skip attempt paid all of them.
 //
 // For each lane: `T_lo[chunk_lo] & T_hi[chunk_hi]` is non-zero iff the
-// chunk byte's (lo, hi) nibble pair matches a set member's. Across
-// multiple halves of ≤ 8 each, we OR the per-half results.
+// chunk byte is a member. Across multiple pairs we OR the per-pair results.
 //
 // Final reduction:
 //
@@ -36,37 +37,103 @@ import "github.com/qrdl/regexped/internal/utils"
 //
 // Pre-conditions:
 //   - `chunkLocal` is a v128 local holding the input bytes for the chunk.
-//   - `firstByteSet` has 1..64 distinct bytes; the upper bound matches
-//     EmitPrefixScan's `useSIMD` gate. (More than 8 just means more halves;
-//     more than 64 falls through to scalar.)
+//   - `firstByteSet` has 1..256 distinct bytes. EmitPrefixScan's `useSIMD`
+//     gate stops at 64 (128 under LikelyNoMatch) for reasons of its own;
+//     the emission itself has no upper bound, since 16 high nibbles cannot
+//     produce more than 16 distinct rows and therefore never more than two
+//     pairs.
 //
 // Post-conditions:
 //   - i32 bitmask on top of stack.
 //   - `chunkLocal` unchanged.
 //   - No other locals written.
+//
+// Shufti first-byte band. Below the first bound the static rarity model
+// decides; between the two, only a LikelyNoMatch caller that can also supply
+// the dense switch gets it.
+const (
+	maxShuftiFirstBytes    = 64
+	maxShuftiFirstBytesLNM = 128
+)
+
+// shuftiPrefixPlan is the SINGLE authority on whether the prefix scan emits a
+// Shufti membership check for a first-byte set, and whether that emission
+// needs the adaptive dense switch.
+//
+// It exists because this decision used to be stated in four places — the
+// emission site below, plus three independent local-reservation sites
+// (`numV128ForScan` and `needsDenseSwitch` in engine_dfa.go, `numV128Locals`
+// in engine_backtrack.go). When they disagree the module does not merely
+// answer wrongly, it FAILS WASM VALIDATION with "expected i32, found v128",
+// because the emitter uses a v128 local the caller never declared. That has
+// already happened once: engine_backtrack.go's copy sat at 16 after this band
+// was widened to 64, and its comment still records the symptom.
+//
+// Callers pass canAdapt = "I have reserved the two i32 locals the dense
+// switch needs". It is a REQUIREMENT above maxShuftiFirstBytes, not a
+// preference: past 64 the static rarity model is not consulted at all — it
+// was calibrated inside the narrow band and asking it about a 94-byte set is
+// asking a question it was never fitted for — so the wide band is
+// force-plus-adapt, exactly as the set frontend's equivalent widening is, and
+// the runtime counter is the only thing bounding a wrong assertion. A caller
+// that cannot adapt therefore stays at 64 rather than being forced blind.
+//
+// Only meaningful for n > 16; smaller sets take the multi-eq SIMD strategy,
+// which is a different shape and is decided by its own bound.
+func shuftiPrefixPlan(firstByteSet []byte, likelyNoMatch, canAdapt bool) (useShufti, wantDenseSwitch bool) {
+	n := len(firstByteSet)
+	switch {
+	case n <= 16:
+		return false, false
+	case n <= maxShuftiFirstBytes:
+		rare := shuftiBeatsScalar(firstByteSet)
+		if likelyNoMatch {
+			return true, !rare && canAdapt
+		}
+		return rare, false
+	case likelyNoMatch && canAdapt && n <= maxShuftiFirstBytesLNM:
+		return true, true
+	}
+	return false, false
+}
+
 func emitShuftiPrefixCheck(b []byte, firstByteSet []byte, chunkLocal byte) []byte {
+	return emitShuftiMask(b, firstByteSet, chunkLocal, false)
+}
+
+// emitShuftiStopMask is emitShuftiPrefixCheck with the opposite polarity: bit k
+// is set when lane k is NOT a member of the set.
+//
+// The bulk skips want exactly this — they advance to the first byte that leaves
+// the self-loop class — and used to get it by taking the member mask and
+// following it with `i32.const 0xFFFF; i32.xor`. Comparing the merged lanes
+// against zero with i8x16.eq instead of i8x16.ne produces it directly, and
+// i8x16.bitmask zero-extends the upper 16 bits, so the xor was never doing
+// anything the compare could not. Two instructions per attempt and per
+// productive 16-byte lap, in every bulk skip in the compiler.
+func emitShuftiStopMask(b []byte, set []byte, chunkLocal byte) []byte {
+	return emitShuftiMask(b, set, chunkLocal, true)
+}
+
+// emitShuftiMask is the shared body. stop=false leaves a member mask (bit k set
+// ⇔ lane k IS in the set); stop=true leaves its complement over the 16 relevant
+// lanes. The nibble-table emission is identical either way — only the final
+// comparison against zero differs — so the two polarities cannot drift apart in
+// the table construction, which is the part that has to be exact.
+func emitShuftiMask(b []byte, firstByteSet []byte, chunkLocal byte, stop bool) []byte {
 	if len(firstByteSet) == 0 {
-		// No candidates — push 0 onto stack as a trivial bitmask.
+		// No candidates — push a trivial bitmask. With stop polarity every lane
+		// is a non-member, so the honest constant is 0xFFFF rather than 0.
 		// (Caller's useSIMD gate makes this unreachable in practice.)
+		if stop {
+			b = append(b, 0x41)
+			return utils.AppendSLEB128(b, int32(0xFFFF))
+		}
 		return append(b, 0x41, 0x00)
 	}
 
-	halves := (len(firstByteSet) + 7) / 8 // ceil(N/8)
-	for h := 0; h < halves; h++ {
-		start := h * 8
-		end := start + 8
-		if end > len(firstByteSet) {
-			end = len(firstByteSet)
-		}
-		half := firstByteSet[start:end]
-
-		// Build the per-half nibble tables.
-		var tLo, tHi [16]byte
-		for i, fb := range half {
-			bit := byte(1) << uint(i)
-			tLo[fb&0x0F] |= bit
-			tHi[fb>>4] |= bit
-		}
+	for i, pair := range buildShuftiPairs(firstByteSet) {
+		tLo, tHi := pair[0], pair[1]
 
 		// swizzle(T_lo, chunk & 0x0F)
 		b = append(b, 0xFD, 0x0C) // v128.const
@@ -85,21 +152,89 @@ func emitShuftiPrefixCheck(b []byte, firstByteSet []byte, chunkLocal byte) []byt
 		b = append(b, 0xFD, 0x6D) // i8x16.shr_u → chunk >> 4
 		b = append(b, 0xFD, 0x0E) // i8x16.swizzle → T_hi[chunk >> 4]
 
-		// half_result = lo_bits & hi_bits
+		// pair_result = lo_bits & hi_bits
 		b = append(b, 0xFD, 0x4E) // v128.and
 
-		if h > 0 {
-			// merged = merged | half_result
+		if i > 0 {
+			// merged = merged | pair_result
 			b = append(b, 0xFD, 0x50) // v128.or
 		}
 	}
 
-	// Reduce to i32 bitmask of non-zero lanes.
+	// Reduce to an i32 bitmask: lanes that matched (member polarity) or lanes
+	// that did not (stop polarity).
 	b = append(b, 0x41, 0x00) // i32.const 0
 	b = append(b, 0xFD, 0x0F) // i8x16.splat
-	b = append(b, 0xFD, 0x24) // i8x16.ne
+	if stop {
+		b = append(b, 0xFD, 0x23) // i8x16.eq → lane == 0, i.e. NOT a member
+	} else {
+		b = append(b, 0xFD, 0x24) // i8x16.ne → lane != 0, i.e. a member
+	}
 	b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
 	return b
+}
+
+// buildShuftiPairs returns the (T_lo, T_hi) nibble-table pairs that test
+// membership in `set` EXACTLY — no false positives, no false negatives —
+// using at most two pairs for any set of bytes whatsoever.
+//
+// The construction is a rectangle cover of the 16×16 nibble grid. Group the
+// set's bytes by high nibble; row h then holds a 16-bit low-nibble mask
+// rows[h]. Give every DISTINCT non-empty row mask one bit, eight bits to a
+// pair:
+//
+//	T_hi[h] = bit(group of rows[h])                  — one bit per non-empty row
+//	T_lo[l] = OR of bit(g) over groups g whose mask contains l
+//
+// A byte (h, l) survives `T_lo[l] & T_hi[h]` iff bit(group of rows[h]) is set
+// in T_lo[l], i.e. iff l ∈ rows[h], i.e. iff the byte is in the set. There
+// are only 16 rows, so there are at most 16 distinct masks and therefore at
+// most ceil(16/8) = 2 pairs — regardless of how many bytes the set holds.
+//
+// The scheme it replaced spent one bit per MEMBER, so it needed ceil(N/8)
+// pairs and 13 SIMD ops each: 7 pairs for `[a-zA-Z]`, 8 for `[a-zA-Z0-9_]`,
+// 12 for `[!-~]`. Every one of the classes this compiler meets in practice
+// is a handful of contiguous ranges, which is a handful of distinct rows, so
+// they all collapse to ONE pair here. That cost was paid per chunk by every
+// probe and every skip attempt, including the ones that bought nothing,
+// which is what made a wrong hint expensive rather than merely useless.
+//
+// Returns nil for an empty set; callers gate on that themselves.
+func buildShuftiPairs(set []byte) [][2][16]byte {
+	var rows [16]uint16
+	for _, c := range set {
+		rows[c>>4] |= 1 << (c & 0x0F)
+	}
+	// group identifies which pair a row mask was assigned to and which bit
+	// within it. Rows that share a mask share a bit — that is the whole point
+	// of the cover: `[a-z]`'s rows 6 and 7 differ, but `[ -~]`'s rows 2..6 are
+	// all "every low nibble" and cost one bit between them.
+	type group struct{ pair, bit int }
+	groups := make(map[uint16]group, 16)
+	var pairs [][2][16]byte
+	next := 0
+	for h := 0; h < 16; h++ {
+		mask := rows[h]
+		if mask == 0 {
+			continue
+		}
+		g, seen := groups[mask]
+		if !seen {
+			g = group{pair: next / 8, bit: next % 8}
+			groups[mask] = g
+			next++
+			for g.pair >= len(pairs) {
+				pairs = append(pairs, [2][16]byte{})
+			}
+			for l := 0; l < 16; l++ {
+				if mask&(1<<uint(l)) != 0 {
+					pairs[g.pair][0][l] |= 1 << uint(g.bit)
+				}
+			}
+		}
+		pairs[g.pair][1][h] |= 1 << uint(g.bit)
+	}
+	return pairs
 }
 
 // prefixScanLocals holds the WASM local variable indices used by emitPrefixScan.
@@ -125,11 +260,21 @@ type prefixScanLocals struct {
 	// 17..64-byte first-byte set). Callers that never hit that combination
 	// may leave these at their zero value.
 	//
-	// DenseCounter persists across attempts (outer-loop re-entries): it
-	// counts consecutive attempts where Shufti found a candidate in the
-	// very first chunk it loaded, i.e. gained no 16-byte skip. Once it
-	// crosses denseSwitchThreshold, the scan stops probing SIMD for the
-	// rest of this call and falls straight through to the scalar tail.
+	// DenseCounter persists across attempts (outer-loop re-entries): it is
+	// seeded to denseSwitchThreshold and counts DOWN once per attempt where
+	// Shufti found a candidate in the very first chunk it loaded, i.e. gained
+	// no 16-byte skip. At zero the scan stops probing SIMD for the rest of
+	// this call and falls straight through to the scalar tail.
+	//
+	// It counts down rather than up so that the per-attempt gate is
+	// `local.get n; if` — two instructions — instead of the four a
+	// `n < threshold` compare costs. That gate is executed on EVERY attempt
+	// for the whole remainder of a call once the switch has tripped, which on
+	// a 50 KB no-match prose buffer is ~40,000 attempts: the two instructions
+	// saved are the entire +3.0% that `prefer-no-match` cost against neutral
+	// on `[a-zA-Z]{20,}`. The seed is emitted with the locals (see
+	// buildFindBody's seedFindFrom), because a WASM local starts at zero and
+	// zero now means "stop".
 	// DenseSkipFlag is transient scratch reset at the top of each attempt's
 	// gated SIMD section, set when a "no candidate, advance 16" iteration
 	// runs, and read once a candidate is found to decide whether to bump or
@@ -137,8 +282,14 @@ type prefixScanLocals struct {
 	DenseCounter, DenseSkipFlag byte
 }
 
+// twinCallImmWidth is the reserved width of the handoff call's function-index
+// immediate. Five bytes is the maximum a u32 LEB128 can take, so the patch can
+// write any index without moving the bytes after it.
+const twinCallImmWidth = 5
+
 // denseSwitchThreshold is the number of consecutive no-skip Shufti attempts
-// that trip the adaptive switch to scalar. Chosen by
+// that trip the adaptive switch to scalar, and therefore the value
+// DenseCounter is seeded to and counts down from. Chosen by
 // initial measurement; see likelytest's alpha-run/word-run/deadskip-near-miss
 // cases for the workloads this tunes against.
 const denseSwitchThreshold int32 = 8
@@ -190,12 +341,21 @@ type prefixScanParams struct {
 	// is required for correctness, not just an optimisation choice.
 	AllowDenseSwitch bool
 
+	// HasTwin says a NEUTRAL twin body exists for this pattern, so the adaptive
+	// dense switch can hand off to it the moment its probe budget runs out
+	// instead of paying its own gate for the rest of the call.
+	HasTwin bool
+
 	Locals prefixScanLocals
 
 	// OnMatch is called after the scan finds a candidate and all scan blocks
 	// have closed. attempt_start holds the candidate position.
 	// Emits engine-specific setup code (e.g. DFA state/pos initialisation).
 	OnMatch func(b []byte) []byte
+
+	// Report, when non-nil, receives the strategy this scan actually chose,
+	// for `regexped compile --verbose`. Nil on every path but that flag.
+	Report *Reporter
 }
 
 // emitPrefixScan emits the WASM bytes for the prefix/firstByteFlags scan phase.
@@ -206,7 +366,20 @@ type prefixScanParams struct {
 // the prefix path).
 //
 // The caller is responsible for the surrounding $no_match/$outer blocks.
-func emitPrefixScan(b []byte, p prefixScanParams) []byte {
+// emitPrefixScan emits the scan and returns the body bytes plus the offset of
+// a twin-call immediate that still needs patching, or -1 when there is none.
+// See the handoff in the adaptive block for what that call is.
+func emitPrefixScan(b []byte, p prefixScanParams) ([]byte, int) {
+	b, patch := emitPrefixScanInner(b, p)
+	return b, patch
+}
+
+func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
+	twinCallPatch := -1
+	// The strategy is reported HERE, by the code that chooses it. Deriving it
+	// again at the call site would be a second implementation of this
+	// if/else — the mistake --verbose already made once with SelectEngine.
+	defer func() { p.Report.Note(p.strategyNote()) }()
 	l := p.Locals
 	ed := p.EngineDepth
 
@@ -405,16 +578,10 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 		if n := len(p.FirstByteSet); n > 0 {
 			if n <= 16 {
 				useSIMD = true
-			} else if n <= 64 {
-				rare := shuftiBeatsScalar(p.FirstByteSet)
-				if p.LikelyNoMatch {
-					useSIMD = true
-					// only adapt when overriding the static heuristic, and
-					// only when the caller has reserved real locals for it
-					adaptive = !rare && p.AllowDenseSwitch
-				} else if rare {
-					useSIMD = true
-				}
+			} else {
+				// One authority, shared with every site that reserves the
+				// locals this emission then uses — see shuftiPrefixPlan.
+				useSIMD, adaptive = shuftiPrefixPlan(p.FirstByteSet, p.LikelyNoMatch, p.AllowDenseSwitch)
 			}
 		}
 
@@ -464,13 +631,10 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 			b = append(b, 0x02, 0x40) // block $found_candidate (void)
 
 			if adaptive {
-				// DenseCounter < threshold? Else skip SIMD entirely
-				// for this attempt and fall straight through to the scalar
-				// tail below.
+				// Still probing? A non-zero DenseCounter says yes. Zero means
+				// the switch has tripped: skip SIMD entirely for this attempt
+				// and fall straight through to the scalar tail below.
 				b = append(b, 0x20, l.DenseCounter)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, denseSwitchThreshold)
-				b = append(b, 0x48)       // i32.lt_s
 				b = append(b, 0x04, 0x40) // if $dense_gate (void)
 				b = append(b, 0x41, 0x00)
 				b = append(b, 0x21, l.DenseSkipFlag) // reset per-attempt skip flag
@@ -624,10 +788,11 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 				b = append(b, 0x04, 0x40) // if (void)
 				b = append(b, 0x20, l.DenseCounter)
 				b = append(b, 0x41, 0x01)
-				b = append(b, 0x6A) // i32.add
+				b = append(b, 0x6B) // i32.sub — one probe of the budget spent
 				b = append(b, 0x21, l.DenseCounter)
-				b = append(b, 0x05) // else
-				b = append(b, 0x41, 0x00)
+				b = append(b, 0x05) // else — SIMD paid off: refill the budget
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, denseSwitchThreshold)
 				b = append(b, 0x21, l.DenseCounter)
 				b = append(b, 0x0B) // end if
 			}
@@ -660,6 +825,41 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 			b = append(b, 0x0B) // end loop $simd_outer
 			b = append(b, 0x0B) // end block $simd_exhausted
 			if adaptive {
+				if p.HasTwin {
+					// The probe budget is spent: this body's prefilter has
+					// proved itself useless on THIS input, and every remaining
+					// attempt would pay `local.get DenseCounter; if` for the
+					// rest of the call — ~40,000 of them on a 50 KB buffer,
+					// which is the whole margin by which prefer-no-match cost
+					// more than neutral.
+					//
+					// Hand the rest of the search to the neutral twin instead.
+					// The else arm is entered at most ONCE per call (the very
+					// first attempt after the trip) and costs nothing on any
+					// path that never trips, because the `if` is already here.
+					//
+					// Exactness: attempt_start has only ever advanced past
+					// positions this body proved cannot begin a match — including
+					// the skip-safe-on-dead jumps, which are proofs over a
+					// range — so a leftmost-first search from it returns the same
+					// answer as one from 0. The twin is ffNative and reads the
+					// WHOLE buffer, so \b and (?m:^) at that position are judged
+					// against the real preceding byte; the two bodies' modes are
+					// asserted equal where the twin is built.
+					b = append(b, 0x05) // else — DenseCounter == 0
+					b = append(b, 0x20, l.AttemptStart)
+					b = append(b, 0x24) // global.set $find_from
+					b = utils.AppendULEB128(b, findFromGlobalIdx)
+					b = append(b, 0x20, l.Ptr)
+					b = append(b, 0x20, l.Len)
+					// The twin's function index is not known until the module is
+					// assembled, so the immediate is five zero-padded LEB128
+					// bytes and its offset is reported to the caller to patch.
+					b = append(b, 0x10)
+					twinCallPatch = len(b)
+					b = utils.AppendPaddedULEB128(b, 0, twinCallImmWidth)
+					b = append(b, 0x0F) // return
+				}
 				b = append(b, 0x0B) // end if $dense_gate
 			}
 		}
@@ -715,5 +915,34 @@ func emitPrefixScan(b []byte, p prefixScanParams) []byte {
 	if p.OnMatch != nil {
 		b = p.OnMatch(b)
 	}
-	return b
+	return b, twinCallPatch
+}
+
+// strategyNote names the scan strategy these params select, in the words the
+// verbose report uses. It repeats the conditions immediately above rather than
+// observing them, which is a duplication worth flagging: if that if/else moves,
+// this must move with it. The alternative — threading a result out of the
+// emitter — costs a return value on a function called from fifteen sites for
+// output that is off by default.
+func (p prefixScanParams) strategyNote() string {
+	if len(p.Prefix) >= 1 {
+		if len(p.Prefix) <= 16 {
+			return fmt.Sprintf("prefix scan: hybrid SIMD, %d-byte prefix", len(p.Prefix))
+		}
+		return fmt.Sprintf("prefix scan: scalar (prefix %d bytes, over one chunk)", len(p.Prefix))
+	}
+	n := len(p.FirstByteSet)
+	switch {
+	case n == 0:
+		return "prefix scan: none"
+	case n <= 8 && p.TeddyTwoByte:
+		return "prefix scan: 2-byte Teddy"
+	case n <= 8:
+		return "prefix scan: 1-byte Teddy"
+	case n <= 16:
+		return "prefix scan: multi-eq SIMD"
+	case n <= 64:
+		return fmt.Sprintf("prefix scan: Shufti or scalar (%d first bytes)", n)
+	}
+	return fmt.Sprintf("prefix scan: scalar flag table (%d first bytes)", n)
 }

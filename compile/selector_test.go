@@ -177,10 +177,13 @@ func TestSelectEngineNonCapturePaths(t *testing.T) {
 		}
 	})
 	// Mixed ASCII+non-ASCII char class → HasUnicode=true in analysePattern → complexity="Unicode".
-	// [a-é] has hasASCII=true so needsUnicodeSupport returns false, but the last rune (0xe9) > 127
-	// sets analysis.HasUnicode=true.
+	// Compiled in BYTE MODE since 2026-09-01: the default mode now rejects a
+	// rune the pattern wrote above 127 (é is 0xE9), which is the FABLE B29
+	// leak this test used to depend on. Byte mode keeps the pattern legal —
+	// é means the single byte 0xE9 — so analysis.HasUnicode is still set and
+	// the selector path under test is unchanged.
 	t.Run("unicode", func(t *testing.T) {
-		got, err := SelectEngine("[a-é]+", CompileOptions{})
+		got, err := SelectEngine("[a-é]+", CompileOptions{ByteMode: true})
 		if err != nil {
 			t.Fatalf("SelectEngine: %v", err)
 		}
@@ -208,21 +211,29 @@ func TestIsAlternationDeterministicPaths(t *testing.T) {
 		pattern string
 		want    EngineType
 		note    string
+		opts    CompileOptions
 	}{
 		// Each branch in its own capture prevents prefix factoring, so both start with 'c'
 		// and getFirstRuneSet returns overlapping sets → not deterministic → BT.
-		{"((cat)|(car))", EngineBacktrack, "overlapping first rune"},
+		{"((cat)|(car))", EngineBacktrack, "overlapping first rune", CompileOptions{}},
 		// Left branch is empty capture (epsilon), right is rune 'a' → disjoint → TDFA-eligible.
-		{"(()|a)", EngineTDFA, "one epsilon branch"},
+		{"(()|a)", EngineTDFA, "one epsilon branch", CompileOptions{}},
 		// Both branches epsilon-accepting: () and (a?) both reach Match without consuming
 		// a byte → ambiguous → BT.
-		{"(()|(?:a?))", EngineBacktrack, "both epsilon branches"},
+		{"(()|(?:a?))", EngineBacktrack, "both epsilon branches", CompileOptions{}},
 		// Large char class >256 chars in left branch → getFirstRuneSet returns empty set
 		// → treated as undetermined → not deterministic → BT.
-		{"(([\x00-Ā])|(b))", EngineBacktrack, "large char class first rune set"},
+		//
+		// Ā is U+0100, so no mode can represent it and byte_mode would not
+		// help — the class has to be >256 codepoints for getFirstRuneSet to
+		// give up, which is the whole point of the case. `Unicode: true` is
+		// the compile-anyway bypass, used here to reach the SELECTOR with a
+		// pattern the gate would otherwise refuse.
+		{"(([\x00-Ā])|(b))", EngineBacktrack, "large char class first rune set",
+			CompileOptions{Unicode: true}},
 	}
 	for _, c := range cases {
-		got, err := SelectEngine(c.pattern, CompileOptions{})
+		got, err := SelectEngine(c.pattern, c.opts)
 		if err != nil {
 			t.Errorf("SelectEngine(%q) [%s]: %v", c.pattern, c.note, err)
 			continue
@@ -518,6 +529,73 @@ func TestSelectBestEngineWithTDFA_MatchesWrapper(t *testing.T) {
 		}
 		if o1.LeftmostFirst != o2.LeftmostFirst {
 			t.Errorf("%q: wrapper left LeftmostFirst=%v, direct left %v", pat, o1.LeftmostFirst, o2.LeftmostFirst)
+		}
+	}
+}
+
+// TestSelectorTDFALimitReasons pins which limit --verbose names when a capture
+// pattern is demoted to Backtracking. The two are reported from opposite sides
+// of one `ok` flag and were swapped: a register-limit pattern was told to raise
+// max_dfa_states (while its own report showed the state count comfortably under
+// that limit), and a state-limit pattern was told nothing at all, because the
+// branch was guarded on the non-nil table newTDFA does not return in that case.
+func TestSelectorTDFALimitReasons(t *testing.T) {
+	cases := []struct {
+		label, pattern     string
+		maxStates, maxRegs int
+		wantReason         string
+		wantLimit          string
+		unwantLimit        string
+	}{
+		{
+			label: "register limit", pattern: strings.Repeat("(x)", 25),
+			maxStates: 1024, maxRegs: 8,
+			wantReason: "TDFA register limit exceeded",
+			wantLimit:  "TDFA registers",
+			// The state count is not the reason and must not be quoted as it.
+			unwantLimit: "TDFA states",
+		},
+		{
+			label: "state limit", pattern: `((a|b|c)+(d|e)+(f|g)+)+`,
+			maxStates: 4, maxRegs: 64,
+			wantReason: "TDFA state limit exceeded",
+			// No table was built, so there is no count to report.
+			unwantLimit: "TDFA states",
+		},
+	}
+	for _, c := range cases {
+		re, err := syntax.Parse(c.pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", c.label, err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatalf("%s: compile: %v", c.label, err)
+		}
+		rep := &Reporter{}
+		rep.Begin(c.label, c.pattern)
+		eng, _ := selectBestEngineWithTDFA(prog, &CompileOptions{
+			Report: rep, MaxDFAStates: c.maxStates, MaxTDFARegs: c.maxRegs})
+		rep.End()
+		if eng != EngineBacktrack {
+			t.Fatalf("%s: engine = %v, want Backtracking", c.label, eng)
+		}
+		if len(rep.Patterns) != 1 {
+			t.Fatalf("%s: reported %d patterns, want 1", c.label, len(rep.Patterns))
+		}
+		got := rep.Patterns[0]
+		if got.Engine != EngineBacktrack {
+			t.Errorf("%s: reported engine = %v, want Backtracking", c.label, got.Engine)
+		}
+		if !strings.Contains(got.Reason, c.wantReason) {
+			t.Errorf("%s: reason = %q, want it to contain %q", c.label, got.Reason, c.wantReason)
+		}
+		limits := strings.Join(got.Limits, " | ")
+		if c.wantLimit != "" && !strings.Contains(limits, c.wantLimit) {
+			t.Errorf("%s: limits = %q, want a %q line", c.label, limits, c.wantLimit)
+		}
+		if c.unwantLimit != "" && strings.Contains(limits, c.unwantLimit) {
+			t.Errorf("%s: limits = %q, must not quote %q", c.label, limits, c.unwantLimit)
 		}
 	}
 }

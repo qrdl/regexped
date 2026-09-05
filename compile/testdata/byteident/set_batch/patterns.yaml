@@ -1,0 +1,27 @@
+# Capability shape: `hints: [batch-find]` — a SECOND entry point beside find
+# that fills the caller's buffer with several consecutive positions per call,
+# resumed through an opaque i64 cursor. Both entries are driven by ONE shared
+# per-position worker, so this pins that the batching set carries one set of
+# bucket code rather than two.
+regexps:
+  - name: p0
+    pattern: 'Aqr00'
+  - name: p1
+    pattern: 'Bqr01'
+  - name: p2
+    pattern: 'Cqr02'
+  - name: p3
+    pattern: 'Dqr03'
+  - name: p4
+    pattern: 'Eqr04'
+  - name: p5
+    pattern: 'Fqr05'
+  - name: p6
+    pattern: 'Gqr06'
+  - name: p7
+    pattern: 'Hqr07'
+sets:
+  - name: s
+    find: s_find
+    hints: [batch-find]
+    patterns: all

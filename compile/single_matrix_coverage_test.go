@@ -34,6 +34,10 @@ type singleCase struct {
 	hints               []string
 	maxDFAStates        int
 	maxTDFARegs         int
+	// byteMode compiles the pattern as byte-oriented (config's `byte_mode`).
+	// Needed by any case whose pattern names a byte above 127 — the default
+	// mode rejects those since 2026-09-01.
+	byteMode bool
 }
 
 func singleCases() []singleCase {
@@ -80,7 +84,10 @@ func singleCases() []singleCase {
 		},
 		{
 			name: "scalar-prologue", selects: "the scalar fallback prologue: too many first bytes to prefilter",
-			pattern: `[\x00-\xff]x`, find: true,
+			// Genuinely byte-oriented: the class IS every byte, which is what
+			// leaves the prologue with nothing to prefilter on. byte_mode is
+			// the declaration that `\xff` means the byte and not U+00FF.
+			pattern: `[\x00-\xff]x`, find: true, byteMode: true,
 		},
 		{
 			name: "lit-anchor", selects: "lit_anchor.go — SIMD literal scan plus a backward DFA for the start",
@@ -443,11 +450,128 @@ func singleCases() []singleCase {
 			name: "bt-window-groups-only", selects: "the same shapes with groups but NO find, which needs no window",
 			pattern: `x(\w+)\b`, groups: true,
 		},
+
+		// ── Shapes that stress the CONSTRUCTORS rather than the emitters ──
+		//
+		// newDFA's subset construction and newTDFA's register allocation both
+		// carry branches no ordinary pattern reaches: case-folded special
+		// runes in the NFA input map, the mid-start collision guards, and the
+		// scratch-register cycle break. They are reached by shape, not by
+		// capability, so they belong in this list rather than in a test of
+		// their own — every sweep over singleCases picks them up.
+		{
+			name: "fold-newline-class", selects: "case folding over a class containing NFA-special runes",
+			pattern: `(?i)[a-z\n]+END`, match: true, find: true,
+		},
+		{
+			name: "fold-word-boundary", selects: "case folding either side of a word boundary",
+			pattern: `(?i)\bKEY\b[a-z]*`, match: true, find: true,
+		},
+		{
+			name: "fold-kelvin", selects: "folds whose partners are the manufactured runes Go's parser adds",
+			pattern: `(?i:[a-z])+x`, match: true, find: true,
+		},
+		{
+			name: "boundary-both-starts", selects: "midStart and midStartWord reachable with the SAME NFA set",
+			pattern: `\B[a-z]+\b[0-9]`, match: true, find: true,
+		},
+		{
+			name: "nested-alt-captures", selects: "TDFA register copies that can form a cycle",
+			pattern: `((a)|(b))+((c)|(d))+`, groups: true,
+		},
+		{
+			name: "swapping-captures", selects: "capture registers whose live ranges cross, forcing sequentialized copies",
+			pattern: `(?:(a)(b))*(c)`, groups: true,
+		},
+		{
+			name: "deep-optional-captures", selects: "many optional groups, which widens the register map",
+			pattern: `(a)?(b)?(c)?(d)?(e)?(f)?z`, groups: true,
+		},
+		{
+			name: "alt-shared-prefix-captures", selects: "ambiguous alternation under captures — the TDFA eligibility gate",
+			pattern: `(abc|abd)(x|y)`, groups: true, find: true,
+		},
+
+		// ── Batch entry points ────────────────────────────────────────────
+		//
+		// `batch-find` adds a SECOND export beside find or groups, filling the
+		// caller's buffer with several matches per call and resuming through
+		// an opaque cursor. The groups form has two shapes — a native
+		// lit-chain capture body whose slots are already absolute, and a
+		// composed one whose slots are relative to a window and must be
+		// rebased per match — and the rebasing arm was reached by nothing.
+		{
+			name: "batch-find", selects: "the batch find wrapper beside a plain find",
+			pattern: `[a-z]+@example\.com`, find: true,
+			hints: []string{"batch-find"},
+		},
+		{
+			name: "batch-groups-composed", selects: "batch groups over a COMPOSED capture body — slots rebased per match",
+			pattern: `<([a-z]+)>`, groups: true, find: true,
+			hints: []string{"batch-find"},
+		},
+		{
+			name: "batch-groups-litchain", selects: "batch groups over a native lit-chain capture body",
+			pattern: `AKIA([A-Z0-9]{16})`, groups: true, find: true,
+			hints: []string{"batch-find"},
+		},
+		{
+			name: "batch-groups-bt", selects: "batch groups over a Backtracking capture body",
+			pattern: `(a.*?b)(c+)`, groups: true, find: true,
+			hints: []string{"batch-find"},
+		},
+		{
+			// The capture body is ffAnchoredZeroOnly, so its slots are
+			// RELATIVE to the ptr it was handed and every one of them has to
+			// be rebased by the match position before the record is written.
+			// That rebasing loop is the arm the composed and native shapes
+			// both skip.
+			name: "batch-groups-anchored", selects: "batch groups over an ANCHORED capture body — per-match slot rebasing",
+			pattern: `\AAKIA([A-Z0-9]{16})`, groups: true,
+			hints: []string{"batch-find"},
+		},
+		{
+			name: "batch-groups-anchored-alt", selects: "the same arm behind a caret rather than \\A",
+			pattern: `^abc([0-9]{4})`, groups: true,
+			hints: []string{"batch-find"},
+		},
+		// ── Teddy tiers ───────────────────────────────────────────────────
+		//
+		// The prefix scan checks up to FOUR byte positions at once with
+		// stacked nibble tables, and each extra tier is selected by its own
+		// validity walk over the transition table. The tiers need a small
+		// first-byte set and NO literal prefix — a literal takes the hybrid
+		// scan instead, which is why every literal-bearing case in this list
+		// misses them.
+		{
+			name: "teddy-four-tier-class", selects: "all four Teddy tiers over a class chain",
+			pattern: `[ab][cd][ef][gh]z`, match: true, find: true,
+		},
+		{
+			name: "teddy-four-tier-alt", selects: "the same tiers reached through an alternation of literals",
+			pattern: `(?:abcd|efgh|ijkl)X`, match: true, find: true,
+		},
+		{
+			name: "teddy-tier-boundary", selects: "a first-byte set at the 8-byte Teddy ceiling",
+			pattern: `[a-h]{4}END`, match: true, find: true,
+		},
+		{
+			name: "teddy-one-tier", selects: "a first-byte set with only ONE usable tier",
+			pattern: `ab|cd|ef`, match: true, find: true,
+		},
+		{
+			// startBeginAccept: the start state accepts on the BEGIN-of-text
+			// assertion alone, so a find must record an empty match at
+			// position 0 before consuming anything. The prologue emits an
+			// extra last_accept arm for it that no other shape reaches.
+			name: "start-begin-accept", selects: "a start state accepting via ecBegin only",
+			pattern: `a*^`, match: true, find: true,
+		},
 	}
 }
 
 func (c singleCase) build() config.BuildConfig {
-	entry := config.RegexEntry{Name: "p", Pattern: c.pattern, Hints: c.hints}
+	entry := config.RegexEntry{Name: "p", Pattern: c.pattern, Hints: c.hints, ByteMode: c.byteMode}
 	if c.match {
 		entry.MatchFunc = "p_match"
 	}
@@ -496,6 +620,162 @@ func TestSingleMatrixCompiles(t *testing.T) {
 	}
 }
 
+// TestSingleMatrixCompilesUnderHints runs the same matrix under both compile
+// hints.
+//
+// Every hint-gated emitter in the package — the dominant self-loop channels,
+// the wide and bare Shufti lifts, the adaptive dense switch and its neutral
+// twin, the chain-start probe — is selected by a LikelyMode the matrix above
+// never sets, so a shape that compiles cleanly neutral and panics under a hint
+// was invisible here. The corpus catches wrong ANSWERS; this catches a body
+// that cannot be built at all, on shapes chosen to span the emitters.
+func TestSingleMatrixCompilesUnderHints(t *testing.T) {
+	modes := []struct {
+		name string
+		mode LikelyMode
+	}{
+		{"prefer-match", LikelyMatch},
+		{"prefer-no-match", LikelyNoMatch},
+	}
+	for _, c := range singleCases() {
+		for _, m := range modes {
+			t.Run(c.name+"/"+m.name, func(t *testing.T) {
+				cfg := c.build()
+				for _, standalone := range []bool{true, false} {
+					wasm, _, err := Compile(cfg.Regexps, 65536, standalone,
+						CompileOptions{LikelyMode: m.mode})
+					if err != nil {
+						t.Fatalf("%s (selects %s), standalone=%v: %v",
+							c.name, c.selects, standalone, err)
+					}
+					if len(wasm) < 8 || string(wasm[:4]) != "\x00asm" {
+						t.Fatalf("%s: not a WASM module (%d bytes)", c.name, len(wasm))
+					}
+					for _, want := range c.wantExports() {
+						if !strings.Contains(string(wasm), want) {
+							t.Errorf("%s: module does not export %q", c.name, want)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestSingleMatrixUnderTightLimits drives the same shapes into the state and
+// register ceilings.
+//
+// Both limits are FALLBACKS, not errors: a DFA over max_dfa_states demotes the
+// pattern to Backtracking, and a TDFA over max_tdfa_regs does the same. Those
+// demotion paths are the ones a user hits on a big pattern and the ones no
+// ordinary test reaches, because every fixture here fits comfortably. A limit
+// of 1 forces the decision on every shape at once.
+func TestSingleMatrixUnderTightLimits(t *testing.T) {
+	for _, c := range singleCases() {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := c.build()
+			for _, opts := range []CompileOptions{
+				{MaxDFAStates: 1},
+				{MaxTDFARegs: 1},
+				{MaxDFAStates: 4, MaxTDFARegs: 1},
+				{MaxDFAStates: 1, LikelyMode: LikelyMatch},
+			} {
+				// A compile error is acceptable here — some shapes genuinely
+				// cannot be built within these bounds — but a PANIC is not,
+				// and neither is a module that claims success while being
+				// malformed.
+				wasm, _, err := Compile(cfg.Regexps, 65536, true, opts)
+				if err != nil {
+					continue
+				}
+				if len(wasm) < 8 || string(wasm[:4]) != "\x00asm" {
+					t.Fatalf("%s with %+v: not a WASM module (%d bytes)",
+						c.name, opts, len(wasm))
+				}
+			}
+		})
+	}
+}
+
+// TestSingleMatrixWithReporter runs the matrix with --verbose reporting on.
+//
+// Every decision compilePattern reports — the engine it actually built and the
+// gate that chose it, the state and register limits it measured, the table
+// encodings and optimisations that fired — sits behind `rep != nil`, and no
+// other test in the package sets Report. That left the reporting arms of the
+// compile path uncovered AND, worse, unexercised against real layouts: the
+// deferred closure reads fields off the layout after the fact, which is a
+// shape that breaks silently when a field moves.
+//
+// This asserts the report is POPULATED and internally consistent, not what it
+// says. Which engine a shape selects is a tuning decision CLAUDE.md says to
+// change only with measurement, so pinning the text here would turn every
+// legitimate tuning change into a test failure.
+func TestSingleMatrixWithReporter(t *testing.T) {
+	for _, c := range singleCases() {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := c.build()
+			rep := &Reporter{}
+			if _, _, err := Compile(cfg.Regexps, 65536, true,
+				CompileOptions{Report: rep}); err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			var out strings.Builder
+			rep.Render(&out)
+
+			if len(rep.Patterns) == 0 {
+				t.Fatalf("%s: compiled but reported no patterns", c.name)
+			}
+			for _, p := range rep.Patterns {
+				// Every record must say SOMETHING about how it was compiled.
+				// A record with neither an engine nor a reason is the failure
+				// this reporter was written to remove: a silent demotion.
+				if p.Engine == 0 && p.Reason == "" {
+					t.Errorf("%s: pattern %q recorded neither an engine nor a reason",
+						c.name, p.Pattern)
+				}
+				if p.Pattern == "" {
+					t.Errorf("%s: a report record has no pattern text", c.name)
+				}
+			}
+			if out.Len() == 0 {
+				t.Errorf("%s: Render produced nothing from %d patterns",
+					c.name, len(rep.Patterns))
+			}
+		})
+	}
+}
+
+// TestReporterUnderTightLimits covers the demotion arms specifically: the
+// switch in compilePattern that names WHICH gate sent a pattern to
+// Backtracking. Those are the lines a user reads when their pattern silently
+// stopped being O(n), and a limit of 1 reaches them on every shape.
+func TestReporterUnderTightLimits(t *testing.T) {
+	sawDemotion := false
+	for _, c := range singleCases() {
+		cfg := c.build()
+		rep := &Reporter{}
+		if _, _, err := Compile(cfg.Regexps, 65536, true,
+			CompileOptions{Report: rep, MaxDFAStates: 1, MaxTDFARegs: 1}); err != nil {
+			continue
+		}
+		for _, p := range rep.Patterns {
+			if p.Engine == EngineBacktrack && p.Reason != "" {
+				sawDemotion = true
+			}
+			if len(p.Limits) == 0 && p.Engine != 0 {
+				t.Errorf("%s: engine reported with no limit measurement", c.name)
+			}
+		}
+		var out strings.Builder
+		rep.Render(&out)
+	}
+	if !sawDemotion {
+		t.Error("no pattern reported a Backtracking demotion under MaxDFAStates=1; " +
+			"the reporting arms this test exists for were not reached")
+	}
+}
+
 func (c singleCase) wantExports() []string {
 	var out []string
 	if c.match {
@@ -526,6 +806,7 @@ func TestSingleMatrixEngineSelection(t *testing.T) {
 			eng, err := SelectEngine(c.pattern, CompileOptions{
 				MaxDFAStates: c.maxDFAStates,
 				MaxTDFARegs:  c.maxTDFARegs,
+				ByteMode:     c.byteMode,
 			})
 			if err != nil {
 				t.Fatalf("SelectEngine(%q): %v", c.pattern, err)

@@ -3,6 +3,8 @@ package utils
 import (
 	"errors"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -703,4 +705,135 @@ func TestWasmTableBaseTruncatedPayloadDoesNotPanic(t *testing.T) {
 			t.Logf("WasmTableBase = %d, err = %v", base, err)
 		})
 	}
+}
+
+// TestAppendPaddedULEB128 pins the property the twin-call patch depends on:
+// a fixed-width encoding that DecodeULEB128 reads back exactly, so an emitter
+// can reserve space for a function index before it is known and overwrite the
+// same bytes later without moving anything after them.
+func TestAppendPaddedULEB128(t *testing.T) {
+	for _, v := range []uint32{0, 1, 0x7F, 0x80, 0x3FFF, 0x4000, 0xFFFFF, 0xFFFFFFF, 0xFFFFFFFF} {
+		for n := 1; n <= 5; n++ {
+			// Skip widths the value cannot fit in; those panic by design.
+			if bits := 7 * n; n < 5 && v >= uint32(1)<<uint(bits) {
+				continue
+			}
+			got := AppendPaddedULEB128(nil, v, n)
+			if len(got) != n {
+				t.Fatalf("AppendPaddedULEB128(%d, %d) is %d bytes, want %d", v, n, len(got), n)
+			}
+			back, used, err := DecodeULEB128(got)
+			if err != nil || back != uint64(v) || used != n {
+				t.Fatalf("AppendPaddedULEB128(%d, %d) = % x, decoded (%d, %d, %v)",
+					v, n, got, back, used, err)
+			}
+		}
+	}
+	// Overwriting in place must not change the width.
+	buf := AppendPaddedULEB128(nil, 0, 5)
+	copy(buf, AppendPaddedULEB128(nil, 123456, 5))
+	if back, used, err := DecodeULEB128(buf); err != nil || back != 123456 || used != 5 {
+		t.Errorf("in-place overwrite decoded (%d, %d, %v), want (123456, 5, nil)", back, used, err)
+	}
+}
+
+// TestAppendPaddedULEB128Guards covers the two refusals.
+//
+// The function exists so an emitter can reserve space for a value it does not
+// yet know — a function index — and overwrite those same bytes later. Both
+// guards protect that contract: a width outside 1..5 cannot hold a u32, and a
+// value that does not fit would be TRUNCATED into a different index, producing
+// a module that validates and calls the wrong function. Silence in either case
+// is the failure this is meant to prevent.
+func TestAppendPaddedULEB128Guards(t *testing.T) {
+	for _, n := range []int{-1, 0, 6, 100} {
+		t.Run("width "+strconv.Itoa(n), func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("width %d did not panic", n)
+				}
+				if msg, ok := r.(string); !ok || !strings.Contains(msg, "width must be 1..5") {
+					t.Errorf("panic %v does not name the width limit", r)
+				}
+			}()
+			AppendPaddedULEB128(nil, 1, n)
+		})
+	}
+	// A value past what the requested width can hold.
+	for _, tc := range []struct {
+		v uint32
+		n int
+	}{
+		{0x80, 1},       // 8 bits into 7
+		{0x4000, 2},     // 15 bits into 14
+		{0xFFFFFFFF, 4}, // 32 bits into 28
+	} {
+		t.Run("overflow", func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("v=%#x in %d bytes did not panic", tc.v, tc.n)
+				}
+				if msg, ok := r.(string); !ok || !strings.Contains(msg, "does not fit") {
+					t.Errorf("panic %v does not name the overflow", r)
+				}
+			}()
+			AppendPaddedULEB128(nil, tc.v, tc.n)
+		})
+	}
+}
+
+// TestDataSectionParserRefusals covers parseSegmentHeader's and
+// findMagicInDataSection's error arms.
+//
+// Both parsers walk a data section byte by byte, and both are reached through
+// callers that decide where a merged module's tables may be placed. They are
+// tested directly rather than through WasmMemTop, which deliberately IGNORES a
+// data-section error (`if v, err := ParseDataSection(...); err == nil`) and
+// falls back to the memory and global sections — so a malformed section that
+// reached it would produce no error at all, and the arm would stay unreached.
+func TestDataSectionParserRefusals(t *testing.T) {
+	// An unterminated LEB128: every byte carries the continuation bit.
+	unterminated := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80}
+
+	t.Run("unknown segment kind", func(t *testing.T) {
+		var data []byte
+		data = AppendULEB128(data, 1)
+		data = AppendULEB128(data, 7) // no such data-segment kind
+		if _, _, err := parseSegmentHeader(data, 1, 0); err == nil {
+			t.Error("parseSegmentHeader accepted an unknown kind")
+		} else if !strings.Contains(err.Error(), "unknown kind") {
+			t.Errorf("error %q does not name the problem", err)
+		}
+		if _, err := ParseDataSection(data); err == nil {
+			t.Error("ParseDataSection accepted an unknown kind")
+		}
+		if _, err := findMagicInDataSection(data); err == nil {
+			t.Error("findMagicInDataSection accepted an unknown kind")
+		}
+	})
+
+	t.Run("truncated segment kind", func(t *testing.T) {
+		if _, _, err := parseSegmentHeader(unterminated, 0, 0); err == nil {
+			t.Error("parseSegmentHeader accepted a truncated kind")
+		}
+	})
+
+	t.Run("truncated memory index on an explicit-memory segment", func(t *testing.T) {
+		// Kind 2 promises a memory index; give it one that never terminates.
+		data := append(AppendULEB128(nil, 2), unterminated...)
+		if _, _, err := parseSegmentHeader(data, 0, 0); err == nil {
+			t.Error("parseSegmentHeader accepted a truncated memory index")
+		}
+	})
+
+	t.Run("truncated segment count", func(t *testing.T) {
+		if _, err := findMagicInDataSection(unterminated); err == nil {
+			t.Error("findMagicInDataSection accepted a truncated segment count")
+		}
+		if _, err := ParseDataSection(unterminated); err == nil {
+			t.Error("ParseDataSection accepted a truncated segment count")
+		}
+	})
 }

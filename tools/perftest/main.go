@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	wasmtime "github.com/bytecodealliance/wasmtime-go/v42"
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -1272,17 +1272,17 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 	warmupEnd := time.Now().Add(50 * time.Millisecond)
 	for time.Now().Before(warmupEnd) {
 		if tc.mode == anchoredGroups {
-			benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters)) //nolint:errcheck
+			wcall(benchFn, store, inputBase, inputLen, slotsBase, int32(benchIters)) //nolint:errcheck
 		} else {
-			benchFn.Call(store, inputBase, inputLen, int32(benchIters)) //nolint:errcheck
+			wcall(benchFn, store, inputBase, inputLen, int32(benchIters)) //nolint:errcheck
 		}
 	}
 
 	var callErr error
 	if tc.mode == anchoredGroups {
-		_, callErr = benchFn.Call(store, inputBase, inputLen, slotsBase, int32(benchIters))
+		_, callErr = wcall(benchFn, store, inputBase, inputLen, slotsBase, int32(benchIters))
 	} else {
-		_, callErr = benchFn.Call(store, inputBase, inputLen, int32(benchIters))
+		_, callErr = wcall(benchFn, store, inputBase, inputLen, int32(benchIters))
 	}
 	if callErr != nil {
 		fmt.Fprintf(os.Stderr, "  regexped bench(%s): %v\n", tc.name, callErr)
@@ -1346,12 +1346,12 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 	}
 
 	// Get the addresses of the static input and timings buffers inside WASM.
-	ptrRes, err := getPtrFn.Call(store)
+	ptrRes, err := wcall(getPtrFn, store)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regexp get_input_ptr(%s): %v\n", tc.name, err)
 		return benchResult{instantiation: instantiation}
 	}
-	timPtrRes, err := getTimingsPtrFn.Call(store)
+	timPtrRes, err := wcall(getTimingsPtrFn, store)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regexp get_timings_ptr(%s): %v\n", tc.name, err)
 		return benchResult{instantiation: instantiation}
@@ -1368,7 +1368,7 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 	patBytes := []byte(pat)
 	copy(buf[inputPtr:], patBytes)
 	t1 := time.Now()
-	_, err = initFn.Call(store, int32(len(patBytes)))
+	_, err = wcall(initFn, store, int32(len(patBytes)))
 	compilation := time.Since(t1)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regex_init(%s): %v\n", tc.name, err)
@@ -1382,10 +1382,10 @@ func benchRegex(regexWasmBytes []byte, tc testCase, input string, engine *wasmti
 
 	warmupEnd := time.Now().Add(50 * time.Millisecond)
 	for time.Now().Before(warmupEnd) {
-		benchExecFn.Call(store, inputLen, int32(benchIters)) //nolint:errcheck
+		wcall(benchExecFn, store, inputLen, int32(benchIters)) //nolint:errcheck
 	}
 
-	_, callErr := benchExecFn.Call(store, inputLen, int32(benchIters))
+	_, callErr := wcall(benchExecFn, store, inputLen, int32(benchIters))
 	if callErr != nil {
 		fmt.Fprintf(os.Stderr, "  regexp bench(%s): %v\n", tc.name, callErr)
 		return benchResult{instantiation: instantiation, compilation: compilation}
@@ -1541,12 +1541,12 @@ func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (u
 	var callErr error
 	switch tc.mode {
 	case anchoredGroups:
-		_, callErr = fn.Call(store, inputBase, inputLen, slotsBase, int32(0))
+		_, callErr = wcall(fn, store, inputBase, inputLen, slotsBase, int32(0))
 	case find:
 		// find is (ptr, len, from); a one-shot find starts at 0.
-		_, callErr = fn.Call(store, inputBase, inputLen, int32(0))
+		_, callErr = wcall(fn, store, inputBase, inputLen, int32(0))
 	default:
-		_, callErr = fn.Call(store, inputBase, inputLen)
+		_, callErr = wcall(fn, store, inputBase, inputLen)
 	}
 	after, _ := store.GetFuel()
 	if callErr != nil {
@@ -1596,7 +1596,7 @@ func measFuelRegex(regexWasmBytes []byte, tc testCase, input string, fuelEngine 
 	if mem == nil || getPtrFn == nil || initFn == nil || execFn == nil {
 		return 0, false
 	}
-	ptrRes, err := getPtrFn.Call(store)
+	ptrRes, err := wcall(getPtrFn, store)
 	if err != nil {
 		return 0, false
 	}
@@ -1607,18 +1607,18 @@ func measFuelRegex(regexWasmBytes []byte, tc testCase, input string, fuelEngine 
 		pat = "^(?:" + tc.pattern + ")$"
 	}
 	copy(buf[inputPtr:], []byte(pat))
-	if _, err = initFn.Call(store, int32(len([]byte(pat)))); err != nil {
+	if _, err = wcall(initFn, store, int32(len([]byte(pat)))); err != nil {
 		return 0, false
 	}
 	copy(buf[inputPtr:], []byte(input))
 	// Warm-up call: the regex crate uses a lazy DFA that builds states on first use.
 	// This uncounted call lets it reach steady state before we measure fuel.
-	if _, err = execFn.Call(store, int32(len(input))); err != nil {
+	if _, err = wcall(execFn, store, int32(len(input))); err != nil {
 		return 0, false
 	}
 	// Measure a single steady-state call.
 	before, _ := store.GetFuel()
-	if _, err = execFn.Call(store, int32(len(input))); err != nil {
+	if _, err = wcall(execFn, store, int32(len(input))); err != nil {
 		fmt.Fprintf(os.Stderr, "  fuel regexp call(%s): %v\n", tc.name, err)
 		return 0, false
 	}
@@ -1872,6 +1872,7 @@ func runCompareTime(baselinePath string, regexWasmBytes []byte, engine *wasmtime
 	nCompared, nFlagged := 0, 0
 
 	for _, tc := range tests {
+		wcallCase = tc.name
 		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
 		modeKey := tcModeStr(tc)
 		for _, inp := range tc.inputs {
@@ -2241,27 +2242,27 @@ func benchRegexSet(sc setTestCase, input string, regexWasmBytes []byte, engine *
 
 	// Write patterns (newline-delimited) to the patterns buffer.
 	patStr := strings.Join(sc.patterns, "\n")
-	patternsPtr, _ := getPatternsPtr.Call(store)
+	patternsPtr, _ := wcall(getPatternsPtr, store)
 	buf := mem.UnsafeData(store)
 	copy(buf[patternsPtr.(int32):], []byte(patStr))
-	if _, err := setInit.Call(store, int32(len(patStr))); err != nil {
+	if _, err := wcall(setInit, store, int32(len(patStr))); err != nil {
 		return benchResult{}
 	}
 
 	// Write input to the input buffer.
-	inputPtrRes, _ := getInputPtr.Call(store)
+	inputPtrRes, _ := wcall(getInputPtr, store)
 	copy(buf[inputPtrRes.(int32):], []byte(input))
 
 	// Warmup.
 	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
-		benchFn.Call(store, int32(len(input)), int32(benchIters)) //nolint:errcheck
+		wcall(benchFn, store, int32(len(input)), int32(benchIters)) //nolint:errcheck
 	}
 
 	// Benchmark.
-	if _, err := benchFn.Call(store, int32(len(input)), int32(benchIters)); err != nil {
+	if _, err := wcall(benchFn, store, int32(len(input)), int32(benchIters)); err != nil {
 		return benchResult{}
 	}
-	timingsPtrRes, _ := getTimingsPtr.Call(store)
+	timingsPtrRes, _ := wcall(getTimingsPtr, store)
 	return benchResult{avgExec: computeStat(buf[timingsPtrRes.(int32):timingsPtrRes.(int32)+timingsBytes], pct)}
 }
 
@@ -2373,7 +2374,7 @@ func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtim
 	total := 0
 	from := int32(0)
 	for {
-		res, err := findFn.Call(store, inBase, inLen, from, gatePtr, outBase, outCap)
+		res, err := wcall(findFn, store, inBase, inLen, from, gatePtr, outBase, outCap)
 		if err != nil {
 			return total
 		}
@@ -2843,7 +2844,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	engine := wasmtime.NewEngine()
+	engine := newWatchedEngine(nil)
 
 	// Warm up Cranelift before the first real measurement.
 	warmup(engine)
@@ -2860,7 +2861,7 @@ func main() {
 	if *fuel || *compareFuel != "" || *compareSetsFuel != "" {
 		fuelCfg := wasmtime.NewConfig()
 		fuelCfg.SetConsumeFuel(true)
-		fuelEngine = wasmtime.NewEngineWithConfig(fuelCfg)
+		fuelEngine = newWatchedEngine(fuelCfg)
 	}
 
 	// -compare-fuel measures fuel and compares against a baseline.
@@ -2900,6 +2901,7 @@ func main() {
 	}
 
 	for _, tc := range tests {
+		wcallCase = tc.name
 		fmt.Fprintf(os.Stderr, "==> %s\n", tc.name)
 		engineName := regexpedEngineName(tc)
 

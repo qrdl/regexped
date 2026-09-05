@@ -5526,3 +5526,239 @@ regexps
 -;-;-;-;-
 -;1-4;-;-;1-4
 -;0-3;-;-;0-3,4-7
+# ============================================================
+# Category 33: leading class chain, the SIMD chain-start probe
+# Exercises detectClassChainPrefix + its emission in
+# buildFindBody's candidate prologue (compile/class_chain_prefix.go).
+#
+# Neither RE2 corpus contains a single `[class]{N,}` pattern — 4,992
+# open-tail repeats in re2-exhaustive.txt and 1,920 in re2-adjusted.txt,
+# none of them over a class — so without this block the probe is
+# reached by nothing in the corpus at all.
+#
+# The dimensions that matter to it, one pattern or input each:
+#   - n across minClassChainPrefix: {3,} is refused, {4,} is the floor.
+#   - both chain ENDS: an accepting state ({N,}, {N}) and a state that
+#     merely self-loops on the class ({N,}[0-9], {N,}END).
+#   - run lengths at 15/16/17 and 31, since the probe loads a fixed
+#     16-byte chunk and masks to min(n,16) lanes.
+#   - a run at the very end of the input, where `p + 16 > len` sends the
+#     candidate down the scalar fallback instead — the arm nothing else
+#     reaches on purpose.
+#   - many SHORT runs, which drive the failure arm: a non-member at
+#     offset r retires the whole range [p, p+r] in one step.
+# Expectations generated with Go's regexp, cross-checked against
+# Category 28's existing rows before use.
+# ============================================================
+Cat33ClassChainPrefix
+strings
+""
+"abc"
+"abcd"
+"abcde"
+"aaaaaaaaaaaaaaa"
+"aaaaaaaaaaaaaaaa"
+"aaaaaaaaaaaaaaaaa"
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"   aaaaaaaaaaaaaaaaaaaa"
+"aaaaaaaaaaaaaaaaaaaa   "
+"a b c d e f g h i j k l m n o p q r s t"
+"ab cd ef gh ij kl mn op qr st uv wx yz"
+"aaa bbbbbbbb"
+"zzzaaaaaaaaaaaaaaaazzz"
+"aaaaaaaaaaaa9"
+"aaaa9"
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa9"
+"aaaaaaEND"
+"aaaaaaEN"
+"aaaabbbbbbbbbbbbbbbbbbbb"
+regexps
+"[a-z]{3,}"
+-;-;-;-
+0-3;0-3;-;-
+0-4;0-4;-;-
+0-5;0-5;-;-
+0-15;0-15;-;-
+0-16;0-16;-;-
+0-17;0-17;-;-
+0-31;0-31;-;-
+-;3-23;-;-
+-;0-20;-;-
+-;-;-;-
+-;-;-;-
+-;0-3;-;-
+0-22;0-22;-;-
+-;0-12;-;-
+-;0-4;-;-
+-;0-60;-;-
+-;0-6;-;-
+-;0-6;-;-
+0-24;0-24;-;-
+"[a-z]{4,}"
+-;-;-;-
+-;-;-;-
+0-4;0-4;-;-
+0-5;0-5;-;-
+0-15;0-15;-;-
+0-16;0-16;-;-
+0-17;0-17;-;-
+0-31;0-31;-;-
+-;3-23;-;-
+-;0-20;-;-
+-;-;-;-
+-;-;-;-
+-;4-12;-;-
+0-22;0-22;-;-
+-;0-12;-;-
+-;0-4;-;-
+-;0-60;-;-
+-;0-6;-;-
+-;0-6;-;-
+0-24;0-24;-;-
+"[a-z]{5,}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-5;0-5;-;-
+0-15;0-15;-;-
+0-16;0-16;-;-
+0-17;0-17;-;-
+0-31;0-31;-;-
+-;3-23;-;-
+-;0-20;-;-
+-;-;-;-
+-;-;-;-
+-;4-12;-;-
+0-22;0-22;-;-
+-;0-12;-;-
+-;-;-;-
+-;0-60;-;-
+-;0-6;-;-
+-;0-6;-;-
+0-24;0-24;-;-
+"[a-z]{16,}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-16;0-16;-;-
+0-17;0-17;-;-
+0-31;0-31;-;-
+-;3-23;-;-
+-;0-20;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-22;0-22;-;-
+-;-;-;-
+-;-;-;-
+-;0-60;-;-
+-;-;-;-
+-;-;-;-
+0-24;0-24;-;-
+"[a-z]{17,}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-17;0-17;-;-
+0-31;0-31;-;-
+-;3-23;-;-
+-;0-20;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-22;0-22;-;-
+-;-;-;-
+-;-;-;-
+-;0-60;-;-
+-;-;-;-
+-;-;-;-
+0-24;0-24;-;-
+"[a-z]{4,}[0-9]"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-13;0-13;-;-
+0-5;0-5;-;-
+0-61;0-61;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"[a-z]{12,}[0-9]"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-13;0-13;-;-
+-;-;-;-
+0-61;0-61;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+"[a-z]{6,}END"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-9;0-9;-;-
+-;-;-;-
+-;-;-;-
+"[a-z]{5}"
+-;-;-;-
+-;-;-;-
+-;-;-;-
+0-5;0-5;-;-
+-;0-5;-;-
+-;0-5;-;-
+-;0-5;-;-
+-;0-5;-;-
+-;3-8;-;-
+-;0-5;-;-
+-;-;-;-
+-;-;-;-
+-;4-9;-;-
+-;0-5;-;-
+-;0-5;-;-
+-;-;-;-
+-;0-5;-;-
+-;0-5;-;-
+-;0-5;-;-
+-;0-5;-;-

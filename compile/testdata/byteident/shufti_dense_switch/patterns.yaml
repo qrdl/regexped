@@ -1,0 +1,13 @@
+# The ADAPTIVE dense switch: a first-byte set the static rarity model calls
+# DENSE (52 letters, rarity sum 130 against a threshold of 40), forced onto
+# Shufti anyway by prefer-no-match. That combination — and only that
+# combination — emits the runtime probe-budget counter that falls back to the
+# scalar scan when the input turns out to be dense in those bytes after all.
+#
+# The sibling `shufti` fixture does NOT reach this path: its first-byte set is
+# 16 bytes, which takes the unconditional SIMD branch and never consults the
+# rarity model, so the dense switch had no fixture at all until this one.
+regexps:
+  - pattern: '[a-zA-Z]{20,}'
+    find_func: dense_switch_find
+    hints: [prefer-no-match]

@@ -48,11 +48,21 @@ var byteRarity = func() [256]int8 {
 	for c := 'a'; c <= 'z'; c++ {
 		t[c] = 3 // lowercase: dominant in prose, ~5-15 % each
 	}
+	// Uppercase and digits were graded 2 — two thirds of lowercase's 3 —
+	// while this file's own comment puts them at ~0.5% of prose against
+	// lowercase's 5-15%. An additive model with those weights cannot tell
+	// "26 bytes that are individually rare" from "17 bytes that are
+	// individually dominant": `[A-Z]` summed to 52 and `[a-q]` to 51, and
+	// measured on prose, forcing Shufti on the first is worth -79% while on
+	// the second it costs +5.9%. Grading both at 1 separates them — `[A-Z]`
+	// to 26, `[A-Z0-9]` to 36, `[a-fA-F0-9]` to 34, all under the threshold
+	// and all measured wins, while every dense-lowercase set stays above it
+	// and stays scalar.
 	for c := 'A'; c <= 'Z'; c++ {
-		t[c] = 2 // uppercase: ~0.5 % each in prose (sentence-initial only)
+		t[c] = 1 // uppercase: ~0.5 % each in prose (sentence-initial only)
 	}
 	for c := '0'; c <= '9'; c++ {
-		t[c] = 2
+		t[c] = 1
 	}
 	for _, c := range []byte{'/', '*', '=', '+', '-', '#', '&',
 		'(', ')', ':', ';', '?', '!', '\'', '"'} {
@@ -85,13 +95,21 @@ func firstByteSetRaritySum(bytes []byte) int {
 // (~25-70 SIMD ops depending on half count). Below a sum threshold,
 // scalar can't exit early enough to win; above, scalar dominates.
 //
-// Threshold = 40 chosen by initial measurement (see perftest). Will
-// be tuned as more workloads are observed.
+// Threshold = 40 chosen by initial measurement (see perftest). It was
+// re-interrogated when the Shufti emission got cheaper (one nibble-table pair
+// for every class in practice, not ceil(N/8)): the crossover on prose sits
+// between sums of 72 and 78, far above 40, which looked like an argument for
+// raising the threshold. It was not — the same measurement found sums 51 and
+// 52 landing on OPPOSITE sides, so no threshold can separate the two. The
+// per-byte weights were what mis-ranked them; see byteRarity above. With
+// those corrected, 40 classifies every measured set correctly or
+// conservatively and needs no change.
 //
-// Examples (prose-calibrated):
+// Examples (prose-calibrated), sums as graded today:
 //
-//	[A-Z]        (26 chars): sum = 26*2 = 52 → scalar  (mixed)
-//	[a-zA-Z]     (52 chars): sum = 26*3+26*2 = 130 → scalar (dense)
+//	[A-Z]        (26 chars): sum = 26*1 = 26 → Shufti  (rare in prose)
+//	[a-q]        (17 chars): sum = 17*3 = 51 → scalar  (dominant letters)
+//	[a-zA-Z]     (52 chars): sum = 26*3+26*1 = 104 → scalar (dense)
 //	[\x00-\x1f]  (32 chars): sum = 0 → Shufti        (rare)
 //	[<>{}\[\]|`] (8 chars):  sum = 8*1 = 8 → Shufti  (uncommon)
 //

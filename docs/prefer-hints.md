@@ -59,6 +59,11 @@ set a hint or not.
   length of 8+ bytes — e.g. `[A-Z]{8,}`, `[a-zA-Z0-9]{10,}`. Typical of
   identifier/token scanners. A minimum length below 8 (e.g. `(\w+)`) doesn't
   qualify.
+- On a **set**, a pattern whose body after its literal is a run over a
+  character class — e.g. `KEY="[a-z0-9]+"`, `A:[^\n]+` — gets the same
+  SIMD skip through that run a single pattern gets. Worth setting when your
+  inputs are match-dense with long bodies; short bodies neither gain nor
+  lose much, because the skip turns itself off once it stops paying.
 
 **`prefer-no-match` targets:**
 - A first-byte set of roughly 17–64 distinct bytes in `find_func` mode (or
@@ -71,8 +76,17 @@ set a hint or not.
   `[0-9]{16}INFO:[^\n]+`. Gets a SIMD chunk-verify instead of a scalar
   reverse walk on the anchor.
 - On a **set**, the same first-byte-set situation forces the Shufti frontend
-  instead of falling back to scalar for a 17–64-byte union of first bytes
-  across the set's patterns.
+  instead of falling back to scalar, for a union of roughly 17–128 distinct
+  first bytes across the set's patterns. (Without the hint the ceiling is 64;
+  the hint is what raises it, since above 64 a prefilter only pays off if
+  your input really is mostly outside those bytes.)
+- On a **set whose patterns have no literal to anchor on** — e.g.
+  `[a-z]{4}[0-9]{3}`, which begins with a character class — driving
+  `scan_any` or `scan_all`, the whole-input scan strides over stretches
+  where no pattern could be starting. The win scales with how much of your
+  input is outside the patterns' opening byte classes: large on binary,
+  structured, or non-ASCII-heavy data, and self-disabling on input that is
+  dense in them.
 
 If your pattern doesn't match one of these shapes, the hint is harmless but
 won't change anything.
@@ -90,6 +104,26 @@ won't change anything.
   byte-class table lookup.
 - **Lit-anchor class-prefix SIMD verify** — same SIMD-chunk idea applied to
   the backward verification step of a literal-anchored find.
+- **Union-scan run skip** — for a set with no literal to filter on, strides
+  over stretches of input where none of the set's patterns could be
+  starting, instead of stepping a byte at a time.
+- **Member self-loop skip** *(prefer-match, sets)* — once a set's suffix walk
+  is inside a state that a run of bytes keeps it in, strides over that run
+  rather than stepping it. Worth about **80%** of a bucket's cost on patterns
+  with long repeated tails (`kw001aaaa…`), and it **costs under 2%** on the
+  same patterns when the tails are short. It notices when it is not paying and
+  stops — first per state, so one unhelpful state does not stop the others,
+  and then for the bucket as a whole, at which point the walk it runs is the
+  one it would run without the feature at all. Both retry periodically in case
+  the input changes character, so a wrong guess costs a bounded amount rather
+  than a proportional one. Applies to any repeated run, however wide the
+  character class, and only to sets large enough to pack into a sparse
+  bucket.
+
+Each of the SIMD skips above turns itself off for the rest of a call once it
+has failed to skip anything several times in a row, so a hint that turns out
+wrong for a particular input costs a bounded amount rather than compounding
+over the whole scan.
 
 ## Measure the actual effect on your pattern
 
@@ -112,3 +146,33 @@ each mode against each bucket — so you can see directly whether a hint helps
 *your* traffic before shipping it. `make example-lm` / `make example-lnm` /
 `make example-combined` (from `tools/pattest`) run pre-built demonstrations
 of each case above if you want to see the shape of a real win first.
+
+### Measuring a SET
+
+A set-level hint is a different question — several of the effects listed
+above (the union-scan run skip, the widened Shufti band, the packer split)
+exist only on the set path, and `pattest` cannot reach any of them. Use
+`tools/settest`, which takes the set from a YAML config file — the same
+schema `regexped compile` reads, so it tests the set you would actually
+ship:
+
+```bash
+cd tools/settest
+make run ARGS="-config your_config.yaml -cap find -inputs your_inputs.txt"
+```
+
+It compiles your set three times varying only its `hints:`, drives whichever
+capability you name with `-cap` (any of the five; optional when the set
+declares just one), and reports the same fuel-and-time-per-bucket table.
+
+Two things it adds, because a set has more places for a hint to land. First,
+when a hint compiles to a byte-identical module it says so and skips the
+measurement: that is a definitive "this hint cannot help this set", and it is
+worth knowing before reading any timing. Second, each mode prints what the
+compiler chose — literal frontend, scan-pair body, anchored body, bucket
+count — which is where a set-level hint's effect actually shows up, and is
+otherwise invisible.
+
+`make example-lnm` and `make example-shufti` (from `tools/settest`) run
+pre-built demonstrations of a real `prefer-no-match` win — one with no
+literal frontend at all, one where the hint changes which frontend ships.

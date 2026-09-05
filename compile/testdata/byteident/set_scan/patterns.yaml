@@ -1,0 +1,24 @@
+# Capability shape: the SCAN pair (scan_any / scan_all) — non-anchored, taking
+# an offset, no positions reported.
+regexps:
+  - name: p0
+    pattern: 'Aqr00'
+  - name: p1
+    pattern: 'Bqr01'
+  - name: p2
+    pattern: 'Cqr02'
+  - name: p3
+    pattern: 'Dqr03'
+  - name: p4
+    pattern: 'Eqr04'
+  - name: p5
+    pattern: 'Fqr05'
+  - name: p6
+    pattern: 'Gqr06'
+  - name: p7
+    pattern: 'Hqr07'
+sets:
+  - name: s
+    scan_any: s_scan_any
+    scan_all: s_scan_all
+    patterns: all

@@ -1,0 +1,8 @@
+# Strict alternation whose branches all carry a fixed-length prefix (Gap E):
+# buildLitChainAltPrefixedFindBody, via the shared
+# emitLitChainAltLitBranchBodyPrefixed. Same missing find-from floor as
+# lit_chain_prefixed, and it was found the same way — by asking which emitters
+# no test reached, not by a failing case.
+regexps:
+  - pattern: '[a-z]{3}AKIA[A-Z0-9]{24}|[0-9]{3}ghp_[A-Za-z0-9]{24}'
+    find_func: altprefixed_find

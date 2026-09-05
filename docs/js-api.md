@@ -213,7 +213,7 @@ releases its region on the way out, so nothing leaks.
 *This was not always true.* Until 2026-08-25 every call staged its input at one
 shared address, so an interleaved call left a suspended generator scanning
 another string's bytes and reporting offsets against it — silently, with no
-exception and plausible-looking output (TODO 58). If you are on an older
+exception and plausible-looking output. If you are on an older
 generated stub, that hazard is real and the old rule ("do not call other stub
 functions while a generator is suspended") still applies to it.
 

@@ -31,6 +31,7 @@ regexps:
     groups_func:       "url_groups"        # match iterator; each item is that match's capture groups
 
     hints: [prefer-match, batch-find]   # optional; see "hints:" below
+    byte_mode: false           # optional; see "byte_mode:" below
 
 sets:
   - name: "my_set"             # unique set name
@@ -136,6 +137,53 @@ Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture gr
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
 
+### `byte_mode:` — matching raw bytes above 127
+
+Regexped is a **byte** engine. `.` consumes one byte, classes are byte classes,
+and `\b` is ASCII. A rune above U+007F has no byte to be, so a pattern naming
+one is rejected:
+
+```
+pattern contains the non-ASCII rune U+00E9; regexped matches bytes,
+so set byte_mode: true to match it as the single byte 0xE9, or remove it
+```
+
+Setting `byte_mode: true` on a `regexps:` entry declares the pattern
+byte-oriented: runes `0x80`-`0xFF` become legal and mean **exactly that byte**.
+
+```yaml
+regexps:
+  - name: utf8_lead
+    pattern: '[\xc0-\xdf]'        # a UTF-8 two-byte lead — needs byte_mode
+    byte_mode: true
+    find_func: find_lead
+```
+
+Runes above `U+00FF` are rejected in **both** modes — no byte holds one — with
+a different message that does not suggest the flag:
+
+```
+pattern contains the rune U+03B1, above U+00FF; regexped matches bytes
+and has no Unicode support
+```
+
+The flag is per pattern because it is a statement about that pattern's text,
+and it applies to set members as well as to `_func` patterns. Rust's regex
+crate spells the same distinction `(?-u)` / `regex::bytes`; an inline flag was
+not chosen here because Go's parser rejects `(?-u)` outright.
+
+**What is NOT rejected**, in either mode:
+
+- **`.` and negated classes.** `[^,]` names every rune there is, and consumes
+  one byte. This is documented byte semantics, not an oversight.
+- **Case-fold artifacts of ASCII.** Go's parser expands `(?i)` over a class
+  eagerly, so `(?i:[a-z])` arrives carrying U+017F (long s) and U+212A (Kelvin
+  sign) — runes you did not write, manufactured from the `s` and `k` you did.
+  `(?i)` therefore keeps working over letter classes, `\w` and ASCII literals.
+  The consequence is that `(?i)k` does not match a Kelvin sign and
+  `(?i:[a-z]+)` does not match a long s: case folding is ASCII-only in
+  practice, and folding within `0x00`-`0xFF` in byte mode.
+
 ### `hints:` — LikelyMode and batch-find compile hints
 
 Both `regexps:` entries and `sets:` entries accept an optional `hints:` list.
@@ -159,14 +207,20 @@ An absent or empty `hints:` list keeps the default (`LikelyNeutral`, no batch
 export). The `prefer-match`/`prefer-no-match` choice never affects match
 correctness — only which optimisation path is emitted.
 
-A pattern's own `prefer-match`/`prefer-no-match` takes precedence over its
-enclosing set's `hints:` (and a set's own suffix-body compilation falls back
-to its `hints:` when a member pattern doesn't set its own). `batch-find` has
-no fallback to resolve: it is read on the entry (or set) that carries it, and
-each one decides for itself. On a `regexps:` entry it requires `find_func` or
-`groups_func`, and on a `sets:` entry it requires `find` — there is otherwise
-nothing to batch, and accepting the hint anyway would leave the caller
-believing they had asked for something.
+`prefer-match`/`prefer-no-match` resolve **per entry, with no fallback chain
+between the two levels**. A `regexps:` entry's hint governs only that
+pattern's own exported bodies (`match_func`/`find_func`/`groups_func`); a
+`sets:` entry's hint governs only that set's own frontend and bucket suffix
+bodies. A set's hint is not inherited by a member's own exported bodies, and a
+member's hint does not reach the set's bucket code — a bucket holds one merged
+suffix DFA for several patterns, so there is no per-pattern choice for it to
+honour. An entry with no `hints:` is neutral regardless of what encloses it.
+
+`batch-find` has no fallback to resolve either: it is read on the entry (or
+set) that carries it, and each one decides for itself. On a `regexps:` entry
+it requires `find_func` or `groups_func`, and on a `sets:` entry it requires
+`find` — there is otherwise nothing to batch, and accepting the hint anyway
+would leave the caller believing they had asked for something.
 
 See [prefer-hints.md](prefer-hints.md) for the full `prefer-match`/
 `prefer-no-match` mechanism, which pattern shapes benefit, and how to

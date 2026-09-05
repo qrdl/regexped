@@ -1,7 +1,5 @@
 package compile
 
-import "github.com/qrdl/regexped/internal/utils"
-
 // --------------------------------------------------------------------------
 // Gap F: TDFA capture-body bulk-skip for dominant self-loop states.
 //
@@ -161,13 +159,10 @@ func emitTDFABulkSkip(b []byte, info *tdfaBulkSkipInfo, localPos, localChunk, lo
 	b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
 	b = append(b, 0x21, byte(localChunk)) // local.set chunk
 
-	// mask = shufti(selfLoopBytes, chunk) -- bit k=1 ⇔ lane k IS a self-loop byte
-	b = emitShuftiPrefixCheck(b, info.selfLoopBytes, byte(localChunk))
-	// mask ^= 0xFFFF -- bit k=1 ⇔ lane k is an exit byte (bitmask zero-extends
-	// the upper 16 bits, so this only flips the lanes that matter)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, 0xFFFF)
-	b = append(b, 0x73)                  // i32.xor
+	// mask = shufti_stop(selfLoopBytes, chunk) -- bit k=1 ⇔ lane k is an EXIT
+	// byte. The stop polarity comes straight out of the primitive's final
+	// compare; it used to be a member mask followed by `xor 0xFFFF`.
+	b = emitShuftiStopMask(b, info.selfLoopBytes, byte(localChunk))
 	b = append(b, 0x21, byte(localMask)) // local.set mask
 
 	// if mask == 0: whole chunk is self-loop bytes

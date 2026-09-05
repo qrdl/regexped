@@ -204,7 +204,7 @@ owns its input and scratch region for its whole lifetime — the guarantee Rust
 and Go get from passing a host pointer — and releases it on any exit, including
 an early `break`. Until 2026-08-25 this was not true: one shared staging address
 meant an interleaved call left a suspended generator scanning another string's
-bytes, silently (TODO 58).
+bytes, silently.
 
 `patternName(id)` is emitted once per config when any set sets
 `emit_name_map: true`.

@@ -86,19 +86,33 @@ func (m findFromMode) String() string {
 }
 
 // emitFindFromSeed appends the two instructions that load the find-from
-// global into a find body's attempt-start local, and returns ffNative.
+// global into a find body's SCAN CURSOR, and returns ffNative.
 //
 // This is the ONLY producer of ffNative, and it returns the mode rather than
 // letting the caller assert it: a body is native exactly when it carries this
-// seed. attemptStartLocal is that body's own scan-start local index — the one
-// fact per emitter that this mechanism cannot check for itself, which is why
-// each emitter conversion lands with its own seed pattern in
-// tools/fuzz/iter_test.go.
+// seed.
+//
+// # Why the parameter is a scanCursor and not a local index
+//
+// It used to take a byte, and "which local is this body's scan start" was then
+// one fact per emitter that nothing could check — stated in a const block,
+// consumed here, never reconciled. WASM locals are zero-initialised, so naming
+// the wrong one yields a module that validates, answers `from == 0` correctly,
+// and ignores `from` for ever after; ffNative is returned either way, so the
+// mode is no evidence. That defect shipped twice, most recently in
+// buildLitChainAltLenientFindBody, whose attempt-start local is DERIVED from
+// its window base rather than being the cursor — every exported find returned
+// the first match in the buffer, and hosts iterating it never terminated.
+//
+// A scanCursor comes only from localAlloc.scanCursor(), so the body must
+// decide which of its locals is the cursor at the point it allocates them, and
+// can then hand that same value to both its scan and this seed. Passing some
+// other local is no longer expressible: ordinary locals are bytes, and a byte
+// is not a scanCursor.
 //
 // Placement: immediately after the locals declaration, before the prologue
-// that reads attempt_start. WASM locals are zero-initialised, which is
-// precisely why "start at 0" used to be the only behaviour available.
-func emitFindFromSeed(b []byte, attemptStartLocal byte) ([]byte, findFromMode) {
+// that reads the cursor.
+func emitFindFromSeed(b []byte, cur scanCursor) ([]byte, findFromMode) {
 	b = append(b, 0x23) // global.get
 	b = utils.AppendULEB128(b, findFromGlobalIdx)
 	b = append(b, 0x21)
@@ -106,7 +120,7 @@ func emitFindFromSeed(b []byte, attemptStartLocal byte) ([]byte, findFromMode) {
 	// byte, and writing one raw produced a truncated index the validator
 	// accepts as a DIFFERENT local. No emitter is near 128 locals today, which
 	// is exactly why this would be found late.
-	b = utils.AppendULEB128(b, uint32(attemptStartLocal))
+	b = utils.AppendULEB128(b, uint32(cur.Local()))
 	return b, ffNative
 }
 
@@ -121,13 +135,81 @@ func emitFindFromSet(b []byte, srcLocal byte) []byte {
 
 // findFromGlobalSection returns the WASM global section payload declaring the
 // single mutable i32 find-from global, initialised to 0.
+//
+// Equivalent to (&moduleGlobals{}).Section(); kept as the name the assemblers
+// used before there was an allocator, and as the fixed point the allocator's
+// zero value has to reproduce.
 func findFromGlobalSection() []byte {
-	return []byte{
-		0x01,       // one global
-		0x7F, 0x01, // mut i32
-		0x41, 0x00, // i32.const 0
-		0x0B, // end of init expr
+	return (&moduleGlobals{}).Section()
+}
+
+// moduleGlobals allocates a regexp module's mutable i32 globals.
+//
+// Global 0 is always the find-from channel (findFromGlobalIdx); everything
+// after it is handed out by Alloc. The zero value therefore describes exactly
+// the module shape that existed before this type — one global — and its
+// Section() is byte-for-byte what findFromGlobalSection used to return
+// literally, which is what lets the allocator be introduced without moving a
+// single fixture.
+//
+// # Why an allocator rather than more consts
+//
+// The alternative is what the rest of the compiler does for table memory: a
+// per-pattern OFFSET computed by arithmetic and stored in a field. That shape
+// has a defect class attached to it — the field's Go zero value, 0, is itself a
+// valid writable address, so an emitter that forgets to set it corrupts memory
+// instead of failing. See this file's header on why the find-from offset is a
+// global at all, and TODO task 75 for the two scratch slots still carrying that
+// hazard.
+//
+// An index from Alloc has no such failure mode. Every index it returns is
+// backed by a declaration in Section(), because both come from the same
+// counter; and a body that reads a global the assembler never declared fails
+// WASM validation at load rather than reading something else's value.
+//
+// # Scope and lifetime
+//
+// One instance per MODULE, threaded through the compile options so that every
+// pattern in a module draws from the same counter, and handed to the assembler
+// so the declarations match the uses. A global is module-scoped state shared by
+// every call into the instance: fine for a performance verdict, wrong for
+// anything a correct answer depends on.
+type moduleGlobals struct {
+	// extra counts globals allocated BEYOND the find-from channel, so the
+	// zero value means "just find-from" and needs no constructor.
+	extra uint32
+}
+
+// Alloc reserves one more mutable i32 global, initialised to 0, and returns its
+// index. Indices are stable in allocation order and start above
+// findFromGlobalIdx.
+func (g *moduleGlobals) Alloc() uint32 {
+	g.extra++
+	return findFromGlobalIdx + g.extra
+}
+
+// Count is the number of globals Section will declare.
+func (g *moduleGlobals) Count() uint32 { return 1 + g.extra }
+
+// Section returns the WASM global section payload: Count() mutable i32 globals,
+// each initialised to 0.
+//
+// The assemblers gate this on the module needing globals at all
+// (moduleUsesFindFrom, plus any allocation). A module that declares the section
+// when nothing reads it is merely six bytes larger; a module that OMITS it
+// while a body reads one does not validate, which is the direction this is
+// deliberately wrong in.
+func (g *moduleGlobals) Section() []byte {
+	n := g.Count()
+	out := utils.AppendULEB128(nil, n)
+	for i := uint32(0); i < n; i++ {
+		out = append(out,
+			0x7F, 0x01, // mut i32
+			0x41, 0x00, // i32.const 0
+			0x0B, // end of init expr
+		)
 	}
+	return out
 }
 
 // buildFindFromWrapperBody emits the exported find function:

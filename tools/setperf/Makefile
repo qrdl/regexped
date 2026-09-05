@@ -3,13 +3,34 @@
 # The Rust harness is shared with tools/perftest: one crate, one toolchain,
 # one build artefact. Build it there first (or via the `harnesses` target).
 
-.PHONY: run fuel fuel-cross size verify harnesses baseline check clean
+.PHONY: run fuel fuel-lm fuel-lnm fuel-frontends fuel-cross size verify harnesses baseline check clean
 
 run: harnesses
 	go run .
 
 fuel:
 	go run . -fuel
+
+# The same board under a set-level hint. NOT baselined and NOT part of
+# `check`: every committed baseline was captured neutral, and these rows are
+# keyed with the hint (`|prefer-match`) precisely so a hinted run can never be
+# compared against one — see setHintsKeySuffix. Read them against a neutral
+# `make fuel` from the same tree, never against baseline_fuel.txt.
+fuel-lm:
+	go run . -fuel -hints=prefer-match
+
+fuel-lnm:
+	go run . -fuel -hints=prefer-no-match
+
+# Every literal frontend forced over every family, which is how the crossover
+# constants in chooseLiteralFrontend get interrogated rather than assumed
+# (TODO task 71 closed that question for the keywords families on a dense
+# corpus; this is the command that re-asks it for a new shape).
+fuel-frontends:
+	@for fe in packed-pair teddy ac scalar; do \
+		echo "=== frontend: $$fe ==="; \
+		go run . -fuel -force-frontend=$$fe 2>/dev/null; \
+	done
 
 # Cross-engine fuel: ours vs regex-automata's, both metered by wasmtime over
 # one whole-input operation. Deterministic and machine-independent, so it is

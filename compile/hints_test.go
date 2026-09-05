@@ -129,8 +129,16 @@ func TestPatternHintsOverridesCallerLikelyMode(t *testing.T) {
 // asserted is the hint→LikelyMode→Shufti wiring, not a frontend ranking that
 // measurement has overturned twice.
 func TestSetHintsSelectsShuftiFrontend(t *testing.T) {
-	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	// Above teddyMaxLiterals so Teddy declines; first bytes cycle the 36-char
+	// LOWERCASE on purpose. This alphabet was digits-and-uppercase until the
+	// byte-rarity weights were corrected, at which point the density heuristic
+	// started selecting Shufti for it unaided and the "unhinted" arm below
+	// stopped asserting anything — rightly, since forcing Shufti on `[A-Z0-9]`
+	// measures -79% on prose, so picking it unhinted is the correct call, not
+	// a bug. What this test needs is a set the heuristic genuinely declines,
+	// and dense lowercase is that set: sum 78 against a threshold of 40, and
+	// measured at +13% if Shufti is forced on it.
+	const alphabet = "abcdefghijklmnopqrstuvwxyz"
+	// Above teddyMaxLiterals so Teddy declines; first bytes cycle the 26-char
 	// alphabet, keeping the union inside Shufti's 17..64 band.
 	n := teddyMaxLiterals + 1
 	buildSpec := func(t *testing.T) (SetSpec, *dfaPool, *dfaPool) {

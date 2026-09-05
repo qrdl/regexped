@@ -1,0 +1,12 @@
+# The rarity model choosing Shufti on its OWN, with no hint: `[A-Z]` is 26
+# first bytes, so it lands in the 17..64 band where shuftiBeatsScalar decides,
+# and uppercase grades 1 apiece, so the sum is 26 against a threshold of 40.
+#
+# This is the path the byte-rarity weights govern, and nothing pinned it: the
+# `shufti` fixture's 16-byte set takes the unconditional SIMD branch without
+# consulting the model, and `shufti_dense_switch` reaches Shufti only because
+# prefer-no-match overrides the model. A change to byteRarity that silently
+# flipped every neutral build in this band would have moved no fixture at all.
+regexps:
+  - pattern: '[A-Z]{8,}'
+    find_func: upper_run_find

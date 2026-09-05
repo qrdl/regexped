@@ -451,6 +451,19 @@ it.
 `emit_name_map: true` additionally emits a `pattern_name(id)` helper mapping a
 pattern id back to its `name:` string.
 
+### `--diag-json` reports what the compiler chose
+
+Several of a set's decisions are invisible in the output and change its cost by
+large factors: which literal frontend shipped, whether the scan pair got the
+one-pass union automaton or the per-position walk, and whether a sparse
+bucket's states carry the member self-loop skip (`member_skip_states`). If a
+set is slower than you expect, that file is where to look first — there is no
+other window onto any of it.
+
+Note it reports the compilation your `hints:` actually asks for. Before
+2026-09-02 it always reported the unhinted one, which made every hint-dependent
+row above misleading for a hinted set.
+
 ## Bin-packing and merge constraints
 
 The bin-packer groups patterns by their mandatory literal and merges compatible
@@ -568,6 +581,17 @@ the fallback half of a mixed set.
 "union_scan": {"used": true, "wide": true, "states": 74, "mask_words": 2}
 ```
 
+Under `hints: [prefer-no-match]` the one-pass automaton additionally **strides
+over stretches of input where no pattern could be starting**, in 16-byte SIMD
+chunks, instead of stepping a byte at a time. It applies to both accept forms
+— narrow (≤64 ids) and wide alike — and it is exact rather than approximate:
+the states it strides through are ones where no pattern can accept, and these
+bodies report no position, so a skipped run has no effect at all beyond
+advancing. Like every other SIMD skip here it turns itself off for the rest of a call once several
+attempts in a row have failed to clear a full chunk, so input that is dense in
+the patterns' opening byte classes pays a bounded cost rather than a
+compounding one.
+
 ## Literal scan frontend
 
 | Condition | Frontend |
@@ -576,7 +600,7 @@ the fallback half of a mixed set.
 | ≤64 distinct literals (≤16 when the shortest literal is 1 byte) | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch. For 9+ literals it uses two groups of 8 (`TwoGroups=true`), ORing two independent nibble probes per 16-byte chunk |
 | >16 distinct literals with low first-byte diversity | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count, with a SIMD first-byte prefilter at the root state |
 | (AC tables exceed 512 KB) | **Scalar** — AC is capped by *table bytes*, not literal count. The budget holds ~1,000 trie nodes uncompressed, and no set of 128 literals tested so far comes close to it; literals sharing no common prefix consume nodes fastest, since each distinct first byte forks the trie at the root. A demotion is always reported in `--diag-json` as `frontend_demotion` |
-| High first-byte diversity, or the `prefer-no-match` hint | **Shufti** — a SIMD first-byte prefilter over the scalar body, answering set membership from nibble tables instead of a per-byte compare chain |
+| High first-byte diversity, or the `prefer-no-match` hint | **Shufti** — a SIMD first-byte prefilter over the scalar body, answering set membership from nibble tables instead of a per-byte compare chain. First-byte union 17–64, or 17–128 with the hint |
 | No mandatory literal at all | **Scalar** |
 
 Aho-Corasick's root-state prefilter skips ahead to the next position whose byte
@@ -597,13 +621,22 @@ with **no mandatory literal**. It requires:
 - **zero fallback buckets** in the set (Shufti can't skip positions that a
   fallback bucket's full-pattern DFA still has to visit for correctness);
 - the **union of first bytes** across all bucket literals falls in the
-  17–64 range (below 17 it's not worth a dedicated table; above 64 the
-  SIMD membership test itself gets expensive);
+  17–64 range without a hint, or 17–128 with `hints: [prefer-no-match]`
+  (below 17 it's not worth a dedicated table; the upper bound is where the
+  scalar tail's per-first-byte compare chain starts to cost more than the
+  SIMD probe saves);
 - and then either a **byte-rarity heuristic** predicts Shufti beats scalar
   for this specific byte set (sum of per-byte rarity scores below a
   threshold — rare bytes mean scalar can't exit early enough to win), **or**
   the set's own `hints: [prefer-no-match]` forces Shufti on regardless of
   what the heuristic predicts.
+
+Above a 64-byte union the rarity heuristic is **not consulted at all** — it
+was calibrated inside the narrow band and has nothing to say about a 90-byte
+set — so that range is hint-only and always pairs the probe with the runtime
+density switch. A wide union has little selectivity on ordinary text, and is
+worth it only when your input really is mostly outside those bytes: ASCII
+literals over binary or non-ASCII-heavy data is the shape it exists for.
 
 Shufti tests set membership against the whole first-byte union in one SIMD
 nibble-table lookup, rather than a per-candidate comparison. See

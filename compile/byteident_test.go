@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
@@ -116,7 +117,10 @@ func TestByteIdenticalPathsAreDistinct(t *testing.T) {
 	for _, name := range byteIdentFixtures(t) {
 		cfg := loadByteIdentConfig(t, name)
 		for _, re := range cfg.Regexps {
-			eng, err := SelectEngine(re.Pattern, CompileOptions{})
+			// The entry's own mode has to be passed: a byte_mode fixture names
+			// runes the default mode rejects, so asking the selector about it
+			// neutrally is asking about a pattern that does not compile.
+			eng, err := SelectEngine(re.Pattern, CompileOptions{ByteMode: re.ByteMode})
 			if err != nil {
 				t.Fatalf("%s: SelectEngine: %v", name, err)
 			}
@@ -127,6 +131,68 @@ func TestByteIdenticalPathsAreDistinct(t *testing.T) {
 	for _, want := range []EngineType{EngineDFA, EngineCompiledDFA, EngineTDFA, EngineBacktrack} {
 		if seen[want] == 0 {
 			t.Errorf("no byteident fixture reaches engine %v", want)
+		}
+	}
+}
+
+// TestByteIdenticalSetShapesAreDistinct is the set-side twin of
+// TestByteIdenticalPathsAreDistinct.
+//
+// Until these fixtures existed there was NO byte-identity pin on set output at
+// all: all fifteen original fixtures were single-pattern, so every set change
+// was made without the drift check the single-pattern path has had all along.
+// TODO 65 names that gap as a hard prerequisite for splitting CompileSet, whose
+// failure mode it also describes — reorder two layout blocks and two table
+// regions overlap, which is "not a compile error and not a WASM validation
+// error, but a module that reads one table through another's bytes".
+//
+// The spread is checked rather than asserted in a comment: a fixture set that
+// silently collapsed onto one frontend would still pass the byte comparison
+// while defending nothing.
+func TestByteIdenticalSetShapesAreDistinct(t *testing.T) {
+	frontends := map[string][]string{}
+	acceptKinds := map[string]int{}
+	capabilities := map[string]int{}
+	for _, name := range byteIdentFixtures(t) {
+		if !strings.HasPrefix(name, "set_") {
+			continue
+		}
+		cfg := loadByteIdentConfig(t, name)
+		_, _, diags, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(diags) != 1 {
+			t.Fatalf("%s: %d set diagnostics, want 1", name, len(diags))
+		}
+		d := diags[0]
+		frontends[d.Frontend] = append(frontends[d.Frontend], name)
+		for _, b := range d.Buckets {
+			acceptKinds[b.AcceptKind]++
+		}
+		for _, c := range d.Capabilities {
+			capabilities[c]++
+		}
+		t.Logf("%-18s frontend=%-12s buckets=%-3d caps=%v", name, d.Frontend, len(d.Buckets), d.Capabilities)
+	}
+	for _, want := range []string{"packed-pair", "teddy", "ac", "scalar"} {
+		if len(frontends[want]) == 0 {
+			t.Errorf("no set fixture reaches the %q frontend", want)
+		}
+	}
+	// Shufti is deliberately absent: it is selected only when Aho-Corasick
+	// declines on budget, which no YAML config can arrange. See
+	// tools/fuzz/set_shufti_test.go, which reaches it through CompileFileOpts.
+	if acceptKinds["sparse"] == 0 {
+		t.Error("no set fixture produces a SPARSE accept bucket — G17's " +
+			"per-state pattern lists are unpinned")
+	}
+	if acceptKinds["bitmask"] == 0 {
+		t.Error("no set fixture produces a bitmask accept bucket")
+	}
+	for _, want := range []string{"match_any", "match_all", "scan_any", "scan_all", "find"} {
+		if capabilities[want] == 0 {
+			t.Errorf("no set fixture declares the %q capability", want)
 		}
 	}
 }

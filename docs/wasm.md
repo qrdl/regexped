@@ -283,7 +283,7 @@ Applied when the match starts at the scanned position:
 Each Teddy tier promotion (1-byte → 2-byte → 3-byte → 4-byte) additionally
 requires every first-byte candidate's next byte to lead to a state with at
 least one live transition — a candidate that dead-ends right after its
-first byte disqualifies the whole tier (task 43, 2026-07-26).
+first byte disqualifies the whole tier (fixed 2026-07-26).
 
 ### Mandatory literal extraction
 
