@@ -71,8 +71,10 @@ regexped/
 │   │                          #   and the hidden per-position worker (a find body with the batch gate
 │   │                          #   rule / skip parameter). Cursor field widths live in config/.
 │   ├── set_union_scan.go      # Start-anywhere union automaton: one pass over the whole input.
-│   │                          #   Under set-level prefer-no-match, emitUnionSkip strides 16
-│   │                          #   bytes at a time through a state's self-loop run. Exact, not
+│   │                          #   Under set-level prefer-no-match, emitUnionSkip strides 32
+│   │                          #   bytes at a time (16 for the last stretch, which is also what
+│   │                          #   keeps the backward tail probe's window valid) through a
+│   │                          #   state's self-loop run. Exact, not
 │   │                          #   approximate: only NON-mid-accepting states qualify, so a run
 │   │                          #   has no effect but the position, and these bodies report no
 │   │                          #   position. It probes the EXIT set, never the self-loop set —

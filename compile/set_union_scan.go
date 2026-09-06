@@ -632,10 +632,23 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 }
 
 // unionUnroll is how many input bytes one iteration of the union scan's bulk
-// loop steps. Four is what the task specifies: it takes
-// the per-byte scaffolding from ~14 fuel to ~3.5 while adding three copies of
-// a ~22-instruction step to two bodies per set.
-const unionUnroll = 4
+// loop steps. Four took the per-byte scaffolding from ~14 fuel to ~3.5 while
+// adding three copies of a ~22-instruction step to two bodies per set.
+//
+// EIGHT since 2026-09-06, measured on setperf: −7% to −12.7% on twenty-four
+// rows across both hint modes — the classchain and greedy-3 no-match scans and
+// finds — for +376 to +1,200 bytes on 18 of 74 set modules, the widest being
+// classchain-128 at +4.2%.
+//
+// The cost is TWO rows, and it is the documented trade above rather than a
+// surprise: the exit tests move to once per block, so a `scan_any` that would
+// have left on byte 1 finishes its block first. greedy-3 50K a's went 141 →
+// 233 fuel (+65%) and classchain-32 dense 362 → 447 (+24%). Both are bounded
+// by unionUnroll-1 extra byte-steps — a constant of at most ~92 fuel that does
+// NOT grow with input — against wins of 140,000 to 243,000 fuel that do. That
+// asymmetry is the whole argument for taking it: a knob whose loss scaled with
+// length would not survive the same numbers.
+const unionUnroll = 8
 
 // A prev-state skip — `if state != lastOr` inside the mid-accept arm, so a
 // repeat visit to the same accepting state records nothing — was BUILT here
@@ -1073,6 +1086,67 @@ func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lArmed,
 		st.Push("skip_done")
 		b = append(b, 0x03, 0x40) // loop $skip
 		st.Push("skip")
+
+		// ── 32-byte lap ────────────────────────────────────────────────────
+		//
+		// The 16-byte body below costs ~34 fuel for the two-pair Shufti probe
+		// and ~12 for the scaffolding around it — the bounds test, the mask
+		// test, the advance and the backward branch. Two probes under ONE set
+		// of scaffolding halves that share: ~46 fuel per 32 bytes against
+		// ~92 per two laps of 16.
+		//
+		// It is a FAST PATH, not a replacement. The 16-byte body stays exactly
+		// as it was and still handles everything from `end-31` on, which is
+		// what keeps the tail probe's precondition intact: that probe loads a
+		// window backwards from `end` and shifts out the lanes below `pos`, so
+		// it is only correct while `pos >= end-16`. Widening the loop's own
+		// step to 32 would leave `pos` as far as 31 bytes back and make the
+		// shift count negative — a valid module reading the wrong lanes.
+		//
+		// The two 16-bit lane masks are combined into one 32-bit mask, so
+		// `ctz` still names the exit byte's offset directly and the stride
+		// still stops ON it.
+		b = append(b, 0x20, lPos, 0x41, 0x20, 0x6A)
+		b = append(b, 0x20, lEnd, 0x4D) // i32.le_u — a whole 32-byte lap fits
+		b = append(b, 0x04, 0x40)       // if $lap32
+		st.Push("lap32")
+
+		b = append(b, 0x20, lPos)
+		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+		b = append(b, 0x21, lChunk)
+		b = emitShuftiPrefixCheck(b, info.exitSet, lChunk)
+		b = append(b, 0x21, lMask) // low half, parked
+		b = append(b, 0x20, lPos)
+		b = append(b, 0xFD, 0x00, 0x00, 0x10) // v128.load align=0 offset=16
+		b = append(b, 0x21, lChunk)
+		b = emitShuftiPrefixCheck(b, info.exitSet, lChunk)
+		b = append(b, 0x41, 0x10, 0x74) // << 16 — the high half's lanes
+		b = append(b, 0x20, lMask, 0x72)
+		b = append(b, 0x22, lMask) // local.tee
+
+		b = append(b, 0x04, 0x40) // if (m != 0) — an exit byte is in the lap
+		st.Push("lap32_exit")
+		b = append(b, 0x20, lPos)
+		b = append(b, 0x20, lMask, 0x68) // i32.ctz
+		b = append(b, 0x6A, 0x21, lPos)
+		// Same staleness accounting as the 16-byte arm: this attempt cleared
+		// no full chunk, so it bought nothing and paid two probes.
+		b = append(b, 0x20, lStale, 0x41, 0x01, 0x6A, 0x22, lStale)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, unionSkipStaleLimit)
+		b = append(b, 0x4E)                     // i32.ge_s
+		b = append(b, 0x04, 0x40)               // if
+		b = append(b, 0x41, 0x7F, 0x21, lArmed) // armed = -1
+		b = append(b, 0x0B)                     // end if
+		b = append(b, 0x0C, st.Depth("skip_done"))
+		b = append(b, 0x0B) // end if
+		st.Pop()
+
+		// Whole lap self-loops.
+		b = append(b, 0x20, lPos, 0x41, 0x20, 0x6A, 0x21, lPos)
+		b = append(b, 0x0C, st.Depth("skip"))
+		b = append(b, 0x0B) // end if $lap32
+		st.Pop()
 
 		// pos + 16 > end: no full chunk at pos. Take ONE overlapping chunk
 		// backwards from the end instead of handing the remainder to the

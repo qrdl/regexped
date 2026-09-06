@@ -582,8 +582,9 @@ the fallback half of a mixed set.
 ```
 
 Under `hints: [prefer-no-match]` the one-pass automaton additionally **strides
-over stretches of input where no pattern could be starting**, in 16-byte SIMD
-chunks, instead of stepping a byte at a time. It applies to both accept forms
+over stretches of input where no pattern could be starting**, in 32-byte SIMD
+laps (falling back to 16 for the last stretch), instead of stepping a byte at a
+time. It applies to both accept forms
 — narrow (≤64 ids) and wide alike — and it is exact rather than approximate:
 the states it strides through are ones where no pattern can accept, and these
 bodies report no position, so a skipped run has no effect at all beyond
