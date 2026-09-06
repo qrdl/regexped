@@ -206,7 +206,7 @@ func hasBTBucketIn(buckets []*bucket) bool {
 type btSharedRegions struct {
 	stackBase   int32 // start of the shared BT frame stack
 	stackLimit  int32 // one past its end; BT reports overflow on reaching this
-	memoBase    int32 // start of the shared BitState memo (0 when unused)
+	memoBase    int32 // start of the shared BitState bitset, past its header (0 when unused)
 	winScratch  int32 // 8-byte (startOff, endOff) window slot
 	slotScratch int32 // 8-byte group-0 (start, end) buffer the BT body writes
 	end         int32 // one past everything above
@@ -237,7 +237,9 @@ func planBTRegions(buckets []*bucket, base int64) *btSharedRegions {
 	r.stackLimit = r.stackBase + int32(maxStack)
 	cur = r.stackLimit
 	if maxMemo > 0 {
-		r.memoBase = cur
+		// maxMemo (from btAllocSizes) already covers the header word that sits
+		// immediately below the bitset, so memoBase points PAST it.
+		r.memoBase = cur + btMemoHeaderBytes
 		cur += int32(maxMemo)
 	}
 	r.winScratch = cur

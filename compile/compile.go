@@ -1425,7 +1425,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			btStackLimit := btStackBase + int32(btStackSize)
 			var btMemoBase int32
 			if useMemo {
-				btMemoBase = btStackLimit
+				btMemoBase = btStackLimit + btMemoHeaderBytes
 			}
 			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx, btMemoMaxLen(len(bt.prog.Inst), matchMemoBudget))
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
@@ -1697,7 +1697,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			btStackLimit := btStackBase + int32(btStackSize)
 			var btMemoBase int32
 			if useMemo {
-				btMemoBase = btStackLimit
+				btMemoBase = btStackLimit + btMemoHeaderBytes
 			}
 			frameSize := int32(8 + btNumLoopFrameLocals(bt, false)*4) // pos + loop trackers + retryPC (no cap slots)
 			p.setFind(appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx, btMemoMaxLen(len(bt.prog.Inst), memoBudget)))
@@ -2155,14 +2155,19 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			winScratchSize = 8
 		}
 
-		if err := checkBTMemoryBudget(btBase, int64(stackSize)+memoMaxSize+winScratchSize); err != nil {
+		// memoMaxSize is the BITSET; the reservation also carries its header.
+		memoReserve := memoMaxSize
+		if useMemo {
+			memoReserve += btMemoHeaderBytes
+		}
+		if err := checkBTMemoryBudget(btBase, int64(stackSize)+memoReserve+winScratchSize); err != nil {
 			return nil, err
 		}
 		stackBase := int32(btBase)
 		stackLimit := stackBase + int32(stackSize)
 		var memoTableBase int32
 		if useMemo {
-			memoTableBase = stackBase + int32(stackSize)
+			memoTableBase = stackBase + int32(stackSize) + btMemoHeaderBytes
 		}
 
 		winScratchOff := int32(-1)
@@ -2172,9 +2177,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// address negative and hide an over-ceiling reservation from the
 		// tableEnd bookkeeping. Identical below 2GiB.
 		afterBT := btBase + int64(stackSize)
-		if useMemo {
-			afterBT += memoMaxSize
-		}
+		afterBT += memoReserve
 		if needWindow {
 			winScratchOff = int32(afterBT)
 			afterBT += 8

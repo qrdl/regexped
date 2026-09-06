@@ -167,9 +167,12 @@ func TestBtAllocSizes(t *testing.T) {
 	if memoSize != 0 {
 		t.Errorf("btAllocSizes(useMemo=false): memoSize = %d, want 0", memoSize)
 	}
+	// The reservation is the budget-sized BITSET plus the 4-byte header word
+	// that records how much of it the last call dirtied.
 	_, memoSize2 := btAllocSizes(bt, true, 0, 128*1024)
-	if memoSize2 != 128*1024 {
-		t.Errorf("btAllocSizes(useMemo=true): memoSize = %d, want 131072", memoSize2)
+	if memoSize2 != 128*1024+btMemoHeaderBytes {
+		t.Errorf("btAllocSizes(useMemo=true): memoSize = %d, want %d",
+			memoSize2, 128*1024+btMemoHeaderBytes)
 	}
 }
 

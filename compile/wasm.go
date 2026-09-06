@@ -254,3 +254,17 @@ func appendDataSegmentMem1(out []byte, offset int32, data []byte) []byte {
 	out = utils.AppendULEB128(out, uint32(len(data)))
 	return append(out, data...)
 }
+
+// appendTableMemoryFill emits `memory.fill` against the TABLE memory.
+//
+// The immediate is a memory index, and it must be the same one the
+// surrounding loads and stores use: an embedded module keeps its tables in
+// memory[1] and reads the host's input from memory[0], so a hardcoded 0 here
+// zeroes the CALLER's memory instead of the table it was meant to clear —
+// silently, since both indices are valid. The BitState memo fill did exactly
+// that until 2026-09-06, wiping up to 128 KB of host memory per call while
+// leaving the memo itself dirty.
+func appendTableMemoryFill(b []byte, tableMemIdx int) []byte {
+	b = append(b, 0xFC, 0x0B)
+	return utils.AppendULEB128(b, uint32(tableMemIdx))
+}

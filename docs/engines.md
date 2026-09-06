@@ -329,14 +329,16 @@ Memoization is only enabled when the pattern contains a **non-greedy loop whose 
 When enabled, before executing a non-greedy loop head (`InstAlt` with a backward edge), the engine checks a `(pc, pos)` visited bitset stored in WASM linear memory immediately after the backtrack stack:
 
 ```
-bitIndex  = pc * (inputLen + 1) + pos
+bitIndex  = pos * numInstructions + pc
 byteAddr  = memoTableBase + bitIndex / 8
 bit       = 1 << (bitIndex & 7)
 ```
 
 If the bit is already set, the current thread is discarded — it cannot produce a new result. Otherwise the bit is set and execution continues. This guarantees each `(pc, pos)` pair is visited at most once, bounding runtime to O(numInstructions × inputLen).
 
-The bitset is zero-initialised at the start of each call. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, computed at runtime from the actual input length, while the region reserved for it is a compile-time 128 KB. The two therefore meet at a ceiling:
+The index is **position-major**: all `numInstructions` bits belonging to one input position are adjacent. That is what keeps the clear cheap. The bytes a single search dirties are then one contiguous run from the base of the bitset, and each call zeroes exactly the run the previous call recorded in a 4-byte header word stored immediately below the bitset — rather than a region sized from the input. For a body called once per candidate position (a set's Backtracking bucket) an input-sized clear made the whole scan quadratic; this makes it linear.
+
+The bitset's addressable size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, bounded by the actual input length, while the region reserved for it is a compile-time 128 KB. The two therefore meet at a ceiling:
 
 ```
 maxInputLen = 128 KB × 8 / numInstructions − 1
@@ -348,7 +350,7 @@ The two ceilings — this one and the frame budget — move independently, with 
 
 **Memory layout:**
 ```
-[DFA find tables] → [backtrack stack] → [BitState memo bitset]
+[DFA find tables] → [backtrack stack] → [4-byte dirty header] → [BitState memo bitset]
 ```
 All regions are page-aligned and strictly non-overlapping. The input buffer is placed at address 0 by the host and never overlaps with the tables region.
 

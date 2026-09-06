@@ -1380,9 +1380,11 @@ func TestSetEmitPlanBTRegionsWithMemo(t *testing.T) {
 			largest = bkt.btFallback.memoSize
 		}
 	}
-	if int(regions.winScratch-regions.memoBase) < largest {
+	// memoBase points past the header word, so the region starts one header
+	// below it — that is what has to hold the largest bucket's reservation.
+	if int(regions.winScratch-(regions.memoBase-btMemoHeaderBytes)) < largest {
 		t.Errorf("memo region is %d bytes, smaller than the largest bucket's %d",
-			regions.winScratch-regions.memoBase, largest)
+			regions.winScratch-(regions.memoBase-btMemoHeaderBytes), largest)
 	}
 }
 
