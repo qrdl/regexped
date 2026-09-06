@@ -73,11 +73,25 @@ type sparseScratch struct {
 
 // memberReprobeCalls is how often a bucket whose member skip was judged
 // unproductive takes the dispatching walk anyway, to find out whether the
-// input has changed character. One candidate in 32 pays the dispatch, so a
-// wrong verdict costs ~3% of what it used to rather than compounding, and a
-// right one keeps ~97% of the saving. Must be a power of two: the test is a
-// mask over the candidate position.
-const memberReprobeCalls = 32
+// input has changed character. One candidate in memberReprobeCalls pays the
+// dispatch, so a wrong verdict costs that fraction of what it used to rather
+// than compounding, and a right one keeps the rest of the saving. Must be a
+// power of two: the test is a mask over the candidate position.
+//
+// memberStateReprobePeriod is the same idea one level down, for the per-STATE
+// stale flag, and the two are declared together because they must move
+// together: the per-bucket verdict counts states DISPATCHED to, and dispatches
+// only happen on a state whose flag let one through, so a per-state period
+// longer than the per-bucket one starves the verdict of evidence.
+//
+// 32 and 64 were the original pair. LM-BENCH §7.8 attributes the residual
+// ~9,000 fuel above neutral on `sparse-member-skip-norun` to the stale flags
+// and the dispatch INSIDE these re-probe walks rather than to the entry test,
+// which is what makes lengthening the periods the remedy for that row.
+const (
+	memberReprobeCalls       = 32
+	memberStateReprobePeriod = 64
+)
 
 func planSparseScratch(base int32, numPatterns, numStates int) sparseScratch {
 	s := sparseScratch{endPos: base}
@@ -651,10 +665,12 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 			b = appendTableLoad8u(b, p.tableMemIdx)
 			b = append(b, 0x45) // i32.eqz — not stale
 			b = append(b, 0x20, lPos)
-			b = append(b, 0x41, 0x3F, 0x71) // lPos & 63
-			b = append(b, 0x45)             // == 0 — the re-probe tick
-			b = append(b, 0x72)             // i32.or
-			b = append(b, 0x04, 0x40)       // if (void): attempt
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(memberStateReprobePeriod-1))
+			b = append(b, 0x71)       // lPos & (period-1)
+			b = append(b, 0x45)       // == 0 — the re-probe tick
+			b = append(b, 0x72)       // i32.or
+			b = append(b, 0x04, 0x40) // if (void): attempt
 			b = append(b, 0x20, lPos, 0x21, lWas)
 			b = emitMemberSetSkip(b, memberSkipLocals{
 				pos: lPos, length: pLen, ptr: pPtr, setID: lTmp,

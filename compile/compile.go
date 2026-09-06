@@ -481,8 +481,8 @@ type compiledPattern struct {
 	// exact at every length (regexpMinMaxLen is a true lower bound and already
 	// gates lmBareShuftiEligible, lit-anchor and set analysis), and one code
 	// path is cheaper to keep right than two.
-	minLen int32
-	groupNames     []string // groupNames[i] = name for group i+1; "" = unnamed
+	minLen     int32
+	groupNames []string // groupNames[i] = name for group i+1; "" = unnamed
 
 	// winScratchOff: table-memory offset of an 8-byte (startOff,endOff) scratch
 	// slot, written by the groups/batch-groups wrapper right before calling
