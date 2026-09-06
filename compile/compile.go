@@ -2172,7 +2172,13 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 
 		p.numGroups = bt.numGroups
 		p.winScratchOff = winScratchOff
-		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winScratchOff, memoMaxLen)
+		// Absolute capture slots, for the same reason and by the same means as
+		// the TDFA body: only when this body sits behind the groups wrapper and
+		// is NOT in window mode, which already writes absolute slots of its own.
+		if !anchored && !needWindow && buildOpts.globals != nil {
+			p.capStartGlobal = int32(buildOpts.globals.Alloc())
+		}
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winScratchOff, memoMaxLen, p.capStartGlobal)
 	}
 
 	return p, nil

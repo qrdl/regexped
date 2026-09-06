@@ -684,8 +684,8 @@ func loopCaptureLocals(prog *syntax.Prog, idom []int, loopPC int) []uint32 {
 	return locals
 }
 
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32, memoMaxLen int32) []byte {
-	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, winScratchOff, memoMaxLen)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32, memoMaxLen int32, capStartGlobal int32) []byte {
+	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, winScratchOff, memoMaxLen, capStartGlobal)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -711,7 +711,8 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // fix-up, and the wrapper needs no per-slot rebasing pass afterwards.
 // Byte consumption is still bounded by endOff (limitLocal), so window mode
 // explores exactly the same positions the narrowed slice used to.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32, memoMaxLen int32) []byte {
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32, memoMaxLen int32, capStartGlobal int32) []byte {
+
 	prog := bt.prog
 	N := len(prog.Inst)
 	numCaps := bt.numGroups
@@ -864,10 +865,21 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	body = utils.AppendSLEB128(body, int32(prog.Start))
 	body = append(body, 0x21, localState) // local.set state
 
-	// ── Initialise capture locals to -1 ─────────────────────────────────────
+	// ── Initialise capture locals ───────────────────────────────────────────
+	//
+	// -1, or `-1 - start` when this body writes ABSOLUTE slots: the bias lets
+	// the write site add `start` unconditionally and still produce exactly -1
+	// for a group that never captured. Sound because a capture local is only
+	// ever initialised here, assigned `pos`, or saved/restored verbatim through
+	// the frame stack — nothing compares one against zero.
 	for i := 0; i < numCapLocals; i++ {
 		body = append(body, 0x41, 0x7F) // i32.const -1
-		body = append(body, 0x21)       // local.set
+		if capStartGlobal >= 0 {
+			body = append(body, 0x23)
+			body = utils.AppendULEB128(body, uint32(capStartGlobal))
+			body = append(body, 0x6B) // i32.sub
+		}
+		body = append(body, 0x21) // local.set
 		body = utils.AppendULEB128(body, capStartLocal(0)+uint32(i))
 	}
 
@@ -1065,7 +1077,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopEntryLocalIdx, loopSnapBase, loopSnapLocals, extraFrameLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, limitLocal, winStartLocal, useWindow)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopEntryLocalIdx, loopSnapBase, loopSnapLocals, extraFrameLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoLenPlus1, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, limitLocal, winStartLocal, useWindow, capStartGlobal)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -1153,6 +1165,20 @@ func emitBitStateGuard(body []byte, p int, memoLenPlus1Local, memoBitIdx, memoBy
 //	second arg is brRunNested (depth from inside one if-block to restart $run).
 //
 // overflowFn: emits stack-overflow return code for btPushFrame (nil = i32.const -1; return).
+// emitAddCapStart appends `+ start` to the i32 already on the stack, for a
+// capture body writing ABSOLUTE slot positions. A no-op when capStartGlobal is
+// -1, which is every body whose slots stay relative to its own ptr.
+//
+// See compiledPattern.capStartGlobal for the channel and why it is a global.
+func emitAddCapStart(b []byte, capStartGlobal int32) []byte {
+	if capStartGlobal < 0 {
+		return b
+	}
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, uint32(capStartGlobal))
+	return append(b, 0x6A) // i32.add
+}
+
 func emitBTInstHandler(
 	body []byte,
 	bt *backtrack,
@@ -1176,6 +1202,7 @@ func emitBTInstHandler(
 	tableMemIdx int,
 	limitLocal, winStartLocal uint32,
 	useWindow bool,
+	capStartGlobal int32,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
@@ -1527,13 +1554,15 @@ func emitBTInstHandler(
 		if useWindow {
 			body = btLocalGet(body, winStartLocal)
 		} else {
-			body = append(body, 0x41, 0x00) // i32.const 0 (group 0 start)
+			body = append(body, 0x41, 0x00)              // i32.const 0 (group 0 start)
+			body = emitAddCapStart(body, capStartGlobal) // ... = start, when absolute
 		}
 		body = append(body, 0x36, 0x02)     // i32.store align=2
 		body = utils.AppendULEB128(body, 0) // offset=0
 
 		body = append(body, 0x20, localOutPtr)
 		body = append(body, 0x20, localPos)
+		body = emitAddCapStart(body, capStartGlobal)
 		body = append(body, 0x36, 0x02)     // i32.store align=2
 		body = utils.AppendULEB128(body, 4) // offset=4 (group 0 end)
 
@@ -1546,12 +1575,14 @@ func emitBTInstHandler(
 			body = append(body, 0x20, localOutPtr)
 			body = append(body, 0x20)
 			body = utils.AppendULEB128(body, capStartLocal(i))
+			body = emitAddCapStart(body, capStartGlobal)
 			body = append(body, 0x36, 0x02) // i32.store align=2
 			body = utils.AppendULEB128(body, startOffset)
 
 			body = append(body, 0x20, localOutPtr)
 			body = append(body, 0x20)
 			body = utils.AppendULEB128(body, capEndLocal(i))
+			body = emitAddCapStart(body, capStartGlobal)
 			body = append(body, 0x36, 0x02) // i32.store align=2
 			body = utils.AppendULEB128(body, endOffset)
 		}
@@ -2300,6 +2331,8 @@ func buildBTInnerDisp(
 			tableMemIdx,
 			uint32(localLen), 0,
 			false,
+			// No-capture bodies write no slots, so there is nothing to rebase.
+			-1,
 		)
 	}
 	return body

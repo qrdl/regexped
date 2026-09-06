@@ -497,7 +497,10 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			// Per-bucket, not per-set: the shared memo region is sized to the
 			// LARGEST bucket's reservation, but each body's fill is sized from
 			// its OWN N, so each must be bounded by its own ceiling.
-			btMemoMaxLen(len(info.bt.prog.Inst), resolveMemoBudget(nil)))
+			btMemoMaxLen(len(info.bt.prog.Inst), resolveMemoBudget(nil)),
+			// Set BT buckets are driven directly, not through the groups
+			// wrapper, and use window mode — their slots are already absolute.
+			-1)
 		cs.btFnBodies = append(cs.btFnBodies, driver)
 
 		// gated and skip-carrying are mutually exclusive and mean DIFFERENT
