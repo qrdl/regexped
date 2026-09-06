@@ -2139,7 +2139,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				panic("compile: pattern contributes a find function but no findFromMode was recorded — " +
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
-			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode)
+			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.minLen)
 		}
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false

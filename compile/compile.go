@@ -471,6 +471,17 @@ type compiledPattern struct {
 	// because compile/find_from.go already established this exact channel shape
 	// for the same reason.
 	capStartGlobal int32
+
+	// minLen is the shortest string this pattern can match, or 0 when it can
+	// match empty. The exported find wrapper turns it into a one-test early
+	// exit: a remainder shorter than this cannot contain a match, so there is
+	// nothing to scan.
+	//
+	// Unconditional by decision — not gated on any declared input length. It is
+	// exact at every length (regexpMinMaxLen is a true lower bound and already
+	// gates lmBareShuftiEligible, lit-anchor and set analysis), and one code
+	// path is cheaper to keep right than two.
+	minLen int32
 	groupNames     []string // groupNames[i] = name for group i+1; "" = unnamed
 
 	// winScratchOff: table-memory offset of an 8-byte (startOff,endOff) scratch
@@ -2472,7 +2483,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				panic("compile: pattern contributes a find function but no findFromMode was recorded — " +
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
-			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode)
+			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.minLen)
 		}
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
@@ -2565,6 +2576,14 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 		p, err := compilePattern(re, cur, forceGroupsEngine, opts)
 		if err != nil {
 			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
+		}
+		// Set here rather than inside compilePattern: that function reaches its
+		// several returns through as many parse branches, and this needs the
+		// AST at exactly one of them.
+		if parsed, perr := syntax.Parse(re.Pattern, syntax.Perl); perr == nil {
+			if n, _ := regexpMinMaxLen(parsed); n > 0 {
+				p.minLen = int32(n)
+			}
 		}
 		// Batch find/groups export trigger. Sole
 		// trigger for batchFindExport/batchGroupsExport — independent of
