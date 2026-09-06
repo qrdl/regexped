@@ -2429,7 +2429,7 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	}
 
 	if useMemo {
-		body = emitBTMemoZeroInit(body, memoTableBase, N, memoLenPlus1, memoZeroLen, memoMaxLen)
+		body = emitBTMemoZeroInit(body, memoTableBase, N, memoLenPlus1, memoZeroLen, memoMaxLen, false)
 	}
 
 	// loop $run
@@ -2567,13 +2567,16 @@ func emitBTMemoLenGuard(body []byte, memoMaxLen int32, i64Return bool) []byte {
 }
 
 // emitBTMemoZeroInit emits a memory.fill instruction to zero the memo bitset.
+// i64Return selects the type of the memo-length guard's sentinel, which must
+// match the enclosing function's result type: the no-capture MATCH body returns
+// i32, the no-capture FIND body returns i64.
 func emitBTMemoZeroInit(body []byte, memoTableBase int32, N int,
-	memoLenPlus1, memoZeroLen uint32, memoMaxLen int32) []byte {
+	memoLenPlus1, memoZeroLen uint32, memoMaxLen int32, i64Return bool) []byte {
 
 	// The fill below is sized from localLen and the reservation is not, so an
 	// input past memoMaxLen would run the fill off the end of it.
 	body = append(body, 0x20, localLen)
-	body = emitBTMemoLenGuard(body, memoMaxLen, false)
+	body = emitBTMemoLenGuard(body, memoMaxLen, i64Return)
 
 	// lenPlus1 = localLen + 1
 	body = append(body, 0x20, localLen, 0x41, 0x01, 0x6A, 0x21)
@@ -2822,6 +2825,37 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// was simply never told where to start.
 	body, findFrom = emitFindFromSeed(body, attemptCursor)
 
+	// ── BitState memo: zeroed ONCE per call, not once per attempt ────────────
+	//
+	// This is the difference between a linear search and a quadratic one, and
+	// it is the whole cost of this body on a no-match input. The memo is
+	// N*(len+1) bits — sized from the WHOLE input — and re-zeroing it at every
+	// attempt_start makes the search O(N*len^2). Measured on
+	// `(?:a?)+?xyz` over a no-match input, fuel per doubling of length:
+	//
+	//	len       64      128      256      512     1024     2048     4096
+	//	per-att  x---    x3.86    x3.93    x3.96    x3.98    x3.99    x4.00
+	//	per-call x---    x1.98    x1.99    x1.99    x2.00    x2.00    x2.00
+	//
+	// x4.00 per doubling is quadratic; x2.00 is linear. At 4,096 bytes that is
+	// 1,796,155,500 fuel against 1,811,052 — a factor of 992, and the factor
+	// grows with length.
+	//
+	// Hoisting is sound HERE and only here, because this body tracks no
+	// captures: its entire NFA state is (pc, pos). A pair marked during a
+	// failed attempt has no accepting continuation, and that fact does not
+	// depend on which start position reached it — so a later attempt may prune
+	// it. The CAPTURE body (buildBacktrackBody) must keep its per-attempt fill:
+	// its state includes the capture registers, so the same (pc, pos) can carry
+	// a different answer.
+	//
+	// The per-attempt form also trimmed the fill by `attempt_start >> 3`. That
+	// trim existed only because the fill was repeated; one fill from 0 covers
+	// every attempt this call will make.
+	if useMemo {
+		body = emitBTMemoZeroInit(body, memoTableBase, N, memoLenPlus1, memoZeroLen, memoMaxLen, true)
+	}
+
 	// ── Mandatory-literal two-level outer loop ────────────────────────────────
 	// When mandLit != nil: outer loop $lit_outer scans for the mandatory literal
 	// using an SIMD prefix scan, inner loop $outer runs BT from each candidate
@@ -2948,9 +2982,6 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			}
 			body = utils.AppendULEB128(body, loopEntryLocalIdx[pc])
 		}
-		if useMemo {
-			body = emitBTMemoZeroInitTrimmed(body, memoTableBase, N, memoLenPlus1, memoZeroLen, memoMaxLen)
-		}
 
 		// block $run_exit / loop $run / dispatch
 		failEmpty := func(bb []byte) []byte {
@@ -3024,9 +3055,6 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 				b = append(b, 0x41, 0x7F, 0x21)
 			}
 			b = utils.AppendULEB128(b, loopEntryLocalIdx[pc])
-		}
-		if useMemo {
-			b = emitBTMemoZeroInitTrimmed(b, memoTableBase, N, memoLenPlus1, memoZeroLen, memoMaxLen)
 		}
 
 		// block $run_exit
