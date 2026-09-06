@@ -1239,7 +1239,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		shuftiFirstByteSet:  shuftiFirstByteSet,
 		packedPair:          packedPair,
 		shuftiAdaptive:      shuftiAdaptive,
-		unionSkipLNM:        opts.LikelyMode == LikelyNoMatch,
+		unionSkipLNM:        opts.LikelyMode == LikelyNoMatch && !measureOff(MeasureUnionStride),
 		litToBuckets:        litToBuckets,
 		litLens:             litLens,
 		diag:                diag,
@@ -2113,7 +2113,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winScratchOff
 				}
-				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff)
+				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal)
 			}
 		}
 		if p.batchFindExport != "" {

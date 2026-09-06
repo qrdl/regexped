@@ -231,7 +231,7 @@ func decodeControlFlow(t *testing.T, b []byte) []string {
 		case 0x20, 0x21, 0x22, 0x41: // local.get/set/tee, i32.const
 			i++
 			skipLEB()
-		case 0x45, 0x46, 0x47, 0x4B, 0x6A, 0x68, 0x73: // eqz, eq, ne, gt_u, add, ctz, xor
+		case 0x45, 0x46, 0x47, 0x4B, 0x4F, 0x6A, 0x6B, 0x68, 0x73, 0x76: // eqz, eq, ne, gt_u, ge_u, add, sub, ctz, xor, shr_u
 			i++
 		case 0xFD: // SIMD prefix
 			i++
@@ -259,6 +259,41 @@ func decodeControlFlow(t *testing.T, b []byte) []string {
 	return ops
 }
 
+// bulkSkipWantShape is the control-flow shape emitTDFABulkSkip must produce.
+//
+// Shared by both shape tests so the two cannot drift apart, and spelled out
+// rather than compared against a golden dump because the POINT of the test is
+// that a reader can see the nesting is what the emitter's comments claim.
+//
+// The leading `if` nest is the overlapping tail probe: the loop no longer
+// abandons a run when fewer than 16 bytes remain, it takes one more chunk
+// backwards from the end and masks off the lanes it has already passed. Before
+// that landed this began `br_if 1`, straight out to $skip_done.
+func bulkSkipWantShape() []string {
+	return []string{
+		"block", // $skip_done
+		"loop",  // $chunks
+		"if",    // pos + 16 > len: the tail probe
+		"if",    //   len >= 16: a full window exists
+		"if",    //     mask == 0: every remaining byte self-loops
+		"else",  //     otherwise stop on the first exit byte
+		"end",
+		"end",  //   end $tail_window
+		"br 2", //   -> $skip_done either way
+		"end",  // end $tail
+		"if",   // mask == 0 (the full-chunk path)
+		"br 1", // continue $chunks
+		"else",
+		"br 2", // break $skip_done
+		"end",  // end if
+		"end",  // end loop $chunks
+		"end",  // end block $skip_done
+		"if",   // pos != skipStart
+		"br 2", // loop back to $main
+		"end",  // end if
+	}
+}
+
 func TestEmitTDFABulkSkipShape(t *testing.T) {
 	info := &tdfaBulkSkipInfo{
 		wasmState:     5,
@@ -275,21 +310,7 @@ func TestEmitTDFABulkSkipShape(t *testing.T) {
 	b := emitTDFABulkSkip(nil, info, localPos, localChunk, localMask, localSkipStart, localCapBase, nil)
 
 	got := decodeControlFlow(t, b)
-	want := []string{
-		"block",   // $skip_done
-		"loop",    // $chunks
-		"br_if 1", // insufficient bytes -> $skip_done
-		"if",      // mask == 0
-		"br 1",    // continue $chunks
-		"else",
-		"br 2", // break $skip_done
-		"end",  // end if
-		"end",  // end loop $chunks
-		"end",  // end block $skip_done
-		"if",   // pos != skipStart
-		"br 2", // loop back to $main
-		"end",  // end if
-	}
+	want := bulkSkipWantShape()
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("control-flow shape mismatch:\ngot:  %v\nwant: %v", got, want)
 	}
@@ -306,12 +327,7 @@ func TestEmitTDFABulkSkipShapeNoTagOps(t *testing.T) {
 	}
 	b := emitTDFABulkSkip(nil, info, 3, 10, 11, 12, 7, nil)
 	got := decodeControlFlow(t, b)
-	want := []string{
-		"block", "loop", "br_if 1",
-		"if", "br 1", "else", "br 2", "end",
-		"end", "end",
-		"if", "br 2", "end",
-	}
+	want := bulkSkipWantShape()
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("control-flow shape mismatch:\ngot:  %v\nwant: %v", got, want)
 	}

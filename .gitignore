@@ -58,3 +58,7 @@ tools/pattest/pattest
 tools/settest/settest
 tools/re2test/make_sets/make_sets
 tools/likelytest/*.txt
+tools/lentest/lentest
+# tools/lentest/baseline_len.txt is deliberately NOT ignored: fuel is
+# deterministic, so the baseline is reviewable in a diff and an accidental
+# overwrite is recoverable — unlike likelytest's and setperf's, which are not.

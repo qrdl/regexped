@@ -144,13 +144,68 @@ func emitTDFABulkSkip(b []byte, info *tdfaBulkSkipInfo, localPos, localChunk, lo
 	b = append(b, 0x02, 0x40) // block $skip_done
 	b = append(b, 0x03, 0x40) // loop $chunks
 
-	// if pos + 16 > len: br_if 1 -> $skip_done (not enough bytes for a full chunk)
+	// pos + 16 > len: not enough bytes for a full chunk at pos. Rather than
+	// leave the remainder to the scalar walk, take ONE overlapping chunk
+	// backwards from the end and mask off the lanes below pos.
+	//
+	// Without this the last `len mod 16` bytes of every run are walked one at a
+	// time, which is the sawtooth the plan measured on the capture body: the
+	// same pattern costs 1,013 fuel at a 15-byte run and 227 at 16, and 1,072 at
+	// 31 against 263 at 32. The step is entirely the missing tail.
+	//
+	// Every byte read is inside the input (guarded on len >= 16), so nothing has
+	// to be arranged with the caller. Correctness is the same argument the
+	// prefix scan's tail probe uses: the shift drops exactly the lanes for
+	// positions before pos, which this attempt has already passed, and a zero
+	// mask proves every remaining byte self-loops — so the walk can go straight
+	// to len instead of stepping there, which is what the scalar loop would have
+	// concluded one byte at a time.
 	b = append(b, 0x20, byte(localPos))
 	b = append(b, 0x41, 0x10) // i32.const 16
 	b = append(b, 0x6A)       // i32.add
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x4B)       // i32.gt_u
-	b = append(b, 0x0D, 0x01) // br_if 1
+	b = append(b, 0x04, 0x40) // if $tail
+	b = append(b, 0x20, 0x01) // local.get len
+	b = append(b, 0x41, 0x10) // i32.const 16
+	b = append(b, 0x4F)       // i32.ge_u — a full window exists in the input
+	b = append(b, 0x04, 0x40) // if $tail_window
+
+	// chunk = v128.load(ptr + len - 16)
+	b = append(b, 0x20, 0x00) // local.get ptr
+	b = append(b, 0x20, 0x01) // local.get len
+	b = append(b, 0x41, 0x10) // i32.const 16
+	b = append(b, 0x6B)       // i32.sub
+	b = append(b, 0x6A)       // i32.add
+	b = append(b, 0xFD, 0x00, 0x00, 0x00)
+	b = append(b, 0x21, byte(localChunk))
+
+	// mask = shufti_stop(chunk) >> (pos - (len - 16))
+	b = emitShuftiStopMask(b, info.selfLoopBytes, byte(localChunk))
+	b = append(b, 0x20, byte(localPos))
+	b = append(b, 0x20, 0x01) // local.get len
+	b = append(b, 0x6B)       // i32.sub
+	b = append(b, 0x41, 0x10) // i32.const 16
+	b = append(b, 0x6A)       // i32.add — shift, in [1,16]
+	b = append(b, 0x76)       // i32.shr_u
+	b = append(b, 0x21, byte(localMask))
+
+	b = append(b, 0x20, byte(localMask))
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x04, 0x40) // if — every remaining byte self-loops
+	b = append(b, 0x20, 0x01) // local.get len
+	b = append(b, 0x21, byte(localPos))
+	b = append(b, 0x05) // else — stop ON the first exit byte at or after pos
+	b = append(b, 0x20, byte(localMask))
+	b = append(b, 0x68) // i32.ctz
+	b = append(b, 0x20, byte(localPos))
+	b = append(b, 0x6A) // i32.add
+	b = append(b, 0x21, byte(localPos))
+	b = append(b, 0x0B) // end if
+
+	b = append(b, 0x0B)       // end if $tail_window
+	b = append(b, 0x0C, 0x02) // br 2 -> $skip_done
+	b = append(b, 0x0B)       // end if $tail
 
 	// chunk = v128.load(ptr + pos)
 	b = append(b, 0x20, 0x00) // local.get ptr

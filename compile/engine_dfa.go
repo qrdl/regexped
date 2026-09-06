@@ -4306,6 +4306,15 @@ func applyDominantStateEncoding(l *dfaLayout, encodeNonMid bool) {
 // should also carry it is a separate measurement with a different balance —
 // it would move every fixture in this family — and is deliberately not asked
 // here.
+// measureClassChainFor is classChainFor with T0.6's measurement gate. See
+// compile/measure.go.
+func measureClassChainFor(l *dfaLayout, t *dfaTable) *classChainPrefix {
+	if measureOff(MeasureClassChain) {
+		return nil
+	}
+	return classChainFor(l, t)
+}
+
 func classChainFor(l *dfaLayout, t *dfaTable) *classChainPrefix {
 	if !l.lmClassChain {
 		return nil
@@ -4809,7 +4818,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		// only at position 0.
 		futureOff:           futureOff,
 		future:              futureWASM,
-		memberSkip:          memberWalkStates(t),
+		memberSkip:          measureMemberWalkStates(t),
 		wasmStart:           uint32(t.startState + 1),
 		wasmMidStart:        uint32(t.midStartState + 1),
 		wasmMidStartNewline: uint32(t.midStartNewlineState + 1),
@@ -6034,7 +6043,7 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 			tableMemIdx:           tableMemIdx,
 			dominantStates:        l.dominantStates,
 			soleMidDominant:       soleMidDominant(l),
-			classChain:            classChainFor(l, t),
+			classChain:            measureClassChainFor(l, t),
 			lnmAction5:            l.lnmAction5,
 			skipSafeOnDead:        l.skipSafeOnDead,
 			eofSkipSafe:           l.eofSkipSafe,
@@ -9290,6 +9299,46 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	// the neutral twin left a five-byte zero-padded immediate. -1 when this
 	// body emits no handoff, which is every body without a twin.
 	twinCallPatch := -1
+
+	// emitScanPreload emits the prefix scan's loop-invariant Teddy nibble-table
+	// loads ONCE, above `loop $outer`, for the emission inside it that sets
+	// PreloadHoisted.
+	//
+	// It reads the v128 local indices at CALL time, not at closure-creation
+	// time, because assignV128Locals rewrites them per table-width variant and
+	// each variant emits its own body. Called after that assignment and before
+	// the loop opens.
+	//
+	// A no-op unless the scan strategy actually reads the tables, so the three
+	// call sites need no condition of their own.
+	emitScanPreload := func(b []byte) []byte {
+		return emitPrefixScanPreload(b, prefixScanParams{
+			FirstByteSet:   firstBytes,
+			TeddyLoOff:     teddyLoOff,
+			TeddyHiOff:     teddyHiOff,
+			TeddyT1LoOff:   teddyT1LoOff,
+			TeddyT1HiOff:   teddyT1HiOff,
+			TeddyTwoByte:   teddyTwoByte,
+			TeddyT2LoOff:   teddyT2LoOff,
+			TeddyT2HiOff:   teddyT2HiOff,
+			TeddyThreeByte: teddyThreeByte,
+			TeddyT3LoOff:   teddyT3LoOff,
+			TeddyT3HiOff:   teddyT3HiOff,
+			TeddyFourByte:  teddyFourByte,
+			TableMemIdx:    tableMemIdx,
+			Locals: prefixScanLocals{
+				TLo:  tLoLocal,
+				THi:  tHiLocal,
+				T1Lo: t1LoLocal,
+				T1Hi: t1HiLocal,
+				T2Lo: t2LoLocal,
+				T2Hi: t2HiLocal,
+				T3Lo: t3LoLocal,
+				T3Hi: t3HiLocal,
+			},
+		})
+	}
+
 	emitOuterPrologue := func(b []byte) []byte {
 		lenForScan := byte(1) // raw len param
 		params := prefixScanParams{
@@ -9312,7 +9361,12 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			LikelyNoMatch:    lnmAction5,
 			AllowDenseSwitch: needsDenseSwitch,
 			HasTwin:          p.hasTwin,
-			EngineDepth:      2, // loop $outer + block $no_match
+			// The Teddy nibble-table loads are emitted once by
+			// emitScanPreload, above `loop $outer`. Left here they re-ran on
+			// every attempt for no gain — the tables are compile-time
+			// constants and their locals are written nowhere else.
+			PreloadHoisted: true,
+			EngineDepth:    2, // loop $outer + block $no_match
 			Locals: prefixScanLocals{
 				Ptr:           0,
 				Len:           lenForScan,
@@ -9979,6 +10033,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		if useMandatoryLit {
 			b = emitMLOuterSetup(b)
 		} else {
+			b = emitScanPreload(b)    // loop-invariant, so above the loop
 			b = append(b, 0x03, 0x40) // loop $outer
 			b = emitOuterPrologue(b)
 		}
@@ -10064,6 +10119,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		if useMandatoryLit {
 			b = emitMLOuterSetup(b)
 		} else {
+			b = emitScanPreload(b)    // loop-invariant, so above the loop
 			b = append(b, 0x03, 0x40) // loop $outer
 			b = emitOuterPrologue(b)
 		}
@@ -10137,6 +10193,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	if useMandatoryLit {
 		b = emitMLOuterSetup(b)
 	} else {
+		b = emitScanPreload(b)    // loop-invariant, so above the loop
 		b = append(b, 0x03, 0x40) // loop $outer
 		b = emitOuterPrologue(b)
 	}

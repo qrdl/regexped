@@ -396,7 +396,30 @@ type CompileOptions struct {
 	// MemoBudget is the maximum bytes allocated for the BitState memoization
 	// buffer. Only used when the pattern requires BitState (needsBitState == true).
 	// Defaults to 128*1024 (128 KB) when zero.
-	MemoBudget  int
+	MemoBudget int
+
+	// InputLength is the caller's TYPICAL input length in bytes, or 0 when they
+	// did not say. It is an EXPECTATION, never a promise: it changes only which
+	// code is emitted, and the emitted code stays correct at every length, so a
+	// caller who mispredicts loses performance and never an answer.
+	//
+	// Every SIMD mechanism in the tree is gated on 16 to 33 bytes of remaining
+	// input and every crossover around them was measured on 50-100 KB corpora.
+	// On an input shorter than one chunk those mechanisms cannot execute, and
+	// the pattern carries no signal about that — the win case and the harm case
+	// of a given channel compile the identical pattern. Only the caller knows.
+	//
+	// Consumers apply their OWN threshold to it (17 for the dominant channels,
+	// 16 for the class-chain verify, MinLen+31 for the set packed-pair frontend,
+	// 2*numStates for the overlapping work sweep), rather than the compiler
+	// mapping it onto size classes.
+	//
+	// NOT YET CONSUMED by any emitter: it exists so tools/lentest has a real
+	// axis to sweep and so the mechanisms can be wired to it one at a time, each
+	// with its own measurement. While nothing reads it, every value produces a
+	// byte-identical module, which is what `make byteident` asserts.
+	InputLength int
+
 	tableMemIdx int // 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables)
 
 	// globals is the module's WASM global allocator, shared by every pattern
@@ -433,9 +456,22 @@ type compiledPattern struct {
 	// composed wrapper's find half carries the mode instead.
 	captureFromMode findFromMode
 
-	numGroups  int      // capture group count (for wrapper slot adjustment)
-	isTDFA     bool     // true = TDFA capture; false = Backtracking (controls sentinel data segment)
-	groupNames []string // groupNames[i] = name for group i+1; "" = unnamed
+	numGroups int  // capture group count (for wrapper slot adjustment)
+	isTDFA    bool // true = TDFA capture; false = Backtracking (controls sentinel data segment)
+
+	// capStartGlobal is the module global through which the groups wrapper
+	// hands this pattern's TDFA capture body the match's start offset, so the
+	// body writes ABSOLUTE slot positions and the wrapper needs no per-slot
+	// rebasing pass. -1 when the pattern has no such channel: every
+	// Backtracking capture body, the trivial single-capture fast path, and an
+	// anchored TDFA export, which has no wrapper in front of it at all.
+	//
+	// A global rather than a fourth parameter because the capture body's
+	// (ptr,len,out_ptr)->i32 type is SHARED with the Backtracking bodies, and
+	// because compile/find_from.go already established this exact channel shape
+	// for the same reason.
+	capStartGlobal int32
+	groupNames     []string // groupNames[i] = name for group i+1; "" = unnamed
 
 	// winScratchOff: table-memory offset of an 8-byte (startOff,endOff) scratch
 	// slot, written by the groups/batch-groups wrapper right before calling
@@ -961,9 +997,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// Gap C: single-pattern range with captures (greedy).
 		if lcp, lcc, ok := analyseLitChainGroupsRange(re.Pattern); ok {
 			p := &compiledPattern{
-				tableEnd:  tableBase,
-				numGroups: lcc.numGroups,
-				anchored:  true,
+				capStartGlobal: -1,
+				tableEnd:       tableBase,
+				numGroups:      lcc.numGroups,
+				anchored:       true,
 			}
 			p.groupsExport = re.GroupsFunc
 			if needFind {
@@ -983,9 +1020,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 		if lcp, lcc, ok := analyseLitChainGroups(re.Pattern); ok {
 			p := &compiledPattern{
-				tableEnd:  tableBase,
-				numGroups: lcc.numGroups,
-				anchored:  true, // captureBody IS the exported groups function (native A.3 path)
+				capStartGlobal: -1,
+				tableEnd:       tableBase,
+				numGroups:      lcc.numGroups,
+				anchored:       true, // captureBody IS the exported groups function (native A.3 path)
 			}
 			p.groupsExport = re.GroupsFunc
 			if needMatch {
@@ -1011,9 +1049,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				// (Gap B). Fall through to the standard pipeline.
 			} else {
 				p := &compiledPattern{
-					tableEnd:  tableBase,
-					numGroups: branchCaps[0].numGroups,
-					anchored:  true, // captureBody IS the exported groups function (native A.3 path)
+					capStartGlobal: -1,
+					tableEnd:       tableBase,
+					numGroups:      branchCaps[0].numGroups,
+					anchored:       true, // captureBody IS the exported groups function (native A.3 path)
 				}
 				p.groupsExport = re.GroupsFunc
 				layout := planLitChainAltLayout(altp, tableBase)
@@ -1067,9 +1106,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						selEng, tt := selectBestEngineWithTDFA(prog, &buildOpts)
 						if selEng == EngineTDFA && tt != nil {
 							p := &compiledPattern{
-								tableEnd:  tableBase,
-								numGroups: tt.numGroups,
-								isTDFA:    true,
+								capStartGlobal: -1,
+								tableEnd:       tableBase,
+								numGroups:      tt.numGroups,
+								isTDFA:         true,
 							}
 							p.groupsExport = re.GroupsFunc
 							p.groupNames = extractGroupNames(parsed)
@@ -1101,7 +1141,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 								lmNonMidShufti:       false,
 								lmWideShufti:         false,
 							})
-							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, false)
+							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, false, -1)
 							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
 							p.dataBytes = append(p.dataBytes, rawTDFA...)
 							p.dataSegCount += cntTDFA
@@ -1119,10 +1159,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// Gap E: mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
 		if lcp, ok := analyseLitChainPrefixed(re.Pattern); ok {
 			p := &compiledPattern{
-				matchExport: re.MatchFunc,
-				findExport:  re.FindFunc,
-				anchored:    false,
-				tableEnd:    tableBase,
+				capStartGlobal: -1,
+				matchExport:    re.MatchFunc,
+				findExport:     re.FindFunc,
+				anchored:       false,
+				tableEnd:       tableBase,
 			}
 			if needMatch {
 				p.matchBody = appendLitChainPrefixedMatchCodeEntry(nil, lcp)
@@ -1139,10 +1180,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 		if lcp, ok := analyseLitChain(re.Pattern, litChainMinCount); ok {
 			p := &compiledPattern{
-				matchExport: re.MatchFunc,
-				findExport:  re.FindFunc,
-				anchored:    false,
-				tableEnd:    tableBase,
+				capStartGlobal: -1,
+				matchExport:    re.MatchFunc,
+				findExport:     re.FindFunc,
+				anchored:       false,
+				tableEnd:       tableBase,
 			}
 			if needMatch {
 				p.matchBody = appendLitChainMatchCodeEntry(nil, lcp)
@@ -1177,10 +1219,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			//   find/groups non-greedy: collapses to {N,N} via existing emission
 			//   (just normalise countMax = count and use buildLitChainFindBody)
 			p := &compiledPattern{
-				matchExport: re.MatchFunc,
-				findExport:  re.FindFunc,
-				anchored:    false,
-				tableEnd:    tableBase,
+				capStartGlobal: -1,
+				matchExport:    re.MatchFunc,
+				findExport:     re.FindFunc,
+				anchored:       false,
+				tableEnd:       tableBase,
 			}
 			if needMatch {
 				p.matchBody = appendLitChainRangeMatchCodeEntry(nil, lcp)
@@ -1204,9 +1247,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		if needMatch && !needFind {
 			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
 				p := &compiledPattern{
-					matchExport: re.MatchFunc,
-					anchored:    false,
-					tableEnd:    tableBase,
+					capStartGlobal: -1,
+					matchExport:    re.MatchFunc,
+					anchored:       false,
+					tableEnd:       tableBase,
 				}
 				p.matchBody = appendLitChainAltMatchCodeEntry(nil, altp)
 				return p, nil
@@ -1216,11 +1260,12 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				layout := planLenAltLayout(lenAltp, tableBase)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				p := &compiledPattern{
-					matchExport:  re.MatchFunc,
-					anchored:     false,
-					tableEnd:     layout.tableEnd,
-					dataBytes:    dataBytes,
-					dataSegCount: segCount,
+					capStartGlobal: -1,
+					matchExport:    re.MatchFunc,
+					anchored:       false,
+					tableEnd:       layout.tableEnd,
+					dataBytes:      dataBytes,
+					dataSegCount:   segCount,
 				}
 				p.matchBody = appendLenAltMatchCodeEntry(nil, lenAltp, layout, buildOpts.tableMemIdx)
 				return p, nil
@@ -1234,11 +1279,12 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				findBody, ffMode := appendLitChainAltPrefixedFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx)
 				p := &compiledPattern{
-					findExport:   re.FindFunc,
-					anchored:     false,
-					dataBytes:    dataBytes,
-					dataSegCount: segCount,
-					tableEnd:     layout.tableEnd,
+					capStartGlobal: -1,
+					findExport:     re.FindFunc,
+					anchored:       false,
+					dataBytes:      dataBytes,
+					dataSegCount:   segCount,
+					tableEnd:       layout.tableEnd,
 				}
 				p.setFind(findBody, ffMode)
 				return p, nil
@@ -1259,13 +1305,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				findBody = utils.AppendULEB128(findBody, uint32(len(body)))
 				findBody = append(findBody, body...)
 				p := &compiledPattern{
-					findExport:   re.FindFunc,
-					anchored:     false,
-					findBody:     findBody,
-					findFromMode: ffMode,
-					dataBytes:    dataBytes,
-					dataSegCount: segCount,
-					tableEnd:     layout.tableEnd,
+					capStartGlobal: -1,
+					findExport:     re.FindFunc,
+					anchored:       false,
+					findBody:       findBody,
+					findFromMode:   ffMode,
+					dataBytes:      dataBytes,
+					dataSegCount:   segCount,
+					tableEnd:       layout.tableEnd,
 				}
 				return p, nil
 			}
@@ -1275,11 +1322,12 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				findBody, ffMode := appendLitChainAltRangeFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx)
 				p := &compiledPattern{
-					findExport:   re.FindFunc,
-					anchored:     false,
-					dataBytes:    dataBytes,
-					dataSegCount: segCount,
-					tableEnd:     layout.tableEnd,
+					capStartGlobal: -1,
+					findExport:     re.FindFunc,
+					anchored:       false,
+					dataBytes:      dataBytes,
+					dataSegCount:   segCount,
+					tableEnd:       layout.tableEnd,
 				}
 				p.setFind(findBody, ffMode)
 				return p, nil
@@ -1295,13 +1343,14 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				findBody = utils.AppendULEB128(findBody, uint32(len(body)))
 				findBody = append(findBody, body...)
 				p := &compiledPattern{
-					findExport:   re.FindFunc,
-					anchored:     false,
-					findBody:     findBody,
-					findFromMode: ffMode,
-					dataBytes:    dataBytes,
-					dataSegCount: segCount,
-					tableEnd:     layout.tableEnd,
+					capStartGlobal: -1,
+					findExport:     re.FindFunc,
+					anchored:       false,
+					findBody:       findBody,
+					findFromMode:   ffMode,
+					dataBytes:      dataBytes,
+					dataSegCount:   segCount,
+					tableEnd:       layout.tableEnd,
 				}
 				return p, nil
 			}
@@ -1378,7 +1427,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
 				useAcceptSideTable:   false,
 				lmBareShufti:         false,
-				lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
+				lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch && !measureOff(MeasureNonMidShufti),
 				lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
 			})
 			// Since 2026-07-18: non-mid dominants are default-on for
@@ -1400,7 +1449,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// gate was proven to be instruction-placement noise
 			// (padding-scan experiment, 2026-07-18); decisions here are
 			// gated on fuel only.
-			applyDominantStateEncoding(lm, true)
+			if !measureOff(MeasureDominantMatch) {
+				applyDominantStateEncoding(lm, true)
+			} else {
+				lm.dominantStates = nil
+			}
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false, false))
 			matchData = rawM
@@ -1527,7 +1580,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
 			useAcceptSideTable:   false,
 			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern),
-			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
+			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch && !measureOff(MeasureNonMidShufti),
 			lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
 			lmClassChain:         buildOpts.LikelyMode == LikelyMatch,
 		})
@@ -1538,9 +1591,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 
 	p := &compiledPattern{
-		matchExport: re.MatchFunc,
-		findExport:  re.FindFunc,
-		anchored:    anchored,
+		capStartGlobal: -1,
+		matchExport:    re.MatchFunc,
+		findExport:     re.FindFunc,
+		anchored:       anchored,
 	}
 	if anchored {
 		// On this path `anchored` really does mean "can only match at 0" —
@@ -1877,7 +1931,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// dispatch (emitNonMidBulkSkipHyst), so neutral callers keep
 			// the −90% long-run win and short-run inputs self-disable the
 			// channel after nonMidHystStreak wasted attempts.
-			canEmitOpt1 := !isAnchoredFind(table)
+			canEmitOpt1 := !isAnchoredFind(table) && !measureOff(MeasureDominantFind)
 			if canEmitOpt1 {
 				// encodeNonMid only when buildFindBody is the consumer of
 				// this layout's midAcceptBytes — the lit-anchor forward
@@ -2017,7 +2071,13 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				lmWideShufti:         false,
 			})
 			p.numGroups = tt.numGroups
-			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored)
+			// Only a body behind the groups wrapper needs the channel: the
+			// anchored export is called with the caller's own ptr, so its
+			// slots are already absolute.
+			if !anchored && buildOpts.globals != nil {
+				p.capStartGlobal = int32(buildOpts.globals.Alloc())
+			}
+			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored, p.capStartGlobal)
 			// TDFA only needs the transition table (no stack/memo).
 			p.tableEnd = tdfaLayout.tableEnd
 			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
@@ -2376,7 +2436,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !p.isTDFA {
 					winOff = p.winScratchOff
 				}
-				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff)
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal)
 			}
 		}
 		// LNM non-mid bulk-skip helper body append was here —
@@ -2974,7 +3034,7 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 // \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already relative
 // to ptr — so this wrapper adds nothing to them. See buildBacktrackBody in
 // engine_backtrack.go for the reading side.
-func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32, capStartGlobal int32) []byte {
 	var b []byte
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F) // 3 × i32
@@ -3005,6 +3065,15 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	b = append(b, 0x88)
 	b = append(b, 0xA7)
 	b = append(b, 0x21, 0x03)
+	if capStartGlobal >= 0 {
+		// Hand the capture body the match's start so it writes ABSOLUTE slot
+		// positions. Must be set before the call below and after `start` is
+		// known — the body reads it at register-init time, before any tag op
+		// can fire.
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x24)
+		b = utils.AppendULEB128(b, uint32(capStartGlobal))
+	}
 	if winScratchOff >= 0 {
 		// Window mode: hand the capture body the caller's real (ptr,len)
 		// and pass the match extent out of band, so its \b/\A/\z/(?m:^)/
@@ -3048,7 +3117,19 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 		// ptr — no per-slot rebasing pass.
 		b = append(b, 0x20, 0x04)
 	} else {
-		for i := 0; i < numGroups*2; i++ {
+		// capStartGlobal >= 0 means the TDFA body already wrote ABSOLUTE slot
+		// positions, so the per-slot pass is skipped — but its RETURN is still
+		// relative to the narrowed ptr, so the `+ start` below stays.
+		//
+		// Only the slots are moved into the body, deliberately. Making the
+		// return absolute too would mean biasing localLastAcceptPos, which has
+		// no explicit -1 initialiser and leans on the WASM local default —
+		// reasoning this change does not need to take on for two instructions.
+		//
+		// The pass this replaces was ~13 instructions per slot (load, `>= 0`
+		// test, add, store) times 2*numGroups, on EVERY call. The absolute form
+		// costs one add per slot inside the body plus one biased register init.
+		for i := 0; capStartGlobal < 0 && i < numGroups*2; i++ {
 			offset := uint32(i * 4)
 			b = append(b, 0x20, 0x02)
 			b = append(b, 0x28, 0x02)
@@ -3076,8 +3157,8 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 }
 
 // appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
-func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
-	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winScratchOff)
+func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32, capStartGlobal int32) []byte {
+	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winScratchOff, capStartGlobal)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
