@@ -163,6 +163,13 @@ type setFindCtx struct {
 	localBase byte
 	lPos      byte
 
+	// locals is THE allocator for this body's frame. newSetFindCtx allocates
+	// the five every frontend shares and hands the allocator on, so a body
+	// continues the same allocation rather than opening a second one and
+	// reserving five slots to skip past these — which is what all five bodies
+	// did while the ctx still numbered its own locals by hand (task 67).
+	locals *localAlloc
+
 	// gated selects the default, per-pattern non-overlapping body: the
 	// gate pre-mask, the write-time empty-extent rule and the write-back.
 	gated bool
@@ -1565,15 +1572,20 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 		}
 		c.preflight = !gated && cs.usesOverlappingFindPreflight()
 	}
-	c.lPos = c.localBase
-	c.lTotal = c.localBase + 1
-	c.lTmp = c.localBase + 2
-	c.lValidMask = c.localBase + 3
-	c.lOutBase = c.localBase + 4
-	// Defaults for a frontend that declares nothing beyond the shared five
-	// (the Scalar body); the others override these.
-	c.lMinStart = c.localBase + 5
-	c.lBase = c.localBase + 6
-	c.lStart = c.localBase + 7
+	// The shared five, allocated rather than numbered. Every frontend body
+	// continues from this allocator, so its own locals follow these by
+	// construction.
+	c.locals = newLocalAlloc(uint32(c.localBase))
+	c.lPos = c.locals.I32()
+	c.lTotal = c.locals.I32()
+	c.lTmp = c.locals.I32()
+	c.lValidMask = c.locals.I32()
+	c.lOutBase = c.locals.I32()
+	// lMinStart, lBase and lStart are NOT defaulted here. Every frontend body
+	// allocates them itself, at the point its own frame decides where they go
+	// — after the v128 group in Teddy and packed-pair, after the prefilter's
+	// locals in AC and Shufti, immediately in the scalar body. The defaults
+	// that used to live here served only the last of those and were silently
+	// overwritten by the other four.
 	return c
 }

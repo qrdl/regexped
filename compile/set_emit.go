@@ -2456,9 +2456,10 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// its own hand-written declaration vector and its own map of indices, and
 	// it additionally passed three raw indices ACROSS a function boundary into
 	// emitFindPreflight. Allocating says each arm once.
-	a := newLocalAlloc(uint32(c.localBase))
-	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
-	a.Reserve(valI32, 3) // lMinStart, lBase, lStart — newSetFindCtx's defaults
+	a := c.locals // the shared five are already allocated (task 67)
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
 
 	// lFirstByte is E5's hoisted input[lPos]; lPfPos/lPfState/lPfMask are the
 	// find preflight's own scratch, named here rather than computed at its call
@@ -2605,8 +2606,7 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	// declaration vectors — six or seven groups each — that had to agree with
 	// each other and with the reads below. Allocating conditionally says it
 	// once.
-	a := newLocalAlloc(uint32(c.localBase))
-	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
+	a := c.locals // the shared five are already allocated (task 67)
 
 	lSkipMask := a.I32()
 	lChunk := a.V128()
@@ -2895,8 +2895,7 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	// which is what the previous form spelled as two index maps and two
 	// hand-written declaration vectors that had to agree with them — the shape
 	// task 67 calls out as most likely to drift.
-	a := newLocalAlloc(uint32(c.localBase))
-	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
+	a := c.locals // the shared five are already allocated (task 67)
 
 	lACState := a.I32()
 	lMatchPos := a.I32()
@@ -3346,8 +3345,7 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	// Locals come from the allocator, in declaration order (task 67). The five
 	// setFindCtx allocates first are reserved, not re-allocated: they are
 	// already named by c.lPos and friends.
-	a := newLocalAlloc(uint32(c.localBase))
-	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
+	a := c.locals // the shared five are already allocated (task 67)
 
 	lLaneMask := a.I32()
 	lMatchPos := a.I32()
@@ -3677,8 +3675,7 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	// body is written twice (task 67). The five setFindCtx allocates first are
 	// reserved rather than re-allocated: they are already named by c.lPos and
 	// friends, and reserving keeps this body's numbering identical to theirs.
-	a := newLocalAlloc(uint32(c.localBase))
-	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
+	a := c.locals // the shared five are already allocated (task 67)
 
 	lLaneMask := a.I32()
 	lMatchPos := a.I32()

@@ -155,28 +155,30 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	pInPtr, pInLen, pCursor = 0, 1, 2
 	pGate, pOutPtr, pOutCap = 3, 4, 5
 	pScratch, pScratchLen = 6, 7
-	localBase := byte(8)
+	// Locals come from the allocator, in declaration order (task 67): the index
+	// and the declaration are one statement rather than two that must agree.
+	a := newLocalAlloc(8) // eight parameters, above
 	var (
-		lPos        = localBase
-		lK          = localBase + 1
-		lCount      = localBase + 2
-		lTotal      = localBase + 3
-		lStart      = localBase + 4
-		lAvail      = localBase + 5
-		lDeliver    = localBase + 6
-		lDone       = localBase + 7
-		lCap        = localBase + 8 // out_cap, clamped to the cursor's count field
-		lReady      = localBase + 9
-		lIdx        = localBase + 10
-		lCacheTotal = localBase + 11
-		lSrc        = localBase + 12
+		lPos        = a.I32()
+		lK          = a.I32()
+		lCount      = a.I32()
+		lTotal      = a.I32()
+		lStart      = a.I32()
+		lAvail      = a.I32()
+		lDeliver    = a.I32()
+		lDone       = a.I32()
+		lCap        = a.I32() // out_cap, clamped to the cursor's count field
+		lReady      = a.I32()
+		lIdx        = a.I32()
+		lCacheTotal = a.I32()
+		lSrc        = a.I32()
 		// The adaptive trigger's working locals.
-		lWork    = localBase + 13 // matched bytes this drive has delivered
-		lWorkIdx = localBase + 14 // cursor over the tuples just delivered
-		lWorkTmp = localBase + 15
+		lWork    = a.I32() // matched bytes this drive has delivered
+		lWorkIdx = a.I32() // cursor over the tuples just delivered
+		lWorkTmp = a.I32()
 		// 1 when the ENTRY-TIME sweep just ran, so the cursor's high half is
 		// still a text POSITION and the cache must be served from tuple 0.
-		lEntrySwept = localBase + 16
+		lEntrySwept = a.I32()
 	)
 
 	//
@@ -199,7 +201,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	}
 
 	var b []byte
-	b = append(b, 0x01, 0x11, 0x7F) // 17 x i32
+	b = a.EmitDecls(b) // 17 x i32, from the allocation above
 
 	// emitWorkExceedsSweep pushes 1 when the walk has already spent more than
 	// the sweep would cost. Computed in i64 because len * cost overflows i32
