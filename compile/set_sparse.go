@@ -296,7 +296,14 @@ func buildSparseAcceptTables(t *dfaTable, base int32, numWASM int, memberSkip bo
 	out.eofOff, out.eofList, blob = emit(t.acceptWide)
 	b = append(b, blob...)
 	// Member self-loop tables. Empty unless the caller opted in.
-	if memberSkip {
+	//
+	// MeasureMemberSkip is honoured HERE rather than at the caller: this is the
+	// one place both the tables and the emitter's decision to dispatch on them
+	// are derived from, so a masked build simply has no member sets and the
+	// bodies fall back to the plain walk. Until this was wired, B5's mask was
+	// declared in measure.go and consumed nowhere — T0.6 reported "this case
+	// never emits it" for a set that emits 41 member-skip states.
+	if memberSkip && !measureOff(MeasureMemberSkip) {
 		idTab, setTab := buildMemberSets(t, numWASM)
 		if len(setTab) > 0 {
 			for _, id := range idTab {

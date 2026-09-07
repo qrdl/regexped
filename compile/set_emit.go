@@ -1097,7 +1097,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// body is emitted is invisible to it. buildMemberSets is a pure function
 	// of (suffix DFA, state count), so asking it twice is safe: the emitter
 	// and this report cannot disagree about what qualified.
-	if opts.LikelyMode == LikelyMatch {
+	if opts.LikelyMode == LikelyMatch && !measureOff(MeasureMemberSkip) {
 		for bi, bkt := range buckets {
 			if bi >= len(diag.Buckets) || bkt.suffixDFA == nil || !bkt.sparse {
 				continue
@@ -3458,7 +3458,7 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	//
 	// A closure because the backward tail probe below runs exactly this at a
 	// different position; a second hand-written copy is how the two would drift.
-	emitLaneMask := func(b []byte, posLocal byte) []byte {
+	emitLaneMask := func(b []byte, posLocal byte, nblocks int) []byte {
 		// Load the two probe columns for each block.
 		emitChunkLoad := func(b []byte, off int, dst byte) []byte {
 			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A)
@@ -3480,14 +3480,14 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 			}
 			return b
 		}
-		for blk := 0; blk < blocks; blk++ {
+		for blk := 0; blk < nblocks; blk++ {
 			b = emitChunkLoad(b, pp.Off1+16*blk, lChunk1[blk])
 			b = emitChunkLoad(b, pp.Off2+16*blk, lChunk2[blk])
 		}
 		// Fold each block's 16-bit bitmask into one lane mask, block k occupying
 		// bits [16k, 16k+16). ctz over the combined mask then yields the position
 		// offset from posLocal directly, exactly as in the single-block case.
-		for blk := 0; blk < blocks; blk++ {
+		for blk := 0; blk < nblocks; blk++ {
 			b = emitColumnMask(b, lChunk1[blk], splat1)
 			b = emitColumnMask(b, lChunk2[blk], splat2)
 			b = append(b, 0xFD, 0x4E) // v128.and — both columns must hit
@@ -3504,7 +3504,7 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 		return b
 	}
 
-	b = emitLaneMask(b, lPos)
+	b = emitLaneMask(b, lPos, blocks)
 
 	// Process candidate lanes.
 	b = append(b, 0x02, 0x40)                                                                // block $lanes_done
@@ -3582,11 +3582,21 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	// them. That is flat per-call cost, so it is the WHOLE of a short call and
 	// noise on a long one.
 	//
-	// base = inLen - simdGuard is the last position the guard itself would have
-	// accepted, so every load here is a load a legal lap would issue and no
-	// over-read is reintroduced. base+span = inLen-MinLen+1, so a position past
-	// the mask's last lane has fewer than MinLen bytes left and can host no
-	// literal: a mask with no bit at or above lPos proves the remainder dead.
+	// The probe uses ONE block, not the scan loop's `blocks`. Nothing about the
+	// tail needs the wider stride — the mask only has to cover the positions
+	// that can still host a literal — and the window costs what it covers: a
+	// two-block probe needs MinLen+31 bytes of input to exist at all, so a set
+	// with a 5-byte literal got no probe below 36 bytes and paid the entry
+	// check at every length under it (+7.4 to +14.6% measured, 4 B through
+	// 32 B). One block needs MinLen+15, which puts the crossover beside Teddy's.
+	//
+	// base = inLen - tailGuard is the last position a one-block lap could start
+	// at, so every load here is a load such a lap would issue and no over-read
+	// is reintroduced. base+16 = inLen-MinLen+1, so a position past the mask's
+	// last lane has fewer than MinLen bytes left and can host no literal: a mask
+	// with no bit at or above lPos proves the remainder dead.
+	tailGuard := int32(pp.MinLen + 15)
+
 	b = append(b, 0x02, 0x40)                  // block $tail_done
 	b = append(b, 0x20, lTailSkip, 0x0D, 0x00) // no window for this input → $tail_done
 
@@ -3599,26 +3609,39 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	// store measured +1.0 to +1.6% on setperf's dense rows for a fact those
 	// calls never read. Later positions pay the two-instruction check above.
 	b = append(b, 0x20, pInLen, 0x41)
-	b = utils.AppendSLEB128(b, simdGuard)
+	b = utils.AppendSLEB128(b, tailGuard)
 	b = append(b, 0x49, 0x04, 0x40) // if inLen < guard: no window, ever
 	b = append(b, 0x41, 0x01, 0x21, lTailSkip)
 	b = append(b, 0x0C, 0x02) // br 2 → $tail_done
 	b = append(b, 0x0B)       // end if
 
 	b = append(b, 0x20, pInLen, 0x41)
-	b = utils.AppendSLEB128(b, simdGuard)
-	b = append(b, 0x6B, 0x21, lTailBase) // base = inLen - guard
-	b = emitLaneMask(b, lTailBase)
+	b = utils.AppendSLEB128(b, tailGuard)
+	b = append(b, 0x6B, 0x21, lTailBase) // base = inLen - tailGuard
+	b = emitLaneMask(b, lTailBase, 1)
 	b = append(b, 0x20, lLaneMask, 0x21, lTailMask)
 	b = append(b, 0x0B) // end if
 
-	// Candidates at or above lPos. Unlike Teddy's 16-lane mask, span can be 32
-	// and simdGuard can exceed 32, so the shift is range-checked rather than
-	// left to i32.shl's 5-bit count: a shift at or past span means every lane
-	// is behind lPos, which is the same verdict as an empty mask.
+	// Candidates at or above lPos.
+	//
+	// A NEGATIVE shift means lPos sits below the window: the scan loop's own
+	// guard needs MinLen+31 bytes while this probe needs only MinLen+15, so the
+	// tail begins up to 16 positions before the window starts. Those positions
+	// are not described by the mask and must take the chain below — reading the
+	// mask for them treats "no lane at or above lPos" as "nothing can match
+	// here", which silently DROPS every match in that band. That is what the
+	// first one-block version did, and setcaps caught it.
 	b = append(b, 0x20, lPos, 0x20, lTailBase, 0x6B, 0x22, c.lTmp) // shift
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(span))
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x48, 0x0D, 0x00) // shift < 0 (signed) → $tail_done
+
+	// The remaining range check is unsigned and rather than left
+	// to i32.shl's 5-bit count: MinLen is a whole literal length here, so
+	// tailGuard can exceed 32 and a shift of 32 would WRAP to a no-op mask
+	// instead of clearing it. At or past 16 every lane is behind lPos, which is
+	// the same verdict as an empty mask.
+	b = append(b, 0x20, c.lTmp)
+	b = append(b, 0x41, 0x10)
 	b = append(b, 0x49)       // i32.lt_u
 	b = append(b, 0x04, 0x7F) // if (result i32)
 	b = append(b, 0x20, lTailMask, 0x41, 0x7F, 0x20, c.lTmp, 0x74, 0x71)

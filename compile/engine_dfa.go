@@ -5938,7 +5938,14 @@ func appendFindCodeEntryTwinned(cs []byte, l *dfaLayout, t *dfaTable, mandatoryL
 	// the escape. shuftiPrefixPlan is the one predicate that decides that, and
 	// it is asked here with the same arguments buildFindBody will ask it with,
 	// so the two cannot disagree about whether a switch exists.
-	if l.lnmAction5 && !isAnchoredFind(t) && mandatoryLit == nil {
+	//
+	// MeasurePrefixScanSIMD is part of the predicate because it removes the arm
+	// that emits the handoff CALL: without it here, T0.6's A3 mask built a twin
+	// nothing branches to and tripped the "twin and its call-site patch must be
+	// emitted together" assertion below. Production is unaffected — the zero
+	// mask reaches neither branch — but the panic made A6's case unmeasurable,
+	// which is how it was found.
+	if l.lnmAction5 && !isAnchoredFind(t) && mandatoryLit == nil && !measureOff(MeasurePrefixScanSIMD) {
 		if _, adaptive := shuftiPrefixPlan(l.firstBytes, true, true); adaptive {
 			hasTwin = true
 		}

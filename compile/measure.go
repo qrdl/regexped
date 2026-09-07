@@ -15,8 +15,15 @@ package compile
 //
 // So this is deliberately the cheap shape: one process-global mask, set by
 // tools/lentest before it compiles and cleared after. It is not safe for
-// concurrent compilation and does not try to be. When the mechanisms are wired
-// to CompileOptions.InputLength for real, this file goes.
+// concurrent compilation and does not try to be.
+//
+// T0.6 has since been ANSWERED — the compile-time key was not worth building —
+// so this file no longer has an end date. It is now the instrument for the
+// question that replaced it: what each mechanism is worth at a given input
+// length, which is what a runtime dispatch to a de-emitted twin would trade.
+// Every mask must have a consumer to be worth anything; tools/lentest's -t06
+// coverage line is what enforces that, after MeasureMemberSkip spent its life
+// declared here and read nowhere.
 //
 // The zero value changes nothing, which `make byteident` asserts.
 type MeasureMask uint32

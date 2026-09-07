@@ -590,9 +590,9 @@ type CompileSetOptions struct {
 	// expectation, never a promise — see that field for the contract and for why
 	// the pattern cannot supply this.
 	//
-	// NOT YET CONSUMED by any set emitter. It exists so tools/lentest can sweep
-	// a declared length over set cases and so the set channels can be wired to
-	// it one at a time. While nothing reads it, every value produces a
+	// NOT CONSUMED by any set emitter, and nothing reads it: see
+	// CompileOptions.InputLength for why the declared-length axis was dropped
+	// and what this field is now being kept for. Every value produces a
 	// byte-identical module.
 	InputLength int
 

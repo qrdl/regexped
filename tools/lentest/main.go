@@ -153,6 +153,15 @@ type lenCase struct {
 	// declared is the declared-length axis. Defaults to defaultDeclared.
 	declared []int
 
+	// acBudget, when non-zero, is the Aho-Corasick table budget the set is
+	// compiled under. It exists for ONE case: the Shufti set frontend is
+	// reachable only after AC declines on budget, which no YAML config can
+	// arrange, so a set that would take AC is pushed onto Shufti by starving
+	// the budget — the same simulated decline settest's -force-frontend=shufti
+	// uses. Without it the tree has no short-input row for a frontend whose
+	// scalar tail is O(|first-byte union|) per byte.
+	acBudget int
+
 	// task names the LENGTH-HINT.md task this case exists to measure, so a row
 	// that moves can be traced to the change that moved it.
 	task string
@@ -164,7 +173,11 @@ var (
 	// only the lengths that HAVE no remainder — which is how the first version
 	// of this axis made a tail-recovery change look like a flat regression.
 	// Real callers' inputs are not chunk-aligned.
-	defaultActual   = []int{4, 8, 15, 16, 17, 31, 32, 100, 1000, 16384, 100000}
+	// 20/24/28 fill what used to be a gap between 17 and 31 — the band every
+	// 16-byte mechanism crosses. With nothing in it, a crossover could only be
+	// bracketed, never located: the backward tail probe's own crossover sits
+	// inside it and had to be inferred from the guard's arithmetic.
+	defaultActual   = []int{4, 8, 15, 16, 17, 20, 24, 28, 31, 32, 100, 1000, 16384, 100000}
 	defaultDeclared = []int{0, 16, 32, 64, 16384}
 )
 
@@ -301,6 +314,107 @@ func cases() []lenCase {
 			},
 		},
 		{
+			// A6's row. `[a-zA-Z]{20,}` is the class-chain case's pattern under
+			// the OTHER hint: prefer-no-match forces the 52-byte first-byte set
+			// onto Shufti, which is what emits the adaptive dense switch and
+			// its runtime probe-budget counter. Under prefer-match the same
+			// pattern takes the dominant dispatch instead, so the two cases
+			// look alike and reach different emitters on purpose.
+			name: "dense-switch",
+			desc: "the adaptive dense switch under prefer-no-match — the runtime probe-budget counter",
+			mode: modeFind, task: "A6",
+			pattern: `[a-zA-Z]{20,}`,
+			likely:  compile.LikelyNoMatch,
+			gen: func(n int, matching bool) (string, bool) {
+				if !matching {
+					return repeatTo("", "0", n)
+				}
+				if n < 20 {
+					return "", false
+				}
+				return repeatTo(strings.Repeat("a", 20), "0", n)
+			},
+			actual: []int{4, 8, 15, 16, 17, 20, 24, 28, 31, 32, 100, 1000, 16384},
+		},
+		{
+			// B5's row: 40 patterns sharing one literal land in ONE sparse
+			// bucket, and prefer-match turns on the member self-loop skip
+			// there. The `a+` tail is the run the skip strides over; the
+			// input carries a 64-byte one, which is the shape likelytest's
+			// sparse-member-skip pair measures at 50 KB and nothing measured
+			// short.
+			name: "set-member-skip",
+			desc: "40 shared-literal patterns in one sparse bucket under prefer-match — the member self-loop skip",
+			mode: modeSet, cap: setCapFind, task: "B5",
+			setPatterns: func() []string {
+				out := make([]string, 40)
+				for i := range out {
+					out[i] = fmt.Sprintf(`union[ \t]+k%02da+`, i)
+				}
+				return out
+			}(),
+			likely: compile.LikelyMatch,
+			gen: func(n int, matching bool) (string, bool) {
+				if !matching {
+					return repeatTo("", ".", n)
+				}
+				needle := "union k07" + strings.Repeat("a", 64)
+				if n < len(needle) {
+					return "", false
+				}
+				return repeatTo(needle, ".", n)
+			},
+		},
+		{
+			// The Teddy SET frontend. set-keywords-8 takes packed-pair and
+			// set-fallback-32 takes Aho-Corasick, so before this case two of
+			// the four literal frontends had no short-input row at all — the
+			// backward tail probe was measured on the other two and inferred
+			// on these.
+			name: "set-teddy-20",
+			desc: "20 literals with diverse first bytes — the Teddy set frontend's nibble tables",
+			mode: modeSet, cap: setCapFind, task: "step 1 (tail probe)",
+			setPatterns: func() []string {
+				out := make([]string, 20)
+				for i := range out {
+					out[i] = fmt.Sprintf("%cqr%02d", 'A'+i, i)
+				}
+				return out
+			}(),
+			gen: fillOnly("...", "Hqr07"),
+		},
+		{
+			// The Shufti SET frontend, reached the only way it can be: the
+			// same shape as set-fallback-32, with the AC budget starved so the
+			// chooser's AC verdict is declined and the scalar branch picks
+			// Shufti up. Its tail was the most expensive of the four — an
+			// O(|union|) membership chain per byte.
+			name: "set-shufti-70",
+			desc: "70 literals, first bytes cycling over 31 values, AC declined on budget — the Shufti set frontend",
+			mode: modeSet, cap: setCapFind, task: "step 1 (tail probe)",
+			// The shape tools/fuzz/set_shufti_test.go established, and the only
+			// one that lands here: more literals than Teddy accepts, a
+			// first-byte union inside Shufti's 17..64 band, and all-rarity-0
+			// bytes so the adaptive density trigger stays off. A first attempt
+			// used 24 literals with 24 distinct first bytes and silently got
+			// TEDDY — which is why the header below prints the frontend the
+			// compiler actually chose rather than the one the name claims.
+			setPatterns: func() []string {
+				out := make([]string, 70)
+				for i := range out {
+					out[i] = fmt.Sprintf(`\x%02xqq%02dxx[a-z]+`, 1+i%31, i)
+				}
+				return out
+			}(),
+			acBudget: 1,
+			gen: func(n int, matching bool) (string, bool) {
+				if !matching {
+					return repeatTo("", ".", n)
+				}
+				return repeatTo("\x01qq00xxab", ".", n)
+			},
+		},
+		{
 			name: "set-keywords-8",
 			desc: "8 literals — the frontend chooser's crossovers were all calibrated at 100 KB",
 			mode: modeSet, cap: setCapFind, task: "B2, B3",
@@ -345,7 +459,16 @@ func cases() []lenCase {
 // ---------------------------------------------------------------------------
 // Compilation.
 
-func compileCase(c lenCase) ([]byte, error) {
+// compileCase compiles one case and, for a set, returns the frontend the
+// compiler actually chose.
+//
+// The frontend is returned rather than assumed because a case can be named for
+// one frontend and silently compile to another: `set-shufti-24` was written
+// with 24 distinct first bytes, which sends chooseLiteralFrontend to TEDDY, and
+// it reported plausible numbers for a frontend it never used. That is the
+// sampleNeedles failure in a different costume — a row that looks like a
+// measurement and is not.
+func compileCase(c lenCase) ([]byte, string, error) {
 	if c.mode == modeSet {
 		entries := make([]config.RegexEntry, len(c.setPatterns))
 		for i, p := range c.setPatterns {
@@ -366,10 +489,15 @@ func compileCase(c lenCase) ([]byte, error) {
 		}
 		cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
 		opts := compile.CompileSetOptions{
-			LikelyMode:  c.likely,
+			LikelyMode:    c.likely,
+			ACBudgetBytes: c.acBudget,
 		}
-		wasm, _, _, err := compile.CompileFileOpts(cfg, "", opts)
-		return wasm, err
+		wasm, _, diags, err := compile.CompileFileOpts(cfg, "", opts)
+		fe := ""
+		if len(diags) > 0 {
+			fe = diags[0].Frontend
+		}
+		return wasm, fe, err
 	}
 
 	re := config.RegexEntry{Pattern: c.pattern}
@@ -383,7 +511,7 @@ func compileCase(c lenCase) ([]byte, error) {
 	}
 	opts := compile.CompileOptions{LikelyMode: c.likely}
 	wasm, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true, opts)
-	return wasm, err
+	return wasm, "", err
 }
 
 func hintsYAML(m compile.LikelyMode) []string {
@@ -694,11 +822,14 @@ func main() {
 		fmt.Printf("  %s\n", c.desc)
 		fmt.Printf("  measures: %s\n", c.task)
 
-		w, err := compileCase(c)
+		w, fe, err := compileCase(c)
 		if err != nil {
 			fmt.Printf("  COMPILE FAILED: %v\n", err)
 			failures++
 			continue
+		}
+		if fe != "" {
+			fmt.Printf("  frontend: %s (as chosen by the compiler, not as named)\n", fe)
 		}
 		fmt.Printf("  wasm size: %d B\n", len(w))
 
@@ -843,7 +974,16 @@ func runT06(fuelEngine *wasmtime.Engine, filter string, setsOnly bool) {
 	fmt.Println("  Each row de-emits ONE mechanism and reports fuel Δ% against the")
 	fmt.Println("  unmodified build at the same input length. Negative = de-emitting is")
 	fmt.Println("  cheaper (the hint's win). Positive = de-emitting costs (the mispredict")
-	fmt.Println("  harm). `identical` means that case never emits that mechanism.")
+	fmt.Println("  harm). `identical` means the masked build is byte-for-byte the")
+	fmt.Println("  unmodified one — either the case does not emit that mechanism, or the")
+	fmt.Println("  mask has no consumer. The coverage line at the end tells those apart.")
+
+	// reached[m] records that SOME case's build actually moved when m was
+	// masked. A mechanism that no case moves is either uncovered by the corpus
+	// or unwired in compile/measure.go, and the two are indistinguishable from
+	// a single row — which is exactly how MeasureMemberSkip stayed declared and
+	// unconsumed while every set-member-skip row read `identical`.
+	reached := map[string]bool{}
 
 	for _, c := range cases() {
 		if setsOnly && c.mode != modeSet {
@@ -859,7 +999,7 @@ func runT06(fuelEngine *wasmtime.Engine, filter string, setsOnly bool) {
 		}
 
 		compile.SetMeasureDisabled(0)
-		base, err := compileCase(c)
+		base, _, err := compileCase(c)
 		if err != nil {
 			fmt.Printf("\n=== %s === COMPILE FAILED: %v\n", c.name, err)
 			continue
@@ -909,7 +1049,7 @@ func runT06(fuelEngine *wasmtime.Engine, filter string, setsOnly bool) {
 
 			for _, m := range mechanisms() {
 				prev := compile.SetMeasureDisabled(m.mask)
-				w, err := compileCase(c)
+				w, _, err := compileCase(c)
 				compile.SetMeasureDisabled(prev)
 				if err != nil {
 					fmt.Printf("  %-*s COMPILE FAILED: %v\n", mechLabelW, m.name, err)
@@ -920,6 +1060,7 @@ func runT06(fuelEngine *wasmtime.Engine, filter string, setsOnly bool) {
 						mechLabelW, m.name+" ("+m.scope+")")
 					continue
 				}
+				reached[m.name] = true
 				fmt.Printf("  %-*s", mechLabelW, m.name+" ("+m.scope+")")
 				for _, a := range actual {
 					bf, ok := baseFuel[a]
@@ -940,4 +1081,24 @@ func runT06(fuelEngine *wasmtime.Engine, filter string, setsOnly bool) {
 		}
 	}
 	compile.SetMeasureDisabled(0)
+
+	// Coverage. A mask no case moves buys nothing, and says nothing: the row it
+	// prints looks exactly like a mechanism that is legitimately absent.
+	var unreached []string
+	for _, m := range mechanisms() {
+		if !reached[m.name] {
+			unreached = append(unreached, m.name+" ("+m.task+")")
+		}
+	}
+	fmt.Println()
+	if len(unreached) == 0 {
+		fmt.Printf("coverage: all %d mechanisms were moved by at least one case.\n", len(mechanisms()))
+		return
+	}
+	fmt.Printf("coverage: %d of %d mechanisms were moved by NO case — each is either\n",
+		len(unreached), len(mechanisms()))
+	fmt.Println("  uncovered by the corpus or unwired in compile/measure.go:")
+	for _, u := range unreached {
+		fmt.Printf("  - %s\n", u)
+	}
 }

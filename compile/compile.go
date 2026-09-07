@@ -414,10 +414,18 @@ type CompileOptions struct {
 	// 2*numStates for the overlapping work sweep), rather than the compiler
 	// mapping it onto size classes.
 	//
-	// NOT YET CONSUMED by any emitter: it exists so tools/lentest has a real
-	// axis to sweep and so the mechanisms can be wired to it one at a time, each
-	// with its own measurement. While nothing reads it, every value produces a
-	// byte-identical module, which is what `make byteident` asserts.
+	// NOT CONSUMED by any emitter, and no longer read by anything at all:
+	// tools/lentest was its only reader and now sweeps the ACTUAL input length
+	// instead, because T0.6 measured what a declared length would buy and it
+	// was not worth building (≈9-15% under 16 bytes against 3-9x when the
+	// declaration is wrong by more than about a factor of six). Every value
+	// produces a byte-identical module, which is what `make byteident` asserts.
+	//
+	// It is kept, rather than deleted, as the anchor for the one route that
+	// measurement left open: a RUNTIME dispatch on `len - from` to a body with
+	// these same mechanisms de-emitted. That decision is open. If it is taken,
+	// this field becomes the twin's build knob; if it is declined, this field
+	// and compile/measure.go should go together.
 	InputLength int
 
 	tableMemIdx int // 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables)
