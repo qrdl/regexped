@@ -1097,7 +1097,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// body is emitted is invisible to it. buildMemberSets is a pure function
 	// of (suffix DFA, state count), so asking it twice is safe: the emitter
 	// and this report cannot disagree about what qualified.
-	if opts.LikelyMode == LikelyMatch && !measureOff(MeasureMemberSkip) {
+	if opts.LikelyMode == LikelyMatch {
 		for bi, bkt := range buckets {
 			if bi >= len(diag.Buckets) || bkt.suffixDFA == nil || !bkt.sparse {
 				continue
@@ -1239,7 +1239,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		shuftiFirstByteSet:  shuftiFirstByteSet,
 		packedPair:          packedPair,
 		shuftiAdaptive:      shuftiAdaptive,
-		unionSkipLNM:        opts.LikelyMode == LikelyNoMatch && !measureOff(MeasureUnionStride),
+		unionSkipLNM:        opts.LikelyMode == LikelyNoMatch,
 		litToBuckets:        litToBuckets,
 		litLens:             litLens,
 		diag:                diag,
@@ -2595,54 +2595,37 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx int, mode setCapKind, probeFnBase int) []byte {
 	var b []byte
 	adaptive := cs.shuftiAdaptive
-	// locals: 6 × i32 (lPos, lTotal, lTmp, lValidMask, lOutBase, lSkipMask), 1 × v128 (lChunk),
-	// + 2 × i32 (lDenseCounter, lDenseSkipFlag) when adaptive,
-	// + 3 × i32 (lMinStart, lBase, lStart) for the first-position state.
-	// The per-position first byte is declared in a TRAILING group so that
-	// every index above it is untouched: WASM assigns local indices in
-	// declaration order, and inserting into an earlier group would move the
-	// v128 and i64 the arms below name explicitly.
-	// The backward tail probe's four locals go in a TRAILING group for the same
-	// reason the hoisted first byte does: every index above stays put.
-	if adaptive {
-		b = append(b, 0x07)       // 7 local groups
-		b = append(b, 0x06, 0x7F) // 6 × i32
-		b = append(b, 0x01, 0x7B) // 1 × v128
-		b = append(b, 0x02, 0x7F) // 2 × i32
-		b = append(b, 0x03, 0x7F) // 3 × i32
-		b = append(b, 0x01, 0x7E) // 1 × i64 (scan_all accumulator)
-		b = append(b, 0x01, 0x7F) // 1 × i32 (hoisted first byte)
-		b = append(b, 0x04, 0x7F) // 4 × i32 (backward tail probe)
-	} else {
-		b = append(b, 0x06)       // 6 local groups
-		b = append(b, 0x06, 0x7F) // 6 × i32
-		b = append(b, 0x01, 0x7B) // 1 × v128
-		b = append(b, 0x03, 0x7F) // 3 × i32
-		b = append(b, 0x01, 0x7E) // 1 × i64 (scan_all accumulator)
-		b = append(b, 0x01, 0x7F) // 1 × i32 (hoisted first byte)
-		b = append(b, 0x04, 0x7F) // 4 × i32 (backward tail probe)
-	}
-
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	c.perPositionDrain = true
 	lPos, lTmp := c.lPos, c.lTmp
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	lSkipMask := c.localBase + 5
-	lChunk := c.localBase + 6
-	lDenseCounter := c.localBase + 7
-	lDenseSkipFlag := c.localBase + 8
-	// The first-position locals go last so the v128 index is stable.
-	c.lMinStart, c.lBase, c.lStart = c.localBase+7, c.localBase+8, c.localBase+9
-	c.lAcc = c.localBase + 10
-	lFirstByte := c.localBase + 11
-	tailBaseIdx := c.localBase + 12
+
+	// Locals come from the allocator, in declaration order (task 67). This body
+	// is the one that most needed it: the adaptive dense switch adds two i32s
+	// in the MIDDLE of the frame, so every index after them moved, and the
+	// previous form spelled that as two index maps and two hand-written
+	// declaration vectors — six or seven groups each — that had to agree with
+	// each other and with the reads below. Allocating conditionally says it
+	// once.
+	a := newLocalAlloc(uint32(c.localBase))
+	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
+
+	lSkipMask := a.I32()
+	lChunk := a.V128()
+	var lDenseCounter, lDenseSkipFlag byte
 	if adaptive {
-		c.lMinStart, c.lBase, c.lStart = c.localBase+9, c.localBase+10, c.localBase+11
-		c.lAcc = c.localBase + 12
-		lFirstByte = c.localBase + 13
-		tailBaseIdx = c.localBase + 14
+		lDenseCounter = a.I32()
+		lDenseSkipFlag = a.I32()
 	}
-	lTailBase, lTailMask, lTailProbed, lTailSkip := tailBaseIdx, tailBaseIdx+1, tailBaseIdx+2, tailBaseIdx+3
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
+	c.lAcc = a.I64()
+	lFirstByte := a.I32()
+	// The backward tail probe's four.
+	lTailBase, lTailMask, lTailProbed, lTailSkip := a.I32(), a.I32(), a.I32(), a.I32()
+
+	b = a.EmitDecls(b)
 
 	b = c.emitFindPrologue(b, lPos)
 	if adaptive {
@@ -2907,36 +2890,41 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, maxLitLen-1, mode, probeFnBase)
 	lPos := c.lPos
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	lACState := c.localBase + 5
-	lMatchPos := c.localBase + 6
-	lOutIdx := c.localBase + 7
-	lACOutEnd := c.localBase + 8
-	lLitID := c.localBase + 9
-	// Prefilter locals (i32 skip mask, the backward tail probe's four, then a
-	// v128 chunk).
-	lSkipMask := c.localBase + 10
-	lTailBase := c.localBase + 11
-	lTailMask := c.localBase + 12
-	lTailProbed := c.localBase + 13
-	lTailSkip := c.localBase + 14
-	lChunk := c.localBase + 15
-	// The first-position locals go in their own trailing group so the
-	// v128 local's index is unaffected by whether the prefilter is emitted.
-	c.lMinStart, c.lBase, c.lStart = c.localBase+10, c.localBase+11, c.localBase+12
-	c.lAcc = c.localBase + 13
+	// Locals come from the allocator, in declaration order (task 67). The five
+	// setFindCtx allocates first are reserved, not re-allocated.
+	//
+	// The prefilter's locals are ALLOCATED only when the prefilter is emitted,
+	// which is what the previous form spelled as two index maps and two
+	// hand-written declaration vectors that had to agree with them — the shape
+	// task 67 calls out as most likely to drift.
+	a := newLocalAlloc(uint32(c.localBase))
+	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
+
+	lACState := a.I32()
+	lMatchPos := a.I32()
+	lOutIdx := a.I32()
+	lACOutEnd := a.I32()
+	lLitID := a.I32()
+
+	// Prefilter locals: the skip mask, the backward tail probe's four, and a
+	// v128 chunk.
+	var lSkipMask, lTailBase, lTailMask, lTailProbed, lTailSkip, lChunk byte
 	if usePrefilter {
-		c.lMinStart, c.lBase, c.lStart = c.localBase+16, c.localBase+17, c.localBase+18
-		c.lAcc = c.localBase + 19
+		lSkipMask = a.I32()
+		lTailBase = a.I32()
+		lTailMask = a.I32()
+		lTailProbed = a.I32()
+		lTailSkip = a.I32()
+		lChunk = a.V128()
 	}
 
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
+	c.lAcc = a.I64()
+
 	var b []byte
-	if usePrefilter {
-		// 15 i32, 1 v128, 3 i32, then the scan_all i64 accumulator.
-		b = append(b, 0x04, 0x0F, 0x7F, 0x01, 0x7B, 0x03, 0x7F, 0x01, 0x7E)
-	} else {
-		// 10 i32, 3 i32, then the scan_all i64 accumulator.
-		b = append(b, 0x03, 0x0A, 0x7F, 0x03, 0x7F, 0x01, 0x7E)
-	}
+	b = a.EmitDecls(b)
 
 	// Init
 	b = c.emitFindPrologue(b, lPos)
@@ -3357,22 +3345,27 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	lPos := c.lPos
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	lLaneMask := c.localBase + 5
-	lMatchPos := c.localBase + 6
-	lLaneOff := c.localBase + 7
-	// The backward tail probe's three locals; see the probe below. lTailProbed
+	// Locals come from the allocator, in declaration order (task 67). The five
+	// setFindCtx allocates first are reserved, not re-allocated: they are
+	// already named by c.lPos and friends.
+	a := newLocalAlloc(uint32(c.localBase))
+	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
+
+	lLaneMask := a.I32()
+	lMatchPos := a.I32()
+	lLaneOff := a.I32()
+	// The backward tail probe's four locals; see the probe below. lTailProbed
 	// is what keeps the probe once-per-call, since the tail block is re-entered
-	// once per surviving candidate.
-	lTailBase := c.localBase + 8
-	lTailMask := c.localBase + 9
-	lTailProbed := c.localBase + 10
-	// lTailSkip is the hoisted "this input is shorter than one probe window"
-	// verdict. It is a local rather than the compare itself because the tail
-	// block is entered once per remaining POSITION, and an input with no window
-	// enters it at every one of them: as a compare against inLen it measured
-	// +3.7% on a 16-byte call, which is half of what the probe saves at 100.
-	lTailSkip := c.localBase + 11
-	numI32 := 12
+	// once per surviving candidate. lTailSkip is the hoisted "this input is
+	// shorter than one probe window" verdict — a local rather than the compare
+	// itself because the tail block is entered once per remaining POSITION, and
+	// an input with no window enters it at every one of them: as a compare
+	// against inLen it measured +3.7% on a 16-byte call, half of what the probe
+	// saves at 100.
+	lTailBase := a.I32()
+	lTailMask := a.I32()
+	lTailProbed := a.I32()
+	lTailSkip := a.I32()
 
 	// Blocks of 16 bytes handled per loop iteration. The probe
 	// work scales linearly with this, but the per-iteration scaffolding —
@@ -3384,36 +3377,31 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	// v128 locals: two input chunks per block, then one hoisted splat per
 	// probe byte. Hoisting matters: the splats are loop-invariant and would
 	// otherwise cost an i32.const + i8x16.splat per chunk per byte.
-	v128Base := c.localBase + byte(numI32)
-	next := v128Base
 	lChunk1 := make([]byte, blocks)
 	lChunk2 := make([]byte, blocks)
 	for i := 0; i < blocks; i++ {
-		lChunk1[i], lChunk2[i] = next, next+1
-		next += 2
+		lChunk1[i], lChunk2[i] = a.V128(), a.V128()
 	}
 	splat1 := make([]byte, len(pp.Bytes1))
 	splat2 := make([]byte, len(pp.Bytes2))
 	for i := range splat1 {
-		splat1[i] = next
-		next++
+		splat1[i] = a.V128()
 	}
 	for i := range splat2 {
-		splat2[i] = next
-		next++
+		splat2[i] = a.V128()
 	}
-	numV128 := 2*blocks + pp.splatCount()
 
 	// First-position locals sit after the v128 group so the v128 indices
 	// above stay stable.
-	c.lMinStart = v128Base + byte(numV128)
-	c.lBase = c.lMinStart + 1
-	c.lStart = c.lMinStart + 2
-	c.lAcc = c.lMinStart + 3
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
+	c.lAcc = a.I64()
 
 	var b []byte
-	// numI32 i32, numV128 v128, 3 i32, then the scan_all i64 accumulator.
-	b = append(b, 0x04, byte(numI32), 0x7F, byte(numV128), 0x7B, 0x03, 0x7F, 0x01, 0x7E)
+	// 12 i32, the v128 group, 3 i32, then the scan_all i64 accumulator — all of
+	// it derived from the allocation above rather than restated here.
+	b = a.EmitDecls(b)
 
 	// Hoist the probe-byte splats.
 	emitSplat := func(b []byte, val, dst byte) []byte {
@@ -3687,69 +3675,69 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	lPos := c.lPos
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	lLaneMask := c.localBase + 5
-	lMatchPos := c.localBase + 6
-	lLaneBit := c.localBase + 7 // Group A lane bit
-	lLaneOff := c.localBase + 8
-	lLaneBitB := c.localBase + 9 // Group B lane bit (only used when TwoGroups)
-	// The backward tail probe's three locals. lTailProbed is what makes the
+	// Locals come from the allocator, in declaration order, so no index in this
+	// body is written twice (task 67). The five setFindCtx allocates first are
+	// reserved rather than re-allocated: they are already named by c.lPos and
+	// friends, and reserving keeps this body's numbering identical to theirs.
+	a := newLocalAlloc(uint32(c.localBase))
+	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
+
+	lLaneMask := a.I32()
+	lMatchPos := a.I32()
+	lLaneBit := a.I32()  // Group A lane bit
+	lLaneOff := a.I32()  //nolint:wastedassign // read by emitExtractLane
+	lLaneBitB := a.I32() // Group B lane bit (only used when TwoGroups)
+	// The backward tail probe's four locals. lTailProbed is what makes the
 	// probe once-per-call: the tail block below is re-entered once per
 	// surviving candidate, and re-probing there would pay for the chunk loads
 	// and nibble tables again at every one of them. WASM zero-initialises
-	// locals per call, so no reset is emitted.
-	lTailBase := c.localBase + 10
-	lTailMask := c.localBase + 11
-	lTailProbed := c.localBase + 12
-	// lTailSkip is the hoisted "shorter than one probe window" verdict; see the
-	// packed-pair body, where leaving it as a per-position compare measured
-	// +3.7% on a 16-byte call.
-	lTailSkip := c.localBase + 13
-	// v128 locals start after the fourteen i32 locals.
-	v128Base := c.localBase + 14
-	lChunk := v128Base
-	lTLo := v128Base + 1
-	lTHi := v128Base + 2
-	lCands := v128Base + 3 // Group A result
+	// locals per call, so no reset is emitted. lTailSkip is the hoisted
+	// "shorter than one probe window" verdict; see the packed-pair body, where
+	// leaving it as a per-position compare measured +3.7% on a 16-byte call.
+	lTailBase := a.I32()
+	lTailMask := a.I32()
+	lTailProbed := a.I32()
+	lTailSkip := a.I32()
 
-	off := byte(4)
+	// v128 locals. Which ones exist depends on the fingerprint width and on
+	// whether the tables are bucketed into two groups, and the allocator emits
+	// the right group vector either way — the previous form had to keep a
+	// hand-run `off` counter in step with a hand-written declaration.
+	lChunk := a.V128()
+	lTLo := a.V128()
+	lTHi := a.V128()
+	lCands := a.V128() // Group A result
+
 	var lChunk1, lT1Lo, lT1Hi, lChunk2, lT2Lo, lT2Hi, lChunk3, lT3Lo, lT3Hi byte
 	if tt.TwoByte {
-		lChunk1, lT1Lo, lT1Hi = v128Base+off, v128Base+off+1, v128Base+off+2
-		off += 3
+		lChunk1, lT1Lo, lT1Hi = a.V128(), a.V128(), a.V128()
 	}
 	if tt.ThreeByte {
-		lChunk2, lT2Lo, lT2Hi = v128Base+off, v128Base+off+1, v128Base+off+2
-		off += 3
+		lChunk2, lT2Lo, lT2Hi = a.V128(), a.V128(), a.V128()
 	}
 	if tt.FourByte {
-		lChunk3, lT3Lo, lT3Hi = v128Base+off, v128Base+off+1, v128Base+off+2
-		off += 3
+		lChunk3, lT3Lo, lT3Hi = a.V128(), a.V128(), a.V128()
 	}
 	var lBT0Lo, lBT0Hi, lCandsB, lBT1Lo, lBT1Hi, lBT2Lo, lBT2Hi, lBT3Lo, lBT3Hi byte
 	if tt.TwoGroups {
-		lBT0Lo, lBT0Hi, lCandsB = v128Base+off, v128Base+off+1, v128Base+off+2
-		off += 3
+		lBT0Lo, lBT0Hi, lCandsB = a.V128(), a.V128(), a.V128()
 		if tt.TwoByte {
-			lBT1Lo, lBT1Hi = v128Base+off, v128Base+off+1
-			off += 2
+			lBT1Lo, lBT1Hi = a.V128(), a.V128()
 		}
 		if tt.ThreeByte {
-			lBT2Lo, lBT2Hi = v128Base+off, v128Base+off+1
-			off += 2
+			lBT2Lo, lBT2Hi = a.V128(), a.V128()
 		}
 		if tt.FourByte {
-			lBT3Lo, lBT3Hi = v128Base+off, v128Base+off+1
-			off += 2
+			lBT3Lo, lBT3Hi = a.V128(), a.V128()
 		}
 	}
-	numV128 := int(off)
 
 	// The first-position locals sit after the v128 group so the v128
 	// indices above stay unchanged.
-	c.lMinStart = v128Base + byte(numV128)
-	c.lBase = c.lMinStart + 1
-	c.lStart = c.lMinStart + 2
-	c.lAcc = c.lMinStart + 3
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
+	c.lAcc = a.I64()
 
 	// Collect literal strings for tail-byte verification.
 	litStr := make([]string, len(cs.litToBuckets))
@@ -3836,8 +3824,9 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	}
 
 	var b []byte
-	// 14 i32, numV128 v128, 3 i32, then the scan_all i64 accumulator.
-	b = append(b, 0x04, 0x0E, 0x7F, byte(numV128), 0x7B, 0x03, 0x7F, 0x01, 0x7E)
+	// 14 i32, the v128 group, 3 i32, then the scan_all i64 accumulator — all of
+	// it derived from the allocation above rather than restated here.
+	b = a.EmitDecls(b)
 
 	// Pre-load group A Teddy tables (loop-invariant)
 	groupAOff := cs.teddyDataOffset

@@ -81,9 +81,6 @@ const (
 // Only meaningful for n > 16; smaller sets take the multi-eq SIMD strategy,
 // which is a different shape and is decided by its own bound.
 func shuftiPrefixPlan(firstByteSet []byte, likelyNoMatch, canAdapt bool) (useShufti, wantDenseSwitch bool) {
-	if measureOff(MeasureDenseSwitch) {
-		canAdapt = false
-	}
 	n := len(firstByteSet)
 	switch {
 	case n <= 16:
@@ -589,7 +586,7 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 	l := p.Locals
 	ed := p.EngineDepth
 
-	if len(p.Prefix) >= 1 && !measureOff(MeasurePrefixScanSIMD) {
+	if len(p.Prefix) >= 1 {
 		// ── Hybrid SIMD prefix scan ───────────────────────────────────────────
 		// Phase A: find prefix[0] in 16-byte chunks.
 		// Phase B: verify prefix[1..N-1] from the same v128 register.
@@ -871,7 +868,7 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 
 		useSIMD := false
 		adaptive := false
-		if n := len(p.FirstByteSet); n > 0 && !measureOff(MeasurePrefixScanSIMD) {
+		if n := len(p.FirstByteSet); n > 0 {
 			if n <= 16 {
 				useSIMD = true
 			} else {
@@ -985,10 +982,10 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 			// bytes one at a time. Those bytes cost about 18 fuel each against
 			// about 0.2 for a byte a chunk covers, so EVERY call carries up to
 			// ~270 fuel of remainder regardless of its length — 0.2% of a
-			// 100 KB scan and most of a 32-byte one. Measured with
-			// tools/lentest: `x[^\n]+` no-match goes 12 B → 242 fuel,
-			// 16 B → 49, 24 B → 193, 32 B → 72, the sawtooth being entirely
-			// this tail.
+			// 100 KB scan and most of a 32-byte one. Measured on a
+			// short-input length sweep: `x[^\n]+` no-match goes 12 B → 242
+			// fuel, 16 B → 49, 24 B → 193, 32 B → 72, the sawtooth being
+			// entirely this tail.
 			//
 			// One more chunk recovers it, loaded BACKWARDS from the end so it
 			// still fits: the window is the last `windowBytes` of the input, it

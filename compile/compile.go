@@ -398,36 +398,6 @@ type CompileOptions struct {
 	// Defaults to 128*1024 (128 KB) when zero.
 	MemoBudget int
 
-	// InputLength is the caller's TYPICAL input length in bytes, or 0 when they
-	// did not say. It is an EXPECTATION, never a promise: it changes only which
-	// code is emitted, and the emitted code stays correct at every length, so a
-	// caller who mispredicts loses performance and never an answer.
-	//
-	// Every SIMD mechanism in the tree is gated on 16 to 33 bytes of remaining
-	// input and every crossover around them was measured on 50-100 KB corpora.
-	// On an input shorter than one chunk those mechanisms cannot execute, and
-	// the pattern carries no signal about that — the win case and the harm case
-	// of a given channel compile the identical pattern. Only the caller knows.
-	//
-	// Consumers apply their OWN threshold to it (17 for the dominant channels,
-	// 16 for the class-chain verify, MinLen+31 for the set packed-pair frontend,
-	// 2*numStates for the overlapping work sweep), rather than the compiler
-	// mapping it onto size classes.
-	//
-	// NOT CONSUMED by any emitter, and no longer read by anything at all:
-	// tools/lentest was its only reader and now sweeps the ACTUAL input length
-	// instead, because T0.6 measured what a declared length would buy and it
-	// was not worth building (≈9-15% under 16 bytes against 3-9x when the
-	// declaration is wrong by more than about a factor of six). Every value
-	// produces a byte-identical module, which is what `make byteident` asserts.
-	//
-	// It is kept, rather than deleted, as the anchor for the one route that
-	// measurement left open: a RUNTIME dispatch on `len - from` to a body with
-	// these same mechanisms de-emitted. That decision is open. If it is taken,
-	// this field becomes the twin's build knob; if it is declined, this field
-	// and compile/measure.go should go together.
-	InputLength int
-
 	tableMemIdx int // 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables)
 
 	// globals is the module's WASM global allocator, shared by every pattern
@@ -1446,7 +1416,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
 				useAcceptSideTable:   false,
 				lmBareShufti:         false,
-				lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch && !measureOff(MeasureNonMidShufti),
+				lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 				lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
 			})
 			// Since 2026-07-18: non-mid dominants are default-on for
@@ -1468,11 +1438,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// gate was proven to be instruction-placement noise
 			// (padding-scan experiment, 2026-07-18); decisions here are
 			// gated on fuel only.
-			if !measureOff(MeasureDominantMatch) {
-				applyDominantStateEncoding(lm, true)
-			} else {
-				lm.dominantStates = nil
-			}
+			applyDominantStateEncoding(lm, true)
 			matchBody = appendMatchCodeEntry(nil, lm, llTable, buildOpts.tableMemIdx)
 			rawM, cntM := stripSegCount(dfaDataSegments(lm, false, false))
 			matchData = rawM
@@ -1599,7 +1565,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
 			useAcceptSideTable:   false,
 			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern),
-			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch && !measureOff(MeasureNonMidShufti),
+			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 			lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
 			lmClassChain:         buildOpts.LikelyMode == LikelyMatch,
 		})
@@ -1950,7 +1916,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// dispatch (emitNonMidBulkSkipHyst), so neutral callers keep
 			// the −90% long-run win and short-run inputs self-disable the
 			// channel after nonMidHystStreak wasted attempts.
-			canEmitOpt1 := !isAnchoredFind(table) && !measureOff(MeasureDominantFind)
+			canEmitOpt1 := !isAnchoredFind(table)
 			if canEmitOpt1 {
 				// encodeNonMid only when buildFindBody is the consumer of
 				// this layout's midAcceptBytes — the lit-anchor forward

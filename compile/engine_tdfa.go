@@ -996,7 +996,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	if needClassLocal {
 		extraLocals++
 	}
-	hasBulkSkip := enableTDFABulkSkip && tt.bulkSkip != nil && !measureOff(MeasureTDFABulkSkip)
+	hasBulkSkip := enableTDFABulkSkip && tt.bulkSkip != nil
 
 	if hasBulkSkip {
 		b = utils.AppendULEB128(b, uint32(3)) // 3 local declaration groups

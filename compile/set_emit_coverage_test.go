@@ -780,25 +780,26 @@ func TestSetEmitShuftiNonAdaptiveBody(t *testing.T) {
 			t.Errorf("mode %v: body does not end with `end` (0x0B), got %#x",
 				mode, body[len(body)-1])
 		}
-		// Six local groups, not seven: the adaptive form's dense-gate counter
-		// is absent. (Both frames gained one trailing i32 group for E5's
-		// hoisted first byte and another for the backward tail probe, so the
-		// non-adaptive frame is 6 and the adaptive one 7.) The count is the
-		// second byte — the first is the body's
-		// LEB128 size prefix, which is single-byte only for tiny bodies, so
-		// the check reads it back through the same size prefix the emitter
-		// wrote.
-		if got := setEmitCovLocalGroups(t, body); got != 6 {
-			t.Errorf("mode %v: %d local groups, want 6 (the non-adaptive frame)", mode, got)
+		// Fourteen i32 locals, not sixteen: the adaptive form's dense-gate
+		// counter and its skip flag are absent.
+		//
+		// The count is of i32s, not of GROUPS, and that is a consequence of
+		// task 67's conversion: the allocator coalesces adjacent same-type
+		// runs, so both frames now declare five groups and the group count no
+		// longer tells them apart. The i32 total does — it is exactly the two
+		// locals the dense switch adds.
+		if got := setEmitCovLocalsOfType(t, body, 0x7F); got != 14 {
+			t.Errorf("mode %v: %d i32 locals, want 14 (the non-adaptive frame)", mode, got)
 		}
 	}
 }
 
-// setEmitCovLocalGroups reads the local-group count out of a size-prefixed
-// WASM function body.
-func setEmitCovLocalGroups(t *testing.T, body []byte) int {
+// setEmitCovLocalsOfType counts the locals of one value type declared by a
+// size-prefixed WASM function body. It sums across groups on purpose: the
+// allocator coalesces adjacent same-type runs, so which GROUP a local lands in
+// is an encoding detail while how many of each type exist is the frame.
+func setEmitCovLocalsOfType(t *testing.T, body []byte, ty byte) int {
 	t.Helper()
-	// Skip the ULEB128 size prefix: continuation bit set means another byte.
 	i := 0
 	for i < len(body) && body[i]&0x80 != 0 {
 		i++
@@ -807,7 +808,20 @@ func setEmitCovLocalGroups(t *testing.T, body []byte) int {
 	if i >= len(body) {
 		t.Fatalf("body of %d bytes has no local declarations", len(body))
 	}
-	return int(body[i])
+	groups := int(body[i])
+	i++
+	n := 0
+	for g := 0; g < groups; g++ {
+		if i+1 >= len(body) {
+			t.Fatalf("local group %d runs past the end of a %d-byte body", g, len(body))
+		}
+		count := int(body[i])
+		if body[i+1] == ty {
+			n += count
+		}
+		i += 2
+	}
+	return n
 }
 
 // TestSetEmitBTAdmissionRefusals covers admitBTFallback's refusals.

@@ -77,15 +77,6 @@ perftest: build
 perftest-check: build
 	$(MAKE) -C tools/perftest perftest-check
 
-# Length sweep: declared input length x actual input length, fuel and module
-# size per cell. The only harness here that measures a SHORT input — see
-# tools/lentest/README.md.
-lentest:
-	$(MAKE) -C tools/lentest run
-
-lentest-check:
-	$(MAKE) -C tools/lentest check
-
 setperf:
 	$(MAKE) -C tools/setperf run
 

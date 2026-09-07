@@ -4306,15 +4306,6 @@ func applyDominantStateEncoding(l *dfaLayout, encodeNonMid bool) {
 // should also carry it is a separate measurement with a different balance —
 // it would move every fixture in this family — and is deliberately not asked
 // here.
-// measureClassChainFor is classChainFor with T0.6's measurement gate. See
-// compile/measure.go.
-func measureClassChainFor(l *dfaLayout, t *dfaTable) *classChainPrefix {
-	if measureOff(MeasureClassChain) {
-		return nil
-	}
-	return classChainFor(l, t)
-}
-
 func classChainFor(l *dfaLayout, t *dfaTable) *classChainPrefix {
 	if !l.lmClassChain {
 		return nil
@@ -4818,7 +4809,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		// only at position 0.
 		futureOff:           futureOff,
 		future:              futureWASM,
-		memberSkip:          measureMemberWalkStates(t),
+		memberSkip:          memberWalkStates(t),
 		wasmStart:           uint32(t.startState + 1),
 		wasmMidStart:        uint32(t.midStartState + 1),
 		wasmMidStartNewline: uint32(t.midStartNewlineState + 1),
@@ -5938,14 +5929,7 @@ func appendFindCodeEntryTwinned(cs []byte, l *dfaLayout, t *dfaTable, mandatoryL
 	// the escape. shuftiPrefixPlan is the one predicate that decides that, and
 	// it is asked here with the same arguments buildFindBody will ask it with,
 	// so the two cannot disagree about whether a switch exists.
-	//
-	// MeasurePrefixScanSIMD is part of the predicate because it removes the arm
-	// that emits the handoff CALL: without it here, T0.6's A3 mask built a twin
-	// nothing branches to and tripped the "twin and its call-site patch must be
-	// emitted together" assertion below. Production is unaffected — the zero
-	// mask reaches neither branch — but the panic made A6's case unmeasurable,
-	// which is how it was found.
-	if l.lnmAction5 && !isAnchoredFind(t) && mandatoryLit == nil && !measureOff(MeasurePrefixScanSIMD) {
+	if l.lnmAction5 && !isAnchoredFind(t) && mandatoryLit == nil {
 		if _, adaptive := shuftiPrefixPlan(l.firstBytes, true, true); adaptive {
 			hasTwin = true
 		}
@@ -6050,7 +6034,7 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 			tableMemIdx:           tableMemIdx,
 			dominantStates:        l.dominantStates,
 			soleMidDominant:       soleMidDominant(l),
-			classChain:            measureClassChainFor(l, t),
+			classChain:            classChainFor(l, t),
 			lnmAction5:            l.lnmAction5,
 			skipSafeOnDead:        l.skipSafeOnDead,
 			eofSkipSafe:           l.eofSkipSafe,

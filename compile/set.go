@@ -585,17 +585,6 @@ type CompileSetOptions struct {
 	// first-byte union under LikelyNoMatch).
 	LikelyMode LikelyMode
 
-	// InputLength is the set-level counterpart of CompileOptions.InputLength:
-	// the caller's TYPICAL input length in bytes, 0 when unstated. An
-	// expectation, never a promise — see that field for the contract and for why
-	// the pattern cannot supply this.
-	//
-	// NOT CONSUMED by any set emitter, and nothing reads it: see
-	// CompileOptions.InputLength for why the declared-length axis was dropped
-	// and what this field is now being kept for. Every value produces a
-	// byte-identical module.
-	InputLength int
-
 	// ForceFrontend overrides chooseLiteralFrontend's verdict. TEST-ONLY, and
 	// specifically a MEASUREMENT knob (task 71): the crossover constants in
 	// chooseLiteralFrontend were each calibrated on a no-match corpus, and the
