@@ -2445,80 +2445,78 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 		}
 	}
 
-	var b []byte
-	// lFirstByte is E5's hoisted input[lPos], declared in a TRAILING group so
-	// every index below it keeps its value — the arms name the i64s and the
-	// v128 explicitly, and inserting into an earlier group would move them.
-	var lFirstByte byte
-	if absence {
-		// 13 i32 (pos, search mask, simd mask, allElig, end), 2 i64 (acc, alive), 1 v128,
-		// then lFirstByte and the absence drain's candidate position.
-		// Always one alive word: the absence prefilter is capped at 64 ids.
-		b = append(b, 0x04+gateGroups(gateLocals), 0x0D, 0x7F, 0x02, 0x7E, 0x01, 0x7B, 0x02, 0x7F)
-		b = appendGateLocalGroup(b, gateLocals)
-	} else if findPreflight {
-		// 8 i32 + the union walk's state/pos + allElig + end, then i64 acc + the
-		// alive mask's words, then lFirstByte.
-		b = append(b, 0x03+gateGroups(gateLocals), 0x0C, 0x7F)
-		b = utils.AppendULEB128(b, uint32(1+aliveWords))
-		b = append(b, 0x7E)
-		b = append(b, 0x01, 0x7F)
-		b = appendGateLocalGroup(b, gateLocals)
-	} else {
-		// locals: 9 x i32, then the scan_all i64 accumulator, then lFirstByte.
-		b = append(b, 0x03+gateGroups(gateLocals), 0x09, 0x7F, 0x01, 0x7E, 0x01, 0x7F)
-		b = appendGateLocalGroup(b, gateLocals)
-	}
-
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	c.tableMemIdx = tableMemIdx
 	c.perPositionDrain = true
-	// lAllElig is the last i32 of each arm; the i64s follow it, so both move
-	// up by one against the pre-2b layout.
-	c.lAllElig = c.localBase + 8
-	c.lAcc = c.localBase + 9
-	lFirstByte = c.localBase + 10
 	lPos := c.lPos
 	pInLen := c.pInLen
-	lEnd := byte(0)
-	if absence {
-		c.lAllElig = c.localBase + 11
-		lEnd = c.localBase + 12
-		c.lAcc = c.localBase + 13
-		c.aliveMask = c.localBase + 14
-		lFirstByte = c.localBase + 16 // past the v128 chunk at +15
-	} else if findPreflight {
-		c.lAllElig = c.localBase + 10
-		lEnd = c.localBase + 11
-		c.lAcc = c.localBase + 12
-		c.aliveMask = c.localBase + 13
-		lFirstByte = byte(int(c.localBase) + 13 + aliveWords)
+
+	// Locals come from the allocator, in declaration order (task 67). This body
+	// had THREE layouts — plain, find-preflight, absence-prefilter — each with
+	// its own hand-written declaration vector and its own map of indices, and
+	// it additionally passed three raw indices ACROSS a function boundary into
+	// emitFindPreflight. Allocating says each arm once.
+	a := newLocalAlloc(uint32(c.localBase))
+	a.Reserve(valI32, 5) // lPos, lTotal, lTmp, lValidMask, lOutBase
+	a.Reserve(valI32, 3) // lMinStart, lBase, lStart — newSetFindCtx's defaults
+
+	// lFirstByte is E5's hoisted input[lPos]; lPfPos/lPfState/lPfMask are the
+	// find preflight's own scratch, named here rather than computed at its call
+	// site.
+	var lFirstByte, lEnd, lChunk, lCand, lPfPos, lPfState, lPfMask byte
+	switch {
+	case absence:
+		// 13 i32 (preflight pos, state, mask, allElig, end), 2 i64 (acc,
+		// alive), 1 v128 chunk, then lFirstByte and the absence drain's
+		// candidate position. Always one alive word: the absence prefilter is
+		// capped at 64 ids.
+		lPfPos, lPfState, lPfMask = a.I32(), a.I32(), a.I32()
+		c.lAllElig = a.I32()
+		lEnd = a.I32()
+		c.lAcc = a.I64()
+		c.aliveMask = a.I64()
+		lChunk = a.V128()
+		lFirstByte = a.I32()
+		lCand = a.I32()
+	case findPreflight:
+		// The union walk's pos and state, then allElig and end, then the i64
+		// accumulator and the alive mask's words, then lFirstByte.
+		lPfPos, lPfState = a.I32(), a.I32()
+		c.lAllElig = a.I32()
+		// The preflight's mask scratch IS lAllElig. That aliasing is safe only
+		// because the preflight runs before emitFindPrologue, which is what
+		// writes lAllElig for the scan proper — and it was previously invisible,
+		// spelled as two separate `c.localBase + 10` expressions 30 lines apart.
+		lPfMask = c.lAllElig
+		lEnd = a.I32()
+		c.lAcc = a.I64()
+		c.aliveMask = a.I64()
+		for w := 1; w < aliveWords; w++ {
+			a.I64() // one alive word per 64 ids, after the mask's first
+		}
+		lFirstByte = a.I32()
+	default:
+		c.lAllElig = a.I32()
+		c.lAcc = a.I64()
+		lFirstByte = a.I32()
 	}
 
 	if gateLocals > 0 {
-		// The gate block is the LAST group of every arm, so its base is one
-		// past that arm's last local. lFirstByte is the last non-gate local in
-		// the plain and preflight arms; lCand is in the absence arm.
-		if absence {
-			c.gateLocalBase = c.localBase + 18
-		} else {
-			c.gateLocalBase = lFirstByte + 1
-		}
+		// F2's gate locals are the last group of every arm.
+		c.gateLocalBase = a.I32()
+		a.Reserve(valI32, gateLocals-1)
 	}
+
+	var b []byte
+	b = a.EmitDecls(b)
 
 	if findPreflight {
 		// Before the prologue: emitGateJump reads the gate array, so the
 		// sentinels must already be in place for it to skip ahead correctly.
 		// One emitter serves both bodies — see emitFindPreflight's header for
 		// why the gated and overlapping forms converged (item 22 fix 2a).
-		// The v128 chunk is the last local of the absence arm, so it moves up
-		// with the i64s when lAllElig is inserted ahead of them.
-		lChunk := byte(c.localBase + 15)
-		// The absence drain's candidate position is the LAST local of the
-		// absence arm, one past lFirstByte.
-		lCand := byte(c.localBase + 17)
-		b = emitFindPreflight(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
-			c.pGate, c.pInLen, c.pFrom, lEnd, tableMemIdx, absence, c.localBase+10, lChunk, lCand)
+		b = emitFindPreflight(b, cs, lPfPos, lPfState, c.aliveMask,
+			c.pGate, c.pInLen, c.pFrom, lEnd, tableMemIdx, absence, lPfMask, lChunk, lCand)
 	}
 	// AFTER the preflight, which WRITES gate sentinels into the caller's
 	// array: locals captured before it hold the pre-preflight values, and the
