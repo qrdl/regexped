@@ -345,7 +345,7 @@ func cases() []lenCase {
 // ---------------------------------------------------------------------------
 // Compilation.
 
-func compileCase(c lenCase, declared int) ([]byte, error) {
+func compileCase(c lenCase) ([]byte, error) {
 	if c.mode == modeSet {
 		entries := make([]config.RegexEntry, len(c.setPatterns))
 		for i, p := range c.setPatterns {
@@ -367,7 +367,6 @@ func compileCase(c lenCase, declared int) ([]byte, error) {
 		cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
 		opts := compile.CompileSetOptions{
 			LikelyMode:  c.likely,
-			InputLength: declared,
 		}
 		wasm, _, _, err := compile.CompileFileOpts(cfg, "", opts)
 		return wasm, err
@@ -382,7 +381,7 @@ func compileCase(c lenCase, declared int) ([]byte, error) {
 	default:
 		re.FindFunc = "find"
 	}
-	opts := compile.CompileOptions{LikelyMode: c.likely, InputLength: declared}
+	opts := compile.CompileOptions{LikelyMode: c.likely}
 	wasm, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true, opts)
 	return wasm, err
 }
@@ -613,6 +612,22 @@ type cell struct {
 	skipped string // non-empty when this cell was not measured, and why
 }
 
+// Column widths for the sweep tables. rowLabelW is sized to the header
+// "declared \\ actual" (17 chars): when it was 14 the header overflowed its own
+// field and every column heading sat three characters right of the data under
+// it. colW must hold the widest cell any row prints — a six-digit fuel figure
+// plus its percentage, which is why the delta form below is %7d%5s and not
+// %5d%5s.
+const (
+	rowLabelW = 18
+	colW      = 12
+	// The T0.6 table's own pair. Its label column holds "<mechanism> (<scope>)"
+	// — "prefix-scan-simd (wide)" is 23 characters and overflowed a 22-wide
+	// field, putting that one row a character right of every other.
+	mechLabelW = 26
+	mechColW   = 9
+)
+
 func pct(cur, base uint64) string {
 	if base == 0 {
 		return "    —"
@@ -626,6 +641,11 @@ func pct(cur, base uint64) string {
 
 func humanLen(n int) string {
 	switch {
+	// 0 is not a declared length of zero — it is the build with NO
+	// declaration, which is the baseline every other row is a delta against.
+	// Printing it as "0" read as "declared zero bytes" and was misleading.
+	case n == 0:
+		return "no-hint"
 	case n >= 1024 && n%1024 == 0:
 		return fmt.Sprintf("%dK", n/1024)
 	default:
@@ -669,43 +689,18 @@ func main() {
 		if actual == nil {
 			actual = defaultActual
 		}
-		declared := c.declared
-		if declared == nil {
-			declared = defaultDeclared
-		}
 
 		fmt.Printf("\n=== %s  [%s%s] ===\n", c.name, c.mode, likelySuffix(c.likely))
 		fmt.Printf("  %s\n", c.desc)
 		fmt.Printf("  measures: %s\n", c.task)
 
-		// Compile every declared value up front: the byte-identity check
-		// against the unset build is what decides whether a row is measured at
-		// all, and it is also the honest report while a mechanism is unwired.
-		mods := make(map[int][]byte, len(declared))
-		var base []byte
-		compileFailed := false
-		for _, d := range declared {
-			w, err := compileCase(c, d)
-			if err != nil {
-				fmt.Printf("  COMPILE FAILED (declared=%d): %v\n", d, err)
-				failures++
-				compileFailed = true
-				break
-			}
-			mods[d] = w
-			if d == 0 {
-				base = w
-			}
-		}
-		if compileFailed {
+		w, err := compileCase(c)
+		if err != nil {
+			fmt.Printf("  COMPILE FAILED: %v\n", err)
+			failures++
 			continue
 		}
-
-		fmt.Printf("  wasm size: ")
-		for _, d := range declared {
-			fmt.Printf(" declared=%-6s %d B", humanLen(d), len(mods[d]))
-		}
-		fmt.Println()
+		fmt.Printf("  wasm size: %d B\n", len(w))
 
 		var firstErr error
 		for _, matching := range []bool{false, true} {
@@ -714,54 +709,39 @@ func main() {
 				label = "match"
 			}
 			fmt.Printf("\n  --- %s inputs ---\n", label)
-			fmt.Printf("  %-14s", "declared \\ actual")
+			fmt.Printf("  %-*s", rowLabelW, "input length")
 			for _, a := range actual {
-				fmt.Printf("%10s", humanLen(a))
+				fmt.Printf("%*s", colW, humanLen(a))
 			}
 			fmt.Println()
 
-			// Baseline row (declared unset) first; every other row is a Δ
-			// against the SAME actual length in it.
-			baseFuel := make(map[int]uint64, len(actual))
-			for _, d := range declared {
-				identical := d != 0 && base != nil && string(mods[d]) == string(base)
-				if identical {
-					fmt.Printf("  %-14s identical WASM — same as unset, not measured\n", humanLen(d))
+			fmt.Printf("  %-*s", rowLabelW, "fuel")
+			for _, a := range actual {
+				in, ok := c.gen(a, matching)
+				if !ok {
+					fmt.Printf("%*s", colW, "n/a")
 					continue
 				}
-				fmt.Printf("  %-14s", humanLen(d))
-				for _, a := range actual {
-					in, ok := c.gen(a, matching)
-					if !ok {
-						fmt.Printf("%10s", "n/a")
-						continue
-					}
-					if len(in) != a {
-						fmt.Printf("%10s", "BADGEN")
-						failures++
-						continue
-					}
-					f, err := measureFuel(fuelEngine, mods[d], c, in)
-					if err != nil {
-						fmt.Printf("%10s", "ERR")
-						if firstErr == nil {
-							firstErr = err
-						}
-						failures++
-						continue
-					}
-					if d == 0 {
-						baseFuel[a] = f
-						fmt.Printf("%10d", f)
-					} else {
-						fmt.Printf("%5d%5s", f, pct(f, baseFuel[a]))
-					}
+				if len(in) != a {
+					fmt.Printf("%*s", colW, "BADGEN")
+					failures++
+					continue
 				}
-				fmt.Println()
+				f, err := measureFuel(fuelEngine, w, c, in)
+				if err != nil {
+					fmt.Printf("%*s", colW, "ERR")
+					if firstErr == nil {
+						firstErr = err
+					}
+					failures++
+					continue
+				}
+				fmt.Printf("%*d", colW, f)
 			}
+			fmt.Println()
 
 			if *withTime {
-				reportTimes(timeEngine, c, mods, declared, actual, matching, base)
+				reportTimes(timeEngine, c, w, actual, matching)
 			}
 		}
 		if firstErr != nil {
@@ -798,30 +778,24 @@ func likelySuffix(m compile.LikelyMode) string {
 // is what makes the two ends of a row comparable. likelytest avoids it with an
 // in-WASM iteration shim, and pays for that by measuring a shim rather than the
 // export.
-func reportTimes(engine *wasmtime.Engine, c lenCase, mods map[int][]byte,
-	declared, actual []int, matching bool, base []byte) {
+func reportTimes(engine *wasmtime.Engine, c lenCase, w []byte,
+	actual []int, matching bool) {
 
-	fmt.Printf("  %-14s (p50 wall-clock, informative only — gate on fuel)\n", "")
-	for _, d := range declared {
-		if d != 0 && base != nil && string(mods[d]) == string(base) {
+	fmt.Printf("  %-*s", rowLabelW, "p50 (informative)")
+	for _, a := range actual {
+		in, ok := c.gen(a, matching)
+		if !ok || len(in) != a {
+			fmt.Printf("%*s", colW, "n/a")
 			continue
 		}
-		fmt.Printf("  %-14s", humanLen(d))
-		for _, a := range actual {
-			in, ok := c.gen(a, matching)
-			if !ok || len(in) != a {
-				fmt.Printf("%10s", "n/a")
-				continue
-			}
-			dur, err := measureTime(engine, mods[d], c, in)
-			if err != nil {
-				fmt.Printf("%10s", "ERR")
-				continue
-			}
-			fmt.Printf("%10s", dur.String())
+		dur, err := measureTime(engine, w, c, in)
+		if err != nil {
+			fmt.Printf("%*s", colW, "ERR")
+			continue
 		}
-		fmt.Println()
+		fmt.Printf("%*s", colW, dur.String())
 	}
+	fmt.Println()
 }
 
 // ---------------------------------------------------------------------------
@@ -885,7 +859,7 @@ func runT06(fuelEngine *wasmtime.Engine, filter string, setsOnly bool) {
 		}
 
 		compile.SetMeasureDisabled(0)
-		base, err := compileCase(c, 0)
+		base, err := compileCase(c)
 		if err != nil {
 			fmt.Printf("\n=== %s === COMPILE FAILED: %v\n", c.name, err)
 			continue
@@ -918,48 +892,48 @@ func runT06(fuelEngine *wasmtime.Engine, filter string, setsOnly bool) {
 			}
 
 			fmt.Printf("\n  --- %s ---\n", label)
-			fmt.Printf("  %-22s", "mechanism (scope)")
+			fmt.Printf("  %-*s", mechLabelW, "mechanism (scope)")
 			for _, a := range actual {
-				fmt.Printf("%9s", humanLen(a))
+				fmt.Printf("%*s", mechColW, humanLen(a))
 			}
 			fmt.Println()
-			fmt.Printf("  %-22s", "baseline fuel")
+			fmt.Printf("  %-*s", mechLabelW, "baseline fuel")
 			for _, a := range actual {
 				if f, ok := baseFuel[a]; ok {
-					fmt.Printf("%9d", f)
+					fmt.Printf("%*d", mechColW, f)
 				} else {
-					fmt.Printf("%9s", "n/a")
+					fmt.Printf("%*s", mechColW, "n/a")
 				}
 			}
 			fmt.Println()
 
 			for _, m := range mechanisms() {
 				prev := compile.SetMeasureDisabled(m.mask)
-				w, err := compileCase(c, 0)
+				w, err := compileCase(c)
 				compile.SetMeasureDisabled(prev)
 				if err != nil {
-					fmt.Printf("  %-22s COMPILE FAILED: %v\n", m.name, err)
+					fmt.Printf("  %-*s COMPILE FAILED: %v\n", mechLabelW, m.name, err)
 					continue
 				}
 				if string(w) == string(base) {
-					fmt.Printf("  %-22s identical — this case never emits it\n",
-						m.name+" ("+m.scope+")")
+					fmt.Printf("  %-*s identical — this case never emits it\n",
+						mechLabelW, m.name+" ("+m.scope+")")
 					continue
 				}
-				fmt.Printf("  %-22s", m.name+" ("+m.scope+")")
+				fmt.Printf("  %-*s", mechLabelW, m.name+" ("+m.scope+")")
 				for _, a := range actual {
 					bf, ok := baseFuel[a]
 					if !ok {
-						fmt.Printf("%9s", "n/a")
+						fmt.Printf("%*s", mechColW, "n/a")
 						continue
 					}
 					in, _ := c.gen(a, matching)
 					f, err := measureFuel(fuelEngine, w, c, in)
 					if err != nil {
-						fmt.Printf("%9s", "ERR")
+						fmt.Printf("%*s", mechColW, "ERR")
 						continue
 					}
-					fmt.Printf("%8.1f%%", (float64(f)-float64(bf))/float64(bf)*100)
+					fmt.Printf("%*.1f%%", mechColW-1, (float64(f)-float64(bf))/float64(bf)*100)
 				}
 				fmt.Println()
 			}

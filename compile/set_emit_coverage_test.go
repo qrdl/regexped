@@ -780,15 +780,16 @@ func TestSetEmitShuftiNonAdaptiveBody(t *testing.T) {
 			t.Errorf("mode %v: body does not end with `end` (0x0B), got %#x",
 				mode, body[len(body)-1])
 		}
-		// Five local groups, not six: the adaptive form's dense-gate counter
+		// Six local groups, not seven: the adaptive form's dense-gate counter
 		// is absent. (Both frames gained one trailing i32 group for E5's
-		// hoisted first byte, so the non-adaptive frame is 5 and the adaptive
-		// one 6.) The count is the second byte — the first is the body's
+		// hoisted first byte and another for the backward tail probe, so the
+		// non-adaptive frame is 6 and the adaptive one 7.) The count is the
+		// second byte — the first is the body's
 		// LEB128 size prefix, which is single-byte only for tiny bodies, so
 		// the check reads it back through the same size prefix the emitter
 		// wrote.
-		if got := setEmitCovLocalGroups(t, body); got != 5 {
-			t.Errorf("mode %v: %d local groups, want 5 (the non-adaptive frame)", mode, got)
+		if got := setEmitCovLocalGroups(t, body); got != 6 {
+			t.Errorf("mode %v: %d local groups, want 6 (the non-adaptive frame)", mode, got)
 		}
 	}
 }
