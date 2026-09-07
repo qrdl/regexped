@@ -1081,9 +1081,9 @@ func TestSetCoreSparseSuffixBodySubtractsFixedPrefix(t *testing.T) {
 	prefixFixedLens[0] = 3 // the bucket-wide fixed prefix length
 
 	withPrefix, _, _, _ := genSuffixWASM(table, 0, 0, setCoreCovIDs(numPatterns), prefixFixedLens, LikelyNeutral,
-		false /* needProbes */, false /* gated */)
+		false /* needProbes */, false /* gated */, nil)
 	withoutPrefix, _, _, _ := genSuffixWASM(table, 0, 0, setCoreCovIDs(numPatterns), make([]int, numPatterns), LikelyNeutral,
-		false, false)
+		false, false, nil)
 
 	if len(withPrefix.fnBody) == 0 {
 		t.Fatal("genSuffixWASM emitted no sparse suffix body")

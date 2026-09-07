@@ -21,10 +21,11 @@ import "github.com/qrdl/regexped/internal/utils"
 //     correct: byteident cannot distinguish a local index from SLEB128 data
 //     that happens to hold the same byte.
 //
-//   - A table-memory SCRATCH SLOT (the shape B13 used for winScratchOff) has
-//     a per-pattern address whose Go zero value — 0 — is a real, writable
-//     table offset. That defect landed twice in one attempt, and is the same
-//     class as the edgeScratchOff.
+//   - A table-memory SCRATCH SLOT (the shape B13 used for the groups wrapper's
+//     window offsets) has a per-pattern address whose Go zero value — 0 — is a
+//     real, writable table offset. That defect landed twice in one attempt.
+//     Those window offsets are globals themselves now, for this reason: see
+//     compiledPattern.winGlobal.
 //
 // A global has neither failure mode. The index is a package constant, so
 // there is no per-pattern address to forget to initialise, and a body that

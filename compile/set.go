@@ -615,6 +615,14 @@ type CompileSetOptions struct {
 	// frontend actually ships. Zero value means "use the verdict".
 	ForceShuftiAdaptive bool
 	forceShuftiAdaptive bool
+
+	// globals is the MODULE's global allocator, shared with every pattern and
+	// every other set in the same compile. A set reaches for it when a bucket
+	// wants module-scoped state — today only the sparse member skip's
+	// per-bucket verdict (TODO 75 group C). nil in the out-of-package entry
+	// points, which is why every consumer must allocate ONLY on the condition
+	// that produced it.
+	globals *moduleGlobals
 }
 
 // SetFrontend is the exported spelling of frontendKind, so an out-of-package

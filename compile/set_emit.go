@@ -789,7 +789,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
 		bkt.dp = art.dp
 		if art.sparseProbeReady {
 			// The scratch address is decided by the emitter; the driver reads
@@ -1149,7 +1149,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// the per-candidate driver calls one suffix function at a time and the
 	// memo re-zeroes itself at the head of every call.
 	btBase := ra.Reserve("bt-fallback", 1)
-	btRegions := planBTRegions(buckets, int64(btBase))
+	btRegions := planBTRegions(buckets, int64(btBase), opts.globals)
 	numBTFns := 0
 	for bi, bkt := range buckets {
 		if bkt.btFallback == nil {
@@ -1714,6 +1714,8 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 			// CompileSetOptions.ForceShuftiAdaptive.
 			ForceShuftiAdaptive: over.ForceShuftiAdaptive,
 			forceShuftiAdaptive: over.forceShuftiAdaptive,
+			// The module's allocator, shared with the per-pattern entries above.
+			globals: globals,
 		}
 		if !standalone {
 			setOpts.TableMemIdx = 1
@@ -2111,7 +2113,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				}
 				winOff := int32(-1)
 				if !p.isTDFA {
-					winOff = p.winScratchOff
+					winOff = p.winGlobal
 				}
 				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal)
 			}
@@ -2129,7 +2131,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				}
 				winOff := int32(-1)
 				if !p.isTDFA {
-					winOff = p.winScratchOff
+					winOff = p.winGlobal
 				}
 				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode)
 			}

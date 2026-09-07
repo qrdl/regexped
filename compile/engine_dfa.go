@@ -4612,7 +4612,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 // holds one suffix DFA for N patterns, so there is deliberately no
 // per-pattern override: the hint that governs this body is the one on the
 // set.
-func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, globals *moduleGlobals, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
 	// probeFlags[0]: also build the first-hit variant (set wants both rules).
 	// probeFlags[1]: the SOLE probe is first-hit (no scan_all declared), so
 	// scanProbe itself gets the cheap exit and no second body is emitted.
@@ -4850,8 +4850,22 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		// bucket's scratch — and therefore its neutral output — for a region
 		// a neutral build never reads.
 		staleStates := 0
+		memberGlobal := int32(-1)
 		if tabs.hasMember {
 			staleStates = l.numWASM
+			// The per-BUCKET verdict is a module global, not a scratch byte:
+			// the index comes from an allocator instead of address arithmetic,
+			// and a body reading a global its assembler never declared fails
+			// WASM validation rather than reading whatever sits at a stale
+			// offset (TODO 75 group A's defect class, applied here).
+			//
+			// Allocated ONLY when the skip is emitted, which is the same
+			// condition the per-state flags are sized on — so a neutral build
+			// allocates nothing and its module is unchanged.
+			if globals == nil {
+				panic("compile: a member-skip bucket needs the module's global allocator")
+			}
+			memberGlobal = int32(globals.Alloc())
 		}
 		scratch := planSparseScratch(idMapOff+int32(len(idMap)), len(patternIDs), staleStates)
 		dataBytes = append(dataBytes, appendDataSegment(nil, tabs.midOff, tabs.data)...)
@@ -4888,6 +4902,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 			wasmStart:    uint32(t.startState + 1),
 			wasmMidStart: uint32(t.midStartState + 1),
 			tableMemIdx:  tableMemIdx, gated: gated, hasSkip: needSkip,
+			memberGlobal: memberGlobal,
 		}
 		art.fnBody = sizePrefixed(buildSparseSuffixBody(sp))
 		if needProbes {

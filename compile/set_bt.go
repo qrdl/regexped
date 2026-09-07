@@ -26,8 +26,8 @@ import (
 // match anchored HERE, and where does it end". Two flags on
 // buildBacktrackBody, in combination, give exactly that:
 //
-//   - WINDOW MODE (winScratchOff >= 0) loads (startOff, endOff) from a table
-//     scratch slot, seeds pos = startOff, and takes endOff as the consumption
+//   - WINDOW MODE (winGlobal >= 0) loads (startOff, endOff) from two module
+//     globals, seeds pos = startOff, and takes endOff as the consumption
 //     limit — while (ptr, len) remain the caller's TRUE input, which is what
 //     lets \b, \B, \A, \z, (?m:^) and (?m:$) see real edges instead of a slice
 //     boundary. startOff is the candidate position; endOff is the real length.
@@ -204,17 +204,21 @@ func hasBTBucketIn(buckets []*bucket) bool {
 // The stack needs no clearing for a third reason: BT pushes from stackBase and
 // unwinds within the call, so it starts empty each time.
 type btSharedRegions struct {
-	stackBase   int32 // start of the shared BT frame stack
-	stackLimit  int32 // one past its end; BT reports overflow on reaching this
-	memoBase    int32 // start of the shared BitState bitset, past its header (0 when unused)
-	winScratch  int32 // 8-byte (startOff, endOff) window slot
+	stackBase  int32 // start of the shared BT frame stack
+	stackLimit int32 // one past its end; BT reports overflow on reaching this
+	memoBase   int32 // start of the shared BitState bitset, past its header (0 when unused)
+	// winGlobal is the first of TWO consecutive module globals holding
+	// (startOff, endOff) for window mode — the same pair the single-pattern
+	// path carries, and globals for the same reason: an allocator index has no
+	// zero value that is also a writable table address (TODO 75 group A).
+	winGlobal   int32
 	slotScratch int32 // 8-byte group-0 (start, end) buffer the BT body writes
 	end         int32 // one past everything above
 }
 
 // planBTRegions lays the shared regions out above `base` and returns them,
 // or nil when the set has no BT bucket. Sizes are the max over BT buckets.
-func planBTRegions(buckets []*bucket, base int64) *btSharedRegions {
+func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals) *btSharedRegions {
 	maxStack, maxMemo := 0, 0
 	any := false
 	for _, b := range buckets {
@@ -242,8 +246,19 @@ func planBTRegions(buckets []*bucket, base int64) *btSharedRegions {
 		r.memoBase = cur + btMemoHeaderBytes
 		cur += int32(maxMemo)
 	}
-	r.winScratch = cur
-	cur += 8
+	// The window pair is allocated, not reserved: no table bytes here.
+	//
+	// A nil allocator means this set is being compiled outside a module
+	// assembly — CompileSet is reachable that way from tests that inspect the
+	// result rather than run it. Numbering from a fresh allocator keeps the
+	// emitted bodies self-consistent; the assemblers always pass the module's
+	// own, which is what makes the declaration and the uses agree in a module
+	// that actually runs. Same defensive shape as assembleModule's.
+	if globals == nil {
+		globals = &moduleGlobals{}
+	}
+	r.winGlobal = int32(globals.Alloc())
+	globals.Alloc() // endOff, at winGlobal+1
 	r.slotScratch = cur
 	cur += 8
 	r.end = cur
@@ -343,14 +358,12 @@ func buildSetBTSuffixBody(regions *btSharedRegions,
 	// and treats len as its consumption limit — while (ptr, len) stay the true
 	// input so \b, \B, \A, \z and the (?m:) anchors see real edges. This is
 	// the whole reason a BT bucket needs no left-context side channel.
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, regions.winScratch)
 	b = append(b, 0x20, btSufStart)
-	b = appendTableStore32(b, tableMemIdx, 0)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, regions.winScratch)
+	b = append(b, 0x24)
+	b = utils.AppendULEB128(b, uint32(regions.winGlobal))
 	b = append(b, 0x20, btSufLen)
-	b = appendTableStore32(b, tableMemIdx, 4)
+	b = append(b, 0x24)
+	b = utils.AppendULEB128(b, uint32(regions.winGlobal+1))
 
 	// end = bt(ptr, len, slotScratch)
 	b = append(b, 0x20, btSufPtr)
@@ -495,7 +508,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			cs.btRegions.stackBase, cs.btRegions.stackLimit,
 			int32(btFrameSize(info.bt)), cs.btRegions.memoBase, info.useMemo,
 			true, // nativeAnchored
-			tableMemIdx, cs.btRegions.winScratch,
+			tableMemIdx, cs.btRegions.winGlobal,
 			// Per-bucket, not per-set: the shared memo region is sized to the
 			// LARGEST bucket's reservation, but each body's fill is sized from
 			// its OWN N, so each must be bounded by its own ceiling.
@@ -592,16 +605,14 @@ func buildSetBTProbeBody(regions *btSharedRegions, btFuncIdx int, tableMemIdx in
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
 
-	// Window slot = (start, len): anchor at start, bound at the true end, keep
+	// Window pair = (start, len): anchor at start, bound at the true end, keep
 	// real left context. Same mechanism the suffix body uses.
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, regions.winScratch)
 	b = append(b, 0x20, pStart)
-	b = appendTableStore32(b, tableMemIdx, 0)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, regions.winScratch)
+	b = append(b, 0x24)
+	b = utils.AppendULEB128(b, uint32(regions.winGlobal))
 	b = append(b, 0x20, pLen)
-	b = appendTableStore32(b, tableMemIdx, 4)
+	b = append(b, 0x24)
+	b = utils.AppendULEB128(b, uint32(regions.winGlobal+1))
 
 	b = append(b, 0x20, pPtr)
 	b = append(b, 0x20, pLen)

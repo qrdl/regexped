@@ -584,7 +584,7 @@ func btHasWordBoundary(prog *syntax.Prog) bool {
 // defined against the true input edges, which a captureBody handed a
 // narrowed match slice cannot see. Their presence is what switches the
 // groups wrappers into window mode — see
-// buildBacktrackBody's winScratchOff.
+// buildBacktrackBody's winGlobal.
 func btHasTextLineAnchors(prog *syntax.Prog) bool {
 	const mask = syntax.EmptyBeginText | syntax.EmptyEndText |
 		syntax.EmptyBeginLine | syntax.EmptyEndLine
@@ -684,8 +684,8 @@ func loopCaptureLocals(prog *syntax.Prog, idom []int, loopPC int) []uint32 {
 	return locals
 }
 
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32, memoMaxLen int32, capStartGlobal int32) []byte {
-	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, winScratchOff, memoMaxLen, capStartGlobal)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winGlobal int32, memoMaxLen int32, capStartGlobal int32) []byte {
+	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, winGlobal, memoMaxLen, capStartGlobal)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -701,7 +701,7 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // full input length, not a DFA-narrowed match extent (see engine_tdfa.go's
 // identically-named parameter for the TDFA-side counterpart of this fix).
 //
-// winScratchOff (-1 = off) switches this body into WINDOW MODE, the fix for
+// winGlobal (-1 = off) switches this body into WINDOW MODE, the fix for
 // a past defect. In window mode the wrapper stops
 // narrowing: it passes the caller's real (ptr,len) and stashes the match
 // window as an (startOff,endOff) pair at this table-memory offset. This
@@ -711,7 +711,7 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // fix-up, and the wrapper needs no per-slot rebasing pass afterwards.
 // Byte consumption is still bounded by endOff (limitLocal), so window mode
 // explores exactly the same positions the narrowed slice used to.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winScratchOff int32, memoMaxLen int32, capStartGlobal int32) []byte {
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winGlobal int32, memoMaxLen int32, capStartGlobal int32) []byte {
 
 	prog := bt.prog
 	N := len(prog.Inst)
@@ -803,10 +803,10 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		memoZeroLen = memoLocalsBase + 4
 	}
 
-	// Window-mode locals (see winScratchOff): the match window's start and
+	// Window-mode locals (see winGlobal): the match window's start and
 	// end offsets, loaded once from scratch at entry. Placed last so no
 	// existing local index shifts.
-	useWindow := winScratchOff >= 0
+	useWindow := winGlobal >= 0
 	memoLocalsCount := 0
 	if useMemo {
 		memoLocalsCount = 5
@@ -836,15 +836,13 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	// Loaded once; winStart also seeds pos, and winEnd is the consumption
 	// limit every bounds check and InstMatch tests against.
 	if useWindow {
-		body = append(body, 0x41)
-		body = utils.AppendSLEB128(body, winScratchOff)
-		body = appendTableLoad32(body, tableMemIdx, 0) // startOff
+		body = append(body, 0x23) // global.get startOff
+		body = utils.AppendULEB128(body, uint32(winGlobal))
 		body = append(body, 0x21)
 		body = utils.AppendULEB128(body, winStartLocal)
 
-		body = append(body, 0x41)
-		body = utils.AppendSLEB128(body, winScratchOff)
-		body = appendTableLoad32(body, tableMemIdx, 4) // endOff
+		body = append(body, 0x23) // global.get endOff
+		body = utils.AppendULEB128(body, uint32(winGlobal+1))
 		body = append(body, 0x21)
 		body = utils.AppendULEB128(body, winEndLocal)
 	}
@@ -1883,7 +1881,7 @@ func btPushFrame(b []byte, numCapLocals int, extraLocals []uint32, retryPC uint3
 // Computes: prevIsWord XOR nextIsWord; check against wantBoundary.
 //
 // The captureBody's (ptr,len) are always the caller's true input under
-// window mode (see buildBacktrackBody's winScratchOff), so pos==0 / pos==len
+// window mode (see buildBacktrackBody's winGlobal), so pos==0 / pos==len
 // are true input edges here and no side-channel edge context is needed —
 // this is what a past defect’s (origPtr,origEnd) scratch used to
 // reconstruct for a narrowed slice.
