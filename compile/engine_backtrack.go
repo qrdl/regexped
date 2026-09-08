@@ -1040,7 +1040,9 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopEntryLocalIdx, loopSnapBase, loopSnapLocals, extraFrameLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, limitLocal, winStartLocal, useWindow, capStartGlobal)
+		body = emitBTInstHandler(body, bt, p, inst, brRun, loopLocalIdx, loopEntryLocalIdx, loopSnapBase, loopSnapLocals, extraFrameLocals, stackLimit, frameSize, numCapLocals, memoTableBase, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte, useMemo, false, nativeAnchored, nil, nil, tableMemIdx, limitLocal, winStartLocal, useWindow, capStartGlobal,
+			// The capture body's memo origin is its window start.
+			winStartLocal, useWindow)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -1056,7 +1058,16 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 // WASM-level if-block (callers pass brRunNested; the enclosing Go-level
 // `if useMemo && ...` around the call site is compile-time only and adds no
 // WASM nesting).
-func emitBitStateGuard(body []byte, p int, progN int, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte uint32, memoTableBase int32, tableMemIdx int, brDepth uint32, winStartLocal uint32, useWindow bool) []byte {
+// memoOriginLocal / hasMemoOrigin are the MEMO ORIGIN: the input position that
+// bit index 0 stands for. Positions below it are never visited by this body, so
+// rebasing shrinks both the bitset the call needs and the ceiling it is checked
+// against.
+//
+// The capture body's origin is its window start; the no-capture FIND body's is
+// the call's `from`, which is why this is its own pair rather than the window
+// flag it used to borrow — a find body is not in window mode and still has an
+// origin. The match body has none.
+func emitBitStateGuard(body []byte, p int, progN int, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte uint32, memoTableBase int32, tableMemIdx int, brDepth uint32, memoOriginLocal uint32, hasMemoOrigin bool) []byte {
 	// bitIdx = (localPos - winStart) * N + p
 	//
 	// POSITION-major, not PC-major. The N bits belonging to one input position
@@ -1070,9 +1081,9 @@ func emitBitStateGuard(body []byte, p int, progN int, memoDirtyHi, memoBitIdx, m
 	// N is a compile-time constant here, where lenPlus1 was a local, so the
 	// multiply is by an immediate rather than by a loaded value.
 	body = append(body, 0x20, localPos)
-	if useWindow {
-		body = btLocalGet(body, winStartLocal)
-		body = append(body, 0x6B) // i32.sub (rebase into the window)
+	if hasMemoOrigin {
+		body = btLocalGet(body, memoOriginLocal)
+		body = append(body, 0x6B) // i32.sub (rebase onto the origin)
 	}
 	body = append(body, 0x41)
 	body = utils.AppendSLEB128(body, int32(progN))
@@ -1202,6 +1213,11 @@ func emitBTInstHandler(
 	limitLocal, winStartLocal uint32,
 	useWindow bool,
 	capStartGlobal int32,
+	// The memo origin, SEPARATE from window mode: the capture body's origin is
+	// its window start, but the no-capture find body has an origin (the call's
+	// `from`) without being in window mode at all.
+	memoOriginLocal uint32,
+	hasMemoOrigin bool,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
@@ -1297,7 +1313,7 @@ func emitBTInstHandler(
 			// non-greedy empty-body loop head is memoised below, to bound the
 			// otherwise-unlimited retry growth. See bt.memoInnerLoop's doc.
 			if useMemo && bt.memoInnerLoop[p] {
-				body = emitBitStateGuard(body, p, len(bt.prog.Inst), memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested, winStartLocal, useWindow)
+				body = emitBitStateGuard(body, p, len(bt.prog.Inst), memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested, memoOriginLocal, hasMemoOrigin)
 			}
 			body = writeLoopEntryArg(body)
 			body = btPushFrame(body, numCapLocals, extraFrameLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx)
@@ -1310,7 +1326,7 @@ func emitBTInstHandler(
 			// Only for non-greedy loop heads with zero-matchable bodies.
 			// Greedy loops are correctly handled by the zero-progress guard below.
 			if useMemo && bt.nonGreedyLoop[p] {
-				body = emitBitStateGuard(body, p, len(bt.prog.Inst), memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested, winStartLocal, useWindow)
+				body = emitBitStateGuard(body, p, len(bt.prog.Inst), memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte, memoTableBase, tableMemIdx, brRunNested, memoOriginLocal, hasMemoOrigin)
 			}
 
 			// For greedy loops: body=Out, exit=Arg. For non-greedy: body=Arg, exit=Out.
@@ -2241,6 +2257,11 @@ func buildBTInnerDisp(
 	instMatchFn func([]byte, uint32) []byte,
 	overflowFn func([]byte, uint32) []byte,
 	tableMemIdx int,
+	// The memo origin for the body being built: the find body's call `from`,
+	// or (0, false) for the match body, which visits absolute positions and
+	// rebases nothing.
+	memoOriginLocal uint32,
+	hasMemoOrigin bool,
 ) []byte {
 	numCapLocals := 0
 	prog := bt.prog
@@ -2334,6 +2355,7 @@ func buildBTInnerDisp(
 			false,
 			// No-capture bodies write no slots, so there is nothing to rebase.
 			-1,
+			memoOriginLocal, hasMemoOrigin,
 		)
 	}
 	return body
@@ -2453,7 +2475,9 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	body = buildBTInnerDisp(body, bt, loopLocalIdx, loopEntryLocalIdx,
 		stackBase, stackLimit, frameSize,
 		memoTableBase, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte,
-		useMemo, failEmpty, matchFn, nil, tableMemIdx)
+		useMemo, failEmpty, matchFn, nil, tableMemIdx,
+		// The anchored match body starts at 0 and has no origin to rebase onto.
+		0, false)
 
 	body = append(body, 0x00)       // unreachable
 	body = append(body, 0x0B)       // end loop $run
@@ -2617,6 +2641,45 @@ func emitBTMemoLazyClear(body []byte, memoTableBase int32, memoZeroLen, memoDirt
 	return body
 }
 
+// emitBTMemoFirstAttempt is emitBTMemoZeroInit moved to the head of the first
+// ATTEMPT of a call instead of the head of the call, behind a once-per-call
+// flag.
+//
+// It exists because the guard REFUSES: past the memo's compile-time ceiling the
+// body returns abi.BTStackOverflow, meaning "the answer is unknown". At the
+// head of a call that verdict is reached before the find body has looked at the
+// input at all — so a long input whose mandatory literal does not occur, or
+// whose prefix scan finds no candidate, was told "unknown" when the engine
+// could have answered "no match" for free, without ever touching the memo.
+//
+// Both find branches emit this at the point an attempt is about to run, which
+// is the first place the memo can actually be read or written. The flag is what
+// keeps it once per CALL: the whole cost model of the hoisted clear is that it
+// happens once, and an attempt-by-attempt clear is the quadratic form this
+// replaced. WASM zero-initialises locals per call, so the flag needs no reset.
+//
+// The guarded LENGTH is passed in rather than assumed: it is the span the bit
+// indices are rebased into, which is not the whole input when the body has a
+// memo origin (see emitBitStateGuard).
+func emitBTMemoFirstAttempt(b []byte, memoTableBase int32,
+	memoReady, memoDirtyHi, memoZeroLen uint32, memoMaxLen int32,
+	tableMemIdx int, emitLen func([]byte) []byte) []byte {
+
+	b = append(b, 0x20)
+	b = utils.AppendULEB128(b, memoReady)
+	b = append(b, 0x45)       // i32.eqz — not yet prepared this call
+	b = append(b, 0x04, 0x40) // if (void)
+	b = append(b, 0x41, 0x01, 0x21)
+	b = utils.AppendULEB128(b, memoReady)
+
+	b = emitLen(b)
+	b = emitBTMemoLenGuard(b, memoMaxLen, true) // this body returns i64
+	b = emitBTMemoLazyClear(b, memoTableBase, memoZeroLen, memoDirtyHi, tableMemIdx)
+
+	b = append(b, 0x0B) // end if
+	return b
+}
+
 // emitBTMemoZeroInit prepares the memo bitset at the head of a call: the length
 // guard, then the lazy clear.
 //
@@ -2751,15 +2814,22 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	}
 
 	memoLocalsCount := 0
-	var memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen uint32
+	var memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte, memoZeroLen, memoReady, memoOrigin uint32
 	if useMemo {
-		memoLocalsCount = 5
+		// Six, not five: memoReady is the once-per-call flag that lets the
+		// guard and the clear sit at the first ATTEMPT rather than at the head
+		// of the call. See emitBTMemoFirstAttempt.
+		// Seven: the five working locals, the once-per-call flag, and the memo
+		// ORIGIN — the input position bit index 0 stands for.
+		memoLocalsCount = 7
 		base := entryBase + uint32(len(entryPCsSorted))
 		memoDirtyHi = base
 		memoBitIdx = base + 1
 		memoByteAddr = base + 2
 		memoMemoByte = base + 3
 		memoZeroLen = base + 4
+		memoReady = base + 5
+		memoOrigin = base + 6
 	}
 
 	// Declare three local groups so that v128 indices are stable regardless of
@@ -2825,18 +2895,61 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// grows with length.
 	//
 	// Hoisting is sound HERE and only here, because this body tracks no
-	// captures: its entire NFA state is (pc, pos). A pair marked during a
-	// failed attempt has no accepting continuation, and that fact does not
-	// depend on which start position reached it — so a later attempt may prune
-	// it. The CAPTURE body (buildBacktrackBody) must keep its per-attempt fill:
-	// its state includes the capture registers, so the same (pc, pos) can carry
-	// a different answer.
+	// captures: the state that can DISTINGUISH two visits to the same
+	// instruction is (pc, pos). A pair marked during a failed attempt has no
+	// accepting continuation, and that fact does not depend on which start
+	// position reached it — so a later attempt may prune it. The CAPTURE body
+	// (buildBacktrackBody) must keep its per-attempt fill: its state includes
+	// the capture registers, so the same (pc, pos) can carry a different
+	// answer.
+	//
+	// The per-loop progress and entry trackers (loopLocalIdx,
+	// loopEntryLocalIdx, reset per attempt below) are state too, and are
+	// deliberately NOT counted above — the omission read as an oversight and
+	// invited exactly this doubt. They cannot break the argument: each one
+	// guards only against re-entering a loop body at the position it was last
+	// entered at, i.e. against an EMPTY iteration, and an empty iteration
+	// reaches the same (pc, pos) the loop head was already at. So a tracker can
+	// suppress a path, never create one, and the futures reachable from a
+	// given (pc, pos) are the same set with or without it. The first visit
+	// anywhere in the call therefore explores a superset of what any later
+	// visit would, which is precisely what a shared mark asserts.
 	//
 	// The per-attempt form also trimmed the fill by `attempt_start >> 3`. That
 	// trim existed only because the fill was repeated; one fill from 0 covers
 	// every attempt this call will make.
+	//
+	// The clear, and the length guard in front of it, are emitted at the head
+	// of the first ATTEMPT rather than here — see emitBTMemoFirstAttempt for
+	// why refusing a call before it has looked at the input is worse than
+	// answering it. `memoPrepare` is that emission; both branches below open
+	// their attempt with it.
+	//
+	// The memo is also REBASED onto the call's `from`. Bit index 0 stands for
+	// that position rather than for position 0, which is sound because no
+	// attempt in this call ever starts before it — attempt_start is seeded
+	// from it and only advances, and the mandatory-literal branch's own
+	// `max(..., attempt_start)` keeps it there. The bitset the call needs is
+	// then N*(len-from+1) bits instead of N*(len+1), so the ceiling applies to
+	// the REMAINDER being searched: a host iterating a long buffer keeps
+	// getting answers as `from` advances, where before every call in the walk
+	// was measured against the whole buffer and refused alike.
 	if useMemo {
-		body = emitBTMemoZeroInit(body, memoTableBase, memoDirtyHi, memoZeroLen, memoMaxLen, true, tableMemIdx)
+		body = append(body, 0x20, locAttemptStart, 0x21)
+		body = utils.AppendULEB128(body, memoOrigin)
+	}
+	memoPrepare := func(b []byte) []byte {
+		if !useMemo {
+			return b
+		}
+		return emitBTMemoFirstAttempt(b, memoTableBase, memoReady, memoDirtyHi,
+			memoZeroLen, memoMaxLen, tableMemIdx, func(bb []byte) []byte {
+				// len - from: the span the rebased bit indices cover.
+				bb = append(bb, 0x20, localLen)
+				bb = append(bb, 0x20)
+				bb = utils.AppendULEB128(bb, memoOrigin)
+				return append(bb, 0x6B) // i32.sub
+			})
 	}
 
 	// ── Mandatory-literal two-level outer loop ────────────────────────────────
@@ -2943,6 +3056,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = append(body, 0x0B)                        // end if
 
 		// Re-init BT state for this attempt_start.
+		body = memoPrepare(body)
 		body = append(body, 0x20, locAttemptStart, 0x21, localPos)
 		body = append(body, 0x41)
 		body = utils.AppendSLEB128(body, stackBase)
@@ -2991,7 +3105,8 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = buildBTInnerDisp(body, bt, loopLocalIdx, loopEntryLocalIdx,
 			stackBase, stackLimit, frameSize,
 			memoTableBase, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte,
-			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx)
+			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx,
+			memoOrigin, useMemo)
 		body = append(body, 0x00) // unreachable
 		body = append(body, 0x0B) // end loop $run
 		body = append(body, 0x0B) // end block $run_exit
@@ -3017,6 +3132,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	scanParams.EngineDepth = 2
 	scanParams.OnMatch = func(b []byte) []byte {
 		// Re-init BT state.
+		b = memoPrepare(b)
 		b = append(b, 0x20, locAttemptStart, 0x21, localPos)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, stackBase)
@@ -3067,7 +3183,8 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		b = buildBTInnerDisp(b, bt, loopLocalIdx, loopEntryLocalIdx,
 			stackBase, stackLimit, frameSize,
 			memoTableBase, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte,
-			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx)
+			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx,
+			memoOrigin, useMemo)
 
 		b = append(b, 0x00) // unreachable
 		b = append(b, 0x0B) // end loop $run

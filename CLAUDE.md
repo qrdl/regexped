@@ -520,6 +520,27 @@ The naive oracle is WRONG and wrongly failed two shapes when this was written:
 so it never reports `[15,28)` for `[a-z]+@example\.com` over
 `"...bb@example.com..."` — but a find starting at 15 must.
 
+Two more `tools/fuzz` tests pin properties nothing else covers.
+`TestByteModeLengthsAcrossEmitters` drives `byte_mode` finds at each shape's
+SHORTEST matching input, which is the only length at which an over-estimated
+minimum length shows; its oracle is an ISOMORPHISM, mapping the high byte to an
+ASCII stand-in Go's `regexp` can run, since Go cannot express byte mode.
+`TestBatchGroupsAbsoluteSlotsSurviveAGroupsCall` calls the batch groups export
+before AND after an ordinary `groups()` call and requires the two to agree —
+the two wrappers drive the same capture body, and a channel one of them sets
+and the other does not is invisible on a fresh instance.
+
+The multi-global merge check in the same package is HAND-RUN and skips without
+its two flags:
+
+```bash
+go test ./tools/fuzz -run TestMergedTwoGlobals \
+    -args -mergeglobals-std=<std.wasm> -mergeglobals-merged=<merged.wasm>
+```
+
+It compares ANSWERS rather than global indices, because a wrong renumbering by
+`wasm-merge` still validates and simply reads the wrong variable.
+
 ### Byte-identical fixtures (`compile/testdata/byteident/`)
 
 ```bash
@@ -613,6 +634,16 @@ no-match input, 0.97x at 32 patterns and 0.80x at 128.** Our `scan_any` and
 `scan_all` do identical per-byte work, while regex-automata's `scan_any` is much
 cheaper than its `scan_all` — so the same engine work wins comfortably against
 one of their capabilities and just misses the other.
+
+Two further rows LOSE to their own previous selves rather than to
+regex-automata, and were accepted deliberately when the union scan's bulk loop
+went from a 4-byte to an 8-byte unroll: the exit tests move to once per block,
+so a `scan_any` that would have left on byte 1 finishes its block first.
+greedy-3 over 50K a's went 141 → 233 fuel and classchain-32 dense 362 → 447.
+Both are bounded by `unionUnroll-1` extra byte-steps — a constant of at most
+~92 fuel that does NOT grow with input — against wins of 140,000 to 243,000
+fuel that do, on twenty-four rows across both hint modes. A knob whose loss
+scaled with length would not survive the same numbers.
 
 Everything else wins. The three literal-less rows — once the evidence for
 "every win comes from the literal frontends" — were closed over 2026-08;

@@ -37,18 +37,18 @@ type mandatoryLit struct {
 // OpRepeat, or OpAlternate. The set router applies that additional check
 // itself; callers that need a yes/no answer on "is this pattern usable as
 // a set anchor?" must do the same.
-func HasMandatoryLit(pattern string) bool {
-	return findMandatoryLit(pattern) != nil
+func HasMandatoryLit(pattern string, byteMode bool) bool {
+	return findMandatoryLit(pattern, byteMode) != nil
 }
 
 // mandatory literal is found or if MaxOff > 256.
 // Does NOT call Simplify() so that OpPlus/OpRepeat are preserved.
-func findMandatoryLit(pattern string) *mandatoryLit {
+func findMandatoryLit(pattern string, byteMode bool) *mandatoryLit {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
 	}
-	lit, _ := findMandatoryLitRec(re, 0, 0)
+	lit, _ := findMandatoryLitRec(re, 0, 0, byteMode)
 	return lit
 }
 
@@ -57,7 +57,7 @@ func findMandatoryLit(pattern string) *mandatoryLit {
 // literal's potential start. Returns the literal and the AST path from re to
 // the literal node (path[0] is the frame at re's level). Returns (nil, nil)
 // when no mandatory literal is found.
-func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) (*mandatoryLit, []splitFrame) {
+func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32, byteMode bool) (*mandatoryLit, []splitFrame) {
 	if maxOff < 0 || maxOff > 256 {
 		return nil, nil
 	}
@@ -81,7 +81,7 @@ func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) (*mandatoryLit
 
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {
-			lit, path := findMandatoryLitRec(re.Sub[0], minOff, maxOff)
+			lit, path := findMandatoryLitRec(re.Sub[0], minOff, maxOff, byteMode)
 			if lit == nil {
 				return nil, nil
 			}
@@ -92,7 +92,7 @@ func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) (*mandatoryLit
 	case syntax.OpPlus:
 		// re+ executes body at least once, so we can recurse into body.
 		if len(re.Sub) == 1 {
-			lit, path := findMandatoryLitRec(re.Sub[0], minOff, maxOff)
+			lit, path := findMandatoryLitRec(re.Sub[0], minOff, maxOff, byteMode)
 			if lit == nil {
 				return nil, nil
 			}
@@ -103,7 +103,7 @@ func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) (*mandatoryLit
 	case syntax.OpRepeat:
 		// re{min,max} with min >= 1: body executes at least once.
 		if re.Min >= 1 && len(re.Sub) == 1 {
-			lit, path := findMandatoryLitRec(re.Sub[0], minOff, maxOff)
+			lit, path := findMandatoryLitRec(re.Sub[0], minOff, maxOff, byteMode)
 			if lit == nil {
 				return nil, nil
 			}
@@ -117,10 +117,10 @@ func findMandatoryLitRec(re *syntax.Regexp, minOff, maxOff int32) (*mandatoryLit
 		curMin := minOff
 		curMax := maxOff
 		for i, sub := range re.Sub {
-			if lit, path := findMandatoryLitRec(sub, curMin, curMax); lit != nil {
+			if lit, path := findMandatoryLitRec(sub, curMin, curMax, byteMode); lit != nil {
 				return lit, append([]splitFrame{{op: syntax.OpConcat, index: i}}, path...)
 			}
-			childMin, childMax := regexpMinMaxLen(sub)
+			childMin, childMax := regexpMinMaxLen(sub, byteMode)
 			curMin += int32(childMin)
 			if childMax < 0 || curMax < 0 {
 				curMax = -1
@@ -234,13 +234,36 @@ func concatRegexp(parts []*syntax.Regexp) *syntax.Regexp {
 
 // regexpMinMaxLen returns the minimum and maximum byte lengths of strings
 // matched by re. maxLen == -1 means unbounded.
-func regexpMinMaxLen(re *syntax.Regexp) (minLen, maxLen int) {
+//
+// byteMode is the pattern's config.RegexEntry.ByteMode, and it changes what a
+// literal rune above U+007F WEIGHS. regexped is a byte engine; `byte_mode:
+// true` declares runes 0x80..0xFF to mean exactly those BYTES, so such a rune
+// consumes ONE byte, not the two its UTF-8 encoding would take. Getting that
+// wrong makes this an OVER-estimate, and every caller reads it as a true
+// bound:
+//
+//   - the exported find wrapper turns minLen into an early exit, so an
+//     over-estimate REFUSES an input that matches — `\xe9ab` under byte_mode
+//     answered -1 for the 3-byte input "\xe9ab";
+//   - the mandatory-literal analyser accumulates it as the literal's offset
+//     from the match start, and the lit-anchor emitters as a fixed prefix
+//     length, both of which are then wrong by one byte per high rune.
+//
+// The multi-byte arms below are unreachable for any pattern that compiles in
+// the DEFAULT mode: compilePattern's unsupportedRune gate rejects a literal
+// rune above U+007F unless byte_mode is on (CompileOptions.Unicode, the
+// test-only compile-anyway bypass, is the one other way in — and there the
+// UTF-8 widths are genuinely right, which is why this stays a parameter rather
+// than becoming an unconditional 1).
+func regexpMinMaxLen(re *syntax.Regexp, byteMode bool) (minLen, maxLen int) {
 	switch re.Op {
 	case syntax.OpLiteral:
 		n := 0
 		for _, r := range re.Rune {
 			switch {
 			case r <= 0x7F:
+				n += 1
+			case byteMode && r <= 0xFF:
 				n += 1
 			case r <= 0x7FF:
 				n += 2
@@ -262,7 +285,7 @@ func regexpMinMaxLen(re *syntax.Regexp) (minLen, maxLen int) {
 		if len(re.Sub) == 0 {
 			return 0, 0
 		}
-		childMin, childMax := regexpMinMaxLen(re.Sub[0])
+		childMin, childMax := regexpMinMaxLen(re.Sub[0], byteMode)
 		lo := re.Min * childMin
 		if re.Max < 0 {
 			return lo, -1
@@ -280,21 +303,21 @@ func regexpMinMaxLen(re *syntax.Regexp) (minLen, maxLen int) {
 		if len(re.Sub) == 0 {
 			return 0, -1
 		}
-		childMin, _ := regexpMinMaxLen(re.Sub[0])
+		childMin, _ := regexpMinMaxLen(re.Sub[0], byteMode)
 		return childMin, -1
 
 	case syntax.OpQuest:
 		if len(re.Sub) == 0 {
 			return 0, 0
 		}
-		_, childMax := regexpMinMaxLen(re.Sub[0])
+		_, childMax := regexpMinMaxLen(re.Sub[0], byteMode)
 		return 0, childMax
 
 	case syntax.OpConcat:
 		totMin := 0
 		totMax := 0
 		for _, sub := range re.Sub {
-			sMin, sMax := regexpMinMaxLen(sub)
+			sMin, sMax := regexpMinMaxLen(sub, byteMode)
 			totMin += sMin
 			if totMax < 0 || sMax < 0 {
 				totMax = -1
@@ -311,7 +334,7 @@ func regexpMinMaxLen(re *syntax.Regexp) (minLen, maxLen int) {
 		totMin := -1
 		totMax := 0
 		for _, sub := range re.Sub {
-			sMin, sMax := regexpMinMaxLen(sub)
+			sMin, sMax := regexpMinMaxLen(sub, byteMode)
 			if totMin < 0 || sMin < totMin {
 				totMin = sMin
 			}
@@ -328,7 +351,7 @@ func regexpMinMaxLen(re *syntax.Regexp) (minLen, maxLen int) {
 
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {
-			return regexpMinMaxLen(re.Sub[0])
+			return regexpMinMaxLen(re.Sub[0], byteMode)
 		}
 		return 0, 0
 

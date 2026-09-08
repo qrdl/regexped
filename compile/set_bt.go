@@ -248,14 +248,12 @@ func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals) *btSha
 	}
 	// The window pair is allocated, not reserved: no table bytes here.
 	//
-	// A nil allocator means this set is being compiled outside a module
-	// assembly — CompileSet is reachable that way from tests that inspect the
-	// result rather than run it. Numbering from a fresh allocator keeps the
-	// emitted bodies self-consistent; the assemblers always pass the module's
-	// own, which is what makes the declaration and the uses agree in a module
-	// that actually runs. Same defensive shape as assembleModule's.
+	// The allocator is guaranteed non-nil by CompileSet, which is the single
+	// entry to the set path and the one place that answers for a nil one. A
+	// second fallback here would have meant the same condition had two answers
+	// and a caller could not tell which it got.
 	if globals == nil {
-		globals = &moduleGlobals{}
+		panic("compile: planBTRegions needs the module's global allocator (CompileSet supplies it)")
 	}
 	r.winGlobal = int32(globals.Alloc())
 	globals.Alloc() // endOff, at winGlobal+1

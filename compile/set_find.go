@@ -871,7 +871,7 @@ func (cs *compiledSet) jumpIsProfitable() bool {
 			if ast == nil {
 				continue
 			}
-			if _, maxLen := regexpMinMaxLen(ast); maxLen < 0 || maxLen >= 2 {
+			if _, maxLen := regexpMinMaxLen(ast, p.byteMode); maxLen < 0 || maxLen >= 2 {
 				return true
 			}
 		}

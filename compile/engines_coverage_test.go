@@ -1461,8 +1461,8 @@ func TestEnginesCovFindAltLitAnchorPointsUnwrapsBranchCaptures(t *testing.T) {
 	// Branch-level captures are transparent to the anchor analysis: the same
 	// alternation written with or without them must produce the same
 	// branches, or a capture-bearing pattern silently loses the optimisation.
-	plain, okPlain := findAltLitAnchorPoints(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`)
-	captured, okCaptured := findAltLitAnchorPoints(`([0-9]{8}ghp_[A-Za-z0-9]{36})|([a-f]{8}secret_[A-Za-z0-9]{36})`)
+	plain, okPlain := findAltLitAnchorPoints(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`, false)
+	captured, okCaptured := findAltLitAnchorPoints(`([0-9]{8}ghp_[A-Za-z0-9]{36})|([a-f]{8}secret_[A-Za-z0-9]{36})`, false)
 	if !okPlain || !okCaptured {
 		t.Fatalf("findAltLitAnchorPoints: plain ok = %v, captured ok = %v, want both true", okPlain, okCaptured)
 	}
@@ -1685,9 +1685,9 @@ func TestEnginesCovBatchGroupsWrapperWindowMode(t *testing.T) {
 
 func enginesCovAltBranches(t *testing.T, pattern string) []altLitAnchorBranch {
 	t.Helper()
-	branches, ok := findAltLitAnchorPoints(pattern)
+	branches, ok := findAltLitAnchorPoints(pattern, false)
 	if !ok {
-		t.Fatalf("findAltLitAnchorPoints(%q) rejected the pattern before the gate under test", pattern)
+		t.Fatalf("findAltLitAnchorPoints(%q, false) rejected the pattern before the gate under test", pattern)
 	}
 	return branches
 }
@@ -1799,12 +1799,12 @@ func TestEnginesCovMandatoryLitSplitsNestedConcat(t *testing.T) {
 	// automaton that matches something other than the original pattern.
 	pattern := `[0-9]{2}([a-z]MANDATORYLIT[0-9]b)[0-9]`
 	parsed := enginesCovParse(t, pattern)
-	mandLit, path := findMandatoryLitRec(parsed, 0, 0)
+	mandLit, path := findMandatoryLitRec(parsed, 0, 0, false)
 	if mandLit == nil {
-		t.Fatalf("findMandatoryLitRec(%q) = nil; the witness no longer has a liftable literal", pattern)
+		t.Fatalf("findMandatoryLitRec(%q, false) = nil; the witness no longer has a liftable literal", pattern)
 	}
 	if string(mandLit.bytes) != "MANDATORYLIT" {
-		t.Fatalf("findMandatoryLitRec(%q) lifted %q, want %q", pattern, mandLit.bytes, "MANDATORYLIT")
+		t.Fatalf("findMandatoryLitRec(%q, false) lifted %q, want %q", pattern, mandLit.bytes, "MANDATORYLIT")
 	}
 
 	prefixAST, suffixAST, ok := splitAtPath(parsed, path)
@@ -1819,11 +1819,11 @@ func TestEnginesCovMandatoryLitSplitsNestedConcat(t *testing.T) {
 	}
 	// Both sides must still account for the inner-concat material, which is
 	// exactly what the two branches under test contribute.
-	prefixMin, prefixMax := regexpMinMaxLen(prefixAST)
+	prefixMin, prefixMax := regexpMinMaxLen(prefixAST, false)
 	if prefixMin != 3 || prefixMax != 3 {
 		t.Errorf("prefix length = [%d, %d], want [3, 3] (two digits plus the capture's leading class)", prefixMin, prefixMax)
 	}
-	suffixMin, suffixMax := regexpMinMaxLen(suffixAST)
+	suffixMin, suffixMax := regexpMinMaxLen(suffixAST, false)
 	if suffixMin != 3 || suffixMax != 3 {
 		t.Errorf("suffix length = [%d, %d], want [3, 3] (digit, 'b', trailing digit)", suffixMin, suffixMax)
 	}

@@ -348,6 +348,33 @@ An input longer than that cannot be memoised in the space reserved, so the engin
 
 The two ceilings — this one and the frame budget — move independently, with `numInstructions` and with `numAlts` respectively, so either can be the one a given pattern and input hits first.
 
+#### What the ceiling is measured against
+
+`-2` here means *the engine did not finish*, never *no match*, and a host must
+surface it as an error. Which **length** is compared against the ceiling differs
+per body, because each searches a different span:
+
+| Body | Length compared against the ceiling |
+|---|---|
+| Anchored `match` | The whole input. |
+| Non-anchored `find` | The **remainder**, `len − from`. The memo is rebased onto `from`, so a host iterating a long buffer keeps getting answers as `from` advances. |
+| `groups` capture body | The narrowed match extent, or in window mode the window's own length — not the whole input. |
+| A set's Backtracking bucket | The span from the candidate position to the end of the input. This is the one case where a long input can refuse at every candidate; it is bounded by the input, not by the match. |
+
+Two further properties are worth relying on:
+
+* The check happens at the head of the **first attempt**, not at the head of the
+  call. A call whose prefilter finds no candidate — no mandatory literal
+  anywhere, or no byte that can begin a match — answers `-1` without ever
+  consulting the memo, however long the input is.
+* Only patterns that need memoisation at all are affected. `needsBitState` is
+  narrow: a non-greedy loop whose body can match zero bytes. Everything else
+  has no ceiling of this kind.
+
+If a pattern you need is refusing long inputs, the levers are the pattern's
+instruction count (the ceiling scales inversely with it) and
+`CompileOptions.MemoBudget`, which is not reachable from YAML.
+
 **Memory layout:**
 ```
 [DFA find tables] → [backtrack stack] → [4-byte dirty header] → [BitState memo bitset]

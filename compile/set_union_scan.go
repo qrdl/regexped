@@ -1056,6 +1056,11 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 // rest of the call. Without it, input dense in the exit set (prose, for a
 // state whose exit set is [a-z]) pays the probe on every bulk iteration and
 // never strides — the alpha-run/word-run regression, in the union scan.
+// lLen is the INPUT LENGTH parameter, which the backward tail probe needs and
+// lEnd cannot supply: lPos and lEnd are absolute input POINTERS here, so
+// `end - 16` is a valid address to load from while `len >= 16` is the question
+// the probe actually has to answer before loading it.
+//
 // bulkExitDepth is the br depth of the enclosing $bulk_exit block counted from
 // INSIDE this function's own `if armed` arm — 2 for both callers (if / loop
 // $bulk / block $bulk_exit).

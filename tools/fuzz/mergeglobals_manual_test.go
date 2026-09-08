@@ -2,7 +2,8 @@ package fuzz
 
 // Multi-global merge check (TODO 75's entry toll), run by hand:
 //
-//	go test ./tools/fuzz -run TestMergedTwoGlobals -args -std=<std.wasm> -merged=<merged.wasm>
+//	go test ./tools/fuzz -run TestMergedTwoGlobals \
+//	    -args -mergeglobals-std=<std.wasm> -mergeglobals-merged=<merged.wasm>
 //
 // A regexp module that declares TWO globals — the find-from channel and the
 // absolute capture start — must answer identically once wasm-merge renumbers
@@ -17,8 +18,11 @@ import (
 )
 
 var (
-	mgStd    = flag.String("std", "", "standalone two-global module")
-	mgMerged = flag.String("merged", "", "the same module merged into a host")
+	// Prefixed, because these are package-level flags in a package that runs
+	// automatically: a bare -std/-merged is the kind of generic name the next
+	// hand-run harness added here would collide with.
+	mgStd    = flag.String("mergeglobals-std", "", "standalone two-global module")
+	mgMerged = flag.String("mergeglobals-merged", "", "the same module merged into a host")
 )
 
 const mgInput = "see http://example.com/abc here"
@@ -68,7 +72,7 @@ func mgRun(t *testing.T, path string, wasi bool) (int64, []int32) {
 
 func TestMergedTwoGlobals(t *testing.T) {
 	if *mgStd == "" || *mgMerged == "" {
-		t.Skip("needs -std and -merged")
+		t.Skip("needs -mergeglobals-std and -mergeglobals-merged")
 	}
 	f1, g1 := mgRun(t, *mgStd, false)
 	f2, g2 := mgRun(t, *mgMerged, true)

@@ -162,7 +162,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		allLits = append(allLits, br.lap.litSet...)
 
 		if i == 0 {
-			minLen, _ := regexpMinMaxLen(br.lap.prefixRe)
+			minLen, _ := regexpMinMaxLen(br.lap.prefixRe, buildOpts.ByteMode)
 			result.fixedPrefixLen = int32(minLen)
 		}
 	}

@@ -508,7 +508,7 @@ const maxAltLitAnchorBranches = 8
 // Returns (nil, false) on ANY rejection — callers must fall through cleanly
 // to the standard combined-DFA find path, exactly as they already do when
 // findLitAnchorPoint returns nil for the single-pattern case.
-func findAltLitAnchorPoints(pattern string) ([]altLitAnchorBranch, bool) {
+func findAltLitAnchorPoints(pattern string, byteMode bool) ([]altLitAnchorBranch, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, false
@@ -531,7 +531,7 @@ func findAltLitAnchorPoints(pattern string) ([]altLitAnchorBranch, bool) {
 		if lap == nil {
 			return nil, false
 		}
-		minLen, maxLen := regexpMinMaxLen(lap.prefixRe)
+		minLen, maxLen := regexpMinMaxLen(lap.prefixRe, byteMode)
 		if minLen != maxLen || maxLen < 0 {
 			return nil, false // not a fixed-length prefix
 		}

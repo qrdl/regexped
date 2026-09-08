@@ -199,3 +199,123 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 		})
 	}
 }
+
+// The memo's length guard REFUSES: past the ceiling the body returns
+// abi.BTStackOverflow, which means "the answer is unknown". Emitted at the head
+// of a call, that verdict was reached before the find body had looked at the
+// input at all — so a long input whose prefilter finds no candidate anywhere
+// was told "unknown" when the engine could have answered "no match" for free,
+// without ever touching the memo.
+//
+// The guard and the clear now sit at the head of the first ATTEMPT instead, so
+// a call that never attempts never pays and never refuses.
+//
+// The test drives ONE pattern at ONE length over two inputs that differ only in
+// which byte they repeat, and requires the two arms to differ:
+//
+//	quiet — no byte can begin a match, so no attempt runs → NoMatch
+//	busy  — every position is a candidate, attempts run, the memo is filled
+//	        past its ceiling → BTStackOverflow
+//
+// Both arms matter. Without the busy one the test would pass just as well
+// against a build with no memo at all, or one whose ceiling was never reached,
+// and would stop being evidence for anything.
+func TestBTMemoGuardDoesNotRefuseWhatThePrefilterAnswers(t *testing.T) {
+	// MaxDFAStates squeezes the pattern onto Backtracking; the small budget
+	// puts the memo ceiling in the low thousands so a 60 KB input is well past
+	// it either way.
+	opts := compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096}
+
+	// Leading `Z` gives the prefilter something to reject on; `(?:a?)+?` is
+	// what makes needsBitState fire.
+	const pattern = `Z(?:a?)+?xyz`
+	const length = 60000
+
+	entry := config.RegexEntry{Pattern: pattern, FindFunc: "find"}
+	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, opts)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	quiet := strings.Repeat("m", length) // no `Z`: nothing can begin a match
+	busy := strings.Repeat("Z", length)  // every position is a candidate
+
+	if regexp.MustCompile(pattern).MatchString(quiet) ||
+		regexp.MustCompile(pattern).MatchString(busy) {
+		t.Fatal("an input matches after all — the case is not testing what it claims")
+	}
+
+	got, err := btMemoCall(t, w, "find", quiet, 0)
+	if err != nil {
+		t.Fatalf("quiet: %v", err)
+	}
+	if got != abi.NoMatch {
+		t.Errorf("quiet input of %d bytes: got %d, want NoMatch(%d) — the memo guard is "+
+			"refusing a call the prefilter answers without ever touching the memo",
+			length, got, abi.NoMatch)
+	}
+
+	got, err = btMemoCall(t, w, "find", busy, 0)
+	if err != nil {
+		t.Fatalf("busy: %v", err)
+	}
+	if got != abi.BTStackOverflow {
+		t.Errorf("busy input of %d bytes: got %d, want BTStackOverflow(%d) — this arm is "+
+			"what proves the memo path is reached at all, so the quiet arm above is "+
+			"evidence of a moved guard rather than of an absent one",
+			length, got, abi.BTStackOverflow)
+	}
+}
+
+// The memo is REBASED onto the call's `from`: bit index 0 stands for that
+// position, not for position 0. No attempt in a call ever starts before `from`
+// — attempt_start is seeded from it and only advances — so the bitset a call
+// needs covers the REMAINDER it is searching, and the ceiling is checked
+// against that rather than against the whole buffer.
+//
+// Without the rebase a host walking a long buffer got BTStackOverflow from
+// every call in the walk, including the ones with only a handful of bytes left
+// to search, because each was measured against the buffer's full length.
+//
+// Both arms again: `from` at 0 must still refuse (the remainder really is past
+// the ceiling), and a late `from` must answer. A build that simply lost its
+// ceiling would pass the second arm and fail the first.
+func TestBTMemoCeilingAppliesToTheRemainder(t *testing.T) {
+	opts := compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096}
+	const pattern = `Z(?:a?)+?xyz`
+	const length = 60000
+
+	entry := config.RegexEntry{Pattern: pattern, FindFunc: "find"}
+	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, opts)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// Every position is a candidate, so every call reaches an attempt and the
+	// memo is genuinely used.
+	input := strings.Repeat("Z", length)
+	if regexp.MustCompile(pattern).MatchString(input) {
+		t.Fatal("the input matches after all — the case is not testing what it claims")
+	}
+
+	got, err := btMemoCall(t, w, "find", input, 0)
+	if err != nil {
+		t.Fatalf("from=0: %v", err)
+	}
+	if got != abi.BTStackOverflow {
+		t.Errorf("from=0: got %d, want BTStackOverflow(%d) — the whole %d-byte remainder "+
+			"is past the memo ceiling, so this call must still refuse",
+			got, abi.BTStackOverflow, length)
+	}
+
+	// Only 100 bytes remain to search, which fits the memo comfortably.
+	const late = length - 100
+	got, err = btMemoCall(t, w, "find", input, int32(late))
+	if err != nil {
+		t.Fatalf("from=%d: %v", late, err)
+	}
+	if got != abi.NoMatch {
+		t.Errorf("from=%d: got %d, want NoMatch(%d) — only %d bytes remain, so the memo "+
+			"ceiling must be measured against those and not against the whole buffer",
+			late, got, abi.NoMatch, length-late)
+	}
+}

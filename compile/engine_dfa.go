@@ -4259,12 +4259,12 @@ const minLMBareShuftiLen = 8
 // ineligible (this recomputes syntax.Parse; compilePattern's caller has
 // already validated the pattern earlier in the pipeline, so failure here
 // should not happen in practice).
-func lmBareShuftiEligible(pattern string) bool {
+func lmBareShuftiEligible(pattern string, byteMode bool) bool {
 	parsed, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return false
 	}
-	minLen, _ := regexpMinMaxLen(parsed)
+	minLen, _ := regexpMinMaxLen(parsed, byteMode)
 	return minLen >= minLMBareShuftiLen
 }
 

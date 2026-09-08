@@ -437,18 +437,26 @@ type compiledPattern struct {
 	numGroups int  // capture group count (for wrapper slot adjustment)
 	isTDFA    bool // true = TDFA capture; false = Backtracking (controls sentinel data segment)
 
-	// capStartGlobal is the module global through which the groups wrapper
-	// hands this pattern's TDFA capture body the match's start offset, so the
-	// body writes ABSOLUTE slot positions and the wrapper needs no per-slot
-	// rebasing pass. -1 when the pattern has no such channel: every
-	// Backtracking capture body, the trivial single-capture fast path, and an
-	// anchored TDFA export, which has no wrapper in front of it at all.
+	// capStartGlobalP1 is the module global through which the groups wrappers
+	// hand this pattern's capture body the match's start offset, so the body
+	// writes ABSOLUTE slot positions and the wrappers need no per-slot
+	// rebasing pass — PLUS ONE, so that the field's zero value means "no such
+	// channel" rather than naming global 0.
+	//
+	// Read it through capStartGlobal(), which returns the emitters' -1 for
+	// "none". The plus-one encoding is the point: global 0 is the find-from
+	// channel, so a field left at its Go zero value would silently make every
+	// capture body add the CALLER'S SEARCH POSITION to every slot it writes.
+	// That is the defect class compile/find_from.go opens by describing, and
+	// the reason the window pair below is stored the same way; an -1 spelled
+	// at each of the fourteen construction sites is a rule the fifteenth will
+	// break.
 	//
 	// A global rather than a fourth parameter because the capture body's
 	// (ptr,len,out_ptr)->i32 type is SHARED with the Backtracking bodies, and
 	// because compile/find_from.go already established this exact channel shape
 	// for the same reason.
-	capStartGlobal int32
+	capStartGlobalP1 int32
 
 	// minLen is the shortest string this pattern can match, or 0 when it can
 	// match empty. The exported find wrapper turns it into a one-test early
@@ -480,7 +488,9 @@ type compiledPattern struct {
 	// standalone, that offset is the CALLER'S OWN INPUT BUFFER, corrupted in
 	// place. A body reading a global its assembler never declared does not
 	// validate, so the same mistake is now a load-time error.
-	winGlobal int32
+	// PLUS ONE, for the same reason as capStartGlobalP1 above: the zero value
+	// has to mean "not in window mode". Read it through winGlobal().
+	winGlobalP1 int32
 
 	// findFromMode records how this pattern's find function receives the
 	// `from` position of an exported find call. It is
@@ -919,10 +929,46 @@ func extractGroupNames(re *syntax.Regexp) []string {
 	return names
 }
 
+// capStartGlobal is the ABSOLUTE-SLOT channel's module global index, or -1
+// when this pattern has none — the spelling every emitter takes. The field
+// behind it is stored plus one so that "none" is the Go zero value and cannot
+// be reached by forgetting to initialise it; see capStartGlobalP1.
+func (p *compiledPattern) capStartGlobal() int32 { return p.capStartGlobalP1 - 1 }
+
+// winGlobal is the first of the window pair's two module globals, or -1 when
+// this pattern is not in window mode. Same encoding, same reason.
+func (p *compiledPattern) winGlobal() int32 { return p.winGlobalP1 - 1 }
+
 // compilePattern compiles one RegexEntry into an intermediate compiledPattern.
 // It does not build the final WASM module; call assembleModule for that.
 // forceGroupsEngine overrides engine selection for the capture path (0 = auto).
+//
+// The body is compilePatternBody; this wrapper exists to attach the facts that
+// belong to EVERY compiled pattern regardless of which emitter produced it.
+// The body reaches its several returns through as many parse branches, so a
+// fact stated at each of them is a fact that will be forgotten at the next one
+// added — and stating it at a CALLER is worse still, which is how minLen came
+// to exist on the compileAll path and not on CompileFile's.
 func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions) (*compiledPattern, error) {
+	p, err := compilePatternBody(re, tableBase, forceGroupsEngine, buildOpts)
+	if err != nil || p == nil {
+		return p, err
+	}
+	// minLen: the shortest string this pattern can match, which the exported
+	// find wrapper turns into a one-test early exit.
+	//
+	// byteMode is the pattern's own mode ORed with the build's, exactly as
+	// compilePatternBody adopts it — an over-estimate here REFUSES an input
+	// that matches, so the two must not disagree.
+	if parsed, perr := syntax.Parse(re.Pattern, syntax.Perl); perr == nil {
+		if n, _ := regexpMinMaxLen(parsed, buildOpts.ByteMode || re.ByteMode); n > 0 {
+			p.minLen = int32(n)
+		}
+	}
+	return p, nil
+}
+
+func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions) (*compiledPattern, error) {
 	// The mode is a property of the PATTERN, so it is adopted here rather than
 	// being expected in the build-wide options every caller would have to
 	// thread.
@@ -994,10 +1040,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// Gap C: single-pattern range with captures (greedy).
 		if lcp, lcc, ok := analyseLitChainGroupsRange(re.Pattern); ok {
 			p := &compiledPattern{
-				capStartGlobal: -1,
-				tableEnd:       tableBase,
-				numGroups:      lcc.numGroups,
-				anchored:       true,
+				tableEnd:  tableBase,
+				numGroups: lcc.numGroups,
+				anchored:  true,
 			}
 			p.groupsExport = re.GroupsFunc
 			if needFind {
@@ -1017,10 +1062,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 		if lcp, lcc, ok := analyseLitChainGroups(re.Pattern); ok {
 			p := &compiledPattern{
-				capStartGlobal: -1,
-				tableEnd:       tableBase,
-				numGroups:      lcc.numGroups,
-				anchored:       true, // captureBody IS the exported groups function (native A.3 path)
+				tableEnd:  tableBase,
+				numGroups: lcc.numGroups,
+				anchored:  true, // captureBody IS the exported groups function (native A.3 path)
 			}
 			p.groupsExport = re.GroupsFunc
 			if needMatch {
@@ -1046,10 +1090,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				// (Gap B). Fall through to the standard pipeline.
 			} else {
 				p := &compiledPattern{
-					capStartGlobal: -1,
-					tableEnd:       tableBase,
-					numGroups:      branchCaps[0].numGroups,
-					anchored:       true, // captureBody IS the exported groups function (native A.3 path)
+					tableEnd:  tableBase,
+					numGroups: branchCaps[0].numGroups,
+					anchored:  true, // captureBody IS the exported groups function (native A.3 path)
 				}
 				p.groupsExport = re.GroupsFunc
 				layout := planLitChainAltLayout(altp, tableBase)
@@ -1103,10 +1146,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 						selEng, tt := selectBestEngineWithTDFA(prog, &buildOpts)
 						if selEng == EngineTDFA && tt != nil {
 							p := &compiledPattern{
-								capStartGlobal: -1,
-								tableEnd:       tableBase,
-								numGroups:      tt.numGroups,
-								isTDFA:         true,
+								tableEnd:  tableBase,
+								numGroups: tt.numGroups,
+								isTDFA:    true,
 							}
 							p.groupsExport = re.GroupsFunc
 							p.groupNames = extractGroupNames(parsed)
@@ -1156,11 +1198,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// Gap E: mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
 		if lcp, ok := analyseLitChainPrefixed(re.Pattern); ok {
 			p := &compiledPattern{
-				capStartGlobal: -1,
-				matchExport:    re.MatchFunc,
-				findExport:     re.FindFunc,
-				anchored:       false,
-				tableEnd:       tableBase,
+				matchExport: re.MatchFunc,
+				findExport:  re.FindFunc,
+				anchored:    false,
+				tableEnd:    tableBase,
 			}
 			if needMatch {
 				p.matchBody = appendLitChainPrefixedMatchCodeEntry(nil, lcp)
@@ -1177,11 +1218,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 		if lcp, ok := analyseLitChain(re.Pattern, litChainMinCount); ok {
 			p := &compiledPattern{
-				capStartGlobal: -1,
-				matchExport:    re.MatchFunc,
-				findExport:     re.FindFunc,
-				anchored:       false,
-				tableEnd:       tableBase,
+				matchExport: re.MatchFunc,
+				findExport:  re.FindFunc,
+				anchored:    false,
+				tableEnd:    tableBase,
 			}
 			if needMatch {
 				p.matchBody = appendLitChainMatchCodeEntry(nil, lcp)
@@ -1216,11 +1256,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			//   find/groups non-greedy: collapses to {N,N} via existing emission
 			//   (just normalise countMax = count and use buildLitChainFindBody)
 			p := &compiledPattern{
-				capStartGlobal: -1,
-				matchExport:    re.MatchFunc,
-				findExport:     re.FindFunc,
-				anchored:       false,
-				tableEnd:       tableBase,
+				matchExport: re.MatchFunc,
+				findExport:  re.FindFunc,
+				anchored:    false,
+				tableEnd:    tableBase,
 			}
 			if needMatch {
 				p.matchBody = appendLitChainRangeMatchCodeEntry(nil, lcp)
@@ -1244,10 +1283,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		if needMatch && !needFind {
 			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
 				p := &compiledPattern{
-					capStartGlobal: -1,
-					matchExport:    re.MatchFunc,
-					anchored:       false,
-					tableEnd:       tableBase,
+					matchExport: re.MatchFunc,
+					anchored:    false,
+					tableEnd:    tableBase,
 				}
 				p.matchBody = appendLitChainAltMatchCodeEntry(nil, altp)
 				return p, nil
@@ -1257,12 +1295,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				layout := planLenAltLayout(lenAltp, tableBase)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				p := &compiledPattern{
-					capStartGlobal: -1,
-					matchExport:    re.MatchFunc,
-					anchored:       false,
-					tableEnd:       layout.tableEnd,
-					dataBytes:      dataBytes,
-					dataSegCount:   segCount,
+					matchExport:  re.MatchFunc,
+					anchored:     false,
+					tableEnd:     layout.tableEnd,
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
 				}
 				p.matchBody = appendLenAltMatchCodeEntry(nil, lenAltp, layout, buildOpts.tableMemIdx)
 				return p, nil
@@ -1276,12 +1313,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				findBody, ffMode := appendLitChainAltPrefixedFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx)
 				p := &compiledPattern{
-					capStartGlobal: -1,
-					findExport:     re.FindFunc,
-					anchored:       false,
-					dataBytes:      dataBytes,
-					dataSegCount:   segCount,
-					tableEnd:       layout.tableEnd,
+					findExport:   re.FindFunc,
+					anchored:     false,
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
+					tableEnd:     layout.tableEnd,
 				}
 				p.setFind(findBody, ffMode)
 				return p, nil
@@ -1302,14 +1338,13 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				findBody = utils.AppendULEB128(findBody, uint32(len(body)))
 				findBody = append(findBody, body...)
 				p := &compiledPattern{
-					capStartGlobal: -1,
-					findExport:     re.FindFunc,
-					anchored:       false,
-					findBody:       findBody,
-					findFromMode:   ffMode,
-					dataBytes:      dataBytes,
-					dataSegCount:   segCount,
-					tableEnd:       layout.tableEnd,
+					findExport:   re.FindFunc,
+					anchored:     false,
+					findBody:     findBody,
+					findFromMode: ffMode,
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
+					tableEnd:     layout.tableEnd,
 				}
 				return p, nil
 			}
@@ -1319,12 +1354,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				findBody, ffMode := appendLitChainAltRangeFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx)
 				p := &compiledPattern{
-					capStartGlobal: -1,
-					findExport:     re.FindFunc,
-					anchored:       false,
-					dataBytes:      dataBytes,
-					dataSegCount:   segCount,
-					tableEnd:       layout.tableEnd,
+					findExport:   re.FindFunc,
+					anchored:     false,
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
+					tableEnd:     layout.tableEnd,
 				}
 				p.setFind(findBody, ffMode)
 				return p, nil
@@ -1340,14 +1374,13 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				findBody = utils.AppendULEB128(findBody, uint32(len(body)))
 				findBody = append(findBody, body...)
 				p := &compiledPattern{
-					capStartGlobal: -1,
-					findExport:     re.FindFunc,
-					anchored:       false,
-					findBody:       findBody,
-					findFromMode:   ffMode,
-					dataBytes:      dataBytes,
-					dataSegCount:   segCount,
-					tableEnd:       layout.tableEnd,
+					findExport:   re.FindFunc,
+					anchored:     false,
+					findBody:     findBody,
+					findFromMode: ffMode,
+					dataBytes:    dataBytes,
+					dataSegCount: segCount,
+					tableEnd:     layout.tableEnd,
 				}
 				return p, nil
 			}
@@ -1572,22 +1605,21 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			leftmostFirst:        true,
 			compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
 			useAcceptSideTable:   false,
-			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern),
+			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern, buildOpts.ByteMode),
 			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 			lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
 			lmClassChain:         buildOpts.LikelyMode == LikelyMatch,
 		})
 	}
-	patMandLit := findMandatoryLit(re.Pattern)
+	patMandLit := findMandatoryLit(re.Pattern, buildOpts.ByteMode)
 	if patMandLit != nil {
 		buildOpts.report().Note("mandatory literal extracted")
 	}
 
 	p := &compiledPattern{
-		capStartGlobal: -1,
-		matchExport:    re.MatchFunc,
-		findExport:     re.FindFunc,
-		anchored:       anchored,
+		matchExport: re.MatchFunc,
+		findExport:  re.FindFunc,
+		anchored:    anchored,
 	}
 	if anchored {
 		// On this path `anchored` really does mean "can only match at 0" —
@@ -1860,7 +1892,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// for v1's simple "return on first success" dispatch to be
 			// correct.
 			if p.litAnchorBackScanBody == nil && !needGroups {
-				if altBranches, ok := findAltLitAnchorPoints(re.Pattern); ok {
+				if altBranches, ok := findAltLitAnchorPoints(re.Pattern, buildOpts.ByteMode); ok {
 					if altCompiled, altOK := compileAltLitAnchorBranches(altBranches, l.tableEnd, buildOpts); altOK {
 						buildOpts.report().Note("alternation literal-anchored find")
 						p.altLitAnchorBranches = altCompiled.branches
@@ -2024,7 +2056,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// an embedded module (tableMemIdx 1) it corrupts the DFA table's own
 		// base instead. Either way, the next find()/groups() call in the
 		// same instance reads back garbage.
-		p.winGlobal = -1
+		// winGlobalP1 stays 0: not in window mode. No -1 to remember.
 		return p, nil
 	}
 
@@ -2064,13 +2096,23 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				lmWideShufti:         false,
 			})
 			p.numGroups = tt.numGroups
+			// A nil allocator DEGRADES here rather than panicking or inventing
+			// one, and that is the deliberate opposite of the set path's answer
+			// (see CompileSet). A pattern compiled alone is assembled by a
+			// caller holding its own allocator, which never saw an allocation
+			// made here — so a body reading an invented global would be one the
+			// module never declares, and would not validate. Emitting the
+			// no-channel form instead is always correct: the groups wrapper
+			// then runs its per-slot rebasing pass, which is what every pattern
+			// did before the channel existed.
+			//
 			// Only a body behind the groups wrapper needs the channel: the
 			// anchored export is called with the caller's own ptr, so its
 			// slots are already absolute.
 			if !anchored && buildOpts.globals != nil {
-				p.capStartGlobal = int32(buildOpts.globals.Alloc())
+				p.capStartGlobalP1 = int32(buildOpts.globals.Alloc()) + 1
 			}
-			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored, p.capStartGlobal)
+			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored, p.capStartGlobal())
 			// TDFA only needs the transition table (no stack/memo).
 			p.tableEnd = tdfaLayout.tableEnd
 			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
@@ -2124,25 +2166,26 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		}
 
 		// Window mode: patterns whose assertions are defined against the
-		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get an 8-byte
-		// (startOff,endOff) scratch slot, and the groups/batch-groups
+		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get the match
+		// extent through a PAIR OF MODULE GLOBALS, and the groups/batch-groups
 		// wrappers stop narrowing (ptr,len) for them entirely — see
 		// buildBacktrackBody, a past defect.
 		// Only needed when this captureBody is composed behind a find
 		// wrapper (!anchored); the native/anchored export already gets the
 		// caller's real ptr/len and has no such gap.
+		//
+		// No table bytes are reserved for it. The budget check below used to
+		// add 8 for the scratch slot the globals replaced; the addend outlived
+		// the region, which is harmless only because it can merely reject and
+		// eight bytes never decided a verdict.
 		needWindow := !anchored && (btHasWordBoundary(prog) || btHasTextLineAnchors(prog))
-		var winScratchSize int64
-		if needWindow {
-			winScratchSize = 8
-		}
 
 		// memoMaxSize is the BITSET; the reservation also carries its header.
 		memoReserve := memoMaxSize
 		if useMemo {
 			memoReserve += btMemoHeaderBytes
 		}
-		if err := checkBTMemoryBudget(btBase, int64(stackSize)+memoReserve+winScratchSize); err != nil {
+		if err := checkBTMemoryBudget(btBase, int64(stackSize)+memoReserve); err != nil {
 			return nil, err
 		}
 		stackBase := int32(btBase)
@@ -2172,14 +2215,17 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		p.tableEnd = utils.PageAlign(afterBT)
 
 		p.numGroups = bt.numGroups
-		p.winGlobal = winGlobal
+		p.winGlobalP1 = winGlobal + 1
 		// Absolute capture slots, for the same reason and by the same means as
 		// the TDFA body: only when this body sits behind the groups wrapper and
 		// is NOT in window mode, which already writes absolute slots of its own.
+		// A nil allocator degrades to the no-channel form here too — see the
+		// TDFA site above for why that, and not a panic, is the right answer on
+		// the pattern path.
 		if !anchored && !needWindow && buildOpts.globals != nil {
-			p.capStartGlobal = int32(buildOpts.globals.Alloc())
+			p.capStartGlobalP1 = int32(buildOpts.globals.Alloc()) + 1
 		}
-		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winGlobal, memoMaxLen, p.capStartGlobal)
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winGlobal, memoMaxLen, p.capStartGlobal())
 	}
 
 	return p, nil
@@ -2441,9 +2487,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				}
 				winOff := int32(-1)
 				if !p.isTDFA {
-					winOff = p.winGlobal
+					winOff = p.winGlobal()
 				}
-				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal)
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal())
 			}
 		}
 		// LNM non-mid bulk-skip helper body append was here —
@@ -2463,9 +2509,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				}
 				winOff := int32(-1)
 				if !p.isTDFA {
-					winOff = p.winGlobal
+					winOff = p.winGlobal()
 				}
-				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode)
+				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal())
 			}
 		}
 		if p.hasFindFunc() {
@@ -2566,14 +2612,6 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 		p, err := compilePattern(re, cur, forceGroupsEngine, opts)
 		if err != nil {
 			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
-		}
-		// Set here rather than inside compilePattern: that function reaches its
-		// several returns through as many parse branches, and this needs the
-		// AST at exactly one of them.
-		if parsed, perr := syntax.Parse(re.Pattern, syntax.Perl); perr == nil {
-			if n, _ := regexpMinMaxLen(parsed); n > 0 {
-				p.minLen = int32(n)
-			}
 		}
 		// Batch find/groups export trigger. Sole
 		// trigger for batchFindExport/batchGroupsExport — independent of
@@ -3347,10 +3385,24 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMo
 // own (ptr,len) and the per-match extent is written to the (startOff,endOff)
 // scratch inside the loop, once per match.
 //
+// capStartGlobal (-1 = not applicable) is the ABSOLUTE-SLOT channel, and it
+// works exactly as in buildGroupsWrapperBody: the match's start relative to
+// ptr is handed to the capture body through a module global, the body adds it
+// to every slot it writes, and the per-slot rebasing pass below is skipped.
+//
+// Both wrappers MUST agree on this, because they call the SAME capture body.
+// This one used to take neither the parameter nor the channel while still
+// running its own `+adj` pass, so a batch call made after any groups() call on
+// the same instance added that call's leftover start on top of its own — every
+// slot of every record off by the previous match's offset, silently. Nothing
+// covered it: no byteident fixture combines groups_func with hints:
+// [batch-find], and the batch groups export is the only caller of a capture
+// body that is not the groups wrapper.
+//
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
 // 12=recBase i32, 13=capRes i32, 14=adj i32, 15=slotVal i32.
-func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode) []byte {
+func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32) []byte {
 	// The `mode` parameter is what decides how this wrapper hands the find
 	// body its position: emitFindCallFromPos seeds the find-from channel for
 	// an ffNative body and narrows for an ffLegacyNarrow one. A comment here
@@ -3412,6 +3464,16 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 		b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A, 0x20, 0x08, 0x6A, 0x21, 0x0A)
 		// matchLen = relEnd - relStart
 		b = append(b, 0x20, 0x09, 0x20, 0x08, 0x6B, 0x21, 0x0B)
+		if capStartGlobal >= 0 {
+			// adj = pos + relStart, hoisted above the call because the capture
+			// body reads the channel at register-init time. Below the call it
+			// is computed only for the rebasing pass, which absolute slots do
+			// not need — so a body with the channel computes it HERE and one
+			// without computes it THERE, and neither pays for the other.
+			b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x22, 0x0E)
+			b = append(b, 0x24)
+			b = utils.AppendULEB128(b, uint32(capStartGlobal))
+		}
 	}
 	// recBase = out_ptr + count*recordSize
 	b = append(b, 0x20, 0x02, 0x20, 0x06, 0x41)
@@ -3438,14 +3500,17 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = append(b, 0x20, 0x0D, 0x41, 0x00, 0x48, 0x0D, 0x01)
 
 	// adj = pos + relStart
-	// (window mode already computed it, and its slots need no adjusting)
-	if winGlobal < 0 {
+	// (window mode already computed it, and its slots need no adjusting;
+	// so did the absolute-slot channel, above the call, for the same reason)
+	if winGlobal < 0 && capStartGlobal < 0 {
 		b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x0E)
 	}
 
 	// Adjust each of numGroups*2 slot ints at recBase+8+g*4 by +adj (skip
-	// unmatched groups, encoded as -1).
-	for g := 0; winGlobal < 0 && g < numGroups*2; g++ {
+	// unmatched groups, encoded as -1). Skipped whenever the slots already
+	// arrive absolute: window mode makes them relative to ptr, and
+	// capStartGlobal makes the body add the start itself.
+	for g := 0; winGlobal < 0 && capStartGlobal < 0 && g < numGroups*2; g++ {
 		off := uint32(8 + g*4)
 		b = append(b, 0x20, 0x0C)
 		b = append(b, 0x28, 0x02)
@@ -3504,8 +3569,8 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 }
 
 // appendBatchGroupsWrapperCodeEntry appends a size-prefixed batch groups wrapper body to cs.
-func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode) []byte {
-	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, mode)
+func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32) []byte {
+	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, mode, capStartGlobal)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

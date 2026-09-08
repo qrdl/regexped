@@ -577,7 +577,7 @@ func TestDFALayoutFindBodyStartContexts(t *testing.T) {
 			if isAnchoredFind(table) {
 				t.Fatalf("%q routes to buildAnchoredFindBody, not buildFindBody — case is not testing what it claims", tc.pattern)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern), 0)
+			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern, false), 0)
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -634,7 +634,7 @@ func TestDFALayoutFindBodyPrefixWalkDivergence(t *testing.T) {
 				t.Fatalf("%q: all four prefix-end states agree (%d) — nothing diverges to emit",
 					tc.pattern, layout.wasmPrefixEnd)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern), 0)
+			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern, false), 0)
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -667,7 +667,7 @@ func TestDFALayoutFindBodyU16NonMidDominant(t *testing.T) {
 	if nonMid == 0 {
 		t.Fatalf("%q: expected at least one non-mid dominant state", pattern)
 	}
-	body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(pattern), 0)
+	body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(pattern, false), 0)
 	if len(body) == 0 {
 		t.Fatalf("%q: empty find body", pattern)
 	}
@@ -700,7 +700,7 @@ func TestDFALayoutFindBodyMandatoryLit(t *testing.T) {
 			if len(layout.prefix) != 0 {
 				t.Fatalf("%q: literal prefix %q present, so the mandatory-literal path is not taken", tc.pattern, layout.prefix)
 			}
-			lit := findMandatoryLit(tc.pattern)
+			lit := findMandatoryLit(tc.pattern, false)
 			if lit == nil || len(lit.bytes) == 0 {
 				t.Fatalf("%q: no mandatory literal found — case is not testing what it claims", tc.pattern)
 			}
