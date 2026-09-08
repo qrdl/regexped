@@ -1436,6 +1436,18 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			useMemo := needsBitState(btProg)
 			btBase := utils.PageAlign(cur)
 			matchMemoBudget := resolveMemoBudget(&buildOpts)
+			// Refuses a budget too small to hold even the shortest admissible
+			// input's bitset — see btMemoPlan. This path reserves the whole
+			// budget rather than the bitset's own size, so without the check it
+			// would accept what the capture path rejects.
+			matchMemoMaxLen := int32(0)
+			if useMemo {
+				var err error
+				matchMemoMaxLen, _, err = btMemoPlan(len(bt.prog.Inst), matchMemoBudget)
+				if err != nil {
+					return nil, err
+				}
+			}
 			btStackSize, btMemoSize := btAllocSizes(bt, useMemo, 0, matchMemoBudget)
 			if err := checkBTMemoryBudget(btBase, int64(btStackSize)+int64(btMemoSize)); err != nil {
 				return nil, err
@@ -1446,7 +1458,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			if useMemo {
 				btMemoBase = btStackLimit + btMemoHeaderBytes
 			}
-			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx, btMemoMaxLen(len(bt.prog.Inst), matchMemoBudget))
+			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx, matchMemoMaxLen)
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(dfaLayoutParams{
@@ -1703,6 +1715,15 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// Allocate BT stack after SIMD tables.
 			btBase := utils.PageAlign(cur + int64(len(btScanDataBytes)))
 			memoBudget := resolveMemoBudget(&buildOpts)
+			// Same refusal as the match path above, for the same reason.
+			findMemoMaxLen := int32(0)
+			if useMemo {
+				var err error
+				findMemoMaxLen, _, err = btMemoPlan(len(bt.prog.Inst), memoBudget)
+				if err != nil {
+					return nil, err
+				}
+			}
 			btStackSize, btMemoSize := btAllocSizes(bt, useMemo, 0, memoBudget)
 			if err := checkBTMemoryBudget(btBase, int64(btStackSize)+int64(btMemoSize)); err != nil {
 				return nil, err
@@ -1714,7 +1735,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				btMemoBase = btStackLimit + btMemoHeaderBytes
 			}
 			frameSize := int32(8 + btNumLoopFrameLocals(bt, false)*4) // pos + loop trackers + retryPC (no cap slots)
-			p.setFind(appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx, btMemoMaxLen(len(bt.prog.Inst), memoBudget)))
+			p.setFind(appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx, findMemoMaxLen))
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
@@ -2153,15 +2174,10 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		var memoMaxLen int32
 		var memoMaxSize int64
 		if useMemo {
-			N := len(prog.Inst)
-			memoBudget := resolveMemoBudget(&buildOpts)
-			memoMaxLen = btMemoMaxLen(N, memoBudget)
-			memoMaxSize = int64((N*(int(memoMaxLen)+1) + 7) / 8)
-			if memoMaxSize > int64(memoBudget) {
-				return nil, fmt.Errorf(
-					"pattern requires %d bytes of memo memory, exceeds budget %d: "+
-						"increase CompileOptions.MemoBudget",
-					memoMaxSize, memoBudget)
+			var err error
+			memoMaxLen, memoMaxSize, err = btMemoPlan(len(prog.Inst), resolveMemoBudget(&buildOpts))
+			if err != nil {
+				return nil, err
 			}
 		}
 

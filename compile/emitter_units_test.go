@@ -166,9 +166,14 @@ func TestChoosePackedPairRefusals(t *testing.T) {
 }
 
 // btMemoMaxLen is the largest input whose BitState memo bitset fits the budget.
-// The clamp at zero is what keeps a pattern too large for any input from
-// wrapping into a huge unsigned comparison in the emitted guard — which would
-// never fire, and the fill would then run past its reservation.
+// The clamp at zero keeps a negative ceiling from becoming a huge unsigned
+// bound in the emitted guard, which would never fire.
+//
+// The clamp is NOT by itself a safety property, and reading it as one is a
+// mistake worth naming here. The emitted guard rejects lengths ABOVE the
+// ceiling, so a ceiling of 0 still admits the EMPTY input — which needs N bits
+// of its own. What makes that safe is btMemoPlan refusing such a budget at
+// compile time; see TestBTMemoPlanRefusesABudgetThatHoldsNothing.
 func TestBTMemoMaxLenClampsAtZero(t *testing.T) {
 	// memoBudget*8 < numInsts: no input at all fits, not even the empty one.
 	if got := btMemoMaxLen(100, 1); got != 0 {
@@ -183,5 +188,40 @@ func TestBTMemoMaxLenClampsAtZero(t *testing.T) {
 	// reservation and the runtime guard both rely on.
 	if btMemoMaxLen(25, 64*1024) >= btMemoMaxLen(25, 128*1024) {
 		t.Error("a larger budget did not admit a longer input")
+	}
+}
+
+// btMemoPlan is what makes the clamp above safe: a budget too small to hold
+// even the shortest admissible input's bitset is refused at COMPILE time,
+// rather than left for the emitted guard, which cannot express it.
+//
+// All three Backtracking paths go through the planner. The capture path always
+// carried this check inline; the match and find paths reserve the whole budget
+// rather than the bitset's own size, so they had no size to compare and
+// accepted budgets the capture path rejected. A memo-enabled empty match then
+// wrote past its reservation — into page padding, which is a property of the
+// layout and not a guarantee to rely on.
+func TestBTMemoPlanRefusesABudgetThatHoldsNothing(t *testing.T) {
+	// 100 instructions need 13 bytes for the empty input alone.
+	if _, _, err := btMemoPlan(100, 1); err == nil {
+		t.Error("a 1-byte budget for a 100-instruction pattern was accepted; not even " +
+			"the empty input's bitset fits in it")
+	}
+	// Exactly enough for the empty input and nothing more: admitted, with a
+	// ceiling of zero. This is the boundary the refusal must not overshoot.
+	const n = 64
+	maxLen, size, err := btMemoPlan(n, n/8)
+	if err != nil {
+		t.Fatalf("a budget of exactly the empty input's bitset was refused: %v", err)
+	}
+	if maxLen != 0 {
+		t.Errorf("ceiling = %d, want 0 — only the empty input fits", maxLen)
+	}
+	if size != int64(n/8) {
+		t.Errorf("bitset = %d bytes, want %d", size, n/8)
+	}
+	// And an ordinary budget is unaffected.
+	if _, _, err := btMemoPlan(25, 128*1024); err != nil {
+		t.Errorf("the default budget was refused: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"fmt"
 	"regexp/syntax"
 	"sort"
 
@@ -2558,6 +2559,38 @@ func btMemoMaxLen(numInsts, memoBudget int) int32 {
 		n = 0
 	}
 	return int32(n)
+}
+
+// btMemoPlan sizes a BitState memo against a budget: the largest input length
+// it can memoise, and the bytes that length's bitset occupies. It REFUSES a
+// budget that cannot hold even the shortest admissible input.
+//
+// The refusal is the point, and it is why this is a planner rather than a bare
+// call to btMemoMaxLen. That function clamps a negative ceiling to 0, and 0
+// reads as "only the empty input" — but the empty input still needs N bits, so
+// a budget below N/8 has nothing to put them in. The emitted guard rejects
+// lengths ABOVE the ceiling, so a ceiling of 0 lets the empty input through and
+// the memo is then written past its reservation. What follows the memo is page
+// padding, so nothing observable breaks today; that is a property of the
+// layout, not a guarantee this code is entitled to lean on.
+//
+// The capture path has always carried this check inline. The match and find
+// paths did not, because they reserve the WHOLE budget rather than the bitset's
+// own size and so never had a size to compare — which is exactly how they came
+// to accept what the capture path rejects. One planner, three call sites, one
+// answer.
+//
+// Only reachable through CompileOptions.MemoBudget; YAML does not expose it.
+func btMemoPlan(numInsts, memoBudget int) (memoMaxLen int32, bitsetBytes int64, err error) {
+	memoMaxLen = btMemoMaxLen(numInsts, memoBudget)
+	bitsetBytes = int64((numInsts*(int(memoMaxLen)+1) + 7) / 8)
+	if bitsetBytes > int64(memoBudget) {
+		return 0, 0, fmt.Errorf(
+			"pattern requires %d bytes of memo memory, exceeds budget %d: "+
+				"increase CompileOptions.MemoBudget",
+			bitsetBytes, memoBudget)
+	}
+	return memoMaxLen, bitsetBytes, nil
 }
 
 // emitBTMemoLenGuard emits `if <len> > memoMaxLen { return abi.BTStackOverflow }`

@@ -194,6 +194,16 @@ func runCompileCmd(args []string) {
 	// streams to the same destination (stdout/stdout, or the same filesystem
 	// path), which would silently corrupt the WASM with the JSON diagnostics.
 	if *diagJSON != "" {
+		// Set-less configs are refused HERE rather than by CmdWriteDiagJSON,
+		// which runs after the module has already been written. Both report the
+		// same thing, but only this one reports it before the command has had
+		// an effect: `compile --diag-json=x.json` on a config with no sets used
+		// to exit non-zero AND leave a freshly generated .wasm behind, which is
+		// the worst combination for a build script — a failure it must not
+		// ignore, next to output it cannot tell apart from a success.
+		if len(cfg.Sets) == 0 {
+			failf(exitUsage, "compile: --diag-json: the config declares no sets, and set composition is all this reports")
+		}
 		if outPath == "-" && *diagJSON == "-" {
 			failf(exitUsage, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
 		}

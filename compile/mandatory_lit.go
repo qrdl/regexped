@@ -37,8 +37,19 @@ type mandatoryLit struct {
 // OpRepeat, or OpAlternate. The set router applies that additional check
 // itself; callers that need a yes/no answer on "is this pattern usable as
 // a set anchor?" must do the same.
-func HasMandatoryLit(pattern string, byteMode bool) bool {
-	return findMandatoryLit(pattern, byteMode) != nil
+// byteMode is OPTIONAL and defaults to false, the default compile mode. It is
+// variadic rather than a second required parameter so that adding it did not
+// break existing callers of this exported function — the same shape Compile
+// uses for its options, and for the same reason. Pass true only for a pattern
+// compiled with `byte_mode: true`, where a literal rune 0x80..0xFF is one byte
+// rather than the two its UTF-8 encoding would take; the offsets this analysis
+// produces are wrong by one byte per such rune otherwise.
+func HasMandatoryLit(pattern string, byteMode ...bool) bool {
+	bm := false
+	if len(byteMode) > 0 {
+		bm = byteMode[0]
+	}
+	return findMandatoryLit(pattern, bm) != nil
 }
 
 // mandatory literal is found or if MaxOff > 256.
