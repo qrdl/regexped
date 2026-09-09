@@ -1889,23 +1889,53 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 			}
 
 			if !placed {
+				// Build the bucket's suffix DFA with correct bitmask accepts (bit 0 = pattern 0).
+				// p.suffixDFA is built without patternBits (for dedup); we need bitmask info for WASM.
+				var single *dfaTable
+				if ast := patternSuffixAST(p); ast != nil {
+					if t, _, mergeErr := mergeSuffixDFA([]*syntax.Regexp{ast}, opts); mergeErr == nil {
+						single = t
+					}
+				}
+				if single == nil {
+					// DROP, loudly. Keeping the bucket would make it LIVE with a
+					// nil suffix DFA, and genSuffixWASM emits a body returning 0
+					// for that — so the literal would gate candidates into a
+					// bucket that reports no match at any of them, and the
+					// pattern would silently never match with no warning and no
+					// --diag-json entry.
+					//
+					// The fallback packers already refuse this, through
+					// admitOrDropFallback. This site kept the failure instead,
+					// which left one policy written down twice with two
+					// different answers; the drop below is the fallback one.
+					//
+					// Not rescued into a BT bucket the way admitOrDropFallback
+					// does: newBTBucket returns a bucket with an EMPTY literal
+					// and isFallback set, and litBuckets is a shared-literal
+					// group — promoteSharedLiteralBuckets keys on
+					// litBuckets[0].literal and treats an empty one as "this is
+					// the fallback group". Injecting one here would corrupt that
+					// classification for the whole group.
+					warnPatternDroppedReason(p, "binPack",
+						"its own suffix DFA could not be built",
+						"simplify the pattern or move it out of the set",
+						0, opts.maxFallbackStates())
+					if diag != nil {
+						diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
+					}
+					continue
+				}
 				// Create a new bucket for this pattern.
-				nb := &bucket{
+				litBuckets = append(litBuckets, &bucket{
 					literal:      lit,
 					patterns:     []*PatternInfo{p},
 					suffixStates: p.suffixStates,
 					tableBytes:   dfaTableBytes(p.suffixDFA),
 					classMap:     p.suffixClassMap,
 					numClasses:   p.suffixClasses,
-				}
-				// Build the bucket's suffix DFA with correct bitmask accepts (bit 0 = pattern 0).
-				// p.suffixDFA is built without patternBits (for dedup); we need bitmask info for WASM.
-				if ast := patternSuffixAST(p); ast != nil {
-					if t, _, mergeErr := mergeSuffixDFA([]*syntax.Regexp{ast}, opts); mergeErr == nil {
-						nb.suffixDFA = t
-					}
-				}
-				litBuckets = append(litBuckets, nb)
+					suffixDFA:    single,
+				})
 			}
 		}
 		// G17: buckets that split ONLY because the accept mask ran out of bits

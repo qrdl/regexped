@@ -542,6 +542,30 @@ func (s SetSpec) needsAnchoredBuckets() bool {
 
 // CompileSet compiles one set specification into a compiledSet.
 // prefixPool and suffixPool are shared dedup pools across all sets in the file.
+// assertBucketEmittable enforces the invariant that a bucket reaching suffix
+// emission has a table to emit.
+//
+// genSuffixWASM answers a nil table with a body that returns 0, which is
+// indistinguishable from "no match at this position". A bucket that got this
+// far without one would therefore be gated by its literal, dispatched to, and
+// silently report nothing at every candidate — the pattern would never match,
+// with no warning and no --diag-json entry. That is FABLE B24, whose live half
+// was binPack's literal-singleton arm keeping a mergeSuffixDFA failure.
+//
+// A BUILD failure rather than a diagnostic, because by this point every packer
+// is supposed to have dropped such a pattern already: admitOrDropFallback does
+// it for the two fallback packers, and binPack's literal singleton now does it
+// too. This is what stops a fourth site reintroducing the hole quietly.
+//
+// Backtracking buckets are excluded by the caller before this runs — having no
+// table is the whole point of one.
+func assertBucketEmittable(bi int, bkt *bucket) {
+	if bkt.suffixDFA == nil {
+		panic(fmt.Sprintf("set bucket %d (literal %q, %d patterns) has no suffix DFA and no BT "+
+			"fallback: a packer admitted a bucket that can never match", bi, bkt.literal, len(bkt.patterns)))
+	}
+}
+
 func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions) *compiledSet {
 	// THE nil-allocator fallback for the whole set path. A nil allocator means
 	// this set is being compiled outside a module assembly — CompileSet is
@@ -801,6 +825,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		if bkt.btFallback != nil {
 			continue
 		}
+		assertBucketEmittable(bi, bkt)
 		base, reused, fp := tableOffset, false, uint64(0)
 		if bkt.suffixDFA != nil && !bkt.sparse {
 			fp = dfaFingerprint(bkt.suffixDFA)
