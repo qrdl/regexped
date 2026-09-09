@@ -1721,11 +1721,18 @@ func btCheckRuneRanges(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 			lo = inst.Rune[i]
 			hi = inst.Rune[i+1]
 		}
-		if lo > 0x7F {
-			continue // skip non-ASCII ranges
+		// SATURATE at 0xFF, exactly as the DFA's nfaBuildInputMap does. This
+		// engine consumes one BYTE per InstRune, and `.` / a negated class
+		// matching one byte is documented semantics (docs/engines.md), so
+		// `[^,]` — which the parser writes as a range to U+10FFFF — must admit
+		// 0x80..0xFF. Truncating to 0x7F here made the capture pass disagree
+		// with the DFA that had just found the extent, and the whole match was
+		// lost. A range entirely above the byte space contributes nothing.
+		if lo > 0xFF {
+			continue
 		}
-		if hi > 0x7F {
-			hi = 0x7F
+		if hi > 0xFF {
+			hi = 0xFF
 		}
 		b = btEmitRangeMatch(b, lo, hi, isFold)
 	}
@@ -1758,11 +1765,14 @@ func btEmitRangeMatch(b []byte, lo, hi rune, isFold bool) []byte {
 
 // btEmitSingleRange emits: (scratch >= lo && scratch <= hi); br_if 0 with result 1
 func btEmitSingleRange(b []byte, lo, hi rune) []byte {
-	if lo > 0x7F {
+	// Same saturation as btCheckRuneRanges — see the comment there. scratch is
+	// an i32.load8_u, so it is 0..255 and the ge_u/le_u pair below compares
+	// correctly against a bound anywhere in that space.
+	if lo > 0xFF {
 		return b
 	}
-	if hi > 0x7F {
-		hi = 0x7F
+	if hi > 0xFF {
+		hi = 0xFF
 	}
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
@@ -2103,7 +2113,12 @@ func nfaFirstBytes(prog *syntax.Prog) (firstBytes []byte, flags [256]byte, allBy
 		switch inst.Op {
 		case syntax.InstRune1:
 			r := inst.Rune[0]
-			if r <= 127 {
+			// 0xFF, not 127: this set feeds a PREFILTER, so omitting a byte
+			// that can begin a match skips valid start positions outright —
+			// an under-approximation loses matches, where an over-approximation
+			// only costs a wasted attempt. The fold twin below stays ASCII,
+			// which is the documented byte-mode rule.
+			if r >= 0 && r <= 0xFF {
 				b := byte(r)
 				if flags[b] == 0 {
 					flags[b] = 1
@@ -2132,7 +2147,10 @@ func nfaFirstBytes(prog *syntax.Prog) (firstBytes []byte, flags [256]byte, allBy
 					lo = inst.Rune[i]
 					hi = inst.Rune[i] // single-rune entry at odd position
 				}
-				for r := lo; r <= hi && r <= 127; r++ {
+				// See the InstRune1 arm: 0xFF, so a negated class (which the
+				// parser writes as a range to U+10FFFF) contributes every byte
+				// that can actually begin a match.
+				for r := lo; r <= hi && r <= 0xFF; r++ {
 					b := byte(r)
 					if flags[b] == 0 {
 						flags[b] = 1

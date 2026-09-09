@@ -861,19 +861,28 @@ func TestEnginesCovDominatesUnreachable(t *testing.T) {
 	}
 }
 
-func TestEnginesCovBTEmitSingleRangeClampsNonASCII(t *testing.T) {
-	// btCheckRuneRanges filters lo>0x7F and clamps hi before calling in, so
+func TestEnginesCovBTEmitSingleRangeClampsAboveByteRange(t *testing.T) {
+	// btCheckRuneRanges filters lo>0xFF and clamps hi before calling in, so
 	// these guards are btEmitSingleRange's own contract rather than a live
 	// path. They matter because the emitted comparison runs against a single
-	// input BYTE: a lo above 0x7F can never match, and an unclamped hi would
+	// input BYTE: a lo above 0xFF can never match, and an unclamped hi would
 	// emit an SLEB128 constant wider than the byte it is compared with.
+	//
+	// The bound was 0x7F until 2026-09-09, which truncated every negated class
+	// to ASCII on the capture path and lost the whole match for input carrying
+	// a byte >= 0x80. It is 0xFF now, which is what the DFA's nfaBuildInputMap
+	// has always saturated to.
 	if got := btEmitSingleRange(nil, 0x100, 0x200); got != nil {
 		t.Errorf("btEmitSingleRange(lo=0x100) emitted % x, want nothing", got)
 	}
 	clamped := btEmitSingleRange(nil, 'a', 0x200)
-	reference := btEmitSingleRange(nil, 'a', 0x7F)
+	reference := btEmitSingleRange(nil, 'a', 0xFF)
 	if !bytes.Equal(clamped, reference) {
-		t.Errorf("btEmitSingleRange(hi=0x200) = % x, want the hi=0x7F emission % x", clamped, reference)
+		t.Errorf("btEmitSingleRange(hi=0x200) = % x, want the hi=0xFF emission % x", clamped, reference)
+	}
+	// 0x80..0xFF must survive rather than be clamped away.
+	if hi := btEmitSingleRange(nil, 0x80, 0xFF); hi == nil {
+		t.Error("btEmitSingleRange(0x80, 0xFF) emitted nothing, want a range check")
 	}
 }
 
