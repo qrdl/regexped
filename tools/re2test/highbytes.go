@@ -49,10 +49,28 @@ import (
 //
 // 0x09-0x0D are excluded as \s members (and 0x0A is what `.` excludes); 0x00 is
 // excluded because a NUL in a test input buys nothing and confuses harnesses.
+//
+// PUNCTUATION is the second tier, and it is what makes the pool survive a
+// pattern that names the control characters as a class. `(?:[[:cntrl:]])$`
+// contains every byte of the first tier and no high byte, so under it no
+// control character is interchangeable — measured, that ONE pattern pinned all
+// 674 high-byte inputs of the chunks it appeared in. A punctuation byte is
+// outside [[:cntrl:]] exactly as a high byte is, so it serves.
+//
+// Both tiers share the properties that make a stand-in for a high byte sound
+// and that the class comparison alone would NOT catch: neither is a word
+// character nor a space, so `\b`, `\B` and `\s` — which are empty-width
+// assertions rather than classes, and so contribute no ranges to compare —
+// behave identically on the twin and the original. `_` is excluded from the
+// punctuation tier for exactly that reason.
 var twinCandidates = []byte{
+	// Tier 1: control characters.
 	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 	0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
 	0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x7F,
+	// Tier 2: non-word, non-space printable ASCII (no '_').
+	'!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
+	':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '`', '{', '|', '}', '~',
 }
 
 // byteRange is one rune range from the pattern's AST, evaluated in BYTE space.
@@ -69,9 +87,18 @@ func (r byteRange) namesByte(b byte) bool {
 	return rune(b) >= r.lo && rune(b) <= hi
 }
 
-// patternByteRanges collects every rune range the pattern names, and whether it
-// contains a dot that excludes newline.
-func patternByteRanges(pattern string) (ranges []byteRange, hasDotNotNL bool, ok bool) {
+// patternByteRanges collects the pattern's byte CLASSES — each as the group of
+// ranges that make it up — and whether it contains a dot that excludes newline.
+//
+// Grouped, not flattened, and that is the difference between a usable oracle
+// and a useless one. Membership has to be compared per CLASS, because a class
+// is the UNION of its ranges: `[^a]` compiles to [0x00-0x60] plus
+// [0x62-U+10FFFF], and a control character lies in the first while a high byte
+// lies in the second. Comparing range by range calls those two bytes
+// distinguishable when the automaton, which branches on the class, cannot tell
+// them apart at all. The flattened version rejected a twin for every negated
+// class — which is to say for exactly the patterns this exists to cover.
+func patternByteRanges(pattern string) (classes [][]byteRange, hasDotNotNL bool, ok bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, false, false
@@ -80,12 +107,17 @@ func patternByteRanges(pattern string) (ranges []byteRange, hasDotNotNL bool, ok
 	walk = func(n *syntax.Regexp) {
 		switch n.Op {
 		case syntax.OpLiteral:
+			// Each literal rune is its own single-member class.
 			for _, r := range n.Rune {
-				ranges = append(ranges, byteRange{r, r})
+				classes = append(classes, []byteRange{{r, r}})
 			}
 		case syntax.OpCharClass:
+			var g []byteRange
 			for i := 0; i+1 < len(n.Rune); i += 2 {
-				ranges = append(ranges, byteRange{n.Rune[i], n.Rune[i+1]})
+				g = append(g, byteRange{n.Rune[i], n.Rune[i+1]})
+			}
+			if len(g) > 0 {
+				classes = append(classes, g)
 			}
 		case syntax.OpAnyCharNotNL:
 			hasDotNotNL = true
@@ -95,7 +127,18 @@ func patternByteRanges(pattern string) (ranges []byteRange, hasDotNotNL bool, ok
 		}
 	}
 	walk(re)
-	return ranges, hasDotNotNL, true
+	return classes, hasDotNotNL, true
+}
+
+// classNamesByte reports whether byte b is in the class, i.e. in ANY of its
+// ranges.
+func classNamesByte(g []byteRange, b byte) bool {
+	for _, r := range g {
+		if r.namesByte(b) {
+			return true
+		}
+	}
+	return false
 }
 
 // interchangeable reports whether byte c behaves identically to byte h under
@@ -110,12 +153,12 @@ func patternByteRanges(pattern string) (ranges []byteRange, hasDotNotNL bool, ok
 // \b and \B come along for free: word-ness is membership of [0-9A-Za-z_], so a
 // control character and a high byte are both outside it and neither can flip a
 // boundary the other would not.
-func interchangeable(c, h byte, ranges []byteRange, hasDotNotNL bool) bool {
+func interchangeable(c, h byte, classes [][]byteRange, hasDotNotNL bool) bool {
 	if hasDotNotNL && (c == '\n' || h == '\n') {
 		return false
 	}
-	for _, r := range ranges {
-		if r.namesByte(c) != r.namesByte(h) {
+	for _, g := range classes {
+		if classNamesByte(g, c) != classNamesByte(g, h) {
 			return false
 		}
 	}
@@ -138,7 +181,7 @@ func asciiTwin(text, pattern string) (string, bool) {
 			return "", false
 		}
 	}
-	ranges, hasDotNotNL, ok := patternByteRanges(pattern)
+	classes, hasDotNotNL, ok := patternByteRanges(pattern)
 	if !ok {
 		return "", false
 	}
@@ -161,7 +204,7 @@ func asciiTwin(text, pattern string) (string, bool) {
 		if !seen {
 			found := false
 			for _, cand := range twinCandidates {
-				if used[cand] || !interchangeable(cand, b, ranges, hasDotNotNL) {
+				if used[cand] || !interchangeable(cand, b, classes, hasDotNotNL) {
 					continue
 				}
 				sub, found = cand, true
@@ -315,7 +358,7 @@ func asciiTwinForPatterns(text string, patterns []string) (string, bool) {
 	if !hasHighByte(text) {
 		return text, true
 	}
-	var ranges []byteRange
+	var classes [][]byteRange
 	dotNotNL := false
 	for _, pat := range patterns {
 		for i := 0; i < len(pat); i++ {
@@ -327,7 +370,7 @@ func asciiTwinForPatterns(text string, patterns []string) (string, bool) {
 		if !ok {
 			return "", false
 		}
-		ranges = append(ranges, rs...)
+		classes = append(classes, rs...)
 		dotNotNL = dotNotNL || dnl
 	}
 	var used [256]bool
@@ -346,7 +389,7 @@ func asciiTwinForPatterns(text string, patterns []string) (string, bool) {
 		if !seen {
 			found := false
 			for _, cand := range twinCandidates {
-				if used[cand] || !interchangeable(cand, b, ranges, dotNotNL) {
+				if used[cand] || !interchangeable(cand, b, classes, dotNotNL) {
 					continue
 				}
 				sub, found = cand, true
@@ -363,24 +406,65 @@ func asciiTwinForPatterns(text string, patterns []string) (string, bool) {
 	return string(out), true
 }
 
-// setOracleStrings returns, for each input, the string the ORACLE should be
-// computed over, plus whether the live oracle can serve that row at all.
+// setOracleTwins returns twins[pi][si] — the string PATTERN pi's expectation
+// should be computed over — plus whether the live oracle can serve input si.
 //
-// ASCII inputs are their own oracle string. A high-byte input becomes its twin
-// when one exists. Anything else is left to the pinned path.
-func setOracleStrings(pats, strs []string) (oracleStrs []string, live []bool) {
-	oracleStrs = make([]string, len(strs))
+// PER PATTERN, not per chunk, and the difference is most of the coverage.
+// Requiring one substitute byte to satisfy every pattern in a chunk at once is
+// stronger than correctness needs: with 32 unrelated patterns a single one
+// naming a control-character range disqualifies that candidate for all of them,
+// and measured on the chunked corpus that left 674 of 778 high-byte inputs on
+// the pinned path.
+//
+// The oracle is already indexed by pattern, and each entry answers exactly one
+// question: what does pattern pi match in this input. Interchangeability
+// guarantees pi's automaton cannot distinguish the original from ITS OWN twin,
+// and the substitution preserves length so every offset still lines up — so
+// pi's expectation may be computed on a twin chosen for pi alone while the
+// module runs once on the original bytes. Two patterns may use different
+// twins: each comparison is independent, and the aggregate capabilities
+// (`match_all`'s bitmap, `scan_any`'s id) are derived from these per-pattern
+// facts rather than computed separately.
+//
+// An input is live only when EVERY pattern has a twin for it. That is still far
+// weaker than one shared byte — pattern A can take 0x7F while B takes 0x01 —
+// and it keeps the comparison simple: a row is either fully judged by the live
+// oracle or fully handed to the pinned path, never half of each.
+func setOracleTwins(pats, strs []string) (twins [][]string, live []bool) {
+	twins = make([][]string, len(pats))
+	for pi := range pats {
+		twins[pi] = make([]string, len(strs))
+	}
 	live = make([]bool, len(strs))
 	for si, s := range strs {
 		if !hasHighByte(s) {
-			oracleStrs[si], live[si] = s, true
+			for pi := range pats {
+				twins[pi][si] = s
+			}
+			live[si] = true
 			continue
 		}
-		if twin, ok := asciiTwinForPatterns(s, pats); ok {
-			oracleStrs[si], live[si] = twin, true
+		ok := true
+		row := make([]string, len(pats))
+		for pi, pat := range pats {
+			t, tok := asciiTwin(s, pat)
+			if !tok {
+				ok = false
+				break
+			}
+			row[pi] = t
+		}
+		if !ok {
+			for pi := range pats {
+				twins[pi][si] = s // unused; the row goes to the pinned path
+			}
+			live[si] = false
 			continue
 		}
-		oracleStrs[si], live[si] = s, false
+		for pi := range pats {
+			twins[pi][si] = row[pi]
+		}
+		live[si] = true
 	}
-	return oracleStrs, live
+	return twins, live
 }

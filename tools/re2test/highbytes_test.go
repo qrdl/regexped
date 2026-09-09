@@ -103,3 +103,106 @@ func TestTwinSubstitutesAreInterchangeable(t *testing.T) {
 		}
 	}
 }
+
+// Membership must be compared per CLASS, not per range.
+//
+// A negated class is several ranges: `[^a]` compiles to [0x00-0x60] plus
+// [0x62-U+10FFFF]. A control character lies in the first and a high byte in the
+// second, so a range-by-range comparison calls them distinguishable when the
+// automaton — which branches on the class as a whole — cannot tell them apart.
+// The first version compared per range and so refused a twin for every negated
+// class, which is exactly the family this exists to cover: measured on the set
+// corpus, 674 of 778 high-byte inputs fell back to the pinned path.
+func TestTwinAcceptsNegatedClasses(t *testing.T) {
+	for _, pat := range []string{`[^a]`, `[^a]+`, `[^>]+`, `<[^>]+>`, `[^,]+,`, `\S+`, `[^\x00]`} {
+		for _, in := range []string{"a\xe9", "\xe9a", "a\xc3\xa2b", "\xe9\xe9"} {
+			twin, ok := asciiTwin(in, pat)
+			if !ok {
+				t.Errorf("asciiTwin(%q, %q): no twin; a negated class admits both a "+
+					"control character and a high byte, so one must exist", in, pat)
+				continue
+			}
+			if len(twin) != len(in) {
+				t.Errorf("asciiTwin(%q, %q) = %q: length changed, offsets would move", in, pat, twin)
+			}
+		}
+	}
+}
+
+// Whatever the grouping, a twin must never be accepted where the pattern really
+// can distinguish the two bytes.
+//
+// `[\x00-\x7f]` is the clean case: it contains EVERY ASCII byte and no high
+// byte, so no substitute can behave like 0xE9 and the row must fall back.
+//
+// The near-misses matter as much. `[\x00-\x1f]` looks like it should refuse a
+// twin, and must not: 0x7F is outside that class and so is 0xE9, which makes
+// them interchangeable under it. An earlier version of this test asserted the
+// opposite and was simply wrong about the contract.
+func TestTwinRejectsDistinguishingPatterns(t *testing.T) {
+	if twin, ok := asciiTwin("\xe9", `[\x00-\x7f]`); ok {
+		t.Errorf("asciiTwin(%q, %q) = %q: every ASCII byte is in that class and no "+
+			"high byte is, so no substitute can be interchangeable", "\xe9", `[\x00-\x7f]`, twin)
+	}
+	// Accepted, and the substitute must genuinely sit outside the class.
+	for _, pat := range []string{`[\x00-\x1f]`, `[\x01\x02]+`} {
+		twin, ok := asciiTwin("\xe9", pat)
+		if !ok {
+			t.Errorf("asciiTwin(%q, %q): no twin, but a byte outside the class exists", "\xe9", pat)
+			continue
+		}
+		classes, dotNotNL, pok := patternByteRanges(pat)
+		if !pok {
+			t.Fatalf("patternByteRanges(%q) failed", pat)
+		}
+		if !interchangeable(twin[0], 0xE9, classes, dotNotNL) {
+			t.Errorf("asciiTwin(%q, %q) = %q: chosen substitute is not interchangeable",
+				"\xe9", pat, twin)
+		}
+	}
+}
+
+// A pattern naming the control characters AS A CLASS must not exhaust the pool.
+//
+// `(?:[[:cntrl:]])$` contains every byte of the control-character tier and no
+// high byte, so under it no first-tier candidate is interchangeable. Measured
+// on the shuffled 70-pattern set chunks, that ONE pattern pinned all 674
+// high-byte inputs of every chunk it landed in. The punctuation tier exists for
+// it: a punctuation byte is outside [[:cntrl:]] exactly as a high byte is.
+func TestTwinSurvivesControlCharClass(t *testing.T) {
+	for _, pat := range []string{`(?:[[:cntrl:]])$`, `[[:cntrl:]]`, `[\x00-\x1f\x7f]`} {
+		twin, ok := asciiTwin("\xc2\x80", pat)
+		if !ok {
+			t.Errorf("asciiTwin(%q, %q): no twin; a byte outside [[:cntrl:]] is "+
+				"interchangeable with a high byte under it", "\xc2\x80", pat)
+			continue
+		}
+		classes, dotNotNL, pok := patternByteRanges(pat)
+		if !pok {
+			t.Fatalf("patternByteRanges(%q) failed", pat)
+		}
+		for i := range twin {
+			if !interchangeable(twin[i], "\xc2\x80"[i], classes, dotNotNL) {
+				t.Errorf("asciiTwin(%q, %q) = %q: byte %d not interchangeable", "\xc2\x80", pat, twin, i)
+			}
+		}
+	}
+}
+
+// Every candidate, in both tiers, must be non-word and non-space. `\b`, `\B`
+// and `\s` are empty-width assertions rather than classes, so they contribute
+// no ranges for interchangeable() to compare — the pool itself has to carry the
+// guarantee.
+func TestTwinCandidatesAreNonWordNonSpace(t *testing.T) {
+	for _, c := range twinCandidates {
+		if c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			t.Errorf("candidate %#02x is a word character; \\b and \\w would differ on the twin", c)
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r' {
+			t.Errorf("candidate %#02x is a space character; \\s would differ on the twin", c)
+		}
+		if c >= 0x80 {
+			t.Errorf("candidate %#02x is not ASCII", c)
+		}
+	}
+}

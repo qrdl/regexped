@@ -472,7 +472,7 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 	// oracleStrs replaces strs EVERYWHERE below: every expectation is a
 	// statement about the twin, and the drive loop compares the module's answer
 	// over the original against it.
-	oracleStrs, usable := setOracleStrings(pats, strs)
+	twins, usable := setOracleTwins(pats, strs)
 	o.live = usable
 	for si, s := range strs {
 		if !hasHighByte(s) {
@@ -484,7 +484,6 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 			setHighBytePinned++
 		}
 	}
-	strs = oracleStrs
 	maxLen := 0
 	for si, s := range strs {
 		if usable[si] && len(s) > maxLen {
@@ -502,8 +501,8 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 				return nil, fmt.Errorf("oracle: anchored probe for %q: %w", pat, err)
 			}
 			row := make([]bool, len(strs))
-			for si, s := range strs {
-				row[si] = usable[si] && anch.MatchString(s)
+			for si := range strs {
+				row[si] = usable[si] && anch.MatchString(twins[pi][si])
 			}
 			o.anchored[pi] = row
 		}
@@ -513,11 +512,11 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 				return nil, fmt.Errorf("oracle: %q: %w", pat, err)
 			}
 			row := make([][][2]int, len(strs))
-			for si, s := range strs {
+			for si := range strs {
 				if !usable[si] {
 					continue
 				}
-				for _, m := range re.FindAllStringIndex(s, -1) {
+				for _, m := range re.FindAllStringIndex(twins[pi][si], -1) {
 					row[si] = append(row[si], [2]int{m[0], m[1]})
 				}
 			}
@@ -529,10 +528,11 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 			// rebuilt per string and the cost is quadratic for no reason.
 			probes := make([]*regexp.Regexp, maxLen+1)
 			row := make([][][2]int, len(strs))
-			for si, s := range strs {
+			for si := range strs {
 				if !usable[si] {
 					continue
 				}
+				s := twins[pi][si]
 				for p := 0; p <= len(s); p++ {
 					if probes[p] == nil {
 						pr, err := regexp.Compile(`\A` + setDotPrefix(p) + `(?:` + body + `)`)
