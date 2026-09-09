@@ -282,3 +282,105 @@ func goAllMatchesCol(pattern, text string) (string, bool) {
 	}
 	return formatAllMatches(re.FindAllStringIndex(text, -1)), true
 }
+
+// ---------------------------------------------------------------------------
+// Set mode.
+//
+// setcaps has the same blind spot one layer down, and papered over rather than
+// skipped: every non-ASCII input bypasses the live Go oracle and is compared
+// against the corpus's PINNED col4 column instead — gated `find` only, one
+// capability of five. `match_any`, `match_all`, `scan_any`, `scan_all` and
+// overlapping `find` get NO high-byte coverage at all, and a pinned column is
+// a transcript of what was expected once, not an independent oracle.
+//
+// The stated reason is real: the oracle's whole-input probe counts RUNES in its
+// `.{p}` prefix, so on a multi-byte input position p is not the byte offset the
+// module was given.
+//
+// The twin removes that objection. It is pure ASCII, so rune positions and byte
+// positions coincide and the probe means what it says; the module is still
+// driven over the ORIGINAL bytes. It also resolves, rather than papers over,
+// the byte-vs-rune advance on empty matches: Go's rune advance over an ASCII
+// twin IS a byte advance, so the oracle now states the engine's contract
+// instead of contradicting it.
+//
+// A set is driven once per input for ALL its patterns, so the substitute has to
+// be interchangeable with respect to every pattern in the chunk at once — not
+// one, as in the single-pattern path. Where no such byte exists the row falls
+// back to the pinned path, which is why that path stays.
+
+// asciiTwinForPatterns is asciiTwin over a whole set: the substitute must be
+// interchangeable under EVERY pattern's ranges simultaneously.
+func asciiTwinForPatterns(text string, patterns []string) (string, bool) {
+	if !hasHighByte(text) {
+		return text, true
+	}
+	var ranges []byteRange
+	dotNotNL := false
+	for _, pat := range patterns {
+		for i := 0; i < len(pat); i++ {
+			if pat[i] >= 0x80 {
+				return "", false
+			}
+		}
+		rs, dnl, ok := patternByteRanges(pat)
+		if !ok {
+			return "", false
+		}
+		ranges = append(ranges, rs...)
+		dotNotNL = dotNotNL || dnl
+	}
+	var used [256]bool
+	for i := 0; i < len(text); i++ {
+		used[text[i]] = true
+	}
+	mapping := make(map[byte]byte)
+	out := make([]byte, len(text))
+	for i := 0; i < len(text); i++ {
+		b := text[i]
+		if b < 0x80 {
+			out[i] = b
+			continue
+		}
+		sub, seen := mapping[b]
+		if !seen {
+			found := false
+			for _, cand := range twinCandidates {
+				if used[cand] || !interchangeable(cand, b, ranges, dotNotNL) {
+					continue
+				}
+				sub, found = cand, true
+				break
+			}
+			if !found {
+				return "", false
+			}
+			used[sub] = true
+			mapping[b] = sub
+		}
+		out[i] = sub
+	}
+	return string(out), true
+}
+
+// setOracleStrings returns, for each input, the string the ORACLE should be
+// computed over, plus whether the live oracle can serve that row at all.
+//
+// ASCII inputs are their own oracle string. A high-byte input becomes its twin
+// when one exists. Anything else is left to the pinned path.
+func setOracleStrings(pats, strs []string) (oracleStrs []string, live []bool) {
+	oracleStrs = make([]string, len(strs))
+	live = make([]bool, len(strs))
+	for si, s := range strs {
+		if !hasHighByte(s) {
+			oracleStrs[si], live[si] = s, true
+			continue
+		}
+		if twin, ok := asciiTwinForPatterns(s, pats); ok {
+			oracleStrs[si], live[si] = twin, true
+			continue
+		}
+		oracleStrs[si], live[si] = s, false
+	}
+	return oracleStrs, live
+}

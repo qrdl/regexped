@@ -1346,3 +1346,87 @@ regexps
 -;0-1;-;-;0-1,3-4
 -;-;-;-;-
 -;0-1;-;-;0-1,3-4
+# ============================================================
+# Negated classes over input bytes >= 0x80, in a SET.
+#
+# Regression for the Backtracking bug fixed 2026-09-09 (commit ecaaf86): rune
+# ranges were truncated at 0x7F while the DFA saturates at 0xFF, so a negated
+# class stopped matching any byte >= 0x80. Drive with --set-bt to route these
+# members onto BT buckets, which is where the truncation lived; the DFA path
+# exercises the same shapes under the ordinary profiles.
+#
+# `.` and negated classes consuming ONE BYTE is documented byte semantics
+# (docs/engines.md), so `[^>]` must match 0xE9.
+#
+# PINNED, so make_sets leaves it alone: Go regenerating col4 here would write
+# the RUNE-advance answer for these inputs, which is not our contract. The
+# columns below were derived the way the runtime oracle now derives them — Go
+# over an ASCII TWIN of each input, where a byte-for-byte substitution of the
+# high bytes makes rune positions and byte positions coincide. See
+# tools/re2test/highbytes.go.
+# ============================================================
+SetHighByteNegClassPinned
+strings
+""
+"<caf\xe9>"
+"caf\xe9,"
+"KEY=caf\xe9&"
+"a\xe9b"
+"\xe9\xe9"
+"aâb"
+"<cafe>"
+regexps
+"<[^>]+>"
+-;-;-;-;-
+0-6;0-6;-;-;0-6
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-6;0-6;-;-;0-6
+"[^,]+,"
+-;-;-;-;-
+-;-;-;-;-
+0-5;0-5;-;-;0-5
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"KEY=[^&]+&"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-9;0-9;-;-;0-9
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"[^a]+"
+-;-;-;-;-
+-;0-2;-;-;0-2,3-6
+-;0-1;-;-;0-1,2-5
+-;0-5;-;-;0-5,6-9
+-;1-3;-;-;1-3
+0-2;0-2;-;-;0-2
+-;1-4;-;-;1-4
+-;0-2;-;-;0-2,3-6
+"\\S+!"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"[^\\x00]"
+-;-;-;-;-
+-;0-1;-;-;0-1,1-2,2-3,3-4,4-5,5-6
+-;0-1;-;-;0-1,1-2,2-3,3-4,4-5
+-;0-1;-;-;0-1,1-2,2-3,3-4,4-5,5-6,6-7,7-8,8-9
+-;0-1;-;-;0-1,1-2,2-3
+-;0-1;-;-;0-1,1-2
+-;0-1;-;-;0-1,1-2,2-3,3-4
+-;0-1;-;-;0-1,1-2,2-3,3-4,4-5,5-6
