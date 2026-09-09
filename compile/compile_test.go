@@ -1460,27 +1460,68 @@ func TestCmdCompile_ErrorPaths(t *testing.T) {
 // error path in CmdWriteDiagJSON, propagated as `continue` (silently
 // dropping the pattern from the set's diagnostics) — the test plan T38.
 func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
-	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "bad", Pattern: `[`},
-			{Name: "good", Pattern: `foo`},
-		},
-		Sets: []config.SetConfig{
-			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
-		},
-	}
-	dir := t.TempDir()
-	path := filepath.Join(dir, "diag.json")
-	if err := CmdWriteDiagJSON(cfg, "", path); err != nil {
-		t.Fatalf("CmdWriteDiagJSON: %v", err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if !bytes.Contains(data, []byte(`"patterns_total": 2`)) {
-		t.Errorf("diag JSON missing expected patterns_total: %s", data)
-	}
+	// This test asserted the DEFECT until 2026-09-09. It required
+	// CmdWriteDiagJSON to skip an unparseable pattern and write a clean
+	// diagnostics file anyway, while CompileFile treats the same pattern as
+	// FATAL — so a config that cannot build produced a diagnostics file
+	// describing a set with the broken pattern quietly missing from it
+	// (FABLE B23, third mechanism).
+	//
+	// The property is AGREEMENT: whatever the build does with a pattern, the
+	// file describing that build must do the same. Both now fail, with the
+	// same message, because both go through setPatternInfos.
+	t.Run("unbuildable pattern fails BOTH", func(t *testing.T) {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{
+				{Name: "bad", Pattern: `[`},
+				{Name: "good", Pattern: `foo`},
+			},
+			Sets: []config.SetConfig{
+				{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
+			},
+		}
+		_, _, buildErr := CompileFile(cfg, "")
+		if buildErr == nil {
+			t.Fatal("CompileFile accepted an unparseable set member; " +
+				"this case no longer tests the divergence it is named for")
+		}
+		dir := t.TempDir()
+		diagErr := CmdWriteDiagJSON(cfg, "", filepath.Join(dir, "diag.json"))
+		if diagErr == nil {
+			t.Fatal("CmdWriteDiagJSON succeeded where CompileFile failed: a config " +
+				"that cannot build must not produce a clean diagnostics file")
+		}
+		if diagErr.Error() != buildErr.Error() {
+			t.Errorf("diag error %q differs from build error %q; they share "+
+				"setPatternInfos precisely so they cannot diverge", diagErr, buildErr)
+		}
+	})
+
+	// A pattern legitimately DROPPED from a set — capture-bearing members are
+	// excluded by design — must still produce a diagnostics file, and say so.
+	t.Run("capture-bearing pattern is dropped, not fatal", func(t *testing.T) {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{
+				{Name: "caps", Pattern: `(foo)(bar)`, GroupsFunc: "g"},
+				{Name: "good", Pattern: `foo`},
+			},
+			Sets: []config.SetConfig{
+				{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
+			},
+		}
+		dir := t.TempDir()
+		path := filepath.Join(dir, "diag.json")
+		if err := CmdWriteDiagJSON(cfg, "", path); err != nil {
+			t.Fatalf("CmdWriteDiagJSON: %v", err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if !bytes.Contains(data, []byte(`"patterns_total": 2`)) {
+			t.Errorf("diag JSON missing expected patterns_total: %s", data)
+		}
+	})
 }
 
 // TestCompileAutoSelectEngine exercises the `else { engineType =

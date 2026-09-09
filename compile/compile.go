@@ -2756,24 +2756,23 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 				}
 			}
 		}
-		var infos []*PatternInfo
-		var globalIDs []int
 		var droppedRefs []PatternRef
 		for _, idx := range selectedIdx {
 			re := cfg.Regexps[idx]
 			if re.CaptureStubsRequested() {
 				diag.CaptureBearing++
 				droppedRefs = append(droppedRefs, PatternRef{ID: idx, Name: re.Name})
-				continue
 			}
-			info, err := analyzePattern(re, &prefixPool, &suffixPool)
-			if err != nil {
-				continue
-			}
-			info.globalID = idx
-			info.name = re.Name
-			infos = append(infos, info)
-			globalIDs = append(globalIDs, idx)
+		}
+		// setPatternInfos, not a second copy of its loop. This used to
+		// `continue` past an analyzePattern error where CompileFile treats the
+		// same error as FATAL, so a config that cannot build could still
+		// produce a clean-looking diagnostics file describing a set with the
+		// broken pattern quietly missing from it (FABLE B23, third mechanism).
+		// Sharing the function is what stops the two answers drifting again.
+		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+		if err != nil {
+			return err
 		}
 		spec := SetSpec{
 			Name:        sc.Name,

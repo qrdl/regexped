@@ -92,6 +92,16 @@ func parseDataSegments(rawData []byte) []dataSegment {
 			panic(fmt.Sprintf("parseDataSegments: malformed segment size in self-emitted data: %v — invariant violation", err))
 		}
 		off += n
+		// The size field is checked against what REMAINS, not trusted. Every
+		// other malformation here panics with an invariant message naming the
+		// problem; an oversized size was the one that instead sliced out of
+		// range and died with Go's own message, which says nothing about where
+		// the bad bytes came from. Same class as the truncation checks above,
+		// same treatment.
+		if int(size) > len(rawData)-off {
+			panic(fmt.Sprintf("parseDataSegments: segment size %d exceeds the %d bytes remaining in self-emitted data — invariant violation",
+				size, len(rawData)-off))
+		}
 		data := make([]byte, size)
 		copy(data, rawData[off:off+int(size)])
 		off += int(size)

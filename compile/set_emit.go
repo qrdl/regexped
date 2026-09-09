@@ -1134,8 +1134,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 	}
 
-	// Record the frontend actually used (after any fallback to scalar).
-	diag.Frontend = fe.String()
+	// diag.Frontend is recorded at the END of this function, from
+	// emittedFrontend(cs) — `fe` alone is the SELECTED frontend, and the body
+	// can still fall back to scalar when the set has fallback buckets.
 
 	// Member self-loop skip counts, recorded HERE rather than at emission.
 	//
@@ -1569,6 +1570,10 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// an extra entry for it, so --diag-json must still say so.
 		diag.Capabilities = append(diag.Capabilities, "find+batch-find")
 	}
+	// The frontend the module will actually contain, not the one selection
+	// picked — see emittedFrontend. Recorded here rather than at selection
+	// time because it depends on the finished bucket list.
+	diag.Frontend = emittedFrontend(cs).String()
 	return cs
 }
 
@@ -2344,28 +2349,56 @@ func rebuildSetMatchBody(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMe
 // shared, which is the whole point — routing the scan trio through the scalar
 // body cost 17x the fuel on a literal-frontend set.
 func emitSetMatchFnFinal(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemIdx int, mode setCapKind, probeFnBase int) []byte {
-	switch cs.fe {
+	switch emittedFrontend(cs) {
 	case frontendAC:
 		return emitSetMatchFnFinalAC(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
 	case frontendTeddy:
+		return emitSetMatchFnFinalTeddy(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
+	case frontendShufti:
+		return emitSetMatchFnFinalShufti(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+	case frontendPackedPair:
+		return emitSetMatchFnFinalPackedPair(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+	}
+	return emitSetMatchFnFinalScalar(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
+}
+
+// emittedFrontend reports the frontend emitSetMatchFnFinal will ACTUALLY use,
+// which is not always the one selection chose.
+//
+// A fallback bucket has no literal gating it and must be tried at EVERY
+// position, so a prefilter that skips positions cannot serve it and the body
+// falls back to the scalar scan. Selection does not know that — chooseLiteral-
+// Frontend sees only the literals — so `cs.fe` can say Teddy while the emitted
+// body is scalar.
+//
+// This exists because `--diag-json` used to report `cs.fe` and was therefore
+// WRONG for exactly those sets (FABLE B23): it named a frontend the module did
+// not contain. Selection and emission now answer through one function, so they
+// cannot drift apart again.
+//
+// Answers for the VIEW: under phase1Only the fallback buckets belong to phase
+// 2, so hasSetFallbackBuckets reports false and the prefilter stays on.
+// cs.packedPair is nil only if selection and build disagreed; scalar is the
+// safe answer if they ever do.
+func emittedFrontend(cs *compiledSet) frontendKind {
+	switch cs.fe {
+	case frontendAC:
+		return frontendAC
+	case frontendTeddy:
 		if !hasSetFallbackBuckets(cs) {
-			return emitSetMatchFnFinalTeddy(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
+			return frontendTeddy
 		}
 	case frontendShufti:
 		// Selection guarantees no fallback buckets — see set_emit.go gap H.3 block.
 		if !hasSetFallbackBuckets(cs) {
-			return emitSetMatchFnFinalShufti(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+			return frontendShufti
 		}
 	case frontendPackedPair:
-		// Same fallback-bucket rule as Teddy: a fallback pattern must be tried
-		// at every position, so a prefilter that skips positions cannot serve
-		// it. cs.packedPair is nil only if selection and build disagreed;
-		// falling through to scalar is the safe answer if they ever do.
 		if !hasSetFallbackBuckets(cs) && cs.packedPair != nil {
-			return emitSetMatchFnFinalPackedPair(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+			return frontendPackedPair
 		}
 	}
-	return emitSetMatchFnFinalScalar(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
+	return frontendScalar
 }
 
 // hasSetFallbackBuckets reports whether the body being emitted must visit
