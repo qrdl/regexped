@@ -443,6 +443,17 @@ Each pattern is compiled and tested for:
 - Col 1: non-anchored find (LeftmostFirst DFA)
 - Col 5: non-anchored find with captures (with --validate-groups)
 
+**All matches, not just the first (`--all-matches`, on by default in the
+`exhaustive` target).** `re2-exhaustive.txt` carries four columns, so col4 —
+every match — is absent for all ~9.5M of its rows and only the FIRST match of
+each is checked. A pattern whose first match is right and whose later matches
+are wrong passed. That is half of why `\b` could skip every boundary whose
+preceding byte was a word character: a bare `\b` matches at position 0, which
+was always found, and the defect lived entirely in the matches after it. The
+flag synthesises col4 from a Go oracle for rows that lack one — 4.9M rows, for
+about 40% more wall time. No twin is needed for ASCII input, where Go's rune
+semantics already coincide with byte semantics.
+
 **High-byte inputs (`make -C tools/re2test high-bytes`, in `make test`)**
 un-skips the ~259K corpus rows whose INPUT carries a byte above 0x7F. Every
 other target skips them, because the expectation columns are RE2's and RE2

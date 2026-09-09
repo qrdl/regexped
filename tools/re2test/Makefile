@@ -9,8 +9,15 @@ ADJUSTED     := re2-adjusted.txt
 $(TESTDATA): $(TESTDATA_BZ2)
 	bzip2 -dk -c $< > $@
 
+# --all-matches closes the corpus's OTHER blind spot. re2-exhaustive.txt carries
+# four columns, so col4 (every match) is absent and only the FIRST match of each
+# row is ever checked. A pattern whose first match is right and whose later ones
+# are wrong passed — which is half of why `\b` could skip every boundary after a
+# word character, since its first match is at position 0 and was always found.
+# The flag synthesises col4 from a Go oracle for rows that lack one: 4.9M rows,
+# and it costs about 40% more wall time than the bare run.
 exhaustive: $(TESTDATA)
-	go run . $(TESTDATA)
+	go run . --all-matches $(TESTDATA)
 
 custom:
 	# Expectation file vs Go, no WASM involved. Was commented out while its
@@ -52,6 +59,10 @@ force-backtrack: $(ADJUSTED)
 high-bytes: $(ADJUSTED)
 	go run . --high-bytes $(TESTDATA)
 	go run . --high-bytes --validate-groups $(ADJUSTED)
+	# --high-bytes-check-corpus only here: custom-tests.txt's columns are
+	# written for a BYTE engine, so they can be compared with the twin. The
+	# RE2-derived corpora above carry UTF-8 answers that legitimately differ.
+	go run . --high-bytes --high-bytes-check-corpus --validate-groups $(CUSTOM)
 
 # Run every test under LikelyMode=LikelyMatch. Patterns matching the lit-chain
 # shape (literal + counted class) take the Opt 2 emission path; others fall

@@ -239,13 +239,46 @@ func highByteCols(pattern, text string) (col0, col1, col4 string, ok bool) {
 	if loc := re.FindStringIndex(twin); loc != nil {
 		col1 = fmt.Sprintf("%d-%d", loc[0], loc[1])
 	}
-	col4 = "-"
-	if all := re.FindAllStringIndex(twin, -1); len(all) > 0 {
-		parts := make([]string, len(all))
-		for i, p := range all {
-			parts[i] = fmt.Sprintf("%d-%d", p[0], p[1])
-		}
-		col4 = strings.Join(parts, ",")
-	}
+	col4 = formatAllMatches(re.FindAllStringIndex(twin, -1))
 	return col0, col1, col4, true
+}
+
+// formatAllMatches renders Go's FindAll output in the corpus's col4 format.
+func formatAllMatches(all [][]int) string {
+	if len(all) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(all))
+	for i, p := range all {
+		parts[i] = fmt.Sprintf("%d-%d", p[0], p[1])
+	}
+	return strings.Join(parts, ",")
+}
+
+// ---------------------------------------------------------------------------
+// The SECOND blind spot: only the FIRST match is ever checked.
+//
+// re2-exhaustive.txt carries four columns, so col4 — every match — is absent
+// for all ~9.5M of its rows, and col1 checks one match per row. A pattern whose
+// first match is right and whose later matches are wrong passes.
+//
+// That is not hypothetical. It is half of why `` could skip every boundary
+// whose preceding byte was a word character: the first match of a bare `` is
+// at position 0, which was always found, and the defect lived entirely in the
+// matches after it. The high-byte harness only caught it because it SYNTHESISES
+// col4, so it was checking a column the rest of the corpus never had.
+//
+// goAllMatchesCol closes that for the ASCII rows, which is the bulk of the
+// corpus. No twin is needed: for pure-ASCII input Go's rune semantics already
+// coincide with byte semantics, so Go's FindAllStringIndex IS the byte answer.
+// High-byte rows are left to highByteCols, which has to go through a twin.
+func goAllMatchesCol(pattern, text string) (string, bool) {
+	if hasHighByte(text) {
+		return "", false // the twin path owns these
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return "", false // \C and friends: Go cannot serve as oracle
+	}
+	return formatAllMatches(re.FindAllStringIndex(text, -1)), true
 }
