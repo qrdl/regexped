@@ -2947,8 +2947,22 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		wbAcceptWMid := t.hasWordBoundary && t.midAcceptWStates[t.midStartState] != 0
 		wbAcceptNWStart0 := t.hasWordBoundary && t.midAcceptNWStates[t.startState] != 0
 		wbAcceptWStart0 := t.hasWordBoundary && t.midAcceptWStates[t.startState] != 0
+		// midStartWordState (prev=WORD) needs the same two, and not having them
+		// lost real matches. The transitions loop below was already taught about
+		// this state; the EMPTY-WIDTH accept out of it was not, so for a pattern
+		// with no byte-consuming instruction at all — bare `\b` — nothing ever
+		// set a flag for the prev=word context. `\b` over "a b" then reported
+		// boundaries at 0, 2 and 3 and skipped the one at 1, where a word
+		// character is followed by a space.
+		//
+		// Only wholly empty-width patterns were affected: as soon as the pattern
+		// consumes a byte, the transitions loop sets the flags and the answer
+		// comes out right, which is why `\b,` and `\bfoo` were always correct.
+		wbAcceptNWMidWord := t.hasWordBoundary && t.midAcceptNWStates[t.midStartWordState] != 0
+		wbAcceptWMidWord := t.hasWordBoundary && t.midAcceptWStates[t.midStartWordState] != 0
 		if t.midAcceptStates[t.midStartState] != 0 || t.midAcceptStates[t.startState] != 0 || t.acceptStates[t.startState] != 0 ||
-			(wbAcceptNWMid && wbAcceptWMid) || (wbAcceptNWStart0 && wbAcceptWStart0) {
+			(wbAcceptNWMid && wbAcceptWMid) || (wbAcceptNWStart0 && wbAcceptWStart0) ||
+			(wbAcceptNWMidWord && wbAcceptWMidWord) {
 			for b := 0; b < 256; b++ {
 				l.firstByteFlags[b] = 1
 			}
@@ -2976,6 +2990,13 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 					l.firstByteFlags[b] = 1
 				}
 				if wbAcceptNWStart0 && !isWordCharByte(byte(b)) {
+					l.firstByteFlags[b] = 1
+				}
+				// The prev=WORD context, which nothing above covers.
+				if wbAcceptWMidWord && isWordCharByte(byte(b)) {
+					l.firstByteFlags[b] = 1
+				}
+				if wbAcceptNWMidWord && !isWordCharByte(byte(b)) {
 					l.firstByteFlags[b] = 1
 				}
 			}

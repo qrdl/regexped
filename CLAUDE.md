@@ -443,6 +443,25 @@ Each pattern is compiled and tested for:
 - Col 1: non-anchored find (LeftmostFirst DFA)
 - Col 5: non-anchored find with captures (with --validate-groups)
 
+**High-byte inputs (`make -C tools/re2test high-bytes`, in `make test`)**
+un-skips the ~259K corpus rows whose INPUT carries a byte above 0x7F. Every
+other target skips them, because the expectation columns are RE2's and RE2
+decodes UTF-8 while this is a byte engine — for `.` and a negated class the two
+legitimately disagree (`.` over the two bytes of U+0080: RE2 says [0,2), a byte
+engine correctly says [0,1)). This target replaces the columns with a Go oracle
+run on an ASCII TWIN of the input: each distinct high byte is swapped for an
+ASCII byte falling inside exactly the same rune ranges of the pattern, so the
+engine cannot tell the two inputs apart, and the swap is BYTE-for-byte so every
+offset is preserved. `tools/re2test/highbytes.go` carries the argument; the
+substitute pool is control characters because a high byte is outside every
+positive ASCII class, and picking letters instead made `\w` match a twin of
+`±` — the oracle lying rather than the engine failing.
+
+Without this the corpus is blind to high bytes, which is how TWO real bugs
+survived it: Backtracking truncating every rune range at 0x7F (so
+`<([^>]+)>` lost any match over input carrying such a byte), and `\b` skipping
+every boundary whose preceding byte was a word character.
+
 **Set mode (`make setcaps` / `make sets`)** drives EVERY capability over
 the corpus, not just gated `find`: the anchored
 pair, the scan pair at many `offset` values, `find` and its batch entry in both the

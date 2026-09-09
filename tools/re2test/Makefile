@@ -33,6 +33,26 @@ force-backtrack: $(ADJUSTED)
 	go run . --force-backtrack --validate-groups $(ADJUSTED)
 	go run . --force-backtrack --validate-groups $(CUSTOM)
 
+# Corpus inputs carrying a byte above 0x7F, which every other target SKIPS.
+#
+# The skip exists because the expectation columns are RE2's and RE2 decodes
+# UTF-8, while this is a byte engine: for `.` and a negated class the two
+# legitimately disagree, so the columns would report correct behaviour as
+# failure. This target judges those rows against a Go oracle run on an ASCII
+# TWIN of the input instead — see highbytes.go for why that is sound.
+#
+# It found `\b` missing every word boundary whose preceding byte was a word
+# character (337 rows, one root cause, not actually high-byte specific — pure
+# ASCII "a b" failed the same way). Fixed 2026-09-09, and this target has been
+# part of `test` since.
+#
+# Worth knowing what this covers: without it the whole corpus is blind to high
+# bytes, which is how a Backtracking engine that dropped every byte >= 0x80
+# from a rune range stayed green across ~9.5M cases.
+high-bytes: $(ADJUSTED)
+	go run . --high-bytes $(TESTDATA)
+	go run . --high-bytes --validate-groups $(ADJUSTED)
+
 # Run every test under LikelyMode=LikelyMatch. Patterns matching the lit-chain
 # shape (literal + counted class) take the Opt 2 emission path; others fall
 # through to the standard DFA. Confirms LikelyMatch correctness across the
@@ -96,7 +116,7 @@ groupsonly: $(ADJUSTED)
 	go run . --groups-only --validate-groups $(ADJUSTED)
 	go run . --groups-only --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets sets-likely
+test: exhaustive custom adjusted high-bytes force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets sets-likely
 
 # ---------------------------------------------------------------------------
 # Set-capability coverage.

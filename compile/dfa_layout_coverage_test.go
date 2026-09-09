@@ -101,26 +101,57 @@ func TestDFALayoutTeddyTiers(t *testing.T) {
 }
 
 // TestDFALayoutFirstByteFlagsWordContext covers the fast-skip first-byte set
-// for a pattern that can match zero-width at the start state under a word
-// context only. Miss the wbAccept*Start0 unions and the prefix scan never
-// looks at bytes that are valid only in that context — the position-0
-// sibling of the mid-string case.
+// for a pattern that can match zero-width under a word-boundary context.
+//
+// This test asserted the DEFECT until 2026-09-09. It required that ' ' NOT be
+// a candidate first byte for `\b|x+y`, reasoning that "\b cannot fire before it
+// from a non-word context". True, and beside the point: firstByteFlags is ONE
+// table consulted at every position, so it has to be the union over every
+// start context, and from the prev=WORD context `\b` fires before a space
+// exactly as it fires before 'a' from the prev=non-word one.
+//
+// Encoding the narrower claim is what let the emitter ship with the union over
+// midStartWordState missing entirely, so `\b` over "a b" skipped the boundary
+// at position 1 and reported only 0, 2 and 3.
+//
+// For a wholly empty-width boundary pattern the honest answer is that EVERY
+// byte is a candidate — before a word byte from a non-word context, before a
+// non-word byte from a word context — so the prefilter cannot narrow anything
+// and must not pretend to. The narrowing case is a pattern that consumes a
+// byte, which is what the second half below pins.
 func TestDFALayoutFirstByteFlagsWordContext(t *testing.T) {
-	// `\b` alone accepts zero-width at the start state exactly when the next
-	// byte is a word char, so every word byte must be a candidate first byte
-	// while non-word bytes stay out (the `x+y` branch contributes 'x' only).
 	table, layout := dfaLayoutCovBuild(t, `\b|x+y`, dfaLayoutCovFindParams())
 	if !table.hasWordBoundary {
 		t.Fatal(`\b|x+y: expected hasWordBoundary`)
 	}
-	if len(layout.firstBytes) == 256 {
-		t.Fatal(`\b|x+y: all 256 bytes flagged — the zero-width start accept took the "everything" branch, not the per-context union`)
+	// Both directions of the boundary, which is the whole point.
+	if layout.firstByteFlags['a'] == 0 {
+		t.Error(`\b|x+y: word byte 'a' must be a candidate — \b fires before it when the previous byte is not a word char`)
 	}
-	if !isWordCharByte('a') || layout.firstByteFlags['a'] == 0 {
-		t.Error(`\b|x+y: word byte 'a' must be a candidate first byte (\b fires before it at position 0)`)
+	if layout.firstByteFlags[' '] == 0 {
+		t.Error(`\b|x+y: non-word byte ' ' must be a candidate — \b fires before it when the previous byte IS a word char, which is the union that was missing`)
 	}
-	if layout.firstByteFlags[' '] != 0 {
-		t.Error(`\b|x+y: non-word byte ' ' must not be a candidate — \b cannot fire before it from a non-word context`)
+	if layout.firstByteFlags[0xE9] == 0 {
+		t.Error(`\b|x+y: high byte 0xE9 must be a candidate — it is not a word char, so \b fires before it after one`)
+	}
+
+	// A pattern that must CONSUME a byte still narrows: the candidates come
+	// from the transitions out of the start states, not from an empty-width
+	// accept, so the union above must not widen this to everything.
+	// A class start, so there is no literal prefix and the firstByteFlags
+	// path is the one actually exercised.
+	_, narrow := dfaLayoutCovBuild(t, `\b[xy]+`, dfaLayoutCovFindParams())
+	if len(narrow.prefix) != 0 {
+		t.Fatalf(`\b[xy]+: prefix %q is non-empty, so firstByteFlags is never built — case is not testing what it claims`, narrow.prefix)
+	}
+	if narrow.firstByteFlags['x'] == 0 || narrow.firstByteFlags['y'] == 0 {
+		t.Error(`\b[xy]+: 'x' and 'y' must be candidate first bytes`)
+	}
+	if narrow.firstByteFlags[' '] != 0 {
+		t.Error(`\b[xy]+: ' ' must NOT be a candidate — no match can begin at a space`)
+	}
+	if len(narrow.firstBytes) == 256 {
+		t.Error(`\b[xy]+: all 256 bytes flagged; a byte-consuming pattern must still narrow the scan`)
 	}
 }
 
