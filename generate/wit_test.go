@@ -192,3 +192,139 @@ func TestWitStubDispatch(t *testing.T) {
 		t.Errorf("written stub differs from WitText")
 	}
 }
+
+// The naming rules are enforced in ONE place (witParts), so every entry point
+// must report the same failure for the same config — otherwise a caller could
+// slip past a rule by choosing a different door.
+func TestEveryWitEntryPointEnforcesTheSameRules(t *testing.T) {
+	bad := map[string]func(config.BuildConfig) config.BuildConfig{
+		"wit_package": func(c config.BuildConfig) config.BuildConfig {
+			c.WitPackage = "Not_Kebab"
+			return c
+		},
+		"wit_world": func(c config.BuildConfig) config.BuildConfig {
+			c.WitWorld = "Bad World"
+			return c
+		},
+		"match_func": func(c config.BuildConfig) config.BuildConfig {
+			c.Regexps = []config.RegexEntry{{Pattern: "a", MatchFunc: "_bad"}}
+			return c
+		},
+	}
+	for want, mutate := range bad {
+		cfg := mutate(componentCfg())
+		if _, err := WitText(cfg); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("WitText: err = %v, want one naming %s", err, want)
+		}
+		if _, err := witExportNames(cfg); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("witExportNames: err = %v, want one naming %s", err, want)
+		}
+		if _, _, _, err := ComponentArtifacts(cfg); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("ComponentArtifacts: err = %v, want one naming %s", err, want)
+		}
+		if err := witStub(cfg, filepath.Join(t.TempDir(), "o.wit")); err == nil ||
+			!strings.Contains(err.Error(), want) {
+			t.Errorf("witStub: err = %v, want one naming %s", err, want)
+		}
+	}
+	// wit_world is NOT part of any export name, so a bad one must not be
+	// reported by the prefix builder — that would be a rule applied where it
+	// does not belong.
+	cfg := componentCfg()
+	cfg.WitWorld = "Bad World"
+	if _, err := WitInterfacePrefix(cfg); err != nil {
+		t.Errorf("WitInterfacePrefix must not care about wit_world: %v", err)
+	}
+	cfg = componentCfg()
+	cfg.WitPackage = "Not_Kebab"
+	if _, err := WitInterfacePrefix(cfg); err == nil {
+		t.Error("WitInterfacePrefix must reject a bad wit_package")
+	}
+}
+
+// ComponentArtifacts must agree with the individual entry points; it exists to
+// avoid three derivations, not to become a fourth one.
+func TestComponentArtifactsAgreesWithItsParts(t *testing.T) {
+	for _, version := range []string{"", "2.3.0"} {
+		cfg := componentCfg()
+		cfg.WitVersion = version
+		text, names, prefix, err := ComponentArtifacts(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantText, err := WitText(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if text != wantText {
+			t.Errorf("version %q: text differs from WitText", version)
+		}
+		wantPrefix, err := WitInterfacePrefix(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if prefix != wantPrefix {
+			t.Errorf("version %q: prefix %q != %q", version, prefix, wantPrefix)
+		}
+		wantNames, err := witExportNames(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(names) != len(wantNames) {
+			t.Fatalf("version %q: %d names, want %d", version, len(names), len(wantNames))
+		}
+		for k, v := range wantNames {
+			if names[k] != v {
+				t.Errorf("version %q: name[%s] = %q, want %q", version, k, names[k], v)
+			}
+		}
+	}
+}
+
+// `-` streams the WIT, like every other stub type.
+func TestWitStubToStdout(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 1<<16)
+		n, _ := r.Read(buf)
+		done <- string(buf[:n])
+	}()
+	err = witStub(componentCfg(), "-")
+	w.Close()
+	os.Stdout = saved
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := <-done; got != wantWit {
+		t.Errorf("stdout WIT differs from WitText:\n%s", got)
+	}
+}
+
+// An unwritable destination must surface, not be swallowed.
+func TestWitStubWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := witStub(componentCfg(), filepath.Join(blocker, "o.wit")); err == nil {
+		t.Error("want an error writing under a regular file")
+	}
+}
+
+// writeStub's write failure, distinct from its mkdir failure: the parent
+// directory is created fine, and the destination itself is what cannot be
+// written.
+func TestWriteStubWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeStub(dir, []byte("x")); err == nil ||
+		!strings.Contains(err.Error(), "write") {
+		t.Errorf("writing over a directory: err = %v", err)
+	}
+}

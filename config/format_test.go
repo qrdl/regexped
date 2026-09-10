@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -209,5 +211,122 @@ func TestPerRoleValidationUsesEffectiveValue(t *testing.T) {
 	cfg.ImportModule = `a"b`
 	if problems := validateImportModule(&cfg, "c"); len(problems) != 1 {
 		t.Errorf("a quote must still be rejected for c: %v", problems)
+	}
+}
+
+// wit_package and wit_world are as inert under `module` as wit_version, and must
+// warn for the same reason: the user believes they named something.
+func TestWitPackageAndWorldUnderModuleWarn(t *testing.T) {
+	cfg := BuildConfig{ImportModule: "m", WitPackage: "a-b", WitWorld: "c-d"}
+	var warned []string
+	if err := validateFormat(&cfg, func(f string, a ...any) {
+		warned = append(warned, fmt.Sprintf(f, a...))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(warned) != 2 {
+		t.Fatalf("warnings = %v, want one per inert key", warned)
+	}
+	for _, want := range []string{"wit_package", "wit_world"} {
+		found := false
+		for _, w := range warned {
+			if strings.Contains(w, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no warning mentions %s: %v", want, warned)
+		}
+	}
+}
+
+func TestValidateSemverEmptyComponent(t *testing.T) {
+	if err := validateSemver("1..3"); err == nil || !strings.Contains(err.Error(), "empty component") {
+		t.Errorf("err = %v, want the empty-component message", err)
+	}
+	if err := validateSemver(".."); err == nil {
+		t.Error("`..` must be rejected")
+	}
+}
+
+// LoadConfig must apply the per-format stub rule, not just the CLI.
+func TestLoadConfigRejectsStubTypeForFormat(t *testing.T) {
+	_, err := loadCfgSrc(t, "wasm_format: component\nimport_module: m\nstub_type: rust\n"+onePattern)
+	if err == nil || !strings.Contains(err.Error(), "not supported for wasm_format: component yet") {
+		t.Errorf("err = %v", err)
+	}
+	_, err = loadCfgSrc(t, "stub_type: wit\nimport_module: m\n"+onePattern)
+	if err == nil || !strings.Contains(err.Error(), "requires wasm_format: component") {
+		t.Errorf("wit under module: err = %v", err)
+	}
+}
+
+// A `.wit` stub_file infers the type, like every other extension.
+func TestResolveStubTypeInfersWit(t *testing.T) {
+	got, err := ResolveStubType(BuildConfig{StubFile: "out/regexps.wit"})
+	if err != nil || got != "wit" {
+		t.Errorf("ResolveStubType = %q, %v; want wit", got, err)
+	}
+	if _, err := ResolveStubType(BuildConfig{StubFile: "out/regexps.xyz"}); err == nil {
+		t.Error("an unknown extension must not resolve")
+	}
+}
+
+// The c/as branch has nothing to check when no name is set; required-ness is the
+// CLI's business, not this function's.
+func TestValidateImportModuleEmptyNameForCAndAS(t *testing.T) {
+	for _, st := range []string{"c", "as"} {
+		cfg := BuildConfig{StubType: st}
+		if problems := validateImportModule(&cfg, st); len(problems) != 0 {
+			t.Errorf("%s with no name: %v", st, problems)
+		}
+	}
+	// Same for the identifier branch.
+	for _, st := range []string{"rust", "go"} {
+		cfg := BuildConfig{StubType: st}
+		if problems := validateImportModule(&cfg, st); len(problems) != 0 {
+			t.Errorf("%s with no name: %v", st, problems)
+		}
+	}
+	// And a stub type with no rule at all.
+	cfg := BuildConfig{ImportModule: "my-mod", StubType: "js"}
+	if problems := validateImportModule(&cfg, "js"); len(problems) != 0 {
+		t.Errorf("js has no naming rule: %v", problems)
+	}
+}
+
+func TestGoPackageOverride(t *testing.T) {
+	cfg := BuildConfig{ImportModule: "url_ipv6", GoPackage: "urlipv6"}
+	if got := cfg.GoPackageName(); got != "urlipv6" {
+		t.Errorf("GoPackageName = %q, want the override", got)
+	}
+}
+
+// validateWitIdent is reached through several doors; these are the arms the
+// public paths cannot produce.
+func TestValidateWitIdentDirect(t *testing.T) {
+	if err := validateWitIdent(""); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Errorf("empty: %v", err)
+	}
+	if err := validateWitIdent("a$b"); err == nil || !strings.Contains(err.Error(), "cannot appear") {
+		t.Errorf("bad char inside a word: %v", err)
+	}
+	if err := validateWitIdent("a-"); err == nil || !strings.Contains(err.Error(), "empty word") {
+		t.Errorf("trailing hyphen: %v", err)
+	}
+	if err := validateWitIdent("1a"); err == nil || !strings.Contains(err.Error(), "lowercase letter") {
+		t.Errorf("leading digit: %v", err)
+	}
+	if err := validateWitIdent("a-b2"); err != nil {
+		t.Errorf("a valid identifier was rejected: %v", err)
+	}
+}
+
+// PatternSelector rejects a shape it cannot interpret, rather than guessing.
+func TestPatternSelectorUnmarshalError(t *testing.T) {
+	var p PatternSelector
+	want := errors.New("boom")
+	if err := p.UnmarshalYAML(func(any) error { return want }); !errors.Is(err, want) {
+		t.Errorf("err = %v, want it propagated", err)
 	}
 }

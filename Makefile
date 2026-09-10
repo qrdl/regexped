@@ -100,7 +100,7 @@ examples: build
 	$(MAKE) -C examples
 
 unittest:
-	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/...
+	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/... ./component
 	@go tool cover -func=cover.out | grep "total:" | awk '{print "Test coverage: " $$3}'
 	@rm cover.out
 

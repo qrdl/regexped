@@ -124,11 +124,7 @@ func TestComponentKeepsModuleExportsAtTheSameIndices(t *testing.T) {
 // export names the same way CmdCompile does.
 func buildCore(t *testing.T, cfg config.BuildConfig) []byte {
 	t.Helper()
-	names, err := generate.ComponentExportNames(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prefix, err := generate.WitInterfacePrefix(cfg)
+	_, names, prefix, err := generate.ComponentArtifacts(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

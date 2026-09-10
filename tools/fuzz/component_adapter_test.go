@@ -29,13 +29,9 @@ import (
 func componentWasm(t *testing.T, entries []config.RegexEntry, opts compile.CompileOptions) ([]byte, map[string]string) {
 	t.Helper()
 	cfg := config.BuildConfig{WasmFormat: "component", ImportModule: "regexps", Regexps: entries}
-	names, err := generate.ComponentExportNames(cfg)
+	_, names, prefix, err := generate.ComponentArtifacts(cfg)
 	if err != nil {
-		t.Fatalf("export names: %v", err)
-	}
-	prefix, err := generate.WitInterfacePrefix(cfg)
-	if err != nil {
-		t.Fatalf("prefix: %v", err)
+		t.Fatalf("component artifacts: %v", err)
 	}
 	opts.Component = true
 	opts.ComponentPackage = prefix

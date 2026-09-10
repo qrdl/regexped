@@ -29,22 +29,34 @@ type witFunc struct {
 	sig    string
 }
 
+// witParts validates and derives, in ONE place, everything the WIT and the
+// canonical export names are built from. Every caller goes through it, so a
+// naming rule is enforced once and no caller carries an error branch that
+// another caller has already made unreachable.
+func witParts(cfg config.BuildConfig) (pkg, world string, funcs []witFunc, err error) {
+	if pkg, err = cfg.WitPackageName(); err != nil {
+		return "", "", nil, err
+	}
+	if world, err = cfg.WitWorldName(); err != nil {
+		return "", "", nil, err
+	}
+	if funcs, err = witFuncs(cfg); err != nil {
+		return "", "", nil, err
+	}
+	return pkg, world, funcs, nil
+}
+
 // WitText renders the .wit file for cfg.
 func WitText(cfg config.BuildConfig) (string, error) {
-	pkg, err := cfg.WitPackageName()
+	pkg, world, funcs, err := witParts(cfg)
 	if err != nil {
 		return "", err
 	}
-	world, err := cfg.WitWorldName()
-	if err != nil {
-		return "", err
-	}
+	return renderWit(cfg, pkg, world, funcs), nil
+}
 
-	funcs, err := witFuncs(cfg)
-	if err != nil {
-		return "", err
-	}
-
+// renderWit is the text itself, with nothing left to validate.
+func renderWit(cfg config.BuildConfig, pkg, world string, funcs []witFunc) string {
 	var b strings.Builder
 	pkgLine := "package regexped:" + pkg
 	// The version is part of the package name and therefore of every export
@@ -72,7 +84,7 @@ func WitText(cfg config.BuildConfig) (string, error) {
 	b.WriteString("}\n\n")
 
 	fmt.Fprintf(&b, "world %s {\n    export matcher;\n}\n", world)
-	return b.String(), nil
+	return b.String()
 }
 
 // witFuncs maps the config's export names to WIT functions, in config order.
@@ -127,10 +139,21 @@ func witStub(cfg config.BuildConfig, out string) error {
 	return writeStub(out, []byte(text))
 }
 
-// ComponentExportNames is witExportNames for callers outside this package:
-// compile needs exactly this mapping to name its adapter exports.
-func ComponentExportNames(cfg config.BuildConfig) (map[string]string, error) {
-	return witExportNames(cfg)
+// ComponentArtifacts derives everything a component build needs from ONE place:
+// the WIT text, the canonical export name per configured func name, and the
+// interface prefix those names are built from.
+//
+// One call rather than three because the three derivations share every failure
+// mode — an unrepresentable package name, a func name that is not a WIT
+// identifier, two names colliding — so three separate calls would give a caller
+// two error branches that the first call has already made unreachable.
+func ComponentArtifacts(cfg config.BuildConfig) (witText string, exportNames map[string]string, prefix string, err error) {
+	pkg, world, funcs, err := witParts(cfg)
+	if err != nil {
+		return "", nil, "", err
+	}
+	prefix = interfacePrefix(pkg, cfg.WitVersion)
+	return renderWit(cfg, pkg, world, funcs), exportNamesFrom(prefix, funcs), prefix, nil
 }
 
 // witExportNames returns the canonical-ABI export name for each emitted
@@ -140,19 +163,20 @@ func ComponentExportNames(cfg config.BuildConfig) (map[string]string, error) {
 //
 //	regexped:<pkg>[@<ver>]/matcher#<kebab>
 func witExportNames(cfg config.BuildConfig) (map[string]string, error) {
-	prefix, err := WitInterfacePrefix(cfg)
+	pkg, _, funcs, err := witParts(cfg)
 	if err != nil {
 		return nil, err
 	}
-	funcs, err := witFuncs(cfg)
-	if err != nil {
-		return nil, err
-	}
+	return exportNamesFrom(interfacePrefix(pkg, cfg.WitVersion), funcs), nil
+}
+
+// exportNamesFrom keys the canonical name by the config's own func name.
+func exportNamesFrom(prefix string, funcs []witFunc) map[string]string {
 	names := make(map[string]string, len(funcs))
 	for _, f := range funcs {
 		names[f.origin] = prefix + "#" + f.kebab
 	}
-	return names, nil
+	return names
 }
 
 // WitInterfacePrefix is `regexped:<pkg>[@<ver>]/matcher` — everything before
@@ -162,11 +186,18 @@ func WitInterfacePrefix(cfg config.BuildConfig) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return interfacePrefix(pkg, cfg.WitVersion), nil
+}
+
+// interfacePrefix builds the prefix from an ALREADY VALIDATED package name. The
+// version is part of it, and therefore part of every export name — see
+// config.BuildConfig.WitVersion.
+func interfacePrefix(pkg, version string) string {
 	prefix := "regexped:" + pkg
-	if cfg.WitVersion != "" {
-		prefix += "@" + cfg.WitVersion
+	if version != "" {
+		prefix += "@" + version
 	}
-	return prefix + "/matcher", nil
+	return prefix + "/matcher"
 }
 
 // sortedNames is a small helper for deterministic error output in tests.

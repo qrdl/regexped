@@ -28,6 +28,17 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
+// Test seams. The error paths guarded by these are real — a full disk, a revoked
+// permission, a vanished file — but unreachable from a test without indirection,
+// because every one of them acts on a file in a directory the function itself
+// just created. Left as package vars so those paths stay exercised rather than
+// merely written.
+var (
+	writeFile = os.WriteFile
+	readFile  = os.ReadFile
+	statFile  = os.Stat
+)
+
 // resolveWasmTools returns the wasm-tools binary path, in the same lookup order
 // merge uses for wasm-merge: config field → $WASM_TOOLS → $PATH.
 func resolveWasmTools(cfg config.BuildConfig) string {
@@ -63,11 +74,11 @@ func Wrap(cfg config.BuildConfig, core []byte, witText, out string) error {
 	defer os.RemoveAll(dir)
 
 	corePath := filepath.Join(dir, "core.wasm")
-	if err := os.WriteFile(corePath, core, 0o644); err != nil {
+	if err := writeFile(corePath, core, 0o644); err != nil {
 		return fmt.Errorf("write core module: %w", err)
 	}
 	witPath := filepath.Join(dir, "regexped.wit")
-	if err := os.WriteFile(witPath, []byte(witText), 0o644); err != nil {
+	if err := writeFile(witPath, []byte(witText), 0o644); err != nil {
 		return fmt.Errorf("write WIT: %w", err)
 	}
 	embedPath := filepath.Join(dir, "embed.wasm")
@@ -82,7 +93,7 @@ func Wrap(cfg config.BuildConfig, core []byte, witText, out string) error {
 		if err := runTool(tool, "component", "new", embedPath, "-o", tmpOut); err != nil {
 			return fmt.Errorf("wasm-tools component new: %w", err)
 		}
-		data, err := os.ReadFile(tmpOut)
+		data, err := readFile(tmpOut)
 		if err != nil {
 			return fmt.Errorf("read component: %w", err)
 		}

@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"testing"
+
+	"github.com/qrdl/regexped/compile"
+	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/generate"
 )
 
 func writeTemp(t *testing.T, data []byte) string {
@@ -35,4 +39,39 @@ func exportMap(t *testing.T, tool string, wasm []byte) map[string]string {
 		m[match[1]] = match[2]
 	}
 	return m
+}
+
+// artifacts is generate.ComponentArtifacts, wrapped for tests.
+func artifacts(t *testing.T, cfg config.BuildConfig) (string, map[string]string, string, error) {
+	t.Helper()
+	return generate.ComponentArtifacts(cfg)
+}
+
+// realCore builds a core module WITH the component adapters.
+func realCore(t *testing.T, cfg config.BuildConfig) ([]byte, string) {
+	t.Helper()
+	witText, names, prefix, err := generate.ComponentArtifacts(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, _, err := compile.Compile(cfg.Regexps, 0, true, compile.CompileOptions{
+		Component:            true,
+		ComponentPackage:     prefix,
+		ComponentExportNames: names,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return core, witText
+}
+
+// plainCore builds the same patterns WITHOUT adapters: valid WASM that
+// `component new` has nothing to lift from.
+func plainCore(t *testing.T, cfg config.BuildConfig) []byte {
+	t.Helper()
+	core, _, err := compile.Compile(cfg.Regexps, 0, true, compile.CompileOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return core
 }

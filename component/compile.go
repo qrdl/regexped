@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
@@ -25,15 +24,7 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	if !cfg.Component() {
 		return fmt.Errorf("component.CmdCompile called for wasm_format: %q", cfg.WasmFormat)
 	}
-	witText, err := generate.WitText(cfg)
-	if err != nil {
-		return err
-	}
-	names, err := generate.ComponentExportNames(cfg)
-	if err != nil {
-		return err
-	}
-	prefix, err := generate.WitInterfacePrefix(cfg)
+	witText, names, prefix, err := generate.ComponentArtifacts(cfg)
 	if err != nil {
 		return err
 	}
@@ -74,10 +65,10 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	// bindgen! all need the interface text, and a component does not hand it
 	// over in a form they take.
 	witPath := WitPathFor(output)
-	if err := os.WriteFile(witPath, []byte(witText), 0o644); err != nil {
+	if err := writeFile(witPath, []byte(witText), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", witPath, err)
 	}
-	info, err := os.Stat(output)
+	info, err := statFile(output)
 	if err != nil {
 		return fmt.Errorf("stat output: %w", err)
 	}
