@@ -139,6 +139,25 @@ func witStub(cfg config.BuildConfig, out string) error {
 	return writeStub(out, []byte(text))
 }
 
+// componentKebabNames maps each configured func name to its WIT (kebab)
+// identifier — the name a WASM import_name must carry verbatim.
+func componentKebabNames(cfg config.BuildConfig) (map[string]string, error) {
+	out := map[string]string{}
+	for _, re := range cfg.Regexps {
+		for _, n := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc} {
+			if n == "" {
+				continue
+			}
+			kebab, err := config.KebabIdent(n)
+			if err != nil {
+				return nil, err
+			}
+			out[n] = kebab
+		}
+	}
+	return out, nil
+}
+
 // ComponentArtifacts derives everything a component build needs from ONE place:
 // the WIT text, the canonical export name per configured func name, and the
 // interface prefix those names are built from.
@@ -193,11 +212,18 @@ func WitInterfacePrefix(cfg config.BuildConfig) (string, error) {
 // version is part of it, and therefore part of every export name — see
 // config.BuildConfig.WitVersion.
 func interfacePrefix(pkg, version string) string {
-	prefix := "regexped:" + pkg
+	// The version sits AFTER the interface name, not after the package:
+	//   regexped:secrets/matcher@2.3.0        correct
+	//   regexped:secrets@2.3.0/matcher        REJECTED by wasm-tools with
+	//                                         "failed to find export of interface"
+	// This was wrong when wit_version shipped, and the unit test asserted the
+	// wrong form too, so nothing caught it until a versioned component was
+	// actually built. §3.1's proof-of-concept had it right all along.
+	prefix := "regexped:" + pkg + "/matcher"
 	if version != "" {
 		prefix += "@" + version
 	}
-	return prefix + "/matcher"
+	return prefix
 }
 
 // sortedNames is a small helper for deterministic error output in tests.

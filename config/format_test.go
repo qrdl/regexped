@@ -154,13 +154,14 @@ func TestWitVersionUnderModuleWarnsAndProceeds(t *testing.T) {
 // later phase, and go/as are never coming.
 func TestStubTypeForFormat(t *testing.T) {
 	component := &BuildConfig{WasmFormat: "component", ImportModule: "regexps"}
-	for _, st := range []string{"rust", "js", "ts", "c"} {
-		err := validateStubTypeForFormat(component, st)
-		if err == nil || !strings.HasSuffix(err.Error(), "yet") {
-			t.Errorf("stub %s under component: err = %v, want one ending in \"yet\"", st, err)
+	for _, st := range []string{"rust", "c", "wit"} {
+		if err := validateStubTypeForFormat(component, st); err != nil {
+			t.Errorf("%s is a supported component stub type: %v", st, err)
 		}
 	}
-	for _, st := range []string{"go", "as"} {
+	// js and ts sit with go and as: no JS runtime loads a component, and the
+	// module format already serves a JS user without a transpiler.
+	for _, st := range []string{"go", "as", "js", "ts"} {
 		err := validateStubTypeForFormat(component, st)
 		if err == nil {
 			t.Fatalf("stub %s under component: want an error", st)
@@ -251,12 +252,23 @@ func TestValidateSemverEmptyComponent(t *testing.T) {
 
 // LoadConfig must apply the per-format stub rule, not just the CLI.
 func TestLoadConfigRejectsStubTypeForFormat(t *testing.T) {
-	_, err := loadCfgSrc(t, "wasm_format: component\nimport_module: m\nstub_type: rust\n"+onePattern)
-	if err == nil || !strings.Contains(err.Error(), "not supported for wasm_format: component yet") {
-		t.Errorf("err = %v", err)
+	for _, st := range []string{"rust", "c"} {
+		if _, err := loadCfgSrc(t, "wasm_format: component\nimport_module: m\nstub_type: "+st+"\n"+onePattern); err != nil {
+			t.Errorf("%s under component must load: %v", st, err)
+		}
 	}
-	_, err = loadCfgSrc(t, "stub_type: wit\nimport_module: m\n"+onePattern)
-	if err == nil || !strings.Contains(err.Error(), "requires wasm_format: component") {
+	// js/ts/go/as remain permanent refusals.
+	for _, st := range []string{"js", "ts", "go", "as"} {
+		_, err := loadCfgSrc(t, "wasm_format: component\nimport_module: m\nstub_type: "+st+"\n"+onePattern)
+		if err == nil || !strings.Contains(err.Error(), "is not supported for wasm_format: component") {
+			t.Errorf("%s under component: err = %v", st, err)
+		}
+		if err != nil && strings.HasSuffix(err.Error(), "yet") {
+			t.Errorf("%s must not be described as temporary: %v", st, err)
+		}
+	}
+	if _, err := loadCfgSrc(t, "stub_type: wit\nimport_module: m\n"+onePattern); err == nil ||
+		!strings.Contains(err.Error(), "requires wasm_format: component") {
 		t.Errorf("wit under module: err = %v", err)
 	}
 }

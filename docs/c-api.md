@@ -4,7 +4,7 @@ Regexped generates a pair of C stub files (`.h` and `.c`) that declare and imple
 wrapper functions for compiled WASM regexp modules. No libc or sysroot is required;
 the stubs compile cleanly with `--target=wasm32-wasi -nostdlib`.
 
-> **Component format:** these stubs are for `wasm_format: module`. Under `wasm_format: component`, `stub_type: c` is refused for now; a component consumer generates bindings from the emitted `.wit` instead. See [component.md](component.md).
+> **Component format:** `stub_type: c` works under `wasm_format: component` too, and the **API is identical** — the same `rx_match_t`, `rx_group_t`, caller-owned iterators and group-index constants — because the header is produced by the same generator. What differs is the `.c`: canonical-ABI imports with a caller-supplied return area instead of a packed `long long`, plus a `cabi_realloc` when a pattern exports groups (a returned list is allocated in *your* memory). A `wit/` directory is generated beside the stub for `wasm-tools component embed`. See [component.md](component.md).
 
 ## Including stubs in your project
 
@@ -28,6 +28,97 @@ Include only the header in your application code:
 ```
 
 ---
+
+## Building for the component format
+
+Under `wasm_format: component` the API below is unchanged — same `rx_match_t`,
+`rx_group_t`, caller-owned `_init`/`_next` iterators and group-index constants,
+because the header is produced by the same generator. `main.c` compiles unchanged.
+
+`regexped generate` emits **three** things under this format:
+
+```
+stub.h  stub.c  wit/          <- wit/consumer.wit + wit/deps/<pkg>/matcher.wit
+```
+
+There are **two routes** to a component, differing only in when the wrapping
+happens and therefore in which tools you need. Both produce the same artefact.
+
+### Route 1 — wasip1, wrap after linking
+
+```sh
+regexped compile
+regexped generate
+clang --target=wasm32-wasi -nostdlib -Wl,--no-entry -o core.wasm main.c stub.c
+wasm-tools component embed wit core.wasm --world <name>-consumer -o embedded.wasm
+wasm-tools component new embedded.wasm -o guest.wasm
+wac plug guest.wasm --plug regexps.wasm -o composed.wasm
+```
+
+Needs `wasm-tools` and `wac`. Add
+`--adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm` to
+`component new` **if your program uses preview1 WASI imports directly** (`_start`,
+`fd_write`, `args_get`); a component that exports a plain function instead needs no
+adapter. The adapter ships in the `wasi-preview1-component-adapter-provider` crate.
+
+Note `component embed` takes the `wit` **directory**, not one file — that is how it
+resolves `deps/`.
+
+### Route 2 — wasip2, wrap at link time
+
+```sh
+wit-bindgen c wit --out-dir wb          # for ONE file: the component-type object
+clang --target=wasm32-wasip2 -nostdlib -Wl,--no-entry \
+      -o guest.wasm main.c stub.c wb/*_component_type.o
+wac plug guest.wasm --plug regexps.wasm -o composed.wasm
+```
+
+Fewer steps: clang wraps into a component itself, so there is no `embed`, no
+`component new` and no adapter flag — `wasm-component-ld` bundles the adapter.
+Needs `wit-bindgen` and `wasm-component-ld` (rustup ships the latter inside the
+toolchain rather than on PATH).
+
+Discard wit-bindgen's `.c` and `.h`: only the object is linked, and the bindings
+come from regexped's stub. The object exists because this route needs the
+component-type metadata *in the objects before the linker runs*, which regexped
+cannot emit — that is the whole reason route 1 exists.
+
+The generated stub is byte-identical between the two routes. Nothing in regexped's
+output chooses one; your build does.
+
+`examples/wasmtime/c/url-parts` implements all three builds — module, route 1 and
+route 2 — from one unchanged `main.c`.
+
+### `cabi_realloc` and its heap
+
+When a pattern exports groups, the stub also defines `cabi_realloc`. The canonical
+ABI allocates a returned `list` in *your* component's memory, so something must
+provide it.
+
+Three things to know about the one you get:
+
+- it is the **whole component's** allocator, not the stub's private scratch — the
+  wasip1 adapter calls it too. The generated wrappers therefore save and restore a
+  bump mark around their own call instead of resetting it;
+- its size is `REGEXPED_CABI_HEAP_BYTES`, **256 KB** by default, chosen by
+  measurement because the adapter's stack takes the bulk of it. Define it smaller
+  for a component that pulls in no adapter;
+- it is **weak**, so your own `cabi_realloc` wins if you have one.
+
+It traps rather than overruns, so too small a heap fails loudly.
+
+### The consumer world needs your exports
+
+`wit/consumer.wit` arrives with the import declared and nothing exported:
+
+```wit
+world <name>-consumer {
+    import regexped:<pkg>/matcher;
+}
+```
+
+Add your own exports to it. A component with no exports can be composed but not
+run.
 
 ## Shared types
 

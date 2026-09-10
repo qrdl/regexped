@@ -1,12 +1,12 @@
 # secrets — credential detection via a WASM **component**
 
 Searches text for three types of leaked credentials using three independent DFA
-find-mode patterns, compiled into a single **Component Model component** with a
-generated WIT interface.
+find-mode patterns, compiled into a single **Component Model component** and
+consumed through a **regexped-generated Rust stub**.
 
 This is the component-format example. Every other Rust example here uses the
-default module format — `regexped generate` for FFI stubs, then `wasm-merge` —
-and `../url-ipv6` is the one to read for that.
+default module format — `wasm-merge` instead of `wac` — and `../url-ipv6` is the
+one to read for that.
 
 | Pattern | Example match |
 |---|---|
@@ -14,13 +14,37 @@ and `../url-ipv6` is the one to read for that.
 | JWT | `eyJ...eyJ...` (three base64url parts) |
 | AWS access key | `AKIA` + 16 uppercase alphanumeric |
 
+## The point of this example: the API does not change
+
+`main.rs` here differs from the module-format version that preceded it by the
+module NAME and one comment. Nothing else:
+
+```
+< fn run() -> regexps::Result<()> {
+> fn run() -> secrets::Result<()> {
+```
+
+Same iterators, same `?` on the overflow error, same call signatures. Switching
+`wasm_format` does not touch calling code — that is what the generated component
+stub exists to guarantee, and it is checkable with `diff`.
+
+What the stub spares you is not just typing. It carries two rules a hand-written
+loop gets wrong: the advance rule that stops a zero-length match spinning
+forever, and **Go's adjacent-empty rule**, which suppresses an empty match
+beginning exactly where the previous one ended. Without the second, `(a?)` over
+`"ab"` yields three matches through a component and two through every other
+regexped stub.
+
 ## Prerequisites
 
 - `regexped` binary (run `make` in the repo root)
-- Rust (a **native** toolchain — no `wasm32-wasip1` target needed here; the host
-  embeds wasmtime rather than being compiled to WASM itself)
+- Rust with the wasip2 target: `rustup target add wasm32-wasip2`
+  (no `cargo-component` needed — wasip2 emits a component directly)
 - [wasm-tools](https://github.com/bytecodealliance/wasm-tools) — `regexped
   compile` shells out to it to wrap the core module into a component
+- [wac](https://github.com/bytecodealliance/wac) — composes this guest with the
+  regexp component, the way `wasm-merge` links a module build
+- [wasmtime](https://wasmtime.dev)
 
 ## Run
 
@@ -42,43 +66,34 @@ AWS key at 25..45: AKIAIOSFODNN7EXAMPLE
 
 ## Build pipeline
 
-Three steps rather than the module format's five — there is no stub generation
-and no merge:
+Four steps, against the module format's four — `generate` and `compile` are the
+same, `wac plug` replaces `wasm-merge`, and there is no host/guest merge of
+memories because the component owns its own:
 
 ```
 regexped compile   →  secrets.wasm (a component) + secrets.wit (its interface)
-cargo build        →  native host; bindgen! reads secrets.wit at COMPILE time
-./target/release/secrets  →  execute
+regexped generate  →  stubs.rs
+cargo build --target wasm32-wasip2  →  the consumer, itself a component
+wac plug           →  composed.wasm, with the import satisfied
+wasmtime run       →  execute
 ```
 
-Because `bindgen!` reads the WIT while the host compiles, an interface that no
-longer matches is a build error rather than a runtime surprise.
+Until `wac plug` runs, the guest has an unsatisfied import and will not
+instantiate. That is the component-model analogue of forgetting `regexped merge`.
 
 ## What is worth reading in the source
 
-**`regexped.yaml`** — `wasm_format: component`, and the absence of two keys the
-module examples need: no `output:` (that is the wasm-merge target, and a
-component owns its own memory) and no `stub_file:` (the host binds against the
-WIT). `import_module: "secrets"` names the WIT package and the world.
+**`regexped.yaml`** — `wasm_format: component`, and the absence of `output:`
+(that is the wasm-merge target, and a component owns its memory). `stub_file:`
+IS set, unlike a WIT-only consumer that binds against the `.wit` itself.
 
-**`main.rs`** — two things the module format hides:
+**`Cargo.toml`** — one dependency, `wit-bindgen`. This is the one place build
+parity does not hold: a component consumer cannot declare its imports by hand,
+because `wasm32-wasip2` requires component-type metadata that only a binding
+generator embeds. The generated stub carries that macro and hides it behind the
+same API as the module stub.
 
-*The host owns the iteration.* `find` answers ONE match, so there is no generated
-`FindIter`; the loop, and the advance rule that keeps it terminating over a
-zero-length match, are written out:
-
-```rust
-start = if span.1 > span.0 { span.1 } else { span.0 + 1 };
-```
-
-The whole input is passed on every call, deliberately: `\b`, `\B` and `(?m:^)`
-are judged against the real preceding byte, so slicing would change the answer at
-the seam.
-
-*"I don't know" is in the type.* A Backtracking pattern that exhausts its frame
-budget yields `Err(ErrorCode::BacktrackOverflow)`, which is **not** "no secrets
-found" — the engine abandoned part of the search space. For a credential scanner
-that distinction is the whole point, so the example exits non-zero rather than
-printing a clean bill of health.
+**`stubs.rs`** — generated; read the top of it to see the inline WIT and the
+`pub mod` wrapper. Regenerated by `regexped generate`, so it is gitignored.
 
 See [../../../../docs/component.md](../../../../docs/component.md).

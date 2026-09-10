@@ -81,11 +81,13 @@ See [docker.md](docker.md) for full Docker usage and workflow examples.
 
 ## Examples
 
-Examples are available for the following environments: wasmtime, Node.js, Cloudflare Workers, FastEdge, browser.
+Examples are available for the following environments: wasmtime, native Rust host, Node.js, Cloudflare Workers, FastEdge, browser.
 
 Languages: Rust, Go, C, JavaScript, TypeScript, AssemblyScript.
 
-See [`examples/README.md`](../examples/README.md) for more details.
+Most build a core WASM module. **[`wasmtime/rust/secrets`](../examples/wasmtime/rust/secrets) 🧩** builds a **Component Model component** instead, consumed through a generated Rust stub and composed with `wac` — see [component.md](component.md).
+
+See [`examples/README.md`](../examples/README.md) for more details, including which format each example builds.
 
 ## Performance
 
@@ -110,7 +112,7 @@ See [`examples/README.md`](../examples/README.md) for more details.
 ## Limitations
 
 - **No Unicode support** — patterns and input are treated as raw bytes (Latin-1/ASCII). Unicode character classes (`\p{L}`, `\p{N}`, etc.), Unicode case folding, and multi-byte Unicode literals are not supported.
-- **Component Model support is partial** — `wasm_format: component` produces a component with a WIT interface for single patterns (`match_func`, `find_func`, `groups_func`). Not yet covered: pattern **sets**, and generated **stubs** for the component format — a component host binds against the generated `.wit` instead. Go and AssemblyScript are not component targets at all. See [component.md](component.md).
+- **Component Model support is partial** — `wasm_format: component` produces a component with a WIT interface for single patterns (`match_func`, `find_func`, `groups_func`), with generated **Rust and C** stubs whose API is identical to the module-format ones. Not covered: pattern **sets**; and Go, AssemblyScript, JavaScript and TypeScript are not component targets — for JS/TS because no runtime loads a component natively, so the module format already serves them better. See [component.md](component.md).
 - **Not thread-safe** — the C, JS, TS, and AS stubs are not safe for concurrent use. Only the Rust and Go stubs are thread-safe.
 
 ## Dependencies

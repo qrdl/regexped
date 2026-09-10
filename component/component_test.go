@@ -414,3 +414,44 @@ func TestUnreachableIOFailuresAreHandled(t *testing.T) {
 		}
 	})
 }
+
+// A VERSIONED component must actually wrap, not merely produce plausible-looking
+// export names. `wit_version` shipped broken because the only test was a string
+// assertion that agreed with the bug: the version was emitted as
+// `regexped:pkg@2.3.0/matcher` when wasm-tools wants
+// `regexped:pkg/matcher@2.3.0`, and `component new` failed with "failed to find
+// export of interface". Nothing caught it until a versioned component was built.
+// So this test builds one.
+func TestCmdCompileVersionedComponent(t *testing.T) {
+	tool := needWasmTools(t)
+	cfg := findCfg("secrets")
+	cfg.WitVersion = "2.3.0"
+	out := filepath.Join(t.TempDir(), "secrets.wasm")
+	if err := CmdCompile(cfg, out, nil); err != nil {
+		t.Fatalf("a versioned component must build: %v", err)
+	}
+	if out, err := exec.Command(tool, "validate", out).CombinedOutput(); err != nil {
+		t.Fatalf("wasm-tools rejected the versioned component: %v\n%s", err, out)
+	}
+	printed, err := exec.Command(tool, "component", "wit", out).CombinedOutput()
+	if err != nil {
+		t.Fatalf("component wit: %v\n%s", err, printed)
+	}
+	// The version belongs on the exported interface AND on the package.
+	for _, want := range []string{
+		"export regexped:secrets/matcher@2.3.0;",
+		"package regexped:secrets@2.3.0",
+	} {
+		if !strings.Contains(string(printed), want) {
+			t.Errorf("missing %q in:\n%s", want, printed)
+		}
+	}
+	// And the sibling .wit must be the versioned one.
+	witBytes, err := os.ReadFile(WitPathFor(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(witBytes), "package regexped:secrets@2.3.0;") {
+		t.Errorf("sibling .wit is not versioned:\n%s", witBytes)
+	}
+}

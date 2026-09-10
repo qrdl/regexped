@@ -2,7 +2,7 @@
 
 Regexped generates a JavaScript ES module stub that loads a compiled WASM regexp module and exports wrapper functions. This document explains how to initialise the module and use the generated functions.
 
-> **Component format:** this stub is for `wasm_format: module`. Under `wasm_format: component`, `stub_type: js` is refused for now; transpile the component with `jco` instead. See [component.md](component.md).
+> **Component format:** this stub is for `wasm_format: module`, and there is no component equivalent — `stub_type: js` is refused permanently under `wasm_format: component`. No JavaScript runtime loads a component (`WebAssembly.instantiate` accepts core modules only), so consuming one from JS needs `jco transpile`, whose output is a core module plus glue — which is what this stub already gives you directly, without the extra tool. See [component.md](component.md).
 
 ## Including stubs in your project
 

@@ -83,12 +83,24 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 // validateStubTypeForFormat rejects the stub types that cannot be generated
 // for the configured output kind.
 //
-// TWO different messages, deliberately. `rust`/`js`/`ts`/`c` say "yet",
-// because their FFI/import shape simply cannot link against a component and a
-// later phase replaces the error with a real generator. `go` and `as` say no
-// such thing: neither is a component target. Stock Go has no wasip2 target so
-// a component stub would have to be TinyGo, which may come later;
-// AssemblyScript has no planned route at all.
+// TWO different messages, deliberately.
+//
+// `rust` and `c` are SUPPORTED as of 2026-09-10 — see
+// generate/rust_component_stub.go and generate/c_component_stub.go. They reach
+// the metadata a component consumer needs by different routes, because their
+// builds differ: Rust links the component in one step and needs the metadata
+// present, so its stub carries `wit_bindgen::generate!`; C builds a plain core
+// module, so the metadata is attached afterwards by `wasm-tools component embed`
+// and its stub needs no third-party dependency at all.
+//
+// `go`, `as`, `js` and `ts` say no such thing, because none of them is a
+// component target. Stock Go has no wasip2 target, so a Go component stub would
+// have to be TinyGo — possible later. AssemblyScript has no planned route. JS
+// and TS are excluded on VALUE rather than feasibility: no JavaScript runtime
+// loads a component (`WebAssembly.instantiate` implements the core module
+// format only), so a transpiler is mandatory, and `jco transpile` produces a
+// core module plus glue — which is exactly where `wasm_format: module` starts.
+// A JS user would pay a tool and a build step to arrive where they already are.
 func validateStubTypeForFormat(cfg *BuildConfig, stubType string) error {
 	if !cfg.Component() {
 		if stubType == "wit" {
@@ -97,9 +109,9 @@ func validateStubTypeForFormat(cfg *BuildConfig, stubType string) error {
 		return nil
 	}
 	switch stubType {
-	case "wit":
+	case "wit", "rust", "c":
 		return nil
-	case "go", "as":
+	case "go", "as", "js", "ts":
 		return fmt.Errorf("stub type %s is not supported for wasm_format: %s", stubType, formatComponent)
 	default:
 		return fmt.Errorf("stub type %s is not supported for wasm_format: %s yet", stubType, formatComponent)

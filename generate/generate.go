@@ -30,6 +30,11 @@ func CmdGenerateStub(cfg config.BuildConfig, out string) error {
 	}
 	switch stubType {
 	case "rust":
+		// The component stub has the same public API and a different body; see
+		// generate/rust_component_stub.go.
+		if cfg.Component() {
+			return rustComponentStub(cfg, out)
+		}
 		return rustStub(cfg, out)
 	case "js":
 		return jsStub(cfg, out)
@@ -38,6 +43,9 @@ func CmdGenerateStub(cfg config.BuildConfig, out string) error {
 	case "go":
 		return goStub(cfg, out)
 	case "c":
+		if cfg.Component() {
+			return cComponentStub(cfg, out)
+		}
 		return cStub(cfg, out)
 	case "as":
 		return asStub(cfg, out)

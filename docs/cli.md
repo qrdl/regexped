@@ -334,9 +334,11 @@ Generates a stub file (Rust, JS, TypeScript, Go, C, AssemblyScript, or WIT) from
 | `wasm_format` | Accepted | Refused |
 |---|---|---|
 | `module` (default) | `rust`, `js`, `ts`, `go`, `c`, `as` | `wit` — "stub_type \"wit\" requires wasm_format: component" |
-| `component` | `wit` | `rust`, `js`, `ts`, `c` — "… is not supported for wasm_format: component **yet**" (a later phase adds them); `go`, `as` — the same message *without* "yet": neither is a component target. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route. |
+| `component` | `wit`, `rust`, `c` | `go`, `as`, `js`, `ts` — "… is not supported for wasm_format: component", with no "yet": none is a component target. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route; and no JavaScript runtime loads a component, so a JS/TS consumer needs `jco transpile`, which lands on the core module the `module` format already produces. |
 
-A component host binds against the generated `.wit` — with `wasmtime::component::bindgen!`, `wit-bindgen`, or `jco transpile` — rather than against a generated FFI stub.
+Under `component`, `stub_type: rust` and `stub_type: c` generate stubs whose public API is identical to the module-format ones; `wit` emits the interface alone, for a consumer that binds against it directly (a host using `wasmtime::component::bindgen!`, for instance).
+
+The C stub additionally writes a `wit/` directory beside itself — `wasm-tools component embed` resolves `deps/` only when given that directory.
 
 > **Note:** AssemblyScript source files use the `.ts` extension (same as TypeScript). Set `stub_type: "as"` explicitly — extension-based inference always resolves `.ts` to the TypeScript ES module stub.
 

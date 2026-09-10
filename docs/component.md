@@ -135,22 +135,84 @@ match matcher.call_find_github_token(&mut store, input, 0)? {
 }
 ```
 
-A complete example is `examples/wasmtime/rust/secrets`.
+That is the **WIT-only** route: `stub_type` unset, no generated stub, the host
+binding for itself. It stays supported, and it is the right route for a host.
 
-### You own the iteration
+### Rust guest, with a generated stub
 
-`find` reports **one** match. The module-format stubs wrap that in a `FindIter` /
-`iter.Seq2` / generator; a component has no such wrapper in this phase, so the
-host writes the loop — including the rule that makes it terminate:
+The route to prefer when your own code is compiled to WASM. `stub_type: rust`
+under `component` produces a stub whose **public API is identical** to the
+module-format one, so calling code does not change:
 
 ```rust
-let mut start = 0;
-while let Ok(Some((s, e))) = matcher.call_find_x(&mut store, input, start)? {
-    // ... use the match ...
-    start = if e > s { e } else { s + 1 };   // an empty match must still advance
-    if start as usize > input.len() { break; }
+include!("stubs.rs");
+
+for m in secrets::find_github_token(input, 0) {
+    let (start, end) = m?;          // Err is BacktrackOverflow, not "no match"
+    println!("{start}..{end}");
 }
 ```
+
+The build differs, not the API:
+
+```sh
+regexped compile          # component + sibling .wit
+regexped generate         # stubs.rs
+cargo build --target wasm32-wasip2       # your code, itself a component
+wac plug your.wasm --plug regexps.wasm -o composed.wasm
+wasmtime run composed.wasm
+```
+
+Your `Cargo.toml` needs `wit-bindgen`. That is the one place parity does not
+hold, and it is not a choice: `wasm32-wasip2` refuses a hand-written import,
+because a component consumer needs component-type metadata that only a binding
+generator embeds. The generated stub carries that macro and hides it behind the
+familiar API. Until `wac plug` runs, the guest has an unsatisfied import and will
+not instantiate — the analogue of forgetting `regexped merge`.
+
+`examples/wasmtime/rust/secrets` 🧩 is this route end to end.
+
+### C guest, with a generated stub
+
+Same API as the module-format C stub — `rx_match_t`, `rx_group_t`, caller-owned
+`_init`/`_next` iterators, group-index constants — because the header comes from
+the same generator. And unlike Rust, **no third-party dependency**: C builds a
+plain core module, so the component metadata is attached afterwards.
+
+```sh
+regexped compile          # component + sibling .wit
+regexped generate         # stub.h, stub.c, and a wit/ directory
+clang --target=wasm32-wasi -nostdlib -Wl,--no-entry -o core.wasm your.c stub.c
+wasm-tools component embed wit core.wasm --world <name>-consumer -o embedded.wasm
+wasm-tools component new embedded.wasm -o guest.wasm
+wac plug guest.wasm --plug regexps.wasm -o composed.wasm
+```
+
+Two things to know:
+
+- **Add your own exports** to the generated `wit/consumer.wit`. It arrives with
+  the import declared and nothing exported, and a component with no exports can
+  be composed but not run.
+- **`component embed` needs the `wit` DIRECTORY**, not one file: that is how it
+  finds `deps/`.
+
+If a pattern exports groups, the stub also defines `cabi_realloc`, because the
+canonical ABI allocates a returned list in *your* memory. It is a bump allocator
+reset per call, sized by `REGEXPED_CABI_HEAP_BYTES` (8 KB default) — raise that
+if a pattern has a very large number of groups.
+
+### Iteration, and the rule a hand-written loop gets wrong
+
+`find` reports **one** match, so something has to drive it. The generated stubs
+do, and they carry two rules worth knowing about if you ever write the loop
+yourself — as a WIT-only host must:
+
+- **the advance rule** — `start = if end > start { end } else { start + 1 }`;
+  without the second arm a zero-length match spins for ever;
+- **Go's adjacent-empty rule** — an empty match beginning exactly where the
+  previous REPORTED match ended is suppressed. Omit it and `(a?)` over `"ab"`
+  gives you `(0,1),(1,1),(2,2)` where every regexped stub gives `(0,1),(2,2)`.
+  Same pattern, same input, different answers.
 
 Passing the **whole** input every time is not an inefficiency to optimise away:
 `\b`, `\B` and `(?m:^)` are judged against the real preceding byte, so a sliced
@@ -159,8 +221,14 @@ input would silently change the answer at the seam.
 ### Other languages
 
 `wit-bindgen` generates **guest** bindings — code for a component that
-*implements* an interface — so it is not what a host uses. For a JavaScript host,
-`jco transpile secrets.wasm`.
+*implements* an interface — so it is not what a host uses.
+
+For a **JavaScript or TypeScript** consumer, prefer `wasm_format: module` and the
+generated JS/TS stub. A component can be consumed from JS only through
+`jco transpile`, which emits a core module plus canonical-ABI glue — the core
+module being exactly what the `module` format produces directly, so the component
+route costs an extra tool and build step to arrive at the same place. `stub_type:
+js`/`ts` is therefore refused under `component`.
 
 ## Costs
 
@@ -178,8 +246,7 @@ input would silently change the answer at the seam.
 | | Status |
 |---|---|
 | Pattern **sets** | Refused at load: "sets are not supported for wasm_format: component yet". A stateless component export would have to run the whole drive internally — the gate array, the advance loop, the overflow retry — which the stubs own today. |
-| `rust` / `js` / `ts` / `c` stubs | Refused with "… **yet**". Bind against the `.wit` in the meantime. |
-| `go` / `as` stubs | Not component targets. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route. |
+| `go` / `as` / `js` / `ts` stubs | Not component targets, permanently. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route; and no JavaScript runtime loads a component — `WebAssembly.instantiate` accepts core modules only — so a JS consumer needs `jco transpile`, whose output is a core module plus glue, i.e. where `wasm_format: module` already starts. |
 | Batch exports (`hints: [batch-find]`) | Not exported from the component. |
 
 ## How it is built

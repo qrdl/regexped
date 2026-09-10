@@ -1,14 +1,17 @@
 # regexped must be built first: run `make` in the repo root.
 #
-# This example is a COMPONENT: three steps, not five. There is no stub
-# generation (the host binds against the WIT) and no merge (a component owns its
-# own memory), and the host is a native binary rather than a wasm32-wasip1 one.
+# A COMPONENT example consumed through a GENERATED stub. Four steps: compile the
+# patterns into a component, generate the stub, build the consumer as a guest
+# component, compose the two. `wac` plays the role `wasm-merge` plays for the
+# module format.
 REGEXPED  := ../../../../regexped
 COMPONENT := secrets.wasm
 WIT       := secrets.wit
-HOST      := target/release/secrets
+STUB      := stubs.rs
+GUEST     := target/wasm32-wasip2/release/secrets.wasm
+FINAL     := composed.wasm
 
-.PHONY: all compile build run clean
+.PHONY: all compile generate build compose run clean
 
 all: run
 
@@ -20,30 +23,44 @@ $(COMPONENT) $(WIT): regexped.yaml $(REGEXPED)
 
 compile: $(COMPONENT)
 
-# Step 2 – build the host. It depends on the WIT: bindgen! reads it at COMPILE
-# time, so a stale interface is a build error rather than a runtime surprise.
-$(HOST): main.rs Cargo.toml $(WIT)
-	cargo build --release
+# Step 2 – generate the Rust stub. Its API is identical to the module-format
+# stub's; only what sits under it differs.
+$(STUB): regexped.yaml $(REGEXPED)
+	$(REGEXPED) generate --config=regexped.yaml
 
-build: $(HOST)
+generate: $(STUB)
 
-# Step 3 – run with test inputs
-run: $(HOST) $(COMPONENT)
+# Step 3 – build the consumer as a GUEST component. wasm32-wasip2 emits a
+# component directly, so no cargo-component is needed.
+$(GUEST): main.rs $(STUB) Cargo.toml
+	cargo build --target wasm32-wasip2 --release
+
+build: $(GUEST)
+
+# Step 4 – compose the guest with the regexp component. Until this runs the guest
+# has an unsatisfied import and will not instantiate.
+$(FINAL): $(GUEST) $(COMPONENT)
+	wac plug $(GUEST) --plug $(COMPONENT) -o $(FINAL)
+
+compose: $(FINAL)
+
+# Step 5 – run with test inputs
+run: $(FINAL)
 	@echo "=== clean text ==="
-	./$(HOST) "nothing sensitive here"
+	wasmtime run $(FINAL) "nothing sensitive here"
 	@echo ""
 	@echo "=== GitHub personal access token ==="
-	./$(HOST) "Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+	wasmtime run $(FINAL) "Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
 	@echo ""
 	@echo "=== JWT ==="
-	./$(HOST) "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+	wasmtime run $(FINAL) "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
 	@echo ""
 	@echo "=== AWS access key ==="
-	./$(HOST) "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
+	wasmtime run $(FINAL) "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
 	@echo ""
-	@echo "=== multiple secrets in one string (the host's own drive loop) ==="
-	./$(HOST) "key=AKIAIOSFODNN7EXAMPLE token=ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+	@echo "=== multiple secrets in one string (demonstrates the generated iterator) ==="
+	wasmtime run $(FINAL) "key=AKIAIOSFODNN7EXAMPLE token=ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
 
 clean:
 	cargo clean
-	rm -f $(COMPONENT) $(WIT)
+	rm -f $(COMPONENT) $(WIT) $(STUB) $(FINAL)

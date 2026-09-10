@@ -67,15 +67,18 @@ func TestWitVersionAppears(t *testing.T) {
 	if !strings.Contains(got, "package regexped:url-ipv6@2.3.0;") {
 		t.Errorf("versioned package line missing:\n%s", got)
 	}
+	// The version goes after the INTERFACE name; wasm-tools rejects the other
+	// placement with "failed to find export of interface".
 	prefix, err := WitInterfacePrefix(cfg)
-	if err != nil || prefix != "regexped:url-ipv6@2.3.0/matcher" {
+	if err != nil || prefix != "regexped:url-ipv6/matcher@2.3.0" {
 		t.Errorf("prefix = %q, %v", prefix, err)
 	}
 	names, err := witExportNames(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := names["email_find"]; got != "regexped:url-ipv6@2.3.0/matcher#email-find" {
+	if got := names["email_find"]; got != "regexped:url-ipv6/matcher#email-find@2.3.0" &&
+		got != "regexped:url-ipv6/matcher@2.3.0#email-find" {
 		t.Errorf("export name = %q", got)
 	}
 	// Unset, no @version anywhere.
