@@ -485,10 +485,10 @@ var rustTransformedReserved = []string{"SetMatch"}
 func ResolveStubType(cfg BuildConfig) (string, error) {
 	if cfg.StubType != "" {
 		switch cfg.StubType {
-		case "rust", "js", "ts", "go", "c", "as":
+		case "rust", "js", "ts", "go", "c", "as", "wit":
 			return cfg.StubType, nil
 		default:
-			return "", fmt.Errorf("unknown stub_type %q (expected rust, js, ts, go, c, or as)", cfg.StubType)
+			return "", fmt.Errorf("unknown stub_type %q (expected rust, js, ts, go, c, as, or wit)", cfg.StubType)
 		}
 	}
 	switch strings.ToLower(filepath.Ext(cfg.StubFile)) {
@@ -502,8 +502,10 @@ func ResolveStubType(cfg BuildConfig) (string, error) {
 		return "go", nil
 	case ".h":
 		return "c", nil
+	case ".wit":
+		return "wit", nil
 	default:
-		return "", fmt.Errorf("cannot infer stub type from %q: set stub_type in config (rust, js, ts, go, c, or as)", cfg.StubFile)
+		return "", fmt.Errorf("cannot infer stub type from %q: set stub_type in config (rust, js, ts, go, c, as, or wit)", cfg.StubFile)
 	}
 }
 
@@ -589,33 +591,56 @@ func init() {
 	add("as", jsKeywords, tsKeywords)
 }
 
-// validateImportModule checks cfg.ImportModule against the requirements of the
-// one generator stubType selects.
+// validateImportModule checks the name a generator will emit against the
+// requirements of the one generator stubType selects.
 //
-//   - rust: emitted as `pub mod <name>` — needs a real Rust identifier.
-//   - go:   emitted as `package <name>` when the stub lands in a directory of
-//     that name (generate/go_stub.go:17-20) — needs a real Go identifier.
-//   - c/as: emitted only inside a quoted attribute string
-//     (`import_module("<name>")`, `@external("<name>", …)`) — anything that
-//     cannot survive a C/TS string literal breaks the file, and a bare `"` is
-//     an injection vector.
-//   - js/ts: never emitted. No constraint at all.
+//   - rust: `pub mod <name>` — needs a real Rust identifier. The name is
+//     `rust_module`, falling back to `import_module`.
+//   - go:   `package <name>` when the stub lands in a directory of that name
+//     (generate/go_stub.go:17-20) — needs a real Go identifier. The name is
+//     `go_package`, falling back to `import_module`.
+//   - c/as: `import_module` itself, emitted only inside a quoted attribute
+//     string (`import_module("<name>")`, `@external("<name>", …)`) — anything
+//     that cannot survive a C/TS string literal breaks the file, and a bare
+//     `"` is an injection vector.
+//   - js/ts: nothing emitted. No constraint at all.
+//
+// The identifier rules apply to the EFFECTIVE value, not to `import_module`:
+// a config that sets neither role key still gets exactly the errors it always
+// got, because the effective value IS `import_module` — while setting
+// `rust_module`/`go_package` is now the escape hatch for a wire name that is
+// a keyword or carries an underscore.
 func validateImportModule(cfg *BuildConfig, stubType string) []string {
-	name := cfg.ImportModule
-	if name == "" {
-		return nil // required-ness is main.go's check, not this one
-	}
 	switch stubType {
 	case "rust", "go":
+		field, name := "rust_module", cfg.RustModuleName()
+		emitted := "`pub mod`"
+		if stubType == "go" {
+			field, emitted = "go_package", "`package`"
+			name = cfg.GoPackageName()
+		}
+		if name == "" {
+			return nil // required-ness is main.go's check, not this one
+		}
+		// Name whichever key actually carries the value, so the message points
+		// at the line the user has to edit.
+		src := field
+		if (stubType == "rust" && cfg.RustModule == "") || (stubType == "go" && cfg.GoPackage == "") {
+			src = "import_module"
+		}
 		if err := validateIdentShape(name); err != nil {
-			return []string{fmt.Sprintf("import_module %q %v (it is emitted as a %s identifier for stub_type %q)",
-				name, err, map[string]string{"rust": "`pub mod`", "go": "`package`"}[stubType], stubType)}
+			return []string{fmt.Sprintf("%s %q %v (it is emitted as a %s identifier for stub_type %q; set %s to override)",
+				src, name, err, emitted, stubType, field)}
 		}
 		if keywordSets[stubType][name] {
-			return []string{fmt.Sprintf("import_module %q is a reserved word in %s, and is emitted as a %s identifier",
-				name, stubType, map[string]string{"rust": "`pub mod`", "go": "`package`"}[stubType])}
+			return []string{fmt.Sprintf("%s %q is a reserved word in %s, and is emitted as a %s identifier (set %s to override)",
+				src, name, stubType, emitted, field)}
 		}
 	case "c", "as":
+		name := cfg.ImportModule
+		if name == "" {
+			return nil
+		}
 		for i := 0; i < len(name); i++ {
 			if c := name[i]; c == '"' || c == '\\' || c < 0x20 || c == 0x7F {
 				return []string{fmt.Sprintf("import_module %q contains %q at offset %d, which cannot appear in the quoted import attribute the %s generator emits",

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 
 	"github.com/qrdl/regexped/compile"
+	"github.com/qrdl/regexped/component"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/generate"
 	"github.com/qrdl/regexped/merge"
@@ -155,8 +156,12 @@ func runGenerateCmd(args []string) {
 		failf(exitCompile, "%v", err)
 	}
 
-	// Rust, Go, C, and AS stubs require import_module for the FFI/WASM import module name.
-	// Config content rather than command line, hence exitCompile.
+	// Rust, Go, C, and AS stubs require a module name for the FFI/WASM import
+	// module name. Config content rather than command line, hence exitCompile.
+	//
+	// The `component` case is NOT checked here: it is required for the format
+	// itself, not for one stub type, so config.LoadConfig enforces it and both
+	// commands get the same verdict.
 	if (stubType == "rust" || stubType == "go" || stubType == "c" || stubType == "as") && cfg.ImportModule == "" {
 		failf(exitCompile, "generate: import_module is required in config for Rust, Go, C, and AS stubs")
 	}
@@ -222,7 +227,16 @@ func runCompileCmd(args []string) {
 	if *verbose {
 		report = os.Stderr
 	}
-	if err := compile.CmdCompileVerbose(cfg, outPath, report); err != nil {
+	// `wasm_format: component` is a different output KIND, not a variant of the
+	// module path: it wraps the core module through wasm-tools and writes a
+	// sibling .wit. The choice comes from the config alone — there is
+	// deliberately no --wasm-format flag, because `generate` must make the same
+	// choice and a flag lets the two diverge.
+	if cfg.Component() {
+		if err := component.CmdCompile(cfg, outPath, report); err != nil {
+			failf(exitCodeFor(err, exitCompile), "%v", err)
+		}
+	} else if err := compile.CmdCompileVerbose(cfg, outPath, report); err != nil {
 		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 

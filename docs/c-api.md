@@ -4,6 +4,8 @@ Regexped generates a pair of C stub files (`.h` and `.c`) that declare and imple
 wrapper functions for compiled WASM regexp modules. No libc or sysroot is required;
 the stubs compile cleanly with `--target=wasm32-wasi -nostdlib`.
 
+> **Component format:** these stubs are for `wasm_format: module`. Under `wasm_format: component`, `stub_type: c` is refused for now; a component consumer generates bindings from the emitted `.wit` instead. See [component.md](component.md).
+
 ## Including stubs in your project
 
 The generator produces two files derived from `stub_file` in the config:

@@ -9,7 +9,11 @@ Regexped generates Go stubs that call into compiled WASM regexp modules via `//g
 
 ## Including stubs in your project
 
-A stub file carries a `//go:build wasip1` constraint and a `package` declaration. Place it alongside your application source. The package name is inferred from the output path: if the stub lives inside a directory named after `import_module`, the package is set to that name; otherwise it defaults to `main`.
+A stub file carries a `//go:build wasip1` constraint and a `package` declaration. Place it alongside your application source. The package name is inferred from the output path: if the stub lives inside a directory named after the Go package name, the package is set to that name; otherwise it defaults to `main`.
+
+That name is `go_package`, which defaults to `import_module`. They are separate keys because `import_module` is a *wire* string — the WASM import-module name — while `package` needs a Go identifier: `url_ipv6` is a fine wire name and a package name every linter flags, and a wire name that happens to be a Go keyword cannot be a package at all. The `//go:wasmimport` lines keep using `import_module` either way.
+
+> **Component format:** Go is **not** a component target. `stub_type: go` under `wasm_format: component` is refused permanently, not "yet": stock Go has no wasip2 target (`go tool dist list` offers `wasip1/wasm` only), so a component stub would have to be TinyGo. See [component.md](component.md).
 
 ```
 myapp/

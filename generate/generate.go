@@ -41,6 +41,8 @@ func CmdGenerateStub(cfg config.BuildConfig, out string) error {
 		return cStub(cfg, out)
 	case "as":
 		return asStub(cfg, out)
+	case "wit":
+		return witStub(cfg, out)
 	}
 	return fmt.Errorf("unknown stub type: %s", stubType)
 }

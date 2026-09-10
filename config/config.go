@@ -15,11 +15,48 @@ import (
 // BuildConfig is the top-level structure of the YAML config file.
 type BuildConfig struct {
 	WasmMerge    string `yaml:"wasm_merge"`    // optional; defaults to "wasm-merge" in $PATH
+	WasmTools    string `yaml:"wasm_tools"`    // optional; defaults to $WASM_TOOLS, then "wasm-tools" in $PATH (used by wasm_format: component)
 	Output       string `yaml:"output"`        // output path for merge command; overridable with -o
 	WasmFile     string `yaml:"wasm_file"`     // output WASM file for compile command; overridable with -o
 	ImportModule string `yaml:"import_module"` // WASM import module name used by wasm-merge and Rust FFI
 	StubFile     string `yaml:"stub_file"`     // stub output file (Rust, Go, JS, TS, AS, or C)
 	StubType     string `yaml:"stub_type"`     // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
+
+	// WasmFormat selects the OUTPUT KIND: "module" (default, today's core WASM
+	// module, unchanged bytes) or "component" (a Component Model component with
+	// a WIT interface). Empty means "module". It is a config key rather than a
+	// CLI flag because `generate` has to make the same choice as `compile`; a
+	// flag would let the two diverge.
+	WasmFormat string `yaml:"wasm_format"`
+
+	// ImportModule above is the WASM import-module name — a WIRE string, which
+	// WASM lets be almost any UTF-8. The keys below are the SOURCE IDENTIFIER
+	// roles it used to serve alone, split out because their rules conflict: WIT
+	// demands hyphens where Rust and Go forbid them, `url_ipv6` is a fine WASM
+	// name and a lint-flagged Go package, and `import_module: match` was a hard
+	// error purely because it became `pub mod match`.
+	//
+	// All are OPTIONAL and fall back to ImportModule, so a config that sets
+	// none of them behaves exactly as it always has.
+	RustModule string `yaml:"rust_module"` // Rust `pub mod` name; default ImportModule
+	GoPackage  string `yaml:"go_package"`  // Go `package` name; default ImportModule
+
+	// WitPackage names the WIT package (component only); default
+	// kebab(ImportModule). WitWorld names the WORLD, falling back to
+	// WitPackage — it gets its own key because it is the one name here that no
+	// ABI depends on: it is absent from every export name and only names the
+	// consumer's generated bindings, so changing it is always safe, while
+	// changing the package renames every export.
+	WitPackage string `yaml:"wit_package"`
+	WitWorld   string `yaml:"wit_world"`
+
+	// WitVersion is the OPTIONAL interface version. UNSET MEANS NO VERSION:
+	// the package is `package regexped:<name>;` and exports are
+	// `…/matcher#<func>`. Set, it is appended as `@<value>` to the package and
+	// therefore to every canonical export name — so adding, removing or
+	// changing it renames every export and breaks that user's consumers. One
+	// time, opt-in, and loud.
+	WitVersion string `yaml:"wit_version"`
 
 	// Namespace prefixes the symbols a stub generates that are NOT named by
 	// the user — Span, SetMatch, the error type, the pattern-name helper, C's
@@ -756,6 +793,17 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	// that carries it is wrong from the moment it is loaded.
 	if cfg.StubType != "" {
 		if _, err := ResolveStubType(cfg); err != nil {
+			return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+		}
+	}
+	// wasm_format and the keys that only mean anything under it. Checked here
+	// rather than per-command so that `compile` and `generate` cannot disagree
+	// about the output kind — the reason it is a config key and not a flag.
+	if err := validateFormat(&cfg, warnToStderr); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
+	if stubType, err := ResolveStubType(cfg); err == nil {
+		if err := validateStubTypeForFormat(&cfg, stubType); err != nil {
 			return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 		}
 	}

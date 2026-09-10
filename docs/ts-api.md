@@ -2,6 +2,8 @@
 
 Regexped generates a TypeScript ES module stub that loads a compiled WASM regexp module and exports typed wrapper functions. The TypeScript stub matches the JavaScript stub's external API and behaviour, with one internal exception noted in [Notes](#notes) below (JS's `find_func`/`groups_func` generators have an internal fast path the TS stub doesn't yet have).
 
+> **Component format:** this stub is for `wasm_format: module`. Under `wasm_format: component`, `stub_type: ts` is refused for now; transpile the component with `jco` instead. See [component.md](component.md).
+
 ## Including stubs in your project
 
 The stub is a single `.ts` ES module file. Import it directly:

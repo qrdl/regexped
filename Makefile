@@ -106,6 +106,12 @@ unittest:
 
 docker: regexped
 	./get_wasm_merge.sh
+	# wasm-tools is needed inside the image for `wasm_format: component`, the
+	# same way wasm-merge is needed for `regexped merge`. get_wasm_tools.sh
+	# short-circuits when the tool is already on PATH, which is right for CI but
+	# leaves nothing in the build CONTEXT — hence the copy fallback.
+	./get_wasm_tools.sh
+	@test -f wasm-tools || cp "$$(command -v wasm-tools)" ./wasm-tools
 	docker build -t regexped .
 
 lint:

@@ -5,6 +5,8 @@ functions and re-exports them with a higher-level interface. Because AssemblyScr
 compiles to WASM itself, the stubs are merged with the regexp modules via
 `wasm-merge` into a single final `.wasm` binary.
 
+> **Component format:** AssemblyScript is **not** a component target. `stub_type: as` under `wasm_format: component` is refused permanently, not "yet" — there is no planned route. These stubs are for `wasm_format: module`. See [component.md](component.md).
+
 ## Requirements
 
 - [AssemblyScript](https://www.assemblyscript.org/) 0.27 or later

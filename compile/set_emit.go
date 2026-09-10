@@ -1825,7 +1825,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		globals = &moduleGlobals{}
 	}
 	if len(sets) == 0 {
-		return assembleModule(patterns, memPages, standalone, globals)
+		return assembleModule(patterns, memPages, standalone, globals, asmOpts{})
 	}
 
 	// Reuse assembleModule for the base (patterns only), then we'll handle sets separately.

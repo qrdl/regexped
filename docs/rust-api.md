@@ -4,7 +4,7 @@ Regexped generates Rust FFI stubs that call into compiled WASM regexp modules. T
 
 ## Including stubs in your project
 
-Each stub file is a plain Rust source file intended to be pulled in with `include!`. The generator already wraps every entry from the config in a single `pub mod <import_module> { ... }` block, so just include the file once and call functions through that module path:
+Each stub file is a plain Rust source file intended to be pulled in with `include!`. The generator already wraps every entry from the config in a single `pub mod <name> { ... }` block, so just include the file once and call functions through that module path:
 
 ```rust
 include!("stubs.rs");
@@ -12,6 +12,10 @@ include!("stubs.rs");
 // import_module: "regexps" in the config → module path "regexps::<func_name>"
 regexps::find_github_token(input, 0);
 ```
+
+The `pub mod` name is `rust_module`, which defaults to `import_module`. They are separate keys because `import_module` is a *wire* string — the WASM import-module name, which may be anything — while `pub mod` needs a Rust identifier. Set `rust_module` when the wire name is a Rust keyword (`match`) or simply reads badly as a module path (`url_ipv6`); the `#[link(wasm_import_module = …)]` inside keeps using `import_module` either way.
+
+> **Component format:** these stubs are for `wasm_format: module`. Under `wasm_format: component`, `stub_type: rust` is refused for now — a component host binds against the generated `.wit`, with `wasmtime::component::bindgen!`. See [component.md](component.md) and `examples/wasmtime/rust/secrets`.
 
 WASM export names (and the generated function names) are whatever you set in `match_func`/`find_func`/`groups_func` — not fixed names like `match`/`find`/`groups` — so two entries only collide if they reuse the same `_func` name within one config, or if two separate configs share the same `import_module`.
 

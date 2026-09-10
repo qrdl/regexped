@@ -69,6 +69,78 @@ For standalone use (JS/TS/browser), the compiled WASM is used directly with no m
 
 ---
 
+## Component Model exports
+
+Everything above describes `wasm_format: module`, and is unchanged by the
+component work — a module build is byte-for-byte what it always was.
+
+Under `wasm_format: component` the compiler emits that same core module and
+**appends** the canonical-ABI machinery, so no pattern function index moves:
+
+| Export | Signature | Role |
+|---|---|---|
+| `cabi_realloc` | `(i32, i32, i32, i32) → i32` | `(old_ptr, old_size, align, new_size)`; a bump allocator that grows memory and traps if growth fails |
+| `cabi_post_<canonical>` | `(i32) → ()` | post-return; resets the bump pointer to the static top. One shared function, exported under one name per adapter |
+| `<canonical>` | see below | one adapter per exported pattern function |
+| the raw exports | unchanged | kept alongside, so `wasm-tools component unbundle` yields a core module the module-format tooling can drive |
+
+A canonical export name is `regexped:<wit_package>[@<wit_version>]/matcher#<kebab-func>`.
+
+Adapters are retptr-shaped: every return type has more than one flat value, so
+the adapter allocates a result area through `cabi_realloc`, calls the existing
+body, and answers the area's address.
+
+| WIT function | adapter signature | inner function it calls |
+|---|---|---|
+| `match` | `(ptr, len) → i32` | the match body, `(ptr, len) → i32` |
+| `find` | `(ptr, len, start) → i32` | the exported `(ptr, len, from) → i64` wrapper |
+| `groups` | `(ptr, len, start) → i32` | the exported `(ptr, len, out_ptr, from) → i32` wrapper |
+
+### Result-area layouts
+
+Byte offsets; discriminants are `u8`; areas are 4-aligned.
+
+```
+result<option<u32>, error-code>                          size 12
+  @0   u8   result disc   0 = ok, 1 = err
+  @4   u8   option disc   0 = none, 1 = some   (err case: @4 = enum index 0)
+  @8   u32  end
+
+result<option<tuple<u32,u32>>, error-code>               size 16
+  @0   u8   result disc
+  @4   u8   option disc
+  @8   u32  start
+  @12  u32  end
+
+result<option<list<option<tuple<u32,u32>>>>, error-code> size 16
+  @0   u8   result disc
+  @4   u8   option disc
+  @8   i32  list ptr      (a separately allocated element buffer)
+  @12  i32  list len      (= numGroups, group 0 included)
+
+element option<tuple<u32,u32>>                           size 12, align 4
+  @0   u8   option disc   0 when the group did not participate
+  @4   u32  start
+  @8   u32  end
+```
+
+The `-1` and `-2` sentinels are translated here, and only here: `-1` becomes
+`ok(none)`, `-2` becomes `err(backtrack-overflow)`. A group is unset iff its
+START slot is negative, which is the same test the generated stubs apply, so all
+six languages and the component agree on which groups participated.
+
+### Call sequence, and where the allocator resets
+
+The host lowers the input list through `cabi_realloc` and copies it in, calls the
+adapter, reads the result area, then calls the post-return. The reset therefore
+belongs in the post-return and **nowhere else**: resetting at adapter entry would
+free the input the host had just lowered.
+
+Memory grows to fit a large input and is never given back — the reset moves a
+bump pointer, it does not shrink memory.
+
+See [component.md](component.md) for the user-facing contract.
+
 ## Memory layout
 
 ### Embedded (Rust/Go via wasm-merge)

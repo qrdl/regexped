@@ -1,6 +1,6 @@
 # Using Regexped via Docker
 
-The regexped Docker image contains the `regexped` compiler and `wasm-merge` (from Binaryen). It is intended to be used as a command-line tool against a project directory mounted as a volume.
+The regexped Docker image contains the `regexped` compiler, `wasm-merge` (from Binaryen) and `wasm-tools` (from the Bytecode Alliance). It is intended to be used as a command-line tool against a project directory mounted as a volume.
 
 ## Official image
 
@@ -16,7 +16,7 @@ docker pull qrdl/regexped
 make docker
 ```
 
-This builds the `regexped` binary locally, downloads `wasm-merge` if not already present, then builds the Docker image tagged `regexped`.
+This builds the `regexped` binary locally, puts `wasm-merge` and `wasm-tools` in the build context (downloading them if not already present), then builds the Docker image tagged `regexped`.
 
 ## General usage
 
@@ -72,7 +72,7 @@ docker run --rm -v /path/to/your/project:/work -w /work --user $(id -u):$(id -g)
 
 Merges the host main WASM with one or more regexp WASM modules into a single binary. The output path is taken from the `output` field in the config, or overridden with `--output`.
 
-`wasm-merge` is available in `$PATH` inside the container — no extra configuration needed.
+`wasm-merge` and `wasm-tools` are both available in `$PATH` inside the container — no extra configuration needed. The compiler shells out to `wasm-merge` for `regexped merge` and to `wasm-tools` for `wasm_format: component`, so an image missing either could only do part of the job.
 
 ---
 

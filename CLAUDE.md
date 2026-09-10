@@ -108,6 +108,15 @@ regexped/
 │   │                          #   authoritative for such a bucket (validMask, the gate pre-mask and
 │   │                          #   the empty-mask group skip are all suppressed for it); the bodies
 │   │                          #   apply the per-pattern gate rule themselves
+│   ├── component.go           # Canonical-ABI adapters for `wasm_format: component`: the
+│   │                          #   cabi_realloc bump allocator, ONE shared post-return, and one
+│   │                          #   retptr-shaped adapter per export, all APPENDED after every
+│   │                          #   pattern function so no baseIdx or per-pattern offset moves.
+│   │                          #   Holds asmOpts, whose ZERO VALUE MEANS MODULE — which is why
+│   │                          #   it is a struct and not two positional params next to the
+│   │                          #   adjacent `standalone` bool. It VALIDATES: Component with no
+│   │                          #   ComponentPackage is refused here rather than surfacing later
+│   │                          #   as a wasm-tools complaint about the WIT
 │   ├── diag.go                # Diagnostics structures (set composition diagnostics JSON)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/
@@ -118,7 +127,17 @@ regexped/
 │   ├── ts_stub.go             # TypeScript ES module stub generator
 │   ├── as_stub.go             # AssemblyScript stub generator
 │   ├── c_stub.go              # C header stub generator (WASM imports, caller-owned scanners and arrays)
-│   └── set_stub.go            # Shared set-stub helpers (patternsInSet, batchSize, hasSetExports)
+│   ├── set_stub.go            # Shared set-stub helpers (patternsInSet, batchSize, hasSetExports)
+│   └── wit.go                 # WIT generator (stub_type: wit). ALSO the single source of the
+│                              #   canonical export names compile/ stamps into its adapters, so
+│                              #   the .wit and the core module cannot disagree about a name
+├── component/
+│   ├── component.go           # Wrap: shells out to `wasm-tools component embed` then
+│   │                          #   `component new`. Mirrors merge/ — same binary-resolution
+│   │                          #   order (config `wasm_tools:` → $WASM_TOOLS → $PATH)
+│   └── compile.go             # CmdCompile for `wasm_format: component`. It lives HERE and not
+│                              #   in compile/ because it needs generate/'s WIT, and generate/
+│                              #   already imports compile/ — this package sits above both
 ├── merge/
 │   └── merge.go               # WASM module merging with wasm-merge
 ├── internal/
@@ -215,7 +234,20 @@ Parses YAML configuration files. Schema:
 wasm_merge:    "path/to/wasm-merge"  # optional; defaults to $WASM_MERGE env var, then wasm-merge in $PATH
 output:        "merged.wasm"         # output path for merge command; overridable with -o/--output
 wasm_file:     "regexps.wasm"        # output path for compile command; overridable with -o/--output
-import_module: "mymod"               # WASM module name used by wasm-merge and Rust/Go FFI
+import_module: "mymod"               # the WASM import-module name — a WIRE string, and the
+                                     #   default for the four source-identifier keys below
+rust_module:   "mymod"               # optional; Rust `pub mod` name.  Default import_module
+go_package:    "mymod"               # optional; Go `package` name.    Default import_module
+wit_package:   "my-mod"              # optional; WIT package name.     Default kebab(import_module)
+wit_world:     "my-mod"              # optional; WIT world name.       Default wit_package
+wasm_format:   module | component    # optional; default module. `component` emits a Component
+                                     #   Model component + sibling .wit, forces standalone memory,
+                                     #   and rejects `sets:`. NO CLI flag — `generate` must make
+                                     #   the same choice, and a flag lets the two diverge.
+wit_version:   "2.3.0"               # optional, component only. UNSET MEANS NO VERSION; the value
+                                     #   lands in every export name, so adding/removing/changing
+                                     #   it renames every export and breaks consumers, once, loudly
+wasm_tools:    "path/to/wasm-tools"  # optional; defaults to $WASM_TOOLS, then wasm-tools in $PATH
 stub_file:     "src/stubs.rs"        # stub output file; extension determines type: .rs, .js, .ts, .go, .h
 stub_type:     "rust"                # optional; overrides extension inference: rust, js, ts, go, c, as
 max_dfa_states: 1024                 # optional; max DFA/TDFA states before falling back (default 1024)
@@ -358,7 +390,7 @@ Because those values are also interpolated verbatim into generated source, `conf
 
 All FFI declarations use `ffi_<func>` internally with `#[link_name = "<func>"]` to avoid collision with the public Rust wrapper of the same name. Iterators advance past zero-length matches by one byte.
 
-All entries are wrapped in a single `pub mod <import_module> { }` block.
+All entries are wrapped in a single `pub mod <rust_module> { }` block (`rust_module` defaults to `import_module`; they are separate keys because the wire name may be a Rust keyword or carry an underscore).
 
 **Go stubs** (`generate/go_stub.go`):
 
@@ -755,6 +787,32 @@ frontend column reports what actually shipped. `make example-lnm` / `make exampl
 run pre-built demonstrations of a real `prefer-no-match` win. See
 `tools/settest/README.md`.
 
+## Output kinds: module and component
+
+`wasm_format` selects between two OUTPUT KINDS, and it is a CONFIG key rather
+than a CLI flag on purpose: `generate` has to make the same choice `compile` did,
+and a flag lets the two diverge.
+
+`module` (the default) is everything else in this document. `component` wraps
+that same core module into a Component Model component:
+
+- `compile/component.go` appends `cabi_realloc`, one shared post-return and one
+  adapter per export; `generate/wit.go` writes the `.wit` AND supplies the
+  canonical export names the adapters are stamped with, so the two cannot
+  disagree; `component/` shells out to `wasm-tools component embed` + `new`.
+- Standalone memory is FORCED (a component owns and exports its own memory), so
+  `output:` is meaningless; `sets:` is refused until a later phase; `stub_type`
+  accepts only `wit`, with `go`/`as` refused PERMANENTLY (no wasip2 target in
+  stock Go; no planned AssemblyScript route) and `rust`/`js`/`ts`/`c` refused
+  "yet".
+- **A `wasm_format: module` build is byte-identical to what it always was**, and
+  that is the gate: `make byteident`, plus `component/byteident_test.go` pinning
+  the component CORE module's bytes (not the wrapped component, whose bytes
+  belong to whichever `wasm-tools` is installed) and asserting that every raw
+  export keeps its function index — adapters are APPENDED, never interleaved.
+
+See `docs/component.md` and `docs/wasm.md` "Component Model exports".
+
 ## Memory Layout
 
 ### Embedded (Rust/Go/C via wasm-merge)
@@ -895,7 +953,11 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 ## Dependencies
 
 - **Go 1.25.9+**
-- **gopkg.in/yaml.v3** — YAML parsing
+- **github.com/goccy/go-yaml** — YAML parsing, in STRICT mode (`yaml.Strict()`):
+  an unknown key anywhere in the file is a line-numbered load error. That is what
+  catches retired set keys and typos — and it also means ADDING a config key is
+  the only way to make one loadable, so a key accepted by one spelling cannot be
+  aliased from another without declaring it.
 - **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (`tools/re2test`, `tools/likelytest`, `tools/pattest`, `tools/settest`, `tools/perftest`, `tools/setperf`, `tools/fuzz` only — not a dependency of the compiler itself)
 - **regex-automata** (Rust, `tools/perftest/regex_bench`) — the cross-engine comparison and correctness target for `tools/setperf`
 - **wasm-merge** (external, Binaryen) — for `merge` command and `tools/perftest`
@@ -903,8 +965,8 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 ---
 
 **Last Updated:** 2026-08-24
-**CLI commands:** `generate` (stubs), `compile`, `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
-**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints)
+**CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
+**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 
 **Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body; reachable ONLY from the scalar branch, i.e. after AC declines over its 512 KB budget — first-byte union 17..64, or up to 128 under set-level `prefer-no-match`), scalar. The crossovers between them were re-measured on a match-dense corpus in 2026-08-31 and did NOT move: the chooser picks the winning frontend in all 20 rows of both corpora, so none of them is hint-conditional. `CompileSetOptions.WithForcedFrontend` + `setperf -force-frontend` are the test-only knobs that ask the question again.

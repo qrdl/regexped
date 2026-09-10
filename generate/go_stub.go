@@ -14,8 +14,10 @@ import (
 // The Go package name is set to cfg.ImportModule when the stub is placed in a
 // subdirectory named after the import module; otherwise "main" is used.
 func goStub(cfg config.BuildConfig, out string) error {
-	pkgName := cfg.ImportModule
-	if filepath.Base(filepath.Dir(out)) != cfg.ImportModule {
+	// `package` is a Go IDENTIFIER, so it takes go_package; the
+	// //go:wasmimport lines keep the WIRE name. Both default to import_module.
+	pkgName := cfg.GoPackageName()
+	if filepath.Base(filepath.Dir(out)) != cfg.GoPackageName() {
 		pkgName = "main"
 	}
 	needsSpan := false

@@ -1,60 +1,49 @@
 # regexped must be built first: run `make` in the repo root.
-REGEXPED    := ../../../../regexped
-WASM_TARGET := wasm32-wasip1
+#
+# This example is a COMPONENT: three steps, not five. There is no stub
+# generation (the host binds against the WIT) and no merge (a component owns its
+# own memory), and the host is a native binary rather than a wasm32-wasip1 one.
+REGEXPED  := ../../../../regexped
+COMPONENT := secrets.wasm
+WIT       := secrets.wit
+HOST      := target/release/secrets
 
-MAIN_WASM   := target/$(WASM_TARGET)/release/secrets.wasm
-REGEX_WASMS := regexps.wasm
-FINAL_WASM  := final.wasm
-
-.PHONY: all generate build compile merge run clean
+.PHONY: all compile build run clean
 
 all: run
 
-# Step 1 – generate Rust stubs (all patterns into one file)
-# $(REGEXPED) is a prerequisite of every rule below that runs it: the generated
-# stubs and the compiled .wasm depend on the COMPILER as much as on the config.
-# Without it a rebuild after a compiler change keeps the stale .wasm and the
-# merge fails with an import/export type mismatch.
-stubs.rs: regexped.yaml $(REGEXPED)
-	$(REGEXPED) generate --config=regexped.yaml
-
-generate: stubs.rs
-
-# Step 2 – compile Rust source to WASM
-$(MAIN_WASM): main.rs stubs.rs Cargo.toml
-	cargo build --target $(WASM_TARGET) --release
-
-build: $(MAIN_WASM)
-
-# Step 3 – compile all regexp patterns to WASM
-$(REGEX_WASMS): regexped.yaml $(REGEXPED)
+# Step 1 – compile the patterns into a component, plus the sibling .wit.
+# $(REGEXPED) is a prerequisite because the component depends on the COMPILER as
+# much as on the config.
+$(COMPONENT) $(WIT): regexped.yaml $(REGEXPED)
 	$(REGEXPED) compile --config=regexped.yaml
 
-compile: $(REGEX_WASMS)
+compile: $(COMPONENT)
 
-# Step 4 – merge main WASM and all regexp WASMs into a single module
-$(FINAL_WASM): $(MAIN_WASM) $(REGEX_WASMS) regexped.yaml $(REGEXPED)
-	$(REGEXPED) merge --config=regexped.yaml --main=$(MAIN_WASM) $(REGEX_WASMS)
+# Step 2 – build the host. It depends on the WIT: bindgen! reads it at COMPILE
+# time, so a stale interface is a build error rather than a runtime surprise.
+$(HOST): main.rs Cargo.toml $(WIT)
+	cargo build --release
 
-merge: $(FINAL_WASM)
+build: $(HOST)
 
-# Step 5 – run with test inputs
-run: $(FINAL_WASM)
+# Step 3 – run with test inputs
+run: $(HOST) $(COMPONENT)
 	@echo "=== clean text ==="
-	wasmtime run $(FINAL_WASM) "nothing sensitive here"
+	./$(HOST) "nothing sensitive here"
 	@echo ""
 	@echo "=== GitHub personal access token ==="
-	wasmtime run $(FINAL_WASM) "Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+	./$(HOST) "Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
 	@echo ""
 	@echo "=== JWT ==="
-	wasmtime run $(FINAL_WASM) "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+	./$(HOST) "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
 	@echo ""
 	@echo "=== AWS access key ==="
-	wasmtime run $(FINAL_WASM) "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
+	./$(HOST) "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
 	@echo ""
-	@echo "=== multiple secrets in one string (demonstrates iterator) ==="
-	wasmtime run $(FINAL_WASM) "key=AKIAIOSFODNN7EXAMPLE token=ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
+	@echo "=== multiple secrets in one string (the host's own drive loop) ==="
+	./$(HOST) "key=AKIAIOSFODNN7EXAMPLE token=ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"
 
 clean:
 	cargo clean
-	rm -f stubs.rs regexps.wasm $(FINAL_WASM)
+	rm -f $(COMPONENT) $(WIT)

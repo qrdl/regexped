@@ -2,6 +2,8 @@
 
 Regexped generates a JavaScript ES module stub that loads a compiled WASM regexp module and exports wrapper functions. This document explains how to initialise the module and use the generated functions.
 
+> **Component format:** this stub is for `wasm_format: module`. Under `wasm_format: component`, `stub_type: js` is refused for now; transpile the component with `jco` instead. See [component.md](component.md).
+
 ## Including stubs in your project
 
 The stub is a single `.js` ES module file. Import it directly from your application:
