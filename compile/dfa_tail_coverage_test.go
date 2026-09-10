@@ -193,7 +193,7 @@ func TestDFATailUnparseablePatternGuards(t *testing.T) {
 		t.Error("shouldTryLitChainAlt failed OPEN on an unparseable pattern: it must " +
 			"fall back to the general path, not claim the alternation shape was ruled out")
 	}
-	if lmBareShuftiEligible(unparseable) {
+	if lmBareShuftiEligible(unparseable, false) {
 		t.Error("lmBareShuftiEligible failed OPEN on an unparseable pattern: it must " +
 			"decline the bare-Shufti optimisation rather than assert a minimum length " +
 			"it could not compute")

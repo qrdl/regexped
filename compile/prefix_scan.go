@@ -295,6 +295,204 @@ const twinCallImmWidth = 5
 const denseSwitchThreshold int32 = 8
 
 // prefixScanParams configures emitPrefixScan.
+// emitPrefixChunkLoads loads the 1..4 v128 chunks the FirstByteSet strategy
+// probes, at consecutive offsets from a base address the caller pushes.
+//
+// emitBase must leave ONE i32 on the stack — the byte offset the first chunk
+// starts at. It is called once per chunk, so it must be side-effect free.
+//
+// Factored out so the main scan loop and the overlapping TAIL probe load the
+// same chunks the same way: the tail's base is len-(window) rather than
+// attempt_start, and a second hand-written copy of four offset loads is exactly
+// the drift a shared emitter exists to prevent.
+func emitPrefixChunkLoads(b []byte, p prefixScanParams, l prefixScanLocals, emitBase func([]byte) []byte) []byte {
+	b = emitBase(b)
+	b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+	b = append(b, 0x21, l.Chunk)
+	if p.TeddyTwoByte && len(p.FirstByteSet) <= 8 {
+		b = emitBase(b)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+		b = append(b, 0x21, l.Chunk1)
+		if p.TeddyThreeByte {
+			b = emitBase(b)
+			b = append(b, 0x41, 0x02)
+			b = append(b, 0x6A)
+			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+			b = append(b, 0x21, l.Chunk2)
+			if p.TeddyFourByte {
+				b = emitBase(b)
+				b = append(b, 0x41, 0x03)
+				b = append(b, 0x6A)
+				b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+				b = append(b, 0x21, l.Chunk3)
+			}
+		}
+	}
+	return b
+}
+
+// emitPrefixCandidateMask reduces the loaded chunks to a 16-bit lane bitmask,
+// left on the stack: bit i is set when the byte at base+i can begin a match.
+//
+// Shared by the main scan loop and the tail probe for the same reason as
+// emitPrefixChunkLoads.
+func emitPrefixCandidateMask(b []byte, p prefixScanParams, l prefixScanLocals) []byte {
+	// Compute candidate mask.
+	if len(p.FirstByteSet) <= 8 {
+		// 1-byte Teddy: candidates0 = swizzle(T0_lo, chunk&0xF) & swizzle(T0_hi, chunk>>4)
+		b = append(b, 0x20, l.TLo) // local.get T0_lo
+		b = append(b, 0x20, l.Chunk)
+		b = append(b, 0x41, 0x0F)
+		b = append(b, 0xFD, 0x0F)  // i8x16.splat(0x0F)
+		b = append(b, 0xFD, 0x4E)  // v128.and → lo_nibbles
+		b = append(b, 0xFD, 0x0E)  // i8x16.swizzle → lo_result
+		b = append(b, 0x20, l.THi) // local.get T0_hi
+		b = append(b, 0x20, l.Chunk)
+		b = append(b, 0x41, 0x04) // i32.const 4
+		b = append(b, 0xFD, 0x6D) // i8x16.shr_u
+		b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi_result
+		b = append(b, 0xFD, 0x4E) // v128.and → candidates0
+
+		if p.TeddyTwoByte {
+			// 2-byte: AND with candidates1 from chunk1.
+			b = append(b, 0x20, l.T1Lo)
+			b = append(b, 0x20, l.Chunk1)
+			b = append(b, 0x41, 0x0F)
+			b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
+			b = append(b, 0xFD, 0x4E) // v128.and
+			b = append(b, 0xFD, 0x0E) // i8x16.swizzle → lo1
+			b = append(b, 0x20, l.T1Hi)
+			b = append(b, 0x20, l.Chunk1)
+			b = append(b, 0x41, 0x04)
+			b = append(b, 0xFD, 0x6D) // i8x16.shr_u
+			b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi1
+			b = append(b, 0xFD, 0x4E) // v128.and → candidates1
+			b = append(b, 0xFD, 0x4E) // v128.and c0&c1 → combined
+			if p.TeddyThreeByte {
+				// 3-byte: AND with candidates2 from chunk2.
+				b = append(b, 0x20, l.T2Lo)
+				b = append(b, 0x20, l.Chunk2)
+				b = append(b, 0x41, 0x0F)
+				b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
+				b = append(b, 0xFD, 0x4E) // v128.and
+				b = append(b, 0xFD, 0x0E) // i8x16.swizzle → lo2
+				b = append(b, 0x20, l.T2Hi)
+				b = append(b, 0x20, l.Chunk2)
+				b = append(b, 0x41, 0x04)
+				b = append(b, 0xFD, 0x6D) // i8x16.shr_u
+				b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi2
+				b = append(b, 0xFD, 0x4E) // v128.and → candidates2
+				b = append(b, 0xFD, 0x4E) // v128.and combined&c2
+				if p.TeddyFourByte {
+					// 4-byte: AND with candidates3 from chunk3.
+					b = append(b, 0x20, l.T3Lo)
+					b = append(b, 0x20, l.Chunk3)
+					b = append(b, 0x41, 0x0F)
+					b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
+					b = append(b, 0xFD, 0x4E) // v128.and
+					b = append(b, 0xFD, 0x0E) // i8x16.swizzle → lo3
+					b = append(b, 0x20, l.T3Hi)
+					b = append(b, 0x20, l.Chunk3)
+					b = append(b, 0x41, 0x04)
+					b = append(b, 0xFD, 0x6D) // i8x16.shr_u
+					b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi3
+					b = append(b, 0xFD, 0x4E) // v128.and → candidates3
+					b = append(b, 0xFD, 0x4E) // v128.and combined&c3
+				}
+			}
+		}
+
+		// bitmask of nonzero lanes.
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0xFD, 0x0F) // i8x16.splat(0)
+		b = append(b, 0xFD, 0x24) // i8x16.ne
+		b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+	} else {
+		// Shufti: multi-half nibble lookup for FirstByteSet of 9..64 bytes.
+		// Each half of ≤ 8 bytes gets its own (T_lo, T_hi) 16-byte
+		// bitmap pair; the SIMD test ORs all halves and reduces to a
+		// per-lane non-zero check. See the LikelyMode work
+		// for the broader history of Shufti adoption in regexped.
+		b = emitShuftiPrefixCheck(b, p.FirstByteSet, l.Chunk)
+	}
+
+	return b
+}
+
+// prefixScanUsesTeddyTables reports whether the strategy emitPrefixScan selects
+// for these params reads the nibble tables. Mirrors its own gate: for a
+// first-byte set of 1..8 the Teddy strategy is unconditional (useSIMD is always
+// true there — see the strategy table on prefixScanParams), so no part of
+// shuftiPrefixPlan's 17..64 decision is duplicated here.
+func prefixScanUsesTeddyTables(p prefixScanParams) bool {
+	n := len(p.FirstByteSet)
+	return n > 0 && n <= 8
+}
+
+// emitPrefixScanPreload emits the Teddy nibble-table loads that emitPrefixScan's
+// <=8-first-byte strategies read on every 16-byte chunk.
+//
+// Split out of emitPrefixScan because the loads are loop-invariant while the
+// scan is emitted INSIDE the caller's per-attempt retry loop. Left there they
+// re-run on every attempt, and on an input too short for one 16-byte chunk they
+// run for a SIMD loop that then executes zero iterations — the bounds test that
+// abandons SIMD is the first instruction after them.
+//
+// Measured on `(?:ab|cd)[a-z]{200}` over 5-byte no-match inputs: 354 fuel with
+// the loads inside the loop against 288 with them hoisted, 18.6% of the call.
+//
+// A no-op for params whose strategy does not read the tables, so a caller may
+// emit it unconditionally. The locals it writes (TLo..T3Hi) are written NOWHERE
+// else in the tree, which is what makes hoisting safe: nothing between the loads
+// and their uses can clobber them.
+func emitPrefixScanPreload(b []byte, p prefixScanParams) []byte {
+	if !prefixScanUsesTeddyTables(p) {
+		return b
+	}
+	l := p.Locals
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, p.TeddyLoOff)
+	b = appendTableVLoad(b, p.TableMemIdx) // v128.load T0_lo
+	b = append(b, 0x21, l.TLo)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, p.TeddyHiOff)
+	b = appendTableVLoad(b, p.TableMemIdx) // v128.load T0_hi
+	b = append(b, 0x21, l.THi)
+	if p.TeddyTwoByte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, p.TeddyT1LoOff)
+		b = appendTableVLoad(b, p.TableMemIdx) // v128.load T1_lo
+		b = append(b, 0x21, l.T1Lo)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, p.TeddyT1HiOff)
+		b = appendTableVLoad(b, p.TableMemIdx) // v128.load T1_hi
+		b = append(b, 0x21, l.T1Hi)
+		if p.TeddyThreeByte {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, p.TeddyT2LoOff)
+			b = appendTableVLoad(b, p.TableMemIdx) // v128.load T2_lo
+			b = append(b, 0x21, l.T2Lo)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, p.TeddyT2HiOff)
+			b = appendTableVLoad(b, p.TableMemIdx) // v128.load T2_hi
+			b = append(b, 0x21, l.T2Hi)
+			if p.TeddyFourByte {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, p.TeddyT3LoOff)
+				b = appendTableVLoad(b, p.TableMemIdx) // v128.load T3_lo
+				b = append(b, 0x21, l.T3Lo)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, p.TeddyT3HiOff)
+				b = appendTableVLoad(b, p.TableMemIdx) // v128.load T3_hi
+				b = append(b, 0x21, l.T3Hi)
+			}
+		}
+	}
+	return b
+}
+
 type prefixScanParams struct {
 	// What to scan for. Exactly one scan strategy is chosen at emit time:
 	//   len(Prefix) >= 1            → SIMD hybrid prefix scan
@@ -345,6 +543,11 @@ type prefixScanParams struct {
 	// dense switch can hand off to it the moment its probe budget runs out
 	// instead of paying its own gate for the rest of the call.
 	HasTwin bool
+
+	// PreloadHoisted says the caller has already emitted the Teddy nibble-table
+	// loads (emitPrefixScanPreload) above its per-attempt retry loop, so this
+	// emission must not repeat them.
+	PreloadHoisted bool
 
 	Locals prefixScanLocals
 
@@ -493,6 +696,96 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 
 			b = append(b, 0x0B) // end loop $simd_outer
 			b = append(b, 0x0B) // end block $simd_exhausted
+
+			// ── Overlapping tail probe ─────────────────────────────────────
+			//
+			// The same recovery the FirstByteSet path below gets, for the same
+			// reason: the loop above abandons SIMD with up to 15 bytes left and
+			// the scalar tail then walks them one at a time. See that site for
+			// the measurement and the correctness argument; this path differs
+			// only in that its window is a fixed 16 bytes and its probe is the
+			// literal-prefix compare rather than a nibble table.
+			//
+			// Coverage is exact here for the same reason it is there. The chunk
+			// spans positions len-16..len-1, and Phase B's `>> k` already drops
+			// the lanes where prefix[k] would fall outside it — which are
+			// exactly the positions where fewer than len(prefix) bytes remain
+			// before the end of the input, so no match can begin at them.
+			// A zero mask therefore proves the whole remainder dead.
+			{
+				emitTailBase := func(bb []byte) []byte {
+					bb = append(bb, 0x20, l.Ptr)
+					bb = append(bb, 0x20, l.Len)
+					bb = append(bb, 0x41, 0x10) // i32.const 16
+					bb = append(bb, 0x6B)       // i32.sub
+					return append(bb, 0x6A)
+				}
+
+				b = append(b, 0x20, l.Len)
+				b = append(b, 0x41, 0x10)
+				b = append(b, 0x4F)       // i32.ge_u — a full window exists
+				b = append(b, 0x04, 0x40) // if $tail_window
+
+				b = append(b, 0x20, l.AttemptStart)
+				b = append(b, 0x20, l.Len)
+				b = append(b, 0x49)       // i32.lt_u — something left to scan
+				b = append(b, 0x04, 0x40) // if $tail_live
+
+				b = emitTailBase(b)
+				b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+				b = append(b, 0x21, l.Chunk)
+
+				// Phase A and Phase B, without the loop's early-out `if`: this
+				// runs once per call, so the branch it would save is not worth
+				// the extra nesting.
+				b = append(b, 0x20, l.Chunk)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(prefix[0]))
+				b = append(b, 0xFD, 0x0F) // i8x16.splat
+				b = append(b, 0xFD, 0x23) // i8x16.eq
+				b = append(b, 0xFD, 0x64) // i8x16.bitmask
+				b = append(b, 0x21, l.SimdMask)
+				for k := 1; k < len(prefix); k++ {
+					b = append(b, 0x20, l.Chunk)
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, int32(prefix[k]))
+					b = append(b, 0xFD, 0x0F) // i8x16.splat
+					b = append(b, 0xFD, 0x23) // i8x16.eq
+					b = append(b, 0xFD, 0x64) // i8x16.bitmask
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, int32(k))
+					b = append(b, 0x76) // i32.shr_u
+					b = append(b, 0x20, l.SimdMask)
+					b = append(b, 0x71) // i32.and
+					b = append(b, 0x21, l.SimdMask)
+				}
+
+				// Drop the lanes below attempt_start.
+				b = append(b, 0x20, l.SimdMask)
+				b = append(b, 0x20, l.AttemptStart)
+				b = append(b, 0x20, l.Len)
+				b = append(b, 0x6B)       // i32.sub
+				b = append(b, 0x41, 0x10) // i32.const 16
+				b = append(b, 0x6A)       // i32.add → shift
+				b = append(b, 0x76)       // i32.shr_u
+				b = append(b, 0x22, l.SimdMask)
+				b = append(b, 0x04, 0x40) // if (a candidate survives)
+				b = append(b, 0x20, l.AttemptStart)
+				b = append(b, 0x20, l.SimdMask)
+				b = append(b, 0x68) // i32.ctz
+				b = append(b, 0x6A) // i32.add
+				b = append(b, 0x21, l.AttemptStart)
+				// 0=this if, 1=$tail_live, 2=$tail_window, 3=$prefix_matched
+				b = append(b, 0x0C, 0x03)
+				b = append(b, 0x0B) // end if
+
+				// Nothing left can begin a match.
+				b = append(b, 0x20, l.Len)
+				b = append(b, 0x21, l.AttemptStart)
+
+				b = append(b, 0x0B) // end if $tail_live
+				b = append(b, 0x0B) // end if $tail_window
+			}
 		}
 
 		// ── Scalar tail (< 16 bytes remaining, or prefix > 16 bytes) ─────────
@@ -586,46 +879,11 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 		}
 
 		if useSIMD {
-			// Pre-load Teddy tables (loop-invariant).
-			if len(p.FirstByteSet) <= 8 {
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, p.TeddyLoOff)
-				b = appendTableVLoad(b, p.TableMemIdx) // v128.load T0_lo
-				b = append(b, 0x21, l.TLo)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, p.TeddyHiOff)
-				b = appendTableVLoad(b, p.TableMemIdx) // v128.load T0_hi
-				b = append(b, 0x21, l.THi)
-				if p.TeddyTwoByte {
-					b = append(b, 0x41)
-					b = utils.AppendSLEB128(b, p.TeddyT1LoOff)
-					b = appendTableVLoad(b, p.TableMemIdx) // v128.load T1_lo
-					b = append(b, 0x21, l.T1Lo)
-					b = append(b, 0x41)
-					b = utils.AppendSLEB128(b, p.TeddyT1HiOff)
-					b = appendTableVLoad(b, p.TableMemIdx) // v128.load T1_hi
-					b = append(b, 0x21, l.T1Hi)
-					if p.TeddyThreeByte {
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, p.TeddyT2LoOff)
-						b = appendTableVLoad(b, p.TableMemIdx) // v128.load T2_lo
-						b = append(b, 0x21, l.T2Lo)
-						b = append(b, 0x41)
-						b = utils.AppendSLEB128(b, p.TeddyT2HiOff)
-						b = appendTableVLoad(b, p.TableMemIdx) // v128.load T2_hi
-						b = append(b, 0x21, l.T2Hi)
-						if p.TeddyFourByte {
-							b = append(b, 0x41)
-							b = utils.AppendSLEB128(b, p.TeddyT3LoOff)
-							b = appendTableVLoad(b, p.TableMemIdx) // v128.load T3_lo
-							b = append(b, 0x21, l.T3Lo)
-							b = append(b, 0x41)
-							b = utils.AppendSLEB128(b, p.TeddyT3HiOff)
-							b = appendTableVLoad(b, p.TableMemIdx) // v128.load T3_hi
-							b = append(b, 0x21, l.T3Hi)
-						}
-					}
-				}
+			// Teddy nibble tables. Loop-invariant, so a caller that emits this
+			// scan inside a per-attempt retry loop hoists them above it and
+			// sets PreloadHoisted — see that field.
+			if !p.PreloadHoisted {
+				b = emitPrefixScanPreload(b, p)
 			}
 
 			b = append(b, 0x02, 0x40) // block $found_candidate (void)
@@ -659,122 +917,14 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 			b = append(b, 0x4F)       // i32.ge_u
 			b = append(b, 0x0D, 0x01) // br_if 1 → $simd_exhausted
 
-			// Load chunk.
-			b = append(b, 0x20, l.Ptr)
-			b = append(b, 0x20, l.AttemptStart)
-			b = append(b, 0x6A)
-			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
-			b = append(b, 0x21, l.Chunk)
-
-			if p.TeddyTwoByte && len(p.FirstByteSet) <= 8 {
-				// Load chunk1 = chunk at attempt_start+1.
-				b = append(b, 0x20, l.Ptr)
-				b = append(b, 0x20, l.AttemptStart)
-				b = append(b, 0x6A)
-				b = append(b, 0x41, 0x01)
-				b = append(b, 0x6A)
-				b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
-				b = append(b, 0x21, l.Chunk1)
-				if p.TeddyThreeByte {
-					// Load chunk2 = chunk at attempt_start+2.
-					b = append(b, 0x20, l.Ptr)
-					b = append(b, 0x20, l.AttemptStart)
-					b = append(b, 0x6A)
-					b = append(b, 0x41, 0x02)
-					b = append(b, 0x6A)
-					b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
-					b = append(b, 0x21, l.Chunk2)
-					if p.TeddyFourByte {
-						// Load chunk3 = chunk at attempt_start+3.
-						b = append(b, 0x20, l.Ptr)
-						b = append(b, 0x20, l.AttemptStart)
-						b = append(b, 0x6A)
-						b = append(b, 0x41, 0x03)
-						b = append(b, 0x6A)
-						b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
-						b = append(b, 0x21, l.Chunk3)
-					}
-				}
-			}
-
-			// Compute candidate mask.
-			if len(p.FirstByteSet) <= 8 {
-				// 1-byte Teddy: candidates0 = swizzle(T0_lo, chunk&0xF) & swizzle(T0_hi, chunk>>4)
-				b = append(b, 0x20, l.TLo) // local.get T0_lo
-				b = append(b, 0x20, l.Chunk)
-				b = append(b, 0x41, 0x0F)
-				b = append(b, 0xFD, 0x0F)  // i8x16.splat(0x0F)
-				b = append(b, 0xFD, 0x4E)  // v128.and → lo_nibbles
-				b = append(b, 0xFD, 0x0E)  // i8x16.swizzle → lo_result
-				b = append(b, 0x20, l.THi) // local.get T0_hi
-				b = append(b, 0x20, l.Chunk)
-				b = append(b, 0x41, 0x04) // i32.const 4
-				b = append(b, 0xFD, 0x6D) // i8x16.shr_u
-				b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi_result
-				b = append(b, 0xFD, 0x4E) // v128.and → candidates0
-
-				if p.TeddyTwoByte {
-					// 2-byte: AND with candidates1 from chunk1.
-					b = append(b, 0x20, l.T1Lo)
-					b = append(b, 0x20, l.Chunk1)
-					b = append(b, 0x41, 0x0F)
-					b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
-					b = append(b, 0xFD, 0x4E) // v128.and
-					b = append(b, 0xFD, 0x0E) // i8x16.swizzle → lo1
-					b = append(b, 0x20, l.T1Hi)
-					b = append(b, 0x20, l.Chunk1)
-					b = append(b, 0x41, 0x04)
-					b = append(b, 0xFD, 0x6D) // i8x16.shr_u
-					b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi1
-					b = append(b, 0xFD, 0x4E) // v128.and → candidates1
-					b = append(b, 0xFD, 0x4E) // v128.and c0&c1 → combined
-					if p.TeddyThreeByte {
-						// 3-byte: AND with candidates2 from chunk2.
-						b = append(b, 0x20, l.T2Lo)
-						b = append(b, 0x20, l.Chunk2)
-						b = append(b, 0x41, 0x0F)
-						b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
-						b = append(b, 0xFD, 0x4E) // v128.and
-						b = append(b, 0xFD, 0x0E) // i8x16.swizzle → lo2
-						b = append(b, 0x20, l.T2Hi)
-						b = append(b, 0x20, l.Chunk2)
-						b = append(b, 0x41, 0x04)
-						b = append(b, 0xFD, 0x6D) // i8x16.shr_u
-						b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi2
-						b = append(b, 0xFD, 0x4E) // v128.and → candidates2
-						b = append(b, 0xFD, 0x4E) // v128.and combined&c2
-						if p.TeddyFourByte {
-							// 4-byte: AND with candidates3 from chunk3.
-							b = append(b, 0x20, l.T3Lo)
-							b = append(b, 0x20, l.Chunk3)
-							b = append(b, 0x41, 0x0F)
-							b = append(b, 0xFD, 0x0F) // i8x16.splat(0x0F)
-							b = append(b, 0xFD, 0x4E) // v128.and
-							b = append(b, 0xFD, 0x0E) // i8x16.swizzle → lo3
-							b = append(b, 0x20, l.T3Hi)
-							b = append(b, 0x20, l.Chunk3)
-							b = append(b, 0x41, 0x04)
-							b = append(b, 0xFD, 0x6D) // i8x16.shr_u
-							b = append(b, 0xFD, 0x0E) // i8x16.swizzle → hi3
-							b = append(b, 0xFD, 0x4E) // v128.and → candidates3
-							b = append(b, 0xFD, 0x4E) // v128.and combined&c3
-						}
-					}
-				}
-
-				// bitmask of nonzero lanes.
-				b = append(b, 0x41, 0x00)
-				b = append(b, 0xFD, 0x0F) // i8x16.splat(0)
-				b = append(b, 0xFD, 0x24) // i8x16.ne
-				b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
-			} else {
-				// Shufti: multi-half nibble lookup for FirstByteSet of 9..64 bytes.
-				// Each half of ≤ 8 bytes gets its own (T_lo, T_hi) 16-byte
-				// bitmap pair; the SIMD test ORs all halves and reduces to a
-				// per-lane non-zero check. See the LikelyMode work
-				// for the broader history of Shufti adoption in regexped.
-				b = emitShuftiPrefixCheck(b, p.FirstByteSet, l.Chunk)
-			}
+			// Load the chunks and reduce them to a candidate bitmask. Both are
+			// shared with the overlapping tail probe below.
+			b = emitPrefixChunkLoads(b, p, l, func(bb []byte) []byte {
+				bb = append(bb, 0x20, l.Ptr)
+				bb = append(bb, 0x20, l.AttemptStart)
+				return append(bb, 0x6A)
+			})
+			b = emitPrefixCandidateMask(b, p, l)
 
 			// mask on stack → tee + if mask != 0.
 			b = append(b, 0x22, l.SimdMask) // local.tee simdMask
@@ -824,6 +974,113 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 
 			b = append(b, 0x0B) // end loop $simd_outer
 			b = append(b, 0x0B) // end block $simd_exhausted
+
+			// ── Overlapping tail probe ─────────────────────────────────────
+			//
+			// The loop above abandons SIMD as soon as fewer than one probe
+			// window remains, and the scalar tail then walks the last 1..15
+			// bytes one at a time. Those bytes cost about 18 fuel each against
+			// about 0.2 for a byte a chunk covers, so EVERY call carries up to
+			// ~270 fuel of remainder regardless of its length — 0.2% of a
+			// 100 KB scan and most of a 32-byte one. Measured on a
+			// short-input length sweep: `x[^\n]+` no-match goes 12 B → 242
+			// fuel, 16 B → 49, 24 B → 193, 32 B → 72, the sawtooth being
+			// entirely this tail.
+			//
+			// One more chunk recovers it, loaded BACKWARDS from the end so it
+			// still fits: the window is the last `windowBytes` of the input, it
+			// overlaps positions already scanned, and the lanes below
+			// attempt_start are shifted out of the mask. Every byte it reads is
+			// inside the input, so there is no over-read to arrange with the
+			// caller.
+			//
+			// The probe covers every position that can still BEGIN a match:
+			// its last lane is len-1 for a one-byte window, and for a k-byte
+			// Teddy the k-1 positions it leaves uncovered are ones where fewer
+			// than k bytes remain, so no match can start there anyway. That is
+			// what lets a zero mask conclude the whole remainder is dead and
+			// set attempt_start = len, retiring the scalar walk entirely rather
+			// than merely shortening it.
+			//
+			// Inputs shorter than one window get nothing — there is no full
+			// chunk anywhere in them — which is the residual only a
+			// compile-time length hint can address.
+			//
+			// Not emitted under `adaptive`: that path carries per-attempt probe
+			// bookkeeping and a handoff to a neutral twin, and a second probe
+			// outside the loop would have to decide what it means for the
+			// density budget. Unmeasured, so not guessed at.
+			if !adaptive {
+				windowBytes := int32(16)
+				if len(p.FirstByteSet) <= 8 {
+					switch {
+					case p.TeddyFourByte:
+						windowBytes = 19
+					case p.TeddyThreeByte:
+						windowBytes = 18
+					case p.TeddyTwoByte:
+						windowBytes = 17
+					}
+				}
+
+				// tailBase = len - windowBytes, as a byte offset in the input.
+				emitTailBase := func(bb []byte) []byte {
+					bb = append(bb, 0x20, l.Ptr)
+					bb = append(bb, 0x20, l.Len)
+					bb = append(bb, 0x41)
+					bb = utils.AppendSLEB128(bb, windowBytes)
+					bb = append(bb, 0x6B) // i32.sub
+					return append(bb, 0x6A)
+				}
+
+				// A full window has to exist in the input at all.
+				b = append(b, 0x20, l.Len)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, windowBytes)
+				b = append(b, 0x4F)       // i32.ge_u
+				b = append(b, 0x04, 0x40) // if $tail_window
+
+				// ...and there has to be something left to scan. The engine can
+				// resume with attempt_start at or past len.
+				b = append(b, 0x20, l.AttemptStart)
+				b = append(b, 0x20, l.Len)
+				b = append(b, 0x49)       // i32.lt_u
+				b = append(b, 0x04, 0x40) // if $tail_live
+
+				b = emitPrefixChunkLoads(b, p, l, emitTailBase)
+				b = emitPrefixCandidateMask(b, p, l)
+
+				// Drop the lanes below attempt_start: they are positions the
+				// loop above already probed. shift = attempt_start - (len -
+				// windowBytes), which the bounds exit guarantees is in
+				// [1, windowBytes-1].
+				b = append(b, 0x20, l.AttemptStart)
+				b = append(b, 0x20, l.Len)
+				b = append(b, 0x6B) // i32.sub
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, windowBytes)
+				b = append(b, 0x6A) // i32.add
+				b = append(b, 0x76) // i32.shr_u
+				b = append(b, 0x22, l.SimdMask)
+				b = append(b, 0x04, 0x40) // if (a candidate survives)
+				b = append(b, 0x20, l.AttemptStart)
+				b = append(b, 0x20, l.SimdMask)
+				b = append(b, 0x68) // i32.ctz
+				b = append(b, 0x6A) // i32.add
+				b = append(b, 0x21, l.AttemptStart)
+				// 0=this if, 1=$tail_live, 2=$tail_window, 3=$found_candidate
+				b = append(b, 0x0C, 0x03)
+				b = append(b, 0x0B) // end if
+
+				// Nothing in the remainder can begin a match: skip the scalar
+				// walk over it entirely.
+				b = append(b, 0x20, l.Len)
+				b = append(b, 0x21, l.AttemptStart)
+
+				b = append(b, 0x0B) // end if $tail_live
+				b = append(b, 0x0B) // end if $tail_window
+			}
+
 			if adaptive {
 				if p.HasTwin {
 					// The probe budget is spent: this body's prefilter has

@@ -5762,3 +5762,207 @@ regexps
 -;0-5;-;-
 -;0-5;-;-
 -;0-5;-;-
+# ============================================================
+# Category 29: Empty-width word boundaries — EVERY match, not just the first
+#
+# Regression for a bug fixed 2026-09-09. `\b` skipped every boundary whose
+# PRECEDING byte was a word character: over "a b" it reported 0, 2 and 3 and
+# missed the one at position 1.
+#
+# Cause: find mode picks candidate start positions from firstByteFlags, whose
+# empty-width-accept half consulted the prev=non-word and start contexts but
+# never prev=WORD. Only WHOLLY empty-width patterns were affected — as soon as
+# a pattern consumes a byte the transitions set the same flags, which is why
+# the `\b,` / `\b\s` / `\b[^a-z]` / `\b[a-z]+` / `x\b` rows below were
+# correct all along and are here so a future change cannot fix the empty case
+# by breaking them.
+#
+# THE COLUMN THAT MATTERS IS col4. The first match of a bare `\b` is at
+# position 0 and was always found; the defect lived entirely in the matches
+# after it. re2-exhaustive.txt has four columns, so it checks only the first
+# match and could never have caught this — see --all-matches.
+#
+# Expectations generated with Go's regexp (tools/re2test's own oracle
+# convention), not hand-written.
+# ============================================================
+WBEmptyWidth
+strings
+"a b"
+"a,b"
+"a\tb"
+"ab cd ef"
+"a"
+" a "
+"ab"
+"abc"
+"a  b"
+" "
+""
+regexps
+"\\b"
+-;0-0;-;-;0-0,1-1,2-2,3-3
+-;0-0;-;-;0-0,1-1,2-2,3-3
+-;0-0;-;-;0-0,1-1,2-2,3-3
+-;0-0;-;-;0-0,2-2,3-3,5-5,6-6,8-8
+-;0-0;-;-;0-0,1-1
+-;1-1;-;-;1-1,2-2
+-;0-0;-;-;0-0,2-2
+-;0-0;-;-;0-0,3-3
+-;0-0;-;-;0-0,1-1,3-3,4-4
+-;-;-;-;-
+-;-;-;-;-
+"\\B"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;1-1;-;-;1-1,4-4,7-7
+-;-;-;-;-
+-;0-0;-;-;0-0,3-3
+-;1-1;-;-;1-1
+-;1-1;-;-;1-1,2-2
+-;2-2;-;-;2-2
+-;0-0;-;-;0-0,1-1
+0-0;0-0;-;-;0-0
+"\\b,"
+-;-;-;-;-
+-;1-2;-;-;1-2
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"\\b\\s"
+-;1-2;-;-;1-2
+-;-;-;-;-
+-;1-2;-;-;1-2
+-;2-3;-;-;2-3,5-6
+-;-;-;-;-
+-;2-3;-;-;2-3
+-;-;-;-;-
+-;-;-;-;-
+-;1-2;-;-;1-2
+-;-;-;-;-
+-;-;-;-;-
+"\\b[^a-z]"
+-;1-2;-;-;1-2
+-;1-2;-;-;1-2
+-;1-2;-;-;1-2
+-;2-3;-;-;2-3,5-6
+-;-;-;-;-
+-;2-3;-;-;2-3
+-;-;-;-;-
+-;-;-;-;-
+-;1-2;-;-;1-2
+-;-;-;-;-
+-;-;-;-;-
+"\\b[a-z]+"
+-;0-1;-;-;0-1,2-3
+-;0-1;-;-;0-1,2-3
+-;0-1;-;-;0-1,2-3
+-;0-2;-;-;0-2,3-5,6-8
+0-1;0-1;-;-;0-1
+-;1-2;-;-;1-2
+0-2;0-2;-;-;0-2
+0-3;0-3;-;-;0-3
+-;0-1;-;-;0-1,3-4
+-;-;-;-;-
+-;-;-;-;-
+"x\\b"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+# ============================================================
+# Category 30: Negated classes over input bytes >= 0x80
+#
+# Regression for a bug fixed 2026-09-09 (commit ecaaf86). The Backtracking
+# engine truncated every rune range at 0x7F while the DFA saturates at 0xFF, so
+# a CAPTURE pattern over a negated class silently failed to match any input
+# carrying a byte >= 0x80. `<([^>]+)>` over "<caf\xe9>" returned no match.
+#
+# `.` and negated classes consuming ONE BYTE is documented byte semantics
+# (docs/engines.md), so `[^>]` must match 0xE9. Backtracking is a hybrid: the
+# DFA found the extent and the NFA capture pass then re-walked the same bytes
+# with ASCII-only ranges, which is why `find` was right and `groups` was not.
+# The shapes below are the family the engine-selection gate exists to route to
+# Backtracking.
+#
+# These rows are SKIPPED unless --high-bytes is given, because the RE2-derived
+# columns of the main corpora cannot judge a byte engine on such input (RE2
+# decodes UTF-8: for `.` over a two-byte codepoint it answers 0-2 where a byte
+# engine correctly answers 0-1). Under --high-bytes the columns here are
+# cross-checked against the twin oracle, so these hand-checked-in expectations
+# guard the oracle while the oracle guards the engine.
+#
+# Expectations generated from Go over the ASCII twin, which is the same
+# technique tools/re2test/highbytes.go uses.
+# ============================================================
+HighByteNegClass
+strings
+"<caf\xe9>"
+"caf\xe9,"
+"KEY=caf\xe9&"
+"a\xe9b"
+"\xe9\xe9"
+"aâb"
+"<cafe>"
+regexps
+"<([^>]+)>"
+0-6 1-5;0-6;-;-;0-6;0-6 1-5
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+0-6 1-5;0-6;-;-;0-6;0-6 1-5
+"([^,]+),"
+-;-;-;-;-;-
+0-5 0-4;0-5;-;-;0-5;0-5 0-4
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+"KEY=([^&]+)&"
+-;-;-;-;-;-
+-;-;-;-;-;-
+0-9 4-8;0-9;-;-;0-9;0-9 4-8
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+"(\\S+)!"
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+-;-;-;-;-;-
+"[^a]+"
+-;0-2;-;-;0-2,3-6;0-2
+-;0-1;-;-;0-1,2-5;0-1
+-;0-5;-;-;0-5,6-9;0-5
+-;1-3;-;-;1-3;1-3
+0-2;0-2;-;-;0-2;0-2
+-;1-4;-;-;1-4;1-4
+-;0-2;-;-;0-2,3-6;0-2
+"\\b"
+-;1-1;-;-;1-1,4-4;1-1
+-;0-0;-;-;0-0,3-3;0-0
+-;0-0;-;-;0-0,3-3,4-4,7-7;0-0
+-;0-0;-;-;0-0,1-1,2-2,3-3;0-0
+-;-;-;-;-;-
+-;0-0;-;-;0-0,1-1,3-3,4-4;0-0
+-;1-1;-;-;1-1,5-5;1-1

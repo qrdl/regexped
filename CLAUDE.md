@@ -71,8 +71,10 @@ regexped/
 │   │                          #   and the hidden per-position worker (a find body with the batch gate
 │   │                          #   rule / skip parameter). Cursor field widths live in config/.
 │   ├── set_union_scan.go      # Start-anywhere union automaton: one pass over the whole input.
-│   │                          #   Under set-level prefer-no-match, emitUnionSkip strides 16
-│   │                          #   bytes at a time through a state's self-loop run. Exact, not
+│   │                          #   Under set-level prefer-no-match, emitUnionSkip strides 32
+│   │                          #   bytes at a time (16 for the last stretch, which is also what
+│   │                          #   keeps the backward tail probe's window valid) through a
+│   │                          #   state's self-loop run. Exact, not
 │   │                          #   approximate: only NON-mid-accepting states qualify, so a run
 │   │                          #   has no effect but the position, and these bodies report no
 │   │                          #   position. It probes the EXIT set, never the self-loop set —
@@ -441,6 +443,36 @@ Each pattern is compiled and tested for:
 - Col 1: non-anchored find (LeftmostFirst DFA)
 - Col 5: non-anchored find with captures (with --validate-groups)
 
+**All matches, not just the first (`--all-matches`, on by default in the
+`exhaustive` target).** `re2-exhaustive.txt` carries four columns, so col4 —
+every match — is absent for all ~9.5M of its rows and only the FIRST match of
+each is checked. A pattern whose first match is right and whose later matches
+are wrong passed. That is half of why `\b` could skip every boundary whose
+preceding byte was a word character: a bare `\b` matches at position 0, which
+was always found, and the defect lived entirely in the matches after it. The
+flag synthesises col4 from a Go oracle for rows that lack one — 4.9M rows, for
+about 40% more wall time. No twin is needed for ASCII input, where Go's rune
+semantics already coincide with byte semantics.
+
+**High-byte inputs (`make -C tools/re2test high-bytes`, in `make test`)**
+un-skips the ~259K corpus rows whose INPUT carries a byte above 0x7F. Every
+other target skips them, because the expectation columns are RE2's and RE2
+decodes UTF-8 while this is a byte engine — for `.` and a negated class the two
+legitimately disagree (`.` over the two bytes of U+0080: RE2 says [0,2), a byte
+engine correctly says [0,1)). This target replaces the columns with a Go oracle
+run on an ASCII TWIN of the input: each distinct high byte is swapped for an
+ASCII byte falling inside exactly the same rune ranges of the pattern, so the
+engine cannot tell the two inputs apart, and the swap is BYTE-for-byte so every
+offset is preserved. `tools/re2test/highbytes.go` carries the argument; the
+substitute pool is control characters because a high byte is outside every
+positive ASCII class, and picking letters instead made `\w` match a twin of
+`±` — the oracle lying rather than the engine failing.
+
+Without this the corpus is blind to high bytes, which is how TWO real bugs
+survived it: Backtracking truncating every rune range at 0x7F (so
+`<([^>]+)>` lost any match over input carrying such a byte), and `\b` skipping
+every boundary whose preceding byte was a word character.
+
 **Set mode (`make setcaps` / `make sets`)** drives EVERY capability over
 the corpus, not just gated `find`: the anchored
 pair, the scan pair at many `offset` values, `find` and its batch entry in both the
@@ -517,6 +549,27 @@ The naive oracle is WRONG and wrongly failed two shapes when this was written:
 `FindAllStringIndex` reports non-overlapping matches from a left-to-right scan,
 so it never reports `[15,28)` for `[a-z]+@example\.com` over
 `"...bb@example.com..."` — but a find starting at 15 must.
+
+Two more `tools/fuzz` tests pin properties nothing else covers.
+`TestByteModeLengthsAcrossEmitters` drives `byte_mode` finds at each shape's
+SHORTEST matching input, which is the only length at which an over-estimated
+minimum length shows; its oracle is an ISOMORPHISM, mapping the high byte to an
+ASCII stand-in Go's `regexp` can run, since Go cannot express byte mode.
+`TestBatchGroupsAbsoluteSlotsSurviveAGroupsCall` calls the batch groups export
+before AND after an ordinary `groups()` call and requires the two to agree —
+the two wrappers drive the same capture body, and a channel one of them sets
+and the other does not is invisible on a fresh instance.
+
+The multi-global merge check in the same package is HAND-RUN and skips without
+its two flags:
+
+```bash
+go test ./tools/fuzz -run TestMergedTwoGlobals \
+    -args -mergeglobals-std=<std.wasm> -mergeglobals-merged=<merged.wasm>
+```
+
+It compares ANSWERS rather than global indices, because a wrong renumbering by
+`wasm-merge` still validates and simply reads the wrong variable.
 
 ### Byte-identical fixtures (`compile/testdata/byteident/`)
 
@@ -611,6 +664,16 @@ no-match input, 0.97x at 32 patterns and 0.80x at 128.** Our `scan_any` and
 `scan_all` do identical per-byte work, while regex-automata's `scan_any` is much
 cheaper than its `scan_all` — so the same engine work wins comfortably against
 one of their capabilities and just misses the other.
+
+Two further rows LOSE to their own previous selves rather than to
+regex-automata, and were accepted deliberately when the union scan's bulk loop
+went from a 4-byte to an 8-byte unroll: the exit tests move to once per block,
+so a `scan_any` that would have left on byte 1 finishes its block first.
+greedy-3 over 50K a's went 141 → 233 fuel and classchain-32 dense 362 → 447.
+Both are bounded by `unionUnroll-1` extra byte-steps — a constant of at most
+~92 fuel that does NOT grow with input — against wins of 140,000 to 243,000
+fuel that do, on twenty-four rows across both hint modes. A knob whose loss
+scaled with length would not survive the same numbers.
 
 Everything else wins. The three literal-less rows — once the evidence for
 "every win comes from the literal frontends" — were closed over 2026-08;

@@ -329,18 +329,55 @@ Memoization is only enabled when the pattern contains a **non-greedy loop whose 
 When enabled, before executing a non-greedy loop head (`InstAlt` with a backward edge), the engine checks a `(pc, pos)` visited bitset stored in WASM linear memory immediately after the backtrack stack:
 
 ```
-bitIndex  = pc * (inputLen + 1) + pos
+bitIndex  = pos * numInstructions + pc
 byteAddr  = memoTableBase + bitIndex / 8
 bit       = 1 << (bitIndex & 7)
 ```
 
 If the bit is already set, the current thread is discarded — it cannot produce a new result. Otherwise the bit is set and execution continues. This guarantees each `(pc, pos)` pair is visited at most once, bounding runtime to O(numInstructions × inputLen).
 
-The bitset is zero-initialised at the start of each call. Its size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, computed at runtime from the actual input length. A compile-time budget of 128 KB is reserved in WASM linear memory for the bitset; the memory region is placed last in the layout so longer inputs consume only unused space.
+The index is **position-major**: all `numInstructions` bits belonging to one input position are adjacent. That is what keeps the clear cheap. The bytes a single search dirties are then one contiguous run from the base of the bitset, and each call zeroes exactly the run the previous call recorded in a 4-byte header word stored immediately below the bitset — rather than a region sized from the input. For a body called once per candidate position (a set's Backtracking bucket) an input-sized clear made the whole scan quadratic; this makes it linear.
+
+The bitset's addressable size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, bounded by the actual input length, while the region reserved for it is a compile-time 128 KB. The two therefore meet at a ceiling:
+
+```
+maxInputLen = 128 KB × 8 / numInstructions − 1
+```
+
+An input longer than that cannot be memoised in the space reserved, so the engine reports `-2` (the same "resource exhausted, answer unknown" sentinel as a backtrack-stack overflow — see *Backtracking frame budget*) instead of running the fill past its region. The ceiling scales inversely with the pattern's instruction count: a 25-instruction pattern accepts inputs up to about 42 KB, a 250-instruction one about 4 KB.
+
+The two ceilings — this one and the frame budget — move independently, with `numInstructions` and with `numAlts` respectively, so either can be the one a given pattern and input hits first.
+
+#### What the ceiling is measured against
+
+`-2` here means *the engine did not finish*, never *no match*, and a host must
+surface it as an error. Which **length** is compared against the ceiling differs
+per body, because each searches a different span:
+
+| Body | Length compared against the ceiling |
+|---|---|
+| Anchored `match` | The whole input. |
+| Non-anchored `find` | The **remainder**, `len − from`. The memo is rebased onto `from`, so a host iterating a long buffer keeps getting answers as `from` advances. |
+| `groups` capture body | The narrowed match extent, or in window mode the window's own length — not the whole input. |
+| A set's Backtracking bucket | The span from the candidate position to the end of the input. This is the one case where a long input can refuse at every candidate; it is bounded by the input, not by the match. |
+
+Two further properties are worth relying on:
+
+* The check happens at the head of the **first attempt**, not at the head of the
+  call. A call whose prefilter finds no candidate — no mandatory literal
+  anywhere, or no byte that can begin a match — answers `-1` without ever
+  consulting the memo, however long the input is.
+* Only patterns that need memoisation at all are affected. `needsBitState` is
+  narrow: a non-greedy loop whose body can match zero bytes. Everything else
+  has no ceiling of this kind.
+
+If a pattern you need is refusing long inputs, the levers are the pattern's
+instruction count (the ceiling scales inversely with it) and
+`CompileOptions.MemoBudget`, which is not reachable from YAML.
 
 **Memory layout:**
 ```
-[DFA find tables] → [backtrack stack] → [BitState memo bitset]
+[DFA find tables] → [backtrack stack] → [4-byte dirty header] → [BitState memo bitset]
 ```
 All regions are page-aligned and strictly non-overlapping. The input buffer is placed at address 0 by the host and never overlaps with the tables region.
 

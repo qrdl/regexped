@@ -15,12 +15,18 @@ import (
 // Populated by analyzePattern; consumed by set composition (Phase 2+).
 type PatternInfo struct {
 	fullPattern string
-	name        string         // YAML name: field; empty when not set
-	globalID    int            // index into cfg.Regexps
-	prefixAST   *syntax.Regexp // AST before the mandatory literal; nil when trivial
-	suffixAST   *syntax.Regexp // AST after the mandatory literal; nil when trivial
-	mandLit     *mandatoryLit  // from findMandatoryLitRec
-	splittable  bool           // false when splitAtPath rejects the path (routes to fallback)
+	// byteMode is the member's config.RegexEntry.ByteMode, kept because the
+	// length analysers need it and PatternInfo is all a set-level consumer
+	// gets: regexpMinMaxLen counts a literal rune 0x80..0xFF as one byte under
+	// it and as two without, and reading the wrong one back is an over-count
+	// every caller treats as a true bound.
+	byteMode   bool
+	name       string         // YAML name: field; empty when not set
+	globalID   int            // index into cfg.Regexps
+	prefixAST  *syntax.Regexp // AST before the mandatory literal; nil when trivial
+	suffixAST  *syntax.Regexp // AST after the mandatory literal; nil when trivial
+	mandLit    *mandatoryLit  // from findMandatoryLitRec
+	splittable bool           // false when splitAtPath rejects the path (routes to fallback)
 
 	prefixDFA *dfaTable // built from prefixAST (reversed); nil when trivial
 	prefixID  int       // index into dedup prefix pool; -1 = trivial
@@ -320,6 +326,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 
 	info := &PatternInfo{
 		fullPattern: re.Pattern,
+		byteMode:    re.ByteMode,
 		prefixID:    -1,
 		suffixID:    -1,
 	}
@@ -356,13 +363,13 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	// anywhere, and the branch below routes them to fallback like every other
 	// zero-length-matchable pattern. Their answers are checked against Go in
 	// TestZCaretIsNotExcluded.
-	if minLen, _ := regexpMinMaxLen(parsed); minLen == 0 {
+	if minLen, _ := regexpMinMaxLen(parsed, re.ByteMode); minLen == 0 {
 		info.splittable = false
 		info.setTopLevelAnchor(parsed)
 		return info, nil
 	}
 
-	lit, path := findMandatoryLitRec(parsed, 0, 0)
+	lit, path := findMandatoryLitRec(parsed, 0, 0, re.ByteMode)
 	info.mandLit = lit
 
 	if lit != nil {
@@ -372,7 +379,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 			// Zero-length prefix: only strip if it consists purely of begin-anchors (^, \A).
 			// Mixed prefixes (e.g. ^$, \b) or non-begin zero-length assertions route to fallback.
 			if prefixAST != nil {
-				if _, maxLen := regexpMinMaxLen(prefixAST); maxLen == 0 {
+				if _, maxLen := regexpMinMaxLen(prefixAST, re.ByteMode); maxLen == 0 {
 					if isOnlyBeginAnchors(prefixAST) {
 						switch strippedAnchorKind(prefixAST) {
 						case beginAnchorLine:
@@ -439,7 +446,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	// nothing can be skipped anyway. The cost is the literal frontend, which
 	// a class-B set could not have used regardless.
 	if info.prefixAST != nil {
-		if minLen, maxLen := regexpMinMaxLen(info.prefixAST); minLen != maxLen {
+		if minLen, maxLen := regexpMinMaxLen(info.prefixAST, re.ByteMode); minLen != maxLen {
 			info.splittable = false
 			info.prefixAST = nil
 			info.suffixAST = nil
@@ -499,7 +506,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		// Only the MAX is kept: a variable-length prefix is fallback-routed
 		// above, so min == max here, and prefixMinLen was a field written and
 		// never read.
-		_, maxLen := regexpMinMaxLen(info.prefixAST)
+		_, maxLen := regexpMinMaxLen(info.prefixAST, re.ByteMode)
 		info.prefixMaxLen = maxLen
 	}
 
@@ -615,6 +622,14 @@ type CompileSetOptions struct {
 	// frontend actually ships. Zero value means "use the verdict".
 	ForceShuftiAdaptive bool
 	forceShuftiAdaptive bool
+
+	// globals is the MODULE's global allocator, shared with every pattern and
+	// every other set in the same compile. A set reaches for it when a bucket
+	// wants module-scoped state — today only the sparse member skip's
+	// per-bucket verdict (TODO 75 group C). nil in the out-of-package entry
+	// points, which is why every consumer must allocate ONLY on the condition
+	// that produced it.
+	globals *moduleGlobals
 }
 
 // SetFrontend is the exported spelling of frontendKind, so an out-of-package
@@ -1874,23 +1889,53 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 			}
 
 			if !placed {
+				// Build the bucket's suffix DFA with correct bitmask accepts (bit 0 = pattern 0).
+				// p.suffixDFA is built without patternBits (for dedup); we need bitmask info for WASM.
+				var single *dfaTable
+				if ast := patternSuffixAST(p); ast != nil {
+					if t, _, mergeErr := mergeSuffixDFA([]*syntax.Regexp{ast}, opts); mergeErr == nil {
+						single = t
+					}
+				}
+				if single == nil {
+					// DROP, loudly. Keeping the bucket would make it LIVE with a
+					// nil suffix DFA, and genSuffixWASM emits a body returning 0
+					// for that — so the literal would gate candidates into a
+					// bucket that reports no match at any of them, and the
+					// pattern would silently never match with no warning and no
+					// --diag-json entry.
+					//
+					// The fallback packers already refuse this, through
+					// admitOrDropFallback. This site kept the failure instead,
+					// which left one policy written down twice with two
+					// different answers; the drop below is the fallback one.
+					//
+					// Not rescued into a BT bucket the way admitOrDropFallback
+					// does: newBTBucket returns a bucket with an EMPTY literal
+					// and isFallback set, and litBuckets is a shared-literal
+					// group — promoteSharedLiteralBuckets keys on
+					// litBuckets[0].literal and treats an empty one as "this is
+					// the fallback group". Injecting one here would corrupt that
+					// classification for the whole group.
+					warnPatternDroppedReason(p, "binPack",
+						"its own suffix DFA could not be built",
+						"simplify the pattern or move it out of the set",
+						0, opts.maxFallbackStates())
+					if diag != nil {
+						diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
+					}
+					continue
+				}
 				// Create a new bucket for this pattern.
-				nb := &bucket{
+				litBuckets = append(litBuckets, &bucket{
 					literal:      lit,
 					patterns:     []*PatternInfo{p},
 					suffixStates: p.suffixStates,
 					tableBytes:   dfaTableBytes(p.suffixDFA),
 					classMap:     p.suffixClassMap,
 					numClasses:   p.suffixClasses,
-				}
-				// Build the bucket's suffix DFA with correct bitmask accepts (bit 0 = pattern 0).
-				// p.suffixDFA is built without patternBits (for dedup); we need bitmask info for WASM.
-				if ast := patternSuffixAST(p); ast != nil {
-					if t, _, mergeErr := mergeSuffixDFA([]*syntax.Regexp{ast}, opts); mergeErr == nil {
-						nb.suffixDFA = t
-					}
-				}
-				litBuckets = append(litBuckets, nb)
+					suffixDFA:    single,
+				})
 			}
 		}
 		// G17: buckets that split ONLY because the accept mask ran out of bits

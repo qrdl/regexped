@@ -31,7 +31,7 @@ func mustParse(t *testing.T, pattern string) *syntax.Regexp {
 func findPath(t *testing.T, pattern string) ([]splitFrame, bool) {
 	t.Helper()
 	re := mustParse(t, pattern)
-	lit, path := findMandatoryLitRec(re, 0, 0)
+	lit, path := findMandatoryLitRec(re, 0, 0, false)
 	if lit == nil {
 		return nil, false
 	}
@@ -164,7 +164,7 @@ func TestSplitAtPath_RejectsQuantifier(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			re := mustParse(t, tc.pattern)
-			lit, path := findMandatoryLitRec(re, 0, 0)
+			lit, path := findMandatoryLitRec(re, 0, 0, false)
 			if lit == nil {
 				t.Skip("no mandatory lit found (pattern not eligible)")
 			}
@@ -180,7 +180,7 @@ func TestSplitAtPath_RejectsAlternate(t *testing.T) {
 	// Construct a path that contains OpAlternate manually (findMandatoryLitRec
 	// never returns a path with OpAlternate, but splitAtPath must reject it).
 	re := mustParse(t, `foo`)
-	lit, path := findMandatoryLitRec(re, 0, 0)
+	lit, path := findMandatoryLitRec(re, 0, 0, false)
 	if lit == nil {
 		t.Fatal("no mandatory lit found")
 	}

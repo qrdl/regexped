@@ -61,9 +61,9 @@ func TestRegexpMinMaxLen(t *testing.T) {
 	}
 	for _, c := range cases {
 		re := parse(c.pattern)
-		gotMin, gotMax := regexpMinMaxLen(re)
+		gotMin, gotMax := regexpMinMaxLen(re, false)
 		if gotMin != c.wantMin || gotMax != c.wantMax {
-			t.Errorf("regexpMinMaxLen(%q) = (%d,%d), want (%d,%d)",
+			t.Errorf("regexpMinMaxLen(%q, false) = (%d,%d), want (%d,%d)",
 				c.pattern, gotMin, gotMax, c.wantMin, c.wantMax)
 		}
 	}
@@ -85,9 +85,9 @@ func TestFindMandatoryLitRecDegenerate(t *testing.T) {
 		{"plus_no_sub", &syntax.Regexp{Op: syntax.OpPlus}},
 	}
 	for _, c := range cases {
-		got, _ := findMandatoryLitRec(c.re, 0, 0)
+		got, _ := findMandatoryLitRec(c.re, 0, 0, false)
 		if got != nil {
-			t.Errorf("findMandatoryLitRec(%s): got %v, want nil", c.name, got)
+			t.Errorf("findMandatoryLitRec(%s, false): got %v, want nil", c.name, got)
 		}
 	}
 }
@@ -112,9 +112,9 @@ func TestRegexpMinMaxLenDegenerate(t *testing.T) {
 		{"unknown_op", &syntax.Regexp{Op: syntax.Op(99)}, 0, -1},
 	}
 	for _, c := range cases {
-		min, max := regexpMinMaxLen(c.re)
+		min, max := regexpMinMaxLen(c.re, false)
 		if min != c.wantMin || max != c.wantMax {
-			t.Errorf("regexpMinMaxLen(%s) = (%d,%d), want (%d,%d)", c.name, min, max, c.wantMin, c.wantMax)
+			t.Errorf("regexpMinMaxLen(%s, false) = (%d,%d), want (%d,%d)", c.name, min, max, c.wantMin, c.wantMax)
 		}
 	}
 }
@@ -152,25 +152,25 @@ func TestFindMandatoryLit(t *testing.T) {
 		{"[a-z]{0,3}foo", false, "foo", 0},
 	}
 	for _, c := range cases {
-		got := findMandatoryLit(c.pattern)
+		got := findMandatoryLit(c.pattern, false)
 		if c.wantNil {
 			if got != nil {
-				t.Errorf("findMandatoryLit(%q): got %v, want nil", c.pattern, got)
+				t.Errorf("findMandatoryLit(%q, false): got %v, want nil", c.pattern, got)
 			}
 			continue
 		}
 		if got == nil {
-			t.Errorf("findMandatoryLit(%q): got nil, want lit=%q", c.pattern, c.wantLit)
+			t.Errorf("findMandatoryLit(%q, false): got nil, want lit=%q", c.pattern, c.wantLit)
 			continue
 		}
 		if string(got.bytes) != c.wantLit {
-			t.Errorf("findMandatoryLit(%q): lit=%q, want %q", c.pattern, got.bytes, c.wantLit)
+			t.Errorf("findMandatoryLit(%q, false): lit=%q, want %q", c.pattern, got.bytes, c.wantLit)
 		}
 		if got.minOff != c.wantMin {
-			t.Errorf("findMandatoryLit(%q): minOff=%d, want %d", c.pattern, got.minOff, c.wantMin)
+			t.Errorf("findMandatoryLit(%q, false): minOff=%d, want %d", c.pattern, got.minOff, c.wantMin)
 		}
 		if got.maxOff < got.minOff {
-			t.Errorf("findMandatoryLit(%q): maxOff %d < minOff %d", c.pattern, got.maxOff, got.minOff)
+			t.Errorf("findMandatoryLit(%q, false): maxOff %d < minOff %d", c.pattern, got.maxOff, got.minOff)
 		}
 	}
 }
@@ -191,8 +191,8 @@ func TestHasMandatoryLit(t *testing.T) {
 		{"[invalid", false}, // parse error
 	}
 	for _, c := range cases {
-		if got := HasMandatoryLit(c.pattern); got != c.want {
-			t.Errorf("HasMandatoryLit(%q) = %v, want %v", c.pattern, got, c.want)
+		if got := HasMandatoryLit(c.pattern, false); got != c.want {
+			t.Errorf("HasMandatoryLit(%q, false) = %v, want %v", c.pattern, got, c.want)
 		}
 	}
 }

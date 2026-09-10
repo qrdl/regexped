@@ -2947,8 +2947,22 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		wbAcceptWMid := t.hasWordBoundary && t.midAcceptWStates[t.midStartState] != 0
 		wbAcceptNWStart0 := t.hasWordBoundary && t.midAcceptNWStates[t.startState] != 0
 		wbAcceptWStart0 := t.hasWordBoundary && t.midAcceptWStates[t.startState] != 0
+		// midStartWordState (prev=WORD) needs the same two, and not having them
+		// lost real matches. The transitions loop below was already taught about
+		// this state; the EMPTY-WIDTH accept out of it was not, so for a pattern
+		// with no byte-consuming instruction at all — bare `\b` — nothing ever
+		// set a flag for the prev=word context. `\b` over "a b" then reported
+		// boundaries at 0, 2 and 3 and skipped the one at 1, where a word
+		// character is followed by a space.
+		//
+		// Only wholly empty-width patterns were affected: as soon as the pattern
+		// consumes a byte, the transitions loop sets the flags and the answer
+		// comes out right, which is why `\b,` and `\bfoo` were always correct.
+		wbAcceptNWMidWord := t.hasWordBoundary && t.midAcceptNWStates[t.midStartWordState] != 0
+		wbAcceptWMidWord := t.hasWordBoundary && t.midAcceptWStates[t.midStartWordState] != 0
 		if t.midAcceptStates[t.midStartState] != 0 || t.midAcceptStates[t.startState] != 0 || t.acceptStates[t.startState] != 0 ||
-			(wbAcceptNWMid && wbAcceptWMid) || (wbAcceptNWStart0 && wbAcceptWStart0) {
+			(wbAcceptNWMid && wbAcceptWMid) || (wbAcceptNWStart0 && wbAcceptWStart0) ||
+			(wbAcceptNWMidWord && wbAcceptWMidWord) {
 			for b := 0; b < 256; b++ {
 				l.firstByteFlags[b] = 1
 			}
@@ -2976,6 +2990,13 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 					l.firstByteFlags[b] = 1
 				}
 				if wbAcceptNWStart0 && !isWordCharByte(byte(b)) {
+					l.firstByteFlags[b] = 1
+				}
+				// The prev=WORD context, which nothing above covers.
+				if wbAcceptWMidWord && isWordCharByte(byte(b)) {
+					l.firstByteFlags[b] = 1
+				}
+				if wbAcceptNWMidWord && !isWordCharByte(byte(b)) {
 					l.firstByteFlags[b] = 1
 				}
 			}
@@ -4259,12 +4280,12 @@ const minLMBareShuftiLen = 8
 // ineligible (this recomputes syntax.Parse; compilePattern's caller has
 // already validated the pattern earlier in the pipeline, so failure here
 // should not happen in practice).
-func lmBareShuftiEligible(pattern string) bool {
+func lmBareShuftiEligible(pattern string, byteMode bool) bool {
 	parsed, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return false
 	}
-	minLen, _ := regexpMinMaxLen(parsed)
+	minLen, _ := regexpMinMaxLen(parsed, byteMode)
 	return minLen >= minLMBareShuftiLen
 }
 
@@ -4612,7 +4633,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 // holds one suffix DFA for N patterns, so there is deliberately no
 // per-pattern override: the hint that governs this body is the one on the
 // set.
-func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, globals *moduleGlobals, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
 	// probeFlags[0]: also build the first-hit variant (set wants both rules).
 	// probeFlags[1]: the SOLE probe is first-hit (no scan_all declared), so
 	// scanProbe itself gets the cheap exit and no second body is emitted.
@@ -4850,8 +4871,22 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		// bucket's scratch — and therefore its neutral output — for a region
 		// a neutral build never reads.
 		staleStates := 0
+		memberGlobal := int32(-1)
 		if tabs.hasMember {
 			staleStates = l.numWASM
+			// The per-BUCKET verdict is a module global, not a scratch byte:
+			// the index comes from an allocator instead of address arithmetic,
+			// and a body reading a global its assembler never declared fails
+			// WASM validation rather than reading whatever sits at a stale
+			// offset (TODO 75 group A's defect class, applied here).
+			//
+			// Allocated ONLY when the skip is emitted, which is the same
+			// condition the per-state flags are sized on — so a neutral build
+			// allocates nothing and its module is unchanged.
+			if globals == nil {
+				panic("compile: a member-skip bucket needs the module's global allocator")
+			}
+			memberGlobal = int32(globals.Alloc())
 		}
 		scratch := planSparseScratch(idMapOff+int32(len(idMap)), len(patternIDs), staleStates)
 		dataBytes = append(dataBytes, appendDataSegment(nil, tabs.midOff, tabs.data)...)
@@ -4888,6 +4923,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 			wasmStart:    uint32(t.startState + 1),
 			wasmMidStart: uint32(t.midStartState + 1),
 			tableMemIdx:  tableMemIdx, gated: gated, hasSkip: needSkip,
+			memberGlobal: memberGlobal,
 		}
 		art.fnBody = sizePrefixed(buildSparseSuffixBody(sp))
 		if needProbes {
@@ -9290,6 +9326,46 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	// the neutral twin left a five-byte zero-padded immediate. -1 when this
 	// body emits no handoff, which is every body without a twin.
 	twinCallPatch := -1
+
+	// emitScanPreload emits the prefix scan's loop-invariant Teddy nibble-table
+	// loads ONCE, above `loop $outer`, for the emission inside it that sets
+	// PreloadHoisted.
+	//
+	// It reads the v128 local indices at CALL time, not at closure-creation
+	// time, because assignV128Locals rewrites them per table-width variant and
+	// each variant emits its own body. Called after that assignment and before
+	// the loop opens.
+	//
+	// A no-op unless the scan strategy actually reads the tables, so the three
+	// call sites need no condition of their own.
+	emitScanPreload := func(b []byte) []byte {
+		return emitPrefixScanPreload(b, prefixScanParams{
+			FirstByteSet:   firstBytes,
+			TeddyLoOff:     teddyLoOff,
+			TeddyHiOff:     teddyHiOff,
+			TeddyT1LoOff:   teddyT1LoOff,
+			TeddyT1HiOff:   teddyT1HiOff,
+			TeddyTwoByte:   teddyTwoByte,
+			TeddyT2LoOff:   teddyT2LoOff,
+			TeddyT2HiOff:   teddyT2HiOff,
+			TeddyThreeByte: teddyThreeByte,
+			TeddyT3LoOff:   teddyT3LoOff,
+			TeddyT3HiOff:   teddyT3HiOff,
+			TeddyFourByte:  teddyFourByte,
+			TableMemIdx:    tableMemIdx,
+			Locals: prefixScanLocals{
+				TLo:  tLoLocal,
+				THi:  tHiLocal,
+				T1Lo: t1LoLocal,
+				T1Hi: t1HiLocal,
+				T2Lo: t2LoLocal,
+				T2Hi: t2HiLocal,
+				T3Lo: t3LoLocal,
+				T3Hi: t3HiLocal,
+			},
+		})
+	}
+
 	emitOuterPrologue := func(b []byte) []byte {
 		lenForScan := byte(1) // raw len param
 		params := prefixScanParams{
@@ -9312,7 +9388,12 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			LikelyNoMatch:    lnmAction5,
 			AllowDenseSwitch: needsDenseSwitch,
 			HasTwin:          p.hasTwin,
-			EngineDepth:      2, // loop $outer + block $no_match
+			// The Teddy nibble-table loads are emitted once by
+			// emitScanPreload, above `loop $outer`. Left here they re-ran on
+			// every attempt for no gain — the tables are compile-time
+			// constants and their locals are written nowhere else.
+			PreloadHoisted: true,
+			EngineDepth:    2, // loop $outer + block $no_match
 			Locals: prefixScanLocals{
 				Ptr:           0,
 				Len:           lenForScan,
@@ -9979,6 +10060,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		if useMandatoryLit {
 			b = emitMLOuterSetup(b)
 		} else {
+			b = emitScanPreload(b)    // loop-invariant, so above the loop
 			b = append(b, 0x03, 0x40) // loop $outer
 			b = emitOuterPrologue(b)
 		}
@@ -10064,6 +10146,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		if useMandatoryLit {
 			b = emitMLOuterSetup(b)
 		} else {
+			b = emitScanPreload(b)    // loop-invariant, so above the loop
 			b = append(b, 0x03, 0x40) // loop $outer
 			b = emitOuterPrologue(b)
 		}
@@ -10137,6 +10220,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	if useMandatoryLit {
 		b = emitMLOuterSetup(b)
 	} else {
+		b = emitScanPreload(b)    // loop-invariant, so above the loop
 		b = append(b, 0x03, 0x40) // loop $outer
 		b = emitOuterPrologue(b)
 	}

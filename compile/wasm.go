@@ -92,6 +92,16 @@ func parseDataSegments(rawData []byte) []dataSegment {
 			panic(fmt.Sprintf("parseDataSegments: malformed segment size in self-emitted data: %v — invariant violation", err))
 		}
 		off += n
+		// The size field is checked against what REMAINS, not trusted. Every
+		// other malformation here panics with an invariant message naming the
+		// problem; an oversized size was the one that instead sliced out of
+		// range and died with Go's own message, which says nothing about where
+		// the bad bytes came from. Same class as the truncation checks above,
+		// same treatment.
+		if int(size) > len(rawData)-off {
+			panic(fmt.Sprintf("parseDataSegments: segment size %d exceeds the %d bytes remaining in self-emitted data — invariant violation",
+				size, len(rawData)-off))
+		}
 		data := make([]byte, size)
 		copy(data, rawData[off:off+int(size)])
 		off += int(size)
@@ -253,4 +263,18 @@ func appendDataSegmentMem1(out []byte, offset int32, data []byte) []byte {
 	out = append(out, 0x0B) // end
 	out = utils.AppendULEB128(out, uint32(len(data)))
 	return append(out, data...)
+}
+
+// appendTableMemoryFill emits `memory.fill` against the TABLE memory.
+//
+// The immediate is a memory index, and it must be the same one the
+// surrounding loads and stores use: an embedded module keeps its tables in
+// memory[1] and reads the host's input from memory[0], so a hardcoded 0 here
+// zeroes the CALLER's memory instead of the table it was meant to clear —
+// silently, since both indices are valid. The BitState memo fill did exactly
+// that until 2026-09-06, wiping up to 128 KB of host memory per call while
+// leaving the memo itself dirty.
+func appendTableMemoryFill(b []byte, tableMemIdx int) []byte {
+	b = append(b, 0xFC, 0x0B)
+	return utils.AppendULEB128(b, uint32(tableMemIdx))
 }

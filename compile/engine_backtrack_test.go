@@ -167,9 +167,12 @@ func TestBtAllocSizes(t *testing.T) {
 	if memoSize != 0 {
 		t.Errorf("btAllocSizes(useMemo=false): memoSize = %d, want 0", memoSize)
 	}
+	// The reservation is the budget-sized BITSET plus the 4-byte header word
+	// that records how much of it the last call dirtied.
 	_, memoSize2 := btAllocSizes(bt, true, 0, 128*1024)
-	if memoSize2 != 128*1024 {
-		t.Errorf("btAllocSizes(useMemo=true): memoSize = %d, want 131072", memoSize2)
+	if memoSize2 != 128*1024+btMemoHeaderBytes {
+		t.Errorf("btAllocSizes(useMemo=true): memoSize = %d, want %d",
+			memoSize2, 128*1024+btMemoHeaderBytes)
 	}
 }
 
@@ -328,13 +331,30 @@ func TestNfaFirstBytesCaseFold(t *testing.T) {
 		}
 	})
 	t.Run("all_non_ascii", func(t *testing.T) {
+		// This subtest asserted `want empty` until 2026-09-09, which was
+		// asserting the defect. An empty set with allBytes == false makes
+		// buildBTScanTables emit an all-zero 256-byte flag table — "no byte
+		// can begin a match" — so the pattern could never match anything at
+		// all. The set feeds a PREFILTER, where omitting a byte skips valid
+		// start positions; 0x80..0xFF is the honest answer for a class that
+		// admits exactly those bytes.
 		prog := compileBTTestProg(t, `[^\x00-\x7F]+`)
-		first, _, allBytes := nfaFirstBytes(prog)
+		first, flags, allBytes := nfaFirstBytes(prog)
 		if allBytes {
 			t.Errorf("nfaFirstBytes([^\\x00-\\x7F]+): allBytes = true, want false (first-byte set entirely non-ASCII)")
 		}
-		if len(first) != 0 {
-			t.Errorf("nfaFirstBytes([^\\x00-\\x7F]+): first = %v, want empty", first)
+		if len(first) != 128 {
+			t.Errorf("nfaFirstBytes([^\\x00-\\x7F]+): got %d first bytes, want 128 (0x80..0xFF)", len(first))
+		}
+		for b := 0; b < 0x80; b++ {
+			if flags[b] != 0 {
+				t.Errorf("nfaFirstBytes([^\\x00-\\x7F]+): ASCII byte %#02x flagged, want unflagged", b)
+			}
+		}
+		for b := 0x80; b < 0x100; b++ {
+			if flags[b] == 0 {
+				t.Errorf("nfaFirstBytes([^\\x00-\\x7F]+): byte %#02x unflagged, want flagged", b)
+			}
 		}
 	})
 }

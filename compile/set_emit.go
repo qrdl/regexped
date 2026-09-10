@@ -542,7 +542,53 @@ func (s SetSpec) needsAnchoredBuckets() bool {
 
 // CompileSet compiles one set specification into a compiledSet.
 // prefixPool and suffixPool are shared dedup pools across all sets in the file.
+// assertBucketEmittable enforces the invariant that a bucket reaching suffix
+// emission has a table to emit.
+//
+// genSuffixWASM answers a nil table with a body that returns 0, which is
+// indistinguishable from "no match at this position". A bucket that got this
+// far without one would therefore be gated by its literal, dispatched to, and
+// silently report nothing at every candidate — the pattern would never match,
+// with no warning and no --diag-json entry. That is FABLE B24, whose live half
+// was binPack's literal-singleton arm keeping a mergeSuffixDFA failure.
+//
+// A BUILD failure rather than a diagnostic, because by this point every packer
+// is supposed to have dropped such a pattern already: admitOrDropFallback does
+// it for the two fallback packers, and binPack's literal singleton now does it
+// too. This is what stops a fourth site reintroducing the hole quietly.
+//
+// Backtracking buckets are excluded by the caller before this runs — having no
+// table is the whole point of one.
+func assertBucketEmittable(bi int, bkt *bucket) {
+	if bkt.suffixDFA == nil {
+		panic(fmt.Sprintf("set bucket %d (literal %q, %d patterns) has no suffix DFA and no BT "+
+			"fallback: a packer admitted a bucket that can never match", bi, bkt.literal, len(bkt.patterns)))
+	}
+}
+
 func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions) *compiledSet {
+	// THE nil-allocator fallback for the whole set path. A nil allocator means
+	// this set is being compiled outside a module assembly — CompileSet is
+	// reachable that way from tests that inspect the result rather than run
+	// it — and numbering from a fresh allocator keeps the emitted bodies
+	// self-consistent with each other.
+	//
+	// It belongs HERE, once, and not in the emitters. planBTRegions used to
+	// carry a fallback of its own and genSuffixWASM a panic, so the same
+	// condition had two answers a caller could not predict from either site;
+	// with the allocator guaranteed from this entry, the emitters need no
+	// policy at all and genSuffixWASM's panic is a real assertion again.
+	//
+	// The PATTERN path deliberately does the opposite — see the two
+	// `buildOpts.globals != nil` guards in compilePatternBody. There a nil
+	// allocator must NOT be replaced: a pattern compiled alone is assembled by
+	// a caller whose own allocator never saw the allocation, so inventing one
+	// here would emit a body reading a global the module never declares.
+	// Those emitters degrade to the equivalent no-global form instead, which
+	// is why they can afford to and these cannot.
+	if opts.globals == nil {
+		opts.globals = &moduleGlobals{}
+	}
 	diag := &SetDiag{Name: spec.Name}
 	// G17's sparse accept. Probes are served too: a sparse probe cannot return
 	// a bucket-local bitmask — that is the 32-pattern ceiling it exists to
@@ -779,6 +825,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		if bkt.btFallback != nil {
 			continue
 		}
+		assertBucketEmittable(bi, bkt)
 		base, reused, fp := tableOffset, false, uint64(0)
 		if bkt.suffixDFA != nil && !bkt.sparse {
 			fp = dfaFingerprint(bkt.suffixDFA)
@@ -789,7 +836,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
 		bkt.dp = art.dp
 		if art.sparseProbeReady {
 			// The scratch address is decided by the emitter; the driver reads
@@ -1087,8 +1134,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 	}
 
-	// Record the frontend actually used (after any fallback to scalar).
-	diag.Frontend = fe.String()
+	// diag.Frontend is recorded at the END of this function, from
+	// emittedFrontend(cs) — `fe` alone is the SELECTED frontend, and the body
+	// can still fall back to scalar when the set has fallback buckets.
 
 	// Member self-loop skip counts, recorded HERE rather than at emission.
 	//
@@ -1149,7 +1197,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// the per-candidate driver calls one suffix function at a time and the
 	// memo re-zeroes itself at the head of every call.
 	btBase := ra.Reserve("bt-fallback", 1)
-	btRegions := planBTRegions(buckets, int64(btBase))
+	btRegions := planBTRegions(buckets, int64(btBase), opts.globals)
 	numBTFns := 0
 	for bi, bkt := range buckets {
 		if bkt.btFallback == nil {
@@ -1522,6 +1570,10 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// an extra entry for it, so --diag-json must still say so.
 		diag.Capabilities = append(diag.Capabilities, "find+batch-find")
 	}
+	// The frontend the module will actually contain, not the one selection
+	// picked — see emittedFrontend. Recorded here rather than at selection
+	// time because it depends on the finished bucket list.
+	diag.Frontend = emittedFrontend(cs).String()
 	return cs
 }
 
@@ -1714,6 +1766,8 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 			// CompileSetOptions.ForceShuftiAdaptive.
 			ForceShuftiAdaptive: over.ForceShuftiAdaptive,
 			forceShuftiAdaptive: over.forceShuftiAdaptive,
+			// The module's allocator, shared with the per-pattern entries above.
+			globals: globals,
 		}
 		if !standalone {
 			setOpts.TableMemIdx = 1
@@ -2111,9 +2165,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				}
 				winOff := int32(-1)
 				if !p.isTDFA {
-					winOff = p.winScratchOff
+					winOff = p.winGlobal()
 				}
-				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff)
+				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal())
 			}
 		}
 		if p.batchFindExport != "" {
@@ -2129,9 +2183,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				}
 				winOff := int32(-1)
 				if !p.isTDFA {
-					winOff = p.winScratchOff
+					winOff = p.winGlobal()
 				}
-				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode)
+				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal())
 			}
 		}
 		if p.hasFindFunc() {
@@ -2139,7 +2193,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				panic("compile: pattern contributes a find function but no findFromMode was recorded — " +
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
-			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode)
+			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.minLen)
 		}
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
@@ -2295,28 +2349,56 @@ func rebuildSetMatchBody(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMe
 // shared, which is the whole point — routing the scan trio through the scalar
 // body cost 17x the fuel on a literal-frontend set.
 func emitSetMatchFnFinal(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemIdx int, mode setCapKind, probeFnBase int) []byte {
-	switch cs.fe {
+	switch emittedFrontend(cs) {
 	case frontendAC:
 		return emitSetMatchFnFinalAC(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
 	case frontendTeddy:
+		return emitSetMatchFnFinalTeddy(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
+	case frontendShufti:
+		return emitSetMatchFnFinalShufti(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+	case frontendPackedPair:
+		return emitSetMatchFnFinalPackedPair(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+	}
+	return emitSetMatchFnFinalScalar(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
+}
+
+// emittedFrontend reports the frontend emitSetMatchFnFinal will ACTUALLY use,
+// which is not always the one selection chose.
+//
+// A fallback bucket has no literal gating it and must be tried at EVERY
+// position, so a prefilter that skips positions cannot serve it and the body
+// falls back to the scalar scan. Selection does not know that — chooseLiteral-
+// Frontend sees only the literals — so `cs.fe` can say Teddy while the emitted
+// body is scalar.
+//
+// This exists because `--diag-json` used to report `cs.fe` and was therefore
+// WRONG for exactly those sets (FABLE B23): it named a frontend the module did
+// not contain. Selection and emission now answer through one function, so they
+// cannot drift apart again.
+//
+// Answers for the VIEW: under phase1Only the fallback buckets belong to phase
+// 2, so hasSetFallbackBuckets reports false and the prefilter stays on.
+// cs.packedPair is nil only if selection and build disagreed; scalar is the
+// safe answer if they ever do.
+func emittedFrontend(cs *compiledSet) frontendKind {
+	switch cs.fe {
+	case frontendAC:
+		return frontendAC
+	case frontendTeddy:
 		if !hasSetFallbackBuckets(cs) {
-			return emitSetMatchFnFinalTeddy(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
+			return frontendTeddy
 		}
 	case frontendShufti:
 		// Selection guarantees no fallback buckets — see set_emit.go gap H.3 block.
 		if !hasSetFallbackBuckets(cs) {
-			return emitSetMatchFnFinalShufti(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+			return frontendShufti
 		}
 	case frontendPackedPair:
-		// Same fallback-bucket rule as Teddy: a fallback pattern must be tried
-		// at every position, so a prefilter that skips positions cannot serve
-		// it. cs.packedPair is nil only if selection and build disagreed;
-		// falling through to scalar is the safe answer if they ever do.
 		if !hasSetFallbackBuckets(cs) && cs.packedPair != nil {
-			return emitSetMatchFnFinalPackedPair(cs, suffixFnBase, prefixFnBaseIdx, mode, probeFnBase)
+			return frontendPackedPair
 		}
 	}
-	return emitSetMatchFnFinalScalar(cs, suffixFnBase, prefixFnBaseIdx, tableMemIdx, mode, probeFnBase)
+	return frontendScalar
 }
 
 // hasSetFallbackBuckets reports whether the body being emitted must visit
@@ -2368,6 +2450,193 @@ func overlapCanPreflight(spec SetSpec, buckets []*bucket) bool {
 	}
 	return maxID+1 <= 64
 }
+
+// setTailProbeParams configures emitSetTailProbe, the ONE backward tail probe
+// shared by all four literal frontends.
+//
+// See emitSetTailProbe for what the probe is and why it is correct. This struct
+// is the record of what legitimately differs between the four, which was the
+// whole problem with four hand-written copies: the differences were real, but
+// indistinguishable from drift because nothing named them.
+type setTailProbeParams struct {
+	// The scan's own locals.
+	lPos, pInPtr, pInLen byte
+
+	// The probe's four. base and mask hold the probe's result; probed makes it
+	// once-per-call (the tail block is re-entered once per remaining position);
+	// skip is the hoisted "this input is shorter than one window" verdict,
+	// which is a local rather than a re-taken compare because an input with no
+	// window enters the block at every position — as a compare it measured
+	// +3.7% on a 16-byte call.
+	lTailBase, lTailMask, lTailProbed, lTailSkip byte
+
+	// survivor holds the mask of candidates at or above lPos.
+	survivor byte
+
+	// window is how many bytes the probe reads backwards from the end. It is
+	// the largest position a legal SIMD lap could have started at, so every
+	// byte it reads is one such a lap would have read and no over-read is
+	// introduced. 16 where a lap needs only a chunk (Shufti, Aho-Corasick),
+	// MinLen+15 or the Teddy guard where a lap also needs the literal to fit.
+	window int32
+
+	// minLeft is a cutoff: with fewer than this many positions left, take the
+	// per-position path instead. Only Aho-Corasick sets one, because only its
+	// per-byte tail is cheap enough for the probe to lose to — a table load and
+	// a branch, about the price of the probe itself. Shufti's per-byte tail is
+	// a compare chain over the whole first-byte union, so the probe wins there
+	// even for a single leftover position.
+	minLeft int32
+
+	// wideShift emits a SIGNED shift guard and an explicit `shift < 16` range
+	// test instead of the plain `0xFFFF << shift`.
+	//
+	// Only packed-pair needs it, and for a reason its siblings do not share:
+	// its scan loop needs MinLen+31 bytes while its probe needs only MinLen+15,
+	// so the tail can begin up to 16 positions BEFORE the window starts. Those
+	// positions are not described by the mask, and reading it for them treats
+	// "no lane at or above lPos" as "nothing can match here", silently dropping
+	// every match in that band — which is what the first one-block version did
+	// and what setcaps caught. The range test is needed for the same reason:
+	// MinLen is a whole literal length, so the shift can reach 32 and wrap.
+	wideShift bool
+
+	// exitsPrefilter picks which of the two tails to emit.
+	//
+	// true (Shufti, Aho-Corasick): the probe drives a prefilter LOOP, so both
+	// outcomes leave it — a survivor becomes the candidate, and a dead
+	// remainder sets lPos past the end so the loop's own bounds test retires
+	// it. false (packed-pair, Teddy): the probe is a FILTER in front of the
+	// per-position literal chain, so a survivor falls through into that chain
+	// and only the dead case branches away.
+	exitsPrefilter bool
+
+	// brContinue is the branch target after the decision, as a depth from the
+	// TOP LEVEL of the block this emitter opens. The emitter adds one where it
+	// branches from inside an `if`.
+	brContinue byte
+
+	// emitMask leaves the 16-bit candidate bitmask for the chunk at the given
+	// base local ON THE STACK. Each frontend has its own — a Shufti nibble
+	// probe, Aho-Corasick's compare chain or Shufti, packed-pair's two probe
+	// columns, Teddy's fingerprint — and passing it in is what lets one emitter
+	// serve all four without knowing any of them.
+	emitMask func([]byte, byte) []byte
+}
+
+// emitSetTailProbe emits the backward tail probe: the recovery for the last
+// bytes of a call, which every 16-byte SIMD scan has to abandon.
+//
+// A scan working in chunks stops as soon as fewer than one chunk remains,
+// because it cannot load another without reading past the input. What follows
+// is a per-position walk over the last few bytes, and that walk is FLAT
+// per-call cost — it does not shrink with the input, so it is a rounding error
+// on a 100 KB scan and most of the work in a 32-byte one. On an 8-keyword set a
+// 16-byte call cost MORE than a 100-byte one for exactly this reason.
+//
+// One more probe recovers it, loaded BACKWARDS from the end of the input so
+// that it still fits: the window is the last `window` bytes, it overlaps
+// positions already scanned, and the lanes below lPos are masked out. Every
+// byte it reads is inside the input.
+//
+// A zero mask proves the WHOLE remainder dead, which is what lets the probe
+// retire the per-position walk rather than merely shorten it: the positions the
+// mask does not cover are ones with fewer than a literal's length left, so no
+// match can begin at them.
+//
+// An input shorter than one window gets nothing — there is no full chunk
+// anywhere in it — and keeps the per-position path.
+func emitSetTailProbe(b []byte, p setTailProbeParams) []byte {
+	b = append(b, 0x02, 0x40) // block $tail
+	// Depths inside: 0=$tail, and one more per enclosing `if` below.
+
+	// A previous position already found this input too short: nothing to do.
+	b = append(b, 0x20, p.lTailSkip, 0x0D, 0x00)
+
+	b = append(b, 0x20, p.lTailProbed, 0x45, 0x04, 0x40) // if not yet probed
+	b = append(b, 0x41, 0x01, 0x21, p.lTailProbed)
+
+	// Whether a window exists is decided HERE and recorded, not once per call
+	// in the prologue: a `find` over match-dense input returns from the first
+	// matching position and never reaches this block, and a prologue store
+	// measured +1.0 to +1.6% on setperf's dense rows for a fact those calls
+	// never read. Later positions pay the two instructions above instead.
+	b = append(b, 0x20, p.pInLen, 0x41)
+	b = utils.AppendSLEB128(b, p.window)
+	b = append(b, 0x49, 0x04, 0x40) // if inLen < window: no window, ever
+	b = append(b, 0x41, 0x01, 0x21, p.lTailSkip)
+	b = append(b, 0x0C, 0x02) // br 2 → $tail
+	b = append(b, 0x0B)       // end if
+
+	if p.minLeft > 0 {
+		// Too few positions left for the probe to pay for itself. The verdict
+		// is taken once and recorded in lTailSkip, so the positions after it
+		// pay the same two instructions as an input with no window at all
+		// rather than this compare again.
+		b = append(b, 0x20, p.pInLen, 0x20, p.lPos, 0x6B, 0x41)
+		b = utils.AppendSLEB128(b, p.minLeft)
+		b = append(b, 0x49)
+		b = append(b, 0x04, 0x40) // if fewer than minLeft positions left
+		b = append(b, 0x41, 0x01, 0x21, p.lTailSkip)
+		b = append(b, 0x0C, 0x02) // br 2 → $tail
+		b = append(b, 0x0B)       // end if
+	}
+
+	// base = inLen - window, then the frontend's own fingerprinting there.
+	b = append(b, 0x20, p.pInLen, 0x41)
+	b = utils.AppendSLEB128(b, p.window)
+	b = append(b, 0x6B, 0x21, p.lTailBase)
+	b = p.emitMask(b, p.lTailBase)
+	b = append(b, 0x21, p.lTailMask)
+	b = append(b, 0x0B) // end if not yet probed
+
+	// Candidates at or above lPos.
+	if p.wideShift {
+		b = append(b, 0x20, p.lPos, 0x20, p.lTailBase, 0x6B, 0x22, p.survivor)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x48, 0x0D, 0x00) // shift < 0 (signed) → $tail
+
+		b = append(b, 0x20, p.survivor)
+		b = append(b, 0x41, 0x10)
+		b = append(b, 0x49)       // i32.lt_u
+		b = append(b, 0x04, 0x7F) // if (result i32)
+		b = append(b, 0x20, p.lTailMask, 0x41, 0x7F, 0x20, p.survivor, 0x74, 0x71)
+		b = append(b, 0x05)       // else
+		b = append(b, 0x41, 0x00) // shifted past the mask: no lane survives
+		b = append(b, 0x0B)       // end if
+	} else {
+		// The shift is lPos - base, which the scan's own bounds test keeps in
+		// [1, window] — inside i32.shl's 5-bit count, so a shift at or past 16
+		// legitimately clears the 16-bit mask rather than wrapping.
+		b = append(b, 0x20, p.lTailMask)
+		b = append(b, 0x41, 0xFF, 0xFF, 0x03) // i32.const 0xFFFF
+		b = append(b, 0x20, p.lPos, 0x20, p.lTailBase, 0x6B)
+		b = append(b, 0x74) // i32.shl
+		b = append(b, 0x71) // i32.and
+	}
+
+	b = append(b, 0x22, p.survivor, 0x04, 0x40) // tee; if a candidate survives
+	b = append(b, 0x20, p.lTailBase, 0x20, p.survivor, 0x68, 0x6A, 0x21, p.lPos)
+	b = append(b, 0x05) // else: nothing left can begin a literal
+	if p.exitsPrefilter {
+		b = append(b, 0x20, p.pInLen, 0x21, p.lPos)
+		b = append(b, 0x0B) // end if
+		b = append(b, 0x0C, p.brContinue)
+	} else {
+		b = append(b, 0x20, p.pInLen, 0x41, 0x01, 0x6A, 0x21, p.lPos)
+		b = append(b, 0x0C, p.brContinue+1)
+		b = append(b, 0x0B) // end if
+	}
+	b = append(b, 0x0B) // end block $tail
+	return b
+}
+
+// acTailProbeMinLeft is how many positions must remain for the AC prefilter's
+// backward tail probe to be worth taking. The probe costs about one chunk load
+// plus the candidate mask; the per-byte tail it replaces costs about the same
+// per POSITION, so at one position left the probe is a pure loss (+22% measured
+// on a 17-byte call) and at two it is already ahead.
+const acTailProbeMinLeft = 2
 
 // hasSetFallbackBucketsIn is the same question about a raw bucket list, for
 // use during compilation before a compiledSet exists.
@@ -2438,80 +2707,79 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 		}
 	}
 
-	var b []byte
-	// lFirstByte is E5's hoisted input[lPos], declared in a TRAILING group so
-	// every index below it keeps its value — the arms name the i64s and the
-	// v128 explicitly, and inserting into an earlier group would move them.
-	var lFirstByte byte
-	if absence {
-		// 13 i32 (pos, search mask, simd mask, allElig, end), 2 i64 (acc, alive), 1 v128,
-		// then lFirstByte and the absence drain's candidate position.
-		// Always one alive word: the absence prefilter is capped at 64 ids.
-		b = append(b, 0x04+gateGroups(gateLocals), 0x0D, 0x7F, 0x02, 0x7E, 0x01, 0x7B, 0x02, 0x7F)
-		b = appendGateLocalGroup(b, gateLocals)
-	} else if findPreflight {
-		// 8 i32 + the union walk's state/pos + allElig + end, then i64 acc + the
-		// alive mask's words, then lFirstByte.
-		b = append(b, 0x03+gateGroups(gateLocals), 0x0C, 0x7F)
-		b = utils.AppendULEB128(b, uint32(1+aliveWords))
-		b = append(b, 0x7E)
-		b = append(b, 0x01, 0x7F)
-		b = appendGateLocalGroup(b, gateLocals)
-	} else {
-		// locals: 9 x i32, then the scan_all i64 accumulator, then lFirstByte.
-		b = append(b, 0x03+gateGroups(gateLocals), 0x09, 0x7F, 0x01, 0x7E, 0x01, 0x7F)
-		b = appendGateLocalGroup(b, gateLocals)
-	}
-
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	c.tableMemIdx = tableMemIdx
 	c.perPositionDrain = true
-	// lAllElig is the last i32 of each arm; the i64s follow it, so both move
-	// up by one against the pre-2b layout.
-	c.lAllElig = c.localBase + 8
-	c.lAcc = c.localBase + 9
-	lFirstByte = c.localBase + 10
 	lPos := c.lPos
 	pInLen := c.pInLen
-	lEnd := byte(0)
-	if absence {
-		c.lAllElig = c.localBase + 11
-		lEnd = c.localBase + 12
-		c.lAcc = c.localBase + 13
-		c.aliveMask = c.localBase + 14
-		lFirstByte = c.localBase + 16 // past the v128 chunk at +15
-	} else if findPreflight {
-		c.lAllElig = c.localBase + 10
-		lEnd = c.localBase + 11
-		c.lAcc = c.localBase + 12
-		c.aliveMask = c.localBase + 13
-		lFirstByte = byte(int(c.localBase) + 13 + aliveWords)
+
+	// Locals come from the allocator, in declaration order (task 67). This body
+	// had THREE layouts — plain, find-preflight, absence-prefilter — each with
+	// its own hand-written declaration vector and its own map of indices, and
+	// it additionally passed three raw indices ACROSS a function boundary into
+	// emitFindPreflight. Allocating says each arm once.
+	a := c.locals // the shared five are already allocated (task 67)
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
+
+	// lFirstByte is E5's hoisted input[lPos]; lPfPos/lPfState/lPfMask are the
+	// find preflight's own scratch, named here rather than computed at its call
+	// site.
+	var lFirstByte, lEnd, lChunk, lCand, lPfPos, lPfState, lPfMask byte
+	switch {
+	case absence:
+		// 13 i32 (preflight pos, state, mask, allElig, end), 2 i64 (acc,
+		// alive), 1 v128 chunk, then lFirstByte and the absence drain's
+		// candidate position. Always one alive word: the absence prefilter is
+		// capped at 64 ids.
+		lPfPos, lPfState, lPfMask = a.I32(), a.I32(), a.I32()
+		c.lAllElig = a.I32()
+		lEnd = a.I32()
+		c.lAcc = a.I64()
+		c.aliveMask = a.I64()
+		lChunk = a.V128()
+		lFirstByte = a.I32()
+		lCand = a.I32()
+	case findPreflight:
+		// The union walk's pos and state, then allElig and end, then the i64
+		// accumulator and the alive mask's words, then lFirstByte.
+		lPfPos, lPfState = a.I32(), a.I32()
+		c.lAllElig = a.I32()
+		// The preflight's mask scratch IS lAllElig. That aliasing is safe only
+		// because the preflight runs before emitFindPrologue, which is what
+		// writes lAllElig for the scan proper — and it was previously invisible,
+		// spelled as two separate `c.localBase + 10` expressions 30 lines apart.
+		lPfMask = c.lAllElig
+		lEnd = a.I32()
+		c.lAcc = a.I64()
+		c.aliveMask = a.I64()
+		for w := 1; w < aliveWords; w++ {
+			a.I64() // one alive word per 64 ids, after the mask's first
+		}
+		lFirstByte = a.I32()
+	default:
+		c.lAllElig = a.I32()
+		c.lAcc = a.I64()
+		lFirstByte = a.I32()
 	}
 
 	if gateLocals > 0 {
-		// The gate block is the LAST group of every arm, so its base is one
-		// past that arm's last local. lFirstByte is the last non-gate local in
-		// the plain and preflight arms; lCand is in the absence arm.
-		if absence {
-			c.gateLocalBase = c.localBase + 18
-		} else {
-			c.gateLocalBase = lFirstByte + 1
-		}
+		// F2's gate locals are the last group of every arm.
+		c.gateLocalBase = a.I32()
+		a.Reserve(valI32, gateLocals-1)
 	}
+
+	var b []byte
+	b = a.EmitDecls(b)
 
 	if findPreflight {
 		// Before the prologue: emitGateJump reads the gate array, so the
 		// sentinels must already be in place for it to skip ahead correctly.
 		// One emitter serves both bodies — see emitFindPreflight's header for
 		// why the gated and overlapping forms converged (item 22 fix 2a).
-		// The v128 chunk is the last local of the absence arm, so it moves up
-		// with the i64s when lAllElig is inserted ahead of them.
-		lChunk := byte(c.localBase + 15)
-		// The absence drain's candidate position is the LAST local of the
-		// absence arm, one past lFirstByte.
-		lCand := byte(c.localBase + 17)
-		b = emitFindPreflight(b, cs, c.localBase+8, c.localBase+9, c.aliveMask,
-			c.pGate, c.pInLen, c.pFrom, lEnd, tableMemIdx, absence, c.localBase+10, lChunk, lCand)
+		b = emitFindPreflight(b, cs, lPfPos, lPfState, c.aliveMask,
+			c.pGate, c.pInLen, c.pFrom, lEnd, tableMemIdx, absence, lPfMask, lChunk, lCand)
 	}
 	// AFTER the preflight, which WRITES gate sentinels into the caller's
 	// array: locals captured before it hold the pre-preflight values, and the
@@ -2588,47 +2856,36 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx int, mode setCapKind, probeFnBase int) []byte {
 	var b []byte
 	adaptive := cs.shuftiAdaptive
-	// locals: 6 × i32 (lPos, lTotal, lTmp, lValidMask, lOutBase, lSkipMask), 1 × v128 (lChunk),
-	// + 2 × i32 (lDenseCounter, lDenseSkipFlag) when adaptive,
-	// + 3 × i32 (lMinStart, lBase, lStart) for the first-position state.
-	// The per-position first byte is declared in a TRAILING group so that
-	// every index above it is untouched: WASM assigns local indices in
-	// declaration order, and inserting into an earlier group would move the
-	// v128 and i64 the arms below name explicitly.
-	if adaptive {
-		b = append(b, 0x06)       // 6 local groups
-		b = append(b, 0x06, 0x7F) // 6 × i32
-		b = append(b, 0x01, 0x7B) // 1 × v128
-		b = append(b, 0x02, 0x7F) // 2 × i32
-		b = append(b, 0x03, 0x7F) // 3 × i32
-		b = append(b, 0x01, 0x7E) // 1 × i64 (scan_all accumulator)
-		b = append(b, 0x01, 0x7F) // 1 × i32 (hoisted first byte)
-	} else {
-		b = append(b, 0x05)       // 5 local groups
-		b = append(b, 0x06, 0x7F) // 6 × i32
-		b = append(b, 0x01, 0x7B) // 1 × v128
-		b = append(b, 0x03, 0x7F) // 3 × i32
-		b = append(b, 0x01, 0x7E) // 1 × i64 (scan_all accumulator)
-		b = append(b, 0x01, 0x7F) // 1 × i32 (hoisted first byte)
-	}
-
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	c.perPositionDrain = true
 	lPos, lTmp := c.lPos, c.lTmp
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	lSkipMask := c.localBase + 5
-	lChunk := c.localBase + 6
-	lDenseCounter := c.localBase + 7
-	lDenseSkipFlag := c.localBase + 8
-	// The first-position locals go last so the v128 index is stable.
-	c.lMinStart, c.lBase, c.lStart = c.localBase+7, c.localBase+8, c.localBase+9
-	c.lAcc = c.localBase + 10
-	lFirstByte := c.localBase + 11
+
+	// Locals come from the allocator, in declaration order (task 67). This body
+	// is the one that most needed it: the adaptive dense switch adds two i32s
+	// in the MIDDLE of the frame, so every index after them moved, and the
+	// previous form spelled that as two index maps and two hand-written
+	// declaration vectors — six or seven groups each — that had to agree with
+	// each other and with the reads below. Allocating conditionally says it
+	// once.
+	a := c.locals // the shared five are already allocated (task 67)
+
+	lSkipMask := a.I32()
+	lChunk := a.V128()
+	var lDenseCounter, lDenseSkipFlag byte
 	if adaptive {
-		c.lMinStart, c.lBase, c.lStart = c.localBase+9, c.localBase+10, c.localBase+11
-		c.lAcc = c.localBase + 12
-		lFirstByte = c.localBase + 13
+		lDenseCounter = a.I32()
+		lDenseSkipFlag = a.I32()
 	}
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
+	c.lAcc = a.I64()
+	lFirstByte := a.I32()
+	// The backward tail probe's four.
+	lTailBase, lTailMask, lTailProbed, lTailSkip := a.I32(), a.I32(), a.I32(), a.I32()
+
+	b = a.EmitDecls(b)
 
 	b = c.emitFindPrologue(b, lPos)
 	if adaptive {
@@ -2742,7 +2999,38 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	b = append(b, 0x0B) // end if SIMD path
 	st.Pop()
 
-	// Scalar tail: byte-by-byte. For simplicity check membership via the
+	// ── Backward tail probe ──────────────────────────────────────────────
+	//
+	// Fewer than 16 bytes remain, and the membership chain below is O(|union|)
+	// PER BYTE — up to 64 compares, 128 under prefer-no-match — so the last
+	// ≤15 positions can cost more than the whole SIMD scan that preceded them.
+	// One Shufti probe at inLen-16 answers for all of them at the same ~7 ops
+	// per 8 set members the main path pays, and the mask is over the same
+	// first-byte set, so no bit at or above lPos proves no candidate remains.
+	// See emitSetTailProbe.
+	//
+	// No minLeft here, unlike Aho-Corasick's otherwise identical probe: the
+	// per-byte alternative is that compare chain, which the probe beats even
+	// for a single leftover position.
+	b = emitSetTailProbe(b, setTailProbeParams{
+		lPos: lPos, pInPtr: pInPtr, pInLen: pInLen,
+		lTailBase: lTailBase, lTailMask: lTailMask,
+		lTailProbed: lTailProbed, lTailSkip: lTailSkip,
+		survivor:       lSkipMask,
+		window:         16,
+		exitsPrefilter: true,
+		// One deeper than the block this emitter is about to open.
+		brContinue: st.Depth("skip_done") + 1,
+		emitMask: func(bb []byte, base byte) []byte {
+			bb = append(bb, 0x20, pInPtr, 0x20, base, 0x6A)
+			bb = append(bb, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+			bb = append(bb, 0x21, lChunk)
+			return emitShuftiPrefixCheck(bb, cs.shuftiFirstByteSet, lChunk)
+		},
+	})
+
+	// Scalar tail: byte-by-byte, for an input shorter than the probe's window.
+	// For simplicity check membership via the
 	// inline byte set (≤ 64 entries) — emit a chained i32.eq + br.
 	// Non-adaptive depths: loop $skip_loop (0), block $skip_done (1).
 	// Adaptive: this now lives INSIDE $dense_gate's then-branch (a sibling
@@ -2833,31 +3121,40 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, maxLitLen-1, mode, probeFnBase)
 	lPos := c.lPos
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	lACState := c.localBase + 5
-	lMatchPos := c.localBase + 6
-	lOutIdx := c.localBase + 7
-	lACOutEnd := c.localBase + 8
-	lLitID := c.localBase + 9
-	// Prefilter locals (i32 skip mask, then a v128 chunk).
-	lSkipMask := c.localBase + 10
-	lChunk := c.localBase + 11
-	// The first-position locals go in their own trailing group so the
-	// v128 local's index is unaffected by whether the prefilter is emitted.
-	c.lMinStart, c.lBase, c.lStart = c.localBase+10, c.localBase+11, c.localBase+12
-	c.lAcc = c.localBase + 13
+	// Locals come from the allocator, in declaration order (task 67). The five
+	// setFindCtx allocates first are reserved, not re-allocated.
+	//
+	// The prefilter's locals are ALLOCATED only when the prefilter is emitted,
+	// which is what the previous form spelled as two index maps and two
+	// hand-written declaration vectors that had to agree with them — the shape
+	// task 67 calls out as most likely to drift.
+	a := c.locals // the shared five are already allocated (task 67)
+
+	lACState := a.I32()
+	lMatchPos := a.I32()
+	lOutIdx := a.I32()
+	lACOutEnd := a.I32()
+	lLitID := a.I32()
+
+	// Prefilter locals: the skip mask, the backward tail probe's four, and a
+	// v128 chunk.
+	var lSkipMask, lTailBase, lTailMask, lTailProbed, lTailSkip, lChunk byte
 	if usePrefilter {
-		c.lMinStart, c.lBase, c.lStart = c.localBase+12, c.localBase+13, c.localBase+14
-		c.lAcc = c.localBase + 15
+		lSkipMask = a.I32()
+		lTailBase = a.I32()
+		lTailMask = a.I32()
+		lTailProbed = a.I32()
+		lTailSkip = a.I32()
+		lChunk = a.V128()
 	}
 
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
+	c.lAcc = a.I64()
+
 	var b []byte
-	if usePrefilter {
-		// 11 i32, 1 v128, 3 i32, then the scan_all i64 accumulator.
-		b = append(b, 0x04, 0x0B, 0x7F, 0x01, 0x7B, 0x03, 0x7F, 0x01, 0x7E)
-	} else {
-		// 10 i32, 3 i32, then the scan_all i64 accumulator.
-		b = append(b, 0x03, 0x0A, 0x7F, 0x03, 0x7F, 0x01, 0x7E)
-	}
+	b = a.EmitDecls(b)
 
 	// Init
 	b = c.emitFindPrologue(b, lPos)
@@ -2909,49 +3206,65 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		// Exhaustion check: if lPos >= pInLen → br 1 → exit $skip_done
 		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, st.Depth("skip_done"))
 
+		// emitCandMask loads the 16-byte chunk at posLocal and leaves the
+		// candidate bitmask — the positions whose byte can begin some literal —
+		// on the stack. A closure because the backward tail probe below runs
+		// exactly this at a different position.
+		emitCandMask := func(b []byte, posLocal byte) []byte {
+			// Load 16-byte chunk from memory[0] (input)
+			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A)
+			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+
+			// Candidate bitmask for this chunk, by one of two strategies.
+			//
+			// The compare chain below costs 4 SIMD ops PER DISTINCT FIRST BYTE
+			// per chunk, so it scales linearly in the size of the first-byte set:
+			// 36 distinct first bytes means ~144 ops to probe 16 input bytes,
+			// which is what made AC 7-10M fuel on the "diverse" shape against
+			// 0.4M on a shared-prefix one. Shufti answers
+			// the same membership question in ~7 ops per 8 bytes of the SET —
+			// ~35 ops for those same 36 first bytes — because the set lives in
+			// nibble tables rather than in the instruction stream.
+			//
+			// Below the crossover the chain still wins: at 1-3 bytes it is 4-12
+			// ops against Shufti's ~7 plus its constant setup, and the chain
+			// needs no table constants. The cutoff mirrors aho-corasick's, which
+			// uses memchr/memchr2/memchr3 for 1-3 bytes and a different structure
+			// above (util/prefilter.rs). Sets at or below 3 first bytes therefore
+			// emit byte-identical code to before this split existed.
+			if len(cs.acFirstByteSet) > 3 {
+				b = append(b, 0x21, lChunk) // local.set lChunk
+				b = emitShuftiPrefixCheck(b, cs.acFirstByteSet, lChunk)
+			} else {
+				// local.SET, not tee: the chunk is re-read from the local by
+				// every compare below, so a tee's copy is dead. It survived
+				// because the only call site ended in an unconditional br,
+				// which puts validation into its polymorphic state and lets a
+				// leftover value through; the tail probe below has no such
+				// cover, and a dead v128 on the stack is a validation error
+				// there rather than a wasted slot.
+				b = append(b, 0x21, lChunk) // local.set lChunk
+				// Compute bitmask: OR of bitmask(eq(chunk, splat(fb))) for each first byte.
+				b = append(b, 0x41, 0x00) // accumulator = 0
+				for _, fb := range cs.acFirstByteSet {
+					b = append(b, 0x20, lChunk)
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, int32(fb))
+					b = append(b, 0xFD, 0x0F) // i8x16.splat
+					b = append(b, 0xFD, 0x23) // i8x16.eq
+					b = append(b, 0xFD, 0x64) // i8x16.bitmask
+					b = append(b, 0x72)       // i32.or
+				}
+			}
+			return b
+		}
+
 		// SIMD path: if lPos + 15 < pInLen
 		b = append(b, 0x20, lPos, 0x41, 15, 0x6A, 0x20, pInLen, 0x49) // lt_u
 		b = append(b, 0x04, 0x40)                                     // if (void) — SIMD path
 		st.Push("simd_if")
 
-		// Load 16-byte chunk from memory[0] (input)
-		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
-		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-
-		// Candidate bitmask for this chunk, by one of two strategies.
-		//
-		// The compare chain below costs 4 SIMD ops PER DISTINCT FIRST BYTE
-		// per chunk, so it scales linearly in the size of the first-byte set:
-		// 36 distinct first bytes means ~144 ops to probe 16 input bytes,
-		// which is what made AC 7-10M fuel on the "diverse" shape against
-		// 0.4M on a shared-prefix one. Shufti answers
-		// the same membership question in ~7 ops per 8 bytes of the SET —
-		// ~35 ops for those same 36 first bytes — because the set lives in
-		// nibble tables rather than in the instruction stream.
-		//
-		// Below the crossover the chain still wins: at 1-3 bytes it is 4-12
-		// ops against Shufti's ~7 plus its constant setup, and the chain
-		// needs no table constants. The cutoff mirrors aho-corasick's, which
-		// uses memchr/memchr2/memchr3 for 1-3 bytes and a different structure
-		// above (util/prefilter.rs). Sets at or below 3 first bytes therefore
-		// emit byte-identical code to before this split existed.
-		if len(cs.acFirstByteSet) > 3 {
-			b = append(b, 0x21, lChunk) // local.set lChunk
-			b = emitShuftiPrefixCheck(b, cs.acFirstByteSet, lChunk)
-		} else {
-			b = append(b, 0x22, lChunk) // local.tee lChunk
-			// Compute bitmask: OR of bitmask(eq(chunk, splat(fb))) for each first byte.
-			b = append(b, 0x41, 0x00) // accumulator = 0
-			for _, fb := range cs.acFirstByteSet {
-				b = append(b, 0x20, lChunk)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(fb))
-				b = append(b, 0xFD, 0x0F) // i8x16.splat
-				b = append(b, 0xFD, 0x23) // i8x16.eq
-				b = append(b, 0xFD, 0x64) // i8x16.bitmask
-				b = append(b, 0x72)       // i32.or
-			}
-		}
+		b = emitCandMask(b, lPos)
 		b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
 
 		// if mask != 0: candidate found at lPos + ctz(mask)
@@ -2968,7 +3281,35 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		b = append(b, 0x0B) // end if (SIMD path)
 		st.Pop()
 
-		// Scalar tail: check firstByteFlags[input[lPos]]
+		// ── Backward tail probe ──────────────────────────────────────────
+		//
+		// Fewer than 16 bytes remain, and the per-byte tail below costs a
+		// table load, an address computation and a branch at every one of
+		// them — ~21 fuel per byte, so up to ~315 per call whatever the input
+		// length. One probe at inLen-16 answers for all of them: the mask is
+		// over FIRST bytes, every literal begins with one, so no bit at or
+		// above lPos proves no candidate remains. See emitSetTailProbe.
+		//
+		// This is the only frontend that sets minLeft. Its per-byte tail is a
+		// table load and a branch — about what the probe itself costs — so at
+		// one leftover position the probe is a pure loss (+22% measured on a
+		// 17-byte call). Shufti's per-byte tail is a compare chain over the
+		// whole first-byte union, which the probe beats even at one position.
+		b = emitSetTailProbe(b, setTailProbeParams{
+			lPos: lPos, pInPtr: pInPtr, pInLen: pInLen,
+			lTailBase: lTailBase, lTailMask: lTailMask,
+			lTailProbed: lTailProbed, lTailSkip: lTailSkip,
+			survivor:       lSkipMask,
+			window:         16,
+			minLeft:        acTailProbeMinLeft,
+			exitsPrefilter: true,
+			// One deeper than the block this emitter is about to open.
+			brContinue: st.Depth("skip_done") + 1,
+			emitMask:   emitCandMask,
+		})
+
+		// Per-byte tail, for an input shorter than the probe's window:
+		// check firstByteFlags[input[lPos]]
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, cs.acFirstByteFlagsOff)              // firstByteFlags base
 		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x2D, 0x00, 0x00) // + input[lPos]
@@ -3191,10 +3532,26 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	lPos := c.lPos
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	lLaneMask := c.localBase + 5
-	lMatchPos := c.localBase + 6
-	lLaneOff := c.localBase + 7
-	numI32 := 8
+	// Locals come from the allocator, in declaration order (task 67). The five
+	// setFindCtx allocates first are reserved, not re-allocated: they are
+	// already named by c.lPos and friends.
+	a := c.locals // the shared five are already allocated (task 67)
+
+	lLaneMask := a.I32()
+	lMatchPos := a.I32()
+	lLaneOff := a.I32()
+	// The backward tail probe's four locals; see the probe below. lTailProbed
+	// is what keeps the probe once-per-call, since the tail block is re-entered
+	// once per surviving candidate. lTailSkip is the hoisted "this input is
+	// shorter than one probe window" verdict — a local rather than the compare
+	// itself because the tail block is entered once per remaining POSITION, and
+	// an input with no window enters it at every one of them: as a compare
+	// against inLen it measured +3.7% on a 16-byte call, half of what the probe
+	// saves at 100.
+	lTailBase := a.I32()
+	lTailMask := a.I32()
+	lTailProbed := a.I32()
+	lTailSkip := a.I32()
 
 	// Blocks of 16 bytes handled per loop iteration. The probe
 	// work scales linearly with this, but the per-iteration scaffolding —
@@ -3206,36 +3563,31 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	// v128 locals: two input chunks per block, then one hoisted splat per
 	// probe byte. Hoisting matters: the splats are loop-invariant and would
 	// otherwise cost an i32.const + i8x16.splat per chunk per byte.
-	v128Base := c.localBase + byte(numI32)
-	next := v128Base
 	lChunk1 := make([]byte, blocks)
 	lChunk2 := make([]byte, blocks)
 	for i := 0; i < blocks; i++ {
-		lChunk1[i], lChunk2[i] = next, next+1
-		next += 2
+		lChunk1[i], lChunk2[i] = a.V128(), a.V128()
 	}
 	splat1 := make([]byte, len(pp.Bytes1))
 	splat2 := make([]byte, len(pp.Bytes2))
 	for i := range splat1 {
-		splat1[i] = next
-		next++
+		splat1[i] = a.V128()
 	}
 	for i := range splat2 {
-		splat2[i] = next
-		next++
+		splat2[i] = a.V128()
 	}
-	numV128 := 2*blocks + pp.splatCount()
 
 	// First-position locals sit after the v128 group so the v128 indices
 	// above stay stable.
-	c.lMinStart = v128Base + byte(numV128)
-	c.lBase = c.lMinStart + 1
-	c.lStart = c.lMinStart + 2
-	c.lAcc = c.lMinStart + 3
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
+	c.lAcc = a.I64()
 
 	var b []byte
-	// 8 i32, numV128 v128, 3 i32, then the scan_all i64 accumulator.
-	b = append(b, 0x04, byte(numI32), 0x7F, byte(numV128), 0x7B, 0x03, 0x7F, 0x01, 0x7E)
+	// 12 i32, the v128 group, 3 i32, then the scan_all i64 accumulator — all of
+	// it derived from the allocation above rather than restated here.
+	b = a.EmitDecls(b)
 
 	// Hoist the probe-byte splats.
 	emitSplat := func(b []byte, val, dst byte) []byte {
@@ -3274,48 +3626,59 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	b = utils.AppendSLEB128(b, simdGuard)
 	b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00) // lPos+guard > pInLen → $not_simd
 
-	// Load the two probe columns for each block.
-	emitChunkLoad := func(b []byte, off int, dst byte) []byte {
-		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A)
-		if off > 0 {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(off))
-			b = append(b, 0x6A)
+	// emitLaneMask emits the probe-column loads and the per-block equality
+	// masks for the span positions starting at posLocal, leaving the combined
+	// candidate bitmask in lLaneMask.
+	//
+	// A closure because the backward tail probe below runs exactly this at a
+	// different position; a second hand-written copy is how the two would drift.
+	emitLaneMask := func(b []byte, posLocal byte, nblocks int) []byte {
+		// Load the two probe columns for each block.
+		emitChunkLoad := func(b []byte, off int, dst byte) []byte {
+			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A)
+			if off > 0 {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(off))
+				b = append(b, 0x6A)
+			}
+			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
+			return append(b, 0x21, dst)
 		}
-		b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
-		return append(b, 0x21, dst)
-	}
-	// column mask = OR over the column's bytes of i8x16.eq(chunk, splat(b)).
-	emitColumnMask := func(b []byte, chunk byte, splats []byte) []byte {
-		for i, s := range splats {
-			b = append(b, 0x20, chunk, 0x20, s, 0xFD, 0x23) // i8x16.eq
-			if i > 0 {
-				b = append(b, 0xFD, 0x50) // v128.or
+		// column mask = OR over the column's bytes of i8x16.eq(chunk, splat(b)).
+		emitColumnMask := func(b []byte, chunk byte, splats []byte) []byte {
+			for i, s := range splats {
+				b = append(b, 0x20, chunk, 0x20, s, 0xFD, 0x23) // i8x16.eq
+				if i > 0 {
+					b = append(b, 0xFD, 0x50) // v128.or
+				}
+			}
+			return b
+		}
+		for blk := 0; blk < nblocks; blk++ {
+			b = emitChunkLoad(b, pp.Off1+16*blk, lChunk1[blk])
+			b = emitChunkLoad(b, pp.Off2+16*blk, lChunk2[blk])
+		}
+		// Fold each block's 16-bit bitmask into one lane mask, block k occupying
+		// bits [16k, 16k+16). ctz over the combined mask then yields the position
+		// offset from posLocal directly, exactly as in the single-block case.
+		for blk := 0; blk < nblocks; blk++ {
+			b = emitColumnMask(b, lChunk1[blk], splat1)
+			b = emitColumnMask(b, lChunk2[blk], splat2)
+			b = append(b, 0xFD, 0x4E) // v128.and — both columns must hit
+			// i8x16.eq lanes are 0xFF/0x00, so the bitmask (which reads each
+			// lane's high bit) needs no separate compare-against-zero step.
+			b = append(b, 0xFD, 0x64) // i8x16.bitmask
+			if blk > 0 {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(16*blk))
+				b = append(b, 0x74, 0x72) // i32.shl; i32.or
 			}
 		}
+		b = append(b, 0x21, lLaneMask)
 		return b
 	}
-	for blk := 0; blk < blocks; blk++ {
-		b = emitChunkLoad(b, pp.Off1+16*blk, lChunk1[blk])
-		b = emitChunkLoad(b, pp.Off2+16*blk, lChunk2[blk])
-	}
-	// Fold each block's 16-bit bitmask into one lane mask, block k occupying
-	// bits [16k, 16k+16). ctz over the combined mask then yields the position
-	// offset from lPos directly, exactly as in the single-block case.
-	for blk := 0; blk < blocks; blk++ {
-		b = emitColumnMask(b, lChunk1[blk], splat1)
-		b = emitColumnMask(b, lChunk2[blk], splat2)
-		b = append(b, 0xFD, 0x4E) // v128.and — both columns must hit
-		// i8x16.eq lanes are 0xFF/0x00, so the bitmask (which reads each
-		// lane's high bit) needs no separate compare-against-zero step.
-		b = append(b, 0xFD, 0x64) // i8x16.bitmask
-		if blk > 0 {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(16*blk))
-			b = append(b, 0x74, 0x72) // i32.shl; i32.or
-		}
-	}
-	b = append(b, 0x21, lLaneMask)
+
+	b = emitLaneMask(b, lPos, blocks)
 
 	// Process candidate lanes.
 	b = append(b, 0x02, 0x40)                                                                // block $lanes_done
@@ -3385,8 +3748,45 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	b = append(b, 0x0C, 0x01)       // br 1 → restart $scan
 	b = append(b, 0x0B)             // end block $not_simd
 
-	// Scalar tail: check each literal at lPos, one position at a time.
-	// The same per-position literal chain the scalar and Shufti bodies run —
+	// ── Backward tail probe ──────────────────────────────────────────────
+	//
+	// Same mechanism, and the same reason, as the other three frontends': the
+	// guard above abandons SIMD with up to simdGuard-1 positions left, and the
+	// chain below then runs a fit test plus a compare chain per bucket at every
+	// one of them. That is flat per-call cost, so it is the WHOLE of a short
+	// call and noise on a long one. See emitSetTailProbe.
+	//
+	// The probe uses ONE block, not the scan loop's `blocks`. Nothing about the
+	// tail needs the wider stride — the mask only has to cover the positions
+	// that can still host a literal — and the window costs what it covers: a
+	// two-block probe needs MinLen+31 bytes of input to exist at all, so a set
+	// with a 5-byte literal got no probe below 36 bytes and paid the entry
+	// check at every length under it (+7.4 to +14.6% measured, 4 B through
+	// 32 B). One block needs MinLen+15, which puts the crossover beside Teddy's
+	// — and is also why this is the one frontend needing wideShift, since its
+	// scan guard and its probe window no longer agree.
+	//
+	// base = inLen - (MinLen+15) is the last position a one-block lap could
+	// start at, so every load here is a load such a lap would issue. base+16 =
+	// inLen-MinLen+1, so a position past the mask's last lane has fewer than
+	// MinLen bytes left and can host no literal.
+	b = emitSetTailProbe(b, setTailProbeParams{
+		lPos: lPos, pInPtr: pInPtr, pInLen: pInLen,
+		lTailBase: lTailBase, lTailMask: lTailMask,
+		lTailProbed: lTailProbed, lTailSkip: lTailSkip,
+		survivor:   c.lTmp,
+		window:     int32(pp.MinLen + 15),
+		wideShift:  true,
+		brContinue: 1, // $scan, one out from the probe's own block
+		emitMask: func(bb []byte, base byte) []byte {
+			bb = emitLaneMask(bb, base, 1)
+			return append(bb, 0x20, lLaneMask)
+		},
+	})
+
+	// Per-position literal chain: every position of an input too short for the
+	// probe's window, and the probe's surviving candidates.
+	// The same chain the scalar and Shufti bodies run —
 	// verified opcode-identical (same litOrderFor order, same fit test, same
 	// compare chain, same emitBucketAt) before being folded into the one
 	// emitter.
@@ -3414,57 +3814,68 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	lPos := c.lPos
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	lLaneMask := c.localBase + 5
-	lMatchPos := c.localBase + 6
-	lLaneBit := c.localBase + 7 // Group A lane bit
-	lLaneOff := c.localBase + 8
-	lLaneBitB := c.localBase + 9 // Group B lane bit (only used when TwoGroups)
-	// v128 locals start after the ten i32 locals.
-	v128Base := c.localBase + 10
-	lChunk := v128Base
-	lTLo := v128Base + 1
-	lTHi := v128Base + 2
-	lCands := v128Base + 3 // Group A result
+	// Locals come from the allocator, in declaration order, so no index in this
+	// body is written twice (task 67). The five setFindCtx allocates first are
+	// reserved rather than re-allocated: they are already named by c.lPos and
+	// friends, and reserving keeps this body's numbering identical to theirs.
+	a := c.locals // the shared five are already allocated (task 67)
 
-	off := byte(4)
+	lLaneMask := a.I32()
+	lMatchPos := a.I32()
+	lLaneBit := a.I32()  // Group A lane bit
+	lLaneOff := a.I32()  //nolint:wastedassign // read by emitExtractLane
+	lLaneBitB := a.I32() // Group B lane bit (only used when TwoGroups)
+	// The backward tail probe's four locals. lTailProbed is what makes the
+	// probe once-per-call: the tail block below is re-entered once per
+	// surviving candidate, and re-probing there would pay for the chunk loads
+	// and nibble tables again at every one of them. WASM zero-initialises
+	// locals per call, so no reset is emitted. lTailSkip is the hoisted
+	// "shorter than one probe window" verdict; see the packed-pair body, where
+	// leaving it as a per-position compare measured +3.7% on a 16-byte call.
+	lTailBase := a.I32()
+	lTailMask := a.I32()
+	lTailProbed := a.I32()
+	lTailSkip := a.I32()
+
+	// v128 locals. Which ones exist depends on the fingerprint width and on
+	// whether the tables are bucketed into two groups, and the allocator emits
+	// the right group vector either way — the previous form had to keep a
+	// hand-run `off` counter in step with a hand-written declaration.
+	lChunk := a.V128()
+	lTLo := a.V128()
+	lTHi := a.V128()
+	lCands := a.V128() // Group A result
+
 	var lChunk1, lT1Lo, lT1Hi, lChunk2, lT2Lo, lT2Hi, lChunk3, lT3Lo, lT3Hi byte
 	if tt.TwoByte {
-		lChunk1, lT1Lo, lT1Hi = v128Base+off, v128Base+off+1, v128Base+off+2
-		off += 3
+		lChunk1, lT1Lo, lT1Hi = a.V128(), a.V128(), a.V128()
 	}
 	if tt.ThreeByte {
-		lChunk2, lT2Lo, lT2Hi = v128Base+off, v128Base+off+1, v128Base+off+2
-		off += 3
+		lChunk2, lT2Lo, lT2Hi = a.V128(), a.V128(), a.V128()
 	}
 	if tt.FourByte {
-		lChunk3, lT3Lo, lT3Hi = v128Base+off, v128Base+off+1, v128Base+off+2
-		off += 3
+		lChunk3, lT3Lo, lT3Hi = a.V128(), a.V128(), a.V128()
 	}
 	var lBT0Lo, lBT0Hi, lCandsB, lBT1Lo, lBT1Hi, lBT2Lo, lBT2Hi, lBT3Lo, lBT3Hi byte
 	if tt.TwoGroups {
-		lBT0Lo, lBT0Hi, lCandsB = v128Base+off, v128Base+off+1, v128Base+off+2
-		off += 3
+		lBT0Lo, lBT0Hi, lCandsB = a.V128(), a.V128(), a.V128()
 		if tt.TwoByte {
-			lBT1Lo, lBT1Hi = v128Base+off, v128Base+off+1
-			off += 2
+			lBT1Lo, lBT1Hi = a.V128(), a.V128()
 		}
 		if tt.ThreeByte {
-			lBT2Lo, lBT2Hi = v128Base+off, v128Base+off+1
-			off += 2
+			lBT2Lo, lBT2Hi = a.V128(), a.V128()
 		}
 		if tt.FourByte {
-			lBT3Lo, lBT3Hi = v128Base+off, v128Base+off+1
-			off += 2
+			lBT3Lo, lBT3Hi = a.V128(), a.V128()
 		}
 	}
-	numV128 := int(off)
 
 	// The first-position locals sit after the v128 group so the v128
 	// indices above stay unchanged.
-	c.lMinStart = v128Base + byte(numV128)
-	c.lBase = c.lMinStart + 1
-	c.lStart = c.lMinStart + 2
-	c.lAcc = c.lMinStart + 3
+	c.lMinStart = a.I32()
+	c.lBase = a.I32()
+	c.lStart = a.I32()
+	c.lAcc = a.I64()
 
 	// Collect literal strings for tail-byte verification.
 	litStr := make([]string, len(cs.litToBuckets))
@@ -3551,8 +3962,9 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	}
 
 	var b []byte
-	// 10 i32, numV128 v128, 3 i32, then the scan_all i64 accumulator.
-	b = append(b, 0x04, 0x0A, 0x7F, byte(numV128), 0x7B, 0x03, 0x7F, 0x01, 0x7E)
+	// 14 i32, the v128 group, 3 i32, then the scan_all i64 accumulator — all of
+	// it derived from the allocation above rather than restated here.
+	b = a.EmitDecls(b)
 
 	// Pre-load group A Teddy tables (loop-invariant)
 	groupAOff := cs.teddyDataOffset
@@ -3666,60 +4078,73 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	b = utils.AppendSLEB128(b, simdGuard)
 	b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x00) // lPos+guard > pInLen → $not_simd
 
-	// Load input chunks from memory[0]
-	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, lChunk)
-	if tt.TwoByte {
-		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x41, 0x01, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, lChunk1)
-	}
-	if tt.ThreeByte {
-		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x41, 0x02, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, lChunk2)
-	}
-	if tt.FourByte {
-		b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x41, 0x03, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, lChunk3)
-	}
-
-	// emitNibbleCheck: cands = swizzle(Lo, chunk&0xF) & swizzle(Hi, chunk>>4) [ANDed onto stack]
-	emitNibbleCheck := func(b []byte, chunkLocal, loLocal, hiLocal byte, andWithStack bool) []byte {
-		b = append(b, 0x20, loLocal, 0x20, chunkLocal, 0x41, 0x0F, 0xFD, 0x0F, 0xFD, 0x4E, 0xFD, 0x0E)
-		b = append(b, 0x20, hiLocal, 0x20, chunkLocal, 0x41, 0x04, 0xFD, 0x6D, 0xFD, 0x0E, 0xFD, 0x4E)
-		if andWithStack {
-			b = append(b, 0xFD, 0x4E) // v128.and with previous result
+	// emitLaneMask emits the chunk loads and both groups' nibble checks for the
+	// 16 positions starting at posLocal, leaving the OR of their candidate bits
+	// in lLaneMask (and the per-group vectors in lCands/lCandsB, which the lane
+	// dispatch reads).
+	//
+	// It is a closure because the backward tail probe below runs exactly this
+	// fingerprinting at a different position, and a second hand-written copy is
+	// how the two would drift.
+	emitLaneMask := func(b []byte, posLocal byte) []byte {
+		// Load input chunks from memory[0]
+		b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, lChunk)
+		if tt.TwoByte {
+			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A, 0x41, 0x01, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, lChunk1)
 		}
+		if tt.ThreeByte {
+			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A, 0x41, 0x02, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, lChunk2)
+		}
+		if tt.FourByte {
+			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A, 0x41, 0x03, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, lChunk3)
+		}
+
+		// emitNibbleCheck: cands = swizzle(Lo, chunk&0xF) & swizzle(Hi, chunk>>4) [ANDed onto stack]
+		emitNibbleCheck := func(b []byte, chunkLocal, loLocal, hiLocal byte, andWithStack bool) []byte {
+			b = append(b, 0x20, loLocal, 0x20, chunkLocal, 0x41, 0x0F, 0xFD, 0x0F, 0xFD, 0x4E, 0xFD, 0x0E)
+			b = append(b, 0x20, hiLocal, 0x20, chunkLocal, 0x41, 0x04, 0xFD, 0x6D, 0xFD, 0x0E, 0xFD, 0x4E)
+			if andWithStack {
+				b = append(b, 0xFD, 0x4E) // v128.and with previous result
+			}
+			return b
+		}
+
+		// Compute group A candidates
+		b = emitNibbleCheck(b, lChunk, lTLo, lTHi, false)
+		if tt.TwoByte {
+			b = emitNibbleCheck(b, lChunk1, lT1Lo, lT1Hi, true)
+		}
+		if tt.ThreeByte {
+			b = emitNibbleCheck(b, lChunk2, lT2Lo, lT2Hi, true)
+		}
+		if tt.FourByte {
+			b = emitNibbleCheck(b, lChunk3, lT3Lo, lT3Hi, true)
+		}
+		b = append(b, 0x21, lCands) // store group A candidates
+
+		// Compute lLaneMask: positions where group A or group B has any hit
+		b = append(b, 0x20, lCands, 0x41, 0x00, 0xFD, 0x0F, 0xFD, 0x24, 0xFD, 0x64) // bitmask(A != 0)
+		if tt.TwoGroups {
+			// Compute group B candidates
+			b = emitNibbleCheck(b, lChunk, lBT0Lo, lBT0Hi, false)
+			if tt.TwoByte {
+				b = emitNibbleCheck(b, lChunk1, lBT1Lo, lBT1Hi, true)
+			}
+			if tt.ThreeByte {
+				b = emitNibbleCheck(b, lChunk2, lBT2Lo, lBT2Hi, true)
+			}
+			if tt.FourByte {
+				b = emitNibbleCheck(b, lChunk3, lBT3Lo, lBT3Hi, true)
+			}
+			b = append(b, 0x21, lCandsB)                                                 // store group B candidates
+			b = append(b, 0x20, lCandsB, 0x41, 0x00, 0xFD, 0x0F, 0xFD, 0x24, 0xFD, 0x64) // bitmask(B != 0)
+			b = append(b, 0x72)                                                          // i32.or with mask A
+		}
+		b = append(b, 0x21, lLaneMask)
 		return b
 	}
 
-	// Compute group A candidates
-	b = emitNibbleCheck(b, lChunk, lTLo, lTHi, false)
-	if tt.TwoByte {
-		b = emitNibbleCheck(b, lChunk1, lT1Lo, lT1Hi, true)
-	}
-	if tt.ThreeByte {
-		b = emitNibbleCheck(b, lChunk2, lT2Lo, lT2Hi, true)
-	}
-	if tt.FourByte {
-		b = emitNibbleCheck(b, lChunk3, lT3Lo, lT3Hi, true)
-	}
-	b = append(b, 0x21, lCands) // store group A candidates
-
-	// Compute lLaneMask: positions where group A or group B has any hit
-	b = append(b, 0x20, lCands, 0x41, 0x00, 0xFD, 0x0F, 0xFD, 0x24, 0xFD, 0x64) // bitmask(A != 0)
-	if tt.TwoGroups {
-		// Compute group B candidates
-		b = emitNibbleCheck(b, lChunk, lBT0Lo, lBT0Hi, false)
-		if tt.TwoByte {
-			b = emitNibbleCheck(b, lChunk1, lBT1Lo, lBT1Hi, true)
-		}
-		if tt.ThreeByte {
-			b = emitNibbleCheck(b, lChunk2, lBT2Lo, lBT2Hi, true)
-		}
-		if tt.FourByte {
-			b = emitNibbleCheck(b, lChunk3, lBT3Lo, lBT3Hi, true)
-		}
-		b = append(b, 0x21, lCandsB)                                                 // store group B candidates
-		b = append(b, 0x20, lCandsB, 0x41, 0x00, 0xFD, 0x0F, 0xFD, 0x24, 0xFD, 0x64) // bitmask(B != 0)
-		b = append(b, 0x72)                                                          // i32.or with mask A
-	}
-	b = append(b, 0x21, lLaneMask)
+	b = emitLaneMask(b, lPos)
 
 	// Process candidate lanes
 	b = append(b, 0x02, 0x40) // block $lanes_done
@@ -3762,8 +4187,43 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	b = append(b, 0x0C, 0x01) // br 1 → restart $scan
 	b = append(b, 0x0B)       // end block $not_simd
 
-	// Scalar tail: check each literal at lPos
-	// The same per-position literal chain the scalar and Shufti bodies run —
+	// ── Backward tail probe ──────────────────────────────────────────────
+	//
+	// The guard above abandons SIMD with up to simdGuard-1 (<= 18) positions
+	// left, and the chain below then costs a fit test plus a compare chain PER
+	// BUCKET at every one of them. That is a flat per-call price no input
+	// length amortises: on an 8-keyword set a 16-byte call cost MORE than a
+	// 100-byte one, because the tail is the whole of the first and 0.3% of the
+	// second. See emitSetTailProbe.
+	//
+	// base = inLen - simdGuard is the largest position the guard itself would
+	// have accepted, so every load it issues is a load a legal lap would issue.
+	// Lane 15 sits at inLen-MinLen, and a position past that has fewer than
+	// MinLen bytes left, so no literal can start there. Unlike packed-pair the
+	// probe window and the scan guard are the SAME here, which is why this one
+	// needs no signed-shift arm.
+	//
+	// The mask is a FILTER in front of the chain below rather than a second
+	// dispatch site. Reusing the lane loop instead measured +4KB on the
+	// byteident Teddy fixture alone, for candidate positions that are rare by
+	// construction — the chain is what the tail already paid, and it now runs
+	// only where a fingerprint hit.
+	b = emitSetTailProbe(b, setTailProbeParams{
+		lPos: lPos, pInPtr: pInPtr, pInLen: pInLen,
+		lTailBase: lTailBase, lTailMask: lTailMask,
+		lTailProbed: lTailProbed, lTailSkip: lTailSkip,
+		survivor:   c.lTmp,
+		window:     simdGuard,
+		brContinue: 1, // $scan, one out from the probe's own block
+		emitMask: func(bb []byte, base byte) []byte {
+			bb = emitLaneMask(bb, base)
+			return append(bb, 0x20, lLaneMask)
+		},
+	})
+
+	// Per-position literal chain: every position of an input too short for the
+	// probe's window, and the probe's surviving candidates.
+	// The same chain the scalar and Shufti bodies run —
 	// verified opcode-identical (same litOrderFor order, same fit test, same
 	// compare chain, same emitBucketAt) before being folded into the one
 	// emitter.

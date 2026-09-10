@@ -62,7 +62,7 @@ func TestFindNeutralTwinEmission(t *testing.T) {
 					l.useHybridDispatch, tc.hybrid)
 			}
 			_, _, twin, patch := appendFindCodeEntryTwinned(
-				nil, l, table, findMandatoryLit(tc.pattern), 0)
+				nil, l, table, findMandatoryLit(tc.pattern, false), 0)
 			if (twin != nil) != tc.wantTwin {
 				t.Errorf("twin emitted = %v, want %v", twin != nil, tc.wantTwin)
 			}

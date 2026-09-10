@@ -898,8 +898,8 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 // caller-facing groups function (compile.go:1568, p.anchored) — see
 // buildTDFAMatchBody's doc comment for why that changes what "len" means and
 // what code gets emitted.
-func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool) []byte {
-	body := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored)
+func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) []byte {
+	body := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored, capStartGlobal)
 	var b []byte
 	b = utils.AppendULEB128(b, uint32(len(body)))
 	b = append(b, body...)
@@ -969,7 +969,7 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 // (compile/selector.go's hasWordBoundary/hasLineAnchors gates route those to
 // Backtracking) — so a single ctx=0 midAccept table, with no NW/W/NL
 // variants, is sufficient.
-func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool) []byte {
+func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) []byte {
 	var b []byte
 
 	numCapRegs := tt.numRegs
@@ -1051,16 +1051,33 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 		b = append(b, 0x6A)
 		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
 		b = append(b, 0x04, 0x40)             // if midAccept[state]
-		b = emitTDFAWriteCaptures(tt, b, stateLocal, posLocal, localCapBase)
+		b = emitTDFAWriteCaptures(tt, b, stateLocal, posLocal, localCapBase, capStartGlobal)
 		b = append(b, 0x20, byte(posLocal))
 		b = append(b, 0x21, byte(localLastAcceptPos))
 		b = append(b, 0x0B) // end if
 		return b
 	}
 
-	// Initialise capture registers to -1.
+	// Initialise capture registers.
+	//
+	// Plain -1 when this body writes slots relative to its own ptr, and
+	// `-1 - start` when it writes ABSOLUTE slots (capStartGlobal >= 0, see
+	// emitTDFAWriteCaptures). The bias is what lets the accept-side write add
+	// `start` UNCONDITIONALLY: an unset register comes back as
+	// (-1 - start) + start = -1 exactly, so the sentinel survives without a
+	// per-slot `>= 0` test. That test, done once per slot in the groups
+	// wrapper, is the whole cost this replaces.
+	//
+	// Safe because a capture register is only ever initialised here, assigned
+	// `pos`, or copied from another register (emitTDFATagOp) — nothing compares
+	// one against zero, so a biased value is never interpreted.
 	for i := 0; i < numCapRegs; i++ {
 		b = append(b, 0x41, 0x7F) // i32.const -1
+		if capStartGlobal >= 0 {
+			b = append(b, 0x23)
+			b = utils.AppendULEB128(b, uint32(capStartGlobal))
+			b = append(b, 0x6B) // i32.sub
+		}
 		b = append(b, 0x21)
 		b = utils.AppendULEB128(b, localCapBase+uint32(i))
 	}
@@ -1113,7 +1130,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 		var midAcceptTail func([]byte) []byte
 		if hasMidAccept && tt.midAcceptStates[int(tt.bulkSkip.wasmState)-1] != 0 {
 			midAcceptTail = func(b []byte) []byte {
-				b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase)
+				b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase, capStartGlobal)
 				b = append(b, 0x20, byte(localPos))
 				b = append(b, 0x21, byte(localLastAcceptPos))
 				return b
@@ -1205,7 +1222,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 		b = appendTableLoad8u(b, tableMemIdx) // immediateAccept[state]
 		b = append(b, 0x04, 0x40)
 		// Accept here: write captures and return pos (pos already = exclusive end).
-		b = emitTDFAAccept(tt, b, localState, localPos, localCapBase)
+		b = emitTDFAAccept(tt, b, localState, localPos, localCapBase, capStartGlobal)
 		b = append(b, 0x0B)
 	}
 
@@ -1233,7 +1250,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	b = append(b, 0x6A) // i32.add
 	b = appendTableLoad8u(b, tableMemIdx)
 	b = append(b, 0x04, 0x7F) // if [i32]: then-branch returns, else-branch leaves i32
-	b = emitTDFAAcceptEOF(tt, b, localState, localPos, localCapBase)
+	b = emitTDFAAcceptEOF(tt, b, localState, localPos, localCapBase, capStartGlobal)
 	b = append(b, 0x05) // else
 	if hasMidAccept {
 		b = append(b, 0x20, byte(localLastAcceptPos)) // captures already written eagerly
@@ -1490,8 +1507,8 @@ func emitTDFATagOp(op tdfaTagOp, b []byte, localPos, localCapBase uint32) []byte
 
 // emitTDFAAccept emits accept ops + capture write + return for immediate-accept.
 // pos has already been incremented, so it equals the exclusive end of the match.
-func emitTDFAAccept(tt *tdfaTable, b []byte, localState, localPos, localCapBase uint32) []byte {
-	b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase)
+func emitTDFAAccept(tt *tdfaTable, b []byte, localState, localPos, localCapBase uint32, capStartGlobal int32) []byte {
+	b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase, capStartGlobal)
 	b = append(b, 0x20, byte(localPos))
 	b = append(b, 0x0F) // return pos (= exclusive end)
 	return b
@@ -1499,8 +1516,8 @@ func emitTDFAAccept(tt *tdfaTable, b []byte, localState, localPos, localCapBase 
 
 // emitTDFAAcceptEOF emits accept ops + capture write + return for EOF accept.
 // pos = len = exclusive end of the full input.
-func emitTDFAAcceptEOF(tt *tdfaTable, b []byte, localState, localPos, localCapBase uint32) []byte {
-	b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase)
+func emitTDFAAcceptEOF(tt *tdfaTable, b []byte, localState, localPos, localCapBase uint32, capStartGlobal int32) []byte {
+	b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase, capStartGlobal)
 	b = append(b, 0x20, byte(localPos))
 	b = append(b, 0x0F) // return pos
 	return b
@@ -1510,7 +1527,22 @@ func emitTDFAAcceptEOF(tt *tdfaTable, b []byte, localState, localPos, localCapBa
 // to out_ptr. Dispatches on state-1 (0-based) for O(1) per-accept overhead.
 // For each accepting state, acceptRegMap tells which local holds each group
 // start/end. pos already equals the exclusive end.
-func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localCapBase uint32) []byte {
+// capStartGlobal >= 0 makes this write ABSOLUTE slot positions — the match's
+// offset in the caller's buffer rather than in the narrowed window the groups
+// wrapper hands this body. The wrapper then needs no per-slot rebasing pass.
+// -1 keeps the original relative writes, which is what the anchored export and
+// the Backtracking capture bodies still use.
+func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localCapBase uint32, capStartGlobal int32) []byte {
+	// addStart appends `+ start` to the value already on the stack.
+	addStart := func(b []byte) []byte {
+		if capStartGlobal < 0 {
+			return b
+		}
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, uint32(capStartGlobal))
+		return append(b, 0x6A) // i32.add
+	}
+
 	// tt.numStates is always ≥ 1 (see emitTDFATagOps), and getOrAddState
 	// unconditionally assigns every state a non-nil acceptRegMap entry (even
 	// non-accepting states get an all -1 slice), so at least state 0 always
@@ -1548,15 +1580,17 @@ func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localC
 				}
 			}
 
-			// Write group 0 start = 0.
+			// Write group 0 start — 0 relative, `start` absolute.
 			b = append(b, 0x20, 0x02) // local.get out_ptr
 			b = append(b, 0x41, 0x00) // i32.const 0
+			b = addStart(b)
 			b = append(b, 0x36, 0x00)
 			b = utils.AppendULEB128(b, 0) // offset 0 = group 0 start
 
 			// Write group 0 end = pos (exclusive end; pos already incremented).
 			b = append(b, 0x20, 0x02) // local.get out_ptr
 			b = append(b, 0x20, byte(localPos))
+			b = addStart(b)
 			b = append(b, 0x36, 0x00)
 			b = utils.AppendULEB128(b, 4) // offset 4 = group 0 end
 
@@ -1575,7 +1609,10 @@ func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localC
 				if startReg >= 0 {
 					b = append(b, 0x20)
 					b = utils.AppendULEB128(b, localCapBase+uint32(startReg))
+					b = addStart(b)
 				} else {
+					// Never captured by ANY path — a compile-time sentinel, so
+					// it is not biased and must not be rebased.
 					b = append(b, 0x41, 0x7F) // -1
 				}
 				b = append(b, 0x36, 0x00)
@@ -1586,6 +1623,7 @@ func emitTDFAWriteCaptures(tt *tdfaTable, b []byte, localState, localPos, localC
 				if endReg >= 0 {
 					b = append(b, 0x20)
 					b = utils.AppendULEB128(b, localCapBase+uint32(endReg))
+					b = addStart(b)
 				} else {
 					b = append(b, 0x41, 0x7F) // -1
 				}

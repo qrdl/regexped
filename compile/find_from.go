@@ -21,10 +21,11 @@ import "github.com/qrdl/regexped/internal/utils"
 //     correct: byteident cannot distinguish a local index from SLEB128 data
 //     that happens to hold the same byte.
 //
-//   - A table-memory SCRATCH SLOT (the shape B13 used for winScratchOff) has
-//     a per-pattern address whose Go zero value — 0 — is a real, writable
-//     table offset. That defect landed twice in one attempt, and is the same
-//     class as the edgeScratchOff.
+//   - A table-memory SCRATCH SLOT (the shape B13 used for the groups wrapper's
+//     window offsets) has a per-pattern address whose Go zero value — 0 — is a
+//     real, writable table offset. That defect landed twice in one attempt.
+//     Those window offsets are globals themselves now, for this reason: see
+//     compiledPattern.winGlobal.
 //
 // A global has neither failure mode. The index is a package constant, so
 // there is no per-pattern address to forget to initialise, and a body that
@@ -224,7 +225,7 @@ func (g *moduleGlobals) Section() []byte {
 // ABI flip separable from the semantic fix: narrowing by zero is a no-op, so
 // switching the export to this wrapper while every pattern is still
 // ffLegacyNarrow cannot change any answer anywhere.
-func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode) []byte {
+func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32) []byte {
 	var b []byte
 
 	switch mode {
@@ -264,6 +265,34 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode) []byte {
 	b = append(b, 0x42, 0x7F) // i64.const -1
 	b = append(b, 0x0F)       // return
 	b = append(b, 0x0B)       // end if
+
+	// len - from < minLen: the remainder is shorter than anything this pattern
+	// can match, so there is nothing to scan. Exact at every length —
+	// regexpMinMaxLen is a true lower bound, and already load-bearing for
+	// lmBareShuftiEligible, lit-anchor and set analysis.
+	//
+	// Emitted HERE rather than in each find body because this wrapper fronts
+	// every one of them: one site covers the general DFA, lit-anchor, alt-lit,
+	// counted-chain and Backtracking find paths alike. The subtraction is safe
+	// because `from > len` has already returned above.
+	//
+	// Costs 6 fuel on a call that does not take it. Two families already carry
+	// their own length exits and do not need this one, but they are cheap to
+	// leave alone: the literal-chain match body (engine_compiled_dfa.go) is not
+	// a find, and the counted-chain family's exit is inside its body, past this
+	// wrapper.
+	if minLen > 1 {
+		b = append(b, 0x20, 0x01) // local.get len
+		b = append(b, 0x20, 0x02) // local.get from
+		b = append(b, 0x6B)       // i32.sub
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, minLen)
+		b = append(b, 0x49)       // i32.lt_u
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x42, 0x7F) // i64.const -1
+		b = append(b, 0x0F)       // return
+		b = append(b, 0x0B)       // end if
+	}
 
 	if mode == ffNative {
 		b = emitFindFromSet(b, 0x02)          // find_from = from
@@ -311,8 +340,8 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode) []byte {
 }
 
 // appendFindFromWrapperCodeEntry appends a size-prefixed find wrapper body.
-func appendFindFromWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode) []byte {
-	body := buildFindFromWrapperBody(findFuncIdx, mode)
+func appendFindFromWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, minLen int32) []byte {
+	body := buildFindFromWrapperBody(findFuncIdx, mode, minLen)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

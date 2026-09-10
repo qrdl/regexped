@@ -68,6 +68,9 @@ func main() {
 	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
 	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
 	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's Gap B lenient path) that match+find-together dispatch never exercises")
+	highByteCheck := flag.Bool("high-bytes-check-corpus", false, "with --high-bytes, also cross-check the corpus's own columns against the twin oracle. Sound ONLY for a corpus whose expectations were written for a BYTE engine (custom-tests.txt); the RE2-derived corpora carry UTF-8 answers that legitimately differ")
+	allMatches := flag.Bool("all-matches", false, "synthesise col4 (EVERY match) from a Go oracle for rows whose corpus line has no such column, so later matches are checked and not just the first. re2-exhaustive.txt has four columns, so without this only one match per row is ever verified")
+	highBytes := flag.Bool("high-bytes", false, "stop skipping corpus inputs that contain bytes above 0x7F: judge them against a Go oracle run on an ASCII twin of the input (see highbytes.go). The corpus columns come from RE2, which decodes UTF-8, and cannot judge a byte engine on such input")
 	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the Gap E alt-prefixed find body, the Gap C alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises")
 	flag.Parse()
 
@@ -110,13 +113,13 @@ func main() {
 		}
 		activeSetProfiles = profs
 	}
-	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly, *matchOnly, *findOnly); err != nil {
+	if err := run(flag.Arg(0), *verbose, *maxErrors, *validateGo, *validateGroups, *forceBacktrack, *setsMode, *likelyMatch, *likelyNoMatch, *groupsOnly, *matchOnly, *findOnly, *highBytes, *allMatches, *highByteCheck); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool, likelyNoMatch bool, groupsOnly bool, matchOnly bool, findOnly bool) error {
+func run(testFile string, verbose bool, maxErrors int, validateGo bool, validateGroups bool, forceBacktrack bool, setsMode bool, likelyMatch bool, likelyNoMatch bool, groupsOnly bool, matchOnly bool, findOnly bool, highBytes bool, allMatches bool, highByteCheckCorpus bool) error {
 	f, err := os.Open(testFile)
 	if err != nil {
 		return err
@@ -171,6 +174,8 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 		npassTDFA        int
 		npassBacktrack   int
 		npassBTMatchFind int // BT match/find (--force-backtrack)
+		nHighByte        int // rows judged via an ASCII twin (--high-bytes)
+		nAllMatches      int // rows given a synthesised col4 (--all-matches)
 		skipCount        = make(map[string]int)
 	)
 
@@ -420,10 +425,65 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				col6 = strings.TrimSpace(results[6])
 			}
 
-			// Skip cases where the input contains Unicode.
+			// Inputs carrying a byte above 0x7F.
+			//
+			// Skipped by default because the expectation columns are RE2's,
+			// and RE2 decodes UTF-8 while this is a byte engine — for `.` and
+			// negated classes the two legitimately disagree, so the columns
+			// would report correct behaviour as failure.
+			//
+			// Under --high-bytes the row is judged instead against a Go oracle
+			// run on an ASCII twin of the input, which IS a valid oracle for a
+			// byte engine (see highbytes.go). Without this the whole corpus is
+			// blind to high bytes, which is how a Backtracking bug that lost
+			// every match on such input survived ~9.5M cases.
 			if hasUnicode(text) {
-				skipCount[skipUnicode]++
-				continue
+				if !highBytes {
+					skipCount[skipUnicode]++
+					continue
+				}
+				hb0, hb1, hb4, hbOK := highByteCols(pattern, text)
+				if !hbOK {
+					skipCount[skipUnicode]++
+					continue
+				}
+				// Cross-check against the corpus's own columns, so neither
+				// oracle silently replaces the other — the same discipline
+				// setcaps applies to col4.
+				//
+				// OPT-IN, and the reason is the whole point of the twin. It is
+				// sound ONLY for a corpus whose columns were written for a BYTE
+				// engine, which means custom-tests.txt and nothing else. The
+				// RE2-derived corpora carry UTF-8 answers: `(?:a(?:a.))` over
+				// "aa☺" has col1 0-5 there, because RE2's `.` consumes the
+				// whole three-byte codepoint, while a byte engine correctly
+				// answers 0-3. Comparing those reports 30,491 "data errors"
+				// that are nothing of the kind — measured, after this check was
+				// first written without the flag.
+				if highByteCheckCorpus {
+					for _, cc := range []struct {
+						name, corpus, twin string
+					}{{"col0", col0, hb0}, {"col1", col1, hb1}, {"col4", col4, hb4}} {
+						if cc.corpus != "" && cc.corpus != cc.twin {
+							nDataErrors++
+							fmt.Printf("DATA  pattern: %q\n      input:   %q\n      %s corpus: %s\n      %s twin:   %s\n",
+								pattern, text, cc.name, cc.corpus, cc.name, cc.twin)
+						}
+					}
+				}
+				// col5/col6 are not recomputed; col0 covers the capture path
+				// under --validate-groups. See highByteCols.
+				col0, col1, col4, col5, col6 = hb0, hb1, hb4, "-", "-"
+				nHighByte++
+			}
+			// The corpus's own col4 always wins; this only fills in a column
+			// the line does not have. re2-exhaustive.txt has four fields, so
+			// for it that is every row.
+			if allMatches && col4 == "" {
+				if c4, ok := goAllMatchesCol(pattern, text); ok {
+					col4 = c4
+					nAllMatches++
+				}
 			}
 
 			// --validate-go: check expectations against Go stdlib before WASM testing.
@@ -929,6 +989,15 @@ done:
 	fmt.Printf("  %-38s %d\n", "Backtrack:", npassBacktrack)
 	if npassBTMatchFind > 0 {
 		fmt.Printf("  %-38s %d\n", "Backtrack (match/find):", npassBTMatchFind)
+	}
+	if nAllMatches > 0 {
+		fmt.Printf("  %-38s %d\n", "rows with synthesised col4:", nAllMatches)
+	}
+	if nHighByte > 0 {
+		// Reported separately because these rows are judged by a DIFFERENT
+		// oracle (a Go run over an ASCII twin) than every other row, which is
+		// something a reader comparing totals across runs has to be able to see.
+		fmt.Printf("  %-38s %d\n", "high-byte inputs (--high-bytes):", nHighByte)
 	}
 	fmt.Printf("failed:  %d\n", nfail)
 	if nDataErrors > 0 {

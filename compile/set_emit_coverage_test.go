@@ -780,24 +780,26 @@ func TestSetEmitShuftiNonAdaptiveBody(t *testing.T) {
 			t.Errorf("mode %v: body does not end with `end` (0x0B), got %#x",
 				mode, body[len(body)-1])
 		}
-		// Five local groups, not six: the adaptive form's dense-gate counter
-		// is absent. (Both frames gained one trailing i32 group for E5's
-		// hoisted first byte, so the non-adaptive frame is 5 and the adaptive
-		// one 6.) The count is the second byte — the first is the body's
-		// LEB128 size prefix, which is single-byte only for tiny bodies, so
-		// the check reads it back through the same size prefix the emitter
-		// wrote.
-		if got := setEmitCovLocalGroups(t, body); got != 5 {
-			t.Errorf("mode %v: %d local groups, want 5 (the non-adaptive frame)", mode, got)
+		// Fourteen i32 locals, not sixteen: the adaptive form's dense-gate
+		// counter and its skip flag are absent.
+		//
+		// The count is of i32s, not of GROUPS, and that is a consequence of
+		// task 67's conversion: the allocator coalesces adjacent same-type
+		// runs, so both frames now declare five groups and the group count no
+		// longer tells them apart. The i32 total does — it is exactly the two
+		// locals the dense switch adds.
+		if got := setEmitCovLocalsOfType(t, body, 0x7F); got != 14 {
+			t.Errorf("mode %v: %d i32 locals, want 14 (the non-adaptive frame)", mode, got)
 		}
 	}
 }
 
-// setEmitCovLocalGroups reads the local-group count out of a size-prefixed
-// WASM function body.
-func setEmitCovLocalGroups(t *testing.T, body []byte) int {
+// setEmitCovLocalsOfType counts the locals of one value type declared by a
+// size-prefixed WASM function body. It sums across groups on purpose: the
+// allocator coalesces adjacent same-type runs, so which GROUP a local lands in
+// is an encoding detail while how many of each type exist is the frame.
+func setEmitCovLocalsOfType(t *testing.T, body []byte, ty byte) int {
 	t.Helper()
-	// Skip the ULEB128 size prefix: continuation bit set means another byte.
 	i := 0
 	for i < len(body) && body[i]&0x80 != 0 {
 		i++
@@ -806,7 +808,20 @@ func setEmitCovLocalGroups(t *testing.T, body []byte) int {
 	if i >= len(body) {
 		t.Fatalf("body of %d bytes has no local declarations", len(body))
 	}
-	return int(body[i])
+	groups := int(body[i])
+	i++
+	n := 0
+	for g := 0; g < groups; g++ {
+		if i+1 >= len(body) {
+			t.Fatalf("local group %d runs past the end of a %d-byte body", g, len(body))
+		}
+		count := int(body[i])
+		if body[i+1] == ty {
+			n += count
+		}
+		i += 2
+	}
+	return n
 }
 
 // TestSetEmitBTAdmissionRefusals covers admitBTFallback's refusals.
@@ -909,7 +924,7 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 // sizes is what distinguishes "took the max" from "took the first".
 func TestSetEmitPlanBTRegionsMemo(t *testing.T) {
 	// Nothing to lay out: no BT bucket, no regions.
-	if got := planBTRegions([]*bucket{{isFallback: true}}, 0); got != nil {
+	if got := planBTRegions([]*bucket{{isFallback: true}}, 0, &moduleGlobals{}); got != nil {
 		t.Error("regions were planned for a set with no Backtracking bucket")
 	}
 
@@ -921,7 +936,7 @@ func TestSetEmitPlanBTRegionsMemo(t *testing.T) {
 		}
 		withMemo = append(withMemo, &bucket{isFallback: true, btFallback: info})
 	}
-	regions := planBTRegions(withMemo, 0)
+	regions := planBTRegions(withMemo, 0, &moduleGlobals{})
 	if regions == nil {
 		t.Fatal("no regions planned for two Backtracking buckets")
 	}
@@ -930,9 +945,13 @@ func TestSetEmitPlanBTRegionsMemo(t *testing.T) {
 	}
 	// Everything above the stack must be laid out in order and inside `end`,
 	// or two regions share an address and one silently overwrites the other.
-	if regions.winScratch < regions.stackLimit || regions.slotScratch <= regions.winScratch ||
-		regions.end <= regions.slotScratch {
+	// The window pair is no longer among them: it is two module globals, so it
+	// has no address to collide with (TODO 75 group A).
+	if regions.slotScratch < regions.stackLimit || regions.end <= regions.slotScratch {
 		t.Errorf("regions overlap or run backwards: %+v", *regions)
+	}
+	if regions.winGlobal < 0 {
+		t.Errorf("no window globals allocated for a BT bucket: %+v", *regions)
 	}
 	memoUsed := false
 	for _, bkt := range withMemo {
@@ -959,7 +978,7 @@ func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
-	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0)
+	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0, &moduleGlobals{})
 	defer func() {
 		recovered := recover()
 		if recovered == nil {
@@ -987,7 +1006,7 @@ func TestSetEmitBTProbeBody(t *testing.T) {
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
-	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0)
+	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0, &moduleGlobals{})
 	body := buildSetBTProbeBody(regions, 7, 0)
 	if len(body) == 0 {
 		t.Fatal("the Backtracking probe emitted nothing")
@@ -1367,7 +1386,7 @@ func TestSetEmitPlanBTRegionsWithMemo(t *testing.T) {
 		}
 		buckets = append(buckets, &bucket{isFallback: true, btFallback: info})
 	}
-	regions := planBTRegions(buckets, 0)
+	regions := planBTRegions(buckets, 0, &moduleGlobals{})
 	if regions == nil {
 		t.Fatal("no regions planned for two Backtracking buckets")
 	}
@@ -1380,9 +1399,13 @@ func TestSetEmitPlanBTRegionsWithMemo(t *testing.T) {
 			largest = bkt.btFallback.memoSize
 		}
 	}
-	if int(regions.winScratch-regions.memoBase) < largest {
+	// memoBase points past the header word, so the region starts one header
+	// below it — that is what has to hold the largest bucket's reservation.
+	// slotScratch is what follows the memo now that the window pair is two
+	// globals rather than eight table bytes.
+	if int(regions.slotScratch-(regions.memoBase-btMemoHeaderBytes)) < largest {
 		t.Errorf("memo region is %d bytes, smaller than the largest bucket's %d",
-			regions.winScratch-regions.memoBase, largest)
+			regions.slotScratch-(regions.memoBase-btMemoHeaderBytes), largest)
 	}
 }
 

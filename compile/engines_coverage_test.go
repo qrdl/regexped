@@ -861,19 +861,28 @@ func TestEnginesCovDominatesUnreachable(t *testing.T) {
 	}
 }
 
-func TestEnginesCovBTEmitSingleRangeClampsNonASCII(t *testing.T) {
-	// btCheckRuneRanges filters lo>0x7F and clamps hi before calling in, so
+func TestEnginesCovBTEmitSingleRangeClampsAboveByteRange(t *testing.T) {
+	// btCheckRuneRanges filters lo>0xFF and clamps hi before calling in, so
 	// these guards are btEmitSingleRange's own contract rather than a live
 	// path. They matter because the emitted comparison runs against a single
-	// input BYTE: a lo above 0x7F can never match, and an unclamped hi would
+	// input BYTE: a lo above 0xFF can never match, and an unclamped hi would
 	// emit an SLEB128 constant wider than the byte it is compared with.
+	//
+	// The bound was 0x7F until 2026-09-09, which truncated every negated class
+	// to ASCII on the capture path and lost the whole match for input carrying
+	// a byte >= 0x80. It is 0xFF now, which is what the DFA's nfaBuildInputMap
+	// has always saturated to.
 	if got := btEmitSingleRange(nil, 0x100, 0x200); got != nil {
 		t.Errorf("btEmitSingleRange(lo=0x100) emitted % x, want nothing", got)
 	}
 	clamped := btEmitSingleRange(nil, 'a', 0x200)
-	reference := btEmitSingleRange(nil, 'a', 0x7F)
+	reference := btEmitSingleRange(nil, 'a', 0xFF)
 	if !bytes.Equal(clamped, reference) {
-		t.Errorf("btEmitSingleRange(hi=0x200) = % x, want the hi=0x7F emission % x", clamped, reference)
+		t.Errorf("btEmitSingleRange(hi=0x200) = % x, want the hi=0xFF emission % x", clamped, reference)
+	}
+	// 0x80..0xFF must survive rather than be clamped away.
+	if hi := btEmitSingleRange(nil, 0x80, 0xFF); hi == nil {
+		t.Error("btEmitSingleRange(0x80, 0xFF) emitted nothing, want a range check")
 	}
 }
 
@@ -1461,8 +1470,8 @@ func TestEnginesCovFindAltLitAnchorPointsUnwrapsBranchCaptures(t *testing.T) {
 	// Branch-level captures are transparent to the anchor analysis: the same
 	// alternation written with or without them must produce the same
 	// branches, or a capture-bearing pattern silently loses the optimisation.
-	plain, okPlain := findAltLitAnchorPoints(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`)
-	captured, okCaptured := findAltLitAnchorPoints(`([0-9]{8}ghp_[A-Za-z0-9]{36})|([a-f]{8}secret_[A-Za-z0-9]{36})`)
+	plain, okPlain := findAltLitAnchorPoints(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`, false)
+	captured, okCaptured := findAltLitAnchorPoints(`([0-9]{8}ghp_[A-Za-z0-9]{36})|([a-f]{8}secret_[A-Za-z0-9]{36})`, false)
 	if !okPlain || !okCaptured {
 		t.Fatalf("findAltLitAnchorPoints: plain ok = %v, captured ok = %v, want both true", okPlain, okCaptured)
 	}
@@ -1685,9 +1694,9 @@ func TestEnginesCovBatchGroupsWrapperWindowMode(t *testing.T) {
 
 func enginesCovAltBranches(t *testing.T, pattern string) []altLitAnchorBranch {
 	t.Helper()
-	branches, ok := findAltLitAnchorPoints(pattern)
+	branches, ok := findAltLitAnchorPoints(pattern, false)
 	if !ok {
-		t.Fatalf("findAltLitAnchorPoints(%q) rejected the pattern before the gate under test", pattern)
+		t.Fatalf("findAltLitAnchorPoints(%q, false) rejected the pattern before the gate under test", pattern)
 	}
 	return branches
 }
@@ -1799,12 +1808,12 @@ func TestEnginesCovMandatoryLitSplitsNestedConcat(t *testing.T) {
 	// automaton that matches something other than the original pattern.
 	pattern := `[0-9]{2}([a-z]MANDATORYLIT[0-9]b)[0-9]`
 	parsed := enginesCovParse(t, pattern)
-	mandLit, path := findMandatoryLitRec(parsed, 0, 0)
+	mandLit, path := findMandatoryLitRec(parsed, 0, 0, false)
 	if mandLit == nil {
-		t.Fatalf("findMandatoryLitRec(%q) = nil; the witness no longer has a liftable literal", pattern)
+		t.Fatalf("findMandatoryLitRec(%q, false) = nil; the witness no longer has a liftable literal", pattern)
 	}
 	if string(mandLit.bytes) != "MANDATORYLIT" {
-		t.Fatalf("findMandatoryLitRec(%q) lifted %q, want %q", pattern, mandLit.bytes, "MANDATORYLIT")
+		t.Fatalf("findMandatoryLitRec(%q, false) lifted %q, want %q", pattern, mandLit.bytes, "MANDATORYLIT")
 	}
 
 	prefixAST, suffixAST, ok := splitAtPath(parsed, path)
@@ -1819,11 +1828,11 @@ func TestEnginesCovMandatoryLitSplitsNestedConcat(t *testing.T) {
 	}
 	// Both sides must still account for the inner-concat material, which is
 	// exactly what the two branches under test contribute.
-	prefixMin, prefixMax := regexpMinMaxLen(prefixAST)
+	prefixMin, prefixMax := regexpMinMaxLen(prefixAST, false)
 	if prefixMin != 3 || prefixMax != 3 {
 		t.Errorf("prefix length = [%d, %d], want [3, 3] (two digits plus the capture's leading class)", prefixMin, prefixMax)
 	}
-	suffixMin, suffixMax := regexpMinMaxLen(suffixAST)
+	suffixMin, suffixMax := regexpMinMaxLen(suffixAST, false)
 	if suffixMin != 3 || suffixMax != 3 {
 		t.Errorf("suffix length = [%d, %d], want [3, 3] (digit, 'b', trailing digit)", suffixMin, suffixMax)
 	}

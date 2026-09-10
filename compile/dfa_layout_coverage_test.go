@@ -101,26 +101,57 @@ func TestDFALayoutTeddyTiers(t *testing.T) {
 }
 
 // TestDFALayoutFirstByteFlagsWordContext covers the fast-skip first-byte set
-// for a pattern that can match zero-width at the start state under a word
-// context only. Miss the wbAccept*Start0 unions and the prefix scan never
-// looks at bytes that are valid only in that context — the position-0
-// sibling of the mid-string case.
+// for a pattern that can match zero-width under a word-boundary context.
+//
+// This test asserted the DEFECT until 2026-09-09. It required that ' ' NOT be
+// a candidate first byte for `\b|x+y`, reasoning that "\b cannot fire before it
+// from a non-word context". True, and beside the point: firstByteFlags is ONE
+// table consulted at every position, so it has to be the union over every
+// start context, and from the prev=WORD context `\b` fires before a space
+// exactly as it fires before 'a' from the prev=non-word one.
+//
+// Encoding the narrower claim is what let the emitter ship with the union over
+// midStartWordState missing entirely, so `\b` over "a b" skipped the boundary
+// at position 1 and reported only 0, 2 and 3.
+//
+// For a wholly empty-width boundary pattern the honest answer is that EVERY
+// byte is a candidate — before a word byte from a non-word context, before a
+// non-word byte from a word context — so the prefilter cannot narrow anything
+// and must not pretend to. The narrowing case is a pattern that consumes a
+// byte, which is what the second half below pins.
 func TestDFALayoutFirstByteFlagsWordContext(t *testing.T) {
-	// `\b` alone accepts zero-width at the start state exactly when the next
-	// byte is a word char, so every word byte must be a candidate first byte
-	// while non-word bytes stay out (the `x+y` branch contributes 'x' only).
 	table, layout := dfaLayoutCovBuild(t, `\b|x+y`, dfaLayoutCovFindParams())
 	if !table.hasWordBoundary {
 		t.Fatal(`\b|x+y: expected hasWordBoundary`)
 	}
-	if len(layout.firstBytes) == 256 {
-		t.Fatal(`\b|x+y: all 256 bytes flagged — the zero-width start accept took the "everything" branch, not the per-context union`)
+	// Both directions of the boundary, which is the whole point.
+	if layout.firstByteFlags['a'] == 0 {
+		t.Error(`\b|x+y: word byte 'a' must be a candidate — \b fires before it when the previous byte is not a word char`)
 	}
-	if !isWordCharByte('a') || layout.firstByteFlags['a'] == 0 {
-		t.Error(`\b|x+y: word byte 'a' must be a candidate first byte (\b fires before it at position 0)`)
+	if layout.firstByteFlags[' '] == 0 {
+		t.Error(`\b|x+y: non-word byte ' ' must be a candidate — \b fires before it when the previous byte IS a word char, which is the union that was missing`)
 	}
-	if layout.firstByteFlags[' '] != 0 {
-		t.Error(`\b|x+y: non-word byte ' ' must not be a candidate — \b cannot fire before it from a non-word context`)
+	if layout.firstByteFlags[0xE9] == 0 {
+		t.Error(`\b|x+y: high byte 0xE9 must be a candidate — it is not a word char, so \b fires before it after one`)
+	}
+
+	// A pattern that must CONSUME a byte still narrows: the candidates come
+	// from the transitions out of the start states, not from an empty-width
+	// accept, so the union above must not widen this to everything.
+	// A class start, so there is no literal prefix and the firstByteFlags
+	// path is the one actually exercised.
+	_, narrow := dfaLayoutCovBuild(t, `\b[xy]+`, dfaLayoutCovFindParams())
+	if len(narrow.prefix) != 0 {
+		t.Fatalf(`\b[xy]+: prefix %q is non-empty, so firstByteFlags is never built — case is not testing what it claims`, narrow.prefix)
+	}
+	if narrow.firstByteFlags['x'] == 0 || narrow.firstByteFlags['y'] == 0 {
+		t.Error(`\b[xy]+: 'x' and 'y' must be candidate first bytes`)
+	}
+	if narrow.firstByteFlags[' '] != 0 {
+		t.Error(`\b[xy]+: ' ' must NOT be a candidate — no match can begin at a space`)
+	}
+	if len(narrow.firstBytes) == 256 {
+		t.Error(`\b[xy]+: all 256 bytes flagged; a byte-consuming pattern must still narrow the scan`)
 	}
 }
 
@@ -432,7 +463,7 @@ func TestDFALayoutSuffixWASMEmptyDFA(t *testing.T) {
 		{"zero-state table", &dfaTable{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bodyArt, data, segCount, nextOff := genSuffixWASM(tc.table, 4096, 0, []int{7}, []int{0}, LikelyNeutral, false, false)
+			bodyArt, data, segCount, nextOff := genSuffixWASM(tc.table, 4096, 0, []int{7}, []int{0}, LikelyNeutral, false, false, nil)
 			body := bodyArt.fnBody
 			if len(body) == 0 {
 				t.Fatal("empty function body")
@@ -465,7 +496,7 @@ func TestDFALayoutSuffixWASMWideBucket(t *testing.T) {
 	for idx := range patternIDs {
 		patternIDs[idx] = 100 + idx
 	}
-	bodyArt, data, segCount, nextOff := genSuffixWASM(table, 0, 0, patternIDs, prefixFixedLens, LikelyNeutral, false, false)
+	bodyArt, data, segCount, nextOff := genSuffixWASM(table, 0, 0, patternIDs, prefixFixedLens, LikelyNeutral, false, false, nil)
 	body := bodyArt.fnBody
 	if len(body) == 0 {
 		t.Fatal("empty function body for a 40-pattern bucket")
@@ -480,7 +511,7 @@ func TestDFALayoutSuffixWASMWideBucket(t *testing.T) {
 	// The same bucket at exactly 32 patterns must emit strictly less code:
 	// bits 32..39 contribute nothing, so the two bodies cannot be equal in
 	// size unless the ceiling silently dropped earlier bits too.
-	narrowBodyArt, _, _, _ := genSuffixWASM(table, 0, 0, patternIDs[:32], prefixFixedLens[:32], LikelyNeutral, false, false)
+	narrowBodyArt, _, _, _ := genSuffixWASM(table, 0, 0, patternIDs[:32], prefixFixedLens[:32], LikelyNeutral, false, false, nil)
 	narrowBody := narrowBodyArt.fnBody
 	if len(narrowBody) != len(body) {
 		t.Errorf("32-pattern body is %d bytes and 40-pattern body is %d; patterns past bit 32 must contribute no code", len(narrowBody), len(body))
@@ -500,7 +531,7 @@ func TestDFALayoutSuffixWASMWideBucket(t *testing.T) {
 	if !midDominant {
 		t.Fatalf(`a[^b]*: expected a mid-accepting dominant state — case is not testing what it claims`)
 	}
-	if dominantBodyArt, _, _, _ := genSuffixWASM(dominantTable, 0, 0, patternIDs, prefixFixedLens, LikelyNeutral, false, false); len(dominantBodyArt.fnBody) == 0 {
+	if dominantBodyArt, _, _, _ := genSuffixWASM(dominantTable, 0, 0, patternIDs, prefixFixedLens, LikelyNeutral, false, false, nil); len(dominantBodyArt.fnBody) == 0 {
 		t.Error(`a[^b]*: empty function body for a 40-pattern bucket`)
 	}
 
@@ -511,7 +542,7 @@ func TestDFALayoutSuffixWASMWideBucket(t *testing.T) {
 	if wideLayout.useU8 {
 		t.Fatalf(`x{127}$|y{128}: expected a u16 suffix table (numWASM=%d)`, wideLayout.numWASM)
 	}
-	if wideBodyArt, _, _, _ := genSuffixWASM(wideTable, 0, 0, []int{1, 2}, []int{0, 0}, LikelyNeutral, false, false); len(wideBodyArt.fnBody) == 0 {
+	if wideBodyArt, _, _, _ := genSuffixWASM(wideTable, 0, 0, []int{1, 2}, []int{0, 0}, LikelyNeutral, false, false, nil); len(wideBodyArt.fnBody) == 0 {
 		t.Error(`x{127}$|y{128}: empty function body for a u16 suffix table`)
 	}
 }
@@ -535,12 +566,12 @@ func TestDFALayoutSuffixWASMCompressed(t *testing.T) {
 	for idx := range patternIDs {
 		patternIDs[idx] = 200 + idx
 	}
-	bodyArt, _, _, _ := genSuffixWASM(table, 0, 0, patternIDs, prefixFixedLens, LikelyNeutral, false, false)
+	bodyArt, _, _, _ := genSuffixWASM(table, 0, 0, patternIDs, prefixFixedLens, LikelyNeutral, false, false, nil)
 	body := bodyArt.fnBody
 	if len(body) == 0 {
 		t.Fatal("empty function body")
 	}
-	singleArt, _, _, _ := genSuffixWASM(table, 0, 0, []int{3}, []int{0}, LikelyNeutral, false, false)
+	singleArt, _, _, _ := genSuffixWASM(table, 0, 0, []int{3}, []int{0}, LikelyNeutral, false, false, nil)
 	single := singleArt.fnBody
 	if len(single) == 0 {
 		t.Fatal("empty function body for a single-pattern bucket")
@@ -577,7 +608,7 @@ func TestDFALayoutFindBodyStartContexts(t *testing.T) {
 			if isAnchoredFind(table) {
 				t.Fatalf("%q routes to buildAnchoredFindBody, not buildFindBody — case is not testing what it claims", tc.pattern)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern), 0)
+			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern, false), 0)
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -634,7 +665,7 @@ func TestDFALayoutFindBodyPrefixWalkDivergence(t *testing.T) {
 				t.Fatalf("%q: all four prefix-end states agree (%d) — nothing diverges to emit",
 					tc.pattern, layout.wasmPrefixEnd)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern), 0)
+			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern, false), 0)
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -667,7 +698,7 @@ func TestDFALayoutFindBodyU16NonMidDominant(t *testing.T) {
 	if nonMid == 0 {
 		t.Fatalf("%q: expected at least one non-mid dominant state", pattern)
 	}
-	body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(pattern), 0)
+	body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(pattern, false), 0)
 	if len(body) == 0 {
 		t.Fatalf("%q: empty find body", pattern)
 	}
@@ -700,7 +731,7 @@ func TestDFALayoutFindBodyMandatoryLit(t *testing.T) {
 			if len(layout.prefix) != 0 {
 				t.Fatalf("%q: literal prefix %q present, so the mandatory-literal path is not taken", tc.pattern, layout.prefix)
 			}
-			lit := findMandatoryLit(tc.pattern)
+			lit := findMandatoryLit(tc.pattern, false)
 			if lit == nil || len(lit.bytes) == 0 {
 				t.Fatalf("%q: no mandatory literal found — case is not testing what it claims", tc.pattern)
 			}

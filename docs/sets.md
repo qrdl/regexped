@@ -582,8 +582,9 @@ the fallback half of a mixed set.
 ```
 
 Under `hints: [prefer-no-match]` the one-pass automaton additionally **strides
-over stretches of input where no pattern could be starting**, in 16-byte SIMD
-chunks, instead of stepping a byte at a time. It applies to both accept forms
+over stretches of input where no pattern could be starting**, in 32-byte SIMD
+laps (falling back to 16 for the last stretch), instead of stepping a byte at a
+time. It applies to both accept forms
 — narrow (≤64 ids) and wide alike — and it is exact rather than approximate:
 the states it strides through are ones where no pattern can accept, and these
 bodies report no position, so a skipped run has no effect at all beyond
@@ -591,6 +592,27 @@ advancing. Like every other SIMD skip here it turns itself off for the rest of a
 attempts in a row have failed to clear a full chunk, so input that is dense in
 the patterns' opening byte classes pays a bounded cost rather than a
 compounding one.
+
+### The last bytes of a call
+
+Every SIMD scan in the compiler works in 16-byte chunks and so has to stop
+short: once fewer than one chunk remains, the scan cannot load another without
+reading past the input. What used to happen then was a byte-at-a-time walk over
+the last few positions, and that walk is flat per-call cost — it does not
+shrink with the input, so it is a rounding error on a 100 KB scan and most of
+the work in a 32-byte one.
+
+The literal frontends and the union scan now finish those bytes with one more
+SIMD probe instead, loaded **backwards from the end of the input** so that it
+still fits, with the lanes for positions already scanned masked off. Every byte
+it reads is inside the input, so no over-read is introduced and hosts need
+arrange nothing. The probe is exact in the same sense the stride above is: a
+probe that finds no candidate proves the whole remainder dead, because the
+positions it does not cover are ones with too few bytes left for any pattern to
+start at.
+
+An input shorter than one probe window gets no probe — there is no full chunk
+anywhere in it — and takes the per-byte walk as before.
 
 ## Literal scan frontend
 
@@ -738,6 +760,25 @@ call — Rust returns `Err(Error::BacktrackOverflow)`, Go returns
 `ErrBacktrackOverflow`, JS and TS **throw**, AssemblyScript returns `null` /
 `RX_ITER_ERROR`, and C returns `RX_ERR_BT_OVERFLOW`. What none of them do is
 quietly report "nothing matched".
+
+**Two budgets can produce it, and one of them scales with input length.** The
+frame budget above is sized from the member's alternation count. A member that
+also needs BitState memoisation — a non-greedy loop whose body can match zero
+bytes — carries a second, independent ceiling sized from its instruction count;
+see *BitState memoization* in [engines.md](engines.md). The two move
+independently, so either can be the one a given input hits first.
+
+The memo ceiling matters more for a set than for a lone pattern. A set's
+Backtracking bucket is a suffix function called once per candidate position, and
+each call searches from that candidate to the end of the input — so the length
+measured against the ceiling is bounded by the INPUT, not by the match, and a
+long enough input can report "unknown" at every candidate. A lone pattern's
+`find` does not behave this way: its memo is rebased onto the call's `from`, so
+a host walking a buffer keeps getting answers as it advances.
+
+If you are scanning inputs of unbounded size with a set, the reliable fix is to
+keep such a member out of the set — its ceiling is a property of the pattern,
+not of the set — or to feed the set in bounded chunks.
 
 A set with no Backtracking member is completely unaffected: it keeps the `i64`
 bitmask form and none of these checks are emitted.

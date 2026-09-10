@@ -46,8 +46,12 @@ type sparseScratch struct {
 	// eligible states and one failing must not silence the others — a shared
 	// flag took the win from -80% to +5%.
 	memberStale int32
-	// memberBucketStale: the BUCKET-level counterpart of
-	// memberStale, and the reason a bucket that never skips can stop paying
+	// The BUCKET-level counterpart of memberStale is NOT here: it is a module
+	// global, allocated per bucket that carries a skip (sparseSuffixParams.
+	// memberGlobal). Its reasoning is kept below because it explains the
+	// emission, not the layout.
+	//
+	// It is the reason a bucket that never skips can stop paying
 	// for the machinery entirely rather than merely stop attempting.
 	//
 	// memberStale bounds the WASTED ATTEMPT. What it cannot bound is the
@@ -61,39 +65,53 @@ type sparseScratch struct {
 	// once without, and picks between them at entry. The second copy is
 	// byte-for-byte the walk a neutral bucket emits, so a bucket whose skip
 	// is not paying costs exactly what not having the feature costs.
-	// memberBucketStale (u8) is that verdict, set at the end of a dispatching
+	// The global is that verdict, set at the end of a dispatching
 	// walk that dispatched and advanced nothing; masking the candidate
 	// position makes it a re-probe rather than a latch, as `lPos & 63` does
 	// for the per-state flag: one candidate in memberReprobeCalls takes the
 	// dispatching walk regardless, so a run-free input cannot disable the
 	// skip for a run-heavy one that follows on the same instance.
-	memberBucketStale int32
-	end               int32
+	//
+	// A global is module-scoped, so every INSTANCE has its own copy and two
+	// instances cannot interfere — but two concurrent calls into ONE instance
+	// share it. That is sound here for the same reason the scratch byte was:
+	// the verdict is a performance hint, and the worst a torn read produces is
+	// a bucket taking the other walk, which answers identically.
+	end int32
 }
 
 // memberReprobeCalls is how often a bucket whose member skip was judged
 // unproductive takes the dispatching walk anyway, to find out whether the
-// input has changed character. One candidate in 32 pays the dispatch, so a
-// wrong verdict costs ~3% of what it used to rather than compounding, and a
-// right one keeps ~97% of the saving. Must be a power of two: the test is a
-// mask over the candidate position.
-const memberReprobeCalls = 32
+// input has changed character. One candidate in memberReprobeCalls pays the
+// dispatch, so a wrong verdict costs that fraction of what it used to rather
+// than compounding, and a right one keeps the rest of the saving. Must be a
+// power of two: the test is a mask over the candidate position.
+//
+// memberStateReprobePeriod is the same idea one level down, for the per-STATE
+// stale flag, and the two are declared together because they must move
+// together: the per-bucket verdict counts states DISPATCHED to, and dispatches
+// only happen on a state whose flag let one through, so a per-state period
+// longer than the per-bucket one starves the verdict of evidence.
+//
+// 32 and 64 were the original pair. LM-BENCH §7.8 attributes the residual
+// ~9,000 fuel above neutral on `sparse-member-skip-norun` to the stale flags
+// and the dispatch INSIDE these re-probe walks rather than to the entry test,
+// which is what makes lengthening the periods the remedy for that row.
+const (
+	memberReprobeCalls       = 32
+	memberStateReprobePeriod = 64
+)
 
 func planSparseScratch(base int32, numPatterns, numStates int) sparseScratch {
 	s := sparseScratch{endPos: base}
 	s.seen = s.endPos + int32(numPatterns)*4
 	s.fired = s.seen + int32(numPatterns)
 	s.memberStale = s.fired + int32(numPatterns)*2
-	s.memberBucketStale = s.memberStale + int32(numStates)
-	s.end = s.memberBucketStale
-	if numStates > 0 {
-		// Reserved on exactly the same condition as the per-state flags above
-		// it — numStates is zero unless the skip is emitted. Sizing this byte
-		// unconditionally would move every sparse bucket's scratch, and
-		// therefore its neutral output, for a region a neutral build never
-		// reads.
-		s.end++
-	}
+	// The per-BUCKET verdict used to take one more byte here. It is a module
+	// GLOBAL now (TODO 75 group C): an allocator index instead of an address,
+	// so there is no per-bucket offset to compute, forget, or leave at a zero
+	// value that is itself a writable table location.
+	s.end = s.memberStale + int32(numStates)
 	// 8-align so a following table starts clean.
 	s.end = (s.end + 7) &^ 7
 	return s
@@ -440,6 +458,10 @@ type sparseSuffixParams struct {
 	tableMemIdx  int
 	gated        bool
 	hasSkip      bool
+	// memberGlobal is the module global holding the per-bucket member-skip
+	// verdict, or -1 when this bucket carries no skip. See sparseScratch's
+	// comment for what the verdict is and why it re-probes.
+	memberGlobal int32
 }
 
 // buildSparseSuffixBody emits the tuple-writing suffix function for a
@@ -651,10 +673,12 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 			b = appendTableLoad8u(b, p.tableMemIdx)
 			b = append(b, 0x45) // i32.eqz — not stale
 			b = append(b, 0x20, lPos)
-			b = append(b, 0x41, 0x3F, 0x71) // lPos & 63
-			b = append(b, 0x45)             // == 0 — the re-probe tick
-			b = append(b, 0x72)             // i32.or
-			b = append(b, 0x04, 0x40)       // if (void): attempt
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(memberStateReprobePeriod-1))
+			b = append(b, 0x71)       // lPos & (period-1)
+			b = append(b, 0x45)       // == 0 — the re-probe tick
+			b = append(b, 0x72)       // i32.or
+			b = append(b, 0x04, 0x40) // if (void): attempt
 			b = append(b, 0x20, lPos, 0x21, lWas)
 			b = emitMemberSetSkip(b, memberSkipLocals{
 				pos: lPos, length: pLen, ptr: pPtr, setID: lTmp,
@@ -714,9 +738,8 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		// the tick when it should always dispatch, which costs the skip's whole
 		// win and no correctness — exactly the kind of silent loss the
 		// `sparse-member-skip` win-half row exists to catch.
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, p.scratch.memberBucketStale)
-		b = appendTableLoad8u(b, p.tableMemIdx)
+		b = append(b, 0x23) // global.get: the verdict mask
+		b = utils.AppendULEB128(b, uint32(p.memberGlobal))
 		b = append(b, 0x20, pLPos)
 		b = append(b, 0x71)       // i32.and — mask & candidate position
 		b = append(b, 0x04, 0x40) // if (void): stale AND off the tick
@@ -727,12 +750,11 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		// already holds the mask (or 0 if nothing was dispatched to), so this
 		// is `advanced ? 0 : lTried` — one select, six instructions in all,
 		// exactly what the boolean store cost before the mask existed.
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, p.scratch.memberBucketStale)
 		b = append(b, 0x41, 0x00) // i32.const 0
 		b = append(b, 0x20, lTried, 0x20, lAdvanced)
 		b = append(b, 0x1B) // select — lAdvanced != 0 ? 0 : lTried
-		b = appendTableStore8(b, p.tableMemIdx)
+		b = append(b, 0x24) // global.set
+		b = utils.AppendULEB128(b, uint32(p.memberGlobal))
 		b = append(b, 0x0B) // end if
 	}
 

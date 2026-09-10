@@ -396,7 +396,8 @@ type CompileOptions struct {
 	// MemoBudget is the maximum bytes allocated for the BitState memoization
 	// buffer. Only used when the pattern requires BitState (needsBitState == true).
 	// Defaults to 128*1024 (128 KB) when zero.
-	MemoBudget  int
+	MemoBudget int
+
 	tableMemIdx int // 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables)
 
 	// globals is the module's WASM global allocator, shared by every pattern
@@ -433,21 +434,63 @@ type compiledPattern struct {
 	// composed wrapper's find half carries the mode instead.
 	captureFromMode findFromMode
 
-	numGroups  int      // capture group count (for wrapper slot adjustment)
-	isTDFA     bool     // true = TDFA capture; false = Backtracking (controls sentinel data segment)
+	numGroups int  // capture group count (for wrapper slot adjustment)
+	isTDFA    bool // true = TDFA capture; false = Backtracking (controls sentinel data segment)
+
+	// capStartGlobalP1 is the module global through which the groups wrappers
+	// hand this pattern's capture body the match's start offset, so the body
+	// writes ABSOLUTE slot positions and the wrappers need no per-slot
+	// rebasing pass — PLUS ONE, so that the field's zero value means "no such
+	// channel" rather than naming global 0.
+	//
+	// Read it through capStartGlobal(), which returns the emitters' -1 for
+	// "none". The plus-one encoding is the point: global 0 is the find-from
+	// channel, so a field left at its Go zero value would silently make every
+	// capture body add the CALLER'S SEARCH POSITION to every slot it writes.
+	// That is the defect class compile/find_from.go opens by describing, and
+	// the reason the window pair below is stored the same way; an -1 spelled
+	// at each of the fourteen construction sites is a rule the fifteenth will
+	// break.
+	//
+	// A global rather than a fourth parameter because the capture body's
+	// (ptr,len,out_ptr)->i32 type is SHARED with the Backtracking bodies, and
+	// because compile/find_from.go already established this exact channel shape
+	// for the same reason.
+	capStartGlobalP1 int32
+
+	// minLen is the shortest string this pattern can match, or 0 when it can
+	// match empty. The exported find wrapper turns it into a one-test early
+	// exit: a remainder shorter than this cannot contain a match, so there is
+	// nothing to scan.
+	//
+	// Unconditional by decision — not gated on any declared input length. It is
+	// exact at every length (regexpMinMaxLen is a true lower bound and already
+	// gates lmBareShuftiEligible, lit-anchor and set analysis), and one code
+	// path is cheaper to keep right than two.
+	minLen     int32
 	groupNames []string // groupNames[i] = name for group i+1; "" = unnamed
 
-	// winScratchOff: table-memory offset of an 8-byte (startOff,endOff) scratch
-	// slot, written by the groups/batch-groups wrapper right before calling
-	// captureBody and read by captureBody's word-boundary (\b/\B) checks at the
-	// two edges of the DFA-narrowed match slice. Only meaningful when
-	// !anchored && !isTDFA (Backtracking captureBody composed behind a find
-	// wrapper. Backtracking's own pos==0/pos==len
-	// checks otherwise wrongly treat the narrowed slice's edges as the true
-	// start/end of the original input, losing real \b context beyond the
-	// match. Zero value (0) is never read unless isTDFA==false && anchored==false,
-	// in which case it always holds a real, explicitly-set offset.
-	winScratchOff int32
+	// winGlobal is the first of TWO consecutive module globals holding the
+	// (startOff, endOff) pair of the DFA-narrowed match slice, written by the
+	// groups/batch-groups wrapper right before it calls captureBody and read by
+	// captureBody's word-boundary (\b/\B) checks at the slice's two edges.
+	// Only meaningful when !anchored && !isTDFA (a Backtracking captureBody
+	// composed behind a find wrapper): Backtracking's own pos==0/pos==len
+	// checks otherwise treat the narrowed slice's edges as the true start and
+	// end of the input, losing real \b context beyond the match. -1 when this
+	// pattern is not in window mode.
+	//
+	// A global is exactly as module-scoped as the table slot it replaces — the
+	// sharing semantics do not change — but the index comes from an allocator
+	// rather than from address arithmetic whose zero value is a real, writable
+	// table offset. That value is what B13's shortcut left unset, and the
+	// wrapper then wrote 8 bytes over table offset 0 on every groups() call:
+	// standalone, that offset is the CALLER'S OWN INPUT BUFFER, corrupted in
+	// place. A body reading a global its assembler never declared does not
+	// validate, so the same mistake is now a load-time error.
+	// PLUS ONE, for the same reason as capStartGlobalP1 above: the zero value
+	// has to mean "not in window mode". Read it through winGlobal().
+	winGlobalP1 int32
 
 	// findFromMode records how this pattern's find function receives the
 	// `from` position of an exported find call. It is
@@ -886,10 +929,46 @@ func extractGroupNames(re *syntax.Regexp) []string {
 	return names
 }
 
+// capStartGlobal is the ABSOLUTE-SLOT channel's module global index, or -1
+// when this pattern has none — the spelling every emitter takes. The field
+// behind it is stored plus one so that "none" is the Go zero value and cannot
+// be reached by forgetting to initialise it; see capStartGlobalP1.
+func (p *compiledPattern) capStartGlobal() int32 { return p.capStartGlobalP1 - 1 }
+
+// winGlobal is the first of the window pair's two module globals, or -1 when
+// this pattern is not in window mode. Same encoding, same reason.
+func (p *compiledPattern) winGlobal() int32 { return p.winGlobalP1 - 1 }
+
 // compilePattern compiles one RegexEntry into an intermediate compiledPattern.
 // It does not build the final WASM module; call assembleModule for that.
 // forceGroupsEngine overrides engine selection for the capture path (0 = auto).
+//
+// The body is compilePatternBody; this wrapper exists to attach the facts that
+// belong to EVERY compiled pattern regardless of which emitter produced it.
+// The body reaches its several returns through as many parse branches, so a
+// fact stated at each of them is a fact that will be forgotten at the next one
+// added — and stating it at a CALLER is worse still, which is how minLen came
+// to exist on the compileAll path and not on CompileFile's.
 func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions) (*compiledPattern, error) {
+	p, err := compilePatternBody(re, tableBase, forceGroupsEngine, buildOpts)
+	if err != nil || p == nil {
+		return p, err
+	}
+	// minLen: the shortest string this pattern can match, which the exported
+	// find wrapper turns into a one-test early exit.
+	//
+	// byteMode is the pattern's own mode ORed with the build's, exactly as
+	// compilePatternBody adopts it — an over-estimate here REFUSES an input
+	// that matches, so the two must not disagree.
+	if parsed, perr := syntax.Parse(re.Pattern, syntax.Perl); perr == nil {
+		if n, _ := regexpMinMaxLen(parsed, buildOpts.ByteMode || re.ByteMode); n > 0 {
+			p.minLen = int32(n)
+		}
+	}
+	return p, nil
+}
+
+func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions) (*compiledPattern, error) {
 	// The mode is a property of the PATTERN, so it is adopted here rather than
 	// being expected in the build-wide options every caller would have to
 	// thread.
@@ -1101,7 +1180,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 								lmNonMidShufti:       false,
 								lmWideShufti:         false,
 							})
-							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, false)
+							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, false, -1)
 							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
 							p.dataBytes = append(p.dataBytes, rawTDFA...)
 							p.dataSegCount += cntTDFA
@@ -1357,6 +1436,18 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			useMemo := needsBitState(btProg)
 			btBase := utils.PageAlign(cur)
 			matchMemoBudget := resolveMemoBudget(&buildOpts)
+			// Refuses a budget too small to hold even the shortest admissible
+			// input's bitset — see btMemoPlan. This path reserves the whole
+			// budget rather than the bitset's own size, so without the check it
+			// would accept what the capture path rejects.
+			matchMemoMaxLen := int32(0)
+			if useMemo {
+				var err error
+				matchMemoMaxLen, _, err = btMemoPlan(len(bt.prog.Inst), matchMemoBudget)
+				if err != nil {
+					return nil, err
+				}
+			}
 			btStackSize, btMemoSize := btAllocSizes(bt, useMemo, 0, matchMemoBudget)
 			if err := checkBTMemoryBudget(btBase, int64(btStackSize)+int64(btMemoSize)); err != nil {
 				return nil, err
@@ -1365,9 +1456,9 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			btStackLimit := btStackBase + int32(btStackSize)
 			var btMemoBase int32
 			if useMemo {
-				btMemoBase = btStackLimit
+				btMemoBase = btStackLimit + btMemoHeaderBytes
 			}
-			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx)
+			matchBody = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx, matchMemoMaxLen)
 			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
 		} else {
 			lm := buildDFALayout(dfaLayoutParams{
@@ -1526,13 +1617,13 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			leftmostFirst:        true,
 			compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
 			useAcceptSideTable:   false,
-			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern),
+			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern, buildOpts.ByteMode),
 			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 			lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
 			lmClassChain:         buildOpts.LikelyMode == LikelyMatch,
 		})
 	}
-	patMandLit := findMandatoryLit(re.Pattern)
+	patMandLit := findMandatoryLit(re.Pattern, buildOpts.ByteMode)
 	if patMandLit != nil {
 		buildOpts.report().Note("mandatory literal extracted")
 	}
@@ -1624,6 +1715,15 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// Allocate BT stack after SIMD tables.
 			btBase := utils.PageAlign(cur + int64(len(btScanDataBytes)))
 			memoBudget := resolveMemoBudget(&buildOpts)
+			// Same refusal as the match path above, for the same reason.
+			findMemoMaxLen := int32(0)
+			if useMemo {
+				var err error
+				findMemoMaxLen, _, err = btMemoPlan(len(bt.prog.Inst), memoBudget)
+				if err != nil {
+					return nil, err
+				}
+			}
 			btStackSize, btMemoSize := btAllocSizes(bt, useMemo, 0, memoBudget)
 			if err := checkBTMemoryBudget(btBase, int64(btStackSize)+int64(btMemoSize)); err != nil {
 				return nil, err
@@ -1632,10 +1732,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			btStackLimit := btStackBase + int32(btStackSize)
 			var btMemoBase int32
 			if useMemo {
-				btMemoBase = btStackLimit
+				btMemoBase = btStackLimit + btMemoHeaderBytes
 			}
 			frameSize := int32(8 + btNumLoopFrameLocals(bt, false)*4) // pos + loop trackers + retryPC (no cap slots)
-			p.setFind(appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx))
+			p.setFind(appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx, findMemoMaxLen))
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
@@ -1813,7 +1913,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 			// for v1's simple "return on first success" dispatch to be
 			// correct.
 			if p.litAnchorBackScanBody == nil && !needGroups {
-				if altBranches, ok := findAltLitAnchorPoints(re.Pattern); ok {
+				if altBranches, ok := findAltLitAnchorPoints(re.Pattern, buildOpts.ByteMode); ok {
 					if altCompiled, altOK := compileAltLitAnchorBranches(altBranches, l.tableEnd, buildOpts); altOK {
 						buildOpts.report().Note("alternation literal-anchored find")
 						p.altLitAnchorBranches = altCompiled.branches
@@ -1965,11 +2065,11 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	if !dfaStateLimitExceeded && !anchored && isWholePatternSingleCapture(parsed) {
 		p.numGroups = 2
 		p.captureBody = appendTrivialSingleCaptureCodeEntry(nil)
-		// winScratchOff must be an explicit -1 here: the field's zero value
+		// winGlobal must be an explicit -1 here: the field's zero value
 		// is 0, a real table-memory offset, and this path is !isTDFA &&
 		// !anchored — exactly the combination the wrapper-emission call site
 		// (compile.go, appendWrapperCodeEntry's winOff) treats as "read
-		// p.winScratchOff", so leaving it unset made the wrapper scribble an
+		// p.winGlobal", so leaving it unset made the wrapper scribble an
 		// 8-byte (origPtr,origEnd) scratch value over table-memory offset 0
 		// on every groups() call. In a standalone module (tableMemIdx 0) that
 		// memory IS the caller's own memory — offset 0 is the input buffer's
@@ -1977,7 +2077,7 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		// an embedded module (tableMemIdx 1) it corrupts the DFA table's own
 		// base instead. Either way, the next find()/groups() call in the
 		// same instance reads back garbage.
-		p.winScratchOff = -1
+		// winGlobalP1 stays 0: not in window mode. No -1 to remember.
 		return p, nil
 	}
 
@@ -2017,7 +2117,23 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 				lmWideShufti:         false,
 			})
 			p.numGroups = tt.numGroups
-			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored)
+			// A nil allocator DEGRADES here rather than panicking or inventing
+			// one, and that is the deliberate opposite of the set path's answer
+			// (see CompileSet). A pattern compiled alone is assembled by a
+			// caller holding its own allocator, which never saw an allocation
+			// made here — so a body reading an invented global would be one the
+			// module never declares, and would not validate. Emitting the
+			// no-channel form instead is always correct: the groups wrapper
+			// then runs its per-slot rebasing pass, which is what every pattern
+			// did before the channel existed.
+			//
+			// Only a body behind the groups wrapper needs the channel: the
+			// anchored export is called with the caller's own ptr, so its
+			// slots are already absolute.
+			if !anchored && buildOpts.globals != nil {
+				p.capStartGlobalP1 = int32(buildOpts.globals.Alloc()) + 1
+			}
+			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored, p.capStartGlobal())
 			// TDFA only needs the transition table (no stack/memo).
 			p.tableEnd = tdfaLayout.tableEnd
 			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
@@ -2058,61 +2174,74 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 		var memoMaxLen int32
 		var memoMaxSize int64
 		if useMemo {
-			N := len(prog.Inst)
-			memoBudget := resolveMemoBudget(&buildOpts)
-			memoMaxLen = int32(memoBudget*8/N - 1)
-			memoMaxSize = int64((N*(int(memoMaxLen)+1) + 7) / 8)
-			if memoMaxSize > int64(memoBudget) {
-				return nil, fmt.Errorf(
-					"pattern requires %d bytes of memo memory, exceeds budget %d: "+
-						"increase CompileOptions.MemoBudget",
-					memoMaxSize, memoBudget)
+			var err error
+			memoMaxLen, memoMaxSize, err = btMemoPlan(len(prog.Inst), resolveMemoBudget(&buildOpts))
+			if err != nil {
+				return nil, err
 			}
 		}
 
 		// Window mode: patterns whose assertions are defined against the
-		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get an 8-byte
-		// (startOff,endOff) scratch slot, and the groups/batch-groups
+		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get the match
+		// extent through a PAIR OF MODULE GLOBALS, and the groups/batch-groups
 		// wrappers stop narrowing (ptr,len) for them entirely — see
 		// buildBacktrackBody, a past defect.
 		// Only needed when this captureBody is composed behind a find
 		// wrapper (!anchored); the native/anchored export already gets the
 		// caller's real ptr/len and has no such gap.
+		//
+		// No table bytes are reserved for it. The budget check below used to
+		// add 8 for the scratch slot the globals replaced; the addend outlived
+		// the region, which is harmless only because it can merely reject and
+		// eight bytes never decided a verdict.
 		needWindow := !anchored && (btHasWordBoundary(prog) || btHasTextLineAnchors(prog))
-		var winScratchSize int64
-		if needWindow {
-			winScratchSize = 8
-		}
 
-		if err := checkBTMemoryBudget(btBase, int64(stackSize)+memoMaxSize+winScratchSize); err != nil {
+		// memoMaxSize is the BITSET; the reservation also carries its header.
+		memoReserve := memoMaxSize
+		if useMemo {
+			memoReserve += btMemoHeaderBytes
+		}
+		if err := checkBTMemoryBudget(btBase, int64(stackSize)+memoReserve); err != nil {
 			return nil, err
 		}
 		stackBase := int32(btBase)
 		stackLimit := stackBase + int32(stackSize)
 		var memoTableBase int32
 		if useMemo {
-			memoTableBase = stackBase + int32(stackSize)
+			memoTableBase = stackBase + int32(stackSize) + btMemoHeaderBytes
 		}
 
-		winScratchOff := int32(-1)
+		// The window offsets are two module globals, so no table region is
+		// reserved for them any more (TODO 75 group A).
+		winGlobal := int32(-1)
+		if needWindow {
+			if buildOpts.globals == nil {
+				panic("compile: a window-mode Backtracking body needs the module's global allocator")
+			}
+			winGlobal = int32(buildOpts.globals.Alloc())
+			buildOpts.globals.Alloc() // endOff, at winGlobal+1
+		}
 		// Kept in int64 throughout: memoTableBase is an int32 whose bit
 		// pattern is the right WASM address even past 2GiB, but
 		// sign-extending it back here would make the reservation's own end
 		// address negative and hide an over-ceiling reservation from the
 		// tableEnd bookkeeping. Identical below 2GiB.
 		afterBT := btBase + int64(stackSize)
-		if useMemo {
-			afterBT += memoMaxSize
-		}
-		if needWindow {
-			winScratchOff = int32(afterBT)
-			afterBT += 8
-		}
+		afterBT += memoReserve
 		p.tableEnd = utils.PageAlign(afterBT)
 
 		p.numGroups = bt.numGroups
-		p.winScratchOff = winScratchOff
-		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winScratchOff)
+		p.winGlobalP1 = winGlobal + 1
+		// Absolute capture slots, for the same reason and by the same means as
+		// the TDFA body: only when this body sits behind the groups wrapper and
+		// is NOT in window mode, which already writes absolute slots of its own.
+		// A nil allocator degrades to the no-channel form here too — see the
+		// TDFA site above for why that, and not a panic, is the right answer on
+		// the pattern path.
+		if !anchored && !needWindow && buildOpts.globals != nil {
+			p.capStartGlobalP1 = int32(buildOpts.globals.Alloc()) + 1
+		}
+		p.captureBody = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winGlobal, memoMaxLen, p.capStartGlobal())
 	}
 
 	return p, nil
@@ -2374,9 +2503,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				}
 				winOff := int32(-1)
 				if !p.isTDFA {
-					winOff = p.winScratchOff
+					winOff = p.winGlobal()
 				}
-				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff)
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal())
 			}
 		}
 		// LNM non-mid bulk-skip helper body append was here —
@@ -2396,9 +2525,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				}
 				winOff := int32(-1)
 				if !p.isTDFA {
-					winOff = p.winScratchOff
+					winOff = p.winGlobal()
 				}
-				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode)
+				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal())
 			}
 		}
 		if p.hasFindFunc() {
@@ -2406,7 +2535,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				panic("compile: pattern contributes a find function but no findFromMode was recorded — " +
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
-			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode)
+			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.minLen)
 		}
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
@@ -2627,24 +2756,23 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 				}
 			}
 		}
-		var infos []*PatternInfo
-		var globalIDs []int
 		var droppedRefs []PatternRef
 		for _, idx := range selectedIdx {
 			re := cfg.Regexps[idx]
 			if re.CaptureStubsRequested() {
 				diag.CaptureBearing++
 				droppedRefs = append(droppedRefs, PatternRef{ID: idx, Name: re.Name})
-				continue
 			}
-			info, err := analyzePattern(re, &prefixPool, &suffixPool)
-			if err != nil {
-				continue
-			}
-			info.globalID = idx
-			info.name = re.Name
-			infos = append(infos, info)
-			globalIDs = append(globalIDs, idx)
+		}
+		// setPatternInfos, not a second copy of its loop. This used to
+		// `continue` past an analyzePattern error where CompileFile treats the
+		// same error as FATAL, so a config that cannot build could still
+		// produce a clean-looking diagnostics file describing a set with the
+		// broken pattern quietly missing from it (FABLE B23, third mechanism).
+		// Sharing the function is what stops the two answers drifting again.
+		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+		if err != nil {
+			return err
 		}
 		spec := SetSpec{
 			Name:        sc.Name,
@@ -2966,7 +3094,7 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 //
 // Signature: (ptr i32, len i32, out_ptr i32) → i32
 //
-// winScratchOff (-1 = not applicable, e.g. TDFA or a captureBody with no
+// winGlobal (-1 = not applicable, e.g. TDFA or a captureBody with no
 // edge-sensitive assertion) turns on WINDOW MODE: instead of narrowing
 // (ptr,len) to the match extent, this wrapper passes the caller's real
 // (ptr,len) and writes the extent as an (startOff,endOff) pair to that
@@ -2974,7 +3102,7 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 // \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already relative
 // to ptr — so this wrapper adds nothing to them. See buildBacktrackBody in
 // engine_backtrack.go for the reading side.
-func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32) []byte {
 	var b []byte
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F) // 3 × i32
@@ -3005,20 +3133,27 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	b = append(b, 0x88)
 	b = append(b, 0xA7)
 	b = append(b, 0x21, 0x03)
-	if winScratchOff >= 0 {
+	if capStartGlobal >= 0 {
+		// Hand the capture body the match's start so it writes ABSOLUTE slot
+		// positions. Must be set before the call below and after `start` is
+		// known — the body reads it at register-init time, before any tag op
+		// can fire.
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x24)
+		b = utils.AppendULEB128(b, uint32(capStartGlobal))
+	}
+	if winGlobal >= 0 {
 		// Window mode: hand the capture body the caller's real (ptr,len)
 		// and pass the match extent out of band, so its \b/\A/\z/(?m:^)/
 		// (?m:$) checks see true input edges. Capture slots come back
 		// already relative to ptr, so no rebasing pass is needed below.
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, winScratchOff)
 		b = append(b, 0x20, 0x03) // startOff
-		b = appendTableStore32(b, tableMemIdx, 0)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, winScratchOff)
+		b = append(b, 0x24)
+		b = utils.AppendULEB128(b, uint32(winGlobal))
 		b = append(b, 0x20, 0x06)
 		b = append(b, 0xA7) // endOff = wrap(r)
-		b = appendTableStore32(b, tableMemIdx, 4)
+		b = append(b, 0x24)
+		b = utils.AppendULEB128(b, uint32(winGlobal+1))
 
 		b = append(b, 0x20, 0x00)
 		b = append(b, 0x20, 0x01)
@@ -3043,12 +3178,24 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	b = append(b, 0x04, 0x7F) // if (result i32)
 	b = append(b, 0x20, 0x04) //   local.get capRes
 	b = append(b, 0x05)       // else
-	if winScratchOff >= 0 {
+	if winGlobal >= 0 {
 		// Window mode: slots and the returned end are already relative to
 		// ptr — no per-slot rebasing pass.
 		b = append(b, 0x20, 0x04)
 	} else {
-		for i := 0; i < numGroups*2; i++ {
+		// capStartGlobal >= 0 means the TDFA body already wrote ABSOLUTE slot
+		// positions, so the per-slot pass is skipped — but its RETURN is still
+		// relative to the narrowed ptr, so the `+ start` below stays.
+		//
+		// Only the slots are moved into the body, deliberately. Making the
+		// return absolute too would mean biasing localLastAcceptPos, which has
+		// no explicit -1 initialiser and leans on the WASM local default —
+		// reasoning this change does not need to take on for two instructions.
+		//
+		// The pass this replaces was ~13 instructions per slot (load, `>= 0`
+		// test, add, store) times 2*numGroups, on EVERY call. The absolute form
+		// costs one add per slot inside the body plus one biased register init.
+		for i := 0; capStartGlobal < 0 && i < numGroups*2; i++ {
 			offset := uint32(i * 4)
 			b = append(b, 0x20, 0x02)
 			b = append(b, 0x28, 0x02)
@@ -3076,8 +3223,8 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 }
 
 // appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
-func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32) []byte {
-	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winScratchOff)
+func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32) []byte {
+	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, capStartGlobal)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -3248,15 +3395,29 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMo
 //	       group 0 is the whole match, duplicating [0:4]/[4:8] — kept for a
 //	       uniform per-group access pattern in the consuming stub.
 //
-// winScratchOff (-1 = not applicable) turns on window mode, exactly as in
+// winGlobal (-1 = not applicable) turns on window mode, exactly as in
 // buildGroupsWrapperBody: the capture body is called with this wrapper's
 // own (ptr,len) and the per-match extent is written to the (startOff,endOff)
 // scratch inside the loop, once per match.
 //
+// capStartGlobal (-1 = not applicable) is the ABSOLUTE-SLOT channel, and it
+// works exactly as in buildGroupsWrapperBody: the match's start relative to
+// ptr is handed to the capture body through a module global, the body adds it
+// to every slot it writes, and the per-slot rebasing pass below is skipped.
+//
+// Both wrappers MUST agree on this, because they call the SAME capture body.
+// This one used to take neither the parameter nor the channel while still
+// running its own `+adj` pass, so a batch call made after any groups() call on
+// the same instance added that call's leftover start on top of its own — every
+// slot of every record off by the previous match's offset, silently. Nothing
+// covered it: no byteident fixture combines groups_func with hints:
+// [batch-find], and the batch groups export is the only caller of a capture
+// body that is not the groups wrapper.
+//
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
 // 12=recBase i32, 13=capRes i32, 14=adj i32, 15=slotVal i32.
-func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32, mode findFromMode) []byte {
+func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32) []byte {
 	// The `mode` parameter is what decides how this wrapper hands the find
 	// body its position: emitFindCallFromPos seeds the find-from channel for
 	// an ffNative body and narrows for an ffLegacyNarrow one. A comment here
@@ -3299,7 +3460,7 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	// relStart, relEnd — relative to pos whichever way the body reported them
 	b = emitUnpackRelative(b, mode, 0x07, 0x05, 0x08, 0x09)
 
-	if winScratchOff >= 0 {
+	if winGlobal >= 0 {
 		// Window mode: the capture body gets the caller's real (ptr,len)
 		// and this match's extent out of band — see buildGroupsWrapperBody.
 		// adj = pos + relStart (window start, also the slot rebase that
@@ -3307,19 +3468,27 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 		b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x0E)
 		// matchLen local reused as the window end = pos + relEnd
 		b = append(b, 0x20, 0x05, 0x20, 0x09, 0x6A, 0x21, 0x0B)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, winScratchOff)
 		b = append(b, 0x20, 0x0E)
-		b = appendTableStore32(b, tableMemIdx, 0)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, winScratchOff)
+		b = append(b, 0x24)
+		b = utils.AppendULEB128(b, uint32(winGlobal))
 		b = append(b, 0x20, 0x0B)
-		b = appendTableStore32(b, tableMemIdx, 4)
+		b = append(b, 0x24)
+		b = utils.AppendULEB128(b, uint32(winGlobal+1))
 	} else {
 		// absStart = ptr + pos + relStart
 		b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A, 0x20, 0x08, 0x6A, 0x21, 0x0A)
 		// matchLen = relEnd - relStart
 		b = append(b, 0x20, 0x09, 0x20, 0x08, 0x6B, 0x21, 0x0B)
+		if capStartGlobal >= 0 {
+			// adj = pos + relStart, hoisted above the call because the capture
+			// body reads the channel at register-init time. Below the call it
+			// is computed only for the rebasing pass, which absolute slots do
+			// not need — so a body with the channel computes it HERE and one
+			// without computes it THERE, and neither pays for the other.
+			b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x22, 0x0E)
+			b = append(b, 0x24)
+			b = utils.AppendULEB128(b, uint32(capStartGlobal))
+		}
 	}
 	// recBase = out_ptr + count*recordSize
 	b = append(b, 0x20, 0x02, 0x20, 0x06, 0x41)
@@ -3328,7 +3497,7 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 
 	// capRes = call capture(absStart, matchLen, recBase+8)
 	// (window mode: capture(ptr, len, recBase+8))
-	if winScratchOff >= 0 {
+	if winGlobal >= 0 {
 		b = append(b, 0x20, 0x00, 0x20, 0x01)
 	} else {
 		b = append(b, 0x20, 0x0A, 0x20, 0x0B)
@@ -3346,14 +3515,17 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = append(b, 0x20, 0x0D, 0x41, 0x00, 0x48, 0x0D, 0x01)
 
 	// adj = pos + relStart
-	// (window mode already computed it, and its slots need no adjusting)
-	if winScratchOff < 0 {
+	// (window mode already computed it, and its slots need no adjusting;
+	// so did the absolute-slot channel, above the call, for the same reason)
+	if winGlobal < 0 && capStartGlobal < 0 {
 		b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x0E)
 	}
 
 	// Adjust each of numGroups*2 slot ints at recBase+8+g*4 by +adj (skip
-	// unmatched groups, encoded as -1).
-	for g := 0; winScratchOff < 0 && g < numGroups*2; g++ {
+	// unmatched groups, encoded as -1). Skipped whenever the slots already
+	// arrive absolute: window mode makes them relative to ptr, and
+	// capStartGlobal makes the body add the start itself.
+	for g := 0; winGlobal < 0 && capStartGlobal < 0 && g < numGroups*2; g++ {
 		off := uint32(8 + g*4)
 		b = append(b, 0x20, 0x0C)
 		b = append(b, 0x28, 0x02)
@@ -3412,8 +3584,8 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 }
 
 // appendBatchGroupsWrapperCodeEntry appends a size-prefixed batch groups wrapper body to cs.
-func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winScratchOff int32, mode findFromMode) []byte {
-	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winScratchOff, mode)
+func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32) []byte {
+	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, mode, capStartGlobal)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

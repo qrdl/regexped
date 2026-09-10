@@ -9,8 +9,15 @@ ADJUSTED     := re2-adjusted.txt
 $(TESTDATA): $(TESTDATA_BZ2)
 	bzip2 -dk -c $< > $@
 
+# --all-matches closes the corpus's OTHER blind spot. re2-exhaustive.txt carries
+# four columns, so col4 (every match) is absent and only the FIRST match of each
+# row is ever checked. A pattern whose first match is right and whose later ones
+# are wrong passed — which is half of why `\b` could skip every boundary after a
+# word character, since its first match is at position 0 and was always found.
+# The flag synthesises col4 from a Go oracle for rows that lack one: 4.9M rows,
+# and it costs about 40% more wall time than the bare run.
 exhaustive: $(TESTDATA)
-	go run . $(TESTDATA)
+	go run . --all-matches $(TESTDATA)
 
 custom:
 	# Expectation file vs Go, no WASM involved. Was commented out while its
@@ -32,6 +39,30 @@ force-backtrack: $(ADJUSTED)
 	go run . --force-backtrack $(TESTDATA)
 	go run . --force-backtrack --validate-groups $(ADJUSTED)
 	go run . --force-backtrack --validate-groups $(CUSTOM)
+
+# Corpus inputs carrying a byte above 0x7F, which every other target SKIPS.
+#
+# The skip exists because the expectation columns are RE2's and RE2 decodes
+# UTF-8, while this is a byte engine: for `.` and a negated class the two
+# legitimately disagree, so the columns would report correct behaviour as
+# failure. This target judges those rows against a Go oracle run on an ASCII
+# TWIN of the input instead — see highbytes.go for why that is sound.
+#
+# It found `\b` missing every word boundary whose preceding byte was a word
+# character (337 rows, one root cause, not actually high-byte specific — pure
+# ASCII "a b" failed the same way). Fixed 2026-09-09, and this target has been
+# part of `test` since.
+#
+# Worth knowing what this covers: without it the whole corpus is blind to high
+# bytes, which is how a Backtracking engine that dropped every byte >= 0x80
+# from a rune range stayed green across ~9.5M cases.
+high-bytes: $(ADJUSTED)
+	go run . --high-bytes $(TESTDATA)
+	go run . --high-bytes --validate-groups $(ADJUSTED)
+	# --high-bytes-check-corpus only here: custom-tests.txt's columns are
+	# written for a BYTE engine, so they can be compared with the twin. The
+	# RE2-derived corpora above carry UTF-8 answers that legitimately differ.
+	go run . --high-bytes --high-bytes-check-corpus --validate-groups $(CUSTOM)
 
 # Run every test under LikelyMode=LikelyMatch. Patterns matching the lit-chain
 # shape (literal + counted class) take the Opt 2 emission path; others fall
@@ -96,7 +127,7 @@ groupsonly: $(ADJUSTED)
 	go run . --groups-only --validate-groups $(ADJUSTED)
 	go run . --groups-only --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets sets-likely
+test: exhaustive custom adjusted high-bytes force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets sets-likely
 
 # ---------------------------------------------------------------------------
 # Set-capability coverage.

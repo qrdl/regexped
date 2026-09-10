@@ -319,6 +319,11 @@ func (s *setCapStats) report() {
 		fmt.Printf("  %-28s pass %10d  fail %6d%s\n", label+":", p, f, flag)
 	}
 	fmt.Printf("  %-28s pass %10d  fail %6d\n", "TOTAL:", total, totalFail)
+	if setHighByteLive > 0 || setHighBytePinned > 0 {
+		// Reported so a collapse back to the pinned path cannot hide as "green".
+		fmt.Printf("  high-byte inputs: %d via the live twin oracle (all capabilities), %d via pinned col4 (gated find only)\n",
+			setHighByteLive, setHighBytePinned)
+	}
 	if s.timeouts > 0 {
 		fmt.Printf("  timeouts (input skipped):    %d\n", s.timeouts)
 	}
@@ -421,7 +426,16 @@ type setOracle struct {
 	// `find` oracle, and the column the corpus's col4 is checked
 	// against rather than replaced by.
 	findAllByStr [][][][2]int
+	// live[si] reports whether the LIVE oracle can serve input si. False only
+	// for a high-byte input with no interchangeable ASCII twin; those rows go
+	// to driveUnicodePinned. See highbytes.go.
+	live []bool
 }
+
+// setHighByteLive / setHighBytePinned count high-byte inputs by which oracle
+// served them, so a silent collapse back to the pinned path — which would look
+// exactly like "all green" — is visible in the summary.
+var setHighByteLive, setHighBytePinned int
 
 // buildSetOracle computes the expectations for one chunk.
 //
@@ -443,18 +457,35 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 	if needFindAll {
 		o.findAllByStr = make([][][][2]int, len(pats))
 	}
-	// Non-ASCII inputs are left with EMPTY expectations, deliberately.
+	// A high-byte input is computed over its ASCII TWIN, not skipped.
 	//
-	// The whole-input probe counts RUNES in its `.{p}` prefix, so on a
-	// multi-byte input position p would not be the byte offset the module was
-	// given and every expectation would be quietly wrong. The drive loop skips
-	// these inputs (as the rest of re2test does), so nothing reads these rows —
-	// but computing a wrong answer and relying on nobody looking at it is how a
-	// harness bug becomes an engine bug report.
-	usable := make([]bool, len(strs))
+	// The probe counts RUNES in its `.{p}` prefix, so on a multi-byte input
+	// position p would not be the byte offset the module was given and every
+	// expectation would be quietly wrong. A twin is pure ASCII, so runes and
+	// bytes coincide and the probe means what it says; the module is still
+	// driven over the ORIGINAL bytes, which the engine cannot distinguish from
+	// the twin (see asciiTwinForPatterns). Rows with no twin keep EMPTY
+	// expectations and are routed to driveUnicodePinned — computing a wrong
+	// answer and relying on nobody reading it is how a harness bug becomes an
+	// engine bug report.
+	//
+	// oracleStrs replaces strs EVERYWHERE below: every expectation is a
+	// statement about the twin, and the drive loop compares the module's answer
+	// over the original against it.
+	twins, usable := setOracleTwins(pats, strs)
+	o.live = usable
+	for si, s := range strs {
+		if !hasHighByte(s) {
+			continue
+		}
+		if usable[si] {
+			setHighByteLive++
+		} else {
+			setHighBytePinned++
+		}
+	}
 	maxLen := 0
 	for si, s := range strs {
-		usable[si] = !hasUnicode(s)
 		if usable[si] && len(s) > maxLen {
 			maxLen = len(s)
 		}
@@ -470,8 +501,8 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 				return nil, fmt.Errorf("oracle: anchored probe for %q: %w", pat, err)
 			}
 			row := make([]bool, len(strs))
-			for si, s := range strs {
-				row[si] = usable[si] && anch.MatchString(s)
+			for si := range strs {
+				row[si] = usable[si] && anch.MatchString(twins[pi][si])
 			}
 			o.anchored[pi] = row
 		}
@@ -481,11 +512,11 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 				return nil, fmt.Errorf("oracle: %q: %w", pat, err)
 			}
 			row := make([][][2]int, len(strs))
-			for si, s := range strs {
+			for si := range strs {
 				if !usable[si] {
 					continue
 				}
-				for _, m := range re.FindAllStringIndex(s, -1) {
+				for _, m := range re.FindAllStringIndex(twins[pi][si], -1) {
 					row[si] = append(row[si], [2]int{m[0], m[1]})
 				}
 			}
@@ -497,10 +528,11 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 			// rebuilt per string and the cost is quadratic for no reason.
 			probes := make([]*regexp.Regexp, maxLen+1)
 			row := make([][][2]int, len(strs))
-			for si, s := range strs {
+			for si := range strs {
 				if !usable[si] {
 					continue
 				}
+				s := twins[pi][si]
 				for p := 0; p <= len(s); p++ {
 					if probes[p] == nil {
 						pr, err := regexp.Compile(`\A` + setDotPrefix(p) + `(?:` + body + `)`)
@@ -1157,12 +1189,16 @@ func runSetProfile(
 	}
 
 	for si, text := range strs {
-		if hasUnicode(text) {
-			// The live oracle has no expectation for a non-ASCII input:
-			// The probe counts RUNES, so position p would not be the byte
-			// offset the module was given. Such inputs are instead driven
-			// against the corpus's own PINNED col4 column, which is the only
-			// coverage the documented byte- vs rune-advance divergence has.
+		if si < len(orc.live) && !orc.live[si] {
+			// A high-byte input for which no ASCII twin exists under this
+			// chunk's patterns, so the live oracle cannot state an expectation
+			// (its probe counts RUNES, and position p would not be the byte
+			// offset the module was given). Those rows fall back to the
+			// corpus's own PINNED col4 column — gated `find` only.
+			//
+			// Every OTHER high-byte input now goes through the live oracle on
+			// a twin, which covers all five capabilities instead of one and is
+			// an independent oracle rather than a transcript.
 			if e := r.driveUnicodePinned(fns, chunk, strs, si, text, verbose); e != nil {
 				return e
 			}

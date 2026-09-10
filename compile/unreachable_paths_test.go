@@ -373,8 +373,20 @@ func TestCompileForcedSelectsTheNamedEngine(t *testing.T) {
 // calling the body at all. Only the modes a compiled pattern happens to select
 // were reached; a mode is a contract, so all three are pinned here.
 func TestFindFromWrapperBodyAllModes(t *testing.T) {
+	// minLen 0 and 11 both, since a non-zero one adds the early exit and that
+	// arm has its own `end` to get right.
 	for _, mode := range []findFromMode{ffLegacyNarrow, ffNative, ffAnchoredZeroOnly} {
-		body := buildFindFromWrapperBody(7, mode)
+		for _, minLen := range []int32{0, 11} {
+			t.Run(fmt.Sprintf("%v/minLen=%d", mode, minLen), func(t *testing.T) {
+				checkFindFromWrapperBody(t, mode, minLen)
+			})
+		}
+	}
+}
+
+func checkFindFromWrapperBody(t *testing.T, mode findFromMode, minLen int32) {
+	{
+		body := buildFindFromWrapperBody(7, mode, minLen)
 		if len(body) == 0 {
 			t.Fatalf("mode %v: emitted nothing", mode)
 		}
@@ -410,7 +422,7 @@ func TestBuildFindFromWrapperBodyRejectsUnsetMode(t *testing.T) {
 			t.Errorf("panic message %q does not name the offending mode", msg)
 		}
 	}()
-	buildFindFromWrapperBody(7, findFromMode(0))
+	buildFindFromWrapperBody(7, findFromMode(0), 0)
 }
 
 // TestEmitFindCallFromPos covers the shared call sequence the BATCH wrappers

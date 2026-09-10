@@ -199,23 +199,24 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 		// parameter is still declared so the function matches the gated suffix
 		// type every find body calls.
 	)
-	// Local group order below is i32 group first, then v128 group — these
-	// indices must track that order, and shift by one in the gated signature.
-	localBase := byte(7)
+	// Locals come from the allocator (task 67), so the group order below is
+	// the allocation order rather than a comment asking the two to agree —
+	// and the gated signature's extra parameter shifts every index by
+	// construction.
+	nParams := uint32(7)
 	if gated || hasSkip {
-		localBase = 8
+		nParams = 8
 	}
+	a := newLocalAlloc(nParams)
 	var (
-		lEndPos  = localBase     // i32: start + n
-		lOutBase = localBase + 1 // i32: output tuple base ptr
-		lChunk   = localBase + 2 // v128
+		lEndPos  = a.I32()  // start + n
+		lOutBase = a.I32()  // output tuple base ptr
+		lChunk   = a.V128() //nolint:wastedassign // read by the SIMD compare below
 	)
 	const patternBit = 1 // bit 0 — single-pattern bucket only
 
 	var b []byte
-	b = append(b, 0x02)       // 2 local groups
-	b = append(b, 0x02, 0x7F) // 2 x i32 (lEndPos, lOutBase)
-	b = append(b, 0x01, 0x7B) // 1 x v128 (lChunk)
+	b = a.EmitDecls(b) // 2 x i32 (lEndPos, lOutBase), 1 x v128 (lChunk)
 
 	retZero := func(b []byte) []byte {
 		return append(b, 0x41, 0x00, 0x0F) // i32.const 0; return
