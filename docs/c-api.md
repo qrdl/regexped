@@ -52,10 +52,17 @@ regexped generate
 clang --target=wasm32-wasi -nostdlib -Wl,--no-entry -o core.wasm main.c stub.c
 wasm-tools component embed wit core.wasm --world <name>-consumer -o embedded.wasm
 wasm-tools component new embedded.wasm -o guest.wasm
-wac plug guest.wasm --plug regexps.wasm -o composed.wasm
+regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
 ```
 
-Needs `wasm-tools` and `wac`. Add
+The two `wasm-tools` lines wrap YOUR code and are yours to run — regexped never
+sees it, and only this route needs them (route 2 below emits a component
+directly). The last line is the same `regexped merge` a module build runs: it
+dispatches on `wasm_format` and shells out to `wac` here, so `wac` never has to
+be typed. See [component.md](component.md#why-the-wasip1-target-needs-two-extra-commands).
+
+Needs `wasm-tools` (yours) and `wac` (regexped's, resolved as config `wac:` →
+`$WAC` → `$PATH`). Add
 `--adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm` to
 `component new` **if your program uses preview1 WASI imports directly** (`_start`,
 `fd_write`, `args_get`); a component that exports a plain function instead needs no
@@ -70,7 +77,7 @@ resolves `deps/`.
 wit-bindgen c wit --out-dir wb          # for ONE file: the component-type object
 clang --target=wasm32-wasip2 -nostdlib -Wl,--no-entry \
       -o guest.wasm main.c stub.c wb/*_component_type.o
-wac plug guest.wasm --plug regexps.wasm -o composed.wasm
+regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
 ```
 
 Fewer steps: clang wraps into a component itself, so there is no `embed`, no
@@ -314,6 +321,7 @@ typedef struct {
 
 int <find>_init(rx_<set>_scanner_t *s, const char *input, size_t len, size_t offset);
 int <find>(rx_<set>_scanner_t *s, rx_set_match_t *buf, size_t cap);
+void <find>_free(rx_<set>_scanner_t *s);   /* a no-op here; see below */
 
 /* only if any set in the config sets emit_name_map: true */
 const char *pattern_name(int id);
@@ -326,7 +334,23 @@ if (<find>_init(&s, input, len, 0) != 0) { /* RX_ERR_* */ }
 for (int n; (n = <find>(&s, buf, <SET>_PATTERN_COUNT)) > 0; )
     for (int i = 0; i < n; i++)
         printf("%d %td..%td\n", buf[i].pattern_id, buf[i].start, buf[i].end);
+<find>_free(&s);
 ```
+
+Under `wasm_format: component` every one of these declarations is the same — the
+header comes from the same generator — and the bodies change: the `_all` pair
+receives a ready-made list of ids rather than scanning a bitmask, and the scanner
+holds a handle to a scan living inside the regexp component. See
+[component.md](component.md#sets).
+
+**`<find>_free` is a no-op in this format, and mandatory in the other.** This
+scanner is caller-owned, by value, and holds only a borrowed input pointer and
+the gate array inline, so abandoning it leaks nothing. Under `wasm_format:
+component` the scan's state lives inside the regexp component behind a handle,
+and dropping that handle is what releases it — so the call is required there.
+It is emitted in both formats, and calling it costs nothing here, so the same
+source compiles and behaves correctly against either. Safe to call twice, and on
+a scanner that already finished.
 
 **`find` is fill-and-count, not an iterator.** C has no iterator protocol, and
 the raw ABI already fills a buffer and returns a count — which is also the C

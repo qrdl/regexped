@@ -2,8 +2,9 @@
 #
 # A COMPONENT example consumed through a GENERATED stub. Four steps: compile the
 # patterns into a component, generate the stub, build the consumer as a guest
-# component, compose the two. `wac` plays the role `wasm-merge` plays for the
-# module format.
+# component, compose the two. The last step is `regexped merge` — the same
+# command a module build uses, which dispatches on wasm_format and calls `wac`
+# where a module build calls `wasm-merge`.
 REGEXPED  := ../../../../regexped
 COMPONENT := secrets.wasm
 WIT       := secrets.wit
@@ -38,9 +39,10 @@ $(GUEST): main.rs $(STUB) Cargo.toml
 build: $(GUEST)
 
 # Step 4 – compose the guest with the regexp component. Until this runs the guest
-# has an unsatisfied import and will not instantiate.
+# has an unsatisfied import and will not instantiate. --main is the SOCKET (the
+# component with the unsatisfied import); the positionals are regexped's own.
 $(FINAL): $(GUEST) $(COMPONENT)
-	wac plug $(GUEST) --plug $(COMPONENT) -o $(FINAL)
+	$(REGEXPED) merge --config=regexped.yaml --main=$(GUEST) $(COMPONENT)
 
 compose: $(FINAL)
 

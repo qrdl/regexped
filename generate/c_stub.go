@@ -143,8 +143,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		idKonst := screamingCase(s.Name) + "_ID_SPACE"
 		wide := wideAllForm(s, cfg)
 
-		fmt.Fprintf(&hb, "/* Number of patterns in set %q. Sizes the match buffer: the scanner can\n   receive at most this many matches at one position. */\n#define %s %d\n\n", s.Name, konst, n)
-		fmt.Fprintf(&hb, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id \u2014 the gate\n   array and the _all bitmap \u2014 is sized from this. The out_ids array you\n   pass to the _all calls is NOT: it is a LIST of ids, not an id-indexed array,\n   and at most PATTERN_COUNT ids can ever be written to it \u2014 which is what\n   the prototypes' `static` sizes say. */\n#define %s %d\n\n", s.Name, idKonst, idN)
+		hb.WriteString(cSetConstDecls(s.Name, konst, idKonst, n, idN))
 
 		imp := func(name, sig string) {
 			fmt.Fprintf(&hb, "__attribute__((import_module(%q), import_name(%q)))\n%s\n", cfg.ImportModule, name, sig)
@@ -164,11 +163,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		}
 		if s.MatchAny != "" {
 			imp(s.MatchAny, decl("match_any"))
-			fmt.Fprintf(&hb, "/* Id of SOME pattern matching the whole input, -1 if none, or\n"+
-				"   RX_ERR_BT_OVERFLOW if a Backtracking member exhausted its frame budget\n"+
-				"   and the answer is UNKNOWN. Test the sentinel EXACTLY: -1 is a real\n"+
-				"   answer and folding the two reports \"unknown\" as a confident \"no\". */\n"+
-				"int %s(const char *input, size_t len);\n\n", s.MatchAny)
+			hb.WriteString(cSetMatchAnyDecl(s.MatchAny))
 			fmt.Fprintf(&cb, `int %s(const char *input, size_t len) { return ffi_%s(input, (int)len); }
 `, s.MatchAny, s.MatchAny)
 		}
@@ -190,7 +185,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// are ever written. ID_SPACE stays correct for things indexed BY
 			// an id — the gate array, the _all bitmap — and this is a LIST of
 			// ids, not an id-indexed array.
-			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into patterns and returns how many. */\nint %s(const char *input, size_t len, int patterns[static %s]);\n\n", s.MatchAll, konst)
+			hb.WriteString(cSetMatchAllDecl(s.MatchAll, konst))
 			if wide {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, int patterns[static %[3]s]) {
     unsigned char bits[(%[2]s + 7) / 8] = {0};
@@ -219,7 +214,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		}
 		if s.ScanAny != "" {
 			imp(s.ScanAny, decl("scan_any"))
-			fmt.Fprintf(&hb, "/* Returns one pattern id matching somewhere at or after offset, or -1.\n   Which id you get is unspecified when several patterns match, and no\n   position is reported.\n\n   May also return RX_ERR_BT_OVERFLOW: a Backtracking member of this set\n   exhausted its frame budget, so the answer is UNKNOWN rather than -1.\n   Test for it before treating a negative result as \"no match\". */\nint %s(const char *input, size_t len, size_t offset);\n\n", s.ScanAny)
+			hb.WriteString(cSetScanAnyDecl(s.ScanAny))
 			fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset) {
     return ffi_%[1]s(input, (int)len, (int)offset);
 }
@@ -231,7 +226,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			} else {
 				imp(s.ScanAll, decl("scan_all"))
 			}
-			fmt.Fprintf(&hb, "/* Writes the matching pattern ids into patterns and returns how many.\n   See match_all for why the size is in the type. */\nint %s(const char *input, size_t len, size_t offset, int patterns[static %s]);\n\n", s.ScanAll, konst)
+			hb.WriteString(cSetScanAllDecl(s.ScanAll, konst))
 			if wide {
 				fmt.Fprintf(&cb, `int %[1]s(const char *input, size_t len, size_t offset, int patterns[static %[3]s]) {
     unsigned char bits[(%[2]s + 7) / 8] = {0};
@@ -284,40 +279,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// than fit records no gate and writes no complete answer, and the
 			// scan cannot step past it. PATTERN_COUNT is that worst case
 			// exactly — one match per pattern at one start.
-			fmt.Fprintf(&hb, `/* Caller-owned scanner for %[1]s. Two scans may be in flight at once, and
-   re-initialising the struct restarts a scan.
-
-   The scanner holds the INPUT as well as the position (decision (5)): the
-   input never changes during a scan while the position changes every step, so
-   the old split — remembering the position and taking the input on every
-   step — was backwards, and let a caller pass a DIFFERENT buffer on a later
-   step with the stored position silently indexing into it.
-
-   %[1]s fills your array with every match at the FIRST position at or after
-   the scanner's offset — they all share that start — and returns HOW MANY.
-   0 means the scan is finished. The return is the position's TOTAL, which may
-   exceed cap: the underlying call is transactional, so it writes min(total,
-   cap), records nothing and does not advance, and n > cap means "grow and call
-   again, same position". Sizing cap at %[2]s makes overflow impossible.
-
-       rx_set_match_t buf[%[2]s];
-       %[4]s sc;
-       if (%[1]s_init(&sc, input, len, 0) != 0) { ... }
-       for (int n; (n = %[1]s(&sc, buf, %[2]s)) > 0; )
-           for (int i = 0; i < n; i++) { ... buf[i] ... }  */
-typedef struct {
-    const char *input;
-    size_t len, offset;
-    int done;
-%[3]s} %[4]s;
-
-/* 0 on success, a negative RX_ERR_* otherwise. An EMPTY input is legitimate
-   (a*, (?:), x?, \\A\\z all match it) and offset > len is not an error either
-   — the ABI defines it as "nothing found". */
-int %[1]s_init(%[4]s *s, const char *input, size_t len, size_t offset);
-int %[1]s(%[4]s *s, rx_set_match_t *buf, size_t cap);
-
-`, s.Find, konst, gateField, scannerType)
+			hb.WriteString(cSetScannerDecls(s.Find, konst, gateField, scannerType))
 			fmt.Fprintf(&cb, `int %[1]s_init(%[2]s *s, const char *input, size_t len, size_t offset) {
     if (!s || !input) return RX_ERR_NULL_ARG;
     /* The FFI imports are i32. */
@@ -360,19 +322,14 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     s->offset = (size_t)buf[0].start + 1;
     return got;
 }
+
+void %[1]s_free(%[2]s *s) { (void)s; }
 `, s.Find, scannerType, gateInit, gateArg)
 		}
 	}
 	if hasEmitNameMap(cfg) {
 		hb.WriteString("const char *pattern_name(int id);\n\n")
-		cb.WriteString("static const char *_pattern_names[] = {")
-		for i, re := range cfg.Regexps {
-			if i > 0 {
-				cb.WriteString(", ")
-			}
-			fmt.Fprintf(&cb, "%q", re.Name)
-		}
-		cb.WriteString("};\nconst char *pattern_name(int id) { int n=sizeof(_pattern_names)/sizeof(*_pattern_names); return (id>=0&&id<n)?_pattern_names[id]:\"\"; }\n")
+		cb.WriteString(cPatternNameTable(cfg))
 	}
 	hContent = hb.String()
 	cContent = cb.String()
@@ -747,4 +704,126 @@ func cABIRet(r abiRet) string {
 		return "long long"
 	}
 	return "int"
+}
+
+// --- the SET header text, shared by both output kinds ------------------------
+//
+// These emit the API a set contributes: the constants and the function
+// declarations. They are called by the module generator above AND by the
+// component generator (c_component_stub.go), which is what makes the two
+// formats' C API identical by construction rather than by two generators
+// happening to agree. Only the FFI import lines and the function BODIES differ
+// between the formats, and those stay with their generator.
+
+// cSetConstDecls is the pair of size constants a set contributes.
+func cSetConstDecls(setName, konst, idKonst string, n, idN int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "/* Number of patterns in set %q. Sizes the match buffer: the scanner can\n   receive at most this many matches at one position. */\n#define %s %d\n\n", setName, konst, n)
+	fmt.Fprintf(&b, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id — the gate\n   array and the _all bitmap — is sized from this. The out_ids array you\n   pass to the _all calls is NOT: it is a LIST of ids, not an id-indexed array,\n   and at most PATTERN_COUNT ids can ever be written to it — which is what\n   the prototypes' `static` sizes say. */\n#define %s %d\n\n", setName, idKonst, idN)
+	return b.String()
+}
+
+// cSetMatchAnyDecl declares the anchored single-id capability.
+func cSetMatchAnyDecl(name string) string {
+	return fmt.Sprintf("/* Id of SOME pattern matching the whole input, -1 if none, or\n"+
+		"   RX_ERR_BT_OVERFLOW if a Backtracking member exhausted its frame budget\n"+
+		"   and the answer is UNKNOWN. Test the sentinel EXACTLY: -1 is a real\n"+
+		"   answer and folding the two reports \"unknown\" as a confident \"no\". */\n"+
+		"int %s(const char *input, size_t len);\n\n", name)
+}
+
+// cSetMatchAllDecl declares the anchored id-list capability.
+//
+// The size is PATTERN_COUNT, not ID_SPACE: this is a LIST of ids, and only
+// patterns IN the set can appear in it. C99's `static N` makes the requirement a
+// diagnosable one at the call site rather than a comment.
+func cSetMatchAllDecl(name, konst string) string {
+	return fmt.Sprintf("/* Writes the matching pattern ids into patterns and returns how many. */\nint %s(const char *input, size_t len, int patterns[static %s]);\n\n", name, konst)
+}
+
+// cSetScanAnyDecl declares the non-anchored single-id capability.
+func cSetScanAnyDecl(name string) string {
+	return fmt.Sprintf("/* Returns one pattern id matching somewhere at or after offset, or -1.\n   Which id you get is unspecified when several patterns match, and no\n   position is reported.\n\n   May also return RX_ERR_BT_OVERFLOW: a Backtracking member of this set\n   exhausted its frame budget, so the answer is UNKNOWN rather than -1.\n   Test for it before treating a negative result as \"no match\". */\nint %s(const char *input, size_t len, size_t offset);\n\n", name)
+}
+
+// cSetScanAllDecl declares the non-anchored id-list capability.
+func cSetScanAllDecl(name, konst string) string {
+	return fmt.Sprintf("/* Writes the matching pattern ids into patterns and returns how many.\n   See match_all for why the size is in the type. */\nint %s(const char *input, size_t len, size_t offset, int patterns[static %s]);\n\n", name, konst)
+}
+
+// cSetScannerDecls is the `find` scanner: its doc comment, its caller-owned
+// struct, and the init / step / free triple.
+//
+// `<func>_free` is emitted in BOTH formats. Here it is a no-op — the struct holds
+// only a borrowed input pointer and the gate array inline, so abandoning it leaks
+// nothing — and under `wasm_format: component` the scan's state lives inside the
+// regexp component behind a handle that has to be dropped. A caller must be able
+// to switch formats without editing code, so the call exists in both and costs
+// nothing here.
+func cSetScannerDecls(find, konst, gateField, scannerType string) string {
+	return fmt.Sprintf(`/* Caller-owned scanner for %[1]s. Two scans may be in flight at once, and
+   re-initialising the struct restarts a scan.
+
+   The scanner holds the INPUT as well as the position (decision (5)): the
+   input never changes during a scan while the position changes every step, so
+   the old split — remembering the position and taking the input on every
+   step — was backwards, and let a caller pass a DIFFERENT buffer on a later
+   step with the stored position silently indexing into it.
+
+   %[1]s fills your array with every match at the FIRST position at or after
+   the scanner's offset — they all share that start — and returns HOW MANY.
+   0 means the scan is finished. The return is the position's TOTAL, which may
+   exceed cap: the underlying call is transactional, so it writes min(total,
+   cap), records nothing and does not advance, and n > cap means "grow and call
+   again, same position". Sizing cap at %[2]s makes overflow impossible.
+
+       rx_set_match_t buf[%[2]s];
+       %[4]s sc;
+       if (%[1]s_init(&sc, input, len, 0) != 0) { ... }
+       for (int n; (n = %[1]s(&sc, buf, %[2]s)) > 0; )
+           for (int i = 0; i < n; i++) { ... buf[i] ... }
+       %[1]s_free(&sc);
+
+   That last call is a no-op here and REQUIRED for wasm_format: component. */
+typedef struct {
+    const char *input;
+    size_t len, offset;
+    int done;
+%[3]s} %[4]s;
+
+/* 0 on success, a negative RX_ERR_* otherwise. An EMPTY input is legitimate
+   (a*, (?:), x?, \\A\\z all match it) and offset > len is not an error either
+   — the ABI defines it as "nothing found". */
+int %[1]s_init(%[4]s *s, const char *input, size_t len, size_t offset);
+int %[1]s(%[4]s *s, rx_set_match_t *buf, size_t cap);
+
+/* Releases whatever the scanner holds. A NO-OP here: this scanner is
+   caller-owned, by value, and holds only a borrowed input pointer and the gate
+   array inline, so abandoning it leaks nothing.
+
+   It exists so that the same source compiles against either output kind. Under
+   wasm_format: component the scan's state lives inside the regexp component
+   and a handle must be dropped, so the call is mandatory there; calling it here
+   costs nothing and lets you switch formats without editing code.
+
+   Safe to call more than once, and on a scanner that finished. */
+void %[1]s_free(%[4]s *s);
+
+`, find, konst, gateField, scannerType)
+}
+
+// cPatternNameTable is the `emit_name_map: true` helper. Shared with the
+// component stub: it maps ids to names and has nothing to do with the output
+// kind.
+func cPatternNameTable(cfg config.BuildConfig) string {
+	var b strings.Builder
+	b.WriteString("static const char *_pattern_names[] = {")
+	for i, re := range cfg.Regexps {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%q", re.Name)
+	}
+	b.WriteString("};\nconst char *pattern_name(int id) { int n=sizeof(_pattern_names)/sizeof(*_pattern_names); return (id>=0&&id<n)?_pattern_names[id]:\"\"; }\n")
+	return b.String()
 }

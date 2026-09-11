@@ -8,6 +8,7 @@ Regexped is driven by a YAML config file (default: `regexped.yaml` in the curren
 wasm_format: "module"      # optional; "module" (default) or "component" — see "Output kinds" below
 wasm_merge: "wasm-merge"   # path to wasm-merge binary; defaults to $WASM_MERGE env var, then wasm-merge in $PATH
 wasm_tools: "wasm-tools"   # path to wasm-tools binary; defaults to $WASM_TOOLS, then wasm-tools in $PATH
+wac:        "wac"          # path to wac binary; defaults to $WAC, then wac in $PATH (merge, wasm_format: component)
                            #   (component format only — it wraps the core module into a component)
 output:   "merged.wasm"    # output path for the merge command; overridable with --output
                            #   MEANINGLESS under wasm_format: component (a component owns its own memory)
@@ -77,8 +78,10 @@ sets:
 > set keys `match`, `scan`, `find_batch`, `find_any`, `find_all` and
 > `batch_size` — see [sets.md](sets.md#the-five-capabilities).
 
-All paths in the config file are resolved relative to the config file's directory.
-A leading `~/` in `output`, `wasm_file`, `stub_file` or `wasm_merge` is expanded to
+All paths in the config file are resolved relative to the config file's directory,
+except the two tool paths `wasm_tools` and `wac`: a bare tool name there must stay
+a bare name for `$PATH` lookup to find it.
+A leading `~/` in `output`, `wasm_file`, `stub_file`, `wasm_merge`, `wasm_tools` or `wac` is expanded to
 the user's home directory (a bare `~` and the `~user` form are not expanded — only
 a shell can resolve another user's home).
 
@@ -455,14 +458,21 @@ Compiles each regexp pattern to a single WASM module, or to a Component Model co
 - **Standalone** (no `output` field in config) — the module owns its memory, DFA/TDFA tables start at address 0. Load directly in JS/TS without merging.
 - **Embedded** (`output` field present) — the module imports memory from a `"main"` host module. Use `regexped merge` to combine with a Rust/Go/C host binary.
 
-**`wasm_format: component`** produces a Component Model component plus a sibling `.wit` (the same path as `wasm_file` with the extension replaced), by wrapping the core module through `wasm-tools`. Standalone memory is **forced** — a component owns and exports its own memory — so `output:` is meaningless and the merge step does not apply. Requires `wasm-tools` (config `wasm_tools:` → `$WASM_TOOLS` → `$PATH`).
+**`wasm_format: component`** produces a Component Model component plus a sibling `.wit` (the same path as `wasm_file` with the extension replaced), by wrapping the core module through `wasm-tools`. Standalone memory is **forced** — a component owns and exports its own memory — so the standalone-vs-embedded choice above is not made here, and `output:` does not drive it. `output:` still means what it means for a module: the `regexped merge` target. Requires `wasm-tools` (config `wasm_tools:` → `$WASM_TOOLS` → `$PATH`) to build, and `wac` (config `wac:` → `$WAC` → `$PATH`) to merge.
 
-Not yet supported under `component`, and refused at load rather than half-emitted:
+Refused at load under `component`, rather than half-emitted:
 
 | Config | Error |
 |---|---|
-| `sets:` | "sets are not supported for wasm_format: component yet" |
+| a set with `hints: [batch-find]` | "…is not supported for wasm_format: component — the component interface exposes one position per call through the find resource" |
 | no `import_module` and no `wit_package` | "…is required for wasm_format: component: it names the WIT package, the world, and every export" |
+
+`sets:` IS supported. Their raw ABI does not cross the boundary: `match_all` and
+`scan_all` return a list of pattern ids instead of a bitmask or a caller-owned
+bitmap, and `find` becomes a `resource` that owns the drive — the gate array the
+module ABI makes the caller own has nowhere to live in a component consumer. The
+generated Rust and C stubs present the same API either way; see
+[component.md](component.md#sets) and [sets.md](sets.md).
 
 See [component.md](component.md) for the generated interface and how to consume it.
 
@@ -537,21 +547,38 @@ See [sets.md](sets.md) for full pipeline details and output tuple formats.
 
 ---
 
-### `merge` — Merge WASM modules
+### `merge` — Link your binary with regexped's
 
 ```
-regexped [--debug] merge [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
+regexped [--debug] merge [--config=<file>] --main=<file> [--output=<file>] <regex1.wasm> ...
 ```
 
-Merges the host main WASM with one or more regexp WASM modules into a single binary using `wasm-merge`. Each regexp module's memory is kept separate (multi-memory) and renumbered by wasm-merge.
+Links the host main WASM with one or more regexp WASM artifacts into a single binary. **The command does not depend on the output kind** — it dispatches on `wasm_format` and runs the right tool:
 
-This command is a thin wrapper around `wasm-merge`. You may invoke wasm-merge directly with:
+| `wasm_format` | Tool | What it does |
+|---|---|---|
+| `module` (default) | `wasm-merge` | merges the core modules into one. Each regexp module keeps its own memory (multi-memory), renumbered by wasm-merge |
+| `component` | `wac plug` | composes the components. `--main` is the **socket** (the component with the unsatisfied import); each positional is a **plug** |
+
+A component config that ran `merge` before this dispatch existed invoked `wasm-merge` on a component binary, which Binaryen cannot parse.
+
+You may invoke either tool directly. For modules:
 
 ```
 wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk-memory-opt \
   <main.wasm> main <regexp.wasm> <module_name> ... \
   --rename-export-conflicts -o output.wasm
 ```
+
+For components:
+
+```
+wac plug --plug <regexp1.wasm> --plug <regexp2.wasm> -o output.wasm <main.wasm>
+```
+
+**Composition is not merging.** `wasm-merge` produces ONE module whose regexp code reads the host's memory directly; `wac plug` produces a component holding two instances with two memories, where each call crosses the canonical ABI and copies its `list<u8>` input. Same command, different cost model — see [component.md](component.md).
+
+**Several regexp artifacts in one call** works for both kinds, with one asymmetry. Regexp *modules* may all share an `import_module` name, because nothing imports it. Regexp *components* are matched by their WIT interface name, `regexped:<wit_package>/matcher`, which the socket genuinely imports — so composing several requires **distinct `wit_package` values**, or `wac` cannot tell which component should satisfy which import.
 
 **Flags:**
 
@@ -564,16 +591,19 @@ wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk
 **Positional arguments:** one or more regexp WASM files (at least one required).
 
 Unlike `generate` and `compile`, `merge` does not accept `-` for stdout: the
-value is handed straight to `wasm-merge`, which would create a file literally
-named `-`.
+value is handed straight to the external tool, which would create a file
+literally named `-`.
 
-**Required config fields:**
+**Config fields:**
 
 | Field | Notes |
 |---|---|
-| `output` | Required unless `--output` is given |
-| `wasm_merge` | Optional; path to wasm-merge binary; defaults to `$WASM_MERGE` env var, then `wasm-merge` in $PATH |
-| `import_module` | Optional; module name passed to wasm-merge; defaults to basename of the regexp WASM |
+| `output` | Required unless `--output` is given. The merge target in both formats |
+| `wasm_format` | Selects the tool: `module` → wasm-merge, `component` → wac |
+| `wasm_merge` | Optional, `module` only; defaults to `$WASM_MERGE`, then `wasm-merge` in $PATH |
+| `wac` | Optional, `component` only; defaults to `$WAC`, then `wac` in $PATH |
+| `import_module` | Optional, `module` only; module name passed to wasm-merge; defaults to basename of the regexp WASM |
+| `wit_package` | `component` only; must be DISTINCT per regexp component when composing several (see above) |
 
 ---
 

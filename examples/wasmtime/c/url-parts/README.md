@@ -86,7 +86,7 @@ need.
 | wrapping | — | `wasm-tools component embed` + `new`, after linking | at LINK time, by clang |
 | WASI bridging | native | `--adapt` with the wasip1 adapter | bundled in the linker |
 | extra tool | wasm-merge | wasm-tools + the adapter | **wit-bindgen** |
-| link step | `regexped merge` | `wac plug` | `wac plug` |
+| link step | `regexped merge` (→ wasm-merge) | `regexped merge` (→ wac) | `regexped merge` (→ wac) |
 
 **Why route 2 exists at all**, given 3 is fewer steps: route 3 needs the
 component-type metadata to be *in the objects before the linker runs*, which means

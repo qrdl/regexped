@@ -21,6 +21,19 @@ func rustComponentCfg() config.BuildConfig {
 			{Pattern: `(?P<user>[a-z]+)@(?P<host>[a-z.]+)`, GroupsFunc: "mail_groups"},
 			{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
 		},
+		// A SET too, so the parity check covers every capability and the find
+		// resource — the one place the component stub's mechanism differs most
+		// from the module stub's, and therefore the one most likely to leak into
+		// the public surface.
+		Sets: []config.SetConfig{{
+			Name:     "secret_scanner",
+			Patterns: config.PatternSelector{All: true},
+			MatchAny: "which_secret",
+			MatchAll: "all_secrets",
+			ScanAny:  "any_secret",
+			ScanAll:  "all_secret_hits",
+			Find:     "scan_secrets",
+		}},
 	}
 }
 
@@ -44,7 +57,7 @@ func TestRustComponentStubHasIdenticalPublicAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	moduleText := wrapRustModule(rustErrorPreamble()+moduleInner, module.RustModuleName())
+	moduleText := wrapRustModule(rustErrorPreamble()+moduleInner+genRustSetInner(module), module.RustModuleName())
 
 	got, want := publicAPI(componentText), publicAPI(moduleText)
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -187,6 +200,7 @@ func TestRustComponentStubNameErrors(t *testing.T) {
 func TestRustComponentStubEmpty(t *testing.T) {
 	cfg := rustComponentCfg()
 	cfg.Regexps = []config.RegexEntry{{Pattern: "abc"}}
+	cfg.Sets = nil // a set declaring a capability IS an export
 	text, err := genRustComponentStubFile(cfg)
 	if err != nil {
 		t.Fatal(err)

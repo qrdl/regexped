@@ -119,13 +119,33 @@ func TestWasmFormatValidation(t *testing.T) {
 }
 
 // A component config carrying sets is refused rather than half-emitted.
-func TestComponentRejectsSets(t *testing.T) {
+// Sets under `component` LOAD as of phase 3.2: their raw ABI does not cross the
+// boundary (`_all` lifts to a list of ids, `find` becomes a resource), so there
+// is nothing left to refuse about them.
+func TestComponentAcceptsSets(t *testing.T) {
 	src := "wasm_format: component\nimport_module: regexps\n" +
 		"regexps:\n  - name: a\n    pattern: 'abc'\n" +
 		"sets:\n  - name: s\n    find: find_s\n    patterns: all\n"
+	if _, err := loadCfgSrc(t, src); err != nil {
+		t.Fatalf("a component config with sets must load: %v", err)
+	}
+}
+
+// `hints: [batch-find]` is the ONE set feature with no component form. It is
+// refused rather than ignored: the user asked for a second entry point, and the
+// component interface has one position per call through the resource. An ignored
+// hint would silently cost them the amortisation they asked for.
+func TestComponentRejectsBatchFindHint(t *testing.T) {
+	src := "wasm_format: component\nimport_module: regexps\n" +
+		"regexps:\n  - name: a\n    pattern: 'abc'\n" +
+		"sets:\n  - name: s\n    find: find_s\n    patterns: all\n    hints: [batch-find]\n"
 	_, err := loadCfgSrc(t, src)
-	if err == nil || !strings.Contains(err.Error(), "sets are not supported") {
-		t.Fatalf("error = %v, want the sets rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "batch-find") {
+		t.Fatalf("error = %v, want the batch-find refusal", err)
+	}
+	// The same config is fine as a module.
+	if _, err := loadCfgSrc(t, strings.Replace(src, "wasm_format: component\n", "", 1)); err != nil {
+		t.Fatalf("batch-find must stay valid for a module: %v", err)
 	}
 }
 

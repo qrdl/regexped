@@ -79,12 +79,28 @@ Under `wasm_format: component` the compiler emits that same core module and
 
 | Export | Signature | Role |
 |---|---|---|
-| `cabi_realloc` | `(i32, i32, i32, i32) → i32` | `(old_ptr, old_size, align, new_size)`; a bump allocator that grows memory and traps if growth fails |
-| `cabi_post_<canonical>` | `(i32) → ()` | post-return; resets the bump pointer to the static top. One shared function, exported under one name per adapter |
+| `cabi_realloc` | `(i32, i32, i32, i32) → i32` | `(old_ptr, old_size, align, new_size)`; segregated free lists by power-of-two size class, growing memory when a class is empty and no space is left, and trapping if growth fails or the alignment exceeds 8 |
+| `cabi_post_<canonical>` | `(i32) → ()` | post-return; returns every block THIS call allocated to its class's free list. One shared function, exported under one name per adapter |
 | `<canonical>` | see below | one adapter per exported pattern function |
 | the raw exports | unchanged | kept alongside, so `wasm-tools component unbundle` yields a core module the module-format tooling can drive |
 
 A canonical export name is `regexped:<wit_package>[@<wit_version>]/matcher#<kebab-func>`.
+
+**Sets add a second interface**, `sets`, and its own adapters:
+
+| Export | Role |
+|---|---|
+| `…/sets#<kebab>` | `match_any` / `scan_any`: the raw id or -1 becomes `option<u32>` |
+| `…/sets#<kebab>` | `match_all` / `scan_all`: the i64 bitmask, or the count plus a bitmap the adapter allocates AND ZEROES, becomes `list<u32>` of ids. The scan uses `i64.ctz` + `v &= v-1`, so it runs once per HIT — a bit-by-bit scan measured up to 11x the whole call at 4096 patterns |
+| `…/sets#[constructor]<res>` | the `find` resource: allocates the scanner state, COPIES the input, zeroes the gate array, and returns a handle from the imported `[resource-new]` builtin |
+| `…/sets#[method]<res>.next` | one position per call, into a `PATTERN_COUNT`-tuple buffer — the exact worst case for one start, so the raw ABI's transactional overflow cannot fire |
+| `…/sets#[dtor]<res>` | frees the input copy, the gate array and the state. Not in the WIT: `component new` binds it by name, and a component without it TRAPS when a handle is dropped |
+
+A set-bearing component therefore has a function IMPORT — `[resource-new]<res>`
+from the synthetic module `[export]regexped:<pkg>/sets` — which shifts every
+defined function index past it. The raw find tuple layout `{id, start, end}` IS
+the canonical layout of `record set-match`, so `next` hands the buffer over
+without converting anything.
 
 Adapters are retptr-shaped: every return type has more than one flat value, so
 the adapter allocates a result area through `cabi_realloc`, calls the existing
@@ -132,12 +148,29 @@ six languages and the component agree on which groups participated.
 ### Call sequence, and where the allocator resets
 
 The host lowers the input list through `cabi_realloc` and copies it in, calls the
-adapter, reads the result area, then calls the post-return. The reset therefore
-belongs in the post-return and **nowhere else**: resetting at adapter entry would
-free the input the host had just lowered.
+adapter, reads the result area, then calls the post-return. Freeing therefore
+belongs in the post-return and **nowhere else**: freeing at adapter entry would
+release the input the host had just lowered.
 
-Memory grows to fit a large input and is never given back — the reset moves a
-bump pointer, it does not shrink memory.
+That ordering is also why the allocator tracks a per-call CHAIN rather than a
+saved mark. The lowering happens before the exported function runs, so a mark
+taken at entry could never cover the input; an allocation instead joins the
+chain wherever it is made, and the post-return walks it.
+
+Block layout, two header words below the payload:
+
+```
+[ptr-8] size class   [ptr-4] call-chain next, or free-list next once freed   [ptr] payload…
+```
+
+The word at `ptr-4` is reused for both links because a block is never live and
+free at once. Payloads are 8-aligned, which is the widest alignment the
+canonical ABI asks for here (`list<u64>`); a wider request traps rather than
+returning a pointer the host would read through misaligned.
+
+Memory grows to fit a large input and is never returned to the OS —
+`memory.grow` is one-way — but it IS reused: a repeated identical call is flat,
+because its blocks come back from the free lists.
 
 See [component.md](component.md) for the user-facing contract.
 

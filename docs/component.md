@@ -159,16 +159,16 @@ The build differs, not the API:
 regexped compile          # component + sibling .wit
 regexped generate         # stubs.rs
 cargo build --target wasm32-wasip2       # your code, itself a component
-wac plug your.wasm --plug regexps.wasm -o composed.wasm
-wasmtime run composed.wasm
+regexped merge --config=regexped.yaml --main=your.wasm regexps.wasm
+wasmtime run composed.wasm               # the `output:` from your config
 ```
 
 Your `Cargo.toml` needs `wit-bindgen`. That is the one place parity does not
 hold, and it is not a choice: `wasm32-wasip2` refuses a hand-written import,
 because a component consumer needs component-type metadata that only a binding
 generator embeds. The generated stub carries that macro and hides it behind the
-familiar API. Until `wac plug` runs, the guest has an unsatisfied import and will
-not instantiate — the analogue of forgetting `regexped merge`.
+familiar API. Until the merge step runs, the guest has an unsatisfied import and
+will not instantiate.
 
 `examples/wasmtime/rust/secrets` 🧩 is this route end to end.
 
@@ -185,10 +185,14 @@ regexped generate         # stub.h, stub.c, and a wit/ directory
 clang --target=wasm32-wasi -nostdlib -Wl,--no-entry -o core.wasm your.c stub.c
 wasm-tools component embed wit core.wasm --world <name>-consumer -o embedded.wasm
 wasm-tools component new embedded.wasm -o guest.wasm
-wac plug guest.wasm --plug regexps.wasm -o composed.wasm
+regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
 ```
 
-Two things to know:
+Three things to know:
+
+- **The two `wasm-tools` lines are yours, not regexped's**, and only the wasip1
+  target needs them — see [Why the wasip1 target needs two extra
+  commands](#why-the-wasip1-target-needs-two-extra-commands) below.
 
 - **Add your own exports** to the generated `wit/consumer.wit`. It arrives with
   the import declared and nothing exported, and a component with no exports can
@@ -200,6 +204,73 @@ If a pattern exports groups, the stub also defines `cabi_realloc`, because the
 canonical ABI allocates a returned list in *your* memory. It is a bump allocator
 reset per call, sized by `REGEXPED_CABI_HEAP_BYTES` (8 KB default) — raise that
 if a pattern has a very large number of groups.
+
+### Composing — `regexped merge`
+
+The last step is the same command a module build runs. `merge` dispatches on
+`wasm_format` and calls the right tool, so the command a user types does not
+depend on the output kind:
+
+```sh
+regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
+```
+
+| `wasm_format` | tool | `--main` is |
+|---|---|---|
+| `module` | `wasm-merge` | the host module |
+| `component` | `wac plug` | the **socket** — the component with the unsatisfied import |
+
+`wac` is resolved as config `wac:` → `$WAC` → `$PATH`, the same order the other
+two tools use. `output:` in the config names the result; `--output` overrides it,
+which is what a directory building the guest twice needs.
+
+**Composing is not merging.** `wasm-merge` produces ONE module whose regexp code
+reads the host's memory directly. `wac plug` produces a component holding two
+instances with two memories, and every call crosses the canonical ABI and copies
+its input. Same command, different cost model — see [Costs](#costs).
+
+**Several regexp components in one call** works, with one asymmetry against the
+module format. Regexp *modules* may all share an `import_module` name, because
+nothing imports it — it is a label with no consumers. Regexp *components* are
+matched by their interface name, `regexped:<wit_package>/matcher`, which the
+socket genuinely imports, so two components built from configs sharing a
+`wit_package` export the same interface and `wac` cannot tell which should
+satisfy the import. **Composing several therefore requires distinct
+`wit_package` values.**
+
+### Why the wasip1 target needs two extra commands
+
+The C recipe above runs `wasm-tools component embed` and `component new` on
+*your* compiled code. That is not something regexped does for you, and it is not
+needed on every route — it depends on what your compiler emits:
+
+| how you build your own code | what comes out | wrap needed |
+|---|---|---|
+| Rust `wasm32-wasip2` | a component | no — rustc links it through `wasm-component-ld` |
+| C `--target=wasm32-wasip2` | a component | no — clang links it through `wasm-component-ld` |
+| **C `--target=wasm32-wasip1`** | a **core module** | **yes** |
+
+Only the last row needs the wrap, and regexped does not do it: the input is your
+own compiled code, which regexped never sees. Run it yourself:
+
+```sh
+wasm-tools component embed <wit-dir> <guest-core.wasm> --world <world>-consumer -o embedded.wasm
+wasm-tools component new embedded.wasm --adapt wasi_snapshot_preview1=<adapter>.wasm -o guest.wasm
+```
+
+- `<wit-dir>` is the `wit/` directory generated beside the C stub. It must be the
+  DIRECTORY, not one file — that is how `embed` resolves `deps/`.
+- `<world>-consumer` is your `wit_world` (default: `wit_package`) with the
+  `-consumer` suffix regexped appends.
+- `<adapter>.wasm` is `wasi_snapshot_preview1.command.wasm`, from the
+  [wasmtime releases](https://github.com/bytecodealliance/wasmtime/releases). It
+  bridges the `wasi_snapshot_preview1` imports your code makes to `wasi:cli`.
+  A `reactor` build of the adapter is the one to use for a library with no
+  `main`.
+
+`examples/wasmtime/c/url-parts` 🧩 builds the same `main.c` three ways — module,
+wasip1 component, wasip2 component — with the two wrap commands appearing only in
+the wasip1 target.
 
 ### Iteration, and the rule a hand-written loop gets wrong
 
@@ -230,6 +301,92 @@ module being exactly what the `module` format produces directly, so the componen
 route costs an extra tool and build step to arrive at the same place. `stub_type:
 js`/`ts` is therefore refused under `component`.
 
+## Sets
+
+A `sets:` block becomes a SECOND interface, `sets`, beside `matcher`. The world
+exports only the interfaces that exist, so a config of only sets gets no empty
+`matcher` and vice versa.
+
+```wit
+interface sets {
+    enum error-code { backtrack-overflow }
+    record set-match { id: u32, start: u32, end: u32 }
+
+    which-matches: func(input: list<u8>) -> result<option<u32>, error-code>;
+    all-matches:   func(input: list<u8>) -> result<list<u32>, error-code>;
+    any-hit:       func(input: list<u8>, start: u32) -> result<option<u32>, error-code>;
+    all-hits:      func(input: list<u8>, start: u32) -> result<list<u32>, error-code>;
+
+    resource scan-secrets {
+        constructor(input: list<u8>, start: u32);
+        next: func() -> result<list<set-match>, error-code>;
+    }
+}
+```
+
+The names are YOUR names — `match_any: which_matches` becomes `which-matches` —
+kebab-cased, exactly as for single patterns. The `find:` name becomes a resource
+rather than a function, for the reason below.
+
+**`error-code` is declared again here rather than shared with `matcher`.** A
+sets-only config would otherwise have to export an interface holding nothing but
+that enum. Both generated stubs map the two enums onto one error type, so a
+consumer never sees the duplication.
+
+### `_all` returns ids, not a bitmask
+
+The raw ABI has two forms — an i64 bitmask up to 64 patterns, and a count plus a
+caller-owned bitmap above it — and neither crosses a component boundary: the
+consumer cannot supply the bitmap. Both lift to `list<u32>` of global pattern
+ids, ascending.
+
+That is measured, not assumed. Handing the bitmap over instead was slower in all
+twelve shapes tried (3 to 4096 patterns, 1 to 2048 matching), because the bit
+scan is the cost and a bitmap does not avoid it — it moves it to the consumer and
+adds the transfer. A shape that varied with pattern count was rejected outright:
+adding a 65th pattern would silently change the interface every consumer compiled
+against.
+
+### `find` is a resource, and that is what the gate array costs
+
+The module ABI makes `find` resumable by giving the CALLER the state: a gate
+array of `ID_SPACE` u32s, plus the position. A component consumer has no way to
+own memory the regexp component reads, so the state moves inside, behind a
+handle:
+
+```wit
+resource <find-name> {
+    constructor(input: list<u8>, start: u32);
+    next: func() -> result<list<set-match>, error-code>;
+}
+```
+
+`next` answers the matches at ONE position — they all share a start — and an
+empty list means the scan is finished. The constructor copies the input in ONCE,
+which is the point: a stateless per-position export would copy the whole input on
+every call, and measurement put that at 2800 ns against 230-400 ns for a
+resource `next` on a 4 KB input.
+
+Two scans can be in flight at once, each with its own handle and its own state —
+the same property the module-format C scanner has.
+
+**Dropping the handle is what frees the scan.** Rust hides that entirely: the
+iterator owns the handle and drops it. C cannot, because its scanner has no
+destructor to hang the drop on — which is why `<func>_free` exists in BOTH
+formats, a no-op for a module and mandatory here. See
+[c-api.md](c-api.md#sets).
+
+### What a set costs here
+
+- `overlapping: true` sets are quadratic per drive by design, and the component
+  form has no answer cache — so it behaves like a C or Rust MODULE consumer,
+  which has none either. Only the JS/TS module stubs reserve one. If you need
+  that mitigation, use `wasm_format: module`.
+- Every `next` is a cross-component call, but NOT a copy of the input: the
+  constructor did that once.
+- The `_all` pair allocates a list of ids per call, bounded by the number of
+  matching patterns rather than by the input.
+
 ## Costs
 
 - **Every call copies the input** into guest memory, as the canonical ABI
@@ -237,23 +394,27 @@ js`/`ts` is therefore refused under `component`.
   the Rust/Go/C embedded path, which shares the host's memory.
 - One allocation per call for the result area, two more for `groups`. Negligible
   against a scan of any real length.
-- Memory grows to fit a large input and is never given back — the per-call reset
-  moves a bump pointer, it does not shrink the memory.
+- Memory grows to fit a large input and is never given back to the OS —
+  `memory.grow` is one-way. It IS reused: the allocator keeps per-size-class free
+  lists, and the post-return returns the call's blocks to them, so a repeated
+  call does not grow the component at all. A block is reused only for a request
+  of its own power-of-two class, which bounds the waste at 2x per allocation and
+  is what makes repeated calls flat.
 - The component is roughly 2 KB larger than the core module it wraps.
 
 ## Not yet supported
 
 | | Status |
 |---|---|
-| Pattern **sets** | Refused at load: "sets are not supported for wasm_format: component yet". A stateless component export would have to run the whole drive internally — the gate array, the advance loop, the overflow retry — which the stubs own today. |
+| Batch exports on a set (`hints: [batch-find]`) | Refused at load. Batching amortises host crossings for a caller that intends to consume everything, and the interface deliberately exposes one position per call through the find resource. It is refused rather than ignored because the user asked for a second entry point. |
 | `go` / `as` / `js` / `ts` stubs | Not component targets, permanently. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route; and no JavaScript runtime loads a component — `WebAssembly.instantiate` accepts core modules only — so a JS consumer needs `jco transpile`, whose output is a core module plus glue, i.e. where `wasm_format: module` already starts. |
-| Batch exports (`hints: [batch-find]`) | Not exported from the component. |
 
 ## How it is built
 
 The compiler emits the core module exactly as it does for `wasm_format: module` —
 same engines, same bodies, same signatures — and **appends** the canonical-ABI
-machinery: a `cabi_realloc` bump allocator, one shared post-return that resets it,
+machinery: a `cabi_realloc` with per-size-class free lists, one shared
+post-return that returns the call's blocks to them,
 and one adapter per exported function that allocates a result area, calls the
 existing body, and translates the `-1` / `-2` sentinels into the discriminated
 layouts. Because they are appended, no pattern function moves, and a
@@ -265,6 +426,11 @@ layouts. Because they are appended, no pattern function moves, and a
 wasm-tools component embed <wit> <core> --world <world> -o <tmp>
 wasm-tools component new <tmp> -o <out>
 ```
+
+It is resolved as config `wasm_tools:` → `$WASM_TOOLS` → `$PATH`, and it is a
+hard requirement of this format: a `module` build needs no external binary,
+a `component` build cannot finish without this one. Composing later needs `wac`
+the same way. Both ship in the Docker image — see [docker.md](docker.md).
 
 The raw core exports (`find_github_token` and friends) are kept alongside the
 canonical ones. They are unreachable from a component host, but they let

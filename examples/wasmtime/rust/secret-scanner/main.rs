@@ -12,23 +12,9 @@
 use anyhow::{anyhow, Result};
 use wasmtime::{Engine, Instance, Module, Store};
 
-// Pattern names — must match the order of `regexps:` in regexped.yaml.
-const PATTERN_NAMES: &[&str] = &[
-    "aws_key",
-    "aws_secret",
-    "github_pat",
-    "github_oauth",
-    "github_app",
-    "jwt",
-    "slack_token",
-    "stripe_live",
-    "stripe_test",
-    "google_api",
-];
-
-fn pattern_name(id: i32) -> &'static str {
-    PATTERN_NAMES.get(id as usize).copied().unwrap_or("unknown")
-}
+// Pattern names: shared with the component host in this directory, since a
+// native host has no stub to generate them for it either way.
+include!("pattern_names.rs");
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();

@@ -136,7 +136,7 @@ func TestComponentAdaptersSelection(t *testing.T) {
 	compiled := compileForTest(t, entries)
 	names := canonicalNames(entries)
 
-	got := componentAdapters(compiled, names)
+	got := componentAdapters(compiled, names, 0)
 	if len(got) != 3 {
 		t.Fatalf("got %d adapters, want 3: %+v", len(got), got)
 	}
@@ -155,11 +155,11 @@ func TestComponentAdaptersSelection(t *testing.T) {
 
 	// Drop one name: that function keeps its raw export and gains no adapter.
 	delete(names, "f")
-	if got := componentAdapters(compiled, names); len(got) != 2 {
+	if got := componentAdapters(compiled, names, 0); len(got) != 2 {
 		t.Errorf("with one name missing, got %d adapters, want 2", len(got))
 	}
 	// No names at all: no adapters.
-	if got := componentAdapters(compiled, nil); len(got) != 0 {
+	if got := componentAdapters(compiled, nil, 0); len(got) != 0 {
 		t.Errorf("with no names, got %d adapters", len(got))
 	}
 }
@@ -222,28 +222,33 @@ func TestComponentWithoutGroupsStillTypesRealloc(t *testing.T) {
 	validateWASM(t, wasm)
 }
 
-// The allocator and post-return are emitted from one place and reference the
-// heap global only through it, so a future async allocator can be swapped in
-// without touching the adapters.
+// The allocator and post-return are emitted from one place and reference their
+// two globals only through it, so the allocator can be replaced without
+// touching the adapters.
 func TestComponentAllocatorBodies(t *testing.T) {
-	realloc := buildComponentReallocBody(1)
+	realloc := buildComponentReallocBody(1, 2, 0x30000)
 	if len(realloc) == 0 {
 		t.Fatal("empty cabi_realloc body")
 	}
-	// One i32 local group, then the body; the last byte closes the function.
+	// One local group, then the body; the last byte closes the function.
 	if realloc[0] != 0x01 || realloc[len(realloc)-1] != 0x0B {
 		t.Errorf("unexpected body framing: % x … %#x", realloc[:3], realloc[len(realloc)-1])
 	}
-	post := buildComponentPostBody(1, 0x30000)
-	if post[0] != 0x00 {
-		t.Error("the post-return needs no locals")
+	if free := buildComponentFreeBody(0x30000); len(free) == 0 || free[len(free)-1] != 0x0B {
+		t.Error("cm_free body is empty or unterminated")
+	}
+	post := buildComponentPostBody(2, 7)
+	// The post-return now walks the per-call chain, so it HAS locals — a body
+	// with none is the old bump-reset version and cannot free anything.
+	if post[0] == 0x00 {
+		t.Error("the post-return declares no locals: it cannot be walking the call chain")
 	}
 	if post[len(post)-1] != 0x0B {
 		t.Error("the post-return body must close")
 	}
-	// The static top must appear as an i32.const in the reset.
-	if !strings.Contains(string(post), "\x41") {
-		t.Error("no i32.const in the post-return body")
+	// It must contain a loop (0x03), which the reset version never did.
+	if !strings.Contains(string(post), "\x03\x40") {
+		t.Error("no loop in the post-return body: nothing is walking the chain")
 	}
 }
 

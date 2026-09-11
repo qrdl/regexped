@@ -109,10 +109,12 @@ $(COMP_GUEST): $(COMP_CORE)
 	wasm-tools component embed $(COMP_DIR)/wit $(COMP_CORE) --world url-parts-consumer -o $(COMP_DIR)/embedded.wasm
 	wasm-tools component new $(COMP_DIR)/embedded.wasm --adapt wasi_snapshot_preview1=$(ADAPTER) -o $@
 
-# Step 4 – compose guest and regexp component. `wac` is to components what
-# wasm-merge is to modules; without it the guest has an unsatisfied import.
+# Step 4 – compose guest and regexp component. The SAME `regexped merge` the
+# module build runs: it dispatches on wasm_format and shells out to `wac` here
+# where the module build gets `wasm-merge`. Without it the guest has an
+# unsatisfied import. The output path comes from the config.
 $(COMP_FINAL): $(COMP_GUEST) $(COMP_REGEX)
-	wac plug $(COMP_GUEST) --plug $(COMP_REGEX) -o $@
+	$(REGEXPED) merge --config=$(COMP_CFG) --main=$(COMP_GUEST) $(COMP_REGEX)
 
 component: $(COMP_FINAL)
 
@@ -142,9 +144,10 @@ $(P2_GUEST): main.c $(COMP_STUB) $(P2_TYPES)
 	@test -n "$(WASM_COMPONENT_LD_DIR)" || { echo "wasm-component-ld not found; set WASM_COMPONENT_LD_DIR" >&2; exit 1; }
 	PATH="$(WASM_COMPONENT_LD_DIR):$$PATH" $(CC) --target=wasm32-wasip2 -nostdlib -Wl,--no-entry 		-I$(COMP_DIR) -o $@ main.c $(COMP_DIR)/stub.c $(P2_TYPES)
 
-# Step 3 – compose, exactly as the wasip1 route does.
+# Step 3 – compose, exactly as the wasip1 route does. --output overrides the
+# config, which names the wasip1 route's target.
 $(P2_FINAL): $(P2_GUEST) $(COMP_REGEX)
-	wac plug $(P2_GUEST) --plug $(COMP_REGEX) -o $@
+	$(REGEXPED) merge --config=$(COMP_CFG) --main=$(P2_GUEST) --output=$@ $(COMP_REGEX)
 
 wasip2: $(P2_FINAL)
 

@@ -12,7 +12,6 @@ import (
 
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/generate"
 )
 
 var updateFixture = flag.Bool("update-component-core", false,
@@ -124,15 +123,7 @@ func TestComponentKeepsModuleExportsAtTheSameIndices(t *testing.T) {
 // export names the same way CmdCompile does.
 func buildCore(t *testing.T, cfg config.BuildConfig) []byte {
 	t.Helper()
-	_, names, prefix, err := generate.ComponentArtifacts(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	core, _, err := compile.Compile(cfg.Regexps, 0, true, compile.CompileOptions{
-		Component:            true,
-		ComponentPackage:     prefix,
-		ComponentExportNames: names,
-	})
+	core, _, err := Core(cfg, nil)
 	if err != nil {
 		t.Fatalf("component compile: %v", err)
 	}

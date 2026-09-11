@@ -379,7 +379,16 @@ const (
 	// There is no separate type for the OVERLAPPING batch entry. Both overlap
 	// policies share ONE signature, so the second type was declared in every
 	// set module and referenced by none.
+
+	// Component-only, APPENDED so the indices above do not move. Emitted only
+	// under `wasm_format: component`; a module build declares neither.
+	setTypeCompVoid = 11 // (i32)→()      cm_free, cm_post, [dtor]<res>
+	setTypeCompNext = 12 // (i32)→i32     [method]<res>.next, [resource-new]<res>
 )
+
+// numSetTypesBase is how many types the set assembler always declares. The two
+// component types sit past it.
+const numSetTypesBase = 11
 
 // batchPosFnOffset returns the index of the set's shared per-position worker,
 // or -1 when the set does not batch. It sits immediately after the exported
@@ -1612,6 +1621,24 @@ func CompileFileOpts(cfg config.BuildConfig, output string, over CompileSetOptio
 	return compileFileDiag(cfg, output, over)
 }
 
+// CompileFileComponent is CompileFile for `wasm_format: component`, including
+// configs that declare `sets:`.
+//
+// The names come in rather than being derived here: they are the WIT's, and
+// generate/ imports compile/, so compile/ cannot reach the derivation. The
+// component/ package sits above both and is what calls this.
+func CompileFileComponent(cfg config.BuildConfig, pkg string, exportNames map[string]string,
+	setNames map[string]ComponentSetNames, rep *Reporter,
+) ([]byte, int64, error) {
+	w, top, _, err := compileFileComponentReport(cfg, "", CompileSetOptions{}, rep, asmOpts{
+		Component:        true,
+		ComponentPackage: pkg,
+		ExportNames:      exportNames,
+		SetNames:         setNames,
+	})
+	return w, top, err
+}
+
 // CompileFileDiag is CompileFile plus the per-set diagnostics the same compile
 // already produced — one SetDiag per entry of cfg.Sets, in that order.
 //
@@ -1638,11 +1665,23 @@ func compileFileDiag(cfg config.BuildConfig, output string, over CompileSetOptio
 // compileFileDiagReport is compileFileDiag with an optional verbose Reporter.
 // nil on every path but `regexped compile --verbose`.
 func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSetOptions, rep *Reporter) ([]byte, int64, []SetDiag, error) {
+	return compileFileComponentReport(cfg, output, over, rep, asmOpts{})
+}
+
+// compileFileComponentReport is compileFileDiagReport plus the component
+// options. `comp` is the zero value — meaning MODULE — on every path but
+// CompileFileComponent, which is the arm component/ drives.
+func compileFileComponentReport(cfg config.BuildConfig, output string, over CompileSetOptions, rep *Reporter, comp asmOpts) ([]byte, int64, []SetDiag, error) {
 	if err := config.ValidateSets(&cfg); err != nil {
 		return nil, 0, nil, err
 	}
+	if err := comp.validate(); err != nil {
+		return nil, 0, nil, err
+	}
 
-	standalone := cfg.Output == ""
+	// A component owns and exports its own memory, so the embedded shape — and
+	// the `output:` key that selects it for a module — has no meaning here.
+	standalone := cfg.Output == "" || comp.Component
 
 	// No sets: delegate to Compile so the output is byte-identical (including
 	// per-pattern page alignment and final memory page count). Replicating
@@ -1650,9 +1689,12 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 	// memory for standalone modules whose DFA tables exceeded 64 KiB.
 	if len(cfg.Sets) == 0 {
 		w, top, err := Compile(cfg.Regexps, 0, standalone, CompileOptions{
-			MaxDFAStates: cfg.MaxDFAStates,
-			MaxTDFARegs:  cfg.MaxTDFARegs,
-			Report:       rep,
+			MaxDFAStates:         cfg.MaxDFAStates,
+			MaxTDFARegs:          cfg.MaxTDFARegs,
+			Report:               rep,
+			Component:            comp.Component,
+			ComponentPackage:     comp.ComponentPackage,
+			ComponentExportNames: comp.ExportNames,
 		})
 		return w, top, nil, err
 	}
@@ -1814,18 +1856,18 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 	// caller trusting it on a set-bearing module wrote its input over the
 	// first set's tables. tools/perftest already worked around this by
 	// re-parsing the data section; nothing else did.
-	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone, globals), dataTop, diags, nil
+	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone, globals, comp), dataTop, diags, nil
 }
 
 // assembleModuleWithSets builds a WASM module from per-pattern compilations
 // plus per-set compiled sets. When sets is empty it produces the same bytes
 // as assembleModule.
-func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, memPages int32, standalone bool, globals *moduleGlobals) []byte {
+func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, memPages int32, standalone bool, globals *moduleGlobals, opts asmOpts) []byte {
 	if globals == nil {
 		globals = &moduleGlobals{}
 	}
 	if len(sets) == 0 {
-		return assembleModule(patterns, memPages, standalone, globals, asmOpts{})
+		return assembleModule(patterns, memPages, standalone, globals, opts)
 	}
 
 	// Reuse assembleModule for the base (patterns only), then we'll handle sets separately.
@@ -1847,9 +1889,40 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 	}
 
+	// A set-bearing COMPONENT imports the `[resource-new]` canon builtin once
+	// per `find` resource, and a function import occupies a function index. So
+	// every DEFINED function here starts past them — including the pattern
+	// bodies, whose internal `call` targets are all derived from baseIdx, so the
+	// offset reaches them without any emitter knowing about it.
+	//
+	// resNewIdx[si] is set-si's builtin, or -1 when the set has no `find`.
+	resNewIdx := make([]int, len(sets))
+	for si := range resNewIdx {
+		// -1 is "this set imports nothing", and it has to be the DEFAULT rather
+		// than something the component arm fills in: the import and export
+		// sections both skip on it, and a zero value made a MODULE build emit a
+		// fourth-byte-perfect but entirely bogus import for every set.
+		resNewIdx[si] = -1
+	}
+	numFuncImports := 0
+	if opts.Component {
+		for si, cs := range sets {
+			// BOTH conditions. The name table having a resource is not enough:
+			// the set must actually declare `find`, or the module imports a
+			// builtin for a resource the WIT does not define and `component new`
+			// refuses. Production callers keep the two in step; this does not
+			// depend on it.
+			n, ok := opts.SetNames[cs.name]
+			if ok && n.ResourceNew != "" && cs.find != "" {
+				resNewIdx[si] = numFuncImports
+				numFuncImports++
+			}
+		}
+	}
+
 	// Assign function indices.
 	baseIdx := make([]int, len(patterns))
-	total := 0
+	total := numFuncImports
 	for i, p := range patterns {
 		baseIdx[i] = total
 		total += p.funcCount()
@@ -1875,6 +1948,29 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	prefixFnBase := make([]int, len(sets))
 	for si, cs := range sets {
 		prefixFnBase[si] = setBaseIdx[si] + cs.prefixFnBaseOffset()
+	}
+
+	// Component machinery, APPENDED after every pattern and set function so no
+	// index above moves: cabi_realloc, cm_free, cm_post, then one adapter per
+	// exported capability.
+	var patAdapters []componentAdapter
+	var setAdapters []setAdapter
+	reallocIdx, freeIdx, postIdx, firstAdapterIdx := -1, -1, -1, -1
+	if opts.Component {
+		reallocIdx = total
+		freeIdx = total + 1
+		postIdx = total + 2
+		firstAdapterIdx = total + 3
+		// A config may declare BOTH single patterns and sets, and this assembler
+		// is the only one such a config reaches. The pattern adapters come first
+		// and are exactly the ones assembleModule emits — omitting them made a
+		// mixed config lose every single-pattern export while the WIT still
+		// declared them, which `component new` then refused as a missing
+		// interface function.
+		patAdapters = componentAdapters(patterns, opts.ExportNames, numFuncImports)
+		setAdapters = componentSetAdapters(sets, setBaseIdx, resNewIdx, opts.SetNames,
+			setTypeI32I32ToI32, setTypeI32x3ToI32, setTypeCompNext, setTypeCompVoid)
+		total += 3 + len(patAdapters) + len(setAdapters)
 	}
 
 	var out []byte
@@ -1915,15 +2011,40 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		0x60, 0x08, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 9
 		0x60, 0x08, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 10
 	}
+	if opts.Component {
+		typeSection[0] = numSetTypesBase + 2
+		typeSection = append(typeSection,
+			0x60, 0x01, 0x7F, 0x00, // type 11: (i32)→()
+			0x60, 0x01, 0x7F, 0x01, 0x7F) // type 12: (i32)→i32
+	}
 	out = appendSection(out, 1, typeSection)
 
-	// Import section.
-	if !standalone {
+	// Import section. A module build imports the host memory when embedded; a
+	// component imports one `[resource-new]` canon builtin per find resource
+	// and never imports memory, since `component` forces standalone.
+	if !standalone || numFuncImports > 0 {
 		var importSec []byte
-		importSec = utils.AppendULEB128(importSec, 1)
-		importSec = appendString(importSec, "main")
-		importSec = appendString(importSec, "memory")
-		importSec = append(importSec, 0x02, 0x00, 0x00)
+		n := 0
+		if !standalone {
+			n++
+		}
+		n += numFuncImports
+		importSec = utils.AppendULEB128(importSec, uint32(n))
+		if !standalone {
+			importSec = appendString(importSec, "main")
+			importSec = appendString(importSec, "memory")
+			importSec = append(importSec, 0x02, 0x00, 0x00)
+		}
+		for si, cs := range sets {
+			if resNewIdx[si] < 0 {
+				continue
+			}
+			nm := opts.SetNames[cs.name]
+			importSec = appendString(importSec, nm.ResourceImport)
+			importSec = appendString(importSec, nm.ResourceNew)
+			importSec = append(importSec, 0x00) // kind: function
+			importSec = utils.AppendULEB128(importSec, uint32(setTypeCompNext))
+		}
 		out = appendSection(out, 2, importSec)
 	}
 
@@ -1952,7 +2073,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		slotGroupsFromWrapper: setTypeI32x4ToI32, // (i32×4)→i32
 	}
 	var fs []byte
-	fs = utils.AppendULEB128(fs, uint32(total))
+	// `total` counts every function index INCLUDING the imported builtins; the
+	// function section declares only the defined ones.
+	fs = utils.AppendULEB128(fs, uint32(total-numFuncImports))
 	for _, p := range patterns {
 		for _, slot := range p.funcLayout() {
 			t, ok := setSlotType[slot.kind]
@@ -2014,17 +2137,50 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			fs = append(fs, byte(setTypeI32x3ToI32))
 		}
 	}
+	if opts.Component {
+		// cabi_realloc reuses the (i32×4)→i32 probe type; cm_free and cm_post
+		// share (i32)→().
+		fs = append(fs, byte(setTypeI32x4ToI32), byte(setTypeCompVoid), byte(setTypeCompVoid))
+		for _, a := range patAdapters {
+			if a.kind == adapterMatch {
+				fs = append(fs, byte(setTypeI32I32ToI32))
+			} else {
+				// find and groups alike: (ptr, len, start) → retptr.
+				fs = append(fs, byte(setTypeI32x3ToI32))
+			}
+		}
+		for _, a := range setAdapters {
+			fs = append(fs, a.typeIdx)
+		}
+	}
 	out = appendSection(out, 3, fs)
 
 	// No function table needed: suffix DFAs are called via direct call, not call_indirect.
 	// This avoids multi-table conflicts when merging with host modules (e.g. Go WASM).
 
-	// Memory section.
+	// Memory section. A component declares one page more: the allocator's
+	// free-list heads sit at the static top and are written without a bounds
+	// check, so the page has to exist before the first allocation.
 	{
 		var mem []byte
 		mem = append(mem, 0x01, 0x00)
-		mem = utils.AppendULEB128(mem, uint32(memPages))
+		declPages := memPages
+		if opts.Component {
+			declPages++
+		}
+		mem = utils.AppendULEB128(mem, uint32(declPages))
 		out = appendSection(out, 5, mem)
+	}
+
+	// The component allocator's two globals, on the same terms as the
+	// single-pattern assembler: the bump frontier starts past the free-list
+	// head array, which sits at the static top.
+	heapGlobal, callListGlobal := uint32(0), uint32(0)
+	staticTop := memPages * 65536
+	classHeadsBase := staticTop
+	if opts.Component {
+		heapGlobal = globals.AllocInit(staticTop + classHeadsBytes)
+		callListGlobal = globals.AllocInit(0)
 	}
 
 	// Global section: the find-from channel (see find_from.go), on the same
@@ -2064,6 +2220,19 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	}
 	for _, cs := range sets {
 		numExports += len(cs.capFns())
+	}
+	if opts.Component {
+		// cabi_realloc, plus each adapter under its canonical name and — for
+		// the ones returning a result area — a `cabi_post_` alias of the single
+		// shared post-return.
+		numExports++
+		numExports += 2 * len(patAdapters) // each carries a cabi_post_ alias
+		for _, a := range setAdapters {
+			numExports++
+			if a.post {
+				numExports++
+			}
+		}
 	}
 
 	var es []byte
@@ -2113,11 +2282,39 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			es = utils.AppendULEB128(es, uint32(base+i))
 		}
 	}
+	if opts.Component {
+		// The raw set exports above are KEPT, for the reason the single-pattern
+		// assembler keeps its own: they are unreachable from a component host,
+		// and they leave the core module drivable by the module-path harnesses
+		// after `wasm-tools component unbundle`.
+		es = appendString(es, "cabi_realloc")
+		es = append(es, 0x00)
+		es = utils.AppendULEB128(es, uint32(reallocIdx))
+		for i, a := range patAdapters {
+			es = appendString(es, a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(firstAdapterIdx+i))
+			es = appendString(es, "cabi_post_"+a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(postIdx))
+		}
+		for i, a := range setAdapters {
+			es = appendString(es, a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(firstAdapterIdx+len(patAdapters)+i))
+			if a.post {
+				es = appendString(es, "cabi_post_"+a.export)
+				es = append(es, 0x00)
+				es = utils.AppendULEB128(es, uint32(postIdx))
+			}
+		}
+	}
 	out = appendSection(out, 7, es)
 
 	// Code section.
 	var cs_bytes []byte
-	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total))
+	// Defined functions only — `total` counts the imported canon builtins too.
+	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total-numFuncImports))
 	for i, p := range patterns {
 		base := baseIdx[i]
 		_, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
@@ -2313,6 +2510,24 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// Backtracking drivers last, matching btFnBaseOffset.
 		for _, bb := range cs.btFnBodies {
 			cs_bytes = append(cs_bytes, bb...)
+		}
+	}
+	if opts.Component {
+		cs_bytes = appendCodeEntry(cs_bytes, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
+		cs_bytes = appendCodeEntry(cs_bytes, buildComponentFreeBody(classHeadsBase))
+		cs_bytes = appendCodeEntry(cs_bytes, buildComponentPostBody(callListGlobal, freeIdx))
+		for _, a := range patAdapters {
+			switch a.kind {
+			case adapterMatch:
+				cs_bytes = appendCodeEntry(cs_bytes, buildMatchAdapterBody(reallocIdx, a.funcIdx))
+			case adapterFind:
+				cs_bytes = appendCodeEntry(cs_bytes, buildFindAdapterBody(reallocIdx, a.funcIdx))
+			case adapterGroups:
+				cs_bytes = appendCodeEntry(cs_bytes, buildGroupsAdapterBody(reallocIdx, a.funcIdx, a.numGroups))
+			}
+		}
+		for _, a := range setAdapters {
+			cs_bytes = appendCodeEntry(cs_bytes, buildSetAdapterBody(a, reallocIdx, freeIdx, callListGlobal))
 		}
 	}
 	out = appendSection(out, 10, cs_bytes)

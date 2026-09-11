@@ -19,6 +19,19 @@ func cComponentCfg() config.BuildConfig {
 			{Pattern: `AKIA[A-Z0-9]{16}`, FindFunc: "find_aws_key"},
 			{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
 		},
+		// A SET too, so the header-parity check covers every capability and the
+		// find scanner — the one place the component mechanism differs most
+		// (a resource handle rather than a caller-owned drive), and therefore
+		// the most likely to leak into the API.
+		Sets: []config.SetConfig{{
+			Name:     "secrets",
+			Patterns: config.PatternSelector{All: true},
+			MatchAny: "which_secret",
+			MatchAll: "all_secrets",
+			ScanAny:  "any_secret",
+			ScanAll:  "all_secret_hits",
+			Find:     "scan_secrets",
+		}},
 	}
 }
 
@@ -34,7 +47,7 @@ func TestCComponentHeaderIsIdenticalToModuleHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	moduleH, _, err := genCStubFiles(module.Regexps, module.ImportModule, "stub.h")
+	moduleH, _, err := genCStubFilesWithSets(module, "stub.h")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,10 +58,37 @@ func TestCComponentHeaderIsIdenticalToModuleHeader(t *testing.T) {
 	if ci < 0 || mi < 0 {
 		t.Fatal("could not locate the shared preamble in one of the headers")
 	}
-	if componentH[ci:] != moduleH[mi:] {
-		t.Errorf("headers differ below the lead comment.\n--- component ---\n%s\n--- module ---\n%s",
-			componentH[ci:], moduleH[mi:])
+	got, want := stripCFFIImports(componentH[ci:]), stripCFFIImports(moduleH[mi:])
+	if got != want {
+		t.Errorf("headers differ below the lead comment.\n--- component ---\n%s\n--- module ---\n%s", got, want)
 	}
+}
+
+// stripCFFIImports removes the raw WASM import declarations from a header.
+//
+// They are NOT API: they are how one stub reaches the module it was generated
+// for, and the two formats import different things from different modules under
+// different signatures — a module build imports `ffi_scan_secrets(ptr, len, from,
+// gates, out, cap)` from the config's import_module, a component build imports
+// `[method]scan-it.next(handle, retptr)` from a WIT interface. Neither could
+// carry the other's, so requiring them to match would be requiring the wrong
+// thing.
+//
+// Everything a CALLER touches — the constants, the types, the function
+// declarations — is compared. The set declarations are the only place the module
+// generator puts import lines in the header at all; the per-pattern ones already
+// live in the .c.
+func stripCFFIImports(h string) string {
+	var out []string
+	lines := strings.Split(h, "\n")
+	for i := 0; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "__attribute__((import_module(") {
+			i++ // and the declaration it applies to
+			continue
+		}
+		out = append(out, lines[i])
+	}
+	return strings.Join(out, "\n")
 }
 
 // A WASM import_name carries the WIT function name verbatim, which is KEBAB.
@@ -110,12 +150,28 @@ func TestCComponentAllocatorOnlyWhenGroupsExist(t *testing.T) {
 
 	cfg := cComponentCfg()
 	cfg.Regexps = []config.RegexEntry{{Pattern: `abc`, FindFunc: "f"}}
+	cfg.Sets = nil // a set's `_all` and `find` return lists too
 	_, noGroups, err := genCComponentStubFiles(cfg, "stub.h")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(noGroups, "cabi_realloc") {
 		t.Error("no list is ever returned here, so no allocator should be emitted")
+	}
+
+	// A SET capability that returns a list needs the allocator just as much: the
+	// `_all` pair hands back a list of ids and the scanner a list of tuples, and
+	// the canonical ABI lowers both into the CALLER's memory. Getting this wrong
+	// fails late, at `component new`, with "module does not export a function
+	// named cabi_realloc".
+	setOnly := cComponentCfg()
+	setOnly.Regexps = []config.RegexEntry{{Pattern: `abc`}, {Pattern: `def`}}
+	_, setC, err := genCComponentStubFiles(setOnly, "stub.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(setC, `export_name("cabi_realloc")`) {
+		t.Error("a set returning lists needs cabi_realloc")
 	}
 }
 
@@ -222,6 +278,7 @@ func TestCComponentDispatchAndEmpty(t *testing.T) {
 
 	// A config with no exports writes nothing at all.
 	cfg.Regexps = []config.RegexEntry{{Pattern: "abc"}}
+	cfg.Sets = nil // a set declaring a capability IS an export
 	empty := filepath.Join(t.TempDir(), "stub.h")
 	if err := cComponentStub(cfg, empty); err != nil {
 		t.Fatal(err)

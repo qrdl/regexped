@@ -2290,13 +2290,15 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	// baseIdx and no per-pattern offset moves. Their own indices start at
 	// `total`: cabi_realloc, then cm_post, then one adapter each.
 	var adapters []componentAdapter
-	reallocIdx, postIdx, firstAdapterIdx := -1, -1, -1
+	reallocIdx, freeIdx, postIdx, firstAdapterIdx := -1, -1, -1, -1
 	if opts.Component {
-		adapters = componentAdapters(patterns, opts.ExportNames)
+		// No function imports on this path, so the defined functions start at 0.
+		adapters = componentAdapters(patterns, opts.ExportNames, 0)
 		reallocIdx = total
-		postIdx = total + 1
-		firstAdapterIdx = total + 2
-		total += 2 + len(adapters)
+		freeIdx = total + 1
+		postIdx = total + 2
+		firstAdapterIdx = total + 3
+		total += 3 + len(adapters)
 	}
 
 	var out []byte
@@ -2409,7 +2411,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		}
 	}
 	if opts.Component {
-		fs = append(fs, byte(reallocTypeIdx), byte(postTypeIdx))
+		// cm_free and cm_post share the (i32)→() shape.
+		fs = append(fs, byte(reallocTypeIdx), byte(postTypeIdx), byte(postTypeIdx))
 		for _, a := range adapters {
 			switch a.kind {
 			case adapterMatch:
@@ -2426,7 +2429,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	{
 		var mem []byte
 		mem = append(mem, 0x01, 0x00)
-		mem = utils.AppendULEB128(mem, uint32(memPages))
+		declPages := memPages
+		if opts.Component {
+			// One page for the allocator's free-list heads, which sit at the
+			// static top and are written without a bounds check.
+			declPages++
+		}
+		mem = utils.AppendULEB128(mem, uint32(declPages))
 		out = appendSection(out, 5, mem)
 	}
 
@@ -2438,13 +2447,20 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	if globals == nil {
 		globals = &moduleGlobals{}
 	}
-	// The component allocator's bump pointer. Allocated here, so it lands in
-	// the section emitted immediately below, and initialised to the static top:
-	// everything under it is DFA tables written by data segments.
-	heapGlobal := uint32(0)
+	// The component allocator's two globals, allocated here so they land in the
+	// section emitted immediately below. See component.go for the layout.
+	//
+	// classHeadsBase is the static top — everything BELOW it is DFA tables
+	// written by data segments — and the heap proper starts past the free-list
+	// head array. The memory section above declares one extra page for
+	// components precisely so that array is in bounds before the first
+	// allocation grows anything.
+	heapGlobal, callListGlobal := uint32(0), uint32(0)
 	staticTop := memPages * 65536
+	classHeadsBase := staticTop
 	if opts.Component {
-		heapGlobal = globals.AllocInit(staticTop)
+		heapGlobal = globals.AllocInit(staticTop + classHeadsBytes)
+		callListGlobal = globals.AllocInit(0)
 	}
 	if moduleUsesFindFrom(patterns) || globals.Count() > 1 {
 		out = appendSection(out, 6, globals.Section())
@@ -2641,8 +2657,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		}
 	}
 	if opts.Component {
-		cs = appendCodeEntry(cs, buildComponentReallocBody(heapGlobal))
-		cs = appendCodeEntry(cs, buildComponentPostBody(heapGlobal, staticTop))
+		cs = appendCodeEntry(cs, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
+		cs = appendCodeEntry(cs, buildComponentFreeBody(classHeadsBase))
+		cs = appendCodeEntry(cs, buildComponentPostBody(callListGlobal, freeIdx))
 		for _, a := range adapters {
 			switch a.kind {
 			case adapterMatch:

@@ -105,6 +105,39 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			lang.compile(t, dir, path)
 		})
 	}
+
+	// The COMPONENT C stub, compiled the same way. It is a different generator
+	// with different bodies — lowered imports, result areas, a resource handle —
+	// and nothing else compiles it. A mis-numbered format verb in one of those
+	// bodies produced code that read `if (count > (unsigned)(const unsigned
+	// char *)input, ...)`: valid C, entirely wrong, and invisible to a
+	// source-text assertion.
+	//
+	// Rust has no counterpart arm here: its component stub needs the
+	// `wit-bindgen` crate and therefore cargo and a network or a populated
+	// cache, where compileRust needs only rustc. It is covered end to end by
+	// examples/wasmtime/rust/secrets instead.
+	t.Run("c-component", func(t *testing.T) {
+		if _, err := exec.LookPath("cc"); err != nil {
+			t.Skip("cc not on PATH; this check is a no-op here")
+		}
+		ccfg := cfg
+		ccfg.WasmFormat = "component"
+		ccfg.WitPackage = "demo"
+		ccfg.WasmFile = "demo.wasm"
+		ccfg.Output = "" // a component's merge target, not its memory mode
+		// `hints: [batch-find]` has no component form and is refused at load,
+		// so the overlapping set keeps its shape without it.
+		ccfg.Sets = append([]config.SetConfig(nil), cfg.Sets...)
+		ccfg.Sets[1].Hints = nil
+		dir := t.TempDir()
+		path := filepath.Join(dir, "stubs.h")
+		ccfg.StubFile = "stubs.h"
+		if err := cComponentStub(ccfg, path); err != nil {
+			t.Fatalf("generate C component stub: %v", err)
+		}
+		compileC(t, dir, path)
+	})
 }
 
 // run executes a command and fails the test with its combined output. The

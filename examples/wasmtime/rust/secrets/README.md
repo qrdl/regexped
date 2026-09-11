@@ -66,26 +66,29 @@ AWS key at 25..45: AKIAIOSFODNN7EXAMPLE
 
 ## Build pipeline
 
-Four steps, against the module format's four — `generate` and `compile` are the
-same, `wac plug` replaces `wasm-merge`, and there is no host/guest merge of
-memories because the component owns its own:
+Four steps, against the module format's four — and the COMMANDS are the same
+ones. `regexped merge` dispatches on `wasm_format`, so it shells out to `wac`
+here where it shells out to `wasm-merge` for a module; what differs is that there
+is no host/guest merge of memories, because the component owns its own:
 
 ```
 regexped compile   →  secrets.wasm (a component) + secrets.wit (its interface)
 regexped generate  →  stubs.rs
 cargo build --target wasm32-wasip2  →  the consumer, itself a component
-wac plug           →  composed.wasm, with the import satisfied
+regexped merge     →  composed.wasm, with the import satisfied (via wac)
 wasmtime run       →  execute
 ```
 
-Until `wac plug` runs, the guest has an unsatisfied import and will not
-instantiate. That is the component-model analogue of forgetting `regexped merge`.
+Until the merge step runs, the guest has an unsatisfied import and will not
+instantiate.
 
 ## What is worth reading in the source
 
-**`regexped.yaml`** — `wasm_format: component`, and the absence of `output:`
-(that is the wasm-merge target, and a component owns its memory). `stub_file:`
-IS set, unlike a WIT-only consumer that binds against the `.wit` itself.
+**`regexped.yaml`** — `wasm_format: component`, and an `output:` naming what
+`regexped merge` composes. The key means the same thing in both formats; what it
+does NOT do here is pick the memory mode, since a component always owns its own.
+`stub_file:` IS set, unlike a WIT-only consumer that binds against the `.wit`
+itself.
 
 **`Cargo.toml`** — one dependency, `wit-bindgen`. This is the one place build
 parity does not hold: a component consumer cannot declare its imports by hand,

@@ -53,12 +53,23 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 
 	// ---- component only, from here down.
 
-	// Sets have their own ABI — the caller-owned gate array, the opaque cursor,
-	// the bitmask/bitmap `_all` split — and the stubs, not the WASM, own the
-	// drive loop. Lifting that into a stateless component export is real work,
-	// deferred to a later phase; refuse it rather than emit half of it.
-	if len(cfg.Sets) > 0 {
-		return fmt.Errorf("sets are not supported for wasm_format: %s yet", formatComponent)
+	// Sets ARE supported as of phase 3.2. Their raw ABI — the caller-owned gate
+	// array, the bitmask/bitmap `_all` split — does not cross the component
+	// boundary: `_all` lifts to a list of ids, and `find` becomes a resource
+	// that owns the drive. One thing is still refused, below.
+	//
+	// `hints: [batch-find]` has no component form. Batching amortises host
+	// crossings for a caller that intends to consume everything, and it is
+	// declared on the SET, so it cannot be silently ignored the way an inert
+	// key can: the user asked for a second entry point that the component
+	// interface does not expose.
+	for _, s := range cfg.Sets {
+		for _, h := range s.Hints {
+			if h == "batch-find" {
+				return fmt.Errorf("set %q: hints: [batch-find] is not supported for wasm_format: %s — the component interface exposes one position per call through the find resource",
+					s.Name, formatComponent)
+			}
+		}
 	}
 
 	// The name is REQUIRED here: it becomes the WIT package, the world, and
@@ -83,7 +94,11 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 // validateStubTypeForFormat rejects the stub types that cannot be generated
 // for the configured output kind.
 //
-// TWO different messages, deliberately.
+// ONE message, not two. Until phase 2 there was a second one ending in "yet",
+// for types that were merely deferred; after it shipped there are none, and the
+// arm that produced it was unreachable — ResolveStubType returns exactly one of
+// the seven known types or an error, and all seven are named below. It was
+// removed rather than left as a message no config could produce.
 //
 // `rust` and `c` are SUPPORTED as of 2026-09-10 — see
 // generate/rust_component_stub.go and generate/c_component_stub.go. They reach
@@ -111,10 +126,9 @@ func validateStubTypeForFormat(cfg *BuildConfig, stubType string) error {
 	switch stubType {
 	case "wit", "rust", "c":
 		return nil
-	case "go", "as", "js", "ts":
-		return fmt.Errorf("stub type %s is not supported for wasm_format: %s", stubType, formatComponent)
 	default:
-		return fmt.Errorf("stub type %s is not supported for wasm_format: %s yet", stubType, formatComponent)
+		// go, as, js, ts — see above for why each is permanent.
+		return fmt.Errorf("stub type %s is not supported for wasm_format: %s", stubType, formatComponent)
 	}
 }
 

@@ -1,6 +1,6 @@
 # Using Regexped via Docker
 
-The regexped Docker image contains the `regexped` compiler, `wasm-merge` (from Binaryen) and `wasm-tools` (from the Bytecode Alliance). It is intended to be used as a command-line tool against a project directory mounted as a volume.
+The regexped Docker image contains the `regexped` compiler and the three external tools it shells out to: `wasm-merge` (from Binaryen), `wasm-tools` and `wac` (both from the Bytecode Alliance). It is intended to be used as a command-line tool against a project directory mounted as a volume.
 
 ## Official image
 
@@ -16,7 +16,7 @@ docker pull qrdl/regexped
 make docker
 ```
 
-This builds the `regexped` binary locally, puts `wasm-merge` and `wasm-tools` in the build context (downloading them if not already present), then builds the Docker image tagged `regexped`.
+This builds the `regexped` binary locally, puts `wasm-merge`, `wasm-tools` and `wac` in the build context (downloading them if not already present), then builds the Docker image tagged `regexped`.
 
 ## General usage
 
@@ -70,9 +70,17 @@ docker run --rm -v /path/to/your/project:/work -w /work --user $(id -u):$(id -g)
   merge --config=regexped.yaml --main=target/wasm32-wasip1/release/app.wasm regexps.wasm
 ```
 
-Merges the host main WASM with one or more regexp WASM modules into a single binary. The output path is taken from the `output` field in the config, or overridden with `--output`.
+Links the host main WASM with one or more regexp WASM artifacts into a single binary. The output path is taken from the `output` field in the config, or overridden with `--output`. The command dispatches on `wasm_format`: a module config is merged with `wasm-merge`, a component config is composed with `wac plug`.
 
-`wasm-merge` and `wasm-tools` are both available in `$PATH` inside the container — no extra configuration needed. The compiler shells out to `wasm-merge` for `regexped merge` and to `wasm-tools` for `wasm_format: component`, so an image missing either could only do part of the job.
+All three tools are available in `$PATH` inside the container — no extra configuration needed:
+
+| Tool | Used for |
+|---|---|
+| `wasm-merge` | `regexped merge` under `wasm_format: module` |
+| `wasm-tools` | `wasm_format: component` — wrapping the core module into a component |
+| `wac` | `regexped merge` under `wasm_format: component` |
+
+An image missing any of them could only do part of the job.
 
 ---
 

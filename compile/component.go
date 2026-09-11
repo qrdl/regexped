@@ -42,6 +42,9 @@ type asmOpts struct {
 	// export name for its adapter. Built by generate.witExportNames so the
 	// .wit and the core module cannot disagree about a single name.
 	ExportNames map[string]string
+	// SetNames is the same thing for `sets:`, keyed by set name. Empty for a
+	// config with no sets, which is every config before phase 3.2.
+	SetNames map[string]ComponentSetNames
 }
 
 // validate rejects the states the struct itself allows. A component with no
@@ -105,11 +108,17 @@ const (
 
 // componentAdapters lists the adapters for a module, in the order their
 // functions are appended.
-func componentAdapters(patterns []*compiledPattern, names map[string]string) []componentAdapter {
+// firstFuncIdx is where the module's DEFINED functions begin. It is 0 for the
+// single-pattern assembler, which imports no function, and the number of
+// imported canon builtins for a set-bearing component — where a `find` resource
+// imports `[resource-new]`. Getting it wrong does not fail to build: the
+// adapters then call a function one index off, and validation reports a stack
+// mismatch in the ADAPTER rather than naming the cause.
+func componentAdapters(patterns []*compiledPattern, names map[string]string, firstFuncIdx int) []componentAdapter {
 	var out []componentAdapter
 	baseIdx, _ := patternBaseIndices(patterns)
 	for i, p := range patterns {
-		base := baseIdx[i]
+		base := firstFuncIdx + baseIdx[i]
 		matchOff, _, _, captureOff, _ := p.offsets()
 		if p.matchExport != "" && matchOff >= 0 {
 			if name, ok := names[p.matchExport]; ok {
@@ -151,71 +160,194 @@ func patternBaseIndices(patterns []*compiledPattern) ([]int, int) {
 	return baseIdx, total
 }
 
+// ---------------------------------------------------------------------------
+// The component allocator.
+//
+// A component is not a module: some of what it allocates has to OUTLIVE the
+// call that allocated it. A `resource` holds its state, and the input it was
+// constructed from, until the handle is dropped — and a bump pointer cannot
+// serve that. Measured before this was written: 20,000 construct/drop cycles
+// over a 4 KB input leaked 82 MB with every handle correctly dropped, because
+// `[dtor]` had nowhere to give anything back to.
+//
+// So this is a real allocator: segregated free lists by power-of-two SIZE
+// CLASS, plus a per-call chain that the shared post-return walks.
+//
+//	block:  [ptr-8] class   [ptr-4] call-chain next / free-list next   [ptr] payload…
+//
+// Two header words, so the payload of an 8-aligned block is itself 8-aligned —
+// the widest alignment the canonical ABI asks of us (`list<u64>`; a `set-match`
+// record is 4, a string is 1). A wider request TRAPS rather than returning a
+// misaligned pointer the host would then read through.
+//
+// The word at ptr-4 carries the one piece of cleverness: while the block is
+// live it links the per-call chain, and while it is free it links its class's
+// free list. A block is never both, so the two uses cannot collide.
+//
+// WHY A PER-CALL CHAIN and not a saved mark. The canonical ABI lowers a call's
+// `list<u8>` argument through cabi_realloc BEFORE the exported function runs,
+// so a mark taken at function entry is already too late to cover it — the same
+// proof of concept measured that leak at 82 MB over 20,000 calls. A chain has
+// no ordering problem: an allocation joins it wherever it is made, and
+// post-return frees the lot.
+//
+// There is no coalescing and no splitting: a block is reused only for a request
+// of its own class. That is exactly what makes a repeated identical call FLAT
+// in memory — the property this allocator exists to have — and it bounds the
+// waste at 2x per allocation instead of trading it for unbounded fragmentation.
+
+const (
+	// classHeadsBytes is the free-list head array: one i32 head per size class,
+	// indexed by the class exponent directly. 32 entries covers every i32 size;
+	// the classes below minClassShift are unreachable and cost 16 bytes of
+	// address space.
+	//
+	// It lives in MEMORY rather than in globals because a WASM global cannot be
+	// indexed, and the class is a runtime value.
+	classHeadsBytes = 128
+
+	// minClassShift is the smallest class: 16 bytes, the two header words plus
+	// an 8-byte payload.
+	minClassShift = 4
+)
+
 // buildComponentReallocBody emits cabi_realloc:
 //
 //	(old_ptr, old_size, align, new_size) → ptr
 //
-// old_ptr and old_size are ignored: nothing here ever reallocates, because a
-// result area's size is known before it is allocated. The allocator is a bump
-// pointer that grows memory when it must and TRAPS if growth fails — returning
-// a bad pointer instead would corrupt the host's read of the result area.
-func buildComponentReallocBody(heapGlobal uint32) []byte {
+//	need  = new_size + 8
+//	class = max(ceil_log2(need), minClassShift)
+//	ptr   = pop classHeads[class], or carve 1<<class off the bump
+//	*(ptr-8) = class ; *(ptr-4) = callList ; callList = ptr
+//
+// old_ptr/old_size stay ignored. The canonical ABI only reallocates a list it
+// is growing, and nothing emitted here grows one: every result area's size is
+// known before it is allocated. That is a contract met by never needing it.
+func buildComponentReallocBody(heapGlobal, callListGlobal uint32, classHeadsBase int32) []byte {
 	const (
 		pAlign = 0x02 // param 2: align
 		pSize  = 0x03 // param 3: new_size
-		lP     = 0x04 // local: the aligned allocation start
+		lP     = 0x04 // local: the payload pointer
+		lClass = 0x05 // local: the size-class exponent
+		lHead  = 0x06 // local: &classHeads[class]
+		lEnd   = 0x07 // local: end of a freshly carved block
 	)
 	var b []byte
-	b = append(b, 0x01, 0x01, 0x7F) // 1 local group: one i32
+	b = append(b, 0x01, 0x04, 0x7F) // 1 local group: four i32
 
-	// p = (heap + align - 1) & -align
+	// An alignment wider than the header can promise traps.
+	b = append(b, 0x20, pAlign)
+	b = append(b, 0x41, 0x08)
+	b = append(b, 0x4B)       // i32.gt_u
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x00)       // unreachable
+	b = append(b, 0x0B)       // end if
+
+	// class = 32 - clz(new_size + 7), floored at minClassShift.
+	// new_size + 7 is (need - 1) with need = new_size + 8; a zero-size request
+	// gives 32-clz(7) = 3, which the floor lifts.
+	b = append(b, 0x41, 0x20) // i32.const 32
+	b = append(b, 0x20, pSize)
+	b = append(b, 0x41, 0x07)
+	b = append(b, 0x6A)         // i32.add
+	b = append(b, 0x67)         // i32.clz
+	b = append(b, 0x6B)         // i32.sub  -> 32 - clz
+	b = append(b, 0x22, lClass) // local.tee class
+	b = append(b, 0x41, minClassShift)
+	b = append(b, 0x49)       // i32.lt_u
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x41, minClassShift)
+	b = append(b, 0x21, lClass)
+	b = append(b, 0x0B) // end if
+
+	// head = &classHeads[class]
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, classHeadsBase)
+	b = append(b, 0x20, lClass)
+	b = append(b, 0x41, 0x02)
+	b = append(b, 0x74) // i32.shl
+	b = append(b, 0x6A) // i32.add
+	b = append(b, 0x21, lHead)
+
+	// p = *head
+	b = append(b, 0x20, lHead)
+	b = append(b, 0x28, 0x02, 0x00) // i32.load align=4 offset=0
+	b = append(b, 0x22, lP)         // local.tee p
+	b = append(b, 0x04, 0x40)       // if p != 0
+	// reuse: *head = *(p-4)
+	b = append(b, 0x20, lHead)
+	b = appendLoadMinus(b, lP, 4)
+	b = append(b, 0x36, 0x02, 0x00) // i32.store
+	b = append(b, 0x05)             // else — carve a fresh block
+	// end = heap + (1 << class)
 	b = append(b, 0x23)
 	b = utils.AppendULEB128(b, heapGlobal)
-	b = append(b, 0x20, pAlign)
-	b = append(b, 0x41, 0x01) // i32.const 1
-	b = append(b, 0x6B)       // i32.sub
-	b = append(b, 0x6A)       // i32.add
-	b = append(b, 0x41, 0x00) // i32.const 0
-	b = append(b, 0x20, pAlign)
-	b = append(b, 0x6B)     // i32.sub   -> -align
-	b = append(b, 0x71)     // i32.and
-	b = append(b, 0x21, lP) // local.set p
-
-	// if p + size > memory.size * 65536 { grow, trap on failure }
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x20, lClass)
+	b = append(b, 0x74) // i32.shl
+	b = append(b, 0x6A) // i32.add
+	b = append(b, 0x21, lEnd)
+	// grow if it does not fit; a failed grow traps rather than handing back a
+	// pointer the host would read through.
 	b = append(b, 0x02, 0x40) // block
-	b = appendHeapEnd(b, lP, pSize)
+	b = append(b, 0x20, lEnd)
 	b = appendMemBytes(b)
 	b = append(b, 0x4D)       // i32.le_u
-	b = append(b, 0x0D, 0x00) // br_if 0 — enough room already
-	b = appendHeapEnd(b, lP, pSize)
+	b = append(b, 0x0D, 0x00) // br_if 0
+	b = append(b, 0x20, lEnd)
 	b = appendMemBytes(b)
-	b = append(b, 0x6B)       // i32.sub — shortfall in bytes
+	b = append(b, 0x6B)       // i32.sub
 	b = append(b, 0x41, 0x10) // i32.const 16
-	b = append(b, 0x76)       // i32.shr_u — whole pages
-	b = append(b, 0x41, 0x01) // i32.const 1
-	b = append(b, 0x6A)       // i32.add   — round up
+	b = append(b, 0x76)       // i32.shr_u
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)       // i32.add — round up
 	b = append(b, 0x40, 0x00) // memory.grow 0
 	b = append(b, 0x41, 0x7F) // i32.const -1
 	b = append(b, 0x46)       // i32.eq
 	b = append(b, 0x04, 0x40) // if
-	b = append(b, 0x00)       // unreachable — out of memory
+	b = append(b, 0x00)       // unreachable
 	b = append(b, 0x0B)       // end if
 	b = append(b, 0x0B)       // end block
-
-	// heap = p + size; return p
-	b = appendHeapEnd(b, lP, pSize)
+	// p = heap + 8 ; heap = end
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, heapGlobal)
+	b = append(b, 0x41, 0x08)
+	b = append(b, 0x6A) // i32.add
+	b = append(b, 0x21, lP)
+	b = append(b, 0x20, lEnd)
 	b = append(b, 0x24)
 	b = utils.AppendULEB128(b, heapGlobal)
+	b = append(b, 0x0B) // end if/else
+
+	// *(p-8) = class
+	b = appendAddrMinus(b, lP, 8)
+	b = append(b, 0x20, lClass)
+	b = append(b, 0x36, 0x02, 0x00)
+	// *(p-4) = callList ; callList = p
+	b = appendAddrMinus(b, lP, 4)
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, callListGlobal)
+	b = append(b, 0x36, 0x02, 0x00)
+	b = append(b, 0x20, lP)
+	b = append(b, 0x24)
+	b = utils.AppendULEB128(b, callListGlobal)
+
 	b = append(b, 0x20, lP)
 	b = append(b, 0x0B) // end function
 	return b
 }
 
-// appendHeapEnd pushes p + size.
-func appendHeapEnd(b []byte, lP, pSize byte) []byte {
-	b = append(b, 0x20, lP)
-	b = append(b, 0x20, pSize)
-	return append(b, 0x6A) // i32.add
+// appendAddrMinus pushes (local - off), the address of a header word.
+func appendAddrMinus(b []byte, local byte, off byte) []byte {
+	b = append(b, 0x20, local)
+	b = append(b, 0x41, off)
+	return append(b, 0x6B) // i32.sub
+}
+
+// appendLoadMinus pushes *(local - off).
+func appendLoadMinus(b []byte, local byte, off byte) []byte {
+	b = appendAddrMinus(b, local, off)
+	return append(b, 0x28, 0x02, 0x00) // i32.load align=4 offset=0
 }
 
 // appendMemBytes pushes memory.size * 65536.
@@ -226,22 +358,83 @@ func appendMemBytes(b []byte) []byte {
 	return append(b, 0x6C) // i32.mul
 }
 
+// buildComponentFreeBody emits cm_free: (ptr i32) → ().
+//
+// It returns one block to its class's free list. A separate function rather than
+// code inlined in the post-return because a `resource`'s destructor frees the
+// same way — the state a handle owns is freed when the handle is dropped, not
+// when a call ends — and two copies of a free list's update is two places for it
+// to be wrong.
+//
+//	*(ptr-4) = classHeads[class] ; classHeads[class] = ptr
+func buildComponentFreeBody(classHeadsBase int32) []byte {
+	const (
+		pP    = 0x00 // param 0: the block
+		lHead = 0x01 // local: &classHeads[class]
+	)
+	var b []byte
+	b = append(b, 0x01, 0x01, 0x7F) // 1 local group: one i32
+
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, classHeadsBase)
+	b = appendLoadMinus(b, pP, 8)
+	b = append(b, 0x41, 0x02)
+	b = append(b, 0x74) // i32.shl
+	b = append(b, 0x6A) // i32.add
+	b = append(b, 0x21, lHead)
+
+	b = appendAddrMinus(b, pP, 4)
+	b = append(b, 0x20, lHead)
+	b = append(b, 0x28, 0x02, 0x00)
+	b = append(b, 0x36, 0x02, 0x00)
+	b = append(b, 0x20, lHead)
+	b = append(b, 0x20, pP)
+	b = append(b, 0x36, 0x02, 0x00)
+	b = append(b, 0x0B) // end function
+	return b
+}
+
 // buildComponentPostBody emits cm_post: (retptr i32) → ().
 //
-// It resets the bump pointer to the static top, which is the ONLY safe place
-// to reset it. Resetting at adapter entry would free the input list the host
-// lowered into guest memory immediately before the call.
+// It walks the per-call chain, frees every block on it, then empties the chain.
+// That releases the result area AND the arguments the host lowered before the
+// call — which a mark taken at function entry could not have covered, since the
+// lowering happens first.
 //
 // One function serves every export: a WASM function may be exported under any
 // number of names.
-func buildComponentPostBody(heapGlobal uint32, staticTop int32) []byte {
+func buildComponentPostBody(callListGlobal uint32, freeIdx int) []byte {
+	const (
+		lP    = 0x01 // local: the block being freed
+		lNext = 0x02 // local: the next block, read BEFORE the free clobbers that word
+	)
 	var b []byte
-	b = append(b, 0x00) // no locals
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, staticTop)
+	b = append(b, 0x01, 0x02, 0x7F) // 1 local group: two i32
+
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, callListGlobal)
+	b = append(b, 0x21, lP)
+
+	b = append(b, 0x02, 0x40) // block
+	b = append(b, 0x03, 0x40) // loop
+	b = append(b, 0x20, lP)
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x0D, 0x01) // br_if 1 — chain exhausted
+	b = appendLoadMinus(b, lP, 4)
+	b = append(b, 0x21, lNext)
+	b = append(b, 0x20, lP)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(freeIdx))
+	b = append(b, 0x20, lNext)
+	b = append(b, 0x21, lP)
+	b = append(b, 0x0C, 0x00) // br 0
+	b = append(b, 0x0B)       // end loop
+	b = append(b, 0x0B)       // end block
+
+	b = append(b, 0x41, 0x00)
 	b = append(b, 0x24)
-	b = utils.AppendULEB128(b, heapGlobal)
-	b = append(b, 0x0B)
+	b = utils.AppendULEB128(b, callListGlobal)
+	b = append(b, 0x0B) // end function
 	return b
 }
 

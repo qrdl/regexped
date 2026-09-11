@@ -44,23 +44,7 @@ func genRustSetInner(cfg config.BuildConfig) string {
 		return ""
 	}
 	var out strings.Builder
-	out.WriteString("/// A match reported by a set `find` iterator.\n" +
-		`#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SetMatch {
-    /// Pattern ids are i32: the FFI import already returns one, so this
-    /// removes a cast rather than adding one. start/end stay usize because
-    /// they index a slice.
-    pub pattern_id: i32,
-    pub start: usize,
-    pub end: usize,
-}
-
-impl SetMatch {
-    /// Returns the matched byte range as a Rust Range.
-    pub fn range(self) -> std::ops::Range<usize> { self.start..self.end }
-}
-
-`)
+	out.WriteString(rustSetMatchType())
 	for _, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
@@ -269,12 +253,21 @@ impl<'a> Iterator for %s<'a> {
 		}
 	}
 	if hasEmitNameMap(cfg) {
-		out.WriteString("pub fn pattern_name(id: i32) -> &'static str {\n    match id {\n")
-		for i, re := range cfg.Regexps {
-			fmt.Fprintf(&out, "        %d => %q,\n", i, re.Name)
-		}
-		out.WriteString("        _ => \"\",\n    }\n}\n\n")
+		out.WriteString(rustPatternNameFn(cfg))
 	}
+	return out.String()
+}
+
+// rustPatternNameFn is the `emit_name_map: true` helper, shared verbatim with
+// the component stub: it maps pattern ids to names and has nothing to do with
+// the output kind.
+func rustPatternNameFn(cfg config.BuildConfig) string {
+	var out strings.Builder
+	out.WriteString("pub fn pattern_name(id: i32) -> &'static str {\n    match id {\n")
+	for i, re := range cfg.Regexps {
+		fmt.Fprintf(&out, "        %d => %q,\n", i, re.Name)
+	}
+	out.WriteString("        _ => \"\",\n    }\n}\n\n")
 	return out.String()
 }
 
@@ -747,6 +740,32 @@ pub struct Span {
 
 impl Span {
     /// The matched byte range, ready to index a slice.
+    pub fn range(self) -> std::ops::Range<usize> { self.start..self.end }
+}
+
+`
+}
+
+// rustSetMatchType is the `SetMatch` a set `find` iterator yields.
+//
+// Shared VERBATIM with the component stub (rust_component_sets.go), which is
+// what makes the two output kinds' public set API identical by construction
+// rather than by two generators agreeing. A caller switching `wasm_format` must
+// not have to touch a field name or a cast.
+func rustSetMatchType() string {
+	return "/// A match reported by a set `find` iterator.\n" +
+		`#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetMatch {
+    /// Pattern ids are i32: the FFI import already returns one, so this
+    /// removes a cast rather than adding one. start/end stay usize because
+    /// they index a slice.
+    pub pattern_id: i32,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl SetMatch {
+    /// Returns the matched byte range as a Rust Range.
     pub fn range(self) -> std::ops::Range<usize> { self.start..self.end }
 }
 

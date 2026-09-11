@@ -52,6 +52,7 @@ examples/**/regexp.*s
 Cargo.lock
 wasm-merge
 wasm-tools
+wac
 examples/workers/.wrangler
 node_modules
 package-lock.json

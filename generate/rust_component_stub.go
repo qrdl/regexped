@@ -54,18 +54,20 @@ func rustComponentStub(cfg config.BuildConfig, out string) error {
 
 // genRustComponentStubFile renders the whole stub.
 func genRustComponentStubFile(cfg config.BuildConfig) (string, error) {
-	witText, _, _, err := ComponentArtifacts(cfg)
+	// ONE derivation, as in the C generator: the package, the world, the
+	// functions and the sets all come from witParts, which is where the naming
+	// rules are enforced. Everything below works from its output, so no line
+	// here carries an error branch for a failure it has already ruled out.
+	pkg, world, funcs, sets, err := witParts(cfg)
 	if err != nil {
 		return "", err
 	}
-	names, err := componentFuncNames(cfg)
+	witText := renderWit(cfg, pkg, world, funcs, sets)
+	inner, err := genRustComponentInner(cfg, snakeNames(funcs))
 	if err != nil {
 		return "", err
 	}
-	inner, err := genRustComponentInner(cfg, names)
-	if err != nil {
-		return "", err
-	}
+	inner += genRustComponentSetInner(cfg, sets)
 	if inner == "" {
 		return "", nil
 	}
@@ -74,25 +76,27 @@ func genRustComponentStubFile(cfg config.BuildConfig) (string, error) {
 	// `pub mod <rust_module>` — so `super::` reaches the generated modules whether
 	// the stub is included at the crate root or inside a `mod`. `crate::` only
 	// worked for the first case and failed to compile in the second.
-	mpath, err := matcherPath(cfg)
-	if err != nil {
-		return "", err
-	}
-	inner = fmt.Sprintf("use %s;\n\n", mpath) + inner
-
-	pkg, err := cfg.WitPackageName()
-	if err != nil {
-		return "", err
-	}
-	world, err := cfg.WitWorldName()
-	if err != nil {
-		return "", err
-	}
+	inner = bindingPaths(pkg, len(funcs) > 0, len(sets) > 0) + inner
 	// Same placement rule as the canonical export names: the version follows the
 	// INTERFACE name. `regexped:secrets@2.3.0/matcher` does not resolve.
-	iface := "regexped:" + pkg + "/matcher"
+	//
+	// A config can declare patterns, sets, or both, and the consumer world
+	// imports only the interfaces that exist — importing an interface the WIT
+	// document does not define is a macro error.
+	var imports []string
+	ver := ""
 	if cfg.WitVersion != "" {
-		iface += "@" + cfg.WitVersion
+		ver = "@" + cfg.WitVersion
+	}
+	if len(funcs) > 0 {
+		imports = append(imports, "regexped:"+pkg+"/matcher"+ver)
+	}
+	if len(sets) > 0 {
+		imports = append(imports, "regexped:"+pkg+"/sets"+ver)
+	}
+	var importLines strings.Builder
+	for _, i := range imports {
+		fmt.Fprintf(&importLines, "    import %s;\n", i)
 	}
 
 	var b strings.Builder
@@ -106,11 +110,13 @@ func genRustComponentStubFile(cfg config.BuildConfig) (string, error) {
 //     [dependencies]
 //     %s
 //
-// Build the consumer as a component and compose it with the regexp component:
+// Build the consumer as a component and compose it with the regexp component.
+// "regexped merge" is the SAME command a module build uses — it dispatches on
+// wasm_format and shells out to wac here, to wasm-merge there:
 //
 //     cargo build --release --target wasm32-wasip2
-//     wac plug <your>.wasm --plug %s -o composed.wasm
-//     wasmtime run composed.wasm
+//     regexped merge --config=<config>.yaml --main=<your>.wasm %s
+//     wasmtime run <output from the config, or --output>
 //
 `, witBindgenReq, filepath.Base(cfg.WasmFile))
 
@@ -121,8 +127,7 @@ func genRustComponentStubFile(cfg config.BuildConfig) (string, error) {
 package regexped-consumer:%s;
 
 world %s {
-    import %s;
-}
+%s}
 
 %s
     "#,
@@ -132,7 +137,7 @@ world %s {
     generate_all,
 });
 
-`, pkg, consumerWorld(world), iface, nestPackage(witText), consumerWorld(world))
+`, pkg, consumerWorld(world), importLines.String(), nestPackage(witText), consumerWorld(world))
 
 	b.WriteString(wrapRustModule(rustErrorPreamble()+inner, cfg.RustModuleName()))
 	return b.String(), nil
@@ -194,26 +199,6 @@ func nestPackage(witText string) string {
 	return b.String()
 }
 
-// componentFuncNames maps each configured func name to the snake_case Rust name
-// wit-bindgen gives it. The macro lowercases the kebab identifier and joins with
-// underscores, so `find-github-token` becomes `find_github_token`.
-func componentFuncNames(cfg config.BuildConfig) (map[string]string, error) {
-	out := map[string]string{}
-	for _, re := range cfg.Regexps {
-		for _, n := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc} {
-			if n == "" {
-				continue
-			}
-			kebab, err := config.KebabIdent(n)
-			if err != nil {
-				return nil, err
-			}
-			out[n] = strings.ReplaceAll(kebab, "-", "_")
-		}
-	}
-	return out, nil
-}
-
 // genRustComponentInner renders the per-entry wrappers, in config order.
 func genRustComponentInner(cfg config.BuildConfig, names map[string]string) (string, error) {
 	var b strings.Builder
@@ -236,18 +221,26 @@ func genRustComponentInner(cfg config.BuildConfig, names map[string]string) (str
 	return b.String(), nil
 }
 
-// matcherPath is how the wrapper reaches the macro's generated bindings.
+// bindingPaths are the `use` lines that reach the macro's generated bindings.
 //
-// `super::` makes the stub position-independent: the macro expands at the include
-// site and the wrapper is one level below it, so the relative path holds whether
-// the file is included at the crate root or inside a `mod`. An earlier `crate::`
-// compiled only in the first case.
-func matcherPath(cfg config.BuildConfig) (string, error) {
-	pkg, err := cfg.WitPackageName()
-	if err != nil {
-		return "", err
+// `super::`, not `crate::`, makes the stub position-independent: the macro
+// expands at the include site and the wrapper is one level below it, so the
+// relative path holds whether the file is included at the crate root or inside a
+// `mod`. An earlier `crate::` compiled only in the first case.
+//
+// A `use` for an interface the document does not define does not compile, so the
+// two flags are passed in rather than guessed here.
+func bindingPaths(pkg string, patterns, sets bool) string {
+	base := "super::regexped::" + strings.ReplaceAll(pkg, "-", "_") + "::"
+	var b strings.Builder
+	if patterns {
+		fmt.Fprintf(&b, "use %smatcher;\n", base)
 	}
-	return "super::regexped::" + strings.ReplaceAll(pkg, "-", "_") + "::matcher", nil
+	if sets {
+		fmt.Fprintf(&b, "use %ssets;\n", base)
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 func genRustComponentMatch(funcName, witFunc string) string {

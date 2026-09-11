@@ -10,7 +10,7 @@ routes (`make`, `make component-run`, `make wasip2-run`).
 |---|---|---|---|---|---|
 | IPv6 URL validation | wasmtime | Rust | individual | module | [wasmtime/rust/url-ipv6](wasmtime/rust/url-ipv6) |
 | Credential detection | wasmtime | Rust | individual | **component 🧩** | [wasmtime/rust/secrets](wasmtime/rust/secrets) |
-| Multi-pattern secret scanning (native host) | native Rust + wasmtime crate | Rust | set | module | [wasmtime/rust/secret-scanner](wasmtime/rust/secret-scanner) |
+| Multi-pattern secret scanning (native host) 🧩 | native Rust + wasmtime crate | Rust | set | **module AND component** | [wasmtime/rust/secret-scanner](wasmtime/rust/secret-scanner) |
 | URL parsing into components | wasmtime | C | individual | **module + component 🧩** | [wasmtime/c/url-parts](wasmtime/c/url-parts) |
 | CSV parsing and validation | wasmtime | Go | individual | module | [wasmtime/go/csv](wasmtime/go/csv) |
 | SQL injection detection | wasmtime | Go | individual | module | [wasmtime/go/sql-injection](wasmtime/go/sql-injection) |
@@ -34,17 +34,25 @@ WASM (wasip1 or wasm32), the regexp module is compiled separately, and
 final binary runs entirely inside a WASM runtime (`wasmtime`, a browser, or a
 CDN worker).
 
-**2. Native host over the core ABI** — `wasmtime/rust/secret-scanner`. The host
-is a native Rust binary that loads a standalone regexp `.wasm` at runtime using
-the `wasmtime` crate. No merge step, no WASI, no generated stub — the host talks
-directly to the WASM ABI. Use this when embedding regexped into a native server,
-CLI tool, or daemon.
+**2. Native host** — `wasmtime/rust/secret-scanner`. The host is a native Rust
+binary that loads regexped's output at runtime using the `wasmtime` crate. No
+merge step, no WASI, and no generated stub — a stub is for a guest compiled to
+WASM. Use this when embedding regexped into a native server, CLI tool, or daemon,
+and when you want patterns to be a file you can replace rather than something
+linked into the binary.
+
+That example builds BOTH output kinds from the same patterns: `make` loads a
+module and drives the raw ABI by hand — memory layout, the gate array, 12-byte
+tuples — while `make component-run` loads a component and drives a `resource`
+through `bindgen!`-generated bindings, with none of that. `make compare` diffs
+the two. It is also the only example that uses a **set** through a component.
 
 **3. Component Model 🧩** — `wasmtime/rust/secrets`. `wasm_format: component`
 produces a component plus a sibling `.wit`. The consumer is itself a component
-that imports that interface, and `wac plug` composes the two — the analogue of
-`wasm-merge` for the module format. No linear-memory bookkeeping; each component
-owns its own.
+that imports that interface, and `regexped merge` composes the two — the SAME
+command the module format uses, which dispatches on `wasm_format` and shells out
+to `wac` here where it shells out to `wasm-merge` there. No linear-memory
+bookkeeping; each component owns its own.
 
 That example uses a **generated Rust stub**, and its `main.rs` differs from the
 module-format version by the module name and one comment: switching

@@ -98,6 +98,22 @@ valid identifier in all six stub languages (see
 >   That is a parameter, not a name.
 > - **`find_any`, `find_all`, `batch_size`** were retired earlier and stay so.
 
+### Sets under `wasm_format: component`
+
+Everything below describes the module format's ABI and stubs. A component build
+supports every capability, with the same generated API in Rust and C — the
+differences are in the interface, not in what you call:
+
+| | module | component |
+|---|---|---|
+| `match_all` / `scan_all` | an i64 bitmask, or a count plus a caller-owned bitmap | `list<u32>` of pattern ids, ascending |
+| `find` | a caller-owned scanner plus the gate array below | a `resource`: the state lives inside the regexp component behind a handle |
+| `<find>_free` in C | a no-op | MANDATORY — it drops the handle |
+| `hints: [batch-find]` | a second entry point | refused at load |
+| `overlapping: true` answer cache | JS/TS stubs reserve one | none, as for a C or Rust module consumer |
+
+See [component.md](component.md#sets).
+
 ### What "anchored" means here
 
 `match_any` and `match_all` require **full consumption**: the pattern
@@ -148,7 +164,14 @@ rx_secret_scanner_scanner_t sc;
 if (scan_secrets_init(&sc, input, len, 0) != 0) { /* RX_ERR_* */ }
 for (int n; (n = scan_secrets(&sc, buf, SECRET_SCANNER_PATTERN_COUNT)) > 0; )
     for (int i = 0; i < n; i++) { /* buf[i] */ }
+scan_secrets_free(&sc);
 ```
+
+That last call is a no-op for `wasm_format: module` — the scanner is
+caller-owned and holds nothing that needs releasing — and MANDATORY for
+`wasm_format: component`, where the scan's state lives inside the regexp
+component behind a handle. It is emitted in both, so one source compiles against
+either.
 
 The scanner holds the INPUT as well as the position: the input never changes
 during a scan while the position changes every step, so remembering the

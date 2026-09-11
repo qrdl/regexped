@@ -16,6 +16,7 @@ import (
 type BuildConfig struct {
 	WasmMerge    string `yaml:"wasm_merge"`    // optional; defaults to "wasm-merge" in $PATH
 	WasmTools    string `yaml:"wasm_tools"`    // optional; defaults to $WASM_TOOLS, then "wasm-tools" in $PATH (used by wasm_format: component)
+	Wac          string `yaml:"wac"`           // optional; defaults to $WAC, then "wac" in $PATH (the merge tool for wasm_format: component)
 	Output       string `yaml:"output"`        // output path for merge command; overridable with -o
 	WasmFile     string `yaml:"wasm_file"`     // output WASM file for compile command; overridable with -o
 	ImportModule string `yaml:"import_module"` // WASM import module name used by wasm-merge and Rust FFI
