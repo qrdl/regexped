@@ -2,7 +2,10 @@
 
 Regexped generates a pair of C stub files (`.h` and `.c`) that declare and implement
 wrapper functions for compiled WASM regexp modules. No libc or sysroot is required;
-the stubs compile cleanly with `--target=wasm32-wasi -nostdlib`.
+the stubs compile cleanly with `--target=wasm32-wasi -nostdlib`. One optional
+feature uses an allocator when one is present — see
+[The overlapping answer cache](#the-overlapping-answer-cache) — and is disabled
+automatically when it is not.
 
 > **Component format:** `stub_type: c` works under `wasm_format: component` too, and the **API is identical** — the same `rx_match_t`, `rx_group_t`, caller-owned iterators and group-index constants — because the header is produced by the same generator. What differs is the `.c`: canonical-ABI imports with a caller-supplied return area instead of a packed `long long`, plus a `cabi_realloc` when a pattern exports groups (a returned list is allocated in *your* memory). A `wit/` directory is generated beside the stub for `wasm-tools component embed`. See [component.md](component.md).
 
@@ -343,9 +346,11 @@ receives a ready-made list of ids rather than scanning a bitmask, and the scanne
 holds a handle to a scan living inside the regexp component. See
 [component.md](component.md#sets).
 
-**`<find>_free` is a no-op in this format, and mandatory in the other.** This
-scanner is caller-owned, by value, and holds only a borrowed input pointer and
-the gate array inline, so abandoning it leaks nothing. Under `wasm_format:
+**`<find>_free` is mandatory in the component format, and here it depends.** On
+an `overlapping: true` set built with a sysroot the scanner OWNS a heap region
+and abandoning one leaks it; otherwise this scanner is caller-owned, by value,
+and holds only a borrowed input pointer and the gate array inline, so abandoning
+it leaks nothing. Call it either way. Under `wasm_format:
 component` the scan's state lives inside the regexp component behind a handle,
 and dropping that handle is what releases it — so the call is required there.
 It is emitted in both formats, and calling it costs nothing here, so the same
@@ -426,7 +431,9 @@ surface.
 - The `#define <FUNC_UPPER>_GROUPS` constant gives the total number of groups
   including group 0 (full match). Use it to size loops or slot arrays.
 - No heap allocation or libc is required. The stubs are self-contained and suitable
-  for embedded WASM environments.
+  for embedded WASM environments. The one exception is an `overlapping: true`
+  set's answer cache, which is enabled only when `<stdlib.h>` is available and
+  declined otherwise.
 - The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for C: it's effective for the JS and TS generators only. Setting it does not change the generated header or its performance.
 
 ---
@@ -450,3 +457,34 @@ C has no unwinding, so the sentinel is returned to the caller instead. The heade
 Check for it wherever you currently check for `-1`: a plain `< 0` test silently treats overflow as "no match", which is the exact failure the sentinel exists to prevent. The iterators make that harder to get wrong — a `while (… == 1)` loop leaves the failing status in the variable for you to test afterwards.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
+
+## The overlapping answer cache
+
+An `overlapping: true` set reports every start position, so a pattern whose
+automaton never dies walks to the end of the input from each one and the drive
+is quadratic. The engine can avoid that given a scratch region, and on every
+other language's stub it simply takes one.
+
+C is different, because it is the only target whose allocator lives outside the
+toolchain's own output: Rust, Go and AssemblyScript ship runtimes that allocate
+and JavaScript has an engine, while a freestanding `wasm32` build of this header
+has nothing. So the feature is DETECTED rather than demanded:
+
+```c
+#if __has_include(<stdlib.h>)   /* what the generated header tests */
+```
+
+| your build | behaviour |
+|---|---|
+| with a sysroot (`wasi-sdk`, a host compiler) | `<find>_init` reserves the cache, an overlapping drive is **linear**, and `<find>_free` releases it |
+| freestanding (`-nostdlib`, no sysroot) | no cache, the drive **walks** — same answers, quadratic |
+
+Define `RX_SET_CACHE` yourself to force it either way.
+
+**Your build decides this, not your source.** The same file, compiled two ways,
+gives identical answers at different speeds. If an overlapping scan is slower
+than you expect, check which of the two you got.
+
+Re-initialising a scanner frees what it held and starts again, so
+"re-initialising restarts a scan" holds whether or not a cache is in play. A
+second `<find>_free` is a no-op.

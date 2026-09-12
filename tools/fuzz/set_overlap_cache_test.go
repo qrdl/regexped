@@ -265,7 +265,7 @@ func driveOverlapCacheEngage(t *testing.T, pats []string, input string, offset, 
 	t.Helper()
 	// Generous scratch: one tuple per pattern per start, which is the worst
 	// case the sweep can produce.
-	scratchLen := int32(config.SetOverlapCacheBytes(len(input), len(pats)))
+	scratchLen, _ := overlapCacheFor(input, pats)
 	return driveOverlapCacheScratch(t, pats, input, offset, outCap, useCache, scratchLen, want)
 }
 
@@ -332,7 +332,8 @@ func driveOverlapCacheScratch(t *testing.T, pats []string, input string, offset,
 	// The DESCRIPTOR the export takes in place of a bare gate pointer: it
 	// carries the gate array and the answer cache, so what used to be two
 	// trailing arguments is now two fields (internal/abi).
-	descPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), passScratch, passLen)
+	_, stride := overlapCacheFor(input, pats)
+	descPtr := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), passScratch, passLen, stride)
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))
 	countMask := int64(1)<<countBits - 1

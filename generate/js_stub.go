@@ -276,19 +276,50 @@ export function %s(input, from = 0) {
 				if s.Overlapping {
 					batchGateRegion = (batchGateRegion + 7) &^ 7
 				}
-				if s.Overlapping {
-					cachePre = fmt.Sprintf(`    // Twelve bytes per tuple, and the worst case really is one tuple per
-    // pattern per start: a pattern that never dies matches from nearly
-    // every position, which is the case this exists for. Past the ceiling
-    // the engine is offered nothing and walks position by position, which
-    // is what it did before this existed.
-    const cacheNeeded = %d + (_inCap(input) + 1) * %s * 12;
-    const cacheBytes = cacheNeeded <= %d ? cacheNeeded : 0;
-`, config.SetOverlapCacheHeaderBytes, konst, config.SetOverlapCacheMaxBytes)
+				if sh := overlapCacheShapeFor(s, cfg); s.Overlapping && sh.Eligible {
+					// The CHECKPOINTED answer cache. Its size depends on the
+					// sweep column's width, which comes from the compiler (the
+					// set was recompiled to learn it) and is baked in here as a
+					// constant; everything else is arithmetic on the input
+					// length, which only exists at call time.
+					//
+					// Below the budget the stride is the WHOLE SPAN, which is a
+					// single block: one sweep, nothing re-swept, and the same
+					// behaviour and very nearly the same bytes as the
+					// whole-drive cache this replaced. Above it the stride
+					// falls to the square-root optimum and the region becomes
+					// sqrt-sized, at the cost of sweeping each position twice.
+					//
+					// This arithmetic MUST match config.SetOverlapCheckpoint*
+					// exactly: the sweep validates the stride it is handed and
+					// reports a header it cannot make sense of.
+					cachePre = fmt.Sprintf(`    const _m = _inCap(input) + 1;
+    const _row = 4 + 4 * %[2]d;
+    const _cell = %[1]d * 4 + 4;
+    const _single = %[3]d + _cell + 4 + _m * _row;
+    let _k;
+    if (_single > 0 && _single <= %[4]d) {
+        _k = _m;
+    } else {
+        _k = Math.floor(Math.sqrt(_m * %[1]d * 4 / _row));
+        if (_k < 16) _k = 16;
+        if (_k > _m) _k = _m;
+    }
+    const _nb = Math.ceil(_m / _k);
+    const cacheNeeded = %[3]d + _nb * _cell + 4 + _k * _row;
+    const cacheBytes = cacheNeeded <= %[4]d ? cacheNeeded : 0;
+`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes)
 					cacheReserve = " + cacheBytes"
+					// The header is zeroed and then the STRIDE written into it:
+					// it is the one field the caller owns, because the caller
+					// is what sized the allocation from it.
 					cachePost = fmt.Sprintf(`    const cacheBase = cacheBytes > 0 ? gateBase + %d : 0;
-    if (cacheBase !== 0) new Uint32Array(_mem.buffer, cacheBase, %d).fill(0);
-`, batchGateRegion, config.SetOverlapCacheHeaderBytes/4)
+    if (cacheBase !== 0) {
+        const _hdr = new Uint32Array(_mem.buffer, cacheBase, %d);
+        _hdr.fill(0);
+        _hdr[4] = _k;
+    }
+`, batchGateRegion, config.SetOverlapCheckpointHeaderBytes/4)
 					cacheArgs = "cacheBase, cacheBytes"
 				}
 				// The descriptor, written last: it carries the cache pointer,

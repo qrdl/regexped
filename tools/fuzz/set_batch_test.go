@@ -89,6 +89,8 @@ type batchRunner struct {
 	outPtr   int32
 	cachePtr int32
 	cacheLen int32
+	// The checkpointed cache's caller-written stride (plans §9.2 decision 2).
+	cacheStride int32
 }
 
 func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool) *batchRunner {
@@ -130,7 +132,7 @@ func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool)
 	// asks. Sized at the sweep's own worst case so "too small" is never the
 	// reason a drive declines — that path has its own test.
 	cachePtr := outPtr + pageSize
-	cacheLen := int32(config.SetOverlapCacheBytes(len(input), len(pats)))
+	cacheLen, cacheStride := overlapCacheFor(input, pats)
 	needed := uint64((int64(cachePtr) + int64(cacheLen) + 2*pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -146,7 +148,7 @@ func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool)
 		store: store, inst: inst, mem: mem, release: release, fn: fn,
 		pats: pats, input: input,
 		inBase: inBase, gatePtr: gatePtr, outPtr: outPtr,
-		cachePtr: cachePtr, cacheLen: cacheLen,
+		cachePtr: cachePtr, cacheLen: cacheLen, cacheStride: cacheStride,
 	}
 }
 
@@ -174,7 +176,7 @@ func (r *batchRunner) drive(t *testing.T, outCap int32, withCache bool) []setMat
 	// The scratch descriptor the export takes in place of the bare gate
 	// pointer: it carries the gate array AND the cache, so it is written after
 	// the cache has been decided (internal/abi).
-	scratchPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), passCache, passCacheLen)
+	scratchPtr := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), passCache, passCacheLen, r.cacheStride)
 	runtime.KeepAlive(store)
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))

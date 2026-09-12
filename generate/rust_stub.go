@@ -202,8 +202,56 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 			// a stale address. Four stores against a call that walks the input.
 			gateField += "    scratch: [u32; 4],\n"
 			gateInit += " scratch: [0u32; 4],"
+			cacheField, cacheInit := "", ""
+			cacheArgs := "0, 0"
+			if sh := overlapCacheShapeFor(s, cfg); sh.Eligible {
+				// The CHECKPOINTED answer cache. Without one an overlapping
+				// drive is quadratic — every start position walks to its own
+				// extent — and `find` reads a cache exactly as the batching
+				// entry does, so there is no reason for this iterator to
+				// decline it.
+				//
+				// Owned by the iterator and dropped with it, which is what
+				// `init`/`free` are in a language that has both. It is sized
+				// ONCE at construction because the input length is fixed for
+				// the life of a scan; the stride is written into the header
+				// here, and it is the one field the caller owns, because the
+				// caller is what sized the allocation from it.
+				//
+				// This arithmetic MUST match config.SetOverlapCheckpoint*: the
+				// sweep validates the stride it is handed and reports a header
+				// it cannot make sense of.
+				cacheField = "    cache: Vec<u32>,\n"
+				cacheInit = fmt.Sprintf(` cache: {
+            let m = (input.len() + 1) as u64;
+            let row = (4 + 4 * %[2]d) as u64;
+            let cell = (%[1]d * 4 + 4) as u64;
+            let single = %[3]d + cell + 4 + m * row;
+            let k = if single <= %[4]d {
+                m
+            } else {
+                let mut k = ((m as f64) * (%[1]d as f64) * 4.0 / (row as f64)).sqrt() as u64;
+                if k < 16 { k = 16; }
+                if k > m { k = m; }
+                k
+            };
+            let nb = m.div_ceil(k);
+            let bytes = %[3]d + nb * cell + 4 + k * row;
+            if bytes > %[4]d {
+                Vec::new()
+            } else {
+                let mut v = vec![0u32; (bytes as usize).div_ceil(4)];
+                v[4] = k as u32;
+                v
+            }
+        },`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes)
+				cacheArgs = "if self.cache.is_empty() { 0 } else { self.cache.as_mut_ptr() as u32 }, " +
+					"(self.cache.len() * 4) as u32"
+			}
+			gateField += cacheField
+			gateInit += cacheInit
 			gateArg := "{ self.scratch = [" + fmt.Sprint(abi.FindScratchMagic) +
-				"u32, self.gates.as_mut_ptr() as u32, 0, 0]; self.scratch.as_mut_ptr() }, "
+				"u32, self.gates.as_mut_ptr() as u32, " + cacheArgs + "]; self.scratch.as_mut_ptr() }, "
 			gateDoc := " and a zeroed gate array"
 			fmt.Fprintf(&out, `/// Iterator over the set's matches. It owns a reusable tuple buffer%s,
 /// refills at each matching position and yields that position's matches one

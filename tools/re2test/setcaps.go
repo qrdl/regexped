@@ -26,6 +26,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -704,12 +705,17 @@ type setRunner struct {
 	// stubs use — declining is legal and costs speed, not correctness.
 	cachePtr int32
 	cacheLen int32
-	npat     int    // patterns IN THE SET — sizes the tuple buffer and the cursor's k
-	idSpace  int    // largest reportable global id + 1 — sizes gates and bitmaps
-	inSet    []bool // by chunk index: is this pattern a member of the set?
-	outCap   int32  // = npat: the exact worst case for one position
-	bmpLen   int32
-	wide     bool // idSpace > 64: the `_all` capabilities take an out_ptr
+	// cacheStride is the checkpointed cache's ONE caller-written header field.
+	// A generated `init` computes it from the same config helper that sized the
+	// allocation; this harness is that init's stand-in, and leaving it zero is
+	// a malformed header the sweep reports rather than guesses at.
+	cacheStride int32
+	npat        int    // patterns IN THE SET — sizes the tuple buffer and the cursor's k
+	idSpace     int    // largest reportable global id + 1 — sizes gates and bitmaps
+	inSet       []bool // by chunk index: is this pattern a member of the set?
+	outCap      int32  // = npat: the exact worst case for one position
+	bmpLen      int32
+	wide        bool // idSpace > 64: the `_all` capabilities take an out_ptr
 
 	// Patterns this compile excluded; see the dropHandler comment.
 	droppedFind     map[int]bool
@@ -799,9 +805,10 @@ func (r *setRunner) offerCache(cachePtr, cacheLen int32) {
 // declined.
 func (r *setRunner) startCacheDrive() {
 	buf := r.buf()
-	for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
+	for i := int32(0); i < config.SetOverlapCheckpointHeaderBytes; i++ {
 		buf[r.cachePtr+i] = 0
 	}
+	binary.LittleEndian.PutUint32(buf[r.cachePtr+16:], uint32(r.cacheStride))
 	r.offerCache(r.cachePtr, r.cacheLen)
 }
 
@@ -1094,10 +1101,19 @@ func newSetRunner(
 	bmpLen := int32((idSpace + 7) / 8)
 	bmpPtr := scratchPtr + abi.FindScratchBytes
 	cachePtr := (bmpPtr + bmpLen + 15) &^ 7
-	cacheLen := int32(0)
-	if want := config.SetOverlapCacheBytes(maxLen, patternCount); want <= config.SetOverlapCacheMaxBytes {
-		cacheLen = int32(want)
-	} else {
+	// The CHECKPOINTED cache. Its size needs the sweep column's width, which
+	// comes from the compiler: the set is recompiled to learn it, which is the
+	// route a stub generator takes too. A set that gets no sweep declines, and
+	// the drive walks.
+	cacheLen, cacheStride := int32(0), int32(0)
+	if sh := overlapShapeForSet(cfg); sh.Eligible {
+		want := config.SetOverlapCheckpointBytes(maxLen, sh.Cells, sh.Patterns, true)
+		if want <= config.SetOverlapCacheMaxBytes {
+			cacheLen = int32(want)
+			cacheStride = int32(config.SetOverlapCheckpointStride(maxLen, sh.Cells, sh.Patterns, true))
+		}
+	}
+	if cacheLen == 0 {
 		cachePtr = 0
 	}
 	// The top is the LAYOUT's true end, not the cache's. Deriving it from
@@ -1122,7 +1138,7 @@ func newSetRunner(
 	return &setRunner{
 		store: store, inst: inst, mem: mem, wd: wd, release: release,
 		inBase: inBase, outBase: outBase, gatePtr: gatePtr, scratchPtr: scratchPtr, bmpPtr: bmpPtr,
-		cachePtr: cachePtr, cacheLen: cacheLen,
+		cachePtr: cachePtr, cacheLen: cacheLen, cacheStride: cacheStride,
 		npat: patternCount, idSpace: idSpace, inSet: inSet,
 		outCap: int32(patternCount), bmpLen: bmpLen,
 		wide:        wideAll,
@@ -2120,4 +2136,27 @@ func setChunksOf(pats []string, orig []int, cols [][]string) []setChunk {
 		out = append(out, c)
 	}
 	return out
+}
+
+// overlapShapeForSet reports the sweep column an overlapping set compiles to.
+//
+// It recompiles, which is what a stub generator does for the same reason: the
+// column width falls out of the DFA construction and nothing in the config
+// implies it. The cost is one extra set compilation per runner, against a
+// corpus run that compiles thousands — and unlike the wide-`_all` question just
+// above, there is no diagnostics field carrying this number, so there is
+// nothing already in hand to read.
+func overlapShapeForSet(cfg config.BuildConfig) compile.OverlapCacheShape {
+	if len(cfg.Sets) == 0 {
+		return compile.OverlapCacheShape{}
+	}
+	s := cfg.Sets[0]
+	if s.Find == "" || !s.Overlapping {
+		return compile.OverlapCacheShape{}
+	}
+	sh, err := compile.SetOverlapCacheShape(s, cfg)
+	if err != nil {
+		return compile.OverlapCacheShape{}
+	}
+	return sh
 }

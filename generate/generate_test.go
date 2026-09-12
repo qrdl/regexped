@@ -459,7 +459,7 @@ func TestGenCGroupsStubParts(t *testing.T) {
 
 func TestGenCStubFilesFind(t *testing.T) {
 	entries := []config.RegexEntry{{FindFunc: "tok_find"}}
-	h, c, err := genCStubFiles(entries, "mymod", "stub.h")
+	h, c, err := genCStubFiles(entries, "mymod", "stub.h", false)
 	if err != nil {
 		t.Fatalf("genCStubFiles find: %v", err)
 	}
@@ -477,7 +477,7 @@ func TestGenCStubFilesFind(t *testing.T) {
 
 func TestGenCStubFilesSingle(t *testing.T) {
 	entries := []config.RegexEntry{{MatchFunc: "url_match"}}
-	h, c, err := genCStubFiles(entries, "mymod", "stub.h")
+	h, c, err := genCStubFiles(entries, "mymod", "stub.h", false)
 	if err != nil {
 		t.Fatalf("genCStubFiles: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestGenCStubFilesNamedGroupIndices(t *testing.T) {
 	entries := []config.RegexEntry{
 		{GroupsFunc: "url_groups", Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
 	}
-	h, _, err := genCStubFiles(entries, "mymod", "stub.h")
+	h, _, err := genCStubFiles(entries, "mymod", "stub.h", false)
 	if err != nil {
 		t.Fatalf("genCStubFiles: %v", err)
 	}

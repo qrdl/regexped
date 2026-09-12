@@ -258,6 +258,14 @@ type compiledSet struct {
 	// sweep.
 	overlapDPColOff int32
 
+	// Lever C: the projection, computed once, plus the addresses of the tables
+	// it needs — projTab (pattern x state -> cell byte offset) and a one-byte
+	// per state successor scratch the per-position step fills before updating.
+	overlapProj       *overlapProj
+	overlapProjDone   bool
+	overlapProjTabOff int32
+	overlapSuccOff    int32
+
 	// litToBuckets[litID] = list of bucket indices sharing this literal.
 	// Multiple buckets can share a literal when bin-packing splits large groups.
 	litToBuckets [][]int
@@ -436,7 +444,12 @@ func (cs *compiledSet) hiddenFnCount() int {
 	// buckets) and phase 2 (the union walk over the fallback patterns).
 	n += 2 * len(cs.twoPhaseCaps())
 	if cs.usesOverlapDP() {
-		n++
+		// TWO now: the checkpoint pass and the block materialiser. The
+		// checkpointed cache splits what the whole-drive sweep did in one
+		// function — sweep-and-store — into sweep-and-checkpoint plus
+		// materialise-on-demand, because storing every tuple is the only
+		// reason the region was linear in the input.
+		n += 2
 	}
 	return n
 }
@@ -453,6 +466,15 @@ func (cs *compiledSet) overlapDPFnOffset() int {
 		n++
 	}
 	return n + 2*len(cs.twoPhaseCaps())
+}
+
+// overlapBlockFnOffset is the block materialiser, immediately after the
+// checkpoint pass.
+func (cs *compiledSet) overlapBlockFnOffset() int {
+	if off := cs.overlapDPFnOffset(); off >= 0 {
+		return off + 1
+	}
+	return -1
 }
 
 // gatedFind reports whether this set emits the default (per-pattern
@@ -1578,6 +1600,24 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		cs.startableDataBytes = append(cs.startableDataBytes,
 			appendDataSegment(nil, cs.overlapDPColOff, make([]byte, n))...)
 		cs.startableDataSegs++
+
+		// Lever C's two tables, placed the same way and for the same reason.
+		if tab := cs.overlapProjTabBytes(); len(tab) > 0 {
+			cs.overlapProjTabOff = ra.Bump("overlap-proj-tab", int32(len(tab)), 2)
+			cs.startableDataBytes = append(cs.startableDataBytes,
+				appendDataSegment(nil, cs.overlapProjTabOff, tab)...)
+			cs.startableDataSegs++
+
+			// One byte per state: delta(state, byte) for the position being
+			// swept. The projected update reads it at a CONSTANT offset per
+			// cell, which is what lets every other address in the step be a
+			// compile-time constant.
+			ns := int32(cs.buckets[cs.overlapDPBucket()].dp.numWASM)
+			cs.overlapSuccOff = ra.Bump("overlap-succ", ns, 1)
+			cs.startableDataBytes = append(cs.startableDataBytes,
+				appendDataSegment(nil, cs.overlapSuccOff, make([]byte, ns))...)
+			cs.startableDataSegs++
+		}
 	}
 
 	// First-position routing data, derived from the finished bucket list.
@@ -1799,43 +1839,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 			return nil, 0, nil, err
 		}
 
-		spec := SetSpec{
-			Name:                 sc.Name,
-			MatchAny:             sc.MatchAny,
-			MatchAll:             sc.MatchAll,
-			ScanAny:              sc.ScanAny,
-			ScanAll:              sc.ScanAll,
-			Find:                 sc.Find,
-			BatchFind:            sc.BatchFind(),
-			DeclaredPatternCount: sc.PatternCount(cfg),
-			Overlapping:          sc.Overlapping,
-			IDSpaceSize:          sc.IDSpaceSize(cfg),
-			Patterns:             infos,
-			PatternIDs:           globalIDs,
-		}
-		setOpts := CompileSetOptions{
-			// Set-level LikelyMode precedence: set hints > neutral.
-			// Used by H.3 (frontend density gate).
-			LikelyMode: resolveHints(sc.Hints),
-			// The knob that decides whether a pattern survives into the set at
-			// all: a fallback bucket over this limit is DROPPED, not demoted to
-			// another engine. It was unreachable before — CompileSetOptions was
-			// built without it, so the default 1024 always won and the drop
-			// warning's own "raise max_dfa_states" hint pointed at a field that
-			// does not feed this budget.
-			MaxFallbackStates: cfg.MaxFallbackStates,
-			// Test-only overrides (CompileFileOpts); zero everywhere else.
-			ACBudgetBytes: over.ACBudgetBytes,
-			// Test-only frontend pin; see CompileSetOptions.ForceFrontend.
-			ForceFrontend: over.ForceFrontend,
-			forceFrontend: over.forceFrontend,
-			// Test-only Shufti density-switch pin; see
-			// CompileSetOptions.ForceShuftiAdaptive.
-			ForceShuftiAdaptive: over.ForceShuftiAdaptive,
-			forceShuftiAdaptive: over.forceShuftiAdaptive,
-			// The module's allocator, shared with the per-pattern entries above.
-			globals: globals,
-		}
+		spec, setOpts := setSpecAndOptions(sc, cfg, infos, globalIDs, over, globals)
 		if !standalone {
 			setOpts.TableMemIdx = 1
 		}
@@ -2140,9 +2144,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			}
 			fs = append(fs, t, t)
 		}
-		// The backward sweep: (ptr, len, from, scratch_ptr, scratch_len) -> i32.
+		// The checkpointed sweep, two functions:
+		//   the pass:        (ptr, len, from, scratch, scratch_len) -> i32
+		//   materialise:     (ptr, len, scratch, block)             -> i32
 		if cs.usesOverlapDP() {
-			fs = append(fs, byte(setTypeI32x5ToI32))
+			fs = append(fs, byte(setTypeI32x5ToI32), byte(setTypeI32x4ToI32))
 		}
 		suffixType := byte(setMatchTypeSuffix)
 		if cs.gatedFind() || cs.suffixHasSkip {
@@ -2446,9 +2452,10 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		anchoredProbeBase := base + cs.anchoredProbeBaseOffset()
 		// The backward sweep, shared by BOTH position-reporting entries since
 		// the cache logic became common code.
-		dpIdx := -1
+		dpIdx, blkIdx := -1, -1
 		if off := cs.overlapDPFnOffset(); off >= 0 {
 			dpIdx = base + off
+			blkIdx = base + cs.overlapBlockFnOffset()
 		}
 		for _, c := range cs.capFns() {
 			switch c.kind {
@@ -2458,7 +2465,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					// worker instead of carrying its own copy of the bucket
 					// code. A non-batching set is wrapped for the answer cache
 					// alone, and forwards into the ordinary find body.
-					cs_bytes = append(cs_bytes, emitSetFindWrapperBody(cs, base+cs.findInnerFnOffset(), dpIdx)...)
+					cs_bytes = append(cs_bytes, emitSetFindWrapperBody(cs, base+cs.findInnerFnOffset(), dpIdx, blkIdx)...)
 				} else {
 					// The EXPORTED find takes a scratch descriptor where the
 					// body reads a gate pointer, so the prologue converts one
@@ -2470,7 +2477,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 						rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx), 3)...)
 				}
 			case capFindBatch:
-				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.findInnerFnOffset(), dpIdx)...)
+				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.findInnerFnOffset(), dpIdx, blkIdx)...)
 			case capMatchAny, capMatchAll:
 				if cs.anchoredUnion != nil {
 					cs_bytes = append(cs_bytes,
@@ -2532,7 +2539,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			}
 		}
 		if cs.usesOverlapDP() {
-			cs_bytes = append(cs_bytes, emitOverlapDPBody(cs, tableMemIdx, cs.overlapDPColOff)...)
+			cs_bytes = append(cs_bytes, emitCkptPassBody(cs, tableMemIdx, cs.overlapDPColOff)...)
+			cs_bytes = append(cs_bytes, emitCkptBlockBody(cs, tableMemIdx, cs.overlapDPColOff)...)
 		}
 		// A Backtracking fallback bucket's suffix body CALLS its driver, so it
 		// can only be built here, where function indices exist. Everything
@@ -4505,4 +4513,96 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	funcBody := utils.AppendULEB128(nil, uint32(len(b)))
 	funcBody = append(funcBody, b...)
 	return funcBody
+}
+
+// setSpecAndOptions builds the SetSpec and CompileSetOptions for one `sets:`
+// entry.
+//
+// EXTRACTED so there is exactly ONE of it. Any second construction of these two
+// values is a place where a real build and an inspection of that build can
+// disagree about which automaton the set has — `CmdWriteDiagJSON` built its own
+// and omitted `LikelyMode`, and therefore reported the NEUTRAL frontend, union
+// scan body and member-skip counts whatever the config's `hints:` said. The
+// checkpointed cache makes that class of divergence worse than a wrong report:
+// `SetOverlapCacheShape` sizes a caller's memory from it, so a different
+// automaton is a region sized for the wrong sweep.
+//
+// TableBase and TableMemIdx are deliberately NOT set here. They are placement,
+// not identity: they move every table's address without changing the automaton,
+// and only the emitting caller knows them.
+func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*PatternInfo, globalIDs []int, over CompileSetOptions, globals *moduleGlobals) (SetSpec, CompileSetOptions) {
+	spec := SetSpec{
+		Name:                 sc.Name,
+		MatchAny:             sc.MatchAny,
+		MatchAll:             sc.MatchAll,
+		ScanAny:              sc.ScanAny,
+		ScanAll:              sc.ScanAll,
+		Find:                 sc.Find,
+		BatchFind:            sc.BatchFind(),
+		DeclaredPatternCount: sc.PatternCount(cfg),
+		Overlapping:          sc.Overlapping,
+		IDSpaceSize:          sc.IDSpaceSize(cfg),
+		Patterns:             infos,
+		PatternIDs:           globalIDs,
+	}
+	setOpts := CompileSetOptions{
+		// Set-level LikelyMode precedence: set hints > neutral.
+		// Used by H.3 (frontend density gate).
+		LikelyMode: resolveHints(sc.Hints),
+		// The knob that decides whether a pattern survives into the set at
+		// all: a fallback bucket over this limit is DROPPED, not demoted to
+		// another engine. It was unreachable before — CompileSetOptions was
+		// built without it, so the default 1024 always won and the drop
+		// warning's own "raise max_dfa_states" hint pointed at a field that
+		// does not feed this budget.
+		MaxFallbackStates: cfg.MaxFallbackStates,
+		// Test-only overrides (CompileFileOpts); zero everywhere else.
+		ACBudgetBytes: over.ACBudgetBytes,
+		// Test-only frontend pin; see CompileSetOptions.ForceFrontend.
+		ForceFrontend: over.ForceFrontend,
+		forceFrontend: over.forceFrontend,
+		// Test-only Shufti density-switch pin; see
+		// CompileSetOptions.ForceShuftiAdaptive.
+		ForceShuftiAdaptive: over.ForceShuftiAdaptive,
+		forceShuftiAdaptive: over.forceShuftiAdaptive,
+		// The module's allocator, shared with the per-pattern entries above.
+		globals: globals,
+	}
+
+	return spec, setOpts
+}
+
+// compileSetForInspection compiles one `sets:` entry the way a real build
+// would, for callers that need to LOOK at the result rather than emit it.
+//
+// Standalone placement (TableBase 0, memory 0) because nothing here reads a
+// table address; the automaton is identical either way.
+func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig) (*compiledSet, error) {
+	nameIdx := make(map[string]int, len(cfg.Regexps))
+	for i, re := range cfg.Regexps {
+		if re.Name != "" {
+			nameIdx[re.Name] = i
+		}
+	}
+	var selectedIdx []int
+	if sc.Patterns.All {
+		for i := range cfg.Regexps {
+			selectedIdx = append(selectedIdx, i)
+		}
+	} else {
+		for _, name := range sc.Patterns.Names {
+			idx, ok := nameIdx[name]
+			if !ok {
+				return nil, fmt.Errorf("set %q: unknown pattern %q", sc.Name, name)
+			}
+			selectedIdx = append(selectedIdx, idx)
+		}
+	}
+	var prefixPool, suffixPool dfaPool
+	infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+	if err != nil {
+		return nil, err
+	}
+	spec, opts := setSpecAndOptions(sc, cfg, infos, globalIDs, CompileSetOptions{}, &moduleGlobals{})
+	return CompileSet(spec, &prefixPool, &suffixPool, opts), nil
 }

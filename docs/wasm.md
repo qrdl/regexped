@@ -555,11 +555,10 @@ never dies — `[^\n]*ERROR` on newline-free input — walks to the end of the
 input from every one of them, and the drive is quadratic in the input length.
 
 The descriptor's `cache_ptr` / `cache_len` let the caller break that. Given a
-region it can fill, the engine may sweep the input **once**, right to left,
-computing every `(start, pattern, extent)` tuple in one pass, and then serve
-the rest of the drive by copying out of it. The sweep reads the same forward
-transition and accept tables the ordinary body reads and emits no tables of its
-own.
+region it can fill, the engine sweeps the input right to left, computing every
+`(start, pattern, extent)` answer in one pass, and serves the rest of the drive
+out of what it recorded. The sweep reads the same forward transition and accept
+tables the ordinary body reads and emits no tables of its own.
 
 **BOTH find entries read it**, on the same rule and out of the same header, so
 an overlapping drive is linear through `find` as well as through the batch
@@ -569,91 +568,97 @@ position differs, which is their protocols and not the cache's:
 
 | entry | serves |
 |---|---|
-| `find` | the tuples at the first cached position at or after `from`, all of them, returning the total — its ordinary transactional rule, so `out_cap = 0` is still a size probe and a run that does not fit still writes nothing |
-| `<find>_batch` | tuples from its cursor onward, up to `out_cap`, splitting a position where it must |
-
-`find` needs no cursor to do that and is given none: the cache is indexed by
-position and `from` IS the position.
+| `find` | every match at the first cached position at or after `from`, returning the total — its ordinary transactional rule, so `out_cap = 0` is still a size probe and a position that does not fit still writes nothing |
+| `<find>_batch` | matches from its cursor onward, up to `out_cap`, splitting a position where it must |
 
 **Engagement is adaptive, and that is the point.** The sweep costs a flat
-`states x patterns` per input byte, while the walk's cost depends on the data —
-on most inputs the walk is far cheaper, and sweeping regardless loses badly.
-Nor can the choice be made at compile time: `a+` never dies on 50,000 `a`s and
-dies on the first byte of ordinary text, so one set wants opposite answers on
-different inputs.
+per-byte amount while the walk's cost depends on the data — on most inputs the
+walk is far cheaper, and sweeping regardless loses badly. Nor can the choice be
+made at compile time: `a+` never dies on 50,000 `a`s and dies on the first byte
+of ordinary text, so one set wants opposite answers on different inputs. So the
+drive walks, counting the bytes it has matched, and switches only once that
+count exceeds what the sweep would have cost. The switch happens at a position
+boundary and the sweep covers only the positions not yet delivered, so the
+handover is invisible: matches keep arriving in order with none repeated or
+dropped.
 
-So the drive decides for itself. It walks, counting the bytes it has matched,
-and switches only once that count exceeds what the sweep would have cost — at
-which point the sweep is at worst a second helping of work already spent, and
-it removes a quadratic tail. The switch happens at a position boundary and the
-sweep covers only the positions not yet delivered, so the handover is invisible
-to the caller: matches keep arriving in the same order with none repeated or
-dropped. A drive that never crosses the line never sweeps, and costs what it
-cost before the cache existed.
+#### What the region holds, and how big it is
+
+The cache does not store the sweep's output. It stores a COLUMN SNAPSHOT every
+`stride` positions, and rebuilds one block of `stride` positions at a time when
+a position in it is first asked for. Every position is therefore swept at most
+twice per drive — once by the pass, once when its block is rebuilt — so the
+drive stays linear, while the region falls from linear in the input to its
+SQUARE ROOT.
 
 | Descriptor field | Meaning |
 |---|---|
 | `cache_ptr` | Caller-owned region, or **0 to decline** |
 | `cache_len` | Its size in bytes |
 
+**Header: 48 bytes at `cache_ptr`.** Zero it to start a drive, then write the
+STRIDE into the word at offset 16. Everything else is the engine's. The stride
+is the one field you own because it is what you sized the allocation from, and
+the engine validates rather than trusts it.
+
+**Sizing.** Call `<find>_cache_bytes`-equivalent arithmetic, which every
+generated stub already does for you:
+
+    row    = 4 + 4 * PATTERNS          one position's row
+    cell   = CELLS * 4 + 4             one column snapshot, plus its count
+    m      = input_len + 1
+    single = 48 + cell + 4 + m * row
+    if single <= 64 MiB:  stride = m                      one block
+    else:                 stride = clamp(sqrt(m*CELLS*4/row), 16, m)
+    blocks = ceil(m / stride)
+    bytes  = 48 + blocks * cell + 4 + stride * row
+
+`CELLS` is the sweep column's width and comes from the COMPILER — it falls out
+of the DFA construction and nothing in your config implies it. Every stub is
+generated with it baked in.
+
+**The single-block case is the whole-drive cache.** A stride equal to the span
+is one block: the pass records every match on its way through, nothing is ever
+rebuilt, and the drive costs what it did before any of this. Below the 64 MiB
+budget that is what you get. Above it the stride drops and the region becomes
+square-root sized, at the price of a second sweep.
+
+Measured region sizes, for shapes the sweep accepts:
+
+| shape | 100 KB input | 10 MB input |
+|---|---|---|
+| 3 patterns, 7 cells | 1.6 MiB | 143 KB |
+| 3 patterns, 12 cells | 1.6 MiB | 183 KB |
+| 32 patterns, 353 cells | 12.9 MiB | 2.7 MiB |
+
 The rules:
 
 - **It is optional.** `cache_ptr = 0` is legal and is what a caller who does
   not want to pay for it passes. The drive then walks position by position.
-- **Zero the first 16 bytes** before the first call of a drive, exactly as you
-  zero the gate array. The header holds the "ready" flag and the drive's
-  accumulated work, and zero is the honest starting value for both — so no
-  magic value is needed. The rest of the region needs no zeroing: it is written
-  before it is read.
+- **Zero the 48-byte header** before the first call of a drive, exactly as you
+  zero the gate array, then write the stride. The rest of the region needs no
+  zeroing: it is written before it is read.
 - **Too small is not an error.** The sweep refuses a region it cannot fill and
   the drive falls back to walking. The answer is identical, only slower. This
   is the same rule `out_cap` underflow has.
-- **Size it at `16 + (in_len + 1) * PATTERN_COUNT * 12`.** Twelve bytes per
-  tuple, and the worst case really is one tuple per pattern per start position:
-  a pattern that never dies matches from nearly every start, which is the case
-  the cache exists for.
-
-  **That grows fast, and the numbers decide whether you can offer one at all:**
-
-  | patterns | input | region |
-  |---|---|---|
-  | 3 | 100 KB | 3.5 MiB |
-  | 100 | 16 KB | 18.8 MiB |
-  | 8 | 1 MiB | 96 MiB |
-  | 100 | 100 KB | 117 MiB |
-
-  The formula hides this; the numbers do not. A hundred patterns over 16 KB of
-  input is nearly 19 MiB, because the worst case is 1.6 million matches. Most
-  inputs produce a small fraction of that — but the sweep cannot know in
-  advance. It fills the region as it goes and refuses when it runs out, so the
-  safe size is the worst case and there is no smaller one to compute.
-- **Offer all of it or none of it.** A short region makes the sweep run and
-  *then* discover it cannot finish — the one outcome strictly worse than never
-  sweeping. The generated JS/TS stubs cap what they will reserve at **64 MiB**
-  and pass `0, 0` beyond that rather than pass a truncated region, which is why
-  the last two rows above get no cache from a stub: the drive walks instead, at
-  the cost the drive had before the cache existed.
+- **A header that contradicts itself IS an error.** A stride below 1, or a
+  layout that does not fit the `cache_len` you declared, returns
+  **`-4`** rather than degrading quietly — a mistake in caller-owned memory is
+  otherwise indistinguishable from the engine legitimately declining the shape,
+  on precisely the inputs the cache exists for.
 - **The cache belongs to one drive.** It holds the answer for one `(input,
   pattern set)` pair; re-zero the header to start a new drive.
-- **Same region on every call of a drive, or none.** The sweep writes its
-  tuples once and later calls serve out of them by index, so passing a
-  different `cache_ptr` (or offering it on some calls and declining on others)
-  mid-drive serves indices into a region that no longer holds what they name.
-  Offer the same `(cache_ptr, cache_len)` on every call, or `0, 0` on every
-  call.
+- **Same region on every call of a drive, or none.** Later calls address the
+  blocks the sweep laid out, so changing `cache_ptr` mid-drive addresses a
+  region that no longer holds what it names.
+- **One entry per drive.** A drive is served by `find` or by the batch entry,
+  never both: the two read the same header and resume differently.
 
 The engine may decline even when offered a large enough region: the sweep is
 emitted only where it reproduces the per-position semantics exactly (one
 bucket, no anchors, no word-boundary or newline channel, a dense accept mask,
-no Backtracking member). Declining is invisible from the caller's side and
-costs nothing but speed.
-
-The rest of this section is the BATCH entry's alone, because it is about the
-cursor. While the cache is live the cursor's high half carries a **tuple index**
-rather than a text position. Both are opaque, which is what lets a drive change from
-one to the other when it switches: the call that switches returns the first
-index-form cursor, and every later call reads it as an index. Pass the value
-back unchanged and the change is invisible.
+no Backtracking member, at most 32 patterns). Declining is invisible from the
+caller's side and costs nothing but speed.
 
 ### find return value and overflow
 

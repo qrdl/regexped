@@ -570,3 +570,47 @@ func spellJSArgs(c *setCapability, s jsArgSpelling) string {
 // untyped constant reads better there than a qualified name repeated four
 // times. It is one line and it is checked by a test that compares the two.
 const scratchDescriptorBytes = abi.FindScratchBytes
+
+// overlapCacheShapeFor reports the sizing an overlapping set's `find` needs, or
+// a zero shape when the set gets no backward sweep.
+//
+// IT RECOMPILES THE SET, which is the route decision 1 of the checkpointed
+// cache task chose over exporting a sizing function from the module or baking a
+// constant into the stub. The column width falls out of the DFA subset
+// construction and is not derivable from the YAML, so a generator that wants it
+// has to build the automaton; doing that in the SAME RUN that writes the stub
+// is what stops the number going stale between `compile` and `generate`.
+//
+// The YAML alone excludes most sets — no `find`, or not `overlapping`, means no
+// sweep and nothing to size — and that filter is applied FIRST so stub
+// generation does not compile a set it has no question about. A set that passes
+// it may still come back ineligible, which is ordinary and not an error.
+func overlapCacheShapeFor(s config.SetConfig, cfg config.BuildConfig) compile.OverlapCacheShape {
+	if s.Find == "" || !s.Overlapping {
+		return compile.OverlapCacheShape{}
+	}
+	sh, err := compile.SetOverlapCacheShape(s, cfg)
+	if err != nil {
+		// A set that cannot be compiled here cannot be compiled by `compile`
+		// either, and that path reports it properly. Declining the cache is the
+		// safe answer: the drive walks.
+		return compile.OverlapCacheShape{}
+	}
+	return sh
+}
+
+// anySetWantsCache reports whether any set in this config gets an overlapping
+// answer cache, which is what decides whether the C header carries the
+// allocator machinery at all.
+//
+// A config with no sets, or none overlapping, must not: the header documents
+// itself as needing no libc, and emitting the feature test would pull
+// <stdlib.h> into builds that rely on that.
+func anySetWantsCache(cfg config.BuildConfig) bool {
+	for _, s := range cfg.Sets {
+		if overlapCacheShapeFor(s, cfg).Eligible {
+			return true
+		}
+	}
+	return false
+}

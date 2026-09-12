@@ -40,6 +40,19 @@ import (
 func driveCacheFind(t *testing.T, pats []string, input string, offset, outCap int32,
 	useCache bool, scratchLen int32, want engageWant,
 ) [][3]int {
+	return driveCacheFindK(t, pats, input, offset, outCap, useCache, scratchLen, want, 0)
+}
+
+// driveCacheFindK is driveCacheFind with the cache's STRIDE forced.
+//
+// The stride is the caller's to choose — `init` computes it from the same
+// formula that sized the allocation — so forcing it needs no compiler knob, and
+// that is what makes the block-boundary paths reachable. At the size the
+// formula picks, a short test input is ONE block and every boundary case is
+// unreachable; at a stride of 1 or 7 the same input has dozens.
+func driveCacheFindK(t *testing.T, pats []string, input string, offset, outCap int32,
+	useCache bool, scratchLen int32, want engageWant, strideOverride int32,
+) [][3]int {
 	t.Helper()
 	entries := make([]config.RegexEntry, len(pats))
 	for i, p := range pats {
@@ -100,7 +113,11 @@ func driveCacheFind(t *testing.T, pats []string, input string, offset, outCap in
 	if !useCache {
 		passScratch, passLen = 0, 0
 	}
-	descPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), passScratch, passLen)
+	_, stride := overlapCacheFor(input, pats)
+	if strideOverride > 0 {
+		stride = strideOverride
+	}
+	descPtr := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), passScratch, passLen, stride)
 
 	var out [][3]int
 	from := offset
@@ -168,7 +185,8 @@ func driveCacheFind(t *testing.T, pats []string, input string, offset, outCap in
 }
 
 func cacheFindScratchLen(input string, pats []string) int32 {
-	return int32(config.SetOverlapCacheBytes(len(input), len(pats)))
+	n, _ := overlapCacheFor(input, pats)
+	return n
 }
 
 // TestOverlapCacheFindEngagesOnQuadraticDrives is the reason the refactor

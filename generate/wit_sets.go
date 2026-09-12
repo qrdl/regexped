@@ -132,7 +132,14 @@ func renderWitSets(sets []witSet) string {
 	// map the two enums onto one error type, so a consumer never sees the
 	// duplication.
 	b.WriteString("    /// The Backtracking engine exhausted its frame budget; the answer is unknown.\n")
-	b.WriteString("    enum error-code { backtrack-overflow }\n")
+	// TWO cases, and the second is only reachable on a set.
+	//
+	// `malformed-cache` is what an overlapping `find` answers when the answer
+	// cache it was handed contradicts itself. A component consumer cannot
+	// provoke it — the resource builds its own header — but the enum is the
+	// interface's error type and hiding a case the core module can return
+	// would leave the adapter with nothing to lift it into.
+	b.WriteString("    enum error-code { backtrack-overflow, malformed-cache }\n")
 	b.WriteString("\n    /// One match: which pattern, and where.\n")
 	b.WriteString("    record set-match { id: u32, start: u32, end: u32 }\n")
 

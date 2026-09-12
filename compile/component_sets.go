@@ -52,7 +52,13 @@ const (
 	// separately: the representation never moves — it is ours, and the handle
 	// holds it — so the gate pointer it contains cannot go stale, and the
 	// constructor can fill it once.
-	repScratch = 20
+	// The overlapping answer cache the constructor reserves, held so the dtor
+	// can free it. It is NOT enough to keep only the descriptor's copy: the
+	// descriptor is caller-facing state and the dtor must not have to parse it.
+	repCache    = 20
+	repCacheLen = 24
+
+	repScratch = 28
 	repBytes   = repScratch + abi.FindScratchBytes
 )
 
@@ -378,18 +384,24 @@ func buildSetAllWideAdapterBody(reallocIdx, innerIdx, nParams, idSpace int) []by
 //     scanner's own blocks from it. Everything this function allocates outlives
 //     the call and is freed by the destructor instead. Without that, the next
 //     post-return frees a live scanner's state.
-func buildSetScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint32, idSpace int) []byte {
+func buildSetScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint32, idSpace int, cells, pats int32) []byte {
 	const (
-		pPtr   = 0x00
-		pLen   = 0x01
-		pStart = 0x02
-		lRep   = 0x03
-		lGate  = 0x04
-		lCopy  = 0x05
-		lChain = 0x06
+		pPtr      = 0x00
+		pLen      = 0x01
+		pStart    = 0x02
+		lRep      = 0x03
+		lGate     = 0x04
+		lCopy     = 0x05
+		lChain    = 0x06
+		lCache    = 0x07
+		lCacheLen = 0x08
+		// i64 working values for the cache sizing, declared after every i32.
+		lM     = 0x09
+		lK     = 0x0A
+		lBytes = 0x0B
 	)
 	var b []byte
-	b = append(b, 0x01, 0x04, 0x7F) // 4 i32 locals
+	b = append(b, 0x02, 0x06, 0x7F, 0x03, 0x7E) // 6 i32 locals, 3 i64
 
 	// Remember the chain, so the blocks below can be taken off it.
 	b = append(b, 0x23)
@@ -436,20 +448,124 @@ func buildSetScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint32, i
 	b = append(b, 0x20, lRep, 0x41, 0x00)
 	b = storeI32(b, repDone)
 
-	// The descriptor, filled once: magic, the gate array, and no answer cache.
-	// The cache is what makes an overlapping drive linear, and the `find` this
-	// resource drives READS one when offered — so what is missing here is the
-	// region, not the plumbing: whether a component should reserve one, and out
-	// of whose budget, is an open question (memory.grow is one-way, so a
-	// reservation stays in the process footprint after the handle is dropped).
+	// THE ANSWER CACHE, reserved here and freed by the dtor.
+	//
+	// A component consumer has no pointer to hand in and nothing to free, so
+	// this is the only place it can come from — which is why it was deferred
+	// when the region was 117 MB and reserving it invisibly was unreasonable.
+	// Checkpointed it is a small fraction of that, and without it an
+	// overlapping component set is the only output kind left quadratic.
+	//
+	// The arithmetic is the one every stub spells in its own language, and it
+	// MUST agree with config.SetOverlapCheckpoint*: the sweep validates the
+	// stride it is handed. i64 throughout, because m*row passes 2^32 on a large
+	// input, and f64 for the square root.
+	//
+	// A region over budget, or an allocation that fails, leaves a declined
+	// cache and a walking drive — the same answer, slower.
+	if cells > 0 {
+		// Seeded FIRST: the allocation below is conditional twice over (over
+		// budget, or a set with no sweep), and every path has to leave these
+		// defined because the descriptor reads them unconditionally.
+		b = append(b, 0x20, lRep, 0x41, 0x00)
+		b = storeI32(b, repCache)
+		b = append(b, 0x20, lRep, 0x41, 0x00)
+		b = storeI32(b, repCacheLen)
+
+		row := int64(4 + 4*pats)
+		cell := int64(cells)*4 + 4
+		// m = len + 1
+		b = append(b, 0x20, pLen, 0xAC, 0x42, 0x01, 0x7C)
+		b = append(b, 0x21, lM)
+		// single = HDR + cell + 4 + m*row
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(overlapCkptHeaderBytes)+cell+4)
+		b = append(b, 0x20, lM, 0x42)
+		b = utils.AppendSLEB128_64(b, row)
+		b = append(b, 0x7E, 0x7C) // i64.mul, i64.add
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, overlapCacheMaxBytes)
+		b = append(b, 0x56)       // i64.gt_u -> over budget, checkpoint
+		b = append(b, 0x04, 0x40) // if
+		// k = trunc(sqrt(m * cells*4 / row)), clamped to [16, m]
+		b = append(b, 0x20, lM, 0xB9) // f64.convert_i64_u
+		b = append(b, 0x44)
+		b = appendF64(b, float64(cells)*4/float64(row))
+		b = append(b, 0xA2, 0x9F) // f64.mul, f64.sqrt
+		b = append(b, 0xB0)       // i64.trunc_f64_u
+		b = append(b, 0x21, lK)
+		b = append(b, 0x20, lK, 0x42, 0x10, 0x54) // k < 16
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x42, 0x10, 0x21, lK)
+		b = append(b, 0x0B)
+		b = append(b, 0x20, lK, 0x20, lM, 0x56) // k > m
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, lM, 0x21, lK)
+		b = append(b, 0x0B)
+		b = append(b, 0x05) // else: one block, the whole span
+		b = append(b, 0x20, lM, 0x21, lK)
+		b = append(b, 0x0B)
+		// bytes = HDR + ceil(m/k)*cell + 4 + k*row
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(overlapCkptHeaderBytes)+4)
+		b = append(b, 0x20, lM, 0x20, lK, 0x7C, 0x42, 0x01, 0x7D, 0x20, lK, 0x80) // (m+k-1)/k
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, cell)
+		b = append(b, 0x7E, 0x7C)
+		b = append(b, 0x20, lK, 0x42)
+		b = utils.AppendSLEB128_64(b, row)
+		b = append(b, 0x7E, 0x7C)
+		b = append(b, 0x21, lBytes)
+
+		b = append(b, 0x20, lBytes, 0x42)
+		b = utils.AppendSLEB128_64(b, overlapCacheMaxBytes)
+		b = append(b, 0x58)       // i64.le_u -> within budget
+		b = append(b, 0x04, 0x40) // if
+		b = append(b, 0x20, lBytes, 0xA7)
+		b = append(b, 0x21, lCacheLen)
+		b = callReallocDyn(b, reallocIdx, 4, lCacheLen)
+		b = append(b, 0x21, lCache)
+		b = append(b, 0x20, lRep, 0x20, lCache)
+		b = storeI32(b, repCache)
+		b = append(b, 0x20, lRep, 0x20, lCacheLen)
+		b = storeI32(b, repCacheLen)
+		// Zero the header and stamp the stride. The allocator hands back reused
+		// memory, so a drive inheriting a stale `ready` would serve another
+		// scan's blocks.
+		b = append(b, 0x20, lCache, 0x41, 0x00, 0x41)
+		b = utils.AppendSLEB128(b, int32(overlapCkptHeaderBytes))
+		b = append(b, 0xFC, 0x0B, 0x00) // memory.fill
+		b = append(b, 0x20, lCache, 0x20, lK, 0xA7)
+		b = append(b, 0x36, 0x02, 16)
+		b = append(b, 0x0B)
+	}
+
+	// A set with NO sweep, or one whose region was over budget, still has to
+	// zero these: the representation came from the allocator, which hands back
+	// REUSED memory, so leaving them is a descriptor pointing at whatever the
+	// last scanner had. It faulted on the first `next` — an out-of-bounds read
+	// through a cache pointer nothing had written.
+	//
+	// Emitted unconditionally, after the block above, so the over-budget arm is
+	// covered too and there is no path that leaves them undefined.
+	if cells <= 0 {
+		b = append(b, 0x20, lRep, 0x41, 0x00)
+		b = storeI32(b, repCache)
+		b = append(b, 0x20, lRep, 0x41, 0x00)
+		b = storeI32(b, repCacheLen)
+	}
+
+	// The descriptor, filled once: magic, the gate array, and the cache above.
 	b = append(b, 0x20, lRep, 0x41)
 	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
 	b = storeI32(b, repScratch+abi.FindScratchMagicOff)
 	b = append(b, 0x20, lRep, 0x20, lGate)
 	b = storeI32(b, repScratch+abi.FindScratchGateOff)
-	b = append(b, 0x20, lRep, 0x41, 0x00)
+	b = append(b, 0x20, lRep, 0x20, lRep)
+	b = loadI32(b, repCache)
 	b = storeI32(b, repScratch+abi.FindScratchCacheOff)
-	b = append(b, 0x20, lRep, 0x41, 0x00)
+	b = append(b, 0x20, lRep, 0x20, lRep)
+	b = loadI32(b, repCacheLen)
 	b = storeI32(b, repScratch+abi.FindScratchCacheLenOff)
 
 	// Detach: the chain goes back to what it held on entry, so the blocks above
@@ -527,8 +643,14 @@ func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
 	b = utils.AppendULEB128(b, uint32(findIdx))
 	b = append(b, 0x21, lN)
 
-	// Negative is the Backtracking sentinel, not a count: what remains is
-	// UNKNOWN, so the scan ends AND reports an error.
+	// Negative is a SENTINEL, not a count: what remains is UNKNOWN, so the scan
+	// ends AND reports an error.
+	//
+	// TWO of them now, and they must not be conflated. -2 is the Backtracking
+	// engine out of frames; -4 is an answer cache whose header contradicts
+	// itself. A consumer cannot provoke the second — the constructor builds the
+	// header — so reaching it means the engine did, and reporting it as a
+	// Backtracking overflow would point at the wrong thing entirely.
 	b = append(b, 0x20, lN)
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x48) // i32.lt_s
@@ -536,7 +658,11 @@ func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
 	b = append(b, 0x20, pRep, 0x41, 0x01)
 	b = storeI32(b, repDone)
 	b = storeDisc(b, lRet, 0, 1)
-	b = storeDisc(b, lRet, 4, 0)
+	b = append(b, 0x20, lRet)
+	b = append(b, 0x20, lN, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheMalformed))
+	b = append(b, 0x46) // n == -4 -> malformed-cache, else backtrack-overflow
+	b = append(b, 0x3A, 0x00, 0x04)
 	b = append(b, 0x20, lRet, 0x0F)
 	b = append(b, 0x0B)
 
@@ -582,12 +708,27 @@ func buildSetScannerDtorBody(freeIdx int) []byte {
 	var b []byte
 	b = append(b, 0x00) // no locals
 
+	// The input copy and the gate array are ALWAYS allocated; the answer cache
+	// may not be — a set with no sweep, or a region over budget, leaves it null
+	// — so it is the one slot that needs a guard.
+	//
+	// cm_free reads the block's class out of the word BELOW the pointer, so
+	// handing it null reads address -8 and traps. It faulted on the first drive
+	// of every non-overlapping component set.
 	for _, off := range []int{repInput, repGate} {
 		b = append(b, 0x20, pRep)
 		b = loadI32(b, off)
 		b = append(b, 0x10)
 		b = utils.AppendULEB128(b, uint32(freeIdx))
 	}
+	b = append(b, 0x20, pRep)
+	b = loadI32(b, repCache)
+	b = append(b, 0x04, 0x40) // if the cache pointer is non-null
+	b = append(b, 0x20, pRep)
+	b = loadI32(b, repCache)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(freeIdx))
+	b = append(b, 0x0B)
 	b = append(b, 0x20, pRep)
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(freeIdx))
@@ -653,6 +794,14 @@ type setAdapter struct {
 	// returns a result area does; the constructor, which returns a bare handle,
 	// does not — and giving it one would free the scanner's state.
 	post bool
+
+	// The overlapping answer cache's GEOMETRY. The region's size depends on the
+	// input length, which the constructor only learns at run time, so what is
+	// fixed at compile time is the sweep column's width and the bucket's
+	// pattern count; the constructor computes the rest. Zero cells means the
+	// set gets no sweep and the drive walks.
+	cacheCells    int32
+	cachePatterns int32
 }
 
 // componentSetAdapters lists the adapters a set-bearing component needs, in
@@ -671,6 +820,18 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 		if !ok {
 			continue
 		}
+		// The sweep column, if this set has one. It fixes the cache geometry the
+		// constructor needs; everything else about the region depends on the
+		// input length, which only exists at call time.
+		cacheCells, cachePats := int32(0), int32(0)
+		if bi := cs.overlapDPBucket(); bi >= 0 {
+			bkt := cs.buckets[bi]
+			cachePats = int32(len(bkt.patterns))
+			cacheCells = int32(bkt.dp.numWASM) * cachePats
+			if pr := cs.overlapProjFor(bi); pr != nil {
+				cacheCells = int32(pr.cells)
+			}
+		}
 		for i, c := range cs.capFns() {
 			inner := setBase[si] + i
 			switch c.kind {
@@ -683,7 +844,8 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 				}
 				out = append(out,
 					setAdapter{kind: setAdapterCtor, export: n.Constructor, idSpace: cs.idSpaceSize(),
-						inner: resNewIdx[si], typeIdx: anyTypeIdx3},
+						inner: resNewIdx[si], typeIdx: anyTypeIdx3,
+						cacheCells: cacheCells, cachePatterns: cachePats},
 					setAdapter{kind: setAdapterNext, export: n.Next, inner: inner,
 						count: cs.patternCount, typeIdx: nextTypeIdx, post: true},
 					setAdapter{kind: setAdapterDtor, export: n.Dtor, typeIdx: dtorTypeIdx},
@@ -729,7 +891,8 @@ func buildSetAdapterBody(a setAdapter, reallocIdx, freeIdx int, callListGlobal u
 	case setAdapterAllWide:
 		return buildSetAllWideAdapterBody(reallocIdx, a.inner, a.nParams, a.idSpace)
 	case setAdapterCtor:
-		return buildSetScannerCtorBody(reallocIdx, a.inner, callListGlobal, a.idSpace)
+		return buildSetScannerCtorBody(reallocIdx, a.inner, callListGlobal, a.idSpace,
+			a.cacheCells, a.cachePatterns)
 	case setAdapterNext:
 		return buildSetScannerNextBody(reallocIdx, a.inner, a.count)
 	case setAdapterDtor:

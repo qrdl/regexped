@@ -378,14 +378,16 @@ formats, a no-op for a module and mandatory here. See
 
 ### What a set costs here
 
-- `overlapping: true` sets are quadratic per drive by design, and the component
-  form has no answer cache — so it behaves like a C or Rust MODULE consumer,
-  whose generated stub reserves none either. The engine reads a cache when one
-  is offered, through either find entry; what a component has no answer for yet
-  is who reserves the memory, since `memory.grow` is one-way and a reservation
-  stays in the process footprint after the handle is dropped. Only the JS/TS
-  module stubs reserve one today. If you need that mitigation, use
-  `wasm_format: module`, or pass a region yourself through the raw module ABI.
+- `overlapping: true` sets get the ANSWER CACHE here as everywhere else, so an
+  overlapping drive is linear rather than quadratic. A component consumer has no
+  pointer to hand in and nothing to free, so the `find` resource's CONSTRUCTOR
+  reserves the region and `[dtor]` releases it with the input copy and the
+  gates. You never see it.
+
+  It is sized from the input length at construction, and it is the square root
+  of that length rather than a multiple of it — a few hundred kilobytes for a
+  ten-megabyte scan. A region over budget is simply declined and the drive
+  walks, with identical answers.
 - Every `next` is a cross-component call, but NOT a copy of the input: the
   constructor did that once.
 - The `_all` pair allocates a list of ids per call, bounded by the number of

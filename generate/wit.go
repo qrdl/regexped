@@ -82,7 +82,11 @@ func renderWit(cfg config.BuildConfig, pkg, world string, funcs []witFunc, sets 
 		// carries it, DFA-only patterns included. A uniform ABI beats a
 		// per-pattern one and the adapter costs one compare.
 		b.WriteString("    /// The Backtracking engine exhausted its frame budget; the answer is unknown.\n")
-		b.WriteString("    enum error-code { backtrack-overflow }\n")
+		// A single-pattern export cannot return the second case — the answer
+		// cache belongs to sets — but the two interfaces share the error type's
+		// NAME, and a consumer that used both would see one enum with two
+		// different shapes. One spelling, both interfaces.
+		b.WriteString("    enum error-code { backtrack-overflow, malformed-cache }\n")
 		for _, f := range funcs {
 			b.WriteString("\n")
 			for _, line := range strings.Split(f.doc, "\n") {

@@ -312,13 +312,16 @@ func TestOverlapDPColumnsUseTableMemory(t *testing.T) {
 	if cs.overlapDPFnOffset() < 0 {
 		t.Skip("this shape no longer engages the backward sweep")
 	}
-	body := emitOverlapDPBody(cs, 1 /* tableMemIdx */, cs.overlapDPColOff)
+	// The CHECKPOINT PASS, which is what the whole-drive sweep became: it holds
+	// the same hazard, since its working columns live in TABLE memory while the
+	// cache it writes is the CALLER's.
+	body := emitCkptPassBody(cs, 1 /* tableMemIdx */, cs.overlapDPColOff)
 
-	// Count memory-0 i32 loads/stores. The tuple writer and the header writer
+	// Count memory-0 i32 loads/stores. The row writer and the header writer
 	// legitimately use them — they address the CALLER's scratch — so the test
 	// is a bound, pinned against the standalone body which uses memory 0 for
 	// everything.
-	standalone := emitOverlapDPBody(cs, 0, cs.overlapDPColOff)
+	standalone := emitCkptPassBody(cs, 0, cs.overlapDPColOff)
 	if got, want := countMem0Access(body), countMem0Access(standalone); got >= want {
 		t.Errorf("the embedded sweep body makes %d memory-0 i32 accesses and the standalone one %d: "+
 			"the column loads/stores are still going to memory 0, i.e. to the host's heap", got, want)

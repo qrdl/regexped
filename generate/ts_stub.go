@@ -407,18 +407,43 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				cachePre, cacheReserve, cachePost, cacheArgs := "", "", "", "0, 0"
 				if s.Overlapping {
 					batchGateRegion = (batchGateRegion + 7) &^ 7
-					cachePre = fmt.Sprintf(`    // Twelve bytes per tuple, and the worst case really is one tuple per
-    // pattern per start: a pattern that never dies matches from nearly
-    // every position, which is the case this exists for. Past the ceiling
-    // the engine is offered nothing and walks position by position, which
-    // is what it did before this existed.
-    const cacheNeeded = %d + (_inCap(input) + 1) * %s * 12;
-    const cacheBytes = cacheNeeded <= %d ? cacheNeeded : 0;
-`, config.SetOverlapCacheHeaderBytes, konst, config.SetOverlapCacheMaxBytes)
+				}
+				if sh := overlapCacheShapeFor(s, cfg); s.Overlapping && sh.Eligible {
+					// The CHECKPOINTED answer cache; see the JS generator for
+					// the full reasoning. The column width is a constant the
+					// compiler supplied (the set was recompiled to learn it);
+					// the rest is arithmetic on the input length, which exists
+					// only at call time. Below the budget the stride is the
+					// whole span — one block, one sweep, the behaviour the
+					// whole-drive cache had — and above it the stride falls to
+					// the square-root optimum.
+					//
+					// This MUST match config.SetOverlapCheckpoint* exactly: the
+					// sweep validates the stride it is handed.
+					cachePre = fmt.Sprintf(`    const _m = _inCap(input) + 1;
+    const _row = 4 + 4 * %[2]d;
+    const _cell = %[1]d * 4 + 4;
+    const _single = %[3]d + _cell + 4 + _m * _row;
+    let _k: number;
+    if (_single > 0 && _single <= %[4]d) {
+        _k = _m;
+    } else {
+        _k = Math.floor(Math.sqrt(_m * %[1]d * 4 / _row));
+        if (_k < 16) _k = 16;
+        if (_k > _m) _k = _m;
+    }
+    const _nb = Math.ceil(_m / _k);
+    const cacheNeeded = %[3]d + _nb * _cell + 4 + _k * _row;
+    const cacheBytes = cacheNeeded <= %[4]d ? cacheNeeded : 0;
+`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes)
 					cacheReserve = " + cacheBytes"
 					cachePost = fmt.Sprintf(`    const cacheBase = cacheBytes > 0 ? gateBase + %d : 0;
-    if (cacheBase !== 0) new Uint32Array(_mem.buffer, cacheBase, %d).fill(0);
-`, batchGateRegion, config.SetOverlapCacheHeaderBytes/4)
+    if (cacheBase !== 0) {
+        const _hdr = new Uint32Array(_mem.buffer, cacheBase, %d);
+        _hdr.fill(0);
+        _hdr[4] = _k;
+    }
+`, batchGateRegion, config.SetOverlapCheckpointHeaderBytes/4)
 					cacheArgs = "cacheBase, cacheBytes"
 				}
 				// Written last: the descriptor carries the cache pointer, which

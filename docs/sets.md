@@ -110,7 +110,7 @@ differences are in the interface, not in what you call:
 | `find` | a caller-owned scanner plus the gate array below | a `resource`: the state lives inside the regexp component behind a handle |
 | `<find>_free` in C | a no-op | MANDATORY — it drops the handle |
 | `hints: [batch-find]` | a second entry point | refused at load |
-| `overlapping: true` answer cache | read by both find entries; the JS/TS stubs reserve one, other module callers pass their own | none, as for a C or Rust module consumer |
+| `overlapping: true` answer cache | read by both find entries; every generated stub reserves one | reserved by the `find` resource's constructor and freed with the handle |
 
 See [component.md](component.md#sets).
 
@@ -243,24 +243,30 @@ export function* scan_secrets(input, offset?, batchSize?): Generator<SetMatch>
 `[1, <set>BatchMaxSize]`. The limit is the cursor layout rather than a policy,
 and never binds in practice — 524,287 tuples is a 6 MB buffer.
 
-**On an `overlapping: true` set the JS/TS iterator also reserves an answer
-cache** for the duration of one iteration, and that reservation is large:
+**On an `overlapping: true` set every generated stub also reserves an answer
+cache** for the duration of one scan:
 
 | patterns | input | region |
 |---|---|---|
-| 3 | 100 KB | 3.5 MiB |
-| 100 | 16 KB | 18.8 MiB |
-| 8 | 1 MiB | 96 MiB — over the cap, nothing reserved |
-| 100 | 100 KB | 117 MiB — over the cap, nothing reserved |
+| 3 patterns | 100 KB | 1.6 MiB |
+| 3 patterns | 10 MB | 143 KB |
+| 32 patterns | 100 KB | 12.9 MiB |
+| 32 patterns | 10 MB | 2.7 MiB |
 
-The rule is `16 + (input_len + 1) * PATTERN_COUNT * 12` bytes, because the worst
-case is one match per pattern at every start position and a match is 12 bytes.
-A hundred patterns over 16 KB is nearly 19 MiB for that reason: 1.6 million
-matches. Most inputs produce far fewer, but the sweep fills the region as it
-goes and gives up when it runs out, so the size that is safe is the worst case.
+The region is the SQUARE ROOT of the input length, not a multiple of it,
+because the cache stores periodic column snapshots rather than every match and
+rebuilds one block at a time. Every position is swept at most twice, so the
+drive stays linear. Below a 64 MiB budget the stride covers the whole input,
+which is one block and behaves exactly as storing everything did; above it the
+stride drops and the region shrinks to its square root.
 
-**The stub caps what it will reserve at 64 MiB** and passes nothing beyond it,
-so the memory is bounded on large inputs and those drives simply walk.
+**Your stub does this for you.** It is generated with the sweep column's width
+baked in — that number comes from the compiler, not from your config — and sizes
+and seeds the region at construction. A C consumer is the one exception: the
+header needs no libc, so the cache is enabled only when a sysroot is present,
+and a freestanding build declines it and walks. See
+[wasm.md](wasm.md#the-overlapping-answer-cache) for the arithmetic and the
+header layout if you are driving the raw ABI.
 
 It is a reservation, not a cost: the sweep described under "Overlap policy" runs
 only when the drive proves expensive, and on the scans where the walk is already

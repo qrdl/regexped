@@ -1,0 +1,74 @@
+package compile
+
+import (
+	"github.com/qrdl/regexped/config"
+)
+
+// OverlapCacheShape is what a STUB GENERATOR needs in order to size an
+// overlapping set's answer cache, and the only thing `generate` is allowed to
+// learn about a compiled set.
+//
+// WHY THIS EXISTS AT ALL. The checkpointed cache's size depends on the sweep
+// column's width, which falls out of the DFA subset construction and is not
+// derivable from the YAML: `generate` can count patterns but cannot know how
+// many states their merged automaton has. The decision (plans §9.2 decision 1)
+// was that `generate` RECOMPILES the set and reads the number off the result,
+// rather than the compiler exporting a sizing function into the module or the
+// stub baking in a constant that goes stale.
+//
+// WHY IT RETURNS CELLS AND NOT A STATE COUNT. `cells` is the column WIDTH —
+// states x patterns today, projected states under §19's lever C. Returning the
+// width rather than its factors keeps every stub and both harnesses indifferent
+// to which of those the compiler is doing.
+type OverlapCacheShape struct {
+	// Eligible is false when this set gets no backward sweep, which is the
+	// ORDINARY case and not an error: the sweep is emitted only for an
+	// overlapping set with `find`, one fallback bucket, a dense accept mask, no
+	// Backtracking member, no word-boundary or newline channel, u8 state ids,
+	// and states x patterns within the column bound. A caller that gets false
+	// reserves no cache and the drive walks, exactly as today.
+	Eligible bool
+
+	// Cells is the sweep column's width. Region arithmetic lives in config
+	// (SetOverlapCheckpointBytes); this is its input.
+	Cells int
+
+	// Patterns is the bucket's pattern count, which sizes one position's worth
+	// of block buffer. It is NOT the set's declared pattern count and NOT its
+	// id space: a set whose members were dropped or packed elsewhere has fewer
+	// here, and sizing off the wrong one over-reserves or under-reserves.
+	Patterns int
+}
+
+// SetOverlapCacheShape compiles `sc` and reports what sizing its `find` needs.
+//
+// THE HAZARD THIS FUNCTION IS BUILT AROUND. It recompiles a set that the real
+// build also compiles, so the two must agree EXACTLY — a different automaton
+// means a region sized for the wrong sweep. `CmdWriteDiagJSON` re-runs
+// CompileSet the same way and shipped a bug by omitting the set's LikelyMode,
+// reporting the neutral frontend and body whatever the config's `hints:` said.
+// So the options are built by setCompileOptions, the SAME helper CompileFile
+// uses, rather than assembled here.
+func SetOverlapCacheShape(sc config.SetConfig, cfg config.BuildConfig) (OverlapCacheShape, error) {
+	cs, err := compileSetForInspection(sc, cfg)
+	if err != nil {
+		return OverlapCacheShape{}, err
+	}
+	bi := cs.overlapDPBucket()
+	if bi < 0 {
+		return OverlapCacheShape{}, nil
+	}
+	bkt := cs.buckets[bi]
+	cells := bkt.dp.numWASM * len(bkt.patterns)
+	if pr := cs.overlapProjFor(bi); pr != nil {
+		// Lever C: the column is one cell per PROJECTION, not per
+		// (state, pattern). Reporting the unprojected width here would size
+		// every caller's region for a column the sweep does not have.
+		cells = pr.cells
+	}
+	return OverlapCacheShape{
+		Eligible: true,
+		Cells:    cells,
+		Patterns: len(bkt.patterns),
+	}, nil
+}

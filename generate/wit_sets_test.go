@@ -57,7 +57,7 @@ func TestWitSetsInterface(t *testing.T) {
 	}
 	// `sets` declares its OWN error-code rather than `use matcher.{…}`, so a
 	// sets-only config needs no matcher interface at all.
-	if strings.Count(text, "enum error-code { backtrack-overflow }") != 2 {
+	if strings.Count(text, "enum error-code { backtrack-overflow, malformed-cache }") != 2 {
 		t.Error("each interface must declare its own error-code")
 	}
 }

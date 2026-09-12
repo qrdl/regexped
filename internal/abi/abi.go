@@ -56,6 +56,24 @@ const (
 	// Hosts must surface it as an error, never as "no match". See
 	// docs/engines.md ("Backtracking frame budget").
 	BTStackOverflow = -2
+
+	// OverlapCacheMalformed is returned when an overlapping `find` is handed an
+	// answer cache whose HEADER contradicts itself — a stride of zero, a stride
+	// wider than the span being swept, or a layout that does not fit the
+	// `cache_len` the same call declared.
+	//
+	// It is an ERROR and not a silent decline, which is the whole point of it.
+	// The region is CALLER-OWNED memory: the generated `init` fills it correctly
+	// by construction, but the raw ABI is documented and usable directly, and a
+	// caller who gets it wrong would otherwise see the drive quietly fall back to
+	// walking — indistinguishable from the engine legitimately refusing the
+	// shape, and quadratic on exactly the inputs the cache exists for.
+	//
+	// A region that is merely TOO SMALL is NOT this. That is a legitimate answer
+	// with its own signal (the sweep refuses, the drive walks, -1 from the sweep
+	// internally), because a caller is allowed to offer less than the optimum.
+	// Only a self-contradictory header lands here.
+	OverlapCacheMalformed = -4
 )
 
 // --- the `find` scratch descriptor -----------------------------------------

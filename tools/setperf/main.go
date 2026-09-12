@@ -343,6 +343,7 @@ func main() {
 	verify := flag.Bool("verify", false, "cross-engine correctness on the honest pairings")
 	compareFuel := flag.String("compare-fuel", "", "compare our fuel against a baseline file; exit 1 on any change")
 	compareSize := flag.String("compare-size", "", "compare module sizes against a baseline file; exit 1 on any change")
+	cacheSize := flag.Bool("cache-size", false, "report the overlapping answer cache region each design would reserve")
 	hints := flag.String("hints", "", "set-level LikelyMode hint applied to every case: prefer-match, prefer-no-match, or empty for neutral")
 	forceFE := flag.String("force-frontend", "", "TEST-ONLY: pin the literal frontend for every case (teddy, ac, scalar, packed-pair); empty lets the chooser decide")
 	flag.Parse()
@@ -373,6 +374,12 @@ func main() {
 	cases := buildMatrix()
 
 	switch {
+	case *cacheSize:
+		if err := reportCacheSizes(); err != nil {
+			fmt.Fprintln(os.Stderr, "cache-size:", err)
+			os.Exit(1)
+		}
+		return
 	case *compareFuel != "":
 		os.Exit(runCompare(*compareFuel, cases, measureFuelRow, "fuel"))
 	case *compareSize != "":
@@ -904,8 +911,12 @@ type rxInstance struct {
 	// handed 0, 0 and takes the ordinary per-position walk.
 	cachePtr int32
 	cacheLen int32
-	npat     int32
-	inLen    int32
+	// The checkpointed cache's stride, which the CALLER picks and the sweep
+	// validates (plans §9.2 decision 2). A generated `init` computes it from
+	// the same config helper; this harness is that init's stand-in.
+	cacheStride int32
+	npat        int32
+	inLen       int32
 	// fnCache holds resolved exports. Resolving inside the timed loop meant
 	// every measured operation paid a string-keyed export lookup that is
 	// neither engine work nor the wasmtime crossing — pure harness cost, and
@@ -968,7 +979,17 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	// The batch buffer sits above the bitmap, 4 KB clear of it.
 	batchPtr := bitmapPt + int32(npat)/8 + 4096
 	cachePtr := (batchPtr + int32(batchCap)*12 + 4096 + 7) &^ 7
-	cacheLen := int32(config.SetOverlapCacheBytes(len(c.input), int(npat)))
+	// The checkpointed region, sized from the sweep column the compiler
+	// actually built. Falls back to a nominal region when the set gets no
+	// sweep: the descriptor still carries a pointer, and the drive declines it.
+	cells, cacheStride := 0, int32(0)
+	cacheLen := int32(config.SetOverlapCheckpointHeaderBytes)
+	if sh, err := overlapShapeFor(c); err == nil && sh.Eligible {
+		cells = sh.Cells
+		k := config.SetOverlapCheckpointStride(len(c.input), sh.Cells, sh.Patterns, true)
+		cacheStride = int32(k)
+		cacheLen = int32(config.SetOverlapCheckpointBytes(len(c.input), cells, int(npat), true))
+	}
 	top := int64(cachePtr) + int64(cacheLen) + 4096
 	needed := uint64((top + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
@@ -983,7 +1004,7 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 		inBase: inBase, outPtr: outPtr, gatePtr: gatePtr, scratchPtr: scratchPtr,
 		bitmapPt: bitmapPt,
 		batchPtr: batchPtr,
-		cachePtr: cachePtr, cacheLen: cacheLen,
+		cachePtr: cachePtr, cacheLen: cacheLen, cacheStride: cacheStride,
 		npat: npat, inLen: int32(len(c.input)),
 	}, nil
 }
@@ -1003,9 +1024,12 @@ func (r *rxInstance) writeScratch(cache bool) {
 	cachePtr, cacheLen := int32(0), int32(0)
 	if cache {
 		cachePtr, cacheLen = r.cachePtr, r.cacheLen
-		for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
+		for i := int32(0); i < config.SetOverlapCheckpointHeaderBytes; i++ {
 			buf[cachePtr+i] = 0
 		}
+		// The stride is the one header field the CALLER fills. Everything else
+		// is zero, which is what "this drive has not swept yet" means.
+		binary.LittleEndian.PutUint32(buf[cachePtr+16:], uint32(r.cacheStride))
 	}
 	abi.WriteFindScratch(buf, r.scratchPtr, r.gatePtr, cachePtr, cacheLen)
 	runtime.KeepAlive(r.store)

@@ -221,9 +221,45 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 			//
 			// Written before EACH call: field 1 is the address of a managed
 			// array, and a descriptor written once could outlive a compaction.
+			cacheSet := "this.scratch[2] = 0, this.scratch[3] = 0"
+			if sh := overlapCacheShapeFor(s, cfg); sh.Eligible {
+				// The CHECKPOINTED answer cache, allocated once with the
+				// iterator and collected with it — `init`/`free` in a language
+				// that has a runtime. Without one an overlapping drive is
+				// quadratic, and `find` reads a cache exactly as the batching
+				// entry does.
+				//
+				// The stride is the one field the caller owns, because the
+				// caller is what sized the allocation from it. This arithmetic
+				// MUST match config.SetOverlapCheckpoint*: the sweep validates
+				// what it is handed and reports a header it cannot parse.
+				gateField += "    cache: StaticArray<u32>;\n"
+				gateInit += fmt.Sprintf(`        {
+            const m: u64 = <u64>input.length + 1;
+            const row: u64 = 4 + 4 * %[2]d;
+            const cell: u64 = %[1]d * 4 + 4;
+            let k: u64 = m;
+            if (%[3]d + cell + 4 + m * row > %[4]d) {
+                k = <u64>Math.sqrt(<f64>m * %[1]d * 4 / <f64>row);
+                if (k < 16) k = 16;
+                if (k > m) k = m;
+            }
+            const nb: u64 = (m + k - 1) / k;
+            const bytes: u64 = %[3]d + nb * cell + 4 + k * row;
+            if (bytes <= %[4]d) {
+                this.cache = new StaticArray<u32>(<i32>((bytes + 3) / 4));
+                this.cache[4] = <u32>k;
+            } else {
+                this.cache = new StaticArray<u32>(0);
+            }
+        }
+`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes)
+				cacheSet = "this.scratch[2] = (this.cache.length == 0 ? 0 : changetype<usize>(this.cache) as u32), " +
+					"this.scratch[3] = <u32>(this.cache.length * 4)"
+			}
 			gateArg := "(this.scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) +
-				", this.scratch[1] = changetype<usize>(this.gates) as u32, this.scratch[2] = 0, " +
-				"this.scratch[3] = 0, changetype<usize>(this.scratch)), "
+				", this.scratch[1] = changetype<usize>(this.gates) as u32, " + cacheSet +
+				", changetype<usize>(this.scratch)), "
 			// AssemblyScript has no generators, so `find` is an explicit
 			// iterator object — caller-owned, so two scans can be in flight
 			// and re-creating it restarts the scan.

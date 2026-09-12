@@ -28,7 +28,7 @@ package regexped:url-ipv6;
 
 interface matcher {
     /// The Backtracking engine exhausted its frame budget; the answer is unknown.
-    enum error-code { backtrack-overflow }
+    enum error-code { backtrack-overflow, malformed-cache }
 
     /// Anchored match against the whole input. some(end) on a match.
     email-match: func(input: list<u8>) -> result<option<u32>, error-code>;

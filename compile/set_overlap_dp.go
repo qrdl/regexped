@@ -1,7 +1,7 @@
 package compile
 
 import (
-	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -99,6 +99,12 @@ type overlapDPTables struct {
 	// was removed, and note that the FORWARD body still reads its own.
 	midBitmaskOff int32
 	eofBitmaskOff int32
+
+	// The same two tables as VALUES, indexed by WASM state. Lever C's
+	// projection is a compile-time partition refinement over them and the
+	// transition table, and cannot read a data-segment offset.
+	midMasks []uint64
+	eofMasks []uint64
 
 	numWASM      int
 	wasmStart    uint32
@@ -215,7 +221,52 @@ func (cs *compiledSet) overlapDPColumnBytes() int32 {
 		return 0
 	}
 	dp := cs.buckets[bi].dp
+	if p := cs.overlapProjFor(bi); p != nil {
+		return int32(2 * p.cells * 4)
+	}
 	return int32(2 * dp.numWASM * len(cs.buckets[bi].patterns) * 4)
+}
+
+// overlapProjFor returns lever C's projection for a bucket, computing it once.
+//
+// Cached on the compiledSet because three places need the SAME answer — the
+// column sizing, the emitted projection table and the sweep bodies — and a
+// second call that decided differently would size a column one thing and index
+// it another.
+func (cs *compiledSet) overlapProjFor(bi int) *overlapProj {
+	if cs.overlapProjDone {
+		return cs.overlapProj
+	}
+	cs.overlapProjDone = true
+	if bi < 0 {
+		return nil
+	}
+	bkt := cs.buckets[bi]
+	cs.overlapProj = buildOverlapProj(bkt.dp, len(bkt.patterns))
+	return cs.overlapProj
+}
+
+// overlapProjTabBytes is the emitted projection table: for each pattern, the
+// BYTE OFFSET within a column of every WASM state's cell. u16 because a column
+// is bounded well under 64 KB.
+func (cs *compiledSet) overlapProjTabBytes() []byte {
+	bi := cs.overlapDPBucket()
+	if bi < 0 {
+		return nil
+	}
+	p := cs.overlapProjFor(bi)
+	if p == nil {
+		return nil
+	}
+	n := cs.buckets[bi].dp.numWASM
+	out := make([]byte, 0, len(p.cellOf)*n*2)
+	for _, col := range p.cellOf {
+		for w := 0; w < n; w++ {
+			off := uint16(col[w] * 4)
+			out = append(out, byte(off), byte(off>>8))
+		}
+	}
+	return out
 }
 
 // emitOverlapDPTransition pushes delta(stateLocal, byteLocal) into dstLocal.
@@ -274,420 +325,6 @@ func emitOverlapDPTransition(b []byte, dp overlapDPTables, tableMemIdx int, stat
 	return b
 }
 
-// Scratch header, in i32 slots at scratchPtr. The caller zeroes the whole
-// region to start a drive, exactly as it zeroes the gate array, so a zero
-// `ready` slot IS "this drive has not swept yet" and needs no magic value.
-const (
-	overlapDPHdrDataOff = 0 // byte offset of the first tuple, from scratchPtr
-	overlapDPHdrCount   = 4 // tuples written
-	overlapDPHdrReady   = 8 // non-zero once the sweep has run
-	// overlapDPHdrWork is the drive's accumulated WORK, in matched bytes: the
-	// sum of (end - start) over every tuple the walk has delivered so far.
-	//
-	// It lives in the caller's scratch for the same reason the gate array
-	// does — the module may not own state across calls — and it is
-	// what makes the sweep ADAPTIVE rather than unconditional. The header was
-	// already 16 bytes with this slot as padding, so nothing about the
-	// contract changes: the caller zeroes the header to start a drive, and a
-	// zero work count is the honest starting value.
-	overlapDPHdrWork = 12
-	// The width is config's, not ours: every stub generator has to agree on
-	// it independently, so it is stated once, beside the cursor layout.
-	overlapDPHdrBytes = config.SetOverlapCacheHeaderBytes
-)
-
-// emitOverlapDPBody emits the sweep.
-//
-//	(ptr, len, from, scratchPtr, scratchLen) -> i32
-//
-// Sweeps [from, len] ONCE, right to left, and writes every (start,
-// pattern, extent) tuple into the caller's scratch. Returns the tuple count,
-// or -1 when the scratch could not hold them — which is a FALLBACK signal
-// rather than an error: the caller then runs the ordinary walk, the same rule
-// `out_cap` underflow already has, so the answer is never wrong, only slower.
-//
-// TUPLES COME OUT ASCENDING despite the sweep running backwards, and no
-// counting pass is needed to arrange that. The writer starts at the END of the
-// scratch region and moves DOWN, so the first tuple produced (the highest
-// start) lands last in memory and the final tuple lands first. The header
-// records where the block begins. Stage B needed a counting pass for exactly
-// this and paid for it twice.
-//
-// The pattern loop is UNROLLED — the count is a compile-time property of the
-// bucket — which turns every accept test into a constant mask, every tuple's
-// pattern id into a constant, and every column access into a static offset off
-// a row base. That is most of the per-entry cost.
-func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
-	bi := cs.overlapDPBucket()
-	bkt := cs.buckets[bi]
-	dp := bkt.dp
-	ids := cs.patternIDs[bi]
-	numPat := len(ids)
-	numStates := dp.numWASM
-	rowBytes := int32(numPat * 4)
-	entries := numStates * numPat
-
-	const (
-		pPtr = iota
-		pLen
-		// pFrom bounds the sweep BELOW: it produces tuples for starts in
-		// [from, len] and nothing under `from`. That is what lets a drive
-		// switch to the cache after the walk has already delivered a prefix —
-		// cache index 0 is then the first UNDELIVERED tuple, so no search and
-		// no skip count are needed, and the walk-delivered and cache-served
-		// halves meet in ascending order by construction.
-		pFrom
-		pScratch
-		pScratchLen
-	)
-	// Locals begin one past the last parameter. Derived rather than written
-	// out: adding `from` to the signature shifted every local by one, and a
-	// hardcoded base turned that into a validation error instead of a compile
-	// error.
-	const (
-		lCur = pScratchLen + 1 + iota
-		lPrev
-		lPos
-		lByte
-		lState
-		lNext
-		lVal
-		lCount
-		lWrite
-		lLimit
-		lCurRow
-		lPrevRow
-		lSwap
-		lStartRow
-	)
-	// lCell holds the current byte's equivalence class, computed once per
-	// position rather than once per state.
-	const lCell = lStartRow + 1
-	const (
-		lMidMask = lCell + 1 + iota
-		lEofMask
-	)
-
-	colA := colOff
-	colB := colOff + int32(entries*4)
-
-	var b []byte
-	b = append(b, 0x02)       // two local groups
-	b = append(b, 0x0F, 0x7F) // 15 i32
-	b = append(b, 0x02, 0x7E) // 2 i64
-
-	konst := func(v int32) { b = append(b, 0x41); b = utils.AppendSLEB128(b, v) }
-	// i64.const takes a SIGNED LEB128, and the whole 64-bit value: encoding it
-	// unsigned, or through a uint32, is wrong twice over. Bit 6 is where it
-	// first shows — 1<<6 is the single byte 0x40, which reads back as -64, so
-	// the mask tests bits 6..63 together instead of bit 6 alone. That is
-	// invisible until a bucket holds EIGHT patterns, because with seven there
-	// are no higher bits to pick up and the wrong constant gives the right
-	// answer. Caught by the corpus, and the reason the differential test now
-	// carries a wide-bucket case.
-	konst64 := func(v uint64) { b = append(b, 0x42); b = utils.AppendSLEB128_64(b, int64(v)) }
-	get := func(l byte) { b = append(b, 0x20, l) }
-	set := func(l byte) { b = append(b, 0x21, l) }
-	tee := func(l byte) { b = append(b, 0x22, l) }
-	add := func() { b = append(b, 0x6A) }
-	mul := func() { b = append(b, 0x6C) }
-
-	// loadMask64 pushes the i64 accept mask for the state in `stateLocal`.
-	loadMask64 := func(off int32, stateLocal byte) {
-		get(stateLocal)
-		konst(8)
-		mul()
-		konst(off)
-		add()
-		b = appendTableLoad64(b, tableMemIdx)
-	}
-	// storeCol stores the value on the stack into the current column row at
-	// slot k.
-	//
-	// The two working columns live at cs.overlapDPColOff — a TABLE-memory
-	// address (their zero-filled data segment is rewritten to memory 1 in
-	// embedded mode), so the access must carry the memory index like every
-	// other table access in this body. Standalone (tableMemIdx == 0, which is
-	// every harness in this repo) is the same bytes either way; embedded with
-	// a raw memory-0 store wrote over the HOST's heap.
-	storeCol := func(k int) {
-		b = appendTableStore32(b, tableMemIdx, uint32(k*4))
-	}
-	// loadCol pushes the column value at slot k of the row whose address is
-	// already on the stack.
-	loadCol := func(k int) {
-		b = appendTableLoad32(b, tableMemIdx, uint32(k*4))
-	}
-
-	// ---- prologue ----
-	get(pScratch)
-	get(pScratchLen)
-	add()
-	set(lWrite) // exclusive end; the writer predecrements
-	get(pScratch)
-	konst(overlapDPHdrBytes)
-	add()
-	set(lLimit)
-	konst(0)
-	set(lCount)
-	konst(colA)
-	set(lCur)
-	konst(colB)
-	set(lPrev)
-
-	// ---- column at t == len: len when the state accepts at EOF, else -1 ----
-	// From state 1: row 0 is the dead state's, and nothing reads it.
-	konst(1)
-	set(lState)
-	b = append(b, 0x02, 0x40) // block $stateDone
-	b = append(b, 0x03, 0x40) // loop $state
-	get(lState)
-	konst(int32(numStates))
-	b = append(b, 0x4E)       // i32.ge_s
-	b = append(b, 0x0D, 0x01) // br_if $stateDone
-	loadMask64(dp.eofBitmaskOff, lState)
-	set(lEofMask)
-	get(lCur)
-	get(lState)
-	konst(rowBytes)
-	mul()
-	add()
-	set(lCurRow)
-	for k := 0; k < numPat; k++ {
-		get(lCurRow)
-		get(lEofMask)
-		konst64(uint64(1) << uint(k))
-		b = append(b, 0x83) // i64.and
-		b = append(b, 0x50) // i64.eqz
-		b = append(b, 0x04, 0x7F)
-		konst(-1)
-		b = append(b, 0x05)
-		get(pLen)
-		b = append(b, 0x0B)
-		storeCol(k)
-	}
-	get(lState)
-	konst(1)
-	add()
-	set(lState)
-	b = append(b, 0x0C, 0x00) // br $state
-	b = append(b, 0x0B)       // end loop
-	b = append(b, 0x0B)       // end block
-
-	// emitTuplesAt writes one tuple per matching pattern for the position in
-	// lPos, reading the column row for that position's START STATE.
-	//
-	// Unrolled over patterns so the id is a constant and the column access is
-	// a static offset. Writes DOWNWARD from the end of the scratch, which is
-	// what makes the finished block ascending without a counting pass.
-	emitTuplesAt := func(atZero bool) {
-		startState := dp.wasmMidStart
-		if atZero {
-			startState = dp.wasmStart
-		}
-		get(lCur)
-		konst(int32(startState) * rowBytes)
-		add()
-		set(lStartRow)
-		for k := 0; k < numPat; k++ {
-			get(lStartRow)
-			loadCol(k)
-			tee(lVal)
-			konst(-1)
-			b = append(b, 0x47)       // i32.ne  -> this pattern matched here
-			b = append(b, 0x04, 0x40) // if
-
-			// Reserve twelve bytes. Running past the header is the
-			// insufficient-scratch case: bail with -1 and let the caller walk.
-			get(lWrite)
-			konst(12)
-			b = append(b, 0x6B) // i32.sub
-			tee(lWrite)
-			get(lLimit)
-			b = append(b, 0x48) // i32.lt_s
-			b = append(b, 0x04, 0x40)
-			konst(-1)
-			b = append(b, 0x0F) // return -1
-			b = append(b, 0x0B)
-
-			get(lWrite)
-			konst(int32(ids[k]))
-			b = append(b, 0x36, 0x02, 0x00) // tuple.id
-			get(lWrite)
-			get(lPos)
-			b = append(b, 0x36, 0x02, 0x04) // tuple.start
-			get(lWrite)
-			get(lVal)
-			b = append(b, 0x36, 0x02, 0x08) // tuple.end
-			get(lCount)
-			konst(1)
-			add()
-			set(lCount)
-			b = append(b, 0x0B) // end if
-		}
-	}
-
-	// Position len first: the empty match at end of input is a legitimate
-	// start, and it is the HIGHEST one, so it must be written before any
-	// other for the downward fill to come out ascending.
-	//
-	// The start state is the mid one EXCEPT on empty input, where position
-	// len IS position 0 and a begin-anchored pattern has to see the
-	// begin-anchored state. The main sweep below runs len-1 down to 0, so on
-	// empty input it runs no iterations at all and cannot supply that case —
-	// which is why the test is here and not only there. Found by the corpus:
-	// `^(?:(?:.|(?:c?)))$` on "" must report 0-0 and reported nothing.
-	get(pLen)
-	set(lPos)
-	// ...but only if position len is at or above the floor. A caller resuming
-	// past the end of the input gets nothing, which is the documented contract.
-	get(pLen)
-	get(pFrom)
-	b = append(b, 0x4E)       // i32.ge_s
-	b = append(b, 0x04, 0x40) // if
-	get(pLen)
-	b = append(b, 0x45)       // i32.eqz -> the input is empty
-	b = append(b, 0x04, 0x40) // if
-	emitTuplesAt(true)
-	b = append(b, 0x05) // else
-	emitTuplesAt(false)
-	b = append(b, 0x0B)
-	b = append(b, 0x0B)
-
-	// ---- main sweep: t = len-1 down to 0 ----
-	get(pLen)
-	konst(1)
-	b = append(b, 0x6B)
-	set(lPos)
-	b = append(b, 0x02, 0x40) // block $sweepDone
-	b = append(b, 0x03, 0x40) // loop $sweep
-	get(lPos)
-	get(pFrom)
-	b = append(b, 0x48)       // i32.lt_s -> below the caller's floor
-	b = append(b, 0x0D, 0x01) // br_if $sweepDone
-
-	// The column just computed becomes the suffix answer for this position.
-	get(lCur)
-	set(lSwap)
-	get(lPrev)
-	set(lCur)
-	get(lSwap)
-	set(lPrev)
-
-	get(pPtr)
-	get(lPos)
-	add()
-	b = appendInputLoad8u(b)
-	set(lByte)
-	b = emitOverlapDPCell(b, dp, tableMemIdx, lByte, lCell)
-
-	// State 0 is the DEAD state, and its column is never read: every read goes
-	// through prev[lNext] with lNext != 0, and both start states are >= 1. It
-	// was computed at every position anyway, which at the eligibility floor is
-	// a third to a half of the whole sweep.
-	konst(1)
-	set(lState)
-	b = append(b, 0x02, 0x40) // block $stDone
-	b = append(b, 0x03, 0x40) // loop $st
-	get(lState)
-	konst(int32(numStates))
-	b = append(b, 0x4E)
-	b = append(b, 0x0D, 0x01)
-
-	b = emitOverlapDPTransition(b, dp, tableMemIdx, lState, lCell, lNext)
-	loadMask64(dp.midBitmaskOff, lState)
-	set(lMidMask)
-
-	get(lCur)
-	get(lState)
-	konst(rowBytes)
-	mul()
-	add()
-	set(lCurRow)
-	get(lPrev)
-	get(lNext)
-	konst(rowBytes)
-	mul()
-	add()
-	set(lPrevRow)
-
-	for k := 0; k < numPat; k++ {
-		get(lCurRow)
-		// The recursion, when the suffix answered and the step is not dead.
-		get(lNext)
-		b = append(b, 0x04, 0x7F)
-		get(lPrevRow)
-		loadCol(k)
-		b = append(b, 0x05)
-		konst(-1)
-		b = append(b, 0x0B)
-		tee(lVal)
-		konst(-1)
-		b = append(b, 0x47) // i32.ne -> the suffix answered
-		b = append(b, 0x04, 0x7F)
-		get(lVal)
-		b = append(b, 0x05)
-		// Otherwise the last accept seen, which is here or nowhere.
-		get(lMidMask)
-		konst64(uint64(1) << uint(k))
-		b = append(b, 0x83)
-		b = append(b, 0x50)
-		b = append(b, 0x04, 0x7F)
-		konst(-1)
-		b = append(b, 0x05)
-		get(lPos)
-		b = append(b, 0x0B)
-		b = append(b, 0x0B)
-		storeCol(k)
-	}
-
-	get(lState)
-	konst(1)
-	add()
-	set(lState)
-	b = append(b, 0x0C, 0x00)
-	b = append(b, 0x0B)
-	b = append(b, 0x0B) // end state loop
-
-	// Position 0 gets the begin-anchored start state; every other position
-	// gets the mid one. The test is on the position, not on the loop, so an
-	// input of length 1 reaches both arms correctly.
-	get(lPos)
-	b = append(b, 0x45) // i32.eqz
-	b = append(b, 0x04, 0x40)
-	emitTuplesAt(true)
-	b = append(b, 0x05)
-	emitTuplesAt(false)
-	b = append(b, 0x0B)
-
-	get(lPos)
-	konst(1)
-	b = append(b, 0x6B)
-	set(lPos)
-	b = append(b, 0x0C, 0x00)
-	b = append(b, 0x0B)
-	b = append(b, 0x0B) // end sweep
-
-	// ---- header ----
-	get(pScratch)
-	get(lWrite)
-	get(pScratch)
-	b = append(b, 0x6B) // i32.sub -> offset of the first tuple
-	b = append(b, 0x36, 0x02, overlapDPHdrDataOff)
-	get(pScratch)
-	get(lCount)
-	b = append(b, 0x36, 0x02, overlapDPHdrCount)
-	get(pScratch)
-	konst(1)
-	b = append(b, 0x36, 0x02, overlapDPHdrReady)
-
-	get(lCount)
-	b = append(b, 0x0B) // end function
-
-	body := utils.AppendULEB128(nil, uint32(len(b)))
-	return append(body, b...)
-}
-
 // --- the shared cache logic -------------------------------------------------
 //
 // Reading a cache is COMMON code, called from both `find` and `find_batch`.
@@ -707,8 +344,13 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 // allocate their frames independently, and threading indices is what lets the
 // SAME bytes come out of both.
 type overlapCacheCtx struct {
-	// dpIdx is the function index of the backward sweep.
+	// dpIdx is the function index of the CHECKPOINT PASS.
 	dpIdx int
+	// blkIdx is the function index of the BLOCK MATERIALISER. The checkpointed
+	// cache answers a position out of one materialised block at a time, so
+	// every serving path needs both: the pass to build the checkpoints, and
+	// this to turn the one block it wants into tuples.
+	blkIdx int
 	// costPerByte is what one input byte of sweeping costs, in the same
 	// currency the work counter uses (matched bytes).
 	costPerByte int64
@@ -719,6 +361,13 @@ type overlapCacheCtx struct {
 	pCacheLen byte // cache_len
 	lReady    byte // the header's `ready`, cached for this call
 	lWork     byte // the header's `work`, cached for this call
+	// lSweepRet holds the sweep's return so the caller can tell a REFUSAL
+	// (the region is too small — walk, same answer) from a MALFORMED header
+	// (the caller got it wrong — report it).
+	lSweepRet byte
+	// i64Ret marks the entry whose export returns an i64, which changes only
+	// how the error is packed.
+	i64Ret bool
 }
 
 // emitWorkExceedsSweep pushes 1 when the walk has already spent more than the
@@ -750,10 +399,10 @@ func (c overlapCacheCtx) emitDefaults(b []byte) []byte {
 // where the cache pointer is known non-zero.
 func (c overlapCacheCtx) emitHeaderRead(b []byte) []byte {
 	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, overlapDPHdrReady)
+	b = append(b, 0x28, 0x02, ckptHdrReady)
 	b = append(b, 0x21, c.lReady)
 	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, overlapDPHdrWork)
+	b = append(b, 0x28, 0x02, ckptHdrWork)
 	b = append(b, 0x21, c.lWork)
 	return b
 }
@@ -769,8 +418,43 @@ func (c overlapCacheCtx) emitSweepCall(b []byte, pushFrom func([]byte) []byte) [
 	b = append(b, 0x20, c.pCacheLen)
 	b = append(b, 0x10) // call
 	b = utils.AppendULEB128(b, uint32(c.dpIdx))
+	b = append(b, 0x22, c.lSweepRet)
 	b = append(b, 0x41, 0x00)
-	b = append(b, 0x48) // i32.lt_s -> the sweep refused
+	b = append(b, 0x48) // i32.lt_s -> the sweep did not deliver
+	return b
+}
+
+// emitMalformedReturn turns a self-contradictory header into the CALLER's
+// error, instead of the silent walk a merely-too-small region gets.
+//
+// The two outcomes look alike from inside — both are a negative return from the
+// sweep — and treating them alike is what plans §9.2 decision 3 forbids. A
+// region the caller could not afford is a legitimate answer and degrades
+// quietly; a header whose stride is nonsense is a MISTAKE, and left quiet it is
+// indistinguishable from the engine declining the shape, on precisely the
+// inputs the cache exists for.
+//
+// Emitted inside the "did not deliver" arm, so the ordinary refusal falls
+// through to marking the drive and walking.
+func (c overlapCacheCtx) emitMalformedReturn(b []byte, i64Ret bool) []byte {
+	b = append(b, 0x20, c.lSweepRet)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheMalformed))
+	b = append(b, 0x46)       // i32.eq
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheMalformed))
+	if i64Ret {
+		// find_batch returns an i64 cursor+count pair. The error rides in the
+		// COUNT half, which is where every other negative answer on that entry
+		// already lives, with the sentinel cursor above it so a caller that
+		// ignores the sign still stops.
+		b = append(b, 0xAC) // i64.extend_i32_s
+		b = append(b, 0x42, 0x7F, 0x42, 0x20, 0x86)
+		b = append(b, 0x84) // i64.or
+	}
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B)
 	return b
 }
 
@@ -778,7 +462,7 @@ func (c overlapCacheCtx) emitSweepCall(b []byte, pushFrom func([]byte) []byte) [
 func (c overlapCacheCtx) emitMarkRefused(b []byte) []byte {
 	b = append(b, 0x20, c.pCache)
 	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x36, 0x02, overlapDPHdrReady)
+	b = append(b, 0x36, 0x02, ckptHdrReady)
 	return b
 }
 
@@ -790,7 +474,7 @@ func (c overlapCacheCtx) emitMarkRefused(b []byte) []byte {
 func (c overlapCacheCtx) emitStoreWork(b []byte) []byte {
 	b = append(b, 0x20, c.pCache)
 	b = append(b, 0x20, c.lWork)
-	b = append(b, 0x36, 0x02, overlapDPHdrWork)
+	b = append(b, 0x36, 0x02, ckptHdrWork)
 	return b
 }
 
@@ -814,10 +498,11 @@ func (c overlapCacheCtx) emitEntrySweep(b []byte, pushFrom func([]byte) []byte, 
 	b = append(b, 0x04, 0x40)
 	b = c.emitSweepCall(b, pushFrom)
 	b = append(b, 0x04, 0x40)
+	b = c.emitMalformedReturn(b, c.i64Ret)
 	b = c.emitMarkRefused(b)
-	b = append(b, 0x0B) // end if the sweep refused
+	b = append(b, 0x0B) // end if the sweep did not deliver
 	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, overlapDPHdrReady)
+	b = append(b, 0x28, 0x02, ckptHdrReady)
 	b = append(b, 0x21, c.lReady)
 	if lEntrySwept >= 0 {
 		b = append(b, 0x41, 0x01, 0x21, byte(lEntrySwept))
@@ -856,5 +541,44 @@ func (c overlapCacheCtx) emitAccumulateWork(b []byte, pOutPtr, idxLocal, countLo
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B) // end loop
 	b = append(b, 0x0B) // end block
+	return b
+}
+
+// emitEnsureBlock makes block `jLocal` the materialised one, calling the block
+// body only when it is not already.
+//
+// `curBlock` is stored +1 so that the caller's zeroed header reads as "no block
+// materialised" without a magic value — the same trick `ready` uses, and the
+// reason a drive needs no initialisation beyond zeroing.
+//
+// It is here, in the shared file, because BOTH find entries need it and a
+// second copy is how the two would come to disagree about which block is live
+// while sharing one header to say so.
+func (c overlapCacheCtx) emitEnsureBlock(b []byte, jLocal byte) []byte {
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x28, 0x02, ckptHdrCurBlock)
+	b = append(b, 0x20, jLocal)
+	b = append(b, 0x41, 0x01, 0x6A) // j+1
+	b = append(b, 0x47)             // i32.ne
+	b = append(b, 0x04, 0x40)       // if
+	b = append(b, 0x20, c.pInPtr)
+	b = append(b, 0x20, c.pInLen)
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x20, jLocal)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(c.blkIdx))
+	b = append(b, 0x1A) // drop: the count lands in the header
+	b = append(b, 0x0B)
+	return b
+}
+
+// emitBlockCum pushes cum[idxLocal] — the number of tuples in blocks below it.
+func (c overlapCacheCtx) emitBlockCum(b []byte, idxLocal byte) []byte {
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x28, 0x02, ckptHdrCntOff)
+	b = append(b, 0x20, c.pCache, 0x6A)
+	b = append(b, 0x20, idxLocal)
+	b = append(b, 0x41, 0x04, 0x6C, 0x6A)
+	b = append(b, 0x28, 0x02, 0x00)
 	return b
 }

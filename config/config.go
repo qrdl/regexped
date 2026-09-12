@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -403,8 +404,16 @@ const SetCursorOverflowPos = 0xFFFFFFFE
 // read, and it is read only once "ready" says so.
 const SetOverlapCacheHeaderBytes = 16
 
-// SetOverlapCacheBytes is the cache size a drive over an input of inputLen
-// bytes wants, for a set of patternCount patterns.
+// SetOverlapCacheBytes is the WHOLE-DRIVE cache size: the region the cache
+// needed before it was checkpointed, twelve bytes per tuple with one tuple per
+// pattern per start position.
+//
+// NOTHING SHIPS THIS ANY MORE. The compiler, every stub and both harnesses size
+// with SetOverlapCheckpointBytes. It survives because it is the baseline the
+// checkpointed design is measured against, and a formula quoted from memory in
+// a benchmark is a formula that drifts from the one it is compared with.
+//
+// Historic form, for an input of inputLen bytes and patternCount patterns.
 //
 // Twelve bytes per tuple, and the worst case is one tuple per pattern per
 // START POSITION. That is not pessimism: a pattern whose automaton never dies
@@ -839,4 +848,137 @@ func ExpandHome(path string) string {
 		}
 	}
 	return path
+}
+
+// ---------------------------------------------------------------------------
+// The CHECKPOINTED answer cache (plans: §9.2 + §19). One place, because the
+// compiler's sweep VALIDATES what the stubs compute, and six stub languages
+// plus two harnesses each spell it independently — exactly the drift the
+// find_batch cursor layout is kept here to avoid.
+//
+// The region is
+//
+//	hdr + nb*(C + 4) + k*B      nb = ceil(m/k), C = cells*4, B = per-position bytes
+//
+// minimised at k = sqrt(m*C/B), giving ~ 2*sqrt(m*C*B): SQUARE-ROOT in the
+// input where the whole-drive tuple cache is linear in it.
+//
+// `cells` is the sweep's column width — states x patterns today, projected
+// states under §19's lever C — and comes from the compiler, never from the
+// YAML: it falls out of the DFA subset construction. generate/ obtains it by
+// recompiling the set (§9.2 decision 1).
+
+// SetOverlapCheckpointHeaderBytes is the header of the checkpointed cache.
+//
+// Eleven i32 fields is 44; 48 leaves one spare word and keeps the 4-byte
+// alignment set_abi_test asserts. The caller zeroes it to start a drive and
+// then writes the stride, exactly as it zeroes the gate array.
+const SetOverlapCheckpointHeaderBytes = 48
+
+// SetOverlapTupleBytes is one match in the block buffer under the TUPLE form
+// (id, start, end). Lever B replaces this with a per-position row.
+const SetOverlapTupleBytes = 12
+
+// SetOverlapBlockRowBytes is one position's worth of block buffer.
+//
+// Tuple form: the worst case is one match per pattern at one start position,
+// so P tuples. Lever B's row form is a mask plus one end per pattern, and is
+// selected by rowForm.
+func SetOverlapBlockRowBytes(patterns int, rowForm bool) int {
+	if rowForm {
+		return 4 + 4*patterns
+	}
+	return patterns * SetOverlapTupleBytes
+}
+
+// SetOverlapCheckpointStride is the k an init should choose: the one that
+// minimises the region.
+//
+// Computed in float64 on purpose. m*cells reaches 2^43 on a large input and
+// wraps in int32, and every stub language must reproduce this exactly or it
+// allocates a region the sweep's validation rejects.
+func SetOverlapCheckpointStride(inputLen, cells, patterns int, rowForm bool) int {
+	m := inputLen + 1
+	if m < 1 {
+		m = 1
+	}
+	// SINGLE-BLOCK MODE, and it is what makes checkpointing free when memory is
+	// not the problem.
+	//
+	// A stride equal to the whole span IS the whole-drive cache: one block, so
+	// the pass sweeps once and materialises it on the way, nothing is ever
+	// re-swept, and serving binary-searches the one block exactly as the
+	// whole-drive form searched the whole region. So the two designs need not
+	// both exist in the module — the second sweep that checkpointing costs is
+	// bought only when the region would otherwise be too large, and below the
+	// budget a drive pays exactly what it paid before any of this.
+	//
+	// The budget is SetOverlapCacheMaxBytes. Above it the stride drops to the
+	// square-root optimum and the region becomes sqrt-sized, which is the whole
+	// point; below it nothing changes but a column's worth of bytes.
+	if n := singleBlockBytes(m, cells, patterns, rowForm); n > 0 && n <= SetOverlapCacheMaxBytes {
+		return m
+	}
+	c := float64(cells) * 4
+	bb := float64(SetOverlapBlockRowBytes(patterns, rowForm))
+	k := int(math.Sqrt(float64(m) * c / bb))
+	if k < 16 {
+		k = 16
+	}
+	if k > m {
+		k = m
+	}
+	return k
+}
+
+// singleBlockBytes is the region a one-block (whole-drive) cache needs, or 0
+// when it overflows an int on this platform — which is itself a reason to
+// checkpoint.
+func singleBlockBytes(m, cells, patterns int, rowForm bool) int {
+	b := SetOverlapBlockRowBytes(patterns, rowForm)
+	if b > 0 && m > (1<<62)/b {
+		return 0
+	}
+	n := SetOverlapCheckpointHeaderBytes + (cells*4 + 4) + 4 + m*b
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// SetOverlapCheckpointBytesForStride is the region for a CHOSEN stride.
+//
+// The stride is a continuous knob, not a switch. At the square-root optimum it
+// minimises MEMORY; at the whole span it is one block, which minimises FUEL
+// because no column is ever copied and nothing is re-swept. Everything between
+// trades one for the other, and this is what lets a caller sit anywhere on that
+// curve rather than at one of its ends.
+func SetOverlapCheckpointBytesForStride(inputLen, cells, patterns, k int, rowForm bool) int {
+	m := inputLen + 1
+	if m < 1 {
+		m = 1
+	}
+	if k < 1 {
+		k = 1
+	}
+	if k > m {
+		k = m
+	}
+	nb := (m + k - 1) / k
+	return SetOverlapCheckpointHeaderBytes +
+		nb*(cells*4+4) + 4 + k*SetOverlapBlockRowBytes(patterns, rowForm)
+}
+
+// SetOverlapCheckpointBytes is the region for that stride.
+func SetOverlapCheckpointBytes(inputLen, cells, patterns int, rowForm bool) int {
+	m := inputLen + 1
+	if m < 1 {
+		m = 1
+	}
+	k := SetOverlapCheckpointStride(inputLen, cells, patterns, rowForm)
+	nb := (m + k - 1) / k
+	return SetOverlapCheckpointHeaderBytes +
+		nb*(cells*4+4) + // checkpoints, plus one cumulative count each
+		4 + // the final cum[nb] total
+		k*SetOverlapBlockRowBytes(patterns, rowForm)
 }

@@ -466,6 +466,19 @@ func loadI32(b []byte, off int) []byte {
 }
 
 // callRealloc pushes a cabi_realloc(0, 0, align, size) call.
+// callReallocDyn is callRealloc with the size in a LOCAL rather than a
+// constant, for the one allocation whose size is not known until the call runs:
+// the overlapping answer cache, which is a function of the input length.
+func callReallocDyn(b []byte, reallocIdx int, align int32, sizeLocal byte) []byte {
+	b = append(b, 0x41, 0x00) // old_ptr
+	b = append(b, 0x41, 0x00) // old_size
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, align)
+	b = append(b, 0x20, sizeLocal)
+	b = append(b, 0x10)
+	return utils.AppendULEB128(b, uint32(reallocIdx))
+}
+
 func callRealloc(b []byte, reallocIdx int, align, size int32) []byte {
 	b = append(b, 0x41, 0x00) // old_ptr
 	b = append(b, 0x41, 0x00) // old_size
